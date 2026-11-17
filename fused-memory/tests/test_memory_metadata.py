@@ -48,24 +48,14 @@ from fused_memory.memory_metadata import (
 #: at the frozen projection restores the stated intent — the assertions
 #: below pin the literal against the census it was actually derived from.
 #:
-#: WHAT THIS DELIBERATELY GIVES UP, AND WHERE IT WENT.  The live-artifact
-#: read doubled as a drift tripwire ("census artifact changed — re-derive
-#: the registry").  It fired correctly on 4006's first live run: the live
-#: corpus moved 329 → 385 distinct ``kind`` values (+70 new, −14 gone), so
-#: ``KIND_REGISTRY`` IS materially stale against today's corpus.  That is
-#: not lost — it is handed to leaf β's owner as a reviewed re-derivation
-#: (with the removal policy the −14 need, and the question of whether a
-#: live-artifact drift check should exist at all), filed as ticket
-#: **tkt_0RSH6HFNT4YWRX20663ZGJ9YGZ** carrying the measured deltas and all
-#: three open decisions.  Naming the ticket is the point: without it this
-#: note records a known-stale registry with no traceable owner, and no test
-#: will ever notice further drift now that the tripwire is gone.  (A ticket,
-#: not a task id — the curator files asynchronously, so the resulting task
-#: is found by searching that ticket, not by a number predicted here.)
-#: It is not urgent:
-#: ``memory_metadata.enforce_kind_registry`` ships default **False** and is
-#: deliberately kept off (PRD §10 open question 1 — 242 of 329 measured
-#: values are singletons), so a stale registry rejects no live write.
+#: WHAT THIS GAVE UP, AND WHERE IT WENT.  The live-artifact read doubled as
+#: a drift tripwire, and it fired correctly on 4006's first live run (329 →
+#: 385 distinct ``kind`` values).  The reviewed re-derivation it called for
+#: happened as task 5266, which ruled PRD §10 open question 1 option (b):
+#: this oracle stays frozen as the derivation pin, ``KIND_REGISTRY`` stays
+#: frozen and append-only, and the drift this frozen fixture stopped
+#: surfacing is reported nightly in the census report's
+#: ``kind_registry_drift`` block.
 #: Do NOT regenerate the fixture to make these tests go green; that would
 #: ratify agent-invented free-text kinds into a normative closed registry
 #: without the review PRD D3 requires.
@@ -251,8 +241,8 @@ class TestKindRegistry:
     #: cleanup_count_snapshots.py:210); two do not (see the registry's
     #: block 2 comments).  All five are retained regardless:
     #: grandfathering means "what is written", not only "what survives"
-    #: an aging sweep, and excluding them would reject in-repo code the
-    #: moment `enforce_kind_registry` flips.
+    #: an aging sweep, and the registry is append-only (see its comment
+    #: block).
     ZERO_RECORD_IN_REPO_KINDS = frozenset({
         'stage1_flag_marker',
         'project_status_correction',
@@ -271,8 +261,8 @@ class TestKindRegistry:
         assert all(isinstance(value, str) for value in KIND_REGISTRY)
 
     def test_superset_of_every_census_measured_value(self):
-        """Every kind that exists live must be grandfathered — otherwise
-        flipping `enforce_kind_registry` rejects live writers."""
+        """Every kind the derivation census measured stays a member: the
+        registry is append-only, so no measured value is ever removed."""
         measured = set(_census_kind_values())
         missing = measured - KIND_REGISTRY
         assert not missing, f'census-measured kinds absent from the registry: {sorted(missing)}'

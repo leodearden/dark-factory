@@ -27,7 +27,8 @@ Contents
 ``kind`` is deliberately **NOT** slug-validated: 321 of the 329 live
 ``kind`` values are snake_case, so applying this regex to ``kind`` would
 reject essentially the entire live population.  ``kind`` is
-registry-membership-validated instead, exactly as V1 specifies.
+registry-membership-CENSUSED instead, and never rejected (PRD §10 open
+question 1, option (b)).
 
 Layering note
 -------------
@@ -198,10 +199,10 @@ def normalize_supersedes(value: Any) -> list[Any]:
 CHILD_KINDS: frozenset[str] = frozenset({'amendment', 'sighting'})
 
 
-#: The normative closed registry of Mem0 ``metadata.kind`` values
-#: (PRD D3).  Membership is checked by :func:`validate_memory_metadata`
-#: and enforced only when ``memory_metadata.enforce_kind_registry`` is
-#: on — see the module docstring for why that flag defaults to False.
+#: The registry of Mem0 ``metadata.kind`` values (PRD D3), FROZEN BY
+#: DECISION (task 5266, PRD §10 open question 1, option (b)).  It is the
+#: drift BASELINE, not a gate: :func:`validate_memory_metadata` censuses a
+#: non-member as ``unknown_kind`` and never rejects it.
 #:
 #: Generated mechanically from the census artifact, NOT read at import
 #: time: a registry that mutates when an artifact is regenerated is not
@@ -213,13 +214,18 @@ CHILD_KINDS: frozenset[str] = frozenset({'amendment', 'sighting'})
 #: rationale, and for why re-deriving needs leaf β review rather than a
 #: fixture refresh).
 #:
-#: KNOWN STALE against the live corpus as of 2026-08-16: 4006's first live
-#: census measured 385 distinct ``kind`` values vs the 329 below (+70 new,
-#: −14 disappeared).  Harmless under the shipped defaults —
-#: ``enforce_kind_registry`` is False and deliberately stays off (see the
-#: WARNING below) — so nothing is rejected; re-derivation is queued as
-#: reviewed leaf-β work, including a policy for values that LEAVE the
-#: corpus, which this registry does not currently have.
+#: REMOVAL POLICY — this is its one home.  APPEND-ONLY: a value is never
+#: removed.  Absence from one census is no evidence its writer is dead —
+#: most writers are agents and prompts a source grep cannot see, which is
+#: the rule BLOCK 2's retention already follows — and a shrinking baseline
+#: would hide exactly the departures the drift report exists to show.
+#:
+#: NO CENSUS TOP-UP: re-seeding from a census would zero the drift signal.
+#: A new normative kind enters only by a PRD decision, as CHILD_KINDS did.
+#:
+#: Live drift is the nightly ``kind_registry_drift`` block of
+#: ``plans/memory-metadata-census-report.{json,md}``, not a test: a
+#: tripwire that goes red every night trains its readers to ignore it.
 KIND_REGISTRY: frozenset[str] = frozenset({
     # ---------------------------------------------------------------
     # BLOCK 1 — CENSUS-MEASURED (329 values)
@@ -234,10 +240,8 @@ KIND_REGISTRY: frozenset[str] = frozenset({
     # WARNING (PRD §10 open question 1): 242 of these 329 values are
     # SINGLETONS.  The population is agent-invented free text and open
     # in practice, which measured D3's "kind writers are in-repo code +
-    # prompts" premise FALSE.  That is precisely why
-    # `enforce_kind_registry` ships defaulted off: a day-one
-    # strict-reject would turn every newly invented kind into a hard
-    # memory-write failure on the live fleet.
+    # prompts" premise FALSE — the reason that question was ruled
+    # option (b): `kind` never rejects.
     # ---------------------------------------------------------------
     'admin_cleanup_task_filed',
     'architectural_failure_mode',
@@ -575,15 +579,14 @@ KIND_REGISTRY: frozenset[str] = frozenset({
     # but measure ZERO live records (esc-3194-1, re-verified against
     # main @ 2814b01202).  They are retained anyway: grandfathering
     # means "what is WRITTEN", not only what survives an aging sweep.
-    # Dropping them would reject in-repo code the moment
-    # `enforce_kind_registry` flips.
+    # Retained under the append-only policy above.
     # ---------------------------------------------------------------
     'consolidated_scope_correction',  # reconciliation/scope_freshness.py:97 (declared), written :251, :495
     # ReconciliationHarness._reconcile_status_correction (same dict as `supersedes`)
     'project_status_correction',
     'count_snapshot_cleanup_audit',   # scripts/cleanup_count_snapshots.py:210
-    # No live Mem0 writer found — retained per esc-3194-1 pending the
-    # PRD §10 open questions.  `entity_standing_decision` is a SQLite
+    # No live Mem0 writer found — retained per esc-3194-1 and the
+    # append-only policy above.  `entity_standing_decision` is a SQLite
     # recon_ledger record kind (reconciliation/standing_decision_writer.py,
     # list_entity_standing_decisions), i.e. a DIFFERENT store's vocabulary;
     # `stage1_flag_marker`'s Mem0 mirror write was RETIRED by task 2406

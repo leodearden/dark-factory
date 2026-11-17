@@ -1043,10 +1043,10 @@ def _materialize_b_grouped(
     variable from an authoring-quality variable.
 
     The canonical carries ``canonical: True`` and NO ``kind``: ``'canonical'``
-    is not a member of β's ``KIND_REGISTRY`` and would be a fatal
-    ``unknown_kind`` violation.  Canonicality is expressed by the
-    ``canonical`` key; ``kind`` says what a CHILD is (``amendment`` /
-    ``sighting``), and the two are not interchangeable.
+    is not a member of β's ``KIND_REGISTRY`` and would census as an
+    ``unknown_kind`` violation (an unregistered kind).  Canonicality is
+    expressed by the ``canonical`` key; ``kind`` says what a CHILD is
+    (``amendment`` / ``sighting``), and the two are not interchangeable.
 
     Child ``parent_id`` values are derived from the canonical CLAIM id via
     :func:`_derive_record_id`, never minted randomly, so the
