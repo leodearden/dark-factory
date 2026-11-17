@@ -3,10 +3,10 @@
 PRD ``plans/merge-lane-quality-prd.md`` task alpha. The instrument itself lives
 in ``scripts/merge_lane_cluster.py`` (measurement), ``scripts/merge_lane_ratchet.py``
 (verdict) and ``scripts/merge_lane_metrics.py`` (command line); this module hosts
-both its detector unit tests and the real tree-scanning gate, in the same
-single-file shape as the guard it supersedes
-(``test_merge_queue_reachback_patch_guard.py`` carries its
-``_find_merge_queue_private_patches`` fixtures and its tree sweep in one file).
+the measurement-stratum unit tests, the command-line tests and the real
+tree-scanning gate. The synthetic unit tests of the write gate, and of the
+comparator it shares with ``--check``, are in
+``test_merge_lane_ratchet_write_gate.py``.
 
 Ratchet contract
 ----------------
