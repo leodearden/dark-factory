@@ -34,15 +34,11 @@ import pytest
 # once this module has been imported (sys.path edits are process-global and
 # outlive collection of this file).
 #
-# `scripts/` provides the `legibility` PACKAGE. `scripts/legibility/` is needed
-# only for a flat sibling name a transitively imported module still uses
-# (census -> coder -> `import codebook`). The `shared` stub installed by
+# `scripts/` provides the `legibility` PACKAGE. The `shared` stub installed by
 # conftest.py is compatible: its `__path__` points at the real
 # `shared/src/shared`.
 if (_SCRIPTS_DIR := str(Path(__file__).resolve().parents[2] / 'scripts')) not in sys.path:
     sys.path.append(_SCRIPTS_DIR)
-if (_LEGIBILITY_DIR := str(Path(_SCRIPTS_DIR) / 'legibility')) not in sys.path:
-    sys.path.append(_LEGIBILITY_DIR)
 
 # The package form keeps ONE `legibility.alarm` module object, the one that
 # holds `own_endpoint`'s grant.

@@ -150,11 +150,11 @@ class TestEncodeCwd:
 def _load_sibling_test_module(name: str):
     """Import a sibling scripts/tests module by file path.
 
-    ``scripts/tests`` is not on ``sys.path`` (its conftest inserts
-    ``scripts/`` and ``scripts/legibility``, not itself), so a bare
-    ``import test_legibility_nightly`` would not resolve under the suite's
-    ``--import-mode=importlib`` collection. Loading by path is the sanctioned
-    equivalent and avoids restructuring the nightly fixture.
+    Its conftest inserts ``scripts/`` and ``scripts/local-model-serving/`` and
+    appends ``scripts/tests`` itself, but importing a test module by bare name is
+    fragile under the suite's ``--import-mode=importlib`` collection. Loading by
+    path is the sanctioned equivalent and avoids restructuring the nightly
+    fixture.
     """
     spec = importlib.util.spec_from_file_location(
         f'_lockstep_{name}', Path(__file__).parent / f'{name}.py'
