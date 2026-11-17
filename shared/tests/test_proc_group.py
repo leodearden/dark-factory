@@ -29,6 +29,7 @@ from shared.proc_group import (
     cpu_ticks_under_path,
     pid_running,
     process_group_members,
+    parse_start_ticks,
     process_group_terminated,
     read_cpu_ticks,
     read_session_id,
@@ -284,6 +285,7 @@ def _synthetic_stat_line(
     comm: str = 'weird (name) proc',
     cpu: tuple[int, int, int, int] = (0, 0, 0, 0),
     session: int | None = None,
+    start_ticks: int = 0,
 ) -> str:
     """A real-format ``/proc/<pid>/stat`` for a fabricated /proc: ``pid (comm) state 1 pgrp session ...``.
 
@@ -292,8 +294,11 @@ def _synthetic_stat_line(
     mis-read this line, and the kernel really does allow it (a process can
     set an arbitrary 15-char comm).  *cpu* is utime, stime, cutime and cstime,
     stat fields 14-17.  *session* is stat field 6, and defaults to *pgrp*.
+    *start_ticks* is stat field 22.
     """
-    counters = ['0'] * 4 + [str(ticks) for ticks in cpu] + ['0'] * 12
+    counters = (
+        ['0'] * 4 + [str(ticks) for ticks in cpu] + ['0'] * 4 + [str(start_ticks)] + ['0'] * 7
+    )
     sid = pgrp if session is None else session
     return (
         f'{pid} ({comm}) {state} 1 {pgrp} {sid} 0 -1 4194304 '
@@ -2491,6 +2496,42 @@ class TestReadSessionId:
 
     def test_on_the_real_proc_it_is_our_own_session(self):
         assert read_session_id(Path('/proc') / str(os.getpid())) == os.getsid(0)
+
+
+def _with_start_ticks_token(token: str) -> str:
+    return _synthetic_stat_line(810, 810, start_ticks=424242).replace(' 424242 ', f' {token} ')
+
+
+class TestParseStartTicks:
+    """Start time (stat field 22) of a ``/proc/<pid>/stat`` text, on the split read_stat_fields uses."""
+
+    def test_a_well_formed_line_reads_field_22_after_the_last_paren(self):
+        text = _synthetic_stat_line(4242, 4242, cpu=(5, 6, 7, 8), session=777, start_ticks=31337)
+
+        assert parse_start_ticks(Path('/proc/4242/stat'), text) == 31337
+
+    @pytest.mark.parametrize(
+        'text',
+        [
+            *_MALFORMED_STAT_LINES,
+            pytest.param(
+                '7 (x) S 1 7 7 0 -1 0 0 0 0 0 0 0 0 0 0 0 0 0\n', id='start-ticks-truncated'
+            ),
+            pytest.param(_with_start_ticks_token('soon'), id='start-ticks-not-a-number'),
+            pytest.param(_with_start_ticks_token('-1'), id='start-ticks-negative'),
+            pytest.param(_with_start_ticks_token('+5'), id='start-ticks-signed'),
+            pytest.param(_with_start_ticks_token('1_0'), id='start-ticks-underscored'),
+        ],
+    )
+    def test_a_malformed_line_raises_naming_its_path_and_text(self, text):
+        path = Path('/proc/810/stat')
+
+        with pytest.raises(MalformedStatLine) as excinfo:
+            parse_start_ticks(path, text)
+
+        exc = excinfo.value
+        assert isinstance(exc, ValueError)
+        assert (exc.path, exc.text) == (path, text)
 
 
 class TestUnifiedCgroupPath:
