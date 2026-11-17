@@ -176,14 +176,31 @@ class TestTheRoutingEndpoint:
             assert built.api_key == expected_key
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize('blank', ['', '   '])
     async def test_a_blank_routing_leaf_assigned_after_construction_still_inherits(
-        self, mock_config,
+        self, mock_config, blank,
     ):
         mock_config.llm.providers.openai.api_url = CONFIGURED_URL
-        mock_config.routing.openai_api_url = ''
+        mock_config.routing.openai_api_url = blank
+        mock_config.routing.openai_api_key = blank
 
         async with _built_from(mock_config) as built:
             assert _endpoint(built) == CONFIGURED_URL
+            assert built.api_key == 'test-key'
+
+    @pytest.mark.asyncio
+    async def test_with_no_openai_provider_the_routing_leaves_still_apply(
+        self, mock_config, monkeypatch,
+    ):
+        mock_config.llm.providers.openai = None
+        mock_config.routing.openai_api_url = ROUTING_URL
+        mock_config.routing.openai_api_key = ROUTING_KEY
+        monkeypatch.setenv('OPENAI_BASE_URL', AMBIENT_URL)
+        monkeypatch.setenv('OPENAI_API_KEY', 'env-key')
+
+        async with _built_from(mock_config) as built:
+            assert _endpoint(built) == ROUTING_URL
+            assert built.api_key == ROUTING_KEY
 
     @pytest.mark.asyncio
     async def test_with_no_openai_provider_and_no_routing_leaves_the_sdk_env_fallback_applies(

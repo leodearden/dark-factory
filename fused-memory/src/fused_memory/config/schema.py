@@ -117,6 +117,18 @@ class YamlSettingsSource(PydanticBaseSettingsSource):
             ) from e
 
 
+# --- Shared leaf normalisers ---
+
+def blank_means_inherit(value: str | None) -> str | None:
+    """None for a blank inheriting leaf, its one spelling of inherit.
+
+    Validators apply it when a config is built, and resolvers again at use.
+    """
+    if value is None or not value.strip():
+        return None
+    return value
+
+
 # --- Server ---
 
 # Mirrors fused_memory.server.main._FORCE_EXIT_BUDGET and
@@ -415,13 +427,6 @@ class Mem0BackendConfig(BaseModel):
 
 # --- Routing ---
 
-def _blank_means_inherit(value: str | None) -> str | None:
-    """Store a blank inheriting leaf as None, its one spelling of inherit."""
-    if value is None or not value.strip():
-        return None
-    return value
-
-
 class RoutingConfig(BaseModel):
     """Write/read routing configuration."""
 
@@ -449,7 +454,7 @@ class RoutingConfig(BaseModel):
     @field_validator('openai_api_url', 'openai_api_key')
     @classmethod
     def _blank_leaf_inherits(cls, value: str | None) -> str | None:
-        return _blank_means_inherit(value)
+        return blank_means_inherit(value)
 
 
 # --- Queue ---
@@ -3073,7 +3078,7 @@ class WriteTriageConfig(BaseModel):
         too means a reload of a blank value reports null rather than an
         applied '' that the judge then silently ignores.
         """
-        return _blank_means_inherit(value)
+        return blank_means_inherit(value)
 
     @field_validator('t_high_by_category')
     @classmethod

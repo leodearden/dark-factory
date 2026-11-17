@@ -3,14 +3,18 @@
 from openai import AsyncOpenAI
 
 from fused_memory.config.env_precedence import warn_if_ambient_base_url_is_overridden
-from fused_memory.config.schema import FusedMemoryConfig
+from fused_memory.config.schema import FusedMemoryConfig, blank_means_inherit
 
 
 def _routing_endpoint(config: FusedMemoryConfig) -> tuple[str | None, str | None]:
     """(api_key, base_url): each routing leaf, else llm.providers.openai's, else None for the SDK env fallback."""
     provider = config.llm.providers.openai
-    api_key = config.routing.openai_api_key or (provider.api_key if provider else None)
-    base_url = config.routing.openai_api_url or (provider.api_url if provider else None)
+    api_key = blank_means_inherit(config.routing.openai_api_key) or (
+        provider.api_key if provider else None
+    )
+    base_url = blank_means_inherit(config.routing.openai_api_url) or (
+        provider.api_url if provider else None
+    )
     return api_key, base_url
 
 
