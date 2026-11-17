@@ -2,10 +2,12 @@
 
 import uuid
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import aiosqlite
 import pytest
 import pytest_asyncio
+from reconciliation.legacy_drains import drain_unattributed
 
 from fused_memory.models.reconciliation import (
     EventSource,
@@ -33,10 +35,15 @@ def _make_event(
     )
 
 
+@pytest.fixture
+def buf_db_path(tmp_path) -> Path:
+    return tmp_path / 'test.db'
+
+
 @pytest_asyncio.fixture
-async def buf(tmp_path):
+async def buf(buf_db_path):
     b = EventBuffer(
-        db_path=tmp_path / 'test.db',
+        db_path=buf_db_path,
         buffer_size_threshold=5,
         max_staleness_seconds=300,
     )
@@ -2003,7 +2010,9 @@ async def test_mark_drained_run_id_attributes_pre_drained_events_to_a_run(buf):
 
 
 @pytest.mark.asyncio
-async def test_restore_drained_include_unattributed_sweeps_null_rows_for_recovered_run(buf):
+async def test_restore_drained_include_unattributed_sweeps_null_rows_for_recovered_run(
+    buf, buf_db_path,
+):
     """include_unattributed=True additionally restores drained_by_run_id IS
     NULL rows (pre-task-2711 leftovers, drained before drains stamped run
     attribution) when recovering a specific run — closing the upgrade-
@@ -2018,13 +2027,12 @@ async def test_restore_drained_include_unattributed_sweeps_null_rows_for_recover
         await buf.push(e)
     await buf.drain('test-project', run_id='orphan-run')
 
-    # Pre-task-2711 leftovers: drained with NO run_id, so drained_by_run_id
-    # is NULL — simulates events drained by the old code before this
-    # upgrade, which an exact-match run-scoped restore alone would never
-    # restore.
+    # Pre-task-2711 leftovers, seeded as a pre-task-2711 process left them:
+    # drained with drained_by_run_id NULL, which an exact-match run-scoped
+    # restore alone would never restore.
     for e in events_legacy_null:
         await buf.push(e)
-    await buf.drain('test-project')
+    assert drain_unattributed(buf_db_path, 'test-project') == 2
 
     # A different, concurrent run's drained events must survive.
     for e in events_concurrent:
@@ -2055,7 +2063,7 @@ async def test_restore_drained_include_unattributed_sweeps_null_rows_for_recover
 
 
 @pytest.mark.asyncio
-async def test_restore_drained_default_excludes_unattributed_rows(buf):
+async def test_restore_drained_default_excludes_unattributed_rows(buf, buf_db_path):
     """Without include_unattributed (the default), a run-scoped restore must
     NOT touch NULL-attributed rows — locks in the exact-match contract relied
     on by test_mark_drained_run_id_attributes_pre_drained_events_to_a_run."""
@@ -2064,9 +2072,10 @@ async def test_restore_drained_default_excludes_unattributed_rows(buf):
     for e in events_run:
         await buf.push(e)
     await buf.drain('test-project', run_id='R1')
+    # Seeded as a pre-task-2711 process left it: drained with no run stamp.
     for e in events_null:
         await buf.push(e)
-    await buf.drain('test-project')
+    assert drain_unattributed(buf_db_path, 'test-project') == 1
 
     restored = await buf.restore_drained('test-project', run_id='R1')
     assert restored == 1
