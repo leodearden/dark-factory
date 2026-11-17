@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 import pytest_asyncio
@@ -379,6 +379,82 @@ class TestExpiry:
         await ledger.gc(PROJECT_ID, now=FAR_FUTURE, terminal_task_ids=[])
 
         assert await ledger.get_by_identity(**_proposal().ledger_key()) is None
+
+
+#: When the retention tests' outcomes were acted on.
+ACTED_AT = '2026-07-02T00:00:00+00:00'
+
+
+class TestRetention:
+    """A non-executed outcome lives ``retention`` past ``acted_at`` (PRD K6)."""
+
+    @pytest.mark.parametrize(
+        'state',
+        [
+            ProposalState.REFUSED,
+            ProposalState.DROPPED,
+            ProposalState.UNRESOLVED,
+            ProposalState.DRY_RUN,
+            ProposalState.REVERTED,
+        ],
+        ids=lambda state: state.value,
+    )
+    @pytest.mark.asyncio
+    async def test_a_non_executed_outcome_expires_retention_after_acted_at(self, ledger, state):
+        record = await _seed(ledger)
+
+        await record_outcome(
+            ledger, record, _outcome(state, acted_at=ACTED_AT), retention=timedelta(days=90),
+        )
+
+        stored = await ledger.get_by_identity(**_proposal().ledger_key())
+        assert stored.expires_at == '2026-09-30T00:00:00+00:00'
+        await ledger.gc(PROJECT_ID, now='2026-09-29T23:59:59+00:00', terminal_task_ids=[])
+        assert await ledger.get_by_identity(**_proposal().ledger_key()) is not None
+        await ledger.gc(PROJECT_ID, now='2026-09-30T00:00:01+00:00', terminal_task_ids=[])
+        assert await ledger.get_by_identity(**_proposal().ledger_key()) is None
+
+    @pytest.mark.asyncio
+    async def test_an_executed_outcome_never_expires_whatever_the_retention(self, ledger):
+        record = await _seed(ledger)
+
+        await record_outcome(ledger, record, _executed_outcome(), retention=timedelta(days=90))
+
+        stored = await ledger.get_by_identity(**_proposal().ledger_key())
+        assert stored.expires_at is None
+        await ledger.gc(PROJECT_ID, now=FAR_FUTURE, terminal_task_ids=[])
+        assert await ledger.get_by_identity(**_proposal().ledger_key()) is not None
+
+    @pytest.mark.asyncio
+    async def test_an_acted_at_with_an_offset_is_stored_in_utc(self, ledger):
+        """``gc`` compares TEXT, so the stored expiry must be canonical UTC."""
+        record = await _seed(ledger)
+        outcome = _outcome(ProposalState.REFUSED, acted_at='2026-07-02T02:00:00+02:00')
+
+        await record_outcome(ledger, record, outcome, retention=timedelta(days=1))
+
+        stored = await ledger.get_by_identity(**_proposal().ledger_key())
+        assert stored.expires_at == '2026-07-03T00:00:00+00:00'
+
+    @pytest.mark.parametrize(
+        ('retention', 'acted_at'),
+        [
+            (timedelta(0), ACTED_AT),
+            (timedelta(days=-1), ACTED_AT),
+            (timedelta(days=1), '2026-07-02T00:00:00'),
+        ],
+        ids=['zero_retention', 'negative_retention', 'naive_acted_at'],
+    )
+    @pytest.mark.asyncio
+    async def test_a_bad_retention_or_acted_at_is_refused(self, ledger, retention, acted_at):
+        record = await _seed(ledger)
+        outcome = _outcome(ProposalState.REFUSED, acted_at=acted_at)
+
+        with pytest.raises(ValueError):
+            await record_outcome(ledger, record, outcome, retention=retention)
+
+        stored = await ledger.get_by_identity(**_proposal().ledger_key())
+        assert stored.state == 'proposed'
 
 
 def _row(state, run_id='r', created_at='2026-07-01T00:00:00+00:00', topic=TOPIC):
