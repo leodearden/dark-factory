@@ -83,6 +83,14 @@ Operator visibility:
 - `scheduler_tick.data.scope` is `main_health_fix` on a tick run against the
   reserve, and `any` otherwise.
 - Each dispatch on the reserve logs an INFO line naming the task.
+- Known false alarm, until follow-up ticket `tkt_0RX39GHVZQB8HE6J4X8944DD3W`
+  lands: the dashboard's E12 parity alarm
+  (`dashboard/src/dashboard/data/burndown.py::compute_parity_alarm`) still
+  takes `max_concurrent_tasks` alone as the cap. A fix running on the reserve
+  therefore logs "Concurrency cap breached" and records a breach row, for
+  example 37 live against 36. A breach of exactly
+  `main_health_fix_reserved_slots` while `scope` is `main_health_fix` is the
+  reserve working as designed, not an over-dispatch.
 
 `main_health_fix_reserved_slots` is restart-only, like `max_concurrent_tasks`.
 The warm-lane pool is sized from every run slot:
