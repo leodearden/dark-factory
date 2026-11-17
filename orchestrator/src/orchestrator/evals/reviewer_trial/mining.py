@@ -27,6 +27,7 @@ from pathlib import Path
 from shared.merge_subject import MergeSubject, parse_merge_subject
 
 from orchestrator.agents.invoke import invoke_agent
+from orchestrator.evals.measurement import Scored, Unmeasured
 from orchestrator.evals.reviewer_trial.adjudication import AdjudicationLog
 from orchestrator.evals.reviewer_trial.corpus import CorpusDiff, CorpusManifest, GroundTruthIssue
 
@@ -693,6 +694,31 @@ def admit_mined_diff(
         frontier_model=frontier_model,
         notes=f'Frontier-proposed labels for FN candidate {diff.diff_id}.',
     )
+
+
+def admit_proposal(
+    manifest: CorpusManifest,
+    log: AdjudicationLog,
+    recovered: RecoveredCandidate,
+    proposal: Scored[list[GroundTruthIssue]] | Unmeasured,
+    *,
+    description: str,
+    escalation_refs: Sequence[EscalationRef],
+    runs_db: Path,
+    frontier_model: str,
+) -> CorpusDiff | None:
+    """Admit *recovered* labelled with *proposal*'s issues and return it.
+
+    Return None and admit nothing when the proposer did not measure or proposed no issues.
+    """
+    if isinstance(proposal, Unmeasured) or not proposal.value:
+        return None
+    diff = mined_corpus_diff(
+        recovered, issues=proposal.value, description=description,
+        escalation_refs=escalation_refs, runs_db=runs_db,
+    )
+    admit_mined_diff(manifest, log, diff, frontier_model=frontier_model)
+    return diff
 
 
 _SPLIT_RATIO_NAMES = ('train', 'selection', 'test')
