@@ -29,7 +29,7 @@ from _verify_boundary_harness import (
     worktree_base_for,
     write_verify_config,
 )
-from test_cli import _setup_verify_repo
+from _verify_merge_cli_fixtures import _setup_verify_repo
 
 from orchestrator.verify_cancel import merge_verify_lock_path, write_lock_holder_pgid
 from orchestrator.verify_runner import FLOCK_CONTENTION_CATEGORY, result_from_json

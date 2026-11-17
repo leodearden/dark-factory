@@ -22,14 +22,14 @@ from unittest.mock import MagicMock
 import pytest
 from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT
 from _task_verify_fixtures import seed_verify_repo, task_verify_spec
-from _xdist_crash_fixtures import XDIST_WORKER_CRASH_OUTPUT
-from click.testing import CliRunner, Result
-from test_cli import (
+from _verify_merge_cli_fixtures import (
     _communicate_or_empty,
     _patched_verify_merge,
     _wait_for_pgid_file_or_report_crash,
     _wait_pgid_gone,
 )
+from _xdist_crash_fixtures import XDIST_WORKER_CRASH_OUTPUT
+from click.testing import CliRunner, Result
 
 import orchestrator.cli as cli_module
 from orchestrator.cli import main

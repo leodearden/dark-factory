@@ -15,8 +15,8 @@ so the sleeper faithfully reproduces the exact cargo/rustc session-escape the
 watchdog/cancel tree-kill machinery must handle, with zero reify toolchain
 dependency.
 
-Fakes/helpers are reused from the sibling test_cli.py harness (established
-cross-test-module import pattern -- see test_concurrent_verify_boundary.py) and
+Fakes/helpers are reused from orchestrator/tests/_verify_merge_cli_fixtures.py
+(the shared verify-merge CLI scaffolding) and
 from orchestrator.verify_cancel (the SAME /proc walkers the production
 watchdog/cancel kill paths use) -- single source of truth, zero divergent
 ad-hoc process-tree parsing.
@@ -97,9 +97,9 @@ from _verify_host_drive import (
     merge_request_for_verify,
     probe_free_orch_config,
 )
+from _verify_merge_cli_fixtures import _setup_verify_repo
 from click.testing import CliRunner
 from escalation.queue import EscalationQueue
-from test_cli import _setup_verify_repo
 
 import orchestrator.cli as cli_module
 from orchestrator.cli import main
