@@ -17,7 +17,10 @@ from audit_manifest_descriptor_drift import (
     format_report,
     load_task_store_scan,
 )
+from dashboard.data.prd_attribution import lineage_entry
+from dashboard.data.prd_view import PrdDocument, SignalCause, signal_of
 from manifest_drift_fixtures import labelled_row, make_project, run_cli
+from shared.capability_manifest import load_capability_manifest
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
@@ -172,14 +175,46 @@ def _leaf_project(tmp_path, make_tasks_db, leaf_metadata):
     )
 
 
-@pytest.mark.parametrize("leaf_metadata", [
+def _rooted(metadata, root):
+    """*metadata* with *root* in place of each '{root}' in a string value."""
+    return {key: value.replace("{root}", str(root)) if isinstance(value, str) else value
+            for key, value in metadata.items()}
+
+
+# Task-8 metadata naming plans/x-prd.md in each spelling the dashboard's
+# coalesce_prd reads as that PRD.
+_X_PRD_SPELLINGS = [
     pytest.param({"prd": "plans/x-prd.md"}, id="prd-only"),
     pytest.param({"prd_ref": "plans/x-prd.md"}, id="prd_ref-only"),
     pytest.param({"prd_path": "plans/x-prd.md#goal"}, id="anchor-suffix"),
     pytest.param({"prd_path": "plans/x-prd.md §5.2"}, id="section-suffix"),
     pytest.param({"prd_path": "", "prd": "plans/x-prd.md"}, id="empty-prd_path-falls-through"),
     pytest.param({"prd_path": 5, "prd": "plans/x-prd.md"}, id="non-string-prd_path-skipped"),
-])
+]
+
+# Task-8 metadata naming plans/x-prd.md by a path the dashboard's
+# normalise_prd_key keys to it; '{root}' is the project root (see _rooted).
+_X_PRD_EQUIVALENT_PATHS = [
+    pytest.param({"prd_path": "./plans/x-prd.md"}, id="dot-slash"),
+    pytest.param({"prd_path": "{root}/plans/x-prd.md"}, id="absolute-inside-root"),
+]
+
+_FOREIGN_X_PRD = "/elsewhere/plans/x-prd.md"
+
+# Every task-8 shape the audit and the dashboard must give one verdict on.
+_PARITY_SHAPES = [
+    *_X_PRD_SPELLINGS,
+    *_X_PRD_EQUIVALENT_PATHS,
+    pytest.param({"prd_path": "plans/x-prd.md"}, id="exact"),
+    pytest.param({"prd_path": "plans/other-prd.md", "prd": "plans/x-prd.md"},
+                 id="prd_path-wins"),
+    pytest.param({"prd": "plans/other-prd.md#a"}, id="other-prd-with-anchor"),
+    pytest.param({"prd_path": _FOREIGN_X_PRD}, id="outside-the-root"),
+    pytest.param({}, id="no-prd-field"),
+]
+
+
+@pytest.mark.parametrize("leaf_metadata", _X_PRD_SPELLINGS)
 def test_a_signal_leaf_naming_the_sidecars_prd_in_any_dashboard_spelling_is_no_row(
         tmp_path, make_tasks_db, leaf_metadata):
     root = _leaf_project(tmp_path, make_tasks_db, leaf_metadata)
@@ -200,6 +235,44 @@ def test_prd_path_takes_precedence_over_prd_for_a_signal_leaf(
     assert audit_project(str(root)).stale_signal_bindings == [StaleSignalBinding(
         manifest=_SIGNAL_SIDECAR, label="ζ", task_id=8, reason="prd_mismatch",
         sidecar_prd="plans/x-prd.md", task_prd=task_prd)]
+
+
+@pytest.mark.parametrize("leaf_metadata", _X_PRD_EQUIVALENT_PATHS)
+def test_a_signal_leaf_naming_the_sidecars_prd_by_an_equivalent_path_is_no_row(
+        tmp_path, make_tasks_db, leaf_metadata):
+    root = tmp_path / "proj"
+    _leaf_project(tmp_path, make_tasks_db, _rooted(leaf_metadata, root))
+
+    assert audit_project(str(root)).stale_signal_bindings == []
+
+
+def test_a_signal_leaf_naming_a_prd_outside_the_root_is_a_mismatch(tmp_path, make_tasks_db):
+    """A PRD outside the project root is foreign to it, and never agrees."""
+    root = _leaf_project(tmp_path, make_tasks_db, {"prd_path": _FOREIGN_X_PRD})
+
+    assert audit_project(str(root)).stale_signal_bindings == [StaleSignalBinding(
+        manifest=_SIGNAL_SIDECAR, label="ζ", task_id=8, reason="prd_mismatch",
+        sidecar_prd="plans/x-prd.md", task_prd=_FOREIGN_X_PRD)]
+
+
+@pytest.mark.parametrize("leaf_metadata", _PARITY_SHAPES)
+def test_audit_and_dashboard_agree_on_which_signal_leaves_are_stale_bindings(
+        tmp_path, make_tasks_db, leaf_metadata):
+    """The audit's prd_mismatch row is the dashboard's STALE_BINDING cause
+    (dashboard/src/dashboard/data/prd_view.py::signal_of), read off one store."""
+    root = tmp_path / "proj"
+    task_8_metadata = _rooted(leaf_metadata, root)
+    _leaf_project(tmp_path, make_tasks_db, task_8_metadata)
+
+    audit = audit_project(str(root))
+    entries = {7: lineage_entry(_prd_row(7, "plans/x-prd.md")["metadata"], str(root)),
+               8: lineage_entry(task_8_metadata, str(root))}
+    document = PrdDocument(
+        title=None, sidecar=load_capability_manifest(root / _SIGNAL_SIDECAR))
+    signal = signal_of("plans/x-prd.md", document, {7: "pending", 8: "pending"}, entries)
+
+    assert any(row.reason == "prd_mismatch" for row in audit.stale_signal_bindings) == (
+        signal.cause is SignalCause.STALE_BINDING)
 
 
 @pytest.mark.parametrize("external", [None, {"ζ": "reify:5613"}],
