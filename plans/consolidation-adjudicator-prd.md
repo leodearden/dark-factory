@@ -381,7 +381,8 @@ not adjudicated and is left out of every denominator), then the call, then the k
   `closure_failed_reverted`, `closure_failed_revert_failed`, and the existing
   `refusal_streak`. `dropped` and `unresolved` file nothing: the row is their home.
 - **Stats** (`auto_consolidation_initial_stats`, the one home): add
-  `auto_consolidation_adjudicator_identity`, `…_adjudications`, `…_memo_hits`,
+  `auto_consolidation_adjudicator_identity`, `auto_consolidation_mode` (`unstaged`,
+  `uncalibrated`, `dry_run` or `live`), `…_adjudications`, `…_memo_hits`,
   `…_adjudicator_failures`, `…_dropped`, `…_unresolved`, `…_repairs` (`{code: n}`),
   `…_reverted`, `…_adjudication_cost_usd`, `…_calibration` (the outcome when a run ended
   this cycle); remove `auto_consolidation_gates_filed` and `…_unfiled`. Calibration calls
@@ -396,7 +397,8 @@ count, which goes from 14 to 21, and the yaml comment "All fourteen leaves" foll
 `max_adjudications_per_cycle` 6; `adjudicator_model` `'gpt-6.1-sol'`;
 `adjudicator_reasoning_effort` `'low'`; `adjudicator_timeout_seconds` 60;
 `adjudicator_field_chars` 4000; `adjudicator_member_max` 8; `outcome_retention_days` 90;
-`memo_days` 30. All eight land in one task (β). The root
+`memo_days` 30. β adds the eight (the pinned count goes 14 to 22); γ removes
+`max_gate_filings_per_cycle` together with the executor code that reads it (22 to 21). The root
 settings ignore unknown keys, so a yaml naming these under older code is silently ignored;
 Γ exists because of that.
 
@@ -525,7 +527,7 @@ predicate stays an import leaf).
 | The service can call OpenAI | `fm/server/write_triage_judge.py::_call_openai_responses`, live with `write_triage.enabled: true` |
 | Every full cycle writes its stats to the ledger | `fm/reconciliation/summary_pool.py::write_cycle_summary` |
 | Unknown config keys are ignored, not rejected | `fm/config/schema.py` root settings (`extra='ignore'`) |
-| Predicate-task shape; `recheck_secs` needs a `dated` milestone | `docs/task-authoring.md` §5–§6 |
+| Predicate-task shape; the predicate script must exist and be executable when the task is filed | `docs/task-authoring.md` §5–§6; `scripts/check_write_triage_readiness_gate.py` (`--subcheck`) |
 | Recurring chain carrier | `docs/task-authoring.md` §6.1 |
 | A task agent reads main-checkout stores read-only | `CLAUDE.md` "Forensic reads of tasks.db"; `scripts/tasks_db_schema.py` resolves the live store from a worktree |
 | Eval set | committed with this PRD (N6) |
@@ -553,13 +555,13 @@ existing, amended).
 | Other | Direction | Seam | Owner | Status |
 |---|---|---|---|---|
 | `plans/memory-auto-consolidation-prd.md` | amends | executor, predicate, proposal ledger, config block, §11 rollout | this PRD | parent gets a dated pointer (§13) |
-| same, task 5242 (ζ) | consumes | `scripts/report_auto_consolidations.py`, skills, `OPERATIONS.md` | task 5242, amended at decompose to this PRD's ζ | pending, never dispatched; task 10419 depends on it |
+| same, task 5242 (ζ) | consumes | `scripts/report_auto_consolidations.py`, skills, `OPERATIONS.md` | task 5242, amended at decompose to this PRD's ζ; it keeps its binding in the parent's sidecar | pending, never dispatched; task 10419 depends on it |
 | `plans/write-triage-link-healing-prd.md` | precedent only | in-service calibration before writes | that PRD | no shared code |
 | write-triage judge (tasks 5277, 9946, 10508) | shares | the parameterised OpenAI helper | β extracts; those tasks rebase onto it | queued |
 | review-all S16 ε2b (task 9700) | consumes later | role-based model routing for fused-memory judges | task 9700 | when it changes the model name the identity changes and the service re-calibrates by itself |
-| review-all S19 (tasks 9767, 9770, 9772) | file moves | `recon_ledger`, `consolidation_gate`, `server/consolidation` | those tasks | serialise by dependency at decompose |
+| review-all S19 (tasks 9767, 9770, 9772) | file moves | `recon_ledger`, `consolidation_gate`, `server/consolidation` | those tasks | file locks serialise; no edge |
 | tasks 5881, 7499 | same file, and semantics | topic-guard seeding, and what a revert leaves behind | those tasks | 7499 becomes load-bearing once the executor reverts by itself: 5881 must not land without it |
-| tasks 7151, 8149 | same files | executor and predicate | those tasks | serialise by dependency at decompose |
+| tasks 7151, 8149 | same files | executor and predicate | those tasks | file locks serialise; no edge |
 | `plans/live-task-facts-at-recall-prd.md` κ (task 10087) | same file | `stages/memory_consolidator.py` | task 10087 | this PRD does not edit that file |
 
 ## 10. Decomposition plan (signals are the G2 gate; Greek labels local to this PRD)
@@ -568,46 +570,58 @@ existing, amended).
   states, outcome fields, `members_key`, retention, the streak rule. Files:
   `consolidation_auto.py`, `consolidation_proposal.py`, `recon_ledger.py`, their tests.
   *Unlocks:* γ.
-- **β — Adjudicator, calibration, helper, config.** K3, K5, all of K7, the eval-set loader.
+- **β — Adjudicator, calibration, helper, config.** K3, K5, K7's eight new leaves, the eval-set loader.
   Files: the two new modules, `write_triage_judge.py` (helper only), `config/schema.py`,
   `config/reload.py`, `tests/test_config_reload.py`, the yaml comment block, their tests.
   Deps α (it uses K1's table and the two new ledger kinds). *Unlocks:* γ.
-- **γ — Executor flow.** K4, K6's records and stats; deletes the three gate functions.
-  Files: `consolidation_auto_executor.py`, its tests. Deps α, β. *Unlocks:* η.
+- **γ — Executor flow.** K4, K6's records and stats; deletes the three gate functions and
+  retires `max_gate_filings_per_cycle` (K7). Files: `consolidation_auto_executor.py`, its
+  tests, and the config schema, reload list and their tests for that one leaf. Deps α, β. *Unlocks:* η.
 - **η — Integration gate.** §5's twenty-one rows as e2e tests through the real ledger, the
   real executor and the real calibration function with a scripted model double. Deps γ.
   *Signal (leaf):* the e2e file passes, and the capability manifest maps A1–A21 to test
-  names.
-- **ζ — Review and check surfaces (task 5242, amended).** `report_auto_consolidations.py`
-  (adjudication columns, calibration records, `--revert`, `--json` with the rows' `shown`
-  text; resolves the main-checkout ledger from a worktree);
-  `scripts/check_auto_consolidation.py` with `code-live`, `live-clean` and `rejections`;
-  `fused-memory/config/consolidation-review.yaml` (the alarm thresholds, one home); the
-  watcher playbook rows for the new findings; `OPERATIONS.md` (the switches table, the kill
-  switch, how to read a rejection, what to do on `adjudicator_calibration_failed`); the
-  parent PRD's pointers. Deps η. *Signal (leaf):* against a ledger written by η's run the
-  report lists an execution, a dropped row, an unresolved row and a calibration record, and
-  each check prints "no producer has written here" and exits 75 on an empty ledger
-  (INV-13).
-- **Γ — Gate: the adjudicator code is the code running** (deterministic, predicate
-  `check_auto_consolidation.py code-live`, `script_root: project`; deps ζ; `dated`
-  milestone set at decompose; `recheck_secs` 86400). Exit 0 when dark_factory's newest
-  Stage 1 `cycle_summary` row (`flag_type='memory_consolidator'`) carries
-  `auto_consolidation_adjudicator_identity`; 75 until then. `delivered_checks` re-runs it.
+  names. Tests are named `test_a<N>_<slug>`, after the file's `test_b<N>_` convention.
+- **ζ — Review surfaces (task 5242, amended; it stays bound in the parent PRD's sidecar).**
+  `scripts/report_auto_consolidations.py` (adjudication columns, calibration records,
+  `--revert`, `--json` with the rows' `shown` text; resolves the main-checkout ledger from
+  a worktree); the watcher playbook rows for the new findings; `OPERATIONS.md` (the
+  switches table, the kill switch, how to read a rejection, what to do on
+  `adjudicator_calibration_failed` and `adjudicator_calibration_stalled`); the parent
+  PRD's pointers. Deps η. *Signal (leaf):* against a ledger written by η's run the report
+  lists an execution, a dropped row, an unresolved row and a calibration record, and says
+  "no producer has written here" on an empty ledger (INV-13).
+- **χ — Check surfaces.** `scripts/check_auto_consolidation.py`, standard library only, with
+  three checks that each exit 0 or 1 and print one JSON line saying why: `code-live`,
+  `live-clean`, `rejections`; and `fused-memory/config/consolidation-review.yaml` (the
+  alarm thresholds, one home), with tests over real ledgers written by η's harness. Deps
+  ζ, η. *Unlocks:* Γ, φ, ρ2.
+- **Γ — Gate: the adjudicator code is the code running** (deterministic, predicate; deps χ;
+  `milestone: {mode: delayed, after_secs: 86400}`, a day for the fleet redeploy to restart
+  fused-memory on the new code). The predicate is the existing
+  `scripts/check_write_triage_readiness_gate.py` with `--subcheck 'python3
+  scripts/check_auto_consolidation.py code-live'`: a predicate script must exist when its
+  task is filed, and χ's does not yet. Passes when any of dark_factory's five newest Stage 1
+  `cycle_summary` rows (`flag_type='memory_consolidator'`) carries
+  `auto_consolidation_adjudicator_identity`; one row is not enough, because the harness
+  writes a backstop summary without executor stats when Stage 1 raised early. `delivered_checks` re-runs it. *On fail:* a
+  born-at-L2 escalation saying the new code is not running a day after it landed.
   *Unlocks:* ε.
 - **ε — Switch on dark_factory** (normal, `complexity: simple`). Uncomment
   `consolidation_auto:` in `fused-memory/config/config.yaml` with
-  `enabled_projects: ['dark_factory']` and `enabled: true`. Deps Γ. It takes effect at the
+  `enabled_projects: ['dark_factory']` and `enabled: true`, written exactly so, with
+  `consolidation_auto:` at column 0 (the manifest's checks match that form). Deps Γ. It takes effect at the
   next fused-memory restart (the fleet redeploy restarts that tier) or `reload_config`; ε
   calls neither, φ watches for it. *Unlocks:* φ.
-- **φ — Gate: calibrated, live and clean** (deterministic, predicate
-  `check_auto_consolidation.py live-clean`; deps ε; `dated` milestone; `recheck_secs`
-  86400). Exit 1, each with its reason in the note, if: the running identity's calibration
-  is `fail` (not `fail_first_run`, `running` or `inconclusive`, which are 75); a `closure_failed_revert_failed`, `adjudicator_calibration_stalled` or
-  `adjudicator_eval_set_invalid` record is open; or the newest Stage 1 summary still shows
-  the project skipped more than 72 hours after the yaml change landed (the config was not
-  applied). Exit 75 until a `pass` record and at least one adjudication exist; else 0.
-  *Signal (leaf):* the gate closes on rows the live service wrote.
+- **φ — Gate: calibrated, live and clean** (deterministic, predicate as Γ with
+  `live-clean`; deps ε; `milestone: {mode: delayed, after_secs: 259200}`;
+  `delivered_checks` re-runs it). Fails, with the reason in its JSON line, if: the newest
+  Stage 1 summary's `auto_consolidation_mode` is not `live` (the config was not applied, or
+  writes are off); there is no `pass` calibration for the
+  running identity (`fail`, or still `fail_first_run`, `running` or `inconclusive` after
+  three days); or a `closure_failed_revert_failed`, `adjudicator_calibration_stalled` or
+  `adjudicator_eval_set_invalid` record is open. It does not require an adjudication to
+  have happened: Stage 1 proposes about once a day and may have proposed nothing.
+  *Signal (leaf):* the gate closes on a calibration record the live service wrote.
 - **ρ1 — First review** (normal agent task; deps φ; `milestone: {mode: delayed, after_secs:
   604800}`). From the report's JSON, which carries what the adjudicator was shown, read
   every `refused`, `dropped`, `unresolved` and `reverted` row and every executed row since
@@ -622,27 +636,28 @@ existing, amended).
   2592000}`). Its entry also says whether further agent reviews are warranted and files the
   next one if so.
 - **ρ2 — Monthly alarm** (recurring chain `consolidation-rejection-review`,
-  `interval_secs` 2592000; deterministic, predicate `check_auto_consolidation.py
-  rejections`; seed link `dated` 45 days after decompose, `recheck_secs` 604800; deps φ).
-  Exit 75 only while no `pass` calibration exists. Exit 0 when fewer than 20 proposals were
-  ruled in the last 30 days (too few to say anything) or every threshold in
-  `consolidation-review.yaml` holds; else exit 1, which reaches Leo as an L2 escalation
-  carrying the digest. Filing values, to be replaced by ρ1: rejected share ≥ 0.60 of ruled
-  proposals; one reason code ≥ 25 original rejections; one `members_key` rejected afresh in
-  3 or more memo windows; any open `blocking` record. They are alarm thresholds set from
-  one data point (2 of 7 rejected offline, before the adjudicator existed), which is why ρ1
-  owns them.
+  `interval_secs` 2592000; deterministic, predicate as Γ with `rejections`; seed link
+  `dated` 2027-01-20; deps φ). The check passes when the service is not live, when fewer
+  than 20 proposals were ruled in the last 30 days (too few to say anything), or when every
+  threshold in `consolidation-review.yaml` holds; otherwise it fails, which reaches Leo as
+  an L2 escalation carrying the digest. Filing values, to be replaced by ρ1: rejected share
+  ≥ 0.60 of ruled proposals; one reason code ≥ 25 original rejections; one `members_key`
+  rejected afresh in 3 or more memo windows; any open `blocking` record. They are alarm
+  thresholds set from one data point (2 of 7 rejected offline, before the adjudicator
+  existed), which is why ρ1 owns them.
 
 Decompose-time actions, not tasks: amend task 5242 to ζ's scope and add its dependency on
-η; add the parent's dated pointer (§13); wire §9's file-overlap dependencies; set the three
-`dated` milestones.
+η; the parent's dated pointer (§13) is already in. §9's file overlaps with tasks outside
+this batch are left to the orchestrator's file locks: an edge would hold either this work
+or unrelated work for no semantic reason.
 
 ## 11. Rollout
 
 Replaces parent §11. No step waits on a person.
 
 1. α, β, γ, η, ζ land. Defaults leave every project unstaged, so nothing calls a model.
-2. Γ sees the new code running. ε stages dark_factory with writes on.
+2. χ lands the checks. A day later Γ sees the new code running. ε stages dark_factory
+   with writes on.
 3. On the first staged cycle the service calibrates. Pass: it is live from the next cycle.
    Fail, after the pooled second run: it files one `blocking` record and stays off; φ
    fails and Leo hears. Inconclusive: it tries again, three times at most.
