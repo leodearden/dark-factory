@@ -68,6 +68,7 @@ def _run_meta_op(
     *,
     reached: Callable[[], bool],
     describe: str,
+    expected: str,
     timeout: float,
 ) -> None:
     """Send one collection meta-op; if its answer is abandoned on a read timeout, wait for *reached*.
@@ -90,10 +91,24 @@ def _run_meta_op(
             interval=0.05,
             message=(
                 f'{describe}: the client stopped waiting for the answer '
-                f'({type(exc.source).__name__}: {exc.source}), and it had not '
-                f'taken effect {timeout}s later'
+                f'({type(exc.source).__name__}: {exc.source}), and the '
+                f'collection was not {expected} {timeout}s later'
             ),
         )
+
+
+def _is_present_and_empty(client: Any, collection_name: str) -> bool:
+    """Whether *collection_name* exists and holds no points; a transient 404 on the count reads as not yet."""
+    from qdrant_client.http.exceptions import UnexpectedResponse
+
+    if not client.collection_exists(collection_name):
+        return False
+    try:
+        return client.count(collection_name, exact=True).count == 0
+    except UnexpectedResponse as exc:
+        if getattr(exc, 'status_code', None) != 404:
+            raise
+        return False
 
 
 def _create_collection(
@@ -103,8 +118,9 @@ def _create_collection(
         lambda: client.create_collection(
             collection_name=collection_name, vectors_config=vectors_config,
         ),
-        reached=lambda: client.collection_exists(collection_name),
+        reached=lambda: _is_present_and_empty(client, collection_name),
         describe=f'create of collection {collection_name!r}',
+        expected='present and empty',
         timeout=settle_timeout,
     )
 
@@ -114,6 +130,7 @@ def _delete_collection(client: Any, collection_name: str, *, settle_timeout: flo
         lambda: client.delete_collection(collection_name),
         reached=lambda: not client.collection_exists(collection_name),
         describe=f'delete of collection {collection_name!r}',
+        expected='absent',
         timeout=settle_timeout,
     )
 
@@ -137,8 +154,10 @@ def ensure_fresh_collection(
     ``UnexpectedResponse`` it deletes the stale collection and creates once more.
     Any other ``UnexpectedResponse`` (e.g. a genuine 500) is re-raised — fail
     loud, no retry. A create or delete whose answer the client abandons on a
-    read timeout is judged by whether the collection appears or disappears
-    within *settle_timeout*.
+    read timeout is judged by whether the collection appears empty, or
+    disappears, within *settle_timeout*. An abandoned create cannot tell its
+    own collection from a stale one whose 409 it never read, so one that
+    appears holding points fails rather than passing as fresh.
 
     Imports ``VectorParams``/``Distance``/``UnexpectedResponse`` lazily inside
     the body, mirroring ``_qdrant_available``'s convention (see its docstring):
@@ -147,7 +166,8 @@ def ensure_fresh_collection(
 
     Args:
         client: A ``qdrant_client.QdrantClient`` (or test double) exposing
-            ``collection_exists`` / ``delete_collection`` / ``create_collection``.
+            ``collection_exists`` / ``delete_collection`` / ``create_collection``
+            / ``count``.
         collection_name: The collection to (re)create.
         size: Vector dimensionality for the new collection.
         distance: Optional ``qdrant_client.models.Distance``; defaults to

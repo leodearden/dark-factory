@@ -173,7 +173,7 @@ class TestEnsureFreshCollection:
 
 
 class TestEnsureFreshCollectionOutlastsAnAbandonedCreate:
-    """A create the client stops waiting for is judged by whether the collection appears.
+    """A create the client stops waiting for is judged by whether the collection appears empty.
 
     Drives a real QdrantClient over a real socket: only a genuine read timeout
     produces the measured sequence, the client abandoning the answer while the
@@ -212,6 +212,26 @@ class TestEnsureFreshCollectionOutlastsAnAbandonedCreate:
             assert "'c'" in str(excinfo.value)
             assert 'create' in str(excinfo.value)
             assert server.creates('c') == 1
+
+    def test_a_late_conflict_against_a_surviving_collection_holding_points_fails_loud(self):
+        from _fm_qdrant_live import ensure_fresh_collection
+        from _stub_qdrant_server import stub_qdrant_server
+        from qdrant_client import QdrantClient
+
+        with stub_qdrant_server(
+            conflict_on_create=['c'], create_delay_s={'c': 3600}, point_counts={'c': 3},
+        ) as server:
+            client = QdrantClient(url=server.url, timeout=1)
+            try:
+                with pytest.raises(AssertionError) as excinfo:
+                    ensure_fresh_collection(client, 'c', size=8, settle_timeout=0.5)
+            finally:
+                client.close()
+
+            assert "'c'" in str(excinfo.value)
+            assert 'empty' in str(excinfo.value)
+            assert server.creates('c') == 1
+            assert server.deletes('c') == 0
 
     def test_a_create_that_never_reached_the_server_propagates_without_waiting_on_state(self):
         from _fm_qdrant_live import ensure_fresh_collection

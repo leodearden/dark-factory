@@ -13,7 +13,8 @@ lock, as a real Qdrant runs them.  The latency of a create, of a delete
 (``PUT /collections/{name}/points``) and of a point retrieve
 (``POST /collections/{name}/points``) is set per collection; the latency of a
 collection list (``GET /collections``), which names no collection, is one
-scalar.  Every latency is waited out on :attr:`StubQdrantServer.release_event`
+scalar.  A point count (``POST /collections/{name}/points/count``) answers at
+once, with a canned count per collection.  Every latency is waited out on :attr:`StubQdrantServer.release_event`
 rather than slept, so a test can end the wait early and no handler thread
 outlives the server.
 
@@ -56,6 +57,11 @@ def _already_exists(name: str) -> dict[str, Any]:
     return _error(f'Wrong input: Collection `{name}` already exists!')
 
 
+def _not_found(name: str) -> dict[str, Any]:
+    """Qdrant's 404 body for a request naming a collection that does not exist."""
+    return _error(f"Not found: Collection `{name}` doesn't exist!")
+
+
 class StubQdrantServer:
     """Handle yielded by :func:`stub_qdrant_server`."""
 
@@ -71,6 +77,7 @@ class StubQdrantServer:
         preexisting: Iterable[str],
         conflict_on_create: Iterable[str],
         create_status: Mapping[str, int],
+        point_counts: Mapping[str, int],
     ) -> None:
         self.url = ''
         self.release_event = threading.Event()
@@ -83,6 +90,7 @@ class StubQdrantServer:
         self._list_collections_delay_s = list_collections_delay_s
         self._conflict_on_create = frozenset(conflict_on_create)
         self._create_status = dict(create_status)
+        self._point_counts = dict(point_counts)
         self._state_lock = threading.Lock()
         self._meta_op_lock = threading.Lock()
         self._create_requests: Counter[str] = Counter()
@@ -195,6 +203,7 @@ class StubQdrantServer:
                 return 409, _already_exists(name)
             if name in self._conflict_on_create:
                 self._created_event(name).set()
+                self.release_event.wait(self._create_delay_s.get(name, 0.0))
                 return 409, _already_exists(name)
             if name in self._create_status:
                 return self._create_status[name], _error(f'stub rejected the create of `{name}`')
@@ -210,6 +219,11 @@ class StubQdrantServer:
             existed = self._exists(name)
             self._created_event(name).clear()
             return 200, _ok(existed)
+
+    def _count(self, name: str) -> tuple[int, dict[str, Any]]:
+        if not self._exists(name):
+            return 404, _not_found(name)
+        return 200, _ok({'count': self._point_counts.get(name, 0)})
 
     def _create_index(self, name: str) -> tuple[int, dict[str, Any]]:
         with self._state_lock:
@@ -252,6 +266,8 @@ class StubQdrantServer:
                 return self._upsert(name)
             case 'POST', ['collections', name, 'points']:
                 return self._retrieve(name)
+            case 'POST', ['collections', name, 'points', 'count']:
+                return self._count(name)
         return 404, _error(f'stub has no route for {method} {path}')
 
 
@@ -311,6 +327,7 @@ def stub_qdrant_server(
     preexisting: Iterable[str] = (),
     conflict_on_create: Iterable[str] = (),
     create_status: Mapping[str, int] | None = None,
+    point_counts: Mapping[str, int] | None = None,
 ) -> Iterator[StubQdrantServer]:
     """Serve the stub on an ephemeral port of loopback address *host*.
 
@@ -322,9 +339,11 @@ def stub_qdrant_server(
     *list_collections_delay_s* is how long every ``GET /collections`` takes.
     *preexisting* collections exist from the start.  A create of a collection
     in *conflict_on_create* answers 409 AND leaves it created, as when another
-    creator wins between an exists check and the create.  A create of a
+    creator wins between an exists check and the create; the collection is
+    present at once and the 409 follows its create delay.  A create of a
     collection in *create_status* answers that error status and leaves it
-    absent.
+    absent.  *point_counts* is what a point count of each named collection
+    answers while it exists (0 for one not named).
     """
     state = StubQdrantServer(
         create_delay_s=create_delay_s or {},
@@ -336,6 +355,7 @@ def stub_qdrant_server(
         preexisting=preexisting,
         conflict_on_create=conflict_on_create,
         create_status=create_status or {},
+        point_counts=point_counts or {},
     )
     httpd = _QuietServer((host, 0), _make_handler(state))
     bound_host, port = httpd.server_address[:2]
