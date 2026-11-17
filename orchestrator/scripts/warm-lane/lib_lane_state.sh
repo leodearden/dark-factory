@@ -26,7 +26,8 @@
 # WHY THE TWO HALVES USE DIFFERENT MECHANISMS
 # -------------------------------------------
 # The lane-state half is pure bash: NO jq, NO python3. It is called once per
-# lane from warm-lane-audit.sh, which runs from the disk-pressure paths and is
+# lane from warm-lane-audit.sh, which is meant to run unattended (its caller is
+# git_ops.py::_run_warm_lane_audit on the theta soft-floor defer path) and is
 # forbidden from ever aborting — a hard jq/python3 requirement there would be a
 # new environmental failure mode for an advisory-only read of flat top-level
 # string scalars.
