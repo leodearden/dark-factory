@@ -4,7 +4,31 @@ import pytest
 from _sdk_client_stubs import completion_client
 from openai import AsyncOpenAI
 
+from fused_memory.config.schema import RoutingConfig
 from fused_memory.routing.openai_client import LazyOpenAIClient
+
+
+class TestRoutingEndpointLeaves:
+    def test_both_leaves_default_to_inherit(self):
+        routing = RoutingConfig()
+
+        assert routing.openai_api_url is None
+        assert routing.openai_api_key is None
+
+    @pytest.mark.parametrize('blank', ['', '   '])
+    def test_a_blank_leaf_is_stored_as_inherit(self, blank):
+        routing = RoutingConfig(openai_api_url=blank, openai_api_key=blank)
+
+        assert routing.openai_api_url is None
+        assert routing.openai_api_key is None
+
+    def test_a_set_leaf_is_kept_verbatim(self):
+        routing = RoutingConfig(
+            openai_api_url='http://127.0.0.1:8317/v1', openai_api_key='sk-routing',
+        )
+
+        assert routing.openai_api_url == 'http://127.0.0.1:8317/v1'
+        assert routing.openai_api_key == 'sk-routing'
 
 
 class TestLazyOpenAIClient:
