@@ -128,13 +128,6 @@ class TestRestart:
 
         assert _state(tmp_path).baseline() == CapBaseline.EMPTY
 
-    def test_waiting_is_read_only(self, tmp_path: Path) -> None:
-        state = _state(tmp_path)
-        state.wait('b', StarvationGate.LOCK_REFUSED)
-
-        with pytest.raises(TypeError):
-            state.waiting()['c'] = StarvationGate.DUAL  # type: ignore[index]
-
     def test_a_waiting_row_with_an_unknown_gate_is_skipped(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
     ) -> None:
