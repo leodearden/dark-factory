@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import logging
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -35,7 +36,6 @@ import pytest_asyncio
 
 from fused_memory.models.reconciliation import (
     ReconciliationRun,
-    RunStatus,
     RunType,
     StageId,
     StageReport,
@@ -59,10 +59,17 @@ from fused_memory.reconciliation.preservation_specimen_guard import (
     filter_preservation_specimen_flags,
     flag_asserts_stranded,
     maybe_escalate_preservation_suppression_storm,
+    maybe_escalate_unresolved_corroboration,
     preservation_mem0_filters,
 )
 from fused_memory.reconciliation.stats_verifier import verify_and_rewrite_stats
 from fused_memory.services.write_journal import WriteJournal
+from reconciliation._preservation_specimen_history import (
+    STAGE1_KEY,
+    observation_report,
+    stage1_pass,
+    unresolved_passes,
+)
 
 # ── Live corroboration strings, copied verbatim from the base branch ─────────
 # Re-verify at any time:
@@ -454,8 +461,8 @@ GUARD_LOGGER = 'fused_memory.reconciliation.preservation_specimen_guard'
 
 
 @contextlib.contextmanager
-def caplog_at_warning():
-    """Yield a growing list of the guard's WARNING+ messages.
+def caplog_at(level):
+    """Yield a growing list of the guard's messages at *level* and above.
 
     A local handler rather than pytest's ``caplog`` fixture: these tests run
     under xdist and assert on one named logger, so attaching to that logger
@@ -468,16 +475,19 @@ def caplog_at_warning():
             # getMessage() already interpolates record.args.
             records.append(record.getMessage())
 
-    handler = _Collect(level=logging.WARNING)
+    handler = _Collect(level=level)
     log = logging.getLogger(GUARD_LOGGER)
     log.addHandler(handler)
     previous = log.level
-    log.setLevel(logging.WARNING)
+    log.setLevel(level)
     try:
         yield records
     finally:
         log.removeHandler(handler)
         log.setLevel(previous)
+
+
+caplog_at_warning = functools.partial(caplog_at, logging.WARNING)
 
 
 def _stranded_flag(
@@ -1530,9 +1540,6 @@ def _unresolved_result(*unresolved, candidates=()):
     )
 
 
-_STAGE_KEY = StageId.memory_consolidator.value
-
-
 class _StubJournal:
     """The one journal read the guard makes, answered from a fixed list.
 
@@ -1552,46 +1559,8 @@ class _StubJournal:
         return self._runs[:limit]
 
 
-def _prior_run(
-    run_id,
-    *,
-    minutes_ago,
-    candidates=(),
-    unresolved=(),
-    stats=None,
-    stage_reports: dict[str, StageReport | dict] | None = None,
-    run_type=RunType.full,
-):
-    """A REAL past ReconciliationRun whose Stage-1 report records one observation.
-
-    The observed candidates are *candidates* plus *unresolved*, so naming only
-    the unresolved tasks builds a well-formed pass.  *stats* replaces the
-    observation outright (a pre-change or malformed row); *stage_reports*
-    replaces the whole report map (a run that built no Stage-1 report).
-    """
-    at = datetime.now(UTC) - timedelta(minutes=minutes_ago)
-    if stats is None:
-        stats = {
-            CANDIDATE_TASK_IDS_STAT: sorted(set(candidates) | set(unresolved)),
-            UNRESOLVED_TASK_IDS_STAT: list(unresolved),
-        }
-    if stage_reports is None:
-        stage_reports = {
-            _STAGE_KEY: StageReport(
-                stage=StageId.memory_consolidator, started_at=at, completed_at=at,
-                stats=stats,
-            ),
-        }
-    return ReconciliationRun(
-        id=run_id,
-        project_id=PROJECT,
-        run_type=run_type,
-        trigger_reason='test',
-        started_at=at,
-        completed_at=at,
-        stage_reports=stage_reports,
-        status=RunStatus.completed,
-    )
+_prior_run = functools.partial(stage1_pass, project_id=PROJECT)
+_unresolved_passes = functools.partial(unresolved_passes, project_id=PROJECT)
 
 
 def _targeted_runs(count, *, prefix, minutes_ago):
@@ -1602,14 +1571,6 @@ def _targeted_runs(count, *, prefix, minutes_ago):
             run_type=RunType.targeted,
         )
         for n in range(count)
-    ]
-
-
-def _unresolved_passes(*task_ids, count, start=1):
-    """*count* prior passes, most-recent-first, each leaving *task_ids* unresolved."""
-    return [
-        _prior_run(f'prior-{n}', unresolved=task_ids, minutes_ago=10 * n)
-        for n in range(start, start + count)
     ]
 
 
@@ -1768,7 +1729,6 @@ class TestMaybeEscalatePreservationSuppressionStorm:
         """One active citation hiding a flood in one cycle is worth a human look."""
         escalated = await maybe_escalate_preservation_suppression_storm(
             queue, PROJECT, self._RUN, _suppression_result(),
-            journal=_StubJournal(), stage_key=_STAGE_KEY,
         )
         assert escalated == ['3105']
 
@@ -1793,7 +1753,6 @@ class TestMaybeEscalatePreservationSuppressionStorm:
         escalated = await maybe_escalate_preservation_suppression_storm(
             queue, PROJECT, self._RUN,
             _suppression_result(PRESERVATION_SUPPRESSION_STORM_THRESHOLD_PER_CYCLE),
-            journal=_StubJournal(), stage_key=_STAGE_KEY,
         )
         assert escalated == []
         assert self._pending(queue, '3105') == []
@@ -1803,7 +1762,6 @@ class TestMaybeEscalatePreservationSuppressionStorm:
         """The normal case — one specimen, one suppressed flag — is silent."""
         escalated = await maybe_escalate_preservation_suppression_storm(
             queue, PROJECT, self._RUN, _suppression_result(1),
-            journal=_StubJournal(), stage_key=_STAGE_KEY,
         )
         assert escalated == []
         assert self._pending(queue, '3105') == []
@@ -1817,11 +1775,9 @@ class TestMaybeEscalatePreservationSuppressionStorm:
         """
         await maybe_escalate_preservation_suppression_storm(
             queue, PROJECT, self._RUN, _suppression_result(),
-            journal=_StubJournal(), stage_key=_STAGE_KEY,
         )
         escalated = await maybe_escalate_preservation_suppression_storm(
             queue, PROJECT, 'run-4223-2', _suppression_result(count=99),
-            journal=_StubJournal(), stage_key=_STAGE_KEY,
         )
 
         assert escalated == []
@@ -1839,7 +1795,6 @@ class TestMaybeEscalatePreservationSuppressionStorm:
             _suppression_result(
                 extra={'4102': PRESERVATION_SUPPRESSION_STORM_THRESHOLD_PER_CYCLE + 3},
             ),
-            journal=_StubJournal(), stage_key=_STAGE_KEY,
         )
 
         assert sorted(escalated) == ['3105', '4102']
@@ -1855,11 +1810,11 @@ class TestMaybeEscalatePreservationSuppressionStorm:
         recommendation flows on, the stat reads 0 suppressed, and nothing
         distinguishes that from a healthy quiet cycle.
         """
-        escalated = await maybe_escalate_preservation_suppression_storm(
+        escalated = await maybe_escalate_unresolved_corroboration(
             queue, PROJECT, self._RUN,
             _suppression_result(1, unresolved=('3105', '4102')),
             journal=_StubJournal(_history_reaching_threshold('3105', '4102')),
-            stage_key=_STAGE_KEY,
+            stage_key=STAGE1_KEY,
         )
 
         assert escalated == [UNRESOLVED_CORROBORATION_SUBJECT]
@@ -1876,13 +1831,19 @@ class TestMaybeEscalatePreservationSuppressionStorm:
     @pytest.mark.asyncio
     async def test_unresolved_report_is_distinct_from_a_storm(self, queue):
         """Both can fire in one cycle, and they must not fold into each other."""
-        escalated = await maybe_escalate_preservation_suppression_storm(
-            queue, PROJECT, self._RUN, _suppression_result(unresolved=('4102',)),
+        result = _suppression_result(unresolved=('4102',))
+
+        storms = await maybe_escalate_preservation_suppression_storm(
+            queue, PROJECT, self._RUN, result,
+        )
+        unresolved_reports = await maybe_escalate_unresolved_corroboration(
+            queue, PROJECT, self._RUN, result,
             journal=_StubJournal(_history_reaching_threshold('4102')),
-            stage_key=_STAGE_KEY,
+            stage_key=STAGE1_KEY,
         )
 
-        assert sorted(escalated) == sorted(['3105', UNRESOLVED_CORROBORATION_SUBJECT])
+        assert storms == ['3105']
+        assert unresolved_reports == [UNRESOLVED_CORROBORATION_SUBJECT]
         storm = self._pending(queue, '3105')[0]
         unresolved = self._pending(queue, UNRESOLVED_CORROBORATION_SUBJECT)[0]
         assert storm.dedupe_fingerprint != unresolved.dedupe_fingerprint
@@ -1890,23 +1851,35 @@ class TestMaybeEscalatePreservationSuppressionStorm:
     @pytest.mark.asyncio
     async def test_clean_cycle_files_nothing(self, queue):
         """No storm, no unresolved reads — no record."""
-        escalated = await maybe_escalate_preservation_suppression_storm(
-            queue, PROJECT, self._RUN,
-            PreservationSuppressionResult([], {}, {}, (), ()),
-            journal=_StubJournal(), stage_key=_STAGE_KEY,
+        clean = PreservationSuppressionResult([], {}, {}, (), ())
+
+        storms = await maybe_escalate_preservation_suppression_storm(
+            queue, PROJECT, self._RUN, clean,
         )
-        assert escalated == []
+        unresolved_reports = await maybe_escalate_unresolved_corroboration(
+            queue, PROJECT, self._RUN, clean, journal=_StubJournal(), stage_key=STAGE1_KEY,
+        )
+
+        assert storms == [] and unresolved_reports == []
+        assert queue.get_pending() == []
 
     @pytest.mark.asyncio
     async def test_escalation_package_unavailable_returns_empty(self, queue, monkeypatch):
         """The reconciliation package must import where escalation is not installed."""
         monkeypatch.setattr(preservation_specimen_guard, 'file_or_fold_l1', None)
-        escalated = await maybe_escalate_preservation_suppression_storm(
-            queue, PROJECT, self._RUN, _suppression_result(),
-            journal=_StubJournal(), stage_key=_STAGE_KEY,
+        result = _suppression_result(unresolved=('4102',))
+        journal = _StubJournal(_history_reaching_threshold('4102'))
+
+        storms = await maybe_escalate_preservation_suppression_storm(
+            queue, PROJECT, self._RUN, result,
         )
-        assert escalated == []
-        assert self._pending(queue, '3105') == []
+        unresolved_reports = await maybe_escalate_unresolved_corroboration(
+            queue, PROJECT, self._RUN, result, journal=journal, stage_key=STAGE1_KEY,
+        )
+
+        assert storms == [] and unresolved_reports == []
+        assert queue.get_pending() == []
+        assert journal.calls == []
 
     @pytest.mark.asyncio
     async def test_submit_failure_costs_one_subject_not_the_cycle(self, tmp_path):
@@ -1921,7 +1894,6 @@ class TestMaybeEscalatePreservationSuppressionStorm:
         with caplog_at_warning() as records:
             escalated = await maybe_escalate_preservation_suppression_storm(
                 queue, PROJECT, self._RUN, _suppression_result(),
-                journal=_StubJournal(), stage_key=_STAGE_KEY,
             )
 
         assert escalated == []
@@ -1963,7 +1935,6 @@ class TestMaybeEscalatePreservationSuppressionStorm:
 
         escalated = await maybe_escalate_preservation_suppression_storm(
             queue, PROJECT, self._RUN, _suppression_result(),
-            journal=_StubJournal(), stage_key=_STAGE_KEY,
         )
 
         assert escalated == []
@@ -1980,10 +1951,10 @@ class TestMaybeEscalatePreservationSuppressionStorm:
             'preservation_specimen_corroboration_unreadable',
         )
 
-        escalated = await maybe_escalate_preservation_suppression_storm(
+        escalated = await maybe_escalate_unresolved_corroboration(
             queue, PROJECT, self._RUN, _suppression_result(1, unresolved=('3105',)),
             journal=_StubJournal(_history_reaching_threshold('3105')),
-            stage_key=_STAGE_KEY,
+            stage_key=STAGE1_KEY,
         )
 
         assert escalated == []
@@ -2015,15 +1986,15 @@ class TestUnresolvedCorroborationPersistence:
         return queue.get_by_task(UNRESOLVED_CORROBORATION_SUBJECT, status='pending', level=1)
 
     async def _escalate(self, queue, result, journal, *, run_id=None, **kwargs):
-        return await maybe_escalate_preservation_suppression_storm(
+        return await maybe_escalate_unresolved_corroboration(
             queue, PROJECT, run_id or self._RUN, result,
-            journal=journal, stage_key=_STAGE_KEY, **kwargs,
+            journal=journal, stage_key=STAGE1_KEY, **kwargs,
         )
 
     @pytest.mark.asyncio
-    async def test_a_single_unresolved_pass_files_nothing(self, queue, caplog):
+    async def test_a_single_unresolved_pass_files_nothing(self, queue):
         """The regression: one blip used to leave a pending L1 nobody resolved."""
-        with caplog.at_level(logging.INFO, logger=GUARD_LOGGER):
+        with caplog_at(logging.INFO) as records:
             escalated = await self._escalate(
                 queue, _unresolved_result('3105'), _StubJournal(),
             )
@@ -2031,9 +2002,7 @@ class TestUnresolvedCorroborationPersistence:
         assert escalated == []
         assert self._pending(queue) == []
         # Below the threshold is quiet in the queue, never in the log.
-        assert any(
-            r.levelno == logging.INFO and '3105' in r.getMessage() for r in caplog.records
-        )
+        assert any('3105' in message and 'not escalated' in message for message in records)
 
     @pytest.mark.asyncio
     async def test_a_task_unresolved_on_k_consecutive_passes_files(self, queue):
@@ -2087,7 +2056,7 @@ class TestUnresolvedCorroborationPersistence:
                 minutes_ago=40,
             ),
             _prior_run(
-                'malformed-report', stage_reports={_STAGE_KEY: {'error': 'cli crashed'}},
+                'malformed-report', stage_reports={STAGE1_KEY: {'error': 'cli crashed'}},
                 minutes_ago=50,
             ),
             *_unresolved_passes('3105', count=self._K - 2, start=6),
@@ -2123,11 +2092,7 @@ class TestUnresolvedCorroborationPersistence:
 
     @pytest.mark.asyncio
     async def test_a_streak_survives_bursts_of_targeted_runs_between_its_passes(self, queue):
-        """The history window counts runs of every type, and most are targeted.
-
-        13 targeted runs between passes is twice the live dark_factory mean
-        (731 targeted to 112 full runs, 14 days to 2026-10-12).
-        """
+        """The history window counts runs of every type, and most are targeted."""
         history: list[ReconciliationRun] = []
         for n in range(1, self._K):
             history += _targeted_runs(13, prefix=f'gap-{n}', minutes_ago=10 * n - 5)
@@ -2233,19 +2198,15 @@ class TestUnresolvedCorroborationPersistence:
         assert self._pending(queue) == []
 
     @pytest.mark.asyncio
-    async def test_a_journal_failure_files_no_unresolved_record_but_the_storm_still_files(
-        self, queue,
-    ):
+    async def test_a_journal_failure_files_nothing_and_warns(self, queue):
+        """Missing history can only under-count a streak, never fabricate one."""
         journal = _StubJournal(error=RuntimeError('journal locked'))
 
         with caplog_at_warning() as records:
-            escalated = await self._escalate(
-                queue, _suppression_result(unresolved=('4102',)), journal,
-            )
+            escalated = await self._escalate(queue, _unresolved_result('4102'), journal)
 
-        assert escalated == ['3105']
-        assert self._pending(queue) == []
-        assert len(queue.get_by_task('3105', status='pending', level=1)) == 1
+        assert escalated == []
+        assert queue.get_pending() == []
         assert any(PROJECT in message for message in records)
 
     @pytest.mark.asyncio
@@ -2254,7 +2215,7 @@ class TestUnresolvedCorroborationPersistence:
 
         escalated = await self._escalate(queue, _suppression_result(), journal)
 
-        assert escalated == ['3105']
+        assert escalated == []
         assert journal.calls == []
 
     @pytest.mark.asyncio
@@ -2315,12 +2276,10 @@ class TestObservationSurvivesTheRealJournal:
             trigger_reason='test', started_at=at,
         ))
         stage_reports: dict[str, StageReport | dict] = {
-            _STAGE_KEY: StageReport(
-                stage=StageId.memory_consolidator, started_at=at, completed_at=at,
-                stats={
-                    CANDIDATE_TASK_IDS_STAT: list(result.candidate_task_ids),
-                    UNRESOLVED_TASK_IDS_STAT: list(result.unresolved_task_ids),
-                },
+            STAGE1_KEY: observation_report(
+                at=at,
+                candidates=result.candidate_task_ids,
+                unresolved=result.unresolved_task_ids,
             ),
         }
         await verify_and_rewrite_stats(run_id, stage_reports, write_journal)
@@ -2343,8 +2302,8 @@ class TestObservationSurvivesTheRealJournal:
             trigger_reason='test', started_at=datetime.now(UTC),
         ))
 
-        escalated = await maybe_escalate_preservation_suppression_storm(
-            queue, PROJECT, 'current', stranded, journal=journal, stage_key=_STAGE_KEY,
+        escalated = await maybe_escalate_unresolved_corroboration(
+            queue, PROJECT, 'current', stranded, journal=journal, stage_key=STAGE1_KEY,
         )
 
         assert escalated == [UNRESOLVED_CORROBORATION_SUBJECT]

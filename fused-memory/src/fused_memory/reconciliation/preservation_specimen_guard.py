@@ -112,7 +112,7 @@ if TYPE_CHECKING:
 
 # Optional escalation dependency: the reconciliation package must import
 # cleanly where the escalation package is not installed, and
-# ``maybe_escalate_preservation_suppression_storm`` no-ops when the name is None.
+# both ``maybe_escalate_*`` disclosures no-op when the name is None.
 try:
     from escalation.dedupe import file_or_fold_l1  # type: ignore[import-untyped]
 except ImportError:
@@ -141,6 +141,7 @@ __all__ = [
     'filter_preservation_specimen_flags',
     'flag_asserts_stranded',
     'maybe_escalate_preservation_suppression_storm',
+    'maybe_escalate_unresolved_corroboration',
     'preservation_mem0_filters',
 ]
 
@@ -309,10 +310,9 @@ CANDIDATE_TASK_IDS_STAT: str = 'preservation_specimen_candidate_task_ids'
 UNRESOLVED_TASK_IDS_STAT: str = 'preservation_specimen_unresolved_task_ids'
 
 #: Past runs the persistence check reads per pass of the streak threshold.  The
-#: window counts runs of every type, and most carry no Stage-1 report: the live
-#: dark_factory journal held 7.5 runs per full cycle over the 14 days to
-#: 2026-10-12 (112 full, 731 targeted).  Twice that, so a burst of targeted runs
-#: does not crowd a streak's earlier passes out of the window.
+#: window counts runs of every type, and most are targeted runs that carry no
+#: Stage-1 report, so it is sized at about twice the observed targeted-to-full
+#: ratio: a burst of targeted runs must not crowd a streak's earlier passes out.
 _HISTORY_RUNS_PER_STREAK_PASS: int = 15
 
 #: Finding-category components of the two records' dedupe fingerprints — the
@@ -323,7 +323,8 @@ _STORM_FINDING_CATEGORY: str = 'preservation_specimen_suppression_storm'
 _UNRESOLVED_FINDING_CATEGORY: str = 'preservation_specimen_corroboration_unreadable'
 
 _AGENT_ROLE: str = 'reconciliation-stage1'
-_LOG_LABEL: str = 'maybe_escalate_preservation_suppression_storm'
+_STORM_LOG_LABEL: str = 'maybe_escalate_preservation_suppression_storm'
+_UNRESOLVED_LOG_LABEL: str = 'maybe_escalate_unresolved_corroboration'
 
 
 # ── Pure helpers ─────────────────────────────────────────────────────────────
@@ -1114,7 +1115,17 @@ def _unresolved_streaks(
     return streaks
 
 
-# ── Storm escape (INV-4) ─────────────────────────────────────────────────────
+# ── Disclosures (INV-4) ──────────────────────────────────────────────────────
+#
+# Two L1 records keep this guard audible, each filed by its own entry point.
+# Both file or fold through ``escalation/dedupe.py::file_or_fold_l1``, NOT gated
+# on ``has_open_l1`` (task 3522): Stage 1 re-evaluates every cycle, so a
+# condition that fires once tends to fire every cycle, and folding keeps ONE
+# pending record per subject whose ``dedupe_count`` carries the recurrence.  A
+# folded record keeps the PARENT's summary, so the figures named there are the
+# FIRST breach's.  Both are best-effort: they return ``[]`` when the
+# ``escalation`` package is unavailable, log a failed submit on *log* and
+# exclude it, and return the subjects that received a NEW record this pass.
 
 
 async def maybe_escalate_preservation_suppression_storm(
@@ -1123,64 +1134,19 @@ async def maybe_escalate_preservation_suppression_storm(
     run_id: str,
     result: PreservationSuppressionResult,
     *,
-    journal: RunHistory,
-    stage_key: str,
     threshold: int = PRESERVATION_SUPPRESSION_STORM_THRESHOLD_PER_CYCLE,
-    streak_threshold: int = UNRESOLVED_CORROBORATION_STREAK_THRESHOLD,
     log: logging.Logger = logger,
 ) -> list[str]:
-    """File (or fold) the two L1 records that keep this guard audible (INV-4).
+    """File or fold one storm record per task suppressed more than *threshold* times this pass.
 
-    1. **Suppression storm** — one record per task whose per-cycle suppression
-       count exceeds *threshold* (strict ``>``), naming the count and the
-       citation the drops leaned on.  A citation hiding a flood of findings in
-       one cycle is a signal it is over-broad or stale, and the guard's whole
-       job is dropping findings, so this is the escape that stops it doing so
-       unaccountably.
-    2. **Unresolved corroboration** — one record once some task has been left
-       uncorroborated on at least *streak_threshold* consecutive Stage-1 passes
-       that flagged it, measured from *journal*'s past *stage_key* reports.
-       The guard fails OPEN, so a subsystem whose reads keep failing otherwise
-       degrades in total silence: every stranded recommendation flows on, the
-       suppressed stat reads 0, and nothing distinguishes that from a healthy
-       quiet cycle.  A single unresolved pass is disclosed by the per-pass
-       stats and the log, not here.
-
-    Each is filed or folded through ``escalation/dedupe.py::file_or_fold_l1``,
-    NOT gated on ``has_open_l1`` (task 3522): Stage 1 re-evaluates every cycle,
-    so a condition that fires once tends to fire every cycle, and folding keeps
-    ONE pending record per subject whose ``dedupe_count`` carries the
-    recurrence.  A folded record keeps the PARENT's summary, so the count named
-    there is the FIRST breach's.
-
-    Best-effort throughout: returns ``[]`` immediately when the ``escalation``
-    package is unavailable, and any per-subject failure is logged on *log* and
-    excluded.  Returns the subjects that received a NEW record this cycle.
+    Strict ``>``; the record names the count and the citation the drops leaned
+    on.  A citation hiding a flood of findings in one pass is a signal it is
+    over-broad or stale, and the guard's whole job is dropping findings, so
+    this is the escape that stops it doing so unaccountably.
     """
     file_l1 = file_or_fold_l1
     if file_l1 is None:
         return []
-    storms = _file_storm_records(
-        file_l1, escalation_queue, project_id, run_id, result, threshold=threshold, log=log,
-    )
-    unresolved = await _file_unresolved_record(
-        file_l1, escalation_queue, project_id, run_id, result,
-        journal=journal, stage_key=stage_key, streak_threshold=streak_threshold, log=log,
-    )
-    return storms + unresolved
-
-
-def _file_storm_records(
-    file_l1: Callable[..., bool],
-    escalation_queue: Any,
-    project_id: str,
-    run_id: str,
-    result: PreservationSuppressionResult,
-    *,
-    threshold: int,
-    log: logging.Logger,
-) -> list[str]:
-    """File or fold one storm record per task suppressed more than *threshold* times."""
     escalated: list[str] = []
     for task_id, count in result.suppressed_by_task.items():
         if count <= threshold:
@@ -1206,15 +1172,14 @@ def _file_storm_records(
                 f'threshold: {threshold}',
             ]),
             log=log,
-            log_label=_LOG_LABEL,
+            log_label=_STORM_LOG_LABEL,
         )
         if filed:
             escalated.append(task_id)
     return escalated
 
 
-async def _file_unresolved_record(
-    file_l1: Callable[..., bool],
+async def maybe_escalate_unresolved_corroboration(
     escalation_queue: Any,
     project_id: str,
     run_id: str,
@@ -1222,38 +1187,28 @@ async def _file_unresolved_record(
     *,
     journal: RunHistory,
     stage_key: str,
-    streak_threshold: int,
-    log: logging.Logger,
+    streak_threshold: int = UNRESOLVED_CORROBORATION_STREAK_THRESHOLD,
+    log: logging.Logger = logger,
 ) -> list[str]:
-    """File or fold the unresolved-corroboration record once some task's blindness persists.
+    """File or fold one record once some task's corroboration has stayed unresolved.
 
-    Reads no history at all when this pass left nothing unresolved, and logs a
-    WARNING when a full history window holds too few Stage-1 passes to measure
-    a streak, rather than letting that blindness read as a short streak.
+    "Stayed" means on at least *streak_threshold* consecutive Stage-1 passes
+    that flagged the task, this one included, measured from *journal*'s past
+    *stage_key* reports.  The guard fails OPEN, so a subsystem whose reads keep
+    failing otherwise degrades in total silence: every stranded recommendation
+    flows on, the suppressed stat reads 0, and nothing distinguishes that from
+    a healthy quiet pass.  A shorter streak is disclosed by the per-pass stats
+    and the log, not here.  The journal is read only when this pass left some
+    task unresolved.
     """
-    if not result.unresolved_task_ids:
+    file_l1 = file_or_fold_l1
+    if file_l1 is None or not result.unresolved_task_ids:
         return []
-    window = _HISTORY_RUNS_PER_STREAK_PASS * streak_threshold
-    prior = await _prior_observations(
-        journal, project_id, run_id, stage_key, limit=window, log=log,
+    persistent = await _persistent_unresolved(
+        journal, project_id, run_id, stage_key, result.unresolved_task_ids,
+        streak_threshold=streak_threshold, log=log,
     )
-    observed_passes = sum(observation is not None for observation in prior)
-    if len(prior) >= window and observed_passes < streak_threshold - 1:
-        log.warning(
-            'preservation_specimen_guard: the last %d run(s) in project %s hold %d '
-            'Stage-1 observation(s), fewer than the %d a %d-pass streak needs — '
-            'unresolved-corroboration persistence is not measurable this pass (run %s)',
-            window, project_id, observed_passes, streak_threshold - 1,
-            streak_threshold, run_id,
-        )
-    streaks = _unresolved_streaks(result.unresolved_task_ids, prior)
-    persistent = {task_id: n for task_id, n in streaks.items() if n >= streak_threshold}
     if not persistent:
-        log.info(
-            'preservation_specimen_guard: corroboration unresolved in project %s '
-            '(run %s) with streaks %s, below the %d-pass threshold — not escalated',
-            project_id, run_id, streaks, streak_threshold,
-        )
         return []
     filed = file_l1(
         escalation_queue,
@@ -1282,6 +1237,46 @@ async def _file_unresolved_record(
             'failing channel or an exhausted per-cycle corroboration budget.',
         ]),
         log=log,
-        log_label=_LOG_LABEL,
+        log_label=_UNRESOLVED_LOG_LABEL,
     )
     return [UNRESOLVED_CORROBORATION_SUBJECT] if filed else []
+
+
+async def _persistent_unresolved(
+    journal: RunHistory,
+    project_id: str,
+    run_id: str,
+    stage_key: str,
+    unresolved: Sequence[str],
+    *,
+    streak_threshold: int,
+    log: logging.Logger,
+) -> dict[str, int]:
+    """``{task_id: streak}`` for each task in *unresolved* whose streak reaches *streak_threshold*.
+
+    Logs a WARNING when a full history window holds too few Stage-1 passes to
+    measure a streak, rather than letting that blindness read as a short
+    streak, and an INFO line when no streak reaches the threshold.
+    """
+    window = _HISTORY_RUNS_PER_STREAK_PASS * streak_threshold
+    prior = await _prior_observations(
+        journal, project_id, run_id, stage_key, limit=window, log=log,
+    )
+    observed_passes = sum(observation is not None for observation in prior)
+    if len(prior) >= window and observed_passes < streak_threshold - 1:
+        log.warning(
+            'preservation_specimen_guard: the last %d run(s) in project %s hold %d '
+            'Stage-1 observation(s), fewer than the %d a %d-pass streak needs — '
+            'unresolved-corroboration persistence is not measurable this pass (run %s)',
+            window, project_id, observed_passes, streak_threshold - 1,
+            streak_threshold, run_id,
+        )
+    streaks = _unresolved_streaks(unresolved, prior)
+    persistent = {task_id: n for task_id, n in streaks.items() if n >= streak_threshold}
+    if not persistent:
+        log.info(
+            'preservation_specimen_guard: corroboration unresolved in project %s '
+            '(run %s) with streaks %s, below the %d-pass threshold — not escalated',
+            project_id, run_id, streaks, streak_threshold,
+        )
+    return persistent

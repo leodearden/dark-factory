@@ -27,6 +27,7 @@ from _fused_memory_tool_surface import (
     registered_fused_memory_tools,
 )
 from _tool_surface_classification import assert_tool_surface_classified
+from reconciliation._preservation_specimen_history import unresolved_passes
 from reconciliation.harness_fixtures import make_harness
 from shared.cli_invoke import AgentResult, AllAccountsCappedException
 from shared.task_claimant import DEFAULT_CLAIMANT_HEARTBEAT_TTL
@@ -37,9 +38,6 @@ from fused_memory.models.reconciliation import (
     EventSource,
     EventType,
     ReconciliationEvent,
-    ReconciliationRun,
-    RunStatus,
-    RunType,
     StageId,
     StageReport,
     Watermark,
@@ -18958,24 +18956,6 @@ class TestMemoryConsolidatorPreservationSpecimenGuard:
         stage.memory.get_entity = AsyncMock(side_effect=RuntimeError('also down'))
 
     @staticmethod
-    def _prior_unresolved_runs(task_id, count):
-        """*count* past runs, most-recent-first, whose Stage-1 pass left *task_id* unresolved."""
-        runs = []
-        for n in range(1, count + 1):
-            at = datetime.now(UTC) - timedelta(minutes=10 * n)
-            report = StageReport(
-                stage=StageId.memory_consolidator, started_at=at, completed_at=at,
-                stats={CANDIDATE_TASK_IDS_STAT: [task_id], UNRESOLVED_TASK_IDS_STAT: [task_id]},
-            )
-            runs.append(ReconciliationRun(
-                id=f'r-prior-{n}', project_id='p', run_type=RunType.full,
-                trigger_reason='test', started_at=at, completed_at=at,
-                stage_reports={StageId.memory_consolidator.value: report},
-                status=RunStatus.completed,
-            ))
-        return runs
-
-    @staticmethod
     def _pending_unresolved(queue):
         return queue.get_by_task(UNRESOLVED_CORROBORATION_SUBJECT, status='pending', level=1)
 
@@ -19009,8 +18989,8 @@ class TestMemoryConsolidatorPreservationSpecimenGuard:
         queue = self._wire_queue(stage, tmp_path)
         stage.remediation_findings = [{'description': 'fix me'}]
         stage.journal.get_recent_runs = AsyncMock(
-            return_value=self._prior_unresolved_runs(
-                '3105', UNRESOLVED_CORROBORATION_STREAK_THRESHOLD - 1,
+            return_value=unresolved_passes(
+                '3105', project_id='p', count=UNRESOLVED_CORROBORATION_STREAK_THRESHOLD - 1,
             ),
         )
         base_report = self._make_base_report([self._stranded_flag()])
