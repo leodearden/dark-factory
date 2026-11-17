@@ -3,8 +3,9 @@
 The harness runs a ``DispatchScope.MAIN_HEALTH_FIX`` tick when only the
 main-health-fix run slot is free.  Such a tick must return the fix even when
 plainer work outranks it, must not take a lock for, skip-bump or pin-dispatch a
-task the reserve cannot run, and must say in its ``scheduler_tick`` event which
-scope it ran under.
+task the reserve cannot run, must leave the pin reservations of the general
+pool's pins in place, and must say in its ``scheduler_tick`` event which scope
+it ran under.
 """
 
 from __future__ import annotations
@@ -67,6 +68,21 @@ async def test_a_pinned_plain_task_does_not_dispatch_on_a_restricted_tick(tmp_pa
 
     assert await w.scheduler.acquire_next(DispatchScope.MAIN_HEALTH_FIX) is None
     assert not w.scheduler.lock_table.is_held('P')
+
+
+@pytest.mark.asyncio
+async def test_a_restricted_tick_that_dispatches_a_fix_keeps_a_blocked_pin_s_reservation(tmp_path):
+    holder = make_task('H', 'low', ['p.py'], status='in-progress')
+    w = _world(tmp_path, [PLAIN, holder], pinned=('P',))
+    assert w.scheduler.lock_table.try_acquire('H', ['p.py'])
+    assert await w.scheduler.acquire_next() is None
+    assert list(w.scheduler.get_state_snapshot().pin_reservations) == ['P'], 'premise: P reserves'
+    w.scheduler.get_tasks = AsyncMock(return_value=[PLAIN, holder, FIX])
+
+    result = await w.scheduler.acquire_next(DispatchScope.MAIN_HEALTH_FIX)
+
+    assert result is not None and result.task_id == 'F'
+    assert list(w.scheduler.get_state_snapshot().pin_reservations) == ['P']
 
 
 @pytest.mark.asyncio
