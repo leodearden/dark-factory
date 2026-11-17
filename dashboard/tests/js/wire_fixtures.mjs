@@ -282,8 +282,14 @@ export function schedulerLockRow({ project, taskId, lockSet }) {
 
 // One SCHEDULER.modules entry: who holds `path` in `project`, and who has it
 // parked. Every lock field is null unless given, which reads as a free module.
-export function schedulerModule({ project, path, holder = null, holderProject = null, parkedBy = null, parkedOwnerLive = null }) {
-  return { project, path, holder, holder_project: holderProject, parked_by: parkedBy, parked_owner_live: parkedOwnerLive };
+export function schedulerModule({
+  project, path, holder = null, holderProject = null, holders = holder ? [holder] : [],
+  atHolderLimit = Boolean(holder), parkedBy = null, parkedOwnerLive = null,
+}) {
+  return {
+    project, path, holder, holder_project: holderProject, holders, at_holder_limit: atHolderLimit,
+    parked_by: parkedBy, parked_owner_live: parkedOwnerLive,
+  };
 }
 
 // One ORCHESTRATORS row, as /orchestrators serves it.

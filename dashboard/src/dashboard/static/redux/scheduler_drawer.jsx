@@ -1,24 +1,24 @@
 /* scheduler_drawer.jsx — slide-in override drawer for a selected task.
-   Behavioral invariants (no JS test runner; verified manually per task spec).
+   Rendered in jsdom by dashboard/tests/js/jsx_render.test.mjs.
 
    Exports: window.DF_SCHED_DRAWER = { SchedulerDrawer }
 */
 const { useState: sdUseState, useCallback: sdUseCallback, useRef: sdUseRef, useEffect: sdUseEffect } = React;
 const { timeago, fmtDateTime } = window.DF_SHELL;
 // Shared helpers loaded by scheduler_utils.jsx (must come before this script).
-const { fmtAge, totalEvents, avgWaitSeconds, labelFor } = window.DF_SCHED_UTILS;
+const { fmtAge, totalEvents, avgWaitSeconds, labelFor, lockHeldAgainst, holdersLabel } = window.DF_SCHED_UTILS;
 
 // Derive which modules are currently blocking this task.
-// A module blocks this task when: it is in the task's lock_set AND it has a
-// holder.  Modules are project-scoped — a same-named path in another project
-// is unrelated, so we filter to entries whose project matches the task's.
+// A module blocks this task when it is in the task's lock_set AND its holders
+// fill its holder limit without this task among them.  Modules are
+// project-scoped — a same-named path in another project is unrelated, so we
+// filter to entries whose project matches the task's.
 function blockingModules(task, modules) {
   const lockSet = new Set(task.lock_set || []);
   return (modules || []).filter(m =>
     (!m.project || !task.project || m.project === task.project) &&
     lockSet.has(m.path) &&
-    m.holder &&
-    m.holder !== task.task_id
+    lockHeldAgainst(m, task.task_id, task.project)
   );
 }
 
@@ -28,7 +28,7 @@ function HolderEtas({ task, modules, spark }) {
   if (blocked.length === 0) {
     return (
       <div style={{ color: 'var(--fg-3)', fontSize: 11, fontStyle: 'italic' }}>
-        No modules currently held by another task.
+        No lock this task needs is held to its limit by other tasks.
       </div>
     );
   }
@@ -47,7 +47,7 @@ function HolderEtas({ task, modules, spark }) {
               {labelMap.get(m.path)}
             </div>
             <div style={{ color: 'var(--fg-2)' }}>
-              held by <span className="mono" style={{ color: 'var(--accent)' }}>T-{m.holder}</span>
+              held by <span className="mono" style={{ color: 'var(--accent)' }}>{holdersLabel(m.holders)}</span>
             </div>
           </div>
           <div style={{ textAlign: 'right', flexShrink: 0 }}>

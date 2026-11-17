@@ -4,12 +4,16 @@ Executes lockChipStateFor(module, taskId, project) from scheduler_utils.jsx in a
 node vm context and asserts the returned {cls, ownerLabel} across the full
 precedence matrix:
 
-  holder (mine/taken) > parked > free
+  mine > held against (taken) > parked > free
 
-It is the module's only classifier export: it derives "this lock is mine" from
-a task's view of a SCHEDULER.modules entry and applies the precedence. The
-Scheduler heatmap's cellStateFor is executed below beside it, and must answer
-every lock state exactly as the task-row LockChip does; membership
+A key held by others below its holder limit is not held against the task, so
+it reads by its park, else free.
+
+It is the module's only classifier export, and it applies the precedence to a
+task's view of a SCHEDULER.modules entry. isLockHolder decides whether the lock
+is mine and lockHeldAgainst whether it blocks the task; both are executed below
+as well. The Scheduler heatmap's cellStateFor is executed below beside it, and
+must answer every lock state exactly as the task-row LockChip does; membership
 (rowTouchesModule) is the only thing it adds.
 """
 
@@ -30,6 +34,7 @@ from _lock_chip_matrix import (
     heatmap_module,
     heatmap_row,
     lock_chip_states_for,
+    lock_predicates_for,
 )
 
 # ---------------------------------------------------------------------------
@@ -51,6 +56,26 @@ _CASES = {
     'held and parked, the holder wins': (
         heatmap_module(holder='A', parked_by='C', parked_owner_live=True), 'lock-taken', 'T-A',
     ),
+    'co-holder of a shared key': (
+        heatmap_module(holder='A', holders=['A', ROW_TASK], holder_project=ROW_PROJECT, at_holder_limit=False),
+        'lock-mine', None,
+    ),
+    'co-holder of a full key': (
+        heatmap_module(holder='A', holders=['A', ROW_TASK], holder_project=ROW_PROJECT, at_holder_limit=True),
+        'lock-mine', None,
+    ),
+    'another task, below its limit': (
+        heatmap_module(holder='A', holders=['A'], holder_project=ROW_PROJECT, at_holder_limit=False),
+        'lock-free', None,
+    ),
+    'two other tasks fill it': (
+        heatmap_module(holder='A', holders=['A', 'C'], holder_project=ROW_PROJECT, at_holder_limit=True),
+        'lock-taken', 'T-A +1',
+    ),
+    'below its limit and parked, the park shows': (
+        heatmap_module(holder='A', holders=['A'], at_holder_limit=False, parked_by='C', parked_owner_live=True),
+        'lock-parked', 'T-C',
+    ),
     'free': (heatmap_module(), 'lock-free', None),
     'not listed by the scheduler': (None, 'lock-free', None),
 }
@@ -64,7 +89,7 @@ def chip_states() -> dict[str, dict]:
 
 
 class TestLockChipStateFor:
-    """lockChipStateFor(module, taskId, project) is the one place a lock is "mine".
+    """lockChipStateFor(module, taskId, project) applies the precedence to isLockHolder and lockHeldAgainst.
 
     Mine means held by this task id IN this project; a module that names no
     holder_project is read as the task's own project. A holder outranks a park.
@@ -75,6 +100,49 @@ class TestLockChipStateFor:
         _module, cls, owner_label = _CASES[case]
         state = chip_states[case]
         assert (state['cls'], state['ownerLabel']) == (cls, owner_label), f'{case}: {state!r}'
+
+    def test_a_key_shared_below_its_limit_names_its_holders_in_the_hint(self, chip_states):
+        assert 'T-A' in chip_states['another task, below its limit']['hint']
+
+    def test_a_full_key_held_by_several_names_every_holder_in_the_hint(self, chip_states):
+        hint = chip_states['two other tasks fill it']['hint']
+        assert 'T-A' in hint and 'T-C' in hint, hint
+
+
+# Each case: the module entry, and (isLockHolder, lockHeldAgainst) for task
+# ROW_TASK of ROW_PROJECT.
+_PREDICATE_CASES = {
+    'held by this task': (heatmap_module(holder=ROW_TASK, holder_project=ROW_PROJECT), True, False),
+    'co-holder of a shared key': (
+        heatmap_module(holder='A', holders=['A', ROW_TASK], holder_project=ROW_PROJECT, at_holder_limit=False),
+        True, False,
+    ),
+    'full key held by another': (heatmap_module(holder='A', holder_project=ROW_PROJECT), False, True),
+    'full key held by this task id in another project': (
+        heatmap_module(holder=ROW_TASK, holder_project='Q'), False, True,
+    ),
+    'shared key below its limit held by another': (
+        heatmap_module(holder='A', holders=['A'], holder_project=ROW_PROJECT, at_holder_limit=False),
+        False, False,
+    ),
+    'unknown limit verdict stays inert': (
+        {'project': ROW_PROJECT, 'path': MODULE_PATH, 'holder': 'A', 'holders': ['A']}, False, False,
+    ),
+    'not listed by the scheduler': (None, False, False),
+}
+
+
+@pytest.fixture(scope='module')
+def predicates() -> dict[str, dict]:
+    cases = [(module, ROW_TASK, ROW_PROJECT) for module, _holder, _against in _PREDICATE_CASES.values()]
+    return dict(zip(_PREDICATE_CASES, lock_predicates_for(cases), strict=True))
+
+
+@pytest.mark.parametrize('case', list(_PREDICATE_CASES))
+def test_is_lock_holder_and_lock_held_against(predicates, case):
+    """isLockHolder is the one place a task holds a lock; lockHeldAgainst the one place a lock blocks it."""
+    _module, holder, against = _PREDICATE_CASES[case]
+    assert predicates[case] == {'isLockHolder': holder, 'lockHeldAgainst': against}, case
 
 
 _EXPORTS_DRIVER = r"""
@@ -103,7 +171,8 @@ def test_lock_chip_state_for_is_the_only_classifier_exported():
     assert 'lockChipStateFor' in exported, exported
     assert 'lockChipState' not in exported, (
         'window.DF_SCHED_UTILS still exports the bare lockChipState, which takes a '
-        'caller-computed isMine; lockChipStateFor is the one place a lock is decided to be mine'
+        'caller-computed isMine; isLockHolder decides whether a lock is mine, and '
+        'lockChipStateFor is the one entry point that applies the precedence to it'
     )
 
 
