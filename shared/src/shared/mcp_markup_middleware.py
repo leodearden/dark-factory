@@ -106,8 +106,8 @@ import inspect
 import json
 import logging
 import time
-from collections.abc import Callable, Mapping
-from typing import Annotated, Any, NoReturn
+from collections.abc import Callable, Iterator, Mapping
+from typing import Annotated, Any, NamedTuple, NoReturn
 
 from fastmcp.exceptions import ToolError
 from fastmcp.server.middleware import Middleware
@@ -134,9 +134,11 @@ from shared.toolcall_markup import (
     # whether what it carries would trip a downstream blanket consumer. That
     # question has no parameter to be aware of, because the recovered value is
     # the caller's own text rather than something this guard rewrote.
+    Repair,
     detect,
     detect_for,
     markup_override_requested,
+    only_inert_html_closers,
     repair,
     strip_markup_override,
 )
@@ -640,6 +642,19 @@ class RepairPolicy(enum.StrEnum):
     FORWARD_REPAIR = 'forward_repair'
 
 
+class _MarkupHit(NamedTuple):
+    """One argument :class:`MarkupGuardMiddleware` must act on, schema in hand."""
+
+    param: str
+    value: str
+    #: The gate's pattern, from the param-only scan.
+    pattern: str
+    #: The invoked tool's live JSON-Schema ``properties``.
+    properties: Mapping[str, Any]
+    #: :func:`~shared.toolcall_markup.repair`'s answer; ``None`` is unrepairable.
+    fix: Repair | None
+
+
 class MarkupGuardMiddleware(Middleware):
     """Detect, repair and police leaked envelope markup at the FastMCP boundary.
 
@@ -673,7 +688,7 @@ class MarkupGuardMiddleware(Middleware):
     PLUS the closing tag of the argument's own name, which is the dialect the
     fixed set could never spell and which 212 of 444 measured real corruptions
     take. One residual is accepted by construction and is documented at
-    :meth:`_first_markup_argument`: a closer naming a DIFFERENT parameter of
+    :meth:`_markup_arguments`: a closer naming a DIFFERENT parameter of
     the same tool still passes, because widening to the tool's schema would
     put an awaited round-trip on every clean call.
 
@@ -740,7 +755,11 @@ class MarkupGuardMiddleware(Middleware):
         needle), and the awaited ``get_tool`` round-trip is still deferred
         behind that gate — which is precisely why the scan takes the parameter
         name, already in hand, and not the schema. See
-        :meth:`_first_markup_argument`.
+        :meth:`_markup_arguments`.
+
+        A hit that :func:`~shared.toolcall_markup.repair` cannot fix and that
+        carries only quoted HTML closers is no event at all, exactly like a
+        clean call (task **10396**); see :meth:`_first_live_markup`.
         """
         name = context.message.name
         arguments = context.message.arguments or {}
@@ -759,14 +778,10 @@ class MarkupGuardMiddleware(Middleware):
             await self._apply_override(context, name, arguments)
             return await call_next(context)
 
-        hit = self._first_markup_argument(arguments)
-        if hit is None:
+        live = await self._first_live_markup(context, name, arguments)
+        if live is None:
             return await call_next(context)
-
-        param, value, pattern = hit
-        return await self._handle_markup(
-            context, call_next, name, arguments, param, value, pattern
-        )
+        return await self._handle_markup(context, call_next, name, arguments, live)
 
     # -- the deliberate-quoting override (B6) ------------------------------
 
@@ -833,8 +848,8 @@ class MarkupGuardMiddleware(Middleware):
     # -- detection --------------------------------------------------------
 
     @staticmethod
-    def _first_markup_argument(arguments: Mapping[str, Any]) -> tuple[str, str, str] | None:
-        """Return the first ``(param, value, pattern)`` carrying envelope markup.
+    def _markup_arguments(arguments: Mapping[str, Any]) -> Iterator[tuple[str, str, str]]:
+        """Yield every ``(param, value, pattern)`` carrying envelope markup.
 
         The matched *pattern* is carried out of the scan rather than re-derived
         later: it is needed on all three outcome paths, and only here is it
@@ -845,11 +860,14 @@ class MarkupGuardMiddleware(Middleware):
         defect in the caller's own text emission, so it can only ever land in a
         string.
 
-        First hit wins rather than collecting all of them, because the repair
-        is defined against ONE absorbing parameter — the argument whose value
-        swallowed the rest of the envelope. A second hit downstream of it is
-        either the same leak seen twice or a value that repair() will refuse
-        anyway.
+        The first NON-INERT hit is handled, and only that one, because the
+        repair is defined against ONE absorbing parameter — the argument whose
+        value swallowed the rest of the envelope. A second hit downstream of it
+        is either the same leak seen twice or a value that repair() will refuse
+        anyway. An INERT hit — a value repair() declines that carries only
+        quoted HTML closers (task **10396**) — is skipped as if it carried no
+        needle, so a real leak in a later argument is still reached; see
+        :meth:`_first_live_markup`.
 
         PARAMETER-AWARE, and free (task **4696**). The scan asks
         :func:`~shared.toolcall_markup.detect_for` with the argument's OWN
@@ -885,7 +903,30 @@ class MarkupGuardMiddleware(Middleware):
             if isinstance(value, str):
                 pattern = detect_for(value, param)
                 if pattern is not None:
-                    return param, value, pattern
+                    yield param, value, pattern
+
+    async def _first_live_markup(
+        self, context, name: str, arguments: Mapping[str, Any]
+    ) -> _MarkupHit | None:
+        """The first hit of :meth:`_markup_arguments` that is a real event.
+
+        The schema is read once, lazily, on the first hit, so a clean call
+        still pays no ``get_tool``. Each hit is offered to
+        :func:`~shared.toolcall_markup.repair` FIRST; only a hit it declines is
+        asked :func:`~shared.toolcall_markup.only_inert_html_closers`, so every
+        value repair() can fix is handled exactly as before. An inert hit is
+        skipped: it is a quoted HTML block, not a leak, and earns no fact, no
+        storm count and no residue, like a clean argument.
+        """
+        properties: Mapping[str, Any] | None = None
+        for param, value, pattern in self._markup_arguments(arguments):
+            if properties is None:
+                properties = await self._schema_properties(context, name)
+            schema_params = tuple(properties)
+            fix = repair(value, param, schema_params, tuple(arguments))
+            if fix is None and only_inert_html_closers(value, param, schema_params):
+                continue
+            return _MarkupHit(param, value, pattern, properties, fix)
         return None
 
     # -- identity ---------------------------------------------------------
@@ -984,15 +1025,16 @@ class MarkupGuardMiddleware(Middleware):
 
     # -- policy -----------------------------------------------------------
 
-    async def _handle_markup(self, context, call_next, name, arguments, param, value, pattern):
+    async def _handle_markup(self, context, call_next, name, arguments, live: _MarkupHit):
         """Apply the declared policy to a detected leak.
 
-        The schema read happens HERE and not on the fast path, so the awaited
+        The schema read and the repair arrive on *live*, resolved by
+        :meth:`_first_live_markup` past the clean-path gate, so the awaited
         ``get_tool`` round-trip is paid only by the 0.26% of calls that
         actually carry a leak.
 
-        ONE PATTERN PER EVENT (task **5283**). *pattern* arrives from
-        :meth:`_first_markup_argument`, which deliberately holds only *param* —
+        ONE PATTERN PER EVENT (task **5283**). ``live.pattern`` comes from
+        :meth:`_markup_arguments`, which deliberately holds only *param* —
         it will not pay ``get_tool`` on the 99.7% clean path. Once the schema
         IS resolved, it is re-derived on the same ``(value, param,
         schema_params)`` triple :func:`repair` now uses, so ``fix.pattern`` and
@@ -1001,12 +1043,11 @@ class MarkupGuardMiddleware(Middleware):
         The rebinding is free: it sits past the clean-path gate, beside an
         awaited round-trip. It can only widen — ``detect_for`` over a superset
         of needles reports earliest-by-text-position — so it is non-``None``
-        whenever the gate fired, and the ``or pattern`` is a belt-and-braces
-        guard that no measured input reaches.
+        whenever the gate fired, and the ``or`` is a belt-and-braces guard that
+        no measured input reaches.
         """
-        properties = await self._schema_properties(context, name)
-        pattern = detect_for(value, param, tuple(properties)) or pattern
-        fix = repair(value, param, tuple(properties), tuple(arguments))
+        param, value, properties, fix = live.param, live.value, live.properties, live.fix
+        pattern = detect_for(value, param, tuple(properties)) or live.pattern
 
         # All three emissions sit SIDE BY SIDE, and every one of them runs
         # BEFORE its outcome is delivered. Two reasons. The detection is a fact

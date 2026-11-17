@@ -1143,7 +1143,7 @@ class TestUnrepairableResidueIsPreserved:
         ``detect_for(value, param, schema_params)`` triple the scan asks, so
         the three sites agree BY CONSTRUCTION rather than coinciding. Here
         ``repair`` returned ``None``, so there is no ``Repair`` to read one off
-        at all and the guard publishes what ``_first_markup_argument``
+        at all and the guard publishes what ``_markup_arguments``
         actually matched on. Asserting
         the blanket ``detect`` here would name a literal that merely TRAILS
         the leak (PRD 2.2) and would disagree with the fact for the same
@@ -1152,7 +1152,7 @@ class TestUnrepairableResidueIsPreserved:
         The expectation is SPELLED, not computed by calling ``detect_for``
         here. An expectation derived from the predicate under test moves with
         it, so it can only ever catch a disagreement between
-        ``_first_markup_argument`` and ``detect_for`` — never a change to what
+        ``_markup_arguments`` and ``detect_for`` — never a change to what
         ``detect_for`` MEANS. Measured on this corpus specimen: the self-name
         closer sits at offset 459 and the blanket ``detect``'s answer at 471,
         so the widened value is the HEAD of the leak and the blanket one
@@ -1350,7 +1350,7 @@ class TestUnrepairableResidueIsPreserved:
         ``detect_for(value, param, schema_params)`` triple the scan asks, so
         the three sites agree BY CONSTRUCTION rather than coinciding. Here
         ``repair`` returned ``None``, so there is no ``Repair`` to read one off
-        at all and the guard publishes what ``_first_markup_argument``
+        at all and the guard publishes what ``_markup_arguments``
         actually matched on. Asserting
         the blanket ``detect`` here would name a literal that merely TRAILS
         the leak (PRD 2.2) and would disagree with the fact for the same
@@ -1359,7 +1359,7 @@ class TestUnrepairableResidueIsPreserved:
         The expectation is SPELLED, not computed by calling ``detect_for``
         here. An expectation derived from the predicate under test moves with
         it, so it can only ever catch a disagreement between
-        ``_first_markup_argument`` and ``detect_for`` — never a change to what
+        ``_markup_arguments`` and ``detect_for`` — never a change to what
         ``detect_for`` MEANS. Measured on this corpus specimen: the self-name
         closer sits at offset 459 and the blanket ``detect``'s answer at 471,
         so the widened value is the HEAD of the leak and the blanket one

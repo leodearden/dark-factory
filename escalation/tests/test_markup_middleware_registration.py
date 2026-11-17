@@ -1155,9 +1155,10 @@ HTML_DETAILS_BLOCK = (
     + _html_element('pre', 'rc=0') + closer_for('details')
 )
 
-#: The same block without its ``summary`` child, for the ``summary`` parameter:
-#: there that child's closer is the parameter's OWN closer, a needle the guard
-#: still refuses (see the last test below).
+#: The same block without its ``summary`` child, for ``escalate_info``: that
+#: tool declares a ``summary`` parameter, so the child's closer is a parameter
+#: closer of a name that is not HTML-colliding, a needle the guard still
+#: refuses in ANY of its arguments (see the last test below).
 HTML_DETAILS_BLOCK_UNLABELLED = (
     '\x3cdetails>' + _html_element('pre', 'rc=0') + closer_for('details')
 )
@@ -1167,7 +1168,7 @@ class TestAQuotedHtmlBlockIsFiledVerbatim:
     """The real server files and resolves prose quoting an HTML block unchanged."""
 
     SUMMARY = 'The report renders ' + HTML_DETAILS_BLOCK_UNLABELLED + ' for each finding.'
-    DETAIL = 'Evidence:\n' + HTML_DETAILS_BLOCK + '\nEnd of evidence.'
+    DETAIL = 'Evidence:\n' + HTML_DETAILS_BLOCK_UNLABELLED + '\nEnd of evidence.'
     RESOLUTION = 'Resolved; the page now shows\n' + HTML_DETAILS_BLOCK
 
     async def _file(self, client) -> str:
@@ -1219,8 +1220,9 @@ class TestAQuotedHtmlBlockIsFiledVerbatim:
         assert payload['field'] == 'detail'
 
     @pytest.mark.asyncio
-    async def test_a_summary_element_in_the_summary_parameter_is_still_refused(
-        self, tmp_path: Path,
+    @pytest.mark.parametrize('field', ['summary', 'detail'])
+    async def test_a_summary_element_is_still_refused_where_summary_is_a_parameter(
+        self, tmp_path: Path, field: str,
     ):
         _, server = build(tmp_path)
 
@@ -1228,9 +1230,10 @@ class TestAQuotedHtmlBlockIsFiledVerbatim:
             with pytest.raises(ToolError) as excinfo:
                 await client.call_tool(
                     'escalate_info',
-                    {**REQUIRED, 'summary': 'Renders ' + HTML_DETAILS_BLOCK + ' per finding.'},
+                    {**REQUIRED, field: 'Renders ' + HTML_DETAILS_BLOCK + ' per finding.'},
                 )
 
         payload = error_payload(excinfo)
         assert payload['error_type'] == 'mcp_markup_unrepairable'
+        assert payload['field'] == field
         assert payload['matched_pattern'] == closer_for('summary')

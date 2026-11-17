@@ -749,7 +749,7 @@ def _carries_markup(plan: dict) -> bool:
     come straight off the declared table — no lookup, no second enumeration
     (INV-5). It is deliberately WIDER than the middleware's gate, which holds
     only the argument's own name; the asymmetry is a cost decision, recorded at
-    ``MarkupGuardMiddleware._first_markup_argument``, not a divergence.
+    ``MarkupGuardMiddleware._markup_arguments``, not a divergence.
     """
     for holder, _index, record in _walk_repairable(plan):
         value = holder.get(record.field)
@@ -2554,9 +2554,9 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
                 legitimately needed no edit to it.
         """
         # Both parameters are flat ``str`` DELIBERATELY, not a map or a list
-        # of drops. MarkupGuardMiddleware._first_markup_argument skips
+        # of drops. MarkupGuardMiddleware._markup_arguments skips
         # non-string values (shared/src/shared/mcp_markup_middleware.py::
-        # _first_markup_argument), so ONLY flat string params get inbound
+        # MarkupGuardMiddleware._markup_arguments), so ONLY flat string params get inbound
         # envelope-markup protection — and ``reason`` is agent-authored free
         # prose, exactly the leak class that guard exists for. A later
         # refactor to a batch/map signature would silently drop the guard.
