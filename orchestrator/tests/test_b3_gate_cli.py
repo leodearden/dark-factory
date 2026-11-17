@@ -20,7 +20,7 @@ from _git_fixtures import seed_repo
 from shared.tasks_db_readonly import TaskDbProblem, TaskDbUnreadable
 
 # ---------------------------------------------------------------------------
-# tasks.db seeding
+# tasks.db and repo scene seeding
 # ---------------------------------------------------------------------------
 
 def _seed_tasks_db(
@@ -61,6 +61,37 @@ def _seed_tasks_db(
     )
     conn.commit()
     conn.close()
+
+
+def _seed_fresh_check_scene(tmp_path: Path, *, description: str = '') -> tuple[Path, Path]:
+    """Seed a repo whose feature branch has diverged from main, and a tasks.db
+    whose task 42 carries *description* and one fresh low-risk proposal
+    anchored at that repo's head and main shas.
+
+    Returns (repo, project_root).
+    """
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    seed_repo(repo)
+    head_sha = diverge_feature_branch(repo)
+    main_sha = subprocess.run(
+        ['git', '-C', str(repo), 'rev-parse', 'main'],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+    root = tmp_path / 'root'
+    root.mkdir()
+    entry = {
+        'proposal_text': 'Fix the bug',
+        'risk_label': 'low',
+        'files_referenced': [],
+        'block_reason': 'test blocked',
+        'investigated_at': '2026-06-04T10:00:00+00:00',
+        'head_sha': head_sha,
+        'main_sha': main_sha,
+    }
+    _seed_tasks_db(root, 42, [entry], description=description)
+    return repo, root
 
 
 # ---------------------------------------------------------------------------
@@ -418,40 +449,10 @@ class TestCLIMain:
     _NOW_ISO = '2026-06-04T12:00:00+00:00'
     _NOW = datetime.fromisoformat(_NOW_ISO)
 
-    def _setup_repo_and_db(self, tmp_path):
-        """Create a git repo + seeded tasks.db with a fresh low-risk proposal.
-
-        Returns (repo_path, project_root, head_sha, main_sha).
-        """
-        repo = tmp_path / 'repo'
-        repo.mkdir()
-        seed_repo(repo)
-        head_sha = diverge_feature_branch(repo)
-        # main sha is the sha before we diverged
-        main_sha = subprocess.run(
-            ['git', '-C', str(repo), 'rev-parse', 'main'],
-            check=True, capture_output=True, text=True,
-        ).stdout.strip()
-
-        root = tmp_path / 'root'
-        root.mkdir()
-
-        entry = {
-            'proposal_text': 'Fix the bug',
-            'risk_label': 'low',
-            'files_referenced': [],
-            'block_reason': 'test blocked',
-            'investigated_at': '2026-06-04T10:00:00+00:00',
-            'head_sha': head_sha,
-            'main_sha': main_sha,
-        }
-        _seed_tasks_db(root, 42, [entry])
-        return repo, root, head_sha, main_sha
-
     def test_check_fresh_verdict_json(self, tmp_path, capsys):
         """check verb: prints a single JSON object with verdict=='fresh'."""
         from orchestrator.b3_gate import main
-        repo, root, head_sha, main_sha = self._setup_repo_and_db(tmp_path)
+        repo, root = _seed_fresh_check_scene(tmp_path)
 
         rc = main([
             'check',
@@ -474,7 +475,7 @@ class TestCLIMain:
     def test_record_launch_first_call(self, tmp_path, capsys):
         """record-launch verb: first call prints {recorded:True, already_attempted:False}."""
         from orchestrator.b3_gate import main
-        repo, root, head_sha, main_sha = self._setup_repo_and_db(tmp_path)
+        repo, root = _seed_fresh_check_scene(tmp_path)
 
         rc = main([
             'record-launch',
@@ -492,7 +493,7 @@ class TestCLIMain:
     def test_record_launch_idempotent_second_call(self, tmp_path, capsys):
         """record-launch verb: second identical call prints already_attempted:True."""
         from orchestrator.b3_gate import main
-        repo, root, head_sha, main_sha = self._setup_repo_and_db(tmp_path)
+        repo, root = _seed_fresh_check_scene(tmp_path)
 
         argv = ['record-launch', '--task-id', '42',
                 '--worktree', str(repo), '--project-root', str(root)]
@@ -509,7 +510,7 @@ class TestCLIMain:
     def test_check_after_record_launch_reports_already_attempted(self, tmp_path, capsys):
         """check verb: after record-launch, already_attempted==True."""
         from orchestrator.b3_gate import main
-        repo, root, head_sha, main_sha = self._setup_repo_and_db(tmp_path)
+        repo, root = _seed_fresh_check_scene(tmp_path)
 
         # Record launch first
         main(['record-launch', '--task-id', '42',
@@ -532,7 +533,7 @@ class TestCLIMain:
     def test_charge_succeeds_remaining_five(self, tmp_path, capsys):
         """charge verb: first charge prints {charged:True, remaining:5} (default cap=6)."""
         from orchestrator.b3_gate import main
-        _, root, _, _ = self._setup_repo_and_db(tmp_path)
+        _, root = _seed_fresh_check_scene(tmp_path)
 
         rc = main([
             'charge',
@@ -549,7 +550,7 @@ class TestCLIMain:
     def test_each_verb_prints_single_parseable_json(self, tmp_path, capsys):
         """Each verb call prints exactly one parseable JSON line to stdout."""
         from orchestrator.b3_gate import main
-        repo, root, head_sha, main_sha = self._setup_repo_and_db(tmp_path)
+        repo, root = _seed_fresh_check_scene(tmp_path)
 
         for argv in [
             ['check', '--task-id', '42', '--worktree', str(repo),
@@ -578,45 +579,16 @@ class TestRunCheckStopInstruction:
     """run_check must READ the task's description from tasks.db and forward
     it to check_proposal as extra_texts — an explicit stop instruction in
     the description hard-aborts even an otherwise-fresh low-risk proposal
-    (task 2509). Mirrors TestCLIMain._setup_repo_and_db's git-repo + seeded
-    tasks.db harness.
+    (task 2509).
     """
 
     _NOW_ISO = '2026-06-04T12:00:00+00:00'
-
-    def _setup_repo_and_db(self, tmp_path, *, description):
-        """Create a git repo + seeded tasks.db with a fresh low-risk proposal
-        whose task row carries *description*. Returns (repo_path, project_root).
-        """
-        repo = tmp_path / 'repo'
-        repo.mkdir()
-        seed_repo(repo)
-        head_sha = diverge_feature_branch(repo)
-        main_sha = subprocess.run(
-            ['git', '-C', str(repo), 'rev-parse', 'main'],
-            check=True, capture_output=True, text=True,
-        ).stdout.strip()
-
-        root = tmp_path / 'root'
-        root.mkdir()
-
-        entry = {
-            'proposal_text': 'Fix the bug',
-            'risk_label': 'low',
-            'files_referenced': [],
-            'block_reason': 'test blocked',
-            'investigated_at': '2026-06-04T10:00:00+00:00',
-            'head_sha': head_sha,
-            'main_sha': main_sha,
-        }
-        _seed_tasks_db(root, 42, [entry], description=description)
-        return repo, root
 
     def test_stop_instruction_in_description_aborts(self, tmp_path, capsys):
         """Case A: description contains 'do not apply' -> run_check prints
         verdict=='abort' with a stop-instruction reason."""
         from orchestrator.b3_gate import main
-        repo, root = self._setup_repo_and_db(
+        repo, root = _seed_fresh_check_scene(
             tmp_path, description='Investigate the failure, but do not apply any fix yet.',
         )
 
@@ -640,7 +612,7 @@ class TestRunCheckStopInstruction:
         """Case B (regression): a benign description leaves the verdict exactly
         what the proposal+git would yield today (fresh)."""
         from orchestrator.b3_gate import main
-        repo, root = self._setup_repo_and_db(
+        repo, root = _seed_fresh_check_scene(
             tmp_path, description='This task is blocked on a flaky integration test.',
         )
 
@@ -674,27 +646,7 @@ class TestRunCheckSharedConnection:
         from orchestrator import b3_gate
         from orchestrator.b3_gate import main
 
-        repo = tmp_path / 'repo'
-        repo.mkdir()
-        seed_repo(repo)
-        head_sha = diverge_feature_branch(repo)
-        main_sha = subprocess.run(
-            ['git', '-C', str(repo), 'rev-parse', 'main'],
-            check=True, capture_output=True, text=True,
-        ).stdout.strip()
-
-        root = tmp_path / 'root'
-        root.mkdir()
-        entry = {
-            'proposal_text': 'Fix the bug',
-            'risk_label': 'low',
-            'files_referenced': [],
-            'block_reason': 'test blocked',
-            'investigated_at': '2026-06-04T10:00:00+00:00',
-            'head_sha': head_sha,
-            'main_sha': main_sha,
-        }
-        _seed_tasks_db(root, 42, [entry], description='benign description')
+        repo, root = _seed_fresh_check_scene(tmp_path, description='benign description')
 
         real_connect = sqlite3.connect
         connect_calls: list[str] = []
