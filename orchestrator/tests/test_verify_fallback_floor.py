@@ -324,6 +324,27 @@ class TestRunScopedVerificationFallbackFloor:
         assert run['scope_kind'] == 'full_suite'
         assert run['module_prefix'] == 'backend'
 
+    @pytest.mark.parametrize('role', ROLES)
+    async def test_mixed_root_and_subproject_records_each_layers_own_floor(self, tmp_path, role):
+        _write_files(tmp_path, ['backend/pyproject.toml', 'tool.py', 'backend/a.py'])
+        mixed_files = ['tool.py', 'backend/a.py']
+        test_command = 'cd backend && uv run pytest'
+        decision_floor = fallback_test_floor_reason(
+            mixed_files, test_command, role, derived_target=False,
+        )
+
+        executed, run = await _run_fallback(tmp_path, test_command, mixed_files, role)
+
+        assert executed.prefix == 'backend'
+        assert executed.test_command is not None
+        assert executed.test_command != test_command
+        assert run['cmd']['raw'] == executed.test_command
+        assert run['reason'] != decision_floor
+
+        decision = _run_for(_fallback_plan(mixed_files, test_command, role), 'pytest:')
+        assert decision.scope_kind is ScopeKind.FULL_SUITE
+        assert decision.reason == decision_floor
+
     async def test_bare_default_source_only_runs_whole_at_merge_role(self, tmp_path):
         _write_files(tmp_path, ['pkg/helpers.py'])
 
