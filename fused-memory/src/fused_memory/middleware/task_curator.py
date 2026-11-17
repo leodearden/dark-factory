@@ -94,7 +94,11 @@ from fused_memory.middleware.curation_deferral import (
     DeferReason,
     pool_defer_reason,
 )
-from fused_memory.middleware.curator_registry import CuratorRegistry, RegistryHealth
+from fused_memory.middleware.curator_registry import (
+    CuratorRegistry,
+    RegistryHealth,
+    RegistryState,
+)
 from fused_memory.middleware.curator_types import (
     DEFAULT_PRIORITY,
     NON_CANCELLED_STATUSES,
@@ -1416,14 +1420,17 @@ class TaskCurator:
     # ------------------------------------------------------------------
 
     async def startup_self_check(self, project_id: str, project_root: str) -> bool:
-        """Report whether the curator's backend CLI binary resolves. Never raises.
-
-        An unresolvable binary degrades every curation; asking once at wiring
-        time escalates it before the first candidate is filed. A verdict, not
-        a precondition: a curator without its binary still fails open to
-        ``action='create'``, whereas raising would reach the interceptor's
+        """Report whether the curator can work as configured: the backend
+        binary resolves, and every configured guard registry loads. Escalates
+        each failure. A verdict, never raises: a curator that fails it still
+        fails open, whereas raising would reach the interceptor's
         ``except Exception -> return None`` and disable dedupe outright.
         """
+        binary_ok = await self._check_backend_binary(project_id, project_root)
+        registries_ok = await self._check_registries(project_id, project_root)
+        return binary_ok and registries_ok
+
+    async def _check_backend_binary(self, project_id: str, project_root: str) -> bool:
         spec = claude_binary_spec()
         resolved = resolve_claude_binary()
         if resolved is not None:
@@ -1448,6 +1455,25 @@ class TaskCurator:
                 search_path=search_path,
             )
         return False
+
+    async def _check_registries(self, project_id: str, project_root: str) -> bool:
+        all_ok = True
+        for registry in self._registries():
+            await registry.entries()
+            health = registry.health()
+            if health.state is not RegistryState.FAILED:
+                continue
+            all_ok = False
+            logger.error(
+                'task_curator: %s registry (%s=%s) failed to load for project %s: '
+                '%s — that guard fails open until a retry succeeds',
+                health.label, health.config_key, health.path, project_id, health.error,
+            )
+            if self._escalator is not None:
+                await self._escalator.report_registry_load_failed(
+                    project_root=project_root, project_id=project_id, health=health,
+                )
+        return all_ok
 
     # ------------------------------------------------------------------
     # Class-agnostic degraded-streak alarm (task 4448)
