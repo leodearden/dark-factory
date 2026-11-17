@@ -122,7 +122,6 @@ _NOT_YET_MIGRATED = frozenset({
     'test_workflow.py',
     'test_workflow_agent_session_preserve.py',
     'test_workflow_escalated_steward_stall.py',
-    'test_workflow_merge_gating_strand.py',
     'test_workflow_signature_loop_guard.py',
     'test_workflow_status_on_resume.py',
     'test_workflow_truthful_commit_stamp.py',
