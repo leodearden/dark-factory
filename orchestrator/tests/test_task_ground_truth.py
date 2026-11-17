@@ -48,6 +48,7 @@ from orchestrator.artifacts import TaskArtifacts
 from orchestrator.merge_lane import InFlightMergeRegistry
 from orchestrator.merge_lane.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
 from orchestrator.task_ground_truth import (
+    BranchShaSource,
     BranchState,
     BranchStateKind,
     Claimant,
@@ -111,6 +112,31 @@ class TestFrozenValueObjects:
         ref = EscalationRef(id='esc-1-1', level=1)
         with pytest.raises(dataclasses.FrozenInstanceError):
             ref.level = 2  # type: ignore[misc]
+
+
+class TestBranchStateLandingSha:
+    """``landing_sha`` is the sha only when its source names a landing commit."""
+
+    @pytest.mark.parametrize(('kind', 'source'), [
+        (BranchStateKind.ON_MAIN, BranchShaSource.JOURNAL),
+        (BranchStateKind.ON_MAIN, BranchShaSource.CITATION),
+        (BranchStateKind.GONE_WITH_MERGE_MARKER, BranchShaSource.MERGE_MARKER),
+    ])
+    def test_independent_sources_are_landing_evidence(
+        self, kind: BranchStateKind, source: BranchShaSource,
+    ) -> None:
+        assert BranchState(kind, 'abc', source).landing_sha == 'abc'
+
+    def test_branch_tip_is_not_landing_evidence(self) -> None:
+        state = BranchState(BranchStateKind.ON_MAIN, 'tip', BranchShaSource.BRANCH_TIP)
+        assert state.landing_sha is None
+
+    def test_unstated_source_is_not_landing_evidence(self) -> None:
+        assert BranchState(BranchStateKind.ON_MAIN, 'abc').landing_sha is None
+
+    def test_a_source_without_a_sha_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match='sha_source'):
+            BranchState(BranchStateKind.ON_MAIN, None, BranchShaSource.CITATION)
 
 
 class TestEscalationRefCarriesSeverityAndFilingIdentity:
@@ -553,7 +579,9 @@ class TestDeriveTruthBranchStateJournalFirst:
 
         report = await resolver.derive_truth('42')
 
-        assert report.branch_state == BranchState(BranchStateKind.ON_MAIN, 'advancedsha123')
+        assert report.branch_state == BranchState(
+            BranchStateKind.ON_MAIN, 'advancedsha123', BranchShaSource.JOURNAL,
+        )
         git_ops.is_ancestor.assert_not_awaited()
         git_ops.resolve_branch_sha.assert_not_awaited()
         git_ops.find_merge_marker.assert_not_awaited()
@@ -588,7 +616,9 @@ class TestDeriveTruthBranchStateGitFallback:
 
         report = await resolver.derive_truth('7')
 
-        assert report.branch_state == BranchState(BranchStateKind.ON_MAIN, citation_sha)
+        assert report.branch_state == BranchState(
+            BranchStateKind.ON_MAIN, citation_sha, BranchShaSource.CITATION,
+        )
         git_ops.find_task_citation_commit.assert_awaited_once()
         # FIX-A mirror (task 2870): the citation-lineage is_ancestor calls are
         # dropped — a positive citation is accepted regardless of branch-ref
@@ -652,7 +682,9 @@ class TestDeriveTruthBranchStateGitFallback:
 
         report = await resolver.derive_truth('2729')
 
-        assert report.branch_state == BranchState(BranchStateKind.ON_MAIN, citation_sha)
+        assert report.branch_state == BranchState(
+            BranchStateKind.ON_MAIN, citation_sha, BranchShaSource.CITATION,
+        )
         git_ops.find_task_citation_commit.assert_awaited_once()
         # The citation-lineage is_ancestor calls are dropped — only the
         # (branch, main) ancestry check runs.
@@ -678,7 +710,9 @@ class TestDeriveTruthBranchStateGitFallback:
 
         report = await resolver.derive_truth('7')
 
-        assert report.branch_state == BranchState(BranchStateKind.ON_MAIN, 'tipsha123')
+        assert report.branch_state == BranchState(
+            BranchStateKind.ON_MAIN, 'tipsha123', BranchShaSource.BRANCH_TIP,
+        )
         # Citations disabled → the attribution guard is skipped entirely.
         git_ops.find_task_citation_commit.assert_not_awaited()
         # Only the (branch, main) ancestry check runs — no citation lineage check.
@@ -703,7 +737,7 @@ class TestDeriveTruthBranchStateGitFallback:
         report = await resolver.derive_truth('9')
 
         assert report.branch_state == BranchState(
-            BranchStateKind.GONE_WITH_MERGE_MARKER, 'markersha789',
+            BranchStateKind.GONE_WITH_MERGE_MARKER, 'markersha789', BranchShaSource.MERGE_MARKER,
         )
         git_ops.is_ancestor.assert_awaited_once_with('task/9', 'main')
         git_ops.find_merge_marker.assert_awaited_once_with('task/9')
@@ -1861,7 +1895,9 @@ class TestRecoveryFor:
 
         report, action = await resolver.recovery_for('30')
 
-        assert report.branch_state == BranchState(BranchStateKind.ON_MAIN, 'g1advancedsha')
+        assert report.branch_state == BranchState(
+            BranchStateKind.ON_MAIN, 'g1advancedsha', BranchShaSource.JOURNAL,
+        )
         assert report.live_claimant is None
         assert action == RecoveryAction.MARK_DONE_WITH_PROVENANCE
         git_ops.find_merge_marker.assert_not_awaited()
@@ -1883,7 +1919,7 @@ class TestRecoveryFor:
         report, action = await resolver.recovery_for('31')
 
         assert report.branch_state == BranchState(
-            BranchStateKind.GONE_WITH_MERGE_MARKER, 'g2markersha',
+            BranchStateKind.GONE_WITH_MERGE_MARKER, 'g2markersha', BranchShaSource.MERGE_MARKER,
         )
         assert action == RecoveryAction.MARK_DONE_WITH_PROVENANCE
         git_ops.find_merge_marker.assert_awaited_once_with('task/31')
