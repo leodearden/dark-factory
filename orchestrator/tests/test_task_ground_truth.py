@@ -719,6 +719,19 @@ class TestDeriveTruthBranchStateGitFallback:
         git_ops.is_ancestor.assert_awaited_once_with('task/7', 'main')
         git_ops.resolve_branch_sha.assert_awaited_once_with('task/7')
 
+    async def test_citations_disabled_tip_vanishing_mid_derivation_carries_no_source(self) -> None:
+        """The branch ref deleted between the ancestry probe and the tip read
+        leaves no sha, so there is no source to record, and resolving does not raise."""
+        git_ops = _fake_git_ops(
+            is_ancestor=True, branch_sha=None, citation_sha=None,
+            commit_citation_pattern='',
+        )
+        resolver = _make_ground_truth(git_ops=git_ops)
+
+        report = await resolver.derive_truth('7')
+
+        assert report.branch_state == BranchState(BranchStateKind.ON_MAIN, None)
+
     async def test_branch_exists_not_ancestor_resolves_exists_off_main(self) -> None:
         git_ops = _fake_git_ops(is_ancestor=False, branch_sha='tipsha456')
         resolver = _make_ground_truth(git_ops=git_ops)
