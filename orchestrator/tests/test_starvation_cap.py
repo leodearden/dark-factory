@@ -173,7 +173,7 @@ class TestChangeRule:
     BASE = _wedged('S3', 'S4').announced()
 
     def test_the_announcement_is_size_modules_and_subjects(self) -> None:
-        assert self.BASE == CapBaseline(
+        assert _wedged('S3', 'S4').announced() == CapBaseline(
             size=2, modules=frozenset({'hot/d.py'}), subjects=frozenset({'0'}),
         )
 
