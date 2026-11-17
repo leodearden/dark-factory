@@ -6572,9 +6572,8 @@ class TestBlocklistLazyLoadRunsOffEventLoop:
         """Behaviour-preservation pin: a relative
         cancelled_premise_blocklist_path with no cwd resolves against the
         process CWD and logs a WARNING naming the config key so an operator
-        can identify which field to make absolute. Green today
-        (task_curator.py _maybe_blocklist_drop's lazy-load block); must stay
-        green once this branch moves into the shared _LazyRegistry._resolve.
+        can identify which field to make absolute. The resolution lives in
+        fused_memory/middleware/curator_registry.py::CuratorRegistry.
         """
         config = FusedMemoryConfig()
         config.curator = CuratorConfig(cancelled_premise_blocklist_path="relative/blocklist.yaml")
@@ -8275,9 +8274,8 @@ class TestOperationalRegistryLazyLoadRunsOffEventLoop:
         """Behaviour-preservation pin: a relative operational_ask_registry_path
         with no cwd resolves against the process CWD and logs a WARNING
         naming the config key so an operator can identify which field to
-        make absolute. Green today (task_curator.py
-        _maybe_route_deterministic's lazy-load block); must stay green once
-        this branch moves into the shared _LazyRegistry._resolve.
+        make absolute. The resolution lives in
+        fused_memory/middleware/curator_registry.py::CuratorRegistry.
         """
         config = FusedMemoryConfig()
         config.curator = CuratorConfig(operational_ask_registry_path="relative/registry.yaml")
