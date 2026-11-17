@@ -170,6 +170,61 @@ class TestEnsureFreshCollection:
         assert client.create_collection.call_count == 1
 
 
+class TestEnsureFreshCollectionOutlastsAnAbandonedCreate:
+    """A create the client stops waiting for is judged by whether the collection appears.
+
+    Drives a real QdrantClient over a real socket: only a genuine read timeout
+    produces the measured sequence, the client abandoning the answer while the
+    server goes on to finish the create. The stub's create delay is a lower
+    bound and the client's 1 s read timeout always fires first.
+    """
+
+    def test_a_create_finished_after_the_read_timeout_is_accepted_without_reissuing_it(self):
+        from _fm_qdrant_live import ensure_fresh_collection
+        from _stub_qdrant_server import stub_qdrant_server
+        from qdrant_client import QdrantClient
+
+        with stub_qdrant_server(create_delay_s={'c': 2.5}) as server:
+            client = QdrantClient(url=server.url, timeout=1)
+            try:
+                ensure_fresh_collection(client, 'c', size=8)
+            finally:
+                client.close()
+
+            assert server.wait_created('c', 0) is True
+            assert server.creates('c') == 1
+
+    def test_a_create_that_never_lands_fails_naming_the_collection_and_the_create(self):
+        from _fm_qdrant_live import ensure_fresh_collection
+        from _stub_qdrant_server import stub_qdrant_server
+        from qdrant_client import QdrantClient
+
+        with stub_qdrant_server(create_delay_s={'c': 3600}) as server:
+            client = QdrantClient(url=server.url, timeout=1)
+            try:
+                with pytest.raises(AssertionError) as excinfo:
+                    ensure_fresh_collection(client, 'c', size=8, settle_timeout=0.5)
+            finally:
+                client.close()
+
+            assert "'c'" in str(excinfo.value)
+            assert 'create' in str(excinfo.value)
+            assert server.creates('c') == 1
+
+    def test_a_create_that_never_reached_the_server_propagates_without_waiting_on_state(self):
+        from _fm_qdrant_live import ensure_fresh_collection
+        from qdrant_client.http.exceptions import ResponseHandlingException
+
+        client = MagicMock()
+        client.collection_exists.return_value = False
+        client.create_collection.side_effect = ResponseHandlingException(httpx.ConnectError('refused'))
+
+        with pytest.raises(ResponseHandlingException):
+            ensure_fresh_collection(client, 'c', size=8)
+
+        assert client.collection_exists.call_count == 1
+
+
 # ---------------------------------------------------------------------------
 # Tests for the shared collection_vector_size() helper (task 2773, item 4)
 # ---------------------------------------------------------------------------
