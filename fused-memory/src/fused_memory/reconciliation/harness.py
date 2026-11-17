@@ -131,7 +131,7 @@ from fused_memory.services.live_workflow_detector import (
 )
 from fused_memory.services.memory_service import MemoryService
 from fused_memory.services.orchestrator_detector import (
-    is_orchestrator_live_for,
+    is_orchestrator_lock_held,
     orchestrator_started_at,
 )
 
@@ -2708,8 +2708,10 @@ class ReconciliationHarness:
           also returned None;
         - the target is not a routable queue key (``is_routable_task_id``);
         - the project is not registered in ``_known_projects``;
-        - no orchestrator is live for that root, so nothing would drain the
-          record;
+        - no process holds that root's orchestrator flock, so nothing would
+          drain the record; or the flock probe raised, so whether anything
+          would is unknown (the recon-queue filing already covers the
+          finding);
         - a pending record already covers this finding: a level-0 record with
           the same finding fingerprint, or a routed record a human already
           holds at a higher level
@@ -2786,11 +2788,26 @@ class ReconciliationHarness:
             )
             return None
 
-        # Do not pile records into a queue no orchestrator is draining.  This
-        # probe never raises and fails safe to False (missing lock file,
-        # unparseable PID, dead PID), so an ambiguous environment yields no
-        # filing rather than a spurious one.
-        if not is_orchestrator_live_for(project_root):
+        # File only into a queue an orchestrator is draining: one holds this
+        # root's flock (orchestrator_detector.py's module docstring says why
+        # the flock and not the PID line).  A raising probe files nothing;
+        # _escalate has already filed the finding on the recon queue, and a
+        # later pass retries while it persists.
+        try:
+            lock_held = is_orchestrator_lock_held(project_root)
+        except Exception:
+            logger.warning(
+                'reconciliation.finding_task_escalation_orchestrator_probe_failed',
+                extra={
+                    'project_id': project_id,
+                    'run_id': run_id,
+                    'task_id': task_id,
+                    'project_root': project_root,
+                },
+                exc_info=True,
+            )
+            return None
+        if not lock_held:
             logger.debug(
                 'reconciliation.finding_task_escalation_orchestrator_not_live',
                 extra={'project_id': project_id, 'run_id': run_id, 'task_id': task_id},

@@ -21139,12 +21139,12 @@ def _orch_finding(**over) -> dict:
 
 
 def _wire_orchestrator_queue(harness, tmp_path, monkeypatch, *, live=True):
-    """Point 'test-project' at *tmp_path* and force the orchestrator-liveness gate."""
+    """Point 'test-project' at *tmp_path* and force the orchestrator-lock gate."""
     import fused_memory.reconciliation.harness as _h
 
     harness._known_projects = dict(harness._known_projects)
     harness._known_projects['test-project'] = str(tmp_path)
-    monkeypatch.setattr(_h, 'is_orchestrator_live_for', lambda _root: live)
+    monkeypatch.setattr(_h, 'is_orchestrator_lock_held', lambda _root: live)
     return escalation_queue_dir(tmp_path)
 
 
