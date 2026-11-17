@@ -88,35 +88,34 @@ FINDING_TASK_ESCALATION_CATEGORY = 'recon_task_finding'
 #
 # `level=0`, and the argument for it is STRUCTURAL, not a matter of degree.
 #
-# Every orchestrator guard that a recon-authored record could hijack reaches
-# the escalation queue through ONE helper — `EscalationQueue.has_open_l1`
-# (`escalation/src/escalation/queue.py`), which filters on `level` + `status`
-# and an OPTIONAL `category`, and is documented as answering "a human is
-# already on this task, so the workflow must not auto-requeue it".  Crucially
-# it never reads `.severity` at all, so a severity choice cannot mitigate the
-# collision — only the level can.  It is level-1-ONLY, so a level-0 record is
-# invisible to every one of them by construction:
+# Every orchestrator guard that a recon-authored record could hijack reads the
+# escalation queue through a level-1-ONLY test: `EscalationQueue.has_open_l1`
+# (`escalation/src/escalation/queue.py`), or in the workflow
+# `orchestrator/workflow.py::_is_l1_handoff` (level == 1 AND
+# `escalation.pins.is_queue_handoff`).  `has_open_l1` filters on `level` +
+# `status` and an OPTIONAL `category`, and is documented as answering "a human
+# is already on this task, so the workflow must not auto-requeue it".
+# Crucially it never reads `.severity` at all, so a severity choice cannot
+# mitigate the collision — only the level can.  The workflow's test is also
+# severity-aware, so an info L1 never hands off there
+# (`plans/info-l0-disposition-router-prd.md` D3).  Both are level-1-ONLY, so a
+# level-0 record is invisible to every one of them by construction:
 #
-#   - `orchestrator/workflow.py::TaskWorkflow._wait_for_resolution`, which
-#     raises `_StewardReescalated` and diverts the workflow on the strength of
-#     an open L1;
-#   - `orchestrator/workflow.py::TaskWorkflow._await_steward_completion`, the
-#     requeue-diversion override, which holds a requeue-producing steward
-#     outcome back when an L1 is already open.
+#   - `orchestrator/workflow.py::_is_l1_handoff`, the workflow's single rule
+#     for an open L1 that hands the task to a human.
+#     `TaskWorkflow._open_l1_handoffs` applies it for
+#     `_await_steward_completion`'s requeue-diversion override and
+#     `_awaited_record_outcome`'s cross-task check;
+#     `TaskWorkflow._wait_for_resolution`'s tail applies it, next to
+#     `escalation.pins.needs_human`, over the full pending set.
 #
 # The orphan-L0 reaper (`orchestrator/harness.py::Harness._reap_orphan_l0_escalations`)
 # is not a reader: since task 5223 its coverage rule is
 # `escalation/queue.py::EscalationQueue.dismiss_if_covered`, scoped to the L0's
 # own category, so an L1 of another category cannot hijack it.
 #
-# BOTH workflow.py sites are uncategorized, and an earlier revision of this
-# block listed only the first. That was a measurement error, corrected here
-# (esc-4821-5): `_await_steward_completion` was mistakenly reported as NOT
-# holding an uncategorized read, when it holds exactly the requeue-diversion
-# one. Grep `has_open_l1(` and subtract the `category=` call sites before
-# editing this list -- there are two uncategorized readers in workflow.py, not
-# one. The omission never changed the DESIGN (level-0 is invisible to every
-# level-1-only reader alike), only this list's claim to be complete.
+# workflow.py holds no uncategorized `has_open_l1` read.  Grep `has_open_l1(`
+# and `_is_l1_handoff` before editing this list.
 #
 # That is the population this closes.  Two classes of `has_open_l1` reader are
 # deliberately NOT in it, and were re-measured rather than assumed: the

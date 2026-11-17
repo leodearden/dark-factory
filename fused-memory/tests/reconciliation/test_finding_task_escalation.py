@@ -315,14 +315,12 @@ class TestBuildFindingTaskEscalationKwargs:
     def test_filed_at_level_zero_so_no_orchestrator_l1_guard_can_be_hijacked(self):
         """Level 0, and this is load-bearing rather than cosmetic.
 
-        ``EscalationQueue.has_open_l1`` is LEVEL-1-ONLY, and the orchestrator
-        reads it as a "a human is already on this task" signal at guards that
-        divert or suppress real work — the external-dep-block, cross-repo and
-        substrate-flip filers, the orphan-L0 reaper's dismiss branch, and the
-        steward-completion / requeue-diversion checks in ``workflow.py``.  A
-        recon-authored L1 sitting on the task would answer YES to every one of
-        them, so a passive observation would start gating dispatch.  A level-0
-        record is invisible to all of them by construction.
+        The orchestrator's guards that divert or suppress real work on a
+        "a human is already on this task" signal read pending LEVEL-1 records
+        only, enumerated in the ``FINDING_TASK_ESCALATION_LEVEL`` comment block.
+        A recon-authored L1 sitting on the task could answer YES to them, so a
+        passive observation would start gating dispatch.  A level-0 record is
+        invisible to all of them by construction.
         """
         assert self._build()['level'] == 0
 

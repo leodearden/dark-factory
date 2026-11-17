@@ -21488,18 +21488,16 @@ def test_routed_record_is_invisible_to_the_orchestrator_l1_guards(
 
     `EscalationQueue.has_open_l1` is LEVEL-1-ONLY
     (`escalation/queue.py::EscalationQueue.has_open_l1`, which delegates to
-    `get_by_task(task_id, status='pending', level=1)`), and the orchestrator
-    reads it UNCATEGORIZED — i.e. "is a human already on this task?" — at
-    guards that divert real work: TWO sites in `orchestrator/workflow.py`.
+    `get_by_task(task_id, status='pending', level=1)`), and the orchestrator's
+    guards that divert real work — "is a human already on this task?" — read
+    pending LEVEL-1 records only.
     That population is enumerated authoritatively,
     in `path::symbol` form, in the `FINDING_TASK_ESCALATION_LEVEL` comment block
     of `fused_memory/reconciliation/finding_task_escalation.py` — read it there
     rather than restating it here, and do not reintroduce bare line pins
     (CLAUDE.md: cite as `path/to/module.py::symbol`, never `module.py:1234`).
-    Deliberately a POINTER and not a summary-with-names: an earlier revision
-    named one of the two workflow.py sites and read as if that were the whole
-    set, which is how the block's own list came to be missing one (see the
-    correction note in it).
+    Deliberately a POINTER and not a summary-with-names: a summary here would
+    read as the whole set and drift from the block's list.
 
     A recon-authored L1 would answer YES to every one of them, turning a
     PASSIVE observation into a gate on dispatch. The two assertions below are
@@ -21520,7 +21518,7 @@ def test_routed_record_is_invisible_to_the_orchestrator_l1_guards(
 
     queue = EscalationQueue(queue_dir)
 
-    # (1) Invisible to every uncategorized L1 guard above.
+    # (1) Invisible to every level-1 guard above.
     assert queue.has_open_l1('4458') is False, (
         'a routed recon finding must NOT register as an open L1 — that is the '
         'signal every uncategorized orchestrator guard reads as "a human is '
