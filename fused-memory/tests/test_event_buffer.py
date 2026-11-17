@@ -1,8 +1,10 @@
 """Tests for SQLite-backed reconciliation event buffer."""
 
+import inspect
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import get_type_hints
 
 import aiosqlite
 import pytest
@@ -1583,6 +1585,18 @@ async def test_drain_by_ids_stamps_run_id_for_run_scoped_restore(buf):
     assert await buf.restore_drained('test-project', run_id='R1') == 2
     assert await buf.count_buffered('test-project') == 2
     assert [e.id for e in await buf.get_drained_events('test-project', 'R2')] == [e3.id]
+
+
+@pytest.mark.parametrize(
+    'drain_path',
+    [EventBuffer.drain, EventBuffer.drain_oldest_chunk, EventBuffer.drain_by_ids],
+)
+def test_no_drain_path_drains_without_a_run_id(drain_path):
+    """An unattributed drained row is what restore_drained(include_unattributed=True)
+    folds into another run's recovery, so no drain path may produce one (task 6784)."""
+    run_id = inspect.signature(drain_path).parameters['run_id']
+    assert run_id.default is inspect.Parameter.empty
+    assert get_type_hints(drain_path)['run_id'] is str
 
 
 # ── _debug_get_deferred_row tests ─────────────────────────────────────
