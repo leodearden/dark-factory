@@ -3621,6 +3621,10 @@ class TestSpeculativeMergeWorker:
         and re-merged. We patch merge_to_main so the re-merge produces a
         conflict for N+1, causing a conflict emit inside _remerge.
         """
+        # Deep chains off (task 10617): under the operational yaml's chain_cap N,
+        # alone in the verify frontier, would chain N+1 rather than leave it to
+        # the _remerge this scene asserts on.
+        config = config.model_copy(update={'merge_deep': MergeDeepConfig(chain_cap=0)})
         db_path = tmp_path / 'events_remerge.db'
         event_store = EventStore(db_path=db_path, run_id='test-run')
 
