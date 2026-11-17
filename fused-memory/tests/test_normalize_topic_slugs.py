@@ -2852,8 +2852,9 @@ class TestFailedRowsAreListedInTheirBuckets:
 class TestPartialUngatedGroup:
     """An ungated slug that only partly moved is listed, with what stood and what did not.
 
-    An ungated group gets no undo, so a partial failure leaves the slug split
-    across both values, and a plain re-run does not finish the move.
+    The members that moved are rolled back, so a re-run finishes the slug;
+    only a rollback that itself fails leaves the slug split, and that slug a
+    re-run refuses.
     """
 
     @staticmethod

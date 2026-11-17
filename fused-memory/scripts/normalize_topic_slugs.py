@@ -47,19 +47,24 @@ gate block out of each named task store, and ``run`` refuses ``--apply``
 unless the census covers every swept project.  A store the census could not
 read is a gap it names, never a silent "no gates here".
 
-A gated slug moves all-or-nothing; an ungated slug does not
------------------------------------------------------------
+Every slug moves all-or-nothing
+-------------------------------
 When any member write of a GATED slug fails, ``rename_group`` undoes the
 members that moved, because a gate left on a vacated slug is uncloseable.
 
-An UNGATED slug gets no undo.  A partial failure leaves it split: the members
-that moved carry the new slug and those whose write did not land keep the
-legacy value.  The residue probe files ``legacy_slug_residue`` for it, and the
-report lists the group under ``ungated_partial_rename``.
+An UNGATED slug is undone when its attempt leaves a member on the legacy
+value, because a split slug cannot be finished by re-running: the collision
+guard sees the moved members as incumbents on the new slug and refuses the
+stragglers as ``slug_collision``.  So the members this run moved are rolled
+back, the report lists the group under ``ungated_partial_rename`` (and the
+residue probe under ``legacy_slug_residue``), and a re-run finishes the move
+once the failure is resolved.  A member that vanished, or that another writer
+moved to a third value, is no longer on the legacy slug: it splits nothing and
+triggers no undo.
 
-A plain re-run does NOT finish the move.  The collision guard sees the moved
-members as incumbents on the new slug and refuses the stragglers as
-``slug_collision``.  The remedy is by hand: once a straggler's failure is
+The residual is an undo that itself fails.  That member stays on the new slug
+and is named in the group's ``undo_failures``, and a re-run refuses its slug
+as ``slug_collision``.  Finish it by hand: once the straggler's failure is
 resolved, patch its ``metadata.topic`` to the new slug with a metadata-only
 ``update_memory`` merge, the same patch this script issues.
 
@@ -91,8 +96,9 @@ Dry run is the default — the operator runbook
    others.  Also check ``under_enumerated`` / ``scroll_budget_exhausted``: a
    run with either populated is a LOWER BOUND, and a clean residue probe over
    it proves nothing.  After an ``--apply``, ``ungated_partial_rename`` lists
-   any slug left split across both values; it too is resolved by hand, as
-   described above.
+   any slug rolled back because a member's write failed: resolve that failure
+   and re-run.  An entry with non-empty ``undo_failures`` is still split
+   across both values and is finished by hand, as described above.
 
 3. **Apply**, as an OPERATOR, with the same roots::
 
@@ -261,7 +267,7 @@ SKIP_BUCKETS: tuple[str, ...] = (
     'orphan_gate_topic',
     'gate_ambiguous',
     'gate_lockstep_failed',
-    # from describe_partial_ungated_group
+    # from rename_group's hold of a split ungated slug
     'ungated_partial_rename',
     # from verify_old_slugs_drained
     'legacy_slug_residue',
@@ -1224,7 +1230,7 @@ def _gate_row(group: GateGroup, outcome: str, **extra) -> dict:
     }
 
 
-async def _undo_group(memory_service, group: GateGroup, results: list[dict]) -> list[dict]:
+async def _undo_group(memory_service, results: list[dict], *, rescore_as: str) -> list[dict]:
     """Put back exactly the writes THIS run made, and report what would not go.
 
     An undo is just a rename in the opposite direction, so it runs through
@@ -1234,7 +1240,8 @@ async def _undo_group(memory_service, group: GateGroup, results: list[dict]) -> 
     Only rows scored ``renamed`` are reversed.  A record that was
     ``already_normalized`` arrived at the new value before this sweep touched
     it; "undoing" it would be this script inventing a write of its own, and
-    would move a record the operator never asked it to move.
+    would move a record the operator never asked it to move.  Each reversed
+    row is re-scored *rescore_as*, the bucket of the hold that reversed it.
     """
     failures: list[dict] = []
     for result in results:
@@ -1257,8 +1264,34 @@ async def _undo_group(memory_service, group: GateGroup, results: list[dict]) -> 
                 'error': undo.get('error') or undo.get('error_type'),
             })
         result['undone'] = undo.get('outcome') == 'renamed'
-        result['outcome'] = 'gate_lockstep_failed'
+        result['outcome'] = rescore_as
     return failures
+
+
+async def _hold_split_ungated_group(
+    memory_service, group: GateGroup, results: list[dict],
+) -> dict | None:
+    """Roll back an ungated slug that this run left split, and report the hold.
+
+    The entry is described from the PRE-undo rows: once the moved members are
+    re-scored, nothing reads as stood.  An attempt that split nothing — every
+    member stood, or a straggler vanished or moved elsewhere — keeps its
+    writes and returns ``None``.
+    """
+    entry = describe_partial_ungated_group(group, results)
+    if entry is None:
+        return None
+    undo_failures = await _undo_group(
+        memory_service, results, rescore_as='ungated_partial_rename')
+    logger.warning(
+        'UNGATED SLUG HELD project=%s topic=%s -> %s: %d member(s) left on the '
+        'legacy value, so %d moved member(s) were rolled back; %d undo failure(s).',
+        group.project_id, group.old_topic, group.new_topic,
+        len(entry['failed_memory_ids']),
+        sum(1 for r in results if r.get('undone')),
+        len(undo_failures),
+    )
+    return {**entry, 'undo_failures': undo_failures}
 
 
 async def rename_group(
@@ -1290,27 +1323,31 @@ async def rename_group(
 
     An UNGATED group is the common case and short-circuits after step 1: it
     needs no client, so a sweep that touches no gate never opens a socket.
-    It also gets no undo; see the module docstring's "A gated slug moves
-    all-or-nothing; an ungated slug does not".
+    It is undone only when step 1 left it split (a member moved while another
+    is still on the legacy value), because a split slug cannot be finished by
+    re-running; see the module docstring's "Every slug moves all-or-nothing".
     A GATED group with no client is the same verdict as a refused gate —
     unable to move it is not permission to leave it behind.
 
     Returns:
-        ``(memory results, gate row or None)``.  Rows whose write was undone
-        are re-scored ``gate_lockstep_failed`` so the report never claims a
-        rename that no longer stands; rows that never wrote keep their own
-        diagnosis, which is the actionable one.
+        ``(memory results, group row or None)``: the gate row of a gated
+        group, the ``ungated_partial_rename`` entry of a held ungated group,
+        else ``None``.  Rows whose write was undone are re-scored
+        ``gate_lockstep_failed`` or ``ungated_partial_rename`` so the report
+        never claims a rename that no longer stands; rows that never wrote
+        keep their own diagnosis, which is the actionable one.
     """
     results = [
         await rename_one(memory_service, rename, apply=apply)
         for rename in group.renames
     ]
     if group.gate_task_id is None:
-        return results, None
+        return results, await _hold_split_ungated_group(memory_service, group, results)
 
     failed = [r for r in results if r.get('outcome') not in _STOOD_OUTCOMES]
     if failed:
-        undo_failures = await _undo_group(memory_service, group, results)
+        undo_failures = await _undo_group(
+            memory_service, results, rescore_as='gate_lockstep_failed')
         logger.warning(
             'GATE LOCKSTEP HELD project=%s topic=%s -> %s: %d of %d memory writes '
             'did not stand, so gate task %s was NOT patched.',
@@ -1358,7 +1395,8 @@ async def rename_group(
             return results, _gate_row(
                 group, 'gate_patched', patch=group.gate_block, response=response)
 
-    undo_failures = await _undo_group(memory_service, group, results)
+    undo_failures = await _undo_group(
+        memory_service, results, rescore_as='gate_lockstep_failed')
     logger.warning(
         'GATE LOCKSTEP HELD project=%s topic=%s -> %s: gate task %s was not '
         'patched (%s); %d memory write(s) undone, %d undo failure(s).',
@@ -1400,13 +1438,12 @@ def describe_partial_ungated_group(group: GateGroup, results: list[dict]) -> dic
         'failed_memory_ids': sorted(r['memory_id'] for r in failed),
         'failed_outcomes': sorted({str(r.get('outcome')) for r in failed}),
         'note': (
-            'this slug carries no consolidation gate, so members that move are '
-            'not rolled back when another fails and the slug is split across '
-            'both values (in a dry run the split is predicted, not yet made); '
-            'a plain re-run refuses the failed members still on the legacy '
-            'value as slug_collision, because the moved members occupy the new '
-            'slug — finish them by hand once their failure is resolved (see '
-            'the module docstring)'
+            'a member of this slug was left on the legacy value, so the '
+            'members this run moved are rolled back to it and a re-run '
+            'finishes the slug once the failure is resolved (in a dry run the '
+            'hold is predicted, not yet made); a member still on the new slug '
+            '(see undo_failures) makes a re-run refuse the rest as '
+            'slug_collision — finish it by hand (see the module docstring)'
         ),
     }
 
@@ -1851,14 +1888,15 @@ async def run(
     results: list[dict] = []
     gate_results: list[dict] = []
     for group in groups:
-        group_results, gate_row = await rename_group(
+        group_results, group_row = await rename_group(
             memory_service, group, apply=apply, client=client)
         results.extend(group_results)
-        if gate_row is not None:
-            gate_results.append(gate_row)
-        partial = describe_partial_ungated_group(group, group_results)
-        if partial is not None:
-            _record_skips([partial])
+        if group_row is None:
+            continue
+        if group.gate_task_id is None:
+            _record_skips([group_row])
+        else:
+            gate_results.append(group_row)
 
     # Scope item 3, in the same run that did the writing.
     await verify_old_slugs_drained(memory_service, results, skips)
