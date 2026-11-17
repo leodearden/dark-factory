@@ -9,6 +9,11 @@ pure readers over a topic's rows (:func:`refusal_streak`,
 ProposalState.PROPOSED)``, decodes each with :func:`from_ledger_record`, and
 moves it on with :func:`record_outcome`, rather than growing a second reader.
 
+The outcome also records what the adjudicator flow did to a proposal (PRD
+``plans/consolidation-adjudicator-prd.md`` K6). Its decision and reason code
+are stored as the strings recorded, so an aged row still decodes after the
+adjudicator's vocabulary changes.
+
 Clock-injected like :mod:`fused_memory.reconciliation.recon_ledger`: the
 builder takes ``now`` and an outcome carries a caller-supplied ``acted_at``
 rather than reading a clock. ``rationale`` and
@@ -20,11 +25,13 @@ from __future__ import annotations
 
 import dataclasses
 import json
-from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+import math
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
-from typing import Any
+from types import MappingProxyType
+from typing import Any, TypeVar
 
 from fused_memory.models.reconciliation import StageId
 from fused_memory.reconciliation.consolidation_auto import AutoOutcome
@@ -45,6 +52,8 @@ class ProposalState(StrEnum):
     GATED = 'gated'
     SUPERSEDED = 'superseded'
     REVERTED = 'reverted'
+    DROPPED = 'dropped'
+    UNRESOLVED = 'unresolved'
 
 
 _MEMBER_IDS_KEY = 'member_ids'
@@ -54,6 +63,8 @@ _RATIONALE_KEY = 'rationale'
 _SEEDED_FROM_KEY = 'seeded_from'
 _OUTCOME_KEY = 'outcome'
 _UNDECODABLE_PAYLOAD_KEY = 'undecodable_payload_json'
+
+_T = TypeVar('_T')
 
 
 @dataclass(frozen=True)
@@ -165,6 +176,160 @@ def _payload_str(payload: dict[str, Any], key: str) -> str:
 
 
 @dataclass(frozen=True)
+class ProposalRef:
+    """Another proposal row of the same project, by its topic and run id."""
+
+    topic: str
+    run_id: str
+
+    @classmethod
+    def from_record(cls, record: ReconLedgerRecord) -> ProposalRef:
+        """The ref to *record*, whose topic is its ``flag_type`` (see ``ConsolidationProposal.ledger_key``)."""
+        if record.record_kind != RECORD_KIND_CONSOLIDATION_PROPOSAL:
+            raise ValueError(
+                f'record_kind {record.record_kind!r} is not {RECORD_KIND_CONSOLIDATION_PROPOSAL!r}'
+            )
+        return cls(topic=record.flag_type, run_id=record.run_id)
+
+    def to_payload(self) -> dict[str, str]:
+        return {'topic': self.topic, 'run_id': self.run_id}
+
+    @classmethod
+    def from_payload(cls, payload: object) -> ProposalRef:
+        obj = _json_object(payload)
+        return cls(topic=_payload_str(obj, 'topic'), run_id=_payload_str(obj, 'run_id'))
+
+
+#: How much of a member's text the adjudication record keeps (PRD K6).
+SHOWN_TEXT_CHARS = 1500
+
+
+@dataclass(frozen=True)
+class ShownMember:
+    """One member as the adjudicator saw it, its text cut to :data:`SHOWN_TEXT_CHARS`."""
+
+    id: str
+    content_sha256: str
+    text: str
+
+    def __post_init__(self) -> None:
+        if len(self.text) > SHOWN_TEXT_CHARS:
+            raise ValueError(
+                f'shown text of {self.id} is {len(self.text)} chars, over the '
+                f'{SHOWN_TEXT_CHARS}-char cap'
+            )
+
+    @classmethod
+    def cut(cls, member_id: str, content_sha256: str, seen_text: str) -> ShownMember:
+        return cls(id=member_id, content_sha256=content_sha256, text=seen_text[:SHOWN_TEXT_CHARS])
+
+    def to_payload(self) -> dict[str, str]:
+        return {'id': self.id, 'content_sha256': self.content_sha256, 'text': self.text}
+
+    @classmethod
+    def from_payload(cls, payload: object) -> ShownMember:
+        obj = _json_object(payload)
+        return cls(
+            id=_payload_str(obj, 'id'),
+            content_sha256=_payload_str(obj, 'content_sha256'),
+            text=_payload_str(obj, 'text'),
+        )
+
+
+@dataclass(frozen=True)
+class AdjudicationRecord:
+    """What the adjudicator was shown and what it decided, for a reviewer with no store access.
+
+    ``waivers`` are the ``(code, subject member id)`` pairs the executor derived
+    from the decision; the model never writes one (PRD K2).
+    """
+
+    decision: str
+    reason_code: str
+    reason: str
+    waivers: tuple[tuple[str, str], ...]
+    claim_suggestion: str | None
+    identity: str
+    context_key: str
+    resolved_model: str | None
+    input_tokens: int | None
+    output_tokens: int | None
+    cost_usd: float | None
+    latency_s: float | None
+    shown: tuple[ShownMember, ...]
+
+    def __post_init__(self) -> None:
+        _check_measure('input_tokens', self.input_tokens, integral=True)
+        _check_measure('output_tokens', self.output_tokens, integral=True)
+        _check_measure('cost_usd', self.cost_usd, integral=False)
+        _check_measure('latency_s', self.latency_s, integral=False)
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            'decision': self.decision,
+            'reason_code': self.reason_code,
+            'reason': self.reason,
+            'waivers': [{'code': code, 'subject_id': subject} for code, subject in self.waivers],
+            'claim_suggestion': self.claim_suggestion,
+            'identity': self.identity,
+            'context_key': self.context_key,
+            'resolved_model': self.resolved_model,
+            'input_tokens': self.input_tokens,
+            'output_tokens': self.output_tokens,
+            'cost_usd': self.cost_usd,
+            'latency_s': self.latency_s,
+            'shown': [member.to_payload() for member in self.shown],
+        }
+
+    @classmethod
+    def from_payload(cls, payload: object) -> AdjudicationRecord:
+        """Decode :meth:`to_payload`'s shape; every key is required."""
+        obj = _json_object(payload)
+        missing = [f.name for f in dataclasses.fields(cls) if f.name not in obj]
+        if missing:
+            raise ValueError(f'adjudication is missing {", ".join(missing)}')
+        return cls(
+            decision=_payload_str(obj, 'decision'),
+            reason_code=_payload_str(obj, 'reason_code'),
+            reason=_payload_str(obj, 'reason'),
+            waivers=_decode_items(obj, 'waivers', _waiver_from_payload),
+            claim_suggestion=_optional_str(obj, 'claim_suggestion'),
+            identity=_payload_str(obj, 'identity'),
+            context_key=_payload_str(obj, 'context_key'),
+            resolved_model=_optional_str(obj, 'resolved_model'),
+            input_tokens=obj['input_tokens'],
+            output_tokens=obj['output_tokens'],
+            cost_usd=obj['cost_usd'],
+            latency_s=obj['latency_s'],
+            shown=_decode_items(obj, 'shown', ShownMember.from_payload),
+        )
+
+
+def _waiver_from_payload(payload: object) -> tuple[str, str]:
+    obj = _json_object(payload)
+    return _payload_str(obj, 'code'), _payload_str(obj, 'subject_id')
+
+
+def _check_measure(key: str, value: object, *, integral: bool) -> None:
+    """Refuse a count or measure that is not a finite non-negative number (``None`` allowed)."""
+    if value is None:
+        return
+    kinds: tuple[type, ...] = (int,) if integral else (int, float)
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, kinds)
+        or (isinstance(value, float) and not math.isfinite(value))
+        or value < 0
+    ):
+        wanted = 'int' if integral else 'number'
+        raise ValueError(f'{key!r} is not a non-negative {wanted} or null: {value!r}')
+
+
+def _no_repairs() -> Mapping[str, tuple[str, ...]]:
+    return MappingProxyType({})
+
+
+@dataclass(frozen=True)
 class ProposalOutcome:
     """What code did with one proposal row, stored on the row itself.
 
@@ -185,6 +350,17 @@ class ProposalOutcome:
     stripped_ids: tuple[str, ...] = ()
     gate_task_id: str | None = None
     closure_codes: tuple[str, ...] = ()
+    members_key: str | None = None
+    kept_ids: tuple[str, ...] = ()
+    repaired: Mapping[str, tuple[str, ...]] = field(default_factory=_no_repairs, hash=False)
+    effective_claim: str | None = None
+    effective_category: str | None = None
+    reused_from: ProposalRef | None = None
+    adjudication: AdjudicationRecord | None = None
+
+    def __post_init__(self) -> None:
+        frozen = MappingProxyType({code: tuple(ids) for code, ids in self.repaired.items()})
+        object.__setattr__(self, 'repaired', frozen)
 
     @property
     def executed(self) -> bool:
@@ -208,11 +384,22 @@ class ProposalOutcome:
             'stripped_ids': list(self.stripped_ids),
             'gate_task_id': self.gate_task_id,
             'closure_codes': list(self.closure_codes),
+            'members_key': self.members_key,
+            'kept_ids': list(self.kept_ids),
+            'repaired': {code: list(ids) for code, ids in self.repaired.items()},
+            'effective_claim': self.effective_claim,
+            'effective_category': self.effective_category,
+            'reused_from': None if self.reused_from is None else self.reused_from.to_payload(),
+            'adjudication': None if self.adjudication is None else self.adjudication.to_payload(),
         }
 
     @classmethod
     def from_payload(cls, payload: object) -> ProposalOutcome:
-        """Decode :meth:`to_payload`'s shape; ``ValueError`` naming any bad field."""
+        """Decode :meth:`to_payload`'s shape; ``ValueError`` naming any bad field.
+
+        The fields the adjudicator flow added read as their defaults when ABSENT,
+        so a row written before them still decodes; present and malformed raises.
+        """
         if not isinstance(payload, dict):
             raise ValueError(f'outcome is not a JSON object: {payload!r}')
         verdict = _optional_str(payload, 'verdict')
@@ -233,6 +420,13 @@ class ProposalOutcome:
             stripped_ids=_str_tuple(payload, 'stripped_ids'),
             gate_task_id=_optional_str(payload, 'gate_task_id'),
             closure_codes=_str_tuple(payload, 'closure_codes'),
+            members_key=_optional_str(payload, 'members_key'),
+            kept_ids=_optional_str_tuple(payload, 'kept_ids'),
+            repaired=_str_tuple_mapping(payload, 'repaired'),
+            effective_claim=_optional_str(payload, 'effective_claim'),
+            effective_category=_optional_str(payload, 'effective_category'),
+            reused_from=_optional_object(payload, 'reused_from', ProposalRef.from_payload),
+            adjudication=_optional_object(payload, 'adjudication', AdjudicationRecord.from_payload),
         )
 
 
@@ -335,3 +529,53 @@ def _str_tuple(payload: dict[str, Any], key: str) -> tuple[str, ...]:
     if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
         raise ValueError(f'payload {key!r} is not a list of strings: {value!r}')
     return tuple(value)
+
+
+def _optional_str_tuple(payload: dict[str, Any], key: str) -> tuple[str, ...]:
+    """:func:`_str_tuple`, reading an absent key as empty."""
+    return _str_tuple(payload, key) if key in payload else ()
+
+
+def _str_tuple_mapping(payload: dict[str, Any], key: str) -> dict[str, tuple[str, ...]]:
+    """An object of string lists, reading an absent key as empty."""
+    value = payload.get(key, {})
+    if not isinstance(value, dict) or not all(
+        isinstance(ids, list) and all(isinstance(i, str) for i in ids) for ids in value.values()
+    ):
+        raise ValueError(f'payload {key!r} is not an object of string lists: {value!r}')
+    return {code: tuple(ids) for code, ids in value.items()}
+
+
+def _optional_object(
+    payload: dict[str, Any], key: str, decode: Callable[[object], _T],
+) -> _T | None:
+    """*decode* the object under *key*, reading an absent or null key as ``None``."""
+    value = payload.get(key)
+    if value is None:
+        return None
+    try:
+        return decode(value)
+    except ValueError as exc:
+        raise ValueError(f'payload {key!r}: {exc}') from exc
+
+
+def _decode_items(
+    payload: dict[str, Any], key: str, decode: Callable[[object], _T],
+) -> tuple[_T, ...]:
+    """*decode* each element of the list under *key*, naming the key and index on failure."""
+    value = payload.get(key)
+    if not isinstance(value, list):
+        raise ValueError(f'payload {key!r} is not a list: {value!r}')
+    items: list[_T] = []
+    for index, item in enumerate(value):
+        try:
+            items.append(decode(item))
+        except ValueError as exc:
+            raise ValueError(f'payload {key!r}[{index}]: {exc}') from exc
+    return tuple(items)
+
+
+def _json_object(value: object) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError(f'not a JSON object: {value!r}')
+    return value
