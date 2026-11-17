@@ -12,7 +12,7 @@ Four facts survive a process restart, in their own tables of
 
 Losing them at a restart re-accrued the same refusals and re-announced the
 same cohort about a day later; plans/scheduler-dispatch-scoring-and-lock-layer-prd.md
-C4 Bounds records why each one is kept.  A store fault never stops the
+C4 "Cap L1" records why each one is kept.  A store fault never stops the
 scheduler: the in-memory state stays authoritative for the process and the
 fault is logged, as for the eligibility clock.
 """

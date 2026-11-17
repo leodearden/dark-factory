@@ -193,10 +193,17 @@ today a scoring retune costs a fleet restart. The new knobs ship as a submodel g
 **D9 — Watchdog consequence is an auto-pin, bounded and owned (INV-7).** The override store
 is the only restart-durable prioritization state. The auto-pin carries `ttl_until`, is
 capped at `auto_pin_max_concurrent`, is tagged with its source so an operator's manual pin
-is never clobbered or miscounted, and is released when the task dispatches. Hitting the cap
-is itself the escalation — a systemically starved queue is an operator-grade signal, not a
-per-task one. This matters concretely: the pin queue already holds 12 entries, 4 of them
-operator pins.
+is never clobbered or miscounted, and is released when the task dispatches. A starving task
+the cap turns away files no per-task escalation; one sentinel L1 speaks for the capped cohort.
+This matters concretely: the pin queue already holds 12 entries, 4 of them operator pins.
+
+*AMENDED 2026-11-13 (task 9636).* The original text made hitting the cap itself the escalation.
+In operation that re-announced the same standing cohort of ~290 tasks, in bursts about a day
+after each restart (plans/starvation-cap-study-2026-11-12.md). Leo's ruling of 2026-11-13: the
+cap L1 signals a CHANGE in the capped cohort, a standing cohort files nothing new, and per-task
+facts stay in `starvation_detected` events. Leo's ruling of 2026-11-16 adds that it is filed only
+when the watchdog can name a wedge: some blocker's holder is not live. The rule, its thresholds
+and the liveness walk are in C4 "Cap L1".
 
 **D10 — Ordering: backfill lands before park persistence.** Making parks durable amplifies
 whatever the current parking regime does. For dark-factory the sim says the current regime
@@ -366,10 +373,67 @@ longer wipes 72h of accrued idleness and a 2.2h process era no longer bounds a 7
 4. Keep the existing level-0 INFO escalation as the human trail; it now has a consequence.
 
 **Bounds (INV-7 / INV-4).** At most `auto_pin_max_concurrent` (default 3) watchdog-owned pins
-at a time. At the cap, do not pin — escalate at L1 instead, naming the starved cohort. Every
+at a time. At the cap, do not pin: the firing joins the *waiting cohort* and waits for a pin
+slot, and the cap L1 below speaks for the cohort. Every
 auto-pin carries `ttl_until` (default 24h) and is released at both dispatch sites (where
 `_resolve_starvation_escalation` already runs), clearing **only** pins whose `source` is the
 watchdog.
+
+**Cap L1 (AMENDED 2026-11-13, task 9636; D9).** One level-1 escalation under the sentinel
+`__starvation_auto_pin_cap__` reports a CHANGE in the waiting cohort, and only when the watchdog
+can point at something a human should look at. Code: `orchestrator/src/orchestrator/starvation_cap.py`.
+
+- *Alarming.* Some blocker of some member has a non-live holder. Every blocker counts, not only
+  the first: a member needs all its modules, so a wedged holder on its second module starves it
+  as surely as one on its first. The cohort also alarms when it has members, some task holds a
+  lock, and no member has a recorded blocker, the case the watchdog cannot explain. An empty
+  lock table explains nothing, so it alarms nothing. That case is the first ticks after a
+  restart, before holders re-dispatch.
+- *Liveness* (`orchestrator/src/orchestrator/blocker_liveness.py`). A HELD blocker's holder is
+  live iff it is in the tick's active task read, not terminal, not `blocked`, and
+  `shared.task_claimant.has_live_claimant` holds at `claimant_liveness_ttl_secs`, the dispatch
+  gate's own predicate and TTL. A workflow heartbeats for its whole slot, merge phase included,
+  so a slow holder reads live. A PARKED blocker's owner is followed to its own blockers, at most
+  `PARK_FOLLOW_DEPTH` = 3 parks deep (park, park, park, holder). A cycle, a deeper chain, or an
+  owner absent from the read or terminal is non-live. A park owner whose modules are all free
+  waits only for a run slot, which is live.
+- *FILE* when no cap L1 is open, the cohort alarms, and it is news against the last
+  announcement: a new non-live holder, a new first-blocker module, or growth to
+  `size + max(GROWTH_FLOOR, ceil(GROWTH_RATIO × size))` with `GROWTH_FLOOR` = 10 and
+  `GROWTH_RATIO` = 0.5.
+- *REFRESH* the open L1 in place (same id, `dedupe_count` + 1) whenever its rendering changes.
+  The rendering carries no ages or counts, so it changes only with membership, first-blocker
+  modules or wedges.
+- *RESOLVE* the open L1, under `orchestrator-starvation-watchdog`, when the cohort empties or no
+  longer alarms.
+- *Baseline.* FILE and REFRESH replace the last announcement. A human or watcher close keeps it,
+  so a standing cohort files nothing after a "wait" close. A resolve on a wedge clearing keeps
+  it, so a flickering heartbeat does not re-file. An empty cohort resets it, so a cohort that
+  re-forms (say after task 10578 lowers `skip_threshold`) is news.
+- *Drain.* A waiter that is a dispatch candidate this tick but no longer fires a pinning gate
+  leaves the cohort, for example after a hot-reload of `skip_threshold`, `idle_secs` or
+  `idle_only_secs`. Disabling the watchdog drains it whole. A waiter off the candidate list keeps
+  its place, as the eligibility clock's anchors do. So the L1 is open iff the live cohort is
+  non-empty and alarming.
+- *Restart durability* (`orchestrator/src/orchestrator/starvation_state.py`). The cohort with each
+  member's gate, the lock-refusal counts, the per-task announced set and the last announcement
+  live in `scheduler_eligibility.db` beside the eligibility anchors. A restart therefore neither
+  re-accrues refusals into a burst a day later nor re-announces a standing cohort or a task
+  already escalated.
+- *Role.* The L1 is filed, refreshed and resolved as `orchestrator-starvation-watchdog`, so none
+  of it feeds the EWA breaker numerator: watchdog alarms are observations (task 3821).
+
+*Why the growth bound.* The 2026-11-12 study saw about 9 genuinely new starving tasks a day
+against about 9 departures: 358 distinct tasks were capped in 7.5 days and 291 still wait. The
+cohort therefore random-walks. Its daily net change has a standard deviation of about 4, about 23
+over a month (about 8% of 290). +50% of a 290-task cohort is 145 tasks, more than 16 days of
+arrivals with no departure and over six monthly standard deviations: a change in the lock
+regime, never drift. The floor of 10 keeps a small cohort from re-filing on two days' arrivals.
+The bounds are code constants, not config knobs: `config.py` is itself one of the hottest
+files the cohort waits on, and nobody has asked to tune them.
+
+The cap itself stays at 3 by Leo's ruling (task 9636). The interim `skip_threshold: 150` override in
+`dark-factory-orchestrator.yaml` stays until task 10578 removes it.
 
 **Park-blocked discriminator (AMENDED 2026-08-07, post-csv-outage).** The clock above measures
 *eligibility*, which cannot separate two classes that need opposite responses:

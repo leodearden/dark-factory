@@ -9,7 +9,7 @@ modules; it is followed to those modules' blockers, at most
 ``PARK_FOLLOW_DEPTH`` parks deep.  A park owner whose modules are all free
 waits only for a run slot, which is not a wedge.
 
-plans/scheduler-dispatch-scoring-and-lock-layer-prd.md C4 Bounds records why
+plans/scheduler-dispatch-scoring-and-lock-layer-prd.md C4 "Cap L1" records why
 the walk stops where it does.
 """
 

@@ -8,7 +8,7 @@ members has a recorded blocker while some task holds a lock.  An empty lock
 table (the first ticks after a restart, before holders re-dispatch) explains
 nothing either way, so it alarms nothing.  The rule, its thresholds and the liveness
 walk are justified in plans/scheduler-dispatch-scoring-and-lock-layer-prd.md
-C4 Bounds.
+C4 "Cap L1".
 
 - FILE when no cap L1 is open, the cohort alarms, and it is news against the
   last announcement: a new non-live holder, a new first-blocker module, or
