@@ -24,7 +24,7 @@ reify's originals on the strength of this suite being green:
   ``N`` at or above a per-suite floor — the same strictly-stronger predicate
   reify's own runner (``tests/infra/run_all_ambient_isolation_lib.sh``) applies.
   Exit-status-only would be the weak link in κ's chain: a block that skips or
-  short-circuits still exits 0 while its share of the 865 asserts never runs.
+  short-circuits still exits 0 while its share of the asserts never runs.
   See ``ASSERT_FLOORS``.
 
 These items no longer run in the default ``orchestrator`` suite.  Task 3349
@@ -108,19 +108,22 @@ SCRIPT_COVERAGE = {
 #: deletes reify's originals on the strength of this suite, so the weaker
 #: predicate is not good enough here.
 #:
-#: Only TWO deductions from the measured counts in
-#: ``orchestrator/tests/warm-lane/README.md`` are legitimate, both from skip
-#: guards this leaf was required to preserve verbatim:
+#: Only THREE deductions from the measured counts are legitimate, each from a
+#: skip guard ported verbatim from reify:
 #:
 #: * ``test_provision_warm_lane_fs.sh`` Block I (5 asserts) — real-geometry
 #:   ``xfs_info``/``xfs_db`` proof, guarded on ``mkfs.xfs``/``xfs_info``/
-#:   ``xfs_db``.  Measured: 111 with xfsprogs, 106 without.  xfsprogs is
+#:   ``xfs_db``.  Measured 115 with xfsprogs on 2026-11-17; without it
+#:   Block I's 5 asserts are skipped.  xfsprogs is
 #:   deliberately NOT added to ``REQUIRED_HOST_TOOLS`` — that guard exists so the
 #:   bash file stays runnable by a developer on any host, and promoting it to a
 #:   hard requirement would red the whole orchestrator suite on a host that only
 #:   lacks an optional package.
 #: * ``test_warm_lane_audit.sh`` L9 (3 asserts) — unreadable-record degradation,
 #:   guarded on ``id -u != 0`` because mode 000 is not a barrier for root.
+#: * ``test_warm_lane_gc.sh`` S-discard3 (8 asserts) — a seed whose discard of
+#:   ``<lane>/target`` itself fails, staged with ``chmod a-w`` on the lane dir
+#:   and so guarded on ``id -u != 0``: the same root-guarded rule as L9.
 #:
 #: ``test_thin_warm_lane.sh``'s Block C df-delta assert is not a deduction: it is
 #: gated on ``REIFY_WARM_LANE_MOUNT``, which ``_sanitized_env`` always strips, so
@@ -183,11 +186,23 @@ SCRIPT_COVERAGE = {
 #:
 #: Dark-factory task 5307 then ported reify task 5823's live-process-reference
 #: gate into ``thin-warm-lane.sh`` with its coverage — A12, the B3 token pair,
-#: B3b and Block F — so the thin floor moved 45 → 75.  RE-MEASURED against the
-#: suite (``Results: 75 passed, 0 failed``), not raised to absorb a red.  The new
+#: B3b and Block F — so the thin floor moved 45 → 74.  RE-MEASURED against the
+#: suite (``Results: 74 passed, 0 failed``), not raised to absorb a red.  The new
 #: asserts carry no skip guard; they need only ``flock`` and a readable ``/proc``.
 #: NON-VACUOUS by construction: against the pre-port script the same file reports
-#: ``61 passed, 14 failed``.
+#: ``60 passed, 14 failed``.
+#:
+#: Dark-factory task 6931 then split ``test_warm_lane_gc.sh`` along its
+#: reify-ported / dark-factory-native seam into ``test_warm_lane_gc.sh`` and
+#: ``test_warm_lane_gc_native.sh``, so the single 441 floor became two:
+#: 441 → 226 and a new 217.  RE-MEASURED against each half
+#: (``Results: 234 passed, 0 failed`` and ``Results: 217 passed, 0 failed``),
+#: not raised to absorb a red.  The partition is lossless: the two halves'
+#: sorted PASS labels equal the pre-split suite's 449 plus the native suite's
+#: own TRASH1/TRASH2 pair.  No skip guard moved: S-discard3 stays in the
+#: ported half, which still deducts its 8 root-guarded asserts, and the native
+#: floor is its measured count.  The decision is recorded in
+#: ``orchestrator/tests/warm-lane/README.md`` "Delta 10".
 ASSERT_FLOORS = {
     'test_warm_lane_disk_guard.sh': 89,  # 79 + 10 (A10, task 5940)
     'test_warm_lane_degenerate_ref.sh': 95,  # 70 + 11 (K1-K6: the conventional-commit citation arm)
@@ -249,9 +264,9 @@ REQUIRED_HOST_TOOLS = ('bash', 'git', 'flock', 'du', 'dd', 'python3')
 #: rationale.  The ``GIT_*`` pair is the subtler hazard — pytest's ``--basetemp``
 #: may legally sit INSIDE a checkout, and this suite runs under git hooks and
 #: ``git rebase --exec``, which export ``GIT_DIR``, under which a bare
-#: ``git init`` in a test fixture fails outright.  Six of the ported tests build
-#: synthetic git repos and ``test_warm_lane_gc.sh`` alone does 34
-#: ``git worktree add`` calls, so stripping these is non-negotiable.
+#: ``git init`` in a test fixture fails outright.  Seven of the bash suites build
+#: synthetic git repos, and both gc suites call ``git worktree add``
+#: throughout, so stripping these is non-negotiable.
 _HOSTILE_ENV_KEYS = ('GIT_DIR', 'GIT_WORK_TREE')
 
 #: A PREFIX rule, not a name list.  The relocated scripts read ~30 ``REIFY_*``
@@ -548,8 +563,8 @@ def test_bash_suite_passes(name: str) -> None:
     """Each bash suite must be green by reify's own greenness predicate.
 
     ``exit 0`` AND a ``Results: N passed, 0 failed`` line AND ``N`` at or above
-    ``ASSERT_FLOORS[name]``.  Exit status alone cannot distinguish "all 865
-    asserts ran and passed" from "a block skipped and the rest passed", and leaf
+    ``ASSERT_FLOORS[name]``.  Exit status alone cannot distinguish "every
+    assert ran and passed" from "a block skipped and the rest passed", and leaf
     κ deletes reify's originals on the strength of this item being green.
     """
     returncode, stdout, stderr = _run_bash_suite(name)
