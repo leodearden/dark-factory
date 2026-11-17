@@ -99,7 +99,7 @@ class CheckoutRootError(RuntimeError):
         self.checkout = checkout
 
 
-_PROBE_ERRORS = (OSError, ValueError, RuntimeError)
+_PROBE_ERRORS = (OSError, ValueError)
 
 
 def default_project_root() -> Path:
@@ -124,9 +124,7 @@ def main_checkout_of(path: StrPath) -> Path:
     with _probing(commondir, checkout=checkout):
         if not commondir.is_file():
             return checkout
-    named_common = gitdir / _read_pointer_file(commondir, checkout=checkout).strip()
-    with _probing(named_common, checkout=checkout):
-        common = named_common.resolve()
+    common = _realpath(gitdir / _read_pointer_file(commondir, checkout=checkout).strip(), checkout=checkout)
     if common.name != '.git':
         raise CheckoutRootError(
             f'{checkout} is a linked worktree whose common git dir {common} is not '
@@ -141,8 +139,6 @@ def main_checkout_of(path: StrPath) -> Path:
 def _probing(target: StrPath, *, checkout: Path | None) -> Iterator[None]:
     try:
         yield
-    except CheckoutRootError:
-        raise
     except _PROBE_ERRORS as exc:
         raise CheckoutRootError(
             f'probing {target} failed ({type(exc).__name__}: {exc}), '
@@ -151,15 +147,24 @@ def _probing(target: StrPath, *, checkout: Path | None) -> Iterator[None]:
         ) from exc
 
 
+def _realpath(path: StrPath, *, checkout: Path | None) -> Path:
+    """``Path.resolve()`` as Python 3.13 does it: before 3.13 it raised RuntimeError on a symlink loop."""
+    with _probing(path, checkout=checkout):
+        return Path(os.path.realpath(path))
+
+
 def _enclosing_checkout(path: StrPath) -> Path:
-    with _probing(path, checkout=None):
-        start = Path(path).resolve()
+    start = _realpath(path, checkout=None)
+    unprobeable: Exception | None = None
     for candidate in (start, *start.parents):
-        dot_git = candidate / '.git'
-        with _probing(dot_git, checkout=None):
-            if dot_git.exists():
+        try:
+            if (candidate / '.git').exists():
                 return candidate
-    raise CheckoutRootError(f'no git checkout encloses {start}: no ancestor has .git')
+        except _PROBE_ERRORS as exc:
+            unprobeable = exc
+    raise CheckoutRootError(
+        f'no git checkout encloses {start}: no ancestor has a .git this process can see'
+    ) from unprobeable
 
 
 def _read_pointer_file(pointer_file: Path, *, checkout: Path) -> str:
@@ -181,9 +186,8 @@ def _gitdir_of(checkout: Path) -> Path:
             f'got {text!r}',
             checkout=checkout,
         )
-    named_gitdir = checkout / values[0]
-    with _probing(named_gitdir, checkout=checkout):
-        gitdir = named_gitdir.resolve()
+    gitdir = _realpath(checkout / values[0], checkout=checkout)
+    with _probing(gitdir, checkout=checkout):
         is_gitdir = gitdir.is_dir()
     if not is_gitdir:
         raise CheckoutRootError(

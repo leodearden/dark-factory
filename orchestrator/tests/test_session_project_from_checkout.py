@@ -158,6 +158,17 @@ def test_gitdir_under_an_unsearchable_directory_falls_back_to_the_checkout_holdi
         locked.chmod(0o755)
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason='root searches a mode-000 directory')
+def test_unsearchable_directory_inside_a_checkout_still_names_the_checkout(acme: Path) -> None:
+    locked = _mkdir(acme / 'locked')
+    sub = _mkdir(locked / 'sub')
+    locked.chmod(0)
+    try:
+        assert _cwd_project(sub) == 'acme'
+    finally:
+        locked.chmod(0o755)
+
+
 def test_nul_byte_cwd_keeps_its_basename(tmp_path: Path) -> None:
     assert _cwd_project(f'{tmp_path}/scr\x00atch') == 'scr\x00atch'
 
