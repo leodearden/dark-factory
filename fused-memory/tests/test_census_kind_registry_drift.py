@@ -173,3 +173,67 @@ class TestKindRegistryDriftInReport:
         report = _report(self.PAYLOADS)
         assert json.loads(json.dumps(report)) == report
         assert self._block() == self._block()
+
+
+def _section(markdown):
+    start = markdown.index('## Kind vocabulary drift')
+    end = markdown.find('\n## ', start + 1)
+    return markdown[start:] if end == -1 else markdown[start:end]
+
+
+class TestRenderKindRegistryDrift:
+    INVENTED = ['invented_kind_a', 'invented_kind_b', 'invented_kind_c']
+
+    def _report(self, top_n=2):
+        return _report(
+            {'dark_factory': [{'kind': 'cycle_summary'}] + [{'kind': k} for k in self.INVENTED]},
+            top_n=top_n,
+        )
+
+    def test_the_section_sits_between_coverage_trend_and_record_counts(self):
+        markdown = _mod.render_markdown(self._report())
+        lines = markdown.splitlines()
+        assert '## Kind vocabulary drift' in lines
+        heading = markdown.index('\n## Kind vocabulary drift\n')
+        assert markdown.index('\n## Coverage trend\n') < heading
+        assert heading < markdown.index('\n## Record counts\n')
+
+    def test_the_headline_carries_the_four_counts(self):
+        report = self._report()
+        block = report['kind_registry_drift']
+        section = _section(_mod.render_markdown(report))
+        assert f'{len(KIND_REGISTRY):,}' in section
+        for key in ('measured_distinct', 'unregistered_distinct', 'absent_from_corpus_distinct'):
+            assert f'**{_mod._num(block[key])}**' in section
+
+    def test_the_unregistered_table_is_cut_to_top_n_and_says_so(self):
+        section = _section(_mod.render_markdown(self._report(top_n=2)))
+        assert '| value | count |' in section
+        assert '`invented_kind_a`' in section
+        assert '`invented_kind_b`' in section
+        assert '`invented_kind_c`' not in section
+        assert 'truncated' in section
+
+    def test_no_drift_renders_explicit_none_lines(self):
+        report = self._report()
+        report['kind_registry_drift'] = _mod.build_kind_registry_drift(
+            [{'value': v, 'count': 1} for v in sorted(KIND_REGISTRY)],
+        )
+        assert report['kind_registry_drift']['unregistered'] == []
+        assert report['kind_registry_drift']['absent_from_corpus'] == []
+        section = _section(_mod.render_markdown(report))
+        assert section.count('_(none)_') == 2
+
+    def test_a_pre_v6_report_discloses_the_missing_block(self):
+        report = self._report()
+        del report['kind_registry_drift']
+        section = _section(_mod.render_markdown(report))
+        assert 'absent' in section
+        assert '| value |' not in section
+
+    def test_the_section_states_the_axis_only_warns(self):
+        assert 'does not reject' in _section(_mod.render_markdown(self._report()))
+
+    def test_rendering_is_deterministic(self):
+        report = self._report()
+        assert _mod.render_markdown(report) == _mod.render_markdown(report)
