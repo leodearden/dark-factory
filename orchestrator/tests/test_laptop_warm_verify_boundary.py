@@ -1041,7 +1041,8 @@ def test_normal_warm_path_reuses_fixed_worktree_twice_no_escalation(tmp_path, mo
 
 # ---------------------------------------------------------------------------
 # Task 2309 step-5/6 -- SS9 Row 4: cancel-verify under a LIVE watchdog (B2
-# coexistence).  Extends test_cli.py:1656's real e2e cancel pattern with a
+# coexistence).  Extends the real e2e cancel pattern of
+# test_cli_verify_merge.py::test_verify_merge_cancel_end_to_end with a
 # live HeartbeatWriter so the stdin watchdog stays armed throughout but never
 # self-fires, proving an explicit cancel-verify tree-kills cleanly anyway.
 # ---------------------------------------------------------------------------
@@ -1057,7 +1058,7 @@ def test_cancel_verify_tree_kills_under_live_watchdog(tmp_path, monkeypatch):
     for the whole test but never times out or self-fires.  Waits for the
     build to publish its session pgid (:func:`sleeper_spec`'s
     *build_pgid_file*), then cancels via ``cancel-verify --request-id``
-    through :class:`CliRunner` (the same in-process pattern as test_cli.py's
+    through :class:`CliRunner` (the same in-process pattern as test_cli_verify_merge.py's
     ``test_verify_merge_cancel_end_to_end``).
 
     Asserts:
@@ -1685,7 +1686,7 @@ def test_flock_contention_full_two_way_seam_blocks_and_escalates(tmp_path):
 # Task 2830 step-4 -- the SS9 Signal at the real subprocess seam: a live
 # knob-ON verify-merge HOLDS the shared <lane_dir>.lock mid-build, so a
 # non-blocking flock probe on it from this process is DENIED.  Stronger
-# evidence than the mock-based step-1 pin (test_cli.py
+# evidence than the mock-based step-1 pin (test_cli_verify_merge.py
 # test_verify_merge_holds_lane_lock_during_warm_run): drives the real CLI
 # span end-to-end and pins the lock PATH the split lane-lock lifetime
 # (esc-2830-1) re-acquires for the build's duration.

@@ -418,7 +418,7 @@ class TestVerifyTaskRefusals:
 
 
 def _verify_task_child_env() -> dict[str, str]:
-    """The env of test_cli.py::test_verify_merge_cancel_end_to_end, plus a hermetic cold verify."""
+    """The env of test_cli_verify_merge.py::test_verify_merge_cancel_end_to_end, plus a hermetic cold verify."""
     env = dict(os.environ)
     worktree_src = str(Path(__file__).parent.parent / 'src')
     existing_pp = env.get('PYTHONPATH', '')
