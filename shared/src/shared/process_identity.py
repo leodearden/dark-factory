@@ -13,6 +13,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Final
 
+from shared.proc_group import MalformedStatLine, parse_start_ticks
 from shared.proc_liveness import pid_alive
 
 __all__ = [
@@ -65,9 +66,6 @@ class _Absent(ProcessIdentityUnreadable):
     """ENOENT/ESRCH: unreadable unless the caller holds positive evidence that it means exited."""
 
 
-_START_TICKS_AFTER_COMM: Final = 19
-
-
 def _errno_cause(exc: OSError) -> str:
     return f'{errno.errorcode.get(exc.errno or 0, f"errno {exc.errno}")} ({exc.strerror})'
 
@@ -107,15 +105,11 @@ def _read_pid_file(path: Path, proc_root: Path) -> str | None:
         return None
 
 
-def _parse_start_ticks(path: Path, text: str) -> int:
-    close = text.rfind(')')
-    fields = text[close + 1 :].split()
-    if close < 0 or len(fields) <= _START_TICKS_AFTER_COMM:
-        raise ProcessIdentityUnreadable(path, f'malformed stat line {text!r}')
-    start_ticks = fields[_START_TICKS_AFTER_COMM]
-    if not start_ticks.isdecimal():
-        raise ProcessIdentityUnreadable(path, f'start_ticks {start_ticks!r} is not a number')
-    return int(start_ticks)
+def _start_ticks(path: Path, text: str) -> int:
+    try:
+        return parse_start_ticks(path, text)
+    except MalformedStatLine as exc:
+        raise ProcessIdentityUnreadable(path, f'malformed stat line {text!r}') from exc
 
 
 def _start_ticks_of_existing_pid(pid: int, proc_root: Path) -> int | None:
@@ -123,7 +117,7 @@ def _start_ticks_of_existing_pid(pid: int, proc_root: Path) -> int | None:
         return None
     path = proc_root / str(pid) / 'stat'
     text = _read_pid_file(path, proc_root)
-    return None if text is None else _parse_start_ticks(path, text)
+    return None if text is None else _start_ticks(path, text)
 
 
 def capture(pid: int, *, proc_root: Path = PROC_ROOT) -> ProcessIdentity | None:
