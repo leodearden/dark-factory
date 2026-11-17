@@ -16,6 +16,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, NonCallableMagicMock
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 # APPEND, never insert(0, ...): the repo root must stay LAST on sys.path or the
@@ -39,6 +40,8 @@ from df_pytest_isolation import (  # noqa: E402  # debt: task 6997
     mock_derived_stray_dirs,
     mock_fspath_root_names,
 )
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # Reached through the module, never imported: importing a fixture into a test
 # module registers it there and would shadow the wiring under test.
