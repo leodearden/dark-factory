@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 
 import pytest
+from shared import proc_liveness
 
 from orchestrator import session_identity
 
@@ -20,6 +21,39 @@ def test_resolve_session_pid_prefers_claude_pid(caplog: pytest.LogCaptureFixture
     assert pid == 1348600
     # The happy path is silent: a resolvable session pid is not a degradation.
     assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+
+@pytest.mark.parametrize(
+    'env',
+    [
+        {},
+        {'CLAUDE_PID': ''},
+        {'CLAUDE_PID': '   '},
+        {'CLAUDE_PID': 'not-a-pid'},
+        {'CLAUDE_PID': '0'},
+        {'CLAUDE_PID': '-1'},
+    ],
+    ids=['unset', 'empty', 'blank', 'non-numeric', 'zero', 'negative'],
+)
+def test_resolve_session_pid_falls_back_loudly_to_a_provably_dead_pid(
+    env: dict[str, str], caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.WARNING):
+        pid = session_identity.resolve_session_pid(env)
+
+    # Fallback, never a raise -- and never a pid that merely LOOKS resolved.
+    # THE assertion: the degraded pid must be one `pid_alive` reports dead,
+    # so the lease's staleness AND-guard collapses to its heartbeat half (the
+    # documented degradation) rather than to a never-reapable lease. The
+    # earlier `os.getsid(0)` fallback failed this: the POSIX session leader is
+    # the interactive shell, which outlives a crashed `claude`.
+    assert pid == 0
+    assert proc_liveness.pid_alive(pid) is False
+    # LOUD, not silent: the repo's loud-over-silent-degradation norm (INV-2).
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert warnings
+    blob = ' '.join(r.getMessage() for r in warnings).lower()
+    assert 'degraded' in blob
 
 
 def test_resolve_session_pid_defaults_to_os_environ(monkeypatch: pytest.MonkeyPatch) -> None:
