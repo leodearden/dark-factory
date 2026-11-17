@@ -45,13 +45,26 @@ verbatim. It checks these arms in order, and the first that applies wins:
 6. **Only the bare `pytest` default, at task role**: no floor. The task-1852
    skip is kept, and its plan record still reads SKIPPED with a reason.
 
-The same rule is applied twice. The plan decision
-(`orchestrator/src/orchestrator/verify_plan.py::_derive_fallback_runs`)
-records a floored test run as FULL_SUITE with the floor's reason. The
-executed config (`orchestrator/src/orchestrator/verify.py::_run_scoped_verification_body`)
-runs it, and the reason reaches `VerifyResult.plan` through
-`orchestrator/src/orchestrator/verify.py::_executed_fallback_plan`'s
-`pytest_reason`.
+The rule is applied at two points, and each record states the floor only for
+its own layer:
+
+- The plan decision
+  (`orchestrator/src/orchestrator/verify_plan.py::_derive_fallback_runs`,
+  reached through `derive_verify_plan`) floors on its idealized flat file
+  list.
+- The executed config
+  (`orchestrator/src/orchestrator/verify.py::_run_scoped_verification_body`)
+  floors on `_build_fallback_config`'s rescoped output. Its reason reaches
+  `VerifyResult.plan` only through
+  `orchestrator/src/orchestrator/verify.py::_executed_fallback_plan`'s
+  `pytest_reason`, because
+  `orchestrator/src/orchestrator/verify.py::_safe_derive_executed_fallback_plan`
+  reconciles the decision derived without its floor.
+
+The two layers can disagree. The known case is the task-2368 mixed
+root+single-subproject source-only diff: the decision floors, while execution
+runs the mixed branch's own derived command. `VerifyResult.plan` then does not
+claim the floor.
 
 ## Who it affects
 
@@ -59,17 +72,35 @@ As of 2026-11-10, every project except autopilot-video declares a
 non-default `test_command`, so arms 5 and 6 matter only to autopilot-video.
 
 In dark_factory every subproject registers a module config, and so do
-`scripts/` and `tests/scripts/`. Only `skills/**`, `plans/**` and the
-repo-root `.py` files reach the fallback, and only at task role:
-`merge_verify_breadth: full` routes the merge gate through the full registry.
-A task-role diff confined to those paths now runs the fleet `test_command`
-chain, segmented, where it previously ran no tests.
+`scripts/` and `tests/scripts/`. But the fallback is chosen by an empty
+resolved module set, not by file path.
+`orchestrator/src/orchestrator/workflow.py::TaskWorkflow._resolve_module_configs`
+returns `[]` when none of the task's modules maps to a registered module
+config. That covers a task whose declared files sit only under `skills/**`,
+`plans/**` or the repo-root `.py` files. It also covers a task that declared
+no files at all: the scheduler then uses the synthetic `task-<id>` lock,
+whatever files the diff actually touches.
+
+This holds at task role and at merge role. `merge_verify_breadth: full` does
+not widen an empty set
+(`orchestrator/src/orchestrator/merge_lane/worker.py::_merge_boundary_module_configs`),
+and dark_factory does not set `merge_verify_workspace`. So for such a task, a
+source-only `.py` diff with no derivable test target now runs the fleet
+`test_command` chain at both roles, segmented at task role and whole at merge
+role. Before, it ran no tests.
+
+Registering a module config for `skills/**` or `plans/**` (task 9068) narrows
+only tasks whose declared files sit there. It does not change a task that
+declared no files.
 
 ## Opting out, or narrowing
 
 - To run no tests at all, set `test_command: "true"`, as autotrade does.
 - For narrower coverage of a path, register a module config for it.
-  `tests/scripts/orchestrator.yaml` did exactly that for task 3350.
+  `tests/scripts/orchestrator.yaml` did exactly that for task 3350. This
+  narrows only tasks whose declared files sit under that path; a task that
+  declared no files still resolves an empty module set and takes the
+  fallback.
 
 ## What it does not change
 
