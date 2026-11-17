@@ -789,7 +789,6 @@ _WALL_CLOCK_DEADLINE_DEBT: dict[str, int] = {
     'orchestrator/tests/test_verify_admission_watch.py': 1,
     'orchestrator/tests/test_verify_hosts.py': 1,
     'orchestrator/tests/test_verify_plan_latch.py': 1,
-    'orchestrator/tests/test_verify_run_cmd_reap.py': 1,
     'orchestrator/tests/test_workflow_halt_owner.py': 1,
     # dashboard/tests
     'dashboard/tests/test_db.py': 26,
