@@ -33,6 +33,7 @@ from dashboard.data.retention import RAW_RETENTION
 _SAMPLE_INTERVAL = timedelta(minutes=10)
 """How often the dashboard's loops sample (dashboard/loops.py::_SAMPLE_INTERVAL_SECONDS)."""
 _SAMPLES_PER_DAY = int(timedelta(days=1) / _SAMPLE_INTERVAL)
+_RAW_TICKS = int(RAW_RETENTION / _SAMPLE_INTERVAL)
 
 
 def sample_instants(count: int, now: datetime) -> list[datetime]:
@@ -42,9 +43,8 @@ def sample_instants(count: int, now: datetime) -> list[datetime]:
     (dashboard/src/dashboard/data/retention.py::apply_retention).
     """
     newest = (now - timedelta(minutes=1)).replace(microsecond=500)
-    raw = int(RAW_RETENTION / _SAMPLE_INTERVAL)
     return [
-        newest - _SAMPLE_INTERVAL * i if i < raw else newest - RAW_RETENTION - timedelta(hours=i - raw + 1)
+        newest - _SAMPLE_INTERVAL * i if i < _RAW_TICKS else newest - RAW_RETENTION - timedelta(hours=i - _RAW_TICKS + 1)
         for i in range(count)
     ]
 
@@ -61,10 +61,18 @@ def _insert(db: Path, schema: str, table: str, columns: Sequence[str], rows: Seq
 
 @dataclass(frozen=True)
 class BurndownShape:
-    """How many measured snapshots each root's burndown series holds, and the cap they were taken under."""
+    """Each root's measured snapshot count, the cap they were taken under, and how often roots' hourly rows misalign.
+
+    Live, projects keep different instants inside one hourly-retained hour,
+    so the union row is longer than any project's own, which breaks into
+    hundreds of index spans over it. Every ``misaligned_hour_every``-th hourly
+    row of the odd-positioned roots is one sampler tick earlier than the even
+    roots' to reproduce that.
+    """
 
     samples_per_root: int
     concurrency_cap: int
+    misaligned_hour_every: int
 
 
 def _snapshot(project_id: str, at: datetime, counts: Mapping[TaskStatus, int], age: int, cap: int) -> dict[str, object]:
@@ -91,11 +99,19 @@ def seed_burndown_history(
     """
     instants = sample_instants(shape.samples_per_root, now)
     rows = [
-        _snapshot(root, at, counts, age, shape.concurrency_cap)
-        for root, counts in trees.items() for age, at in enumerate(instants)
+        _snapshot(root, _root_instant(at, age, position, shape), counts, age, shape.concurrency_cap)
+        for position, (root, counts) in enumerate(trees.items()) for age, at in enumerate(instants)
     ]
     columns = list(rows[0])
     _insert(burndown_db, BURNDOWN_SCHEMA, 'snapshots', columns, [[row[c] for c in columns] for row in rows])
+
+
+def _root_instant(at: datetime, age: int, position: int, shape: BurndownShape) -> datetime:
+    """The instant the root at *position* writes its row *age* ticks old: one tick early on its misaligned hours."""
+    hour = age - _RAW_TICKS
+    if position % 2 and hour >= 0 and hour % shape.misaligned_hour_every == 0:
+        return at - _SAMPLE_INTERVAL
+    return at
 
 
 @dataclass(frozen=True)
