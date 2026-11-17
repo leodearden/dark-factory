@@ -31,8 +31,7 @@ from shared.cli_invoke import (
     run_cli_subprocess,
 )
 from shared.process_cost import ProcessCostBasis
-from shared.python_env import without_python_env_selection
-from shared.secret_env import agent_subprocess_env, without_agent_endpoint_vars
+from shared.secret_env import agent_subprocess_env
 
 from orchestrator.agents.agent_run_home import require_operator_home
 from orchestrator.agents.mimo_backend import (
@@ -474,6 +473,9 @@ async def _invoke_claude_with_sandbox(
 # Codex backend
 # ---------------------------------------------------------------------------
 
+# _invoke_codex: the API key; codex's ChatGPT login lives in ~/.codex and needs no env var.
+CODEX_CREDENTIAL_VARS = frozenset({'OPENAI_API_KEY'})
+
 _CODEX_WRITE_TOOLS = frozenset({'Edit', 'Write'})
 
 
@@ -636,7 +638,8 @@ async def _invoke_codex(
     codex_input = f'{system_prompt}\n\n{prompt}'.encode()
 
     cmd, env = _sandbox_spawn(
-        cmd, without_python_env_selection(os.environ), cwd, sandbox_modules, sandbox_extras,
+        cmd, agent_subprocess_env(os.environ, credentials=CODEX_CREDENTIAL_VARS),
+        cwd, sandbox_modules, sandbox_extras,
     )
 
     result = await runner(
@@ -809,6 +812,9 @@ def _parse_codex_output(
 # Gemini backend
 # ---------------------------------------------------------------------------
 
+# The two API-key variables the gemini CLI reads (task 7311, measured).
+GEMINI_CREDENTIAL_VARS = frozenset({'GEMINI_API_KEY', 'GOOGLE_API_KEY'})
+
 async def _invoke_gemini(
     prompt: str,
     system_prompt: str,
@@ -842,7 +848,8 @@ async def _invoke_gemini(
         cmd = ['gemini', '-p', prompt, '-m', model, '-o', 'json', '--yolo']
 
         cmd, env = _sandbox_spawn(
-            cmd, without_python_env_selection(os.environ), cwd, sandbox_modules, sandbox_extras,
+            cmd, agent_subprocess_env(os.environ, credentials=GEMINI_CREDENTIAL_VARS),
+            cwd, sandbox_modules, sandbox_extras,
         )
 
         result = await runner(
@@ -949,6 +956,9 @@ def _write_gemini_settings(
 # spike, plans/pi-spike-findings.md. See that doc for the observed evidence
 # behind every divergence from the codex/gemini shape below.
 # ---------------------------------------------------------------------------
+
+# plans/pi-spike-findings.md "Auth"; any other provider key reaches pi only through env_overrides.
+PI_CREDENTIAL_VARS = frozenset({'ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'GEMINI_API_KEY'})
 
 _PI_BUILTIN_TOOL_MAP: dict[str, str] = {
     'Read': 'read',
@@ -1302,16 +1312,12 @@ async def _invoke_pi(
 
         cmd.append(prompt)
 
-        env = without_agent_endpoint_vars(os.environ)
+        env = agent_subprocess_env(os.environ, credentials=PI_CREDENTIAL_VARS)
         if oauth_token:
-            # Strip a lingering ANTHROPIC_API_KEY so it can't shadow the
-            # OAuth token pi is being asked to use (mirrors
-            # _invoke_claude_with_sandbox's credential-precedence guard) —
-            # otherwise the multi-account OAuth failover oauth_token exists
-            # for is silently defeated whenever both are present in the
-            # inherited environment. Left untouched when oauth_token is
-            # unset so a direct ANTHROPIC_API_KEY credential (pi's
-            # non-OAuth Anthropic auth path) keeps working.
+            # An inherited ANTHROPIC_API_KEY would shadow the OAuth token pi
+            # is asked to use (mirrors _invoke_claude_with_sandbox's
+            # credential precedence). Without oauth_token it stays, as pi's
+            # non-OAuth Anthropic auth path.
             env.pop('ANTHROPIC_API_KEY', None)
             env['ANTHROPIC_OAUTH_TOKEN'] = oauth_token
         if env_overrides:
