@@ -836,10 +836,10 @@ Whether the `request_id` you received cancels the in-flight entry depends on how
 If `merge_cancel` answers an epistemic state on the `request_id` handle (or the re-check above still leaves it unresolved), its `reason` field is the hint prose, not the code: poll `mcp__escalation__merge_status(task_id="<TASK_ID>")` and switch on that answer's `reason` per [the shared reason switch](../_shared/merge-status-reasons.md#the-switch).
 
 **This site's dispositions** — you are deciding whether anything still needs abandoning:
-- a `done` whose sha you hold (a `kind: "found_on_main"` answer's `merge_sha`, or one the ladder yields — an event-store `done`'s `merge_sha` is the record's, not a git proof, so run the ladder for it), or a `landing_unattributable` whose ladder yields a stampable sha → nothing to abandon; proceed to **step 8** with `done_provenance={"kind": "found_on_main", "commit": "<that sha>", "note": "<the note the ladder specifies for that arm>"}`; both fields are required.
+- a `done` whose sha step 7's polled-`done` bullet says is stampable (its two exceptions included; otherwise the sha the ladder yields), or a `landing_unattributable` whose ladder yields a stampable sha → nothing to abandon; proceed to **step 8** with `done_provenance={"kind": "found_on_main", "commit": "<that sha>", "note": "<the note the ladder specifies for that arm>"}`; both fields are required.
 - `never_submitted` or `prior_run_terminal` → nothing in flight to abandon; report `last_outcome` if present.
 - a live state → the merge is still in flight, so cancel it: `merge_cancel(request_id=<that answer's request_id>)`. The merge lane cancels it by id even when this server holds no waiter for it (`escalation/src/escalation/server.py::merge_cancel`, task 5248). A `cancelled: false` carrying a `code` (`finalize_window`, `train_cancel_unsupported`) is the lane refusing: report that code and the state, never retry into it.
-- a wait state (`journaled_not_live`, `probe_failed`) → no live entry for `merge_cancel` to reach: report it rather than retrying.
+- a wait-state reason (a **WAIT** row of [the shared reason switch](../_shared/merge-status-reasons.md#the-switch)) → the server cannot currently see the entry, which is not evidence that none is live (the switch's meaning column says why for each reason): report it rather than retrying.
 
 Never fall back to direct merge in response to an epistemic answer.
 

@@ -275,7 +275,7 @@ def _opens_inside_html_comment(lines: list[str], index: int, marker_column: int)
 
     So the question asked is "is this marker inside an unclosed ``<!--``?",
     answered over everything preceding it: the last opener wins unless a closer
-    came after it. Cheap enough to do per marker (five files, fourteen markers).
+    came after it. Cheap enough to do per marker: the registry holds a handful of files.
     """
     before = "\n".join([*lines[:index], lines[index][:marker_column]])
     return before.rfind("<!--") > before.rfind("-->")
@@ -483,8 +483,8 @@ def assert_span_matches(
 # WHAT THIS STILL DOES NOT CATCH, stated so nobody assumes otherwise: a
 # registered file GROWING a brand-new unwrapped list. The reviewer's suggested
 # closure — require every discriminating token in a registered file to sit inside
-# some span — was MEASURED against this tree and rejected: the five registered
-# files carry 5, 9, 9, 11 and 12 distinct discriminating tokens OUTSIDE their
+# some span — was MEASURED and rejected: for task 4829 the five files then
+# registered carried 5, 9, 9, 11 and 12 distinct discriminating tokens OUTSIDE their
 # spans, all of it legitimate prose explaining what the values mean (`merge_status
 # collapses all of them except done_wip_recovery to blocked`, and so on). Any
 # threshold that passes today's prose is far above "one new list", so the check
@@ -552,8 +552,8 @@ _UNPINNED_RULE_SITES = {
 _ENUMERATION_THRESHOLD = 4
 
 # BOUNDARY, deliberate and worth stating so a reader does not read it as an
-# oversight: this scan covers `skills/**` only — the domain of the five registered
-# sites. `ARCHITECTURE.md` (~lines 700-702) and `OPERATIONS.md` (~lines 517-523)
+# oversight: this scan covers `skills/**` only — the domain of the registered
+# skill sites. `ARCHITECTURE.md` (~lines 700-702) and `OPERATIONS.md` (~lines 517-523)
 # each carry a further enumeration interleaving BOTH vocabularies, and
 # `skills/merge-queue/SKILL.md` documents a `needs_rebase` outcome that
 # `merge_request` never returns (it is a `suffix_graph.py` internal). Those are out

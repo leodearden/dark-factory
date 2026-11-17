@@ -1467,9 +1467,10 @@ launch by `task_id` / background-task-id):
   pending, write only the digest line and file no DecisionRecord: whoever took the escalation
   owns it, and the merge carries on.
 - `outcome == "handed_off"`: neither a failure nor an abort. The merge `request_id` it returns
-  is either picked up by the merge worker and still live (merging or verifying), or still
-  answering a wait-state reason (`probe_failed`, `journaled_not_live`) and so possibly still in
-  flight, or, when the result also carries `superseded_by`, superseded by a successor that has not resolved yet: an
+  is either still live (picked up by the merge worker, or, from step 9's re-poll hand-off, the
+  entry an `attached` submit joined, which may still be queued), or still
+  answering a wait-state reason (a **WAIT** row of [the shared reason
+  switch](../_shared/merge-status-reasons.md#the-switch)) and so possibly still in flight, or, when the result also carries `superseded_by`, superseded by a successor that has not resolved yet: an
   `mr-*` generation advance or a `coalesce-*` train. Either way the sub-agent did not cancel
   it, did not change the task status, and left the escalation pending. **Never
   `merge_cancel` it**, and never submit another merge for that `task_id`, whichever shape it is:

@@ -263,12 +263,12 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
        return `outcome: "handed_off"` with the `request_id` and the observed state in `reason`.
        The escalation-watcher resumes it through [resume mode](#resuming-a-handed-off-merge-resume-mode).
        Handing off is **not** an ABORT, so the cancel rule in "Aborting" does not apply to it.
-     - **Still answering a wait-state reason** (`probe_failed`, `journaled_not_live`) — **HAND
-       OFF** exactly as for a picked-up entry, and call no `merge_cancel`. `probe_failed` says a
-       probe raised, not that the entry is idle, so it may hide a picked-up entry;
-       `journaled_not_live` is owned by the journal and startup recovery. Return the `state` and
-       `reason` in the hand-off's `reason`. This deadline replaces the shared doc's own
-       [wait bound](../_shared/merge-status-reasons.md#wait-bound).
+     - **Still answering a wait-state reason** (a **WAIT** row of [the shared reason
+       switch](../_shared/merge-status-reasons.md#the-switch)) — **HAND OFF** exactly as for a
+       picked-up entry, and call no `merge_cancel`. A wait-state reason says the server cannot
+       currently see the entry, not that it is idle; the switch's meaning column says why for
+       each reason. Return the `state` and `reason` in the hand-off's `reason`. This deadline
+       replaces the shared doc's own [wait bound](../_shared/merge-status-reasons.md#wait-bound).
 
      Proceed to step 9 with the final `result` if the deadline is not reached; any epistemic
      answer that reaches step 9 is therefore not a wait state.
@@ -409,9 +409,10 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
      always carries a `reason`): switch on `reason` per [the shared reason
      switch](../_shared/merge-status-reasons.md#the-switch), including its [request_id re-poll
      rule](../_shared/merge-status-reasons.md#request-id-polls) — this skill polls by
-     `request_id`, so before acting on `stale_record` or `no_record` re-poll once with
+     `request_id`, so before acting on `stale_record` or `no_record` (other than
+     `coalesce_train_id`, which that rule exempts) re-poll once with
      `merge_status(task_id=task_id)` and switch on that answer instead. Unattended, so every
-     answer ends in ABORT except two:
+     answer ends in ABORT except three:
      - A re-poll `done` carrying `kind: "found_on_main"` and a `merge_sha` (the only re-poll
        shape the shared rule counts as a landing) → success; proceed with sub-steps a–d using
        `done_provenance={"kind": "found_on_main", "commit": "<merge_sha>", "note": "landed
@@ -427,6 +428,15 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
        `done_provenance={"kind": "found_on_main", "commit": "<sha from the ladder>",
        "note": "<the note the ladder specifies for that outcome>"}`. Otherwise follow
        [this skill's dispositions](#ladder-dispositions).
+     - A re-poll answering a live state (any of them, `queued` included) or a wait-state reason
+       → a merge carrying this task's work may still be in flight under another request. That
+       is the expected shape after an `attached` submit whose `poll_by` is `task_id` or
+       `branch`: this run's own `request_id` answers `no_record` while the entry it attached to
+       is live. **HAND OFF** exactly as step 8's deadline does for a picked-up entry: call no
+       `merge_cancel`, leave the task status and the escalation untouched, and return `outcome:
+       "handed_off"` carrying the re-poll's `request_id` when it has one (the in-flight entry,
+       which resume mode then polls), else this run's own, with the re-poll's `state` and
+       `reason` in `reason`.
 
      Every other answer — `prior_run_terminal` (copy `last_outcome`'s `state`, `run_id`,
      `finished_at` and `reason` into the return value's `reason`), `never_submitted`,
@@ -438,8 +448,9 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
 ### Resuming a handed-off merge (resume mode)
 
 The escalation-watcher launches this skill in **resume mode** after a prior run returned
-`handed_off`, either from step 8's deadline disposition or from step 9's `superseded` arm. Resume
-mode finishes that run's merge; it is not a second attempt.
+`handed_off`: from step 8's deadline disposition, from step 9's `superseded` arm, or from step
+9's epistemic arm on a re-poll still live or waiting. Resume mode finishes that run's merge; it
+is not a second attempt.
 
 - **Inputs:** `task_id`, `escalation_id`, `project_root`, `worktree`, `request_id`, and an
   optional `superseded_by`. `superseded_by` is present exactly when the hand-off came from step
@@ -667,11 +678,13 @@ On any ABORT:
   fast-path), call `mcp__escalation__merge_cancel(request_id)` FIRST, before anything else, on:
   - an entry still `queued` at step 8's polling deadline;
   - step 9's `conflict` | `blocked` | `abandoned` | `failed` | `unknown_branch` arm;
-  - step 9's epistemic-state arm, on every answer that is not a landing;
+  - step 9's epistemic-state arm, on the answers its catch-all routes to `merge_cancel` (not
+    `landing_unattributable`, which takes [this skill's dispositions](#ladder-dispositions));
   - the ladder's genuine not-landed outcome ([this skill's dispositions](#ladder-dispositions)).
 
-  Every other ABORT leaves the entry alone. Neither hand-off is an ABORT at all: not step 8's
-  hand-off of a picked-up entry or a wait-state answer, and not step 9's hand-off of an unresolved successor. Where the call is made, it prevents an orphaned durable-intent entry (PRD D2 —
+  Every other ABORT leaves the entry alone. No hand-off is an ABORT at all: not step 8's
+  hand-off of a picked-up entry or a wait-state answer, not step 9's hand-off of an unresolved
+  successor, and not step 9's hand-off of a re-poll still live or waiting. Where the call is made, it prevents an orphaned durable-intent entry (PRD D2 —
   submitted merges now outlive the MCP call and session) from accumulating. `merge_cancel` never
   raises and is a safe no-op if the entry already finalized (it returns `cancelled: false` with
   the terminal state). A coalesced or `attached` `request_id` may answer an epistemic state (typically
@@ -697,9 +710,9 @@ Return ONLY this JSON object (no prose):
   "outcome": "merged" | "aborted" | "handed_off",
   "task_id": "<id>",
   "escalation_id": "<id>",
-  "request_id": "<merge request id when this run submitted or resumed one, else null — always set for handed_off>",
+  "request_id": "<merge request id when this run submitted or resumed one (on step 9's re-poll hand-off, the re-poll's when it has one), else null — always set for handed_off>",
   "superseded_by": "<latest successor id (mr-* or coalesce-*) when handed_off from step 9's superseded arm, else null>",
-  "reason": "<merged: what changed + merge sha | aborted: which precondition/step failed and why | handed_off: the merge state (with its `reason` when epistemic) at the polling deadline, or the unresolved successor and the ladder's last verdict>",
+  "reason": "<merged: what changed + merge sha | aborted: which precondition/step failed and why | handed_off: the merge state (with its `reason` when epistemic) at the polling deadline or on step 9's re-poll, or the unresolved successor and the ladder's last verdict>",
   "commit": "<merge sha if merged, else null>"
 }
 ```

@@ -6,7 +6,7 @@ skills consume it:
 
 - [`skills/merge-queue/SKILL.md`](../merge-queue/SKILL.md) — interactive submit-and-poll; the only consumer that resubmits on its own
 - [`skills/unblock/SKILL.md`](../unblock/SKILL.md) — the step-7 poll loop and the `merge_cancel` cleanup
-- [`skills/unblock-low-risk/SKILL.md`](../unblock-low-risk/SKILL.md) — unattended; a wait-state reason still answering at its deadline is handed off, and every other reason except a verified landing ends in ABORT
+- [`skills/unblock-low-risk/SKILL.md`](../unblock-low-risk/SKILL.md) — unattended; an answer that leaves the merge possibly in flight (a wait-state reason at its deadline, or a task_id re-poll still live or waiting) is handed off, and every other answer except a verified landing ends in ABORT
 - [`skills/escalation-watcher/SKILL.md`](../escalation-watcher/SKILL.md) — its merge-status fallback note
 
 Each consumer keeps its own **dispositions** inline in its own file — resubmit, report, abort,
@@ -45,12 +45,14 @@ Sources of truth, named once: the reason vocabulary is
 3. <a id="request-id-polls"></a>**Re-poll a request_id answer by task_id.** Only a task_id- or
    branch-keyed poll reaches the git tier (`escalation/src/escalation/server.py::_PollKey.landing_key`).
    Before acting on `stale_record` or `no_record` from a request_id poll, re-poll once with
-   `merge_status(task_id="<TASK_ID>")` and switch on that answer instead. A landing shows up
-   there as an ordinary `done` with `kind: "found_on_main"` and a `merge_sha`, and only that
-   shape counts as one. A re-poll `done` without that `kind` may be an earlier round's
-   current-run row, so it is unconfirmed, and any `merge_sha` it carries is the record's, not a
-   git proof. If the re-poll is also `stale_record`, report the request_id
-   answer's `last_outcome`: it names your request.
+   `merge_status(task_id="<TASK_ID>")` and switch on that answer instead. The exception is
+   `coalesce_train_id`: it names a train, not your request, so act on its row directly. A
+   landing shows up in the re-poll as an ordinary `done` with `kind: "found_on_main"` and a
+   `merge_sha`, and only that shape counts as one. A re-poll `done` without that `kind` may be
+   an earlier round's current-run row, so it is unconfirmed, and any `merge_sha` it carries is
+   the record's, not a git proof. If the request_id answer was `prior_run_terminal` and the
+   re-poll is also `stale_record`, report the request_id answer's `last_outcome`: it names
+   your request.
 
 <a id="the-switch"></a>
 ## The switch
@@ -60,7 +62,7 @@ Sources of truth, named once: the reason vocabulary is
 | `probe_failed` | `unknown`; `source` names the failing tier | a probe raised — the answer is not negative | **WAIT**: retry on the normal backoff, under the [wait bound](#wait-bound) |
 | `journaled_not_live` | `journaled` | the durable journal holds the request but the live worker does not show it; startup recovery re-drives it | **WAIT**, under the [wait bound](#wait-bound). Never resubmit: the journal still owns it |
 | `prior_run_terminal` | `stale_record` | only another orchestrator run's finalize row exists | **REPORT** `last_outcome` (`state`, `run_id`, `finished_at`, `reason`) as history, and stop. Never resubmit on it and never stamp `done_provenance` from it: resubmitting after a prior-run record is a human's decision, and an unattended caller aborts |
-| `never_submitted` | `no_record` | no tier holds a record and git shows no landing: never enqueued (expected for the own `request_id` of an `attached` submit whose `poll_by` is `task_id` or `branch`), or its record was lost | **NOT IN FLIGHT HERE**: the consumer's disposition decides. A resubmit is licensed only by a task_id- or branch-keyed `never_submitted` with `get_merge_queue()` showing no entry for the branch |
+| `never_submitted` | `no_record` | no tier holds a record (and, on a task_id or branch poll, git shows no landing): never enqueued (expected for the own `request_id` of an `attached` submit whose `poll_by` is `task_id` or `branch`), or its record was lost | **NOT IN FLIGHT HERE**: the consumer's disposition decides. A resubmit is licensed only by a task_id- or branch-keyed `never_submitted` with `get_merge_queue()` showing no entry for the branch |
 | `coalesce_train_id` | `stale_record` | the id names a coalesce train with no outcome row of its own; `last_outcome` is a member's absorption record, never your outcome | **FOLLOW THE MEMBERS**: for your own branch, take merge-queue's [Follow the superseded successor](../merge-queue/SKILL.md#follow-the-superseded-successor) Escape |
 | `landing_unattributable` | any epistemic state but `unknown`, replacing that state's own reason | git shows the branch's work on main but could not confirm attribution or effect | **VERIFY** at once, never resubmit. It is not transient, so it exits every poll loop, including an arm that otherwise treats epistemic answers as its live state. Run [the ladder](deriving-landed-sha.md#the-ladder) in full: a stampable sha is a landing (`done_provenance` kind `found_on_main`, with `commit` and the ladder's `note`); no stampable sha means stop and report |
 | any reason not listed here | — | the vocabulary grew past this table | **FAIL CLOSED**: stop and report `state`, `reason` and `hint` verbatim |
@@ -68,7 +70,7 @@ Sources of truth, named once: the reason vocabulary is
 <a id="wait-bound"></a>
 ## The wait bound
 
-An unbroken run of wait-state answers (`probe_failed`, `journaled_not_live`) is bounded at
+An unbroken run of wait-state answers (the **WAIT** rows of [the switch](#the-switch)) is bounded at
 **20 minutes from the first of them**. At expiry, stop and report `state`, `reason`, `source`
 and `hint` — never resubmit, never direct-merge. The bound exists because the merge journal is
 not complete across restarts (`plans/merge-status-durable-non-landed-prd.md`, Out of scope:
