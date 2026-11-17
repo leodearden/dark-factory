@@ -8269,9 +8269,9 @@ class SpeculativeMergeWorker:
         # marked task is neither a chain owner (`_deep_chain_placement` guard
         # 2b) nor a link (`chain_snapshot`), so its own subset tree gets a
         # verdict that IS attributable to it.  One-shot: discarded when that
-        # task's own verify returns a result and at every terminal exit, in
-        # the statement group of the `_inflight_dead_verify_aborts.pop` whose
-        # lifecycle it mirrors; a cascade-cancelled verify keeps the mark.
+        # task's own verify returns a result and at the in-verify terminal
+        # exits, beside the `_inflight_dead_verify_aborts.pop` it mirrors.  A
+        # cascade-cancelled verify and a pre-verify terminal exit keep the mark.
         self._next_dispatch_unchained: set[str] = set()
         # task 2828 amend (reviewer_comprehensive, robustness): per-task
         # consecutive contended-lease requeue counter.  Incremented each time

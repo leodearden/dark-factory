@@ -75,7 +75,8 @@ Pending (non-blocking, confirmatory): the study's S/C control re-runs
    and the good members land. A request whose outcome is already decided
    (cancelled or resolved) is never chained. The floor (d=1) is
    byte-identical to today's adjacent verify. No separate rolling-flake
-   suppressor in v1 (halving is the degradation mechanism; revisit in θ).
+   suppressor in v1 (halving bounds the next chain of untested requests;
+   the un-chained round is what isolates the bad item; revisit in θ).
 6. **Cap staging: 6 → 32 ("uncapped-in-practice").** Ship enabled at
    `chain_cap=6` (the study-validated depth), promote to 32 (≥2× max
    observed queue depth; still bounds wall vs the 7200 s timeout) via the
