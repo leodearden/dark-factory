@@ -40,7 +40,6 @@ from orchestrator.verify_cmd import (
 )
 from orchestrator.verify_evidence import Leg
 from orchestrator.verify_fallback_floor import (
-    NON_PYTHON_SOURCE_EXTENSIONS,
     fallback_test_floor_reason,
     has_configured_suite,
 )
@@ -1395,9 +1394,8 @@ def _fallback_pytest_decision(kinds: dict[str, FileKind], test_command: str) -> 
 # concept as FileKind.INERT: classify_file treats a .rs path as INERT too
 # (cargo/.rs scoping is a separate concern left to run_scoped_verification's
 # execute step — see FileKind's docstring), but .rs is still real source for
-# the purposes of "is this diff trivially a no-op". The non-Python half comes
-# from verify_fallback_floor, which owns the fallback's non-Python source set.
-_SOURCE_EXTENSIONS = ('.py', *NON_PYTHON_SOURCE_EXTENSIONS)
+# the purposes of "is this diff trivially a no-op".
+_SOURCE_EXTENSIONS = ('.py', '.rs')
 
 
 def _has_source_files(files: list[str]) -> bool:
