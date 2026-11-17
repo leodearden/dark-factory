@@ -20,12 +20,14 @@ comes from ``chr(60)``; the rule and its rationale are owned by
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
 import pytest
 from _markup_helpers import INVOKE_CLOSER, LT, closer
 from _plan_markup_fixtures import (
+    corrupt_plan,
     isolate_the_refusal_memo,  # noqa: F401 — autouse; pytest resolves it by name
     plan_artifacts,  # noqa: F401 — a fixture, requested by test parameter name
 )
@@ -101,7 +103,7 @@ class Harness:
 
 
 @pytest.fixture()
-def harness(monkeypatch, plan_artifacts: TaskArtifacts) -> Harness:  # noqa: F811 — the imported fixture
+def harness(monkeypatch, plan_artifacts: TaskArtifacts) -> Harness:
     return Harness(monkeypatch, plan_artifacts)
 
 
@@ -143,3 +145,66 @@ class TestTheWriteBoundaryStoresTheQuoteVerbatim:
         assert payload['error_type'] == 'mcp_markup_unrepairable'
         assert payload['field'] == 'description'
         assert harness.plan()['steps'] == []
+
+
+# ---------------------------------------------------------------------------
+# The read path: a stored quote never re-announces itself.
+# ---------------------------------------------------------------------------
+
+
+def _markup_fact_warnings(caplog) -> list[str]:
+    return [
+        record.getMessage() for record in caplog.records
+        if record.name == plan_tools.logger.name
+        and record.levelno == logging.WARNING
+        and plan_tools._MARKUP_FACT_EVENT in record.getMessage()
+    ]
+
+
+class TestTheReadPathLeavesTheQuoteAlone:
+
+    @pytest.mark.asyncio
+    async def test_later_calls_carry_no_markup_repairs(self, harness: Harness, caplog):
+        await harness.create_plan()
+
+        with caplog.at_level(logging.WARNING, logger=plan_tools.logger.name):
+            responses = [
+                await harness.add_step('step-1', STEP_DESCRIPTION),
+                await harness.add_step('step-2', 'A clean second step.'),
+                await harness.call(
+                    'add_design_decision',
+                    {'decision': 'Fold each finding.', 'rationale': 'The page is long.'},
+                ),
+            ]
+
+        assert [response['status'] for response in responses] == ['ok', 'ok', 'ok']
+        assert [response for response in responses if 'markup_repairs' in response] == []
+        assert _markup_fact_warnings(caplog) == []
+        assert harness.plan()['steps'][0]['description'] == STEP_DESCRIPTION
+
+    def test_the_read_seam_reports_nothing_and_writes_nothing(self, plan_artifacts: TaskArtifacts):
+        plan = corrupt_plan(analysis=ANALYSIS)
+        plan['steps'][0]['description'] = STEP_DESCRIPTION
+        plan_artifacts.write_plan(plan)
+        path = plan_artifacts.artifact_path('plan.json')
+        before = (path.read_bytes(), path.stat().st_mtime_ns)
+
+        repaired, facts = plan_tools._read_plan_repaired(plan_artifacts)
+
+        assert facts == []
+        assert repaired['analysis'] == ANALYSIS
+        assert repaired['steps'][0]['description'] == STEP_DESCRIPTION
+        assert (path.read_bytes(), path.stat().st_mtime_ns) == before
+
+    def test_an_invoke_closer_beside_a_stored_block_is_still_unrepairable(
+        self, plan_artifacts: TaskArtifacts,
+    ):
+        plan = corrupt_plan()
+        plan['steps'][0]['description'] = HTML_DETAILS_BLOCK + INVOKE_CLOSER + 'junk'
+        plan_artifacts.write_plan(plan)
+
+        _, facts = plan_tools._read_plan_repaired(plan_artifacts)
+
+        assert [(fact['outcome'], fact['field'], fact['pattern']) for fact in facts] == [
+            ('unrepairable', 'description', closer('details')),
+        ]
