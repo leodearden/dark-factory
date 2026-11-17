@@ -714,9 +714,7 @@ def test_importing_verdict_fails_on_a_codebook_severity_without_a_meaning() -> N
         "codebook.ENTRY_SEVERITIES = (*codebook.ENTRY_SEVERITIES, 'critical')\n"
         "from legibility import verdict\n"
     )
-    env = {**os.environ, "PYTHONPATH": os.pathsep.join(
-        [str(_SCRIPTS_DIR), str(_SCRIPTS_DIR / "legibility")],
-    )}
+    env = {**os.environ, "PYTHONPATH": str(_SCRIPTS_DIR)}
 
     result = subprocess.run(
         [sys.executable, "-c", probe],

@@ -150,11 +150,10 @@ class TestEncodeCwd:
 def _load_sibling_test_module(name: str):
     """Import a sibling scripts/tests module by file path.
 
-    Its conftest inserts ``scripts/`` and ``scripts/local-model-serving/`` and
-    appends ``scripts/tests`` itself, but importing a test module by bare name is
-    fragile under the suite's ``--import-mode=importlib`` collection. Loading by
-    path is the sanctioned equivalent and avoids restructuring the nightly
-    fixture.
+    ``scripts/tests`` is on ``sys.path``, but ``--import-mode=importlib`` has
+    already collected the module as ``scripts.tests.<name>``, so a bare
+    ``import <name>`` would build a second copy of it. Loading by path under a
+    distinct ``_lockstep_`` name makes that second copy explicit and intentional.
     """
     spec = importlib.util.spec_from_file_location(
         f'_lockstep_{name}', Path(__file__).parent / f'{name}.py'
