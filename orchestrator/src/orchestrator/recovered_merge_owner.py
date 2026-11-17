@@ -120,7 +120,7 @@ class RecoveredMergeOwner:
       ``merge_lane/worker.py::reconcile_landed_row``'s disposition, or None with no row.
     - Halt: files the halt-owning L1 and registers it with *merge_halt*; then blocks the task,
       or reconciles the landing for ``done_wip_recovery``. A task a workflow holds is
-      left to it unless the halt is still ownerless after the workflow's turn.
+      left to it: an attached workflow's own handler files the halt-owning record.
     - Transient (``superseded``): left to the stranded sweep.
     - Durable or unclassified failure: blocks the task and files one L1 under its block category.
 
@@ -186,11 +186,10 @@ class RecoveredMergeOwner:
         if is_merge_worker_shutdown(outcome):
             return Settled.WORKER_SHUTDOWN
         tid = request.task_id
-        held = self.tasks.is_actively_held(tid)
-        if outcome.status in MERGE_HALT_STATUSES:
-            return await self._own_halt(request, outcome, held=held)
-        if held:
+        if self.tasks.is_actively_held(tid):
             return Settled.WORKFLOW_HELD
+        if outcome.status in MERGE_HALT_STATUSES:
+            return await self._own_halt(request, outcome)
         if outcome.status in LANDED_MERGE_STATUSES:
             return await self._reconcile_landing(tid)
         if outcome.status in SUCCESS_TRANSIENT_MERGE_STATUSES:
@@ -245,21 +244,11 @@ class RecoveredMergeOwner:
         )
         return Settled.LANDING_NOT_DONE
 
-    async def _own_halt(
-        self, request: RecoveredRequest, outcome: MergeOutcome, *, held: bool,
-    ) -> Settled:
-        if held:
-            # A workflow attached to this request owns the halt from its own
-            # handler; holding the task does not prove it is attached.
-            await asyncio.sleep(0)
-            if not self._halt_is_ownerless():
-                return Settled.WORKFLOW_HELD
+    async def _own_halt(self, request: RecoveredRequest, outcome: MergeOutcome) -> Settled:
         tid = request.task_id
         self._file_halt_record(
             request, outcome, build_merge_halt_escalation_text(outcome.status, outcome, task_id=tid),
         )
-        if held:
-            return Settled.HALTED
         if outcome.status == 'done_wip_recovery':
             await self._reconcile_landing(tid)
         else:

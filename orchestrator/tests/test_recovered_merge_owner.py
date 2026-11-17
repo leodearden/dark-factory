@@ -7,6 +7,7 @@ merge-lane ratchet counts every private read and lane patch target in it.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from collections.abc import Coroutine
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -14,14 +15,20 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
 from orchestrator.event_store import EventType
-from orchestrator.merge_halt_escalation import MERGE_HALT_CATEGORY_BY_STATUS
+from orchestrator.merge_halt_escalation import (
+    MERGE_HALT_CATEGORY_BY_STATUS,
+    submit_halt_owning_escalation,
+)
 from orchestrator.merge_lane import (
     MERGE_WORKER_SHUTDOWN_REASON,
+    InFlightMergeRegistry,
     MergeBlockCategory,
     MergeOutcome,
+    WaiterRecord,
 )
 from orchestrator.recovered_merge_owner import RecoveredMergeOwner, Settled
 
@@ -318,6 +325,32 @@ def _open_l1s_in(queue: EscalationQueue, category: str) -> list:
     return [esc for esc in _open_l1s(queue) if esc.category == category]
 
 
+_WORKFLOW_ROLE = 'orchestrator'
+
+
+async def _workflow_attached_to(
+    registry: InFlightMergeRegistry, queue: EscalationQueue, halt: FakeMergeHalt,
+) -> None:
+    """A workflow peer-attached to the in-flight request, awaiting it as
+    ``workflow.py::TaskWorkflow._await_cancellable`` does, then filing its halt
+    record as its wip handler does."""
+    waiter: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
+    assert registry.attach(_TID, WaiterRecord(request_id='mr-workflow', future=waiter, source='workflow'))
+    cancel_task = asyncio.create_task(asyncio.Event().wait())
+    try:
+        await asyncio.wait({waiter, cancel_task}, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        cancel_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await cancel_task
+    outcome = waiter.result()
+    submit_halt_owning_escalation(queue, halt, Escalation(
+        id=queue.make_id(_TID), task_id=_TID, agent_role=_WORKFLOW_ROLE,
+        severity='blocking', category=MERGE_HALT_CATEGORY_BY_STATUS[outcome.status],
+        summary=f'merge {outcome.status}', detail='', level=1,
+    ))
+
+
 @pytest.mark.asyncio
 class TestHaltOutcomeOwnsTheMergeHalt:
     @pytest.mark.parametrize('status', sorted(_HALT_OUTCOMES))
@@ -392,51 +425,46 @@ class TestHaltOutcomeOwnsTheMergeHalt:
         assert halt.owners == [esc.id]
         assert store.writes == []
 
-    async def test_a_held_tasks_workflow_that_owns_the_halt_in_its_turn_is_left_to_it(
-        self, queue: EscalationQueue, reconcile_landing: AsyncMock,
+    @pytest.mark.parametrize('status', sorted(_HALT_OUTCOMES))
+    async def test_a_held_task_is_left_to_its_workflow(
+        self, queue: EscalationQueue, reconcile_landing: AsyncMock, status: str,
     ) -> None:
         store = FakeTaskStore('in-progress', held=True)
         halt = FakeMergeHalt()
-        asyncio.get_running_loop().call_soon(halt.set_halt_owner, 'esc-workflow')
 
         settled = await _owner(store, queue, reconcile_landing, merge_halt=halt).settle(
-            _request(), _STASH_FAILED,
+            _request(), _HALT_OUTCOMES[status],
         )
 
         assert settled == Settled.WORKFLOW_HELD
         assert _open_l1s(queue) == []
-        assert halt.owners == ['esc-workflow']
+        assert halt.owners == []
+        assert store.writes == []
+        reconcile_landing.assert_not_awaited()
 
-    async def test_a_held_task_whose_halt_stays_ownerless_still_gets_the_halt_owner(
-        self, queue: EscalationQueue, reconcile_landing: AsyncMock,
+    @pytest.mark.parametrize('status', ['wip_halted', 'done_wip_recovery'])
+    async def test_a_workflow_attached_to_the_recovered_request_alone_owns_the_halt(
+        self, queue: EscalationQueue, reconcile_landing: AsyncMock, status: str,
     ) -> None:
-        store = FakeTaskStore('in-progress', held=True)
+        registry = InFlightMergeRegistry()
+        primary = _request()
+        registry.acquire(_TID, _TID, primary.result, request_id=_REQUEST_ID, source='recovery')
         halt = FakeMergeHalt()
-
-        settled = await _owner(store, queue, reconcile_landing, merge_halt=halt).settle(
-            _request(), _STASH_FAILED,
+        settles: list[asyncio.Task[Settled]] = []
+        _owner(FakeTaskStore('in-progress', held=True), queue, reconcile_landing, merge_halt=halt).adopt(
+            [primary], schedule=lambda coro, *, label: settles.append(asyncio.create_task(coro)),
         )
+        workflow = asyncio.create_task(_workflow_attached_to(registry, queue, halt))
+        await asyncio.sleep(0)
 
-        assert settled == Settled.HALTED
-        [esc] = _open_l1s_in(queue, 'stash_failed')
+        primary.result.set_result(_HALT_OUTCOMES[status])
+        await workflow
+        assert [await settle for settle in settles] == [Settled.WORKFLOW_HELD]
+
+        [esc] = _open_l1s(queue)
+        assert esc.category == MERGE_HALT_CATEGORY_BY_STATUS[status]
+        assert esc.agent_role == _WORKFLOW_ROLE
         assert halt.owners == [esc.id]
-        assert store.writes == []
-
-    @pytest.mark.parametrize('halt', [None, FakeMergeHalt(is_wip_halted=False)],
-                             ids=['no_merge_worker', 'force_unhalted'])
-    async def test_a_held_task_with_no_ownable_halt_is_left_to_its_workflow(
-        self, queue: EscalationQueue, reconcile_landing: AsyncMock,
-        halt: FakeMergeHalt | None,
-    ) -> None:
-        store = FakeTaskStore('in-progress', held=True)
-
-        settled = await _owner(store, queue, reconcile_landing, merge_halt=halt).settle(
-            _request(), _STASH_FAILED,
-        )
-
-        assert settled == Settled.WORKFLOW_HELD
-        assert _open_l1s(queue) == []
-        assert store.writes == []
 
     async def test_a_second_settle_files_no_second_halt_record(
         self, queue: EscalationQueue, reconcile_landing: AsyncMock,
