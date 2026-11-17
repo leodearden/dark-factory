@@ -70,7 +70,7 @@ from shared.sqlite_sync_base import apply_full_durability_pragmas_sync
 
 from sampler.metrics import SampleKey, Samples
 
-__all__ = ['SCHEMA', 'Connect', 'GroupRecord', 'LoadSampleStore', 'connect_durably']
+__all__ = ['SCHEMA', 'Connect', 'GroupRecord', 'LoadSampleStore', 'connect_durably', 'stamp_is_due']
 
 logger = logging.getLogger(__name__)
 
@@ -134,6 +134,15 @@ _HOST_WINDOW_SQL = (
 _LEAF_WINDOW_SQL = (
     'SELECT value FROM samples WHERE metric = ? AND leaf = ? ORDER BY ts DESC LIMIT ?'
 )
+
+
+def stamp_is_due(stamp: int | None, now: int, interval_seconds: int) -> bool:
+    """The one interval clock: due when *stamp* is absent or ``interval_seconds`` old.
+
+    A stamp in the FUTURE is due too, so a stamp written during a forward
+    clock step cannot hold a clock shut.
+    """
+    return stamp is None or not 0 <= now - stamp < interval_seconds
 
 
 @dataclass(frozen=True)
@@ -423,16 +432,13 @@ class LoadSampleStore:
     # ------------------------------------------------------------------
 
     def _is_due(self, key: str, now: int, interval_seconds: int) -> bool:
-        """Return True when the interval clock at *key* has run out.
+        """Return True when the interval clock at *key* has run out (``stamp_is_due``).
 
         An absent record is due, so a fresh store prunes and compacts on its
-        first tick. A record in the FUTURE is due too, so a stamp written during
-        a forward clock step cannot disable either sweep.
+        first tick.
         """
         last_str = self._get_meta(key)
-        if last_str is None:
-            return True
-        return not 0 <= now - int(last_str) < interval_seconds
+        return stamp_is_due(None if last_str is None else int(last_str), now, interval_seconds)
 
     def should_cleanup(self, now: int, *, interval_seconds: int = 86400) -> bool:
         """Return True when a cleanup is due (no prior record or interval elapsed)."""

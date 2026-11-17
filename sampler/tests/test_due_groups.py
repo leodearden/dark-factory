@@ -448,7 +448,7 @@ class TestAFailedCollection:
         assert str(GroupName.LOAD) in _tracebacks(caplog)[0].getMessage()
         assert fail_with(RuntimeError('again'), T0 + 30) == 0
         assert fail_with(OSError('another kind'), T0 + 60) == 1
-        assert fail_with(RuntimeError('still'), T0 + 3599) == 0
+        assert fail_with(RuntimeError('still'), T0 + 3600 - DUE) == 0
         assert fail_with(RuntimeError('an hour on'), T0 + 3600) == 1
 
     def test_the_throttle_round_trips_and_a_corrupt_one_reads_empty(self):

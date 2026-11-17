@@ -40,6 +40,9 @@ logger = logging.getLogger(__name__)
 __all__ = [
     'SampleKey',
     'Samples',
+    'Collected',
+    'Collector',
+    'every_tick',
     'GroupName',
     'MetricSpec',
     'MetricGroup',
@@ -76,6 +79,31 @@ class SampleKey(NamedTuple):
 
 
 Samples = Mapping[SampleKey, float]
+
+
+@dataclass(frozen=True)
+class Collected:
+    """One group's collection: its samples, and the state its next collection starts from.
+
+    ``state`` is opaque to everything but the group's own collector. None
+    carries nothing forward, and the store keeps whatever state it held.
+    """
+
+    samples: Samples
+    state: str | None = None
+
+
+Collector = Callable[[int, str | None], Collected]
+"""``collect(now, previous_state)``: every group's one collector signature."""
+
+
+def every_tick(collect: Callable[[], Samples]) -> Collector:
+    """Adapt a stateless zero-argument collector to the ``Collector`` signature."""
+
+    def collect_stateless(_now: int, _previous_state: str | None) -> Collected:
+        return Collected(collect())
+
+    return collect_stateless
 
 
 class GroupName(StrEnum):
@@ -126,17 +154,24 @@ class MetricSpec:
 class MetricGroup:
     """Metrics collected by one collector, admitted and windowed together.
 
-    ``collect`` is the live zero-argument collector. ``windowed`` is False when
-    the source is already windowed (PSI avg10), so its rows carry NULL window
-    columns.
+    ``collect`` is the live collector. ``windowed`` is False when the source is
+    already windowed (PSI avg10), so its rows carry NULL window columns.
+    ``due_seconds`` None collects the group on every tick; otherwise it is
+    collected when that many seconds have passed since its last attempt, and
+    must be unwindowed, because a trailing window is a row count and would
+    span a different time at another cadence. ``logs_rows`` False renders the
+    group in the tick line as a row and leaf count instead of every row.
     """
 
     name: GroupName
-    collect: Callable[[], Samples]
+    collect: Collector
     metrics: tuple[MetricSpec, ...]
     windowed: bool
+    due_seconds: int | None = None
+    logs_rows: bool = True
 
     def __post_init__(self) -> None:
+        self._check_cadence()
         repeated = _repeated(spec.name for spec in self.metrics)
         if repeated:
             raise ValueError(
@@ -151,6 +186,20 @@ class MetricGroup:
             raise ValueError(
                 f'a readability metric must belong to the same group: in {self.name}, '
                 f'{"; ".join(foreign)}, which the group does not declare'
+            )
+
+    def _check_cadence(self) -> None:
+        due = self.due_seconds
+        if due is None:
+            return
+        if isinstance(due, bool) or not isinstance(due, int) or due <= 0:
+            raise ValueError(
+                f'due_seconds must be a positive whole number of seconds: {self.name} has {due!r}'
+            )
+        if self.windowed:
+            raise ValueError(
+                f'a group with due_seconds must be unwindowed: {self.name} has '
+                f'due_seconds={due} and windowed=True'
             )
 
     @property
@@ -470,7 +519,7 @@ def _metric_table(*groups: MetricGroup) -> tuple[MetricGroup, ...]:
 METRIC_GROUPS: tuple[MetricGroup, ...] = _metric_table(
     MetricGroup(
         GroupName.PSI,
-        collect=collect_psi,
+        collect=every_tick(collect_psi),
         metrics=(
             _PSI_CPU_SOME, _PSI_CPU_FULL,
             _PSI_MEM_SOME, _PSI_MEM_FULL,
@@ -480,13 +529,13 @@ METRIC_GROUPS: tuple[MetricGroup, ...] = _metric_table(
     ),
     MetricGroup(
         GroupName.PROCESS,
-        collect=collect_process_metrics,
+        collect=every_tick(collect_process_metrics),
         metrics=(_OCCT_QUEUE_DEPTH, _VERIFY_CONCURRENCY, _VERIFY_RSS_TOTAL_BYTES),
         windowed=True,
     ),
     MetricGroup(
         GroupName.LOAD,
-        collect=collect_load_metrics,
+        collect=every_tick(collect_load_metrics),
         metrics=(_RUNQUEUE_RATIO, _RUNQUEUE_READ_OK, _OWN_CPU_SOME10, _OWN_READ_OK),
         windowed=True,
     ),
