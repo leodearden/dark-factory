@@ -38,10 +38,12 @@ _SITE_PACKAGES = frozenset(Path(sysconfig.get_paths()[key]).resolve() for key in
 _PROBE = """\
 import importlib.util
 import json
+import os
 import sys
 
 path, statements = sys.argv[1], json.loads(sys.argv[2])
-spec = importlib.util.spec_from_file_location('collected_test_module', path)
+sys.path.insert(0, os.path.dirname(path))
+spec =importlib.util.spec_from_file_location('collected_test_module', path)
 collected = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(collected)
 newly_loaded = {}
