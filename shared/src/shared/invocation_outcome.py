@@ -6,10 +6,11 @@ cap string tables, ``detect_cap_hit``) and ``shared.cli_invoke``
 (``NON_CAP_CLI_ERROR_MARKERS``, ``is_zero_output_timeout``) into one total,
 pure classifier: :func:`classify_invocation`.
 
-This module is additive only — it does not modify ``usage_gate.py`` or
-``cli_invoke.py``. Rewiring those consumers to call ``classify_invocation``
-is a follow-up task; until then the string tables are intentionally
-duplicated between the old and new homes.
+This module is the single home of those string tables and of the
+classifier: ``usage_gate.py`` and ``cli_invoke.py`` consume them from here
+and keep no copies, which
+``shared/tests/test_invocation_outcome.py::TestSingleSourceOwnership``
+asserts.
 
 Provenance note: consolidating the auth-failure path here originally LOST the
 401/403 response-body snippet — b68eea415b (task 2134 step-4) replaced
@@ -257,7 +258,7 @@ _CODEX_RESET_ROLLOVER_GRACE = timedelta(minutes=10)
 # ETA.
 #
 # Single ownership is now mechanically enforced, by
-# shared/tests/test_auth_failed.py::TestSingleResetsParserOwnership — a
+# tests/repo_guards/test_auth_failed_parser_ownership.py::TestSingleResetsParserOwnership — a
 # re-fork here or a re-export elsewhere fails it. So this pair is no longer
 # the un-guarded exception to the string tables' TestSingleSourceOwnership
 # coverage (CAP_HIT_PREFIXES / CAP_CONFIRM_KEYWORDS / NEAR_CAP_PREFIXES /
@@ -501,7 +502,7 @@ MODEL_NOT_FOUND_MARKERS = [
 ]
 
 # Patterns that indicate a usage cap has been hit (from Claude Code CLI
-# output). Copied from usage_gate.py:48 (CAP_HIT_PREFIXES).
+# output).
 CAP_HIT_PREFIXES = [
     "You've hit your",
     "You've used",
@@ -517,11 +518,9 @@ CAP_HIT_PREFIXES = [
 # cases.  'upgrade your plan' and 'upgrade your subscription' are natural SaaS
 # cap-message phrases unlikely to appear in non-cap contexts.  The primary
 # defense remains the CAP_HIT_PREFIXES / NEAR_CAP_PREFIXES prefix match.
-# Copied from usage_gate.py:78 (CAP_CONFIRM_KEYWORDS).
 CAP_CONFIRM_KEYWORDS = ['resets', 'usage limit', 'upgrade your plan', 'upgrade your subscription']
 
-# Patterns for near-cap warnings (pause proactively). Copied from
-# usage_gate.py:81 (NEAR_CAP_PREFIXES).
+# Patterns for near-cap warnings (pause proactively).
 NEAR_CAP_PREFIXES = [
     "You're close to",
 ]
@@ -556,7 +555,7 @@ def _extract_cap_message(text: str, prefix: str) -> str:
     TestSingleSourceOwnership, which only asserts the plain string-table
     constants are single-sourced here with no mirrored copies elsewhere;
     single ownership of this function is covered by
-    ``shared/tests/test_auth_failed.py::TestSingleResetsParserOwnership``.
+    ``tests/repo_guards/test_auth_failed_parser_ownership.py::TestSingleResetsParserOwnership``.
     """
     lower = text.lower()
     idx = lower.find(prefix.lower())

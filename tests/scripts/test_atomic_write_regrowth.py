@@ -9,9 +9,9 @@ survivor rather than a fresh hand-rolled copy.
 
 WHY IT LIVES HERE AND NOT IN A PACKAGE SUITE (task 3388).  ``CONTRIBUTING.md``
 §2, "Where repo-wide gates live", places a gate by what it reads: one that walks
-the shared ``first_party_tree`` parse lives in ``shared/tests``, and a sweep
+the shared ``first_party_tree`` parse lives in ``tests/repo_guards``, and a sweep
 that brings its own reader lives here.  This guard brings its own reader, and
-its ``_SRC_TREES`` is not ``shared/tests/silent_fallthrough_scan.py::SCOPE_ROOTS``:
+its ``_SRC_TREES`` is not ``tests/repo_guards/silent_fallthrough_scan.py::SCOPE_ROOTS``:
 it adds ``fused-memory/scripts`` and scans the test directories inside
 ``scripts``, which ``iter_first_party_files`` excludes.  So it cannot share
 that parse without changing what it detects.  It was born in
@@ -58,8 +58,9 @@ this file: all three commands there are directory-wide.
 
 SCOPE LIMIT, stated because a green run here must not be over-read: relocating
 this guard did NOT make ``shared/tests`` standalone-runnable, and was not meant
-to — ``shared/tests`` deliberately hosts the whole-tree source gates and
-presumes a full checkout (``CONTRIBUTING.md`` §2, "Where repo-wide gates live").
+to.  The whole-tree source gates now live in ``tests/repo_guards``
+(``CONTRIBUTING.md`` §2, "Where repo-wide gates live"), but other shared tests
+still read outside their package.
 """
 import ast
 import functools
@@ -145,14 +146,18 @@ _ALLOWED_RENAMERS = {
         'THE consolidated implementation — the one blessed home for this pattern.',
     ('shared/src/shared/safe_io.py', 'load_json_or_warn'):
         'Quarantine rename of a corrupt file (<name>.corrupt); not a write path.',
-    ('orchestrator/src/orchestrator/session_registry.py', '_atomic_write_text'):
-        'DELIBERATE EXCEPTION to task 3223, not an oversight. The module is '
-        'invoked by absolute path from skills/spawn/spawn-claude.sh under an '
-        'interpreter with no venv/install/workspace packages, so its docstring '
-        "declares it stdlib-only; a module-scope `from shared import safe_io` "
-        'made it unimportable there (ModuleNotFoundError) and silently broke '
-        'the spawn hook. Pinned by test_session_registry.py::'
-        'TestStdlibOnlySelfContainment. Do not "finish" this migration.',
+    ('orchestrator/src/orchestrator/fleet_files.py', 'atomic_write_text'):
+        'DELIBERATE EXCEPTION to task 3223, not an oversight. fleet_files is '
+        'imported at module scope by session_registry.py, which '
+        'skills/spawn/spawn-claude.sh runs by absolute path under an '
+        'interpreter with no venv/install/workspace packages; a module-scope '
+        '`from shared import safe_io` once made session_registry unimportable '
+        'there (ModuleNotFoundError) and silently broke the spawn hook. Pinned '
+        'by test_session_registry.py::TestStdlibOnlySelfContainment. Whether to '
+        'delegate to shared.safe_io stays open under ticket '
+        'tkt_0RW29CREM5XVXNE710FGF4W5MA. Task 9778 (S19 theta-1) later moves '
+        'this module, and this key, to shared/src/shared/session/fleet_files.py. '
+        'Do not "finish" this migration here.',
     ('orchestrator/src/orchestrator/session_hooks.py', '_run_install'):
         'Out of task 3223 enumerated scope; left alone deliberately.',
     ('escalation/src/escalation/queue.py', 'EscalationQueue._atomic_write_path'):
@@ -327,7 +332,7 @@ _ALLOWED_RENAMERS = {
         'second one. Added by task 6151.',
     ('scripts/dashboard-watchdog.py', 'save_state'):
         'STDLIB-ONLY STANDALONE ENTRYPOINT — the same constraint already '
-        'recorded above for session_registry._atomic_write_text, so that '
+        'recorded above for fleet_files.atomic_write_text, so that '
         'argument is not restated. This is a ``#!/usr/bin/env python3`` '
         'systemd/cron oneshot; verified by reading its imports (contextlib, '
         'json, os, subprocess, sys, tempfile, time, urllib) that it pulls in '
@@ -354,7 +359,7 @@ _ALLOWED_RENAMERS = {
         'rather than a str already in memory.',
     ('scripts/_watchdog_state.py', 'atomic_write_json'):
         'STDLIB-ONLY STANDALONE ENTRYPOINT — as dashboard-watchdog.save_state '
-        'above, and session_registry._atomic_write_text before it. A flat '
+        'above, and fleet_files.atomic_write_text before it. A flat '
         'stdlib sibling that scripts/orchestrator-watchdog.py, a '
         '``#!/usr/bin/env python3`` systemd/cron oneshot, imports from its own '
         'directory; verified by reading both files\' imports that they are '
@@ -387,7 +392,7 @@ _ALLOWED_RENAMERS = {
     ('scripts/render_systemd_unit.py', 'main'):
         'STDLIB-ONLY STANDALONE ENTRYPOINT — the class of dashboard-watchdog.'
         'save_state and _watchdog_state.atomic_write_json above, and of '
-        'session_registry._atomic_write_text before them, but under a HARDER '
+        'fleet_files.atomic_write_text before them, but under a HARDER '
         'constraint than any of them: setup-host.sh invokes it as bare '
         '``python3 <abs path>`` (never ``uv run``) while BOOTSTRAPPING the '
         'host, so at that moment there is no venv and no workspace install for '
@@ -834,7 +839,7 @@ class TestNoRegrownAtomicWriters:
         {memory_eval_limits,memory_eval_metrics,prompt_artifact}.py).  The other
         three are skipped by construction rather than overlooked —
         shared/src/shared/safe_io.py::atomic_write_text is the blessed
-        implementation (skipped by path), and session_registry's and
+        implementation (skipped by path), and fleet_files's and
         bake_off_storage_shape's copies are allowlisted exceptions (skipped by
         _ALLOWED_RENAMERS).  Merging main back in then added a SEVENTH name and
         a THIRD such exception, scripts/census_tagger_debris.py::
@@ -858,9 +863,10 @@ class TestNoRegrownAtomicWriters:
             for name, delegates in module.write_helpers:
                 if (module.relpath, name) in _ALLOWED_RENAMERS:
                     # Same documented exceptions as the sibling guard above.
-                    # session_registry in particular MUST keep an inlined body:
-                    # it is stdlib-only so spawn-claude.sh can run it with no
-                    # venv, and importing shared makes it unimportable there.
+                    # fleet_files in particular MUST keep an inlined body: it
+                    # is stdlib-only so spawn-claude.sh can run session_registry
+                    # (which imports it) with no venv, and importing shared
+                    # made that unimportable there.
                     continue
                 checked.append(f'{module.relpath}::{name}')
                 if not delegates:
@@ -1017,14 +1023,13 @@ def test_atomic_write_guard_does_not_scan_sibling_package_trees():
 
     (b) This test pins ONE file, not ``shared/tests`` as a whole.  It does NOT
     establish that shared's suite is standalone-runnable, and it is not meant
-    to: ``shared/tests`` deliberately hosts the whole-tree source gates, which
-    name sibling trees by design, and presumes a full checkout
-    (``CONTRIBUTING.md`` §2, "Where repo-wide gates live").
+    to: the whole-tree source gates, which name sibling trees by design, live
+    in ``tests/repo_guards`` (``CONTRIBUTING.md`` §2, "Where repo-wide gates
+    live"), but other shared tests still read outside their package.
 
     WHY THE NARROW FORM.  A walk of ``shared/tests/**/*.py`` asserting the
-    whole directory names no sibling tree would be red forever: the whole-tree
-    source gates that live there name sibling trees on purpose, and each is
-    load-bearing where it sits.  The fence's purpose is SPOT: the atomic-write
+    whole directory names no sibling tree would fence more than this guard's
+    one home.  The fence's purpose is SPOT: the atomic-write
     guard has one home, this module, so ``test_safe_io.py`` must not fork a
     second sweep.
     """
@@ -1049,7 +1054,7 @@ def test_atomic_write_guard_does_not_scan_sibling_package_trees():
         + '\nThe atomic-write anti-regrowth guard lives in '
         'tests/scripts/test_atomic_write_regrowth.py; extend it there rather than '
         'forking a second sweep into safe_io\'s unit suite. A new gate over the '
-        'shared first_party_tree parse belongs beside that fixture in shared/tests '
+        'shared first_party_tree parse belongs beside that fixture in tests/repo_guards '
         '(CONTRIBUTING.md §2, "Where repo-wide gates live"). If the '
         'literal is genuinely PROSE rather than a scan root, write it as prose: '
         'the predicate only flags a bare path with no whitespace in it.'
@@ -1167,7 +1172,7 @@ def test_every_fenced_package_tests_dir_is_a_required_pointer_tree():
 #: beside the symbol — so the check would fail on its own definition site.
 #:
 #: Backticks are optional and the gaps span newlines AND the ``#`` of a wrapped
-#: comment: session_registry.py wraps the phrase across a line break inside a
+#: comment: fleet_files.py wraps the phrase across a line break inside a
 #: docstring (pure whitespace), while test_safe_io.py's pointer wraps inside a
 #: ``#`` comment block.  A plain ``\s+`` matches the first and silently misses
 #: the second — measured, when this module's own pointer went unseen — so a
@@ -1258,7 +1263,7 @@ def test_allowlist_pointers_resolve_to_the_guard_module():
     # means the matcher regressed, not that the docs got tidy.
     assert pointers, (
         'The pointer sweep matched nothing. Real pointers exist (orchestrator '
-        'session_registry.py and test_session_registry.py both carry one), so '
+        'fleet_files.py and test_fleet_files.py both carry one), so '
         'an empty result means _POINTER_RE stopped matching or '
         '_iter_pointer_candidates stopped walking — not that the repo is clean.'
     )

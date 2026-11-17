@@ -48,7 +48,7 @@ from legibility.detectors import (  # noqa: E402  # debt: task 6760
     record_hits,
     user_turn_text,
 )
-from legibility.inventory import (  # noqa: E402
+from legibility.inventory import (
     UNREADABLE_FILE_ERRORS,
     as_unreadable_file_error,
     encode_cwd,

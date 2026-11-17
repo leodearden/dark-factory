@@ -981,7 +981,7 @@ action); task goes `blocked` until resolved.
 |---|---|---|---|
 | present | `false` | run action; escalate only on failure; else `done` | **auto-deploy** |
 | present | `true` | run action; then escalate born-at-L2; `done` after `resume` | act-then-ask (incompatible with `human_curator_gate`) |
-| absent | `true` | escalate born-at-L2 immediately; `done` after `resume`; re-fires instead if resumed behind a new dependency, external dependency or milestone | **pure gate** |
+| absent | `true` | escalate born-at-L2 immediately; `done` on `resume` (immediately, unless it waits on a dependency, milestone or `deferred_watch`, or carries any `external_deps` or delivered-check dependency — see `docs/deterministic-runner.md` §"Resuming a pure gate"); re-fires instead if resumed behind a new dependency, external dependency or milestone | **pure gate** |
 | absent | `false` | **rejected** at `submit_task` (ill-formed no-op) | — |
 
 **Validation (enforced at `submit_task`):** `task_kind='deterministic'`
@@ -1001,7 +1001,10 @@ open (quiescence guard — no re-dispatch, no churn).
 
 - `before_done.target_unit` equals this orchestrator's own unit → detached
   `systemd-run --user` with `--on-failure` (done = `scheduled`; the
-  dispatching orchestrator is **not** killed).
+  dispatching orchestrator is **not** killed). The script is re-checked for
+  existence and the executable bit before the unit is registered; an
+  unrunnable script blocks the task instead of marking it `scheduled`
+  (`docs/deterministic-runner.md` §2).
 - `before_done.target_unit` differs from own unit (or is `None`) →
   blocking subprocess + fresh `MainPID`/`ActiveEnterTimestamp` verify
   against a pre-run baseline (done = `deployed-and-verified`).
@@ -1013,6 +1016,9 @@ author-supplied): `before_done_ran_at`, `before_done_verified_at`,
 `deterministic-*` kinds — see the requirement table in §2 for
 per-kind semantics; `deterministic-milestone` is stamped on both the
 first-pass check and the post-escalation re-check described in §6).
+Both gate stamps are removed by fused-memory when the task enters or
+leaves `done`/`cancelled` (task 3638), so a closed gate carries neither
+and a reopened one files afresh.
 
 A **pure-gate** close cites the resolving `milestone_gate` record via
 `done_provenance.escalation_id`, exactly as the curator-gate close already
@@ -1028,13 +1034,14 @@ dependency (by CLAUDE.md's `planning_mode=True` → `add_dependency` →
 fresh gate escalation itself, because the task now waits on more than its
 `gate_escalated_preconditions` record (rationale:
 `docs/deterministic-runner.md` §3), so nobody clears `gate_escalated_at` by
-hand. Wiring the hold after the resume races: the task re-pends with
-nothing new to wait on and closes. One transitional exception: a gate
-whose metadata has no `gate_escalated_preconditions` record fired before
-task 9520 deployed, and closes when the hold lands. For it, set
-`gate_escalated_at` to null after wiring the hold and before the resume,
-so the gate files afresh. The exception can go once no blocked gate lacks
-the record.
+hand. The hold must be wired BEFORE the resume: a resume with nothing new
+to wait on closes the gate at once, at resolution time (task 3638). One
+transitional exception: a gate whose metadata has no
+`gate_escalated_preconditions` record fired before task 9520 deployed, and
+closes when the hold lands. For it, set `gate_escalated_at` to null after
+wiring the hold and before the resume; with no stamp it is not a held pure
+gate, so the resume re-pends it and it files afresh on dispatch. The
+exception can go once no blocked gate lacks the record.
 
 **`done_provenance.kind='operational-verified'`** — a related but distinct
 closure path (see §2), used for `normal`-task no-code operational asks
@@ -1673,7 +1680,7 @@ row, or null when it has none. It is never re-derived at plan refinement or at
 `done`. The only re-stamp is a curator combine (`basis='combine'`, task
 8415). An absent key, on a task filed before the stamp existed, means no
 information, never `undeclared`. The modules allowed to import it are pinned
-by `shared/tests/test_declared_scope_readers.py`
+by `tests/repo_guards/test_declared_scope_readers.py`
 (`plans/follow-up-filing-shape-prd.md` §3 decisions 6–8), and no verify,
 merge-lane, triage or routing path may read it: the same test fails if one of
 those modules names the key or anything `shared.declared_scope` exports.
@@ -2015,8 +2022,8 @@ other top-level key through `find_tasks_by_metadata` (§9).
 sweep (exceptions are owned or ratified; PRD
 `plans/inv12-exceptions-owned-or-ratified-prd.md`, D11).
 `x_inv12_finding` is the sweep's idempotence key, one per
-`(scope, dead owner)` where scope is a governed `list_id` or `inline`; the
-sweep skips filing while a live task or pending escalation carries it.
+`(scope, dead owner)` where scope is a governed `list_id` or `inline`; what
+counts as already raised is `scripts/exception_owner_sweep.py::decide`.
 `x_inv12_owns` is a note the sweep merges into a live owner task, saying
 which exception entries cite it. A sweep-filed task asks the implementer to
 re-dispose each entry whose owner is dead: fix the underlying type or code so
@@ -2494,6 +2501,49 @@ event carrying the advisory plus `writer_source` (`update_task` or
 `curator_combine`) and `agent_id`. That includes a curator combine
 rewriting a planned task's text, which no caller is told about. Contract:
 `plans/task-amendment-delivery-prd.md` §9 C7.
+
+### Superseding another task's plan
+
+A frozen `plan.json` is not inert:
+`orchestrator/src/orchestrator/workflow.py::TaskWorkflow._plan` picks its
+branch from the plan file. A plan with steps, a `_session_id` and a
+resolvable revalidation base (`TaskWorkflow._revalidation_base`) is
+revalidated. A description or details amendment declines the Lever-B skip
+(previous subsection), but the revalidating architect is still handed the
+old plan to confirm, update or recreate. A metadata-only correction changes
+no fingerprint. So with `revalidation_skip_enabled`, no overlap with main's
+changes and `TaskWorkflow._can_skip_revalidation` passing, the orchestrator
+stamps `_revalidated_at` and proceeds without invoking the architect at all.
+Moving `plan.json` out of the way is the reliable way to force fresh
+planning.
+
+No task lane can remove or rewrite another task's plan. The OS sandbox
+grants only `orchestrator/src/orchestrator/agents/write_set.py::WriteSet.writable_paths`,
+whose only `.task-meta` entries are the dispatch's own lane and task dirs.
+A resolution's `granted_files` folds into plan files and locks, never into
+the sandbox. A plan step that writes another task's `.task-meta/` is
+therefore unimplementable (task 4822's step 5d; task 4825).
+
+plan-tools flags such a step when it is authored. The `add_plan_step`,
+`add_prerequisite`, `replace_plan_step` and `confirm_plan` responses carry
+`foreign_task_meta` (`{paths: {<step id>: [<path>]}, note}`) for any
+absolute, `~/` or worktree-relative `../` path inside another lane's or
+task's `.task-meta` dir
+(`WriteSet.is_foreign_task_meta`). The flag is advisory: prose cannot tell a
+read from a write, and reads are fine.
+
+The route: to make another task plan fresh, resolve an escalation whose
+`task_id` is THAT task's with `resolve_issue(action='restart', recut=True)`
+(task 5516; `escalation/src/escalation/server.py::resolve_issue`). Its next
+dispatch parks the branch, quarantines the worktree and moves `.task-meta`
+aside, deleting nothing, then cuts fresh from main and plans fresh.
+`resolve_issue` acts on the task its escalation names, so restart+recut on
+the requesting task's own escalation recuts the requesting task, not the
+target. A task that needs this files `escalate_blocker` for itself instead
+of scheduling the write as a step, with a `suggested_action` naming the
+target task id. The handler then resolves a pending escalation for the
+target, filing one with `escalate_blocker(task_id=<target id>)` first if
+there is none.
 
 ## 10. Rotating a long-running audit-trail task
 

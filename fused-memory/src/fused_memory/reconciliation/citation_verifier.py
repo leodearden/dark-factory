@@ -751,7 +751,7 @@ async def scan_prose_citations(
             tombstone = await memory_service.get_mem0_deletion_tombstone(
                 project_id, memory_id,
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             outcome: tuple[str, str | None] = ('inconclusive', type(exc).__name__)
         else:
             outcome = ('tombstoned', None) if tombstone else ('absent', None)
@@ -1435,7 +1435,7 @@ async def repoint_task_citations(
             )
         except (KeyboardInterrupt, SystemExit):
             raise
-        except Exception as exc:  # noqa: BLE001 — best-effort per-task sweep
+        except Exception as exc:  # best-effort per-task sweep
             log.warning(
                 'citation repoint failed for task %s (%s -> %s): %s',
                 task_id, memory_id, replacement_id, exc,

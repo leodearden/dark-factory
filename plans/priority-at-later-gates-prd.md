@@ -388,7 +388,9 @@ Notes for decompose:
 - κ1 and κ2 are the signal leaves.
 - Critical path to the priority pick: 9908 → α1 → γ (after 8528) → ι1 → ι2 (after α2 and after 8532 has read); β and α2 in
   parallel. Until α2 lands, age at the later gates is counted from the request's first enqueue or the plan's arrival. The pin tier at the
-  later gates arrives with α1; inside the scheduler it waits for the restructuring chain.
+  later gates arrives with α1; inside the scheduler it waits for the restructuring chain. (Changed 2026-11-17 by
+  Leo's ruling: θ1, task 9939, no longer waits on task 9683 or the restructuring chain; it waits on θ2 only, and
+  seam notes on tasks 9665, 9678 and 9679 carry its pin-order map through the restructuring.)
 
 ## 9. Out of scope
 

@@ -61,9 +61,15 @@ from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
 from fused_memory.backends.task_backend_types import (
     AmendmentAdvisory,
     MetadataLookupResult,
+    TaskFactsRow,
 )
 from fused_memory.config.schema import CuratorConfig
-from fused_memory.middleware import deferral_gate, recon_write_policy, task_text_write_guard
+from fused_memory.middleware import (
+    deferral_gate,
+    gate_stamp_lifecycle,
+    recon_write_policy,
+    task_text_write_guard,
+)
 from fused_memory.middleware.amendment_advisory import (
     TASK_TEXT_FIELDS,
     AmendmentWriter,
@@ -1022,7 +1028,7 @@ class TaskInterceptor:
                 exists=self._consolidation_exists,
                 project_id=project_id,
             )
-        except Exception as exc:  # noqa: BLE001 — every failure is a refusal
+        except Exception as exc:  # every failure is a refusal
             logger.warning(
                 'consolidation closure scroll or probe failed for task=%s '
                 'topic=%s: %s; REFUSING the done transition (fail-closed)',
@@ -2035,7 +2041,12 @@ class TaskInterceptor:
                     _status_write_body(
                         tm, task_id, status, project_root, tag,
                         audit_fields=audit_fields,
-                        clear_keys=deferral_write.clear_keys,
+                        clear_keys=deferral_write.clear_keys
+                        | gate_stamp_lifecycle.terminal_crossing_clear_keys(
+                            old_status=old_status,
+                            new_status=status,
+                            stored_metadata=stored_metadata,
+                        ),
                         claimant_kwargs=claimant_kwargs,
                     ),
                     agent_id=_journal_agent_id,
@@ -6208,6 +6219,13 @@ class TaskInterceptor:
         """
         tm = await self._ensure_taskmaster()
         return await tm.get_statuses_raw(project_root, tag=tag, ids=ids)
+
+    async def get_task_facts(
+        self, ids: Sequence[str], project_root: str,
+    ) -> dict[str, TaskFactsRow]:
+        """Pure read of the backend's task facts; no events, no journal entry."""
+        tm = await self._ensure_taskmaster()
+        return await tm.get_task_facts(ids, project_root)
 
     async def get_statuses_fresh(
         self,

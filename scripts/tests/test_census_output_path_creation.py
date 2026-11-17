@@ -98,6 +98,7 @@ def _run_census_kwargs(root, **overrides) -> dict[str, Any]:
         selection_of=lambda: None,
         invoke=lambda prompt, model: "pong",
         verify_fn=lambda clusters, *, model: {"verified": [], "rejected": [], "fixed": []},
+        fit_fn=lambda check, *, model: (),
         synthesize_fn=lambda brief, *, model: _EMPTY_SYNTHESIS,
         embedder=embeddings.Embedder(
             embed_fn=_distinct_one_hot_embed, cache_path=root / "embeddings.sqlite",

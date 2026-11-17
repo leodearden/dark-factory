@@ -682,7 +682,7 @@ def test_refusals_are_returned_not_raised(sweep_root):
     """Refusals are structured VALUES carrying (path, lane, reason).
 
     Never raised-and-swallowed: `scripts` is inside
-    shared/tests/silent_fallthrough_scan.py's SCOPE_ROOTS, so a broad
+    tests/repo_guards/silent_fallthrough_scan.py's SCOPE_ROOTS, so a broad
     `except Exception` funnelling into a default would trip the ratchet — and
     would also lose the reason a human needs to adjudicate the refusal.
     """
@@ -1076,39 +1076,49 @@ def test_a_REAL_sibling_key_leak_with_a_tail_is_still_repaired():
 # ---------------------------------------------------------------------------
 
 
-def test_repair_document_converges_and_is_idempotent_on_a_nested_leak():
-    """Case (a): a recovered value that ITSELF still carries markup.
+def test_a_nested_leak_with_an_unterminated_inner_opener_is_refused_in_round_one():
+    """Case (a), refused: the nested double-leak shape cancelled task 3654 classified.
 
-    The nested double-leak shape cancelled task 3654 classified. What actually
-    happens is worth pinning precisely, because it is NOT "repaired twice":
+    The recovered ``suggested_action`` would hide a canonical ``triage_note``
+    opener, so repair() refuses in round one, as it refuses a strictly nested
+    closer, and nothing lands in a hole. The value stays byte-identical and is
+    reported once as leak residue; a second pass finds the same and repairs
+    nothing. The grounds the round bound rests on are written once, at
+    scripts/sweep_toolcall_markup.py::_MAX_REPAIR_ROUNDS.
+    """
+    detail = (
+        'The intended detail.' + _closer('detail') + '\n' + _lit('suggested_action')
+        + 'rc_text' + _lit('triage_note') + 'tn_text'
+        + _closer('parameter') + '\n' + INVOKE_CLOSER + '\n'
+    )
+    record = make_escalation('esc-8-2', 'resolved', detail)
 
-    ``_parse_tail`` refuses when a recovered item contains a further mis-close
-    (PRD boundary row B5 — the inner value's boundary would be a guess), so a
-    STRICTLY nested leak is a refusal, not a two-round repair. It said "refuses
-    OUTRIGHT" until task **5620**, which is the pre-**4502** rule stated
-    unconditionally (scripts/sweep_toolcall_markup.py::_MAX_REPAIR_ROUNDS). Nothing this
-    test asserts changes: its inner value is a real mis-close, and only a
-    merely-QUOTED closing tag repairs now.
+    repaired, outcomes = sweep.repair_document(record)
 
-    THE REST OF THIS PARAGRAPH IS UNAFFECTED, and deliberately so. The shape
-    that DOES survive round one is the unterminated inner opener below: it
-    carries no closing tag, so B5 does not fire, and the recovered value lands
-    in its hole still tripping detect(). Task 5620 added a rule blocking a
-    parameter OPENER inside a recovered value and this shape STILL survives,
-    because ``_parse_body``'s cheap prefilter only fires on a closing-tag
-    sequence, so the rule never sees it. That asymmetry is declared rather than
-    overlooked — task **5639** owns it — and
-    closing it would rewrite this convergence case rather than merely correct
-    its prose.
+    assert repaired['detail'] == detail, 'a refusal leaves the value byte-identical'
+    assert repaired['suggested_action'] == ''
+    assert [o.action for o in outcomes] == [sweep.ACTION_REFUSED]
+    assert outcomes[0].reason == sweep.REASON_UNREPAIRABLE
+    assert outcomes[0].residue == sweep.RESIDUE_LEAK
 
-    Round two then REFUSES it (there is no qualifying mis-close to scan), so
-    the residue is reported rather than silently left — and a second
-    ``repair_document`` call applies zero repairs. That is the idempotence the
-    second-run-zero invariant needs, and it holds here by measurement rather
-    than by assumption.
+    before = json.dumps(repaired, indent=2)
+    again, again_outcomes = sweep.repair_document(repaired)
+    assert json.dumps(again, indent=2) == before
+    assert [o.action for o in again_outcomes].count(sweep.ACTION_REPAIRED) == 0
+
+
+def test_repair_document_converges_and_is_idempotent_on_a_quoted_closer():
+    """Case (a), converging: a recovered value that QUOTES a closing tag.
+
+    Task 4502's carve-out lets that value parse, so round one repairs it and
+    lands it in its hole still tripping detect(). Round two has no qualifying
+    mis-close to scan and REFUSES it, so the residue is reported rather than
+    silently left, and a second ``repair_document`` call applies zero repairs.
+    This is the shape that keeps the convergence loop load-bearing; see
+    scripts/sweep_toolcall_markup.py::_MAX_REPAIR_ROUNDS.
     """
     intended = 'The intended detail.'
-    inner = 'rc_text' + _lit('triage_note') + 'tn_text'
+    inner = 'rc_text quotes ' + _closer('content') + ' in prose'
     record = make_escalation(
         'esc-8-1',
         'resolved',
@@ -2078,11 +2088,12 @@ def test_a_refusal_that_only_appears_in_a_later_round_is_still_reported():
     ``[('detail', 'repaired'), ('root_cause', 'refused')]`` — the refusal
     appears in NO round but the last.
 
-    This is the nested double-leak shape (cancelled task 3654) that motivates
-    the convergence loop existing at all, so dropping its refusal would make
-    the loop report less than no loop did.
+    The recovered value QUOTES a closing tag, the shape that still lands in a
+    hole (scripts/sweep_toolcall_markup.py::_MAX_REPAIR_ROUNDS) and so the one
+    that keeps the convergence loop load-bearing. Dropping its refusal would
+    make the loop report less than no loop did.
     """
-    inner = 'rc_text' + _lit('triage_note') + 'tn_text'
+    inner = 'rc_text quotes ' + _closer('content') + ' in prose'
     record = {
         'id': 'esc-late-1',
         'status': 'resolved',

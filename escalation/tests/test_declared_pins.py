@@ -34,7 +34,7 @@ from escalation.models import Escalation
 
 def _esc(
     *,
-    id: str = 'esc-3371-2',  # noqa: A002 — mirrors the Escalation attribute name
+    id: str = 'esc-3371-2',  # mirrors the Escalation attribute name
     pin_declared_by: list[str] | None = None,
     pin_declared_reason: str = '',
 ) -> Escalation:

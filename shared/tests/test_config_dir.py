@@ -25,6 +25,7 @@ from shared import config_dir as config_dir_module
 from shared.config_dir import (
     CONFIG_DIR_PREFIX,
     TaskConfigDir,
+    ambient_config_dir,
     reset_sweep_once_state,
     sweep_stale_pid_dirs,
     sweep_stale_pid_dirs_once,
@@ -816,3 +817,14 @@ class TestRemoveCredentials:
 
     def test_is_a_no_op_without_credentials(self, tmp_path):
         TaskConfigDir('creds', base_dir=tmp_path).remove_credentials()
+
+
+class TestAmbientConfigDir:
+    def test_returns_the_inherited_claude_config_dir(self):
+        assert ambient_config_dir({'CLAUDE_CONFIG_DIR': '/x/cfg'}) == Path('/x/cfg')
+
+    def test_falls_back_to_home_claude_when_unset(self):
+        assert ambient_config_dir({}) == Path.home() / '.claude'
+
+    def test_treats_an_empty_value_as_unset(self):
+        assert ambient_config_dir({'CLAUDE_CONFIG_DIR': ''}) == Path.home() / '.claude'

@@ -853,7 +853,8 @@ class TestLiveRead:
     `mem0_update.*` is green-tier — hot-reloadable with no restart — and
     `reload_config` delivers that by mutating the SHARED config object in
     place. A helper that bound `memory_service.config`, or any leaf of it,
-    to a local would make all five leaves restart-only in disguise while
+    to a local would make every green-tier `mem0_update.*` leaf
+    restart-only in disguise while
     every other test in this file still passed.
 
     Mirrors `tests/server/test_update_memory_authz_gate.py::TestLiveRead`,

@@ -2513,6 +2513,10 @@ class TestSpeculativeMergeWorker:
         With fix: except clause resolves N+1's Future as 'blocked' with
         'Verifier error'; finally clause always sets _speculation_slot.
         """
+        # Deep chains off (task 8527): under the operational yaml's chain_cap N,
+        # alone in the verify frontier, would chain N+1 rather than leave it to
+        # the _remerge this scene raises in.
+        config = config.model_copy(update={'merge_deep': MergeDeepConfig(chain_cap=0)})
         wt_n = await _make_branch_with_file(
             git_ops, 'vre-n', 'file_vre_n.py', 'n = 1\n',
         )
@@ -17088,7 +17092,7 @@ class TestSnapshotOwnedMergeWorktrees:
         p1.mkdir()
         worker._register_owned_merge_worktree(p1)  # resolve happens HERE, once
 
-        def _explode(self, *a, **kw):  # noqa: ANN001, ANN002, ANN003, ARG001
+        def _explode(self, *a, **kw):
             raise AssertionError(
                 'snapshot() resolved a ledger path at read time — the resolve '
                 'must be memoised at _register_owned_merge_worktree time'
@@ -17122,7 +17126,7 @@ class TestSnapshotOwnedMergeWorktrees:
         direct.mkdir()
         worker._owned_merge_worktrees.add(direct)  # NO memo entry
 
-        def _explode(self, *a, **kw):  # noqa: ANN001, ANN002, ANN003, ARG001
+        def _explode(self, *a, **kw):
             raise AssertionError('fallback path must not resolve at read time')
 
         monkeypatch.setattr(Path, 'resolve', _explode)
@@ -18970,7 +18974,7 @@ class TestCheckMergeLivenessMarginHeartbeatFloor:
 
     def test_merge_ahead_bound_kwarg_raises_type_error(self, tmp_path: Path):
         """check_merge_liveness_margin no longer accepts merge_ahead_bound kwarg."""
-        from orchestrator.merge_lane.liveness import check_merge_liveness_margin  # noqa: PLC0415
+        from orchestrator.merge_lane.liveness import check_merge_liveness_margin
 
         cfg = OrchestratorConfig(project_root=tmp_path)
         with pytest.raises(TypeError):
@@ -18978,7 +18982,7 @@ class TestCheckMergeLivenessMarginHeartbeatFloor:
 
     def test_num_hosts_kwarg_raises_type_error(self, tmp_path: Path):
         """check_merge_liveness_margin no longer accepts num_hosts kwarg."""
-        from orchestrator.merge_lane.liveness import check_merge_liveness_margin  # noqa: PLC0415
+        from orchestrator.merge_lane.liveness import check_merge_liveness_margin
 
         cfg = OrchestratorConfig(project_root=tmp_path)
         with pytest.raises(TypeError):
@@ -18986,7 +18990,7 @@ class TestCheckMergeLivenessMarginHeartbeatFloor:
 
     def test_threshold_equals_safety_factor_times_liveness(self, tmp_path: Path):
         """threshold_secs == safety_factor * liveness_secs (injected)."""
-        from orchestrator.merge_lane.liveness import check_merge_liveness_margin  # noqa: PLC0415
+        from orchestrator.merge_lane.liveness import check_merge_liveness_margin
 
         cfg = OrchestratorConfig(project_root=tmp_path)
         result = check_merge_liveness_margin(cfg, safety_factor=0.5, liveness_secs=3600.0)
@@ -18997,7 +19001,7 @@ class TestCheckMergeLivenessMarginHeartbeatFloor:
 
     def test_safe_flag_matches_comparison(self, tmp_path: Path):
         """safe == (worst_case_secs < threshold_secs)."""
-        from orchestrator.merge_lane.liveness import check_merge_liveness_margin  # noqa: PLC0415
+        from orchestrator.merge_lane.liveness import check_merge_liveness_margin
 
         cfg = OrchestratorConfig(project_root=tmp_path)
         # Shipped defaults: floor=600, threshold=8100 → safe=True
@@ -19020,7 +19024,7 @@ class TestMergeLivenessAssessmentFields:
 
     def test_new_fields_present(self, tmp_path: Path):
         """Assessment exposes heartbeat_poll_secs, touch_miss_tolerance, safety_factor."""
-        from orchestrator.merge_lane.liveness import check_merge_liveness_margin  # noqa: PLC0415
+        from orchestrator.merge_lane.liveness import check_merge_liveness_margin
 
         cfg = OrchestratorConfig(project_root=tmp_path)
         result = check_merge_liveness_margin(cfg)
@@ -19037,7 +19041,7 @@ class TestMergeLivenessAssessmentFields:
 
     def test_old_fields_absent(self, tmp_path: Path):
         """Assessment no longer has timeout_secs, merge_ahead_bound, num_hosts, max_verify_timeouts."""
-        from orchestrator.merge_lane.liveness import check_merge_liveness_margin  # noqa: PLC0415
+        from orchestrator.merge_lane.liveness import check_merge_liveness_margin
 
         cfg = OrchestratorConfig(project_root=tmp_path)
         result = check_merge_liveness_margin(cfg)
@@ -19108,7 +19112,7 @@ class TestCheckMergeLivenessMarginClassificationAndLogging:
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
     ):
         """liveness_secs=600 → threshold=450 ≤ floor=600 → safe=False + exactly one WARNING."""
-        from orchestrator.merge_lane.liveness import check_merge_liveness_margin  # noqa: PLC0415
+        from orchestrator.merge_lane.liveness import check_merge_liveness_margin
 
         cfg = OrchestratorConfig(project_root=tmp_path)
         with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
@@ -19129,7 +19133,7 @@ class TestCheckMergeLivenessMarginClassificationAndLogging:
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
     ):
         """Shipped defaults → safe=True → no WARNING emitted."""
-        from orchestrator.merge_lane.liveness import check_merge_liveness_margin  # noqa: PLC0415
+        from orchestrator.merge_lane.liveness import check_merge_liveness_margin
 
         cfg = OrchestratorConfig(project_root=tmp_path)
         with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
@@ -19147,7 +19151,7 @@ class TestCheckMergeLivenessMarginClassificationAndLogging:
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
     ):
         """WARNING names the heartbeat model; does NOT mention cold_timeout or merge_ahead_bound."""
-        from orchestrator.merge_lane.liveness import check_merge_liveness_margin  # noqa: PLC0415
+        from orchestrator.merge_lane.liveness import check_merge_liveness_margin
 
         cfg = OrchestratorConfig(project_root=tmp_path)
         with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
@@ -19171,7 +19175,7 @@ class TestCheckMergeLivenessMarginInvariant:
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
     ):
         """liveness_secs=600 with safety_factor=0.5 → .safe False + exactly one WARNING."""
-        from orchestrator.merge_lane.liveness import check_merge_liveness_margin  # noqa: PLC0415
+        from orchestrator.merge_lane.liveness import check_merge_liveness_margin
 
         cfg = OrchestratorConfig(project_root=tmp_path)
         with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
@@ -21517,6 +21521,10 @@ class TestSpeculationPermitLeakOnMergerError:
         """(a) WorktreeMissing raised during N+1's merger step must release
         the speculation permit (currently leaks → deadlock at next look-ahead).
         """
+        # Deep chains off (task 8527): under the operational yaml's chain_cap N,
+        # alone in the verify frontier, would chain N+1 rather than leave it to
+        # the merger step this scene raises in.
+        config = config.model_copy(update={'merge_deep': MergeDeepConfig(chain_cap=0)})
         wt_n = await _make_branch_with_file(git_ops, 'leak-wm-n', 'leak_wm_n.py', 'n = 1\n')
         wt_n1 = await _make_branch_with_file(git_ops, 'leak-wm-n1', 'leak_wm_n1.py', 'n1 = 2\n')
         wt_n2 = await _make_branch_with_file(git_ops, 'leak-wm-n2', 'leak_wm_n2.py', 'n2 = 3\n')
@@ -21581,6 +21589,10 @@ class TestSpeculationPermitLeakOnMergerError:
         """(b) Generic Exception raised during N+1's merger step must release
         the speculation permit (currently leaks → deadlock at next look-ahead).
         """
+        # Deep chains off (task 8527): under the operational yaml's chain_cap N,
+        # alone in the verify frontier, would chain N+1 rather than leave it to
+        # the merger step this scene raises in.
+        config = config.model_copy(update={'merge_deep': MergeDeepConfig(chain_cap=0)})
         wt_n = await _make_branch_with_file(git_ops, 'leak-ex-n', 'leak_ex_n.py', 'n = 1\n')
         wt_n1 = await _make_branch_with_file(git_ops, 'leak-ex-n1', 'leak_ex_n1.py', 'n1 = 2\n')
         wt_n2 = await _make_branch_with_file(git_ops, 'leak-ex-n2', 'leak_ex_n2.py', 'n2 = 3\n')

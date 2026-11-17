@@ -244,7 +244,7 @@ class TestAwaitStewardCompletionOverrideDismissesOrphanL0:
         wf.escalation_queue.has_open_l1 = MagicMock(return_value=True)
         pending_l0 = MagicMock(id='esc-orig-0')
 
-        def _get_by_task(task_id, *, status, level):  # noqa: ARG001
+        def _get_by_task(task_id, *, status, level):
             if level == 1:
                 return [MagicMock(id='L1')]
             assert level == 0

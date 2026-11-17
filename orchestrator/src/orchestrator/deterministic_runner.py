@@ -34,10 +34,13 @@ from shared.before_done_paths import (
     BeforeDonePaths,
     BeforeDonePathsRefused,
     FactoryRootUnresolved,
+    ScriptUnrunnable,
+    require_runnable_script,
     resolve_before_done_paths,
 )
 from shared.milestone_rearm import rearmed_milestone
 from shared.repo_paths import DARK_FACTORY_ROOT_ENV, resolve_dark_factory_root
+from shared.task_fields import dependency_ids
 from shared.task_metadata import (
     HUMAN_CURATOR_ADJUDICATED_AT_KEY,
     HUMAN_CURATOR_GATE_KEY,
@@ -54,7 +57,6 @@ from orchestrator.before_done_script import (
     run_script,
 )
 from orchestrator.config import PREDICATE_RECHECK_STALL_CAP
-from orchestrator.dependency_verdict import task_dependency_ids
 from orchestrator.deploy_state import (
     SCHEDULED_DEPLOY_PROVENANCE_KIND,
     DeployPhase,
@@ -711,7 +713,7 @@ def build_gate_escalation_fields(
     The operational-LLM token prefix applies to either.
     """
     task = task or {}
-    dep_ids = task_dependency_ids(task)
+    dep_ids = dependency_ids(task)
     detail_parts = [task.get('description', '')]
     if dep_ids:
         detail_parts.append(f'\nLanded dependencies: {", ".join(dep_ids)}')
@@ -781,7 +783,7 @@ async def read_human_gate_facts(
 
 async def _read_completion_gate(scheduler, task: dict) -> CompletionGateReading:
     """Every dependency, read concurrently, then :func:`first_completion_gate` in dependency order."""
-    dep_ids = task_dependency_ids(task)
+    dep_ids = dependency_ids(task)
     reads = await asyncio.gather(
         *(_read_dependency(scheduler, task.get('id'), dep_id) for dep_id in dep_ids),
     )
@@ -984,7 +986,13 @@ class DeterministicRunner:
 
         Returns:
             (rc, tail) — rc=0 on successful registration; rc≠0 if registration
-            fails (tail carries the error detail).
+            fails, or if scheduling is refused because the resolved script is
+            missing or not executable (tail carries the error detail).
+
+        That refusal is the run-time half of the rule ``submit_task`` enforces
+        (``shared/src/shared/before_done_paths.py::require_runnable_script``):
+        ``RestartPlan`` deliberately does not stat-check, and a failure at fire
+        time would land after the scheduled-done write.
         """
         target_unit = before_done.get('target_unit', 'unknown')
         args = before_done.get('args') or []
@@ -1080,6 +1088,15 @@ class DeterministicRunner:
             on_active_secs=on_active_secs,
             env=dict(before_done.get('env') or {}),
         )
+        try:
+            require_runnable_script(paths.script)
+        except ScriptUnrunnable as exc:
+            logger.warning(
+                'DeterministicRunner: refusing to register restart transient unit %s '
+                'for task %s: %s',
+                transient_unit, task_id, exc,
+            )
+            return 1, f'{exc} The transient unit {transient_unit} was NOT registered.'
         outcome = await plan.execute()
         if outcome.disposition == RestartDisposition.REGISTRATION_FAILED:
             logger.warning(
@@ -3671,8 +3688,12 @@ class DeterministicRunner:
                         description,
                         f'Target unit: {target_unit}',
                         f'Transient unit: {transient_unit}',
-                        f'systemd-run exit code: rc={rc}',
+                        f'Restart scheduling rc={rc}',
                         f'Output:\n{tail}',
+                        _I1_NOT_RERUN_LINE,
+                        "No restart is scheduled, so resolve_issue action='resume' "
+                        'marks the task done without one: fix the cause and restart '
+                        f'{target_unit} by hand before resuming.',
                     ])
                     return await self._file_infra_issue_and_block(
                         task_id,

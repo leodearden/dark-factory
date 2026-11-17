@@ -1147,7 +1147,7 @@ def _teardown_step(label: str) -> Iterator[None]:
     """
     try:
         yield
-    except Exception as exc:  # noqa: BLE001  (deliberately broad — see docstring)
+    except Exception as exc:  # (deliberately broad — see docstring)
         print(
             f'startup_completion_probe: WARNING — teardown step {label!r} failed '
             f'({exc!r}); continuing with the remaining teardown.',
@@ -1242,7 +1242,7 @@ def run_live_probe(
 
         # start_new_session=True mirrors cli_invoke._run_subprocess's spawn shape,
         # so the observed process-group / children topology is production's.
-        proc = subprocess.Popen(  # noqa: S603
+        proc = subprocess.Popen(
             argv,
             cwd=str(cwd),
             env=env,

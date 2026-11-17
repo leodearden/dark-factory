@@ -358,9 +358,11 @@ def _conflicting_referents(
        would let a bare 'escalation 2500' mention corroborate (or contradict)
        an unrelated TASK referent.
     2. PROJECT-SCOPED for a FOREIGN declaration, and ONLY for a foreign one.
-       The scan can name a foreign task ONLY through an explicit qualifier
-       ('reify:132'), so for a foreign project the blind list of resolved
-       decision 8 is total: a title-only reference, an alias, a bare-digit node
+       The scan can name a foreign task ONLY through a qualifier: an explicit
+       one ('reify:132') or, given a registry, a registered project's name
+       directly before the task word ('Reify task 132'). So for a foreign
+       project the blind list of resolved decision 8 is total: a title-only
+       reference, an alias, a bare-digit node
        name — and even a perfectly honest bare 'task 132' — all land somewhere
        other than that project's bucket. Its silence is therefore uninformative
        in exactly the sense decision 8 means. Read as contradiction, it made a
@@ -386,16 +388,17 @@ def _conflicting_referents(
        referent the scan did not name conflicts only on positive evidence.
        This is the load-bearing consequence of resolved decision 8: the
        scanner cannot see bare-digit node names, title-only references,
-       Greek-letter aliases, list continuations or non-task vocabulary, and it
-       is exactly as blind to a referent beside a scannable task as it is
-       alone.
+       Greek-letter aliases, a list after the singular task word or non-task
+       vocabulary, and it is exactly as blind to a referent beside a
+       scannable task as it is alone.
     5. Two evidence axes (:func:`_contradicts`). PROJECT: a scanned referent
        carries the declared number under another project. TYPO: a scanned
        number is one Damerau edit from the declared one AND the declared
        number is written nowhere in the content as a digit run. The
-       literal-presence clause exists because list continuations ('Tasks
-       5949/5849') and consecutively filed siblings (4754/4755) make a scanned
-       near-miss routine for honest writes, and a declaration that copies a
+       literal-presence clause exists because a list after the singular task
+       word ('Task 5949/5849') and consecutively filed siblings (4754/4755)
+       make a scanned near-miss routine for honest writes, and a declaration
+       that copies a
        number the prose itself wrote is not a typo of the declaration. A real
        typo — 3129 declared beside 'Task 3127' — is written nowhere.
 
@@ -778,9 +781,11 @@ def resolve_referents(
             ``_canonical_allowlist`` and is not re-checked here. Populated, it
             drops FOREIGN referents naming a project outside it, so a junk
             qualifier ('localhost:6379', 'INFO:1234') stops minting one.
-            Narrowing is STRICTLY SUBTRACTIVE by the guarantee ``scan_content``
-            states: a dropped candidate keeps the ambiguity contest it created,
-            so this can only ever remove a referent, never add one.
+            By the guarantee ``scan_content`` states, narrowing never mints a
+            referent from an unregistered qualifier, and a dropped candidate
+            keeps the ambiguity contest it created; a registered project's
+            name directly before a mention ('Reify task 3674') re-qualifies
+            that mention.
 
     Raises:
         InputValidationError: On a malformed ``declared`` entry (see

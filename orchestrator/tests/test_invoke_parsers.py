@@ -9,7 +9,7 @@ from dataclasses import replace
 from typing import Any
 
 import pytest
-from shared.cli_invoke import _SubprocessResult
+from shared.cli_invoke import SubprocessResult
 from shared.invocation_outcome import CapHit, Failure, classify_invocation
 from shared.process_cost import ProcessCostBasis
 
@@ -31,9 +31,9 @@ def _make_subprocess_result(
     stderr: str = '',
     returncode: int = 0,
     duration_ms: int = 100,
-) -> _SubprocessResult:
-    """Construct a _SubprocessResult with sensible defaults."""
-    return _SubprocessResult(
+) -> SubprocessResult:
+    """Construct a SubprocessResult with sensible defaults."""
+    return SubprocessResult(
         stdout=stdout,
         stderr=stderr,
         returncode=returncode,
@@ -298,7 +298,7 @@ _CODEX_MODEL_METADATA_WARNING = (
 )
 
 
-def _codex_stream(*events: dict[str, Any]) -> _SubprocessResult:
+def _codex_stream(*events: dict[str, Any]) -> SubprocessResult:
     return _make_subprocess_result(stdout='\n'.join(json.dumps(e) for e in events), returncode=0)
 
 
@@ -462,7 +462,7 @@ _ASTRA_PRICES = {
 }
 
 
-def _codex_turns(*usages: dict[str, int]) -> _SubprocessResult:
+def _codex_turns(*usages: dict[str, int]) -> SubprocessResult:
     return _codex_stream(
         {'type': 'thread.started', 'thread_id': 'tid-usage'},
         {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': 'done'}},
@@ -606,7 +606,7 @@ class TestParsePiEmptyOutput:
     def test_empty_stdout_propagates_timed_out(self):
         """timed_out propagates on the empty-stdout path too (a timeout
         with nothing captured yet still routes through this branch)."""
-        result = _SubprocessResult(
+        result = SubprocessResult(
             stdout='', stderr='timeout', returncode=1, duration_ms=100, timed_out=True,
         )
         agent_result = _parse_pi_output(result, 'anthropic/claude-haiku-4-5')

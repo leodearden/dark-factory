@@ -26,7 +26,7 @@ _ENTRY_KEYS = {'id', 'category', 'severity', 'level', 'same_task', 'shared_membe
 
 
 def _esc(
-    id: str,  # noqa: A002 — mirrors the Escalation attribute name
+    id: str,  # mirrors the Escalation attribute name
     *,
     task_id: str = 'T1',
     level: int = 1,

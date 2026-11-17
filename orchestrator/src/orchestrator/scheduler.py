@@ -90,7 +90,11 @@ from orchestrator.event_store import EventStore, EventType
 from orchestrator.fm_retry import fm_retry_backoffs
 from orchestrator.hold_history import HoldHistory
 from orchestrator.id_tie_break import id_tie_break
-from orchestrator.lock_table import ModuleLockTable, UncontestedAcquisition
+from orchestrator.lock_table import (
+    ModuleLockTable,
+    UncontestedAcquisition,
+    one_holder_per_key,
+)
 from orchestrator.mcp_lifecycle import ORCHESTRATOR_MCP_IDENTITY, mcp_call
 from orchestrator.module_charter import derive_modules, sanitize_files_for_persist
 from orchestrator.overrides import OverrideRow, OverrideSource, OverrideStore
@@ -120,7 +124,7 @@ from orchestrator.recovery_emission import (
     veto_signature,
 )
 from orchestrator.recovery_pins import records_pin_blocked_recovery
-from orchestrator.sentinel_l1 import file_sentinel_l1
+from orchestrator.sentinel_l1 import file_sentinel_l1, resolve_sentinel_l1
 from orchestrator.starvation_watchdog import (
     AUTO_PIN_CAP_SENTINEL,
     STARVATION_WATCHDOG_ROLE,
@@ -1678,13 +1682,13 @@ class Scheduler:
         # The I-6 arming gate and its storm-escape state (task 3819, PRD D12).
         self._anchor_gate = AnchorCoverageGate()
         # The continuity work-product probe (task 3820, PRD C3).  The lambdas
-        # and the bound method read self at call time, so a hot TTL retune and
-        # the late attribute-injected escalation_queue are both honoured.
+        # read self at call time, so a hot TTL retune and the late
+        # attribute-injected escalation_queue are both honoured.
         self.work_product = WorkProductProbe(
             ttl_secs=lambda: self.config.scoring.continuity_probe_ttl_secs,
             clock=self._time_source,
             escalate=lambda l1: file_sentinel_l1(self.escalation_queue, l1),
-            resolve=self._resolve_sentinel_l1,
+            resolve=lambda sentinel, resolution: resolve_sentinel_l1(self.escalation_queue, sentinel, resolution),
         )
         # --- Startup gate (task 2235, W10-α) ---
         # False until finish_startup() is called.  acquire_next() asserts
@@ -6130,7 +6134,7 @@ class Scheduler:
                     now=now,
                 ),
             )
-        except Exception as exc:  # noqa: BLE001 — telemetry never disturbs a sweep
+        except Exception as exc:  # telemetry never disturbs a sweep
             logger.warning(
                 'Task %s: recovery-disposition emission failed (non-fatal): %s',
                 task_id, exc,
@@ -6168,7 +6172,7 @@ class Scheduler:
             for tracked_site, tid in tuple(tracker.tracked()):
                 if str(tracked_site) == site and tid not in observed:
                     tracker.clear(tracked_site, tid)
-        except Exception as exc:  # noqa: BLE001 — bookkeeping never aborts a tick
+        except Exception as exc:  # bookkeeping never aborts a tick
             logger.warning(
                 'recovery veto-streak release failed (non-fatal): %s', exc,
             )
@@ -7209,18 +7213,6 @@ class Scheduler:
             file_sentinel_l1(self.escalation_queue, verdict.escalation)
         return verdict.armed
 
-    def _resolve_sentinel_l1(self, sentinel: str, resolution: str) -> None:
-        """Resolve each open L1 the scheduler filed under *sentinel*, its condition cleared; never raises."""
-        queue = self.escalation_queue
-        if queue is None:
-            return
-        try:
-            for esc in queue.get_by_task(sentinel, status='pending', level=1, agent_role='orchestrator-scheduler'):
-                queue.resolve(esc.id, resolution, resolved_by='orchestrator-scheduler')
-                logger.info('Auto-resolved L1 %s escalation %s', sentinel, esc.id)
-        except Exception:
-            logger.warning('Failed to resolve %s escalation', sentinel, exc_info=True)
-
     def _load_work_product(self, store: EventStore) -> WorkProductSnapshot:
         """Git's task branches plus the restart-safe zero-progress gate, on a worker thread (PRD C3).
 
@@ -7640,6 +7632,7 @@ class Scheduler:
                         exc_info=True,
                     )
 
+        held_by_task = self.lock_table.snapshot_held_by_task()
         return SchedulerStateSnapshot(
             skip_counts=dict(self._skip_count),
             parks=_park_records(self.lock_table.snapshot_parks()),
@@ -7651,7 +7644,9 @@ class Scheduler:
             effective_priorities=dict(self._last_effective_priorities),
             pin_queue=tuple(pin_queue),
             overrides=overrides,
-            current_holders=self.lock_table.snapshot_holders(),
+            current_holders=one_holder_per_key(held_by_task),
+            held_by_task=held_by_task,
+            holder_limits=self.lock_table.snapshot_holder_limits(),
             lock_depth=self.config.lock_depth,
             is_paused=self.is_paused,
             pause_reason=self.pause_reason,

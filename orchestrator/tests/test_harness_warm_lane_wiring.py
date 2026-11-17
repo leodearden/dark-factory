@@ -207,15 +207,14 @@ def _make_spec_config(
 
 
 class TestHarnessSpecPoolWiring:
-    """Harness passes merge_spec_warm_lane_pool_size=K to GitOps (step-5 RED, step-6 GREEN).
+    """Harness sizes GitOps' spec warm-lane pool at the lane's speculation depth.
 
-    K = 1 + len(config.enabled_verify_runners) — the SAME expression as
-    speculation_depth passed to SpeculativeMergeWorker — so the spec pool size
-    and the worker cap derive from one source and cannot drift.
+    The pool size is orchestrator/src/orchestrator/harness.py::Harness._speculation_k:
+    one warm lane per frontier entry (plans/merge-lane-policy-prd.md D4).
     """
 
     def test_spec_pool_sized_from_k_with_runners(self, tmp_path: Path):
-        """K=3 (1+2 runners) → spec pool size==3 when knob on."""
+        """Two enabled runners → spec pool size==4 when knob on."""
         runners = [_make_runner('r1'), _make_runner('r2')]
         config = _make_spec_config(
             merge_spec_warm_lane_pool=True,
@@ -228,14 +227,12 @@ class TestHarnessSpecPoolWiring:
             'spec_warm_lane_pool should be a WarmLanePool when knob on and K>0'
         )
         assert isinstance(harness.git_ops.spec_warm_lane_pool, WarmLanePool)
-        # K = 1 + len(enabled_verify_runners) = 1 + 2 = 3
-        expected_k = 1 + len(config.enabled_verify_runners)
-        assert harness.git_ops.spec_warm_lane_pool.size == expected_k, (
-            f'spec pool size must equal K={expected_k}'
+        assert harness.git_ops.spec_warm_lane_pool.size == 4, (
+            'spec pool size must be hosts (1 + 2 runners) + 1 = 4'
         )
 
-    def test_spec_pool_k1_no_runners(self, tmp_path: Path):
-        """K=1 (no remote runners) → spec pool size==1 when knob on."""
+    def test_spec_pool_no_runners_is_two(self, tmp_path: Path):
+        """No remote runners → spec pool size==2 (one host + 1) when knob on."""
         config = _make_spec_config(
             merge_spec_warm_lane_pool=True,
             verify_runners=[],
@@ -244,8 +241,9 @@ class TestHarnessSpecPoolWiring:
         harness = _build_harness(config)
 
         assert harness.git_ops.spec_warm_lane_pool is not None
-        # K = 1 + 0 = 1
-        assert harness.git_ops.spec_warm_lane_pool.size == 1
+        assert harness.git_ops.spec_warm_lane_pool.size == 2, (
+            'spec pool size must be one host + 1 = 2'
+        )
 
     def test_spec_pool_none_when_knob_off(self, tmp_path: Path):
         """spec_warm_lane_pool is None when merge_spec_warm_lane_pool=False."""

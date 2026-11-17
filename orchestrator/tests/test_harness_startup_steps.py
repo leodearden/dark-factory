@@ -16,6 +16,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _startup_harness import STUBBED_STEPS, SYNC_STEPS, UNSTUBBED_STEPS
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
@@ -30,33 +31,6 @@ from orchestrator.startup_steps import (
     run_startup_step,
     sentinel_task_id,
 )
-
-#: The stubbed table steps in run() order, as (step name, Harness attribute).
-_STUBBED_STEPS: tuple[tuple[str, str], ...] = (
-    ('1c', '_dismiss_stale_escalations'),
-    ('1c0-dirty', '_file_dirty_tree_escalation'),
-    ('1c0-config-keys', '_file_config_unknown_keys_escalation'),
-    ('1c0', '_rehydrate_merge_halt'),
-    ('1c0a', '_recover_pending_merges'),
-    ('1c0a2', '_reap_orphaned_merge_worktrees'),
-    ('1c0a3', '_reconcile_landed_outbox'),
-    ('1c0b', '_file_restored_pause_escalation'),
-    ('1c1g', '_run_interactive_worktree_reaper_pass'),
-    ('1c1h', '_run_leftover_verify_scope_reaper_pass'),
-    ('2c', '_recover_crashed_tasks'),
-    ('2c2', '_reconcile_lane_checkouts'),
-    ('2c3-streak-alarms', '_inherit_pending_streak_alarms'),
-    ('2d', '_reconcile_stranded_in_progress'),
-    ('2e', '_reap_orphan_worktrees'),
-    ('diff7', '_reconcile_terminal_lanes'),
-    ('2g', '_run_scheduled_deploy_settle_pass'),
-)
-_SYNC_STEPS = frozenset({
-    '_rehydrate_merge_halt', '_file_restored_pause_escalation',
-    '_inherit_pending_streak_alarms',
-})
-#: Table steps the fixture runs for real against its mocked services.
-_UNSTUBBED_STEPS = frozenset({'1b', '2f'})
 
 _INJECTABLE = [
     ('2c', '_recover_crashed_tasks'),
@@ -80,9 +54,9 @@ class StartupHarness:
 
 
 def _stub_table_steps(h: Harness) -> tuple[dict[str, AsyncMock], dict[str, MagicMock]]:
-    stubs = {attr: AsyncMock() for _step, attr in _STUBBED_STEPS if attr not in _SYNC_STEPS}
+    stubs = {attr: AsyncMock() for _step, attr in STUBBED_STEPS if attr not in SYNC_STEPS}
     stubs['_recover_pending_merges'] = AsyncMock(return_value={'requests': []})
-    sync_stubs = {attr: MagicMock() for attr in _SYNC_STEPS}
+    sync_stubs = {attr: MagicMock() for attr in SYNC_STEPS}
     for attr, stub in {**stubs, **sync_stubs}.items():
         setattr(h, attr, stub)
     h._tag_task_modules = AsyncMock()
@@ -157,8 +131,8 @@ def _inject(handle: StartupHarness, attr: str, exc: Exception) -> AsyncMock:
 
 
 def _steps_after(step: str) -> list[str]:
-    names = [name for name, _attr in _STUBBED_STEPS]
-    return [attr for name, attr in _STUBBED_STEPS[names.index(step) + 1:]]
+    names = [name for name, _attr in STUBBED_STEPS]
+    return [attr for name, attr in STUBBED_STEPS[names.index(step) + 1:]]
 
 
 def _not_ok_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
@@ -181,8 +155,8 @@ class TestStubbedStepsMirrorTheTable:
             await _run(handle.harness)
 
         ran = [call.args[0].name for call in runner.await_args_list]
-        assert [name for name in ran if name not in _UNSTUBBED_STEPS] == [
-            name for name, _attr in _STUBBED_STEPS
+        assert [name for name in ran if name not in UNSTUBBED_STEPS] == [
+            name for name, _attr in STUBBED_STEPS
         ]
 
 

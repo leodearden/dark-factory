@@ -80,6 +80,8 @@ _COLD_START = {
     'pin_queue': [],
     'overrides': {},
     'current_holders': {},
+    'held_by_task': {},
+    'holder_limits': {},
     'lock_depth': None,
     'is_paused': False,
     'pause_reason': None,

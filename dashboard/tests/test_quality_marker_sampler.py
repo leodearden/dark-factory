@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sqlite3
+import time
 from collections.abc import AsyncIterator, Sequence
 from contextlib import closing, suppress
 from dataclasses import dataclass
@@ -14,6 +15,7 @@ from pathlib import Path
 import aiosqlite
 import pytest
 from _quality_fixture import GitRepo, append_events, build_quality_project, routing_decision
+from _quality_snapshots import default_params, placed_point, snapshot_doc, write_snapshot
 from _runs_db_fixture import EventRow, write_runs_db
 from shared.project_id import project_id_for_root
 from shared.project_layout import runs_db
@@ -22,7 +24,6 @@ from shared.tasks_db_readonly import TaskDbUnreadable, connect_ro
 from dashboard.config import DashboardConfig
 from dashboard.data.db import DbPool
 from dashboard.data.quality_marker_sampler import (
-    FACTORY_REPO,
     MARKER_GIT_TIMEOUT_SECONDS,
     MARKER_PER_ROOT_BUDGET_SECONDS,
     ROLES_PY,
@@ -33,17 +34,21 @@ from dashboard.data.quality_markers import (
     DerivedState,
     Marker,
     MarkerKind,
+    MarkerSource,
     PromptCoverage,
     RoutingFold,
+    SourceType,
     StoredMarkerState,
     derived_markers,
     fold_routing_decisions,
 )
+from dashboard.data.quality_root_tick import FACTORY_REPO
 from dashboard.data.quality_sampler import (
     QUALITY_PER_ROOT_BUDGET_SECONDS,
     QUALITY_SAMPLE_INTERVAL_SECONDS,
 )
-from dashboard.data.quality_store import read_marker_state
+from dashboard.data.quality_snapshots import BASELINE_HOME, RootScan, SnapshotCache, scan_root
+from dashboard.data.quality_store import read_marker_state, write_snapshot_scan
 from dashboard.loops import _quality_loop, _QualityStore
 
 T0 = datetime(2026, 10, 27, 13, 0, tzinfo=UTC)
@@ -467,3 +472,88 @@ async def test_the_quality_loop_stores_marker_state_within_its_first_tick(
     assert stored.failure is None, stored.failure
     assert stored.derived is not None
     assert [(m.kind, m.at) for m in stored.derived.markers] == [(MarkerKind.EFFORT, _at(5))]
+
+
+SNAPSHOT_TIMES = (datetime(2026, 10, 8, 12, tzinfo=UTC), datetime(2026, 11, 1, 3, tzinfo=UTC))
+
+
+def _snapshot_scan(path: Path, project_id: str, monkeypatch: pytest.MonkeyPatch) -> tuple[RootScan, str]:
+    """A schema-2 baseline then a schema-3 nightly snapshot, at commits dated SNAPSHOT_TIMES; and
+    the schema-3 snapshot's sha."""
+    repo = GitRepo(path / 'snapshot-repo')
+    _dated(monkeypatch, SNAPSHOT_TIMES[0].isoformat())
+    baseline_sha = repo.init()
+    _dated(monkeypatch, SNAPSHOT_TIMES[1].isoformat())
+    nightly_sha = repo.commit({'a.txt': 'two\n'}, 'two')
+    nightly = path / 'nightly'
+    write_snapshot(repo.root / BASELINE_HOME / 'baseline.json', snapshot_doc(2, as_of_sha=baseline_sha, run_id='r1'))
+    write_snapshot(nightly / project_id / f'{nightly_sha}.json', snapshot_doc(3, as_of_sha=nightly_sha, run_id='r2'))
+    scan = scan_root(repo.root, project_id, nightly, SnapshotCache.empty(), deadline=time.monotonic() + 120)
+    assert [point.committed_at for point in scan.points] == list(SNAPSHOT_TIMES)
+    return scan, nightly_sha
+
+
+async def test_stored_snapshots_reach_the_derivation_as_one_instrument_marker(
+    conn: aiosqlite.Connection, factory: Path, no_curated: Path, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    landed = datetime(2026, 11, 2, 9, 0, tzinfo=UTC)
+    measured = build_quality_project(tmp_path / 'measured', first_landed_at=landed)
+    unmeasured = build_quality_project(tmp_path / 'unmeasured', first_landed_at=landed)
+    pid, other = project_id_for_root(measured.root), project_id_for_root(unmeasured.root)
+    scan, nightly_sha = _snapshot_scan(tmp_path / 'snapshots', pid, monkeypatch)
+    await write_snapshot_scan(conn, pid, scan, NOW)
+    await conn.commit()
+
+    await _tick(conn, [measured.root, unmeasured.root], factory, no_curated)
+
+    [instrument] = [m for m in (await _derived(conn, pid)).markers if m.kind is MarkerKind.INSTRUMENT]
+    nightly_point = scan.points[1].point_id
+    assert (instrument.marker_id, instrument.at, instrument.ref) == (
+        f'instrument:{nightly_point}', SNAPSHOT_TIMES[1], nightly_sha,
+    )
+    assert instrument.source == MarkerSource(SourceType.INSTRUMENT, point=nightly_point)
+    assert 'instrument (unknown)' in instrument.label
+    assert 'python_version (unknown)' in instrument.label
+    assert not [m for m in (await _derived(conn, other)).markers if m.kind is MarkerKind.INSTRUMENT]
+
+
+SHA_A, SHA_B = 'a' * 40, 'b' * 40
+
+
+def _same_commit_scan(path: Path) -> RootScan:
+    """A nightly at SHA_A, then a baseline and a nightly both at SHA_B and one commit time, whose
+    python_version flips 3.13.9 -> 3.14.0 -> 3.13.9; each point diffed against the one before it."""
+    files = [
+        ('n-a', False, SHA_A, SNAPSHOT_TIMES[0], '3.13.9'),
+        ('b-b', True, SHA_B, SNAPSHOT_TIMES[1], '3.14.0'),
+        ('n-b', False, SHA_B, SNAPSHOT_TIMES[1], '3.13.9'),
+    ]
+    points = []
+    for point_id, baseline, sha, committed_at, python in files:
+        doc = snapshot_doc(3, as_of_sha=sha, run_id=point_id,
+                           params={**default_params(3), 'python_version': python})
+        points.append(placed_point(
+            write_snapshot(path / f'{point_id}.json', doc), point_id=point_id, baseline=baseline,
+            committed_at=committed_at, previous=points[-1] if points else None,
+        ))
+    return RootScan(points=tuple(points), unplaced=(), new_diffs={}, pending_files=0,
+                    pending_diffs=0, baseline_home=path, nightly_home=path)
+
+
+async def test_a_baseline_and_a_nightly_at_one_commit_are_two_instrument_markers(
+    conn: aiosqlite.Connection, factory: Path, no_curated: Path, tmp_path: Path,
+) -> None:
+    project = build_quality_project(tmp_path / 'proj', first_landed_at=datetime(2026, 11, 2, 9, 0, tzinfo=UTC))
+    pid = project_id_for_root(project.root)
+    await write_snapshot_scan(conn, pid, _same_commit_scan(tmp_path / 'snapshots'), NOW)
+    await conn.commit()
+
+    await _tick(conn, [project.root], factory, no_curated)
+
+    stored = await read_marker_state(conn, pid)
+    assert stored is not None and stored.failure is None, stored
+    instruments = [m for m in (await _derived(conn, pid)).markers if m.kind is MarkerKind.INSTRUMENT]
+    assert [(m.marker_id, m.source.point, m.ref) for m in instruments] == [
+        ('instrument:b-b', 'b-b', SHA_B), ('instrument:n-b', 'n-b', SHA_B),
+    ]

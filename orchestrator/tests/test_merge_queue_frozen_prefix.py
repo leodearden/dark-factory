@@ -91,7 +91,7 @@ from orchestrator.merge_lane.worker import (
 # non-None object doubles as a verifying-entry sentinel in tests that do not
 # need a real asyncio.Task (no event-loop required for the accessor methods
 # themselves).  The type annotation is unenforced at runtime.
-_SENTINEL_VERIFY_TASK = object()  # noqa: PD901 (not a dataframe)
+_SENTINEL_VERIFY_TASK = object()  # (not a dataframe)
 
 
 # ── Fixtures (mirrored from test_merge_queue_conflict_graph.py) ───────────────

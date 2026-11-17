@@ -400,12 +400,17 @@ class PlanFilesTouchedResult:
             to that entry and a later rebase dropped it because the rebase
             target already carried the change (task 4669) — not
             under-delivery.
+        touched_set_error: The branch's history scan failed, so
+            ``not_touched`` lists every declared entry UNMEASURED and
+            nothing about the branch can be concluded from it.  ``None``
+            when the touched set was read.
     """
 
     not_touched: list[str] = field(default_factory=list)
     missing_from_tree: list[str] = field(default_factory=list)
     resolved_renames: dict[str, str] = field(default_factory=dict)
     dropped_by_rebase: dict[str, tuple[DroppedCommit, ...]] = field(default_factory=dict)
+    touched_set_error: str | None = None
 
     def __post_init__(self) -> None:
         dropped = set(self.dropped_by_rebase)
@@ -1942,7 +1947,7 @@ async def resolve_already_landed_branch(
         )
     except asyncio.CancelledError:
         raise
-    except Exception:  # noqa: BLE001
+    except Exception:
         logger.warning(
             'already-landed: probe raised for task_id=%s branch=%s — failing '
             'closed (the unchanged plan_files_not_touched path runs)',
@@ -2142,18 +2147,17 @@ async def _resolve_already_landed_branch(
         return None
 
     # --- signal 3: the landing COVERS every declared entry -----------------
-    touched = await git_ops.get_files_touched_in_branch(
+    touched, touched_err = await git_ops.get_files_touched_in_branch(
         f'{landed_sha}^1', landed_sha,
     )
     touched_set = set(touched)
-    if not touched_set:
-        # `get_files_touched_in_branch` fails OPEN with [] on a git error, so
-        # an empty set is indistinguishable from "could not measure".  Either
-        # way there is no coverage evidence, so decline.
+    if touched_err is not None or not touched_set:
+        # An unreadable history and a landing that touched nothing are both
+        # absent coverage evidence, so decline either way.
         logger.warning(
             'already-landed: attributing commit %s (mechanism=%s) touched no '
-            'measurable files task_id=%s — failing closed',
-            landed_sha, mechanism, task_id,
+            'measurable files task_id=%s err=%s — failing closed',
+            landed_sha, mechanism, task_id, touched_err,
         )
         return None
 
@@ -2763,6 +2767,12 @@ async def _resolve_renamed_plan_path(
     return candidates
 
 
+def _with_git_stderr(err: Exception) -> str:
+    """*err* as text, carrying git's own message when *err* has a ``stderr``."""
+    stderr = (getattr(err, 'stderr', None) or '').strip()
+    return f'{err}: {stderr[:200]}' if stderr else str(err)
+
+
 async def _check_plan_files_touched_in_branch(
     plan_files: list[str],
     base_sha: str,
@@ -2804,14 +2814,27 @@ async def _check_plan_files_touched_in_branch(
     and reported in ``dropped_by_rebase``.  That attribution only explains a
     failure; it never passes the gate.
 
-    Fail-open on git error (matches :func:`_check_plan_targets_in_tree`):
-    return an empty ``PlanFilesTouchedResult`` so a transient diff error
-    doesn't block a real merge.  Loud-log so regressions surface in ops.
+    When the branch's history cannot be read the gate fails CLOSED but
+    says so: every non-empty declared entry is returned in ``not_touched``
+    with ``touched_set_error`` set, and no per-entry probe runs, so the
+    caller can report the delivery as unmeasured rather than undelivered.
     """
     if not plan_files:
         return PlanFilesTouchedResult()
 
-    touched = await git_ops.get_files_touched_in_branch(base_sha, branch_head)
+    touched, touched_err = await git_ops.get_files_touched_in_branch(
+        base_sha, branch_head,
+    )
+    if touched_err is not None:
+        logger.warning(
+            'plan-files-touched: touched set unreadable task_id=%s base=%s '
+            'head=%s err=%s — every declared entry is unmeasured',
+            task_id or '<unknown>', base_sha, branch_head, touched_err,
+        )
+        return PlanFilesTouchedResult(
+            not_touched=[entry for entry in plan_files if entry],
+            touched_set_error=_with_git_stderr(touched_err),
+        )
     touched_set = set(touched)
 
     # Lazily-computed, once-per-invocation listing of every path in the

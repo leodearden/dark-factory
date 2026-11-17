@@ -14,7 +14,7 @@ import uuid
 from datetime import UTC, datetime
 
 import pytest
-import pytest_asyncio  # noqa: F401  — strict-mode async fixtures land here in later steps
+import pytest_asyncio  # strict-mode async fixtures land here in later steps
 
 from fused_memory.models.reconciliation import (
     EventSource,

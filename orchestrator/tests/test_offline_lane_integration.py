@@ -1078,7 +1078,7 @@ def test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling(pytestconfi
     holds) or skips, naming the governing inifile (an invocation artifact,
     e.g. a root-bound run).
     """
-    from test_lane_lock_leak_guard import _effective_per_test_timeout  # noqa: PLC0415
+    from test_lane_lock_leak_guard import _effective_per_test_timeout
 
     floor = _SPAWNS_PER_LANE_PASS_WORST_CASE * MEASURED_SPAWN_LATENCY_SECS
     assert floor <= _LANE_PASS_BOUND_SECS, (
@@ -1093,19 +1093,19 @@ def test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling(pytestconfi
         f'real infra run_all.sh spawns).'
     )
 
-    from test_offline_lane_infra_integration import (  # noqa: PLC0415
+    from test_offline_lane_infra_integration import (
         _LANE_PASS_BOUND_SECS as _infra_lane_pass_bound_secs,
     )
-    from test_offline_lane_infra_integration import (  # noqa: PLC0415
+    from test_offline_lane_infra_integration import (
         _SPAWNS_PER_ASSERT_INFRA_NEVER_A_GATE as _infra_spawns_per_assert_never_a_gate,
     )
-    from test_offline_lane_infra_integration import (  # noqa: PLC0415
+    from test_offline_lane_infra_integration import (
         _SPAWNS_PER_DRIVE_ADVANCE as _infra_spawns_per_drive_advance,
     )
     from test_offline_lane_infra_integration import (
         _SPAWNS_PER_FIXTURE_COMMIT as _infra_spawns_per_fixture_commit,
     )
-    from test_offline_lane_infra_integration import (  # noqa: PLC0415
+    from test_offline_lane_infra_integration import (
         _SPAWNS_PER_REPO_FIXTURE as _infra_spawns_per_repo_fixture,
     )
 

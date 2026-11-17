@@ -22,7 +22,12 @@
 # full in 80% of those minutes and an agent allowance that was capped for 24% of
 # them, so watch the merge-phase share of slot time after the redeploy.
 # Red tier: takes effect at the next redeploy.
-max_concurrent_tasks: 24
+# 24 -> 36 (Leo, 2026-11-15): the merge queue drained to depth 0, and every task
+# verify module now goes to leo-laptop (verify_task_host_policy: remote_all),
+# whose task slots went 1 -> 3, all in the same ruling. Applied at the gate-8273
+# drained fleet restart. Watch task-verify admission wait and local merge-verify
+# time after the redeploy.
+max_concurrent_tasks: 36
 
 # lock_depth 4→12 (Leo 2026-08-07): make module locks effectively file-granular.
 # Until now dark-factory never set this key at all — it silently inherited the
@@ -118,22 +123,23 @@ module_overrides:
   orchestrator/tests/merge_lane_ratchet_baseline.json: 99
   orchestrator/tests/merge_lane_ratchet_authorized_raises.json: 99
   orchestrator/tests/merge_lane_ratchet_raises/_README.json: 99
-  # DOCUMENTATION FILES (Leo's ruling of 2026-11-12): unbounded for the same reason
-  # as the ratchet paths. OPERATIONS.md is declared by 171 pending tasks and was at
-  # capacity 99% of 2026-11-09..11-12; two edits of a prose file conflict textually,
-  # at rebase. INTERIM for task 5467, which strips docs/ and root-level Markdown
-  # from lock derivation for every project: remove these ten keys when it lands.
-  # skills/ is deliberately not listed (agent instructions; no ruling).
-  OPERATIONS.md: 99
-  ARCHITECTURE.md: 99
-  CHANGELOG.md: 99
-  CLAUDE.md: 99
-  CONTRIBUTING.md: 99
-  DESIGN.md: 99
-  README.md: 99
-  RECONCILIATION_PLAN.md: 99
-  SETUP.md: 99
-  docs/task-authoring.md: 99
+
+# DOCUMENTATION LOCK KEYS take unlimited holders (Leo's rulings of 2026-09-13,
+# 2026-11-12 and 2026-11-13; task 5467). Every key under docs/ and every root-level
+# *.md stays in each task's lock list, but any number of tasks may hold it at once:
+# two edits of a prose file conflict textually, at rebase, so the lock only
+# serialised work (OPERATIONS.md: 171 pending declarers, held 99% of 11-09..11-12).
+# docs/ also holds machine-read and tool-written files (docs/legibility/
+# census-state.json, confusion-codebook.yaml, the PRD capability manifests); an
+# exact module_overrides entry beats this rule, so one `<key>: 1` line there pins
+# any of them back, but only against requests for that file itself: a request for
+# a directory above it (docs/legibility, docs) still matches the prefix and takes
+# unlimited holders.
+# skills/ is deliberately outside it (agent instructions; no ruling).
+# Same red tier as module_overrides: takes effect at the next restart.
+unlimited_holder_locks:
+  prefixes: ["docs/"]
+  root_markdown: true
 
 # Verification commands (dark-factory multi-subproject layout)
 # test_command fans out per-subproject so each runs in its own venv with its
@@ -207,6 +213,10 @@ module_overrides:
 # accounting below for how this feeds verify_command_timeout_secs; the
 # combined-directories figure is recorded in project memory for task 3460
 # rather than duplicated here.
+# task 5654: the last segment runs tests/repo_guards/, the never-cached module
+# of repo-wide guards (tests/repo_guards/orchestrator.yaml), in its own
+# invocation. Folding it into the segment before would break that segment's
+# target-list coupling with scripts/orchestrator.yaml, described below.
 #
 # DEFENCE-IN-DEPTH ONLY: this whole chain is built by
 # ``_build_fallback_config``, which ``run_scoped_verification``
@@ -242,7 +252,7 @@ module_overrides:
 # Do NOT re-close it here: this segment still never runs for a
 # scripts/** diff, so a change made here to fix a scripts/ coverage
 # question would be inert, and would read as a gate that is not one.
-test_command: "cd shared && uv run pytest tests/ --timeout=300 && cd ../escalation && uv run pytest tests/ --timeout=300 && cd ../orchestrator && uv run pytest tests/ --timeout=300 && cd ../fused-memory && uv run pytest tests/ --timeout=300 && cd ../dashboard && uv run pytest tests/ --timeout=300 && cd ../sampler && uv run pytest tests/ --timeout=300 && cd ../client-feed && uv run pytest tests/ --timeout=300 && cd .. && ( [ -d cockpit ] || exit 0; cd cockpit && uv run pytest tests/ --timeout=300 ) && uv run --project shared pytest tests/scripts/ scripts/tests/ --timeout=300"
+test_command: "cd shared && uv run pytest tests/ --timeout=300 && cd ../escalation && uv run pytest tests/ --timeout=300 && cd ../orchestrator && uv run pytest tests/ --timeout=300 && cd ../fused-memory && uv run pytest tests/ --timeout=300 && cd ../dashboard && uv run pytest tests/ --timeout=300 && cd ../sampler && uv run pytest tests/ --timeout=300 && cd ../client-feed && uv run pytest tests/ --timeout=300 && cd .. && ( [ -d cockpit ] || exit 0; cd cockpit && uv run pytest tests/ --timeout=300 ) && uv run --project shared pytest tests/scripts/ scripts/tests/ --timeout=300 && uv run --project shared pytest tests/repo_guards/ --timeout=300"
 # ``uv run`` prefix is load-bearing: ruff is not on PATH at the worktree root
 # (only inside each member venv). Without it the fallback scoper (which narrows
 # this to a single touched file for root-level changes) emits a bare ``ruff
@@ -479,7 +489,7 @@ lint_command: "uv run ruff check shared escalation fused-memory orchestrator das
 #   tests/scripts/test_shadow_ruling_doc_contract.py — reads
 #       skills/escalation-watcher/SKILL.md to validate its x_shadow_ruling
 #       payload literals against the live parser (task 5374).
-#   scripts/tests/test_design_invariants_consistency.py — reads
+#   tests/repo_guards/test_design_invariants_consistency.py — reads
 #       skills/prd/references/gates.md live; its enumeration and citation
 #       scans walk the repo with no skills/ prune (task 4941).
 #   fused-memory/tests/test_referent_declaration_examples.py — reads the
@@ -704,8 +714,8 @@ type_check_command: "cd fused-memory && npx pyright && cd ../orchestrator && npx
 # WHAT THEY BOUND. verify_command_timeout_secs is a PER-COMMAND budget
 # (skills/orchestrate/references/project-setup.md §"Per-subproject module
 # overrides"), and the fleet chain is ONE shell command, so this ceiling bounds
-# all nine suites together — eight `&&` segments, since tests/scripts/ and
-# scripts/tests/ share the last. It bounds nothing else: every discovered module
+# every suite in it together, tests/scripts/ and scripts/tests/ sharing one
+# segment. It bounds nothing else: every discovered module
 # config declares its own budget (MODULE_BUDGET_EXCLUSIONS is empty, and
 # tests/scripts/test_module_verify_budgets.py::
 # test_every_discovered_module_config_declares_its_own_verify_budget keeps it so).
@@ -722,7 +732,7 @@ type_check_command: "cd fused-memory && npx pyright && cd ../orchestrator && npx
 #
 # WHY 7200 (Leo, 2026-09-12). The measured floor is
 # sum(MEASURED_FLEET_SEGMENT_SECS) in tests/scripts/test_fallback_verify_config.py:
-# six of the nine suites, each a representative green run, so a lower bound on
+# the measured subset of its suites, each a representative green run, so a lower bound on
 # the MEDIAN green chain and not a bound on any one run. Its orchestrator row is
 # derived from task 3353's census (tests/scripts/verify_budget_census_records.py::
 # ORCHESTRATOR_BUDGET_CENSUS); every other row carries dated provenance beside
@@ -938,8 +948,9 @@ verify_admission_pytest_n: "8"
 # test legs run at once, admitted through the per-project flock; merge legs never
 # take a slot. The code default is 1
 # (config.py::OrchestratorConfig.verify_admission_task_slots).
-# 2 since 2026-11-12 04:27Z: stepped down from 3 under Leo's progressive-slot
-# rule (two local merge verifies over 46 min while reify rebuilt a warm lane).
+# 3 since 2026-11-15 ~14:40Z, by Leo's ruling: this key also sizes the task legs sent
+# to each remote verify host, so the laptop's 3 slots need it (step down on a
+# local merge verify over 46 min).
 # Basis, step-down triggers and the dated value history:
 # plans/verify-admission-task-slots-gate.md.
 # Any change to this value appends a dated entry there AND rewrites the
@@ -947,7 +958,7 @@ verify_admission_pytest_n: "8"
 # GREEN-tier (config.py::RELOADABLE_FIELDS) and re-read at each grant, so it
 # applies via reload_config with no restart, which matters: a restart destroys
 # the in-flight work this knob protects.
-verify_admission_task_slots: 2
+verify_admission_task_slots: 3
 
 # TASK-VERIFY ADMISSION ORDER (arrival; 2026-10-16, task 5629, PRD task beta of
 # plans/verify-admission-fifo-prd.md). Grant waiters in arrival order within a
@@ -1619,15 +1630,17 @@ verify_cross_check_remote_green: false
 # 2026-11-10, gate 6673 (task ε) step 4: the three-day parity window opens on these
 # values. Both parity knobs are on for the window only; Leo rules at its end (PRD §12
 # Q7: cross-check 0 and red-confirm off after a zero-disagreement window, the 5416
-# precedent). The laptop side (verify_admission_task_slots: 1,
+# precedent). The laptop side (verify_admission_task_slots: 3 since 2026-11-15,
 # verify_admission_pytest_n: "8") lives in leo-laptop's dark-factory-laptop.yaml.
 # 2026-11-13, gate 6673 step 6, Leo's ruling (esc-6673-1): keep remote legs on, turn
 # red-confirm off, and keep the cross-check at 5 until task 7030 lands. 7030 gives the
 # laptop a pinned reify checkout; until then three reify-dependent guards can skip
 # there silently. The cross-check then goes to 0. Measurements:
 # plans/merge-lane-throughput-prd.measurements/2026-11-10-task-6673-remote-task-leg-window.md.
-verify_task_host_policy: remote_modules        # local | remote_modules | remote_all
-verify_task_remote_modules: [orchestrator]     # must be non-empty under remote_modules
+# 2026-11-15, Leo: remote_modules [orchestrator] -> remote_all. Every task verify is
+# eligible for leo-laptop, whose dark-factory-laptop.yaml went to 3 task slots.
+verify_task_host_policy: remote_all            # local | remote_modules | remote_all
+verify_task_remote_modules: [orchestrator]     # read only under remote_modules
 verify_task_remote_red_confirms_locally: false # off after the window (2 raw / 0 adjudicated splits)
 verify_task_remote_cross_check_every_n: 5      # kept until task 7030 lands, then 0
 # ROLLBACK: verify_task_host_policy: local (or delete the keys) + mcp__escalation__reload_config.
@@ -1799,3 +1812,23 @@ merge_deep:
   chain_cap: 6
   # No warm spec pool here, so builds are git-only (8 builds, max 31 s).
   chain_build_timeout_secs: 300
+
+# TRIAL (Leo 2026-11-14, lock hand-off study): the automatic file reservation
+# is off. A task earns one when its count of skips reaches its tier's threshold,
+# and the count resets only when the task starts or the orchestrator restarts.
+# The busiest tasks are skipped about 130 times a day, so 1000000 is out of
+# reach. The pin reservation (operator and starvation-watchdog pins, at most
+# pin_reservation_max_active owners) is unchanged. Polish stays at its default.
+# Side effect: at a threshold of 1000 or more the scheduler records task_skipped
+# events only at counts 1, 10, 100, 1000 and 10000, so readers of those events
+# see fewer of them; the watchdog reads the in-memory counts and is unaffected.
+# Review and alerts: task 10128. To end the trial delete this block; the code
+# defaults then apply (critical 0, high 1, medium 2, low 4). Green tier:
+# applied with reload_config.
+fairness:
+  skip_threshold:
+    critical: 1000000
+    high: 1000000
+    medium: 1000000
+    low: 1000000
+    polish: 9999

@@ -12,6 +12,7 @@ from shared.secret_env import (
     agent_subprocess_env,
     is_secret_env_name,
     secret_env_values,
+    without_account_pool,
     without_agent_endpoint_vars,
 )
 
@@ -150,6 +151,43 @@ class TestWithoutAgentEndpointVars:
     def test_keeps_every_other_credential(self):
         environ = {**_environ_with_secrets(), 'HF_DOWNLOAD_TOKEN': 'hf-' + 'h' * 40}
         assert without_agent_endpoint_vars(environ) == environ
+
+
+
+class TestWithoutAccountPool:
+    def test_drops_every_pool_name(self):
+        environ = {**_environ_with_secrets(), 'CLAUDE_OAUTH_TOKEN_MAX_B': 'max-b-' + 'm' * 40}
+        child = without_account_pool(environ)
+        assert [k for k in child if k.startswith('CLAUDE_OAUTH_TOKEN_')] == []
+
+    def test_keeps_every_other_credential_and_the_python_env_selection(self):
+        environ = {
+            **_environ_with_secrets(),
+            'HF_DOWNLOAD_TOKEN': 'hf-' + 'h' * 40,
+            'VIRTUAL_ENV': '/srv/orch/.venv',
+            'PATH': '/srv/orch/.venv/bin:/usr/bin:/bin',
+        }
+        expected = {k: v for k, v in environ.items() if not k.startswith('CLAUDE_OAUTH_TOKEN_')}
+        assert without_account_pool(environ) == expected
+
+    @pytest.mark.parametrize(
+        'name', ('CLAUDE_OAUTH_TOKEN', 'MY_CLAUDE_OAUTH_TOKEN_A', 'CLAUDE_OAUTH_TOKENS')
+    )
+    def test_lookalike_names_survive(self, name):
+        environ = {**ORDINARY_ENV, name: 'lookalike-' + 'l' * 40}
+        assert without_account_pool(environ) == environ
+
+    def test_returns_a_new_dict(self):
+        environ = _environ_with_secrets()
+        child = without_account_pool(environ)
+        assert isinstance(child, dict)
+        assert child is not environ
+
+    def test_leaves_the_input_unmutated(self):
+        environ = _environ_with_secrets()
+        snapshot = dict(environ)
+        without_account_pool(environ)
+        assert environ == snapshot
 
 
 class TestSecretEnvValues:

@@ -862,7 +862,7 @@ class TestTriageFailOpenCounter:
             assert counter.record(project='dark_factory') is None
 
     def test_the_crossing_call_returns_a_json_serializable_summary(self) -> None:
-        import json  # noqa: PLC0415
+        import json
 
         counter = TriageFailOpenCounter(time_provider=_Clock())
         summary = None
@@ -1913,7 +1913,7 @@ class TestEmitTriageFailOpenStormEscalation:
     def test_files_afresh_once_the_prior_escalation_is_resolved(self, tmp_path) -> None:
         """Dedup must not silence a NEW outage after the old one was cleared."""
         pytest.importorskip('escalation')
-        from escalation.queue import EscalationQueue  # noqa: PLC0415
+        from escalation.queue import EscalationQueue
 
         first = emit_triage_fail_open_storm_escalation(str(tmp_path), _STORM)
         assert first is not None

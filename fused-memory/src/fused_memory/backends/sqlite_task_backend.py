@@ -40,6 +40,7 @@ from shared.sqlite_column_migration import add_column_if_missing
 from shared.task_created_at import CreatedAtSource
 from shared.task_metadata import (
     _WHOLE_METADATA_FIELD,
+    GATE_EPISODE_STAMP_KEYS,
     SchemaWarning,
     apply_migrations,
     parse_metadata,
@@ -76,6 +77,7 @@ from fused_memory.backends.task_backend_errors import (
 from fused_memory.backends.task_backend_types import (
     AddTaskResult,
     DefectWriteResult,
+    DependencyFact,
     DependencyResult,
     GetTasksResult,
     MetadataLookupResult,
@@ -83,6 +85,7 @@ from fused_memory.backends.task_backend_types import (
     RemoveTaskResult,
     SetTaskStatusResult,
     StatusWriteNotPersistedResult,
+    TaskFactsRow,
     UpdateTaskResult,
     ValidateDependenciesResult,
 )
@@ -763,8 +766,9 @@ async def _migrate_v3_to_v4(
                     mode='merge',
                     project_root=project_root, tag=group['tag'], task_id=cancel_id,
                 )
-                # Leaving deferred drops its record (plans/deferral-flip-condition-prd.md decision 4).
-                new_metadata = _metadata_without_keys(new_metadata, _CLEARABLE_AUDIT_KEYS)
+                # Leaving deferred drops its record (plans/deferral-flip-condition-prd.md decision 4),
+                # and entering cancelled ends a gate episode (middleware/gate_stamp_lifecycle.py).
+                new_metadata = _metadata_without_keys(new_metadata, _STATUS_CLEARABLE_KEYS)
                 await conn.execute(
                     "UPDATE tasks SET status = 'cancelled', updated_at = ?, "
                     "metadata = ? WHERE tag = ? AND id = ?",
@@ -1590,6 +1594,20 @@ _ReadAll = Callable[[str, Iterable[Any]], Awaitable[Iterable[aiosqlite.Row]]]
 """Run one SELECT and return every row: ``AtomicConnection.read_all`` or ``execute_fetchall``."""
 
 
+def _int_task_ids(ids: Iterable[str]) -> list[int]:
+    """The numeric ids among *ids*; a non-numeric id is dropped, so it reads as an unknown task."""
+    int_ids: list[int] = []
+    for raw_id in ids:
+        with contextlib.suppress(ValueError, TypeError):
+            int_ids.append(int(raw_id))
+    return int_ids
+
+
+def _stored_status(status: str | None) -> str:
+    """A ``NULL`` status (defensive; unreachable via normal writes) reads as ``'unknown'``."""
+    return status if status is not None else 'unknown'
+
+
 async def _read_status_map(
     read_all: _ReadAll, tag: str, ids: list[str] | None,
 ) -> dict[str, str]:
@@ -1615,12 +1633,7 @@ async def _read_status_map(
         ``'unknown'``.
     """
     if ids is not None:
-        if not ids:
-            return {}
-        int_ids: list[int] = []
-        for raw_id in ids:
-            with contextlib.suppress(ValueError, TypeError):
-                int_ids.append(int(raw_id))
+        int_ids = _int_task_ids(ids)
         if not int_ids:
             return {}
         placeholders = ','.join('?' * len(int_ids))
@@ -1630,9 +1643,66 @@ async def _read_status_map(
         sql = 'SELECT id, status FROM tasks WHERE tag = ?'
         params = (tag,)
     rows = await read_all(sql, params)
+    return {str(row['id']): _stored_status(row['status']) for row in rows}
+
+
+def _done_provenance_text_sql(field: str) -> str:
+    """``metadata.done_provenance.<field>`` when it is a JSON string, else ``NULL``.
+
+    The nested CASE keeps JSON functions off malformed rows, as in
+    :func:`_metadata_lookup_sql`.
+    """
+    path = f"'$.done_provenance.{field}'"
+    return (
+        f"CASE WHEN json_valid(metadata) THEN "
+        f"CASE WHEN json_type(metadata, {path}) = 'text' THEN metadata ->> {path} END END"
+    )
+
+
+_TASK_FACTS_SQL = f"""
+SELECT id, title, status,
+       {_done_provenance_text_sql('kind')} AS done_kind,
+       {_done_provenance_text_sql('commit')} AS done_commit
+FROM tasks WHERE tag = ? AND id IN ({{placeholders}})
+"""
+
+_TASK_FACT_DEPENDENCIES_SQL = """
+SELECT d.task_id, d.depends_on, t.id AS dep_row, t.status AS dep_status
+FROM dependencies d LEFT JOIN tasks t ON t.tag = d.tag AND t.id = d.depends_on
+WHERE d.tag = ? AND d.task_id IN ({placeholders})
+ORDER BY d.task_id, d.depends_on
+"""
+
+
+def _text_or_none(value: str | None) -> str | None:
+    return (value or '').strip() or None
+
+
+async def _read_task_facts(
+    read_all: _ReadAll, tag: str, int_ids: list[int],
+) -> dict[str, TaskFactsRow]:
+    """The rows behind :meth:`SqliteTaskBackend.get_task_facts`, two SELECTs through *read_all*."""
+    placeholders = ','.join('?' * len(int_ids))
+    params = (tag, *int_ids)
+    task_rows = await read_all(_TASK_FACTS_SQL.format(placeholders=placeholders), params)
+    dependency_rows = await read_all(
+        _TASK_FACT_DEPENDENCIES_SQL.format(placeholders=placeholders), params,
+    )
+    dependencies: dict[int, list[DependencyFact]] = {}
+    for row in dependency_rows:
+        dependencies.setdefault(row['task_id'], []).append({
+            'id': str(row['depends_on']),
+            'status': None if row['dep_row'] is None else _stored_status(row['dep_status']),
+        })
     return {
-        str(row['id']): (row['status'] if row['status'] is not None else 'unknown')
-        for row in rows
+        str(row['id']): {
+            'status': _stored_status(row['status']),
+            'title': row['title'],
+            'dependencies': dependencies.get(row['id'], []),
+            'done_provenance_kind': _text_or_none(row['done_kind']),
+            'done_provenance_commit': _text_or_none(row['done_commit']),
+        }
+        for row in task_rows
     }
 
 
@@ -2139,6 +2209,26 @@ class SqliteTaskBackend:
         access = await self._get_read_access(project_root)
         return await _fetch_dependencies(access.read_all, tag)
 
+    async def get_task_facts(
+        self, ids: Sequence[str], project_root: str,
+    ) -> dict[str, TaskFactsRow]:
+        """Status, title, local dependencies and done provenance of *ids*, keyed by ``str(id)``.
+
+        Presence is existence: an unknown or non-numeric id is omitted, as in
+        :meth:`get_statuses_raw`. A dependency whose task row is gone
+        (``remove_tasks`` leaves those dangling) has status ``None``. Only the
+        local ``dependencies`` table is read; cross-project
+        ``metadata.external_deps`` are out of scope. The two SELECTs are not
+        one snapshot: see :func:`_fetch_dependencies`' "Intra-call read skew"
+        note. Contract: plans/live-task-facts-at-recall-prd.md C1.
+        """
+        await self.ensure_connected()
+        int_ids = _int_task_ids(ids)
+        if not int_ids:
+            return {}
+        access = await self._get_read_access(project_root)
+        return await _read_task_facts(access.read_all, DEFAULT_TAG, int_ids)
+
     async def get_statuses_raw(
         self,
         project_root: str,
@@ -2570,9 +2660,9 @@ class SqliteTaskBackend:
     ) -> SetTaskStatusResult | StatusWriteNotPersistedResult:
         """Atomically update ``status`` AND merge ``audit_fields`` into metadata.
 
-        ``clear_keys`` (a subset of ``_CLEARABLE_AUDIT_KEYS``) are removed from
+        ``clear_keys`` (a subset of ``_STATUS_CLEARABLE_KEYS``) are removed from
         the resulting blob in the same transaction: leaving ``deferred`` drops
-        its record.
+        its record, and a terminal crossing drops the gate-episode stamps.
 
         The sole atomic status+audit writer (task 2649). Calling
         ``stamp_audit_metadata`` followed by ``set_task_status`` — the
@@ -2614,10 +2704,10 @@ class SqliteTaskBackend:
         :meth:`stamp_audit_metadata`, kept off the 12-method contract so
         other callers do not treat it as sanctioned public surface.
         """
-        if unclearable := clear_keys - _CLEARABLE_AUDIT_KEYS:
+        if unclearable := clear_keys - _STATUS_CLEARABLE_KEYS:
             raise ValueError(
                 f'set_status_and_stamp_audit cannot clear {sorted(unclearable)}; '
-                f'clearable keys are {sorted(_CLEARABLE_AUDIT_KEYS)}'
+                f'clearable keys are {sorted(_STATUS_CLEARABLE_KEYS)}'
             )
         await self.ensure_connected()
         tag = tag or DEFAULT_TAG
@@ -4447,7 +4537,7 @@ def _assert_passthrough_only_keys(
     return frozenset(key for key in _PASSTHROUGH_ONLY_METADATA_KEYS if key in incoming)
 
 
-_CLEARABLE_AUDIT_KEYS: frozenset[str] = frozenset({'deferral'})
+_STATUS_CLEARABLE_KEYS: frozenset[str] = frozenset({'deferral'}) | GATE_EPISODE_STAMP_KEYS
 
 
 def _metadata_without_keys(blob_json: str, keys: frozenset[str]) -> str:

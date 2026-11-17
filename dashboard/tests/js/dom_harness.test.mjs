@@ -103,6 +103,77 @@ test('a script that fails to evaluate fails the build, naming the file (negative
   );
 });
 
+// ── beforeScripts(window): a test's look at what scripts do at load ───────
+
+test('beforeScripts runs once, on the fresh window with its browser gaps, before the first local script', t => {
+  const calls = [];
+  const { window } = openWindow(t, {
+    beforeScripts(win) {
+      calls.push({ fetch: win.fetch, sawDfData: 'DF_DATA' in win, sawPollScope: 'DF_POLL_SCOPE' in win, sawReact: 'React' in win });
+    },
+  });
+  assert.equal(calls.length, 1, 'beforeScripts must run exactly once per build');
+  const [call] = calls;
+  assert.equal(call.fetch, window.fetch, "the hook must see the harness's fetch stub already installed");
+  assert.equal(call.sawReact, false, 'the hook must run before the React builds load');
+  assert.equal(call.sawPollScope, false, 'the hook must run before poll_scope.js, the first local script');
+  assert.equal(call.sawDfData, false, 'the hook must run before data.js assigns window.DF_DATA');
+});
+
+test("an accessor beforeScripts defines on DF_DATA sees data.js's assignment and shell.jsx's load-time read", t => {
+  const assigned = [];
+  const readsAtLoad = [];
+  const { window } = openWindow(t, {
+    beforeScripts(win) {
+      let current;
+      Object.defineProperty(win, 'DF_DATA', {
+        configurable: true,
+        get: () => current,
+        set(value) {
+          assigned.push(value);
+          current = new win.Proxy(value, {
+            get(target, key, receiver) {
+              readsAtLoad.push(key);
+              return Reflect.get(target, key, receiver);
+            },
+          });
+        },
+      });
+    },
+  });
+  assert.equal(assigned.length, 1, "the setter must see data.js's one assignment of window.DF_DATA");
+  assert.ok(Array.isArray(assigned[0].PROJECTS), "the setter must receive data.js's own DF_DATA object");
+  assert.ok(readsAtLoad.includes('PROJECTS'), "shell.jsx's load-time read of DF_DATA.PROJECTS must go through the getter");
+  assert.equal(window.DF_DATA.PROJECTS, assigned[0].PROJECTS);
+});
+
+test('a beforeScripts hook that throws fails the build, naming the hook, and closes the window', () => {
+  let seen = null;
+  let built = null;
+  try {
+    assert.throws(
+      () => {
+        built = buildDashboardWindow({
+          beforeScripts(win) {
+            seen = win;
+            throw new Error('hook boom');
+          },
+        });
+      },
+      err => err.message.includes('beforeScripts') && err.message.includes('hook boom'),
+    );
+  } finally {
+    built?.close();
+  }
+  assert.ok(seen, 'the hook never ran, so the check below proves nothing');
+  assert.equal(seen.document, undefined, 'a failed build must close the window it opened (jsdom drops a closed window\'s document)');
+});
+
+test('beforeScripts defaults to a no-op', t => {
+  const { window } = openWindow(t, { beforeScripts: undefined });
+  assert.ok(window.DF_DATA, 'an omitted beforeScripts must leave the load unchanged');
+});
+
 test('the window exposes the helpers and tabs the render tests mount', t => {
   const { window } = openWindow(t);
   for (const name of ['DF_TASK_ROW_CELLS', 'DF_BURNDOWN_BANDS', 'DF_PINS_RECOVERY']) {

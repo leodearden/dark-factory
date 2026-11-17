@@ -27,7 +27,7 @@ from test_merge_queue_rebased_landing_dead_base import (
 )
 from test_merge_speculation import _LateArrivalFakeEventStore
 
-from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.config import GitConfig, MergeDeepConfig, OrchestratorConfig
 from orchestrator.event_store import EventType
 from orchestrator.git_ops import GitOps
 from orchestrator.merge_lane import MergeLane
@@ -58,8 +58,15 @@ def git_ops(git_config: GitConfig, git_repo: Path) -> GitOps:
 
 @pytest.fixture
 def config(git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
-    """Policy pinned so the operational yaml's ``verify_host_policy`` cannot leak in."""
-    return lane_scene_config(git_repo, git_config, verify_host_policy='prefer_local')
+    """Policy pinned so the operational yaml's ``verify_host_policy`` cannot leak in.
+
+    Deep chains off (task 8527), so a follower is its own dispatch rather than a
+    link of a head alone in the verify frontier.
+    """
+    return lane_scene_config(
+        git_repo, git_config, verify_host_policy='prefer_local',
+        merge_deep=MergeDeepConfig(chain_cap=0),
+    )
 
 
 def _rows(store: _LateArrivalFakeEventStore, kind: EventType, task_id: str) -> list[dict]:
@@ -214,7 +221,7 @@ async def _cascade(
         if b_finishes_first:
             b_release.set()
             await _until(
-                lambda: _lease_activity(lane, f'{prefix}-b') == 'finished',
+                lambda: _lease_activity(lane, f'{prefix}-b') == 'verified_pending_landing',
                 what=f'{prefix}-b verify to finish',
             )
         a_release.set()

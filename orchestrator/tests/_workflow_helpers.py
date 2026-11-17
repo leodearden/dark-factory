@@ -50,6 +50,7 @@ from orchestrator.merge_lane import MergeLane
 from orchestrator.merge_lane.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
 from orchestrator.module_charter import sanitize_files_for_persist
 from orchestrator.pin_reservation import Blocker, BlockerKind
+from orchestrator.review_lineage import RetiredReview
 from orchestrator.scheduler import (
     BlastRadiusResult,
     TaskAssignment,
@@ -498,6 +499,7 @@ class FakeBriefing:
         *, include_prior_proposals: bool = False,
         committed_work: list[dict] | None = None,
         rulings: Sequence[Ruling] = (),
+        retired_reviews: Sequence[RetiredReview] = (),
     ) -> str:
         return f'Plan task: {task.get("title", "")}'
 
@@ -588,6 +590,7 @@ class FakeBriefing:
         self, task: dict, existing_plan: dict, changed_files: list,
         worktree=None, context: str | None = None, *, text_drift=None,
         integrity_refusal=None, rulings: Sequence[Ruling] = (),
+        retired_reviews: Sequence[RetiredReview] = (),
     ) -> str:
         return f'Revalidate: {task.get("title", "")}'
 
@@ -623,7 +626,7 @@ def _make_resolving_steward(queue: EscalationQueue, task_id: str) -> type:
     """
 
     class _FakeSteward:
-        def __init__(self, wt_path, cfg_dir):  # noqa: ARG002
+        def __init__(self, wt_path, cfg_dir):
             self._outcome_channel = None
             self._wip_probe = None
 
@@ -663,7 +666,7 @@ def _make_status_setting_steward(
     """
 
     class _FakeSteward:
-        def __init__(self, wt_path, cfg_dir):  # noqa: ARG002
+        def __init__(self, wt_path, cfg_dir):
             self._outcome_channel = None
             self._wip_probe = None
 

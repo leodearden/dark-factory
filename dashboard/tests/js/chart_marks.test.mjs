@@ -151,6 +151,7 @@ test('markStyleFor: each marker kind maps to its overlay style', () => {
     instrument: 'rug',
     artefact: 'range',
     alarm: 'alarm',
+    baseline: 'baseline',
   };
   for (const [kind, style] of Object.entries(expected)) {
     assert.equal(markStyleFor(kind), style, kind);
@@ -208,4 +209,12 @@ test('legendEntries: only the styles present are listed', () => {
   );
   assert.deepEqual(legendEntries([]), []);
   assert.deepEqual(legendEntries(null), []);
+});
+
+test('legendEntries: a baseline mark is named the /review-all baseline, never a change', () => {
+  assert.deepEqual(legendEntries([{ kind: 'baseline' }]), [{ style: 'baseline', label: '/review-all baseline' }]);
+  assert.deepEqual(
+    legendEntries([{ kind: 'baseline' }, { kind: 'instrument' }]).map(e => e.style),
+    ['rug', 'baseline'],
+  );
 });

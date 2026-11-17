@@ -79,9 +79,11 @@ from escalation.models import (
     ACTION_TERMINATE_CLEANLY,
     AGENT_FILABLE_LEVELS,
     BORN_AT_L2_SEVERITIES,
+    EVAL_LANE_CONTAINMENT_RESOLVER,
     HARNESS_SENTINEL_ROLE_PREFIXES,
     KNOWN_SEVERITIES,
     NOTE_TO_FILE_CLASS,
+    PRE_SUBMIT_CHECK_RESOLVER,
     RESOLUTION_CLASSES,
     STATUS_ACCEPTED_UNPERSISTED,
     Escalation,
@@ -1933,7 +1935,7 @@ def create_server(
                 f'contained: eval-lane artifact ({eval_lane_reason}); not a '
                 'production signal, the eval measurement is scored from the '
                 'cell result artifacts',
-                resolved_by='escalation-eval-lane-containment',
+                resolved_by=EVAL_LANE_CONTAINMENT_RESOLVER,
                 resolution_class=NOTE_TO_FILE_CLASS if esc.note_to_file else 'benign',
             )
             return {
@@ -2064,7 +2066,7 @@ def create_server(
             resolved = queue.submit_resolved(
                 esc,
                 f'auto-resolved: task already terminal (status={status})',
-                resolved_by='escalation-mcp-pre-submit-check',
+                resolved_by=PRE_SUBMIT_CHECK_RESOLVER,
                 resolution_class='benign',
             )
             return {
@@ -2684,7 +2686,10 @@ def create_server(
         NOTE: resolve_issue itself writes no task status — this call changes
         only the escalation record. The orchestrator harness applies the
         ``target_status`` values above. Table B's consumers are listed in the
-        ``escalation/src/escalation/action_effects.py`` module docstring.
+        ``escalation/src/escalation/action_effects.py`` module docstring. A
+        ``resume`` of a held deterministic pure gate is run by the harness
+        inline, which closes it or re-holds it, instead of being re-pended, see
+        ``orchestrator/src/orchestrator/harness.py::Harness._run_held_pure_gate_inline``.
         """
         if terminate is not None:
             return {
@@ -2944,7 +2949,7 @@ def create_server(
             if callable(bump):
                 try:
                     bump(rec.task_id)
-                except Exception as _e:  # noqa: BLE001 — best-effort telemetry
+                except Exception as _e:  # best-effort telemetry
                     logger.warning(
                         'escalate_model tier bump failed for task %s '
                         '(non-fatal): %s',
@@ -3184,8 +3189,8 @@ def create_server(
         the reconciliation queue are separate stores), so a caller connected to
         one of them learns nothing about records in the other: confirm which
         queue you are talking to before reading any [] as a gap.  Auditing a
-        ``done`` ``task_kind='deterministic'`` gate task that has
-        ``metadata.gate_escalated_at`` set?  Those records live in the
+        ``done`` ``task_kind='deterministic'`` gate task whose
+        ``done_provenance.kind`` is ``'deterministic-gate'``?  Those records live in the
         ORCHESTRATOR queue — call this tool against THAT server before emitting
         any finding, flag, memory or remediation task claiming the escalation
         record was never written.  (Reconciliation stages are denied this tool
@@ -3262,8 +3267,8 @@ def create_server(
         so a caller connected to one of them learns nothing about records in
         the other: confirm which queue you are talking to before treating
         ``count: 0`` as proof that no record was ever filed. Auditing a
-        ``done`` ``task_kind='deterministic'`` gate task that has
-        ``metadata.gate_escalated_at`` set? Those records live in the
+        ``done`` ``task_kind='deterministic'`` gate task whose
+        ``done_provenance.kind`` is ``'deterministic-gate'``? Those records live in the
         ORCHESTRATOR queue — query THAT server before emitting any finding,
         flag, memory or remediation task claiming the escalation record was
         never written. (Reconciliation stages are denied this tool outright

@@ -36,13 +36,13 @@ import pytest
 from shared.cli_invoke import (
     AgentFailureKind,
     AgentResult,
+    SubprocessResult,
     _content_blocks,
     _iter_result_texts,
-    _parse_claude_output,
-    _SubprocessResult,
     classify_agent_failure,
     detect_ended_awaiting_background,
     ended_awaiting_background_for_session,
+    parse_claude_output,
 )
 
 # ── Fixture builders ────────────────────────────────────────────────────────
@@ -1241,7 +1241,7 @@ _SUCCESS_ENVELOPE = json.dumps(
 
 class TestEndedAwaitingBackgroundField:
     """The new boolean outcome flag mirrors schema_salvaged / schema_tool_denied:
-    it defaults False on both AgentResult and _SubprocessResult."""
+    it defaults False on both AgentResult and SubprocessResult."""
 
     def test_agent_result_defaults_false(self) -> None:
         """AgentResult.ended_awaiting_background defaults to False."""
@@ -1249,38 +1249,38 @@ class TestEndedAwaitingBackgroundField:
         assert result.ended_awaiting_background is False
 
     def test_subprocess_result_defaults_false(self) -> None:
-        """_SubprocessResult.ended_awaiting_background defaults to False."""
-        result = _SubprocessResult(stdout='', stderr='', returncode=0, duration_ms=0)
+        """SubprocessResult.ended_awaiting_background defaults to False."""
+        result = SubprocessResult(stdout='', stderr='', returncode=0, duration_ms=0)
         assert result.ended_awaiting_background is False
 
 
 class TestParseClaudeOutputDowngrade:
-    """_parse_claude_output downgrades success→failure when the subprocess was
+    """parse_claude_output downgrades success→failure when the subprocess was
     flagged ended_awaiting_background, and propagates the flag on every path."""
 
     def test_success_envelope_flagged_is_downgraded(self) -> None:
         """subtype=success + ended_awaiting_background=True → success False, flag True."""
-        sub = _SubprocessResult(
+        sub = SubprocessResult(
             stdout=_SUCCESS_ENVELOPE,
             stderr='',
             returncode=0,
             duration_ms=681_000,
             ended_awaiting_background=True,
         )
-        agent = _parse_claude_output(sub)
+        agent = parse_claude_output(sub)
         assert agent.success is False
         assert agent.ended_awaiting_background is True
 
     def test_success_envelope_unflagged_stays_success(self) -> None:
         """subtype=success + ended_awaiting_background=False → success stays True, flag False."""
-        sub = _SubprocessResult(
+        sub = SubprocessResult(
             stdout=_SUCCESS_ENVELOPE,
             stderr='',
             returncode=0,
             duration_ms=681_000,
             ended_awaiting_background=False,
         )
-        agent = _parse_claude_output(sub)
+        agent = parse_claude_output(sub)
         assert agent.success is True
         assert agent.ended_awaiting_background is False
 
@@ -1288,14 +1288,14 @@ class TestParseClaudeOutputDowngrade:
         """An already-failing empty-stdout result + flag=True → success stays
         False and the flag is still propagated (downgrade is an idempotent no-op
         on an already-failing result; no crash)."""
-        sub = _SubprocessResult(
+        sub = SubprocessResult(
             stdout='',
             stderr='boom',
             returncode=1,
             duration_ms=100,
             ended_awaiting_background=True,
         )
-        agent = _parse_claude_output(sub)
+        agent = parse_claude_output(sub)
         assert agent.success is False
         assert agent.ended_awaiting_background is True
 
@@ -1370,7 +1370,7 @@ class TestDetectorTotalityAndTokenHygiene:
         """A tool_use block whose ``name`` is unhashable is skipped, not fatal.
 
         Pre-amendment this raised ``TypeError: unhashable type`` at ``name in
-        _BACKGROUND_REAP_TOOLS``.  The call site in ``_run_subprocess`` is
+        _BACKGROUND_REAP_TOOLS``.  The call site in ``run_cli_subprocess`` is
         unguarded, so the exception would fail the whole agent invocation —
         a malformed block breaking a completed run.
         """

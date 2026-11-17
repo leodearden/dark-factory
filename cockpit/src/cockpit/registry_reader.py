@@ -31,7 +31,7 @@ import logging
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
-from orchestrator import session_registry
+from orchestrator import decision_registry, session_registry
 from shared.project_id import fold_project_token
 
 logger = logging.getLogger(__name__)
@@ -54,7 +54,7 @@ _SNAPSHOT_FIELDS = (
 
 
 def _canonicalize_project(
-    record: session_registry.SessionRecord | session_registry.DecisionRecord,
+    record: session_registry.SessionRecord | decision_registry.DecisionRecord,
 ) -> None:
     """Fold *record*'s ``.project`` onto its canonical spelling, in place.
 
@@ -123,7 +123,7 @@ def _read_record_soft(
     return record
 
 
-def scan_decisions(root: Path | str | None = None) -> list[session_registry.DecisionRecord]:
+def scan_decisions(root: Path | str | None = None) -> list[decision_registry.DecisionRecord]:
     """Return every readable DecisionRecord, ``.project`` canonicalized.
 
     The decision-side twin of scan_sessions (task 3812), applying the same
@@ -133,7 +133,7 @@ def scan_decisions(root: Path | str | None = None) -> list[session_registry.Deci
     The whole READ -- and therefore the whole fail-soft policy: absent
     decisions/ dir -> [], a single corrupt or foreign ``*.json`` logged and
     skipped rather than aborting the rest -- is delegated to
-    ``session_registry.list_decisions``. This is a fold over that reader,
+    ``decision_registry.list_decisions``. This is a fold over that reader,
     never a second implementation of it, so its contract cannot drift away
     from the frozen one (pinned by
     test_returns_the_same_ids_in_the_same_order_as_list_decisions).
@@ -151,7 +151,7 @@ def scan_decisions(root: Path | str | None = None) -> list[session_registry.Deci
     in-memory only and are never written back (the cockpit never calls
     write_decision).
     """
-    decisions = session_registry.list_decisions(root)
+    decisions = decision_registry.list_decisions(root)
     for record in decisions:
         _canonicalize_project(record)
     return decisions

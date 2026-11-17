@@ -35,7 +35,7 @@ from reconciliation.plural_enum_shapes import (
 # The SHIPPED pagination engine, imported for the same reason the guard below
 # is: the probe delegates to it, and identity checks against the real objects
 # are the only way to catch the probe quietly growing a private copy back.
-from fused_memory.backends import graphiti_client
+from fused_memory.backends import graphiti_client, paged_read
 
 # The PRODUCTION guard object, imported the same way the extraction suite imports
 # it. Held here only so the baseline test can assert the probe's 'shipped'
@@ -521,7 +521,7 @@ def test_the_enumerator_delegates_to_the_shipped_paginator():
     Asserted by IDENTITY against the real objects rather than by equal
     values, because equal values are exactly what a re-spelled copy has.
     """
-    assert _mod._paged_ro_query is graphiti_client._paged_ro_query
+    assert _mod._paged_ro_query is paged_read.paged_ro_query
     assert _mod.DEFAULT_PAGE_SIZE is graphiti_client._DEFAULT_READ_PAGE_SIZE
     assert _mod.RESULTSET_SIZE is graphiti_client._RESULTSET_SIZE
     assert _mod.MAX_ENUM_PAGES is graphiti_client._MAX_READ_PAGES

@@ -27,7 +27,7 @@ import pytest
 @pytest.mark.asyncio
 async def test_fake_scheduler_smoke() -> None:
     """FakeScheduler tracks status changes correctly."""
-    from _workflow_helpers import FakeScheduler  # noqa: PLC0415
+    from _workflow_helpers import FakeScheduler
 
     sched = FakeScheduler()
     await sched.set_task_status('x', 'pending')
@@ -53,7 +53,7 @@ async def test_fake_scheduler_submit_task_through_the_chronic_flake_adapter_file
 
 def test_fake_mcp_smoke() -> None:
     """FakeMcp returns the expected URL and empty MCP config."""
-    from _workflow_helpers import FakeMcp  # noqa: PLC0415
+    from _workflow_helpers import FakeMcp
 
     mcp = FakeMcp()
     assert mcp.url == 'http://localhost:9999'
@@ -69,7 +69,7 @@ async def test_fake_briefing_smoke() -> None:
     not checked — only the caller-supplied argument value must appear in the
     result, guarding against a builder silently dropping its argument.
     """
-    from _workflow_helpers import FakeBriefing  # noqa: PLC0415
+    from _workflow_helpers import FakeBriefing
 
     briefing = FakeBriefing()
 
@@ -122,11 +122,11 @@ def _reset_merge_provenance():
 
 def test_merge_provenance_factories_smoke(tmp_path) -> None:
     """_make builds a real TaskWorkflow+TaskArtifacts fixture; _bind_landed_row is lookup-able."""
-    from _workflow_helpers import _bind_landed_row, _Fixture, _make  # noqa: PLC0415
+    from _workflow_helpers import _bind_landed_row, _Fixture, _make
 
-    from orchestrator.artifacts import TaskArtifacts  # noqa: PLC0415
+    from orchestrator.artifacts import TaskArtifacts
     from orchestrator.merge_lane.landed_outbox import MergeProvenance
-    from orchestrator.workflow import TaskWorkflow  # noqa: PLC0415
+    from orchestrator.workflow import TaskWorkflow
 
     fixture = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'pr')
     assert isinstance(fixture, _Fixture)
@@ -146,9 +146,9 @@ def test_merge_provenance_factories_smoke(tmp_path) -> None:
 
 def test_warmlane_workflow_factory_smoke(tmp_path) -> None:
     """_make_warmlane_workflow builds a TaskWorkflow with worktree deliberately unset."""
-    from _workflow_helpers import _make_warmlane_workflow  # noqa: PLC0415
+    from _workflow_helpers import _make_warmlane_workflow
 
-    from orchestrator.workflow import TaskWorkflow  # noqa: PLC0415
+    from orchestrator.workflow import TaskWorkflow
 
     wf = _make_warmlane_workflow(tmp_path=tmp_path)
     assert isinstance(wf, TaskWorkflow)
@@ -162,7 +162,7 @@ def test_warmlane_workflow_factory_smoke(tmp_path) -> None:
 
 def test_init_git_repo_factory_smoke(tmp_path) -> None:
     """_init_git_repo seeds a real git repo with an initial README commit."""
-    from _workflow_helpers import _init_git_repo  # noqa: PLC0415
+    from _workflow_helpers import _init_git_repo
 
     _init_git_repo(tmp_path)
     assert (tmp_path / '.git').is_dir()
@@ -176,7 +176,7 @@ def test_init_git_repo_factory_smoke(tmp_path) -> None:
 
 def test_e2e_factories_smoke(tmp_path) -> None:
     """Behavioral smoke: PLAN/_make_review/AgentStub/_init_repo real invocation checks."""
-    from _workflow_helpers import PLAN, AgentStub, _init_repo, _make_review  # noqa: PLC0415
+    from _workflow_helpers import PLAN, AgentStub, _init_repo, _make_review
 
     assert PLAN['task_id'] == '42'
     assert len(PLAN['steps']) == 2
@@ -214,7 +214,7 @@ def test_transcript_archival_factories_smoke(tmp_path) -> None:
     arbitrary (the archiver mirrors whatever ``projects/`` subdir name it
     finds), so an equality check against its own literal would assert nothing.
     """
-    from _workflow_helpers import (  # noqa: PLC0415
+    from _workflow_helpers import (
         ENC,
         _archive_root,
         _archived,
@@ -223,10 +223,10 @@ def test_transcript_archival_factories_smoke(tmp_path) -> None:
         _make_git_ops,
         _write_transcript,
     )
-    from shared.config_dir import TaskConfigDir  # noqa: PLC0415
+    from shared.config_dir import TaskConfigDir
 
-    from orchestrator.config import TranscriptArchiveConfig  # noqa: PLC0415
-    from orchestrator.git_ops import GitOps  # noqa: PLC0415
+    from orchestrator.config import TranscriptArchiveConfig
+    from orchestrator.git_ops import GitOps
 
     repo = tmp_path / 'repo'
     wt = tmp_path / 'wt'
@@ -278,9 +278,9 @@ async def test_init_transcript_repo_smoke(tmp_path) -> None:
     merge of them. The seed contents are what the transcript suites' worktrees
     are branched from, so they are pinned here.
     """
-    from _workflow_helpers import _init_transcript_repo  # noqa: PLC0415
+    from _workflow_helpers import _init_transcript_repo
 
-    from orchestrator.git_ops import _run  # noqa: PLC0415
+    from orchestrator.git_ops import _run
 
     _init_transcript_repo(tmp_path)
 
@@ -322,9 +322,9 @@ class TestSameModuleSiblings:
 
     @pytest.mark.parametrize('lock_depth', [1, 2, 3, 4, 12, 20])
     def test_siblings_are_distinct_files_in_one_module_at_any_depth(self, lock_depth: int):
-        from _workflow_helpers import same_module_siblings  # noqa: PLC0415
+        from _workflow_helpers import same_module_siblings
 
-        from orchestrator.scheduler import files_to_modules  # noqa: PLC0415
+        from orchestrator.scheduler import files_to_modules
 
         f1, f2 = same_module_siblings(lock_depth)
 
@@ -353,12 +353,12 @@ class TestSameModuleSiblings:
         `OrchestratorConfig.lock_depth` carries no `ge=1` constraint, so a
         caller forwarding `config.lock_depth` can genuinely reach this input.
         """
-        from _workflow_helpers import (  # noqa: PLC0415
+        from _workflow_helpers import (
             _unguarded_sibling_pair,
             same_module_siblings,
         )
 
-        from orchestrator.scheduler import files_to_modules  # noqa: PLC0415
+        from orchestrator.scheduler import files_to_modules
 
         with pytest.raises(ValueError, match='lock_depth >= 1'):
             same_module_siblings(lock_depth)

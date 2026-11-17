@@ -10,7 +10,7 @@ from typing import Any
 import pytest
 from escalation.authority import COORDINATOR_IDENTITY, EXECUTOR_IDENTITY, policy_row
 from escalation.models import Escalation
-from orchestrator.session_registry import (
+from orchestrator.decision_registry import (
     AuditOutcome,
     AuditVerdict,
     DecisionRecord,

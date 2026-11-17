@@ -2,10 +2,12 @@
 
 The shape a scheduler storm escape files (PRD INV-4).  ``has_open_l1`` keeps
 one open L1 per sentinel, so a condition re-checked every tick never stacks
-duplicates, and a human who resolves it while the condition persists gets a
-fresh one.  Filing is best-effort: a missing queue (bare-Scheduler unit tests)
-is a warning and any failure is logged and swallowed, so filing can never
-abort the dispatch tick that noticed the condition.
+duplicates.  The filer that sees its condition clear resolves the L1 with
+``resolve_sentinel_l1``.  A human may resolve it too; if the condition still
+holds, the next check files a fresh one.  Filing and resolving are both
+best-effort: a missing queue (bare-Scheduler unit tests) is a warning on
+filing and a no-op on resolving, and any queue failure is logged and
+swallowed, so neither can abort the tick that noticed the condition.
 """
 
 from __future__ import annotations
@@ -20,6 +22,8 @@ if TYPE_CHECKING:
     from escalation.queue import EscalationQueue
 
 logger = logging.getLogger(__name__)
+
+SENTINEL_L1_ROLE: str = 'orchestrator-scheduler'
 
 
 @dataclass(frozen=True)
@@ -42,7 +46,7 @@ def file_sentinel_l1(queue: EscalationQueue | None, l1: SentinelL1) -> None:
         esc = Escalation(
             id=queue.make_id(l1.sentinel),
             task_id=l1.sentinel,
-            agent_role='orchestrator-scheduler',
+            agent_role=SENTINEL_L1_ROLE,
             severity='blocking',
             category=l1.category,
             summary=l1.summary[:200],
@@ -54,3 +58,15 @@ def file_sentinel_l1(queue: EscalationQueue | None, l1: SentinelL1) -> None:
         logger.warning('Filed L1 %s escalation %s', l1.sentinel, esc.id)
     except Exception:
         logger.warning('Failed to file %s escalation', l1.sentinel, exc_info=True)
+
+
+def resolve_sentinel_l1(queue: EscalationQueue | None, sentinel: str, resolution: str) -> None:
+    """Resolve each open L1 filed under *sentinel*, its condition cleared; never raises."""
+    if queue is None:
+        return
+    try:
+        for esc in queue.get_by_task(sentinel, status='pending', level=1, agent_role=SENTINEL_L1_ROLE):
+            queue.resolve(esc.id, resolution, resolved_by=SENTINEL_L1_ROLE)
+            logger.info('Auto-resolved L1 %s escalation %s', sentinel, esc.id)
+    except Exception:
+        logger.warning('Failed to resolve %s escalation', sentinel, exc_info=True)

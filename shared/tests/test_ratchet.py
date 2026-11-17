@@ -306,7 +306,7 @@ class TestTighten:
 class TestTheKernelIsAMultisetNotASet:
     """Repeated multiplicities survive every operation.
 
-    Mirrors ``shared/tests/test_loop_blocking_gate.py::
+    Mirrors ``tests/repo_guards/test_loop_blocking_gate.py::
     test_ratchet_is_a_multiset_not_a_set``, and for the same reason: under set
     semantics a SECOND site sharing a key with an already-blessed one slips in
     silently.  D7 accepts that 67% of sites share a key with another site, so
@@ -470,7 +470,7 @@ OPERATIONS = [excess, slack, tighten]
 class TestParamsMismatchRefusal:
     """Different parameters mean the two sides are not measurements of one thing.
 
-    From ``scripts/merge_lane_metrics.py::_require_matching_params``: comparing
+    From ``scripts/merge_lane_ratchet.py::_require_matching_params``: comparing
     across a parameter change reports a wall of downstream violations instead
     of the one named cause, and the one named cause is the parameter change.
     """
@@ -584,7 +584,7 @@ class TestIncompleteEnumerationRefusal:
         """An ABSENT completeness flag must refuse, not be read as "probably fine".
 
         INV-11's shape is ``complete is True``, and
-        ``scripts/merge_lane_metrics.py::_require_complete_enumeration`` spells
+        ``scripts/merge_lane_ratchet.py::_require_complete_enumeration`` spells
         it that way for exactly this reason: under truthiness a value that is
         merely non-falsy — or a flag a future loader forgot to populate —
         compares green.  Identity refuses anything that is not literally True.
@@ -600,7 +600,7 @@ class TestPreconditionsRunBeforeAnyComparison:
     def test_incompleteness_is_reported_before_a_params_mismatch(self, operation):
         """Both faults present; the named winner is asserted, not left to chance.
 
-        The discipline of ``scripts/merge_lane_metrics.py::
+        The discipline of ``scripts/merge_lane_ratchet.py::
         check_against_baseline`` and its
         ``test_preconditions_are_checked_before_any_comparison``: the
         preconditions run ahead of every comparison, in a fixed order, so the

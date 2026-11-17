@@ -169,7 +169,7 @@ def _make_handler(state: MockOpenAIServer) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         protocol_version = 'HTTP/1.1'
 
-        def log_message(self, *args: Any) -> None:  # noqa: A002 - stdlib signature
+        def log_message(self, *args: Any) -> None:  # stdlib signature
             """Silence the default stderr access log."""
 
         def _send_json(self, status: int, body: dict[str, Any]) -> None:
@@ -180,7 +180,7 @@ def _make_handler(state: MockOpenAIServer) -> type[BaseHTTPRequestHandler]:
             self.end_headers()
             self.wfile.write(payload)
 
-        def do_POST(self) -> None:  # noqa: N802 - stdlib naming
+        def do_POST(self) -> None:  # stdlib naming
             length = int(self.headers.get('Content-Length') or 0)
             raw = self.rfile.read(length) if length else b''
             try:

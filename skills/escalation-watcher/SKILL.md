@@ -276,9 +276,10 @@ After `lease-claim` returns `acquired` or `proceed`, and before the first brief:
    mind for the session and carry into your own handover while they still hold.
 
    A **handed-off B3 merge** in the In flight section (`{task_id, escalation_id, request_id,
-   worktree}`) has no live owner: any resume-mode run polling it ended with the predecessor. If
-   `get_escalation(escalation_id)` still shows the escalation `pending`, launch
-   `unblock-low-risk` in resume mode for it once, exactly as the `handed_off` bullet of B3
+   worktree}`, plus `superseded_by` when the hand-off carried one) has no live owner: any
+   resume-mode run polling it ended with the predecessor. If `get_escalation(escalation_id)`
+   still shows the escalation `pending`, launch `unblock-low-risk` in resume mode for it once,
+   passing the recorded `superseded_by` when present, exactly as the `handed_off` bullet of B3
    "Completion handling" does, and track the `task_id` as in flight from then on. This launch
    replaces a resume the stop cut off; it is not a second resume. Do not run `b3_gate check` or
    `record-launch` first: `check` reports `already_attempted` for this task, and skipping on that
@@ -311,7 +312,8 @@ Four steps, in this order:
    into the handover's in-flight section. A B3 `unblock-low-risk` sub-agent cut off by the stop is
    not relaunched by a successor: its `record-launch` marker makes `check` report
    `already_attempted`. A handed-off B3 merge whose resume has not yet returned is different:
-   record its `{task_id, escalation_id, request_id, worktree}` in the In flight section, whether
+   record its `{task_id, escalation_id, request_id, worktree}`, plus `superseded_by` when the
+   hand-off carried one, in the In flight section, whether
    or not a resume-mode run was still polling at the stop. Step 3 of "Reading the predecessor's
    handover at launch" says what the successor does with it.
 2. **Write the handover** (see "The handover file (`l2-handover.md`)"). It goes before the release,
@@ -445,7 +447,7 @@ Never process L0 or L1 from this skill, even if explicitly asked — doing so wo
 
 ```bash
 cd $DARK_FACTORY_ROOT && scripts/watcher-rearm.sh \
-  --queue-dir <project_root>/data/escalations --level 2 --timeout 3600 [--baseline] 2>&1
+  --queue-dir <project_root>/data/escalations --level 2 --timeout 3600 [--baseline]
 ```
 
 Run as a **background task** (Bash with `run_in_background`). `scripts/watcher-rearm.sh` is the
@@ -462,7 +464,7 @@ re-finds it). The wrapper preserves the underlying watcher's exit code and emits
 |---|---|---|
 | `WATCHER_REARM_OUTCOME: FIRED` | 0 | A wake: loop back to re-arm, then drain (Main Loop). Exit 0 with EMPTY stdout is a caught SIGTERM (`scripts/watcher-rearm.sh` header), not a fire, and it counts against the cap. |
 | `WATCHER_REARM_OUTCOME: CEILING` | 124 | The hourly heartbeat: re-arm in the background as normal. The cap exempts it, because this lane's AFK loop runs on CEILING ticks for up to 48h. |
-| `WATCHER_REARM_OUTCOME: KILLED` | 137 / 143 / 144 | Never re-issue a killed FOREGROUND arm in the foreground: move to the `run_in_background` pattern. A BACKGROUND arm that died with no marker at ~2 min had no Bash `timeout` ("Diagnostic — watcher dies at ~2 minutes" below), and re-arming WITH it is a material change. Re-touch the `watcher-<project>` lease before assuming a second watcher is needed. Counts against the cap. |
+| `WATCHER_REARM_OUTCOME: KILLED` | 137 / 143 / 144 | Never re-issue a killed FOREGROUND arm in the foreground: move to the `run_in_background` pattern. A BACKGROUND arm the CLI stopped at its background time limit (its task notification says so) had no Bash `timeout`, or one shorter than the slice ("Diagnostic — an arm stopped from outside" below), and re-arming WITH it is a material change. Re-touch the `watcher-<project>` lease before assuming a second watcher is needed. Counts against the cap. |
 | `WATCHER_REARM_OUTCOME: ERROR` | any other; exit 2 prints NO marker | Diagnose from stderr before any retry. Exit 2 is a usage/guard error (unset `DARK_FACTORY_ROOT`, unresolved queue dir, bad flag): it returns before the watcher runs and recurs until fixed. Counts against the cap. |
 
 **Identical-retry cap: 1.** After KILLED, ERROR, a missing marker, an empty-stdout FIRED or a
@@ -488,26 +490,27 @@ here always means a drop. The line travels the watcher's logging stream, so it c
 level as a prefix (`ERROR: WATCHER_NTFY_OUTCOME: FAILED ...`) — match on the marker as a
 substring rather than anchoring at the start of the line.
 
-**Bash-tool timeout contract:** the wrapper blocks for up to `--timeout` seconds per slice before
-returning, and **every** call — background *and* foreground — must carry an explicit Bash-tool
-`timeout` parameter sized to at least `(--timeout + 60s) × 1000` ms — e.g. `timeout: 3660000` for
-`--timeout 3600`. `run_in_background: true` does **not** exempt a call from the harness timeout.
-With that parameter passed, use the long canonical slice: `--timeout 3600` yields at most one heartbeat wake per hour (`CEILING`) while a
-real L2 escalation still fires instantly via inotify. A short slice buys no protection — the old
-`--timeout 540` merely forced a wake-notify-rearm turn every 9 minutes. A slice that long requires
-`BASH_MAX_TIMEOUT_MS` ≥ that value in the settings env (dark-factory onboarding provisions it —
-see `skills/factory-init`). Only on a machine WITHOUT that setting does the harness's 600000ms
-(10 min) cap apply: there, cap the slice at `--timeout 540` and set the Bash tool's `timeout`
-**≥ 600000ms** so the slice can return before the harness kills it.
+**Bash-tool timeout contract:** the wrapper blocks for up to `--timeout` seconds per slice. Every
+call, background and foreground, carries an explicit Bash-tool `timeout` of at least
+`(--timeout + 60s) × 1000` ms, e.g. `timeout: 3660000` for `--timeout 3600`. For a background call
+that parameter is the CLI's background deadline, and at that limit the CLI stops the command.
+Without it the CLI applies its default background deadline (the Bash tool's description states the
+current default and maximum; on CLI 2.1.325 they are 1800000 ms and 7200000 ms), which stops a
+3600 s slice before it can return `CEILING`. Use the long canonical slice `--timeout 3600`: at most
+one heartbeat wake per hour (`CEILING`) while a real L2 escalation still fires at once via inotify.
+A short slice buys no protection. A FOREGROUND call (debugging only) is capped by
+`BASH_MAX_TIMEOUT_MS`, 600000 ms when unset (dark-factory onboarding raises it, see
+`skills/factory-init`); without that setting a foreground arm uses `--timeout 540` and a Bash
+`timeout` of at least 600000 ms.
 
-**Diagnostic — watcher dies at ~2 minutes with no outcome line:** if an arm disappears after
-roughly 120s and stderr carries **no** `WATCHER_REARM_OUTCOME` line, the Bash `timeout` parameter
-was omitted. The wrapper emits that line on every exit path including its own timeout, so its
-absence means the exit handler never ran — an external SIGKILL to the process group, not a wrapper
-or watcher fault (the 07-09 exit-143 failure mode the wrapper exists to bound; it cannot bound a
-kill of the whole group). This hides during a backlog drain, where every arm FIRES within seconds
-and finishes well inside the 120s window; the kills only start once the queue is fully triaged and
-the watcher genuinely waits, leaving a loop that looks armed but reaps itself every ~2 minutes.
+**Diagnostic — an arm stopped from outside:** the wrapper prints `WATCHER_REARM_OUTCOME` on every
+exit path it controls, including its own timeout, except the exit-2 guard error (the ERROR row
+above). So a missing line with any exit other than 2 means the process group was killed from
+outside (the 07-09 exit-143 failure mode the wrapper exists to bound; it cannot bound a kill of the
+whole group). When the CLI's task notification says the command was stopped at its
+background time limit, the Bash `timeout` was missing or shorter than the slice, whatever marker the
+wrapper printed: re-arm with `(--timeout + 60) × 1000` ms. This hides during a backlog drain, where
+every arm FIRES within seconds, and shows once the queue is triaged and the watcher genuinely waits.
 
 **Re-arming over deliberately-pending items:** any L2 item you deliberately left pending (Priority
 3b, `design_concern`, `risk_identified`, `infra_issue`, AFK leave-pending paths) sits in the queue
@@ -763,10 +766,22 @@ it, and the gate slug where one corresponds:
   does not qualify: a `milestone_gate` whose detail carries "This human gate files milestone_gate
   rather than review_due because …"
   (`orchestrator/src/orchestrator/review_due.py::ReviewDueWithheld.detail_line`: an invalid chain,
-  or a config without project_id or project_root) is asked like any other milestone gate. The
-  spawn itself is not a `spend_or_eval_launch`: the spawned skill confirms scope and cost with Leo
-  before any agent runs (`/review-all` today; `/review` and `/hotspot-survey` once their
+  or a config without project_id or project_root) is asked like any other milestone gate. A
+  `review_due` spawn is not a `spend_or_eval_launch`: the spawned skill confirms scope and cost
+  with Leo before any agent runs (`/review-all` today; `/review` and `/hotspot-survey` once their
   `--launched-from` go-gate lands, task 9446).
+  **Third exception:** a milestone gate whose task carries `metadata.x_preauthorised_spawn`
+  (Leo's pre-authorisation of that one gate's session) is handled under "Pre-authorised gate
+  spawn" below, which runs a fixed check and then spawns with no prior ask, attended or AFK. A
+  gate whose check fails is asked like any other milestone gate (Leo, 2026-11-12, S16 OQ-2,
+  residual R-5 2026-11-13: `plans/review-all-s16-orchestrator-config-shape-defaults-and-routing-prd.md`
+  §"Rulings (sitting of 2026-11-12)"; task 9712). A
+  gate that passes the check is not asked under any other class below because of what its task
+  description says. `orchestrator/src/orchestrator/deterministic_runner.py::build_gate_escalation_fields`
+  copies that description into the record's `detail`, but the description is the brief Leo ruled,
+  and the spawned session owns every scope, spend, config, bypass and host decision in it. The
+  pin-and-HOLD class still asks (`pin_declared_by` set, or a Leo HOLD on the record). It keys on
+  the record's state, not its description, and a later Leo signal outranks the pre-authorisation.
 - Spend or eval launch: dollars, budget, cap raise, calibration, tranche, cells, fable run
   (`spend_or_eval_launch`).
 - Physical or host actions: reboot, kernel modules, graphical session, `systemctl` restart or stop
@@ -1015,7 +1030,7 @@ python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py wri
   pipeline stall): task 4835 decided against exempting them, because the same-queue custody hold
   keys on stamp equality, so an unstamped sentinel later re-filed with a stamp would re-open a row
   an operator had dropped.
-  There is a third value the field can hold: `<unknown>` (`session_registry.UNKNOWN_QUEUE`) —
+  There is a third value the field can hold: `<unknown>` (`decision_registry.UNKNOWN_QUEUE`) —
   "this record's owning queue was investigated and could not be determined". You never write it —
   and that is now enforced, not just asked: `write-decision` **rejects**
   `--escalations-dir <unknown>` outright, because a record stamped that way is refused by *every*
@@ -1187,7 +1202,7 @@ Because no call can block >100 s, top-level submission is safe BY PROTOCOL.
    <!-- merge-state-vocab:end -->
    (`already_merged` is a *submit* status the server collapses to `done` when observed by
    polling — see step 1 and
-   `escalation/src/escalation/server.py::_map_terminal_state`.)
+   `escalation/src/escalation/merge_status_answer.py::map_terminal_state`.)
    After an orchestrator restart,
    `{state: 'unknown', hint: 'check git log main'}` → fall back to `git log main` (PRD I3).
 
@@ -1256,6 +1271,12 @@ switches on and off. Three behavioural shifts:
      busy-loop on it.
    - Either way, also **file a DecisionRecord via `write-decision`** (see "Filing Parked Decisions
      to the Cockpit Registry" below) for each item left pending — IN ADDITION to the digest entry.
+   - **One exception: a pre-authorised gate.** A milestone gate that passes the check in
+     "Pre-authorised gate spawn" is spawned in AFK posture exactly as when attended. Leo ruled the
+     session before he left, so the "needs a human in the session" premise does not hold for it.
+     Nothing else in this shift is relaxed: a gate that fails the check, or whose spawned session
+     has ended with the gate still pending, stays pending + digest + DecisionRecord like any other
+     item left pending (see "After the spawn" in "Pre-authorised gate spawn").
 
 3. **Batch into a digest, don't ping per-item.** Reminding "every 3-5 cycles" is noise when nobody is
    reading. Maintain a single rolling manifest at `<project_root>/data/escalations/afk-digest.md`
@@ -1445,21 +1466,26 @@ launch by `task_id` / background-task-id):
   pending, write only the digest line and file no DecisionRecord: whoever took the escalation
   owns it, and the merge carries on.
 - `outcome == "handed_off"`: neither a failure nor an abort. The merge `request_id` it returns
-  was picked up by the merge worker and is still live (merging or verifying); the sub-agent did
-  not cancel it, did not change the task status, and left the escalation pending. **Never
-  `merge_cancel` it**, and never submit another merge for that `task_id`: it is an in-flight
-  merge, so record its `{task_id, escalation_id, request_id}` per "Tracking in-flight merges". Launch
+  is either picked up by the merge worker and still live (merging or verifying), or, when the
+  result also carries `superseded_by`, superseded by a successor that has not resolved yet: an
+  `mr-*` generation advance or a `coalesce-*` train. Either way the sub-agent did not cancel
+  it, did not change the task status, and left the escalation pending. **Never
+  `merge_cancel` it**, and never submit another merge for that `task_id`, whichever shape it is:
+  it is an in-flight merge, so record its `{task_id, escalation_id, request_id}`, plus
+  `superseded_by` when present, per "Tracking in-flight merges". Launch
   `unblock-low-risk` again as a NON-INTERACTIVE background sub-agent in **resume mode**, exactly
   as B3 is launched above (`Agent` tool, general-purpose, `run_in_background: true`), pointing it
   at the "Resuming a handed-off merge (resume mode)" subsection of
   `skills/unblock-low-risk/SKILL.md` and passing `task_id`, `escalation_id`, `project_root`,
-  `worktree` and `request_id`. Do **not** run `b3_gate check` or `record-launch` for it: the slot
+  `worktree` and `request_id`, plus `superseded_by` when the result carried one. Do **not** run
+  `b3_gate check` or `record-launch` for it: the slot
   is already charged, and `check` would report `already_attempted`. Keep the `task_id` in flight
   until that run completes; its completion is handled by this same list. **Resume once per B3
   launch:** if a resume-mode run itself returns `handed_off` (its 3 h backstop expired with the
-  merge still live), do not resume again — leave the escalation pending, write the digest line,
-  and file a DecisionRecord via `write-decision` whose `--text` names the `request_id` and its
-  last state. Still never cancel. A resume-mode `merged` is handled by the `merged` bullet, and a
+  merge still live or its successor still unresolved), do not resume again — leave the
+  escalation pending, write the digest line, and file a DecisionRecord via `write-decision`
+  whose `--text` names the `request_id`, the `superseded_by` when present, and the last state.
+  Still never cancel. A resume-mode `merged` is handled by the `merged` bullet, and a
   resume-mode `aborted` by the `aborted` bullet, including its resume-mode exceptions.
 
 The sub-agent re-checks the gate defensively and refuses anything not unambiguously low-risk; treat
@@ -1482,6 +1508,9 @@ outcome ledger for AFK and attended modes alike; AFK shift 3 manages it):
 - **Drift-reinvestigated, relaunched**: `B3 <task_id> — drift re-investigated; re-gate: fresh → launched`
 - **Handed off**: `B3 <task_id> — handed off: <request_id> still <state> at the polling ceiling → resume launched`
 - **Resume backstop**: `B3 <task_id> — resume backstop: <request_id> still <state> → pending (not cancelled)`
+
+In both hand-off lines `<state>` is the live merge state, or `superseded by <superseded_by>` when
+the hand-off came from unblock-low-risk step 9's superseded arm.
 
 Every outcome above that left a decision open reaches the return brief through its DecisionRecord
 — that is every outcome except "Merged", a first "Handed off" (its resume is still running) and a
@@ -2144,6 +2173,106 @@ comes from `cd "$DARK_FACTORY_ROOT" && .venv/bin/python scripts/check_run_comple
   rather than review_due because …" (an invalid chain or an unusable config), is never spawned: it
   is asked like any other milestone gate, per "Always ask".
 
+### Pre-authorised gate spawn (`metadata.x_preauthorised_spawn`)
+
+A `milestone_gate` (filed by the deterministic runner) whose task Leo pre-authorised to run in its
+own session. The key is task metadata, read with `mcp__fused-memory__get_task`, never the
+escalation's summary or detail: `x_preauthorised_spawn = {ruled_by: 'human', ruled_on: '<date>',
+ruling_ref: '<repo path>::<section>', prompt_from: 'description'}`. A sentence in the gate's prose
+authorises nothing; only the key does (INV-11).
+
+**Spawned already?** Read the record with `mcp__escalation__get_escalation`. If its `triage_note`
+has a line starting `x_preauthorised_spawn_launched:`, a session was already spawned for this
+escalation, by this watcher session or an earlier one, compacted or not. Any other `stamp_triage`
+writer replaces the whole note and can drop that line, so two independent sources count too: a
+session-registry record under `~/.claude/fleet/sessions/` whose `escalation_id` field is this
+escalation's id, live or terminal (step 2 below stamps it), or an In flight paragraph in the
+predecessor's handover naming this escalation. Any one of the three means spawned already. Match
+the typed field, never the title: a title is per task, so a gate the runner re-files for the same
+task would read as spawned already. Never spawn again, whatever the check says; handle it under
+"After the spawn" below. This comes before the check so that durable records, not this session's
+memory, are what stop a second spawn: a compaction drops in-context state (see "AFK by silence" →
+"Measuring the silence").
+
+**The check.** Run it as code would; any failure means the gate is asked under "Always ask", and
+the digest names the failing line:
+1. `ruled_by` is exactly `human`, and `ruled_on` and `ruling_ref` are present.
+2. `prompt_from` is exactly `description`.
+3. `ruling_ref` opens: the repo path (relative to `$DARK_FACTORY_ROOT`, or this watcher's
+   `<project_root>`) exists, its `<section>` heading is in the file, and that section quotes the
+   ruling, meaning it records Leo's authorisation of this task's spawn. Read the section; an
+   absent file, absent heading or a section that does not mention the ruling fails.
+4. The task's description is non-empty.
+
+You judge nothing past the check. Whether the work is right, safe or worth doing is the spawned
+session's call. Nor does any other "Always ask" class bite on what the description asks for
+(budgets, timeouts, commits to a main). The third exception there says so and names the one class
+that still asks.
+
+**On a pass, in attended and AFK posture alike** (the one exception to AFK shift 2), in this order:
+1. **Stamp the marker first.** Call `stamp_triage(escalation_id=<id>,
+   triaged_by="escalation-watcher", triage_note=...)`, the identity this skill resolves with (see
+   "Two facts about attribution and timing"). Its `triage_note` is the existing note with one line
+   appended,
+   `x_preauthorised_spawn_launched: {"at": "<date -u +%FT%TZ>", "terminal_title": "<the title in step 2>"}`,
+   as one line of sorted JSON. `stamp_triage` replaces the whole note (see "CAUTION:
+   `stamp_triage` REPLACES `triage_note`, it never appends"), so build it the way
+   `scripts/sitting/payloads.py::append_markers` does: the existing note verbatim, then the line.
+   Stamp before spawning. A crash between the two then leaves a marked record with no session,
+   which "After the spawn" takes to Leo. It never leaves an unmarked session that a successor
+   would spawn twice. This is a marker line like `x_prepared`, not a shadow stamp: "Never stamp a
+   human-forever gate" governs `x_shadow_ruling:` lines only, and
+   `escalation/src/escalation/shadow_ruling.py` counts no other line. If `stamp_triage` returns
+   an error, no marker landed: do not spawn. Re-read the record and handle it under its new state.
+2. `/spawn` with `--prompt-file <abs-path>`, `terminal_title="gate:<project>#<task_id>
+   <short-slug>"`, `cwd=<project_root>`. The description is multi-paragraph and may hold single
+   quotes, so write the prompt to an absolute path outside the repo (`skills/spawn/SKILL.md`
+   §Arguments). The file holds the task's description verbatim, then one trailing line that only
+   identifies the gate, in the spirit of the "Additive-context convention for spawned `/unblock`
+   prompts": `(gate esc <escalation_id>, task <task_id>: on success resume this escalation with
+   resolve_issue(action='resume'); otherwise leave it pending at your escape row)`. The
+   description carries no handle on its own gate (it is filed before the escalation exists), and
+   two pre-authorised gates can be pending at once, so without that line the session would have
+   to guess which one to resume. Set three variables explicitly on the spawn, since
+   `skills/spawn/SKILL.md` says callers must set them on every spawn:
+   `CLAUDE_SPAWN_ESCALATION_ID=<escalation_id>` and `CLAUDE_SPAWN_TASK_ID=<task_id>`, which stamp
+   the registry record's `escalation_id` and `task_id` fields that "Spawned already?" and "After
+   the spawn" find it by; and `CLAUDE_SPAWN_SELF_EXIT=1`, so the session ends itself once its work
+   is done (on the T3 lane that is `CLAUDE_SPAWN_T3_END=archive`).
+3. Append `<esc-id>` to the exclude-file, so the next scan does not re-fire on the pending gate.
+4. Record the spawn in the digest: `afk-digest.md` when AFK, the brief's Standing footer when
+   attended. Name the escalation id, task id and `ruling_ref`. While the session runs, write no
+   "ask Leo" line and no DecisionRecord for it. In the sitting it is a `standing` of kind `owned`
+   (`scripts/sitting/preparation.py::STANDING_KINDS`), owner the spawn's registry slug, release
+   predicate `escalation_closed` on this escalation's id.
+5. At a stop, name it in the handover's In flight section, as its own paragraph: escalation id,
+   task id, the spawn's registry slug and its terminal title.
+
+**After the spawn.** Apply this each time the marked gate comes up in a drain. The session's
+record is the one under `~/.claude/fleet/sessions/` whose `escalation_id` is this escalation's
+id, else the slug the handover names, else the record whose `title` is the marker's
+`terminal_title`. The session has ended when any one of these holds:
+- its `/spawn` background task has completed (in this session);
+- its record reads a terminal status (`exited` or `failed-to-start`) or no longer exists;
+- its `result.md` carries a final outcome, anything but `in-progress`
+  (`orchestrator/src/orchestrator/session_registry.py::TERMINAL_RESULT_OUTCOMES`), even while its
+  process lives. `skills/review-all/scripts/program/watch_sessions.py::standing` names that state
+  `FINISHED_NOT_EXITED`. Self-exit acts only where its Stop hook is installed, and nobody types
+  `/exit` while AFK, so a finished session can sit idle in its window indefinitely.
+
+Until the session has ended, nothing is asked. If the gate is still pending once it has, read its
+`result.md` (see "Joining a completed spawn: read `result.md`, don't explore").
+`outcome: handed-off` means the gate is still owned: track the successor session named there as
+in flight (and in the handover's In flight section), and apply "After the spawn" again once that
+session has ended. Otherwise clear the standing first (re-record the item with `standing: null`, so it leaves
+the Standing footer), then ask Leo about the gate under "Always ask": a numbered brief line when
+attended; the digest plus a DecisionRecord via `write-decision` when AFK. Carry the session's
+stated escape reason (`action_needed`). An absent `result.md` says the session left no reason.
+Never spawn it again: a re-run is Leo's call.
+
+**Never resolve the gate.** The spawned session resumes it on success, or leaves it pending for
+Leo at its own escape row. A second spawn is ruled out under "Spawned already?".
+
 ### `milestone_check_stalled` (trigger chain, completion gate)
 
 Filed on a chain's completion gate when its predicate re-armed to its cap (the PRD's C1). Three
@@ -2628,15 +2757,35 @@ promoted L2 carries that value, never the `orchestrator-`-prefixed form. Seeing
 **Do not stand down, halt the watch loop, or treat it as an anomaly** — it is the same auto-watcher
 this skill hands L1 items off to, working as designed.
 
-Distinguish it from a **genuinely unknown resolver**: the same connection is capped at
-`X-Escalation-Levels: 0,1`, so the server rejects (`level_forbidden`, no state change) any attempt
-by that identity to `resolve_issue`/`park` a level-2 escalation. If you ever see
-`resolved_by="orchestrator-escalation-watcher-auto"` (or `agent_role="escalation-watcher-auto"`) on
-an L2 record's *own* resolution/park — as opposed to an L1 member cascade-resolved via
-`resolved_by='l2-cascade:<id>'`, or an L1/L0 admin item, or a `promote_to_l2` call — that should not
-be possible under the enforced guard, and is the actual anomaly worth reporting to the human
-(possible guard regression, bypassed connection headers, or a stale pre-guard orchestrator/server
-pair that hasn't been restarted onto the fix yet).
+Distinguish it from a **genuinely unknown resolver**. The same connection is capped at
+`X-Escalation-Levels: 0,1` (`escalation/src/escalation/authority.py::ROLE_LEVEL_ALLOWLIST`), with
+exactly one sanctioned exception above that ceiling: `resolve_issue(action='close_only')` on an L2,
+the task-2630 carve-out whose authority is `escalation/src/escalation/authority.py::L2_AUTO_CLOSE_ACTION`
+and `escalation/src/escalation/authority.py::l2_auto_close_class`. The classes it admits and the
+evidence each must quote are in `skills/escalation-watcher-auto/SKILL.md` §"Auto-closing a
+rubber-stamp L2". So `resolved_by="orchestrator-escalation-watcher-auto"` on an L2's own
+`close_only` that the carve-out admits (normally `resolution_class=benign`, with the class's
+evidence quoted in the resolution) is expected, rare, and **not** an anomaly: do not report it to
+the human as a guard regression.
+
+The anomaly worth reporting to the human is either of these on an L2 record's *own* resolution,
+as opposed to an L1 member cascade-resolved via `resolved_by='l2-cascade:<id>'`, an L1/L0 admin
+item, or a `promote_to_l2` call:
+
+- **Any other action by that identity** — `resume`, `restart`, `park` or `abandon`. The server
+  still rejects all four at L2 as `level_forbidden` with no state change, so one that landed should
+  not have.
+- **A `close_only` by that identity that
+  `escalation/src/escalation/authority.py::l2_auto_close_class` would not admit** — the server
+  answers that `level_forbidden` too, so one that landed should not have. Either the record is
+  denylisted (its category is in `escalation/src/escalation/authority.py::L2_AUTO_CLOSE_DENY_CATEGORIES`,
+  or its `agent_role` is in `escalation/src/escalation/authority.py::L2_AUTO_CLOSE_DENY_ROLES`: the
+  human-judgment gates the denylist exists to protect, checked before the allowlist), or it matches
+  none of the allowlisted classes, or its `resolution` does not quote the matched class's required
+  evidence, per `skills/escalation-watcher-auto/SKILL.md` §"Auto-closing a rubber-stamp L2".
+
+Possible causes: a guard regression, bypassed connection headers, or a stale pre-guard
+orchestrator/server pair that hasn't been restarted onto the fix yet.
 
 **Capped identity leaking into an interactive session:** if this session's own L2
 `resolve_issue`/`park` fails `level_forbidden`, the capped identity

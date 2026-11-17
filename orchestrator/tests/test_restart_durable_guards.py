@@ -377,7 +377,7 @@ def _merge_worker(project_root: Path | None, config):
     ``os.fspath()`` is repr-derived, so letting the attribute auto-spec would
     have the worker materialise a real ``MagicMock/`` tree the moment it
     persisted anything — the task-3223 incident conftest's
-    ``_no_mock_derived_stray_dirs`` fence exists for.
+    ``_df_no_mock_derived_stray_dirs`` fence exists for.
     """
     from orchestrator.merge_lane.types import TrainCallbacks
     from orchestrator.merge_lane.worker import SpeculativeMergeWorker

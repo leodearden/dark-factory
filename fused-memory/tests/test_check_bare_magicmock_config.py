@@ -634,7 +634,7 @@ class TestHooksIntegration:
         only asserts the gate block (selection through invocation, non-comment
         portions) actually expands that array.
         """
-        import re as _re  # noqa: PLC0415 — avoid polluting module namespace
+        import re as _re  # avoid polluting module namespace
 
         hooks_path = Path(__file__).parent.parent.parent / 'hooks' / 'project-checks'
         content = hooks_path.read_text(encoding='utf-8')
@@ -2012,7 +2012,6 @@ _EXPECTED_WALL_CLOCK_DEBT_PATHS = frozenset({
     'orchestrator/tests/test_merge_queue_verifier_raw_cancel.py',
     'orchestrator/tests/_task_verify_integration_rig.py',
     'orchestrator/tests/test_git_ops.py',
-    'orchestrator/tests/test_invoke.py',
     'orchestrator/tests/test_merge_queue_bounce.py',
     'orchestrator/tests/test_merge_queue_deep_landing.py',
     'orchestrator/tests/test_merge_queue_invariant_integration_gate.py',

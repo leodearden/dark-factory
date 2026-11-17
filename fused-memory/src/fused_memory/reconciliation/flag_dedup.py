@@ -2971,7 +2971,7 @@ async def _safe_get_task_or_none(
     which filter degraded.  WARN, not debug: a swallowed lookup error is a real
     degraded outcome and must be visible without raising the log level — a
     broad handler returning an empty value with NO ``WARN+`` log is signature
-    (b) of ``shared/tests/test_silent_fallthrough_gate.py``.
+    (b) of ``tests/repo_guards/test_silent_fallthrough_gate.py``.
 
     ``CancelledError`` / ``KeyboardInterrupt`` / ``SystemExit`` need no explicit
     re-raise clause: all three are ``BaseException`` subclasses, which a bare

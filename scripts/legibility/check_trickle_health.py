@@ -182,7 +182,7 @@ def _invoke(runner, project_id: str, **kwargs) -> tuple[bool, str]:
     cannot run is not a probe that passed."""
     try:
         returncode, output = runner(project_id, **kwargs)
-    except Exception as exc:  # noqa: BLE001 — deliberately total
+    except Exception as exc:  # deliberately total
         return False, (
             f'{type(exc).__name__}: probe runner raised ({exc}) — treated as '
             f'a FAILED probe, never as a pass'
@@ -457,7 +457,7 @@ def _load_config(*, config_path, project_id):
         return legibility_config.load_config(
             nightly.resolve_config_path(project_id)
         )
-    except Exception as exc:  # noqa: BLE001 — deliberately total
+    except Exception as exc:  # deliberately total
         logger.warning(
             'legibility trickle health: could not load config for project=%s '
             '(%s: %s); the verdict stands, the escalation is skipped',

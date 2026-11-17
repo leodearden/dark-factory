@@ -394,7 +394,7 @@ def repair_content(text: str | None) -> str | None:
         return text
     if classification in (REPAIRABLE_TAIL, REPAIRABLE_DUPLICATE):
         split = _split_at_leak(text)
-        assert split is not None  # noqa: S101 - guaranteed by the classification
+        assert split is not None  # guaranteed by the classification
         return split[0]
     return None
 
@@ -495,7 +495,7 @@ async def probe_delete_landed(
         )
     try:
         found = await getter(project_id=project_id, memory_id=memory_id)
-    except Exception as exc:  # noqa: BLE001 - the probe must never mask the delete error
+    except Exception as exc:  # the probe must never mask the delete error
         return None, (
             f'delete-landed probe FAILED ({type(exc).__name__}: {exc}); whether the '
             'point survived is unknown. The original delete error is preserved.'
@@ -843,7 +843,7 @@ async def run(args: Any, memory_service: Any, progress: dict | None = None) -> d
                     'human review.',
                     match.get('id'),
                 )
-        except Exception as exc:  # noqa: BLE001 - one bad record must not void the run
+        except Exception as exc:  # one bad record must not void the run
             # ONE rule, consulted rather than re-derived: _repair_record has
             # already settled whether this record's delete landed, so the
             # catch-all reads that field instead of writing record_error
@@ -989,7 +989,7 @@ async def _repair_record(
             store='mem0',
             project_id=args.project_id,
         )
-    except Exception as delete_exc:  # noqa: BLE001 - adjudicated, then reported
+    except Exception as delete_exc:  # adjudicated, then reported
         # A raised delete does NOT mean the point survived. mem0 removes the
         # Qdrant point BEFORE writing its SQLite history, so the measured
         # 7d073281 failure raised with the content already gone. Ask the store
@@ -1185,7 +1185,7 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.config:
-        import os  # noqa: PLC0415
+        import os
         os.environ['CONFIG_PATH'] = str(args.config)
 
     # Owned HERE, not inside run(), so the report survives an abort. For any
@@ -1195,17 +1195,12 @@ def main() -> int:
     progress = new_progress()
 
     async def _run_live() -> dict:
-        from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
-        from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+        from fused_memory.config.schema import FusedMemoryConfig
+        from fused_memory.maintenance._utils import maintenance_service
 
         config = FusedMemoryConfig()
-        memory = MemoryService(config)
-        try:
-            await memory.initialize()
+        async with maintenance_service(config=config) as (_, memory):
             return await run(args, memory, progress)
-        finally:
-            if hasattr(memory, 'close'):
-                await memory.close()
 
     exit_code = 0
     try:

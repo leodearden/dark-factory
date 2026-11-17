@@ -34,6 +34,7 @@ from _workflow_helpers import (
 from escalation.queue import EscalationQueue
 from shared.task_statuses import TaskStatus
 from shared.task_transitions import outcome_allows_status
+from shared.usage_gate import SessionBudgetExhausted
 
 from orchestrator import session_registry
 from orchestrator.agents.invoke import AgentResult
@@ -1483,7 +1484,7 @@ def _build_workflow_no_merge_worker(
     config: OrchestratorConfig,
     git_ops: GitOps,
     assignment: TaskAssignment,
-    agent_stub: AgentStub,  # noqa: ARG001
+    agent_stub: AgentStub,
     tmp_path: Path,
 ) -> tuple[TaskWorkflow, FakeScheduler, EscalationQueue]:
     """Thin delegate over `_build_workflow_with_escalation(spawn_merge_worker=False)`.
@@ -1510,13 +1511,13 @@ def _make_dismissing_steward(queue: EscalationQueue, task_id: str) -> type:
     from escalation.models import Escalation
 
     class _FakeSteward:
-        def __init__(self, wt_path, cfg_dir):  # noqa: ARG002
+        def __init__(self, wt_path, cfg_dir):
             self._outcome_channel = None
 
         def set_outcome_channel(self, channel) -> None:
             self._outcome_channel = channel
 
-        def set_wip_probe(self, probe) -> None:  # noqa: ARG002
+        def set_wip_probe(self, probe) -> None:
             pass
 
         async def start(self) -> None:
@@ -1577,13 +1578,13 @@ def _make_resolve_then_dismiss_chained_steward(
     from escalation.models import Escalation
 
     class _FakeSteward:
-        def __init__(self, wt_path, cfg_dir):  # noqa: ARG002
+        def __init__(self, wt_path, cfg_dir):
             self._outcome_channel = None
 
         def set_outcome_channel(self, channel) -> None:
             self._outcome_channel = channel
 
-        def set_wip_probe(self, probe) -> None:  # noqa: ARG002
+        def set_wip_probe(self, probe) -> None:
             pass
 
         async def start(self) -> None:
@@ -3098,7 +3099,7 @@ class TestMarkBlockedFalseDoneGuard:
         invocations: list[str] = []
 
         class _SpyStewardFactory:
-            def __call__(self, wt_path, cfg_dir):  # noqa: ARG002
+            def __call__(self, wt_path, cfg_dir):
                 invocations.append('init')
                 return _SpyStewardFactory.Steward()
 
@@ -5553,13 +5554,13 @@ def _make_l1_escalating_steward(
     """
 
     class _FakeSteward:
-        def __init__(self, wt_path, cfg_dir):  # noqa: ARG002
+        def __init__(self, wt_path, cfg_dir):
             self._outcome_channel = None
 
         def set_outcome_channel(self, channel) -> None:
             self._outcome_channel = channel
 
-        def set_wip_probe(self, probe) -> None:  # noqa: ARG002
+        def set_wip_probe(self, probe) -> None:
             pass
 
         async def start(self) -> None:
@@ -6802,8 +6803,6 @@ class TestSessionBudgetExhaustionEscalation:
         self, config, git_ops, task_assignment, monkeypatch, tmp_path
     ):
         """L1 escalation summary carries budget limit and cost-spent figures."""
-        from orchestrator.usage_gate import SessionBudgetExhausted
-
         stub = AgentStub()
         config.usage_cap.session_budget_usd = 0.10
         workflow, _, queue = _build_workflow_with_escalation(
@@ -6863,8 +6862,6 @@ class TestSessionBudgetExhaustionEscalation:
         Before step-4 impl, the detail defaults to the summary string (no separate
         detail is passed to _mark_blocked), so the metric-label assertions fail.
         """
-        from orchestrator.usage_gate import SessionBudgetExhausted
-
         stub = AgentStub()
         config.usage_cap.session_budget_usd = 0.10
         workflow, _, queue = _build_workflow_with_escalation(
@@ -6930,8 +6927,6 @@ class TestFirstInvocationBudgetExhaustion:
           (iii) detail contains 'last_completed_role=n/a'  (new label + default fallback)
           (iv)  summary contains 'last completed role: n/a'  (new summary wording)
         """
-        from orchestrator.usage_gate import SessionBudgetExhausted
-
         stub = AgentStub()
         config.usage_cap.session_budget_usd = 0.10
         workflow, _, queue = _build_workflow_with_escalation(
@@ -6991,13 +6986,13 @@ def _make_done_setting_steward(
     'done' is terminal, mirroring ``_make_status_setting_steward``.
     """
     class _FakeSteward:
-        def __init__(self, wt_path, cfg_dir):  # noqa: ARG002
+        def __init__(self, wt_path, cfg_dir):
             self._outcome_channel = None
 
         def set_outcome_channel(self, channel) -> None:
             self._outcome_channel = channel
 
-        def set_wip_probe(self, probe) -> None:  # noqa: ARG002
+        def set_wip_probe(self, probe) -> None:
             pass
 
         async def start(self) -> None:
@@ -8001,7 +7996,7 @@ class TestMergeRetryLoopSoftCancelExits:
 
         GREEN once step-2 lands (SOFT_CANCELLED enum + _handle_soft_cancel update).
         """
-        import logging as _logging  # noqa: PLC0415
+        import logging as _logging
 
         stub = AgentStub()
         workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
@@ -8071,9 +8066,9 @@ class TestMergeRetryLoopSoftCancelExits:
         RED before step-4 (loop retries on REQUEUED regardless of cancel_event).
         GREEN after step-4 (cancel re-check exits before "retrying merge" log).
         """
-        import logging as _logging  # noqa: PLC0415
+        import logging as _logging
 
-        from orchestrator.config import OrchestratorConfig  # noqa: PLC0415
+        from orchestrator.config import OrchestratorConfig
 
         # Use max_merge_retries=2 so the RED path exhausts in 2 iters, not 3.
         config_2 = OrchestratorConfig(
@@ -8147,7 +8142,7 @@ class TestDryRunUnblockE2EGuardOptOut:
 
     async def test_stub_raises_assertion_error_on_call(self):
         """Calling run_dry_run_unblock without opt-in raises a descriptive AssertionError."""
-        import orchestrator.workflow as _wf  # noqa: PLC0415
+        import orchestrator.workflow as _wf
 
         # The guard installs a synchronous stub (not a coroutine), so the call
         # raises AssertionError immediately.  Pin the marker name as the stable
@@ -8177,7 +8172,7 @@ class TestDryRunUnblockE2EGuardOptIn:
 
     async def test_async_mock_installed_when_marker_present(self):
         """run_dry_run_unblock is an AsyncMock when mocks_dry_run_unblock marker is set."""
-        import orchestrator.workflow as _wf  # noqa: PLC0415
+        import orchestrator.workflow as _wf
 
         assert isinstance(_wf.run_dry_run_unblock, AsyncMock), (
             f'Expected AsyncMock, got {type(_wf.run_dry_run_unblock)!r}'

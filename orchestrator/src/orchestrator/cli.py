@@ -53,8 +53,6 @@ if TYPE_CHECKING:
     from orchestrator.verify import VerifyResult
     from orchestrator.verify_runner import MergeVerifySpec
 
-load_dotenv()  # loads .env into os.environ (e.g. CLAUDE_OAUTH_TOKEN_A/B)
-
 LOG_FORMAT = '%(asctime)s %(levelname)-8s [%(name)s] %(message)s'
 DATE_FORMAT = '%Y-%m-%d %H:%M:%S'
 
@@ -216,7 +214,20 @@ def _make_cancel_handler(main_task, logger):
     return _cancel
 
 
-@click.group()
+def load_program_dotenv() -> None:
+    """Load .env into os.environ for a program run of the CLI; importing this module never does."""
+    load_dotenv()
+
+
+class _DotenvProgramGroup(click.Group):
+    """Root group that loads .env when run as a program (console script, python -m), never on import or CliRunner.invoke."""
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        load_program_dotenv()
+        return super().__call__(*args, **kwargs)
+
+
+@click.group(cls=_DotenvProgramGroup)
 @click.option('--verbose', is_flag=True, help='Enable debug logging')
 def main(verbose: bool):
     """Dark Factory agent orchestrator."""
@@ -397,18 +408,30 @@ def flake_ledger_cmd(config_path: Path | None):
 
     READ ONLY. This command opens no debt, files no task, resolves nothing and
     escalates nothing, and it will NOT create a ledger DB for a project that has
-    none — it reports the absence instead.
+    none — it reports the absence instead. It also reads each open row's owner
+    status live from fused-memory, and says READ FAILED when it cannot.
     """
     # Named flake_ledger_cmd so the function does not shadow the flake_ledger module.
     from orchestrator.flake_ledger import ledger_db_path
-    from orchestrator.flake_report import build_report, render_report
+    from orchestrator.flake_report import build_report, corroborate_owners, render_report
 
     try:
         config = load_config(config_path)
     except ConfigRequiredError as e:
         click.echo(f'Error: {e}', err=True)
         sys.exit(1)
-    click.echo(render_report(build_report(ledger_db_path(Path(config.project_root)))))
+
+    # Built only when there are owners to read, so an absent ledger never builds one.
+    async def read_statuses(ids: list[str]) -> tuple[dict[str, str], Exception | None]:
+        from orchestrator.chronic_flake import SchedulerChronicFlakeTaskClient
+        from orchestrator.scheduler import Scheduler
+
+        client = SchedulerChronicFlakeTaskClient(Scheduler(config), config.project_root)
+        return await client.get_statuses(ids)
+
+    report = build_report(ledger_db_path(Path(config.project_root)))
+    report = asyncio.run(corroborate_owners(report, read_statuses))
+    click.echo(render_report(report))
 
 
 @main.group('verify-cache')
@@ -636,7 +659,7 @@ def check_config(config_path: Path | None):
     # findings" rather than taking check-config down with it.
     try:
         findings = audit_census_ignore_entries(config_path)
-    except Exception as exc:  # noqa: BLE001 — reported, never swallowed
+    except Exception as exc:  # reported, never swallowed
         click.echo(f'WARNING: ignore-entry audit failed ({exc}) — skipped.', err=True)
         findings = []
 

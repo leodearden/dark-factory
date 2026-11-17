@@ -20,7 +20,7 @@ You are running an autonomous, fully non-interactive level-1 escalation handler.
 - **No merge-queue interaction.** Do not call merge-queue or git-merge tools. This skill never submits to the merge queue — no `merge_request` call exists anywhere in this flow and none may be added; if merge interaction is ever introduced, it must use the bounded submit→poll protocol (explicit `wait_secs`, `merge_status` polling — see `skills/escalation-watcher/SKILL.md` §"Merge Submissions — Bounded Submit, Then Poll").
 - **No infra commands.** Do not issue infrastructure commands (docker, systemctl, kill, etc.).
 - **No recovery ref-moves.** NEVER perform red-on-main recovery ref-moves — no `git reset`, `git update-ref refs/heads/main`, or any other direct ref mutation. When main is RED and a recovery ref-move is required, PROMOTE to L2 so the human-driven escalation-watcher can execute the enforce-safe recovery procedure (`skills/escalation-watcher/SKILL.md §"Red-on-main recovery"`). This invariant applies even if a recovery SHA is known — the auto-watcher is read-only and has no sanctioned path to move the main ref.
-- **`resolve_issue` on level ≥ 2 is forbidden, with one narrow, evidence-gated exception.** This was always the contract, and the escalation server **enforces** it structurally (`plans/escalation-connection-capability-guard-prd.md`, narrowed by task 2630's carve-out — `escalation.authority.l2_auto_close_class`): this watcher's supervised MCP connection carries `X-Escalation-Levels: 0,1`, so `resume` / `restart` / `park` / `abandon` against a level-2 escalation are **always** rejected server-side with `{'error': ..., 'code': 'level_forbidden'}` and make **no** state change — that part of the contract is unchanged and cannot succeed. The one exception: `resolve_issue(action='close_only')` on an L2 record now **succeeds** when (a) the record matches one of three allowlisted classes AND (b) your `resolution` text quotes that class's required evidence verbatim — see [Auto-closing a rubber-stamp L2](#auto-closing-a-rubber-stamp-l2-narrow-close_only-carve-out) below for the classes, evidence, and the NEVER-allowed set (`design_concern` / `milestone_gate` categories, and any record filed by `orchestrator-deterministic` — the born-at-L2 human-gate sentinel role covering deterministic `always_escalates` / operator / acceptance / milestone-predicate gates — are **never** auto-closable, checked before the allowlist). Every other action at L2, and any L2 record outside the three classes or missing its evidence, still returns `level_forbidden` exactly as before. Resolve L0/L1 admin-class items directly; promote judgement-class and L2-bound items via `promote_to_l2` (which is exempt from the level gate); leave every other L2 pending for the human. The same connection carries `X-Escalation-Identity: orchestrator-escalation-watcher-auto`, which the server stamps onto the archived record's `resolved_by` for every permitted `resolve`/`park`/auto-close — server-attributed and non-spoofable, regardless of the `resolved_by="escalation-watcher-auto"` tool argument used in the call-shape examples throughout this skill.
+- **`resolve_issue` on level ≥ 2 is forbidden, with one narrow, evidence-gated exception.** This was always the contract, and the escalation server **enforces** it structurally (`plans/escalation-connection-capability-guard-prd.md`, narrowed by task 2630's carve-out — `escalation.authority.l2_auto_close_class`): this watcher's supervised MCP connection carries `X-Escalation-Levels: 0,1`, so `resume` / `restart` / `park` / `abandon` against a level-2 escalation are **always** rejected server-side with `{'error': ..., 'code': 'level_forbidden'}` and make **no** state change — that part of the contract is unchanged and cannot succeed. The one exception: `resolve_issue(action='close_only')` on an L2 record now **succeeds** when (a) the record matches one of three allowlisted classes AND (b) your `resolution` text quotes that class's required evidence verbatim — see [Auto-closing a rubber-stamp L2](#auto-closing-a-rubber-stamp-l2-narrow-close_only-carve-out) below for the classes, evidence, and the NEVER-allowed set (every born-at-L2 human-judgment category in `escalation/src/escalation/authority.py::L2_AUTO_CLOSE_DENY_CATEGORIES`, and any record whose `agent_role` is in `escalation/src/escalation/authority.py::L2_AUTO_CLOSE_DENY_ROLES` — e.g. `orchestrator-deterministic`, the born-at-L2 human-gate sentinel role covering deterministic `always_escalates` / operator / acceptance / milestone-predicate gates — are **never** auto-closable, checked before the allowlist). Every other action at L2, and any L2 record outside the three classes or missing its evidence, still returns `level_forbidden` exactly as before. Resolve L0/L1 admin-class items directly; promote judgement-class and L2-bound items via `promote_to_l2` (which is exempt from the level gate); leave every other L2 pending for the human. The same connection carries `X-Escalation-Identity: orchestrator-escalation-watcher-auto`, which the server stamps onto the archived record's `resolved_by` for every permitted `resolve`/`park`/auto-close — server-attributed and non-spoofable, regardless of the `resolved_by="escalation-watcher-auto"` tool argument used in the call-shape examples throughout this skill.
 
 When in doubt, **promote the escalation to L2** (see [Promote to L2](#promote-to-l2)). Every L1 you assess ends resolved, filed-and-resolved or promoted — never parked. [Terminal dispositions](#terminal-dispositions--never-park) is the single statement of this rule and of its exceptions; read it before leaving any L1 pending.
 
@@ -320,7 +320,7 @@ Why this exists: on 2026-08-08 an L2 cascade close of the homogeneous 11-member 
 
 ### Auto-closing a rubber-stamp L2 (narrow close_only carve-out)
 
-The server carves out one narrow exception to the level-2 authority boundary described in [Hard Constraints](#hard-constraints--never-violate) (task 2630, `escalation.authority.l2_auto_close_class`): `resolve_issue(action='close_only')` on an L2 record succeeds when the record matches one of three allowlisted classes **and** your `resolution` text quotes that class's required evidence. This exists to stop the human from rubber-stamping closes you already pre-triaged — trace analysis found roughly 45% of human `resolve_issue` clicks were exactly that, and recommendations were rotting while pending (one RCA was 21h stale by the time it was closed). It changes **nothing** else: `resume` / `restart` / `park` / `abandon` at L2 are still always `level_forbidden`, and `design_concern` / `milestone_gate` categories and any record filed by `orchestrator-deterministic` (the born-at-L2 human-gate sentinel — deterministic `always_escalates`, operator/acceptance gates, milestone-predicate gates) are **NEVER** auto-closable no matter how good the evidence looks — the server checks this denylist before the allowlist.
+The server carves out one narrow exception to the level-2 authority boundary described in [Hard Constraints](#hard-constraints--never-violate) (task 2630, `escalation.authority.l2_auto_close_class`): `resolve_issue(action='close_only')` on an L2 record succeeds when the record matches one of three allowlisted classes **and** your `resolution` text quotes that class's required evidence. This exists to stop the human from rubber-stamping closes you already pre-triaged — trace analysis found roughly 45% of human `resolve_issue` clicks were exactly that, and recommendations were rotting while pending (one RCA was 21h stale by the time it was closed). It changes **nothing** else: `resume` / `restart` / `park` / `abandon` at L2 are still always `level_forbidden`, and every category in `escalation/src/escalation/authority.py::L2_AUTO_CLOSE_DENY_CATEGORIES` (the born-at-L2 human-judgment categories) and any record whose `agent_role` is in `escalation/src/escalation/authority.py::L2_AUTO_CLOSE_DENY_ROLES` (e.g. `orchestrator-deterministic`, the born-at-L2 human-gate sentinel — deterministic `always_escalates`, operator/acceptance gates, milestone-predicate gates) are **NEVER** auto-closable no matter how good the evidence looks — the server checks this denylist before the allowlist.
 
 The three classes, and the evidence each requires you to **quote verbatim in `resolution`** (the server only checks that the text is present — it trusts you to have actually verified it, since it cannot itself run git or probe infra):
 
@@ -1076,6 +1076,20 @@ category. If `disposition == "integration_skew"`:
   main" path above; `branch_bug` and `indeterminate` are handled exactly as before
   (no disposition-specific change).
 
+**A block reason starting `Plan files not touched by branch` is a claim about a
+measured range: check that the range measured this task before promoting.** Run
+`git rev-list --count <own-work base>..<branch>` and
+`git diff --name-only <own-work base>..<branch>`, where the own-work base is
+`git merge-base <branch> main`. A PARTIAL not-touched list is a suspected
+mis-measurement, not evidence of partial delivery. Also check for sibling refs
+`task/<id>-*` that carry the declared work, a rebase in progress in the worktree,
+and uncommitted edits to the declared files. One exception for sibling refs: a
+ref is NOT where the work lives when the task's `metadata.recut_executed` names
+it as `parked_branch`, or when its tip predates `recut_executed.executed_at`.
+Such a ref is the prior incarnation a human re-cut ruling forbids resuming, and
+does not count. While any of those conditions holds, never offer "restart the
+task" as an option.
+
 1. Fetch the current proposal (if any):
    ```python
    task = mcp__fused-memory__get_task(id=<task_id>, project_root=<project_root>)
@@ -1100,6 +1114,30 @@ category. If `disposition == "integration_skew"`:
    )
    ```
 4. Add to digest: `PROMOTED (L2 <id>): task_failure — <task_id> — <summary>` (include proposal snippet if present)
+
+#### `plan_delivery_unmeasured`
+
+**Producer.** `orchestrator/src/orchestrator/workflow.py::TaskWorkflow._block_if_delivery_unmeasured`
+blocks the task when the pre-merge plan-files gate failed on a range that never
+measured the task's own work, as found by
+`merge_lane/unmeasured_delivery.py::diagnose_unmeasured_branch` (causes inside the
+worktree) or `merge_lane/unmeasured_delivery.py::find_work_on_sibling_ref` (work on
+a sibling ref, for a task branch with no commit of its own). The reason starts
+`Plan-file delivery not measured` and names the cause and its remedy
+(`merge_lane/unmeasured_delivery.py::UnmeasuredCause`): an unreadable history
+(`retry_merge`), a stopped rebase, merge, cherry-pick or revert
+(`finish_or_abort_operation`), uncommitted declared edits (`commit_worktree_edits`),
+or the work on a sibling ref (`recover_work_from_sibling_ref`). The record's `suggested_action` carries the same
+value. [Promote](#promote-to-l2) with `category="plan_delivery_unmeasured"` and the
+reason's remedy as option A. Never offer "restart the task" or "narrow the plan": nothing was
+measured, so neither is supported by evidence.
+
+Before promoting `recover_work_from_sibling_ref` as option A, confirm the named ref
+is not superseded by an executed re-cut ruling (the rule's home is
+`orchestrator/src/orchestrator/recut_ruling.py::RecutSupersession`; read the task's
+`metadata.recut_executed`). If it is superseded, the finding is a defect: promote
+WITHOUT the recover option and let the ruling decide. A restart may then be the
+right option.
 
 #### `workflow_exit_contract`
 

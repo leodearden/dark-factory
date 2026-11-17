@@ -137,7 +137,7 @@ class TestTheScriptIsLoadedOnceNotReExecuted:
     """
 
     def test_the_script_is_loaded_once_not_re_executed(self):
-        import sys  # noqa: PLC0415
+        import sys
 
         first = _load_module()
         second = _load_module()
@@ -543,7 +543,7 @@ class TestFetchCacheRoundTrip:
         doc['arms']['c_peers']['queries']['q1'].append(['rec-nope', 0.1])
         path.write_text(json.dumps(doc), encoding='utf-8')
 
-        with pytest.raises(Exception) as excinfo:  # noqa: PT011 — typed in step-3
+        with pytest.raises(Exception) as excinfo:  # typed in step-3
             mod.load_fetches(path, {'c_peers': seeded})
         assert 'rec-nope' in str(excinfo.value)
 
@@ -1310,8 +1310,8 @@ def _install_driver_doubles(monkeypatch):
     ``drop_collections`` is patched on the script itself because it is the
     script's own qdrant seam.
     """
-    import fused_memory.config.schema as schema_mod  # noqa: PLC0415
-    import fused_memory.services.memory_service as service_mod  # noqa: PLC0415
+    import fused_memory.config.schema as schema_mod
+    import fused_memory.services.memory_service as service_mod
 
     _FakeMemoryService.instances = []
     monkeypatch.setattr(schema_mod, 'FusedMemoryConfig', _driver_config)
@@ -1802,7 +1802,7 @@ def test_a_live_dump_replays_offline_and_agrees_cell_for_cell(
     Deliberately NOT asserting any metric VALUE (G6): what is pinned is that
     live and replayed agree, and that the replay acquired nothing.
     """
-    from qdrant_client import QdrantClient  # noqa: PLC0415
+    from qdrant_client import QdrantClient
 
     mod = _mod()
     cache = tmp_path / 'live_cache.json'
@@ -1830,7 +1830,7 @@ def test_a_live_dump_replays_offline_and_agrees_cell_for_cell(
     assert surviving.isdisjoint(collections)
 
     # Now booby-trap every seam the live path reached through, and replay.
-    import fused_memory.services.memory_service as service_mod  # noqa: PLC0415
+    import fused_memory.services.memory_service as service_mod
 
     monkeypatch.setattr(service_mod, 'MemoryService', _RefusesToBeConstructed)
     dropped = _DropRecorder()

@@ -225,7 +225,7 @@ class TestFindNearDuplicateMemoryGroupsDeterminism:
         assert [m['id'] for m in memories] == original_order
 
     def test_result_is_deterministic_regardless_of_input_order(self):
-        import random  # noqa: PLC0415
+        import random
 
         memories = [
             _memory('m1', _VENV_GOTCHA_A),
@@ -681,7 +681,7 @@ class TestFetchProceduralMemoriesCallShape:
     """scroll_by_metadata is called with the category filter and scan_limit."""
 
     async def test_called_with_category_filter_and_scan_limit(self):
-        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock, MagicMock
 
         memory = MagicMock()
         memory.mem0 = MagicMock()
@@ -701,7 +701,7 @@ class TestFetchProceduralMemoriesNormalization:
     """Raw records are normalized to {'id','content','created_at','metadata'}."""
 
     async def test_content_extracted_from_memory_key(self):
-        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock, MagicMock
 
         raw = [_raw_record(
             'm1', '2026-07-12T00:00:00+00:00',
@@ -722,7 +722,7 @@ class TestFetchProceduralMemoriesNormalization:
         }]
 
     async def test_content_extracted_from_data_key(self):
-        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock, MagicMock
 
         raw = [_raw_record('m2', None, {'data': 'gotcha text v2'})]
         memory = MagicMock()
@@ -741,7 +741,7 @@ class TestFetchProceduralMemoriesNormalization:
         # metadata.get('data')); 'memory' is a search-result-layer key
         # (MemoryResult.content) that can appear stale on a scroll payload.
         # When both are present on the same payload, 'data' must win.
-        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock, MagicMock
 
         raw = [_raw_record(
             'm5', '2026-07-12T00:00:00+00:00',
@@ -765,7 +765,7 @@ class TestFetchProceduralMemoriesSafeDegradation:
     """A record with no extractable content normalizes to content=''."""
 
     async def test_no_extractable_content_degrades_to_empty_string(self):
-        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock, MagicMock
 
         raw = [_raw_record('m3', '2026-07-12T00:00:00+00:00', {'unrelated_field': 'x'})]
         memory = MagicMock()
@@ -782,7 +782,7 @@ class TestFetchProceduralMemoriesEmptyScan:
     """An empty/[] scan returns []."""
 
     async def test_empty_scan_returns_empty_list(self):
-        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock, MagicMock
 
         memory = MagicMock()
         memory.mem0 = MagicMock()
@@ -804,7 +804,7 @@ class TestFetchToSweepPlanIntegration:
     sweep a silent no-op in production."""
 
     async def test_fetched_records_cluster_and_report(self):
-        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock, MagicMock
 
         # scroll_by_metadata-shaped raw records: category lives inside the
         # payload ('metadata'), NOT at the top level — the shape the real
@@ -837,7 +837,7 @@ class TestFetchToSweepPlanIntegration:
         assert set(plan['delete_candidates']) == {'m2', 'm3'}
 
     async def test_fetched_unextractable_content_not_deleted(self):
-        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock, MagicMock
 
         # Two records whose content cannot be extracted degrade to '' and must
         # not cluster with each other (or be marked for deletion).
@@ -871,7 +871,7 @@ class TestApplyDeletionsDryRun:
     """dry_run=True performs no delete_memory calls and returns zero counts."""
 
     async def test_dry_run_no_calls_zero_counts(self):
-        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock, MagicMock
 
         memory = MagicMock()
         memory.delete_memory = AsyncMock(return_value={'status': 'deleted'})
@@ -888,7 +888,7 @@ class TestApplyDeletionsApply:
     """dry_run=False deletes each candidate once with the expected kwargs."""
 
     async def test_delete_memory_called_once_per_candidate(self):
-        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock, MagicMock
 
         memory = MagicMock()
         memory.delete_memory = AsyncMock(return_value={'status': 'deleted'})
@@ -900,7 +900,7 @@ class TestApplyDeletionsApply:
         assert result == {'deleted': 3, 'delete_errors': 0}
 
     async def test_delete_memory_called_with_expected_kwargs(self):
-        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock, MagicMock
 
         memory = MagicMock()
         memory.delete_memory = AsyncMock(return_value={'status': 'deleted'})
@@ -918,7 +918,7 @@ class TestApplyDeletionsPartialFailure:
     """A raising delete_memory call does not abort the remaining deletes."""
 
     async def test_partial_failure_counted_others_proceed(self):
-        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock, MagicMock
 
         async def _side_effect(memory_id, **kwargs):
             if memory_id == 'bad':
@@ -1325,7 +1325,7 @@ def _calibrated_ann_threshold() -> float:
     and it is the single home for that number — the detector reads the same
     one. Re-deriving or hardcoding it here would let the two drift apart.
     """
-    import yaml  # noqa: PLC0415
+    import yaml
 
     config_path = Path(__file__).parent.parent / 'config' / 'config.yaml'
     data = yaml.safe_load(config_path.read_text())
@@ -1352,7 +1352,7 @@ class TestAnnPathCatchesParaphraseLexicalPathMisses:
         If someone edits either fixture record, this fails loudly instead of
         letting the recorded cosine silently describe different text.
         """
-        import difflib  # noqa: PLC0415
+        import difflib
 
         a, b = _load_fixture_pair()
         live_raw = difflib.SequenceMatcher(None, a['content'], b['content']).ratio()
@@ -1641,7 +1641,7 @@ _OS = 'observations_and_summaries'
 
 def _scroll_mock(by_category: dict[str, list[dict]]):
     """AsyncMock scroll_by_metadata dispatching on the filter's category."""
-    from unittest.mock import AsyncMock  # noqa: PLC0415
+    from unittest.mock import AsyncMock
 
     async def _scroll(scope, filters, limit=1000, **kwargs):
         return list(by_category.get(filters.get('category'), []))
@@ -1659,7 +1659,7 @@ class TestFetchMemoriesAllCategories:
     """
 
     async def test_one_scroll_per_category_with_vectors_forwarded(self):
-        from unittest.mock import MagicMock  # noqa: PLC0415
+        from unittest.mock import MagicMock
 
         memory = MagicMock()
         memory.mem0 = MagicMock()
@@ -1680,7 +1680,7 @@ class TestFetchMemoriesAllCategories:
         assert seen == [_PK, _PN, _OS]
 
     async def test_default_categories_are_the_three_mem0_categories(self):
-        from unittest.mock import MagicMock  # noqa: PLC0415
+        from unittest.mock import MagicMock
 
         memory = MagicMock()
         memory.mem0 = MagicMock()
@@ -1695,7 +1695,7 @@ class TestFetchMemoriesAllCategories:
         assert set(_ALL_CATEGORIES) == {_PK, _PN, _OS}
 
     async def test_merges_records_and_lifts_category_and_vector(self):
-        from unittest.mock import MagicMock  # noqa: PLC0415
+        from unittest.mock import MagicMock
 
         memory = MagicMock()
         memory.mem0 = MagicMock()
@@ -1723,7 +1723,7 @@ class TestFetchMemoriesAllCategories:
 
     async def test_per_category_truncation_is_counted_separately(self):
         """A cap firing on ONE category must not be reported as a clean scan."""
-        from unittest.mock import MagicMock  # noqa: PLC0415
+        from unittest.mock import MagicMock
 
         memory = MagicMock()
         memory.mem0 = MagicMock()
@@ -1744,7 +1744,7 @@ class TestFetchMemoriesAllCategories:
 
     async def test_fetch_procedural_memories_alias_still_single_category(self):
         """The 3136-scheduled path keeps working byte-for-byte."""
-        from unittest.mock import MagicMock  # noqa: PLC0415
+        from unittest.mock import MagicMock
 
         memory = MagicMock()
         memory.mem0 = MagicMock()
@@ -2342,7 +2342,7 @@ class TestLexicalMaxRatioReuseAndBound:
 
     def test_reported_ratio_matches_an_exhaustive_recomputation(self):
         """The prefilter + seeded maximum must not change the answer."""
-        import difflib  # noqa: PLC0415
+        import difflib
 
         memories = [
             _memory('m1', _VENV_GOTCHA_A, created_at='2026-01-01T00:00:00+00:00'),
@@ -2426,7 +2426,7 @@ def _config_double(t_high, t_high_by_category=_UNSET):
     the junk leaf the resolver's isinstance guard has to reject. Every test
     that does not name a map therefore also exercises that rejection.
     """
-    from unittest.mock import MagicMock  # noqa: PLC0415
+    from unittest.mock import MagicMock
 
     service = MagicMock()
     service.config.write_triage.t_high = t_high
@@ -2513,7 +2513,7 @@ class TestResolveAnnThreshold:
         silently mis-cluster the corpus, and under --apply that means wrong
         deletions. Disabled-and-counted is the loud degradation.
         """
-        import logging  # noqa: PLC0415
+        import logging
 
         with caplog.at_level(logging.ERROR, logger='audit_duplicate_memories'):
             resolved, disclosure = resolve_ann_threshold(
@@ -2537,7 +2537,7 @@ class TestResolveAnnThreshold:
         silently missing detector this module forbids. It also has to agree
         with build_sweep_plan's default for the same argument.
         """
-        import inspect  # noqa: PLC0415
+        import inspect
 
         service = _config_double(0.4242424242, None)
         resolved, disclosure = resolve_ann_threshold(service)
@@ -2568,7 +2568,7 @@ class TestResolveAnnThreshold:
         measured cutoff still runs and the other is simply not in the mapping
         — never a guessed stand-in, and never silently blended in.
         """
-        import logging  # noqa: PLC0415
+        import logging
 
         with caplog.at_level(logging.ERROR, logger='audit_duplicate_memories'):
             resolved, disclosure = resolve_ann_threshold(
@@ -2593,7 +2593,7 @@ class TestResolveAnnThreshold:
 
     def test_pooled_fallback_is_warned_by_name(self, caplog):
         """The weaker evidence is named in the log, not just tallied."""
-        import logging  # noqa: PLC0415
+        import logging
 
         with caplog.at_level(logging.WARNING, logger='audit_duplicate_memories'):
             resolve_ann_threshold(
@@ -2727,7 +2727,7 @@ class TestCategoriesWithoutOwnCutoff:
         the config. Widening this predicate to a bare ``is not None`` would
         fence every category on a value that never gated anything.
         """
-        from unittest.mock import MagicMock  # noqa: PLC0415
+        from unittest.mock import MagicMock
 
         for not_an_override in (None, True, False, MagicMock().unspecced_attr):
             unevidenced = categories_without_own_cutoff(
@@ -2757,7 +2757,7 @@ class TestCategoriesWithoutOwnCutoff:
         deletion. That is the two readers of one config disagreeing, which is
         the whole reason `_write_triage_cutoffs` is a single function.
         """
-        from unittest.mock import MagicMock  # noqa: PLC0415
+        from unittest.mock import MagicMock
 
         for junk in ('0.9', True, False, object(), None, MagicMock().unspecced_attr):
             service = _config_double(0.42, {_PK: junk})
@@ -2794,7 +2794,7 @@ class TestFetchAnnNeighbors:
     """query_points once per record, using the record's OWN stored vector."""
 
     def _memory_service(self, query_points):
-        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock, MagicMock
 
         client = MagicMock()
         client.query_points = query_points
@@ -2804,7 +2804,7 @@ class TestFetchAnnNeighbors:
         return service, client
 
     def _points(self, hits):
-        from unittest.mock import MagicMock  # noqa: PLC0415
+        from unittest.mock import MagicMock
 
         result = MagicMock()
         result.points = [
@@ -2813,7 +2813,7 @@ class TestFetchAnnNeighbors:
         return result
 
     async def test_queries_once_per_record_with_its_own_vector(self):
-        from unittest.mock import AsyncMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock
 
         query_points = AsyncMock(return_value=self._points([]))
         service, _client = self._memory_service(query_points)
@@ -2838,7 +2838,7 @@ class TestFetchAnnNeighbors:
         assert first['with_payload'] is False
 
     async def test_self_hit_is_dropped(self):
-        from unittest.mock import AsyncMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock
 
         query_points = AsyncMock(return_value=self._points([('a', 1.0), ('b', 0.93)]))
         service, _client = self._memory_service(query_points)
@@ -2851,7 +2851,7 @@ class TestFetchAnnNeighbors:
         assert neighbors['a'] == [{'id': 'b', 'score': 0.93}]
 
     async def test_vectorless_record_is_not_queried(self):
-        from unittest.mock import AsyncMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock
 
         query_points = AsyncMock(return_value=self._points([]))
         service, _client = self._memory_service(query_points)
@@ -2865,7 +2865,7 @@ class TestFetchAnnNeighbors:
 
     async def test_per_record_failure_is_counted_and_does_not_abort(self):
         """One bad record must not lose the whole sweep."""
-        from unittest.mock import AsyncMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock
 
         async def _side_effect(**kwargs):
             if kwargs['query'] == [0.1]:
@@ -2885,7 +2885,7 @@ class TestFetchAnnNeighbors:
         assert neighbors['b'] == [{'id': 'c', 'score': 0.95}], 'the sweep continued'
 
     async def test_empty_records_makes_no_queries(self):
-        from unittest.mock import AsyncMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock
 
         query_points = AsyncMock(return_value=self._points([]))
         service, _client = self._memory_service(query_points)
@@ -2911,7 +2911,7 @@ class TestFetchAnnNeighborsCategoryFilter:
     """
 
     def _service(self, query_points):
-        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock, MagicMock
 
         client = MagicMock()
         client.query_points = query_points
@@ -2924,9 +2924,9 @@ class TestFetchAnnNeighborsCategoryFilter:
         return types.SimpleNamespace(points=[])
 
     async def test_the_records_category_becomes_a_payload_equality_filter(self):
-        from unittest.mock import AsyncMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock
 
-        from qdrant_client.http import models as qmodels  # noqa: PLC0415
+        from qdrant_client.http import models as qmodels
 
         query_points = AsyncMock(return_value=self._empty())
         records = [{'id': 'a', 'vector': [0.1], 'category': _PK}]
@@ -2943,7 +2943,7 @@ class TestFetchAnnNeighborsCategoryFilter:
         ), 'same Filter/FieldCondition/MatchValue shape scroll_by_metadata builds'
 
     async def test_each_record_is_filtered_to_its_own_category(self):
-        from unittest.mock import AsyncMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock
 
         query_points = AsyncMock(return_value=self._empty())
         records = [
@@ -2964,7 +2964,7 @@ class TestFetchAnnNeighborsCategoryFilter:
 
     async def test_a_categoryless_record_is_queried_unfiltered(self):
         """It cannot be clustered at all, so the query shape is unchanged."""
-        from unittest.mock import AsyncMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock
 
         query_points = AsyncMock(return_value=self._empty())
         records = [{'id': 'a', 'vector': [0.1]}]
@@ -2988,7 +2988,7 @@ class TestFetchAnnNeighborsSkipsUncalibratedCategories:
     """
 
     def _service(self, query_points):
-        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock, MagicMock
 
         client = MagicMock()
         client.query_points = query_points
@@ -3011,7 +3011,7 @@ class TestFetchAnnNeighborsSkipsUncalibratedCategories:
         )
 
     async def test_only_calibrated_categories_are_queried(self):
-        from unittest.mock import AsyncMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock
 
         query_points = AsyncMock(return_value=types.SimpleNamespace(points=[]))
 
@@ -3026,7 +3026,7 @@ class TestFetchAnnNeighborsSkipsUncalibratedCategories:
         )
 
     async def test_the_skip_is_disclosed_and_the_counter_is_always_present(self):
-        from unittest.mock import AsyncMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock
 
         query_points = AsyncMock(return_value=types.SimpleNamespace(points=[]))
 
@@ -3040,7 +3040,7 @@ class TestFetchAnnNeighborsSkipsUncalibratedCategories:
             assert all(isinstance(v, int) for v in disclosure.values())
 
     async def test_no_mapping_keeps_the_pre_3357_behaviour(self):
-        from unittest.mock import AsyncMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock
 
         query_points = AsyncMock(return_value=types.SimpleNamespace(points=[]))
 
@@ -3050,7 +3050,7 @@ class TestFetchAnnNeighborsSkipsUncalibratedCategories:
         assert disclosure['ann_query_skipped_uncalibrated'] == 0
 
     async def test_a_fully_calibrated_sweep_skips_nothing(self):
-        from unittest.mock import AsyncMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock
 
         query_points = AsyncMock(return_value=types.SimpleNamespace(points=[]))
 
@@ -3068,7 +3068,7 @@ class TestFetchAnnNeighborsSkipsUncalibratedCategories:
         always going to discard it — so the pairs are identical with and
         without the skip, and only the attribution of the loss moves.
         """
-        from unittest.mock import AsyncMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock
 
         memories = [
             {'id': 'a', 'vector': [0.1], 'category': _PK},
@@ -3100,7 +3100,7 @@ class TestFetchAnnNeighborsConcurrency:
     """Queries fan out under a bound — never one blocking round-trip at a time."""
 
     def _service(self, query_points):
-        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock, MagicMock
 
         client = MagicMock()
         client.query_points = query_points
@@ -3110,8 +3110,8 @@ class TestFetchAnnNeighborsConcurrency:
         return service
 
     async def test_in_flight_queries_are_concurrent_and_capped(self):
-        import asyncio  # noqa: PLC0415
-        from unittest.mock import AsyncMock  # noqa: PLC0415
+        import asyncio
+        from unittest.mock import AsyncMock
 
         in_flight = 0
         peak = 0
@@ -3138,8 +3138,8 @@ class TestFetchAnnNeighborsConcurrency:
 
     async def test_results_are_keyed_in_input_order_despite_the_fan_out(self):
         """Two identical runs must serialise identically."""
-        import asyncio  # noqa: PLC0415
-        from unittest.mock import AsyncMock  # noqa: PLC0415
+        import asyncio
+        from unittest.mock import AsyncMock
 
         async def _side_effect(**kwargs):
             # Later records finish FIRST, so insertion order cannot be
@@ -3159,7 +3159,7 @@ class TestFetchAnnNeighborsConcurrency:
 
     async def test_one_failure_is_counted_without_losing_the_rest(self):
         """Per-record error accounting survives the fan-out."""
-        from unittest.mock import AsyncMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock
 
         async def _side_effect(**kwargs):
             if kwargs['query'] == [1.0]:
@@ -3632,7 +3632,7 @@ class TestBuildMetricSeries:
         return compute_cluster_metrics(records, plans, {})[0]
 
     def test_series_shape_and_corpus_counts(self):
-        from shared.memory_eval_metrics import validate_metric_series  # noqa: PLC0415
+        from shared.memory_eval_metrics import validate_metric_series
 
         series = build_metric_series(
             'dark_factory', self._metrics(),
@@ -3658,7 +3658,7 @@ class TestBuildMetricSeries:
         assert all(i.rsplit('.', 1)[-1] in (*_ALL_CATEGORIES, _GLOBAL_SCOPE) for i in ids)
 
     def test_run_stamp_defaults_to_the_shared_helper(self, monkeypatch):
-        from shared.memory_eval_metrics import RUN_STAMP_ENV_VAR  # noqa: PLC0415
+        from shared.memory_eval_metrics import RUN_STAMP_ENV_VAR
 
         monkeypatch.setenv(RUN_STAMP_ENV_VAR, '20260101T010101Z')
         series = build_metric_series('dark_factory', self._metrics(), corpus_counts={_PK: 2})
@@ -3666,7 +3666,7 @@ class TestBuildMetricSeries:
 
     def test_malformed_metric_raises_metric_schema_error_at_build_time(self):
         """M1: rejected in the runner that computed it, not by the reader."""
-        from shared.memory_eval_metrics import MetricSchemaError  # noqa: PLC0415
+        from shared.memory_eval_metrics import MetricSchemaError
 
         malformed = {
             'metric_id': f'clustered_member_share.{_PK}',
@@ -3681,7 +3681,7 @@ class TestBuildMetricSeries:
 
     def test_duplicate_metric_id_raises_metric_schema_error(self):
         """A duplicate would make one of the two invisible to the baseline join."""
-        from shared.memory_eval_metrics import MetricSchemaError  # noqa: PLC0415
+        from shared.memory_eval_metrics import MetricSchemaError
 
         one = {'metric_id': 'dup.all', 'kind': 'scalar', 'value': 1.0, 'n': 1}
         with pytest.raises(MetricSchemaError):
@@ -3689,7 +3689,7 @@ class TestBuildMetricSeries:
 
     def test_missing_direction_on_a_count_raises(self):
         """The exact test is two-sided; without a direction an improvement alarms."""
-        from shared.memory_eval_metrics import MetricSchemaError  # noqa: PLC0415
+        from shared.memory_eval_metrics import MetricSchemaError
 
         with pytest.raises(MetricSchemaError):
             build_metric_series(
@@ -3699,7 +3699,7 @@ class TestBuildMetricSeries:
             )
 
     def test_computed_metrics_round_trip_through_the_schema(self):
-        from shared.memory_eval_metrics import (  # noqa: PLC0415
+        from shared.memory_eval_metrics import (
             parse_metric_series,
             serialize_metric_series,
         )
@@ -3745,7 +3745,7 @@ class TestEmitMetricsArtifact:
 
     def test_written_metrics_round_trip_through_the_shared_loader(self, tmp_path):
         """The artifact is read by a process that never imports this script."""
-        from shared.memory_eval_metrics import load_metric_series  # noqa: PLC0415
+        from shared.memory_eval_metrics import load_metric_series
 
         series = _series()
         metrics_path, _report, _details = emit_metrics_artifact(
@@ -3766,7 +3766,7 @@ class TestEmitMetricsArtifact:
         assert det_path.name == details_artifact_path(_STAMP)
 
     def test_run_stamp_env_var_pins_the_filenames(self, tmp_path, monkeypatch):
-        from shared.memory_eval_metrics import RUN_STAMP_ENV_VAR, run_stamp  # noqa: PLC0415
+        from shared.memory_eval_metrics import RUN_STAMP_ENV_VAR, run_stamp
 
         monkeypatch.setenv(RUN_STAMP_ENV_VAR, '20260101T000000Z')
         stamp = run_stamp()
@@ -3784,7 +3784,7 @@ class TestEmitMetricsArtifact:
         the limits evaluator like a run whose metrics file went missing —
         strictly worse than the run never having written anything.
         """
-        from shared.memory_eval_metrics import MetricSchemaError  # noqa: PLC0415
+        from shared.memory_eval_metrics import MetricSchemaError
 
         malformed = {
             'schema_version': 1,
@@ -3819,7 +3819,7 @@ class TestEmitMetricsArtifact:
         is logged and re-raised rather than leaving a dangling details_path
         silently behind a successful-looking run.
         """
-        import logging  # noqa: PLC0415
+        import logging
 
         artifact_dir = tmp_path / _EVAL_ID
         artifact_dir.mkdir(parents=True)
@@ -3929,7 +3929,7 @@ class TestRepeatedCategoryDoesNotDoubleIngest:
     """
 
     async def test_fetch_memories_skips_an_already_scanned_category(self):
-        from unittest.mock import MagicMock  # noqa: PLC0415
+        from unittest.mock import MagicMock
 
         memory = MagicMock()
         memory.mem0 = MagicMock()
@@ -4062,8 +4062,8 @@ def _install_run_doubles(monkeypatch, raw_by_category, *, t_high: float | None =
                          t_high_by_category: dict[str, float] | None = None,
                          ann_hits: dict[tuple, list[tuple]] | None = None,
                          project_calibrations: dict[str, dict[str, float]] | None = None):
-    import fused_memory.config.schema as schema_mod  # noqa: PLC0415
-    import fused_memory.services.memory_service as service_mod  # noqa: PLC0415
+    import fused_memory.config.schema as schema_mod
+    import fused_memory.services.memory_service as service_mod
 
     _FakeMemoryService.instances = []
     _FakeMemoryService.raw_by_category = raw_by_category
@@ -4196,7 +4196,7 @@ class TestStdoutAndStoreFailuresStopBeforeAnySideEffect:
         ])
 
     async def test_a_store_that_cannot_be_opened(self, monkeypatch, tmp_path, caplog):
-        import fused_memory.services.memory_service as service_mod  # noqa: PLC0415
+        import fused_memory.services.memory_service as service_mod
 
         _install_run_doubles(monkeypatch, self._CLUSTER)
         monkeypatch.setattr(service_mod, 'MemoryService', _UnopenableFakeMemoryService)
@@ -4743,7 +4743,7 @@ class TestRunWiring:
     async def test_metrics_artifact_is_emitted_under_metrics_root(
         self, monkeypatch, tmp_path,
     ):
-        from shared.memory_eval_metrics import (  # noqa: PLC0415
+        from shared.memory_eval_metrics import (
             RUN_STAMP_ENV_VAR,
             load_metric_series,
         )
@@ -4776,7 +4776,7 @@ class TestRunWiring:
         silently withheld by the evidence gate would be un-alarmable recall
         loss.
         """
-        from shared.memory_eval_metrics import (  # noqa: PLC0415
+        from shared.memory_eval_metrics import (
             RUN_STAMP_ENV_VAR,
             load_metric_series,
         )
@@ -6413,7 +6413,7 @@ class TestLivenessRecurrenceMetrics:
         )
 
     def test_series_still_validates_and_metrics_stay_sorted(self):
-        from shared.memory_eval_metrics import validate_metric_series  # noqa: PLC0415
+        from shared.memory_eval_metrics import validate_metric_series
 
         records, plans = self._fixture()
         metrics, _details = compute_cluster_metrics(records, plans, {})
@@ -6540,7 +6540,7 @@ class TestRunLivenessRecurrenceWiring:
     async def test_metric_series_carries_the_count_and_both_disclosures(
         self, monkeypatch, tmp_path,
     ):
-        from shared.memory_eval_metrics import (  # noqa: PLC0415
+        from shared.memory_eval_metrics import (
             RUN_STAMP_ENV_VAR,
             load_metric_series,
         )
@@ -7065,8 +7065,8 @@ class TestApplyStoreMutationPreflightThroughMain:
         coroutine really is ``_run(args)`` as ``main`` built it, argv parsing
         included.
         """
-        import asyncio  # noqa: PLC0415
-        import sys  # noqa: PLC0415
+        import asyncio
+        import sys
 
         deny(_mod, monkeypatch)
         _install_run_doubles(monkeypatch, {})

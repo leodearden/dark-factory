@@ -1,0 +1,12 @@
+{
+  "task_id": "3320",
+  "reason": "net-additive: new API-outage Phase-1 integration-gate substrate orchestrator/tests/_api_outage_harness.py (lane-importing only via git_ops.WarmLaneReseedContaminated for the genuine-requeue control); it drives the real Harness._run_slot, injects the escalation queue and run id the un-started Harness lacks, and fakes the out-of-scope MERGE/worktree boundaries via TaskWorkflow._enter_phase/_artifact_roots -- none has a public seam and the plan declares no production files",
+  "measures": [
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6476,
+      "current": 6482
+    }
+  ]
+}

@@ -74,7 +74,7 @@ def atomic_write_json(path: str, payload: dict, log: LogSink) -> bool:
         os.replace(tmp_path, path)
         tmp_path = None  # renamed away — nothing to clean up
         return True
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         if tmp_path is not None:
             # Best-effort cleanup: if the temp file cannot be removed there is
             # nothing further to do, and raising here would mask *exc* (the

@@ -1484,7 +1484,7 @@ def nightly(monkeypatch: pytest.MonkeyPatch) -> Iterator[types.ModuleType]:
     """
     monkeypatch.syspath_prepend(str(REPO_ROOT / "scripts" / "legibility"))
     before = set(sys.modules)
-    from legibility import nightly as nightly_mod  # noqa: PLC0415
+    from legibility import nightly as nightly_mod
 
     yield nightly_mod
 

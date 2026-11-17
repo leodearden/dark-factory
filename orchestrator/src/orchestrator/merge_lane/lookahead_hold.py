@@ -1,4 +1,4 @@
-"""The merger waits here, before its look-ahead pop, for the verifier to dispatch the speculative item it just queued.
+"""The merger waits here, before its look-ahead pop, for the verifier to dispatch the item it just queued.
 
 The decision is what the item's successors stack on, as its dispatch left it
 (its chain tip when it chained), or None. The contract is

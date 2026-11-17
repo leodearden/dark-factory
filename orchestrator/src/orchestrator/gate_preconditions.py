@@ -10,11 +10,13 @@ import copy
 import logging
 from dataclasses import dataclass
 
-from orchestrator.dependency_verdict import task_dependency_ids, task_external_deps
+from shared.task_fields import dependency_ids
+from shared.task_metadata import GATE_ESCALATED_PRECONDITIONS_KEY
+
+from orchestrator.dependency_verdict import task_external_deps
 
 logger = logging.getLogger(__name__)
 
-GATE_ESCALATED_PRECONDITIONS_KEY = 'gate_escalated_preconditions'
 _STAMP_SHAPE = (
     "{'dependencies': list[str], 'external_deps': list[str], 'milestone': <milestone or None>}"
 )
@@ -31,7 +33,7 @@ class GatePreconditions:
     @classmethod
     def of_task(cls, task: dict) -> GatePreconditions:
         return cls(
-            dependencies=frozenset(task_dependency_ids(task)),
+            dependencies=frozenset(dependency_ids(task)),
             external_deps=frozenset(task_external_deps(task)),
             milestone=copy.deepcopy((task.get('metadata') or {}).get('milestone')),
         )

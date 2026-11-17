@@ -5203,7 +5203,7 @@ def _select_proactive_sample(tasks: Iterable[dict], n: int) -> list[dict]:
     filter_task_tree already pre-validates to be dict-only.
     """
     # Import from task_filter — the single source of truth for status priority
-    from fused_memory.reconciliation.task_filter import _STATUS_PRIORITY  # noqa: PLC0415
+    from fused_memory.reconciliation.task_filter import _STATUS_PRIORITY
 
     def sort_key(t: dict) -> tuple[int, int]:
         status = t.get('status', 'pending')

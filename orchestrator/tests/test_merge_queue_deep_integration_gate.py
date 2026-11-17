@@ -1593,10 +1593,10 @@ class _GateScene:
         #
         #   * any round that requeued (i.e. every red tip) leaves
         #     `_n_failed=True`, so the NEXT round's speculative item is
-        #     re-merged into a NON-speculative one and `_deep_chain_placement`
-        #     declines at its `item.speculative` guard.  The halving walk could
-        #     never take a second step — round 2 of every bisection would
-        #     silently be an ordinary verify.
+        #     re-merged into a NON-speculative one.  Alone in this scene's
+        #     empty frontier it would chain as a head (PRD D5), so round 2 of
+        #     every bisection would silently test the head path instead of the
+        #     slot-2 walk.
         #   * `_remerge_occurred` is self-sustaining once set (it is assigned
         #     from the same dispatch's own `iteration_did_remerge`), so ONE
         #     re-merge would disable chaining for the rest of the scene.
@@ -1631,7 +1631,7 @@ class _GateScene:
             ),
             merge_wt=wt,
             base_sha=main_before,   # this round really CASes against main
-            speculative=True,       # slot 2 — the only kind that chains
+            speculative=True,       # slot 2 — chains whatever the frontier holds (PRD D5)
         )
         entry = await worker._dispatch_item(item)
         assert entry is not None, 'dispatch must not decline: a host is free'
@@ -1743,7 +1743,7 @@ class _GateScene:
             ),
             merge_wt=wt,
             base_sha=main_sha,      # slot 1 CASes against REAL main
-            speculative=speculative,    # the trust anchor — never chained
+            speculative=speculative,    # the trust anchor (chains only when alone, PRD D5)
         )
         entry = InflightEntry(
             item=head_item,
@@ -1828,7 +1828,7 @@ class _GateScene:
             ),
             merge_wt=wt,
             base_sha=self.head_mc,  # stacked on the head's merge commit
-            speculative=True,       # slot 2 — the only kind that chains
+            speculative=True,       # slot 2 — chains whatever the frontier holds (PRD D5)
         )
         entry = await worker._dispatch_item(item)
         assert entry is not None, 'dispatch must not decline: a host is free'

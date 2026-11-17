@@ -118,6 +118,13 @@ the existing inconclusive→don't-report fail-safe.
   uses today (re-running `write_cycle_summary` fixes both ledger and mirror). No
   new finding category. (Richer `cross_store_inconsistency` labeling for
   ledger-absent-but-mirror-present is deferred — see Open questions.)
+  *(Task 6295, after task 3734: `suggested_action` is now
+  `carry_forward_ledger_write_gap`. No remediation-pass agent can re-run
+  `write_cycle_summary` for a prior run, and the harness's own re-attempts have
+  already run by the time Stage 3 sees `reason='missing'`. So the remediation
+  pass decides the finding against the ledger and carries it forward unresolved.
+  Category `missing_knowledge` and `actionable` are unchanged, and so is routing
+  through `_maybe_remediate` and recurrence escalation.)*
 - **D5 — Presence is a boolean, not a payload dump.** The tool returns
   `{present, ledger_available, project_id, run_id, stage}` — no record body — to
   stay a pure presence check and not become a browse API (D1).
@@ -246,6 +253,7 @@ per-cycle summary missing for `run_id`:
    - `present=false` **and** `expected=true` (`reason='missing'`) → the stage ran,
      the run is within retention, and the row is genuinely lost → **report missing**
      (`missing_knowledge`, actionable, suggested_action = reconstruct).
+     *(suggested_action amended by task 6295; see D4.)*
    - `present=false` **and** `expected=false` (`reason='stage_not_run'`) → the run
      never reached the stage, so no summary was ever owed → **not a gap**; do not
      report. *(Task 3731. Previously this reported missing — 61 of 64 such
@@ -370,6 +378,7 @@ hard-blocker token). `task_kind='normal'`.
 - **Richer divergence signal:** when the ledger is absent but a Mem0 mirror is
   present, τ2 could emit `cross_store_inconsistency` instead of plain
   `missing_knowledge`. Default: reuse `missing_knowledge` (reconstruct fixes both).
+  *(Task 6295: nothing reconstructs; see D4.)*
   Upgrade only if a run surfaces a case where the distinction changes remediation.
 - **Return payload width:** ~~whether to include the row's `state` /
   `created_at` alongside `present` for richer Stage-3 reporting. Default:

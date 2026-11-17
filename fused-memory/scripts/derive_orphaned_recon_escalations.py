@@ -229,10 +229,10 @@ async def run(
 
     owns_backend = taskmaster is None
     if owns_backend:
-        from fused_memory.backends.sqlite_task_backend import (  # noqa: PLC0415
+        from fused_memory.backends.sqlite_task_backend import (
             SqliteTaskBackend,
         )
-        from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+        from fused_memory.config.schema import FusedMemoryConfig
 
         config = FusedMemoryConfig()
         if config.taskmaster is None:

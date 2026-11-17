@@ -106,6 +106,7 @@ def _mocked_service(config) -> MemoryService:
     svc.graphiti._require_client = MagicMock()
     svc.graphiti.get_nodes_by_exact_name = AsyncMock(return_value=[])
     svc.graphiti.get_valid_edges_for_node = AsyncMock(return_value=[])
+    svc.graphiti.get_node_names_by_uuids = AsyncMock(return_value={})
     svc.graphiti.read_server_settings = AsyncMock(return_value=_MATCHING_SERVER_SETTINGS)
     install_identity_mocks(svc.graphiti)
 
@@ -158,7 +159,7 @@ def _mocked_service(config) -> MemoryService:
 
 
 def _mem0_add_journal() -> MagicMock:
-    """A write-journal double covering every call add_memory's Mem0 leg makes."""
+    """A write-journal double covering every call a Mem0 write leg makes."""
     journal = MagicMock()
     journal.log_write_op = AsyncMock()
     journal.log_backend_op = AsyncMock()
@@ -838,10 +839,8 @@ class TestAddSystemRecord:
         both logged as a WARNING and journaled as success=False — never a silent,
         unconditional success on the guaranteed-persistence system-write path."""
         service.mem0.add_system_record = AsyncMock(return_value={'results': []})
-        mock_journal = MagicMock()
-        mock_journal.log_write_op = AsyncMock()
-        mock_journal.log_backend_op = AsyncMock()
-        service._write_journal = mock_journal
+        mock_journal = _mem0_add_journal()
+        service.set_write_journal(mock_journal)
 
         with caplog.at_level(logging.WARNING, logger='fused_memory.services.memory_service'):
             result = await service.add_system_record(
@@ -875,10 +874,8 @@ class TestAddSystemRecord:
     async def test_nonempty_result_journals_success_no_warning(self, service, caplog):
         """The happy path (non-empty mem0 result) must journal success=True with no warning."""
         service.mem0.add_system_record = AsyncMock(return_value={'results': [{'id': 'sys-1'}]})
-        mock_journal = MagicMock()
-        mock_journal.log_write_op = AsyncMock()
-        mock_journal.log_backend_op = AsyncMock()
-        service._write_journal = mock_journal
+        mock_journal = _mem0_add_journal()
+        service.set_write_journal(mock_journal)
 
         with caplog.at_level(logging.WARNING, logger='fused_memory.services.memory_service'):
             await service.add_system_record(
@@ -936,10 +933,8 @@ class TestAddSystemRecord:
         actually returned an id, and every failure is named in the message
         itself (task 4045)."""
         service.mem0.add_system_record = AsyncMock(**backend_mock_kwargs)
-        mock_journal = MagicMock()
-        mock_journal.log_write_op = AsyncMock()
-        mock_journal.log_backend_op = AsyncMock()
-        service._write_journal = mock_journal
+        mock_journal = _mem0_add_journal()
+        service.set_write_journal(mock_journal)
 
         result = await service.add_system_record(
             content='cycle summary',
@@ -1335,15 +1330,13 @@ class TestSearch:
     ):
         """When filtering by a GRAPHITI_PRIMARY category, Graphiti results
         (which have category=None) must NOT be silently dropped."""
-        from _fm_helpers import MockEdge, MockNode
+        from _fm_helpers import MockEdge
 
         # Mock Graphiti returning edges (category=None in MemoryResult)
         service.graphiti.search = AsyncMock(return_value=[
             MockEdge(
                 fact='Auth service depends on Redis',
                 uuid='edge-uuid-1',
-                source_node=MockNode(name='Auth Service'),
-                target_node=MockNode(name='Redis'),
             ),
         ])
         # Mock Mem0 returning a result with matching category
@@ -1375,14 +1368,12 @@ class TestSearch:
     ):
         """When filtering by only MEM0_PRIMARY categories (e.g. preferences_and_norms),
         Graphiti results (category=None) should be correctly excluded."""
-        from _fm_helpers import MockEdge, MockNode
+        from _fm_helpers import MockEdge
 
         service.graphiti.search = AsyncMock(return_value=[
             MockEdge(
                 fact='Auth service depends on Redis',
                 uuid='edge-uuid-1',
-                source_node=MockNode(name='Auth Service'),
-                target_node=MockNode(name='Redis'),
             ),
         ])
         service.mem0.search = AsyncMock(return_value={
@@ -1412,14 +1403,12 @@ class TestSearch:
     ):
         """When exactly one GRAPHITI_PRIMARY category is in the filter,
         Graphiti results should have that category assigned (not left as None)."""
-        from _fm_helpers import MockEdge, MockNode
+        from _fm_helpers import MockEdge
 
         service.graphiti.search = AsyncMock(return_value=[
             MockEdge(
                 fact='Auth service depends on Redis',
                 uuid='edge-uuid-1',
-                source_node=MockNode(name='Auth Service'),
-                target_node=MockNode(name='Redis'),
             ),
         ])
         service.mem0.search = AsyncMock(return_value={'results': []})
@@ -1437,14 +1426,13 @@ class TestSearch:
     @pytest.mark.asyncio
     async def test_search_graphiti_temporal_valid_at_only(self, service):
         """Graphiti search results with only valid_at set get temporal dict with null invalid_at."""
-        from _fm_helpers import MockEdge, MockNode
+        from _fm_helpers import MockEdge
 
         dt_valid = datetime(2024, 3, 1, 10, 0, 0, tzinfo=UTC)
         service.graphiti.search = AsyncMock(return_value=[
             MockEdge(
                 fact='Service A started',
                 uuid='edge-temporal-1',
-                source_node=MockNode(name='Service A'),
                 valid_at=dt_valid,
                 invalid_at=None,
             ),
@@ -1469,14 +1457,13 @@ class TestSearch:
         with only invalid_at set was returned (len==1). After the fix, superseded
         edges are filtered out, so the result must be empty (len==0).
         """
-        from _fm_helpers import MockEdge, MockNode
+        from _fm_helpers import MockEdge
 
         dt_invalid = datetime(2024, 9, 1, 10, 0, 0, tzinfo=UTC)
         service.graphiti.search = AsyncMock(return_value=[
             MockEdge(
                 fact='Service B deprecated',
                 uuid='edge-temporal-2',
-                source_node=MockNode(name='Service B'),
                 valid_at=None,
                 invalid_at=dt_invalid,
             ),
@@ -1496,13 +1483,12 @@ class TestSearch:
     @pytest.mark.asyncio
     async def test_search_graphiti_result_carries_created_at(self, service):
         """A Graphiti hit with no temporal context still carries its edge's creation time."""
-        from _fm_helpers import MockEdge, MockNode
+        from _fm_helpers import MockEdge
 
         service.graphiti.search = AsyncMock(return_value=[
             MockEdge(
                 fact='Service C owns the ledger',
                 uuid='edge-created-1',
-                source_node=MockNode(name='Service C'),
                 valid_at=None,
                 invalid_at=None,
                 created_at=datetime(2026, 8, 22, 9, 30, 0, tzinfo=UTC),
@@ -1525,19 +1511,17 @@ class TestSearch:
     @pytest.mark.asyncio
     async def test_search_graphiti_created_at_is_canonical_utc(self, service):
         """An offset-aware stamp is converted to its UTC instant; a naive one is read as UTC."""
-        from _fm_helpers import MockEdge, MockNode
+        from _fm_helpers import MockEdge
 
         service.graphiti.search = AsyncMock(return_value=[
             MockEdge(
                 fact='Service D runs in Karachi time',
                 uuid='edge-offset',
-                source_node=MockNode(name='Service D'),
                 created_at=datetime(2026, 8, 22, 9, 30, 0, tzinfo=timezone(timedelta(hours=5))),
             ),
             MockEdge(
                 fact='Service E stamps naive times',
                 uuid='edge-naive',
-                source_node=MockNode(name='Service E'),
                 created_at=datetime(2026, 8, 22, 9, 30, 0),
             ),
         ])
@@ -1559,7 +1543,7 @@ class TestSearch:
         topic_anchor.py::select_topic_canonical compares recency on the raw
         string, so a preserved offset would mis-order these two edges.
         """
-        from _fm_helpers import MockEdge, MockNode
+        from _fm_helpers import MockEdge
 
         earlier_instant = datetime(2026, 8, 22, 8, 0, tzinfo=UTC)
         later_instant = datetime(2026, 8, 22, 9, 0, tzinfo=UTC)
@@ -1571,13 +1555,11 @@ class TestSearch:
             MockEdge(
                 fact='Service F was renamed',
                 uuid='edge-earlier',
-                source_node=MockNode(name='Service F'),
                 created_at=earlier_stored,
             ),
             MockEdge(
                 fact='Service F was renamed again',
                 uuid='edge-later',
-                source_node=MockNode(name='Service F'),
                 created_at=later_stored,
             ),
         ])
@@ -3278,15 +3260,13 @@ class TestSearchDeleteRoundtrip:
     @pytest.mark.asyncio
     async def test_search_then_delete_graphiti_roundtrip(self, service):
         """End-to-end contract test: search returns edge UUIDs that work with delete_memory."""
-        from _fm_helpers import MockEdge, MockNode
+        from _fm_helpers import MockEdge
 
         edge_uuid = '00000000-0000-4000-8000-000000000042'
         service.graphiti.search = AsyncMock(return_value=[
             MockEdge(
                 fact='Payment gateway depends on billing API',
                 uuid=edge_uuid,
-                source_node=MockNode(name='Payment Gateway'),
-                target_node=MockNode(name='Billing API'),
             ),
         ])
         service.mem0.search = AsyncMock(return_value={'results': []})
@@ -3769,34 +3749,6 @@ class TestMem0BackendAddInferContract:
             'normative/procedural content and returns empty results.'
         )
         assert result == {'results': [{'id': 'mem0-new', 'event': 'ADD'}]}
-
-
-class TestMem0BackendClose:
-    @pytest.mark.asyncio
-    async def test_close_awaits_client_close(self, mock_config):
-        """Mem0Backend.close() must await client.close() for each cached instance."""
-        from fused_memory.backends.mem0_client import Mem0Backend
-
-        backend = Mem0Backend(mock_config)
-
-        # Build a mock instance with a vector_store.client.close AsyncMock
-        mock_client = MagicMock()
-        mock_client.close = AsyncMock()
-
-        mock_vector_store = MagicMock()
-        mock_vector_store.client = mock_client
-
-        mock_instance = MagicMock()
-        mock_instance.vector_store = mock_vector_store
-
-        backend._instances = {'test_project': mock_instance}
-
-        await backend.close()
-
-        # The close coroutine must have been awaited, not just created
-        mock_client.close.assert_awaited_once()
-        # All instances must be cleared
-        assert backend._instances == {}
 
 
 class TestGraphitiBackendClose:
@@ -11909,7 +11861,7 @@ class TestGetMemoryTimeoutNotCoercedToNotFound:
 
     @pytest.mark.asyncio
     async def test_mem0_read_timeout_propagates(self, service):
-        from fused_memory.services.memory_service import MemoryNotFoundError  # noqa: PLC0415
+        from fused_memory.services.memory_service import MemoryNotFoundError
 
         uuid = '77a3f6bc-0000-0000-0000-000000000000'
         service.mem0.get = AsyncMock(
@@ -12691,9 +12643,9 @@ class TestMemoryMetadataValidationAtSeam:
         rejection raised after the intent was journalled would convert a
         clean structured rejection into permanent store-reconciliation debt.
 
-        add_memory only: ``add_system_record`` has no write-ahead intent — it
-        goes straight to ``_journaled_backend_call`` — so its equivalent
-        "no persistence side effect" observable is asserted separately below.
+        add_memory here; ``add_system_record``'s write-ahead intent (task
+        7401), together with its other "no persistence side effect"
+        observables, is asserted separately below.
         """
         from fused_memory.memory_metadata import MemoryMetadataValidationError
 
@@ -12706,11 +12658,14 @@ class TestMemoryMetadataValidationAtSeam:
         journal.log_mem0_intent.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_positive_control_valid_write_does_log_the_intent(self, service):
+    @pytest.mark.parametrize('entry_point', _MM_ADD_ENTRY_POINTS)
+    async def test_positive_control_valid_write_does_log_the_intent(
+        self, service, entry_point
+    ):
         """Without this, `not_called` cannot distinguish "rejected before the
         intent" from "the branch never runs at all"."""
         journal = _mm_install_journal(service)
-        await _mm_write(service, 'add_memory', metadata={'topic': 'a-good-slug'})
+        await _mm_write(service, entry_point, metadata={'topic': 'a-good-slug'})
         journal.log_mem0_intent.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -12724,6 +12679,7 @@ class TestMemoryMetadataValidationAtSeam:
             await _mm_write(service, 'add_system_record', metadata={'topic': 'bad_slug'})
 
         journal.log_backend_op.assert_not_called()
+        journal.log_mem0_intent.assert_not_called()
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)

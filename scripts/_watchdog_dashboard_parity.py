@@ -161,7 +161,7 @@ def unit_parity_pass(repo_dir: str, log: LogSink) -> None:
             )
         elif verdict == UnitParityVerdict.UNKNOWN:
             log(f"dashboard unit parity: checker could not run, parity unknown: {report}")
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         log(f"dashboard unit parity pass error: {exc!r}")
 
 
@@ -184,7 +184,7 @@ def print_unit_parity(repo_dir: str, log: LogSink) -> None:
     """
     try:
         verdict, detail = unit_parity_verdict(repo_dir)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         log(f"watchdog error printing the dashboard unit parity row: {exc}")
         verdict, detail = UnitParityVerdict.UNKNOWN, ""
     print(f"dashboard unit parity: {verdict} | CHECKER: {DASHBOARD_PARITY_SCRIPT_RELPATH}")

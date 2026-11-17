@@ -8,7 +8,7 @@ cannot fire while that happens either.
 Each off-loop case runs one real tool against a checkout-shaped root, with the
 pathlib primitive it reaches instrumented to ask a ``LoopFreedomProbe`` whether
 the loop stayed free. The structural twin is
-``shared/tests/test_loop_blocking_gate.py``, whose ratchet flags the same sites
+``tests/repo_guards/test_loop_blocking_gate.py``, whose ratchet flags the same sites
 from the source. The contract pins below fix the result dicts the model sees,
 so moving the tool bodies cannot change them.
 """

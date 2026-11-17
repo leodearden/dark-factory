@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import os
 
+from orchestrator import decision_registry as dr
 from orchestrator import session_registry as sr
 
 
@@ -53,7 +54,7 @@ def _make_decision(**overrides):
         'filed_at': '2026-07-07T00:00:00+00:00',
     }
     fields.update(overrides)
-    return sr.DecisionRecord(**fields)
+    return dr.DecisionRecord(**fields)
 
 
 class TestScanSessions:
@@ -503,7 +504,7 @@ class TestScanDecisions:
         from cockpit.registry_reader import scan_decisions
 
         for i, project in enumerate(('dark-factory', 'df', 'dark_factory')):
-            assert sr.write_decision(_make_decision(id=f'dec-{i}', project=project), root=tmp_path)
+            assert dr.write_decision(_make_decision(id=f'dec-{i}', project=project), root=tmp_path)
 
         result = scan_decisions(tmp_path)
 
@@ -520,13 +521,13 @@ class TestScanDecisions:
             project='DARK-Factory',
             text='Which port?',
             filed_at='2026-07-07T00:00:00+00:00',
-            state=sr.DecisionState.OPEN,
+            state=dr.DecisionState.OPEN,
             manual_boost=3,
             task_id='2085',
             escalation_id='esc-2085-1',
             severity='blocking',
         )
-        assert sr.write_decision(written, root=tmp_path)
+        assert dr.write_decision(written, root=tmp_path)
 
         (scanned,) = scan_decisions(tmp_path)
 
@@ -557,10 +558,10 @@ class TestScanDecisions:
         from cockpit.registry_reader import scan_decisions
 
         for i, project in enumerate(('dark-factory', 'df', 'dark_factory', 'other-project')):
-            assert sr.write_decision(_make_decision(id=f'dec-{i}', project=project), root=tmp_path)
+            assert dr.write_decision(_make_decision(id=f'dec-{i}', project=project), root=tmp_path)
 
         result = scan_decisions(tmp_path)
-        expected = sr.list_decisions(tmp_path)
+        expected = dr.list_decisions(tmp_path)
 
         assert [d.id for d in result] == [d.id for d in expected]
 

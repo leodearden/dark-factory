@@ -63,7 +63,7 @@ def main(argv: list[str] | None = None) -> int:
         cfg = load_config(Path(args.config))
         git_ops = GitOps(cfg.git, Path(args.project_root))
         result = asyncio.run(git_ops.recover_red_main(args.target_sha, args.expected_main))
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         print(json.dumps({
             'result': 'error',
             'detail': str(exc),

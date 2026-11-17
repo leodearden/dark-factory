@@ -1765,7 +1765,7 @@ class _FakeEscalationQueue:
         self._seq = 0
         self.submitted: list = []
 
-    def has_open_l1(self, task_id: str) -> bool:  # noqa: ARG002
+    def has_open_l1(self, task_id: str) -> bool:
         return self._open_l1
 
     def get_by_task(self, task_id: str, status: str | None = None, level: int | None = None) -> list:

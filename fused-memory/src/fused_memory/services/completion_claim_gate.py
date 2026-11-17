@@ -36,7 +36,11 @@ A claim must also be ASSERTED (task 6677). A marker inside a quotation,
 governed by a modal, inside a conditional/interrogative, present-tense
 temporal or imperative scope, or in attributive position is not a claim. Nor is
 a bare participle after a temporal cue ('until merged') a claim about an earlier
-ref (task 7811). See tests/test_completion_claim_mood.py and
+ref (task 7811). A marker predicated of a ref that a contingency, necessity or
+simulation head governs ('depends on task N having landed', 'needs task N merged
+first', 'a mock of task N's edits merged') is not a claim either; nor is one after
+the determiner 'no' or a catch-up 'merged up to' (task 6824). See
+tests/test_completion_claim_mood.py and
 docs/completion-claim-mood-filter-2026-10/measurement.md.
 
 Verification is split from detection behind INJECTED probes (mirroring
@@ -232,6 +236,15 @@ _EXTERNAL_TASK_REF_RE: re.Pattern[str] = re.compile(
     r'\b([A-Za-z][A-Za-z0-9_-]*)[:#](\d+)\b'
 )
 
+# A premise note names a dependency by number ('dependency 327 merged at a106cd8'), and
+# without this family the marker binds back to the branch task the note is written on
+# (solar esc-unverified-claim-432-2). A bare number only: 'dependency #N' is TASK_REF_RE's,
+# and 'dependency 2.0' is a version. Pinned by
+# tests/test_completion_claim_mood.py::TestPremiseNotesClaimTheirDependency.
+_DEPENDENCY_REF_RE: re.Pattern[str] = re.compile(
+    r'\bdependency\s+(\d+)\b(?!\.\d)', re.IGNORECASE,
+)
+
 APPLIED_WORK_RE: re.Pattern[str] = re.compile(
     r'\b(?:'
     # bare past-tense/participle completion words that read as a completion of
@@ -311,11 +324,19 @@ def _iter_clauses(text: str):
         yield text[pos:], pos
 
 
+# 'merged up to X' brings a branch up to date with X, a merge INTO the branch, so it
+# does not land the branch's task (solar esc-unverified-claim-195-2). Pinned by
+# tests/test_completion_claim_mood.py::TestNonAssertiveScopes.
+_CATCH_UP_MERGE_RE: re.Pattern[str] = re.compile(
+    r'\bmerged\s+up\s+(?:to|with)\b', re.IGNORECASE,
+)
+
 _EXEMPTION_STRIPPERS: tuple[re.Pattern[str], ...] = (
     NEGATED_TERMINAL_RE,
     _NEGATED_EXTENSION_RE,
     FUTURE_ASPIRATIONAL_RE,
     _GOVERNED_VERB_RE,
+    _CATCH_UP_MERGE_RE,
 )
 
 
@@ -622,6 +643,7 @@ def _ref_mentions(
     mentions += [
         owned(m, 'task', _anchor_project(m, registry)) for m in TASK_REF_RE.finditer(clause)
     ]
+    mentions += [owned(m, 'task', None) for m in _DEPENDENCY_REF_RE.finditer(clause)]
     mentions += [
         _RefMention(
             phrase_start=m.start(), start=m.start(), end=m.end(),
@@ -685,16 +707,50 @@ _NOT_ADVERBIAL_ONCE: str = (
 )
 
 # A marker with no subject of its own binds forward only. After a determiner it is
-# attributive ('the shipped examples'); after a temporal cue it heads a verbless clause
+# attributive ('the shipped examples'), and after 'no' it is negated besides ('gets no
+# landed-outbox hit'); after a temporal cue it heads a verbless clause
 # ('holds once merged') with no auxiliary for the _MOOD_SCOPES tense gate to read.
 # Pinned by tests/test_completion_claim_mood.py::TestNonAssertiveScopes (temporal
 # cue) and ::TestAttributiveMarkersBindForwardOnly (determiner).
 _FORWARD_ONLY_LEAD_RE: re.Pattern[str] = re.compile(
-    r'(?:\b(?:the|a|an|its|their|our|your|his|her|my)|'
+    r'(?:\b(?:the|a|an|no|its|their|our|your|his|her|my)|'
     + _NOT_ADVERBIAL_ONCE + _TEMPORAL_CUE + r')'
     r'\s+(?:(?:\w+ly|already|just|now)\s+)?$',
     re.IGNORECASE,
 )
+
+_CONTINGENCY_HEADS: str = (
+    r'conditional\s+(?:on|upon)|contingent\s+(?:on|upon)|dependent\s+(?:on|upon)|'
+    r'depend(?:s|ed|ing)?\s+(?:on|upon)|gated\s+on|blocked\s+on|subject\s+to|'
+    r'provid(?:ed|ing)(?:\s+that)?|assuming(?:\s+that)?|assum(?:e|es|ed)\s+that'
+)
+# After a determiner a necessity participle is attributive ('the required task N has
+# landed') and governs nothing.
+_NECESSITY_VERBS: str = (
+    r'(?<!\bthe\s)(?<!\ban\s)(?<!\ba\s)'
+    r'(?:need(?:s|ed)?|requir(?:e|es|ed|ing)|want(?:s|ed)?)'
+)
+_SIMULATION_HEADS: str = r'(?:mock|dry[-\s]run|trial\s+merge)s?\s+of'
+_NON_ASSERTING_HEADS: tuple[str, ...] = (
+    _CONTINGENCY_HEADS, _NECESSITY_VERBS, _SIMULATION_HEADS,
+)
+
+# A ref that is the object of a head which does not assert its complement ('depends
+# on task N having landed') takes no backward-bound marker; a necessity verb's object
+# complement ('needs task N merged first') is a precondition, not a report, and a ref
+# inside a simulation of its work ('a mock of task N's planned edits merged') names a
+# stand-in, not the task's landing. Forward binding is untouched, so 'depends on
+# cancelled task N' still claims N. 'pending' is excluded by measurement, and only
+# the simulation heads a specimen evidences are listed (task 6824).
+# Pinned by tests/test_completion_claim_mood.py::TestNonAssertiveScopes.
+_NON_ASSERTING_GOVERNOR_RE: re.Pattern[str] = re.compile(
+    r'(?<![-\w])(?:' + '|'.join(_NON_ASSERTING_HEADS) + r')\s+(?:(?:the|a|an)\s+)?$',
+    re.IGNORECASE,
+)
+
+# A relative clause after a governed ref is a predication of the ref's own, which the
+# head does not reach ('blocked on task N which merged yesterday' claims N).
+_RELATIVE_PRONOUN_RE: re.Pattern[str] = re.compile(r'\b(?:which|that|who)\b', re.IGNORECASE)
 
 
 def _bind_marker(
@@ -707,7 +763,9 @@ def _bind_marker(
     FORWARD first, because the complement is what the claim asserts into
     existence ('task N was merged as commit X' is a claim about X): the first
     ref after the marker, when :func:`_binds_forward` admits the gap. Otherwise
-    BACKWARD: the nearest ref before the marker, with no barrier between them.
+    BACKWARD: the nearest ref before the marker, when :func:`_binds_backward`
+    admits it, which a barrier between them or a non-asserting head governing
+    the ref (:data:`_NON_ASSERTING_GOVERNOR_RE`) refuses.
     A marker led by a determiner or a temporal cue (:data:`_FORWARD_ONLY_LEAD_RE`)
     binds forward only.
     """
@@ -717,11 +775,26 @@ def _bind_marker(
     if _FORWARD_ONLY_LEAD_RE.search(clause, 0, marker.start):
         return None
     preceding = next((m for m in reversed(mentions) if m.end <= marker.start), None)
-    if preceding is not None and not _BINDING_BARRIER_RE.search(
-        clause[preceding.end:marker.start]
-    ):
+    if preceding is not None and _binds_backward(clause, marker, preceding):
         return preceding
     return None
+
+
+def _binds_backward(clause: str, marker: _Marker, mention: _RefMention) -> bool:
+    """Whether *marker* reaches back to the *mention* before it.
+
+    Not across a binding barrier, and not to a ref a non-asserting head governs
+    unless a relative pronoun between them opens a predication of the ref's own
+    (:data:`_RELATIVE_PRONOUN_RE`). The head is read up to the ref's written
+    phrase, so a registered qualifier is part of the ref ('depends on dark_factory
+    task 5707 having landed').
+    """
+    gap = clause[mention.end:marker.start]
+    if _BINDING_BARRIER_RE.search(gap):
+        return False
+    if _RELATIVE_PRONOUN_RE.search(gap):
+        return True
+    return _NON_ASSERTING_GOVERNOR_RE.search(clause, 0, mention.phrase_start) is None
 
 
 def _binds_forward(clause: str, marker: _Marker, mention: _RefMention) -> bool:

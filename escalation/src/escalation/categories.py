@@ -6,8 +6,9 @@ producer, a live reader, an agent/skill instruction, or a record still pending
 in some queue.
 
 Enforced by :func:`require_registered_category` at ``EscalationQueue.submit``,
-``submit_resolved``, ``has_open_l1`` and ``find_terminal_by_citation``, and by
-the ``escalate_blocker``, ``escalate_info`` and ``promote_to_l2`` tools.
+``submit_resolved``, ``has_open_l1``, ``find_terminal_by_citation`` and
+``newest_terminal_by_task``, and by the ``escalate_blocker``, ``escalate_info``
+and ``promote_to_l2`` tools.
 Rehydrating a stored record is never checked. ``escalation/tests/
 test_category_census.py`` fails verify on a filer passing an unregistered one.
 """
@@ -72,6 +73,7 @@ class EscalationCategory(StrEnum):
     MISSING_PREMISE = 'missing_premise'
     OUT_OF_SCOPE = 'out_of_scope'
     PLANNING_STALLED = 'planning_stalled'
+    PLAN_DELIVERY_UNMEASURED = 'plan_delivery_unmeasured'
     POST_MERGE_VERIFY = 'post_merge_verify'
     PREEXISTING_MAIN_BREAK = 'preexisting_main_break'
     PROVENANCE_CONFLICT = 'provenance_conflict'
@@ -84,7 +86,6 @@ class EscalationCategory(StrEnum):
     RECON_MISSING_INDEX = 'recon_missing_index'
     RECON_REMEDIATION_PHANTOM_CITATION_STORM = 'recon_remediation_phantom_citation_storm'
     RECON_REMEDIATION_PLACEHOLDER_STORM = 'recon_remediation_placeholder_storm'
-    RECON_RESUME_FAILURE_STORM = 'recon_resume_failure_storm'
     RECON_STALE_RUN = 'recon_stale_run'
     RECON_STALE_TASK_COUNT_SNAPSHOT = 'recon_stale_task_count_snapshot'
     RECON_TASK_FINDING = 'recon_task_finding'

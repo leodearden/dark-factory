@@ -247,13 +247,18 @@ parameter, the γ2 auto-chain through `_GenerationChainContext`.
 | `POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX` | merge_lane/gates.py | Reason prefix: post-merge Decision-2 content-equivalence gate failed |
 | `POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX` | merge_lane/gates.py | Reason prefix: post-merge unscoped type-check found a cross-PR union break |
 | `DropGuardResult` | merge_lane/gates.py | Structured return value from `_check_plan_targets_in_tree` |
-| `PlanFilesTouchedResult` | merge_lane/gates.py | Structured return value from `_check_plan_files_touched_in_branch` |
+| `PlanFilesTouchedResult` | merge_lane/gates.py | Structured return value from `_check_plan_files_touched_in_branch`; `touched_set_error` set means the branch history was unreadable, so every declared entry is listed unmeasured (task 3918) |
 | `PostMergePyrightResult` | merge_lane/gates.py | Structured return value from `_check_post_merge_pyright` / `_run_unscoped_typechecks` |
 | `_GenerationChainContext` | merge_lane/gates.py | Bundle passed into `_finalize_advanced_merge` for γ2 auto-chaining (queue + counters + retention) |
 | `_OVERLAP_GIT_ERROR_SENTINEL` | merge_lane/gates.py | Fail-CLOSED sentinel returned by `_rebase_delta_touched_overlap` on a git error |
 | `_check_plan_targets_in_tree()` | merge_lane/gates.py | Drop-guard: files on task HEAD but dropped from the merge commit |
 | `_normalize_plan_path()` | merge_lane/gates.py | Git-canonical form of a declared plan path (helper of the plan-files-touched gate) |
 | `_check_plan_files_touched_in_branch()` | merge_lane/gates.py | Pre-merge Decision-1: every declared plan file must be touched on the branch |
+| `PLAN_DELIVERY_UNMEASURED_REASON_PREFIX` | merge_lane/unmeasured_delivery.py | Reason prefix: the Decision-1 range never measured the task's own work, so no non-delivery is claimed (task 3918) |
+| `UnmeasuredCause` | merge_lane/unmeasured_delivery.py | Why a not-touched verdict measured nothing: unreadable history, a stopped rebase, merge, cherry-pick or revert, uncommitted declared edits, work on a sibling ref; one policy table maps each to its `suggested_action` and remedy |
+| `UnmeasuredDelivery` | merge_lane/unmeasured_delivery.py | Frozen finding: the cause, the entries it explains, the rest still not touched, `block_reason()` |
+| `diagnose_unmeasured_branch()` | merge_lane/unmeasured_delivery.py | Never-raises in-branch diagnosis (unreadable history, a stopped rebase, merge, cherry-pick or revert, uncommitted declared edits) on the gate's failing arm; runs BEFORE the already-landed carve-out, since a mid-rebase HEAD invalidates its empty-range signal, and again on the re-check after narrowing |
+| `find_work_on_sibling_ref()` | merge_lane/unmeasured_delivery.py | Never-raises probe for declared work on a `task/<id>-*` ref, offered only when the measured HEAD has no commit beyond main; runs AFTER the already-landed carve-out declines and before narrowing, and skips any ref `recut_ruling.py::RecutSupersession` says an executed re-cut ruling superseded |
 | `_check_post_merge_equivalence()` | merge_lane/gates.py | Post-merge Decision-2: branch-touched paths must match the advanced main tree |
 | `_rebase_delta_touched_overlap()` | merge_lane/gates.py | Intersection of branch-touched and intervening-rebase-delta files (fail-closed) |
 | `_reverify_rebased_tree()` | merge_lane/gates.py | Disjoint-delta re-verify gate; records each decision as a `merge_reverify_gate` event and, when it fires, delegates to `_run_post_merge_verify` (forwarding `event_store`). On a same tree that declares a history leg, it passes that leg as `history_leg_command`, so only the leg runs through `_run_post_merge_verify` |

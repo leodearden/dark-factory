@@ -119,6 +119,7 @@ from orchestrator.quarantine_provenance import (
 from orchestrator.rebase_drops import RebaseDropLedger, run_rebase_reporting_drops
 from orchestrator.recut_ruling import ParkedIncarnation, RecutRuling, RecutRulingViolation
 from orchestrator.script_warnings import log_warnings_despite_success
+from orchestrator.staged_gitlinks import unstage_new_gitlinks
 from orchestrator.teardown import complete_despite_cancellation, path_confirmed_absent
 from orchestrator.tree_removal import remove_tree
 from orchestrator.verify_cancel import (
@@ -9678,12 +9679,20 @@ class GitOps:
         conflicted tree (which may contain literal conflict markers) is
         never snapshotted.  All WIP-save call sites funnel through this
         method, so this single guard covers every one of them.
+
+        Embedded git repositories stay out of the commit: ``--ignore-errors``
+        stops a commit-less one aborting the whole ``git add``, and
+        ``orchestrator/src/orchestrator/staged_gitlinks.py::unstage_new_gitlinks``
+        unstages the gitlink of any other.
         """
         conflicted = await self._detect_unmerged_paths(worktree)
         if conflicted:
             raise WorktreeConflictError(worktree, conflicted)
 
-        await _run(['git', 'add', '-A', '--', '.', ':!.claude'], cwd=worktree)
+        await _run(
+            ['git', 'add', '-A', '--ignore-errors', '--', '.', ':!.claude'], cwd=worktree,
+        )
+        await unstage_new_gitlinks(worktree, _run)
 
         # Check for changes
         rc, _, _ = await _run(['git', 'diff', '--cached', '--quiet'], cwd=worktree)
@@ -12677,7 +12686,7 @@ class GitOps:
 
     async def get_files_touched_in_branch(
         self, base_sha: str, branch_head: str,
-    ) -> list[str]:
+    ) -> tuple[list[str], Exception | None]:
         """Files touched by any commit in ``base_sha..branch_head``.
 
         Union of file paths that appeared in any commit on the branch
@@ -12685,33 +12694,38 @@ class GitOps:
         Decision-1 check: an architect-declared plan target is "touched"
         if it appears in this set.
 
+        A merge commit counts by its combined diff
+        (``--diff-merges=dense-combined``): only paths whose merged content
+        differs from EVERY parent, i.e. the merge's own conflict-resolution
+        or evil hunks.  A path a back-merge merely brought in from main is
+        not counted; a per-parent diff (``-m``, first-parent) would count
+        everything main brought in.
+
         Excludes ``.task/`` and uses ``--no-renames`` so a rename
         surfaces both old and new paths (the old path is "touched" too).
 
-        Returns ``[]`` on git error so the helper fails open — its
-        consumer logs and proceeds rather than blocking the merge on
-        a transient diff error.
+        Returns a ``(files, error)`` tuple, total and never raising, like
+        :meth:`get_merge_diff_files`: ``(sorted unique paths, None)`` on
+        success, ``([], exception)`` when the history could not be read.
+        An error is returned, never hidden as an empty touched set.
         """
-        rc, output, stderr = await _run(
-            [
-                'git', 'log', '--name-only', '--no-renames',
-                '--pretty=format:', f'{base_sha}..{branch_head}',
-                '--', ':!.task/',
-            ],
-            cwd=self.project_root,
-        )
+        cmd = [
+            'git', 'log', '--name-only', '--no-renames',
+            '--diff-merges=dense-combined',
+            '--pretty=format:', f'{base_sha}..{branch_head}',
+            '--', ':!.task/',
+        ]
+        try:
+            rc, output, stderr = await _run(cmd, cwd=self.project_root)
+        except Exception as exc:
+            return [], exc
         if rc != 0:
             logger.warning(
                 'get_files_touched_in_branch: git log %s..%s failed (rc=%s): %s',
                 base_sha, branch_head, rc, (stderr or '').strip()[:200],
             )
-            return []
-        seen: set[str] = set()
-        for ln in output.splitlines():
-            ln = ln.strip()
-            if ln:
-                seen.add(ln)
-        return sorted(seen)
+            return [], subprocess.CalledProcessError(rc, cmd, output=output, stderr=stderr)
+        return sorted({ln.strip() for ln in output.splitlines() if ln.strip()}), None
 
     async def get_branch_changed_files(
         self, ref: str,
