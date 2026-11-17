@@ -91,20 +91,14 @@ def _coerce_source_assertion(item: object) -> SourceAssertion | None:
 
 
 def load_premise_registry(path: Path | None) -> list[PremiseEntry]:
-    """Load the recon code-fix premise-verification registry from a YAML file; never raises.
+    """Load the recon code-fix premise-verification registry from a YAML file.
 
-    File-level failures (unset path, missing / unreadable / undecodable file,
-    invalid YAML, non-list document) degrade to [] as specified by
-    fused_memory/utils/safe_yaml.py::load_yaml_list_file. Malformed individual
-    entries are skipped with one WARNING each.
+    An unset path yields []. Raises YamlListFileError
+    (fused_memory/utils/safe_yaml.py::load_yaml_list_file) on a file-level
+    failure; malformed entries are skipped with one WARNING each.
     """
     entries: list[PremiseEntry] = []
-    for item in load_yaml_list_file(
-        path,
-        logger=logger,
-        label=_LOG_LABEL,
-        consequence="guard disabled",
-    ):
+    for item in load_yaml_list_file(path):
         if not isinstance(item, dict):
             logger.warning(
                 "%s: skipping non-dict entry in %s: %r",

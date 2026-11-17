@@ -853,11 +853,11 @@ class _LazyRegistry:
                     try:
                         self._entries = await asyncio.to_thread(loader, path)
                     except Exception as exc:
-                        # The loaders never raise (their file-level contract is
-                        # fused_memory/utils/safe_yaml.py::load_yaml_list_file),
-                        # but asyncio.to_thread adds a raise path of its own
-                        # (thread-pool failure or shutdown) that no loader-
-                        # internal except can cover. Fail OPEN (guard
+                        # The loaders raise YamlListFileError on a file-level
+                        # failure (fused_memory/utils/safe_yaml.py::
+                        # load_yaml_list_file), and asyncio.to_thread adds a
+                        # raise path of its own (thread-pool failure or
+                        # shutdown). Fail OPEN (guard
                         # disabled) rather than escaping into the curation
                         # pipeline, which calls the guard methods unguarded —
                         # an escape would defer every candidate in the batch.

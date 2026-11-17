@@ -6344,6 +6344,14 @@ def _make_create_mocks():
     return fake_exact_match, fake_corpus, create_result
 
 
+def _blocklist_warnings(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    """Every WARNING naming the blocklist, whichever module logged it."""
+    return [
+        r for r in caplog.records
+        if r.levelno == logging.WARNING and "blocklist" in r.getMessage()
+    ]
+
+
 @pytest.mark.asyncio
 class TestCuratorBlocklistDisabledOrMissing:
     """Blocklist degradation: misconfigured or absent blocklist must not block task creation."""
@@ -6361,19 +6369,15 @@ class TestCuratorBlocklistDisabledOrMissing:
             config=config, taskmaster=None,
             invoke=AsyncMock(return_value=create_result),
         )
-        with caplog.at_level(logging.WARNING, logger="fused_memory.middleware.cancelled_premise_blocklist"), \
+        with caplog.at_level(logging.WARNING), \
              patch.object(curator, "_pre_llm_exact_match", side_effect=fake_exact_match), \
              patch.object(curator, "_build_corpus", side_effect=fake_corpus):
             decision = await curator.curate(candidate, project_id="p", project_root="/x")
 
         assert decision is not None
         assert decision.action == "create"
-        # No WARNING from the blocklist module (path=None is a deliberate opt-out)
-        blocklist_warns = [
-            r for r in caplog.records
-            if r.name == "fused_memory.middleware.cancelled_premise_blocklist"
-            and r.levelno == logging.WARNING
-        ]
+        # No blocklist WARNING (path=None is a deliberate opt-out)
+        blocklist_warns = _blocklist_warnings(caplog)
         assert len(blocklist_warns) == 0, f"Expected no blocklist warnings, got: {blocklist_warns}"
 
     async def test_nonexistent_path_one_warning_then_silent(self, tmp_path, caplog):
@@ -6391,7 +6395,7 @@ class TestCuratorBlocklistDisabledOrMissing:
             config=config, taskmaster=None,
             invoke=AsyncMock(return_value=create_result),
         )
-        with caplog.at_level(logging.WARNING, logger="fused_memory.middleware.cancelled_premise_blocklist"), \
+        with caplog.at_level(logging.WARNING), \
              patch.object(curator, "_pre_llm_exact_match", side_effect=fake_exact_match), \
              patch.object(curator, "_build_corpus", side_effect=fake_corpus):
             decision1 = await curator.curate(candidate, project_id="p", project_root="/x")
@@ -6401,12 +6405,8 @@ class TestCuratorBlocklistDisabledOrMissing:
         assert decision1.action == "create"
         assert decision2 is not None
 
-        # Exactly one WARNING from the blocklist module (not repeated on second call)
-        blocklist_warns = [
-            r for r in caplog.records
-            if r.name == "fused_memory.middleware.cancelled_premise_blocklist"
-            and r.levelno == logging.WARNING
-        ]
+        # Exactly one blocklist WARNING (not repeated on second call)
+        blocklist_warns = _blocklist_warnings(caplog)
         assert len(blocklist_warns) == 1, (
             f"Expected exactly 1 blocklist WARNING on first call only, got {len(blocklist_warns)}"
         )
@@ -6428,7 +6428,7 @@ class TestCuratorBlocklistDisabledOrMissing:
             config=config, taskmaster=None,
             invoke=AsyncMock(return_value=create_result),
         )
-        with caplog.at_level(logging.WARNING, logger="fused_memory.middleware.cancelled_premise_blocklist"), \
+        with caplog.at_level(logging.WARNING), \
              patch.object(curator, "_pre_llm_exact_match", side_effect=fake_exact_match), \
              patch.object(curator, "_build_corpus", side_effect=fake_corpus):
             decision1 = await curator.curate(candidate, project_id="p", project_root="/x")
@@ -6438,12 +6438,8 @@ class TestCuratorBlocklistDisabledOrMissing:
         assert decision1.action == "create"
         assert decision2 is not None
 
-        # Exactly one WARNING from the blocklist module (not repeated)
-        blocklist_warns = [
-            r for r in caplog.records
-            if r.name == "fused_memory.middleware.cancelled_premise_blocklist"
-            and r.levelno == logging.WARNING
-        ]
+        # Exactly one blocklist WARNING (not repeated)
+        blocklist_warns = _blocklist_warnings(caplog)
         assert len(blocklist_warns) == 1, (
             f"Expected exactly 1 blocklist WARNING, got {len(blocklist_warns)}"
         )
@@ -6467,7 +6463,7 @@ class TestCuratorBlocklistDisabledOrMissing:
             config=config, taskmaster=None,
             invoke=AsyncMock(return_value=create_result),
         )
-        with caplog.at_level(logging.WARNING, logger="fused_memory.middleware.cancelled_premise_blocklist"), \
+        with caplog.at_level(logging.WARNING), \
              patch.object(curator, "_pre_llm_exact_match", side_effect=fake_exact_match), \
              patch.object(curator, "_build_corpus", side_effect=fake_corpus):
             decision = await curator.curate(candidate, project_id="p", project_root="/x")
@@ -6475,11 +6471,7 @@ class TestCuratorBlocklistDisabledOrMissing:
         assert decision is not None
         assert decision.action == "create"
         # No WARNING (empty file is a valid config — not a misconfiguration)
-        blocklist_warns = [
-            r for r in caplog.records
-            if r.name == "fused_memory.middleware.cancelled_premise_blocklist"
-            and r.levelno == logging.WARNING
-        ]
+        blocklist_warns = _blocklist_warnings(caplog)
         assert len(blocklist_warns) == 0, f"Expected no blocklist warnings for empty YAML, got: {blocklist_warns}"
 
 
