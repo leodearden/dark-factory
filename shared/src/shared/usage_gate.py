@@ -32,13 +32,16 @@ from dotenv import load_dotenv
 from shared.account_reserve import (
     ActiveReserve,
     ReserveConfig,
+    ReserveEvent,
     ReserveRefusal,
     ReserveState,
     WorkClassSource,
+    config_event_details,
     first_choice,
     refusal,
     refuses_account,
     resolve_work_class,
+    schedule_drift,
 )
 from shared.cli_invoke import (
     BUDGET_EXHAUSTED_SUBTYPE,
@@ -842,6 +845,9 @@ class UsageGate:
     # keep the wall clock. Declared on the class for the same `__new__` reason
     # as the park clock above.
     _reserve_clock: Callable[[], datetime] | None = None
+    # The configured reset whose drift was last recorded: PRD §6.2 inv. 5's
+    # "at most once per week", without storing a calendar.
+    _reserve_drift_noted_for: datetime | None = None
 
     def __init__(
         self,
@@ -1155,6 +1161,18 @@ class UsageGate:
                 self._fire_cost_event(acct.name, 'auth_failed', json.dumps(details))
         elif new_phase == AccountPhase.PROBE_IN_FLIGHT:
             self._arm_probe_hold(acct)
+
+        self._after_transition_for_reserve(acct, new_phase)
+
+    def _after_transition_for_reserve(self, acct: AccountState, new_phase: AccountPhase) -> None:
+        """The reserve's side of a phase edge: the reserve failing authentication is recorded."""
+        rule = self._active_reserve_config()
+        if rule is None:
+            return
+        if acct.name == rule.account and new_phase == AccountPhase.AUTH_FAILED:
+            self._fire_reserve_event(
+                acct.name, ReserveEvent.ACCOUNT_UNAVAILABLE, {'account': acct.name}
+            )
 
     async def check_at_startup(self) -> None:
         """No-op: pre-existing caps are detected reactively on first invocation.
@@ -2030,6 +2048,7 @@ class UsageGate:
         # _refresh_capped_accounts, independent of whether a phase edge fires.
         acct.resets_at = resets_at
         logger.warning(f'Account {acct.name} CAPPED: {reason}')
+        self._note_reserve_drift(acct, resets_at)
         if acct.phase != AccountPhase.CAPPED:
             # _transition owns: the phase write, near_cap clear, the
             # centralized _open recompute, cancelling/starting the
@@ -2040,6 +2059,28 @@ class UsageGate:
             # and re-fire the cost event on every repeat detection.
             self._transition(acct, AccountPhase.CAPPED, resets_at=resets_at, reason=reason)
         return True
+
+    def _note_reserve_drift(self, acct: AccountState, resets_at: datetime | None) -> None:
+        """Record a reserve cap banner whose reset drifted from the configured one (PRD §6.2 inv. 5).
+
+        Account-level caps only: a scoped banner reports its model's own limit, not the account's
+        weekly reset. Recorded at most once per configured reset; the calendar never moves.
+        """
+        rule = self._active_reserve_config()
+        if rule is None or resets_at is None or acct.name != rule.account:
+            return
+        drift = schedule_drift(rule, resets_at)
+        if drift is None or drift.configured_reset == self._reserve_drift_noted_for:
+            return
+        self._reserve_drift_noted_for = drift.configured_reset
+        self._fire_reserve_event(
+            acct.name,
+            ReserveEvent.SCHEDULE_DRIFT,
+            {
+                'configured_reset': drift.configured_reset.isoformat(),
+                'observed_reset': drift.observed_reset.isoformat(),
+            },
+        )
 
     def _handle_near_cap_warning(
         self,
@@ -2468,6 +2509,29 @@ class UsageGate:
             )
         except Exception as exc:
             logger.warning('CostStore write failed for %s/%s: %s', account_name, event_type, exc)
+
+    def attach_cost_store(self, store: CostStore) -> None:
+        """Give the gate its event store after construction: the one way to do so.
+
+        With a ``reserve:`` block in the accounts file it records ``reserve_config``
+        there (PRD §6.6): the account, calendar and tiers of an active reserve, or
+        an invalid one's reason under account name ``''``. The row goes through the
+        fire-and-forget event writer, so call this on a running event loop. A store
+        passed to the constructor records no ``reserve_config`` row.
+        """
+        self._cost_store = store
+        reserve = self._config.reserve
+        if reserve is None:
+            return
+        account_name = reserve.config.account if isinstance(reserve, ActiveReserve) else ''
+        self._fire_reserve_event(
+            account_name, ReserveEvent.CONFIG, config_event_details(reserve, self._reserve_now())
+        )
+
+    def _fire_reserve_event(
+        self, account_name: str, event: ReserveEvent, details: dict[str, object]
+    ) -> None:
+        self._fire_cost_event(account_name, event.value, json.dumps(details))
 
     def _fire_cost_event(
         self,
