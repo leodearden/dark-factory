@@ -47,10 +47,13 @@ def keeps_read_row(*, operation: str | None, success: bool) -> bool:
 
 _KEPT_OPERATIONS_SQL = ', '.join(f"'{op}'" for op in sorted(READ_OPERATIONS_KEPT_PER_ROW))
 
-COUNT_ONLY_READ_PREDICATE = (
-    "kind = 'read' AND success = 1 "
-    f'AND (operation IS NULL OR operation NOT IN ({_KEPT_OPERATIONS_SQL}))'
+#: The write_ops search and read retention horizons; together they partition kind = 'read' rows.
+KEPT_OPERATION_READ_PREDICATE = f"kind = 'read' AND operation IN ({_KEPT_OPERATIONS_SQL})"
+UNKEPT_OPERATION_READ_PREDICATE = (
+    f"kind = 'read' AND (operation IS NULL OR operation NOT IN ({_KEPT_OPERATIONS_SQL}))"
 )
+
+COUNT_ONLY_READ_PREDICATE = f'{UNKEPT_OPERATION_READ_PREDICATE} AND success = 1'
 
 # History migration (fused-memory/scripts/roll_up_journal_reads.py). Parameters
 # for both: a rowid window (lo, hi), half-open. NOT INDEXED pins the plan to the
