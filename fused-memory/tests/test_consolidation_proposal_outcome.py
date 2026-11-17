@@ -469,6 +469,19 @@ def _row(state, run_id='r', created_at='2026-07-01T00:00:00+00:00', topic=TOPIC)
     )
 
 
+def _acted_row(state, *, reused=False):
+    """A row acted on in *state*; *reused* makes it a memo copy of an earlier row (PRD K4)."""
+    outcome = ProposalOutcome(
+        state=state,
+        acted_run_id='r',
+        acted_at='2026-07-01T00:00:00+00:00',
+        reused_from=ProposalRef(topic=TOPIC, run_id='orig') if reused else None,
+    )
+    return dataclasses.replace(
+        _row(state.value), payload_json=json.dumps({'outcome': outcome.to_payload()}),
+    )
+
+
 class TestRefusalStreak:
     def test_trailing_refusals_after_an_addressed_row(self):
         rows = [
@@ -490,6 +503,41 @@ class TestRefusalStreak:
     def test_an_unknown_state_is_refused_loudly(self):
         with pytest.raises(ValueError, match='bogus'):
             refusal_streak([_row('bogus')])
+
+    def test_a_reused_refusal_neither_counts_nor_resets(self):
+        rows = [
+            _acted_row(ProposalState.REFUSED),
+            _acted_row(ProposalState.REFUSED, reused=True),
+            _acted_row(ProposalState.REFUSED),
+        ]
+        assert refusal_streak(rows) == 2
+
+    def test_a_reused_row_of_any_state_is_skipped(self):
+        rows = [
+            _acted_row(ProposalState.REFUSED),
+            _acted_row(ProposalState.DROPPED, reused=True),
+            _acted_row(ProposalState.UNRESOLVED, reused=True),
+            _acted_row(ProposalState.REFUSED),
+        ]
+        assert refusal_streak(rows) == 2
+
+    @pytest.mark.parametrize(
+        'state', [ProposalState.DROPPED, ProposalState.UNRESOLVED], ids=lambda s: s.value,
+    )
+    def test_an_original_drop_or_unresolved_resets(self, state):
+        rows = [
+            _acted_row(ProposalState.REFUSED),
+            _acted_row(state),
+            _acted_row(ProposalState.REFUSED),
+        ]
+        assert refusal_streak(rows) == 1
+
+    def test_a_row_whose_outcome_cannot_be_decoded_counts_as_an_original(self):
+        undecodable = dataclasses.replace(
+            _row('refused'), payload_json=json.dumps({'outcome': {'state': 'refused'}}),
+        )
+        rows = [undecodable, _acted_row(ProposalState.REFUSED)]
+        assert refusal_streak(rows) == 2
 
 
 class TestNewestPerTopic:
