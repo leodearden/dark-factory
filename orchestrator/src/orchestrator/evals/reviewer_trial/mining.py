@@ -23,13 +23,23 @@ from collections import Counter
 from collections.abc import Collection, Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from shared.merge_subject import MergeSubject, parse_merge_subject
 
 from orchestrator.agents.invoke import invoke_agent
-from orchestrator.evals.measurement import Scored, Unmeasured
+from orchestrator.evals.measurement import (
+    MeasurementStage,
+    Scored,
+    Unmeasured,
+    json_answer,
+    measured_call,
+)
 from orchestrator.evals.reviewer_trial.adjudication import AdjudicationLog
 from orchestrator.evals.reviewer_trial.corpus import CorpusDiff, CorpusManifest, GroundTruthIssue
+
+if TYPE_CHECKING:
+    from shared.cli_invoke import AgentResult
 
 logger = logging.getLogger(__name__)
 
@@ -467,11 +477,11 @@ async def propose_labels_frontier(
     description: str = '',
     oauth_token: str | None = None,
     max_turns: int = 3,
-) -> tuple[list[GroundTruthIssue], float]:
+) -> Scored[list[GroundTruthIssue]] | Unmeasured:
     """Propose ground-truth issue labels for a mined diff via a frontier model.
 
-    Reuses the ``scorer.match_issues`` ``invoke_agent`` pattern (no tools,
-    structured JSON output, cost always reported) but the frontier model
+    Runs through ``measured_call`` like ``scorer.match_issues`` (no tools,
+    structured JSON output, spend always reported) but the frontier model
     proposes NEW issues found in *diff_text* rather than matching against
     existing ground truth.
 
@@ -483,10 +493,11 @@ async def propose_labels_frontier(
     layer richer provenance (model name, diff description, timestamps) on
     top of this.
 
-    Returns ``(issues, cost_usd)``. Never raises: returns ``([], cost_usd)``
-    when the output is unparseable or carries no usable ``issues`` list —
-    the incurred cost is still reported since the tokens were billed
-    regardless (mirrors ``match_issues``' unparseable-output behaviour).
+    Returns ``Scored`` with the proposed issues; an empty list means the
+    model judged the diff clean. Returns ``Unmeasured`` with the spend when
+    the call was refused or the answer carries no usable ``issues`` list, so
+    a refusal is never read as a clean diff. Any other exception propagates
+    (``measured_call``'s contract).
 
     *oauth_token*, when set, is forwarded to ``invoke_agent`` to select a
     specific Claude account from the multi-account pool (env vars
@@ -540,7 +551,12 @@ If there are no issues, return an empty issues list. Output your findings as JSO
         'report issues you are confident are real. Output ONLY valid JSON.'
     )
 
-    result = await invoke_agent(
+    return await measured_call(
+        invoke_agent,
+        _frontier_labels,
+        stage=MeasurementStage.LABEL_PROPOSER,
+        backend='claude',
+        label='frontier label proposer',
         prompt=prompt,
         system_prompt=system_prompt,
         cwd=Path('/home/leo/src/dark-factory'),
@@ -553,22 +569,16 @@ If there are no issues, return an empty issues list. Output your findings as JSO
         oauth_token=oauth_token,
     )
 
-    cost = result.cost_usd
 
-    data = result.structured_output
-    if not data:
-        try:
-            data = json.loads(result.output)
-        except (json.JSONDecodeError, TypeError):
-            logger.warning(
-                'Frontier label proposal produced unparseable output: %s',
-                result.output[:200],
-            )
-            return [], cost
+def _frontier_labels(result: AgentResult) -> list[GroundTruthIssue]:
+    """The proposer's answer as issues, skipping each malformed item.
 
-    raw_issues = data.get('issues') if isinstance(data, dict) else None
+    Raises ``ValueError`` when the answer has no ``issues`` list, or a
+    non-empty one in which no item is well-formed.
+    """
+    raw_issues = json_answer(result).get('issues')
     if not isinstance(raw_issues, list):
-        return [], cost
+        raise ValueError(f'issues is not a list but {type(raw_issues).__name__}')
 
     issues: list[GroundTruthIssue] = []
     for i, raw in enumerate(raw_issues, start=1):
@@ -583,9 +593,10 @@ If there are no issues, return an empty issues list. Output your findings as JSO
             ))
         except (KeyError, TypeError):
             logger.warning('Skipping malformed frontier issue at index %d: %r', i, raw)
-            continue
 
-    return issues, cost
+    if raw_issues and not issues:
+        raise ValueError(f'none of the {len(raw_issues)} proposed issues is well-formed')
+    return issues
 
 
 _LANG_EXTENSIONS = {

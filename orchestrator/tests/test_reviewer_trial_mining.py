@@ -320,11 +320,13 @@ def _proposed_issue(location: str = 'src/foo.py:10') -> dict[str, str]:
 
 
 async def _propose(
-    result: AgentResult, **kwargs: str,
+    result: AgentResult, *, oauth_token: str | None = None,
 ) -> tuple[Scored[list[GroundTruthIssue]] | Unmeasured, AsyncMock]:
     with patch('orchestrator.evals.reviewer_trial.mining.invoke_agent', new_callable=AsyncMock) as mock_invoke:
         mock_invoke.return_value = result
-        outcome = await propose_labels_frontier('diff text', model='opus', description='d', **kwargs)
+        outcome = await propose_labels_frontier(
+            'diff text', model='opus', description='d', oauth_token=oauth_token,
+        )
     return outcome, mock_invoke
 
 

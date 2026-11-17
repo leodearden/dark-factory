@@ -20,7 +20,7 @@ from shared.cli_invoke import AgentResult
 
 from orchestrator.agents.review_briefing import ReviewBriefing
 from orchestrator.config import default_price_table
-from orchestrator.evals.measurement import MeasurementStage, Unmeasured, UnmeasuredCause
+from orchestrator.evals.measurement import MeasurementStage, Scored, Unmeasured, UnmeasuredCause
 from orchestrator.evals.reviewer_trial.__main__ import _select_original_corpus, cli
 from orchestrator.evals.reviewer_trial.corpus import (
     CorpusDiff,
@@ -309,7 +309,7 @@ class TestMineDelegates:
 
         async def propose(diff_text: str, **_kwargs: object):
             if diff_text == 'LABELLED_DIFF':
-                return [_gt('frontier_1')], 0.1
+                return Scored([_gt('frontier_1')], cost_usd=0.1)
             raise RuntimeError('frontier call failed')
 
         runs_db = tmp_path / 'runs.db'
@@ -340,6 +340,8 @@ class TestMineDelegates:
         ]
         assert not any(e.diff_id == 'mined_102' for e in saved_log.entries)
         assert 'Mined 1/2 new diffs' in result.output, result.output
+        assert 'mined_102: proposer did not measure (raised' in result.output, result.output
+        assert 'Unmeasured proposals: 1 ' in result.output, result.output
 
 
 class TestRefreshCommand:
