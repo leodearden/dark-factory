@@ -977,7 +977,7 @@ class TestValidateMemoryMetadata:
         assert self._validate({'kind': 'cycle_summary'}) == []
 
     def test_unknown_kind_censuses_and_is_never_fatal(self):
-        """PRD §10 OQ1 ruled option (b): `kind` is a census axis that only warns."""
+        """PRD §10 OQ1 ruled option (b): `kind` membership is a census axis that only warns."""
         violations = self._validate({'kind': 'not_in_registry_xyz'})
         assert len(violations) == 1
         assert violations[0].code == 'unknown_kind'

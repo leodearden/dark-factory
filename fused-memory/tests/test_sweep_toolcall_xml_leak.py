@@ -1597,7 +1597,7 @@ class TestRunApplyPreflightMetadataGuard:
     @pytest.mark.asyncio
     async def test_an_unknown_kind_is_repaired_under_enforce(self):
         """``_payload``'s ``kind='observation'`` is not in KIND_REGISTRY — the
-        realistic old-corpus shape. ``kind`` never rejects (PRD §10 OQ1,
+        realistic old-corpus shape. ``kind`` membership never rejects (PRD §10 OQ1,
         option (b)), so it must not stop a repair."""
         service = _service([_match('r', _TAIL_LEAK)], enforce=True)
 

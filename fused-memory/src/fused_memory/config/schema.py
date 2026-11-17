@@ -649,7 +649,7 @@ class MemoryMetadataConfig(BaseModel):
     enforcement was on.
 
     ``enforce_kind_registry`` was retired by task 5266 (PRD §10 OQ1 option
-    (b): ``kind`` never rejects); a config still carrying it loads with a
+    (b): ``kind`` membership never rejects); a config still carrying it loads with a
     ``retired key(s)`` WARNING.
 
     Reload tier: ``reload.py``'s ``RELOADABLE_FIELDS`` is an opt-IN allowlist,

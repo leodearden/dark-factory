@@ -4932,9 +4932,10 @@ score the live `kind` population against the frozen
 `memory_metadata.KIND_REGISTRY`. `unregistered` lists live values that are not
 in the registry; `absent_from_corpus` lists registry values with no live
 record. A growing unregistered count is the **expected** steady state: PRD §10
-open question 1 was ruled option (b), so `kind` only warns. Do not top up the
-registry, regenerate the frozen oracle fixture, or file a "registry is stale"
-task. What is worth a look is a step change in `unregistered_records`
+open question 1 was ruled option (b), so `kind` membership only warns (a
+non-str `kind` is still a fatal type defect under `memory_metadata.enforce`).
+Do not top up the registry, regenerate the frozen oracle fixture, or file a
+"registry is stale" task. What is worth a look is a step change in `unregistered_records`
 concentrated on a few values. That means a first-party writer started emitting
 an unregistered kind, as `fused-memory/scripts/cleanup_pin_queue_edges.py` does
 with `pin_queue_edge_cleanup_audit`. The trend is

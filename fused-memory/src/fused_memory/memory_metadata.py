@@ -241,7 +241,7 @@ KIND_REGISTRY: frozenset[str] = frozenset({
     # SINGLETONS.  The population is agent-invented free text and open
     # in practice, which measured D3's "kind writers are in-repo code +
     # prompts" premise FALSE — the reason that question was ruled
-    # option (b): `kind` never rejects.
+    # option (b): `kind` membership never rejects.
     # ---------------------------------------------------------------
     'admin_cleanup_task_filed',
     'architectural_failure_mode',
