@@ -32,11 +32,10 @@ import asyncio
 import json
 import logging
 import sys
-import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 
 from fused_memory.maintenance._utils import ServiceOpen, maintenance_service
-from fused_memory.maintenance.graph_sweep import GraphFailure, read_each_graph
+from fused_memory.maintenance.graph_sweep import GraphFailure, read_each_graph, sweep_complete
 from fused_memory.utils.task_naming import group_task_node_families
 
 logger = logging.getLogger(__name__)
@@ -111,25 +110,31 @@ class GraphCensus:
 class CensusSweep:
     """What a sweep over one or more graphs found.
 
-    ``total_families`` and ``complete`` are summaries of ``graphs`` and
-    ``failures`` rather than independent facts. They are stored rather than
-    derived on access so that ``--json`` emits them (``dataclasses.asdict``
-    sees fields, not properties) — and they cannot drift from what they
-    summarise because :meth:`TaskFamilyCensus.sweep` is this type's only
-    constructor. ``GraphCensus.nodes_scanned`` is stored for the same reason.
+    ``total_families`` and ``complete`` are derived from ``graphs`` and
+    ``failures`` at construction and cannot be passed in, so no sweep can
+    contradict what it summarises. They are fields rather than properties so
+    that ``--json`` emits them (``dataclasses.asdict`` sees fields, not
+    properties). ``GraphCensus.nodes_scanned`` is stored for the same reason.
 
-    ``complete`` is the flag to read before acting on ``total_families``: it is
-    False if ANY graph was truncated OR failed outright. A failed graph is an
-    unknown, not a zero, and the per-graph flags cannot say that on their own —
-    every graph the sweep DID read can be complete while a graph it never read
-    holds the residue that matters.
+    ``complete`` is the flag to read before acting on ``total_families``. It is
+    ``graph_sweep.sweep_complete``'s answer: False if ANY graph was truncated,
+    failed outright, or no graph was read. A failed graph is an unknown, not a
+    zero, and the per-graph flags cannot say that on their own — every graph
+    the sweep DID read can be complete while a graph it never read holds the
+    residue that matters.
     """
 
     graphs: tuple[GraphCensus, ...]
     failures: tuple[GraphFailure, ...]
-    total_families: int
-    complete: bool
+    total_families: int = field(init=False)
+    complete: bool = field(init=False)
     elapsed_ms: float
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, 'total_families', sum(len(graph.families) for graph in self.graphs),
+        )
+        object.__setattr__(self, 'complete', sweep_complete(self.graphs, self.failures))
 
 
 def _describe_variants(variants: tuple[VariantSpelling, ...]) -> str:
@@ -242,27 +247,17 @@ class TaskFamilyCensus:
             ``total_families``.
         """
         graphs = [group_id] if group_id is not None else await self.backend.list_graphs()
-        start = time.monotonic()
-
-        censused, failures = await read_each_graph(
-            graphs, self.run, what='task-family census',
+        reads = await read_each_graph(graphs, self.run, what='task-family census')
+        sweep = CensusSweep(
+            graphs=reads.results, failures=reads.failures, elapsed_ms=reads.elapsed_ms,
         )
-
-        elapsed_ms = (time.monotonic() - start) * 1000
-        total_families = sum(len(graph.families) for graph in censused)
-        complete = not failures and all(graph.complete for graph in censused)
         logger.info(
             'task-family census complete: graphs_censused=%d graphs_failed=%d '
             'fragmented_families=%d complete=%s elapsed_ms=%.1f',
-            len(censused), len(failures), total_families, complete, elapsed_ms,
+            len(sweep.graphs), len(sweep.failures), sweep.total_families, sweep.complete,
+            sweep.elapsed_ms,
         )
-        return CensusSweep(
-            graphs=tuple(censused),
-            failures=tuple(failures),
-            total_families=total_families,
-            complete=complete,
-            elapsed_ms=elapsed_ms,
-        )
+        return sweep
 
 
 async def run_task_family_census(
@@ -352,7 +347,8 @@ def main(argv: list[str] | None = None) -> int:
 
     Returns:
         0 only when every graph was read in full; 1 when any graph was
-        truncated or could not be read at all. A truncated census must never
+        truncated or could not be read at all, or when no graph was read (an
+        empty listing proves nothing). A truncated census must never
         pass for a clean one to a script reading the exit status — the number it
         reports is then a lower bound, and acting on it as a total would
         under-count the residue.

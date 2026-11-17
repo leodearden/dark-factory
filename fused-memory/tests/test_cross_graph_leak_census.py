@@ -402,11 +402,13 @@ class TestCrossGraphLeakCensusSweep:
             'clean': LeakGraph(CLEAN_GRAPH_NODES),
         })
         failed = await sweep_of({'home': LeakGraph(HOME_NODES), 'broken': BrokenGraph()})
+        nothing = await sweep_of({})
 
         assert whole.complete is True
         assert truncated.complete is False
         assert failed.complete is False
         assert all(graph.complete for graph in failed.graphs)
+        assert nothing.complete is False
 
     @pytest.mark.asyncio
     async def test_elapsed_ms_is_a_non_negative_float(self):
@@ -426,6 +428,51 @@ class TestCrossGraphLeakCensusSweep:
         assert isinstance(sweep.graphs, tuple)
         assert isinstance(sweep.failures, tuple)
         assert isinstance(sweep.totals, tuple)
+
+
+def label_leak(label: str, leaked: int | None) -> LabelLeak:
+    """A LabelLeak that is whole exactly when *leaked* is known."""
+    kind = None if leaked is not None else INCOMPLETE_CENSUS_UNAVAILABLE
+    return LabelLeak(
+        label=label, leaked=leaked, by_group_id=(), complete=kind is None, incomplete_kind=kind,
+    )
+
+
+class TestTheSummariesAreDerivedNotSupplied:
+    """Every summary field is computed from what it summarises, so no caller can contradict it."""
+
+    @pytest.mark.parametrize(
+        ('summarised', 'given', 'summary'),
+        [
+            (LeakSweep, {'graphs': (), 'failures': (), 'elapsed_ms': 0.0}, {'totals': ()}),
+            (LeakSweep, {'graphs': (), 'failures': (), 'elapsed_ms': 0.0}, {'complete': True}),
+            (GraphLeaks, {'graph_key': 'home', 'labels': ()}, {'complete': True}),
+        ],
+    )
+    def test_a_caller_supplied_summary_is_refused(self, summarised, given, summary):
+        with pytest.raises(TypeError):
+            summarised(**given, **summary)
+
+    def test_a_directly_built_sweep_derives_its_totals_and_complete_flag(self):
+        home = GraphLeaks(
+            graph_key='home', labels=(label_leak('Entity', 3), label_leak('Episodic', 4)),
+        )
+        broken = GraphFailure(group_id='broken', error='RuntimeError: FalkorDB connection reset')
+
+        sweep = LeakSweep(graphs=(home,), failures=(broken,), elapsed_ms=1.0)
+
+        assert sweep.totals == (
+            LabelTotal(label='Entity', leaked=3),
+            LabelTotal(label='Episodic', leaked=4),
+        )
+        assert sweep.complete is False
+
+    def test_a_graph_is_complete_only_when_every_label_is(self):
+        whole = (label_leak('Entity', 0), label_leak('Episodic', 2))
+        partial = (label_leak('Entity', 0), label_leak('Episodic', None))
+
+        assert GraphLeaks(graph_key='home', labels=whole).complete is True
+        assert GraphLeaks(graph_key='home', labels=partial).complete is False
 
 
 # ---------------------------------------------------------------------------
@@ -531,6 +578,10 @@ class TestTheExitCodeAnswersWasEveryGraphReadWhole:
 
         assert run_main(built_sweep(graphs)) == 1
 
+    def test_a_sweep_that_read_no_graph_exits_one(self):
+        """An empty listing (an empty store, a wrong FALKORDB_URI) proves nothing about leaks."""
+        assert run_main(built_sweep({})) == 1
+
 
 class TestTheTwoOutputShapes:
     def test_json_round_trips_the_whole_sweep(self, capsys):
@@ -576,6 +627,7 @@ class TestTheTwoOutputShapes:
         out = capsys.readouterr().out
         assert '0 graph(s)' in out
         assert 'no graphs read' in out
+        assert 'complete=False' in out
 
 
 class TestTheCliOffersNoWayToMutate:
@@ -635,7 +687,7 @@ class TestCrossGraphLeakCensusLiveFalkorDB:
             await _create(live.graph, 'Episodic', f'episode-{i}', group_id)
 
         leaks = await CrossGraphLeakCensus(
-            graphs=FakeGraphAccess({live.name: live.graph}),
+            graph_access=FakeGraphAccess({live.name: live.graph}),
         ).run(graph_key=live.name)
 
         entity = label_of(leaks, 'Entity')

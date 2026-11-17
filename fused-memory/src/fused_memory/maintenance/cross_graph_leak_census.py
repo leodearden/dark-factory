@@ -15,9 +15,8 @@ import asyncio
 import json
 import logging
 import sys
-import time
 from collections.abc import Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 
 from fused_memory.backends.graph_access import GraphAccess, GraphHandle, OpBoundReader
 from fused_memory.backends.paged_read import (
@@ -27,7 +26,7 @@ from fused_memory.backends.paged_read import (
     census_count,
 )
 from fused_memory.maintenance._utils import ServiceOpen, maintenance_service
-from fused_memory.maintenance.graph_sweep import GraphFailure, read_each_graph
+from fused_memory.maintenance.graph_sweep import GraphFailure, read_each_graph, sweep_complete
 
 logger = logging.getLogger(__name__)
 
@@ -86,11 +85,18 @@ class LabelLeak:
 
 @dataclass(frozen=True)
 class GraphLeaks:
-    """Every label's leak count in the graph named ``graph_key``; ``complete`` is False if any label's is not."""
+    """Every label's leak count in the graph named ``graph_key``.
+
+    ``complete`` is derived from ``labels`` at construction — False if any
+    label's count is not whole — and cannot be passed in.
+    """
 
     graph_key: str
     labels: tuple[LabelLeak, ...]
-    complete: bool
+    complete: bool = field(init=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, 'complete', all(leak.complete for leak in self.labels))
 
 
 @dataclass(frozen=True)
@@ -101,25 +107,42 @@ class LabelTotal:
     leaked: int
 
 
+def _label_totals(graphs: tuple[GraphLeaks, ...]) -> tuple[LabelTotal, ...]:
+    return tuple(
+        LabelTotal(
+            label=label,
+            leaked=sum(
+                leak.leaked or 0
+                for graph in graphs for leak in graph.labels if leak.label == label
+            ),
+        )
+        for label in LEAK_LABELS
+    )
+
+
 @dataclass(frozen=True)
 class LeakSweep:
     """What a sweep over one or more graphs found.
 
-    ``totals`` and ``complete`` summarise ``graphs`` and ``failures``. They are
-    stored rather than derived on access so that ``--json`` emits them
-    (``dataclasses.asdict`` sees fields, not properties), and they cannot drift
-    from what they summarise because :meth:`CrossGraphLeakCensus.sweep` is this
-    type's only constructor.
+    ``totals`` and ``complete`` are derived from ``graphs`` and ``failures`` at
+    construction and cannot be passed in, so no sweep can contradict what it
+    summarises. They are fields rather than properties so that ``--json`` emits
+    them (``dataclasses.asdict`` sees fields, not properties).
 
-    ``complete`` is the flag to read before trusting ``totals``: it is False if
-    ANY graph's count was not whole OR any graph could not be read at all.
+    ``complete`` is the flag to read before trusting ``totals``. It is
+    ``graph_sweep.sweep_complete``'s answer: False if ANY graph's count was not
+    whole, any graph could not be read at all, or no graph was read.
     """
 
     graphs: tuple[GraphLeaks, ...]
     failures: tuple[GraphFailure, ...]
-    totals: tuple[LabelTotal, ...]
-    complete: bool
+    totals: tuple[LabelTotal, ...] = field(init=False)
+    complete: bool = field(init=False)
     elapsed_ms: float
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, 'totals', _label_totals(self.graphs))
+        object.__setattr__(self, 'complete', sweep_complete(self.graphs, self.failures))
 
 
 def _describe_breakdown(groups: tuple[ForeignGroup, ...]) -> str:
@@ -182,11 +205,7 @@ class CrossGraphLeakCensus:
             leak = await self._read_label(handle, graph_key, label)
             _log_label(graph_key, leak)
             labels.append(leak)
-        return GraphLeaks(
-            graph_key=graph_key,
-            labels=tuple(labels),
-            complete=all(leak.complete for leak in labels),
-        )
+        return GraphLeaks(graph_key=graph_key, labels=tuple(labels))
 
     @staticmethod
     async def _read_label(handle: GraphHandle, graph_key: str, label: str) -> LabelLeak:
@@ -224,34 +243,17 @@ class CrossGraphLeakCensus:
             A :class:`LeakSweep`. Read its ``complete`` flag before trusting
             ``totals``.
         """
-        start = time.monotonic()
-        graphs, failures = await read_each_graph(
-            graph_keys, self.run, what='cross-graph leak census',
+        reads = await read_each_graph(graph_keys, self.run, what='cross-graph leak census')
+        sweep = LeakSweep(
+            graphs=reads.results, failures=reads.failures, elapsed_ms=reads.elapsed_ms,
         )
-        elapsed_ms = (time.monotonic() - start) * 1000
-        totals = tuple(
-            LabelTotal(
-                label=label,
-                leaked=sum(
-                    leak.leaked or 0
-                    for graph in graphs for leak in graph.labels if leak.label == label
-                ),
-            )
-            for label in LEAK_LABELS
-        )
-        complete = not failures and all(graph.complete for graph in graphs)
         logger.info(
             'cross-graph leak census complete: graphs_read=%d graphs_failed=%d %s '
             'complete=%s elapsed_ms=%.1f',
-            len(graphs), len(failures), _describe_totals(totals), complete, elapsed_ms,
+            len(sweep.graphs), len(sweep.failures), _describe_totals(sweep.totals),
+            sweep.complete, sweep.elapsed_ms,
         )
-        return LeakSweep(
-            graphs=graphs,
-            failures=failures,
-            totals=totals,
-            complete=complete,
-            elapsed_ms=elapsed_ms,
-        )
+        return sweep
 
 
 async def run_cross_graph_leak_census(
@@ -323,9 +325,9 @@ def main(argv: list[str] | None = None) -> int:
     """CLI entry point: ``python -m fused_memory.maintenance.cross_graph_leak_census``.
 
     Returns:
-        0 only when every graph was read whole; 1 when any count was incomplete
-        or any graph could not be read. It answers "can I trust these numbers",
-        not "were leaks found".
+        0 only when every graph was read whole; 1 when any count was incomplete,
+        any graph could not be read, or no graph was read at all. It answers
+        "can I trust these numbers", not "were leaks found".
     """
     args = _build_parser().parse_args(argv)
     logging.basicConfig(level=logging.INFO)

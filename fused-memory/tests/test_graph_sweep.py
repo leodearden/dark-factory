@@ -1,17 +1,23 @@
 """The best-effort per-graph loop every read-only sweep shares (task 6849).
 
 A failed graph is recorded as structure, never folded into a zero, and an
-operator's Ctrl-C or a cancellation still aborts the sweep.
+operator's Ctrl-C or a cancellation still aborts the sweep. Whether a sweep's
+numbers can be trusted as a whole is decided once, by ``sweep_complete``.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import FrozenInstanceError, fields
+from dataclasses import FrozenInstanceError, dataclass, fields
 
 import pytest
 
-from fused_memory.maintenance.graph_sweep import GraphFailure, read_each_graph
+from fused_memory.maintenance.graph_sweep import (
+    GraphFailure,
+    SweepReads,
+    read_each_graph,
+    sweep_complete,
+)
 
 
 def reader(failing: dict[str, BaseException] | None = None):
@@ -33,24 +39,24 @@ class TestReadEachGraph:
     async def test_results_arrive_in_key_order_one_per_key(self):
         read_one, _ = reader()
 
-        results, failures = await read_each_graph(['b', 'a', 'c'], read_one, what='probe')
+        reads = await read_each_graph(['b', 'a', 'c'], read_one, what='probe')
 
-        assert results == ('read:b', 'read:a', 'read:c')
-        assert failures == ()
+        assert reads.results == ('read:b', 'read:a', 'read:c')
+        assert reads.failures == ()
 
     @pytest.mark.asyncio
     async def test_a_failing_graph_is_recorded_and_the_rest_are_still_read(self):
         read_one, asked = reader({'broken': RuntimeError('FalkorDB connection reset')})
         keys = ['home', 'broken', 'clean']
 
-        results, failures = await read_each_graph(keys, read_one, what='probe')
+        reads = await read_each_graph(keys, read_one, what='probe')
 
-        assert failures == (
+        assert reads.failures == (
             GraphFailure(group_id='broken', error='RuntimeError: FalkorDB connection reset'),
         )
-        assert results == ('read:home', 'read:clean')
+        assert reads.results == ('read:home', 'read:clean')
         assert asked == keys
-        assert len(results) + len(failures) == len(keys)
+        assert len(reads.results) + len(reads.failures) == len(keys)
 
     @pytest.mark.asyncio
     async def test_a_failure_is_logged_at_error_naming_what_and_the_graph(self, caplog):
@@ -74,18 +80,59 @@ class TestReadEachGraph:
 
         assert asked == ['home']
 
-    def test_a_graph_failure_is_frozen(self):
-        failure = GraphFailure(group_id='broken', error='RuntimeError: boom')
+    @pytest.mark.asyncio
+    async def test_the_loop_is_timed_in_milliseconds(self):
+        read_one, _ = reader()
 
-        for field in fields(failure):
-            with pytest.raises(FrozenInstanceError):
-                setattr(failure, field.name, 'other')
+        reads = await read_each_graph(['home'], read_one, what='probe')
+
+        assert isinstance(reads.elapsed_ms, float)
+        assert reads.elapsed_ms >= 0
+
+    @pytest.mark.asyncio
+    async def test_what_it_read_and_each_failure_are_frozen(self):
+        read_one, _ = reader({'broken': RuntimeError('boom')})
+
+        reads = await read_each_graph(['home', 'broken'], read_one, what='probe')
+
+        for frozen in (reads, reads.failures[0]):
+            for field in fields(frozen):
+                with pytest.raises(FrozenInstanceError):
+                    setattr(frozen, field.name, 'other')
+        assert isinstance(reads, SweepReads)
 
     @pytest.mark.asyncio
     async def test_no_keys_reads_nothing(self):
         read_one, asked = reader()
 
-        results, failures = await read_each_graph([], read_one, what='probe')
+        reads = await read_each_graph([], read_one, what='probe')
 
-        assert (results, failures) == ((), ())
+        assert (reads.results, reads.failures) == ((), ())
         assert asked == []
+
+
+@dataclass(frozen=True)
+class Read:
+    """A per-graph result that only says whether its graph was read whole."""
+
+    complete: bool
+
+
+BROKEN = GraphFailure(group_id='broken', error='RuntimeError: boom')
+
+
+class TestSweepComplete:
+    def test_whole_reads_and_no_failures_are_complete(self):
+        assert sweep_complete((Read(True), Read(True)), ()) is True
+
+    def test_one_failed_graph_makes_the_sweep_incomplete_though_every_read_was_whole(self):
+        assert sweep_complete((Read(True), Read(True)), (BROKEN,)) is False
+
+    def test_one_partial_read_makes_the_sweep_incomplete(self):
+        assert sweep_complete((Read(True), Read(False)), ()) is False
+
+    def test_a_sweep_that_read_no_graph_is_not_complete(self):
+        assert sweep_complete((), ()) is False
+
+    def test_a_sweep_whose_every_graph_failed_is_not_complete(self):
+        assert sweep_complete((), (BROKEN,)) is False
