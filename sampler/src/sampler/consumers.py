@@ -61,7 +61,9 @@ __all__ = [
     'account',
     'classify_member',
     'classify_residual',
+    'counter_increment',
     'encode_consumer',
+    'is_gap',
     'parse_consumer',
     'read_tree',
 ]
@@ -514,10 +516,11 @@ def _increment_values(node: CgroupNode, previous: TreeState) -> _Values:
     before = previous.readings.get(node.segments)
     if before is None:
         return _INVALID
-    return _Values(True, {f: _counter_increment(before.get(f), v) for f, v in current.items()})
+    return _Values(True, {f: counter_increment(before.get(f), v) for f, v in current.items()})
 
 
-def _counter_increment(before: int | None, now: int) -> int:
+def counter_increment(before: int | None, now: int) -> int:
+    """D3's counter rule: current - previous, or the current value after a reset or when new."""
     return now if before is None or now < before else now - before
 
 
@@ -601,15 +604,16 @@ def _member_stalls(node: CgroupNode, increments: _Values) -> dict[Figure, int]:
     return {figure: v for figure, v in increments.own.items() if figure in _STALLS}
 
 
-def _is_gap(previous: TreeState | None, now: int, nominal_interval: int) -> bool:
-    return previous is None or not 0 < now - previous.ts <= 2 * nominal_interval
+def is_gap(previous_ts: int | None, now: int, nominal_interval: int) -> bool:
+    """D3's gap: no previous collection, or one more than two intervals old (or ahead)."""
+    return previous_ts is None or not 0 < now - previous_ts <= 2 * nominal_interval
 
 
 def account(
     previous: TreeState | None, current: TreeReading, *, now: int, nominal_interval: int
 ) -> Accounting:
     """Per-consumer gauges and interval increments for one collection (D3)."""
-    gap = _is_gap(previous, now, nominal_interval)
+    gap = is_gap(None if previous is None else previous.ts, now, nominal_interval)
     gauges = {node.segments: _gauge_values(node) for node in current.nodes}
     increments = (
         {node.segments: _INVALID for node in current.nodes}
