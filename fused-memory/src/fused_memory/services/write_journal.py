@@ -324,6 +324,27 @@ READ_HORIZON_INDEX_SQL = (
 )
 
 
+async def _ensure_read_horizon_index(db: aiosqlite.Connection) -> None:
+    """Build ``READ_HORIZON_INDEX`` exactly as ``READ_HORIZON_INDEX_SQL``: its WHERE
+    must equal the read horizon's predicate, or INDEXED BY has no query solution."""
+    rows = list(await db.execute_fetchall(
+        "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?",
+        (READ_HORIZON_INDEX,),
+    ))
+    if rows:
+        built_sql = rows[0][0]
+        if built_sql == READ_HORIZON_INDEX_SQL:
+            return
+        logger.warning(
+            'Migration: rebuilding %s, built as %r instead of %r',
+            READ_HORIZON_INDEX, built_sql, READ_HORIZON_INDEX_SQL,
+        )
+        await db.execute(f'DROP INDEX {READ_HORIZON_INDEX}')
+    started = _monotonic()
+    await db.execute(READ_HORIZON_INDEX_SQL)
+    logger.info('Migration: built %s in %.1f s', READ_HORIZON_INDEX, _monotonic() - started)
+
+
 def _prune_batch_sql(horizon_rows: str, index: str) -> str:
     return (
         'DELETE FROM write_ops WHERE id IN ('
@@ -638,11 +659,7 @@ class WriteJournal:
             await db.execute(
                 'CREATE INDEX IF NOT EXISTS idx_wo_agent_time ON write_ops(agent_id, created_at)'
             )
-            if not await db.execute_fetchall(
-                "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?",
-                (READ_HORIZON_INDEX,),
-            ):
-                await db.execute(READ_HORIZON_INDEX_SQL)
+            await _ensure_read_horizon_index(db)
 
     async def log_write_op(
         self,
