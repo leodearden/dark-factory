@@ -71,8 +71,9 @@ Canonical source: merge_queue.POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX.
 Re-declared here (not imported) to keep b3_gate dependency-light — b3_gate
 uses stdlib sqlite3 only and imports orchestrator.config lazily; importing
 from merge_queue would pull event_store / git_ops / verify at module load.
-A coherence test in test_b3_gate.py asserts these two constants stay in sync
-so they cannot silently drift (see TestPostMergeRedMainAbort.test_coherence_*).
+A coherence test in test_b3_gate_hard_aborts.py asserts these two constants
+stay in sync so they cannot silently drift (see
+TestPostMergeRedMainAbort.test_coherence_*).
 """
 
 DEFAULT_TAG = 'master'
@@ -406,7 +407,7 @@ def check_proposal(
           block_reason, including any other fence, an unterminated one, and
           whatever follows a stray fence line inside captured output.  Pinned
           by
-          orchestrator/tests/test_b3_gate.py::TestStopScanExcludesCapturedOutput.
+          orchestrator/tests/test_b3_gate_hard_aborts.py::TestStopScanExcludesCapturedOutput.
           Hard-aborted before risk_label/git checks, same shape as 1b, and
           takes precedence even over an otherwise-fresh low-risk entry — a
           stop instruction is the highest-authority human directive and must
