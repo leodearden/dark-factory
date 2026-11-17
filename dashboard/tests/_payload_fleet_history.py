@@ -74,6 +74,10 @@ class BurndownShape:
     concurrency_cap: int
     misaligned_hour_every: int
 
+    def __post_init__(self) -> None:
+        if self.misaligned_hour_every < 1:
+            raise ValueError(f'misaligned_hour_every must be at least 1, got {self.misaligned_hour_every}')
+
 
 def _snapshot(project_id: str, at: datetime, counts: Mapping[TaskStatus, int], age: int, cap: int) -> dict[str, object]:
     """One measured row, *age* ticks old: the tree as it stood, one task fewer finished per 36 ticks back."""
@@ -94,8 +98,9 @@ def seed_burndown_history(
 ) -> None:
     """``samples_per_root`` measured snapshots of every tree in *trees*, keyed by root path.
 
-    One collector writes every root into the primary root's store at one
-    instant per tick, as ``burndown.py::collect_snapshot`` does.
+    One collector writes every root into the primary root's store, as
+    ``burndown.py::collect_snapshot`` does, so the roots share one instant per
+    tick, except on the misaligned hourly rows ``BurndownShape`` describes.
     """
     instants = sample_instants(shape.samples_per_root, now)
     rows = [
