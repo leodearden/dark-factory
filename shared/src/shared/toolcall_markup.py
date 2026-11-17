@@ -55,6 +55,13 @@ the sweep's bare list items, prose scans), and an optional keyword would make
 each site's blindness ungreppable. The predicates split by NAME so a reader can
 see at a glance which gates are parameter-aware.
 
+:func:`only_inert_html_closers` refines the REFUSAL path and narrows no gate
+(task **10396**). Three closer names, :data:`HTML_COLLIDING_CLOSER_NAMES`, are
+also ordinary markup element names, so a value quoting an HTML block carries
+their closers. The predicate says whether every needle :func:`detect_for` sees
+is such a closer and terminates no envelope boundary of the call. Callers ask
+it only after :func:`repair` declines, so every value it can fix is still fixed.
+
 ## What ``repair`` guarantees about its OWN output — and what it does not
 
 Two outputs, two different contracts. Confusing them is how this module's one
@@ -121,6 +128,7 @@ from typing import Any, NamedTuple
 __all__ = [
     'CANONICAL_OPENER_PREFIX',
     'ENVELOPE_LITERALS',
+    'HTML_COLLIDING_CLOSER_NAMES',
     'INVOKE_CLOSER',
     'MARKUP_OVERRIDE_KEY',
     'MCP_MARKUP_PATTERNS',
@@ -132,6 +140,7 @@ __all__ = [
     'detect_for',
     'escape_envelope_literals',
     'markup_override_requested',
+    'only_inert_html_closers',
     'repair',
     'strip_markup_override',
 ]
@@ -201,6 +210,17 @@ PREFILTER_NEEDLES: tuple[str, ...] = tuple(
 ENVELOPE_LITERALS: tuple[str, ...] = tuple(
     dict.fromkeys((*PREFILTER_NEEDLES, *MCP_MARKUP_PATTERNS))
 )
+
+#: The closer names that are also ordinary markup element names, so prose
+#: quoting an HTML block spells their closers. Read only by
+#: :func:`only_inert_html_closers`.
+HTML_COLLIDING_CLOSER_NAMES: frozenset[str] = frozenset(
+    (_NAME_DESCRIPTION, _NAME_DETAILS, _NAME_CONTENT)
+)
+
+_HTML_COLLIDING_CLOSERS: dict[str, str] = {
+    closer_for(name): name for name in HTML_COLLIDING_CLOSER_NAMES
+}
 
 
 #: ONE pass over the whole literal set, as an alternation in tuple order.
@@ -323,7 +343,7 @@ def _extra_names(param: str, schema_params: frozenset[str]) -> frozenset[str]:
       widening vocabulary is held exactly equal to the repairer's candidate
       grammar, so a needle can never be spelled for a name :func:`repair` would
       refuse to qualify. It also bounds what a caller-controlled *param* can
-      turn into a cache key: ``_first_markup_argument`` passes each key of the
+      turn into a cache key: ``_markup_arguments`` passes each key of the
       caller's argument mapping straight through.
     """
     names = set(schema_params)
@@ -385,6 +405,49 @@ def detect_for(
     )
     match = _widened_re(names).search(value)
     return match.group(0) if match is not None else None
+
+
+def only_inert_html_closers(
+    value: object,
+    param: object,
+    schema_params: object,
+) -> bool:
+    """Is every needle :func:`detect_for` sees in *value* a quoted HTML closer?
+
+    True iff *value* carries at least one needle of the alternation
+    ``detect_for(value, param, schema_params)`` scans, every occurrence is the
+    closer of a :data:`HTML_COLLIDING_CLOSER_NAMES` name, and every such closer
+    whose name could close a parameter of this call (*param* or a
+    *schema_params* member) leaves the parser short of an item boundary, per
+    :func:`_at_item_boundary`. A closer meeting that terminates no envelope
+    boundary and has no swallowed parameter behind it.
+
+    Any canonical opener, invoke closer, ``parameter`` closer, or closer of a
+    non-colliding *param* or schema name answers False: those are unambiguous
+    harness markup. An empty or unusable schema answers False too (fail-closed,
+    the direction :func:`repair` takes): with no schema nothing can be judged.
+
+    Callers ask this only AFTER :func:`repair` returned ``None``; it widens no
+    gate and replaces no refusal :func:`repair` can turn into a fix.
+
+    Pure, total and one scan of *value*. Each boundary test passes a position,
+    never a slice; see :func:`_at_item_boundary`'s *pos*.
+    """
+    if not value or not isinstance(value, str):
+        return False
+    schema = _as_name_set(schema_params)
+    if not schema:
+        return False
+    own_name = param if isinstance(param, str) else ''
+    seen = False
+    for match in _widened_re(_extra_names(own_name, schema)).finditer(value):
+        name = _HTML_COLLIDING_CLOSERS.get(match.group(0))
+        if name is None:
+            return False
+        if (name == own_name or name in schema) and _at_item_boundary(value, match.end()):
+            return False
+        seen = True
+    return seen
 
 
 # ---------------------------------------------------------------------------

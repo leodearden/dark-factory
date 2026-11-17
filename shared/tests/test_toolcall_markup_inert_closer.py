@@ -59,10 +59,10 @@ _PROSE_WITH_BLOCK = 'Before the block.\n' + _DETAILS_BLOCK + '\nAfter the block.
 class TestTheCollidingNames:
 
     def test_names_are_the_markup_element_names_of_the_enumeration(self):
-        assert HTML_COLLIDING_CLOSER_NAMES == frozenset({'description', 'details', 'content'})
+        assert frozenset({'description', 'details', 'content'}) == HTML_COLLIDING_CLOSER_NAMES
 
     def test_every_name_is_already_enumerated_and_parameter_is_not_one(self):
-        assert HTML_COLLIDING_CLOSER_NAMES <= set(PARAMETER_CLOSER_NAMES)
+        assert set(PARAMETER_CLOSER_NAMES) >= HTML_COLLIDING_CLOSER_NAMES
         assert 'parameter' not in HTML_COLLIDING_CLOSER_NAMES
 
     def test_both_names_are_exported(self):
