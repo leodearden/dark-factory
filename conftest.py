@@ -19,13 +19,9 @@ _ROOT = Path(__file__).parent
 if str(_ROOT) not in sys.path:
     sys.path.append(str(_ROOT))
 
-# Suite-wide isolation (git ceiling: task 3355, incident esc-3072-3; deploy-clock
-# guard: task 3797; leaked-drain-process guard: task 3798; live-fleet-dir
-# redirect: task 3799; mock-derived stray-dir guard: task 5145). The fixture
-# imports are what arm the session GIT_CEILING_DIRECTORIES ceiling, the
-# deploy-clock guard, the leaked-drain-process guard, the ORCH_FLEET_DIR
-# redirect and the mock-derived stray-dir guard; pytest only
-# collects fixtures bound into a conftest's namespace, so the F401 bindings are
+# Each binding below arms one suite-wide defence; df_pytest_isolation.py's
+# module docstring says what each one guards against. pytest only collects
+# fixtures bound into a conftest's namespace, so the F401 bindings are
 # load-bearing.
 from df_pytest_isolation import (  # noqa: E402
     _df_claude_binary_unset,  # noqa: F401  # debt: task 6997

@@ -441,17 +441,31 @@ _REQUIRED_FIXTURE_BINDINGS: dict[str, str] = {
     ),
 }
 
-_WIRING_SNIPPET = (
-    'REPO_ROOT = Path(__file__).resolve().parents[2]\n'
-    'if str(REPO_ROOT) not in sys.path:\n'
-    '    sys.path.append(str(REPO_ROOT))   # APPEND — never insert(0, ...)\n'
-    'from df_pytest_isolation import (\n'
-    + ''.join(f'    {name},  # noqa: F401\n' for name in sorted(_REQUIRED_FIXTURE_BINDINGS))
-    + '    reject_unsafe_basetemp,\n'
-    ')\n'
-    'def pytest_configure(config):\n'
-    '    reject_unsafe_basetemp(config)\n'
-)
+
+def _conftest_sample(
+    bindings: Iterable[str] = tuple(_REQUIRED_FIXTURE_BINDINGS),
+    *,
+    binding_suffix: str = '',
+    bootstrap: str = (
+        'if str(REPO_ROOT) not in sys.path:\n'
+        '    sys.path.append(str(REPO_ROOT))   # APPEND — never insert(0, ...)\n'
+    ),
+    configure_body: str = '    reject_unsafe_basetemp(config)\n',
+) -> str:
+    """A test-root conftest binding *bindings*: the printed remediation and the self-tests' input."""
+    imported = ''.join(f'    {name},{binding_suffix}\n' for name in sorted(bindings))
+    return (
+        'import sys\n'
+        'from pathlib import Path\n'
+        'REPO_ROOT = Path(__file__).resolve().parents[2]\n'
+        f'{bootstrap}'
+        f'from df_pytest_isolation import (\n{imported}    reject_unsafe_basetemp,\n)\n'
+        'def pytest_configure(config):\n'
+        f'{configure_body}'
+    )
+
+
+_WIRING_SNIPPET = _conftest_sample(binding_suffix='  # noqa: F401')
 
 
 def _test_root_conftests() -> list[Path]:
@@ -580,25 +594,6 @@ def _wiring_defects(source: str, conftest: Path) -> list[str]:
     return defects
 
 
-def _conftest_sample(
-    bindings: Iterable[str] = tuple(_REQUIRED_FIXTURE_BINDINGS),
-    *,
-    bootstrap: str = 'if str(REPO_ROOT) not in sys.path:\n    sys.path.append(str(REPO_ROOT))\n',
-    configure_body: str = '    reject_unsafe_basetemp(config)\n',
-) -> str:
-    """A synthetic test-root conftest binding *bindings*, for the detector self-tests."""
-    imported = ''.join(f'    {name},\n' for name in (*sorted(bindings), 'reject_unsafe_basetemp'))
-    return (
-        'import sys\n'
-        'from pathlib import Path\n'
-        'REPO_ROOT = Path(__file__).resolve().parents[2]\n'
-        f'{bootstrap}'
-        f'from df_pytest_isolation import (\n{imported})\n'
-        'def pytest_configure(config):\n'
-        f'{configure_body}'
-    )
-
-
 class TestEveryTestRootConftestIsWired:
     """The defence is uniform across subprojects, and stays that way."""
 
@@ -651,10 +646,17 @@ class TestEveryTestRootConftestIsWired:
 
         assert _wiring_defects(sample, REPO_ROOT / 'orchestrator' / 'tests' / 'conftest.py')
 
-    def test_the_detector_clears_a_correctly_wired_conftest(self) -> None:
-        sample = _conftest_sample()
+    def test_the_detector_clears_the_wiring_snippet_it_prints(self) -> None:
+        """Self-test: the remediation the failures print is wiring the detector accepts.
 
-        assert _wiring_defects(sample, REPO_ROOT / 'orchestrator' / 'tests' / 'conftest.py') == []
+        Otherwise a drift in the snippet would have the guard prescribe a fix it
+        then rejects.
+        """
+        defects = _wiring_defects(
+            _WIRING_SNIPPET, REPO_ROOT / 'orchestrator' / 'tests' / 'conftest.py',
+        )
+
+        assert defects == [], f'{defects}\n{_WIRING_SNIPPET}'
 
     @pytest.mark.parametrize('missing', sorted(_REQUIRED_FIXTURE_BINDINGS))
     def test_the_detector_flags_a_conftest_missing_only_one_required_binding(
