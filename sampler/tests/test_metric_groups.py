@@ -21,6 +21,7 @@ from sampler.metrics import (
     SampleKey,
     arm_metrics,
     collect_load_metrics,
+    every_tick,
     exact_metric_names,
 )
 
@@ -30,7 +31,7 @@ def _no_samples():
 
 
 def _group(name: GroupName, *metrics: MetricSpec, windowed: bool = True) -> MetricGroup:
-    return MetricGroup(name, collect=_no_samples, metrics=metrics, windowed=windowed)
+    return MetricGroup(name, collect=every_tick(_no_samples), metrics=metrics, windowed=windowed)
 
 
 READ_OK = MetricSpec('fixture_read_ok')

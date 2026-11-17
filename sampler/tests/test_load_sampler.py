@@ -13,11 +13,13 @@ import pytest
 
 from sampler.metrics import (
     METRIC_GROUPS,
+    Collected,
     GroupName,
     MetricGroup,
     MetricSpec,
     SampleKey,
     Samples,
+    every_tick,
 )
 
 # ---------------------------------------------------------------------------
@@ -51,12 +53,12 @@ _NOTHING: Samples = MappingProxyType({})
 
 def _collected(
     *, psi: Samples = _NOTHING, process: Samples = _NOTHING, load: Samples = _NOTHING
-) -> dict[MetricGroup, Samples]:
-    """One tick's collection over the live table, a degraded group being ``{}``."""
+) -> dict[MetricGroup, Collected]:
+    """One tick's collection over the live table's every-tick groups, an empty one being ``{}``."""
     return {
-        _GROUPS[GroupName.PSI]: psi,
-        _GROUPS[GroupName.PROCESS]: process,
-        _GROUPS[GroupName.LOAD]: load,
+        _GROUPS[GroupName.PSI]: Collected(psi),
+        _GROUPS[GroupName.PROCESS]: Collected(process),
+        _GROUPS[GroupName.LOAD]: Collected(load),
     }
 
 
@@ -368,10 +370,12 @@ class TestRunTickAdmitsEachGroupAgainstItself:
         from sampler.store import LoadSampleStore
 
         spec = MetricSpec('fixture_metric')
-        group = MetricGroup(GroupName.LOAD, collect=dict, metrics=(spec,), windowed=windowed)
+        group = MetricGroup(
+            GroupName.LOAD, collect=every_tick(dict), metrics=(spec,), windowed=windowed
+        )
         db_path = tmp_path / 'db.sqlite'
 
-        run_tick(LoadSampleStore(db_path), 1_000_000, {group: {spec.key(): 3.5}})
+        run_tick(LoadSampleStore(db_path), 1_000_000, {group: Collected({spec.key(): 3.5})})
 
         ((_ts, value, window_mean, window_max),) = _rows(db_path, spec.key())
         assert value == pytest.approx(3.5)
@@ -380,17 +384,18 @@ class TestRunTickAdmitsEachGroupAgainstItself:
         else:
             assert (window_mean, window_max) == (None, None)
 
-    def test_it_returns_the_groups_it_wrote(self, tmp_path: Path):
-        from sampler.sampler import run_tick
+    def test_it_returns_each_groups_disposition(self, tmp_path: Path):
+        from sampler.sampler import Skipped, run_tick
         from sampler.store import LoadSampleStore
 
         collected = _collected(psi=FAKE_PSI, load={SampleKey('runqueu_ratio'): 1.0})
 
-        written = run_tick(LoadSampleStore(tmp_path / 'db.sqlite'), 1_000_000, collected)
+        dispositions = run_tick(LoadSampleStore(tmp_path / 'db.sqlite'), 1_000_000, collected)
 
-        assert written == {
-            _GROUPS[GroupName.PSI]: FAKE_PSI,
-            _GROUPS[GroupName.PROCESS]: {},
+        assert dispositions == {
+            _GROUPS[GroupName.PSI]: Collected(FAKE_PSI),
+            _GROUPS[GroupName.PROCESS]: Collected({}),
+            _GROUPS[GroupName.LOAD]: Skipped.DROPPED,
         }
 
     def test_every_admitted_group_lands_in_one_write(self, tmp_path: Path):
@@ -407,7 +412,7 @@ class TestRunTickAdmitsEachGroupAgainstItself:
         three_groups = _collected(
             psi=FAKE_PSI, process=FAKE_PROCESS_METRICS, load=FAKE_LOAD_METRICS
         )
-        one_group = {_GROUPS[GroupName.LOAD]: FAKE_LOAD_METRICS}
+        one_group = {_GROUPS[GroupName.LOAD]: Collected(FAKE_LOAD_METRICS)}
         run_tick(store, 999_995, three_groups)
 
         opened.clear()
@@ -457,7 +462,8 @@ def _table(
         return collect
 
     return tuple(
-        dataclasses.replace(group, collect=collector(group.name)) for group in METRIC_GROUPS
+        dataclasses.replace(group, collect=every_tick(collector(group.name)))
+        for group in METRIC_GROUPS
     )
 
 

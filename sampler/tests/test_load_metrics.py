@@ -1302,6 +1302,7 @@ class TestEmittedNamesAreAdmittedByRunTick:
             collect_load_metrics,
             collect_process_metrics,
             collect_psi,
+            every_tick,
         )
 
         pressure = {'cpu': PSI_CPU_TEXT, 'memory': PSI_MEM_TEXT, 'io': PSI_IO_TEXT}
@@ -1317,7 +1318,8 @@ class TestEmittedNamesAreAdmittedByRunTick:
             ),
         }
         return tuple(
-            dataclasses.replace(group, collect=bound[group.name]) for group in METRIC_GROUPS
+            dataclasses.replace(group, collect=every_tick(bound[group.name]))
+            for group in METRIC_GROUPS
         )
 
     def _store_one_tick(self, tmp_path, tree) -> tuple[set[SampleKey], set[SampleKey]]:
@@ -1327,9 +1329,9 @@ class TestEmittedNamesAreAdmittedByRunTick:
         from sampler.sampler import run_tick
         from sampler.store import LoadSampleStore
 
-        collected = {group: group.collect() for group in self._bound_table(tree)}
-        for group, samples in collected.items():
-            unadmitted = sorted(key.label() for key in samples if not group.admits(key))
+        collected = {group: group.collect(1_000_000, None) for group in self._bound_table(tree)}
+        for group, outcome in collected.items():
+            unadmitted = sorted(key.label() for key in outcome.samples if not group.admits(key))
             assert not unadmitted, f'the {group.name} group does not admit {unadmitted}'
 
         db_path = tmp_path / 'db.sqlite'
@@ -1343,7 +1345,7 @@ class TestEmittedNamesAreAdmittedByRunTick:
             }
         finally:
             conn.close()
-        emitted = {key for samples in collected.values() for key in samples}
+        emitted = {key for outcome in collected.values() for key in outcome.samples}
         return emitted, stored
 
     def test_every_name_the_collectors_emit_reaches_the_store(self, tmp_path):

@@ -25,9 +25,10 @@ from sampler.metrics import (
     MetricGroup,
     MetricSpec,
     arm_metrics,
+    every_tick,
     exact_metric_names,
 )
-from sampler.sampler import run_tick
+from sampler.sampler import Skipped, run_tick
 from sampler.store import LoadSampleStore
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -97,10 +98,10 @@ def _table_with(spec: MetricSpec, into: GroupName = GroupName.PROCESS) -> tuple[
 
     return tuple(
         dataclasses.replace(
-            group, metrics=(*group.metrics, spec), collect=emits_only_the_new_spec
+            group, metrics=(*group.metrics, spec), collect=every_tick(emits_only_the_new_spec)
         )
         if group.name is into
-        else dataclasses.replace(group, collect=dict)
+        else dataclasses.replace(group, collect=every_tick(dict))
         for group in METRIC_GROUPS
     )
 
@@ -113,10 +114,12 @@ class TestASpecAddedToTheTableReachesEveryProjection:
         db_path = tmp_path / 'db.sqlite'
 
         written = run_tick(
-            LoadSampleStore(db_path), 1_000_000, {group: group.collect() for group in table}
+            LoadSampleStore(db_path),
+            1_000_000,
+            {group: group.collect(1_000_000, None) for group in table},
         )
 
-        assert len(written) == len(table), 'a group was dropped at admission'
+        assert Skipped.DROPPED not in written.values(), 'a group was dropped at admission'
         conn = sqlite3.connect(str(db_path))
         try:
             stored = conn.execute('SELECT metric, leaf FROM samples').fetchall()
@@ -146,7 +149,7 @@ class TestASpecAddedToTheTableReachesEveryProjection:
 _FIXTURE_TABLE = (
     MetricGroup(
         GroupName.LOAD,
-        collect=dict,
+        collect=every_tick(dict),
         metrics=(
             MetricSpec('fixture_alpha'),
             MetricSpec('fixture_beta', per_leaf=True),

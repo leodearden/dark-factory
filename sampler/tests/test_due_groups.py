@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from sampler.metrics import SampleKey
+from sampler.metrics import GroupName, MetricSpec, SampleKey
 
 ROW = SampleKey('occt_queue_depth')
 GROUP = 'consumers'
@@ -225,3 +226,338 @@ class TestIsGroupDue:
 
     def test_another_groups_stamp_does_not_count(self, tmp_path: Path):
         assert self._attempted_at(tmp_path, 1_000).is_group_due(OTHER, 1_010, self.DUE)
+
+
+# ---------------------------------------------------------------------------
+# Tick: the group contract
+# ---------------------------------------------------------------------------
+
+DUE = 30
+T0 = 1_000_000
+INCREMENT = MetricSpec('fixture_counter_increment')
+LEAF_FIGURE = MetricSpec('fixture_leaf_figure', per_leaf=True)
+
+
+def _due_group(collect: Any, *, due_seconds: int | None = DUE, logs_rows: bool = True):
+    from sampler.metrics import MetricGroup
+
+    return MetricGroup(
+        GroupName.LOAD,
+        collect=collect,
+        metrics=(INCREMENT, LEAF_FIGURE),
+        windowed=False,
+        due_seconds=due_seconds,
+        logs_rows=logs_rows,
+    )
+
+
+def _increments(db_path: Path) -> list[tuple[int, float]]:
+    conn = sqlite3.connect(str(db_path))
+    try:
+        return conn.execute(
+            'SELECT ts, value FROM samples WHERE metric = ? ORDER BY ts', (INCREMENT.name,)
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def _tick(store, now: int, groups):
+    from sampler.sampler import collect_tick, run_tick
+
+    return run_tick(store, now, collect_tick(store, now, groups))
+
+
+class _Recording:
+    """A stateful collector that records what it was handed and returns a scripted state."""
+
+    def __init__(self, *, samples: Any = None, raises: list[BaseException] | None = None):
+        self.calls: list[tuple[int, str | None]] = []
+        self.samples = {} if samples is None else samples
+        self.raises = list(raises or [])
+
+    def __call__(self, now: int, previous: str | None):
+        from sampler.metrics import Collected
+
+        self.calls.append((now, previous))
+        if self.raises:
+            raise self.raises.pop(0)
+        return Collected(self.samples, state=f'state@{now}')
+
+
+class _Counter:
+    """A cumulative counter recorded as increments against the collector's own state."""
+
+    def __init__(self, value: int) -> None:
+        self.value = value
+
+    def __call__(self, now: int, previous: str | None):
+        import json
+
+        from sampler.metrics import Collected
+
+        state = json.dumps(self.value)
+        if previous is None:
+            return Collected({}, state=state)
+        return Collected({INCREMENT.key(): float(self.value - json.loads(previous))}, state=state)
+
+
+class TestTheGroupContract:
+    @pytest.mark.parametrize('due_seconds', [0, -30])
+    def test_due_seconds_must_be_positive(self, due_seconds: int):
+        from sampler.metrics import every_tick
+
+        with pytest.raises(ValueError, match='due_seconds') as raised:
+            _due_group(every_tick(dict), due_seconds=due_seconds)
+        assert str(GroupName.LOAD) in str(raised.value)
+        assert str(due_seconds) in str(raised.value)
+
+    def test_a_due_group_must_be_unwindowed(self):
+        from sampler.metrics import MetricGroup, every_tick
+
+        with pytest.raises(ValueError, match='windowed') as raised:
+            MetricGroup(
+                GroupName.LOAD,
+                collect=every_tick(dict),
+                metrics=(INCREMENT,),
+                windowed=True,
+                due_seconds=DUE,
+            )
+        assert str(GroupName.LOAD) in str(raised.value)
+        assert str(DUE) in str(raised.value)
+
+    def test_an_every_tick_group_may_be_windowed_and_logs_its_rows_by_default(self):
+        from sampler.metrics import MetricGroup, every_tick
+
+        group = MetricGroup(
+            GroupName.LOAD, collect=every_tick(dict), metrics=(INCREMENT,), windowed=True
+        )
+
+        assert group.due_seconds is None
+        assert group.logs_rows is True
+
+    def test_every_tick_adapts_a_zero_argument_collector(self):
+        from sampler.metrics import Collected, every_tick
+
+        collect = every_tick(lambda: {INCREMENT.key(): 1.0})
+
+        assert collect(T0, 'whatever came before') == Collected({INCREMENT.key(): 1.0}, state=None)
+
+
+class TestCollectTickHonoursEachGroupsCadence:
+    def test_an_every_tick_group_is_collected_on_every_call(self, tmp_path: Path):
+        collector = _Recording()
+        group = _due_group(collector, due_seconds=None)
+        store = _store(tmp_path)
+
+        _tick(store, T0, [group])
+        _tick(store, T0 + 1, [group])
+        _tick(store, T0 + 2, [group])
+
+        assert [now for now, _previous in collector.calls] == [T0, T0 + 1, T0 + 2]
+
+    def test_a_due_group_waits_out_its_interval(self, tmp_path: Path):
+        from sampler.metrics import Collected
+        from sampler.sampler import Skipped, collect_tick
+
+        group = _due_group(_Recording())
+        store = _store(tmp_path)
+
+        assert isinstance(collect_tick(store, T0, [group])[group], Collected)
+        _tick(store, T0, [group])
+        assert collect_tick(store, T0 + DUE - 1, [group]) == {group: Skipped.NOT_DUE}
+        assert isinstance(collect_tick(store, T0 + DUE, [group])[group], Collected)
+
+    def test_the_collector_receives_the_state_the_last_written_tick_persisted(self, tmp_path: Path):
+        collector = _Recording()
+        group = _due_group(collector)
+        store = _store(tmp_path)
+
+        _tick(store, T0, [group])
+        _tick(store, T0 + DUE, [group])
+
+        assert collector.calls == [(T0, None), (T0 + DUE, f'state@{T0}')]
+
+
+class TestRunTickPersistsEachGroupsRecord:
+    def test_state_rows_and_stamp_land_together(self, tmp_path: Path):
+        from sampler.store import GroupRecord
+
+        group = _due_group(_Recording(samples={INCREMENT.key(): 4.0}))
+        store = _store(tmp_path)
+
+        _tick(store, T0, [group])
+
+        assert _increments(tmp_path / 'db.sqlite') == [(T0, 4.0)]
+        assert store.read_group_records([GroupName.LOAD]) == {
+            GroupName.LOAD: GroupRecord(attempted_at=T0, state=f'state@{T0}')
+        }
+
+    def test_a_group_dropped_at_admission_keeps_its_state_but_advances_its_stamp(
+        self, tmp_path: Path, caplog
+    ):
+        from sampler.sampler import Skipped
+
+        store = _store(tmp_path)
+        _tick(store, T0, [_due_group(_Recording())])
+        bad = _due_group(_Recording(samples={SampleKey('fixture_misspelt'): 1.0}))
+
+        with caplog.at_level(logging.ERROR):
+            dispositions = _tick(store, T0 + DUE, [bad])
+
+        assert dispositions == {bad: Skipped.DROPPED}
+        record = store.read_group_records([GroupName.LOAD])[GroupName.LOAD]
+        assert record.state == f'state@{T0}'
+        assert record.attempted_at == T0 + DUE
+        assert _increments(tmp_path / 'db.sqlite') == []
+        (error,) = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+        assert str(GroupName.LOAD) in error
+        assert 'fixture_misspelt' in error
+
+
+def _tracebacks(caplog) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if r.levelno >= logging.ERROR and r.exc_info]
+
+
+class TestAFailedCollection:
+    def test_it_writes_nothing_keeps_its_state_and_advances_its_stamp(self, tmp_path: Path):
+        from sampler.sampler import Failed
+
+        db_path = tmp_path / 'db.sqlite'
+        _tick(_store(tmp_path), T0, [_due_group(_Recording(samples={INCREMENT.key(): 1.0}))])
+        failing = _due_group(_Recording(raises=[RuntimeError('cgroupfs went away')]))
+
+        dispositions = _tick(_store(tmp_path), T0 + DUE, [failing])
+
+        (outcome,) = dispositions.values()
+        assert isinstance(outcome, Failed) and outcome.kind == 'RuntimeError'
+        assert _increments(db_path) == [(T0, 1.0)]
+        record = _store(tmp_path).read_group_records([GroupName.LOAD])[GroupName.LOAD]
+        assert record.state == f'state@{T0}'
+        assert record.attempted_at == T0 + DUE
+
+    def test_its_traceback_is_logged_once_per_kind_per_hour_across_processes(
+        self, tmp_path: Path, caplog
+    ):
+        def fail_with(exc: BaseException, now: int) -> int:
+            caplog.clear()
+            with caplog.at_level(logging.ERROR):
+                _tick(_store(tmp_path), now, [_due_group(_Recording(raises=[exc]))])
+            return len(_tracebacks(caplog))
+
+        assert fail_with(RuntimeError('first'), T0) == 1
+        assert str(GroupName.LOAD) in _tracebacks(caplog)[0].getMessage()
+        assert fail_with(RuntimeError('again'), T0 + 30) == 0
+        assert fail_with(OSError('another kind'), T0 + 60) == 1
+        assert fail_with(RuntimeError('still'), T0 + 3599) == 0
+        assert fail_with(RuntimeError('an hour on'), T0 + 3600) == 1
+
+    def test_the_throttle_round_trips_and_a_corrupt_one_reads_empty(self):
+        from sampler.sampler import LogThrottle
+
+        throttle = LogThrottle().logged('RuntimeError', T0)
+
+        assert LogThrottle.from_json(throttle.to_json()) == throttle
+        assert not throttle.should_log('RuntimeError', T0 + 10)
+        assert throttle.should_log('OSError', T0 + 10)
+        assert LogThrottle.from_json('{not json') == LogThrottle()
+        assert LogThrottle.from_json(None) == LogThrottle()
+
+
+class TestACrashMidTickLosesNothingAndCountsNothingTwice:
+    """PRD §7: rows and state commit together, so a lost tick is re-spanned, not dropped."""
+
+    def test_a_process_that_dies_before_writing(self, tmp_path: Path):
+        from sampler.sampler import collect_tick
+
+        counter = _Counter(100)
+        group = _due_group(counter)
+
+        _tick(_store(tmp_path), T0, [group])
+        counter.value = 130
+        collect_tick(_store(tmp_path), T0 + DUE, [group])
+        counter.value = 175
+        _tick(_store(tmp_path), T0 + 2 * DUE, [group])
+
+        assert sum(value for _ts, value in _increments(tmp_path / 'db.sqlite')) == 175 - 100
+
+    def test_a_tick_whose_commit_fails(self, tmp_path: Path):
+        counter = _Counter(100)
+        group = _due_group(counter)
+        spy = Spy()
+        store = _store(tmp_path, spy)
+
+        _tick(store, T0, [group])
+        counter.value = 130
+        spy.commit_fails = True
+        with pytest.raises(sqlite3.OperationalError, match='injected'):
+            _tick(store, T0 + DUE, [group])
+        spy.commit_fails = False
+        counter.value = 175
+        _tick(store, T0 + 2 * DUE, [group])
+
+        assert sum(value for _ts, value in _increments(tmp_path / 'db.sqlite')) == 175 - 100
+
+
+# ---------------------------------------------------------------------------
+# Tick: the journal line
+# ---------------------------------------------------------------------------
+
+
+def _main(monkeypatch, tmp_path: Path, groups, caplog) -> str:
+    import sampler.__main__ as entry
+
+    monkeypatch.setenv('DARK_FACTORY_ROOT', str(tmp_path))
+    caplog.clear()
+    with caplog.at_level(logging.INFO):
+        entry.main(groups=groups)
+    (line,) = [r.getMessage() for r in caplog.records if r.getMessage().startswith('tick ')]
+    return line
+
+
+class TestTheTickLine:
+    LEAVES = ('service@orchestrator-reify.service', 'verify@x-1234abcd', 'kernel')
+
+    def _summarised(self):
+        samples = {LEAF_FIGURE.key(leaf): 1.0 for leaf in self.LEAVES}
+        return _due_group(_Recording(samples={**samples, INCREMENT.key(): 2.0}), logs_rows=False)
+
+    def test_a_group_that_does_not_log_its_rows_renders_one_summary_token(
+        self, monkeypatch, tmp_path: Path, caplog
+    ):
+        line = _main(monkeypatch, tmp_path, [self._summarised()], caplog)
+
+        assert f'{GroupName.LOAD}=rows:4 leaves:3' in line, line
+        for leaf in self.LEAVES:
+            assert leaf not in line, line
+        assert LEAF_FIGURE.name not in line, line
+
+    def test_a_group_that_logs_its_rows_renders_them(self, monkeypatch, tmp_path: Path, caplog):
+        from sampler.metrics import every_tick
+
+        group = _due_group(every_tick(lambda: {INCREMENT.key(): 2.0}), due_seconds=None)
+
+        line = _main(monkeypatch, tmp_path, [group], caplog)
+
+        assert INCREMENT.name in line, line
+
+    def test_a_group_not_yet_due_renders_not_due(self, monkeypatch, tmp_path: Path, caplog):
+        group = self._summarised()
+
+        _main(monkeypatch, tmp_path, [group], caplog)
+        line = _main(monkeypatch, tmp_path, [group], caplog)
+
+        assert f'{GroupName.LOAD}=not-due' in line, line
+
+    def test_a_failed_group_renders_its_exception_class(self, monkeypatch, tmp_path: Path, caplog):
+        group = _due_group(_Recording(raises=[PermissionError('denied')]))
+
+        line = _main(monkeypatch, tmp_path, [group], caplog)
+
+        assert f'{GroupName.LOAD}=failed:PermissionError' in line, line
+
+    def test_a_dropped_group_renders_dropped(self, monkeypatch, tmp_path: Path, caplog):
+        group = _due_group(_Recording(samples={SampleKey('fixture_misspelt'): 1.0}))
+
+        line = _main(monkeypatch, tmp_path, [group], caplog)
+
+        assert f'{GroupName.LOAD}=dropped' in line, line
