@@ -333,7 +333,7 @@ class TestAdjudicatorFlowFields:
 
         assert dict(outcome.repaired) == {'member_not_found': ('m9',)}
         with pytest.raises(TypeError):
-            outcome.repaired['x'] = ('y',)
+            outcome.repaired['x'] = ('y',)  # type: ignore[index]
 
     def test_shown_text_is_capped(self):
         assert SHOWN_TEXT_CHARS == 1500
