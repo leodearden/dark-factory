@@ -6,19 +6,27 @@ import asyncio
 import logging
 import sqlite3
 import uuid
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from shared.jcodemunch_launch import JCODEMUNCH_COMMAND, JCODEMUNCH_ENV
 
 from fused_memory.config.schema import ReconciliationConfig
-from fused_memory.models.reconciliation import StageAgentOutcome, StageId, Watermark
+from fused_memory.models.reconciliation import (
+    ReconciliationRun,
+    RunStatus,
+    RunType,
+    StageAgentOutcome,
+    StageId,
+    Watermark,
+)
 from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
 from fused_memory.reconciliation.cli_stage_runner import STAGE_REPORT_SCHEMA, StageResult
 from fused_memory.reconciliation.stages.base import BaseStage
 from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
 from reconciliation.consolidator_fixtures import make_consolidator
-from reconciliation.harness_fixtures import make_harness
+from reconciliation.harness_fixtures import make_harness, open_journal
 
 
 class _StubStage(BaseStage):
@@ -1055,6 +1063,40 @@ class TestSessionCaptureLifecycle:
 
         if cancelled_write == 'record_run_session':
             runner.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_stage_run_leaves_its_run_row_untouched(self, tmp_path):
+        async with open_journal(tmp_path / 'journal') as journal:
+            await journal.start_run(ReconciliationRun(
+                id='run-row-untouched',
+                project_id='test_project',
+                run_type=RunType.full,
+                trigger_reason='unit-test',
+                started_at=datetime.now(UTC),
+                status=RunStatus.running,
+            ))
+            before = await journal.get_run('run-row-untouched')
+            stage = _make_stage(recon_report_state=None)
+            stage.journal = journal
+            stage.config = ReconciliationConfig(explore_codebase_root=str(tmp_path / 'proj'))
+
+            with patch(
+                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                new=AsyncMock(return_value=StageResult(report={}, success=True)),
+            ):
+                await stage.run(
+                    [], Watermark(project_id='test_project'), [], run_id='run-row-untouched',
+                )
+
+            after = await journal.get_run('run-row-untouched')
+
+        assert before is not None and after is not None
+        assert after == before, (
+            'a stage run must leave its run row untouched: '
+            f'before (session_id, stage_cursor, attempt) = '
+            f'{(before.session_id, before.stage_cursor, before.attempt)!r}, '
+            f'after = {(after.session_id, after.stage_cursor, after.attempt)!r}'
+        )
 
 
 class TestStageTranscriptArchival:
