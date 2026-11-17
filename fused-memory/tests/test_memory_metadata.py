@@ -159,7 +159,7 @@ class TestTopicSlug:
 
         over = 'a' * (TOPIC_SLUG_MAX_LEN + 1)
         assert TOPIC_SLUG_RE.match(over), 'the regex alone must NOT reject it'
-        violations = validate_memory_metadata({'topic': over}, enforce_kind_registry=False)
+        violations = validate_memory_metadata({'topic': over})
         assert {v.code for v in violations} == {'invalid_topic_slug'}
 
     def test_max_len_is_100(self):
@@ -840,16 +840,16 @@ def _by_key(violations, key):
 class TestValidateMemoryMetadata:
     """Pure shape checks (leaf β owns SHAPES ONLY).
 
-    Signature: ``validate_memory_metadata(meta, *, enforce_kind_registry)``
+    Signature: ``validate_memory_metadata(meta)``
     -> ``list[MetadataViolation]``.  It mutates *meta* in place ONLY to
     normalize `supersedes`, mirroring `parse_metadata`'s (value, warnings)
     contract: the caller owns the warn-vs-reject decision.
     """
 
-    def _validate(self, meta, *, enforce_kind_registry=False):
+    def _validate(self, meta):
         from fused_memory.memory_metadata import validate_memory_metadata
 
-        return validate_memory_metadata(meta, enforce_kind_registry=enforce_kind_registry)
+        return validate_memory_metadata(meta)
 
     # -- valid path ------------------------------------------------------
 
@@ -976,12 +976,7 @@ class TestValidateMemoryMetadata:
             'a non-bool canonical is a TYPE defect; canonical_without_topic is '
             'reserved for a genuine `is True`, per §2b\'s isinstance-not-truthiness rule'
         )
-        codes = _codes(
-            self._validate(
-                {'canonical': True, 'kind': 'not_in_registry_xyz'},
-                enforce_kind_registry=True,
-            )
-        )
+        codes = _codes(self._validate({'canonical': True, 'kind': 'not_in_registry_xyz'}))
         assert codes == {'canonical_without_topic', 'unknown_kind'}, (
             'unrelated violations must still be reported alongside, in one pass'
         )
@@ -991,28 +986,13 @@ class TestValidateMemoryMetadata:
     def test_known_kind_accepted(self):
         assert self._validate({'kind': 'cycle_summary'}) == []
 
-    def test_unknown_kind_is_fatal_when_registry_enforced(self):
-        violations = self._validate(
-            {'kind': 'not_in_registry_xyz'}, enforce_kind_registry=True
-        )
-        assert len(violations) == 1
-        assert violations[0].code == 'unknown_kind'
-        assert violations[0].fatal is True
-        assert 'KIND_REGISTRY' in violations[0].message
-
-    def test_unknown_kind_still_censuses_when_registry_not_enforced(self):
-        """Same violation CODE, but non-fatal: it censuses, it does not reject.
-
-        This is the census-refuted-premise carve-out (PRD D3 amendment):
-        242 of 329 live kinds are singletons, so day-one rejection would
-        break the live fleet.
-        """
-        violations = self._validate(
-            {'kind': 'not_in_registry_xyz'}, enforce_kind_registry=False
-        )
+    def test_unknown_kind_censuses_and_is_never_fatal(self):
+        """PRD §10 OQ1 ruled option (b): `kind` is a census axis that only warns."""
+        violations = self._validate({'kind': 'not_in_registry_xyz'})
         assert len(violations) == 1
         assert violations[0].code == 'unknown_kind'
         assert violations[0].fatal is False
+        assert 'KIND_REGISTRY' in violations[0].message
 
     def test_non_str_kind(self):
         assert _codes(self._validate({'kind': 42})) == {'invalid_kind_type'}
@@ -1121,7 +1101,7 @@ class TestValidateMemoryMetadata:
             'supersedes': [42],
             'weird_key': 1,
         }
-        violations = self._validate(meta, enforce_kind_registry=True)
+        violations = self._validate(meta)
         assert _codes(violations) == {
             'invalid_topic_slug',
             'invalid_canonical_type',
@@ -1165,20 +1145,20 @@ class TestValidateMemoryMetadata:
         assert all(v.fatal is True for v in violations)
 
     @pytest.mark.parametrize(
-        ('meta', 'kwargs', 'code'),
+        ('meta', 'code'),
         [
-            ({'weird_key': 1}, {}, 'unknown_key'),
-            ({'kind': 'not_in_registry_xyz'}, {}, 'unknown_kind'),
+            ({'weird_key': 1}, 'unknown_key'),
+            ({'kind': 'not_in_registry_xyz'}, 'unknown_kind'),
         ],
     )
-    def test_census_only_violations_are_not_fatal(self, meta, kwargs, code):
-        """The two census axes never reject under the shipped defaults.
+    def test_census_only_violations_are_not_fatal(self, meta, code):
+        """The two census axes never reject.
 
         `unknown_key` is census-only by design (1,627 distinct live keys);
-        `unknown_kind` is non-fatal unless `enforce_kind_registry` is on,
-        because leaf alpha measured D3's closed-registry premise false.
+        `unknown_kind` is census-only unconditionally (PRD §10 OQ1, option
+        (b)), because D3's closed-registry premise was measured false.
         """
-        violations = [v for v in self._validate(meta, **kwargs) if v.code == code]
+        violations = [v for v in self._validate(meta) if v.code == code]
         assert violations, f'expected a {code} violation'
         assert all(v.fatal is False for v in violations)
 
