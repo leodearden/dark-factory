@@ -28,7 +28,7 @@ pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 # A sidecar's `signal_leaves` names the block(s) whose task status the
 # dashboard reads as the PRD's signal (plans/dashboard-prd-lanes-prd.md §4.7,
 # §5.2). A signal leaf bound to a task this store lacks, or to a task whose own
-# prd_path is another PRD, is reported as a StaleSignalBinding row, never mixed
+# PRD field is another PRD, is reported as a StaleSignalBinding row, never mixed
 # into the other lists.
 # ---------------------------------------------------------------------------
 
@@ -74,10 +74,12 @@ _ROW6 = StaleSignalBinding(
     sidecar_prd="plans/x-prd.md", task_prd="plans/other-prd.md")
 
 
-def test_scan_collects_each_rows_prd_path(make_tasks_db):
+def test_scan_collects_each_rows_coalesced_prd(make_tasks_db):
     """Taken in the SAME one scan, so the signal check reads the snapshot the
-    other two directions read. Only a non-empty string prd_path is kept, and
-    the tag='master' pin covers it too."""
+    other two directions read. Each task's PRD field is read the way the
+    dashboard coalesces it: prd_path, else prd, else prd_ref, the first
+    non-empty string once any '#' or '§' suffix is stripped. The tag='master'
+    pin covers it too."""
     db = make_tasks_db([
         labelled_row(7, prd_path="plans/x-prd.md"),
         _prd_row(8, "plans/y-prd.md"),
@@ -85,12 +87,21 @@ def test_scan_collects_each_rows_prd_path(make_tasks_db):
         {"id": 10, "status": "pending", "metadata": {}},
         {"id": 11, "status": "pending", "metadata": {"prd_path": ""}},
         {**_prd_row(12, "plans/z-prd.md"), "tag": "other-tag"},
+        {"id": 13, "status": "pending", "metadata": {"prd": "plans/w-prd.md"}},
+        {"id": 14, "status": "pending", "metadata": {"prd_ref": "plans/v-prd.md#§2"}},
+        {"id": 15, "status": "pending",
+         "metadata": {"prd_path": "", "prd": "plans/u-prd.md"}},
+        {"id": 16, "status": "pending",
+         "metadata": {"prd_path": "plans/t-prd.md §5.2", "prd": "plans/other-prd.md"}},
     ])
 
     scan = load_task_store_scan(str(db))
 
-    assert scan.prd_paths == {7: "plans/x-prd.md", 8: "plans/y-prd.md"}
-    assert scan.row_ids == {7, 8, 9, 10, 11}
+    assert scan.task_prds == {
+        7: "plans/x-prd.md", 8: "plans/y-prd.md", 13: "plans/w-prd.md",
+        14: "plans/v-prd.md", 15: "plans/u-prd.md", 16: "plans/t-prd.md",
+    }
+    assert scan.row_ids == {7, 8, 9, 10, 11, 13, 14, 15, 16}
     assert scan.delivered_checks == {}
     assert [b.task_id for b in scan.manifest_bindings] == [7]
 
@@ -147,6 +158,48 @@ def test_an_agreeing_signal_binding_is_no_row(tmp_path, make_tasks_db):
     )
 
     assert audit_project(str(root)).stale_signal_bindings == []
+
+
+def _leaf_project(tmp_path, make_tasks_db, leaf_metadata):
+    """Task 7 names plans/x-prd.md; the signal leaf ζ binds task 8, whose
+    metadata is *leaf_metadata*."""
+    return make_project(
+        tmp_path, make_tasks_db,
+        tasks=[_prd_row(7, "plans/x-prd.md"),
+               {"id": 8, "status": "pending", "metadata": leaf_metadata}],
+        manifests=[(_SIGNAL_SIDECAR, _signalling(
+            "plans/x-prd.md", [("α", 7), ("ζ", 8)], ["ζ"]))],
+    )
+
+
+@pytest.mark.parametrize("leaf_metadata", [
+    pytest.param({"prd": "plans/x-prd.md"}, id="prd-only"),
+    pytest.param({"prd_ref": "plans/x-prd.md"}, id="prd_ref-only"),
+    pytest.param({"prd_path": "plans/x-prd.md#goal"}, id="anchor-suffix"),
+    pytest.param({"prd_path": "plans/x-prd.md §5.2"}, id="section-suffix"),
+    pytest.param({"prd_path": "", "prd": "plans/x-prd.md"}, id="empty-prd_path-falls-through"),
+    pytest.param({"prd_path": 5, "prd": "plans/x-prd.md"}, id="non-string-prd_path-skipped"),
+])
+def test_a_signal_leaf_naming_the_sidecars_prd_in_any_dashboard_spelling_is_no_row(
+        tmp_path, make_tasks_db, leaf_metadata):
+    root = _leaf_project(tmp_path, make_tasks_db, leaf_metadata)
+
+    assert audit_project(str(root)).stale_signal_bindings == []
+
+
+@pytest.mark.parametrize(("leaf_metadata", "task_prd"), [
+    pytest.param({"prd_path": "plans/other-prd.md", "prd": "plans/x-prd.md"},
+                 "plans/other-prd.md", id="prd_path-wins"),
+    pytest.param({"prd": "plans/other-prd.md#a"}, "plans/other-prd.md",
+                 id="coalesced-value-reported"),
+])
+def test_prd_path_takes_precedence_over_prd_for_a_signal_leaf(
+        tmp_path, make_tasks_db, leaf_metadata, task_prd):
+    root = _leaf_project(tmp_path, make_tasks_db, leaf_metadata)
+
+    assert audit_project(str(root)).stale_signal_bindings == [StaleSignalBinding(
+        manifest=_SIGNAL_SIDECAR, label="ζ", task_id=8, reason="prd_mismatch",
+        sidecar_prd="plans/x-prd.md", task_prd=task_prd)]
 
 
 @pytest.mark.parametrize("external", [None, {"ζ": "reify:5613"}],
