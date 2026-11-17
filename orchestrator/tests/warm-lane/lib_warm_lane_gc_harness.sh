@@ -38,8 +38,8 @@ source "$WARM_LANE_SCRIPTS_DIR/lib_lane_state.sh"
 # dark-factory's PROTECTED_PREFIXES through lib_lane_state.sh's
 # lane_protect_glob, which starts a python3 and imports orchestrator.git_ops
 # (and transitively pydantic) ONCE PER INVOCATION — measured 1.9-5.6s per
-# invocation on the development host, against the ~22 invocations in this file
-# that reach glob resolution. That is tens of seconds of added wall-clock for a
+# invocation on the development host, against the ~22 invocations in the gc
+# suites that reach glob resolution. That is tens of seconds of added wall-clock for a
 # resolution almost none of those blocks is asserting anything about.
 #
 # run_helper therefore PINS the glob to the shipped static fallback through
@@ -48,7 +48,8 @@ source "$WARM_LANE_SCRIPTS_DIR/lib_lane_state.sh"
 # runs. No new production surface is added for the tests' benefit: this is the
 # knob gc.sh already ships and documents. The pin is an inline command prefix,
 # NEVER an `export`, so the test shell's own environment stays clean for every
-# other call site (same idiom as K4's PATH prefix and O-env's).
+# other call site (same idiom as test_warm_lane_gc.sh's K4 PATH prefix and
+# O-env).
 #
 # The pin is behaviour-NEUTRAL, not merely believed to be. $LANE_PROTECT_GLOB_FALLBACK
 # EQUALS, byte for byte, what gc.sh renders by default, and
@@ -115,8 +116,8 @@ make_gc_fixture() {
 
 # _seed_stub_body — printed to stdout; redirect into a seed-script stub file.
 # Logs its argv to $SEED_LOG and removes the lane's divergent marker (simulates
-# the α reflink-reseed's thinning effect). Shared by the make_task_lane-based
-# fixtures (Block K).
+# the α reflink-reseed's thinning effect). Shared by both gc suites' seeded
+# fixtures, test_warm_lane_gc.sh's make_task_lane-based Block K among them.
 _seed_stub_body() {
     cat << 'STUB_EOF'
 #!/usr/bin/env bash

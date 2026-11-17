@@ -86,7 +86,8 @@ BASH_SUITES: tuple[str, ...] = PORTED_TESTS + NATIVE_TESTS
 #: ``lib_live_refs.sh`` / ``lib_portable.sh`` are deliberately absent — see
 #: ``test_every_invocable_script_has_ported_coverage``.
 SCRIPT_COVERAGE = {
-    # also exercised for real by test_warm_lane_gc_sweep.sh blocks G4/G5/U/W
+    # also exercised for real by test_warm_lane_gc_sweep.sh blocks G4/G5/U/W, and
+    # by test_warm_lane_gc_native.sh (the native half of the gc split, task 6931)
     'warm-lane-gc.sh': 'test_warm_lane_gc.sh',
     'warm-lane-gc-sweep.sh': 'test_warm_lane_gc_sweep.sh',
     # also test_warm_lane_sizing_lifecycle.sh
@@ -377,9 +378,9 @@ def test_every_invocable_script_has_ported_coverage() -> None:
       invocation;
     * ``lib_lane_state.sh`` by the same audit suite's Block L and by
       ``test_lane_state_lib.py``, which pins it directly;
-    * ``lib_lane_seed.sh`` by ``test_warm_lane_gc.sh`` Block V, which drives
-      its one predicate through gc.sh's Pass 1, and A12, its missing-sibling
-      guard (task 7859);
+    * ``lib_lane_seed.sh`` by ``test_warm_lane_gc_native.sh`` Block V, which
+      drives its one predicate through gc.sh's Pass 1, and A12, its
+      missing-sibling guard (task 7859);
     * ``lib_task_citation.sh`` — TWO of its three exports, by
       ``test_warm_lane_degenerate_ref.sh``: every classification runs through
       ``task_citation_message_cites``, and the ``--branch-prefix``

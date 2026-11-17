@@ -208,7 +208,7 @@ make_isolated_lane() {
 #
 # updated_at is stamped from the CLOCK when the 6th argument is omitted, and
 # emitted verbatim when supplied (that is how a caller writes a deliberately
-# stale record -- see test_warm_lane_gc.sh Block S-age).
+# stale record -- see test_warm_lane_gc_native.sh Block S-age).
 #
 # That field used to be the frozen literal 2026-07-26T12:43:10.704531+00:00,
 # justified by "the audit never reads this field". Task 5504 retired that

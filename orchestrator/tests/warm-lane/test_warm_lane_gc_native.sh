@@ -7,18 +7,18 @@
 # Blocks:
 #   A — CLI guard, the native cases: A10, A12, A11a-n/l. A MISSING sibling
 #       scripts/lib_lane_state.sh fails LOUD with exit 2, with
-#       lib_live_refs.sh PRESENT so A9's guard cannot account for it
-#       (A10, task 3075), and so does scripts/lib_lane_seed.sh with both earlier
-#       siblings present (A12, task 7859); --max-record-age-days is validated and a
-#       misconfiguration is FATAL, because EVERY wrong bound is invisible in
-#       the summary line: missing value, non-integer and negative all exit 2
-#       (A11a-A11d), and so do the two doors the `^[0-9]+$` first cut ACCEPTED
-#       — a LEADING ZERO read as octal and an OVERFLOWING magnitude that
-#       wrapped the multiply negative (A11e-A11k, which also pin the env var as
-#       the guard's second door). A11l is the non-vacuity case. What each door
-#       measurably did lives in orchestrator/scripts/warm-lane/README.md
-#       "Delta 10"; what is pinned HERE is only that the guard rejects it
-#       (task 5504)
+#       lib_live_refs.sh PRESENT so the guard test_warm_lane_gc.sh's A9 pins
+#       cannot account for it (A10, task 3075), and so does
+#       scripts/lib_lane_seed.sh with both earlier siblings present (A12, task
+#       7859); --max-record-age-days is validated and a misconfiguration is
+#       FATAL, because EVERY wrong bound is invisible in the summary line:
+#       missing value, non-integer and negative all exit 2 (A11a-A11d), and so
+#       do the two doors the `^[0-9]+$` first cut ACCEPTED — a LEADING ZERO read
+#       as octal and an OVERFLOWING magnitude that wrapped the multiply negative
+#       (A11e-A11k, which also pin the env var as the guard's second door). A11l
+#       is the non-vacuity case. What each door measurably did lives in
+#       orchestrator/scripts/warm-lane/README.md "Delta 10"; what is pinned HERE
+#       is only that the guard rejects it (task 5504)
 #   A11-boundary — the bound is validated BEFORE any lane is touched, which no
 #       Block A case can reach because A11's fixture has no lanes. Glob order
 #       puts a reclaimable lane ahead of the assigned one, so a boundary guard
@@ -38,7 +38,8 @@
 #       record is loud while the ordinary recordless case stays quiet;
 #       S-toctou pins PLACEMENT — a lane assigned MID-PASS is still preserved,
 #       so the read cannot be hoisted into an up-front classification pass
-#       without going RED (GREEN on arrival, like Block R).
+#       without going RED (GREEN on arrival, like test_warm_lane_gc.sh's
+#       Block R).
 #       Task 5504 BOUNDS that preserve, because an unbounded one composed with
 #       the gate's position before the --disk-pressure branch held the ENOSPC
 #       valve shut with the very failure it responds to (a release whose
@@ -91,6 +92,8 @@ SCRIPT="$WARM_LANE_SCRIPTS_DIR/warm-lane-gc.sh"
 }
 # shellcheck source=orchestrator/tests/warm-lane/test_helpers.sh
 source "$SCRIPT_DIR/test_helpers.sh"
+# run_helper/run_helper_live_default, make_repo, make_gc_fixture, _seed_stub_body
+# and _wait_for_reader_lock come from the harness both gc suites share.
 # shellcheck source=orchestrator/tests/warm-lane/lib_warm_lane_gc_harness.sh
 source "$SCRIPT_DIR/lib_warm_lane_gc_harness.sh"
 
@@ -130,8 +133,8 @@ echo "--- Block A: CLI guard (dark-factory-native cases) ---"
 #
 # The fixture copies BOTH gc.sh AND lib_live_refs.sh, deliberately withholding
 # only lib_lane_state.sh. Copying lib_live_refs.sh is what makes the assertion
-# SPECIFIC: without it, A9's guard would fire first and A10 would prove nothing
-# about the new dependency.
+# SPECIFIC: without it, the guard test_warm_lane_gc.sh's A9 pins would fire
+# first and A10 would prove nothing about the new dependency.
 A10_DIR="$(mktemp -d /tmp/test-gc-a10-XXXXXX)"
 _TMPDIRS+=("$A10_DIR")
 cp "$SCRIPT" "$A10_DIR/warm-lane-gc.sh"
@@ -141,7 +144,7 @@ assert "A10: fixture — the copy HAS lib_live_refs.sh and has NO lib_lane_state
 A10_RC=0
 A10_ERR="$(bash "$A10_DIR/warm-lane-gc.sh" --help 2>&1 >/dev/null)" || A10_RC=$?
 # --help normally exits 0, so a 2 here also pins that the guard fires BEFORE
-# argv is parsed — the same ordering property A9 asserts.
+# argv is parsed — the same ordering property test_warm_lane_gc.sh's A9 asserts.
 assert "A10a: missing sibling lib_lane_state.sh exits 2 (wiring error, not runtime 1)" \
     test "$A10_RC" -eq 2
 # The VERBATIM fragment already registered in
@@ -249,7 +252,8 @@ assert "A11h: --max-record-age-days 00 exits 2 (the disable hatch is spelled 0, 
 # The env var is a REAL second door into the same guard, so it must be guarded
 # identically — and the message must name the door the operator actually used,
 # not a flag they never passed. Inline command prefix, NEVER an export, per the
-# file's established REIFY_* idiom (K4's PATH prefix, O-env).
+# gc suites' established REIFY_* idiom (test_warm_lane_gc.sh's K4 PATH prefix
+# and O-env).
 REIFY_WARM_LANE_GC_MAX_RECORD_AGE_DAYS=09 run_helper reclaim \
     --worktrees-dir "$A11_ROOT/worktrees" \
     --base-target "$A11_ROOT/base/target"
@@ -468,7 +472,7 @@ make_lane_state "$SR_WORKTREES" _lane-7 assigned
 make_lane_state "$SR_WORKTREES" _lane-8 assigned 5416
 
 # Live cwd holder under _lane-8/target, established causally (technique R — no
-# wall-clock sleep), exactly as P-basic does.
+# wall-clock sleep), exactly as test_warm_lane_gc.sh's P-basic does.
 SR_READY="$SR_ROOT/lane8-holder.ready"
 ( cd "$SR_WORKTREES/_lane-8/target" && touch "$SR_READY" && exec sleep 300 ) &
 SR_HELPER_PID=$!
@@ -507,8 +511,8 @@ assert "S10b: ...and NOT attributed to the /proc live-reference gate (record is 
     bash -c '! printf "%s\n" "$1" | grep -qF "preserving _lane-8: live consumer (process reference)"' _ "$ERR_OUT"
 # The full adjacent triple pins BOTH the new field's value AND that it was
 # APPENDED after preserved_live_ref rather than interposed — the header's stated
-# rule, and what keeps K5's and P-fd8's `preserved=1 preserved_live_ref=1` greps
-# green.
+# rule, and what keeps test_warm_lane_gc.sh's K5 and P-fd8
+# `preserved=1 preserved_live_ref=1` greps green.
 assert "S11: summary APPENDS preserved_assigned=3 after preserved_live_ref (never interposed)" \
     bash -c 'printf "%s\n" "$1" | grep -qE "preserved=3 preserved_live_ref=0 preserved_assigned=3"' _ "$OUT"
 
@@ -619,17 +623,18 @@ _BGPIDS=()  # clear so EXIT cleanup does not re-kill a possibly-reused PID
 # across a sweep that ran 06:32-06:59 BST while _lane-5 dropped out of the
 # protect set at 06:32 (PRD §2).
 #
-# Mechanism, mirroring P-toctou: gc.sh invokes --seed-script SYNCHRONOUSLY
-# inside the Pass-1 loop, and bash `*/` glob expansion is LC_COLLATE-sorted, so
-# _lane-1 is ALWAYS visited before _lane-2. The ordering is RELIED UPON, not
-# incidental. _lane-1's stub therefore overwrites _lane-2's record — the only
-# place in a hermetic bash test that provably runs between one lane's reset and
-# the next lane's gate.
+# Mechanism, mirroring test_warm_lane_gc.sh's P-toctou: gc.sh invokes
+# --seed-script SYNCHRONOUSLY inside the Pass-1 loop, and bash `*/` glob
+# expansion is LC_COLLATE-sorted, so _lane-1 is ALWAYS visited before _lane-2.
+# The ordering is RELIED UPON, not incidental. _lane-1's stub therefore
+# overwrites _lane-2's record — the only place in a hermetic bash test that
+# provably runs between one lane's reset and the next lane's gate.
 #
 # Expected disposition: GREEN ON ARRIVAL, because step-2 already placed the read
-# inside the loop — recorded here the way Block R records its own. Its job is to
-# go RED against any LATER optimisation that hoists the read into an up-front
-# classification pass, which is precisely what PRD D5 forbids.
+# inside the loop — recorded here the way test_warm_lane_gc.sh's Block R records
+# its own. Its job is to go RED against any LATER optimisation that hoists the
+# read into an up-front classification pass, which is precisely what PRD D5
+# forbids.
 ST_ROOT="$(mktemp -d /tmp/test-gc-st-XXXXXX)"
 _TMPDIRS+=("$ST_ROOT")
 
@@ -707,9 +712,10 @@ assert "S23: summary reset=1 with the preserve attributed to the record gate" \
     bash -c 'printf "%s\n" "$1" | grep -qE "reset=1 .*preserved_assigned=1"' _ "$OUT"
 
 # ── S-pressure: --disk-pressure DOWNGRADES the record gate (task 5504) ────────
-# Block K5 pins one half of the "before BOTH reset branches" contract: under
-# --disk-pressure the LIVE-REFERENCE gate still fires. This is the other half,
-# and it is the half the composition in task 5504 turns on.
+# test_warm_lane_gc.sh's Block K5 pins one half of the "before BOTH reset
+# branches" contract: under --disk-pressure the LIVE-REFERENCE gate still fires.
+# This is the other half, and it is the half the composition in task 5504 turns
+# on.
 #
 # THE DEFECT. The record gate `continue`d unconditionally on ASSIGNED, and it
 # sits BEFORE the --disk-pressure branch. So a lane whose durable record says
@@ -766,8 +772,9 @@ _TMPDIRS+=("$SPA_ROOT")
 _make_sp_fixture "$SPA_ROOT"
 
 # _lane-2 also carries a live cwd holder, established causally (technique R, no
-# wall-clock sleep) exactly as K5 does. It is the lane that proves the downgrade
-# hands the record's verdict to the /proc gate rather than discarding it.
+# wall-clock sleep) exactly as test_warm_lane_gc.sh's K5 does. It is the lane
+# that proves the downgrade hands the record's verdict to the /proc gate rather
+# than discarding it.
 SPA_READY="$SPA_ROOT/lane2-holder.ready"
 ( cd "$SPA_ROOT/worktrees/_lane-2/target" && touch "$SPA_READY" && exec sleep 300 ) &
 SPA_HELPER_PID=$!
@@ -1240,10 +1247,10 @@ assert "V3: the seed received target.gen.2, the gen live now" \
 
 # ── V4: no stamp ⇒ exactly today's behaviour, and no skip-gate diagnostic ─────
 # The ordinary reading for every project that writes no stamp: the eight
-# non-reify units. (a) with a seed, the lane resets as in Block B. (b) their
-# production shape, `--mount` with no --seed-script and no sibling seed: the lane
-# is preserved by the seed-presence guard as in S-discard5c, neither skipped nor
-# failing the pass.
+# non-reify units. (a) with a seed, the lane resets as in test_warm_lane_gc.sh's
+# Block B. (b) their production shape, `--mount` with no --seed-script and no
+# sibling seed: the lane is preserved by the seed-presence guard as in
+# test_warm_lane_gc.sh's S-discard5c, neither skipped nor failing the pass.
 V4A_ROOT="$V_ROOT/v4a"
 _make_v_lane "$V4A_ROOT"
 _run_v "$V4A_ROOT"
@@ -1466,12 +1473,13 @@ assert "X-band7: summary shows removed=1 (the stale stock band)" \
 
 # ── X-degrade: a failed render degrades to the fallback, LOUDLY, without ──────
 # ── aborting the sweep ────────────────────────────────────────────────────────
-# Fixture idiom is A9/A10's (copy the shipped script plus selected siblings into
-# a temp dir), aimed differently: A9/A10 WITHHOLD a lib to reach gc.sh's own
-# sourcing guard, whereas this relocates the copy so lib_lane_state.sh's
-# environment-free root arithmetic (`<lib dir>/../../..`) lands on `/`, whose
-# missing orchestrator/src/orchestrator/git_ops.py witness makes the bridge
-# return non-zero. gc.sh does NOT source lib_portable.sh (that is
+# Fixture idiom is A9/A10's (test_warm_lane_gc.sh's A9 and Block A's A10 here:
+# copy the shipped script plus selected siblings into a temp dir), aimed
+# differently: A9/A10 WITHHOLD a lib to reach gc.sh's own sourcing guard,
+# whereas this relocates the copy so lib_lane_state.sh's environment-free root
+# arithmetic (`<lib dir>/../../..`) lands on `/`, whose missing
+# orchestrator/src/orchestrator/git_ops.py witness makes the bridge return
+# non-zero. gc.sh does NOT source lib_portable.sh (that is
 # warm-lane-audit.sh's), so the three siblings copied here are exactly the three
 # it needs.
 #

@@ -28,7 +28,8 @@
 #   F — preserve a lane with a live-consumer lock — ONE of Pass 1's preserve
 #       gates, holding even for a lane that is ALSO dirty+ahead (5326). It was
 #       the SOLE gate when 5326 collapsed the Tier-3 machinery; 5572 added the
-#       /proc live-reference gate and 3075 the durable-record gate (Block S)
+#       /proc live-reference gate and 3075 the durable-record gate (Block S,
+#       in test_warm_lane_gc_native.sh)
 #   G — combined PRD δ signal: pool lanes (clean + dirty) reset, orphan removed,
 #       ahead orphan + live-consumer lane + protect-glob preserved + summary line
 #   K — disk-pressure fast-path: rm -rf target/ instead of an alpha reseed clone
@@ -37,11 +38,11 @@
 #       the live-reference gate covers THIS branch too — Block P only ever
 #       drives the α branch, so gc.sh's "before BOTH reset branches" claim was
 #       structurally true but unasserted on the destructive one (task 5572
-#       review). K5 and S-pressure are the TWO HALVES OF ONE CONTRACT — K5
-#       pins that --disk-pressure still HONOURS the live-reference gate,
-#       S-pressure that it DOWNGRADES the record gate; a reader who meets
-#       either should read the other, because "downgrade" is only safe
-#       BECAUSE the gate K5 pins is still standing (task 5504)
+#       review). K5 and test_warm_lane_gc_native.sh's S-pressure are the TWO
+#       HALVES OF ONE CONTRACT — K5 pins that --disk-pressure still HONOURS the
+#       live-reference gate, S-pressure that it DOWNGRADES the record gate; a
+#       reader who meets either should read the other, because "downgrade" is
+#       only safe BECAUSE the gate K5 pins is still standing (task 5504)
 #   M — ephemeral verify/sweep worktrees (_mainsweep-*/_mainprobe-*) protected
 #       by the DEFAULT protect-glob, DF-faithful (--mount only, no
 #       --protect-glob) (task 5221)
@@ -80,14 +81,14 @@
 #   S-discard — a seed that did NOT certify the lane (non-zero exit) has its
 #       <lane>/target DISCARDED and counted reset + the appended reset_cold
 #       sub-count, never preserved (task 7862, a port of reify task 5635's
-#       Block S1-S4, renamed because this file's Block S is the record gate).
-#       S-discard2 pins the discard to the seed's EXIT STATUS, S-discard3 a
-#       discard that itself fails (preserved, loud; root-skipped), S-discard4 a
-#       refusal with nothing to discard. S-discard5 is DARK-FACTORY-NATIVE: a
-#       seed script that is missing or not executable — including the
-#       production shape, `--mount` with no --seed-script and no sibling
-#       seed-warm-lane.sh — is never invoked, so nothing is discarded and the
-#       lane is preserved with target/ untouched (README.md "Delta 13")
+#       Block S1-S4, renamed because Block S, in test_warm_lane_gc_native.sh, is
+#       the record gate). S-discard2 pins the discard to the seed's EXIT STATUS,
+#       S-discard3 a discard that itself fails (preserved, loud; root-skipped),
+#       S-discard4 a refusal with nothing to discard. S-discard5 is
+#       DARK-FACTORY-NATIVE: a seed script that is missing or not executable —
+#       including the production shape, `--mount` with no --seed-script and no
+#       sibling seed-warm-lane.sh — is never invoked, so nothing is discarded
+#       and the lane is preserved with target/ untouched (README.md "Delta 13")
 #   T — the base generation is pinned PER LANE, not once per pass (task 7862,
 #       a port of reify task 7366's Block T). T1 rotates the base BETWEEN two
 #       lanes; T2 reaps the gen between gc's resolve and its reader lock, so
@@ -120,6 +121,8 @@ SCRIPT="$WARM_LANE_SCRIPTS_DIR/warm-lane-gc.sh"
 }
 # shellcheck source=tests/infra/test_helpers.sh
 source "$SCRIPT_DIR/test_helpers.sh"
+# run_helper/run_helper_live_default, make_repo, make_gc_fixture, _seed_stub_body
+# and _wait_for_reader_lock come from the harness both gc suites share.
 # shellcheck source=orchestrator/tests/warm-lane/lib_warm_lane_gc_harness.sh
 source "$SCRIPT_DIR/lib_warm_lane_gc_harness.sh"
 
@@ -156,7 +159,8 @@ _TMPDIRS+=("$ERR_FILE")
 # Pass-1 gate to the live-consumer flock alone). make_task_lane is retained: it
 # still builds the ahead-of-main / dirty pool-lane fixtures that Blocks E/K now
 # reclaim via always-reclaim, and the ahead-of-main ORPHAN fixtures Pass 2 still
-# preserves.
+# preserves. The causal live-consumer-lock handshake, _wait_for_reader_lock, is
+# in lib_warm_lane_gc_harness.sh.
 
 # make_task_lane REPO WORKTREES NAME BRANCH [ahead]
 # Creates a lane at WORKTREES/NAME as a git worktree checked out on BRANCH
@@ -705,8 +709,8 @@ assert "E5: stderr mentions unlanded/ahead-of-main preservation (orphan)" \
 # isolating it from the dirty/ahead predicates this block's fixtures also carry.
 # It is no longer the SOLE Pass-1 gate — task 5572 added the /proc
 # live-reference gate (Block P) and task 3075 the durable lane-record gate
-# (Block S). Every lane here is recordless, so those two fall open and this
-# block still isolates the flock.
+# (Block S, in test_warm_lane_gc_native.sh). Every lane here is recordless, so
+# those two fall open and this block still isolates the flock.
 # ──────────────────────────────────────────────────────────────────────────────
 echo ""
 echo "--- Block F: live-consumer flock is Pass 1's first preserve gate ---"
@@ -2076,11 +2080,12 @@ _BGPIDS=()  # clear so EXIT cleanup does not re-kill a possibly-reused PID
 # logged the seed error and counted the lane PRESERVED, leaving the next consumer
 # to inherit an uncertified clone.
 #
-# S-discard1-4 are reify's S1-S4, renamed because this file's Block S is the
-# task-3075 record gate. S-discard5 is dark-factory's own: the discard keys on a
-# non-zero seed status, and in dark-factory the seed script is routinely ABSENT
-# (README.md "Delta 13"), so without a guard every lane would be discarded on
-# every pass for a certification nobody was asked to make.
+# S-discard1-4 are reify's S1-S4, renamed because Block S, in
+# test_warm_lane_gc_native.sh, is the task-3075 record gate. S-discard5 is
+# dark-factory's own: the discard keys on a non-zero seed status, and in
+# dark-factory the seed script is routinely ABSENT (README.md "Delta 13"), so
+# without a guard every lane would be discarded on every pass for a
+# certification nobody was asked to make.
 # ──────────────────────────────────────────────────────────────────────────────
 echo ""
 echo "--- Block S-discard: seed fail-closed abort => discard the uncertified lane target/ (task 7862) ---"
