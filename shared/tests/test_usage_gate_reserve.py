@@ -31,7 +31,7 @@ from shared.account_reserve import (
 from shared.cli_invoke import AllAccountsCappedException
 from shared.config_models import UsageCapConfig
 from shared.cost_store import CostStore
-from shared.invocation_outcome import AuthFailed, CapHit
+from shared.invocation_outcome import OK, AuthFailed, CapHit
 from shared.testing_virtual_clock import virtual_clock_test
 from shared.usage_gate import AccountLease, InvokeSlot, PoolFrozen, UsageGate
 
@@ -909,3 +909,98 @@ class TestTransitionsWakeTheWait:
         assert served is not None and served.name == RESERVE
         await cancel(low)
         await gate.shutdown()
+
+
+CAP_BANNER = "You've hit your usage limit for Claude Pro. Your plan resets in 3 hours."
+HIGH_SERVED: dict[str, object] = {
+    'kind': 'task',
+    'role': 'implementer',
+    'project_id': 'dark_factory',
+    'tier': 'high',
+    'task_id': '8',
+}
+
+
+class TestReserveServed:
+    """B3 and B5: a call on the reserve settling in the protected window is recorded once."""
+
+    async def test_b3_an_admitted_task_is_recorded_with_its_cost(self, tmp_path: Path) -> None:
+        gate, store = refused_state(tmp_path)
+
+        async with gate.invoke_slot(work_class=HIGH) as slot:
+            assert slot.account_name == RESERVE
+            assert slot.work_class is HIGH
+            slot.confirm(1.25)
+
+        assert await events(store, 'reserve_served') == [
+            (RESERVE, {**HIGH_SERVED, 'cost_usd': 1.25})
+        ]
+
+    async def test_b3_essential_work_is_recorded_as_essential(self, tmp_path: Path) -> None:
+        gate, store = refused_state(tmp_path)
+
+        async with gate.invoke_slot(work_class=ESSENTIAL) as slot:
+            slot.confirm(0.75)
+
+        [(_, served)] = await events(store, 'reserve_served')
+        assert served['kind'] == 'essential'
+        assert served['role'] == 'steward'
+        assert served['cost_usd'] == 0.75
+
+    async def test_b5_a_call_in_the_release_window_is_not_recorded(self, tmp_path: Path) -> None:
+        store = make_mock_cost_store()
+        gate = make_reserve_gate(tmp_path, clock=FakeClock(IN_RELEASE), cost_store=store)
+
+        async with gate.invoke_slot(work_class=LOW) as slot:
+            assert slot.account_name == RESERVE
+            slot.confirm(0.5)
+
+        assert await events(store, 'reserve_served') == []
+
+    async def test_a_call_on_another_account_is_not_recorded(self, tmp_path: Path) -> None:
+        store = make_mock_cost_store()
+        gate = make_reserve_gate(tmp_path, clock=FakeClock(), cost_store=store)
+
+        async with gate.invoke_slot(work_class=LOW) as slot:
+            assert slot.account_name == 'max-d'
+            slot.confirm(0.5)
+
+        assert await events(store, 'reserve_served') == []
+
+    async def test_one_verdict_one_row_and_a_report_has_no_cost(self, tmp_path: Path) -> None:
+        gate, store = refused_state(tmp_path)
+
+        async with gate.invoke_slot(work_class=HIGH) as slot:
+            slot.report(OK())
+            slot.confirm(2.0)
+
+        assert await events(store, 'reserve_served') == [
+            (RESERVE, {**HIGH_SERVED, 'cost_usd': None})
+        ]
+
+    async def test_a_slot_left_without_a_verdict_is_not_recorded(self, tmp_path: Path) -> None:
+        gate, store = refused_state(tmp_path)
+
+        async with gate.invoke_slot(work_class=HIGH) as slot:
+            assert slot.account_name == RESERVE
+
+        assert await events(store, 'reserve_served') == []
+
+    async def test_a_detected_cap_is_recorded_without_a_cost(self, tmp_path: Path) -> None:
+        gate, store = refused_state(tmp_path)
+
+        async with gate.invoke_slot(work_class=HIGH) as slot:
+            assert slot.detect_cap_hit('', CAP_BANNER) is True
+
+        assert await events(store, 'reserve_served') == [
+            (RESERVE, {**HIGH_SERVED, 'cost_usd': None})
+        ]
+
+    async def test_the_keyword_reaches_selection(self, tmp_path: Path) -> None:
+        gate, _ = refused_state(tmp_path)
+
+        with pytest.raises(PoolFrozen) as raised:
+            async with gate.invoke_slot(work_class=LOW, park=False):
+                pytest.fail('a refused caller was given a slot')
+
+        assert raised.value.reserved_account == RESERVE
