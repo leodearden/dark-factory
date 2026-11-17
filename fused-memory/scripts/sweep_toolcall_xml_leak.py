@@ -569,7 +569,7 @@ def metadata_accepted(metadata: dict, *, enforce: bool) -> tuple[bool, str]:
     """
     if not enforce:
         return True, ''
-    violations = validate_memory_metadata(dict(metadata), enforce_kind_registry=False)
+    violations = validate_memory_metadata(dict(metadata))
     fatal = [violation for violation in violations if violation.fatal]
     if not fatal:
         return True, ''

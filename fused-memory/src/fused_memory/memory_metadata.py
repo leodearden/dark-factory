@@ -993,9 +993,7 @@ def parent_liveness_violation(parent_id: Any, *, code: str) -> MetadataViolation
     )
 
 
-def validate_memory_metadata(
-    meta: dict[str, Any], *, enforce_kind_registry: bool
-) -> list[MetadataViolation]:
+def validate_memory_metadata(meta: dict[str, Any]) -> list[MetadataViolation]:
     """Shape-check the reserved Mem0 metadata vocabulary (PRD V1, leaf β).
 
     Returns **every** violation found — it never short-circuits at the first
@@ -1045,16 +1043,6 @@ def validate_memory_metadata(
     2. shape-check each reserved key that is PRESENT — absence is never a
        violation, since none of V1's five keys is required;
     3. classify unknown top-level keys (census-only, never fatal).
-
-    :param enforce_kind_registry: whether an unknown ``kind`` is fatal.  The
-        violation is emitted either way — this flag only decides whether it
-        can reject.  It exists because leaf α measured PRD D3's stated
-        premise ("kind writers are in-repo code + prompts, enumerated and
-        grandfathered") FALSE: 242 of the 329 live ``kind`` values are
-        singletons, i.e. the population is agent-invented free text and open
-        in practice.  Day-one strict rejection would convert every newly
-        invented kind into a hard memory-write failure on the live fleet.
-        See PRD §10 open question 1.
     """
     violations: list[MetadataViolation] = []
 
@@ -1168,12 +1156,13 @@ def validate_memory_metadata(
                 fatal=True,
             ))
         elif kind not in KIND_REGISTRY:
+            # Census-only by PRD §10 OQ1 option (b); the registry is the drift baseline.
             violations.append(_violation(
                 'kind',
                 'unknown_kind',
                 f'kind {kind!r} is not in KIND_REGISTRY '
                 f'({len(KIND_REGISTRY)} grandfathered values)',
-                fatal=enforce_kind_registry,
+                fatal=False,
             ))
 
     # 2d. parent_id — SHAPE only.
