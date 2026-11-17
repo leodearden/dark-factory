@@ -29,7 +29,6 @@ from enum import StrEnum
 from orchestrator.config import StarvationWatchdogConfig
 from orchestrator.overrides import OverrideRow, OverrideSource
 from orchestrator.pin_reservation import Blocker
-from orchestrator.sentinel_l1 import SentinelL1
 
 STARVATION_WATCHDOG_ROLE = 'orchestrator-starvation-watchdog'
 # Grep anchor leading every watchdog summary; tests and classifiers key on it.
@@ -200,33 +199,3 @@ def escalation_text(
             f'{counts}\nBlockers:\n{_blocker_lines(blockers)}'
         )
     return summary[:_SUMMARY_LIMIT], detail
-
-
-def cap_escalation(cohort: Sequence[Finding], cfg: StarvationWatchdogConfig) -> SentinelL1:
-    """One L1 naming every pin-worthy firing the auto-pin cap turned away."""
-    lines = '\n'.join(
-        f'- task {f.facts.task_id}: gate {f.gate.value}, eligible_age_secs='
-        f'{f.facts.eligible_age_secs:.0f}, skip_count={f.facts.skip_count}, '
-        f'lock_refusals={f.facts.lock_refusals}, first blocker '
-        + (f'{f.blockers[0].module} {_first_blocker(f.blockers)}' if f.blockers else 'none recorded')
-        for f in cohort
-    )
-    return SentinelL1(
-        AUTO_PIN_CAP_SENTINEL,
-        category='risk_identified',
-        summary=(
-            f'{STARVATION_WATCHDOG_MARKER}: {len(cohort)} starving task(s) not '
-            f'auto-pinned: the cap of {cfg.auto_pin_max_concurrent} watchdog pins is full'
-        ),
-        detail=(
-            f'The starvation watchdog fired on these tasks, but '
-            f'starvation_watchdog.auto_pin_max_concurrent='
-            f'{cfg.auto_pin_max_concurrent} watchdog-owned pins already exist, so '
-            f'none was pinned and no per-task escalation was filed:\n{lines}\n\n'
-            f'Several tasks starving at once usually share one long lock holder.'
-        ),
-        suggested_action=(
-            'Check the first blockers for a wedged holder; pin by hand any task '
-            'that must go first, or raise auto_pin_max_concurrent.'
-        ),
-    )

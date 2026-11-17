@@ -11,13 +11,10 @@ import pytest
 from orchestrator.config import StarvationWatchdogConfig
 from orchestrator.pin_reservation import Blocker, BlockerKind
 from orchestrator.starvation_watchdog import (
-    AUTO_PIN_CAP_SENTINEL,
     STARVATION_WATCHDOG_MARKER,
     CandidateFacts,
-    Finding,
     ParkBlock,
     StarvationGate,
-    cap_escalation,
     classify,
     escalation_text,
 )
@@ -108,15 +105,3 @@ class TestEscalationText:
         assert 'escalation/src' in detail
 
 
-def test_cap_escalation_names_every_capped_task() -> None:
-    cohort = [
-        Finding(_facts(task_id='A', age=FLOOR, skips=50), StarvationGate.DUAL, (HOLDER,)),
-        Finding(_facts(task_id='B', age=FLOOR, refusals=50), StarvationGate.LOCK_REFUSED, ()),
-    ]
-
-    l1 = cap_escalation(cohort, CFG)
-
-    assert l1.sentinel == AUTO_PIN_CAP_SENTINEL
-    assert l1.summary.startswith(STARVATION_WATCHDOG_MARKER)
-    for text in ('A', 'B', 'dual', 'lock_refused', HOLDER.module, str(CFG.auto_pin_max_concurrent)):
-        assert text in l1.detail

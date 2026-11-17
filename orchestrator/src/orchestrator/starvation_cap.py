@@ -4,7 +4,9 @@ The cohort is every pin-gate firing the auto-pin cap turned away, waiting for
 a watchdog pin slot.  The L1 reports a CHANGE in that cohort, not the
 standing backlog, and only when the watchdog can point at something a human
 should look at: a blocker whose holder is not live, or a cohort none of whose
-members has a recorded blocker.  The rule, its thresholds and the liveness
+members has a recorded blocker while some task holds a lock.  An empty lock
+table (the first ticks after a restart, before holders re-dispatch) explains
+nothing either way, so it alarms nothing.  The rule, its thresholds and the liveness
 walk are justified in plans/scheduler-dispatch-scoring-and-lock-layer-prd.md
 C4 Bounds.
 
@@ -83,11 +85,16 @@ class CapReport:
     cap: int
     members: tuple[CohortMember, ...]
     wedges: tuple[Wedge, ...]
+    locks_held: bool
 
     @property
     def unexplained(self) -> bool:
-        """Members wait, yet none has a recorded blocker the watchdog could name."""
-        return bool(self.members) and all(m.first_module is None for m in self.members)
+        """Members wait while locks are held, yet none has a recorded blocker the watchdog could name."""
+        return (
+            self.locks_held
+            and bool(self.members)
+            and all(m.first_module is None for m in self.members)
+        )
 
     @property
     def alarming(self) -> bool:
@@ -116,8 +123,13 @@ class CapAction(StrEnum):
     RESOLVE = 'resolve'
 
 
-def cap_report(waiting: Mapping[str, StarvationGate], world: LockWorld, cap: int) -> CapReport:
-    """The cohort waiting on a full cap, with every non-live holder behind any member's blocker."""
+def cap_report(
+    waiting: Mapping[str, StarvationGate], world: LockWorld, cap: int, *, locks_held: bool,
+) -> CapReport:
+    """The cohort waiting on a full cap, with every non-live holder behind any member's blocker.
+
+    *locks_held* is whether any task holds a lock this tick.
+    """
     members: list[CohortMember] = []
     waiters: dict[NonLiveHolder, list[str]] = {}
     for tid in sorted(waiting):
@@ -133,7 +145,7 @@ def cap_report(waiting: Mapping[str, StarvationGate], world: LockWorld, cap: int
         Wedge(holder, tuple(tids))
         for holder, tids in sorted(waiters.items(), key=lambda kv: (kv[0].blocker, kv[0].reason))
     )
-    return CapReport(cap=cap, members=tuple(members), wedges=wedges)
+    return CapReport(cap=cap, members=tuple(members), wedges=wedges, locks_held=locks_held)
 
 
 def is_news(report: CapReport, baseline: CapBaseline) -> bool:

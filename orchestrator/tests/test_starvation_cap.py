@@ -72,9 +72,11 @@ def _report(
     waiting: Mapping[str, StarvationGate],
     blockers: Mapping[str, Sequence[Blocker]],
     holders: Mapping[str, Mapping[str, Any]],
+    *,
+    locks_held: bool = True,
 ) -> CapReport:
     tasks = {tid: _pending() for tid in waiting} | dict(holders)
-    return cap_report(waiting, _world(tasks, blockers), CAP)
+    return cap_report(waiting, _world(tasks, blockers), CAP, locks_held=locks_held)
 
 
 def _wedged(*members: str, module: str = 'hot/d.py', holder: str = '0') -> CapReport:
@@ -151,6 +153,13 @@ class TestCapReport:
         assert report.unexplained
         assert report.alarming
         assert report.subjects == frozenset({'S3', 'S4'})
+
+    def test_a_cohort_without_blockers_while_no_lock_is_held_is_not_alarming(self) -> None:
+        report = _report({'S3': REFUSED, 'S4': DUAL}, {}, {}, locks_held=False)
+
+        assert not report.unexplained
+        assert not report.alarming
+        assert report.subjects == frozenset()
 
     def test_one_member_without_blockers_among_live_holders_is_not_alarming(self) -> None:
         report = _report(

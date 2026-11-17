@@ -71,6 +71,7 @@ from orchestrator.already_landed_tick_view import (
     PendingEscalationsByTask,
 )
 from orchestrator.anchor_coverage_gate import AnchorCoverageGate
+from orchestrator.blocker_liveness import LockWorld
 from orchestrator.config import (
     DEFAULT_TIER,
     PRIORITY_RANK,
@@ -102,6 +103,7 @@ from orchestrator.park_eviction_requests import ParkEvictionRequestStore
 from orchestrator.pause_policy import PauseClass, PausePolicy, policy_for
 from orchestrator.pending_age import AnchorReading, read_pending_age
 from orchestrator.pin_reservation import (
+    Blocker,
     ParkPriority,
     PinBlockedLimiter,
     PinOrder,
@@ -125,6 +127,7 @@ from orchestrator.recovery_emission import (
 )
 from orchestrator.recovery_pins import records_pin_blocked_recovery
 from orchestrator.sentinel_l1 import file_sentinel_l1, resolve_sentinel_l1
+from orchestrator.starvation_cap import CapReport, cap_report, sync_cap_l1
 from orchestrator.starvation_state import StarvationStateStore, WatchdogState
 from orchestrator.starvation_watchdog import (
     AUTO_PIN_CAP_SENTINEL,
@@ -134,7 +137,6 @@ from orchestrator.starvation_watchdog import (
     ParkBlock,
     PinOutcome,
     StarvationDisposition,
-    cap_escalation,
     classify,
     escalation_text,
 )
@@ -1893,9 +1895,9 @@ class Scheduler:
         # Whether the escalated set has been seeded from the open watchdog
         # escalations a previous process filed (task 3821).
         self._starvation_rehydrated = False
-        # Whether the cap L1 naming the waiting cohort may be open, so it is
-        # resolved once none waits.
-        self._cap_sentinel_maybe_open = False
+        # The cap report the queue last reflected; the cap L1 is re-synced
+        # only when the report changes (a failed sync retries next tick).
+        self._last_cap_report: CapReport | None = None
         # --- Warm-base hard-down watchdog state (task 2061) ---
         # SINGLETON latch — one host-scoped warm-lane CoW seed base, so exactly
         # one signal/window/L2 (unlike the starvation watchdog's per-task dict/
@@ -3704,36 +3706,83 @@ class Scheduler:
         ``starvation_watchdog.py`` and delivers every finding whose task a
         live status read still shows ``pending`` (INV-3); a failed read
         delivers nothing, so the findings recur next tick.  A capped task
-        waiting on a full cap is not re-delivered until a slot frees.  Called
-        once per tick by ``_phase_starvation``, whose try/except keeps a
-        watchdog failure from ever aborting the tick (PROPERTY 1).
+        waiting on a full cap is not re-delivered until a slot frees, and
+        leaves the waiting cohort once it is a candidate that no longer fires
+        a pinning gate (a hot-reload) or the watchdog is disabled.  Every pass
+        ends by syncing the cap L1 with the cohort.  Called once per tick by
+        ``_phase_starvation``, whose try/except keeps a watchdog failure from
+        ever aborting the tick (PROPERTY 1).
         """
         now = self._wall_now()
         candidates = {str(t.get('id', '')): t for t in ctx.candidates}
         candidates.pop('', None)
         self._eligibility.observe(candidates, now)
         self._rehydrate_starvation_escalated()
+        state = self._watchdog_state
         if not self.config.starvation_watchdog.enabled:
+            state.drop_waiting(list(state.waiting()))
+            self._sync_cap_l1(ctx, now, ())
             return
         free_slots = self.config.starvation_watchdog.auto_pin_max_concurrent - sum(
             1 for row in ctx.overrides.values()
             if row.pinned and row.source is OverrideSource.STARVATION_WATCHDOG
         )
+        all_findings = self._starvation_findings(candidates, now)
+        firing = {f.facts.task_id for f in all_findings if f.gate.pins}
+        state.drop_waiting([
+            tid for tid in state.waiting() if tid in candidates and tid not in firing
+        ])
         findings = [
-            f for f in self._starvation_findings(candidates, now)
+            f for f in all_findings
             if free_slots > 0 or not self._awaits_pin_slot(f, ctx.overrides)
         ]
         if findings:
             statuses, err = await self.get_statuses([f.facts.task_id for f in findings])
-            if err is not None:
+            if err is None:
+                live = [f for f in findings if statuses.get(f.facts.task_id) == 'pending']
+                await self._deliver_starvation_findings(ctx, live, free_slots, now)
+            else:
                 logger.warning(
                     'Starvation watchdog: live status read failed (%r); delivering '
                     'none of %d finding(s) this tick', err, len(findings),
                 )
-                return
-            live = [f for f in findings if statuses.get(f.facts.task_id) == 'pending']
-            await self._deliver_starvation_findings(ctx, live, free_slots, now)
-        self._resolve_cap_sentinel_once_drained()
+        self._sync_cap_l1(ctx, now, all_findings)
+
+    def _sync_cap_l1(
+        self, ctx: TickContext, now: datetime, findings: Sequence[Finding],
+    ) -> None:
+        """Bring the auto-pin cap L1 in line with the waiting cohort (task 9636).
+
+        The L1 is open only while the cohort is non-empty and alarming, and
+        names that cohort; ``starvation_cap.py`` holds the rule.  This tick's
+        findings already carry their blockers; any other task's are read from
+        the lock table once per pass.
+        """
+        known: dict[str, tuple[Blocker, ...]] = {f.facts.task_id: f.blockers for f in findings}
+
+        def blockers_of(task_id: str) -> tuple[Blocker, ...]:
+            if task_id not in known:
+                task = ctx.tasks_by_id.get(task_id)
+                known[task_id] = () if task is None else tuple(
+                    self.lock_table.blockers(task_id, self._get_modules(task)),
+                )
+            return known[task_id]
+
+        world = LockWorld(
+            tasks=ctx.tasks_by_id,
+            blockers_of=blockers_of,
+            now=now,
+            claimant_ttl=timedelta(seconds=self.config.claimant_liveness_ttl_secs),
+        )
+        report = cap_report(
+            self._watchdog_state.waiting(), world,
+            cap=self.config.starvation_watchdog.auto_pin_max_concurrent,
+            locks_held=bool(self.lock_table.snapshot_held_by_task()),
+        )
+        if report == self._last_cap_report:
+            return
+        if sync_cap_l1(self.escalation_queue, report, self._watchdog_state):
+            self._last_cap_report = report
 
     def _starvation_findings(
         self, candidates: Mapping[str, dict[str, Any]], now: datetime,
@@ -3782,9 +3831,7 @@ class Scheduler:
             )
             return
         for esc in pending:
-            if esc.task_id == AUTO_PIN_CAP_SENTINEL:
-                self._cap_sentinel_maybe_open = True
-            elif esc.agent_role == STARVATION_WATCHDOG_ROLE:
+            if esc.agent_role == STARVATION_WATCHDOG_ROLE and esc.task_id != AUTO_PIN_CAP_SENTINEL:
                 self._mark_starvation_announced(esc.task_id)
         self._starvation_rehydrated = True
 
@@ -3793,13 +3840,11 @@ class Scheduler:
     ) -> None:
         """Deliver this pass's findings oldest first, auto-pinning within *free_slots*.
 
-        A pin-gate finding the cap turns away files no escalation of its own
-        and is announced once: one sentinel L1 names the newly capped cohort,
-        and the task joins the durable waiting cohort until a slot frees.  A failure on
-        one finding is logged and leaves it undelivered, to retry next tick
-        (PROPERTY 1).
+        A pin-gate finding the cap turns away files no escalation of its own:
+        it is delivered once and joins the durable waiting cohort until a slot
+        frees, and the cap L1 speaks for the cohort.  A failure on one finding
+        is logged and leaves it undelivered, to retry next tick (PROPERTY 1).
         """
-        newly_capped: list[Finding] = []
         for finding in sorted(findings, key=lambda f: f.facts.eligible_age_secs, reverse=True):
             tid = finding.facts.task_id
             row = ctx.overrides.get(tid)
@@ -3816,37 +3861,11 @@ class Scheduler:
                 if capped and tid in self._watchdog_state.waiting():
                     continue
                 await self._deliver_starvation_finding(finding, outcome)
-                if capped:
-                    newly_capped.append(finding)
             except Exception:
                 logger.warning(
                     'Starvation watchdog delivery for %s raised; retrying next tick',
                     tid, exc_info=True,
                 )
-        if newly_capped:
-            l1 = cap_escalation(newly_capped, self.config.starvation_watchdog)
-            file_sentinel_l1(self.escalation_queue, l1)
-            self._cap_sentinel_maybe_open = True
-
-    def _resolve_cap_sentinel_once_drained(self) -> None:
-        """Resolve the open auto-pin cap L1 once no capped task still waits on a slot."""
-        queue = self.escalation_queue
-        if self._watchdog_state.waiting() or not self._cap_sentinel_maybe_open or queue is None:
-            return
-        try:
-            for esc in queue.get_by_task(AUTO_PIN_CAP_SENTINEL, status='pending'):
-                queue.resolve(
-                    esc.id,
-                    'auto-resolved: no starving task waits on a watchdog pin slot',
-                    resolved_by=STARVATION_WATCHDOG_ROLE,
-                )
-        except Exception:
-            logger.warning(
-                'Starvation watchdog: cannot resolve the auto-pin cap L1; retrying next pass',
-                exc_info=True,
-            )
-            return
-        self._cap_sentinel_maybe_open = False
 
     def _starvation_pin(
         self,

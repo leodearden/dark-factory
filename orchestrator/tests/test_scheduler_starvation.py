@@ -495,6 +495,8 @@ async def _three_starve_behind_a_cap_of_two(rig: _Rig, *extra: dict) -> Escalati
 
     S3 depends on the seed for the first minute, so it becomes a candidate
     later than S1 and S2 while staying pending (and keeping its refusals).
+    The young high '1' is the top candidate, so S1-S3 accrue refusals but no
+    top-skips; it waits on S3's module, so its own later firing is no news.
     """
     queue = EscalationQueue(rig.scheduler.config.project_root / 'esc')
     rig.scheduler.escalation_queue = queue
@@ -509,7 +511,7 @@ async def _three_starve_behind_a_cap_of_two(rig: _Rig, *extra: dict) -> Escalati
     s3['dependencies'] = []
     assert await rig.tick() is None
     rig.advance(FLOOR)
-    rig.tasks.extend([_task('1', 'high', 'hot/a.py'), *extra])
+    rig.tasks.extend([_task('1', 'high', 'hot/d.py'), *extra])
     for _ in range(_COHORT_SCANS):
         await rig.tick_with_low_winner()
     return queue
@@ -520,11 +522,13 @@ def _prior_cohort_refusals(tmp_path: Path, skip_threshold: int) -> None:
 
     A scan is one tick, and accruing a production-sized threshold one tick at
     a time costs minutes on a loaded host; the durable state is the seam a
-    previous process writes anyway.
+    previous process writes anyway.  The store counts one refusal per listed
+    id, so every prior scan lands in one transaction.
     """
-    store = StarvationStateStore(tmp_path / 'scheduler_eligibility.db')
-    for _ in range(skip_threshold - (_COHORT_SCANS - 1)):
-        store.note_scan(str(tmp_path), ['S1', 'S2', 'S3'])
+    scans = skip_threshold - (_COHORT_SCANS - 1)
+    StarvationStateStore(tmp_path / 'scheduler_eligibility.db').note_scan(
+        str(tmp_path), ['S1', 'S2', 'S3'] * scans,
+    )
 
 
 def _open_cap_l1s(queue: EscalationQueue) -> list[Escalation]:
