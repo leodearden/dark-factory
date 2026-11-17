@@ -83,6 +83,7 @@ from fused_memory.middleware.task_curator import (
     _trim_pool,
     flatten_task_tree,
 )
+from fused_memory.utils.safe_yaml import YamlListFileError
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
@@ -5773,49 +5774,43 @@ class TestCancelledPremiseBlocklistLoader:
         assert e.title_substrings == ["search-then-delete", "fix c"]
         assert e.description_substrings == ["fixc_flags_deleted_not_found", "stage1_flag_marker"]
 
-    def test_load_missing_path_returns_empty_and_warns(self, tmp_path, caplog):
-        """(b) Missing file returns [] and emits exactly one WARNING."""
+    def test_load_missing_path_raises(self, tmp_path):
+        """(b) A missing file raises YamlListFileError naming the path."""
         from fused_memory.middleware.cancelled_premise_blocklist import load_blocklist
 
         missing = tmp_path / "does_not_exist.yaml"
-        with caplog.at_level("WARNING"):
-            entries = load_blocklist(missing)
+        with pytest.raises(YamlListFileError) as excinfo:
+            load_blocklist(missing)
 
-        assert entries == []
-        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
-        assert len(warnings) == 1
+        assert excinfo.value.path == missing
+        assert str(excinfo.value) == f"file not found: {missing}"
 
-    def test_load_malformed_yaml_returns_empty_and_warns(self, tmp_path, caplog):
-        """(c) Malformed YAML returns [] and emits exactly one WARNING."""
+    def test_load_malformed_yaml_raises(self, tmp_path):
+        """(c) Malformed YAML raises YamlListFileError."""
         from fused_memory.middleware.cancelled_premise_blocklist import load_blocklist
 
         bad_yaml = tmp_path / "bad.yaml"
         bad_yaml.write_text("key: [unclosed bracket\n: invalid\n", encoding="utf-8")
 
-        with caplog.at_level("WARNING"):
-            entries = load_blocklist(bad_yaml)
+        with pytest.raises(YamlListFileError) as excinfo:
+            load_blocklist(bad_yaml)
 
-        assert entries == []
-        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
-        assert len(warnings) == 1
+        assert excinfo.value.path == bad_yaml
+        assert "YAML parse error" in str(excinfo.value)
 
-    def test_load_undecodable_encoding_returns_empty_and_warns(self, tmp_path, caplog):
-        """(c2) File with bytes that are not valid UTF-8 returns [] and emits
-        exactly one WARNING, on this module's own logger.
-        """
+    def test_load_undecodable_encoding_raises(self, tmp_path):
+        """(c2) A file whose bytes are not valid UTF-8 raises YamlListFileError."""
         from fused_memory.middleware.cancelled_premise_blocklist import load_blocklist
 
         bad_encoding = tmp_path / "bad_encoding.yaml"
         bad_encoding.write_bytes(b"\xff\xfe- name: x\x00")
 
-        with caplog.at_level("WARNING"):
-            entries = load_blocklist(bad_encoding)
+        with pytest.raises(YamlListFileError) as excinfo:
+            load_blocklist(bad_encoding)
 
-        assert entries == []
-        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
-        assert len(warnings) == 1
-        assert str(bad_encoding) in warnings[0].getMessage()
-        assert warnings[0].name == "fused_memory.middleware.cancelled_premise_blocklist"
+        assert excinfo.value.path == bad_encoding
+        assert str(bad_encoding) in str(excinfo.value)
+        assert "UTF-8" in str(excinfo.value)
 
     def test_load_entry_missing_required_field_skips_and_warns(self, tmp_path, caplog):
         """(d) Entry missing title_substrings is skipped with WARNING; well-formed entries returned."""

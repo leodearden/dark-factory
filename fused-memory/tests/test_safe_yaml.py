@@ -20,13 +20,12 @@ from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.utils.safe_yaml import (
     SAFE_YAML_LOADER,
+    YamlListFileError,
     load_yaml_list_file,
     resolve_safe_yaml_loader,
 )
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
-
-LOG = logging.getLogger('tests.safe_yaml_owner')
 
 CONFIG_DIR = Path(__file__).resolve().parents[1] / 'config'
 
@@ -40,9 +39,7 @@ REGISTRY_LOADER_MODULES = (
 
 
 def _load(path: Path | None) -> list[object]:
-    return load_yaml_list_file(
-        path, logger=LOG, label='test_registry', consequence='registry disabled'
-    )
+    return load_yaml_list_file(path)
 
 
 def _warnings(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
@@ -72,90 +69,68 @@ class TestLoadYamlListFile:
         ]
         assert _warnings(caplog) == []
 
-    def test_missing_file_returns_empty_and_warns_with_existing_message(
-        self, tmp_path, caplog
-    ):
+    def test_missing_file_raises_with_existing_reason(self, tmp_path):
         missing = tmp_path / 'does_not_exist.yaml'
 
-        with caplog.at_level('WARNING'):
-            assert _load(missing) == []
+        with pytest.raises(YamlListFileError) as excinfo:
+            _load(missing)
 
-        warnings = _warnings(caplog)
-        assert len(warnings) == 1
-        assert (
-            warnings[0].getMessage()
-            == f'test_registry: file not found: {missing} — registry disabled'
-        )
+        assert excinfo.value.path == missing
+        assert str(excinfo.value) == f'file not found: {missing}'
 
     @pytest.mark.skipif(
         sys.platform == 'win32' or getattr(os, 'getuid', lambda: -1)() == 0,
         reason='chmod not reliable on Windows or when running as root',
     )
-    def test_unreadable_file_returns_empty_and_warns(self, tmp_path, caplog):
+    def test_unreadable_file_raises(self, tmp_path):
         locked = tmp_path / 'unreadable.yaml'
         locked.write_text('- name: x\n', encoding='utf-8')
         locked.chmod(0o000)
         try:
-            with caplog.at_level('WARNING'):
-                data = _load(locked)
+            with pytest.raises(YamlListFileError) as excinfo:
+                _load(locked)
         finally:
             locked.chmod(0o644)
 
-        assert data == []
-        warnings = _warnings(caplog)
-        assert len(warnings) == 1
-        assert str(locked) in warnings[0].getMessage()
+        assert excinfo.value.path == locked
+        assert str(locked) in str(excinfo.value)
 
-    def test_undecodable_file_returns_empty_and_warns(self, tmp_path, caplog):
+    def test_undecodable_file_raises(self, tmp_path):
         bad_encoding = tmp_path / 'bad_encoding.yaml'
         bad_encoding.write_bytes(b'\xff\xfe- name: x\x00')
 
-        with caplog.at_level('WARNING'):
-            data = _load(bad_encoding)
+        with pytest.raises(YamlListFileError) as excinfo:
+            _load(bad_encoding)
 
-        assert data == []
-        warnings = _warnings(caplog)
-        assert len(warnings) == 1
-        message = warnings[0].getMessage()
+        assert excinfo.value.path == bad_encoding
+        message = str(excinfo.value)
         assert str(bad_encoding) in message
         assert 'UTF-8' in message
 
-    def test_malformed_yaml_returns_empty_and_warns(self, tmp_path, caplog):
+    def test_malformed_yaml_raises(self, tmp_path):
         bad_yaml = tmp_path / 'bad.yaml'
         bad_yaml.write_text('key: [unclosed bracket\n: invalid\n', encoding='utf-8')
 
-        with caplog.at_level('WARNING'):
-            data = _load(bad_yaml)
+        with pytest.raises(YamlListFileError) as excinfo:
+            _load(bad_yaml)
 
-        assert data == []
-        warnings = _warnings(caplog)
-        assert len(warnings) == 1
-        assert 'YAML parse error' in warnings[0].getMessage()
+        assert excinfo.value.path == bad_yaml
+        assert 'YAML parse error' in str(excinfo.value)
 
     @pytest.mark.parametrize(
         'document',
         ['just_a_key: just_a_value\n', ''],
         ids=['mapping', 'empty-file'],
     )
-    def test_non_list_document_returns_empty_and_warns(self, tmp_path, caplog, document):
+    def test_non_list_document_raises(self, tmp_path, document):
         p = tmp_path / 'not_a_list.yaml'
         p.write_text(document, encoding='utf-8')
 
-        with caplog.at_level('WARNING'):
-            data = _load(p)
+        with pytest.raises(YamlListFileError) as excinfo:
+            _load(p)
 
-        assert data == []
-        warnings = _warnings(caplog)
-        assert len(warnings) == 1
-        assert 'expected a YAML list' in warnings[0].getMessage()
-
-    def test_warning_is_emitted_on_the_caller_supplied_logger(self, tmp_path, caplog):
-        with caplog.at_level('WARNING'):
-            _load(tmp_path / 'does_not_exist.yaml')
-
-        warnings = _warnings(caplog)
-        assert len(warnings) == 1
-        assert warnings[0].name == 'tests.safe_yaml_owner'
+        assert excinfo.value.path == p
+        assert 'expected a YAML list' in str(excinfo.value)
 
 
 class TestSafeYamlLoader:
