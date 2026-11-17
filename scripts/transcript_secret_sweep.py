@@ -16,8 +16,10 @@ the repo ``.env``), and replaces them with ``shared.secret_redaction``'s
 same-length placeholders. It reads only regular files, and skips those
 modified within ``min_age_secs``, which a live session or test run may still
 be appending to. A sweep that redacted or refused anything files one
-``risk_identified`` info escalation. Nothing it prints or files carries a
-value. Operator view: ``OPERATIONS.md`` §12.
+``risk_identified`` info escalation, and a sweep that could not run, found a
+required root absent or could not read an orchestrator unit files one
+``infra_issue`` info escalation naming each shortfall. Nothing it prints or
+files carries a value. Operator view: ``OPERATIONS.md`` §12.
 """
 
 from __future__ import annotations
@@ -72,6 +74,7 @@ DEFAULT_MIN_AGE_SECS = 900.0
 ESCALATION_TIMEOUT_SECS = 30.0
 MAX_DETAIL_FILES = 200
 NO_SECRETS_CAUSE = 'no secret-bearing values in the environment'
+SHORTFALL_TASK_ID = 'transcript-secret-sweep-shortfall'
 TRANSCRIPT_SUFFIXES = ('.jsonl', '.jsonl' + STAGING_SUFFIX)
 LOG_SUFFIXES = ('.log', '.json', '.xml', '.xml.gz')
 
@@ -89,6 +92,7 @@ NeedlesByMarkup = Mapping[Markup, Sequence[Needle]]
 class SweptTree:
     root: Path
     suffixes: tuple[str, ...]
+    required: bool
 
 
 @dataclass(frozen=True)
@@ -96,6 +100,7 @@ class SweepConfig:
     trees: tuple[SweptTree, ...]
     now: datetime.datetime
     min_age_secs: float = DEFAULT_MIN_AGE_SECS
+    unswept: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -127,7 +132,17 @@ class SweepResult:
     deferred: tuple[Path, ...] = ()
     unreadable: tuple[Path, ...] = ()
     clean: int = 0
+    missing: tuple[Path, ...] = ()
+    unswept: tuple[str, ...] = ()
     escalation_error: str | None = None
+
+    @property
+    def shortfall(self) -> tuple[str, ...]:
+        return (
+            *(() if self.ok else (f'could not run: {self.cause}',)),
+            *(f'{path}: required root does not exist' for path in self.missing),
+            *self.unswept,
+        )
 
     def record(self) -> dict[str, object]:
         return {
@@ -138,6 +153,8 @@ class SweepResult:
             'deferred': [str(path) for path in self.deferred],
             'unreadable': [str(path) for path in self.unreadable],
             'clean': self.clean,
+            'missing': [str(path) for path in self.missing],
+            'unswept': list(self.unswept),
             'escalation_error': self.escalation_error,
         }
 
@@ -147,12 +164,12 @@ def swept_trees(project_roots: Iterable[Path], claude_projects_dir: Path) -> tup
         tree
         for root in project_roots
         for tree in (
-            SweptTree(agent_transcripts_dir(root), TRANSCRIPT_SUFFIXES),
-            SweptTree(verify_logs_dir(root), LOG_SUFFIXES),
-            SweptTree(offline_lane_dir(root), LOG_SUFFIXES),
+            SweptTree(agent_transcripts_dir(root), TRANSCRIPT_SUFFIXES, required=True),
+            SweptTree(verify_logs_dir(root), LOG_SUFFIXES, required=False),
+            SweptTree(offline_lane_dir(root), LOG_SUFFIXES, required=False),
         )
     )
-    return (*per_project, SweptTree(claude_projects_dir, TRANSCRIPT_SUFFIXES))
+    return (*per_project, SweptTree(claude_projects_dir, TRANSCRIPT_SUFFIXES, required=True))
 
 
 def run(
@@ -161,18 +178,35 @@ def run(
     environ: Mapping[str, str],
     post_escalation: PostEscalation,
 ) -> SweepResult:
+    result = _sweep(config, environ)
+    errors = [
+        error
+        for arguments in _escalations(result, config.now)
+        if (error := _posting_error(post_escalation, arguments)) is not None
+    ]
+    return dataclasses.replace(result, escalation_error='; '.join(errors) or None)
+
+
+def _sweep(config: SweepConfig, environ: Mapping[str, str]) -> SweepResult:
     secrets = secret_env_values(environ)
     needles = {markup: redaction_needles(secrets, markup=markup) for markup in Markup}
-    if not needles[Markup.JSON]:
-        return SweepResult(ok=False, cause=NO_SECRETS_CAUSE)
-    result = _scan(config, needles)
-    if not (result.redacted or result.refused):
-        return result
+    result = _scan(config, needles) if needles[Markup.JSON] else SweepResult(ok=False, cause=NO_SECRETS_CAUSE)
+    missing = tuple(tree.root for tree in config.trees if tree.required and not tree.root.is_dir())
+    return dataclasses.replace(result, missing=missing, unswept=config.unswept)
+
+
+def _escalations(result: SweepResult, now: datetime.datetime) -> list[dict[str, object]]:
+    findings = [_escalation_arguments(result, now)] if result.redacted or result.refused else []
+    shortfalls = [_shortfall_arguments(result, now)] if result.shortfall else []
+    return [*findings, *shortfalls]
+
+
+def _posting_error(post_escalation: PostEscalation, arguments: dict[str, object]) -> str | None:
     try:
-        post_escalation(_escalation_arguments(result, config.now))
+        post_escalation(arguments)
     except Exception as exc:
-        return dataclasses.replace(result, escalation_error=f'{type(exc).__name__}: {exc}')
-    return result
+        return f'{type(exc).__name__}: {exc}'
+    return None
 
 
 def _scan(config: SweepConfig, needles: NeedlesByMarkup) -> SweepResult:
@@ -297,6 +331,23 @@ def _escalation_arguments(result: SweepResult, now: datetime.datetime) -> dict[s
     }
 
 
+def _shortfall_arguments(result: SweepResult, now: datetime.datetime) -> dict[str, object]:
+    summary = f'Transcript secret sweep did not cover everything: {len(result.shortfall)} shortfall(s)'
+    return {
+        'task_id': SHORTFALL_TASK_ID,
+        'agent_role': AGENT_ROLE,
+        'category': 'infra_issue',
+        'summary': summary,
+        'detail': '\n'.join(_bounded(list(result.shortfall))),
+        'suggested_action': (
+            'Check that $REPO/.env exists and still defines the secret-bearing variables, that each '
+            "project's transcript archive exists at its default root, and that the orchestrator unit "
+            'files are readable.'
+        ),
+        'evidence': [{'observation': summary, 'measured_at': now.isoformat(), 'ref': SHORTFALL_TASK_ID}],
+    }
+
+
 def escalation_url() -> str:
     config = DashboardConfig(project_root=default_project_root())
     return config.escalation_urls[config.project_root.name]
@@ -314,7 +365,10 @@ def _parser() -> argparse.ArgumentParser:
             'Redact live secret values from agent transcripts, verify logs and offline-lane logs '
             'already on disk.'
         ),
-        epilog='Exit 0: the sweep ran. Exit 2: it could not run, or its escalation was not filed.',
+        epilog=(
+            'Exit 0: the sweep covered every required root. Exit 2: it could not run or could not cover '
+            'a required root (it files an infra_issue escalation), or an escalation was not filed.'
+        ),
     )
     orchestrator_projects.add_arguments(parser)
     parser.add_argument(
@@ -340,13 +394,12 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     targets, unit_scan = orchestrator_projects.targets_from_args(args)
-    for problem in unit_scan.problems:
-        print(f'transcript_secret_sweep.py: {problem}', file=sys.stderr)
     claude_projects = args.claude_projects_dir or Path.home() / '.claude' / 'projects'
     config = SweepConfig(
         trees=swept_trees([target.root for target in targets], claude_projects),
         now=datetime.datetime.now(datetime.UTC),
         min_age_secs=args.min_age_secs,
+        unswept=unit_scan.problems,
     )
     result = run(
         config,
@@ -354,13 +407,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         post_escalation=functools.partial(_post_escalate_info, args.escalation_url),
     )
     print(json.dumps(result.record(), sort_keys=True))
-    if not result.ok:
-        print(f'transcript_secret_sweep.py: could not run: {result.cause}', file=sys.stderr)
-        return 2
+    for line in result.shortfall:
+        print(f'transcript_secret_sweep.py: did not cover: {line}', file=sys.stderr)
     if result.escalation_error is not None:
         print(f'transcript_secret_sweep.py: the escalation was not filed: {result.escalation_error}', file=sys.stderr)
-        return 2
-    return 0
+    return 2 if result.shortfall or result.escalation_error is not None else 0
 
 
 if __name__ == '__main__':
