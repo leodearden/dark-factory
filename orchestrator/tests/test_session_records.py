@@ -192,7 +192,9 @@ def test_session_record_round_trip_includes_claude_owner_pid() -> None:
 @pytest.mark.parametrize(
     ('raw', 'expected'),
     [
-        (True, None),  # bool is an int subclass; must be rejected before the int check
+        # bool is an int subclass: True would survive as a real-looking pid
+        # that could compare equal to a live one in session_hooks' ownership probe.
+        (True, None),
         ('x', None),
         (3.0, None),
         (0, None),
@@ -201,13 +203,18 @@ def test_session_record_round_trip_includes_claude_owner_pid() -> None:
         (4242, 4242),
     ],
 )
-def test_coerce_owner_pid(raw: object, expected: int | None) -> None:
-    assert session_records._coerce_owner_pid(raw) == expected
+def test_from_dict_coerces_claude_owner_pid(raw: object, expected: int | None) -> None:
+    data = make_record().to_dict()
+    data['claude_owner_pid'] = raw
+    assert session_records.SessionRecord.from_dict(data).claude_owner_pid == expected
 
 
+@pytest.mark.parametrize('field', ['claude_session_id', 'claude_launch_session_id'])
 @pytest.mark.parametrize(
     ('raw', 'expected'),
     [
+        # A non-str must not survive: session_hooks strips the stored id
+        # outside a try/except, so an int would lose the whole hook event.
         (True, None),
         (123, None),
         (3.0, None),
@@ -218,34 +225,10 @@ def test_coerce_owner_pid(raw: object, expected: int | None) -> None:
         ('  uuid-claude-abc123  ', 'uuid-claude-abc123'),
     ],
 )
-def test_coerce_session_id(raw: object, expected: str | None) -> None:
-    assert session_records._coerce_session_id(raw) == expected
-
-
-def test_session_record_from_dict_coerces_non_str_claude_session_id() -> None:
-    # esc-4193-11 suggestion 2: a hand-edited or future-writer record body
-    # carrying a non-string claude_session_id must not survive into the
-    # SessionRecord -- session_hooks does `(record.claude_session_id or
-    # '').strip()` outside a try/except, so a raw int here would raise
-    # AttributeError and lose the whole hook event.
+def test_from_dict_coerces_session_ids(field: str, raw: object, expected: str | None) -> None:
     data = make_record().to_dict()
-    data['claude_session_id'] = 123
-    record = session_records.SessionRecord.from_dict(data)
-    assert record.claude_session_id is None
-
-
-def test_session_record_from_dict_coerces_non_int_claude_owner_pid() -> None:
-    # Sibling to the claude_session_id regression test above (task 4660
-    # review follow-up): pins the from_dict call site for claude_owner_pid
-    # too, so replacing `_coerce_owner_pid(data.get(...))` with a bare
-    # `data.get(...)` cannot go unnoticed. True is an int subclass and would
-    # otherwise survive as a real-looking pid, which could silently compare
-    # equal to a real pid in session_hooks._env_slug_ownership
-    # (session_hooks.py:329).
-    data = make_record().to_dict()
-    data['claude_owner_pid'] = True
-    record = session_records.SessionRecord.from_dict(data)
-    assert record.claude_owner_pid is None
+    data[field] = raw
+    assert getattr(session_records.SessionRecord.from_dict(data), field) == expected
 
 
 # ---------------------------------------------------------------------------
