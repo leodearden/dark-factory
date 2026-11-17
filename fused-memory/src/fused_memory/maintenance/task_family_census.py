@@ -36,6 +36,7 @@ import time
 from dataclasses import asdict, dataclass
 
 from fused_memory.maintenance._utils import ServiceOpen, maintenance_service
+from fused_memory.maintenance.graph_sweep import GraphFailure, read_each_graph
 from fused_memory.utils.task_naming import group_task_node_families
 
 logger = logging.getLogger(__name__)
@@ -104,20 +105,6 @@ class GraphCensus:
     incomplete_kind: str | None
     rows_seen: int
     expected_rows: int | None
-
-
-@dataclass(frozen=True)
-class GraphFailure:
-    """A graph the sweep tried to census and could not read.
-
-    Recorded as structure rather than folded into a log line, because the two
-    fields answer different operator questions: ``group_id`` is what a re-run
-    is scoped to, and ``error`` names the exception TYPE as well as its message,
-    which is what says whether to retry or to go and fix something.
-    """
-
-    group_id: str
-    error: str
 
 
 @dataclass(frozen=True)
@@ -237,17 +224,11 @@ class TaskFamilyCensus:
     async def sweep(self, group_id: str | None = None) -> CensusSweep:
         """Census every project graph, or just one.
 
-        Each graph is censused inside its own ``try/except Exception``, copying
-        ``GraphitiBackend._run_startup_identity_scan``'s shape: one unreachable
+        Graphs are read through ``graph_sweep.read_each_graph``: one unreachable
         graph costs the sweep that graph and nothing else. The failure is
         recorded in the result, not merely logged — a count that quietly omits
         an unreachable graph reads as "this graph has no residue" when the truth
         is "this graph was never looked at".
-
-        ``except Exception`` deliberately does not catch ``CancelledError``,
-        ``KeyboardInterrupt`` or ``SystemExit``: all three are ``BaseException``,
-        so an operator's Ctrl-C aborts the sweep instead of being recorded as
-        one graph's data problem.
 
         Args:
             group_id: A single graph to census. When None, every graph
@@ -262,18 +243,9 @@ class TaskFamilyCensus:
         graphs = [group_id] if group_id is not None else await self.backend.list_graphs()
         start = time.monotonic()
 
-        censused: list[GraphCensus] = []
-        failures: list[GraphFailure] = []
-        for graph_name in graphs:
-            try:
-                censused.append(await self.run(graph_name))
-            except Exception as exc:
-                logger.error(
-                    'task-family census failed for graph %r', graph_name, exc_info=True,
-                )
-                failures.append(
-                    GraphFailure(group_id=graph_name, error=f'{type(exc).__name__}: {exc}')
-                )
+        censused, failures = await read_each_graph(
+            graphs, self.run, what='task-family census',
+        )
 
         elapsed_ms = (time.monotonic() - start) * 1000
         total_families = sum(len(graph.families) for graph in censused)
