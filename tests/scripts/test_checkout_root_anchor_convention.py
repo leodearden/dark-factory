@@ -77,7 +77,7 @@ Afterwards, every relative path is measured from the root it printed.
 """
 
 
-def test_marked_command_extracts_the_marked_span():
+def test_checkout_root_bullet_extracts_the_marked_span():
     assert (
         vci.marked_bullet_command(
             _HAPPY_DOC,
@@ -90,7 +90,7 @@ def test_marked_command_extracts_the_marked_span():
     )
 
 
-def test_marked_command_is_immune_to_inline_code_in_the_begin_comment():
+def test_checkout_root_bullet_is_immune_to_inline_code_in_the_begin_comment():
     assert (
         vci.marked_bullet_command(
             _DECOY_DOC,

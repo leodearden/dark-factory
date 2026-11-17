@@ -104,7 +104,7 @@ Afterwards, `SELECT` against the columns it printed.
 """
 
 
-def test_marked_command_extracts_the_marked_span():
+def test_tasks_db_schema_bullet_extracts_the_marked_span():
     """Only the marked bullet's command is returned, backticks stripped."""
     assert (
         vci.marked_bullet_command(
@@ -118,7 +118,7 @@ def test_marked_command_extracts_the_marked_span():
     )
 
 
-def test_marked_command_is_immune_to_inline_code_in_the_begin_comment():
+def test_tasks_db_schema_bullet_is_immune_to_inline_code_in_the_begin_comment():
     """Prose inline code inside the marked slice is never extracted.
 
     An extractor keyed on "the first backtick span after the begin marker"

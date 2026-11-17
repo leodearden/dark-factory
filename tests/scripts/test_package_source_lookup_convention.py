@@ -155,7 +155,7 @@ Afterwards, `grep -rn 'timeout_keep_alive' <that dir>/config.py`.
 """
 
 
-def test_marked_command_extracts_the_marked_span():
+def test_package_source_bullet_extracts_the_marked_span():
     """Only the marked bullet's command is returned, backticks stripped."""
     assert (
         vci.marked_bullet_command(
@@ -169,7 +169,7 @@ def test_marked_command_extracts_the_marked_span():
     )
 
 
-def test_marked_command_is_immune_to_inline_code_in_the_begin_comment():
+def test_package_source_bullet_is_immune_to_inline_code_in_the_begin_comment():
     """Prose inline code inside the marked slice is never extracted.
 
     An extractor keyed on "the first backtick span after the begin marker" would
