@@ -26,10 +26,11 @@ from shared.account_reserve import (
     WorkClassSource,
     WorkKind,
 )
+from shared.cli_invoke import AllAccountsCappedException
 from shared.config_models import UsageCapConfig
 from shared.cost_store import CostStore
 from shared.invocation_outcome import AuthFailed, CapHit
-from shared.usage_gate import AccountLease, InvokeSlot, UsageGate
+from shared.usage_gate import AccountLease, InvokeSlot, PoolFrozen, UsageGate
 
 ACCOUNTS = ('max-d', 'max-e', 'max-f', 'max-g', 'max-b', 'max-c', 'max-h')
 RESERVE = 'max-h'
@@ -479,3 +480,75 @@ class TestWithoutAStore:
         assert gate.capped_account_names == ACCOUNTS[:-1]
         assert gate.auth_failed_account_names == (RESERVE,)
         await gate.shutdown()
+
+
+SIX_CAPPED = ACCOUNTS[:-1]
+FROZEN_TODAY = (
+    'Usage pool frozen: no account admissible among all 7 account(s) — '
+    'capped: max-d, max-e, max-f, max-g, max-b, max-c; auth-failed: none'
+)
+
+
+def reserve_frozen() -> PoolFrozen:
+    return PoolFrozen(
+        account_count=7,
+        capped_account_names=SIX_CAPPED,
+        auth_failed_account_names=(),
+        reserved_account=RESERVE,
+        release_at=RELEASE_AT,
+    )
+
+
+def capped_frozen() -> PoolFrozen:
+    return PoolFrozen(
+        account_count=7, capped_account_names=SIX_CAPPED, auth_failed_account_names=()
+    )
+
+
+class TestPoolFrozenNamesTheReserve:
+    def test_a_reserve_refusal_says_so_and_names_the_release_time(self) -> None:
+        frozen = reserve_frozen()
+
+        assert frozen.reserved_account == RESERVE
+        assert frozen.release_at == RELEASE_AT
+        assert frozen.scope is None
+        assert 'refused the reserve' in str(frozen)
+        assert RESERVE in str(frozen)
+        assert RELEASE_AT.isoformat() in str(frozen)
+        assert 'all accounts capped' not in str(frozen)
+        assert 'no account admissible' not in str(frozen)
+
+    def test_without_the_reserve_fields_the_message_is_unchanged(self) -> None:
+        frozen = capped_frozen()
+
+        assert frozen.reserved_account is None
+        assert frozen.release_at is None
+        assert str(frozen) == FROZEN_TODAY
+
+
+class TestCapPatienceMessage:
+    def test_a_reserve_refusal_is_not_called_a_cap_wait(self) -> None:
+        error = AllAccountsCappedException(
+            retries=0, elapsed_secs=1.5, label='Task 7 [impl]', pool_frozen=reserve_frozen()
+        )
+
+        assert str(error).startswith('Task 7 [impl]: ')
+        assert 'refused the reserve' in str(error)
+        assert RELEASE_AT.isoformat() in str(error)
+        assert 'all accounts capped' not in str(error).lower()
+        assert 'cap-wait' not in str(error).lower()
+
+    def test_a_frozen_pool_without_the_reserve_keeps_its_message(self) -> None:
+        error = AllAccountsCappedException(
+            retries=0, elapsed_secs=1.5, label='Task 7 [impl]', pool_frozen=capped_frozen()
+        )
+
+        assert str(error) == (
+            'Task 7 [impl]: cap-wait deadline spent parked after 0 retries (1.5s elapsed) — '
+            + FROZEN_TODAY
+        )
+
+    def test_without_a_frozen_pool_the_message_is_unchanged(self) -> None:
+        error = AllAccountsCappedException(retries=3, elapsed_secs=1.5, label='Task 7 [impl]')
+
+        assert str(error) == 'Task 7 [impl]: all accounts capped after 3 retries (1.5s elapsed)'
