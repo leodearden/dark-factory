@@ -33,7 +33,11 @@ from fused_memory.server.tools import create_mcp_server
 # The shared write-triage harness (tests/server/write_triage_harness.py),
 # imported rather than re-derived: reaching add_memory's C1 fallback call site
 # needs triage enabled with a calibrated candidate.
-from server.write_triage_harness import configure_triage_config, search_candidate
+from server.write_triage_harness import (
+    configure_pass_through_add_memory,
+    configure_triage_config,
+    search_candidate,
+)
 
 _PROJECT_ID = 'dark_factory'
 _CLAIM_CONTENT = "task 5422's de-flake fix has been applied"
@@ -43,9 +47,7 @@ _IN_PROGRESS = {'5422': 'in-progress'}
 
 def _mock_service(**config_overrides) -> AsyncMock:
     mock_service = AsyncMock()
-    mem_result = MagicMock()
-    mem_result.model_dump.return_value = {'id': 'mem-1'}
-    mock_service.add_memory.return_value = mem_result
+    configure_pass_through_add_memory(mock_service)
     configure_triage_config(
         mock_service,
         **{'enabled': False, 'near_dup_guard_enabled': False, **config_overrides},

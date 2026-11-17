@@ -1,8 +1,8 @@
 """Contract suite for ``server/write_triage_harness.py``.
 
-The harness is the one copy of the ``add_memory`` write-path config stand-in and
-post-RRF search hit that the triage, near-duplicate, entities and completion-claim
-tool suites share; these contracts hold for every importer, and are read back
+The harness is the one copy of the ``add_memory`` write-path config stand-in,
+post-RRF search hit and pass-through result that the triage, near-duplicate,
+entities and completion-claim tool suites share; these contracts hold for every importer, and are read back
 through production's own resolvers so a misspelled leaf fails here.
 """
 
@@ -27,6 +27,7 @@ from fused_memory.server.write_triage_judge import resolve_judge_enabled
 from server.write_triage_harness import (
     T_HIGH,
     T_LOW,
+    configure_pass_through_add_memory,
     configure_reject_guard_config,
     configure_triage_config,
     search_candidate,
@@ -87,3 +88,40 @@ def test_the_default_candidate_lands_in_the_deterministic_band() -> None:
     assert decision.outcome == OUTCOME_RESTATED
     assert decision.canonical_id == 'm1'
     assert decision.similarity == pytest.approx(0.97)
+
+
+@pytest.mark.asyncio
+async def test_the_pass_through_result_is_returned_and_dumps_to_a_plain_dict() -> None:
+    svc = AsyncMock()
+    returned = configure_pass_through_add_memory(svc)
+
+    result = await svc.add_memory(content='x')
+
+    assert result is returned
+    assert result.model_dump() == {'id': 'new-id'}
+
+
+@pytest.mark.asyncio
+async def test_an_explicit_dump_is_what_the_result_dumps_to() -> None:
+    svc = AsyncMock()
+    dump = {'id': 'child-id', 'category': 'procedural_knowledge'}
+    configure_pass_through_add_memory(svc, dump=dump)
+
+    assert (await svc.add_memory()).model_dump() == dump
+
+
+@pytest.mark.asyncio
+async def test_each_configured_service_gets_its_own_default_dump() -> None:
+    first, second = AsyncMock(), AsyncMock()
+    configure_pass_through_add_memory(first)
+    configure_pass_through_add_memory(second)
+
+    first_dump = (await first.add_memory()).model_dump()
+    first_dump['routed'] = 'restated'
+    second_dump = (await second.add_memory()).model_dump()
+
+    assert second_dump == {'id': 'new-id'}, (
+        'tools.py::add_memory mutates the ack model_dump() hands it, so a '
+        'shared default dict would leak one test\'s ack keys into the next'
+    )
+    assert first_dump is not second_dump
