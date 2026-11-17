@@ -452,10 +452,15 @@ had landed in `test_warm_lane_gc.sh`, which grew to 4245 lines against its
 **Why this seam.** Provenance decides how each half changes. The ported half
 changes by re-sync from reify, which still lands changes to this file (its
 Block U, reify `9f01c9c0ae`, is not yet ported), and its drift check is one
-`diff` against the anchor. That diff was almost purely additive: 24 hunks, 21
-reify lines removed and 2327 added. Moving the native blocks out cut the
-additions to 746. The native half changes only when dark-factory changes its own
-gates. A behavioural split (CLI and reclaim, protect set, live-reference and
+`diff` against the anchor. Before the split (base `2c2f34db14`) that diff was
+almost purely additive: 24 hunks, 21 reify lines removed and 2327 added. At the
+split itself (`c922a744f4`, task/6931, "carve the dark-factory-native gc blocks
+into test_warm_lane_gc_native.sh") it was 21 hunks, 63 removed and 746 added;
+later edits move these figures, so re-measure rather than quote them. The
+removed side grew because the helpers lifted into `lib_warm_lane_gc_harness.sh`
+now show as anchor-side deletions: a re-sync should expect them there, not read
+them as lost reify text. The native half changes only when dark-factory changes
+its own gates. A behavioural split (CLI and reclaim, protect set, live-reference and
 record gates, seed outcome) would mix provenances in every file and turn each
 re-sync into a reassembly.
 
@@ -486,8 +491,8 @@ stem `test-native-gc`. It must not start with `test-gc`:
 `assert_no_shared_trash_litter` attributes litter by a prefix test on the stem,
 so the ported suite's `test-gc` would claim a `test-gc-native` suite's litter.
 
-**Why the ported file is not split further.** At 2622 lines it is still past
-the 2000-line alarm. It is the one-to-one mirror of reify's single
+**Why the ported file is not split further.** It is still past the 2000-line
+alarm. It is the one-to-one mirror of reify's single
 `tests/infra/test_warm_lane_gc.sh`, and both this README's one-diff drift check
 and the pending Block U port rely on that mapping. The partition tried and the
 measurement are in the commit that created `test_warm_lane_gc_native.sh`.

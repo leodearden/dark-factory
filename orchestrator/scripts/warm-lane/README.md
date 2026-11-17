@@ -1255,12 +1255,12 @@ This is patched here, not upstream, for the reason Delta 7 gives under "Why
 patch here rather than upstream to reify". reify's copies still carry the
 pipelines.
 
-**Pinned by** these cases in the ported suites under `orchestrator/tests/warm-lane/`:
+**Pinned by** these cases in the suites under `orchestrator/tests/warm-lane/`:
 
 - provision N4
 - disk-guard A10
 - gc-sweep G6g
-- gc A11m/A11n
+- gc-native (`test_warm_lane_gc_native.sh`) A11m/A11n
 - audit A3/A4
 - degenerate-ref U8
 
