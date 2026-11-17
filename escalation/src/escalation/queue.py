@@ -1215,9 +1215,9 @@ class EscalationQueue:
         Level-1 is the handed-to-human tier: the presence of one signals that
         the workflow must not auto-requeue the task — a human will unblock.
         This method counts EVERY pending L1 whatever its severity; the
-        workflow's hand-off gates instead read open L1s through
-        ``orchestrator/workflow.py::_is_l1_handoff``, so an info L1 never holds
-        a task there.
+        workflow's hand-off gates instead admit an open L1 only when
+        ``escalation.pins.is_queue_handoff`` calls it a hand-off, so an info
+        L1 never holds a task there.
 
         ``category``, when given, restricts the check to open L1s whose
         ``.category`` matches — a signature filter (task 2757).  This lets a NEW

@@ -21499,8 +21499,8 @@ def test_routed_record_is_invisible_to_the_orchestrator_l1_guards(
     Deliberately a POINTER and not a summary-with-names: a summary here would
     read as the whole set and drift from the block's list.
 
-    A recon-authored L1 would answer YES to every one of them, turning a
-    PASSIVE observation into a gate on dispatch. The two assertions below are
+    A recon-authored L1 sitting on the task could answer YES to them, turning
+    a PASSIVE observation into a gate on dispatch. The two assertions below are
     together the executable proof that the collision class is closed WITHOUT
     sacrificing the acceptance criterion — the record is still on the task's
     own ladder, it simply is not an L1.
@@ -21521,7 +21521,7 @@ def test_routed_record_is_invisible_to_the_orchestrator_l1_guards(
     # (1) Invisible to every level-1 guard above.
     assert queue.has_open_l1('4458') is False, (
         'a routed recon finding must NOT register as an open L1 — that is the '
-        'signal every uncategorized orchestrator guard reads as "a human is '
+        'signal every orchestrator level-1 guard reads as "a human is '
         'handling this task"'
     )
 

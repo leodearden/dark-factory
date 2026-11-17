@@ -95,11 +95,13 @@ FINDING_TASK_ESCALATION_CATEGORY = 'recon_task_finding'
 # `escalation.pins.is_queue_handoff`).  `has_open_l1` filters on `level` +
 # `status` and an OPTIONAL `category`, and is documented as answering "a human
 # is already on this task, so the workflow must not auto-requeue it".
-# Crucially it never reads `.severity` at all, so a severity choice cannot
-# mitigate the collision — only the level can.  The workflow's test is also
-# severity-aware, so an info L1 never hands off there
-# (`plans/info-l0-disposition-router-prd.md` D3).  Both are level-1-ONLY, so a
-# level-0 record is invisible to every one of them by construction:
+# Crucially it never reads `.severity` at all, so for any `has_open_l1` reader
+# a severity choice cannot mitigate the collision — only the level can.  The
+# workflow's test, by contrast, is severity-aware, so an info L1 never hands
+# off there (`plans/info-l0-disposition-router-prd.md` D3); for it, level 0 is
+# defence in depth that also keeps the record clear of any future uncategorized
+# `has_open_l1` reader.  Both are level-1-ONLY, so a level-0 record is
+# invisible to every one of them by construction:
 #
 #   - `orchestrator/workflow.py::_is_l1_handoff`, the workflow's single rule
 #     for an open L1 that hands the task to a human.
