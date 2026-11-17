@@ -128,15 +128,16 @@ class FleetCensus:
     """The population the payload budgets were measured against.
 
     PROVENANCE. The budgets in ``payload_budgets.json`` were set on 2026-10-15
-    from live measurements (task 5824, pre-1). The ACTIVE row counts here are
-    that day's: 4,951 rows, pending 4,304, deferred 527, in-progress 88,
-    blocked 30, merge-deferred 2, and 8,278 scheduler modules. The pre-1
-    iteration log did not survive, so the per-root split, the terminal totals
-    and the per-row shapes were re-measured against the live dashboard on
-    2026-10-21 (5,335 active rows):
+    from live measurements (task 5824, pre-1). The active and terminal counts,
+    module pools, dependency densities and merge-cap fill here were re-measured
+    live on 2026-11-15 (task 10139): 7,245 active rows across 12 projects
+    (dark-factory 3,635, reify 2,760) and 10,743 scheduler modules. The fleet
+    titles 11 dependencies in 12, so the densities seed 9,883 dependencies to
+    match live's titled ones (9,043 of 11,623); the rest are id-only
+    references to finished tasks. The per-row shapes were measured against
+    the live dashboard on 2026-10-21 (5,335 active rows):
 
     * titles average 120 characters, ``meta_files`` 5.5 paths of 43;
-    * 1.12 dependencies per row, 92% of them on another active row (titled);
     * 36% of rows name a PRD of 45 characters; 1.1% carry an external dep;
     * 480 held modules, 9 parked tasks, 8 skipped, 17 pinned, 7 recovery
       events in the last hour;
@@ -214,71 +215,82 @@ CENSUS = FleetCensus(
         RootCensus(
             'dark-factory',
             {
-                TaskStatus.PENDING: 1465, TaskStatus.DEFERRED: 293, TaskStatus.IN_PROGRESS: 24,
-                TaskStatus.BLOCKED: 6, TaskStatus.MERGE_DEFERRED: 2,
+                TaskStatus.PENDING: 3346, TaskStatus.DEFERRED: 255, TaskStatus.IN_PROGRESS: 24,
+                TaskStatus.BLOCKED: 10,
             },
-            {TaskStatus.DONE: 4929, TaskStatus.CANCELLED: 396},
-            files_per_row=5, modules=2792, deps_per_100_rows=25,
+            {TaskStatus.DONE: 5951, TaskStatus.CANCELLED: 601},
+            files_per_row=5, modules=4704, deps_per_100_rows=63,
             parked=5, skipped=4, pinned=17, recovery_events=1,
             pending_escalations=12, resolved_escalations=1968,
             completed_hours=1555, claimed_terminal=40, merges=600, trains=50, prds=119,
         ),
         RootCensus(
             'reify',
-            {TaskStatus.PENDING: 2095, TaskStatus.DEFERRED: 223, TaskStatus.IN_PROGRESS: 23},
-            {TaskStatus.DONE: 6076, TaskStatus.CANCELLED: 772},
-            files_per_row=5, modules=3775, deps_per_100_rows=131, parked=4, skipped=4,
+            {TaskStatus.PENDING: 2526, TaskStatus.DEFERRED: 218, TaskStatus.IN_PROGRESS: 16},
+            {TaskStatus.DONE: 6445, TaskStatus.CANCELLED: 786},
+            files_per_row=5, modules=4181, deps_per_100_rows=201, parked=4, skipped=4,
             pending_escalations=4, resolved_escalations=8658,
             completed_hours=2123, claimed_terminal=37, merges=600, trains=4, prds=110,
         ),
         RootCensus(
             'solar-challenge-platform',
-            {TaskStatus.PENDING: 499, TaskStatus.IN_PROGRESS: 18, TaskStatus.BLOCKED: 9},
-            {TaskStatus.DONE: 715, TaskStatus.CANCELLED: 94},
-            files_per_row=8, modules=1255, deps_per_100_rows=247,
+            {TaskStatus.PENDING: 563, TaskStatus.BLOCKED: 13},
+            {TaskStatus.DONE: 1242, TaskStatus.CANCELLED: 106},
+            files_per_row=8, modules=1327, deps_per_100_rows=233,
             pending_escalations=31, resolved_escalations=1380,
             completed_hours=529, merges=400, prds=37,
         ),
         RootCensus(
             'solar-challenge',
-            {TaskStatus.PENDING: 200, TaskStatus.IN_PROGRESS: 20, TaskStatus.BLOCKED: 3},
-            {TaskStatus.DONE: 658, TaskStatus.CANCELLED: 133},
-            files_per_row=8, modules=354, deps_per_100_rows=270, recovery_events=6,
+            {TaskStatus.PENDING: 165, TaskStatus.BLOCKED: 2},
+            {TaskStatus.DONE: 1118, TaskStatus.CANCELLED: 146},
+            files_per_row=8, modules=380, deps_per_100_rows=296, recovery_events=6,
             pending_escalations=8, resolved_escalations=633,
             completed_hours=397, merges=400, prds=23,
         ),
         RootCensus(
             'scoping-intake',
-            {TaskStatus.PENDING: 45, TaskStatus.IN_PROGRESS: 3},
-            {TaskStatus.DONE: 50, TaskStatus.CANCELLED: 3},
-            files_per_row=5, modules=88, deps_per_100_rows=181,
+            {TaskStatus.PENDING: 22},
+            {TaskStatus.DONE: 924, TaskStatus.CANCELLED: 15},
+            files_per_row=5, modules=46, deps_per_100_rows=455,
             pending_escalations=0, resolved_escalations=67,
-            completed_hours=32, merges=51, prds=2,
+            completed_hours=32, merges=300, prds=2,
         ),
         RootCensus(
             'know-live',
-            {TaskStatus.DEFERRED: 10, TaskStatus.BLOCKED: 6},
-            {TaskStatus.DONE: 594, TaskStatus.CANCELLED: 2},
-            files_per_row=2, modules=10, deps_per_100_rows=214,
+            {TaskStatus.DEFERRED: 10, TaskStatus.BLOCKED: 1},
+            {TaskStatus.DONE: 599, TaskStatus.CANCELLED: 2},
+            files_per_row=2, modules=14, deps_per_100_rows=273,
             pending_escalations=14, resolved_escalations=13,
             completed_hours=113, merges=300,
         ),
         RootCensus(
-            'pump-web-ui', {TaskStatus.BLOCKED: 5}, {TaskStatus.DONE: 14, TaskStatus.CANCELLED: 1},
-            files_per_row=1, modules=2,
+            'pump-web-ui',
+            {TaskStatus.PENDING: 54, TaskStatus.BLOCKED: 3},
+            {TaskStatus.DONE: 71, TaskStatus.CANCELLED: 2},
+            files_per_row=3, modules=61, deps_per_100_rows=44,
             pending_escalations=11,
-            completed_hours=13, merges=15,
+            completed_hours=13, merges=70,
         ),
         RootCensus(
             'autopilot-video',
-            {TaskStatus.DEFERRED: 1, TaskStatus.BLOCKED: 1},
-            {TaskStatus.DONE: 615, TaskStatus.CANCELLED: 37},
+            {TaskStatus.DEFERRED: 1},
+            {TaskStatus.DONE: 616, TaskStatus.CANCELLED: 37},
             files_per_row=1, modules=2,
             pending_escalations=4, resolved_escalations=7,
             completed_hours=58, merges=250,
         ),
         RootCensus('autotrade', {}, {}, orchestrator_running=False),
         RootCensus('mission-control', {}, {}, orchestrator_running=False),
+        RootCensus(
+            'stream-touch',
+            {TaskStatus.PENDING: 4, TaskStatus.BLOCKED: 3, TaskStatus.DEFERRED: 9},
+            {TaskStatus.DONE: 481, TaskStatus.CANCELLED: 13},
+            files_per_row=2, modules=28, deps_per_100_rows=206,
+            pending_escalations=3, resolved_escalations=247,
+            completed_hours=238, merges=250,
+        ),
+        RootCensus('market-predictor', {}, {TaskStatus.CANCELLED: 1}, orchestrator_running=False),
     ),
     title_len=120,
     description_len=2600,

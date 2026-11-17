@@ -922,6 +922,34 @@ class QueuedBranch:
         return cls(bare_id=bare_id, full_name=full_name)
 
 
+@dataclass(frozen=True)
+class MergeContent:
+    """A merge request's submit-time facts, replaced whole by its one writer (PRD
+    ``plans/one-merge-request-per-task-prd.md`` D5/D11).
+
+    ``content_seq`` counts those replacements; it is distinct from
+    :attr:`MergeRequest.generation`, which counts auto-chained merges.
+    """
+
+    branch: QueuedBranch
+    tip: str
+    worktree: Path
+    task_files: tuple[str, ...] | None
+    module_configs: tuple[ModuleConfig, ...]
+    pre_rebased: bool
+    content_seq: int = 1
+
+    def __post_init__(self) -> None:
+        if not self.tip:
+            raise ValueError(
+                f'MergeContent needs a tip (D7: every request has one); got tip={self.tip!r}',
+            )
+        if self.content_seq < 1:
+            raise ValueError(
+                f'MergeContent content_seq starts at 1; got content_seq={self.content_seq}',
+            )
+
+
 @dataclass
 class MergeRequest:
     """A request to merge a task branch into main."""

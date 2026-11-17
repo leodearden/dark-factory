@@ -39,3 +39,15 @@ No binding resolves to declared-only, producer-downstream or rejection-absent. T
 | Γ4 | population bound replaces the fixture bound | args edit only; never cancelled (D4) | PASS |
 
 No new binding resolves to declared-only, producer-downstream or rejection-absent.
+
+## Amendment 2026-10-08 (PRD §12)
+
+The sidecar gained these five labels in a8a366faa2 with no change here; this table records them alongside, rendered from their sidecar blocks.
+
+| leaf | capability | binding | verdict |
+|---|---|---|---|
+| π2 (task 6530) | `write-time-population-published` | publishes a population artifact scored on slates that existed when each write was made; grep `"n_judge_band_write_time":` present in `fused-memory/calibration/write_triage_population_write_time.json` on landing | OPEN |
+| λ2 (task 6531) | `every-write-time-pair-rated` | blind rating top-up under λ's brief and protocol; operational, so completeness is asserted by ι2 at μ, which refuses on an unrated pair so an incomplete top-up cannot pass Γ3 | OPEN |
+| ι2 (task 6532) | `comparative-block-published` | writes the comparative block Γ3's re-pointed args read; grep `"harm_delta_vs_status_quo":` present in `fused-memory/calibration/write_triage_best_config.json` on landing | OPEN |
+| contested-heal (task 6533) | `judge-contested-links-healable` | lifts link-heal H1 row 2 for triage-stamped children only; not a flip dependency; asserted by the sweep's own report and tests | OPEN |
+| contested-render-full (task 6534) | `contesting-child-full-text-on-parent-only-hit` | completes χ's intent for the parent-only fallback path; not a flip dependency; asserted by the orchestrator fixture and tests | OPEN |

@@ -13,7 +13,7 @@ import logging
 import stat
 from typing import cast
 
-from orchestrator import session_registry as sr
+from orchestrator import fleet_files
 
 
 class TestLoadUiConfig:
@@ -46,7 +46,7 @@ class TestSaveUiConfig:
 
         save_ui_config(cfg, tmp_path)
 
-        expected_path = sr.fleet_root(tmp_path) / 'cockpit-ui.json'
+        expected_path = fleet_files.fleet_root(tmp_path) / 'cockpit-ui.json'
         assert ui_config_path(tmp_path) == expected_path
         assert expected_path.is_file()
 

@@ -6,18 +6,25 @@ The placeholder shape is the one the 2026-10-11 hand redaction left on disk:
 
 from __future__ import annotations
 
+import gzip
+import hashlib
 import json
 import os
 import stat
+import xml.etree.ElementTree as ET
+import zlib
 from pathlib import Path
 
 import pytest
 
 from shared.secret_redaction import (
+    MIN_REDACTABLE_LEN,
+    Codec,
+    CorruptCompressedFile,
     FileChangedDuringRedaction,
+    Markup,
     RedactionWouldCorruptJson,
     RefusedLine,
-    copy_redacted,
     file_stamp,
     redact_in_place,
     redaction_needles,
@@ -51,6 +58,21 @@ def _transcript_lines(value: str) -> list[str]:
         }),
         json.dumps({'type': 'assistant', 'message': {'content': 'done'}}),
     ]
+
+
+def _junit_lines(value: str) -> list[str]:
+    suite = ET.Element('testsuite', name='orchestrator', tests='1', failures='1')
+    case = ET.SubElement(suite, 'testcase', classname='tests.test_env', name='test_env_is_scrubbed')
+    failure = ET.SubElement(case, 'failure', message=f'AssertionError: leaked {value} here')
+    failure.text = f"E   AssertionError: {{'{VAR}': '{value}', 'PATH': '/usr/bin'}}"
+    ET.indent(suite)
+    return ET.tostring(suite, encoding='unicode', xml_declaration=True).splitlines()
+
+
+def _parsed_failure(data: bytes) -> ET.Element:
+    failure = ET.fromstring(data).find('testcase/failure')
+    assert failure is not None
+    return failure
 
 
 def _write(path: Path, lines: list[str], *, mode: int = 0o640) -> Path:
@@ -160,22 +182,6 @@ class TestRedactInPlace:
         _assert_every_line_is_json(path)
 
 
-def test_copy_redacted_redacts_the_destination_and_leaves_the_source(tmp_path):
-    src = _write(tmp_path / 'src.jsonl', _transcript_lines(VALUE))
-    dest = tmp_path / 'dest.jsonl'
-    src_bytes = src.read_bytes()
-
-    result = copy_redacted(src, dest, redaction_needles({VAR: VALUE}))
-
-    assert dict(result.counts) == {VAR: 2}
-    assert src.read_bytes() == src_bytes
-    data = dest.read_bytes()
-    assert VALUE.encode() not in data
-    assert _placeholder(VAR, len(VALUE)) in data
-    assert len(data) == len(src_bytes)
-    _assert_every_line_is_json(dest)
-
-
 class TestRefusedLine:
     VALUE = '00e9' + 'X' * 40
 
@@ -220,18 +226,6 @@ class TestRefusedLine:
         assert path.read_bytes() == content
         assert list(path.parent.iterdir()) == [path]
 
-    def test_copy_redacted_keeps_the_refused_line_and_redacts_the_rest(self, tmp_path):
-        src = _write(tmp_path / 'src.jsonl', self._lines())
-        dest = tmp_path / 'dest.jsonl'
-
-        result = copy_redacted(src, dest, self._needles())
-
-        assert result.refused == (RefusedLine(2, VAR),)
-        assert dict(result.counts) == {VAR: 2}
-        copied = _lines(dest)
-        assert copied[1] == _lines(src)[1]
-        assert self.VALUE.encode() not in copied[0] + copied[2]
-
     def test_raise_if_refused_names_the_path_line_and_variable_but_never_the_value(self, tmp_path):
         path = _write(tmp_path / 'held' / 's.jsonl', self._lines())
         result = redact_in_place(path, self._needles())
@@ -267,3 +261,233 @@ def test_a_file_changed_since_the_stamp_is_left_untouched(tmp_path):
     assert path.read_bytes() == content
     assert content.endswith(appended.encode())
     assert list(path.parent.iterdir()) == [path]
+
+
+class TestXmlMarkup:
+    SPECIALS = 'tok&en<"q\'>-' + 'z' * 30
+
+    @pytest.mark.parametrize('value', [VALUE, SPECIALS])
+    def test_every_placeholder_keeps_its_patterns_byte_length(self, value):
+        needles = redaction_needles({VAR: value}, markup=Markup.XML)
+
+        assert needles
+        for needle in needles:
+            assert len(needle.placeholder) == len(needle.pattern)
+
+    def test_a_redacted_junit_report_still_parses_and_reads_as_the_redaction_label(self, tmp_path):
+        path = _write(tmp_path / 'r.xml', _junit_lines(VALUE))
+        before = path.stat()
+        line_count = len(_lines(path))
+
+        result = redact_in_place(path, redaction_needles({VAR: VALUE}, markup=Markup.XML))
+
+        after = path.stat()
+        data = path.read_bytes()
+        assert dict(result.counts) == {VAR: 2}
+        assert VALUE.encode() not in data
+        assert after.st_size == before.st_size
+        assert len(_lines(path)) == line_count
+        assert stat.S_IMODE(after.st_mode) == 0o640
+        assert after.st_mtime_ns == OLD_MTIME_NS
+        failure = _parsed_failure(data)
+        label = f'<redacted:{VAR}>'
+        assert label in failure.get('message', '')
+        assert label in (failure.text or '')
+
+    @pytest.mark.parametrize(
+        'length', range(MIN_REDACTABLE_LEN, len(f'&lt;redacted:{VAR}&gt;') + 1)
+    )
+    def test_a_value_too_short_for_the_label_never_truncates_mid_entity(self, tmp_path, length):
+        value = 'q' * length
+        path = _write(tmp_path / 'r.xml', _junit_lines(value))
+
+        result = redact_in_place(path, redaction_needles({VAR: value}, markup=Markup.XML))
+
+        assert dict(result.counts) == {VAR: 2}
+        failure = _parsed_failure(path.read_bytes())
+        assert value not in failure.get('message', '')
+        assert value not in (failure.text or '')
+
+    def test_a_value_with_an_xml_special_is_matched_in_its_escaped_form(self, tmp_path):
+        value = 'tok&en-' + 'z' * 30
+        lines = _junit_lines(value)
+        escaped = value.replace('&', '&amp;')
+        assert sum(line.count(escaped) for line in lines) == 2, 'ElementTree escapes & both times'
+        path = _write(tmp_path / 'r.xml', lines)
+
+        result = redact_in_place(path, redaction_needles({VAR: value}, markup=Markup.XML))
+
+        data = path.read_bytes()
+        assert dict(result.counts) == {VAR: 2}
+        assert escaped.encode() not in data
+        failure = _parsed_failure(data)
+        assert value not in failure.get('message', '')
+        assert value not in (failure.text or '')
+
+    @pytest.mark.parametrize('value', [SPECIALS, 'tok"en' + 'z' * 30, "tok'en" + 'z' * 30])
+    def test_a_value_elementtree_wrote_into_an_attribute_and_text_is_matched_in_both(self, tmp_path, value):
+        path = _write(tmp_path / 'r.xml', _junit_lines(value))
+
+        result = redact_in_place(path, redaction_needles({VAR: value}, markup=Markup.XML))
+
+        assert dict(result.counts) == {VAR: 2}
+        failure = _parsed_failure(path.read_bytes())
+        assert value not in failure.get('message', '')
+        assert value not in (failure.text or '')
+
+    def test_a_value_with_whitespace_elementtree_escapes_in_an_attribute_is_matched_there(self, tmp_path):
+        value = 'tok\ten\nline\r-' + 'z' * 30
+        suite = ET.Element('testsuite', name='orchestrator')
+        ET.SubElement(ET.SubElement(suite, 'testcase', name='t'), 'failure', message=f'leaked {value}')
+        path = _write(tmp_path / 'r.xml', [ET.tostring(suite, encoding='unicode')])
+
+        result = redact_in_place(path, redaction_needles({VAR: value}, markup=Markup.XML))
+
+        assert dict(result.counts) == {VAR: 1}
+        assert value not in _parsed_failure(path.read_bytes()).get('message', '')
+
+
+class TestJsonAndTextMarkup:
+    SPECIALS = 'ab"cd\\ef' + 'z' * 30
+
+    def test_json_markup_is_the_default_and_keeps_the_raw_label(self):
+        default = redaction_needles({VAR: VALUE})
+
+        assert default == redaction_needles({VAR: VALUE}, markup=Markup.JSON)
+        assert all(needle.placeholder.startswith(b'<redacted:') for needle in default)
+
+    def test_text_markup_matches_the_raw_value_a_plain_log_holds(self, tmp_path):
+        path = _write(tmp_path / 'detect.log', [f'E   AssertionError: token={self.SPECIALS}', '1 failed'])
+
+        result = redact_in_place(path, redaction_needles({VAR: self.SPECIALS}, markup=Markup.TEXT))
+
+        assert dict(result.counts) == {VAR: 1}
+        assert self.SPECIALS.encode() not in path.read_bytes()
+        assert _placeholder(VAR, len(self.SPECIALS)) in path.read_bytes()
+
+    def test_text_markup_still_matches_a_json_escaped_value_a_log_line_embeds(self, tmp_path):
+        path = _write(tmp_path / 'detect.log', [f'payload: {json.dumps({"token": self.SPECIALS})}'])
+
+        result = redact_in_place(path, redaction_needles({VAR: self.SPECIALS}, markup=Markup.TEXT))
+
+        assert dict(result.counts) == {VAR: 1}
+        assert json.dumps(self.SPECIALS)[1:-1].encode() not in path.read_bytes()
+
+    def test_json_markup_does_not_match_the_raw_value(self, tmp_path):
+        path = _write(tmp_path / 'detect.log', [f'token={self.SPECIALS}'])
+
+        assert dict(redact_in_place(path, redaction_needles({VAR: self.SPECIALS})).counts) == {}
+
+    def test_a_value_without_specials_has_one_pattern_in_every_markup(self):
+        for markup in Markup:
+            assert [needle.pattern for needle in redaction_needles({VAR: VALUE}, markup=markup)] == [VALUE.encode()]
+
+
+def _write_gzip(path: Path, lines: list[str], *, mode: int = 0o640) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(gzip.compress(''.join(f'{line}\n' for line in lines).encode()))
+    path.chmod(mode)
+    os.utime(path, ns=(OLD_ATIME_NS, OLD_MTIME_NS))
+    return path
+
+
+def _filler_lines(count: int) -> list[str]:
+    return [hashlib.sha256(str(i).encode()).hexdigest() for i in range(count)]
+
+
+class TestGzip:
+    def _xml_needles(self):
+        return redaction_needles({VAR: VALUE}, markup=Markup.XML)
+
+    def test_a_gzipped_report_is_redacted_through_decompress_and_recompress(self, tmp_path):
+        path = _write_gzip(tmp_path / 'r.xml.gz', _junit_lines(VALUE))
+        original = gzip.decompress(path.read_bytes())
+
+        result = redact_in_place(path, self._xml_needles(), codec=Codec.GZIP)
+
+        after = path.stat()
+        data = gzip.decompress(path.read_bytes())
+        assert dict(result.counts) == {VAR: 2}
+        assert VALUE.encode() not in data
+        assert len(data) == len(original)
+        assert len(data.splitlines()) == len(original.splitlines())
+        failure = _parsed_failure(data)
+        assert f'<redacted:{VAR}>' in failure.get('message', '')
+        assert stat.S_IMODE(after.st_mode) == 0o640
+        assert after.st_mtime_ns == OLD_MTIME_NS
+        assert list(path.parent.iterdir()) == [path]
+
+    def test_a_second_gzip_call_finds_nothing_and_does_not_rewrite(self, tmp_path):
+        path = _write_gzip(tmp_path / 'r.xml.gz', _junit_lines(VALUE))
+        redact_in_place(path, self._xml_needles(), codec=Codec.GZIP)
+        before = path.stat()
+
+        result = redact_in_place(path, self._xml_needles(), codec=Codec.GZIP)
+
+        after = path.stat()
+        assert dict(result.counts) == {}
+        assert (after.st_ino, after.st_mtime_ns) == (before.st_ino, before.st_mtime_ns)
+
+    def test_a_clean_gzip_file_is_not_rewritten(self, tmp_path):
+        path = _write_gzip(tmp_path / 'clean.xml.gz', _junit_lines('nothing-secret-here'))
+        before = path.stat()
+        content = path.read_bytes()
+
+        result = redact_in_place(path, self._xml_needles(), codec=Codec.GZIP)
+
+        after = path.stat()
+        assert dict(result.counts) == {}
+        assert (after.st_ino, after.st_mtime_ns) == (before.st_ino, before.st_mtime_ns)
+        assert path.read_bytes() == content
+
+    def test_a_value_straddling_a_decompressed_read_boundary_is_found(self, tmp_path):
+        boundaries = [2**k for k in range(12, 23)]
+        body = bytearray(b'a' * (boundaries[-1] + 4096))
+        for boundary in boundaries:
+            start = boundary - 7
+            body[start:start + len(VALUE)] = VALUE.encode()
+        path = tmp_path / 'big.jsonl.gz'
+        path.write_bytes(gzip.compress(b'{"t": "' + bytes(body) + b'"}\n'))
+
+        result = redact_in_place(path, redaction_needles({VAR: VALUE}), codec=Codec.GZIP)
+
+        data = gzip.decompress(path.read_bytes())
+        assert dict(result.counts) == {VAR: len(boundaries)}
+        assert VALUE.encode() not in data
+        json.loads(data)
+
+    def test_a_gzip_file_changed_since_the_stamp_is_left_untouched(self, tmp_path):
+        path = _write_gzip(tmp_path / 'live' / 'r.xml.gz', _junit_lines(VALUE))
+        stamp = file_stamp(path)
+        path.write_bytes(gzip.compress(''.join(f'{line}\n' for line in [
+            *_junit_lines(VALUE), '<!-- rewritten -->',
+        ]).encode()))
+        content = path.read_bytes()
+
+        with pytest.raises(FileChangedDuringRedaction):
+            redact_in_place(path, self._xml_needles(), codec=Codec.GZIP, unchanged_since=stamp)
+
+        assert path.read_bytes() == content
+        assert list(path.parent.iterdir()) == [path]
+
+    @pytest.mark.parametrize('holds_value', [True, False], ids=['value-in-prefix', 'no-value'])
+    def test_a_truncated_gzip_member_raises_corrupt_compressed_file_and_is_left_as_found(
+        self, tmp_path, holds_value
+    ):
+        head = [f'{VAR}={VALUE}'] if holds_value else ['clean head']
+        path = _write_gzip(tmp_path / 'cut' / 'r.xml.gz', [*head, *_filler_lines(2000)])
+        whole = path.read_bytes()
+        path.write_bytes(whole[: len(whole) // 2])
+        if holds_value:
+            prefix = zlib.decompressobj(wbits=31).decompress(path.read_bytes())
+            assert VALUE.encode() in prefix, 'fixture premise: the value is in the decodable prefix'
+        content = path.read_bytes()
+
+        with pytest.raises(CorruptCompressedFile) as excinfo:
+            redact_in_place(path, redaction_needles({VAR: VALUE}), codec=Codec.GZIP)
+
+        message = str(excinfo.value)
+        assert str(path) in message
+        assert VALUE not in message
+        assert path.read_bytes() == content
+        assert list(path.parent.iterdir()) == [path]

@@ -116,6 +116,7 @@ _SPAWN_PATHS = [
 ]
 
 
+@pytest.mark.spawns_agent_cli
 @pytest.mark.asyncio
 @pytest.mark.parametrize('spawn_path', _SPAWN_PATHS)
 async def test_child_inherits_no_python_env_selection(agent_child, tmp_path, spawn_path):

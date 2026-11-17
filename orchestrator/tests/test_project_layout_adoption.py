@@ -29,6 +29,7 @@ from escalation.queue import EscalationQueue
 from pydantic import ValidationError
 from shared import project_layout
 from shared.cli_invoke import AgentResult
+from shared.mcp_markup_middleware import MARKUP_STORM_ERROR_TYPE
 from shared.project_id import project_id_for_root
 from shared.project_layout import (
     ESCALATION_QUEUE_RELPATH,
@@ -278,7 +279,7 @@ class TestOperatorToolsFollowTheLayout:
         )
 
         filed = await sink({
-            'error_type': markup_sink.MARKUP_STORM_ERROR_TYPE,
+            'error_type': MARKUP_STORM_ERROR_TYPE,
             'count': 7,
             'threshold': 5,
             'window_seconds': 3600,

@@ -954,17 +954,12 @@ def main(argv: list[str] | None = None) -> int:
         # Deferred so importing this module for tests never touches config or
         # a backend (mirrors tag_cgl_eta_rehome_scope.main).
         from fused_memory.config.schema import FusedMemoryConfig
-        from fused_memory.services.memory_service import MemoryService
+        from fused_memory.maintenance._utils import maintenance_service
 
-        memory = MemoryService(FusedMemoryConfig())
-        await memory.initialize()
-        try:
+        async with maintenance_service(config=FusedMemoryConfig()) as (_, memory):
             report = await run(
                 memory, project_id=args.project_id, apply=args.apply,
             )
-        finally:
-            if hasattr(memory, 'close'):
-                await memory.close()
 
         print(json.dumps(report, indent=2))
         print(

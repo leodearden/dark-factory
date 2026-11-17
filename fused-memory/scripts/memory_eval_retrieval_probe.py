@@ -1526,13 +1526,14 @@ def emit_series(series, root: str | Path, *, stamp: str | None = None) -> tuple[
 # ---------------------------------------------------------------------------
 # The read-only run band
 #
-# D8's runner pattern (audit_duplicate_memories.py:364-378) minus every
-# mutation: CONFIG_PATH from --config, FusedMemoryConfig(), MemoryService(),
-# initialize_for_reads(), try/finally close(); the full initialize() starts the
-# durable write queue and runs Graphiti startup maintenance, which repairs
-# edges. MemoryService rather than Mem0Backend
-# because a retrieval probe MUST embed its queries — unlike the census, which
-# skips the embedder deliberately, this one cannot.
+# D8's runner pattern minus every mutation: CONFIG_PATH from --config,
+# FusedMemoryConfig(), then
+# fused_memory/maintenance/_utils.py::maintenance_service(open_as=READS), which
+# opens and always closes the service. The full opening starts the durable
+# write queue and runs Graphiti startup maintenance, which repairs edges.
+# MemoryService rather than Mem0Backend because a retrieval probe MUST embed
+# its queries — unlike the census, which skips the embedder deliberately, this
+# one cannot.
 #
 # There is no --apply band and no write call. The guarantee is asserted as
 # behaviour: the tests drive this band against a service double whose every
@@ -1895,15 +1896,17 @@ async def _probe(args: argparse.Namespace, registry: TopicRegistry) -> ProbeOutc
     ``shared/src/shared/cli_boundary.py::run_cli``.
     """
     from fused_memory.config.schema import FusedMemoryConfig
-    from fused_memory.services.memory_service import MemoryService
+    from fused_memory.maintenance._utils import ServiceOpen, maintenance_service
 
     if args.config:
         os.environ['CONFIG_PATH'] = str(args.config)
 
-    memory = MemoryService(FusedMemoryConfig())
-    try:
+    config = FusedMemoryConfig()
+    async with contextlib.AsyncExitStack() as stack:
         try:
-            await memory.initialize_for_reads()
+            _, memory = await stack.enter_async_context(
+                maintenance_service(config=config, open_as=ServiceOpen.READS),
+            )
         except (OSError, sqlite3.Error) as exc:
             raise ProbeRunError(
                 f'the memory store could not be opened ({type(exc).__name__}): {exc}'
@@ -1915,8 +1918,6 @@ async def _probe(args: argparse.Namespace, registry: TopicRegistry) -> ProbeOutc
             out_root=args.out_root,
             census=load_census_coverage(args.census),
         )
-    finally:
-        await memory.close()
 
 
 def main(argv: list[str] | None = None) -> int:

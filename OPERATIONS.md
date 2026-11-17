@@ -864,19 +864,35 @@ duplicate-spawn incident. `holder_record=<unlinked|absent|unreadable|active|exit
 axis: the state of the holder's session-registry record, found through the
 `record_slug` the lease body carries. `exited`/`absent` corroborate an
 `orphaned` pid, and `unlinked` (a lease claimed before that field existed) is no
-evidence either way.
+evidence either way. `lease-claim` also prints `slug=<resolved>`: the slug the
+CLI derived for **this caller**, never the holder's. It is a diagnostic to
+compare against `lease-show`'s `holder_slug` when a later heartbeat comes back
+`result=refused`, not a value to carry into a later verb, and it is printed on
+the fail-open `decision=proceed` path too, where `holder_liveness=` is not
+(`orchestrator/src/orchestrator/session_registry.py::_run_lease_claim`).
 
 A holder whose lease body says `holder_pid=0` claimed it on the **degraded**
-pid path (`$CLAUDE_PID` unset — the CLI records 0, a never-alive sentinel, and
-logs a WARNING). Such a lease is protected only by its heartbeat and always
-reads `orphaned`; that is deliberate, because recording some other durable pid
-(the shell) instead would make it unreapable forever.
+pid path: from a shared `claude agents` host, whose pid outlives every session
+it hosts and so cannot vouch for one, or with `$CLAUDE_PID` unset, which since
+4248 also needs an explicit `--slug` to claim at all. The CLI records 0, a
+never-alive sentinel, and logs a WARNING
+(`orchestrator/src/orchestrator/session_registry.py::lease_liveness_pid`).
+Such a lease is protected only by its heartbeat and always reads `orphaned`;
+that is deliberate, because recording some other durable pid (the shell)
+instead would make it unreapable forever.
 
-`lease-heartbeat` and `lease-release` require the `--slug` the lease was
-claimed with and **refuse** on a mismatch (`result=refused`, nothing touched),
-so no session can evict another's lease or keep a stranger's alive. `--force`
-is the deliberate operator-recovery override: it acts anyway and logs at
-WARNING naming both the forcing slug and the displaced holder.
+`lease-heartbeat` and `lease-release` act only for the lease's holder and
+**refuse** anyone else (`result=refused`, nothing touched), so no session can
+evict another's lease or keep a stranger's alive. The holder is identified by a
+slug the CLI derives afresh on every lease verb
+(`orchestrator/src/orchestrator/session_registry.py::default_lease_slug`;
+`watcher-df-1430433` is a typical one, and `lease-claim`'s `slug=` line shows
+yours). Pass `--slug` only as an operator override. When the slug cannot be
+derived and no `--slug` is given, all three lease verbs exit 2 naming the
+unusable variable, rather than invent a token that a second degraded session
+would share. `--force` is the deliberate operator-recovery override: it acts
+anyway and logs at WARNING naming both the forcing slug and the displaced
+holder.
 
 `result=absent` differs by verb: on a **release** it is plain idempotence, but
 on a **heartbeat** it means that session's lease is gone (reaped, or
@@ -885,11 +901,27 @@ can claim the name freely. Both watcher skills tell a heartbeating session to
 re-claim on `absent` rather than continue; if you force-release a live
 watcher's lease, expect it to re-claim on its next cycle.
 
-**Rollout note (task 3994).** Any watcher session already running on the
-pre-3994 prescription must be **restarted** so it re-reads its skill: its
-`lease-heartbeat`/`lease-release` calls pass no `--slug` and now exit 2
-(argparse) instead of mutating. Nothing is stranded — such a lease stops being
-heartbeated and ages out normally within `LEASE_HEARTBEAT_TTL`, then is reaped.
+**Rollout note (tasks 3994, 4248).** Between 3994 and 4248, a
+`lease-heartbeat`/`lease-release` with no `--slug` exited 2 (argparse) instead
+of mutating. Since 4248 such a call derives the slug, so it no longer exits 2
+whenever the session's identity resolves, and exit 2 now means the slug is
+underivable. A derived slug that does not match the holder's is still
+`result=refused`. For the two watcher leases (`watcher-<project>`,
+`recon-watcher-<project>`) the derived slug is byte-identical to the one the
+skills used to build in shell, so an in-flight watcher keeps its lease.
+`/unblock`'s slug changed shape, from `unblock-<project>-<TASK_ID>-<pid>` to
+`unblock-<project>#<TASK_ID>-<pid>`, so a pre-4248 `/unblock` that releases
+without a slug gets `result=refused`: loud and non-destructive. Its recovery is
+the one-time rollout note in
+`skills/unblock/SKILL.md`'s release step (pass the original `--slug`, or wait
+for the lease to go stale). Any watcher session still running on the pre-3994
+prescription must be **restarted** so it re-reads its skill. Nothing is
+stranded — a lease that stops being heartbeated, or whose release is refused,
+becomes reapable by the same rule as any other: once its holder pid is dead
+**and** its heartbeat is past `LEASE_HEARTBEAT_TTL`. A pre-4248 `/unblock`
+lease from a non-hosted session records that session's long-lived
+`$CLAUDE_PID`, so a refused one lingers for as long as that claude process
+lives, and up to the TTL after.
 
 Its priority order when triaging is: infra stability first, software
 quality second, task progress third. Clear-cut issues get acted on
@@ -917,7 +949,10 @@ through the **B3 low-risk gate** instead of spawning an interactive
   never cancelled at the sub-agent's 20-minute polling ceiling: the
   sub-agent hands its `request_id` back to the watcher, which resumes
   polling it to terminal in a fresh background sub-agent. Only an entry
-  still queued at the ceiling is cancelled.
+  still queued at the ceiling is cancelled. A submission superseded by a
+  successor (a generation advance or a coalesce train) that has not
+  resolved by the ceiling is handed back and resumed the same way, never
+  cancelled.
 - Anything else (drift, an aborted low-risk attempt, a capped budget) is
   left pending, written to the project's `afk-digest.md`, and recorded as
   a decision for the next human return-triage pass. A handed-off merge
@@ -1068,12 +1103,11 @@ terminal tier's claimants through `set_task_claimant` (`--repair-hygiene`
 adds the hygiene tier). Exit 3 means nothing was read. Run the script
 directly, never via `python -m`.
 
-The census reports the raw terminal tier, ledgered rows included: unlike
-the gauge, it does not separate sanctioned C4-E2 exceptions (task 6777
-owns adding that). Before you
-treat a census terminal row as unledgered, or run `--apply`, check it
-against the gauge's `ledgered` flag or the row's
-`metadata.claimant_exception`.
+The census reports sanctioned C4-E2 exceptions separately: a terminal row
+whose `metadata.claimant_exception` names its claimant is tier `ledgered`.
+So the census `terminal` tier is the same set as the gauge's unledgered rows.
+`--apply` never writes a ledgered row. A row that becomes ledgered between
+the census and the write is skipped as `skipped_changed_under_us`.
 
 **The mint-time tripwire.** A `set_task_claimant` write that stamps a
 claimant onto a terminal row logs an ERROR whose discriminator is
@@ -1134,6 +1168,57 @@ knob): a halt auto-resumes once its cooldown expires, and the judge re-halts
 if the pipeline is still sick. So a halt you find with an already-expired
 cooldown is about to clear itself on the next ~5s tick — in that one window a
 manual trigger IS consumed, and the tool says so.
+
+### Has the reconciliation judge hit its turn cap?
+
+Any retune of the judge's `max_turns` waits for the first production
+`error_max_turns` (esc-4344-6, option C; task 6573). Every `claude_cli` judge
+invocation records one row in the `judge_invocations` table of
+`data/reconciliation/reconciliation.db`. That path is this deployment's
+`reconciliation.data_dir` in `fused-memory/config/config.yaml`; a relative
+value is anchored at the checkout by
+`fused-memory/src/fused_memory/config/checkout_anchor.py::anchor_at_checkout`.
+
+- **Is the tripwire armed?** Check this first:
+
+      sqlite3 -readonly data/reconciliation/reconciliation.db "SELECT COUNT(*), MAX(completed_at) FROM judge_invocations;"
+
+  Zero rows means no judge invocation has ever been recorded: the judge is
+  disabled, its provider is not `claude_cli`, or fused-memory has not
+  restarted onto this code. The tripwire is then NOT armed, which is a
+  different state from "no hit".
+- **Has it fired?** Any row means the trigger has fired:
+
+      sqlite3 -readonly data/reconciliation/reconciliation.db "SELECT ji.completed_at, ji.run_id, r.project_id, ji.schema_salvaged, ji.num_turns, ji.rejected_tool_calls FROM judge_invocations ji LEFT JOIN runs r ON r.id = ji.run_id WHERE ji.ended_error_max_turns = 1 ORDER BY ji.completed_at LIMIT 1;"
+
+  A schema-salvaged run counts too: the turn cap ended it, even though its
+  verdict was recovered. The `schema_salvaged` column tells the two apart: 1
+  is a run whose verdict was recovered, 0 is a verdict-less one, which also
+  shows up as a `JUDGE_INFRA_FAILURE` no-verdict. A NULL `num_turns` means
+  the CLI reported no turn count (a timed-out or killed run), not zero turns,
+  so leave those rows out of any turn distribution.
+- **Rejected tool calls.** The judge registers no tool but `StructuredOutput`,
+  so the CLI rejects every other call it makes:
+
+      sqlite3 -readonly data/reconciliation/reconciliation.db "SELECT COUNT(*), SUM(rejected_tool_calls), SUM(rejected_tool_calls IS NULL) FROM judge_invocations;"
+
+  NULL means the transcript was unreadable, not zero.
+- **Live signals.** Grep the fused-memory journal with a bounded window:
+
+      journalctl --user -u fused-memory --since -1h --no-pager -o cat --grep 'reconciliation.judge_(turn_cap_hit|invocation_record_failed)'
+
+  The user journal is tens of GB, so widen `--since` with care; the table,
+  not the journal, is the durable record. Each WARNING's message reads
+  `reconciliation.judge_turn_cap_hit run_id='…' num_turns=… max_turns=… rejected_tool_calls=… schema_salvaged=…`,
+  logged on every hit even when the row write fails, or
+  `reconciliation.judge_invocation_record_failed run_id='…' ended_error_max_turns=…`,
+  logged when a row was lost. So the table is a lower bound, and the log is
+  the backstop. String values print quoted, so no value can split into
+  further `key=value` fields.
+- **Next action on a hit.** Re-run
+  `fused-memory/scripts/probe_schema_max_turns.py --shape judge` before
+  changing `_JUDGE_CLI_MAX_TURNS`
+  (`fused-memory/src/fused_memory/reconciliation/judge.py`).
 
 ### Is the curator deduping, or just creating?
 
@@ -1891,7 +1976,7 @@ allowlist over `fused-memory/config/config.yaml`, applied by
 process, different file. Do not look for one config's leaves in the
 other's list. Its green tier currently covers several `reconciliation.*`
 leaves (the near-dup/topic-guard knobs and `stale_run_recovery_seconds`),
-`write_triage.*`, and the five in-place-update leaves below — read
+`write_triage.*`, and the in-place-update leaves below — read
 `RELOADABLE_FIELDS` in `fused-memory/src/fused_memory/config/reload.py` as
 the authoritative list rather than treating this enumeration as exhaustive.
 `server.*` (the bind host, the port and `recon_report_port`) is not in it, so
@@ -1921,6 +2006,19 @@ a bind change is restart-only in both processes (the orchestrator's
   to correct; a silent content rewrite is neither. (`agent_id` is
   self-reported, so this is a misuse deterrent for cooperating callers,
   not a security boundary.)
+- `mem0_update.agent_prefix_sanctioned_use` — the prefix-to-role map. A
+  `Mem0UpdateNotAuthorized` refusal renders, for each prefix on the
+  refusing arm's list, the role that prefix declares, together with the
+  norm: adopt a prefix only if you are that role, and a caller refused in
+  the middle of other work escalates rather than renaming itself. A listed
+  prefix with no entry renders as undocumented ("do not adopt it").
+  Documenting a prefix here is part of widening either list. The shipped
+  default (`Mem0UpdateConfig.agent_prefix_sanctioned_use`) documents every
+  prefix on either default allowlist; a YAML value replaces that map
+  wholesale, so restate every entry. Green-tier,
+  reloaded as one atomic leaf. This makes the norm legible, not the gate
+  enforceable: `agent_id` stays self-reported, and the storm alarm below
+  remains the backstop.
 - `mem0_update.storm_threshold` and `mem0_update.storm_window_seconds` —
   the content-amend burst alarm (escalates, never blocks; metadata-only
   calls do not count toward it). Genuinely reload-safe because the shared
@@ -3649,11 +3747,12 @@ critical path — so a cold cache degrades to the previous behaviour exactly.
 | `Permission denied` reading `/proc/<pid>/environ` while diagnosing a systemd --user unit's `PATH` or environment, or a unit failing `ENOENT` on a binary that `which` finds | That pid is the user manager, whose environ is readable or not depending on its capabilities, and is the wrong layer anyway. Or the unit is `DRIFTED`: it still has the environment of its last start | [§3 Inspecting a unit's live environment](#inspecting-a-units-live-environment) |
 | `escalation-watcher-auto` rotations respawn continuously while the L1 queue shows only `esc-task-path-guard*` records, and each rotation resolves nothing | The path-scope guard files its rejection / advisory audit records at `level=1` under a **synthetic anchor** `task_id` — no such task exists. Until the record reaches a terminal state it stays `pending`, and the supervisor's pre-boot precheck (`orchestrator/src/orchestrator/harness.py::_watcher_has_actionable_l1`) counts any pending un-promoted L1 as actionable, so it keeps spawning rotations. A `stamp_triage` does **not** clear it: that precheck reads `status`/`level` only, never `triaged_at` | Expected, and clears on the first rotation that actually reaches the record — the watcher's `scope_violation` recipe has an audit-only branch that closes these `close_only`/`benign` (see `skills/escalation-watcher-auto/SKILL.md`). **Do not `stamp_triage` these records**: a stamp reaches no terminal state, so it cannot clear the precheck, but its fresh `triaged_at` makes the next rotation drop the record at the drain filter before the auto-close branch is consulted — the loop then persists for as long as the stamp stays fresh (~6h). The recipe carves these out of that skip; a rotation running an older copy will not. If they persist beyond that, check the drain-filter carve-out is present, then compare the branch's tokens against `_ANCHOR_TASK_ID` / `_AGENT_ROLE` in `fused-memory/src/fused_memory/middleware/scope_violation_escalator.py` for producer drift. Do **not** "fix" this by re-gating the producer — the guard is the census, and the one deliberate bypass (`routing_override_reason`) already returns before any verdict or escalation fires (`fused-memory/src/fused_memory/middleware/task_interceptor.py::TaskInterceptor._path_guard_or_skip`), so there is nothing left to gate |
 | Two branches that each moved `orchestrator/tests/merge_lane_ratchet_baseline.json` conflict on it (a probe bounce or a stopped merge), although they moved different code | The structured merge driver `.gitattributes` names (`merge=ratchet-baseline`) is not installed in this host's `.git/config`, so git falls back to its line merge, which conflicts whenever two branches touch one baseline row; or the driver REFUSED this pair (it says why on stderr: two different changes to one scalar, a row deleted on one side and changed on the other, two insertions at one place in a path list) and wrote git's own text merge with markers. The probe (`git merge-tree` at `project_root`) reads attributes from `project_root`'s working tree, so it composes only once `.gitattributes` is on main and `project_root` has re-synced | `git config --get merge.ratchet-baseline.driver` on the host: empty means run `python3 scripts/merge_lane_ratchet_merge.py install` from the main checkout (it writes the shared `.git/config`, so it covers every linked worktree; `scripts/setup-host.sh` step 9 does the same on a new host). A merge or probe that instead DIES with `fatal: custom merge driver ratchet-baseline lacks command line` (exit 128) means a `merge.ratchet-baseline` section without its `driver` key: `git config --remove-section merge.ratchet-baseline`, then install. A refusal is an ordinary conflict: resolve the code, then regenerate the baseline with `python scripts/merge_lane_metrics.py --write-baseline orchestrator/tests/merge_lane_ratchet_baseline.json`. While a driver merge runs under the probe, git leaves transient `.merge_file_*` files in `project_root`; they are untracked and gone when the probe returns. A raise is never authorized in the baseline file itself: it is one new file under `orchestrator/tests/merge_lane_ratchet_raises/`, which never conflicts |
-| `git commit` finishing a merge (one stopped on another file) is refused by the ratchet commit gate for a baseline raise over its 3-way bound, and `--write-baseline --authorize-raise` then prints `no measure rose; nothing recorded` | The staged baseline holds more than merging both parents can (`scripts/merge_lane_metrics.py::_both_moved_bound`; two raises of one measure compose, so the ratchet-baseline merge driver's own `ours + theirs - base` passes), and the excess is the merge's own raise; but the file on disk already holds that value, so the write gate sees nothing rising | `git checkout HEAD -- orchestrator/tests/merge_lane_ratchet_baseline.json` (ours; `--ours` does nothing once the driver resolved the file), then `python scripts/merge_lane_metrics.py --write-baseline orchestrator/tests/merge_lane_ratchet_baseline.json --authorize-raise <task-id> --reason "<why>"`: it measures from ours, records the merge's own entry file, and the commit passes. The gate's refusal prints the same recipe |
+| `git commit` finishing a merge (one stopped on another file) is refused by the ratchet commit gate for a baseline raise over its 3-way bound, and `--write-baseline --authorize-raise` then prints `no measure rose; nothing recorded` | The staged baseline holds more than merging both parents can (`scripts/merge_lane_ratchet.py::_both_moved_bound`; two raises of one measure compose, so the ratchet-baseline merge driver's own `ours + theirs - base` passes), and the excess is the merge's own raise; but the file on disk already holds that value, so the write gate sees nothing rising | `git checkout HEAD -- orchestrator/tests/merge_lane_ratchet_baseline.json` (ours; `--ours` does nothing once the driver resolved the file), then `python scripts/merge_lane_metrics.py --write-baseline orchestrator/tests/merge_lane_ratchet_baseline.json --authorize-raise <task-id> --reason "<why>"`: it measures from ours, records the merge's own entry file, and the commit passes. The gate's refusal prints the same recipe |
 | `scripts/setup-host.sh` §11 prints a `Network exposure:` FAIL, or `python3 scripts/check_network_exposure.py` exits 1 | Read the kind on each tagged line. `[exposed]`: a listener is bound to a wildcard address. That is `fused-memory.socket`'s `ListenStream` (`scripts/fused-memory.socket.template`), fused-memory's `server.host`, which binds `:8003` itself (`fused-memory/config/config.yaml`), or a compose `ports` entry without a `127.0.0.1:` prefix (`fused-memory/docker/docker-compose.yml`). `[not-listening]`: the named owner is down, or bound somewhere other than `127.0.0.1`. `[timed-out]`: an off-loopback connect was neither accepted nor refused, typically because a DROP rule hides whatever listens there; a timeout counts as a failure. `[unverified]`: an off-loopback connect failed with the errno the line names, so that address was not checked. `[source-error]`: `systemctl`, `ip` or the `docker container ls` query could not be read, usually because there is no user bus for `systemctl --user`, no `ip` binary, or no reachable docker daemon; every port it could still find was probed, and when the docker query failed, the port it asked about stays a `[not-listening]` failure. `[no-container]` is informational and never the cause of exit 1: an optional compose service has no container on this host, so nothing is expected on its port yet ([§8 Network exposure check](#network-exposure-check)) | Bind the named owner to `127.0.0.1` in its committed home and restart it. A socket's `ListenStream` change needs the stop-then-start in [§8 Socket activation](#socket-activation-mcp-ports-survive-restarts); for fused-memory that is `scripts/restart-fused-memory.sh --rebind-socket`. `plans/mcp-network-exposure-prd.md` tracks the loopback flip of today's known wildcard binds. Start a not-listening owner. For an unverified address, read the errno (a link going down, say) and rerun once the link has settled. For a source error, run the check as the login user with `XDG_RUNTIME_DIR` set; for the docker query, also check that this user can run `docker ps`. How to run the check: [§8 Network exposure check](#network-exposure-check) |
 | A `recon_missing_index` escalation appears on the reconciliation queue (port 8103, `task_id` `graph:<group_id>`) | A registered graph lacks indices in the expected set, typically because a provisioning statement failed or the graph was born after the last restart and its first-write provisioning did not complete. `index_health.missing` names the specs | Read the `Index provisioning statement failed on graph` (or `did not complete`) journal line for that graph in `journalctl --user -u fused-memory`, fix what it names, then restart fused-memory (`scripts/restart-fused-memory.sh`, with operator sign-off): startup provisioning creates only what is missing. That restart is how the escalation's `ensure_indices(group_id=...)` suggestion is carried out, since no tool exposes it. The next reconciliation cycle re-checks it. See [§8 FalkorDB index provisioning](#falkordb-index-provisioning-expected-set-drift-the-bm25-canary-the-composite-trap) |
 | A `durable_write_dead_letter` escalation appears (`esc-durable-write-dead-letter-N`, agent_role `fused-memory/dead-letter-guard`) | A durably-queued memory write exhausted its attempts and was **permanently abandoned** — `add_episode`, `add_memory`'s Graphiti leg, or a derived `mem0_classify_and_add` fact. The caller was already told it succeeded: the record's `reported_to_caller=` line says exactly what it was told (`add_episode` returned `status='queued'`; `add_memory` returned `stores_queued` containing graphiti), or says plainly that no synchronous claim was made — an `add_memory_graphiti` death carrying that neutral line came from `replay_from_store`, the operation's second producer, which has no caller and mints no `write_op_id`, so there is nobody to warn. One record folds every death sharing `(project_id, operation, error class)` — deliberately keyed on the error CLASS, not its message, because the esc-3561-3 errors carried a different uuid per write — so `dedupe_count` is the VOLUME, not the record count: 28 lost writes page once | Read **`post_execute` first**; it decides the remedy and the two are opposites. `True` means the backend write LANDED and only the post-write callback kept failing (`durable_queue.py::POST_EXECUTE_DEAD_PREFIX`), so a blind replay **duplicates** it — check `backend_ops` joined on `write_op_id`, never on `backend_ops.operation`, which is the literal `'add_episode'` for both the add_episode and add_memory_graphiti paths, before acting. `False` means the write never landed: `replay_dead_letters` is the safe default once the cause is fixed, `delete_dead_letters` only when the item is known unrecoverable. The escalation is self-sufficient for triage by design — corroborating PULL surfaces exist but are not substitutes: `dead_by_operation` on `get_queue_stats` / `memory_service.py::MemoryService.get_status`, and `reconciliation/queue_health.py::summarize_graphiti_queue_health`'s aggregate `dead_count`, both read the LIVE `write_queue` table and go to zero once `delete_dead_letters` sweeps the rows (that sweep had already erased 26 of the 28 rows in esc-3561-3). `dead_by_operation` is also GROUP-scoped, so a `project_id`-scoped call covers that project's Graphiti group only: a dead `mem0_classify_and_add` for the same project appears under group `mem0_<project_id>` or in the unscoped call, and `{}` from the scoped probe does not contradict the alarm. Anyone holding a `write_op_id` can read the durable per-write record via `write_journal.py::WriteJournal.get_write_op` (`terminal_status`/`terminal_error`, task 3582) |
 | A reviewer verdict carried `note_dispositions` that were not applied: the info note is still pending after the review, or was later closed by the router or promoted instead of carrying the reviewer's class | One of four mechanisms. (i) The workflow rejected the entry: `orchestrator/src/orchestrator/escalation_router.py::reviewer_note_refusal` admits only a pending, router-owned info L0 of the reviewed task that is agent-filed, not mechanical, and not already held on a curator ticket, so an unknown id, another task's record, a non-info or eval-lane record, a harness or mechanical notice, or a router-disabled config is refused; a refusal logs the WARNING `info-l0-router: rejected the reviewer disposition` with the reason and emits `info_l0_dispositioned` with class `rejected_disposition`. (ii) `work` never closes a note, by design: it stamps the reviewer mark (triaged_by `reviewer-comprehensive/workflow`) and the exit router converts the note. (iii) The verdict was lost or errored, so nothing was applied: `TaskWorkflow._salvageable_verdict_payload` drops a malformed payload whole, and an ERROR verdict carries no dispositions (`orchestrator/src/orchestrator/review_payload.py::normalize_review`). (iv) Applying raised, which logs an exception and emits class `router-error` | Read the task's `info_l0_dispositioned` events (`class`, `reason`) and the journal WARNING to see which case applied. Nothing needs repairing, and a pending note must not be hand-closed: the exit finalizer, or the orphan reaper or startup amnesty, routes it, which is the designed backstop (`plans/info-l0-disposition-router-prd.md` boundary row 17). A `convert_to_task` L1 under `harness-info-l0-router` with reason `router_error` means the router already dismissed the note (`orchestrator/src/orchestrator/escalation_router.py::_promote` dismisses before it files the L1), so act on that L1, not the note. If the journal shows the ERROR `could not file its fallback L1`, the note is dismissed and its text survives only in that log line. A recurring (i) for the reviewer's own notes points at a briefing/eligibility mismatch; file it against `reviewer_notes` / `reviewer_note_refusal` |
+| A `legibility census commit did not land`, `legibility census refused by its landing gate` or `legibility trickle codebook commit failed` escalation, or one that repeats nightly | The target's pre-commit hook or the census landing gate refused a machine-written legibility write, which was quarantined and rolled back | [§12 Unlanded legibility writes and the quarantine](#unlanded-legibility-writes-and-the-quarantine) |
 | An orchestrator unit restarts every ~100 s | A startup step, or a crash site between steps, raises a process-killing fault on every start (a `BaseException` such as `SystemExit`, or a fatal step's refusal), so systemd's `Restart=` loops the unit. A non-fatal step that raises an ordinary `Exception` is reported on `orchestrator-startup-<step>` and skipped instead, and does not loop | `journalctl --user -u orchestrator-<name>.service` for the traceback. Then `sqlite3 <project_root>/data/orchestrator/runs.db "SELECT run_id, started_at, startup_completed_at, exit_reason FROM runs ORDER BY rowid DESC LIMIT 10"`: `startup_crash:<site>` names the step, or `before-first-step` / `after-<step>` for a crash between steps; `cancelled` is a SIGTERM; a NULL `exit_reason` with `startup_completed_at` set is a start that came up. `cat <project_root>/data/orchestrator/startup_failures.json` shows the current streak. After 3 consecutive crashes at one non-fatal step, the next start skips that step and files the born-at-L2 `orchestrator-startup-crash-loop` (`orchestrator/src/orchestrator/startup_steps.py::page_crash_loop`); a fatal step, or a crash outside any step, still runs and pages the same way. The `finish_startup` of a start that comes up clears the journal, so fix the cause before the next restart. A crash the process cannot record itself (SIGKILL, an import error) is the [§8](#8-fleet-redeploy--watchdog) watchdog's `orchestrator-crash-loop-<unit>` page instead |
 
 ---
@@ -3766,16 +3865,25 @@ cases, the same backing stores. **Check this table before adding a job** —
 
 **A row here is a claim about the host, not about `scripts/`.** An installer
 committed to main installs nothing; only running it does. So a timer job is
-done when its timer is listed, not when its installer lands. The check is one
-command: `systemctl --user list-timers --all` must list an instance for every
-row, which for a templated `@` unit means one `@<project_id>` instance per
-project. An agent cannot run the installer, because `~/.config/systemd/user/`
-is outside the sandbox write-set
+done when its timer is armed, not when its installer lands.
+`scripts/user_timers.py check` reads every timer declared in
+`scripts/expected_user_timers.py` (each row here, plus the load sampler) and
+exits non-zero naming each one that is not loaded, enabled and active, with
+the installer that arms it. `scripts/user_timers.py arm` runs the installer of
+each unarmed one and leaves a masked one alone; `scripts/setup-host.sh` §7b
+runs it, and a deterministic `before_done` deploy can run it too. Adding a row
+here means adding a `scripts/expected_user_timers.py::EXPECTED_TIMERS` entry,
+which `scripts/tests/test_expected_user_timers.py` enforces for every
+committed `.timer`. Both commands bind a templated `@` unit to the main
+checkout's own `@<project_id>` instance; an instance for any other project
+remains that project's own deploy task. `systemctl --user list-timers --all`
+stays the manual cross-check. An agent cannot run an installer, because
+`~/.config/systemd/user/` is outside the sandbox write-set
 (`orchestrator/src/orchestrator/agents/write_set.py`). The deploy is therefore
 a `task_kind='deterministic'` `before_done` task, one per project, paired with
 a liveness predicate so that a timer which stops firing is loud. History:
 tasks 2901, 4557 and 5351 (rows that were never installed); task 5400 (the
-missing `LoadState` detector).
+declared registry and its `LoadState`-aware detector).
 
 | Slot | Job | Units |
 |---|---|---|
@@ -3985,12 +4093,25 @@ everything already on disk.
   `~/.config/systemd/user/orchestrator-*.service`) and under
   `~/.claude/projects`, subagent transcripts included. It also scans the
   `*.jsonl.archive-tmp` staging copies a hard kill can strand mid-archive,
-  which are redacted only after they are staged.
+  which are redacted only after they are staged. Under each of those project
+  roots it also scans `data/verify-logs` and `data/orchestrator/offline-lane`.
+  In both it scans `*.log`, `*.json` and `*.xml`, and the gzipped junit
+  `*.xml.gz`. A `*.xml.gz` is redacted by decompressing it, replacing the
+  value and recompressing it, with mode and mtime kept. These logs were added
+  after failing pytest env assertions printed live tokens into them (task
+  10144). `~/.claude/projects` is still scanned for transcripts only. The
+  full tree list is `scripts/transcript_secret_sweep.py::swept_trees`.
 - **What it matches.** Only the live values the sweep's own environment holds.
   The wrapper sources the repo `.env` for them. It never matches a token-shaped
-  pattern. Each hit is replaced in place, by the 2026-10-11 method: a
+  pattern. A value is matched in the form the file holds it: JSON-escaped in
+  `*.jsonl` and `*.json`, raw or JSON-escaped in a `*.log`, and entity-escaped
+  in junit text and attribute values. Each hit is replaced in place, by the
+  2026-10-11 method: a
   `<redacted:VAR>` placeholder padded with `x` to the same length, mode and
-  mtime kept, no backup. A rewrite that would break a JSON line is refused
+  mtime kept, no backup. In XML the placeholder is entity-escaped
+  (`&lt;redacted:VAR&gt;`), so a junit report still parses and reads as
+  `<redacted:VAR>`. `scripts/suite_census_evidence.py` reads these reports as
+  census evidence. A rewrite that would break a JSON line is refused
   for that line only: the line keeps its value, the rest of the file is still
   redacted, and the escalation names the path, the line and the variable.
 - **What it cannot see.** A secret defined only in another factory project's
@@ -4000,8 +4121,10 @@ everything already on disk.
 - **What it files.** One `risk_identified` info escalation per sweep that
   redacted or refused anything, naming each path with its per-variable counts.
   It prints one JSON record line to the journal, and never prints a value.
+  A `*.xml.gz` that does not decompress is listed under `unreadable` in that
+  record line and left as found.
 - **What it skips.** Files modified in the last 15 minutes, which a live
-  session may still be appending to. The next night picks them up.
+  session or test run may still be appending to. The next night picks them up.
 
 Installing it is a post-merge deterministic deploy
 (`scripts/install-transcript-secret-sweep-timer.sh`, which kicks no immediate
@@ -4474,7 +4597,9 @@ is how an operator ends up tuning the sampler for a crashed coder:
   the verdict names `<since>` and the outcome lines to look for. Nights where
   the trigger was not evaluated (a failed or capped trickle) neither break nor
   extend the streak. A census that advances clears the verdict at once,
-  because the probe re-reads census-state live.
+  because the probe re-reads census-state live. For the `census: commit did
+  not land` and landing-gate shapes, see
+  [Unlanded legibility writes and the quarantine](#unlanded-legibility-writes-and-the-quarantine).
 
 **Retried nights** (task 5678). A night that did not finish (a non-zero exit,
 or a usage-cap DEFERRED night) leaves its date in the `retry_backlog` key of
@@ -4522,9 +4647,17 @@ census-probe failure **always** posts, because nothing else escalates an
 unadvanced-fire streak. A non-zero exit is the authoritative signal whether or
 not the POST landed.
 
-The nightly escalates once per streak, on the night the barren streak reaches
-its threshold: `trickle_state.DEFAULT_MAX_BARREN_RUNS` (3), or
-`nightly.py run --max-barren-runs N`. To read whether it did, run
+The nightly escalates when the barren streak reaches its threshold
+(`trickle_state.DEFAULT_MAX_BARREN_RUNS` (3), or
+`nightly.py run --max-barren-runs N`), again on a bounded doubling of it (the
+threshold times each entry of
+`scripts/legibility/trickle_state.py::BARREN_ESCALATION_MULTIPLES`), and then
+not again for that streak. The schedule counts streak values, not nights: a
+failed or deferred night carries the streak without advancing it. A productive
+or quiet night resets the schedule. On
+every other night of a streak at or past the threshold this health probe posts,
+because that night's record says `barren_escalated: false`. To read whether the
+nightly escalated, run
 `python3 scripts/legibility/check_trickle_progress.py <project> <N>`: every
 verdict on a readable record, and its OK line, prints `barren_escalated=` as
 `True`, `False`, or `unrecorded`.
@@ -4551,6 +4684,133 @@ lever. **No shipped unit sets it** — production always takes the anchored
 branch — and if you do set it, set it for **both** units at once: pinning one
 half is exactly how the writer/reader divergence comes back.
 
+### Unlanded legibility writes and the quarantine
+
+**What happens.** The trickle's codebook dump
+(`scripts/legibility/nightly.py::_commit_stage`) and the census's outputs
+(`scripts/legibility/census_run.py::persist`: the report `.md`, its `.json`
+record, the codebook, `census-state.json`, and the payloads file under
+`--dry-run-filing`) are committed into the target's main checkout by
+`scripts/legibility/unlanded.py::commit_only`, which never skips the hooks. A
+write does not land when the pre-commit hook refuses it, when a lock is still
+contended after `unlanded.py::COMMIT_ATTEMPTS` attempts, when git fails for
+any other reason, or, for the census only, when its `census.landing_gate`
+command does not pass (`scripts/legibility/landing_gate.py`).
+
+Then `unlanded.py::roll_back` copies every written file into a fresh
+quarantine dir FIRST, and only then restores those paths to HEAD in the index
+and the worktree; a path HEAD does not track is deleted. If the copy cannot be
+made, the checkout is left untouched (dirty) instead. `census-state.json`
+rolls back with the rest, so `last_census_at` and the session watermark do not
+move, and the trigger fires again on its next evaluation. Three effects are
+not undone, or were never made:
+
+- Census remediation tickets are filed before the commit; the escalation
+  lists them.
+- Census sessions are ledgered only after a landed commit, so none are
+  ledgered.
+- A trickle night is recorded `failed`, and neither its ledger nor its census
+  stage runs. Its date is re-coded later (see "Retried nights" under
+  [Legibility trickle health probe (04:30)](#legibility-trickle-health-probe-0430)).
+
+**Reading the escalation.** Each is an `escalate_info` with
+`category=infra_issue` and `severity=info`
+(`scripts/legibility/alarm.py::raise_alarm`), under
+`task_id=legibility-census-<project_id>` or
+`legibility-trickle-<project_id>`. Summaries
+(`census_run.py::_unlanded`, `_commit_refusal`, `_gate_refusal`;
+`nightly.py::_commit_stage`):
+
+- `legibility census commit did not land (<project_id>): outputs rolled back, census-state NOT advanced`
+- `legibility census refused by its landing gate (<project_id>): outputs rolled back, census-state NOT advanced`
+- either census headline followed by `(<project_id>): rollback INCOMPLETE, outputs still dirty in the checkout`
+- `legibility trickle codebook commit failed`
+
+The detail opens with git's diagnostic (the trickle's may be the committer's
+traceback instead), or with the gate command's verdict and its output tail. Next
+comes `refused content quarantined at <dir>; restored to HEAD: <paths>`, or
+`rollback INCOMPLETE: <why>`, either one ending with a pointer to this section.
+A census detail then lists the tickets filed before the commit. The census
+child's own stderr line (`census: commit did not land -- ...` or
+`census: landing gate refused the census -- ...`; census.py exits 1) is in
+`journalctl --user -u legibility-trickle@<project_id>`.
+
+**Where the quarantine is.** `<quarantine root>/<label>-<random>/<repo-relative path>`,
+where `<quarantine root>` is `quarantine/` in the directory holding
+`trickle-state.json`; its resolution and the
+`DARK_FACTORY_LEGIBILITY_STATE_ROOT` lever are in "Where the state file lives"
+above. Print it from its one home, `scripts/legibility/unlanded.py::quarantine_root`,
+in a dark-factory checkout root:
+`python3 -c 'import sys; sys.path.insert(0, "scripts"); from legibility import unlanded; print(unlanded.quarantine_root("<project_id>"))'`.
+`<label>` is `trickle-<target date>` or `census-<census date>`. Use the dir the
+escalation names. To list them newest first, `ls -lt <quarantine root>`; to see
+what one holds, `find <dir> -type f`.
+
+**Recovering.**
+
+1. Fix why the write did not land first: the escalation names git's
+   diagnostic or the gate command, which you can re-run by hand in the
+   checkout.
+2. Diff before you copy, for each file:
+   `git diff --no-index <project_root>/<path> <dir>/<path>`. Lines the copy
+   would REMOVE (`-` lines) are content that landed after the refusal, such as
+   a later trickle night's sightings; then do not overwrite. Never re-apply a
+   census's `census-state.json` once a later census has landed.
+3. Decide whether to re-apply at all. For the trickle it is optional: the
+   retry backlog re-codes the date. For the census it is optional too, since
+   the next fire re-mines the window, but that pays for another census and
+   files its tickets again, relying on the curator's dedup. Re-applying keeps
+   the codebook's back-links to the tickets already filed
+   (`census_run.py::_after_filing`). It does not ledger the census's sessions,
+   which only a run whose own commit landed does
+   (`census_run.py::_ledger_census_codings`), so the next census re-mines any
+   of them its window still covers, the same re-mine cost a failed ledger
+   write has.
+4. Re-apply with a normal hooked commit, per
+   [§9](#9-working-in-the-main-checkout): copy the files to their repo paths,
+   then `git -C <project_root> add -- <paths>` and
+   `git -C <project_root> commit --only -m '<msg>' -- <paths>`. **Never
+   `--no-verify`.** If the hook refuses again, the cause is not fixed: put the
+   paths back with
+   `git -C <project_root> restore --source=HEAD --staged --worktree -- <paths HEAD tracks>`
+   and `git -C <project_root> rm -f -- <paths HEAD does not track>`, and
+   return to step 1.
+
+**Cleaning up.** Once the content is on main, or you have decided to drop it,
+`rm -r <dir>`. Nothing else reads a quarantine dir, and nothing expires one.
+
+**Rollback INCOMPLETE.** The paths are still dirty in the main checkout, which
+blocks the target's redeploys and trips the dirty-tree guard
+([§10](#10-troubleshooting)), so fix this first. If a quarantine dir is named,
+confirm it holds every written file by comparing it with the checkout; if none
+is named, copy the files out yourself. Then restore those paths to HEAD as in
+step 4.
+
+**Breaking a repeated-unlanded-census loop.** The signs: the same census
+escalation recurs on every FIRE night, each adding a `census-<date>-*` dir
+(`ls -d <quarantine root>/census-*` counts them), and after
+`trickle_state.DEFAULT_MAX_UNADVANCED_CENSUS_FIRES` fires the 04:30 probe's
+"census fired without advancing" verdict appears. Each repeat pays again for
+mining, verify and synthesis. Two levers:
+
+1. **Fix the cause** in the target repo (its hook, or the gate's failing
+   tests) through a normal task. If the gate refuses the census's OWN output,
+   that is a census defect: file it, and do not loosen the gate.
+2. **Pause.** `legibility.yaml` has no census-only switch, so stop the trickle
+   timer, which pauses the trickle and the census it launches:
+   `systemctl --user stop legibility-trickle@<project_id>.timer`, or
+   `disable --now` to survive a reboot. Do not stop a running
+   `legibility-trickle@<project_id>.service`: that kills a census mid-run.
+   While paused, the 04:30 probe reports the recorder stale, as expected.
+   Resume only after lever 1, with `systemctl --user start` (or
+   `enable --now`) on the timer, or by re-running
+   `scripts/legibility/install-trickle-timer.sh <project_id>`.
+   `Persistent=true` then starts a catch-up run at once, and the missed
+   nights enter the retry backlog ("Retried nights").
+
+Do not edit `legibility.yaml` uncommitted in the main checkout to pause it:
+that trips the same dirty-tree guard.
+
 ### Nightly legibility transcript check (04:00)
 
 **What it does.** Runs `check_transcript_persistence.py`, task 2893's
@@ -4562,12 +4822,32 @@ down escalation server is swallowed. So a night with a finding leaves the
 unit `failed`. That is the alarm, not a broken unit, and the liveness probe
 below tells the two apart.
 
-**Why no `--check-preventer`.** The comment in
-`legibility-transcript-check@.service` (task 2901 DD2) says the 2893 guard
-regex missed `spawn-claude.sh`'s mid-line export, so the flag would make the
-timer exit 1 every night. Task 2923 fixed that regex on 2026-07-23. Measured
-on 2026-09-24, the guard finds the export, so the comment is stale. Whether to
-enable the flag is an open decision owned by task 5859.
+**Why no `--check-preventer`.** With the flag, the detector also exits 1 when `skills/spawn/spawn-claude.sh` stops
+exporting `CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1`. Task 5859 decided to
+leave it off. The reason task 2901 gave (DD2: the guard regex missed the
+script's mid-line export, so the timer would exit 1 every night) has been
+false since task 2923 fixed the regex on 2026-07-23, and
+`scripts/tests/test_legibility_transcript_persistence.py::test_main_check_preventer_passes_on_committed_spawn_script`
+now pins that the guard recognises the committed script. The current
+reasons:
+
+- **The export is already a merge gate.**
+  `tests/scripts/test_spawn_claude.py::test_spawn_exports_session_and_parent_ids`
+  and `::test_spawn_id_exports_fail_soft_when_registry_faults` run the real
+  script against a fake `claude` and assert the child sees the variable set
+  to `1`, so a change that drops the export cannot land. The nightly guard
+  would only re-check a tracked file after the fact, by regex.
+- **A preventer-only failure files nothing.** `run_check` POSTs only when
+  there is a lost-transcript finding, and the liveness probe reads exit 1 as
+  ALIVE, so no reader is bound to that exit.
+- **It would give exit 1 a second meaning**, where this section and the
+  probe read it as a lost-transcript finding.
+- **It is not per-project.** The guard reads the dark-factory checkout's
+  spawn script whatever `%i` names, so the `dark_factory` and `reify`
+  instances would both report the same fact.
+
+The r6 chain carrier (task 4681, below) runs the same command without the
+flag and inherits this decision.
 
 | File | Role |
 |---|---|

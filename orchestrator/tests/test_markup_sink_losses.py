@@ -33,7 +33,9 @@ from fastmcp import Client
 from fastmcp.exceptions import ToolError
 from shared.mcp_markup_middleware import (
     FACT_MARKUP_DETECTED,
+    MARKUP_STORM_ERROR_TYPE,
     MARKUP_UNRECOVERED_PARAM_ERROR_TYPE,
+    MARKUP_UNREPAIRABLE_ERROR_TYPE,
     OUTCOMES,
 )
 from shared.project_layout import escalation_queue_dir
@@ -145,7 +147,7 @@ def sink_over(
 
 
 def residue_record(
-    error_type: str = markup_sink.MARKUP_RESIDUE_ERROR_TYPE,
+    error_type: str = MARKUP_UNREPAIRABLE_ERROR_TYPE,
 ) -> dict[str, Any]:
     return {
         'error_type': error_type,
@@ -157,7 +159,7 @@ def residue_record(
 
 def storm_record() -> dict[str, Any]:
     return {
-        'error_type': markup_sink.MARKUP_STORM_ERROR_TYPE,
+        'error_type': MARKUP_STORM_ERROR_TYPE,
         'count': 7,
         'threshold': 5,
         'window_seconds': 3600,
@@ -169,7 +171,7 @@ def storm_record() -> dict[str, Any]:
 
 #: Both residue kinds: a refusal's, and FORWARD_REPAIR's dropped slice.
 RESIDUE_KINDS = [
-    pytest.param(markup_sink.MARKUP_RESIDUE_ERROR_TYPE, id='refused'),
+    pytest.param(MARKUP_UNREPAIRABLE_ERROR_TYPE, id='refused'),
     pytest.param(MARKUP_UNRECOVERED_PARAM_ERROR_TYPE, id='dropped-slice'),
 ]
 

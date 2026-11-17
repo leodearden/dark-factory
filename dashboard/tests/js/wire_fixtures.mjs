@@ -64,6 +64,11 @@ export function servingEndpoint(loader, key, win = '24h') {
   return { stateKey: loader.pollKey(url), spec: keySpecs[key] };
 }
 
+// Every DF_DATA key some endpoint data.js polls at window `win` serves.
+export function everyPolledKey(loader, win = '24h') {
+  return Object.values(loader.endpointsFor(win)).flatMap(keySpecs => Object.keys(keySpecs));
+}
+
 // The __receipt entries a poll records for the endpoints serving `keys`,
 // received now so nothing reads as aged.
 export function receiptsFor(loader, keys, win = '24h') {

@@ -52,7 +52,11 @@ This module is intentionally pure: it defines the table and the
 infra-hold interaction (ω4, task 2200) is a harness pre-gate on
 ``orchestrator.task_status.is_infra_held`` in
 ``orchestrator/src/orchestrator/harness.py::Harness._cascade_unblock_member``,
-not a Table B entry. This module also does NOT import ``shared`` — the
+not a Table B entry. Running a resumed held pure gate inline, which closes
+or re-holds it, instead of re-pending it (task 3638,
+``Harness._run_held_pure_gate_inline``) is likewise
+a harness refinement in that method, not a Table B entry. This module also
+does NOT import ``shared`` — the
 ``target_status`` values below are plain lowercase string literals kept in
 parity with ``shared.task_statuses.TaskStatus`` by test (see
 ``tests/test_action_effects.py``), not by import, so this module adds no new

@@ -17,6 +17,7 @@ from shared.project_layout import escalation_queue_dir
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.config.schema import FusedMemoryConfig, ReconciliationConfig
+from fused_memory.memory_metadata import is_completion_record
 from fused_memory.models.enums import SourceStore
 from fused_memory.models.memory import MemoryResult
 from fused_memory.models.reconciliation import VerificationResult, VerificationVerdict
@@ -160,6 +161,24 @@ async def test_on_task_done_fast_path_write_stamps_stage2_suppress(reconciler, m
     # Additive, not a replacement -- the existing fields must still be present.
     assert metadata.get('source') == 'targeted_reconciliation'
     assert metadata.get('transition') == 'done'
+
+
+@pytest.mark.asyncio
+async def test_on_task_done_fast_path_echo_is_a_registered_completion_record(
+    reconciler, mock_memory_service,
+):
+    """The registry's completion-record predicate agrees with the real echo writer."""
+    task_before = {
+        'id': '5192', 'title': 'Fix the thing', 'status': 'in-progress',
+        'description': 'Some description',
+    }
+    await reconciler.reconcile_task(
+        task_id='5192', transition='done', project_id='test-project', project_root='/tmp/test',
+        task_before=task_before,
+    )
+
+    first_call = mock_memory_service.add_memory.call_args_list[0]
+    assert is_completion_record(first_call.kwargs.get('metadata') or {}) is True
 
 
 @pytest.mark.asyncio
@@ -3388,7 +3407,7 @@ def test_is_authoritative_resolution_truth_table(metadata, expected):
     task's own earlier echoes never trigger suppression or oscillation.
 
     `stage2_suppress` is authoritative only when the memory is NOT this
-    reconciler's own echo (source != _ECHO_SOURCE):
+    reconciler's own echo (source != TARGETED_RECONCILIATION_SOURCE):
     `targeted_echo_with_suppress_not_authoritative` below locks in that even
     once TargetedReconciliation's own completion echo also stamps
     `stage2_suppress` (to seed Stage 2's suppression count gate), that
@@ -4555,7 +4574,7 @@ async def test_on_task_done_refetches_when_snapshot_provenance_unusable(
 # redispatched, but the stale echo was never deleted, so it kept lingering in
 # Mem0 search alongside (and even after) a second, correctly-cited echo.
 # _on_task_blocked must delete this reconciler's own completion echoes
-# (metadata source==_ECHO_SOURCE AND transition=='done') for task_id when the
+# (metadata source==TARGETED_RECONCILIATION_SOURCE AND transition=='done') for task_id when the
 # PRE-transition status (task_before) was 'done' -- i.e. a genuine
 # reopen-from-done, not an ordinary pending/in-progress->blocked transition.
 
@@ -4718,7 +4737,7 @@ async def test_on_task_blocked_reopen_preserves_non_echo_memories(
     echoes. A non-echo, task_id-tagged memory (e.g. flag_dedup.py's
     stage1_flag_marker) picked up by the same {'task_id'} scroll must never
     be deleted -- _is_authoritative_resolution's over-suppression concern
-    (task 1984) applies equally here: only source==_ECHO_SOURCE AND
+    (task 1984) applies equally here: only source==TARGETED_RECONCILIATION_SOURCE AND
     transition=='done' identifies a completion echo. Hint attachment must
     still proceed normally alongside the (no-op) sweep."""
     mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[

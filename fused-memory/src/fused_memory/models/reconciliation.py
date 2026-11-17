@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class EventType(StrEnum):
@@ -332,3 +332,19 @@ class JudgeVerdict(BaseModel):
     severity: VerdictSeverity
     findings: list[dict] = Field(default_factory=list)
     action_taken: VerdictAction = VerdictAction.none
+
+
+class JudgeInvocation(BaseModel):
+    """One claude_cli judge invocation's turn-cap and rejected-tool-call outcome (task 6573).
+
+    Both counts are None when unknown, never a fabricated 0.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    run_id: str
+    completed_at: datetime
+    ended_error_max_turns: bool
+    schema_salvaged: bool
+    num_turns: int | None = Field(ge=1)
+    rejected_tool_calls: int | None = Field(ge=0)

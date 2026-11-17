@@ -948,8 +948,9 @@ verify_admission_pytest_n: "8"
 # test legs run at once, admitted through the per-project flock; merge legs never
 # take a slot. The code default is 1
 # (config.py::OrchestratorConfig.verify_admission_task_slots).
-# 2 since 2026-11-12 04:27Z: stepped down from 3 under Leo's progressive-slot
-# rule (two local merge verifies over 46 min while reify rebuilt a warm lane).
+# 3 since 2026-11-15 ~14:40Z, by Leo's ruling: this key also sizes the task legs sent
+# to each remote verify host, so the laptop's 3 slots need it (step down on a
+# local merge verify over 46 min).
 # Basis, step-down triggers and the dated value history:
 # plans/verify-admission-task-slots-gate.md.
 # Any change to this value appends a dated entry there AND rewrites the
@@ -957,7 +958,7 @@ verify_admission_pytest_n: "8"
 # GREEN-tier (config.py::RELOADABLE_FIELDS) and re-read at each grant, so it
 # applies via reload_config with no restart, which matters: a restart destroys
 # the in-flight work this knob protects.
-verify_admission_task_slots: 2
+verify_admission_task_slots: 3
 
 # TASK-VERIFY ADMISSION ORDER (arrival; 2026-10-16, task 5629, PRD task beta of
 # plans/verify-admission-fifo-prd.md). Grant waiters in arrival order within a
@@ -1629,7 +1630,7 @@ verify_cross_check_remote_green: false
 # 2026-11-10, gate 6673 (task ε) step 4: the three-day parity window opens on these
 # values. Both parity knobs are on for the window only; Leo rules at its end (PRD §12
 # Q7: cross-check 0 and red-confirm off after a zero-disagreement window, the 5416
-# precedent). The laptop side (verify_admission_task_slots: 1,
+# precedent). The laptop side (verify_admission_task_slots: 3 since 2026-11-15,
 # verify_admission_pytest_n: "8") lives in leo-laptop's dark-factory-laptop.yaml.
 # 2026-11-13, gate 6673 step 6, Leo's ruling (esc-6673-1): keep remote legs on, turn
 # red-confirm off, and keep the cross-check at 5 until task 7030 lands. 7030 gives the

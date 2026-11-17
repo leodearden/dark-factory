@@ -62,9 +62,11 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any
 
 from shared.memory_supersession import SUPERSEDED_BY_METADATA_KEY
+from shared.task_statuses import TaskStatus
 
 from fused_memory.backends.mem0_client import MEM0_MANAGED_METADATA_KEYS
 
@@ -104,16 +106,20 @@ __all__ = [
     'PARENT_ID_DEAD_CODE',
     'PARENT_ID_UNAVAILABLE_CODE',
     'ParentHasChildrenError',
+    'RECONCILIATION_COMPLETION_ECHO_MARKER',
     'RESERVED_VOCABULARY_KEYS',
     'SERVER_STAMPED_KEYS',
     'SUPERSEDED_BY_METADATA_KEY',
+    'TARGETED_RECONCILIATION_SOURCE',
     'TOPIC_SLUG_MAX_LEN',
     'TOPIC_SLUG_RE',
     'TRIAGE_CONTESTED_METADATA_KEY',
     'check_canonical_routing',
     'classify_unknown_keys',
     'is_canonical',
+    'is_completion_record',
     'is_orchestrator_completion_record',
+    'is_reconciliation_completion_echo',
     'is_valid_topic_slug',
     'normalize_supersedes',
     'parent_liveness_violation',
@@ -690,6 +696,28 @@ ORCHESTRATOR_COMPLETION_SOURCE = 'orchestrator_completion'
 
 def is_orchestrator_completion_record(meta: Mapping[str, Any]) -> bool:
     return meta.get('source') == ORCHESTRATOR_COMPLETION_SOURCE
+
+
+#: The ``source`` reconciliation/targeted.py::TargetedReconciler stamps on its
+#: notes: the completion echo and the verification-verdict note.
+TARGETED_RECONCILIATION_SOURCE = 'targeted_reconciliation'
+
+#: The metadata that marks reconciliation's completion echo, as against its
+#: verification-verdict note. TargetedReconciler._on_task_done's fast path
+#: stamps it and TargetedReconciler._delete_stale_completion_echoes filters on it.
+RECONCILIATION_COMPLETION_ECHO_MARKER: Mapping[str, str] = MappingProxyType({
+    'source': TARGETED_RECONCILIATION_SOURCE,
+    'transition': TaskStatus.DONE.value,
+})
+
+
+def is_reconciliation_completion_echo(meta: Mapping[str, Any]) -> bool:
+    return all(meta.get(key) == value for key, value in RECONCILIATION_COMPLETION_ECHO_MARKER.items())
+
+
+def is_completion_record(meta: Mapping[str, Any]) -> bool:
+    """Is this a record ABOUT its metadata.task_id, as opposed to one merely written by that task?"""
+    return is_orchestrator_completion_record(meta) or is_reconciliation_completion_echo(meta)
 
 
 #: Union of every known layer, precomputed for the unknown-key scan.

@@ -710,15 +710,20 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
     (
         'fused-memory/src/fused_memory/server/main.py',
         'run_server',
-        'e3f8e93f2610',
+        '91313b9744f3',
         'accepted',
         'ACCEPTED, startup only: run_server reaches '
         'build_topic_cluster_store -> TopicClusterStore.open(), a sync '
-        'SQLite open matched by the method name open. It genuinely blocks, '
-        'but like the configured_known_projects_map row beside it, it runs once '
-        'during process STARTUP, before the server binds and begins '
-        'serving traffic, so there is no concurrent work to stall. If it '
-        'ever moves onto a request or reload path, the content_hash '
+        'SQLite open (mkdir, connect, schema, hydrate) matched by the method '
+        'name open. It runs once per process, before server.serve() binds, '
+        'so no request is in flight to be delayed; background tasks '
+        'run_server has already started can be stalled for that one open. '
+        'It cannot simply hop threads: the store keeps sqlite3 '
+        'check_same_thread at its default because its add_memory-path '
+        'reader is sync, so the connection must be opened on the loop '
+        'thread that uses it. Owned with the other accepted rows by task '
+        '5270 (the ledger default, docs/legibility/inv12-day-one-rulings.md). '
+        'If it ever moves onto a request or reload path, the content_hash '
         'changes and the gate re-asks.',
     ),
     (

@@ -33,6 +33,7 @@ from fused_memory.config.schema import (
     FusedMemoryConfig,
 )
 from fused_memory.server.entity_mint_authz import resolve_entity_mint_authorization
+from fused_memory.server.mem0_update_authz import resolve_mem0_update_authorization
 from fused_memory.server.near_duplicate_guard import (
     resolve_near_dup_guard_enabled,
     resolve_near_dup_threshold,
@@ -452,8 +453,17 @@ class TestReloadConfigTool:
         assert svc.config.reconciliation.stale_run_recovery_seconds == flagship_before
 
 
+
+def _refusal(svc: Any) -> str:
+    error = resolve_mem0_update_authorization(
+        svc, agent_id='rando', content_amend=True, metadata_patch=False,
+    ).error
+    assert isinstance(error, str)
+    return error
+
+
 class TestMem0UpdateLeavesAreGreenTier:
-    """All five mem0_update.* leaves must hot-apply (task 3088).
+    """Every mem0_update.* leaf must hot-apply (task 3088).
 
     Modelled on TestWriteTriageLeavesAreGreenTier below — the direct precedent
     for registering TOP-LEVEL (non-reconciliation.*) leaves. The existing
@@ -470,6 +480,7 @@ class TestMem0UpdateLeavesAreGreenTier:
         'mem0_update.enabled',
         'mem0_update.content_amend_allowed_agent_prefixes',
         'mem0_update.metadata_patch_allowed_agent_prefixes',
+        'mem0_update.agent_prefix_sanctioned_use',
         'mem0_update.storm_threshold',
         'mem0_update.storm_window_seconds',
     )
@@ -488,6 +499,10 @@ class TestMem0UpdateLeavesAreGreenTier:
             (
                 'mem0_update.metadata_patch_allowed_agent_prefixes',
                 ['recon-stage-', 'curator-', 'auditor-'],
+            ),
+            (
+                'mem0_update.agent_prefix_sanctioned_use',
+                {'auditor-': 'an audit sitting'},
             ),
             ('mem0_update.storm_threshold', 5),
             ('mem0_update.storm_window_seconds', 600.0),
@@ -508,13 +523,42 @@ class TestMem0UpdateLeavesAreGreenTier:
         assert d.applied_candidates[path] == {'old': old, 'new': new_value}
         assert path not in d.restart_required
 
+    @pytest.mark.asyncio
+    async def test_sanctioned_use_yaml_edit_is_rendered_live_via_reload_config(
+        self, tmp_path, monkeypatch,
+    ):
+        config_yaml = tmp_path / 'config.yaml'
+        config_yaml.write_text(yaml.safe_dump({'mem0_update': {
+            'agent_prefix_sanctioned_use': {
+                'recon-stage-': 'RECON-ROLE', 'curator-': 'OLD-CURATOR-ROLE',
+            },
+        }}))
+        monkeypatch.setenv('CONFIG_PATH', str(config_yaml))
+
+        svc = AsyncMock()
+        svc.config = FusedMemoryConfig()
+        assert "'curator-': OLD-CURATOR-ROLE" in _refusal(svc), (
+            'the seeded YAML must be rendered before the reload, or the test '
+            'cannot tell a reload from a schema default'
+        )
+        _edit_yaml(config_yaml, 'mem0_update.agent_prefix_sanctioned_use', {
+            'recon-stage-': 'RECON-ROLE', 'curator-': 'RELOADED-CURATOR-ROLE',
+        })
+
+        server = create_mcp_server(svc)
+        result = await server._tool_manager.call_tool('reload_config', {})
+
+        assert result['reloaded'] is True, result
+        assert 'mem0_update.agent_prefix_sanctioned_use' in result['applied'], result
+        assert 'mem0_update.agent_prefix_sanctioned_use' not in result['restart_required']
+        error = _refusal(svc)
+        assert "'curator-': RELOADED-CURATOR-ROLE" in error, error
+
     def test_kill_switch_flip_is_observed_live_without_a_restart(self):
         """A reload must be visible to the resolver through the SHARED config
         object — the precondition config/reload.py's reload-safety rule states
         before a leaf may be registered at all."""
         from types import SimpleNamespace
-
-        from fused_memory.server.mem0_update_authz import resolve_mem0_update_authorization
 
         live = FusedMemoryConfig()
         svc = SimpleNamespace(config=live)
@@ -544,8 +588,6 @@ class TestMem0UpdateLeavesAreGreenTier:
         widening to it would be a vacuous no-op diff and the content-amend
         denial below would fail."""
         from types import SimpleNamespace
-
-        from fused_memory.server.mem0_update_authz import resolve_mem0_update_authorization
 
         live = FusedMemoryConfig()
         svc = SimpleNamespace(config=live)

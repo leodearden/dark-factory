@@ -527,11 +527,11 @@ def _retrieved_plan(
     """
     import asyncio
 
+    from fused_memory.maintenance._utils import maintenance_service
     from fused_memory.server.write_triage import (
         resolve_bands,
         resolve_candidate_k,
     )
-    from fused_memory.services.memory_service import MemoryService
 
     retrieval = load_retrieval()
     service = types.SimpleNamespace(config=config)
@@ -544,14 +544,10 @@ def _retrieved_plan(
     )
 
     async def prefetch() -> dict[str, dict[str, Any]]:
-        memory = MemoryService(config)
-        await memory.initialize()
-        try:
+        async with maintenance_service(config=config) as (_, memory):
             return await retrieval.prefetch_retrievals(
                 memory, labelled, project_id=args.project_id, k=k,
             )
-        finally:
-            await memory.close()
 
     slates = retrieval.retrieved_slates(
         labelled, asyncio.run(prefetch()),

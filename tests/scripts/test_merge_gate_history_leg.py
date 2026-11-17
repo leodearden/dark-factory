@@ -123,7 +123,7 @@ READS_ONLY_THROWAWAY_REPOS: Mapping[str, str] = {
     'orchestrator/tests/test_review_inputs.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_roles_already_done_commit_search.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_roles_ancestry_check.py': 'every call runs in a clone under tmp_path',
-    'orchestrator/tests/test_timeout_marker_inversion_guard.py': (
+    'orchestrator/tests/test_spawn_budget_guard.py': (
         'create_subprocess_exec is faked; the git argv is a recorded-call literal'
     ),
     'orchestrator/tests/test_train_moved_main.py': _SEEDS_ITS_OWN_REPO,

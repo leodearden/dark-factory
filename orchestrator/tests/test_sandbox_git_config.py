@@ -171,6 +171,7 @@ _REPO_CONFIG = ['true', 'true']
 _SANDBOX_CONFIG = ['false', 'false']
 
 
+@pytest.mark.spawns_agent_cli
 class TestSandboxedDispatchGitConfig:
     @pytest.mark.asyncio
     @pytest.mark.parametrize(

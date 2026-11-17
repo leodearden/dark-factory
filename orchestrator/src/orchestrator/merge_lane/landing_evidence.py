@@ -212,6 +212,7 @@ from shared.storm_counter import StormCounter
 
 from orchestrator.config import RecoveryEmissionConfig
 from orchestrator.git_ops import _run
+from orchestrator.merge_lane.git_read import git_read
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -254,6 +255,101 @@ async def _classify_patch_containment(
     return PatchContainment.contained
 
 
+class Containment(enum.StrEnum):
+    """The D10 answer: is every commit a tip carries beyond the target already on it?
+
+    'git could not answer' is UNKNOWN, never NOT_CONTAINED.
+    """
+
+    CONTAINED = 'contained'
+    NOT_CONTAINED = 'not_contained'
+    UNKNOWN = 'unknown'
+
+
+class _AncestryReading(NamedTuple):
+    on_target: bool | None
+    containment: Containment
+
+
+async def _containment_by_ancestry(
+    git_ops: GitOps, tip: str, target: str,
+) -> _AncestryReading:
+    """Empty ``git cherry`` output is containment only when *tip* is ON *target*.
+
+    There git cherry has nothing to list for a genuine landing.  Elsewhere the
+    branch has no non-merge commit beyond *target*, so nothing of its own is
+    proven present.  An unanswerable ancestry probe is a git error.
+    """
+    on_target = await git_ops.is_ancestor_checked(tip, target)
+    if on_target is None:
+        containment = Containment.UNKNOWN
+    elif on_target:
+        containment = Containment.CONTAINED
+    else:
+        containment = Containment.NOT_CONTAINED
+    return _AncestryReading(on_target, containment)
+
+
+_CONTAINMENT_OF_CHERRY: dict[PatchContainment, Containment] = {
+    PatchContainment.contained: Containment.CONTAINED,
+    PatchContainment.not_contained: Containment.NOT_CONTAINED,
+    PatchContainment.unreadable: Containment.UNKNOWN,
+}
+
+
+async def classify_containment(
+    git_ops: GitOps, *, tip: str, target: str,
+) -> Containment:
+    """Whether every commit *tip* has beyond *target* is on *target* by patch id.
+
+    One ``git cherry`` read; its empty answer is settled by ancestry, because
+    a tip whose only commits beyond *target* are merges proves nothing landed.
+    """
+    cherry = await _classify_patch_containment(tip, target, git_ops)
+    if cherry is PatchContainment.vacuous:
+        return (await _containment_by_ancestry(git_ops, tip, target)).containment
+    return _CONTAINMENT_OF_CHERRY[cherry]
+
+
+@dataclass(frozen=True)
+class RangePatchIds:
+    """What a commit range carries, by content.
+
+    ``patch_ids`` holds the ``git patch-id --stable`` ids of the range's
+    non-merge commits, sorted: the canonical form of a multiset, so two values
+    compare with ``==``.
+    """
+
+    patch_ids: tuple[str, ...]
+    has_merge_commit: bool
+
+
+async def range_patch_ids(
+    git_ops: GitOps, *, target: str, tip: str,
+) -> RangePatchIds:
+    """The patch ids of ``target..tip``: one ``git log`` and one ``git patch-id``, whatever its length.
+
+    The range is the set ``target..tip``, the one ``git cherry target tip``
+    reads, and the D6 ``merge-base(target, tip)..tip`` whenever that merge base
+    is unique.  A merge shows no diff, so it contributes no id; the parent list
+    on its ``commit`` line is what flags it.  A git error raises
+    :class:`~orchestrator.merge_lane.git_read.GitReadFailed`.
+    """
+    log = await git_read(git_ops, [
+        'git', 'log', '-p', '--no-color', '--format=commit %H %P', f'{target}..{tip}',
+    ])
+    if not log.strip():
+        return RangePatchIds(patch_ids=(), has_merge_commit=False)
+    has_merge_commit = any(
+        len(line.split()) > 3 for line in log.splitlines() if line.startswith('commit ')
+    )
+    ids = await git_read(git_ops, ['git', 'patch-id', '--stable'], input_text=log)
+    return RangePatchIds(
+        patch_ids=tuple(sorted(line.split()[0] for line in ids.splitlines() if line.strip())),
+        has_merge_commit=has_merge_commit,
+    )
+
+
 async def patch_content_contained(
     head: str,
     upstream: str,
@@ -285,6 +381,7 @@ __all__ = [
     'LANDING_GIT_ERROR_STORM_CATEGORY',
     'LANDING_GIT_ERROR_STORM_SENTINEL',
     'LANDING_TALLY',
+    'Containment',
     'DifferentialOutcome',
     'LandingEvidenceVerdict',
     'LandingMethod',
@@ -292,13 +389,16 @@ __all__ = [
     'LandingTally',
     'LandingVerdict',
     'PatchContainment',
+    'RangePatchIds',
     'branch_is_degenerate',
     'branch_work_landed',
+    'classify_containment',
     'file_landing_git_error_storm_escalation',
     'file_unattributed_landing_escalation',
     'format_unattributed_landing_detail',
     'found_on_main_note',
     'is_valid_sha_40',
+    'range_patch_ids',
     'validate_landing_evidence',
     'validate_reported_landing',
 ]
@@ -1402,18 +1502,13 @@ async def _containment_rejection(
 async def _vacuous_containment_rejection(
     git_ops: GitOps, head: str, upstream: str, probe: dict[str, Any],
 ) -> LandingReason | None:
-    """Empty ``git cherry`` output is containment only when *head* is ON *upstream*.
-
-    There git cherry has nothing to list for a genuine landing.  Elsewhere the
-    branch has no non-merge commit beyond *upstream*, so nothing of its own is
-    proven present.
-    """
-    on_upstream = await git_ops.is_ancestor_checked(head, upstream)
-    probe['containment_by_ancestry'] = on_upstream
-    if on_upstream is None:
+    """The vacuous arm of :func:`_containment_rejection`, decided by :func:`_containment_by_ancestry`."""
+    reading = await _containment_by_ancestry(git_ops, head, upstream)
+    probe['containment_by_ancestry'] = reading.on_target
+    if reading.containment is Containment.UNKNOWN:
         probe['git_error_stage'] = 'patch_id_containment'
         return LandingReason.git_error
-    return None if on_upstream else LandingReason.not_landed
+    return None if reading.containment is Containment.CONTAINED else LandingReason.not_landed
 
 
 async def branch_work_landed(

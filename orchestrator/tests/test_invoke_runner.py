@@ -152,6 +152,7 @@ def _canned_stdout(backend: str) -> tuple[str, int]:
     return (MIMO_SESSION_LIST, 0) if backend == 'mimo' else (PLAIN_STDOUT, 3)
 
 
+@pytest.mark.spawns_agent_cli
 class TestNonClaudeBackendsSpawnThroughTheRunner:
     @pytest.mark.timeout(60)
     @pytest.mark.parametrize('backend', NON_CLAUDE_BACKENDS)
@@ -205,6 +206,7 @@ class TestNonClaudeBackendsSpawnThroughTheRunner:
         ]
 
 
+@pytest.mark.spawns_agent_cli
 class TestNonClaudeTimeouts:
     @pytest.mark.timeout(60)
     @pytest.mark.parametrize('backend', SINGLE_SPAWN_BACKENDS)
@@ -228,6 +230,7 @@ class TestNonClaudeTimeouts:
         assert agent.success is False
 
 
+@pytest.mark.spawns_agent_cli
 class TestNonClaudeCpuNice:
     @pytest.mark.timeout(60)
     @pytest.mark.parametrize('backend', ENV_OVERRIDE_BACKENDS)

@@ -150,8 +150,6 @@ class MockEdge:
 
     fact: str
     uuid: str = ''
-    source_node: MockNode | None = None
-    target_node: MockNode | None = None
     source_node_uuid: str = ''
     target_node_uuid: str = ''
     episodes: list[str] = field(default_factory=list)

@@ -35,7 +35,7 @@ import pwd
 import shutil
 import subprocess
 import tempfile
-from collections.abc import MutableMapping
+from collections.abc import Callable, MutableMapping
 from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
@@ -1123,6 +1123,59 @@ class TestBarrenStreakDue:
     def test_due_at_or_past_the_threshold(self, streak, threshold, due):
         state = _state(consecutive_barren_runs=streak)
         assert trickle_state.barren_streak_due(state, threshold) is due
+
+
+_NIGHT_KINDS: dict[str, Callable[[int], trickle_state.NightRun]] = {
+    'barren': lambda day: _night(day=day, below_sampling_cut=3),
+    'failed': lambda day: _night(day=day, exit_code=1),
+    'deferred': lambda day: _night(day=day, capped=True, selected_count=1),
+    'productive': lambda day: _night(day=day, selected_count=1),
+}
+
+
+def _escalation_due_on(kinds, max_runs) -> list[int]:
+    """The 1-based nights of the *kinds* walk, folded one after another, on
+    which barren_escalation_due is true at *max_runs*."""
+    prior = None
+    due = []
+    for number, kind in enumerate(kinds, start=1):
+        night = trickle_state.fold_night(prior, 'p', _NIGHT_KINDS[kind](number))
+        if trickle_state.barren_escalation_due(night, max_runs):
+            due.append(number)
+        prior = night.state
+    return due
+
+
+class TestBarrenEscalationDue:
+    """The nightly's barren-streak escalation schedule: the threshold, then
+    each later multiple of it in BARREN_ESCALATION_MULTIPLES, then silence
+    until a productive or quiet night resets the streak."""
+
+    def test_a_persistent_streak_reescalates_on_a_doubling_backoff_then_stops(self):
+        assert _escalation_due_on(
+            ['barren'] * 30, trickle_state.DEFAULT_MAX_BARREN_RUNS
+        ) == [3, 6, 12, 24]
+
+    @pytest.mark.parametrize('threshold', [1, 2, 5])
+    def test_the_schedule_is_multiples_of_the_threshold(self, threshold):
+        expected = [
+            threshold * multiple
+            for multiple in trickle_state.BARREN_ESCALATION_MULTIPLES
+            if threshold * multiple <= 30
+        ]
+        assert _escalation_due_on(['barren'] * 30, threshold) == expected
+
+    @pytest.mark.parametrize('kinds, due', [
+        (['barren'] * 5 + ['failed', 'barren'], [3, 7]),
+        (['barren'] * 6 + ['failed', 'barren'], [3, 6]),
+        (['barren'] * 6 + ['deferred', 'barren'], [3, 6]),
+    ], ids=['failed-before-a-point', 'failed-on-a-point', 'deferred-on-a-point'])
+    def test_a_carried_night_neither_fires_nor_shifts_the_schedule(self, kinds, due):
+        assert _escalation_due_on(kinds, trickle_state.DEFAULT_MAX_BARREN_RUNS) == due
+
+    def test_a_reset_rearms_the_schedule_from_its_start(self):
+        kinds = ['barren'] * 6 + ['productive'] + ['barren'] * 3
+        assert _escalation_due_on(kinds, trickle_state.DEFAULT_MAX_BARREN_RUNS) == [3, 6, 10]
 
 
 class TestBarrenRemedy:

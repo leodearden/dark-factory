@@ -1552,6 +1552,12 @@ entries:
     manifested_phase: recon
     invariant_violated: one-fact-one-home
     note: Tasks 3735 and 3661 remain deferred and described as live although their work landed under coalesced task 4845 (done, merged). Task status does not reflect delivered capability, so the recon stage must reconcile it by hand.
+  - date: '2026-11-15'
+    project: dark_factory
+    session: bac8c94d-e70c-432d-a5ce-4cfc60594aa6
+    origin_phase: unknown
+    manifested_phase: architect
+    note: Task 10312 is an auto-filed duplicate of heal task 10239, and it was marked found_on_main on the basis of a watcher note. The architect's done-claim could not be attributed (reason no_attribution, basis nothing_declared, declared_scope files=0), so the task was blocked on the premise rather than on the code.
   last_seen_runs:
   - census-dark_factory-20261024
 - id: warm-lane-cache-incoherence
@@ -2309,6 +2315,18 @@ entries:
     origin_phase: unknown
     manifested_phase: recon
     note: A recon-stage get_task call passed project_id, which the fused-memory server does not declare (it declares project_root). The server rejected the call before execution. Sibling fused-memory tools name project identifiers inconsistently, which fits this entry's schema-drift theme. Origin is unknown because the digest does not show whether a stage prompt taught the wrong name.
+  - date: '2026-11-15'
+    project: dark_factory
+    session: 4a9c8cec-1fb8-4909-af93-9c120a47f110
+    origin_phase: unknown
+    manifested_phase: recon
+    note: Four consecutive mcp__fused-memory__get_task calls in a recon session passed project_id, which the tool does not declare. Each was rejected as unknown_argument with closest_declared project_root, so the mismatch is the fused-memory identifier naming drift this entry describes. The origin of the project_id argument is not visible in the digest, so origin_phase is unknown.
+  - date: '2026-11-15'
+    project: dark_factory
+    session: 3bebabc0-2c5b-4965-a268-e1018d182cfc
+    origin_phase: unknown
+    manifested_phase: recon
+    note: 'The recon agent called mcp__fused-memory__get_task with a project_id argument that the tool does not declare (declared: id, project_root, tag). The server rejected each call with unknown_argument (turns 27, 28, 30), so the contract was machine-checked and nothing was written. This is the fused-memory identifier-naming inconsistency across sibling tools that the entry describes. The digest does not show the call shape originating in a stage prompt, so origin_phase is unknown.'
 - id: recon-lifecycle-state-gaps
   title: 'Recon harness run/flag lifecycle is leaky and invisible: flags silently dropped, events redelivered, actions conflated with sightings, payloads omit project_root'
   severity: medium
@@ -2642,6 +2660,12 @@ entries:
     origin_phase: recon
     manifested_phase: recon
     note: Weak match. The Self-Corrections entry says CLAUDE.md documents search_tasks as missing deferred tasks, but a 2026-11-13 measurement found deferred tasks are included and only planning-mode tasks are missing. A documented tool contract that disagrees with observed behaviour is the family this entry covers.
+  - date: '2026-11-15'
+    project: dark_factory
+    session: 9cf2c2e0-dbd0-4b0f-b3ce-90568504df44
+    origin_phase: unknown
+    manifested_phase: recon
+    note: 'Two mcp__fused-memory__get_task calls passed undeclared ''project_id'' (declared: id, project_root, tag). The server rejected them cleanly, but the caller''s call shape diverged from the tool contract and the error''s ''closest_declared'' hint was a spelling guess. The origin of the wrong argument name is not visible in the digest.'
 - id: watcher-loop-harness-mismatch
   title: 'Escalation-watcher loop mechanics fight the harness: bg-task reaping, initial-scan instant fire, 2-min Bash kill of the 540s wait, improvised liveness checks'
   severity: medium
@@ -3163,6 +3187,12 @@ entries:
     origin_phase: unknown
     manifested_phase: ops
     note: Watcher issued a chained `sleep 45; cat ...; ls ...` and the harness blocked it, directing use of Monitor with an until-loop or run_in_background. This is the same Bash-sleep versus watcher-wait harness mismatch the entry describes.
+  - date: '2026-11-15'
+    project: dark_factory
+    session: 2a9e590f-938e-4bd1-b5ff-6c9ef4647a9b
+    origin_phase: ops
+    manifested_phase: ops
+    note: watcher-rearm.sh was launched with --timeout 3600 and exited 137 (killed by the harness) during the blocking L1 wait, consistent with the entry's documented Bash-kill-of-long-wait mismatch. Digest is thin (n_user_turns 0, guard trips with empty detail), so this is a partial match.
   last_seen_runs:
   - census-dark_factory-20261024
   - census-dark_factory-20261031
@@ -4655,6 +4685,42 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     note: 'Agent called mcp__fused-memory__get_task with an undeclared ''task_id'' argument (declared: ''id'') before the deferred tool''s schema was loaded. The call was rejected by validation with a clear unknown_argument error, and the digest prompts a ToolSearch load. This is the deferred-tool guess-then-fail pattern.'
+  - date: '2026-11-15'
+    project: dark_factory
+    session: 01d4a79c-066b-4b3e-b9ef-c9c5f325e350
+    origin_phase: recon
+    manifested_phase: recon
+    note: The session repeatedly called the deferred fused-memory tool count_memories_by_metadata with a guessed `metadata` argument before loading its schema. Each call failed unknown_argument, and the error text says the schema was not in the prompt. The digest shows six tool_error signals and no successful retry through ToolSearch.
+  - date: '2026-11-15'
+    project: dark_factory
+    session: 09639a5e-f8cb-445d-bbc8-dc0d9f04ae35
+    origin_phase: recon
+    manifested_phase: recon
+    note: The agent called mcp__fused-memory__count_memories_by_metadata with an undeclared 'metadata' argument (turns 32-36) before loading the deferred tool's schema via ToolSearch. Each call was rejected with unknown_argument, and the error text says the schema was not in the prompt. This is the deferred-tool-before-discovery guessing pattern.
+  - date: '2026-11-15'
+    project: dark_factory
+    session: a01b9d76-8520-4fb7-a87d-bba6482bf8a0
+    origin_phase: recon
+    manifested_phase: recon
+    note: The agent called count_memories_by_metadata with a 'metadata' argument before the tool's schema was loaded, and got unknown_argument errors at turns 29 and 31. The error text shows the schema was not in the prompt and the agent guessed parameters. The retry was rejected before execution, so no data was written.
+  - date: '2026-11-15'
+    project: dark_factory
+    session: c0088021-a88c-4993-88de-89c7aeeb5cf1
+    origin_phase: recon
+    manifested_phase: recon
+    note: The agent called the deferred mcp__fused-memory__get_task tool three times with an undeclared project_id argument before its input schema was loaded. Each call failed validation with unknown_argument. The schema was absent from the prompt, so the agent guessed the parameters, which matches this entry.
+  - date: '2026-11-15'
+    project: dark_factory
+    session: 55fc61b6-cc96-45c6-9f8b-0382a7a70da0
+    origin_phase: recon
+    manifested_phase: recon
+    note: A deferred MCP tool (mcp__fused-memory__get_statuses) was called before its schema was loaded. The schema was absent from the prompt, so the agent guessed an undeclared `project_id` argument and got an unknown_argument rejection at turn 36. The tool's own error text says a ToolSearch select was needed.
+  - date: '2026-11-15'
+    project: dark_factory
+    session: e56c92d6-602a-4d15-b6b6-a4a3e0e2cb9c
+    origin_phase: recon
+    manifested_phase: recon
+    note: The recon agent called mcp__fused-memory__get_task before loading its schema via ToolSearch, guessed a project_id argument that the tool does not declare, and was rejected with unknown_argument. The error's closest_declared hint (project_root) is a spelling guess, not the intended parameter.
   last_seen_runs:
   - census-dark_factory-20261024
   - census-dark_factory-20261031
@@ -5207,6 +5273,18 @@ entries:
     origin_phase: recon
     manifested_phase: recon
     note: 'Stage 1 report shows ''LLM calls: 2 | Tokens: 0'', so tokens_used reads zero despite nonzero llm_calls, matching the known cost-telemetry gap.'
+  - date: '2026-11-15'
+    project: dark_factory
+    session: 9cf2c2e0-dbd0-4b0f-b3ce-90568504df44
+    origin_phase: unknown
+    manifested_phase: recon
+    note: 'Stage 1 report for memory_consolidator shows ''LLM calls: 2 | Tokens: 0'', matching the always-zero tokens_used telemetry against nonzero llm_calls.'
+  - date: '2026-11-15'
+    project: dark_factory
+    session: edde017c-38f4-441d-bf7e-4beef401f751
+    origin_phase: recon
+    manifested_phase: recon
+    note: 'The Stage 1 report shows ''LLM calls: 2 | Tokens: 0'', which is the zero-tokens-with-nonzero-llm_calls telemetry defect.'
 - id: entry-cand-20260722-3
   title: watcher-rearm.sh requires undocumented DARK_FACTORY_ROOT env var not set by rotation launch context
   severity: medium
@@ -6259,6 +6337,12 @@ entries:
     origin_phase: unknown
     manifested_phase: recon
     note: Error Neighborhoods shows a 'mcp__fused-memory__resolve_ticket' call returning 'The operation timed out.' at turn 141. The digest does not show the redundant follow-up polling the entry describes, so this is a partial match on the timeout only.
+  - date: '2026-11-15'
+    project: dark_factory
+    session: 90f18124-41ff-4c5f-a579-7d247a8db661
+    origin_phase: unknown
+    manifested_phase: ops
+    note: mcp__fused-memory__resolve_ticket timed out at turn 1136 with only 'The operation timed out.' returned, giving no outcome signal to the watcher.
   last_seen_runs:
   - census-dark_factory-20261017
   - census-dark_factory-20261024
@@ -10339,6 +10423,12 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     note: Weak match. The digest records one not_found signal (turn 126, modulenotfounderror) in a task worktree (cwd .worktrees/8402, orchestrated-task). The digest does not show the session's phase or that it was architect explore-phase, so both phases are unknown. The rest of the signal counts are zero and the body has no further evidence.
+  - date: '2026-11-15'
+    project: dark_factory
+    session: 936a9fa2-6846-4556-a21a-9cfa8280a482
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Repeated ModuleNotFoundError not_found signals (turns 39, 112, 514, 541) inside a task worktree. Matches the entry's ModuleNotFoundError-in-worktree pattern. The digest does not identify the agent role, so the entry's architect explore-phase attribution is not confirmed.
   last_seen_runs:
   - census-dark_factory-20261017
   - census-dark_factory-20261024
@@ -13374,6 +13464,20 @@ entries:
     manifested_phase: unknown
     invariant_violated: structured-facts-at-failure
     note: Digest shows three df_guard trips (turns 134, 142, 277) rendered as bare 'blocked:' lines with no reason text, so the guard's matched content is dropped. Same rendering defect as the entry. Phase is unsupported by the digest, so both phases are unknown.
+  - date: '2026-11-15'
+    project: dark_factory
+    session: dc46f6f7-6fba-4593-9fed-f7dcc47bf5ff
+    origin_phase: unknown
+    manifested_phase: unknown
+    invariant_violated: structured-facts-at-failure
+    note: Guard trips at turns 42, 57, and 555 show only 'blocked:' with no reason text, and not_found entries show bare phrases ('no such file or directory', 'does not exist', 'modulenotfounderror') with no matched path or symbol. The digest drops the failure detail.
+  - date: '2026-11-15'
+    project: dark_factory
+    session: a3f26b72-42d6-44a6-afe6-da126d7b4495
+    origin_phase: unknown
+    manifested_phase: unknown
+    invariant_violated: structured-facts-at-failure
+    note: The Guard Trips section shows bare 'blocked:' lines with no reason, and the Not Found line shows 'does not exist' with no path or symbol. The digest renders these signals as templates and drops the matched substance.
   last_seen_runs:
   - census-dark_factory-20261017
   - census-dark_factory-20261024
@@ -15094,6 +15198,24 @@ entries:
     origin_phase: unknown
     manifested_phase: recon
     note: The 'User Corrections' bucket (turn 3) holds a reconciliation Stage 1 prompt and buffered event log, not a user correction. The session has n_user_turns=1 and no corrective content.
+  - date: '2026-11-15'
+    project: dark_factory
+    session: 90f18124-41ff-4c5f-a579-7d247a8db661
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: The 'User Corrections' bucket captures pasted non-corrective report content. Turn 385 is a multi-paragraph relayed status report from a sibling session, filed as a user correction.
+  - date: '2026-11-15'
+    project: dark_factory
+    session: a3f26b72-42d6-44a6-afe6-da126d7b4495
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: The same bucket captures pasted non-corrective content, namely a multi-paragraph research brief with path and process instructions, as user feedback.
+  - date: '2026-11-15'
+    project: dark_factory
+    session: e22cbec7-f161-46ef-a6a2-00f754ae38a5
+    origin_phase: unknown
+    manifested_phase: recon
+    note: The 'User Corrections' bucket (turn 3) holds a pasted recon Stage 1 report and Stage 3 header, not a user correction. The digest pipeline files non-corrective report content as user feedback.
   last_seen_runs:
   - census-dark_factory-20261017
   - census-dark_factory-20261024
@@ -16603,6 +16725,12 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     note: 'The digest''s ''User Corrections'' bucket captured a recon stage''s ''## Stage 2: Task-Knowledge Sync'' prompt block as a user correction, although the session has zero fired signal counters apart from one tool_error. The origin is the digest pipeline, not a dark-factory phase, so phases are unknown.'
+  - date: '2026-11-15'
+    project: dark_factory
+    session: 87b9c80c-cb08-4af0-b182-c2be035cf7cf
+    origin_phase: recon
+    manifested_phase: unknown
+    note: The digest's 'User Corrections' bucket holds a recon stage-report dump (Stage 1 Report Summary with stats JSON) and a Stage 2 prompt, not a user correction. Only user_turns=1 and no corrective content appear. signal_counts are zero except not_found=1, so the 'zero counters' condition holds only approximately. Manifested phase is unknown because the digest pipeline's phase is not evidenced.
   last_seen_runs:
   - census-dark_factory-20261031
   - census-dark_factory-20261107
@@ -18635,6 +18763,24 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     note: The 'User Corrections' bucket holds a pasted recon Stage 1 report dump, although all signal_counts other than tool_error read zero. This is the known digest mislabeling pattern.
+  - date: '2026-11-15'
+    project: dark_factory
+    session: 63e1f5d1-ae21-48ac-98a5-1318c0f1cf53
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Digest 'User Corrections' bucket captured a pasted recon stage-report dump (Stage 1 Report Summary and stats JSON) as a user correction, while signal_counts are zero apart from one not_found at turn 31. Origin is the digest generator, not a dark-factory phase, so phases are unknown.
+  - date: '2026-11-15'
+    project: dark_factory
+    session: edde017c-38f4-441d-bf7e-4beef401f751
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: The 'User Corrections' bucket (turn 3) holds a pasted recon stage-prompt and stage-report block, not a user correction, and the not_found signal is the only nonzero counter.
+  - date: '2026-11-15'
+    project: dark_factory
+    session: 67ebe374-3914-4971-ba58-da77fd0aa65f
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: The digest's 'User Corrections' bucket holds a pasted recon Stage 1 report summary and stats dump (turn 3), while signal_counts for tool_error, self_correct, df_guard, interrupt and designed_outcome are all zero. This is the same mislabel the entry describes. Phase is unknown because the session's origin and manifestation cannot be determined from the digest alone.
   last_seen_runs:
   - census-dark_factory-20261024
   - census-dark_factory-20261031
@@ -23680,6 +23826,12 @@ entries:
     manifested_phase: unknown
     invariant_violated: structured-facts-at-failure
     note: Orchestrated worktree session (cwd .worktrees/8465) logs six bare 'no such file or directory' / 'does not exist' not-found signals (turns 28, 47, 56, 146, 380, 397) with no path or other diagnostic context, matching the codebook entry's pattern.
+  - date: '2026-11-15'
+    project: dark_factory
+    session: 936a9fa2-6846-4556-a21a-9cfa8280a482
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Orchestrated worktree session (cwd .worktrees/4637) with repeated 'does not exist' and 'no such file or directory' not_found signals (turns 27, 75, 85) and no other diagnostic signal. Matches the entry's pattern. Phase cannot be determined from the digest.
   last_seen_runs:
   - census-dark_factory-20261017
   - census-dark_factory-20261024
@@ -24536,6 +24688,12 @@ entries:
     origin_phase: unknown
     manifested_phase: recon
     note: 'The digest''s ''Retry Loops'' bucket lists 9 Bash calls to scripts/watcher-rearm.sh with designed-outcome markers ([exit 124] [watcher-rearm-declared], WATCHER_REARM_OUTCOME: CEILING). These are the designed bounded-wait re-arms, not retries, so the bucket mislabels them. The same session''s Designed Outcomes section records the same calls, so the signal is internally inconsistent.'
+  - date: '2026-11-15'
+    project: dark_factory
+    session: 90f18124-41ff-4c5f-a579-7d247a8db661
+    origin_phase: unknown
+    manifested_phase: ops
+    note: The 'Retry Loops' bucket flags a watcher's designed re-arm calls as retry loops. Bash ran 17 times with the same watcher-rearm.sh command (run_in_background, 3600s timeout), which is the rotation's designed re-arm pattern.
   last_seen_runs:
   - census-dark_factory-20261017
   - census-dark_factory-20261024
@@ -24926,6 +25084,12 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     note: The agent tried to wait on a background run with a chained `sleep 45; tail ...` in foreground Bash. A df_guard blocked it and directed the agent to Monitor or run_in_background. This is the same wait-primitive confusion as the busy-poll entry.
+  - date: '2026-11-15'
+    project: dark_factory
+    session: e564fb37-14fa-4d6d-b34b-6055da693c88
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Weak match. The agent chained a foreground `sleep 60` with `tail` to wait on a background task's output, and the harness blocked it with a message pointing to run_in_background or a Monitor until-loop. This is the same wait-primitive misuse described in the entry, but the digest shows only this single blocked call (tool_error=1, n_user_turns=0), so the phase cannot be established from the evidence.
   last_seen_runs:
   - census-dark_factory-20261017
   - census-dark_factory-20261024
@@ -25872,6 +26036,18 @@ entries:
     origin_phase: unknown
     manifested_phase: recon
     note: The Not Found signal fires at turn 59 while the session has n_user_turns=1, so the not_found turn index exceeds the session's turn count.
+  - date: '2026-11-15'
+    project: dark_factory
+    session: dc46f6f7-6fba-4593-9fed-f7dcc47bf5ff
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: The digest is 606 bytes with n_user_turns 0, yet records not_found and guard events at turns 127 and 555. Those turn indices cannot fit in a session that small, which fits the 'not_found at turns exceeding session turn count' pattern.
+  - date: '2026-11-15'
+    project: dark_factory
+    session: f5a8e9bb-a91c-4fe1-8d5a-ceb073330fb9
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: The digest reports not_found at turn 102 and guard trips at turns 183 and 300, but n_user_turns is 1. Turn indices exceed the session's turn count, matching the described pattern.
   filed_tickets:
   - ticket: tkt_0RW5FRBTQM864TQ7K3NFHM6H5K
     project_root: /home/leo/src/dark-factory
@@ -26954,6 +27130,54 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     note: 'The ''User Corrections'' bucket''s only entry (turn 3) is the injected ''## Stage 2: Task-Knowledge Sync'' task-framing prompt, not a user correction. The session has n_user_turns=1 and all correction-type signal counts are zero, so this is the known digest mislabel of injected task context. Phases are unsupported by the digest, so they are ''unknown''.'
+  - date: '2026-11-15'
+    project: dark_factory
+    session: a3f26b72-42d6-44a6-afe6-da126d7b4495
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: The 'User Corrections' bucket at turn 4 holds a pasted sub-agent role brief ('Act as the research sub-agent...'), which is a dispatch instruction and not a correction. Signal counts are otherwise zero apart from df_guard and not_found.
+  - date: '2026-11-15'
+    project: dark_factory
+    session: f5a8e9bb-a91c-4fe1-8d5a-ceb073330fb9
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: The 'User Corrections' bucket's turn-4 entry is a pasted review sub-agent role prompt ("Act as the review sub-agent for this task..."), an injected task briefing rather than a user correction. The digest pipeline mislabels it as corrective feedback.
+  - date: '2026-11-15'
+    project: dark_factory
+    session: b8aad316-5897-4cdd-ba2e-237d0dd20e4f
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: The digest's 'User Corrections' entry (turn 4) is an injected spawn-brief pointer ('Read ... and follow it as your brief'), not a user correction. The digest pipeline mislabels injected task briefing as a correction.
+  - date: '2026-11-15'
+    project: dark_factory
+    session: a01b9d76-8520-4fb7-a87d-bba6482bf8a0
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: 'The ''User Corrections'' bucket (turn 3) holds an injected ''## Stage 2: Task-Knowledge Sync'' recon stage prompt and report summary, not a user correction. The session has one user turn, and the signal counts do not support a correction.'
+  - date: '2026-11-15'
+    project: dark_factory
+    session: b00c9b19-152a-4c39-867f-d8199085dab0
+    origin_phase: recon
+    manifested_phase: recon
+    note: 'The ''User Corrections'' bucket''s only entry is an injected recon stage prompt (''## Stage 2: Task-Knowledge Sync''), not a user correction. The digest''s signal_counts are all zero except not_found, so the bucket is mislabeling injected task context.'
+  - date: '2026-11-15'
+    project: dark_factory
+    session: b0c5589b-b1d6-4918-8368-d413efa4a06a
+    origin_phase: unknown
+    manifested_phase: recon
+    note: 'The digest''s ''User Corrections'' bucket holds ''(turn 3) ## Stage 2: Task-Knowledge Sync / ## Project: reify'', an injected recon stage prompt header. The session shows n_user_turns: 1, so this is not a user correction. This matches the known mislabeling of injected task/briefing context as a correction. Origin phase is not supported by the digest, so it is marked unknown.'
+  - date: '2026-11-15'
+    project: dark_factory
+    session: 55fc61b6-cc96-45c6-9f8b-0382a7a70da0
+    origin_phase: recon
+    manifested_phase: unknown
+    note: 'The digest''s ''User Corrections'' bucket (turn 3) holds the injected ''## Stage 2: Task-Knowledge Sync'' stage prompt and stage-1 report, not a user correction. n_user_turns is 1 and no correction signal fired.'
+  - date: '2026-11-15'
+    project: dark_factory
+    session: e56c92d6-602a-4d15-b6b6-a4a3e0e2cb9c
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: 'The digest''s ''User Corrections'' bucket (turn 3) holds an injected recon stage prompt (''## Stage 3: Cross-System Integrity Check'' / ''## Project: market_predictor'') rather than a user correction. The session''s signal_counts are all zero apart from tool_error, so the bucket label is unsupported.'
   filed_tickets:
   - ticket: tkt_0RW5FRC7ET51RZA763BVXH7ZAA
     project_root: /home/leo/src/dark-factory
@@ -27147,6 +27371,12 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     note: The digest's 'User Corrections' bucket holds a /team skill invocation (command-message/command-name/command-args) with an injected brief and output-file instructions, not a user correction. The digest's own n_user_turns is 1 and every signal_count except tool_error is zero. This matches the known mislabel of skill invocations and injected task content as corrections.
+  - date: '2026-11-15'
+    project: dark_factory
+    session: 90f18124-41ff-4c5f-a579-7d247a8db661
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: 'The ''User Corrections'' bucket captures a skill invocation (turn 4: <command-message>escalation-watcher</command-message>) and other non-correction content (turn 385: a relayed sibling-session status report) as if they were user corrections.'
   filed_tickets:
   - ticket: tkt_0RW5FRCC10XP47EPHA3X9HRK50
     project_root: /home/leo/src/dark-factory
@@ -27432,6 +27662,24 @@ entries:
     origin_phase: unknown
     manifested_phase: verify
     note: Orchestrated-task sub-agent was denied read-only Bash inspection in don't-ask mode (turns 26 and 91) while diagnosing post-merge verify failures, forcing it to work from guesses.
+  - date: '2026-11-15'
+    project: dark_factory
+    session: 57baffd1-63ba-454c-bc19-7d3e0fa358ad
+    origin_phase: unknown
+    manifested_phase: verify
+    note: Orchestrated-task sub-agent diagnosing a post-merge verify block was repeatedly denied Bash in don't-ask mode (turns 36 and 42), forcing blind guesses about main's test file layout. The Glob search also timed out at turn 52, so the agent could not confirm the file's existence on main.
+  - date: '2026-11-15'
+    project: dark_factory
+    session: 8b276f23-fef2-4fc7-a329-543d0c5b1826
+    origin_phase: unknown
+    manifested_phase: verify
+    note: Post-merge verify failed on test_loop_blocking_gate ratchet tests. The orchestrated-task agent was then denied Bash in don't-ask mode on read-only diagnostics (ls .task, iterations.jsonl, pytest rerun of the failing ratchet, an ast hash probe), so it could not inspect the failing gate state directly.
+  - date: '2026-11-15'
+    project: dark_factory
+    session: bac8c94d-e70c-432d-a5ce-4cfc60594aa6
+    origin_phase: ops
+    manifested_phase: architect
+    note: Architect's read-only Bash inspection (git log, git status, git branch --contains, cat .task/plan.json) was denied by don't-ask permission mode at turn 27, forcing it to reason about the already-done claim without the commands it needed to attribute commit a508801728.
   filed_tickets:
   - ticket: null
     project_root: /home/leo/src/dark-factory
@@ -45029,6 +45277,32 @@ candidates:
     origin_phase: unknown
     manifested_phase: verify
     evidence_quote: 'AssertionError: fused-memory/src/fused_memory/server/main.py:41: noqa[E402] -- this suppression is not in the baseline and names no owner.'
+- id: cand-20261115-1
+  title: Installer timer tests each inline a copy of the fake_systemctl harness, so migrating them requires per-file AST surgery
+  cause: Each scripts/tests/test_install_*_timer.py file carries its own fake_systemctl fixture, state env, bin_dir and _run_script call sites. A shared change to the harness therefore has to be applied file by file, and the agent resorted to ad-hoc AST and substring rewriting scripts that crashed (ValueError on substring not found, AttributeError on Assign nodes), leaving unused json imports for ruff to flag.
+  area: tests
+  first_seen: '2026-11-15'
+  disposition: pending
+  sightings:
+  - date: '2026-11-15'
+    project: dark_factory
+    session: 9f156566-1a70-4efc-afb8-9fb61f571f81
+    origin_phase: unknown
+    manifested_phase: implement
+    evidence_quote: scripts/tests/test_install_trickle_timer.py reset sites 1 bin_dir sites 1 STATE env sites 1 _run_script call sites 10
+- id: cand-20261115-2
+  title: Task worktree .task/ symlinks dangle to an external .task-meta directory, so agents see entries that cat and wc reject as missing
+  cause: Inside the task worktree, .task/plan.json and .task/iterations.jsonl are symlinks to /home/leo/src/dark-factory/.worktrees/.task-meta/task-6991/, outside the worktree. The agent's ls lists them, but cat, tail and wc report 'No such file or directory'. Nothing in the worktree tells the agent that the metadata lives elsewhere or that the links are dangling, so it repeats the failing reads and guesses paths across several turns.
+  area: task-worktree-metadata-layout
+  first_seen: '2026-11-15'
+  disposition: pending
+  sightings:
+  - date: '2026-11-15'
+    project: dark_factory
+    session: e68852eb-5264-4b8a-b077-3e0be7e075fd
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: 'lrwxrwxrwx  1 leo leo   75 Nov 15 11:17 iterations.jsonl -> /home/leo/src/dark-factory/.worktrees/.task-meta/task-6991/iterations.jsonl ... cat: .task/plan.json: No such file or directory'
 historical_backfill:
   run_id: census-dark_factory-20261024
   unmatched_task_ids:

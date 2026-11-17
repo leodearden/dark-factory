@@ -28,7 +28,7 @@ from types import MappingProxyType
 from typing import Literal
 
 from escalation.authority import EXECUTOR_IDENTITY, policy_row
-from orchestrator.session_registry import (
+from orchestrator.decision_registry import (
     UNKNOWN_QUEUE,
     AuditOutcome,
     AuditVerdict,

@@ -372,10 +372,10 @@ class AgentResult:
       salvaged — see
       ``test_is_error_with_non_dict_structured_output_not_salvaged`` — whereas
       a dict payload would already have flipped the result to success before a
-      caller ever saw the failure). Measured (CLI 2.1.236/2.1.241, via
-      ``fused-memory/scripts/probe_schema_max_turns.py`` — added by task 3241,
-      unmerged as of this writing; the path resolves once that branch lands):
-      ``error_max_turns`` almost never carries a completed JSON schema
+      caller ever saw the failure). Measured by
+      ``fused-memory/scripts/probe_schema_max_turns.py``, whose docstring
+      records the runs and the CLI versions they used: ``error_max_turns``
+      almost never carries a completed JSON schema
       tool-use turn — the model spent its turns on prose and never invoked
       the schema tool — so at that boundary salvage is rarely a backstop and
       usually has nothing to recover. Re-run the probe to re-check this claim

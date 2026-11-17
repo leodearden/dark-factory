@@ -385,13 +385,25 @@ def _canonicalize_group_args(func):
 class EdgeDict(TypedDict):
     """Normalised edge dict returned by GraphitiBackend._edge_dict.
 
-    Consumed by get_valid_edges_for_node, get_all_valid_edges,
-    _canonical_facts, and rebuild_entity_from_edges.
+    Consumed by get_all_valid_edges, _canonical_facts, and
+    rebuild_entity_from_edges.  get_valid_edges_for_node returns the dated
+    subtype, DatedEdgeDict.
     """
 
     uuid: str
     fact: str
     name: str
+
+
+class DatedEdgeDict(EdgeDict):
+    """An EdgeDict with the edge's stored ISO-8601 validity window.
+
+    ``valid_at`` / ``invalid_at`` are returned verbatim as FalkorDB holds them,
+    ``None`` when the property is NULL.
+    """
+
+    valid_at: str | None
+    invalid_at: str | None
 
 
 class EdgeWithEndpoints(TypedDict):
@@ -2428,7 +2440,9 @@ class GraphitiBackend:
         return edges
 
     @_canonicalize_group_args
-    async def get_valid_edges_for_node(self, node_uuid: str, *, group_id: str) -> list[EdgeDict]:
+    async def get_valid_edges_for_node(
+        self, node_uuid: str, *, group_id: str,
+    ) -> list[DatedEdgeDict]:
         """Return all currently-valid RELATES_TO edges for an Entity node.
 
         Matches the node as either source or target (undirected) and excludes
@@ -2446,17 +2460,17 @@ class GraphitiBackend:
             group_id: Project graph to query.
 
         Returns:
-            List of dicts with keys: uuid, fact, name.
+            List of DatedEdgeDicts with keys: uuid, fact, name, valid_at, invalid_at.
         """
         graph = self.graph_access.graph(group_id)
         cypher = (
             'MATCH (n:Entity {uuid: $uuid})-[e:RELATES_TO]-() '
             f'WHERE {ACTIVE_EDGE_PREDICATE} '
-            'RETURN e.uuid, e.fact, e.name'
+            'RETURN e.uuid, e.fact, e.name, e.valid_at, e.invalid_at'
         )
         result = await graph.ro_query(cypher, {'uuid': node_uuid}, op='get_valid_edges_for_node')
-        seen: dict[str, EdgeDict] = {}
-        edges: list[EdgeDict] = []
+        seen: dict[str, DatedEdgeDict] = {}
+        edges: list[DatedEdgeDict] = []
         for row in (result.result_set or []):
             edge_uuid = row[0]
             if edge_uuid in seen:
@@ -2466,7 +2480,7 @@ class GraphitiBackend:
                 # genuinely-distinct edges sharing a uuid would silently
                 # collapse to the first-seen row. Surface it at debug level
                 # rather than failing silently.
-                dup = self._edge_dict(row[0], row[1], row[2])
+                dup = self._dated_edge_dict(*row[:5])
                 prior = seen[edge_uuid]
                 if dup['fact'] != prior['fact'] or dup['name'] != prior['name']:
                     logger.debug(
@@ -2477,7 +2491,7 @@ class GraphitiBackend:
                         edge_uuid, prior['fact'], prior['name'], dup['fact'], dup['name'],
                     )
                 continue
-            edge = self._edge_dict(row[0], row[1], row[2])
+            edge = self._dated_edge_dict(*row[:5])
             seen[edge_uuid] = edge
             edges.append(edge)
         return edges
@@ -3580,6 +3594,31 @@ class GraphitiBackend:
         return (row[0], row[1] or '')
 
     @_canonicalize_group_args
+    async def get_node_names_by_uuids(
+        self, uuids: Sequence[str], *, group_id: str,
+    ) -> dict[str, str]:
+        """Name the Entity nodes among *uuids* in one indexed read (``Entity(uuid)`` range index).
+
+        It names the endpoints of a batch of graph hits. A node that is absent
+        or has no name is omitted: it has no name to give. Like
+        get_edges_by_uuids, it applies no ``n.group_id`` predicate, so an
+        edge's endpoint is named as stored.
+        """
+        wanted = list(dict.fromkeys(uuids))
+        if not wanted:
+            return {}
+        result = await self.graph_access.graph(group_id).ro_query(
+            'MATCH (n:Entity) WHERE n.uuid IN $uuids RETURN n.uuid, n.name',
+            {'uuids': wanted},
+            op='get_node_names_by_uuids',
+        )
+        names: dict[str, str] = {}
+        for node_uuid, name in result.result_set or []:
+            if isinstance(name, str) and name:
+                names.setdefault(node_uuid, name)
+        return names
+
+    @_canonicalize_group_args
     async def resolve_entity_by_name(self, name: str, *, group_id: str) -> str:
         """Resolve an entity name to its UUID via an exact Cypher lookup.
 
@@ -4257,6 +4296,18 @@ class GraphitiBackend:
             'fact': fact if fact is not None else '',
             'name': name if name is not None else '',
         }
+
+    @classmethod
+    def _dated_edge_dict(
+        cls,
+        uuid: str,
+        fact: str | None,
+        name: str | None,
+        valid_at: str | None,
+        invalid_at: str | None,
+    ) -> DatedEdgeDict:
+        """An _edge_dict carrying the stored validity window verbatim."""
+        return {**cls._edge_dict(uuid, fact, name), 'valid_at': valid_at, 'invalid_at': invalid_at}
 
     @staticmethod
     def _duplicate_edge_uuids(rows: Sequence[Sequence[Any]]) -> list[str]:

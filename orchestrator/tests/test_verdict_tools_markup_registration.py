@@ -48,7 +48,9 @@ from escalation.queue import EscalationQueue
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
 from shared.mcp_markup_middleware import (
+    MARKUP_STORM_ERROR_TYPE,
     MARKUP_UNRECOVERED_PARAM_ERROR_TYPE,
+    MARKUP_UNREPAIRABLE_ERROR_TYPE,
     MarkupGuardMiddleware,
     RepairPolicy,
 )
@@ -1195,7 +1197,7 @@ class TestVerdictToolsResidueChannelIsShared:
             loss_sink=LossRecorder(),
         )
         record = {
-            'error_type': markup_sink.MARKUP_RESIDUE_ERROR_TYPE,
+            'error_type': MARKUP_UNREPAIRABLE_ERROR_TYPE,
             'tool': 'submit_review_verdict',
             'field': 'issues',
             'category': 'mcp_markup_residue',
@@ -1278,7 +1280,7 @@ class TestVerdictToolsResidueChannelIsShared:
 
         with caplog.at_level(logging.INFO, logger='orchestrator.mcp.markup_sink'):
             locator = await sink({
-                'error_type': markup_sink.MARKUP_RESIDUE_ERROR_TYPE,
+                'error_type': MARKUP_UNREPAIRABLE_ERROR_TYPE,
                 'tool': 'submit_review_verdict',
                 'field': 'issues',
                 'raw_value': raw,
@@ -1312,7 +1314,7 @@ class TestVerdictToolsResidueChannelIsShared:
 
         with caplog.at_level(logging.INFO, logger='orchestrator.mcp.markup_sink'):
             locator = await sink({
-                'error_type': markup_sink.MARKUP_STORM_ERROR_TYPE,
+                'error_type': MARKUP_STORM_ERROR_TYPE,
                 'count': 7,
                 'threshold': 5,
                 'window_seconds': 3600,
