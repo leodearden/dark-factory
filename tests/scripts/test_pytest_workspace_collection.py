@@ -65,6 +65,7 @@ _RELATIVE_IMPORT_RE = re.compile(r'^\s*from\s+\.+\w')
 # All test directories to scan for namespace-relative imports and __init__.py files.
 # Vendored sub-libraries (graphiti, mem0, taskmaster-ai) inside fused-memory are excluded.
 _ALL_TEST_DIRS = [
+    REPO_ROOT / 'cockpit' / 'tests',
     REPO_ROOT / 'dashboard' / 'tests',
     REPO_ROOT / 'escalation' / 'tests',
     REPO_ROOT / 'fused-memory' / 'tests',
@@ -248,11 +249,13 @@ def test_no_subproject_tests_init_py() -> None:
     Any __init__.py in tests/ causes pytest to treat it as a package, forcing
     the `tests.conftest` module name — which collides across subprojects.
 
-    The seven paths below are the ones that existed before this refactor.
+    The paths below are the seven that existed before this refactor, plus
+    cockpit/tests (task 6881), which joined the bare-name sibling-import scheme later.
     If any are present, pytest root-collection will fail with:
       ValueError: Plugin already registered: conftest (tests.conftest)
     """
     _INIT_PY_PATHS = [
+        REPO_ROOT / 'cockpit' / 'tests' / '__init__.py',
         REPO_ROOT / 'dashboard' / 'tests' / '__init__.py',
         REPO_ROOT / 'escalation' / 'tests' / '__init__.py',
         REPO_ROOT / 'fused-memory' / 'tests' / '__init__.py',
