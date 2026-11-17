@@ -643,9 +643,7 @@ def build_report(
         # at the top level rather than under any one project.
         'registry_coverage': registry_coverage,
         'registry_error': registry_error,
-        'kind_registry_drift': build_kind_registry_drift(
-            (grand_total_dict.get('kind') or {}).get('entries'),
-        ),
+        'kind_registry_drift': build_kind_registry_drift(grand_total_dict['kind']['entries']),
         # Placeholder so the key keeps its position in the artifact; filled
         # below, since the diff is computed FROM the finished report (one
         # distillation path -- see _coverage_run_row).
@@ -850,18 +848,17 @@ def _records_by_folded_slug(census: CategoryCensus) -> Counter[str]:
 
 
 def build_kind_registry_drift(
-    kind_entries: list[dict[str, Any]] | None,
+    entries: list[dict[str, Any]],
     registry: frozenset[str] = KIND_REGISTRY,
 ) -> dict[str, Any]:
     """Score the live ``kind`` population against the frozen registry.
 
     A DELTA on the nightly cadence, never a gate: PRD §10 open question 1
-    ruled option (b), so ``kind`` never rejects a write. It replaced a test
+    ruled option (b), so ``kind`` membership never rejects a write. It replaced a test
     tripwire over the live artifact, which a nightly-regenerated artifact made
     impossible to keep green. Why the baseline is frozen and append-only:
     ``fused_memory.memory_metadata.KIND_REGISTRY``.
     """
-    entries = kind_entries or []
     unregistered = [
         {'value': entry.get('value'), 'count': entry.get('count') or 0}
         for entry in entries

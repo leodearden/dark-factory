@@ -2,7 +2,7 @@
 
 The block scores the live ``kind`` population against the frozen
 ``memory_metadata.KIND_REGISTRY`` baseline (PRD §10 open question 1, ruled
-option (b): ``kind`` only warns). Every input here is SYNTHETIC: a live
+option (b): ``kind`` membership only warns). Every input here is SYNTHETIC: a live
 number would move nightly, so a test asserting one could never stay green.
 Assertions against the real registry are relational only.
 """
@@ -12,15 +12,11 @@ import copy
 import json
 from pathlib import Path
 
-import pytest
 from _fm_helpers import load_script_module
-from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory import memory_metadata
 from fused_memory.memory_metadata import KIND_REGISTRY
 from fused_memory.models.enums import MemoryCategory
-
-pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _mod = load_script_module(
     Path(__file__).parent.parent / 'scripts' / 'census_memory_metadata.py',
@@ -102,9 +98,8 @@ class TestBuildKindRegistryDrift:
         assert drift['registered_distinct'] == 1
         assert drift['absent_from_corpus'] == ['42']
 
-    @pytest.mark.parametrize('entries', [[], None])
-    def test_empty_input_is_a_measured_state_not_a_missing_one(self, entries):
-        drift = _mod.build_kind_registry_drift(entries, self.REGISTRY)
+    def test_empty_input_is_a_measured_state(self):
+        drift = _mod.build_kind_registry_drift([], self.REGISTRY)
         assert drift['measured_distinct'] == 0
         assert drift['measured_records'] == 0
         assert drift['registered_distinct'] == 0
@@ -199,12 +194,11 @@ class TestRenderKindRegistryDrift:
         assert heading < markdown.index('\n## Record counts\n')
 
     def test_the_headline_carries_the_four_counts(self):
-        report = self._report()
-        block = report['kind_registry_drift']
-        section = _section(_mod.render_markdown(report))
-        assert f'{len(KIND_REGISTRY):,}' in section
-        for key in ('measured_distinct', 'unregistered_distinct', 'absent_from_corpus_distinct'):
-            assert f'**{_mod._num(block[key])}**' in section
+        section = _section(_mod.render_markdown(self._report()))
+        assert f'**{len(KIND_REGISTRY):,}**' in section
+        assert '**4**' in section
+        assert '**3**' in section
+        assert f'**{len(KIND_REGISTRY) - 1:,}**' in section
 
     def test_the_unregistered_table_is_cut_to_top_n_and_says_so(self):
         section = _section(_mod.render_markdown(self._report(top_n=2)))
@@ -228,7 +222,8 @@ class TestRenderKindRegistryDrift:
         report = self._report()
         del report['kind_registry_drift']
         section = _section(_mod.render_markdown(report))
-        assert 'absent' in section
+        assert 'pre-schema-6' in section
+        assert 'no drift was measured' in section
         assert '| value |' not in section
 
     def test_the_section_states_the_axis_only_warns(self):
