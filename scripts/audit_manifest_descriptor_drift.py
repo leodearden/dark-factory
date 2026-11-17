@@ -78,11 +78,15 @@ THE SIGNAL-BINDING CHECK (task 6582). A sidecar's ``signal_leaves`` names the
 blocks whose task status the dashboard reads as the PRD's signal
 (plans/dashboard-prd-lanes-prd.md §4.7, §5.2). A STALE SIGNAL BINDING is a
 signal leaf whose locally bound task is missing from this store, or whose own
-PRD field does not name this sidecar's ``prd``. Both are read as the
-dashboard's signal check reads them: the task's field by
-``dashboard/src/dashboard/data/prd_attribution.py::coalesce_prd``, then it
-and the sidecar's ``prd`` each keyed by ``::normalise_prd_key`` against the
-project root. Every such row makes a run dirty; what one means and how it is
+PRD field does not name this sidecar's ``prd``. The task's field is read as
+the dashboard reads it, by
+``dashboard/src/dashboard/data/prd_attribution.py::coalesce_prd``; it and the
+sidecar's ``prd`` are each keyed by ``::normalise_prd_key`` against the
+absolute project root. The dashboard's own check
+(``dashboard/src/dashboard/data/prd_view.py::signal_of``) compares with the
+key of the PRD the sidecar sits beside instead of its ``prd``, so the two
+verdicts agree only while those name the same PRD. Every such row makes a run
+dirty; what one means and how it is
 fixed is stated once, in ``_SIGNAL_BINDING_CAVEAT``. How many leaves were
 named and how many could be checked is in the coverage block, so a run with no
 signal leaves to check never reads as one whose leaves all agreed.
@@ -91,6 +95,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -130,9 +135,9 @@ from shared.tasks_db_readonly import connect_ro
 # worktree (that is what --manifest-root is for). Same reasoning and same form
 # as audit_combine_gate_marker_loss.py (tasks 2881/2882/3329). The shared.*
 # imports below MUST stay after this insert.
-# The shared.tasks_db_readonly import ABOVE is sound without it: importing
-# _task_db_scan already ran `import _checkout`, which bound this checkout's
-# shared/src.
+# The shared.tasks_db_readonly and dashboard.data.prd_attribution imports
+# ABOVE are sound without it: importing _task_db_scan already ran
+# `import _checkout`, which bound this checkout's member srcs.
 _SHARED_SRC = Path(__file__).resolve().parent.parent / "shared" / "src"
 if str(_SHARED_SRC) not in sys.path:
     sys.path.insert(0, str(_SHARED_SRC))
@@ -672,9 +677,9 @@ def _stale_signal_bindings(
     PRD field (``TaskStoreScan.task_prds``) does not name *sidecar_prd* under
     *project_root*, in the order given.
 
-    *project_root* is the tasks.db owner, never a separate manifest root: an
-    absolute PRD path in a task names the primary checkout, which is the root
-    the dashboard keys a PRD against.
+    *project_root* is the tasks.db owner made absolute, never a separate
+    manifest root: an absolute PRD path in a task names the primary checkout,
+    which is the root the dashboard keys a PRD against.
     """
     rows: list[StaleSignalBinding] = []
     for label, task_id in bound_leaves:
@@ -921,7 +926,8 @@ def audit_project(project_root: str, manifest_root: str | None = None) -> Projec
         signal_leaves_checked += len(bound_signal_leaves)
         stale_signal_bindings.extend(
             _stale_signal_bindings(
-                relpath, doc.prd, bound_signal_leaves, scan, project_root=root))
+                relpath, doc.prd, bound_signal_leaves, scan,
+                project_root=os.path.abspath(root)))
         for task in doc.tasks:
             if task.external_task_id is not None:
                 # ANOTHER project's registry, so absent from THIS project's

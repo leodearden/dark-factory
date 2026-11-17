@@ -163,15 +163,15 @@ def test_an_agreeing_signal_binding_is_no_row(tmp_path, make_tasks_db):
     assert audit_project(str(root)).stale_signal_bindings == []
 
 
-def _leaf_project(tmp_path, make_tasks_db, leaf_metadata):
+def _leaf_project(tmp_path, make_tasks_db, leaf_metadata, *, sidecar_prd="plans/x-prd.md"):
     """Task 7 names plans/x-prd.md; the signal leaf ζ binds task 8, whose
-    metadata is *leaf_metadata*."""
+    metadata is *leaf_metadata*, in a sidecar whose prd is *sidecar_prd*."""
     return make_project(
         tmp_path, make_tasks_db,
         tasks=[_prd_row(7, "plans/x-prd.md"),
                {"id": 8, "status": "pending", "metadata": leaf_metadata}],
         manifests=[(_SIGNAL_SIDECAR, _signalling(
-            "plans/x-prd.md", [("α", 7), ("ζ", 8)], ["ζ"]))],
+            sidecar_prd, [("α", 7), ("ζ", 8)], ["ζ"]))],
     )
 
 
@@ -222,19 +222,27 @@ def test_a_signal_leaf_naming_the_sidecars_prd_in_any_dashboard_spelling_is_no_r
     assert audit_project(str(root)).stale_signal_bindings == []
 
 
-@pytest.mark.parametrize(("leaf_metadata", "task_prd"), [
-    pytest.param({"prd_path": "plans/other-prd.md", "prd": "plans/x-prd.md"},
-                 "plans/other-prd.md", id="prd_path-wins"),
-    pytest.param({"prd": "plans/other-prd.md#a"}, "plans/other-prd.md",
-                 id="coalesced-value-reported"),
-])
-def test_prd_path_takes_precedence_over_prd_for_a_signal_leaf(
-        tmp_path, make_tasks_db, leaf_metadata, task_prd):
-    root = _leaf_project(tmp_path, make_tasks_db, leaf_metadata)
-
-    assert audit_project(str(root)).stale_signal_bindings == [StaleSignalBinding(
+def _leaf_8_mismatch(*, sidecar_prd="plans/x-prd.md", task_prd):
+    return [StaleSignalBinding(
         manifest=_SIGNAL_SIDECAR, label="ζ", task_id=8, reason="prd_mismatch",
-        sidecar_prd="plans/x-prd.md", task_prd=task_prd)]
+        sidecar_prd=sidecar_prd, task_prd=task_prd)]
+
+
+def test_prd_path_takes_precedence_over_prd_for_a_signal_leaf(tmp_path, make_tasks_db):
+    root = _leaf_project(tmp_path, make_tasks_db,
+                         {"prd_path": "plans/other-prd.md", "prd": "plans/x-prd.md"})
+
+    assert audit_project(str(root)).stale_signal_bindings == _leaf_8_mismatch(
+        task_prd="plans/other-prd.md")
+
+
+def test_a_mismatch_row_reports_the_coalesced_task_prd(tmp_path, make_tasks_db):
+    """The value a fixer edits: the field coalesce_prd chose, suffix stripped,
+    not the raw metadata value and not the normalised key."""
+    root = _leaf_project(tmp_path, make_tasks_db, {"prd": "./plans/other-prd.md#a"})
+
+    assert audit_project(str(root)).stale_signal_bindings == _leaf_8_mismatch(
+        task_prd="./plans/other-prd.md")
 
 
 @pytest.mark.parametrize("leaf_metadata", _X_PRD_EQUIVALENT_PATHS)
@@ -246,13 +254,40 @@ def test_a_signal_leaf_naming_the_sidecars_prd_by_an_equivalent_path_is_no_row(
     assert audit_project(str(root)).stale_signal_bindings == []
 
 
+def test_a_sidecar_prd_spelled_by_an_equivalent_path_is_keyed_too(tmp_path, make_tasks_db):
+    root = _leaf_project(tmp_path, make_tasks_db, {"prd_path": "plans/x-prd.md"},
+                         sidecar_prd="./plans/x-prd.md")
+
+    assert audit_project(str(root)).stale_signal_bindings == []
+
+
+def test_an_absolute_in_root_prd_agrees_under_a_relative_project_root(
+        tmp_path, make_tasks_db, monkeypatch):
+    """The dashboard keys against its absolute configured root, so the audit
+    does too, however --project-root was spelled."""
+    root = tmp_path / "proj"
+    _leaf_project(tmp_path, make_tasks_db, {"prd_path": f"{root}/plans/x-prd.md"})
+    monkeypatch.chdir(tmp_path)
+
+    assert audit_project("proj").stale_signal_bindings == []
+
+
 def test_a_signal_leaf_naming_a_prd_outside_the_root_is_a_mismatch(tmp_path, make_tasks_db):
     """A PRD outside the project root is foreign to it, and never agrees."""
     root = _leaf_project(tmp_path, make_tasks_db, {"prd_path": _FOREIGN_X_PRD})
 
-    assert audit_project(str(root)).stale_signal_bindings == [StaleSignalBinding(
-        manifest=_SIGNAL_SIDECAR, label="ζ", task_id=8, reason="prd_mismatch",
-        sidecar_prd="plans/x-prd.md", task_prd=_FOREIGN_X_PRD)]
+    assert audit_project(str(root)).stale_signal_bindings == _leaf_8_mismatch(
+        task_prd=_FOREIGN_X_PRD)
+
+
+def test_a_leaf_and_sidecar_naming_the_same_foreign_prd_are_a_mismatch(
+        tmp_path, make_tasks_db):
+    """Equal foreign values do not agree: neither keys to a PRD of this root."""
+    root = _leaf_project(tmp_path, make_tasks_db, {"prd_path": _FOREIGN_X_PRD},
+                         sidecar_prd=_FOREIGN_X_PRD)
+
+    assert audit_project(str(root)).stale_signal_bindings == _leaf_8_mismatch(
+        sidecar_prd=_FOREIGN_X_PRD, task_prd=_FOREIGN_X_PRD)
 
 
 @pytest.mark.parametrize("leaf_metadata", _PARITY_SHAPES)
