@@ -31,6 +31,7 @@ from shared.project_layout import escalation_queue_dir
 
 from fused_memory.middleware import curator_escalator
 from fused_memory.middleware.curator_escalator import CuratorEscalator
+from fused_memory.middleware.curator_registry import RegistryHealth, RegistryState
 from fused_memory.middleware.curator_types import CuratorFailureError
 from fused_memory.middleware.curator_zot_duplicate_sweep import (
     DUPLICATE_METADATA_KEY,
@@ -1309,6 +1310,101 @@ class TestBackendBinaryUnresolvableEscalation:
         assert any('claude' in r.getMessage() for r in errors)
 
 
+def _failed_registry_health(
+    label: str = 'blocklist', config_key: str = 'cancelled_premise_blocklist_path',
+) -> RegistryHealth:
+    return RegistryHealth(
+        label=label,
+        config_key=config_key,
+        state=RegistryState.FAILED,
+        path=f'/srv/config/{label}.yaml',
+        error=f'YamlListFileError: file not found: /srv/config/{label}.yaml',
+        failures=2,
+    )
+
+
+class TestReportRegistryLoadFailed:
+    """A curator guard registry failed to load, so that guard fails open and
+    curation looks like a healthy curator with an empty registry."""
+
+    @pytest.mark.asyncio
+    async def test_queues_one_level_one_escalation_with_remediation(self, tmp_path):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            health = _failed_registry_health()
+            await CuratorEscalator().report_registry_load_failed(
+                project_root=str(tmp_path), project_id='proj-x', health=health,
+            )
+
+            [record] = _pending_records(tmp_path)
+            assert record['category'] == 'curator_registry_load_failed'
+            assert record['level'] == 1
+            assert record['task_id'] == curator_escalator._ANCHOR_TASK_ID
+            assert 'blocklist' in record['summary']
+            detail = record['detail']
+            for expected in (
+                'proj-x', 'blocklist', health.config_key, health.path, health.error,
+                'failures=2',
+            ):
+                assert expected in detail
+            assert health.config_key in detail.split('FIX', 1)[1]
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    async def test_repeat_reports_for_one_label_fold_into_one_record(self, tmp_path):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            escalator = CuratorEscalator()
+            for _ in range(2):
+                await escalator.report_registry_load_failed(
+                    project_root=str(tmp_path), project_id='proj-x',
+                    health=_failed_registry_health(),
+                )
+
+            [parent] = _pending_records(tmp_path)
+            assert parent['dedupe_fingerprint']
+            assert parent['dedupe_count'] == 1
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    async def test_each_label_gets_its_own_record(self, tmp_path):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            escalator = CuratorEscalator()
+            await escalator.report_registry_load_failed(
+                project_root=str(tmp_path), project_id='proj-x',
+                health=_failed_registry_health(),
+            )
+            await escalator.report_registry_load_failed(
+                project_root=str(tmp_path), project_id='proj-x',
+                health=_failed_registry_health(
+                    'operational-ask', 'operational_ask_registry_path',
+                ),
+            )
+
+            records = _pending_records(tmp_path)
+            assert len(records) == 2
+            assert records[0]['dedupe_fingerprint'] != records[1]['dedupe_fingerprint']
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    async def test_no_orchestrator_logs_and_does_not_raise(self, tmp_path, caplog):
+        """Raising here would break the curator's fail-open contract at startup."""
+        with caplog.at_level(logging.ERROR):
+            await CuratorEscalator().report_registry_load_failed(
+                project_root=str(tmp_path), project_id='proj-x',
+                health=_failed_registry_health(),
+            )
+
+        assert not list((tmp_path / 'data' / 'escalations').glob('esc-*.json'))
+        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert errors, 'a dropped alarm must still be loud in the log'
+        assert any('blocklist' in r.getMessage() for r in errors)
+
+
 _EVERY_ROUTE = [
     pytest.param(
         'report_failure',
@@ -1352,6 +1448,11 @@ _EVERY_ROUTE = [
         'report_backend_binary_unresolvable',
         dict(binary_spec='claude', search_path='/usr/bin'),
         id='backend-binary-unresolvable',
+    ),
+    pytest.param(
+        'report_registry_load_failed',
+        dict(health=_failed_registry_health()),
+        id='registry-load-failed',
     ),
 ]
 
