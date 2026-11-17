@@ -10,6 +10,7 @@ by ``record_proposal``.
 from __future__ import annotations
 
 import dataclasses
+import json
 from datetime import UTC, datetime
 
 import pytest
@@ -17,9 +18,13 @@ import pytest_asyncio
 
 from fused_memory.reconciliation.consolidation_auto import AutoOutcome
 from fused_memory.reconciliation.consolidation_proposal import (
+    SHOWN_TEXT_CHARS,
+    AdjudicationRecord,
     ConsolidationProposal,
     ProposalOutcome,
+    ProposalRef,
     ProposalState,
+    ShownMember,
     from_ledger_record,
     newest_per_topic,
     outcome_from_record,
@@ -93,6 +98,7 @@ class TestStates:
     def test_the_lifecycle_states(self):
         assert {s.value for s in ProposalState} == {
             'proposed', 'addressed', 'dry_run', 'refused', 'gated', 'superseded', 'reverted',
+            'dropped', 'unresolved',
         }
 
 
@@ -188,6 +194,155 @@ class TestRecordOutcome:
         assert await record_proposal(ledger, _proposal(), now=NOW, ttl_hours=168) is False
         stored = await ledger.get_by_identity(**_proposal().ledger_key())
         assert stored.state == 'addressed'
+
+
+
+def _adjudication(**overrides):
+    fields = {
+        'decision': 'drop',
+        'reason_code': 'not_same_lesson',
+        'reason': 'r',
+        'waivers': (('member_carries_correction_banner', MEMBERS[0]),),
+        'claim_suggestion': None,
+        'identity': 'i' * 64,
+        'context_key': 'k' * 64,
+        'resolved_model': 'gpt-x',
+        'input_tokens': 10,
+        'output_tokens': 5,
+        'cost_usd': 0.0073,
+        'latency_s': 5.4,
+        'shown': (ShownMember(id=MEMBERS[0], content_sha256='b' * 64, text='t'),),
+    }
+    fields.update(overrides)
+    return AdjudicationRecord(**fields)
+
+
+def _adjudicated_outcome():
+    """An outcome with every field the adjudicator flow adds set to a non-default."""
+    return _outcome(
+        ProposalState.DROPPED,
+        members_key='a' * 64,
+        kept_ids=MEMBERS[:1],
+        repaired={'member_not_found': ('m9',)},
+        effective_claim='c',
+        effective_category='procedural_knowledge',
+        reused_from=ProposalRef(topic=TOPIC, run_id='run-0'),
+        adjudication=_adjudication(),
+    )
+
+
+#: The thirteen outcome keys a row written before the adjudicator carries.
+_PRE_ADJUDICATOR_OUTCOME = {
+    'state': 'refused',
+    'acted_run_id': 'run-exec',
+    'acted_at': '2026-07-01T01:00:00+00:00',
+    'verdict': None,
+    'reason_codes': ['mixed_category'],
+    'predicate_version': None,
+    'canonical_id': None,
+    'canonical_minted': False,
+    'tagged_ids': [],
+    'tag_failure_ids': [],
+    'stripped_ids': [],
+    'gate_task_id': None,
+    'closure_codes': [],
+}
+
+
+def _corrupt(path, value):
+    """A to_payload() of the adjudicated outcome with one nested key set to *value*."""
+    def corrupted():
+        payload = _adjudicated_outcome().to_payload()
+        target = payload
+        for key in path[:-1]:
+            target = target[key]
+        target[path[-1]] = value
+        return payload
+    return corrupted
+
+
+class TestAdjudicatorFlowFields:
+    """What the adjudicator flow records on the row (PRD consolidation-adjudicator K6)."""
+
+    @pytest.mark.parametrize(
+        'outcome',
+        [_adjudicated_outcome(), _outcome(ProposalState.UNRESOLVED)],
+        ids=['dropped_with_every_field', 'unresolved_with_defaults'],
+    )
+    @pytest.mark.asyncio
+    async def test_every_new_field_round_trips(self, ledger, outcome):
+        record = await _seed(ledger)
+
+        assert await record_outcome(ledger, record, outcome) is True
+
+        stored = await ledger.get_by_identity(**_proposal().ledger_key())
+        assert stored.state == outcome.state.value
+        assert outcome_from_record(stored) == outcome
+
+    def test_a_row_written_before_the_adjudicator_decodes_with_defaults(self):
+        record = ReconLedgerRecord(
+            project_id=PROJECT_ID,
+            record_kind='consolidation_proposal',
+            flag_type=TOPIC,
+            run_id='run-old',
+            payload_json=json.dumps({
+                'member_ids': list(MEMBERS),
+                'category': 'procedural_knowledge',
+                'claim': 'c',
+                'rationale': 'r',
+                'seeded_from': None,
+                'outcome': _PRE_ADJUDICATOR_OUTCOME,
+            }),
+            state='refused',
+            created_at=NOW.isoformat(),
+        )
+
+        outcome = outcome_from_record(record)
+
+        assert outcome is not None
+        assert outcome.reason_codes == ('mixed_category',)
+        assert outcome.members_key is None
+        assert outcome.kept_ids == ()
+        assert dict(outcome.repaired) == {}
+        assert outcome.effective_claim is None
+        assert outcome.effective_category is None
+        assert outcome.reused_from is None
+        assert outcome.adjudication is None
+
+    @pytest.mark.parametrize(
+        ('corrupted', 'key'),
+        [
+            (_corrupt(('kept_ids',), 'abc'), 'kept_ids'),
+            (_corrupt(('repaired',), {'member_not_found': 'm9'}), 'repaired'),
+            (_corrupt(('reused_from',), {'topic': TOPIC}), 'reused_from'),
+            (_corrupt(('adjudication', 'shown'), [{'id': 'x'}]), 'shown'),
+            (_corrupt(('adjudication', 'input_tokens'), True), 'input_tokens'),
+        ],
+        ids=['kept_ids', 'repaired', 'reused_from', 'shown', 'input_tokens'],
+    )
+    def test_a_malformed_new_field_is_refused_loudly(self, corrupted, key):
+        with pytest.raises(ValueError, match=key):
+            ProposalOutcome.from_payload(corrupted())
+
+    def test_repaired_cannot_be_changed_through_the_callers_dict(self):
+        repaired = {'member_not_found': ('m9',)}
+        outcome = _outcome(ProposalState.REFUSED, repaired=repaired)
+
+        repaired['member_not_found'] = ('m8',)
+        repaired['member_different_topic'] = ('m7',)
+
+        assert dict(outcome.repaired) == {'member_not_found': ('m9',)}
+        with pytest.raises(TypeError):
+            outcome.repaired['x'] = ('y',)
+
+    def test_shown_text_is_capped(self):
+        assert SHOWN_TEXT_CHARS == 1500
+        with pytest.raises(ValueError):
+            ShownMember(id='m1', content_sha256='b' * 64, text='x' * (SHOWN_TEXT_CHARS + 1))
+
+        cut = ShownMember.cut('m1', 'b' * 64, 'x' * 5000)
+
+        assert len(cut.text) == SHOWN_TEXT_CHARS
 
 
 class TestExpiry:
