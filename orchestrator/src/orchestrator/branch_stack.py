@@ -15,8 +15,9 @@ The record is one git ref per stacked branch under
 :data:`STACK_BASE_REF_NAMESPACE`.  A ref is atomic, survives restarts, is
 shared by every worktree, and keeps a never-landed base reachable.
 
-The ledger's record lifetime (pruning a deleted branch's records) is the
-shared ``orchestrator/src/orchestrator/ref_ledger.py`` mechanics.
+The ledger's record lifetime (pruning a deleted branch's records, and
+carrying a record across a branch rename) is the shared
+``orchestrator/src/orchestrator/ref_ledger.py`` mechanics.
 
 Layering: this module sits BELOW ``orchestrator/src/orchestrator/git_ops.py``,
 which imports it, and above ``orchestrator/src/orchestrator/rebase_drops.py``,
@@ -40,6 +41,7 @@ from orchestrator.ref_ledger import (
     GitReadError,
     GitRunner,
     git_lines,
+    move_branch_records,
     prune_orphaned_records,
 )
 
@@ -104,6 +106,15 @@ class StackBaseLedger:
         """
         return await prune_orphaned_records(
             self.run, self.repo_root, STACK_BASE_REF_NAMESPACE, branch_of=lambda key: key,
+        )
+
+    async def move_branch(self, old_branch: str, new_branch: str) -> None:
+        """Re-key *old_branch*'s record to *new_branch*, which it was renamed to.
+
+        A failed git command is logged, not raised.
+        """
+        await move_branch_records(
+            self.run, self.repo_root, self.ref_for(old_branch), self.ref_for(new_branch),
         )
 
 

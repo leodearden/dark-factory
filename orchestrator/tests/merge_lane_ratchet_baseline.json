@@ -74,7 +74,7 @@
     "complete": true
   },
   "files": {
-    "orchestrator/src/orchestrator/git_ops.py": {"cognitive": 1538, "function_local_imports": 4, "lines": 16925, "prose_lines": 9591, "reexport_names": 1},
+    "orchestrator/src/orchestrator/git_ops.py": {"cognitive": 1538, "function_local_imports": 4, "lines": 16925, "prose_lines": 9590, "reexport_names": 1},
     "orchestrator/src/orchestrator/lane_lifecycle.py": {"cognitive": 58, "function_local_imports": 1, "lines": 868, "prose_lines": 360, "reexport_names": 0},
     "orchestrator/src/orchestrator/merge_lane/__init__.py": {"cognitive": 1, "function_local_imports": 0, "lines": 205, "prose_lines": 22, "reexport_names": 0},
     "orchestrator/src/orchestrator/merge_lane/chain_reservation.py": {"cognitive": 24, "function_local_imports": 0, "lines": 167, "prose_lines": 19, "reexport_names": 0},

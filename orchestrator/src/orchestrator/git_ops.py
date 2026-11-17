@@ -16753,9 +16753,9 @@ class GitOps:
         await self._carry_branch_records(f'{prefix}{branch_name}', f'{prefix}{parked_name}')
 
     async def _carry_branch_records(self, full_old: str, full_new: str) -> None:
-        """Re-key the commits a rebase dropped from *full_old*, just renamed to
-        *full_new*, so they stay with the work that wrote them and a branch
-        re-cut under the old name starts with none."""
+        """Re-key *full_old*'s stack-base and rebase-drop records to *full_new*,
+        its new name, so a branch re-cut under the old name starts with none."""
+        await self._stack_ledger().move_branch(full_old, full_new)
         await RebaseDropLedger(self.project_root, _run).move_branch(full_old, full_new)
 
     async def _free_lane_checkout(self, branch_name: str) -> None:
