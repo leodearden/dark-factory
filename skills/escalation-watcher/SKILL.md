@@ -1734,6 +1734,9 @@ pending L2 (also runnable across all queues via `scripts/member-chain-sweep.py`,
 
 - For each id in `.members`, locate the member **across the archive** (`find <queue-dir> -name
   '<member-id>.json'` — every ruled member is archived by definition), never just the live dir.
+- For a dark-factory item, `get_task_escalation_history(task_id=<subject task>,
+  project_root=<root>)` lists every record ever filed on the subject task, archived rulings
+  included — it answers for this server's queue only.
 - If the member's status is terminal, **read its `resolution` TEXT — status alone is useless**
   (both shapes below show `dismissed`):
   - substantive ruling text ⇒ this L2 is ANSWERED. Recover the ruling verbatim from the record
@@ -1763,10 +1766,13 @@ exists to spend a pin deliberately, not to clear an inconvenient error. None of 
 check: it stays REPORT-ONLY, and an **unmarked** record is still not proof that nothing relies on
 it — the marker is opt-in, so absence means "not declared", not "safe". Reading the record and its
 companions before proposing any disposition remains the protection. Note also who can WRITE the
-marker: `declare_pin` is operator/steward-only today — it is not in the rotation's allowed tools
+marker: `declare_pin` is held by the steward role
+(`orchestrator/src/orchestrator/agents/roles.py::STEWARD`) and by interactive sessions such as this
+one, and not by the escalation-watcher-auto rotation
 (`orchestrator/src/orchestrator/harness.py::_WATCHER_ALLOWED_TOOLS`) — so when this probe finds a
 likely pin that carries no `pin_declared_by`, the output is a REPORTED *candidate pin* naming what
-appears to rely on it, for a human to declare. esc-3105-3 itself is still in that state.
+appears to rely on it, for the human to ratify and declare. esc-3105-3 itself is still in that
+state.
 
 **Carve-out: mechanically actioning a ruling Leo has ALREADY made.** You do not need Leo's
 permission a second time to do the bookkeeping on a decision he has already made and that has
