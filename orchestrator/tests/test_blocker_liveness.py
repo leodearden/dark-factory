@@ -1,4 +1,4 @@
-"""Whether a lock blocker's holder is live: claimant heartbeat for holders, parks followed."""
+"""Whether a lock blocker's holder is live: in-flight slots and claimant heartbeat for holders, parks followed."""
 
 from __future__ import annotations
 
@@ -35,13 +35,16 @@ def _running(beat_secs_ago: float = 30) -> dict[str, Any]:
 def _world(
     tasks: Mapping[str, Mapping[str, Any]],
     blockers: Mapping[str, Sequence[Blocker]] | None = None,
+    in_flight: frozenset[str] | None = None,
 ) -> LockWorld:
+    """In production every lock holder has a slot, so *in_flight* defaults to every task."""
     table = dict(blockers or {})
     return LockWorld(
         tasks=tasks,
         blockers_of=lambda tid: tuple(table.get(tid, ())),
         now=NOW,
         claimant_ttl=TTL,
+        in_flight=frozenset(tasks) if in_flight is None else in_flight,
     )
 
 
@@ -54,29 +57,52 @@ def _parked(owner: str, module: str = 'hot/a.py') -> Blocker:
 
 
 class TestHeldBlocker:
-    def test_a_heartbeating_claimant_is_live(self) -> None:
-        assert non_live_holder(_held('H'), _world({'H': _running()})) is None
+    """A held lock's owner is judged against this process's in-flight slots."""
+
+    @pytest.mark.parametrize('record', [
+        _running(),
+        _task('pending'),
+        _task('pending', claimant='run-x', beat_secs_ago=900),
+        _task('blocked', claimant='run-x', beat_secs_ago=10),
+        _task('done'),
+        _task('cancelled'),
+    ], ids=[
+        'heartbeating', 'dispatched-not-yet-claimed', 'requeued-unwinding',
+        'blocked-on-its-way-out', 'done-before-release', 'cancelled-before-release',
+    ])
+    def test_an_in_flight_owner_with_progress_or_unwinding_is_live(
+        self, record: dict[str, Any],
+    ) -> None:
+        assert non_live_holder(_held('H'), _world({'H': record})) is None
+
+    def test_an_in_flight_owner_gone_from_the_task_read_is_live(self) -> None:
+        assert non_live_holder(_held('H'), _world({}, in_flight=frozenset({'H'}))) is None
 
     @pytest.mark.parametrize(('record', 'reason'), [
         (_running(beat_secs_ago=301), HolderState.NO_LIVE_CLAIMANT),
         (_task('in-progress', claimant=None, beat_secs_ago=10), HolderState.NO_LIVE_CLAIMANT),
         (_task('in-progress', claimant='run-x'), HolderState.NO_LIVE_CLAIMANT),
-        (_task('blocked', claimant='run-x', beat_secs_ago=10), HolderState.BLOCKED),
-        (_task('done', claimant='run-x', beat_secs_ago=10), HolderState.NOT_ACTIVE),
-        (_task('cancelled'), HolderState.NOT_ACTIVE),
-    ], ids=['stale-heartbeat', 'no-claimant', 'no-heartbeat', 'blocked', 'done', 'cancelled'])
-    def test_a_non_live_holder_names_its_blocker(
+        (_task('blocked', claimant='run-x', beat_secs_ago=301), HolderState.BLOCKED),
+        (_task('blocked'), HolderState.BLOCKED),
+    ], ids=[
+        'stale-heartbeat', 'no-claimant', 'no-heartbeat', 'blocked-stale-claimant',
+        'blocked-no-claimant',
+    ])
+    def test_an_in_flight_owner_without_a_live_claimant_names_its_blocker(
         self, record: dict[str, Any], reason: HolderState,
     ) -> None:
         blocker = _held('H')
 
         assert non_live_holder(blocker, _world({'H': record})) == NonLiveHolder(blocker, reason)
 
-    def test_a_holder_absent_from_the_task_read_is_not_active(self) -> None:
-        blocker = _held('gone')
+    @pytest.mark.parametrize('tasks', [{'H': _running()}, {}], ids=['heartbeating', 'absent'])
+    def test_an_owner_with_no_slot_holds_a_lock_without_a_slot(
+        self, tasks: dict[str, Mapping[str, Any]],
+    ) -> None:
+        blocker = _held('H')
 
-        assert non_live_holder(blocker, _world({})) == NonLiveHolder(
-            blocker, HolderState.NOT_ACTIVE,
+        assert non_live_holder(blocker, _world(tasks, in_flight=frozenset())) == NonLiveHolder(
+            blocker, HolderState.LOCK_WITHOUT_SLOT,
         )
 
 

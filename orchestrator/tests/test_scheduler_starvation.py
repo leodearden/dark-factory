@@ -90,14 +90,17 @@ class _Rig:
                 task['claimant_run_id'] = f'run-{tid}'
                 task['heartbeat_at'] = self.wall[0].isoformat()
 
-    async def tick(self) -> TaskAssignment | None:
+    async def tick(self, *, claim: bool = True) -> TaskAssignment | None:
+        """One scheduler tick; *claim* False leaves a dispatched task pending and unclaimed."""
         self._heartbeat()
         assignment = await self.scheduler.acquire_next()
-        if assignment is not None:
-            for task in self.tasks:
-                if str(task['id']) == assignment.task_id:
-                    task['status'] = 'in-progress'
+        if assignment is not None and claim:
+            self.claim(assignment.task_id)
         return assignment
+
+    def claim(self, task_id: str) -> None:
+        """The dispatched workflow's in-progress claim; only a live holder then heartbeats."""
+        self.set_status(task_id, 'in-progress')
 
     async def tick_id(self) -> str | None:
         assignment = await self.tick()
@@ -1050,3 +1053,50 @@ async def test_a_holder_that_stops_heartbeating_files_one_cap_l1(tmp_path: Path)
     for text in (cap_l1.summary, cap_l1.detail):
         assert 'task 0' in text
         assert 'no_live_claimant' in text
+
+
+async def _capped_behind_a_live_holder(rig: _Rig) -> EscalationQueue:
+    """The live seed caps the cohort without an L1; S4 waits on its hot/d.py and on hot/x.py."""
+    rig.live_holders.add('0')
+    queue = await _three_starve_behind_a_cap_of_two(
+        rig, _task('S4', 'medium', 'hot/d.py', 'hot/x.py'),
+    )
+    rig.advance(FLOOR)
+    await rig.tick_with_low_winner()
+    [capped] = rig.detected('S4')
+    assert capped['disposition'] == 'cap_reached'
+    assert queue.get_by_task(AUTO_PIN_CAP_SENTINEL) == []
+    return queue
+
+
+@pytest.mark.asyncio
+async def test_a_holder_dispatched_but_not_yet_claimed_files_no_cap_l1(tmp_path: Path) -> None:
+    rig = _rig(tmp_path, **CAP_OF_TWO)
+    queue = await _capped_behind_a_live_holder(rig)
+
+    rig.tasks.append(_task('D', 'low', 'hot/x.py'))
+    dispatched = await rig.tick(claim=False)
+    assert dispatched is not None
+    assert dispatched.task_id == 'D'
+    await rig.tick()
+
+    assert queue.get_by_task(AUTO_PIN_CAP_SENTINEL) == []
+
+    rig.claim('D')
+    await rig.tick()
+
+    [cap_l1] = _open_cap_l1s(queue)
+    assert 'task D' in cap_l1.detail
+    assert 'no_live_claimant' in cap_l1.detail
+
+
+@pytest.mark.asyncio
+async def test_a_finished_holder_still_holding_its_locks_files_no_cap_l1(tmp_path: Path) -> None:
+    rig = _rig(tmp_path, **CAP_OF_TWO)
+    queue = await _capped_behind_a_live_holder(rig)
+
+    rig.set_status('0', 'done')
+    await rig.tick()
+    await rig.tick()
+
+    assert queue.get_by_task(AUTO_PIN_CAP_SENTINEL) == []

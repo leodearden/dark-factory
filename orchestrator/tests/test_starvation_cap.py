@@ -58,13 +58,16 @@ def _held(module: str, owner: str) -> Blocker:
 
 
 def _world(
-    tasks: Mapping[str, Mapping[str, Any]], blockers: Mapping[str, Sequence[Blocker]],
+    tasks: Mapping[str, Mapping[str, Any]],
+    blockers: Mapping[str, Sequence[Blocker]],
+    in_flight: frozenset[str] | None = None,
 ) -> LockWorld:
     return LockWorld(
         tasks=tasks,
         blockers_of=lambda tid: tuple(blockers.get(tid, ())),
         now=NOW,
         claimant_ttl=TTL,
+        in_flight=frozenset(tasks) if in_flight is None else in_flight,
     )
 
 
@@ -170,6 +173,22 @@ class TestCapReport:
 
         assert not report.unexplained
         assert not report.alarming
+
+    def test_a_holder_dispatched_but_not_yet_claimed_is_live_only_while_in_flight(self) -> None:
+        waiting = {'S3': REFUSED}
+        blockers = {'S3': [_held('hot/d.py', 'D')]}
+        tasks = {'S3': _pending(), 'D': _pending()}
+
+        claiming = cap_report(waiting, _world(tasks, blockers), CAP, locks_held=True)
+        slotless = cap_report(
+            waiting, _world(tasks, blockers, in_flight=frozenset()), CAP, locks_held=True,
+        )
+
+        assert claiming.wedges == ()
+        assert not claiming.alarming
+        assert [w.holder for w in slotless.wedges] == [
+            NonLiveHolder(blockers['S3'][0], HolderState.LOCK_WITHOUT_SLOT),
+        ]
 
     def test_an_empty_cohort_is_not_alarming(self) -> None:
         report = _report({}, {}, {})
