@@ -9,14 +9,24 @@ Every repository here is real git; nothing in the ancestry path is mocked.
 from __future__ import annotations
 
 import subprocess
+from collections.abc import Iterator
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 from _git_fixtures import seed_repo
-from _orch_helpers import assert_isolated_git_repo, git_env_with_ceiling
+from _orch_helpers import (
+    assert_isolated_git_repo,
+    git_env_with_ceiling,
+    wire_clear_claim_then_set_status,
+    wire_live_status_from_get_task,
+    wire_scheduler_liveness_mock,
+)
 
 from orchestrator.config import GitConfig
 from orchestrator.git_ops import GitOps
+from orchestrator.harness import Harness
+from orchestrator.merge_lane.landed_outbox import MergeProvenance
 from orchestrator.merge_lane.landing_evidence import branch_tip_landed
 
 
@@ -162,3 +172,92 @@ class TestBranchTipLanded:
         repo.git('checkout', 'main')
 
         assert await branch_tip_landed(git_ops, 'task/704', tip, landing_sha='0' * 40) is False
+
+
+# ---------------------------------------------------------------------------
+# The reconcile sweep over real git.  Only the warm-lane script is stubbed: it
+# answers `degenerate`, the verdict both copies of
+# warm-lane-degenerate-ref-check.sh give an uncited landed tip.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _unbound_merge_provenance() -> Iterator[None]:
+    """No landed-outbox journal row leaks in: the sweep must decide from git alone."""
+    with patch.object(MergeProvenance, '_outbox', None):
+        yield
+
+
+@pytest.fixture
+def scheduler_double() -> MagicMock:
+    scheduler = MagicMock()
+    wire_scheduler_liveness_mock(scheduler)
+    wire_clear_claim_then_set_status(scheduler)
+    wire_live_status_from_get_task(scheduler)
+    scheduler.get_statuses = AsyncMock(return_value=({}, None))
+    scheduler.get_task = AsyncMock(return_value=None)
+    scheduler.set_task_status = AsyncMock()
+
+    async def _fake_mark_done(tid, *, kind, sha, note=None):
+        provenance = {'kind': kind, 'commit': sha}
+        if note is not None:
+            provenance['note'] = note
+        await scheduler.set_task_status(tid, 'done', done_provenance=provenance)
+
+    scheduler.mark_done = AsyncMock(side_effect=_fake_mark_done)
+    return scheduler
+
+
+@pytest.fixture
+def harness(
+    tmp_path: Path, repo: _Repo, mock_orch_config: MagicMock, scheduler_double: MagicMock,
+) -> Harness:
+    mock_orch_config.project_root = repo.root
+    with patch('orchestrator.harness.McpLifecycle'), \
+         patch('orchestrator.harness.Scheduler'), \
+         patch('orchestrator.harness.BriefingAssembler'):
+        h = Harness(mock_orch_config)
+    h.config.convert_to_blocked_enforce = False
+    h.scheduler = scheduler_double
+    h.git_ops.worktree_base = (tmp_path / '.worktrees').resolve()
+    h.git_ops.warm_lane_ref_is_degenerate = AsyncMock(return_value=True)
+    return h
+
+
+async def run_mid_run_sweep(harness: Harness) -> None:
+    """The file's one coupling to the sweep's private driver."""
+    await harness._reconcile_stranded_in_progress(mid_run=True)
+
+
+def stage_in_progress(scheduler: MagicMock, tid: str, metadata: dict[str, str]) -> None:
+    scheduler.get_statuses = AsyncMock(return_value=({tid: 'in-progress'}, None))
+    scheduler.get_task = AsyncMock(
+        return_value={'status': 'in-progress', 'metadata': metadata},
+    )
+
+
+@pytest.mark.asyncio
+class TestReconcileSweepOverUncitedLandedTip:
+    async def test_landed_branch_with_uncited_tip_is_marked_done_not_reverted(
+        self, repo: _Repo, harness: Harness, scheduler_double: MagicMock,
+    ) -> None:
+        fork_point, _, landing = land_uncited_tip(repo, '701')
+        stage_in_progress(scheduler_double, '701', {'branch_base_sha': fork_point})
+
+        await run_mid_run_sweep(harness)
+
+        scheduler_double.mark_done.assert_awaited_once()
+        assert scheduler_double.mark_done.await_args.kwargs['kind'] == 'found_on_main'
+        assert scheduler_double.mark_done.await_args.kwargs['sha'] == landing
+        assert call('701', 'pending') not in scheduler_double.set_task_status.await_args_list
+
+    async def test_foreign_degenerate_tip_still_reverts(
+        self, repo: _Repo, harness: Harness, scheduler_double: MagicMock,
+    ) -> None:
+        land_then_reseed_foreign_tip(repo, '702')
+        stage_in_progress(scheduler_double, '702', {})
+
+        await run_mid_run_sweep(harness)
+
+        scheduler_double.set_task_status.assert_any_await('702', 'pending')
+        scheduler_double.mark_done.assert_not_awaited()
