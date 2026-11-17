@@ -12,7 +12,7 @@ import contextlib
 import json
 import logging
 import os
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -1016,44 +1016,51 @@ class TestReserveServed:
         assert raised.value.reserved_account == RESERVE
 
 
-class TodaysGateDouble:
-    """A hand-written gate double whose invoke_slot knows nothing of work_class."""
-
-    account_count = 1
-    soonest_resets_at = None
-
-    def __init__(self) -> None:
-        self.calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
-        self.slot = MagicMock()
-        self.slot.account_name = 'double'
-        self.slot.token = None
-        self.slot.detect_cap_hit = MagicMock(return_value=False)
-
-    def invoke_slot(self, *args: object, **kwargs: object):
-        self.calls.append((args, kwargs))
-        return self._invoke_slot(*args, **kwargs)
-
-    @contextlib.asynccontextmanager
-    async def _invoke_slot(self, scope=None, *, park=True, max_wait_secs=None):
-        yield self.slot
+def double_slot() -> MagicMock:
+    slot = MagicMock()
+    slot.account_name = 'double'
+    slot.token = None
+    slot.detect_cap_hit = MagicMock(return_value=False)
+    return slot
 
 
-class ReserveAwareGateDouble(TodaysGateDouble):
-    @contextlib.asynccontextmanager
-    async def _invoke_slot(
-        self, scope=None, *, park=True, max_wait_secs=None, work_class=None
-    ):
-        yield self.slot
+@contextlib.asynccontextmanager
+async def todays_invoke_slot(
+    scope: str | None = None, *, park: bool = True, max_wait_secs: float | None = None
+) -> AsyncIterator[MagicMock]:
+    yield double_slot()
+
+
+@contextlib.asynccontextmanager
+async def reserve_aware_invoke_slot(
+    scope: str | None = None,
+    *,
+    park: bool = True,
+    max_wait_secs: float | None = None,
+    work_class: WorkClassSource | None = None,
+) -> AsyncIterator[MagicMock]:
+    yield double_slot()
+
+
+def gate_double(
+    invoke_slot: Callable[..., contextlib.AbstractAsyncContextManager[MagicMock]],
+) -> MagicMock:
+    """A gate whose invoke_slot keeps `invoke_slot`'s signature, so a stray keyword raises."""
+    double = MagicMock(spec=UsageGate)
+    double.account_count = 1
+    double.soonest_resets_at = None
+    double.invoke_slot = MagicMock(side_effect=invoke_slot)
+    return double
 
 
 class TestTheKeywordIsForwardedOnlyWhenGiven:
     """B1 (call shape): a caller passing no class calls invoke_slot exactly as today."""
 
     async def test_without_a_class_the_double_is_called_as_today(self) -> None:
-        double = TodaysGateDouble()
+        double = gate_double(todays_invoke_slot)
 
         result = await invoke_with_cap_retry(
-            double,  # type: ignore[arg-type]
+            double,
             'L',
             prompt='p',
             model='m',
@@ -1061,15 +1068,15 @@ class TestTheKeywordIsForwardedOnlyWhenGiven:
         )
 
         assert result.success
-        [(args, kwargs)] = double.calls
-        assert args == ()
-        assert set(kwargs) == {'scope', 'park', 'max_wait_secs'}
+        double.invoke_slot.assert_called_once()
+        assert double.invoke_slot.call_args.args == ()
+        assert set(double.invoke_slot.call_args.kwargs) == {'scope', 'park', 'max_wait_secs'}
 
     async def test_a_given_class_reaches_invoke_slot_as_the_same_object(self) -> None:
-        double = ReserveAwareGateDouble()
+        double = gate_double(reserve_aware_invoke_slot)
 
         await invoke_with_cap_retry(
-            double,  # type: ignore[arg-type]
+            double,
             'L',
             prompt='p',
             model='m',
@@ -1077,8 +1084,7 @@ class TestTheKeywordIsForwardedOnlyWhenGiven:
             invoke_fn=scripted_invoke(ok_result()),
         )
 
-        [(_, kwargs)] = double.calls
-        assert kwargs['work_class'] is HIGH
+        assert double.invoke_slot.call_args.kwargs['work_class'] is HIGH
 
 
 class TestGateMock:
