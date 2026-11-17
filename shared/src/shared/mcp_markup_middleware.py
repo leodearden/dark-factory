@@ -584,14 +584,20 @@ def _caller_label(
 MARKUP_BOUNDARY_STORM_CATEGORY = 'mcp_markup_boundary_storm'
 
 #: Where an operator takes a recurrence of the envelope-markup leak: the live
-#: PRD, never DF 3083, which is done and closed to appends. Interpolated by
-#: this module's storm ERROR line and by the storm and residue text of
-#: fused-memory's markup_guard and markup_tripwire and orchestrator's
-#: markup_sink. The escalation server's filers still keep their own copy
-#: (task 6732).
+#: PRD, never DF 3083, which is done and closed to appends.
 MARKUP_RECURRENCE_ROUTING = (
     'report the recurrence against plans/toolcall-markup-containment-prd.md '
     '(DF 3083 is done and closed to appends, so not against 3083)'
+)
+
+#: All a ``MARKUP_UNRECOVERED_PARAM_ERROR_TYPE`` residue record can say about
+#: its call's outcome. :meth:`MarkupGuardMiddleware._handle_markup` files the
+#: dropped slice BEFORE it forwards the call, so no sink can know whether the
+#: call then succeeded.
+MARKUP_UNRECOVERED_PARAM_OUTCOME_CAVEAT = (
+    'This record was filed BEFORE the call ran, so whether the call then '
+    'succeeded is not known here; if it did, whatever it stored is missing '
+    'this value.'
 )
 
 #: Surfaced on the FORWARDED call, whose caller is NOT bounced and would
@@ -1488,7 +1494,7 @@ class MarkupGuardMiddleware(Middleware):
             residue_id = await self._file_residue_escalation({
                 # A DISTINCT error_type from the refusal's, because the two
                 # differ in the one way that matters to whoever reads the queue:
-                # this call SUCCEEDED, lossily, and no caller was bounced — so
+                # this call is FORWARDED, lossily, and no caller is bounced — so
                 # nobody is waiting on a retry, and nobody was told.
                 'error_type': MARKUP_UNRECOVERED_PARAM_ERROR_TYPE,
                 'category': _ESCALATION_CATEGORY,
