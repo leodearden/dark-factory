@@ -509,12 +509,14 @@ _ESCALATION_BOUNDARY_NO_ACTION = (
 # stage prompts and requires every such example to carry `run_id=`).
 _GATE_CLOSURE_ARCHIVE_GUIDANCE = """\
 ### Deterministic-gate closure is established from the TASK RECORD
-Scope: a `done` task with `task_kind='deterministic'`, `metadata.gate_escalated_at` \
-set, and a `done_provenance.kind` of `deterministic-gate` or `deterministic-milestone`.
+Scope: a `done` task with `task_kind='deterministic'` and a `done_provenance.kind` of \
+`deterministic-gate` or `deterministic-milestone`.
 
 Call `mcp__fused-memory__get_task(task_id)` — a READ you do hold. `status == 'done'` \
-PLUS `metadata.gate_escalated_at` set PLUS one of those `done_provenance.kind` values \
-IS LEGITIMATE CLOSURE on its own; this rule is primary and sufficient. Do not flag such \
+PLUS `task_kind='deterministic'` PLUS one of those `done_provenance.kind` values IS \
+LEGITIMATE CLOSURE on its own; this rule is primary and sufficient. Since task 3638 \
+`metadata.gate_escalated_at` is removed when a gate closes; older closures may still \
+carry it, and its presence or absence changes nothing here. Do not flag such \
 a task, do not file remediation work against it, and do not write a memory asserting a \
 missing escalation record. An archive-inclusive `get_task_escalations` lookup that would \
 confirm the record directly does exist, but only on the ORCHESTRATOR-side escalation \
@@ -803,12 +805,12 @@ def render_finding_provenance_section(*, can_file_tasks: bool) -> str:
         + capability_clause
     )
 
-# Shared guidance about the memory_ids=[] + stores=['graphiti'] → graphiti_writes_queued
+# Shared guidance about the memory_ids=[] + stores_queued=['graphiti'] → graphiti_writes_queued
 # invariant.  Both stages need to teach the LLM not to count async-enqueued Graphiti
 # writes under their `memories_*` stats; only the stat-key tokens differ between stages.
 _GRAPHITI_QUEUED_GUIDANCE_TEMPLATE = (
-    "Graphiti-only async-enqueued writes show `stores: ['graphiti']` in the response but "
-    "return `memory_ids: []` because the write is queued rather than persisted inline. These "
+    "Graphiti-only async-enqueued writes show `stores_queued: ['graphiti']` in the response "
+    "and return `memory_ids: []` because the write is queued rather than persisted inline. These "
     "must NOT be counted under {stat_keys_phrase}. Report them instead under "
     "a separate `graphiti_writes_queued` stat. The stats verifier enforces this split "
     "independently and will override any inflated {primary_stat_key} count, but you should "

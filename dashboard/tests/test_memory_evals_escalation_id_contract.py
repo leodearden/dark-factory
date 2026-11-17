@@ -547,9 +547,9 @@ def test_the_id_space_check_scopes_by_queue(tmp_path: Path) -> None:
 # The three reach paths, and WHY it takes two trees to exercise them.
 #
 # MEASURED against the real producer, not assumed: a TRIGGERED storm escape
-# suppresses every per-metric link program-wide.  `_build_eval` only consults
-# the escalation index when `storm is None`; otherwise the fingerprint goes to
-# `storm_suppressed` and the row renders `parity='storm_collapsed'` with
+# suppresses every per-metric link program-wide.  `memory_evals.py::_join_escalation`
+# links a row only when `storm is None`; otherwise the fingerprint goes to
+# `_RowClaims.suppressed` and the row renders `parity='storm_collapsed'` with
 # `escalation: None`.  So `evals[i].metrics[j].escalation` and
 # `storm_escape.escalation` can never BOTH be populated in one payload — they
 # are alternatives by design, since the storm exists precisely to collapse the

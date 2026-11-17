@@ -364,7 +364,7 @@ async def _bounded(coro: Awaitable[Any], *, label: str) -> _HalfRead[Any]:
             None, SnapshotFailure.BUDGET,
             f'{label} read exceeded its {PER_CALL_TIMEOUT}s budget',
         )
-    except Exception as exc:  # noqa: BLE001 — a failed half degrades, never raises
+    except Exception as exc:  # a failed half degrades, never raises
         return _HalfRead(
             None, SnapshotFailure.UNREACHABLE,
             f'{label} read raised {type(exc).__name__}: {exc}',

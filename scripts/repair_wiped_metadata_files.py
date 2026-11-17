@@ -567,7 +567,7 @@ async def repair_one(
                 "metadata_mode": "merge",
             },
         )
-    except Exception as exc:  # noqa: BLE001 — a per-task failure, never fatal
+    except Exception as exc:  # a per-task failure, never fatal
         return RepairOutcome(
             task_id=candidate.task_id,
             tag=candidate.tag,
@@ -773,7 +773,7 @@ async def repair_project(
                     "project_root": project_root,
                 },
             )
-        except Exception as exc:  # noqa: BLE001 — transport-only, by construction; see below
+        except Exception as exc:  # transport-only, by construction; see below
             # This arm can ONLY be client-side/transport. The fused-memory
             # tool layer never raises across the wire — @mcp_tool_errors
             # (fused-memory/src/fused_memory/server/tool_errors.py:44-59)

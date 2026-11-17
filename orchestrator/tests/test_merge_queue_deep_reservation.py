@@ -373,27 +373,37 @@ def _hang_then(release: asyncio.Event, entered: asyncio.Event, then: VerifyScrip
 class TestEAChainRoundThatDoesNotAdoptReleasesItsLinks:
     """E: a tip that fails, raises or is abandoned only releases the reservation.
 
-    No outcome is rendered for a link by that round: each link later lands on
-    its own, verified on its own, and nothing is blocked.
+    No outcome is rendered for a link by that round, and nothing is blocked.
+    A requeued S goes behind F2. Once H and P have landed, F1 is merged on
+    main and, alone in the verify frontier, re-chains the rest that may be
+    chained (PRD D5). A member of a red tip's chain may not be, nor the owner
+    of a tip that raised, until it has verified alone (task 10617).
     """
 
-    async def _assert_links_go_their_own_way(
-        self, scene: _Scene, rnd: _Round, *, s_status: str = 'done',
+    async def _assert_released_links_land_by_a_later_round(
+        self, scene: _Scene, rnd: _Round, *,
+        rechained: tuple[str, ...], alone: tuple[str, ...] = (),
     ) -> None:
+        """F1's round lands *rechained* (F1 first); then each of *alone* lands
+        on a round of its own."""
         reqs = rnd.reqs
         await _until(lambda: _reservations(rnd.lane) == [], label='the reservation released')
         for name in ('F1', 'F2'):
             assert not reqs[name].result.done(), name
         await rnd.land_head_and_p()
-        names = ('F1', 'F2') if s_status != 'done' else ('S', 'F1', 'F2')
+        names = (*rechained, *alone)
         outcomes = await _outcomes(rnd, names)
         assert {n: o.status for n, o in outcomes.items()} == dict.fromkeys(names, 'done')
-        assert {n: o.landed_via_chain for n, o in outcomes.items()} == dict.fromkeys(names)
-        for name in ('F1', 'F2'):
-            own = [e for e in _verify_events_for(scene, {name}) if e['data'].get('chain_items') == 1]
-            assert own, f'{name} was never verified on its own'
-        landed = await _landed_task_files(scene)
-        assert (landed[:2], sorted(landed[2:])) == (['H', 'P'], sorted(names))
+        via_chain = 1 if len(rechained) > 1 else None
+        assert {n: o.landed_via_chain for n, o in outcomes.items()} == {
+            **dict.fromkeys(rechained, via_chain), **dict.fromkeys(alone, None),
+        }
+        rechain = [
+            (e['data']['chain_items'], e['data']['speculative'])
+            for e in _verify_events_for(scene, {'F1'})
+        ]
+        assert rechain == [(len(rechained), False)]
+        assert await _landed_task_files(scene) == ['H', 'P', *names]
         assert _reservations(rnd.lane) == []
         assert rnd.lane.speculation_accounting_violations() == []
 
@@ -406,7 +416,9 @@ class TestEAChainRoundThatDoesNotAdoptReleasesItsLinks:
         async with _deep_round(scene, ('F1', 'F2'), s_script=red) as rnd:
             await wait_responsive(s_entered.wait(), label="S's tip verify under way")
             release_s.set()
-            await self._assert_links_go_their_own_way(scene, rnd)
+            await self._assert_released_links_land_by_a_later_round(
+                scene, rnd, rechained=('F1',), alone=('F2', 'S'),
+            )
 
     async def test_a_raised_tip_releases_the_links(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
@@ -417,7 +429,9 @@ class TestEAChainRoundThatDoesNotAdoptReleasesItsLinks:
         async with _deep_round(scene, ('F1', 'F2'), s_script=boom) as rnd:
             await wait_responsive(s_entered.wait(), label="S's tip verify under way")
             release_s.set()
-            await self._assert_links_go_their_own_way(scene, rnd)
+            await self._assert_released_links_land_by_a_later_round(
+                scene, rnd, rechained=('F1', 'F2'), alone=('S',),
+            )
 
     async def test_an_abandoned_round_releases_the_links(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
@@ -429,7 +443,9 @@ class TestEAChainRoundThatDoesNotAdoptReleasesItsLinks:
         ) as rnd:
             await wait_responsive(s_entered.wait(), label="S's tip verify under way")
             rnd.reqs['S'].result.cancel()
-            await self._assert_links_go_their_own_way(scene, rnd, s_status='abandoned')
+            await self._assert_released_links_land_by_a_later_round(
+                scene, rnd, rechained=('F1', 'F2'),
+            )
 
 
 async def _tip_passed_and_landed_its_head(
@@ -458,7 +474,9 @@ class TestEAPassedTipTornDownByTheCascadeReleasesItsLinks:
     own finalize, ends its reservation; the old tip never reaches main.
 
     Once released, a link may be chained again by a later round of its own,
-    so how F1 and F2 land is not pinned; that each lands once is.
+    so how F1 and F2 land is not pinned; that each lands once is. S itself,
+    requeued behind the landed H, dispatches alone in the verify frontier and
+    chains again (PRD D5).
     """
 
     async def test_an_abandoned_p_cascades_over_the_passed_tip(
@@ -480,7 +498,7 @@ class TestEAPassedTipTornDownByTheCascadeReleasesItsLinks:
             rnd.release_p.set()
             outcomes = await _outcomes(rnd, ('S', 'F1', 'F2'))
             assert {n: o.status for n, o in outcomes.items()} == dict.fromkeys(outcomes, 'done')
-            assert outcomes['S'].landed_via_chain is None
+            assert outcomes['S'].landed_via_chain == 1
             landed = await _landed_task_files(scene)
             assert (landed[:1], sorted(landed[1:])) == (['H'], ['F1', 'F2', 'S'])
             assert not await _reaches_main(scene, old_tip)
@@ -929,9 +947,105 @@ class TestDTheLookAheadWaitsForTheChainDecision:
         assert all(reqs[name].result.done() for name in ('H', 'S', 'S1'))
 
 
+class TestFTheHeadChainsWhenAloneInTheFrontier:
+    """F: boundary row 9 of ``plans/merge-lane-policy-prd.md`` (D5).
+
+    A head with nothing else in the verify frontier chains the followers
+    buffered behind it, and the merger holds its look-ahead for that decision.
+    """
+
+    async def test_a_head_alone_chains_the_followers_buffered_behind_it(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """speculation_depth 3 leaves permits free, so without the hold the
+        merger would take F1 before H's dispatch could chain it."""
+        scene = _scene(tmp_path, monkeypatch, merge_deep=_deep())
+        reqs = await _requests(scene, 'H', 'F1', 'F2')
+        h_entered, release_h = asyncio.Event(), asyncio.Event()
+        verifier = _FirstVerifyScripted({'H': hangs_until(release_h, entered=h_entered)})
+        async with _running(scene, verifier=verifier, remotes=[], speculation_depth=3) as run:
+            run.put(reqs['H'], reqs['F1'], reqs['F2'])
+            await wait_responsive(
+                h_entered.wait(), timeout=MERGE_GATE_BARRIER_TIMEOUT,
+                label="H's tip verify under way on local",
+            )
+            rows = [(r['owner_task_id'], r['link_task_ids']) for r in _reservations(run.lane)]
+            assert rows == [('H', ['F1', 'F2'])]
+            assert run.lane.unfrozen_suffix() == (reqs['F1'].request_id, reqs['F2'].request_id)
+
+            release_h.set()
+            outcomes = {
+                name: await wait_responsive(reqs[name].result, label=f'{name} outcome')
+                for name in ('H', 'F1', 'F2')
+            }
+            assert {n: o.status for n, o in outcomes.items()} == dict.fromkeys(outcomes, 'done')
+            assert [outcomes[n].landed_via_chain for n in ('H', 'F1', 'F2')] == [1, 1, 1]
+            assert verifier.verified == ['H']
+            assert await _landed_task_files(scene) == ['H', 'F1', 'F2']
+            (h_verify,) = _verify_events_for(scene, {'H'})
+            assert (h_verify['data']['chain_items'], h_verify['data']['speculative']) == (3, False)
+            _assert_no_live_permit(run.lane)
+            assert _reservations(run.lane) == []
+
+
 async def _main_sha(scene: _Scene) -> str:
     _, sha, _ = await _run(['git', 'rev-parse', 'main'], cwd=scene.git_ops.project_root)
     return sha.strip()
+
+
+class TestGTheRebasedHeadChainsAheadOfItsReparkedSuccessor:
+    """G: PRD D3 with D5. The gate re-verify dispatches H's rebased commit alone
+    in the verify frontier, so it chains the followers buffered in the lane,
+    and S, re-parked behind it, re-anchors on the chain tip.
+
+    ``chain_snapshot()`` reads the lane buffers and not the redispatch park, so
+    the newer F1 and F2 land before S: every tree is sound, FIFO is not.
+    """
+
+    async def test_the_reparked_successor_lands_once_on_the_chain_tip(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """S, merged on H, waits for the one host, so the merger holds F1 and F2
+        in the lane; main moves while H verifies, and H's gate re-verifies."""
+        scene = _scene(tmp_path, monkeypatch, merge_deep=_deep())
+        reqs = await _requests(scene, 'H', 'S', 'F1', 'F2')
+        h_entered, release_h = asyncio.Event(), asyncio.Event()
+        verifier = _FirstVerifyScripted({'H': hangs_until(release_h, entered=h_entered)})
+        async with _running(scene, verifier=verifier, remotes=[], speculation_depth=3) as run:
+            run.put(reqs['H'])
+            await wait_responsive(
+                h_entered.wait(), timeout=MERGE_GATE_BARRIER_TIMEOUT,
+                label="H's verify under way on local",
+            )
+            run.put(reqs['S'], reqs['F1'], reqs['F2'])
+            await _until(
+                lambda: (
+                    lane_state(run.lane, reqs['S'].request_id) in _AWAITING_DISPATCH
+                    and run.lane.unfrozen_suffix() == (
+                        reqs['F1'].request_id, reqs['F2'].request_id,
+                    )
+                ),
+                label='S merged on H and waiting for the host, F1 and F2 buffered',
+            )
+
+            await _move_main_by_a_foreign_commit(scene)
+            release_h.set()
+            names = ('H', 'S', 'F1', 'F2')
+            outcomes = {
+                name: await wait_responsive(reqs[name].result, label=f'{name} outcome')
+                for name in names
+            }
+            assert {n: o.status for n, o in outcomes.items()} == dict.fromkeys(names, 'done')
+            assert _gate_decided_reverify(scene, 'H')
+            assert [
+                (e['data']['chain_items'], e['data']['speculative'])
+                for e in _verify_events_for(scene, {'H'})
+            ] == [(1, False), (3, False)]
+            assert [outcomes[n].landed_via_chain for n in ('F1', 'F2')] == [1, 1]
+            assert await _landed_task_files(scene) == ['H', 'F1', 'F2', 'S']
+            assert run.lane.two_layer_invariants(await _main_sha(scene)) == []
+            _assert_no_live_permit(run.lane)
+            assert _reservations(run.lane) == []
 
 
 class TestCAnItemBehindTheChainStacksOnTheChainTip:

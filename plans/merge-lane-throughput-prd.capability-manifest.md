@@ -456,3 +456,14 @@ baseline, and the overlapping-span contention rate. The residual risk is verify
 *duration*, which cannot block a merge.
 
 Revised DAG: **A → B → D1 → D2 → E → F → H**, with **A → G**.
+
+## C′ (`Cprime`) — verify_host_policy knob — task 5097
+
+C′ was stamped into the sidecar by b661148035 on 2026-09-04 with no section here, and is recorded alongside now, rendered from its sidecar block.
+
+| Capability | Binding | Verdict |
+|---|---|---|
+| `host-allocator-prefer-local-is-the-current-policy` | capability→producer (wired) — `orchestrator/src/orchestrator/verify_runner.py::HostAllocator.acquire` tried local first, then remote; no config knob existed (measured 2026-09-03). Pre-existing substrate; manual check. | PASS |
+| `verify-host-policy-config-field` | capability→producer — built by C′ as an `OrchestratorConfig` field defaulting to `prefer_local`; consumed by D1 (5053), which sets `prefer_remote` for dark_factory. grep `verify_host_policy` present in `orchestrator/src/orchestrator/config.py`. | PASS |
+| `host-allocator-consults-the-policy` | capability→producer — built by C′; `HostAllocator.acquire` reads the policy and tries the remote lease first under `prefer_remote`, falling back to local. grep `prefer_remote` present in `orchestrator/src/orchestrator/verify_runner.py`. | PASS |
+| `no-appendix-a-file-touched` | G4 — none of C′'s files is in `plans/merge-lane-quality-prd.md` Appendix A; γ3 (5026) is serialised behind C′ on `test_verify_runner.py` by a real dependency edge. Manual check at filing. | PASS |

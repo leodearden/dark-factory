@@ -7,7 +7,7 @@ from urllib.parse import urlsplit
 import pytest
 import yaml
 from fused_memory.config.schema import ReconciliationConfig
-from orchestrator.session_registry import normalize_escalations_dir
+from orchestrator.decision_registry import normalize_escalations_dir
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from sitting import ports
 

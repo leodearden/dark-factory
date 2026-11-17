@@ -21,7 +21,8 @@ from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # scripts/tests -> scripts -> repo root. Same idiom as
-# shared/tests/capability_manifest_corpus.py; correct inside a worktree too.
+# shared/tests/cross_suite_helpers/capability_manifest_corpus.py; correct
+# inside a worktree too.
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = REPO_ROOT / 'scripts' / 'check_method_param_wiring.py'
 MEM0_CLIENT = 'fused-memory/src/fused_memory/backends/mem0_client.py'
@@ -594,7 +595,7 @@ class TestManifestScriptCoherence:
     """A manifest naming a script that cannot be exec'd is ERRORED forever.
 
     Complements rather than duplicates the corpus guards in
-    `shared/tests/test_capability_manifest.py`: `TestCheckedInManifestCorpus`
+    `tests/repo_guards/test_checked_in_capability_manifests.py`: `TestCheckedInManifestCorpus`
     sweeps manifest SHAPE and `TestCheckedInScriptCheckTargets` sweeps script
     LIFECYCLE (exists + executable + committed 100755) for every checked-in
     `kind: script` capability; this class pins what only THIS capability's
@@ -608,7 +609,7 @@ class TestManifestScriptCoherence:
     `scripts/gc_agent_transcripts.py`, was committed at mode 100644 and had
     been ERRORing forever. Task 3649 (ticket `tkt_0RS3PJJZFSJRJERYB11FNNKF5W`,
     escalation `esc-3364-2`) fixed that mode and generalized the assertion into
-    `shared/tests/test_capability_manifest.py::TestCheckedInScriptCheckTargets`,
+    `tests/repo_guards/test_checked_in_capability_manifests.py::TestCheckedInScriptCheckTargets`,
     which now sweeps every checked-in `kind: script` capability for both the
     working-tree executable bit and the committed index mode — and pins
     `scripts/check_method_param_wiring.py` there BY NAME via its

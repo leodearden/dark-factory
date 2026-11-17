@@ -31,7 +31,6 @@ from _read_policy_logs import node_read_warnings
 from _rebuild_service_results import rebuild_service_result
 
 from fused_memory.backends.graphiti_client import (
-    _ACTIVE_EDGE_PREDICATE,
     INCOMPLETE_CENSUS_UNAVAILABLE,
     INCOMPLETE_SHORT_READ,
     INCOMPLETE_STRUCTURAL_KINDS,
@@ -42,6 +41,7 @@ from fused_memory.backends.graphiti_client import (
     StaleProbeResult,
     StaleSummaryResult,
 )
+from fused_memory.backends.relates_to_schema import ACTIVE_EDGE_PREDICATE
 from fused_memory.config.schema import FusedMemoryConfig
 
 #: The logger the service hands both stale probes, detect_stale_with_edges and
@@ -2571,10 +2571,10 @@ class _DualCorpusGraph:
 
 
 def _force_edge_read_structural(monkeypatch, **forced):
-    """Force _paged_ro_query kwargs for the EDGE read only (dispatch on the template)."""
+    """Force paged_ro_query kwargs for the EDGE read only (dispatch on the template)."""
     from fused_memory.backends import graphiti_client
 
-    real = graphiti_client._paged_ro_query
+    real = graphiti_client.paged_ro_query
 
     async def dispatching(*args, **kwargs):
         page_template = args[1] if len(args) > 1 else kwargs.get('page_template', '')
@@ -2582,7 +2582,7 @@ def _force_edge_read_structural(monkeypatch, **forced):
             kwargs = {**kwargs, **forced}
         return await real(*args, **kwargs)
 
-    monkeypatch.setattr(graphiti_client, '_paged_ro_query', dispatching)
+    monkeypatch.setattr(graphiti_client, 'paged_ro_query', dispatching)
 
 
 _STRUCTURAL_CASES = [
@@ -2699,9 +2699,9 @@ class TestBulkAndSingleRefreshShareTheEdgePopulation:
         bulk = [q for q in graph.queries if 'RELATES_TO' in q]
 
         graph.queries.clear()
-        # ...and the single-entity refresh.  _DualCorpusGraph's edge corpus is
-        # 4-column (bulk shape); get_valid_edges_for_node reads columns 0..2, so
-        # the rows are harmless here — the claim under test is the predicate.
+        # ...and the single-entity refresh, whose read has its own row shape:
+        # uuid, fact, name, valid_at, invalid_at.
+        graph.edge_rows = [['e1', 'Task 99 depends on Task 98', 'DEPENDS_ON', None, None]]
         await backend.refresh_entity_summary(
             'u1', group_id='test', name='Task 99', old_summary='stale'
         )
@@ -2710,7 +2710,7 @@ class TestBulkAndSingleRefreshShareTheEdgePopulation:
         assert bulk, 'no RELATES_TO read recorded for the bulk path'
         assert single, 'no RELATES_TO read recorded for the refresh path'
         for query in bulk + single:
-            assert _ACTIVE_EDGE_PREDICATE in query, query
+            assert ACTIVE_EDGE_PREDICATE in query, query
             assert 'expired_at' not in query, query  # restored edges stay (esc-4714-9)
 
 

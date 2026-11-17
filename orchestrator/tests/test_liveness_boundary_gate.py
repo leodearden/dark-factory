@@ -15,7 +15,7 @@ See shared/tests/test_liveness_boundary_gate.py for the shared-contract half
 (B1/B2/B4/B7 predicate and reader assertions).
 
 The gate uses REAL on-disk JSONL transcripts driven through REAL count_transcript_turns /
-_run_subprocess watchdog / predicates / orchestrator consumers — the genuine two-way
+run_cli_subprocess watchdog / predicates / orchestrator consumers — the genuine two-way
 integration that per-component unit tests (which mock one side of the seam) do not provide.
 """
 
@@ -34,10 +34,11 @@ import pytest
 from _orch_helpers import pydantic_spec
 from _workflow_helpers import fixed_prompt
 from shared.cli_invoke import (
-    _run_subprocess,
+    TranscriptWatch,
     count_transcript_turns,
     is_timed_out_with_progress,
     is_zero_output_timeout,
+    run_cli_subprocess,
 )
 from shared.config_dir import TaskConfigDir
 
@@ -256,7 +257,7 @@ def _make_hanging_proc():
     """
     call_count = [0]
 
-    async def communicate_side_effect(input=None):  # noqa: A002
+    async def communicate_side_effect(input=None):
         call_count[0] += 1
         if call_count[0] == 1:
             # Hang until the watchdog cancels comm_task — CancelledError is raised here.
@@ -337,7 +338,7 @@ class TestB2PreTurn1Wedge:
     """B2: a zero-turn wedge is killed fast at the grace bound AND trips the breaker.
 
     Two sub-tests (two-way seam):
-      (a) Watchdog fast kill: real _run_subprocess with 0-turn transcript → killed at grace.
+      (a) Watchdog fast kill: real run_cli_subprocess with 0-turn transcript → killed at grace.
       (b) Consumer: zero-output AgentResult → breaker trips → BLOCKED, no resume.
     """
 
@@ -352,7 +353,7 @@ class TestB2PreTurn1Wedge:
 
         Deliberately NOT asserted on outer wall-clock: under a saturated parallel
         (full-suite xdist) run the coroutine can be descheduled for seconds either
-        side of ``_run_subprocess``, so wall time is not a sound proxy for which
+        side of ``run_cli_subprocess``, so wall time is not a sound proxy for which
         kill path fired — same class as done tasks 1836/1851/2320/2840/2921/2959/
         3491. Observed under load: 6.98s wall for a kill the watchdog itself
         measured at 0.1s — correct behaviour reported red by scheduling noise
@@ -379,15 +380,10 @@ class TestB2PreTurn1Wedge:
             patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec),
             patch('shared.cli_invoke.terminate_process_group', terminate_pg_mock),
         ):
-            result = await _run_subprocess(
-                ['fake'],
-                cwd=tmp_path,
-                env={},
-                model='opus',
-                timeout_seconds=5.0,
-                startup_grace_secs=0.05,
-                session_id=sid,
-                config_dir=cfg_dir,
+            result = await run_cli_subprocess(
+                ['fake'], cwd=tmp_path, env={},
+                backend='claude', model='opus', timeout_seconds=5.0,
+                transcript=TranscriptWatch(session_id=sid, config_dir=cfg_dir, startup_grace_secs=0.05),
             )
 
         assert result.timed_out is True, 'Expected timed_out=True for startup wedge kill'
@@ -407,7 +403,7 @@ class TestB2PreTurn1Wedge:
         )
         # Quantitative half, measured inside the watchdog loop (cli_invoke.py's
         # `elapsed = time.monotonic() - watchdog_start`), so it excludes
-        # descheduling OUTSIDE `_run_subprocess` (before t0 / after the await)
+        # descheduling OUTSIDE `run_cli_subprocess` (before t0 / after the await)
         # — but NOT in-loop event-loop starvation, since `elapsed` is read
         # from inside the same coroutine that can itself be starved. The 2.0s
         # bound below is a load margin, not a tight assertion about the 0.05s
@@ -693,15 +689,10 @@ class TestB6LongSyncToolSurvives:
             patch('shared.cli_invoke.terminate_process_group', terminate_pg_mock),
         ):
             t0 = time.monotonic()
-            result = await _run_subprocess(
-                ['fake'],
-                cwd=tmp_path,
-                env={},
-                model='opus',
-                timeout_seconds=0.3,
-                startup_grace_secs=0.05,
-                session_id=sid,
-                config_dir=cfg_dir,
+            result = await run_cli_subprocess(
+                ['fake'], cwd=tmp_path, env={},
+                backend='claude', model='opus', timeout_seconds=0.3,
+                transcript=TranscriptWatch(session_id=sid, config_dir=cfg_dir, startup_grace_secs=0.05),
             )
             wall = time.monotonic() - t0
 
@@ -788,15 +779,10 @@ class TestB7UnreadableTranscriptConservative:
             patch('shared.cli_invoke.terminate_process_group', terminate_pg_mock),
         ):
             t0 = time.monotonic()
-            result = await _run_subprocess(
-                ['fake'],
-                cwd=tmp_path,
-                env={},
-                model='opus',
-                timeout_seconds=0.3,
-                startup_grace_secs=0.05,
-                session_id=sid,
-                config_dir=cfg_dir,
+            result = await run_cli_subprocess(
+                ['fake'], cwd=tmp_path, env={},
+                backend='claude', model='opus', timeout_seconds=0.3,
+                transcript=TranscriptWatch(session_id=sid, config_dir=cfg_dir, startup_grace_secs=0.05),
             )
             wall = time.monotonic() - t0
 

@@ -177,7 +177,7 @@ class _ScratchSpy:
         self.removed: list[tuple[Path, str]] = []
         self.find_calls = 0
 
-    async def find_inflight_merge_worktree(self, branch: str) -> Path | None:  # noqa: ARG002
+    async def find_inflight_merge_worktree(self, branch: str) -> Path | None:
         self.find_calls += 1
         return self._scratch
 
@@ -187,7 +187,7 @@ class _ScratchSpy:
             shutil.rmtree(path)
         return 'removed'
 
-    async def cleanup_merge_worktree(self, merge_wt: Path) -> None:  # noqa: ARG002
+    async def cleanup_merge_worktree(self, merge_wt: Path) -> None:
         return None
 
 

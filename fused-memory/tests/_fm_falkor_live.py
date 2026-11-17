@@ -194,8 +194,10 @@ async def await_index_operational(graph, timeout_s: float = 10.0) -> None:
     than hardcoded to its current position (7 of 9), so a FalkorDB column
     reorder fails loudly here instead of silently reading the wrong column and
     turning the barrier into a no-op. Resolution goes through
-    ``falkor_indices.resolve_header_positions``, the single home shared with
-    ``GraphitiBackend.list_indices``.
+    ``falkor_indices.resolve_header_positions``, the helper shared with
+    ``falkor_indices.index_records_from_rows``. The production barrier is
+    ``falkor_indices.await_index_catalog_settled``, which deliberately differs
+    on an empty catalog (see ``falkor_indices.unsettled_index_statuses``).
 
     Readiness is an **exact** match on ``'OPERATIONAL'`` for every row, never a
     substring test for ``'UNDER CONSTRUCTION'``: the live not-ready value

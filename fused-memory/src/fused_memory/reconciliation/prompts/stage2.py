@@ -1,6 +1,13 @@
 """System prompt for Stage 2: Task-Knowledge Sync."""
 
 from fused_memory.memory_metadata import render_metadata_vocabulary_guidance
+from fused_memory.middleware.task_text_write_guard import (
+    TASK_TEXT_FP_KEY,
+    TEXT_BASE_REQUIRED,
+    TEXT_BASE_STALE,
+    TEXT_VERIFIED_KEY,
+    TEXT_WRITE_UNCONFIRMED_FLAG_TYPE,
+)
 from fused_memory.reconciliation.audit_trail_rotation import (
     render_audit_trail_rotation_section,
 )
@@ -565,12 +572,33 @@ were extending the field destroyed the entire original description instead, with
 and no warning. To EXTEND a task's description (or title), do the same read-modify-write \
 as the RESHAPE case above: call `mcp__fused-memory__get_task(id=<task_id>, \
 project_root=<project_root>)` to read the FULL current text, concatenate your addition \
-locally, then write the COMPLETE new `description` with `append` OMITTED. If a write \
-genuinely means to REPLACE the field, omit `append` (or pass `append=False`) to confirm \
-it; if the `append=True` was meant for `metadata` or `details`, split it into a separate \
-`update_task` call. An `update_task` that supplies no field to write is likewise \
-REJECTED with a `TASKMASTER_TOOL_ERROR` (`error_type` `NoFieldsToUpdateError`, whose \
-message lists the writable fields) and writes nothing.
+locally, then write the COMPLETE new `description` with `append` OMITTED and \
+`expected_text_fp` set to that read's `{TASK_TEXT_FP_KEY}` (the compare-and-swap rule \
+below). If a write genuinely means to REPLACE the field, omit `append` (or pass \
+`append=False`) to confirm it; if the `append=True` was meant for `metadata` or \
+`details`, split it into a separate `update_task` call. An `update_task` that supplies \
+no field to write is likewise REJECTED with a `TASKMASTER_TOOL_ERROR` (`error_type` \
+`NoFieldsToUpdateError`, whose message lists the writable fields) and writes nothing.
+
+TASK-TEXT AMENDMENTS (compare-and-swap + readback). The server enforces both halves of \
+this rule on every `description`/`details` amendment you make:
+1. Immediately before composing the amendment, call \
+`mcp__fused-memory__get_task(id=<task_id>, project_root=<project_root>)` and compose \
+against THAT read's text — never a copy read earlier in the cycle.
+2. Pass `expected_text_fp` set to that response's `{TASK_TEXT_FP_KEY}`. A write that \
+replaces `description`, or `details`/`prompt` without `append=True`, is REJECTED without \
+it (`error_type` `{TEXT_BASE_REQUIRED}`). If the text changed since your read, the write \
+is REJECTED with `{TEXT_BASE_STALE}`: re-read with `get_task`, recompose against the NEW \
+text, and resend with the fresh `{TASK_TEXT_FP_KEY}` — never resend the same text.
+3. For a pure ADDITION to `details`, prefer `details` carrying ONLY the new section with \
+`append=True`: it needs no token, because the backend appends onto the stored body itself.
+4. Count a text amendment as applied — in `stats.task_text_amendments_confirmed` and in \
+any finding resolution or report claim — ONLY when the `update_task` response carries \
+`{TEXT_VERIFIED_KEY}: true`. The server sets it from a fresh read under the write lock, \
+the same contract as Stage 1's `edges_updated`, which counts only on `verified: true`. A \
+self-reported "VERIFIED via get_task" never suffices. On `{TEXT_VERIFIED_KEY}: false`, do \
+NOT count it and report it as unconfirmed; the server has already filed a \
+`{TEXT_WRITE_UNCONFIRMED_FLAG_TYPE}` finding, so do not file another.
 
 {render_audit_trail_rotation_section()}
 
@@ -863,11 +891,13 @@ lifecycle; the rules below say how to confirm it.
    cancel-and-remint never is. Identify the carrier by `metadata.gate_subject` (the \
    "## Source-Completion" section is the authority for that canonical key and its \
    read-side aliases). AMEND HAZARD: a carrier's `description` is REPLACE-ONLY, so \
-   amending one is a read-modify-write — READ the current text first, then write the \
-   COMPLETE merged text with `append` OMITTED, and verify the echoed `updated_task` \
-   reflects it. Pairing `description` with `append=True` is REJECTED; the \
-   REPLACE-ONLY rule under "## Verifying Task Operations" states that contract once \
-   and is the authority for it. Re-filing is not an escape \
+   amending one is a read-modify-write — READ the current text with `get_task` first, \
+   then write the COMPLETE merged text with `append` OMITTED and `expected_text_fp` set \
+   to that read's `{TASK_TEXT_FP_KEY}`, and treat the amend as applied only when the \
+   response carries `{TEXT_VERIFIED_KEY}: true`. Pairing `description` with \
+   `append=True` is REJECTED; the REPLACE-ONLY rule and the TASK-TEXT AMENDMENTS rule \
+   under "## Verifying Task Operations" state that contract once and are the authority \
+   for it. Re-filing is not an escape \
    from this rule: the `submit_task` boundary now REJECTS a second gate for a subject \
    whose carrier is still non-terminal.
 

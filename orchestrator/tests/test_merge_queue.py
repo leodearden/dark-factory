@@ -2513,6 +2513,10 @@ class TestSpeculativeMergeWorker:
         With fix: except clause resolves N+1's Future as 'blocked' with
         'Verifier error'; finally clause always sets _speculation_slot.
         """
+        # Deep chains off (task 8527): under the operational yaml's chain_cap N,
+        # alone in the verify frontier, would chain N+1 rather than leave it to
+        # the _remerge this scene raises in.
+        config = config.model_copy(update={'merge_deep': MergeDeepConfig(chain_cap=0)})
         wt_n = await _make_branch_with_file(
             git_ops, 'vre-n', 'file_vre_n.py', 'n = 1\n',
         )
@@ -3617,6 +3621,10 @@ class TestSpeculativeMergeWorker:
         and re-merged. We patch merge_to_main so the re-merge produces a
         conflict for N+1, causing a conflict emit inside _remerge.
         """
+        # Deep chains off (task 10617): under the operational yaml's chain_cap N,
+        # alone in the verify frontier, would chain N+1 rather than leave it to
+        # the _remerge this scene asserts on.
+        config = config.model_copy(update={'merge_deep': MergeDeepConfig(chain_cap=0)})
         db_path = tmp_path / 'events_remerge.db'
         event_store = EventStore(db_path=db_path, run_id='test-run')
 
@@ -9674,7 +9682,9 @@ class TestEnsureVerifyDiskSpace:
                 gops, tmp_path, 10 * _GIB, 't1',
             )
         assert reason is not None
-        assert reason.startswith(TRANSIENT_INFRA_REASON_PREFIX)
+        assert reason.startswith(f'{TRANSIENT_INFRA_REASON_PREFIX} (disk pressure): '), (
+            f'expected the transient-infra reason naming disk pressure, got: {reason!r}'
+        )
         gops.prune_stale_merge_worktrees.assert_awaited_once()
 
     async def test_oserror_on_first_stat_fails_open(self, tmp_path: Path):
@@ -13384,9 +13394,9 @@ class TestRunPostMergeVerify:
 
         assert result is not None
         assert result.status == 'blocked'
-        assert result.reason.startswith(TRANSIENT_INFRA_REASON_PREFIX), (
-            f'expected transient-infra reason, got: {result.reason!r}'
-        )
+        assert result.reason.startswith(
+            f'{TRANSIENT_INFRA_REASON_PREFIX} (disk pressure): ',
+        ), f'expected the transient-infra reason naming disk pressure, got: {result.reason!r}'
         git_ops.prune_stale_merge_worktrees.assert_awaited_once()
         assert enospc_retries.get(req.task_id, 0) == 1, (
             f'expected enospc_retries[task_id]=1, got: {enospc_retries}'
@@ -13437,7 +13447,8 @@ class TestRunPostMergeVerify:
         not the generic branch-blaming block); no timeout-counter bump (no
         merge verify attempt consumed) and no dry-run debugger spawn.
         Parametrized over every INFRA_TRANSIENT_CATEGORIES member (task 2591
-        amendment, reviewer_comprehensive/test_coverage).
+        amendment, reviewer_comprehensive/test_coverage). The reason header
+        names the measured category, never disk pressure (task 3177).
         """
         from orchestrator.merge_lane.worker import (
             _DryRunInvestigationHandles,
@@ -13465,8 +13476,11 @@ class TestRunPostMergeVerify:
 
         assert result is not None
         assert result.status == 'blocked'
-        assert result.reason.startswith(TRANSIENT_INFRA_REASON_PREFIX), (
-            f'expected transient-infra reason, got: {result.reason!r}'
+        assert result.reason.startswith(
+            f'{TRANSIENT_INFRA_REASON_PREFIX} (category={category}): ',
+        ), (
+            f'the generic infra hold must name its measured category, not a '
+            f'disk-pressure cause; got: {result.reason!r}'
         )
         assert len(verifier.verified) == 2, (
             f'expected exactly one bounded infra retry (2 total calls), got {len(verifier.verified)}'
@@ -17082,7 +17096,7 @@ class TestSnapshotOwnedMergeWorktrees:
         p1.mkdir()
         worker._register_owned_merge_worktree(p1)  # resolve happens HERE, once
 
-        def _explode(self, *a, **kw):  # noqa: ANN001, ANN002, ANN003, ARG001
+        def _explode(self, *a, **kw):
             raise AssertionError(
                 'snapshot() resolved a ledger path at read time — the resolve '
                 'must be memoised at _register_owned_merge_worktree time'
@@ -17116,7 +17130,7 @@ class TestSnapshotOwnedMergeWorktrees:
         direct.mkdir()
         worker._owned_merge_worktrees.add(direct)  # NO memo entry
 
-        def _explode(self, *a, **kw):  # noqa: ANN001, ANN002, ANN003, ARG001
+        def _explode(self, *a, **kw):
             raise AssertionError('fallback path must not resolve at read time')
 
         monkeypatch.setattr(Path, 'resolve', _explode)
@@ -18964,7 +18978,7 @@ class TestCheckMergeLivenessMarginHeartbeatFloor:
 
     def test_merge_ahead_bound_kwarg_raises_type_error(self, tmp_path: Path):
         """check_merge_liveness_margin no longer accepts merge_ahead_bound kwarg."""
-        from orchestrator.merge_lane.liveness import check_merge_liveness_margin  # noqa: PLC0415
+        from orchestrator.merge_lane.liveness import check_merge_liveness_margin
 
         cfg = OrchestratorConfig(project_root=tmp_path)
         with pytest.raises(TypeError):
@@ -18972,7 +18986,7 @@ class TestCheckMergeLivenessMarginHeartbeatFloor:
 
     def test_num_hosts_kwarg_raises_type_error(self, tmp_path: Path):
         """check_merge_liveness_margin no longer accepts num_hosts kwarg."""
-        from orchestrator.merge_lane.liveness import check_merge_liveness_margin  # noqa: PLC0415
+        from orchestrator.merge_lane.liveness import check_merge_liveness_margin
 
         cfg = OrchestratorConfig(project_root=tmp_path)
         with pytest.raises(TypeError):
@@ -18980,7 +18994,7 @@ class TestCheckMergeLivenessMarginHeartbeatFloor:
 
     def test_threshold_equals_safety_factor_times_liveness(self, tmp_path: Path):
         """threshold_secs == safety_factor * liveness_secs (injected)."""
-        from orchestrator.merge_lane.liveness import check_merge_liveness_margin  # noqa: PLC0415
+        from orchestrator.merge_lane.liveness import check_merge_liveness_margin
 
         cfg = OrchestratorConfig(project_root=tmp_path)
         result = check_merge_liveness_margin(cfg, safety_factor=0.5, liveness_secs=3600.0)
@@ -18991,7 +19005,7 @@ class TestCheckMergeLivenessMarginHeartbeatFloor:
 
     def test_safe_flag_matches_comparison(self, tmp_path: Path):
         """safe == (worst_case_secs < threshold_secs)."""
-        from orchestrator.merge_lane.liveness import check_merge_liveness_margin  # noqa: PLC0415
+        from orchestrator.merge_lane.liveness import check_merge_liveness_margin
 
         cfg = OrchestratorConfig(project_root=tmp_path)
         # Shipped defaults: floor=600, threshold=8100 → safe=True
@@ -19014,7 +19028,7 @@ class TestMergeLivenessAssessmentFields:
 
     def test_new_fields_present(self, tmp_path: Path):
         """Assessment exposes heartbeat_poll_secs, touch_miss_tolerance, safety_factor."""
-        from orchestrator.merge_lane.liveness import check_merge_liveness_margin  # noqa: PLC0415
+        from orchestrator.merge_lane.liveness import check_merge_liveness_margin
 
         cfg = OrchestratorConfig(project_root=tmp_path)
         result = check_merge_liveness_margin(cfg)
@@ -19031,7 +19045,7 @@ class TestMergeLivenessAssessmentFields:
 
     def test_old_fields_absent(self, tmp_path: Path):
         """Assessment no longer has timeout_secs, merge_ahead_bound, num_hosts, max_verify_timeouts."""
-        from orchestrator.merge_lane.liveness import check_merge_liveness_margin  # noqa: PLC0415
+        from orchestrator.merge_lane.liveness import check_merge_liveness_margin
 
         cfg = OrchestratorConfig(project_root=tmp_path)
         result = check_merge_liveness_margin(cfg)
@@ -19102,7 +19116,7 @@ class TestCheckMergeLivenessMarginClassificationAndLogging:
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
     ):
         """liveness_secs=600 → threshold=450 ≤ floor=600 → safe=False + exactly one WARNING."""
-        from orchestrator.merge_lane.liveness import check_merge_liveness_margin  # noqa: PLC0415
+        from orchestrator.merge_lane.liveness import check_merge_liveness_margin
 
         cfg = OrchestratorConfig(project_root=tmp_path)
         with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
@@ -19123,7 +19137,7 @@ class TestCheckMergeLivenessMarginClassificationAndLogging:
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
     ):
         """Shipped defaults → safe=True → no WARNING emitted."""
-        from orchestrator.merge_lane.liveness import check_merge_liveness_margin  # noqa: PLC0415
+        from orchestrator.merge_lane.liveness import check_merge_liveness_margin
 
         cfg = OrchestratorConfig(project_root=tmp_path)
         with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
@@ -19141,7 +19155,7 @@ class TestCheckMergeLivenessMarginClassificationAndLogging:
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
     ):
         """WARNING names the heartbeat model; does NOT mention cold_timeout or merge_ahead_bound."""
-        from orchestrator.merge_lane.liveness import check_merge_liveness_margin  # noqa: PLC0415
+        from orchestrator.merge_lane.liveness import check_merge_liveness_margin
 
         cfg = OrchestratorConfig(project_root=tmp_path)
         with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
@@ -19165,7 +19179,7 @@ class TestCheckMergeLivenessMarginInvariant:
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
     ):
         """liveness_secs=600 with safety_factor=0.5 → .safe False + exactly one WARNING."""
-        from orchestrator.merge_lane.liveness import check_merge_liveness_margin  # noqa: PLC0415
+        from orchestrator.merge_lane.liveness import check_merge_liveness_margin
 
         cfg = OrchestratorConfig(project_root=tmp_path)
         with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
@@ -21511,6 +21525,10 @@ class TestSpeculationPermitLeakOnMergerError:
         """(a) WorktreeMissing raised during N+1's merger step must release
         the speculation permit (currently leaks → deadlock at next look-ahead).
         """
+        # Deep chains off (task 8527): under the operational yaml's chain_cap N,
+        # alone in the verify frontier, would chain N+1 rather than leave it to
+        # the merger step this scene raises in.
+        config = config.model_copy(update={'merge_deep': MergeDeepConfig(chain_cap=0)})
         wt_n = await _make_branch_with_file(git_ops, 'leak-wm-n', 'leak_wm_n.py', 'n = 1\n')
         wt_n1 = await _make_branch_with_file(git_ops, 'leak-wm-n1', 'leak_wm_n1.py', 'n1 = 2\n')
         wt_n2 = await _make_branch_with_file(git_ops, 'leak-wm-n2', 'leak_wm_n2.py', 'n2 = 3\n')
@@ -21575,6 +21593,10 @@ class TestSpeculationPermitLeakOnMergerError:
         """(b) Generic Exception raised during N+1's merger step must release
         the speculation permit (currently leaks → deadlock at next look-ahead).
         """
+        # Deep chains off (task 8527): under the operational yaml's chain_cap N,
+        # alone in the verify frontier, would chain N+1 rather than leave it to
+        # the merger step this scene raises in.
+        config = config.model_copy(update={'merge_deep': MergeDeepConfig(chain_cap=0)})
         wt_n = await _make_branch_with_file(git_ops, 'leak-ex-n', 'leak_ex_n.py', 'n = 1\n')
         wt_n1 = await _make_branch_with_file(git_ops, 'leak-ex-n1', 'leak_ex_n1.py', 'n1 = 2\n')
         wt_n2 = await _make_branch_with_file(git_ops, 'leak-ex-n2', 'leak_ex_n2.py', 'n2 = 3\n')

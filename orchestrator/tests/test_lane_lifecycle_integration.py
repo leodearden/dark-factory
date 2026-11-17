@@ -59,7 +59,7 @@ from _lane_test_helpers import (
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.event_store import EventType
-from orchestrator.git_ops import WorktreeInfo, _run
+from orchestrator.git_ops import GitOps, WorktreeInfo, _run
 from orchestrator.lane_lifecycle import (
     ESCALATION_SENTINEL_ROLE,
     IllegalLaneTransition,
@@ -176,6 +176,19 @@ class TestB1WriterReaderRoundTrip:
 # ── B2 — crash->quarantine (orphaned admin-entry divergence) ───────────
 
 
+async def _assert_parked_once(git_ops: GitOps, lane: Path) -> None:
+    """*lane* left worktree_base for exactly one quarantine parking, its branch renamed to match.
+
+    Task 4845: a full ``task/42`` record branch must not double-prefix, and an
+    unregistered lane must still be moved.
+    """
+    assert not lane.exists()
+    parkings = list(git_ops.quarantine_base.glob('42-*'))
+    assert len(parkings) == 1, parkings
+    assert await git_ops.resolve_branch_sha('task/42') is None
+    assert await git_ops.resolve_branch_sha(f'task/{parkings[0].name}') is not None
+
+
 @pytest.mark.asyncio
 class TestB2CrashQuarantine:
     """B2: crash-recovery divergence between the durable record and git
@@ -248,6 +261,8 @@ class TestB2CrashQuarantine:
             and 'quarantin' in log_rec.getMessage().lower()
             for log_rec in caplog.records
         ), f'expected a quarantine warning naming task 42; got: {caplog.text!r}'
+
+        await _assert_parked_once(harness.git_ops, lane)
 
         # Next dispatch is clean: a different task can still acquire a lane.
         # Unpack the tuple rather than a bare `is not None` smoke check —
@@ -329,6 +344,8 @@ class TestB2CrashQuarantine:
             and 'identity' in log_rec.getMessage().lower()
             for log_rec in caplog.records
         ), f'expected an identity-mismatch warning naming task 42; got: {caplog.text!r}'
+
+        await _assert_parked_once(harness.git_ops, lane)
 
         # Next dispatch is clean: a different task can still acquire a lane.
         # Unpack the tuple rather than a bare `is not None` smoke check —

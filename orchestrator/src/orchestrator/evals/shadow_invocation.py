@@ -14,9 +14,20 @@ from orchestrator.config import OrchestratorConfig
 from orchestrator.evals.configs import EvalConfig
 from orchestrator.evals.eval_gate import GATE_UNSET, InjectedGate
 from orchestrator.evals.results import EvalResult, ResultStore
-from orchestrator.evals.runner import build_eval_orch_config, run_end_to_end, run_eval
+from orchestrator.evals.runner import (
+    CellProfile,
+    build_eval_orch_config,
+    run_end_to_end,
+    run_eval,
+)
+from orchestrator.verify import run_scoped_verification
 
-__all__ = ['build_shadow_orch_config', 'run_shadow_end_to_end', 'run_shadow_eval']
+__all__ = [
+    'SHADOW_PROFILE',
+    'build_shadow_orch_config',
+    'run_shadow_end_to_end',
+    'run_shadow_eval',
+]
 
 
 def build_shadow_orch_config(
@@ -55,6 +66,10 @@ def build_shadow_orch_config(
     )
 
 
+SHADOW_PROFILE = CellProfile(build_shadow_orch_config, run_scoped_verification)
+"""Shadow cells replay live tasks cut from recent main, so production's scoped gate fits."""
+
+
 async def run_shadow_eval(
     task_path: Path,
     config: EvalConfig,
@@ -67,11 +82,11 @@ async def run_shadow_eval(
     usage_gate: InjectedGate = GATE_UNSET,
     store: ResultStore | None = None,
 ) -> EvalResult:
-    """``run_eval`` with its cell config built by ``build_shadow_orch_config``."""
+    """``run_eval`` under ``SHADOW_PROFILE``."""
     return await run_eval(
         task_path, config, base_config, trial, timeout_override, worktree_path,
         judge_config=judge_config, usage_gate=usage_gate, store=store,
-        orch_config_builder=build_shadow_orch_config,
+        profile=SHADOW_PROFILE,
     )
 
 
@@ -86,8 +101,8 @@ async def run_shadow_end_to_end(
     usage_gate: InjectedGate = GATE_UNSET,
     store: ResultStore | None = None,
 ) -> EvalResult:
-    """``run_end_to_end`` with its cell config built by ``build_shadow_orch_config``."""
+    """``run_end_to_end`` under ``SHADOW_PROFILE``."""
     return await run_end_to_end(
         task_path, arch_config, impl_config, base_config, trial, timeout_override,
-        usage_gate=usage_gate, store=store, orch_config_builder=build_shadow_orch_config,
+        usage_gate=usage_gate, store=store, profile=SHADOW_PROFILE,
     )

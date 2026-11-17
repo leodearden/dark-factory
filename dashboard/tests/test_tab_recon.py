@@ -2,12 +2,12 @@
 
 THE DEFECT. `runs.status` is written by exactly one place —
 fused-memory/src/fused_memory/reconciliation/journal.py::ReconciliationJournal
-— which defaults the column to 'running' and completes a run as 'completed',
-'failed' or 'interrupted'. The dashboard tested for two spellings the store
-has never written: the rail badge counted `'failed' || 'partial'` (a dead
-disjunct, and 'interrupted' uncounted), and the success-rate tile counted
-`x.status === 'success'`, which is always zero — so the tile read 0% forever
-while reconciliation was in fact succeeding.
+— which defaults the column to 'running' and completes a run as 'completed'
+or 'failed'. The dashboard tested for two spellings the store has never
+written: the rail badge counted `'failed' || 'partial'` (a dead disjunct,
+and the since-retired 'interrupted' uncounted), and the success-rate tile
+counted `x.status === 'success'`, which is always zero — so the tile read 0%
+forever while reconciliation was in fact succeeding.
 
 THE SPLIT. The counting is pure and lives in recon_status.js, covered
 executably by dashboard/tests/js/recon_status.test.mjs. What THAT suite
@@ -35,17 +35,19 @@ import re
 import pytest
 from _jsx_source_helpers import extract_function_body, strip_js_comments
 
-# The store's vocabulary plus the two spellings it has never written. Any
-# `status === '<one of these>'` left in the recon UI means a call site is
-# restating the vocabulary instead of consuming recon_status.js — the
-# condition that let two sites in one file disagree with each other.
+# The store's vocabulary, the two spellings it has never written, and
+# 'interrupted', retired with its producer (tasks 5514/7876) and banned here so
+# no call site reintroduces it. Any `status === '<one of these>'` left in the
+# recon UI means a call site is restating the vocabulary instead of consuming
+# recon_status.js — the condition that let two sites in one file disagree
+# with each other.
 RECON_STATUS_LITERALS = (
     'running',
     'completed',
     'failed',
-    'interrupted',
     'success',
     'partial',
+    'interrupted',
 )
 
 # The burst-AGENT states, a separate vocabulary rendered by ReconTab's Burst
@@ -133,13 +135,10 @@ class TestReconRailBadgeWiring:
 
         Scoped to the railCounts literal so a call elsewhere in app.jsx cannot
         satisfy it. The badge asks "how many rows should an operator go and
-        look at?", which is NOT the same question as the rate tile's "how many
-        did not succeed?": journal.py writes 'interrupted' whenever a run's
-        process died, and this fleet is restarted routinely, so an interrupted
-        row is a healthy-fleet artefact. Counting it here would sit the badge
-        permanently nonzero — the old under-count traded for a standing false
-        alarm. recon_status.js answers both questions separately; the badge
-        must consume the one it means rather than arithmetic of its own.
+        look at?": failures, plus any row whose status recon_status.js does not
+        recognise, which is the only runtime signal that the store's
+        vocabulary has moved. The badge must consume that answer rather than
+        arithmetic of its own.
         """
         rail = _extract_object_literal(app_jsx_code, 'railCounts')
 
@@ -155,11 +154,6 @@ class TestReconRailBadgeWiring:
             f'railCounts.recon does not call reconAttentionCount(...): '
             f'{entry!r} — the badge is an attention signal, and what deserves '
             'attention is the module\'s call, not a bucket picked here.'
-        )
-        assert '.unsuccessful' not in entry, (
-            f'railCounts.recon reads `.unsuccessful`: {entry!r} — that bucket '
-            "includes 'interrupted', which this fleet produces routinely, so "
-            'the badge would never return to zero on a healthy system.'
         )
 
     def test_dead_partial_disjunct_is_gone(self, app_jsx_code):

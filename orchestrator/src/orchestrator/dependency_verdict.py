@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from functools import partial
 
+from shared.task_fields import dependency_ids
 from shared.task_metadata import parse_metadata
 
 from orchestrator.deploy_state import awaits_scheduled_restart
@@ -189,19 +190,13 @@ def deps_verdict(
     dep is absent from BOTH, the arm skips it, except that the scheduled-deploy
     arm waits on a dep in *deferred_terminal_deps* (above).
 
-    Handles three dependency formats:
-      - dict with 'id' key: ``{'id': 1}`` or ``{'id': '1'}``
-      - integer: ``1``
-      - string: ``'1'``
+    Dependency ids are read by ``shared/src/shared/task_fields.py::dependency_ids``.
 
     Emits a DEBUG log when a dependency blocks dispatch, naming the dep ID
     and its current status to aid diagnosis of premature-dispatch issues.
     Emits a separate DEBUG log when the intra-train allowance fires.
     """
-    dep_ids = [
-        str(d.get('id', d) if isinstance(d, dict) else d)
-        for d in task.get('dependencies', [])
-    ]
+    dep_ids = dependency_ids(task)
     arms = (
         partial(_local_verdict, task, dep_ids, status_map, tasks_by_id),
         partial(

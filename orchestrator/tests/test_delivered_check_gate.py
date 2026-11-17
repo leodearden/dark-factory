@@ -3226,10 +3226,10 @@ class TestDeliveredCheckGraceEscalation:
             sha_box['value'] = sha
             if present:
                 # The dependent is pending and gate-held — the real tick's
-                # _update_age_anchors stamps its pending-age anchor each tick
+                # AgeAnchors.observe stamps its pending-age anchor each tick
                 # it appears in the fetch; model that so tick3's absence
                 # exercises the stale_sweep absence-GC path under test.
-                scheduler._pending_anchor['10'] = 10
+                scheduler.age_anchors.observe([task], max_id=10)
                 ctx = TickContext(
                     tasks=[task],
                     status_map={'20': 'done'},

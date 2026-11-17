@@ -25,6 +25,7 @@ from shared.phantom_verdict import UNPARSEABLE_VERDICT_CODE, is_phantom_verdict_
 from shared.sqlite_column_migration import add_column_if_missing
 
 from fused_memory.models.reconciliation import (
+    JudgeInvocation,
     JudgeVerdict,
     ReconciliationRun,
     RunStatus,
@@ -53,11 +54,7 @@ CITATION_REPAIRS_KEY = 'citation_repairs'
 # REFUSING yields a loud, recoverable error. So a status absent from the
 # enum-of-today must land on the refusing side by default.
 #
-# These four are genuinely terminal. ``interrupted`` stays excluded as a legacy
-# status (task 5514): nothing writes it any more, but the startup sweep
-# ``harness.py::ReconciliationHarness._recover_legacy_interrupted_runs`` still
-# converts each such row to ``failed`` with a ``complete_run_if_status``
-# wholesale stage_reports write from its own loaded copy.
+# These four are genuinely terminal.
 #
 # It lives here, beside CITATION_REPAIRS_KEY, because it is also this layer's
 # invariant: a write that does not carry repairs forward must never land on a
@@ -184,6 +181,17 @@ CREATE TABLE IF NOT EXISTS judge_pending (
     marked_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_judge_pending_project ON judge_pending(project_id);
+
+CREATE TABLE IF NOT EXISTS judge_invocations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    completed_at TEXT NOT NULL,
+    ended_error_max_turns INTEGER NOT NULL,
+    schema_salvaged INTEGER NOT NULL,
+    num_turns INTEGER,
+    rejected_tool_calls INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_judge_invocations_completed ON judge_invocations(completed_at);
 """
 
 
@@ -234,19 +242,15 @@ class ReconciliationJournal:
         *,
         connect: Connector = connect_daemon,
     ):
-        """Store *data_dir* VERBATIM — it may be RELATIVE, and by default is.
+        """Store *data_dir* VERBATIM; nothing coerces it here.
 
-        Nothing coerces it here, and nothing upstream does either (task 4592;
-        why, and the deployment story behind it, at ``fused-memory/src/fused_memory/reconciliation/cli_stage_runner.py::recon_config_base_dir``).
+        A config-sourced value is already absolute: a relative
+        ``reconciliation.data_dir`` is anchored at config load by
+        ``fused-memory/src/fused_memory/config/checkout_anchor.py::anchor_at_checkout``
+        (task 5462; the deployment story is at
+        ``fused-memory/src/fused_memory/reconciliation/cli_stage_runner.py::recon_config_base_dir``).
 
-        In-process that is deliberate: ``initialize`` mkdirs ``data_dir`` and
-        opens ``reconciliation.db`` under it, and
-        ``fused-memory/src/fused_memory/server/main.py`` builds ten sibling paths
-        (``WriteJournal``, ``EventBuffer``, ``TicketStore``, curator/report state,
-        the dead-letter JSONL) the same way — all anchored at the PROCESS cwd, all
-        in this process, so they agree with each other by construction.
-
-        A CROSS-PROCESS consumer must NOT inherit that relativity: a path handed
+        A CROSS-PROCESS consumer must NOT inherit a relative one: a path handed
         to a child is resolved against the CHILD's cwd, so the two would silently
         name different directories. ``fused-memory/src/fused_memory/reconciliation/cli_stage_runner.py::recon_config_base_dir`` is the boundary that absolutizes it for
         the ``CLAUDE_CONFIG_DIR`` chain, and
@@ -579,6 +583,11 @@ class ReconciliationJournal:
             return None
         return _row_to_run(row)
 
+    #: No longer a ``RunStatus`` member; kept only for
+    #: ``_stage_reports_are_settled`` under task 3731's contract
+    #: (``plans/stage3-ledger-presence-prd.md``). Removal tracked by task 10047.
+    _LEGACY_INTERRUPTED_STATUS = 'interrupted'
+
     #: Run statuses at which ``runs.stage_reports`` is known to have been
     #: PERSISTED, i.e. every status :meth:`complete_run` can write.
     #:
@@ -598,7 +607,7 @@ class ReconciliationJournal:
             RunStatus.failed.value,
             RunStatus.rolled_back.value,
             RunStatus.circuit_breaker.value,
-            RunStatus.interrupted.value,
+            _LEGACY_INTERRUPTED_STATUS,
         }
     )
 
@@ -628,7 +637,7 @@ class ReconciliationJournal:
         """
         if run_status not in ReconciliationJournal._STAGE_REPORTS_PERSISTED_STATUSES:
             return False
-        if run_status == RunStatus.interrupted.value:
+        if run_status == ReconciliationJournal._LEGACY_INTERRUPTED_STATUS:
             return resumed is False
         return True
 
@@ -821,6 +830,23 @@ class ReconciliationJournal:
             for row in rows
         ]
 
+    async def record_judge_invocation(self, invocation: JudgeInvocation) -> None:
+        async with self._require_access().write() as db:
+            await db.execute(
+                """INSERT INTO judge_invocations
+                   (run_id, completed_at, ended_error_max_turns, schema_salvaged,
+                    num_turns, rejected_tool_calls)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    invocation.run_id,
+                    invocation.completed_at.isoformat(),
+                    int(invocation.ended_error_max_turns),
+                    int(invocation.schema_salvaged),
+                    invocation.num_turns,
+                    invocation.rejected_tool_calls,
+                ),
+            )
+
     # ── Judge pending markers (durable across restarts) ─────────────────
 
     async def mark_judge_pending(self, run_id: str, project_id: str) -> None:
@@ -995,19 +1021,6 @@ class ReconciliationJournal:
         """
         rows = await self._require_access().read_all(
             "SELECT * FROM runs WHERE status = 'running'"
-        )
-        return [_row_to_run(row) for row in rows]
-
-    async def get_interrupted_runs(self) -> list[ReconciliationRun]:
-        """Return every run marked 'interrupted', with no age filter.
-
-        Mirrors ``get_running_runs`` but filters the legacy status (see
-        ``RunStatus.interrupted``). Consumed by the startup sweep
-        ``harness.py::ReconciliationHarness._recover_legacy_interrupted_runs``,
-        which converts each row a pre-5514 process left behind to ``failed``.
-        """
-        rows = await self._require_access().read_all(
-            "SELECT * FROM runs WHERE status = 'interrupted'"
         )
         return [_row_to_run(row) for row in rows]
 
@@ -1319,11 +1332,11 @@ def flagged_findings_by_id(items_flagged: Any) -> dict[str, dict[str, Any]]:
 def _row_to_run(row: aiosqlite.Row) -> ReconciliationRun:
     """Map a single ``runs`` table row to a ``ReconciliationRun``.
 
-    Shared by ``get_run``, ``get_recent_runs``, ``get_stale_runs``,
-    ``get_running_runs``, and ``get_interrupted_runs`` (task 3885 dedup;
-    originally task 2711) — every query differs only in its WHERE clause, so
-    the row→model mapping (including ``stage_reports`` parsing) lives in
-    exactly one place and can't drift between call sites.
+    Shared by ``get_run``, ``get_recent_runs``, ``get_stale_runs`` and
+    ``get_running_runs`` (task 3885 dedup; originally task 2711) — every query
+    differs only in its WHERE clause, so the row→model mapping (including
+    ``stage_reports`` parsing) lives in exactly one place and can't drift
+    between call sites.
     """
     reports_raw = json.loads(row['stage_reports'] or '{}')
     stage_reports: dict[str, StageReport | dict] = {}

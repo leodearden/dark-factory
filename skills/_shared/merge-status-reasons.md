@@ -47,8 +47,9 @@ Sources of truth, named once: the reason vocabulary is
    Before acting on `stale_record` or `no_record` from a request_id poll, re-poll once with
    `merge_status(task_id="<TASK_ID>")` and switch on that answer instead. A landing shows up
    there as an ordinary `done` with `kind: "found_on_main"` and a `merge_sha`, and only that
-   shape counts as one. A re-poll `done` without them may be an earlier round's current-run
-   row, so it is unconfirmed. If the re-poll is also `stale_record`, report the request_id
+   shape counts as one. A re-poll `done` without that `kind` may be an earlier round's
+   current-run row, so it is unconfirmed, and any `merge_sha` it carries is the record's, not a
+   git proof. If the re-poll is also `stale_record`, report the request_id
    answer's `last_outcome`: it names your request.
 
 <a id="the-switch"></a>

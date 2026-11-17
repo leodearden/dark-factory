@@ -32,18 +32,14 @@ import ast
 from pathlib import Path
 
 import pytest
+from _tree_scan import ORCHESTRATOR_SRC, TREE_PASS_XDIST_GROUP, ParsedModule, TreeAnalysis, TreePass
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
-# This guard AST-parses every *.py under orchestrator/src/orchestrator/ via
-# rglob. Not individually reproduced under load; marked because it is
-# structurally identical to the three members that crashed.
-# WHY 300s, the thread-mode os._exit() cost model it clears, and the guard that
-# ENFORCES this mark rather than trusting it to be sprinkled: see
-# shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT, and
-# test_whole_tree_scan_timeout_guard.py (task 4215).
-pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
-
-_SRC_DIR = Path(__file__).parent.parent / 'src' / 'orchestrator'
+# The family mark and shared group: shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT, _tree_scan.py.
+pytestmark = [
+    pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT),
+    pytest.mark.xdist_group(TREE_PASS_XDIST_GROUP),
+]
 
 _GUARDED_ATTRS = {'_speculation_slot', '_merge_ahead_cap'}
 _GUARDED_METHODS = {'acquire', 'release'}
@@ -68,7 +64,11 @@ def _raw_semaphore_accesses(source: str) -> list[tuple[int, str]]:
         tree = ast.parse(source)
     except SyntaxError:
         return []
+    return _raw_semaphore_accesses_in(tree)
 
+
+def _raw_semaphore_accesses_in(tree: ast.Module) -> list[tuple[int, str]]:
+    """:func:`_raw_semaphore_accesses` over an already-parsed module."""
     hits: list[tuple[int, str]] = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
@@ -80,6 +80,19 @@ def _raw_semaphore_accesses(source: str) -> list[tuple[int, str]]:
         if isinstance(target, ast.Attribute) and target.attr in _GUARDED_ATTRS:
             hits.append((node.lineno, f'{target.attr}.{func.attr}'))
     return hits
+
+
+def _raw_access_sites(module: ParsedModule) -> tuple[tuple[int, str], ...]:
+    """:func:`_raw_semaphore_accesses` for one file of the shared pass; none if unparseable."""
+    try:
+        tree = module.tree
+    except SyntaxError:
+        return ()
+    return tuple(_raw_semaphore_accesses_in(tree))
+
+
+ANALYSIS = TreeAnalysis(name=Path(__file__).stem, files=ORCHESTRATOR_SRC, extract=_raw_access_sites)
+TREE_ANALYSES = (ANALYSIS,)
 
 
 # ---------------------------------------------------------------------------
@@ -169,7 +182,7 @@ def test_guard_flags_synthetic_new_raw_access() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_no_raw_semaphore_access_outside_permit_ledger() -> None:
+def test_no_raw_semaphore_access_outside_permit_ledger(tree_pass: TreePass) -> None:
     """No file under orchestrator/src/orchestrator may contain a raw
     ``_speculation_slot``/``_merge_ahead_cap`` ``.acquire()``/``.release()``
     call. Every acquire/release must route through the owning
@@ -179,9 +192,8 @@ def test_no_raw_semaphore_access_outside_permit_ledger() -> None:
     """
     offenders: list[str] = []
 
-    for py_file in sorted(_SRC_DIR.rglob('*.py')):
-        source = py_file.read_text(encoding='utf-8')
-        for lineno, attr_method in _raw_semaphore_accesses(source):
+    for py_file, hits in tree_pass.facts(ANALYSIS).items():
+        for lineno, attr_method in hits:
             offenders.append(f'{py_file.name}:{lineno}: {attr_method}()')
 
     if offenders:

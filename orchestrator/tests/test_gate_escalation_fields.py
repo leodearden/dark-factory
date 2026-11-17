@@ -350,9 +350,13 @@ class TestRunnerFilesTheHumanGate:
         assert esc.review_due['completion_gate_task_id'] == '41'
         assert esc.review_due['launched_from'] == esc.id
         assert esc.review_due['fired_at'] == FIXED_NOW.isoformat()
-        scheduler.update_task.assert_any_await(
-            '42', {'gate_escalated_at': FIXED_NOW.isoformat()}, metadata_mode='merge',
-        )
+        [stamp_write] = [
+            call for call in scheduler.update_task.await_args_list
+            if call.args[0] == '42' and 'gate_escalated_at' in call.args[1]
+        ]
+        assert stamp_write.args[1]['gate_escalated_at'] == FIXED_NOW.isoformat()
+        assert stamp_write.kwargs == {'metadata_mode': 'merge'}
+        assert 'gate_escalated_preconditions' in stamp_write.args[1]
         scheduler.set_task_status.assert_awaited_once_with('42', 'blocked')
 
     async def test_interim_form_files_review_due_without_a_completion_gate(self, tmp_path: Path):

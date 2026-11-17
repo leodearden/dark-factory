@@ -2008,7 +2008,7 @@ async def _ensure_owner_task(
                 'flake_ledger: owner %s of test_id=%s is done but its debt cycle could not '
                 'be closed — KEEPING the owner rather than replacing it; '
                 'regressed_after_resolution detection is DEFERRED to the next suppression '
-                "(or θ's sweep)",
+                "(or θ's sweep); `orchestrator flake-ledger` shows the row as OWNER DONE",
                 row.owner_task_id,
                 row.test_id,
             )

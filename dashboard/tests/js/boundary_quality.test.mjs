@@ -1,6 +1,6 @@
 // Boundary family: the Quality tab, the client half of
-// plans/quality-dashboard-prd.md sketch rows 3, 4, 5, 9, 10 and 12, plus the
-// module drill-down.
+// plans/quality-dashboard-prd.md sketch rows 3, 4, 5, 9, 10, 12 and 20, plus
+// the module drill-down.
 //
 // Each test lands a body the REAL /quality route served (test_boundary_js.py
 // builds them and holds each row's server half) through data.js's real
@@ -155,4 +155,54 @@ test('quality module: a drill-down lands under its own query and serves the modu
   for (const [id, metric] of Object.entries(metrics)) {
     for (const array of metricArrays(metric)) assert.equal(array.length, ordinals.length, id);
   }
+});
+
+test('quality #20: a served snapshot series charts its baseline and instrument marks at their columns, and its member tables as served', async () => {
+  const landed = await landQuality('quality_snapshots');
+  const snapshots = landed.datum('QUALITY_SNAPSHOTS');
+  assert.equal(snapshots.state, 'fresh', snapshots.reason);
+  const { points } = snapshots.value;
+  const { markers } = landed.datum('QUALITY_MARKERS').value;
+  const [instrument] = markers.filter(marker => marker.kind === 'instrument');
+
+  const marks = landed.view.snapshotMarks(points, markers);
+  assert.deepEqual(marks.map(mark => [mark.kind, mark.fraction]), [['baseline', 0], ['instrument', 0.5]]);
+  for (const point of points) {
+    assert.deepEqual(
+      landed.view.snapshotTable(point).rows.map(row => row.slice(2)),
+      point.members.rows.map(row => row.cells),
+      point.id,
+    );
+  }
+
+  const quality = landed.datum('QUALITY').value;
+  const ordinals = quality.axis.map(point => point.ordinal);
+  assert.ok(ordinals.includes(instrument.ordinal), 'the instrument marker is served on the landing axis too');
+  for (const metricId of Object.keys(quality.metrics)) {
+    const metric = quality.metrics[metricId];
+    const placed = landed.view.qualityMarks({
+      axis: quality.axis, markers, alarms: metric.alarms, beforeAfter: quality.before_after, metricId, kind: metric.kind,
+    });
+    assert.equal(placed.some(mark => mark.kind === 'instrument'), false, `${metricId} draws no instrument mark`);
+  }
+});
+
+test('quality #20: a baseline and a nightly file at one commit place the instrument mark at the nightly’s column', async () => {
+  const landed = await landQuality('quality_snapshots_same_commit');
+  const snapshots = landed.datum('QUALITY_SNAPSHOTS');
+  assert.equal(snapshots.state, 'fresh', snapshots.reason);
+  const { points } = snapshots.value;
+  const { markers } = landed.datum('QUALITY_MARKERS').value;
+
+  assert.equal(points[0].as_of_sha, points[1].as_of_sha);
+  const marks = landed.view.snapshotMarks(points, markers);
+  assert.deepEqual(marks.map(mark => [mark.kind, mark.fraction]), [['baseline', 0], ['instrument', 0.5]]);
+});
+
+test('quality #20: a root holding neither snapshot home lands an unknown snapshot series saying no snapshot yet', async () => {
+  const landed = await landQuality('quality_no_snapshot');
+  const reading = landed.datumView(landed.datum('QUALITY_SNAPSHOTS'), { now: RECEIVED_AT });
+
+  assert.equal(reading.isHole, true);
+  assert.ok(reading.title.includes('no snapshot yet'), reading.title);
 });

@@ -40,6 +40,7 @@ from contextlib import closing
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from _dashboard_routes import dashboard_get_paths
 from escalation.models import Escalation
 
 # Budgets are shrunk to this so the whole sweep is fast. The stub never
@@ -71,36 +72,6 @@ cannot wedge — and not a shrinking of the sweep. ``/api/v2/dashboard/orchestra
 is still requested below, because the route list is derived from ``app.routes``
 and cannot be opted out of; it must still answer 200 while the seam hangs.
 """
-
-
-def _dashboard_get_paths() -> list[str]:
-    """Every LITERAL GET route under /api/v2/dashboard/, read off the live app.
-
-    Templated routes (``/api/v2/dashboard/task/{project:path}/T-{task_id}``) are excluded: this
-    sweep requests each path verbatim, so a templated one would be fetched as
-    the literal string ``.../{task_id}`` and answer 404/422 — a false failure
-    about path construction, reported under a message about hung dependencies,
-    in a probe whose whole point is to be self-maintaining. A templated route
-    needs its own probe that binds real parameter values; see the guard in
-    :func:`test_templated_dashboard_routes_are_not_silently_unswept`, which
-    fails loudly if one is ever added rather than letting it go unswept.
-    """
-    return [p for p in _all_dashboard_get_paths() if '{' not in p]
-
-
-def _all_dashboard_get_paths() -> list[str]:
-    """Every GET route under /api/v2/dashboard/, templated ones included."""
-    from dashboard.app import app
-
-    # ``app.routes`` is typed ``list[BaseRoute]``, which declares no ``path``
-    # — bind it once via getattr (as the filter already did) so the duck-typed
-    # sweep still covers every route class, Mount included.
-    return sorted({
-        path
-        for route in app.routes
-        if (path := getattr(route, 'path', '')).startswith('/api/v2/dashboard/')
-        and 'GET' in (getattr(route, 'methods', None) or set())
-    })
 
 
 @pytest.fixture()
@@ -269,8 +240,17 @@ def _seed_merge_attempt(project_root):
 
 
 def test_every_dashboard_endpoint_survives_a_hung_fetch_tasks(client, hung_mcp, tmp_path):
-    """Every GET endpoint answers 200 while the fetch_tasks seam hangs."""
-    paths = _dashboard_get_paths()
+    """Every GET endpoint answers 200 while the fetch_tasks seam hangs.
+
+    Only the LITERAL routes are swept. A templated one
+    (``/api/v2/dashboard/task/{project}/T-{task_id}``) would be fetched as the
+    literal brace string and answer 404/422 — a false failure about path
+    construction, reported under a message about hung dependencies. A
+    templated route needs its own probe that binds real parameter values; see
+    :func:`test_templated_dashboard_routes_are_not_silently_unswept`, which
+    fails loudly if one is ever added rather than letting it go unswept.
+    """
+    paths = dashboard_get_paths().literal
 
     # The sweep is derived, and may not silently shrink. 14 is the count at
     # the time this probe was written; a NEW endpoint raises it, and a route
@@ -346,15 +326,15 @@ def test_task_prose_route_survives_a_hung_fetch_task_prose(client, monkeypatch):
 def test_templated_dashboard_routes_are_not_silently_unswept():
     """A templated route must be noticed, not quietly dropped from the sweep.
 
-    ``_dashboard_get_paths`` filters out ``{``-bearing paths because the sweep
-    cannot request them verbatim. That filter is the right call — but a silent
+    The sweep requests only ``dashboard_get_paths().literal``, because it
+    cannot request a templated path verbatim. That filter is the right call — but a silent
     filter is how coverage rots, so this test fails the moment one appears and
     says what to do about it. Extend the expected set below ONLY together with
     a dedicated probe that exercises the new route with real parameter values
     against a hung dependency, as
     :func:`test_task_prose_route_survives_a_hung_fetch_task_prose` does.
     """
-    templated = sorted(p for p in _all_dashboard_get_paths() if '{' in p)
+    templated = list(dashboard_get_paths().templated)
 
     assert templated == ['/api/v2/dashboard/task/{project:path}/T-{task_id}'], (
         f'templated GET route(s) {templated} exist under /api/v2/dashboard/; '

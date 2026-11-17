@@ -93,7 +93,8 @@ class TestVocabulary:
         assert Addressed.resolution_class == 'addressed'
         assert ObservationConsumed.resolution_class == 'observation-consumed'
         assert StatusInfo.resolution_class == 'status-info'
-        for variant in (Addressed, ObservationConsumed, StatusInfo):
+        assert ConvertViaCurator.resolution_class == 'converted'
+        for variant in (Addressed, ObservationConsumed, StatusInfo, ConvertViaCurator):
             assert variant.resolution_class in RESOLUTION_CLASSES
 
 

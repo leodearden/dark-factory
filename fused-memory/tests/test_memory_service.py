@@ -28,6 +28,7 @@ from fused_memory.config.schema import TaskmasterConfig
 from fused_memory.middleware import dead_letter_escalator
 from fused_memory.middleware import mem0_update_storm_escalator as storm_mod
 from fused_memory.models.enums import MemoryCategory, SourceStore
+from fused_memory.models.memory import render_add_memory_message
 from fused_memory.models.scope import Scope, resolve_project_id_for_root
 from fused_memory.services import memory_service
 from fused_memory.services.memory_service import (
@@ -105,6 +106,7 @@ def _mocked_service(config) -> MemoryService:
     svc.graphiti._require_client = MagicMock()
     svc.graphiti.get_nodes_by_exact_name = AsyncMock(return_value=[])
     svc.graphiti.get_valid_edges_for_node = AsyncMock(return_value=[])
+    svc.graphiti.get_node_names_by_uuids = AsyncMock(return_value={})
     svc.graphiti.read_server_settings = AsyncMock(return_value=_MATCHING_SERVER_SETTINGS)
     install_identity_mocks(svc.graphiti)
 
@@ -157,7 +159,7 @@ def _mocked_service(config) -> MemoryService:
 
 
 def _mem0_add_journal() -> MagicMock:
-    """A write-journal double covering every call add_memory's Mem0 leg makes."""
+    """A write-journal double covering every call a Mem0 write leg makes."""
     journal = MagicMock()
     journal.log_write_op = AsyncMock()
     journal.log_backend_op = AsyncMock()
@@ -188,7 +190,8 @@ class TestAddMemory:
             category='entities_and_relations',
             project_id='test',
         )
-        assert SourceStore.graphiti in result.stores_written
+        assert SourceStore.graphiti in result.stores_queued
+        assert SourceStore.graphiti not in result.stores_written
         assert result.category == MemoryCategory.entities_and_relations
         # Graphiti write goes through durable queue, not directly
         service.durable_queue.enqueue.assert_called_once()
@@ -215,7 +218,8 @@ class TestAddMemory:
             project_id='test',
             dual_write=True,
         )
-        assert SourceStore.graphiti in result.stores_written
+        assert SourceStore.graphiti in result.stores_queued
+        assert SourceStore.graphiti not in result.stores_written
         assert SourceStore.mem0 in result.stores_written
         # Graphiti still goes through the durable queue; Mem0 is now a direct call
         assert service.durable_queue.enqueue.call_count == 1
@@ -235,7 +239,8 @@ class TestAddMemory:
         assert result.memory_ids == ['mem0-1'], (
             f'Expected memory_ids=[\'mem0-1\'] for dual_write, got {result.memory_ids!r}'
         )
-        assert SourceStore.graphiti in result.stores_written
+        assert SourceStore.graphiti in result.stores_queued
+        assert SourceStore.graphiti not in result.stores_written
         assert SourceStore.mem0 in result.stores_written
 
     @pytest.mark.asyncio
@@ -551,28 +556,28 @@ class TestAddMemory:
         (
             'backend_mock_kwargs',
             'expected_stores',
-            'expected_message_suffix',
+            'expected_message_notes',
             'expected_journal_error',
         ),
         [
             pytest.param(
                 {'return_value': {'results': [{'id': 'mem0-1'}]}},
                 [SourceStore.mem0],
-                '',
+                {},
                 None,
                 id='landed',
             ),
             pytest.param(
                 {'side_effect': RuntimeError('qdrant down')},
                 [],
-                ' [mem0_error: qdrant down]',
+                {'mem0_error': 'qdrant down'},
                 'qdrant down',
                 id='raised',
             ),
             pytest.param(
                 {'return_value': {'results': []}},
                 [],
-                ' [empty_result: mem0 add returned zero memory_ids]',
+                {'mem0_empty_result': 'empty_result: mem0 add returned zero memory_ids'},
                 'empty_result: mem0 add returned zero memory_ids',
                 id='zero_ids',
             ),
@@ -583,7 +588,7 @@ class TestAddMemory:
         service,
         backend_mock_kwargs,
         expected_stores,
-        expected_message_suffix,
+        expected_message_notes,
         expected_journal_error,
     ):
         """add_memory says mem0 was written — in the response, the journal and
@@ -604,9 +609,14 @@ class TestAddMemory:
         assert result.stores_written == expected_stores
         journal_kwargs = mock_journal.log_write_op.call_args[1]
         assert journal_kwargs['result_summary']['stores'] == expected_store_values
+        assert journal_kwargs['result_summary']['stores_queued'] == []
         assert journal_kwargs['success'] is (expected_journal_error is None)
         assert journal_kwargs['error'] == expected_journal_error
-        assert result.message == f'Memory queued for {expected_store_values}{expected_message_suffix}'
+        assert result.message == render_add_memory_message(
+            stores_written=expected_stores, **expected_message_notes
+        )
+        for error_text in expected_message_notes.values():
+            assert error_text in result.message
 
     @pytest.mark.asyncio
     async def test_dual_write_zero_ids_claims_graphiti_alone_and_names_the_drop(
@@ -628,15 +638,58 @@ class TestAddMemory:
         )
 
         service.durable_queue.enqueue.assert_awaited_once()
-        assert result.stores_written == [SourceStore.graphiti]
+        assert result.stores_written == []
+        assert result.stores_queued == [SourceStore.graphiti]
         journal_kwargs = mock_journal.log_write_op.call_args[1]
-        assert journal_kwargs['result_summary']['stores'] == ['graphiti']
+        assert journal_kwargs['result_summary']['stores'] == []
+        assert journal_kwargs['result_summary']['stores_queued'] == ['graphiti']
         assert journal_kwargs['success'] is False
         assert journal_kwargs['error'] == 'empty_result: mem0 add returned zero memory_ids'
-        assert result.message == (
-            "Memory queued for ['graphiti'] "
-            '[empty_result: mem0 add returned zero memory_ids]'
+        assert result.message == render_add_memory_message(
+            stores_written=[],
+            stores_queued=[SourceStore.graphiti],
+            mem0_empty_result='empty_result: mem0 add returned zero memory_ids',
         )
+        assert 'empty_result: mem0 add returned zero memory_ids' in result.message
+
+    @pytest.mark.asyncio
+    async def test_a_failed_graphiti_enqueue_appears_in_no_store_list(self, service):
+        service.durable_queue.enqueue = AsyncMock(side_effect=RuntimeError('queue down'))
+        mock_journal = _mem0_add_journal()
+        service.set_write_journal(mock_journal)
+
+        result = await service.add_memory(
+            content='The auth service depends on Redis',
+            category='entities_and_relations',
+            project_id='dark_factory',
+            causation_id='c1',
+        )
+
+        assert SourceStore.graphiti not in result.stores_written
+        assert SourceStore.graphiti not in result.stores_queued
+        assert SourceStore.graphiti not in result.stores_pending_retry
+        assert '[graphiti_error: RuntimeError: queue down]' in result.message
+        assert mock_journal.log_write_op.call_args[1]['success'] is False
+
+    @pytest.mark.asyncio
+    async def test_a_dual_write_whose_both_legs_fail_keeps_both_error_texts(self, service):
+        service.durable_queue.enqueue = AsyncMock(side_effect=RuntimeError('queue down'))
+        service.mem0.add = AsyncMock(side_effect=RuntimeError('qdrant down'))
+        service.set_write_journal(_mem0_add_journal())
+
+        result = await service.add_memory(
+            content='We decided to use PostgreSQL for its JSON support',
+            category='decisions_and_rationale',
+            project_id='dark_factory',
+            dual_write=True,
+            causation_id='c1',
+        )
+
+        assert result.stores_written == []
+        assert result.stores_queued == []
+        assert result.stores_pending_retry == []
+        assert '[graphiti_error: RuntimeError: queue down]' in result.message
+        assert '[mem0_error: qdrant down]' in result.message
 
 
 class TestAddSystemRecord:
@@ -786,10 +839,8 @@ class TestAddSystemRecord:
         both logged as a WARNING and journaled as success=False — never a silent,
         unconditional success on the guaranteed-persistence system-write path."""
         service.mem0.add_system_record = AsyncMock(return_value={'results': []})
-        mock_journal = MagicMock()
-        mock_journal.log_write_op = AsyncMock()
-        mock_journal.log_backend_op = AsyncMock()
-        service._write_journal = mock_journal
+        mock_journal = _mem0_add_journal()
+        service.set_write_journal(mock_journal)
 
         with caplog.at_level(logging.WARNING, logger='fused_memory.services.memory_service'):
             result = await service.add_system_record(
@@ -823,10 +874,8 @@ class TestAddSystemRecord:
     async def test_nonempty_result_journals_success_no_warning(self, service, caplog):
         """The happy path (non-empty mem0 result) must journal success=True with no warning."""
         service.mem0.add_system_record = AsyncMock(return_value={'results': [{'id': 'sys-1'}]})
-        mock_journal = MagicMock()
-        mock_journal.log_write_op = AsyncMock()
-        mock_journal.log_backend_op = AsyncMock()
-        service._write_journal = mock_journal
+        mock_journal = _mem0_add_journal()
+        service.set_write_journal(mock_journal)
 
         with caplog.at_level(logging.WARNING, logger='fused_memory.services.memory_service'):
             await service.add_system_record(
@@ -850,40 +899,42 @@ class TestAddSystemRecord:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        ('backend_mock_kwargs', 'expected_stores', 'expected_message_suffix'),
+        ('backend_mock_kwargs', 'expected_stores', 'expected_message_notes'),
         [
             pytest.param(
                 {'return_value': {'results': [{'id': 'sys-1'}]}},
                 [SourceStore.mem0],
-                '',
+                {},
                 id='landed',
             ),
             pytest.param(
                 {'side_effect': RuntimeError('qdrant down')},
                 [],
-                ' [mem0_error: qdrant down]',
+                {'mem0_error': 'qdrant down'},
                 id='raised',
             ),
             pytest.param(
                 {'return_value': {'results': []}},
                 [],
-                ' [empty_result: mem0 add_system_record returned zero memory_ids]',
+                {
+                    'mem0_empty_result': (
+                        'empty_result: mem0 add_system_record returned zero memory_ids'
+                    ),
+                },
                 id='zero_ids',
             ),
         ],
     )
     async def test_stores_written_and_journal_stores_reflect_mem0_outcome(
-        self, service, backend_mock_kwargs, expected_stores, expected_message_suffix,
+        self, service, backend_mock_kwargs, expected_stores, expected_message_notes,
     ):
         """On the guaranteed-persistence system-write path, the response's
         stores_written and the journal's stores say mem0 only when Mem0
         actually returned an id, and every failure is named in the message
         itself (task 4045)."""
         service.mem0.add_system_record = AsyncMock(**backend_mock_kwargs)
-        mock_journal = MagicMock()
-        mock_journal.log_write_op = AsyncMock()
-        mock_journal.log_backend_op = AsyncMock()
-        service._write_journal = mock_journal
+        mock_journal = _mem0_add_journal()
+        service.set_write_journal(mock_journal)
 
         result = await service.add_system_record(
             content='cycle summary',
@@ -898,7 +949,11 @@ class TestAddSystemRecord:
         assert result.stores_written == expected_stores
         journal_kwargs = mock_journal.log_write_op.call_args[1]
         assert journal_kwargs['result_summary']['stores'] == expected_store_values
-        assert result.message == f'Memory queued for {expected_store_values}{expected_message_suffix}'
+        assert result.message == render_add_memory_message(
+            stores_written=expected_stores, **expected_message_notes
+        )
+        for error_text in expected_message_notes.values():
+            assert error_text in result.message
 
     # -- Amendment (task 2620 review): same task_id normalization as add_memory --
 
@@ -1275,15 +1330,13 @@ class TestSearch:
     ):
         """When filtering by a GRAPHITI_PRIMARY category, Graphiti results
         (which have category=None) must NOT be silently dropped."""
-        from _fm_helpers import MockEdge, MockNode
+        from _fm_helpers import MockEdge
 
         # Mock Graphiti returning edges (category=None in MemoryResult)
         service.graphiti.search = AsyncMock(return_value=[
             MockEdge(
                 fact='Auth service depends on Redis',
                 uuid='edge-uuid-1',
-                source_node=MockNode(name='Auth Service'),
-                target_node=MockNode(name='Redis'),
             ),
         ])
         # Mock Mem0 returning a result with matching category
@@ -1315,14 +1368,12 @@ class TestSearch:
     ):
         """When filtering by only MEM0_PRIMARY categories (e.g. preferences_and_norms),
         Graphiti results (category=None) should be correctly excluded."""
-        from _fm_helpers import MockEdge, MockNode
+        from _fm_helpers import MockEdge
 
         service.graphiti.search = AsyncMock(return_value=[
             MockEdge(
                 fact='Auth service depends on Redis',
                 uuid='edge-uuid-1',
-                source_node=MockNode(name='Auth Service'),
-                target_node=MockNode(name='Redis'),
             ),
         ])
         service.mem0.search = AsyncMock(return_value={
@@ -1352,14 +1403,12 @@ class TestSearch:
     ):
         """When exactly one GRAPHITI_PRIMARY category is in the filter,
         Graphiti results should have that category assigned (not left as None)."""
-        from _fm_helpers import MockEdge, MockNode
+        from _fm_helpers import MockEdge
 
         service.graphiti.search = AsyncMock(return_value=[
             MockEdge(
                 fact='Auth service depends on Redis',
                 uuid='edge-uuid-1',
-                source_node=MockNode(name='Auth Service'),
-                target_node=MockNode(name='Redis'),
             ),
         ])
         service.mem0.search = AsyncMock(return_value={'results': []})
@@ -1377,14 +1426,13 @@ class TestSearch:
     @pytest.mark.asyncio
     async def test_search_graphiti_temporal_valid_at_only(self, service):
         """Graphiti search results with only valid_at set get temporal dict with null invalid_at."""
-        from _fm_helpers import MockEdge, MockNode
+        from _fm_helpers import MockEdge
 
         dt_valid = datetime(2024, 3, 1, 10, 0, 0, tzinfo=UTC)
         service.graphiti.search = AsyncMock(return_value=[
             MockEdge(
                 fact='Service A started',
                 uuid='edge-temporal-1',
-                source_node=MockNode(name='Service A'),
                 valid_at=dt_valid,
                 invalid_at=None,
             ),
@@ -1409,14 +1457,13 @@ class TestSearch:
         with only invalid_at set was returned (len==1). After the fix, superseded
         edges are filtered out, so the result must be empty (len==0).
         """
-        from _fm_helpers import MockEdge, MockNode
+        from _fm_helpers import MockEdge
 
         dt_invalid = datetime(2024, 9, 1, 10, 0, 0, tzinfo=UTC)
         service.graphiti.search = AsyncMock(return_value=[
             MockEdge(
                 fact='Service B deprecated',
                 uuid='edge-temporal-2',
-                source_node=MockNode(name='Service B'),
                 valid_at=None,
                 invalid_at=dt_invalid,
             ),
@@ -1436,13 +1483,12 @@ class TestSearch:
     @pytest.mark.asyncio
     async def test_search_graphiti_result_carries_created_at(self, service):
         """A Graphiti hit with no temporal context still carries its edge's creation time."""
-        from _fm_helpers import MockEdge, MockNode
+        from _fm_helpers import MockEdge
 
         service.graphiti.search = AsyncMock(return_value=[
             MockEdge(
                 fact='Service C owns the ledger',
                 uuid='edge-created-1',
-                source_node=MockNode(name='Service C'),
                 valid_at=None,
                 invalid_at=None,
                 created_at=datetime(2026, 8, 22, 9, 30, 0, tzinfo=UTC),
@@ -1465,19 +1511,17 @@ class TestSearch:
     @pytest.mark.asyncio
     async def test_search_graphiti_created_at_is_canonical_utc(self, service):
         """An offset-aware stamp is converted to its UTC instant; a naive one is read as UTC."""
-        from _fm_helpers import MockEdge, MockNode
+        from _fm_helpers import MockEdge
 
         service.graphiti.search = AsyncMock(return_value=[
             MockEdge(
                 fact='Service D runs in Karachi time',
                 uuid='edge-offset',
-                source_node=MockNode(name='Service D'),
                 created_at=datetime(2026, 8, 22, 9, 30, 0, tzinfo=timezone(timedelta(hours=5))),
             ),
             MockEdge(
                 fact='Service E stamps naive times',
                 uuid='edge-naive',
-                source_node=MockNode(name='Service E'),
                 created_at=datetime(2026, 8, 22, 9, 30, 0),
             ),
         ])
@@ -1499,7 +1543,7 @@ class TestSearch:
         topic_anchor.py::select_topic_canonical compares recency on the raw
         string, so a preserved offset would mis-order these two edges.
         """
-        from _fm_helpers import MockEdge, MockNode
+        from _fm_helpers import MockEdge
 
         earlier_instant = datetime(2026, 8, 22, 8, 0, tzinfo=UTC)
         later_instant = datetime(2026, 8, 22, 9, 0, tzinfo=UTC)
@@ -1511,13 +1555,11 @@ class TestSearch:
             MockEdge(
                 fact='Service F was renamed',
                 uuid='edge-earlier',
-                source_node=MockNode(name='Service F'),
                 created_at=earlier_stored,
             ),
             MockEdge(
                 fact='Service F was renamed again',
                 uuid='edge-later',
-                source_node=MockNode(name='Service F'),
                 created_at=later_stored,
             ),
         ])
@@ -3218,15 +3260,13 @@ class TestSearchDeleteRoundtrip:
     @pytest.mark.asyncio
     async def test_search_then_delete_graphiti_roundtrip(self, service):
         """End-to-end contract test: search returns edge UUIDs that work with delete_memory."""
-        from _fm_helpers import MockEdge, MockNode
+        from _fm_helpers import MockEdge
 
         edge_uuid = '00000000-0000-4000-8000-000000000042'
         service.graphiti.search = AsyncMock(return_value=[
             MockEdge(
                 fact='Payment gateway depends on billing API',
                 uuid=edge_uuid,
-                source_node=MockNode(name='Payment Gateway'),
-                target_node=MockNode(name='Billing API'),
             ),
         ])
         service.mem0.search = AsyncMock(return_value={'results': []})
@@ -3709,34 +3749,6 @@ class TestMem0BackendAddInferContract:
             'normative/procedural content and returns empty results.'
         )
         assert result == {'results': [{'id': 'mem0-new', 'event': 'ADD'}]}
-
-
-class TestMem0BackendClose:
-    @pytest.mark.asyncio
-    async def test_close_awaits_client_close(self, mock_config):
-        """Mem0Backend.close() must await client.close() for each cached instance."""
-        from fused_memory.backends.mem0_client import Mem0Backend
-
-        backend = Mem0Backend(mock_config)
-
-        # Build a mock instance with a vector_store.client.close AsyncMock
-        mock_client = MagicMock()
-        mock_client.close = AsyncMock()
-
-        mock_vector_store = MagicMock()
-        mock_vector_store.client = mock_client
-
-        mock_instance = MagicMock()
-        mock_instance.vector_store = mock_vector_store
-
-        backend._instances = {'test_project': mock_instance}
-
-        await backend.close()
-
-        # The close coroutine must have been awaited, not just created
-        mock_client.close.assert_awaited_once()
-        # All instances must be cleared
-        assert backend._instances == {}
 
 
 class TestGraphitiBackendClose:
@@ -11849,7 +11861,7 @@ class TestGetMemoryTimeoutNotCoercedToNotFound:
 
     @pytest.mark.asyncio
     async def test_mem0_read_timeout_propagates(self, service):
-        from fused_memory.services.memory_service import MemoryNotFoundError  # noqa: PLC0415
+        from fused_memory.services.memory_service import MemoryNotFoundError
 
         uuid = '77a3f6bc-0000-0000-0000-000000000000'
         service.mem0.get = AsyncMock(
@@ -12631,9 +12643,9 @@ class TestMemoryMetadataValidationAtSeam:
         rejection raised after the intent was journalled would convert a
         clean structured rejection into permanent store-reconciliation debt.
 
-        add_memory only: ``add_system_record`` has no write-ahead intent — it
-        goes straight to ``_journaled_backend_call`` — so its equivalent
-        "no persistence side effect" observable is asserted separately below.
+        add_memory here; ``add_system_record``'s write-ahead intent (task
+        7401), together with its other "no persistence side effect"
+        observables, is asserted separately below.
         """
         from fused_memory.memory_metadata import MemoryMetadataValidationError
 
@@ -12646,11 +12658,14 @@ class TestMemoryMetadataValidationAtSeam:
         journal.log_mem0_intent.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_positive_control_valid_write_does_log_the_intent(self, service):
+    @pytest.mark.parametrize('entry_point', _MM_ADD_ENTRY_POINTS)
+    async def test_positive_control_valid_write_does_log_the_intent(
+        self, service, entry_point
+    ):
         """Without this, `not_called` cannot distinguish "rejected before the
         intent" from "the branch never runs at all"."""
         journal = _mm_install_journal(service)
-        await _mm_write(service, 'add_memory', metadata={'topic': 'a-good-slug'})
+        await _mm_write(service, entry_point, metadata={'topic': 'a-good-slug'})
         journal.log_mem0_intent.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -12664,6 +12679,7 @@ class TestMemoryMetadataValidationAtSeam:
             await _mm_write(service, 'add_system_record', metadata={'topic': 'bad_slug'})
 
         journal.log_backend_op.assert_not_called()
+        journal.log_mem0_intent.assert_not_called()
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)

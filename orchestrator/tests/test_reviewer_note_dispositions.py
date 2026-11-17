@@ -93,7 +93,7 @@ class TestReviewerIsBriefedWithItsNotes:
     ):
         run = RouterRun(tmp_path, monkeypatch, DispositioningReviewer())
         _file_note(run.queue)
-        run.fail_the_first_queue_read_after_verification()
+        run.fail_the_first_note_read_after_verification()
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.workflow'):
             assert await run.run() == WorkflowOutcome.DONE

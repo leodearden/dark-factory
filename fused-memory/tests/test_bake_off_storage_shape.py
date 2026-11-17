@@ -174,7 +174,7 @@ class TestLoadE2Fixtures:
         assert len({d.distractor_id for d in slab}) == 300
         # A distractor must never be topic-anchorable, or it stops being a
         # distractor and starts being a right answer for the pin to find.
-        from fused_memory.memory_metadata import RESERVED_VOCABULARY_KEYS  # noqa: PLC0415
+        from fused_memory.memory_metadata import RESERVED_VOCABULARY_KEYS
         for d in slab:
             assert not (RESERVED_VOCABULARY_KEYS & set(d.raw))
 
@@ -296,9 +296,9 @@ class TestDefaultFixturePaths:
         entirely and import THAT — and require the defaults to follow it.
         Only a `__file__`-derived path can.
         """
-        import importlib.util  # noqa: PLC0415
-        import shutil  # noqa: PLC0415
-        import sys  # noqa: PLC0415
+        import importlib.util
+        import shutil
+        import sys
 
         (tmp_path / 'scripts').mkdir()
         relocated = tmp_path / 'scripts' / SCRIPT_PATH.name
@@ -406,9 +406,9 @@ class TestLoadRegrowthInjections:
         fixtures: a path baked in at author time works only from the tree it
         was written in.
         """
-        import importlib.util  # noqa: PLC0415
-        import shutil  # noqa: PLC0415
-        import sys  # noqa: PLC0415
+        import importlib.util
+        import shutil
+        import sys
 
         (tmp_path / 'scripts').mkdir()
         relocated = tmp_path / 'scripts' / SCRIPT_PATH.name
@@ -948,7 +948,7 @@ class TestMaterializeStatusQuoArm:
 
     def test_carries_no_reserved_vocabulary_key_at_all(self):
         """The α records genuinely have no `metadata` key — arm (a) reproduces that."""
-        from fused_memory.memory_metadata import RESERVED_VOCABULARY_KEYS  # noqa: PLC0415
+        from fused_memory.memory_metadata import RESERVED_VOCABULARY_KEYS
 
         for record in _knowledge(_arm('status_quo')):
             assert not (RESERVED_VOCABULARY_KEYS & set(record.metadata))
@@ -1060,7 +1060,7 @@ class TestMaterializeBGroupedArm:
         Canonicality is expressed by the `canonical` key, not by a `kind` —
         this test pins that the arm does not conflate the two.
         """
-        from fused_memory.memory_metadata import KIND_REGISTRY  # noqa: PLC0415
+        from fused_memory.memory_metadata import KIND_REGISTRY
 
         for record in _knowledge(_arm('b_grouped')):
             kind = record.metadata.get('kind')
@@ -1079,7 +1079,7 @@ class TestMaterializeBGroupedArm:
         A short hex id or a bare hex32 would trip `invalid_parent_id_shape`,
         so the arm cannot mint ids casually.
         """
-        import uuid  # noqa: PLC0415
+        import uuid
 
         seen = set()
         for record in _knowledge(_arm('b_grouped')):
@@ -1111,7 +1111,7 @@ class TestDistractorSlabIsSharedAndInert:
     def test_distractors_are_never_topic_anchorable(self):
         """A distractor carrying a `topic` would stop being a distractor and
         start being a right answer for the pin to find."""
-        from fused_memory.memory_metadata import RESERVED_VOCABULARY_KEYS  # noqa: PLC0415
+        from fused_memory.memory_metadata import RESERVED_VOCABULARY_KEYS
 
         for shape in _mod().ARM_SHAPES:
             for record in _distractors(_arm(shape)):
@@ -1222,7 +1222,7 @@ class TestBetaVocabularyConformance:
     """
 
     def test_no_arm_emits_a_fatal_metadata_violation(self):
-        from fused_memory.memory_metadata import validate_memory_metadata  # noqa: PLC0415
+        from fused_memory.memory_metadata import validate_memory_metadata
 
         for shape in _mod().ARM_SHAPES:
             for record in _arm(shape):
@@ -1235,7 +1235,7 @@ class TestBetaVocabularyConformance:
     def test_every_topic_matches_the_shared_slug_shape(self):
         """PRD D4's one-namespace rule, pinned mechanically rather than by
         convention — the slugs come verbatim from E1's registry."""
-        from fused_memory.memory_metadata import (  # noqa: PLC0415
+        from fused_memory.memory_metadata import (
             TOPIC_SLUG_MAX_LEN,
             TOPIC_SLUG_RE,
         )
@@ -2296,7 +2296,7 @@ def _available_estimators():
         import tiktoken  # type: ignore[reportMissingImports]  # noqa: PLC0415
 
         encoding = tiktoken.get_encoding('cl100k_base')
-    except Exception:  # noqa: BLE001 — absent OR unable to fetch its BPE file
+    except Exception:  # absent OR unable to fetch its BPE file
         return estimators
     estimators.append(
         (mod.TIKTOKEN_ESTIMATOR_NAME, lambda text: len(encoding.encode(text)))
@@ -2315,7 +2315,7 @@ class TestResolveTokenEstimator:
         assert isinstance(encode('some text'), int)
 
     def test_names_tiktoken_when_tiktoken_is_importable(self, monkeypatch):
-        import sys  # noqa: PLC0415
+        import sys
 
         mod = _mod()
         monkeypatch.setitem(sys.modules, 'tiktoken', _fake_tiktoken())
@@ -2331,7 +2331,7 @@ class TestResolveTokenEstimator:
     def test_falls_back_to_the_character_proxy_when_tiktoken_is_absent(
         self, monkeypatch
     ):
-        import sys  # noqa: PLC0415
+        import sys
 
         mod = _mod()
         monkeypatch.setitem(sys.modules, 'tiktoken', None)  # forces ImportError
@@ -2352,7 +2352,7 @@ class TestResolveTokenEstimator:
         """tiktoken imports fine but fetches its BPE file from the network on
         first `get_encoding`. On an offline box that raises — and a cost
         metric must not take the whole bake-off down with it."""
-        import sys  # noqa: PLC0415
+        import sys
 
         mod = _mod()
         monkeypatch.setitem(
@@ -2369,7 +2369,7 @@ class TestResolveTokenEstimator:
     def test_resolution_is_not_cached_across_calls(self, monkeypatch):
         """A cached resolution would make the report state whichever
         estimator the FIRST caller in the process happened to get."""
-        import sys  # noqa: PLC0415
+        import sys
 
         mod = _mod()
         monkeypatch.setitem(sys.modules, 'tiktoken', _fake_tiktoken())
@@ -2569,7 +2569,7 @@ class TestTheCharProxyNameIsTrueOfItsArithmetic:
         `context_assembler.estimate_tokens` with no test noticing.  Asserted
         by VALUE — introspecting the function object would only restate the
         import."""
-        from fused_memory.reconciliation.context_assembler import (  # noqa: PLC0415
+        from fused_memory.reconciliation.context_assembler import (
             estimate_tokens,
         )
 
@@ -2683,7 +2683,7 @@ class TestGuardAdequacyUsesTheRealSelector:
     """A reimplemented selector would measure this file, not the guard."""
 
     def test_it_delegates_to_near_duplicate_guard(self, monkeypatch):
-        from fused_memory.server import near_duplicate_guard  # noqa: PLC0415
+        from fused_memory.server import near_duplicate_guard
 
         seen = {}
 
@@ -2712,9 +2712,9 @@ class TestGuardAdequacyUsesTheRealSelector:
         guard_adequacy report `guard_matched: False` for every arm in the
         program rather than raising.
         """
-        from fused_memory.models.enums import MemoryCategory, SourceStore  # noqa: PLC0415
-        from fused_memory.models.memory import MemoryResult  # noqa: PLC0415
-        from fused_memory.server import near_duplicate_guard  # noqa: PLC0415
+        from fused_memory.models.enums import MemoryCategory, SourceStore
+        from fused_memory.models.memory import MemoryResult
+        from fused_memory.server import near_duplicate_guard
 
         captured = []
         monkeypatch.setattr(
@@ -2763,7 +2763,7 @@ class TestGuardThresholdIsNotHardcodedTwice:
     """0.92 lives in near_duplicate_guard. A copy here would drift silently."""
 
     def test_the_default_threshold_comes_from_the_guard_module(self):
-        from fused_memory.server.near_duplicate_guard import (  # noqa: PLC0415
+        from fused_memory.server.near_duplicate_guard import (
             _DEFAULT_NEAR_DUP_THRESHOLD,
         )
 
@@ -2782,7 +2782,7 @@ class TestGuardThresholdIsNotHardcodedTwice:
         assert _mod().resolve_guard_threshold(service) == 0.77
 
     def test_no_memory_service_falls_back_to_the_module_default(self):
-        from fused_memory.server.near_duplicate_guard import (  # noqa: PLC0415
+        from fused_memory.server.near_duplicate_guard import (
             _DEFAULT_NEAR_DUP_THRESHOLD,
         )
 
@@ -2866,7 +2866,7 @@ class TestDropCollectionsNeverAbandonsTheRemainingNames:
 
     @staticmethod
     def _fake_qdrant(monkeypatch, *, fails_on: Container[str] = frozenset()):
-        import qdrant_client  # noqa: PLC0415
+        import qdrant_client
 
         state = {'attempted': [], 'closed': 0}
 
@@ -3175,7 +3175,7 @@ class TestMaxLexicalRatio:
         """SequenceMatcher is order-sensitive; a one-directional ruler would
         put a pair in the paraphrase band or not depending on which id sorted
         first, which is not a property of the pair."""
-        import difflib  # noqa: PLC0415
+        import difflib
 
         mod = _mod()
         left, right = 'the merge worker retries twice', 'retries twice worker'
@@ -4607,8 +4607,8 @@ def _install_driver_doubles(
     script's OWN qdrant seam — the alternative, a fake QdrantClient, would
     test qdrant_client's import machinery rather than the driver's teardown.
     """
-    import fused_memory.config.schema as schema_mod  # noqa: PLC0415
-    import fused_memory.services.memory_service as service_mod  # noqa: PLC0415
+    import fused_memory.config.schema as schema_mod
+    import fused_memory.services.memory_service as service_mod
 
     _FakeMemoryService.instances = []
     _FakeMemoryService.search_raises_on = search_raises_on
@@ -4835,7 +4835,7 @@ class TestEphemeralCollectionIdentity:
         """Derived through Scope, not string-formatted here: Scope canonicalizes
         the project_id (lowercase, '-'->'_'), so a hand-built name would differ
         from the collection mem0 actually writes to and the reap would miss."""
-        from fused_memory.models.scope import Scope  # noqa: PLC0415
+        from fused_memory.models.scope import Scope
 
         mod = _mod()
 
@@ -5437,7 +5437,7 @@ class TestRegrowthPassKey:
         lowercases and `-`->`_`s.  A key that canonicalized DIFFERENTLY would
         name a collection under one spelling and be swept under another —
         i.e. a collection the teardown cannot find, which is the leak."""
-        from fused_memory.models.scope import Scope  # noqa: PLC0415
+        from fused_memory.models.scope import Scope
 
         mod = _mod()
 
@@ -6387,7 +6387,7 @@ class TestReadPathPromote:
         assert, and it is what stops a future positional argument from
         silently re-pointing an existing call site.
         """
-        import inspect  # noqa: PLC0415
+        import inspect
         mod = _mod()
         seeded, hits = _full_window_arm(n=5)
 
@@ -9197,7 +9197,7 @@ async def test_a_live_two_cluster_run_reports_completely_and_leaves_nothing(
     The timeout covers five seed+fetch passes rather than three: the probe
     adds one live seeding and one live fetch per injection mode.
     """
-    from qdrant_client import QdrantClient  # noqa: PLC0415
+    from qdrant_client import QdrantClient
 
     mod = _mod()
     suffix = f'live_{worker_id}'

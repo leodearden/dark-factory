@@ -331,7 +331,7 @@ def emit_zero_progress_requeue_alert(
                 filed_at[task_id] = streak
             return False
 
-        from escalation.models import Escalation  # noqa: PLC0415 — optional dep
+        from escalation.models import Escalation  # optional dep
 
         span_str = _fmt_duration(span_seconds)
         summary = (
@@ -386,7 +386,7 @@ def emit_zero_progress_requeue_alert(
                 'min_span_seconds}.'
             ),
         )
-    except Exception as exc:  # noqa: BLE001 — fail-open backstop
+    except Exception as exc:  # fail-open backstop
         logger.warning(
             'zero-progress-requeue alert for task %s could not be built '
             '(non-fatal): %s', task_id, exc,
@@ -398,7 +398,7 @@ def emit_zero_progress_requeue_alert(
     # a failure of the second must not cost us the first.
     try:
         escalation_queue.submit(esc)
-    except Exception as exc:  # noqa: BLE001 — fail-open backstop
+    except Exception as exc:  # fail-open backstop
         logger.warning(
             'zero-progress-requeue escalation for task %s could not be filed '
             '(non-fatal): %s', task_id, exc,
@@ -418,7 +418,7 @@ def emit_zero_progress_requeue_alert(
 
     if event_store is not None:
         try:
-            from orchestrator.event_store import EventType  # noqa: PLC0415
+            from orchestrator.event_store import EventType
 
             event_store.emit(
                 EventType.zero_progress_requeue,
@@ -434,7 +434,7 @@ def emit_zero_progress_requeue_alert(
                     'block_phase': block_phase,
                 },
             )
-        except Exception as exc:  # noqa: BLE001 — telemetry is best-effort
+        except Exception as exc:  # telemetry is best-effort
             logger.warning(
                 'zero-progress-requeue event for task %s could not be emitted '
                 '(non-fatal, escalation WAS filed): %s', task_id, exc,
@@ -519,7 +519,7 @@ def resolve_zero_progress_requeue_alert(
     try:
         pending = escalation_queue.get_pending()
         alarms = _resolve_own_alarms(escalation_queue, pending, sentinel, resolution)
-    except Exception as exc:  # noqa: BLE001 — fail-open backstop
+    except Exception as exc:  # fail-open backstop
         logger.warning(
             'zero-progress-requeue alert for task %s could not be resolved '
             '(non-fatal): %s', task_id, exc,
@@ -542,14 +542,14 @@ def resolve_zero_progress_requeue_alert(
 
     if event_store is not None:
         try:
-            from orchestrator.event_store import EventType  # noqa: PLC0415
+            from orchestrator.event_store import EventType
 
             event_store.emit(
                 EventType.zero_progress_requeue_recovered,
                 task_id=task_id,
                 data={'streak': recovered_streak, 'resolved': alarms, 'wrappers': wrappers},
             )
-        except Exception as exc:  # noqa: BLE001 — telemetry is best-effort
+        except Exception as exc:  # telemetry is best-effort
             logger.warning(
                 'zero-progress-requeue recovery event for task %s could not be '
                 'emitted (non-fatal, alert WAS resolved): %s', task_id, exc,

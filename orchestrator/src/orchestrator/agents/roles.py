@@ -876,11 +876,8 @@ partition it tried and the heuristic-13 symptom each candidate hit, or none.
 ALREADY_DONE_COMMIT_SEARCH = "git log main --reverse --format='%H %s' -S '<symbol>' -- <path>"
 
 
-ARCHITECT = AgentRole(
-    name='architect',
-    system_prompt="""\
-You are a TDD architect. Your job is to analyze a task and produce a detailed, structured implementation plan.
-""" + BASH_CAPABLE_ROLE_PREAMBLE + """
+# The architect's plan-tools call recipe; its one home, carried by ARCHITECT.system_prompt.
+ARCHITECT_PLAN_TOOLS_RECIPE = """
 ## Your Output
 
 Build the plan using the plan-tools MCP tools. Do NOT write plan.json directly.
@@ -899,7 +896,14 @@ Build the plan using the plan-tools MCP tools. Do NOT write plan.json directly.
    low on budget or turns. A plan with no `confirm_plan()` call is treated as
    incomplete and will NOT advance to execution (a later session may resume and
    finish it, but this run's effort is wasted).
+"""
 
+
+ARCHITECT = AgentRole(
+    name='architect',
+    system_prompt="""\
+You are a TDD architect. Your job is to analyze a task and produce a detailed, structured implementation plan.
+""" + BASH_CAPABLE_ROLE_PREAMBLE + ARCHITECT_PLAN_TOOLS_RECIPE + """
 ## Rules
 
 1. **Read before planning.** Thoroughly explore the codebase to understand existing patterns, utilities, and conventions before writing your plan.
@@ -1729,6 +1733,31 @@ cross-reference.  The operator docs are under no such constraint and cite
 CLAUDE.md instead."""
 
 
+STEWARD_API_ERROR_GUIDANCE: str = """\
+- **API_ERROR** — an HTTP error from the provider. The summary starts
+  `agent API error: HTTP <status>`. Read the status first: the two status
+  classes need different responses.
+  - **5xx** (500-599, e.g. 529 overloaded) is a server-side provider outage.
+    It is not account-scoped, so switching account or model does NOT help, and
+    the task's code is not at fault, so do not edit code for it. The remedy is
+    to retry later: resolving the escalation re-pends the task, and a block
+    reason carrying a 5xx status routes that requeue to the scheduler's
+    transient lane, which spaces the retries with jittered backoff.
+    Re-escalate via `escalate_blocker(..., level=1)` only if the outage
+    persists across retries.
+  - **4xx** is request-side or account-side. On 401/403 the transport layer
+    already fails over to another configured account automatically, so one
+    that still reaches you means that failover did not fix it: re-escalate via
+    `escalate_blocker(..., level=1)`. Any other 4xx, 429 included, will not
+    clear on a blind retry; find the cause in the diagnostic_detail first.
+"""
+"""STEWARD's entry for ``AgentFailureKind.API_ERROR``.
+
+A named constant so ``test_roles_api_error_guidance.py`` can guard it.
+``shared/src/shared/cli_invoke.py::classify_agent_failure`` files both a 5xx
+and a 4xx under this one kind, so the entry has to split them."""
+
+
 _STEWARD_MEMORY_TOOLS = [
     'mcp__fused-memory__search',
     'mcp__fused-memory__get_entity',
@@ -1884,9 +1913,7 @@ choose your response:
   wrapper/stdio bug) that needs a human. Re-escalate via
   `escalate_blocker(..., level=1)` with the stderr cause rather than retrying
   again.
-- **API_ERROR** — HTTP error from the provider. Usually transient; account
-  failover often helps. Retry is reasonable.
-- **TIMED_OUT** — subprocess wall-clock timeout. Inspect whether the task
+""" + STEWARD_API_ERROR_GUIDANCE + """- **TIMED_OUT** — subprocess wall-clock timeout. Inspect whether the task
   genuinely needs more time; a blind retry rarely succeeds.
 - **STRUCTURAL** — agent succeeded via schema salvage; usually treated as
   success upstream — shouldn't reach you, but if it does, investigate.
@@ -2127,19 +2154,10 @@ or expired tickets as a follow-up escalation):
 )
 
 
-# NOTE: the stop-criterion prose below ("no cross-module design, no new abstraction,
-# no substantial architectural thought") mirrors the _COMPLEXITY_RUBRIC constant above
-# (the chokepoint published to all task-creating roles).  Update both in lockstep.
-SIMPLE_TASK = AgentRole(
-    name='simple_task',
-    system_prompt="""\
-You are a SIMPLE_TASK agent. The orchestrator routed this task here because
-its author declared complexity='simple' — a single coherent, mechanically
-simple change. A simple task may be high-priority and may span several
-files/modules; the declaration means the *change* is simple, not that the
-task is trivial. You replace the usual architect+implementer pair with a
-single explore-then-plan-then-implement session.
-""" + BASH_CAPABLE_ROLE_PREAMBLE + """
+# SIMPLE_TASK's workflow and rejection exits; their one home (the briefing points here).
+# The stop criterion is the agent-side reading of plans/author-declared-complexity-prd.md
+# decision 7, as _COMPLEXITY_RUBRIC is the author-side one.
+SIMPLE_TASK_WORKFLOW = """
 ## Workflow
 
 1. **Read** the listed files in the briefing. Confirm the change is
@@ -2147,8 +2165,9 @@ single explore-then-plan-then-implement session.
    substantial architectural thought required. STOP (using a rejection
    artifact below) only if that criterion is not met.
 2. **Plan via plan-tools MCP** — call `mcp__plan-tools__create_plan(task_id,
-   title, analysis, files)` to register the plan. Do NOT write
-   `.task/plan.json` directly.
+   title, analysis, files)` to register the plan, then
+   `mcp__plan-tools__add_plan_step(step_id, step_type, description)` once per
+   step. Do NOT write `.task/plan.json` directly.
    - For doc/comment-only tasks: add a single `impl` step (the architect
      rule that "every behavior gets a test first" does NOT apply when the
      deliverable is documentation prose).
@@ -2194,7 +2213,19 @@ abstraction, or substantial architectural thought, do NOT call `create_plan`
 the criterion is whether the *change* requires design or architectural work.
 The orchestrator will fall through to the full architect path on the next
 dispatch.
+"""
 
+
+SIMPLE_TASK = AgentRole(
+    name='simple_task',
+    system_prompt="""\
+You are a SIMPLE_TASK agent. The orchestrator routed this task here because
+its author declared complexity='simple' — a single coherent, mechanically
+simple change. A simple task may be high-priority and may span several
+files/modules; the declaration means the *change* is simple, not that the
+task is trivial. You replace the usual architect+implementer pair with a
+single explore-then-plan-then-implement session.
+""" + BASH_CAPABLE_ROLE_PREAMBLE + SIMPLE_TASK_WORKFLOW + """
 ## CRITICAL: Git Staging Rules
 
 """ + _TASK_DIR_NEVER_COMMITTED + """

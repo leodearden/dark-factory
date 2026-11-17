@@ -237,7 +237,8 @@ CREATE INDEX IF NOT EXISTS idx_bo_created ON backend_ops(created_at);
 -- terminal completed/failed rows are aged out by WriteJournal.prune_mem0_intents
 -- (run at startup after recovery); 'dead' rows are preserved for manual replay.
 -- 'retrying' rows (task 7397: a transient provider failure, re-issued at
--- next_attempt_at) keep resolved_at NULL and so are never pruned.
+-- next_attempt_at) keep resolved_at NULL and so are never pruned. A re-issue
+-- calls the Mem0Backend method write_method names (task 7401).
 CREATE TABLE IF NOT EXISTS mem0_intents (
     id TEXT PRIMARY KEY,
     write_op_id TEXT,
@@ -254,7 +255,8 @@ CREATE TABLE IF NOT EXISTS mem0_intents (
     created_at TEXT NOT NULL,
     resolved_at TEXT,
     attempts INTEGER NOT NULL DEFAULT 0,
-    next_attempt_at TEXT
+    next_attempt_at TEXT,
+    write_method TEXT NOT NULL DEFAULT 'add'
 );
 CREATE INDEX IF NOT EXISTS idx_mi_status ON mem0_intents(status);
 CREATE INDEX IF NOT EXISTS idx_mi_write_op ON mem0_intents(write_op_id);
@@ -447,6 +449,13 @@ class Mem0IntentStatus(StrEnum):
     DEAD = 'dead'
 
 
+class Mem0WriteMethod(StrEnum):
+    """Which ``Mem0Backend`` method an intent's write goes through, so a re-issue calls the same one."""
+
+    ADD = 'add'
+    ADD_SYSTEM_RECORD = 'add_system_record'
+
+
 def _schedule_timestamp(moment: datetime) -> str:
     return moment.isoformat(timespec='microseconds')
 
@@ -454,6 +463,14 @@ def _schedule_timestamp(moment: datetime) -> str:
 def decode_mem0_intent_metadata(intent: Mapping[str, Any]) -> dict[str, Any]:
     """The metadata a ``mem0_intents`` row journaled: the one decoder of that column."""
     return json.loads(intent.get('metadata') or '{}')
+
+
+def decode_mem0_intent_write_method(intent: Mapping[str, Any]) -> Mem0WriteMethod:
+    """The method a ``mem0_intents`` row writes through: the one decoder of that column.
+
+    Raises ``ValueError`` naming an unknown or missing value.
+    """
+    return Mem0WriteMethod(intent.get('write_method'))
 
 
 @dataclass(frozen=True)
@@ -596,6 +613,11 @@ class WriteJournal:
 
             if await add_column_if_missing(db, 'mem0_intents', 'next_attempt_at', 'TEXT'):
                 logger.info('Migration: added next_attempt_at column to mem0_intents')
+
+            if await add_column_if_missing(
+                db, 'mem0_intents', 'write_method', "TEXT NOT NULL DEFAULT 'add'"
+            ):
+                logger.info('Migration: added write_method column to mem0_intents')
 
             # Indexes on new columns (safe after migration ensures columns exist)
             await db.execute(
@@ -1070,6 +1092,7 @@ class WriteJournal:
         content: str,
         metadata: dict | None = None,
         payload_digest: str | None,
+        write_method: Mem0WriteMethod,
     ) -> None:
         """Write-ahead a Mem0 write intent.
 
@@ -1089,8 +1112,8 @@ class WriteJournal:
                     """INSERT INTO mem0_intents
                        (id, write_op_id, causation_id, project_id, agent_id,
                         session_id, category, payload_digest, content, metadata,
-                        status, reason, created_at, resolved_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, ?, NULL)""",
+                        write_method, status, reason, created_at, resolved_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, ?, NULL)""",
                     (
                         intent_id,
                         write_op_id,
@@ -1102,6 +1125,7 @@ class WriteJournal:
                         payload_digest,
                         content,
                         json.dumps(metadata) if metadata else '{}',
+                        write_method.value,
                         datetime.now(UTC).isoformat(),
                     ),
                 )

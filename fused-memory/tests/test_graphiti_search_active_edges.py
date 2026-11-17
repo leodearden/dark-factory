@@ -29,7 +29,7 @@ from graphiti_core.cross_encoder.client import CrossEncoderClient
 from graphiti_core.embedder import EmbedderClient
 from graphiti_core.llm_client.client import LLMClient
 
-from fused_memory.backends.graphiti_client import _ACTIVE_EDGE_PREDICATE
+from fused_memory.backends.relates_to_schema import ACTIVE_EDGE_PREDICATE
 
 QUERY_VECTOR = (1.0, 0.0, 0.0)
 
@@ -62,7 +62,7 @@ class TestSearchRanksOnlyActiveEdges:
         assert bm25, 'no BM25 edge leg was issued'
         assert cosine, 'no cosine edge leg was issued'
         unfiltered = [
-            cypher for cypher in [*bm25, *cosine] if _ACTIVE_EDGE_PREDICATE not in cypher
+            cypher for cypher in [*bm25, *cosine] if ACTIVE_EDGE_PREDICATE not in cypher
         ]
         assert unfiltered == []
 

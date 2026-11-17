@@ -346,7 +346,7 @@ def escalation_ages_secs(
     for record in records:
         try:
             rec_id = str(record.id)
-        except Exception:  # noqa: BLE001 — a corrupt record must not abort a sweep
+        except Exception:  # a corrupt record must not abort a sweep
             logger.debug('recovery emission: skipping an unreadable escalation record')
             continue
         created = _parse_timestamp(getattr(record, 'created_at', None))
@@ -395,7 +395,7 @@ def as_ageable_records(records: Any) -> list[AgeableRecord]:
                     or getattr(record, 'timestamp', None)
                 ),
             ))
-        except Exception:  # noqa: BLE001 — a corrupt record must not abort a sweep
+        except Exception:  # a corrupt record must not abort a sweep
             logger.debug('recovery emission: skipping an unreadable escalation record')
     return adapted
 
@@ -458,7 +458,7 @@ def pin_buckets(
     established no incarnation holds the task) and free at the dispatch gate,
     whose ``vetoes_done_flip`` answer is liveness-independent.
     """
-    from escalation.pins import (  # noqa: PLC0415
+    from escalation.pins import (
         classify_pins,
         pinned_only_by_human_parked,
     )
@@ -640,7 +640,7 @@ def emit_recovery_event(
         return False
     try:
         event_store.emit(event_type, task_id=task_id, data=payload)
-    except Exception as exc:  # noqa: BLE001 — telemetry is best-effort
+    except Exception as exc:  # telemetry is best-effort
         logger.warning(
             'recovery emission for task %s could not be emitted (non-fatal): %s',
             task_id, exc,
@@ -1079,7 +1079,7 @@ def emit_recovery_veto_streak_escalation(
                 filed_at[task_id] = streak
             return False
 
-        from escalation.models import Escalation  # noqa: PLC0415 — optional dep
+        from escalation.models import Escalation  # optional dep
 
         ids = _flatten_ids(escalation_ids)
         span_str = _fmt_duration(span_seconds)
@@ -1139,7 +1139,7 @@ def emit_recovery_veto_streak_escalation(
                 'needed.'
             ),
         )
-    except Exception as exc:  # noqa: BLE001 — fail-open backstop
+    except Exception as exc:  # fail-open backstop
         logger.warning(
             'recovery veto streak alarm for task %s could not be built '
             '(non-fatal): %s', task_id, exc,
@@ -1148,7 +1148,7 @@ def emit_recovery_veto_streak_escalation(
 
     try:
         escalation_queue.submit(esc)
-    except Exception as exc:  # noqa: BLE001 — fail-open backstop
+    except Exception as exc:  # fail-open backstop
         logger.warning(
             'recovery veto streak alarm for task %s could not be filed '
             '(non-fatal): %s', task_id, exc,
@@ -1242,7 +1242,7 @@ def resolve_recovery_veto_streak_escalation(
                 esc.id, resolution, resolved_by=RECOVERY_VETO_STREAK_ROLE,
             )
             alarms += 1
-    except Exception as exc:  # noqa: BLE001 — fail-open backstop
+    except Exception as exc:  # fail-open backstop
         logger.warning(
             'recovery veto streak alarm for task %s could not be resolved '
             '(non-fatal): %s', task_id, exc,

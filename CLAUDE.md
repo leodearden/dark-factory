@@ -14,12 +14,7 @@ consult those docs yourself rather than re-deriving what they cover.
 Package dirs follow a `<pkg>/src/<pkg>/` double-nesting convention:
 `orchestrator/src/orchestrator/`, `fused-memory/src/fused_memory/`,
 `escalation/src/escalation/`, `shared/src/shared/`. `skills/` is the
-**in-repo** skill source (distinct from `~/.claude/skills`). Other
-top-level dirs: `dashboard/` — web UI for task/escalation state;
-`scripts/` — operator and CI helper scripts; `hooks/` — git hooks
-(pre-commit, pre-merge-commit); `plans/` — design docs and PRDs for
-in-flight/past work; `docs/` — reference docs (see `docs/legibility/` for
-the confusion codebook).
+**in-repo** skill source (distinct from `~/.claude/skills`).
 
 Every project targeted by Dark Factory — this repo included — must expose
 its top-level orchestrator config at
@@ -83,6 +78,12 @@ cd fused-memory && uv sync
 ```
 
 Full fresh-machine walkthrough: `SETUP.md`.
+
+Production FalkorDB (`docker-falkordb-1`, `:6379`) takes no experiments,
+clones or index work, and ad-hoc access to it is `redis-cli` reads only. The
+rule, and the stopword IN-list crash it guards against, are in `OPERATIONS.md`
+§"FalkorDB settings and the recreate gate" → "Experiments never touch
+production FalkorDB".
 
 ### Locating installed code
 
@@ -154,6 +155,35 @@ printing every copy. `Glob` passes `--no-ignore` and fails the same way;
 `Grep` honours `.gitignore`. Ask git's index instead:
 `git ls-files -- '*<name>'`, adding `--others --exclude-standard` for untracked
 files. Inside a task worktree both walks are fine.
+
+### Locating a session transcript
+
+A session id is enough to find its transcript, so **never `find /` for one**:
+two census-verifier sessions on 2026-08-16 scanned the whole filesystem for a
+session id and outran the Bash tool's 2-minute default `timeout`, though both
+transcripts were in the archive. Dispatched agents' sessions are archived at
+the MAIN checkout (`data/` is untracked, so no worktree has one) as
+`data/orchestrator/agent-transcripts/<task_id>/<encoded-cwd>/<session-id>.jsonl`,
+subagents under `<session-id>/subagents/`; the first component can be a run key
+such as `recon-<run_id>`. The files are plain `.jsonl` since task 3618, so the
+`.jsonl.gz` in `plans/agent-transcript-archival-prd.md` is historical. A
+session is archived when its invocation ends; until then it is in its
+worktree's `.task/claude-config-<task_id>/projects/`. Interactive sessions are
+never archived and stay at `~/.claude/projects/<encoded-cwd>/<session-id>.jsonl`.
+The layout's one home is `shared/src/shared/transcript_archive.py::durable_archive_path`.
+
+<!-- session-transcript-lookup:begin
+     EXECUTED by tests/scripts/test_session_transcript_lookup_convention.py from a
+     linked worktree, against an archive the real writer built. Turn it into a
+     hand-written glob or `find` and that guard goes red. -->
+- **Session transcript**: `python3 scripts/locate_session_transcript.py <session-id>`
+<!-- session-transcript-lookup:end -->
+
+It prints every match, one path per line; on a miss it exits 1, naming each
+root it searched. It takes full ids only. Another project's sessions are in
+that project's own archive (`--project-root <root>`). It searches only the
+archive and `~/.claude/projects`, so it misses a session still in flight in a
+worktree's `.task/` config or one run under another `CLAUDE_CONFIG_DIR`.
 
 ### Anchoring ad-hoc paths
 
@@ -250,27 +280,14 @@ orchestrator/src/orchestrator. Note: your current working directory is
 
 ### Write operations
 
-| Operation | Cost | When to use |
-|-----------|------|-------------|
-| `add_memory` | 0-3 LLM calls | Discrete, distilled facts — **prefer this** |
-| `add_episode` | 5-15 LLM calls | Raw content needing extraction — use sparingly |
+Prefer `add_memory` (0-3 LLM calls) over `add_episode` (5-15); category
+routing is in the fused-memory server instructions.
 
 ```
 add_memory(content="Task 3127 moved retries into the caller because they hid latency",
            category="decisions_and_rationale", project_id="dark_factory",
            agent_id="claude-interactive", entities=[{'kind': 'task', 'id': 3127}])
 ```
-
-### Category routing
-
-| Category | Primary Store | Use for |
-|----------|--------------|---------|
-| `entities_and_relations` | Graphiti | Facts about things and connections |
-| `temporal_facts` | Graphiti | State that changes over time |
-| `decisions_and_rationale` | Graphiti | Choices made and why |
-| `preferences_and_norms` | Mem0 | Conventions, style rules |
-| `procedural_knowledge` | Mem0 | Workflows, how-to steps |
-| `observations_and_summaries` | Mem0 | High-level takeaways, session recaps |
 
 ## Write-Tagging Convention
 
@@ -376,13 +393,7 @@ Use `/memory` for detailed guidance on writing effective memories.
 `mcp__escalation__reload_config` hot-applies an
 `dark-factory-orchestrator.yaml` edit to a **running** orchestrator
 without a restart (it always re-reads that process's own
-`ORCH_CONFIG_PATH`, never another project's). Green tier (hot-reloadable)
-covers per-role models/budgets/max_turns/effort/timeouts/backends,
-`routing.*`, steward grace, scheduler + watcher tuning, `review.*`,
-`unblock_auto.*`, `verify_env`, and `git.offline_lane_*` leaves; red tier
-(restart-only) covers `max_concurrent_tasks`, pool sizes, escalation
-host/port, `sandbox.backend`, `project_root`, merge-lane `git.*`
-structural fields, and `usage_cap.*`. **Reloaded ≠ everything took
+`ORCH_CONFIG_PATH`, never another project's). **Reloaded ≠ everything took
 effect** — always read the returned `applied` / `restart_required`
 dispositions, not just the top-level `reloaded` flag. Full tier lists and
 workflow: **`OPERATIONS.md` §"Config reload vs restart"** and
@@ -400,28 +411,8 @@ read-only) before manually restarting anything. Full model, `--report`
 column reference, and the soak signal to watch:
 **`OPERATIONS.md` §"Fleet redeploy & watchdog"**.
 
-Two things that section used to claim, and that measurement disproved on
-2026-08-24/25: only the **staleness** tier passes `--drain` (historical: the
-coordinator passed no arguments then; since task **5371** both tiers pass it),
-and the two tiers **can** both redeploy inside one 8h window — the clock is stamped only
-when a sweep completes, so a long sweep leaves it reading the previous deploy
-throughout. Tasks **4754** and **4755** have since closed this: a sweep now
-holds an in-flight lease that the backstop, the coordinator and (for its
-`current_unit` only) the liveness probe all honor. Two residuals remain — a
-sweep overrunning `orchestrator_restart_lease_max_age_secs` loses the lease
-and degrades to the old collision, and the fused-memory tier has no lease at
-all — so read `--report`'s `FLEET-LEASE:` line rather than assuming.
-
-`--drain` (task 5371, per unit since task 7297) is a two-stage drain: Stage A
-halts a unit's merge admission when the sweep reaches it; Stage B restarts it
-once none of its merge verifies is in flight, bounded by each verify's own
-timeout, a per-unit `ORCH_DRAIN_VERIFY_MAX_WAIT_SECS`, and a sweep-wide
-ceiling `ORCH_DRAIN_SWEEP_VERIFY_MAX_WAIT_SECS` counted from sweep start; past
-the ceiling every unit still gets its request and is restarted at its first
-acknowledged poll. How the ceiling fits under the lease is derived at
-`scripts/restart-all-orchestrators.sh::DRAIN_SWEEP_VERIFY_MAX_WAIT_SECS`.
-Pre-5371 units and refused requests keep the old 600s merge-idle gate. The
-first sweep after a deploy of that code still meets old-code units. Detail:
+Restart sweeps hold a lease, with known residuals: read `--report`'s
+`FLEET-LEASE:` line rather than assuming. `--drain` mechanics:
 `OPERATIONS.md` §"Reading a drain".
 
 ## Working in the main checkout
@@ -434,7 +425,8 @@ directly, not just interactive agents.
   (not a bare `git commit`) so you don't sweep up unrelated staged/dirty state
   from a concurrent process.
 - `pre-commit` runs the merge gate's module checks **only for modules with
-  staged `.py` changes** (`hooks/project-checks` via
+  staged `.py` changes**, plus `root:type` for a staged repo-root `.py`
+  (`hooks/project-checks` via
   `scripts/hook_module_checks.py`, task 8531). A commit mapping to none prints
   `merge-gate checks skipped (...)` and is quick. A docs-only commit runs the
   `scripts/merge_screen.yaml` screen instead (about 10 s warm) when it stages
@@ -496,12 +488,6 @@ directly, not just interactive agents.
 
 ## Reference
 
-- **User docs**: `README.md` (entry point) · `SETUP.md` (install/onboard)
-  · `OPERATIONS.md` (runbook: skills map, merging, resolve_issue, config
-  reload, model routing, fleet redeploy, troubleshooting)
-  · `ARCHITECTURE.md` (process topology, task lifecycle, agent roles,
-  escalation ladder, merge lane) · `docs/task-authoring.md` (task metadata
-  reference) · `CONTRIBUTING.md` (conventions, quality gates, git workflow)
 - **Design docs**: `DESIGN.md` (fused-memory architecture),
   `fused-memory/src/fused_memory/reconciliation/prompts/` (reconciliation
   stage/judge prompt sources), `RECONCILIATION_PLAN.md`

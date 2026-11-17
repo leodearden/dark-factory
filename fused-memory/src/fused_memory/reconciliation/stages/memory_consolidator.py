@@ -49,9 +49,12 @@ from fused_memory.reconciliation.orphaned_recon_escalation_sweep import (
 )
 from fused_memory.reconciliation.overreach_flags import render_overreach_flags_section
 from fused_memory.reconciliation.preservation_specimen_guard import (
+    CANDIDATE_TASK_IDS_STAT,
+    UNRESOLVED_TASK_IDS_STAT,
     PreservationSuppressionResult,
     filter_preservation_specimen_flags,
     maybe_escalate_preservation_suppression_storm,
+    maybe_escalate_unresolved_corroboration,
 )
 from fused_memory.reconciliation.prompts import _STAGE1_PROJECT_ID_GUIDELINE
 from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
@@ -61,6 +64,7 @@ from fused_memory.reconciliation.recon_pool_map import (
 from fused_memory.reconciliation.stage1_flag_chain import FlagChainContext, run_stage1_flag_chain
 from fused_memory.reconciliation.stage1_payload_format import (
     append_note,
+    format_context_fetch_failures,
     format_context_items,
     format_episodes,
     format_events,
@@ -292,6 +296,7 @@ class MemoryConsolidator(BaseStage):
     # Fetch degraded sources for the current run — reset at the top of assemble_payload
     # and _format_assembled_payload; copied to report.stats['stage1_fetch_degraded'] in run()
     # (task 1812). Empty list = genuine empty corpus; non-empty = fetch failure on that source.
+    # 'event_context' means the ContextAssembler could not fetch some event's context (task 5370).
     # Initialized per-instance in __init__ to avoid the shared-mutable-default hazard.
     _fetch_degraded_sources: list
 
@@ -330,9 +335,10 @@ class MemoryConsolidator(BaseStage):
 
         Phantom-citation verification already ran inside ``super().run()``, for
         every stage; repeating it here would double-count each citation stat.
-        The two guards run above the remediation early-return because a
-        remediation pass needs them too. A remediation pass re-emits a curated
-        flag list, so it skips the flag chain and every full-cycle step.
+        The two guards, and the preservation guard's disclosures, run above the
+        remediation early-return because a remediation pass needs them too. A
+        remediation pass re-emits a curated flag list, so it skips the flag
+        chain and every full-cycle step.
 
         The flag-emitting steps (curator gate, orphan sweep, unlanded check)
         run above the flag chain, so their flags earn ``stage1_flag_marker``
@@ -344,11 +350,11 @@ class MemoryConsolidator(BaseStage):
         )
         self._publish_always_present_stats(report)
         preservation_result = await self._apply_preservation_specimen_guard(report)
+        await self._escalate_preservation_disclosures(preservation_result, run_id)
         self._apply_live_workflow_citation_guard(report)
         if self.remediation_findings is not None:
             return report
 
-        await self._escalate_preservation_storm(preservation_result, run_id)
         await self._append_curator_gate_sweep_flags(report, run_id)
         await self._run_auto_consolidation(report, run_id)
         await self._append_orphaned_recon_escalation_flags(report, run_id)
@@ -404,6 +410,8 @@ class MemoryConsolidator(BaseStage):
             'preservation_specimen_suppressed': 0,
             'preservation_specimen_unresolved': 0,
             'preservation_specimen_citations': {},
+            CANDIDATE_TASK_IDS_STAT: [],
+            UNRESOLVED_TASK_IDS_STAT: [],
             CITATION_CONTRADICTIONS_STAT: 0,
             'gate_owned_suggested_actions_normalized': 0,
             **auto_consolidation_initial_stats(),
@@ -432,6 +440,8 @@ class MemoryConsolidator(BaseStage):
             )
             report.stats['preservation_specimen_unresolved'] = len(result.unresolved_task_ids)
             report.stats['preservation_specimen_citations'] = dict(result.citations_by_task)
+            report.stats[CANDIDATE_TASK_IDS_STAT] = list(result.candidate_task_ids)
+            report.stats[UNRESOLVED_TASK_IDS_STAT] = list(result.unresolved_task_ids)
         except Exception:
             logger.exception(
                 'preservation-specimen guard failed for project %s (best-effort — '
@@ -452,13 +462,15 @@ class MemoryConsolidator(BaseStage):
         except Exception:
             logger.exception('live-workflow citation guard failed for project %s', self.project_id)
 
-    async def _escalate_preservation_storm(
+    async def _escalate_preservation_disclosures(
         self, preservation_result: PreservationSuppressionResult | None, run_id: str,
     ) -> None:
-        """The preservation guard's per-cycle storm escape, with its unreadable-corroboration disclosure.
+        """The preservation guard's storm escape and its persistent-unresolved report.
 
-        It runs whether or not any flag survived: a storm is the cycle in which
-        the guard may have suppressed every flag.
+        They run whether or not any flag survived: a storm is the pass in which
+        the guard may have suppressed every flag. They run on remediation passes
+        too, as the guard does (tasks 4223, 5464): why is
+        ``preservation_specimen_guard``'s module docstring.
         """
         if self._escalation_queue is None or preservation_result is None:
             return
@@ -467,6 +479,14 @@ class MemoryConsolidator(BaseStage):
             project_id=self.project_id,
             run_id=run_id,
             result=preservation_result,
+        )
+        await maybe_escalate_unresolved_corroboration(
+            escalation_queue=self._escalation_queue,
+            project_id=self.project_id,
+            run_id=run_id,
+            result=preservation_result,
+            journal=self.journal,
+            stage_key=self.stage_id.value,
         )
 
     async def _append_curator_gate_sweep_flags(self, report: StageReport, run_id: str) -> None:
@@ -1113,6 +1133,8 @@ Review the above data and perform memory consolidation:
         # assemble_payload's line-262 reset is bypassed by the early return at lines 250-251.
         # Reset here so each assembled-path call starts clean (no leak from a prior run).
         self._fetch_degraded_sources = []
+        if ap.context_fetch_failures:
+            self._fetch_degraded_sources.append('event_context')
         # This path does no freshness filtering (it formats ContextAssembler output
         # directly, not the episodes/mem0-memories filters below), so the count stays
         # 0 here — but reset it anyway so a reused instance never inherits a stale
@@ -1166,6 +1188,7 @@ Review the above data and perform memory consolidation:
 
         ctx_str, ctx_n = format_context_items(ap.context_items)
         self._entity_summary_snapshot_lines_stripped = ctx_n
+        ctx_str = append_note(ctx_str, format_context_fetch_failures(ap.context_fetch_failures))
 
         return f"""## Reconciliation Run — Stage 1: Memory Consolidation
 ## Project: {self.project_id}

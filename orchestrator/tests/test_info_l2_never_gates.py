@@ -23,15 +23,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from _info_l0_router_fixtures import handing_off_steward
-from _workflow_helpers import (
-    AgentStub,
-    _build_workflow_with_escalation,
-    _make_resolving_steward,
-)
-from escalation.models import Escalation
-from escalation.pins import classify_pins
-from escalation.queue import EscalationQueue
-from test_workflow_merge_gating_strand import (
+from _merge_phase_fixtures import (
     _build_workflow,
     _make_advanced_worktree,
     _make_silent_steward,
@@ -40,10 +32,18 @@ from test_workflow_merge_gating_strand import (
     _time_the_wait,
     _wire_resolve_callback,
 )
-from test_workflow_merge_gating_strand import config as config
-from test_workflow_merge_gating_strand import git_ops as git_ops
-from test_workflow_merge_gating_strand import git_repo as git_repo
-from test_workflow_merge_gating_strand import task_assignment as task_assignment
+from _merge_phase_fixtures import config as config
+from _merge_phase_fixtures import git_ops as git_ops
+from _merge_phase_fixtures import git_repo as git_repo
+from _merge_phase_fixtures import task_assignment as task_assignment
+from _workflow_helpers import (
+    AgentStub,
+    _build_workflow_with_escalation,
+    _make_resolving_steward,
+)
+from escalation.models import Escalation
+from escalation.pins import classify_pins
+from escalation.queue import EscalationQueue
 
 from orchestrator.agents.roles import STEWARD
 from orchestrator.verify import VerifyResult

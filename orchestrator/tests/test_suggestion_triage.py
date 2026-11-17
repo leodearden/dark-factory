@@ -7,7 +7,7 @@ import json
 import logging
 from pathlib import Path
 from typing import cast
-from unittest.mock import AsyncMock, MagicMock, patch  # noqa: F401
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _mcp_transport_harness import tool_reply_envelope

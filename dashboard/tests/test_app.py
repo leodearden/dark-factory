@@ -1928,7 +1928,7 @@ def test_tasks_offline_flag_survives_a_hang_that_degrades_most_roots(client):
     """No root produced rows + at least one demonstrably failed IS the outage.
 
     The handler's own budget caps how many roots can reach the offline state:
-    in a hang each root burns up to ``_TASKS_PER_PROJECT_BUDGET`` before
+    in a hang each root burns up to ``TASKS_PER_PROJECT_BUDGET`` before
     ``wait_for`` cuts it, and a cut root lands in ``degraded``, not
     ``offline``. A stricter ``len(offline) == total_roots`` test therefore
     made this flag unreachable on a nine-root config for the most likely total

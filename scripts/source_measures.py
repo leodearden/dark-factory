@@ -26,14 +26,17 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import NamedTuple
 
-# NOTE: module scope imports only the stdlib ON PURPOSE. complexipy and radon
-# are imported lazily inside the functions that need them (see
-# ``_import_complexipy``), so this module stays importable and type-checkable in
-# environments whose dev group does not carry them -- notably the ``shared``
-# project, which owns the ``ruff check scripts/`` and ``pyright scripts/`` gates
-# for this file. Laziness is not softness: the moment a measure actually needs
-# the tool, a missing or wrong-version one raises MetricsError with a named
-# cause (INV-11).
+import _checkout
+
+# NOTE: module scope imports only the stdlib, plus the stdlib-only
+# scripts/_checkout.py, ON PURPOSE. Importing _checkout binds this checkout's
+# members, as it does for every script. complexipy and radon are imported lazily
+# inside the functions that need them (see ``_import_complexipy``), so this
+# module stays importable and type-checkable in environments whose dev group
+# does not carry them -- notably the ``shared`` project, which owns the
+# ``ruff check scripts/`` and ``pyright scripts/`` gates for this file.
+# Laziness is not softness: the moment a measure actually needs the tool, a
+# missing or wrong-version one raises MetricsError with a named cause (INV-11).
 
 
 class MetricsError(Exception):
@@ -417,7 +420,7 @@ def require_complexipy() -> str:
     return version
 
 
-def _import_complexipy():  # noqa: ANN202 - third-party module object
+def _import_complexipy():  # third-party module object
     """Import complexipy LAZILY, naming it in the failure.
 
     Lazy so this module stays importable and type-checkable under the
@@ -438,7 +441,7 @@ def _import_complexipy():  # noqa: ANN202 - third-party module object
     return complexipy
 
 
-def _file_complexity(path: Path):  # noqa: ANN202 - complexipy.FileComplexity
+def _file_complexity(path: Path):  # complexipy.FileComplexity
     complexipy = _import_complexipy()
     try:
         return complexipy.file_complexity(str(path))
@@ -1052,7 +1055,6 @@ PSEUDO_MEMBERS: tuple[MemberRoots, ...] = (_SCRIPTS_PSEUDO_MEMBER, _TESTS_PSEUDO
 _SINGLE_PACKAGE_PSEUDO_MEMBERS: tuple[MemberRoots, ...] = (_SCRIPTS_PSEUDO_MEMBER,)
 
 
-_MEMBERS_KEY = '[tool.uv.workspace].members'
 _PROJECT_NAME_KEY = '[project].name'
 
 
@@ -1075,38 +1077,23 @@ def _lookup(config: object, *keys: str) -> object:
     return found
 
 
-def _member_list(path: Path, config: dict[str, object]) -> list[str]:
-    found = _lookup(config, 'tool', 'uv', 'workspace', 'members')
-    if (
-        not isinstance(found, list)
-        or not found
-        or not all(isinstance(member, str) for member in found)
-    ):
-        raise MetricsError(
-            f'{path}: {_MEMBERS_KEY} must be a non-empty list of member directory '
-            f'names; found {found!r}'
-        )
-    return found
+def _declared_members(path: Path) -> tuple[str, ...]:
+    """The workspace members the pyproject.toml at *path* declares.
 
-
-def _declared_members(path: Path, config: dict[str, object]) -> tuple[str, ...]:
-    """``[tool.uv.workspace].members`` of the pyproject.toml at *path*, read as *config*.
-
-    Each must be a plain directory name (uv's glob expansion cannot be
-    reproduced from the index), listed once, and not a pseudo-member's name.
+    The acceptance rule is ``_checkout.workspace_members``'. Here a member is
+    also refused if it is listed twice or shares a pseudo-member's name.
     """
-    members = _member_list(path, config)
-    globbed = [member for member in members if any(char in member for char in '*?[')]
-    if globbed:
-        raise MetricsError(
-            f'{path}: {_MEMBERS_KEY} holds glob member(s) {globbed!r}, which are not '
-            'supported -- list each member directory by name'
-        )
+    try:
+        members = _checkout.workspace_members(path.parent)
+    except _checkout.CheckoutBindingError as exc:
+        raise MetricsError(str(exc)) from exc
     duplicates = sorted({member for member in members if members.count(member) > 1})
     if duplicates:
-        raise MetricsError(f'{path}: {_MEMBERS_KEY} lists duplicate member(s) {duplicates!r}')
-    _require_no_pseudo_collision(path, _MEMBERS_KEY, members, PSEUDO_MEMBERS)
-    return tuple(members)
+        raise MetricsError(
+            f'{path}: {_checkout.MEMBERS_KEY} lists duplicate member(s) {duplicates!r}'
+        )
+    _require_no_pseudo_collision(path, _checkout.MEMBERS_KEY, members, PSEUDO_MEMBERS)
+    return members
 
 
 def _require_no_pseudo_collision(
@@ -1125,8 +1112,8 @@ def _project_name(path: Path, config: dict[str, object]) -> str:
     name = _lookup(config, 'project', 'name')
     if not isinstance(name, str) or not name:
         raise MetricsError(
-            f'{path}: has neither {_MEMBERS_KEY} nor a {_PROJECT_NAME_KEY}; a uv workspace '
-            f'declares its members, and a single-package project is named by its '
+            f'{path}: has neither {_checkout.MEMBERS_KEY} nor a {_PROJECT_NAME_KEY}; '
+            'a uv workspace declares its members, and a single-package project is named by its '
             f'[project] table -- found {_PROJECT_NAME_KEY} = {name!r}'
         )
     return name
@@ -1145,8 +1132,8 @@ def _single_package_members(
     package = MemberRoots.single_package(name)
     if not _git_output(root, 'ls-files', '-z', '--', f'{package.src_root}/*.py'):
         raise MetricsError(
-            f'{path}: declares no {_MEMBERS_KEY}, so it is read as the single-package '
-            f'project {name!r} in the src layout ({package.src_root}/ and '
+            f'{path}: declares no {_checkout.MEMBERS_KEY}, so it is read as the '
+            f'single-package project {name!r} in the src layout ({package.src_root}/ and '
             f'{package.tests_root}/), but {package.src_root}/ holds no tracked .py; '
             "declare the workspace's members or keep the package under "
             f'{package.src_root}/'
@@ -1161,7 +1148,7 @@ def _domain_members(root: Path) -> tuple[MemberRoots, ...]:
     if _lookup(config, 'tool', 'uv', 'workspace') is None:
         return _single_package_members(root, path, config)
     return (
-        *(MemberRoots.declared(name) for name in _declared_members(path, config)),
+        *(MemberRoots.declared(name) for name in _declared_members(path)),
         *PSEUDO_MEMBERS,
     )
 

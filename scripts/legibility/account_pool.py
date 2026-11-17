@@ -97,7 +97,7 @@ def build_pool(*, accounts_file=None, env_file=None) -> UsageGate:
     try:
         config = _pool_config(accounts_file=str(Path(resolved).resolve()))
         gate = UsageGate(config)
-    except Exception as exc:  # noqa: BLE001 — a bad roster defers the night, never crashes it
+    except Exception as exc:  # a bad roster defers the night, never crashes it
         logger.warning(
             "legibility account pool could not load its roster %s (%s: %s) — "
             "every invocation will defer for want of an account; there is no "

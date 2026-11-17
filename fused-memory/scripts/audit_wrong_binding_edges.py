@@ -1154,7 +1154,7 @@ def _resolve_uri(args: argparse.Namespace) -> str | None:
     if env_uri:
         return env_uri
     try:
-        from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+        from fused_memory.config.schema import FusedMemoryConfig
 
         config = FusedMemoryConfig()
         return getattr(getattr(config.graphiti, 'falkordb', None), 'uri', None)

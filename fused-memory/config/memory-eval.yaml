@@ -25,5 +25,15 @@ baseline_window: 7
 # Resolves PRD section 9's open aggregate-K default; tune it from experience.
 storm_alarm_limit: 10
 
-# Wall-clock bound on each producer subprocess, in seconds.
+# Wall-clock bound on each producer subprocess, in seconds, unless
+# producer_timeout_secs_by_eval names that producer's eval.
 producer_timeout_secs: 3600
+
+# Per-eval wall-clock bounds, in seconds, each replacing producer_timeout_secs
+# for its eval. Every key must be a registered producer's eval_id
+# (DEFAULT_PRODUCERS in fused-memory/scripts/memory_eval_runner.py); {} declares
+# no overrides. e6-corpus-health's O(n^2) lexical sweep of all three Mem0
+# categories runs for hours; it exceeded 3600 s on 2026-11-13 and 2026-11-14
+# (task 9961).
+producer_timeout_secs_by_eval:
+  e6-corpus-health: 21600

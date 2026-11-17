@@ -1,0 +1,443 @@
+# Machine-readable twin of per-consumer-resource-recording-prd.capability-manifest.md
+# Anchors verified against main fad550f26f (2026-11-16). Cited by symbol.
+# The three FAIL rows a first draft found (leaf 2, leaf 7b, leaf 8) were resolved 2026-11-16: C2 relaxed for leaf 2; edges 1 -> 7a, 1 -> 7b and 2 -> 8 added.
+prd: plans/per-consumer-resource-recording-prd.md
+schema_version: 1
+signal_leaves: ["3", "8"]
+tasks:
+  - label: "1"
+    task_id: 10456
+    title: "Record every consumer's memory, swap, reclaim, stall and CPU"
+    note: "New leaf; absorbs task 7858 part 2 and task 7006 item 2 (re-scoped at decompose). No prerequisites."
+    capabilities:
+      - name: "metric-table-and-vocabulary-guard"
+        binding: "`grep:sampler/src/sampler/__main__.py::main` `grep:sampler/src/sampler/metrics.py::METRIC_GROUPS` `grep:sampler/tests/test_vocabulary_one_table.py::_scope` wired: main runs every group of the table; the scan is the guard"
+        verdict: PASS
+      - name: "due-time-state-substrate"
+        binding: "`grep:sampler/src/sampler/store.py::LoadSampleStore.should_cleanup` `grep:sampler/src/sampler/sampler.py::run_tick` wired: should_cleanup reads the meta-table due time through _is_due; run_tick is the tick write"
+        verdict: PASS
+      - name: "pressure-file-parser-reused"
+        binding: "`grep:sampler/src/sampler/metrics.py::_read_leaf_some_avg10` `grep:shared/src/shared/psi.py::parse_pressure_file` wired: the sampler's reader calls the shared parser"
+        verdict: PASS
+      - name: "served-group-table"
+        binding: "`grep:dashboard/src/dashboard/data/load.py::_SERVED_GROUPS` `grep:dashboard/src/dashboard/static/redux/tab_overview.jsx` the module-level table the verify-scope group is added to; the tiles are JSX names, not Python-checkable"
+        verdict: PASS
+      - name: "old-verify-scope-tag-rule"
+        binding: "`grep:orchestrator/src/orchestrator/verify.py::reap_leftover_verify_scopes` `grep:orchestrator/src/orchestrator/verify.py::_scope_tag_for` wired: reap_leftover_verify_scopes calls _scope_tag_for, the rule the shared one is cross-checked against"
+        verdict: PASS
+      - name: "stateful-group-contract"
+        binding: "built here; previous state in, samples and new state out, persisted with the rows and the next due time in one transaction"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "The new names are the architect's; the boundary rows for a crash mid-tick and a recorder gap prove it, not a grep."
+      - name: "cgroup-file-parser"
+        binding: "built here; shared/src/shared/cgroup_stats.py, the one parser for memory.stat, cpu.stat and memory.events (D7)"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["shared/src/shared/cgroup_stats.py"]
+          expect: present
+      - name: "consumer-classifier-module"
+        binding: "built here; sampler/src/sampler/consumers.py, the one rule table, walk, residuals and consumer-name encode and parse (D2)"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["sampler/src/sampler/consumers.py"]
+          expect: present
+      - name: "refault-and-swap-in-counters-read"
+        binding: "built here; memory.stat keys pswpin, pgsteal_kswapd, pgsteal_direct and workingset_refault_anon and _file read per cgroup (C1); absent on main"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "workingset_refault"
+          paths: ["sampler/src/sampler/", "shared/src/shared/"]
+          expect: present
+      - name: "reclaim-thread-cpu-recorded"
+        binding: "built here; the background reclaim and compaction threads' CPU from /proc/<pid>/stat, kswapd and kcompactd (C1); absent on main"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "kswapd"
+          paths: ["sampler/src/sampler/"]
+          expect: present
+      - name: "two-zero-series-retired"
+        binding: "built here; the verify_rss_total_bytes metric declaration leaves the table (D6); present in metrics.py on main"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "MetricSpec\\('verify_rss_total_bytes'"
+          paths: ["sampler/src/sampler/metrics.py"]
+          expect: absent
+      - name: "verify-scope-tiles-swapped"
+        binding: "built here; the host load card reads live verify scopes and their memory in place of the two zero tiles"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "Operator-visible: while a verify scope is live the card shows non-zero values. The tile list is JSX and its old keys also sit in a comment, so no grep is sound."
+      - name: "shared-scope-tag-rule"
+        binding: "built here; one public home in shared/src/shared/ that builds and parses the verify scope tag, with a cross-check test against _scope_tag_for"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "The module and function names are the architect's; guessing them in a pattern could wedge leaves 2 and 4 forever."
+      - name: "consumer-rows-in-the-store"
+        binding: "built here; the consumer rows for the named consumers appear in data/load-samples.db within a minute of the merge"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "The goal signal; an sqlite read of the live store on the host after deploy."
+      - name: "one-journal-summary-line-per-collection"
+        binding: "built here; sampler __main__ prints one summary line for the group, never its rows"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "Observed in the user journal; no mechanical form."
+      - name: "retention-cleanup-timing"
+        binding: "built here; one cleanup timed against a copy of the store at about 8 times its rows, an index led by ts added above 2 seconds"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "A measurement recorded in the task report."
+  - label: "2"
+    task_id: 10457
+    title: "Report which consumers grew and which paid before each memory hold"
+    note: "C2 was relaxed 2026-11-16: the project consumer is keyed by the last segment of the hold's own_cgroup when it names a project slice, so this leaf imports nothing from task 3394 and does not wait on the slices."
+    capabilities:
+      - name: "consumer-samples-written"
+        binding: "producer:task-1 upstream"
+        verdict: PASS
+      - name: "shared-scope-tag-rule-for-the-verify-mapping"
+        binding: "producer:task-1 upstream"
+        verdict: PASS
+      - name: "hold-events-carry-own-cgroup"
+        binding: "`grep:orchestrator/src/orchestrator/scheduler.py::Scheduler._note_heavy_deferral` `grep:orchestrator/src/orchestrator/event_store.py::EventType` wired: _note_heavy_deferral emits dispatch_deferred with the whole pressure sample, own_cgroup included"
+        verdict: PASS
+      - name: "project-id-from-the-root"
+        binding: "`grep:orchestrator/src/orchestrator/config.py::OrchestratorConfig._derive_fused_memory_project_id` `grep:orchestrator/src/orchestrator/config.py::load_config` wired: the config derives the project id through shared.project_id.project_id_for_root"
+        verdict: PASS
+      - name: "default-project-roots"
+        binding: "`grep:dashboard/src/dashboard/config.py::DashboardConfig.all_project_roots` the dashboard's known roots, which the script defaults to"
+        verdict: PASS
+      - name: "vocabulary-scan-covers-the-report"
+        binding: "`grep:sampler/tests/test_vocabulary_one_table.py::_scope` the scan list the script is added to; the script's name is not in it on main"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "resource_report"
+          paths: ["sampler/tests/test_vocabulary_one_table.py"]
+          expect: present
+      - name: "project-mapping-by-own-cgroup"
+        binding: "built here; C2 maps service, agents and project consumers by the last segment of the hold's sample.own_cgroup, so no slice-name import from task 3394 is needed"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "A mapping rule exercised by the leaf's boundary tests (PRD section 7, 'Hold mapping, both shapes'); no distinctive token to grep."
+      - name: "holds-subcommand"
+        binding: "built here; scripts/resource_report.py with the holds subcommand, --summary, --json and repeated --project-root"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["scripts/resource_report.py"]
+          expect: present
+      - name: "recorder-not-live-state"
+        binding: "built here; a hold before the first consumer sample prints recorder not live, distinct from an empty ranking (INV-13); absent on main"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "recorder not live"
+          paths: ["scripts/"]
+          expect: present
+  - label: "3"
+    task_id: 10458
+    title: "Decision task: a week of consumer data on the memory holds"
+    note: "Signal leaf with 8. A pure gate (task_kind deterministic, always_escalates, no before_done): its only dispatch action is the escalation, so the report command rides in the escalation body and the reader runs it. If the runner must run it, the leaf is act-then-ask instead; the PRD's word is 'Check: runs'."
+    capabilities:
+      - name: "holds-report-with-summary-and-json"
+        binding: "producer:task-2 upstream"
+        verdict: PASS
+      - name: "seven-day-delay-honoured"
+        binding: "`grep:orchestrator/src/orchestrator/scheduler.py::Scheduler._milestone_time_gated` wired: holds a task whose metadata.milestone is not yet due; delayed mode after_secs of 7 days"
+        verdict: PASS
+      - name: "pure-gate-shape-accepted"
+        binding: "`grep:fused-memory/src/fused_memory/middleware/deterministic_task_guard.py::deterministic_task_error` wired: accepts task_kind deterministic with always_escalates and no before_done"
+        verdict: PASS
+      - name: "escalation-to-leo-carries-the-summary"
+        binding: "built here; a pure gate's born-at-L2 escalation naming holds per project, top consumers per ranking, the unattributed share and the reclaim threads' share"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "A human gate: Leo receives the escalation. The task is the deliverable and carries no code."
+  - label: "4"
+    task_id: 6355
+    title: "Every verify command records its CPU, peak memory and stall from inside its scope"
+    note: "Existing task 6355, retitled and re-planned at decompose (store edit; task_id stays null here and is stamped at commit). Hooks land wherever review-all stream 4 has left _run_cmd at dispatch."
+    capabilities:
+      - name: "cgroup-file-parser"
+        binding: "producer:task-1 upstream"
+        verdict: PASS
+      - name: "shared-scope-tag-rule"
+        binding: "producer:task-1 upstream"
+        verdict: PASS
+      - name: "scope-script-runs-the-command"
+        binding: "`grep:orchestrator/src/orchestrator/verify.py::_run_cmd` `grep:orchestrator/src/orchestrator/scope_launch_handshake.py::ScopeLaunchHandshake.payload` wired: _run_cmd runs handshake.payload(cmd) under bash in the scope"
+        verdict: PASS
+      - name: "kill-path-reaps-the-scope"
+        binding: "`grep:orchestrator/src/orchestrator/verify.py::_run_cmd` `grep:orchestrator/src/orchestrator/verify.py::_reap_command_subtree` wired: _run_cmd calls _reap_command_subtree on timeout, cancel and error"
+        verdict: PASS
+      - name: "relocated-scope-detection"
+        binding: "`grep:orchestrator/src/orchestrator/verify.py::_reap_command_subtree` wired: it calls _discover_relocated_scopes"
+        verdict: PASS
+      - name: "summary-whitelist-and-run-result"
+        binding: "`grep:orchestrator/src/orchestrator/verify.py::_build_summary_payload`; `grep:orchestrator/src/orchestrator/verify.py::CheckRun`"
+        verdict: PASS
+      - name: "census-reads-local-summaries"
+        binding: "`grep:scripts/verify_budget_census.py::load_records` wired: it reads the summaries under data/verify-logs"
+        verdict: PASS
+      - name: "c4-record-fields"
+        binding: "built here; the C4 dataclass with user_usec, system_usec, the three stall totals and the identity fields, one home, listed in remote_gate wire_classes; absent on main"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "user_usec"
+          paths: ["orchestrator/src/orchestrator/"]
+          expect: present
+      - name: "kill-path-capture-state"
+        binding: "built here; the before_kill capture state, read from the scope's sysfs path before the kill; absent on main"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "before_kill"
+          paths: ["orchestrator/src/orchestrator/"]
+          expect: present
+      - name: "census-prints-cpu-and-peak"
+        binding: "built here; scripts/verify_budget_census.py prints CPU and peak memory per command from the record; absent on main"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "cpu_usec"
+          paths: ["scripts/verify_budget_census.py"]
+          expect: present
+      - name: "capture-never-changes-the-verify"
+        binding: "built here; the subshell suffix keeps the exit code and adds nothing to the command's output; an unavailable capture is a record that says so"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "A behavioural property proven by the capture-at-exit, timeout, relocated and unavailable boundary rows, not a grep."
+  - label: "5"
+    task_id: 10459
+    title: "Carry verify records back from the laptop, and store each command run as an event"
+    capabilities:
+      - name: "c4-record-and-run-result-carrier"
+        binding: "producer:task-4 upstream"
+        verdict: PASS
+      - name: "strict-wire-reader"
+        binding: "`grep:orchestrator/src/orchestrator/verify_runner.py::result_from_dict` `grep:orchestrator/src/orchestrator/remote_gate.py::wire_classes` `grep:orchestrator/src/orchestrator/remote_gate.py::wire_fingerprint` result_from_dict is the strict reader of the VerifyResult wire; wire_classes is the registry the record is added to"
+        verdict: PASS
+      - name: "pass-summary-payloads"
+        binding: "`grep:orchestrator/src/orchestrator/verify_runner.py::_task_pass_summary_payload`; `grep:orchestrator/src/orchestrator/verify_runner.py::_merge_pass_summary_payload`; `grep:orchestrator/src/orchestrator/verify_runner.py::RemoteRunner._archive_failure_streams`"
+        verdict: PASS
+      - name: "event-registry-and-local-emit-precedent"
+        binding: "`grep:orchestrator/src/orchestrator/event_store.py::EventType` `grep:orchestrator/src/orchestrator/verify.py::_recorded_admission_plan` `grep:orchestrator/src/orchestrator/task_verify_dispatch.py` wired: EventType is the registry; _recorded_admission_plan is the local emit point beside the admission-plan event; remote dispatch is in task_verify_dispatch"
+        verdict: PASS
+      - name: "event-type-registered"
+        binding: "built here; verify_command_resources in the EventType registry; absent on main"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "verify_command_resources"
+          paths: ["orchestrator/src/orchestrator/event_store.py", "shared/src/shared/run_events.py"]
+          expect: present
+      - name: "event-emitted-per-command-run"
+        binding: "built here; one verify_command_resources event per command run, local and remote, task id or merge sha and request id; absent on main"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "EventType\\.verify_command_resources"
+          paths: ["orchestrator/src/orchestrator/"]
+          expect: present
+      - name: "laptop-and-local-events-and-pass-summaries"
+        binding: "built here; runs.db holds events with runner laptop and runner local, and a remote green pass summary carries the same records"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "Observed in the live runs.db after deploy; the remote-carry boundary row proves it in CI."
+  - label: "6"
+    task_id: 10460
+    title: "Delegate each orchestrator service's subtree, start it in daemon/, and keep the slice weight check working"
+    note: "Intermediate leaf. Add the edge 9985 -> this leaf at decompose (an edge on the existing task). Prerequisite task 3394 supplies the slice module, the weight check, the Slice= unit lines, the unit-file test and the topology doc (all in its declared files)."
+    capabilities:
+      - name: "slices-weight-check-and-slice-lines"
+        binding: "producer:task-3394 upstream"
+        verdict: PASS
+      - name: "own-reading-resolver"
+        binding: "`grep:shared/src/shared/psi.py::read_own_cgroup_pressure` `grep:shared/src/shared/psi.py::resolve_own_cgroup` wired: read_own_cgroup_pressure calls resolve_own_cgroup"
+        verdict: PASS
+      - name: "unit-file-test"
+        binding: "`grep:tests/scripts/test_orchestrator_service_files.py` exists on main; task 3394 extends it, this leaf adds the three-lines-together rule"
+        verdict: PASS
+      - name: "units-delegate-the-memory-controller"
+        binding: "built here; Delegate=memory in every scripts/orchestrator-*.service; absent on main"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "Delegate=memory"
+          paths: ["scripts/"]
+          expect: present
+      - name: "units-start-in-the-daemon-subgroup"
+        binding: "built here; DelegateSubgroup=daemon in every scripts/orchestrator-*.service; absent on main"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "DelegateSubgroup=daemon"
+          paths: ["scripts/"]
+          expect: present
+      - name: "weight-check-accepts-a-daemon-child"
+        binding: "built here; ensure_project_slice_weight accepts a daemon child of the service"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "The file is task 3394's and may already mention the word daemon, so a pattern could pass before this leaf; the weight-check boundary row proves it."
+      - name: "no-unit-delegates-cpu-and-slice-comes-with-delegate"
+        binding: "built here; no unit carries Delegate=memory or DelegateSubgroup=daemon without Slice=, and none delegates cpu"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "A negative property across all units; the unit-file test is its check, and a grep for a cpu delegation is absent today (vacuous)."
+  - label: "7a"
+    task_id: 10461
+    title: "The shared spawn path accepts a placement and records each attempt's reading"
+    note: "Intermediate leaf. Producers outside this batch: task 9812 (row schema) and task 9846 (stream 20 eta, the per-attempt writer, named in plans/review-all-s20-cli-invocation-and-usage-gate-prd.capability-manifest.yaml). Same-file serialization to wire at decompose: task 10429 (allowance reserve 1b) and task 9850 (stream 20 theta, moves the spawn to shared/claude_runner.py); the pointers here resolve on main today and are re-located if theta lands first."
+    capabilities:
+      - name: "one-invocations-row-per-attempt-schema"
+        binding: "producer:task-9812 upstream"
+        verdict: PASS
+      - name: "one-invocations-row-per-attempt-writer"
+        binding: "producer:task-9846 upstream"
+        verdict: PASS
+      - name: "spawn-prefix-chain"
+        binding: "`grep:shared/src/shared/cli_invoke.py::run_cli_subprocess` `grep:orchestrator/src/orchestrator/agents/invoke.py::invoke_agent` wired: run_cli_subprocess composes the govern, nice and sandbox prefixes before the argv; invoke_agent reaches it through its runner default"
+        verdict: PASS
+      - name: "retry-wrapper-threads-a-keyword"
+        binding: "`grep:shared/src/shared/cli_invoke.py::invoke_with_cap_retry` wired: it calls the usage gate's invoke_slot and run_cli_subprocess; the optional placement parameter rides here"
+        verdict: PASS
+      - name: "added-columns-stay-last-and-nullable"
+        binding: "`grep:shared/src/shared/cost_store.py::_ADDED_INVOCATION_COLUMNS` `grep:shared/src/shared/cost_store.py::CostStore.save_invocation` the table the C5 columns are appended to, and the writer"
+        verdict: PASS
+      - name: "c5-columns-on-invocations"
+        binding: "built here; cgroup_capture, cgroup_capture_reason, cpu_usec, memory_peak_bytes, swap_peak_bytes and the four stall totals; absent on main"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "cgroup_capture_reason"
+          paths: ["shared/src/shared/cost_store.py"]
+          expect: present
+      - name: "outermost-join-prefix"
+        binding: "built here; a launch prefix writes its own pid into the child's cgroup.procs and execs, outside the govern and nice prefixes and the sandbox wrap; absent from shared/src/shared on main"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "cgroup\\.procs"
+          paths: ["shared/src/shared/cli_invoke.py", "shared/src/shared/claude_runner.py"]
+          expect: present
+      - name: "placement-protocol-and-stdin-survives"
+        binding: "built here; the placement protocol (prefix and env before, reading after) declared in shared code; the stdin-starvation pin in shared/tests/test_cli_invoke.py stays green through the new prefix"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "The protocol's names are the architect's; the CI spawn through the full prefix chain with a fixture placement is the leaf's signal."
+  - label: "7b"
+    task_id: 10462
+    title: "Each agent attempt gets its own cgroup inside its orchestrator service"
+    note: "Leaf 1 is upstream (edges 1 -> 7a and 1 -> 7b added 2026-11-16). Task 9985's reinstall is the production signal, not a code dependency, so no edge 9985 -> 7b."
+    capabilities:
+      - name: "daemon-subgroup-and-delegated-memory-controller"
+        binding: "producer:task-6 upstream"
+        verdict: PASS
+      - name: "placement-protocol-and-c5-columns"
+        binding: "producer:task-7a upstream"
+        verdict: PASS
+      - name: "topology-doc-and-slice-weight-check"
+        binding: "producer:task-3394 upstream, through leaf 6"
+        verdict: PASS
+      - name: "cgroup-file-parser-import"
+        binding: "producer:task-1 upstream (shared/src/shared/cgroup_stats.py, D7)"
+        verdict: PASS
+      - name: "startup-step-hook"
+        binding: "`grep:orchestrator/src/orchestrator/harness.py::Harness._run_startup_steps` wired: it runs the daemon's startup steps, the site the +memory write joins"
+        verdict: PASS
+      - name: "agent-row-writers"
+        binding: "`grep:orchestrator/src/orchestrator/workflow.py::TaskWorkflow._invoke` `grep:orchestrator/src/orchestrator/review_checkpoint.py::ReviewCheckpoint._run_review` `grep:orchestrator/src/orchestrator/agents/invoke.py::invoke_agent` wired: _invoke and _run_review write the invocations row through cost_store.save_invocation; invoke_agent is the spawn entry"
+        verdict: PASS
+      - name: "harness-guidance-advice"
+        binding: "`grep:orchestrator/src/orchestrator/agents/harness_guidance.py` carries the advice to read one's own memory.events, checked in prose against the new layout"
+        verdict: PASS
+      - name: "agent-cgroup-manager-module"
+        binding: "built here; orchestrator/src/orchestrator/agent_cgroups.py: startup checks, +memory, the placement implementation, remove and sweep"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["orchestrator/src/orchestrator/agent_cgroups.py"]
+          expect: present
+      - name: "memory-controller-enabled-at-startup"
+        binding: "built here; the daemon writes +memory to the service's cgroup.subtree_control; absent from orchestrator/src on main"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "subtree_control"
+          paths: ["orchestrator/src/orchestrator/agent_cgroups.py"]
+          expect: present
+      - name: "per-project-switch"
+        binding: "built here; defaults on, reloadable, in the review-all stream 16 config layout; decides only whether new spawns get a child"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "The key's name and place depend on stream 16's layout at dispatch; the switch-off boundary row proves it."
+      - name: "agent-children-in-production"
+        binding: "built here; after task 9985's restart the service holds daemon/ and one agent-* child per running agent, new invocations rows carry cgroup_capture exit, and the recorder shows agents@df-dark_factory.slice"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "Operator-observable on the host after task 9985's reinstall."
+  - label: "8"
+    task_id: 10463
+    title: "Report what verify runs and agent attempts cost"
+    note: "Signal leaf with 3. Leaf 2 is upstream (edge 2 -> 8 added 2026-11-16), which is also the same-file serialization on scripts/resource_report.py and the vocabulary-scan list."
+    capabilities:
+      - name: "verify-command-events"
+        binding: "producer:task-5 upstream"
+        verdict: PASS
+      - name: "agent-attempt-columns"
+        binding: "producer:task-7b upstream, which carries 7a's columns"
+        verdict: PASS
+      - name: "report-script-and-its-scaffolding"
+        binding: "producer:task-2 upstream (scripts/resource_report.py, its argument handling, default project roots and vocabulary-scan entry)"
+        verdict: PASS
+      - name: "invocations-carry-role-and-model"
+        binding: "`grep:shared/src/shared/cost_store.py::CostStore.save_invocation` wired: it writes the model and role columns of the invocations table the report groups by"
+        verdict: PASS
+      - name: "runs-db-event-reader"
+        binding: "`grep:orchestrator/src/orchestrator/event_store.py::EventStore` the events store the report reads read-only per project root"
+        verdict: PASS
+      - name: "costs-subcommand-reads-verify-events"
+        binding: "built here; the costs subcommand groups verify_command_resources events by project, role, leg and host; absent from scripts on main"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "verify_command_resources"
+          paths: ["scripts/resource_report.py"]
+          expect: present
+      - name: "no-producer-written-state"
+        binding: "built here; a source with no rows prints no producer has written here (INV-13), the agent rows before task 9985; absent on main"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "no producer has written here"
+          paths: ["scripts/"]
+          expect: present
+      - name: "percentiles-and-labels"
+        binding: "built here; CPU seconds and peak-memory percentiles per project, verify role, leg and host and per agent role and model, with peak memory labelled as including file cache"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "Output shape on the live stores; the report's own fixture tests assert it."

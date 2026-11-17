@@ -21,7 +21,8 @@ If `metadata.gate_escalated_at` is already set:
 - If a pending escalation still exists for the task → return BLOCKED (B3:
   no second escalation on quiescence).
 - Else (escalation resolved) → drive the task to `done` and return DONE
-  (I2/B4/B11: resume path).
+  (I2/B4/B11: resume path) — except a pure gate that now waits on more
+  than it did when it escalated, which re-files (§3).
 
 If `metadata.before_done_ran_at` is already set (γ):
 - If a pending infra_issue escalation exists → return BLOCKED (B7: reaper
@@ -87,6 +88,21 @@ Excludes predicates (read-only, apply nothing — see the predicate
 sub-path below) and excludes every resume/idempotency branch above (those
 already have `before_done_ran_at` or `gate_escalated_at` set, so they
 never reach this first-dispatch check).
+
+**Refused `before_done` record** (task 9116): next, still before the
+stamp, the runner resolves the record's paths once through
+`shared/src/shared/before_done_paths.py::resolve_before_done_paths`.  A
+`BeforeDonePathsRefused` (a missing, non-string or blank `script`, a
+non-string `cwd`, or a `script_root` the record may not use, reaching the
+runner through `update_task`) files a
+born-at-L2 `infra_issue` — summary "Deploy refused before_done:
+<target_unit>", or "Deploy refused before_done (no target_unit)" — and
+blocks without running the deploy, without stamping `before_done_ran_at`
+and without advancing `deploy_state`.  Because nothing is stamped, fixing
+the record and resolving the escalation (`resume`/`restart`) leads to a
+first dispatch that really runs the deploy; filed after the stamp, a
+`resume` would drive the task to done with the deploy never run.  The
+cross-unit sub-path reuses these resolved paths.
 
 The `before_done_ran_at` stamp is written FIRST (crash-safe I1) and is
 SHARED between the self-target (ε) and cross-unit sub-paths below.
@@ -165,7 +181,16 @@ Phase ε **self-restart** sub-path (`before_done.target_unit` == own unit):
   re-filing the gate — the human-approval gate is NEVER bypassed.
 - If scheduling fails (`rc != 0`): file born-at-L2 infra_issue, block
   (parallel to γ's rc≠0/verify-fail handling); `before_done_ran_at`
-  already stamped (not re-run, I1).
+  already stamped (not re-run, I1).  Scheduling also fails, before any
+  transient unit is registered, when the resolved script is missing or not
+  executable (`shared/src/shared/before_done_paths.py::require_runnable_script`,
+  the same rule `submit_task` applies).  A script removed, renamed or
+  chmod'ed after submit, or a `before_done` edited through `update_task`,
+  therefore blocks the task with the `Self-restart scheduling failed: <unit>`
+  infra_issue instead of a phantom `deterministic-deploy-scheduled` done.
+  Either way no restart is scheduled, and as for any escalation filed after
+  the stamp, resolving with `resume` marks the task done without one; the
+  escalation detail says to restart the unit by hand first.
 
 Phase γ **cross-unit** sub-path (`target_unit` ≠ own unit or `ORCH_UNIT` unset):
 - Capture baseline unit state (`unit_inspector`).
@@ -283,7 +308,11 @@ Phase γ **predicate** sub-path (`before_done['kind'] == 'predicate'`):
   `orchestrator/src/orchestrator/before_done_script.py::ScriptTimeout` class
   docstring for the full rationale.
 - Outer-guard timeout, an unresolvable factory script root
-  (`FactoryRootUnresolved`, task 6386) or an unexpected `run_fn` error
+  (`shared/src/shared/before_done_paths.py::FactoryRootUnresolved`, task
+  6386), any other refused `before_done` record
+  (`shared/src/shared/before_done_paths.py::BeforeDonePathsRefused`, summary
+  "Predicate before_done refused (check not run)", task 9116) or an
+  unexpected `run_fn` error
   (likewise no verdict — an infra fault, not a check failure): file
   born-at-L2 `infra_issue` and block — again NO `gate_escalated_at`
   stamp, so the check is simply re-attempted on the next dispatch.  The
@@ -352,17 +381,62 @@ verdict.  The runner meets it like this (tasks 4065 / 4252):
   `orchestrator-deterministic` keeps level=2 past the server downgrade gate).
   Dedup: if a pending escalation already exists for the task (e.g. from a prior
   crash-safe re-dispatch), filing is skipped to avoid duplicate L2 escalations.
-- Stamp `metadata.gate_escalated_at` (crash-safe: file-before-stamp means a
-  stamp failure re-files rather than silently skipping the gate).
+- Stamp `gate_escalated_at` and `gate_escalated_preconditions` (the local
+  dependency ids, `external_deps` and `milestone` the gate escalated under)
+  in one write (crash-safe: file-before-stamp means a stamp failure re-files
+  rather than silently skipping the gate).
 - Set task status to `blocked`.
 - Return BLOCKED (B2).
 
-**Resuming a pure gate** — the proof ladder has TWO rungs, not one:
+**Resuming a pure gate** — a `resume` runs the runner at resolution time
+(task 3638). Before, it re-pended the gate and only a dispatch slot closed
+it, so a resolved gate could sit `pending` for days.
+`orchestrator/src/orchestrator/harness.py::Harness._cascade_unblock_member`
+runs its usual gates first (infra-hold, status, claimant liveness, the
+re-block guard, the corroborating read), then hands the row to
+`Harness._run_held_pure_gate_inline`, which runs this same runner through
+`orchestrator/src/orchestrator/pure_gate_resolution.py`: the same proof
+ladder, the same re-hold check, and the runner makes every status write.
+It falls back to the re-pend whenever dispatch would still make the gate
+wait: a local dependency not yet terminal, any `external_deps` entry or
+delivered-check dependency (the inline path holds neither cache, so both
+answer unknown), a milestone that has not fired, or a `deferred_watch`
+whose `trigger_met` is unset. It also falls back when the runner raises,
+so the worst case is the old wait. `close_only` still changes no status.
+The inline run does not wait on a dispatch pause: a paused scheduler holds
+back slots, and this run takes none. Each inline run is recorded in runs.db
+`task_results`, as a deterministic slot run is. Neither path emits an
+events.db `task_completed` row.
+
+The two gate stamps end with the episode: fused-memory removes
+`gate_escalated_at` and `gate_escalated_preconditions` on any status write
+that enters or leaves `done`/`cancelled`
+(`fused-memory/src/fused_memory/middleware/gate_stamp_lifecycle.py`). A
+reopened gate therefore files afresh on its next dispatch.
+
+The proof ladder has TWO rungs, not one:
 
 (i) An archive-inclusive, role-scoped escalation record must exist (task
 2954). This proves a gate was established and is no longer pending. An
 empty PENDING queue alone is not proof: a LOST escalation would otherwise
 let an operator's re-pend of a stuck task silently bypass the gate.
+
+Between the rungs runs a re-hold check (task 9520). A resolution that held
+the gate behind something new is "not yet", not approval: a watcher that
+finds a gate fired prematurely wires its real precondition and resumes it.
+On 2026-11-12 gates 9424 and 8939 were held behind a new dependency that
+way and closed as `pure gate resolved` the moment it landed, with no human
+step. So on resume
+`orchestrator/src/orchestrator/gate_preconditions.py::gate_held_since_escalation`
+compares what the task waits on now with the `gate_escalated_preconditions`
+record its filing stamped, and the runner re-files a fresh gate escalation
+(`milestone_gate`, or `review_due` for a `trigger_chain` human gate) and
+stays BLOCKED when a local dependency or an `external_deps` entry was
+added, or a present `milestone` differs. The re-file restamps the record,
+so the next resolution with nothing new closes normally. Removing a
+dependency or a milestone never re-fires, because it never extends the
+wait. A gate stamped before task 9520 carries no record and closes as
+before; a record that is present but unreadable fails CLOSED and re-files.
 
 (ii) If `metadata.human_curator_gate` is truthy, then
 `metadata.human_curator_adjudicated_at` must carry a non-empty string (task
@@ -402,7 +476,9 @@ on `category:summary`, so the distinct category gets its own counter
 Ordering matters and is pinned by test: rung (i) runs FIRST. Zero records
 anywhere means the gate was never established, so re-filing the ORIGINAL
 `milestone_gate` is the correct recovery; asking for an adjudication
-stamp on a gate nobody has yet seen would be incoherent.
+stamp on a gate nobody has yet seen would be incoherent. The re-hold check
+runs after rung (i) and before rung (ii), so a re-held curator gate is
+re-asked as the gate, not as an adjudication request.
 
 A curator gate that DOES close carries a specific `done_provenance.note`
 naming the adjudication stamp (plus the gate record via

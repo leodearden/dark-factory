@@ -6,7 +6,7 @@ S7, Phase 1 LEAF).
 Background
 ----------
 ``scripts/investigate_cross_graph_duplication.py`` (task 2116) confirmed that
-``GraphitiBackend._graph_for``/``_driver_for`` use a node's ``group_id``
+``GraphitiBackend.graph_access.graph``/``_driver_for`` use a node's ``group_id``
 verbatim as the FalkorDB graph name, with no canonicalization -- so a node
 whose ``group_id`` names a spelling variant, alias, or otherwise-wrong graph
 key ends up "foreign" to the graph it actually lives in (``n.group_id <>
@@ -101,13 +101,16 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import logging
 import sys
 import types
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
+from fused_memory.backends.graph_access import GraphHandle
 from fused_memory.maintenance.cross_graph_move import (
     SubgraphEdgeResult,
     create_moved_node,
@@ -275,7 +278,7 @@ async def census_foreign_nodes(
     WARNING is logged -- the caller must not treat the returned list as
     guaranteed-complete in that case (no silent caps).
     """
-    graph = graphiti._graph_for(graph_key)
+    graph = graphiti.graph_access.graph(graph_key)
     rows: list[dict] = []
     skip = 0
     for _page_num in range(MAX_CENSUS_PAGES):
@@ -284,6 +287,7 @@ async def census_foreign_nodes(
             'RETURN n.uuid, n.name, n.group_id, labels(n) '
             'SKIP $skip LIMIT $limit',
             {'graph_key': graph_key, 'skip': skip, 'limit': page_size},
+            op='census_foreign_nodes',
         )
         page = result.result_set or []
         rows.extend(
@@ -310,7 +314,7 @@ async def census_foreign_nodes(
     return rows
 
 
-async def node_present_in_graph(graph: Any, uuid: str) -> bool:
+async def node_present_in_graph(graph: GraphHandle, uuid: str) -> bool:
     """Read-only presence probe: True iff a node with *uuid* exists in *graph*.
 
     Distinguishes MOVE (absent from the resolved target -- displaced-only)
@@ -320,11 +324,12 @@ async def node_present_in_graph(graph: Any, uuid: str) -> bool:
     result = await graph.ro_query(
         'MATCH (n {uuid: $uuid}) RETURN n.uuid LIMIT 1',
         {'uuid': uuid},
+        op='node_present_in_graph',
     )
     return bool(result.result_set)
 
 
-async def count_node_edges_episodes(graph: Any, uuid: str) -> dict:
+async def count_node_edges_episodes(graph: GraphHandle, uuid: str) -> dict:
     """Read-only {'edges', 'episodes'} counts incident to *uuid* in *graph*.
 
     Surfaced on each manifest node so a human reviewer can see how much
@@ -334,10 +339,12 @@ async def count_node_edges_episodes(graph: Any, uuid: str) -> dict:
     edges_result = await graph.ro_query(
         'MATCH (n {uuid: $uuid})-[e:RELATES_TO]-(m) RETURN count(DISTINCT e)',
         {'uuid': uuid},
+        op='count_node_edges_episodes',
     )
     episodes_result = await graph.ro_query(
         'MATCH (ep:Episodic)-[e:MENTIONS]->(n {uuid: $uuid}) RETURN count(e)',
         {'uuid': uuid},
+        op='count_node_edges_episodes',
     )
     edges = edges_result.result_set[0][0] if edges_result.result_set else 0
     episodes = episodes_result.result_set[0][0] if episodes_result.result_set else 0
@@ -389,12 +396,12 @@ async def classify_node(
         disposition = REKEY
     else:
         present_in_target = await node_present_in_graph(
-            graphiti._graph_for(target_graph), node['uuid'],
+            graphiti.graph_access.graph(target_graph), node['uuid'],
         )
         disposition = disposition_for(target_graph, present_in_target)
 
     counts = await count_node_edges_episodes(
-        graphiti._graph_for(node['source_graph']), node['uuid'],
+        graphiti.graph_access.graph(node['source_graph']), node['uuid'],
     )
 
     return {
@@ -412,7 +419,7 @@ async def classify_node(
 # Graphiti: in-place mutation (REKEY only)
 # ---------------------------------------------------------------------------
 
-async def rekey_node_in_place(graph: Any, uuid: str, new_group_id: str) -> None:
+async def rekey_node_in_place(graph: GraphHandle, uuid: str, new_group_id: str) -> None:
     """In-place group_id re-key for a REKEY-dispositioned node.
 
     Unlike MOVE (``move_entity_across_graphs``) and MERGE
@@ -429,16 +436,19 @@ async def rekey_node_in_place(graph: Any, uuid: str, new_group_id: str) -> None:
     await graph.query(
         'MATCH (n:Entity {uuid: $uuid}) SET n.group_id = $gid',
         {'uuid': uuid, 'gid': new_group_id},
+        op='rekey_node_in_place',
     )
     await graph.query(
         'MATCH (n:Entity {uuid: $uuid})-[e:RELATES_TO]-(m:Entity) '
         'SET e.group_id = $gid',
         {'uuid': uuid, 'gid': new_group_id},
+        op='rekey_node_in_place',
     )
     await graph.query(
         'MATCH (ep:Episodic)-[e:MENTIONS]->(n:Entity {uuid: $uuid}) '
         'SET e.group_id = $gid',
         {'uuid': uuid, 'gid': new_group_id},
+        op='rekey_node_in_place',
     )
 
 
@@ -629,7 +639,7 @@ async def run(args: Any, memory_service: Any) -> dict:
             # try/except so one bad REKEY node cannot abort the batch.
             try:
                 await rekey_node_in_place(
-                    graphiti._graph_for(node['source_graph']), uuid, node['target_graph'],
+                    graphiti.graph_access.graph(node['source_graph']), uuid, node['target_graph'],
                 )
             except Exception as exc:
                 apply_results.append({
@@ -942,36 +952,41 @@ async def run(args: Any, memory_service: Any) -> dict:
 # Backend construction
 # ---------------------------------------------------------------------------
 
-async def build_memory_service(args: Any, config: Any) -> Any:
-    """Build+initialize the backend/service run() drives, branching on args.apply.
+@contextlib.asynccontextmanager
+async def open_memory_service(args: Any, config: Any) -> AsyncIterator[Any]:
+    """Open the backend/service run() drives, branching on args.apply, and close it on exit.
 
     Dry-run (``args.apply`` False): the census/classify path only ever
     READS (``list_graphs``, ``ro_query``) -- it never needs a full
     ``MemoryService``, whose ``initialize()`` unconditionally runs the
     W6-ε startup identity scan (a dup-uuid-edge REPAIR, i.e. a write) and
-    builds indices. Build a lean ``GraphitiBackend`` directly and
-    initialize it with ``skip_maintenance=True`` so the default
+    builds indices. Open a lean ``GraphitiBackend`` directly with
+    ``skip_maintenance=True`` so the default
     ``python migrate_cross_graph_leak.py > manifest.json`` invocation no
     longer mutates on startup or contends with a running service's own
-    maintenance sweep. Returned as a tiny namespace exposing ``.graphiti``
-    (the backend itself) and an awaitable ``.close``, mirroring the shape
-    ``run()``/``_run_live`` expect from a full ``MemoryService``.
+    maintenance sweep. Yielded as a tiny namespace exposing ``.graphiti``
+    (the backend itself), the one attribute ``run()`` reads from a full
+    ``MemoryService``; the backend is closed when the block exits, and after
+    a failed ``initialize`` too.
 
-    Apply (``args.apply`` True): ``--apply`` legitimately mutates, so build
-    and initialize the full ``MemoryService``, unskipped, exactly as
-    before.
+    Apply (``args.apply`` True): ``--apply`` legitimately mutates, so the
+    full ``MemoryService`` is opened, unskipped, by ``maintenance_service``,
+    which also closes it.
     """
-    from fused_memory.backends.graphiti_client import GraphitiBackend  # noqa: PLC0415
-    from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+    from fused_memory.backends.graphiti_client import GraphitiBackend
+    from fused_memory.maintenance._utils import maintenance_service
 
     if not args.apply:
         backend = GraphitiBackend(config)
-        await backend.initialize(skip_maintenance=True)
-        return types.SimpleNamespace(graphiti=backend, close=backend.close)
+        try:
+            await backend.initialize(skip_maintenance=True)
+            yield types.SimpleNamespace(graphiti=backend)
+        finally:
+            await backend.close()
+        return
 
-    memory = MemoryService(config)
-    await memory.initialize()
-    return memory
+    async with maintenance_service(config=config) as (_, memory):
+        yield memory
 
 
 # ---------------------------------------------------------------------------
@@ -1017,19 +1032,15 @@ def main() -> int:
     args = build_arg_parser().parse_args()
 
     if args.config:
-        import os  # noqa: PLC0415
+        import os
         os.environ['CONFIG_PATH'] = str(args.config)
 
     async def _run_live() -> dict:
-        from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+        from fused_memory.config.schema import FusedMemoryConfig
 
         config = FusedMemoryConfig()
-        built = await build_memory_service(args, config)
-        try:
+        async with open_memory_service(args, config) as built:
             return await run(args, built)
-        finally:
-            if hasattr(built, 'close'):
-                await built.close()
 
     report = asyncio.run(_run_live())
     print(json.dumps(report, indent=2, default=str))

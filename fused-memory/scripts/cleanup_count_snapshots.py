@@ -683,8 +683,8 @@ async def run(
     generated_at = datetime.now(UTC).isoformat()
 
     if known_projects_map is None:
-        from fused_memory.config.schema import FusedMemoryConfig as _FMC  # noqa: PLC0415
-        from fused_memory.models.scope import build_known_projects_map  # noqa: PLC0415
+        from fused_memory.config.schema import FusedMemoryConfig as _FMC
+        from fused_memory.models.scope import build_known_projects_map
         cfg = _FMC()
         known_projects_map = build_known_projects_map(cfg.taskmaster.project_root if cfg.taskmaster else '')
 
@@ -748,7 +748,7 @@ async def run(
     # aborts BEFORE apply_cleanup -- precisely what the shim's raise does
     # today.  An EMPIRICAL incompleteness only warns, and the scan proceeds on
     # what was fetched with the report saying so.
-    from fused_memory.backends.graphiti_client import (  # noqa: PLC0415
+    from fused_memory.backends.graphiti_client import (
         apply_incompleteness_policy,
     )
 
@@ -908,17 +908,12 @@ def main() -> int:
     args = parser.parse_args()
 
     async def _run_live() -> int:
-        from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
-        from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+        from fused_memory.config.schema import FusedMemoryConfig
+        from fused_memory.maintenance._utils import maintenance_service
 
         config = FusedMemoryConfig()
-        memory = MemoryService(config)
-        await memory.initialize()
-        try:
+        async with maintenance_service(config=config) as (_, memory):
             report = await run(args, memory=memory)
-        finally:
-            if hasattr(memory, 'close'):
-                await memory.close()
         return 1 if report.get('aborted') else 0
 
     return asyncio.run(_run_live())

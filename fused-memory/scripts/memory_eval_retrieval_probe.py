@@ -466,7 +466,7 @@ def run_derive_registry(
     the Goodhart guard depends on. Print, diff, merge by hand.
     """
     if guard_clusters is None:
-        from fused_memory.config.schema import (  # noqa: PLC0415
+        from fused_memory.config.schema import (
             _default_topic_guard_clusters,
         )
 
@@ -680,7 +680,7 @@ def is_initial_run(root: str | Path, eval_id: str = EVAL_ID) -> bool:
     is not a prior measurement, and treating it as one would silently suppress
     the initial-state snapshot D1 requires.
     """
-    from shared.memory_eval_metrics import eval_dir  # noqa: PLC0415
+    from shared.memory_eval_metrics import eval_dir
 
     directory = eval_dir(root, eval_id)
     return not any(directory.glob('metrics-*.json'))
@@ -1103,7 +1103,7 @@ def probe_report_sections(
     *census_split* is taken already computed, never derived here, so the report
     renders the very split the caller hands back to its own callers.
     """
-    from shared.memory_eval_metrics import render_report  # noqa: PLC0415
+    from shared.memory_eval_metrics import render_report
 
     sections: list[ReportSection] = []
 
@@ -1518,7 +1518,7 @@ def emit_series(series, root: str | Path, *, stamp: str | None = None) -> tuple[
     shared module's, and re-implementing any of them here would be a second
     home for the artifact contract.
     """
-    from shared.memory_eval_metrics import write_metric_series  # noqa: PLC0415
+    from shared.memory_eval_metrics import write_metric_series
 
     return write_metric_series(series, root, stamp=stamp)
 
@@ -1526,13 +1526,14 @@ def emit_series(series, root: str | Path, *, stamp: str | None = None) -> tuple[
 # ---------------------------------------------------------------------------
 # The read-only run band
 #
-# D8's runner pattern (audit_duplicate_memories.py:364-378) minus every
-# mutation: CONFIG_PATH from --config, FusedMemoryConfig(), MemoryService(),
-# initialize_for_reads(), try/finally close(); the full initialize() starts the
-# durable write queue and runs Graphiti startup maintenance, which repairs
-# edges. MemoryService rather than Mem0Backend
-# because a retrieval probe MUST embed its queries — unlike the census, which
-# skips the embedder deliberately, this one cannot.
+# D8's runner pattern minus every mutation: CONFIG_PATH from --config,
+# FusedMemoryConfig(), then
+# fused_memory/maintenance/_utils.py::maintenance_service(open_as=READS), which
+# opens and always closes the service. The full opening starts the durable
+# write queue and runs Graphiti startup maintenance, which repairs edges.
+# MemoryService rather than Mem0Backend because a retrieval probe MUST embed
+# its queries — unlike the census, which skips the embedder deliberately, this
+# one cannot.
 #
 # There is no --apply band and no write call. The guarantee is asserted as
 # behaviour: the tests drive this band against a service double whose every
@@ -1607,7 +1608,7 @@ def graphiti_primary_categories() -> tuple[str, ...]:
     counting scope, not an empty graph. Derived for the same reason
     ``fused_memory/eval/topic_registry.py::corpus_categories`` is.
     """
-    from fused_memory.models.enums import GRAPHITI_PRIMARY  # noqa: PLC0415
+    from fused_memory.models.enums import GRAPHITI_PRIMARY
 
     return tuple(sorted(c.value for c in GRAPHITI_PRIMARY))
 
@@ -1737,7 +1738,7 @@ async def run_probe(
     counts = await count_corpus(memory, selected)
 
     if stamp is None:
-        from shared.memory_eval_metrics import run_stamp  # noqa: PLC0415
+        from shared.memory_eval_metrics import run_stamp
 
         stamp = run_stamp()
 
@@ -1894,16 +1895,18 @@ async def _probe(args: argparse.Namespace, registry: TopicRegistry) -> ProbeOutc
     Only the open is converted to :class:`ProbeRunError`; see
     ``shared/src/shared/cli_boundary.py::run_cli``.
     """
-    from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
-    from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+    from fused_memory.config.schema import FusedMemoryConfig
+    from fused_memory.maintenance._utils import ServiceOpen, maintenance_service
 
     if args.config:
         os.environ['CONFIG_PATH'] = str(args.config)
 
-    memory = MemoryService(FusedMemoryConfig())
-    try:
+    config = FusedMemoryConfig()
+    async with contextlib.AsyncExitStack() as stack:
         try:
-            await memory.initialize_for_reads()
+            _, memory = await stack.enter_async_context(
+                maintenance_service(config=config, open_as=ServiceOpen.READS),
+            )
         except (OSError, sqlite3.Error) as exc:
             raise ProbeRunError(
                 f'the memory store could not be opened ({type(exc).__name__}): {exc}'
@@ -1915,8 +1918,6 @@ async def _probe(args: argparse.Namespace, registry: TopicRegistry) -> ProbeOutc
             out_root=args.out_root,
             census=load_census_coverage(args.census),
         )
-    finally:
-        await memory.close()
 
 
 def main(argv: list[str] | None = None) -> int:

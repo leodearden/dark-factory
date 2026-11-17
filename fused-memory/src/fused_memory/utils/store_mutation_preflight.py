@@ -286,7 +286,7 @@ def _mem0_configured_history_db_path() -> str:
     contract hermetically without paying that cost or touching a real
     ``~/.mem0``.
     """
-    from mem0.configs.base import MemoryConfig  # noqa: PLC0415
+    from mem0.configs.base import MemoryConfig
 
     return MemoryConfig().history_db_path
 

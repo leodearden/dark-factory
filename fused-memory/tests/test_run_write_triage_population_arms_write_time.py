@@ -493,7 +493,7 @@ JUDGED = ['w-marker', 'w-late', 'w-long', 'w-kid', 'w-keys']
 
 
 def _sha(data: bytes | str) -> str:
-    import hashlib  # noqa: PLC0415
+    import hashlib
 
     return hashlib.sha256(data.encode() if isinstance(data, str) else data).hexdigest()
 
@@ -1035,7 +1035,7 @@ class TestCommittedWriteTimePopulationIsTraceable:
         assert population['judge_band_sample']['size'] == pi['n_judge_band']
 
     def test_the_spend_is_the_sum_of_the_arms(self) -> None:
-        import math  # noqa: PLC0415
+        import math
 
         artifact = _committed()
         assert artifact['spend']['usd_total'] == round(

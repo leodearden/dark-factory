@@ -30,6 +30,7 @@ const {
   axisY,
   axisMax,
   axisPaths,
+  axisStepPaths,
   bandPaths,
   barFractions,
   stackedAreaPaths,
@@ -141,7 +142,9 @@ function StepSpark({ values, width = 100, height = 28, color = PALETTE.bad, stro
 // (task 6370); formatY is presentation only. Rationale at spark_path.js::axisMax.
 // `band` ({ lo, hi, color? }) is drawn beneath the series wherever both bounds
 // are plottable, and its hi joins the axis fold. A series with `dash` is drawn
-// dashed. `minAxisMax` is the least axis maximum, the seed of that fold.
+// dashed, and one with `step` holds each value until the next column
+// (spark_path.js::axisStepPaths). `minAxisMax` is the least axis maximum, the
+// seed of that fold.
 function LineChart({ series, labels, band, height = 220, yLabel, formatY = (v) => String(v), formatX = (v) => v, countAxis = false, minAxisMax = 1 }) {
   const ref = useRef(null);
   const [w, setW] = useState(600);
@@ -182,7 +185,7 @@ function LineChart({ series, labels, band, height = 220, yLabel, formatY = (v) =
   // the labels from the marks the first time the x-mapping changes, and a chart
   // whose labels no longer line up with its marks renders as a plausible chart
   // rather than an error.
-  const built = series.map(s => axisPaths(s.values, geom));
+  const built = series.map(s => (s.step ? axisStepPaths : axisPaths)(s.values, geom));
   const bandColor = (band && band.color) || PALETTE.accent;
   const bandSubpaths = band ? bandPaths(band.lo, band.hi, geom) : [];
   // The axes and label row render even with no series at all (an empty frame
@@ -324,6 +327,7 @@ const MARK_SWATCH = Object.freeze({
   rug: { borderLeft: '2px solid var(--fg-3)' },
   range: { background: MARK_HATCH },
   alarm: { borderLeft: '1px solid var(--warn)' },
+  baseline: { borderLeft: '1px dotted var(--accent)' },
 });
 
 function markLeft(fraction) {
@@ -386,6 +390,7 @@ function OneMark({ mark }) {
     case 'rug': return <UnlabelledMark mark={mark} style="rug" />;
     case 'range': return <RangeMark mark={mark} />;
     case 'alarm': return <LabelledMark mark={mark} className="chart-mark-alarm" color="var(--warn)" line="solid" />;
+    case 'baseline': return <LabelledMark mark={mark} className="chart-mark-baseline" color="var(--accent)" line="dotted" />;
     default: return <LabelledMark mark={mark} />;
   }
 }

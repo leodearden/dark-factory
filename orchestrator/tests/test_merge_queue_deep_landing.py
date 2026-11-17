@@ -157,7 +157,7 @@ def _within_spawn_budget(request, monkeypatch):
     construction.  Nine copies in nine class bodies is the other way to dodge
     that, and a flat SPOT violation in a file already this long.  The opt-in
     is visible on each class, and
-    test_timeout_marker_inversion_guard.py::TestDeepLandingModuleMarkers pins
+    test_spawn_budget_guard.py::TestDeepLandingModuleMarkers pins
     the marker/fixture pairing in BOTH directions.
 
     A WIRE between two shared parts and nothing else: ``count_git_spawns``
@@ -742,13 +742,16 @@ class TestTipPassAdoptionSignal:
         red; it does NOT identify WHICH member broke it, so terminally failing
         any of them would be the same unsound attribution pointing the other
         way — and would feed `consecutive_merge_thrash` a deterministic
-        signature on every retry.
+        signature on every retry.  What changed since γ (task 10617): every
+        member's next dispatch verifies its own tree, so none is chained again.
         """
         from orchestrator.merge_lane.types import InflightStatus
 
         _g, worker, item, _chain, res, store, queued, releases = await self._scene(
             git_repo, monkeypatch, verdict=_red_tip(),
         )
+        assert worker.chain_snapshot() == ()
+        assert await worker._deep_chain_placement(item) is None
 
         assert res.status == InflightStatus.REQUEUED
         assert res.outcome is None, 'a defer renders no MergeOutcome at all'
@@ -782,7 +785,7 @@ class TestTipPassAdoptionSignal:
         assert res.status == InflightStatus.REQUEUED
         assert res.outcome is None
         assert not item.request.result.done()
-        assert '101' in worker._chain_error_suppressed, (
+        assert '101' in worker._next_dispatch_unchained, (
             'the one-shot suppression is what makes an infra blip cost exactly '
             'one non-chained round'
         )
@@ -1334,18 +1337,18 @@ class TestStaleCasAbortLeavesTheRestAlone:
                 f'task {tid} emitted more than its own enqueue event'
             )
 
-    async def test_two_consecutive_tip_fails_render_nothing_for_any_link(
+    async def test_a_red_tip_is_never_followed_by_a_second_over_the_same_links(
         self, git_repo: Path, tmp_path: Path, monkeypatch,
     ) -> None:
-        """(b) The same silence across two RED tips in a row.
+        """(b) No pair of red tips over the same links, and silence for every link.
 
-        Two rounds is the interesting number: ``max_consecutive_merge_thrash``
+        Two rounds was the interesting number: ``max_consecutive_merge_thrash``
         defaults to 2, so a pair of identical rendered failures is exactly what
-        would trip the ladder.  The chain arm must produce no such pair.
+        would trip the ladder.  Since task 10617 the pair cannot form: a red tip
+        sends its owner and every link to an un-chained verify first, so the
+        head's re-dispatch builds no chain and no link is offered to any other.
         """
         import dataclasses
-
-        from orchestrator.merge_lane.types import InflightEntry
 
         s = await _prefix_scene_upto_finalize(
             git_repo, tmp_path, monkeypatch, db_name='delta-tipfail.db',
@@ -1355,28 +1358,20 @@ class TestStaleCasAbortLeavesTheRestAlone:
         await worker._finalize_inflight(s['entry'])
         await asyncio.sleep(0)
 
-        # Round 2.  The head was REQUEUED by the fail arm, so it now sits on
-        # `_queue` and is deliberately left there — draining it back into a lane
-        # would make the head a member of its OWN next chain (chain_snapshot
-        # walks lane buffers), which is a different scenario.  Everything the
-        # claim is about — the three links — is still buffered where round 1
-        # left it, so the rebuild sees exactly the prefix it saw before.
+        # The head was REQUEUED by the fail arm, so it now sits on `_queue`,
+        # behind the links still buffered where the red round left them.
         assert queued_request_ids(worker, ALL_LANES)[-1] == s['reqs']['101'].request_id, (
             'the fail arm must have requeued the head, behind the links'
         )
         item2 = dataclasses.replace(
             s['item'], merge_wt=_ephemeral_merge_wt(git_ops, 'tipfail2'),
         )
-        chain2 = await worker._deep_chain_placement(item2)
-        assert chain2 is not None and chain2.links
-        res2 = await worker._run_inflight_verify(item2, _local_lease(), chain=chain2)
-        done2: asyncio.Future = asyncio.get_running_loop().create_future()
-        done2.set_result(res2)
-        await worker._finalize_inflight(InflightEntry(
-            item=item2, lease=_local_lease(), verify_task=done2,  # type: ignore[arg-type]
-            merge_wt=res2.merge_wt, was_speculative=True, chain=chain2,
-        ))
-        await asyncio.sleep(0)
+        assert await worker._deep_chain_placement(item2) is None, (
+            "the head's re-dispatch verifies its own tree, un-chained"
+        )
+        assert [r.task_id for r in worker.chain_snapshot()] == [_DELTA_TRUNCATOR], (
+            'only the truncator, which the red tip never covered, may still chain'
+        )
 
         assert not s['adv'], 'a red tip lands NOTHING via the chain'
         for tid in (*_DELTA_LINKS, _DELTA_TRUNCATOR):
@@ -1797,7 +1792,7 @@ async def _head_and_prefix_scene(
         ),
         merge_wt=_ephemeral_merge_wt(git_ops, 'head'),
         base_sha=main_sha,          # slot 1 CASes against REAL main
-        speculative=head_speculative,   # the trust anchor — never chained
+        speculative=head_speculative,   # the trust anchor (chains only when alone, PRD D5)
     )
     spec_item = RealMergeItem(
         request=reqs['101'],
@@ -2157,9 +2152,7 @@ class TestHeadCancelOnAdoption:
         await _deliver_terminal_blocked(s, 'dead/hung verify cap-out x3')
         worker, head = s['worker'], s['head_entry']
 
-        adopted = await worker._adopt_head_on_tip_authority(
-            s['reqs']['101'].request_id, '101',
-        )
+        adopted = await worker._adopt_head_on_tip_authority(s['spec_item'])
 
         assert adopted is None, (
             'a head whose outcome is already delivered must not be adopted; '
@@ -2273,9 +2266,7 @@ class TestHeadCancelOnAdoption:
         assert s['head_task'].done()
         assert not s['reqs']['100'].result.done(), 'future deliberately UNresolved'
 
-        adopted = await s['worker']._adopt_head_on_tip_authority(
-            s['reqs']['101'].request_id, '101',
-        )
+        adopted = await s['worker']._adopt_head_on_tip_authority(s['spec_item'])
 
         assert adopted is s['head_entry']
         assert s['head_entry'].chain_adopted is True
@@ -2290,13 +2281,50 @@ class TestHeadCancelOnAdoption:
         assert not s['head_task'].done()
         assert not s['reqs']['100'].result.done()
 
-        adopted = await s['worker']._adopt_head_on_tip_authority(
-            s['reqs']['101'].request_id, '101',
-        )
+        adopted = await s['worker']._adopt_head_on_tip_authority(s['spec_item'])
 
         assert adopted is s['head_entry']
         assert s['head_entry'].chain_adopted is True
         assert s['head_entry'].verify_task is None, 'torn down, per topology 1'
+
+    async def test_a_non_speculative_tip_adopts_nothing_ahead_of_it(
+        self, git_repo: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """A non-speculative tip is built on main, so its tree contains no entry ahead of it.
+
+        When the chained item IS the head (PRD D5), the only entry that can sit
+        ahead of it in ``_inflight`` is a vacated one: here I0, whose own verify
+        requeued its request, still head-of-line and awaiting finalize.  It must
+        not be marked adopted.
+        """
+        import dataclasses
+
+        from orchestrator.merge_lane.types import InflightStatus, InflightVerifyResult
+
+        def _requeued_verify(_git_ops) -> asyncio.Future:
+            done = asyncio.get_running_loop().create_future()
+            done.set_result(InflightVerifyResult(
+                outcome=None, merge_wt=None, status=InflightStatus.REQUEUED,
+            ))
+            return done
+
+        s = await _head_and_prefix_scene(
+            git_repo, tmp_path, monkeypatch, db_name='delta-head-non-spec-tip.db',
+            head_task_factory=_requeued_verify,
+        )
+        requeued = s['head_entry']
+        requeued.lease = None
+        requeued.status = InflightStatus.REQUEUED
+        assert requeued.vacated
+        chained_head = dataclasses.replace(
+            s['spec_item'], speculative=False, permit=None, base_sha=s['main_sha'],
+        )
+
+        adopted = await s['worker']._adopt_head_on_tip_authority(chained_head)
+
+        assert adopted is None
+        assert requeued.chain_adopted is False
+        assert requeued.status is InflightStatus.REQUEUED
 
 
 @pytest.mark.asyncio
@@ -3353,7 +3381,7 @@ class _DeltaScene:
             ),
             merge_wt=wt,
             base_sha=main_before,   # this round really CASes against main
-            speculative=True,       # slot 2 — the only kind that chains
+            speculative=True,       # slot 2 — chains whatever the frontier holds (PRD D5)
         )
         entry = await worker._dispatch_item(item)
         assert entry is not None, 'dispatch must not decline: a host is free'

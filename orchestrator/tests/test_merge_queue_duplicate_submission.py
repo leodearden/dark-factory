@@ -120,7 +120,7 @@ class _FakeEscalationQueue:
         self._seq = 0
         self.submitted: list = []
 
-    def has_open_l1(self, task_id: str) -> bool:  # noqa: ARG002
+    def has_open_l1(self, task_id: str) -> bool:
         return self._open_l1
 
     def make_id(self, task_id: str) -> str:
@@ -498,7 +498,7 @@ class _FakeEventStore:
     def __init__(self) -> None:
         self.emitted: list = []
 
-    def emit(self, event_type, *, task_id=None, phase=None, data=None, **kw):  # noqa: ARG002
+    def emit(self, event_type, *, task_id=None, phase=None, data=None, **kw):
         self.emitted.append({'event_type': event_type, 'task_id': task_id, 'data': data or {}})
 
 

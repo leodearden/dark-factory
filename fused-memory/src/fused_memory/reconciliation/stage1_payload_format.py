@@ -9,9 +9,15 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Sequence
 from datetime import UTC, datetime
 
-from fused_memory.models.reconciliation import ContextItem, ReconciliationEvent, Watermark
+from fused_memory.models.reconciliation import (
+    ContextFetchFailure,
+    ContextItem,
+    ReconciliationEvent,
+    Watermark,
+)
 from fused_memory.reconciliation.child_memory_link import render_parent_link
 from fused_memory.reconciliation.dangling_citation import render_dangling_citation_line
 from fused_memory.reconciliation.task_filter import strip_snapshot_lines
@@ -20,6 +26,8 @@ from fused_memory.utils.clip_disclosure import elide_text
 logger = logging.getLogger(__name__)
 
 _RECORD_BODY_CHARS = 2_000  # basis: plans/recon-evidence-caps-measurement-2026-10.md
+
+CONTEXT_FETCH_FAILED_HEADING = 'Context fetch failed'
 
 
 def to_utc(dt: datetime) -> datetime:
@@ -142,6 +150,19 @@ def format_context_items(items: dict[str, ContextItem]) -> tuple[str, int]:
             total_stripped += n
             sections.append(cleaned)
     return '\n'.join(sections), total_stripped
+
+
+def format_context_fetch_failures(failures: Sequence[ContextFetchFailure]) -> str:
+    """Name each event whose related context is unknown; '' when every fetch succeeded."""
+    if not failures:
+        return ''
+    lines = [f'**{CONTEXT_FETCH_FAILED_HEADING}** ({len(failures)})']
+    lines.extend(f'- [{f.event_type}] {f.event_id}: {f.error}' for f in failures)
+    lines.append(
+        'The related context for these events is UNKNOWN, not absent: do not infer '
+        'from its absence that no duplicate, contradiction or related record exists.'
+    )
+    return '\n'.join(lines)
 
 
 def format_findings(findings: list[dict]) -> str:

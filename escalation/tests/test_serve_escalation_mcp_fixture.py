@@ -95,13 +95,13 @@ def test_the_injected_conftest_is_this_directorys_conftest(
 class _NotMcpHandler(BaseHTTPRequestHandler):
     """Answer 404 to everything: a live HTTP port with no ``/mcp/`` route."""
 
-    def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler's own API
+    def do_GET(self) -> None:  # BaseHTTPRequestHandler's own API
         self.send_error(404)
 
-    def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler's own API
+    def do_POST(self) -> None:  # BaseHTTPRequestHandler's own API
         self.send_error(404)
 
-    def log_message(self, format: str, *args) -> None:  # noqa: A002
+    def log_message(self, format: str, *args) -> None:
         """Silence the handler's default per-request stderr log."""
 
 

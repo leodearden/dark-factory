@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 from _mimo_fixture import measured_export
 from _plan_tools_mcp_fixture import plan_tools_mcp
-from shared.cli_invoke import _SubprocessResult
+from shared.cli_invoke import SubprocessResult
 from shared.process_cost import ProcessCostBasis
 
 from orchestrator.agents import mimo_backend
@@ -43,8 +43,8 @@ MODEL = 'mimo-v2.6-pro'
 
 def _subprocess_result(
     stdout: str = '', stderr: str = '', returncode: int = 0, timed_out: bool = False,
-) -> _SubprocessResult:
-    return _SubprocessResult(
+) -> SubprocessResult:
+    return SubprocessResult(
         stdout=stdout, stderr=stderr, returncode=returncode, duration_ms=1234,
         timed_out=timed_out,
     )
@@ -270,7 +270,7 @@ def _jsonl(*session_ids: str) -> str:
     )
 
 
-def _parse(exports, run: _SubprocessResult | None = None, *, max_turns: int = MAX_TURNS):
+def _parse(exports, run: SubprocessResult | None = None, *, max_turns: int = MAX_TURNS):
     return parse_mimo_sessions(
         exports, run or _subprocess_result(), max_turns=max_turns, cost_of=_cost_of,
     )
@@ -416,7 +416,7 @@ class _FakeSessionStore:
         )
         self.exports = exports or {}
 
-    async def __call__(self, argv: list[str], timeout: float) -> _SubprocessResult:
+    async def __call__(self, argv: list[str], timeout: float) -> SubprocessResult:
         self.calls.append(argv)
         self.timeouts.append(timeout)
         if argv[1:3] == ['session', 'list']:

@@ -36,13 +36,12 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Any
-from unittest.mock import patch
 
 import pytest
 from shared.cli_invoke import (
     _SCHEMA_OUTPUT_TOOL,
     AgentResult,
-    _SubprocessResult,
+    SubprocessResult,
     invoke_claude_agent,
 )
 
@@ -63,8 +62,8 @@ _RECON_LIKE_SCHEMA: dict[str, Any] = {
 _STRUCTURED_PAYLOAD: dict[str, Any] = {'summary': 'ok', 'findings': ['a', 'b']}
 
 
-def _make_subprocess_result(**overrides: Any) -> _SubprocessResult:
-    """A canned _SubprocessResult whose stdout carries a StructuredOutput payload."""
+def _make_subprocess_result(**overrides: Any) -> SubprocessResult:
+    """A canned SubprocessResult whose stdout carries a StructuredOutput payload."""
     stdout = json.dumps({
         'result': 'ok',
         'is_error': False,
@@ -83,33 +82,33 @@ def _make_subprocess_result(**overrides: Any) -> _SubprocessResult:
         'timed_out': False,
     }
     defaults.update(overrides)
-    return _SubprocessResult(**defaults)
+    return SubprocessResult(**defaults)
 
 
 async def _drive_recon_like(cwd: Path) -> tuple[list[str], AgentResult]:
     """Invoke the shared non-sandbox path with a recon/curator-like config,
-    returning the argv handed to _run_subprocess and the parsed AgentResult.
+    returning the argv handed to run_cli_subprocess and the parsed AgentResult.
     """
     captured: list[list[str]] = []
 
-    async def fake_run_subprocess(cmd: list[str], *args: Any, **kwargs: Any) -> _SubprocessResult:
+    async def fake_runner(cmd: list[str], *args: Any, **kwargs: Any) -> SubprocessResult:
         captured.append(list(cmd))
         return _make_subprocess_result()
 
-    with patch('shared.cli_invoke._run_subprocess', side_effect=fake_run_subprocess):
-        result = await invoke_claude_agent(
-            prompt='hello',
-            system_prompt='sys prompt',
-            cwd=cwd,
-            model='opus',
-            max_turns=20,
-            max_budget_usd=3.0,
-            allowed_tools=['Read'],
-            disallowed_tools=['*'],
-            mcp_config=None,
-            output_schema=_RECON_LIKE_SCHEMA,
-            permission_mode='bypassPermissions',
-        )
+    result = await invoke_claude_agent(
+        prompt='hello',
+        system_prompt='sys prompt',
+        cwd=cwd,
+        model='opus',
+        max_turns=20,
+        max_budget_usd=3.0,
+        allowed_tools=['Read'],
+        disallowed_tools=['*'],
+        mcp_config=None,
+        output_schema=_RECON_LIKE_SCHEMA,
+        permission_mode='bypassPermissions',
+        runner=fake_runner,
+    )
 
     assert len(captured) == 1, f'expected exactly one subprocess invocation; got {captured!r}'
     return captured[0], result

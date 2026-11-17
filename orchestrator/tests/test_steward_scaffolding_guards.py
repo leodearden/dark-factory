@@ -37,9 +37,8 @@ failure mode is that they keep getting scattered and re-derived:
    invariant, and a fourth address is exactly the scattering described above.
    NOT for cost, and the distinction matters in a module whose premise is that
    unchecked rationales rot — module membership buys nothing here.  Each
-   census runs its OWN streaming pass through ``_tests_tree_census``, lands on
-   an arbitrary worker, and pays one full-tree parse there, wherever it is
-   written.
+   census is a projection of the one shared tree pass (``_tree_scan.py``),
+   wherever it is written.
 
 Modelled on ``test_git_repo_isolation_guard.py``, which is exactly this shape for
 the esc-3072-3 incident class: helper unit tests, plus an AST recurrence guard
@@ -49,8 +48,10 @@ module.
 from __future__ import annotations
 
 import ast
+import dataclasses
 import functools
-from collections.abc import Callable, Mapping, MutableMapping
+from collections.abc import Callable, Iterable, Mapping, MutableMapping
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import NamedTuple
@@ -61,15 +62,22 @@ from _orch_helpers import (
     MOCK_WORKFLOW_PROJECT_ROOT,
     assert_sandboxed_project_root,
 )
+from _tree_scan import (
+    ORCHESTRATOR_TESTS,
+    TESTS_DIR,
+    TREE_PASS_XDIST_GROUP,
+    ParsedModule,
+    TreeAnalysis,
+    TreePass,
+    python_files,
+)
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
-# Both AST guards below rglob() every *.py under orchestrator/tests/ and
-# ast.parse() each one, which is the family the pyproject default 60s timeout is
-# too tight for under `-n auto`. WHY the ceiling is a shared constant rather than
-# a hand-picked literal, and the guard that ENFORCES this mark: see
-# shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT, and
-# test_whole_tree_scan_timeout_guard.py (task 4215).
-pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
+# The family mark and shared group: shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT, _tree_scan.py.
+pytestmark = [
+    pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT),
+    pytest.mark.xdist_group(TREE_PASS_XDIST_GROUP),
+]
 
 
 class TestAssertSandboxedProjectRoot:
@@ -245,7 +253,6 @@ class TestAssertSandboxedProjectRoot:
 # Recurrence guard: nobody re-implements the sandbox block inline (task 3647)
 # ===========================================================================
 
-_TESTS_DIR = Path(__file__).parent
 _HELPER_NAME = 'assert_sandboxed_project_root'
 
 # The canonical OWNER of the pattern, excluded from the sweep by construction:
@@ -263,9 +270,6 @@ _CANONICAL_OWNER = '_orch_helpers.py'
 # while both liveness tests stayed green.  The tree only grows, so raise this
 # when it drifts; do NOT lower it to silence a failure.
 _MIN_MODULES_SWEPT = 400
-
-# No xdist_group: each census streams its own pass, so grouping would share
-# nothing and only serialise three parses.
 
 
 def _mentions(node: ast.AST, name: str) -> bool:
@@ -299,6 +303,9 @@ def _asserts_isinstance_path(func: ast.AST) -> bool:
     return False
 
 
+_CONTAINMENT_METHOD = 'is_relative_to'
+
+
 def _asserts_is_relative_to_tmp_path(func: ast.AST) -> bool:
     """Signal (iii): a NON-NEGATED ``assert ....is_relative_to(<...tmp_path...>)``.
 
@@ -319,7 +326,7 @@ def _asserts_is_relative_to_tmp_path(func: ast.AST) -> bool:
             if (
                 isinstance(call, ast.Call)
                 and isinstance(call.func, ast.Attribute)
-                and call.func.attr == 'is_relative_to'
+                and call.func.attr == _CONTAINMENT_METHOD
                 and _mentions(call, 'tmp_path')
             ):
                 return True
@@ -391,54 +398,78 @@ class _Census(NamedTuple):
     sites: Mapping[str, tuple[str, ...]]
 
 
-def _census_tree(root: Path, detector: _Detector) -> _Census:
-    """Stream every ``*.py`` under *root* through *detector*, one tree at a time.
+@dataclass(frozen=True)
+class _Unparseable:
+    """A module's census fact when it raised ``SyntaxError``, so it can be named rather than dropped."""
 
-    Keys are POSIX paths relative to *root*; ``sites`` holds only modules with
-    a finding.  No exclusion is applied here: that belongs to each consuming
-    guard.  A decode error raises rather than landing in ``unparseable``.
+    error: str
+
+
+_CensusFact = tuple[str, ...] | _Unparseable
+
+
+def _census_analysis(
+    detector: _Detector,
+    files: Callable[[], Iterable[Path]],
+    may_find: Callable[[ParsedModule], bool],
+) -> TreeAnalysis[_CensusFact]:
+    """*detector* as a tree-pass analysis over *files*.
+
+    A ``SyntaxError`` becomes an :class:`_Unparseable` fact; a decode error
+    propagates, which fails the pass loudly rather than shrinking the swept set.
+    A module *may_find* rules out has no findings and is not walked; it is
+    still parsed first, so an unparseable one is named all the same.
     """
+    def extract(module: ParsedModule) -> _CensusFact:
+        try:
+            tree = module.tree
+        except SyntaxError as exc:
+            return _Unparseable(str(exc))
+        if not may_find(module):
+            return ()
+        return tuple(detector(tree))
+
+    return TreeAnalysis(name=f'{Path(__file__).stem}:{detector.__name__}', files=files, extract=extract)
+
+
+def _census_from(facts: Mapping[Path, _CensusFact], root: Path) -> _Census:
+    """Project per-file facts into a :class:`_Census` keyed by POSIX path relative to *root*.
+
+    ``sites`` holds only modules with a finding.  No exclusion is applied here:
+    that belongs to each consuming guard.
+    """
+    resolved_root = root.resolve()
     parsed: list[str] = []
     unparseable: list[str] = []
     sites: dict[str, tuple[str, ...]] = {}
-    for path in sorted(root.rglob('*.py')):
-        module = path.relative_to(root).as_posix()
-        try:
-            findings = detector(ast.parse(path.read_text(encoding='utf-8')))
-        except SyntaxError as exc:
-            unparseable.append(f'{module}: {exc}')
+    for path, fact in facts.items():
+        module = path.relative_to(resolved_root).as_posix()
+        if isinstance(fact, _Unparseable):
+            unparseable.append(f'{module}: {fact.error}')
             continue
         parsed.append(module)
-        if findings:
-            sites[module] = tuple(findings)
+        if fact:
+            sites[module] = fact
     return _Census(tuple(parsed), tuple(unparseable), MappingProxyType(sites))
 
 
-@functools.cache
-def _tests_tree_census(detector: _Detector) -> _Census:
-    """*detector*'s census of this tests tree: one streaming pass per detector
-    per process.
+def _census_tree(root: Path, detector: _Detector) -> _Census:
+    """*detector*'s census of every ``*.py`` under *root*, through its own one-analysis pass."""
+    analysis = dataclasses.replace(
+        _CENSUS_ANALYSES[detector], files=functools.partial(python_files, root),
+    )
+    return _census_from(TreePass.run((analysis,)).facts(analysis), root)
+
+
+def _tests_tree_census(tree_pass: TreePass, detector: _Detector) -> _Census:
+    """*detector*'s census of this tests tree, projected from the shared pass (``_tree_scan.py``).
 
     Deliberately UNFILTERED, so each guard applies its own exclusions at use
     time.  The recurrence guard drops the canonical owner.  The tmp-literal
     census must keep it, because ``_orch_helpers.py`` OWNS the canonical
-    literal.
-
-    COST.  The pass is the most expensive thing in this file, and it is paid
-    per process AND per detector.  Under ``pytest-xdist`` the cache buys
-    nothing across workers, so each census lands on some worker and pays one
-    full-tree parse there.  NO tree outlives the pass: retaining ~700 parsed
-    modules costs ~800 MB RSS per worker and more than doubles the parse.  The
-    measurement is in plans/pytest-per-test-timeout-measurement-2026-09-17.md
-    (task 6556 addendum).
-
-    Hence each guard exposes ONE test that asserts its offender list, its
-    liveness floor and its exclusions together.  Splitting those into a test
-    apiece is not more rigorous; it re-pays the pass on a fresh worker for each
-    one.  Add a case to the detector self-tests instead (synthetic sources, no
-    scan).
+    literal.  Each detector's analysis is registered in ``_CENSUS_ANALYSES``.
     """
-    return _census_tree(_TESTS_DIR, detector)
+    return _census_from(tree_pass.facts(_CENSUS_ANALYSES[detector]), TESTS_DIR)
 
 
 class TestCensusTree:
@@ -463,7 +494,7 @@ class TestCensusTree:
         assert [entry.split(':', 1)[0] for entry in census.unparseable] == ['broken.py']
         assert dict(census.sites) == {'a.py': ('1 (constructs TaskSteward)',)}
         assert not isinstance(census.sites, MutableMapping), (
-            'the census is memoised and shared, so its sites must be read-only'
+            'the census is projected from shared facts, so its sites must be read-only'
         )
 
     def test_it_applies_no_exclusion_of_its_own(self, tmp_path) -> None:
@@ -487,7 +518,7 @@ class TestCensusTree:
         (tmp_path / 'a.py').write_text('x = 1\n', encoding='utf-8')
         (tmp_path / 'undecodable.py').write_bytes(b'x = "\xff\xfe"\n')
 
-        with pytest.raises(UnicodeDecodeError):
+        with pytest.raises(AssertionError, match=r'undecodable\.py: UnicodeDecodeError'):
             _census_tree(tmp_path, _steward_construction_sites)
 
 
@@ -500,31 +531,30 @@ class TestNoInlineSandboxedProjectRootAsserts:
     is what the lineage already tried three times.  This makes it checkable.
     """
 
-    def test_no_module_reimplements_the_block(self) -> None:
-        """The whole recurrence guard, in ONE full-tree scan.
+    def test_no_module_reimplements_the_block(self, tree_pass: TreePass) -> None:
+        """The whole recurrence guard, over the shared full-tree pass.
 
         Liveness, the canonical-owner exclusion and the offender list are
         asserted together and IN THAT ORDER, so a broken sweep reports itself as
-        a broken sweep rather than as "zero recurrences".  They are not split
-        into a test apiece on purpose — see ``_tests_tree_census`` for the cost.
+        a broken sweep rather than as "zero recurrences".
         """
-        census = _tests_tree_census(_inline_sandbox_asserts)
+        census = _tests_tree_census(tree_pass, _inline_sandbox_asserts)
         swept = [m for m in census.parsed if PurePosixPath(m).name != _CANONICAL_OWNER]
 
         # -- liveness first: a sweep that inspects nothing reads as coverage.
         assert not census.unparseable, (
-            f'modules under {_TESTS_DIR} failed to parse and so were silently '
+            f'modules under {TESTS_DIR} failed to parse and so were silently '
             f'absent from this sweep — fix them or this guard is blind to them: '
             f'{list(census.unparseable)}'
         )
         assert len(swept) >= _MIN_MODULES_SWEPT, (
             f'the recurrence sweep found only {len(swept)} modules under '
-            f'{_TESTS_DIR} — expected at least {_MIN_MODULES_SWEPT}. A guard '
+            f'{TESTS_DIR} — expected at least {_MIN_MODULES_SWEPT}. A guard '
             f'that parses nothing reports zero recurrences and reads as coverage.'
         )
 
         # -- the canonical owner is where the block is SUPPOSED to live.
-        assert (_TESTS_DIR / _CANONICAL_OWNER).is_file(), (
+        assert (TESTS_DIR / _CANONICAL_OWNER).is_file(), (
             f'{_CANONICAL_OWNER} must exist — it owns {_HELPER_NAME}'
         )
         assert any(PurePosixPath(m).name == _CANONICAL_OWNER for m in census.parsed), (
@@ -651,7 +681,7 @@ class _Sanctioned(NamedTuple):
 
 # Every module allowed to construct a steward outside conftest's `make_steward`
 # factory, keyed by path RELATIVE TO the tests tree (not basename: the sweep is
-# a full rglob, so basename keys would let a same-named module in a `fixtures/`
+# recursive, so basename keys would let a same-named module in a `fixtures/`
 # subdir inherit a sanction it was never adjudicated for).
 #
 # This mapping IS the adjudication record: task 3647 ruled the split permanent,
@@ -694,6 +724,9 @@ _SANCTIONED_STEWARD_CONSTRUCTION: dict[str, _Sanctioned] = {
         ),
     ),
 }
+
+
+_STEWARD_SUFFIX = 'Steward'
 
 
 def _steward_construction_sites(tree: ast.Module) -> list[str]:
@@ -741,7 +774,7 @@ def _steward_construction_sites(tree: ast.Module) -> list[str]:
                 else node.func.attr if isinstance(node.func, ast.Attribute)
                 else None
             )
-            if called is not None and called.endswith('Steward'):
+            if called is not None and called.endswith(_STEWARD_SUFFIX):
                 sites.append(f'{node.lineno} (constructs {called})')
         if isinstance(node, ast.ClassDef):
             for base in node.bases:
@@ -750,7 +783,7 @@ def _steward_construction_sites(tree: ast.Module) -> list[str]:
                     else base.attr if isinstance(base, ast.Attribute)
                     else None
                 )
-                if name is not None and name.endswith('Steward'):
+                if name is not None and name.endswith(_STEWARD_SUFFIX):
                     sites.append(f'{node.lineno} (class {node.name} subclasses {name})')
     return sites
 
@@ -770,27 +803,26 @@ class TestStewardConstructionSitesAreCensused:
     scratch.
     """
 
-    def test_every_steward_construction_site_is_sanctioned(self) -> None:
-        """The whole census, in ONE full-tree scan.
+    def test_every_steward_construction_site_is_sanctioned(self, tree_pass: TreePass) -> None:
+        """The whole census, over the shared full-tree pass.
 
         Liveness, the unsanctioned-module check, the per-module site COUNT and
         allowlist staleness are asserted together and in that order: a census
         that read nothing sanctions everything, so it must report itself as
-        broken before it reports "all clear".  Not split into a test apiece on
-        purpose — see ``_tests_tree_census`` for the cost.
+        broken before it reports "all clear".
         """
-        census = _tests_tree_census(_steward_construction_sites)
+        census = _tests_tree_census(tree_pass, _steward_construction_sites)
 
         # -- liveness first, in both directions: did we read the tree, and does
         #    the detector still match anything at all?
         assert not census.unparseable, (
-            f'modules under {_TESTS_DIR} failed to parse and so were silently '
+            f'modules under {TESTS_DIR} failed to parse and so were silently '
             f'absent from this census — a module that cannot be read cannot be '
             f'censused: {list(census.unparseable)}'
         )
         assert len(census.parsed) >= _MIN_MODULES_SWEPT, (
             f'the census parsed only {len(census.parsed)} modules '
-            f'under {_TESTS_DIR} — expected at least {_MIN_MODULES_SWEPT}. A '
+            f'under {TESTS_DIR} — expected at least {_MIN_MODULES_SWEPT}. A '
             f'census that reads nothing sanctions everything.'
         )
         assert census.sites, (
@@ -935,8 +967,8 @@ class TestMockWorkflowProjectRootContract:
     is adjudicated in the census below instead of being folded onto the sandbox
     invariant.
 
-    No tree scan in this class, so neither test pays the full-tree parse the two
-    sweeping guards above do — see ``_tests_tree_census``.
+    No tree scan in this class, so neither test requests the shared full-tree
+    pass the two sweeping guards above project from.
     """
 
     def test_it_is_an_absolute_real_path_clear_of_pytest_paths(self) -> None:
@@ -1062,7 +1094,7 @@ class _Adjudicated(NamedTuple):
 
 # Every module allowed to hold an absolute-`/tmp` `project_root` literal, keyed
 # by path RELATIVE TO the tests tree (not basename, for the same reason
-# `_SANCTIONED_STEWARD_CONSTRUCTION` is: the sweep is a full rglob, so a basename
+# `_SANCTIONED_STEWARD_CONSTRUCTION` is: the sweep is recursive, so a basename
 # key would let a same-named module in a subdir inherit a sanction it was never
 # adjudicated for).
 #
@@ -1206,6 +1238,9 @@ def _tmp_literal(value: ast.expr) -> str | None:
     return None
 
 
+_PROJECT_ROOT = 'project_root'
+
+
 def _names_project_root(name: str) -> bool:
     """True if the bare identifier *name* denotes a ``project_root``.
 
@@ -1215,7 +1250,7 @@ def _names_project_root(name: str) -> bool:
     a second spelling here is how the parameter-default or keyword shape would
     drift out from under the assignment shape.
     """
-    return name.lower().strip('_').endswith('project_root')
+    return name.lower().strip('_').endswith(_PROJECT_ROOT)
 
 
 def _is_project_root_target(target: ast.expr) -> bool:
@@ -1235,7 +1270,7 @@ def _is_project_root_target(target: ast.expr) -> bool:
     guard meant to pin it.
     """
     if isinstance(target, ast.Attribute):
-        return target.attr == 'project_root'
+        return target.attr == _PROJECT_ROOT
     if isinstance(target, ast.Name):
         return _names_project_root(target.id)
     return False
@@ -1382,27 +1417,28 @@ class TestAbsoluteTmpProjectRootLiteralsAreCensused:
     use the shared constant or write down why they cannot.
     """
 
-    def test_every_absolute_tmp_project_root_literal_is_adjudicated(self) -> None:
-        """The whole census, in ONE full-tree scan.
+    def test_every_absolute_tmp_project_root_literal_is_adjudicated(
+        self, tree_pass: TreePass,
+    ) -> None:
+        """The whole census, over the shared full-tree pass.
 
         Liveness, the unadjudicated-module check, the per-module site COUNT and
         allowlist staleness are asserted together and IN THAT ORDER: a census
         that read nothing sanctions everything, so it must report itself as
-        broken before it reports "all clear".  Not split into a test apiece on
-        purpose — see ``_tests_tree_census`` for the cost.
+        broken before it reports "all clear".
         """
-        census = _tests_tree_census(_absolute_tmp_project_root_literals)
+        census = _tests_tree_census(tree_pass, _absolute_tmp_project_root_literals)
 
         # -- liveness first, in both directions: did we read the tree, and does
         #    the detector still match anything at all?
         assert not census.unparseable, (
-            f'modules under {_TESTS_DIR} failed to parse and so were silently '
+            f'modules under {TESTS_DIR} failed to parse and so were silently '
             f'absent from this census — a module that cannot be read cannot be '
             f'censused: {list(census.unparseable)}'
         )
         assert len(census.parsed) >= _MIN_MODULES_SWEPT, (
             f'the census parsed only {len(census.parsed)} modules '
-            f'under {_TESTS_DIR} — expected at least {_MIN_MODULES_SWEPT}. A '
+            f'under {TESTS_DIR} — expected at least {_MIN_MODULES_SWEPT}. A '
             f'census that reads nothing sanctions everything.'
         )
         assert census.sites, (
@@ -1753,3 +1789,17 @@ class TestAbsoluteTmpProjectRootLiteralsAreCensused:
         tree = ast.parse(source)
 
         assert _absolute_tmp_project_root_literals(tree) == []
+
+
+_CENSUS_ANALYSES: Mapping[_Detector, TreeAnalysis[_CensusFact]] = MappingProxyType({
+    detector: _census_analysis(detector, ORCHESTRATOR_TESTS, may_find)
+    for detector, may_find in (
+        (_inline_sandbox_asserts, lambda module: module.may_name(_CONTAINMENT_METHOD)),
+        (_steward_construction_sites, lambda module: module.may_name(_STEWARD_SUFFIX)),
+        (
+            _absolute_tmp_project_root_literals,
+            lambda module: module.may_name(_PROJECT_ROOT, ignore_case=True),
+        ),
+    )
+})
+TREE_ANALYSES = tuple(_CENSUS_ANALYSES.values())

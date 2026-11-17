@@ -474,7 +474,9 @@ def create_server(
     # One injected resolver feeds both channels, so a residue record and the
     # journal line about it land in the same checkout: two independently
     # resolved roots could silently disagree. The one journal instance also
-    # serves the reviewer tool's issue-contract facts below.
+    # serves the reviewer tool's issue-contract facts below and the escalation
+    # sink's loss records (see
+    # orchestrator/src/orchestrator/mcp/markup_sink.py::make_escalation_sink).
     fact_journal = _markup_fact_journal(artifacts, resolve_project_root)
     mcp.add_middleware(MarkupGuardMiddleware(
         policy=RepairPolicy.FORWARD_REPAIR,
@@ -484,6 +486,7 @@ def create_server(
             worktree=artifacts.worktree,
             spec=MARKUP_SINK_SPEC,
             subject_task_id=lambda: _markup_subject_task_id(artifacts),
+            loss_sink=fact_journal,
             resolve_root=resolve_project_root,
         ),
     ))

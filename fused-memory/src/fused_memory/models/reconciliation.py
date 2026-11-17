@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class EventType(StrEnum):
@@ -88,6 +88,15 @@ class ContextItem:
             self.token_estimate = len(self.formatted) // 4
 
 
+@dataclass(frozen=True)
+class ContextFetchFailure:
+    """An event whose related context could not be fetched: absent context for it is unknown, not empty."""
+
+    event_id: str
+    event_type: str
+    error: str
+
+
 @dataclass
 class AssembledPayload:
     """Result of the ContextAssembler — a token-budgeted chunk of events with
@@ -98,6 +107,7 @@ class AssembledPayload:
     total_tokens: int = 0
     events_remaining: int = 0  # > 0 exactly when token_budget stopped the assembly
     token_budget: int = 0
+    context_fetch_failures: tuple[ContextFetchFailure, ...] = ()
 
     def budget_report(self) -> dict[str, int]:
         """How much of token_budget this chunk spent, and on how many events and context items."""
@@ -141,11 +151,6 @@ class RunStatus(StrEnum):
     failed = 'failed'
     rolled_back = 'rolled_back'
     circuit_breaker = 'circuit_breaker'
-    # Legacy, read-only. Task 2717's retired resume path wrote it for a run
-    # cancelled mid-stage; nothing writes it since task 5514, and
-    # harness.py::ReconciliationHarness._recover_legacy_interrupted_runs
-    # converts any such row to 'failed' at startup.
-    interrupted = 'interrupted'
 
 
 class ReconciliationRun(BaseModel):
@@ -327,3 +332,19 @@ class JudgeVerdict(BaseModel):
     severity: VerdictSeverity
     findings: list[dict] = Field(default_factory=list)
     action_taken: VerdictAction = VerdictAction.none
+
+
+class JudgeInvocation(BaseModel):
+    """One claude_cli judge invocation's turn-cap and rejected-tool-call outcome (task 6573).
+
+    Both counts are None when unknown, never a fabricated 0.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    run_id: str
+    completed_at: datetime
+    ended_error_max_turns: bool
+    schema_salvaged: bool
+    num_turns: int | None = Field(ge=1)
+    rejected_tool_calls: int | None = Field(ge=0)

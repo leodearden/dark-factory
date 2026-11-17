@@ -1,8 +1,10 @@
 """The /prds fetch budget must be structurally deliverable (boundary row 12a).
 
 Written in the idiom of ``test_tasks_budget.py``: shipped constants only, no
-fakes and no event loop, the browser's fetch abort parsed out of the shipped
-``data.js``, and every name read is public. The /prds handler acquires each
+fakes and no event loop, the browser's fetch abort taken from the abort the
+shipped ``data.js`` arms for /prds (read by running its production poll
+through ``dashboard/tests/js/_abort_delay_probe.mjs``, never parsed out of its
+source), and every name read is public. The /prds handler acquires each
 root's snapshot unit, lineage index, scheduler state and task activity
 together, then that root's PRD documents, inside a per-root share of a
 whole-handler deadline, so the same arithmetic must hold here: each part
@@ -11,8 +13,7 @@ fits the layer above it, and the whole fits the browser's abort.
 
 from __future__ import annotations
 
-import re
-from pathlib import Path
+from _browser_abort import browser_abort_ms
 
 from dashboard.api import prds
 from dashboard.data import (
@@ -25,18 +26,7 @@ from dashboard.data import (
     tasks,
 )
 
-_DATA_JS = Path(prds.__file__).parent.parent / 'static' / 'redux' / 'data.js'
-_ABORT_MS_RE = re.compile(r'DEFAULT_TIMEOUT_MS\s*=\s*(\d+)')
-
-
-def _browser_abort_ms() -> int:
-    """The browser-side fetch abort, in ms, read from the shipped data.js."""
-    match = _ABORT_MS_RE.search(_DATA_JS.read_text(encoding='utf-8'))
-    assert match is not None, (
-        f'could not find DEFAULT_TIMEOUT_MS in {_DATA_JS}; if the constant was renamed, '
-        'update _ABORT_MS_RE rather than dropping the ceiling check'
-    )
-    return int(match.group(1))
+_PRDS_ENDPOINT = '/api/v2/dashboard/prds'
 
 
 def test_prds_budget_is_structurally_deliverable() -> None:
@@ -52,7 +42,7 @@ def test_prds_budget_is_structurally_deliverable() -> None:
         'budget-degraded root'
     )
     assert budget.per_project <= budget.total
-    assert budget.total * 1000 < _browser_abort_ms(), (
+    assert budget.total * 1000 < browser_abort_ms(_PRDS_ENDPOINT), (
         f'the {budget.total}s /prds deadline would be aborted by the browser before '
         'its degraded payload could render'
     )

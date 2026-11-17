@@ -1,6 +1,6 @@
 """Contract tests for ``conftest.py`` correctness.
 
-This module guards seven invariants that would silently regress under refactoring
+This module guards eight invariants that would silently regress under refactoring
 and are NOT already covered by other tests:
 
 1. **sys.path ordering / module resolution** — ``conftest.py`` must insert
@@ -42,6 +42,9 @@ and are NOT already covered by other tests:
    too.  See ``TestMakeStewardFixture``.
 
 7. **No real cold pre-provision** — ``_isolate_orch_config`` empties the host-reaching ``verify_cold_preprovision_command``, so no test runs a real ``uv sync``; an explicit kwarg still opts in.
+
+8. **The shared mock-derived stray-dir guard is bound** — see
+   ``TestTheMockDerivedStrayDirGuardIsWired``.
 
 Tests of plain attribute defaults (e.g. ``mock.usage_cap.enabled is False``)
 are deliberately omitted — they would just duplicate literals from
@@ -773,4 +776,16 @@ class TestMakeStewardFixture:
         assert real_queue.queue_dir == own_dir, (
             f'the fixture must not re-stamp queue_dir on a caller-supplied queue — '
             f'expected {own_dir}, got {real_queue.queue_dir}'
+        )
+
+
+class TestTheMockDerivedStrayDirGuardIsWired:
+    """The shared guard from ``df_pytest_isolation`` is live in this suite (task 5145)."""
+
+    def test_it_is_registered_for_every_test(self, request):
+        assert '_df_no_mock_derived_stray_dirs' in request.fixturenames, (
+            'bind _df_no_mock_derived_stray_dirs from df_pytest_isolation in '
+            'orchestrator/tests/conftest.py (`# noqa: F401 — the binding IS the '
+            'wiring`). Without it an orchestrator run can materialise an '
+            'AsyncMock/ or MagicMock/ tree silently (tasks 3223 and 4592).'
         )

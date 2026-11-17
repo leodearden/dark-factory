@@ -930,7 +930,7 @@ def test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling(pytestconfi
     holds) or skips, naming the governing inifile (an invocation artifact,
     e.g. a root-bound run).
     """
-    from test_lane_lock_leak_guard import _effective_per_test_timeout  # noqa: PLC0415
+    from test_lane_lock_leak_guard import _effective_per_test_timeout
 
     floor = _SPAWNS_PER_LANE_PASS_WORST_CASE * MEASURED_SPAWN_LATENCY_SECS
     assert floor <= _LANE_PASS_BOUND_SECS, (

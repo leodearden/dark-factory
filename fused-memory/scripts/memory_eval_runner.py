@@ -29,10 +29,10 @@ import subprocess
 import sys
 import traceback
 from collections import Counter
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TextIO
+from typing import Annotated, TextIO
 
 import yaml
 from escalation.categories import EscalationCategory
@@ -95,6 +95,10 @@ class RunnerConfigError(ValueError):
     """The runner config file is missing, unparseable or not a valid declaration."""
 
 
+_WallClockBoundSecs = Annotated[float, Field(gt=0)]
+"""How long one producer may run before the runner kills it."""
+
+
 class RunnerConfig(BaseModel):
     """Operator declarations; every field is required because none has a defensible default (G6)."""
 
@@ -107,12 +111,32 @@ class RunnerConfig(BaseModel):
     min_samples: int
     baseline_window: int
     storm_alarm_limit: int = Field(gt=0)
-    producer_timeout_secs: float = Field(gt=0)
+    producer_timeout_secs: _WallClockBoundSecs
+    producer_timeout_secs_by_eval: Mapping[str, _WallClockBoundSecs]
+    """Per-eval bounds that replace ``producer_timeout_secs``; ``{}`` declares none.
+
+    Frozen only shallowly: validation copies it into a plain dict, which nothing stops a reader
+    mutating in place.
+    """
 
     @model_validator(mode='after')
     def _check_limits(self) -> RunnerConfig:
         self.limits_config()
         return self
+
+    @model_validator(mode='after')
+    def _check_timeout_overrides_name_registered_evals(self) -> RunnerConfig:
+        registered = sorted(producer.eval_id for producer in DEFAULT_PRODUCERS)
+        unregistered = sorted(set(self.producer_timeout_secs_by_eval) - set(registered))
+        if unregistered:
+            raise ValueError(
+                f'producer_timeout_secs_by_eval names {unregistered}, which no registered '
+                f'producer runs; registered: {registered}'
+            )
+        return self
+
+    def producer_timeout(self, eval_id: str) -> float:
+        return self.producer_timeout_secs_by_eval.get(eval_id, self.producer_timeout_secs)
 
     def limits_config(self) -> LimitsConfig:
         return LimitsConfig(
@@ -625,7 +649,7 @@ def _produce_all(
     for producer in producers:
         failure = run_producer(
             producer, root=root, stamp=stamp, project_id=config.project_id,
-            timeout=config.producer_timeout_secs,
+            timeout=config.producer_timeout(producer.eval_id),
         )
         if failure is not None:
             failures.append(failure)

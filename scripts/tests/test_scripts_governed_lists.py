@@ -10,18 +10,17 @@ collection until the new entry has a disposition.
 import check_dashboard_unit_parity
 import governed_list_agreement
 import inline_suppressions
-import merge_lane_metrics
+import merge_lane_cluster
 import sweep_toolcall_markup
-import test_design_invariants_consistency as design_invariants_consistency
 import test_merge_state_vocabulary_consistency as merge_state_vocabulary_consistency
 from shared.governed_exceptions import Debt, Policy, TaskRef, governed_exceptions
 
 SIZE_CEILING_EXEMPT_LIST = governed_exceptions(
-    'scripts.merge_lane_metrics.SIZE_CEILING_EXEMPT',
+    'scripts.merge_lane_cluster.SIZE_CEILING_EXEMPT',
     'A path the merge-lane ratchet measures and freezes but exempts from '
     'FILE_LINE_CEILING, because its split into smaller modules is owed by a '
     'follow-up PRD.',
-    sorted(merge_lane_metrics.SIZE_CEILING_EXEMPT),
+    sorted(merge_lane_cluster.SIZE_CEILING_EXEMPT),
     default=Debt(TaskRef(7140)),
     default_covers=1,
 )
@@ -34,15 +33,6 @@ DIVERGENCE_ALLOWLIST_LIST = governed_exceptions(
     sorted(check_dashboard_unit_parity.DIVERGENCE_ALLOWLIST),
     default=Policy('inv12-dashboard-unit-divergence'),
     default_covers=2,
-)
-
-DESIGN_INVARIANT_PINNED_SITES_LIST = governed_exceptions(
-    'scripts.tests.test_design_invariants_consistency.PINNED_SITES',
-    'A file whose relationship to the design-invariant family is pinned in that '
-    'module instead of being flagged as an unregistered enumeration site.',
-    sorted(design_invariants_consistency.PINNED_SITES),
-    default=Debt(TaskRef(7136)),
-    default_covers=5,
 )
 
 MERGE_STATE_PINNED_SITES_LIST = governed_exceptions(

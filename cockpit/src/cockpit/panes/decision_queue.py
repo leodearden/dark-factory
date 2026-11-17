@@ -26,13 +26,8 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Protocol
 
-from orchestrator.session_registry import (
-    DecisionRecord,
-    DecisionState,
-    Display,
-    SessionRecord,
-    Status,
-)
+from orchestrator.decision_registry import DecisionRecord, DecisionState
+from orchestrator.session_registry import Display, SessionRecord, Status
 from rich.cells import cell_len, set_cell_size
 from textual.events import Resize
 from textual.widgets import DataTable

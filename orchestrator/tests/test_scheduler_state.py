@@ -16,9 +16,9 @@ from pydantic import ValidationError
 from shared.project_layout import scheduler_state_json
 from shared.scheduler_state import PinQueueEntry, SchedulerStateSnapshot
 
-from orchestrator.config import OrchestratorConfig
+from orchestrator.config import OrchestratorConfig, UnlimitedHolderLocksConfig
 from orchestrator.event_store import EventType
-from orchestrator.lock_table import ModuleLockTable
+from orchestrator.lock_table import UNLIMITED_HOLDERS, ModuleLockTable, one_holder_per_key
 from orchestrator.overrides import OverrideStore
 from orchestrator.pin_reservation import PinOrder
 from orchestrator.scheduler import Scheduler
@@ -552,7 +552,7 @@ _SNAPSHOT_KEYS = frozenset({
     'skip_counts', 'parks', 'park_stacks', 'effective_priorities',
     'pin_queue', 'overrides', 'current_holders', 'lock_depth', 'snapshot_at',
     'is_paused', 'pause_reason', 'pause_class', 'requeue_cooldowns',
-    'pin_reservations',
+    'pin_reservations', 'held_by_task', 'holder_limits',
 })
 
 
@@ -585,6 +585,7 @@ class TestGetStateSnapshotShape:
         assert snap.pin_queue == ()
         assert snap.overrides == {}
         assert snap.current_holders == {}
+        assert snap.held_by_task == {}
         assert snap.requeue_cooldowns == {}
         assert snap.pin_reservations == {}
         assert snap.snapshot_at is not None
@@ -678,6 +679,46 @@ class TestGetStateSnapshotShape:
             snap.is_paused = True
 
 
+@pytest.mark.usefixtures('code_default_config')
+class TestGetStateSnapshotNamesEveryHolder:
+    @pytest.mark.parametrize('order', [('A', 'B'), ('B', 'A')])
+    def test_both_holders_of_an_unlimited_key_are_published(self, order):
+        first, second = order
+        scheduler = Scheduler(OrchestratorConfig(
+            max_per_module=1,
+            unlimited_holder_locks=UnlimitedHolderLocksConfig(root_markdown=True),
+        ))
+        scheduler.finish_startup()
+        assert scheduler.lock_table.try_acquire(first, ['OPERATIONS.md'])
+        assert scheduler.lock_table.try_acquire(second, ['OPERATIONS.md'])
+
+        snap = scheduler.get_state_snapshot()
+
+        assert snap.held_by_task == {
+            first: ('OPERATIONS.md',),
+            second: ('OPERATIONS.md',),
+        }
+        assert snap.current_holders == one_holder_per_key(snap.held_by_task)
+        assert snap.holder_task_ids() == {first, second}
+        round_tripped = SchedulerStateSnapshot.from_json(json.loads(json.dumps(snap.to_json())))
+        assert round_tripped.holder_task_ids() == {first, second}
+
+    def test_the_unlimited_keys_holder_limit_is_published(self):
+        scheduler = Scheduler(OrchestratorConfig(
+            max_per_module=1,
+            unlimited_holder_locks=UnlimitedHolderLocksConfig(root_markdown=True),
+        ))
+        scheduler.finish_startup()
+        assert scheduler.lock_table.try_acquire('A', ['OPERATIONS.md'])
+        assert scheduler.lock_table.try_acquire('B', ['OPERATIONS.md'])
+
+        snap = scheduler.get_state_snapshot()
+
+        assert snap.holder_limits == {'OPERATIONS.md': UNLIMITED_HOLDERS}
+        round_tripped = SchedulerStateSnapshot.from_json(json.loads(json.dumps(snap.to_json())))
+        assert round_tripped.holder_limit('OPERATIONS.md') == UNLIMITED_HOLDERS
+
+
 # ===========================================================================
 # Step-13: get_state_snapshot() with populated state after real ticks
 # ===========================================================================
@@ -705,6 +746,9 @@ class TestGetStateSnapshotPopulated:
         Assertions mirror the step-13 spec exactly.
         """
         config = OrchestratorConfig(max_per_module=1, lock_depth=2)
+        config.fairness.skip_threshold = {
+            'critical': 0, 'high': 1, 'medium': 2, 'low': 4, 'polish': 9999,
+        }
         store = OverrideStore(tmp_path / 'o.db')
 
         # T1 gets a boost override (medium → high).
@@ -1207,7 +1251,7 @@ class TestSnapshotWriteThrottle:
         # with a counter that always returns a unique string, making the time-throttle
         # gate the SOLE mechanism bounding writes.
         _dedup_counter = [0]
-        def _unique_payload(state=None):  # noqa: E301
+        def _unique_payload(state=None):
             _dedup_counter[0] += 1
             return str(_dedup_counter[0])
         scheduler._build_snapshot_payload = _unique_payload

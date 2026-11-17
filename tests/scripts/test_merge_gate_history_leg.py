@@ -101,6 +101,9 @@ READS_ONLY_THROWAWAY_REPOS: Mapping[str, str] = {
         'a predicate over recorded argv; the probe it intercepts runs in the tmp git_repo fixture'
     ),
     'orchestrator/tests/test_merge_gates_rename_family.py': _SEEDS_ITS_OWN_REPO,
+    'orchestrator/tests/test_merge_lane_lease_at_verdict.py': (
+        'GitOps over the tmp_path git_repo fixture'
+    ),
     'orchestrator/tests/test_merge_lane_ratchet_commit_gate.py': (
         '_Repo.seeded builds its repo under tmp_path'
     ),
@@ -114,13 +117,15 @@ READS_ONLY_THROWAWAY_REPOS: Mapping[str, str] = {
     'orchestrator/tests/test_merge_speculation.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_plan_tools_server.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_rebase_branch_reset_guard.py': _SEEDS_ITS_OWN_REPO,
+    'orchestrator/tests/test_rebase_drops.py': _SEEDS_ITS_OWN_REPO,
+    'orchestrator/tests/test_rebase_drops_wiring.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_rebased_solo_landing_ladder.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_reconcile_done_step_commits.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_recut_ruling_gitops.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_review_inputs.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_roles_already_done_commit_search.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_roles_ancestry_check.py': 'every call runs in a clone under tmp_path',
-    'orchestrator/tests/test_timeout_marker_inversion_guard.py': (
+    'orchestrator/tests/test_spawn_budget_guard.py': (
         'create_subprocess_exec is faked; the git argv is a recorded-call literal'
     ),
     'orchestrator/tests/test_train_moved_main.py': _SEEDS_ITS_OWN_REPO,
@@ -134,10 +139,10 @@ READS_ONLY_THROWAWAY_REPOS: Mapping[str, str] = {
     'scripts/tests/test_flip_reify_gate_exclude_heavy.py': (
         'every call runs in the fake reify repo under tmp_path'
     ),
-    'scripts/tests/test_install_memory_metadata_coverage_census_timer.py': (
+    'scripts/tests/test_legibility_nightly.py': _SEEDS_ITS_OWN_REPO,
+    'scripts/tests/test_memory_metadata_coverage_census_wrapper.py': (
         'every call runs in a fake, decoy or outer repo under tmp_path'
     ),
-    'scripts/tests/test_legibility_nightly.py': _SEEDS_ITS_OWN_REPO,
     'scripts/tests/test_merge_deep_set_cap.py': _SEEDS_ITS_OWN_REPO,
     'scripts/tests/test_merge_pytest_n_ab_switch.py': _SEEDS_ITS_OWN_REPO,
     'scripts/tests/test_merge_queue_landing.py': _SEEDS_ITS_OWN_REPO,

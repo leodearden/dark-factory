@@ -512,7 +512,7 @@ def test_systemctl_user_show_returns_none_when_subprocess_raises(
     dev box.
     """
 
-    def fake_run(*args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+    def fake_run(*args, **kwargs):
         raise raised
 
     monkeypatch.setattr(subprocess, "run", fake_run)

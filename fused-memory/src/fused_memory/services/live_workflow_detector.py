@@ -212,11 +212,11 @@ from shared.task_claimant import (
     carries_claimant,
     has_live_claimant,
 )
+from shared.task_fields import dependency_ids as task_dependency_ids
 from shared.task_metadata import RoutingState
 from shared.task_statuses import ACTIVE, TaskStatus
 
 from fused_memory.services.orchestrator_detector import is_orchestrator_live_for
-from fused_memory.utils.task_dependency_ids import task_dependency_ids
 
 logger = logging.getLogger(__name__)
 
@@ -676,8 +676,9 @@ async def is_workflow_live_for_task(
 #
 # Three corroborating signals, ANY sufficient:
 #   1. Fresh claimant/heartbeat — ``has_live_claimant(task, now, ttl)``.
-#   2. Scheduler holder/park — task_id in ``parks`` keys OR ``current_holders``
-#      values (both reset by an orchestrator restart).
+#   2. Scheduler holder/park — task_id in ``parks`` keys OR
+#      ``SchedulerStateSnapshot.holder_task_ids()`` (both reset by an
+#      orchestrator restart).
 #   3. routing.latest.decided_at newer than the orchestrator's start time (a
 #      dispatch predating the last restart cannot have a live workflow).
 
@@ -748,6 +749,14 @@ class ClaimantLabel(StrEnum):
     LIVE = 'live'
     STALE = 'stale'
     NONE = 'none'
+    UNKNOWN = 'unknown'
+
+
+class TaskLiveness(StrEnum):
+    """UNKNOWN means a probe or its inputs failed, and is never collapsed into NOT_LIVE."""
+
+    LIVE = 'live'
+    NOT_LIVE = 'not_live'
     UNKNOWN = 'unknown'
 
 
@@ -862,16 +871,16 @@ def is_unclaimed_awaiting_dependency(task: object, dependency_statuses: object) 
 def _task_in_scheduler_holders_or_parks(
     task_id: str | int, scheduler_state: SchedulerStateSnapshot | None
 ) -> bool:
-    """Return True when *task_id* is a scheduler park owner or a current holder.
+    """Return True when *task_id* is a scheduler park owner or a lock holder.
 
-    ``current_holders`` maps module to task_id, so the task appears as a VALUE
-    there. Both are reset by an orchestrator restart, so a stranded
-    post-redeploy task is absent from both. Snapshot task ids are strings.
+    A lock holder per ``shared/src/shared/scheduler_state.py::SchedulerStateSnapshot.holder_task_ids``.
+    Both are reset by an orchestrator restart, so a stranded post-redeploy task
+    is absent from both. Snapshot task ids are strings.
     """
     if scheduler_state is None:
         return False
     tid = str(task_id)
-    return tid in scheduler_state.parks or tid in scheduler_state.current_holders.values()
+    return tid in scheduler_state.parks or tid in scheduler_state.holder_task_ids()
 
 
 def _routing_decided_after_restart(

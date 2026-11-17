@@ -1025,7 +1025,7 @@ def _wire_stale_evidence_mark_done(h: Harness, *, evidence_commit: str) -> None:
     """
     from orchestrator.scheduler import StaleEvidenceRejection
 
-    async def _stale_reject(tid, *, kind, sha, note=None):  # noqa: ARG001
+    async def _stale_reject(tid, *, kind, sha, note=None):
         raise StaleEvidenceRejection(
             task_id=tid,
             evidence_commit=evidence_commit,

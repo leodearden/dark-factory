@@ -666,8 +666,12 @@ class ArtifactRoot(Enum):
     TASK = 'task'
 
 
-_REVIEW_ARCHIVE_FAMILY = 'reviews-<label>/'
-_ZERO_OUTPUT_EVIDENCE_FAMILY = 'zero_output_evidence-iter<n>.json'
+_REVIEW_ARCHIVE_PREFIX = 'reviews-'
+_REVIEW_ARCHIVE_FAMILY = f'{_REVIEW_ARCHIVE_PREFIX}<label>/'
+_RETIRED_LINEAGES_KEY = 'retired_lineages'
+_RETIRED_REVIEWS_DIR = 'retired-reviews'
+_ZERO_OUTPUT_EVIDENCE_NAME_TEMPLATE = 'zero_output_evidence-iter{}.json'
+_ZERO_OUTPUT_EVIDENCE_FAMILY = _ZERO_OUTPUT_EVIDENCE_NAME_TEMPLATE.format('<n>')
 
 ARTIFACT_ROOTS: Mapping[str, ArtifactRoot] = MappingProxyType({
     'metadata.json': ArtifactRoot.LANE,
@@ -688,6 +692,7 @@ ARTIFACT_ROOTS: Mapping[str, ArtifactRoot] = MappingProxyType({
     'review_state.json': ArtifactRoot.TASK,
     'reconcile_state.json': ArtifactRoot.TASK,
     _REVIEW_ARCHIVE_FAMILY: ArtifactRoot.TASK,
+    _RETIRED_REVIEWS_DIR: ArtifactRoot.TASK,
     _ZERO_OUTPUT_EVIDENCE_FAMILY: ArtifactRoot.TASK,
 })
 """The single routing table: artifact name (or family key) -> owning root.
@@ -721,13 +726,13 @@ class ReviewAggregation:
 
     def format_for_replan(self) -> str:
         """Blocking issues only — the architect's input (TaskWorkflow._replan)."""
-        return _format_issue_section('# Review Feedback — Blocking Issues\n', self.blocking_issues)
+        return format_issue_section('# Review Feedback — Blocking Issues\n', self.blocking_issues)
 
     def format_for_escalation(self) -> str:
         """Blocking issues then suggestions — the steward's review_issues detail (TaskWorkflow._escalate_review_issues)."""
         text = self.format_for_replan()
         if self.suggestions:
-            text += '\n' + _format_issue_section('# Review Feedback — Suggestions\n', self.suggestions)
+            text += '\n' + format_issue_section('# Review Feedback — Suggestions\n', self.suggestions)
         return text
 
 
@@ -745,7 +750,9 @@ def _warn_off_contract_issues(reviewer_name: str, issues: tuple[dict, ...]) -> N
         )
 
 
-def _format_issue_section(heading: str, issues: list[dict]) -> str:
+def format_issue_section(heading: str, issues: Iterable[Mapping[str, Any]], *, issue_level: int = 2) -> str:
+    """*heading*, then each review issue under a level-*issue_level* heading: reviewer, category, location, issue and suggested fix."""
+    issue_heading = '#' * issue_level
     lines = [heading]
     for issue in issues:
         reviewer = issue.get('reviewer', 'unknown')
@@ -753,7 +760,7 @@ def _format_issue_section(heading: str, issues: list[dict]) -> str:
         category = issue.get('category', '')
         description = issue.get('description', '')
         fix = issue.get('suggested_fix', '')
-        lines.append(f'## [{reviewer}] {category}')
+        lines.append(f'{issue_heading} [{reviewer}] {category}')
         if location:
             lines.append(f'**Location:** {location}')
         lines.append(f'**Issue:** {description}')
@@ -836,10 +843,25 @@ class TaskArtifacts:
 
     def review_archive_dir(self, label: str) -> Path:
         """The archive of one review round, e.g. ``label='amend-1'``."""
-        return self.review_archives_root / f'reviews-{label}'
+        return self.review_archives_root / f'{_REVIEW_ARCHIVE_PREFIX}{label}'
+
+    def review_archive_dirs(self) -> tuple[Path, ...]:
+        """Every ``reviews-<label>`` archive directly under ``review_archives_root``, sorted."""
+        root = self.review_archives_root
+        if not root.is_dir():
+            return ()
+        return tuple(sorted(p for p in root.glob(f'{_REVIEW_ARCHIVE_PREFIX}*') if p.is_dir()))
+
+    def retired_review_dir(self, parking_name: str) -> Path:
+        """Where the round archives of the lineage parked as *parking_name* were retired to."""
+        return self._root_for(_RETIRED_REVIEWS_DIR) / _RETIRED_REVIEWS_DIR / parking_name
 
     def zero_output_evidence_path(self, iteration: int) -> Path:
-        return self._root_for(_ZERO_OUTPUT_EVIDENCE_FAMILY) / f'zero_output_evidence-iter{iteration}.json'
+        return self._root_for(_ZERO_OUTPUT_EVIDENCE_FAMILY) / _ZERO_OUTPUT_EVIDENCE_NAME_TEMPLATE.format(iteration)
+
+    def zero_output_evidence_glob(self) -> str:
+        """Every iteration's ``zero_output_evidence_path``, as one glob, for operator-facing text."""
+        return str(self._root_for(_ZERO_OUTPUT_EVIDENCE_FAMILY) / _ZERO_OUTPUT_EVIDENCE_NAME_TEMPLATE.format('*'))
 
     def read_title(self) -> str | None:
         """metadata.json's title, else plan.json's; None unless a non-blank str."""
@@ -1410,10 +1432,14 @@ class TaskArtifacts:
         re-pend: on the next blocking review the seeded local is already at
         the cap, so the loop re-escalates WITHOUT attempting a replan.
 
-        Deliberately NOT auto-cleared on re-dispatch — the loop cannot tell
-        churn (must keep the counters) from a legitimate operator re-pend
-        (should reset them) without an out-of-band signal, so granting a
-        fresh allowance is an EXPLICIT operator action, never inferred.
+        Deliberately NOT auto-cleared on an ordinary re-dispatch — the loop
+        cannot tell churn (must keep the counters) from a legitimate operator
+        re-pend (should reset them) without an out-of-band signal, so granting
+        a fresh allowance is an EXPLICIT operator action, never inferred. The
+        one such signal is a branch-swapping quarantine, which ends the
+        reviewed branch's lineage:
+        ``orchestrator/src/orchestrator/review_lineage.py::retire_quarantined_lineages``
+        retires the counters through :meth:`record_retired_lineage`.
         When an operator resolves the review escalation and re-pends the
         task to make replan progress, call this hook (e.g. from the
         resume/re-pend path, or manually against the ``.task-meta/<name>/``
@@ -1426,6 +1452,27 @@ class TaskArtifacts:
         state['amendment_rounds_total'] = 0
         state['review_cycles_total'] = 0
         self._write_json('review_state.json', state)
+
+    def record_retired_lineage(self, record: Mapping[str, Any], *, zero_counters: bool) -> None:
+        """Append *record* to ``retired_lineages`` and, when *zero_counters*, zero both lifetime counters, in one write.
+
+        The verdict cache is preserved. A non-list ``retired_lineages`` is
+        replaced.
+        """
+        state = self.read_review_state()
+        if zero_counters:
+            state['amendment_rounds_total'] = 0
+            state['review_cycles_total'] = 0
+        existing = state.get(_RETIRED_LINEAGES_KEY)
+        state[_RETIRED_LINEAGES_KEY] = [*(existing if isinstance(existing, list) else []), dict(record)]
+        self._write_json('review_state.json', state)
+
+    def retired_review_records(self) -> tuple[dict, ...]:
+        """The ``retired_lineages`` entries that are dicts; () when absent or malformed."""
+        records = self.read_review_state().get(_RETIRED_LINEAGES_KEY)
+        if not isinstance(records, list):
+            return ()
+        return tuple(record for record in records if isinstance(record, dict))
 
     def _read_json_object(self, name: str) -> dict | None:
         """The single fail-safe read seam for the whole-file JSON-object

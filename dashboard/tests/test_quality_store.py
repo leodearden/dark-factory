@@ -171,6 +171,7 @@ def test_quality_db_sits_beside_the_other_sampler_stores(tmp_path: Path) -> None
 QUALITY_TABLES = {
     'landings', 'late_events', 'sample_state',
     'markers_derived', 'routing_steps', 'routing_rules', 'marker_state',
+    'snapshot_points', 'snapshot_diffs', 'snapshot_scans',
 }
 
 
@@ -489,7 +490,9 @@ MARKER_SOURCES: dict[SourceType, tuple[MarkerKind, MarkerSource, str | None]] = 
     SourceType.MODEL_VERSION: (
         MarkerKind.MODEL, MarkerSource(SourceType.MODEL_VERSION, alias='opus'), 'claude-opus-5-5',
     ),
-    SourceType.INSTRUMENT: (MarkerKind.INSTRUMENT, MarkerSource(SourceType.INSTRUMENT), 'd' * 40),
+    SourceType.INSTRUMENT: (
+        MarkerKind.INSTRUMENT, MarkerSource(SourceType.INSTRUMENT, point='payload-nightly'), 'd' * 40,
+    ),
     SourceType.CURATED: (
         MarkerKind.REGIME, MarkerSource(SourceType.CURATED, file='regime-markers.yaml'), None,
     ),

@@ -35,7 +35,7 @@ from shared.sqlite_column_migration import add_column_if_missing
 from dashboard.config import DashboardConfig
 from dashboard.data.census import SERIES_KEYS, TaskCensus
 from dashboard.data.datum import DatumState
-from dashboard.data.mcp_fanout import _LOCK_ACQUIRE_TIMEOUT_SECONDS
+from dashboard.data.mcp_fanout import LOCK_ACQUIRE_TIMEOUT_SECONDS
 from dashboard.data.orchestrator import (
     _read_project_root_from_config,
     _resolve_project_root,
@@ -58,7 +58,7 @@ logger = logging.getLogger(__name__)
 # run concurrently, each under wait_for(PER_CALL_TIMEOUT). The terminal-window
 # slot of task_snapshot.PER_PROJECT_MCP_CALLS is not counted, because
 # acquire_snapshot never spends it.
-_SNAPSHOT_UNIT_WORST_CASE_SECONDS = _LOCK_ACQUIRE_TIMEOUT_SECONDS + PER_CALL_TIMEOUT
+_SNAPSHOT_UNIT_WORST_CASE_SECONDS = LOCK_ACQUIRE_TIMEOUT_SECONDS + PER_CALL_TIMEOUT
 
 # Wall-clock-aligned sampling tick for the burndown (and metrics) collectors.
 SAMPLE_INTERVAL_SECONDS = 600

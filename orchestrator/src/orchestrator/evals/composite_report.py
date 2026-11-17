@@ -13,6 +13,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, TypeAlias
 
 from .cell_admission import (
+    candidate_cost_usd,
     cost_per_plan,
     has_plan_quality_score,
     is_plan_only,
@@ -77,7 +78,10 @@ def build_composite_report(
     (architect) trial's quality axis is its :func:`plan_quality_score`, a workflow
     trial's is its ``composite_score``. An unmeasurable trial
     (:func:`is_unmeasurable`) leaves every measured pool, but is still counted in
-    ``trials``, ``fixtures`` and ``judge``.
+    ``trials``, ``fixtures`` and ``judge``. Every cost figure on a row (both
+    floors, the cost ratio, ``cost_usd`` / ``ci95.cost`` and the ``cost_per_plan``
+    numerator) is the cell's :func:`candidate_cost_usd`, so a plan-only row's cost
+    excludes the plan judge, whose spend stays on ``judge.cost_usd``.
 
     Returns ``generated_at``, ``aggregation``, ``price_table`` (*price_table*
     echoed, ``{}`` when omitted) and ``configs``: one row per config, sorted by
@@ -115,7 +119,7 @@ def build_composite_report(
         if is_unmeasurable(r.metrics):
             continue
         key = _baseline_key(r)
-        cost = float(r.metrics.get('cost_usd', 0.0) or 0.0)
+        cost = candidate_cost_usd(r.metrics, where=f'{r.task_id} x {r.config_name}')
         latency = float(r.metrics.get('workflow_duration_ms', 0) or 0) / 1000.0
         # A plan-only trial passes when it was scored AND planned: a no-plan cell is
         # cheap because it failed, so it must not set the floor (task 3302).
@@ -163,14 +167,16 @@ def build_composite_report(
     for r in results:
         fixture = r.task_id
         m = r.metrics
-        cost = float(m.get('cost_usd', 0.0) or 0.0)
+        where = f'{fixture} x {r.config_name}'
+        measured = not is_unmeasurable(m)
+        cost = candidate_cost_usd(m, where=where) if measured else 0.0
         latency = float(m.get('workflow_duration_ms', 0) or 0) / 1000.0
         tests_pass = m.get('tests_pass')
         plan_only = is_plan_only(m)
         acc = by_config[r.config_name]
         # The axis that fed the composite: the θ score for a plan-only cell (floored
         # when it produced no plan), compute_composite's score for a workflow one.
-        scored_pq = plan_quality_score(m, where=f'{fixture} x {r.config_name}')
+        scored_pq = plan_quality_score(m, where=where)
         quality = (
             scored_pq if plan_only and scored_pq is not None
             else float(m.get('composite_score', 0.0) or 0.0)
@@ -180,7 +186,7 @@ def build_composite_report(
         no_plan = has_plan_quality_score(m) and not produced_a_plan(m)
         # ONE admission decision for every measured pool. The trial is still counted
         # in ``trials`` and ``plan_quality_cap_excluded``.
-        if not is_unmeasurable(m):
+        if measured:
             # Each trial normalizes against its OWN (fixture, role_group) floor.
             bkey = _baseline_key(r)
             acc['composite'].append(blend_composite(

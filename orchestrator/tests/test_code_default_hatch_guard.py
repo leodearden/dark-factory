@@ -35,6 +35,7 @@ This module holds three things:
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -42,23 +43,27 @@ from _code_default_hatch import require_code_default_config
 from _config_default_scan import (
     DEFAULT_CONFIG,
     ConfigPathWrite,
+    config_path_blanking_sites_in,
+    default_asserting_tests_in,
     iter_config_path_blanking_sites,
     iter_default_asserting_tests,
+)
+from _tree_scan import (
+    TREE_PASS_XDIST_GROUP,
+    ParsedModule,
+    TreeAnalysis,
+    TreePass,
+    orchestrator_test_modules,
 )
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from orchestrator.config import OrchestratorConfig
 
-# The ratchet below glob()s every test_*.py directly in tests/ and ast.parse()s each
-# one, which makes this module the newest member of the whole-tree-scanner
-# family.  Exceeding the 60s pyproject default does NOT merely fail the test:
-# pytest-timeout's thread method os._exit()s the whole xdist worker and
-# --max-worker-restart=0 then truncates the ENTIRE suite, reporting against
-# some innocent guard that shared the dead worker (esc-3980-1, esc-3787-1).
-# WHY 300s and the guard that ENFORCES this mark rather than trusting it to be
-# sprinkled: see shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT, and
-# test_whole_tree_scan_timeout_guard.py (task 4215).
-pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
+# The family mark and shared group: shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT, _tree_scan.py.
+pytestmark = [
+    pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT),
+    pytest.mark.xdist_group(TREE_PASS_XDIST_GROUP),
+]
 
 
 def _write(tmp_path: Path, name: str, body: str) -> Path:
@@ -1077,24 +1082,46 @@ def test_z(monkeypatch, tmp_path, env, fake_environ):
 # THE RATCHETS
 # ---------------------------------------------------------------------------
 
+@dataclass(frozen=True)
+class _HatchFacts:
+    """One suite module's findings for both ratchets; each asserted value as its repr."""
+
+    default_assertions: tuple[tuple[str | None, str, int, str, str], ...]
+    blanking_sites: tuple[tuple[str, int, ConfigPathWrite], ...]
+
+
+def _hatch_facts(module: ParsedModule) -> _HatchFacts:
+    tree = module.tree
+    return _HatchFacts(
+        default_assertions=tuple(
+            (cls, test, lineno, attr, repr(value))
+            for cls, test, lineno, attr, value in default_asserting_tests_in(tree)
+        ),
+        blanking_sites=tuple(config_path_blanking_sites_in(tree)),
+    )
+
+
+ANALYSIS = TreeAnalysis(name=Path(__file__).stem, files=orchestrator_test_modules, extract=_hatch_facts)
+TREE_ANALYSES = (ANALYSIS,)
+
 #: One param per FILE, not one per suite, so a regression names the offending
-#: file directly and each repair turns a specific subset green.  Collected by
-#: glob so a newly added test module is covered automatically.
-_SUITE_FILES = sorted(Path(__file__).parent.glob('test_*.py'))
+#: file directly and each repair turns a specific subset green.  Listed at
+#: collection so a newly added test module is covered automatically.
+_SUITE_FILES = orchestrator_test_modules()
 
 
 @pytest.mark.parametrize('source', _SUITE_FILES, ids=lambda p: p.name)
-def test_no_unhatched_code_default_assertions(source):
+def test_no_unhatched_code_default_assertions(source, tree_pass: TreePass):
     """No test may assert a package default off an un-isolated bare config.
 
     See this module's docstring for the incident.  The remedy is one line.
     """
-    findings = list(iter_default_asserting_tests(source))
+    findings = tree_pass.facts(ANALYSIS)[source].default_assertions
     if not findings:
         return
     lines = '\n'.join(
         f'  {cls or "<module>"}::{test}  line {lineno}  '
-        f'{attr} == {literal!r}'
+        f'{attr} == {literal}'
         for cls, test, lineno, attr, literal in findings
     )
     tests = {(cls, test) for cls, test, _, _, _ in findings}
@@ -1133,11 +1160,11 @@ _ABSENT_CONFIG_PATH_IS_THE_PRECONDITION = frozenset({
 
 
 @pytest.mark.parametrize('source', _SUITE_FILES, ids=lambda p: p.name)
-def test_no_cwd_dependent_config_isolation(source):
+def test_no_cwd_dependent_config_isolation(source, tree_pass: TreePass):
     """No test may blank or delete ``ORCH_CONFIG_PATH`` to isolate itself."""
     sites = [
         (qualname, lineno, kind)
-        for qualname, lineno, kind in iter_config_path_blanking_sites(source)
+        for qualname, lineno, kind in tree_pass.facts(ANALYSIS)[source].blanking_sites
         if (source.name, qualname) not in _ABSENT_CONFIG_PATH_IS_THE_PRECONDITION
     ]
     if not sites:
@@ -1166,11 +1193,11 @@ _EXEMPTIONS = sorted(_ABSENT_CONFIG_PATH_IS_THE_PRECONDITION)
 
 @pytest.mark.parametrize('file_name, qualname', _EXEMPTIONS,
                          ids=[f'{f}::{q}' for f, q in _EXEMPTIONS])
-def test_every_exemption_still_names_a_blanking_site(file_name, qualname):
+def test_every_exemption_still_names_a_blanking_site(file_name, qualname, tree_pass: TreePass):
     """A renamed or migrated exemption must not linger as a silent blind spot."""
-    source = Path(__file__).parent / file_name
+    source = Path(__file__).resolve().parent / file_name
     assert source.is_file(), f'exempted file {file_name} no longer exists'
-    qualnames = {site[0] for site in iter_config_path_blanking_sites(source)}
+    qualnames = {site[0] for site in tree_pass.facts(ANALYSIS)[source].blanking_sites}
     assert qualname in qualnames, (
         f'{file_name}::{qualname} is exempted from '
         f'test_no_cwd_dependent_config_isolation but no longer blanks or '

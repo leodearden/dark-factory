@@ -28,11 +28,13 @@ from dashboard.data.quality_markers import (
     MarkerKind,
     PromptCoverage,
     RoutingFold,
+    SnapshotIdentity,
     derive,
     fold_routing_decisions,
     load_curated_markers,
 )
 from dashboard.data.quality_root_tick import (
+    FACTORY_REPO,
     describe_root_failure,
     git_checkouts,
     run_in_root_threads,
@@ -40,13 +42,13 @@ from dashboard.data.quality_root_tick import (
 )
 from dashboard.data.quality_store import (
     read_routing_fold,
+    read_snapshot_identities,
     record_marker_failure,
     write_marker_state,
 )
 from dashboard.data.utils import resolve_now
 
 __all__ = [
-    'FACTORY_REPO',
     'MARKER_GIT_TIMEOUT_SECONDS',
     'MARKER_PER_ROOT_BUDGET_SECONDS',
     'MARKER_ROUTING_BATCH',
@@ -66,10 +68,6 @@ MARKER_GIT_TIMEOUT_SECONDS = 30.0
 
 ROLES_PY = 'orchestrator/src/orchestrator/agents/roles.py'
 """Where every role's prompt lives in the factory repo."""
-
-FACTORY_REPO = Path(__file__).resolve().parents[4]
-"""This module's own checkout: the factory whose roles.py every project's orchestrator runs."""
-
 
 def _counted_since(fold: RoutingFold, curated: CuratedMarkers) -> datetime | None:
     """The newest curated prompt marker in the project's scope, else its first routing decision."""
@@ -111,13 +109,14 @@ def prompt_coverage(fold: RoutingFold, curated: CuratedMarkers, factory_repo: Pa
 
 def _refresh_root(
     root: Path, previous: RoutingFold, curated: CuratedMarkers, factory_repo: Path, batch: int,
-    now: datetime,
+    now: datetime, snapshots: Sequence[SnapshotIdentity],
 ) -> DerivedState:
-    """*previous* advanced over the root's next routing rows, and every marker re-derived from it."""
+    """*previous* advanced over the root's next routing rows, and every marker re-derived from it
+    and from the root's stored *snapshots*."""
     conn = connect_ro(runs_db(root))
     try:
         fold = fold_routing_decisions(conn, previous, batch=batch)
-        derived = derive(fold, conn, snapshots=())
+        derived = derive(fold, conn, snapshots=snapshots)
     finally:
         conn.close()
     return DerivedState(
@@ -137,6 +136,17 @@ async def _resume_fold(conn: aiosqlite.Connection, project_id: str) -> RoutingFo
                        project_id, exc_info=True)
         return RoutingFold.empty(project_id)
     return RoutingFold.empty(project_id) if stored is None else stored
+
+
+async def _stored_snapshots(conn: aiosqlite.Connection, project_id: str) -> list[SnapshotIdentity]:
+    """The project's stored snapshot identities, else none: an unreadable snapshot store costs the
+    instrument markers until the next snapshot write, never the routing derivation."""
+    try:
+        return await read_snapshot_identities(conn, project_id)
+    except Exception:
+        logger.warning('The stored snapshot identities of %s do not read; deriving without them',
+                       project_id, exc_info=True)
+        return []
 
 
 async def _record_failure(
@@ -171,7 +181,7 @@ async def refresh_markers(
     """Advance and store the marker derivation of every root in *roots* that is a git checkout.
 
     Each root folds at most *batch* routing rows after its stored cursor and re-derives every
-    marker. A root that raises or overruns *per_root_budget_s* records a failure naming why and
+    marker, its instrument markers from its stored snapshot scan. A root that raises or overruns *per_root_budget_s* records a failure naming why and
     keeps its previous derivation; each root commits on its own, and one whose write fails
     records that failure instead. A stored fold that no longer decodes is folded again from the
     start.
@@ -181,11 +191,12 @@ async def refresh_markers(
     project_ids = [project_id_for_root(root) for root in checkouts]
     curated = await asyncio.to_thread(load_curated_markers, curated_path)
     previous = [await _resume_fold(conn, pid) for pid in project_ids]
+    snapshots = [await _stored_snapshots(conn, pid) for pid in project_ids]
 
     results: list[DerivedState | BaseException] = await run_in_root_threads(
         _refresh_root,
-        [(root, fold, curated, factory_repo, batch, now_dt)
-         for root, fold in zip(checkouts, previous, strict=True)],
+        [(root, fold, curated, factory_repo, batch, now_dt, identities)
+         for root, fold, identities in zip(checkouts, previous, snapshots, strict=True)],
         per_root_budget_s,
         thread_name_prefix='quality-markers',
     )

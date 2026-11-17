@@ -15,7 +15,7 @@ The live-corpus tests in this file
 :func:`test_live_sidecars_still_declare_none_of_the_adjudicated_labels` and
 :func:`test_identifier_anchor_names_a_definition_inside_its_certified_suite`)
 read only TRACKED GIT FILES and open no database at all — the same legitimacy
-as shared/tests/test_capability_manifest.py::TestCheckedInManifestCorpus and
+as tests/repo_guards/test_checked_in_capability_manifests.py::TestCheckedInManifestCorpus and
 scripts/tests/test_lms_marker_contract.py.
 """
 from __future__ import annotations

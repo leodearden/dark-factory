@@ -154,6 +154,8 @@ it past 8 once the per-item chain wall is measured at depth ≥ 8 (today measure
 row's depth may exceed `chain_cap`: `chain_cap` becomes the kill switch only (0 = off; any positive value =
 on), documented as such; 3191 ("promote chain_cap 6 → 32") is cancelled by decompose, 3190's canary
 predicate stays (it reads gates per landing and chain-attributed reds, both still meaningful).
+(Superseded 2026-11-17 by Leo's ruling: task 3190 is cancelled. Its figures, and a check on deep-chain verify
+duration against the merge wall, move into ι's readout, task 8532; human gate 7860 now waits on 8532.)
 `chain_depth_reason` on `merge_verify` records p̂, the row chosen, the queue depth and the suspect state.
 
 **D8. Direct commits meet the merge gate's checks before they land.** `hooks/project-checks` (main-only

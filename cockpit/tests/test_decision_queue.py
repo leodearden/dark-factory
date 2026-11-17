@@ -13,6 +13,7 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import cast
 
+from orchestrator import decision_registry as dr
 from orchestrator import session_registry as sr
 
 from cockpit.panes.decision_queue import QueueItem, _QueueRowLike
@@ -71,7 +72,7 @@ def _make_decision(**overrides):
         'filed_at': '2026-07-07T00:00:00+00:00',
     }
     fields.update(overrides)
-    return sr.DecisionRecord(**fields)
+    return dr.DecisionRecord(**fields)
 
 
 def _make_session(**overrides):
@@ -97,7 +98,7 @@ class TestScoringAdapters:
         decision = _make_decision(
             project='df',
             manual_boost=3,
-            state=sr.DecisionState.OPEN,
+            state=dr.DecisionState.OPEN,
             filed_at='2026-07-01T00:00:00+00:00',
         )
 
@@ -125,7 +126,7 @@ class TestScoringAdapters:
         """state is copied through verbatim -- order_queue is what filters to 'open'."""
         from cockpit.panes.decision_queue import decision_to_scoring_item
 
-        decision = _make_decision(state=sr.DecisionState.DROPPED)
+        decision = _make_decision(state=dr.DecisionState.DROPPED)
 
         item = decision_to_scoring_item(decision, now=_NOW)
 
@@ -599,9 +600,9 @@ class TestOrderQueue:
         from cockpit.panes.decision_queue import order_queue
         from cockpit.priority import Priorities
 
-        open_decision = _make_decision(id='dec-open', state=sr.DecisionState.OPEN)
-        dropped_decision = _make_decision(id='dec-dropped', state=sr.DecisionState.DROPPED)
-        answered_decision = _make_decision(id='dec-answered', state=sr.DecisionState.ANSWERED)
+        open_decision = _make_decision(id='dec-open', state=dr.DecisionState.OPEN)
+        dropped_decision = _make_decision(id='dec-dropped', state=dr.DecisionState.DROPPED)
+        answered_decision = _make_decision(id='dec-answered', state=dr.DecisionState.ANSWERED)
         awaiting_session = _make_session(session_slug='awaiting-1', status=sr.Status.AWAITING_INPUT)
         running_session = _make_session(session_slug='running-1', status=sr.Status.RUNNING)
 
@@ -621,7 +622,7 @@ class TestOrderQueue:
         from cockpit.panes.decision_queue import QueueItem, order_queue
         from cockpit.priority import Priorities
 
-        decision = _make_decision(state=sr.DecisionState.OPEN)
+        decision = _make_decision(state=dr.DecisionState.OPEN)
 
         items = order_queue([decision], [], Priorities.default(), _NOW)
 
@@ -679,7 +680,7 @@ class TestOrderQueue:
         linked_session = _make_session(
             session_slug='linked-1', status=sr.Status.RUNNING, display=display
         )
-        decision = _make_decision(session_id='linked-1', state=sr.DecisionState.OPEN)
+        decision = _make_decision(session_id='linked-1', state=dr.DecisionState.OPEN)
 
         items = order_queue([decision], [linked_session], Priorities.default(), _NOW)
 
@@ -690,7 +691,7 @@ class TestOrderQueue:
         from cockpit.panes.decision_queue import order_queue
         from cockpit.priority import Priorities
 
-        decision = _make_decision(session_id='no-such-session', state=sr.DecisionState.OPEN)
+        decision = _make_decision(session_id='no-such-session', state=dr.DecisionState.OPEN)
 
         items = order_queue([decision], [], Priorities.default(), _NOW)
 
@@ -701,7 +702,7 @@ class TestOrderQueue:
         from cockpit.panes.decision_queue import order_queue
         from cockpit.priority import Priorities
 
-        decision = _make_decision(session_id=None, state=sr.DecisionState.OPEN)
+        decision = _make_decision(session_id=None, state=dr.DecisionState.OPEN)
 
         items = order_queue([decision], [], Priorities.default(), _NOW)
 
@@ -751,9 +752,9 @@ class TestOrderQueue:
         from cockpit.panes.decision_queue import order_queue
         from cockpit.priority import Priorities
 
-        decision = _make_decision(id='dec-1', state=sr.DecisionState.OPEN, escalation_id='esc-9')
+        decision = _make_decision(id='dec-1', state=dr.DecisionState.OPEN, escalation_id='esc-9')
         no_escalation = _make_decision(
-            id='dec-2', state=sr.DecisionState.OPEN, escalation_id=None
+            id='dec-2', state=dr.DecisionState.OPEN, escalation_id=None
         )
         session = _make_session(
             session_slug='awaiting-1', status=sr.Status.AWAITING_INPUT, escalation_id='esc-7'
@@ -778,7 +779,7 @@ class TestOrderQueue:
         decision = _make_decision(
             id='dec-critical',
             severity='critical',
-            state=sr.DecisionState.OPEN,
+            state=dr.DecisionState.OPEN,
             filed_at=_NOW.isoformat(),
         )
         stale_session = _make_session(
@@ -802,7 +803,7 @@ class TestOrderQueue:
         decision = _make_decision(
             id='dec-blocking',
             severity='blocking',
-            state=sr.DecisionState.OPEN,
+            state=dr.DecisionState.OPEN,
             filed_at=_NOW.isoformat(),
         )
         stale_session = _make_session(
@@ -884,7 +885,7 @@ class TestQueueItemSessionSlug:
         from cockpit.panes.decision_queue import order_queue
         from cockpit.priority import Priorities
 
-        decision = _make_decision(id='dec-1', state=sr.DecisionState.OPEN)
+        decision = _make_decision(id='dec-1', state=dr.DecisionState.OPEN)
         sessions = [_make_session(session_slug='awaiting-1', status=sr.Status.AWAITING_INPUT)]
 
         items = order_queue([decision], sessions, Priorities.default(), _NOW)
@@ -965,7 +966,7 @@ class TestResolveTargetLinksThroughRecordSlug:
         decision = _make_decision(
             session_id=self._LEASE_TOKEN,
             record_slug=self._WATCHER_SLUG,
-            state=sr.DecisionState.OPEN,
+            state=dr.DecisionState.OPEN,
         )
 
         [item] = order_queue([decision], [self._watcher()], Priorities.default(), _NOW)

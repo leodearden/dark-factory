@@ -7,6 +7,7 @@ the replay never needs one.
 """
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 from datetime import UTC, datetime
@@ -19,15 +20,25 @@ from _fm_helpers import load_script_module
 from graphiti_core.llm_client.client import LLMClient
 from graphiti_core.llm_client.config import LLMConfig as GraphitiLLMConfig
 from graphiti_core.llm_client.config import ModelSize
+from graphiti_core.llm_client.openai_client import OpenAIClient
 from graphiti_core.llm_client.token_tracker import TokenUsageTracker
+from graphiti_core.prompts.extract_edges import ExtractedEdges
+from graphiti_core.prompts.extract_nodes import ExtractedEntities
 from graphiti_core.prompts.models import Message
 from graphiti_core.search.search_utils import RELEVANT_SCHEMA_LIMIT
 from pydantic import BaseModel
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.backends.falkor_read_only import ReadOnlyGraphReader
 from fused_memory.backends.falkor_string_bounds import exact_string_upper_bound
-from fused_memory.backends.llm_token_usage import AttributingTokenUsageTracker, LlmTokenUsage
+from fused_memory.backends.llm_token_usage import (
+    AttributingTokenUsageTracker,
+    LlmTokenUsage,
+    measure_llm_tokens,
+)
 from fused_memory.config.schema import FusedMemoryConfig
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SCRIPTS = Path(__file__).parent.parent / 'scripts'
 mod = load_script_module(SCRIPTS / 'replay_overreach_extraction.py', mod_name='replay_overreach_extraction')
@@ -43,10 +54,11 @@ class _FakeLLM(LLMClient):
     def __init__(
         self, entities: tuple[str, ...] = ('Alpha', 'Beta'),
         edges: tuple[tuple[str, str, str], ...] = (('Alpha', 'Beta', 'Alpha adopts Beta'),),
-        *, model: str = 'fake-extractor',
+        *, model: str = 'fake-extractor', reasoning_effort: str | None = None,
     ) -> None:
         super().__init__(GraphitiLLMConfig(model=model))
         self.token_tracker = AttributingTokenUsageTracker()
+        self.reasoning_effort = reasoning_effort
         self.entities = entities
         self.edges = edges
         self.calls: list[tuple[str | None, list[Message]]] = []
@@ -116,28 +128,70 @@ class TestTheArms:
         assert mod.ARMS['o1'].instructions_version == mod.O1_INSTRUCTIONS_VERSION
         assert mod.ARMS['control'].instructions_version == mod.NO_INSTRUCTIONS
 
-    def test_o6_is_the_controls_instructions_on_the_stronger_model(self) -> None:
-        o6, control = mod.ARMS['o6'], mod.ARMS['control']
+    def test_o6_is_two_arms_one_per_reasoning_effort(self) -> None:
+        """esc-9065-2: 'o6' could only ever mean one effort, so each measured effort is its own arm."""
+        assert sorted(mod.ARMS) == ['control', 'o1', 'o6-low', 'o6-medium']
+
+    @pytest.mark.parametrize('effort', ['low', 'medium'])
+    def test_each_o6_arm_is_the_controls_instructions_on_the_stronger_model_at_its_effort(
+        self, effort: str,
+    ) -> None:
+        o6 = mod.ARMS[f'o6-{effort}']
+        assert o6.llm == mod.ExtractionLlm(mod.O6_MODEL, effort)
         assert (o6.instructions, o6.instructions_version) == (None, mod.NO_INSTRUCTIONS)
-        assert (control.instructions, control.instructions_version) == (None, mod.NO_INSTRUCTIONS)
-        assert o6.model == mod.O6_MODEL
-        assert control.model is None and mod.ARMS['o1'].model is None
+
+    @pytest.mark.parametrize('arm', ['control', 'o1'])
+    def test_the_control_and_o1_extract_on_the_configured_client(self, arm: str) -> None:
+        llm = mod.ARMS[arm].llm
+        assert llm == mod.ExtractionLlm()
+        assert (llm.model, llm.reasoning_effort) == (None, None)
+
+    def test_an_extraction_llm_is_a_frozen_hashable_key(self) -> None:
+        llm = mod.ExtractionLlm(mod.O6_MODEL, 'low')
+        assert {llm: 1}[mod.ExtractionLlm(mod.O6_MODEL, 'low')] == 1
+        for field in dataclasses.fields(llm):
+            with pytest.raises(dataclasses.FrozenInstanceError):
+                setattr(llm, field.name, 'medium')
 
     @pytest.mark.asyncio
-    async def test_the_o6_arm_splices_nothing_and_runs_on_its_model(self) -> None:
-        llm = _FakeLLM(model=mod.O6_MODEL)
-        result = await _replay(llm, 'o6')
+    async def test_the_o6_low_arm_splices_nothing_and_runs_on_its_client(self) -> None:
+        llm = _FakeLLM(model=mod.O6_MODEL, reasoning_effort='low')
+        result = await _replay(llm, 'o6-low')
         first_line = mod.O1_INSTRUCTIONS.strip().splitlines()[0]
         assert first_line not in llm.prompt(NODE_PROMPT)
         assert first_line not in llm.prompt(EDGE_PROMPT)
-        assert (result.arm, result.model) == ('o6', mod.O6_MODEL)
+        assert (result.arm, result.model, result.reasoning_effort) == ('o6-low', mod.O6_MODEL, 'low')
+
+    @pytest.mark.asyncio
+    async def test_an_arm_refuses_a_client_at_another_effort_before_any_call(self) -> None:
+        llm = _FakeLLM(model=mod.O6_MODEL, reasoning_effort='medium')
+        with pytest.raises(mod.ArmClientMismatch) as raised:
+            await _replay(llm, 'o6-low')
+        assert all(name in str(raised.value) for name in ('o6-low', "'low'", "'medium'"))
+        assert llm.calls == []
+
+    @pytest.mark.asyncio
+    async def test_an_effort_arm_refuses_a_client_sending_no_effort(self) -> None:
+        """A client sending no effort runs at the API's default, which nobody chose."""
+        llm = _FakeLLM(model=mod.O6_MODEL)
+        with pytest.raises(mod.ArmClientMismatch):
+            await _replay(llm, 'o6-low')
+        assert llm.calls == []
 
     @pytest.mark.asyncio
     async def test_an_arm_refuses_a_client_on_another_model_before_any_call(self) -> None:
-        llm = _FakeLLM(model='m-small')
-        with pytest.raises(mod.ArmModelMismatch) as raised:
-            await _replay(llm, 'o6')
-        assert all(name in str(raised.value) for name in ('o6', mod.O6_MODEL, 'm-small'))
+        llm = _FakeLLM(model='m-small', reasoning_effort='medium')
+        with pytest.raises(mod.ArmClientMismatch) as raised:
+            await _replay(llm, 'o6-medium')
+        assert all(name in str(raised.value) for name in ('o6-medium', mod.O6_MODEL, 'm-small'))
+        assert llm.calls == []
+
+    @pytest.mark.asyncio
+    async def test_the_control_refuses_an_effort_client(self) -> None:
+        """The control's records claim the configured client, so an effort client must not run it."""
+        llm = _FakeLLM(reasoning_effort='low')
+        with pytest.raises(mod.ArmClientMismatch):
+            await _replay(llm, 'control')
         assert llm.calls == []
 
     @pytest.mark.asyncio
@@ -227,6 +281,19 @@ class TestTheResult:
         assert result.entities == ('Alpha', 'Beta', 'Gamma')
 
     @pytest.mark.asyncio
+    async def test_a_replayed_record_carries_the_clients_reasoning_effort(self) -> None:
+        o6_low = await _replay(_FakeLLM(model=mod.O6_MODEL, reasoning_effort='low'), 'o6-low')
+        control = await _replay(_FakeLLM(), 'control')
+        assert mod.replayed_record(o6_low, _input())['reasoning_effort'] == 'low'
+        assert mod.replayed_record(control, _input())['reasoning_effort'] is None
+
+    def test_a_failed_record_carries_the_clients_model_and_reasoning_effort(self) -> None:
+        llm = _FakeLLM(model=mod.O6_MODEL, reasoning_effort='medium')
+        record = mod.failed_record(mod.ARMS['o6-medium'], llm, _worksheet_row(), RuntimeError('provider down'))
+        assert (record['arm'], record['model'], record['reasoning_effort']) == ('o6-medium', mod.O6_MODEL, 'medium')
+        assert (record['kind'], record['error_type']) == ('failed', 'RuntimeError')
+
+    @pytest.mark.asyncio
     async def test_tokens_are_measured_per_prompt(self) -> None:
         result = await _replay(_FakeLLM())
         assert result.tokens == {
@@ -235,22 +302,176 @@ class TestTheResult:
         }
 
 
+class _Answer(BaseModel):
+    answer: str
+
+
+class _RecordingSdk:
+    """A fake AsyncOpenAI: records the kwargs of every Responses and chat call it is sent, and
+    answers each Responses call with the JSON *answers* holds for its text_format."""
+
+    def __init__(self, answers: dict[type[BaseModel], dict[str, Any]] | None = None) -> None:
+        self.answers = answers if answers is not None else {_Answer: {'answer': 'yes'}}
+        self.sent: list[dict[str, Any]] = []
+        self.responses = SimpleNamespace(parse=self._parse)
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+    async def _parse(self, **kwargs: Any) -> Any:
+        self.sent.append(kwargs)
+        return SimpleNamespace(
+            output_text=json.dumps(self.answers[kwargs['text_format']]),
+            usage=SimpleNamespace(input_tokens=11, output_tokens=7),
+        )
+
+    async def _create(self, **kwargs: Any) -> Any:
+        self.sent.append(kwargs)
+        raise AssertionError('a JSON-mode chat completion cannot carry the effort')
+
+
+EFFORT_MAX_TOKENS = 4096
+"""config.yaml's llm.max_tokens: the client's own cap, which extract_nodes uses because it passes none."""
+EXTRACT_EDGES_MAX_TOKENS = 16384
+"""graphiti_core 0.28.2 edge_operations.py::extract_edges' own cap, passed on every edge call."""
+EXTRACTION_ANSWERS: dict[type[BaseModel], dict[str, Any]] = {
+    ExtractedEntities: {'extracted_entities': [
+        {'name': 'Alpha', 'entity_type_id': 0}, {'name': 'Beta', 'entity_type_id': 0},
+    ]},
+    ExtractedEdges: {'edges': [
+        {'source_entity_name': 'Alpha', 'target_entity_name': 'Beta', 'relation_type': 'ADOPTS',
+         'fact': 'Alpha adopts Beta'},
+    ]},
+}
+
+
+def _effort_client(
+    effort: str = 'low', sdk: _RecordingSdk | None = None,
+) -> tuple[Any, _RecordingSdk, OpenAIClient]:
+    """An OpenAIClient as build_llm_client builds one for O6_MODEL, wrapped at *effort*."""
+    sdk = sdk if sdk is not None else _RecordingSdk()
+    built = OpenAIClient(
+        config=GraphitiLLMConfig(api_key='test', model=mod.O6_MODEL, small_model=mod.O6_MODEL, temperature=0.0),
+        client=sdk, max_tokens=EFFORT_MAX_TOKENS,
+    )
+    built.token_tracker = AttributingTokenUsageTracker()
+    return mod.ExplicitEffortOpenAIClient(built, effort), sdk, built
+
+
+async def _structured_call(client: Any, response_model: type[BaseModel] | None = _Answer) -> Any:
+    messages = [Message(role='system', content='extract'), Message(role='user', content='the record')]
+    return await client.generate_response(
+        messages, response_model=response_model, prompt_name='extract_nodes.extract_text',
+    )
+
+
+class TestTheExplicitEffortClient:
+    @pytest.mark.asyncio
+    async def test_it_sends_the_effort_and_no_other_sampling_control(self) -> None:
+        client, sdk, _ = _effort_client('low')
+        assert await _structured_call(client) == {'answer': 'yes'}
+        (sent,) = sdk.sent
+        assert 'temperature' not in sent and 'text' not in sent
+        assert sent['reasoning'] == {'effort': 'low'}
+        assert sent['model'] == mod.O6_MODEL
+        assert sent['max_output_tokens'] == client.max_tokens == EFFORT_MAX_TOKENS
+        assert set(sent) == {'model', 'input', 'max_output_tokens', 'text_format', 'reasoning'}
+
+    @pytest.mark.asyncio
+    async def test_it_keeps_the_built_clients_token_tracker_so_the_call_is_attributed(self) -> None:
+        client, _, built = _effort_client()
+        assert client.token_tracker is built.token_tracker
+        async with measure_llm_tokens(client) as measured:
+            await _structured_call(client)
+        assert measured.usage == LlmTokenUsage(input_tokens=11, output_tokens=7, llm_calls=1)
+
+    @pytest.mark.parametrize('effort', ['low', 'medium'])
+    def test_it_declares_the_effort_it_sends(self, effort: str) -> None:
+        client, _, _ = _effort_client(effort)
+        assert client.reasoning_effort == effort
+        assert mod.client_reasoning_effort(client) == effort
+
+    @pytest.mark.asyncio
+    async def test_a_json_mode_call_is_refused_before_anything_is_sent(self) -> None:
+        """A JSON-mode chat completion cannot carry reasoning.effort, so it is never sent without it."""
+        client, sdk, _ = _effort_client()
+        with pytest.raises(NotImplementedError, match='reasoning.effort'):
+            await _structured_call(client, response_model=None)
+        assert sdk.sent == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('message', [
+        {'role': 'assistant', 'content': 'an earlier answer'},
+        {'role': 'user', 'content': [{'type': 'text', 'text': 'a content part'}]},
+    ])
+    async def test_a_message_graphiti_never_emits_is_refused_before_anything_is_sent(self, message: Any) -> None:
+        """graphiti's message conversion emits only system and user text, so through
+        generate_response this is unreachable; the hook graphiti calls is where it is refused."""
+        client, sdk, _ = _effort_client()
+        messages: list[Any] = [{'role': 'system', 'content': 'extract'}, message]
+        with pytest.raises(TypeError, match='is not Responses input'):
+            await client._create_structured_completion(
+                model=mod.O6_MODEL, messages=messages, temperature=None,
+                max_tokens=EFFORT_MAX_TOKENS, response_model=_Answer,
+            )
+        assert sdk.sent == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('effort', ['low', 'medium'])
+    async def test_graphitis_own_extraction_sends_the_effort_and_each_stages_cap(self, effort: str) -> None:
+        """design.md §2.2: both stages go through the structured path, so both carry the effort and
+        no temperature, and each carries its own output cap."""
+        sdk = _RecordingSdk(EXTRACTION_ANSWERS)
+        client, _, _ = _effort_client(effort, sdk)
+        result = await mod.replay_episode(client, _input(), mod.ARMS[f'o6-{effort}'])
+        assert [sent['text_format'] for sent in sdk.sent] == [ExtractedEntities, ExtractedEdges]
+        assert [sent['max_output_tokens'] for sent in sdk.sent] == [EFFORT_MAX_TOKENS, EXTRACT_EDGES_MAX_TOKENS]
+        for sent in sdk.sent:
+            assert set(sent) == {'model', 'input', 'max_output_tokens', 'text_format', 'reasoning'}
+            assert sent['reasoning'] == {'effort': effort}
+            assert [message['role'] for message in sent['input']] == ['system', 'user']
+        assert [(m.source_name, m.target_name, m.fact) for m in result.minted] == [
+            ('Alpha', 'Beta', 'Alpha adopts Beta'),
+        ]
+        assert (result.model, result.reasoning_effort) == (mod.O6_MODEL, effort)
+
+
 class TestBuildArmLlm:
+    def test_the_default_client_is_build_llm_clients_own_on_the_configured_model(
+        self, mock_config: FusedMemoryConfig,
+    ) -> None:
+        client = mod.build_arm_llm(mock_config, mod.ExtractionLlm())
+        assert type(client) is OpenAIClient and client.model == mock_config.llm.model
+        assert not hasattr(client, 'reasoning_effort')
+        assert mod.client_reasoning_effort(client) is None
+
     def test_a_model_override_builds_that_model_and_leaves_the_config_alone(
         self, mock_config: FusedMemoryConfig,
     ) -> None:
         before = mock_config.llm.model
-        client = mod.build_arm_llm(mock_config, model='m-strong')
+        client = mod.build_arm_llm(mock_config, mod.ExtractionLlm('m-strong'))
         assert client is not None and client.model == 'm-strong'
         assert mock_config.llm.model == before
 
-    def test_no_override_keeps_the_configured_model(self, mock_config: FusedMemoryConfig) -> None:
-        client = mod.build_arm_llm(mock_config, model=None)
-        assert client is not None and client.model == mock_config.llm.model
-
     def test_the_client_attributes_its_tokens(self, mock_config: FusedMemoryConfig) -> None:
-        client = mod.build_arm_llm(mock_config, model=None)
+        client = mod.build_arm_llm(mock_config, mod.ExtractionLlm())
         assert client is not None and isinstance(client.token_tracker, AttributingTokenUsageTracker)
+
+    def test_a_set_effort_wraps_the_built_client_in_the_effort_client(self, mock_config: FusedMemoryConfig) -> None:
+        before = mock_config.llm.model
+        client = mod.build_arm_llm(mock_config, mod.ExtractionLlm(mod.O6_MODEL, 'medium'))
+        assert isinstance(client, mod.ExplicitEffortOpenAIClient)
+        assert (client.model, client.small_model) == (mod.O6_MODEL, mod.O6_MODEL)
+        assert client.reasoning_effort == 'medium'
+        assert isinstance(client.token_tracker, AttributingTokenUsageTracker)
+        assert mock_config.llm.model == before
+
+    def test_a_set_effort_on_a_chat_completions_only_client_class_is_refused(
+        self, mock_config: FusedMemoryConfig,
+    ) -> None:
+        generic = mock_config.model_copy(deep=True)
+        generic.llm.client_class = 'openai_generic'
+        with pytest.raises(mod.ArmClientMismatch) as raised:
+            mod.build_arm_llm(generic, mod.ExtractionLlm(mod.O6_MODEL, 'low'))
+        assert 'openai_generic' in str(raised.value) and 'low' in str(raised.value)
 
 
 # --------------------------------------------------------------------------- #
@@ -434,33 +655,39 @@ def _run_replay_on(paths: dict[str, Path], factory: Any, *arms: str) -> int:
 
 
 def _run_replay(paths: dict[str, Path], llm: _FakeLLM, *arms: str) -> int:
-    return _run_replay_on(paths, lambda model: llm, *arms)
+    return _run_replay_on(paths, lambda llm_spec: llm, *arms)
 
 
 CONFIGURED = 'm-configured'
 
 
-class _ClientsByModel:
-    """An llm_factory building one _CountingLLM per model it is asked for; None is the configured model."""
+CONTROL_LLM = mod.ExtractionLlm()
+O6_LOW_LLM = mod.ExtractionLlm(mod.O6_MODEL, 'low')
+O6_MEDIUM_LLM = mod.ExtractionLlm(mod.O6_MODEL, 'medium')
+
+
+class _ClientsByLlm:
+    """An llm_factory building one _CountingLLM per ExtractionLlm it is asked for, on that model
+    (None is CONFIGURED) and declaring that effort."""
 
     def __init__(
-        self, *, unavailable: frozenset[str | None] = frozenset(),
-        edges: dict[str | None, tuple[tuple[str, str, str], ...]] | None = None,
+        self, *, unavailable: frozenset[Any] = frozenset(),
+        edges: dict[Any, tuple[tuple[str, str, str], ...]] | None = None,
     ) -> None:
         self.unavailable = unavailable
         self.edges = edges or {}
-        self.asked: list[str | None] = []
-        self.clients: dict[str | None, _CountingLLM] = {}
+        self.asked: list[Any] = []
+        self.clients: dict[Any, _CountingLLM] = {}
 
-    def __call__(self, model: str | None) -> _CountingLLM | None:
-        self.asked.append(model)
-        if model in self.unavailable:
+    def __call__(self, spec: Any) -> _CountingLLM | None:
+        self.asked.append(spec)
+        if spec in self.unavailable:
             return None
-        name = model or CONFIGURED
-        self.clients[model] = (
-            _CountingLLM(model=name, edges=self.edges[model]) if model in self.edges else _CountingLLM(model=name)
-        )
-        return self.clients[model]
+        fields: dict[str, Any] = {'model': spec.model or CONFIGURED, 'reasoning_effort': spec.reasoning_effort}
+        if spec in self.edges:
+            fields['edges'] = self.edges[spec]
+        self.clients[spec] = _CountingLLM(**fields)
+        return self.clients[spec]
 
 
 def _records(path: Path) -> list[dict[str, Any]]:
@@ -542,7 +769,7 @@ class TestReplayCommand:
     def test_a_client_on_another_model_than_its_arms_exits_2_before_any_call(self, tmp_path: Path) -> None:
         paths = _cli_inputs(tmp_path)
         llm = _CountingLLM(model='m-small')
-        assert _run_replay(paths, llm, 'control', 'o6') == 2
+        assert _run_replay(paths, llm, 'control', 'o6-low') == 2
         assert not paths['replay'].exists() and llm.calls == []
 
     def test_a_defect_in_an_episode_read_is_raised_not_recorded_as_a_failure(self, tmp_path: Path) -> None:
@@ -552,42 +779,64 @@ class TestReplayCommand:
 
         paths = _cli_inputs(tmp_path)
         with pytest.raises(KeyError):
-            mod.run(_replay_argv(paths), llm_factory=lambda model: _CountingLLM(),
+            mod.run(_replay_argv(paths), llm_factory=lambda llm_spec: _CountingLLM(),
                     reader_factory=lambda graph: ReadOnlyGraphReader(graph_name=graph, graph=_Broken()))
         assert _records(paths['replay']) == []
 
     def test_a_missing_client_exits_1(self, tmp_path: Path) -> None:
         paths = _cli_inputs(tmp_path)
-        code = mod.run(_replay_argv(paths), llm_factory=lambda model: None,
+        code = mod.run(_replay_argv(paths), llm_factory=lambda llm_spec: None,
                        reader_factory=lambda graph: ReadOnlyGraphReader(graph_name=graph, graph=_episode_graph()))
         assert code == 1 and not paths['replay'].exists()
 
-    def test_each_arm_model_gets_one_client_and_every_arm_one_file(self, tmp_path: Path) -> None:
+    def test_each_distinct_arm_client_gets_one_client_and_every_arm_one_file(self, tmp_path: Path) -> None:
         paths = _cli_inputs(tmp_path)
-        factory = _ClientsByModel()
-        assert _run_replay_on(paths, factory, 'control', 'o6') == 0
-        assert factory.asked == [None, mod.O6_MODEL]
+        factory = _ClientsByLlm()
+        assert _run_replay_on(paths, factory, 'control', 'o1', 'o6-low', 'o6-medium') == 0
+        assert factory.asked == [CONTROL_LLM, O6_LOW_LLM, O6_MEDIUM_LLM]
         records = _records(paths['replay'])
         assert sorted((r['arm'], r['uuid']) for r in records) == sorted(
-            (arm, row['uuid']) for arm in ('control', 'o6') for row in CLI_ROWS
+            (arm, row['uuid']) for arm in ('control', 'o1', 'o6-low', 'o6-medium') for row in CLI_ROWS
         )
-        assert {r['model'] for r in records if r['arm'] == 'control'} == {CONFIGURED}
-        assert {r['model'] for r in records if r['arm'] == 'o6'} == {mod.O6_MODEL}
+        clients = {arm: {(r['model'], r['reasoning_effort']) for r in records if r['arm'] == arm}
+                   for arm in ('control', 'o1', 'o6-low', 'o6-medium')}
+        assert clients == {
+            'control': {(CONFIGURED, None)}, 'o1': {(CONFIGURED, None)},
+            'o6-low': {(mod.O6_MODEL, 'low')}, 'o6-medium': {(mod.O6_MODEL, 'medium')},
+        }
 
-    def test_a_resume_adds_the_o6_arm_beside_a_recorded_control(self, tmp_path: Path) -> None:
+    def test_a_resume_adds_both_o6_arms_beside_a_recorded_control(self, tmp_path: Path) -> None:
         paths = _cli_inputs(tmp_path)
-        assert _run_replay_on(paths, _ClientsByModel(), 'control') == 0
-        second = _ClientsByModel()
-        assert _run_replay_on(paths, second, 'control', 'o6') == 0
-        assert second.clients[None].calls == []
-        assert sorted(second.clients[mod.O6_MODEL].episodes_called()) == ['ep-a', 'ep-b', 'ep-c']
-        assert len(_records(paths['replay'])) == 6
+        assert _run_replay_on(paths, _ClientsByLlm(), 'control') == 0
+        second = _ClientsByLlm()
+        assert _run_replay_on(paths, second, 'control', 'o6-low', 'o6-medium') == 0
+        assert second.clients[CONTROL_LLM].calls == []
+        for spec in (O6_LOW_LLM, O6_MEDIUM_LLM):
+            assert sorted(second.clients[spec].episodes_called()) == ['ep-a', 'ep-b', 'ep-c']
+        assert len(_records(paths['replay'])) == 9
 
-    def test_an_arm_model_with_no_client_exits_1_before_any_call(self, tmp_path: Path) -> None:
+    def test_a_recorded_effort_arm_whose_client_now_declares_another_effort_exits_2(self, tmp_path: Path) -> None:
         paths = _cli_inputs(tmp_path)
-        factory = _ClientsByModel(unavailable=frozenset({mod.O6_MODEL}))
-        assert _run_replay_on(paths, factory, 'control', 'o6') == 1
-        assert not paths['replay'].exists()
+        assert _run_replay_on(paths, _ClientsByLlm(), 'control', 'o6-low') == 0
+        before = paths['replay'].read_bytes()
+
+        def medium_for_low(spec: Any) -> _CountingLLM:
+            if spec == O6_LOW_LLM:
+                return _CountingLLM(model=mod.O6_MODEL, reasoning_effort='medium')
+            return _CountingLLM(model=CONFIGURED)
+
+        assert _run_replay_on(paths, medium_for_low, 'control', 'o6-low') == 2
+        assert paths['replay'].read_bytes() == before
+
+    def test_a_recorded_record_at_another_effort_than_its_arms_client_exits_2(self, tmp_path: Path) -> None:
+        paths = _cli_inputs(tmp_path)
+        assert _run_replay_on(paths, _ClientsByLlm(), 'o6-low') == 0
+        rewritten = [r | {'reasoning_effort': 'medium'} for r in _records(paths['replay'])]
+        paths['replay'].write_text(''.join(json.dumps(r) + '\n' for r in rewritten))
+        before = paths['replay'].read_bytes()
+        factory = _ClientsByLlm()
+        assert _run_replay_on(paths, factory, 'o6-low') == 2
+        assert paths['replay'].read_bytes() == before
         assert all(client.calls == [] for client in factory.clients.values())
 
     def test_a_second_model_for_a_recorded_arm_exits_2(self, tmp_path: Path) -> None:
@@ -596,6 +845,44 @@ class TestReplayCommand:
         before = paths['replay'].read_text()
         assert _run_replay(paths, _CountingLLM(model='m-other'), 'control') == 2
         assert paths['replay'].read_text() == before
+
+    def test_a_record_written_before_9065_resumes_as_effort_none(self, tmp_path: Path) -> None:
+        """A 9040-era record has no 'reasoning_effort' key; it reads as the configured client's None."""
+        paths = _cli_inputs(tmp_path)
+        assert _run_replay_on(paths, _ClientsByLlm(), 'control') == 0
+        legacy = [{k: v for k, v in r.items() if k != 'reasoning_effort'} for r in _records(paths['replay'])]
+        paths['replay'].write_text(''.join(json.dumps(r) + '\n' for r in legacy))
+        second = _ClientsByLlm()
+        assert _run_replay_on(paths, second, 'control', 'o6-low') == 0
+        assert second.clients[CONTROL_LLM].calls == []
+        assert len(_records(paths['replay'])) == 6
+
+    def test_a_factory_refusing_an_arms_client_exits_2_and_writes_nothing(self, tmp_path: Path) -> None:
+        paths = _cli_inputs(tmp_path)
+        built: list[_CountingLLM] = []
+
+        def refusing(spec: Any) -> _CountingLLM:
+            if spec.reasoning_effort is not None:
+                raise mod.ArmClientMismatch('this client class cannot send an effort')
+            built.append(_CountingLLM(model=CONFIGURED))
+            return built[-1]
+
+        assert _run_replay_on(paths, refusing, 'control', 'o6-low') == 2
+        assert not paths['replay'].exists()
+        assert all(client.calls == [] for client in built)
+
+    def test_an_arm_client_with_no_client_exits_1_before_any_call(self, tmp_path: Path) -> None:
+        paths = _cli_inputs(tmp_path)
+        factory = _ClientsByLlm(unavailable=frozenset({O6_LOW_LLM}))
+        assert _run_replay_on(paths, factory, 'control', 'o6-low') == 1
+        assert not paths['replay'].exists()
+        assert all(client.calls == [] for client in factory.clients.values())
+
+    def test_the_retired_o6_arm_is_refused(self, tmp_path: Path) -> None:
+        paths = _cli_inputs(tmp_path)
+        with pytest.raises(SystemExit) as raised:
+            _run_replay_on(paths, _ClientsByLlm(), 'control', 'o6')
+        assert raised.value.code == 2
 
 
 def _worksheet_argv(paths: dict[str, Path]) -> list[str]:
@@ -806,6 +1093,13 @@ class TestScorePerArm:
         }
         assert arms['o1']['tokens']['extract_edges'] == {'input_tokens': 1400, 'output_tokens': 160, 'llm_calls': 8}
 
+    def test_a_record_without_a_reasoning_effort_scores_as_effort_none(self, tmp_path: Path) -> None:
+        records, _ = _score_records(PASSING)
+        assert not any('reasoning_effort' in record for record in records)
+        assert {arm: block['reasoning_effort'] for arm, block in _scored(tmp_path)['arms'].items()} == {
+            'control': None, 'o1': None,
+        }
+
     def test_each_arm_names_its_model_and_instructions(self, tmp_path: Path) -> None:
         arms = _scored(tmp_path)['arms']
         assert (arms['o1']['model'], arms['o1']['instructions_version']) == ('gpt-4o-mini', mod.O1_INSTRUCTIONS_VERSION)
@@ -929,29 +1223,24 @@ CLI_SCORE_BASELINE = {
 }
 OVERREACHING_FACT = 'Beta overrides Alpha'
 CONFIGURED_EDGES = (('Alpha', 'Beta', 'Alpha adopts Beta'), ('Beta', 'Alpha', OVERREACHING_FACT))
-O6_EDGES = (('Alpha', 'Beta', 'Alpha adopts Beta'),)
+O6_LOW_EDGES = tuple(('Alpha', 'Beta', f'Alpha adopts Beta for queue {index}') for index in range(8))
+"""Eight holdings per episode and no overreach: enough edges that its Wilson upper bound clears
+the control's point, so o6-low passes."""
+O6_MEDIUM_EDGES = CONFIGURED_EDGES
+"""The control's overreach rate exactly, so o6-medium fails."""
+EDGES_PER_EPISODE = len(CONFIGURED_EDGES) + len(O6_LOW_EDGES) + len(O6_MEDIUM_EDGES)
 
 
-class TestOneReplayAcrossArmModels:
+class TestOneReplayAcrossArmClients:
     def _replayed(self, tmp_path: Path) -> dict[str, Path]:
         paths = _cli_inputs(tmp_path, baseline=CLI_SCORE_BASELINE)
-        assert _run_replay_on(paths, _ClientsByModel(edges={None: CONFIGURED_EDGES, mod.O6_MODEL: O6_EDGES}), 'control', 'o6') == 0
+        factory = _ClientsByLlm(edges={
+            CONTROL_LLM: CONFIGURED_EDGES, O6_LOW_LLM: O6_LOW_EDGES, O6_MEDIUM_LLM: O6_MEDIUM_EDGES,
+        })
+        assert _run_replay_on(paths, factory, 'control', 'o6-low', 'o6-medium') == 0
         return paths
 
-    def test_the_worksheet_interleaves_both_models_edges_naming_no_arm(self, tmp_path: Path) -> None:
-        paths = self._replayed(tmp_path)
-        assert mod.run(_worksheet_argv(paths)) == 0
-        records = _records(paths['replay'])
-        for row in _records(paths['blind']):
-            replayed = {m['edge_uuid'] for r in records if r['uuid'] == row['uuid'] for m in r['minted']}
-            assert {m['edge_uuid'] for m in row['minted']} == replayed and len(replayed) == 3
-            hashes = [hashlib.sha256(m['edge_uuid'].encode()).hexdigest() for m in row['minted']]
-            assert hashes == sorted(hashes)
-            assert not {'arm', 'model'} & (row.keys() | {key for m in row['minted'] for key in m})
-        text = paths['blind'].read_text()
-        assert mod.O6_MODEL not in text and CONFIGURED not in text
-
-    def test_the_score_judges_o6_against_the_same_files_control(self, tmp_path: Path) -> None:
+    def _report(self, tmp_path: Path) -> dict[str, Any]:
         paths = self._replayed(tmp_path)
         records = _records(paths['replay'])
         labels = {
@@ -962,12 +1251,79 @@ class TestOneReplayAcrossArmModels:
         verdict_file.write_text(json.dumps(_score_verdicts(records, labels)))
         assert mod.run(['score', '--replay', str(paths['replay']), '--verdicts', str(verdict_file),
                         '--baseline-report', str(paths['baseline']), '--out', str(out)]) == 0
-        report = json.loads(out.read_text())
-        control, o6 = report['arms']['control'], report['arms']['o6']
-        assert (control['model'], o6['model']) == (CONFIGURED, mod.O6_MODEL)
-        assert o6['instructions_version'] == mod.NO_INSTRUCTIONS
-        assert o6['population_weighted']['overreach_rate_minted']['rate'] == 0.0
-        assert control['population_weighted']['overreach_rate_minted']['rate'] == 0.5
-        assert report['comparison']['o6'] == mod.lever_decision(
-            control['population_weighted'], o6['population_weighted'],
-        )
+        return json.loads(out.read_text())
+
+    def test_the_worksheet_interleaves_every_clients_edges_naming_no_arm(self, tmp_path: Path) -> None:
+        paths = self._replayed(tmp_path)
+        assert mod.run(_worksheet_argv(paths)) == 0
+        records = _records(paths['replay'])
+        for row in _records(paths['blind']):
+            replayed = {m['edge_uuid'] for r in records if r['uuid'] == row['uuid'] for m in r['minted']}
+            assert {m['edge_uuid'] for m in row['minted']} == replayed and len(replayed) == EDGES_PER_EPISODE
+            hashes = [hashlib.sha256(m['edge_uuid'].encode()).hexdigest() for m in row['minted']]
+            assert hashes == sorted(hashes)
+            assert row.keys() == {'graph', 'uuid', 'stratum', 'content', 'minted'}
+            assert all(m.keys() == {'edge_uuid', 'fact', 'source_name', 'target_name'} for m in row['minted'])
+        text = paths['blind'].read_text()
+        assert mod.O6_MODEL not in text and CONFIGURED not in text
+        assert not any(arm in text for arm in ('o6-low', 'o6-medium', 'control'))
+
+    def test_each_arm_block_names_its_client(self, tmp_path: Path) -> None:
+        arms = self._report(tmp_path)['arms']
+        assert {arm: (block['model'], block['reasoning_effort']) for arm, block in arms.items()} == {
+            'control': (CONFIGURED, None), 'o6-low': (mod.O6_MODEL, 'low'), 'o6-medium': (mod.O6_MODEL, 'medium'),
+        }
+        assert {arms[arm]['instructions_version'] for arm in ('o6-low', 'o6-medium')} == {mod.NO_INSTRUCTIONS}
+
+    def test_each_o6_arm_is_judged_against_the_same_files_control(self, tmp_path: Path) -> None:
+        report = self._report(tmp_path)
+        control = report['arms']['control']['population_weighted']
+        assert control['overreach_rate_minted']['rate'] == 0.5
+        assert set(report['comparison']) == {'o6-low', 'o6-medium'}
+        for arm in ('o6-low', 'o6-medium'):
+            assert report['comparison'][arm] == mod.lever_decision(control, report['arms'][arm]['population_weighted'])
+
+    def test_the_two_efforts_are_decided_independently(self, tmp_path: Path) -> None:
+        comparison = self._report(tmp_path)['comparison']
+        assert (comparison['o6-low']['passes'], comparison['o6-medium']['passes']) == (True, False)
+
+
+# --------------------------------------------------------------------------- #
+# 9040's committed evidence still scores to its committed report
+# --------------------------------------------------------------------------- #
+
+REPO = Path(__file__).resolve().parents[2]
+EVIDENCE_9040 = REPO / 'docs' / 'ruling-overreach-lever-reopen-2026-11-10'
+BASELINE_4716 = REPO / 'docs' / 'ruling-overreach-guard-design-2026-10-01' / 'report.json'
+
+
+class TestThe9040EvidenceRescoresUnchanged:
+    """The 2026-11-10 design.md documents re-scoring its committed files, so a 9040-era replay
+    (no reasoning_effort key) must still score, and its decision-bearing output must not move."""
+
+    @pytest.fixture(scope='class')
+    def rescored(self, tmp_path_factory: pytest.TempPathFactory) -> dict[str, Any]:
+        out = tmp_path_factory.mktemp('rescore-9040') / 'report.json'
+        assert mod.run([
+            'score', '--replay', str(EVIDENCE_9040 / 'replay.jsonl'),
+            '--verdicts', str(EVIDENCE_9040 / 'verdicts.json'),
+            '--baseline-report', str(BASELINE_4716), '--out', str(out),
+        ]) == 0
+        return json.loads(out.read_text())
+
+    @pytest.fixture(scope='class')
+    def committed(self) -> dict[str, Any]:
+        return json.loads((EVIDENCE_9040 / 'report.json').read_text())
+
+    def test_the_comparison_and_fidelity_are_unchanged(
+        self, rescored: dict[str, Any], committed: dict[str, Any],
+    ) -> None:
+        assert rescored['comparison'] == committed['comparison']
+        assert rescored['fidelity'] == committed['fidelity']
+
+    def test_each_arm_block_gains_only_reasoning_effort_none(
+        self, rescored: dict[str, Any], committed: dict[str, Any],
+    ) -> None:
+        assert set(rescored['arms']) == set(committed['arms']) == {'control', 'o1'}
+        for arm, block in committed['arms'].items():
+            assert rescored['arms'][arm] == block | {'reasoning_effort': None}

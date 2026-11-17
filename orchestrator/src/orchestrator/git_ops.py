@@ -67,7 +67,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Literal, NamedTuple, TypedDict, TypeGuard
 
-from shared.branch_names import canonical_queued_branch_name
+from shared.branch_names import bare_queued_branch_id, canonical_queued_branch_name
 from shared.git_async import run_git
 from shared.merge_subject import (
     MergeSubject,
@@ -111,8 +111,15 @@ from orchestrator.lane_lifecycle import (
     LaneState,
 )
 from orchestrator.lane_task_dir import archive_root_for, evict_previous_occupant
+from orchestrator.quarantine_provenance import (
+    NOT_RELOCATED,
+    QuarantineOutcome,
+    record_quarantine_provenance,
+)
+from orchestrator.rebase_drops import RebaseDropLedger, run_rebase_reporting_drops
 from orchestrator.recut_ruling import ParkedIncarnation, RecutRuling, RecutRulingViolation
 from orchestrator.script_warnings import log_warnings_despite_success
+from orchestrator.staged_gitlinks import unstage_new_gitlinks
 from orchestrator.teardown import complete_despite_cancellation, path_confirmed_absent
 from orchestrator.tree_removal import remove_tree
 from orchestrator.verify_cancel import (
@@ -2095,6 +2102,22 @@ class BranchResetError(RuntimeError):
             f'would collapse the branch from {n_before} commit(s) over main '
             f'to 0 (onto={onto}); {restore_note}'
         )
+
+
+class _ParkedBranchStranded(RuntimeError):
+    """A quarantine move failed after its branch was renamed aside, and git refused the rename back."""
+
+    def __init__(self, parked_branch: str, move_error: Exception):
+        self.parked_branch = parked_branch
+        super().__init__(
+            f'{move_error}; the branch could not be renamed back, so the work '
+            f'is stranded on {parked_branch}'
+        )
+
+
+def _stranded_branch(error: Exception) -> str | None:
+    """The parked ref a failed quarantine move left its work on, or None when it left none."""
+    return error.parked_branch if isinstance(error, _ParkedBranchStranded) else None
 
 
 class MergeVerifyLeaseHeld(RuntimeError):
@@ -4922,19 +4945,20 @@ class GitOps:
                         'creating fresh',
                         worktree_path, stored_title, expected_title,
                     )
-                    dest = await self.quarantine_worktree(
+                    outcome = await self.quarantine_worktree(
                         worktree_path, branch_name, 'reuse-identity-mismatch',
+                        stored_title=stored_title,
                     )
                     # Relocate (not delete) the foreign sibling .task-meta
                     # root alongside the quarantined worktree — mirrors the
                     # cold-reattach guard's identical call below; see
                     # _relocate_foreign_meta_root's docstring. Skipped when
-                    # dest is None (relocation failed): worktree_path is
+                    # outcome.dest is None (relocation failed): worktree_path is
                     # still a live registered worktree, so the elif
                     # self-heal branch below raises rather than destroying
                     # anything, and the sidecar is correctly left in place.
-                    if dest is not None:
-                        await self._relocate_foreign_meta_root(worktree_path, dest)
+                    if outcome.dest is not None:
+                        await self._relocate_foreign_meta_root(worktree_path, outcome.dest)
                     reuse_ok = False
             if reuse_ok:
                 logger.info(f'Reusing existing worktree at {worktree_path} on branch {full_branch}')
@@ -5282,11 +5306,12 @@ class GitOps:
                     'creating fresh',
                     worktree_path, stored_title, expected_title, full_branch,
                 )
-                dest = await self.quarantine_worktree(
+                outcome = await self.quarantine_worktree(
                     worktree_path, branch_name, 'cold-reattach-identity-mismatch',
+                    stored_title=stored_title,
                 )
-                if dest is None:
-                    # quarantine_worktree never raises — a None return means
+                if outcome.dest is None:
+                    # quarantine_worktree never raises — a None dest means
                     # the relocation could not complete, so the branch is
                     # STILL task/<branch_name> and worktree_path is STILL
                     # attached. Falling through here would make the caller's
@@ -5316,7 +5341,7 @@ class GitOps:
                 # detect the mismatch) and ONLY on this confirmed-mismatch
                 # route — never on the match/fail-open path below, a
                 # same-task resume whose own artifacts must be preserved.
-                await self._relocate_foreign_meta_root(worktree_path, dest)
+                await self._relocate_foreign_meta_root(worktree_path, outcome.dest)
                 return None
 
         return await self._reuse_warm_lane(
@@ -8703,7 +8728,7 @@ class GitOps:
         Used by the two "nothing is destroyed" quarantine guards —
         ``create_worktree``'s REUSE-path and ``_reattach_cold_worktree``'s
         cold-path ``expected_title`` mismatch checks — where *dest* is the
-        :meth:`quarantine_worktree` return value
+        :meth:`quarantine_worktree` outcome's ``.dest``
         (``quarantine_base/<branch>-<ts>``). Unlike
         :meth:`_clear_foreign_meta_root` (used by the warm-lane
         DIFFERENT-task ACQUISITION routes, where the sidecar is genuinely
@@ -9391,23 +9416,28 @@ class GitOps:
                 result[name[len(head_prefix):]] = matched
         return result
 
-    async def _branch_has_commits_beyond_main(self, full_branch: str) -> bool:
-        """Whether *full_branch* carries commits beyond main.
-
-        **Fail-safe ``True``** on any git error or unparseable output — never
-        report a branch as empty (safe to delete) when we cannot prove it.
-        """
+    async def commits_beyond_main(self, full_branch: str) -> int | None:
+        """How many commits *full_branch* carries beyond main; None on any git error or unparseable output."""
         rc, out, _ = await _run(
             ['git', 'rev-list', '--count',
              f'{self.config.main_branch}..{full_branch}'],
             cwd=self.project_root,
         )
         if rc != 0:
-            return True
+            return None
         try:
-            return int(out.strip()) > 0
+            return int(out.strip())
         except ValueError:
-            return True
+            return None
+
+    async def _branch_has_commits_beyond_main(self, full_branch: str) -> bool:
+        """Whether *full_branch* carries commits beyond main.
+
+        **Fail-safe ``True``** on any git error or unparseable output — never
+        report a branch as empty (safe to delete) when we cannot prove it.
+        """
+        count = await self.commits_beyond_main(full_branch)
+        return count is None or count > 0
 
     async def branch_tip_if_no_commits_beyond(
         self, full_branch: str, base_ref: str,
@@ -9649,12 +9679,20 @@ class GitOps:
         conflicted tree (which may contain literal conflict markers) is
         never snapshotted.  All WIP-save call sites funnel through this
         method, so this single guard covers every one of them.
+
+        Embedded git repositories stay out of the commit: ``--ignore-errors``
+        stops a commit-less one aborting the whole ``git add``, and
+        ``orchestrator/src/orchestrator/staged_gitlinks.py::unstage_new_gitlinks``
+        unstages the gitlink of any other.
         """
         conflicted = await self._detect_unmerged_paths(worktree)
         if conflicted:
             raise WorktreeConflictError(worktree, conflicted)
 
-        await _run(['git', 'add', '-A', '--', '.', ':!.claude'], cwd=worktree)
+        await _run(
+            ['git', 'add', '-A', '--ignore-errors', '--', '.', ':!.claude'], cwd=worktree,
+        )
+        await unstage_new_gitlinks(worktree, _run)
 
         # Check for changes
         rc, _, _ = await _run(['git', 'diff', '--cached', '--quiet'], cwd=worktree)
@@ -10139,18 +10177,19 @@ class GitOps:
         Returns True on success.  On failure, ATTEMPTS a guarded abort and
         returns False — which does NOT imply a clean worktree: aborts fail.
 
+        A commit the rebase drops because the target already carries its
+        change is logged and recorded
+        (``orchestrator/src/orchestrator/rebase_drops.py::RebaseDropLedger``).
+
         Caller must NOT hold ``_merge_lock`` — this is designed to run
         outside the lock so multiple tasks can rebase concurrently in
         their own worktrees.
         """
         target = onto if onto is not None else self.config.main_branch
-        rc, _, err = await _run(
-            ['git', 'rebase', target],
-            cwd=worktree,
-        )
-        if rc != 0:
+        rebased = await run_rebase_reporting_drops(_run, worktree, onto=target)
+        if not rebased.ok:
             await rebase_recovery.guarded_abort('rebase', worktree, _run)
-            logger.info(f'Pre-merge rebase failed in {worktree}: {err}')
+            logger.info(f'Pre-merge rebase failed in {worktree}: {rebased.stderr}')
             return False
         return True
 
@@ -10609,6 +10648,38 @@ class GitOps:
         landed = await self.is_ancestor_checked(base, self.config.main_branch)
         return None if landed is True else base
 
+    async def own_delta_upstream(self, full_branch: str) -> str | None:
+        """The ``<upstream>`` of a ``git rebase --onto <main> <upstream>`` that
+        replays only *full_branch*'s own commits.
+
+        Main, unless the branch still carries commits of an unlanded stack base
+        (``orchestrator/src/orchestrator/branch_stack.py::StackBaseLedger``);
+        then the newest of those.  Read-only, unlike
+        :meth:`unstack_from_unlanded_base`, so a successor stacked on the
+        branch still finds its own commits above it.  None when the foreign
+        prefix cannot be inspected; an unreadable record or tip answers main.
+        """
+        main = self.config.main_branch
+        base = await self._stack_ledger().base_of(full_branch)
+        if base is None:
+            return main
+        try:
+            cut = await self._foreign_cut(full_branch, base, await self.get_main_sha())
+        except branch_stack.StackInspectionError as exc:
+            logger.warning(
+                'Cannot tell where %s\'s own delta starts above stack base %s: %s',
+                full_branch, base, exc,
+            )
+            return None
+        if cut is None:
+            return main
+        logger.warning(
+            '%s still carries commits of unlanded stack base %s; '
+            'its own delta starts above %s',
+            full_branch, base, cut,
+        )
+        return cut
+
     async def restore_pre_stack_tip(self, tip: PreStackTip) -> TipRestore:
         """Put a stacked member's branch back on the tip it had before stacking.
 
@@ -10706,16 +10777,20 @@ class GitOps:
             return f'{why}; putting {ref} back on {found} failed too: {" ".join(err.split())}'
         return f'{why}; {ref} is back on {found}'
 
+    async def _foreign_cut(self, full_branch: str, base: str, main_sha: str) -> str | None:
+        """Newest commit unlanded *base* put under *full_branch*'s own, or None."""
+        tip = await self.resolve_branch_sha(full_branch)
+        if tip is None or await self.is_ancestor(base, main_sha):
+            return None
+        return await foreign_commit_cut(
+            _run, self.project_root, tip=tip, main_ref=main_sha, base=base,
+        )
+
     async def _unstack_recorded(
         self, ledger: StackBaseLedger, full_branch: str, base: str,
     ) -> UnstackResult:
-        tip = await self.resolve_branch_sha(full_branch)
         main_sha = await self.get_main_sha()
-        cut = None
-        if tip is not None and not await self.is_ancestor(base, main_sha):
-            cut = await foreign_commit_cut(
-                _run, self.project_root, tip=tip, main_ref=main_sha, base=base,
-            )
+        cut = await self._foreign_cut(full_branch, base, main_sha)
         if cut is None:
             await ledger.forget(full_branch)
             return UnstackResult(
@@ -10815,8 +10890,8 @@ class GitOps:
         Args:
             member_id: The member's task id (used to locate its branch/worktree).
             predecessor_ref: The ref that forms the base of the member's own
-                commits — ``task/<predecessor_id>`` for non-anchors, or
-                ``self.config.main_branch`` for the anchor.
+                commits — ``task/<predecessor_id>`` for non-anchors, or,
+                for the anchor, :meth:`own_delta_upstream` of its branch.
             solo_prefix: Prefix for the temporary branch/worktree name.
                 Defaults to ``'_solo-'``.
 
@@ -12611,7 +12686,7 @@ class GitOps:
 
     async def get_files_touched_in_branch(
         self, base_sha: str, branch_head: str,
-    ) -> list[str]:
+    ) -> tuple[list[str], Exception | None]:
         """Files touched by any commit in ``base_sha..branch_head``.
 
         Union of file paths that appeared in any commit on the branch
@@ -12619,33 +12694,38 @@ class GitOps:
         Decision-1 check: an architect-declared plan target is "touched"
         if it appears in this set.
 
+        A merge commit counts by its combined diff
+        (``--diff-merges=dense-combined``): only paths whose merged content
+        differs from EVERY parent, i.e. the merge's own conflict-resolution
+        or evil hunks.  A path a back-merge merely brought in from main is
+        not counted; a per-parent diff (``-m``, first-parent) would count
+        everything main brought in.
+
         Excludes ``.task/`` and uses ``--no-renames`` so a rename
         surfaces both old and new paths (the old path is "touched" too).
 
-        Returns ``[]`` on git error so the helper fails open — its
-        consumer logs and proceeds rather than blocking the merge on
-        a transient diff error.
+        Returns a ``(files, error)`` tuple, total and never raising, like
+        :meth:`get_merge_diff_files`: ``(sorted unique paths, None)`` on
+        success, ``([], exception)`` when the history could not be read.
+        An error is returned, never hidden as an empty touched set.
         """
-        rc, output, stderr = await _run(
-            [
-                'git', 'log', '--name-only', '--no-renames',
-                '--pretty=format:', f'{base_sha}..{branch_head}',
-                '--', ':!.task/',
-            ],
-            cwd=self.project_root,
-        )
+        cmd = [
+            'git', 'log', '--name-only', '--no-renames',
+            '--diff-merges=dense-combined',
+            '--pretty=format:', f'{base_sha}..{branch_head}',
+            '--', ':!.task/',
+        ]
+        try:
+            rc, output, stderr = await _run(cmd, cwd=self.project_root)
+        except Exception as exc:
+            return [], exc
         if rc != 0:
             logger.warning(
                 'get_files_touched_in_branch: git log %s..%s failed (rc=%s): %s',
                 base_sha, branch_head, rc, (stderr or '').strip()[:200],
             )
-            return []
-        seen: set[str] = set()
-        for ln in output.splitlines():
-            ln = ln.strip()
-            if ln:
-                seen.add(ln)
-        return sorted(seen)
+            return [], subprocess.CalledProcessError(rc, cmd, output=output, stderr=stderr)
+        return sorted({ln.strip() for ln in output.splitlines() if ln.strip()}), None
 
     async def get_branch_changed_files(
         self, ref: str,
@@ -16158,17 +16238,7 @@ class GitOps:
         full_old = f'{self.config.branch_prefix}{old_branch}'
         full_new = f'{self.config.branch_prefix}{new_branch}'
 
-        new_path.parent.mkdir(parents=True, exist_ok=True)
-
-        rc, _, err = await _run(
-            ['git', 'worktree', 'move', str(old_path), str(new_path)],
-            cwd=self.project_root,
-        )
-        if rc != 0:
-            raise RuntimeError(
-                f'rename_worktree: git worktree move {old_path} -> '
-                f'{new_path} failed (rc={rc}): {err}'
-            )
+        await self._move_registered_worktree(old_path, new_path)
 
         rc, _, err = await _run(
             ['git', 'branch', '-m', full_old, full_new],
@@ -16186,6 +16256,7 @@ class GitOps:
                 f'rename_worktree: git branch -m {full_old} -> {full_new} '
                 f'failed (rc={rc}): {err}'
             )
+        await self._carry_branch_records(full_old, full_new)
 
         logger.info(
             'Renamed worktree %s -> %s and branch %s -> %s',
@@ -16417,21 +16488,75 @@ class GitOps:
             return True
 
     async def quarantine_worktree(
-        self, worktree: Path, branch: str, reason: str,
-    ) -> Path | None:
+        self, worktree: Path, branch: str, reason: str, *, stored_title: str | None = None,
+    ) -> QuarantineOutcome:
         """Relocate a worktree (and its branch) into the quarantine base.
 
-        Best-effort: commits any uncommitted WIP first (so it is preserved on
-        the renamed branch), then moves the worktree to
-        ``quarantine_base/<branch>-<UTC-ts>`` and renames the branch to
-        ``task/<branch>-<ts>``.  Logs a WARNING and returns the destination
-        path, or ``None`` if the relocation could not complete.  **Never
-        raises** — callers treat a ``None`` return as "left in place".
+        *branch* may be a bare id (``42``) or a full ref (``task/42``): it is
+        normalized here, once, through
+        ``shared/src/shared/branch_names.py::bare_queued_branch_id``. The
+        worktree moves to ``quarantine_base/<bare>-<UTC-ts>``. The branch
+        ``<prefix><bare>`` is renamed to ``<prefix><bare>-<ts>`` unless ANOTHER
+        registered worktree holds it; the rule is the same whether the moved
+        worktree holds it, is detached, is on another branch, or is no longer
+        registered. ``outcome.branch`` is None only when no branch was parked.
+        WIP is committed only when the moved worktree holds the branch being
+        parked; any other checkout moves with its WIP intact. A dir git no
+        longer lists as a worktree is moved with a plain rename.
+
+        A relocation is recorded before this returns
+        (``orchestrator/src/orchestrator/quarantine_provenance.py::record_quarantine_provenance``):
+        the task's artifacts are copied into the parking, and the live task
+        plan gains a ``_quarantined_from`` entry, carrying *stored_title* (the
+        title an identity-mismatch caller read from the worktree) as evidence.
+        It reads the PRE-move *worktree* path, so it runs ahead of any caller
+        relocating a ``.task-meta`` root.
+
+        Logs a WARNING and returns the parking as a :class:`QuarantineOutcome`,
+        or ``NOT_RELOCATED`` if the relocation could not complete; a failed
+        move whose branch could not be renamed back returns a None ``dest``
+        naming the stranded ``branch``. **Never raises** — callers treat a
+        ``None`` ``dest`` as "left in place".
         """
-        dest_name = f'{branch}-{_utc_stamp()}'
-        dest_path = self.quarantine_base / dest_name
+        bare = bare_queued_branch_id(branch, self.config.branch_prefix)
+        parked = f'{bare}-{_utc_stamp()}'
+        dest_path = self.quarantine_base / parked
         try:
-            # Preserve uncommitted WIP on the branch before relocating.
+            parked_branch = await self._relocate_into_quarantine(
+                worktree, dest_path, bare, parked, reason=reason,
+            )
+        except Exception as e:
+            logger.warning(
+                'quarantine_worktree: failed to relocate %s (reason=%s): %s',
+                worktree, reason, e,
+            )
+            return await self._parked_outcome(None, _stranded_branch(e))
+        outcome = await self._parked_outcome(dest_path, parked_branch)
+        logger.warning(
+            'QUARANTINED worktree %s -> %s (reason=%s, parked branch=%s, '
+            'commits beyond main=%s)',
+            worktree, dest_path, reason, outcome.branch, outcome.unique_commit_count,
+        )
+        record_quarantine_provenance(worktree, bare, outcome, reason, stored_title=stored_title)
+        return outcome
+
+    async def _relocate_into_quarantine(
+        self, worktree: Path, dest: Path, bare: str, parked: str, *, reason: str,
+    ) -> str | None:
+        """Move *worktree* to *dest*, renaming branch ``<prefix><bare>`` to ``<prefix><parked>`` unless ANOTHER registered worktree holds it.
+
+        The rule is the same whether *worktree* holds the branch, is detached,
+        is on another branch, or is unregistered; WIP is committed only when
+        it holds the branch. Returns the parked full ref, or None when there
+        was no branch to park.
+        """
+        checkouts = await self._worktree_checkouts()
+        held = f'refs/heads/{self.config.branch_prefix}{bare}'
+        here = worktree.resolve()
+        held_elsewhere = any(
+            ref == held for path, ref in checkouts.items() if path != here
+        )
+        if checkouts.get(here) == held:
             try:
                 await self.commit(worktree, f'chore: quarantine WIP ({reason})')
             except Exception as e:
@@ -16439,18 +16564,142 @@ class GitOps:
                     'quarantine_worktree: WIP commit failed for %s (%s) — '
                     'continuing with relocation: %s', worktree, reason, e,
                 )
-            await self.rename_worktree(worktree, dest_path, branch, dest_name)
-            logger.warning(
-                'QUARANTINED worktree %s -> %s (reason=%s)',
-                worktree, dest_path, reason,
+        return await self._move_with_branch_parked(
+            bare, parked, rename_branch=not held_elsewhere,
+            move=(lambda: self._move_registered_worktree(worktree, dest)) if here in checkouts
+            else (lambda: self._rename_unregistered(worktree, dest, parked)),
+        )
+
+    async def _worktree_checkouts(self) -> dict[Path, str | None]:
+        """Every registered worktree's resolved path, mapped to its checked-out ref (None when detached); raises when git cannot list them."""
+        rc, out, err = await _run(
+            ['git', 'worktree', 'list', '--porcelain'], cwd=self.project_root,
+        )
+        if rc != 0:
+            raise RuntimeError(f'git worktree list failed (rc={rc}): {err}')
+        checkouts: dict[Path, str | None] = {}
+        current: Path | None = None
+        for line in out.splitlines():
+            if line.startswith('worktree '):
+                current = Path(line[len('worktree '):].strip()).resolve()
+                checkouts[current] = None
+            elif line.startswith('branch ') and current is not None:
+                checkouts[current] = line[len('branch '):].strip()
+        return checkouts
+
+    async def _move_registered_worktree(self, old_path: Path, new_path: Path) -> None:
+        new_path.parent.mkdir(parents=True, exist_ok=True)
+        rc, _, err = await _run(
+            ['git', 'worktree', 'move', str(old_path), str(new_path)],
+            cwd=self.project_root,
+        )
+        if rc != 0:
+            raise RuntimeError(
+                f'git worktree move {old_path} -> {new_path} failed (rc={rc}): {err}'
             )
-            return dest_path
+
+    async def _move_with_branch_parked(
+        self, bare: str, parked: str, *, rename_branch: bool,
+        move: Callable[[], Awaitable[None]],
+    ) -> str | None:
+        """Run *move*, renaming branch ``<prefix><bare>`` to ``<prefix><parked>`` first when *rename_branch* and it exists.
+
+        A failed *move* renames the branch back, so the two stay together. A
+        failed rename-back is logged naming the stranded parked ref, and
+        raises :class:`_ParkedBranchStranded` carrying it. Returns the parked
+        full ref, or None when no branch was renamed.
+        """
+        prefix = self.config.branch_prefix
+        full_old, full_new = f'{prefix}{bare}', f'{prefix}{parked}'
+        if not rename_branch or await self.resolve_branch_sha(full_old) is None:
+            await move()
+            return None
+        rc, _, err = await _run(['git', 'branch', '-m', full_old, full_new], cwd=self.project_root)
+        if rc != 0:
+            raise RuntimeError(f'git branch -m {full_old} -> {full_new} failed (rc={rc}): {err}')
+        try:
+            await move()
+        except BaseException as move_error:
+            if not await self._rename_branch_back(full_new, full_old) and isinstance(move_error, Exception):
+                raise _ParkedBranchStranded(full_new, move_error) from move_error
+            raise
+        await self._carry_branch_records(full_old, full_new)
+        return full_new
+
+    async def _rename_branch_back(self, parked: str, original: str) -> bool:
+        """Rename *parked* back to *original*; False, logging the work as STRANDED on *parked*, when git refuses."""
+        rc, _, err = await _run(['git', 'branch', '-m', parked, original], cwd=self.project_root)
+        if rc != 0:
+            logger.error(
+                'quarantine_worktree: move failed and the branch rename-back '
+                '%s -> %s failed too (rc=%s): %s — the work is STRANDED on %s',
+                parked, original, rc, err, parked,
+            )
+        return rc == 0
+
+    async def _rename_unregistered(self, worktree: Path, dest: Path, parked: str) -> None:
+        """Rename a dir ``git worktree move`` refuses (its admin entry is gone) to *dest*.
+
+        ``os.rename`` never copies: a cross-device *dest* fails rather than
+        duplicating a warm lane's build tree. The dir's gitfile is repointed
+        first (:meth:`_sever_parked_gitfile`) and restored if the move fails.
+        """
+        if dest.exists():
+            raise FileExistsError(f'quarantine destination {dest} already exists')
+        original_gitfile = await self._sever_parked_gitfile(worktree, parked)
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            os.rename(worktree, dest)
+        except OSError:
+            if original_gitfile is not None:
+                try:
+                    (worktree / '.git').write_text(original_gitfile)
+                except OSError as restore_error:
+                    logger.error(
+                        'quarantine_worktree: could not restore the gitfile of %s: %s',
+                        worktree, restore_error,
+                    )
+            raise
+
+    async def _sever_parked_gitfile(self, worktree: Path, parked: str) -> str | None:
+        """Repoint *worktree*'s ``.git`` gitfile at ``<common-dir>/worktrees/<parked>``, an admin entry git never creates.
+
+        An unregistered dir's gitfile still names its ORIGINAL admin entry,
+        which the next ``git worktree add`` at the same slot recreates; git in
+        the parking would then report and commit onto that live task's
+        checkout. Pointed at a parking-unique, absent entry, git there fails
+        closed (``not a git repository``). Returns the original gitfile text,
+        or None when there is no gitfile to repoint.
+        """
+        gitfile = worktree / '.git'
+        if not gitfile.is_file():
+            return None
+        rc, common_dir, err = await _run(
+            ['git', 'rev-parse', '--path-format=absolute', '--git-common-dir'],
+            cwd=self.project_root,
+        )
+        if rc != 0:
+            raise RuntimeError(f'git rev-parse --git-common-dir failed (rc={rc}): {err}')
+        original = gitfile.read_text()
+        gitfile.write_text(f'gitdir: {Path(common_dir.strip()) / "worktrees" / parked}\n')
+        return original
+
+    async def _parked_outcome(self, dest: Path | None, parked_branch: str | None) -> QuarantineOutcome:
+        """Describe where a quarantine left the work; never raises, so a moved lane is never reported as unmoved."""
+        if parked_branch is None:
+            return QuarantineOutcome(dest=dest)
+        try:
+            return QuarantineOutcome(
+                dest=dest,
+                branch=parked_branch,
+                tip_sha=await self.resolve_branch_sha(parked_branch),
+                unique_commit_count=await self.commits_beyond_main(parked_branch),
+            )
         except Exception as e:
             logger.warning(
-                'quarantine_worktree: failed to relocate %s (reason=%s): %s',
-                worktree, reason, e,
+                'quarantine_worktree: could not measure parked branch %s: %s', parked_branch, e,
             )
-            return None
+            return QuarantineOutcome(dest=dest, branch=parked_branch)
 
     async def park_prior_incarnation(
         self, branch_name: str, *, reason: str,
@@ -16467,20 +16716,21 @@ class GitOps:
         assigned = pool.assignment_for(branch_name) if pool is not None else None
         quarantined = await self._quarantine_cold_incarnation(branch_name, reason)
         parked_name = (
-            quarantined.name if quarantined is not None else f'{branch_name}-{_utc_stamp()}'
+            quarantined.dest.name if quarantined.dest is not None else f'{branch_name}-{_utc_stamp()}'
         )
-        if had_branch and quarantined is None:
+        parked_branch = quarantined.branch
+        if had_branch and parked_branch is None:
             await self._rename_branch_aside(branch_name, parked_name)
+            parked_branch = f'{prefix}{parked_name}'
         if assigned is not None:
             await self.release_warm_lane(assigned, branch_name)
         relocated = self._park_meta_roots(branch_name, parked_name)
         if not had_branch and assigned is None and not relocated:
             return None
-        parked_branch = f'{prefix}{parked_name}' if had_branch else None
         parked = ParkedIncarnation(
             parked_branch=parked_branch,
             parked_tip=await self.resolve_branch_sha(parked_branch) if parked_branch else None,
-            quarantined_worktree=str(quarantined) if quarantined is not None else None,
+            quarantined_worktree=str(quarantined.dest) if quarantined.dest is not None else None,
             relocated_meta_roots=tuple(relocated),
         )
         logger.warning(
@@ -16489,15 +16739,17 @@ class GitOps:
         )
         return parked
 
-    async def _quarantine_cold_incarnation(self, branch_name: str, reason: str) -> Path | None:
-        """Quarantine the registered cold worktree for *branch_name*, if any."""
+    async def _quarantine_cold_incarnation(
+        self, branch_name: str, reason: str,
+    ) -> QuarantineOutcome:
+        """Quarantine the registered cold worktree for *branch_name*; its ``dest`` is None only when none is registered."""
         cold = self.worktree_base / branch_name
         if not await self._is_registered_worktree(cold):
-            return None
-        dest = await self.quarantine_worktree(cold, branch_name, reason)
-        if dest is None:
+            return NOT_RELOCATED
+        outcome = await self.quarantine_worktree(cold, branch_name, reason)
+        if outcome.dest is None:
             raise RuntimeError(f'park_prior_incarnation: could not quarantine {cold}')
-        return dest
+        return outcome
 
     async def _rename_branch_aside(self, branch_name: str, parked_name: str) -> None:
         """Free any lane checkout of ``task/<branch_name>``, then rename it."""
@@ -16512,6 +16764,13 @@ class GitOps:
                 f'park_prior_incarnation: git branch -m {prefix}{branch_name} '
                 f'{prefix}{parked_name} failed (rc={rc}): {err}'
             )
+        await self._carry_branch_records(f'{prefix}{branch_name}', f'{prefix}{parked_name}')
+
+    async def _carry_branch_records(self, full_old: str, full_new: str) -> None:
+        """Re-key *full_old*'s stack-base and rebase-drop records to *full_new*,
+        its new name, so a branch re-cut under the old name starts with none."""
+        await self._stack_ledger().move_branch(full_old, full_new)
+        await RebaseDropLedger(self.project_root, _run).move_branch(full_old, full_new)
 
     async def _free_lane_checkout(self, branch_name: str) -> None:
         """Commit WIP on and detach the lane holding ``task/<branch_name>``.

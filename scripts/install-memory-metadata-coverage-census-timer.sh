@@ -19,7 +19,7 @@
 # the nightly timer owns, and would do it while an operator is watching the
 # install rather than the report. An operator who wants a look right now runs
 #
-#   uv run --frozen --project fused-memory python \
+#   uv run --no-sync --project fused-memory python \
 #       fused-memory/scripts/census_memory_metadata.py --top-n 400 --no-history
 #
 # which measures and reports the trend without entering it. See OPERATIONS.md

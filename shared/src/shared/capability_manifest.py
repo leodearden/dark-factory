@@ -8,7 +8,9 @@ accompanies a PRD's ``.capability-manifest.md`` (see
 field and of a producer task's ``metadata.delivered_checks``; the scheduler
 (orchestrator, task δ) is the canonical reader of ``metadata.delivered_checks``
 at the dispatch gate. :func:`sidecar_path` is the one home of the rule that
-derives a PRD's sidecar path from its PRD key.
+derives a PRD's sidecar path from its PRD key, :func:`sidecar_for` the one
+home of where that sidecar sits under a project root, and
+:func:`tracked_sidecar_paths` the one home of which sidecars git tracks there.
 
 This module also registers the ``metadata.delivered_checks`` sub-model with
 ``shared.task_metadata``'s W10 extension point
@@ -23,9 +25,11 @@ comment at the bottom of this module).
 
 from __future__ import annotations
 
+import os
 import re
+import subprocess
 from pathlib import Path
-from typing import Literal, get_args
+from typing import Final, Literal, get_args
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -35,17 +39,21 @@ from shared.task_metadata import ExternalDep, register_metadata_submodel
 __all__ = [
     'CHECK_SUBJECT_FIELD',
     'MECHANICAL_CHECK_KINDS',
+    'SIDECAR_SUFFIX',
     'CapabilityManifestDoc',
     'DeliveredCheck',
     'DeliveredCheckMeta',
     'ManifestCapability',
+    'ManifestDiscoveryUnavailable',
     'ManifestTask',
     'load_capability_manifest',
     'parse_capability_manifest',
+    'sidecar_for',
     'sidecar_path',
+    'tracked_sidecar_paths',
 ]
 
-_SIDECAR_SUFFIX = '.capability-manifest.yaml'
+SIDECAR_SUFFIX: Final = '.capability-manifest.yaml'
 
 
 def sidecar_path(prd_key: str) -> str:
@@ -53,7 +61,62 @@ def sidecar_path(prd_key: str) -> str:
 
     ``plans/x-prd.md`` → ``plans/x-prd.capability-manifest.yaml``.
     """
-    return re.sub(r'\.md$', '', prd_key) + _SIDECAR_SUFFIX
+    return re.sub(r'\.md$', '', prd_key) + SIDECAR_SUFFIX
+
+
+def sidecar_for(prd_path: object, project_root: str | os.PathLike[str]) -> str | None:
+    """The root-relative POSIX path of the sidecar commit_planning would open for *prd_path* under *project_root*.
+
+    ``None`` when *prd_path* is not a non-empty str, cannot be resolved (an
+    embedded NUL), or resolves outside the root; contract C3 of
+    ``plans/review-all-s20-cli-invocation-and-usage-gate-prd.md``.
+    """
+    if not isinstance(prd_path, str) or not prd_path:
+        return None
+    root = Path(project_root).resolve()
+    try:
+        resolved = (root / sidecar_path(prd_path)).resolve()
+    except ValueError:
+        return None
+    if not resolved.is_relative_to(root):
+        return None
+    return resolved.relative_to(root).as_posix()
+
+
+class ManifestDiscoveryUnavailable(RuntimeError):
+    """git could not list the tracked sidecars.
+
+    Raised rather than returning ``[]`` because an empty corpus and an
+    unlistable one must not look alike (``docs/legibility/design-invariants.md``,
+    no-silent-fail-soft).
+    """
+
+
+def tracked_sidecar_paths(project_root: str | os.PathLike[str], *, timeout: float = 30) -> list[str]:
+    """Sorted root-relative paths of every git-TRACKED sidecar under *project_root*.
+
+    Raises :class:`ManifestDiscoveryUnavailable` when git cannot be run, times
+    out, exits non-zero, or lists a path that is not UTF-8.
+    """
+    root = os.fspath(project_root)
+    try:
+        completed = subprocess.run(
+            ['git', '-C', root, 'ls-files', '-z', '--', f'*{SIDECAR_SUFFIX}'],
+            capture_output=True,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ManifestDiscoveryUnavailable(f'could not run git ls-files in {root}: {exc}') from exc
+    if completed.returncode != 0:
+        stderr = completed.stderr.decode('utf-8', errors='replace').strip()
+        raise ManifestDiscoveryUnavailable(
+            f'git ls-files failed in {root} (rc={completed.returncode}): {stderr or "no stderr"}'
+        )
+    try:
+        listing = completed.stdout.decode('utf-8')
+    except UnicodeDecodeError as exc:
+        raise ManifestDiscoveryUnavailable(f'git ls-files in {root} listed a non-UTF-8 path: {exc}') from exc
+    return sorted({p for p in listing.split('\0') if p})
 
 
 def _check_kind_conditional_fields(

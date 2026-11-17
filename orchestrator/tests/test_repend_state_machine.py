@@ -861,7 +861,7 @@ class TestReblockGuardB11B12:
         set_status_calls: list = []
         original_set = harness.scheduler.set_task_status
 
-        async def spy_set(task_id, status, **kw):  # noqa: F841
+        async def spy_set(task_id, status, **kw):
             set_status_calls.append(status)
             await original_set(task_id, status, **kw)
 
@@ -930,7 +930,7 @@ class TestReblockGuardB11B12:
         set_status_calls: list = []
         original_set = harness.scheduler.set_task_status
 
-        async def spy_set(task_id, status, **kw):  # noqa: F841
+        async def spy_set(task_id, status, **kw):
             set_status_calls.append(status)
             await original_set(task_id, status, **kw)
 

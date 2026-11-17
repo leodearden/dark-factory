@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import re
 from collections.abc import Callable, Mapping
+from pathlib import Path
 
 import httpx
 
@@ -316,6 +317,33 @@ def _project(row: dict, fields: list[str]) -> dict:
         metadata = row.get('metadata') or {}
         projected['metadata'] = {key: metadata[key] for key in metadata_keys if key in metadata}
     return projected
+
+
+class ByRoot:
+    """One canned substrate per project root, routed by the read's ``project_root``.
+
+    Keyed by the root's directory name, which is the project label the
+    dashboard derives for it. ``get_external_statuses`` names no root: it
+    answers each ``project:id`` dep from the substrate labelled ``project``,
+    flat, with fused-memory's ``unknown_project`` / ``unknown_task`` sentinels
+    for one no substrate holds.
+    """
+
+    def __init__(self, by_label: Mapping[str, CannedMCP]) -> None:
+        self._by_label = by_label
+
+    async def __call__(self, client, url, tool, args, **kwargs):
+        if tool == 'get_external_statuses':
+            return {dep: self._external_status(dep) for dep in args['deps']}
+        substrate = self._by_label[Path(args['project_root']).name]
+        return await substrate(client, url, tool, args, **kwargs)
+
+    def _external_status(self, dep: str) -> str:
+        label, _, task_id = dep.partition(':')
+        substrate = self._by_label.get(label)
+        if substrate is None:
+            return 'unknown_project'
+        return substrate.status_map.get(int(task_id), 'unknown_task')
 
 
 def _raw_row(task_id, status, **overrides) -> dict:

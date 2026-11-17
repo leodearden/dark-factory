@@ -4,7 +4,7 @@ Contract: plans/follow-up-filing-shape-prd.md §4.2 and §3 decisions 6-8. ``sub
 record once, ``basis='submit'``. ``basis='combine'`` is reserved for the curator-combine re-stamp
 that task 8415 adds in ``_execute_combine``; nothing else may add, alter or remove it. An absent key
 (a task filed before the stamp existed) means no information, never ``'undeclared'``. The modules
-allowed to import this one are pinned by ``shared/tests/test_declared_scope_readers.py``.
+allowed to import this one are pinned by ``tests/repo_guards/test_declared_scope_readers.py``.
 """
 
 from __future__ import annotations

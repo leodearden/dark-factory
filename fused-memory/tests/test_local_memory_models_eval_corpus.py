@@ -216,7 +216,7 @@ class TestPayloadKind:
         fail in the change that makes it, not later when the next corpus build
         refuses the ``add_episode`` kind it would land in.
         """
-        from fused_memory.backends.graphiti_client import GraphitiBackend  # noqa: PLC0415
+        from fused_memory.backends.graphiti_client import GraphitiBackend
 
         class _RecordingClient:
             def __init__(self):
@@ -1065,7 +1065,7 @@ class TestNoGraphitiDriverIsConstructed:
         no-index evidence owned by docs/prds/falkordb-index-provisioning.md. So
         the test makes construction fatal and asserts the fetch still succeeds.
         """
-        from graphiti_core.driver import falkordb_driver  # noqa: PLC0415
+        from graphiti_core.driver import falkordb_driver
 
         def _boom(*args, **kwargs):
             raise AssertionError(
@@ -3786,7 +3786,7 @@ def test_live_population_read_smoke(monkeypatch):
     month span and window start are printed in the build's report
     (``build_corpus.render_report``), and no automated check asserts them.
     """
-    from graphiti_core.driver import falkordb_driver  # noqa: PLC0415
+    from graphiti_core.driver import falkordb_driver
 
     def _boom(*args, **kwargs):
         raise AssertionError(

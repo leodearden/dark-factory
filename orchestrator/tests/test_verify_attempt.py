@@ -30,7 +30,7 @@ class TestCheckRun:
     """
 
     def test_fields_exposed(self):
-        from orchestrator.verify import CheckRun  # noqa: PLC0415
+        from orchestrator.verify import CheckRun
 
         run = CheckRun(
             label='test',
@@ -50,7 +50,7 @@ class TestCheckRun:
         assert run.duration_secs == 1.5
 
     def test_skipped_classmethod(self):
-        from orchestrator.verify import CheckRun  # noqa: PLC0415
+        from orchestrator.verify import CheckRun
 
         run = CheckRun.skipped('lint')
         assert run.label == 'lint'
@@ -62,7 +62,7 @@ class TestCheckRun:
         assert run.duration_secs == 0.0
 
     def test_to_dict_schema_keys_exact(self):
-        from orchestrator.verify import CheckRun  # noqa: PLC0415
+        from orchestrator.verify import CheckRun
 
         run = CheckRun(
             label='test',
@@ -80,7 +80,7 @@ class TestCheckRun:
         }
 
     def test_to_dict_started_at_passthrough_when_not_none(self):
-        from orchestrator.verify import CheckRun  # noqa: PLC0415
+        from orchestrator.verify import CheckRun
 
         run = CheckRun(
             label='test', cmd='uv run pytest', rc=0, output='',
@@ -95,13 +95,13 @@ class TestCheckRun:
         ``None``, so ``_persist_attempt_logs``/``_build_summary_payload``
         (which write it straight into JSON) see the same shape as before.
         """
-        from orchestrator.verify import CheckRun  # noqa: PLC0415
+        from orchestrator.verify import CheckRun
 
         run = CheckRun.skipped('lint')
         assert run.to_dict()['started_at'] == ''
 
     def test_to_dict_all_values_roundtrip(self):
-        from orchestrator.verify import CheckRun  # noqa: PLC0415
+        from orchestrator.verify import CheckRun
 
         run = CheckRun(
             label='type', cmd='uv run pyright', rc=2, output='err',
@@ -191,7 +191,7 @@ class TestCheckRunSegments:
 
     def test_segments_defaults_to_none(self):
         """Every pre-3338 construction site stays valid — it is the LAST field."""
-        from orchestrator.verify import CheckRun  # noqa: PLC0415
+        from orchestrator.verify import CheckRun
 
         run = CheckRun(
             label='test',
@@ -207,7 +207,7 @@ class TestCheckRunSegments:
 
     def test_skipped_leaves_segments_none(self):
         """A module_config skip ran no command at all, so it ran no segments."""
-        from orchestrator.verify import CheckRun  # noqa: PLC0415
+        from orchestrator.verify import CheckRun
 
         assert CheckRun.skipped('test').segments is None
 
@@ -219,7 +219,7 @@ class TestCheckRunSegments:
         JSON, so anything that needs its own serialisation step is a second
         place for the shape to drift.
         """
-        from orchestrator.verify import CheckRun  # noqa: PLC0415
+        from orchestrator.verify import CheckRun
 
         segments = [
             {
@@ -283,7 +283,7 @@ class TestCheckRunLoad:
 
     def test_load_defaults_to_none(self):
         """Every pre-3353 construction site stays valid — it is the LAST field."""
-        from orchestrator.verify import CheckRun  # noqa: PLC0415
+        from orchestrator.verify import CheckRun
 
         run = CheckRun(
             label='test',
@@ -299,7 +299,7 @@ class TestCheckRunLoad:
 
     def test_load_is_positionally_last(self):
         """`segments` keeps its slot, so a positional caller passing it still works."""
-        from orchestrator.verify import CheckRun  # noqa: PLC0415
+        from orchestrator.verify import CheckRun
 
         run = CheckRun('test', 'cmd', 0, '', False, 'ts', 1.5, [{'index': 1}])
         assert run.segments == [{'index': 1}]
@@ -307,13 +307,13 @@ class TestCheckRunLoad:
 
     def test_skipped_leaves_load_none(self):
         """A module_config skip ran no command, so it ran under no load."""
-        from orchestrator.verify import CheckRun  # noqa: PLC0415
+        from orchestrator.verify import CheckRun
 
         assert CheckRun.skipped('test').load is None
         assert CheckRun.skipped('test').to_dict()['load'] is None
 
     def test_load_round_trips_through_to_dict_unchanged(self):
-        from orchestrator.verify import CheckRun  # noqa: PLC0415
+        from orchestrator.verify import CheckRun
 
         load = {
             'start': {'cpu_some10': 2.5, 'cpu_some60': 1.8, 'runqueue_ratio': 0.75},
@@ -333,7 +333,7 @@ class TestCheckRunLoad:
 
 def _run(label, rc=0, timed_out=False, cmd='cmd', output='', started_at='ts', duration_secs=1.0):
     """Build a CheckRun with sane defaults, overriding only what a case cares about."""
-    from orchestrator.verify import CheckRun  # noqa: PLC0415
+    from orchestrator.verify import CheckRun
 
     return CheckRun(
         label=label, cmd=cmd, rc=rc, output=output, timed_out=timed_out,
@@ -353,7 +353,7 @@ class TestVerifyAttempt:
 
     def test_all_passing_including_a_skipped_check(self):
         """(a) Three rc=0 legs, one of them skipped -> clean pass, no timeout signal."""
-        from orchestrator.verify import CheckRun, VerifyAttempt  # noqa: PLC0415
+        from orchestrator.verify import CheckRun, VerifyAttempt
 
         attempt = VerifyAttempt(checks=[
             _run('test', rc=0),
@@ -370,7 +370,7 @@ class TestVerifyAttempt:
         means `timed_out=(not passed and pure_timeout_failure)` can never be
         False while this is classified as a pure timeout (the 2048 drift
         this task removes structurally)."""
-        from orchestrator.verify import VerifyAttempt  # noqa: PLC0415
+        from orchestrator.verify import VerifyAttempt
 
         attempt = VerifyAttempt(checks=[
             _run('test', rc=1, timed_out=True),
@@ -385,7 +385,7 @@ class TestVerifyAttempt:
         """(c) test has a REAL (non-timeout) failure; type times out ->
         pure_timeout_failure must be False, since not every non-zero rc is
         attributable to a timeout."""
-        from orchestrator.verify import VerifyAttempt  # noqa: PLC0415
+        from orchestrator.verify import VerifyAttempt
 
         attempt = VerifyAttempt(checks=[
             _run('test', rc=1, timed_out=False),
@@ -398,7 +398,7 @@ class TestVerifyAttempt:
     def test_lint_only_pure_timeout(self):
         """(d) A single-check attempt where that lone check timed out is
         still a pure timeout."""
-        from orchestrator.verify import VerifyAttempt  # noqa: PLC0415
+        from orchestrator.verify import VerifyAttempt
 
         attempt = VerifyAttempt(checks=[_run('lint', rc=1, timed_out=True)])
         assert attempt.pure_timeout_failure is True
@@ -409,7 +409,7 @@ class TestVerifyAttempt:
         by run_verification as `[c.label for c in attempt.checks if
         c.timed_out]`) preserves `checks` order rather than e.g. sorting or
         dropping duplicates."""
-        from orchestrator.verify import VerifyAttempt  # noqa: PLC0415
+        from orchestrator.verify import VerifyAttempt
 
         attempt = VerifyAttempt(checks=[
             _run('test', rc=1, timed_out=True),
@@ -426,7 +426,7 @@ class TestVerifyAttempt:
         construction a future caller could make) must fail loudly on
         `.test` rather than raising a bare StopIteration from the
         underlying `next()` call."""
-        from orchestrator.verify import VerifyAttempt  # noqa: PLC0415
+        from orchestrator.verify import VerifyAttempt
 
         attempt = VerifyAttempt(checks=[_run('lint', rc=0)])
         with pytest.raises(KeyError, match="no check labeled 'test'"):
@@ -437,7 +437,7 @@ class TestVerifyAttempt:
         the per-leg consumer sites (env-recovery, _summarize_checks call
         sites, xdist gate, VerifyResult construction) read through these
         instead of the old parallel scalar locals."""
-        from orchestrator.verify import VerifyAttempt  # noqa: PLC0415
+        from orchestrator.verify import VerifyAttempt
 
         test_run = _run('test', cmd='uv run pytest')
         lint_run = _run('lint', cmd='uv run ruff')

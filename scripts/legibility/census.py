@@ -64,6 +64,7 @@ from legibility import (  # noqa: E402
     layout,
     session_ledger,
     session_runner,
+    sighting_fit,
     synthesis,
     task_store,
     unlanded,
@@ -415,7 +416,7 @@ def main(argv: list[str] | None = None, *, poster: alarm.Poster | None = None) -
 
     try:
         cfg = config.load_config(config_path)
-    except Exception as exc:  # noqa: BLE001 - a broken/missing config fails loud at CLI startup
+    except Exception as exc:  # a broken/missing config fails loud at CLI startup
         print(f"census: failed to load config at {config_path}: {exc}", file=sys.stderr)
         return 1
 
@@ -530,6 +531,9 @@ def _run_configured_census(
                     census_headroom.preflight_headroom, verify_invoke, model=cfg.models.trickle,
                 ),
             ),
+            # A pure classifier over text in its prompt, so it rides the
+            # mining stage; the census_verify model is passed per call.
+            fit_fn=sighting_fit.build_fit_fn(mining_invoke),
             synthesize_fn=build_synthesize_fn(synthesis_invoke),
             embedder=embeddings.Embedder(
                 embed_fn=embeddings.openai_embed, cache_path=embeddings.cache_path(cfg.project_id),

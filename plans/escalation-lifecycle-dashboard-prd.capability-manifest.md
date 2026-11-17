@@ -87,6 +87,8 @@ decompose 2026-07-16). Machine-readable twin:
 
 ## η₀–η₃ — perf predicates (immediate, +30d, +90d, +180d)
 
+Sidecar blocks: η0 (task 2663, immediate), η1 (task 2664, +30d), η2 (task 2665, +90d), η3 (task 2666, +180d). The first two bullets below are their sidecar capabilities: η0 carries `perf-script-committed-executable`, and η1, η2 and η3 each carry `milestone-predicate-machinery`.
+
 - **milestone-predicate-machinery** — capability→producer (wired) —
   grep:shared/src/shared/task_metadata.py:222 `class Milestone`, :58
   `kind: Literal['deploy', 'predicate']`; submit-time script validation

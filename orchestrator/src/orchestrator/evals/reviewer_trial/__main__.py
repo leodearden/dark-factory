@@ -661,7 +661,7 @@ def mine(
                         item.diff_text, model=model, description=description,
                         oauth_token=oauth_token, max_turns=max_turns,
                     )
-                except Exception as exc:  # noqa: BLE001 -- offline generation script; one bad candidate must not sink the batch
+                except Exception as exc:  # offline generation script; one bad candidate must not sink the batch
                     logging.getLogger(__name__).warning(
                         'propose_labels_frontier failed for task %s: %s', candidate.task_id, exc,
                     )

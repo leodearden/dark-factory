@@ -72,7 +72,10 @@ async def test_startup_recovery_leaves_a_merge_worker_held_spec_lane_assigned(
     assert any('_merge-verify' in m for m in infos), infos
     assert any(lane.name in m for m in infos), infos
 
-    lane2, warm2 = await git_ops.acquire_spec_lane(head)
-    assert lane2 != lane
-    assert warm2 is False
+    others = [await git_ops.acquire_spec_lane(head) for _ in range(spec_pool.size - 1)]
+    assert all(warm for _, warm in others)
+    assert lane not in {other for other, _ in others}
+    overflow, overflow_warm = await git_ops.acquire_spec_lane(head)
+    assert overflow != lane
+    assert overflow_warm is False
     assert spec_pool.is_assigned(lane)

@@ -168,6 +168,14 @@ def _seed_resolved_gate(queue: EscalationQueue, task_id: str) -> Escalation:
     return esc
 
 
+def _runnable_script(directory: Path, name: str = 'restart-deploy.sh') -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    script = directory / name
+    script.write_text('#!/bin/sh\nexit 0\n')
+    script.chmod(0o755)
+    return script
+
+
 def _deploy_task(
     task_id: str = '200',
     target_unit: str | None = 'orchestrator-reify.service',
@@ -5455,9 +5463,9 @@ class TestFileMilestoneGateSkipsRedundantEscalatedAdvance:
         assert illegal_escs == []
 
     async def test_pure_gate_path_unchanged(self, tmp_path: Path) -> None:
-        """Parity fence (GREEN before AND after the step-2 fix): the pure-gate
-        (before_done=None) branch is byte-unchanged by this task's guard,
-        which is confined to the before_done-is-not-None deploy path."""
+        """Parity fence (GREEN before AND after the step-2 fix): the task-4048
+        deploy guard leaves the pure-gate (before_done=None) arm untouched; the
+        guard is confined to the before_done-is-not-None deploy path."""
         from orchestrator.deterministic_runner import DeterministicRunner
         from orchestrator.workflow import WorkflowOutcome
 
@@ -5474,7 +5482,9 @@ class TestFileMilestoneGateSkipsRedundantEscalatedAdvance:
         assert scheduler.update_task.call_count == 1
         call = scheduler.update_task.call_args
         assert call.args[0] == '4048'
-        assert set(call.args[1].keys()) == {'gate_escalated_at'}
+        assert set(call.args[1].keys()) == {
+            'gate_escalated_at', 'gate_escalated_preconditions',
+        }
         assert call.args[1]['gate_escalated_at']
         assert call.kwargs.get('metadata_mode') == 'merge'
 
@@ -7915,7 +7925,7 @@ class TestDefaultScheduleDetachedRestart:
         runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
 
         before_done = {
-            'script': '/usr/local/bin/restart-deploy.sh',
+            'script': str(_runnable_script(tmp_path / 'bin')),
             'args': [],
             'target_unit': 'orchestrator-reify.service',
         }
@@ -7945,7 +7955,7 @@ class TestDefaultScheduleDetachedRestart:
         runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
 
         before_done = {
-            'script': '/usr/local/bin/restart-deploy.sh',
+            'script': str(_runnable_script(tmp_path / 'bin')),
             'args': [],
             'target_unit': 'orchestrator-reify.service',
         }
@@ -7978,8 +7988,9 @@ class TestDefaultScheduleDetachedRestart:
         queue = EscalationQueue(tmp_path)
         runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
 
+        script = _runnable_script(tmp_path / 'bin')
         before_done = {
-            'script': '/usr/local/bin/restart-deploy.sh',
+            'script': str(script),
             'args': [],
             'target_unit': 'orchestrator-reify.service',
         }
@@ -7997,7 +8008,7 @@ class TestDefaultScheduleDetachedRestart:
             str(a) for call in mock_exec.call_args_list for a in call.args
         )
         assert '--collect' in all_argv, f'--collect must appear in argv: {all_argv!r}'
-        assert '/usr/local/bin/restart-deploy.sh' in all_argv, (
+        assert str(script) in all_argv, (
             f'payload script must appear in argv: {all_argv!r}'
         )
 
@@ -8020,7 +8031,7 @@ class TestDefaultScheduleDetachedRestart:
         runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
 
         before_done = {
-            'script': '/usr/local/bin/restart-deploy.sh',
+            'script': str(_runnable_script(tmp_path / 'bin')),
             'args': [],
             'target_unit': 'orchestrator-reify.service',
         }
@@ -8253,7 +8264,7 @@ class TestDefaultScheduleDetachedRestart:
         runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
 
         before_done = {
-            'script': '/usr/local/bin/restart-deploy.sh',
+            'script': str(_runnable_script(tmp_path / 'bin')),
             'args': [],
             'target_unit': 'orchestrator-reify.service',
         }
@@ -8283,7 +8294,7 @@ class TestDefaultScheduleDetachedRestart:
         runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
 
         before_done = {
-            'script': '/usr/local/bin/restart-deploy.sh',
+            'script': str(_runnable_script(tmp_path / 'bin')),
             'args': [],
             'target_unit': 'orchestrator-reify.service',
         }
@@ -8315,7 +8326,7 @@ class TestDefaultScheduleDetachedRestart:
         runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
 
         before_done = {
-            'script': '/usr/local/bin/restart-deploy.sh',
+            'script': str(_runnable_script(tmp_path / 'bin')),
             'args': [],
             'target_unit': 'orchestrator-reify.service',
         }
@@ -8354,7 +8365,7 @@ class TestDefaultScheduleDetachedRestart:
         runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
 
         before_done = {
-            'script': '/usr/local/bin/restart-deploy.sh',
+            'script': str(_runnable_script(tmp_path / 'bin')),
             'args': [],
             'target_unit': 'orchestrator-reify.service',
         }
@@ -8512,12 +8523,18 @@ class TestDetachedRestartWorkingDirectory:
         from orchestrator.deterministic_runner import DeterministicRunner
 
         queue = EscalationQueue(tmp_path)
-        runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
+        project_root = (tmp_path / 'project').resolve()
+        _runnable_script(project_root / 'scripts', 'restart-all-orchestrators.sh')
+        working_dir = (tmp_path / 'working-dir').resolve()
+        working_dir.mkdir()
+        scheduler = MagicMock()
+        scheduler.config.project_root = project_root
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
 
         before_done = {
             'script': 'scripts/restart-all-orchestrators.sh',
             'args': [],
-            'cwd': '/home/leo/src/dark-factory',
+            'cwd': str(working_dir),
             'target_unit': 'orchestrator-dark-factory.service',
         }
         mock_proc = self._make_mock_proc()
@@ -8532,7 +8549,7 @@ class TestDetachedRestartWorkingDirectory:
 
         argv = mock_exec.call_args_list[0].args
         all_argv = ' '.join(str(a) for a in argv)
-        assert '--working-directory=/home/leo/src/dark-factory' in all_argv, (
+        assert f'--working-directory={working_dir}' in all_argv, (
             f'--working-directory must be set from before_done["cwd"]: {all_argv!r}'
         )
         assert argv[-3] == '/bin/sh' and argv[-2] == '-c', (
@@ -8552,6 +8569,7 @@ class TestDetachedRestartWorkingDirectory:
 
         queue = EscalationQueue(tmp_path)
         project_root = (tmp_path / 'project').resolve()
+        _runnable_script(project_root / 'scripts', 'restart-all-orchestrators.sh')
         scheduler = MagicMock()
         scheduler.config.project_root = project_root
         runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
@@ -8594,10 +8612,13 @@ class TestDetachedRestartWorkingDirectory:
         queue = EscalationQueue(tmp_path)
         runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
 
+        script = _runnable_script((tmp_path / 'bin').resolve())
+        cwd = (tmp_path / 'working-dir').resolve()
+        cwd.mkdir()
         before_done = {
-            'script': '/usr/local/bin/restart-deploy.sh',
+            'script': str(script),
             'args': [],
-            'cwd': '/home/leo/src/dark-factory',
+            'cwd': str(cwd),
             'target_unit': 'orchestrator-reify.service',
         }
         mock_proc = self._make_mock_proc()
@@ -8612,10 +8633,10 @@ class TestDetachedRestartWorkingDirectory:
 
         argv = mock_exec.call_args_list[0].args
         wrapped = argv[-1]
-        assert wrapped.startswith('/usr/local/bin/restart-deploy.sh'), (
+        assert wrapped.startswith(str(script)), (
             f'an absolute script must be embedded unchanged, leading the payload: {wrapped!r}'
         )
-        assert '/home/leo/src/dark-factory/usr/local/bin/restart-deploy.sh' not in wrapped, (
+        assert f'{cwd}{script}' not in wrapped, (
             f'absolute script must not be double-joined under cwd: {wrapped!r}'
         )
 
@@ -8651,7 +8672,7 @@ class TestDetachedRestartDelegatesToRestartPlan:
         runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
 
         before_done = {
-            'script': '/usr/local/bin/restart-deploy.sh',
+            'script': str(_runnable_script(tmp_path / 'bin')),
             'args': ['--flag'],
             'cwd': '/home/leo/src/dark-factory',
             'target_unit': 'orchestrator-reify.service',
@@ -8703,7 +8724,7 @@ class TestDetachedRestartDelegatesToRestartPlan:
         runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
 
         before_done = {
-            'script': '/usr/local/bin/restart-deploy.sh',
+            'script': str(_runnable_script(tmp_path / 'bin')),
             'args': [],
             'target_unit': 'orchestrator-reify.service',
         }
@@ -8736,7 +8757,7 @@ class TestDetachedRestartDelegatesToRestartPlan:
         runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
 
         before_done = {
-            'script': '/usr/local/bin/restart-deploy.sh',
+            'script': str(_runnable_script(tmp_path / 'bin')),
             'args': [],
             'target_unit': 'orchestrator-reify.service',
         }
@@ -8766,7 +8787,7 @@ class TestDetachedRestartDelegatesToRestartPlan:
         runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
 
         before_done = {
-            'script': '/usr/local/bin/restart-deploy.sh',
+            'script': str(_runnable_script(tmp_path / 'bin')),
             'args': [],
             'target_unit': 'orchestrator-reify.service',
         }
@@ -8800,8 +8821,9 @@ class TestDetachedRestartDelegatesToRestartPlan:
         queue = EscalationQueue(tmp_path)
         runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
 
+        script = _runnable_script(tmp_path / 'bin')
         before_done = {
-            'script': '/usr/local/bin/restart-deploy.sh',
+            'script': str(script),
             'args': [],
             'cwd': '/home/leo/src/dark-factory',
             'target_unit': 'orchestrator-reify.service',
@@ -8833,7 +8855,7 @@ class TestDetachedRestartDelegatesToRestartPlan:
             f'expected a /bin/sh -c wrapper payload, got {argv!r}'
         )
         wrapped = argv[-1]
-        assert '/usr/local/bin/restart-deploy.sh' in wrapped
+        assert str(script) in wrapped
         assert '-ne 0' in wrapped, f'escalation must be gated behind a non-zero exit check: {wrapped!r}'
         assert 'escalation' in wrapped and 'submit' in wrapped
 
@@ -11444,6 +11466,7 @@ class TestSelfTargetRestartCarriesBeforeDoneEnv:
 
         task = _deploy_task(
             task_id='8598', target_unit='orchestrator-reify.service', env=env,
+            script=str(_runnable_script(tmp_path / 'bin')),
         )
         scheduler = _mock_scheduler(task)
         queue = EscalationQueue(tmp_path)

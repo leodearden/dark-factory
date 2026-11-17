@@ -211,3 +211,85 @@ multiply cache misses.
 All are left to operator task 8955, which installs `mimo` on the orchestrator
 host and runs the paired `-mimocode` / `-endpoint` eval cells. Until task 8955
 is done, the arm is built and awaiting its live run, not measured.
+
+## 2026-11-13 live run (task 8955)
+
+Operator gate esc-8955-2, run on main `a2377e8699`. Logs, result summaries
+and the probe scripts are in `/tmp/gate-8955/`, which is volatile.
+
+**Install.** The archive's sha256 matched
+`3793d8b0…ee1d9a5e`. It holds one file, `mimo`, a Bun 1.3.14
+single-executable with sha256
+`09245de5a046a664ad3ed3b0ebda8a4c684a1b1f6b9b14e81754572c974be8c4`. It is installed as `~/.local/bin/mimo`, and
+`mimo --version` prints `0.1.16`, under `env -i` as well.
+
+**.env walk: none.** ZCode (task 9541) loaded the first `.env` above its
+cwd. MiMo Code loads no `.env`, neither from its cwd nor from a parent. The
+canary was `XDG_CONFIG_HOME` in the `.env`, because `mimo debug paths` echoes
+it back:
+
+- `.env` in the parent dir: not read.
+- `.env` in the cwd: not read.
+- `XDG_CONFIG_HOME` passed explicitly: echoed. This is the positive control.
+- An env-dumping `rg` on PATH, which `mimo debug rg files` spawned, received
+  mimo's own `MIMOCODE_*` variables but no canary, in both layouts.
+
+The binary carries Bun's `--compile-autoload-dotenv` option text and Effect's
+`ConfigProvider.fromDotEnv`, but nothing at runtime acts on either. In the
+two live MiMo Code cells, 106 `/proc` samples of `mimo` and its children
+(`HOME=/tmp/mimo-home-*`) carried 0 secret names. The eval CLI's own verify
+subprocesses still carry the whole `.env`, which tasks 6828 and 7649 track.
+
+**Endpoint facts.** These come from a direct probe of
+`https://token-plan-ams.xiaomimimo.com/v1/chat/completions`
+(`/tmp/gate-8955/v1-probe.jsonl`), plus the cells.
+
+| question | answer |
+|---|---|
+| Does the `tp-` key answer on `/v1`? | **Yes.** The ams region returned 200 for both `mimo-v2.6-pro` and `mimo-v2.6-flash`, and both MiMo Code cells completed through it. |
+| Does `completion_tokens` include `reasoning_tokens`? | **Yes.** `total_tokens` = `prompt_tokens` + `completion_tokens`. One flash call: completion 22, of which `completion_tokens_details.reasoning_tokens` 17, for the 3-character answer "289". MiMo Code's subtraction and the arm's `output + reasoning` are therefore correct. |
+| Do cache hits arrive as `prompt_tokens_details.cached_tokens`? | **Yes.** Three identical pro calls with an 8,550-token prompt read 0, then 8448, then 8448. `prompt_tokens` stayed 8550, so it includes the cached part. Two flash repeats read 0 and 0, so a hit is not guaranteed; the calls were answered by different `MiFE` front ends. |
+| Is the 0.8 off-peak coefficient still live? | **Documented, not observable.** The price page, updated 2026-10-21, still lists 0.8x from 00:00 to 08:00 Beijing time (16:00–24:00 UTC). Neither the responses nor their headers carry credits. All cells ran from 18:32 to 23:34Z, inside that window. |
+| What does quota exhaustion return? | **Not reached.** No 429 or quota response appeared in 4 cells and 5 direct calls: 272/272 bridged `/v1/messages` calls returned 200. The docs say only that the service is suspended. Task 7994 still needs the real status and body. |
+
+**Paired cells.** Fixture `df_task_12`, `--timeout 180`, run sequentially.
+Every cell has `outcome=done`, `role_under_test=implementer`, a scoring
+verify that is green on tests, lint and types, `cap_tainted=false` and
+`invocation_errors=null`.
+
+| arm | impl wall | impl turns | total turns | in / out | cache read / create | cost_usd | debug | review verdict | composite |
+|---|---|---|---|---|---|---|---|---|---|
+| pro-mimocode `804dae3d` | 3m45s | 33 | 72 | 221,131 / 22,438 | 3,472,651 / 132,540 | 0.1157 | 2 | PASS, 6 suggestions | 0.90 |
+| pro-endpoint `8e83c100` | 14m16s | 31 | 92 | 96,264 / 29,222 | 2,938,992 / 105,505 | 0.0673 | 1 | ISSUES_FOUND, 0 blocking, 5 suggestions | 0.95 |
+| flash-mimocode `0dd5e13c` | 3m36s | 37 (+20 in a review fix) | 103 | 168,088 / 50,700 | 6,070,235 / 148,677 | 0.0377 | 1 | cycle 1: 1 blocking (tests patch private `_run_cmd`); cycle 2: ISSUES_FOUND, 0 blocking, 4 suggestions | 0.95 |
+| flash-endpoint `9a48a423` | 43m29s | 57 | 101 | 4,924 / 29,534 | 4,196,141 / 133,798 | 0.0090 | 1 | PASS, 5 suggestions | 0.95 |
+
+How to read the table:
+
+- **Metrics are summed over every role**, including the Claude judge
+  (sonnet) and the reviewer (opus). That follows
+  `orchestrator/src/orchestrator/workflow.py` metrics accumulation and
+  `orchestrator/src/orchestrator/evals/runner.py::run_eval`. So `turns`,
+  the tokens and `cost_usd` are not the implementer's own figures.
+- **The MiMo Code arm's own `cache.write` is 0 over OpenAI**, as section (f)
+  says. The non-null `cache_create_tokens` in the two `-mimocode` rows comes
+  from the Claude roles. The acceptance check "non-null" passes, but it does
+  not exercise the arm.
+- **`cost_usd` prices uncached input and output at the MiMo list rate and
+  drops cache reads**, the same as gate 8939's finding 1. It also prices the
+  Claude roles' tokens at MiMo rates, so it supports no comparison.
+- **Every cell's task-gate verify was red** on fixture noise: lint scripts
+  missing at `pre_task_commit`, and `mem0`/`graphiti_core` import errors.
+  Each cell paid 1 or 2 debugger cycles to work around it, and every arm
+  copied about 2.1k lines of lint scripts from main. Turns and diff size
+  therefore do not compare across arms.
+- **The `-endpoint` control runs Claude Code through `shared.vllm_bridge`.**
+  `shared/src/shared/cli_invoke.py` starts the bridge for any
+  `ANTHROPIC_BASE_URL`. The bridge forces `stream=False` and clamps
+  `max_tokens` from 32000 to 8192, because no `max_model_len` is discovered.
+  So the control is not the plain vendor `/anthropic` path. This was
+  equally true of gate 8939's GLM control.
+
+**Still not established:** the quota-exhaustion response, the `mimo export`
+size on a long run (the largest here was 339 KB), and the checkpoint-writer
+case under a large context.

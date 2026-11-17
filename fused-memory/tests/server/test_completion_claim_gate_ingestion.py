@@ -31,10 +31,16 @@ import subprocess
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import pytest_asyncio
 from _distinct_git_repo import init_distinct_git_repo
+from _out_of_band_task_writes import write_task_out_of_band
+from _task_facts_rows import task_facts_rows
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
-from fused_memory.middleware.task_interceptor import TicketStoreNotConfiguredError
+from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
+from fused_memory.config.schema import TaskmasterConfig
+from fused_memory.middleware.task_interceptor import TaskInterceptor, TicketStoreNotConfiguredError
+from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.server.tools import create_mcp_server
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
@@ -64,12 +70,12 @@ def _server(
 ):
     """Build a hermetic server whose task_interceptor answers `statuses`.
 
-    `statuses` is the string-keyed {id: status} map real get_statuses returns.
+    `statuses` is a {id: status} map, served as get_task_facts rows.
     get_ticket_row is stubbed to the "no such ticket" answer; tests that care
     about tickets override it.
     """
     task_interceptor = MagicMock()
-    task_interceptor.get_statuses = AsyncMock(return_value=statuses or {})
+    task_interceptor.get_task_facts = AsyncMock(return_value=task_facts_rows(statuses or {}))
     task_interceptor.get_ticket_row = AsyncMock(return_value=None)
     return create_mcp_server(
         mock_service,
@@ -207,7 +213,7 @@ class TestAddEpisodeUnverifiedClaimTagging:
         """
         mock_service = _episode_service()
         task_interceptor = MagicMock()
-        task_interceptor.get_statuses = AsyncMock(return_value={'5422': 'in-progress'})
+        task_interceptor.get_task_facts = AsyncMock(return_value=task_facts_rows({'5422': 'in-progress'}))
         task_interceptor.get_ticket_row = AsyncMock(return_value=None)
         server = create_mcp_server(
             mock_service,
@@ -224,8 +230,8 @@ class TestAddEpisodeUnverifiedClaimTagging:
             },
         )
 
-        task_interceptor.get_statuses.assert_awaited_once()
-        kwargs = task_interceptor.get_statuses.call_args.kwargs
+        task_interceptor.get_task_facts.assert_awaited_once()
+        kwargs = task_interceptor.get_task_facts.call_args.kwargs
         assert kwargs.get('project_root') == _KNOWN_PROJECTS[_PROJECT_ID], (
             f'Status read must target the claimed project root; got: {kwargs!r}'
         )
@@ -364,7 +370,7 @@ class TestVerifiedClaimsAreInert:
         """
         mock_service = _episode_service()
         task_interceptor = MagicMock()
-        task_interceptor.get_statuses = AsyncMock(return_value={})
+        task_interceptor.get_task_facts = AsyncMock(return_value=task_facts_rows({}))
         task_interceptor.get_ticket_row = AsyncMock(
             return_value={'ticket_id': _TICKET_ID, 'project_id': 'dark_factory',
                           'status': 'pending'},
@@ -494,7 +500,7 @@ class TestNoClaimPathIsUntouched:
 
         mock_service = _episode_service()
         task_interceptor = MagicMock()
-        task_interceptor.get_statuses = AsyncMock(return_value={})
+        task_interceptor.get_task_facts = AsyncMock(return_value=task_facts_rows({}))
         task_interceptor.get_ticket_row = AsyncMock(return_value=None)
         server = create_mcp_server(
             mock_service,
@@ -512,7 +518,7 @@ class TestNoClaimPathIsUntouched:
                 },
             )
 
-        task_interceptor.get_statuses.assert_not_awaited()
+        task_interceptor.get_task_facts.assert_not_awaited()
         task_interceptor.get_ticket_row.assert_not_awaited()
         # A plain (sync) MagicMock, so call_count rather than an assert_not_*
         # helper: the task-525 style check forbids mixing assert_not_called with
@@ -613,10 +619,10 @@ class TestUnresolvableAuthoritiesTag:
         assert entry.get('status') == 'unverifiable', f'Got: {entry!r}'
 
     @pytest.mark.asyncio
-    async def test_get_statuses_raising_tags(self):
+    async def test_task_facts_read_raising_tags(self):
         mock_service = _episode_service()
         task_interceptor = MagicMock()
-        task_interceptor.get_statuses = AsyncMock(side_effect=RuntimeError('taskmaster down'))
+        task_interceptor.get_task_facts = AsyncMock(side_effect=RuntimeError('taskmaster down'))
         task_interceptor.get_ticket_row = AsyncMock(return_value=None)
         server = create_mcp_server(
             mock_service,
@@ -645,8 +651,7 @@ class TestUnresolvableAuthoritiesTag:
         ],
     )
     async def test_unknown_or_absent_status_tags(self, statuses):
-        """`unknown` is get_statuses' documented sentinel for a NULL/absent DB
-        status. It is not a live status, so it can neither confirm nor
+        """`unknown` is the task store's sentinel for a NULL DB status. It is not a live status, so it can neither confirm nor
         contradict — which under this gate's inverted fail direction means
         tagged, exactly where the 2824 gate deliberately passes.
         """
@@ -669,7 +674,7 @@ class TestUnresolvableAuthoritiesTag:
     async def test_get_ticket_row_raising_tags(self):
         mock_service = _episode_service()
         task_interceptor = MagicMock()
-        task_interceptor.get_statuses = AsyncMock(return_value={})
+        task_interceptor.get_task_facts = AsyncMock(return_value=task_facts_rows({}))
         task_interceptor.get_ticket_row = AsyncMock(side_effect=RuntimeError('tickets.db locked'))
         server = create_mcp_server(
             mock_service,
@@ -700,7 +705,7 @@ class TestUnresolvableAuthoritiesTag:
         """
         mock_service = _episode_service()
         task_interceptor = MagicMock()
-        task_interceptor.get_statuses = AsyncMock(return_value={})
+        task_interceptor.get_task_facts = AsyncMock(return_value=task_facts_rows({}))
         task_interceptor.get_ticket_row = AsyncMock(
             side_effect=TicketStoreNotConfiguredError('no store'),
         )
@@ -806,7 +811,7 @@ _CROSS_PROJECTS = {'reify': '/reify-root', 'dark_factory': '/df-root'}
 
 def _cross_project_server(mock_service, *, statuses=None, ticket_row=None):
     task_interceptor = MagicMock()
-    task_interceptor.get_statuses = AsyncMock(return_value=statuses or {})
+    task_interceptor.get_task_facts = AsyncMock(return_value=task_facts_rows(statuses or {}))
     task_interceptor.get_ticket_row = AsyncMock(return_value=ticket_row)
     server = create_mcp_server(
         mock_service,
@@ -880,8 +885,8 @@ class TestCrossProjectClaims:
             },
         )
 
-        task_interceptor.get_statuses.assert_awaited_once()
-        kwargs = task_interceptor.get_statuses.call_args.kwargs
+        task_interceptor.get_task_facts.assert_awaited_once()
+        kwargs = task_interceptor.get_task_facts.call_args.kwargs
         assert kwargs.get('project_root') == '/df-root', (
             "The status read must target the CLAIMED project's root, not the "
             f'writer\'s; got: {kwargs!r}'
@@ -913,7 +918,7 @@ class TestCrossProjectClaims:
 
         reads = {
             call.kwargs.get('project_root'): sorted(call.kwargs.get('ids') or [])
-            for call in task_interceptor.get_statuses.await_args_list
+            for call in task_interceptor.get_task_facts.await_args_list
         }
         assert reads == {'/df-root': ['3142'], '/reify-root': ['5638']}, (
             f'Expected one batched read per claimed project; got: {reads!r}'
@@ -940,7 +945,7 @@ class TestCrossProjectClaims:
             },
         )
 
-        kwargs = task_interceptor.get_statuses.call_args.kwargs
+        kwargs = task_interceptor.get_task_facts.call_args.kwargs
         assert kwargs.get('project_root') == '/reify-root', (
             f"An unrecognised qualifier falls back to the writer's project; got: {kwargs!r}"
         )
@@ -1036,3 +1041,61 @@ class TestTaggedIngestionFilesAnEscalation:
         assert 'escalation_id' not in result['unverified_claim'], (
             f'no id was filed, so none may be echoed; got: {result!r}'
         )
+
+
+class TestTaskClaimsOverARealStore:
+    """The task-claim verdicts against a real SqliteTaskBackend behind a bare TaskInterceptor.
+
+    Task 1 is done and task 2 is pending; task 404 does not exist.
+    """
+
+    @pytest_asyncio.fixture
+    async def store(self, tmp_path):
+        backend = SqliteTaskBackend(TaskmasterConfig(project_root=str(tmp_path)))
+        await backend.start()
+        interceptor = TaskInterceptor(backend, None, EventBuffer(db_path=None))
+        root = str(tmp_path / 'df')
+        finished = await backend.add_task(project_root=root, title='Finished claim subject')
+        await backend.add_task(project_root=root, title='Pending claim subject')
+        write_task_out_of_band(root, finished['id'], status='done')
+        try:
+            yield interceptor, root
+        finally:
+            await interceptor.close()
+            await backend.close()
+
+    @staticmethod
+    async def _claim(store, task_id: str):
+        interceptor, root = store
+        mock_service = _episode_service()
+        server = create_mcp_server(
+            mock_service, task_interceptor=interceptor, known_projects={_PROJECT_ID: root},
+        )
+        result = await server._tool_manager.call_tool('add_episode', {
+            'content': _APPLIED_CONTENT.replace('5422', task_id),
+            'agent_id': 'claude-interactive',
+            'project_id': _PROJECT_ID,
+        })
+        return result, mock_service
+
+    @pytest.mark.asyncio
+    async def test_a_claim_about_a_done_task_is_not_tagged(self, store):
+        result, mock_service = await self._claim(store, '1')
+
+        mock_service.add_episode.assert_awaited_once()
+        assert _service_kwargs(mock_service).get('unverified_claim', False) is False
+        assert 'unverified_claim' not in result, f'{result!r}'
+
+    @pytest.mark.asyncio
+    async def test_a_claim_about_a_pending_task_is_tagged_as_a_mismatch(self, store):
+        result, mock_service = await self._claim(store, '2')
+
+        entry = _assert_tagged(result, mock_service, ref='2')
+        assert entry.get('status') == 'mismatch', f'Got: {entry!r}'
+
+    @pytest.mark.asyncio
+    async def test_a_claim_about_a_missing_task_is_tagged_unverifiable(self, store):
+        result, mock_service = await self._claim(store, '404')
+
+        entry = _assert_tagged(result, mock_service, ref='404')
+        assert entry.get('status') == 'unverifiable', f'Got: {entry!r}'

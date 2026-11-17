@@ -124,7 +124,7 @@ def run_clipboard_command(
     only signal the caller needs.
     """
     try:
-        completed = subprocess.run(  # noqa: S603 -- argv comes from _CANDIDATES, not shell text
+        completed = subprocess.run(  # argv comes from _CANDIDATES, not shell text
             list(argv),
             input=text.encode('utf-8'),
             stdout=subprocess.DEVNULL,

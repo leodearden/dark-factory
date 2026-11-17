@@ -5898,6 +5898,10 @@ async def _read_x_probe_task_ids(backend, project_root):
     return [row['task_id'] for row in result['results']]
 
 
+async def _read_task_1_facts_status(backend, project_root):
+    return (await backend.get_task_facts(['1'], project_root))['1']['status']
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ('out_of_band_sql', 'read', 'stale', 'fresh'),
@@ -5926,6 +5930,10 @@ async def _read_x_probe_task_ids(backend, project_root):
         pytest.param(
             """UPDATE tasks SET metadata='{"x_probe": 1}' WHERE id=1""",
             _read_x_probe_task_ids, [], [1], id='find_tasks_by_metadata',
+        ),
+        pytest.param(
+            "UPDATE tasks SET status='cancelled' WHERE id=1",
+            _read_task_1_facts_status, 'done', 'cancelled', id='get_task_facts',
         ),
     ],
 )

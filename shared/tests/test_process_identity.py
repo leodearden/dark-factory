@@ -2,7 +2,9 @@
 
 Boundary rows 12 (liveness) and 26 (unreadable /proc) of
 plans/deferral-flip-condition-prd.md §6. Fake proc roots go through the public
-``proc_root`` keyword; nothing private is patched.
+``proc_root`` keyword; nothing private is patched. Whether a pid exists is
+asked of the kernel, not of the proc root, so a fake root must name a pid whose
+host liveness the test controls.
 """
 
 from __future__ import annotations
@@ -131,11 +133,16 @@ def test_other_host_is_decided_before_any_proc_read(live_child, tmp_path):
     assert liveness(elsewhere, proc_root=tmp_path / 'absent') is Liveness.OTHER_HOST
 
 
-def test_unreaped_zombie_is_dead(live_child):
+def test_unreaped_zombie_is_alive_and_captured_until_reaped(live_child):
     identity = _captured(live_child.pid)
 
     os.kill(live_child.pid, signal.SIGKILL)
     os.waitid(os.P_PID, live_child.pid, os.WEXITED | os.WNOWAIT)
+
+    assert liveness(identity) is Liveness.ALIVE
+    assert capture(live_child.pid) == identity
+
+    live_child.wait()
 
     assert liveness(identity) is Liveness.DEAD
     assert capture(live_child.pid) is None
@@ -174,6 +181,18 @@ def test_absent_pid_with_visible_pid_1_is_positive_evidence_of_death(live_child,
     assert liveness(identity, proc_root=fake) is Liveness.DEAD
     assert capture(identity.pid, proc_root=fake) is None
     assert command_name(identity.pid, proc_root=fake) is None
+
+
+def test_kernel_absence_outranks_a_stale_stat_in_the_proc_root(live_child, tmp_path):
+    identity = _captured(live_child.pid)
+    stale_stat = _live_stat_line(live_child.pid)
+
+    _kill_and_reap(live_child)
+    fake = _fake_proc_root(tmp_path / 'proc', boot_id=identity.boot_id)
+    _write_pid_files(fake, identity.pid, stat=stale_stat)
+
+    assert capture(identity.pid, proc_root=fake) is None
+    assert liveness(identity, proc_root=fake) is Liveness.DEAD
 
 
 def test_printed_liveness_of_the_current_process_reads_alive():

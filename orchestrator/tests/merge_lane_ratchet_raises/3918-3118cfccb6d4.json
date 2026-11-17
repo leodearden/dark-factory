@@ -1,0 +1,30 @@
+{
+  "task_id": "3918",
+  "reason": "Amendment pass on the unmeasured-delivery diagnosis adds guards, not a failed refactor: the sibling-ref finding now checks that the measured HEAD carries no commit beyond main (_sibling_ref_finding 3 -> 4), a stopped merge, cherry-pick or revert is detected beside a stopped rebase (new _operation_in_progress and _describe_stopped, each under the new-function ceiling), and the gate keeps git's stderr in touched_set_error (new gates.py::_with_git_stderr, +1).",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/gates.py",
+      "baseline": 363,
+      "current": 364
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/unmeasured_delivery.py",
+      "baseline": 46,
+      "current": 54
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/unmeasured_delivery.py::_sibling_ref_finding",
+      "baseline": 3,
+      "current": 4
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5288,
+      "current": 5297
+    }
+  ]
+}
