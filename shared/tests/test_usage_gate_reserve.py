@@ -8,7 +8,9 @@ reserve clock, and changes account phases only through public seams.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
+import logging
 import os
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
@@ -30,6 +32,7 @@ from shared.cli_invoke import AllAccountsCappedException
 from shared.config_models import UsageCapConfig
 from shared.cost_store import CostStore
 from shared.invocation_outcome import AuthFailed, CapHit
+from shared.testing_virtual_clock import virtual_clock_test
 from shared.usage_gate import AccountLease, InvokeSlot, PoolFrozen, UsageGate
 
 ACCOUNTS = ('max-d', 'max-e', 'max-f', 'max-g', 'max-b', 'max-c', 'max-h')
@@ -552,3 +555,257 @@ class TestCapPatienceMessage:
         error = AllAccountsCappedException(retries=3, elapsed_secs=1.5, label='Task 7 [impl]')
 
         assert str(error) == 'Task 7 [impl]: all accounts capped after 3 retries (1.5s elapsed)'
+
+
+def refused_state(
+    tmp_path: Path, clock: FakeClock | None = None, **cfg: object
+) -> tuple[UsageGate, AsyncMock]:
+    """B2's state: a gate with a store, the reserve open and the six others capped for good."""
+    store = make_mock_cost_store()
+    gate = make_reserve_gate(tmp_path, clock=clock or FakeClock(), cost_store=store, **cfg)
+    cap_all_but(gate, RESERVE)
+    return gate, store
+
+
+async def let_run() -> None:
+    for _ in range(10):
+        await asyncio.sleep(0)
+
+
+async def cancel(task: asyncio.Task[object]) -> None:
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+
+def heartbeats(caplog: pytest.LogCaptureFixture, event: str) -> list[dict[str, object]]:
+    found = []
+    for record in caplog.records:
+        if record.name == 'shared.usage_gate' and record.getMessage().startswith('{'):
+            line = json.loads(record.getMessage())
+            if line.get('event') == event:
+                found.append(line)
+    return found
+
+
+LOW_WAIT_DETAILS: dict[str, object] = {
+    'account': RESERVE,
+    'kind': 'task',
+    'role': 'implementer',
+    'project_id': 'dark_factory',
+    'tier': 'low',
+    'task_id': '7',
+    'release_at': RELEASE_AT.isoformat(),
+    'unclassified': False,
+}
+
+
+class TestReserveWait:
+    """B2: a refused caller waits without freezing the pool; others are served meanwhile."""
+
+    async def test_a_refused_caller_waits_and_an_admitted_one_is_served(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        gate, store = refused_state(tmp_path)
+        caplog.set_level(logging.WARNING, logger='shared.usage_gate')
+
+        waiter = asyncio.create_task(gate.before_invoke(work_class=LOW))
+        await let_run()
+
+        assert not waiter.done()
+        assert gate.reserve_waiters == 1
+        assert gate.is_paused is False
+        assert gate.paused_reason == ''
+        lease = await asyncio.wait_for(gate.before_invoke(work_class=HIGH), timeout=1)
+        assert lease is not None and lease.name == RESERVE
+        assert await events(store, 'reserve_wait_started') == [(RESERVE, LOW_WAIT_DETAILS)]
+        [beat] = heartbeats(caplog, 'reserve_wait')
+        assert beat['reserve_account'] == RESERVE
+        assert beat['release_at'] == RELEASE_AT.isoformat()
+        assert (beat['kind'], beat['tier'], beat['task_id']) == ('task', 'low', '7')
+        assert {
+            'account_count': 7,
+            'capped_accounts': list(SIX_CAPPED),
+            'auth_failed_accounts': [],
+            'probe_in_flight_accounts': [],
+            'soonest_open_at': None,
+        }.items() <= beat.items()
+        assert isinstance(beat['elapsed_s'], float)
+
+        await cancel(waiter)
+
+        assert gate.reserve_waiters == 0
+        [(account_name, ended)] = await events(store, 'reserve_wait_ended')
+        assert account_name == RESERVE
+        assert ended['ended_by'] == 'cancelled'
+        assert isinstance(ended['waited_secs'], (int, float))
+
+    async def test_b16_a_caller_without_a_class_waits_unclassified(self, tmp_path: Path) -> None:
+        gate, store = refused_state(tmp_path)
+
+        waiter = asyncio.create_task(gate.before_invoke())
+        await let_run()
+
+        assert gate.reserve_waiters == 1
+        [(_, started)] = await events(store, 'reserve_wait_started')
+        assert started['kind'] == 'background'
+        assert started['unclassified'] is True
+        await cancel(waiter)
+
+
+class TestReserveWaitDeadline:
+    """B9: the deadline names the reserve; no cap is counted."""
+
+    async def test_the_caller_deadline_raises_pool_frozen_naming_the_reserve(
+        self, tmp_path: Path
+    ) -> None:
+        gate, store = refused_state(tmp_path)
+
+        with pytest.raises(PoolFrozen) as raised:
+            await asyncio.wait_for(
+                gate.before_invoke(work_class=LOW, max_wait_secs=0.05), timeout=2
+            )
+
+        assert raised.value.reserved_account == RESERVE
+        assert raised.value.release_at == RELEASE_AT
+        assert raised.value.scope is None
+        [(_, ended)] = await events(store, 'reserve_wait_ended')
+        assert ended['ended_by'] == 'deadline'
+        assert gate.capped_account_names == SIX_CAPPED
+        assert gate.reserve_waiters == 0
+
+    async def test_park_false_raises_at_once(self, tmp_path: Path) -> None:
+        gate, _ = refused_state(tmp_path)
+
+        with pytest.raises(PoolFrozen) as raised:
+            await asyncio.wait_for(gate.before_invoke(work_class=LOW, park=False), timeout=1)
+
+        assert raised.value.reserved_account == RESERVE
+        assert gate.capped_account_names == SIX_CAPPED
+
+
+class TestReserveWaitRouting:
+    async def test_b17_a_refused_caller_leaves_a_probing_reserve_unclaimed(
+        self, tmp_path: Path
+    ) -> None:
+        gate, _ = refused_state(tmp_path)
+        cap(gate, RESERVE, resets_at=WEDNESDAY)
+        await gate.wait_for_open(timeout=0)
+
+        with pytest.raises(PoolFrozen) as raised:
+            await asyncio.wait_for(gate.before_invoke(work_class=LOW, park=False), timeout=1)
+
+        assert raised.value.reserved_account == RESERVE
+        assert gate.probe_in_flight_account_names == ()
+        lease = await asyncio.wait_for(gate.before_invoke(work_class=HIGH), timeout=1)
+        assert lease is not None and lease.name == RESERVE
+        assert gate.probe_in_flight_account_names == (RESERVE,)
+        await gate.shutdown()
+
+    async def test_b12_an_unusable_reserve_sends_the_caller_down_the_all_capped_path(
+        self, tmp_path: Path
+    ) -> None:
+        gate, store = refused_state(tmp_path)
+        auth_fail(gate, RESERVE)
+
+        with pytest.raises(PoolFrozen) as raised:
+            await asyncio.wait_for(gate.before_invoke(work_class=LOW, park=False), timeout=1)
+
+        assert raised.value.reserved_account is None
+        assert gate.reserve_waiters == 0
+        assert await events(store, 'reserve_wait_started') == []
+
+    async def test_b15_an_admitted_scoped_caller_takes_the_scope_wait(
+        self, tmp_path: Path
+    ) -> None:
+        gate, store = refused_state(tmp_path)
+        cap(gate, RESERVE, scope=SCOPE, resets_at=datetime.now(UTC) + timedelta(hours=1))
+
+        with pytest.raises(PoolFrozen) as raised:
+            await asyncio.wait_for(
+                gate.before_invoke(SCOPE, work_class=HIGH, park=False), timeout=1
+            )
+
+        assert raised.value.scope == SCOPE
+        assert raised.value.reserved_account is None
+        assert await events(store, 'reserve_wait_started') == []
+
+
+SUNDAY_10 = datetime(2026, 11, 15, 10, tzinfo=UTC)
+
+
+class TestReserveWaitWakes:
+    """B6, B19 and B14 on the virtual clock: re-selection with no account event."""
+
+    @virtual_clock_test
+    async def test_b6_the_release_time_ends_the_wait(self, tmp_path: Path) -> None:
+        clock = FakeClock()
+        gate, store = refused_state(tmp_path, clock)
+        loop = asyncio.get_running_loop()
+
+        waiter = asyncio.create_task(gate.before_invoke(work_class=LOW))
+        await asyncio.sleep(301)
+
+        assert not waiter.done()
+        assert len(await events(store, 'reserve_wait_started')) == 1
+        assert await events(store, 'reserve_wait_ended') == []
+
+        clock.advance(SUNDAY_10 - clock.now)
+        released_at = loop.time()
+        lease = await waiter
+
+        assert lease is not None and lease.name == RESERVE
+        assert loop.time() - released_at <= 300
+        [(_, ended)] = await events(store, 'reserve_wait_ended')
+        assert ended['ended_by'] == 'released'
+
+    @virtual_clock_test
+    async def test_b19_a_promoted_caller_leases_the_reserve(self, tmp_path: Path) -> None:
+        gate, store = refused_state(tmp_path)
+        loop = asyncio.get_running_loop()
+        answers = [LOW]
+
+        waiter = asyncio.create_task(gate.before_invoke(work_class=lambda: answers[-1]))
+        await asyncio.sleep(301)
+        assert not waiter.done()
+
+        answers.append(HIGH)
+        promoted_at = loop.time()
+        lease = await waiter
+
+        assert lease is not None and lease.name == RESERVE
+        assert loop.time() - promoted_at <= 300
+        [(_, started)] = await events(store, 'reserve_wait_started')
+        [(_, ended)] = await events(store, 'reserve_wait_ended')
+        assert started['tier'] == 'low'
+        assert ended['tier'] == 'high'
+        assert ended['ended_by'] == 'admitted'
+
+    @virtual_clock_test
+    async def test_b14_a_refused_scoped_caller_takes_the_reserve_wait(
+        self, tmp_path: Path
+    ) -> None:
+        clock = FakeClock()
+        gate, _ = refused_state(tmp_path, clock)
+
+        waiter = asyncio.create_task(gate.before_invoke(SCOPE, work_class=LOW))
+        await let_run()
+        assert gate.reserve_waiters == 1
+
+        clock.advance(SUNDAY_10 - clock.now)
+        lease = await waiter
+
+        assert lease is not None and lease.name == RESERVE
+
+    async def test_b14_its_deadline_names_the_reserve_not_the_scope(
+        self, tmp_path: Path
+    ) -> None:
+        gate, _ = refused_state(tmp_path)
+
+        with pytest.raises(PoolFrozen) as raised:
+            await asyncio.wait_for(
+                gate.before_invoke(SCOPE, work_class=LOW, max_wait_secs=0.05), timeout=2
+            )
+
+        assert raised.value.reserved_account == RESERVE
+        assert raised.value.scope is None
