@@ -10,14 +10,16 @@ against a scratch FalkorDB.
 """
 from __future__ import annotations
 
+import asyncio
 import contextlib
+import json
 import logging
 import re
 from collections import Counter
 from collections.abc import Iterable
-from dataclasses import FrozenInstanceError, fields
+from dataclasses import FrozenInstanceError, asdict, fields
 from typing import Any, NamedTuple
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
@@ -29,6 +31,7 @@ from fused_memory.backends.paged_read import (
     INCOMPLETE_CENSUS_UNAVAILABLE,
     INCOMPLETE_SHORT_READ,
 )
+from fused_memory.maintenance._utils import ServiceOpen
 from fused_memory.maintenance.cross_graph_leak_census import (
     LEAK_LABELS,
     CrossGraphLeakCensus,
@@ -37,6 +40,8 @@ from fused_memory.maintenance.cross_graph_leak_census import (
     LabelLeak,
     LabelTotal,
     LeakSweep,
+    main,
+    run_cross_graph_leak_census,
 )
 from fused_memory.maintenance.graph_sweep import GraphFailure
 
@@ -421,6 +426,165 @@ class TestCrossGraphLeakCensusSweep:
         assert isinstance(sweep.graphs, tuple)
         assert isinstance(sweep.failures, tuple)
         assert isinstance(sweep.totals, tuple)
+
+
+# ---------------------------------------------------------------------------
+# The entrypoint: which graphs a run sweeps, and how the store is opened
+# ---------------------------------------------------------------------------
+
+_ENTRYPOINT_SEAM = 'fused_memory.maintenance.cross_graph_leak_census.maintenance_service'
+
+
+def leak_service(graphs: dict[str, LeakGraph], listed: list[str]) -> MagicMock:
+    """A maintenance service whose graphiti exposes *graphs* and lists *listed*."""
+    service = MagicMock()
+    service.graphiti.graph_access = FakeGraphAccess(graphs)
+    service.graphiti.list_graphs = AsyncMock(return_value=listed)
+    return service
+
+
+class TestRunCrossGraphLeakCensus:
+    @pytest.mark.asyncio
+    async def test_opens_the_store_for_reads_only(self, make_fake_maintenance_service):
+        service = leak_service({'home': LeakGraph(HOME_NODES)}, ['home'])
+
+        with patch(
+            _ENTRYPOINT_SEAM, side_effect=make_fake_maintenance_service(MagicMock(), service),
+        ) as entered:
+            await run_cross_graph_leak_census(config_path='/tmp/config.yaml')
+
+        entered.assert_called_once_with('/tmp/config.yaml', open_as=ServiceOpen.READS)
+
+    @pytest.mark.asyncio
+    async def test_without_a_group_id_sweeps_every_graph_the_backend_lists(
+        self, make_fake_maintenance_service,
+    ):
+        unlisted = LeakGraph(HOME_NODES)
+        service = leak_service(
+            {'home': LeakGraph(HOME_NODES), 'other': LeakGraph(OTHER_NODES), 'default_db': unlisted},
+            ['home', 'other'],
+        )
+
+        with patch(
+            _ENTRYPOINT_SEAM, side_effect=make_fake_maintenance_service(MagicMock(), service),
+        ):
+            sweep = await run_cross_graph_leak_census()
+
+        assert [graph.group_id for graph in sweep.graphs] == ['home', 'other']
+        assert unlisted.ro_calls == []
+
+    @pytest.mark.asyncio
+    async def test_a_group_id_reads_only_that_graph_and_lists_nothing(
+        self, make_fake_maintenance_service,
+    ):
+        other = LeakGraph(OTHER_NODES)
+        service = leak_service({'home': LeakGraph(HOME_NODES), 'other': other}, ['home', 'other'])
+
+        with patch(
+            _ENTRYPOINT_SEAM, side_effect=make_fake_maintenance_service(MagicMock(), service),
+        ):
+            sweep = await run_cross_graph_leak_census(group_id='home')
+
+        assert [graph.group_id for graph in sweep.graphs] == ['home']
+        assert other.ro_calls == []
+        service.graphiti.list_graphs.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# The CLI: exit code, --json, the summary, and the flag surface
+# ---------------------------------------------------------------------------
+
+
+def built_sweep(graphs: dict[str, LeakGraph]) -> LeakSweep:
+    """The LeakSweep the census really produces over *graphs*; sync because main() runs its own loop."""
+    return asyncio.run(sweep_of(graphs))
+
+
+def run_main(sweep: LeakSweep, argv=()) -> int:
+    """``main(argv)`` over a canned *sweep*, returning its exit code."""
+    with patch(
+        'fused_memory.maintenance.cross_graph_leak_census.run_cross_graph_leak_census',
+        AsyncMock(return_value=sweep),
+    ):
+        return main(list(argv))
+
+
+def three_graphs() -> dict[str, LeakGraph]:
+    return {
+        'home': LeakGraph(HOME_NODES),
+        'other': LeakGraph(OTHER_NODES),
+        'clean': LeakGraph(CLEAN_GRAPH_NODES),
+    }
+
+
+class TestTheExitCodeAnswersWasEveryGraphReadWhole:
+    def test_a_whole_sweep_exits_zero_even_with_leaks(self):
+        assert run_main(built_sweep(three_graphs())) == 0
+
+    def test_an_incomplete_graph_exits_one(self):
+        graphs = {'home': LeakGraph(HOME_NODES, count_override={'Entity': []})}
+
+        assert run_main(built_sweep(graphs)) == 1
+
+    def test_an_unreadable_graph_exits_one(self):
+        graphs = {'home': LeakGraph(HOME_NODES), 'broken': BrokenGraph()}
+
+        assert run_main(built_sweep(graphs)) == 1
+
+
+class TestTheTwoOutputShapes:
+    def test_json_round_trips_the_whole_sweep(self, capsys):
+        sweep = built_sweep({**three_graphs(), 'broken': BrokenGraph()})
+
+        run_main(sweep, ['--json'])
+
+        emitted = json.loads(capsys.readouterr().out)
+        assert emitted == json.loads(json.dumps(asdict(sweep), default=str))
+        assert set(emitted) == {'graphs', 'failures', 'totals', 'complete', 'elapsed_ms'}
+
+    def test_the_summary_carries_totals_graph_count_and_only_the_leaking_graphs(self, capsys):
+        run_main(built_sweep(three_graphs()))
+
+        out = capsys.readouterr().out
+        assert 'Entity=5 Episodic=5' in out
+        assert '3 graph(s)' in out
+        assert 'home: Entity=3 Episodic=4' in out
+        assert 'other: Entity=2 Episodic=1' in out
+        assert 'clean' not in out
+        assert 'complete=True' in out
+        assert 'elapsed_ms=' in out
+
+    def test_the_summary_names_a_graph_with_an_incomplete_label(self, capsys):
+        graphs = {'clean': LeakGraph(CLEAN_GRAPH_NODES, count_override={'Entity': []})}
+
+        run_main(built_sweep(graphs))
+
+        out = capsys.readouterr().out
+        assert 'clean:' in out
+        assert INCOMPLETE_CENSUS_UNAVAILABLE in out
+        assert 'complete=False' in out
+
+    def test_the_summary_carries_a_failed_block_naming_every_unread_graph(self, capsys):
+        run_main(built_sweep({'home': LeakGraph(HOME_NODES), 'broken': BrokenGraph()}))
+
+        out = capsys.readouterr().out
+        assert 'FAILED to read 1 graph(s): broken (RuntimeError: FalkorDB connection reset)' in out
+
+    def test_the_summary_says_so_when_nothing_was_read(self, capsys):
+        run_main(built_sweep({}))
+
+        out = capsys.readouterr().out
+        assert '0 graph(s)' in out
+        assert 'no graphs read' in out
+
+
+class TestTheCliOffersNoWayToMutate:
+    @pytest.mark.parametrize('flag', ['--apply', '--fix'])
+    def test_a_mutating_flag_is_rejected_by_argparse(self, flag):
+        with pytest.raises(SystemExit) as excinfo:
+            run_main(built_sweep({}), [flag])
+
+        assert excinfo.value.code == 2
 
 
 # ---------------------------------------------------------------------------
