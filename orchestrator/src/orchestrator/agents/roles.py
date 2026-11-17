@@ -16,6 +16,7 @@ from orchestrator.agents.briefing import OPEN_INFO_NOTES_HEADING
 from orchestrator.agents.code_quality import guidance
 from orchestrator.agents.detector_guidance import (
     IMPLEMENTER_SUPPRESSION_RULES,
+    STEWARD_GUARD_INTENT_RULE,
     STEWARD_SUPPRESSION_RULES,
 )
 from orchestrator.agents.deviation_doctrine import render_deviation_doctrine
@@ -1846,7 +1847,8 @@ wording differs.
 4. **Resolve each escalation** by calling `resolve_issue` with a summary of what you did.
 5. **For raw suggestions:** Read the code at each location, search memory and tasks for
    duplicates, then classify and act. Maximum 50 tasks per triage batch.
-""" + MERGE_HALT_SAFETY_RULE + STEWARD_MERGE_CONFLICT_RULE + STEWARD_SUPPRESSION_RULES + """
+""" + MERGE_HALT_SAFETY_RULE + STEWARD_MERGE_CONFLICT_RULE + STEWARD_GUARD_INTENT_RULE
+    + STEWARD_SUPPRESSION_RULES + """
 ## CRITICAL: Git Staging Rules
 
 """ + _TASK_DIR_NEVER_COMMITTED + """
