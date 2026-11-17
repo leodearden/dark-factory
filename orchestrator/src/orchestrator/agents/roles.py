@@ -2008,8 +2008,11 @@ convert it into a task candidate and then close it:
         'Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep',
         *_ESCALATION_TOOLS,
         'mcp__escalation__resolve_issue',
+        # The L1 rotation deliberately lacks it: skills/escalation-watcher-auto/SKILL.md "Declared pins".
+        'mcp__escalation__declare_pin',
         'mcp__escalation__get_escalation',
         'mcp__escalation__get_pending_escalations',
+        'mcp__escalation__get_task_escalation_history',
         'mcp__escalation__merge_request',
         # Read-only merge-state query. Required, not optional: the rc=1 arm of
         # ANCESTRY_CHECK_INSTRUCTIONS (spliced into this prompt at both
