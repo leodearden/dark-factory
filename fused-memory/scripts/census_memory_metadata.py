@@ -2036,6 +2036,7 @@ def render_markdown(report: dict[str, Any]) -> str:
 
     lines += _render_topic_coverage(report, top_n)
     lines += _render_coverage_trend(report)
+    lines += _render_kind_registry_drift(report, top_n)
 
     lines += ['## Record counts', '']
     lines += _render_record_counts(report)
@@ -2530,6 +2531,51 @@ def _render_registry_coverage(report: dict[str, Any], top_n: int | None) -> list
             f'`metadata.topic`): {named}.',
             '',
         ]
+    return lines
+
+
+def _render_kind_registry_drift(report: dict[str, Any], top_n: int | None) -> list[str]:
+    """The live ``kind`` population against the frozen registry -- or a stated absence."""
+    lines = [
+        '## Kind vocabulary drift',
+        '',
+        'The registry (`fused_memory.memory_metadata.KIND_REGISTRY`) is a FROZEN '
+        'baseline, deliberately not topped up from any census. `kind` is a census '
+        'axis that only warns: the registry does not reject a write carrying an '
+        'unregistered value (PRD §10 open question 1, option (b)). A registry '
+        'value listed as absent is recorded as departed, never removed from the '
+        'registry.',
+        '',
+    ]
+    drift = report.get('kind_registry_drift')
+    if not drift:
+        lines += [
+            '_The `kind_registry_drift` block is absent from this report '
+            '(pre-schema-6), so no drift was measured._',
+            '',
+        ]
+        return lines
+    lines += [
+        f'Registry values: **{_num(drift.get("registry_total"))}** · '
+        f'live distinct: **{_num(drift.get("measured_distinct"))}** · '
+        f'unregistered: **{_num(drift.get("unregistered_distinct"))}** '
+        f'({_num(drift.get("unregistered_records"))} records) · '
+        f'absent from the corpus: **{_num(drift.get("absent_from_corpus_distinct"))}**.',
+        '',
+    ]
+    lines += _render_named_rows(
+        'Unregistered — live `kind` values not in the frozen registry',
+        ['value', 'count'],
+        [[f'`{row["value"]}`', _num(row["count"])] for row in drift.get('unregistered') or []],
+        top_n,
+        aligns=['---', '---:'],
+    )
+    lines += _render_named_rows(
+        'Absent from the corpus — registry values with no live record',
+        ['value'],
+        [[f'`{value}`'] for value in drift.get('absent_from_corpus') or []],
+        top_n,
+    )
     return lines
 
 
