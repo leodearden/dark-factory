@@ -12445,12 +12445,14 @@ class TaskWorkflow:
         the merge in-place instead of requeueing via the scheduler.
         """
         from orchestrator.merge_lane import (
-            PLAN_FILES_NOT_TOUCHED_REASON_PREFIX,
             OperatorMergeCancel,
             WaiterRecord,
         )
         from orchestrator.merge_lane.disposition import MergeFailureDisposition
-        from orchestrator.merge_lane.gates import _check_plan_files_touched_in_branch
+        from orchestrator.merge_lane.gates import (
+            _check_plan_files_touched_in_branch,
+            plan_files_not_touched_reason,
+        )
         from orchestrator.merge_lane.intake import (
             emit_merge_coalesced,
             register_and_enqueue_merge_request,
@@ -12525,10 +12527,18 @@ class TaskWorkflow:
             rc, branch_head, _ = await _run(
                 ['git', 'rev-parse', 'HEAD'], cwd=self.worktree,
             )
+            # The PREFIXED branch: the gate reads the commits a rebase
+            # dropped from it, and the already-landed merge-marker probe
+            # greps for the exact subject `Merge <prefix><id> into main`.
+            # Both production call sites pass `branch_name = self.task_id`
+            # (bare), same as the rebind below — but stripping any prefix
+            # already present before re-adding it makes the derivation
+            # correct for a prefixed caller too, instead of silently
+            # producing `task/task/<id>`.
+            canonical_branch = (
+                f'{self.config.git.branch_prefix}{branch_name.split("/")[-1]}'
+            )
             if rc == 0 and branch_head.strip():
-                canonical_branch = (
-                    f'{self.config.git.branch_prefix}{branch_name.split("/")[-1]}'
-                )
                 own_base = await self._own_work_base()
                 check = await _check_plan_files_touched_in_branch(
                     list(self._task_files),
@@ -12536,6 +12546,7 @@ class TaskWorkflow:
                     branch_head.strip(),
                     self.git_ops,
                     task_id=self.task_id,
+                    branch=canonical_branch,
                 )
                 narrowing_succeeded = False
                 if check.not_touched:
@@ -12627,15 +12638,6 @@ class TaskWorkflow:
                         branch_head.strip(),
                         self.git_ops,
                         task_id=self.task_id,
-                        # The merge-marker probe greps for the exact subject
-                        # `Merge <prefix><id> into main`, so it needs the
-                        # PREFIXED branch.  Both production call sites pass
-                        # `branch_name = self.task_id` (bare), same as the
-                        # rebind below — but stripping any prefix already
-                        # present before re-adding it makes the derivation
-                        # correct for a prefixed caller too, instead of
-                        # silently producing `task/task/<id>` and failing
-                        # closed on a marker that is really there.
                         branch=canonical_branch,
                     )
                     if already_landed is not None:
@@ -12688,6 +12690,7 @@ class TaskWorkflow:
                                 branch_head2.strip(),
                                 self.git_ops,
                                 task_id=self.task_id,
+                                branch=canonical_branch,
                             )
                             if not check.not_touched:
                                 narrowing_succeeded = True
@@ -12701,49 +12704,11 @@ class TaskWorkflow:
                                 if unmeasured is not None:
                                     return unmeasured
                 if check.not_touched:
-                    # Task 3110 — the message is CLASS-SCOPED, because the
-                    # gate's two failure classes are different failures.
-                    # `missing_from_tree` entries do not exist in the branch
-                    # tree at all (renamed away on main, or never created),
-                    # so the touched set was never consulted for them: the
-                    # old unconditional "no commit on the branch touched
-                    # them" was a confident claim about a branch that was
-                    # never tested.  Measured on reify-5196 / esc-5196-22,
-                    # where main relocated crates/tests/*_e2e.rs into
-                    # crates/tests/harness_topo/ and 22 escalations in a row
-                    # told a human the implementation had not delivered —
-                    # while it had delivered exactly what was asked, at the
-                    # file's current name.  The head (prefix + full path
-                    # list) is preserved verbatim: unblock_types
-                    # .classify_block_reason keys off it via startswith.
-                    stale_set = set(check.missing_from_tree)
-                    stale = [e for e in check.not_touched if e in stale_set]
-                    real = [e for e in check.not_touched if e not in stale_set]
-                    parts = [
-                        f'{PLAN_FILES_NOT_TOUCHED_REASON_PREFIX}: '
-                        f'{", ".join(check.not_touched)}. '
-                    ]
-                    if real:
-                        parts.append(
-                            f'The architect declared these files but no commit '
-                            f'on the branch touched them: {", ".join(real)}.  '
-                            f'Implementation has not delivered against the plan.  '
-                        )
-                    if stale:
-                        parts.append(
-                            f'Declared path does not exist in the tree at branch '
-                            f'HEAD (renamed or never created), so the '
-                            f'branch-touched set was not consulted for: '
-                            f'{", ".join(stale)} — investigate the declared '
-                            f'path, not the branch.  '
-                        )
-                    if check.resolved_renames:
-                        pairs = ', '.join(
-                            f'{declared} -> {resolved}'
-                            for declared, resolved in check.resolved_renames.items()
-                        )
-                        parts.append(f'Rename resolution: {pairs}.')
-                    reason = ''.join(parts).strip()
+                    # Tasks 3110 and 4669 — the message is CLASS-SCOPED, because
+                    # a stale path and a commit a rebase dropped are not
+                    # under-delivery; see
+                    # orchestrator/src/orchestrator/merge_lane/gates.py::plan_files_not_touched_reason.
+                    reason = plan_files_not_touched_reason(check)
                     _emit_merge_attempt(
                         self.event_store, self.task_id,
                         OutcomeKind.plan_files_not_touched,
