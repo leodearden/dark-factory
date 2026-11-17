@@ -1815,8 +1815,9 @@ class UsageGate:
         cannot be served here any more (:func:`wait_end_without_lease`), for
         ``before_invoke`` to take the scope or all-capped path;
         :class:`PoolFrozen` at the deadline; cancellation. It counts nothing
-        toward a cap. *view* is the entry pass's; each pass reads its own, and
-        the rows carry the class the last pass read, so the caller's class
+        toward a cap. *refused* and *view* are the entry pass's; each pass reads
+        its own, so the heartbeat, the deadline's PoolFrozen and the rows name
+        the release and class the last pass read, and the caller's class
         function runs only in selection.
         """
         started = time.monotonic()
@@ -1850,6 +1851,7 @@ class UsageGate:
                 if end is not None:
                     ended_by = end
                     return None
+                refused = ReserveRefusal(view.rule.account, view.rule.release_at(view.now))
                 time_left = _park_time_left(deadline)
                 if time_left is not None and time_left <= 0:
                     ended_by = ReserveWaitEnd.DEADLINE
@@ -1869,7 +1871,7 @@ class UsageGate:
                     )
                     last_logged = now
                 until_release = (refused.release_at - view.now).total_seconds()
-                sleep_for = min(_RESERVE_WAIT_REPOLL_SECS, max(0.0, until_release))
+                sleep_for = min(_RESERVE_WAIT_REPOLL_SECS, until_release)
                 if time_left is not None:
                     sleep_for = min(sleep_for, time_left)
                 with contextlib.suppress(TimeoutError):

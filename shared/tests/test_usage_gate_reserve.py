@@ -764,6 +764,7 @@ class TestReserveWaitRouting:
 
 
 SUNDAY_10 = datetime(2026, 11, 15, 10, tzinfo=UTC)
+NEXT_WEEK_RELEASE_AT = RELEASE_AT + timedelta(days=7)
 
 
 class TestReserveWaitWakes:
@@ -814,6 +815,31 @@ class TestReserveWaitWakes:
         assert ended['ended_by'] == 'admitted'
 
     @virtual_clock_test
+    async def test_a_clock_past_the_release_waits_for_the_next_one(self, tmp_path: Path) -> None:
+        clock = FakeClock()
+        gate, store = refused_state(tmp_path, clock)
+        selections = 0
+
+        def counted() -> WorkClass:
+            nonlocal selections
+            selections += 1
+            if selections > 20:
+                raise RuntimeError('the reserve wait is spinning')
+            return LOW
+
+        waiter = asyncio.create_task(gate.before_invoke(work_class=counted))
+        await let_run()
+        clock.advance(timedelta(days=8))
+        await asyncio.sleep(901)
+
+        assert not waiter.done()
+        assert selections <= 5
+        assert gate.reserve_refusal(LOW) == ReserveRefusal(RESERVE, NEXT_WEEK_RELEASE_AT)
+        await cancel(waiter)
+        [(_, ended)] = await events(store, 'reserve_wait_ended')
+        assert ended['release_at'] == NEXT_WEEK_RELEASE_AT.isoformat()
+
+    @virtual_clock_test
     async def test_b8_a_repoll_during_the_reserves_probe_keeps_the_same_wait(
         self, tmp_path: Path
     ) -> None:
@@ -849,6 +875,22 @@ class TestReserveWaitWakes:
         lease = await waiter
 
         assert lease is not None and lease.name == RESERVE
+
+    async def test_a_deadline_after_the_clock_passed_the_release_names_the_next_one(
+        self, tmp_path: Path
+    ) -> None:
+        clock = FakeClock()
+        gate, _ = refused_state(tmp_path, clock)
+
+        waiter = asyncio.create_task(gate.before_invoke(work_class=LOW, max_wait_secs=0.2))
+        await let_run()
+        clock.advance(timedelta(days=8))
+
+        with pytest.raises(PoolFrozen) as raised:
+            await asyncio.wait_for(waiter, timeout=2)
+
+        assert raised.value.reserved_account == RESERVE
+        assert raised.value.release_at == NEXT_WEEK_RELEASE_AT
 
     async def test_b14_its_deadline_names_the_reserve_not_the_scope(
         self, tmp_path: Path
