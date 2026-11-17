@@ -35,7 +35,10 @@ from fused_memory.maintenance.cross_graph_leak_census import (
     ForeignGroup,
     GraphLeaks,
     LabelLeak,
+    LabelTotal,
+    LeakSweep,
 )
+from fused_memory.maintenance.graph_sweep import GraphFailure
 
 _CENSUS_LOGGER = 'fused_memory.maintenance.cross_graph_leak_census'
 _LABEL_PATTERN = re.compile(r'\(n:(\w+)\)')
@@ -291,6 +294,133 @@ class TestLabelLeakInvariant:
                     setattr(frozen, field.name, None)
         assert isinstance(leaks.labels, tuple)
         assert isinstance(entity.by_group_id, tuple)
+
+
+# ---------------------------------------------------------------------------
+# The sweep: several graphs, best-effort per graph
+# ---------------------------------------------------------------------------
+
+
+class SweepOnlyAccess(FakeGraphAccess):
+    """A provider whose listing fails the test: a sweep reads only the keys it is given."""
+
+    async def list_graphs(self) -> list[str]:
+        raise AssertionError('sweep consulted list_graphs; it must read only the keys given')
+
+
+class BrokenGraph(LeakGraph):
+    """A raw graph whose every read fails."""
+
+    def __init__(self) -> None:
+        super().__init__([])
+
+    async def ro_query(self, cypher: str, params: dict[str, Any] | None = None) -> _Result:
+        raise RuntimeError('FalkorDB connection reset')
+
+
+#: Graph 'other': Entity 2 leaked, Episodic 1 leaked.
+OTHER_NODES = [
+    *nodes_of('Entity', 'other', 4),
+    *nodes_of('Entity', 'reify', 2),
+    *nodes_of('Episodic', 'home', 1),
+]
+
+#: Graph 'clean': nothing leaked.
+CLEAN_GRAPH_NODES = [*nodes_of('Entity', 'clean', 3), *nodes_of('Episodic', 'clean', 1)]
+
+
+async def sweep_of(graphs: dict[str, LeakGraph], keys: list[str] | None = None) -> LeakSweep:
+    census = CrossGraphLeakCensus(graphs=SweepOnlyAccess(graphs))
+    return await census.sweep(list(graphs) if keys is None else keys)
+
+
+class TestCrossGraphLeakCensusSweep:
+    @pytest.mark.asyncio
+    async def test_reads_only_the_given_keys_in_the_given_order(self):
+        unread = LeakGraph(HOME_NODES)
+        graphs = {
+            'home': LeakGraph(HOME_NODES),
+            'other': LeakGraph(OTHER_NODES),
+            'clean': LeakGraph(CLEAN_GRAPH_NODES),
+            'unread': unread,
+        }
+
+        sweep = await sweep_of(graphs, ['other', 'clean', 'home'])
+
+        assert [graph.group_id for graph in sweep.graphs] == ['other', 'clean', 'home']
+        assert unread.ro_calls == []
+
+    @pytest.mark.asyncio
+    async def test_totals_sum_each_label_across_the_graphs_read(self):
+        sweep = await sweep_of({
+            'home': LeakGraph(HOME_NODES),
+            'other': LeakGraph(OTHER_NODES),
+            'clean': LeakGraph(CLEAN_GRAPH_NODES),
+        })
+
+        assert sweep.totals == (
+            LabelTotal(label='Entity', leaked=5),
+            LabelTotal(label='Episodic', leaked=5),
+        )
+        assert [total.label for total in sweep.totals] == list(LEAK_LABELS)
+
+    @pytest.mark.asyncio
+    async def test_an_unknown_count_adds_nothing_and_leaves_the_sweep_incomplete(self):
+        sweep = await sweep_of({
+            'home': LeakGraph(HOME_NODES, count_override={'Entity': [[None]]}),
+            'other': LeakGraph(OTHER_NODES),
+        })
+
+        assert sweep.totals[0] == LabelTotal(label='Entity', leaked=2)
+        assert sweep.complete is False
+
+    @pytest.mark.asyncio
+    async def test_a_failing_graph_is_recorded_and_the_others_are_still_read(self):
+        sweep = await sweep_of({
+            'home': LeakGraph(HOME_NODES),
+            'broken': BrokenGraph(),
+            'clean': LeakGraph(CLEAN_GRAPH_NODES),
+        })
+
+        assert [graph.group_id for graph in sweep.graphs] == ['home', 'clean']
+        assert sweep.failures == (
+            GraphFailure(group_id='broken', error='RuntimeError: FalkorDB connection reset'),
+        )
+
+    @pytest.mark.asyncio
+    async def test_complete_only_when_every_graph_was_read_whole(self):
+        whole = await sweep_of({
+            'home': LeakGraph(HOME_NODES), 'clean': LeakGraph(CLEAN_GRAPH_NODES),
+        })
+        truncated = await sweep_of({
+            'home': LeakGraph(HOME_NODES, breakdown_override={'Entity': [['reify', 1]]}),
+            'clean': LeakGraph(CLEAN_GRAPH_NODES),
+        })
+        failed = await sweep_of({'home': LeakGraph(HOME_NODES), 'broken': BrokenGraph()})
+
+        assert whole.complete is True
+        assert truncated.complete is False
+        assert failed.complete is False
+        assert all(graph.complete for graph in failed.graphs)
+
+    @pytest.mark.asyncio
+    async def test_elapsed_ms_is_a_non_negative_float(self):
+        sweep = await sweep_of({'home': LeakGraph(HOME_NODES)})
+
+        assert isinstance(sweep.elapsed_ms, float)
+        assert sweep.elapsed_ms >= 0
+
+    @pytest.mark.asyncio
+    async def test_the_sweep_and_its_totals_are_frozen(self):
+        sweep = await sweep_of({'home': LeakGraph(HOME_NODES)})
+
+        for frozen in (sweep, sweep.totals[0]):
+            for field in fields(frozen):
+                with pytest.raises(FrozenInstanceError):
+                    setattr(frozen, field.name, None)
+        assert isinstance(sweep.graphs, tuple)
+        assert isinstance(sweep.failures, tuple)
+        assert isinstance(sweep.totals, tuple)
 
 
 # ---------------------------------------------------------------------------
