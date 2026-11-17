@@ -13,12 +13,16 @@ from contextlib import closing
 from pathlib import Path
 
 
-def drain_unattributed(db_path: Path, project_id: str) -> int:
-    """Mark every buffered row of *project_id* drained with no run or instance stamp; return how many."""
+def drain_unattributed(db_path: Path, project_id: str, *, instance_id: str | None = None) -> int:
+    """Mark every buffered row of *project_id* drained with no run stamp; return how many.
+
+    *instance_id* defaults to no instance stamp, as a pre-task-2711 process left
+    it; naming one reproduces a pre-task-6784 ``drain`` called without a run_id.
+    """
     with closing(sqlite3.connect(db_path)) as conn, conn:
         return conn.execute(
             "UPDATE event_buffer SET status = 'drained', "
-            "drained_by_run_id = NULL, drained_by_instance_id = NULL "
+            "drained_by_run_id = NULL, drained_by_instance_id = ? "
             "WHERE project_id = ? AND status = 'buffered'",
-            (project_id,),
+            (instance_id, project_id),
         ).rowcount

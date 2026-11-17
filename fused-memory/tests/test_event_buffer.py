@@ -1591,9 +1591,10 @@ async def test_drain_by_ids_stamps_run_id_for_run_scoped_restore(buf):
     'drain_path',
     [EventBuffer.drain, EventBuffer.drain_oldest_chunk, EventBuffer.drain_by_ids],
 )
-def test_no_drain_path_drains_without_a_run_id(drain_path):
+def test_every_drain_method_requires_a_str_run_id(drain_path):
     """An unattributed drained row is what restore_drained(include_unattributed=True)
-    folds into another run's recovery, so no drain path may produce one (task 6784)."""
+    folds into another run's recovery, so no drain path may produce one (task 6784).
+    A new drain method belongs both here and in restore_drained's list of drain paths."""
     run_id = inspect.signature(drain_path).parameters['run_id']
     assert run_id.default is inspect.Parameter.empty
     assert get_type_hints(drain_path)['run_id'] is str
