@@ -35,6 +35,7 @@ from shared.account_reserve import (
     ReserveEvent,
     ReserveRefusal,
     ReserveState,
+    ReserveWaitEnd,
     WorkClassSource,
     config_event_details,
     first_choice,
@@ -42,6 +43,8 @@ from shared.account_reserve import (
     refuses_account,
     resolve_work_class,
     schedule_drift,
+    wait_end_for_lease,
+    work_class_details,
 )
 from shared.cli_invoke import (
     BUDGET_EXHAUSTED_SUBTYPE,
@@ -137,6 +140,13 @@ _SCOPE_WAIT_REPOLL_CEIL_SECS = 5.0
 # enough not to bury the signal. Deliberately an internal observability
 # constant, not an operator knob.
 _ALL_CAPPED_PARK_LOG_INTERVAL_SECS = 600.0
+
+# The allowance reserve's wait (plans/allowance-reserve-by-account-prd.md
+# §6.3): a refused caller re-selects at least this often with no account
+# event, which is what bounds a promoted caller and a reserve that capped
+# under its waiters. Its heartbeat is per waiter, at the park's interval.
+_RESERVE_WAIT_REPOLL_SECS = 300.0
+_RESERVE_WAIT_LOG_INTERVAL_SECS = 600.0
 
 # Consecutive spawn failures on ONE account before the gate latches
 # `probe_infra_fault` (task 4512). Greater than 1 so a single transient spawn
@@ -864,6 +874,10 @@ class UsageGate:
     # The configured reset whose drift was last recorded: PRD §6.2 inv. 5's
     # "at most once per week", without storing a calendar.
     _reserve_drift_noted_for: datetime | None = None
+    # Callers in a reserve wait right now, and the Event that wakes them;
+    # created on first use, so a gate without a reserve never allocates it.
+    _reserve_wait_count: int = 0
+    _reserve_wake: asyncio.Event | None = None
 
     def __init__(
         self,
@@ -1371,6 +1385,7 @@ class UsageGate:
         *,
         park: bool = True,
         max_wait_secs: float | None = None,
+        work_class: WorkClassSource | None = None,
     ) -> AccountLease | None:
         """Block until at least one account is available. Return its lease.
 
@@ -1395,6 +1410,13 @@ class UsageGate:
         :class:`PoolFrozen`. *park* ``False`` (task 6042) is the zero allowance:
         it raises before parking at all. The default, ``park=True`` with no
         ``max_wait_secs``, parks until an account reopens.
+
+        *work_class* is the caller's class for the allowance reserve, passed to
+        every selection (see :meth:`try_lease`). A caller the reserve refuses
+        while it is the only open account takes the reserve wait, before the
+        scope branch and whatever its scope (PRD §6.3): the pool is not frozen,
+        so ``_open`` and ``paused_reason`` are left alone, and the same deadline
+        raises a :class:`PoolFrozen` naming the reserve and its release time.
         """
         # Session budget check
         if (
@@ -1410,7 +1432,7 @@ class UsageGate:
         # Find first non-capped account (works with 1 or N)
         while True:
             async with self._lock:
-                lease = self.try_lease(scope=scope)
+                lease = self.try_lease(scope=scope, work_class=work_class)
                 if lease is not None:
                     return lease
 
@@ -1418,6 +1440,15 @@ class UsageGate:
             refreshed = await self._refresh_capped_accounts()
             if refreshed:
                 continue  # re-check accounts with updated flags
+
+            refused = self.reserve_refusal(work_class)
+            if refused is not None:
+                lease = await self._wait_while_reserve_refuses(
+                    refused, work_class, scope, park_deadline
+                )
+                if lease is not None:
+                    return lease
+                continue
 
             if scope is not None:
                 # Scope-aware no-freeze fall-through (task γ, S3/S6). The select
@@ -1493,7 +1524,9 @@ class UsageGate:
             # _open recompute entirely. This clear() is derived independently:
             # the for-loop above just confirmed every account is non-AVAILABLE
             # and non-PROBING, so clearing here is always correct regardless of
-            # how _open drifted.
+            # how _open drifted. The walk withholds an open account from a caller
+            # in one case only, the reserve refusing it, and the reserve wait
+            # above has already diverted that case.
             park_left = _park_time_left(park_deadline)
             if park_left is not None and park_left <= 0:
                 raise self._pool_frozen(None)
@@ -1666,24 +1699,7 @@ class UsageGate:
                     >= _ALL_CAPPED_PARK_LOG_INTERVAL_SECS
                 ):
                     logger.warning(
-                        json.dumps(
-                            {
-                                'event': 'all_capped_park',
-                                'elapsed_s': round(now - self._park_started_at, 1),
-                                'account_count': self.account_count,
-                                'capped_accounts': list(self.capped_account_names),
-                                'auth_failed_accounts': list(self.auth_failed_account_names),
-                                'probe_in_flight_accounts': list(
-                                    self.probe_in_flight_account_names
-                                ),
-                                'soonest_open_at': (
-                                    self.soonest_resets_at.isoformat()
-                                    if self.soonest_resets_at
-                                    else None
-                                ),
-                            },
-                            default=str,
-                        )
+                        self._park_heartbeat('all_capped_park', now - self._park_started_at)
                     )
                     self._park_last_logged_at = now
                 wait_for = _ALL_CAPPED_PARK_LOG_INTERVAL_SECS
@@ -1702,6 +1718,125 @@ class UsageGate:
         finally:
             self._park_waiters -= 1
 
+    def _park_heartbeat(self, event: str, elapsed_s: float, **extra: object) -> str:
+        """A parked caller's heartbeat line: the pool snapshot, then *extra*."""
+        return json.dumps(
+            {
+                'event': event,
+                'elapsed_s': round(elapsed_s, 1),
+                'account_count': self.account_count,
+                'capped_accounts': list(self.capped_account_names),
+                'auth_failed_accounts': list(self.auth_failed_account_names),
+                'probe_in_flight_accounts': list(self.probe_in_flight_account_names),
+                'soonest_open_at': (
+                    self.soonest_resets_at.isoformat() if self.soonest_resets_at else None
+                ),
+                **extra,
+            },
+            default=str,
+        )
+
+    async def _wait_while_reserve_refuses(
+        self,
+        refused: ReserveRefusal,
+        source: WorkClassSource | None,
+        scope: str | None,
+        deadline: float | None,
+    ) -> AccountLease | None:
+        """Wait while the reserve, refused to this caller, is the only open account (PRD §6.3).
+
+        One wait however often the caller is refused again: one
+        ``reserve_wait_started`` and one ``reserve_wait_ended`` row, the latter
+        naming its exit. Selection re-runs at the first of the waiter Event, the
+        release time, ``_RESERVE_WAIT_REPOLL_SECS`` and *deadline*. Exits: a
+        lease (account_opened, released or admitted); None when the caller is
+        no longer refused yet nothing is open (reserve_unusable), for
+        ``before_invoke`` to take the all-capped path; :class:`PoolFrozen` at
+        the deadline; cancellation. It counts nothing toward a cap.
+        """
+        rule = self._active_reserve_config()
+        if rule is None:
+            return None
+        self._reserve_wait_count += 1
+        started = time.monotonic()
+        last_logged: float | None = None
+        ended_by = ReserveWaitEnd.CANCELLED
+        self._fire_reserve_event(
+            refused.account,
+            ReserveEvent.WAIT_STARTED,
+            self._reserve_wait_details(refused, source),
+        )
+        try:
+            while True:
+                wake = self._reserve_waiter()
+                wake.clear()
+                await self._refresh_capped_accounts()
+                async with self._lock:
+                    lease = self.try_lease(scope=scope, work_class=source)
+                if lease is not None:
+                    ended_by = wait_end_for_lease(rule, lease.name, self._reserve_now())
+                    return lease
+                still_refused = self.reserve_refusal(source)
+                if still_refused is None:
+                    ended_by = ReserveWaitEnd.RESERVE_UNUSABLE
+                    return None
+                refused = still_refused
+                time_left = _park_time_left(deadline)
+                if time_left is not None and time_left <= 0:
+                    ended_by = ReserveWaitEnd.DEADLINE
+                    raise self._pool_frozen(None, refused)
+                now = time.monotonic()
+                if last_logged is None or now - last_logged >= _RESERVE_WAIT_LOG_INTERVAL_SECS:
+                    caller = resolve_work_class(source)
+                    logger.warning(
+                        self._park_heartbeat(
+                            'reserve_wait',
+                            now - started,
+                            reserve_account=refused.account,
+                            release_at=refused.release_at.isoformat(),
+                            kind=caller.kind.value,
+                            tier=caller.tier,
+                            task_id=caller.task_id,
+                        )
+                    )
+                    last_logged = now
+                until_release = (refused.release_at - self._reserve_now()).total_seconds()
+                sleep_for = min(_RESERVE_WAIT_REPOLL_SECS, max(0.0, until_release))
+                if time_left is not None:
+                    sleep_for = min(sleep_for, time_left)
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(wake.wait(), timeout=sleep_for)
+        finally:
+            self._reserve_wait_count -= 1
+            self._fire_reserve_event(
+                refused.account,
+                ReserveEvent.WAIT_ENDED,
+                {
+                    **self._reserve_wait_details(refused, source),
+                    'waited_secs': round(time.monotonic() - started, 1),
+                    'ended_by': ended_by.value,
+                },
+            )
+
+    def _reserve_wait_details(
+        self, refused: ReserveRefusal, source: WorkClassSource | None
+    ) -> dict[str, object]:
+        return {
+            **work_class_details(resolve_work_class(source), unclassified=source is None),
+            'account': refused.account,
+            'release_at': refused.release_at.isoformat(),
+        }
+
+    def _reserve_waiter(self) -> asyncio.Event:
+        if self._reserve_wake is None:
+            self._reserve_wake = asyncio.Event()
+        return self._reserve_wake
+
+    @property
+    def reserve_waiters(self) -> int:
+        """The number of callers in a reserve wait right now (PRD §6.3)."""
+        return self._reserve_wait_count
+
     def _release_park_clock(self) -> None:
         """Clear the shared heartbeat clock as a parked caller leaves, unless a
         sibling is still parked: a frozen pool typically has many waiters, so
@@ -1718,12 +1853,18 @@ class UsageGate:
         *,
         park: bool = True,
         max_wait_secs: float | None = None,
+        work_class: WorkClassSource | None = None,
     ):
         """Acquire an account slot, releasing the probe lock on any exit path.
 
         *park* and *max_wait_secs* are forwarded to :meth:`before_invoke`: a
         spent park allowance raises :class:`PoolFrozen` out of the
         ``async with``, before any account is claimed.
+
+        *work_class*, the caller's class for the allowance reserve, is forwarded
+        to :meth:`before_invoke` when given, so a refused caller takes the
+        reserve wait there and a spent allowance raises a :class:`PoolFrozen`
+        naming the reserve.
 
         Yields an :class:`InvokeSlot` whose ``token`` and ``account_name``
         are ready to use.  On exit, if neither :meth:`~InvokeSlot.detect_cap_hit`
@@ -1750,8 +1891,9 @@ class UsageGate:
                     break          # probe settled by confirm
                 # any other exit path (continue, exception): auto-released
         """
+        reserve_kwargs = {} if work_class is None else {'work_class': work_class}
         lease = await self.before_invoke(
-            scope=scope, park=park, max_wait_secs=max_wait_secs,
+            scope=scope, park=park, max_wait_secs=max_wait_secs, **reserve_kwargs,
         )
         slot = InvokeSlot(self, lease, scope=scope)
         try:
