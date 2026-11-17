@@ -832,24 +832,17 @@ class TestProseCitationScanWiring:
             assert report.stats[f'{prefix}_{suffix}'] == 0
 
 
-class TestSessionCaptureLifecycle:
+class TestSessionMintAndRunRow:
     """BaseStage.run mints a uuid4 CLI session and a per-run TaskConfigDir and
     forwards both to run_stage_via_cli (task 2744); it writes nothing to the run
     row (task 8745)."""
-
-    def _make_stage_with_real_journal_dir(self, tmp_path):
-        """_StubStage whose journal has a real data_dir."""
-        stage = _make_stage(recon_report_state=None)
-        journal = MagicMock()
-        journal.data_dir = tmp_path
-        stage.journal = journal
-        return stage, journal
 
     @pytest.mark.asyncio
     async def test_session_minted_and_forwarded(self, tmp_path):
         from shared.config_dir import TaskConfigDir
 
-        stage, _ = self._make_stage_with_real_journal_dir(tmp_path)
+        stage = _make_stage(recon_report_state=None)
+        stage.journal = MagicMock(data_dir=tmp_path)
         captured: dict = {}
 
         async def _runner(**kwargs):
@@ -917,13 +910,11 @@ class TestStageTranscriptArchival:
 
     def _make_archiving_stage(self, tmp_path, **config_overrides):
         stage = _make_stage(recon_report_state=None)
-        journal = MagicMock()
-        journal.data_dir = tmp_path / 'data'
-        stage.journal = journal
+        stage.journal = MagicMock(data_dir=tmp_path / 'data')
         stage.config = ReconciliationConfig(
             explore_codebase_root=str(tmp_path / 'proj'), **config_overrides,
         )
-        return stage, journal
+        return stage
 
     def _transcript_writing_runner(self, captured: dict, raises=None):
         """Plant the transcript where the CLI writes it, in the forwarded config dir."""
@@ -950,7 +941,7 @@ class TestStageTranscriptArchival:
 
     @pytest.mark.asyncio
     async def test_stage_transcript_is_copied_to_the_archive(self, tmp_path):
-        stage, _ = self._make_archiving_stage(tmp_path)
+        stage = self._make_archiving_stage(tmp_path)
         captured: dict = {}
 
         with patch(
@@ -965,7 +956,7 @@ class TestStageTranscriptArchival:
     @pytest.mark.asyncio
     async def test_source_transcript_survives_the_archival(self, tmp_path):
         """The producer COPIES: deleting the source is the teardown half's job."""
-        stage, _ = self._make_archiving_stage(tmp_path)
+        stage = self._make_archiving_stage(tmp_path)
         captured: dict = {}
 
         with patch(
@@ -980,7 +971,7 @@ class TestStageTranscriptArchival:
     @pytest.mark.asyncio
     async def test_archival_runs_even_when_the_stage_is_cancelled(self, tmp_path):
         """A cancelled stage still archives its transcript."""
-        stage, _ = self._make_archiving_stage(tmp_path)
+        stage = self._make_archiving_stage(tmp_path)
         captured: dict = {}
 
         with patch(
@@ -996,7 +987,7 @@ class TestStageTranscriptArchival:
 
     @pytest.mark.asyncio
     async def test_disabled_config_archives_nothing(self, tmp_path):
-        stage, _ = self._make_archiving_stage(
+        stage = self._make_archiving_stage(
             tmp_path, transcript_archive_enabled=False,
         )
         captured: dict = {}
@@ -1018,7 +1009,7 @@ class TestStageTranscriptArchival:
         (binding even under root, unlike chmod); the hook is total."""
         (tmp_path / 'proj').mkdir()
         (tmp_path / 'proj' / 'blocker').write_text('not a directory')
-        stage, _ = self._make_archiving_stage(
+        stage = self._make_archiving_stage(
             tmp_path, transcript_archive_root='blocker/archive',
         )
         captured: dict = {}

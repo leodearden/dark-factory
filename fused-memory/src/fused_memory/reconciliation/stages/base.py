@@ -491,9 +491,9 @@ class BaseStage:
         The case only this copy covers: a kill that runs no ``finally``
         (SIGKILL, watchdog SIGABRT, OOM) after the row went terminal and before
         the teardown ``cli_stage_runner.py::gc_run_config_dir`` ran.
-        ``harness.py::ReconciliationHarness.run_full_cycle`` writes the row
-        terminal (``complete_run``, ``_record_*_run``) before its finally-GC,
-        and every recovery pass selects only 'running' rows
+        ``harness.py::ReconciliationHarness.run_full_cycle`` and
+        ``::_run_remediation_pass`` write the row terminal (``complete_run``,
+        ``_record_*_run``) before their finally-GC, and every recovery pass selects only 'running' rows
         (``journal.py::ReconciliationJournal.get_stale_runs`` /
         ``get_running_runs``). Nothing revisits such a dir, so this copy is the
         only archival its transcripts get. A boot-time orphan sweep over recon

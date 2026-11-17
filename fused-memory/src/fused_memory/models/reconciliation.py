@@ -167,8 +167,9 @@ class ReconciliationRun(BaseModel):
     status: RunStatus = RunStatus.running
     triggered_by: str | None = None  # parent run_id for remediation runs
     instance_id: str | None = None  # EventBuffer.instance_id of the harness that started the run
-    # Legacy run-row fields (task 2744), unwritten since task 8745; kept only so
-    # old rows decode.
+    # Legacy run-row fields (task 2744), unwritten since task 8745. They surface
+    # a pre-8745 row's values via get_run; their columns stay to avoid a
+    # column-drop migration.
     session_id: str | None = None
     stage_cursor: str | None = None
     attempt: int = 0

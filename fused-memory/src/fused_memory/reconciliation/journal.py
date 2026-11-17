@@ -296,7 +296,8 @@ class ReconciliationJournal:
 
             # Legacy columns (task 2744): BaseStage.run's session snapshot wrote
             # them until task 8745 retired it. Nothing writes them now; they stay
-            # so pre-8745 rows still decode.
+            # to avoid a column-drop migration, and _row_to_run still reads them
+            # by name, so a DB that predates them must gain them here.
             await add_column_if_missing(db, 'runs', 'session_id', 'TEXT')
             await add_column_if_missing(db, 'runs', 'stage_cursor', 'TEXT')
             await add_column_if_missing(db, 'runs', 'attempt', 'INTEGER DEFAULT 0')
