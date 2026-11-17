@@ -74,10 +74,12 @@ THE THIRD COPY OF THE TIER-3 SKELETON, AND WHY IT STAYS OUT (task 3817).
 ``audit_wiped_metadata_files.py`` — keeps its own ``EXIT_*`` ladder and its own
 per-root skip loop inside ``main_async`` instead of adopting
 :func:`run_audit_cli`. That is a decision, not an oversight. It reaches Tier 1
-discovery only second-hand, through the ``discover_project_roots`` re-export in
-``audit_wiped_metadata_files.py``. Its ONE direct import from this module is
+discovery second-hand, through the ``discover_project_roots`` re-export in
+``audit_wiped_metadata_files.py``. Its TWO direct imports from this module are
 :data:`UNREADABLE_STORE_ERRORS`, so its per-root loop skips exactly what this
-tier skips. Four things Tier 3 cannot express, each measured in the source:
+tier skips, and :func:`discover_or_report_no_default_root`, so an underivable
+default root takes its no-root exit as it does here. Four things Tier 3 cannot
+express, each measured in the source:
 
 1. ``main_async`` is ``async`` and awaits ``repair_project`` (itself
    ``async def``), while :func:`run_audit_cli` and :func:`sweep_project_roots`
