@@ -2847,7 +2847,9 @@ class TestAwaitStewardCompletionDrainsAndGatesOnOpenL1:
         outcome = await wf._await_steward_completion(escalation_id=None)
 
         assert outcome == StewardReescalatedL1(esc_id='L1')
-        assert wf._steward_outcome_channel.empty(), (
+        channel = wf._steward_outcome_channel
+        assert channel is not None
+        assert channel.empty(), (
             'both queued outcomes must be drained, not just the first'
         )
 
