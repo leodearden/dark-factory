@@ -695,7 +695,7 @@ def _wire_plan_files_gate(wf, monkeypatch, results, *, narrowed=False):
         check_seq,
     )
 
-    async def fake_run(cmd, **kwargs):  # noqa: ARG001
+    async def fake_run(cmd, **kwargs):
         return 0, 'fake_head_sha\n', ''
     monkeypatch.setattr('orchestrator.workflow._run', fake_run)
 
