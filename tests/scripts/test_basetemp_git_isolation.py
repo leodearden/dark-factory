@@ -29,6 +29,7 @@ import os
 import subprocess
 import sys
 import tomllib
+from collections.abc import Iterable
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -417,24 +418,13 @@ class TestCeilingIsLiveInThisRun:
 # needs it most.  This guard is what makes the coverage uniform and keeps it
 # that way, rather than trusting the next person to remember.
 
-_WIRING_SNIPPET = (
-    'REPO_ROOT = Path(__file__).resolve().parents[2]\n'
-    'if str(REPO_ROOT) not in sys.path:\n'
-    '    sys.path.append(str(REPO_ROOT))   # APPEND — never insert(0, ...)\n'
-    'from df_pytest_isolation import (\n'
-    '    _df_claude_binary_unset,  # noqa: F401\n'
-    '    _df_deploy_clocks_unwritten,  # noqa: F401\n'
-    '    _df_git_ceiling_at_basetemp,  # noqa: F401\n'
-    '    reject_unsafe_basetemp,\n'
-    ')\n'
-    'def pytest_configure(config):\n'
-    '    reject_unsafe_basetemp(config)\n'
-)
-
 # Every suite-wide fixture a test-root conftest must bind, mapped to the clause
 # its defect message appends: what goes wrong in a suite that forgets it.
 _REQUIRED_FIXTURE_BINDINGS: dict[str, str] = {
-    '_df_git_ceiling_at_basetemp': '',
+    '_df_git_ceiling_at_basetemp': (
+        ' — without it a cwd=tmp_path git call can walk up into the enclosing '
+        'live worktree (esc-3072-3)'
+    ),
     '_df_deploy_clocks_unwritten': (
         ' — without it this suite can stamp a REAL deploy clock and suppress the '
         'watchdog staleness backstop for 8h (task 3797)'
@@ -444,7 +434,24 @@ _REQUIRED_FIXTURE_BINDINGS: dict[str, str] = {
         '(shared.cli_invoke::claude_binary_spec), so a test that hides or fakes '
         '`claude` by editing PATH would spawn the REAL CLI'
     ),
+    '_df_no_mock_derived_stray_dirs': (
+        ' — without it a test that hands a MagicMock or AsyncMock to code calling '
+        'Path(...).mkdir() materialises a real AsyncMock/ or MagicMock/ tree under '
+        'the CWD, which only .gitignore contains (tasks 3223, 4592)'
+    ),
 }
+
+_WIRING_SNIPPET = (
+    'REPO_ROOT = Path(__file__).resolve().parents[2]\n'
+    'if str(REPO_ROOT) not in sys.path:\n'
+    '    sys.path.append(str(REPO_ROOT))   # APPEND — never insert(0, ...)\n'
+    'from df_pytest_isolation import (\n'
+    + ''.join(f'    {name},  # noqa: F401\n' for name in sorted(_REQUIRED_FIXTURE_BINDINGS))
+    + '    reject_unsafe_basetemp,\n'
+    ')\n'
+    'def pytest_configure(config):\n'
+    '    reject_unsafe_basetemp(config)\n'
+)
 
 
 def _test_root_conftests() -> list[Path]:
@@ -573,6 +580,25 @@ def _wiring_defects(source: str, conftest: Path) -> list[str]:
     return defects
 
 
+def _conftest_sample(
+    bindings: Iterable[str] = tuple(_REQUIRED_FIXTURE_BINDINGS),
+    *,
+    bootstrap: str = 'if str(REPO_ROOT) not in sys.path:\n    sys.path.append(str(REPO_ROOT))\n',
+    configure_body: str = '    reject_unsafe_basetemp(config)\n',
+) -> str:
+    """A synthetic test-root conftest binding *bindings*, for the detector self-tests."""
+    imported = ''.join(f'    {name},\n' for name in (*sorted(bindings), 'reject_unsafe_basetemp'))
+    return (
+        'import sys\n'
+        'from pathlib import Path\n'
+        'REPO_ROOT = Path(__file__).resolve().parents[2]\n'
+        f'{bootstrap}'
+        f'from df_pytest_isolation import (\n{imported})\n'
+        'def pytest_configure(config):\n'
+        f'{configure_body}'
+    )
+
+
 class TestEveryTestRootConftestIsWired:
     """The defence is uniform across subprojects, and stays that way."""
 
@@ -587,12 +613,9 @@ class TestEveryTestRootConftestIsWired:
             'Unwired test-root conftest(s). The verify lane runs '
             '`cd <subproject> && uv run pytest tests/`, so rootdir is the '
             'SUBPROJECT and the repo-root conftest.py is never loaded — a '
-            'conftest missing this wiring runs its whole suite with NONE of the '
-            'suite-wide defences: no basetemp git ceiling (esc-3072-3); no '
-            'deploy-clock guard, so it can stamp a REAL deploy clock and '
-            'suppress the watchdog staleness backstop for 8h (task 3797); and no '
-            'CLAUDE_BINARY scrub, so a test that hides or fakes `claude` via PATH '
-            'can spawn the REAL CLI.\n'
+            'conftest missing this wiring runs its whole suite without the '
+            'suite-wide defences it lacks. Each offender\'s defects below name '
+            'what that suite loses.\n'
             f'Offenders: {offenders}\n'
             f'Add:\n{_WIRING_SNIPPET}'
         )
@@ -629,73 +652,27 @@ class TestEveryTestRootConftestIsWired:
         assert _wiring_defects(sample, REPO_ROOT / 'orchestrator' / 'tests' / 'conftest.py')
 
     def test_the_detector_clears_a_correctly_wired_conftest(self) -> None:
-        sample = (
-            'import sys\n'
-            'from pathlib import Path\n'
-            'REPO_ROOT = Path(__file__).resolve().parents[2]\n'
-            'if str(REPO_ROOT) not in sys.path:\n'
-            '    sys.path.append(str(REPO_ROOT))\n'
-            'from df_pytest_isolation import (\n'
-            '    _df_claude_binary_unset,\n'
-            '    _df_deploy_clocks_unwritten,\n'
-            '    _df_git_ceiling_at_basetemp,\n'
-            '    reject_unsafe_basetemp,\n'
-            ')\n'
-            'def pytest_configure(config):\n'
-            '    reject_unsafe_basetemp(config)\n'
-        )
+        sample = _conftest_sample()
 
         assert _wiring_defects(sample, REPO_ROOT / 'orchestrator' / 'tests' / 'conftest.py') == []
 
-    def test_the_detector_flags_a_conftest_missing_only_the_deploy_clock_guard(self) -> None:
-        """Self-test: the NEW rule is not vacuous on its own.
+    @pytest.mark.parametrize('missing', sorted(_REQUIRED_FIXTURE_BINDINGS))
+    def test_the_detector_flags_a_conftest_missing_only_one_required_binding(
+        self, missing: str,
+    ) -> None:
+        """Self-test: each required-binding rule is not vacuous on its own.
 
         A conftest correctly wired for everything else must still be flagged
-        for the deploy-clock guard alone — otherwise the rule would only ever
+        for the one binding it lacks — otherwise that rule would only ever
         fire alongside another defect and could be deleted without any test
         noticing (task 3797).
         """
-        sample = (
-            'import sys\n'
-            'from pathlib import Path\n'
-            'REPO_ROOT = Path(__file__).resolve().parents[2]\n'
-            'if str(REPO_ROOT) not in sys.path:\n'
-            '    sys.path.append(str(REPO_ROOT))\n'
-            'from df_pytest_isolation import (\n'
-            '    _df_claude_binary_unset,\n'
-            '    _df_git_ceiling_at_basetemp,\n'
-            '    reject_unsafe_basetemp,\n'
-            ')\n'
-            'def pytest_configure(config):\n'
-            '    reject_unsafe_basetemp(config)\n'
-        )
+        sample = _conftest_sample(b for b in _REQUIRED_FIXTURE_BINDINGS if b != missing)
 
         defects = _wiring_defects(sample, REPO_ROOT / 'orchestrator' / 'tests' / 'conftest.py')
 
-        assert [d for d in defects if '_df_deploy_clocks_unwritten' in d], defects
-        assert len(defects) == 1, f'only the deploy-clock rule should fire: {defects}'
-
-    def test_the_detector_flags_a_conftest_missing_only_the_claude_binary_scrub(self) -> None:
-        """Self-test: the CLAUDE_BINARY rule fires on its own, not only beside another defect."""
-        sample = (
-            'import sys\n'
-            'from pathlib import Path\n'
-            'REPO_ROOT = Path(__file__).resolve().parents[2]\n'
-            'if str(REPO_ROOT) not in sys.path:\n'
-            '    sys.path.append(str(REPO_ROOT))\n'
-            'from df_pytest_isolation import (\n'
-            '    _df_deploy_clocks_unwritten,\n'
-            '    _df_git_ceiling_at_basetemp,\n'
-            '    reject_unsafe_basetemp,\n'
-            ')\n'
-            'def pytest_configure(config):\n'
-            '    reject_unsafe_basetemp(config)\n'
-        )
-
-        defects = _wiring_defects(sample, REPO_ROOT / 'orchestrator' / 'tests' / 'conftest.py')
-
-        assert [d for d in defects if '_df_claude_binary_unset' in d], defects
-        assert len(defects) == 1, f'only the CLAUDE_BINARY rule should fire: {defects}'
+        assert len(defects) == 1, f'only the {missing} rule should fire: {defects}'
+        assert missing in defects[0], defects
 
     def test_the_detector_flags_an_insert_of_the_repo_root(self) -> None:
         """Self-test: the namespace-package hazard is pinned STRUCTURALLY.
@@ -703,20 +680,7 @@ class TestEveryTestRootConftestIsWired:
         insert(0, ...) is invisible in review and only bites much later, far
         from this change, as confusing import breakage.
         """
-        sample = (
-            'import sys\n'
-            'from pathlib import Path\n'
-            'REPO_ROOT = Path(__file__).resolve().parents[2]\n'
-            'sys.path.insert(0, str(REPO_ROOT))\n'
-            'from df_pytest_isolation import (\n'
-            '    _df_claude_binary_unset,\n'
-            '    _df_deploy_clocks_unwritten,\n'
-            '    _df_git_ceiling_at_basetemp,\n'
-            '    reject_unsafe_basetemp,\n'
-            ')\n'
-            'def pytest_configure(config):\n'
-            '    reject_unsafe_basetemp(config)\n'
-        )
+        sample = _conftest_sample(bootstrap='sys.path.insert(0, str(REPO_ROOT))\n')
 
         defects = _wiring_defects(sample, REPO_ROOT / 'orchestrator' / 'tests' / 'conftest.py')
 
@@ -724,19 +688,8 @@ class TestEveryTestRootConftestIsWired:
 
     def test_the_detector_flags_a_pytest_configure_that_does_not_call_the_check(self) -> None:
         """Self-test: presence of the hook is not enough — the CALL is the point."""
-        sample = (
-            'import sys\n'
-            'from pathlib import Path\n'
-            'REPO_ROOT = Path(__file__).resolve().parents[2]\n'
-            'sys.path.append(str(REPO_ROOT))\n'
-            'from df_pytest_isolation import (\n'
-            '    _df_claude_binary_unset,\n'
-            '    _df_deploy_clocks_unwritten,\n'
-            '    _df_git_ceiling_at_basetemp,\n'
-            '    reject_unsafe_basetemp,\n'
-            ')\n'
-            'def pytest_configure(config):\n'
-            "    config.addinivalue_line('markers', 'slow: ...')\n"
+        sample = _conftest_sample(
+            configure_body="    config.addinivalue_line('markers', 'slow: ...')\n",
         )
 
         defects = _wiring_defects(sample, REPO_ROOT / 'orchestrator' / 'tests' / 'conftest.py')
