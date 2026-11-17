@@ -107,34 +107,34 @@ function EscalationLink({ escalation, onOpenEscalation }) {
 // (a storm) or the link itself, then its fingerprint when the payload carries
 // one.  A quiet tripwire item ships neither verdict_detail nor fingerprint, so
 // both simply render nothing.
-function MemoryEvalVerdict({ verdict, onOpenEscalation }) {
-  const badge = verdictBadge(verdict);
+function MemoryEvalVerdict({ entry, onOpenEscalation }) {
+  const badge = verdictBadge(entry);
   return (
     <div>
       {/* verdict_detail carries the evaluator's own words, untranslated. */}
-      <span className={badge.cls} title={verdict.verdict_detail || undefined}>
+      <span className={badge.cls} title={entry.verdict_detail || undefined}>
         {badge.label}
       </span>
       {/* Under storm the per-metric escalations were deliberately collapsed
           into the one aggregate, so the absence of a link here is explained
           rather than left looking like a missing link. */}
-      {verdict.parity === 'storm_collapsed'
+      {entry.parity === 'storm_collapsed'
         ? (
           <div className="mono" style={{ fontSize: 10, color: 'var(--fg-3)' }}>
             link suppressed — storm aggregate
           </div>
         )
-        : verdict.escalation && (
+        : entry.escalation && (
           <div style={{ marginTop: 4 }}>
-            <EscalationLink escalation={verdict.escalation} onOpenEscalation={onOpenEscalation} />
+            <EscalationLink escalation={entry.escalation} onOpenEscalation={onOpenEscalation} />
           </div>
         )}
       {/* Fingerprints are rendered whole — never parsed. They are the
           producer's private construction
           (memory_evals._escalation_projection()). */}
-      {verdict.fingerprint && (
+      {entry.fingerprint && (
         <div className="mono" style={{ fontSize: 10, color: 'var(--fg-3)' }}>
-          fp {verdict.fingerprint}
+          fp {entry.fingerprint}
         </div>
       )}
     </div>
@@ -230,8 +230,8 @@ function MemoryEvalMetricRow({ metric, onOpenEscalation }) {
         <div style={{ fontSize: 10, color: 'var(--fg-3)' }}>{m.rule_kind}</div>
       </td>
       <td>
-        {own.map((verdict, i) => (
-          <MemoryEvalVerdict key={i} verdict={verdict} onOpenEscalation={onOpenEscalation} />
+        {own.map((entry, i) => (
+          <MemoryEvalVerdict key={i} entry={entry} onOpenEscalation={onOpenEscalation} />
         ))}
         {m.limit_ref && (
           <div className="mono" style={{ fontSize: 10, color: 'var(--fg-3)' }}>
@@ -367,13 +367,13 @@ function MemoryEvalMetricRow({ metric, onOpenEscalation }) {
         </div>
       </td>
     </tr>
-    {items.map(verdict => (
-      <tr key={verdict.item}>
+    {items.map(entry => (
+      <tr key={entry.item}>
         <td className="mono" style={{ fontSize: 10, color: 'var(--fg-3)', paddingLeft: 16 }}>
-          item {verdict.item}
+          item {entry.item}
         </td>
         <td />
-        <td><MemoryEvalVerdict verdict={verdict} onOpenEscalation={onOpenEscalation} /></td>
+        <td><MemoryEvalVerdict entry={entry} onOpenEscalation={onOpenEscalation} /></td>
         <td colSpan={6} />
       </tr>
     ))}

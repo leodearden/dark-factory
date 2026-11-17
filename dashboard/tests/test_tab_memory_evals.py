@@ -822,11 +822,6 @@ _PRESENCE_CONTRACTS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         (r'\bev\s*\.\s*metrics\b',),
     ),
     (
-        'per-verdict escalation guard',
-        r'\bverdict\.escalation\s*&&',
-        (r'\bverdict\s*\.\s*escalation\s*&&\s*\(',),
-    ),
-    (
         # The producer end of the escalation-link contract, and the exact site
         # `test_memory_evals_escalation_id_contract.py` is built around: the
         # `(queue, id)` descriptor handed to `onNavigate` is what
@@ -2509,10 +2504,12 @@ def test_escalation_links_and_storm_aggregate_banner(
     """
     code = tab_memory_evals_jsx_code
 
-    # (a) a verdict entry carrying an escalation renders a link, guarded so a
-    #     null projection renders no dead control.
+    # (a) a verdict entry carrying an escalation renders a link.  That ONLY
+    #     entries carrying one do, so a null projection renders no dead
+    #     control, is rendered and asserted by
+    #     js/jsx_render.test.mjs::assertRendersItsVerdicts.
     assert 'data-testid="memory-eval-escalation-link"' in code, (
-        'a verdict entry carrying `verdict.escalation` must render a '
+        'a verdict entry carrying an `escalation` must render a '
         'data-testid="memory-eval-escalation-link" control.'
     )
     assert re.search(r'\{\s*escalation\.id\b', code), (
@@ -2523,12 +2520,6 @@ def test_escalation_links_and_storm_aggregate_banner(
         'the escalation control must RENDER `escalation.summary` — an opaque '
         'id alone makes the operator click to find out what it is. Anchored to '
         'the JSX expression position, not a bare name grep.'
-    )
-    assert re.search(
-        _presence_pattern('per-verdict escalation guard', code), code, re.MULTILINE
-    ), (
-        'the escalation control must be guarded by `verdict.escalation &&` so a '
-        'null projection renders nothing rather than a dead control.'
     )
 
     # (b) built from `id` only — the projection has no `url` field.
