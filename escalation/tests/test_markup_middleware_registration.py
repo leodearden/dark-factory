@@ -1136,3 +1136,101 @@ class TestAnUnknownResidueKindIsFiledVisibly:
         assert any(
             'unrecognised residue kind' in r.getMessage() for r in caplog.records
         ), 'an unknown kind must be visible in the log, not merely in the queue'
+
+
+# ---------------------------------------------------------------------------
+# Task 10396 — a quoted HTML block is not a leak.
+# ---------------------------------------------------------------------------
+
+
+def _html_element(name: str, body: str) -> str:
+    return '\x3c' + name + '>' + body + closer_for(name)
+
+
+#: A collapsible HTML block as escalation prose quotes it. ``details`` is an
+#: envelope closer name, but no escalation tool declares a ``details``
+#: parameter, so its closer here terminates no envelope boundary.
+HTML_DETAILS_BLOCK = (
+    '\x3cdetails>' + _html_element('summary', 'Measured')
+    + _html_element('pre', 'rc=0') + closer_for('details')
+)
+
+#: The same block without its ``summary`` child, for the ``summary`` parameter:
+#: there that child's closer is the parameter's OWN closer, a needle the guard
+#: still refuses (see the last test below).
+HTML_DETAILS_BLOCK_UNLABELLED = (
+    '\x3cdetails>' + _html_element('pre', 'rc=0') + closer_for('details')
+)
+
+
+class TestAQuotedHtmlBlockIsFiledVerbatim:
+    """The real server files and resolves prose quoting an HTML block unchanged."""
+
+    SUMMARY = 'The report renders ' + HTML_DETAILS_BLOCK_UNLABELLED + ' for each finding.'
+    DETAIL = 'Evidence:\n' + HTML_DETAILS_BLOCK + '\nEnd of evidence.'
+    RESOLUTION = 'Resolved; the page now shows\n' + HTML_DETAILS_BLOCK
+
+    async def _file(self, client) -> str:
+        result = await client.call_tool(
+            'escalate_info', {**REQUIRED, 'summary': self.SUMMARY, 'detail': self.DETAIL},
+        )
+        assert result.data['status'] == 'queued'
+        return result.data['id']
+
+    @pytest.mark.asyncio
+    async def test_escalate_info_stores_the_text_verbatim(self, tmp_path: Path):
+        queue, server = build(tmp_path)
+
+        async with Client(server) as client:
+            esc_id = await self._file(client)
+
+        esc = queue.get(esc_id)
+        assert esc is not None
+        assert esc.summary == self.SUMMARY
+        assert esc.detail == self.DETAIL
+
+    @pytest.mark.asyncio
+    async def test_resolve_issue_stores_the_resolution_verbatim(self, tmp_path: Path):
+        queue, server = build(tmp_path)
+
+        async with Client(server) as client:
+            esc_id = await self._file(client)
+            await client.call_tool(
+                'resolve_issue', {'escalation_id': esc_id, 'resolution': self.RESOLUTION},
+            )
+
+        esc = queue.get(esc_id)
+        assert esc is not None
+        assert esc.resolution == self.RESOLUTION
+
+    @pytest.mark.asyncio
+    async def test_an_invoke_closer_beside_the_block_is_still_refused(self, tmp_path: Path):
+        _, server = build(tmp_path)
+
+        async with Client(server) as client:
+            with pytest.raises(ToolError) as excinfo:
+                await client.call_tool(
+                    'escalate_info',
+                    {**REQUIRED, 'detail': HTML_DETAILS_BLOCK + INVOKE_CLOSER + 'junk'},
+                )
+
+        payload = error_payload(excinfo)
+        assert payload['error_type'] == 'mcp_markup_unrepairable'
+        assert payload['field'] == 'detail'
+
+    @pytest.mark.asyncio
+    async def test_a_summary_element_in_the_summary_parameter_is_still_refused(
+        self, tmp_path: Path,
+    ):
+        _, server = build(tmp_path)
+
+        async with Client(server) as client:
+            with pytest.raises(ToolError) as excinfo:
+                await client.call_tool(
+                    'escalate_info',
+                    {**REQUIRED, 'summary': 'Renders ' + HTML_DETAILS_BLOCK + ' per finding.'},
+                )
+
+        payload = error_payload(excinfo)
+        assert payload['error_type'] == 'mcp_markup_unrepairable'
+        assert payload['matched_pattern'] == closer_for('summary')
