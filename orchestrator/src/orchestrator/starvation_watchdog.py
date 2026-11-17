@@ -1,4 +1,4 @@
-"""The starvation watchdog's predicate, its lock-refusal counter and its filing text.
+"""The starvation watchdog's predicate and its filing text.
 
 The predicate (plans/scheduler-dispatch-scoring-and-lock-layer-prd.md C4, as
 retuned by esc-4851-3): a task is starving only when it has BOTH a durable
@@ -16,13 +16,13 @@ age alone never fires.
   a task parked behind a holder is never routed to a pinning gate.
 
 This module owns the predicate and the text; ``Scheduler`` gathers the facts
-and delivers the consequence (event, pin, escalation).
+(the durable counts live in ``starvation_state.py``) and delivers the
+consequence (event, pin, escalation).
 """
 
 from __future__ import annotations
 
-from collections import Counter
-from collections.abc import Iterable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -126,25 +126,6 @@ def classify(facts: CandidateFacts, cfg: StarvationWatchdogConfig) -> Starvation
     if facts.lock_refusals >= cfg.skip_threshold and age >= cfg.idle_only_secs:
         return StarvationGate.LOCK_REFUSED
     return None
-
-
-class LockRefusals:
-    """Per-task count of scans that refused the task its locks while a lower-ranked task dispatched."""
-
-    def __init__(self) -> None:
-        self._counts: Counter[str] = Counter()
-
-    def note_scan(self, refused: Iterable[str]) -> None:
-        self._counts.update(set(refused))
-
-    def count(self, task_id: str) -> int:
-        return self._counts.get(task_id, 0)
-
-    def forget(self, task_id: str) -> None:
-        self._counts.pop(task_id, None)
-
-    def task_ids(self) -> frozenset[str]:
-        return frozenset(self._counts)
 
 
 def _hours(secs: float) -> str:

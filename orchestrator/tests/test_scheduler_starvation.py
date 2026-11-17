@@ -476,14 +476,22 @@ CAP_OF_TWO: dict[str, Any] = {'auto_pin_max_concurrent': 2, 'auto_pin_ttl_secs':
 
 
 async def _three_starve_behind_a_cap_of_two(rig: _Rig, *extra: dict) -> EscalationQueue:
-    """S1 and S2 starve first and take both watchdog pins; the cap turns S3 away."""
+    """S1 and S2 starve first and take both watchdog pins; the cap turns S3 away.
+
+    S3 depends on the seed for the first minute, so it becomes a candidate
+    later than S1 and S2 while staying pending (and keeping its refusals).
+    """
     queue = EscalationQueue(rig.scheduler.config.project_root / 'esc')
     rig.scheduler.escalation_queue = queue
     seed = _task('0', 'critical', 'hot/a.py', 'hot/b.py', 'hot/c.py', 'hot/d.py')
-    rig.set_tasks([seed, _task('S1', 'medium', 'hot/b.py'), _task('S2', 'medium', 'hot/c.py')])
+    s3 = _task('S3', 'medium', 'hot/d.py')
+    s3['dependencies'] = ['0']
+    rig.set_tasks([
+        seed, _task('S1', 'medium', 'hot/b.py'), _task('S2', 'medium', 'hot/c.py'), s3,
+    ])
     assert await rig.tick_id() == '0'
     rig.advance(60)
-    rig.tasks.append(_task('S3', 'medium', 'hot/d.py'))
+    s3['dependencies'] = []
     assert await rig.tick() is None
     rig.advance(FLOOR)
     rig.tasks.extend([_task('1', 'high', 'hot/a.py'), *extra])

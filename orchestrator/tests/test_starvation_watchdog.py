@@ -15,7 +15,6 @@ from orchestrator.starvation_watchdog import (
     STARVATION_WATCHDOG_MARKER,
     CandidateFacts,
     Finding,
-    LockRefusals,
     ParkBlock,
     StarvationGate,
     cap_escalation,
@@ -73,27 +72,6 @@ def test_each_gate_has_its_own_age_floor() -> None:
 
 def test_only_park_blocked_does_not_pin() -> None:
     assert {gate for gate in StarvationGate if not gate.pins} == {StarvationGate.PARK_BLOCKED}
-
-
-class TestLockRefusals:
-    def test_counts_scans_per_task(self) -> None:
-        refusals = LockRefusals()
-        refusals.note_scan(['a', 'b'])
-        refusals.note_scan(['a', 'b'])
-        refusals.note_scan(['a'])
-
-        assert refusals.count('a') == 3
-        assert refusals.count('b') == 2
-        assert refusals.count('never') == 0
-        assert refusals.task_ids() == frozenset({'a', 'b'})
-
-    def test_forget_drops_the_count(self) -> None:
-        refusals = LockRefusals()
-        refusals.note_scan(['a', 'b'])
-        refusals.forget('a')
-
-        assert refusals.count('a') == 0
-        assert refusals.task_ids() == frozenset({'b'})
 
 
 class TestEscalationText:
