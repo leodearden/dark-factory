@@ -12,9 +12,10 @@ a single file rather than to an opaque aggregate.
 Three non-vacuity guards are load-bearing here, because PRD leaf **κ** deletes
 reify's originals on the strength of this suite being green:
 
-* ``PORTED_TESTS`` is an explicit manifest asserted set-equal to the on-disk
-  glob.  A glob-only driver reports a green suite when it discovers zero files;
-  the manifest turns a dropped, renamed or mis-globbed port into a hard failure.
+* ``BASH_SUITES`` (``PORTED_TESTS`` plus ``NATIVE_TESTS``) is an explicit
+  manifest asserted set-equal to the on-disk glob.  A glob-only driver reports a
+  green suite when it discovers zero files; the manifest turns a dropped,
+  renamed or mis-globbed suite into a hard failure.
 * Required host tools FAIL rather than skip.  reify's originals hard-require
   ``flock``, ``git``, procfs, ``du``, ``dd`` and (for audit) ``python3`` with no
   guards at all, so a skip on a tool-less host would silently convert this
@@ -70,6 +71,13 @@ PORTED_TESTS: tuple[str, ...] = (
     'test_warm_lane_sizing_lifecycle.sh',
     'test_provision_warm_lane_fs.sh',
 )
+
+#: Bash suites with no reify source, never diffed against reify; currently only
+#: the dark-factory-native half of the gc split (task 6931).
+NATIVE_TESTS: tuple[str, ...] = ('test_warm_lane_gc_native.sh',)
+
+#: Every bash suite this driver runs, whatever its provenance.
+BASH_SUITES: tuple[str, ...] = PORTED_TESTS + NATIVE_TESTS
 
 #: Every invocable script α relocated, mapped to the ported bash test that owns
 #: its coverage.  The parenthesised notes record *additional* real exercise, so a
@@ -186,10 +194,8 @@ ASSERT_FLOORS = {
                                              # + 6 (M1-M3: merge arm from shared.merge_subject, task 6716)
                                              # + 5 (M4-M5: the lib refuses an empty merge arm, task 6716)
     'test_thin_warm_lane.sh': 74,  # 45 + 29 (A12 3, B3 2, B3b 6, Block F 18)
-    'test_warm_lane_gc.sh': 441,  # 214 + 64 (S-pressure 17 + S-age 16 + S-age-degrade 14
-                                 #           + A11 12 + A11-boundary 5) + 2 (A11m/A11n, task 5940)
-                                 # + 43 (S-discard) + 21 (T) − 8 (S-discard3, root-guarded; task 7862)
-                                 # + 105 (V/A12, task 7859)
+    'test_warm_lane_gc.sh': 226,  # 234 measured − 8 (S-discard3, root-guarded)
+    'test_warm_lane_gc_native.sh': 217,  # 215 moved from test_warm_lane_gc.sh + 2 (its own TRASH pair)
     'test_warm_lane_gc_sweep.sh': 130,  # 99 + 3 (G6g, task 5940) + 28 (Z, task 7859)
     'test_warm_lane_audit.sh': 229,  # 232 measured − 3 (L9, root-guarded)
     'test_warm_lane_sizing_lifecycle.sh': 65,
@@ -317,9 +323,10 @@ def _tail(text: str, limit: int = 4000) -> str:
 
 
 def test_manifest_matches_disk() -> None:
-    """``PORTED_TESTS`` must name exactly the ``test_*.sh`` files on disk.
+    """``BASH_SUITES`` must name exactly the ``test_*.sh`` files on disk.
 
-    The non-vacuity guard, plus its companion: ``ASSERT_FLOORS`` must be keyed by
+    The non-vacuity guard, plus its companions: a suite is either a reify port
+    or dark-factory-native, never both, and ``ASSERT_FLOORS`` must be keyed by
     exactly the same set.  ``test_helpers.sh`` is excluded: it is the sourced
     harness, not a runnable suite.
     """
@@ -327,18 +334,23 @@ def test_manifest_matches_disk() -> None:
         p.name for p in BASH_TEST_DIR.glob('test_*.sh')
         if p.name != 'test_helpers.sh'
     }
-    assert set(PORTED_TESTS) == on_disk, (
-        f'PORTED_TESTS and {BASH_TEST_DIR} disagree.\n'
-        f'  manifest-only (dropped/renamed port?): {sorted(set(PORTED_TESTS) - on_disk)}\n'
-        f'  disk-only (unregistered port?):        {sorted(on_disk - set(PORTED_TESTS))}'
+    assert set(BASH_SUITES) == on_disk, (
+        f'BASH_SUITES and {BASH_TEST_DIR} disagree.\n'
+        f'  manifest-only (dropped/renamed suite?): {sorted(set(BASH_SUITES) - on_disk)}\n'
+        f'  disk-only (unregistered suite?):        {sorted(on_disk - set(BASH_SUITES))}'
     )
-    # Every suite must carry an assert floor, and a removed port must not leave a
-    # stale one behind: without this, a dropped floor is a KeyError at run time
-    # while a stale floor is invisible.
-    assert set(ASSERT_FLOORS) == set(PORTED_TESTS), (
-        f'ASSERT_FLOORS and PORTED_TESTS disagree.\n'
-        f'  floor without a port:  {sorted(set(ASSERT_FLOORS) - set(PORTED_TESTS))}\n'
-        f'  port without a floor:  {sorted(set(PORTED_TESTS) - set(ASSERT_FLOORS))}'
+    overlap = set(PORTED_TESTS) & set(NATIVE_TESTS)
+    assert not overlap, (
+        f'PORTED_TESTS and NATIVE_TESTS overlap: {sorted(overlap)}. A suite is '
+        f'either a reify port or dark-factory-native, never both.'
+    )
+    # Every suite must carry an assert floor, and a removed suite must not leave
+    # a stale one behind: without this, a dropped floor is a KeyError at run
+    # time while a stale floor is invisible.
+    assert set(ASSERT_FLOORS) == set(BASH_SUITES), (
+        f'ASSERT_FLOORS and BASH_SUITES disagree.\n'
+        f'  floor without a suite:  {sorted(set(ASSERT_FLOORS) - set(BASH_SUITES))}\n'
+        f'  suite without a floor:  {sorted(set(BASH_SUITES) - set(ASSERT_FLOORS))}'
     )
 
 
@@ -390,10 +402,10 @@ def test_every_invocable_script_has_ported_coverage() -> None:
     )
     unported = {
         script: test for script, test in SCRIPT_COVERAGE.items()
-        if test not in PORTED_TESTS
+        if test not in BASH_SUITES
     }
     assert not unported, (
-        f'SCRIPT_COVERAGE names bash tests that are not in PORTED_TESTS: {unported}'
+        f'SCRIPT_COVERAGE names bash tests that are not in BASH_SUITES: {unported}'
     )
 
 
@@ -530,9 +542,9 @@ def _run_bash_suite(name: str) -> tuple[int, str, str]:
         return proc.returncode, stdout, stderr
 
 
-@pytest.mark.parametrize('name', PORTED_TESTS, ids=PORTED_TESTS)
+@pytest.mark.parametrize('name', BASH_SUITES, ids=BASH_SUITES)
 def test_bash_suite_passes(name: str) -> None:
-    """Each ported bash suite must be green by reify's own greenness predicate.
+    """Each bash suite must be green by reify's own greenness predicate.
 
     ``exit 0`` AND a ``Results: N passed, 0 failed`` line AND ``N`` at or above
     ``ASSERT_FLOORS[name]``.  Exit status alone cannot distinguish "all 865
