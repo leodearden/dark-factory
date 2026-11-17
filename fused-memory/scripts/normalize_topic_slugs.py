@@ -54,7 +54,7 @@ members that moved, because a gate left on a vacated slug is uncloseable.
 
 An UNGATED slug is undone when its attempt leaves a member on the legacy
 value, because a split slug cannot be finished by re-running: the collision
-guard sees the moved members as incumbents on the new slug and refuses the
+guard sees the members on the new slug as incumbents and refuses the
 stragglers as ``slug_collision``.  So the members this run moved are rolled
 back, the report lists the group under ``ungated_partial_rename`` (and the
 residue probe under ``legacy_slug_residue``), and a re-run finishes the move
@@ -62,11 +62,14 @@ once the failure is resolved.  A member that vanished, or that another writer
 moved to a third value, is no longer on the legacy slug: it splits nothing and
 triggers no undo.
 
-The residual is an undo that itself fails.  That member stays on the new slug
-and is named in the group's ``undo_failures``, and a re-run refuses its slug
-as ``slug_collision``.  Finish it by hand: once the straggler's failure is
-resolved, patch its ``metadata.topic`` to the new slug with a metadata-only
-``update_memory`` merge, the same patch this script issues.
+The residual is a member the rollback leaves on the new slug: one whose undo
+itself fails (named in ``undo_failures``), or one another writer had already
+put there between plan and apply, which this run never moved and so never
+undoes.  The group's ``on_new_slug_memory_ids`` names every such member, and
+while it is non-empty the slug is still split and a re-run refuses it as
+``slug_collision``.  Finish it by hand: patch each member it names back to the
+legacy value with a metadata-only ``update_memory`` merge, the same patch this
+script issues, and re-run once the straggler's failure is resolved.
 
 Dry run is the default — the operator runbook
 --------------------------------------------
@@ -97,8 +100,8 @@ Dry run is the default — the operator runbook
    run with either populated is a LOWER BOUND, and a clean residue probe over
    it proves nothing.  After an ``--apply``, ``ungated_partial_rename`` lists
    any slug rolled back because a member's write failed: resolve that failure
-   and re-run.  An entry with non-empty ``undo_failures`` is still split
-   across both values and is finished by hand, as described above.
+   and re-run.  An entry with non-empty ``on_new_slug_memory_ids`` is still
+   split across both values and needs the hand step described above first.
 
 3. **Apply**, as an OPERATOR, with the same roots::
 
@@ -1274,24 +1277,51 @@ async def _hold_split_ungated_group(
     """Roll back an ungated slug that this run left split, and report the hold.
 
     The entry is described from the PRE-undo rows: once the moved members are
-    re-scored, nothing reads as stood.  An attempt that split nothing — every
+    re-scored, nothing reads as moved.  An attempt that split nothing — every
     member stood, or a straggler vanished or moved elsewhere — keeps its
     writes and returns ``None``.
+
+    ``on_new_slug_memory_ids`` is the state the hold leaves behind, measured
+    rather than inferred: a member another writer had already put on the new
+    slug, which the undo never touches, plus every member whose undo failed.
+    Non-empty, it means the slug is still split.
     """
     entry = describe_partial_ungated_group(group, results)
     if entry is None:
         return None
     undo_failures = await _undo_group(
         memory_service, results, rescore_as='ungated_partial_rename')
+    on_new_slug = sorted(
+        r['memory_id'] for r in results
+        if r.get('outcome') == 'already_normalized' or r.get('undone') is False
+    )
     logger.warning(
         'UNGATED SLUG HELD project=%s topic=%s -> %s: %d member(s) left on the '
-        'legacy value, so %d moved member(s) were rolled back; %d undo failure(s).',
+        'legacy value, so %d moved member(s) were rolled back; %d member(s) '
+        'still on the new slug, %d undo failure(s).',
         group.project_id, group.old_topic, group.new_topic,
         len(entry['failed_memory_ids']),
         sum(1 for r in results if r.get('undone')),
+        len(on_new_slug),
         len(undo_failures),
     )
-    return {**entry, 'undo_failures': undo_failures}
+    return {**entry, 'on_new_slug_memory_ids': on_new_slug, 'undo_failures': undo_failures}
+
+
+@dataclass(frozen=True)
+class GroupOutcome:
+    """What :func:`rename_group` did to one slug, one field per destination.
+
+    Attributes:
+        results: The member rows, in plan order.
+        gate_row: A gated group's gate row — patched, would-patch or held.
+        held_entry: The ``ungated_partial_rename`` entry of an ungated group
+            this run left split and rolled back.
+    """
+
+    results: list[dict]
+    gate_row: dict | None = None
+    held_entry: dict | None = None
 
 
 async def rename_group(
@@ -1300,7 +1330,7 @@ async def rename_group(
     *,
     apply: bool,
     client: Any = None,
-) -> tuple[list[dict], dict | None]:
+) -> GroupOutcome:
     """Move one slug in both stores, or leave it exactly where it started.
 
     Order, and why it is this way round:
@@ -1330,19 +1360,22 @@ async def rename_group(
     unable to move it is not permission to leave it behind.
 
     Returns:
-        ``(memory results, group row or None)``: the gate row of a gated
-        group, the ``ungated_partial_rename`` entry of a held ungated group,
-        else ``None``.  Rows whose write was undone are re-scored
-        ``gate_lockstep_failed`` or ``ungated_partial_rename`` so the report
-        never claims a rename that no longer stands; rows that never wrote
-        keep their own diagnosis, which is the actionable one.
+        A :class:`GroupOutcome`: the member rows, a gated group's gate row,
+        and a held ungated group's ``ungated_partial_rename`` entry.  Rows
+        whose write was undone are re-scored ``gate_lockstep_failed`` or
+        ``ungated_partial_rename`` so the report never claims a rename that no
+        longer stands; rows that never wrote keep their own diagnosis, which
+        is the actionable one.
     """
     results = [
         await rename_one(memory_service, rename, apply=apply)
         for rename in group.renames
     ]
     if group.gate_task_id is None:
-        return results, await _hold_split_ungated_group(memory_service, group, results)
+        return GroupOutcome(
+            results,
+            held_entry=await _hold_split_ungated_group(memory_service, group, results),
+        )
 
     failed = [r for r in results if r.get('outcome') not in _STOOD_OUTCOMES]
     if failed:
@@ -1354,7 +1387,7 @@ async def rename_group(
             group.project_id, group.old_topic, group.new_topic,
             len(failed), len(results), group.gate_task_id,
         )
-        return results, _gate_row(
+        return GroupOutcome(results, gate_row=_gate_row(
             group, 'gate_lockstep_failed',
             half='memory',
             error=f'{len(failed)} of {len(results)} memory renames did not stand',
@@ -1364,10 +1397,11 @@ async def rename_group(
                 'the gate patch was withheld, so the gate still points at the '
                 'legacy slug — resolve the memory-side failures and re-run'
             ),
-        )
+        ))
 
     if not apply:
-        return results, _gate_row(group, 'would_patch_gate', patch=group.gate_block)
+        return GroupOutcome(
+            results, gate_row=_gate_row(group, 'would_patch_gate', patch=group.gate_block))
 
     error: str | None = None
     if client is None:
@@ -1392,8 +1426,8 @@ async def rename_group(
         except Exception as exc:
             error = f'{type(exc).__name__}: {exc}'
         else:
-            return results, _gate_row(
-                group, 'gate_patched', patch=group.gate_block, response=response)
+            return GroupOutcome(results, gate_row=_gate_row(
+                group, 'gate_patched', patch=group.gate_block, response=response))
 
     undo_failures = await _undo_group(
         memory_service, results, rescore_as='gate_lockstep_failed')
@@ -1403,7 +1437,7 @@ async def rename_group(
         group.project_id, group.old_topic, group.new_topic, group.gate_task_id,
         error, len(group.renames), len(undo_failures),
     )
-    return results, _gate_row(
+    return GroupOutcome(results, gate_row=_gate_row(
         group, 'gate_lockstep_failed',
         half='gate', error=error, undo_failures=undo_failures,
         note=(
@@ -1411,17 +1445,24 @@ async def rename_group(
             'stores; a gate left pointing at a slug no record carries is '
             'permanently uncloseable, which is worse than not migrating'
         ),
-    )
+    ))
 
 
 def describe_partial_ungated_group(group: GateGroup, results: list[dict]) -> dict | None:
     """The report entry for an ungated slug that only partly moved, else ``None``.
 
-    Pure.  A gated group is never described here: its gate row already reports
-    a held pair.  ``failed_outcomes`` has the gate row's key and shape, so the
-    two read the same way.  "Failed" means a member whose rename did not land
-    and so still carries the legacy value; a vanished or concurrently moved
-    member splits nothing and is reported only in its own bucket.
+    Pure, and read from the rows BEFORE any rollback.  A gated group is never
+    described here: its gate row already reports a held pair.
+    ``failed_outcomes`` has the gate row's key and shape, so the two read the
+    same way.  A slug is split when a member stood on the new slug while
+    another is "failed": its rename did not land, so it still carries the
+    legacy value.  A vanished or concurrently moved member splits nothing and
+    is reported only in its own bucket.
+
+    ``moved_memory_ids`` are the members whose rename this run landed (or, in
+    a dry run, would land): the ones the hold rolls back.  A member another
+    writer had already put on the new slug stood without being moved, so it
+    is not among them.
     """
     if group.gate_task_id is not None:
         return None
@@ -1434,16 +1475,18 @@ def describe_partial_ungated_group(group: GateGroup, results: list[dict]) -> dic
         'project_id': group.project_id,
         'old_topic': group.old_topic,
         'new_topic': group.new_topic,
-        'stood_memory_ids': sorted(r['memory_id'] for r in stood),
+        'moved_memory_ids': sorted(
+            r['memory_id'] for r in stood if r.get('outcome') in _LANDED_OUTCOMES),
         'failed_memory_ids': sorted(r['memory_id'] for r in failed),
         'failed_outcomes': sorted({str(r.get('outcome')) for r in failed}),
         'note': (
             'a member of this slug was left on the legacy value, so the '
-            'members this run moved are rolled back to it and a re-run '
-            'finishes the slug once the failure is resolved (in a dry run the '
-            'hold is predicted, not yet made); a member still on the new slug '
-            '(see undo_failures) makes a re-run refuse the rest as '
-            'slug_collision — finish it by hand (see the module docstring)'
+            'members this run moved are rolled back to it (in a dry run the '
+            'hold is predicted, not yet made).  With on_new_slug_memory_ids '
+            'empty the slug is whole on the legacy value and a re-run finishes '
+            'it once the failure is resolved; non-empty, the slug is still '
+            'split and a re-run refuses it as slug_collision until the members '
+            'it names are put back by hand (see the module docstring)'
         ),
     }
 
@@ -1504,9 +1547,14 @@ _REHEARSED_OUTCOMES = frozenset({'would_rename'})
 #: never touched one, so there is nothing to drain and nothing to probe.
 _MOVED_OUTCOMES = frozenset({'renamed', 'would_rename', 'update_failed', 'rename_error'})
 
-#: Outcomes after which a member sits on the new slug, or would in a dry run.
-#: Every other outcome is a member that did not stand.
-_STOOD_OUTCOMES: frozenset[str] = frozenset({'renamed', 'would_rename', 'already_normalized'})
+#: Outcomes after which THIS run's rename of a member landed, or would in a
+#: dry run.
+_LANDED_OUTCOMES: frozenset[str] = frozenset({'renamed', 'would_rename'})
+
+#: Outcomes after which a member sits on the new slug, or would in a dry run:
+#: moved there by this run, or found there already.  Every other outcome is a
+#: member that did not stand.
+_STOOD_OUTCOMES: frozenset[str] = _LANDED_OUTCOMES | {'already_normalized'}
 
 #: Outcomes after which a member still carries the LEGACY value: its rename was
 #: attempted and did not land.  A record that is gone (``memory_not_found``) or
@@ -1888,15 +1936,12 @@ async def run(
     results: list[dict] = []
     gate_results: list[dict] = []
     for group in groups:
-        group_results, group_row = await rename_group(
-            memory_service, group, apply=apply, client=client)
-        results.extend(group_results)
-        if group_row is None:
-            continue
-        if group.gate_task_id is None:
-            _record_skips([group_row])
-        else:
-            gate_results.append(group_row)
+        group_outcome = await rename_group(memory_service, group, apply=apply, client=client)
+        results.extend(group_outcome.results)
+        if group_outcome.gate_row is not None:
+            gate_results.append(group_outcome.gate_row)
+        if group_outcome.held_entry is not None:
+            _record_skips([group_outcome.held_entry])
 
     # Scope item 3, in the same run that did the writing.
     await verify_old_slugs_drained(memory_service, results, skips)

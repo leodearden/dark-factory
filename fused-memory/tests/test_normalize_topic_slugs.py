@@ -1663,12 +1663,12 @@ class TestGateLockstepWriter:
             [_mod.Rename('dark_factory', 'm1', 'gate_topic', 'gate-topic')],
             [_gate_task('4220', 'gate_topic')])
 
-        results, gate_row = await _mod.rename_group(
+        outcome = await _mod.rename_group(
             service, group, apply=True, client=client)
 
-        assert [r['outcome'] for r in results] == ['renamed']
+        assert [r['outcome'] for r in outcome.results] == ['renamed']
         assert records['m1']['metadata']['topic'] == 'gate-topic'
-        assert gate_row['outcome'] == 'gate_patched'
+        assert outcome.gate_row['outcome'] == 'gate_patched'
         # The write is a NARROW merge of the one block, never a whole-blob
         # replace: `update_task` refuses any replace carrying `done_provenance`.
         (tool, payload), _ = client.call_tool.call_args
@@ -1688,11 +1688,11 @@ class TestGateLockstepWriter:
             [_mod.Rename('dark_factory', 'm1', 'gate_topic', 'gate-topic')],
             [_gate_task('4220', 'gate_topic')])
 
-        results, gate_row = await _mod.rename_group(
+        outcome = await _mod.rename_group(
             service, group, apply=False, client=client)
 
-        assert [r['outcome'] for r in results] == ['would_rename']
-        assert gate_row['outcome'] == 'would_patch_gate'
+        assert [r['outcome'] for r in outcome.results] == ['would_rename']
+        assert outcome.gate_row['outcome'] == 'would_patch_gate'
         assert records['m1']['metadata']['topic'] == 'gate_topic'
         service.update_memory.assert_not_awaited()
         client.call_tool.assert_not_awaited()
@@ -1708,13 +1708,14 @@ class TestGateLockstepWriter:
              _mod.Rename('dark_factory', 'm2', 'gate_topic', 'gate-topic')],
             [_gate_task('4220', 'gate_topic')])
 
-        results, gate_row = await _mod.rename_group(
+        outcome = await _mod.rename_group(
             service, group, apply=True, client=client)
 
-        assert {r['outcome'] for r in results} >= {'memory_not_found'}
+        assert {r['outcome'] for r in outcome.results} >= {'memory_not_found'}
         client.call_tool.assert_not_awaited()
-        assert gate_row['outcome'] == 'gate_lockstep_failed'
-        assert gate_row['half'] == 'memory'
+        assert outcome.gate_row['outcome'] == 'gate_lockstep_failed'
+        assert outcome.gate_row['half'] == 'memory'
+        assert outcome.held_entry is None, 'a held gated pair is reported by its gate row'
 
     @pytest.mark.asyncio
     async def test_a_refused_gate_patch_undoes_the_memory_half(self):
@@ -1733,16 +1734,16 @@ class TestGateLockstepWriter:
              _mod.Rename('dark_factory', 'm2', 'gate_topic', 'gate-topic')],
             [_gate_task('4220', 'gate_topic')])
 
-        results, gate_row = await _mod.rename_group(
+        outcome = await _mod.rename_group(
             service, group, apply=True, client=client)
 
-        assert gate_row['outcome'] == 'gate_lockstep_failed'
-        assert gate_row['half'] == 'gate'
-        assert 'done_provenance_via_update_task' in str(gate_row['error'])
+        assert outcome.gate_row['outcome'] == 'gate_lockstep_failed'
+        assert outcome.gate_row['half'] == 'gate'
+        assert 'done_provenance_via_update_task' in str(outcome.gate_row['error'])
         # Net effect: the slug is exactly where it started in BOTH stores.
         assert records['m1']['metadata']['topic'] == 'gate_topic'
         assert records['m2']['metadata']['topic'] == 'gate_topic'
-        assert [r['outcome'] for r in results] == [
+        assert [r['outcome'] for r in outcome.results] == [
             'gate_lockstep_failed', 'gate_lockstep_failed']
 
     @pytest.mark.asyncio
@@ -1754,11 +1755,11 @@ class TestGateLockstepWriter:
             [_mod.Rename('dark_factory', 'm1', 'gate_topic', 'gate-topic')],
             [_gate_task('4220', 'gate_topic')])
 
-        _results, gate_row = await _mod.rename_group(
+        outcome = await _mod.rename_group(
             service, group, apply=True, client=client)
 
-        assert gate_row['outcome'] == 'gate_lockstep_failed'
-        assert 'mcp down' in str(gate_row['error'])
+        assert outcome.gate_row['outcome'] == 'gate_lockstep_failed'
+        assert 'mcp down' in str(outcome.gate_row['error'])
         assert records['m1']['metadata']['topic'] == 'gate_topic'
 
     @pytest.mark.asyncio
@@ -1781,12 +1782,12 @@ class TestGateLockstepWriter:
 
         service.update_memory = AsyncMock(side_effect=_fail_the_undo)
 
-        _results, gate_row = await _mod.rename_group(
+        outcome = await _mod.rename_group(
             service, group, apply=True, client=client)
 
-        assert gate_row['outcome'] == 'gate_lockstep_failed'
-        assert gate_row['undo_failures']
-        assert 'undo failed' in str(gate_row['undo_failures'])
+        assert outcome.gate_row['outcome'] == 'gate_lockstep_failed'
+        assert outcome.gate_row['undo_failures']
+        assert 'undo failed' in str(outcome.gate_row['undo_failures'])
 
     @pytest.mark.asyncio
     async def test_an_ungated_group_never_reaches_the_client(self):
@@ -1796,11 +1797,11 @@ class TestGateLockstepWriter:
         group = _one_group(
             [_mod.Rename('dark_factory', 'm1', 'plain_topic', 'plain-topic')])
 
-        results, gate_row = await _mod.rename_group(
+        outcome = await _mod.rename_group(
             service, group, apply=True, client=client)
 
-        assert [r['outcome'] for r in results] == ['renamed']
-        assert gate_row is None
+        assert [r['outcome'] for r in outcome.results] == ['renamed']
+        assert (outcome.gate_row, outcome.held_entry) == (None, None)
         client.call_tool.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -1810,11 +1811,11 @@ class TestGateLockstepWriter:
         group = _one_group(
             [_mod.Rename('dark_factory', 'm1', 'plain_topic', 'plain-topic')])
 
-        results, gate_row = await _mod.rename_group(
+        outcome = await _mod.rename_group(
             _stateful_service(records), group, apply=True, client=None)
 
-        assert [r['outcome'] for r in results] == ['renamed']
-        assert gate_row is None
+        assert [r['outcome'] for r in outcome.results] == ['renamed']
+        assert outcome.gate_row is None
 
     @pytest.mark.asyncio
     async def test_a_gated_group_with_no_client_is_a_lockstep_failure(self):
@@ -1825,10 +1826,10 @@ class TestGateLockstepWriter:
             [_mod.Rename('dark_factory', 'm1', 'gate_topic', 'gate-topic')],
             [_gate_task('4220', 'gate_topic')])
 
-        _results, gate_row = await _mod.rename_group(
+        outcome = await _mod.rename_group(
             service, group, apply=True, client=None)
 
-        assert gate_row['outcome'] == 'gate_lockstep_failed'
+        assert outcome.gate_row['outcome'] == 'gate_lockstep_failed'
         assert records['m1']['metadata']['topic'] == 'gate_topic'
 
     @pytest.mark.asyncio
@@ -1842,10 +1843,10 @@ class TestGateLockstepWriter:
              _mod.Rename('dark_factory', 'm2', 'gate_topic', 'gate-topic')],
             [_gate_task('4220', 'gate_topic')])
 
-        _results, gate_row = await _mod.rename_group(
+        outcome = await _mod.rename_group(
             service, group, apply=True, client=client)
 
-        assert gate_row['outcome'] == 'gate_lockstep_failed'
+        assert outcome.gate_row['outcome'] == 'gate_lockstep_failed'
         assert records['m1']['metadata']['topic'] == 'gate-topic'
         assert records['m2']['metadata']['topic'] == 'gate_topic'
 
@@ -1871,23 +1872,24 @@ class TestUngatedGroupRollback:
         service = _stateful_service(records)
         _refuse_writes_to(service, 'm2')
 
-        results, entry = await _mod.rename_group(
+        outcome = await _mod.rename_group(
             service, self._plain_group(), apply=True, client=None)
 
         assert records['m1']['metadata']['topic'] == 'plain_topic'
         assert records['m2']['metadata']['topic'] == 'plain_topic'
-        assert [(r['memory_id'], r['outcome'], r.get('undone')) for r in results] == [
+        assert [(r['memory_id'], r['outcome'], r.get('undone')) for r in outcome.results] == [
             ('m1', 'ungated_partial_rename', True),
             ('m2', 'update_failed', None),
         ]
-        assert {key: value for key, value in entry.items() if key != 'note'} == {
+        assert {key: value for key, value in outcome.held_entry.items() if key != 'note'} == {
             'reason': 'ungated_partial_rename',
             'project_id': 'dark_factory',
             'old_topic': 'plain_topic',
             'new_topic': 'plain-topic',
-            'stood_memory_ids': ['m1'],
+            'moved_memory_ids': ['m1'],
             'failed_memory_ids': ['m2'],
             'failed_outcomes': ['update_failed'],
+            'on_new_slug_memory_ids': [],
             'undo_failures': [],
         }
 
@@ -1898,14 +1900,37 @@ class TestUngatedGroupRollback:
         _refuse_writes_to(service, 'm2')
         _fail_writes_moving_back_to(service, 'm1', 'plain_topic')
 
-        results, entry = await _mod.rename_group(
+        outcome = await _mod.rename_group(
             service, self._plain_group(), apply=True, client=None)
 
         assert records['m1']['metadata']['topic'] == 'plain-topic'
-        (m1_row,) = [r for r in results if r['memory_id'] == 'm1']
+        (m1_row,) = [r for r in outcome.results if r['memory_id'] == 'm1']
         assert m1_row['undone'] is False
-        assert [failure['memory_id'] for failure in entry['undo_failures']] == ['m1']
-        assert 'undo failed' in str(entry['undo_failures'])
+        assert [failure['memory_id'] for failure in outcome.held_entry['undo_failures']] == ['m1']
+        assert 'undo failed' in str(outcome.held_entry['undo_failures'])
+        assert outcome.held_entry['on_new_slug_memory_ids'] == ['m1']
+
+    @pytest.mark.asyncio
+    async def test_a_member_found_on_the_new_slug_is_named_as_still_there(self):
+        """Another writer moved m1 between plan and apply: the hold cannot put it back.
+
+        The undo reverses only this run's writes, so nothing is rolled back and
+        the slug stays split.  The entry says so structurally, rather than
+        leaving an empty ``undo_failures`` to read as "whole again".
+        """
+        records = _store(('m1', 'plain-topic'), ('m2', 'plain_topic'))
+        service = _stateful_service(records)
+        _refuse_writes_to(service, 'm2')
+
+        outcome = await _mod.rename_group(
+            service, self._plain_group(), apply=True, client=None)
+
+        assert records['m1']['metadata']['topic'] == 'plain-topic'
+        assert records['m2']['metadata']['topic'] == 'plain_topic'
+        entry = outcome.held_entry
+        assert (entry['moved_memory_ids'], entry['failed_memory_ids'],
+                entry['on_new_slug_memory_ids'], entry['undo_failures']) == (
+            [], ['m2'], ['m1'], [])
 
     @pytest.mark.asyncio
     async def test_a_vanished_straggler_does_not_roll_back_the_rest(self):
@@ -1913,14 +1938,14 @@ class TestUngatedGroupRollback:
         records = _store(('m1', 'plain_topic'))  # m2 is absent -> memory_not_found
         service = _stateful_service(records)
 
-        results, entry = await _mod.rename_group(
+        outcome = await _mod.rename_group(
             service, self._plain_group(), apply=True, client=None)
 
         assert records['m1']['metadata']['topic'] == 'plain-topic'
-        assert [(r['memory_id'], r['outcome']) for r in results] == [
+        assert [(r['memory_id'], r['outcome']) for r in outcome.results] == [
             ('m1', 'renamed'), ('m2', 'memory_not_found'),
         ]
-        assert entry is None
+        assert outcome.held_entry is None
 
     @pytest.mark.asyncio
     async def test_a_dry_run_predicts_the_hold_and_writes_nothing(self):
@@ -1935,14 +1960,16 @@ class TestUngatedGroupRollback:
 
         service.get_memory_by_id = AsyncMock(side_effect=_read)
 
-        results, entry = await _mod.rename_group(
+        outcome = await _mod.rename_group(
             service, self._plain_group(), apply=False, client=None)
 
-        assert [(r['memory_id'], r['outcome']) for r in results] == [
+        assert [(r['memory_id'], r['outcome']) for r in outcome.results] == [
             ('m1', 'would_rename'), ('m2', 'rename_error'),
         ]
-        assert entry['reason'] == 'ungated_partial_rename'
-        assert entry['undo_failures'] == []
+        entry = outcome.held_entry
+        assert (entry['reason'], entry['moved_memory_ids'], entry['failed_memory_ids']) == (
+            'ungated_partial_rename', ['m1'], ['m2'])
+        assert (entry['on_new_slug_memory_ids'], entry['undo_failures']) == ([], [])
         service.update_memory.assert_not_awaited()
 
 
@@ -2850,10 +2877,11 @@ class TestFailedRowsAreListedInTheirBuckets:
 
 
 class TestPartialUngatedGroup:
-    """An ungated slug that only partly moved is listed, with what stood and what did not.
+    """An ungated slug that only partly moved is listed, with what moved and what did not.
 
-    The members that moved are rolled back, so a re-run finishes the slug;
-    only a rollback that itself fails leaves the slug split, and that slug a
+    The members that moved are rolled back, so a re-run finishes the slug.
+    Only a member the rollback leaves on the new slug keeps it split — one
+    whose undo failed, or one another writer had put there — and that slug a
     re-run refuses.
     """
 
@@ -2880,20 +2908,25 @@ class TestPartialUngatedGroup:
             'project_id': 'dark_factory',
             'old_topic': 'plain_topic',
             'new_topic': 'plain-topic',
-            'stood_memory_ids': ['m1'],
+            'moved_memory_ids': ['m1'],
             'failed_memory_ids': ['m2'],
             'failed_outcomes': ['update_failed'],
         }
-        assert 'slug_collision' in entry['note']
 
-    def test_a_rehearsed_rename_counts_as_stood(self):
+    def test_a_rehearsed_rename_counts_as_moved(self):
         entry = _mod.describe_partial_ungated_group(
             self._plain_group(), self._plain_results('would_rename', 'rename_error'))
 
-        assert entry['stood_memory_ids'] == ['m1']
+        assert entry['moved_memory_ids'] == ['m1']
         assert entry['failed_memory_ids'] == ['m2']
         assert entry['failed_outcomes'] == ['rename_error']
-        assert 'predicted' in entry['note']
+
+    def test_a_member_found_on_the_new_slug_splits_it_without_having_moved(self):
+        entry = _mod.describe_partial_ungated_group(
+            self._plain_group(), self._plain_results('already_normalized', 'update_failed'))
+
+        assert entry['moved_memory_ids'] == []
+        assert entry['failed_memory_ids'] == ['m2']
 
     @pytest.mark.parametrize(('gate_tasks', 'outcomes'), [
         pytest.param([_gate_task('4220', 'plain_topic')], ('renamed', 'update_failed'), id='gated'),
@@ -2911,7 +2944,7 @@ class TestPartialUngatedGroup:
             self._plain_group(members=3),
             self._plain_results('renamed', 'update_failed', 'memory_not_found'))
 
-        assert entry['stood_memory_ids'] == ['m1']
+        assert entry['moved_memory_ids'] == ['m1']
         assert entry['failed_memory_ids'] == ['m2']
         assert entry['failed_outcomes'] == ['update_failed']
 
@@ -2949,9 +2982,8 @@ class TestPartialUngatedGroup:
 
     @staticmethod
     def _held_group_entry(report: dict) -> dict:
-        (entry,) = [
-            e for e in report['skips']['ungated_partial_rename'] if 'stood_memory_ids' in e
-        ]
+        """The group's entry, told apart from its member rows by carrying a ``reason``."""
+        (entry,) = [e for e in report['skips']['ungated_partial_rename'] if 'reason' in e]
         return entry
 
     @pytest.mark.asyncio
@@ -2965,9 +2997,10 @@ class TestPartialUngatedGroup:
         assert report['renamed_total'] == 0
         held = report['skips']['ungated_partial_rename']
         entry = self._held_group_entry(report)
-        (member,) = [e for e in held if 'stood_memory_ids' not in e]
-        assert (entry['stood_memory_ids'], entry['failed_memory_ids'], entry['undo_failures']) == (
-            ['m1'], ['m2'], [])
+        (member,) = [e for e in held if 'reason' not in e]
+        assert (entry['moved_memory_ids'], entry['failed_memory_ids'],
+                entry['on_new_slug_memory_ids'], entry['undo_failures']) == (
+            ['m1'], ['m2'], [], [])
         assert (member['memory_id'], member['undone']) == ('m1', True)
         assert [e['memory_id'] for e in report['skips']['update_failed']] == ['m2']
         assert [e['residue_count'] for e in report['skips']['legacy_slug_residue']] == [2]
@@ -2975,8 +3008,8 @@ class TestPartialUngatedGroup:
         assert resolve_exit(report) == 1
         _assert_outcomes_match_buckets(report)
         section = _bucket_section(_mod.render_markdown(report), 'ungated_partial_rename')
-        assert "stood_memory_ids=['m1']" in section
-        assert 'undo_failures=[]' in section
+        assert "moved_memory_ids=['m1']" in section
+        assert 'on_new_slug_memory_ids=[]' in section
 
         second = await run_sweep(corpus.service(), projects=('dark_factory',), apply=True)
 
@@ -2996,8 +3029,9 @@ class TestPartialUngatedGroup:
 
         assert corpus.topic_of('dark_factory', 'm1') == 'legacy-topic'
         assert corpus.topic_of('dark_factory', 'm2') == 'legacy_topic'
-        undo_failures = self._held_group_entry(report)['undo_failures']
-        assert [failure['memory_id'] for failure in undo_failures] == ['m1']
+        entry = self._held_group_entry(report)
+        assert [failure['memory_id'] for failure in entry['undo_failures']] == ['m1']
+        assert entry['on_new_slug_memory_ids'] == ['m1']
 
         second = await run_sweep(corpus.service(), projects=('dark_factory',), apply=True)
 
