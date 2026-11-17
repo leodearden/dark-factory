@@ -19,8 +19,11 @@ from typing import Any
 
 import pytest
 from _fm_helpers import load_script_module
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.server.grouped_read import DEFAULT_AMENDMENT_TEXT_CHARS
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SCRIPTS = Path(__file__).parent.parent / 'scripts'
 

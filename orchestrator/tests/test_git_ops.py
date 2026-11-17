@@ -22,6 +22,7 @@ from _orch_helpers import (
     assert_isolated_git_repo,
     git_env_with_ceiling,
 )
+from _worktree_registrations import lane_admin_dir, registered_worktree_paths
 from shared.git_async import MAX_CONCURRENT_SPAWNS, GitResult
 from shared.merge_subject import format_merge_subject
 
@@ -50,6 +51,7 @@ from orchestrator.git_ops import (
     _run,
 )
 from orchestrator.lane_branch_holder import BranchCheckedOutElsewhere, BranchHolderAction
+from orchestrator.quarantine_provenance import NOT_RELOCATED
 
 
 @pytest.fixture
@@ -276,7 +278,7 @@ def test_git_config_rejects_bypass_command_without_clear():
     time.  (The reverse — clear set, bypass unset — is a harmless no-op and
     stays permissive, asserted in test_git_config_accepts_main_gate_bypass_commands.)
     """
-    import pydantic  # noqa: PLC0415
+    import pydantic
 
     with pytest.raises((pydantic.ValidationError, ValueError)) as excinfo:
         GitConfig(main_gate_bypass_command='git config reify.mainGate.bypass true')
@@ -965,11 +967,7 @@ class TestWorktreeLifecycle:
         assert 'task/orig-task ' not in branches  # exact-match exclusion
 
         # New worktree is registered with git
-        rc, listing, _ = await _run(
-            ['git', 'worktree', 'list', '--porcelain'],
-            cwd=git_ops.project_root,
-        )
-        assert str(new_path.resolve()) in listing
+        assert str(new_path.resolve()) in registered_worktree_paths(git_ops.project_root)
 
     async def test_rename_worktree_unregistered_path_raises(
         self, git_ops: GitOps,
@@ -7044,6 +7042,28 @@ class TestWorktreeReuseIdentityGuard:
         assert len(quarantined) == 1
         assert (quarantined[0] / 'spline.rs').exists()
 
+    async def test_mismatch_stamps_the_live_plan_with_the_stored_title(
+        self, git_ops: GitOps,
+    ):
+        info = await git_ops.create_worktree('recycled-plan')
+        _write_stored_title(info.path, 'Trajectory beta: spline solver')
+        live = TaskArtifacts.for_task(info.path, 'recycled-plan')
+        live.task_root.mkdir(parents=True)
+        live.write_plan({'task_id': 'recycled-plan', 'title': 'Cycle-breaker beta: dedup edges', 'steps': []})
+        plan_before = live.read_plan()
+        assert plan_before is not None
+
+        await git_ops.create_worktree(
+            'recycled-plan', expected_title='Cycle-breaker beta: dedup edges',
+        )
+
+        (parking,) = git_ops.quarantine_base.glob('recycled-plan-*')
+        assert json.loads((parking / '.task' / 'plan.json').read_text()) == plan_before
+        (entry,) = live.read_plan()['_quarantined_from']
+        assert entry['reason'] == 'reuse-identity-mismatch'
+        assert entry['stored_title'] == 'Trajectory beta: spline solver'
+        assert entry['parking'] == str(parking)
+
     async def test_none_expected_title_skips_guard(self, git_ops: GitOps):
         info = await git_ops.create_worktree('reuse-noguard')
         _write_stored_title(info.path, 'Original task')
@@ -7130,6 +7150,26 @@ class TestColdReattachIdentityGuard:
     reaped-but-retained shape (worktree dir gone, only the branch survives)
     instead of a registered worktree."""
 
+    async def test_cold_reattach_mismatch_stamps_the_live_plan_with_the_stored_title(
+        self, git_ops: GitOps,
+    ):
+        await _build_cold_orphan_branch(git_ops, 'cold-stamp')
+        _write_sibling_stored_title(
+            git_ops.worktree_base, 'cold-stamp', 'Trajectory beta: spline solver',
+        )
+        live = TaskArtifacts.for_task(git_ops.worktree_base / 'cold-stamp', 'cold-stamp')
+        live.task_root.mkdir(parents=True, exist_ok=True)
+        live.write_plan({'task_id': 'cold-stamp', 'title': 'Cycle-breaker beta: dedup edges', 'steps': []})
+
+        await git_ops.create_worktree('cold-stamp', expected_title='Cycle-breaker beta: dedup edges')
+
+        (parking,) = git_ops.quarantine_base.glob('cold-stamp-*')
+        assert (parking / '.task' / 'plan.json').is_file()
+        entry = live.read_plan()['_quarantined_from'][-1]
+        assert entry['reason'] == 'cold-reattach-identity-mismatch'
+        assert entry['stored_title'] == 'Trajectory beta: spline solver'
+        assert entry['parking'] == str(parking)
+
     async def test_cold_reattach_quarantines_on_identity_mismatch(
         self, git_ops: GitOps, caplog,
     ):
@@ -7200,9 +7240,9 @@ class TestColdReattachIdentityGuard:
         )
         sha_before = sha_before.strip()
 
-        # quarantine_worktree never raises by contract — it returns None when
-        # it could not relocate. Force that outcome.
-        git_ops.quarantine_worktree = AsyncMock(return_value=None)
+        # quarantine_worktree never raises by contract — it returns
+        # NOT_RELOCATED when it could not relocate. Force that outcome.
+        git_ops.quarantine_worktree = AsyncMock(return_value=NOT_RELOCATED)
 
         with pytest.raises(RuntimeError) as excinfo:
             await git_ops.create_worktree(
@@ -7347,6 +7387,26 @@ class TestColdReattachIdentityGuard:
         )
 
 
+async def _drop_admin_entry(git_ops: GitOps, worktree: Path) -> None:
+    """Delete *worktree*'s ``.git/worktrees/<name>`` admin entry: the 2097 orphaned-registration state."""
+    rc, admin_dir, err = await _run(['git', 'rev-parse', '--absolute-git-dir'], cwd=worktree)
+    assert rc == 0, err
+    shutil.rmtree(admin_dir.strip())
+    assert str(worktree.resolve()) not in registered_worktree_paths(git_ops.project_root)
+
+
+async def _branches_matching(git_ops: GitOps, pattern: str) -> str:
+    rc, branches, err = await _run(['git', 'branch', '--list', pattern], cwd=git_ops.project_root)
+    assert rc == 0, err
+    return branches.strip()
+
+
+async def _checked_out_ref(worktree: Path) -> str:
+    rc, ref, err = await _run(['git', 'rev-parse', '--symbolic-full-name', 'HEAD'], cwd=worktree)
+    assert rc == 0, err
+    return ref.strip()
+
+
 @pytest.mark.asyncio
 class TestOrphanWorktreeHelpers:
     """Fix B git_ops helpers: quarantine_worktree, worktree_has_unsaved_work."""
@@ -7373,8 +7433,9 @@ class TestOrphanWorktreeHelpers:
         )
         (wt / conflicted_path).write_text(marker_content)
 
-        dest = await git_ops.quarantine_worktree(wt, 'q-conflict-task', 'unit-test')
+        outcome = await git_ops.quarantine_worktree(wt, 'q-conflict-task', 'unit-test')
 
+        dest = outcome.dest
         assert dest is not None
         assert dest.parent == git_ops.quarantine_base
         assert not wt.exists()  # still relocated despite the refused commit
@@ -7391,8 +7452,9 @@ class TestOrphanWorktreeHelpers:
         (info.path / 'work.py').write_text('x = 1\n')
         await git_ops.commit(info.path, 'committed work')
 
-        dest = await git_ops.quarantine_worktree(info.path, 'q-task', 'unit-test')
+        outcome = await git_ops.quarantine_worktree(info.path, 'q-task', 'unit-test')
 
+        dest = outcome.dest
         assert dest is not None
         assert dest.parent == git_ops.quarantine_base
         assert (dest / 'work.py').exists()  # committed work preserved
@@ -7402,6 +7464,323 @@ class TestOrphanWorktreeHelpers:
             ['git', 'branch', '--list', 'task/q-task'], cwd=git_ops.project_root,
         )
         assert branches.strip() == ''
+
+    async def test_quarantine_outcome_describes_the_parked_branch(self, git_ops: GitOps):
+        info = await git_ops.create_worktree('q-count')
+        (info.path / 'one.py').write_text('a = 1\n')
+        await git_ops.commit(info.path, 'first commit beyond main')
+        (info.path / 'two.py').write_text('b = 2\n')
+        await git_ops.commit(info.path, 'second commit beyond main')
+
+        outcome = await git_ops.quarantine_worktree(info.path, 'q-count', 'unit-test')
+
+        assert outcome.dest is not None
+        parked_branch = f'task/{outcome.dest.name}'
+        assert outcome.branch == parked_branch
+        assert outcome.tip_sha is not None
+        assert await git_ops.resolve_branch_sha(parked_branch) == outcome.tip_sha
+        assert outcome.unique_commit_count == 2
+
+    async def test_commits_beyond_main_counts_or_reports_none(self, git_ops: GitOps):
+        info = await git_ops.create_worktree('q-beyond')
+        assert await git_ops.commits_beyond_main('task/q-beyond') == 0
+        (info.path / 'one.py').write_text('a = 1\n')
+        await git_ops.commit(info.path, 'a commit beyond main')
+
+        assert await git_ops.commits_beyond_main('task/q-beyond') == 1
+        assert await git_ops.commits_beyond_main('task/no-such-branch') is None
+
+    async def test_quarantine_accepts_a_full_ref(self, git_ops: GitOps):
+        info = await git_ops.create_worktree('q-full')
+        (info.path / 'work.py').write_text('x = 1\n')
+        await git_ops.commit(info.path, 'committed work')
+
+        outcome = await git_ops.quarantine_worktree(info.path, 'task/q-full', 'unit-test')
+
+        dest = outcome.dest
+        assert dest is not None
+        assert dest.parent == git_ops.quarantine_base
+        assert dest.name.startswith('q-full-')
+        assert not (git_ops.quarantine_base / 'task').exists()
+        parked_branch = f'task/{dest.name}'
+        assert outcome.branch == parked_branch
+        assert await git_ops.resolve_branch_sha(parked_branch) is not None
+        assert await _branches_matching(git_ops, 'task/q-full') == ''
+        assert await _branches_matching(git_ops, 'task/task/*') == ''
+        assert not info.path.exists()
+
+    async def test_quarantine_relocates_an_unregistered_worktree(self, git_ops: GitOps):
+        info = await git_ops.create_worktree('q-orphan')
+        (info.path / 'work.py').write_text('x = 1\n')
+        await git_ops.commit(info.path, 'committed work')
+        await _drop_admin_entry(git_ops, info.path)
+
+        outcome = await git_ops.quarantine_worktree(info.path, 'q-orphan', 'unit-test')
+
+        assert not info.path.exists()
+        assert outcome.dest is not None
+        assert (outcome.dest / 'work.py').read_text() == 'x = 1\n'
+        assert outcome.branch is not None
+        assert await git_ops.resolve_branch_sha(outcome.branch) is not None
+        assert outcome.unique_commit_count == 1
+        assert await git_ops.resolve_branch_sha('task/q-orphan') is None
+
+    async def test_quarantine_unregistered_dir_without_branch(self, git_ops: GitOps):
+        info = await git_ops.create_worktree('q-nobranch')
+        await _drop_admin_entry(git_ops, info.path)
+        rc, _, err = await _run(['git', 'branch', '-D', 'task/q-nobranch'], cwd=git_ops.project_root)
+        assert rc == 0, err
+
+        outcome = await git_ops.quarantine_worktree(info.path, 'q-nobranch', 'unit-test')
+
+        assert not info.path.exists()
+        assert outcome.dest is not None
+        assert outcome.dest.is_dir()
+        assert outcome.branch is None
+
+    async def test_an_unregistered_parking_never_aliases_the_reused_slot(self, git_ops: GitOps):
+        info = await git_ops.create_worktree('q-alias')
+        (info.path / 'work.py').write_text('x = 1\n')
+        await git_ops.commit(info.path, 'committed work')
+        (info.path / 'wip.py').write_text('uncommitted\n')
+        await _drop_admin_entry(git_ops, info.path)
+
+        outcome = await git_ops.quarantine_worktree(info.path, 'q-alias', 'unit-test')
+        assert outcome.dest is not None
+        rc, _, err = await _run(
+            ['git', 'worktree', 'add', '-b', 'task/q-alias-next', str(info.path)],
+            cwd=git_ops.project_root,
+        )
+        assert rc == 0, err
+
+        rc, head, _ = await _run(['git', 'rev-parse', '--abbrev-ref', 'HEAD'], cwd=outcome.dest)
+        assert rc != 0, f'git in the parking resolved to a checkout: {head!r}'
+        assert (outcome.dest / 'wip.py').read_text() == 'uncommitted\n'
+
+    async def test_quarantine_snapshots_and_stamps_provenance(self, git_ops: GitOps):
+        info = await git_ops.create_worktree('q-prov')
+        ta = TaskArtifacts.for_task(info.path, 'q-prov')
+        ta.init('q-prov', 'Provenance', 'd')
+        ta.write_plan({
+            'task_id': 'q-prov',
+            'title': 'Provenance',
+            'steps': [
+                {'id': 'step-1', 'description': 'red', 'status': 'done', 'commit': 'abc'},
+                {'id': 'step-2', 'description': 'green', 'status': 'pending'},
+            ],
+        })
+        ta.ensure_lane_symlinks()
+        (info.path / 'work.py').write_text('x = 1\n')
+        await git_ops.commit(info.path, 'committed work')
+        plan_before = ta.read_plan()
+
+        outcome = await git_ops.quarantine_worktree(info.path, 'q-prov', 'unit-test')
+
+        assert outcome.dest is not None
+        parked_plan = outcome.dest / '.task' / 'plan.json'
+        assert parked_plan.is_file()
+        assert not parked_plan.is_symlink()
+        assert json.loads(parked_plan.read_text()) == plan_before
+        parked_metadata = outcome.dest / '.task' / 'metadata.json'
+        assert parked_metadata.is_file()
+        assert not parked_metadata.is_symlink()
+        stamp = TaskArtifacts.for_task(info.path, 'q-prov').read_plan()['_quarantined_from'][-1]
+        assert stamp['branch'] == outcome.branch
+        assert stamp['tip_sha'] == outcome.tip_sha
+        assert stamp['unique_commit_count'] == 1
+        assert stamp['parking'] == str(outcome.dest)
+
+    async def test_quarantine_without_a_plan_writes_no_plan(self, git_ops: GitOps):
+        info = await git_ops.create_worktree('q-noplan')
+        (info.path / 'work.py').write_text('x = 1\n')
+        await git_ops.commit(info.path, 'committed work')
+
+        outcome = await git_ops.quarantine_worktree(info.path, 'q-noplan', 'unit-test')
+
+        assert outcome.dest is not None
+        assert not TaskArtifacts.for_task(info.path, 'q-noplan').artifact_path('plan.json').exists()
+
+    async def test_quarantine_never_renames_a_branch_another_worktree_holds(
+        self, git_ops: GitOps,
+    ):
+        holder = await git_ops.create_worktree('q-held')
+        (holder.path / 'held.py').write_text('h = 1\n')
+        await git_ops.commit(holder.path, 'held work')
+        held_tip = await git_ops.resolve_branch_sha('task/q-held')
+        foreign = await git_ops.create_worktree('q-foreign')
+        (foreign.path / 'wip.py').write_text('w = 1\n')
+
+        outcome = await git_ops.quarantine_worktree(
+            foreign.path, 'q-held', 'recovery-record-divergence',
+        )
+
+        assert outcome.dest is not None
+        assert outcome.dest.parent == git_ops.quarantine_base
+        assert not foreign.path.exists()
+        assert outcome.branch is None
+        assert outcome.tip_sha is None
+        assert outcome.unique_commit_count is None
+        assert await _checked_out_ref(holder.path) == 'refs/heads/task/q-held'
+        assert await git_ops.resolve_branch_sha('task/q-held') == held_tip
+        assert await _branches_matching(git_ops, 'task/q-held-*') == ''
+        assert await _checked_out_ref(outcome.dest) == 'refs/heads/task/q-foreign'
+        assert (outcome.dest / 'wip.py').exists()
+        assert await git_ops.commits_beyond_main('task/q-foreign') == 0
+
+    async def test_quarantine_parks_the_branch_of_a_detached_worktree(self, git_ops: GitOps):
+        info = await git_ops.create_worktree('q-detached')
+        (info.path / 'work.py').write_text('x = 1\n')
+        await git_ops.commit(info.path, 'committed work')
+        tip = await git_ops.resolve_branch_sha('task/q-detached')
+        rc, _, err = await _run(['git', 'checkout', '--detach'], cwd=info.path)
+        assert rc == 0, err
+
+        outcome = await git_ops.quarantine_worktree(info.path, 'q-detached', 'unit-test')
+
+        assert outcome.dest is not None
+        assert not info.path.exists()
+        assert outcome.branch is not None
+        assert outcome.tip_sha == tip
+        assert outcome.unique_commit_count == 1
+        assert await git_ops.resolve_branch_sha('task/q-detached') is None
+
+    async def test_parking_a_detached_cold_incarnation_leaves_no_task_branch(
+        self, git_ops: GitOps,
+    ):
+        info = await git_ops.create_worktree('q-recut')
+        (info.path / 'work.py').write_text('x = 1\n')
+        await git_ops.commit(info.path, 'committed work')
+        tip = await git_ops.resolve_branch_sha('task/q-recut')
+        rc, _, err = await _run(['git', 'checkout', '--detach'], cwd=info.path)
+        assert rc == 0, err
+
+        parked = await git_ops.park_prior_incarnation('q-recut', reason='recut')
+
+        assert parked is not None and parked.parked_branch is not None
+        assert await git_ops.resolve_branch_sha('task/q-recut') is None
+        assert await git_ops.resolve_branch_sha(parked.parked_branch) == tip
+        assert parked.parked_tip == tip
+        assert parked.quarantined_worktree is not None
+        assert not info.path.exists()
+
+    async def test_a_failed_unregistered_move_restores_branch_and_gitfile(self, git_ops: GitOps):
+        info = await git_ops.create_worktree('q-rollback')
+        (info.path / 'work.py').write_text('x = 1\n')
+        await git_ops.commit(info.path, 'committed work')
+        tip = await git_ops.resolve_branch_sha('task/q-rollback')
+        await _drop_admin_entry(git_ops, info.path)
+        gitfile_before = (info.path / '.git').read_bytes()
+        git_ops.quarantine_base.parent.mkdir(parents=True, exist_ok=True)
+        git_ops.quarantine_base.write_text('not a directory\n')
+
+        outcome = await git_ops.quarantine_worktree(info.path, 'q-rollback', 'unit-test')
+
+        assert outcome.dest is None
+        assert info.path.is_dir()
+        assert await git_ops.resolve_branch_sha('task/q-rollback') == tip
+        assert await _branches_matching(git_ops, 'task/q-rollback-*') == ''
+        assert (info.path / '.git').read_bytes() == gitfile_before
+
+    async def test_a_failed_registered_move_restores_the_branch_checkout(self, git_ops: GitOps):
+        info = await git_ops.create_worktree('q-held-rollback')
+        (info.path / 'work.py').write_text('x = 1\n')
+        await git_ops.commit(info.path, 'committed work')
+        tip = await git_ops.resolve_branch_sha('task/q-held-rollback')
+        git_ops.quarantine_base.parent.mkdir(parents=True, exist_ok=True)
+        git_ops.quarantine_base.write_text('not a directory\n')
+
+        outcome = await git_ops.quarantine_worktree(info.path, 'q-held-rollback', 'unit-test')
+
+        assert outcome == NOT_RELOCATED
+        assert info.path.is_dir()
+        assert await _checked_out_ref(info.path) == 'refs/heads/task/q-held-rollback'
+        assert await git_ops.resolve_branch_sha('task/q-held-rollback') == tip
+        assert await _branches_matching(git_ops, 'task/q-held-rollback-*') == ''
+
+    async def test_a_failed_move_whose_branch_cannot_be_renamed_back_names_the_stranded_ref(
+        self, git_ops: GitOps, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+    ):
+        info = await git_ops.create_worktree('q-stranded')
+        (info.path / 'work.py').write_text('x = 1\n')
+        await git_ops.commit(info.path, 'committed work')
+        tip = await git_ops.resolve_branch_sha('task/q-stranded')
+        await _drop_admin_entry(git_ops, info.path)
+        project_root = git_ops.project_root
+
+        def rename_after_a_rival_takes_the_branch_name(source: object, destination: object) -> None:
+            subprocess.run(['git', 'branch', 'task/q-stranded', 'HEAD'], cwd=project_root, check=True)
+            raise OSError(18, 'Invalid cross-device link')
+
+        monkeypatch.setattr(os, 'rename', rename_after_a_rival_takes_the_branch_name)
+        with caplog.at_level(logging.ERROR, logger='orchestrator.git_ops'):
+            outcome = await git_ops.quarantine_worktree(info.path, 'q-stranded', 'unit-test')
+
+        assert outcome.dest is None
+        assert info.path.is_dir()
+        assert outcome.branch is not None
+        assert outcome.branch.startswith('task/q-stranded-')
+        assert outcome.tip_sha == tip
+        assert outcome.unique_commit_count == 1
+        assert await git_ops.resolve_branch_sha(outcome.branch) == tip
+        assert f'STRANDED on {outcome.branch}' in caplog.text
+        assert outcome.event_data('unit-test')['branch'] == outcome.branch
+
+    async def test_a_parked_branch_that_cannot_be_measured_is_still_reported_moved(
+        self, git_ops: GitOps, monkeypatch: pytest.MonkeyPatch,
+    ):
+        info = await git_ops.create_worktree('q-unmeasured')
+        (info.path / 'work.py').write_text('x = 1\n')
+        await git_ops.commit(info.path, 'committed work')
+
+        async def unmeasurable(full_branch: str) -> int | None:
+            raise RuntimeError(f'cannot count {full_branch}')
+
+        monkeypatch.setattr(git_ops, 'commits_beyond_main', unmeasurable)
+        outcome = await git_ops.quarantine_worktree(info.path, 'q-unmeasured', 'unit-test')
+
+        assert outcome.dest is not None
+        assert not info.path.exists()
+        assert outcome.branch == f'task/{outcome.dest.name}'
+        assert outcome.tip_sha is None
+        assert outcome.unique_commit_count is None
+
+    async def test_quarantine_relocates_a_registered_worktree_without_the_branch(
+        self, git_ops: GitOps,
+    ):
+        other = await git_ops.create_worktree('q-other')
+
+        outcome = await git_ops.quarantine_worktree(
+            other.path, 'q-absent', 'recovery-record-divergence',
+        )
+
+        assert outcome.dest is not None
+        assert not other.path.exists()
+        assert outcome.branch is None
+        assert str(outcome.dest.resolve()) in registered_worktree_paths(git_ops.project_root)
+
+    async def test_quarantine_unregistered_dir_leaves_a_branch_checked_out_elsewhere(
+        self, git_ops: GitOps, tmp_path: Path,
+    ):
+        orphan = await git_ops.create_worktree('q-split')
+        (orphan.path / 'work.py').write_text('x = 1\n')
+        await git_ops.commit(orphan.path, 'committed work')
+        await _drop_admin_entry(git_ops, orphan.path)
+        live = tmp_path / 'live-q-split'
+        rc, _, err = await _run(
+            ['git', 'worktree', 'add', str(live), 'task/q-split'], cwd=git_ops.project_root,
+        )
+        assert rc == 0, err
+
+        outcome = await git_ops.quarantine_worktree(
+            orphan.path, 'q-split', 'recovery-record-divergence',
+        )
+
+        assert outcome.dest is not None
+        assert not orphan.path.exists()
+        assert outcome.branch is None
+        assert await _checked_out_ref(live) == 'refs/heads/task/q-split'
+        assert await git_ops.resolve_branch_sha('task/q-split') is not None
+        assert await _branches_matching(git_ops, 'task/q-split-*') == ''
 
     async def test_unsaved_work_false_when_clean_no_commits(self, git_ops: GitOps):
         info = await git_ops.create_worktree('clean-wt')
@@ -8000,18 +8379,9 @@ class TestPersistentMergeWorktree:
         assert warm_path.exists()
 
         # Path is a registered git worktree
-        rc, out, _ = await _run(
-            ['git', 'worktree', 'list', '--porcelain'],
-            cwd=git_ops.project_root,
-        )
-        assert rc == 0
-        registered_paths = [
-            line[len('worktree '):].strip()
-            for line in out.splitlines()
-            if line.startswith('worktree ')
-        ]
-        assert str(warm_path) in registered_paths, (
-            f'_merge-verify not in registered worktrees: {registered_paths}'
+        registered = registered_worktree_paths(git_ops.project_root)
+        assert str(warm_path.resolve()) in registered, (
+            f'_merge-verify not in registered worktrees: {registered}'
         )
 
         # HEAD of warm worktree == merge_commit
@@ -8182,27 +8552,17 @@ class TestPersistentMergeWorktree:
         # Simulate shape-1: remove the .git/worktrees/<name> admin dir the
         # lane's .git pointer names — registration is gone while the on-disk
         # tree survives, exactly the interrupted-teardown on-disk shape.
-        shutil.rmtree(_lane_admin_dir(merge_wt))
+        shutil.rmtree(lane_admin_dir(merge_wt))
+        registered = registered_worktree_paths(git_ops.project_root)
+        assert str(merge_wt.resolve()) not in registered, (
+            f'shape-1 leak must be unregistered once its admin dir is gone (setup check): {registered}'
+        )
 
         await git_ops.cleanup_merge_worktree(merge_wt)
 
         # The on-disk tree is gone...
         assert not merge_wt.exists(), (
             'shape-1 leak tree must be removed by crash-safe cleanup'
-        )
-        # ...absent from git worktree list...
-        rc, out, _ = await _run(
-            ['git', 'worktree', 'list', '--porcelain'],
-            cwd=git_ops.project_root,
-        )
-        assert rc == 0
-        registered = [
-            line[len('worktree '):].strip()
-            for line in out.splitlines()
-            if line.startswith('worktree ')
-        ]
-        assert str(merge_wt) not in registered, (
-            f'shape-1 leak must be gone from git worktree list: {registered}'
         )
         # ...and NO _merge-* directory OR sibling .lock orphan survives under
         # worktree_base (task 2924's strict no-leak glob).
@@ -8417,18 +8777,9 @@ class TestPersistentOfflineDeepWorktree:
         assert warm_path.exists()
 
         # Path is a registered git worktree
-        rc, out, _ = await _run(
-            ['git', 'worktree', 'list', '--porcelain'],
-            cwd=git_ops.project_root,
-        )
-        assert rc == 0
-        registered_paths = [
-            line[len('worktree '):].strip()
-            for line in out.splitlines()
-            if line.startswith('worktree ')
-        ]
-        assert str(warm_path) in registered_paths, (
-            f'_offline-deep not in registered worktrees: {registered_paths}'
+        registered = registered_worktree_paths(git_ops.project_root)
+        assert str(warm_path.resolve()) in registered, (
+            f'_offline-deep not in registered worktrees: {registered}'
         )
 
         # HEAD of warm worktree == merge_commit
@@ -10902,12 +11253,9 @@ class TestGetMergeCommitDiffFiles:
 
 @pytest.mark.asyncio
 class TestGetFilesTouchedInBranchWarning:
-    """Step-1 (RED): get_files_touched_in_branch must emit a WARNING when
-    git log exits non-zero (e.g. non-existent base SHA), while still
-    returning [].
-
-    Before step-2 impl: rc!=0 path is silent → RED (no WARNING).
-    After step-2 impl: WARNING captured at 'orchestrator.git_ops'.
+    """get_files_touched_in_branch must emit a WARNING when git log exits
+    non-zero (e.g. non-existent base SHA), and return the error with its
+    empty file list rather than an empty list alone (task 3918).
     """
 
     async def test_nonexistent_sha_returns_empty_and_warns(
@@ -10919,10 +11267,11 @@ class TestGetFilesTouchedInBranchWarning:
         non_existent = 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef'
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
-            result = await ops.get_files_touched_in_branch(non_existent, 'HEAD')
+            files, err = await ops.get_files_touched_in_branch(non_existent, 'HEAD')
 
-        assert result == [], (
-            f'Expected [] on git error; got {result!r}'
+        assert files == [], f'Expected [] on git error; got {files!r}'
+        assert isinstance(err, Exception), (
+            f'Expected the git error to be returned; got {err!r}'
         )
 
         warning_texts = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
@@ -12798,15 +13147,6 @@ class TestAcquireWarmLaneReclaimOnExhaustion:
 # ===========================================================================
 
 
-def _lane_admin_dir(lane: Path) -> Path:
-    """Parse the ``.git/worktrees/<name>`` admin dir path out of a lane's
-    ``.git`` pointer file (``gitdir: <repo>/.git/worktrees/<name>``)."""
-    content = (lane / '.git').read_text().strip()
-    prefix = 'gitdir:'
-    assert content.startswith(prefix), f'unexpected worktree .git pointer: {content!r}'
-    return Path(content[len(prefix):].strip())
-
-
 @pytest.mark.asyncio
 class TestAcquireWarmLaneOrphanedReuseGuard:
     """The REUSE path (in-memory map hit -> reused=True) assumes a mapped
@@ -12881,7 +13221,7 @@ class TestAcquireWarmLaneOrphanedReuseGuard:
         # so the next acquire_for('A') returns reused=True.
 
         # Simulate the prune wipe: delete the lane's admin dir.
-        admin_dir = _lane_admin_dir(lane)
+        admin_dir = lane_admin_dir(lane)
         shutil.rmtree(admin_dir)
         assert not await git_ops._is_registered_worktree(lane), (
             'lane must be unregistered after its admin dir is wiped (setup check)'
@@ -12948,7 +13288,7 @@ class TestAcquireWarmLaneOrphanedReuseGuard:
         _, main_head_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
         main_head = main_head_raw.strip()
 
-        admin_dir = _lane_admin_dir(lane)
+        admin_dir = lane_admin_dir(lane)
         shutil.rmtree(admin_dir)
         assert not await git_ops._is_registered_worktree(lane), (
             'lane must be unregistered after its admin dir is wiped (setup check)'
@@ -13047,7 +13387,7 @@ class TestAcquireWarmLaneOrphanedReuseGuard:
 
         # Construct a REPAIRABLE orphan: corrupt the admin dir's gitdir
         # pointer (lane dir + admin dir both survive and stay linkable).
-        admin_dir = _lane_admin_dir(lane)
+        admin_dir = lane_admin_dir(lane)
         (admin_dir / 'gitdir').write_text('/tmp/bogus/.git\n')
         assert not await git_ops._is_registered_worktree(lane), (
             'lane must appear unregistered once its admin dir gitdir '
@@ -14313,7 +14653,7 @@ class TestRunDelegatesToSharedGitAsync:
             def __init__(self, tag: str) -> None:
                 self._tag = tag
 
-            async def communicate(self, input: bytes | None = None):  # noqa: A002
+            async def communicate(self, input: bytes | None = None):
                 spawned.append(self._tag)
                 await released.wait()
                 return b'', b''

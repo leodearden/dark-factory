@@ -7,6 +7,7 @@ import subprocess
 
 import pytest
 from _fm_git_repos import _init_git_repo
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.middleware.gitignored_deliverable_guard import (
     GitignoredDeliverableFinding,
@@ -17,6 +18,8 @@ from fused_memory.middleware.gitignored_deliverable_guard import (
     log_gitignored_deliverable_flagged,
     make_gitignore_probe,
 )
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 
 def _require_git() -> None:

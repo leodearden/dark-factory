@@ -277,7 +277,11 @@ async def test_recut_restart_parks_the_prior_incarnation_and_runs_the_architect(
         ['git', 'rev-parse', parked_branch], cwd=config.project_root,
     )
     assert parked_sha.strip() == prior_tip
-    parked_plans = [
-        json.loads(p.read_text()) for p in git_ops.quarantine_base.rglob('plan.json')
-    ]
-    assert [p.get('_session_id') for p in parked_plans] == ['prior-session']
+    parked_plans = list(git_ops.quarantine_base.rglob('plan.json'))
+    assert len(parked_plans) == 2, (
+        f'expected the parked task root and the parking snapshot, got {parked_plans}'
+    )
+    assert all(not plan.is_symlink() for plan in parked_plans)
+    assert {json.loads(plan.read_text()).get('_session_id') for plan in parked_plans} == {
+        'prior-session',
+    }

@@ -1,0 +1,12 @@
+{
+  "task_id": "3663",
+  "reason": "Net-additive regression test for task 3663's fix: the new test_workflow_quarantine_review_lineage.py drives TaskWorkflow's dispatch setup (_setup_worktree_and_artifacts) and _execute_verify_review_loop over a parked review lineage, stubbing the agent-facing seams (_review, _amend, _invoke, curator routing, venv sync) as test_workflow_review_persistence.py does, to pin that a branch-swapping quarantine's stamp retires the parked lineage so the new branch gets its own amendment round and the task-2523 adjudicator is not run against suggestions settled on the parked branch.",
+  "measures": [
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6482,
+      "current": 6497
+    }
+  ]
+}

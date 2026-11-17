@@ -671,8 +671,8 @@ class TestDispatcherEnqueuesDebt:
         assert (storm.category, storm.severity, storm.summary) == (
             'merge_flake_suppression_storm',
             'critical',
-            'Merge-verify flake-suppression storm: the isolated-rerun-confirm gate has '
-            'suppressed 5 merge-verify reds since the last reset',
+            'Flake-suppression storm: isolated re-runs have suppressed 5 reds since the '
+            'last reset (merge_gate: merge-verify reds)',
         )
 
         client = _FakeLedgerTaskClient()

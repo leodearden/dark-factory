@@ -13,6 +13,7 @@ from typing import Any
 import pytest
 import yaml
 from _fm_helpers import load_script_module
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from arm_harness import _embedding_doubles as doubles
 from arm_harness._fakes import (
@@ -78,6 +79,8 @@ from fused_memory.arm_harness.topology import (
 from fused_memory.config.schema import EmbedderConfig, FusedMemoryConfig
 from fused_memory.eval import topic_registry
 from fused_memory.eval.retrieval_probe import content_key
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 LME_DIR = Path(__file__).parents[2] / 'scripts' / 'local_memory_models_eval'
 STAMP = '20261009T120000Z'

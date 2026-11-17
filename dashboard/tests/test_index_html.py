@@ -22,7 +22,7 @@ from _cache_buster_helpers import (
     resolve_redux_base_state,
     sole_cache_buster_version,
 )
-from _dashboard_helpers import assert_script_loads_before, find_script_position, strip_js_comments
+from _jsx_source_helpers import assert_script_loads_before, find_script_position, strip_js_comments
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -1939,37 +1939,71 @@ def test_spend_readings_js_load_order(
 
 
 # ---------------------------------------------------------------------------
-# Regression guard: dependency-free classic modules are served, versioned, and
-# load before every consumer that reads them (task 5743)
+# Regression guard: classic modules read at module scope are served, versioned,
+# and load after every module they read and before every consumer that reads
+# them (tasks 5743, 8461)
 #
-# A module in this table reads no window.DF_* global, so its only load-order
-# edges are to its consumers, each of which destructures the module's global
-# at module scope with no fallback. One row per module; each consumer is its
-# own case because each blanks a different surface.
+# A reader destructures the read module's global at module scope with no
+# fallback, so each edge blanks a different surface and is its own case. A row
+# names the modules its key reads and the consumers that read it; a module that
+# reads no window.DF_* global has reads=(). An edge between two modules that
+# both have rows is stated once, as the reader's `reads`
+# (test_module_table_states_each_edge_once). tab_quality.jsx's datum.js read is
+# pinned through data.js.
 # ---------------------------------------------------------------------------
 
-_DEPENDENCY_FREE_MODULES = {
-    'escalation_focus.js': ('tab_escalations.jsx',),
-    'escalation_check_owner.js': ('tab_escalations.jsx',),
-    'persisted_state.js': (
+
+@dataclass(frozen=True)
+class _ModuleEdges:
+    reads: tuple[str, ...] = ()
+    consumers: tuple[str, ...] = ()
+
+
+_MODULE_EDGES = {
+    'escalation_focus.js': _ModuleEdges(consumers=('tab_escalations.jsx',)),
+    'escalation_check_owner.js': _ModuleEdges(consumers=('tab_escalations.jsx',)),
+    'persisted_state.js': _ModuleEdges(consumers=(
         'tab_memory_evals.jsx',
         'tabs.jsx',
         'tab_escalations.jsx',
         'tab_escalation_analytics.jsx',
         'tab_tasks.jsx',
+    )),
+    'render_failure.js': _ModuleEdges(consumers=('app.jsx',)),
+    'poll_scope.js': _ModuleEdges(consumers=('data.js', 'app.jsx')),
+    'chart_marks.js': _ModuleEdges(consumers=('charts.jsx', 'tab_escalation_analytics.jsx')),
+    'quality_view.js': _ModuleEdges(reads=('chart_marks.js',)),
+    'tab_quality.jsx': _ModuleEdges(
+        reads=('charts.jsx', 'shell.jsx', 'data.js', 'window_chip.js', 'persisted_state.js', 'quality_view.js'),
+        consumers=('app.jsx',),
     ),
-    'render_failure.js': ('app.jsx',),
-    'poll_scope.js': ('data.js', 'app.jsx'),
 }
-_DEPENDENCY_FREE_CONSUMER_CASES = [
-    (module, consumer)
-    for module, consumers in _DEPENDENCY_FREE_MODULES.items()
-    for consumer in consumers
+_LOAD_ORDER_EDGES = [
+    *((read, module) for module, edges in _MODULE_EDGES.items() for read in edges.reads),
+    *((module, consumer) for module, edges in _MODULE_EDGES.items() for consumer in edges.consumers),
 ]
 
 
-@pytest.mark.parametrize('module', list(_DEPENDENCY_FREE_MODULES))
-def test_dependency_free_module_is_served(client, module: str) -> None:
+def _readers_of(module: str) -> list[str]:
+    return [after for before, after in _LOAD_ORDER_EDGES if before == module]
+
+
+def test_module_table_states_each_edge_once() -> None:
+    """A consumer with a row of its own carries the edge in its `reads`."""
+    restated = [
+        (module, consumer)
+        for module, edges in _MODULE_EDGES.items()
+        for consumer in edges.consumers
+        if consumer in _MODULE_EDGES
+    ]
+    assert restated == [], (
+        f'{restated} are stated as consumers, but each consumer has a row of its '
+        "own: move the edge into that row's `reads`, so the edge has one home."
+    )
+
+
+@pytest.mark.parametrize('module', list(_MODULE_EDGES))
+def test_read_module_is_served(client, module: str) -> None:
     """The module is reachable at runtime, not merely tagged in index.html."""
     resp = client.get(f'/static/redux/{module}')
     assert resp.status_code == 200, (
@@ -1978,32 +2012,30 @@ def test_dependency_free_module_is_served(client, module: str) -> None:
     )
 
 
-@pytest.mark.parametrize('module', list(_DEPENDENCY_FREE_MODULES))
-def test_dependency_free_module_has_cache_buster(index_html_body: str, module: str) -> None:
+@pytest.mark.parametrize('module', list(_MODULE_EDGES))
+def test_read_module_has_cache_buster(index_html_body: str, module: str) -> None:
     """The module is present among the VERSIONED redux assets."""
     assert re.search(rf'/static/redux/{re.escape(module)}\?v=\d+', index_html_body), (
         f'{module} is not present among the versioned /static/redux/* assets in '
-        f'index.html — {", ".join(_DEPENDENCY_FREE_MODULES[module])} destructure its '
-        'global at top level with no fallback. Bump all /static/redux/* ?v= uniformly.'
+        f'index.html — {", ".join(_readers_of(module))} destructure '
+        'its global at top level with no fallback. Bump all /static/redux/* ?v= uniformly.'
     )
 
 
 @pytest.mark.parametrize(
-    'module, consumer',
-    _DEPENDENCY_FREE_CONSUMER_CASES,
-    ids=[f'{module}-before-{consumer}' for module, consumer in _DEPENDENCY_FREE_CONSUMER_CASES],
+    'before, after',
+    _LOAD_ORDER_EDGES,
+    ids=[f'{before}-before-{after}' for before, after in _LOAD_ORDER_EDGES],
 )
-def test_dependency_free_module_loads_before_its_consumers(
-    index_html_body: str, module: str, consumer: str,
-) -> None:
-    """The module defines its global before any consumer destructures it."""
+def test_read_module_load_order(index_html_body: str, before: str, after: str) -> None:
+    """Each read global is defined before the module that destructures it runs."""
     assert_script_loads_before(
         index_html_body,
-        f'/static/redux/{module}',
-        f'/static/redux/{consumer}',
-        before_label=module,
-        after_label=consumer,
-        consumer_note=f'{consumer} ' + _READS_AT_MODULE_SCOPE.format(before=module),
+        f'/static/redux/{before}',
+        f'/static/redux/{after}',
+        before_label=before,
+        after_label=after,
+        consumer_note=f'{after} ' + _READS_AT_MODULE_SCOPE.format(before=before),
     )
 
 

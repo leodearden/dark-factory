@@ -50,6 +50,7 @@ from dashboard.data.quality_markers import (
     derive,
     derived_markers,
     fold_routing_decisions,
+    instrument_markers,
     load_curated_markers,
     marker_datum,
     marker_stream,
@@ -67,7 +68,7 @@ EXAMPLE_SOURCES = {
     SourceType.POLICY_RULE: MarkerSource(SourceType.POLICY_RULE, rule='large-plan-steps'),
     SourceType.DEPLOY: MarkerSource(SourceType.DEPLOY),
     SourceType.MODEL_VERSION: MarkerSource(SourceType.MODEL_VERSION, alias='opus'),
-    SourceType.INSTRUMENT: MarkerSource(SourceType.INSTRUMENT),
+    SourceType.INSTRUMENT: MarkerSource(SourceType.INSTRUMENT, point='0123456789abcdef'),
     SourceType.CURATED: MarkerSource(SourceType.CURATED, file='regime-markers.yaml'),
 }
 
@@ -158,6 +159,7 @@ class TestMarkerSource:
         (SourceType.CONFIG_RELOAD, 'path'),
         (SourceType.POLICY_RULE, 'rule'),
         (SourceType.MODEL_VERSION, 'alias'),
+        (SourceType.INSTRUMENT, 'point'),
         (SourceType.CURATED, 'file'),
     ])
     def test_refuses_a_missing_required_field(self, source_type: SourceType, missing: str) -> None:
@@ -1038,14 +1040,20 @@ class TestOtherDerivedSources:
 
     def test_a_params_change_between_snapshots_is_an_instrument_marker(self, tmp_path: Path) -> None:
         snapshots = (
-            SnapshotIdentity(as_of_sha=SHA_A, committed_at=_t(10), params={'a': 1, 'b': 2}),
-            SnapshotIdentity(as_of_sha='c' * 40, committed_at=_t(20), params={'a': 1, 'b': 2}),
-            SnapshotIdentity(as_of_sha=SHA_B, committed_at=_t(30), params={'a': 1, 'b': 3, 'c': 1}),
+            SnapshotIdentity(point_id='p-1', previous_id=None, as_of_sha=SHA_A,
+                             committed_at=_t(10), params={'a': 1, 'b': 2}),
+            SnapshotIdentity(point_id='p-2', previous_id='p-1', as_of_sha='c' * 40,
+                             committed_at=_t(20), params={'a': 1, 'b': 2}),
+            SnapshotIdentity(point_id='p-3', previous_id='p-2', as_of_sha=SHA_B,
+                             committed_at=_t(30), params={'a': 1, 'b': 3, 'c': 1}),
         )
 
         (marker,) = _derived(_runs(tmp_path, [_decision(1, 'merger')]), snapshots)
 
-        assert (marker.kind, marker.at, marker.ref) == (MarkerKind.INSTRUMENT, _t(30), SHA_B)
+        assert (marker.marker_id, marker.kind, marker.at, marker.ref) == (
+            'instrument:p-3', MarkerKind.INSTRUMENT, _t(30), SHA_B,
+        )
+        assert marker.source == MarkerSource(SourceType.INSTRUMENT, point='p-3')
         assert 'b' in marker.label and 'c' in marker.label and 'a' not in marker.label.split(':')[-1]
 
     def test_unreadable_source_rows_are_skipped_and_counted(self, tmp_path: Path) -> None:
@@ -1057,6 +1065,111 @@ class TestOtherDerivedSources:
 
         assert derived.skipped == 2
         assert derived.markers == ()
+
+
+_SCHEMA_2_PARAMS = {'complexipy_version': '6.2.0', 'h14_soft_ceiling_lines': 1500, 'h14_alarm_lines': 2000}
+_SCHEMA_3_PARAMS = {
+    **_SCHEMA_2_PARAMS,
+    'python_version': '3.13.9',
+    'instrument': {'quality_metrics_snapshot': 'f' * 40, 'source_measures': 'e' * 40},
+}
+_SCHEMA_2_UNKNOWN = frozenset({'instrument', 'python_version'})
+
+
+def _identity(
+    point_id: str, previous_id: str | None, sha: str, minutes: float, params: dict[str, object],
+    unknown: frozenset[str] = frozenset(),
+) -> SnapshotIdentity:
+    return SnapshotIdentity(
+        point_id=point_id, previous_id=previous_id, as_of_sha=sha, committed_at=_t(minutes),
+        params=params, unknown_params=unknown,
+    )
+
+
+class TestInstrumentMarkerPolarity:
+    """Unknown never equals unknown: a marker sits wherever the instrument's --diff says 'params differ'."""
+
+    def test_schema_2_then_schema_3_marks_the_unknown_keys(self) -> None:
+        sha3 = 'c' * 40
+        snapshots = [
+            _identity('p-a', None, SHA_A, 10, _SCHEMA_2_PARAMS, _SCHEMA_2_UNKNOWN),
+            _identity('p-c', 'p-a', sha3, 20, _SCHEMA_3_PARAMS),
+        ]
+
+        (marker,) = instrument_markers('dark_factory', snapshots)
+
+        assert (marker.marker_id, marker.at, marker.kind, marker.ref) == (
+            'instrument:p-c', _t(20), MarkerKind.INSTRUMENT, sha3,
+        )
+        assert marker.source == MarkerSource(SourceType.INSTRUMENT, point='p-c')
+        assert marker.label == 'instrument params changed: instrument (unknown), python_version (unknown)'
+
+    def test_two_schema_2_snapshots_with_equal_params_still_differ(self) -> None:
+        snapshots = [
+            _identity('p-a', None, SHA_A, 10, _SCHEMA_2_PARAMS, _SCHEMA_2_UNKNOWN),
+            _identity('p-b', 'p-a', SHA_B, 20, dict(_SCHEMA_2_PARAMS), _SCHEMA_2_UNKNOWN),
+        ]
+
+        (marker,) = instrument_markers('dark_factory', snapshots)
+
+        assert (marker.marker_id, marker.at, marker.ref) == ('instrument:p-b', _t(20), SHA_B)
+        assert marker.label == 'instrument params changed: instrument (unknown), python_version (unknown)'
+
+    def test_two_schema_3_snapshots_with_equal_params_are_the_same_instrument(self) -> None:
+        snapshots = [
+            _identity('p-a', None, SHA_A, 10, _SCHEMA_3_PARAMS),
+            _identity('p-b', 'p-a', SHA_B, 20, dict(_SCHEMA_3_PARAMS)),
+        ]
+
+        assert instrument_markers('dark_factory', snapshots) == []
+
+    def test_a_schema_3_params_change_names_only_that_key(self) -> None:
+        snapshots = [
+            _identity('p-a', None, SHA_A, 10, _SCHEMA_3_PARAMS),
+            _identity('p-b', 'p-a', SHA_B, 20, {**_SCHEMA_3_PARAMS, 'complexipy_version': '6.3.0'}),
+        ]
+
+        (marker,) = instrument_markers('dark_factory', snapshots)
+
+        assert marker.label == 'instrument params changed: complexipy_version'
+
+    def test_input_order_does_not_matter(self) -> None:
+        snapshots = [
+            _identity('p-a', None, SHA_A, 10, _SCHEMA_2_PARAMS, _SCHEMA_2_UNKNOWN),
+            _identity('p-c', 'p-a', 'c' * 40, 20, _SCHEMA_3_PARAMS),
+            _identity('p-b', 'p-c', SHA_B, 30, {**_SCHEMA_3_PARAMS, 'complexipy_version': '6.3.0'}),
+        ]
+
+        assert instrument_markers('dark_factory', list(reversed(snapshots))) == instrument_markers(
+            'dark_factory', snapshots
+        )
+        assert [marker.at for marker in instrument_markers('dark_factory', snapshots)] == [_t(20), _t(30)]
+
+    def test_a_baseline_and_a_nightly_at_one_commit_mark_each_their_own_point(self) -> None:
+        nightly_params = {**_SCHEMA_3_PARAMS, 'python_version': '3.13.9'}
+        baseline_params = {**_SCHEMA_3_PARAMS, 'python_version': '3.14.0'}
+        snapshots = [
+            _identity('n-a', None, SHA_A, 10, nightly_params),
+            _identity('b-b', 'n-a', SHA_B, 20, baseline_params),
+            _identity('n-b', 'b-b', SHA_B, 20, dict(nightly_params)),
+        ]
+
+        markers = instrument_markers('dark_factory', snapshots)
+
+        assert [marker.marker_id for marker in markers] == ['instrument:b-b', 'instrument:n-b']
+        assert [marker.ref for marker in markers] == [SHA_B, SHA_B]
+        assert [marker.source.point for marker in markers] == ['b-b', 'n-b']
+
+    def test_pairing_follows_the_diffs_predecessor_not_input_or_commit_order(self) -> None:
+        snapshots = [
+            _identity('n-1', 'b-1', SHA_A, 10, {**_SCHEMA_3_PARAMS, 'complexipy_version': '6.3.0'}),
+            _identity('b-1', None, SHA_A, 10, _SCHEMA_3_PARAMS),
+        ]
+
+        (marker,) = instrument_markers('dark_factory', snapshots)
+
+        assert marker.marker_id == 'instrument:n-1'
+        assert marker.label == 'instrument params changed: complexipy_version'
 
 
 def _every_source(tmp_path: Path) -> Path:
@@ -1075,8 +1188,10 @@ def _every_source(tmp_path: Path) -> Path:
 
 class TestDerivedMarkers:
     SNAPSHOTS = (
-        SnapshotIdentity(as_of_sha=SHA_A, committed_at=_t(1), params={'v': 1}),
-        SnapshotIdentity(as_of_sha=SHA_B, committed_at=_t(9), params={'v': 2}),
+        SnapshotIdentity(point_id='p-a', previous_id=None, as_of_sha=SHA_A, committed_at=_t(1),
+                         params={'v': 1}),
+        SnapshotIdentity(point_id='p-b', previous_id='p-a', as_of_sha=SHA_B, committed_at=_t(9),
+                         params={'v': 2}),
     )
 
     def test_every_derived_marker_is_scoped_to_the_project_for_every_series(

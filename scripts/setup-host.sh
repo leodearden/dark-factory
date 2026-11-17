@@ -12,8 +12,8 @@ ok()    { printf '\033[1;32m  ✓ %s\033[0m\n' "$*"; }
 warn()  { printf '\033[1;33m  ! %s\033[0m\n' "$*"; }
 fail()  { printf '\033[1;31m  ✗ %s\033[0m\n' "$*"; }
 
-# Classify what a tagged checker just told us: the five parity checkers and the
-# network exposure check. Defined HERE, once, immediately below the log shims
+# Classify what a tagged checker just told us: the five parity checkers, the
+# network exposure check and the expected-user-timer arming. Defined HERE, once, immediately below the log shims
 # and above every call site — the sites share one shell scope, and every sliced
 # block is executed by the test harness under
 # a preamble that provides this helper (tests/scripts/setup_host_sections.py
@@ -35,8 +35,8 @@ fail()  { printf '\033[1;31m  ✗ %s\033[0m\n' "$*"; }
 # CLASSIFICATION ONLY. Each call site keeps its own wording, severity and side
 # effects, because those legitimately differ — `absent` is `info` at the
 # orchestrator, dashboard pre-install and lms sites, `warn` at the
-# fused-memory and dashboard post-install ones and `fail` at the network
-# exposure one; the orchestrator gate may `fail` and sets
+# fused-memory, dashboard post-install and expected-user-timer ones and `fail`
+# at the network exposure one; the orchestrator gate may `fail` and sets
 # _orch_install_blocked, while the lms gate is forbidden from ever calling
 # `fail` (test_setup_host_lms_parity_gate.py::test_the_lms_gate_is_warn_only).
 # A helper that also emitted messages would have to collapse those distinctions
@@ -1152,6 +1152,40 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 7b. Expected user timers — the nightly ladder and the load sampler
+# ---------------------------------------------------------------------------
+info "Arming the expected user timers"
+info "  An unarmed timer's installer may run its job once, which can take minutes; the report prints when arming ends."
+
+# The registry is scripts/expected_user_timers.py. Only an unarmed timer's
+# installer runs, and a masked one is left alone. The status is believed only
+# with the [user_timers] tag (scripts/user_timers.py). Why: OPERATIONS.md §12.
+_user_timers_script="$REPO_ROOT/scripts/user_timers.py"
+if [ ! -f "$_user_timers_script" ]; then
+  fail "Expected-user-timer arming missing: $_user_timers_script"
+  fail "  Not treating that as 'every timer armed' — it is 'nothing checked'."
+else
+  _user_timers_out="$(python3 "$_user_timers_script" arm --repo-root "$REPO_ROOT" 2>&1)" \
+       && _user_timers_exit=0 || _user_timers_exit=$?
+  printf '%s\n' "$_user_timers_out"
+  _user_timers_verdict="$(_parity_verdict "$_user_timers_out" \
+       "$_user_timers_exit" '[user_timers]')"
+  case "$_user_timers_verdict" in
+  unreported)
+    fail "Expected-user-timer arming produced no [user_timers] report"
+    fail "  (status $_user_timers_exit) — it did not run, so no timer was checked."
+    ;;
+  parity)
+    ok "Expected user timers: every one is armed"
+    ;;
+  absent | finding | *)
+    warn "Expected user timers: not all armed, or an installer failed — see the [user_timers] report above."
+    warn "  Re-check: python3 $_user_timers_script check"
+    ;;
+  esac
+fi
+
+# ---------------------------------------------------------------------------
 # 8. Claude Code skill symlinks
 # ---------------------------------------------------------------------------
 info "Creating Claude Code skill symlinks"
@@ -1510,8 +1544,9 @@ else
   esac
 fi
 
-# Every factory port must refuse off-loopback connects and accept on 127.0.0.1
-# (contract: plans/mcp-network-exposure-prd.md §3). The status is believed only
+# Every factory port must refuse off-loopback connects and accept on 127.0.0.1,
+# unless the report notes it [no-container]: an optional compose service with no
+# container yet (contract: plans/mcp-network-exposure-prd.md §3). The status is believed only
 # with the [network_exposure] tag; the check never exits 2 under it, so `absent`
 # is a failure here.
 _net_exposure_script="$REPO_ROOT/scripts/check_network_exposure.py"
@@ -1530,7 +1565,7 @@ else
     fail "  (status $_net_exposure_exit) — it did not run, so nothing was checked."
     ;;
   parity)
-    ok "Network exposure: every factory port refuses off-loopback connects and accepts on 127.0.0.1"
+    ok "Network exposure: no factory port is reachable off loopback; every running owner accepts on 127.0.0.1 (see the report above)"
     ;;
   absent | finding | *)
     fail "Network exposure: a factory port is reachable off loopback, unreachable on it, or unverified —"

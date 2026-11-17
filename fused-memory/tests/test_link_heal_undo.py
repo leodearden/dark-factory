@@ -87,6 +87,42 @@ def link_keys(harness: LinkHealHarness) -> dict:
     return LinkImage.from_metadata(harness.mem0.payload(DF, CHILD)).as_dict()
 
 
+class TestUndoRecords:
+    @pytest.mark.asyncio
+    async def test_each_undo_step_records_its_before_and_after_child(
+        self, harness, ledger, tmp_path,
+    ):
+        harness.seed_link()
+        _plan, applied = await plan_and_apply(harness, ledger, tmp_path, corpus_basis('RELATED'))
+
+        report = await undo(harness, ledger, applied.run_id)
+
+        steps = ledger.undo_steps(report.run_id)
+        assert steps
+        for step in steps:
+            assert step.state is ActionState.APPLIED
+            assert step.before_child_snapshot_id is not None
+            assert step.after_child_snapshot_id is not None
+            assert ledger.read_snapshot(step.before_child_snapshot_id).link_image() == step.before
+            assert ledger.read_snapshot(step.after_child_snapshot_id).link_image() == step.after
+
+    @pytest.mark.asyncio
+    async def test_undo_works_from_the_ledger_alone(self, harness, ledger, tmp_path):
+        harness.seed_link()
+        plan, applied = await plan_and_apply(harness, ledger, tmp_path, corpus_basis('RELATED'))
+        (tmp_path / 'plan.json').unlink()
+        heal = the_heal(ledger, plan)
+        assert heal.before_child_snapshot_id is not None
+
+        await run_undo(
+            ledger.undo_target(ledger.resolve_run(applied.run_id)),
+            store=harness.store(), ledger=ledger, limits=DEFAULT_LIMITS,
+        )
+
+        before = ledger.read_snapshot(heal.before_child_snapshot_id)
+        assert link_keys(harness) == before.link_image().as_dict()
+
+
 class TestUndoAHalfLinkCompletion:
     async def _undone(self, harness, ledger, tmp_path):
         harness.seed_link(kind=None)

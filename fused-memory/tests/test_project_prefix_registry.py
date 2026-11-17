@@ -5,11 +5,14 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.middleware.project_prefix_registry import (
     DARK_FACTORY_ROOT,
     ProjectPrefixRegistry,
 )
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 
 def _mkproj(parent: Path, name: str, dirs: list[str]) -> Path:

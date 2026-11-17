@@ -36,7 +36,7 @@ from shared.git_async import GitResult, run_git
 from shared.git_read_rules import git_read_rules
 from shared.transcript_archive import archive_task_transcripts
 
-from orchestrator.agents.invoke import invoke_agent  # noqa: E402
+from orchestrator.agents.invoke import invoke_agent
 from orchestrator.agents.sandbox_dispatch import (
     SandboxUnavailable,
     get_backend,
@@ -115,15 +115,13 @@ _INFRA_FAILURE_KINDS: frozenset[AgentFailureKind] = frozenset({
 
 # Outer wall-clock sanity bound for invoke_with_cap_retry's cap patience,
 # covering both its cap-retry loop and the gate's park on a pool frozen at
-# spawn (shared/src/shared/cli_invoke.py cap-wait policy table). This is a
-# fire-and-forget, best-effort block-time investigation — it must NOT inherit
-# the 14-day default, which would leave a background task pending for weeks
-# under a sustained cap storm. Mirrors the 1800s reconciliation-stage
-# precedent (short-lived stage runners, same table).
+# spawn. This is a fire-and-forget, best-effort block-time investigation — it
+# must NOT inherit the 14-day default, which would leave a background task
+# pending for weeks under a sustained cap storm.
 _DRY_RUN_CAP_WAIT_SANITY_SECS: float = 1800.0
 
 
-def _is_budget_exhausted(result: Any, budget_usd: float) -> bool:  # noqa: ARG001
+def _is_budget_exhausted(result: Any, budget_usd: float) -> bool:
     """Return True only when the agent's subtype explicitly signals budget exhaustion.
 
     We avoid the ``cost >= budget_usd`` heuristic: an agent can spend close to

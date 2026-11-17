@@ -18,6 +18,7 @@ import pytest
 import pytest_asyncio
 from _curator_helpers import answer_each_with, curator_returning, serve_existing_task
 from _fm_polling import poll_until
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.backends.task_backend_errors import DuplicateCandidateKeyError
 from fused_memory.middleware.curator_types import CuratorDecision, RewrittenTask
@@ -33,6 +34,8 @@ from fused_memory.middleware.task_creation_journal import (
 from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.middleware.ticket_store import TicketStore
 from fused_memory.reconciliation.event_buffer import EventBuffer
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 RUN = 'f9e49aef-0000-4000-8000-000000000001'
 OTHER_RUN = '90d762d0-0000-4000-8000-000000000002'

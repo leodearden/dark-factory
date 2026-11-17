@@ -14,6 +14,7 @@ import json
 from pathlib import Path
 
 import pytest
+from _external_submit_producers import EXTERNAL_SUBMIT_PRODUCERS
 from _filing_tools import call_blocker, call_info, call_promote
 
 from escalation.categories import (
@@ -45,12 +46,20 @@ _AGENT_INSTRUCTED = (
 )
 
 
-# Categories filed through ``escalation submit`` by producers in other
-# repositories, which the census cannot walk. Each entry names its producer.
-_EXTERNAL_PRODUCERS = (
+# Categories that producers in other repositories file through ``escalation
+# submit``, which the census cannot walk. Derived from those producers' whole
+# calls in _external_submit_producers.py, which test_submit_cli.py runs.
+_EXTERNAL_PRODUCERS = tuple(
+    pytest.param(p.category, id=p.locator) for p in EXTERNAL_SUBMIT_PRODUCERS
+)
+
+
+# Categories an in-tree producer files through a value the census cannot
+# resolve, such as a route table's dataclass field. Each entry names its producer.
+_UNRESOLVED_IN_TREE_PRODUCERS = (
     pytest.param(
-        'validation_lane_red',
-        id='solar-challenge-platform:src/solar_challenge_platform/ci/cadence_alert.py::CATEGORY',
+        'link_heal_run_report',
+        id='fused-memory/src/fused_memory/maintenance/link_heal_executor.py::_ESCAPE_ROUTES',
     ),
 )
 
@@ -58,6 +67,10 @@ _EXTERNAL_PRODUCERS = (
 class TestRegistry:
     @pytest.mark.parametrize('value', _EXTERNAL_PRODUCERS)
     def test_external_producer_categories_stay_registered(self, value: str):
+        assert value in EscalationCategory
+
+    @pytest.mark.parametrize('value', _UNRESOLVED_IN_TREE_PRODUCERS)
+    def test_unresolved_in_tree_producer_categories_stay_registered(self, value: str):
         assert value in EscalationCategory
 
     @pytest.mark.parametrize('value', _REGISTERED_AHEAD_OF_ANY_PRODUCER)
@@ -179,6 +192,13 @@ class TestQueueChokepoint:
 
     def test_find_terminal_by_citation_registered_unchanged(self, queue: EscalationQueue):
         assert queue.find_terminal_by_citation('t1', 'infra_issue', 'a' * 40) is None
+
+    def test_newest_terminal_by_task_rejects_unregistered(self, queue: EscalationQueue):
+        with pytest.raises(UnregisteredEscalationCategory):
+            queue.newest_terminal_by_task('t1', 'nope', lambda esc: True)
+
+    def test_newest_terminal_by_task_registered_unchanged(self, queue: EscalationQueue):
+        assert queue.newest_terminal_by_task('t1', 'infra_issue', lambda esc: True) is None
 
     def test_legacy_unregistered_record_loads_lists_and_resolves(
         self, queue: EscalationQueue,

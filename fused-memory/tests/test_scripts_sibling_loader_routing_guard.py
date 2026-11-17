@@ -17,6 +17,9 @@ import pathlib
 
 import pytest
 from _ast_guard import calls_named, parse_python_module
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SCRIPTS_ROOT = pathlib.Path(__file__).parent.parent / 'scripts'
 

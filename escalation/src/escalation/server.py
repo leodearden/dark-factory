@@ -79,9 +79,11 @@ from escalation.models import (
     ACTION_TERMINATE_CLEANLY,
     AGENT_FILABLE_LEVELS,
     BORN_AT_L2_SEVERITIES,
+    EVAL_LANE_CONTAINMENT_RESOLVER,
     HARNESS_SENTINEL_ROLE_PREFIXES,
     KNOWN_SEVERITIES,
     NOTE_TO_FILE_CLASS,
+    PRE_SUBMIT_CHECK_RESOLVER,
     RESOLUTION_CLASSES,
     STATUS_ACCEPTED_UNPERSISTED,
     Escalation,
@@ -609,6 +611,35 @@ class _ProbeFailed(Exception):
         return MergeStatusAnswer.epistemic(
             MergeState.unknown, MergeReason.probe_failed, key.request_id, source=self.source,
         )
+
+
+@dataclass(frozen=True)
+class _HistoryRead:
+    """merge_status's one up-front cross-run read: the newest durable row, or that it failed."""
+
+    history: _DurableHistory | None
+    failed: bool
+
+    def __post_init__(self) -> None:
+        if self.failed and self.history is not None:
+            raise ValueError('_HistoryRead: a failed read carries no history row')
+
+    @classmethod
+    def found(cls, history: _DurableHistory | None) -> _HistoryRead:
+        return cls(history, failed=False)
+
+    @classmethod
+    def failure(cls) -> _HistoryRead:
+        return cls(None, failed=True)
+
+    def history_or_probe_failure(self) -> _DurableHistory | None:
+        """The cross-run tier's own answer: a failed read ends the walk at this tier."""
+        if self.failed:
+            raise _ProbeFailed(MergeStatusSource.event_store_cross_run)
+        return self.history
+
+    def last_outcome(self) -> LastOutcome | None:
+        return LastOutcome.from_row(self.history.row) if self.history is not None else None
 
 
 def _require_matching_project_root(wired_root: Path, project_root: str) -> str | None:
@@ -1309,8 +1340,9 @@ def create_server(
 
     *merge_inflight_registry* is an optional ``InFlightMergeRegistry`` injected
     for testing.  When *merge_queue* is not None and no registry is supplied, a
-    fresh registry is created lazily inside this function so it is shared across
-    all ``merge_request`` calls for the lifetime of the server.  When
+    fresh registry is created lazily inside this function so it is shared by
+    ``merge_request``, ``merge_status`` and ``merge_cancel`` for the lifetime of
+    the server.  When
     *merge_queue* is None (escalation standalone — orchestrator not wired) the
     registry is never imported, preserving the standalone import path.
 
@@ -1558,6 +1590,7 @@ def create_server(
             InFlightMergeRegistry,
         )
         _registry = InFlightMergeRegistry()
+    del merge_inflight_registry  # one registry, one name: every tool below reads _registry
 
     # Server-side durable-intent waiter store (β1 D2/I5).
     # Keyed by request_id; each entry is a WaiterRecord holding the shielded
@@ -1902,7 +1935,7 @@ def create_server(
                 f'contained: eval-lane artifact ({eval_lane_reason}); not a '
                 'production signal, the eval measurement is scored from the '
                 'cell result artifacts',
-                resolved_by='escalation-eval-lane-containment',
+                resolved_by=EVAL_LANE_CONTAINMENT_RESOLVER,
                 resolution_class=NOTE_TO_FILE_CLASS if esc.note_to_file else 'benign',
             )
             return {
@@ -2033,7 +2066,7 @@ def create_server(
             resolved = queue.submit_resolved(
                 esc,
                 f'auto-resolved: task already terminal (status={status})',
-                resolved_by='escalation-mcp-pre-submit-check',
+                resolved_by=PRE_SUBMIT_CHECK_RESOLVER,
                 resolution_class='benign',
             )
             return {
@@ -2653,7 +2686,10 @@ def create_server(
         NOTE: resolve_issue itself writes no task status — this call changes
         only the escalation record. The orchestrator harness applies the
         ``target_status`` values above. Table B's consumers are listed in the
-        ``escalation/src/escalation/action_effects.py`` module docstring.
+        ``escalation/src/escalation/action_effects.py`` module docstring. A
+        ``resume`` of a held deterministic pure gate is run by the harness
+        inline, which closes it or re-holds it, instead of being re-pended, see
+        ``orchestrator/src/orchestrator/harness.py::Harness._run_held_pure_gate_inline``.
         """
         if terminate is not None:
             return {
@@ -2913,7 +2949,7 @@ def create_server(
             if callable(bump):
                 try:
                     bump(rec.task_id)
-                except Exception as _e:  # noqa: BLE001 — best-effort telemetry
+                except Exception as _e:  # best-effort telemetry
                     logger.warning(
                         'escalate_model tier bump failed for task %s '
                         '(non-fatal): %s',
@@ -3153,8 +3189,8 @@ def create_server(
         the reconciliation queue are separate stores), so a caller connected to
         one of them learns nothing about records in the other: confirm which
         queue you are talking to before reading any [] as a gap.  Auditing a
-        ``done`` ``task_kind='deterministic'`` gate task that has
-        ``metadata.gate_escalated_at`` set?  Those records live in the
+        ``done`` ``task_kind='deterministic'`` gate task whose
+        ``done_provenance.kind`` is ``'deterministic-gate'``?  Those records live in the
         ORCHESTRATOR queue — call this tool against THAT server before emitting
         any finding, flag, memory or remediation task claiming the escalation
         record was never written.  (Reconciliation stages are denied this tool
@@ -3231,8 +3267,8 @@ def create_server(
         so a caller connected to one of them learns nothing about records in
         the other: confirm which queue you are talking to before treating
         ``count: 0`` as proof that no record was ever filed. Auditing a
-        ``done`` ``task_kind='deterministic'`` gate task that has
-        ``metadata.gate_escalated_at`` set? Those records live in the
+        ``done`` ``task_kind='deterministic'`` gate task whose
+        ``done_provenance.kind`` is ``'deterministic-gate'``? Those records live in the
         ORCHESTRATOR queue — query THAT server before emitting any finding,
         flag, memory or remediation task claiming the escalation record was
         never written. (Reconciliation stages are denied this tool outright
@@ -4112,9 +4148,13 @@ def create_server(
         it.  When True (and an event store is wired), emits a
         ``workflow_verify`` event so the merge-skew classifier can attribute
         a later skewed merge failure to ``INTEGRATION_SKEW`` instead of
-        degrading to ``INDETERMINATE``.  Default ``False`` — no attribution,
-        emits nothing (mirrors the orchestrator's own emission at the
-        VERIFY→REVIEW transition for its own submissions).
+        degrading to ``INDETERMINATE``.  The vouch records the branch tip the
+        server resolved: a redispatch at that tip skips VERIFY, and the
+        stranded-green reaper and the architect's ready_to_merge gate treat
+        that tip as verified.  The merge worker's own gate still runs.
+        Default ``False`` — no attribution, emits nothing (mirrors the
+        orchestrator's own emission at the VERIFY→REVIEW transition for its
+        own submissions).
 
         *retry_failed_only* — set True to vouch that this request's post-merge
         verify retries should re-run only the previously-failed tests instead
@@ -4626,9 +4666,10 @@ def create_server(
         # returns immediately with in_flight=True — no future await, no duplicate
         # enqueue.  On dispatch acquires the registry slot and awaits the future
         # exactly as the original enqueue_merge_request path.
-        # Task 2411: mirror the orchestrator's own workflow_verify emission
-        # (workflow.py:1724-1733) for non-orchestrator submission pathways
-        # (/merge-queue, /unblock, /do) so the merge-skew classifier's I5
+        # The payload's single definition is
+        # orchestrator/src/orchestrator/verify_evidence.py::workflow_verify_event_data.
+        # Task 2411: non-orchestrator submission pathways
+        # (/merge-queue, /unblock, /do) vouch here so the merge-skew classifier's I5
         # branch-green fact (merge_disposition._branch_pre_merge_verify_green,
         # keyed by task_id, reads only data['passed']) can source from these
         # too.  verified_green is a caller-supplied vouch — only the caller
@@ -4645,6 +4686,12 @@ def create_server(
             from orchestrator.merge_lane import (
                 resolve_dispatch_time_merge_base,
             )
+            from orchestrator.task_verify_dispatch import LOCAL_RUNNER
+            from orchestrator.verify_evidence import (
+                TipUnresolved,
+                VerifySite,
+                workflow_verify_event_data,
+            )
             base_sha = (
                 await resolve_dispatch_time_merge_base(
                     orch_config.project_root, orch_config.git.main_branch, resolved_tip,
@@ -4652,25 +4699,24 @@ def create_server(
                 if resolved_tip is not None
                 else None
             )
-            # SYNC CONTRACT (reviewer follow-up on step-4): this payload shape —
-            # keys 'passed' / 'base_sha' / 'branch', task_id-keyed — MUST stay
-            # byte-identical to the orchestrator's own emission at
-            # workflow.py:1724-1733, since merge_disposition._branch_pre_merge_verify_green
-            # reads both call sites as one logical event stream.  A shared
-            # canonical constructor (e.g. an `emit_workflow_verify(...)` helper)
-            # would remove this manual-sync risk, but its natural home is
-            # orchestrator (workflow.py would need to call it too) — out of
-            # this task's locked scope (escalation/server.py + tests +
-            # skills/{merge-queue,unblock}/SKILL.md only).  Deferred as a
-            # follow-up rather than expanding this task's file locks.
+            if resolved_tip is None:
+                logger.warning(
+                    'merge_request: no tip resolved for branch %s (task %s); recording the '
+                    'verified_green vouch with tip_sha_unresolved',
+                    full_branch, task_id,
+                )
             event_store.emit(
                 EventType.workflow_verify,
                 task_id=task_id,
-                data={
-                    'passed': True,
-                    'base_sha': base_sha,
-                    'branch': canonical_queued_branch_name(branch, orch_config.git.branch_prefix),
-                },
+                data=workflow_verify_event_data(
+                    True,
+                    tip_sha=resolved_tip if resolved_tip is not None else TipUnresolved.BRANCH_UNRESOLVED,
+                    base_sha=base_sha,
+                    branch=full_branch,
+                    result=None,
+                    site=VerifySite.MCP_MERGE_REQUEST,
+                    runner=LOCAL_RUNNER,
+                ),
             )
 
         # classifier_git_ops: the same harness GitOps handle is reused here so
@@ -5497,9 +5543,9 @@ def create_server(
             logger.warning('merge_status: snapshot() failed', exc_info=True)
             raise _ProbeFailed(MergeStatusSource.live) from exc
         eta = None
-        if merge_inflight_registry is not None:
+        if _registry is not None:
             with contextlib.suppress(Exception):
-                eta = merge_inflight_registry.eta_seconds(entry['branch'])
+                eta = _registry.eta_seconds(entry['branch'])
         return MergeStatusAnswer.outcome(
             source=MergeStatusSource.live,
             fields={
@@ -5514,11 +5560,16 @@ def create_server(
     def _current_run_answer(key: _PollKey) -> MergeStatusAnswer | None:
         if event_store is None:
             return None
-        row = event_store.latest_merge_finalized(
-            request_id=key.request_id, branch=key.branch, task_id=key.task_id,
-        )
-        if row is None and key.request_id is not None:
-            row = event_store.merge_finalized_absorbing(key.request_id)
+        try:
+            row = event_store.latest_merge_finalized(
+                request_id=key.request_id, branch=key.branch, task_id=key.task_id,
+                fire_safe=False,
+            )
+            if row is None and key.request_id is not None:
+                row = event_store.merge_finalized_absorbing(key.request_id, fire_safe=False)
+        except Exception as exc:
+            logger.warning('merge_status: event store (current run) read failed', exc_info=True)
+            raise _ProbeFailed(MergeStatusSource.event_store) from exc
         if row is None:
             return None
         if not row['is_current_run']:
@@ -5531,7 +5582,7 @@ def create_server(
             'outcome': row['state'],
             'finished_at': row['finished_at'],
         }
-        for name in ('superseded_by', 'reason'):
+        for name in ('merge_sha', 'superseded_by', 'reason'):
             if row.get(name) is not None:
                 fields[name] = row[name]
         return MergeStatusAnswer.outcome(source=MergeStatusSource.event_store, fields=fields)
@@ -5556,26 +5607,34 @@ def create_server(
         matches = [e for e in entries if key.matches(e.request_id, e.branch, e.task_id)]
         return max(matches, key=lambda e: e.enqueued_at) if matches else None
 
-    def _durable_history(key: _PollKey) -> _DurableHistory | None:
+    def _durable_history(key: _PollKey) -> _HistoryRead:
         if event_store is None:
-            return None
-        row = event_store.latest_merge_finalized(
-            request_id=key.request_id, branch=key.branch, task_id=key.task_id,
-            cross_run=True,
-        )
-        if row is None and key.request_id is not None:
-            row = event_store.merge_finalized_absorbing(key.request_id, cross_run=True)
-        if row is not None:
-            return _DurableHistory(row, MergeReason.prior_run_terminal)
-        if key.request_id is not None:
-            members = event_store.merge_finalized_superseded_by(key.request_id, cross_run=True)
-            if members:
-                return _DurableHistory(members[-1], MergeReason.coalesce_train_id)
-        return None
+            return _HistoryRead.found(None)
+        try:
+            row = event_store.latest_merge_finalized(
+                request_id=key.request_id, branch=key.branch, task_id=key.task_id,
+                cross_run=True, fire_safe=False,
+            )
+            if row is None and key.request_id is not None:
+                row = event_store.merge_finalized_absorbing(
+                    key.request_id, cross_run=True, fire_safe=False,
+                )
+            if row is not None:
+                return _HistoryRead.found(_DurableHistory(row, MergeReason.prior_run_terminal))
+            if key.request_id is not None:
+                members = event_store.merge_finalized_superseded_by(
+                    key.request_id, cross_run=True, fire_safe=False,
+                )
+                if members:
+                    return _HistoryRead.found(
+                        _DurableHistory(members[-1], MergeReason.coalesce_train_id),
+                    )
+            return _HistoryRead.found(None)
+        except Exception:
+            logger.warning('merge_status: event store (cross run) read failed', exc_info=True)
+            return _HistoryRead.failure()
 
-    async def _walk_durable(
-        key: _PollKey, history: _DurableHistory | None,
-    ) -> MergeStatusAnswer:
+    async def _walk_durable(key: _PollKey, history_read: _HistoryRead) -> MergeStatusAnswer:
         current = _current_run_answer(key)
         if current is not None:
             return current
@@ -5601,6 +5660,7 @@ def create_server(
                 MergeState.journaled, reason(MergeReason.journaled_not_live),
                 entry.request_id, fields={'enqueued_at': entry.enqueued_at},
             )
+        history = history_read.history_or_probe_failure()
         if history is not None:
             return MergeStatusAnswer.epistemic(
                 MergeState.stale_record, reason(history.reason), key.request_id,
@@ -5611,13 +5671,12 @@ def create_server(
 
     async def _resolve(key: _PollKey) -> MergeStatusAnswer:
         """Walk the tiers, live first; the first probe that raises ends it as unknown."""
-        history = _durable_history(key)
+        history_read = _durable_history(key)
         try:
-            answer = _live_answer(key) or await _walk_durable(key, history)
+            answer = _live_answer(key) or await _walk_durable(key, history_read)
         except _ProbeFailed as failure:
             answer = failure.answer_for(key)
-        last_outcome = LastOutcome.from_row(history.row) if history is not None else None
-        return answer.with_last_outcome(last_outcome)
+        return answer.with_last_outcome(history_read.last_outcome())
 
     @mcp.tool()
     async def merge_status(
@@ -5637,7 +5696,10 @@ def create_server(
             → durable journal → event store (prior runs) → no_record
 
         The first tier that answers wins; the first probe that RAISES ends the
-        walk as ``unknown`` with ``source`` naming that tier.  The git tier
+        walk as ``unknown`` with ``source`` naming that tier.  The prior-run
+        history is read once, up front, for ``last_outcome``; if that read
+        fails it ends the walk only on reaching its own tier, and
+        ``last_outcome`` is None.  The git tier
         only consumes ``escalation/src/escalation/git_authority.py::probe_landing``'s
         verdict and needs a branch or task_id plus ``harness.git_ops`` and
         ``orch_config``.  The newest durable row of ANY run is attached to every

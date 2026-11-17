@@ -27,6 +27,9 @@ import pytest
 # HARDCODED_SERVICE_REPO_ROOT for why this module renders through the
 # installer's own code rather than replaying the substitution.
 import render_systemd_unit
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 TEMPLATE = REPO_ROOT / "scripts" / "dashboard.service.template"

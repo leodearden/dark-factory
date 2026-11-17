@@ -27,6 +27,9 @@ from setup_host_sections import (
     usage_error_checker,
     write_checker,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 CHECKER_PATH = REPO_ROOT / "scripts" / "check_fused_memory_unit_parity.py"
@@ -124,6 +127,7 @@ Restart=on-failure
 RestartSec=5
 RestartSteps=4
 TimeoutStartSec=300
+KillMode=mixed
 TimeoutStopSec=90
 
 [Install]
@@ -297,6 +301,20 @@ def test_find_drift_detects_injected_timeout_stop_sec_divergence():
     assert "TimeoutStopSec=90" in drift
 
 
+def test_find_drift_detects_missing_kill_mode():
+    """An installed unit still on the default KillMode=control-group is drift (task 9493)."""
+    mod = _load_checker()
+    unit = _CLEAN_UNIT.replace("KillMode=mixed\n", "")
+    assert mod.find_drift(unit) == ["KillMode=mixed"]
+
+
+def test_find_drift_flags_a_control_group_kill_mode():
+    """An explicit KillMode=control-group is drift too: membership is exact."""
+    mod = _load_checker()
+    unit = _CLEAN_UNIT.replace("KillMode=mixed", "KillMode=control-group")
+    assert "KillMode=mixed" in mod.find_drift(unit)
+
+
 def test_parity_checker_subprocess_exit_1_on_divergent_timeout_stop_sec(
     tmp_path: pathlib.Path,
 ):
@@ -357,12 +375,14 @@ WantedBy=default.target
 """
 
 
-def test_fix_unit_text_adds_missing_directive():
-    """fix_unit_text inserts Environment=MEM0_TELEMETRY=false into [Service]."""
+def test_fix_unit_text_adds_every_missing_required_directive():
+    """fix_unit_text appends each REQUIRED_SERVICE_DIRECTIVES entry [Service] lacks,
+    so a newly required directive is covered without a test of its own."""
     mod = _load_checker()
     fixed = mod.fix_unit_text(_DRIFTED_WITH_HOST_SPECIFIC)
-    sections = mod.parse_unit_sections(fixed)
-    assert "Environment=MEM0_TELEMETRY=false" in sections["Service"]
+    service = mod.parse_unit_sections(fixed)["Service"]
+    still_missing = [d for d in mod.REQUIRED_SERVICE_DIRECTIVES if d not in service]
+    assert still_missing == []
 
 
 def test_fix_unit_text_preserves_host_specific_line():
@@ -399,6 +419,7 @@ Restart=on-failure
 RestartSec=5
 RestartSteps=4
 TimeoutStartSec=300
+KillMode=mixed
 TimeoutStopSec=90
 
 [Install]

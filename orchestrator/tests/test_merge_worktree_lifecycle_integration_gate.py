@@ -331,6 +331,7 @@ from orchestrator.merge_lane.types import (
     TerminalOutcomeRetention,
 )
 from orchestrator.merge_lane.worker import PRODUCTION_CLOCK
+from orchestrator.quarantine_provenance import NOT_RELOCATED
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_cancel import (
     acquire_merge_verify_flock,
@@ -470,7 +471,7 @@ def _build_recovery_harness(mock_orch_config: MagicMock, git_repo: Path) -> Harn
     h.git_ops = GitOps(recovery_git_config, git_repo)
     h.git_ops.mark_pool_storage_present()
     h.git_ops.cleanup_worktree = AsyncMock()
-    h.git_ops.quarantine_worktree = AsyncMock(return_value=None)
+    h.git_ops.quarantine_worktree = AsyncMock(return_value=NOT_RELOCATED)
     h.event_store = MagicMock()
 
     return h
@@ -1521,7 +1522,7 @@ class _RetireSpy:
         self.removed: list[tuple[Path, str]] = []
         self.find_calls = 0
 
-    async def find_inflight_merge_worktree(self, branch: str) -> Path | None:  # noqa: ARG002
+    async def find_inflight_merge_worktree(self, branch: str) -> Path | None:
         self.find_calls += 1
         if self._scratch is not None and self._scratch.exists():
             return self._scratch

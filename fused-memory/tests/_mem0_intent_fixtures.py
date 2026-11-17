@@ -16,7 +16,11 @@ from datetime import UTC, datetime
 import httpx
 import openai
 
-from fused_memory.services.write_journal import Mem0IntentStatus, WriteJournal
+from fused_memory.services.write_journal import (
+    Mem0IntentStatus,
+    Mem0WriteMethod,
+    WriteJournal,
+)
 
 EMBEDDINGS_REQUEST = httpx.Request('POST', 'https://api.openai.com/v1/embeddings')
 
@@ -51,6 +55,7 @@ async def seed_mem0_intent(
     agent_id: str | None = None,
     session_id: str | None = None,
     category: str | None = None,
+    write_method: Mem0WriteMethod = Mem0WriteMethod.ADD,
 ) -> str:
     """Journal one intent, move it to ``status``, and return its id.
 
@@ -67,6 +72,7 @@ async def seed_mem0_intent(
         content=content,
         metadata=metadata,
         payload_digest='d',
+        write_method=write_method,
     )
     if status == Mem0IntentStatus.RETRYING:
         assert await journal.schedule_mem0_retry(
@@ -89,6 +95,17 @@ def set_mem0_intent_created_at(
         conn.execute(
             'UPDATE mem0_intents SET created_at = ? WHERE id = ?',
             (created_at.isoformat(), intent_id),
+        )
+
+
+def set_mem0_intent_write_method(
+    journal: WriteJournal, intent_id: str, value: str
+) -> None:
+    """Plant a raw ``write_method``; the journal API only ever writes a ``Mem0WriteMethod``."""
+    with closing(sqlite3.connect(journal.db_path)) as conn, conn:
+        conn.execute(
+            'UPDATE mem0_intents SET write_method = ? WHERE id = ?',
+            (value, intent_id),
         )
 
 

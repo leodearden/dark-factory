@@ -7,7 +7,7 @@ that accepts everything can never report a passing endpoint.
 
 import asyncio
 import uuid
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -41,6 +41,7 @@ from fused_memory.arm_harness.metrics_record import IndexConfiguration, MetricsR
 from fused_memory.arm_harness.replay_types import EpisodeOutcome
 from fused_memory.arm_harness.run_manifest import RunManifest
 from fused_memory.arm_harness.scratch_guard import GuardCheckpoint, require_scratch_name
+from fused_memory.arm_harness.sleep_seam import Sleep
 from fused_memory.config.schema import FusedMemoryConfig
 
 # --- endpoint conformance smoke (boundary row 1) -------------------------------------
@@ -155,7 +156,7 @@ async def check_index_configuration(
     graph_name: str,
     expected: IndexConfiguration,
     *,
-    sleep: Callable[[float], Awaitable[object]] = asyncio.sleep,
+    sleep: Sleep = asyncio.sleep,
 ) -> CheckResult:
     """Whether the scratch graph's fulltext index exists in fact, as ``expected`` claims.
 
@@ -181,7 +182,7 @@ async def _remove_probe_node(graph: ProbeGraph, graph_name: str, node_uuid: str)
 
 
 async def _probe_fulltext(
-    graph: ProbeGraph, token: str, sleep: Callable[[float], Awaitable[object]]
+    graph: ProbeGraph, token: str, sleep: Sleep
 ) -> _ProbeAnswer:
     """Polls until a row arrives. A server-side ``ResponseError`` ends the poll.
 

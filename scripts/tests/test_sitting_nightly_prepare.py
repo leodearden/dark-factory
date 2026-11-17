@@ -22,8 +22,11 @@ from legibility import account_pool
 from orchestrator.agents import landlock, sandbox, sandbox_dispatch
 from shared.cap_markers import REAL_CLI_CAP_HIT_MESSAGES
 from shared.cli_invoke import CAP_HIT_RESUME_PROMPT, build_claude_argv, resolve_claude_binary
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from sitting import nightly_prepare as mod
 from sitting import prepare_sitting
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 

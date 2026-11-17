@@ -558,6 +558,7 @@ _TASK_ROW_KEYS = frozenset({
     'id', 'project', 'title', 'status', 'agent',
     'loops', 'attempts', 'lane', 'phase', 'lane_state', 'runtime_offline',
     'runtime_status', 'claimant_run_id', 'heartbeat_at', 'stranded',
+    'created_at', 'created_at_source',
     'meta_files', 'train', 'external_deps', 'prd', 'started', 'deps',
 })
 """One active ``TaskRow``'s keys: ``_build_task_row``'s plus ``started`` and ``deps``.
@@ -1927,7 +1928,7 @@ def test_tasks_offline_flag_survives_a_hang_that_degrades_most_roots(client):
     """No root produced rows + at least one demonstrably failed IS the outage.
 
     The handler's own budget caps how many roots can reach the offline state:
-    in a hang each root burns up to ``_TASKS_PER_PROJECT_BUDGET`` before
+    in a hang each root burns up to ``TASKS_PER_PROJECT_BUDGET`` before
     ``wait_for`` cuts it, and a cut root lands in ``degraded``, not
     ``offline``. A stricter ``len(offline) == total_roots`` test therefore
     made this flag unreachable on a nine-root config for the most likely total

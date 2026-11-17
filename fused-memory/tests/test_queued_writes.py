@@ -18,6 +18,7 @@ import pytest
 from _ast_guard import parse_python_module
 from _leaf_import_guard import imported_modules, stdlib_or_allowed
 from _queued_write_fixtures import EPISODE_WIRE_KEYS
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.services.queued_writes import (
     NO_REFERENTS,
@@ -37,6 +38,8 @@ from fused_memory.services.queued_writes import (
 )
 from fused_memory.utils.canonical_labels import Referent
 from fused_memory.utils.referent_resolution import ReferentResolution
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 QUEUED_WRITES = (
     pathlib.Path(__file__).parents[1] / 'src' / 'fused_memory' / 'services' / 'queued_writes.py'

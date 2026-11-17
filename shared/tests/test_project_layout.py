@@ -25,14 +25,20 @@ from shared.project_layout import (
     escalation_queue_dir,
     known_project_roots,
     main_checkout_of,
+    offline_lane_dir,
     orchestrator_data_dir,
     park_eviction_requests_db,
     runs_db,
     scheduler_eligibility_db,
     scheduler_overrides_db,
     scheduler_state_json,
+    startup_failures_json,
     tasks_db,
+    verify_logs_dir,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _ORCHESTRATOR_STORES = (
     (runs_db, 'runs.db'),
@@ -40,6 +46,8 @@ _ORCHESTRATOR_STORES = (
     (scheduler_overrides_db, 'scheduler_overrides.db'),
     (park_eviction_requests_db, 'park_eviction_requests.db'),
     (scheduler_eligibility_db, 'scheduler_eligibility.db'),
+    (startup_failures_json, 'startup_failures.json'),
+    (offline_lane_dir, 'offline-lane'),
 )
 
 
@@ -61,6 +69,9 @@ class TestStoreLocators:
     def test_agent_transcripts_dir(self, root: str | Path) -> None:
         assert agent_transcripts_dir(root) == Path(root) / 'data' / 'orchestrator' / 'agent-transcripts'
 
+    def test_verify_logs_dir(self, root: str | Path) -> None:
+        assert verify_logs_dir(root) == Path(root) / 'data' / 'verify-logs'
+
     @pytest.mark.parametrize(('locator', 'name'), _ORCHESTRATOR_STORES)
     def test_orchestrator_store(self, root: str | Path, locator, name: str) -> None:
         assert locator(root) == Path(root) / 'data' / 'orchestrator' / name
@@ -78,6 +89,7 @@ class TestStoreLocators:
             orchestrator_data_dir,
             *(locator for locator, _ in _ORCHESTRATOR_STORES),
             tasks_db,
+            verify_logs_dir,
         ],
     )
     def test_returns_a_path(self, root: str | Path, locator) -> None:
@@ -98,6 +110,7 @@ class TestLocatorsArePure:
             orchestrator_data_dir,
             *(locator for locator, _ in _ORCHESTRATOR_STORES),
             tasks_db,
+            verify_logs_dir,
         ],
     )
     def test_no_io_on_a_missing_root(self, tmp_path: Path, locator) -> None:

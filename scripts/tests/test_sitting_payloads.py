@@ -7,11 +7,14 @@ from pathlib import Path
 
 import pytest
 from escalation.shadow_ruling import SHADOW_RULING_MARKER
-from orchestrator.session_registry import decision_path_for_id
+from orchestrator.decision_registry import DecisionRecord, decision_path_for_id, qualify_decision_id
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from sitting import payloads as mod
 from sitting.inventory import OpenItem, decision_key, escalation_key, queue_tag
 
 from orchestrator import session_registry
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 ESCALATION_SERVER = REPO_ROOT / 'escalation' / 'src' / 'escalation' / 'server.py'
@@ -245,7 +248,7 @@ class TestCloseDecisionArgv:
         assert (write[2], close[2]) == ('write-decision', 'close-decision')
         assert _flag(write, '--id') == local_id
         assert _flag(close, '--id') == mod.sitting_decision_id(item)
-        assert _flag(close, '--id') == session_registry.qualify_decision_id(item.project, local_id)
+        assert _flag(close, '--id') == qualify_decision_id(item.project, local_id)
         for argv in (write, close):
             assert _flag(argv, '--project') == item.project
             assert _flag(argv, '--escalations-dir') == item.queue_dir
@@ -261,7 +264,7 @@ class TestCloseDecisionArgv:
         assert session_registry.main(close[2:]) == 0
 
         path = decision_path_for_id(_flag(close, '--id'), root=tmp_path)
-        record = session_registry.DecisionRecord.from_json(path.read_text())
+        record = DecisionRecord.from_json(path.read_text())
         assert (record.state, record.closing_evidence) == ('answered', 'gate evidence')
 
     @pytest.mark.parametrize('evidence', ['', '   '])

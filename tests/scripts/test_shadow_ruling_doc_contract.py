@@ -66,6 +66,9 @@ from escalation.shadow_ruling import (
     main,
     parse_shadow_ruling,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # Resolved by walking up from THIS file, never from cwd: the suite is run from
 # the repo root by its module config and from `tests/scripts/` by hand.

@@ -3678,10 +3678,10 @@ class _B9GitOpsSpy:
     async def resolve_branch_sha(self, branch: str) -> str | None:
         return self._tip if branch == self._branch_full else None
 
-    async def is_ancestor(self, ancestor: str, descendant: str) -> bool:  # noqa: ARG002
+    async def is_ancestor(self, ancestor: str, descendant: str) -> bool:
         return False  # never already-merged -> skip the fast-path
 
-    async def find_inflight_merge_worktree(self, branch: str) -> Path | None:  # noqa: ARG002
+    async def find_inflight_merge_worktree(self, branch: str) -> Path | None:
         if self._scratch.exists():
             return self._scratch
         return None

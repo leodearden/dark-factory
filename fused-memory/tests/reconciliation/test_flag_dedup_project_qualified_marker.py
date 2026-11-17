@@ -18,18 +18,23 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 import pytest_asyncio
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.models.memory import AddMemoryResponse
 from fused_memory.models.reconciliation import StageId, StageReport, Watermark
 from fused_memory.reconciliation.flag_dedup import (
     acknowledge_resolved_flags,
+    dedup_flags,
+)
+from fused_memory.reconciliation.flag_identity import (
     compute_content_fingerprint_signature,
     compute_marker_signature,
-    dedup_flags,
 )
 from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord, ReconLedgerStore
 from fused_memory.reconciliation.stages.base import BaseStage
 from reconciliation.consolidator_fixtures import make_consolidator
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 RUNNING = 'dark_factory'
 FT = 'some_recurring_gap'

@@ -135,6 +135,8 @@ import pathlib
 import posixpath
 import shlex
 
+import pytest
+
 # The skills/ ruff probe itself, imported so the DECIDING FACT can be asserted
 # against its RUNTIME target list rather than only against its path. Resolves
 # because tests/scripts/conftest.py puts this directory on sys.path (pytest's
@@ -149,6 +151,9 @@ import test_root_lint_covers_nonmember_py as skills_ruff_probe
 import verify_command_invariants as vci
 from git_listing import git
 from orchestrator.config import _discover_module_configs
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 
@@ -221,7 +226,7 @@ SKILLS_CONSUMING_TESTS = (
     # both walk the repo with no skills/ prune, feeding
     # test_every_enumeration_site_is_pinned and the citation-drift checks —
     # the single broadest skills/ consumer in the repo (task 4941).
-    "scripts/tests/test_design_invariants_consistency.py",
+    "tests/repo_guards/test_design_invariants_consistency.py",
     # Reads the skills/ docs named in its _GUARDED_DOCS to execute their
     # `entities=` examples against the live entities_gate (tasks 3675, 5555, 5866).
     "fused-memory/tests/test_referent_declaration_examples.py",

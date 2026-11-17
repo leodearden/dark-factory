@@ -61,6 +61,7 @@ from fused_memory.reconciliation.recon_pool_map import (
 from fused_memory.reconciliation.stage1_flag_chain import FlagChainContext, run_stage1_flag_chain
 from fused_memory.reconciliation.stage1_payload_format import (
     append_note,
+    format_context_fetch_failures,
     format_context_items,
     format_episodes,
     format_events,
@@ -292,6 +293,7 @@ class MemoryConsolidator(BaseStage):
     # Fetch degraded sources for the current run — reset at the top of assemble_payload
     # and _format_assembled_payload; copied to report.stats['stage1_fetch_degraded'] in run()
     # (task 1812). Empty list = genuine empty corpus; non-empty = fetch failure on that source.
+    # 'event_context' means the ContextAssembler could not fetch some event's context (task 5370).
     # Initialized per-instance in __init__ to avoid the shared-mutable-default hazard.
     _fetch_degraded_sources: list
 
@@ -1113,6 +1115,8 @@ Review the above data and perform memory consolidation:
         # assemble_payload's line-262 reset is bypassed by the early return at lines 250-251.
         # Reset here so each assembled-path call starts clean (no leak from a prior run).
         self._fetch_degraded_sources = []
+        if ap.context_fetch_failures:
+            self._fetch_degraded_sources.append('event_context')
         # This path does no freshness filtering (it formats ContextAssembler output
         # directly, not the episodes/mem0-memories filters below), so the count stays
         # 0 here — but reset it anyway so a reused instance never inherits a stale
@@ -1166,6 +1170,7 @@ Review the above data and perform memory consolidation:
 
         ctx_str, ctx_n = format_context_items(ap.context_items)
         self._entity_summary_snapshot_lines_stripped = ctx_n
+        ctx_str = append_note(ctx_str, format_context_fetch_failures(ap.context_fetch_failures))
 
         return f"""## Reconciliation Run — Stage 1: Memory Consolidation
 ## Project: {self.project_id}

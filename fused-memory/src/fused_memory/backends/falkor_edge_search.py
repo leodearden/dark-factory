@@ -9,6 +9,11 @@ query TIMEOUT on production graphs.  Every edge leg here instead reads its edges
 through :func:`fused_memory.backends.falkor_entity_edges.read_entity_edges`,
 which FalkorDB plans with no per-row scan.
 
+The edge BM25 leg ranks first the live edges matching every identifier term of
+the query, when they all fit in the leg
+(:func:`fused_memory.backends.falkor_fulltext.build_edge_queries`,
+``plans/edge-bm25-leg-ranking-9542/README.md``).
+
 Dispatch contract: ``graphiti_core.search.search_utils`` hands five legs to
 ``driver.search_interface`` UNCONDITIONALLY, with no NotImplementedError
 fallback: edge fulltext, edge similarity, node fulltext, node similarity and
@@ -27,6 +32,7 @@ from typing import Any
 from graphiti_core.driver.driver import GraphDriver
 from graphiti_core.driver.search_interface.search_interface import SearchInterface
 from graphiti_core.graph_queries import get_relationships_query, get_vector_cosine_func_query
+from graphiti_core.helpers import validate_group_ids
 from graphiti_core.models.nodes.node_db_queries import get_entity_node_return_query
 from graphiti_core.nodes import get_entity_node_from_record
 from graphiti_core.search import search_utils
@@ -35,7 +41,9 @@ from graphiti_core.search.search_filters import (
     node_search_filter_query_constructor,
 )
 
-from fused_memory.backends.falkor_entity_edges import read_entity_edges
+from fused_memory.backends.falkor_entity_edges import bind_entity_endpoints, read_entity_edges
+from fused_memory.backends.falkor_fulltext import build_edge_queries
+from fused_memory.backends.relates_to_schema import ACTIVE_EDGE_PREDICATE
 
 # The origin labels graphiti's SearchInterface.edge_bfs_search documents; edge
 # BFS and node BFS both start from them.
@@ -92,6 +100,41 @@ def _bfs_reached_nodes(depth: int, filter_queries: list[str]) -> str:
     return _union_over_origin_labels(leg)
 
 
+async def _promoted_uuids(
+    driver: GraphDriver,
+    intersection: str,
+    filter_queries: list[str],
+    limit: int,
+    params: dict[str, Any],
+) -> list[str]:
+    """The live edges matching every identifier term, promoted only when all of them fit in the leg.
+
+    Under the leg's own filters, plus ``relates_to_schema.py::ACTIVE_EDGE_PREDICATE``:
+    the read path discards retired edges after fusion, so promoting one would
+    spend a slot.
+    ``limit + 1`` rows are read so an overflowing tier is told apart from one
+    that fits.
+    """
+    if intersection == '':
+        return []
+    fulltext_hits = get_relationships_query(
+        'edge_name_and_fact', limit=limit, provider=driver.provider
+    )
+    records, _, _ = await driver.execute_query(
+        bind_entity_endpoints(
+            f'{fulltext_hits} YIELD relationship AS e',
+            [*filter_queries, ACTIVE_EDGE_PREDICATE],
+        )
+        + ' RETURN e.uuid AS uuid LIMIT $tier_cap',
+        query=intersection,
+        tier_cap=limit + 1,
+        routing_='r',
+        **params,
+    )
+    uuids = [record['uuid'] for record in records]
+    return uuids if len(uuids) <= limit else []
+
+
 def _builtin_search_driver(driver: GraphDriver) -> GraphDriver:
     """A shallow copy of *driver* on which graphiti takes its built-in branch.
 
@@ -113,8 +156,11 @@ class FalkorEdgeSearch(SearchInterface):
         group_ids: list[str] | None = None,
         limit: int = 100,
     ) -> list[Any]:
-        fuzzy_query = search_utils.fulltext_query(query, group_ids, driver)
-        if fuzzy_query == '':
+        validate_group_ids(group_ids)
+        queries = build_edge_queries(
+            driver.sanitize(query), group_ids, search_utils.MAX_QUERY_LENGTH
+        )
+        if queries.union == '':
             return []
 
         filter_queries, filter_params = edge_search_filter_query_constructor(
@@ -124,6 +170,9 @@ class FalkorEdgeSearch(SearchInterface):
             filter_queries.append('e.group_id IN $group_ids')
             filter_params['group_ids'] = group_ids
 
+        promoted_uuids = await _promoted_uuids(
+            driver, queries.intersection, filter_queries, limit, filter_params
+        )
         fulltext_hits = get_relationships_query(
             'edge_name_and_fact', limit=limit, provider=driver.provider
         )
@@ -131,9 +180,10 @@ class FalkorEdgeSearch(SearchInterface):
             driver,
             f'{fulltext_hits} YIELD relationship AS e, score',
             filter_queries,
-            order_by='score DESC',
-            query=fuzzy_query,
+            order_by='e.uuid IN $promoted_uuids DESC, score DESC',
+            query=queries.union,
             limit=limit,
+            promoted_uuids=promoted_uuids,
             **filter_params,
         )
 

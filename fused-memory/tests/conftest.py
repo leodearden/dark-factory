@@ -539,7 +539,7 @@ def _reap_leaked_async_httpx_clients_sync():
     if _leaked_async_httpx_clients():
         try:
             asyncio.run(reap_leaked_async_httpx_clients())
-        except Exception as exc:  # noqa: BLE001 — a backstop must not fail the test
+        except Exception as exc:  # a backstop must not fail the test
             warnings.warn(
                 f'async-httpx drain fallback failed: {exc!r}. The sync arm '
                 f'closes clients from a throwaway asyncio.run loop, so an '
@@ -614,13 +614,18 @@ def make_backend():
     make_backend_over_fake_graphiti.
 
     ``driver=`` replaces the default MagicMock driver; make_graph_driver builds one.
+    ``graph_access=`` injects the provider every raw Cypher call resolves its
+    graph through; ``_graph_access_fake.FakeGraphAccess`` is the test one.
     For a real driver and spec'd sub-clients, use make_wired_backend.
     """
-    def _factory(config, *, registered_graph_ids=(), driver=None) -> GraphitiBackend:
+    def _factory(
+        config, *, registered_graph_ids=(), driver=None, graph_access=None,
+    ) -> GraphitiBackend:
         backend = GraphitiBackend.with_driver(
             config,
             MagicMock() if driver is None else driver,
             registered_graph_ids=registered_graph_ids,
+            graph_access=graph_access,
         )
         backend.client = MagicMock()
         return backend
@@ -637,16 +642,13 @@ def make_graph_driver():
     it as ``make_backend(config, driver=...)`` instead of assigning
     ``backend._driver._get_graph``.
     """
+    from _graph_access_fake import wired_graph
+
     from fused_memory.backends.graphiti_client import _MultiTenantFalkorDriver
 
     def _factory(graphs: Mapping[str, Any]) -> _MultiTenantFalkorDriver:
-        def _select(name: str) -> Any:
-            if name not in graphs:
-                raise KeyError(f'no graph wired for {name!r}; wired: {sorted(graphs)}')
-            return graphs[name]
-
         falkor = MagicMock()
-        falkor.select_graph.side_effect = _select
+        falkor.select_graph.side_effect = lambda name: wired_graph(graphs, name)
         return _MultiTenantFalkorDriver(falkor_db=falkor)
 
     return _factory
@@ -824,7 +826,7 @@ def make_fake_maintenance_service():
     """Factory fixture: returns a callable(mock_cfg, mock_service) -> async context manager."""
     def _factory(mock_cfg, mock_service):
         @asynccontextmanager
-        async def fake(config_path):
+        async def fake(config_path=None, *, config=None, open_as=None):
             yield mock_cfg, mock_service
 
         return fake
@@ -962,7 +964,7 @@ def _integration_collection_lease(request):
         yield
         return
 
-    from _fm_helpers import load_script_module  # noqa: PLC0415
+    from _fm_helpers import load_script_module
 
     reaper = load_script_module(
         Path(__file__).parent.parent / 'scripts' / 'cleanup_test_collections.py',

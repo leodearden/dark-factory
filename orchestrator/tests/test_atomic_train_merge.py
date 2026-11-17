@@ -43,6 +43,7 @@ from orchestrator.merge_lane.worker import (
     MergeOutcome,
     MergeRequest,
 )
+from orchestrator.quarantine_provenance import QuarantineOutcome
 from orchestrator.verify import VerifyResult, run_scoped_verification
 
 # Real git + real cargo integration module (see module docstring): a workspace
@@ -262,7 +263,7 @@ class TestScenario1HappyPath:
 
     async def test_happy_path_3_train_single_merge(
         self,
-        cargo_or_skip,            # noqa: ARG002  (skip guard; value unused)
+        cargo_or_skip,  # (skip guard; value unused)
         shared_cargo_target: Path,
         tmp_path: Path,
     ) -> None:
@@ -646,7 +647,7 @@ class TestScenario5GroupMergeVerify:
 
     async def test_group_merge_workspace_verify_green(
         self,
-        cargo_or_skip,  # noqa: ARG002
+        cargo_or_skip,
         shared_cargo_target: Path,
         tmp_path: Path,
     ) -> None:
@@ -730,7 +731,7 @@ class TestScenario5GroupMergeVerify:
     @pytest.mark.exercise_merge_verify
     async def test_group_merge_workspace_verify_red(
         self,
-        cargo_or_skip,  # noqa: ARG002
+        cargo_or_skip,
         shared_cargo_target: Path,
         tmp_path: Path,
     ) -> None:
@@ -1097,7 +1098,7 @@ class TestScenario6ParkPrefixDerail:
         # to this test's live-vs-orphan routing.
         harness.git_ops.mark_pool_storage_present()
         harness.git_ops.worktree_has_unsaved_work = AsyncMock(return_value=False)
-        harness.git_ops.quarantine_worktree = AsyncMock(return_value=tmp_path / "q-dest")
+        harness.git_ops.quarantine_worktree = AsyncMock(return_value=QuarantineOutcome(dest=tmp_path / "q-dest"))
         harness.git_ops.cleanup_worktree = AsyncMock()
         harness.git_ops.prune_worktrees = AsyncMock()
         harness.config.worktree_orphan_reaper_enabled = True
@@ -1307,7 +1308,7 @@ class TestScenario8MainAdvances:
 
     async def test_main_advances_then_train_merges_clean(
         self,
-        cargo_or_skip,  # noqa: ARG002
+        cargo_or_skip,
         shared_cargo_target: Path,
         tmp_path: Path,
     ) -> None:
@@ -1724,7 +1725,7 @@ class TestScenario11NonTrainRegression:
 
     async def test_non_train_regression(
         self,
-        cargo_or_skip,  # noqa: ARG002
+        cargo_or_skip,
         shared_cargo_target: Path,
         tmp_path: Path,
     ) -> None:
@@ -1824,7 +1825,7 @@ class TestScenario12DegenerateTrainOfOne:
 
     async def test_degenerate_train_of_one(
         self,
-        cargo_or_skip,  # noqa: ARG002
+        cargo_or_skip,
         shared_cargo_target: Path,
         tmp_path: Path,
     ) -> None:

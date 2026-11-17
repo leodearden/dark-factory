@@ -23,14 +23,16 @@ from __future__ import annotations
 
 import json
 import logging
+import shlex
 from typing import Any
 
 import pytest
+from _serial_recovery_helpers import xdist_offenders
 
 
 def _sample(**overrides):
     """A healthy host sample; overrides degrade exactly the component under test."""
-    from shared.psi import PsiSample  # noqa: PLC0415
+    from shared.psi import PsiSample
 
     # dict[str, Any], not the inferred join: a dict mixing floats with bools
     # widens to dict[str, float], and PsiSample's bool/str fields reject that
@@ -64,7 +66,7 @@ class TestLoadSample:
         written straight into JSON, so anything needing its own serialisation
         step is a second place for the shape to drift.
         """
-        from orchestrator.verify import _load_sample  # noqa: PLC0415
+        from orchestrator.verify import _load_sample
 
         assert set(_load_sample(read=_sample, loadavg=_loadavg)) == {
             'cpu_some10',
@@ -74,7 +76,7 @@ class TestLoadSample:
         }
 
     def test_a_healthy_sample_carries_floats(self):
-        from orchestrator.verify import _load_sample  # noqa: PLC0415
+        from orchestrator.verify import _load_sample
 
         record = _load_sample(read=_sample)
 
@@ -91,7 +93,7 @@ class TestLoadSample:
         the single most interesting reading for a budget census, since it is
         what the "measure on a quiet host" advice was asking for.
         """
-        from orchestrator.verify import _load_sample  # noqa: PLC0415
+        from orchestrator.verify import _load_sample
 
         record = _load_sample(
             read=lambda: _sample(cpu_some10=0.0, cpu_some60=0.0, runqueue_ratio=0.0),
@@ -107,7 +109,7 @@ class TestLoadSample:
 
     def test_a_degraded_host_reads_null_not_zero(self):
         """``read_ok=False`` governs the HOST component — both CPU windows."""
-        from orchestrator.verify import _load_sample  # noqa: PLC0415
+        from orchestrator.verify import _load_sample
 
         record = _load_sample(read=lambda: _sample(read_ok=False))
 
@@ -121,14 +123,14 @@ class TestLoadSample:
         succeeded — the two are read independently, and collapsing them would
         be the silent-fail-soft shape INV-11 forbids.
         """
-        from orchestrator.verify import _load_sample  # noqa: PLC0415
+        from orchestrator.verify import _load_sample
 
         record = _load_sample(read=lambda: _sample(read_ok=False))
 
         assert record['runqueue_ratio'] == pytest.approx(0.75)
 
     def test_a_degraded_runqueue_nulls_only_itself(self):
-        from orchestrator.verify import _load_sample  # noqa: PLC0415
+        from orchestrator.verify import _load_sample
 
         record = _load_sample(read=lambda: _sample(runqueue_read_ok=False))
 
@@ -138,7 +140,7 @@ class TestLoadSample:
 
     def test_a_degraded_runqueue_reading_of_zero_is_still_null(self):
         """``read_ok=False`` wins over the value, which is the fail-open zero."""
-        from orchestrator.verify import _load_sample  # noqa: PLC0415
+        from orchestrator.verify import _load_sample
 
         record = _load_sample(
             read=lambda: _sample(runqueue_ratio=0.0, runqueue_read_ok=False),
@@ -157,7 +159,7 @@ class TestLoadSample:
         The loadavg is a separate read, so a broken PSI path does not discard
         it: per-component degradation (INV-11), as for the runqueue above.
         """
-        from orchestrator.verify import _load_sample  # noqa: PLC0415
+        from orchestrator.verify import _load_sample
 
         def boom():
             raise RuntimeError('/proc went away')
@@ -180,7 +182,7 @@ class TestLoadSample:
         An int from the source is still recorded as a float, so a reader never
         has to special-case the type of one column.
         """
-        from orchestrator.verify import _load_sample  # noqa: PLC0415
+        from orchestrator.verify import _load_sample
 
         assert _load_sample(read=_sample, loadavg=_loadavg)['loadavg1'] == 3.5
         whole = _load_sample(read=_sample, loadavg=lambda: (4, 2, 1))['loadavg1']
@@ -192,7 +194,7 @@ class TestLoadSample:
 
         The PSI components are read independently and stay intact.
         """
-        from orchestrator.verify import _load_sample  # noqa: PLC0415
+        from orchestrator.verify import _load_sample
 
         def unobtainable():
             raise OSError('Load averages are unobtainable')
@@ -206,7 +208,7 @@ class TestLoadSample:
 
     def test_a_raising_loadavg_is_not_a_bare_except(self):
         """Same as the PSI half: a BaseException from the loadavg read propagates."""
-        from orchestrator.verify import _load_sample  # noqa: PLC0415
+        from orchestrator.verify import _load_sample
 
         def interrupt():
             raise KeyboardInterrupt
@@ -220,7 +222,7 @@ class TestLoadSample:
         Swallowing those would make a verify unkillable, which is a strictly
         worse failure than a missing telemetry field.
         """
-        from orchestrator.verify import _load_sample  # noqa: PLC0415
+        from orchestrator.verify import _load_sample
 
         def interrupt():
             raise KeyboardInterrupt
@@ -235,7 +237,7 @@ class TestLoadSample:
     )
     def test_the_record_is_json_native(self, degrade):
         """It lands in summary.json verbatim, so it must serialise with no step."""
-        from orchestrator.verify import _load_sample  # noqa: PLC0415
+        from orchestrator.verify import _load_sample
 
         record = _load_sample(read=lambda: _sample(**degrade))
 
@@ -248,7 +250,7 @@ class TestLoadSample:
         so any threshold would be a guessed number. What is asserted is the
         shape and the never-raise guarantee.
         """
-        from orchestrator.verify import _load_sample  # noqa: PLC0415
+        from orchestrator.verify import _load_sample
 
         record = _load_sample()
 
@@ -262,9 +264,9 @@ class TestLoadSample:
         identity rather than by reading source text, which is the same shape
         the sampler's own re-home guard uses.
         """
-        import shared.psi  # noqa: PLC0415
+        import shared.psi
 
-        import orchestrator.verify  # noqa: PLC0415
+        import orchestrator.verify
 
         assert orchestrator.verify.read_psi_sample is shared.psi.read_psi_sample
 
@@ -275,6 +277,21 @@ class TestLoadSample:
 # which the verify path never reads.
 LIVE_TEST_COMMAND = (
     'uv run --directory orchestrator pytest tests/ --tb=short -q --timeout=300'
+)
+
+WORKER_COUNT_SPELLINGS = [
+    pytest.param('-n 8', id='short'),
+    pytest.param('--numprocesses 8', id='long'),
+    pytest.param('-n=8', id='short-attached'),
+    pytest.param('--numprocesses=8', id='long-attached'),
+    pytest.param('-n8', id='short-concatenated'),
+]
+
+# tests/scripts/orchestrator.yaml's `test_command`. It already names `-n auto`,
+# so verify's role cap lands on its argv as a SECOND `-n`.
+TESTS_SCRIPTS_TEST_COMMAND = (
+    'uv run --project shared pytest tests/scripts/ --tb=short -q --timeout=300'
+    ' -n auto --dist loadgroup'
 )
 
 
@@ -310,7 +327,7 @@ class TestXdistWorkers:
         monkeypatch.delenv('PYTEST_XDIST_AUTO_NUM_WORKERS', raising=False)
 
     def test_the_exact_key_set(self):
-        from orchestrator.verify import _xdist_workers  # noqa: PLC0415
+        from orchestrator.verify import _xdist_workers
 
         assert set(_xdist_workers(LIVE_TEST_COMMAND, {})) == {
             'n_flag',
@@ -318,7 +335,7 @@ class TestXdistWorkers:
         }
 
     def test_an_explicit_worker_count_is_read_off_the_flag(self):
-        from orchestrator.verify import _xdist_workers  # noqa: PLC0415
+        from orchestrator.verify import _xdist_workers
 
         record = _xdist_workers('uv run pytest tests/ -n 8 --timeout=300', {})
 
@@ -326,15 +343,17 @@ class TestXdistWorkers:
 
     def test_n_auto_is_reported_verbatim_not_resolved(self):
         """``'auto'`` is what the command SAYS; resolving it here would guess."""
-        from orchestrator.verify import _xdist_workers  # noqa: PLC0415
+        from orchestrator.verify import _xdist_workers
 
         assert _xdist_workers('uv run pytest tests/ -n auto', {})['n_flag'] == 'auto'
 
-    @pytest.mark.parametrize(
-        'flag',
-        ['-n 8', '--numprocesses 8', '-n=8', '--numprocesses=8'],
-        ids=['short', 'long', 'short-attached', 'long-attached'],
-    )
+    def test_the_concatenated_auto_is_reported_verbatim(self):
+        """``-nauto`` is what the command SAYS, exactly as ``-n auto`` is."""
+        from orchestrator.verify import _xdist_workers
+
+        assert _xdist_workers('uv run pytest tests/ -nauto', {})['n_flag'] == 'auto'
+
+    @pytest.mark.parametrize('flag', WORKER_COUNT_SPELLINGS)
     def test_every_worker_count_spelling_is_read(self, flag):
         """The SPELLINGS are tested, not one literal.
 
@@ -343,11 +362,32 @@ class TestXdistWorkers:
         flag on argv, so addopts decided the count". That is a wrong fact,
         silently, in the corpus this deliverable exists to make trustworthy; no
         live config uses the long spelling today, so it was latent rather than
-        active. Both attached forms are here because argparse accepts both.
+        active. Both attached forms and the concatenated ``-n8`` are here
+        because argparse reads all three, and pytest-xdist accepts them.
         """
-        from orchestrator.verify import _xdist_workers  # noqa: PLC0415
+        from orchestrator.verify import _xdist_workers
 
         assert _xdist_workers(f'uv run pytest tests/ {flag}', {})['n_flag'] == '8'
+
+    @pytest.mark.parametrize('flag', WORKER_COUNT_SPELLINGS)
+    def test_every_spelling_the_stamp_reads_is_one_serial_recovery_sheds(self, flag):
+        """The telemetry never claims a worker flag the serial strip would leave.
+
+        ``test_every_worker_count_spelling_is_read`` pins the stamp reading
+        each of these spellings. A spelling the stamp reads as a count but
+        ``serial_pytest`` keeps on argv is one the ``-p no:xdist`` re-run
+        rejects as an unrecognized argument: two disagreeing answers to "is
+        this a worker flag".
+        """
+        from orchestrator.verify_cmd import (
+            parse_config_command,
+            render,
+            serial_pytest,
+        )
+
+        serial = render(serial_pytest(parse_config_command(f'uv run pytest tests/ {flag}')))
+
+        assert xdist_offenders(shlex.split(serial)) == []
 
     @pytest.mark.parametrize(
         'cmd',
@@ -366,13 +406,13 @@ class TestXdistWorkers:
         distribution MODE) and ``--maxprocesses`` (a CAP). Reusing it here would report ``'loadgroup'``
         as a worker count — the fabricated datum this stamp exists to remove.
         """
-        from orchestrator.verify import _xdist_workers  # noqa: PLC0415
+        from orchestrator.verify import _xdist_workers
 
         assert _xdist_workers(cmd, {})['n_flag'] is None
 
     def test_a_count_after_a_mode_is_still_found(self):
         """The walk does not stop at the first value flag it declines."""
-        from orchestrator.verify import _xdist_workers  # noqa: PLC0415
+        from orchestrator.verify import _xdist_workers
 
         record = _xdist_workers(
             'uv run pytest tests/ --dist loadgroup --numprocesses 8', {},
@@ -382,7 +422,7 @@ class TestXdistWorkers:
 
     def test_an_empty_attached_value_names_no_count(self):
         """``--numprocesses=`` is a pytest usage error, not a count of ``''``."""
-        from orchestrator.verify import _xdist_workers  # noqa: PLC0415
+        from orchestrator.verify import _xdist_workers
 
         assert _xdist_workers('uv run pytest tests/ --numprocesses=', {})['n_flag'] is None
 
@@ -394,8 +434,8 @@ class TestXdistWorkers:
         value is the adjacent token (the walk's pair-binding is what reads it).
         Either containment breaking is drift, and would break silently.
         """
-        from orchestrator.verify import _XDIST_N_FLAGS  # noqa: PLC0415
-        from orchestrator.verify_cmd import (  # noqa: PLC0415
+        from orchestrator.verify import _XDIST_N_FLAGS
+        from orchestrator.verify_cmd import (
             _PYTEST_VALUE_FLAGS,
             _XDIST_OPTIONS,
         )
@@ -405,13 +445,13 @@ class TestXdistWorkers:
 
     def test_the_live_command_carries_no_flag_and_says_so(self):
         """The dominant case: addopts decides, and verify cannot see addopts."""
-        from orchestrator.verify import _xdist_workers  # noqa: PLC0415
+        from orchestrator.verify import _xdist_workers
 
         assert _xdist_workers(LIVE_TEST_COMMAND, {})['n_flag'] is None
 
     def test_a_non_pytest_command_yields_no_flag(self):
         """Mirrors the no-op guard ``apply_pytest_numprocesses`` documents."""
-        from orchestrator.verify import _xdist_workers  # noqa: PLC0415
+        from orchestrator.verify import _xdist_workers
 
         assert _xdist_workers('uv run ruff check src/ tests/', {})['n_flag'] is None
         assert _xdist_workers('uv run pyright src/', {})['n_flag'] is None
@@ -426,7 +466,7 @@ class TestXdistWorkers:
         The stamp is taken BEFORE the wrap for exactly this reason, so this
         case is defence in depth rather than the live path.
         """
-        from orchestrator.verify import _xdist_workers  # noqa: PLC0415
+        from orchestrator.verify import _xdist_workers
 
         governed = (
             "/opt/df/cpu-governed-exec.sh -- /bin/bash -c "
@@ -436,13 +476,13 @@ class TestXdistWorkers:
 
     def test_a_raw_retained_chain_yields_no_flag(self):
         """An `&&` chain has no ONE invocation's flag to report."""
-        from orchestrator.verify import _xdist_workers  # noqa: PLC0415
+        from orchestrator.verify import _xdist_workers
 
         chain = 'cd shared && uv run pytest tests/ -n 4 && uv run pytest tests/scripts/'
         assert _xdist_workers(chain, {})['n_flag'] is None
 
     def test_auto_num_workers_comes_off_the_passed_env(self):
-        from orchestrator.verify import _xdist_workers  # noqa: PLC0415
+        from orchestrator.verify import _xdist_workers
 
         record = _xdist_workers(
             'uv run pytest tests/ -n auto', {'PYTEST_XDIST_AUTO_NUM_WORKERS': '6'},
@@ -451,7 +491,7 @@ class TestXdistWorkers:
         assert record['auto_num_workers'] == '6'
 
     def test_auto_num_workers_is_null_when_the_env_does_not_set_it(self):
-        from orchestrator.verify import _xdist_workers  # noqa: PLC0415
+        from orchestrator.verify import _xdist_workers
 
         assert _xdist_workers(LIVE_TEST_COMMAND, {})['auto_num_workers'] is None
         assert _xdist_workers(LIVE_TEST_COMMAND, None)['auto_num_workers'] is None
@@ -466,7 +506,7 @@ class TestXdistWorkers:
         Reading the overlay alone stamped `null`: "not set" about a variable
         that was set, in the record whose purpose is saying what the run saw.
         """
-        from orchestrator.verify import _xdist_workers  # noqa: PLC0415
+        from orchestrator.verify import _xdist_workers
 
         monkeypatch.setenv('PYTEST_XDIST_AUTO_NUM_WORKERS', '8')
 
@@ -475,7 +515,7 @@ class TestXdistWorkers:
 
     def test_the_overlay_wins_over_an_ambient_value(self, monkeypatch):
         """The overlay is applied LAST by the builder, so config beats ambient."""
-        from orchestrator.verify import _xdist_workers  # noqa: PLC0415
+        from orchestrator.verify import _xdist_workers
 
         monkeypatch.setenv('PYTEST_XDIST_AUTO_NUM_WORKERS', '8')
         record = _xdist_workers(
@@ -500,7 +540,7 @@ class TestXdistWorkers:
         precedence is exactly what would drift silently. Every cell of the
         2x2 is covered so agreement cannot come from both sides being null.
         """
-        from orchestrator.verify import (  # noqa: PLC0415
+        from orchestrator.verify import (
             _target_subprocess_env,
             _xdist_workers,
         )
@@ -522,7 +562,7 @@ class TestXdistWorkers:
         literal ``-n`` is reported with no env value present. A reader that
         wants the effective count joins them itself and can see when it cannot.
         """
-        from orchestrator.verify import _xdist_workers  # noqa: PLC0415
+        from orchestrator.verify import _xdist_workers
 
         env = {'PYTEST_XDIST_AUTO_NUM_WORKERS': '6'}
 
@@ -547,7 +587,7 @@ class TestXdistWorkers:
         splitter falls back to bare-flag classification rather than indexing
         past the end, so there is no value to report and none is invented.
         """
-        from orchestrator.verify import _xdist_workers  # noqa: PLC0415
+        from orchestrator.verify import _xdist_workers
 
         record = _xdist_workers(cmd, {})
 
@@ -555,13 +595,50 @@ class TestXdistWorkers:
         assert record['n_flag'] is None
 
     def test_the_record_is_json_native(self):
-        from orchestrator.verify import _xdist_workers  # noqa: PLC0415
+        from orchestrator.verify import _xdist_workers
 
         record = _xdist_workers(
             'uv run pytest tests/ -n 8', {'PYTEST_XDIST_AUTO_NUM_WORKERS': '6'},
         )
 
         assert json.loads(json.dumps(record)) == record
+
+    @pytest.mark.parametrize(
+        ('cmd', 'expected'),
+        [
+            (TESTS_SCRIPTS_TEST_COMMAND + ' -n 8', '8'),
+            ('uv run pytest tests/ --numprocesses=auto -n8', '8'),
+            ('uv run pytest tests/ -n 0 -n 4', '4'),
+        ],
+        ids=[
+            'tests-scripts-leg-as-capped',
+            'mixed-spellings',
+            'a-zero-count-outvoted',
+        ],
+    )
+    def test_a_later_worker_count_outvotes_an_earlier_one(self, cmd, expected):
+        """The stamp records the count pytest runs with, not an overridden one.
+
+        Ruling D17 (task 3353) wants the count in effect. Which count argv
+        applies, and the flag/value pairing, are pinned at the decoder seam:
+        ``test_serial_confirm_pytest.py::TestTheWorkerCountDecoder``.
+        """
+        from orchestrator.verify import _xdist_workers
+
+        assert _xdist_workers(cmd, {})['n_flag'] == expected
+
+    def test_the_stamp_reads_the_cap_verify_appends(self):
+        from orchestrator.verify import (
+            _with_pytest_numprocesses_str,
+            _xdist_workers,
+        )
+        from orchestrator.verify_cmd import worker_count_values
+
+        capped = _with_pytest_numprocesses_str(TESTS_SCRIPTS_TEST_COMMAND, '8')
+
+        assert capped is not None
+        assert worker_count_values(shlex.split(capped)) == ['auto', '8']
+        assert _xdist_workers(capped, {})['n_flag'] == '8'
 
 
 class TestLoadReachesTheSummaryPayload:
@@ -597,7 +674,7 @@ class TestLoadReachesTheSummaryPayload:
         return run
 
     def test_every_command_entry_carries_its_load(self):
-        from orchestrator.verify import _build_summary_payload  # noqa: PLC0415
+        from orchestrator.verify import _build_summary_payload
 
         payload = _build_summary_payload(
             [self._run('test'), self._run('lint', load=self._load(cpu=7.5))],
@@ -618,7 +695,7 @@ class TestLoadReachesTheSummaryPayload:
         path. This is the exact accommodation `segments` already documents for
         the same callers.
         """
-        from orchestrator.verify import _build_summary_payload  # noqa: PLC0415
+        from orchestrator.verify import _build_summary_payload
 
         legacy = self._run()
         del legacy['load']
@@ -629,7 +706,7 @@ class TestLoadReachesTheSummaryPayload:
 
     def test_load_is_present_on_every_entry_even_when_null(self):
         """Unconditional: absent-vs-null is the ambiguity the key exists to kill."""
-        from orchestrator.verify import _build_summary_payload  # noqa: PLC0415
+        from orchestrator.verify import _build_summary_payload
 
         legacy = self._run()
         del legacy['load']
@@ -642,7 +719,7 @@ class TestLoadReachesTheSummaryPayload:
 
     def test_a_skipped_leg_contributes_no_entry_at_all(self):
         """Unchanged behaviour — `cmd is None` is filtered before the rebuild."""
-        from orchestrator.verify import _build_summary_payload  # noqa: PLC0415
+        from orchestrator.verify import _build_summary_payload
 
         payload = _build_summary_payload(
             [self._run('test'), self._run('type', cmd=None, load=None)],
@@ -654,7 +731,7 @@ class TestLoadReachesTheSummaryPayload:
         assert [e['label'] for e in payload['commands']] == ['test']
 
     def test_the_payload_is_json_native(self):
-        from orchestrator.verify import _build_summary_payload  # noqa: PLC0415
+        from orchestrator.verify import _build_summary_payload
 
         payload = _build_summary_payload([self._run()], 'clean', '', role='task')
 
@@ -679,7 +756,7 @@ _CHAIN_TEST_COMMAND = (
 
 def _module_config(*, test_command, type_check_command=None):
     """A `__fallback__` module config; type is left SKIPPED by default."""
-    from orchestrator.config import ModuleConfig  # noqa: PLC0415
+    from orchestrator.config import ModuleConfig
 
     return ModuleConfig(
         prefix='__fallback__',
@@ -698,10 +775,10 @@ async def _run_and_read_summary(tmp_path, *, segmented, reader):
     work: `_load_sample`'s `read=` default is bound at def time, so a later
     patch of the module attribute never reaches it.
     """
-    from unittest.mock import patch  # noqa: PLC0415
+    from unittest.mock import patch
 
-    from orchestrator import verify as verify_mod  # noqa: PLC0415
-    from orchestrator.config import OrchestratorConfig  # noqa: PLC0415
+    from orchestrator import verify as verify_mod
+    from orchestrator.config import OrchestratorConfig
 
     (tmp_path / '.task').mkdir(parents=True, exist_ok=True)
     real_load_sample = verify_mod._load_sample
@@ -747,7 +824,7 @@ def _rising_reader():
     interleave their samples arbitrarily, but a single leg's start is always
     drawn before its own end.
     """
-    import itertools  # noqa: PLC0415
+    import itertools
 
     counter = itertools.count(1)
 
@@ -997,7 +1074,7 @@ class TestTheWindowClosesWhenTheCommandDoes:
 
     @staticmethod
     def _slot_recorder(events):
-        import contextlib  # noqa: PLC0415
+        import contextlib
 
         @contextlib.asynccontextmanager
         async def recording_slot(role, config, request):
@@ -1017,10 +1094,10 @@ class TestTheWindowClosesWhenTheCommandDoes:
         are one leg's and cannot interleave with a concurrent leg's under the
         gather.
         """
-        from unittest.mock import patch  # noqa: PLC0415
+        from unittest.mock import patch
 
-        from orchestrator import verify as verify_mod  # noqa: PLC0415
-        from orchestrator.config import ModuleConfig, OrchestratorConfig  # noqa: PLC0415
+        from orchestrator import verify as verify_mod
+        from orchestrator.config import ModuleConfig, OrchestratorConfig
 
         events: list[str] = []
         reader = _rising_reader()
@@ -1090,8 +1167,8 @@ class TestTheWindowClosesWhenTheCommandDoes:
         closed with the command reads ~0. The 250x margin is deliberate —
         this must not become a timing-sensitive test.
         """
-        import asyncio  # noqa: PLC0415
-        from unittest.mock import patch  # noqa: PLC0415
+        import asyncio
+        from unittest.mock import patch
 
         async def slow_escape_probe(worktree):
             await asyncio.sleep(0.5)

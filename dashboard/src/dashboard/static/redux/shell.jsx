@@ -106,6 +106,7 @@ const Glyph = ({ kind }) => {
     case 'curator':  return <svg {...props}><path d="M2 3.5h10 M2 7h10 M2 10.5h6"/><path d="M10 8.5v4 M12 8.5v4"/></svg>;
     case 'esc':      return <svg {...props}><path d="M7 2 L12 12 H2 Z"/><path d="M7 6v3"/><circle cx="7" cy="10.5" r="0.6" fill="currentColor"/></svg>;
     case 'esc-analytics': return <svg {...props}><path d="M2 12.5h10"/><path d="M4 12.5v-4 M7 12.5v-7 M10 12.5v-2.5"/></svg>;
+    case 'quality':  return <svg {...props}><path d="M2 12.5h10"/><path d="M2 9 L5 6 L8 8 L12 3"/><path d="M2 4.5h10" strokeDasharray="1.5 1.5"/></svg>;
     case 'search':   return <svg {...props}><circle cx="6" cy="6" r="3.5"/><path d="M8.5 8.5 L12 12"/></svg>;
     case 'filter':   return <svg {...props}><path d="M2 3h10 M3.5 7h7 M5 11h4"/></svg>;
     case 'chev':     return <svg {...props}><path d="M4 5l3 3 3-3"/></svg>;
@@ -372,6 +373,7 @@ function Rail({ active, onSelect, counts }) {
     { id: 'burn',      label: 'Burndown',     glyph: 'burn',     count: '' },
     { id: 'esc',       label: 'Escalations',  glyph: 'esc',      count: counts.esc ?? '' },
     { id: 'esc-analytics', label: 'Analytics', glyph: 'esc-analytics', count: '' },
+    { id: 'quality',   label: 'Quality',      glyph: 'quality',  count: '' },
   ];
   return (
     <div className="rail">

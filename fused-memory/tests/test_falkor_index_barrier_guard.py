@@ -78,6 +78,9 @@ import re
 
 import pytest
 from _ast_guard import calls_named, imported_names_from, parse_python_module
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 TESTS_ROOT = pathlib.Path(__file__).parent
 SELF = pathlib.Path(__file__).resolve()

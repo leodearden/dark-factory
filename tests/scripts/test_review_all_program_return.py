@@ -13,6 +13,9 @@ from typing import Any
 
 import pytest
 from review_all_program_fixture import FIXTURE_DIR, FakeStore, load_state, running_fake_store
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 state = load_state()
 

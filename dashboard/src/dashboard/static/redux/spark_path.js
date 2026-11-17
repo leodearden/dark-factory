@@ -139,8 +139,8 @@ function sparkScale(values, width, height) {
 // is deliberately just the functions listed in SPARK_PATH_API, and
 // spark_path.test.mjs asserts that set EXHAUSTIVELY.
 //
-// Shared verbatim by all four builders (sparkPaths, stepPaths, axisPaths and
-// stackedAreaPaths), which is most of why task 3489's chart primitives were
+// Shared verbatim by every builder (sparkPaths, stepPaths, axisPaths,
+// bandPaths and stackedAreaPaths), which is most of why task 3489's chart primitives were
 // added to this module rather than a second one.
 function plottableRuns(points) {
   const runs = [];
@@ -263,15 +263,8 @@ function stepPaths(values, width, height) {
       drawn = [run[0], [endX, y]];
       lineCommands = `M${x},${y} L${endX},${y}`;
     } else {
-      const parts = [`M${run[0][0]},${run[0][1]}`];
-      for (let i = 1; i < run.length; i++) {
-        // Horizontal segment to the new x, keeping the old y...
-        parts.push(`L${run[i][0]},${run[i - 1][1]}`);
-        // ...then the vertical segment to the new y. Sharp step edges.
-        parts.push(`L${run[i][0]},${run[i][1]}`);
-      }
       drawn = run;
-      lineCommands = parts.join(' ');
+      lineCommands = stepLineCommands(run);
     }
 
     lines.push(lineCommands);
@@ -280,6 +273,18 @@ function stepPaths(values, width, height) {
   }
 
   return { line: lines.join(' '), area: areas.join(' ') };
+}
+
+// One run of two or more points as step edges: a horizontal segment to each
+// new x at the old y, then the vertical segment to the new y. Shared by
+// stepPaths and axisStepPaths. Module-private.
+function stepLineCommands(run) {
+  const parts = [`M${run[0][0]},${run[0][1]}`];
+  for (let i = 1; i < run.length; i++) {
+    parts.push(`L${run[i][0]},${run[i - 1][1]}`);
+    parts.push(`L${run[i][0]},${run[i][1]}`);
+  }
+  return parts.join(' ');
 }
 
 // ── Axis maximum over real samples only ────────────────────────────────────
@@ -389,16 +394,9 @@ function axisMax(dataMax, ticks, countAxis) {
 // requested window, not measurements, so they keep rendering and only the
 // series paths are skipped.
 function axisPaths(values, geom) {
-  const series = values || [];
-  const stepX = geom.width / Math.max(geom.count - 1, 1);
+  const stepX = columnStepX(geom);
   const baselineY = geom.y0 + geom.height;
-
-  // x comes from the ORIGINAL index, exactly as sparkScale does — compacting
-  // would silently redate every surviving sample.
-  const points = series.map((v, i) => {
-    const y = axisY(v, geom);
-    return y === null ? null : [geom.x0 + i * stepX, y];
-  });
+  const points = axisColumnPoints(values, geom, stepX);
 
   const lines = [];
   const areas = [];
@@ -417,6 +415,76 @@ function axisPaths(values, geom) {
   }
 
   return { line: lines.join(' '), area: areas.join(' '), stepX };
+}
+
+// ── Step series for a PADDED chart (charts.jsx's `LineChart` `step` flag) ──
+// Same `geom`, column x's and `stepX` as axisPaths; only the within-run edges
+// differ, built as stepPaths builds them, so a value holds until the next
+// column (the Quality tab's snapshot series, task 8465). A hole ends the run:
+// no edge is held across a slot that holds no measurement. A run of one is a
+// zero-length segment at its own x, never widened to a full-width tick, since
+// a lone column of a padded chart is still one column.
+function axisStepPaths(values, geom) {
+  const stepX = columnStepX(geom);
+  const baselineY = geom.y0 + geom.height;
+  const lines = [];
+  const areas = [];
+
+  for (const run of plottableRuns(axisColumnPoints(values, geom, stepX))) {
+    const drawn = run.length === 1 ? [run[0], run[0]] : run;
+    const lineCommands = run.length === 1 ? `M${run[0][0]},${run[0][1]} L${run[0][0]},${run[0][1]}` : stepLineCommands(run);
+
+    lines.push(lineCommands);
+    const areaCommands = closeRunArea(drawn, lineCommands, baselineY);
+    if (areaCommands !== null) areas.push(areaCommands);
+  }
+
+  return { line: lines.join(' '), area: areas.join(' '), stepX };
+}
+
+// The one x-mapping of the padded charts, shared by axisPaths, axisStepPaths,
+// bandPaths and stackedAreaPaths so a band or stack can never drift from the
+// line it sits under. Module-private.
+function columnStepX(geom) {
+  return geom.width / Math.max(geom.count - 1, 1);
+}
+
+// Each sample at its column: x from the ORIGINAL index, exactly as sparkScale
+// does (compacting would silently redate every surviving sample), and null at
+// a hole. Module-private.
+function axisColumnPoints(values, geom, stepX) {
+  return (values || []).map((v, i) => {
+    const y = axisY(v, geom);
+    return y === null ? null : [geom.x0 + i * stepX, y];
+  });
+}
+
+// One run of [x, yTop, yBase] points as a closed polygon: forward along the
+// top, back along the base. A one-column run is a zero-width sliver at its own
+// x, never widened toward a neighbouring slot. Module-private.
+function closedBand(run) {
+  const forward = run.map((p, i) => (i === 0 ? `M${p[0]},${p[1]}` : `L${p[0]},${p[1]}`));
+  const back = run.slice().reverse().map(p => `L${p[0]},${p[2]}`);
+  return `${forward.concat(back).join(' ')} Z`;
+}
+
+// ── Bound band for a PADDED chart (charts.jsx's `LineChart` `band` prop) ───
+// Same `geom` as axisPaths. Returns one closed subpath per run of indices
+// where BOTH lo[i] and hi[i] are plottable; a hole in either bound ends the
+// run, and a band with nothing plottable is []. A missing bound is a band of
+// holes, so a count series with no interval draws nothing rather than a
+// fabricated band.
+function bandPaths(lo, hi, geom) {
+  const lower = lo || [];
+  const upper = hi || [];
+  const stepX = columnStepX(geom);
+  const points = [];
+  for (let i = 0; i < Math.max(lower.length, upper.length); i++) {
+    const yTop = axisY(upper[i], geom);
+    const yBase = axisY(lower[i], geom);
+    points.push(yTop === null || yBase === null ? null : [geom.x0 + i * stepX, yTop, yBase]);
+  }
+  return plottableRuns(points).map(closedBand);
 }
 
 // ── Bar sizes as a fraction of the axis max (`BarChart`, `HistBar`, ───────
@@ -515,7 +583,7 @@ function barFractions(values, max) {
 function stackedAreaPaths(stacks, geom, snapMax = (foldedMax) => foldedMax) {
   const layers = (stacks || []).map(st => (st && st.values) || []);
   const count = geom.count;
-  const stepX = geom.width / Math.max(count - 1, 1);
+  const stepX = columnStepX(geom);
 
   // Per layer, per column: the cumulative base/top pair, or null where the
   // prefix rule says this band's position is unknowable.
@@ -562,20 +630,11 @@ function stackedAreaPaths(stacks, geom, snapMax = (foldedMax) => foldedMax) {
       );
     }
 
-    const polygons = [];
-    for (const run of plottableRuns(points)) {
-      // Forward along the top, back along the base, closed — the same shape
-      // the pre-fix code built, but per RUN rather than once across the whole
-      // label row, so a band never spans a column it was not measured in. A
-      // run of one column emits a zero-width polygon at its own x (a thin tick
-      // under the component's stroke): an honest "measured here, unknown
-      // either side", deliberately not widened toward a neighbouring slot.
-      const forward = run.map((p, i) => (i === 0 ? `M${p[0]},${p[1]}` : `L${p[0]},${p[1]}`));
-      const back = run.slice().reverse().map(p => `L${p[0]},${p[2]}`);
-      polygons.push(`${forward.concat(back).join(' ')} Z`);
-    }
-
-    return polygons.join(' ');
+    // The same shape the pre-fix code built, but per RUN rather than once
+    // across the whole label row, so a band never spans a column it was not
+    // measured in. A run of one column is a thin tick under the component's
+    // stroke: an honest "measured here, unknown either side".
+    return plottableRuns(points).map(closedBand).join(' ');
   });
 
   return { max, paths, stepX };
@@ -595,6 +654,8 @@ const SPARK_PATH_API = {
   axisY,
   axisMax,
   axisPaths,
+  axisStepPaths,
+  bandPaths,
   barFractions,
   stackedAreaPaths,
 };

@@ -73,13 +73,11 @@ def _emit(root, *, project_id=_PROJECT, operation='add_episode',
 class TestImportsCleanlyOnItsOwn:
     """This module must be importable FIRST, before the service layer.
 
-    Regression pin for a real cycle. This module imports the services layer
-    (`QueueOperation`, `POST_EXECUTE_DEAD_PREFIX`) at module scope, which runs
-    `services/__init__`, which eagerly imports `MemoryService`, which imports
-    this module back while it is half-initialized. That is safe only because
-    `memory_service` imports this MODULE rather than a name from it. It bites
-    asymmetrically: most test modules pull in `memory_service` first, but
-    collecting `tests/middleware/` on its own imports this module first.
+    `memory_service` imports this module, and this module imports services
+    leaves (`durable_queue`, `queued_writes`) at module scope. Until task 6635
+    emptied `services/__init__`, which eagerly imported `MemoryService`, that
+    formed a cycle through the package init. This class pins that every entry
+    order still imports cleanly.
 
     A SUBPROCESS is load-bearing: by the time any in-process test runs, both
     modules are long since in `sys.modules`, so an in-process import assertion
@@ -554,7 +552,7 @@ class TestWhatTheCallerWasTold:
 
         assert dle_mod._REPORTED_TO_CALLER['add_episode'].text in detail, detail
 
-    def test_the_add_memory_leg_names_the_stores_written_it_returned(self, tmp_path):
+    def test_the_add_memory_leg_names_the_stores_queued_it_returned(self, tmp_path):
         """The claim `add_memory` makes, and the one it does NOT make."""
         _emit(tmp_path, operation='add_memory_graphiti', write_op_id='W-9')
         detail = _filed(tmp_path)[0]['detail']
@@ -566,7 +564,7 @@ class TestWhatTheCallerWasTold:
         """`add_memory_graphiti` has TWO producers and only one faces a caller.
 
         `MemoryService.replay_from_store` enqueues this same operation from a
-        background loop: no `add_memory` call, no synchronous `stores_written`
+        background loop: no `add_memory` call, no synchronous `stores_queued`
         claim, and — the discriminator — no `_write_op_id`, which `add_memory`
         mints for every item it enqueues. Keyed on the operation NAME alone the
         record would tell an operator a caller had been lied to, and send them

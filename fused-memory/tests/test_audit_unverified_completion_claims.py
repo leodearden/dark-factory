@@ -20,8 +20,11 @@ from _fm_helpers import load_script_module
 from shared.project_layout import tasks_db
 from shared.task_store_schema import TASK_STORE_DDL
 from shared.tasks_db_readonly import TaskDbProblem, TaskDbUnreadable
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.backends.falkor_read_only import RO_COMMAND
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SCRIPT_PATH = (
     Path(__file__).parent.parent / 'scripts' / 'audit_unverified_completion_claims.py'
@@ -1717,7 +1720,7 @@ class TestProbeBuilders:
         no longer goes through TicketStore, so schema agreement is exactly what
         could silently drift.
         """
-        from fused_memory.middleware.ticket_store import TicketStore  # noqa: PLC0415
+        from fused_memory.middleware.ticket_store import TicketStore
 
         db_path = tmp_path / 'tickets.db'
         store = TicketStore(db_path)
@@ -1755,7 +1758,7 @@ class TestProbeBuilders:
         every store with, so this test fails if the read's SQL ever drifts from
         the schema the backend writes — the silent-all-unverifiable regression.
         """
-        import sqlite3  # noqa: PLC0415
+        import sqlite3
 
         root = tmp_path / 'proj'
         db_path = tasks_db(root)

@@ -835,7 +835,7 @@ class TestMalformedDeclarationIsRejectedLoudly:
         """``declared`` is caller-supplied JSON off an MCP tool argument, so a
         confused agent can reach every one of these. An UNHASHABLE kind is the
         sharp case: ``Referent.__post_init__``'s ``self.kind not in
-        _KIND_LABELS`` membership test raises ``TypeError``, which is not a
+        KIND_LABELS`` membership test raises ``TypeError``, which is not a
         ``ValueError``, so the existing ``except ValueError`` around the
         construction structurally cannot convert it — and δ's ``except
         InputValidationError`` gate would take an unhandled exception instead of
@@ -1131,7 +1131,7 @@ class TestMalformedDeclarationIsRejectedLoudly:
         """
         try:
             resolve_referents(declared=declared, metadata={}, content='', group_id=GROUP)
-        except Exception as exc:  # noqa: BLE001 — the assertion IS the type check
+        except Exception as exc:  # the assertion IS the type check
             assert isinstance(exc, InputValidationError), (
                 f'{declared!r} left _declared_referents as '
                 f'{type(exc).__name__}, which δ\'s `except InputValidationError` '
@@ -1754,7 +1754,7 @@ class TestStructuralInputsAreRejectedLoudly:
         """
         try:
             resolve_referents(declared=None, metadata={}, **kwargs)
-        except Exception as exc:  # noqa: BLE001 — the assertion IS the type check
+        except Exception as exc:  # the assertion IS the type check
             assert isinstance(exc, InputValidationError), (
                 f'{kwargs!r} left resolve_referents as {type(exc).__name__}, which '
                 f"δ's `except InputValidationError` gate does not catch: {exc}"
@@ -1922,8 +1922,8 @@ class TestKnownProjectIdsNarrowing:
         self, registry_kwargs, declared, metadata, content, expected_source
     ):
         """Omitted, None and ``{}`` are byte-identical to HEAD. The
-        empty-registry permissiveness belongs to ``_canonical_allowlist`` and
-        needs no second emptiness check here."""
+        empty-registry permissiveness belongs to ``scan_content``'s
+        ``known_project_ids`` and needs no second emptiness check here."""
         baseline = resolve_referents(
             declared=declared, metadata=metadata, content=content, group_id=GROUP
         )
@@ -1983,3 +1983,37 @@ class TestKnownProjectIdsNarrowing:
         become the one a caller can pass positionally."""
         with pytest.raises(TypeError):
             resolve_referents(None, {}, 'mirrors reify:132', GROUP, self.REGISTRY)  # type: ignore[misc]
+
+
+class TestDerivedPathReadsTheScanFixes:
+    """The write path derives referents through the fixed scan (task 10082)."""
+
+    REGISTRY = {'dark_factory': '/src/dark-factory', 'reify': '/src/reify'}
+
+    def _derive(self, content, known_project_ids=REGISTRY):
+        return resolve_referents(
+            declared=None,
+            metadata={},
+            content=content,
+            group_id=GROUP,
+            known_project_ids=known_project_ids,
+        )
+
+    def test_a_commit_hash_after_the_task_word_derives_nothing(self):
+        resolution = self._derive('merged 8c7e163fcf for task 8c7e163fcf')
+        assert resolution.source == 'none'
+        assert resolution.referents == ()
+
+    def test_every_number_of_a_plural_list_is_derived(self):
+        resolution = self._derive('tasks 2226 and 2227 both landed')
+        assert resolution.source == 'derived'
+        assert resolution.referents == (Referent(number='2226'), Referent(number='2227'))
+
+    def test_a_registered_project_name_qualifies_a_derived_mention(self):
+        resolution = self._derive('Reify task 3674 was cancelled')
+        assert resolution.source == 'derived'
+        assert resolution.referents == (Referent(project_id='reify', number='3674'),)
+
+    def test_without_a_registry_the_mention_stays_local(self):
+        resolution = self._derive('Reify task 3674 was cancelled', known_project_ids=None)
+        assert resolution.referents == (Referent(number='3674'),)

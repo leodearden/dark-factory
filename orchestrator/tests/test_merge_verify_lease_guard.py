@@ -113,7 +113,7 @@ class TestMergeVerifyLeaseContextManager:
         yield-without-a-lease path that let a 1--2h verify run fully exposed
         to a concurrent reseed/thin/gc clobber.
         """
-        from orchestrator.git_ops import MergeVerifyLeaseContended  # noqa: PLC0415
+        from orchestrator.git_ops import MergeVerifyLeaseContended
 
         git_ops = _git_ops(tmp_path)
         # Simulate acquire_merge_verify_flock's bounded-wait TIMEOUT (-> None).
@@ -143,9 +143,9 @@ class TestMergeVerifyLeaseContextManager:
         orchestrator; we prove off-thread execution by asserting the acquire
         ran on a DIFFERENT thread than the event-loop thread.
         """
-        import threading  # noqa: PLC0415
+        import threading
 
-        from orchestrator.git_ops import MergeVerifyLeaseContended  # noqa: PLC0415
+        from orchestrator.git_ops import MergeVerifyLeaseContended
 
         git_ops = _git_ops(tmp_path)
         main_thread_id = threading.get_ident()
@@ -225,7 +225,7 @@ class TestResetPersistentMergeWorktreeLeaseGuard:
     async def test_foreign_live_holder_refuses_reset(
         self, real_git_ops: GitOps, monkeypatch: pytest.MonkeyPatch,
     ):
-        from orchestrator.git_ops import MergeVerifyLeaseHeld  # noqa: PLC0415
+        from orchestrator.git_ops import MergeVerifyLeaseHeld
 
         merge_commit_a = await _get_merge_commit(real_git_ops, 'lease-a1', 'a1.py')
         await real_git_ops.reset_persistent_merge_worktree(merge_commit_a)
@@ -405,7 +405,7 @@ class TestMergeVerifyLeaseHoldsLaneLock:
         flock) on the SAME <lane_dir>.lock, rather than letting it proceed
         and clobber the tree underneath the verify.
         """
-        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
+        from orchestrator import git_ops as git_ops_mod
 
         merge_commit = await _get_merge_commit(real_git_ops, 'lease-lock-1', 'll1.py')
         warm_path = await real_git_ops.reset_persistent_merge_worktree(merge_commit)
@@ -463,7 +463,7 @@ class TestResetHoldsLaneLock:
     async def test_reset_blocks_until_lane_lock_released(
         self, real_git_ops: GitOps, monkeypatch: pytest.MonkeyPatch,
     ):
-        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
+        from orchestrator import git_ops as git_ops_mod
 
         # Comfortably longer than the ~0.3s external hold below, but far
         # short of the real 30s default so a regression that never
@@ -549,12 +549,12 @@ class TestResetHoldsLaneLock:
         longer exercise foreign contention at all, and this test would be
         quietly asserting something other than what it says.
         """
-        from test_lane_lock_leak_guard import (  # noqa: PLC0415
+        from test_lane_lock_leak_guard import (
             foreign_lane_lock_holder,
         )
 
-        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
-        from orchestrator.git_ops import MergeVerifyLeaseContended  # noqa: PLC0415
+        from orchestrator import git_ops as git_ops_mod
+        from orchestrator.git_ops import MergeVerifyLeaseContended
 
         # Small enough the test doesn't wait the real 30s default, but long
         # enough it can't be satisfied by anything other than a genuine
@@ -863,7 +863,7 @@ class TestEphemeralLaneLeaseLeavesGlobalRendezvousUntouched:
         foreign holder's rendezvous on the refusal path, and nothing else in
         this suite would fail.
         """
-        from orchestrator.git_ops import MergeVerifyLeaseContended  # noqa: PLC0415
+        from orchestrator.git_ops import MergeVerifyLeaseContended
 
         git_ops = _git_ops(tmp_path)
         ephemeral_wt = git_ops.worktree_base / '_merge-98c756bc'

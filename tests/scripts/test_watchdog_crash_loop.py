@@ -18,9 +18,12 @@ import types
 import _watchdog_crash_loop as crash_loop
 import pytest
 from fake_uv import argv_flag, recorded_argvs, write_fake_uv
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 # Resolves because the root conftest.py appends the repo root to sys.path.
 from df_pytest_isolation import synthetic_unit
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 CRASH_LOOP_PATH = REPO_ROOT / "scripts" / "_watchdog_crash_loop.py"

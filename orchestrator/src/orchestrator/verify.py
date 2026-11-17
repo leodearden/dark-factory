@@ -44,6 +44,7 @@ if TYPE_CHECKING:
 from shared.proc_group import terminate_process_group
 from shared.psi import cpu_some10_or_none, read_psi_sample
 from shared.python_env import without_python_env_selection
+from shared.secret_env import without_account_pool
 from shared.verify_admission import acquire_task_slot, is_gated_role, nice_prefix
 
 from orchestrator import verify_evidence, verify_plan
@@ -57,6 +58,8 @@ from orchestrator.config import ModuleConfig, OrchestratorConfig
 # flake_ledger depends only on shared.sqlite_sync_base, so there is no cycle.
 from orchestrator.flake_ledger import FlakeCallSite, FlakeSuppression, FlakeVerdict
 from orchestrator.main_tip_sweep_cadence import SweepSeedMode
+from orchestrator.relocated_scopes import relocated_scopes
+from orchestrator.scope_launch_handshake import ScopeLaunchHandshake
 from orchestrator.tree_removal import remove_tree
 from orchestrator.verify_admission_gate import (
     AdmissionGrant,
@@ -91,20 +94,25 @@ from orchestrator.verify_classify import (
     is_interpreter_missing_workspace_packages,
     is_partially_provisioned_venv_type_failure,
     is_shell_reported_external_kill,
+    output_proves_no_finding,
     unresolved_top_level_modules,
 )
 from orchestrator.verify_cmd import (
-    _PYTEST_VALUE_FLAGS,
+    _XDIST_N_FLAGS as _XDIST_N_FLAGS,  # re-exported for test_verify_load_stamp.py
+)
+from orchestrator.verify_cmd import (
     ChainSegment,
     ToolKind,
     VerifyCmd,
     _unspliceable_pytest_spans,
+    applied_worker_count,
     apply_pytest_numprocesses,
     cargo_scope,
     govern_cpu,
     parse_config_command,
     render,
     reproject,
+    serial_confirm_pytest,
     serial_pytest,
     split_and_chain_segments,
     split_chain_tail,
@@ -1001,7 +1009,7 @@ def _carries_pytest_failure_verdict(output: str) -> bool:
     The surfaces are one flat veto set: a ``^FAILED `` line, an ``^E   ``
     traceback line, a failure summary, an ``INTERNALERROR>`` line, or either
     ``ERROR`` short-summary form (node-id or bare-file). It is the single
-    veto set of every verdictless-exit recogniser
+    veto set of every pytest verdictless-exit recogniser
     (``_is_bare_xdist_worker_crash``, ``_pytest_session_aborted_without_verdict``).
 
     The set is flat on purpose. It used to be two branches keyed on whether
@@ -1105,6 +1113,18 @@ def _pytest_session_aborted_without_verdict(rc: int, output: str) -> bool:
     ):
         return False
     return is_shell_reported_external_kill(rc) or bool(_XDIST_CHANNEL_COLLAPSE_RE.search(output))
+
+
+def _leg_aborted_without_verdict(tool: ToolKind, rc: int, output: str) -> bool:
+    """Return True when a leg was torn down before reaching any verdict.
+
+    A pytest leg answers through ``_pytest_session_aborted_without_verdict``.
+    Any other leg needs a shell-reported kill and output proving no finding
+    was reached (``verify_classify.py::output_proves_no_finding``).
+    """
+    if tool is ToolKind.PYTEST:
+        return _pytest_session_aborted_without_verdict(rc, output)
+    return is_shell_reported_external_kill(rc) and output_proves_no_finding(tool, output)
 
 
 # Pytest node-id extraction for the main-tip-sweep isolated-rerun confirm gate
@@ -2390,32 +2410,64 @@ def _serial_pytest_str(cmd: str | None, *, invocation_dir: Path | None) -> str |
     so it never reaches ``rewritten is parsed`` at all, and a non-PYTEST or
     OPAQUE command is an expected, benign no-op.
     """
+    return _apply_serial_form(
+        cmd, invocation_dir=invocation_dir, mutator=serial_pytest, flags='-p no:xdist -o addopts=',
+    )
+
+
+def _serial_confirm_pytest_str(cmd: str | None, *, invocation_dir: Path | None) -> str | None:
+    """``_serial_pytest_str`` for a confirm re-run: ``verify_cmd.py::serial_confirm_pytest``."""
+    return _apply_serial_form(
+        cmd,
+        invocation_dir=invocation_dir,
+        mutator=serial_confirm_pytest,
+        flags='-n 0 (or -p no:xdist -o addopts= where xdist is not in play)',
+    )
+
+
+def _apply_serial_form(
+    cmd: str | None,
+    *,
+    invocation_dir: Path | None,
+    mutator: Callable[[VerifyCmd, Sequence[str]], VerifyCmd],
+    flags: str,
+) -> str | None:
+    """Apply a serial-form *mutator* to *cmd* under the addopts governing *invocation_dir*.
+
+    The one body behind ``_serial_pytest_str`` and ``_serial_confirm_pytest_str``,
+    whose docstring holds the contract: an unchanged raw PYTEST chain WARNs,
+    naming the *flags* that could not be placed, and comes back as *cmd* itself.
+    """
     if cmd is None:
         return None
     parsed = parse_config_command(cmd)
     ini_addopts = verify_plan.governing_addopts(parsed, _worktree_reader(invocation_dir))
-    rewritten = serial_pytest(parsed, ini_addopts)
+    rewritten = mutator(parsed, ini_addopts)
     if rewritten is parsed:
         if parsed.tool is ToolKind.PYTEST and parsed.raw is not None:
-            refused = _unspliceable_pytest_spans(parsed.raw)
-            reason = (
-                f'the matched pytest span {refused[0]!r} ends inside an unclosed '
-                'quote, so nowhere in it could take -p no:xdist -o addopts= without '
-                'landing inside a live quoted argument and silently running the '
-                'wrong tests'
-                if refused
-                else 'no pytest invocation could be located outside a quoted '
-                'argument, so there was nowhere to put -p no:xdist -o addopts='
-            )
-            logger.warning(
-                'serial recovery flags could not be applied to %s: %s. The ORIGINAL '
-                'command is being re-run unchanged, so this retry will fail for its '
-                'own reason rather than recover',
-                cmd,
-                reason,
-            )
+            _warn_serial_flags_unapplied(cmd, parsed.raw, flags=flags)
         return cmd
     return render(rewritten)
+
+
+def _warn_serial_flags_unapplied(cmd: str, raw: str, *, flags: str) -> None:
+    """The WARNING ``_serial_pytest_str``'s docstring explains, naming the *flags* not placed."""
+    refused = _unspliceable_pytest_spans(raw)
+    reason = (
+        f'the matched pytest span {refused[0]!r} ends inside an unclosed '
+        f'quote, so nowhere in it could take {flags} without '
+        'landing inside a live quoted argument and silently running the '
+        'wrong tests'
+        if refused
+        else 'no pytest invocation could be located outside a quoted '
+        f'argument, so there was nowhere to put {flags}'
+    )
+    logger.warning(
+        'serial re-run flags could not be applied to %s: %s. The ORIGINAL '
+        'command is being re-run unchanged instead of serially',
+        cmd,
+        reason,
+    )
 
 
 def _with_pytest_timeout_str(cmd: str | None, secs: int) -> str | None:
@@ -2429,12 +2481,11 @@ def _with_pytest_timeout_str(cmd: str | None, secs: int) -> str | None:
     structured PYTEST command (an OPAQUE / raw-retained chain / non-pytest
     command — covers the same no-op surface as ``with_pytest_timeout``, P1).
 
-    The α confirm gate composes this OUTSIDE ``_serial_pytest_str`` — the
-    generous explicit ``--timeout`` is required because the serial recovery's
-    ``-o addopts=<value>`` overrides only pyproject ``addopts`` — the
-    ``[tool.pytest.ini_options] timeout`` default is a separate ini key, so it
-    is neither cleared nor carried and would otherwise starve the isolated
-    confirm run into a false non-suppression.
+    The α confirm gate composes this OUTSIDE ``_serial_confirm_pytest_str`` —
+    the generous explicit ``--timeout`` is required because the
+    ``[tool.pytest.ini_options] timeout`` default is its own ini key, which
+    addopts never carries, so neither serial form touches it and it would
+    otherwise starve the isolated confirm run into a false non-suppression.
     """
     if cmd is None:
         return None
@@ -2740,27 +2791,45 @@ def _red_gate_category(slot: LegSlot) -> FailureCategory:
             assert_never(slot)
 
 
+def _require_launch_refusal_is_red(
+    label: str, rc: int, timed_out: bool, cmd: str | None,
+) -> None:
+    if cmd is None or rc == 0 or timed_out:
+        raise ValueError(
+            f'leg {str(label)!r}: scope_launch_refused requires a red leg whose '
+            'launch was attempted (cmd set, rc != 0, not timed out); '
+            f'got cmd={cmd!r}, rc={rc}, timed_out={timed_out}'
+        )
+
+
 def classify_leg(
     slot: LegSlot, rc: int, output: str, timed_out: bool, cmd: str | None, *,
     event_channel: VerifyEventChannel | None = None,
+    scope_launch_refused: bool = False,
 ) -> FailureCategory:
     """The ONE per-leg classifier. ``classify_failure`` answers what the tool's
     OUTPUT says (and the leg's *event_channel*, when present); this adds what
-    only verify knows: the leg's slot, and that verify interposed the shell.
-    It rewrites only the UNKNOWN_TEST_FAILURE fall-through, so every more
-    specific diagnosis survives.
+    only verify knows: the leg's slot, that verify interposed the shell, and
+    that verify's scope launcher refused to start the command
+    (*scope_launch_refused*, from ``ScopeLaunchRefused``). A refused leg is
+    ENV_TRANSIENT before any output is read: the output is the launcher's, not
+    the command's. Otherwise this rewrites only the UNKNOWN_TEST_FAILURE
+    fall-through, so every more specific diagnosis survives.
     """
+    if scope_launch_refused:
+        _require_launch_refusal_is_red(slot, rc, timed_out, cmd)
+        return FailureCategory.ENV_TRANSIENT
     tool = _tool_for_cmd(cmd)
     category = classify_failure(tool, rc, output, timed_out, event_channel=event_channel)
     if category != FailureCategory.UNKNOWN_TEST_FAILURE:
         return category
-    if tool is ToolKind.PYTEST and _pytest_session_aborted_without_verdict(rc, output):
+    if _leg_aborted_without_verdict(tool, rc, output):
         return FailureCategory.INFRA_ABORT
     return _red_gate_category(slot)
 
 
 def _classify_failing_legs(
-    legs: Iterable[tuple[LegSlot, int, str, bool, str | None, VerifyEventChannel | None]],
+    legs: Iterable[tuple[LegSlot, int, str, bool, str | None, VerifyEventChannel | None, bool]],
 ) -> dict[LegSlot, FailureCategory]:
     """Each failing leg's own category, keyed by slot, in *legs* order.
 
@@ -2769,19 +2838,24 @@ def _classify_failing_legs(
     provisioned venv is ENV_TRANSIENT, not TYPE_ERROR.
     """
     by_slot = {leg[0]: leg for leg in legs}
-    _, test_rc, _, _, test_cmd, _ = by_slot[LegSlot.TEST]
+    _, test_rc, _, _, test_cmd, _, _ = by_slot[LegSlot.TEST]
     categories: dict[LegSlot, FailureCategory] = {}
-    for slot, rc, output, timed_out, cmd, event_channel in by_slot.values():
+    for slot, rc, output, timed_out, cmd, event_channel, scope_launch_refused in by_slot.values():
         if rc == 0:
             continue
-        if slot is LegSlot.TYPE and _type_leg_read_partially_provisioned_venv(
-            rc, output, timed_out, cmd, test_rc=test_rc, test_cmd=test_cmd,
-            event_channel=event_channel,
+        if (
+            slot is LegSlot.TYPE
+            and not scope_launch_refused
+            and _type_leg_read_partially_provisioned_venv(
+                rc, output, timed_out, cmd, test_rc=test_rc, test_cmd=test_cmd,
+                event_channel=event_channel,
+            )
         ):
             categories[slot] = FailureCategory.ENV_TRANSIENT
         else:
             categories[slot] = classify_leg(
                 slot, rc, output, timed_out, cmd, event_channel=event_channel,
+                scope_launch_refused=scope_launch_refused,
             )
     return categories
 
@@ -2923,9 +2997,9 @@ def _summarize_checks(
         return True, 'passed', '', 'All checks passed', []
 
     legs = (
-        (LegSlot.TEST, test_rc, test_out, test_timed_out, test_cmd, None),
-        (LegSlot.LINT, lint_rc, lint_out, lint_timed_out, lint_cmd, None),
-        (LegSlot.TYPE, type_rc, type_out, type_timed_out, type_cmd, None),
+        (LegSlot.TEST, test_rc, test_out, test_timed_out, test_cmd, None, False),
+        (LegSlot.LINT, lint_rc, lint_out, lint_timed_out, lint_cmd, None, False),
+        (LegSlot.TYPE, type_rc, type_out, type_timed_out, type_cmd, None, False),
     )
     if leg_categories is None:
         leg_categories = _classify_failing_legs(legs)
@@ -3535,7 +3609,7 @@ def _archive_junit_report(
         # 0.214s).
         with junit_path.open('rb') as report, gzip.open(dest, 'wb', 6) as archived:
             shutil.copyfileobj(report, archived)
-    except Exception:  # noqa: BLE001 — observability may not fail a verify
+    except Exception:  # observability may not fail a verify
         logger.warning(
             '_archive_junit_report: could not archive %s → %s',
             junit_path, dest, exc_info=True,
@@ -3627,7 +3701,7 @@ def _archive_attempt_summary(
     )
 
 
-def _archive_merge_verify_logs(
+def archive_verify_logs(
     runs: list[dict],
     archive_root: 'Path | None',
     task_id: str,
@@ -3636,21 +3710,29 @@ def _archive_merge_verify_logs(
     cause_hint: str,
     *,
     module_prefix: 'str | None' = None,
-    role: Literal['merge', 'task'] = 'merge',
+    role: Literal['merge', 'task'],
 ) -> list[Path]:
-    """Write merge-verify run outputs + summary DIRECTLY to the durable archive.
+    """Write a verify's run outputs + summary DIRECTLY to the durable archive.
+
+    ``role`` is stamped into the summary: 'merge' from the local merge lane
+    and ``verify_runner.RemoteRunner.run_merge_verify``, 'task' from
+    ``verify_runner.RemoteRunner.run_task_verify``.
 
     Unlike ``_archive_attempt_log`` (which copies files from the worktree's
     ``.task/verify/``), this function writes directly to
-    ``<archive_root>/<task_id>/`` because merge worktrees have ``.task/``
-    scrubbed by design (git_ops.py) and there are no intermediate worktree
-    log files to copy from.
+    ``<archive_root>/<task_id>/`` because no caller has worktree log files
+    to copy from: merge worktrees have ``.task/`` scrubbed by design
+    (git_ops.py), and a remote verify's streams arrive over ssh with no
+    worktree copy on this host.
 
     Differences from the task-path helpers:
-    - **No deny-list check**: on the merge path there is no debugger loop;
-      every failure reaches a human.  ``infra_timeout`` and ``test_failure``
-      (the exact categories that distinguish timeout-vs-real-failure) are
-      archived unconditionally.
+    - **No deny-list check, for either role**.  On the merge path there is
+      no debugger loop; every failure reaches a human.  A remote task
+      verify does have one, but ``plans/remote-task-leg-verify-prd.md``
+      §4.3 archives its streams on every red: this archive is their only
+      copy on this host, and the result's ``archive_log_paths`` point at it.
+      ``infra_timeout`` and ``test_failure`` (the exact categories that
+      distinguish timeout-vs-real-failure) are archived unconditionally.
     - **Direct-to-archive**: bypasses ``.task/verify/``; the archive is the
       only persistence target that survives merge_wt cleanup.
 
@@ -3670,7 +3752,7 @@ def _archive_merge_verify_logs(
     try:
         target_dir.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
-        logger.warning('_archive_merge_verify_logs: could not create %s: %s', target_dir, exc)
+        logger.warning('archive_verify_logs: could not create %s: %s', target_dir, exc)
         return []
 
     infix = _make_infix(module_prefix)
@@ -3684,7 +3766,7 @@ def _archive_merge_verify_logs(
             continue
         path = _write_run_log(
             target_dir, attempt_id, infix, run,
-            ts_suffix=ts_suffix, caller='_archive_merge_verify_logs',
+            ts_suffix=ts_suffix, caller='archive_verify_logs',
         )
         if path is not None:
             archived.append(path)
@@ -4659,6 +4741,9 @@ class CheckRun:
     # result, started_at and duration_secs are that attempt's first pass's
     # (the env-recovery retry, task 5624). LAST field, as above.
     carried_over: bool = False
+    # True when verify's scope launcher refused to start this leg's command
+    # (task 7339). LAST field, as above, and kept out of ``to_dict``.
+    scope_launch_refused: bool = False
 
     def __post_init__(self) -> None:
         if self.carried_over and self.cmd is None:
@@ -4666,6 +4751,8 @@ class CheckRun:
                 f'CheckRun {str(self.label)!r}: a check that never ran (cmd=None) '
                 'cannot be carried over'
             )
+        if self.scope_launch_refused:
+            _require_launch_refusal_is_red(self.label, self.rc, self.timed_out, self.cmd)
 
     @classmethod
     def skipped(cls, label: str) -> 'CheckRun':
@@ -4682,7 +4769,7 @@ class CheckRun:
 
     def to_dict(self) -> dict:
         """Serialise to the runs-dict schema consumed by ``_persist_attempt_logs``/
-        ``_build_summary_payload``/``_archive_merge_verify_logs``
+        ``_build_summary_payload``/``archive_verify_logs``
         (all take ``list[dict]``) — the exact 12-key shape (label/cmd/rc/output/
         timed_out/started_at/duration_secs/segments/load/slot_wait_secs/admission/
         carried_over), 7 of which were previously hand-built inline in
@@ -4822,7 +4909,10 @@ class VerifyAttempt:
         """Each failing check's own category (``classify_leg``), keyed by slot."""
         checks = ((slot, self._by_label(slot)) for slot in LegSlot)
         return _classify_failing_legs(
-            (slot, check.rc, check.output, check.timed_out, check.cmd, check.event_channel)
+            (
+                slot, check.rc, check.output, check.timed_out, check.cmd,
+                check.event_channel, check.scope_launch_refused,
+            )
             for slot, check in checks
         )
 
@@ -5324,7 +5414,9 @@ def _target_subprocess_env(
     """Build the subprocess env for a TARGET project's verify/build/test spawn.
 
     Starts from ``os.environ`` minus the orchestrator's own venv/uv activation
-    vars (``shared.python_env.without_python_env_selection``), minus the orchestrator's ``ORCH_*``
+    vars (``shared.python_env.without_python_env_selection``), minus the Claude
+    OAuth account pool (``shared/src/shared/secret_env.py::without_account_pool``),
+    minus the orchestrator's ``ORCH_*``
     control-plane namespace (``_ORCH_ENV_PREFIX`` — so an ambient, leaked
     ``ORCH_CONFIG_PATH`` can't make a snapshot-era test load the production
     config; task 2957), and minus the venv ``bin`` dir on PATH, so the target's
@@ -5353,7 +5445,7 @@ def _target_subprocess_env(
     """
     env = {
         k: v
-        for k, v in without_python_env_selection(os.environ).items()
+        for k, v in without_account_pool(without_python_env_selection(os.environ)).items()
         if not k.startswith(_ORCH_ENV_PREFIX)
     }
     env['PYTHONUNBUFFERED'] = '1'
@@ -6084,18 +6176,67 @@ async def _reap_command_subtree(
     pgid: int | None,
     scope_unit: str | None,
 ) -> None:
-    """Kill a spawned verify command's whole subtree: its cgroup scope first
-    (reaps process-group escapes), then its spawn process group as the backstop.
+    """Kill a spawned verify command's whole subtree: its launch scope and every
+    scope its session moved into
+    (orchestrator/src/orchestrator/relocated_scopes.py::relocated_scopes), which
+    reaps process-group escapes, then its spawn process group as the backstop.
+
+    Discovery runs first, while the leader still proves ownership, and never
+    costs the kills: a failure finds nothing, and a cancellation during it
+    still kills the launch scope and the process group before propagating.
 
     A no-op when the spawn never returned a process: either it failed before
     any scope existed, or it was interrupted and asyncio's spawn cleanup
     already killed the child."""
     if proc is None:
         return
-    if scope_unit is not None:
-        await _kill_cgroup_scope(scope_unit)
-    if pgid is not None:
-        await terminate_process_group(proc, pgid, grace_secs=5.0)
+    relocated: frozenset[str] = frozenset()
+    try:
+        relocated = await _discover_relocated_scopes(proc, scope_unit)
+    finally:
+        launched = [] if scope_unit is None else [scope_unit]
+        for unit in [*launched, *sorted(relocated)]:
+            await _kill_cgroup_scope(unit)
+        if pgid is not None:
+            await terminate_process_group(proc, pgid, grace_secs=5.0)
+
+
+async def _discover_relocated_scopes(
+    proc: asyncio.subprocess.Process, scope_unit: str | None
+) -> frozenset[str]:
+    try:
+        relocated = await relocated_scopes(proc, launched_in=scope_unit)
+    except Exception:
+        logger.warning(
+            'verify command pid %d: finding the scopes it moved into failed; '
+            'reaping only its launch scope and process group',
+            proc.pid, exc_info=True,
+        )
+        return frozenset()
+    if relocated:
+        logger.info(
+            'verify command pid %d moved into scopes %s; killing them too',
+            proc.pid, sorted(relocated),
+        )
+    return relocated
+
+
+class ScopeLaunchRefused(NamedTuple):
+    """The triple ``_run_cmd`` returns when its systemd-run scope launcher exited
+    without exec'ing the command; *output* is the launcher's own. The leg never
+    started, so ``classify_leg`` makes it ENV_TRANSIENT."""
+
+    rc: int
+    output: str
+    timed_out: bool = False
+
+
+def _exited_outcome(
+    rc: int, output: str, handshake: ScopeLaunchHandshake | None,
+) -> tuple[int, str, bool]:
+    if rc != 0 and handshake is not None and handshake.launcher_exited_before_exec():
+        return ScopeLaunchRefused(rc, output)
+    return rc, output, False
 
 
 async def _run_cmd(
@@ -6113,6 +6254,9 @@ async def _run_cmd(
 ) -> tuple[int, str, bool]:
     """Run a shell command, return (returncode, combined output, timed_out).
 
+    The triple is a ``ScopeLaunchRefused`` when the scope launcher exited
+    without ever starting the command (``scope_launch_handshake.py``).
+
     When *env* is non-None, it is merged on top of ``os.environ`` and passed
     to the subprocess so callers can inject build accelerators like
     ``RUSTC_WRAPPER=sccache`` without mutating the parent process's env.
@@ -6125,6 +6269,8 @@ async def _run_cmd(
     inner GNU ``timeout`` that setpgid'd cargo into a separate group, which
     defeats the ``killpg``-on-spawn-pgid fallback and was the leak that let a
     defeated post-merge verify strand live ``cargo`` for up to 30 minutes.
+    A scope the command moves itself into (a nested ``systemd-run --scope``)
+    is reaped too, found by the command's session (``_reap_command_subtree``).
     Falls back to the plain ``start_new_session`` + ``killpg`` path when the
     flag is off or ``systemd-run`` is missing, so the default behaviour and the
     existing test suite are unchanged. When *cpu_weight* is not None the scope
@@ -6170,12 +6316,11 @@ async def _run_cmd(
     # progress dots stay in stdio buffers and never reach our streaming loop,
     # so a hanging subprocess produces an opaque ``Command timed out after …``
     # cause hint with no actionable signal.
-    # Build the target subprocess env via the venv-isolation scrub so the
-    # TARGET's `uv` resolves the TARGET's .venv, never dark-factory/.venv (the
-    # 2026-05-29 ghost-venv coupling).  The scrub strips the orchestrator's
-    # venv/uv activation vars + the venv bin dir from PATH, sets
-    # PYTHONUNBUFFERED, and reapplies the caller overlay (`env`) LAST so reify's
-    # RUSTC_WRAPPER/CARGO_*/jobserver vars and DF_VERIFY_ROLE always win.
+    # Build the target subprocess env through
+    # orchestrator/src/orchestrator/verify.py::_target_subprocess_env, the one
+    # home of what that env scrubs, injects and overlays, so the TARGET's `uv`
+    # resolves the TARGET's .venv, never dark-factory/.venv (the 2026-05-29
+    # ghost-venv coupling), and the caller overlay (`env`) still wins.
     # `cwd` doubles as the ruff-cache anchor (task 3922): <cwd>/.ruff_cache
     # terminates ruff's cache walk-up at the subprocess cwd instead of letting it
     # escape into the parent checkout's shared .ruff_cache.  Both spawn branches
@@ -6208,6 +6353,7 @@ async def _run_cmd(
     proc = None
     pgid: int | None = None
     scope_unit: str | None = None
+    handshake: ScopeLaunchHandshake | None = None
     if use_cgroup_scope and shutil.which('systemd-run') is not None:
         scope_unit = _verify_scope_name(scope_tag)
     # Populated by the clock-stop loop, via _clock_stop_reason evaluated AT
@@ -6226,15 +6372,20 @@ async def _run_cmd(
             # bash as a direct child of systemd-run, inheriting our cwd/env and
             # forwarding stdio to our pipe; --collect auto-removes the scope when
             # it exits (no unit leak on the normal-completion path).
-            proc = await asyncio.create_subprocess_exec(
-                *_scope_launch_argv(scope_unit, cpu_weight, memory_properties),
-                '/bin/bash', '-c', cmd,
-                cwd=str(cwd),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-                env=subprocess_env,
-                start_new_session=True,
-            )
+            handshake = ScopeLaunchHandshake()
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *_scope_launch_argv(scope_unit, cpu_weight, memory_properties),
+                    '/bin/bash', '-c', handshake.payload(cmd),
+                    cwd=str(cwd),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                    env=subprocess_env,
+                    start_new_session=True,
+                    pass_fds=handshake.pass_fds,
+                )
+            finally:
+                handshake.release_writer()
         else:
             proc = await asyncio.create_subprocess_shell(
                 cmd,
@@ -6253,7 +6404,7 @@ async def _run_cmd(
                 proc.communicate(), timeout=wall_deadline - clock(),
             )
             rc = proc.returncode if proc.returncode is not None else 1
-            return rc, stdout.decode(errors='replace'), False
+            return _exited_outcome(rc, stdout.decode(errors='replace'), handshake)
 
         # Streamed path: chunked read + per-chunk flush so the kill on timeout
         # cannot strand the partial output in kernel buffers.  The ``with``
@@ -6407,7 +6558,7 @@ async def _run_cmd(
                                 state = _CS_RUNNING
 
         rc = proc.returncode if proc.returncode is not None else 1
-        return rc, buf.decode(errors='replace'), False
+        return _exited_outcome(rc, buf.decode(errors='replace'), handshake)
     except TimeoutError:
         await _reap_command_subtree(proc, pgid, scope_unit)
         if _cs_timeout_msg:
@@ -6423,9 +6574,20 @@ async def _run_cmd(
     except Exception as e:
         await _reap_command_subtree(proc, pgid, scope_unit)
         return 1, f'Command failed: {e}', False
+    finally:
+        if handshake is not None:
+            handshake.close()
 
 
 _CHAIN_BUDGET_EXHAUSTED = 'chain wall-clock budget exhausted before this segment started'
+
+
+def _segments_red_only_from_scope_launch_refusal(segments: list[dict]) -> bool:
+    """Whether a segmented leg's every red is a refused scope launch: at least
+    one segment refused, and every other segment passed."""
+    return any(seg['scope_launch_refused'] for seg in segments) and all(
+        seg['scope_launch_refused'] or seg['status'] == 'passed' for seg in segments
+    )
 
 
 async def _run_segmented(
@@ -6466,8 +6628,9 @@ async def _run_segmented(
       `infra_timeout`; see the loop's ``chain_broken`` guard and the comment on
       the return statement.
     * ``segments`` is one flat JSON-native dict per segment
-      (index/label/cwd/cmd/status/rc/timed_out/duration_secs/skip_reason;
-      ``run_verification`` adds each segment's ``xdist`` at its call site),
+      (index/label/cwd/cmd/status/rc/timed_out/duration_secs/skip_reason/
+      scope_launch_refused, the last True when *run_one* returned a
+      ``ScopeLaunchRefused``; ``run_verification`` adds each segment's ``xdist`` at its call site),
       which rides on ``CheckRun.segments`` into the persisted
       ``.task/verify/attempt-N[.<prefix>].summary.json`` (via ``to_dict`` ->
       ``_build_summary_payload``'s per-command entries) and into the aggregated
@@ -6514,16 +6677,18 @@ async def _run_segmented(
                 'timed_out': False,
                 'duration_secs': 0.0,
                 'skip_reason': _CHAIN_BUDGET_EXHAUSTED,
+                'scope_launch_refused': False,
             })
             blocks.append(_segment_output_block(results[-1], len(segments), ''))
             continue
         started = now()
-        rc, out, seg_timed_out = await run_one(
+        result = await run_one(
             segment.command,
             worktree / segment.cwd_rel,
             remaining,
             segment.label,
         )
+        rc, out, seg_timed_out = result
         duration = now() - started
         if seg_timed_out:
             status = 'timed_out'
@@ -6561,6 +6726,7 @@ async def _run_segmented(
             'timed_out': seg_timed_out,
             'duration_secs': duration,
             'skip_reason': None,
+            'scope_launch_refused': isinstance(result, ScopeLaunchRefused),
         })
         blocks.append(_segment_output_block(results[-1], len(segments), out))
 
@@ -6916,9 +7082,10 @@ def _govern_cpu_str(cmd: 'str | None', exec_path: 'str | None') -> 'str | None':
     (outer ``df-verify`` scope).  ``cpu-governed-exec.sh``, on its governed
     path, creates an *inner* ``systemd-run --user --scope --slice=...``
     scope.  The inner scope MOVES the governed workload out of the outer
-    ``df-verify`` scope into its own scope under that slice, so neither the
-    outer scope's CPUWeight nor its cgroup kill reaches that workload —
-    ``cpu-governed-exec.sh`` sets the workload's weight itself.
+    ``df-verify`` scope into its own scope under that slice, so the outer
+    scope's CPUWeight does not reach that workload — ``cpu-governed-exec.sh``
+    sets the workload's weight itself.  The kill still reaches it: an abnormal
+    exit kills the relocated scope too (``verify.py::_reap_command_subtree``).
     ``cpu-governed-exec.sh`` also has a runtime probe + fail-open, so a
     nested-scope failure degrades gracefully.
     """
@@ -7851,9 +8018,12 @@ async def run_verification(
                     {**seg, 'xdist': segment_xdist.get(seg['label'])}
                     for seg in segment_dicts
                 ]
+                scope_launch_refused = _segments_red_only_from_scope_launch_refusal(
+                    segment_dicts,
+                )
             else:
                 segment_dicts = None
-                rc, out, timed_out_flag = await _run_cmd(
+                outcome = await _run_cmd(
                     cmd,
                     worktree,
                     timeout,
@@ -7862,6 +8032,8 @@ async def run_verification(
                     **_scope_kw,
                     **_clock_kw,
                 )
+                rc, out, timed_out_flag = outcome
+                scope_launch_refused = isinstance(outcome, ScopeLaunchRefused)
             # Both branches converge here, still INSIDE the slot and one
             # statement after the command returned. The clock and the load
             # window close at the SAME instant, so `duration_secs` and
@@ -7980,6 +8152,7 @@ async def run_verification(
                 grant, slot_taken=slot_taken, released=slot_released,
                 rc=rc, timed_out=timed_out_flag,
             ),
+            scope_launch_refused=scope_launch_refused,
         )
 
     async def _run_or_skip_timed(
@@ -8218,7 +8391,7 @@ async def run_verification(
     # editing it would be an unrequested blast radius for a purely additive
     # verdict detail. Placed here — after BOTH `_summarize_checks` calls and
     # before `runs`/persistence — so the augmented hint reaches
-    # `_persist_attempt_logs`/`_archive_merge_verify_logs` too, not just the
+    # `_persist_attempt_logs`/`archive_verify_logs` too, not just the
     # returned VerifyResult.
     _not_run_labels = [
         seg['label']
@@ -8244,12 +8417,13 @@ async def run_verification(
         # that auto-excludes cold-shadow / drift paths (left at None).
         if archive_root is not None and task_id is not None and not passed:
             try:
-                arch_paths = _archive_merge_verify_logs(
+                arch_paths = archive_verify_logs(
                     runs, archive_root, task_id, _archive_attempt_id(attempt_id),
                     category, cause_hint, module_prefix=module_prefix,
+                    role=role,
                 )
                 archive_log_paths = [str(p) for p in arch_paths]
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 logger.warning(
                     'run_verification: merge archival error (non-fatal): %s', exc,
                 )
@@ -8276,7 +8450,7 @@ async def run_verification(
                 infra_reclassified=bare_xdist_crash,
             )
             archive_log_paths = [str(p) for p in arch_paths]
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning('run_verification: persistence error (non-fatal): %s', exc)
 
     if bare_xdist_crash:
@@ -8988,7 +9162,7 @@ def _safe_derive_executed_fallback_plan(
                 plan, executed_fallback, pytest_reason=fallback_pytest_reason,
             )
         return plan
-    except Exception as exc:  # noqa: BLE001 — best-effort; must never fail the verify gate
+    except Exception as exc:  # best-effort; must never fail the verify gate
         logger.warning(
             'derive_verify_plan failed — omitting VerifyResult.plan for this attempt: %s',
             exc, exc_info=True,
@@ -10375,7 +10549,7 @@ async def run_main_tip_sweep(
     guarantee: a broad prune would deregister concurrently-active sibling
     probe/merge worktrees).
     """
-    from orchestrator.git_ops import (  # noqa: PLC0415 — lazy, mirrors verify_failure_is_preexisting_on_main
+    from orchestrator.git_ops import (  # lazy, mirrors verify_failure_is_preexisting_on_main
         EphemeralWorktreeError,
         WorktreeKind,
     )
@@ -10631,8 +10805,8 @@ async def run_main_tip_sweep(
 # 2370). A PASS on ANY attempt within this bound is treated as a confirmed
 # flake for that group — mirrors run_main_tip_sweep's single-retry heuristic,
 # widened slightly since this re-run is already scoped to just the named
-# tests (cheap) and serial with xdist stripped from addopts (task 2045's
-# proven xdist-contention recovery). No config flag: the gate is a strict fail-safe
+# tests (cheap) and serial (verify_cmd.py::serial_confirm_pytest).
+# No config flag: the gate is a strict fail-safe
 # improvement over the status quo (a bare, unconfirmed alarm), so it is
 # always-on.
 _SWEEP_CONFIRM_MAX_ATTEMPTS = 2
@@ -10640,9 +10814,9 @@ _SWEEP_CONFIRM_MAX_ATTEMPTS = 2
 #: Generous per-test timeout (seconds) injected into the main-tip-sweep
 #: CONFIRM gate's isolated re-run command via ``_with_pytest_timeout_str``.
 #: Same rationale as ``_MERGE_FLAKE_CONFIRM_TIMEOUT_SECS`` /
-#: ``_SWEEP_PREFILTER_TIMEOUT_SECS``: the serial recovery's ``-o addopts=``
-#: overrides only pyproject ``addopts``, NOT the
-#: ``[tool.pytest.ini_options] timeout`` default, so without this
+#: ``_SWEEP_PREFILTER_TIMEOUT_SECS``: the
+#: ``[tool.pytest.ini_options] timeout`` default is its own ini key, which
+#: addopts never carries, so without this
 #: explicit override a still-loaded host can starve the isolated confirm
 #: run into a false "still fails" verdict — and unlike the merge gate
 #: (which only holds a merge), a false verdict HERE files a red-main L1.
@@ -11007,11 +11181,12 @@ def _node_id_test_config(
     tree: Path,
     timeout_secs: int,
 ) -> ModuleConfig:
-    """The module's test leg alone, scoped to *node_ids*, forced serial, with a per-test timeout."""
+    """The module's test leg alone, scoped to *node_ids*, serial in the confirm form
+    (``verify_cmd.py::serial_confirm_pytest``), with a per-test timeout."""
     return replace(
         module_config,
         test_command=_with_pytest_timeout_str(
-            _serial_pytest_str(
+            _serial_confirm_pytest_str(
                 _scope_to_keyword(module_config.test_command, 'pytest', list(node_ids)),
                 invocation_dir=tree,
             ),
@@ -11212,9 +11387,9 @@ async def run_node_ids(
 
 #: Generous per-test timeout (seconds) injected into the main-tip-sweep
 #: isolated PRE-FILTER's re-run command via ``_with_pytest_timeout_str``.
-#: Same rationale as ``_MERGE_FLAKE_CONFIRM_TIMEOUT_SECS``: the serial
-#: recovery's ``-o addopts=`` overrides only pyproject ``addopts``, NOT the
-#: ``[tool.pytest.ini_options] timeout`` default, so without this explicit
+#: Same rationale as ``_MERGE_FLAKE_CONFIRM_TIMEOUT_SECS``: the
+#: ``[tool.pytest.ini_options] timeout`` default is its own ini key, which
+#: addopts never carries, so without this explicit
 #: override a still-loaded host could starve the isolated run into a false
 #: "reproduces" verdict. Kept as a SEPARATE constant from the merge gate's so
 #: sweep tuning is not coupled to merge-gate tuning (they are retuned on
@@ -11275,7 +11450,7 @@ async def _sweep_failure_reproduces_in_isolation(
         # Discover module configs on the SWEEP worktree (never config's
         # snapshot — that is for a different worktree/SHA). Lazy import
         # mirrors confirm_main_tip_failure_is_real.
-        from orchestrator.config import _discover_module_configs  # noqa: PLC0415
+        from orchestrator.config import _discover_module_configs
 
         module_configs = _discover_module_configs(worktree)
 
@@ -11344,14 +11519,14 @@ async def confirm_main_tip_failure_is_real(
     esc-main-sweep-ea2bd3c95e33-2 and the 2026-07-09 park_stop/symlink-loop
     incidents. This function is the harness's confirm-before-alarm gate: it
     extracts the named failing pytest node-ids from *failing_result*, and
-    re-runs JUST those tests, in ISOLATION (scoped + forced-serial with xdist
-    stripped from addopts — the task-2045 recovery — plus an explicit generous
+    re-runs JUST those tests, in ISOLATION (scoped + serial in the confirm
+    form, ``verify_cmd.py::serial_confirm_pytest``, plus an explicit generous
     ``--timeout``), in a FRESH probe worktree pinned at *main_sha* — never
     the sweep's own contended worktree.
 
     The ``--timeout`` (``_SWEEP_CONFIRM_TIMEOUT_SECS``, task 3290) is not
-    cosmetic: ``-o addopts=`` overrides only pyproject's ``addopts``, NOT its
-    ``[tool.pytest.ini_options] timeout`` default, so without the
+    cosmetic: pyproject's ``[tool.pytest.ini_options] timeout`` default is
+    its own ini key, which addopts never carries, so without the
     override a still-loaded host could starve this confirmation into a
     false "still fails" verdict — which here means filing a red-main L1
     escalation for a flake, the exact false positive this gate exists to
@@ -11403,8 +11578,8 @@ async def confirm_main_tip_failure_is_real(
     likelihood, non-fatal ambiguity, not a fail-safe-to-alarm path.
     """
     import uuid  # noqa: PLC0415, I001 — lazy, mirrors run_main_tip_sweep/verify_failure_is_preexisting_on_main
-    from orchestrator.config import _discover_module_configs  # noqa: PLC0415
-    from orchestrator.git_ops import _run  # noqa: PLC0415
+    from orchestrator.config import _discover_module_configs
+    from orchestrator.git_ops import _run
 
     _sha_prefix = main_sha[:12] if main_sha else '?'
 
@@ -11528,9 +11703,9 @@ async def confirm_main_tip_failure_is_real(
 
 #: Generous per-test timeout (seconds) injected into the α confirm gate's
 #: isolated re-run command via ``_with_pytest_timeout_str``. Must comfortably
-#: exceed any legitimate single-test wall time: the serial recovery's
-#: ``-o addopts=`` overrides only pyproject ``addopts``, NOT the
-#: ``[tool.pytest.ini_options] timeout`` default, so without this explicit
+#: exceed any legitimate single-test wall time: the
+#: ``[tool.pytest.ini_options] timeout`` default is its own ini key, which
+#: addopts never carries, so without this explicit
 #: override the isolated confirm re-run could itself starve under residual load
 #: into a false non-suppression. A tunable (PRD §9).
 _MERGE_FLAKE_CONFIRM_TIMEOUT_SECS = 300
@@ -11539,8 +11714,8 @@ _MERGE_FLAKE_CONFIRM_TIMEOUT_SECS = 300
 #: gate's isolated re-run command via ``_with_pytest_timeout_str``. A
 #: SEPARATE constant from ``_SWEEP_CONFIRM_TIMEOUT_SECS`` /
 #: ``_MERGE_FLAKE_CONFIRM_TIMEOUT_SECS`` so the three are retuned on their own
-#: signals. Same rationale as both: ``-o addopts=`` overrides only pyproject
-#: ``addopts``, NOT the ``[tool.pytest.ini_options] timeout`` default,
+#: signals. Same rationale as both: the ``[tool.pytest.ini_options] timeout``
+#: default is its own ini key, which addopts never carries,
 #: so without this explicit override a still-loaded host can starve the
 #: isolated confirm run into a false "still fails" verdict — and here that
 #: false verdict would mean a false red-main verdict (BLOCKED awaiting a
@@ -11731,20 +11906,6 @@ def _loadavg1_or_none(loadavg: Callable[[], tuple[float, float, float]]) -> 'flo
         return None
 
 
-# The spellings of the xdist WORKER-COUNT flag this stamp must recognise.
-#
-# DELIBERATELY NARROWER than ``verify_cmd._XDIST_OPTIONS``, and not a
-# drifting copy of it: that set is xdist's whole option surface, which a serial
-# recovery must SHED, so it also carries ``--dist`` (a distribution MODE),
-# ``--maxprocesses`` (a CAP) and more. None of those is a worker count, and
-# reporting any one's value as ``n_flag`` would put a fabricated count in the
-# corpus this stamp exists to make trustworthy. Both members here are also ``_PYTEST_VALUE_FLAGS`` members, so
-# the pair-binding walk below needs no special case for them;
-# test_verify_load_stamp.py asserts BOTH containments, so the narrowing stays a
-# stated choice rather than becoming drift the day either set moves.
-_XDIST_N_FLAGS = frozenset({'-n', '--numprocesses'})
-
-
 def _xdist_workers(cmd: str, verify_env: 'Mapping[str, str] | None') -> dict:
     """The xdist worker facts for *cmd*, as two independently-nullable fields.
 
@@ -11760,27 +11921,16 @@ def _xdist_workers(cmd: str, verify_env: 'Mapping[str, str] | None') -> dict:
 
     So two orthogonal facts, separately sourced:
 
-    - ``n_flag`` — the worker count the command NAMES, AS PARSED, or ``None``
-      when it names none. Read off the STRUCTURED ``base_flags``, never by
-      regex over the string: a regex would find the ``-n`` inside a
-      cpu-governed ``<exec> -- /bin/bash -c '...'`` payload and report it as
-      this command's flag. ``_PYTEST_VALUE_FLAGS`` is read rather than
-      re-derived so the flag/value pairing has one home, which is also what
-      keeps a ``-k '-n'`` from being mistaken for a worker count.
-
-      SPELLINGS, tested rather than assumed equal to one literal: both ``-n 8``
-      and its long form ``--numprocesses 8`` (``_XDIST_N_FLAGS``), each also in
-      the attached one-token form (``--numprocesses=8``, ``-n=8`` — argparse
-      accepts both). A set that bound ``-n`` alone would report ``n_flag: null``
-      for a module config using the long spelling, which the census reads as
-      "no flag on argv, so addopts decided the count" — a wrong fact, silently,
-      in the corpus this deliverable exists to make trustworthy. No live config
-      uses the long spelling today, so that was latent rather than active.
-
-      The CONCATENATED short form (``-n8``) is reported as absent. The serial
-      recovery's strip (``verify_cmd._is_xdist_option``) does shed it, because
-      there a surviving xdist token is a hard usage error; here the miss only
-      under-reports, and no live config uses that spelling.
+    - ``n_flag`` — the worker count the command's argv APPLIES, AS PARSED, or
+      ``None`` when it names none; which count that is, in every spelling, is
+      ``verify_cmd.py::applied_worker_count``'s to decide. Read off the
+      STRUCTURED ``base_flags``, never by regex over the string: a regex would
+      find the ``-n`` inside a cpu-governed ``<exec> -- /bin/bash -c '...'``
+      payload and report it as this command's flag. A stamp that bound
+      ``-n`` alone would report ``n_flag: null`` for a module config using the
+      long spelling, which the census reads as "no flag on argv, so addopts
+      decided the count" — a wrong fact, silently, in the corpus this
+      deliverable exists to make trustworthy.
     - ``auto_num_workers`` — ``PYTEST_XDIST_AUTO_NUM_WORKERS`` as this command's
       own subprocess will see it, or ``None`` when nothing sets it. Resolved by
       asking ``_target_subprocess_env`` — the SAME builder ``_run_cmd`` spawns
@@ -11816,28 +11966,7 @@ def _xdist_workers(cmd: str, verify_env: 'Mapping[str, str] | None') -> dict:
         ).get('PYTEST_XDIST_AUTO_NUM_WORKERS')
         parsed = parse_config_command(cmd)
         if parsed.tool is ToolKind.PYTEST and parsed.raw is None:
-            flags = parsed.base_flags
-            i = 0
-            while i < len(flags):
-                # One partition covers both spellings of "this flag's value":
-                # attached (`--numprocesses=8` -> sep is '=') or the adjacent
-                # token (`-n 8`), which `_PYTEST_VALUE_FLAGS` has already bound
-                # next to its flag. An attached form with an EMPTY value
-                # (`--numprocesses=`) names no count — pytest rejects that
-                # command outright — so it falls through and reports absent
-                # rather than recording `''` as a worker count.
-                head, sep, attached = flags[i].partition('=')
-                if head in _XDIST_N_FLAGS:
-                    if sep and attached:
-                        n_flag = attached
-                        break
-                    if not sep and i + 1 < len(flags):
-                        n_flag = flags[i + 1]
-                        break
-                if flags[i] in _PYTEST_VALUE_FLAGS and i + 1 < len(flags):
-                    i += 2
-                else:
-                    i += 1
+            n_flag = applied_worker_count(parsed.base_flags)
     except Exception:
         logger.warning(
             '_xdist_workers: could not read the worker facts off %r; '
@@ -12531,7 +12660,7 @@ def _emit_trivial_pass_escalated(
     """
     if event_store is None:
         return
-    from orchestrator.event_store import EventType  # noqa: PLC0415 — lazy, avoid cycle
+    from orchestrator.event_store import EventType  # lazy, avoid cycle
 
     event_store.emit(
         EventType.trivial_pass_escalated,

@@ -124,6 +124,7 @@ import shutil
 import subprocess
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from systemd_unit_invariants import (
     CANONICAL_CONFIG_BASENAME,
     INSTALLED_UNIT_DIR,
@@ -135,6 +136,8 @@ from systemd_unit_invariants import (
     restart_directive,
     systemctl_user_show,
 )
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 UNIT_BASENAME = "orchestrator-know-live.service"
 INSTALLED_UNIT_PATH = INSTALLED_UNIT_DIR / UNIT_BASENAME
@@ -509,7 +512,7 @@ def test_systemctl_user_show_returns_none_when_subprocess_raises(
     dev box.
     """
 
-    def fake_run(*args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+    def fake_run(*args, **kwargs):
         raise raised
 
     monkeypatch.setattr(subprocess, "run", fake_run)

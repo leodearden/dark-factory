@@ -15,13 +15,14 @@ from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import closing, contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from functools import partial
 from pathlib import Path
 from typing import Any, NamedTuple
 from unittest.mock import AsyncMock, patch
 
 import aiosqlite
 import httpx
-from _canned_mcp import CannedMCP, _raw_row, is_metadata_projection
+from _canned_mcp import ByRoot, CannedMCP, _raw_row, is_metadata_projection
 from _dt_helpers import fixed_clock, installed_clock
 from _prd_lanes_tree import (
     CARRIER,
@@ -34,6 +35,7 @@ from _prd_lanes_tree import (
     tree_tasks,
 )
 from _prd_tree import prd_tree_tasks
+from _quality_fixture import GitRepo
 from _quality_rows import (
     NO_COST,
     NO_OUTCOMES,
@@ -41,8 +43,10 @@ from _quality_rows import (
     history,
     train,
     write_landing_events,
+    write_marker_state_db,
     write_quality_db,
 )
+from _quality_snapshots import snapshot_doc, write_snapshot
 from _runs_db_fixture import EVENTS_DDL, EventRow, runs_db_path, write_runs_db
 from _served_reads import forget_escalation_corpus, forget_served_reads
 from escalation.archive import archive_dir_for_date
@@ -52,6 +56,7 @@ from fastapi.testclient import TestClient
 from shared.capability_manifest import sidecar_path
 from shared.locking import files_to_modules
 from shared.project_id import project_id_for_root
+from shared.quality_series.git_lines import ModuleLines
 from shared.quality_series.landings import GitCrossCheck, LinesBase
 from shared.quality_series.rows import Cost, LandingRow, Outcomes
 from shared.task_statuses import TaskStatus
@@ -61,9 +66,14 @@ from dashboard.app import app
 from dashboard.config import DashboardConfig
 from dashboard.data import escalation_corpus
 from dashboard.data.burndown import BURNDOWN_SCHEMA, collect_snapshot
+from dashboard.data.quality_marker_sampler import refresh_markers
+from dashboard.data.quality_markers import Marker, MarkerKind, MarkerSource, SourceType
 from dashboard.data.quality_sampler import QUALITY_SAMPLE_INTERVAL_SECONDS
+from dashboard.data.quality_snapshot_sampler import refresh_snapshots
+from dashboard.data.quality_snapshots import BASELINE_HOME
 from dashboard.data.quality_store import QualitySample
 from dashboard.data.scheduler import _scheduler_cache_clear
+from dashboard.loops import _QualityStore
 
 T0 = datetime(2026, 10, 4, 9, 0, 0, tzinfo=UTC)
 """The instant every scenario's first render is served at."""
@@ -78,6 +88,7 @@ MEMORY_GRAPHS = '/api/v2/dashboard/memory-graphs'
 SCHEDULER = '/api/v2/dashboard/scheduler'
 PRDS = '/api/v2/dashboard/prds'
 QUALITY = '/api/v2/dashboard/quality'
+QUALITY_SNAPSHOT_DIFF = '/api/v2/dashboard/quality/snapshot-diff'
 
 # in_flight 43 (running 25), backlog 1310, terminal 4106: total 5459.
 DARK_FACTORY_COUNTS: Mapping[TaskStatus, int] = {
@@ -249,31 +260,6 @@ def _heal(substrate: CannedMCP) -> None:
     substrate.fail_when = lambda call: False
 
 
-class _ByRoot:
-    """One canned substrate per project root, routed by the read's ``project_root``.
-
-    ``get_external_statuses`` names no root: it answers each ``project:id`` dep
-    from the substrate labelled ``project``, flat, with fused-memory's
-    ``unknown_project`` / ``unknown_task`` sentinels for one no substrate holds.
-    """
-
-    def __init__(self, by_label: Mapping[str, CannedMCP]) -> None:
-        self._by_label = by_label
-
-    async def __call__(self, client, url, tool, args, **kwargs):
-        if tool == 'get_external_statuses':
-            return {dep: self._external_status(dep) for dep in args['deps']}
-        substrate = self._by_label[Path(args['project_root']).name]
-        return await substrate(client, url, tool, args, **kwargs)
-
-    def _external_status(self, dep: str) -> str:
-        label, _, task_id = dep.partition(':')
-        substrate = self._by_label.get(label)
-        if substrate is None:
-            return 'unknown_project'
-        return substrate.status_map.get(int(task_id), 'unknown_task')
-
-
 class _SchedulerByRoot:
     """The scheduler fan-out, one canned state per root label; a label mapped to ``None`` is
     unreachable. Every other root serves :data:`CANNED_SCHEDULER_STATE`, and no root has events."""
@@ -336,7 +322,7 @@ def _canned_roots(
 
     try:
         with (
-            patch('dashboard.data.tasks.mcp_tool_call', new=_ByRoot(substrates)),
+            patch('dashboard.data.tasks.mcp_tool_call', new=ByRoot(substrates)),
             patch('dashboard.data.scheduler.mcp_tool_call', new=_SchedulerByRoot(schedulers or {})),
             patch('dashboard.data.active_tasks.fetch_task_runtime', new=AsyncMock(return_value={})),
             patch.object(snapshot_mod, 'SNAPSHOT_TTL_SECONDS', 0.0),
@@ -893,6 +879,15 @@ QUALITY_SOURCE_EPOCH = datetime(2026, 10, 21, tzinfo=UTC)
 QUALITY_PENDING_TRAIN = ('7001', '7002', '7003')
 """A train runs.db records after the main-ahead scenario's last tick, which quality.db lacks."""
 QUALITY_TICK = timedelta(seconds=QUALITY_SAMPLE_INTERVAL_SECONDS)
+QUALITY_MODULE = 'dashboard'
+QUALITY_MODULE_ORDINALS = tuple(range(0, QUALITY_STORED, 3))
+"""The module the drill-down scenario is read for, and the stored landings touching it."""
+QUALITY_SHIFT = 300
+"""The landing at which the alarm scenarios' rejection rate jumps from 3 in 10 to every landing:
+past the 200 a frozen baseline needs before the marker nearest it."""
+QUALITY_SHIFTED = 15
+"""Landings the alarm scenarios store from the shift on: enough for the up-CUSUM to cross h, too
+few to give the explaining marker's own segment a baseline of its own."""
 _NO_DISAGREEMENT = GitCrossCheck(0, 0, 0)
 
 
@@ -911,10 +906,26 @@ def _quality_cost(ordinal: int) -> Cost:
 
 def _quality_history(
     n: int, *, cost: Callable[[int], Cost] = lambda ordinal: NO_COST,
+    outcome: Callable[[int], Outcomes] = _quality_outcome,
+    modules: Callable[[int], tuple[ModuleLines, ...]] = lambda ordinal: (),
 ) -> list[LandingRow]:
     """*n* landings two hours apart, the newest a day before :data:`QUALITY_AT`."""
     return history(n, start=QUALITY_AT - timedelta(days=1, hours=2 * (n - 1)),
-                   outcome=_quality_outcome, cost=cost)
+                   outcome=outcome, cost=cost, modules=modules)
+
+
+def _shifted_outcome(ordinal: int) -> Outcomes:
+    """The first three of every ten landings rejected until :data:`QUALITY_SHIFT`, every one from it."""
+    rejected = ordinal >= QUALITY_SHIFT or ordinal % 10 < 3
+    return replace(NO_OUTCOMES, rejected=rejected, rejection_events=int(rejected))
+
+
+_MODULE_TOUCHED = frozenset(QUALITY_MODULE_ORDINALS)
+
+
+def _module_lines(ordinal: int) -> tuple[ModuleLines, ...]:
+    module = QUALITY_MODULE if ordinal in _MODULE_TOUCHED else 'orchestrator'
+    return (ModuleLines(module, 40),)
 
 
 def _off_the_line(rows: list[LandingRow]) -> list[LandingRow]:
@@ -954,14 +965,43 @@ def _store_quality(
     client.portal.call(write_quality_db, app.state.config.quality_db, rows, [sample])
 
 
-def _render_quality(client: TestClient, at: datetime) -> dict[str, Any]:
-    """GET /quality?project=dark_factory&window=100 on the real route, its clock at *at*."""
+def _render_quality(client: TestClient, at: datetime, **module: str) -> dict[str, Any]:
+    """GET /quality?project=dark_factory&window=100 on the real route, its clock at *at*; a
+    ``module=`` keyword drills down to that module."""
     with installed_clock(app, fixed_clock(at)):
-        return _get(client, QUALITY, project='dark_factory', window=str(QUALITY_WINDOW))
+        return _get(client, QUALITY, project='dark_factory', window=str(QUALITY_WINDOW), **module)
+
+
+def _store_routing_marker(client: TestClient, at: datetime, *, refreshed_at: datetime) -> None:
+    """Store one derived reviewer effort change at *at* as dark_factory's marker derivation."""
+    marker = Marker(
+        marker_id=f'routing:reviewer_comprehensive:{at.isoformat()}', at=at, kind=MarkerKind.EFFORT,
+        scope='dark_factory', series=None, until=None,
+        label='reviewer_comprehensive effort high → xhigh',
+        source=MarkerSource(SourceType.ROUTING, role='reviewer_comprehensive'),
+    )
+    assert client.portal is not None, 'quality.db is written inside a live TestClient'
+    client.portal.call(partial(write_marker_state_db, app.state.config.quality_db, 'dark_factory',
+                               (marker,), refreshed_at=refreshed_at))
+
+
+def _alarm_scenario(
+    client: TestClient, workdir: Path, *, marker_before: int, sampled_at: datetime,
+) -> dict[str, Any]:
+    """Sketch row 9: the rejection rate shifts at :data:`QUALITY_SHIFT`, and the one derived
+    marker is dated at the landing *marker_before* landings before it."""
+    root = _quality_root(workdir)
+    rows = _quality_history(QUALITY_SHIFT + QUALITY_SHIFTED, outcome=_shifted_outcome)
+    write_landing_events(root, rows)
+    _store_quality(client, root, rows, sampled_at=sampled_at)
+    _store_routing_marker(client, rows[QUALITY_SHIFT - marker_before].landing.landed_at,
+                          refreshed_at=sampled_at)
+    return _render_quality(client, QUALITY_AT)
 
 
 def _quality_family(client: TestClient, workdir: Path) -> dict[str, Any]:
-    """Quality sketch rows 3, 4, 5, 10 and 12: one project's per-landing series as /quality serves it.
+    """Quality sketch rows 3, 4, 5, 9, 10 and 12 and the module drill-down: one project's
+    per-landing series as /quality serves it.
 
     Each scenario stores rows in quality.db and records the same landings in runs.db, so the
     read side's freshness is runs.db's verdict on the store, never a fixture's say-so.
@@ -1001,6 +1041,99 @@ def _quality_family(client: TestClient, workdir: Path) -> dict[str, Any]:
     _store_quality(client, root, [*stored, *pending], sampled_at=next_tick)
     bodies['quality_main_ahead_cleared'] = _render_quality(client, next_tick + timedelta(minutes=1))
 
+    bodies['quality_alarm_explained'] = _alarm_scenario(
+        client, workdir / 'quality_alarm_explained', marker_before=10, sampled_at=sampled)
+    bodies['quality_alarm_unexplained'] = _alarm_scenario(
+        client, workdir / 'quality_alarm_unexplained', marker_before=100, sampled_at=sampled)
+
+    root = _quality_root(workdir / 'quality_module')
+    touched = _quality_history(QUALITY_STORED, cost=_quality_cost, modules=_module_lines)
+    write_landing_events(root, touched)
+    _store_quality(client, root, touched, sampled_at=sampled)
+    bodies['quality_module'] = _render_quality(client, QUALITY_AT, module=QUALITY_MODULE)
+
+    return bodies
+
+
+QUALITY_SNAPSHOT_TIMES = (
+    datetime(2026, 10, 8, 18, 30, tzinfo=UTC),
+    datetime(2026, 11, 5, 2, 0, tzinfo=UTC),
+    datetime(2026, 11, 6, 2, 0, tzinfo=UTC),
+)
+"""The committer dates of the snapshot scenario's three shas: the baseline's, then two nightly
+points', the nightly ones inside the window of the landings the scenario also stores."""
+QUALITY_SNAPSHOT_SCANNED_AT = QUALITY_AT - timedelta(minutes=5)
+
+
+def _dated_commits(root: Path, times: Iterable[datetime]) -> list[str]:
+    """A git repository at *root* with one commit per instant in *times*, committed then; its shas."""
+    repo = GitRepo(root)
+    shas: list[str] = []
+    for index, at in enumerate(times):
+        with patch.dict(os.environ, {'GIT_AUTHOR_DATE': at.isoformat(), 'GIT_COMMITTER_DATE': at.isoformat()}):
+            shas.append(repo.commit({'a.txt': f'{index}\n'}, f'commit {index}') if shas else repo.init())
+    return shas
+
+
+async def _scan_snapshots(config: DashboardConfig, root: Path, *, markers: bool) -> None:
+    """The quality loop's snapshot tick over *root*, then its marker tick when *markers*."""
+    async with _QualityStore(config.quality_db) as store:
+        await refresh_snapshots(store.connection, [root], nightly_dir=config.quality_metrics_dir,
+                                now=QUALITY_SNAPSHOT_SCANNED_AT)
+        if markers:
+            await refresh_markers(store.connection, [root], now=QUALITY_SNAPSHOT_SCANNED_AT)
+
+
+def _quality_snapshot_family(client: TestClient, workdir: Path) -> dict[str, Any]:
+    """Quality sketch row 20: a schema-2 baseline then two schema-3 nightly snapshots at three
+    shas, with one params change, through the real snapshot and marker ticks over a project whose
+    landings are stored too, so its instrument marker also sits on the landing axis; the same
+    files with the baseline and the first nightly at one commit; and a root that holds neither
+    home.
+    """
+    assert client.portal is not None, 'the quality ticks run inside a live TestClient'
+    bodies: dict[str, Any] = {}
+
+    root = _quality_root(workdir / 'quality_snapshots')
+    baseline_sha, *nightly_shas = _dated_commits(root, QUALITY_SNAPSHOT_TIMES)
+    landings = _quality_history(QUALITY_STORED)
+    write_landing_events(root, landings)
+    _store_quality(client, root, landings, sampled_at=QUALITY_SNAPSHOT_SCANNED_AT)
+    config = app.state.config
+    write_snapshot(root / BASELINE_HOME / 'review-all-dark_factory-20261008.json',
+                   snapshot_doc(2, as_of_sha=baseline_sha, run_id='review-all-dark_factory-20261008'))
+    for sha in nightly_shas:
+        write_snapshot(config.quality_metrics_dir / project_id_for_root(root) / f'{sha}.json',
+                       snapshot_doc(3, as_of_sha=sha, run_id=f'nightly-{sha[:10]}'))
+    client.portal.call(partial(_scan_snapshots, config, root, markers=True))
+    served = _render_quality(client, QUALITY_AT)
+    bodies['quality_snapshots'] = served
+    second = served['QUALITY_SNAPSHOTS']['value']['points'][1]['id']
+    bodies['quality_snapshot_diff'] = _get(client, QUALITY_SNAPSHOT_DIFF, project='dark_factory', point=second)
+
+    root = _quality_root(workdir / 'quality_snapshots_same_commit')
+    shared_sha, later_sha = _dated_commits(root, QUALITY_SNAPSHOT_TIMES[1:])
+    write_landing_events(root, landings)
+    _store_quality(client, root, landings, sampled_at=QUALITY_SNAPSHOT_SCANNED_AT)
+    config = app.state.config
+    write_snapshot(root / BASELINE_HOME / 'review-all-dark_factory-20261105.json',
+                   snapshot_doc(2, as_of_sha=shared_sha, run_id='review-all-dark_factory-20261105'))
+    for sha in (shared_sha, later_sha):
+        write_snapshot(config.quality_metrics_dir / project_id_for_root(root) / f'{sha}.json',
+                       snapshot_doc(3, as_of_sha=sha, run_id=f'nightly-{sha[:10]}'))
+    client.portal.call(partial(_scan_snapshots, config, root, markers=True))
+    served = _render_quality(client, QUALITY_AT)
+    bodies['quality_snapshots_same_commit'] = served
+    nightly = served['QUALITY_SNAPSHOTS']['value']['points'][1]['id']
+    bodies['quality_snapshots_same_commit_diff'] = _get(
+        client, QUALITY_SNAPSHOT_DIFF, project='dark_factory', point=nightly,
+    )
+
+    root = _quality_root(workdir / 'quality_no_snapshot')
+    _dated_commits(root, QUALITY_SNAPSHOT_TIMES[:1])
+    client.portal.call(partial(_scan_snapshots, app.state.config, root, markers=False))
+    bodies['quality_no_snapshot'] = _render_quality(client, QUALITY_AT)
+
     return bodies
 
 
@@ -1031,4 +1164,5 @@ def build_all(workdir: Path) -> dict[str, Any]:
             **prd_view_family(client, workdir),
             **prd_lanes_family(client, workdir),
             **_quality_family(client, workdir),
+            **_quality_snapshot_family(client, workdir),
         }

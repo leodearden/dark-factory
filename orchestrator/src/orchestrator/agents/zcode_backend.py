@@ -7,19 +7,21 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
-import shutil
-import tempfile
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from shared.cli_invoke import AgentResult, _SubprocessResult
+from shared.cli_invoke import AgentResult, SubprocessResult
 from shared.process_cost import ProcessCostBasis
-from shared.secret_env import agent_subprocess_env, is_secret_env_name
+
+from orchestrator.agents.agent_run_home import (
+    private_run_home,
+    redirected_home_env,
+    write_owner_only_json,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -29,15 +31,6 @@ PROVIDER_ID = 'dark-factory'
 INTERACTIVE_TOOLS = ('AskUserQuestion', 'EnterPlanMode', 'ExitPlanMode')
 MAX_ARG_STRLEN = 131072
 PROMPT_FLAG = '--prompt'
-# HOME-derived tool locations the agent's commands keep at the operator's values; see plans/zcode-harness-probe-2026-11.md.
-OPERATOR_TOOL_HOMES: tuple[tuple[str, str], ...] = (
-    ('XDG_CONFIG_HOME', '.config'),
-    ('XDG_CACHE_HOME', '.cache'),
-    ('XDG_DATA_HOME', '.local/share'),
-    ('XDG_STATE_HOME', '.local/state'),
-    ('CARGO_HOME', '.cargo'),
-    ('RUSTUP_HOME', '.rustup'),
-)
 
 _PLAIN_TOOL_NAME = re.compile(r'[A-Za-z0-9_-]+')
 
@@ -115,21 +108,12 @@ def _zcode_mcp_server(name: str, server: Mapping[str, Any]) -> dict[str, Any]:
     )
 
 
-def zcode_operator_home(base_env: Mapping[str, str]) -> Path:
-    home = (base_env.get('HOME') or '').strip()
-    if not home:
-        raise ValueError(
-            'the zcode backend needs HOME in its environment: without the operator home it '
-            "cannot reproduce its control's tool environment under the redirected run home",
-        )
-    return Path(home)
-
-
 @dataclass(frozen=True)
 class ZCodeRunHome:
     root: Path
     provider_config_path: Path
     operator_home: Path
+    workspace: Path
 
 
 @contextmanager
@@ -140,75 +124,45 @@ def zcode_run_home(
     endpoint: ZCodeEndpoint,
     mcp_config: Mapping[str, Any] | None,
     operator_home: Path,
+    worktree: Path,
 ) -> Iterator[ZCodeRunHome]:
-    """A private home for one invocation, holding the only copy of the endpoint key; removed on exit."""
-    root = Path(tempfile.mkdtemp(prefix='zcode-home-'))
-    try:
+    """A private home for one invocation, holding the only copy of the endpoint key and the link to *worktree* ZCode runs in; removed on exit."""
+    with private_run_home(backend='zcode', operator_home=operator_home) as root:
         zcode_dir = root / '.zcode'
         provider_config_path = zcode_dir / 'v2' / 'provider_config.json'
-        _write_owner_only_json(provider_config_path, zcode_provider_config(model, endpoint))
+        write_owner_only_json(provider_config_path, zcode_provider_config(model, endpoint))
         cli_config_path = zcode_dir / 'cli' / 'config.json'
         cli_config_path.parent.mkdir(parents=True)
         cli_config_path.write_text(json.dumps(zcode_cli_config(mcp_config)))
         (zcode_dir / 'AGENTS.md').write_text(system_prompt)
-        (root / '.gitconfig').write_text(_git_include(operator_home / '.gitconfig'))
-        (root / 'tmp').mkdir()
+        workspace = _fenced_workspace(root, worktree)
         yield ZCodeRunHome(
             root=root, provider_config_path=provider_config_path, operator_home=operator_home,
+            workspace=workspace,
         )
-    finally:
-        _remove_run_home(root)
 
 
-def _git_include(path: Path) -> str:
-    quoted = str(path).replace('\\', '\\\\').replace('"', '\\"')
-    return f'[include]\n\tpath = "{quoted}"\n'
-
-
-def _write_owner_only_json(path: Path, document: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True)
-    with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'w') as handle:
-        json.dump(document, handle)
-
-
-def _remove_run_home(root: Path) -> None:
-    try:
-        shutil.rmtree(root)
-    except OSError:
-        logger.warning(
-            'zcode backend: could not remove run home %s, which holds an endpoint key',
-            root, exc_info=True,
-        )
+def _fenced_workspace(root: Path, worktree: Path) -> Path:
+    """See plans/zcode-harness-probe-2026-11.md §"Dotenv walk"."""
+    (root / '.env').touch(exist_ok=False)
+    workspace = root / 'workspace'
+    workspace.symlink_to(worktree.resolve(), target_is_directory=True)
+    return workspace
 
 
 def zcode_spawn_env(base_env: Mapping[str, str], home: ZCodeRunHome) -> dict[str, str]:
-    root = str(home.root)
-    inherited = {
-        name: value for name, value in agent_subprocess_env(base_env).items()
-        if not is_secret_env_name(name)
-    }
     return {
-        **inherited,
-        **_operator_tool_homes(base_env, home.operator_home),
-        'HOME': root,
-        'USERPROFILE': root,
-        'ZCODE_DATA_BASE_DIR': root,
+        **redirected_home_env(base_env, root=home.root, operator_home=home.operator_home),
+        'ZCODE_DATA_BASE_DIR': str(home.root),
         'ZCODE_PERSONAL_PROVIDER_CONFIG_FILE': str(home.provider_config_path),
-        'TMPDIR': str(home.root / 'tmp'),
     }
 
 
-def _operator_tool_homes(base_env: Mapping[str, str], operator_home: Path) -> dict[str, str]:
-    overlay: dict[str, str] = {}
-    for name, default in OPERATOR_TOOL_HOMES:
-        inherited = base_env.get(name, '')
-        overlay[name] = inherited if inherited.strip() else str(operator_home / default)
-    return overlay
-
-
-def zcode_argv(prompt: str, cwd: Path, disallowed_tools: Iterable[str] | None) -> list[str]:
+def zcode_argv(
+    prompt: str, home: ZCodeRunHome, disallowed_tools: Iterable[str] | None,
+) -> list[str]:
     return [
-        'zcode', _prompt_argument(prompt), '--cwd', str(cwd), '--mode', 'yolo',
+        'zcode', _prompt_argument(prompt), '--cwd', str(home.workspace), '--mode', 'yolo',
         '--output-format', 'json', '--no-color',
         '--disallowed-tools', ' '.join(_disallowed_tool_names(disallowed_tools)),
     ]
@@ -245,7 +199,7 @@ def _disallowed_tool_names(specs: Iterable[str] | None) -> list[str]:
     return names
 
 
-def parse_zcode_output(result: _SubprocessResult, *, cost_of: CostOf) -> AgentResult:
+def parse_zcode_output(result: SubprocessResult, *, cost_of: CostOf) -> AgentResult:
     """*cost_of* prices (uncached input, output, cached input) tokens in dollars."""
     if result.returncode != 0 or result.timed_out:
         return _failure(result, '\n'.join(filter(None, [_exit_line(result), result.stderr.strip()])))
@@ -257,7 +211,7 @@ def parse_zcode_output(result: _SubprocessResult, *, cost_of: CostOf) -> AgentRe
     return _success(result, payload, cost_of)
 
 
-def _exit_line(result: _SubprocessResult) -> str:
+def _exit_line(result: SubprocessResult) -> str:
     return f'zcode exited rc={result.returncode}' + (' (timed out)' if result.timed_out else '')
 
 
@@ -269,7 +223,7 @@ def _json_object(stdout: str) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
-def _failure(result: _SubprocessResult, output: str, subtype: str = 'error') -> AgentResult:
+def _failure(result: SubprocessResult, output: str, subtype: str = 'error') -> AgentResult:
     return AgentResult(
         success=False,
         output=output,
@@ -281,7 +235,7 @@ def _failure(result: _SubprocessResult, output: str, subtype: str = 'error') -> 
     )
 
 
-def _success(result: _SubprocessResult, payload: dict[str, Any], cost_of: CostOf) -> AgentResult:
+def _success(result: SubprocessResult, payload: dict[str, Any], cost_of: CostOf) -> AgentResult:
     usage = payload.get('usage') or {}
     cache_read = int(usage.get('cacheReadTokens') or 0)
     cache_write = int(usage.get('cacheWriteTokens') or 0)

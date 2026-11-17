@@ -30,7 +30,8 @@ from typing import Any, TypeVar
 from unittest.mock import AsyncMock, patch
 from urllib.parse import urlsplit
 
-from _dashboard_helpers import ScriptTagCollector, node_path
+from _dashboard_helpers import node_path
+from _jsx_source_helpers import ScriptTagCollector
 
 # ---------------------------------------------------------------------------
 # The finder

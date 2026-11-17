@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, NamedTuple, Protocol, TypeAlias
 
 from shared.lane_probe import LANE_ROLE_VARIABLE, OFFLINE_LANE_ROLE, OUTAGE_EXIT_STATUS
 from shared.proc_group import reap_process_groups, terminate_process_group
+from shared.secret_env import without_account_pool
 from shared.verify_admission import nice_prefix
 
 from orchestrator.offline_lane_records import (
@@ -281,7 +282,7 @@ async def launch(
 
 
 def _lane_env() -> dict[str, str]:
-    return {**os.environ, LANE_ROLE_VARIABLE: OFFLINE_LANE_ROLE}
+    return {**without_account_pool(os.environ), LANE_ROLE_VARIABLE: OFFLINE_LANE_ROLE}
 
 
 def command_cwd(worktree: Path, command: LaneCommand) -> Path:

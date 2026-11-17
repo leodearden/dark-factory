@@ -10,7 +10,7 @@ from __future__ import annotations
 import re
 
 import pytest
-from _dashboard_helpers import (
+from _jsx_source_helpers import (
     assert_script_loads_before,
     extract_df_data_block,
     extract_function_body,

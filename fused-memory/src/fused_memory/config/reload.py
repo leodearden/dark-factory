@@ -181,6 +181,12 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset({
     # flow on a running server WITHOUT granting content-amend authority.
     'mem0_update.content_amend_allowed_agent_prefixes',
     'mem0_update.metadata_patch_allowed_agent_prefixes',
+    # Read live per refusal by resolve_mem0_update_sanctioned_uses
+    # (server/mem0_update_authz.py) off the shared memory_service.config.mem0_update
+    # object. Rendering-only: it never changes an allow/deny decision. A dict,
+    # so _iter_leaves yields it whole and it reloads all-or-nothing, like
+    # write_triage.t_high_by_category.
+    'mem0_update.agent_prefix_sanctioned_use',
     # Read live per shadow job by services/overreach_shadow.py::OverreachShadow,
     # whose settings() re-reads memory_service.config.overreach_guard on every
     # submit and judge call. shadow_enabled is the shadow's kill switch.
@@ -288,6 +294,13 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset({
     'link_heal.misfile_share_ceiling',
     'link_heal.corrects_share_ceiling',
     'link_heal.shard_failure_streak',
+    # The scheduled sweep and its calibration gate (task 7159): same consumers.
+    'link_heal.projects',
+    'link_heal.writes',
+    'link_heal.sweep_actions',
+    'link_heal.sweep_window_hours',
+    'link_heal.calibration_kappa_margin',
+    'link_heal.calibration_min_project_items',
 })
 
 

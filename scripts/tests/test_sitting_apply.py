@@ -18,7 +18,7 @@ import pytest
 from escalation.authority import COORDINATOR_IDENTITY, EXECUTOR_IDENTITY, ClassSwitch
 from escalation.classify import classify_resolver_tier
 from escalation.models import Escalation
-from orchestrator.session_registry import (
+from orchestrator.decision_registry import (
     AuditOutcome,
     AuditVerdict,
     DecisionRecord,
@@ -32,6 +32,7 @@ from orchestrator.session_registry import (
     write_decision,
 )
 from shared.mcp_session import SyncMcpSession
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from sitting import apply as mod
 from sitting import audits, payloads, prepare_sitting
 from sitting import ledger as ledger_mod
@@ -41,6 +42,8 @@ from sitting.ports import QueuePort
 from sitting_escalation_servers import RecordingToolCaller, ServedQueue, serve_project_queue
 
 from escalation import policy_state
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 STEP_NAMES = ['stamp_triage', 'resolve_issue', 'update_task', 'close_decision', 'add_memory', 'add_memory']
 

@@ -32,7 +32,7 @@ from __future__ import annotations
 import re
 
 import pytest
-from _dashboard_helpers import extract_function_body, strip_js_comments
+from _jsx_source_helpers import extract_function_body, strip_js_comments
 
 
 def _parameter_list(source: str, func_name: str) -> str:
@@ -50,7 +50,7 @@ def _parameter_list(source: str, func_name: str) -> str:
     rule ``extract_function_body`` follows).
 
     Same paren-depth walk as test_charts_axis_labels.py's ``_extract_signature``.
-    Its proper home is ``_dashboard_helpers`` beside ``extract_function_body``/
+    Its proper home is ``_jsx_source_helpers`` beside ``extract_function_body``/
     ``strip_js_comments``, and hoisting it there is tracked by ticket
     tkt_0RSN5VVGAVK7BQ8K9GX4PM2YBZ (see test_esc_flow_diagram.py's header note
     on this helper family); task 4137 holds a lock on neither file, so it fixes

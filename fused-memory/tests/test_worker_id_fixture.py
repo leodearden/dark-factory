@@ -23,7 +23,11 @@ import types
 from pathlib import Path
 from typing import Any
 
+import pytest
 from _fm_helpers import resolve_xdist_worker_id
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _FUSED_MEMORY_DIR = Path(__file__).resolve().parents[1]
 _CONTRACT_NODE_ID = 'tests/test_worker_id_fixture.py::test_worker_id_matches_xdist_semantics'

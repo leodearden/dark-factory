@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Refuse a commit that RAISES the merge-lane ratchet baseline without recording it.
 
-``scripts/merge_lane_metrics.py``'s write gate is the enforcement point for a
+``scripts/merge_lane_ratchet.py``'s write gate is the enforcement point for a
 *regeneration*: it refuses to absorb a raise into a baseline it can read first.
 What it cannot see is the baseline deleted before the write, or rendered at a
 scratch path and copied over -- with nothing at the destination to compare
@@ -23,17 +23,17 @@ with `git commit`, with MERGE_HEAD set; only a clean merge skips it. Read
 against HEAD alone, every measure MERGE_HEAD moved is a "raise" -- 18 of them
 refused esc-3620-11's resolver, all main's own. So a merge's artifacts are
 audited against BOTH parents: each measure is held to the 3-way bound defined
-by merge_lane_metrics.py::compare_merged_baseline_files, and only the ledger
+by scripts/merge_lane_ratchet.py::compare_merged_baseline_files, and only the ledger
 entry files the merge itself adds cover anything above that bound. The restore
 carve-out is a single-parent rule and is not consulted.
 
 THE LEDGER IS A DIRECTORY, one file per authorization
-(``metrics.LEDGER_DIR_RELPATH``), so append-only is a comparison of file
+(``ratchet.LEDGER_DIR_RELPATH``), so append-only is a comparison of file
 listings: every entry file a parent holds must be staged with the same blob,
 and a commit's own entries are the files no parent holds. The retired
-single-array file (``metrics.LEGACY_LEDGER_RELPATH``) appears here for one
+single-array file (``ratchet.LEGACY_LEDGER_RELPATH``) appears here for one
 reason: the commit that splits it into files is held to
-``metrics.retire_legacy_ledger``'s set-equal rule, and nothing may stage it
+``ratchet.retire_legacy_ledger``'s set-equal rule, and nothing may stage it
 back once a parent has dropped it.
 
 AN ENTRY IS ATTRIBUTED, NOT MERELY NAMED (Leo, 2026-10-21, task 7298). A NEW
@@ -47,7 +47,7 @@ carrier landing another task's work, whose commits cite the carried id. Its
 ``task_id`` covered a raise whenever its measures matched. The task store is
 deliberately not consulted: a git hook does not depend on ``tasks.db``.
 
-WHY THIS IS A SEPARATE FILE from the instrument it calls. ``merge_lane_metrics``
+WHY THIS IS A SEPARATE FILE from the instrument it calls. ``merge_lane_ratchet``
 deliberately has no git dependency -- ``repo_root()`` derives from ``__file__``,
 and ``write_baseline``'s docstring declines to consult git HEAD in as many
 words. Every comparison lives there; reading the artifacts out of git at a
@@ -78,7 +78,7 @@ import tempfile
 from pathlib import Path
 
 try:
-    import merge_lane_metrics as metrics  # type: ignore[import-not-found]
+    import merge_lane_ratchet as ratchet
     import ratchet_revisions as revisions
     import source_measures  # type: ignore[import-not-found]
 except ImportError as exc:  # pragma: no cover - exercised by the hook, not pytest
@@ -141,17 +141,17 @@ def _index_changes(root: Path, diff_filter: str, *commit: str) -> set[str]:
 
 
 def _refuse_unrecorded(
-    raises: list[metrics.Violation], appended: list[dict]
+    raises: list[ratchet.Violation], appended: list[dict]
 ) -> list[str]:
     """The refusal lines for every raise this commit's own ledger entries do not cover."""
-    unrecorded = metrics.unrecorded_raises(raises, appended)
+    unrecorded = ratchet.unrecorded_raises(raises, appended)
     if not unrecorded:
         return []
     return [
-        f'{metrics.BASELINE_RELPATH} RAISES {len(unrecorded)} measure(s) that '
+        f'{ratchet.BASELINE_RELPATH} RAISES {len(unrecorded)} measure(s) that '
         'this commit does not record:',
         *(f'  {violation.message}' for violation in unrecorded),
-        metrics.RAISE_REMEDY,
+        ratchet.RAISE_REMEDY,
     ]
 
 
@@ -188,7 +188,7 @@ def _refuse_unattributed(own_entries: list[dict], task_ids: set[str]) -> list[st
     lines = []
     for entry in own_entries:
         task_id, reason = entry.get('task_id'), entry.get('reason')
-        name = metrics.entry_filename(entry)
+        name = ratchet.entry_filename(entry)
         if not isinstance(reason, str) or not reason.strip():
             lines.append(f'  {name} records no reason')
         if not isinstance(task_id, str) or task_id.strip() not in task_ids:
@@ -196,7 +196,7 @@ def _refuse_unattributed(own_entries: list[dict], task_ids: set[str]) -> list[st
     if not lines:
         return []
     return [
-        f'ratchet commit gate: {len(lines)} new {metrics.LEDGER_DIR_RELPATH} '
+        f'ratchet commit gate: {len(lines)} new {ratchet.LEDGER_DIR_RELPATH} '
         'entr(ies) are not attributed to a task this branch works on:',
         *lines,
         "An entry's task_id must be this branch's own task (task/<id>, "
@@ -213,7 +213,7 @@ def _audit_baseline(
     root: Path, scratch: Path, appended: list[dict]
 ) -> list[str]:
     """Audit the staged baseline against HEAD's. Empty list means clean."""
-    baseline = metrics.BASELINE_RELPATH
+    baseline = ratchet.BASELINE_RELPATH
     head_oid = revisions.object_id(root, f'HEAD:{baseline}')
     if head_oid is None:
         return _first_write('HEAD')
@@ -222,7 +222,7 @@ def _audit_baseline(
     if staged_oid is None:
         return []
 
-    raises = metrics.compare_baseline_files(
+    raises = ratchet.compare_baseline_files(
         revisions.write_blob(root, head_oid, scratch / 'previous.json'),
         revisions.write_blob(root, staged_oid, scratch / 'current.json'),
     )
@@ -257,7 +257,7 @@ def _audit_merged_baseline(
     parent's history, and in a merge HEAD's previous value is exactly the stale
     image that discards HEAD's own last move.
     """
-    baseline = metrics.BASELINE_RELPATH
+    baseline = ratchet.BASELINE_RELPATH
     ours_oid = revisions.object_id(root, f'HEAD:{baseline}')
     theirs_oid = revisions.object_id(root, f'{merge_head}:{baseline}')
     if ours_oid is None and theirs_oid is None:
@@ -278,7 +278,7 @@ def _audit_merged_baseline(
     def image(oid: str | None, name: str) -> Path | None:
         return None if oid is None else revisions.write_blob(root, oid, scratch / name)
 
-    raises = metrics.compare_merged_baseline_files(
+    raises = ratchet.compare_merged_baseline_files(
         base=image(base_oid, 'base.json'),
         ours=image(ours_oid, 'ours.json'),
         theirs=image(theirs_oid, 'theirs.json'),
@@ -292,7 +292,7 @@ def _audit_merged_baseline(
         'FINISHING A MERGE: a value above that bound is this merge\'s own raise '
         '-- and --write-baseline records nothing over a file that already holds '
         'it. Run `git checkout '
-        f'HEAD -- {metrics.BASELINE_RELPATH}` (ours; `--ours` is a no-op once the '
+        f'HEAD -- {ratchet.BASELINE_RELPATH}` (ours; `--ours` is a no-op once the '
         'ratchet-baseline driver resolved the file), then the --write-baseline --authorize-raise '
         "command above: it measures from ours and records the merge's own entry.",
     ]
@@ -305,7 +305,7 @@ def _first_write(absent_from: str) -> list[str]:
     already-documented limit, announced rather than passed over.
     """
     print(
-        f'ratchet commit gate: {metrics.BASELINE_RELPATH} is absent from '
+        f'ratchet commit gate: {ratchet.BASELINE_RELPATH} is absent from '
         f'{absent_from}, so this is a first write with nothing to compare against.'
     )
     return []
@@ -327,12 +327,12 @@ def _audit(root: Path) -> int:
         # ordinary commit is never ambushed, and never pays for archaeology.
         return 0
 
-    if metrics.BASELINE_RELPATH in _staged(root, 'D', merge_head):
+    if ratchet.BASELINE_RELPATH in _staged(root, 'D', merge_head):
         # The first half of "delete the destination first", closed before any
         # comparison is attempted. Deleting the baseline is never legitimate:
         # the freshness gate fails hard without it.
         return _refuse([
-            f'ratchet commit gate: {metrics.BASELINE_RELPATH} may not be '
+            f'ratchet commit gate: {ratchet.BASELINE_RELPATH} may not be '
             'DELETED. With nothing to compare against, every frozen measure '
             'resets and every ceiling is re-grandfathered, unrefused and '
             'unrecorded.'
@@ -347,7 +347,7 @@ def _audit(root: Path) -> int:
         parents = ['HEAD'] if merge_head is None else ['HEAD', merge_head]
         try:
             own_entries = revisions.own_entries(root, parents)
-        except metrics.AppendOnlyViolation as exc:
+        except ratchet.AppendOnlyViolation as exc:
             # A VERDICT, so the POLICY rung -- never the instrument-failure one
             # its ``MetricsError`` siblings take at ``main``. It returns here
             # rather than joining the baseline arm's lines because nothing else
@@ -357,7 +357,7 @@ def _audit(root: Path) -> int:
             unattributed = _refuse_unattributed(own_entries, _branch_task_ids(root))
             if unattributed:
                 return _refuse(unattributed)
-        if metrics.BASELINE_RELPATH not in staged:
+        if ratchet.BASELINE_RELPATH not in staged:
             return 0
         refusals = (
             _audit_baseline(root, scratch, own_entries)
@@ -376,7 +376,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         '--root',
-        default=str(metrics.repo_root()),
+        default=str(ratchet.repo_root()),
         help='repository root whose staged diff is audited (default: this checkout)',
     )
     return parser

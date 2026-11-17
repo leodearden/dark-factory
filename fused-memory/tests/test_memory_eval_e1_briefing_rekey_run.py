@@ -31,8 +31,11 @@ from shared.memory_eval_metrics import (
     parse_metric_series,
     serialize_metric_series,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.eval import retrieval_probe, topic_registry
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = Path(__file__).parents[2]
 RUN_ROOT = REPO_ROOT / 'plans' / 'memory-eval-e1-briefing-rekey-run'

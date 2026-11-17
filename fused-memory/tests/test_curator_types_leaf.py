@@ -20,7 +20,11 @@ import pathlib
 import subprocess
 import sys
 
+import pytest
 from _ast_guard import imported_names_from, parse_python_module
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SRC_ROOT = pathlib.Path(__file__).parents[1] / 'src' / 'fused_memory'
 MIDDLEWARE = SRC_ROOT / 'middleware'

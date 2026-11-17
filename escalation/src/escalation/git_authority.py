@@ -119,9 +119,10 @@ def found_on_main_response(request_id: str | None, merge_sha: str) -> dict[str, 
       merge-commit SHA found on main via ``git log``.
     - **Patch-id path** (a live branch that is NOT an ancestor of main,
       every commit patch-equivalent on main — the worker-rebased landing):
-      ``branch_work_landed``'s ``evidence_sha``, the task's most recent
-      subject-citing commit on main, else the branch tip's patch-id twin
-      on main.
+      ``branch_work_landed``'s ``evidence_sha``, the most recent commit on
+      main whose subject cites the task by the project's
+      ``git.commit_citation_pattern`` (none on a ``''`` opt-out), else the
+      branch tip's patch-id twin on main.
 
     The first two are effect-present-checked against current main HEAD
     before being returned.  The patch-id path is NOT, by
@@ -130,11 +131,9 @@ def found_on_main_response(request_id: str | None, merge_sha: str) -> dict[str, 
     it.  So ``merge_sha`` is safe to record as provenance as-is on every
     path — EXCEPT in the two cases below, which
     :attr:`GitAuthorityVerdict.merge_sha_fully_guarded` answers as one
-    question, and the two patch-id residuals after them, which it does NOT
-    answer.  Neither exception applies to the patch-id path, but for
-    different reasons: it never consults the delivered checks, and it
-    ignores the project's citation configuration altogether, which is
-    residual (a) rather than a strength.  (Before task 3103 the
+    question.  Neither exception applies to the patch-id path: it never
+    consults the delivered checks, and on a ``''`` opt-out its sha is still
+    a commit on main carrying the tip's diff.  (Before task 3103 the
     live-branch path returned the *branch tip*, which for a ``--no-ff``
     merge is a distinct commit that is not
     on main's first-parent chain — callers were told to prefer the
@@ -162,7 +161,8 @@ def found_on_main_response(request_id: str | None, merge_sha: str) -> dict[str, 
     commit ON MAIN here (this exception does NOT reach the where-the-sha-
     came-from paragraphs above), but the EFFECT-PRESENT guarantee is gone:
     ``validate_landing_evidence``'s second accept path
-    (``orchestrator/src/orchestrator/landing_evidence.py``, both modes)
+    (``orchestrator/src/orchestrator/merge_lane/landing_evidence.py::validate_landing_evidence``,
+    both modes)
     sits INSIDE the ``commit_effect_present_in_main(...) is False`` branch
     and accepts anyway when the three-leg delivered-checks differential
     confirms.  So ``merge_sha`` may name a landing that was later REVERTED
@@ -177,29 +177,6 @@ def found_on_main_response(request_id: str | None, merge_sha: str) -> dict[str, 
     covers both exceptions — or from
     :attr:`GitAuthorityVerdict.rescued_by_delivered_checks` for this one
     specifically, rather than by inspecting task metadata or config.
-
-    **Patch-id residuals: known gaps, not guarantees.**  Both live in the
-    producer, ``branch_work_landed``, and are follow-up ticket
-    ``tkt_0RWW0SXKJP4TV6YV4GZ235YX8Q``.  ``merge_sha_fully_guarded`` is True
-    on both, so a caller cannot detect either from the verdict.
-
-    (a) The producer never reads ``git.commit_citation_pattern``.  It
-    attributes by ``DEFAULT_COMMIT_CITATION_PATTERN``, whose bare
-    ``(#<id>)`` arm also matches GitHub-style ``Fix x (#123)`` squash
-    subjects.  On a project that opts out (``''``) or sets its own
-    pattern, an accept can name an unrelated commit that only matches the
-    default.  The ancestor arm honours the project's pattern, so the arms
-    apply different citation policies to one project.
-
-    (b) Containment is ``patch_content_contained``, which reads EMPTY
-    ``git cherry`` output as contained.  git cherry skips merge commits,
-    so a branch whose only commit is a ``--no-ff`` merge of main counts as
-    contained.  With a recorded ``branch_base_sha`` the empty-net-diff
-    guard measures base..tip, which holds main's changes, so it does not
-    fire.  The verdict is then ``landed_unconfirmed``, or ``found_on_main``
-    at any earlier citing commit on main: an over-report.  The shell
-    ladder's check (c) in ``skills/_shared/deriving-landed-sha.md``
-    refuses empty output for this reason.
     """
     return {
         'state': MergeState.done,
@@ -388,8 +365,7 @@ class GitAuthorityVerdict:
         A ``patch_id``-arm ``found_on_main`` is fully guarded: that path is
         checked by containment rather than effect survival, which is
         ``docs/prds/landed-not-done-recovery.md`` D1's contract and not a
-        weakening.  Its two residuals are NOT reflected here: see
-        :func:`found_on_main_response`.
+        weakening.
         """
         return (
             self.outcome is GitAuthorityOutcome.found_on_main
@@ -406,6 +382,7 @@ async def _evidence_verdict(
     fetch: TaskMetadataResult,
     *,
     branch_tip_sha: str | None,
+    checks_enabled: bool,
     candidate_sha: str | None = None,
     pattern_template: str | None = None,
 ) -> GitAuthorityVerdict:
@@ -449,6 +426,10 @@ async def _evidence_verdict(
     "``{}`` is not proof" invariant travels with the data, and so the
     unavailability flag reaches the verdict without a second parameter.
 
+    *checks_enabled* is the project's ``delivered_checks.enabled`` leaf, read
+    from :func:`probe_landing`'s ``orch_config``, because a real
+    ``GitOps.config`` is the ``git`` sub-config and cannot supply it.
+
     The runtime-only reverse import is repeated here rather than threaded in
     from :func:`probe_landing` — see the module docstring for why it must
     stay inside a function body.  Resolving it per call is also what lets
@@ -465,6 +446,7 @@ async def _evidence_verdict(
         candidate_sha=candidate_sha,
         pattern_template=pattern_template,
         delivered_checks=fetch.metadata.get('delivered_checks') or [],
+        checks_enabled=checks_enabled,
     )
     # Plain `str`, never LandingReason — see GitAuthorityVerdict.reason.
     reason = None if verdict.reason is None else str(verdict.reason)
@@ -510,6 +492,7 @@ async def _marker_arm(
     fetch: TaskMetadataResult,
     *,
     marker: str,
+    checks_enabled: bool,
 ) -> GitAuthorityVerdict:
     """Judge a merge marker found on main for a deleted branch ref.
 
@@ -531,7 +514,7 @@ async def _marker_arm(
         )
     return await _evidence_verdict(
         git_ops, tid, full_branch, GitAuthorityArm.marker, fetch,
-        branch_tip_sha=None, candidate_sha=marker,
+        branch_tip_sha=None, candidate_sha=marker, checks_enabled=checks_enabled,
     )
 
 
@@ -543,6 +526,7 @@ async def _ancestor_arm(
     *,
     branch_tip_sha: str,
     pattern: str | None,
+    checks_enabled: bool,
 ) -> GitAuthorityVerdict:
     """Judge a live branch whose tip is an ancestor of main but not main's tip.
 
@@ -579,6 +563,7 @@ async def _ancestor_arm(
     return await _evidence_verdict(
         git_ops, tid, full_branch, GitAuthorityArm.ancestor, fetch,
         branch_tip_sha=branch_tip_sha, pattern_template=pattern,
+        checks_enabled=checks_enabled,
     )
 
 
@@ -589,6 +574,7 @@ async def _patch_id_arm(
     fetch: TaskMetadataResult,
     *,
     branch_tip_sha: str,
+    pattern: str | None,
     site: str,
 ) -> GitAuthorityVerdict:
     """Decide the patch-id arm through ``branch_work_landed`` and render its verdict.
@@ -603,11 +589,13 @@ async def _patch_id_arm(
     table keyed by ``LandingReason`` would hoist the reverse import, which is
     runtime-only for the same reason as :func:`_evidence_verdict`'s.  No
     escalation queue is passed: ``None`` is the producer's documented
-    supported shape, and this tier is a read-only probe.
+    supported shape, and this tier is a read-only probe.  *pattern* is
+    forwarded so this arm and :func:`_ancestor_arm` apply one citation policy.
     """
     from orchestrator.merge_lane.landing_evidence import LandingReason, branch_work_landed
     verdict = await branch_work_landed(
         git_ops, tid, full_branch, branch_tip_sha=branch_tip_sha, metadata=fetch.metadata,
+        pattern_template=pattern,
     )
     reason = str(verdict.reason)
     if verdict.accepted and verdict.evidence_sha is not None:
@@ -690,6 +678,7 @@ async def probe_landing(
 
     try:
         git_config = orch_config.git
+        checks_enabled = orch_config.delivered_checks.enabled
         full_branch = canonical_queued_branch_name(key, git_config.branch_prefix)
         tip = await git_ops.resolve_branch_sha(full_branch)
         main_tip = await git_ops.resolve_branch_sha(git_config.main_branch)
@@ -702,7 +691,10 @@ async def probe_landing(
                 return _verdict(GitAuthorityOutcome.no_signal)
             fetch = await task_metadata(harness, tid, site=site)
             metadata_unavailable = fetch.unavailable
-            return await _marker_arm(git_ops, tid, full_branch, fetch, marker=marker)
+            return await _marker_arm(
+                git_ops, tid, full_branch, fetch,
+                marker=marker, checks_enabled=checks_enabled,
+            )
         if tip == main_tip:
             # A commit is its own ancestor, so a branch at exactly main's HEAD
             # passes is_ancestor while nothing has been merged.
@@ -714,9 +706,11 @@ async def probe_landing(
             return await _ancestor_arm(
                 git_ops, tid, full_branch, fetch,
                 branch_tip_sha=tip, pattern=git_config.commit_citation_pattern,
+                checks_enabled=checks_enabled,
             )
         return await _patch_id_arm(
-            git_ops, tid, full_branch, fetch, branch_tip_sha=tip, site=site,
+            git_ops, tid, full_branch, fetch, branch_tip_sha=tip,
+            pattern=git_config.commit_citation_pattern, site=site,
         )
     except Exception:
         logger.warning(

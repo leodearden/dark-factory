@@ -97,7 +97,7 @@ Derivation: ``DEFAULT_PER_CALL_TIMEOUT`` (2.0) * ``len(COLD_SESSION_POSTS)``
 (3) = 6.0 <= 7.0, leaving 1.0 s of slack so the bound is a real backstop for
 non-MCP overhead (JSON decode, row shaping, event-loop scheduling) rather
 than coinciding exactly with the sum of its parts. It deliberately equals
-``active_tasks._TASKS_PER_PROJECT_BUDGET`` because both fall out of the same
+``active_tasks.TASKS_PER_PROJECT_BUDGET`` because both fall out of the same
 arithmetic — the two are not coupled in code, so either may be tightened
 independently.
 
@@ -113,7 +113,7 @@ nevertheless operator-configurable (a comma-separated env var), and for that
 case this budget deliberately CAPS the fan-out rather than accommodating it.
 Capping exactly this residual is why the caller-side ``wait_for`` layer
 exists: the two layers are complementary, not redundant — the same
-disclosure ``active_tasks._TASKS_PER_PROJECT_BUDGET`` carries for its own
+disclosure ``active_tasks.TASKS_PER_PROJECT_BUDGET`` carries for its own
 budget. Without this note, ``6.0 <= 7.0`` reads as a total-worst-case
 guarantee it is not.
 """
@@ -231,7 +231,7 @@ seam that speaks it.
 
 SHAPED_ROW_FIELDS: tuple[str, ...] = (
     'id', 'title', 'status', 'priority', 'dependencies', 'updatedAt',
-    'claimant_run_id', 'heartbeat_at',
+    'claimant_run_id', 'heartbeat_at', 'created_at', 'created_at_source',
 )
 """The top-level wire keys :func:`_shape_task` reads besides ``metadata``.
 
@@ -259,6 +259,13 @@ def _shape_task(task: dict) -> dict | None:
     ``.get`` so a pre-migration row (or an older fused-memory that does not
     emit them) surfaces ``None`` rather than raising — the shaped dict always
     carries the keys, so consumers never have to guard for their absence.
+
+    ``created_at`` and ``created_at_source`` are carried through as the
+    task's FILING TIME and the proxy it was learned from (PRD α; vocabulary
+    ``shared/src/shared/task_created_at.py::CreatedAtSource``).  Both are
+    read with ``.get``: a store without the v6 columns omits them and an
+    un-backfilled row serves ``None``, so the shaped dict always carries the
+    keys.
 
     Mutation warning: ``task_snapshot``'s unit cache holds these dicts by
     reference and hands the same objects to every reader within its TTL, so
@@ -295,6 +302,8 @@ def _shape_task(task: dict) -> dict | None:
         'updated_at': task.get('updatedAt'),
         'claimant_run_id': task.get('claimant_run_id'),
         'heartbeat_at': task.get('heartbeat_at'),
+        'created_at': task.get('created_at'),
+        'created_at_source': task.get('created_at_source'),
     }
 
 

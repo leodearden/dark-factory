@@ -90,7 +90,7 @@ from orchestrator.verify_runner import HostLease
 
 # ── Module-level sentinel ─────────────────────────────────────────────────────
 
-_SENTINEL_VERIFY_TASK = object()  # noqa: PD901
+_SENTINEL_VERIFY_TASK = object()
 """Sentinel for verify_task in pure unit tests.
 
 frozen_prefix() checks ``e.verify_task is not None`` only, so any non-None

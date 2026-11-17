@@ -33,7 +33,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from cgl_eta_scheduler_gate import McpClient  # noqa: E402  (self-contained MCP/JSON-RPC client)
+from cgl_eta_scheduler_gate import McpClient  # (self-contained MCP/JSON-RPC client)
 
 REPO = '/home/leo/src/dark-factory'
 FUSED_URL = os.environ.get('CGL_FUSED_URL', 'http://127.0.0.1:8002')

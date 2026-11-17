@@ -12,6 +12,9 @@ from pathlib import Path
 import pytest
 from check_fused_memory_unit_parity import compose_up_bypasses_aof_gate
 from falkordb_aof_gate import CommandResult, main
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 COMPOSE = "/repo/fused-memory/docker/docker-compose.yml"
 CONTAINER = "dad0940ab28a"

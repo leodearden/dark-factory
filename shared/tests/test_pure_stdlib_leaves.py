@@ -37,7 +37,7 @@ DESIGN.
 
 References:
   - shared/tests/test_verify_admission.py:188 (``python -c`` child pattern)
-  - shared/tests/silent_fallthrough_scan.py (stdlib AST scanner + contract)
+  - tests/repo_guards/silent_fallthrough_scan.py (stdlib AST scanner + contract)
 """
 
 from __future__ import annotations
@@ -61,9 +61,11 @@ _SRC = Path(__file__).resolve().parent.parent / 'src'
 PURE_STDLIB_LEAVES = (
     'agent_result',
     'asyncio_tasks',
+    'backends',
     'branch_names',
     'cli_boundary',
     'config_dir',
+    'escalation_layout',
     'eval_lane',
     'git_async',
     'governed_exceptions',
@@ -72,6 +74,7 @@ PURE_STDLIB_LEAVES = (
     'mcp_idempotency',
     'merge_subject',
     'neutral_cwd',
+    'pidfd',
     'plan_deviation',
     'proc_group',
     'proc_liveness',
@@ -98,21 +101,26 @@ PURE_STDLIB_LEAVES = (
     'session_liveness',
     'streak',
     'task_claimant',
+    'task_created_at',
+    'task_fields',
     'task_metadata_wire',
     'task_statuses',
     'task_store_schema',
     'task_text_fingerprint',
+    'task_timestamp',
     'task_transitions',
     'tasks_db_readonly',
     'testing_fake_claude',
     'testing_mcp_stub',
     'testing_reify_layout',
+    'testing_repo_wide_tests',
     'testing_streams',
     'testing_timeout_markers',
     'testing_virtual_clock',
     'timestamps',
     'transcript_archive',
     'verify_admission',
+    'whole_tree_guard_family',
 )
 
 # Child program: snapshot sys.modules, import argv[1], report the top-level

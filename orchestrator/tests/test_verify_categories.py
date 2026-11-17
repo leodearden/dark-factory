@@ -485,8 +485,8 @@ class TestClassifierByteIdentityGolden:
     def test_classify_failure_returns_legacy_str_with_byte_identical_json(
         self, rc, output, timed_out, expected,
     ):
-        from orchestrator.verify_classify import classify_failure  # noqa: PLC0415
-        from orchestrator.verify_cmd import ToolKind  # noqa: PLC0415
+        from orchestrator.verify_classify import classify_failure
+        from orchestrator.verify_cmd import ToolKind
 
         category = classify_failure(ToolKind.OPAQUE, rc, output, timed_out)
         assert category == expected

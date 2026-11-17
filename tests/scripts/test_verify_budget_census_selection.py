@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from verify_budget_census_fixture import (
     FULL_SUITE,
     STAMP_US,
@@ -18,6 +19,8 @@ from verify_budget_census_fixture import (
     write_corpus,
     write_worktree_record,
 )
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 
 class TestTheSelectorReadsTheCommandsArray:
@@ -38,7 +41,7 @@ class TestTheSelectorReadsTheCommandsArray:
     """
 
     def test_the_test_legs_duration_is_reported_not_the_top_levels(self, tmp_path):
-        from verify_budget_census import load_records, select_full_suite_legs  # noqa: PLC0415
+        from verify_budget_census import load_records, select_full_suite_legs
 
         write_corpus(tmp_path, command_entry(duration_secs=3300.0))
 
@@ -50,7 +53,7 @@ class TestTheSelectorReadsTheCommandsArray:
 
     def test_a_loud_top_level_does_not_mask_a_green_test_leg(self, tmp_path):
         """The top level says rc=-9; the selected leg says rc=0. Both are true."""
-        from verify_budget_census import load_records, select_full_suite_legs  # noqa: PLC0415
+        from verify_budget_census import load_records, select_full_suite_legs
 
         write_corpus(tmp_path, command_entry(rc=0))
 
@@ -65,7 +68,7 @@ class TestTheFullSuiteShapeFilter:
     """Selection is by label AND by command SHAPE, each rejection counted."""
 
     def _select(self, tmp_path, *commands):
-        from verify_budget_census import load_records, select_full_suite_legs  # noqa: PLC0415
+        from verify_budget_census import load_records, select_full_suite_legs
 
         write_corpus(tmp_path, *commands)
         return select_full_suite_legs(
@@ -153,7 +156,7 @@ class TestTheFullSuiteShapeFilter:
         shape this replaced — makes the entry identity read 1 + 3 == 3 and
         fails here.
         """
-        from verify_budget_census import load_records, select_full_suite_legs  # noqa: PLC0415
+        from verify_budget_census import load_records, select_full_suite_legs
 
         write_corpus(
             tmp_path,
@@ -177,7 +180,7 @@ class TestTheFullSuiteShapeFilter:
         assert selection.rejected_records == {'prefix_mismatch': 1}
 
     def test_another_modules_record_is_rejected_on_prefix(self, tmp_path):
-        from verify_budget_census import load_records, select_full_suite_legs  # noqa: PLC0415
+        from verify_budget_census import load_records, select_full_suite_legs
 
         write_corpus(tmp_path, command_entry())
         other = write_worktree_record(tmp_path, '4242', 'attempt-1.shared.summary.json')
@@ -192,7 +195,7 @@ class TestTheFullSuiteShapeFilter:
         assert selection.rejected_entries == {}
 
     def test_a_role_filter_excludes_other_lanes(self, tmp_path):
-        from verify_budget_census import load_records, select_full_suite_legs  # noqa: PLC0415
+        from verify_budget_census import load_records, select_full_suite_legs
 
         write_corpus(tmp_path, command_entry())
         merge = write_worktree_record(
@@ -222,7 +225,7 @@ class TestTheStampedRoleWinsOverThePath:
 
     @staticmethod
     def _only_record(root):
-        from verify_budget_census import load_records  # noqa: PLC0415
+        from verify_budget_census import load_records
 
         corpus = load_records([root])
         assert len(corpus.records) == 1, corpus
@@ -234,7 +237,7 @@ class TestTheStampedRoleWinsOverThePath:
         return path
 
     def test_an_archive_record_stamped_merge_is_a_merge_record(self, tmp_path):
-        from verify_budget_census import load_records, select_full_suite_legs  # noqa: PLC0415
+        from verify_budget_census import load_records, select_full_suite_legs
 
         self._write(
             write_archive_record(
@@ -277,7 +280,7 @@ class TestTheStampedRoleWinsOverThePath:
 
     @pytest.mark.parametrize('stamp', [7, None], ids=['int', 'null'])
     def test_a_malformed_stamp_falls_back_to_the_path(self, tmp_path, stamp):
-        from verify_budget_census import load_records, select_full_suite_legs  # noqa: PLC0415
+        from verify_budget_census import load_records, select_full_suite_legs
 
         self._write(
             write_worktree_record(tmp_path, '3353', 'attempt-1.orchestrator.summary.json'),
@@ -302,7 +305,7 @@ class TestTheExpectedCommandHasOneHome:
     """
 
     def test_the_command_comes_from_the_modules_own_yaml(self, tmp_path):
-        from verify_budget_census import read_module_test_command  # noqa: PLC0415
+        from verify_budget_census import read_module_test_command
 
         module_yaml = tmp_path / 'orchestrator' / 'orchestrator.yaml'
         module_yaml.parent.mkdir(parents=True)
@@ -336,12 +339,12 @@ class TestTheExpectedCommandHasOneHome:
         )
 
     def test_an_absent_module_yaml_is_reported_not_guessed(self, tmp_path):
-        from verify_budget_census import read_module_test_command  # noqa: PLC0415
+        from verify_budget_census import read_module_test_command
 
         assert read_module_test_command(tmp_path, 'nosuchmodule') is None
 
     def test_a_yaml_without_a_test_command_is_reported_not_guessed(self, tmp_path):
-        from verify_budget_census import read_module_test_command  # noqa: PLC0415
+        from verify_budget_census import read_module_test_command
 
         module_yaml = tmp_path / 'docs' / 'orchestrator.yaml'
         module_yaml.parent.mkdir(parents=True)
@@ -351,7 +354,7 @@ class TestTheExpectedCommandHasOneHome:
 
     def test_an_unparseable_yaml_is_reported_not_guessed(self, tmp_path):
         """Read-only and total: a broken config is a None, never a traceback."""
-        from verify_budget_census import read_module_test_command  # noqa: PLC0415
+        from verify_budget_census import read_module_test_command
 
         module_yaml = tmp_path / 'broken' / 'orchestrator.yaml'
         module_yaml.parent.mkdir(parents=True)
@@ -370,7 +373,7 @@ class TestATornOrMalformedRecordIsCountedNotFatal:
     """
 
     def test_a_torn_module_yaml_is_none_not_a_traceback(self, tmp_path):
-        from verify_budget_census import read_module_test_command  # noqa: PLC0415
+        from verify_budget_census import read_module_test_command
 
         module_yaml = tmp_path / 'orchestrator' / 'orchestrator.yaml'
         module_yaml.parent.mkdir(parents=True)
@@ -379,7 +382,7 @@ class TestATornOrMalformedRecordIsCountedNotFatal:
         assert read_module_test_command(tmp_path, 'orchestrator') is None
 
     def test_an_entry_without_rc_is_rejected_not_indexed(self, tmp_path):
-        from verify_budget_census import load_records, select_full_suite_legs  # noqa: PLC0415
+        from verify_budget_census import load_records, select_full_suite_legs
 
         entry = command_entry()
         del entry['rc']
@@ -399,7 +402,7 @@ class TestATornOrMalformedRecordIsCountedNotFatal:
         record — became evidence of a failing run in the very distribution a
         budget is derived from.
         """
-        from verify_budget_census import (  # noqa: PLC0415
+        from verify_budget_census import (
             load_records,
             select_full_suite_legs,
             summarise_legs,
@@ -416,7 +419,7 @@ class TestATornOrMalformedRecordIsCountedNotFatal:
 
     def test_a_bool_is_not_a_duration(self, tmp_path):
         """`bool` subclasses `int`, so `True` was admitted as a 1.0s suite."""
-        from verify_budget_census import load_records, select_full_suite_legs  # noqa: PLC0415
+        from verify_budget_census import load_records, select_full_suite_legs
 
         write_corpus(tmp_path, command_entry(duration_secs=True))
 

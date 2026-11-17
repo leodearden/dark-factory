@@ -12,13 +12,11 @@ from pathlib import Path
 
 import pytest
 from escalation.models import Escalation
-from orchestrator.session_registry import (
-    DecisionRecord,
-    SessionRecord,
-    Status,
-    normalize_escalations_dir,
-)
+from orchestrator.decision_registry import DecisionRecord, normalize_escalations_dir
+from orchestrator.session_registry import SessionRecord, Status
 from shared.project_id import fold_project_token
+from shared.task_statuses import TERMINAL
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from sitting import ledger as ledger_mod
 from sitting import preparation as prep_mod
 from sitting import prepare_sitting as mod
@@ -33,6 +31,8 @@ from sitting.inventory import (
 )
 from sitting.ownership import ProbeResult
 from sitting.preparation import Manual, Standing
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 NOW = '2026-09-26T09:00:00+00:00'
 LATER = '2026-09-26T10:00:00+00:00'
@@ -247,6 +247,7 @@ class TestBuckets:
         }
         assert standing['esc-200-1']['standing']['kind'] == 'owned'
         assert 'task 201' in standing['esc-200-1']['standing']['owner']
+        assert standing['esc-200-1']['standing']['release']['task_status_is']['statuses'] == sorted(TERMINAL)
         assert standing['esc-200-1']['release']['observed'] == 'pending'
         assert standing['esc-200-1']['release']['released'] is False
         assert standing['esc-700-1']['release'] is None

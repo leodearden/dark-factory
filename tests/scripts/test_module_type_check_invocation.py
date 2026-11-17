@@ -76,9 +76,12 @@ from collections.abc import Callable
 
 import pytest
 from orchestrator.config import ModuleConfig
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from verify_command_invariants import PYRIGHT, anchor_split
 
 from orchestrator import verify_cmd
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 
 def _npx_fronted_segments(cmd: str) -> list[str]:

@@ -908,6 +908,20 @@ def cascade_parent_id(resolved_by: object) -> str | None:
     return resolved_by.removeprefix(_L2_CASCADE_RESOLVER_PREFIX) or None
 
 
+EVAL_LANE_CONTAINMENT_RESOLVER = 'escalation-eval-lane-containment'
+PRE_SUBMIT_CHECK_RESOLVER = 'escalation-mcp-pre-submit-check'
+_FILING_RESOLVERS = frozenset({EVAL_LANE_CONTAINMENT_RESOLVER, PRE_SUBMIT_CHECK_RESOLVER})
+
+
+def closed_at_filing(escalation: Escalation) -> bool:
+    """Was *escalation* closed as it was filed — a note to file, or the server's eval-lane containment or terminal-task auto-close — so that no one ruled on it?"""
+    return (
+        escalation.note_to_file
+        or escalation.resolution_class == NOTE_TO_FILE_CLASS
+        or escalation.resolved_by in _FILING_RESOLVERS
+    )
+
+
 def recut_action_conflict(resolution_action: str | None, recut: bool) -> str | None:
     """Why *recut* cannot qualify *resolution_action*, else None."""
     if not recut or resolution_action == 'restart':

@@ -9,7 +9,7 @@ import os
 import re
 import shutil
 import stat
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
@@ -25,6 +25,7 @@ from orchestrator import file_mutex
 from orchestrator.config import TASK_META_DIRNAME
 from orchestrator.review_issue_contract import REVIEW_ISSUE_OFF_CONTRACT_FACT, check_issues
 from orchestrator.review_payload import NoteDisposition, Verdict, normalize_review
+from orchestrator.scope_drift import InvalidScopeRequest, ScopeDriftReport, ScopeRequest
 
 logger = logging.getLogger(__name__)
 
@@ -665,8 +666,12 @@ class ArtifactRoot(Enum):
     TASK = 'task'
 
 
-_REVIEW_ARCHIVE_FAMILY = 'reviews-<label>/'
-_ZERO_OUTPUT_EVIDENCE_FAMILY = 'zero_output_evidence-iter<n>.json'
+_REVIEW_ARCHIVE_PREFIX = 'reviews-'
+_REVIEW_ARCHIVE_FAMILY = f'{_REVIEW_ARCHIVE_PREFIX}<label>/'
+_RETIRED_LINEAGES_KEY = 'retired_lineages'
+_RETIRED_REVIEWS_DIR = 'retired-reviews'
+_ZERO_OUTPUT_EVIDENCE_NAME_TEMPLATE = 'zero_output_evidence-iter{}.json'
+_ZERO_OUTPUT_EVIDENCE_FAMILY = _ZERO_OUTPUT_EVIDENCE_NAME_TEMPLATE.format('<n>')
 
 ARTIFACT_ROOTS: Mapping[str, ArtifactRoot] = MappingProxyType({
     'metadata.json': ArtifactRoot.LANE,
@@ -677,6 +682,8 @@ ARTIFACT_ROOTS: Mapping[str, ArtifactRoot] = MappingProxyType({
     'ready_to_merge.json': ArtifactRoot.LANE,
     'false_premise.json': ArtifactRoot.LANE,
     'unactionable_task.json': ArtifactRoot.LANE,
+    'scope_requests.json': ArtifactRoot.LANE,
+    'scope_drift_brief.json': ArtifactRoot.TASK,
     'plan.json': ArtifactRoot.TASK,
     'plan.lock': ArtifactRoot.TASK,
     'iterations.jsonl': ArtifactRoot.TASK,
@@ -685,6 +692,7 @@ ARTIFACT_ROOTS: Mapping[str, ArtifactRoot] = MappingProxyType({
     'review_state.json': ArtifactRoot.TASK,
     'reconcile_state.json': ArtifactRoot.TASK,
     _REVIEW_ARCHIVE_FAMILY: ArtifactRoot.TASK,
+    _RETIRED_REVIEWS_DIR: ArtifactRoot.TASK,
     _ZERO_OUTPUT_EVIDENCE_FAMILY: ArtifactRoot.TASK,
 })
 """The single routing table: artifact name (or family key) -> owning root.
@@ -718,13 +726,13 @@ class ReviewAggregation:
 
     def format_for_replan(self) -> str:
         """Blocking issues only — the architect's input (TaskWorkflow._replan)."""
-        return _format_issue_section('# Review Feedback — Blocking Issues\n', self.blocking_issues)
+        return format_issue_section('# Review Feedback — Blocking Issues\n', self.blocking_issues)
 
     def format_for_escalation(self) -> str:
         """Blocking issues then suggestions — the steward's review_issues detail (TaskWorkflow._escalate_review_issues)."""
         text = self.format_for_replan()
         if self.suggestions:
-            text += '\n' + _format_issue_section('# Review Feedback — Suggestions\n', self.suggestions)
+            text += '\n' + format_issue_section('# Review Feedback — Suggestions\n', self.suggestions)
         return text
 
 
@@ -742,7 +750,9 @@ def _warn_off_contract_issues(reviewer_name: str, issues: tuple[dict, ...]) -> N
         )
 
 
-def _format_issue_section(heading: str, issues: list[dict]) -> str:
+def format_issue_section(heading: str, issues: Iterable[Mapping[str, Any]], *, issue_level: int = 2) -> str:
+    """*heading*, then each review issue under a level-*issue_level* heading: reviewer, category, location, issue and suggested fix."""
+    issue_heading = '#' * issue_level
     lines = [heading]
     for issue in issues:
         reviewer = issue.get('reviewer', 'unknown')
@@ -750,7 +760,7 @@ def _format_issue_section(heading: str, issues: list[dict]) -> str:
         category = issue.get('category', '')
         description = issue.get('description', '')
         fix = issue.get('suggested_fix', '')
-        lines.append(f'## [{reviewer}] {category}')
+        lines.append(f'{issue_heading} [{reviewer}] {category}')
         if location:
             lines.append(f'**Location:** {location}')
         lines.append(f'**Issue:** {description}')
@@ -833,10 +843,25 @@ class TaskArtifacts:
 
     def review_archive_dir(self, label: str) -> Path:
         """The archive of one review round, e.g. ``label='amend-1'``."""
-        return self.review_archives_root / f'reviews-{label}'
+        return self.review_archives_root / f'{_REVIEW_ARCHIVE_PREFIX}{label}'
+
+    def review_archive_dirs(self) -> tuple[Path, ...]:
+        """Every ``reviews-<label>`` archive directly under ``review_archives_root``, sorted."""
+        root = self.review_archives_root
+        if not root.is_dir():
+            return ()
+        return tuple(sorted(p for p in root.glob(f'{_REVIEW_ARCHIVE_PREFIX}*') if p.is_dir()))
+
+    def retired_review_dir(self, parking_name: str) -> Path:
+        """Where the round archives of the lineage parked as *parking_name* were retired to."""
+        return self._root_for(_RETIRED_REVIEWS_DIR) / _RETIRED_REVIEWS_DIR / parking_name
 
     def zero_output_evidence_path(self, iteration: int) -> Path:
-        return self._root_for(_ZERO_OUTPUT_EVIDENCE_FAMILY) / f'zero_output_evidence-iter{iteration}.json'
+        return self._root_for(_ZERO_OUTPUT_EVIDENCE_FAMILY) / _ZERO_OUTPUT_EVIDENCE_NAME_TEMPLATE.format(iteration)
+
+    def zero_output_evidence_glob(self) -> str:
+        """Every iteration's ``zero_output_evidence_path``, as one glob, for operator-facing text."""
+        return str(self._root_for(_ZERO_OUTPUT_EVIDENCE_FAMILY) / _ZERO_OUTPUT_EVIDENCE_NAME_TEMPLATE.format('*'))
 
     def read_title(self) -> str | None:
         """metadata.json's title, else plan.json's; None unless a non-blank str."""
@@ -979,15 +1004,25 @@ class TaskArtifacts:
         workflow in the orchestrator stalls. Keep critical sections short, and
         never hold one across a subprocess the plan does not depend on.
         """
-        lock_path = self._plan_mutex_path()
+        with self._artifact_mutex('plan.json'):
+            yield
+
+    @contextmanager
+    def _artifact_mutex(self, name: str) -> Iterator[None]:
+        """The cross-process lock for a read-modify-write of artifact *name*.
+
+        The policy :meth:`plan_mutex` documents, for any artifact: keyed on
+        the RESOLVED path, and no lock once the root is gone.
+        """
+        lock_path = self._artifact_mutex_path(name)
         if lock_path is None:
             yield
             return
         with file_mutex.exclusive(lock_path, timeout=PLAN_MUTEX_TIMEOUT_SECS):
             yield
 
-    def _plan_mutex_path(self) -> Path | None:
-        lock_path = Path(os.path.realpath(self.artifact_path('plan.json'))).with_name('plan.json.mutex')
+    def _artifact_mutex_path(self, name: str) -> Path | None:
+        lock_path = Path(os.path.realpath(self.artifact_path(name))).with_name(f'{name}.mutex')
         return lock_path if lock_path.parent.is_dir() else None
 
     def write_plan_model(self, plan: Plan, *, mutex_held: bool = False) -> Plan:
@@ -1002,7 +1037,7 @@ class TaskArtifacts:
         """
         written = _at_current_schema(plan)
         with nullcontext() if mutex_held else self.plan_mutex():
-            lock_path = self._plan_mutex_path()
+            lock_path = self._artifact_mutex_path('plan.json')
             if lock_path is not None and not file_mutex.held(lock_path):
                 raise PlanMutexNotHeld(
                     f'{self.artifact_path("plan.json")} reached its write without {lock_path} held: '
@@ -1076,6 +1111,76 @@ class TaskArtifacts:
         subsequent architect invocation does not see a stale report.
         """
         self._clear_path('blocking_dependency.json')
+
+    def write_scope_request(self, request: ScopeRequest) -> int:
+        """Record a writer agent's request to add an existing file to its scope.
+
+        One entry per path: a repeat replaces the earlier entry and moves to
+        the end. Returns how many requests are now pending. The plan-tools
+        server runs concurrent tool calls on threads, so the read-modify-write
+        holds its :meth:`_artifact_mutex`. The workflow applies and removes
+        them at each writer boundary
+        (``workflow.py::TaskWorkflow._apply_scope_requests``).
+        """
+        with self._artifact_mutex('scope_requests.json'):
+            kept = [r for r in self.read_scope_requests() if r.path != request.path]
+            entries = [r.to_mapping() for r in (*kept, request)]
+            self._write_json('scope_requests.json', {'requests': entries})
+            return len(entries)
+
+    def read_scope_requests(self) -> tuple[ScopeRequest, ...]:
+        """The recorded scope requests in write order; each invalid entry is dropped with a warning."""
+        data = self._read_json_object('scope_requests.json') or {}
+        entries = data.get('requests', [])
+        if not isinstance(entries, list):
+            logger.warning('Malformed scope_requests.json: requests is %r', entries)
+            return ()
+        requests: list[ScopeRequest] = []
+        for entry in entries:
+            try:
+                requests.append(ScopeRequest.from_mapping(entry))
+            except InvalidScopeRequest as exc:
+                logger.warning('Dropping scope request %r from scope_requests.json: %s', entry, exc)
+        return tuple(requests)
+
+    def clear_scope_requests(self, applied: Iterable[ScopeRequest]) -> None:
+        """Remove the *applied* requests, keeping any filed since they were read.
+
+        The artifact goes once nothing is left in it.
+        """
+        done = set(applied)
+        with self._artifact_mutex('scope_requests.json'):
+            remaining = [r for r in self.read_scope_requests() if r not in done]
+            if remaining:
+                self._write_json(
+                    'scope_requests.json', {'requests': [r.to_mapping() for r in remaining]},
+                )
+            else:
+                self._clear_path('scope_requests.json')
+
+    def read_scope_drift_brief(self) -> ScopeDriftReport | None:
+        """The scope-drift report no writer session has received yet, or None.
+
+        TASK-rooted, so a brief outlives the dispatch that recorded it: a
+        requeue or restart before the next writer session still briefs it.
+        Only the workflow writes it, and reads it once per dispatch
+        (``workflow.py::TaskWorkflow._hold_scope_drift_brief``). A malformed
+        file reads as None with a warning.
+        """
+        data = self._read_json_object('scope_drift_brief.json')
+        if data is None:
+            return None
+        try:
+            return ScopeDriftReport.from_event_data(data)
+        except ValueError as exc:
+            logger.warning('Ignoring malformed scope_drift_brief.json: %s', exc)
+            return None
+
+    def write_scope_drift_brief(self, report: ScopeDriftReport) -> None:
+        self._write_json('scope_drift_brief.json', report.event_data())
+
+    def clear_scope_drift_brief(self) -> None:
+        self._clear_path('scope_drift_brief.json')
 
     # ──────────────────────────────────────────────────────────────────
     # Architect task-rejection artifacts (paired with plan-tools MCP)
@@ -1327,10 +1432,14 @@ class TaskArtifacts:
         re-pend: on the next blocking review the seeded local is already at
         the cap, so the loop re-escalates WITHOUT attempting a replan.
 
-        Deliberately NOT auto-cleared on re-dispatch — the loop cannot tell
-        churn (must keep the counters) from a legitimate operator re-pend
-        (should reset them) without an out-of-band signal, so granting a
-        fresh allowance is an EXPLICIT operator action, never inferred.
+        Deliberately NOT auto-cleared on an ordinary re-dispatch — the loop
+        cannot tell churn (must keep the counters) from a legitimate operator
+        re-pend (should reset them) without an out-of-band signal, so granting
+        a fresh allowance is an EXPLICIT operator action, never inferred. The
+        one such signal is a branch-swapping quarantine, which ends the
+        reviewed branch's lineage:
+        ``orchestrator/src/orchestrator/review_lineage.py::retire_quarantined_lineages``
+        retires the counters through :meth:`record_retired_lineage`.
         When an operator resolves the review escalation and re-pends the
         task to make replan progress, call this hook (e.g. from the
         resume/re-pend path, or manually against the ``.task-meta/<name>/``
@@ -1343,6 +1452,27 @@ class TaskArtifacts:
         state['amendment_rounds_total'] = 0
         state['review_cycles_total'] = 0
         self._write_json('review_state.json', state)
+
+    def record_retired_lineage(self, record: Mapping[str, Any], *, zero_counters: bool) -> None:
+        """Append *record* to ``retired_lineages`` and, when *zero_counters*, zero both lifetime counters, in one write.
+
+        The verdict cache is preserved. A non-list ``retired_lineages`` is
+        replaced.
+        """
+        state = self.read_review_state()
+        if zero_counters:
+            state['amendment_rounds_total'] = 0
+            state['review_cycles_total'] = 0
+        existing = state.get(_RETIRED_LINEAGES_KEY)
+        state[_RETIRED_LINEAGES_KEY] = [*(existing if isinstance(existing, list) else []), dict(record)]
+        self._write_json('review_state.json', state)
+
+    def retired_review_records(self) -> tuple[dict, ...]:
+        """The ``retired_lineages`` entries that are dicts; () when absent or malformed."""
+        records = self.read_review_state().get(_RETIRED_LINEAGES_KEY)
+        if not isinstance(records, list):
+            return ()
+        return tuple(record for record in records if isinstance(record, dict))
 
     def _read_json_object(self, name: str) -> dict | None:
         """The single fail-safe read seam for the whole-file JSON-object

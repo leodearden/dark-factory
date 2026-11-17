@@ -1,17 +1,19 @@
-"""Scaffolding shared by the suites that drive ``census.run_census``.
+"""Scaffolding shared by the census test suites: fake model seams, and helpers
+over ``census_run.run_census``'s effects and outcomes.
 
 A plain module rather than a conftest fixture, the same convention as
 ``legibility_task_store_fake``: conftest appends this directory to
 ``sys.path``, so the test files import it by bare name.
 
-Nothing here imports the census module. A suite may load it as
-``legibility.census`` or by its bare name ``census``, and those are two
-module objects with two sets of classes, so each helper takes the caller's
-``CensusEffects`` instance or outcome class instead.
+Nothing here imports a census module. The outcome and effects classes come
+from ``legibility.census_run``; a bare ``import census_run`` would load a
+second module object with a second set of classes, so each helper takes the
+caller's ``CensusEffects`` instance or outcome class instead.
 """
 from __future__ import annotations
 
 import dataclasses
+import json
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeVar
@@ -74,3 +76,50 @@ def journaled(effects: Effects, journal: list[str], *, labels: Mapping[Path, str
         write_text=logged("write_text", lambda path, text: labels[Path(path)]),
         **{name: logged(name, constant(label)) for name, label in PERSISTING_SEAMS.items()},
     )
+
+
+def make_fake_invoke(response_fn=None, *, default="{}"):
+    """Fake ``invoke(prompt, model) -> str`` seam, the one-shot model call
+    behind mining, verifying and the headroom probe. Records every call as a
+    dict in ``.calls`` (prompt/model). When ``response_fn(prompt, model)`` is
+    given it decides the reply per call; otherwise every call returns
+    *default* verbatim."""
+    calls = []
+
+    def fake_invoke(prompt, model):
+        calls.append({"prompt": prompt, "model": model})
+        if response_fn is not None:
+            return response_fn(prompt, model)
+        return default
+
+    fake_invoke.calls = calls
+    return fake_invoke
+
+
+def cap_themed_verdict(marker, *, verified=True, remediation=None):
+    """A WELL-FORMED verdict whose ``reason`` quotes a cap-themed cluster.
+
+    This is ordinary healthy verifier output, not a banner: the model is
+    adjudicating a confusion cluster that happens to be ABOUT usage limits.
+    *remediation*, when given, is the verdict's in-tree remediation proposal.
+    """
+    verdict = {
+        "verified": verified,
+        "reason": (
+            "Confirmed against main: the watcher rotation was interrupted "
+            f"by a {marker}; the 'continue where you left off' resume "
+            "prompt appears at turns 17/27."
+        ),
+    }
+    if remediation is not None:
+        verdict["remediation"] = remediation
+    return json.dumps(verdict)
+
+
+_QUALITY_MARKER = "=== QUALITY DEFINITION ===\n"
+
+
+def quality_block_of(prompt):
+    """The quality definition *prompt* embeds, between its one marker and the next section."""
+    assert prompt.count(_QUALITY_MARKER) == 1
+    return prompt.split(_QUALITY_MARKER, 1)[1].split("\n=== ", 1)[0]

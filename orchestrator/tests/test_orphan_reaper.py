@@ -16,6 +16,7 @@ from _orch_helpers import wire_scheduler_liveness_mock
 
 from orchestrator.event_store import EventType
 from orchestrator.harness import Harness
+from orchestrator.quarantine_provenance import QuarantineOutcome
 from orchestrator.startup_steps import EntryFailures
 from orchestrator.warm_lane_pool import WarmLanePool
 
@@ -47,7 +48,7 @@ def harness(tmp_path: Path, mock_orch_config):
     h.git_ops.mark_pool_storage_present()
     # Mock the git-level helpers — their behaviour is covered in test_git_ops.
     h.git_ops.worktree_has_unsaved_work = AsyncMock(return_value=False)
-    h.git_ops.quarantine_worktree = AsyncMock(return_value=tmp_path / 'q-dest')
+    h.git_ops.quarantine_worktree = AsyncMock(return_value=QuarantineOutcome(dest=tmp_path / 'q-dest'))
     h.git_ops.cleanup_worktree = AsyncMock()
     h.git_ops.prune_worktrees = AsyncMock()
 
@@ -76,21 +77,26 @@ class TestOrphanReaper:
         harness.git_ops.quarantine_worktree.assert_not_called()  # type: ignore[attr-defined]
         assert EventType.worktree_reaped in _emitted_types(harness)
 
-    async def test_quarantines_orphans_with_work(self, harness: Harness):
+    async def test_quarantines_orphans_with_work(self, harness: Harness, tmp_path: Path):
         """Orphans the work-detector flags (commits OR dirty WIP) are quarantined."""
         wt_commits = _mk(harness.git_ops.worktree_base, '600')
         wt_dirty = _mk(harness.git_ops.worktree_base, '601')
         harness.git_ops.worktree_has_unsaved_work = AsyncMock(return_value=True)
+        outcome = QuarantineOutcome(
+            dest=tmp_path / 'q', branch='task/600-T', tip_sha='abc', unique_commit_count=3,
+        )
+        quarantine = AsyncMock(return_value=outcome)
+        harness.git_ops.quarantine_worktree = quarantine
+        events = MagicMock()
+        harness.event_store = events
 
         await harness._reap_orphan_worktrees()
 
-        quarantined = {
-            c.args[0]
-            for c in harness.git_ops.quarantine_worktree.call_args_list  # type: ignore[attr-defined]
-        }
-        assert quarantined == {wt_commits, wt_dirty}
+        assert {c.args[0] for c in quarantine.call_args_list} == {wt_commits, wt_dirty}
         harness.git_ops.cleanup_worktree.assert_not_called()  # type: ignore[attr-defined]
-        assert _emitted_types(harness).count(EventType.worktree_quarantined) == 2
+        emits = [c.kwargs for c in events.emit.call_args_list if c.args[0] == EventType.worktree_quarantined]
+        assert sorted(emit['task_id'] for emit in emits) == ['600', '601']
+        assert all(emit['data'] == outcome.event_data('orphan-reaper') for emit in emits)
 
     async def test_skips_reserved_names(self, harness: Harness):
         """``_merge-*`` and ``*-skip-attempt`` are reserved — never touched."""

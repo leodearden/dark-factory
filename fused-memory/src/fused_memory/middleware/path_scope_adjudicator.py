@@ -45,7 +45,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from shared.cli_invoke import (
     BUDGET_EXHAUSTED_SUBTYPE,
-    AgentResult,  # noqa: F401 (re-exported for tests)
+    AgentResult,  # (re-exported for tests)
     invoke_with_cap_retry,
     is_zero_output_timeout,
     no_mcp_servers_config,

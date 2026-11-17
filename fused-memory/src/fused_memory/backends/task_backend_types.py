@@ -127,10 +127,28 @@ class MetadataLookupResult(TypedDict):
     malformed_metadata_ids: list[int]
 
 
+class DependencyFact(TypedDict):
+    """One local dependency of a task; ``status`` is ``None`` when it names no task."""
+
+    id: str
+    status: str | None
+
+
+class TaskFactsRow(TypedDict):
+    """One task in ``get_task_facts``' reply; see plans/live-task-facts-at-recall-prd.md C1."""
+
+    status: str
+    title: str
+    dependencies: list[DependencyFact]
+    done_provenance_kind: str | None
+    done_provenance_commit: str | None
+
+
 __all__ = [
     'AddTaskResult',
     'AmendmentAdvisory',
     'DefectWriteResult',
+    'DependencyFact',
     'DependencyResult',
     'GetTasksResult',
     'MetadataLookupResult',
@@ -138,6 +156,7 @@ __all__ = [
     'RemoveTaskResult',
     'SetTaskStatusResult',
     'StatusWriteNotPersistedResult',
+    'TaskFactsRow',
     'UpdateTaskResult',
     'ValidateDependenciesResult',
 ]

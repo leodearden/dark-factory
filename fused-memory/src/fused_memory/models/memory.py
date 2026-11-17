@@ -1,8 +1,9 @@
 """Response and result models for the fused memory system."""
 
+from collections.abc import Sequence
 from enum import StrEnum
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from fused_memory.models.enums import (
     ClassificationFallback,
@@ -112,6 +113,9 @@ class AddMemoryResponse(BaseModel):
 
     memory_ids: list[str] = Field(default_factory=list)
     stores_written: list[SourceStore] = Field(default_factory=list)
+    # Stores whose leg is durably enqueued and lands asynchronously via the
+    # queue; disjoint from stores_written.
+    stores_queued: list[SourceStore] = Field(default_factory=list)
     # Stores whose leg hit a transient provider error and is durably queued for
     # server-side retry; disjoint from stores_written, ids assigned when it lands.
     stores_pending_retry: list[SourceStore] = Field(default_factory=list)
@@ -121,6 +125,23 @@ class AddMemoryResponse(BaseModel):
     # rather than a classification.
     classification_fallback: ClassificationFallback | None = None
 
+    @model_validator(mode='after')
+    def _each_store_has_one_outcome(self) -> 'AddMemoryResponse':
+        """A store is reported in at most one of the written / queued / pending-retry lists."""
+        outcome_lists = {
+            'stores_written': self.stores_written,
+            'stores_queued': self.stores_queued,
+            'stores_pending_retry': self.stores_pending_retry,
+        }
+        for store in SourceStore:
+            reported_in = [name for name, stores in outcome_lists.items() if store in stores]
+            if len(reported_in) > 1:
+                raise ValueError(
+                    f'store {store.value!r} is reported in more than one outcome list: '
+                    f'{", ".join(reported_in)}'
+                )
+        return self
+
     @property
     def mem0_write_state(self) -> Mem0WriteState:
         """The one reading of whether this write's Mem0 leg landed; every consumer of memory_ids routes through it."""
@@ -129,6 +150,50 @@ class AddMemoryResponse(BaseModel):
         if SourceStore.mem0 in self.stores_pending_retry:
             return Mem0WriteState.PENDING_RETRY
         return Mem0WriteState.NOT_LANDED
+
+
+def render_add_memory_message(
+    *,
+    stores_written: Sequence[SourceStore],
+    stores_queued: Sequence[SourceStore] = (),
+    stores_pending_retry: Sequence[SourceStore] = (),
+    graphiti_error: str | None = None,
+    mem0_error: str | None = None,
+    mem0_empty_result: str | None = None,
+    mem0_pending_retry: str | None = None,
+    classification_fallback: ClassificationFallback | None = None,
+) -> str:
+    """The one renderer of add_memory's ``message``; no code should parse its output.
+
+    Each failed store's error text is carried verbatim until task 9839 moves
+    its source to ``AddMemoryResponse.store_errors``.
+    """
+    outcomes = [
+        (label, stores)
+        for label, stores in (
+            ('written to', stores_written),
+            ('queued for', stores_queued),
+            ('pending retry for', stores_pending_retry),
+        )
+        if stores
+    ]
+    if outcomes:
+        msg = 'Memory ' + '; '.join(
+            f'{label} {[s.value for s in stores]}' for label, stores in outcomes
+        )
+    else:
+        msg = 'Memory not written to any store'
+    if graphiti_error:
+        msg += f' [graphiti_error: {graphiti_error}]'
+    if mem0_error:
+        msg += f' [mem0_error: {mem0_error}]'
+    if mem0_empty_result:
+        msg += f' [{mem0_empty_result}]'
+    if mem0_pending_retry:
+        msg += f' [mem0_pending_retry: {mem0_pending_retry}]'
+    if classification_fallback is not None:
+        msg += f' [classification_fallback: {classification_fallback.value}]'
+    return msg
 
 
 class ReadRouteResult(BaseModel):

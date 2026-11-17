@@ -19,12 +19,15 @@ from mcp.server.fastmcp import FastMCP
 from mcp.shared.memory import create_connected_server_and_client_session
 from mcp.types import TextContent
 from shared.mcp_unknown_arguments import UNKNOWN_ARGUMENT_CODE
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.server.main import (
     _build_recon_report_components,
     _install_tool_dispatch_guards,
 )
 from fused_memory.server.tools import create_mcp_server
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _PROJECT_ROOT = '/project'
 

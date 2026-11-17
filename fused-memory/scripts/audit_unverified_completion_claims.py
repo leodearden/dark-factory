@@ -1002,7 +1002,7 @@ def _load_config(config_path: str | None = None) -> Any:
     (config/schema.py:2047) — so this script does not invent a second
     config-resolution path that could drift from the server's.
     """
-    from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+    from fused_memory.config.schema import FusedMemoryConfig
 
     if config_path:
         os.environ['CONFIG_PATH'] = str(config_path)
@@ -1257,7 +1257,7 @@ def _build_commit_probe(
     miss only when all of them answered. Delegating keeps the sweep and the
     write path on one definition of "this commit does not exist".
     """
-    from fused_memory.services.completion_claim_gate import (  # noqa: PLC0415
+    from fused_memory.services.completion_claim_gate import (
         make_registry_commit_probe,
     )
 
@@ -1275,7 +1275,7 @@ def _default_project_roots() -> dict[str, str]:
     claim against the wrong tree.
     """
     try:
-        from fused_memory.models.scope import (  # noqa: PLC0415
+        from fused_memory.models.scope import (
             build_known_projects_map,
         )
 

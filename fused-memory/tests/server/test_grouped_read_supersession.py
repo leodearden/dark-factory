@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from pydantic_core import to_jsonable_python
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.memory_metadata import SUPERSEDED_BY_METADATA_KEY
 from fused_memory.models.enums import MemoryCategory, SourceStore
@@ -29,6 +30,8 @@ from fused_memory.server.grouped_read import (
 )
 from fused_memory.server.tools import create_mcp_server
 from fused_memory.services.memory_service import SearchResults
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 PROJECT_ID = 'dark_factory'
 P = '11111111-1111-4111-8111-111111111111'

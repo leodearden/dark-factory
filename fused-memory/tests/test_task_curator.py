@@ -41,6 +41,7 @@ from shared.prompt_artifact import (
     compose_prompt,
 )
 from shared.task_statuses import TaskStatus
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.backends.task_backend_errors import TaskmasterError, TaskNotFoundError
 from fused_memory.config.schema import CuratorConfig, FusedMemoryConfig
@@ -82,6 +83,8 @@ from fused_memory.middleware.task_curator import (
     _trim_pool,
     flatten_task_tree,
 )
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 
 async def _prepare_and_curate(

@@ -96,6 +96,14 @@ class EventType(StrEnum):
     #   reviewer-leg disposition, which is made at no exit; ticket: the
     #   curator ticket id, or null; decided_at: ISO-8601 UTC.
     info_l0_dispositioned = 'info_l0_dispositioned'
+    # A briefing carried the task's escalation rulings (task 4764).  Producer:
+    # orchestrator/workflow.py::TaskWorkflow._record_rulings_briefed, once per
+    # build that found any and, for a review round, which reads the rulings
+    # once, once per reviewer briefed; the role column is the briefed role.
+    # data: {escalation_ids, since}
+    #   escalation_ids: the rulings listed, oldest first; since: the ISO-8601
+    #   plan-confirmation cutoff they were selected after, or null for every ruling.
+    escalation_rulings_briefed = 'escalation_rulings_briefed'
 
     # Waste detection
     waste_detected = 'waste_detected'
@@ -110,6 +118,13 @@ class EventType(StrEnum):
     # by evidencing the DURABLE write; persisted=False means the in-memory
     # narrowing applied but the metadata write failed (non-critical).
     set_to_plan = 'set_to_plan'
+    # A writer's scope moving past its declared files, one row per boundary
+    # that had something to apply; the row's phase is the workflow phase the
+    # boundary ran in.  Payload: {reason, boundary, role, iteration,
+    # requested, acquired, contested: {path: holder}}.  The reasons and the
+    # boundary kinds live in orchestrator/src/orchestrator/scope_drift.py
+    # (ScopeDriftReason, ScopeBoundary); task 4371 adds its own reason there.
+    scope_drift = 'scope_drift'
     # Declared-vs-landed at done, from
     # orchestrator/src/orchestrator/workflow.py::TaskWorkflow._stamp_landed_scope.
     # One row per done-time reconcile of a MEASURED merge diff.  data:
@@ -211,6 +226,10 @@ class EventType(StrEnum):
     # the verify ran on that host) and base_relation (what the merge was built
     # on); vocabulary in orchestrator/src/orchestrator/merge_verify_facts.py,
     # rationale in plans/merge-lane-policy-prd.md D10.
+    # PLUS chain_request_ids / chain_task_ids (task 9908): the requests the
+    # verify covers as built, dispatching one first; absent where unknown
+    # (trains, shadow and solo-attribution verifies). Built by
+    # orchestrator/src/orchestrator/merge_pool_facts.py::with_chain_members.
     merge_verify = 'merge_verify'
     # The merge lane cancelled a still-running merge verify (task 8523).
     # task_id-keyed, phase='merge'; emitted by
@@ -241,26 +260,18 @@ class EventType(StrEnum):
     # ReverifyGateDecision.event_data. A fire's verdict is the merge_verify row
     # with the same task_id and merge_sha.
     merge_reverify_gate = 'merge_reverify_gate'
-    # The branch's OWN pre-merge verify verdict, recorded by the orchestrator
-    # workflow VERIFY phase (branch-vs-its-merge-base) — distinct from
-    # merge_verify, which is the merge worker's POST-rebase verify (branch
-    # already merged onto CURRENT main).  task_id-keyed; the workflow's rows
-    # (TaskWorkflow._emit_workflow_verify, task 5651) carry {passed, tip_sha,
-    # base_sha, branch, site, duration_ms, slot_wait_secs, plan_hash,
-    # cache_mode, units}, site per verify_evidence.py::VerifySite and the
-    # last three per verify_evidence.py::verify_event_fields.  duration_ms is
-    # the verify run's own wall
-    # (VerifyResult.duration_secs), excluding the admission queueing that
-    # slot_wait_secs records.  Escalation-side vouch rows carry only
-    # {passed, base_sha, branch} until task 5409.  A 2752 checkpoint hit emits
+    # The branch's OWN verify verdict at its tip, before any merge onto main —
+    # distinct from merge_verify, the merge worker's verify of the branch
+    # merged onto CURRENT main.  task_id-keyed; data is defined by
+    # orchestrator/src/orchestrator/verify_evidence.py::workflow_verify_event_data,
+    # and VerifySite there names every emitting site and what each reader
+    # makes of its rows.  A 2752 checkpoint hit emits
     # phase_skipped(verify, reason='durable_verified_green') INSTEAD of this
-    # row.  Consumed by the merge-skew
-    # attribution classifier's I5 branch-green fact (merge_disposition.
-    # _branch_pre_merge_verify_green).  Task 2381 α adds this member + the
-    # reader; task 2383 β emits it at the workflow VERIFY-pass site.  Its
-    # ABSENCE is honest, not a bug: non-orchestrator paths (/merge-queue,
-    # /unblock, /do) submit branches without emitting it -> classifier
-    # degrades to INDETERMINATE by design.
+    # row.  A non-orchestrator path (/merge-queue, /unblock, /do) emits it only
+    # through merge_request(verified_green=True); without that vouch it is
+    # absent, honestly, and the I5 branch-green fact
+    # (orchestrator/src/orchestrator/merge_lane/disposition.py::
+    # _branch_pre_merge_verify_green) degrades to INDETERMINATE by design.
     workflow_verify = 'workflow_verify'
     # Client-feed θ (plans/client-feed-prd.md §4 decision 16). Producer:
     # orchestrator/src/orchestrator/workflow.py::TaskWorkflow._emit_review_completed; data:
@@ -317,8 +328,13 @@ class EventType(StrEnum):
     verify_env_divergence = 'verify_env_divergence'
     # data.queue_depth = depth-at-enqueue INCLUDING the newly-queued item
     # (CAS-retry: qsize()+len(urgent)+1; plain enqueue: qsize() after put)
+    # PLUS the merge-pool facts of task 9908, always present and null when
+    # unknown: orchestrator/src/orchestrator/merge_pool_facts.py::queued_request_fields.
     merge_queued = 'merge_queued'
     # data.queue_depth = remaining depth AFTER removal (excludes the dequeued item)
+    # PLUS the pick record of task 9908 (absent if recording failed): the
+    # picked request's id, lane, tier and pin and what still waited, from
+    # orchestrator/src/orchestrator/merge_pool_facts.py::PickRecords.
     merge_dequeued = 'merge_dequeued'
     merge_coalesced = 'merge_coalesced'
     # Periodic queue-depth heartbeat: emitted while items wait in the pipeline.
@@ -682,7 +698,8 @@ class EventType(StrEnum):
 
     # Scheduler fairness
     task_skipped = 'task_skipped'
-    # Producer: scheduler.py::Scheduler._update_age_anchors.  Payload
+    # Producer: scheduler.py::Scheduler._journal_age_resets, for each reset
+    # age_anchors.py::AgeAnchors.observe returns.  Payload
     # {anchor: int, pending_since: str}: the max_id the task's age now counts
     # from, and the stamp whose change signalled the reset.  Emitted once per
     # applied reset; restoring that anchor at a later process start emits
@@ -1380,6 +1397,7 @@ class EventStore:
         task_id: str | None = None,
         *,
         cross_run: bool = False,
+        fire_safe: bool = True,
     ) -> dict | None:
         """Return the most-recent merge_finalized row matching the given key.
 
@@ -1398,8 +1416,9 @@ class EventStore:
         events-table timestamp), run_id, is_current_run and
         absorbed_request_ids (None on rows written before that key existed).
 
-        Returns None on miss.  Errors are logged and return None (read path is
-        fire-safe).
+        Returns None on miss.  Fire-safe by default: an error is logged and
+        reads as a miss.  ``fire_safe=False`` re-raises it instead, so a caller
+        can tell a failed read from a miss.
         """
         if request_id is not None:
             key, value = MergeFinalizedKey.request_id, request_id
@@ -1410,18 +1429,23 @@ class EventStore:
         else:
             return None
         rows = self._select_merge_finalized(
-            'latest_merge_finalized', key, value, cross_run=cross_run, latest_only=True,
+            'latest_merge_finalized',
+            key,
+            value,
+            cross_run=cross_run,
+            latest_only=True,
+            fire_safe=fire_safe,
         )
         return rows[0] if rows else None
 
     def merge_finalized_superseded_by(
-        self, superseded_by: str, *, cross_run: bool = False,
+        self, superseded_by: str, *, cross_run: bool = False, fire_safe: bool = True,
     ) -> list[dict]:
         """Return the member rows a coalesce-* train id or a gen-(n+1) request id superseded.
 
         Oldest first, in latest_merge_finalized's projection and run scope
-        (plans/merge-status-durable-non-landed-prd.md D7).  Fire-safe: errors
-        are logged and return [].
+        (plans/merge-status-durable-non-landed-prd.md D7).  Same read-failure
+        policy as latest_merge_finalized; a fire-safe miss is [].
         """
         if not superseded_by:
             return []
@@ -1431,10 +1455,11 @@ class EventStore:
             superseded_by,
             cross_run=cross_run,
             latest_only=False,
+            fire_safe=fire_safe,
         )
 
     def merge_finalized_absorbing(
-        self, request_id: str, *, cross_run: bool = False,
+        self, request_id: str, *, cross_run: bool = False, fire_safe: bool = True,
     ) -> dict | None:
         """Return the newest primary row whose absorbed_request_ids lists *request_id*.
 
@@ -1443,7 +1468,8 @@ class EventStore:
         replacement for TerminalOutcomeRetention.record_alias
         (plans/merge-status-durable-non-landed-prd.md D6/D7).  Kept apart from
         latest_merge_finalized so a caller can tell an alias hit from a direct
-        one.  Whole-id match; same projection, run scope and fire-safe policy.
+        one.  Whole-id match; same projection, run scope and read-failure
+        policy as latest_merge_finalized.
         """
         if not request_id:
             return None
@@ -1453,6 +1479,7 @@ class EventStore:
             request_id,
             cross_run=cross_run,
             latest_only=True,
+            fire_safe=fire_safe,
         )
         return rows[0] if rows else None
 
@@ -1464,10 +1491,12 @@ class EventStore:
         *,
         cross_run: bool,
         latest_only: bool,
+        fire_safe: bool,
     ) -> list[dict]:
         """Every merge_finalized read: runs *key*'s statement in this run's scope and projects it.
 
-        *reader* names the public method in the fire-safe warning.
+        *reader* names the public method in the warning a fire-safe read logs
+        when it swallows an error; a strict read re-raises and logs nothing.
         """
         sql, params = key.select(
             value, run_id=None if cross_run else self.run_id, latest_only=latest_only,
@@ -1480,6 +1509,8 @@ class EventStore:
                 conn.close()
             return [self._merge_finalized_row(*row) for row in rows]
         except Exception:
+            if not fire_safe:
+                raise
             logger.warning('event_store.%s failed', reader, exc_info=True)
             return []
 

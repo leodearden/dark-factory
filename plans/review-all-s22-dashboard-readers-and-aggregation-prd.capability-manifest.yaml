@@ -1,0 +1,1086 @@
+prd: plans/review-all-s22-dashboard-readers-and-aggregation-prd.md
+schema_version: 1
+signal_leaves: ["ω", "π8"]
+tasks:
+  - label: "α"
+    task_id: 9766
+    title: "Move the run-event and merge-outcome vocabularies into shared"
+    note: "Contributes fk-c927adb040e9 (θ closes). C4. α → 9140 (7612 landed, 3b1f243a9b); lead edges 9152 → α and 9144 → α; the 22 amends ruled at the sitting (OQ-1)."
+    capabilities:
+      - name: "run-events-module"
+        binding: "capability→producer (α; C4) — shared/src/shared/run_events.py holds EventType"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["shared/src/shared/run_events.py"]
+          expect: present
+      - name: "event-type-defined-once"
+        binding: "anti-inversion (D2) — orchestrator/event_store.py imports EventType, defines none"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^class EventType\\("
+          paths: ["orchestrator/src/orchestrator/event_store.py"]
+          expect: absent
+      - name: "outcome-kind-defined-once"
+        binding: "anti-inversion (D2) — merge_lane/types.py imports OutcomeKind, defines none"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^class OutcomeKind\\("
+          paths: ["orchestrator/src/orchestrator/merge_lane/types.py"]
+          expect: absent
+      - name: "script-non-terminal-copy-gone"
+        binding: "anti-inversion — scripts/merge_lane_throughput.py imports NON_TERMINAL_OUTCOMES (task 7612 made its copy public; measured at 1b106418da)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^NON_TERMINAL_OUTCOMES = frozenset\\("
+          paths: ["scripts/merge_lane_throughput.py"]
+          expect: absent
+      - name: "authoring-doc-pointer"
+        binding: "capability→producer (α; D2) — docs/task-authoring.md names the shared vocabulary home"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "shared/src/shared/run_events\\.py"
+          paths: ["docs/task-authoring.md"]
+          expect: present
+      - name: "wave2-chain-position"
+        binding: "ruled at the sitting (OQ-1, Leo, 2026-11-12) — α's place on the event_store.py / merge_lane/types.py chains and the 22 amends, wired by the lead at decompose"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "a reviewer confirms 9152 and 9144 depend on α, α depends on 9140 and 7612, and the 22 open tasks expected to add an EventType or OutcomeKind member were amended to declare the shared file"
+  - label: "β"
+    task_id: 9800
+    title: "Shared runs.db read model: query values, three-state results, the shared read-only opener"
+    note: "R36 deliverable (no key). C5, D3, D4, D4b. β → α. Priority inversion with θ (high) recorded, not overridden. Lead edge 8661 → β (8460 landed before its edge, 5a1f289e91; ρ3 takes its reads)."
+    capabilities:
+      - name: "runs-read-query-module"
+        binding: "capability→producer (β; C5) — RunsQuery and the executors"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["shared/src/shared/runs_read/query.py"]
+          expect: present
+      - name: "unreadable-is-a-value"
+        binding: "capability→producer (β; D4) — Unreadable carries path, reason, error type"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^class Unreadable"
+          paths: ["shared/src/shared/runs_read/query.py"]
+          expect: present
+      - name: "executor-on-a-connection"
+        binding: "capability→producer (β; C5) — run_query runs a query on a caller's snapshot (lead ruling OQ-8)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^def run_query\\("
+          paths: ["shared/src/shared/runs_read/query.py"]
+          expect: present
+      - name: "read-only-uri-builder"
+        binding: "capability→producer (β; D4) — tasks_db_readonly builds the read-only URI once, for connect_ro, the async executor and task 8661"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^def read_only_uri\\("
+          paths: ["shared/src/shared/tasks_db_readonly.py"]
+          expect: present
+      - name: "counted-outcomes-home"
+        binding: "capability→producer (β; C5) — the counted-outcome reading lives in the read model"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^COUNTED_OUTCOMES"
+          paths: ["shared/src/shared/runs_read/task_results.py"]
+          expect: present
+      - name: "producer-contract-test"
+        binding: "INV-13 producer proof — orchestrator test writes through the real stores and runs every exported query"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["orchestrator/tests/test_runs_read_contract.py"]
+          expect: present
+      - name: "schema-floor-fixture"
+        binding: "capability→producer (β; D4b) — the fleet's oldest runs.db schema, run by the contract test"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["orchestrator/tests/fixtures/runs_db_schema_floor.sql"]
+          expect: present
+      - name: "runs-db-locator-substrate"
+        binding: "substrate — shared.project_layout.runs_db exists at 1b106418da (task 6710); not a producer check"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^def runs_db\\("
+          paths: ["shared/src/shared/project_layout.py"]
+          expect: present
+      - name: "workflow-outcomes-substrate"
+        binding: "substrate — shared.task_transitions.WORKFLOW_OUTCOMES exists at 1b106418da; not a producer check"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^WORKFLOW_OUTCOMES"
+          paths: ["shared/src/shared/task_transitions.py"]
+          expect: present
+      - name: "read-only-opener-substrate"
+        binding: "substrate — shared.tasks_db_readonly.connect_ro exists at 1b106418da and already opens runs.db for five readers; not a producer check"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^def connect_ro\\("
+          paths: ["shared/src/shared/tasks_db_readonly.py"]
+          expect: present
+  - label: "γ1"
+    task_id: 9791
+    title: "One fan-out failure classification; memory's queue and WAL reads fail over"
+    note: "Closes fk-f3a5a34831e9; contributes fk-70e1ee9218a7 (tasks.py prose). C2a, D6, D7. γ1 → 6722, 8558, S19 κ1, S19 κ2 (lead ruling S19/Q-C3 = OQ-6; κ2 shares mcp_fanout.py and metrics.py). Subsumes 6872, 8119."
+    capabilities:
+      - name: "one-classifier"
+        binding: "capability→producer (γ1; C2a) — classify_fanout_failure"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def classify_fanout_failure"
+          paths: ["dashboard/src/dashboard/data/mcp_fanout.py"]
+          expect: present
+      - name: "hand-rolled-url-loops-gone"
+        binding: "anti-inversion — memory's queue/WAL reads go through first_success (failover, not a sum)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "for url in config\\.fused_memory_urls"
+          paths: ["dashboard/src/dashboard/data/memory.py"]
+          expect: absent
+      - name: "s19-egress-delivered"
+        binding: "producer: S19 κ1 (S19 C8, dashboard/data/mcp_client.py; the mcp_fanout↔memory cycle broken) — upstream, unfiled at authoring; cross-plan edge wired at decompose"
+        verdict: OPEN
+        delivered_check:
+          kind: manual
+          reason: "a reviewer confirms S19 κ1 is on main (mcp_client.py holds mcp_tool_call and invalidate_session; mcp_fanout imports nothing from memory) and γ1 uses those names"
+  - label: "γ2"
+    task_id: 9802
+    title: "One concurrent escalation-URL probe; the four probes become projectors"
+    note: "Closes fk-ad49b80c5554 (high). C2b. γ2 → γ1, 6722, 9162, S19 κ1, S19 κ2 (merge_queue.py, api/merge_queue.py); lead edge 8561 → γ2 (8561 is parked behind 8528). Subsumes 7628, 7503."
+    capabilities:
+      - name: "probe-helper"
+        binding: "capability→producer (γ2; C2b) — probe_escalation_urls"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def probe_escalation_urls"
+          paths: ["dashboard/src/dashboard/data/escalation_probe.py"]
+          expect: present
+      - name: "base-url-copies-gone"
+        binding: "anti-inversion (SPOT) — base URLs come from shared.mcp_post.mcp_server_base"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "removesuffix\\('/mcp'\\)"
+          paths: ["dashboard/src/dashboard/data/merge_halt.py", "dashboard/src/dashboard/data/merge_queue.py", "dashboard/src/dashboard/data/escalations.py", "dashboard/src/dashboard/data/task_runtime.py"]
+          expect: absent
+      - name: "mcp-server-base-substrate"
+        binding: "substrate — shared.mcp_post.mcp_server_base exists at 1b106418da (task 6747); not a producer check"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^def mcp_server_base"
+          paths: ["shared/src/shared/mcp_post.py"]
+          expect: present
+      - name: "merge-queue-survives-one-restart"
+        binding: "rejection-mechanism — boundary row 2: one orchestrator's ReadError leaves the endpoint 200"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "behavioural; asserted by test_escalation_probe.py and the merge-queue route test (row 2)"
+  - label: "δ1"
+    task_id: 9807
+    title: "TTLCache in its own module, one slot per key, policy at construction"
+    note: "Closes fk-b5760d0dfe85 (high), fk-c51423b7b7e5; contributes fk-70e1ee9218a7 (mcp_fanout prose). C3 invariants 1–5, D8. δ1 → γ1, ν, 9162, 8559, 8563, S19 κ1, S19 κ2; lead edges 9285 → δ1, 8564 → δ1 (both already wait on 8528)."
+    capabilities:
+      - name: "ttl-cache-module"
+        binding: "capability→producer (δ1; C3) — dashboard/data/ttl_cache.py"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["dashboard/src/dashboard/data/ttl_cache.py"]
+          expect: present
+      - name: "fanout-holds-no-cache"
+        binding: "anti-inversion (heuristic 6) — mcp_fanout keeps transport only"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^class TTLCache"
+          paths: ["dashboard/src/dashboard/data/mcp_fanout.py"]
+          expect: absent
+      - name: "no-asyncio-private-read"
+        binding: "anti-inversion (D8) — the slot counts its own waiters"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_waiters"
+          paths: ["dashboard/src/dashboard/data/mcp_fanout.py", "dashboard/src/dashboard/data/ttl_cache.py"]
+          expect: absent
+      - name: "lineage-single-flight-gone"
+        binding: "anti-inversion (one TTLCache owner) — task_lineage uses C3"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def _start_refresh"
+          paths: ["dashboard/src/dashboard/data/task_lineage.py"]
+          expect: absent
+      - name: "burndown-off-fanout-constant"
+        binding: "anti-inversion (D8; S19 C8 seam) — burndown imports the lock timeout from ttl_cache, not mcp_fanout"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "from dashboard\\.data\\.mcp_fanout import .*LOCK_ACQUIRE_TIMEOUT_SECONDS"
+          paths: ["dashboard/src/dashboard/data/burndown.py"]
+          expect: absent
+  - label: "δ2"
+    task_id: 9816
+    title: "The dashboard's caches are app-scoped; tests construct cache policies"
+    note: "Contributes fk-b5760d0dfe85 (tests stance). C3 CacheRegistry, D8. δ2 → δ1, θ, ξ1."
+    capabilities:
+      - name: "cache-registry"
+        binding: "capability→producer (δ2; C3) — CacheRegistry, installed in lifespan, read through caches()"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^class CacheRegistry"
+          paths: ["dashboard/src/dashboard/data/ttl_cache.py"]
+          expect: present
+      - name: "callable-ttl-gone"
+        binding: "anti-inversion (D8) — no module TTL constant read through a lambda for a test to patch"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "ttl_seconds=lambda"
+          paths: ["dashboard/src/dashboard/data/prd_signal.py", "dashboard/src/dashboard/data/task_activity.py", "dashboard/src/dashboard/data/scheduler.py", "dashboard/src/dashboard/data/task_snapshot.py", "dashboard/src/dashboard/data/task_lookup.py", "dashboard/src/dashboard/data/escalation_corpus.py", "dashboard/src/dashboard/api/escalations.py", "dashboard/src/dashboard/api/memory_evals.py"]
+          expect: absent
+      - name: "tests-construct-policy"
+        binding: "anti-inversion (tests stance) — no test setattr of a module TTL constant"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "setattr\\([^)]*_TTL_SECONDS|_TTL_SECONDS', "
+          paths: ["dashboard/tests/_boundary_payloads.py", "dashboard/tests/test_active_tasks.py", "dashboard/tests/test_api_prds.py", "dashboard/tests/test_app.py", "dashboard/tests/test_burndown_data.py", "dashboard/tests/test_escalation_corpus.py", "dashboard/tests/test_prd_signal.py", "dashboard/tests/test_scheduler_page.py", "dashboard/tests/test_scheduler_state_access.py", "dashboard/tests/test_task_activity.py", "dashboard/tests/test_tasks_census_projection.py", "dashboard/tests/test_task_snapshot.py"]
+          expect: absent
+  - label: "ε"
+    task_id: 9818
+    title: "Recon and memory-ops panels read fused-memory's read model; the dashboard's fused-memory SQL goes"
+    note: "Closes fk-1c1d247caaa7. Consumes S15 C4 (S15 κ). ε → ζ, ν, θ, 6722, 8563, S15 κ."
+    capabilities:
+      - name: "recon-sql-gone"
+        binding: "anti-inversion (R19) — the dashboard names no recon table"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "FROM (runs|event_buffer|burst_state|watermarks|judge_verdicts)\\b"
+          paths: ["dashboard/src/dashboard/data/reconciliation.py"]
+          expect: absent
+      - name: "index-hint-gone"
+        binding: "anti-inversion (R19) — the dashboard names no fused-memory index"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "INDEXED BY"
+          paths: ["dashboard/src/dashboard/data/write_journal.py"]
+          expect: absent
+      - name: "recon-ddl-fixtures-gone"
+        binding: "anti-inversion — no hand-copied fused-memory DDL in dashboard tests"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "CREATE TABLE( IF NOT EXISTS)? +(watermarks|event_buffer|burst_state|judge_verdicts)"
+          paths: ["dashboard/tests/_dashboard_helpers.py"]
+          expect: absent
+      - name: "journal-db-path-gone"
+        binding: "anti-inversion — no dashboard reader of write_journal.db remains"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def write_journal_db"
+          paths: ["dashboard/src/dashboard/config.py"]
+          expect: absent
+      - name: "reader-cooldown-copy-gone"
+        binding: "anti-inversion (S15 C4: effective_state is computed by the owner) — the dashboard restates no burst cooldown"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_DEFAULT_BURST_COOLDOWN"
+          paths: ["dashboard/src/dashboard/data/reconciliation.py"]
+          expect: absent
+      - name: "s15-read-model-delivered"
+        binding: "producer: S15 κ (S15 C4, shared/dashboard_panels.py via get_status(panels=…)) — upstream, unfiled at authoring; cross-plan edge wired at decompose"
+        verdict: OPEN
+        delivered_check:
+          kind: manual
+          reason: "a reviewer confirms S15 κ is on main and ε parses PanelsReply rather than reading SQLite"
+  - label: "ζ"
+    task_id: 9820
+    title: "The curator panel reports a fused-memory outage as one; samplers write NULL"
+    note: "Closes fk-4afbeb684a22 (high); contributes fk-1c1d247caaa7 (tickets). ζ → γ1, ν, S15 κ. Subsumes 7815."
+    capabilities:
+      - name: "zero-substitution-gone"
+        binding: "anti-inversion (INV-11) — an unreachable root is not an empty queue"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "offline_result=lambda errs: \\(0, \\[\\]\\)"
+          paths: ["dashboard/src/dashboard/data/metrics.py"]
+          expect: absent
+      - name: "tickets-sql-gone"
+        binding: "anti-inversion (R19) — curator latency reads S15's CuratorPanel"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "FROM tickets"
+          paths: ["dashboard/src/dashboard/data/metrics.py"]
+          expect: absent
+      - name: "tickets-db-plumbing-gone"
+        binding: "anti-inversion — no dashboard reader of tickets.db remains, so its config path and pool open go"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "tickets_db"
+          paths: ["dashboard/src/dashboard/config.py", "dashboard/src/dashboard/loops.py"]
+          expect: absent
+      - name: "outage-writes-null"
+        binding: "INV-13 producer proof — a tick with fused-memory stopped writes NULL pending_total/capped_now"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "live metrics.db read after a sampler tick with fused-memory stopped; not a tree property"
+  - label: "η"
+    task_id: 9847
+    title: "Performance: additive per-DB tallies, one merge, one partial-tally rule"
+    note: "Closes fk-a9e45ca0eb10 (weakened, re-verified). η → β, ε, ν, 9162."
+    capabilities:
+      - name: "one-merge"
+        binding: "capability→producer (η) — merge_tallies owns the merge and the partial rule"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def merge_tallies"
+          paths: ["dashboard/src/dashboard/data/performance.py"]
+          expect: present
+      - name: "percentile-mean-gone"
+        binding: "anti-inversion — no unweighted mean of per-DB percentiles"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def _merge_history"
+          paths: ["dashboard/src/dashboard/data/performance.py"]
+          expect: absent
+      - name: "dead-centiles-gone"
+        binding: "anti-inversion — get_time_centiles had no production caller"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def get_time_centiles"
+          paths: ["dashboard/src/dashboard/data/performance.py"]
+          expect: absent
+      - name: "unreachable-branch-patches-gone"
+        binding: "anti-inversion (tests stance) — no patch reaches an unreachable merge branch"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "dashboard\\.data\\.performance\\.get_loop_histograms"
+          paths: ["dashboard/tests/test_performance.py"]
+          expect: absent
+  - label: "θ"
+    task_id: 9852
+    title: "Dashboard event readers on the read model; outcome families keyed by the imported members"
+    note: "Closes fk-af4ba730a48a (high), fk-c927adb040e9. θ → β, γ2, 8563 (8460 landed, 5a1f289e91)."
+    capabilities:
+      - name: "code-family-copy-gone"
+        binding: "anti-inversion (D2) — outcome_colors keys its families by imported OutcomeKind members"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^_CODE_FAMILY"
+          paths: ["dashboard/src/dashboard/data/outcome_colors.py"]
+          expect: absent
+      - name: "outcome-family-in-dashboard"
+        binding: "capability→producer (θ; C4 consumer side, D2) — OUTCOME_FAMILY lives with the colours, held total by a test"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^OUTCOME_FAMILY"
+          paths: ["dashboard/src/dashboard/data/outcome_colors.py"]
+          expect: present
+      - name: "merge-event-literals-gone"
+        binding: "anti-inversion (R19) — merge_queue and the merge tab spell no event type"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "'(merge_attempt|train_merged)'"
+          paths: ["dashboard/src/dashboard/data/merge_queue.py", "dashboard/src/dashboard/static/redux/tabs.jsx"]
+          expect: absent
+      - name: "test-events-ddl-copy-gone"
+        binding: "anti-inversion — tests build runs.db through write_runs_db_fixture"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "MERGE_EVENTS_SCHEMA"
+          paths: ["dashboard/tests/test_merge_queue_data.py"]
+          expect: absent
+      - name: "dashboard-runs-fixture-copy-gone"
+        binding: "anti-inversion — the hand-copied runs.db fixture module is deleted"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["dashboard/tests/_runs_db_fixture.py"]
+          expect: absent
+      - name: "merge-queue-quality-grants-retired"
+        binding: "anti-inversion (D3, two guards) — the quality guard's merge_queue grants go with the SQL they excused"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "recent_train_events\\._query"
+          paths: ["dashboard/tests/test_datum_access_paths.py"]
+          expect: absent
+  - label: "ι"
+    task_id: 9853
+    title: "Cost, cap, model-role and load readers typed; with_db deleted"
+    note: "Closes fk-9979f1b771de. ι → β, η, ε, S20 ζ (no edge onto θ: they share only a test file); lead edge 8564 → ι."
+    capabilities:
+      - name: "with-db-gone"
+        binding: "anti-inversion (D4) — unreadable and empty are distinct values"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def with_db"
+          paths: ["dashboard/src/dashboard/data/db.py"]
+          expect: absent
+      - name: "spend-today-not-synthetic"
+        binding: "anti-inversion (D5) — shape_costs serves null, not 0.0"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "if trend_values else 0\\.0"
+          paths: ["dashboard/src/dashboard/data/redux_api.py"]
+          expect: absent
+      - name: "account-event-vocabulary"
+        binding: "capability→producer (ι; C5) — AccountEventType in cost_store"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^class AccountEventType"
+          paths: ["shared/src/shared/cost_store.py"]
+          expect: present
+      - name: "model-role-query-module"
+        binding: "capability→producer (ι; C5) — the one model-role query the digest (υ) and the dashboard share"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["shared/src/shared/runs_read/model_role.py"]
+          expect: present
+  - label: "κ"
+    task_id: 9859
+    title: "Scheduler collector: fetch plus a pure shaper, a named record, raw task ids on rows"
+    note: "Closes fk-6aee6c49fa2e, fk-d21f64525e52, fk-70e1ee9218a7. κ → δ2, ι, α, ρ2, 8558, 8559, 8563. Subsumes 6842."
+    capabilities:
+      - name: "named-scheduler-record"
+        binding: "capability→producer (κ) — SchedulerState replaces the 8-tuple"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^class SchedulerState\\("
+          paths: ["dashboard/src/dashboard/data/scheduler.py"]
+          expect: present
+      - name: "uid-parse-gone"
+        binding: "anti-inversion (heuristic 12) — rows carry task_id"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "split\\('/T-'"
+          paths: ["dashboard/src/dashboard/data/scheduler.py", "dashboard/src/dashboard/static/redux/scheduler_utils.jsx", "dashboard/src/dashboard/static/redux/tabs.jsx"]
+          expect: absent
+      - name: "stale-rationale-gone"
+        binding: "anti-inversion (Comments stance) — the event types are EventType members"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "does not exist yet"
+          paths: ["dashboard/src/dashboard/data/scheduler.py"]
+          expect: absent
+  - label: "λ"
+    task_id: 9864
+    title: "Orchestrator discovery and the orchestrator-yaml read, one function each"
+    note: "Closes fk-d0a7ebc4a4f1, fk-9cf2a161c9c0 (weakened; part c retired 3f78c8a09c). λ → ε, δ1, 6722, 8563, S16 α, S19 κ2. Subsumes 6875. Defaults from S16 C8 (lead rulings S16/OQ-4 option 2, OQ-5)."
+    capabilities:
+      - name: "typed-discovery-record"
+        binding: "capability→producer (λ; D12) — RunningOrchestrator with a root or Unresolved"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^class RunningOrchestrator"
+          paths: ["dashboard/src/dashboard/data/orchestrator.py"]
+          expect: present
+      - name: "mirrored-discovery-gone"
+        binding: "anti-inversion (INV-5) — metrics calls the one discovery function"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "Mirrors the discovery logic"
+          paths: ["dashboard/src/dashboard/data/metrics.py"]
+          expect: absent
+      - name: "escalation-port-shared-default"
+        binding: "capability→producer (λ; D12, S16 C8) — the escalation port's default lives in shared/config_defaults.py, which the dashboard imports"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^DEFAULT_ESCALATION_PORT"
+          paths: ["shared/src/shared/config_defaults.py"]
+          expect: present
+      - name: "escalation-port-field-names-constant"
+        binding: "anti-inversion (C8 one home) — EscalationConfig.port's field default names the shared constant"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "default=DEFAULT_ESCALATION_PORT"
+          paths: ["orchestrator/src/orchestrator/config.py"]
+          expect: present
+  - label: "μ"
+    task_id: 9865
+    title: "/healthz probe as a HealthProbe on app.state"
+    note: "Closes fk-166cacf84a18. D9. μ → 6722, S19 κ2 (app.py)."
+    capabilities:
+      - name: "health-module"
+        binding: "capability→producer (μ) — dashboard/api/health.py"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^class HealthBudget"
+          paths: ["dashboard/src/dashboard/api/health.py"]
+          expect: present
+      - name: "module-globals-gone"
+        binding: "anti-inversion (heuristic 5) — probe state lives on app.state"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "global _mcp_probe"
+          paths: ["dashboard/src/dashboard/app.py"]
+          expect: absent
+      - name: "test-reset-hook-gone"
+        binding: "anti-inversion (tests stance) — tests construct HealthProbe"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def _mcp_probe_state_clear"
+          paths: ["dashboard/src/dashboard/app.py"]
+          expect: absent
+  - label: "ν"
+    task_id: 9868
+    title: "Remaining app.py routes into api/ routers with typed bodies"
+    note: "Closes fk-1b8c06cd8b2f, fk-ce66d4da9b0f. D10. ν → μ, S19 κ2. Subsumes 8700."
+    capabilities:
+      - name: "scheduler-router"
+        binding: "capability→producer (ν) — dashboard/api/scheduler.py with pydantic bodies"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["dashboard/src/dashboard/api/scheduler.py"]
+          expect: present
+      - name: "no-post-routes-in-app"
+        binding: "anti-inversion (heuristic 6) — app.py registers routers only"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^@app\\.post"
+          paths: ["dashboard/src/dashboard/app.py"]
+          expect: absent
+      - name: "boost-tier-copy-gone"
+        binding: "anti-inversion (SPOT) — tiers from shared.task_priority"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_VALID_BOOST_TIERS"
+          paths: ["dashboard/src/dashboard/app.py"]
+          expect: absent
+  - label: "ξ1"
+    task_id: 9871
+    title: "Static assets revalidate; the tests stop pinning a ?v= floor"
+    note: "Contributes fk-94fc76e7a123 (ξ2 closes); priority inversion with ξ2 recorded. D11. ξ1 → ν, δ1, 8558 (no edge onto 8461: they share only test files)."
+    capabilities:
+      - name: "static-revalidation-module"
+        binding: "capability→producer (ξ1; D11) — static assets served with no-cache and an ETag"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["dashboard/src/dashboard/static_assets.py"]
+          expect: present
+      - name: "cache-buster-floor-pins-gone"
+        binding: "anti-inversion (D11) — no test pins a ?v= floor or a sibling-version agreement"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "cache_buster_(not_reverted_below|floor)|redux_cache_buster_versions"
+          paths: ["dashboard/tests/test_charts_axis_labels.py", "dashboard/tests/test_esc_flow_diagram.py", "dashboard/tests/test_tab_memory_evals.py", "dashboard/tests/test_tab_scheduler.py", "dashboard/tests/test_tab_tasks_invariant_chip.py"]
+          expect: absent
+  - label: "ξ2"
+    task_id: 9874
+    title: "Strip the ?v= stamps; the cache-buster freshness test goes"
+    note: "Closes fk-94fc76e7a123 (high); revalidation only, ruled at the sitting (OQ-3). D11. ξ2 → ξ1. Moves the four served-module body checks into a node test before ο lands (D14 Scope), recording the narrowed pin in its commit message."
+    capabilities:
+      - name: "served-body-substring-checks-gone"
+        binding: "anti-inversion (D14 Scope; C6 direct-read clause) — no Python test asserts on a substring of a served script's text in these four files (4 hits at 0f21f5e457)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "' in resp\\.text"
+          paths: ["dashboard/tests/test_tab_tasks_deferral.py", "dashboard/tests/test_tab_tasks_invariant_chip.py", "dashboard/tests/test_tab_tasks_offline_banner.py", "dashboard/tests/test_index_html.py"]
+          expect: absent
+      - name: "served-module-globals-node-test"
+        binding: "capability→producer (ξ2) — the served modules' global bindings are checked in node through _served_bundle.mjs"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["dashboard/tests/js/served_module_globals.test.mjs"]
+          expect: present
+      - name: "version-literals-gone"
+        binding: "anti-inversion (D11) — no ?v= stamp in index.html"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "\\?v=[0-9]+"
+          paths: ["dashboard/src/dashboard/static/redux/index.html"]
+          expect: absent
+      - name: "freshness-test-gone"
+        binding: "anti-inversion — the git-history freshness test has nothing to police"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["dashboard/tests/test_cache_buster_freshness.py"]
+          expect: absent
+      - name: "buster-helpers-gone"
+        binding: "anti-inversion — the cache-buster test helpers have no caller left"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["dashboard/tests/_cache_buster_helpers.py"]
+          expect: absent
+      - name: "scope-and-order-tests-substrate"
+        binding: "substrate — the classic-script scope test and the load-order tests that stay the enforcement (OQ-3, ruled at the sitting) exist at 1b106418da; not a producer check"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["dashboard/tests/js/classic_script_scope.test.mjs", "dashboard/tests/test_index_html.py"]
+          expect: present
+  - label: "ο"
+    task_id: 9892
+    title: "Guard: no new dashboard test reads frontend source text; each exempted module is owned by its conversion task"
+    note: "Contributes fk-1bdd95e804cb (π8 closes). C6, D14; option B ruled at the sitting (OQ-4). ο → ξ2. Owned debt (INV-12), no ratification row."
+    capabilities:
+      - name: "source-text-guard"
+        binding: "rejection-mechanism (INV-10) — the guard flags its seeded fixture"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["dashboard/tests/test_no_frontend_source_assertions.py"]
+          expect: present
+      - name: "exemptions-owned-debt"
+        binding: "capability→producer (ο; C6) — the exemption list is declared through governed_exceptions, every entry Debt(TaskRef) of its conversion task"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "governed_exceptions\\("
+          paths: ["dashboard/tests/source_text_exemptions.py"]
+          expect: present
+      - name: "ratchet-kernel-substrate"
+        binding: "substrate — shared.ratchet (excess, slack) and shared.governed_exceptions exist at 1b106418da; not a producer check"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^def slack\\("
+          paths: ["shared/src/shared/ratchet.py"]
+          expect: present
+  - label: "π1"
+    task_id: 9879
+    title: "Tasks-tab source-text tests become render tests: runtime, status counts, focus header, staleness banner, layout memo, terminal window, prose, module locks"
+    note: "Contributes fk-1bdd95e804cb (π8 closes). D14; option B ruled at the sitting (OQ-4). π1 → ξ2, 8461. Subsumes 7907, 8703. Records every dropped pin with its reason in its commit message."
+    capabilities:
+      - name: "render-tasks-tab-file"
+        binding: "capability→producer (π1; D14) — the tab group's render tests on the jsdom harness, in a file of their own"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["dashboard/tests/js/render_tasks_tab.test.mjs"]
+          expect: present
+      - name: "π1-source-text-modules-gone"
+        binding: "anti-inversion (heuristic 10; tests stance) — the tab group's source-text modules are deleted"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["dashboard/tests/test_tab_tasks_runtime.py", "dashboard/tests/test_tab_tasks_status_counts.py", "dashboard/tests/test_tab_tasks_focus_header.py", "dashboard/tests/test_tab_staleness_indicator.py", "dashboard/tests/test_tab_tasks_layout_memo.py", "dashboard/tests/test_tab_tasks_terminal_window.py", "dashboard/tests/test_tab_tasks_prose.py", "dashboard/tests/test_tab_tasks_module_locks.py"]
+          expect: absent
+  - label: "π2"
+    task_id: 9881
+    title: "Overview and Orchestrators tabs and the app-chrome census become render tests"
+    note: "Contributes fk-1bdd95e804cb (π8 closes). D14; option B ruled at the sitting (OQ-4). π2 → θ, 8461. Records every dropped pin with its reason in its commit message."
+    capabilities:
+      - name: "render-overview-orchestrators-file"
+        binding: "capability→producer (π2; D14) — the tab group's render tests on the jsdom harness, in a file of their own"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["dashboard/tests/js/render_overview_orchestrators.test.mjs"]
+          expect: present
+      - name: "π2-source-text-modules-gone"
+        binding: "anti-inversion (heuristic 10; tests stance) — the tab group's source-text modules are deleted"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["dashboard/tests/test_tab_overview.py", "dashboard/tests/test_tab_orchestrators.py", "dashboard/tests/test_app_chrome_census.py"]
+          expect: absent
+  - label: "π3"
+    task_id: 9884
+    title: "Burndown tab and chart source-text tests become render tests: axis labels, null samples, census tones, chart consumer bindings"
+    note: "Contributes fk-1bdd95e804cb (π8 closes). D14; option B ruled at the sitting (OQ-4). π3 → ξ2, 8461, 8563. Absorbs 4351, 7971. Records every dropped pin with its reason in its commit message."
+    capabilities:
+      - name: "render-burndown-charts-file"
+        binding: "capability→producer (π3; D14) — the tab group's render tests on the jsdom harness, in a file of their own"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["dashboard/tests/js/render_burndown_charts.test.mjs"]
+          expect: present
+      - name: "π3-source-text-modules-gone"
+        binding: "anti-inversion (heuristic 10; tests stance) — the tab group's source-text modules are deleted"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["dashboard/tests/test_tab_burndown.py", "dashboard/tests/test_charts_axis_labels.py", "dashboard/tests/test_charts_null_samples.py", "dashboard/tests/test_census_tone_bindings.py", "dashboard/tests/test_charts_consumer_bindings.py"]
+          expect: absent
+  - label: "π4"
+    task_id: 9885
+    title: "Memory and Memory-evals tab source-text tests become render tests"
+    note: "Contributes fk-1bdd95e804cb (π8 closes). D14; option B ruled at the sitting (OQ-4). π4 → ξ2, γ1, 8461. Records every dropped pin with its reason in its commit message."
+    capabilities:
+      - name: "render-memory-tabs-file"
+        binding: "capability→producer (π4; D14) — the tab group's render tests on the jsdom harness, in a file of their own"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["dashboard/tests/js/render_memory_tabs.test.mjs"]
+          expect: present
+      - name: "π4-source-text-modules-gone"
+        binding: "anti-inversion (heuristic 10; tests stance) — the tab group's source-text modules are deleted"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["dashboard/tests/test_tab_memory.py", "dashboard/tests/test_tab_memory_evals.py"]
+          expect: absent
+  - label: "π5"
+    task_id: 9886
+    title: "Escalations and Escalation-analytics tabs, the flow diagram and the persisted-state consumers become render tests"
+    note: "Contributes fk-1bdd95e804cb (π8 closes). D14; option B ruled at the sitting (OQ-4). π5 → ξ2, 8461. Records every dropped pin with its reason in its commit message."
+    capabilities:
+      - name: "render-escalation-tabs-file"
+        binding: "capability→producer (π5; D14) — the tab group's render tests on the jsdom harness, in a file of their own"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["dashboard/tests/js/render_escalation_tabs.test.mjs"]
+          expect: present
+      - name: "π5-source-text-modules-gone"
+        binding: "anti-inversion (heuristic 10; tests stance) — the tab group's source-text modules are deleted"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["dashboard/tests/test_tab_escalations.py", "dashboard/tests/test_tab_escalation_analytics.py", "dashboard/tests/test_esc_flow_diagram.py", "dashboard/tests/test_persisted_state_consumers.py"]
+          expect: absent
+  - label: "π6"
+    task_id: 9887
+    title: "Scheduler, Recon, Curator and Merge tabs, the park label and the chip-list hooks become render tests"
+    note: "Contributes fk-1bdd95e804cb (π8 closes). D14; option B ruled at the sitting (OQ-4). π6 → ξ2, κ, ζ, ε, 8461. Also rewires the two importers of _lock_chip_matrix.py outside the six modules (D14 Scope). Records every dropped pin with its reason in its commit message."
+    capabilities:
+      - name: "lock-chip-matrix-importers-rewired"
+        binding: "anti-inversion (D14 Scope; C6 helper clause) — the lock-chip matrix runs through the jsdom window, not a sliced-out function (3 hits at 0f21f5e457)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_lock_chip_matrix"
+          paths: ["dashboard/tests/test_lock_chip_state.py", "dashboard/tests/test_boundary_js.py"]
+          expect: absent
+      - name: "render-ops-tabs-file"
+        binding: "capability→producer (π6; D14) — the tab group's render tests on the jsdom harness, in a file of their own"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["dashboard/tests/js/render_ops_tabs.test.mjs"]
+          expect: present
+      - name: "π6-source-text-modules-gone"
+        binding: "anti-inversion (heuristic 10; tests stance) — the tab group's source-text modules are deleted"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["dashboard/tests/test_tab_scheduler.py", "dashboard/tests/test_tab_recon.py", "dashboard/tests/test_tab_curator.py", "dashboard/tests/test_tab_merge_queue.py", "dashboard/tests/test_park_entry_label.py", "dashboard/tests/test_chip_list_hooks.py"]
+          expect: absent
+  - label: "π7"
+    task_id: 9888
+    title: "App-shell source-text tests become render tests: Datum components, poll scope, tab error boundary, the browser abort timeout"
+    note: "Contributes fk-1bdd95e804cb (π8 closes). D14; option B ruled at the sitting (OQ-4). π7 → 8461. Subsumes 7566; absorbs 7004. Records every dropped pin with its reason in its commit message."
+    capabilities:
+      - name: "render-app-shell-file"
+        binding: "capability→producer (π7; D14) — the tab group's render tests on the jsdom harness, in a file of their own"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["dashboard/tests/js/render_app_shell.test.mjs"]
+          expect: present
+      - name: "π7-source-text-modules-gone"
+        binding: "anti-inversion (heuristic 10; tests stance) — the tab group's source-text modules are deleted"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["dashboard/tests/test_datum_components.py", "dashboard/tests/test_app_poll_scope.py", "dashboard/tests/test_app_tab_error_boundary.py"]
+          expect: absent
+      - name: "abort-timeout-not-read-from-source"
+        binding: "anti-inversion (D14) — the two budget tests stop reading data.js text for DEFAULT_TIMEOUT_MS"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_ABORT_MS_RE"
+          paths: ["dashboard/tests/test_prds_budget.py", "dashboard/tests/test_tasks_budget.py"]
+          expect: absent
+  - label: "π8"
+    task_id: 9889
+    title: "Delete the source-text helper layer; the last served-script reads become node tests; the exemption list ends empty"
+    note: "Closes fk-1bdd95e804cb. D14, C6; option B ruled at the sitting (OQ-4). π8 → π1, π2, π3, π4, π5, π6, π7, ο. Absorbs 4244, 4287, 4461, 6562, 9046 (and 9037 with π3, π5, π7). Signal leaf for the Goal's source-text bullet. Records every dropped pin with its reason in its commit message."
+    capabilities:
+      - name: "served-script-fixtures-gone"
+        binding: "anti-inversion (D14 Scope; C6 direct-read clause) — conftest serves no .js/.jsx text to a test (9 fixtures at 0f21f5e457)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_client\\.get\\('/static/redux/[a-z_]+\\.jsx?'\\)\\.text"
+          paths: ["dashboard/tests/conftest.py"]
+          expect: absent
+      - name: "no-source-text-helper-under-tests"
+        binding: "anti-inversion (the sitting's delivered check for the cleanup task) — the source-text grep rule returns nothing under dashboard/tests"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "strip_js_comments|extract_function_body|app_jsx_body|_app_jsx_source|jsx_prop_expr"
+          paths: ["dashboard/tests/"]
+          expect: absent
+      - name: "helper-modules-gone"
+        binding: "anti-inversion — the helper modules and the helpers' own contract module are deleted"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["dashboard/tests/test_jsx_source_helpers.py", "dashboard/tests/_app_jsx_source.py", "dashboard/tests/_lock_chip_matrix.py"]
+          expect: absent
+      - name: "retired-globals-node-test"
+        binding: "capability→producer (π8) — the served-script retirement checks run as a node test over the served bundle"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["dashboard/tests/js/retired_globals.test.mjs"]
+          expect: present
+  - label: "ρ1"
+    task_id: 9894
+    title: "Quality series on the read model"
+    note: "R36 deliverable (no key). ρ1 → β, S20 ζ (lead ruling OQ-8: run_query on the caller's connection)."
+    capabilities:
+      - name: "quality-landings-sql-gone"
+        binding: "anti-inversion (C5) — landings reads through the read model"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "FROM events"
+          paths: ["shared/src/shared/quality_series/landings.py"]
+          expect: absent
+      - name: "quality-rows-sql-gone"
+        binding: "anti-inversion (C5) — rows_for runs read-model queries on its caller's connection"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "FROM (events|task_results|invocations|flake_occurrence)"
+          paths: ["shared/src/shared/quality_series/rows.py"]
+          expect: absent
+      - name: "quality-queries-module"
+        binding: "capability→producer (ρ1; C5) — the quality family's query module"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["shared/src/shared/runs_read/quality.py"]
+          expect: present
+  - label: "ρ2"
+    task_id: 9895
+    title: "Client feed and fused-memory's scheduler reads on the read model"
+    note: "R36 deliverable (no key). ρ2 → β, 8559."
+    capabilities:
+      - name: "client-feed-mirror-gone"
+        binding: "anti-inversion (C4) — the client feed imports EventType"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class StoreEventType"
+          paths: ["client-feed/src/client_feed/sources/events.py"]
+          expect: absent
+      - name: "scheduler-events-sql-gone"
+        binding: "anti-inversion (C5) — get_scheduler_events runs a read-model query"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "FROM events"
+          paths: ["fused-memory/src/fused_memory/mcp_tools/scheduler_state.py"]
+          expect: absent
+      - name: "scheduler-row-query-module"
+        binding: "capability→producer (ρ2; C5) — the scheduler_state row query 8559's reader and τ share"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["shared/src/shared/runs_read/scheduler.py"]
+          expect: present
+  - label: "ρ3"
+    task_id: 9897
+    title: "Quality markers read runs.db through the read model"
+    note: "R36 deliverable (no key); the reads landed with task 8460 (5a1f289e91). ρ3 → β, S20 ζ, 8465."
+    capabilities:
+      - name: "markers-queries-module"
+        binding: "capability→producer (ρ3; C5) — the quality markers' query module"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["shared/src/shared/runs_read/markers.py"]
+          expect: present
+      - name: "markers-sql-gone"
+        binding: "anti-inversion (C5) — quality_markers.py runs read-model queries on its caller's connection"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "FROM (events|runs|invocations)\\b"
+          paths: ["dashboard/src/dashboard/data/quality_markers.py"]
+          expect: absent
+      - name: "markers-sampler-opens-runs-db"
+        binding: "anti-inversion (D4) — the marker sampler opens through open_runs_db, so a refusal names runs.db"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "connect_ro\\(runs_db"
+          paths: ["dashboard/src/dashboard/data/quality_marker_sampler.py"]
+          expect: absent
+  - label: "σ"
+    task_id: 9899
+    title: "Merge-lane scripts on the read model"
+    note: "R36 deliverable (no key). σ → β, θ, 6765; lead edges 9144 → σ, 9146 → σ, 7838 → σ."
+    capabilities:
+      - name: "private-openers-gone"
+        binding: "anti-inversion (C5) — one read-only opener"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def _connect_ro"
+          paths: ["scripts/merge_lane_throughput.py", "scripts/suite_census_evidence.py"]
+          expect: absent
+      - name: "plan-event-copy-gone"
+        binding: "anti-inversion (C4) — EventType.verify_admission_plan imported"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^PLAN_EVENT_TYPE = "
+          paths: ["scripts/verify_admission_cancel_on_red_census.py"]
+          expect: absent
+  - label: "τ"
+    task_id: 9901
+    title: "Audit and operator scripts on the read model; query-events.sh deleted"
+    note: "R36 deliverable (no key). τ → β, ι, ρ2, 9162, 8563, 6759, 6761, 6762, 6765, 6766, S20 ζ; lead edge 7838 → τ."
+    capabilities:
+      - name: "unreferenced-shell-reader-gone"
+        binding: "anti-inversion — scripts/query-events.sh (17 raw sites, referenced by nothing) deleted"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["scripts/query-events.sh"]
+          expect: absent
+      - name: "fleet-state-off-digest"
+        binding: "anti-inversion (S8 ι2 seam) — fleet_state stops importing orchestrator.digest"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "from orchestrator\\.digest import"
+          paths: ["scripts/sitting/fleet_state.py"]
+          expect: absent
+      - name: "audit-opener-gone"
+        binding: "anti-inversion (C5) — one read-only opener"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^def connect_ro"
+          paths: ["scripts/audit_model_admission.py"]
+          expect: absent
+      - name: "audit-queries-module"
+        binding: "capability→producer (τ; C5) — the audit family's query module (incl. the runs read)"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["shared/src/shared/runs_read/audit.py"]
+          expect: present
+  - label: "υ"
+    task_id: 9902
+    title: "EventStore's typed reads delegate their SQL to the read model; one model-role query"
+    note: "No key. υ → 9231, β, θ (runs_read/events.py), ι, 8563, S20 ζ. Delegation ruled by the lead (OQ-2)."
+    capabilities:
+      - name: "event-store-delegates"
+        binding: "capability→producer (υ) — event_store.py imports the read model"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "from shared\\.runs_read"
+          paths: ["orchestrator/src/orchestrator/event_store.py"]
+          expect: present
+      - name: "in-process-events-sql-delegated"
+        binding: "anti-inversion (υ; R36) — no raw events SQL left in event_store.py or digest.py"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "(FROM|JOIN)[[:space:]]+events"
+          paths: ["orchestrator/src/orchestrator/event_store.py", "orchestrator/src/orchestrator/digest.py"]
+          expect: absent
+      - name: "one-model-role-query"
+        binding: "rejection-mechanism (OQ-2, ruled by the lead) — the digest and the dashboard run one model-role query"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "a reviewer confirms the digest's model-role rollup and the dashboard's cells run one query (boundary row 19)"
+  - label: "ω"
+    task_id: 9903
+    title: "Integration gate: the dashboard's readers end to end; the runs.db read encapsulation guard"
+    note: "Signal leaf. ω → α β γ1 γ2 δ1 δ2 ε ζ η θ ι κ λ μ ν ξ1 ξ2 ο ρ1 ρ2 ρ3 σ τ, 8563 (not π1–π8; 8460 landed)."
+    capabilities:
+      - name: "encapsulation-guard"
+        binding: "rejection-mechanism (INV-10/INV-12) — no raw runs.db SQL outside the read model; the co-occurrence rule (lead ruling OQ-7); no list"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["shared/tests/test_runs_db_read_encapsulation.py"]
+          expect: present
+      - name: "boundary-suite"
+        binding: "capability→producer (ω) — boundary rows 1–18, 20–22 and 24 on real fixtures"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["dashboard/tests/test_readers_boundary.py"]
+          expect: present
+      - name: "project-labels-substrate"
+        binding: "substrate — C1 ProjectLabels.root_for exists at 1b106418da (task 5760); not a producer check"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def root_for"
+          paths: ["dashboard/src/dashboard/project_labels.py"]
+          expect: present
+      - name: "goal-holds-live"
+        binding: "INV-13 producer proof — the §Goal checks on the live dashboard"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "live: fused-memory stopped renders unknown panels; an orchestrator restart leaves the merge tab rendering others"

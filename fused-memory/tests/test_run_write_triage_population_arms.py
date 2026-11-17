@@ -187,7 +187,7 @@ class TestArms:
         assert {arm.model for arm in _mod().ARMS} <= set(_scorer().LIST_PRICES)
 
     def test_an_arm_is_immutable(self) -> None:
-        import dataclasses  # noqa: PLC0415
+        import dataclasses
 
         with pytest.raises(dataclasses.FrozenInstanceError):
             _mod().ARMS[0].width = 7  # type: ignore[misc]
@@ -441,7 +441,7 @@ _ONE_CALL_USD = _scorer().LIST_PRICES['gpt-4o-mini'].usd(1_000, 50)
 
 class TestTheRunSet:
     def test_the_order_is_the_snapshot_hash_order_of_the_judge_band(self, tmp_path: Path) -> None:
-        import hashlib  # noqa: PLC0415
+        import hashlib
 
         path = _snapshot_file(tmp_path)
         snapshot, sha = _freeze_mod().load_snapshot(path)
@@ -609,7 +609,7 @@ def _calibrate() -> types.ModuleType:
 
 
 def _sha(data: bytes | str) -> str:
-    import hashlib  # noqa: PLC0415
+    import hashlib
 
     return hashlib.sha256(data.encode() if isinstance(data, str) else data).hexdigest()
 

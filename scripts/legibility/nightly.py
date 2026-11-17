@@ -43,7 +43,7 @@ from typing import NamedTuple, assert_never
 if __name__ == '__main__':
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from legibility import (  # noqa: E402
+from legibility import (
     alarm,
     census_trigger,
     codebook,
@@ -59,7 +59,7 @@ from legibility import (  # noqa: E402
     trickle_state,
     unlanded,
 )
-from legibility.config import (  # noqa: E402
+from legibility.config import (
     LegibilityConfig,
     TrickleCensusCaps,
     _require_absolute,
@@ -189,28 +189,6 @@ def select_scored_records(
     return [sampling.score_session(session) for session in sessions]
 
 
-DEFAULT_MAX_DIGEST_BYTES = sampling.DEFAULT_DIGEST_MAX_BYTES
-"""Per-digest soft byte cap (PRD §7.2) — an ALIAS, not a second definition.
-
-Both the COST basis (:func:`select_digest_sessions`) and the RENDER basis
-(:func:`build_digests`) read this one name, so what the sampler charged is
-provably the digest that later gets produced. It binds to
-:data:`sampling.DEFAULT_DIGEST_MAX_BYTES` rather than re-declaring ``15360``
-because ``DEFAULT_MAX_DIGEST_BYTES`` and ``DEFAULT_DIGEST_MAX_BYTES`` are one
-word-order swap apart — trivially confusable at a call site, and if they were
-independent literals a drift between them would be invisible to every test
-(reviewer_comprehensive, task 3268 amendment pass). The alias is kept because
-this is the established public name for the nightly cap.
-
-The remaining independent literal is :func:`legibility.digest.build_digest`'s
-own ``max_bytes=15360`` default. ``digest.py`` is outside task 3268's locked
-scope, so collapsing all three into a single ``digest.DEFAULT_MAX_BYTES``
-(the reviewer's preferred shape, and where the §7.2 cap naturally belongs) is
-left to a follow-up; ``TestDigestByteCostFn.test_module_constant_matches_the_
-renderers_own_default`` pins the two against each other in the meantime so
-drift fails a test instead of silently mis-charging the budget."""
-
-
 def select_digest_sessions(
     cfg: LegibilityConfig, projects_root: Path | str, target_date: date,
     *, rendered: dict[tuple, str] | None = None,
@@ -235,7 +213,7 @@ def select_digest_sessions(
 
     The byte budget (``cfg.budgets.max_daily_digest_bytes``) is charged
     against each candidate's ACTUAL rendered digest size, at exactly the
-    :data:`DEFAULT_MAX_DIGEST_BYTES` cap :func:`build_digests` will render
+    :data:`legibility.digest.DEFAULT_MAX_BYTES` cap :func:`build_digests` will render
     with -- the same constant on both sides, so ``bytes_used`` describes the
     digests this night actually produces. Charging the RAW transcript size
     instead over-charged the budget by 20x-500x (a 0.5-6.5MB session renders
@@ -278,7 +256,7 @@ def select_digest_sessions(
     return sampling.stratified_sample(
         scored, cfg,
         cost_fn=sampling.digest_byte_cost_fn(
-            max_bytes=DEFAULT_MAX_DIGEST_BYTES, build=build, rendered=rendered,
+            max_bytes=digest.DEFAULT_MAX_BYTES, build=build, rendered=rendered,
         ),
     )
 
@@ -291,7 +269,7 @@ def select_digest_sessions(
 def build_digests(
     selected: Sequence[sampling.ScoredRecord],
     *,
-    max_bytes: int = DEFAULT_MAX_DIGEST_BYTES,
+    max_bytes: int = digest.DEFAULT_MAX_BYTES,
     build=digest.build_digest,
     rendered: dict[tuple, str] | None = None,
 ) -> tuple[list[str], list[tuple[str, str]]]:
@@ -304,7 +282,7 @@ def build_digests(
     while COSTING these same records against the byte budget. A record whose
     digest is already in it is emitted from the cache rather than rendered a
     second time -- the cost basis and the render basis are the same constant
-    by construction (:data:`DEFAULT_MAX_DIGEST_BYTES`), so the cached text is
+    by construction (:data:`legibility.digest.DEFAULT_MAX_BYTES`), so the cached text is
     byte-identical to what a re-render would produce, and
     :func:`sampling.render_cache_key` makes a mismatched cap or builder a
     structural MISS rather than a wrong digest. Skipping the re-render matters
@@ -338,7 +316,7 @@ def build_digests(
             text = build(
                 record.path, agent_class_override=record.stratum, max_bytes=max_bytes,
             )
-        except Exception as exc:  # noqa: BLE001 - isolate, never propagate/fabricate
+        except Exception as exc:  # isolate, never propagate/fabricate
             extractor_failures.append((record.path.name, str(exc)))
             continue
         cache[key] = text
@@ -522,7 +500,7 @@ def evaluate_census_step(
 
     try:
         decision = decide(cfg, now=now, completion_runner=completion_runner)
-    except Exception as exc:  # noqa: BLE001 - the census trigger must never fail the run
+    except Exception as exc:  # the census trigger must never fail the run
         # The exception text is BOUNDED before it reaches either sink, and both
         # sinks are single-line: the WARNING becomes one nightly journal line,
         # and `census_line` is a one-line field on `NightlyResult`. An escaping
@@ -530,7 +508,7 @@ def evaluate_census_step(
         # YAML / pydantic error -- so it is truncated (and its newlines escaped) by
         # census_trigger's own log-hygiene helper rather than a second copy of
         # that logic here. Formatted once, so the two sinks cannot drift.
-        detail = f'{type(exc).__name__}: {census_trigger._bounded_repr(str(exc))}'
+        detail = f'{type(exc).__name__}: {census_trigger.bounded_repr(str(exc))}'
         logger.warning(
             'census trigger evaluation failed (%s) -- NO-FIRE; the nightly '
             'run is unaffected', detail,
@@ -584,7 +562,7 @@ def evaluate_census_step(
 
     try:
         launcher(cfg.project_root, config_path=config_path, caps=cfg.census.trickle_caps)
-    except Exception as exc:  # noqa: BLE001 - best-effort, never fail the run
+    except Exception as exc:  # best-effort, never fail the run
         logger.warning('legibility trickle: census launcher failed (best-effort): %s', exc)
 
     return CensusEvaluation(line, True, completion)
@@ -1106,7 +1084,7 @@ def _record_trickle_progress(
         night = trickle_state.fold_night(
             trickle_state.read_prior(cfg.project_id), cfg.project_id, run
         )
-        streak_landed = trickle_state.barren_streak_reached(night, max_barren_runs) and (
+        streak_landed = trickle_state.barren_escalation_due(night, max_barren_runs) and (
             _escalate_barren_streak(
                 cfg, night.state, target_date,
                 max_barren_runs=max_barren_runs, raise_alarm=raise_alarm,
@@ -1167,7 +1145,7 @@ def _best_effort_recording(project_id: str, target_date: date) -> Iterator[None]
     failure must never mask or replace the run's own outcome."""
     try:
         yield
-    except Exception as exc:  # noqa: BLE001 — deliberately total
+    except Exception as exc:  # deliberately total
         logger.warning(
             'legibility trickle: could not record run state for project=%s '
             'date=%s (%s: %s); the run itself is unaffected, but the '
@@ -1234,8 +1212,8 @@ def _escalate_barren_streak(
     that is running."""
     counters = night.counters
     summary = (
-        f'legibility trickle has produced nothing for {max_barren_runs} '
-        f'consecutive runs'
+        f'legibility trickle has produced nothing for '
+        f'{night.consecutive_barren_runs} consecutive runs'
     )
     detail = (
         f'project={cfg.project_id} date={target_date.isoformat()} '
@@ -1245,7 +1223,7 @@ def _escalate_barren_streak(
         f'budget_skipped={counters.budget_skipped} '
         f'last_productive_at={trickle_state.isoformat_or_none(night.last_productive_at)}. '
         f'Real confusion signal reached the sampling/budget stage on each of '
-        f'those runs and NOTHING was digested -- {max_barren_runs} '
+        f'those runs and NOTHING was digested -- {max_barren_runs} or more '
         f'consecutive means persistent config state, not a run of bad luck. '
         f'Remedy: {trickle_state.barren_remedy(counters)}. '
         f'Probe on demand with: check_trickle_progress.py '
@@ -1344,8 +1322,9 @@ def run_nightly(
     distinction ``check_trickle_liveness.sh`` cannot make.
     *retry_recorder* (default :func:`trickle_state.record_retry`, which
     rewrites only the backlog) is the same seam for a retry pass.
-    *max_barren_runs* is the barren streak on which the pass posts its one
-    streak escalation.
+    *max_barren_runs* is the barren streak on which the pass first posts its
+    streak escalation; it re-posts at the multiples in
+    :data:`trickle_state.BARREN_ESCALATION_MULTIPLES`.
 
     *pass_kind* (:class:`PassKind`) has no default: it decides whether the
     pass moves the schedule cursor. A ``RETRY`` pass, run by
@@ -1812,6 +1791,18 @@ def _parse_date(value: str) -> date:
     return date.fromisoformat(value)
 
 
+def _parse_barren_threshold(value: str) -> int:
+    """``--max-barren-runs`` as an int >= 1. Below 1, no barren streak lands
+    on the escalation schedule, so the nightly's alarm would be silently off."""
+    try:
+        parsed = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f'expected an integer, got {value!r}') from None
+    if parsed < 1:
+        raise argparse.ArgumentTypeError(f'must be 1 or greater, got {value!r}')
+    return parsed
+
+
 def run_scheduled_night(
     *,
     config_path: Path | str | None = None,
@@ -1871,7 +1862,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     undated run is the scheduled night (yesterday UTC) plus any retry the
     backlog owes (:func:`run_scheduled_night`); a ``--date`` run is a single
     pass. ``--max-barren-runs`` is every pass's barren-streak escalation
-    threshold. ``--dry-run`` is accepted for forward operator visibility but not
+    threshold (first escalation; see
+    ``trickle_state.BARREN_ESCALATION_MULTIPLES``). ``--dry-run`` is accepted for forward operator visibility but not
     yet wired to any behavior change. Returns the first non-zero
     :attr:`NightlyResult.exit_code` among the passes, else 0.
 
@@ -1911,8 +1903,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
     )
     run_parser.add_argument(
-        '--max-barren-runs', type=int, default=trickle_state.DEFAULT_MAX_BARREN_RUNS,
-        help='Consecutive barren runs on which the nightly escalates (default: %(default)s).',
+        '--max-barren-runs', type=_parse_barren_threshold,
+        default=trickle_state.DEFAULT_MAX_BARREN_RUNS,
+        help=(
+            'Barren-streak threshold: the nightly escalates when the streak '
+            'reaches it and again at the multiples in '
+            'trickle_state.BARREN_ESCALATION_MULTIPLES (default: %(default)s).'
+        ),
     )
     run_parser.add_argument(
         '--dry-run', action='store_true',

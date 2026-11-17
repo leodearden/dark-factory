@@ -39,6 +39,9 @@ from typing import NamedTuple
 import pytest
 from git_listing import listed_files
 from shared.merge_subject import format_merge_subject
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = Path(__file__).parents[2]
 

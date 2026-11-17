@@ -27,7 +27,9 @@ from orchestrator.merge_lane.types import (
     MergeRequest,
     SpeculativeItem,
 )
+from orchestrator.merge_pool_facts import PickRecords
 from orchestrator.suffix_graph import SuffixConflictGraph, SuffixConflictTracker
+from orchestrator.task_priority import TaskPriorityLookup
 
 logger = logging.getLogger('orchestrator.merge_lane')
 
@@ -186,8 +188,7 @@ def _aging_key(req: MergeRequest) -> tuple[float, str]:
     clique-minimal item within a footprint clique — the buffered item whose
     footprint-clique peers all have an equal-or-larger aging key.
     """
-    ts = req.merge_first_enqueued_at if req.merge_first_enqueued_at is not None else req.enqueued_at
-    return (ts, req.request_id)
+    return (req.first_enqueued_at, req.request_id)
 
 
 def answers_to(req: MergeRequest, request_id: str | None, task_id: str | None) -> bool:
@@ -226,8 +227,11 @@ class MergeIntake:
         frozen_prefix_tip: Callable[[str], str],
         retire_item: Callable[[str], None],
         assert_merger_owns: Callable[[str], None],
+        is_reserved: Callable[[str], bool],
+        task_priority: TaskPriorityLookup | None = None,
     ) -> None:
         self._queue = queue
+        self._is_reserved = is_reserved
         self._lanes = lanes
         self._lifecycle = lifecycle
         self._halt = halt
@@ -267,6 +271,11 @@ class MergeIntake:
             frozen_requests=frozen_requests,
             frozen_prefix_tip=frozen_prefix_tip,
             retire_item=retire_item,
+            is_reserved=is_reserved,
+        )
+        self._pick_records = PickRecords(
+            lanes=lanes, is_reserved=is_reserved, is_lane_halted=halt.is_lane_halted,
+            task_priority=task_priority,
         )
 
     # ── reads ──────────────────────────────────────────────────────────────
@@ -288,6 +297,10 @@ class MergeIntake:
     def pending_redispatch(self) -> tuple[SpeculativeItem, ...]:
         """The parked redispatch items, in the order they will be dispatched."""
         return tuple(self._redispatch)
+
+    def take_pick_record(self, request_id: str) -> dict[str, object]:
+        """What the buffers held when *request_id* was last picked, once; empty if unrecorded."""
+        return self._pick_records.take(request_id)
 
     @property
     def has_pending_redispatch(self) -> bool:
@@ -378,7 +391,7 @@ class MergeIntake:
         if self._merge_store is not None:
             try:
                 self._merge_store.record(item)
-            except Exception:  # noqa: BLE001
+            except Exception:
                 logger.warning(
                     'merge_queue: _buffer_owned_request: store.record failed for %s',
                     item.request_id,
@@ -422,10 +435,10 @@ class MergeIntake:
                                 and result.reason == MERGE_WORKER_SHUTDOWN_REASON
                             ):
                                 return  # crash / graceful-stop path: keep for recovery
-                        except Exception:  # noqa: BLE001
+                        except Exception:
                             pass  # exception-set future: fall through to remove
                         self._merge_store.remove(_rid)
-                    except Exception:  # noqa: BLE001
+                    except Exception:
                         logger.warning(
                             'merge_queue: _on_terminal: store.remove failed for %s',
                             _rid,
@@ -596,48 +609,55 @@ class MergeIntake:
 
         Returns None too while admission is halted (the worker's
         ``halt_admission``).
+
+        A request a deep chain reserves (task 7720) is invisible here, as a
+        candidate and as a neighbour: it belongs to that chain's round, whose
+        walk takes it through :meth:`take_buffered`. A lane holding only
+        reserved requests falls through to the next lane.
         """
         if self._admission_halted():
             return None
         self._rebucket_relaned_requests()
-        graph = self._suffix_tracker.graph
         for lane in self._lanes:  # high → normal
             if self._halt.is_lane_halted(lane):
                 continue
-            buf = self._lane_buffers[lane]
-            if not buf:
+            picked = self._clique_minimal_visible(lane)
+            if picked is None:
                 continue
-            # Clique-minimal selection: scan FIFO order; pick the first item x
-            # such that no footprint-neighbor of x in the same buffer has a
-            # strictly smaller aging key than x.  Items with no buffered
-            # footprint-neighbor are vacuously minimal → pure FIFO for disjoint
-            # items.  Degrades to FIFO when graph is empty or rid is absent
-            # from the graph (footprint_neighbors returns frozenset()).
-            buf_rids: frozenset[str] = frozenset(item.request_id for item in buf)
-            for i, x in enumerate(buf):
-                neighbors = graph.footprint_neighbors(x.request_id) & buf_rids
-                key_x = _aging_key(x)
-                # x is clique-minimal iff no same-lane neighbor has key < key_x
-                if not any(_aging_key(buf[j]) < key_x
-                           for j, item in enumerate(buf)
-                           if item.request_id in neighbors):
-                    self._assert_merger_owns('_lane_buffers')
-                    del buf[i]
-                    self._lifecycle.note_transition(
-                        x.request_id, ItemLifecycleState.LANE_BUFFERED, ItemLifecycleState.MERGING,
-                        live_obj=x,
-                    )
-                    return x
-            # Defensive fallback (unreachable: the aging-minimal item is always
-            # minimal by the above criterion, so the loop always returns).
             self._assert_merger_owns('_lane_buffers')
-            popped = buf.popleft()
+            buf = self._lane_buffers[lane]
+            del buf[next(i for i, req in enumerate(buf) if req is picked)]
             self._lifecycle.note_transition(
-                popped.request_id, ItemLifecycleState.LANE_BUFFERED, ItemLifecycleState.MERGING,
-                live_obj=popped,
+                picked.request_id, ItemLifecycleState.LANE_BUFFERED, ItemLifecycleState.MERGING,
+                live_obj=picked,
             )
-            return popped
+            self._pick_records.record(picked, lane, self._lane_buffers, self._suffix_tracker.graph)
+            return picked
         return None
+
+    def _clique_minimal_visible(self, lane: str) -> MergeRequest | None:
+        """The FIFO-earliest unreserved request in *lane* that no unreserved
+        footprint-neighbour in *lane* out-ages; None when nothing is visible.
+
+        Items with no visible footprint-neighbour are vacuously minimal, so
+        disjoint items pick in pure FIFO, and the pick degrades to FIFO when the
+        graph is empty or a request is absent from it. The aging-minimal
+        visible item always qualifies, so the FIFO head is only a defensive
+        fallback.
+        """
+        visible = [
+            req for req in self._lane_buffers[lane] if not self._is_reserved(req.request_id)
+        ]
+        if not visible:
+            return None
+        graph = self._suffix_tracker.graph
+        by_rid = {req.request_id: req for req in visible}
+        for x in visible:
+            neighbours = graph.footprint_neighbors(x.request_id) & by_rid.keys()
+            key_x = _aging_key(x)
+            if not any(_aging_key(by_rid[rid]) < key_x for rid in neighbours):
+                return x
+        return visible[0]
 
     def _rebucket_relaned_requests(self) -> None:
         """Move each buffered request whose ``lane`` was changed by
@@ -724,8 +744,10 @@ class MergeIntake:
 
         Returns ``None`` when the request is no longer buffered.  That is a
         REAL state, not a defensive branch: ``_run_inflight_verify`` awaits a
-        whole verify between the build and this walk, and the merger loop is
-        free to :meth:`pop_next_pickable` a follower during it.  The caller MUST
+        whole verify between the build and this walk.  A reserved link cannot
+        be popped (task 7720), but once its reservation has ended (expiry, or a
+        release) the merger loop may :meth:`pop_next_pickable` it, and a
+        cancel or a relane can take it at any time.  The caller MUST
         stop the walk on ``None`` — the pipeline has taken ownership of that
         item elsewhere, and landing it from here would be the double-land the
         removal above exists to prevent.

@@ -7,13 +7,16 @@ from pathlib import Path
 
 import pytest
 from escalation.models import Escalation
-from orchestrator.session_registry import (
+from orchestrator.decision_registry import (
     UNKNOWN_QUEUE,
     DecisionRecord,
     list_decisions,
     normalize_escalations_dir,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from sitting import inventory as mod
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 NOW = datetime(2026, 9, 26, 12, 0, tzinfo=UTC)
 

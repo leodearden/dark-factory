@@ -19,9 +19,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
-from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from _review_loop_harness import review_loop_workflow
 from _review_payloads import blocking_review
+from _worktree_registrations import lane_admin_dir
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import TASK_META_DIRNAME, GitConfig
@@ -38,20 +38,6 @@ from orchestrator.lane_lifecycle import (
     LaneState,
 )
 from orchestrator.workflow import WorkflowOutcome
-
-# HONEST EXCEPTION in this family, recorded rather than papered over:
-# TestSingleWriterSourceScan does sweep every *.py under orchestrator/src via
-# rglob, but with a plain `'.note_assigned(' in py.read_text()` SUBSTRING test
-# and NO ast.parse -- MEASURED at 0.05s/call here, three orders of magnitude
-# below the 60s default. Marked for family consistency and future-proofing,
-# NOT because it is near the cliff: the whole-tree walk is already in place, so
-# the day this scan grows an AST step (as every other member has) the cost
-# jumps by those three orders with no other signal.
-# WHY 300s, the thread-mode os._exit() cost model it clears, and the guard that
-# ENFORCES this mark rather than trusting it to be sprinkled: see
-# WHOLE_TREE_SCAN_TEST_TIMEOUT in _orch_helpers.py, and
-# test_whole_tree_scan_timeout_guard.py (task 4215).
-pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # ---------------------------------------------------------------------------
 # Repo fixture (mirrors test_warm_lane_abort_teardown.py)
@@ -122,15 +108,6 @@ async def _get_head(repo: Path) -> str:
     return out.strip()
 
 
-def _lane_admin_dir(lane: Path) -> Path:
-    """Parse the ``.git/worktrees/<name>`` admin dir path out of a lane's
-    ``.git`` pointer file (``gitdir: <repo>/.git/worktrees/<name>``)."""
-    content = (lane / '.git').read_text().strip()
-    prefix = 'gitdir:'
-    assert content.startswith(prefix), f'unexpected worktree .git pointer: {content!r}'
-    return Path(content[len(prefix):].strip())
-
-
 def _assert_route_logged(caplog: pytest.LogCaptureFixture, route: AcquireRoute) -> None:
     """Assert the route= INFO log fired for *route* — anchored on the
     trailing ' edge=' so a REUSE assertion can't false-positive-match a
@@ -151,42 +128,15 @@ class TestSingleWriterSourceScan:
     """Architectural fitness function for I2 (single-writer consolidation).
 
     The task's contract-literal I2 is "zero LaneLifecycle.note_assigned callers
-    outside warm_lane_pool.py; grep-checkable".  Encoded as two source scans:
-
-      (i)  tree-wide, the ONLY orchestrator/src/orchestrator file containing a
-           ``.note_assigned(`` CALL is warm_lane_pool.py.  (lane_lifecycle.py
-           DEFINES ``def note_assigned`` and its body is
-           ``self.transition(lane, LaneState.ASSIGNED, ...)`` — neither is a
-           ``.note_assigned(`` call, so the primitive is naturally excluded.)
-           Already true for the pool seam; this locks it against regression.
-
-      (ii) git_ops.py contains ZERO ``LaneState.ASSIGNED`` / ``LaneState.RELEASED``
-           references — the real consolidation teeth.  Both GitOps assignment
-           writers (``_note_assigned_via_route``'s ASSIGNED ladder and
-           ``_lifecycle_note_released``'s RELEASED write) are gone after step-12;
-           the only durable LaneState GitOps still touches is
-           ``LaneState.QUARANTINED`` (a NON-assignment read, retained).
-
-    NOT asserted: "no ASSIGNED/RELEASED transition anywhere in the tree" —
-    harness.py's crash-recovery terminal-release finalizer
-    (``_lane_lifecycle.transition(entry, LaneState.RELEASED)``) is a legitimate
-    NON-pool lifecycle write the task does not consolidate, and the
-    lane_lifecycle.py primitive body is the writer of record.  Both are excluded
-    by construction (this scan targets ``.note_assigned(`` callers and git_ops.py
-    only).
+    outside warm_lane_pool.py; grep-checkable".  Its tree-wide half lives in
+    test_lane_note_assigned_single_writer_guard.py::TestSingleWriterSourceScan.
+    The half here is the real consolidation teeth: git_ops.py contains ZERO
+    ``LaneState.ASSIGNED`` / ``LaneState.RELEASED`` references.  Both GitOps
+    assignment writers (``_note_assigned_via_route``'s ASSIGNED ladder and
+    ``_lifecycle_note_released``'s RELEASED write) are gone after step-12; the
+    only durable LaneState GitOps still touches is ``LaneState.QUARANTINED``
+    (a NON-assignment read, retained).
     """
-
-    def test_note_assigned_called_only_from_warm_lane_pool(self):
-        callers = sorted(
-            py.name
-            for py in _ORCH_SRC_DIR.rglob('*.py')
-            if '.note_assigned(' in py.read_text()
-        )
-        assert callers == ['warm_lane_pool.py'], (
-            'LaneLifecycle.note_assigned() must be called ONLY from '
-            'warm_lane_pool.py (the sole durable ASSIGNED writer, I2); '
-            f'found callers in {callers}'
-        )
 
     def test_git_ops_has_no_assigned_or_released_lane_state_writes(self):
         text = (_ORCH_SRC_DIR / 'git_ops.py').read_text()
@@ -323,7 +273,7 @@ class TestAcquireRouteClassification:
         # DO NOT release — 'R' stays mapped, so the next acquire_for('R')
         # returns reused=True.
 
-        admin_dir = _lane_admin_dir(lane)
+        admin_dir = lane_admin_dir(lane)
         (admin_dir / 'gitdir').write_text('/tmp/bogus/.git\n')
         assert not await git_ops._is_registered_worktree(lane), (
             'lane must appear unregistered once its admin dir gitdir '

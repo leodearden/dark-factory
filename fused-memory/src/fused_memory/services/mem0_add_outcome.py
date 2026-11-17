@@ -1,4 +1,4 @@
-"""Read a non-raising Mem0 add the one way every write path reads it."""
+"""Read a Mem0 add, raised or not, the one way every write path reads it."""
 
 from __future__ import annotations
 
@@ -32,6 +32,35 @@ class Mem0AddOutcome:
 
 
 RAISED_MEM0_ADD = Mem0AddOutcome(memory_ids=(), empty_result_error=None)
+
+
+@dataclass(frozen=True)
+class Mem0LegResult:
+    """One Mem0 write leg: what the add returned, or why it raised and whether it was deferred."""
+
+    outcome: Mem0AddOutcome
+    error: str | None = None
+    pending_retry_reason: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.error is not None and self.pending_retry_reason is not None:
+            raise ValueError(
+                'Mem0LegResult: a leg either failed or was deferred, not both, got '
+                f'error={self.error!r} and pending_retry_reason={self.pending_retry_reason!r}'
+            )
+        if (
+            self.error is not None or self.pending_retry_reason is not None
+        ) and self.outcome != RAISED_MEM0_ADD:
+            raise ValueError(
+                'Mem0LegResult: an error or pending_retry_reason means the add raised, '
+                f'so the outcome must be RAISED_MEM0_ADD, got memory_ids='
+                f'{self.outcome.memory_ids!r} and empty_result_error='
+                f'{self.outcome.empty_result_error!r}'
+            )
+
+    @property
+    def pending_retry(self) -> bool:
+        return self.pending_retry_reason is not None
 
 
 def read_mem0_add_result(

@@ -1521,7 +1521,11 @@ leaves a pointer `plans/review-all-s26-memory-service-write-path-and-graph-clien
   newline (tasks 4123, 4850); ASCII task word, no `IGNORECASE`, because Unicode case folding accepts
   U+017F/U+212A (task 4850); `[0-9]` not `\d` (task 4174); the task-vocabulary qualifier fullmatches a
   caller-lowercased string; per-clause measured false-positive cases live as parametrised test ids in
-  `test_canonical_labels.py`.
+  `test_canonical_labels.py`. Direction of safety: a narrowing that removes a foreign ref is safe, but one
+  that removes a bare mention removes a contest, which is why the whitespace gap and the local node-name
+  padding stay `\s`. Anchored rules end in `\Z`, not `$`, because `$` tolerates a trailing newline. The
+  right edge stays `(?!\d)` rather than `(?![0-9])`, so a mixed digit run yields nothing rather than a
+  truncated real number.
 - Why the queue worker and the journal were "call-time resolved" (γ): `initialize()` started workers before
   `set_write_journal`; `start()` after wiring makes the binding static.
 - Why `MemoryService` keeps delegates after the split (ρ/τ/υ): its public mutators have callers in dozens of

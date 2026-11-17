@@ -171,7 +171,7 @@ async def measure_width(
         started = clock()
         try:
             verdict = await call_judge(service, entry, candidates)
-        except Exception as exc:  # noqa: BLE001 — a measurement counts failures
+        except Exception as exc:  # a measurement counts failures
             samples.append(CallSample(clock() - started, None, None, type(exc).__name__))
             continue
         input_tokens = verdict.usage.input_tokens if verdict.usage is not None else None
@@ -272,10 +272,10 @@ async def _measure_all(
 
 
 def main() -> int:
-    import argparse  # noqa: PLC0415
-    import os  # noqa: PLC0415
+    import argparse
+    import os
 
-    from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+    from fused_memory.config.schema import FusedMemoryConfig
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', default=None,

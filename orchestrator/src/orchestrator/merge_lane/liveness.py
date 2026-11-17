@@ -1213,6 +1213,7 @@ def enforce_persistent_worktree_serial_lane(
 
     if not config.git.persistent_merge_worktree:
         return None
+    # This lane's lease lifetime: orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker._release_lease_at_verdict
     # Shared formula (INV-5): see :func:`per_host_inflight_bound` for the
     # ceil semantics and the fail-SAFE degenerate clamps.  It is deliberately
     # NOT restated here — the C4 runtime tripwire

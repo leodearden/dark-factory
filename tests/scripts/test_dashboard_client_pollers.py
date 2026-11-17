@@ -21,6 +21,9 @@ from dashboard_client_pollers import (
     slowest_client_poll,
     unclassified_setinterval_sites,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 
 def test_poll_interval_parser_requires_exactly_one_interval() -> None:

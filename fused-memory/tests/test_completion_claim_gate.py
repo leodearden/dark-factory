@@ -18,6 +18,7 @@ import logging
 
 import pytest
 from _distinct_git_repo import init_distinct_git_repo
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.services.completion_claim_gate import (
     UNRESOLVABLE,
@@ -29,6 +30,8 @@ from fused_memory.services.completion_claim_gate import (
     make_registry_commit_probe,
     verify_claims,
 )
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _KNOWN = frozenset({'reify', 'dark_factory'})
 _GATE_LOGGER = 'fused_memory.services.completion_claim_gate'

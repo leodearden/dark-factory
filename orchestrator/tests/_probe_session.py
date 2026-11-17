@@ -1,4 +1,4 @@
-"""Runs an orchestrator probe file in a nested serial pytest session from ORCH_DIR, under this subproject's inifile and conftest chain.
+"""Runs an orchestrator probe file in a nested serial pytest session from ORCH_DIR, or the ``cwd`` its caller names, under this subproject's inifile and conftest chain.
 
 A probe session never uses the host's default pytest temp root, whose
 exit-time cleanup of other sessions' dead dirs is unbounded and runs outside
@@ -23,7 +23,7 @@ from _orch_helpers import ORCH_DIR, ORCH_PYPROJECT, sanitized_probe_env
 
 def run_probe_session(
     probe: Path, *, basetemp: Path, kill_secs: int, backstop_secs: float,
-    extra: Sequence[str] = (),
+    cwd: Path = ORCH_DIR, extra: Sequence[str] = (),
 ) -> subprocess.CompletedProcess[str]:
     smuggled = [arg for arg in extra if arg == '--basetemp' or arg.startswith('--basetemp=')]
     if smuggled:
@@ -39,6 +39,6 @@ def run_probe_session(
             f'--timeout={kill_secs}', '--timeout-method=thread', '-q',
             *extra,
         ],
-        cwd=ORCH_DIR, env=sanitized_probe_env(), capture_output=True, text=True,
+        cwd=cwd, env=sanitized_probe_env(), capture_output=True, text=True,
         timeout=backstop_secs,
     )

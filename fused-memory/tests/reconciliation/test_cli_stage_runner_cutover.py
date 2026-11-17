@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.reconciliation.cli_stage_runner import (
     FINDING_ITEM_SCHEMA,
@@ -15,6 +16,8 @@ from fused_memory.reconciliation.cli_stage_runner import (
     _extract_report,
 )
 from fused_memory.utils.clip_disclosure import TRUNCATION_FACTS_KEY, elision_marker
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 
 class TestFindingItemSchemaShape:

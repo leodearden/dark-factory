@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 # The repo-wide deploy-clock guard's OWN snapshot/compare (task 3797), reused
 # rather than re-implemented here: two copies of the same "(bytes, mtime_ns) or
@@ -52,6 +53,8 @@ from df_pytest_isolation import (
     wait_pid_gone,
     wait_proof_grace_secs,
 )
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SCRIPT = Path(__file__).parent.parent / "restart-all-orchestrators.sh"
 # SYNTHETIC, not the real `orchestrator-reify.service` this used to be (task

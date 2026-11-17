@@ -2875,7 +2875,7 @@ class TestStalenessAndDegradedStates:
         assert 'which has no chart primitive' in issue['detail']
 
     def test_two_distinct_huge_kinds_sharing_a_prefix_are_not_deduped(self, tmp_path: Path) -> None:
-        """The ``seen_kinds`` dedup key (memory_evals.py::_build_eval) stays UNCAPPED, on purpose.
+        """The ``seen_kinds`` dedup key (memory_evals.py::_name_unrenderable_kinds) stays UNCAPPED, on purpose.
 
         It is an internal set key, never emitted into the payload -- capping
         it would make two distinct kinds differing only past char 120 collide
@@ -3273,7 +3273,7 @@ class TestStalenessAndDegradedStates:
         assert payload['evals'][0]['stale'] is False
 
     def test_unparseable_run_stamp_is_capped(self, tmp_path: Path) -> None:
-        """``latest_run_stamp`` is ``isinstance``-guarded (memory_evals.py::_build_eval) but never length-guarded.
+        """``latest_run_stamp`` is ``isinstance``-guarded (memory_evals.py::_run_age_seconds) but never length-guarded.
 
         Same size exposure as the other rendering-vocabulary details: a
         hostile in-body ``run_stamp`` must not blow up the payload.

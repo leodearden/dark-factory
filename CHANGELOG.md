@@ -12,8 +12,44 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 - `update_task` with none of `prompt`, `metadata`, `title`, `description`, `details`, `priority` or `dependencies` now raises `NoFieldsToUpdateError` (wire `error_type='NoFieldsToUpdateError'`) instead of bumping `updated_at` and returning `updated: True`; `dependencies=[]` and `metadata='{}'` still write (task 4867).
 - fused-memory's primary and recon-report MCP servers now refuse a tool call naming an argument the tool does not declare, instead of silently dropping it: a structured `ToolError` with `code='unknown_argument'`, each unknown name with its `closest_declared` name (a spelling guess, so no ready-to-resubmit call is offered) and the `declared` list. Nothing runs, and the server logs one WARNING per refusal. The declared set is read live from the tool's schema; the guard lets the call through unchecked when there is no usable schema. Fixed the in-repo callers that relied on the drop: the dashboard's Unpin no longer clears the whole override row (it sent `fields`; now one `field` per call), and its pin-queue reorder sends `ordered_task_ids` (task 4867).
+- fused-memory's task-mention scan (`fused_memory/utils/canonical_labels.py::scan_content`) now refuses digits glued to a letter or underscore (`task 8c7e163fcf` and `reify:8c7e163` yield nothing, no longer Task 8 and reify:8), reads every number of a `tasks A, B and C` / `tasks A/B` list after the plural task word (not only the first), and, given a project registry, reads `Reify task N` and `in reify, task N` as `reify:N` instead of the local Task N. Write-time derived referents (`utils/referent_resolution.py::resolve_referents`) change accordingly; without a registry the project-name reading is off (task 10082).
 
 ### Added
+
+#### Weekly duplicate-cluster report with a consecutive-run regrowth diff (task 3136)
+
+A new systemd user timer, `scripts/fused-memory-duplicate-audit.timer` (Sun 06:30),
+runs `fused-memory/scripts/duplicate_cluster_report.py`. That script runs the
+detector once per project and category, read-only, with `--no-metrics`. It saves each
+plan, writes `report-<STAMP>.json` and `summary-<STAMP>.txt` under
+`fused-memory/data/duplicate-cluster-reports/<project>/`, and diffs each report against
+that project's previous one. The diff covers cluster lineage by member overlap
+(`new`/`grew`/`shrank`/`split`/dissolved), splits added members into re-emitted and
+pre-existing, and lists per-category `incomparable_reasons`. Regrowth is also totalled
+per category, and the headline leaves out categories the previous report did not
+sweep. Each category's detector stderr is kept beside its plan as
+`plan-<STAMP>-<category>.stderr.log`. A previous report that cannot be read is
+refused before that project's sweep starts. The report is
+`authoritative: false` and files nothing. Gate filing stays blocked on the detector's
+recall and belongs to task 4916. `--plan` mode rebuilds a report from saved plans with
+no store access, which seeds the 2026-08-11 T0 baseline. Settings live in
+`fused-memory/config/duplicate-audit.yaml`, including the recall caveat every report
+carries. See OPERATIONS.md §12, "Weekly duplicate-cluster report (Sun 06:30)".
+
+The detector (`fused-memory/scripts/audit_duplicate_memories.py`) changes in three ways:
+
+- **Retention carve-out.** A cluster member carrying a non-empty `metadata.parent_id`
+  (`child_record`) or `metadata.topic` (`topic_stamped`) is never a delete candidate,
+  so `--apply` can no longer delete it. Such members are listed in the group's
+  `retained_members`, and the plan's `retained_carveout` counts them. Before this, a
+  stamped member of a mixed or differing-topic cluster could be deleted.
+- **Report-feed fields.** The stdout plan gains per-group `members` facts (`id`,
+  `created_at`, `topic`, `canonical`, `parent_id`, `kind`), a plan-level `child_counts`
+  over every scanned child record, and `scan_coverage`. Existing keys keep their
+  meaning.
+- **One `created_at` reading.** Survivor ordering and the report's member ages both
+  parse through `fused_memory.utils.created_at.parse_created_at`, which reads a naive
+  timestamp as UTC. The detector used to read one as host-local time.
 
 #### `mem0.persist_history` keeps mem0's change history off the shared DB (task 6100)
 

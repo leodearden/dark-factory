@@ -10,7 +10,7 @@ from typing import Any
 import pytest
 from escalation.authority import COORDINATOR_IDENTITY, EXECUTOR_IDENTITY, policy_row
 from escalation.models import Escalation
-from orchestrator.session_registry import (
+from orchestrator.decision_registry import (
     AuditOutcome,
     AuditVerdict,
     DecisionRecord,
@@ -22,9 +22,12 @@ from orchestrator.session_registry import (
     reopen_decision,
     write_decision,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from sitting import audits as mod
 from sitting import inventory
 from sitting.fleet_state import Window
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 NOW = datetime(2026, 9, 26, 5, 30, tzinfo=UTC)
 WINDOW = Window.trailing(NOW, days=mod.AUDIT_WINDOW_DAYS)

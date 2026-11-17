@@ -29,14 +29,18 @@
 // one of them after the first chip change.
 //
 // ONE MAP, ONE RENDER SITE. app.jsx renders the notices for TAB_ENDPOINTS[tab]
-// once, for the active tab, rather than thirteen per-tab banners, so adding a
+// once, for the active tab, rather than one banner per tab, so adding a
 // tab is a one-line edit here. poll_scope.test.mjs machine-checks BOTH
 // directions — every path is a real endpointsFor() key, and every app.jsx tab
 // id has an entry — because a map that silently stops matching a renamed
-// endpoint is a check that has quietly stopped checking. test_app_poll_scope.py
-// walks each tab's components and fails when a path the tab reads is missing
-// from its entry. `toolbarConfig` in app.jsx is the sibling per-tab map; keep
-// the two tab-id lists in step.
+// endpoint is a check that has quietly stopped checking.
+// dashboard/tests/js/render_app_shell.test.mjs renders each tab the rail opens,
+// plus the views its DEEPER_VIEWS map opens behind a click. It fails when a
+// path the tab's own component reads is missing from the tab's entry (/tasks
+// only if it reads task rows), and when anything on the open page reads a path
+// neither the entry nor CHROME_ENDPOINTS polls; a reader that renders only
+// behind a click is covered once DEEPER_VIEWS opens it. `toolbarConfig` in
+// app.jsx is the sibling per-tab map; keep the two tab-id lists in step.
 //
 // LIST /tasks FOR A TAB ONLY IF IT RENDERS TASK ROWS. Listing it polls the full
 // multi-MB render on that tab; the census every tab's chrome reads is already
@@ -88,15 +92,18 @@ const TAB_ENDPOINTS = Object.freeze({
     '/api/v2/dashboard/escalation-analytics',
   ]),
   'esc-analytics': Object.freeze(['/api/v2/dashboard/escalation-analytics']),
+  // Its own /quality read is on demand (data.js::ON_DEMAND_KEYS.quality);
+  // this is its project selector's PROJECTS.
+  quality: Object.freeze(['/api/v2/dashboard/orchestrators']),
 })
 
 // The endpoint PATHS the always-mounted chrome reads, whatever tab is open.
 // Polled on every tab, beside the open tab's own TAB_ENDPOINTS entry.
 //
-// EXACTLY the chrome's read set, no more: test_app_poll_scope.py derives what
-// app.jsx's rail/topbar and shell.jsx's toolbar actually read and fails if it
-// differs from this list in either direction — a missing path freezes a badge
-// on every other tab, and a dead one polls an endpoint for nothing.
+// EXACTLY the chrome's read set, no more: render_app_shell.test.mjs renders
+// every tab and fails when a tab reads a path its poll set leaves out, or when
+// a path here goes unread on some tab — a missing path freezes a badge on every
+// other tab, and a dead one polls an endpoint for nothing.
 const CHROME_ENDPOINTS = Object.freeze([
   '/api/v2/dashboard/orchestrators', // rail orch badge, topbar orch counts, Toolbar PROJECTS
   '/api/v2/dashboard/tasks',         // rail and topbar census (census only)

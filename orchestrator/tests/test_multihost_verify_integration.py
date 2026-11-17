@@ -918,7 +918,7 @@ class TestStartupGuards:
         )
 
         # num_hosts=1, bound=2 → per_host = ceil(2/1) = 2 > 1 → raises
-        import pytest as _pytest  # noqa: PLC0415
+        import pytest as _pytest
         with _pytest.raises(PersistentWorktreeConfigError):
             enforce_persistent_worktree_serial_lane(
                 cfg_persistent, merge_ahead_bound=2, num_hosts=1
@@ -1353,7 +1353,7 @@ class _ShortSleepClock:
     def monotonic(self) -> float:
         return time.monotonic()
 
-    def newest_content_mtime(self, root: Path) -> float | None:  # noqa: ARG002
+    def newest_content_mtime(self, root: Path) -> float | None:
         return None
 
     def verify_cpu_ticks(self, root: Path) -> int | None:
@@ -1436,7 +1436,7 @@ class _HostEscalationQueue:
     def submit(self, esc: Any) -> None:
         self.submitted.append(esc)
 
-    def get_by_task(self, task_id: str, status: str | None = None, **kw: Any) -> list[Any]:  # noqa: ARG002
+    def get_by_task(self, task_id: str, status: str | None = None, **kw: Any) -> list[Any]:
         return self._open_l1s(task_id)
 
     def resolve(self, esc_id: str, resolution: str, **kw: Any) -> None:

@@ -45,6 +45,7 @@ from _fake_t3_server import (
     ToolSuccess,
     replies_in_turn,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 # `_load_scaled_grace` lives in df_pytest_isolation (task 4890 promoted it out
 # of this file so scripts/tests/ could reach it); aliased back to the local
@@ -57,6 +58,8 @@ from orchestrator import (
     session_hooks,  # pyright: ignore[reportAttributeAccessIssue]
     session_registry,  # pyright: ignore[reportAttributeAccessIssue]
 )
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 SPAWN_SCRIPT = REPO_ROOT / "skills" / "spawn" / "spawn-claude.sh"

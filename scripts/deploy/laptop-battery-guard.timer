@@ -1,0 +1,11 @@
+[Unit]
+Description=Poll the laptop battery guard every 30 s (task 9051)
+
+[Timer]
+# Tune the poll interval with `systemctl edit laptop-battery-guard.timer`.
+OnBootSec=1min
+OnUnitActiveSec=30s
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target

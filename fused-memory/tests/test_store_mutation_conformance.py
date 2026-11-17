@@ -119,8 +119,11 @@ import re
 
 import pytest
 from _ast_guard import calls_named, imported_names_from, parse_python_module
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.utils.store_mutation_preflight import PREFLIGHT_EXEMPT_SCRIPTS
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # ---------------------------------------------------------------------------
 # The classifier (task 4280 / 4848)

@@ -66,6 +66,7 @@ from orchestrator.git_ops import GitOps, _run
 from orchestrator.harness import Harness
 from orchestrator.lane_lifecycle import LaneLifecycle
 from orchestrator.lane_lifecycle import LaneState as DurableLaneState
+from orchestrator.quarantine_provenance import NOT_RELOCATED
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.warm_lane_pool import WarmLanePool
 from orchestrator.workflow import TaskWorkflow
@@ -108,7 +109,7 @@ def harness(tmp_path: Path, mock_orch_config):
     # Mount-presence guard: mark storage present so recovery does not defer.
     h.git_ops.mark_pool_storage_present()
     h.git_ops.cleanup_worktree = AsyncMock()
-    h.git_ops.quarantine_worktree = AsyncMock(return_value=None)
+    h.git_ops.quarantine_worktree = AsyncMock(return_value=NOT_RELOCATED)
     # Rebind lane lifecycle onto the reassigned worktree_base (W11 delta).
     h.git_ops._lane_lifecycle = LaneLifecycle(
         h.git_ops.worktree_base, quarantine_worktree=h.git_ops.quarantine_worktree,

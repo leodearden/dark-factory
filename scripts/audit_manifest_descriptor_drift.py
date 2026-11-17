@@ -875,7 +875,7 @@ def audit_project(project_root: str, manifest_root: str | None = None) -> Projec
     # told that instead of reading a zero as "none found".
     try:
         audited_project_id: str | None = resolve_project_id_for_root(root)
-    except Exception as exc:  # noqa: BLE001 — recorded, never swallowed
+    except Exception as exc:  # recorded, never swallowed
         audited_project_id = None
         uncomparable_details.append(
             f"{root}: could not resolve this project's own project_id "
@@ -886,7 +886,7 @@ def audit_project(project_root: str, manifest_root: str | None = None) -> Projec
     for relpath in relpaths:
         try:
             doc = load_capability_manifest(Path(manifests_root) / relpath)
-        except Exception as exc:  # noqa: BLE001 — recorded, never swallowed
+        except Exception as exc:  # recorded, never swallowed
             # NAMED, not merely counted: a sweep that could not read half the
             # corpus must never read as complete (no-silent-fail-soft).
             parse_failure_details.append(f"{relpath}: {exc}")
@@ -969,7 +969,7 @@ def audit_project(project_root: str, manifest_root: str | None = None) -> Projec
 
                 try:
                     expected = _expected_meta(capability.name, check)
-                except Exception as exc:  # noqa: BLE001 — recorded, never swallowed
+                except Exception as exc:  # recorded, never swallowed
                     # SYMMETRIC with the task-record guard below, and for the
                     # same reason: an unconvertible descriptor is a coverage
                     # row, never a finding and never an abort. See
@@ -984,7 +984,7 @@ def audit_project(project_root: str, manifest_root: str | None = None) -> Projec
 
                 try:
                     actual = DeliveredCheckMeta(**entry).model_dump()
-                except Exception as exc:  # noqa: BLE001 — recorded, never swallowed
+                except Exception as exc:  # recorded, never swallowed
                     # NAMED, never silently dropped. A task-record entry
                     # that will not validate cannot be compared, and is a
                     # different defect from a drifted one — it goes to the

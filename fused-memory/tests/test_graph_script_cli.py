@@ -6,6 +6,9 @@ from pathlib import Path
 
 import pytest
 from _fm_helpers import load_script_module
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SCRIPTS = Path(__file__).parent.parent / 'scripts'
 cli = load_script_module(SCRIPTS / '_graph_script_cli.py', mod_name='_graph_script_cli')

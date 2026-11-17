@@ -501,21 +501,52 @@ what decides whether its row stays `in-progress` or lands in `blocked`:
   steward_max_timeouts_per_escalation` windows for a steward that keeps
   invoking its agent — bounded by the steward's own attempt ceilings, which is
   the property that makes it INV-7 `holds-owned-and-bounded`-legal. A record
-  that is born-at-L2 (severity `critical`/`urgent`) or at `level ≥ 2`
+  that is born-at-L2 (severity `critical`/`urgent`) or a non-info record at
+  `level ≥ 2` (the predicate is `escalation/src/escalation/pins.py::needs_human`)
   short-circuits the wait immediately: the orchestrator does not hold a slot
   waiting on a human. This now covers **every** phase, MERGE entry included —
   `_handle_merge_gate_escalations`
   (`orchestrator/src/orchestrator/workflow.py`) replaced the old
   steward-less bail, which returned `ESCALATED` with no steward, no wait and no
   status write, leaving `in-progress` + NULL claimant + an open gating record
-  with nothing running to advance it (task 3536 / PRD γ1 / spec §8-E1).
+  with nothing running to advance it (task 3536 / PRD γ1 / spec §8-E1). An
+  info L2 never short-circuits the wait, in any phase.
 - **(b) Blocked exit.** When the wait concludes without resolution — idle-window
   expiry, steward re-escalation, or a gating record still open on the
   single-shot re-check — `_mark_blocked` parks the row `blocked` and frees the
-  slot. The open escalation record then *is* the ownership token and the wake
+  slot. The block reason names the hand-off that fired: 'Steward re-escalated
+  to human' only when this wait's steward filed the hand-off
+  (`orchestrator/src/orchestrator/workflow.py::_StewardReescalated`), otherwise
+  'Gated by open L2 <ids>; no steward applicable' (`_NoStewardApplicable`,
+  which also lists the L1 ids when an L1 hand-off ended the wait). The open
+  escalation record then *is* the ownership token and the wake
   edge: resolving it re-pends the task (§6). The gate predicate itself
   (`_is_gating_escalation`) is untouched stop-the-line either way — nothing
-  merges past an open gating record.
+  merges past an open gating record. An info record is never a gating record
+  at any level, because the predicate consults `needs_human`, so a green,
+  reviewed branch whose only open records are info merges.
+
+**Info notes have a consumer chain, not a gate.** An `escalate_info` record
+(severity `info`) never moves the workflow to `ESCALATED`, never gates, never
+short-circuits the wait, and never vetoes recovery: the recovery sites read
+`classify_pins`, where info is non-pinning (§3.7). Its consumers, in order:
+
+1. The comprehensive reviewer. It is briefed with its own task's open
+   agent-filed notes and returns a `note_dispositions` list in its verdict,
+   which `TaskWorkflow._apply_note_dispositions` applies through
+   `orchestrator/src/orchestrator/escalation_router.py::apply_reviewer_disposition`.
+2. A steward that is already running for a blocking record.
+3. The info-L0 router, run as the `disposition_info_l0s` entry of
+   `TaskWorkflow._on_terminal_cleanups` — after `stop_steward`, before
+   `release_lane` — on DONE, MERGE_DEFERRED, BLOCKED/ESCALATED and CANCELLED
+   exits. A requeued (or plan-only) exit leaves its notes pending for the
+   next incarnation's reviewer, and the orphan reaper backstops them (§6).
+
+The post-merge success tail starts a steward only for a pending blocking L0
+(`TaskWorkflow._pending_steward_l0s`). The decision table is
+`escalation/src/escalation/disposition.py::route_info_l0`, and the rationale
+is [plans/info-l0-disposition-router-prd.md](plans/info-l0-disposition-router-prd.md)
+D1–D3 and D7.
 
 Which exit status each outcome must write is specified normatively in
 [docs/task-escalation-state-spec.md](docs/task-escalation-state-spec.md) §4
@@ -636,8 +667,16 @@ and are not restated here.
     below, a dead-filer L0 does not suppress that re-file.
   - **Both blocked-arm predicates** carry the `MERGE_REMEDIABLE_ESC_CATEGORIES`
     relaxation, so a record set made up entirely of `stranded_blocked`
-    records does not veto the merge it asks for. They differ on exactly one
-    input: a dead-filer L0 holds the done-flip but not the recovery.
+    records does not veto the merge it asks for. The recovery predicate
+    applies it only while no record needs a human
+    (`escalation/src/escalation/pins.py::needs_human`): a re-dispatch would
+    meet the workflow gate that stops on that record, and the off-main
+    verified-green submit goes straight to the merge queue and would merge
+    past it, which repend-PRD D4 stop-the-line forbids (task 6145). They differ
+    on exactly three inputs: a dead-filer L0 holds the done-flip but not the
+    recovery; a lone `preexisting_main_break` record holds the recovery but
+    not the on-main done-flip; and a human-held `stranded_blocked` record
+    holds the recovery but not the done-flip.
   - **Owned-record question.** `Harness._reconcile_one_stranded`'s re-file
     dedup asks `records_would_duplicate_a_handoff`, which counts a dead-filer
     L0 even though it does not pin: the orphan-L0 reaper will promote it, so a
@@ -675,7 +714,7 @@ and are not restated here.
   blocked-arm upgrade clauses would move again on the next sweep —
   `orchestrator/src/orchestrator/recovery_pins.py::records_pin_blocked_recovery`
   is False, because it is pinned only by merge-remediable `stranded_blocked`
-  records or only by dead-filer L0s — would not be at rest in `blocked`, so it
+  records that no human holds, or only by dead-filer L0s — would not be at rest in `blocked`, so it
   is held at `LEAVE` instead. The write is observe-before-enforce, gated by
   `convert_to_blocked_enforce`
   (`orchestrator/src/orchestrator/config.py::OrchestratorConfig`). With it
@@ -689,11 +728,12 @@ and are not restated here.
   quarantines, then reaps, `.worktrees/*` directories left behind by a
   crashed or killed workflow.
 - **Orphaned L0 records.** A *separate* sweep,
-  `Harness._reap_orphan_l0_escalations` (`harness.py`), promotes to L1 any L0
+  `Harness._reap_orphan_l0_escalations` (`harness.py`), takes any L0
   escalation *record* older than `orphan_l0_timeout_secs` whose **filing**
-  incarnation is provably dead, judged by the classifier's L0 liveness link
-  (§6). A newer live workflow on the same task does not keep a prior
-  incarnation's L0 alive. The two are easily conflated — one reaps
+  incarnation is provably dead, judged by the classifier's L0 liveness link:
+  it routes a note the info-L0 router owns through that router and promotes
+  any other record to L1 (§6 has the full predicate). A newer live workflow
+  on the same task does not keep a prior incarnation's L0 alive. The two are easily conflated — one reaps
   directories, the other reaps queue rows.
 - **Retry caps** bound every retryable failure mode (`requeue_cap=3`,
   `transient_requeue_cap=10`, `max_consecutive_infra_resumes=3`,
@@ -879,7 +919,8 @@ Every escalation is one row in a single model
 by `level`:
 
 ```
-L0  level=0   producer: agent             consumer: steward (per-task, interactive-equivalent review)
+L0  level=0   producer: agent             consumer: blocking → steward (per-task, interactive-equivalent review)
+                                                    info     → reviewer → running steward → info-L0 router
 L1  level=1   producer: steward/workflow  consumer: escalation-watcher-auto (automated triage)
 L2  level=2   producer: auto-watcher      consumer: human (direct — bypasses the auto-watcher)
 ```
@@ -897,8 +938,10 @@ flowchart LR
 
 - **L0.** A per-task `TaskSteward` — a single, persistent Claude session
   across every escalation that task ever raises, with a lifetime budget (§4)
-  — the first responder for any workflow failure.
-- **L0 → L1.** Two routes. Automatically,
+  — the first responder for any workflow failure. An info L0 is consumed by
+  the chain in §3.6, not by the steward ladder.
+- **L0 → L1.** Two routes for a blocking record, and a third for info.
+  Automatically,
   `TaskSteward._auto_escalate_to_human` files a fresh `level=1` escalation and
   dismisses the L0 when the steward exhausts its budget, hits a
   retry/timeout/empty-output cap, or finds its worktree missing at preflight.
@@ -918,8 +961,38 @@ flowchart LR
   filer's liveness — unless it is `info` severity, which never pins at any
   level. `TaskSteward._auto_escalate_to_human`
   (`orchestrator/src/orchestrator/steward.py`) carries the L0's severity onto
-  the L1. A separate orphan sweep (`Harness._reap_orphan_l0_escalations`)
-  promotes to L1 an aged L0 whose filing incarnation is dead (§3.7).
+  the L1. The third route, for info only, is the info-L0 router filing its
+  own L1s. A work-shaped note it cannot convert into a task is dismissed and promoted to
+  one fallback L1 under agent_role `harness-info-l0-router` with
+  suggested_action `convert_to_task`, with the author's text kept in
+  `detail`. The router also files one status-info aggregate L1 per mechanical
+  class per sweep. OPERATIONS.md §5 "Info notes, deliberate holds, and the
+  info-L0 router" says how to read both.
+
+  *Orphan sweep and restart amnesty, as built*
+  ([plans/info-l0-disposition-router-prd.md](plans/info-l0-disposition-router-prd.md)
+  D6/D7). The orphan sweep (`Harness._reap_orphan_l0_escalations`) acts only
+  on L0s older than `orphan_l0_timeout_secs`, and dismisses an eval-lane
+  record outright. The rest split on whether the info-L0 router owns the
+  record (`orchestrator/src/orchestrator/escalation_router.py::router_owns`:
+  an info L0 outside the eval lane, while `info_l0_router_enabled` is on). A
+  router-owned note already held on a curator ticket is finished first, even
+  with a live workflow. Otherwise the sweep skips a record while a workflow
+  attends the task (`_escalation_events`) or the scheduler holds it
+  (`Scheduler.is_actively_held`), unless `classify_pins` proves the filing
+  incarnation gone (§3.7). A router-owned record is then routed
+  (`escalation_router.py::InfoL0Sweep`, exit kind `orphan`). A record the
+  router does not own (every blocking record, and any info record while
+  `info_l0_router_enabled` is off) keeps the old path: covered-by-open-L1
+  dismissal (`EscalationQueue.dismiss_if_covered`), the done-step-commit
+  rebase-superseded dismissal, then verbatim promotion to L1 with
+  `manual_intervention`. The done-step tripwire files `info`, so that middle
+  arm is reached only with the router off. The startup amnesty
+  `Harness._dismiss_stale_escalations` first routes the router-owned notes
+  and finishes their holds (`_route_info_l0s_across_restart`, exit kind
+  `restart`). Its `dismiss_all_pending` then keeps those notes for the
+  reaper, so only L0s the router does not own are dismissed and counted as
+  stale strands.
 - **L1 auto-watcher.** A repeatedly-spawned Claude CLI rotation (§2.1) that
   only launches when there's an actionable pending L1, running the
   `escalation-watcher-auto` skill.
@@ -927,7 +1000,14 @@ flowchart LR
   updating a root-cause-deduplicated `level=2` escalation whose `members`
   list references the contributing L1 escalation ids (which stay at level
   1). Promotion is gated to the watcher's own identity or an unauthenticated
-  (human) caller.
+  (human) caller. A promote with `severity` omitted over a cluster whose
+  members are all info is refused —
+  `{'status': 'refused', 'code': 'info_only_cluster', …}` — and nothing is
+  minted or folded (`escalation/src/escalation/server.py::promote_to_l2`). The
+  auto-watcher then closes the members at L1, or re-issues with an explicit
+  blocking severity when its RCA judges the cluster collectively blocking
+  (the rung is in `skills/escalation-watcher-auto/SKILL.md`, "Info-only
+  cluster"), so the L2 queue holds no inherited-info records.
 - **Born-at-L2.** `escalate_blocker`/`escalate_info` called with severity
   `critical` or `urgent` are stamped `level=2` immediately — but **only**
   when the filer's `agent_role` is a recognized harness sentinel (e.g.

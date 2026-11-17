@@ -37,6 +37,7 @@ from pathlib import Path
 
 import pytest
 from shared.tasks_db_readonly import connect_ro
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from tasks_db_schema import (
     EXIT_OK,
     EXIT_UNREADABLE,
@@ -47,6 +48,8 @@ from tasks_db_schema import (
     main,
     resolve_live_db_path,
 )
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # ---------------------------------------------------------------------------
 # Git fixtures. Real repositories rather than a stubbed `git worktree list`:

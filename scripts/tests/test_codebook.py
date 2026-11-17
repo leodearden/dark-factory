@@ -22,6 +22,9 @@ from legibility import codebook as mod
 from legibility import coder, disposition, invariants, verdict
 from legibility_task_store_fake import FakeTaskStore
 from shared.finding_key import finding_key
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # ---------------------------------------------------------------------------
 # Fixtures

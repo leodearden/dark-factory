@@ -55,7 +55,7 @@ from test_merge_queue_concurrent_verify import (
 )
 from test_merge_speculation import _LateArrivalFakeEventStore
 
-from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.config import GitConfig, MergeDeepConfig, OrchestratorConfig
 from orchestrator.event_store import EventType
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_lane import MergeLane
@@ -90,7 +90,9 @@ def git_ops(git_config: GitConfig, git_repo: Path) -> GitOps:
 
 @pytest.fixture
 def config(git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
-    return lane_scene_config(git_repo, git_config)
+    """Deep chains off (tasks 7720, 8527): every scene here needs its successors
+    merged and verified one by one, not chained by a head or follower dispatch."""
+    return lane_scene_config(git_repo, git_config, merge_deep=MergeDeepConfig(chain_cap=0))
 
 
 class _BaseRecordingVerifier(FakeVerifier):
@@ -276,7 +278,11 @@ def _awaiting_host(lane: MergeLane) -> list[str]:
 
 
 def _leased_task_ids(lane: MergeLane) -> list[str]:
-    return [row['task_id'] for row in lane.snapshot()['occupancy']['leases']]
+    """The task ids holding a host lease; an entry released at its verdict holds none."""
+    return [
+        row['task_id'] for row in lane.snapshot()['occupancy']['leases']
+        if row['activity'] != 'verified_pending_landing'
+    ]
 
 
 async def _stacked_base(store: _LateArrivalFakeEventStore, task_id: str) -> str:
@@ -560,9 +566,14 @@ class TestTornDownSuccessorRecordsItsCommitDead:
 @pytest.mark.asyncio
 @pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)
 class TestRebasedHeadWaitsFirstForAHost:
+    """PRD §7 boundary row 6, at the serial K = 1 and at K = hosts + 1 (task 8526)."""
 
+    @pytest.mark.parametrize('speculation_depth', [
+        pytest.param(1, id='serial-k'),
+        pytest.param(3, id='k-hosts-plus-1'),
+    ])
     async def test_a_rebased_head_with_no_free_host_waits_first_in_line_and_takes_the_first_free_host(
-        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path, speculation_depth: int,
     ) -> None:
         head_gate = asyncio.Event()
         remote_release = asyncio.Event()
@@ -571,7 +582,9 @@ class TestRebasedHeadWaitsFirstForAHost:
         })
         store = _LateArrivalFakeEventStore()
 
-        async with _running_lane(git_ops, verifier=verifier, event_store=store) as (lane, queue):
+        async with _running_lane(
+            git_ops, verifier=verifier, event_store=store, speculation_depth=speculation_depth,
+        ) as (lane, queue):
             remote = _gated_runner(remote_release, name='remote-wh')
             allocator = _inject_two_host_allocator(
                 lane, remote, allocator_cls=_LocalSlotTakenOnceFreed,

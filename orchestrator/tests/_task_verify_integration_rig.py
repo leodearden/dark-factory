@@ -22,7 +22,7 @@ The laptop runs on the same repository as the workstation, under its own
 ``git.worktree_dir`` (:data:`LAPTOP_WORKTREE_DIR`), so a leg can tell from its
 cwd which host ran it (:class:`Legs`).
 
-This module imports no merge-lane module (``scripts/merge_lane_metrics.py::
+This module imports no merge-lane module (``scripts/merge_lane_cluster.py::
 imports_lane_module``): it reaches GitOps and the merge worker only through
 Harness attributes and the worker's public methods.
 """
@@ -811,6 +811,7 @@ class Scene:
         """Start the harness's own merge worker, with the escalation queue run() would give it."""
         self.harness._escalation_queue = EscalationQueue(self.tmp_path / 'escalations')
         await self.harness._start_merge_worker()
+        await self.harness._launch_merge_worker_loop()
         self._worker_started = True
 
     async def stop_worker(self) -> None:

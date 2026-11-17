@@ -31,7 +31,7 @@ dispatch loop (``Harness._run_stale_service_restart_pass``), passing
 
 from __future__ import annotations
 
-# noqa: F401 below — no direct call site in this module (the actual
+  # below — no direct call site in this module (the actual
 # asyncio.create_subprocess_exec now lives in proc_supervision.RestartPlan.
 # execute()), but this binding is load-bearing: some tests OUTSIDE this
 # task's locked scope patch it via the

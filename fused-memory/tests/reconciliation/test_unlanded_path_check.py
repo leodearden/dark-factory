@@ -30,8 +30,8 @@ from fused_memory.reconciliation.cli_stage_runner import FINDING_ITEM_SCHEMA
 from fused_memory.reconciliation.flag_dedup import (
     ABSENCE_FLAG_TYPES,
     STALE_METADATA_FAMILY,
-    compute_flag_signature,
 )
+from fused_memory.reconciliation.flag_identity import compute_flag_signature
 from fused_memory.reconciliation.unlanded_path_check import (
     UNLANDED_PATH_FLAG_CATEGORY,
     UNLANDED_PATH_FLAG_TYPE,

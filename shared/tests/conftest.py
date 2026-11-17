@@ -1,7 +1,6 @@
 """pytest configuration — ensure local src takes precedence over installed package."""
 import importlib
 import sys
-from functools import partial
 from pathlib import Path
 from types import ModuleType
 
@@ -14,6 +13,11 @@ if str(_SRC) not in sys.path:
 _TESTS_DIR = Path(__file__).parent
 if str(_TESTS_DIR) not in sys.path:
     sys.path.insert(0, str(_TESTS_DIR))
+# Helpers this suite shares with tests/repo_guards/, which inserts the same
+# directory (the orchestrator/tests/cross_suite_helpers precedent, task 8507).
+_CROSS_SUITE_HELPERS_DIR = _TESTS_DIR / 'cross_suite_helpers'
+if str(_CROSS_SUITE_HELPERS_DIR) not in sys.path:
+    sys.path.insert(0, str(_CROSS_SUITE_HELPERS_DIR))
 
 # Suite-wide git isolation (task 3355, incident esc-3072-3).  The verify lane
 # runs `cd shared && uv run pytest tests/`, which makes rootdir the SUBPROJECT —
@@ -37,14 +41,8 @@ from df_pytest_isolation import (  # noqa: E402
     arm_usage_gate_sweep_confinement,
     reject_unsafe_basetemp,
 )
-from session_prebuild import SessionPrebuild  # noqa: E402
-from silent_fallthrough_scan import ParsedFile, parse_first_party_tree  # noqa: E402
 
 from shared import usage_gate  # noqa: E402
-
-_FIRST_PARTY_TREE = SessionPrebuild(
-    'first_party_tree', partial(parse_first_party_tree, REPO_ROOT)
-)
 
 
 def pytest_configure(config):
@@ -52,11 +50,6 @@ def pytest_configure(config):
     reject_unsafe_basetemp(config)
     arm_leaked_drain_process_guard(config)
     arm_usage_gate_sweep_confinement(config, usage_gate)
-
-
-def pytest_collection_finish(session):
-    """Build the first-party tree here: after collection, before any item's pytest-timeout timer."""
-    _FIRST_PARTY_TREE.prebuild_if_requested(session)
 
 
 @pytest.fixture
@@ -109,28 +102,3 @@ def reload_module_under_env(monkeypatch):
         monkeypatch.undo()
         for module in reloaded:
             importlib.reload(module)
-
-
-@pytest.fixture(scope='session')
-def first_party_tree(request: pytest.FixtureRequest) -> tuple[ParsedFile, ...]:
-    """The whole first-party source tree, read and parsed ONCE per session.
-
-    The single source every gate module in this directory walks (task 4520).
-    The one read+parse happens in ``pytest_collection_finish``, and only when a
-    collected item requests this fixture, so it sits outside every item's
-    pytest-timeout timer (see ``session_prebuild``). Under xdist each worker
-    collects every item, so each worker that collects a requester builds its
-    own copy.
-
-    The provider is memoized on the resolved root, so a direct
-    ``parse_first_party_tree(REPO_ROOT)`` call returns the same object. Its
-    other cost is memory: ~361 MB of ASTs retained until the process exits.
-    ``parse_first_party_tree``'s docstring records both halves and why the trade
-    is currently made in CPU's favour — read it before tuning either.
-
-    Take it as a fixture argument: a dynamic
-    ``request.getfixturevalue('first_party_tree')`` is invisible at collection
-    and fails loudly. Consumers walk the ASTs READ-ONLY — they are shared with
-    every other gate.
-    """
-    return _FIRST_PARTY_TREE.result(request.session)

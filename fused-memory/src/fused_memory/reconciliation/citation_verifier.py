@@ -24,9 +24,10 @@ dangling pointers behind it. These run from the ``delete_memory`` MCP tool
 handler's citation-repoint gate, NOT from ``MemoryConsolidator.run()``: the
 consolidator never deletes from Python, so a sweep inside ``run()`` would
 execute AFTER the delete and could only report damage. Their stats therefore
-ride back on the ``delete_memory`` response under ``citation_repoint`` and
-deliberately carry NO ``stage1_`` prefix — they are tool-response stats, not
-stage-report stats.
+ride back on the ``delete_memory`` response under ``citation_repoint``: they
+are tool-response stats, never merged into any stage report. The ``stage1_``
+prefix on their scalar counters is that response's key spelling, kept for
+compatibility with its consumers.
 
 Half 3 — PROSE citations (task 4818), and the one half that only WARNS.
 Halves 1 and 2 act on STRUCTURED citations: a finding's ``cited_memories``
@@ -750,7 +751,7 @@ async def scan_prose_citations(
             tombstone = await memory_service.get_mem0_deletion_tombstone(
                 project_id, memory_id,
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             outcome: tuple[str, str | None] = ('inconclusive', type(exc).__name__)
         else:
             outcome = ('tombstoned', None) if tombstone else ('absent', None)
@@ -1299,14 +1300,16 @@ async def repoint_task_citations(
     project would need ``list_tags()`` aggregation. Out of scope here.
 
     Returns a stats dict whose keys are ALWAYS present, on every path. Scalar
-    counters carry a HARD-CODED ``stage1_*`` prefix, because they are merged
-    into the flat Stage-1 stats block where an unprefixed name would collide.
-    Unlike :func:`verify_cited_memories` — which is now per-stage and takes a
-    ``stat_prefix`` — this sweep is genuinely Stage-1-only: it runs from the
-    ``delete_memory`` MCP tool handler's citation-repoint gate, never from any
-    stage's ``run()``, so there is no second stage for it to serve. The detail
-    LISTS (``terminal_citations``, ``unrepointed``) are consumed structurally
-    by the delete gate and stay unprefixed.
+    counters carry a HARD-CODED ``stage1_*`` prefix: that is the key spelling
+    of the ``citation_repoint`` tool-response payload, kept for compatibility
+    (``server/tools.py::_citation_repoint_gate`` reads
+    ``stage1_citation_repoint_failures``). These stats are never merged into
+    any stage's ``report.stats``. Unlike :func:`verify_cited_memories`, which
+    takes a ``stat_prefix`` because ``BaseStage.run()`` merges its stats per
+    stage, this sweep runs only from the ``delete_memory`` citation-repoint
+    gate, so its prefix is fixed rather than parameterised. The detail LISTS
+    (``terminal_citations``, ``unrepointed``) are consumed structurally by the
+    delete gate and stay unprefixed.
     """
     log = log or logger
     stats: dict[str, Any] = {
@@ -1432,7 +1435,7 @@ async def repoint_task_citations(
             )
         except (KeyboardInterrupt, SystemExit):
             raise
-        except Exception as exc:  # noqa: BLE001 — best-effort per-task sweep
+        except Exception as exc:  # best-effort per-task sweep
             log.warning(
                 'citation repoint failed for task %s (%s -> %s): %s',
                 task_id, memory_id, replacement_id, exc,

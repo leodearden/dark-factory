@@ -32,7 +32,6 @@ def test_the_paged_read_module_loads_no_graphiti_and_no_falkordb():
     ('graphiti_client_name', 'paged_read_name'),
     [
         ('PagedRead', 'PagedRead'),
-        ('_paged_ro_query', 'paged_ro_query'),
         ('_DEFAULT_READ_PAGE_SIZE', 'DEFAULT_READ_PAGE_SIZE'),
         ('_RESULTSET_SIZE', 'RESULTSET_SIZE'),
         ('INCOMPLETE_STRUCTURAL_KINDS', 'INCOMPLETE_STRUCTURAL_KINDS'),

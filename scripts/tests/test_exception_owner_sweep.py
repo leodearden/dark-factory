@@ -2,7 +2,8 @@
 
 Under test, through public names only: the register input boundary and the
 finding key; the scan/act core against a real temp tasks.db and an in-process
-stub of both MCP servers (``StubMcp``); filing confirmation, the storm bound,
+stub of both MCP servers (``StubMcp``, in ``owner_sweep_stub``); filing
+confirmation, the storm bound,
 the ``x_inv12_owns`` pointer note, the run stamp, ``--dry-run``, fail-loud and
 the CLI.  ``plans/inv12-exceptions-owned-or-ratified-prd.md`` D11, Contract
 "Sweep", scenarios 16-24.  Fixture markers live in string literals only.
@@ -13,6 +14,7 @@ from __future__ import annotations
 import datetime
 import json
 import os
+import shlex
 import shutil
 import socket
 import sqlite3
@@ -23,9 +25,10 @@ from pathlib import Path
 
 import exception_register
 import pytest
-from _task_db_scan import decode_metadata, tasks_db_path
+from _task_db_scan import tasks_db_path
 from exception_owner_liveness import Liveness
 from exception_owner_sweep import (
+    DRY_RUN_COMMAND,
     FAILURE_TASK_ID,
     FINDING_KEY_FIELD,
     INLINE_SCOPE,
@@ -36,7 +39,6 @@ from exception_owner_sweep import (
     TIGHTEN_COMMAND,
     TIGHTEN_KEY,
     Action,
-    ActOutcome,
     Citation,
     FailureStage,
     FindingKey,
@@ -47,7 +49,6 @@ from exception_owner_sweep import (
     RunConfig,
     SweepFailure,
     SweepResult,
-    Tally,
     act,
     build_ports,
     escalation_url,
@@ -56,9 +57,18 @@ from exception_owner_sweep import (
     run,
     scan,
 )
-from fused_memory.middleware.candidate_key import compute_candidate_key
 from inline_suppression_fixtures import RUFF_CONFIG, SUBPROCESS_TIMEOUT_SECS, track_fixture_tree
 from inline_suppressions import BASELINE_PATH
+from owner_sweep_stub import (
+    FIRST_CREATED_ID,
+    NOW,
+    StubMcp,
+    act_once,
+    insert_task,
+    ports_for,
+    set_status,
+    sweep_once,
+)
 from shared.governed_exceptions import (
     Debt,
     Disposition,
@@ -69,6 +79,9 @@ from shared.governed_exceptions import (
     owner_record,
 )
 from shared.testing_mcp_stub import StubMcpServer
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 TICKET = TicketRef('tkt_0A')
 
@@ -311,131 +324,8 @@ def test_a_failing_register_is_a_register_failure(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# The scan/act harness: a real temp tasks.db and an in-process StubMcp.
-
-NOW = datetime.datetime(2026, 10, 17, 6, 0, tzinfo=datetime.UTC)
-
-#: Where the stub's curator inserts the tasks it creates: clear of every seeded id.
-FIRST_CREATED_ID = 9001
-
-
-class StubMcp:
-    """Both MCP servers, in process, at the sweep's ToolCall port signature.
-
-    Records every call as ``(server, tool, args)``.  On the fused-memory side it
-    plays the curator: a submitted candidate resolves per ``submit_outcome``,
-    and a created task is INSERTED into the temp store with the submitted
-    metadata.  ``'pending'`` answers the unpersisted ``timeout`` of a curator
-    that has not finished, so the task may still appear after the sweep has
-    stopped waiting.  Like the store's ``(tag, candidate_key)`` index, which
-    covers done rows, it folds a created submission into any non-cancelled row
-    of the same key.  The stub writes; the sweep only reads.
-    """
-
-    def __init__(
-        self,
-        db: Path,
-        *,
-        owner_tickets: Mapping[str, dict] | None = None,
-        submit_outcome: str = 'created',
-        combine_into: int | None = None,
-        fail_on: frozenset[str] = frozenset(),
-    ) -> None:
-        self.db = db
-        self.owner_tickets = dict(owner_tickets or {})
-        self.submit_outcome = submit_outcome
-        self.combine_into = combine_into
-        self.fail_on = fail_on
-        self.calls: list[tuple[str, str, dict]] = []
-        self.pending: list[dict] = []
-        self.submitted: dict[str, dict] = {}
-        self.next_task_id = FIRST_CREATED_ID
-
-    def tool_calls(self, tool: str) -> list[dict]:
-        return [args for _, called, args in self.calls if called == tool]
-
-    def _record(self, server: str, tool: str, args: Mapping[str, object]) -> None:
-        self.calls.append((server, tool, dict(args)))
-        if tool in self.fail_on:
-            raise ConnectionError(f'{tool}: connection refused')
-
-    def fused_memory(self, tool: str, args: Mapping[str, object]) -> Mapping[str, object]:
-        self._record('fused-memory', tool, args)
-        if tool == 'submit_task':
-            if self.submit_outcome == 'error':
-                return {'error': 'curator queue closed', 'error_type': 'RuntimeError'}
-            ticket = f'tkt_S{len(self.submitted) + 1}'
-            self.submitted[ticket] = dict(args)
-            return {'ticket': ticket}
-        if tool == 'resolve_ticket':
-            ticket = str(args['ticket'])
-            if ticket in self.owner_tickets:
-                return self.owner_tickets[ticket]
-            return self._resolve_submitted(self.submitted[ticket])
-        if tool == 'update_task':
-            return self._update(int(str(args['id'])), args['metadata'])
-        raise AssertionError(f'unexpected fused-memory tool {tool}')
-
-    def _colliding_row(self, args: dict) -> int | None:
-        key = compute_candidate_key(args['title'], args['metadata'].get('files'))
-        if key is None:
-            return None
-        with sqlite3.connect(self.db) as conn:
-            rows = conn.execute(
-                "SELECT id, title, metadata FROM tasks WHERE tag = 'master' AND status != 'cancelled'"
-            ).fetchall()
-        return next(
-            (
-                row_id
-                for row_id, title, raw in rows
-                if compute_candidate_key(title, decode_metadata(raw).get('files')) == key
-            ),
-            None,
-        )
-
-    def _resolve_submitted(self, args: dict) -> dict:
-        if self.submit_outcome == 'created':
-            colliding = self._colliding_row(args)
-            if colliding is not None:
-                return {'status': 'combined', 'task_id': str(colliding), 'reason': 'candidate_key_collision'}
-            task_id = self.next_task_id
-            self.next_task_id += 1
-            with sqlite3.connect(self.db) as conn:
-                conn.execute(
-                    "INSERT INTO tasks (tag, id, title, status, metadata, updated_at) "
-                    "VALUES ('master', ?, ?, 'pending', ?, '2026-10-17T06:00:00+00:00')",
-                    (task_id, args['title'], json.dumps(args['metadata'])),
-                )
-            return {'status': 'created', 'task_id': str(task_id)}
-        if self.submit_outcome == 'combined':
-            return {'status': 'combined', 'task_id': str(self.combine_into)}
-        if self.submit_outcome == 'refused':
-            return {'status': 'refused', 'reason': 'premise_cancelled'}
-        if self.submit_outcome == 'pending':
-            return {'status': 'failed', 'reason': 'timeout', 'task_id': None}
-        raise AssertionError(f'unexpected submit_outcome {self.submit_outcome}')
-
-    def _update(self, task_id: int, metadata: object) -> dict:
-        assert isinstance(metadata, dict)
-        with sqlite3.connect(self.db) as conn:
-            (raw,) = conn.execute(
-                "SELECT metadata FROM tasks WHERE tag = 'master' AND id = ?", (task_id,)
-            ).fetchone()
-            merged = {**json.loads(raw or '{}'), **metadata}
-            conn.execute(
-                "UPDATE tasks SET metadata = ? WHERE tag = 'master' AND id = ?",
-                (json.dumps(merged), task_id),
-            )
-        return {'id': task_id, 'updated': True}
-
-    def escalation(self, tool: str, args: Mapping[str, object]) -> Mapping[str, object]:
-        self._record('escalation', tool, args)
-        if tool == 'get_pending_escalations':
-            return {'result': [{'task_id': entry['task_id']} for entry in self.pending]}
-        if tool == 'escalate_info':
-            self.pending.append(dict(args))
-            return {'id': f'esc-{len(self.pending)}', 'status': 'queued', 'level': 0}
-        raise AssertionError(f'unexpected escalation tool {tool}')
+# The scan/act harness: a real temp tasks.db and an in-process StubMcp
+# (``scripts/tests/owner_sweep_stub.py``).
 
 
 @pytest.fixture
@@ -455,30 +345,8 @@ def seed(make_tasks_db, project_root: Path):
     return _seed
 
 
-def ports_for(project_root: Path, stub: StubMcp) -> Ports:
-    return Ports(
-        project_root=project_root,
-        db=tasks_db_path(project_root),
-        fused_memory=stub.fused_memory,
-        escalation=stub.escalation,
-    )
-
-
-def act_once(register: RegisterView, ports: Ports, now: datetime.datetime = NOW) -> Tally:
-    return act(scan(register, ports, now=now), ports, now=now)
-
-
-def sweep_once(register: RegisterView, ports: Ports, now: datetime.datetime = NOW) -> ActOutcome:
-    return act_once(register, ports, now).counts()
-
-
 def view(*citations: Citation, slack_total: int = 0) -> RegisterView:
     return RegisterView(citations=citations, slack_total=slack_total)
-
-
-def set_status(db: Path, task_id: int, status: str) -> None:
-    with sqlite3.connect(db) as conn:
-        conn.execute("UPDATE tasks SET status = ? WHERE tag = 'master' AND id = ?", (status, task_id))
 
 
 LIST_SCOPE = 'pkg.mod.LIST'
@@ -733,6 +601,184 @@ def test_a_submit_error_is_a_fused_memory_failure(project_root, seed):
 
 
 # ---------------------------------------------------------------------------
+# D11 idempotence across the info-L0 router, which dismisses every sweep
+# escalation and converts it into a task carrying metadata.escalation_id.
+
+LIST_2733_DOCUMENT = register_document(declarations=(_declaration(LIST_SCOPE, default=Debt(TaskRef(2733))),))
+LIST_2733 = parse_register(LIST_2733_DOCUMENT)
+
+
+@pytest.mark.parametrize('promote', [False, True], ids=['l0-converted', 'l1-converted'])
+def test_a_dismissed_escalation_whose_conversion_is_live_is_not_raised_again(project_root, seed, promote):
+    stub = StubMcp(seed([{'id': 2733, 'status': 'done'}]))
+    ports = ports_for(project_root, stub)
+    sweep_once(LIST_2733, ports)
+    stub.route_info_notes(convert_to=9500, promote=promote)
+
+    tally = act_once(LIST_2733, ports)
+
+    assert len(stub.tool_calls('escalate_info')) == 1
+    assert (tally.counts().skipped_existing, tally.counts().escalated) == (1, 0)
+    assert [report.step for report in tally.reports] == [Performed.SKIPPED_EXISTING]
+
+
+def test_an_inline_finding_whose_closed_task_escalated_is_not_escalated_again(project_root, seed):
+    db = seed(
+        [
+            {'id': 2733, 'status': 'done'},
+            {'id': 5000, 'status': 'done', 'metadata': {FINDING_KEY_FIELD: DEAD_2733.record()}},
+        ]
+    )
+    stub = StubMcp(db)
+    ports = ports_for(project_root, stub)
+    assert sweep_once(INLINE_2733, ports).escalated == 1
+    stub.route_info_notes(convert_to=9500)
+
+    sweep_once(INLINE_2733, ports)
+
+    assert len(stub.tool_calls('escalate_info')) == 1
+    assert stub.tool_calls('submit_task') == []
+
+
+def test_a_conversion_counts_only_for_an_escalation_its_own_key_filed(project_root, seed):
+    db = seed([{'id': 27, 'status': 'done'}, {'id': 2733, 'status': 'done'}])
+    stub = StubMcp(db)
+    ports = ports_for(project_root, stub)
+    key_27, key_2733 = (FindingKey(FindingKind.DEAD_OWNER, LIST_SCOPE, TaskRef(n)) for n in (27, 2733))
+    register = view(Citation(LIST_SCOPE, TaskRef(27), ('k1',)), Citation(LIST_SCOPE, TaskRef(2733), ('k2',)))
+    sweep_once(register, ports)
+    assert len(stub.tool_calls('escalate_info')) == 2
+    stub.route_info_notes(convert_to=None)
+    (id_2733,) = [record['id'] for record in stub.filed if record['task_id'] == key_2733.escalation_task_id()]
+    assert id_2733.startswith(f'esc-{key_27.escalation_task_id()}')
+    insert_task(db, 9500, {'escalation_id': id_2733})
+
+    sweep_once(register, ports)
+
+    escalated = stub.tool_calls('escalate_info')
+    assert len(escalated) == 3
+    assert escalated[-1]['task_id'] == key_27.escalation_task_id()
+
+
+def test_a_closed_home_is_escalated_once_per_closure(project_root, seed):
+    db = seed([{'id': 2733, 'status': 'done'}])
+    stub = StubMcp(db)
+    ports = ports_for(project_root, stub)
+    sweep_once(LIST_2733, ports)
+    stub.route_info_notes(convert_to=9500)
+    set_status(db, 9500, 'done')
+
+    planned = run_once(project_root, stub, LIST_2733_DOCUMENT, dry_run=True)
+    second = sweep_once(LIST_2733, ports)
+
+    assert [report.step for report in planned.reports] == [Action.ESCALATE_CLOSED_FINDING]
+    assert second.escalated == 1
+    first_raise, second_raise = stub.tool_calls('escalate_info')
+    assert second_raise['summary'] != first_raise['summary']
+    assert 'task 9500' in second_raise['summary']
+
+    stub.route_info_notes(convert_to=9501)
+
+    assert stored_metadata(db, 9501)['escalation_id'] == stub.filed[1]['id']
+    third = sweep_once(LIST_2733, ports)
+    assert len(stub.tool_calls('escalate_info')) == 2
+    assert third.skipped_existing == 1
+
+    set_status(db, 9501, 'done')
+    sweep_once(LIST_2733, ports)
+
+    escalated = stub.tool_calls('escalate_info')
+    assert len(escalated) == 3
+    assert 'task 9501' in escalated[-1]['summary']
+
+    stub.route_info_notes(convert_to=9502)
+
+    assert stored_metadata(db, 9502)['escalation_id'] == stub.filed[2]['id']
+    sweep_once(LIST_2733, ports)
+    assert len(stub.tool_calls('escalate_info')) == 3
+
+
+def test_an_unreadable_escalation_history_is_an_escalation_failure(project_root, seed):
+    stub = StubMcp(seed([{'id': 2733, 'status': 'done'}]), fail_on=frozenset({'get_task_escalations'}))
+
+    with pytest.raises(SweepFailure) as excinfo:
+        sweep_once(LIST_2733, ports_for(project_root, stub))
+
+    assert excinfo.value.stage is FailureStage.ESCALATION
+    assert stub.tool_calls('escalate_info') == []
+
+
+def test_a_dry_run_plans_a_skip_for_a_live_conversion(project_root, seed):
+    stub = StubMcp(seed([{'id': 2733, 'status': 'done'}]))
+    sweep_once(LIST_2733, ports_for(project_root, stub))
+    stub.route_info_notes(convert_to=9500)
+
+    (report,) = run_once(project_root, stub, LIST_2733_DOCUMENT, dry_run=True).reports
+
+    assert report.step is Action.SKIP_CONVERTED_TASK
+    assert report.line().endswith('planned skip_converted_task')
+
+
+def test_a_deferred_home_is_raised_again_saying_it_is_deferred_never_closed(project_root, seed):
+    db = seed([{'id': 2733, 'status': 'done'}])
+    stub = StubMcp(db)
+    ports = ports_for(project_root, stub)
+    sweep_once(LIST_2733, ports)
+    stub.route_info_notes(convert_to=9500)
+    set_status(db, 9500, 'deferred')
+
+    assert sweep_once(LIST_2733, ports).escalated == 1
+
+    reraise = stub.tool_calls('escalate_info')[-1]
+    (raised_again,) = [line for line in reraise['detail'].splitlines() if line.startswith('Raised again')]
+    assert "task 9500" in reraise['summary'] and "'deferred'" in reraise['summary']
+    assert 'closed' not in reraise['summary']
+    assert "'deferred'" in raised_again and 'closed' not in raised_again
+
+
+@pytest.mark.parametrize(
+    ('tool', 'field'),
+    [('get_pending_escalations', 'task_id'), ('get_task_escalations', 'id')],
+)
+def test_an_escalation_record_without_its_field_is_an_escalation_failure(project_root, seed, tool, field):
+    stub = StubMcp(seed([{'id': 2733, 'status': 'done'}]))
+    record = {'id': 'esc-x-1', 'task_id': DEAD_2733.escalation_task_id(), 'status': 'dismissed', 'level': 0}
+    reshaped = {name: value for name, value in record.items() if name != field}
+
+    def escalation(called: str, args: Mapping[str, object]) -> Mapping[str, object]:
+        return {'result': [reshaped]} if called == tool else stub.escalation(called, args)
+
+    ports = Ports(project_root, tasks_db_path(project_root), stub.fused_memory, escalation)
+    with pytest.raises(SweepFailure) as excinfo:
+        sweep_once(INLINE_2733, ports)
+
+    assert excinfo.value.stage is FailureStage.ESCALATION
+    assert tool in excinfo.value.detail and f'`{field}`' in excinfo.value.detail
+    assert stub.tool_calls('escalate_info') == stub.tool_calls('submit_task') == []
+
+
+def test_a_finding_its_own_key_answers_never_reads_the_escalation_history(project_root, seed):
+    db = seed(
+        [
+            {'id': 2733, 'status': 'done'},
+            {'id': 5000, 'status': 'pending', 'metadata': {FINDING_KEY_FIELD: DEAD_2733.record()}},
+        ]
+    )
+    stub = StubMcp(db)
+    ports = ports_for(project_root, stub)
+    sweep_once(INLINE_2733, ports)
+    run_once(project_root, stub, register_document(debt=(_site('m.py', 1, TaskRef(2733)),)), dry_run=True)
+    assert stub.tool_calls('get_task_escalations') == []
+
+    sweep_once(LIST_2733, ports)
+    history_reads = len(stub.tool_calls('get_task_escalations'))
+    sweep_once(LIST_2733, ports)
+
+    assert len(stub.tool_calls('get_task_escalations')) == history_reads
+    assert len(stub.tool_calls('escalate_info')) == 1
+
+
+# ---------------------------------------------------------------------------
 # INV-4: the storm bound, and the slack tighten task (scenarios 20 and 24).
 
 
@@ -765,7 +811,9 @@ def test_scenario_20_outputs_stop_at_the_bound_and_one_roll_up_reports_the_rest(
     (roll_up,) = stub.tool_calls('escalate_info')
     assert roll_up['task_id'] == OVERFLOW_KEY.escalation_task_id()
     assert '4' in roll_up['detail']
-    assert REPORT_COMMAND in roll_up['detail']
+    assert DRY_RUN_COMMAND in roll_up['detail']
+    assert REPORT_COMMAND not in roll_up['detail']
+    assert DRY_RUN_COMMAND in roll_up['suggested_action']
     assert (first.filed, first.overflow, first.findings) == (10, 4, 14)
 
     second = sweep_once(register, ports)
@@ -1070,7 +1118,7 @@ def test_scenario_23_a_dry_run_reports_what_it_would_do_and_writes_nothing(proje
     result = run_once(project_root, stub, document, dry_run=True)
 
     assert result.ok
-    assert {tool for _, tool, _ in stub.calls} <= {'get_pending_escalations', 'resolve_ticket'}
+    assert {tool for _, tool, _ in stub.calls} <= {'get_pending_escalations', 'get_task_escalations', 'resolve_ticket'}
     assert not stamp_path(project_root).exists()
     assert [(r.scope, r.owner, r.verdict.liveness, r.step) for r in result.reports] == [
         (INLINE_SCOPE, TaskRef(2733), Liveness.DEAD, Action.FILE_TASK),
@@ -1130,6 +1178,24 @@ def test_a_dry_runs_lines_label_every_step_as_planned(project_root, seed):
     for line in lines:
         assert line.endswith(Action.FILE_TASK.value)
         assert 'planned' in line
+
+
+def test_a_dead_owner_finding_names_the_dry_run_that_lists_it(project_root, seed):
+    stub = StubMcp(seed([{'id': 2733, 'status': 'done'}]))
+    document = register_document(
+        declarations=(_declaration(LIST_SCOPE, default=Debt(TaskRef(2733))),),
+        debt=(_site('m.py', 1, TaskRef(2733)),),
+    )
+
+    sweep_once(parse_register(document), ports_for(project_root, stub))
+
+    (escalated,) = stub.tool_calls('escalate_info')
+    (submitted,) = stub.tool_calls('submit_task')
+    for body in (escalated['detail'], submitted['description']):
+        assert DRY_RUN_COMMAND in body
+        assert REPORT_COMMAND not in body
+    lines = run_once(project_root, stub, document, dry_run=True).lines()
+    assert any(LIST_SCOPE in line and 'task 2733' in line and 'dead' in line for line in lines)
 
 
 def test_scenario_21_an_unreadable_store_files_nothing_and_says_so_once(project_root):
@@ -1297,6 +1363,14 @@ def test_build_ports_reach_fused_memory_at_its_base_and_escalation_at_its_endpoi
 SWEEP_SCRIPT = Path(__file__).resolve().parents[1] / 'exception_owner_sweep.py'
 
 
+def dry_run_command_argv() -> list[str]:
+    """DRY_RUN_COMMAND as this test runs it: the command's own script and flags, under this interpreter."""
+    tokens = shlex.split(DRY_RUN_COMMAND)
+    (script_at,) = [index for index, token in enumerate(tokens) if token.endswith('.py')]
+    assert (SWEEP_SCRIPT.parents[1] / tokens[script_at]).resolve() == SWEEP_SCRIPT
+    return [sys.executable, str(SWEEP_SCRIPT), *tokens[script_at + 1 :]]
+
+
 def unbound_port() -> int:
     """A loopback port nothing listens on: bound, read, then released."""
     with socket.socket() as probe:
@@ -1310,12 +1384,11 @@ def test_the_cli_dry_run_against_unreachable_servers_is_exit_two_and_writes_noth
     seed([{'id': 77, 'status': 'done'}])
     tree = register_tree(tmp_path / 'tree', {'m.py': OWNED_MODULE})
     port = unbound_port()
+    prior = write_prior_stamp(project_root).read_text(encoding='utf-8')
 
     completed = subprocess.run(
         [
-            sys.executable,
-            str(SWEEP_SCRIPT),
-            '--dry-run',
+            *dry_run_command_argv(),
             '--root',
             str(tree),
             '--project-root',
@@ -1334,7 +1407,7 @@ def test_the_cli_dry_run_against_unreachable_servers_is_exit_two_and_writes_noth
     assert completed.returncode == 2, completed.stderr
     assert json.loads(completed.stdout.splitlines()[-1])['ok'] is False
     assert 'Traceback' not in completed.stderr
-    assert not stamp_path(project_root).exists()
+    assert stamp_path(project_root).read_text(encoding='utf-8') == prior
 
 
 def test_a_missing_import_is_exit_two_and_never_a_traceback(tmp_path: Path):

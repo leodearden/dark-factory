@@ -37,8 +37,10 @@ from shared.elision import elide_at_word
 from shared.project_id import normalize_project_id
 from shared.project_layout import tasks_db
 from shared.sqlite_column_migration import add_column_if_missing
+from shared.task_created_at import CreatedAtSource
 from shared.task_metadata import (
     _WHOLE_METADATA_FIELD,
+    GATE_EPISODE_STAMP_KEYS,
     SchemaWarning,
     apply_migrations,
     parse_metadata,
@@ -46,6 +48,7 @@ from shared.task_metadata import (
 from shared.task_metadata_wire import coerce_task_metadata
 from shared.task_statuses import TERMINAL, TaskStatus
 from shared.task_store_schema import TASK_STORE_DDL
+from shared.task_timestamp import format_task_timestamp
 
 from fused_memory.backends.defect_records import (
     DEFECT_RECORD_KEYS,
@@ -74,6 +77,7 @@ from fused_memory.backends.task_backend_errors import (
 from fused_memory.backends.task_backend_types import (
     AddTaskResult,
     DefectWriteResult,
+    DependencyFact,
     DependencyResult,
     GetTasksResult,
     MetadataLookupResult,
@@ -81,10 +85,14 @@ from fused_memory.backends.task_backend_types import (
     RemoveTaskResult,
     SetTaskStatusResult,
     StatusWriteNotPersistedResult,
+    TaskFactsRow,
     UpdateTaskResult,
     ValidateDependenciesResult,
 )
-from fused_memory.backends.task_projection import parse_task_projection
+from fused_memory.backends.task_projection import (
+    SCHEMA_OPTIONAL_ROW_KEYS,
+    parse_task_projection,
+)
 from fused_memory.backends.task_text_markup_gate import refuse_leaked_task_text
 from fused_memory.config.schema import TaskmasterConfig
 from fused_memory.middleware.candidate_key import compute_candidate_key
@@ -115,7 +123,11 @@ logger = logging.getLogger(__name__)
 #       plans/scheduler-dispatch-scoring-and-lock-layer-prd.md §C1). No
 #       column or index change — a pure metadata back-fill. See
 #       ``_migrate_v4_to_v5``.
-_SCHEMA_VERSION = 5
+#   v6: + created_at / created_at_source columns (task 8558, PRD
+#       plans/instruments-honesty-prd.md decision 3); stamped by add_task,
+#       backfilled only by scripts/backfill_task_created_at.py. See
+#       ``_migrate_v5_to_v6``.
+_SCHEMA_VERSION = 6
 
 # Per-process dedup set for the malformed-metadata WARNING below.  `_row_to_task`
 # is invoked once per row on every `get_tasks` / `get_task` call, so a project
@@ -206,20 +218,15 @@ class _StatusWriteNotPersisted(Exception):
 
 
 def task_timestamp_now() -> str:
-    """The current UTC instant in the task store's timestamp format.
+    """The current UTC instant in the task store's timestamp form.
 
-    Exactly ``%Y-%m-%dT%H:%M:%S.mmmZ`` — millisecond precision, literal ``Z``
-    suffix — matching the Taskmaster ``updatedAt`` format, which is the shape
-    every timestamp this store writes must carry: ``updated_at``,
-    ``heartbeat_at``, and ``metadata.pending_since``.
+    The form itself lives in ``shared/src/shared/task_timestamp.py::format_task_timestamp``.
 
-    PUBLIC because that format is a CONTRACT, not an implementation detail.
+    PUBLIC because that form is a CONTRACT, not an implementation detail.
     ``TaskInterceptor``'s CSV ``set_task_status`` branch computes one value
     here and threads it through ``pending_since_now`` so a whole batch lands
     on one instant (task 3816, PRD §C1 rule 5); it must not substitute its own
-    ``datetime.now(UTC).isoformat()`` helper, whose offset-suffixed
-    microsecond shape would give the live-stamped and the back-filled
-    populations two incommensurable string shapes for one column.
+    ``datetime.now(UTC).isoformat()`` helper.
 
     ONE clock reading, deliberately: composing the value from two
     ``datetime.now(UTC)`` calls can straddle a second boundary and emit a
@@ -227,8 +234,7 @@ def task_timestamp_now() -> str:
     milliseconds from the next second), which the anchor's
     monotone-non-decreasing invariant cannot tolerate.
     """
-    reading = datetime.now(UTC)
-    return reading.strftime('%Y-%m-%dT%H:%M:%S.') + f'{reading.microsecond // 1000:03d}Z'
+    return format_task_timestamp(datetime.now(UTC))
 
 
 def _parse_task_id(raw: str | int) -> int:
@@ -359,6 +365,11 @@ async def _migrate(
       ``metadata.pending_since`` back-fill (task 3816). Gated on a RE-READ of
       ``PRAGMA user_version``, not on the local ``version``, because the
       preceding step is self-gating (see the dispatch below).
+    * v5 → v6: see :func:`_migrate_v5_to_v6` — add ``created_at`` /
+      ``created_at_source`` (task 8558). Only a store that reached v5 is
+      stamped 6. A store the self-gating v3 → v4 step held below v4 still
+      gains both columns, unstamped, because ``add_task`` names them on every
+      INSERT; its version catches up through this ladder once the index lands.
 
     Each ALTER step is column-presence-guarded, so a fresh DB whose
     ``TASK_STORE_DDL`` already created every column runs all steps as no-op
@@ -464,6 +475,13 @@ async def _migrate(
 
     if version >= 4 and version < 5:
         await _migrate_v4_to_v5(conn)
+        version = 5
+
+    if version == 5:
+        await _migrate_v5_to_v6(conn)
+    else:
+        await _add_created_at_columns(conn)
+        await conn.commit()
 
 
 async def _migrate_v1_to_v2(conn: aiosqlite.Connection) -> None:
@@ -748,8 +766,9 @@ async def _migrate_v3_to_v4(
                     mode='merge',
                     project_root=project_root, tag=group['tag'], task_id=cancel_id,
                 )
-                # Leaving deferred drops its record (plans/deferral-flip-condition-prd.md decision 4).
-                new_metadata = _metadata_without_keys(new_metadata, _CLEARABLE_AUDIT_KEYS)
+                # Leaving deferred drops its record (plans/deferral-flip-condition-prd.md decision 4),
+                # and entering cancelled ends a gate episode (middleware/gate_stamp_lifecycle.py).
+                new_metadata = _metadata_without_keys(new_metadata, _STATUS_CLEARABLE_KEYS)
                 await conn.execute(
                     "UPDATE tasks SET status = 'cancelled', updated_at = ?, "
                     "metadata = ? WHERE tag = ? AND id = ?",
@@ -1050,6 +1069,31 @@ async def _migrate_v4_to_v5(conn: aiosqlite.Connection) -> None:
     )
 
     await conn.execute('PRAGMA user_version = 5')
+    await conn.commit()
+
+
+async def _add_created_at_columns(conn: aiosqlite.Connection) -> None:
+    """Add the nullable ``created_at`` / ``created_at_source`` pair; never commits."""
+    await add_column_if_missing(conn, 'tasks', 'created_at', 'TEXT')
+    await add_column_if_missing(conn, 'tasks', 'created_at_source', 'TEXT')
+
+
+async def _migrate_v5_to_v6(conn: aiosqlite.Connection) -> None:
+    """v5 -> v6 (task 8558, PRD plans/instruments-honesty-prd.md decision 3):
+    add the ``created_at`` / ``created_at_source`` columns.
+
+    Adds whichever column is missing, then stamps ``user_version = 6``. No
+    row gains a value here: a pre-existing row reads NULL until
+    ``scripts/backfill_task_created_at.py`` fills it, because this open-time
+    step is lazy per store and must not reach into another store's runs.db.
+
+    IMPORTANT: never short-circuit to just stamping the version.
+    ``TASK_STORE_DDL`` uses ``CREATE TABLE IF NOT EXISTS`` and never adds
+    columns to an existing table, so a v5 production store would silently
+    keep missing columns forever if this step only stamped the version.
+    """
+    await _add_created_at_columns(conn)
+    await conn.execute('PRAGMA user_version = 6')
     await conn.commit()
 
 
@@ -1417,7 +1461,7 @@ def _row_to_task(row: aiosqlite.Row, dependencies: list[int], *, project_root: s
             metadata = {}
 
     row_keys = row.keys()
-    return {
+    task: dict[str, Any] = {
         'id': str(row['id']),
         'title': row['title'],
         'description': row['description'] or '',
@@ -1436,6 +1480,12 @@ def _row_to_task(row: aiosqlite.Row, dependencies: list[int], *, project_root: s
         'heartbeat_at': row['heartbeat_at'] if 'heartbeat_at' in row_keys else None,
         'candidate_key': row['candidate_key'] if 'candidate_key' in row_keys else None,
     }
+    # Omitted, not None, on a connection whose v6 ALTER never landed: None is
+    # reserved for a migrated row the backfill has not reached yet.
+    for key in SCHEMA_OPTIONAL_ROW_KEYS:
+        if key in row_keys:
+            task[key] = row[key]
+    return task
 
 
 def _updated_task_response(
@@ -1544,6 +1594,20 @@ _ReadAll = Callable[[str, Iterable[Any]], Awaitable[Iterable[aiosqlite.Row]]]
 """Run one SELECT and return every row: ``AtomicConnection.read_all`` or ``execute_fetchall``."""
 
 
+def _int_task_ids(ids: Iterable[str]) -> list[int]:
+    """The numeric ids among *ids*; a non-numeric id is dropped, so it reads as an unknown task."""
+    int_ids: list[int] = []
+    for raw_id in ids:
+        with contextlib.suppress(ValueError, TypeError):
+            int_ids.append(int(raw_id))
+    return int_ids
+
+
+def _stored_status(status: str | None) -> str:
+    """A ``NULL`` status (defensive; unreachable via normal writes) reads as ``'unknown'``."""
+    return status if status is not None else 'unknown'
+
+
 async def _read_status_map(
     read_all: _ReadAll, tag: str, ids: list[str] | None,
 ) -> dict[str, str]:
@@ -1569,12 +1633,7 @@ async def _read_status_map(
         ``'unknown'``.
     """
     if ids is not None:
-        if not ids:
-            return {}
-        int_ids: list[int] = []
-        for raw_id in ids:
-            with contextlib.suppress(ValueError, TypeError):
-                int_ids.append(int(raw_id))
+        int_ids = _int_task_ids(ids)
         if not int_ids:
             return {}
         placeholders = ','.join('?' * len(int_ids))
@@ -1584,9 +1643,66 @@ async def _read_status_map(
         sql = 'SELECT id, status FROM tasks WHERE tag = ?'
         params = (tag,)
     rows = await read_all(sql, params)
+    return {str(row['id']): _stored_status(row['status']) for row in rows}
+
+
+def _done_provenance_text_sql(field: str) -> str:
+    """``metadata.done_provenance.<field>`` when it is a JSON string, else ``NULL``.
+
+    The nested CASE keeps JSON functions off malformed rows, as in
+    :func:`_metadata_lookup_sql`.
+    """
+    path = f"'$.done_provenance.{field}'"
+    return (
+        f"CASE WHEN json_valid(metadata) THEN "
+        f"CASE WHEN json_type(metadata, {path}) = 'text' THEN metadata ->> {path} END END"
+    )
+
+
+_TASK_FACTS_SQL = f"""
+SELECT id, title, status,
+       {_done_provenance_text_sql('kind')} AS done_kind,
+       {_done_provenance_text_sql('commit')} AS done_commit
+FROM tasks WHERE tag = ? AND id IN ({{placeholders}})
+"""
+
+_TASK_FACT_DEPENDENCIES_SQL = """
+SELECT d.task_id, d.depends_on, t.id AS dep_row, t.status AS dep_status
+FROM dependencies d LEFT JOIN tasks t ON t.tag = d.tag AND t.id = d.depends_on
+WHERE d.tag = ? AND d.task_id IN ({placeholders})
+ORDER BY d.task_id, d.depends_on
+"""
+
+
+def _text_or_none(value: str | None) -> str | None:
+    return (value or '').strip() or None
+
+
+async def _read_task_facts(
+    read_all: _ReadAll, tag: str, int_ids: list[int],
+) -> dict[str, TaskFactsRow]:
+    """The rows behind :meth:`SqliteTaskBackend.get_task_facts`, two SELECTs through *read_all*."""
+    placeholders = ','.join('?' * len(int_ids))
+    params = (tag, *int_ids)
+    task_rows = await read_all(_TASK_FACTS_SQL.format(placeholders=placeholders), params)
+    dependency_rows = await read_all(
+        _TASK_FACT_DEPENDENCIES_SQL.format(placeholders=placeholders), params,
+    )
+    dependencies: dict[int, list[DependencyFact]] = {}
+    for row in dependency_rows:
+        dependencies.setdefault(row['task_id'], []).append({
+            'id': str(row['depends_on']),
+            'status': None if row['dep_row'] is None else _stored_status(row['dep_status']),
+        })
     return {
-        str(row['id']): (row['status'] if row['status'] is not None else 'unknown')
-        for row in rows
+        str(row['id']): {
+            'status': _stored_status(row['status']),
+            'title': row['title'],
+            'dependencies': dependencies.get(row['id'], []),
+            'done_provenance_kind': _text_or_none(row['done_kind']),
+            'done_provenance_commit': _text_or_none(row['done_commit']),
+        }
+        for row in task_rows
     }
 
 
@@ -2093,6 +2209,26 @@ class SqliteTaskBackend:
         access = await self._get_read_access(project_root)
         return await _fetch_dependencies(access.read_all, tag)
 
+    async def get_task_facts(
+        self, ids: Sequence[str], project_root: str,
+    ) -> dict[str, TaskFactsRow]:
+        """Status, title, local dependencies and done provenance of *ids*, keyed by ``str(id)``.
+
+        Presence is existence: an unknown or non-numeric id is omitted, as in
+        :meth:`get_statuses_raw`. A dependency whose task row is gone
+        (``remove_tasks`` leaves those dangling) has status ``None``. Only the
+        local ``dependencies`` table is read; cross-project
+        ``metadata.external_deps`` are out of scope. The two SELECTs are not
+        one snapshot: see :func:`_fetch_dependencies`' "Intra-call read skew"
+        note. Contract: plans/live-task-facts-at-recall-prd.md C1.
+        """
+        await self.ensure_connected()
+        int_ids = _int_task_ids(ids)
+        if not int_ids:
+            return {}
+        access = await self._get_read_access(project_root)
+        return await _read_task_facts(access.read_all, DEFAULT_TAG, int_ids)
+
     async def get_statuses_raw(
         self,
         project_root: str,
@@ -2524,9 +2660,9 @@ class SqliteTaskBackend:
     ) -> SetTaskStatusResult | StatusWriteNotPersistedResult:
         """Atomically update ``status`` AND merge ``audit_fields`` into metadata.
 
-        ``clear_keys`` (a subset of ``_CLEARABLE_AUDIT_KEYS``) are removed from
+        ``clear_keys`` (a subset of ``_STATUS_CLEARABLE_KEYS``) are removed from
         the resulting blob in the same transaction: leaving ``deferred`` drops
-        its record.
+        its record, and a terminal crossing drops the gate-episode stamps.
 
         The sole atomic status+audit writer (task 2649). Calling
         ``stamp_audit_metadata`` followed by ``set_task_status`` — the
@@ -2568,10 +2704,10 @@ class SqliteTaskBackend:
         :meth:`stamp_audit_metadata`, kept off the 12-method contract so
         other callers do not treat it as sanctioned public surface.
         """
-        if unclearable := clear_keys - _CLEARABLE_AUDIT_KEYS:
+        if unclearable := clear_keys - _STATUS_CLEARABLE_KEYS:
             raise ValueError(
                 f'set_status_and_stamp_audit cannot clear {sorted(unclearable)}; '
-                f'clearable keys are {sorted(_CLEARABLE_AUDIT_KEYS)}'
+                f'clearable keys are {sorted(_STATUS_CLEARABLE_KEYS)}'
             )
         await self.ensure_connected()
         tag = tag or DEFAULT_TAG
@@ -2970,12 +3106,13 @@ class SqliteTaskBackend:
                 # BEFORE _validate_metadata_on_write deliberately: that call
                 # must see the blob that is actually persisted, or enforce-mode
                 # validates a different value than the one on disk. One hoisted
-                # `now` is bound to BOTH the anchor and the INSERT's
-                # updated_at, so a freshly inserted pending row satisfies
-                # `pending_since == updated_at` exactly -- the same identity the
-                # one-shot v4->v5 back-fill establishes for the legacy
-                # population, rather than two `task_timestamp_now()` calls a millisecond
-                # apart. `candidate_key` above stays on the pre-stamp value: it
+                # `now` is bound to the anchor and to the INSERT's updated_at
+                # and created_at, so a freshly inserted pending row satisfies
+                # `pending_since == updated_at == created_at` exactly, rather
+                # than three `task_timestamp_now()` calls a millisecond apart;
+                # the first equality is the identity the one-shot v4->v5
+                # back-fill establishes for the legacy population.
+                # `candidate_key` above stays on the pre-stamp value: it
                 # keys off title + metadata['files'] only — neither stripped
                 # key participates, so the strip below cannot move it.
                 #
@@ -3042,14 +3179,15 @@ class SqliteTaskBackend:
                     """
                         INSERT INTO tasks (tag, id, title, description,
                                            details, test_strategy, status, priority,
-                                           metadata, updated_at, candidate_key)
-                        VALUES (?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?)
+                                           metadata, updated_at, candidate_key,
+                                           created_at, created_at_source)
+                        VALUES (?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?)
                         """,
                     (
                         tag, next_id, title,
                         description or '', details or '',
                         status, priority or 'medium', metadata, now,
-                        candidate_key,
+                        candidate_key, now, CreatedAtSource.STAMPED.value,
                     ),
                 )
                 if self._after_insert_fault_hook is not None:
@@ -4399,7 +4537,7 @@ def _assert_passthrough_only_keys(
     return frozenset(key for key in _PASSTHROUGH_ONLY_METADATA_KEYS if key in incoming)
 
 
-_CLEARABLE_AUDIT_KEYS: frozenset[str] = frozenset({'deferral'})
+_STATUS_CLEARABLE_KEYS: frozenset[str] = frozenset({'deferral'}) | GATE_EPISODE_STAMP_KEYS
 
 
 def _metadata_without_keys(blob_json: str, keys: frozenset[str]) -> str:

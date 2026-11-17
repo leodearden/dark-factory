@@ -32,7 +32,7 @@ git's own text merge, markers and all, and the merge stops as it did before this
 driver existed. So does a host where the driver is not installed, because the
 attribute names a driver git then cannot find.
 
-Output goes through ``merge_lane_metrics.render_baseline`` (SPOT), carrying the
+Output goes through ``merge_lane_ratchet.render_baseline`` (SPOT), carrying the
 merged images' own README so a checkout whose copy of the instrument differs
 from the trees it merges does not substitute its own.
 
@@ -48,7 +48,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-import merge_lane_metrics as metrics
+import merge_lane_ratchet as ratchet
 
 #: The ``merge=`` attribute value ``.gitattributes`` names, and the
 #: ``merge.<name>.*`` config section ``install`` writes.
@@ -56,7 +56,7 @@ DRIVER_NAME = 'ratchet-baseline'
 
 #: This file, relative to the repo root. git runs a merge driver from the top
 #: of the work tree, so each merging checkout runs ITS OWN copy of the driver.
-DRIVER_RELPATH = Path(__file__).resolve().relative_to(metrics.repo_root()).as_posix()
+DRIVER_RELPATH = Path(__file__).resolve().relative_to(ratchet.repo_root()).as_posix()
 
 #: The ``merge.<name>.driver`` value: git substitutes %O, %A and %B with the
 #: base, ours and theirs images and reads the result back from %A. ``-B``
@@ -80,7 +80,7 @@ def merge_baselines(base: dict, ours: dict, theirs: dict) -> dict:
     merged: dict = {}
     for key in _ordered_keys(ours, theirs):
         values = (base.get(key, _ABSENT), ours.get(key, _ABSENT), theirs.get(key, _ABSENT))
-        if key in metrics.PER_PATH_SECTIONS:
+        if key in ratchet.PER_PATH_SECTIONS:
             value = _merge_section(key, *(_as_dict(value) for value in values))
         else:
             value = _merge_value(key, *values)
@@ -167,7 +167,7 @@ def _merge_row(path: str, base: object, ours: object, theirs: object) -> object:
 def _merge_measure(path: str, base: object, ours: object, theirs: object) -> object:
     if ours == theirs or base in (ours, theirs):
         return _one_side(path, base, ours, theirs)
-    if metrics.is_count(base) and metrics.is_count(ours) and metrics.is_count(theirs):
+    if ratchet.is_count(base) and ratchet.is_count(ours) and ratchet.is_count(theirs):
         composed = ours + theirs - base
         if composed < 0:
             raise MergeRefused(f'{path}: the two sides removed more than the base held')
@@ -228,11 +228,11 @@ def _insertions(base: list, side: list) -> dict[str | None, list]:
 
 def render_merge(base: Path, ours: Path, theirs: Path) -> str:
     """The merged baseline's exact bytes. Raises ``MergeRefused`` or ``RatchetError``."""
-    merged = merge_baselines(*(metrics.load_baseline(path) for path in (base, ours, theirs)))
+    merged = merge_baselines(*(ratchet.load_baseline(path) for path in (base, ours, theirs)))
     readme = merged.pop('_README', None)
     if isinstance(readme, str):
-        return metrics.render_baseline(merged, readme=readme)
-    return metrics.render_baseline(merged)
+        return ratchet.render_baseline(merged, readme=readme)
+    return ratchet.render_baseline(merged)
 
 
 def _text_merge(base: Path, ours: Path, theirs: Path) -> str | None:
@@ -261,7 +261,7 @@ def merge(base: Path, ours: Path, theirs: Path) -> int:
         print(
             f'{DRIVER_NAME} merge driver: {exc}. Recorded as a conflict: resolve '
             'the code, then regenerate with python scripts/merge_lane_metrics.py '
-            f'--write-baseline {metrics.BASELINE_RELPATH}.',
+            f'--write-baseline {ratchet.BASELINE_RELPATH}.',
             file=sys.stderr,
         )
         conflicted = _text_merge(base, ours, theirs)
@@ -298,7 +298,7 @@ def _build_parser() -> argparse.ArgumentParser:
     for name in ('base', 'ours', 'theirs'):
         merging.add_argument(name, type=Path)
     installing = verbs.add_parser('install', help="Write the driver into a repository's git config.")
-    installing.add_argument('--repo', type=Path, default=metrics.repo_root())
+    installing.add_argument('--repo', type=Path, default=ratchet.repo_root())
     return parser
 
 

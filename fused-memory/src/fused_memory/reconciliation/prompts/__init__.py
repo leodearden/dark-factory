@@ -436,10 +436,13 @@ value.\
 # exists for. So the note is RENDERED via render_escalation_boundary_note()
 # rather than pasted: only Stage 2 holds the FIX D escalate_blocker path.
 #
-# The companion mechanism is DISALLOW_ESCALATION_READS in cli_stage_runner.py,
-# which denies the escalation READ tools in every stage, with its write-side
-# counterpart DISALLOW_ESCALATION_WRITES denying the filing tools to Stage 1 and
-# Stage 3 (the stages handed the no-action clause below). This paragraph is not
+# The companion mechanisms are DISALLOW_ESCALATION_READS in cli_stage_runner.py,
+# which denies the escalation READ tools in every stage, and
+# DISALLOW_ESCALATION_RUNTIME_READS, which denies every stage the orchestrator
+# runtime snapshot the harness-less recon server can only answer as "online,
+# nothing running" (task 6553); the write-side counterpart
+# DISALLOW_ESCALATION_WRITES denies the filing tools to Stage 1 and Stage 3 (the
+# stages handed the no-action clause below). This paragraph is not
 # decorative: `--disallowed-tools` OMITS a denied tool from the agent's listing
 # rather than rejecting the call, so without it the agent gets no explanation
 # for the missing tool and can conclude the escalation surface does not exist.
@@ -459,7 +462,11 @@ escalation result you encounter is NOT evidence that no escalation exists. It \
 means only that you are looking in the wrong store. Never report, infer, or \
 flag "no escalation was filed for task X" on the strength of this connection; \
 if a finding depends on that question, record what you actually observed and \
-hand the question on rather than asserting an absence.\
+hand the question on rather than asserting an absence. The orchestrator's live \
+task-runtime snapshot (`get_task_runtime_state`) is withheld from this stage too: \
+no orchestrator is attached to this connection, so that snapshot could only ever \
+claim "online, nothing running", whatever is actually in flight. A task's current \
+status comes from the task record (`mcp__fused-memory__get_task`), a read you do hold.\
 """
 
 # Per-stage sanctioned-action clauses appended to ESCALATION_BOUNDARY_NOTE.
@@ -502,12 +509,14 @@ _ESCALATION_BOUNDARY_NO_ACTION = (
 # stage prompts and requires every such example to carry `run_id=`).
 _GATE_CLOSURE_ARCHIVE_GUIDANCE = """\
 ### Deterministic-gate closure is established from the TASK RECORD
-Scope: a `done` task with `task_kind='deterministic'`, `metadata.gate_escalated_at` \
-set, and a `done_provenance.kind` of `deterministic-gate` or `deterministic-milestone`.
+Scope: a `done` task with `task_kind='deterministic'` and a `done_provenance.kind` of \
+`deterministic-gate` or `deterministic-milestone`.
 
 Call `mcp__fused-memory__get_task(task_id)` — a READ you do hold. `status == 'done'` \
-PLUS `metadata.gate_escalated_at` set PLUS one of those `done_provenance.kind` values \
-IS LEGITIMATE CLOSURE on its own; this rule is primary and sufficient. Do not flag such \
+PLUS `task_kind='deterministic'` PLUS one of those `done_provenance.kind` values IS \
+LEGITIMATE CLOSURE on its own; this rule is primary and sufficient. Since task 3638 \
+`metadata.gate_escalated_at` is removed when a gate closes; older closures may still \
+carry it, and its presence or absence changes nothing here. Do not flag such \
 a task, do not file remediation work against it, and do not write a memory asserting a \
 missing escalation record. An archive-inclusive `get_task_escalations` lookup that would \
 confirm the record directly does exist, but only on the ORCHESTRATOR-side escalation \
@@ -796,12 +805,12 @@ def render_finding_provenance_section(*, can_file_tasks: bool) -> str:
         + capability_clause
     )
 
-# Shared guidance about the memory_ids=[] + stores=['graphiti'] → graphiti_writes_queued
+# Shared guidance about the memory_ids=[] + stores_queued=['graphiti'] → graphiti_writes_queued
 # invariant.  Both stages need to teach the LLM not to count async-enqueued Graphiti
 # writes under their `memories_*` stats; only the stat-key tokens differ between stages.
 _GRAPHITI_QUEUED_GUIDANCE_TEMPLATE = (
-    "Graphiti-only async-enqueued writes show `stores: ['graphiti']` in the response but "
-    "return `memory_ids: []` because the write is queued rather than persisted inline. These "
+    "Graphiti-only async-enqueued writes show `stores_queued: ['graphiti']` in the response "
+    "and return `memory_ids: []` because the write is queued rather than persisted inline. These "
     "must NOT be counted under {stat_keys_phrase}. Report them instead under "
     "a separate `graphiti_writes_queued` stat. The stats verifier enforces this split "
     "independently and will override any inflated {primary_stat_key} count, but you should "

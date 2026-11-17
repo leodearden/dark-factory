@@ -23,13 +23,18 @@ import check_network_exposure as exposure
 import pytest
 import yaml
 from setup_host_sections import checker_repo, run_section, slice_section, usage_error_checker
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from shell_sections import stub_bin_dir, write_stub
+from systemd_unit_parity import parse_unit_directives
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 COMPOSE_PATH = REPO_ROOT / "fused-memory" / "docker" / "docker-compose.yml"
 SCHEMA_PATH = REPO_ROOT / "fused-memory" / "src" / "fused_memory" / "config" / "schema.py"
 FM_CONFIG_PATH = REPO_ROOT / "fused-memory" / "config" / "config.yaml"
 SCRIPT_PATH = REPO_ROOT / "scripts" / "check_network_exposure.py"
+FM_SERVICE_TEMPLATE_PATH = REPO_ROOT / "scripts" / "fused-memory.service.template"
 REPORT_TAG = "[network_exposure]"
 
 # ---------------------------------------------------------------------------
@@ -244,20 +249,56 @@ def test_static_ports_owns_one_port_per_table_entry():
     assert "ServerConfig.recon_report_port" in owner_of[exposure.RECON_REPORT_PORT]
 
 
+def test_optional_compose_services_are_published_compose_services():
+    assert exposure.OPTIONAL_COMPOSE_SERVICES
+    assert exposure.OPTIONAL_COMPOSE_SERVICES.issubset(exposure.COMPOSE_PUBLISHED_PORTS.values())
+
+
+def _compose_up_services(argv: list[str]) -> set[str]:
+    """The services a `docker compose ... up ...` argv names; empty for any other command."""
+    if "compose" not in argv or "up" not in argv[argv.index("compose") :]:
+        return set()
+    after_up = argv[argv.index("up", argv.index("compose")) + 1 :]
+    return {token for token in after_up if not token.startswith("-")}
+
+
+def test_optional_compose_services_are_the_compose_ups_fused_memory_may_fail():
+    unit = parse_unit_directives(FM_SERVICE_TEMPLATE_PATH.read_text(encoding="utf-8"))
+    may_fail: set[str] = set()
+    for command in unit["Service"]["ExecStartPre"]:
+        if command.startswith("-"):
+            may_fail |= _compose_up_services(shlex.split(command.removeprefix("-")))
+    assert may_fail == exposure.OPTIONAL_COMPOSE_SERVICES
+
+
+def test_an_optional_service_must_be_the_owner_it_excuses():
+    with pytest.raises(ValueError, match="'embedder'"):
+        exposure.OwnedPort(8420, exposure.compose_owner("falkordb"), optional_service="embedder")
+
+
+def test_static_ports_mark_exactly_the_optional_services():
+    by_port = {owned.port: owned for owned in exposure.STATIC_PORTS}
+    for port, service in exposure.COMPOSE_PUBLISHED_PORTS.items():
+        expected = service if service in exposure.OPTIONAL_COMPOSE_SERVICES else None
+        assert by_port[port].optional_service == expected, by_port[port]
+    assert by_port[exposure.RECON_REPORT_PORT].optional_service is None
+
+
+def test_compose_project_is_the_compose_files_directory():
+    compose = yaml.safe_load(COMPOSE_PATH.read_text(encoding="utf-8"))
+    assert "name" not in compose, "a top-level name: would replace the directory as the compose project"
+    assert COMPOSE_PATH.parent.name == exposure.COMPOSE_PROJECT
+
+
 def test_merge_owners_names_every_owner_of_a_port_once_in_source_order():
-    sockets = [
-        exposure.OwnedPort(port=8002, owner="fused-memory.socket"),
-        exposure.OwnedPort(port=8002, owner="fused-memory.socket"),
-        exposure.OwnedPort(port=8103, owner="fused-memory.socket"),
-    ]
-    static = [
-        exposure.OwnedPort(port=6379, owner="compose service falkordb"),
-        exposure.OwnedPort(port=8002, owner="compose service fused-mcp"),
-    ]
-    assert exposure.merge_owners(sockets, static) == {
-        6379: ("compose service falkordb",),
-        8002: ("fused-memory.socket", "compose service fused-mcp"),
-        8103: ("fused-memory.socket",),
+    socket_8002 = exposure.OwnedPort(port=8002, owner="fused-memory.socket")
+    socket_8103 = exposure.OwnedPort(port=8103, owner="fused-memory.socket")
+    falkordb = exposure.OwnedPort(port=6379, owner="compose service falkordb")
+    fused_mcp = exposure.OwnedPort(port=8002, owner="compose service fused-mcp")
+    assert exposure.merge_owners([socket_8002, socket_8002, socket_8103], [falkordb, fused_mcp]) == {
+        6379: (falkordb,),
+        8002: (socket_8002, fused_mcp),
+        8103: (socket_8103,),
     }
 
 
@@ -276,7 +317,7 @@ FINDING_TOKENS = (
 
 
 class FakeHost:
-    """Fake `systemctl` / `ip` on PATH, each printing a JSON payload the test chose."""
+    """Fake `systemctl` / `ip` / `docker` on PATH, each printing a payload the test chose."""
 
     def __init__(self, root: pathlib.Path) -> None:
         self.root = root
@@ -297,6 +338,9 @@ class FakeHost:
     def argv(self, command: str) -> list[str]:
         return (self.root / f"{command}.argv").read_text(encoding="utf-8").splitlines()
 
+    def ran(self, command: str) -> bool:
+        return (self.root / f"{command}.argv").exists()
+
 
 def _fake_links(*extra: dict[str, object]) -> list[dict[str, object]]:
     return [
@@ -314,6 +358,7 @@ def fake_host(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> FakeHo
     host = FakeHost(tmp_path)
     host.serve("systemctl", [])
     host.serve("ip", _fake_links())
+    host.serve_bytes("docker", b"")
     monkeypatch.setenv("PATH", f"{host.bin_dir}:{os.environ['PATH']}")
     return host
 
@@ -536,19 +581,121 @@ def test_run_reports_findings_in_ascending_port_order(fake_host: FakeHost, held)
     assert _line_index(lines, "[exposed]", f"port {low}") < _line_index(lines, "[exposed]", f"port {high}")
 
 
+def _optional_owner(port: int) -> exposure.OwnedPort:
+    return exposure.OwnedPort(port, "compose service embedder", optional_service="embedder")
+
+
+def _no_container_lines(lines: list[str]) -> list[str]:
+    return [line for line in lines if "[no-container]" in line]
+
+
+def test_run_notes_a_never_created_optional_service_without_failing(fake_host: FakeHost, held):
+    port = _bound_not_listening(held)
+
+    verdict, lines = _run(static_ports=(_optional_owner(port),))
+
+    assert verdict == exposure.ExposureExit.LOOPBACK_ONLY, lines
+    assert _findings(lines) == []
+    _line_index(lines, "[no-container]", f"port {port}", "compose service embedder", "127.0.0.1")
+    _line_index(lines, "[ok]")
+    assert fake_host.argv("docker") == [
+        "container ls --all --quiet"
+        " --filter label=com.docker.compose.project=docker"
+        " --filter label=com.docker.compose.service=embedder"
+    ]
+
+
+def test_run_fails_an_optional_service_whose_container_exists(fake_host: FakeHost, held):
+    port = _bound_not_listening(held)
+    fake_host.serve_bytes("docker", b"a735737e7533\n")
+
+    verdict, lines = _run(static_ports=(_optional_owner(port),))
+
+    assert verdict == exposure.ExposureExit.FINDING
+    _line_index(lines, "[not-listening]", f"port {port}", "127.0.0.1")
+    assert _no_container_lines(lines) == []
+
+
+def test_run_fails_a_required_compose_service_with_no_container(fake_host: FakeHost, held):
+    port = _bound_not_listening(held)
+
+    verdict, lines = _run(static_ports=(exposure.OwnedPort(port, "compose service falkordb"),))
+
+    assert verdict == exposure.ExposureExit.FINDING
+    _line_index(lines, "[not-listening]", f"port {port}", "compose service falkordb")
+    assert not fake_host.ran("docker")
+
+
+def test_run_fails_an_optional_port_another_owner_shares(fake_host: FakeHost, held):
+    port = _bound_not_listening(held)
+    fake_host.serve("systemctl", [_row(port, "orchestrator-x.socket")])
+
+    verdict, lines = _run(static_ports=(_optional_owner(port),))
+
+    assert verdict == exposure.ExposureExit.FINDING
+    _line_index(lines, "[not-listening]", f"port {port}", "orchestrator-x.socket, compose service embedder")
+    assert not fake_host.ran("docker")
+
+
+def test_run_fails_an_exposed_port_of_a_never_created_optional_service(fake_host: FakeHost, held):
+    port = _listen(held, "0.0.0.0")
+
+    verdict, lines = _run(static_ports=(_optional_owner(port),))
+
+    assert verdict == exposure.ExposureExit.FINDING
+    _line_index(lines, "[exposed]", f"port {port}", "127.0.0.2", "compose service embedder")
+    assert not fake_host.ran("docker")
+
+
+def test_run_excuses_only_a_loopback_refusal(fake_host: FakeHost, held):
+    port = _full_backlog(held)
+
+    verdict, lines = _run(static_ports=(_optional_owner(port),), connect_timeout=0.3)
+
+    assert verdict == exposure.ExposureExit.FINDING
+    _line_index(lines, "[timed-out]", f"port {port}", "127.0.0.2")
+    _line_index(lines, "[not-listening]", f"port {port}", "127.0.0.1", "timed out")
+    assert _no_container_lines(lines) == []
+    assert not fake_host.ran("docker")
+
+
+def test_run_still_fails_an_unverified_address_beside_a_noted_port(fake_host: FakeHost, held):
+    port = _bound_not_listening(held)
+    fake_host.serve("ip", [_link(99999, "ghost0", _addr("inet6", "fe80::1", "link"))])
+
+    verdict, lines = _run(static_ports=(_optional_owner(port),))
+
+    assert verdict == exposure.ExposureExit.FINDING
+    _line_index(lines, "[unverified]", f"port {port}", "fe80::1%ghost0")
+    _line_index(lines, "[no-container]", f"port {port}", "127.0.0.1")
+
+
+def test_run_keeps_the_failure_when_docker_cannot_be_read(fake_host: FakeHost, held):
+    port = _bound_not_listening(held)
+    fake_host.stub("docker", 'echo "Cannot connect to the Docker daemon" >&2\nexit 1\n')
+
+    verdict, lines = _run(static_ports=(_optional_owner(port),))
+
+    assert verdict == exposure.ExposureExit.FINDING
+    _line_index(lines, "[source-error]", "docker container ls", "Cannot connect")
+    _line_index(lines, "[not-listening]", f"port {port}", "127.0.0.1")
+    assert _no_container_lines(lines) == []
+
+
 # ---------------------------------------------------------------------------
 # The CLI's exit contract: 0/1 always tagged, 2 never tagged
 # ---------------------------------------------------------------------------
 
 
 def _cli(tmp_path: pathlib.Path, *args: str, script: pathlib.Path = SCRIPT_PATH) -> tuple[int, str]:
-    """Run the real script with systemctl printing no rows and ip printing garbage.
+    """Run the real script with systemctl printing no rows, ip printing garbage and docker no container.
 
     The unreadable `ip` source makes the exit 1 whatever this host's ports are.
     """
     host = FakeHost(tmp_path)
     host.serve("systemctl", [])
     host.stub("ip", "echo 'not json'\n")
+    host.serve_bytes("docker", b"")
     env = {**os.environ, "PATH": f"{host.bin_dir}:{os.environ['PATH']}"}
     result = subprocess.run(
         [sys.executable, str(script), *args], capture_output=True, text=True, env=env, timeout=120

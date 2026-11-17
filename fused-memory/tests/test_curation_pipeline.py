@@ -37,6 +37,7 @@ from _curator_helpers import (
     zot_agent_result,
 )
 from shared.cli_invoke import AgentResult, AllAccountsCappedException
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
 from fused_memory.config.schema import FusedMemoryConfig, TaskmasterConfig
@@ -50,6 +51,8 @@ from fused_memory.middleware.task_curator import TaskCurator
 from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.middleware.ticket_store import TicketStore
 from fused_memory.reconciliation.event_buffer import EventBuffer
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 PROJECT_ID = 'p'
 PROJECT_ROOT = '/x'

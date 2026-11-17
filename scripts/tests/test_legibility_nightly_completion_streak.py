@@ -26,6 +26,9 @@ from pathlib import Path
 import pytest
 import yaml
 from legibility import nightly, trickle_state
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _PROJECT_ID = 'proj_streak'
 _RUN_ID = 'census-proj_streak-20260601'

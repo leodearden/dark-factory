@@ -1197,6 +1197,14 @@ def _read_at(
     return Provenance(value.ts, state, reason, QUALITY_FRESHNESS_BOUND_SECONDS, served_at=now)
 
 
+def _touching(rows: Sequence[LandingRow], module: str | None) -> list[LandingRow]:
+    """The *rows* whose landed lines touch *module* (every row when None); a train's members share
+    their unit's modules, so a unit is kept or dropped whole."""
+    if module is None:
+        return list(rows)
+    return [row for row in rows if any(lines.module == module for lines in row.modules)]
+
+
 async def read_quality_series(
     db: aiosqlite.Connection | None,
     root: Path,
@@ -1204,9 +1212,13 @@ async def read_quality_series(
     *,
     now: datetime,
     events: Sequence[RegimeEvent] = (),
+    module: str | None = None,
 ) -> Datum[QualitySeries]:
     """*root*'s stored series as read at *now*: unknown until a value sample exists, stale while
-    a newer gap, an unsampled recorded landing or the bound says so, otherwise fresh."""
+    a newer gap, an unsampled recorded landing or the bound says so, otherwise fresh.
+
+    *module* serves only the landings touching it; freshness is still read over every stored
+    landing of the project."""
     if db is None:
         return unknown_datum('quality.db does not exist yet: the quality sampler has not written it',
                              QUALITY_FRESHNESS_BOUND_SECONDS)
@@ -1219,8 +1231,9 @@ async def read_quality_series(
     rows = await read_landing_rows(db, project_id)
     unsampled = await asyncio.to_thread(_unsampled, root, rows, value.cursor_sha)
     provenance = _read_at(value, newest.latest, unsampled, now)
+    served = _touching(rows, module)
     series = await asyncio.to_thread(
-        lambda: quality_series_view(rows, window_landings=window_landings, provenance=provenance,
+        lambda: quality_series_view(served, window_landings=window_landings, provenance=provenance,
                                     events=events, git_check=value.git_check),
     )
     datum = provenance.measured(series)

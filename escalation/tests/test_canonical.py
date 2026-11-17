@@ -228,7 +228,7 @@ class TestCanonicalModuleIsALeaf:
             f'leaf-ness probe failed to run (rc={proc.returncode}).\n'
             f'stdout: {proc.stdout}\nstderr: {proc.stderr}'
         )
-        delta = eval(proc.stdout.strip())  # noqa: S307 — our own repr(sorted(...))
+        delta = eval(proc.stdout.strip())  # our own repr(sorted(...))
         assert delta == ['escalation.canonical'], (
             'escalation.canonical must stay a LEAF (zero intra-package imports) '
             'so queue.py can import it without completing the dedupe -> queue '

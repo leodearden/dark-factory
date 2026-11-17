@@ -50,6 +50,7 @@ from shared.toolcall_markup import (
     CANONICAL_OPENER_PREFIX,
     closer_for,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.server.main import _install_safe_tool_wrapper
 from fused_memory.server.markup_guard import (
@@ -57,6 +58,8 @@ from fused_memory.server.markup_guard import (
     install_markup_guard,
 )
 from fused_memory.server.tools import create_mcp_server
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _PROJECT_ID = 'dark_factory'
 _PROJECT_ROOT = '/project'

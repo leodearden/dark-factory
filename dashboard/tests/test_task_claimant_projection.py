@@ -114,7 +114,7 @@ class TestShapeTaskCarriesClaimantFields:
         assert set(shaped) == {
             'id', 'title', 'status', 'priority',
             'dependencies', 'metadata', 'updated_at',
-            'claimant_run_id', 'heartbeat_at',
+            'claimant_run_id', 'heartbeat_at', 'created_at', 'created_at_source',
         }
         assert shaped['id'] == 7            # cast to int at the boundary
         assert shaped['title'] == 'a distinctive title'

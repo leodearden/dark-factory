@@ -582,7 +582,7 @@ class _JournalLog:
 
     Intentionally exposes ONLY ``.warning()`` — the minimal attribute-call
     surface required by the silent-fallthrough gate's WARN_METHODS check
-    (see shared/tests/silent_fallthrough_scan.py::_handler_has_warn_log).
+    (see tests/repo_guards/silent_fallthrough_scan.py::_handler_has_warn_log).
     This is not a general-purpose logging facade: other call sites in this
     module (e.g. probe_port's diagnostics) intentionally keep calling the
     bare ``log()`` helper directly, since those are not silent-fallthrough
@@ -706,7 +706,7 @@ def probe_health(url: str, timeout: float) -> bool:
         # The server responded (even with an error status) — the loop is
         # alive. A degraded backing store is not something a restart fixes.
         return True
-    except Exception as exc:  # noqa: BLE001 -- any other failure means no response
+    except Exception as exc:  # any other failure means no response
         log(f"probe_health({url!r}) got no response ({type(exc).__name__}: {exc})")
         return False
 
@@ -753,7 +753,7 @@ def _fused_memory_liveness_verdict() -> str:
     return "wedged"
 
 
-def restart_unit(unit: str) -> None:
+def restart_unit(unit: str) -> tuple[str, ...]:
     """Revive *unit* via ``systemctl --user reset-failed`` then ``restart --no-block``.
 
     NEVER STOPS THE UNIT. Each service unit gets
@@ -787,8 +787,15 @@ def restart_unit(unit: str) -> None:
     wedged systemctl invocation cannot hang the oneshot watchdog.
     ``subprocess.TimeoutExpired`` is caught and logged, never raised, and the
     restart phase still runs after a reset-failed timeout.
+
+    Returns the names of the phases whose systemctl invocation exceeded its
+    budget (``()`` when every phase returned in time). A timeout here is the
+    watchdog's own subprocess budget expiring, not evidence about what systemd
+    did, so callers pass the result to ``_log_restart_outcome`` to keep their
+    closing line from reading as an unqualified success.
     """
     socket_unit = unit.replace(".service", ".socket")
+    timed_out: list[str] = []
     try:
         subprocess.run(
             ["systemctl", "--user", "reset-failed", unit, socket_unit],
@@ -796,6 +803,7 @@ def restart_unit(unit: str) -> None:
             timeout=10,
         )
     except subprocess.TimeoutExpired:
+        timed_out.append("reset-failed")
         log(f"systemctl reset-failed {unit} {socket_unit} timed out after 10s")
 
     try:
@@ -805,7 +813,25 @@ def restart_unit(unit: str) -> None:
             timeout=45,
         )
     except subprocess.TimeoutExpired:
+        timed_out.append("restart")
         log(f"systemctl restart --no-block {unit} timed out after 45s")
+    return tuple(timed_out)
+
+
+def _log_restart_outcome(unit: str, timed_out_phases: tuple[str, ...]) -> None:
+    """Close a ``restart_unit`` call with a line that names what was observed.
+
+    Clean run: ``<unit> restart issued``. Any phase timeout: the line says so
+    and that the unit's state is unconfirmed, because a timed-out ``systemctl``
+    says nothing about whether systemd completed the transition.
+    """
+    if not timed_out_phases:
+        log(f"{unit} restart issued")
+        return
+    log(
+        f"{unit} restart issued, but systemctl phase(s) "
+        f"{', '.join(timed_out_phases)} timed out; unit state unconfirmed"
+    )
 
 
 def _unit_start_elapsed_secs(unit: str) -> float | None:
@@ -849,7 +875,7 @@ def _unit_start_elapsed_secs(unit: str) -> float | None:
             now_secs = time.clock_gettime(time.CLOCK_MONOTONIC)
             return max(0.0, now_secs - start_mono_us / 1_000_000)
         return None
-    except Exception:  # noqa: BLE001
+    except Exception:
         return None
 
 
@@ -929,7 +955,7 @@ def _unit_is_active(unit: str) -> bool:
             text=True,
         )
         return (result.stdout or "").strip() in UNIT_IN_FLIGHT_ACTIVE_STATES
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         log(
             f"is-active probe for {unit} could not complete "
             f"({type(exc).__name__}); treating the registration as failed"
@@ -1026,7 +1052,7 @@ def _unit_start_epoch(unit: str) -> int | None:
                 return None  # unit has never started (or no PID recorded)
             return epoch
         return None
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning(
             f"_unit_start_epoch({unit!r}): swallowed {exc!r}; "
             "returning None (staleness undeterminable this tick)"
@@ -1083,7 +1109,7 @@ def _unit_active_enter_epoch(unit: str) -> int | None:
                 return None  # unit has never activated (no readiness signal recorded)
             return epoch
         return None
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning(
             f"_unit_active_enter_epoch({unit!r}): swallowed {exc!r}; "
             "returning None (staleness undeterminable this tick)"
@@ -1135,7 +1161,7 @@ def _newest_watched_commit_epoch(paths: list[str] | None = None) -> int | None:
             return int(stdout)
         except ValueError:
             return None
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning(
             f"_newest_watched_commit_epoch: swallowed {exc!r}; "
             "returning None (staleness undeterminable this tick)"
@@ -1184,7 +1210,7 @@ def _newest_fm_watched_commit_epoch() -> int | None:
             return int(stdout)
         except ValueError:
             return None
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning(
             f"_newest_fm_watched_commit_epoch: swallowed {exc!r}; "
             "returning None (fm staleness undeterminable this tick)"
@@ -1905,7 +1931,7 @@ def main(
     for port, unit in WATCHED:
         try:
             _revive_if_dead(port, unit, statuses.get(unit, UNKNOWN_RESTART_STATUS))
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             log(f"watchdog error for {unit} (port {port}): {exc}")
 
 
@@ -2016,8 +2042,7 @@ def _revive_if_dead(port: int, unit: str, status: UnitRestartStatus) -> None:
     # sequence revives every case.
     log(f"{unit} {reason}; restarting")
     try:
-        restart_unit(unit)
-        log(f"{unit} restart issued")
+        _log_restart_outcome(unit, restart_unit(unit))
     finally:
         # Armed on the raising path too, as fused_memory_liveness_pass does.
         if not _stamp_orch_liveness_restart_clock(unit):
@@ -2164,8 +2189,7 @@ def fused_memory_liveness_pass() -> None:
             f"(streak {streak}/{FM_LIVENESS_STREAK_THRESHOLD}); restarting"
         )
         try:
-            restart_unit(FUSED_MEMORY_UNIT)
-            log(f"{FUSED_MEMORY_UNIT} restart issued")
+            _log_restart_outcome(FUSED_MEMORY_UNIT, restart_unit(FUSED_MEMORY_UNIT))
         finally:
             # Arming before the streak clear, and on the raising path too —
             # see THE BOOKKEEPING RUNS ON THE RAISING PATH TOO above.
@@ -2179,7 +2203,7 @@ def fused_memory_liveness_pass() -> None:
             # pass would degrade back to one-verdict-per-kill immediately after
             # the first restart.
             _clear_fm_liveness_streak()
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         log(f"watchdog error for {FUSED_MEMORY_UNIT} (port {FUSED_MEMORY_PORT}): {exc}")
 
 
@@ -2224,7 +2248,7 @@ def _register_transient_unit(argv: list[str], unit: str) -> None:
         result = subprocess.run(
             argv, check=False, timeout=10, capture_output=True, text=True
         )
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning(f"systemd-run registration of {unit} failed: {exc!r}")
         return
 
@@ -2602,7 +2626,7 @@ def staleness_pass() -> None:
                     f"watched commit ({commit_epoch}); flagging for fleet-wide staleness redeploy"
                 )
                 stale_found = True
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             log(f"staleness probe error for {unit}: {exc}")
 
     if stale_found:
@@ -2753,7 +2777,7 @@ def fused_memory_staleness_pass() -> None:
                 f"fm-watched commit ({commit_epoch}); delegating fused-memory staleness redeploy"
             )
             _delegate_fm_restart()
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         log(f"fm staleness probe error for {FUSED_MEMORY_UNIT}: {exc}")
 
 
@@ -2835,7 +2859,7 @@ def _safe_age(read: Callable[[], float | None], label: str) -> str:
     """
     try:
         return _render_age_hours(read())
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         log(f"could not read {label}: {exc}")
         return "unknown"
 
@@ -2865,7 +2889,7 @@ def _classify_unit_heartbeat(unit: str, now: float) -> str:
             drain_check.heartbeat_path(drain_check.resolve_fleet_dir(), unit)
         )
         return drain_check.classify(heartbeat, now, DRAIN_FRESH_WINDOW_SECS)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning(
             f"_classify_unit_heartbeat({unit!r}): swallowed {exc!r}; returning 'unknown'"
         )
@@ -3064,14 +3088,14 @@ def _fused_memory_recon_busy_verdict() -> str:
         scripts_dir = os.path.dirname(os.path.abspath(__file__))
         if scripts_dir not in sys.path:
             sys.path.insert(0, scripts_dir)
-        import recon_busy_check  # noqa: PLC0415
+        import recon_busy_check
 
         with urllib.request.urlopen(
             FUSED_MEMORY_HEALTH_URL, timeout=FUSED_MEMORY_HEALTH_TIMEOUT_SECS
         ) as resp:
             body = resp.read().decode("utf-8", errors="replace")
         return recon_busy_check.classify(recon_busy_check.parse_health(body))
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning(
             f"_fused_memory_recon_busy_verdict: swallowed {exc!r}; returning 'unknown'"
         )
@@ -3135,7 +3159,7 @@ def _print_fused_memory_liveness() -> None:
     """
     try:
         verdict = _fused_memory_liveness_verdict()
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         log(f"watchdog error printing {FUSED_MEMORY_UNIT} liveness row: {exc}")
         verdict = "unknown"
     deploy_age_str = _safe_age(_read_last_fm_deploy_epoch, f"the {FUSED_MEMORY_UNIT} deploy clock")
@@ -3145,7 +3169,7 @@ def _print_fused_memory_liveness() -> None:
         streak_str = (
             f"{streak[0]}/{FM_LIVENESS_STREAK_THRESHOLD}" if streak is not None else "none"
         )
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         log(f"could not read the {FUSED_MEMORY_UNIT} liveness streak for --report: {exc}")
         streak_str = "unknown"
     restart_age_str = _safe_age(

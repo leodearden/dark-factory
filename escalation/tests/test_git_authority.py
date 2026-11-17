@@ -397,8 +397,12 @@ def _marker_git_ops(
     )
 
 
-def _config(tmp_path: Path, *, commit_citation_pattern: str | None = None) -> Any:
+def _config(
+    tmp_path: Path, *, commit_citation_pattern: str | None = None,
+    delivered_checks_enabled: bool = True,
+) -> Any:
     from orchestrator.config import (  # type: ignore[reportMissingImports]
+        DeliveredChecksConfig,
         GitConfig,
         OrchestratorConfig,
     )
@@ -410,6 +414,7 @@ def _config(tmp_path: Path, *, commit_citation_pattern: str | None = None) -> An
             worktree_dir='.worktrees',
             commit_citation_pattern=commit_citation_pattern,
         ),
+        delivered_checks=DeliveredChecksConfig(enabled=delivered_checks_enabled),
     )
 
 
@@ -430,6 +435,30 @@ def _task_declaring_checks() -> dict[str, Any]:
             ],
         },
     }
+
+
+def _confirming_check_runner(refs_run: list[str]) -> Callable[..., Any]:
+    """A ``run_delivered_check`` fake that makes the REAL differential confirm.
+
+    FALSE before the landing (``<sha>^1``), TRUE at it and at main: the
+    contract of ``orchestrator/tests/_landing_evidence_helpers.py::differential_confirms``,
+    which escalation tests cannot import.  Every ref asked about is appended
+    to *refs_run*, so a test can tell a check that never ran from one that
+    ran and declined.
+    """
+    from orchestrator.delivered_checks import (
+        DeliveredCheckResult,
+    )
+
+    async def _run(
+        check: dict[str, Any], *, project_root: Any, ref: str = 'main', runner: Any = None,
+    ) -> Any:
+        refs_run.append(ref)
+        if ref.endswith('^1'):
+            return DeliveredCheckResult.FAILED
+        return DeliveredCheckResult.DELIVERED
+
+    return _run
 
 
 def _force_differential_confirm(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -682,6 +711,46 @@ class TestProbeLanding:
         assert verdict.rescued_by_delivered_checks is True
         assert verdict.merge_sha_fully_guarded is False
 
+    @pytest.mark.parametrize('enabled', [True, False])
+    @pytest.mark.parametrize('arm', ['ancestor', 'marker'])
+    async def test_the_project_kill_switch_governs_the_rescue_in_both_arms(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, arm: str, enabled: bool,
+    ) -> None:
+        """``delivered_checks.enabled`` reaches the differential from orch_config.
+
+        The REAL differential runs, with only its leaf check runner faked,
+        because the kill switch lives inside it.  A real ``GitOps.config`` is
+        the ``git`` sub-config and cannot carry the leaf, so the probe must
+        pass it from the project config in both arms.
+        """
+        git_ops = (
+            _ancestor_git_ops(tip='a' * 40, citation='c' * 40, effect_present=False)
+            if arm == 'ancestor'
+            else _marker_git_ops(marker='d' * 40, effect_present=False)
+        )
+        git_ops.project_root = tmp_path
+        refs_run: list[str] = []
+        monkeypatch.setattr(
+            'orchestrator.delivered_checks.run_delivered_check',
+            _confirming_check_runner(refs_run),
+        )
+
+        verdict = await probe_landing(
+            git_ops, '910',
+            orch_config=_config(tmp_path, delivered_checks_enabled=enabled),
+            harness=_harness(read=TaskFound(_task_declaring_checks())),
+        )
+
+        if enabled:
+            assert verdict.outcome is GitAuthorityOutcome.found_on_main
+            assert verdict.rescued_by_delivered_checks is True
+            assert verdict.merge_sha_fully_guarded is False
+        else:
+            assert verdict.outcome is GitAuthorityOutcome.landed_unconfirmed
+            assert verdict.rescued_by_delivered_checks is False
+            assert verdict.merge_sha is None
+            assert refs_run == [], 'a disabled feature runs no declared check'
+
     async def test_declaring_checks_does_not_by_itself_set_the_flag(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -913,14 +982,16 @@ def fresh_landing_tally(monkeypatch: pytest.MonkeyPatch) -> None:
 
 async def _probe_repo(
     repo: Path, tid: str, *, metadata: dict[str, Any] | None = None, read_raises: bool = False,
+    commit_citation_pattern: str | None = None,
 ) -> GitAuthorityVerdict:
     """Probe *tid*'s branch in the real repo at *repo*.
 
     The task read answers *metadata* (none by default), or raises when
-    *read_raises*.
+    *read_raises*.  *commit_citation_pattern* is the project's
+    ``git.commit_citation_pattern``.
     """
     from orchestrator.git_ops import GitOps
-    config = _config(repo)
+    config = _config(repo, commit_citation_pattern=commit_citation_pattern)
     return await probe_landing(
         GitOps(config.git, repo), tid, orch_config=config,
         harness=_harness(read=TaskFound({'metadata': metadata or {}}), raises=read_raises),
@@ -987,9 +1058,7 @@ class TestProbeLandingPatchIdArm:
 
         Such a commit reads '+' in ``git cherry``, and so does a genuine
         landing whose context drifted (task 6936).  Either way the answer is
-        ``no_signal``: here the arm under-reports.  It can also over-report,
-        when ``git cherry`` prints nothing at all; see
-        ``test_main_merged_into_branch_with_recorded_base_is_not_a_landing``.
+        ``no_signal``: here the arm under-reports.
         """
         landing = build_rebased_solo_landing(tmp_path / 'repo', '6978', cited=True)
         landing_git(landing.repo, 'checkout', 'task/6978')
@@ -1112,26 +1181,14 @@ class TestProbeLandingPatchIdArm:
         assert verdict.outcome is GitAuthorityOutcome.no_signal, verdict
         assert verdict.reason == 'no_op_landing'
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason=(
-            'branch_work_landed reads empty git cherry output as contained, and with a '
-            "recorded branch_base_sha its no-op guard measures base..tip, which holds main's "
-            'changes, so the verdict is landed at the earlier citing commit. Follow-up ticket '
-            'tkt_0RWW0SXKJP4TV6YV4GZ235YX8Q (landing_evidence.py) removes this marker.'
-        ),
-    )
     async def test_main_merged_into_branch_with_recorded_base_is_not_a_landing(
         self, tmp_path: Path,
     ) -> None:
         """The same branch, with the creation point every dispatched task records.
 
-        None of the task's work is on main beyond an earlier round's citing
-        commit, so the right answer is no landing.  Today the producer
-        answers ``found_on_main`` at that earlier commit, reported as fully
-        guarded: an over-report, documented as residual (b) in
-        ``escalation/src/escalation/git_authority.py::found_on_main_response``.
+        Empty ``git cherry`` output carries no content proof: the branch has
+        no non-merge commit beyond main, so nothing of its own is shown to be
+        on main and it is not a landing, whatever an earlier round cited.
         """
         repo = tmp_path / 'repo'
         new_repo(repo)
@@ -1140,6 +1197,36 @@ class TestProbeLandingPatchIdArm:
         verdict = await _probe_repo(repo, '6978', metadata={'branch_base_sha': base})
 
         assert verdict.outcome is GitAuthorityOutcome.no_signal, verdict
+        assert verdict.reason == 'not_landed'
+        assert verdict.merge_sha is None
+
+    async def test_an_opted_out_project_answers_at_the_patch_id_twin_not_the_citing_commit(
+        self, tmp_path: Path,
+    ) -> None:
+        landing = build_rebased_solo_landing(tmp_path / 'repo', '6978', cited=True)
+
+        verdict = await _probe_repo(landing.repo, '6978', commit_citation_pattern='')
+
+        assert verdict.outcome is GitAuthorityOutcome.found_on_main, verdict
+        assert verdict.arm is GitAuthorityArm.patch_id
+        assert verdict.merge_sha == landing.main_tip
+        assert verdict.merge_sha != landing.citing_sha
+        assert verdict.merge_sha_fully_guarded is True
+        assert verdict.citation_gate_skipped is False
+
+    async def test_a_project_override_pattern_decides_the_patch_id_arms_citation(
+        self, tmp_path: Path,
+    ) -> None:
+        landing = build_rebased_solo_landing(tmp_path / 'repo', '6978', cited=False)
+        squash = landing_commit(landing.repo, 'Fix an unrelated thing (#6978)', 'squash.txt')
+
+        overridden = await _probe_repo(
+            landing.repo, '6978', commit_citation_pattern=r'^\[{tid}\]',
+        )
+        default = await _probe_repo(landing.repo, '6978')
+
+        assert overridden.merge_sha == landing.main_tip, overridden
+        assert default.merge_sha == squash, default
 
 
 class TestGitAuthorityVerdict:

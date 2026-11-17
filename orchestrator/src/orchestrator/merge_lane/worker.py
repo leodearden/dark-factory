@@ -15,7 +15,9 @@ import asyncio
 import collections
 import contextlib
 import dataclasses
+import enum
 import functools
+import itertools
 import json
 import logging
 import math
@@ -78,6 +80,7 @@ from orchestrator.main_health_fix_owner import (
     build_main_fix_task_arguments,
     ensure_main_fix_owner,
 )
+from orchestrator.merge_lane.chain_reservation import ChainReservations
 from orchestrator.merge_lane.coalesce_unwind import restore_pre_stack_tips
 from orchestrator.merge_lane.dead_base_ledger import (
     DeadBaseKiller,
@@ -141,6 +144,7 @@ from orchestrator.merge_lane.liveness import (
     release_chain_build_lane,
     verify_tree_cpu_ticks,
 )
+from orchestrator.merge_lane.lookahead_hold import LookaheadHold
 from orchestrator.merge_lane.member_redrive import MemberRedriveOutcome, MemberRedriver
 from orchestrator.merge_lane.no_progress_abort import NoProgressAbort, emit_no_progress_abort
 from orchestrator.merge_lane.outcome_facts import ConflictEvidence, MergeBlockCategory
@@ -162,7 +166,8 @@ from orchestrator.merge_lane.remerge_base import (
     RemergeClaim,
     choose_remerge_base,
     claim_remerge_base,
-    entry_commit,
+    entry_bases,
+    entry_successor_base,
     frontier_tip,
 )
 from orchestrator.merge_lane.request_ledger import (
@@ -210,6 +215,7 @@ from orchestrator.merge_lane.types import (
     InflightVerifyResult,
     ItemLifecycleState,
     LandingCandidate,
+    LeaseActivity,
     LeaseRow,
     MainHealthAutoHealRegistry,
     MergeCancelRefusal,
@@ -255,6 +261,7 @@ from orchestrator.merge_lane.verify_cancellation import (
     VerifyDurationWindow,
     merge_verify_cancelled_data,
 )
+from orchestrator.merge_pool_facts import with_chain_members
 from orchestrator.merge_verify_facts import (
     BaseRelation,
     MergeVerifyDispatchFacts,
@@ -263,6 +270,7 @@ from orchestrator.merge_verify_facts import (
 )
 from orchestrator.remote_gate import GateIdentityPair, RunnerUnavailableKind
 from orchestrator.scheduler import StaleEvidenceRejection
+from orchestrator.task_priority import TaskPriorityLookup
 from orchestrator.task_status import WORKFLOW_PRESERVE_STATUSES
 from orchestrator.unblock_types import BlockClass
 from orchestrator.verify import (
@@ -393,16 +401,22 @@ import-order fragility.  Off by default: zero production overhead beyond a
 single module-bool branch at each call site."""
 
 
-TRANSIENT_INFRA_REASON_PREFIX = 'Transient infrastructure failure (disk pressure)'
-"""Prefix of the ``MergeOutcome.reason`` emitted when a post-merge verify
-fails with a no-space-left/ENOSPC signature that PERSISTS after one
-prune-and-retry.  Disk pressure is frequently a self-healing host condition
-(a concurrent build finishes, a worktree is reaped), so the merge worker
-prunes stale ``_merge-*`` worktrees and retries the verify once before
-surfacing this.  The workflow routes this prefix to
+TRANSIENT_INFRA_REASON_PREFIX = 'Transient infrastructure failure'
+"""Cause-neutral prefix of every transient-infra hold's ``MergeOutcome.reason``:
+the pre-verify disk guard, a persistent ENOSPC verify, and a persistent
+``INFRA_TRANSIENT_CATEGORIES`` verify.  Every producer builds its reason with
+``_transient_infra_reason``, which appends the measured cause in parentheses.
+The workflow routes this prefix to
 ``_mark_blocked(escalate_to_human=True, category='infra_issue')`` — the
 infra_issue category plus the durable ref lets the escalation-watcher
-auto-resolve if the disk has recovered by read-time."""
+auto-resolve if the host has recovered by read-time."""
+
+_DISK_PRESSURE_CAUSE = 'disk pressure'
+
+
+def _transient_infra_reason(cause: str, message: str) -> str:
+    """The ``'<prefix> (<cause>): <message>'`` reason of a transient-infra hold."""
+    return f'{TRANSIENT_INFRA_REASON_PREFIX} ({cause}): {message}'
 
 
 TRAIN_INCOMPLETE_REASON_PREFIX = 'Train merge rejected: not all members are merge-deferred'
@@ -536,7 +550,7 @@ AUTO_HEAL_MECHANICAL_CATEGORIES: frozenset[str] = frozenset({'compile_error'})
 
 
 def is_auto_heal_eligible(
-    category: str | None, cause_hint: str | None,  # noqa: ARG001
+    category: str | None, cause_hint: str | None,
 ) -> bool:
     """Return True when the failure class is safe for automated fix spawning.
 
@@ -696,11 +710,12 @@ async def _ensure_verify_disk_space(
             task_id, len(pruned), free / gib,
         )
         return None
-    return (
-        f'{TRANSIENT_INFRA_REASON_PREFIX}: pre-verify disk guard found only '
+    return _transient_infra_reason(
+        _DISK_PRESSURE_CAUSE,
+        f'pre-verify disk guard found only '
         f'{free / gib:.2f} GiB free (threshold {min_free_bytes / gib:.2f} GiB) '
         f'after pruning {len(pruned)} stale merge worktree(s); skipping '
-        f'post-merge verify to avoid a doomed build under disk pressure.'
+        f'post-merge verify to avoid a doomed build under disk pressure.',
     )
 
 
@@ -3503,10 +3518,11 @@ async def _run_post_merge_verify(
         # Persistent ENOSPC after the prune-and-retry → transient infra.
         if _verify_hit_enospc(verify):
             detail = verify.failure_report()
-            reason = (
-                f'{TRANSIENT_INFRA_REASON_PREFIX}: post-merge verify '
+            reason = _transient_infra_reason(
+                _DISK_PRESSURE_CAUSE,
+                f'post-merge verify '
                 f'still reports no space left on device after pruning '
-                f'stale merge worktrees and retrying. {verify.summary}'
+                f'stale merge worktrees and retrying. {verify.summary}',
             )
             if detail:
                 reason = f'{reason}\n\n{detail}'
@@ -3524,10 +3540,10 @@ async def _run_post_merge_verify(
         # branch-blaming.
         if (verify.category or '') in INFRA_TRANSIENT_CATEGORIES:
             detail = verify.failure_report()
-            reason = (
-                f'{TRANSIENT_INFRA_REASON_PREFIX}: post-merge verify '
-                f'classified infra-transient (category={verify.category!r}) '
-                f'and did not clear after retry. {verify.summary}'
+            reason = _transient_infra_reason(
+                f'category={verify.category}',
+                f'post-merge verify classified infra-transient '
+                f'and did not clear after retry. {verify.summary}',
             )
             if detail:
                 reason = f'{reason}\n\n{detail}'
@@ -4112,7 +4128,7 @@ async def _maybe_auto_chain_generation(
     # coexist on gen_next.result.  The callback fires whichever path
     # finalizes gen_next.
     _branch = req.branch.bare_id  # close over the bare branch name (dict key)
-    def _cleanup_chain_counter(fut: asyncio.Future) -> None:  # noqa: ANN001
+    def _cleanup_chain_counter(fut: asyncio.Future) -> None:
         try:
             if fut.cancelled():
                 # Cancellation — lineage ends; pop the counter.
@@ -4130,7 +4146,7 @@ async def _maybe_auto_chain_generation(
                     # pop() is idempotent so both callbacks are harmless.
                     counts.pop(_branch, None)
                 # 'superseded': lineage continues; keep the counter.
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.warning(
                 '_maybe_auto_chain_generation: _cleanup_chain_counter failed '
                 'for branch=%s', _branch, exc_info=True,
@@ -4355,6 +4371,11 @@ def _verifying_by_host(rows: Iterable[LeaseRow]) -> dict[str, list[str]]:
     return _task_ids_by_host(row for row in rows if row.counts_verifying)
 
 
+def _leased_by_host(rows: Iterable[LeaseRow]) -> dict[str, list[str]]:
+    """``occupancy.inflight_by_host``: :func:`_task_ids_by_host` of the rows that hold a lease."""
+    return _task_ids_by_host(row for row in rows if row.holds_lease)
+
+
 def _ssh_targets_by_runner(config: OrchestratorConfig) -> Mapping[str, str]:
     """``{runner name: ssh_host}`` of *config*'s enabled verify runners."""
     return {r.name: r.ssh_host for r in config.enabled_verify_runners}
@@ -4370,11 +4391,12 @@ def _lease_part(row: LeaseRow) -> str:
 
 
 def _occupancy_suffix(rows: Sequence[LeaseRow], *, hosts_total: int) -> str:
-    """The heartbeat's `` | verifying N/M hosts: ...`` segment; '' with no lease held.
+    """The heartbeat's `` | verifying N/M hosts: ...`` segment; '' with no row.
 
-    N counts the hosts of :func:`_verifying_by_host`, and every lease is named,
+    N counts the hosts of :func:`_verifying_by_host`, and every row is named,
     so a held lease with nothing running on its host reads
-    ``laptop=5300(finished)``.
+    ``laptop=5300(finished)``, and an entry released at its verdict
+    ``laptop=5300(verified_pending_landing)``.
     """
     if not rows:
         return ''
@@ -4586,14 +4608,14 @@ async def reverify_member_solo(
     # Fail: tear down the solo worktree and branch — failer is never landed.
     try:
         await git_ops.cleanup_merge_worktree(solo_wt)
-    except Exception:  # noqa: BLE001
+    except Exception:
         logger.warning(
             'reverify_member_solo: cleanup_merge_worktree failed for member %s',
             member_id, exc_info=True,
         )
     try:
         await git_ops.delete_solo_branch(solo_branch)
-    except Exception:  # noqa: BLE001
+    except Exception:
         logger.warning(
             'reverify_member_solo: delete_solo_branch failed for member %s',
             member_id, exc_info=True,
@@ -5166,6 +5188,7 @@ async def build_chain(
         return ChainResult(links=[], tip=head_merge_commit)
 
     links: list[tuple[str, str]] = []
+    link_request_ids: list[str] = []
     # `tip` starts at the base so a zero-link result still names a verifiable tip.
     tip = head_merge_commit
     truncated_at: str | None = None
@@ -5237,6 +5260,7 @@ async def build_chain(
                     truncated_reason = 'merge_error'
                 break
             links.append((req.task_id, res.merge_commit))
+            link_request_ids.append(req.request_id)
             tip = res.merge_commit
     except BaseException:
         # A cancellation mid-build must not strand a pool lane in ASSIGNED
@@ -5281,7 +5305,7 @@ async def build_chain(
     return ChainResult(
         links=links, tip=tip,
         truncated_at=truncated_at, truncated_reason=truncated_reason,
-        lane=lane, lane_warm=warm,
+        lane=lane, lane_warm=warm, link_request_ids=tuple(link_request_ids),
     )
 
 
@@ -7564,6 +7588,15 @@ def select_probe_depth(
 # _deep_chain_placement passes `cap - 1` / `d - 1` (see its docstring).
 
 
+def may_chain(*, speculative: bool, frontier_depth: int | None) -> bool:
+    """Whether a dispatch may build a deep chain (``plans/merge-lane-policy-prd.md`` D5).
+
+    Its item is speculative, or no other entry is in the verify frontier; a
+    *frontier_depth* of ``None`` is unknown and never licenses a non-speculative chain.
+    """
+    return speculative or frontier_depth == 0
+
+
 def select_chain_depth(
     chain_cap: int,
     queue_len: int,
@@ -7703,6 +7736,14 @@ class ProbePlacement:
 
     depth: int
     base: str
+
+
+class _LookAhead(enum.Enum):
+    """How the merger's look-ahead after a speculative merge ended."""
+
+    PICKED = 'picked'
+    PENDING = 'pending'
+    SHUTDOWN = 'shutdown'
 
 
 class SpeculativeMergeWorker:
@@ -8065,6 +8106,7 @@ class SpeculativeMergeWorker:
         runner_quarantine: set[str] | None = None,
         host_holder_reader: Callable[[], Mapping[str, str]] | None = None,
         on_host_readmitted: Callable[[str], None] | None = None,
+        task_priority: TaskPriorityLookup | None = None,
     ):
         self._git_ops = git_ops
         # Task 6565: handed to every RemoteRunner this worker builds.
@@ -8556,6 +8598,14 @@ class SpeculativeMergeWorker:
         # Cleared by the merger before each wait; never cancelled.
         self._resume_signal = asyncio.Event()
         self._halt_state = HaltState(MERGE_LANES, on_resume=self._resume_signal.set)
+        # The lane-buffered requests each deep chain holds for its tip verify
+        # (task 7720); a release wakes the merger, since links became pickable.
+        self._chain_reservations = ChainReservations(
+            monotonic=lambda: self._clock.monotonic(), on_release=self._resume_signal.set,
+        )
+        # Where the merger waits, before its look-ahead pop, for the chain
+        # decision on the speculative item it just queued (task 7720).
+        self._lookahead_hold = LookaheadHold()
         # The lane buffers, the redispatch park and the suffix-conflict state.
         # Every port re-reads the live worker attribute on each call.
         self._intake = MergeIntake(
@@ -8584,6 +8634,8 @@ class SpeculativeMergeWorker:
             assert_merger_owns=lambda structure: self._assert_single_writer(
                 self._merger_task, structure,
             ),
+            is_reserved=self._chain_reservations.holds,
+            task_priority=task_priority,
         )
         # Persistent queue.get() future — kept alive across iterations to
         # avoid the lost-item hazard of cancelling an in-flight get().
@@ -9100,6 +9152,54 @@ class SpeculativeMergeWorker:
         self.bench_unavailable_runner(entry.lease.name, exc)
         await self._host_allocator.quarantine_and_release(entry.lease)
         entry.lease = None
+
+    async def _verify_releasing_at_verdict(
+        self,
+        verify: Callable[[], Awaitable[InflightVerifyResult]],
+        entry_slot: InflightEntrySlot,
+    ) -> InflightVerifyResult:
+        """Run *verify*, then release its host at the verdict (task 8526).
+
+        *verify* is called inside this task, so a task cancelled before its
+        first step leaves no never-awaited verify coroutine behind.  A raise
+        or a cancellation releases nothing: the canceller owns the lease.
+        """
+        vr = await verify()
+        await self._release_lease_at_verdict(entry_slot, vr)
+        return vr
+
+    async def _release_lease_at_verdict(
+        self, entry_slot: InflightEntrySlot, vr: InflightVerifyResult,
+    ) -> None:
+        """Free the host of the entry in *entry_slot* once *vr* is a verdict
+        and the entry sits behind the ``_inflight`` head.
+
+        The entry keeps its ``_inflight`` place for its in-order landing, as
+        VERIFIED_PENDING_LANDING.  The head keeps its lease to its finalize,
+        which follows at once: a head whose CAS meets a moved main holds it
+        through its parked gate, which keeps the host for its rebased head.
+        A verdict in the persistent merge lane keeps its lease too: that
+        singleton is where its landing still runs, and the held local lease
+        is what serializes it.  A DROPPED, REQUEUED or RUNNER_UNAVAILABLE
+        exit has already vacated or benched it.  The lease is cleared before
+        the release, so no finalize, cascade or ``stop()`` releases it again.
+        """
+        entry = entry_slot.entry
+        if (
+            vr.status is not None or entry is None or entry.lease is None
+            or self._host_allocator is None or not self._behind_inflight_head(entry)
+            or (vr.merge_wt is not None and self._git_ops.is_persistent_merge_lane(vr.merge_wt))
+        ):
+            return
+        await self._host_allocator.release(entry.release_lease_at_verdict())
+
+    def _behind_inflight_head(self, entry: InflightEntry) -> bool:
+        """Whether *entry* sits behind the ``_inflight`` head.
+
+        A head popped for its finalize is not counted, so the entry then at
+        ``_inflight[0]`` keeps its host through its own finalize.
+        """
+        return any(e is entry for e in itertools.islice(self._inflight, 1, None))
 
     # ── task 3204 sweep: two neighbouring candidates, deliberately REJECTED ──
     # Recorded here because this is where a future author would be tempted.
@@ -10612,6 +10712,12 @@ class SpeculativeMergeWorker:
         ``is_lane_halted`` skip, and is the one place the twin invariant above
         needs a same-halt-state caveat.
 
+        **Requests owned by another round are excluded** too (task 7720): a
+        link another chain reserves, and a candidate of an in-flight coalesce.
+        Chaining one would duplicate a link or race a stack. That is the twin
+        invariant's second caveat: it holds item for item only while no
+        reservation and no coalesce is live.
+
         Returns the UNFROZEN suffix only (the lane buffers) — never
         frozen/in-flight items.  The frozen prefix is the immutable head that
         supplies ``head_merge_commit`` via :meth:`frozen_prefix_tip`.
@@ -10620,13 +10726,19 @@ class SpeculativeMergeWorker:
         for lane in MERGE_LANES:  # high → normal, FIFO within lane
             if self.is_lane_halted(lane):
                 continue
-            items.extend(self._intake.buffered(lane))
+            items.extend(
+                req for req in self._intake.buffered(lane)
+                if not self._chain_reservations.holds(req.request_id)
+                and req.request_id not in self._coalescing_ids
+            )
         return tuple(items)
 
     def _newest_frozen_commit(self) -> str | None:
-        """Return the newest frozen entry's merge_commit, or None (ε=1890).
+        """Return what a successor of the newest frozen entry stacks on, or None (ε=1890).
 
-        The tip has one definition, :func:`~orchestrator.merge_lane.remerge_base.frontier_tip`.
+        The tip has one definition, :func:`~orchestrator.merge_lane.remerge_base.frontier_tip`,
+        over :func:`~orchestrator.merge_lane.remerge_base.entry_successor_base`
+        (a chained entry's successors stack on its chain tip).
         Pure/synchronous.
         """
         return frontier_tip(self._frozen_inflight_entries())
@@ -10634,8 +10746,9 @@ class SpeculativeMergeWorker:
     def frozen_prefix_tip(self, main_sha: str) -> str:
         """Return the base SHA that η should stack bounce/verify onto (ε=1890).
 
-        Returns the newest frozen item's merge_commit (the tip of the frozen
-        speculative stack) when the frozen prefix is non-empty, or main_sha
+        Returns what a successor of the newest frozen item stacks on (the tip
+        of the frozen speculative stack: its chain tip when it chained, else
+        its merge commit) when the frozen prefix is non-empty, or main_sha
         when the frozen prefix is empty (tip == main when no item is verifying).
 
         Pure/synchronous (takes main_sha as a parameter to stay await-free,
@@ -10706,12 +10819,15 @@ class SpeculativeMergeWorker:
         ).tip
         if tip is None:
             return None
-        return LiveTip(tip, next(e.item.request for e in frontier if entry_commit(e) == tip))
+        return LiveTip(
+            tip, next(e.item.request for e in frontier if entry_successor_base(e) == tip),
+        )
 
     def _cascade_doomed_commits(self) -> frozenset[str]:
         """The commits :meth:`_verifier_loop`'s head-failure cascade tears down
-        and records dead whenever :meth:`_finalize_inflight` returns False."""
-        return frozenset(c for e in self._inflight if (c := entry_commit(e)) is not None)
+        and records dead whenever :meth:`_finalize_inflight` returns False:
+        each entry's own commit and, when it chained, its chain tip."""
+        return frozenset(sha for e in self._inflight for sha in entry_bases(e))
 
     def _record_item_commit_dead(
         self, item: SpeculativeItem, site: DeadBaseSite, *, doomed: Collection[str] = (),
@@ -10783,8 +10899,8 @@ class SpeculativeMergeWorker:
     def _frozen_base_chain(self) -> Iterator[tuple[RealMergeItem, str | None]]:
         """Walk the frozen prefix's real merges as (item, predecessor_commit), oldest first.
 
-        *predecessor_commit* is the previous frozen real merge's merge commit,
-        or None for the head: the head's base is judged by INV-3 alone
+        *predecessor_commit* is the previous frozen real merge's successor base
+        (its merge commit, or its chain tip when it chained), or None for the head: the head's base is judged by INV-3 alone
         (:meth:`_chain_dead_link`), never against current main, which may
         legitimately move under an in-flight verify (PRD §5.3, task 5302).
 
@@ -10803,7 +10919,7 @@ class SpeculativeMergeWorker:
             if not isinstance(item, RealMergeItem) or not item.merge_result.merge_commit:
                 continue
             yield item, predecessor
-            predecessor = item.merge_result.merge_commit.strip()
+            predecessor = entry_successor_base(entry)
 
     def _chain_breaks(
         self, item: RealMergeItem, predecessor: str | None, main_sha: str,
@@ -11212,13 +11328,16 @@ class SpeculativeMergeWorker:
             return None
         return ProbePlacement(depth=d, base=base)
 
-    async def _deep_chain_placement(self, item: RealMergeItem) -> ChainResult | None:
-        """Decide whether THIS second-slot dispatch should verify a deep CHAIN
-        tip instead of the item's own adjacent merge commit (task 3185, PRD γ).
+    async def _deep_chain_placement(
+        self, item: RealMergeItem, *, frontier_depth: int | None = None,
+    ) -> ChainResult | None:
+        """Decide whether THIS dispatch should verify a deep CHAIN tip instead
+        of the item's own adjacent merge commit (task 3185, PRD γ; task 8527
+        extends it to a head alone in the verify frontier).
 
         The deep twin of :meth:`_probe_verify_placement`, and deliberately the
-        same shape: a slot-1 guard, a hoisted zero-cost kill-switch guard, then
-        the pure policy.  The one structural difference is what a firing
+        same shape: an eligibility guard, a hoisted zero-cost kill-switch guard,
+        then the pure policy.  The one structural difference is what a firing
         placement MEANS.  A :class:`ProbePlacement` only RELABELS the dispatch's
         depth/base attribution — the verify still exercises *item*'s own tree
         (its "KNOWN PHASE-1 LIMITATION").  A :class:`ChainResult` genuinely
@@ -11233,11 +11352,15 @@ class SpeculativeMergeWorker:
 
         The guards, in order, and why that order:
 
-          1. ``not item.speculative`` -> ``None``.  **Slot 1 is never chained.**
-             The head item is merged onto REAL main and is the pipeline's trust
-             anchor: its verdict is the one :meth:`_finalize_inflight` lands a
-             CAS advance on.  Chaining it would make that anchor a verdict about
-             a cumulative tree instead of about the item being landed.
+          1. not :func:`may_chain` -> ``None``
+             (``plans/merge-lane-policy-prd.md`` D5).  A speculative item may
+             chain.  A non-speculative item (the head, merged onto REAL main)
+             may chain only when no other entry is in the verify frontier:
+             anything landing ahead of a main-based item would leave its chain
+             stale.  *frontier_depth* is the dispatch-time ``depth``
+             :meth:`_launch_verify` also hands :meth:`_run_inflight_verify`,
+             so this guard and the d=1 floor's reset arm judge one value;
+             ``None`` (a direct caller) never licenses a head.
           2. ``cap = item.request.config.merge_deep.chain_cap; cap <= 0`` ->
              ``None``.  α's shipped kill switch, hoisted ABOVE the queue scan
              for the same reason :meth:`_probe_verify_placement` hoists its
@@ -11278,8 +11401,11 @@ class SpeculativeMergeWorker:
              intervenes between the bind and the use, so no concurrent dispatch
              can interleave and make the two reads differ.
 
-        Reads, never mutates: :meth:`chain_snapshot` is a pure reader (it must
-        never pop, transition, or resolve), and this method touches neither
+        Never mutates the lane buffers: :meth:`chain_snapshot` is a pure reader
+        (it must never pop, transition, or resolve). The chain's candidates are
+        RESERVED from the snapshot to the round's end instead (task 7720,
+        :mod:`~orchestrator.merge_lane.chain_reservation`), so no other consumer
+        takes one. This method touches neither
         ``_verifier_queue`` nor ``_inflight`` nor the halving state —
         :meth:`_note_chain_outcome` is the sole writer of the latter, and it is
         driven by the tip VERDICT, not by a dispatch decision.
@@ -11289,7 +11415,7 @@ class SpeculativeMergeWorker:
             caller must release it exactly once — see
             :meth:`_run_inflight_verify`'s chain arm), or ``None``.
         """
-        if not item.speculative:
+        if not may_chain(speculative=item.speculative, frontier_depth=frontier_depth):
             return None
         cap = item.request.config.merge_deep.chain_cap
         if cap <= 0:
@@ -11346,6 +11472,36 @@ class SpeculativeMergeWorker:
             # than assert: this is the OPTIONAL deep path, and it must never be
             # the thing that crashes a dispatch.
             return None
+        owner = item.request
+        candidates = snapshot[:d - 1]
+        self._chain_reservations.reserve_candidates(owner, candidates)
+        try:
+            result = await self._build_deep_chain(item, snapshot, base, cap=cap, d=d)
+        except BaseException:
+            self._chain_reservations.release(owner.request_id)
+            raise
+        if result is None:
+            self._chain_reservations.release(owner.request_id)
+            return None
+        chained = {task_id for task_id, _ in result.links}
+        self._chain_reservations.confirm(
+            owner.request_id,
+            link_request_ids={c.request_id for c in candidates if c.task_id in chained},
+            tip=result.tip,
+            timeout_secs=owner.config.merge_deep.chain_reservation_timeout_secs,
+        )
+        return result
+
+    async def _build_deep_chain(
+        self, item: RealMergeItem, snapshot: tuple[MergeRequest, ...], base: str,
+        *, cap: int, d: int,
+    ) -> ChainResult | None:
+        """Build *item*'s chain over *snapshot* onto *base*, bounded by the build
+        deadline; None (the adjacent verify) on overrun, error or zero links.
+
+        Its candidates are reserved for the whole call (task 7720), so no other
+        consumer of the lane buffers can take one mid-build.
+        """
         # Bound on the whole build: lane acquisition (git reset/clean, the CoW
         # re-seed of target/) plus the merges; no cargo. The 1800 s default sits
         # above reify's measured whole-process p99 (seeds, n=401 over
@@ -11850,7 +12006,7 @@ class SpeculativeMergeWorker:
         for branch in recovered_branches:
             try:
                 wt = await self._git_ops.find_inflight_merge_worktree(branch)
-            except Exception:  # noqa: BLE001
+            except Exception:
                 # Fail-open: one branch's oracle miss must never abort the
                 # startup sweep (find_inflight_merge_worktree runs git).
                 logger.warning(
@@ -11904,7 +12060,7 @@ class SpeculativeMergeWorker:
             if age > grace:
                 try:
                     await self._git_ops.cleanup_merge_worktree(path)
-                except Exception:  # noqa: BLE001
+                except Exception:
                     # Fail-open: one worktree's removal failure must never
                     # abort the sweep of the remaining orphans.
                     logger.warning(
@@ -12058,8 +12214,9 @@ class SpeculativeMergeWorker:
         shutdown sentinel has been seen.
         """
         while True:
-            # Drain any newly arrived items into lane buffers.
+            # Buffer anything the persistent getter or the queue delivered.
             # Sets _shutdown_signaled if the sentinel is encountered.
+            self._harvest_pending_get()
             self._drain_queue_into_lanes()
 
             # δ/1889 — refresh the conflict-graph over the unfrozen suffix.
@@ -12090,31 +12247,40 @@ class SpeculativeMergeWorker:
             if await self._dissolve_coalesce_trains_if_halted():
                 continue
 
-            # Nothing pickable — start (or reuse) the persistent queue getter
-            # and wait for EITHER a new arrival OR a lane resume.
-            if self._pending_get is None or self._pending_get.done():
-                self._pending_get = asyncio.ensure_future(self._queue.get())
-
+            # Nothing pickable — wait for EITHER a new arrival OR a lane resume;
+            # the loop top harvests the arrival.
+            arrival = self._live_pending_get()
             self._resume_signal.clear()
             resume_task = asyncio.ensure_future(self._resume_signal.wait())
             try:
-                done, _ = await asyncio.wait(
-                    [self._pending_get, resume_task],
-                    return_when=asyncio.FIRST_COMPLETED,
+                await asyncio.wait(
+                    [arrival, resume_task], return_when=asyncio.FIRST_COMPLETED,
                 )
             finally:
                 if not resume_task.done():
                     resume_task.cancel()
 
-            # If _pending_get finished, harvest its result into lane buffers.
-            if self._pending_get in done:
-                item = self._pending_get.result()
-                self._pending_get = None
-                if item is None:
-                    self._shutdown_signaled = True
-                else:
-                    self._intake.buffer_owned_request(item)
-            # Loop to try pop_next_pickable again (maybe the resume unblocked a lane).
+    def _live_pending_get(self) -> asyncio.Task:
+        """The persistent queue getter, started when none is live.
+
+        Never replaced while it holds an undelivered item: only
+        :meth:`_harvest_pending_get` clears it.  Cancelling a pending
+        ``get()`` could lose an item, so it persists across waits.
+        """
+        if self._pending_get is None:
+            self._pending_get = asyncio.ensure_future(self._queue.get())
+        return self._pending_get
+
+    def _harvest_pending_get(self) -> None:
+        """Buffer the item the persistent getter delivered, noting a shutdown sentinel."""
+        if self._pending_get is None or not self._pending_get.done():
+            return
+        item = self._pending_get.result()
+        self._pending_get = None
+        if item is None:
+            self._shutdown_signaled = True
+        else:
+            self._intake.buffer_owned_request(item)
 
     # ── ι=1894 metric wiring helpers ─────────────────────────────────────────
 
@@ -12303,7 +12469,7 @@ class SpeculativeMergeWorker:
         found = [
             VerifyInFlight.for_request(
                 entry.item.request,
-                host=entry.lease.name if entry.lease is not None else None,
+                host=entry.verify_host,
                 kind=VerifyInFlightKind.for_phase(self._entry_phase(entry)),
                 started_ts=self._phase_started.get(
                     entry.item.request.request_id,
@@ -12398,19 +12564,30 @@ class SpeculativeMergeWorker:
     def _lease_rows(
         self, fh_entry: InflightEntry | None, occupying: Sequence[InflightEntry],
     ) -> list[LeaseRow]:
-        """One :class:`LeaseRow` per held lease: the finalize head, then *occupying*."""
+        """One :class:`LeaseRow` per entry with a host: the finalize head, then *occupying*."""
         return [
-            self._lease_row(entry, entry.lease) for entry in (fh_entry, *occupying)
-            if entry is not None and entry.lease is not None
+            row for entry in (fh_entry, *occupying)
+            if entry is not None and (row := self._entry_row(entry)) is not None
         ]
 
-    def _lease_row(self, entry: InflightEntry, lease: HostLease) -> LeaseRow:
+    def _entry_row(self, entry: InflightEntry) -> LeaseRow | None:
+        """*entry*'s held lease, or the host it released at its verdict (task 8526)."""
+        host = entry.verify_host
+        if host is None:
+            return None
+        activity = (
+            lease_activity(entry.lease, entry.pending_task) if entry.lease is not None
+            else LeaseActivity.VERIFIED_PENDING_LANDING
+        )
+        return self._host_row(entry, host, activity)
+
+    def _host_row(self, entry: InflightEntry, host: str, activity: LeaseActivity) -> LeaseRow:
         return LeaseRow(
-            host=lease.name,
+            host=host,
             task_id=entry.item.request.task_id,
             request_id=entry.item.request.request_id,
-            activity=lease_activity(lease, entry.pending_task),
-            host_quarantined=lease.name in self._runner_quarantine,
+            activity=activity,
+            host_quarantined=host in self._runner_quarantine,
         )
 
     def _hosts_total(self) -> int:
@@ -12420,16 +12597,17 @@ class SpeculativeMergeWorker:
     def _occupancy_block(self, rows: Sequence[LeaseRow]) -> dict:
         """:meth:`snapshot`'s ``occupancy``, from :meth:`_lease_rows`.
 
-        by_host / inflight_by_host / hosts_busy / inflight_total are LEASE
-        occupancy; ``leases`` and ``verifying_by_host`` say what each lease is
-        doing (task 5290).
+        by_host / inflight_by_host / hosts_busy are LEASE occupancy, so a row
+        released at its verdict is left out; inflight_total counts every row,
+        and ``leases`` and ``verifying_by_host`` say what each is doing
+        (tasks 5290, 8526).
         """
-        inflight_by_host = _task_ids_by_host(rows)
+        inflight_by_host = _leased_by_host(rows)
         return {
             'hosts_total': self._hosts_total(),
             'hosts_busy': len(inflight_by_host),
             # LOSSY on purpose (historical shape): the last occupant per host.
-            'by_host': {row.host: row.task_id for row in rows},
+            'by_host': {host: task_ids[-1] for host, task_ids in inflight_by_host.items()},
             'inflight_by_host': inflight_by_host,
             'inflight_total': len(rows),
             'leases': [row.to_wire() for row in rows],
@@ -12465,12 +12643,15 @@ class SpeculativeMergeWorker:
             inflight_by_host: {host: [task_id, ...]} — lossless, every leased
               occupant present.  Ordered finalize head first, then _inflight
               order, mirroring `entries`.
-            inflight_total: total leased in-flight entries across all hosts.
-            These four are LEASE occupancy: a lease is not evidence that its
-            host is reachable or verifying (task 5290).  The activity view:
+            inflight_total: leased in-flight entries plus entries released
+              at their verdict and awaiting landing (task 8526).
+            hosts_busy / by_host / inflight_by_host are LEASE occupancy: a
+            lease is not evidence that its host is reachable or verifying
+            (task 5290).  The activity view:
             leases: one {host, task_id, request_id, activity,
-              host_quarantined} row per lease, in inflight_by_host order;
-              activity is a :class:`LeaseActivity` value.
+              host_quarantined} row per such entry, finalize head first;
+              activity is a :class:`LeaseActivity` value, and a released
+              entry's host is the one its verdict came from.
             verifying_by_host: {host: [task_id, ...]} for the leases whose
               activity is live and whose host is not quarantined.
           hosts: list of per-host state dicts (task 3275), one per host the
@@ -12564,7 +12745,7 @@ class SpeculativeMergeWorker:
                 worktree_path=infl.merge_wt,
                 position=position,
             )
-            e['host'] = infl.lease.name if infl.lease is not None else None
+            e['host'] = infl.verify_host
             e['verify_started_at'] = infl.started_at
             e['verify_age_secs'] = (
                 max(0.0, now - infl.started_at)
@@ -12832,6 +13013,8 @@ class SpeculativeMergeWorker:
             'verify_base_divergences': list(
                 map(VerifyBaseDivergence.to_wire, self.verify_base_divergences()),
             ),
+            # task 7720: the lane-buffered links each deep chain holds.
+            'chain_reservations': self._chain_reservations.snapshot(),
             # θ=1993 additive key: merger-side speculation state (from
             # self._speculation_controller.snapshot()) plus
             # inflight_speculative — the count of speculative items now owned
@@ -13321,7 +13504,10 @@ class SpeculativeMergeWorker:
              never starve the heartbeat log.
           2. Delegates the fire/rate-limit/format/emit decision to the
              synchronous, clock-injectable :meth:`_maybe_log_queue_heartbeat`.
-          3. Delegates to the rate-limited, clock-injectable
+          3. Hands back the links of every deep chain reservation past its
+             deadline (:meth:`_expire_chain_reservations`, task 7720), the
+             only bound on a reservation nothing else released.
+          4. Delegates to the rate-limited, clock-injectable
              :meth:`_maybe_reap_orphaned_merge_worktrees` (task 3018), the
              steady-state counterpart to the startup-only orphan reap — this
              is what bounds an audit-flagged leak's on-disk lifetime instead
@@ -13332,12 +13518,11 @@ class SpeculativeMergeWorker:
              a timed-out sweep is logged and simply retried on a later poll,
              subject to its own rate limit.
 
-        Steps 1-2 and step 3 are wrapped in their OWN, SEPARATE try/except
-        (mirroring the swallow-and-log convention used here and in
-        :meth:`_reprobe_loop`) so a fault in the periodic reap can never
-        suppress — or be suppressed by — the touch/heartbeat step, and
-        either kind of bug is logged and swallowed instead of crashing the
-        worker.
+        Steps 1-2, step 3 and step 4 are each wrapped in their OWN, SEPARATE
+        try/except (mirroring the swallow-and-log convention used here and in
+        :meth:`_reprobe_loop`) so a fault in one can never suppress — or be
+        suppressed by — another, and every kind of bug is logged and
+        swallowed instead of crashing the worker.
         """
         while self._running:
             await self._clock.sleep(_HEARTBEAT_POLL_S)
@@ -13346,6 +13531,10 @@ class SpeculativeMergeWorker:
                 self._maybe_log_queue_heartbeat(self._clock.now())
             except Exception:
                 logger.exception('merge queue heartbeat: unexpected error')
+            try:
+                self._expire_chain_reservations()
+            except Exception:
+                logger.exception('merge queue heartbeat: chain-reservation expiry failed')
             try:
                 await asyncio.wait_for(
                     self._maybe_reap_orphaned_merge_worktrees(self._clock.now()),
@@ -13704,6 +13893,8 @@ class SpeculativeMergeWorker:
         # `live` -- the same over-release-is-safe shutdown valve as before,
         # now the sole acquire/release surface for both semaphores (P-2).
         self._speculation_ledger.release_for_shutdown(self._speculation_depth + 1)
+        self._chain_reservations.clear()
+        self._lookahead_hold.release_all()
         self._halt_state.release_lanes_for_shutdown()
         self._merge_ahead_ledger.release_for_shutdown(self._speculation_depth + 1)
 
@@ -14297,7 +14488,7 @@ class SpeculativeMergeWorker:
         predicate = self._merge_ready_predicate or self._default_coalesce_exclusion_reason
         try:
             return predicate(candidate)
-        except Exception:  # noqa: BLE001
+        except Exception:
             # An injected predicate raised — degrade gracefully: log the
             # error and treat the candidate as eligible so a buggy closure
             # does not kill the merger loop.  The default predicate is
@@ -14537,6 +14728,7 @@ class SpeculativeMergeWorker:
             and req.lane == 'normal'
             and not req.result.done()
             and not req.result.cancelled()
+            and not self._chain_reservations.holds(req.request_id)
         ]
 
         # Guard: need at least 2 candidates to form a train.
@@ -14951,7 +15143,10 @@ class SpeculativeMergeWorker:
                         EventType.merge_dequeued,
                         task_id=req.task_id,
                         phase='merge',
-                        data={'branch': req.branch.bare_id, 'queue_depth': self._queue.qsize()},
+                        data={
+                            **self._intake.take_pick_record(req.request_id),
+                            'branch': req.branch.bare_id, 'queue_depth': self._queue.qsize(),
+                        },
                     )
                 t0 = self._clock.monotonic()
                 merge_result_local: MergeResult | None = None
@@ -15267,6 +15462,12 @@ class SpeculativeMergeWorker:
                     # ledger.live forever — same hazard as the
                     # on_transfer_terminal() sites above.
                     _real_item.permit = self._speculation_controller.on_transfer()
+                    # The look-ahead hold is registered in this same no-await
+                    # window, so it exists before the verifier can dispatch
+                    # _real_item (task 7720).
+                    held = self._holds_lookahead(_real_item)
+                    if held:
+                        self._lookahead_hold.hold(req.request_id)
                     # This request's merge commit is now on the verifier queue
                     # and main has NOT advanced to it yet.  A train dequeued
                     # before this Future resolves would CAS against a main that
@@ -15282,48 +15483,10 @@ class SpeculativeMergeWorker:
                     # _resolve_merging_requests) now read to see that (task
                     # 2435 kappa-b: self._inflight_req field deleted).
 
-                    # ── Speculative look-ahead (depth-K cap) ──────────────────
-                    # Acquire one speculation permit before the look-ahead peek.
-                    # If an item is found and prefetched, the permit stays held;
-                    # the Verifier releases it when draining this speculative item.
-                    # If nothing is pickable (or shutdown), the permit is released
-                    # immediately — symmetric accounting keeps in-flight speculations
-                    # bounded at self._speculation_depth (K).
-                    await self._speculation_controller.acquire_for_lookahead()  # depth-K cap
-                    # Harvest any item already delivered to the persistent
-                    # getter so the look-ahead can see it via MergeIntake.pop_next_pickable.
-                    if self._pending_get is not None and self._pending_get.done():
-                        _item = self._pending_get.result()
-                        self._pending_get = None
-                        if _item is None:
-                            self._shutdown_signaled = True
-                        else:
-                            self._intake.buffer_owned_request(_item)
-                    self._drain_queue_into_lanes()
-                    next_req = self._intake.pop_next_pickable()
-                    if next_req is not None:
-                        # Permit stays held — verifier will release on drain.
-                        self._speculation_controller.on_lookahead_found(next_req, merge_commit)
-                        logger.debug(
-                            f'Task {req.task_id}: speculative look-ahead for '
-                            f'{next_req.task_id} (base={merge_commit[:8]})'
-                        )
-                    elif self._shutdown_signaled:
-                        self._speculation_controller.on_shutdown()  # return unused permit
-                        break  # shutdown sentinel and nothing left to speculate
-                    else:
-                        # Nothing pickable right now AND predecessor is in-flight.
-                        # RETAIN the held speculation permit so a late-arriving
-                        # successor can attach to the predecessor's merge commit
-                        # (task 1862: close the disjoint-skip semantic-conflict hole).
-                        #
-                        # • DON'T release: the permit transfers to the late arrival
-                        #   on ATTACH (or is released on FALLBACK at next dequeue).
-                        # • DON'T set spec_base: the late arrival hasn't been dequeued
-                        #   yet; spec_base is set at the ATTACH/FALLBACK decision.
-                        # • Record predecessor's commit so the next dequeue can attach.
-                        self._speculation_controller.on_lookahead_pending(merge_commit, req)
-                        # held_by_merger stays 1 — permit retained for late arrival
+                    decided_base = await self._await_dispatch_decision(req) if held else None
+                    look_ahead = await self._look_ahead(req, decided_base or merge_commit)
+                    if look_ahead is _LookAhead.SHUTDOWN:
+                        break
                 except WorktreeMissing as exc:
                     # The task worktree was removed out-of-band (typical
                     # cause: a human marked the task done and cleaned up
@@ -15450,6 +15613,87 @@ class SpeculativeMergeWorker:
             if not self._running or exited_via_sentinel:
                 await self._verifier_queue.put(None)
 
+    def _holds_lookahead(self, item: RealMergeItem) -> bool:
+        """Whether the merger waits for *item*'s dispatch before its look-ahead
+        pop (task 7720): any item may chain at its own dispatch (a
+        non-speculative one when it is then alone in the verify frontier,
+        which the merger cannot know yet; PRD D5), so the look-ahead waits for
+        every dispatch's decision while ``merge_deep.chain_cap`` (read live)
+        is on and a live verifier loop can decide."""
+        verifier = self._verifier_task
+        return (
+            item.request.config.merge_deep.chain_cap > 0
+            and verifier is not None
+            and not verifier.done()
+        )
+
+    async def _await_dispatch_decision(self, req: MergeRequest) -> str | None:
+        """What *req*'s successors stack on, as its dispatch left it, or None
+        when no dispatch decided (see :meth:`_dispatch_deciding`).
+
+        Races the verifier loop, so a verifier that dies undecided can never
+        wedge the merger; ``stop()`` releases every hold.  Requests arriving
+        meanwhile go into the lane buffers, where *req*'s dispatch can chain
+        them: *req* may wait hours for a host.
+        """
+        verifier = self._verifier_task
+        assert verifier is not None, 'a look-ahead hold needs a live verifier loop'
+        ended = None
+        while ended is None:
+            self._harvest_pending_get()
+            self._drain_queue_into_lanes()
+            arrival = None if self._shutdown_signaled else self._live_pending_get()
+            ended = await self._lookahead_hold.wait(
+                req.request_id, alive=verifier, wake=arrival,
+            )
+        return ended.successor_base
+
+    async def _look_ahead(self, req: MergeRequest, base: str) -> _LookAhead:
+        """Pre-pick the request to merge after *req*, onto *base*.
+
+        *base* is what *req*'s successors stack on: its chain tip when its
+        dispatch built a chain, else its own merge commit, re-merged when its
+        dispatch re-merged it
+        (:func:`~orchestrator.merge_lane.remerge_base.entry_successor_base`).
+        """
+        # ── Speculative look-ahead (depth-K cap) ──────────────────
+        # Acquire one speculation permit before the look-ahead peek.
+        # If an item is found and prefetched, the permit stays held;
+        # the Verifier releases it when draining this speculative item.
+        # If nothing is pickable (or shutdown), the permit is released
+        # immediately — symmetric accounting keeps in-flight speculations
+        # bounded at self._speculation_depth (K).
+        await self._speculation_controller.acquire_for_lookahead()  # depth-K cap
+        # Harvest any item already delivered to the persistent
+        # getter so the look-ahead can see it via MergeIntake.pop_next_pickable.
+        self._harvest_pending_get()
+        self._drain_queue_into_lanes()
+        next_req = self._intake.pop_next_pickable()
+        if next_req is not None:
+            # Permit stays held — verifier will release on drain.
+            self._speculation_controller.on_lookahead_found(next_req, base)
+            logger.debug(
+                f'Task {req.task_id}: speculative look-ahead for '
+                f'{next_req.task_id} (base={base[:8]})'
+            )
+            return _LookAhead.PICKED
+        if self._shutdown_signaled:
+            self._speculation_controller.on_shutdown()  # return unused permit
+            return _LookAhead.SHUTDOWN
+        # Nothing pickable right now AND predecessor is in-flight.
+        # RETAIN the held speculation permit so a late-arriving
+        # successor can attach to *base* (task 1862: close the
+        # disjoint-skip semantic-conflict hole).
+        #
+        # • DON'T release: the permit transfers to the late arrival
+        #   on ATTACH (or is released on FALLBACK at next dequeue).
+        # • DON'T set spec_base: the late arrival hasn't been dequeued
+        #   yet; spec_base is set at the ATTACH/FALLBACK decision.
+        # • Record predecessor's commit so the next dequeue can attach.
+        self._speculation_controller.on_lookahead_pending(base, req)
+        # held_by_merger stays 1 — permit retained for late arrival
+        return _LookAhead.PENDING
+
     # ------------------------------------------------------------------
     # Verifier coroutine
     # ------------------------------------------------------------------
@@ -15509,6 +15753,9 @@ class SpeculativeMergeWorker:
         #
         # No hard block: the append already happened above; this block has no
         # `return`, no `raise`, and no veto.
+        #
+        # The bound is the host count, not speculation depth: leased verifies
+        # are bounded by one allocator slot per host, while K = hosts + 1.
         try:
             _local = sum(
                 1 for _e in self._frozen_inflight_entries()
@@ -15521,7 +15768,7 @@ class SpeculativeMergeWorker:
             alarm_serial_lane_breach(
                 check_serial_lane_tripwire(
                     _local,
-                    merge_ahead_bound=self._speculation_depth,
+                    merge_ahead_bound=_hosts,
                     num_hosts=_hosts,
                 ),
                 event_store=self._event_store,
@@ -15885,7 +16132,7 @@ class SpeculativeMergeWorker:
                         else ItemLifecycleState.REDISPATCH_PARKED,
                         ItemLifecycleState.DISPATCHING, live_obj=item,
                     )
-                    dispatched = await self._dispatch_item(item)
+                    dispatched = await self._dispatch_deciding(item)
                 except (asyncio.CancelledError, KeyboardInterrupt):
                     raise
                 except BaseException as exc:
@@ -16007,8 +16254,9 @@ class SpeculativeMergeWorker:
                     logger.exception(
                         'Task %s: unexpected finalize error', head.item.request.task_id
                     )
-                    # _finalize_inflight's finally already released the lease
-                    # and speculation permit; the chokepoint's own release is
+                    # The verify released its lease at the verdict, or
+                    # _finalize_inflight's finally released the lease still
+                    # held and the speculation permit; the chokepoint's own release is
                     # a no-op here (idempotent lease FREE-check + permit
                     # .released guard) — it just resolves the future and
                     # marks the chain as failed.
@@ -16211,7 +16459,7 @@ class SpeculativeMergeWorker:
                         item.request.request_id, ItemLifecycleState.AWAITING_VERIFY,
                         ItemLifecycleState.DISPATCHING, live_obj=item,
                     )
-                    dispatched = await self._dispatch_item(item)
+                    dispatched = await self._dispatch_deciding(item)
                 except (asyncio.CancelledError, KeyboardInterrupt):
                     raise
                 except BaseException as exc:
@@ -17310,7 +17558,8 @@ class SpeculativeMergeWorker:
         local whatever host the head holds, and acquires no slot.
         """
         return await self._lane_post_merge_verify(
-            git_ops, req, merge_wt, dispatch_facts=_GATE_HISTORY_LEG_FACTS, **gate_kwargs,
+            git_ops, req, merge_wt,
+            dispatch_facts=with_chain_members(_GATE_HISTORY_LEG_FACTS, req, None), **gate_kwargs,
         )
 
     async def _run_inflight_verify(
@@ -17465,6 +17714,7 @@ class SpeculativeMergeWorker:
             ``None`` (default) leaves the lease to finalize.
         """
         req = item.request
+        dispatch_facts = with_chain_members(dispatch_facts, req, chain)
         # ── task 3185 (PRD γ): THE DEEP-CHAIN REDIRECT ──────────────────────
         # The two facts every path below is written against — WHAT is verified
         # and WHERE — are chosen here, once, so no downstream branch has to
@@ -18512,6 +18762,12 @@ class SpeculativeMergeWorker:
             # returning the lane to the pool while a verify subprocess is still
             # running inside it would let the next chain build check the lane
             # out from under it.
+            #
+            # task 7720: a round that will not adopt (tip fail, raise, abort,
+            # defer, cancel) gives its reserved links back, synchronously and
+            # before the await, so a cancel cannot separate the two releases.
+            if chain is not None and not _chain_adopting:
+                self._end_chain_reservation(req.request_id, all_landed=False)
             await _release_chain_lane()
 
             # ── task 3186 (PRD δ): the chain item's EPHEMERAL worktree ──────
@@ -18627,9 +18883,7 @@ class SpeculativeMergeWorker:
                 # the tip just made redundant.  See `_adopt_head_on_tip_authority` for which
                 # entry counts as the head, why the tip's verdict covers it,
                 # and the two lease axes the teardown must leave idle.
-                await self._adopt_head_on_tip_authority(
-                    req.request_id, req.task_id,
-                )
+                await self._adopt_head_on_tip_authority(item)
                 return InflightVerifyResult(
                     outcome=None,
                     merge_wt=item.merge_wt,
@@ -18677,16 +18931,16 @@ class SpeculativeMergeWorker:
         #   * `chain_cap > 0` — α's kill switch.  At the shipped default this
         #     arm does not merely have no effect, it is not REACHED: cap=0
         #     dispatch stays byte-identical down to "no method call".
-        #   * `item.speculative` — slot 2 only.  A slot-1 head verify is a
-        #     different tree (merged onto REAL main, never chained by γ), so
-        #     its verdict says nothing about whether chaining is safe.
+        #   * `may_chain(...)` — a round that could have chained: slot 2, or a
+        #     head alone in the frontier at its dispatch (PRD D5); a depth of
+        #     None (a non-production caller) never licenses a head.
         #   * state `is not None` — already reset; nothing to do.
         # `depth=1` is truthful, not a placeholder: at the floor the tree that
         # actually ran IS a one-item chain (that is what makes the floor
         # byte-identical to today's adjacent verify in the first place).
         if (
             out is None
-            and item.speculative
+            and may_chain(speculative=item.speculative, frontier_depth=depth)
             and self._chain_halving_state is not None
             and req.config.merge_deep.chain_cap > 0
         ):
@@ -18787,18 +19041,32 @@ class SpeculativeMergeWorker:
         self._intake.request_redispatch(_remerged, front=True)
         return False
 
-    async def _adopt_head_on_tip_authority(
-        self, tip_req_id: str, tip_task_id: str,
-    ) -> InflightEntry | None:
+    def _head_inside_tip(self, tip: RealMergeItem) -> InflightEntry | None:
+        """The entry ahead of *tip* that *tip*'s tree contains, or None.
+
+        A non-speculative tip is built on main, so it is the head itself and
+        contains no entry ahead of it (``plans/merge-lane-policy-prd.md`` D5).
+        """
+        if not tip.speculative:
+            return None
+        head = self._finalizing_head_entry()
+        if head is None and self._inflight:
+            head = self._inflight[0]
+        if head is None or head.item.request.request_id == tip.request.request_id:
+            return None
+        return head
+
+    async def _adopt_head_on_tip_authority(self, tip: RealMergeItem) -> InflightEntry | None:
         """Claim the HEAD I0 for a green chain tip and tear its verify down
         (task 3186, PRD δ; decision #3).
 
-        WHY THE HEAD IS DELTA'S BUSINESS AT ALL.  ``_deep_chain_placement`` is
-        gated on ``item.speculative``, so slot 1's head is never chained — but
-        the speculative slot-2 item that IS chained was merged onto the head's
-        merge commit (the frozen-prefix tip), and the links were merged onto
-        that.  The tip tree the verify just passed therefore strictly CONTAINS
-        the head's tree.  Two consequences, and both are decision #3:
+        WHY THE HEAD IS DELTA'S BUSINESS AT ALL.  A speculative tip was merged
+        onto the head's merge commit (the frozen-prefix tip), and its links
+        onto that, so the tree the verify just passed strictly CONTAINS the
+        head's tree.  A non-speculative tip IS the head (PRD D5): it lands on
+        its own tip authority through the unchanged CAS walk, and there is
+        nothing ahead of it to cancel (:meth:`_head_inside_tip`).  For a
+        speculative tip, two consequences, and both are decision #3:
 
           * The head's own verdict is about a SUBSET the tip has better
             evidence for.  Waiting for it buys nothing; OBEYING it when it is
@@ -18824,9 +19092,9 @@ class SpeculativeMergeWorker:
              would silently skip the cancel there, leaving the finalize parked
              on a verdict it no longer needs.
 
-        Either way the TIP'S OWN entry is excluded explicitly: in production it
-        sits on ``_inflight`` behind the head, and reading it as "the head"
-        would have this coroutine cancel itself.
+        Either way :meth:`_head_inside_tip` excludes the TIP'S OWN entry: in
+        production it sits on ``_inflight`` behind the head, and reading it as
+        "the head" would have this coroutine cancel itself.
 
         THE TEARDOWN IS THE SANCTIONED PAIR, in the head-failure cascade's
         order: :meth:`_teardown_verify_task` (which owns the load-bearing
@@ -18861,12 +19129,8 @@ class SpeculativeMergeWorker:
         Returns the adopted entry, or ``None`` when there is no head to adopt
         (single-slot round, head already finalized, passthrough head).
         """
-        head = self._finalizing_head_entry()
-        if head is None and self._inflight:
-            candidate = self._inflight[0]
-            if candidate.item.request.request_id != tip_req_id:
-                head = candidate
-        if head is None or head.item.request.request_id == tip_req_id:
+        head = self._head_inside_tip(tip)
+        if head is None:
             return None
         if head.verify_task is None:
             # A passthrough / pre-established-PASS entry has no verify to
@@ -18874,6 +19138,7 @@ class SpeculativeMergeWorker:
             # decision #3 says nothing about it.
             return None
 
+        tip_task_id = tip.request.task_id
         head_task_id = head.item.request.task_id
         if head.verify_task.done() and head.item.request.result.done():
             # ── task 3186 (PRD δ), review fix #4: DELIVERED ≠ UNDECIDED ─────
@@ -19259,6 +19524,39 @@ class SpeculativeMergeWorker:
             'deep chain walk: landed %d of %d chained link(s) on top of %s',
             landed, len(chain.links), head_sha[:8],
         )
+        self._end_chain_reservation(
+            entry.item.request.request_id, all_landed=landed == len(chain.links),
+        )
+
+    def _expire_chain_reservations(self) -> None:
+        """Release every chain reservation past its deadline (the WARNING is
+        the reservation module's) and record each tip dead.
+
+        The release has already woken the merger. The tip verify keeps running;
+        a passing tip's walk lands the still-buffered prefix and stops at the
+        first link taken elsewhere.
+        """
+        for record in self._chain_reservations.expire():
+            if record.tip is not None:
+                self._record_dead_base(
+                    record.tip,
+                    killer=DeadBaseKiller(DeadBaseSite.CHAIN_RELEASED, record.owner_task_id),
+                )
+
+    def _end_chain_reservation(self, owner_request_id: str, *, all_landed: bool) -> None:
+        """End *owner_request_id*'s chain reservation (idempotent).
+
+        A confirmed tip whose links did not all land never reaches main, so it
+        is recorded dead (INV-3): anything stacked on it is re-merged at
+        dispatch or voided at adoption by the existing machinery.
+        """
+        record = self._chain_reservations.release(owner_request_id)
+        if record is None or record.tip is None or all_landed:
+            return
+        self._record_dead_base(
+            record.tip,
+            killer=DeadBaseKiller(DeadBaseSite.CHAIN_RELEASED, record.owner_task_id),
+        )
 
     async def _finalize_landed_by_successor(
         self,
@@ -19377,7 +19675,9 @@ class SpeculativeMergeWorker:
           PASS          — vr.outcome is None (or verify_task=None for compat shim):
                           CAS advance_main loop.
 
-        Lease release and speculation-slot release happen in the single finally:
+        A lease still held at finalize (the head's own verdict, a verdict kept
+        on the persistent merge lane, or a pre-verdict exit) and the
+        speculation slot are released in the single finally:
           · _cancel_release=True  → cancel_and_release  (DROPPED/REQUEUED,
                                     unless vacated: lease is None; and a gate
                                     re-verify interrupted mid-run, as an
@@ -19558,10 +19858,9 @@ class SpeculativeMergeWorker:
                 #     True, so those verifies are cancelled and their requests
                 #     manually requeued (NOT re-merged onto the stale tip) --
                 #     again correct, for the same base-is-gone reason.
-                # "Head path unaffected" DOES hold literally: the deep gate
-                # returns None for a non-speculative item, and the head
-                # finalizes ahead of the deep item in submission order, so slot
-                # 1 never reaches this branch on account of a chain.
+                # A chained head (alone in the frontier, PRD D5) reaches this
+                # branch on a red tip as a slot-2 tip does, and its successors,
+                # stacked on its dead chain tip, die in the cascade.
                 _n_failed_val = True
                 if vr.status == InflightStatus.DROPPED:
                     self._retire_item(req.request_id)
@@ -19988,6 +20287,10 @@ class SpeculativeMergeWorker:
             # A head parked on its gate keeps its lease, permit, chain flag
             # and drift base until the call that resumes it ends.
             if entry.gate is None:
+                # First, ahead of the awaits below: a raise or cancel there must
+                # not leave the links reserved until the deadline (idempotent;
+                # a landed chain already ended it).
+                self._end_chain_reservation(req.request_id, all_landed=False)
                 # Always: release the host lease (unless passthrough / already skipped),
                 # release the speculation permit iff one was threaded, and update
                 # _n_failed.
@@ -20618,7 +20921,7 @@ class SpeculativeMergeWorker:
     async def _tear_down_inflight_entry(
         self, entry: InflightEntry, cause: VerifyCancelCause,
     ) -> InflightStatus | None:
-        """Cancel *entry*'s verify for *cause* and release its lease.
+        """End *entry*'s verify (cancelled for *cause*), its lease and its chain reservation.
 
         Returns the status the verify had already finished with, if any, so
         a caller can see a REQUEUED request that is back on the queue.  The
@@ -20627,28 +20930,29 @@ class SpeculativeMergeWorker:
         """
         status: InflightStatus | None = None
         task = entry.verify_task
-        if task is not None:
-            # A CancelledError propagates to stop the loop, rather than being
-            # suppressed the way the stop() drain paths suppress it.
-            await self._teardown_verify_task(
-                entry.lease, task, entry.item.request.task_id,
-                cancel=VerifyCancel.of(cause, entry),
-            )
-            if task.done() and not task.cancelled():
-                with contextlib.suppress(BaseException):
-                    status = getattr(task.result(), 'status', None)
-        if entry.lease is not None and self._host_allocator is not None:
-            await self._cancel_and_release_tracked(entry.lease)
-            entry.lease = None
+        try:
+            if task is not None:
+                # A CancelledError propagates to stop the loop, rather than being
+                # suppressed the way the stop() drain paths suppress it.
+                await self._teardown_verify_task(
+                    entry.lease, task, entry.item.request.task_id,
+                    cancel=VerifyCancel.of(cause, entry),
+                )
+                if task.done() and not task.cancelled():
+                    with contextlib.suppress(BaseException):
+                        status = getattr(task.result(), 'status', None)
+            if entry.lease is not None and self._host_allocator is not None:
+                await self._cancel_and_release_tracked(entry.lease)
+                entry.lease = None
+        finally:
+            self._end_chain_reservation(entry.item.request.request_id, all_landed=False)
         return status
 
     def _frontier_base_commits(self) -> tuple[set[str], set[str]]:
-        """The frozen prefix's merge commits and gate-rebased heads a dispatch may be built on."""
+        """The frozen prefix's merge commits, chain tips and gate-rebased heads a
+        dispatch may be built on."""
         frozen = self._frozen_inflight_entries()
-        stacked_on = {
-            e.item.merge_result.merge_commit for e in frozen
-            if isinstance(e.item, RealMergeItem) and e.item.merge_result.merge_commit
-        }
+        stacked_on = {sha for e in frozen for sha in entry_bases(e)}
         rebased_heads = {e.gate.rebased_sha for e in frozen if e.gate is not None}
         rebased_heads |= rebased_head_commits(frozen)
         return stacked_on, rebased_heads
@@ -20696,6 +21000,23 @@ class SpeculativeMergeWorker:
             ItemLifecycleState.REDISPATCH_PARKED, live_obj=item,
         )
         self._intake.request_redispatch(item, front=front)
+
+    async def _dispatch_deciding(self, item: SpeculativeItem) -> InflightEntry | NoHost:
+        """:meth:`_dispatch_item`, publishing to a merger held on *item* (task
+        7720) what *item*'s successors stack on: the dispatched entry's chain
+        tip, else its own commit, which a dispatch-time re-merge replaced
+        after the merger queued it. None on a raise, or when the entry built
+        no commit. A :class:`NoHost` return decides nothing, since the item
+        dispatches again later."""
+        rid = item.request.request_id
+        try:
+            dispatched = await self._dispatch_item(item)
+        except BaseException:
+            self._lookahead_hold.decide(rid, None)
+            raise
+        if not isinstance(dispatched, NoHost):
+            self._lookahead_hold.decide(rid, entry_successor_base(dispatched))
+        return dispatched
 
     async def _dispatch_item(
         self,
@@ -21294,7 +21615,7 @@ class SpeculativeMergeWorker:
             # `except BaseException` arm is what returns it.  The obligation only
             # begins once `chain` is bound, and from that point to the
             # ensure_future there is still nothing that can raise.
-            chain = await self._deep_chain_placement(item)
+            chain = await self._deep_chain_placement(item, frontier_depth=depth)
         except BaseException:
             # See the LEASE/PERMIT LEAK GUARD note above the `try`.  Hand back
             # both resources, then re-raise UNCHANGED -- this arm is a resource
@@ -21315,10 +21636,14 @@ class SpeculativeMergeWorker:
         verify_wt = VerifyWorktreeHandle(merge_wt=item.merge_wt, spec_warm=False)
         entry_slot = InflightEntrySlot()
         verify_task: asyncio.Task = asyncio.ensure_future(  # type: ignore[type-arg]
-            self._run_inflight_verify(
-                item, lease, depth=depth, probe_base=probe_base,
-                chain_items=chain_items, chain=chain, verify_wt=verify_wt,
-                entry_slot=entry_slot, dispatch_facts=dispatch_facts,
+            self._verify_releasing_at_verdict(
+                functools.partial(
+                    self._run_inflight_verify,
+                    item, lease, depth=depth, probe_base=probe_base,
+                    chain_items=chain_items, chain=chain, verify_wt=verify_wt,
+                    entry_slot=entry_slot, dispatch_facts=dispatch_facts,
+                ),
+                entry_slot,
             )
         )
 

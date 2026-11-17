@@ -16,6 +16,9 @@ from shared.transcript_archive import (
     durable_archive_path,
     restore_archived_transcript,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # A representative encoded-project directory name (Claude Code encodes the
 # absolute project path into this leaf; the exact encoding is irrelevant here).
@@ -997,6 +1000,24 @@ class TestDurableArchivePathLookup:
 
         assert durable_archive_path(root, '42', sid) is not None
         assert durable_archive_path(root, '99', sid) is None
+
+    def test_b4_glob_metacharacters_in_task_id_are_matched_literally(self, tmp_path):
+        """B4: a task_id that looks like a glob pattern names only itself.
+
+        Task 4637: a session archived under task 42 must not answer for task
+        ``4*``, ``4?`` or ``[4]2``. Matching the task_id literally is also what
+        keeps one lookup inside its own key's subtree.
+        """
+        root = tmp_path / 'archive'
+        sid = 'sess-b4-literal'
+
+        _write(root / '42' / ENC / f'{sid}.jsonl', b'{}')
+
+        assert durable_archive_path(root, '42', sid) is not None
+        for pattern_like_task_id in ('4*', '4?', '[4]2'):
+            assert durable_archive_path(root, pattern_like_task_id, sid) is None, (
+                f'task_id {pattern_like_task_id!r} was globbed and matched task 42'
+            )
 
     def test_b3_uncompressed_archive_is_found(self, tmp_path):
         """B3 (I-C): the post-task-3618 plain-``.jsonl`` shape is located too."""

@@ -74,6 +74,9 @@ from audit_combine_gate_marker_loss import (
     tickets_db_path,
 )
 from shared.project_id import project_id_for_root
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # ---------------------------------------------------------------------------
 # load_combine_targets — the combine-target population.

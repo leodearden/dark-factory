@@ -28,6 +28,7 @@ import pytest_asyncio
 from _curator_helpers import agent_result, invoke_by_role, make_config, must_not_invoke, tripwire
 from shared.cli_invoke import AgentResult
 from shared.task_statuses import ACTIVE
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
 from fused_memory.config.schema import FusedMemoryConfig, TaskmasterConfig
@@ -41,6 +42,8 @@ from fused_memory.middleware.task_curator import TaskCurator
 from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.middleware.ticket_store import TicketStatus, TicketStore
 from fused_memory.reconciliation.event_buffer import EventBuffer
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _CLOSED_LOOPBACK_URL = 'http://127.0.0.1:9'
 _FOLLOWUP = 'agent_followup'

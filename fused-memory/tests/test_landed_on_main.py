@@ -20,6 +20,7 @@ from pathlib import Path
 import pytest
 from _fm_git_repos import _init_git_repo
 from shared.merge_subject import format_merge_subject
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.services import landed_on_main as landed_module
 from fused_memory.services.landed_on_main import (
@@ -28,6 +29,8 @@ from fused_memory.services.landed_on_main import (
     LandingVerdict,
     probe_landing,
 )
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 #: A fixed, whole-second instant every dated commit is placed around.
 T0 = datetime(2026, 9, 1, 12, 0, 0, tzinfo=UTC)

@@ -268,6 +268,24 @@ DISALLOW_ESCALATION_READS = [
     'mcp__escalation__resolve_escalation_shas',
 ]
 
+# SILENT standalone orchestrator RUNTIME reads (disallowed in every stage —
+# task 6553, plans/escalation-store-ambiguity-prd.md §11 OQ3): with no harness
+# attached they answer an empty-but-live result instead of an error.
+#
+# The recon escalation server is built with no orchestrator harness
+# (reconciliation/harness.py::ReconciliationHarness._start_escalation_server),
+# so escalation/server.py::create_server's get_task_runtime_state answers with
+# the snapshot model's default envelope: offline=False, tasks=[]. That is the
+# categorical empty DISALLOW_ESCALATION_READS exists to stop, made worse by a
+# positive "online, nothing running" claim. It is a separate bucket because it
+# reads orchestrator runtime state, not escalation records. Reading runtime
+# state alone does not qualify a tool: the merge-queue reads stay reviewed-safe
+# because standalone they fail loudly. S3 δ moving get_task_runtime_state off
+# create_server supersedes this bucket; OQ3's resolution names what δ retires.
+DISALLOW_ESCALATION_RUNTIME_READS = [
+    'mcp__escalation__get_task_runtime_state',
+]
+
 # Escalation FILING tools (disallowed in Stage 1 and Stage 3 — task 3250).
 #
 # The write path is sanctioned in Stage 2 only: the FIX D Stale Flag Escalation
@@ -302,19 +320,22 @@ STAGE1_DISALLOWED = (
     + DISALLOW_FUSED_MEMORY_CONTROL_PLANE_WRITES
     + DISALLOW_DEFECT_RECORD_WRITES
     + DISALLOW_ESCALATION_READS
+    + DISALLOW_ESCALATION_RUNTIME_READS
     + DISALLOW_ESCALATION_MERGE_LANE_CONTROL
     + DISALLOW_ESCALATION_WRITES
     + DISALLOW_BUILTIN
 )
 # Stage 2 keeps its memory + task write access except the consolidation op and
-# the proposal tool; built-ins, the escalation reads, the fused-memory
-# control-plane mutators and the defect-record writers are blocked too.
+# the proposal tool; built-ins, the escalation reads, the orchestrator runtime
+# snapshot read, operator merge-lane control, the fused-memory control-plane
+# mutators and the defect-record writers are blocked too.
 STAGE2_DISALLOWED = (
     DISALLOW_CONSOLIDATION_OP
     + DISALLOW_CONSOLIDATION_PROPOSALS
     + DISALLOW_FUSED_MEMORY_CONTROL_PLANE_WRITES
     + DISALLOW_DEFECT_RECORD_WRITES
     + DISALLOW_ESCALATION_READS
+    + DISALLOW_ESCALATION_RUNTIME_READS
     + DISALLOW_ESCALATION_MERGE_LANE_CONTROL
     + DISALLOW_BUILTIN
 )
@@ -327,6 +348,7 @@ STAGE3_DISALLOWED = (
     + DISALLOW_FUSED_MEMORY_CONTROL_PLANE_WRITES
     + DISALLOW_DEFECT_RECORD_WRITES
     + DISALLOW_ESCALATION_READS
+    + DISALLOW_ESCALATION_RUNTIME_READS
     + DISALLOW_ESCALATION_MERGE_LANE_CONTROL
     + DISALLOW_ESCALATION_WRITES
     + DISALLOW_BUILTIN
@@ -591,40 +613,30 @@ def recon_config_base_dir(data_dir: Path) -> Path:
     fail-closed containment check reports PASS while the kernel denies every
     transcript write, which is exactly the 2026-07-18 -> 2026-08-11 silent
     transcript loss that task 4003's check exists to make impossible.
-    ``data_dir`` really can be relative: ``fused-memory/config/config.yaml``
-    supplies ``${RECONCILIATION_DATA_DIR:./data/reconciliation}``, the
-    ``${VAR:default}`` expander
-    (``fused-memory/src/fused_memory/config/schema.py::YamlSettingsSource._expand_env_vars``)
-    is plain string substitution with no abspath, and
-    ``scripts/fused-memory.service.template`` sets ``WorkingDirectory`` and
-    ``PROJECT_ROOT`` but NOT ``RECONCILIATION_DATA_DIR`` — so the relative default
-    is what a standalone/systemd launch actually uses. Only a MANAGED spawn
-    escapes it, because ``orchestrator/src/orchestrator/mcp_lifecycle.py`` injects
-    an absolute XDG path. The two cwds agree today only because that unit sets
-    ``WorkingDirectory`` == ``PROJECT_ROOT``; nothing enforces it.
+    Since task 5462 a config-sourced ``data_dir`` arrives ABSOLUTE: a relative
+    ``reconciliation.data_dir`` is anchored at load by
+    ``fused-memory/src/fused_memory/config/checkout_anchor.py::anchor_at_checkout``
+    at the checkout root, which in production equals the unit's
+    ``WorkingDirectory`` and ``PROJECT_ROOT``
+    (``scripts/fused-memory.service.template``), and a MANAGED spawn injects an
+    absolute XDG path (``orchestrator/src/orchestrator/mcp_lifecycle.py``). The
+    relative branch below therefore engages only for a direct caller handing a
+    relative ``Path``; it stays as this boundary's own guarantee that
+    ``CLAUDE_CONFIG_DIR`` is absolute whatever the caller passes.
 
     THIS DOCSTRING IS THE CANONICAL STATEMENT of that deployment story. The other
     sites that depend on it — ``journal.py::ReconciliationJournal.__init__``,
-    ``config/schema.py``'s ``data_dir`` and ``sandbox_recon_writable_extras``
-    comments, ``sandbox_guard.py``'s module docstring, and the two test modules —
-    state only their LOCAL invariant and cite back here, so a change to the
-    deployment story (the unit starts setting ``RECONCILIATION_DATA_DIR``, or the
-    expander gains an abspath) has exactly one place to be corrected.
+    ``config/schema.py``'s ``sandbox_recon_writable_extras`` comment,
+    ``sandbox_guard.py``'s module docstring, and the two test modules — state
+    only their LOCAL invariant and cite back here, so a change to the deployment
+    story has exactly one place to be corrected.
 
-    The anchor is ``Path.cwd()`` and deliberately NOT
-    ``config.explore_codebase_root``. This function's job is only to make the
-    parent and the child NAME THE SAME DIRECTORY, which either anchor achieves
-    once the path is absolute — so the tie-break is "relocate no byte". The
-    process cwd is the anchor every existing ``data_dir`` consumer already uses
-    implicitly: ``fused-memory/src/fused_memory/reconciliation/journal.py::ReconciliationJournal.initialize``
-    mkdirs ``data_dir`` and opens ``reconciliation.db`` under it, and
-    ``fused-memory/src/fused_memory/server/main.py`` builds ten sibling paths
-    (``WriteJournal``, ``EventBuffer``, ``TicketStore``, curator/report state,
-    the dead-letter JSONL) the same way. Anchoring here therefore renames nothing
-    on disk; anchoring at ``explore_codebase_root`` would silently relocate the
-    per-run config dirs into a different tree from the journal DB they are keyed
-    to whenever the two diverge — trading a silent write-denial for a silent
-    relocation. Capturing ``Path.cwd()`` per call is safe because ``os.chdir``
+    The anchor for a relative input is ``Path.cwd()``. This function's job is
+    only to make the parent and the child NAME THE SAME DIRECTORY, which any
+    absolute anchor achieves; ``config.explore_codebase_root`` could relocate the
+    per-run config dirs away from the journal DB they are keyed to, and the
+    checkout root would make a direct caller's relative test path mkdir inside
+    the checkout. Capturing ``Path.cwd()`` per call is safe because ``os.chdir``
     appears nowhere in ``shared/src``, ``orchestrator/src`` or
     ``fused-memory/src``, so the process cwd is stable for the life of a run.
 
@@ -641,8 +653,8 @@ def recon_config_base_dir(data_dir: Path) -> Path:
     ``data_dir`` is used AS GIVEN rather than re-wrapped in ``Path(...)``, which
     honours the annotation instead of widening it to "anything os.PathLike".
     Both production construction sites already pass a real ``Path``
-    (``fused-memory/src/fused_memory/server/main.py`` and
-    ``fused-memory/scripts/repair_recon_citation.py`` each build
+    (``fused-memory/src/fused_memory/server/main.py::resolve_data_dir`` returns
+    one, and ``fused-memory/scripts/repair_recon_citation.py`` builds
     ``Path(config.reconciliation.data_dir)`` before handing it to
     ``ReconciliationJournal``), so the wrap would buy nothing there — while
     costing something real elsewhere: ``MagicMock``/``AsyncMock`` implement

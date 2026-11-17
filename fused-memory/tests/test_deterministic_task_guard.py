@@ -12,10 +12,13 @@ import logging
 import os
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.middleware.deterministic_task_guard import (
     deterministic_task_error,
 )
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _SCHEMA_WARNING = 'task_metadata.schema_warning'
 _SOURCE = 'source=deterministic_task_guard'
@@ -182,6 +185,22 @@ class TestDeterministicTaskErrorBeforeDoneStructural:
         assert result.get('error_type') == 'ValidationError'
         msg = result['error']
         assert 'script' in msg
+
+    @pytest.mark.parametrize(
+        'value', [5, ['x.sh'], None, '', '   '], ids=['int', 'list', 'none', 'empty', 'blank'],
+    )
+    def test_before_done_bad_script_rejects_with_script_hint(self, tmp_path, value):
+        result = deterministic_task_error(
+            'deterministic',
+            {'before_done': {'script': value, 'timeout_secs': 60}},
+            str(tmp_path),
+        )
+        assert result is not None
+        assert result.get('error_type') == 'ValidationError'
+        assert 'before_done.script' in result['error']
+        assert result['hint'] == (
+            "Set 'script' to a relative path of an executable file under project_root."
+        )
 
     def test_before_done_script_not_exist_rejects(self, tmp_path):
         """before_done.script points to a non-existent file under project_root → reject."""

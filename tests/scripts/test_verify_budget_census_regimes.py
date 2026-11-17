@@ -10,6 +10,7 @@ import json
 from typing import Any
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from verify_budget_census_fixture import (
     FULL_SUITE,
     command_entry,
@@ -19,6 +20,8 @@ from verify_budget_census_fixture import (
     write_module_yaml,
     write_worktree_record,
 )
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # "Whatever the start instant reads" — a sentinel, because `None` is itself a
 # MEANINGFUL end reading here (a degraded component) and cannot double as the
@@ -62,7 +65,7 @@ class TestPsiBanding:
     """
 
     def _banded(self, tmp_path, *entries):
-        from verify_budget_census import (  # noqa: PLC0415
+        from verify_budget_census import (
             by_load_band,
             load_records,
             select_full_suite_legs,
@@ -92,7 +95,7 @@ class TestPsiBanding:
 
     def test_the_bands_are_named_constants_not_inline_numbers(self):
         """Band edges carry a rationale, so a later reader can argue with them."""
-        from verify_budget_census import PSI_BANDS  # noqa: PLC0415
+        from verify_budget_census import PSI_BANDS
 
         assert PSI_BANDS
         for band in PSI_BANDS:
@@ -101,7 +104,7 @@ class TestPsiBanding:
 
     def test_the_bands_tile_the_range_without_gaps_or_overlap(self):
         """Every possible pressure reading lands in exactly one band."""
-        from verify_budget_census import PSI_BANDS, band_for  # noqa: PLC0415
+        from verify_budget_census import PSI_BANDS, band_for
 
         for value in (0.0, 0.01, 4.9, 5.0, 24.9, 25.0, 49.9, 50.0, 99.9, 100.0):
             matches = [b.name for b in PSI_BANDS if b.lo <= value < b.hi]
@@ -123,7 +126,7 @@ class TestUnstampedIsItsOwnRow:
     """
 
     def _banded(self, tmp_path, *entries):
-        from verify_budget_census import (  # noqa: PLC0415
+        from verify_budget_census import (
             by_load_band,
             load_records,
             select_full_suite_legs,
@@ -178,13 +181,13 @@ class TestUnstampedIsItsOwnRow:
 
 
 def _idle_band_name():
-    from verify_budget_census import PSI_BANDS  # noqa: PLC0415
+    from verify_budget_census import PSI_BANDS
 
     return PSI_BANDS[0].name
 
 
 def _heavy_band_name():
-    from verify_budget_census import band_for  # noqa: PLC0415
+    from verify_budget_census import band_for
 
     return band_for(75.0)
 
@@ -202,7 +205,7 @@ class TestTheBandStatisticSpansTheRun:
     """
 
     def _banded(self, tmp_path, *entries):
-        from verify_budget_census import (  # noqa: PLC0415
+        from verify_budget_census import (
             by_load_band,
             load_records,
             select_full_suite_legs,
@@ -255,7 +258,7 @@ class TestTheBandStatisticSpansTheRun:
         contention", and a mean would let a run that started quiet and ended
         saturated file as merely moderate.
         """
-        from verify_budget_census import band_pressure  # noqa: PLC0415
+        from verify_budget_census import band_pressure
 
         assert band_pressure(_load_record(cpu=1.0, end_cpu=75.0)) == 75.0
         assert band_pressure(_load_record(cpu=75.0, end_cpu=1.0)) == 75.0
@@ -266,7 +269,7 @@ class TestTheBandStatisticSpansTheRun:
         """`cpu_some60` is a DIFFERENT averaging window, and the band edges were
         argued for avg10 — mixing them would make the edges mean something
         nobody stated. It is reported by `load_movement` instead."""
-        from verify_budget_census import band_pressure  # noqa: PLC0415
+        from verify_budget_census import band_pressure
 
         load = _load_record(cpu=1.0, cpu60=90.0, end_cpu=2.0, end_cpu60=95.0)
 
@@ -282,7 +285,7 @@ class TestHostMovementIsReported:
     """
 
     def _movement(self, tmp_path, *entries):
-        from verify_budget_census import (  # noqa: PLC0415
+        from verify_budget_census import (
             load_movement,
             load_records,
             select_full_suite_legs,
@@ -323,7 +326,7 @@ class TestHostMovementIsReported:
     def test_a_half_degraded_record_is_not_knowable_yet_still_banded(self, tmp_path):
         """The two counts differ DELIBERATELY: a movement needs both instants, a
         band needs only one. Asserted together so neither drifts into the other."""
-        from verify_budget_census import (  # noqa: PLC0415
+        from verify_budget_census import (
             by_load_band,
             load_movement,
             load_records,
@@ -399,17 +402,17 @@ class TestTheProducerAndTheConsumerAgreeOnTheLoadShape:
     _END_CPU60 = 40.0
 
     def _legs_from_a_real_verify(self, tmp_path, monkeypatch):
-        import asyncio  # noqa: PLC0415
-        from unittest.mock import patch  # noqa: PLC0415
+        import asyncio
+        from unittest.mock import patch
 
-        from orchestrator.config import ModuleConfig, OrchestratorConfig  # noqa: PLC0415
-        from shared.psi import PsiSample  # noqa: PLC0415
-        from verify_budget_census import (  # noqa: PLC0415
+        from orchestrator.config import ModuleConfig, OrchestratorConfig
+        from shared.psi import PsiSample
+        from verify_budget_census import (
             load_records,
             select_full_suite_legs,
         )
 
-        from orchestrator import verify  # noqa: PLC0415
+        from orchestrator import verify
 
         # `OrchestratorConfig(project_root=...)` reads an ambient
         # ORCH_CONFIG_PATH, so without this the "default" config is whichever
@@ -481,7 +484,7 @@ class TestTheProducerAndTheConsumerAgreeOnTheLoadShape:
         self, tmp_path, monkeypatch,
     ):
         """`band_pressure` indexes the producer's own keys, not a literal."""
-        from verify_budget_census import band_pressure  # noqa: PLC0415
+        from verify_budget_census import band_pressure
 
         legs = self._legs_from_a_real_verify(tmp_path, monkeypatch)
 
@@ -492,7 +495,7 @@ class TestTheProducerAndTheConsumerAgreeOnTheLoadShape:
     ):
         """The failure this guard exists for: a renamed key books every run as
         "load not knowable" while every single-module test stays green."""
-        from verify_budget_census import by_load_band  # noqa: PLC0415
+        from verify_budget_census import by_load_band
 
         bands = by_load_band(self._legs_from_a_real_verify(tmp_path, monkeypatch))
 
@@ -502,7 +505,7 @@ class TestTheProducerAndTheConsumerAgreeOnTheLoadShape:
     def test_the_movement_section_reads_both_instants_of_a_real_record(
         self, tmp_path, monkeypatch,
     ):
-        from verify_budget_census import load_movement  # noqa: PLC0415
+        from verify_budget_census import load_movement
 
         movement = load_movement(self._legs_from_a_real_verify(tmp_path, monkeypatch))
 
@@ -523,7 +526,7 @@ class TestColdSeparabilityIsReportedNotInferred:
     """
 
     def _finding(self, tmp_path, *entries):
-        from verify_budget_census import (  # noqa: PLC0415
+        from verify_budget_census import (
             cold_separability,
             load_records,
             select_full_suite_legs,
@@ -543,7 +546,7 @@ class TestColdSeparabilityIsReportedNotInferred:
 
     def test_the_guessable_records_are_counted(self, tmp_path):
         """attempt-1 records are the ones a cold inference would have claimed."""
-        from verify_budget_census import (  # noqa: PLC0415
+        from verify_budget_census import (
             cold_separability,
             load_records,
             select_full_suite_legs,
@@ -581,7 +584,7 @@ class TestTheMergeGateBudgetIsReported:
     """
 
     def test_the_project_yaml_value_is_read(self, tmp_path):
-        from verify_budget_census import merge_gate_budget  # noqa: PLC0415
+        from verify_budget_census import merge_gate_budget
 
         (tmp_path / 'dark-factory-orchestrator.yaml').write_text(
             'merge_verify_cold_command_timeout_secs: 7200\n', encoding='utf-8',
@@ -594,7 +597,7 @@ class TestTheMergeGateBudgetIsReported:
 
     def test_the_defaults_yaml_is_the_fallback(self, tmp_path):
         """Unset in the project yaml is the LIVE state — the default governs."""
-        from verify_budget_census import merge_gate_budget  # noqa: PLC0415
+        from verify_budget_census import merge_gate_budget
 
         (tmp_path / 'dark-factory-orchestrator.yaml').write_text(
             'max_concurrent_tasks: 4\n', encoding='utf-8',
@@ -611,7 +614,7 @@ class TestTheMergeGateBudgetIsReported:
         assert readout['source'].endswith('defaults.yaml')
 
     def test_an_unresolvable_budget_is_null_not_guessed(self, tmp_path):
-        from verify_budget_census import merge_gate_budget  # noqa: PLC0415
+        from verify_budget_census import merge_gate_budget
 
         readout = merge_gate_budget(tmp_path)
 
@@ -619,7 +622,7 @@ class TestTheMergeGateBudgetIsReported:
         assert readout['source'] is None
 
     def test_the_readout_states_the_merge_gate_is_always_cold(self, tmp_path):
-        from verify_budget_census import merge_gate_budget  # noqa: PLC0415
+        from verify_budget_census import merge_gate_budget
 
         readout = merge_gate_budget(tmp_path)
 

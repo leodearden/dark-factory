@@ -114,6 +114,7 @@ from collections.abc import Callable
 import pytest
 import verify_budget_census_records as census_records
 import yaml
+from git_listing import listed_files
 from module_budget_family import (
     FAMILY_PUBLISHER_PATHS,
     FAMILY_READER_PATH,
@@ -122,8 +123,16 @@ from module_budget_family import (
     published_pairs,
 )
 from orchestrator.config import ModuleConfig, OrchestratorConfig
+from orchestrator.verify_plan import FileKind, classify_file
+from shared.whole_tree_guard_family import (
+    WHOLE_TREE_SCAN_TEST_TIMEOUT,
+    is_whole_tree_guard_module,
+    min_leg_budget_for_family,
+)
 
 from orchestrator import verify
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 
@@ -291,6 +300,8 @@ MEASURED_MODULE_SUITE_WORST_SECS: dict[str, float] = {
     'sampler': 22.49,
     'cockpit': 130.50,
     'client-feed': 7.88,
+    # Task 5654; the runs and their loadavg are in tests/repo_guards/orchestrator.yaml.
+    'tests/repo_guards': 165.09,
     # REFRESHED 2026-09-14 from ORCHESTRATOR_BUDGET_CENSUS (5288.0 was a
     # RETIRED-REGIME figure — D17 orders the refresh). This is the prevailing
     # regime's worst GREEN full-suite run.
@@ -437,6 +448,8 @@ SAMPLE_TOUCHED_FILE: dict[str, str] = {
     'cockpit': 'cockpit/src/cockpit/__init__.py',
     'client-feed': 'client-feed/src/client_feed/__init__.py',
     'orchestrator': 'orchestrator/src/orchestrator/__init__.py',
+    # No production file lives under tests/, so this diff routes to the module's full suite.
+    'tests/repo_guards': 'tests/repo_guards/conftest.py',
 }
 
 
@@ -843,6 +856,7 @@ KNOWN_MODULE_CONFIG_PREFIXES = frozenset(
         'orchestrator',
         'scripts',
         'tests/scripts',
+        'tests/repo_guards',
     }
 )
 
@@ -1873,6 +1887,75 @@ class TestCensusBudgetFloor:
         silently switch derivations and still evaluate green — which is the
         exact drift that namespace exists to catch.
         """
-        import module_budget_family as family  # noqa: PLC0415
+        import module_budget_family as family
 
         assert family.HELPER_NAME == 'min_budget'
+
+
+FAMILY_RUNNING_LEGS_FLOOR = frozenset(
+    {'orchestrator', 'fused-memory', 'shared', 'scripts', 'tests/scripts'},
+)
+
+
+def _source_or_none(path: pathlib.Path) -> str | None:
+    try:
+        return path.read_text(encoding='utf-8')
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def _leg_tree_holds_a_member(prefix: str) -> bool:
+    return any(
+        classify_file(path.as_posix(), None) is FileKind.COLLECTABLE_TEST
+        and is_whole_tree_guard_module(_source_or_none(path))
+        for path in listed_files(REPO_ROOT, f'{prefix}/*.py')
+    )
+
+
+def test_every_leg_running_the_family_outlasts_its_ceiling(
+    discover_module_configs: Callable[[], dict[str, ModuleConfig]],
+) -> None:
+    """A whole-tree guard member's per-test ceiling must be able to fire before verify kills its leg.
+
+    A leg whose tracked tree holds a collectable member must budget at least
+    ``min_leg_budget_for_family(W)``, whichever run collects the member (task-role family
+    or merge-gate suite), W being its recorded worst green run: a hang starting as late
+    as W must still reach WHOLE_TREE_SCAN_TEST_TIMEOUT, or it surfaces as a retried,
+    unattributed infra_timeout (task 8402). It lives here because this file alone holds
+    every leg's budget and W.
+    Scope: registered module legs only; the repo-root fallback chain and
+    merge_gate_history_test_command are not checked (task 9396).
+    """
+    published = published_pairs()
+    family_running: set[str] = set()
+    failures: list[str] = []
+    for prefix, module_config in sorted(discover_module_configs().items()):
+        if not _leg_tree_holds_a_member(prefix):
+            continue
+        family_running.add(prefix)
+        budget = module_config.verify_command_timeout_secs
+        worst = MEASURED_MODULE_SUITE_WORST_SECS.get(prefix)
+        if worst is None and prefix in published:
+            worst = published[prefix].worst
+        floor = None if worst is None else min_leg_budget_for_family(worst)
+        if budget is None or floor is None or budget < floor:
+            failures.append(
+                f'{prefix}: verify_command_timeout_secs={budget}, W={worst}, '
+                f'WHOLE_TREE_SCAN_TEST_TIMEOUT={WHOLE_TREE_SCAN_TEST_TIMEOUT}, '
+                f'min_leg_budget_for_family(W)={floor}'
+            )
+
+    missing = FAMILY_RUNNING_LEGS_FLOOR - family_running
+    assert not missing, (
+        f'no whole-tree guard member found under {sorted(missing)}: the family scan '
+        f'has regressed, and the budget check below would pass vacuously. '
+        f'Family-running legs found: {sorted(family_running)}'
+    )
+    assert not failures, (
+        'every leg running a whole-tree guard family member must budget at least '
+        'min_leg_budget_for_family(W), so the per-test ceiling fires before verify '
+        'kills the leg. Raise the leg budget to the derived floor; never lower the '
+        'ceiling, whose floor is '
+        'orchestrator/tests/test_whole_tree_scan_timeout_guard.py::_ABSOLUTE_FLOOR_SECONDS.\n'
+        + '\n'.join(failures)
+    )

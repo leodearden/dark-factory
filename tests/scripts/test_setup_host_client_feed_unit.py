@@ -7,6 +7,7 @@ hand, one per client project, so the section must never enable or start one.
 
 import pathlib
 
+import pytest
 import render_systemd_unit
 from setup_host_sections import (
     REPO_ROOT,
@@ -15,6 +16,9 @@ from setup_host_sections import (
     slice_section,
     systemctl_calls,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 TEMPLATE = REPO_ROOT / "scripts" / "client-feed.service.template"
 INSTALLED_NAME = "client-feed@.service"

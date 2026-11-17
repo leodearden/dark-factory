@@ -3,13 +3,32 @@
 // real .jsx renders in a jsdom window (dom_harness.mjs); every expected value
 // comes from calling the helper itself, never from source text.
 //
-// All render tests live in this one file: node --test runs each file in its
-// own process, and each process pays the Babel compile once.
+// node --test runs each file in its own process, and each process pays the
+// Babel compile once, so render tests share as few files as possible: this
+// one, and jsx_render_quality.test.mjs for the quality dashboard's seams. The
+// window/act/fetch plumbing both use is _render_helpers.mjs.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { caughtFrom } from './_caught.mjs';
-import { buildDashboardWindow, seedDashboardData } from './dom_harness.mjs';
+import {
+  NOTICE_SELECTOR,
+  UNIT_NOTICE_TESTID,
+  allowAsyncAct,
+  assertReportsOnlyContainedThrows,
+  assertSiblingRenders,
+  click,
+  failureNotices,
+  graphNode,
+  mountInsideBoundary,
+  noticeLines,
+  openContainingWindow,
+  openTab,
+  openWindow,
+  settle,
+  stubFetch,
+} from './_render_helpers.mjs';
+import { seedDashboardData } from './dom_harness.mjs';
 import {
   burndownBlock,
   escalationAnalytics,
@@ -28,28 +47,13 @@ import {
   schedulerModule,
   schedulerSnapshot,
   taskCensus,
+  taskRow,
   tasksSnapshotEntry,
   wireDatum,
 } from './wire_fixtures.mjs';
 
 const PROJECT = 'p';
 const TAB_PROPS = { projectFilter: [], search: '' };
-
-// React reports a broken render (a missing key, an update outside act(), a bad
-// prop) on console.error and renders on, so every test also asserts that
-// nothing reached it, through the unmount.
-function openWindow(t) {
-  const harness = buildDashboardWindow();
-  t.after(() => {
-    harness.close();
-    assert.deepEqual(harness.consoleErrors, [], 'the window wrote to console.error');
-  });
-  return harness;
-}
-
-function click(window, element) {
-  window.React.act(() => element.dispatchEvent(new window.MouseEvent('click', { bubbles: true })));
-}
 
 function spansDescribedBy(root, descriptor) {
   return [...root.querySelectorAll('span')].filter(
@@ -63,7 +67,7 @@ function spansDescribedBy(root, descriptor) {
 // ── Decision 1: the stranded badge (task_row_cells.js::strandBadgeState) ──
 
 function inProgressTask(stranded) {
-  return { id: '42', project: PROJECT, title: 'TT', status: 'in-progress', agent: 'impl', stranded, deps: [] };
+  return taskRow({ project: PROJECT, agent: 'impl', stranded });
 }
 
 // One running orchestrator for one project holding one task, as the
@@ -80,10 +84,6 @@ function seedOneTask(window, task) {
 function orchTaskRow(window, container, task) {
   const idText = window.DF_SHELL.taskId(task.id);
   return [...container.querySelectorAll('tbody tr')].find(tr => tr.querySelector('td')?.textContent === idText);
-}
-
-function graphNode(container, task) {
-  return [...container.querySelectorAll('.node')].find(node => node.querySelector('.ttl')?.textContent === task.title);
 }
 
 // By PRD is the Tasks tab's default view, and it draws no graph until a lanes
@@ -557,59 +557,8 @@ test('tabs.jsx::PerfTab Completion paths gives every slice its own PALETTE.paths
 });
 
 // ── Decision 6: a render throw is contained, and its notice is render_failure.js's ──
-// React's development build reports every throw a boundary catches on
-// console.error: jsdom's report of the replayed throw (its stack, or
-// 'undefined' for a non-Error), then a note naming the boundary that caught
-// it. So these tests cannot assert an empty console. They assert that every
-// report is of a throw RenderFailureBoundary caught, and nothing else.
-
-const CAUGHT_NOTE = 'using the error boundary you provided, ';
-const UNCAUGHT_NOTE = 'Consider adding an error boundary';
-
-function assertReportsOnlyContainedThrows(consoleErrors) {
-  const caughtNotes = consoleErrors.filter(entry => entry.includes(CAUGHT_NOTE));
-  assert.ok(caughtNotes.length > 0, `no throw was reported as caught by a boundary: ${JSON.stringify(consoleErrors)}`);
-  for (const note of caughtNotes) {
-    assert.ok(note.includes(`${CAUGHT_NOTE}RenderFailureBoundary.`), `a boundary other than RenderFailureBoundary caught: ${note}`);
-  }
-  for (const entry of consoleErrors) {
-    assert.ok(!entry.includes(UNCAUGHT_NOTE), `a throw escaped every boundary: ${entry}`);
-    assert.ok(!entry.startsWith('Warning:'), `React warned beside the contained throw: ${entry}`);
-  }
-}
-
-// Like openWindow, but the test asserts the window's reports itself.
-function openContainingWindow(t) {
-  const harness = buildDashboardWindow();
-  t.after(() => harness.close());
-  return harness;
-}
-
-const UNIT_NOTICE_TESTID = 'unit-render-failure-banner';
-const SIBLING_TESTID = 'boundary-sibling';
-
-function noticeLines(notice) {
-  return [...notice.children].map(line => line.textContent);
-}
-
-// The boundary around `child`, beside a sibling that is outside it.
-function mountInsideBoundary(harness, child) {
-  const { React, DF_SHELL, DF_RENDER_FAILURE } = harness.window;
-  const describe = thrown => DF_RENDER_FAILURE.tabRenderFailureNotice('Overview', thrown);
-  const Page = () =>
-    React.createElement(
-      'div',
-      null,
-      React.createElement(DF_SHELL.RenderFailureBoundary, { describe, testId: UNIT_NOTICE_TESTID }, child),
-      React.createElement('span', { 'data-testid': SIBLING_TESTID }, 'outside the boundary'),
-    );
-  const { container } = harness.mount(Page);
-  return { container, describe };
-}
-
-function assertSiblingRenders(container) {
-  assert.equal(container.querySelector(`[data-testid="${SIBLING_TESTID}"]`)?.textContent, 'outside the boundary');
-}
+// _render_helpers.mjs::assertReportsOnlyContainedThrows says why these tests
+// cannot assert an empty console.
 
 test('shell.jsx::RenderFailureBoundary contains a real DatumReading throw and renders its describe() notice', t => {
   const harness = openContainingWindow(t);
@@ -694,8 +643,6 @@ for (const reader of DATUM_READERS) {
 // Every fault lands as a malformed payload a poll could deliver, then App's
 // own re-render signal; nothing patches a component or writes DF_DATA directly.
 
-const NOTICE_SELECTOR = '[data-testid$="-render-failure-banner"]';
-
 // Lands `payloads` as one poll would: each key with its endpoint's receipt.
 function landPayloads(window, payloads) {
   seedDashboardData(window, { ...payloads, __receipt: receiptsFor(window.DF_DATA_LOADER, Object.keys(payloads)) });
@@ -712,22 +659,6 @@ function openPage(t, seed = null) {
 function landPoll(window, payloads) {
   landPayloads(window, payloads);
   window.React.act(() => window.dispatchEvent(new window.Event('df-data-refresh')));
-}
-
-function railButton(root, label) {
-  const button = [...root.querySelectorAll('.rail-nav button')].find(candidate =>
-    [...candidate.children].some(part => part.textContent === label),
-  );
-  assert.ok(button, `the rail has no "${label}" button`);
-  return button;
-}
-
-function openTab(page, label) {
-  click(page.window, railButton(page.root, label));
-}
-
-function failureNotices(root) {
-  return [...root.querySelectorAll(NOTICE_SELECTOR)];
 }
 
 function crumb(root) {
@@ -991,17 +922,9 @@ function linkedTaskRow(task) {
 }
 
 // Answers the taskProse url for `uid` with `response`, a fetch Response or a
-// promise of one, and leaves every other fetch pending, as the harness's own
-// stub does. Returns every url asked for.
+// promise of one. Returns every url asked for.
 function stubProseFetch(window, uid, response) {
-  const { ON_DEMAND_KEYS } = window.DF_DATA_LOADER;
-  const asked = [];
-  window.fetch = url => {
-    asked.push(url);
-    if (url !== ON_DEMAND_KEYS.taskProse.url(uid)) return new Promise(() => {});
-    return Promise.resolve(response);
-  };
-  return asked;
+  return stubFetch(window, { [window.DF_DATA_LOADER.ON_DEMAND_KEYS.taskProse.url(uid)]: response });
 }
 
 function proseResponse(window, uid, prose) {
@@ -1010,23 +933,6 @@ function proseResponse(window, uid, prose) {
 }
 
 const PROSE_UNAVAILABLE = 'The description of this task could not be fetched.';
-
-// React 18's async act() ends with one MessageChannel task, which jsdom lacks;
-// a window timer is the same macrotask hop.
-function allowAsyncAct(window) {
-  window.MessageChannel = class {
-    constructor() {
-      this.port1 = { onmessage: null };
-      this.port2 = { postMessage: () => window.setTimeout(() => this.port1.onmessage(), 0) };
-    }
-  };
-}
-
-async function settle(window) {
-  await window.React.act(async () => {
-    await new Promise(resolve => window.setTimeout(resolve, 0));
-  });
-}
 
 test("tab_escalations.jsx::EscalationSidebar renders the linked task's description from the taskProse on-demand read", async t => {
   const harness = openWindow(t);
@@ -1620,3 +1526,51 @@ test("tab_memory_evals.jsx::MemoryEvalsSection renders a tripwire's per-item ver
     assertLinksOnly(trs[i], row);
   });
 });
+
+// ── Decision 12: the filed cell (task_row_cells.js::filedCellState) ──
+
+// TaskDetail's 'filed' kv row: its key span and the value span beside it.
+function filedRowOf(detail) {
+  const key = [...detail.querySelectorAll('.kv > span.k')].find(span => span.textContent === 'filed');
+  return { key, value: key?.nextElementSibling };
+}
+
+const FILED_CASES = [
+  {
+    name: 'a recorded filing time',
+    task: () => ({ ...inProgressTask(false), created_at: '2026-11-12T09:10:17.253Z', created_at_source: 'first_event' }),
+    recorded: true,
+  },
+  {
+    name: 'no recorded filing time',
+    task: () => ({ ...inProgressTask(false), created_at: null, created_at_source: null }),
+    recorded: false,
+  },
+];
+
+for (const { name, task: buildTask, recorded } of FILED_CASES) {
+  test(`tab_tasks.jsx::TaskDetail renders the filed row filedCellState describes, for ${name}`, t => {
+    const harness = openWindow(t);
+    const task = buildTask();
+    seedOneTask(harness.window, task);
+    const detail = taskDetailOf(harness, task);
+    assert.ok(detail, 'the detail pane never opened on the task');
+
+    const expected = harness.window.DF_TASK_ROW_CELLS.filedCellState(task);
+    const { key, value } = filedRowOf(detail);
+    assert.ok(key, "TaskDetail renders no 'filed' kv key");
+    assert.equal(value?.textContent, expected.text);
+    assert.equal(value?.title, expected.title);
+    const statusKey = key.previousElementSibling?.previousElementSibling;
+    assert.ok(statusKey?.matches('span.k'), "the 'filed' row does not follow a kv row");
+    assert.equal(statusKey.textContent, 'status', "the 'filed' row is not directly after the status row");
+
+    if (recorded) {
+      assert.notEqual(expected.text, harness.window.DF_DATUM.EM_DASH, 'fixture: the filing time is recorded');
+      assert.ok(
+        !detail.querySelector('.sub').textContent.includes(expected.text),
+        "the filing time is rendered on the .sub line beside fmtAge's unlabelled reading",
+      );
+    }
+  });
+}

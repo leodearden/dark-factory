@@ -38,6 +38,7 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 # The repo's session-isolated subprocess runner (task 3798, THIRD DEFENCE), a
 # documented drop-in for `subprocess.run(cmd, env=..., capture_output=True,
@@ -47,6 +48,8 @@ import pytest
 # Importable because conftest.py appends REPO_ROOT to sys.path for this
 # directory.
 from df_pytest_isolation import run_in_new_session
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SELFTEST_SH = Path(__file__).parent / "test_remove_lms_dropin.sh"
 
@@ -560,7 +563,7 @@ def test_importing_this_module_touches_no_unit_directory(tmp_path: Path) -> None
 
     program = (
         "import importlib.util\n"
-        f"spec = importlib.util.spec_from_file_location('_wrapper_import_probe', {str(Path(__file__).resolve())!r})\n"  # noqa: E501
+        f"spec = importlib.util.spec_from_file_location('_wrapper_import_probe', {str(Path(__file__).resolve())!r})\n"
         "assert spec is not None and spec.loader is not None\n"
         "spec.loader.exec_module(importlib.util.module_from_spec(spec))\n"
     )

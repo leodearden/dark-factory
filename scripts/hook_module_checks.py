@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
-"""List the merge gate's checks for a staged file set, for hooks/project-checks to run.
+"""List the checks hooks/project-checks runs for a staged file set: the merge gate's units plus the hook's own root:type.
 
 Reads newline-separated staged paths on stdin and prints one ``<unit>\\t<command>``
 line per check: ``module:<prefix>:lint`` and ``module:<prefix>:type`` carry the
 registered module's own commands, verbatim, for every module the gate would
 execute for those paths; ``screen:<id>`` runs one scripts/merge_screen.yaml check
-when a staged path is one the whole-tree screen reads. Exit 0 is a listing,
-possibly empty; exit 2 means no listing could be derived, with the named cause on
-stderr. Contract: plans/merge-lane-policy-prd.md D8 / §6 'Hook contract'.
+when a staged path is one the whole-tree screen reads. ``root:type`` is the
+hook's own unit, pyright over every staged repo-root ``.py`` file: no registered
+module can own a repo-root path, so the gate's registry never lists it. Lint is
+not listed here: the hook's main-only ruff pass lints the root files
+hooks/project-checks::RUFF_TARGETS names. Exit 0 is a listing, possibly empty;
+exit 2 means no listing could be derived, with the named cause on stderr.
+Contract: plans/merge-lane-policy-prd.md D8 / §6 'Hook contract'.
 """
 from __future__ import annotations
 
@@ -30,6 +34,8 @@ from orchestrator.verify_cmd import (
 )
 from orchestrator.verify_evidence import module_leg_name
 from orchestrator.verify_plan import (
+    FileKind,
+    classify_file,
     derive_verify_plan,
     effective_merge_module_configs,
     executed_module_prefixes,
@@ -38,6 +44,9 @@ from orchestrator.verify_plan import (
 TOP_CONFIG = 'dark-factory-orchestrator.yaml'
 # A staged .py here can break any importer, so it type-checks every module (task 2551).
 DEPENDENCY_MODULES = frozenset({'shared', 'escalation'})
+ROOT_TYPE_UNIT = 'root:type'
+# Run from the root with no --directory, so the root pyproject's [tool.pyright] governs it.
+ROOT_TYPE_COMMAND = parse_config_command('uv run --project shared pyright')
 SCREEN_MANIFEST = Path('scripts/merge_screen.yaml')
 SCREEN_TREES = ('plans/', 'docs/', 'review/')
 SCREEN_SUFFIXES = frozenset({'.yaml', '.json', '.md'})
@@ -87,12 +96,23 @@ def _require_dependency_modules(registry: list[ModuleConfig]) -> None:
         )
 
 
+def staged_root_python(staged: list[str]) -> list[str]:
+    return [path for path in staged if '/' not in path and path.endswith('.py')]
+
+
+def types_every_module(staged: list[str], touched: frozenset[str]) -> bool:
+    # Every member's pyright also resolves repo-root modules, through `..` in its extraPaths.
+    return bool(touched & DEPENDENCY_MODULES) or any(
+        classify_file(path, None) is not FileKind.CONFTEST for path in staged_root_python(staged)
+    )
+
+
 def module_units(
     staged: list[str], registry: list[ModuleConfig], config: OrchestratorConfig,
 ) -> list[Unit]:
     _require_dependency_modules(registry)
     touched = touched_modules(staged, registry, config)
-    typed = registry if touched & DEPENDENCY_MODULES else [mc for mc in registry if mc.prefix in touched]
+    typed = registry if types_every_module(staged, touched) else [mc for mc in registry if mc.prefix in touched]
     lint = [(mc.prefix, 'lint', mc.lint_command) for mc in registry if mc.prefix in touched]
     type_ = [(mc.prefix, 'type', mc.type_check_command) for mc in typed]
     return [
@@ -100,6 +120,13 @@ def module_units(
         for prefix, leg, command in (*lint, *type_)
         if command is not None
     ]
+
+
+def root_units(staged: list[str]) -> list[Unit]:
+    present = [path for path in staged_root_python(staged) if (_checkout.ROOT / path).is_file()]
+    if not present:
+        return []
+    return [(ROOT_TYPE_UNIT, render(scope_to(ROOT_TYPE_COMMAND, present)))]
 
 
 @dataclass(frozen=True)
@@ -201,7 +228,7 @@ def screen_units(checks: Sequence[ScreenCheck]) -> list[Unit]:
 
 def listed_units(staged: list[str]) -> list[Unit]:
     config, registry = load_registry()
-    units = module_units(staged, registry, config)
+    units = [*module_units(staged, registry, config), *root_units(staged)]
     if not screen_triggered(staged, member_package_dirs()):
         return units
     checks = load_screen_checks(_checkout.ROOT / SCREEN_MANIFEST, registry)

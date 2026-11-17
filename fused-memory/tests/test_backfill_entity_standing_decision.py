@@ -38,7 +38,9 @@ from _store_mutation_preflight_contract import (
     fail_closed_records,
     neutralise_fixture,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
+from fused_memory.config.checkout_anchor import CHECKOUT_ROOT
 from fused_memory.memory_metadata import (
     EXPERIMENTAL_KEY_PREFIX,
     classify_unknown_keys,
@@ -62,6 +64,8 @@ from fused_memory.utils.store_mutation_preflight import (
     assert_store_mutation_allowed as _real_guard,
 )
 from fused_memory.utils.validation import is_full_uuid
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SCRIPT_PATH = (
     Path(__file__).parent.parent / 'scripts' / 'backfill_entity_standing_decision.py'
@@ -840,16 +844,15 @@ class TestResolveLedgerDbPath:
             tmp_path / _mod.LEDGER_DB_FILENAME
         )
 
-    def test_a_relative_data_dir_is_resolved_against_the_cwd(
+    def test_a_relative_data_dir_is_anchored_at_the_checkout_not_the_cwd(
         self, tmp_path: Path, monkeypatch
     ) -> None:
-        """The default ``./data/reconciliation`` names a DIFFERENT file from
-        every directory — which is the whole hazard, so the resolution must be
-        absolute and the report must be able to quote it."""
+        """The script shares the config's anchor, so the CWD it was launched
+        from cannot pick which ledger it writes."""
         monkeypatch.chdir(tmp_path)
         resolved = _mod.resolve_ledger_db_path(_config(Path('./data/reconciliation')))
         assert resolved.is_absolute()
-        assert resolved == tmp_path / 'data' / 'reconciliation' / (
+        assert resolved == CHECKOUT_ROOT / 'data' / 'reconciliation' / (
             _mod.LEDGER_DB_FILENAME
         )
 

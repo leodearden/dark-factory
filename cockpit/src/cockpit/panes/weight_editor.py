@@ -19,10 +19,8 @@ import math
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import replace
 
-from orchestrator.session_registry import (
-    DecisionRecord,
-    SessionRecord,
-)
+from orchestrator.decision_registry import DecisionRecord
+from orchestrator.session_registry import SessionRecord
 from shared.project_id import fold_project_token
 from textual.app import ComposeResult
 from textual.binding import Binding

@@ -5,7 +5,9 @@ staged module file, and a tree-read file the screen's manifest test rejects,
 are both refused at commit time with the failing unit named. Each case commits
 in a throwaway repo through the real hooks/pre-commit and hooks/project-checks;
 the stub ``uv`` from ``hook_checks_fixture`` runs real pyright and real pytest,
-so the refusals are genuine failures rather than stub verdicts. The hook runs
+so the refusals are genuine failures rather than stub verdicts. A staged
+repo-root ``.py``, which no module owns, is refused the same way under the
+hook's own ``root:type`` unit. The hook runs
 at most ``GATE_SLOTS`` units at once, and an interrupted commit stops them.
 """
 from __future__ import annotations
@@ -32,6 +34,9 @@ from hook_checks_fixture import (
     ModuleSpec,
     make_hook_repo,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 BAD_TYPE = 'x: int = "not an int"\n'
 TIMED_LINE = re.compile(r'merge-gate checks\b.* in [0-9]+s')
@@ -42,22 +47,30 @@ MODULES = (
     ESCALATION,
     ORCHESTRATOR,
 )
+REPO_GUARDS = ModuleSpec('tests/repo_guards', None, None, 'uv run --project shared pytest tests/repo_guards/ -q', False)
+SCREEN_MODULES = (*MODULES, REPO_GUARDS)
 SCREEN_CHECK_ID = 'capability_manifest_script_targets'
 SCREEN_MANIFEST = yaml.safe_dump({
     'checks': [{
         'id': SCREEN_CHECK_ID,
-        'module': 'shared',
+        'module': REPO_GUARDS.prefix,
         'node_ids': [
-            'tests/test_capability_manifest.py::TestCheckedInScriptCheckTargets::'
+            'tests/repo_guards/test_checked_in_capability_manifests.py::TestCheckedInScriptCheckTargets::'
             'test_target_exists_and_is_executable',
-            'tests/test_capability_manifest.py::TestCheckedInScriptCheckTargets::'
+            'tests/repo_guards/test_checked_in_capability_manifests.py::TestCheckedInScriptCheckTargets::'
             'test_target_is_committed_executable',
         ],
     }],
 })
 CAPABILITY_TEST_COPIES = {
-    f'shared/tests/{name}': REPO_ROOT / 'shared' / 'tests' / name
-    for name in ('test_capability_manifest.py', 'capability_manifest_corpus.py')
+    rel: REPO_ROOT / rel
+    for rel in (
+        'tests/repo_guards/test_checked_in_capability_manifests.py',
+        'tests/repo_guards/conftest.py',
+        'tests/repo_guards/session_prebuild.py',
+        'tests/repo_guards/silent_fallthrough_scan.py',
+        'shared/tests/cross_suite_helpers/capability_manifest_corpus.py',
+    )
 }
 
 
@@ -120,8 +133,36 @@ def test_row_10_control_a_well_typed_module_file_lands(tmp_path: Path) -> None:
     assert TIMED_LINE.search(landed.stdout), landed.stdout
 
 
+def test_a_type_error_in_a_staged_root_py_is_refused(tmp_path: Path) -> None:
+    repo = make_hook_repo(tmp_path, MODULES)
+    before = repo.head()
+    repo.stage('conftest.py', BAD_TYPE)
+
+    refused = repo.commit()
+
+    out = refused.stdout
+    failure = _failure_line('root:type').search(out)
+    _assert_refused(repo, before, refused)
+    assert failure is not None, out
+    assert failure['command'] == 'uv run --project shared pyright conftest.py'
+    assert re.search(r'conftest\.py:1:\d+ - error', out), out
+    assert TIMED_LINE.search(out), out
+    _assert_lands(repo, before, repo.commit('--no-verify'))
+
+
+def test_a_well_typed_staged_root_py_lands(tmp_path: Path) -> None:
+    repo = make_hook_repo(tmp_path, MODULES)
+    before = repo.head()
+    repo.stage('conftest.py', 'x: int = 1\n')
+
+    landed = repo.commit()
+
+    _assert_lands(repo, before, landed)
+    assert 'ok root:type' in landed.stdout
+
+
 def _screen_repo(tmp_path: Path) -> HookRepo:
-    return make_hook_repo(tmp_path, MODULES, screen_manifest=SCREEN_MANIFEST, copies=CAPABILITY_TEST_COPIES)
+    return make_hook_repo(tmp_path, SCREEN_MODULES, screen_manifest=SCREEN_MANIFEST, copies=CAPABILITY_TEST_COPIES)
 
 
 def test_row_11_a_tree_read_file_the_screen_rejects_is_refused(tmp_path: Path) -> None:
@@ -135,7 +176,7 @@ def test_row_11_a_tree_read_file_the_screen_rejects_is_refused(tmp_path: Path) -
     _assert_refused(repo, before, refused)
     assert _failure_line(f'screen:{SCREEN_CHECK_ID}').search(out), out
     assert re.search(
-        r'^FAILED \S*test_capability_manifest\.py::TestCheckedInScriptCheckTargets::'
+        r'^FAILED \S*test_checked_in_capability_manifests\.py::TestCheckedInScriptCheckTargets::'
         r'test_target_exists_and_is_executable\b',
         out,
         re.MULTILINE,

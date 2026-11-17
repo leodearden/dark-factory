@@ -19,6 +19,9 @@ import restamp_degenerate_branch_bases as restamp
 from committed_git_repo import committed_repo
 from orchestrator.config import GitConfig
 from orchestrator.git_ops import GitOps, GitQueryFailed
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 
 def git(cwd: Path, *args: str) -> str:

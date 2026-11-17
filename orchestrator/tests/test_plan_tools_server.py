@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import subprocess
 import sys
@@ -12,6 +13,7 @@ import pytest
 from _git_fixtures import RepoSeed, seed_repo
 from fastmcp import FastMCP
 
+from orchestrator import quarantine_provenance
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.mcp import plan_markup_stamp, plan_tools
 from orchestrator.mcp.plan_tools import (
@@ -295,6 +297,69 @@ class TestCreatePlanCarriesTheRejectionCounterThroughTheAlgebra:
         _create_plan(artifacts, 'test-1', 'T2', 'A2', ['m.py'])
 
         assert self.KEY not in artifacts.read_plan()
+
+
+def _quarantine_stamp(reason: str) -> dict[str, Any]:
+    return {
+        'branch': f'task/test-1-{reason}',
+        'tip_sha': 'abc123',
+        'unique_commit_count': 2,
+        'quarantined_at': '2026-11-12T00:00:00+00:00',
+        'reason': reason,
+        'parking': f'/quarantine/test-1-{reason}',
+        'stored_title': None,
+    }
+
+
+class TestCreatePlanCarriesQuarantineProvenance:
+    """A quarantine's ``_quarantined_from`` back-pointer survives a wholesale re-plan (task 4845)."""
+
+    KEY = quarantine_provenance.QUARANTINED_FROM_KEY
+
+    def test_a_re_plan_keeps_every_stamp_in_order_and_resets_steps(self, artifacts):
+        _create_plan(artifacts, 'test-1', 'T', 'A', ['m.py'])
+        first, second = _quarantine_stamp('orphan-reaper'), _quarantine_stamp('recovery-record-divergence')
+        assert quarantine_provenance.stamp_quarantined_from(artifacts, first)
+        assert quarantine_provenance.stamp_quarantined_from(artifacts, second)
+
+        assert _create_plan(artifacts, 'test-1', 'Re-plan', 'A2', ['b.py'])['status'] == 'ok'
+
+        plan = artifacts.read_plan()
+        assert plan['title'] == 'Re-plan'
+        assert plan['files'] == ['b.py']
+        assert plan['steps'] == []
+        assert plan[self.KEY] == [first, second]
+
+    def test_an_unstamped_plan_gains_no_key(self, artifacts):
+        _create_plan(artifacts, 'test-1', 'T', 'A', ['m.py'])
+
+        _create_plan(artifacts, 'test-1', 'Re-plan', 'A2', ['b.py'])
+
+        assert self.KEY not in artifacts.read_plan()
+
+    def test_only_the_normalized_projection_survives(self, artifacts):
+        _create_plan(artifacts, 'test-1', 'T', 'A', ['m.py'])
+        valid = _quarantine_stamp('orphan-reaper')
+        extra = {**_quarantine_stamp('recovery-identity-mismatch'), 'unreviewed': 'x' * 900}
+        plan = artifacts.read_plan()
+        plan[self.KEY] = [valid, 'not-a-dict', extra]
+        artifacts.write_plan(plan)
+
+        _create_plan(artifacts, 'test-1', 'Re-plan', 'A2', ['b.py'])
+
+        assert artifacts.read_plan()[self.KEY] == [valid, _quarantine_stamp('recovery-identity-mismatch')]
+
+    def test_the_orchestrator_stampers_keep_the_back_pointer(self, artifacts):
+        _create_plan(artifacts, 'test-1', 'T', 'A', ['m.py'])
+        _add_plan_step(artifacts, 'step-1', 'test', 'Write test for foo')
+        _add_plan_step(artifacts, 'step-2', 'impl', 'Implement foo')
+        quarantine_provenance.stamp_quarantined_from(artifacts, _quarantine_stamp('orphan-reaper'))
+        before = json.dumps(artifacts.read_plan()[self.KEY])
+
+        artifacts.stamp_plan_provenance('orch-sess-2', task_text_fp='tfp:abc')
+        artifacts.bump_revalidation_stamp('orch-sess-3')
+
+        assert json.dumps(artifacts.read_plan()[self.KEY]) == before
 
 
 class TestAddPlanStep:

@@ -202,10 +202,11 @@ def _make_item(
     """Build a RealMergeItem around *req* sitting at *merge_commit*.
 
     ``speculative=True`` is SLOT 2 (the merge-ahead item, stacked on the
-    predecessor's merge commit) — the ONLY kind ``_deep_chain_placement`` gates
-    on, and therefore the only kind the chain walk ever sees;
-    ``speculative=False`` is SLOT 1, the head trust-anchor verify against real
-    main, which δ CANCELS and lands on the tip's authority (PRD decision #3).
+    predecessor's merge commit), which ``_deep_chain_placement`` chains at any
+    verify frontier; ``speculative=False`` is SLOT 1, the head trust-anchor
+    verify against real main, which chains only when alone in the verify
+    frontier (``plans/merge-lane-policy-prd.md`` D5) and which δ otherwise
+    CANCELS and lands on a slot-2 tip's authority (PRD decision #3).
     """
     return RealMergeItem(
         request=req,

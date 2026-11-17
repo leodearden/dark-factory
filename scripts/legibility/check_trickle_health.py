@@ -62,6 +62,22 @@ DEFAULT_MAX_AGE_HOURS = 72
 Deliberately loose enough that a ``Persistent=true`` catch-up firing
 BEFORE the nightly's own catch-up cannot false-alarm."""
 
+EXIT_HEALTHY = 0
+"""Every probe ran and passed."""
+
+EXIT_UNRESOLVED = 1
+"""No project id resolved, so no probe ran. It shares 1 with Python's own
+uncaught-exception status, and both mean the run reached no verdict."""
+
+EXIT_DEGRADED = 3
+"""Every probe ran and at least one FAILED: a verdict, not a crash.
+
+Deliberately neither 1 (Python's crash status, so an ImportError cannot
+pass for a finding) nor 2 (argparse's and uv's usage status).
+``check_trickle_health_liveness.sh`` accepts exactly :data:`EXIT_HEALTHY`
+and this; the rationale lives in OPERATIONS.md §"Legibility trickle health
+probe (04:30)"."""
+
 PROBE_TIMEOUT_SECONDS = 120.0
 """Per-probe subprocess timeout. A probe that hangs must become a FAILED
 verdict rather than wedging the unit until systemd kills it."""
@@ -71,11 +87,11 @@ verdict rather than wedging the unit until systemd kills it."""
 class HealthResult:
     """The outcome of one :func:`run_health_check` pass.
 
-    ``exit_code`` is the authoritative loud signal (0 healthy, 1 = at
-    least one probe failed) that a systemd unit surfaces. It is NEVER
-    affected by whether the escalation POST landed: ``escalated`` records
-    that separately, because a down escalation server must not be able to
-    mask a verdict.
+    ``exit_code`` is the authoritative loud signal (:data:`EXIT_HEALTHY`,
+    :data:`EXIT_DEGRADED` or :data:`EXIT_UNRESOLVED`) that a systemd unit
+    surfaces. It is NEVER affected by whether the escalation POST landed:
+    ``escalated`` records that separately, because a down escalation server
+    must not be able to mask a verdict.
 
     Every ``*_ok`` field is REQUIRED: a defaulted ``True`` is how a future
     constructor would silently pass a probe that never ran.
@@ -166,7 +182,7 @@ def _invoke(runner, project_id: str, **kwargs) -> tuple[bool, str]:
     cannot run is not a probe that passed."""
     try:
         returncode, output = runner(project_id, **kwargs)
-    except Exception as exc:  # noqa: BLE001 — deliberately total
+    except Exception as exc:  # deliberately total
         return False, (
             f'{type(exc).__name__}: probe runner raised ({exc}) — treated as '
             f'a FAILED probe, never as a pass'
@@ -207,7 +223,7 @@ def _unresolved_result(config_path) -> HealthResult:
     not evidence of health — applies a fortiori to a probe that was never
     invoked."""
     return HealthResult(
-        exit_code=1,
+        exit_code=EXIT_UNRESOLVED,
         progress_ok=False,
         liveness_ok=False,
         progress_output='',
@@ -307,7 +323,10 @@ def run_health_check(
     )
 
     result = HealthResult(
-        exit_code=0 if (progress_ok and liveness_ok and census_ok) else 1,
+        exit_code=(
+            EXIT_HEALTHY if (progress_ok and liveness_ok and census_ok)
+            else EXIT_DEGRADED
+        ),
         progress_ok=progress_ok,
         liveness_ok=liveness_ok,
         progress_output=progress_output,
@@ -438,7 +457,7 @@ def _load_config(*, config_path, project_id):
         return legibility_config.load_config(
             nightly.resolve_config_path(project_id)
         )
-    except Exception as exc:  # noqa: BLE001 — deliberately total
+    except Exception as exc:  # deliberately total
         logger.warning(
             'legibility trickle health: could not load config for project=%s '
             '(%s: %s); the verdict stands, the escalation is skipped',

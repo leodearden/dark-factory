@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 import yaml
 from pydantic import ValidationError
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from arm_harness._fakes import (
     CODE_SHA,
@@ -28,6 +29,8 @@ from fused_memory.arm_harness.slate import (
     load_embedding_slate,
     load_llm_slate,
 )
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = Path(__file__).parents[3]
 COMMITTED_ARMS = REPO_ROOT / 'scripts' / 'local-model-serving' / 'arms.yaml'

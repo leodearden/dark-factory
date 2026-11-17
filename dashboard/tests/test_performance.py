@@ -1155,7 +1155,7 @@ class TestAggregateLoopHistograms:
         """
         call_count = 0
 
-        async def _fake_get_loop_histograms(db, *, days, now, projects):  # noqa: ARG001
+        async def _fake_get_loop_histograms(db, *, days, now, projects):
             nonlocal call_count
             call_count += 1
             if call_count == 1:
@@ -1228,7 +1228,7 @@ class TestAggregateLoopHistograms:
         """
         call_count = 0
 
-        async def _fake_get_loop_histograms(db, *, days, now, projects):  # noqa: ARG001
+        async def _fake_get_loop_histograms(db, *, days, now, projects):
             nonlocal call_count
             call_count += 1
             if call_count == 1:
@@ -1302,7 +1302,7 @@ class TestAggregateLoopHistograms:
         """
         call_count = 0
 
-        async def _fake_get_loop_histograms(db, *, days, now, projects):  # noqa: ARG001
+        async def _fake_get_loop_histograms(db, *, days, now, projects):
             nonlocal call_count
             call_count += 1
             canonical_inner = {
@@ -1383,7 +1383,7 @@ class TestAggregateLoopHistograms:
             'values': [1, 1, 1, 1, 1, 1],
         }
 
-        async def _fake_get_loop_histograms(db, *, days, now, projects):  # noqa: ARG001
+        async def _fake_get_loop_histograms(db, *, days, now, projects):
             nonlocal call_count
             call_count += 1
             if call_count == 1:

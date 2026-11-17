@@ -260,7 +260,7 @@ class TestLoadRecordsIsTotal:
     """
 
     def test_both_corpora_are_walked(self, tmp_path):
-        from verify_budget_census import load_records  # noqa: PLC0415
+        from verify_budget_census import load_records
 
         write_worktree_record(tmp_path, '3353', 'attempt-1.orchestrator.summary.json')
         write_archive_record(
@@ -274,7 +274,7 @@ class TestLoadRecordsIsTotal:
 
     def test_several_roots_are_walked(self, tmp_path):
         """`--project-root` is repeatable, like the sibling report's."""
-        from verify_budget_census import load_records  # noqa: PLC0415
+        from verify_budget_census import load_records
 
         one, two = tmp_path / 'one', tmp_path / 'two'
         write_worktree_record(one, '1', 'attempt-1.orchestrator.summary.json')
@@ -285,7 +285,7 @@ class TestLoadRecordsIsTotal:
         assert sorted(r.where.task_id for r in corpus.records) == ['1', '2']
 
     def test_a_missing_root_is_not_a_crash(self, tmp_path):
-        from verify_budget_census import load_records  # noqa: PLC0415
+        from verify_budget_census import load_records
 
         corpus = load_records([tmp_path / 'absent'])
 
@@ -293,7 +293,7 @@ class TestLoadRecordsIsTotal:
         assert corpus.skipped == ()
 
     def test_the_payload_is_carried_verbatim(self, tmp_path):
-        from verify_budget_census import load_records  # noqa: PLC0415
+        from verify_budget_census import load_records
 
         path = write_worktree_record(tmp_path, '3353', 'attempt-1.orchestrator.summary.json')
         payload = {'category': 'clean', 'rc': 0, 'commands': [{'label': 'test'}]}
@@ -315,7 +315,7 @@ class TestLoadRecordsIsTotal:
     def test_an_unusable_file_is_counted_with_its_reason(
         self, tmp_path, content, reason,
     ):
-        from verify_budget_census import load_records  # noqa: PLC0415
+        from verify_budget_census import load_records
 
         path = write_worktree_record(tmp_path, '3353', 'attempt-1.orchestrator.summary.json')
         path.write_text(content, encoding='utf-8')
@@ -328,7 +328,7 @@ class TestLoadRecordsIsTotal:
 
     def test_an_unreadable_file_is_counted_not_raised(self, tmp_path):
         """A directory standing where a summary should be — the never-raise arm."""
-        from verify_budget_census import load_records  # noqa: PLC0415
+        from verify_budget_census import load_records
 
         stub = tmp_path / '.worktrees' / '3353' / '.task' / 'verify'
         (stub / 'attempt-1.orchestrator.summary.json').mkdir(parents=True)
@@ -340,7 +340,7 @@ class TestLoadRecordsIsTotal:
 
     def test_a_read_torn_mid_multibyte_character_is_unreadable(self, tmp_path):
         """Summaries are written `ensure_ascii=False`, so this is reachable."""
-        from verify_budget_census import _read_payload  # noqa: PLC0415
+        from verify_budget_census import _read_payload
 
         raw = json.dumps({'cmd': 'pytest — dash'}, ensure_ascii=False).encode('utf-8')
         torn = tmp_path / 'attempt-1.orchestrator.summary.json'
@@ -350,7 +350,7 @@ class TestLoadRecordsIsTotal:
 
     def test_every_selected_file_is_accounted_for(self, tmp_path):
         """The reconciliation property, asserted directly."""
-        from verify_budget_census import load_records  # noqa: PLC0415
+        from verify_budget_census import load_records
 
         good = write_worktree_record(tmp_path, '1', 'attempt-1.orchestrator.summary.json')
         bad = write_worktree_record(tmp_path, '2', 'attempt-1.orchestrator.summary.json')
@@ -364,7 +364,7 @@ class TestLoadRecordsIsTotal:
 
     def test_the_log_legs_beside_a_summary_are_not_selected(self, tmp_path):
         """Neither glob admits a `.log`, so they are not skips either."""
-        from verify_budget_census import load_records  # noqa: PLC0415
+        from verify_budget_census import load_records
 
         write_worktree_record(tmp_path, '3353', 'attempt-1.orchestrator.test.log')
         write_archive_record(
@@ -405,7 +405,7 @@ class TestALiveAttemptIsCountedOnce:
     """
 
     def test_the_archived_twin_is_a_counted_skip_not_a_second_record(self, tmp_path):
-        from verify_budget_census import load_records  # noqa: PLC0415
+        from verify_budget_census import load_records
 
         wt, ar = _live_and_archived(tmp_path, summary_payload(command_entry()))
 
@@ -418,7 +418,7 @@ class TestALiveAttemptIsCountedOnce:
         assert len(corpus.records) + len(corpus.skipped) == 2
 
     def test_a_role_filtered_census_still_sees_the_live_attempt(self, tmp_path):
-        from verify_budget_census import (  # noqa: PLC0415
+        from verify_budget_census import (
             load_records,
             select_full_suite_legs,
         )
@@ -458,7 +458,7 @@ class TestALiveAttemptIsCountedOnce:
         archive keeps both runs; only the rerun has a worktree twin, so twin
         identity has to be content and not name.
         """
-        from verify_budget_census import load_records  # noqa: PLC0415
+        from verify_budget_census import load_records
 
         first = summary_payload(
             command_entry(started_at='2026-09-13T04:00:00+00:00', duration_secs=3300.0),
@@ -488,7 +488,7 @@ class TestALiveAttemptIsCountedOnce:
     def test_identical_content_under_another_task_attempt_or_module_is_not_a_twin(
         self, tmp_path, task_id, attempt, prefix,
     ):
-        from verify_budget_census import load_records  # noqa: PLC0415
+        from verify_budget_census import load_records
 
         payload = summary_payload(command_entry())
         worktree = write_worktree_record(

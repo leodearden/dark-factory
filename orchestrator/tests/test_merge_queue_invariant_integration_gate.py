@@ -116,7 +116,7 @@ from test_merge_queue_concurrent_verify import (
     _make_branch_with_file,
 )
 
-from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.config import GitConfig, MergeDeepConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore
 from orchestrator.git_ops import AdvanceOutcome, GitOps, MergeResult, _run
 from orchestrator.merge_lane import MergeLane, WaiterRecord
@@ -277,7 +277,7 @@ class _FakeEscalationQueue:
         self._seq = 0
         self.submitted: list = []
 
-    def has_open_l1(self, task_id: str) -> bool:  # noqa: ARG002
+    def has_open_l1(self, task_id: str) -> bool:
         return self._open_l1
 
     def make_id(self, task_id: str) -> str:
@@ -411,6 +411,10 @@ class TestScenario1SpeculativeCascade:
         self, git_ops: GitOps, config: OrchestratorConfig,
     ) -> None:
         """N fails permanently (local, parked); N+1 (remote) survives via cascade."""
+        # Deep chains off (task 8527): under the operational yaml's chain_cap the
+        # head, alone in the verify frontier, would chain the follower into one
+        # tip verify, and this cascade needs the follower verifying on its own.
+        config = config.model_copy(update={'merge_deep': MergeDeepConfig(chain_cap=0)})
         head_gate = asyncio.Event()
         follower_release = asyncio.Event()
         follower_entered = asyncio.Event()
@@ -438,10 +442,17 @@ class TestScenario1SpeculativeCascade:
             await _until(lambda: 'casc1-a' in verifier.verified, what="N's verify to enter")
             await asyncio.wait_for(follower_entered.wait(), timeout=_SETTLE_TIMEOUT)
 
+            # Only N's gate opens, so N+1's verify is still running on its
+            # remote host when the cascade reaches it. A verdict reached first
+            # would have freed that host already (task 8526).
             head_gate.set()
-            # Release N+1's gate too, so the (possibly still-running) gated
-            # task can unblock even if cancel() arrives slightly late.
-            follower_release.set()
+            try:
+                await _until(
+                    lambda: gated_remote.cancel_verify.called,
+                    what="the cascade to cancel N+1's running remote verify",
+                )
+            finally:
+                follower_release.set()
 
             outcome_a = await wait_responsive(
                 req_a.result, label='casc1-a (N, head) outcome after head-failure cascade',
@@ -1090,6 +1101,10 @@ class TestB8MidPipelineCensus:
         self, git_ops: GitOps, config: OrchestratorConfig,
     ) -> None:
         """Two-item cascade sampled mid-verify, then drained to quiescence."""
+        # Deep chains off (task 8527): under the operational yaml's chain_cap the
+        # head, alone in the verify frontier, would chain the follower into one
+        # tip verify, and this cascade needs the follower verifying on its own.
+        config = config.model_copy(update={'merge_deep': MergeDeepConfig(chain_cap=0)})
         head_gate = asyncio.Event()
         follower_release = asyncio.Event()
         follower_entered = asyncio.Event()

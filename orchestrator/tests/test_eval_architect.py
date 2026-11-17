@@ -3739,7 +3739,7 @@ def _dispatch_mixed_eval(cfgs, capsys, *, gate=None, raise_on: str | None = None
             cli._run_single_eval(
                 Path('/fake/task.json'), 'all', base_config=MagicMock(),
             )
-        except Exception as exc:  # noqa: BLE001 — surfaced to the caller below
+        except Exception as exc:  # surfaced to the caller below
             error = exc
     return capsys.readouterr().out, {
         'run_eval': mock_run_eval, 'run_arch': mock_run_arch,

@@ -400,7 +400,7 @@ def _inject_operational_registry(
     ``TaskCurator.curate_prepared`` neutralization) — scenario 5 must reach
     ``_maybe_route_deterministic`` for real.
     """
-    def _fake_load(path):  # noqa: ARG001 — path unread; see docstring
+    def _fake_load(path):  # path unread; see docstring
         return [entry]
 
     monkeypatch.setattr(

@@ -41,6 +41,9 @@ from shared.governed_exceptions import (
     TicketRef,
 )
 from shared.testing_xdist_groups import single_xdist_group
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -803,17 +806,23 @@ def test_an_inline_report_with_a_mistyped_field_is_refused():
 def test_a_missing_shared_import_is_exit_two_and_never_exit_one(tmp_path: Path):
     """Only a real process can prove it: the fault happens before main exists.
 
-    The script is copied with ``source_measures.py``, its one sibling import, so
-    the import that fails is yaml's or shared's; ``-S`` hides the editable
-    install, which an emptied ``PYTHONPATH`` alone cannot.
+    The run uses a checkout-shaped copy: the script, ``source_measures.py`` (its
+    one sibling import) and the ``_checkout.py`` that imports, under
+    ``tmp_path/scripts``, with the root pyproject.toml at ``tmp_path``. No member
+    ``src/`` exists in the copy, so ``_checkout`` binds nothing and the
+    ``<copy>/shared/src`` the script inserts is absent too; the import that fails
+    is yaml's or shared's. ``-S`` hides the editable install, which an emptied
+    ``PYTHONPATH`` alone cannot.
     """
-    scripts = REPO_ROOT / 'scripts'
-    for name in ('exception_register.py', 'source_measures.py'):
-        shutil.copyfile(scripts / name, tmp_path / name)
+    scripts_dir = tmp_path / 'scripts'
+    scripts_dir.mkdir()
+    for name in ('exception_register.py', 'source_measures.py', '_checkout.py'):
+        shutil.copyfile(REPO_ROOT / 'scripts' / name, scripts_dir / name)
+    shutil.copyfile(REPO_ROOT / 'pyproject.toml', tmp_path / 'pyproject.toml')
     env = {key: value for key, value in os.environ.items() if key != 'PYTHONPATH'}
 
     completed = subprocess.run(
-        [sys.executable, '-S', str(tmp_path / 'exception_register.py'), '--report'],
+        [sys.executable, '-S', str(scripts_dir / 'exception_register.py'), '--report'],
         cwd=tmp_path,
         capture_output=True,
         text=True,
@@ -822,6 +831,9 @@ def test_a_missing_shared_import_is_exit_two_and_never_exit_one(tmp_path: Path):
     )
 
     assert completed.returncode == 2, completed.stderr
+    assert any(
+        f"No module named '{name}" in completed.stderr for name in ('yaml', 'shared')
+    ), completed.stderr
     assert 'uv run --project shared' in completed.stderr
     assert 'Traceback' not in completed.stderr
 

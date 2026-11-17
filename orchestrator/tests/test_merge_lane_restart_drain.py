@@ -35,7 +35,7 @@ from _orch_helpers import (
 )
 from df_pytest_isolation import git_redirect_env
 
-from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.config import GitConfig, MergeDeepConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps
 from orchestrator.merge_lane import GroupMergeRequest, MergeLane, MergeRequest, QueuedBranch
 from orchestrator.merge_lane.types import TrainCallbacks
@@ -405,6 +405,12 @@ async def test_a_train_does_not_park_on_a_predecessor_the_halt_sent_back_to_the_
     """A halt requeues both a parked train T and the predecessor A it waited
     on, T ahead of A. Once admission resumes T must not park on A, which can
     only move after T: that would stall the merger for the whole park."""
+    # Deep chains off (task 7720): under the operational yaml's chain_cap the
+    # merger waits for pred's chain decision while pred waits for the one
+    # host, so it could not take T into the park this scene is about.
+    scene = dataclasses.replace(
+        scene, config=lane_scene_config(scene.repo, _GIT, merge_deep=MergeDeepConfig(chain_cap=0)),
+    )
     release_head = asyncio.Event()
     verifier = FakeVerifier(scripts={'head': hangs_until(release_head)})
     queue: asyncio.Queue[Any] = asyncio.Queue()

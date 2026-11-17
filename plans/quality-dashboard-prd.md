@@ -237,7 +237,8 @@ negative, so an EWMA chart can never show improvement at these rates.
       and its id is `dark_factory`. A missing token, or one that resolves to no configured root,
       answers 200 with an `unknown` `QUALITY` saying so, never an empty series.
     - `QUALITY_MARKERS` and `QUALITY_SNAPSHOTS` are `unknown` Datums whose reasons start "no producer
-      has written here" until δ and ι land. `read_quality_series` already takes `events`
+      has written here" until δ and ι land (they have: §Contract → Markers, Correction (δ), and
+      decision 20, Correction (ι)). `read_quality_series` already takes `events`
       (`RegimeEvent`s), so δ only has to supply them. Until then, alarms carry `explained_by: null`
       and `before_after` is `[]`.
     - The access-path guard got a second vocabulary rather than an extended `GUARDED`. The quality
@@ -263,6 +264,49 @@ negative, so an EWMA chart can never show improvement at these rates.
     server-resolved `ordinal` fractions; `tab_escalation_analytics.jsx` consumes the lifted overlay through
     an adapter from its date labels. No view is computed in JS (`deriveVelocitySeries` is the
     counter-precedent).
+
+    **Correction (ε, 2026-11-12).** What shipped, and where each part is homed:
+    - `/api/v2/dashboard/quality` is an on-demand read, never polled: one read costs 0.5–1.3 s, its data
+      moves on the sampler's 600 s tick, and a polled row cannot carry `?project=`. It is the `quality`
+      row of `dashboard/src/dashboard/static/redux/data.js::ON_DEMAND_KEYS`. The param is the canonical
+      query `data.js::qualityQuery` builds (project, window, module, in that order), an opaque identity
+      that nothing parses back. The body's keys are fixed while their values depend on the param, so the
+      row declares `fields` (`QUALITY`, `QUALITY_MARKERS`, `QUALITY_SNAPSHOTS`), each landed under
+      `<FIELD>:<query>` and read from the body by `data.js::fromBody`. `data.js::onDemandReceipt` exposes
+      the request's receipt and its `WINDOW` echo. `endpointsFor` and its pins are unchanged.
+    - The landing window belongs to the tab, not the global chip. The vocabulary is
+      `dashboard/src/dashboard/static/redux/window_chip.js::WINDOW_SETS` (`landings`, default
+      `::LANDING_DEFAULT_WINDOW`), and `::TAB_WINDOWS` has no `quality` entry. Two facts force this. An
+      on-demand receipt is keyed by its query, not by a path the global chip can look up. And the global
+      window is also sent to the day-windowed chrome endpoints. One echo validator,
+      `window_chip.js::receiptWindow`, accepts both day and landing echoes, so the label, highlight and
+      pending functions are shared.
+    - `?module=` drills down on the server. `dashboard/src/dashboard/data/quality_series.py::read_quality_series(module=)`
+      keeps only the stored landings whose lines touch the module, and
+      `dashboard/src/dashboard/api/quality.py::api_quality` passes the parameter through. The filter
+      runs after the freshness check, so "N landings not yet sampled" still describes the whole
+      project's store. Train members share modules, so verify units stay whole.
+    - The overlay is an HTML layer over the chart (`dashboard/src/dashboard/static/redux/charts.jsx::Markers`,
+      wrapped with its chart by `::MarkedChart`). It is positioned from the one `charts.jsx::PLOT_PAD`
+      that `LineChart` and `StackedAreaChart` also use. Its decisions live in
+      `dashboard/src/dashboard/static/redux/chart_marks.js`: the style for each marker kind, placement
+      on a gapped ordinal axis or a date-label axis, the hover text and the legend. The server places
+      each marker at a landing ordinal; turning that ordinal into a fraction of the served axis is
+      placement (`chart_marks.js::fractionAt`), not a view. Escalation analytics uses the overlay through
+      `chart_marks.js::dateLabelMarks`, and its regime marks render exactly the DOM its old
+      `RegimeMarkers` did (sketch row 21).
+    - The tab is `dashboard/src/dashboard/static/redux/tab_quality.jsx::QualityTab`. Its quality-specific
+      decisions live in `dashboard/src/dashboard/static/redux/quality_view.js`: the layout, the text of a
+      headline, rule, alarm verdict, before/after comparison and cost-model reading, the chart arrays
+      (served verbatim) and each metric's marks. While the tab is open it polls only `/orchestrators`,
+      for its project selector (`poll_scope.js::TAB_ENDPOINTS`).
+    - Two wire limits are rendered around, not computed. The wire carries no per-landing residual
+      series: the cost model is shown as `cost_model.reference_cost_100` and
+      `cost_model.residual_median`. The wire carries no occurrence-cap field: mass events reach the
+      tab only as the served `artefact` markers, drawn as hatched ranges.
+    - Tests: the client half of quality sketch rows 3, 4, 5, 9, 10 and 12 is
+      `dashboard/tests/js/boundary_quality.test.mjs`. The tab's render cases are in
+      `dashboard/tests/js/jsx_render_quality.test.mjs`.
 17. **Item 2: measurement identity.** Schema 3 `params` adds `python_version` and `instrument` (blob
     shas of `scripts/quality_metrics_snapshot.py` and `scripts/source_measures.py`); identity =
     (`as_of_sha`, `params`); a test pins byte-identity below `run_id` and `cost` for two runs at one
@@ -295,6 +339,104 @@ negative, so an EWMA chart can never show improvement at these rates.
     counts, cycle counts, deferred and cycle-closing imports and private patch targets, marks
     `/review-all` baselines and `params` changes, and shows no ranking, target, average or headline line
     count (contract §10; snapshot PRD decision 6).
+
+    **Correction (ι, 2026-11-14).** What shipped, and where each part is homed:
+    - The figures have one definition, the instrument's `--summary SNAPSHOT --json`
+      (`scripts/quality_metrics_snapshot.py::summary_json`). It aggregates through the same
+      `_SUMMARY_COLUMNS` and `_GRAPH_KINDS` as the markdown `--summary`, and each cell carries its typed
+      value and its exact markdown text. `h14_marks` names the line mark each heuristic-14 column counted
+      files at (`::_H14_COLUMN_MARKS`), so a point's h14 marks and counts come from one source, not from
+      the snapshot's recorded params. The dashboard runs it as a subprocess of `sys.executable` on the
+      factory checkout's script (`dashboard/src/dashboard/data/quality_snapshots.py::INSTRUMENT_SCRIPT`),
+      inside the loop, and never imports `scripts/`.
+    - `dashboard/src/dashboard/data/quality_snapshots.py` is the one reader of both homes: the project
+      root's `plans/quality-metrics/` (`::BASELINE_HOME`) and `<quality_metrics_dir>/<project_id>/`.
+      `quality_metrics_dir` is `dashboard/src/dashboard/config.py::DashboardConfig.quality_metrics_dir`,
+      the dashboard's `<project_root>/data/quality-metrics`. With the factory checkout as that root, it
+      is `scripts/quality_snapshot_cadence.py::DEFAULT_DATA_DIR`, where the cadence writes. `::scan_root` summarises each
+      file, places it at its `as_of_sha`'s commit time, orders the points by commit time, a baseline
+      before a nightly file at the same commit, then point id (`::point_order`), and diffs each point
+      against the one before it with the instrument's `--diff`. A file the instrument refuses, or whose
+      sha git cannot resolve, is served in `unplaced` with its reason: never placed, never dropped.
+      Only the instrument's refusal exit (`::INSTRUMENT_REFUSAL_EXIT`, 2) is cached as a refusal or a
+      `failed` diff; any other exit, a signal included (`::InstrumentInterrupted`), and a timeout leave
+      the file or diff pending, retried by the next scan.
+    - Cache keys (`::SnapshotCache`). A summary is reused while the file's size and mtime_ns are
+      unchanged. Otherwise it is reused while the file's content digest and the summariser digest are
+      unchanged (`::summariser_digest`, sha256 of the instrument and `scripts/source_measures.py`). A
+      diff is keyed by both points' identities plus the summariser digest (`::pair_key`). A point's
+      identity is its `as_of_sha` and canonical `params` JSON, or its content digest when any params key
+      is unknown (`::cache_identity`). What a scan cannot reach before its deadline stays pending.
+    - Store: quality.db's `snapshot_points`, `snapshot_diffs` and `snapshot_scans` tables, written by
+      `dashboard/src/dashboard/data/quality_store.py::write_snapshot_scan` and
+      `::record_snapshot_failure`, and read by `::read_snapshot_state`, `::read_snapshot_diff` and
+      `::read_snapshot_identities`. The request path only reads them.
+    - Tick: `dashboard/src/dashboard/data/quality_snapshot_sampler.py::refresh_snapshots`, on the
+      per-root machinery of `dashboard/src/dashboard/data/quality_root_tick.py` (which also homes
+      `FACTORY_REPO`), within `::SNAPSHOT_PER_ROOT_BUDGET_SECONDS` (180 s) per root.
+      `dashboard/src/dashboard/loops.py::_quality_loop` runs landings (`collect_quality`), then
+      snapshots, then markers (`refresh_markers`), each guarded on its own, so each pass's marker
+      derivation carries the instrument markers of that pass's scan.
+    - `QUALITY_SNAPSHOTS` is `Datum[SnapshotSeries]` (`quality_snapshots.py::snapshot_datum`), not a
+      bare list of points. Before any scan it is unknown, "the snapshot homes of <project> have not been
+      scanned yet". When every scan failed it is unknown naming the failure. When a scan found neither
+      home holding a file it is unknown, starting "no snapshot yet" and naming both homes (INV-13). It is
+      stale when a newer attempt failed (serving the last good scan) or files are not yet summarised or
+      placed;
+      otherwise fresh as of the scan, aged against `QUALITY_FRESHNESS_BOUND_SECONDS`. Pending diffs do
+      not make it stale: each point's diff state says so.
+    - Wire (`::SnapshotSeries.to_wire`, `::ScannedPoint.to_wire`, replacing §Contract's
+      `SnapshotPoint` sketch): `{points: [SnapshotPoint], unplaced: [{id, file, baseline, reason}],
+      pending: {files, diffs}}`, with `SnapshotPoint = {id, file, baseline, as_of_sha,
+      committed_at, run_id, params, unknown_params, complete, members: {columns: [header], rows:
+      [{member, pseudo, cells: [text]}]}, h14: {soft_ceiling_lines, alarm_lines, at_soft_ceiling,
+      at_alarm}, cycles: {cycles, hidden_cycles, typing_cycles}, deferred_imports,
+      cycle_closing_imports, private_patch_targets, diff: {previous_id, state, reason}}`. Member cells
+      are the instrument's texts only, and no domain row is served. A count the snapshot's schema does
+      not record is null. `diff.state` is `first`, `ready`, `pending` or `failed` (`::DiffState`).
+    - One point's diff text is served on demand by `GET
+      /api/v2/dashboard/quality/snapshot-diff?project=&point=`
+      (`dashboard/src/dashboard/api/quality.py::api_quality_snapshot_diff`): PLAIN
+      `{QUALITY_SNAPSHOT_DIFF: {point_id, previous_id, state, text, reason}}`, always 200, with state
+      `absent` and a reason when the project has no such placed point (`quality_snapshots.py::ServedDiff`,
+      `::ABSENT`). Its `dashboard/src/dashboard/payload_budgets.json` entry budgets 590,000 bytes for the
+      payload fleet's seeded point (`dashboard/tests/_payload_fleet.py::SNAPSHOT_DIFF_POINT`), whose
+      ready diff is the length of a schema-3 snapshot of HEAD diffed against df's 2026-10-08 baseline.
+      The client reads it through `dashboard/src/dashboard/static/redux/data.js::ON_DEMAND_KEYS.qualitySnapshotDiff`
+      (PLAIN, `fields: ['QUALITY_SNAPSHOT_DIFF']`, retain 8), addressed by `data.js::snapshotDiffQuery`.
+    - Instrument markers take the instrument's polarity: unknown never equals unknown.
+      `SnapshotIdentity` carries `unknown_params`, and `quality_markers.py::instrument_markers` places a
+      marker wherever a params key differs or is unknown on either side, labelling an unknown key
+      ` (unknown)` (`::_changed_params`). The marker therefore sits where the point's diff opens "params
+      differ", including at a schema-2 → 3 change. `quality_marker_sampler.py::refresh_markers` reads
+      the identities from the stored scan. `SnapshotIdentity` also carries the point's `point_id` and
+      the `previous_id` its diff is against (`quality_snapshots.py::PointDiff`).
+      `quality_markers.py::instrument_markers` pairs each point with that predecessor, ids the marker
+      `instrument:<point_id>` and names the point in `source.point`, so two points at one commit never
+      share an id. `quality_view.js::snapshotMarks` places the mark by `source.point`, so the mark
+      sits on the point whose diff opens "params differ", also when a baseline and a nightly file
+      share a commit.
+    - Instrument markers are drawn on the snapshot charts and not on the landing charts:
+      `dashboard/src/dashboard/static/redux/quality_view.js::qualityMarks` drops them, since
+      `quality_markers.py::REGIME_ROLE` gives them no landing-axis role. The snapshot axis is one column
+      per point in served order, labelled by its commit date (`quality_view.js::snapshotAxis`), and each
+      series is a step (`spark_path.js::axisStepPaths`, the `step` flag of `charts.jsx::LineChart`).
+      Baselines are a `baseline` mark kind with its own legend entry (`chart_marks.js`). The chart groups
+      are fixed (`quality_view.js::snapshotCharts`): the h14 counts; cycles, hidden and typing cycles;
+      deferred and cycle-closing imports; private patch targets.
+      `tab_quality.jsx::QualitySnapshots` adds a point selector defaulting to the newest point, its
+      heading (`quality_view.js::snapshotHeading`, "instrument unknown" for a schema without
+      `instrument`), its member table (`::snapshotTable`), its diff verbatim in a `<pre>`
+      (`::snapshotDiffText`), and the unplaced files with their reasons.
+    - Tests: sketch row 20's server half is
+      `dashboard/tests/test_boundary_js.py::test_quality_sketch_20_snapshot_step_series`, over
+      `dashboard/tests/_boundary_payloads.py::_quality_snapshot_family`, which runs the real snapshot
+      and marker ticks. Its client half is the `quality #20:` cases of
+      `dashboard/tests/js/boundary_quality.test.mjs`. The same family's same-commit scenario, a
+      baseline and a nightly file at one commit, is asserted by
+      `dashboard/tests/test_boundary_js.py::test_quality_same_commit_instrument_marker_names_the_nightly_point`
+      and by the matching `quality #20:` client case, which places the instrument mark at the
+      nightly's column.
 21. **Where statistics live**: in the shared producer, not the dashboard module (Leo, 11-04:
     recommended (ii)). `shared/src/shared/memory_eval_limits.py` is left untouched; the quality
     statistics need Wilson, Newcombe, bootstrap, EWMA, CUSUM and Theil–Sen, none of which it has, and
@@ -492,7 +634,7 @@ that γ and δ build on; `shared/src/shared/quality_series/stats.py` is the sing
  modules: [{module, landings, metrics: {...}}],
  before_after: [{marker_id, n_before, n_after, effect, lo, hi, state, eta_days, min_detectable}]}
 Marker = {id, at, ordinal|null, kind, scope: project|'fleet', series: [..]|null, until|null, label,
-          source: {type, role?, path?, file?}, ref}
+          source: {type, role?, path?, file?, point?}, ref}
 SnapshotPoint = {as_of_sha, committed_at, params, complete, baseline: bool, members: {...}, h14: {...},
                  cycles: {...}, deferred_imports, cycle_closing_imports, private_patch_targets}
 ```
@@ -614,7 +756,7 @@ are in `dashboard/src/dashboard/data/quality_markers.py`.
   rejected entry is counted. `derived_markers(runs_db, project_id, snapshots)` is the stateless full
   derivation, equal to folding in batches.
 - The instrument rule (f) takes `SnapshotIdentity` values (`::instrument_markers`). The loop passes
-  none until ι supplies a snapshot reader.
+  none until ι supplies a snapshot reader. ι has: see decision 20, Correction (ι, 2026-11-14).
 
 ### Orchestrator fields
 

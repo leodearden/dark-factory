@@ -122,6 +122,11 @@ _DEFAULT_TEMPLATE = _SCRIPT_DIR / "fused-memory.service.template"
 # no RestartSteps= setting. Ignoring." at load and moves on). An installed unit
 # missing this line therefore has no growing backoff at all, silently, and the
 # only way that gets corrected on the host is for this checker to report it.
+#
+# KillMode=mixed is host-invariant too (task 9493). Without it an installed unit
+# silently keeps the default control-group, where a restart double-signals the
+# server and SIGTERMs the subprocesses of live tool calls; listing it here is
+# what lets setup-host's parity gate report that and --fix append it in place.
 REQUIRED_SERVICE_DIRECTIVES: tuple[str, ...] = (
     *ENV_POLICY.required_directives(UnitFamily.FUSED_MEMORY),
     "WatchdogSec=120",
@@ -130,6 +135,7 @@ REQUIRED_SERVICE_DIRECTIVES: tuple[str, ...] = (
     "RestartSteps=4",
     "TimeoutStartSec=300",
     "TimeoutStopSec=90",
+    "KillMode=mixed",
 )
 
 # Directive PREFIXES that MUST be present (as the start of some non-comment
