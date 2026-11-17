@@ -243,6 +243,67 @@ class TestQuietItemsAreTrimmed:
         assert entry['verdict_detail'] == _window()['detail']
 
 
+class TestAnItemAnEscalationCarriesIsNeverTrimmed:
+    """Quietness is "no open escalation carries this fingerprint", not "parity reads quiet"."""
+
+    @pytest.fixture
+    def storm_payload(self, tmp_path: Path) -> dict[str, Any]:
+        root = _root(tmp_path)
+        _write_eval(root)
+        _write_verdicts(
+            root,
+            [_item('t-gf', 'grandfathered'), _item('t-rec', 'no_alarm'), _item('t-passes', 'no_alarm')],
+            storm={'triggered': True, 'alarm_count': 1, 'aggregate_fingerprint': 'fp-aggregate'},
+        )
+        esc_dir = _esc_dir(tmp_path)
+        write_escalation_record(esc_dir, 'esc-gf', dedupe_fingerprint=f'fp-{_TRIPWIRE}-t-gf')
+        write_escalation_record(esc_dir, 'esc-rec', dedupe_fingerprint=f'fp-{_TRIPWIRE}-t-rec')
+        return _build(tmp_path)
+
+    @pytest.mark.parametrize(('item', 'parity'), [('t-gf', 'grandfathered'), ('t-rec', 'clear')])
+    def test_a_storm_suppressed_item_keeps_the_fingerprint_its_escalation_names(
+        self, storm_payload: dict[str, Any], item: str, parity: str,
+    ) -> None:
+        entry = _entry(storm_payload, _TRIPWIRE, item)
+
+        assert entry['parity'] == parity
+        assert entry['escalation'] is None
+        assert set(entry) == _FULL_ENTRY_KEYS
+        assert entry['fingerprint'] == f'fp-{_TRIPWIRE}-{item}'
+        assert entry['verdict_detail'] == f'Item {item!r} detail.'
+        explained = [
+            unmatched for unmatched in storm_payload['unmatched_escalations']
+            if unmatched['reason'] == 'storm_suppressed'
+            and unmatched['dedupe_fingerprint'] == entry['fingerprint']
+        ]
+        assert len(explained) == 1
+
+    def test_an_item_no_escalation_carries_is_still_trimmed_under_a_storm(
+        self, storm_payload: dict[str, Any],
+    ) -> None:
+        assert set(_entry(storm_payload, _TRIPWIRE, 't-passes')) == _QUIET_ITEM_KEYS
+
+    def test_a_shared_fingerprint_second_claimer_keeps_its_fingerprint(self, tmp_path: Path) -> None:
+        root = _root(tmp_path)
+        _write_eval(root)
+        _write_verdicts(root, [
+            _item('t-a', 'alarm', fingerprint='fp-shared'),
+            _item('t-b', 'no_alarm', fingerprint='fp-shared'),
+        ])
+        write_escalation_record(_esc_dir(tmp_path), 'esc-shared', dedupe_fingerprint='fp-shared')
+
+        payload = _build(tmp_path)
+
+        first = _entry(payload, _TRIPWIRE, 't-a')
+        assert first['parity'] == 'alarmed_open'
+        assert first['escalation']['id'] == 'esc-shared'
+        second = _entry(payload, _TRIPWIRE, 't-b')
+        assert (second['parity'], second['escalation']) == ('clear', None)
+        assert set(second) == _FULL_ENTRY_KEYS
+        assert second['fingerprint'] == 'fp-shared'
+        assert 'duplicate_verdict_fingerprint' in {issue['kind'] for issue in payload['issues']}
+
+
 class TestTheJoinRunsPerEntry:
     def test_a_linked_item_carries_the_escalation_its_fingerprint_names(self, tmp_path: Path) -> None:
         root = _root(tmp_path)
