@@ -29,6 +29,7 @@ from _lane_test_helpers import (
     make_warm_lane_repo,
     wire_recovery_scheduler,
 )
+from _seed_script_stubs import seed_default_warm_base
 from _workflow_helpers import _build_harness, _init_git_repo
 from escalation.queue import EscalationQueue
 
@@ -2275,16 +2276,8 @@ class TestReconcileLaneCheckouts:
         repo.mkdir()
         _init_git_repo(repo)
 
-        # Pre-create the default warm-lane CoW seed base so the pre-acquire
-        # base-health gate sees WarmBaseHealth.OK (mirrors wl_git_repo in
-        # test_warm_lane_pool.py), and a no-op seed script so a successful
-        # acquire's seed step succeeds.
-        default_base = repo / '.worktrees' / '_merge-verify' / 'target'
-        default_base.mkdir(parents=True, exist_ok=True)
-        (default_base / '.keep').write_text('warm base sentinel\n')
-        # Task 2099: mark pool storage present so the create-once discriminator
-        # does not refuse the first lane creation below (mirrors wl_git_repo).
-        (repo / '.worktrees' / '.pool-root').touch()
+        seed_default_warm_base(repo)
+        # A no-op seed script so a successful acquire's seed step succeeds.
         scripts_dir = repo / 'scripts'
         scripts_dir.mkdir(parents=True, exist_ok=True)
         seed_script = scripts_dir / 'seed-warm-lane.sh'
@@ -2598,16 +2591,8 @@ class TestMidRunRecycleLeak:
         repo.mkdir()
         _init_git_repo(repo)
 
-        # Pre-create the default warm-lane CoW seed base so the pre-acquire
-        # base-health gate sees WarmBaseHealth.OK — it runs BEFORE the (here
-        # mocked-out) real seed step either way.
-        default_base = repo / '.worktrees' / '_merge-verify' / 'target'
-        default_base.mkdir(parents=True, exist_ok=True)
-        (default_base / '.keep').write_text('warm base sentinel\n')
-        # Task 2099: mark pool storage present (mirrors wl_git_repo) — belt
-        # and braces even though this test's reset-in-place path does not
-        # exercise the create-once discriminator.
-        (repo / '.worktrees' / '.pool-root').touch()
+        # The base-health gate runs BEFORE the (here mocked-out) seed step.
+        seed_default_warm_base(repo)
 
         config = OrchestratorConfig(
             project_root=repo,
