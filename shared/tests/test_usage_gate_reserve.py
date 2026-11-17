@@ -817,13 +817,17 @@ class TestReserveWaitWakes:
         assert raised.value.scope is None
 
 
-async def eventually(check: Callable[[], bool], *, within: float = 3.0) -> None:
-    """Poll *check* on a real loop; far below the 300 s re-poll, so a pass proves a wake."""
-    loop = asyncio.get_running_loop()
-    give_up_at = loop.time() + within
-    while not check():
-        assert loop.time() < give_up_at, f'not within {within}s'
+async def eventually(check: Callable[[], bool], *, polls: int = 300) -> None:
+    """Poll *check* on a real loop for at most *polls* loop turns 10 ms apart.
+
+    The budget counts loop turns, not wall clock, so a descheduled loop spends none
+    of it; at most a few seconds, far below the 300 s re-poll, so a pass proves a wake.
+    """
+    for _ in range(polls):
+        if check():
+            return
         await asyncio.sleep(0.01)
+    assert check(), f'not within {polls} polls'
 
 
 def soon() -> datetime:
@@ -882,7 +886,7 @@ class TestTransitionsWakeTheWait:
         assert gate.reserve_waiters == 1
 
         auth_fail(gate, RESERVE)
-        await eventually(lambda: gate.reserve_waiters == 0, within=1)
+        await eventually(lambda: gate.reserve_waiters == 0, polls=100)
 
         [(_, ended)] = await events(store, 'reserve_wait_ended')
         assert ended['ended_by'] == 'reserve_unusable'
