@@ -281,7 +281,10 @@ _UNREADABLE_PROC_ROOTS = [
         id='eacces',
         marks=pytest.mark.skipif(os.geteuid() == 0, reason='root ignores file modes'),
     ),
-    *(pytest.param(*row.values, _STAT_READS, id=row.id) for row in _MALFORMED_STAT_ROOTS),
+    *(
+        pytest.param(*row.values, _STAT_READS, id=row.id, marks=row.marks)
+        for row in _MALFORMED_STAT_ROOTS
+    ),
     pytest.param(_boot_id_missing, _STAT_READS, id='boot-id-missing'),
 ]
 
@@ -319,10 +322,10 @@ def test_unreadable_proc_raises_and_never_reads_as_dead(
 
 @pytest.mark.parametrize('build_proc_root', _MALFORMED_STAT_ROOTS)
 def test_a_malformed_stat_is_unreadable_and_chained_from_the_shared_stat_parse(
-    build_proc_root, live_child, removable_tmp_path
+    build_proc_root, live_child, tmp_path
 ):
     identity = _captured(live_child.pid)
-    proc_root = build_proc_root(removable_tmp_path / 'proc', identity)
+    proc_root = build_proc_root(tmp_path / 'proc', identity)
 
     for name in _STAT_READS:
         with pytest.raises(ProcessIdentityUnreadable) as raised:
