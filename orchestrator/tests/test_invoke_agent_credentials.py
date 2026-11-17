@@ -158,6 +158,8 @@ _BACKEND_ENV = {
     'CLAUDE_OAUTH_TOKEN_B': POOL_B,
     'CLAUDE_CODE_OAUTH_TOKEN': AMBIENT_SESSION_TOKEN,
     'OPENAI_API_KEY': 'openai-' + 'o' * 41,
+    'CODEX_API_KEY': 'codex-' + 'c' * 42,
+    'CODEX_ACCESS_TOKEN': 'codex-access-' + 'a' * 35,
     'ANTHROPIC_API_KEY': 'anthropic-' + 'k' * 38,
     'GEMINI_API_KEY': 'gemini-' + 'g' * 41,
     'GOOGLE_API_KEY': 'google-' + 'q' * 41,
@@ -223,7 +225,9 @@ async def _dispatch_backend(
 @pytest.mark.parametrize(
     ('backend', 'oauth_token', 'expected_credentials'),
     [
-        pytest.param('codex', None, {'OPENAI_API_KEY'}, id='codex'),
+        pytest.param(
+            'codex', None, {'OPENAI_API_KEY', 'CODEX_API_KEY', 'CODEX_ACCESS_TOKEN'}, id='codex',
+        ),
         pytest.param('gemini', None, {'GEMINI_API_KEY', 'GOOGLE_API_KEY'}, id='gemini'),
         pytest.param(
             'pi', None, {'ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'GEMINI_API_KEY'}, id='pi',

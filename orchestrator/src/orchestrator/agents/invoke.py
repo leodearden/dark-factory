@@ -473,8 +473,9 @@ async def _invoke_claude_with_sandbox(
 # Codex backend
 # ---------------------------------------------------------------------------
 
-# _invoke_codex: the API key; codex's ChatGPT login lives in ~/.codex and needs no env var.
-CODEX_CREDENTIAL_VARS = frozenset({'OPENAI_API_KEY'})
+# codex-cli's auth env vars (0.167.0 binary: "provide an API key through a supported auth env var");
+# its ChatGPT login lives in ~/.codex and needs none.
+CODEX_CREDENTIAL_VARS = frozenset({'OPENAI_API_KEY', 'CODEX_API_KEY', 'CODEX_ACCESS_TOKEN'})
 
 _CODEX_WRITE_TOOLS = frozenset({'Edit', 'Write'})
 
