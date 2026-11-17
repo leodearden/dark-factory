@@ -45,7 +45,7 @@ gate consumers stay calibrated against one shared meaning per slug:
   Step 5.5 finding: a `findings` entry (schema
   `skills/review/references/run-record.md` §Findings, fields per
   `docs/quality-findings-contract.md` §1) restricted to the fields Step 5.5
-  decides —
+  decides that differ between fixtures —
   `{"anchor": "<path>::<symbol>", "tags": ["inv-<n>"], "severity": ..., "statement": ...}`,
   plus `proposal` where the fixture has one. `tags` shows only the lens,
   `tags[0]`, which resolves to the expected slug through the normative
@@ -53,12 +53,15 @@ gate consumers stay calibrated against one shared meaning per slug:
   `docs/code-quality.md` §"Relationship to the design invariants" names
   one, and the `kind:` tag from run-record.md, are derived from those homes
   and not copied here. `severity` is one of the contract §4 values
-  `high | medium | low`. `key`, `area`, `verdict`, `disposition` and the
-  run-record's other bookkeeping fields are omitted: they are minted or set
-  downstream of Step 5.5, and the fixture paths are illustrative, so no
-  real area or key exists. Verdict cells from walks before 2026-10-04 name
-  an `invariant_findings` entry: that is what Step 5.5 recorded until the
-  findings-contract rewrite (commit `20a3ed0ece`).
+  `high | medium | low`. `evidence_source` is omitted because it is the
+  same for every fixture: each claim rests on the snippet alone, so Step
+  5.5 sets `["present-tree"]`. `key`, `area`, `verdict`, `disposition` and
+  the run-record's other bookkeeping fields are omitted because they are
+  minted or set downstream of Step 5.5, and the fixture paths are
+  illustrative, so no real area or key exists. Verdict cells from walks
+  before 2026-10-04, and the closing clause of the `INV-14-CODE` cell (see
+  the INV-14 addendum), name an `invariant_findings` entry: the shape Step
+  5.5 recorded until the findings-contract rewrite (commit `20a3ed0ece`).
 
 **Rehearsal verdict-table legend.** The table at the end of this doc walks
 the AS-LANDED G7 text against every PRD-leaf-shaped fixture, and the
@@ -292,18 +295,19 @@ backstop only, never a designed exit.
 ### Code-snippet-shaped (`INV-6-CODE`)
 
 ```python
-async def _bail_on_pressure(self) -> Outcome:
-    if host_memory_pct() > 95:
-        # no status write here — caller's finally releases the slot;
-        # the reconcile sweep will eventually revert the row
-        return Outcome.ABORTED
-    return Outcome.CONTINUE
+class PressureBail:
+    async def _bail_on_pressure(self) -> Outcome:
+        if host_memory_pct() > 95:
+            # no status write here — caller's finally releases the slot;
+            # the reconcile sweep will eventually revert the row
+            return Outcome.ABORTED
+        return Outcome.CONTINUE
 ```
 
 **Expected `findings` entry**:
 
 ```json
-{"anchor": "orchestrator/src/orchestrator/pressure_bail.py::_bail_on_pressure", "tags": ["inv-6"], "severity": "high", "statement": "the ABORTED exit releases the slot without writing a successor status, leaving an in-progress row with no live claimant and delegating its recovery to the stranded sweep by design"}
+{"anchor": "orchestrator/src/orchestrator/pressure_bail.py::PressureBail._bail_on_pressure", "tags": ["inv-6"], "severity": "high", "statement": "the ABORTED exit releases the slot without writing a successor status, leaving an in-progress row with no live claimant and delegating its recovery to the stranded sweep by design"}
 ```
 
 ## INV-7 `holds-owned-and-bounded`
