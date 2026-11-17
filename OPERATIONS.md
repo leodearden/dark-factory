@@ -4073,8 +4073,13 @@ check.
 
 ### Transcript secret sweep (02:30)
 
-Agent subprocesses inherit no secret-bearing variable except their own
-`CLAUDE_CODE_OAUTH_TOKEN` (`shared/src/shared/secret_env.py`). Verify and
+Agent subprocesses inherit no secret-bearing variable except the credentials
+their backend names (`shared/src/shared/secret_env.py::agent_subprocess_env`).
+A Claude child keeps only its own `CLAUDE_CODE_OAUTH_TOKEN`. codex, gemini and
+pi keep only their provider keys
+(`orchestrator/src/orchestrator/agents/invoke.py::CODEX_CREDENTIAL_VARS`,
+`GEMINI_CREDENTIAL_VARS`, `PI_CREDENTIAL_VARS`). The `CLAUDE_OAUTH_TOKEN_*`
+pool never reaches any agent child. Verify and
 offline-lane children, a target project's build and test runs, inherit every
 credential except the `CLAUDE_OAUTH_TOKEN_*` account pool
 (`shared/src/shared/secret_env.py::without_account_pool`, task 6828); that
@@ -4095,7 +4100,11 @@ everything already on disk.
   value and recompressing it, with mode and mtime kept. These logs were added
   after failing pytest env assertions printed live tokens into them (task
   10144). `~/.claude/projects` is still scanned for transcripts only. The
-  full tree list is `scripts/transcript_secret_sweep.py::swept_trees`.
+  transcript archive and `~/.claude/projects` are required roots;
+  `data/verify-logs` and `data/orchestrator/offline-lane` are optional,
+  because most projects have no offline lane and a project has no verify logs
+  before its first verify. The full tree list, with each root's
+  required flag, is `scripts/transcript_secret_sweep.py::swept_trees`.
 - **What it matches.** Only the live values the sweep's own environment holds.
   The wrapper sources the repo `.env` for them. It never matches a token-shaped
   pattern. A value is matched in the form the file holds it: JSON-escaped in
@@ -4118,6 +4127,15 @@ everything already on disk.
   It prints one JSON record line to the journal, and never prints a value.
   A `*.xml.gz` that does not decompress is listed under `unreadable` in that
   record line and left as found.
+- **What it files when it cannot cover its roots.** When the sweep cannot run
+  (no secret-bearing values in its environment, e.g. `.env` moved or its
+  variables renamed), cannot find a required root, or cannot read an
+  orchestrator unit, it files one `infra_issue` info escalation (task_id
+  `transcript-secret-sweep-shortfall`) naming each shortfall, and exits 2.
+  The wrapper still exits 0, as every §12 job does, so the escalation is the
+  signal. A failing night re-files: one escalation per night until it is
+  fixed. The wrapper resolves `uv` via `scripts/lib/resolve_uv.sh`, so a
+  boot catch-up run without the login PATH still finds it.
 - **What it skips.** Files modified in the last 15 minutes, which a live
   session or test run may still be appending to. The next night picks them up.
 
