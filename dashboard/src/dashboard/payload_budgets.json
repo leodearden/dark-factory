@@ -294,6 +294,11 @@
           "budget_bytes": 21000,
           "task": "5824",
           "reason": "Measured 2026-10-15 against the live dashboard (127.0.0.1:8080): 4,081 bytes with no query. Three evals. Small; the 16 KiB headroom floor sets this budget."
+        },
+        {
+          "budget_bytes": 69000,
+          "task": "10137",
+          "reason": "Measured 2026-11-17: 52,211 bytes, by building this route with task 10137's code (build_memory_evals plus shape_memory_evals, serialized as Starlette's JSONResponse does) over the live artifact tree fused-memory/data/memory-evals and the live reconciliation queue, since the live dashboard still served main's code. In the old per-item-row shape the live dashboard served 79,622 bytes on 2026-11-14, 83,768 on 2026-11-15 and 116,964 on 2026-11-17. Census: 6 eval dirs, 4 with runs: e1-retrieval-health 6 metric rows (5 window plus a tripwire whose 34 items are now nested under it) over 6 runs; e4-staleness-sweep 5 rows (76 items nested) over 5 runs; e6-corpus-health 44 rows over 2 runs; e7-write-after-miss 1 row over 5 runs; 2 run-less dirs. Item rows no longer copy the metric fields or the trend, so growth is O(items) plus one trend per metric; the 44 e6 metrics are most of today's bytes. Headroom: max(1.25*m, m + 16384) rounded up to 2 significant figures."
         }
       ]
     },
