@@ -7,6 +7,8 @@ reserve clock, and changes account phases only through public seams.
 
 from __future__ import annotations
 
+import asyncio
+import json
 import os
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
@@ -15,6 +17,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 import yaml
+from _usage_gate_test_helpers import SCOPE, make_mock_cost_store
 
 from shared.account_reserve import (
     ReserveRefusal,
@@ -293,3 +296,186 @@ class TestInvalidBlock:
         assert gate.reserve_state is ReserveState.INVALID
         assert gate.reserve_refusal(LOW) is None
         assert leased_name(gate, work_class=LOW) == RESERVE
+
+
+async def events(store: AsyncMock, event_type: str) -> list[tuple[str, dict[str, object]]]:
+    """The ``(account_name, details)`` of every *event_type* row written so far.
+
+    Gate events are fire-and-forget tasks, so the loop is given a few turns to run them first.
+    """
+    for _ in range(5):
+        await asyncio.sleep(0)
+    return [
+        (call.kwargs['account_name'], json.loads(call.kwargs['details']))
+        for call in store.save_account_event.call_args_list
+        if call.kwargs['event_type'] == event_type
+    ]
+
+
+class TestAttachCostStore:
+    async def test_attaching_a_store_records_the_reserve_config_once(
+        self, tmp_path: Path
+    ) -> None:
+        gate = make_reserve_gate(tmp_path, clock=FakeClock())
+        store = make_mock_cost_store()
+
+        gate.attach_cost_store(store)
+
+        assert await events(store, 'reserve_config') == [
+            (
+                RESERVE,
+                {
+                    'state': 'active',
+                    'reason': None,
+                    'account': RESERVE,
+                    'next_reset': NEXT_RESET.isoformat(),
+                    'release_at': RELEASE_AT.isoformat(),
+                    'admit_tiers': {'default': ['critical', 'high']},
+                },
+            )
+        ]
+        cap(gate, 'max-d')
+        assert [name for name, _ in await events(store, 'cap_hit')] == ['max-d']
+
+    async def test_a_store_given_to_the_constructor_gets_no_config_row(
+        self, tmp_path: Path
+    ) -> None:
+        store = make_mock_cost_store()
+        make_reserve_gate(tmp_path, clock=FakeClock(), cost_store=store)
+
+        assert await events(store, 'reserve_config') == []
+
+    async def test_without_a_block_attaching_records_no_config_row(self, tmp_path: Path) -> None:
+        gate = make_reserve_gate(tmp_path, block=None, clock=FakeClock())
+        store = make_mock_cost_store()
+
+        gate.attach_cost_store(store)
+        cap(gate, 'max-d')
+
+        assert await events(store, 'reserve_config') == []
+        assert len(await events(store, 'cap_hit')) == 1
+
+    @pytest.mark.parametrize(
+        ('block', 'cause'),
+        [
+            pytest.param({**DEFAULT_BLOCK, 'account': 'max-z'}, 'max-z', id='unknown-account'),
+            pytest.param({**DEFAULT_BLOCK, 'colour': 'red'}, 'colour', id='unknown-key'),
+            pytest.param(
+                {**DEFAULT_BLOCK, 'release_hours': 0}, 'release_hours', id='release-hours-0'
+            ),
+        ],
+    )
+    async def test_b11_an_invalid_block_is_recorded_with_its_reason(
+        self, tmp_path: Path, block: object, cause: str
+    ) -> None:
+        gate = make_reserve_gate(tmp_path, block=block, clock=FakeClock())
+        store = make_mock_cost_store()
+
+        gate.attach_cost_store(store)
+
+        [(account_name, details)] = await events(store, 'reserve_config')
+        assert account_name == ''
+        assert details['state'] == 'invalid'
+        assert cause in str(details['reason'])
+        assert details['account'] is None
+        assert details['release_at'] is None
+
+
+class TestReserveAccountUnavailable:
+    """B12 (event): the reserve failing authentication is recorded, once."""
+
+    async def test_the_reserve_failing_authentication_is_recorded(self, tmp_path: Path) -> None:
+        store = make_mock_cost_store()
+        gate = make_reserve_gate(tmp_path, clock=FakeClock(), cost_store=store)
+
+        auth_fail(gate, RESERVE)
+
+        assert await events(store, 'reserve_account_unavailable') == [
+            (RESERVE, {'account': RESERVE})
+        ]
+
+    async def test_another_account_failing_is_not(self, tmp_path: Path) -> None:
+        store = make_mock_cost_store()
+        gate = make_reserve_gate(tmp_path, clock=FakeClock(), cost_store=store)
+
+        auth_fail(gate, 'max-d')
+
+        assert await events(store, 'reserve_account_unavailable') == []
+
+    async def test_without_a_block_nothing_is_recorded(self, tmp_path: Path) -> None:
+        store = make_mock_cost_store()
+        gate = make_reserve_gate(tmp_path, block=None, clock=FakeClock(), cost_store=store)
+
+        auth_fail(gate, RESERVE)
+
+        assert await events(store, 'reserve_account_unavailable') == []
+        assert len(await events(store, 'auth_failed')) == 1
+
+
+class TestScheduleDrift:
+    """B13: a banner does not move the calendar; drift is recorded at most once per week."""
+
+    async def test_drift_is_recorded_once_and_the_release_time_stays(
+        self, tmp_path: Path
+    ) -> None:
+        store = make_mock_cost_store()
+        gate = make_reserve_gate(tmp_path, clock=FakeClock(), cost_store=store)
+        cap_all_but(gate, RESERVE)
+
+        cap(gate, RESERVE, resets_at=NEXT_RESET + timedelta(hours=1))
+        expected = [
+            (
+                RESERVE,
+                {
+                    'configured_reset': NEXT_RESET.isoformat(),
+                    'observed_reset': (NEXT_RESET + timedelta(hours=1)).isoformat(),
+                },
+            )
+        ]
+        assert await events(store, 'reserve_schedule_drift') == expected
+
+        assert await gate.wait_for_open(timeout=0) is True
+        cap(gate, RESERVE, resets_at=NEXT_RESET + timedelta(minutes=50))
+        assert await events(store, 'reserve_schedule_drift') == expected
+
+        assert await gate.wait_for_open(timeout=0) is True
+        refused = gate.reserve_refusal(LOW)
+        assert refused is not None
+        assert refused.release_at == RELEASE_AT
+        await gate.shutdown()
+
+    async def test_a_reset_five_hours_off_is_not_drift(self, tmp_path: Path) -> None:
+        store = make_mock_cost_store()
+        gate = make_reserve_gate(tmp_path, clock=FakeClock(), cost_store=store)
+
+        cap(gate, RESERVE, resets_at=NEXT_RESET + timedelta(hours=5))
+
+        assert await events(store, 'reserve_schedule_drift') == []
+        assert gate.reserve_refusal(LOW) is None
+        cap_all_but(gate, RESERVE)
+        assert gate.capped_account_names == ACCOUNTS
+
+    async def test_a_scoped_cap_is_not_drift(self, tmp_path: Path) -> None:
+        store = make_mock_cost_store()
+        gate = make_reserve_gate(tmp_path, clock=FakeClock(), cost_store=store)
+
+        cap(gate, RESERVE, scope=SCOPE, resets_at=NEXT_RESET + timedelta(hours=1))
+
+        assert len(await events(store, 'cap_hit')) == 1
+        assert await events(store, 'reserve_schedule_drift') == []
+
+
+class TestWithoutAStore:
+    async def test_the_reserve_events_record_nothing_and_raise_nothing(
+        self, tmp_path: Path
+    ) -> None:
+        gate = make_reserve_gate(tmp_path, clock=FakeClock())
+
+        cap(gate, RESERVE, resets_at=NEXT_RESET + timedelta(hours=1))
+        cap_all_but(gate, RESERVE)
+        assert await gate.wait_for_open(timeout=0) is True
+        auth_fail(gate, RESERVE)
+
+        assert gate.capped_account_names == ACCOUNTS[:-1]
+        assert gate.auth_failed_account_names == (RESERVE,)
+        await gate.shutdown()
