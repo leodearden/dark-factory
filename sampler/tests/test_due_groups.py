@@ -561,3 +561,99 @@ class TestTheTickLine:
         line = _main(monkeypatch, tmp_path, [group], caplog)
 
         assert f'{GroupName.LOAD}=dropped' in line, line
+
+
+# ---------------------------------------------------------------------------
+# Retention: the cleanup DELETE reads an index led by ts
+# ---------------------------------------------------------------------------
+
+# The store's DDL before the ts index, verbatim: a historical fixture, not a
+# copy of anything live, so it must never be "kept in sync".
+_PRE_TS_INDEX_SCHEMA = """\
+CREATE TABLE IF NOT EXISTS samples (
+    ts          INTEGER NOT NULL,
+    metric      TEXT    NOT NULL,
+    value       REAL    NOT NULL,
+    window_mean REAL,
+    window_max  REAL,
+    leaf        TEXT
+);
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_samples_metric_ts_leaf ON samples (metric, ts, leaf);
+CREATE INDEX IF NOT EXISTS idx_samples_metric_leaf_ts ON samples (metric, leaf, ts)
+    WHERE leaf IS NOT NULL;
+"""
+
+RETAIN = 30 * 24 * 60 * 60
+
+
+def _ts_led_indexes(conn: sqlite3.Connection) -> set[str]:
+    return {
+        name
+        for (name,) in conn.execute("SELECT name FROM sqlite_master WHERE type = 'index'")
+        if [row[2] for row in conn.execute(f'PRAGMA index_info({name})')][:1] == ['ts']
+    }
+
+
+class TestTheCleanupDeleteIsAnIndexSearch:
+    def test_both_arms_of_the_cutoff_search_an_index_led_by_ts(self, tmp_path: Path):
+        from sampler.store import RETENTION_DELETE_SQL
+
+        _store(tmp_path)
+        conn = sqlite3.connect(str(tmp_path / 'db.sqlite'))
+        try:
+            plan = [
+                row[3]
+                for row in conn.execute(f'EXPLAIN QUERY PLAN {RETENTION_DELETE_SQL}', (1, 2))
+            ]
+            ts_led = _ts_led_indexes(conn)
+        finally:
+            conn.close()
+
+        assert ts_led, 'no index on samples is led by ts'
+        searches = [step for step in plan if step.startswith('SEARCH samples')]
+        assert len(searches) == 2, plan
+        for step in searches:
+            assert any(f'INDEX {name} ' in f'{step} ' for name in ts_led), plan
+        assert not any(step.startswith('SCAN samples') for step in plan), plan
+
+    def test_a_store_written_before_the_index_gains_it_and_keeps_its_rows(self, tmp_path: Path):
+        db_path = tmp_path / 'db.sqlite'
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.executescript(_PRE_TS_INDEX_SCHEMA)
+            conn.executemany(
+                'INSERT INTO samples (ts, metric, value, leaf) VALUES (?, ?, ?, ?)',
+                [(100, 'occt_queue_depth', 1.0, None), (105, 'own_read_ok', 1.0, 'leaf.service')],
+            )
+            conn.commit()
+            assert not _ts_led_indexes(conn)
+        finally:
+            conn.close()
+
+        _store(tmp_path)
+
+        conn = sqlite3.connect(str(db_path))
+        try:
+            assert _ts_led_indexes(conn)
+        finally:
+            conn.close()
+        assert _rows(db_path) == [
+            (100, 'occt_queue_depth', None, 1.0),
+            (105, 'own_read_ok', 'leaf.service', 1.0),
+        ]
+
+    def test_it_still_deletes_exactly_the_rows_outside_the_window(self, tmp_path: Path):
+        now = 10_000_000
+        store = _store(tmp_path)
+        for ts in (now - RETAIN - 1, now - RETAIN, now, now + RETAIN, now + RETAIN + 1):
+            store.insert_sample(ts, ROW, 1.0)
+
+        store.cleanup_old(now, retain_seconds=RETAIN)
+
+        assert [ts for ts, *_rest in _rows(tmp_path / 'db.sqlite')] == [
+            now - RETAIN, now, now + RETAIN
+        ]
