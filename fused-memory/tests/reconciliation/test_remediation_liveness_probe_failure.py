@@ -25,7 +25,7 @@ from escalation.queue import EscalationQueue
 from shared.project_layout import escalation_queue_dir
 
 import fused_memory.reconciliation.harness as harness_module
-from fused_memory.reconciliation.harness import LIVENESS_UNKNOWN_DETAIL_KEY
+from fused_memory.reconciliation.finding_task_escalation import LIVENESS_UNKNOWN_DETAIL_KEY
 from reconciliation.harness_fixtures import (
     make_memory_service,
     open_event_buffer,
@@ -253,9 +253,10 @@ class TestTheRoutedTargetGateFailsClosedToo:
         _stub_corroboration(monkeypatch, raising_for=frozenset({'777'}))
         _stub_detector(monkeypatch, lingering=frozenset({'777'}))
 
-        routed, [filed] = await self._drive_routed(drive, tmp_path, caplog)
+        [record], [filed] = await self._drive_routed(drive, tmp_path, caplog)
 
-        assert [e.task_id for e in routed] == ['777']
+        assert record.task_id == '777'
+        assert json.loads(record.detail)[LIVENESS_UNKNOWN_DETAIL_KEY] == ['777']
         assert (filed.task_id, filed.liveness_unknown) == ('777', True)
         assert filed.levelno == logging.WARNING
 
@@ -266,8 +267,9 @@ class TestTheRoutedTargetGateFailsClosedToo:
         _stub_corroboration(monkeypatch)
         _stub_detector(monkeypatch, lingering=frozenset({'777'}))
 
-        routed, [filed] = await self._drive_routed(drive, tmp_path, caplog)
+        [record], [filed] = await self._drive_routed(drive, tmp_path, caplog)
 
-        assert [e.task_id for e in routed] == ['777']
+        assert record.task_id == '777'
+        assert LIVENESS_UNKNOWN_DETAIL_KEY not in json.loads(record.detail)
         assert (filed.task_id, filed.liveness_unknown) == ('777', False)
         assert filed.levelno == logging.INFO
