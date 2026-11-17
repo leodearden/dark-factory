@@ -1224,5 +1224,7 @@ def emit_unverified_claim_escalation(
         logger=logger,
         log_label='completion_claim_gate',
         context=f'unverified claim about {ref!r}',
-        level=1,
+        # L0: the info-L0 router turns each claim into a curator task (see
+        # tests/test_completion_claim_gate.py::TestEmitUnverifiedClaimEscalation).
+        level=0,
     )
