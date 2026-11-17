@@ -532,13 +532,8 @@ def _resolve_hook_slug(
     # §Forked-inheritor identity.
     identity = resolve_hook_identity(hook_input, env)
     session_id = _hook_session_id(hook_input) or 'unknown'
-    # session_id fills the launcher_pid slot as the uniqueness token; the int
-    # annotation does not bind, since build_session_slug only str()s it.
     slug = session_records.build_session_slug(
-        identity.role,
-        identity.project,
-        identity.task_id,
-        session_id,  # type: ignore[arg-type]
+        identity.role, identity.project, identity.task_id, session_id
     )
     # This slug embeds session_id itself, so binding it is tautological.
     # No snapshot: any read above was of a DIFFERENT record than this slug.

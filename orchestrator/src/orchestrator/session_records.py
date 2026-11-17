@@ -631,21 +631,23 @@ def build_session_slug(
     role: str,
     project: str,
     task_id: str | None,
-    launcher_pid: int,
+    uniqueness_token: int | str,
 ) -> str:
-    """Build the record-identity/directory key ``<role>-<project>[-<taskid>]-<pid>``.
+    """Build the record-identity/directory key ``<role>-<project>[-<taskid>]-<token>``.
 
-    The pid guarantees per-record uniqueness across concurrent spawns that
-    share role+project+task (PRD §4 decision 2); single-ownership is a
-    separate concern (T7 leases), not encoded in the key. Any character
-    outside ``[A-Za-z0-9._-]`` in any segment (or the joined whole) is
-    sanitized to ``'-'`` (see ``sanitize_slug``) so the slug is always
-    filesystem-safe.
+    The token is the launcher pid for a spawned session (session_registry's
+    ``launching`` verb) or the Claude session_id for a hook-keyed session
+    (``session_hooks.hook_session_slug``). Either way it keeps records unique
+    across concurrent sessions that share role+project+task (PRD §4
+    decision 2); single-ownership is a separate concern (T7 leases), not
+    encoded in the key. Any character outside ``[A-Za-z0-9._-]`` in any
+    segment (or the joined whole) is sanitized to ``'-'`` (see
+    ``sanitize_slug``) so the slug is always filesystem-safe.
     """
     segments = [role, project]
     if task_id:
         segments.append(task_id)
-    segments.append(str(launcher_pid))
+    segments.append(str(uniqueness_token))
     raw = '-'.join(segments)
     return sanitize_slug(raw)
 
