@@ -3721,7 +3721,7 @@ class Scheduler:
         state = self._watchdog_state
         if not self.config.starvation_watchdog.enabled:
             state.drop_waiting(list(state.waiting()))
-            self._sync_cap_l1(ctx, now, ())
+            self._sync_cap_l1(ctx, now)
             return
         free_slots = self.config.starvation_watchdog.auto_pin_max_concurrent - sum(
             1 for row in ctx.overrides.values()
@@ -3746,19 +3746,18 @@ class Scheduler:
                     'Starvation watchdog: live status read failed (%r); delivering '
                     'none of %d finding(s) this tick', err, len(findings),
                 )
-        self._sync_cap_l1(ctx, now, all_findings)
+        self._sync_cap_l1(ctx, now)
 
-    def _sync_cap_l1(
-        self, ctx: TickContext, now: datetime, findings: Sequence[Finding],
-    ) -> None:
+    def _sync_cap_l1(self, ctx: TickContext, now: datetime) -> None:
         """Bring the auto-pin cap L1 in line with the waiting cohort (task 9636).
 
         The L1 is open only while the cohort is non-empty and alarming, and
-        names that cohort; ``starvation_cap.py`` holds the rule.  This tick's
-        findings already carry their blockers; any other task's are read from
-        the lock table once per pass.
+        names that cohort; ``starvation_cap.py`` holds the rule.  Blockers,
+        in-flight slots and held locks are read here with no await between
+        them, so the report is one snapshot of the lock state after the
+        tick's live status read; each task's blockers are read once per pass.
         """
-        known: dict[str, tuple[Blocker, ...]] = {f.facts.task_id: f.blockers for f in findings}
+        known: dict[str, tuple[Blocker, ...]] = {}
 
         def blockers_of(task_id: str) -> tuple[Blocker, ...]:
             if task_id not in known:
@@ -3773,6 +3772,7 @@ class Scheduler:
             blockers_of=blockers_of,
             now=now,
             claimant_ttl=timedelta(seconds=self.config.claimant_liveness_ttl_secs),
+            in_flight=frozenset(self._dispatched),
         )
         report = cap_report(
             self._watchdog_state.waiting(), world,

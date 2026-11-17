@@ -1,10 +1,12 @@
 """Whether a lock blocker's holder is live, following parks to their owner's own blockers.
 
-A HELD module's owner is live when it is in the tick's active task read, not
-terminal, not blocked, and has a live claimant: the scheduler's own
-claimant/heartbeat liveness at the dispatch gate's TTL.  A workflow heartbeats
-for its whole slot, merge phase included, so a holder that is merely slow
-reads live.  A PARKED module's owner is a pending task waiting for its own
+A HELD module's owner must be a slot this scheduler process has dispatched and
+not yet released; a lock outside every slot is a leak.  An in-flight owner with
+a live claimant (the dispatch gate's claimant/heartbeat liveness and TTL) is
+live: a workflow heartbeats for its whole slot, merge phase included.  Without
+one it is non-live when in-progress or blocked, and live when pending (dispatched,
+not yet claimed), terminal or gone from the task read (unwinding to its
+release).  A PARKED module's owner is a pending task waiting for its own
 modules; it is followed to those modules' blockers, at most
 ``PARK_FOLLOW_DEPTH`` parks deep.  A park owner whose modules are all free
 waits only for a run slot, which is not a wedge.
@@ -28,6 +30,8 @@ from orchestrator.pin_reservation import Blocker, BlockerKind
 
 PARK_FOLLOW_DEPTH = 3
 
+_UNCLAIMED_SLOT_STATUSES = TERMINAL | {TaskStatus.PENDING}
+
 
 class HolderState(StrEnum):
     """Why a blocker's holder is not live."""
@@ -37,16 +41,18 @@ class HolderState(StrEnum):
     NO_LIVE_CLAIMANT = 'no_live_claimant'
     PARK_CYCLE = 'park_cycle'
     PARK_TOO_DEEP = 'park_too_deep'
+    LOCK_WITHOUT_SLOT = 'lock_without_slot'
 
 
 @dataclass(frozen=True)
 class LockWorld:
-    """One tick's view: the active task records and each task's current blockers."""
+    """One tick's view: active task records, each task's blockers, and the slots in flight."""
 
     tasks: Mapping[str, Mapping[str, Any]]
     blockers_of: Callable[[str], Sequence[Blocker]]
     now: datetime
     claimant_ttl: timedelta
+    in_flight: frozenset[str]
 
 
 @dataclass(frozen=True)
@@ -68,7 +74,7 @@ def _walk(
     owner = blocker.owner
     record = world.tasks.get(owner)
     if blocker.kind is BlockerKind.HELD:
-        reason = _held_owner_state(record, world)
+        reason = _held_owner_state(owner, record, world)
         return None if reason is None else NonLiveHolder(blocker, reason)
     if owner in path:
         return NonLiveHolder(blocker, HolderState.PARK_CYCLE)
@@ -83,14 +89,19 @@ def _walk(
     return None
 
 
-def _held_owner_state(record: Mapping[str, Any] | None, world: LockWorld) -> HolderState | None:
-    if record is None or not _active(record):
-        return HolderState.NOT_ACTIVE
-    if record.get('status') == TaskStatus.BLOCKED:
+def _held_owner_state(
+    owner: str, record: Mapping[str, Any] | None, world: LockWorld,
+) -> HolderState | None:
+    if owner not in world.in_flight:
+        return HolderState.LOCK_WITHOUT_SLOT
+    if record is None or has_live_claimant(record, world.now, world.claimant_ttl):
+        return None
+    status = record.get('status')
+    if status == TaskStatus.BLOCKED:
         return HolderState.BLOCKED
-    if not has_live_claimant(record, world.now, world.claimant_ttl):
-        return HolderState.NO_LIVE_CLAIMANT
-    return None
+    if status in _UNCLAIMED_SLOT_STATUSES:
+        return None
+    return HolderState.NO_LIVE_CLAIMANT
 
 
 def _active(record: Mapping[str, Any] | None) -> bool:
