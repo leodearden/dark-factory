@@ -2363,8 +2363,14 @@ Every resolved invocation emits a `routing_decision` event (model, effort,
 budget, turns, which layer set the model, which rule matched, any
 rejections) and mirrors the latest decision onto the task's own
 `metadata.routing` — a bounded history (last 5), a routing-tier counter,
-and a `simple_saturated` flag. Today this is what you read directly
-(`routing_decision` events, `metadata.routing` per task) — there is not
+and a `simple_saturated` flag. The event row's `phase` column carries the
+workflow phase the invocation ran in (the live phase inside a task
+workflow, `escalated` for steward and triage, `blocked` for unblock_auto),
+matching that invocation's `invocation_end` row, so a per-role cap or cost
+cohort splits by phase from `runs.db` alone; it is NULL for the
+project-level deep_reviewer and the batch module_tagger. Today this is
+what you read directly (`routing_decision` events, `metadata.routing` per
+task) — there is not
 yet an auto-escalating retry ladder or a rendered rollup panel; see below.
 
 ### Adaptive-routing substrate (not yet active)
