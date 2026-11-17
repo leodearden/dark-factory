@@ -20,7 +20,7 @@ from datetime import UTC, datetime, timedelta
 from enum import Enum
 from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, NamedTuple, Protocol, cast
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, Protocol, TypeVar, cast
 
 # escalation.pins is pure and imports only escalation.models, so it is
 # cycle-safe at module top (harness.py imports it the same way);
@@ -63,6 +63,7 @@ from shared.transcript_archive import (
     resolve_archive_root,
     restore_archived_transcript,
 )
+from shared.usage_gate import SessionBudgetExhausted as _SessionBudgetExhausted
 
 from orchestrator import chronic_flake
 from orchestrator.agents.briefing import PriorAttemptCause, VerifyAttemptContext
@@ -179,6 +180,11 @@ from orchestrator.resume_resolution import (
     select_carried_resolutions,
 )
 from orchestrator.review_inputs import gather_review_subject
+from orchestrator.review_lineage import (
+    RetiredReview,
+    retire_quarantined_lineages,
+    retired_reviews_since,
+)
 from orchestrator.review_outcome import review_completed_payload
 from orchestrator.review_suggestions.curator_intake import (
     review_suggestion_submit_arguments,
@@ -230,7 +236,6 @@ from orchestrator.task_status import (
 )
 from orchestrator.task_verify_dispatch import LOCAL_RUNNER, TaskVerifyPort, verdict_runner
 from orchestrator.unblock_types import BlockClass, classify_block_reason
-from orchestrator.usage_gate import SessionBudgetExhausted as _SessionBudgetExhausted
 from orchestrator.verify import (
     VerifyInfraError,
     VerifyResult,
@@ -579,11 +584,11 @@ if TYPE_CHECKING:
     from escalation.disposition import ExitKind
     from escalation.models import Escalation, EvidenceEntry, TrainState
     from escalation.queue import EscalationQueue
+    from shared.usage_gate import UsageGate
 
     from orchestrator.merge_lane.types import OperatorMergeCancel
     from orchestrator.merge_lane.worker import InFlightMergeRegistry, MergeOutcome, SoloVerifyResult
     from orchestrator.scheduler import SchedulerFacade
-    from orchestrator.usage_gate import UsageGate
 
 
 # ---------------------------------------------------------------------------
@@ -655,6 +660,7 @@ class _BriefingLike(Protocol):
         *, include_prior_proposals: bool = ...,
         committed_work: list[dict] | None = ...,
         rulings: Sequence[Ruling] = ...,
+        retired_reviews: Sequence[RetiredReview] = ...,
     ) -> str: ...
     async def build_resume_prompt(
         self,
@@ -710,6 +716,7 @@ class _BriefingLike(Protocol):
         *, text_drift: TaskTextDrift | None = ...,
         integrity_refusal: DoneStepIntegrityVerdict | None = ...,
         rulings: Sequence[Ruling] = ...,
+        retired_reviews: Sequence[RetiredReview] = ...,
     ) -> str: ...
     async def build_plan_completion_prompt(
         self, task: dict, partial_plan: dict,
@@ -738,6 +745,8 @@ class _BriefingLike(Protocol):
     ) -> str: ...
 
 logger = logging.getLogger(__name__)
+
+_SuggestionT = TypeVar('_SuggestionT', bound=Mapping[str, Any])
 
 # Reason string used when the fresh-invocation zero-output circuit breaker trips.
 # Mirrors the _inherited_break_info pattern: set by _execute_iterations, consumed
@@ -2968,6 +2977,10 @@ class TaskWorkflow:
                 self.task_id, self._old_plan_base[:8], base_commit[:8],
             )
             self.artifacts.clear_iteration_log()
+
+        # A branch-swapping quarantine stamped since the last dispatch ended
+        # the review record's lineage; retire it before PLAN and the loop seed.
+        retire_quarantined_lineages(self.artifacts)
 
         # ── .task/ contamination guard ────────────────────────────
         # If .task/ slipped into git on main (inherited contamination),
@@ -5640,6 +5653,7 @@ class TaskWorkflow:
                     self.task, self._live_plan() or existing_plan, changed_files,
                     worktree=self.worktree, text_drift=text_drift,
                     rulings=await self._escalation_rulings(ARCHITECT.name, since=confirmed_at),
+                    retired_reviews=self._retired_reviews_since(confirmed_at),
                 )
 
             build_prompt = build_revalidation_prompt
@@ -5691,6 +5705,7 @@ class TaskWorkflow:
                     include_prior_proposals=include_prior_proposals,
                     committed_work=committed_work,
                     rulings=await self._escalation_rulings(ARCHITECT.name, since=None),
+                    retired_reviews=self._retired_reviews_since(None),
                 )
 
             build_prompt = build_fresh_prompt
@@ -6051,6 +6066,7 @@ class TaskWorkflow:
                 worktree=self.worktree, text_drift=text_drift,
                 integrity_refusal=verdict,
                 rulings=await self._escalation_rulings(ARCHITECT.name, since=confirmed_at),
+                retired_reviews=self._retired_reviews_since(confirmed_at),
             )
 
         if outcome := await self._run_architect_for_plan(build_remedy_prompt):
@@ -6232,7 +6248,39 @@ class TaskWorkflow:
                 self.task_id,
             )
             return False
+        if self._retired_reviews_since(plan_confirmed_at(plan)):
+            logger.info(
+                'Task %s: revalidation skip declined — review rounds retired '
+                'by a quarantine await the architect',
+                self.task_id,
+            )
+            return False
         return True
+
+    def _retired_reviews_since(self, since: datetime | None) -> tuple[RetiredReview, ...]:
+        """The quarantine-retired review rounds after *since*, narrowed to this task's lock set.
+
+        Each suggestion the narrowing drops is logged at WARNING. It was filed
+        as a follow-up task (task 2640) only if the parked dispatch's lock set
+        excluded it too; one that a changed lock set moved out of scope was
+        amended on the parked branch and never filed.
+        """
+        if self.artifacts is None:
+            return ()
+        scoped = (self._retired_review_in_scope(review) for review in retired_reviews_since(self.artifacts, since))
+        return tuple(review for review in scoped if review.suggestions)
+
+    def _retired_review_in_scope(self, review: RetiredReview) -> RetiredReview:
+        in_scope = self._suggestions_in_scope(review.suggestions)
+        kept = {id(suggestion) for suggestion in in_scope}
+        for suggestion in review.suggestions:
+            if id(suggestion) not in kept:
+                logger.warning(
+                    'Task %s: retired suggestion at %r from quarantined branch %s falls outside '
+                    'this task\'s lock set; not carried to the architect',
+                    self.task_id, suggestion.get('location'), review.branch,
+                )
+        return replace(review, suggestions=tuple(in_scope))
 
     async def _apply_revalidation_skip(
         self, plan: dict, current_main: str,
@@ -8828,6 +8876,8 @@ class TaskWorkflow:
         # action — call TaskArtifacts.clear_review_counters() (the reset
         # hook) on the re-pend to grant one. Auto-wiring that hook into the
         # scheduler/escalation resume path is out of scope for this module.
+        # The one automatic reset: a branch-swapping quarantine, retired at
+        # dispatch setup by orchestrator/review_lineage.py::retire_quarantined_lineages.
         review_cycle = (
             self.artifacts.get_review_cycles_total() if self.artifacts else 0
         )
@@ -12002,7 +12052,7 @@ class TaskWorkflow:
             )
         return payload
 
-    def _suggestions_in_scope(self, suggestions: list[dict]) -> list[dict]:
+    def _suggestions_in_scope(self, suggestions: Sequence[_SuggestionT]) -> list[_SuggestionT]:
         """Filter suggestions to those whose location falls within a module
         this task already holds a lock for.
 
@@ -12017,13 +12067,13 @@ class TaskWorkflow:
         locked = set(self.modules)
         if not locked:
             logger.warning(
-                'Task %s: empty lock set at amendment filter time; '
+                'Task %s: empty lock set at suggestion scope filter time; '
                 'returning zero in-scope suggestions',
                 self.task_id,
             )
             return []
         depth = self.config.lock_depth
-        in_scope: list[dict] = []
+        in_scope: list[_SuggestionT] = []
         for s in suggestions:
             location = (s.get('location') or '').strip()
             if not location:
@@ -12395,12 +12445,14 @@ class TaskWorkflow:
         the merge in-place instead of requeueing via the scheduler.
         """
         from orchestrator.merge_lane import (
-            PLAN_FILES_NOT_TOUCHED_REASON_PREFIX,
             OperatorMergeCancel,
             WaiterRecord,
         )
         from orchestrator.merge_lane.disposition import MergeFailureDisposition
-        from orchestrator.merge_lane.gates import _check_plan_files_touched_in_branch
+        from orchestrator.merge_lane.gates import (
+            _check_plan_files_touched_in_branch,
+            plan_files_not_touched_reason,
+        )
         from orchestrator.merge_lane.intake import (
             emit_merge_coalesced,
             register_and_enqueue_merge_request,
@@ -12475,10 +12527,18 @@ class TaskWorkflow:
             rc, branch_head, _ = await _run(
                 ['git', 'rev-parse', 'HEAD'], cwd=self.worktree,
             )
+            # The PREFIXED branch: the gate reads the commits a rebase
+            # dropped from it, and the already-landed merge-marker probe
+            # greps for the exact subject `Merge <prefix><id> into main`.
+            # Both production call sites pass `branch_name = self.task_id`
+            # (bare), same as the rebind below — but stripping any prefix
+            # already present before re-adding it makes the derivation
+            # correct for a prefixed caller too, instead of silently
+            # producing `task/task/<id>`.
+            canonical_branch = (
+                f'{self.config.git.branch_prefix}{branch_name.split("/")[-1]}'
+            )
             if rc == 0 and branch_head.strip():
-                canonical_branch = (
-                    f'{self.config.git.branch_prefix}{branch_name.split("/")[-1]}'
-                )
                 own_base = await self._own_work_base()
                 check = await _check_plan_files_touched_in_branch(
                     list(self._task_files),
@@ -12486,6 +12546,7 @@ class TaskWorkflow:
                     branch_head.strip(),
                     self.git_ops,
                     task_id=self.task_id,
+                    branch=canonical_branch,
                 )
                 narrowing_succeeded = False
                 if check.not_touched:
@@ -12577,15 +12638,6 @@ class TaskWorkflow:
                         branch_head.strip(),
                         self.git_ops,
                         task_id=self.task_id,
-                        # The merge-marker probe greps for the exact subject
-                        # `Merge <prefix><id> into main`, so it needs the
-                        # PREFIXED branch.  Both production call sites pass
-                        # `branch_name = self.task_id` (bare), same as the
-                        # rebind below — but stripping any prefix already
-                        # present before re-adding it makes the derivation
-                        # correct for a prefixed caller too, instead of
-                        # silently producing `task/task/<id>` and failing
-                        # closed on a marker that is really there.
                         branch=canonical_branch,
                     )
                     if already_landed is not None:
@@ -12638,6 +12690,7 @@ class TaskWorkflow:
                                 branch_head2.strip(),
                                 self.git_ops,
                                 task_id=self.task_id,
+                                branch=canonical_branch,
                             )
                             if not check.not_touched:
                                 narrowing_succeeded = True
@@ -12651,49 +12704,11 @@ class TaskWorkflow:
                                 if unmeasured is not None:
                                     return unmeasured
                 if check.not_touched:
-                    # Task 3110 — the message is CLASS-SCOPED, because the
-                    # gate's two failure classes are different failures.
-                    # `missing_from_tree` entries do not exist in the branch
-                    # tree at all (renamed away on main, or never created),
-                    # so the touched set was never consulted for them: the
-                    # old unconditional "no commit on the branch touched
-                    # them" was a confident claim about a branch that was
-                    # never tested.  Measured on reify-5196 / esc-5196-22,
-                    # where main relocated crates/tests/*_e2e.rs into
-                    # crates/tests/harness_topo/ and 22 escalations in a row
-                    # told a human the implementation had not delivered —
-                    # while it had delivered exactly what was asked, at the
-                    # file's current name.  The head (prefix + full path
-                    # list) is preserved verbatim: unblock_types
-                    # .classify_block_reason keys off it via startswith.
-                    stale_set = set(check.missing_from_tree)
-                    stale = [e for e in check.not_touched if e in stale_set]
-                    real = [e for e in check.not_touched if e not in stale_set]
-                    parts = [
-                        f'{PLAN_FILES_NOT_TOUCHED_REASON_PREFIX}: '
-                        f'{", ".join(check.not_touched)}. '
-                    ]
-                    if real:
-                        parts.append(
-                            f'The architect declared these files but no commit '
-                            f'on the branch touched them: {", ".join(real)}.  '
-                            f'Implementation has not delivered against the plan.  '
-                        )
-                    if stale:
-                        parts.append(
-                            f'Declared path does not exist in the tree at branch '
-                            f'HEAD (renamed or never created), so the '
-                            f'branch-touched set was not consulted for: '
-                            f'{", ".join(stale)} — investigate the declared '
-                            f'path, not the branch.  '
-                        )
-                    if check.resolved_renames:
-                        pairs = ', '.join(
-                            f'{declared} -> {resolved}'
-                            for declared, resolved in check.resolved_renames.items()
-                        )
-                        parts.append(f'Rename resolution: {pairs}.')
-                    reason = ''.join(parts).strip()
+                    # Tasks 3110 and 4669 — the message is CLASS-SCOPED, because
+                    # a stale path and a commit a rebase dropped are not
+                    # under-delivery; see
+                    # orchestrator/src/orchestrator/merge_lane/gates.py::plan_files_not_touched_reason.
+                    reason = plan_files_not_touched_reason(check)
                     _emit_merge_attempt(
                         self.event_store, self.task_id,
                         OutcomeKind.plan_files_not_touched,

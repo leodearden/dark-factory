@@ -7,11 +7,16 @@ that seam.  Built on stdlib ``http.server`` for the reason
 ``_mock_openai_server.py`` gives: no HTTP-mock library is installed.
 
 Collection meta-ops (create) run one after another under a single lock, as a
-real Qdrant runs them.  A create's latency is set per collection, and it is
-waited out on :attr:`StubQdrantServer.release_event` rather than slept, so a
-test can end the wait early and no handler thread outlives the server.
+real Qdrant runs them.  The latency of a create, of a payload-index create
+(``PUT /collections/{name}/index``), of a point upsert
+(``PUT /collections/{name}/points``) and of a point retrieve
+(``POST /collections/{name}/points``) is set per collection; the latency of a
+collection list (``GET /collections``), which names no collection, is one
+scalar.  Every latency is waited out on :attr:`StubQdrantServer.release_event`
+rather than slept, so a test can end the wait early and no handler thread
+outlives the server.
 
-Binds 127.0.0.1 on port 0, so ``-n auto`` xdist workers cannot collide.
+Binds a loopback address on port 0, so ``-n auto`` xdist workers cannot collide.
 """
 
 from __future__ import annotations
@@ -29,6 +34,12 @@ from urllib.parse import unquote, urlsplit
 #: The server version reported on ``GET /``, which qdrant-client reads for its
 #: client/server compatibility check.
 STUB_SERVER_VERSION = '1.17.1'
+
+#: A loopback address qdrant-client keeps connections alive to.  It turns
+#: keep-alive off for the hosts ``localhost`` and ``127.0.0.1`` only
+#: (``qdrant_client/qdrant_remote.py``), so a stub on the default address never
+#: holds a connection past its request, and nothing is left for a close to release.
+POOLING_LOOPBACK_HOST = '127.0.0.2'
 
 
 def _ok(result: Any) -> dict[str, Any]:
@@ -51,22 +62,35 @@ class StubQdrantServer:
         self,
         *,
         create_delay_s: Mapping[str, float],
+        index_delay_s: Mapping[str, float],
+        upsert_delay_s: Mapping[str, float],
+        retrieve_delay_s: Mapping[str, float],
+        list_collections_delay_s: float,
         preexisting: Iterable[str],
         conflict_on_create: Iterable[str],
         create_status: Mapping[str, int],
     ) -> None:
         self.url = ''
         self.release_event = threading.Event()
-        """Set it to finish every pending and future create without its delay."""
+        """Set it to finish every pending and future delayed request without its delay."""
         self._create_delay_s = dict(create_delay_s)
+        self._index_delay_s = dict(index_delay_s)
+        self._upsert_delay_s = dict(upsert_delay_s)
+        self._retrieve_delay_s = dict(retrieve_delay_s)
+        self._list_collections_delay_s = list_collections_delay_s
         self._conflict_on_create = frozenset(conflict_on_create)
         self._create_status = dict(create_status)
         self._state_lock = threading.Lock()
         self._meta_op_lock = threading.Lock()
         self._create_requests: Counter[str] = Counter()
         self._exists_requests: Counter[str] = Counter()
+        self._upsert_requests: Counter[str] = Counter()
         self._create_bodies: dict[str, list[dict[str, Any]]] = {}
         self._created: dict[str, threading.Event] = {}
+        self._upserted: dict[str, threading.Event] = {}
+        self._open_connections = 0
+        self._collection_lists_in_flight = 0
+        self._index_creates_in_flight: Counter[str] = Counter()
         for name in preexisting:
             self._created_event(name).set()
 
@@ -85,13 +109,49 @@ class StubQdrantServer:
         with self._state_lock:
             return self._exists_requests[name]
 
+    def upserts(self, name: str) -> int:
+        """How many ``PUT /collections/{name}/points`` requests the server has received."""
+        with self._state_lock:
+            return self._upsert_requests[name]
+
+    def open_connections(self) -> int:
+        """How many client connections the server is holding open right now."""
+        with self._state_lock:
+            return self._open_connections
+
+    def collection_lists_in_flight(self) -> int:
+        """How many ``GET /collections`` requests the server is holding unanswered right now."""
+        with self._state_lock:
+            return self._collection_lists_in_flight
+
+    def index_creates_in_flight(self, name: str) -> int:
+        """How many ``PUT /collections/{name}/index`` requests the server is holding unanswered right now."""
+        with self._state_lock:
+            return self._index_creates_in_flight[name]
+
+    def _connection_opened(self) -> None:
+        with self._state_lock:
+            self._open_connections += 1
+
+    def _connection_closed(self) -> None:
+        with self._state_lock:
+            self._open_connections -= 1
+
     def wait_created(self, name: str, timeout: float) -> bool:
         """Block until collection *name* exists server-side; False on timeout."""
         return self._created_event(name).wait(timeout)
 
+    def wait_upserted(self, name: str, timeout: float) -> bool:
+        """Block until an upsert into collection *name* has finished server-side; False on timeout."""
+        return self._upserted_event(name).wait(timeout)
+
     def _created_event(self, name: str) -> threading.Event:
         with self._state_lock:
             return self._created.setdefault(name, threading.Event())
+
+    def _upserted_event(self, name: str) -> threading.Event:
+        with self._state_lock:
+            return self._upserted.setdefault(name, threading.Event())
 
     def _exists(self, name: str) -> bool:
         with self._state_lock:
@@ -106,6 +166,16 @@ class StubQdrantServer:
     def _collection_names(self) -> list[str]:
         with self._state_lock:
             return [name for name, event in self._created.items() if event.is_set()]
+
+    def _list_collections(self) -> tuple[int, dict[str, Any]]:
+        with self._state_lock:
+            self._collection_lists_in_flight += 1
+        try:
+            self.release_event.wait(self._list_collections_delay_s)
+            return 200, _ok({'collections': [{'name': name} for name in self._collection_names()]})
+        finally:
+            with self._state_lock:
+                self._collection_lists_in_flight -= 1
 
     def _create(self, name: str, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         with self._state_lock:
@@ -123,6 +193,27 @@ class StubQdrantServer:
             self._created_event(name).set()
             return 200, _ok(True)
 
+    def _create_index(self, name: str) -> tuple[int, dict[str, Any]]:
+        with self._state_lock:
+            self._index_creates_in_flight[name] += 1
+        try:
+            self.release_event.wait(self._index_delay_s.get(name, 0.0))
+            return 200, _ok({'operation_id': 0, 'status': 'completed'})
+        finally:
+            with self._state_lock:
+                self._index_creates_in_flight[name] -= 1
+
+    def _upsert(self, name: str) -> tuple[int, dict[str, Any]]:
+        with self._state_lock:
+            self._upsert_requests[name] += 1
+        self.release_event.wait(self._upsert_delay_s.get(name, 0.0))
+        self._upserted_event(name).set()
+        return 200, _ok({'operation_id': 0, 'status': 'completed'})
+
+    def _retrieve(self, name: str) -> tuple[int, dict[str, Any]]:
+        self.release_event.wait(self._retrieve_delay_s.get(name, 0.0))
+        return 200, _ok([])
+
     def respond(self, method: str, path: str, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         """Route one request to its canned Qdrant answer."""
         segments = [unquote(part) for part in urlsplit(path).path.split('/') if part]
@@ -130,15 +221,17 @@ class StubQdrantServer:
             case 'GET', []:
                 return 200, {'title': 'qdrant - vector search engine', 'version': STUB_SERVER_VERSION}
             case 'GET', ['collections']:
-                return 200, _ok({'collections': [{'name': name} for name in self._collection_names()]})
+                return self._list_collections()
             case 'GET', ['collections', name, 'exists']:
                 return self._check_exists(name)
             case 'PUT', ['collections', name]:
                 return self._create(name, body)
-            case 'PUT', ['collections', _, 'index']:
-                return 200, _ok({'operation_id': 0, 'status': 'completed'})
-            case 'POST', ['collections', _, 'points']:
-                return 200, _ok([])
+            case 'PUT', ['collections', name, 'index']:
+                return self._create_index(name)
+            case 'PUT', ['collections', name, 'points']:
+                return self._upsert(name)
+            case 'POST', ['collections', name, 'points']:
+                return self._retrieve(name)
         return 404, _error(f'stub has no route for {method} {path}')
 
 
@@ -148,6 +241,16 @@ def _make_handler(state: StubQdrantServer) -> type[BaseHTTPRequestHandler]:
 
         def log_message(self, *args: Any) -> None:
             """Silence the default stderr access log."""
+
+        def setup(self) -> None:
+            super().setup()
+            state._connection_opened()
+
+        def finish(self) -> None:
+            try:
+                super().finish()
+            finally:
+                state._connection_closed()
 
         def _serve(self) -> None:
             length = int(self.headers.get('Content-Length') or 0)
@@ -178,14 +281,23 @@ class _QuietServer(ThreadingHTTPServer):
 @contextmanager
 def stub_qdrant_server(
     *,
+    host: str = '127.0.0.1',
     create_delay_s: Mapping[str, float] | None = None,
+    index_delay_s: Mapping[str, float] | None = None,
+    upsert_delay_s: Mapping[str, float] | None = None,
+    retrieve_delay_s: Mapping[str, float] | None = None,
+    list_collections_delay_s: float = 0.0,
     preexisting: Iterable[str] = (),
     conflict_on_create: Iterable[str] = (),
     create_status: Mapping[str, int] | None = None,
 ) -> Iterator[StubQdrantServer]:
-    """Serve the stub on an ephemeral local port.
+    """Serve the stub on an ephemeral port of loopback address *host*.
 
-    *create_delay_s* is how long a create of each named collection takes.
+    *create_delay_s* is how long a create of each named collection takes, and
+    *index_delay_s*, *upsert_delay_s* and *retrieve_delay_s* how long a
+    payload-index create on, a point upsert into, or a point retrieve from, it
+    takes; a retrieve always answers no points.
+    *list_collections_delay_s* is how long every ``GET /collections`` takes.
     *preexisting* collections exist from the start.  A create of a collection
     in *conflict_on_create* answers 409 AND leaves it created, as when another
     creator wins between an exists check and the create.  A create of a
@@ -194,13 +306,17 @@ def stub_qdrant_server(
     """
     state = StubQdrantServer(
         create_delay_s=create_delay_s or {},
+        index_delay_s=index_delay_s or {},
+        upsert_delay_s=upsert_delay_s or {},
+        retrieve_delay_s=retrieve_delay_s or {},
+        list_collections_delay_s=list_collections_delay_s,
         preexisting=preexisting,
         conflict_on_create=conflict_on_create,
         create_status=create_status or {},
     )
-    httpd = _QuietServer(('127.0.0.1', 0), _make_handler(state))
-    host, port = httpd.server_address[:2]
-    state.url = f'http://{host!s}:{port}'
+    httpd = _QuietServer((host, 0), _make_handler(state))
+    bound_host, port = httpd.server_address[:2]
+    state.url = f'http://{bound_host!s}:{port}'
     thread = threading.Thread(target=httpd.serve_forever, kwargs={'poll_interval': 0.05}, daemon=True)
     thread.start()
     try:

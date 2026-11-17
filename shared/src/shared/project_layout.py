@@ -19,6 +19,7 @@ __all__ = [
     'escalation_queue_dir',
     'known_project_roots',
     'main_checkout_of',
+    'offline_lane_dir',
     'orchestrator_data_dir',
     'park_eviction_requests_db',
     'runs_db',
@@ -27,6 +28,7 @@ __all__ = [
     'scheduler_state_json',
     'startup_failures_json',
     'tasks_db',
+    'verify_logs_dir',
 ]
 
 ESCALATION_QUEUE_RELPATH = 'data/escalations'
@@ -45,6 +47,14 @@ def orchestrator_data_dir(root: StrPath) -> Path:
 
 def agent_transcripts_dir(root: StrPath) -> Path:
     return orchestrator_data_dir(root) / 'agent-transcripts'
+
+
+def offline_lane_dir(root: StrPath) -> Path:
+    return orchestrator_data_dir(root) / 'offline-lane'
+
+
+def verify_logs_dir(root: StrPath) -> Path:
+    return Path(root) / 'data' / 'verify-logs'
 
 
 def runs_db(root: StrPath) -> Path:

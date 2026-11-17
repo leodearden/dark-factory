@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 from escalation.models import Escalation
-from orchestrator.session_registry import (
+from orchestrator.decision_registry import (
     UNKNOWN_QUEUE,
     DecisionRecord,
     list_decisions,

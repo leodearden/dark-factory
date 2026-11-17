@@ -7,6 +7,7 @@ Pure: built over a fixture scheduler snapshot and fixture rows naming
 from __future__ import annotations
 
 import dataclasses
+import sys
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from types import MappingProxyType
@@ -146,18 +147,50 @@ def test_top_counts_ready_tasks_once_per_key_most_wanted_first(wire):
 
 
 def test_each_holder_carries_its_status_in_the_store_pending_served_as_pending(wire):
-    holders = {entry['key']: entry['holder'] for entry in wire['top']}
+    holders = {
+        entry['key']: (entry['holders'], entry['at_holder_limit']) for entry in wire['top']
+    }
     assert holders == {
-        'docs/guide': None,
-        'orch/core': {'task_id': str(PENDING_HOLDER), 'status': 'pending'},
-        'web/ui': {'task_id': str(BUSY_HOLDER), 'status': 'in-progress'},
+        'docs/guide': ([], False),
+        'orch/core': ([{'task_id': str(PENDING_HOLDER), 'status': 'pending'}], True),
+        'web/ui': ([{'task_id': str(BUSY_HOLDER), 'status': 'in-progress'}], True),
     }
 
 
 def test_a_holder_absent_from_the_store_has_no_status():
     inputs = _inputs(scheduler=_fresh(_snapshot(current_holders={'docs/guide': '777'})))
     [docs] = [entry for entry in _built(inputs).top if entry.key == 'docs/guide']
-    assert docs.holder == Holder(task_id='777', status=None)
+    assert docs.holders == (Holder(task_id='777', status=None),)
+
+
+SHARED_DOCS = {
+    'held_by_task': {
+        str(PENDING_HOLDER): ('docs/guide', 'orch/core'),
+        str(BUSY_HOLDER): ('docs/guide', 'web/ui'),
+    },
+    'holder_limits': {'docs/guide': sys.maxsize, 'orch/core': 1, 'web/ui': 1},
+}
+"""Both holders also share ``docs/guide``, a key taking unlimited holders."""
+
+
+def test_every_holder_of_a_shared_key_is_listed_and_the_key_is_not_full():
+    contention = _built(_inputs(scheduler=_fresh(_snapshot(**SHARED_DOCS))))
+    [docs] = [entry.to_wire() for entry in contention.top if entry.key == 'docs/guide']
+    assert docs['holders'] == [
+        {'task_id': str(PENDING_HOLDER), 'status': 'pending'},
+        {'task_id': str(BUSY_HOLDER), 'status': 'in-progress'},
+    ]
+    assert docs['at_holder_limit'] is False
+
+
+def test_a_ready_task_naming_only_a_shared_key_below_its_limit_is_not_counted():
+    contention = _built(_inputs(scheduler=_fresh(_snapshot(**SHARED_DOCS))))
+    assert contention.to_wire()['held_share'] == {
+        'critical': {'ready': 1, 'naming_full_key': 1},
+        'high': {'ready': 2, 'naming_full_key': 1},
+        'medium': {'ready': 2, 'naming_full_key': 1},
+        'low': {'ready': 1, 'naming_full_key': 0},
+    }, 'tasks 4 and 5 want only docs/guide; task 2 still counts through orch/core'
 
 
 def test_top_keeps_at_most_n_keys_ties_broken_by_key():
@@ -192,10 +225,10 @@ def test_snapshot_at_is_the_files_own_stamp_not_the_read_instant(contention, wir
 
 def test_held_share_counts_each_band_of_the_ready_set(wire):
     assert wire['held_share'] == {
-        'critical': {'ready': 1, 'naming_held_key': 1},
-        'high': {'ready': 2, 'naming_held_key': 1},
-        'medium': {'ready': 2, 'naming_held_key': 1},
-        'low': {'ready': 1, 'naming_held_key': 0},
+        'critical': {'ready': 1, 'naming_full_key': 1},
+        'high': {'ready': 2, 'naming_full_key': 1},
+        'medium': {'ready': 2, 'naming_full_key': 1},
+        'low': {'ready': 1, 'naming_full_key': 0},
     }
 
 
@@ -290,14 +323,14 @@ def _breach(contention: Contention, **changes: Any) -> ContentionInvariant:
 
 
 def test_validate_refuses_a_top_longer_than_n(contention):
-    top = tuple(LockKey(f'k{n:02d}', 1, None) for n in range(CONTENTION_TOP_N + 1))
+    top = tuple(LockKey(f'k{n:02d}', 1, (), False) for n in range(CONTENTION_TOP_N + 1))
     assert _breach(contention, top=top) is ContentionInvariant.TOP_LENGTH
 
 
 def test_validate_refuses_an_unsorted_top(contention):
-    top = (LockKey('a', 1, None), LockKey('b', 2, None))
+    top = (LockKey('a', 1, (), False), LockKey('b', 2, (), False))
     assert _breach(contention, top=top) is ContentionInvariant.TOP_ORDER
-    tied = (LockKey('b', 1, None), LockKey('a', 1, None))
+    tied = (LockKey('b', 1, (), False), LockKey('a', 1, (), False))
     assert _breach(contention, top=tied) is ContentionInvariant.TOP_ORDER
 
 

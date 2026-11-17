@@ -31,6 +31,7 @@ from reconciliation.harness_fixtures import (
     open_event_buffer,
     open_journal,
 )
+from reconciliation.orchestrator_lock_fixtures import held_orchestrator_lock
 from reconciliation.remediation_pass_fixtures import (
     finding_citing,
     in_progress_task,
@@ -226,10 +227,12 @@ class TestTheRoutedTargetGateFailsClosedToo:
     """901 is confirmed not live; the finding is routed to 777, which lingers."""
 
     @staticmethod
-    async def _drive_routed(drive, tmp_path, monkeypatch, caplog):
+    async def _drive_routed(drive, tmp_path, caplog):
         orchestrator_root = tmp_path / 'orchestrator-root'
-        monkeypatch.setattr(harness_module, 'is_orchestrator_live_for', lambda _root: True)
-        with caplog.at_level(logging.INFO, logger=_HARNESS_LOGGER):
+        with (
+            held_orchestrator_lock(orchestrator_root),
+            caplog.at_level(logging.INFO, logger=_HARNESS_LOGGER),
+        ):
             await drive(
                 [finding_citing('901', routed_to='777')],
                 [in_progress_task('901'), in_progress_task('777')],
@@ -250,7 +253,7 @@ class TestTheRoutedTargetGateFailsClosedToo:
         _stub_corroboration(monkeypatch, raising_for=frozenset({'777'}))
         _stub_detector(monkeypatch, lingering=frozenset({'777'}))
 
-        routed, [filed] = await self._drive_routed(drive, tmp_path, monkeypatch, caplog)
+        routed, [filed] = await self._drive_routed(drive, tmp_path, caplog)
 
         assert [e.task_id for e in routed] == ['777']
         assert (filed.task_id, filed.liveness_unknown) == ('777', True)
@@ -263,7 +266,7 @@ class TestTheRoutedTargetGateFailsClosedToo:
         _stub_corroboration(monkeypatch)
         _stub_detector(monkeypatch, lingering=frozenset({'777'}))
 
-        routed, [filed] = await self._drive_routed(drive, tmp_path, monkeypatch, caplog)
+        routed, [filed] = await self._drive_routed(drive, tmp_path, caplog)
 
         assert [e.task_id for e in routed] == ['777']
         assert (filed.task_id, filed.liveness_unknown) == ('777', False)

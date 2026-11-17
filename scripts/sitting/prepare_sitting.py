@@ -40,11 +40,13 @@ for _path in (_REPO_ROOT / 'orchestrator' / 'src', _REPO_ROOT / 'scripts'):
 
 from _task_db_scan import discover_project_roots  # noqa: E402
 from escalation.models import SEVERITY_RANK, Escalation  # noqa: E402
-from orchestrator.session_registry import (  # noqa: E402
+from orchestrator.decision_registry import (  # noqa: E402  # debt: task 6760
     DecisionState,
     decisions_dir,
-    fleet_root,
     list_decisions,
+)
+from orchestrator.fleet_files import fleet_root  # noqa: E402  # debt: task 6760
+from orchestrator.session_registry import (  # noqa: E402
     sessions_dir,
 )
 from sitting import brief, gates, inventory, ownership, payloads  # noqa: E402

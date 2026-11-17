@@ -35,7 +35,7 @@ import sys
 import time
 from dataclasses import asdict, dataclass
 
-from fused_memory.maintenance._utils import maintenance_service
+from fused_memory.maintenance._utils import ServiceOpen, maintenance_service
 from fused_memory.utils.task_naming import group_task_node_families
 
 logger = logging.getLogger(__name__)
@@ -296,11 +296,13 @@ async def run_task_family_census(
     config_path: str | None = None,
     group_id: str | None = None,
 ) -> CensusSweep:
-    """Load config, initialize the service, sweep, close resources.
+    """Load config, open the store for reads only, sweep, close resources.
 
     The CLI-callable entrypoint. Lifecycle is delegated entirely to
     ``maintenance_service``, exactly as ``verify_zombie_edges.py`` does, so this
-    module owns no setup or teardown of its own.
+    module owns no setup or teardown of its own. The store is opened with
+    ``ServiceOpen.READS``: a census counts, so it runs no Graphiti startup
+    maintenance and opens no durable queue (task 6835).
 
     Args:
         config_path: Optional path to the YAML config file. When given it is
@@ -310,7 +312,7 @@ async def run_task_family_census(
     Returns:
         A :class:`CensusSweep`.
     """
-    async with maintenance_service(config_path) as (_config, service):
+    async with maintenance_service(config_path, open_as=ServiceOpen.READS) as (_config, service):
         census = TaskFamilyCensus(backend=service.graphiti)
         return await census.sweep(group_id=group_id)
 

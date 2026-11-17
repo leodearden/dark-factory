@@ -38,9 +38,9 @@ from pydantic import ValidationError
 
 from shared.capability_manifest import load_capability_manifest
 
-#: Mirrors fused_memory.server.manifest_stamping._SIDECAR_SUFFIX. Deliberately
-#: re-declared rather than imported — shared/tests must not depend on
-#: fused_memory.
+#: Mirrors shared/src/shared/capability_manifest.py::SIDECAR_SUFFIX. Restated
+#: rather than imported until task 6764 (S25 ι in
+#: plans/review-all-s25-scripts-instruments-prd.md) switches it to the import.
 MANIFEST_SUFFIX = '.capability-manifest.yaml'
 
 #: shared/tests/cross_suite_helpers/capability_manifest_corpus.py ->

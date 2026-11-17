@@ -88,6 +88,7 @@ from df_pytest_isolation import (  # noqa: E402
     _df_deploy_clocks_unwritten,  # noqa: F401  — the binding IS the wiring
     _df_git_ceiling_at_basetemp,  # noqa: F401  — the binding IS the wiring
     _df_git_env_hermetic,  # noqa: F401  — the binding IS the wiring
+    _df_no_mock_derived_stray_dirs,  # noqa: F401  — the binding IS the wiring  # debt: task 6997
     arm_leaked_drain_process_guard,
     arm_usage_gate_sweep_confinement,
     reject_unsafe_basetemp,
@@ -825,7 +826,7 @@ def make_fake_maintenance_service():
     """Factory fixture: returns a callable(mock_cfg, mock_service) -> async context manager."""
     def _factory(mock_cfg, mock_service):
         @asynccontextmanager
-        async def fake(config_path):
+        async def fake(config_path=None, *, config=None, open_as=None):
             yield mock_cfg, mock_service
 
         return fake

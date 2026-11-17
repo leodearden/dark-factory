@@ -373,8 +373,8 @@ test('displayedAgeMs: an unparseable instant yields null, not NaN', () => {
 // datumView — THE render decision. Every shared component delegates here and
 // holds no arm of its own, which is what makes "one datum, one path" a
 // checkable property rather than a slogan: a tile cannot invent a second rule
-// for holes, prefixes, tooltips or ages without the probe in
-// tests/test_datum_components.py noticing.
+// for holes, prefixes, tooltips or ages without render_app_shell.test.mjs's
+// StatTile/Pip/DatumReading render tests noticing.
 // ---------------------------------------------------------------------------
 
 // A formatter that throws if it is ever called. HBarChart's valueText

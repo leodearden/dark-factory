@@ -41,6 +41,7 @@ if TYPE_CHECKING:
     from orchestrator.event_store import EventStore
     from orchestrator.git_ops import GitOps, WorktreeKind
 
+from shared.asyncio_tasks import gather_unwound
 from shared.proc_group import terminate_process_group
 from shared.psi import cpu_some10_or_none, read_psi_sample
 from shared.python_env import without_python_env_selection
@@ -7487,31 +7488,6 @@ def _log_event_channel(label: str, channel: VerifyEventChannel) -> None:
         )
 
 
-_Gathered = TypeVar('_Gathered')
-
-
-async def _gather_unwound(*aws: Awaitable[_Gathered]) -> list[_Gathered]:
-    """``asyncio.gather``, except that it raises only once every child has ended.
-
-    A plain gather raises at its first cancelled or failed child, so a sibling
-    still killing its subprocess would outlive the verify that spawned it.
-    Here, as in a ``TaskGroup``, the other children are cancelled and awaited
-    first; the exception raised is the one the gather raised.  A child already
-    asked to cancel (a cancelled gather asks every child) is not asked again,
-    which would interrupt the kill it is awaiting.
-    """
-    children = [asyncio.ensure_future(aw) for aw in aws]
-    try:
-        return await asyncio.gather(*children)
-    except BaseException:
-        for child in children:
-            if not (isinstance(child, asyncio.Task) and child.cancelling()):
-                child.cancel()
-        if children:
-            await asyncio.wait(children)
-        raise
-
-
 async def run_verification(
     worktree: Path,
     config: OrchestratorConfig,
@@ -8202,7 +8178,7 @@ async def run_verification(
         # `break` below, so it is always bound whenever the loop exits — no
         # pre-loop sentinel scaffolding needed.
         if concurrent:
-            attempt = VerifyAttempt(list(await _gather_unwound(
+            attempt = VerifyAttempt(list(await gather_unwound(
                 _run_or_skip_timed(test_cmd, label=LegSlot.TEST, current_attempt=current_attempt_id),
                 _run_or_skip_timed(lint_cmd, label=LegSlot.LINT, current_attempt=current_attempt_id),
                 _run_or_skip_timed(type_cmd, label=LegSlot.TYPE, current_attempt=current_attempt_id),
@@ -8800,7 +8776,7 @@ async def run_full_verification(
             'Full verification: running %d subprojects in parallel',
             len(module_configs),
         )
-        results = await _gather_unwound(
+        results = await gather_unwound(
             *(
                 run_verification(
                     project_root, config, mc, role=role, max_retries=max_retries,
@@ -9523,7 +9499,7 @@ async def _run_scoped_verification_body(
                             plan_dict, worktree, attempt_id=attempt_id,
                             task_id=task_id, archive_root=archive_root,
                         )
-                        results = await _gather_unwound(*(
+                        results = await gather_unwound(*(
                             _verify_module(mc, _test_scope_kind(plan, mc.prefix)) for mc in scoped
                         ))
                         aggregated = _aggregate_results(list(results))
@@ -9709,7 +9685,7 @@ async def _run_scoped_verification_body(
                         'Verification mode: per-subproject fan-out (%d subprojects)',
                         len(module_configs),
                     )
-                    results = await _gather_unwound(*(
+                    results = await gather_unwound(*(
                         _verify_module(mc) for mc in module_configs
                     ))
                     return _aggregate_results(list(results))
@@ -9804,7 +9780,7 @@ async def _run_scoped_verification_body(
                 plan = None
                 plan_dict = None
                 logger.info('Verification mode: subproject-scoped (%d subprojects)', len(module_configs))
-            results = await _gather_unwound(
+            results = await gather_unwound(
                 *(_verify_module(mc, _test_scope_kind(plan, mc.prefix)) for mc in scoped)
             )
             aggregated = _aggregate_results(list(results))
@@ -11376,7 +11352,7 @@ async def run_node_ids(
         )
 
     if concurrent_groups:
-        group_statuses = await asyncio.gather(*map(run_group, qualified_by_prefix))
+        group_statuses = await gather_unwound(*map(run_group, qualified_by_prefix))
     else:
         group_statuses = [await run_group(prefix) for prefix in qualified_by_prefix]
     statuses: dict[str, NodeIdStatus] = {}

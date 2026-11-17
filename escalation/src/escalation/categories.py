@@ -6,8 +6,9 @@ producer, a live reader, an agent/skill instruction, or a record still pending
 in some queue.
 
 Enforced by :func:`require_registered_category` at ``EscalationQueue.submit``,
-``submit_resolved``, ``has_open_l1`` and ``find_terminal_by_citation``, and by
-the ``escalate_blocker``, ``escalate_info`` and ``promote_to_l2`` tools.
+``submit_resolved``, ``has_open_l1``, ``find_terminal_by_citation`` and
+``newest_terminal_by_task``, and by the ``escalate_blocker``, ``escalate_info``
+and ``promote_to_l2`` tools.
 Rehydrating a stored record is never checked. ``escalation/tests/
 test_category_census.py`` fails verify on a filer passing an unregistered one.
 """

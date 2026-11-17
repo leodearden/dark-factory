@@ -116,8 +116,10 @@ from orchestrator.quarantine_provenance import (
     QuarantineOutcome,
     record_quarantine_provenance,
 )
+from orchestrator.rebase_drops import RebaseDropLedger, run_rebase_reporting_drops
 from orchestrator.recut_ruling import ParkedIncarnation, RecutRuling, RecutRulingViolation
 from orchestrator.script_warnings import log_warnings_despite_success
+from orchestrator.staged_gitlinks import unstage_new_gitlinks
 from orchestrator.teardown import complete_despite_cancellation, path_confirmed_absent
 from orchestrator.tree_removal import remove_tree
 from orchestrator.verify_cancel import (
@@ -9677,12 +9679,20 @@ class GitOps:
         conflicted tree (which may contain literal conflict markers) is
         never snapshotted.  All WIP-save call sites funnel through this
         method, so this single guard covers every one of them.
+
+        Embedded git repositories stay out of the commit: ``--ignore-errors``
+        stops a commit-less one aborting the whole ``git add``, and
+        ``orchestrator/src/orchestrator/staged_gitlinks.py::unstage_new_gitlinks``
+        unstages the gitlink of any other.
         """
         conflicted = await self._detect_unmerged_paths(worktree)
         if conflicted:
             raise WorktreeConflictError(worktree, conflicted)
 
-        await _run(['git', 'add', '-A', '--', '.', ':!.claude'], cwd=worktree)
+        await _run(
+            ['git', 'add', '-A', '--ignore-errors', '--', '.', ':!.claude'], cwd=worktree,
+        )
+        await unstage_new_gitlinks(worktree, _run)
 
         # Check for changes
         rc, _, _ = await _run(['git', 'diff', '--cached', '--quiet'], cwd=worktree)
@@ -10167,18 +10177,19 @@ class GitOps:
         Returns True on success.  On failure, ATTEMPTS a guarded abort and
         returns False — which does NOT imply a clean worktree: aborts fail.
 
+        A commit the rebase drops because the target already carries its
+        change is logged and recorded
+        (``orchestrator/src/orchestrator/rebase_drops.py::RebaseDropLedger``).
+
         Caller must NOT hold ``_merge_lock`` — this is designed to run
         outside the lock so multiple tasks can rebase concurrently in
         their own worktrees.
         """
         target = onto if onto is not None else self.config.main_branch
-        rc, _, err = await _run(
-            ['git', 'rebase', target],
-            cwd=worktree,
-        )
-        if rc != 0:
+        rebased = await run_rebase_reporting_drops(_run, worktree, onto=target)
+        if not rebased.ok:
             await rebase_recovery.guarded_abort('rebase', worktree, _run)
-            logger.info(f'Pre-merge rebase failed in {worktree}: {err}')
+            logger.info(f'Pre-merge rebase failed in {worktree}: {rebased.stderr}')
             return False
         return True
 
@@ -16245,6 +16256,7 @@ class GitOps:
                 f'rename_worktree: git branch -m {full_old} -> {full_new} '
                 f'failed (rc={rc}): {err}'
             )
+        await self._carry_branch_records(full_old, full_new)
 
         logger.info(
             'Renamed worktree %s -> %s and branch %s -> %s',
@@ -16611,6 +16623,7 @@ class GitOps:
             if not await self._rename_branch_back(full_new, full_old) and isinstance(move_error, Exception):
                 raise _ParkedBranchStranded(full_new, move_error) from move_error
             raise
+        await self._carry_branch_records(full_old, full_new)
         return full_new
 
     async def _rename_branch_back(self, parked: str, original: str) -> bool:
@@ -16751,6 +16764,13 @@ class GitOps:
                 f'park_prior_incarnation: git branch -m {prefix}{branch_name} '
                 f'{prefix}{parked_name} failed (rc={rc}): {err}'
             )
+        await self._carry_branch_records(f'{prefix}{branch_name}', f'{prefix}{parked_name}')
+
+    async def _carry_branch_records(self, full_old: str, full_new: str) -> None:
+        """Re-key *full_old*'s stack-base and rebase-drop records to *full_new*,
+        its new name, so a branch re-cut under the old name starts with none."""
+        await self._stack_ledger().move_branch(full_old, full_new)
+        await RebaseDropLedger(self.project_root, _run).move_branch(full_old, full_new)
 
     async def _free_lane_checkout(self, branch_name: str) -> None:
         """Commit WIP on and detach the lane holding ``task/<branch_name>``.

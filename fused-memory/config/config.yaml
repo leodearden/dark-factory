@@ -168,7 +168,6 @@ queue:
 # ─────────────────────────────────────────────────────────────────────────────
 taskmaster:
   project_root: "${PROJECT_ROOT:.}"
-  tool_mode: "all"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # write_journal — RED-TIER / restart-only. Every journal table with a horizon is
@@ -558,10 +557,11 @@ summary_rebuild:
 
 # In-place Mem0 amendment (task 3088) — the update_memory MCP tool, which
 # rewrites a record's content and/or metadata while PRESERVING its Qdrant point
-# id. All five leaves are green-tier hot-reloadable (see OPERATIONS.md §6).
+# id. Every leaf is green-tier hot-reloadable (see OPERATIONS.md §6).
 # Only metadata_patch_allowed_agent_prefixes is active; every commented value
-# below is the shipped default, shown so the knobs are discoverable without
-# reading the schema. Uncomment to change one.
+# below, except the agent_prefix_sanctioned_use placeholder, is the shipped
+# default, shown so the knobs are discoverable without reading the schema.
+# Uncomment to change one.
 mem0_update:
   # Kill switch. false denies every caller on the very next call, allowlisted
   # or not — this is the knob to flip during a runaway-rewrite incident.
@@ -575,12 +575,11 @@ mem0_update:
   #
   # curator- is part of the SCHEMA DEFAULT (ruling 2026-08-12, promoting the
   # 2026-08-11 esc-3524-1 ruling (b) from a per-machine override here to an
-  # all-deployments default): it admits the interactive memory-consolidation
-  # sitting defined by skills/curate-fused-memories, which cannot work
-  # without the grant. Both arms deliberately — gate 3200's retain-and-tag
-  # stamps retained peers via metadata-only patches, so content_amend alone
-  # would be the destructive half without the preserving half. Full
-  # rationale: the Mem0UpdateConfig field descriptions in config/schema.py.
+  # all-deployments default). Both arms deliberately — gate 3200's
+  # retain-and-tag stamps retained peers via metadata-only patches, so
+  # content_amend alone would be the destructive half without the preserving
+  # half. The role each prefix declares is agent_prefix_sanctioned_use below.
+  # Full rationale: the Mem0UpdateConfig field descriptions in config/schema.py.
   # content_amend_allowed_agent_prefixes: ['recon-stage-', 'curator-']
   #
   # link-heal- is owned by plans/write-triage-link-healing-prd.md H1 and task α
@@ -590,6 +589,16 @@ mem0_update:
   # for this arm, so a future change to Mem0UpdateConfig's default
   # metadata_patch_allowed_agent_prefixes must be mirrored here by hand.
   metadata_patch_allowed_agent_prefixes: ['recon-stage-', 'curator-', 'link-heal-']
+  # The role each prefix above declares, rendered into the
+  # Mem0UpdateNotAuthorized refusal for the refusing arm's prefixes. The
+  # shipped default (Mem0UpdateConfig.agent_prefix_sanctioned_use) documents
+  # every prefix on either default allowlist. Setting it here REPLACES that map
+  # wholesale, so restate every entry and add one for any prefix added to
+  # either list. agent_id is self-reported: this makes the norm legible, not
+  # the gate enforceable. Unlike the values above, the placeholder below is
+  # NOT the default and cannot be uncommented as-is: a bare key is YAML null
+  # and fails validation.
+  # agent_prefix_sanctioned_use: {...}  # restate every entry of Mem0UpdateConfig's default
   # Content-amend burst alarm: escalates, never blocks (a hard block would
   # risk a legitimate large consolidation cycle failing mid-run over its own
   # success count). Metadata-only calls do not count toward it.

@@ -4707,7 +4707,8 @@ class TestEveryPassEndsWithOneJournalLine:
 
 
 # ---------------------------------------------------------------------------
-# task 3340 step-11/12: edge-triggered barren-streak escalation
+# task 3340 step-11/12, task 5513: edge-triggered barren-streak escalation on
+# a bounded doubling backoff
 # ---------------------------------------------------------------------------
 
 def _is_streak_escalation(arguments) -> bool:
@@ -4865,8 +4866,9 @@ class TestBarrenStreakEscalation:
     """The LIVE CALLER, so the new probe is not "a probe nobody runs".
 
     nightly.py owns this because it is the only thing that already runs
-    every night. EDGE-triggered (fires on the run where the streak first
-    REACHES the threshold, re-arms only after a productive/quiet run
+    every night. EDGE-triggered (fires on the run where the streak REACHES
+    the threshold and at each later point in
+    trickle_state.BARREN_ESCALATION_MULTIPLES; a productive or quiet run
     resets it) — which sidesteps task 3270's alarm-fatigue debate rather
     than re-opening it, and avoids the one-shot latch's worse failure mode
     that 3270 explicitly rejected.
@@ -4916,7 +4918,8 @@ class TestBarrenStreakEscalation:
         """barren, barren, FAILED, barren — the FOURTH night is the one
         that reaches the threshold. Asserting exactly one streak
         escalation across all four proves the carry-forward cannot
-        double-fire the exact-equality edge trigger."""
+        double-fire the streak escalation: a carried night never lands the
+        streak on a schedule point twice."""
         runner = _NightRunner(tmp_path)
 
         runner.night(13, 'barren')
@@ -5157,23 +5160,25 @@ class TestBarrenStreakEscalation:
         assert runner.recorded()['barren_escalated'] is True
 
 
+def _health_check_posts(runner) -> list:
+    """What the REAL health check posts over *runner*'s recorded night, at
+    the runner's own threshold, with liveness and census probes passing."""
+    posted = []
+    check_trickle_health.run_health_check(
+        project_id='testproj',
+        config_path=runner.config_path,
+        max_barren_runs=runner.max_barren_runs,
+        max_age_hours=_fixture_clock_window_hours(),
+        liveness_runner=lambda project_id, **kwargs: (0, 'OK: ran'),
+        census_runner=lambda project_id, **kwargs: (0, 'OK: no fire'),
+        poster=lambda url, arguments: posted.append(arguments),
+    )
+    return posted
+
+
 class TestANonDefaultThresholdEndToEnd:
     """BOUNDARY ROW 6: a nightly at ``max_barren_runs=5``, the real progress
     probe and the health check agree through the recorded fact."""
-
-    @staticmethod
-    def _health_posts(runner) -> list:
-        posted = []
-        check_trickle_health.run_health_check(
-            project_id='testproj',
-            config_path=runner.config_path,
-            max_barren_runs=5,
-            max_age_hours=_fixture_clock_window_hours(),
-            liveness_runner=lambda project_id, **kwargs: (0, 'OK: ran'),
-            census_runner=lambda project_id, **kwargs: (0, 'OK: no fire'),
-            poster=lambda url, arguments: posted.append(arguments),
-        )
-        return posted
 
     def test_five_barren_nights_escalate_once_and_the_health_check_stays_silent(
         self, tmp_path,
@@ -5192,12 +5197,67 @@ class TestANonDefaultThresholdEndToEnd:
             f'stdout={probe.stdout!r} stderr={probe.stderr!r}'
         )
         assert 'barren_escalated=True' in probe.stderr
-        assert self._health_posts(runner) == []
+        assert _health_check_posts(runner) == []
 
         sixth = runner.night(18, 'barren')
 
         assert sixth.barren_escalated is False
-        assert len(self._health_posts(runner)) == 1
+        assert len(_health_check_posts(runner)) == 1
+
+
+class TestBarrenReescalationBackoff:
+    """A persistent barren streak re-escalates from the nightly at each
+    point of trickle_state.BARREN_ESCALATION_MULTIPLES, and the health
+    check covers the nights between them without double-posting."""
+
+    def test_the_health_check_is_silent_on_a_reescalation_night(self, tmp_path):
+        runner = _NightRunner(tmp_path)
+        for day in (13, 14, 15, 16, 17):
+            runner.night(day, 'barren')
+
+        assert len(_health_check_posts(runner)) == 1, (
+            'night five falls between escalations, so the health check posts'
+        )
+
+        sixth = runner.night(18, 'barren')
+
+        assert sixth.barren_escalated is True
+        assert runner.recorded()['barren_escalated'] is True
+        assert _health_check_posts(runner) == []
+        assert len(_streak_escalations(runner.escalations)) == 2
+
+    def test_a_24_night_sampling_cut_streak_escalates_four_times(self, tmp_path):
+        """The task's own scenario: a streak only the sampling cut causes,
+        which no per-night alarm reports, is re-escalated by the nightly
+        at each point of the backoff, each post naming its own streak."""
+        poster, posted = _capture_poster()
+        results = []
+        for offset in range(24):
+            target_date = date(2026, 7, 1) + timedelta(days=offset)
+            results.append(_run_manual_night(
+                tmp_path,
+                selector=lambda *args, **kwargs: _sample(below_sampling_cut=3),
+                poster=poster,
+                target_date=target_date,
+                now=datetime(2026, 7, 2, 3, 0, tzinfo=UTC) + timedelta(days=offset),
+            ))
+
+        assert [
+            night for night, result in enumerate(results, start=1)
+            if result.barren_escalated
+        ] == [3, 6, 12, 24]
+        assert all(result.exit_code == 0 for result in results)
+        assert _testproj_state()['consecutive_barren_runs'] == 24
+        streak = [arguments for arguments in posted if _is_streak_escalation(arguments)]
+        assert len(streak) == 4
+        assert len(posted) == 4, (
+            'the sampling-cut door has no per-night alarm; only the streak posts'
+        )
+        remedy = trickle_state.BARREN_REMEDIES[trickle_state.BarrenDoor.SAMPLING_CUT]
+        for runs, arguments in zip((3, 6, 12, 24), streak, strict=True):
+            assert f'for {runs} consecutive runs' in arguments['summary']
+            assert f'consecutive_barren_runs={runs}' in arguments['detail']
+            assert remedy in arguments['detail']
 
 
 class TestADeferredNightIsRecordedAsDeferred:
@@ -5673,6 +5733,20 @@ class TestRunScheduledNight:
 
         assert [call['max_barren_runs'] for call in calls] == [7]
 
+    @pytest.mark.parametrize('value', ['0', '-3', 'three'])
+    def test_main_refuses_a_max_barren_runs_below_one(self, monkeypatch, capsys, value):
+        """A threshold below 1 puts no barren streak on the escalation
+        schedule, so it would silently disable the nightly's alarm."""
+        fake, calls = _scripted_run_nightly(_result())
+        monkeypatch.setattr(nightly, 'run_nightly', fake)
+
+        with pytest.raises(SystemExit) as exited:
+            nightly.main(['run', '--project-id', 'proj_a', '--max-barren-runs', value])
+
+        assert exited.value.code == 2
+        assert calls == []
+        assert repr(value) in capsys.readouterr().err
+
     def test_main_fails_when_the_retry_fails(self, monkeypatch):
         fake, calls = _scripted_run_nightly(
             _result(retry_due=(date(2026, 7, 13),)),
@@ -5818,14 +5892,20 @@ def _run_sampled_night(tmp_path, sample, **seams):
     return result, posted
 
 
-def _run_manual_night(tmp_path, *, selector, poster, **seams):
-    """Run one MANUAL night of project 'testproj' drawing its sample from
-    *selector*; its digest builder renders nothing."""
+def _run_manual_night(
+    tmp_path, *, selector, poster,
+    target_date=date(2026, 7, 13),
+    now=datetime(2026, 7, 14, 3, 0, tzinfo=UTC),
+    **seams,
+):
+    """Run one MANUAL night of project 'testproj' for *target_date* on the
+    *now* clock, drawing its sample from *selector*; its digest builder
+    renders nothing."""
     return nightly.run_nightly(
         config_path=_write_config(tmp_path, project_id='testproj'),
         projects_root=tmp_path / 'projects',
-        target_date=date(2026, 7, 13),
-        now=datetime(2026, 7, 14, 3, 0, tzinfo=UTC),
+        target_date=target_date,
+        now=now,
         invoke=lambda prompt, model: pytest.fail('no digest may reach the coder'),
         completion_runner=_passing_completion_runner,
         poster=poster,

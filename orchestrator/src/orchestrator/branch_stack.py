@@ -15,8 +15,14 @@ The record is one git ref per stacked branch under
 :data:`STACK_BASE_REF_NAMESPACE`.  A ref is atomic, survives restarts, is
 shared by every worktree, and keeps a never-landed base reachable.
 
+The ledger's record lifetime (pruning a deleted branch's records, and
+carrying a record across a branch rename) is the shared
+``orchestrator/src/orchestrator/ref_ledger.py`` mechanics.
+
 Layering: this module sits BELOW ``orchestrator/src/orchestrator/git_ops.py``,
-which imports it.  The git runner is therefore injected, exactly as
+which imports it, and above ``orchestrator/src/orchestrator/rebase_drops.py``,
+which it imports so the un-stack rebase reports the commits it drops.  The
+git runner is therefore injected, exactly as
 ``orchestrator/src/orchestrator/rebase_recovery.py::guarded_abort`` receives
 its runner, and nothing here imports git_ops or merge_queue.
 """
@@ -29,28 +35,24 @@ from enum import StrEnum
 from pathlib import Path
 from typing import NamedTuple
 
-from orchestrator.rebase_recovery import AbortRunner, guarded_abort
+from orchestrator.rebase_drops import run_rebase_reporting_drops
+from orchestrator.rebase_recovery import guarded_abort
+from orchestrator.ref_ledger import (
+    GitReadError,
+    GitRunner,
+    git_lines,
+    move_branch_records,
+    prune_orphaned_records,
+)
 
 logger = logging.getLogger(__name__)
 
 STACK_BASE_REF_NAMESPACE = 'refs/dark-factory/stack-base/'
-_BRANCH_REF_NAMESPACE = 'refs/heads/'
 
 STACKED_ON_UNLANDED_BASE_REASON_PREFIX = 'Branch is stacked on an unlanded base'
 
-#: The injected ``(cmd, cwd=...) -> (rc, stdout, stderr)`` runner.  It is the
-#: same callable :func:`orchestrator.rebase_recovery.guarded_abort` is handed,
-#: so one type names both uses.
-GitRunner = AbortRunner
-
-
-class StackInspectionError(RuntimeError):
-    """A git read needed to decide the foreign-commit cut failed."""
-
-    def __init__(self, command: tuple[str, ...], stderr: str) -> None:
-        super().__init__(f'{" ".join(command)} failed: {stderr.strip()}')
-        self.command = command
-        self.stderr = stderr
+#: A git read needed to decide the foreign-commit cut failed.
+StackInspectionError = GitReadError
 
 
 @dataclass(frozen=True)
@@ -100,34 +102,20 @@ class StackBaseLedger:
         """Drop every record whose branch no longer exists; return those branches.
 
         A record lives no longer than its branch, however the branch ended.
-        Never raises: a failed listing prunes nothing.
+        A failed git command is logged, not raised.
         """
-        rc, out, err = await self.run(
-            [
-                'git', 'for-each-ref', '--format=%(refname)',
-                STACK_BASE_REF_NAMESPACE, _BRANCH_REF_NAMESPACE,
-            ],
-            cwd=self.repo_root,
+        return await prune_orphaned_records(
+            self.run, self.repo_root, STACK_BASE_REF_NAMESPACE, branch_of=lambda key: key,
         )
-        if rc != 0:
-            logger.warning('Could not list stack-base records: %s', err.strip())
-            return ()
-        orphans = _orphaned_branches(set(out.split()))
-        for full_branch in orphans:
-            await self.forget(full_branch)
-        return orphans
 
+    async def move_branch(self, old_branch: str, new_branch: str) -> None:
+        """Re-key *old_branch*'s record to *new_branch*, which it was renamed to.
 
-def _orphaned_branches(refnames: set[str]) -> tuple[str, ...]:
-    recorded = (
-        refname.removeprefix(STACK_BASE_REF_NAMESPACE)
-        for refname in refnames
-        if refname.startswith(STACK_BASE_REF_NAMESPACE)
-    )
-    return tuple(sorted(
-        full_branch for full_branch in recorded
-        if f'{_BRANCH_REF_NAMESPACE}{full_branch}' not in refnames
-    ))
+        A failed git command is logged, not raised.
+        """
+        await move_branch_records(
+            self.run, self.repo_root, self.ref_for(old_branch), self.ref_for(new_branch),
+        )
 
 
 async def foreign_commit_cut(
@@ -145,10 +133,10 @@ async def foreign_commit_cut(
     Returns None when the oldest commit is already the branch's own.  Raises
     :class:`StackInspectionError` when any git read fails.
     """
-    ordered = await _git_lines(
+    ordered = await git_lines(
         run, repo_root, 'rev-list', '--reverse', '--topo-order', f'{main_ref}..{tip}',
     )
-    foreign = set(await _git_lines(run, repo_root, 'rev-list', f'{main_ref}..{base}'))
+    foreign = set(await git_lines(run, repo_root, 'rev-list', f'{main_ref}..{base}'))
     foreign |= await _patch_equivalent_to_base(
         run, repo_root, tip=tip, main_ref=main_ref, base=base,
     )
@@ -158,7 +146,7 @@ async def foreign_commit_cut(
 async def _patch_equivalent_to_base(
     run: GitRunner, repo_root: Path, *, tip: str, main_ref: str, base: str,
 ) -> set[str]:
-    cherry = await _git_lines(run, repo_root, 'cherry', base, tip, main_ref)
+    cherry = await git_lines(run, repo_root, 'cherry', base, tip, main_ref)
     return {line.split()[1] for line in cherry if line.startswith('-')}
 
 
@@ -169,14 +157,6 @@ def _end_of_prefix(ordered: list[str], foreign: set[str]) -> str | None:
             break
         cut = sha
     return cut
-
-
-async def _git_lines(run: GitRunner, repo_root: Path, *args: str) -> list[str]:
-    command = ('git', *args)
-    rc, out, err = await run(list(command), cwd=repo_root)
-    if rc != 0:
-        raise StackInspectionError(command, err)
-    return [line.strip() for line in out.splitlines() if line.strip()]
 
 
 async def base_owners(run: GitRunner, repo_root: Path, base: str) -> tuple[str, ...]:
@@ -322,15 +302,17 @@ async def rebase_own_delta(
 ) -> OwnDeltaRebase:
     """Replay the commits after *cut* onto *onto*, in *worktree*.
 
+    A commit the replay drops because *onto* already carries its change is
+    logged and recorded (see ``orchestrator/src/orchestrator/rebase_drops.py``).
     On failure the conflicted paths are collected BEFORE the guarded abort,
     because the abort erases them.
     """
-    rc, _, err = await run(['git', 'rebase', '--onto', onto, cut], cwd=worktree)
-    if rc == 0:
+    rebased = await run_rebase_reporting_drops(run, worktree, onto=onto, upstream=cut)
+    if rebased.ok:
         return OwnDeltaRebase(ok=True, conflicted_paths=(), stderr='')
     conflicted = await _conflicted_paths(run, worktree)
     await guarded_abort('rebase', worktree, run)
-    return OwnDeltaRebase(ok=False, conflicted_paths=conflicted, stderr=err)
+    return OwnDeltaRebase(ok=False, conflicted_paths=conflicted, stderr=rebased.stderr)
 
 
 async def _conflicted_paths(run: GitRunner, worktree: Path) -> tuple[str, ...]:

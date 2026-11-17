@@ -608,8 +608,8 @@ class TestEscalation:
         assert len(posted) == 1
 
     def test_posts_once_the_nightly_has_gone_silent(self, tmp_path):
-        """The nightly escalates once per streak; night four records that it
-        did not, so this probe takes over."""
+        """Night four falls between the nightly's escalation points and
+        records that it did not escalate, so this probe takes over."""
         _seed_state('dark_factory', outcomes=['barren'] * 4, escalated_on=(2,))
 
         result, posted = self._posted(

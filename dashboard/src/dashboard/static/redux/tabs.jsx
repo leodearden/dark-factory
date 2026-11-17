@@ -209,20 +209,15 @@ function DepsCell({ task }) {
 // harness in this repo can run. This function only draws the answer: the
 // placeholder carrying its reason, or the existing ChipList untouched.
 function LocksCell({ task, datum }) {
-  const { buildSchedLockInfo, disambiguateLabels } = window.DF_SCHED_UTILS || {};
+  const { buildSchedLockInfo, disambiguateLabels, lockHeldAgainst } = window.DF_SCHED_UTILS || {};
   const lockInfo = buildSchedLockInfo
     ? buildSchedLockInfo(task, DF.SCHEDULER)
     : { rawTaskId: String(task.id).split('/T-').pop(), lockSet: [], moduleByPath: new Map() };
   const cell = locksCellState(datum, lockInfo);
   if (cell.placeholder) return <span className="chip-empty" title={cell.title || undefined}>{cell.placeholder}</span>;
   const { rawTaskId, lockSet, moduleByPath } = lockInfo;
-  const sorted = [...lockSet].sort((a, b) => {
-    const ma = moduleByPath.get(a), mb = moduleByPath.get(b);
-    const ha = ma && ma.holder, hb = mb && mb.holder;
-    const blockedA = ha && ha !== rawTaskId ? 0 : 1;
-    const blockedB = hb && hb !== rawTaskId ? 0 : 1;
-    return blockedA - blockedB; // blocked-by-other first
-  });
+  const blockedRank = path => (lockHeldAgainst(moduleByPath.get(path), rawTaskId, task.project) ? 0 : 1);
+  const sorted = [...lockSet].sort((a, b) => blockedRank(a) - blockedRank(b)); // blocked-by-other first
   const labelMap = disambiguateLabels ? disambiguateLabels(sorted) : null;
   return <ChipList items={sorted} renderChip={(modPath) => {
     const m = moduleByPath.get(modPath);

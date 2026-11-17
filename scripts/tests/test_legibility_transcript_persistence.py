@@ -10,8 +10,9 @@ transcript (the "session ran, no transcript" regression).
 Every test injects a tmp ``fleet_root`` (so ``session_registry`` never
 touches the real ``~/.claude`` tree), a tmp ``projects_root``, a FIXED
 ``now``, a written fixture ``legibility.yaml``, and a fake ``poster`` — no
-real ``~/.claude``, no live escalation server, and no dependency on the
-separately-landing ``CLAUDE_CODE_FORCE_SESSION_PERSISTENCE`` preventer.
+real ``~/.claude`` and no live escalation server. Every preventer-guard test
+reads a fixture spawn script except the one that pins the guard against the
+committed ``skills/spawn/spawn-claude.sh``.
 """
 from __future__ import annotations
 
@@ -1148,8 +1149,8 @@ def test_run_check_healthy_no_escalation(tmp_path):
 
 def test_run_check_preventer_guard_toggles_force_persistence_ok(tmp_path):
     # A tmp spawn-script fixture MISSING the token -> force_persistence_ok False;
-    # a fixture WITH the token -> True. Fixtures only — never the real
-    # committed spawn-claude.sh (which does not carry the token on this branch).
+    # a fixture WITH the token -> True. Fixtures only, so the test controls
+    # the verdict in both directions.
     fleet, projects, config_path = _build_fleet_and_projects(tmp_path, include_lost=False)
 
     missing_token = tmp_path / "spawn-no-token.sh"
@@ -1193,6 +1194,31 @@ def test_main_healthy_returns_zero(tmp_path):
         "--lookback-hours", "48",
     ])
     assert rc == 0
+
+
+def test_main_check_preventer_passes_on_committed_spawn_script(tmp_path, capsys):
+    assert mod.DEFAULT_SPAWN_SCRIPT.is_file(), (
+        f"--check-preventer's default spawn script {mod.DEFAULT_SPAWN_SCRIPT} "
+        "does not exist; the guard would read '' and fail safe on every run"
+    )
+    fleet, projects, config_path = _build_fleet_and_projects(tmp_path, include_lost=False)
+
+    rc = mod.main([
+        "--config", str(config_path),
+        "--fleet-root", str(fleet),
+        "--projects-root", str(projects),
+        "--lookback-hours", "48",
+        "--check-preventer",
+    ])
+
+    captured = capsys.readouterr()
+    assert rc == 0 and "preventer guard present" in captured.out, (
+        "the --check-preventer guard no longer recognises the "
+        "CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1 export in the committed "
+        "skills/spawn/spawn-claude.sh, so an operator's --check-preventer run "
+        f"would false-alarm (rc={rc}, stdout={captured.out!r}, "
+        f"stderr={captured.err!r})"
+    )
 
 
 def test_run_check_enriches_escalation_detail_with_preventer_verdict(tmp_path):

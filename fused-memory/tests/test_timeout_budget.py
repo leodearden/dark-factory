@@ -5,7 +5,7 @@ import asyncio
 
 import pytest
 
-from fused_memory.backends.timeout_budget import await_within
+from fused_memory.backends.timeout_budget import await_within, socket_timeout_outlasting
 
 
 async def _resolve(value):
@@ -48,3 +48,19 @@ async def test_non_timeout_exception_passes_through_unwrapped() -> None:
         await await_within(_raise(original), store='Mem0', op='get', budget_s=5.0)
 
     assert excinfo.value is original
+
+
+@pytest.mark.parametrize(
+    ('budgets_s', 'expected'),
+    [
+        pytest.param((30.0, 120.0), 121, id='widest-budget-governs'),
+        pytest.param((120.0, 30.0), 121, id='order-free'),
+        pytest.param((5.5,), 6, id='fractional-rounds-up'),
+        pytest.param((0.5, 0.25), 1, id='sub-second-never-zero'),
+        pytest.param((120.0,), 121, id='integral-budget-is-exceeded-not-equalled'),
+    ],
+)
+def test_socket_timeout_is_the_smallest_whole_second_above_every_budget(
+    budgets_s: tuple[float, ...], expected: int,
+) -> None:
+    assert socket_timeout_outlasting(*budgets_s) == expected

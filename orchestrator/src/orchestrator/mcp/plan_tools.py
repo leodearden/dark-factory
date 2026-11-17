@@ -2118,11 +2118,6 @@ _MARKUP_RESIDUE_ANCHOR_TASK_ID = 'plan-tools-markup-residue'
 _MARKUP_STORM_ANCHOR_TASK_ID = 'plan-tools-markup-storm'
 
 _MARKUP_UNATTRIBUTED_SUBJECT = markup_sink.MARKUP_UNATTRIBUTED_SUBJECT
-_MARKUP_RESIDUE_ERROR_TYPE = markup_sink.MARKUP_RESIDUE_ERROR_TYPE
-_MARKUP_STORM_ERROR_TYPE = markup_sink.MARKUP_STORM_ERROR_TYPE
-_MARKUP_STORM_CATEGORY = markup_sink.MARKUP_STORM_CATEGORY
-_MARKUP_STORM_LEVEL = markup_sink.MARKUP_STORM_LEVEL
-_ESCALATION_FALLBACK_CATEGORY = markup_sink.ESCALATION_FALLBACK_CATEGORY
 
 #: plan-tools' declaration of its own channel. Every field is stated here
 #: rather than defaulted in ``markup_sink``: adding a server must be a decision
@@ -2147,8 +2142,6 @@ MARKUP_SINK_SPEC = markup_sink.MarkupSinkSpec(
         "the burst window's own lines (jq or grep '\"subject_task_id\"')"
     ),
 )
-
-_ESCALATION_FALLBACK_SUMMARY = MARKUP_SINK_SPEC.fallback_summary
 
 
 def _markup_project_root(worktree: Path) -> Path | None:

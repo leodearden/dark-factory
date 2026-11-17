@@ -775,16 +775,15 @@ async def test_default_suite_runner_builds_run_offline_deep_command(tmp_path: Pa
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures('account_pool_in_env')
 async def test_default_run_command_builds_idle_niced_sh_c_invocation(tmp_path: Path):
     """The default command_runner seam launches `nice -n19 ionice -c3 sh -c <cmd>`.
 
     A bare pytest does not self-nice (unlike the reify scripts), so the
     generic runner applies the idle nice/ionice prefix itself (D4). cwd is
-    <worktree>/<cmd.cwd>; env overlays DF_VERIFY_ROLE=offline onto a full
-    os.environ copy; rc + the decoded <=2000-char tail are returned.
-
-    Step 11 (RED): _default_run_command / the command_runner seam do not
-    exist — must fail before impl.
+    <worktree>/<cmd.cwd>; env overlays DF_VERIFY_ROLE=offline onto os.environ
+    minus the CLAUDE_OAUTH_TOKEN_* account pool; rc + the decoded
+    <=2000-char tail are returned.
     """
     from orchestrator.config import LaneCommand
 
@@ -817,7 +816,6 @@ async def test_default_run_command_builds_idle_niced_sh_c_invocation(tmp_path: P
     assert kwargs['cwd'] == str(wt_path / 'fused-memory'), (
         'cwd must be <worktree>/<cmd.cwd>'
     )
-    assert kwargs['env']['DF_VERIFY_ROLE'] == 'offline'
     _assert_lane_env(kwargs['env'])
     assert Path(kwargs['stdout'].name) == lane_pass.output_path(Phase.DETECT)
     assert kwargs['stderr'] == asyncio.subprocess.STDOUT
@@ -967,9 +965,11 @@ def _assert_lane_env(env: dict[str, str]) -> None:
     assert env['DF_VERIFY_ROLE'] == 'offline'
     pool = [k for k in env if k.startswith('CLAUDE_OAUTH_TOKEN_')]
     assert pool == [], f'the lane env must not carry the CLAUDE_OAUTH_TOKEN_* account pool: {pool!r}'
-    for key, value in os.environ.items():
-        if key != 'DF_VERIFY_ROLE' and not key.startswith('CLAUDE_OAUTH_TOKEN_'):
-            assert env.get(key) == value, f'the lane env must overlay os.environ (missing/altered {key!r})'
+    altered = sorted(
+        k for k in os.environ
+        if k != 'DF_VERIFY_ROLE' and not k.startswith('CLAUDE_OAUTH_TOKEN_') and env.get(k) != os.environ[k]
+    )
+    assert altered == [], f'the lane env must overlay os.environ (missing/altered: {altered!r})'
 
 
 @pytest.mark.asyncio

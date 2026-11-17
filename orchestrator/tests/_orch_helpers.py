@@ -211,9 +211,10 @@ UNDER_LOAD_HEADROOM_FACTOR = 8
 # runs tighter than a bare local `pytest` -- and a slow test's marker must
 # clear the one that gates its merge.
 #
-# A LITERAL: marks read it at import, and the guard's _SANCTIONED_TIMEOUT_NAMES
-# and TestSanctionedNameMirrors resolve it only through literal arithmetic.
-# Held to the yaml by
+# A LITERAL: marks read it at import,
+# _sanctioned_timeout_names.py::SANCTIONED_TIMEOUT_NAMES imports it, and
+# test_timeout_marker_inversion_guard.py::TestSanctionedNameMirrors re-derives
+# it from this line through literal arithmetic only.  Held to the yaml by
 # test_timeout_marker_inversion_guard.py::TestVerifyCliBudgetConstant, whose
 # docstring records why that pin is deliberately loud on a retune.
 VERIFY_CLI_PER_TEST_TIMEOUT = 300
@@ -248,7 +249,7 @@ VERIFY_CLI_PER_TEST_TIMEOUT = 300
 # the same arithmetic in test_merge_queue_deep_integration_gate.py -- a module
 # that cannot import a test module without coupling the two suites' collection
 # order.  Pinned, along with a guard against a second copy growing back, by
-# test_timeout_marker_inversion_guard.py::TestSpawnBoundSizingModel.
+# test_spawn_budget_guard.py::TestSpawnBoundSizingModel.
 MEASURED_SPAWN_LATENCY_SECS = 4.71
 
 
@@ -311,14 +312,14 @@ class SpawnBudget(NamedTuple):
 
     A BUNDLE, never a second definition: every number here is read from the
     module-level scalar that defines it.  Those scalars stay the single home
-    of each value, so a marker, ``_SANCTIONED_TIMEOUT_NAMES`` and this
+    of each value, so a marker, ``_sanctioned_timeout_names.py::SANCTIONED_TIMEOUT_NAMES`` and this
     descriptor cannot drift into three readings of one figure.  The constant
     names are spelled as strings because a name cannot refer to itself.
 
     THE STRINGS ARE RESOLVED BACK, so a rename cannot leave a stale name in a
     failure message: every descriptor's two names are looked up on this module
     and compared against the scalars it carries
-    (test_timeout_marker_inversion_guard.py::TestSpawnBudgetVerdict::
+    (test_spawn_budget_guard.py::TestSpawnBudgetVerdict::
     test_each_descriptors_constant_names_resolve_to_its_numbers).  Also pinned
     there is the property the messages depend on -- that each caller's verdict
     names ITS OWN pair and neither of the other's
@@ -335,7 +336,7 @@ class SpawnBudget(NamedTuple):
 # (test_merge_queue_deep_integration_gate.py) is ALLOWED to cost, and the
 # per-test timeout derived from it.  This comment is the SINGLE home of that
 # derivation; the class points HERE rather than restating it, and
-# test_timeout_marker_inversion_guard.py::TestDeepGateSceneBudget re-derives
+# test_spawn_budget_guard.py::TestDeepGateSceneBudget re-derives
 # the second constant from the first at runtime so neither literal can drift.
 #
 # MEASURED, 2026-09-14 at main 99ab62335a, by counting
@@ -447,7 +448,7 @@ DEEP_GATE_SCENE_BUDGET = SpawnBudget(
 # test_merge_queue_deep_landing.py are ALLOWED to cost, and the per-test
 # timeout derived from it.  This comment is the SINGLE home of that
 # derivation; those classes point HERE rather than restating it, and
-# test_timeout_marker_inversion_guard.py::TestDeepLandingSceneBudget
+# test_spawn_budget_guard.py::TestDeepLandingSceneBudget
 # re-derives the third constant from the first two at runtime so no literal
 # can drift from its inputs.
 #
@@ -2144,6 +2145,10 @@ def git_env_with_ceiling(cwd: Path) -> dict[str, str]:
 #: pinned against either path must hold identically under both.
 ORCH_DIR = Path(__file__).resolve().parents[1]
 ORCH_PYPROJECT = ORCH_DIR / 'pyproject.toml'
+#: The per-module merge-verify config whose ``test_command`` and
+#: ``verify_command_timeout_secs`` the timeout guards read, resolved like its
+#: siblings from this file and never from the CWD.
+ORCH_YAML = ORCH_DIR / 'orchestrator.yaml'
 
 #: Environment keys stripped from a pytest/git subprocess probe by
 #: :func:`sanitized_probe_env`. Each one can silently turn a probe's result

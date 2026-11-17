@@ -42,10 +42,10 @@ from orchestrator.workflow_types import classify_failure
 if TYPE_CHECKING:
     from escalation.queue import EscalationQueue
     from shared.cost_store import CostStore
+    from shared.usage_gate import UsageGate
 
     from orchestrator.event_store import EventStore
     from orchestrator.mcp_lifecycle import McpLifecycle
-    from orchestrator.usage_gate import UsageGate
 
 logger = logging.getLogger(__name__)
 

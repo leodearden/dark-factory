@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+from orchestrator import decision_registry as dr
 from orchestrator import session_registry as sr
 
 
@@ -38,7 +39,7 @@ def _make_decision(**overrides):
         'filed_at': '2026-07-07T00:00:00+00:00',
     }
     fields.update(overrides)
-    return sr.DecisionRecord(**fields)
+    return dr.DecisionRecord(**fields)
 
 
 class TestMergeWeightEdits:

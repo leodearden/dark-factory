@@ -314,24 +314,39 @@ test('signalCell: a leaf_not_in_store mark names the bound id of a leaf the stor
 
 // ── (f) The contention line ──
 
-test('contentionEntryText: a held key names its holder and the holder\'s store status', () => {
-  const text = contentionEntryText({ key: 'src/m', wanted_by_ready: 3, holder: { task_id: '1', status: 'pending' } });
+test('contentionEntryText: a key held to its limit names its holder and the holder\'s store status', () => {
+  const text = contentionEntryText({
+    key: 'src/m', wanted_by_ready: 3, holders: [{ task_id: '1', status: 'pending' }], at_holder_limit: true,
+  });
   assert.equal(text, 'src/m · 3 ready want it · held by #1 (pending)');
 });
 
 test('contentionEntryText: a holder absent from the store says so, never a blank status', () => {
-  const text = contentionEntryText({ key: 'src/m', wanted_by_ready: 1, holder: { task_id: '9', status: null } });
+  const text = contentionEntryText({
+    key: 'src/m', wanted_by_ready: 1, holders: [{ task_id: '9', status: null }], at_holder_limit: true,
+  });
   assert.equal(text, 'src/m · 1 ready want it · held by #9 (not in the store)');
 });
 
 test('contentionEntryText: an unheld key says no holder', () => {
-  assert.equal(contentionEntryText({ key: 'src/n', wanted_by_ready: 2, holder: null }), 'src/n · 2 ready want it · no holder');
+  const text = contentionEntryText({ key: 'src/n', wanted_by_ready: 2, holders: [], at_holder_limit: false });
+  assert.equal(text, 'src/n · 2 ready want it · no holder');
 });
 
-test('heldShareText: each served band in served order, its held-key share of its ready tasks', () => {
-  const share = { medium: { ready: 16, naming_held_key: 0 }, high: { ready: 2, naming_held_key: 1 } };
-  assert.equal(heldShareText(share), 'ready naming a held key: medium 0 of 16 · high 1 of 2');
-  assert.equal(heldShareText({}), 'ready naming a held key: no ready tasks');
+test('contentionEntryText: a shared key names its first holder, how many more, and that it is below its limit', () => {
+  const text = contentionEntryText({
+    key: 'OPERATIONS.md',
+    wanted_by_ready: 4,
+    holders: [{ task_id: '1', status: 'in-progress' }, { task_id: '2', status: 'pending' }],
+    at_holder_limit: false,
+  });
+  assert.equal(text, 'OPERATIONS.md · 4 ready want it · held by #1 (in-progress) and 1 more · below its holder limit');
+});
+
+test('heldShareText: each served band in served order, its share naming a key at its holder limit', () => {
+  const share = { medium: { ready: 16, naming_full_key: 0 }, high: { ready: 2, naming_full_key: 1 } };
+  assert.equal(heldShareText(share), 'ready naming a key at its holder limit: medium 0 of 16 · high 1 of 2');
+  assert.equal(heldShareText({}), 'ready naming a key at its holder limit: no ready tasks');
 });
 
 test('neverStartedText: the served count of the served total, with the served ids', () => {

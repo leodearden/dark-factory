@@ -6,7 +6,7 @@ import copy
 import dataclasses
 import json
 import logging
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -208,16 +208,23 @@ class ResultStore:
             return []
         return sorted(p for p in self.directory.glob(f'*{_SUFFIX}') if p.is_file())
 
-    def paths_matching(self, task_id: str, config_name: str) -> list[Path]:
-        matches = []
+    def _named_cells(self) -> Iterator[tuple[Path, CellName]]:
         for path in self.cell_paths():
             try:
                 name = CellName.from_path(path)
             except ValueError:
                 continue
-            if (name.task_id, name.config_name) == (task_id, config_name):
-                matches.append(path)
-        return matches
+            yield path, name
+
+    def paths_for_task(self, task_id: str) -> list[Path]:
+        return [path for path, name in self._named_cells() if name.task_id == task_id]
+
+    def paths_matching(self, task_id: str, config_name: str) -> list[Path]:
+        return [
+            path
+            for path, name in self._named_cells()
+            if (name.task_id, name.config_name) == (task_id, config_name)
+        ]
 
     def exists(self, task_id: str, config_name: str) -> bool:
         return bool(self.paths_matching(task_id, config_name))

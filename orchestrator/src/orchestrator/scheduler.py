@@ -7646,6 +7646,7 @@ class Scheduler:
             overrides=overrides,
             current_holders=one_holder_per_key(held_by_task),
             held_by_task=held_by_task,
+            holder_limits=self.lock_table.snapshot_holder_limits(),
             lock_depth=self.config.lock_depth,
             is_paused=self.is_paused,
             pause_reason=self.pause_reason,

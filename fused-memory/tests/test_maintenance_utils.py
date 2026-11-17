@@ -88,7 +88,7 @@ class TestMaintenanceService:
 
         with (
             patch('fused_memory.maintenance._utils.FusedMemoryConfig', return_value=mock_cfg),
-            patch('fused_memory.maintenance._utils.MemoryService', return_value=mock_service),
+            patch('fused_memory.services.memory_service.MemoryService', return_value=mock_service),
         ):
             async with maintenance_service(None) as (cfg, svc):
                 assert cfg is mock_cfg
@@ -106,7 +106,7 @@ class TestMaintenanceService:
 
         with (
             patch('fused_memory.maintenance._utils.FusedMemoryConfig', return_value=mock_cfg),
-            patch('fused_memory.maintenance._utils.MemoryService', return_value=mock_service),
+            patch('fused_memory.services.memory_service.MemoryService', return_value=mock_service),
         ):
             async with maintenance_service(None):
                 call_order.append('body')
@@ -123,7 +123,7 @@ class TestMaintenanceService:
 
         with (
             patch('fused_memory.maintenance._utils.FusedMemoryConfig', return_value=mock_cfg),
-            patch('fused_memory.maintenance._utils.MemoryService', return_value=mock_service),
+            patch('fused_memory.services.memory_service.MemoryService', return_value=mock_service),
         ):
             async with maintenance_service(None):
                 pass
@@ -140,7 +140,7 @@ class TestMaintenanceService:
 
         with (
             patch('fused_memory.maintenance._utils.FusedMemoryConfig', return_value=mock_cfg),
-            patch('fused_memory.maintenance._utils.MemoryService', return_value=mock_service),
+            patch('fused_memory.services.memory_service.MemoryService', return_value=mock_service),
             pytest.raises(RuntimeError, match='body error'),
         ):
             async with maintenance_service(None):
@@ -159,7 +159,7 @@ class TestMaintenanceService:
 
         with (
             patch('fused_memory.maintenance._utils.FusedMemoryConfig', return_value=mock_cfg),
-            patch('fused_memory.maintenance._utils.MemoryService', return_value=mock_service),
+            patch('fused_memory.services.memory_service.MemoryService', return_value=mock_service),
             pytest.raises(RuntimeError, match='original'),
         ):
             async with maintenance_service(None):
@@ -175,7 +175,7 @@ class TestMaintenanceService:
                 'fused_memory.maintenance._utils.FusedMemoryConfig',
                 side_effect=RuntimeError('config failed'),
             ),
-            patch('fused_memory.maintenance._utils.MemoryService') as mock_svc_cls,
+            patch('fused_memory.services.memory_service.MemoryService') as mock_svc_cls,
             pytest.raises(RuntimeError, match='config failed'),
         ):
             async with maintenance_service(None):
@@ -199,7 +199,7 @@ class TestMaintenanceService:
 
         with (
             patch('fused_memory.maintenance._utils.FusedMemoryConfig', side_effect=capture_config),
-            patch('fused_memory.maintenance._utils.MemoryService', return_value=mock_service),
+            patch('fused_memory.services.memory_service.MemoryService', return_value=mock_service),
         ):
             async with maintenance_service('/tmp/custom.yaml'):
                 pass
@@ -216,7 +216,7 @@ class TestMaintenanceService:
 
         with (
             patch('fused_memory.maintenance._utils.FusedMemoryConfig', return_value=MagicMock()),
-            patch('fused_memory.maintenance._utils.MemoryService', return_value=mock_service),
+            patch('fused_memory.services.memory_service.MemoryService', return_value=mock_service),
         ):
             async with maintenance_service('/tmp/custom.yaml'):
                 pass
@@ -233,9 +233,183 @@ class TestMaintenanceService:
 
         with (
             patch('fused_memory.maintenance._utils.FusedMemoryConfig', return_value=MagicMock()),
-            patch('fused_memory.maintenance._utils.MemoryService', return_value=mock_service),
+            patch('fused_memory.services.memory_service.MemoryService', return_value=mock_service),
         ):
             async with maintenance_service(None):
                 assert os.environ.get('CONFIG_PATH') == '/existing/config.yaml'
 
         assert os.environ.get('CONFIG_PATH') == '/existing/config.yaml'
+
+
+# ---------------------------------------------------------------------------
+# TestServiceOpen: the opening modes and the config= overload
+# ---------------------------------------------------------------------------
+
+
+def _recording_service(calls: list[str], *, failing: str | None = None) -> AsyncMock:
+    """An AsyncMock service recording initialize / initialize_for_reads / close in *calls*.
+
+    When *failing* names an opening method, that method records itself and raises.
+    """
+    service = AsyncMock()
+
+    def recorder(name: str):
+        def record(*args, **kwargs):
+            calls.append(name)
+            if name == failing:
+                raise RuntimeError(f'{name} failed')
+
+        return record
+
+    for name in ('initialize', 'initialize_for_reads', 'close'):
+        setattr(service, name, AsyncMock(side_effect=recorder(name)))
+    return service
+
+
+def _as_an_unchecked_caller(**kwargs):
+    """Enter maintenance_service the way a caller outside pyright's gate can."""
+    from fused_memory.maintenance._utils import maintenance_service
+
+    return maintenance_service(**kwargs)
+
+
+class TestServiceOpen:
+    """maintenance_service opens the service as its open_as mode says, and closes it once."""
+
+    @pytest.mark.asyncio
+    async def test_default_opening_awaits_initialize_only(self):
+        from fused_memory.maintenance._utils import maintenance_service
+
+        calls: list[str] = []
+        service = _recording_service(calls)
+        config = MagicMock(spec_set=pydantic_spec(FusedMemoryConfig))
+
+        with patch('fused_memory.services.memory_service.MemoryService', return_value=service):
+            async with maintenance_service(config=config):
+                assert calls == ['initialize']
+
+        service.initialize.assert_awaited_once_with()
+        service.initialize_for_reads.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_reads_opening_awaits_initialize_for_reads_only(self):
+        from fused_memory.maintenance._utils import ServiceOpen, maintenance_service
+
+        calls: list[str] = []
+        service = _recording_service(calls)
+        config = MagicMock(spec_set=pydantic_spec(FusedMemoryConfig))
+
+        with patch('fused_memory.services.memory_service.MemoryService', return_value=service):
+            async with maintenance_service(config=config, open_as=ServiceOpen.READS):
+                assert calls == ['initialize_for_reads']
+
+        service.initialize_for_reads.assert_awaited_once_with()
+        service.initialize.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_none_opening_awaits_nothing_and_yields_the_constructed_service(self):
+        from fused_memory.maintenance._utils import ServiceOpen, maintenance_service
+
+        calls: list[str] = []
+        service = _recording_service(calls)
+        config = MagicMock(spec_set=pydantic_spec(FusedMemoryConfig))
+
+        with patch(
+            'fused_memory.services.memory_service.MemoryService', return_value=service,
+        ) as service_cls:
+            async with maintenance_service(config=config, open_as=ServiceOpen.NONE) as (_, svc):
+                assert calls == []
+                assert svc is service
+
+        service_cls.assert_called_once_with(config)
+        service.initialize.assert_not_awaited()
+        service.initialize_for_reads.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('open_as', ['full', 'reads', 'none'])
+    async def test_close_is_awaited_once_on_a_normal_exit(self, open_as):
+        from fused_memory.maintenance._utils import ServiceOpen, maintenance_service
+
+        calls: list[str] = []
+        service = _recording_service(calls)
+
+        with patch('fused_memory.services.memory_service.MemoryService', return_value=service):
+            async with maintenance_service(config=MagicMock(), open_as=ServiceOpen(open_as)):
+                pass
+
+        service.close.assert_awaited_once_with()
+        assert calls[-1] == 'close'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('open_as', 'opening'),
+        [('full', 'initialize'), ('reads', 'initialize_for_reads')],
+    )
+    async def test_a_failed_opening_still_closes_and_propagates_its_own_error(
+        self, open_as, opening,
+    ):
+        from fused_memory.maintenance._utils import ServiceOpen, maintenance_service
+
+        calls: list[str] = []
+        service = _recording_service(calls, failing=opening)
+
+        with (
+            patch('fused_memory.services.memory_service.MemoryService', return_value=service),
+            pytest.raises(RuntimeError, match=f'{opening} failed'),
+        ):
+            async with maintenance_service(config=MagicMock(), open_as=ServiceOpen(open_as)):
+                calls.append('body')
+
+        assert calls == [opening, 'close']
+
+    @pytest.mark.asyncio
+    async def test_a_given_config_is_used_untouched(self, monkeypatch):
+        from fused_memory.maintenance._utils import maintenance_service
+
+        monkeypatch.setenv('CONFIG_PATH', '/existing/config.yaml')
+        config = MagicMock(spec_set=pydantic_spec(FusedMemoryConfig))
+        service = _recording_service([])
+
+        with (
+            patch('fused_memory.maintenance._utils.FusedMemoryConfig') as config_cls,
+            patch(
+                'fused_memory.services.memory_service.MemoryService', return_value=service,
+            ) as service_cls,
+        ):
+            async with maintenance_service(config=config) as (cfg, svc):
+                assert cfg is config
+                assert svc is service
+                assert os.environ.get('CONFIG_PATH') == '/existing/config.yaml'
+
+        config_cls.assert_not_called()
+        service_cls.assert_called_once_with(config)
+        assert os.environ.get('CONFIG_PATH') == '/existing/config.yaml'
+
+    @pytest.mark.asyncio
+    async def test_both_config_sources_are_rejected_before_construction(self):
+        from fused_memory.maintenance._utils import maintenance_service
+
+        with (
+            patch('fused_memory.services.memory_service.MemoryService') as service_cls,
+            pytest.raises(ValueError, match='config_path') as excinfo,
+        ):
+            async with maintenance_service('/tmp/custom.yaml', config=MagicMock()):
+                pytest.fail('the body must not run')
+
+        assert 'config=' in str(excinfo.value)
+        assert '/tmp/custom.yaml' in str(excinfo.value)
+        service_cls.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_an_unknown_opening_mode_is_rejected_before_construction(self):
+
+        with (
+            patch('fused_memory.maintenance._utils.FusedMemoryConfig') as config_cls,
+            patch('fused_memory.services.memory_service.MemoryService') as service_cls,
+            pytest.raises(ValueError, match='write'),
+        ):
+            async with _as_an_unchecked_caller(open_as='write'):
+                pytest.fail('the body must not run')
+
+        config_cls.assert_not_called()
+        service_cls.assert_not_called()

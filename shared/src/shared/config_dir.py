@@ -11,11 +11,12 @@ from __future__ import annotations
 import atexit
 import json
 import logging
+import os
 import re
 import shutil
 import tempfile
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +25,15 @@ from shared.proc_liveness import pid_alive
 logger = logging.getLogger(__name__)
 
 _HOME_CLAUDE = Path.home() / '.claude'
+
+
+def ambient_config_dir(environ: Mapping[str, str] = os.environ) -> Path:
+    """The config dir a Claude CLI child invoked with no ``config_dir`` writes its transcript under.
+
+    ``invoke_claude_agent`` builds that child's env from ``agent_subprocess_env``,
+    which inherits ``CLAUDE_CONFIG_DIR``; unset or empty means the CLI default.
+    """
+    return Path(environ['CLAUDE_CONFIG_DIR']) if environ.get('CLAUDE_CONFIG_DIR') else _HOME_CLAUDE
 
 # Files to symlink from ~/.claude/ into the per-task config dir.
 # Provides settings/hooks without duplicating config.

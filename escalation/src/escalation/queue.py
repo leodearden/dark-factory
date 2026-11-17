@@ -614,7 +614,8 @@ def read_escalation_for_scan(
     ``queue.py::EscalationQueue.get_by_task``,
     ``queue.py::EscalationQueue.get_pending`` (which also backs
     ``dismiss_all_pending``, so the startup L0 sweep inherits the fix),
-    ``queue.py::EscalationQueue.find_terminal_by_citation``,
+    ``queue.py::EscalationQueue.newest_terminal_by_task`` (which also backs
+    ``find_terminal_by_citation``),
     ``sweep.py::reap_loose_archive_files``, and BOTH of ``sweep.py::sweep``'s
     reads -- the root file, and the ARCHIVE copy its reconciliation branch
     compares that file against.  The second one is not a glob-then-read but an
@@ -675,7 +676,7 @@ def read_escalation_for_scan(
     reproduces each module's pre-existing behaviour exactly: queue.py's
     ``(JSONDecodeError, KeyError, TypeError)`` does not match it, so it still
     propagates at ``get_by_task`` / ``get_pending`` /
-    ``find_terminal_by_citation``; sweep.py's tuple carries a bare
+    ``newest_terminal_by_task``; sweep.py's tuple carries a bare
     ``ValueError`` and does match it, so both sweep sites count it as
     unparsable, warn once, and continue the pass.  Hard-coding
     ``except UnicodeDecodeError`` instead would silently overturn the queue-side
@@ -1298,13 +1299,34 @@ class EscalationQueue:
         ``find_dedupe_parent`` falsy-key convention.  An absent identity is not
         an identity, and suppressing on one would collapse unrelated findings.
 
+        The scan itself, and why it is targeted, is ``newest_terminal_by_task``.
+
+        A *category* outside ``escalation.categories.EscalationCategory`` raises
+        ``UnregisteredEscalationCategory``.
+        """
+        require_registered_category(category)
+        if not citation_sha:
+            return None
+        return self.newest_terminal_by_task(
+            task_id, category, lambda esc: esc.citation_sha == citation_sha,
+        )
+
+    def newest_terminal_by_task(
+        self, task_id: str, category: str, matches: Callable[[Escalation], bool],
+    ) -> Escalation | None:
+        """Newest TERMINAL record of *task_id* and *category* that *matches* accepts, or None.
+
+        A PURE READ.  Terminal means ``resolved`` or ``dismissed``; a pending
+        record is never returned, whatever *matches* says.  The caller states
+        only its own identity rule in *matches*; newest is by ``resolved_at``.
+
         Cost — why the TARGETED per-task glob (``esc-{task_id}-*.json`` over
         the queue root plus ``_iter_archive_paths``, the shape
         ``_recover_seq_from_disk`` already uses) rather than
-        ``get_by_task``'s full-archive ``esc-*.json`` rglob: this runs on the
-        REJECT path, which is exactly the path that recurs every tick in the
-        storm case being fixed, over an archive shared across 7+ projects.  An
-        O(whole-archive) parse per tick would be the wrong bound.
+        ``get_by_task``'s full-archive ``esc-*.json`` rglob: callers run it on
+        paths that recur every tick or cycle in the storm case they suppress,
+        over an archive shared across 7+ projects.  An O(whole-archive) parse
+        per tick would be the wrong bound.
 
         The ``.json`` suffix is load-bearing for the same three reasons
         ``_recover_seq_from_disk`` lists: it excludes the
@@ -1318,8 +1340,6 @@ class EscalationQueue:
         ``UnregisteredEscalationCategory``.
         """
         require_registered_category(category)
-        if not citation_sha:
-            return None
 
         pattern = f'esc-{task_id}-*.json'
         newest: Escalation | None = None
@@ -1328,7 +1348,7 @@ class EscalationQueue:
             self.queue_dir.glob(pattern), self._iter_archive_paths(pattern),
         ):
             esc, reason = read_escalation_for_scan(
-                path, context='queue.find_terminal_by_citation',
+                path, context='queue.newest_terminal_by_task',
             )
             if reason != 'ok' or esc is None:
                 continue
@@ -1337,16 +1357,14 @@ class EscalationQueue:
                 continue
             if esc.category != category:
                 continue
-            if esc.citation_sha != citation_sha:
-                continue
-            if esc.status not in ('resolved', 'dismissed'):
+            if esc.status not in ('resolved', 'dismissed') or not matches(esc):
                 continue
             # Malformed stamps sort OLDEST (never dropped, never displacing a
             # well-formed newer match) and are logged loudly, not swallowed.
             ts, _ = parse_timestamp_or_warn(
                 esc.resolved_at,
                 fallback=datetime.min.replace(tzinfo=UTC),
-                context='queue.find_terminal_by_citation',
+                context='queue.newest_terminal_by_task',
             )
             # Strictly-newer displaces, so a TIE keeps the incumbent — and the
             # queue root is scanned first, matching get_by_task's "queue_dir

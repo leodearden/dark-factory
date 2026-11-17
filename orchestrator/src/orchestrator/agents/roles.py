@@ -876,11 +876,8 @@ partition it tried and the heuristic-13 symptom each candidate hit, or none.
 ALREADY_DONE_COMMIT_SEARCH = "git log main --reverse --format='%H %s' -S '<symbol>' -- <path>"
 
 
-ARCHITECT = AgentRole(
-    name='architect',
-    system_prompt="""\
-You are a TDD architect. Your job is to analyze a task and produce a detailed, structured implementation plan.
-""" + BASH_CAPABLE_ROLE_PREAMBLE + """
+# The architect's plan-tools call recipe; its one home, carried by ARCHITECT.system_prompt.
+ARCHITECT_PLAN_TOOLS_RECIPE = """
 ## Your Output
 
 Build the plan using the plan-tools MCP tools. Do NOT write plan.json directly.
@@ -899,7 +896,14 @@ Build the plan using the plan-tools MCP tools. Do NOT write plan.json directly.
    low on budget or turns. A plan with no `confirm_plan()` call is treated as
    incomplete and will NOT advance to execution (a later session may resume and
    finish it, but this run's effort is wasted).
+"""
 
+
+ARCHITECT = AgentRole(
+    name='architect',
+    system_prompt="""\
+You are a TDD architect. Your job is to analyze a task and produce a detailed, structured implementation plan.
+""" + BASH_CAPABLE_ROLE_PREAMBLE + ARCHITECT_PLAN_TOOLS_RECIPE + """
 ## Rules
 
 1. **Read before planning.** Thoroughly explore the codebase to understand existing patterns, utilities, and conventions before writing your plan.
