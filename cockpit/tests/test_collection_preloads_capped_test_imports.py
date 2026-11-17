@@ -130,3 +130,17 @@ def test_collecting_the_module_loads_what_its_capped_tests_import(test_file: Pat
         f'collecting {test_file.name} leaves these function-local imports a cold third-party import '
         'to pay inside a timeout cap; import them at module scope'
     )
+
+
+def test_the_replay_resolves_a_sibling_helper_the_way_collection_does(tmp_path: Path) -> None:
+    suite = tmp_path / 'suite'
+    suite.mkdir()
+    (suite / '_sibling_helper.py').write_text('VALUE = 1\n')
+    test_file = suite / 'test_uses_sibling.py'
+    test_file.write_text('from _sibling_helper import VALUE\n')
+    elsewhere = tmp_path / 'elsewhere'
+    elsewhere.mkdir()
+
+    result = _replay_after_collection_in_fresh_interpreter(test_file, [], cwd=elsewhere)
+
+    assert result.returncode == 0, result.stderr
