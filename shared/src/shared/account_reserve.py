@@ -52,8 +52,11 @@ __all__ = [
     'refuses_account',
     'resolve_work_class',
     'schedule_drift',
+    'served_details',
     'wait_end_for_lease',
-    'work_class_details',
+    'wait_end_without_lease',
+    'wait_ended_details',
+    'wait_started_details',
 ]
 
 
@@ -273,16 +276,72 @@ def wait_end_for_lease(
     return ReserveWaitEnd.ADMITTED
 
 
-def work_class_details(work_class: WorkClass, *, unclassified: bool) -> dict[str, object]:
-    """A work class as the JSON details of the reserve's wait and served events."""
+def wait_end_without_lease(
+    config: ReserveConfig,
+    open_accounts: Collection[str],
+    failed_accounts: Collection[str],
+    work_class: WorkClass,
+    now: datetime,
+) -> ReserveWaitEnd | None:
+    """Why a waiting caller that selection could not serve leaves the wait, or None if it stays.
+
+    ``open_accounts`` is as for :func:`refusal`; ``failed_accounts`` names the capped accounts and
+    those failing authentication. An open account other than the reserve, one this caller's scope
+    cannot use, ends the wait as account_opened; the reserve failed, as reserve_unusable. Otherwise
+    the reserve is open or its own probe is in flight, which does not end a wait (PRD §7 B8): the
+    caller stays while the rule refuses it.
+    """
+    now = _as_utc(now)
+    if any(name != config.account for name in open_accounts):
+        return ReserveWaitEnd.ACCOUNT_OPENED
+    if config.account in failed_accounts:
+        return ReserveWaitEnd.RESERVE_UNUSABLE
+    if refuses_account(config, config.account, work_class, now):
+        return None
+    return ReserveWaitEnd.RELEASED if config.in_release_window(now) else ReserveWaitEnd.ADMITTED
+
+
+def _work_class_fields(work_class: WorkClass) -> dict[str, object]:
     return {
         'kind': work_class.kind.value,
         'role': work_class.role,
         'project_id': work_class.project_id,
         'tier': work_class.tier,
         'task_id': work_class.task_id,
+    }
+
+
+def wait_started_details(
+    work_class: WorkClass, refused: ReserveRefusal, *, unclassified: bool
+) -> dict[str, object]:
+    """The JSON details of ``reserve_wait_started``."""
+    return {
+        'account': refused.account,
+        **_work_class_fields(work_class),
+        'release_at': refused.release_at.isoformat(),
         'unclassified': unclassified,
     }
+
+
+def wait_ended_details(
+    work_class: WorkClass,
+    refused: ReserveRefusal,
+    *,
+    unclassified: bool,
+    waited_secs: float,
+    ended_by: ReserveWaitEnd,
+) -> dict[str, object]:
+    """The JSON details of ``reserve_wait_ended``: the started shape, the class as last read."""
+    return {
+        **wait_started_details(work_class, refused, unclassified=unclassified),
+        'waited_secs': round(waited_secs, 1),
+        'ended_by': ended_by.value,
+    }
+
+
+def served_details(work_class: WorkClass, *, cost_usd: float | None) -> dict[str, object]:
+    """The JSON details of ``reserve_served``."""
+    return {**_work_class_fields(work_class), 'cost_usd': cost_usd}
 
 
 DRIFT_TOLERANCE = timedelta(minutes=30)

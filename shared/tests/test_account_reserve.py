@@ -35,8 +35,11 @@ from shared.account_reserve import (
     refuses_account,
     resolve_work_class,
     schedule_drift,
+    served_details,
     wait_end_for_lease,
-    work_class_details,
+    wait_end_without_lease,
+    wait_ended_details,
+    wait_started_details,
 )
 from shared.config_models import UsageCapConfig
 
@@ -639,29 +642,99 @@ class TestConfigEventDetails:
         }
 
 
-class TestWorkClassDetails:
-    def test_a_task_class_is_recorded_with_every_key(self) -> None:
-        details = work_class_details(LOW_TASK, unclassified=False)
+class TestWaitEndWithoutLease:
+    """A waiting caller selection could not serve: max-h is the reserve, max-d another account."""
+
+    def test_another_account_open_means_an_account_opened(self) -> None:
+        end = wait_end_without_lease(reserve_config(), ['max-d'], [], LOW_TASK, GATE_WEDNESDAY)
+
+        assert end is ReserveWaitEnd.ACCOUNT_OPENED
+
+    @pytest.mark.parametrize(
+        'open_accounts',
+        [pytest.param([], id='nothing-open'), pytest.param(['max-h'], id='reserve-open')],
+    )
+    def test_a_refused_caller_stays_while_the_reserve_is_open_or_probing(
+        self, open_accounts: list[str]
+    ) -> None:
+        end = wait_end_without_lease(reserve_config(), open_accounts, [], LOW_TASK, GATE_WEDNESDAY)
+
+        assert end is None
+
+    def test_the_reserve_failed_means_reserve_unusable(self) -> None:
+        end = wait_end_without_lease(reserve_config(), [], ['max-h'], LOW_TASK, GATE_WEDNESDAY)
+
+        assert end is ReserveWaitEnd.RESERVE_UNUSABLE
+
+    def test_an_open_account_outranks_a_failed_reserve(self) -> None:
+        end = wait_end_without_lease(
+            reserve_config(), ['max-d'], ['max-h'], LOW_TASK, GATE_WEDNESDAY
+        )
+
+        assert end is ReserveWaitEnd.ACCOUNT_OPENED
+
+    def test_a_caller_no_longer_refused_has_been_admitted_or_released(self) -> None:
+        config = reserve_config()
+
+        assert wait_end_without_lease(config, [], [], HIGH_TASK, GATE_WEDNESDAY) is (
+            ReserveWaitEnd.ADMITTED
+        )
+        assert wait_end_without_lease(config, [], [], LOW_TASK, GATE_IN_RELEASE) is (
+            ReserveWaitEnd.RELEASED
+        )
+
+
+LOW_TASK_FIELDS: dict[str, object] = {
+    'kind': 'task',
+    'role': 'implementer',
+    'project_id': 'dark_factory',
+    'tier': 'low',
+    'task_id': '7',
+}
+REFUSED = ReserveRefusal(account='max-h', release_at=GATE_RELEASE_AT)
+
+
+class TestEventDetails:
+    def test_a_wait_start_names_the_class_the_reserve_and_the_release(self) -> None:
+        details = wait_started_details(LOW_TASK, REFUSED, unclassified=False)
 
         assert details == {
-            'kind': 'task',
-            'role': 'implementer',
-            'project_id': 'dark_factory',
-            'tier': 'low',
-            'task_id': '7',
+            **LOW_TASK_FIELDS,
+            'account': 'max-h',
+            'release_at': '2026-11-15T09:00:00+00:00',
             'unclassified': False,
         }
         assert type(details['kind']) is str
         assert json.loads(json.dumps(details)) == details
 
-    def test_an_unclassified_caller_is_recorded_as_background(self) -> None:
-        details = work_class_details(resolve_work_class(None), unclassified=True)
+    def test_an_unclassified_caller_waits_as_background(self) -> None:
+        details = wait_started_details(resolve_work_class(None), REFUSED, unclassified=True)
 
-        assert details == {
+        assert {key: details[key] for key in LOW_TASK_FIELDS} == {
             'kind': 'background',
             'role': None,
             'project_id': None,
             'tier': None,
             'task_id': None,
-            'unclassified': True,
         }
+        assert details['unclassified'] is True
+
+    def test_a_wait_end_adds_the_time_waited_and_the_exit(self) -> None:
+        details = wait_ended_details(
+            LOW_TASK,
+            REFUSED,
+            unclassified=False,
+            waited_secs=12.345,
+            ended_by=ReserveWaitEnd.RELEASED,
+        )
+
+        assert details == {
+            **wait_started_details(LOW_TASK, REFUSED, unclassified=False),
+            'waited_secs': 12.3,
+            'ended_by': 'released',
+        }
+        assert json.loads(json.dumps(details)) == details
+
+    def test_a_served_call_names_the_class_and_its_cost_only(self) -> None:
+        assert served_details(LOW_TASK, cost_usd=1.25) == {**LOW_TASK_FIELDS, 'cost_usd': 1.25}
+        assert served_details(LOW_TASK, cost_usd=None)['cost_usd'] is None

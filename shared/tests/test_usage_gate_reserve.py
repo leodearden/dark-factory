@@ -39,7 +39,7 @@ from shared.cost_store import CostStore
 from shared.invocation_outcome import OK, AuthFailed, CapHit
 from shared.testing import make_gate_mock
 from shared.testing_virtual_clock import virtual_clock_test
-from shared.usage_gate import AccountLease, InvokeSlot, PoolFrozen, UsageGate
+from shared.usage_gate import AccountLease, AccountState, InvokeSlot, PoolFrozen, UsageGate
 
 ACCOUNTS = ('max-d', 'max-e', 'max-f', 'max-g', 'max-b', 'max-c', 'max-h')
 RESERVE = 'max-h'
@@ -111,8 +111,13 @@ def make_reserve_gate(
     tokens = {token_env(name): f'fake-token-{name}' for name in ACCOUNTS}
     with patch.dict(os.environ, tokens):
         gate = UsageGate(config, cost_store=cost_store, reserve_clock=clock)
-    gate._run_probe = AsyncMock(return_value=True)
+    stub_probe(gate, lambda _: True)
     return gate
+
+
+def stub_probe(gate: UsageGate, answer: Callable[[AccountState], bool]) -> None:
+    """Stand *answer* in for the resume probe: the kit's one write of that private seam."""
+    gate._run_probe = AsyncMock(side_effect=answer)
 
 
 def lease_only(gate: UsageGate, name: str) -> AccountLease:
@@ -607,7 +612,13 @@ LOW_WAIT_DETAILS: dict[str, object] = {
 
 
 class TestReserveWait:
-    """B2: a refused caller waits without freezing the pool; others are served meanwhile."""
+    """B2: a refused caller waits without freezing the pool; others are served meanwhile.
+
+    Nothing public reads ``_open`` in a way a reserve wait could disturb: ``is_paused`` and
+    ``wait_for_open``'s fast path read account phases, and every wait on ``_open`` follows a
+    selection that found no account open. So "the wait never clears ``_open``" holds by
+    construction, and these tests assert only the PRD's public signal of it, ``is_paused``.
+    """
 
     async def test_a_refused_caller_waits_and_an_admitted_one_is_served(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture
@@ -680,14 +691,29 @@ class TestReserveWaitDeadline:
         assert gate.capped_account_names == SIX_CAPPED
         assert gate.reserve_waiters == 0
 
-    async def test_park_false_raises_at_once(self, tmp_path: Path) -> None:
-        gate, _ = refused_state(tmp_path)
+    @pytest.mark.parametrize(
+        ('park', 'max_wait_secs'),
+        [
+            pytest.param(False, None, id='park-false'),
+            pytest.param(True, 0.0, id='spent-allowance'),
+        ],
+    )
+    async def test_no_allowance_raises_at_once_and_records_no_wait(
+        self, tmp_path: Path, park: bool, max_wait_secs: float | None
+    ) -> None:
+        gate, store = refused_state(tmp_path)
 
         with pytest.raises(PoolFrozen) as raised:
-            await asyncio.wait_for(gate.before_invoke(work_class=LOW, park=False), timeout=1)
+            await asyncio.wait_for(
+                gate.before_invoke(work_class=LOW, park=park, max_wait_secs=max_wait_secs),
+                timeout=1,
+            )
 
         assert raised.value.reserved_account == RESERVE
         assert gate.capped_account_names == SIX_CAPPED
+        assert gate.reserve_waiters == 0
+        assert await events(store, 'reserve_wait_started') == []
+        assert await events(store, 'reserve_wait_ended') == []
 
 
 class TestReserveWaitRouting:
@@ -788,6 +814,27 @@ class TestReserveWaitWakes:
         assert ended['ended_by'] == 'admitted'
 
     @virtual_clock_test
+    async def test_b8_a_repoll_during_the_reserves_probe_keeps_the_same_wait(
+        self, tmp_path: Path
+    ) -> None:
+        gate, store = refused_state(tmp_path, probe_slot_hold_secs=3600)
+        cap(gate, RESERVE, resets_at=WEDNESDAY)
+        await gate.wait_for_open(timeout=0)
+        waiter = asyncio.create_task(gate.before_invoke(work_class=LOW))
+        await let_run()
+
+        lease = await gate.before_invoke(work_class=HIGH)
+        assert lease is not None and lease.name == RESERVE
+        await asyncio.sleep(301)
+
+        assert gate.probe_in_flight_account_names == (RESERVE,)
+        assert not waiter.done()
+        assert gate.reserve_waiters == 1
+        assert await events(store, 'reserve_wait_ended') == []
+        await cancel(waiter)
+        await gate.shutdown()
+
+    @virtual_clock_test
     async def test_b14_a_refused_scoped_caller_takes_the_reserve_wait(
         self, tmp_path: Path
     ) -> None:
@@ -877,6 +924,30 @@ class TestTransitionsWakeTheWait:
         assert await events(store, 'reserve_wait_ended') == []
         await cancel(waiter)
 
+    async def test_b14_a_scope_capped_account_opening_sends_the_waiter_to_the_scope_wait(
+        self, tmp_path: Path
+    ) -> None:
+        store = make_mock_cost_store()
+        gate = make_reserve_gate(
+            tmp_path, clock=FakeClock(), cost_store=store, wait_for_reset=True
+        )
+        cap_all_but(gate, 'max-d', RESERVE)
+        cap(gate, 'max-d', scope=SCOPE, resets_at=datetime.now(UTC) + timedelta(hours=1))
+        cap(gate, 'max-d', resets_at=soon())
+
+        waiter = asyncio.create_task(gate.before_invoke(SCOPE, work_class=LOW))
+        await let_run()
+        assert gate.reserve_waiters == 1
+
+        await eventually(lambda: gate.reserve_waiters == 0)
+
+        [(_, ended)] = await events(store, 'reserve_wait_ended')
+        assert ended['ended_by'] == 'account_opened'
+        assert not waiter.done()
+        assert gate.is_paused is False
+        await cancel(waiter)
+        await gate.shutdown()
+
     async def test_b20_the_reserve_failing_sends_the_waiter_to_the_all_capped_path(
         self, tmp_path: Path
     ) -> None:
@@ -897,8 +968,9 @@ class TestTransitionsWakeTheWait:
     async def test_b10_when_the_reserve_reopens_only_the_admitted_caller_takes_it(
         self, tmp_path: Path
     ) -> None:
+        """``is_paused`` is the PRD's public signal that ``_open`` is untouched (TestReserveWait)."""
         gate = make_reserve_gate(tmp_path, clock=FakeClock(), wait_for_reset=True)
-        gate._run_probe = AsyncMock(side_effect=lambda acct: acct.name == RESERVE)
+        stub_probe(gate, lambda acct: acct.name == RESERVE)
         cap_all_but(gate, RESERVE)
         cap(gate, RESERVE, resets_at=soon())
         paused_reason = gate.paused_reason

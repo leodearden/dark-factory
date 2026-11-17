@@ -36,6 +36,7 @@ from shared.account_reserve import (
     ReserveRefusal,
     ReserveState,
     ReserveWaitEnd,
+    WorkClass,
     WorkClassSource,
     config_event_details,
     first_choice,
@@ -43,8 +44,11 @@ from shared.account_reserve import (
     refuses_account,
     resolve_work_class,
     schedule_drift,
+    served_details,
     wait_end_for_lease,
-    work_class_details,
+    wait_end_without_lease,
+    wait_ended_details,
+    wait_started_details,
 )
 from shared.cli_invoke import (
     BUDGET_EXHAUSTED_SUBTYPE,
@@ -484,6 +488,11 @@ class AccountState:
         elif self.phase == AccountPhase.AUTH_FAILED:
             self.phase = AccountPhase.AVAILABLE
 
+    @property
+    def is_open(self) -> bool:
+        """Neither capped, probe-in-flight nor failing authentication: selection may take it."""
+        return self.phase in (AccountPhase.AVAILABLE, AccountPhase.PROBING)
+
 
 @dataclass(frozen=True)
 class AccountLease:
@@ -506,6 +515,18 @@ class AccountLease:
     name: str
     token: str | None
     generation: int
+
+
+@dataclass(frozen=True)
+class _ReserveView:
+    """The reserve rule as one selection pass reads it: the caller's class and the clock, read once.
+
+    Selection and the refusal test of the same pass share it, so they cannot disagree.
+    """
+
+    rule: ReserveConfig
+    caller: WorkClass
+    now: datetime
 
 
 class SessionBudgetExhausted(Exception):
@@ -1150,7 +1171,7 @@ class UsageGate:
             self._reset_probe_spawn_failures(acct, reason='operator hard reset (SIGHUP)')
 
         # --- Centralized _open recompute (DD-5) ---------------------------
-        if any(a.phase in (AccountPhase.AVAILABLE, AccountPhase.PROBING) for a in self._accounts):
+        if any(a.is_open for a in self._accounts):
             self._open.set()
             # Symmetric counterpart to the closing branch below: consume the
             # gate-level pause into _total_pause_secs and clear
@@ -1220,12 +1241,12 @@ class UsageGate:
             return
         if acct.name != rule.account:
             if new_phase in (AccountPhase.AVAILABLE, AccountPhase.PROBING):
-                self._reserve_waiter().set()
+                self._reserve_wake_event().set()
         elif new_phase == AccountPhase.AUTH_FAILED:
             self._fire_reserve_event(
                 acct.name, ReserveEvent.ACCOUNT_UNAVAILABLE, {'account': acct.name}
             )
-            self._reserve_waiter().set()
+            self._reserve_wake_event().set()
 
     async def check_at_startup(self) -> None:
         """No-op: pre-existing caps are detected reactively on first invocation.
@@ -1307,22 +1328,29 @@ class UsageGate:
         rule refuses, and in the release window it is tried first. Without
         one, nothing is resolved and the walk is today's.
         """
+        return self._select(scope=scope, exclude=exclude, view=self._reserve_view(work_class))
+
+    def _select(
+        self,
+        *,
+        scope: str | None,
+        exclude: Collection[str] | None,
+        view: _ReserveView | None,
+    ) -> AccountLease | None:
+        """:meth:`try_lease`'s walk under *view*, the pass's one reading of the reserve rule."""
         refused: frozenset[str] = frozenset()
         walk = self._accounts
-        rule = self._active_reserve_config()
-        if rule is not None:
-            now = self._reserve_now()
-            caller = resolve_work_class(work_class)
+        if view is not None:
             refused = frozenset(
                 acct.name
                 for acct in self._accounts
-                if refuses_account(rule, acct.name, caller, now)
+                if refuses_account(view.rule, acct.name, view.caller, view.now)
             )
-            first = first_choice(rule, now)
+            first = first_choice(view.rule, view.now)
             if first is not None:
                 walk = sorted(self._accounts, key=lambda acct: acct.name != first)
         for acct in walk:
-            if acct.capped or acct.probe_in_flight or acct.auth_failed:
+            if not acct.is_open:
                 continue
             if exclude and acct.name in exclude:
                 # Checked BEFORE the PROBE_IN_FLIGHT claim below: selecting a
@@ -1455,7 +1483,8 @@ class UsageGate:
         # Find first non-capped account (works with 1 or N)
         while True:
             async with self._lock:
-                lease = self.try_lease(scope=scope, work_class=work_class)
+                view = self._reserve_view(work_class)
+                lease = self._select(scope=scope, exclude=None, view=view)
                 if lease is not None:
                     return lease
 
@@ -1464,10 +1493,13 @@ class UsageGate:
             if refreshed:
                 continue  # re-check accounts with updated flags
 
-            refused = self.reserve_refusal(work_class)
-            if refused is not None:
+            # The selection's own view: both read one class and one clock.
+            if view is not None and (refused := self._refusal_in(view)) is not None:
+                park_left = _park_time_left(park_deadline)
+                if park_left is not None and park_left <= 0:
+                    raise self._pool_frozen(None, refused)
                 lease = await self._wait_while_reserve_refuses(
-                    refused, work_class, scope, park_deadline
+                    refused, view, work_class, scope, park_deadline
                 )
                 if lease is not None:
                     return lease
@@ -1549,7 +1581,8 @@ class UsageGate:
             # and non-PROBING, so clearing here is always correct regardless of
             # how _open drifted. The walk withholds an open account from a caller
             # in one case only, the reserve refusing it, and the reserve wait
-            # above has already diverted that case.
+            # above has already diverted that case: the walk and the refusal
+            # test read one view.
             park_left = _park_time_left(park_deadline)
             if park_left is not None and park_left <= 0:
                 raise self._pool_frozen(None)
@@ -1566,23 +1599,28 @@ class UsageGate:
         reserve = self._config.reserve
         return reserve.config if isinstance(reserve, ActiveReserve) else None
 
+    def _reserve_view(self, work_class: WorkClassSource | None) -> _ReserveView | None:
+        rule = self._active_reserve_config()
+        return None if rule is None else self._view_under(rule, work_class)
+
+    def _view_under(self, rule: ReserveConfig, work_class: WorkClassSource | None) -> _ReserveView:
+        return _ReserveView(rule, resolve_work_class(work_class), self._reserve_now())
+
     def reserve_refusal(self, work_class: WorkClassSource | None) -> ReserveRefusal | None:
         """The refusal an unscoped caller of *work_class* would meet now, or None.
 
-        PRD §6.4: a refusal exactly when every account that is neither capped,
-        probe-in-flight nor failing authentication is the reserve, and the rule
-        refuses this class; None when nothing at all is open. It changes
-        nothing and claims nothing.
+        PRD §6.4: a refusal exactly when every open account (``AccountState.is_open``)
+        is the reserve, and the rule refuses this class; None when nothing at all
+        is open. It changes nothing and claims nothing.
         """
-        rule = self._active_reserve_config()
-        if rule is None:
-            return None
-        open_names = [
-            acct.name
-            for acct in self._accounts
-            if not (acct.capped or acct.probe_in_flight or acct.auth_failed)
-        ]
-        return refusal(rule, open_names, resolve_work_class(work_class), self._reserve_now())
+        view = self._reserve_view(work_class)
+        return None if view is None else self._refusal_in(view)
+
+    def _refusal_in(self, view: _ReserveView) -> ReserveRefusal | None:
+        return refusal(view.rule, self._open_account_names(), view.caller, view.now)
+
+    def _open_account_names(self) -> list[str]:
+        return [acct.name for acct in self._accounts if acct.is_open]
 
     @property
     def reserve_state(self) -> ReserveState | None:
@@ -1591,7 +1629,7 @@ class UsageGate:
         return None if reserve is None else reserve.state
 
     def _pool_frozen(
-        self, scope: str | None, refusal: ReserveRefusal | None = None
+        self, scope: str | None, refused: ReserveRefusal | None = None
     ) -> PoolFrozen:
         """The :class:`PoolFrozen` describing this gate right now."""
         return PoolFrozen(
@@ -1599,8 +1637,8 @@ class UsageGate:
             capped_account_names=self.capped_account_names,
             auth_failed_account_names=self.auth_failed_account_names,
             scope=scope,
-            reserved_account=refusal.account if refusal is not None else None,
-            release_at=refusal.release_at if refusal is not None else None,
+            reserved_account=refused.account if refused is not None else None,
+            release_at=refused.release_at if refused is not None else None,
         )
 
     async def _wait_for_any_account_to_reopen(self, deadline: float | None) -> None:
@@ -1762,68 +1800,75 @@ class UsageGate:
     async def _wait_while_reserve_refuses(
         self,
         refused: ReserveRefusal,
+        view: _ReserveView,
         source: WorkClassSource | None,
         scope: str | None,
         deadline: float | None,
     ) -> AccountLease | None:
-        """Wait while the reserve, refused to this caller, is the only open account (PRD §6.3).
+        """Wait while the reserve, refused to this caller, is all it could have (PRD §6.3).
 
         One wait however often the caller is refused again: one
         ``reserve_wait_started`` and one ``reserve_wait_ended`` row, the latter
-        naming its exit. Selection re-runs at the first of the waiter Event, the
+        naming its exit. Selection re-runs at the first of the wake Event, the
         release time, ``_RESERVE_WAIT_REPOLL_SECS`` and *deadline*. Exits: a
-        lease (account_opened, released or admitted); None when the caller is
-        no longer refused yet nothing is open (reserve_unusable), for
-        ``before_invoke`` to take the all-capped path; :class:`PoolFrozen` at
-        the deadline; cancellation. It counts nothing toward a cap.
+        lease (account_opened, released or admitted); None when the caller
+        cannot be served here any more (:func:`wait_end_without_lease`), for
+        ``before_invoke`` to take the scope or all-capped path;
+        :class:`PoolFrozen` at the deadline; cancellation. It counts nothing
+        toward a cap. *view* is the entry pass's; each pass reads its own, and
+        the rows carry the class the last pass read, so the caller's class
+        function runs only in selection.
         """
-        rule = self._active_reserve_config()
-        if rule is None:
-            return None
-        self._reserve_wait_count += 1
         started = time.monotonic()
         last_logged: float | None = None
         ended_by = ReserveWaitEnd.CANCELLED
-        self._fire_reserve_event(
-            refused.account,
-            ReserveEvent.WAIT_STARTED,
-            self._reserve_wait_details(refused, source),
-        )
+        unclassified = source is None
+        self._reserve_wait_count += 1
         try:
+            self._fire_reserve_event(
+                refused.account,
+                ReserveEvent.WAIT_STARTED,
+                wait_started_details(view.caller, refused, unclassified=unclassified),
+            )
             while True:
-                wake = self._reserve_waiter()
+                wake = self._reserve_wake_event()
                 wake.clear()
                 await self._refresh_capped_accounts()
                 async with self._lock:
-                    lease = self.try_lease(scope=scope, work_class=source)
+                    view = self._view_under(view.rule, source)
+                    lease = self._select(scope=scope, exclude=None, view=view)
                 if lease is not None:
-                    ended_by = wait_end_for_lease(rule, lease.name, self._reserve_now())
+                    ended_by = wait_end_for_lease(view.rule, lease.name, view.now)
                     return lease
-                still_refused = self.reserve_refusal(source)
-                if still_refused is None:
-                    ended_by = ReserveWaitEnd.RESERVE_UNUSABLE
+                end = wait_end_without_lease(
+                    view.rule,
+                    self._open_account_names(),
+                    (*self.capped_account_names, *self.auth_failed_account_names),
+                    view.caller,
+                    view.now,
+                )
+                if end is not None:
+                    ended_by = end
                     return None
-                refused = still_refused
                 time_left = _park_time_left(deadline)
                 if time_left is not None and time_left <= 0:
                     ended_by = ReserveWaitEnd.DEADLINE
                     raise self._pool_frozen(None, refused)
                 now = time.monotonic()
                 if last_logged is None or now - last_logged >= _RESERVE_WAIT_LOG_INTERVAL_SECS:
-                    caller = resolve_work_class(source)
                     logger.warning(
                         self._park_heartbeat(
                             'reserve_wait',
                             now - started,
                             reserve_account=refused.account,
                             release_at=refused.release_at.isoformat(),
-                            kind=caller.kind.value,
-                            tier=caller.tier,
-                            task_id=caller.task_id,
+                            kind=view.caller.kind.value,
+                            tier=view.caller.tier,
+                            task_id=view.caller.task_id,
                         )
                     )
                     last_logged = now
-                until_release = (refused.release_at - self._reserve_now()).total_seconds()
+                until_release = (refused.release_at - view.now).total_seconds()
                 sleep_for = min(_RESERVE_WAIT_REPOLL_SECS, max(0.0, until_release))
                 if time_left is not None:
                     sleep_for = min(sleep_for, time_left)
@@ -1834,21 +1879,14 @@ class UsageGate:
             self._fire_reserve_event(
                 refused.account,
                 ReserveEvent.WAIT_ENDED,
-                {
-                    **self._reserve_wait_details(refused, source),
-                    'waited_secs': round(time.monotonic() - started, 1),
-                    'ended_by': ended_by.value,
-                },
+                wait_ended_details(
+                    view.caller,
+                    refused,
+                    unclassified=unclassified,
+                    waited_secs=time.monotonic() - started,
+                    ended_by=ended_by,
+                ),
             )
-
-    def _reserve_wait_details(
-        self, refused: ReserveRefusal, source: WorkClassSource | None
-    ) -> dict[str, object]:
-        return {
-            **work_class_details(resolve_work_class(source), unclassified=source is None),
-            'account': refused.account,
-            'release_at': refused.release_at.isoformat(),
-        }
 
     def _note_reserve_served(
         self, lease: AccountLease, source: WorkClassSource | None, cost_usd: float | None
@@ -1859,13 +1897,13 @@ class UsageGate:
             return
         if rule.in_release_window(self._reserve_now()):
             return
-        details = work_class_details(resolve_work_class(source), unclassified=source is None)
-        del details['unclassified']
         self._fire_reserve_event(
-            lease.name, ReserveEvent.SERVED, {**details, 'cost_usd': cost_usd}
+            lease.name,
+            ReserveEvent.SERVED,
+            served_details(resolve_work_class(source), cost_usd=cost_usd),
         )
 
-    def _reserve_waiter(self) -> asyncio.Event:
+    def _reserve_wake_event(self) -> asyncio.Event:
         if self._reserve_wake is None:
             self._reserve_wake = asyncio.Event()
         return self._reserve_wake
