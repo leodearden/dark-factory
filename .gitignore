@@ -73,8 +73,9 @@ mutants/
 # AsyncMock is not a MagicMock subclass but shares MagicMixin; it reached a
 # commit in task 4592 because only MagicMock was listed.
 # tests/scripts/test_mock_fspath_dir_isolation.py fails if a name is missing.
-# Both are containment only: the real fence is the autouse guard
-# df_pytest_isolation.py::_df_no_mock_derived_stray_dirs.
+# These entries are containment only. The DIRECTORY shape's fence is
+# df_pytest_isolation.py::_df_no_mock_derived_stray_dirs; in the orchestrator
+# suite the FILE shape's is orchestrator/tests/conftest.py::_no_mock_repr_stray_entries.
 <AsyncMock*
 <MagicMock*
 <Mock*

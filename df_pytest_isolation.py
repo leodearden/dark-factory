@@ -3109,9 +3109,10 @@ def _df_no_mock_derived_stray_dirs(request):
     tree: usually, not always, the leaker.  Removing it keeps one polluter from
     failing every later test.
 
-    Deliberately NOT matched: the ``<ClassName ...>`` repr FILE shape.  It is
-    contained by ``.gitignore`` and tracked separately by ticket
-    ``tkt_0RRXS67RDHVVRVM811KFCAPSX8``.
+    Deliberately NOT matched: the ``<ClassName ...>`` repr FILE shape.
+    ``.gitignore`` contains it everywhere, and in the orchestrator suite
+    ``orchestrator/tests/conftest.py::_no_mock_repr_stray_entries`` fails a
+    test that leaves one.
     """
     cwd = Path.cwd()
     present_at_setup = set(mock_derived_stray_dirs(cwd))
