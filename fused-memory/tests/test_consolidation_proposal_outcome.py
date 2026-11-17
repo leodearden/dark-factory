@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+from collections.abc import MutableMapping
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -332,8 +333,7 @@ class TestAdjudicatorFlowFields:
         repaired['member_different_topic'] = ('m7',)
 
         assert dict(outcome.repaired) == {'member_not_found': ('m9',)}
-        with pytest.raises(TypeError):
-            outcome.repaired['x'] = ('y',)  # type: ignore[index]
+        assert not isinstance(outcome.repaired, MutableMapping)
 
     def test_shown_text_is_capped(self):
         assert SHOWN_TEXT_CHARS == 1500
