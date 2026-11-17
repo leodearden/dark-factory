@@ -4391,6 +4391,10 @@ def _build_fallback_config(
     used as-is when it differs from the bare ``pytest`` default so that
     complex flag sequences like ``-m 'not slow' --ignore=tests/e2e`` are not
     mangled by :func:`_scope_to_keyword`'s prefix-then-parse approach.
+    Where no test target is derivable here, the caller's fallback test floor
+    (``orchestrator/src/orchestrator/verify_fallback_floor.py::apply_fallback_test_floor``)
+    may replace the returned ``test_command`` with the configured one whole;
+    see docs/fallback-test-floor.md.
 
     *content_cache*, when given, is threaded into the structural-file content
     read (see :func:`_worktree_reader`) so a file already read through the

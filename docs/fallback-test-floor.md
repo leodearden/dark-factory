@@ -4,8 +4,9 @@ Implemented by task 8714, which also lands the core of task 7041.
 
 ## The question
 
-When a project has no module config for a path, verify takes the fallback
-branch (`orchestrator/src/orchestrator/verify.py::_build_fallback_config`).
+When a verify's resolved module set is empty (no task module maps to a
+registered module config), verify takes the fallback branch
+(`orchestrator/src/orchestrator/verify.py::_build_fallback_config`).
 Before this change a `.py` diff with no derivable test target ran no tests at
 all, at task role and at merge role alike. That is a source-only diff with no
 touched test, conftest or test-data file. Lint and type check still ran.
@@ -104,6 +105,9 @@ declared no files.
 
 ## What it does not change
 
-- `_build_fallback_config`'s narrowing when a test target is derivable.
+- `_build_fallback_config`'s narrowing when a test target is derivable. Where
+  it derives none, the floor overrides it. In particular, a source-only diff
+  under a single real subproject (task 2344's pure-subproject branch) now runs
+  the whole configured `test_command`, not that subproject's suite alone.
 - The module-config branch.
 - `force_workspace` and `merge_verify_workspace`.

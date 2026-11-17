@@ -1454,10 +1454,17 @@ def derive_verify_plan(
 
     Fallback branch (*module_configs* empty): a single synthetic
     ``'__fallback__'`` module is derived from *config*'s global commands via
-    :func:`_derive_fallback_runs`. *fallback_test_floor* False returns the
-    fallback branch's pytest decision before the test floor;
-    ``verify.py::_safe_derive_executed_fallback_plan`` passes it because the
-    executed record takes its floor from the execution layer alone.
+    :func:`_derive_fallback_runs`. Its pytest run carries the fallback test
+    floor, as an intent record no production caller acts on:
+    ``orchestrator/src/orchestrator/task_verify_dispatch.py::_TaskVerifyDispatcher._scope_of``
+    and ``scripts/hook_module_checks.py::touched_modules`` read only
+    :func:`executed_module_prefixes`, which the floor cannot change. A caller
+    that reconciles this decision against an executed fallback config must
+    pass *fallback_test_floor* False, as
+    ``orchestrator/src/orchestrator/verify.py::_safe_derive_executed_fallback_plan``
+    does: the execution layer can floor differently (the task-2368 mixed
+    root+subproject shape), so the executed record takes its floor from that
+    layer alone.
 
     Fidelity: this plan is no longer just a decision record on either branch
     (task κ, verify-scope-inversion-prd.md) — by the time it reaches
