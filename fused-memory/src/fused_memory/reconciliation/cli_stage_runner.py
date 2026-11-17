@@ -43,8 +43,15 @@ logger = logging.getLogger(__name__)
 
 # ── Disallowed tool lists ──────────────────────────────────────────────
 
-# Non-MCP built-in tools that stages should never use
-DISALLOW_BUILTIN = ['Bash', 'Edit', 'Write', 'NotebookEdit']
+# Non-MCP built-in tools no stage calls. Skill and Workflow go together: with Skill denied
+# alone, Workflow's description inlines a ~17,400-char reference (task 10451).
+DISALLOW_BUILTIN = [
+    'Bash', 'Edit', 'Write', 'NotebookEdit',
+    'Agent', 'ListAgents', 'ReportFindings', 'ScheduleWakeup', 'Skill', 'Workflow',
+    'CronCreate', 'CronDelete', 'CronList', 'DesignSync', 'EnterWorktree', 'ExitWorktree',
+    'Monitor', 'PushNotification', 'RemoteTrigger', 'SendMessage', 'TaskStop', 'WebFetch',
+    'WebSearch',
+]
 
 # Task write tools (disallowed in Stage 1 and Stage 3; Stage 2 files tasks).
 DISALLOW_TASK_WRITES = [
