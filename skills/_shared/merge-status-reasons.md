@@ -6,7 +6,7 @@ skills consume it:
 
 - [`skills/merge-queue/SKILL.md`](../merge-queue/SKILL.md) — interactive submit-and-poll; the only consumer that resubmits on its own
 - [`skills/unblock/SKILL.md`](../unblock/SKILL.md) — the step-7 poll loop and the `merge_cancel` cleanup
-- [`skills/unblock-low-risk/SKILL.md`](../unblock-low-risk/SKILL.md) — unattended; every reason except a verified landing ends in ABORT
+- [`skills/unblock-low-risk/SKILL.md`](../unblock-low-risk/SKILL.md) — unattended; a wait-state reason still answering at its deadline is handed off, and every other reason except a verified landing ends in ABORT
 - [`skills/escalation-watcher/SKILL.md`](../escalation-watcher/SKILL.md) — its merge-status fallback note
 
 Each consumer keeps its own **dispositions** inline in its own file — resubmit, report, abort,

@@ -1467,8 +1467,9 @@ launch by `task_id` / background-task-id):
   pending, write only the digest line and file no DecisionRecord: whoever took the escalation
   owns it, and the merge carries on.
 - `outcome == "handed_off"`: neither a failure nor an abort. The merge `request_id` it returns
-  is either picked up by the merge worker and still live (merging or verifying), or, when the
-  result also carries `superseded_by`, superseded by a successor that has not resolved yet: an
+  is either picked up by the merge worker and still live (merging or verifying), or still
+  answering a wait-state reason (`probe_failed`, `journaled_not_live`) and so possibly still in
+  flight, or, when the result also carries `superseded_by`, superseded by a successor that has not resolved yet: an
   `mr-*` generation advance or a `coalesce-*` train. Either way the sub-agent did not cancel
   it, did not change the task status, and left the escalation pending. **Never
   `merge_cancel` it**, and never submit another merge for that `task_id`, whichever shape it is:
@@ -1483,7 +1484,7 @@ launch by `task_id` / background-task-id):
   is already charged, and `check` would report `already_attempted`. Keep the `task_id` in flight
   until that run completes; its completion is handled by this same list. **Resume once per B3
   launch:** if a resume-mode run itself returns `handed_off` (its 3 h backstop expired with the
-  merge still live or its successor still unresolved), do not resume again — leave the
+  merge still live, still answering a wait-state reason, or its successor still unresolved), do not resume again — leave the
   escalation pending, write the digest line, and file a DecisionRecord via `write-decision`
   whose `--text` names the `request_id`, the `superseded_by` when present, and the last state.
   Still never cancel. A resume-mode `merged` is handled by the `merged` bullet, and a
