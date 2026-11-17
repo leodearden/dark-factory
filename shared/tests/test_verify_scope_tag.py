@@ -13,6 +13,7 @@ import re
 from pathlib import Path
 
 import pytest
+
 from shared.verify_scope_tag import (
     VerifyScopeUnit,
     parse_verify_scope_unit,
