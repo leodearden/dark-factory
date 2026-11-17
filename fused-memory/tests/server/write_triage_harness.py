@@ -81,12 +81,14 @@ def configure_pass_through_add_memory(
 ) -> MagicMock:
     """Make ``mock_service.add_memory`` return a result that dumps to a plain dict.
 
-    The default dict is built fresh on every call: ``tools.py::add_memory``
-    mutates the ack it gets from ``model_dump()`` in place, so a shared default
-    would carry one test's ack keys into the next.
+    Every ``model_dump()`` call returns a fresh copy of *dump*, which defaults
+    to ``{'id': 'new-id'}``. ``tools.py::add_memory`` mutates the ack it gets
+    from ``model_dump()`` in place, so a shared dict would carry one write's
+    ack keys into the next write's result and into the caller's *dump*.
     """
+    base = {'id': 'new-id'} if dump is None else dict(dump)
     result = MagicMock()
-    result.model_dump.return_value = dict(dump) if dump is not None else {'id': 'new-id'}
+    result.model_dump.side_effect = lambda *_args, **_kwargs: dict(base)
     mock_service.add_memory.return_value = result
     return result
 

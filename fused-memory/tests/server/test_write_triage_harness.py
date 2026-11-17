@@ -2,8 +2,10 @@
 
 The harness is the one copy of the ``add_memory`` write-path config stand-in,
 post-RRF search hit and pass-through result that the triage, near-duplicate,
-entities and completion-claim tool suites share; these contracts hold for every importer, and are read back
-through production's own resolvers so a misspelled leaf fails here.
+entities and completion-claim tool suites share; these contracts hold for
+every importer. The config and search-hit contracts are read back through
+production's own resolvers and band decision, so a misspelled leaf fails here.
+The pass-through contracts drive the configured mock alone.
 """
 
 from __future__ import annotations
@@ -107,7 +109,29 @@ async def test_an_explicit_dump_is_what_the_result_dumps_to() -> None:
     dump = {'id': 'child-id', 'category': 'procedural_knowledge'}
     configure_pass_through_add_memory(svc, dump=dump)
 
-    assert (await svc.add_memory()).model_dump() == dump
+    ack = (await svc.add_memory()).model_dump()
+    assert ack == dump
+
+    ack['routed'] = 'restated'
+    assert dump == {'id': 'child-id', 'category': 'procedural_knowledge'}, (
+        'tools.py::add_memory mutates the ack model_dump() hands it, so the '
+        'result must dump to a copy rather than to the caller\'s own dict'
+    )
+
+
+@pytest.mark.asyncio
+async def test_each_write_through_one_service_gets_its_own_dump() -> None:
+    svc = AsyncMock()
+    configure_pass_through_add_memory(svc)
+
+    first_dump = (await svc.add_memory()).model_dump()
+    first_dump['routed'] = 'restated'
+    second_dump = (await svc.add_memory()).model_dump()
+
+    assert second_dump == {'id': 'new-id'}, (
+        'tools.py::add_memory mutates the ack model_dump() hands it, so a dict '
+        'shared across writes would leak the first write\'s ack keys into the second'
+    )
 
 
 @pytest.mark.asyncio
