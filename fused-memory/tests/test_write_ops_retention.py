@@ -69,6 +69,35 @@ def _surviving_ids(journal: WriteJournal) -> set[str]:
         return {row[0] for row in conn.execute('SELECT id FROM write_ops')}
 
 
+def _null_operation(journal: WriteJournal, op_id: str) -> None:
+    with contextlib.closing(sqlite3.connect(journal.db_path)) as conn:
+        conn.execute('UPDATE write_ops SET operation = NULL WHERE id = ?', (op_id,))
+        conn.commit()
+
+
+@pytest.mark.asyncio
+async def test_a_read_with_no_operation_is_pruned_on_the_read_horizon(journal):
+    config = WriteJournalConfig(
+        read_retention_days=10, search_retention_days=1000, write_retention_days=1000
+    )
+    nameless_read = await _seed(
+        journal, operation='get_task', kind='read', success=False, age_days=20
+    )
+    _null_operation(journal, nameless_read)
+    search = await _seed(journal, operation='search', kind='read', age_days=20)
+    nameless_write = await _seed(journal, operation='add_memory', kind='write', age_days=20)
+    _null_operation(journal, nameless_write)
+
+    deleted = await prune_write_ops_pass(journal, config)
+
+    remaining = _surviving_ids(journal)
+    assert deleted == 1 and nameless_read not in remaining, (
+        'a read with a NULL operation matched neither the read nor the search '
+        'horizon, so it was kept forever'
+    )
+    assert {search, nameless_write} <= remaining
+
+
 @pytest.mark.asyncio
 async def test_pass_takes_every_horizon_from_the_config(journal):
     config = WriteJournalConfig(
