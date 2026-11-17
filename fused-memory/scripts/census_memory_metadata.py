@@ -531,7 +531,9 @@ def build_report(
         or per-category counts summing short of the collection's point total
         -- sets ``coverage.complete=false`` and appears as a NAMED entry in
         ``coverage.deltas`` (INV-11 no-silent-fail-soft). The caller exits
-        non-zero on that flag.
+        non-zero on that flag. The top-level ``kind_registry_drift`` block
+        scores the grand-total ``kind`` table against the frozen registry
+        (:func:`build_kind_registry_drift`); it reports, never fails.
     """
     projects: dict[str, Any] = {}
     grand_total = CategoryCensus()
@@ -585,6 +587,7 @@ def build_report(
             registry_coverage = None
             registry_error = f'{type(exc).__name__}: {exc}'
 
+    grand_total_dict = _census_to_dict(grand_total)
     report = {
         # v2: value tables are the complete population (v1 capped them at
         # top_n, which could truncate the JSON while coverage read complete);
@@ -614,7 +617,11 @@ def build_report(
         # 'variant_spelling_records' (records under another spelling that
         # folds to the same slug); the zero-canonical rows are split into
         # 'stamping_worklist' (records present) and 'unpopulated_topics'.
-        'schema_version': 5,
+        # v6 (task 5266): new top-level 'kind_registry_drift' -- the live
+        # `kind` population scored against the frozen
+        # memory_metadata.KIND_REGISTRY baseline; reports a delta, never
+        # fails (PRD §10 OQ1 ruled option (b)).
+        'schema_version': 6,
         'params': {
             'projects': sorted(cells),
             'categories': category_order,
@@ -627,7 +634,7 @@ def build_report(
             **(extra_params or {}),
         },
         'projects': projects,
-        'grand_total': _census_to_dict(grand_total),
+        'grand_total': grand_total_dict,
         'topic_coverage': _regrade_uniqueness_at_project_grain(
             _build_topic_coverage(grand_total, canonical_uniqueness_enforced),
             projects,
@@ -636,6 +643,9 @@ def build_report(
         # at the top level rather than under any one project.
         'registry_coverage': registry_coverage,
         'registry_error': registry_error,
+        'kind_registry_drift': build_kind_registry_drift(
+            (grand_total_dict.get('kind') or {}).get('entries'),
+        ),
         # Placeholder so the key keeps its position in the artifact; filled
         # below, since the diff is computed FROM the finished report (one
         # distillation path -- see _coverage_run_row).
