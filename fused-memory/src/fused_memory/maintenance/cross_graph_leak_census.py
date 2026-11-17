@@ -9,10 +9,14 @@ manifest and the remedy are ``scripts/migrate_cross_graph_leak.py``'s dry run.
 """
 from __future__ import annotations
 
+import argparse
+import asyncio
+import json
 import logging
+import sys
 import time
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 
 from fused_memory.backends.graph_access import GraphAccess, GraphHandle, OpBoundReader
 from fused_memory.backends.paged_read import (
@@ -21,6 +25,7 @@ from fused_memory.backends.paged_read import (
     INCOMPLETE_SHORT_READ,
     census_count,
 )
+from fused_memory.maintenance._utils import ServiceOpen, maintenance_service
 from fused_memory.maintenance.graph_sweep import GraphFailure, read_each_graph
 
 logger = logging.getLogger(__name__)
@@ -246,3 +251,94 @@ class CrossGraphLeakCensus:
             complete=complete,
             elapsed_ms=elapsed_ms,
         )
+
+
+async def run_cross_graph_leak_census(
+    config_path: str | None = None,
+    group_id: str | None = None,
+) -> LeakSweep:
+    """Open the store for reads only, sweep one graph or every listed graph, close.
+
+    The listing is ``GraphitiBackend.list_graphs``, which keeps its own filter
+    of non-project graphs; supplying *group_id* skips the listing entirely.
+    """
+    async with maintenance_service(config_path, open_as=ServiceOpen.READS) as (_config, service):
+        keys = [group_id] if group_id is not None else await service.graphiti.list_graphs()
+        census = CrossGraphLeakCensus(graphs=service.graphiti.graph_access)
+        return await census.sweep(keys)
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    """The CLI surface: no flag offers to change the graph, because none may."""
+    parser = argparse.ArgumentParser(
+        description=(
+            "Count nodes whose group_id names another graph, or none — task 2115's "
+            'cross-graph leak — per graph and per label. Read-only: this never changes '
+            'the graph. For the per-node manifest and the remedy, see '
+            'scripts/migrate_cross_graph_leak.py.'
+        ),
+    )
+    parser.add_argument(
+        '--config', default=None,
+        help='Path to the YAML config file (overrides CONFIG_PATH env var).',
+    )
+    parser.add_argument(
+        '--group-id', default=None,
+        help='Read only this graph. Default: every graph in the store.',
+    )
+    parser.add_argument(
+        '--json', action='store_true',
+        help='Emit the full sweep as JSON instead of the summary.',
+    )
+    return parser
+
+
+def _describe_label(leak: LabelLeak) -> str:
+    count = '?' if leak.leaked is None else str(leak.leaked)
+    if leak.complete:
+        return f'{leak.label}={count}'
+    return f'{leak.label}={count} ({leak.incomplete_kind})'
+
+
+def _format_summary(sweep: LeakSweep) -> str:
+    """The summary line, then one line per graph holding a leaked node or an incomplete count."""
+    read = f'{len(sweep.graphs)} graph(s)' if sweep.graphs else '0 graph(s) (no graphs read)'
+    lines = [
+        f'cross-graph leak census: {_describe_totals(sweep.totals)} across {read} '
+        f'complete={sweep.complete} elapsed_ms={sweep.elapsed_ms:.1f}'
+    ]
+    lines.extend(
+        f'  {graph.group_id}: ' + ' '.join(_describe_label(leak) for leak in graph.labels)
+        for graph in sweep.graphs
+        if not graph.complete or any(leak.leaked for leak in graph.labels)
+    )
+    if sweep.failures:
+        failed = ', '.join(f'{f.group_id} ({f.error})' for f in sweep.failures)
+        lines.append(f'FAILED to read {len(sweep.failures)} graph(s): {failed}')
+    return '\n'.join(lines)
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI entry point: ``python -m fused_memory.maintenance.cross_graph_leak_census``.
+
+    Returns:
+        0 only when every graph was read whole; 1 when any count was incomplete
+        or any graph could not be read. It answers "can I trust these numbers",
+        not "were leaks found".
+    """
+    args = _build_parser().parse_args(argv)
+    logging.basicConfig(level=logging.INFO)
+
+    sweep = asyncio.run(
+        run_cross_graph_leak_census(config_path=args.config, group_id=args.group_id)
+    )
+
+    if args.json:
+        print(json.dumps(asdict(sweep), indent=2, default=str))
+    else:
+        print(_format_summary(sweep))
+    return 0 if sweep.complete else 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())
