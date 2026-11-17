@@ -680,6 +680,35 @@ class TestScopedWaitSettlesOnTheAwaitedRecord:
 
         assert outcome == StewardResolved('main fixed upstream')
 
+    async def test_an_info_l1_on_the_other_task_does_not_refuse_its_resolution(
+        self, tmp_path: Path,
+    ):
+        """An info L1 never hands a task off (PRD D3), so one open on the
+        dedupe-fold parent's task leaves that parent's resolution to settle
+        the wait; a real hand-off still refuses it (the test above)."""
+        wf, queue, channel, older, _awaited = self._workflow_with_two_l0s(
+            tmp_path, timeout=30.0,
+        )
+        foreign_parent = Escalation(
+            id=queue.make_id('99'), task_id='99', agent_role='implementer',
+            severity='blocking', category='task_failure', summary='main is red',
+        )
+        queue.submit(foreign_parent)
+        _submit_l1(queue, 'info', task_id='99')
+        queue.resolve(
+            foreign_parent.id, 'main fixed upstream',
+            resolved_by='claude-task-99-steward',
+        )
+        channel.put_nowait(
+            PublishedStewardOutcome(older.id, StewardResolved('older fixed')),
+        )
+
+        outcome = await asyncio.wait_for(
+            wf._await_steward_completion(escalation_id=foreign_parent.id), 5,
+        )
+
+        assert outcome == StewardResolved('main fixed upstream')
+
     async def test_deadline_consults_the_awaited_record(self, tmp_path: Path):
         wf, queue, _channel, _older, awaited = self._workflow_with_two_l0s(
             tmp_path, timeout=0.2,
