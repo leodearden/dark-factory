@@ -109,6 +109,15 @@ def _create_collection(
     )
 
 
+def _delete_collection(client: Any, collection_name: str, *, settle_timeout: float) -> None:
+    _run_meta_op(
+        lambda: client.delete_collection(collection_name),
+        reached=lambda: not client.collection_exists(collection_name),
+        describe=f'delete of collection {collection_name!r}',
+        timeout=settle_timeout,
+    )
+
+
 def ensure_fresh_collection(
     client: Any,
     collection_name: str,
@@ -127,8 +136,9 @@ def ensure_fresh_collection(
     next run. This helper self-heals that case: if the create raises a 409
     ``UnexpectedResponse`` it deletes the stale collection and creates once more.
     Any other ``UnexpectedResponse`` (e.g. a genuine 500) is re-raised — fail
-    loud, no retry. A create whose answer the client abandons on a read timeout
-    is judged by whether the collection appears within *settle_timeout*.
+    loud, no retry. A create or delete whose answer the client abandons on a
+    read timeout is judged by whether the collection appears or disappears
+    within *settle_timeout*.
 
     Imports ``VectorParams``/``Distance``/``UnexpectedResponse`` lazily inside
     the body, mirroring ``_qdrant_available``'s convention (see its docstring):
@@ -150,7 +160,7 @@ def ensure_fresh_collection(
     vectors_config = VectorParams(size=size, distance=distance or Distance.COSINE)
 
     if client.collection_exists(collection_name):
-        client.delete_collection(collection_name)
+        _delete_collection(client, collection_name, settle_timeout=settle_timeout)
     try:
         _create_collection(
             client, collection_name, vectors_config, settle_timeout=settle_timeout,
@@ -160,7 +170,7 @@ def ensure_fresh_collection(
             raise
         # Stale collection survived a swallowed teardown / lost create race:
         # delete it and create once more rather than propagating the conflict.
-        client.delete_collection(collection_name)
+        _delete_collection(client, collection_name, settle_timeout=settle_timeout)
         _create_collection(
             client, collection_name, vectors_config, settle_timeout=settle_timeout,
         )
