@@ -6620,16 +6620,15 @@ def _fixc_blocklist_candidate() -> CandidateTask:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# task-5007 RED: TestBlocklistLazyLoadRunsOffEventLoop
+# task-5007 RED: TestBlocklistRegistryWiring
 # ──────────────────────────────────────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
-class TestBlocklistLazyLoadRunsOffEventLoop:
-    """Site-specific coverage for _maybe_blocklist_drop's registry load: a
-    failed load fails open and is retried, and the relative-path-without-cwd
-    warning. Both pin the "blocklist" label / cancelled_premise_blocklist_path
-    config-key wiring that is unique to this call site.
+class TestBlocklistRegistryWiring:
+    """_maybe_blocklist_drop is wired to the "blocklist" registry read from
+    cancelled_premise_blocklist_path: a failed load fails open and is retried,
+    and a relative path without cwd warns naming that config key.
 
     The generic load contract (off-loop, concurrent first calls,
     cancellation, backoff) is pinned once, canonically, by
@@ -6761,8 +6760,7 @@ _SHIPPED_BLOCKLIST_PATH = (
 
 def _load_shipped_blocklist():
     """Load the shipped blocklist, asserting it parsed to something non-empty
-    (a YAML the loader cannot read degrades to [], which would otherwise make
-    every pin below pass vacuously)."""
+    (an empty list would otherwise make every pin below pass vacuously)."""
     from fused_memory.middleware.cancelled_premise_blocklist import load_blocklist
     entries = load_blocklist(_SHIPPED_BLOCKLIST_PATH)
     assert entries, f"Shipped blocklist is empty — path: {_SHIPPED_BLOCKLIST_PATH}"
@@ -7670,6 +7668,15 @@ class TestPremiseGuardRunsOffEventLoop:
         # module does (verified by grep).
         assert len(fail_open_records) == 1
 
+
+@pytest.mark.asyncio
+class TestPremiseRegistryWiring:
+    """_maybe_premise_refuted_drop is wired to the "recon-premise" registry
+    read from recon_code_fix_premise_registry_path: a failed load fails open
+    and is retried. The generic load contract is pinned once, canonically, by
+    tests/test_curator_registry.py.
+    """
+
     async def test_premise_registry_failed_load_is_retried(self, tmp_path, caplog):
         """A missing premise registry fails open with one WARNING and reports
         FAILED; once the file appears, the next call loads it and refuses."""
@@ -8330,17 +8337,16 @@ class TestCuratorMaybeRouteDeterministic:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# task-5007 RED: TestOperationalRegistryLazyLoadRunsOffEventLoop
+# task-5007 RED: TestOperationalRegistryWiring
 # ──────────────────────────────────────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
-class TestOperationalRegistryLazyLoadRunsOffEventLoop:
-    """Site-specific coverage for _maybe_route_deterministic's registry load:
-    a failed load fails open and is retried, and the
-    relative-path-without-cwd warning. Both pin the "operational-ask" label /
-    operational_ask_registry_path config-key wiring that is unique to this
-    call site. The generic load contract is pinned once, canonically, by
+class TestOperationalRegistryWiring:
+    """_maybe_route_deterministic is wired to the "operational-ask" registry
+    read from operational_ask_registry_path: a failed load fails open and is
+    retried, and a relative path without cwd warns naming that config key.
+    The generic load contract is pinned once, canonically, by
     tests/test_curator_registry.py.
 
     Candidates here are deliberately UNTAGGED (no execution_class) so they

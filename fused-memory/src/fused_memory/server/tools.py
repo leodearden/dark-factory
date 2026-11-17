@@ -7986,7 +7986,8 @@ def create_mcp_server(
     @mcp.tool()
     @mcp_tool_errors()
     async def get_curator_state() -> dict[str, Any]:
-        """Read-only snapshot of the curator UsageGate's current state.
+        """Read-only snapshot of the curator's operational state: its UsageGate
+        and the load health of its guard registries.
 
         Returns ``{'paused', 'paused_reason', 'soonest_open_at', 'account_count',
         'registries'}``.
@@ -8003,7 +8004,7 @@ def create_mcp_server(
         The dashboard polls this to surface WHY the curator is paused alongside
         the existing ``capped_now`` indicator.
 
-        Note: the four values are read from the live gate without a lock. During
+        Note: the four gate values are read from the live gate without a lock. During
         a state transition (e.g. ``_on_resume()`` flipping paused → unpaused) the
         snapshot may be momentarily inconsistent; refresh on the next poll.
         """
