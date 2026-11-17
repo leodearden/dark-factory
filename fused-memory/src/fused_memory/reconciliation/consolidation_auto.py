@@ -865,6 +865,32 @@ def _slug_hazards(
     return reasons
 
 
+def _require_adjudicator_waivers(waived: frozenset[tuple[AutoReasonCode, str]]) -> None:
+    """Raise unless every waiver names an adjudicator-class code (K2).
+
+    Every offender is collected into one error, an unknown code included, so a
+    mis-wired caller learns all of them at once.
+    """
+    offenders = sorted(
+        (str(code), str(subject), str(REASON_CODE_CLASSES.get(code, 'unclassified')))
+        for code, subject in waived
+        if REASON_CODE_CLASSES.get(code) is not ReasonCodeClass.ADJUDICATOR
+    )
+    if offenders:
+        named = '; '.join(
+            f'{code} for {subject} (class {cls})' for code, subject, cls in offenders
+        )
+        raise ValueError(f'only adjudicator-class codes may be waived: {named}')
+
+
+def _is_waived(reason: AutoReason, waived: frozenset[tuple[AutoReasonCode, str]]) -> bool:
+    """Is every record *reason* names waived under its code?
+
+    A reason naming no record can never be waived.
+    """
+    return bool(reason.ids) and all((reason.code, member_id) in waived for member_id in reason.ids)
+
+
 def evaluate_auto_predicate(
     proposal: AutoProposal,
     *,
@@ -873,6 +899,7 @@ def evaluate_auto_predicate(
     open_gate_id: str | None,
     existing_canonical_slugs: Sequence[str],
     config: ConsolidationAutoConfig,
+    waived: frozenset[tuple[AutoReasonCode, str]] = frozenset(),
 ) -> AutoVerdict:
     """Rule on whether *proposal* may be consolidated with no human in the loop.
 
@@ -897,6 +924,11 @@ def evaluate_auto_predicate(
        topic's canonical state undecidable here — and a *proposal* whose
        declared ``category`` contradicts the one its members share, which would
        otherwise reach the executor as the minted canonical's own category.
+       A hazard the caller listed in *waived* — ``(code, subject member id)``,
+       derived from its adjudicator's judgement (PRD
+       ``plans/consolidation-adjudicator-prd.md`` K2) — is skipped. Only
+       adjudicator-class codes may be waived; any other waiver raises
+       ``ValueError`` before rung 1. The verdict does not echo waived hazards.
     3. An incumbent canonical of THIS topic named in the member list is
        STRIPPED from the retained set and disclosed.
     4. ``already_consolidated`` -> NOOP, judged over the RETAINED set.
@@ -928,6 +960,8 @@ def evaluate_auto_predicate(
     deleted twice, or a canonical minted over nothing. C1 is not the only door
     into this predicate, so those two are refused here as well.
     """
+    _require_adjudicator_waivers(waived)
+
     # Rung 1. Evaluated before the hazard arm on purpose: when a human already
     # holds the topic, what the members look like is not this function's
     # business, and reporting a hazard here would invite a second filing on a
@@ -959,9 +993,13 @@ def evaluate_auto_predicate(
     # One flat concatenation, so collecting every offender is structural rather
     # than remembered: no arm can short-circuit another.
     hazards = [
-        *_member_hazards(proposal, members),
-        *_canonical_hazards(proposal, members, canonical_count),
-        *_slug_hazards(proposal, existing_canonical_slugs, config.slug_collision_jaccard),
+        reason
+        for reason in (
+            *_member_hazards(proposal, members),
+            *_canonical_hazards(proposal, members, canonical_count),
+            *_slug_hazards(proposal, existing_canonical_slugs, config.slug_collision_jaccard),
+        )
+        if not _is_waived(reason, waived)
     ]
     if hazards:
         return AutoVerdict(
