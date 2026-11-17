@@ -498,17 +498,31 @@ def outcome_from_record(record: ReconLedgerRecord) -> ProposalOutcome | None:
 def refusal_streak(rows: Iterable[ReconLedgerRecord]) -> int:
     """Count the trailing ``refused`` rows of one topic, in the given order.
 
-    ``proposed`` rows (not yet acted on) and ``superseded`` rows (never
-    evaluated) neither count nor break the streak; any other acted state
-    resets it.
+    ``proposed`` rows (not yet acted on), ``superseded`` rows (never
+    evaluated) and rows carrying ``reused_from`` (memo copies, PRD
+    consolidation-adjudicator K4) neither count nor break the streak; every
+    other acted state, ``dropped`` and ``unresolved`` included, resets it.
     """
     streak = 0
     for row in rows:
         state = ProposalState(row.state)
-        if state in (ProposalState.PROPOSED, ProposalState.SUPERSEDED):
+        if state in (ProposalState.PROPOSED, ProposalState.SUPERSEDED) or _is_memo_copy(row):
             continue
         streak = streak + 1 if state is ProposalState.REFUSED else 0
     return streak
+
+
+def _is_memo_copy(row: ReconLedgerRecord) -> bool:
+    """Does *row*'s outcome reuse an earlier row's? An undecodable outcome counts as an original.
+
+    Fail-safe for an escalation counter: the executor reads the streak on
+    every refusal, and a raise here would abort its whole Stage 1 post-step.
+    """
+    try:
+        outcome = outcome_from_record(row)
+    except ValueError:
+        return False
+    return outcome is not None and outcome.reused_from is not None
 
 
 def newest_per_topic(
