@@ -53,6 +53,10 @@ AGENT_ROLE = 'harness-recovered-merge-owner'
 
 LANDED_MERGE_STATUSES: frozenset[str] = frozenset({'done', 'already_merged'})
 
+# The ``merge_lane/worker.py::reconcile_landed_row`` dispositions that leave the
+# task done, or resting in a status its steward owns.
+_LANDING_RECONCILED: frozenset[str] = frozenset({'marked_done', 'already_done_pruned'})
+
 _BLOCKABLE_STATUSES: frozenset[str] = frozenset({
     TaskStatus.IN_PROGRESS, TaskStatus.PENDING,
 })
@@ -87,8 +91,10 @@ class Settled(enum.StrEnum):
     WORKER_SHUTDOWN = 'worker_shutdown'
     LANDED = 'landed'
     LANDING_UNRECORDED = 'landing_unrecorded'
+    LANDING_NOT_DONE = 'landing_not_done'
     HALTED = 'halted'
     BLOCKED = 'blocked'
+    BLOCK_UNWRITTEN = 'block_unwritten'
     WORKFLOW_HELD = 'workflow_held'
     STATUS_MOVED = 'status_moved'
     TRANSIENT = 'transient'
@@ -96,12 +102,25 @@ class Settled(enum.StrEnum):
 
 
 @dataclass(frozen=True)
+class _BlockAttempt:
+    left: str
+    written: bool
+
+    def describe(self) -> str:
+        if self.written:
+            return f'The task was moved {self.left} -> blocked.'
+        return f'Blocking the task (from {self.left}) did not reach the store.'
+
+
+@dataclass(frozen=True)
 class RecoveredMergeOwner:
     """Settles each adopted request's outcome once its future finalizes.
 
-    - Landing: *reconcile_landed* makes the landed-outbox done-write.
+    - Landing: *reconcile_landing* drives the landed-outbox done-write and returns
+      ``merge_lane/worker.py::reconcile_landed_row``'s disposition, or None with no row.
     - Halt: files the halt-owning L1 and registers it with *merge_halt*; then blocks the task,
-      or records the landing for ``done_wip_recovery``.
+      or reconciles the landing for ``done_wip_recovery``. A task a workflow holds is
+      left to it unless the halt is still ownerless after the workflow's turn.
     - Transient (``superseded``): left to the stranded sweep.
     - Durable or unclassified failure: blocks the task and files one L1 under its block category.
 
@@ -111,7 +130,7 @@ class RecoveredMergeOwner:
 
     tasks: OutcomeTasks
     escalations: EscalationQueue | None
-    reconcile_landed: Callable[[str], Awaitable[bool]]
+    reconcile_landing: Callable[[str], Awaitable[str | None]]
     merge_halt: MergeHaltControl | None
     event_store: EventStore | None = None
 
@@ -167,19 +186,13 @@ class RecoveredMergeOwner:
         if is_merge_worker_shutdown(outcome):
             return Settled.WORKER_SHUTDOWN
         tid = request.task_id
-        if self.tasks.is_actively_held(tid):
-            return Settled.WORKFLOW_HELD
+        held = self.tasks.is_actively_held(tid)
         if outcome.status in MERGE_HALT_STATUSES:
-            await self._own_halt(request, outcome)
-            return Settled.HALTED
+            return await self._own_halt(request, outcome, held=held)
+        if held:
+            return Settled.WORKFLOW_HELD
         if outcome.status in LANDED_MERGE_STATUSES:
-            if await self.reconcile_landed(tid):
-                return Settled.LANDED
-            logger.info(
-                'Task %s landed with no outbox row; the stranded sweep marks it '
-                'done from main once the request is out of flight', tid,
-            )
-            return Settled.LANDING_UNRECORDED
+            return await self._reconcile_landing(tid)
         if outcome.status in SUCCESS_TRANSIENT_MERGE_STATUSES:
             return Settled.TRANSIENT
         if outcome.status not in DURABLE_MERGE_FAILURE_STATUSES:
@@ -193,16 +206,14 @@ class RecoveredMergeOwner:
     async def _block_and_escalate(
         self, request: RecoveredRequest, outcome: MergeOutcome,
     ) -> Settled:
-        moved_from = await self._block_task(request)
-        if moved_from is None:
+        attempt = await self._block_task(request)
+        if attempt is None:
             return Settled.STATUS_MOVED
-        self._file_l1(
-            request, outcome, extra_lines=(f'The task was moved {moved_from} -> blocked.',),
-        )
-        return Settled.BLOCKED
+        self._file_l1(request, outcome, extra_lines=(attempt.describe(),))
+        return Settled.BLOCKED if attempt.written else Settled.BLOCK_UNWRITTEN
 
-    async def _block_task(self, request: RecoveredRequest) -> str | None:
-        """Block the task unless another owner moved or holds it; returns the status it left."""
+    async def _block_task(self, request: RecoveredRequest) -> _BlockAttempt | None:
+        """Block the task unless another owner moved or holds it."""
         tid = request.task_id
         live = await self.tasks.get_status(tid)
         if live not in _BLOCKABLE_STATUSES or self.tasks.is_actively_held(tid):
@@ -214,20 +225,50 @@ class RecoveredMergeOwner:
                 'Task %s: blocking after recovered merge request %s finished did '
                 'not reach the store', tid, request.request_id, exc_info=True,
             )
-        return live
+            return _BlockAttempt(left=live, written=False)
+        return _BlockAttempt(left=live, written=True)
 
-    async def _own_halt(self, request: RecoveredRequest, outcome: MergeOutcome) -> None:
+    async def _reconcile_landing(self, tid: str) -> Settled:
+        disposition = await self.reconcile_landing(tid)
+        if disposition in _LANDING_RECONCILED:
+            return Settled.LANDED
+        if disposition is None:
+            logger.info(
+                'Task %s landed with no outbox row; the stranded sweep marks it '
+                'done from main once the request is out of flight', tid,
+            )
+            return Settled.LANDING_UNRECORDED
+        logger.warning(
+            'Task %s landed, but the landed-outbox reconcile left it not done (%s); '
+            'the stranded sweep re-checks it once the request is out of flight',
+            tid, disposition,
+        )
+        return Settled.LANDING_NOT_DONE
+
+    async def _own_halt(
+        self, request: RecoveredRequest, outcome: MergeOutcome, *, held: bool,
+    ) -> Settled:
+        if held:
+            # A workflow attached to this request owns the halt from its own
+            # handler; holding the task does not prove it is attached.
+            await asyncio.sleep(0)
+            if not self._halt_is_ownerless():
+                return Settled.WORKFLOW_HELD
         tid = request.task_id
         self._file_halt_record(
             request, outcome, build_merge_halt_escalation_text(outcome.status, outcome, task_id=tid),
         )
-        if outcome.status != 'done_wip_recovery':
+        if held:
+            return Settled.HALTED
+        if outcome.status == 'done_wip_recovery':
+            await self._reconcile_landing(tid)
+        else:
             await self._block_task(request)
-        elif not await self.reconcile_landed(tid):
-            logger.info(
-                'Task %s landed with WIP recovery but no outbox row; the stranded '
-                'sweep marks it done from main once the request is out of flight', tid,
-            )
+        return Settled.HALTED
+
+    def _halt_is_ownerless(self) -> bool:
+        halt = self.merge_halt
+        return halt is not None and halt.is_wip_halted and halt.halt_owner_esc_id is None
 
     def _file_halt_record(
         self, request: RecoveredRequest, outcome: MergeOutcome, text: MergeHaltEscalationText,
@@ -242,8 +283,7 @@ class RecoveredMergeOwner:
             return
         if self.escalations.has_open_l1(tid, category=text.category):
             return
-        halt = self.merge_halt
-        if halt is not None and halt.is_wip_halted and halt.halt_owner_esc_id is None:
+        if self._halt_is_ownerless():
             esc = Escalation(
                 id=self.escalations.make_id(tid),
                 task_id=tid,
@@ -255,9 +295,10 @@ class RecoveredMergeOwner:
                 suggested_action='manual_intervention',
                 level=1,
             )
-            submit_halt_owning_escalation(self.escalations, halt, esc)
+            submit_halt_owning_escalation(self.escalations, self.merge_halt, esc)
             self._emit_created(esc, outcome)
             return
+        halt = self.merge_halt
         owner = halt.halt_owner_esc_id if halt is not None else None
         holder = (
             f'the halt is already owned by escalation {owner}' if owner is not None

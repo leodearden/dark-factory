@@ -161,6 +161,7 @@ from orchestrator.merge_lane.skew_tripwire import emit_pipeline_landing_tripwire
 from orchestrator.merge_lane.tip_relation import select_recovery_winner
 from orchestrator.merge_lane.worker import (
     reconcile_landed_outbox,
+    reconcile_landed_row,
     reconcile_landed_task,
 )
 from orchestrator.module_charter import derive_modules, sanitize_files_for_persist
@@ -13607,9 +13608,9 @@ class Harness:
         No workflow awaits a recovered request, so each one's outcome is
         adopted by
         ``orchestrator/src/orchestrator/recovered_merge_owner.py::RecoveredMergeOwner``
-        (task 7277): a landing drives the landed-outbox done-write, a
-        durable failure blocks the task and files an L1, and an outcome that
-        halted the merge queue files the halt-owning L1.
+        (task 7277): a landing drives the landed-outbox done-write through
+        :meth:`_reconcile_landing`, a durable failure blocks the task and files
+        an L1, and an outcome that halted the merge queue files the halt-owning L1.
         """
         report = await recover_pending_merges(
             self._merge_store,
@@ -13626,7 +13627,7 @@ class Harness:
         RecoveredMergeOwner(
             tasks=self.scheduler,
             escalations=self._escalation_queue,
-            reconcile_landed=self._landed_dispatch_gate,
+            reconcile_landing=self._reconcile_landing,
             merge_halt=self._merge_worker,
             event_store=self.event_store,
         ).adopt(report.get('requests', []), schedule=self._schedule_coro_threadsafe)
@@ -13699,10 +13700,7 @@ class Harness:
             return
         report = await reconcile_landed_outbox(
             self._merge_worker._landed_outbox, self.git_ops, self.scheduler,
-            provenance_conflict_sink=self._provenance_conflict_sink,
-            project_root=str(self.config.project_root),
-            check_timeout_secs=self.config.delivered_checks.check_timeout_secs,
-            delivered_checks_enabled=self.config.delivered_checks.enabled,
+            **self._landed_reconcile_guards(),
         )
         logger.info(
             '_reconcile_landed_outbox: pruned_not_landed=%d marked_done=%d '
@@ -13764,11 +13762,33 @@ class Harness:
             git_ops=self.git_ops,
             scheduler=self.scheduler,
             outbox=self._merge_worker._landed_outbox,
-            provenance_conflict_sink=self._provenance_conflict_sink,
-            project_root=str(self.config.project_root),
-            check_timeout_secs=self.config.delivered_checks.check_timeout_secs,
-            delivered_checks_enabled=self.config.delivered_checks.enabled,
+            **self._landed_reconcile_guards(),
         )
+
+    async def _reconcile_landing(self, task_id: str) -> str | None:
+        """Drive *task_id*'s landed-outbox done-write; its row's disposition, None with no row.
+
+        The disposition is
+        ``orchestrator/src/orchestrator/merge_lane/worker.py::reconcile_landed_row``'s,
+        under the same guards as :meth:`_landed_dispatch_gate`.
+        """
+        outbox = self._merge_worker._landed_outbox if self._merge_worker is not None else None
+        row = outbox.lookup(task_id) if outbox is not None else None
+        if outbox is None or row is None:
+            return None
+        return await reconcile_landed_row(
+            row, git_ops=self.git_ops, scheduler=self.scheduler, outbox=outbox,
+            main_sha=await self.git_ops.get_main_sha(), **self._landed_reconcile_guards(),
+        )
+
+    def _landed_reconcile_guards(self) -> dict[str, Any]:
+        """The RC-2 guards every landed-outbox reconcile passes, so its callers stay in lockstep."""
+        return {
+            'provenance_conflict_sink': self._provenance_conflict_sink,
+            'project_root': str(self.config.project_root),
+            'check_timeout_secs': self.config.delivered_checks.check_timeout_secs,
+            'delivered_checks_enabled': self.config.delivered_checks.enabled,
+        }
 
     async def _read_already_landed_tick_view(self) -> AlreadyLandedTickView:
         return await read_already_landed_tick_view(self.git_ops)

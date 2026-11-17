@@ -42,6 +42,9 @@ if TYPE_CHECKING:
     from orchestrator.merge_lane.member_redrive import (
         MemberRedriveOutcome,
     )
+    from orchestrator.merge_lane.outcome_facts import (
+        MergeBlockCategory,
+    )
     from orchestrator.merge_lane.ports import (
         ClockPort,
         DiscardingEscalations,
@@ -88,6 +91,7 @@ _INTAKE = 'orchestrator.merge_lane.intake'
 _INTAKE_BUFFERS = 'orchestrator.merge_lane.intake_buffers'
 _LANDING_EVIDENCE = 'orchestrator.merge_lane.landing_evidence'
 _MEMBER_REDRIVE = 'orchestrator.merge_lane.member_redrive'
+_OUTCOME_FACTS = 'orchestrator.merge_lane.outcome_facts'
 _PORTS = 'orchestrator.merge_lane.ports'
 _TYPES = 'orchestrator.merge_lane.types'
 
@@ -115,6 +119,7 @@ _EXPORTS = _ExportTable({
     'MergeRequest': (_TYPES, 'MergeRequest'),
     'GroupMergeRequest': (_TYPES, 'GroupMergeRequest'),
     'MergeOutcome': (_TYPES, 'MergeOutcome'),
+    'MergeBlockCategory': (_OUTCOME_FACTS, 'MergeBlockCategory'),
     'MergeCancelRefusal': (_TYPES, 'MergeCancelRefusal'),
     'MergeCancelVerdict': (_TYPES, 'MergeCancelVerdict'),
     'OperatorMergeCancel': (_TYPES, 'OperatorMergeCancel'),
@@ -167,6 +172,7 @@ __all__ = [
     'MAIN_HEALTH_RED_REASON_PREFIX',
     'MERGE_WORKER_SHUTDOWN_REASON',
     'MemberRedriveOutcome',
+    'MergeBlockCategory',
     'MergeCancelRefusal',
     'MergeCancelVerdict',
     'MergeLane',

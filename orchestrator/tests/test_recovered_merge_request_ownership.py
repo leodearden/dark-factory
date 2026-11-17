@@ -19,12 +19,13 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _landed_rows import record_landing
 from _orch_helpers import (
     wire_clear_claim_then_set_status,
     wire_live_status_from_get_task,
     wire_scheduler_liveness_mock,
 )
-from _startup_harness import merge_lane_harness_factory
+from _startup_harness import journal_merge_request, merge_lane_harness_factory
 from escalation.queue import EscalationQueue
 
 from orchestrator.harness import Harness
@@ -108,16 +109,32 @@ class TestRecoveredRequestOwnsItsTask:
 
         assert _pending_writes(scheduler_double) == []
 
+    @pytest.mark.parametrize('mid_run', [False, True], ids=['startup', 'mid_run'])
     async def test_sweep_reverts_once_the_recovered_request_finalizes(
-        self, harness: Harness, scheduler_double: MagicMock,
+        self, harness: Harness, scheduler_double: MagicMock, mid_run: bool,
     ) -> None:
         future = _hold_recovery_slot(harness)
         future.set_result(None)
         await asyncio.sleep(0)
 
-        await harness._reconcile_stranded_in_progress()
+        await harness._reconcile_stranded_in_progress(mid_run=mid_run)
 
         assert len(_pending_writes(scheduler_double)) == 1
+
+    @pytest.mark.parametrize('recovered', [True, False], ids=['recovered', 'not_recovered'])
+    async def test_sweep_leaves_a_task_whose_journaled_request_startup_recovered(
+        self, tmp_path: Path, scheduler_double: MagicMock, recovered: bool,
+    ) -> None:
+        h = merge_lane_harness_factory(tmp_path)()
+        await journal_merge_request(h, _TID)
+        if recovered:
+            await h._recover_pending_merges()
+        h.config.convert_to_blocked_enforce = False
+        h.scheduler = scheduler_double
+
+        await Harness._reconcile_stranded_in_progress(h)
+
+        assert len(_pending_writes(scheduler_double)) == (0 if recovered else 1)
 
 
 def _recovered_request() -> SimpleNamespace:
@@ -171,18 +188,25 @@ class TestRecoveredRequestOutcomeHasAnOwner:
         assert esc.agent_role == 'harness-recovered-merge-owner'
 
     async def test_landed_recovered_request_drives_the_landed_outbox_done_write(
-        self, harness: Harness, scheduler_double: MagicMock, tmp_path: Path,
+        self, tmp_path: Path, scheduler_double: MagicMock,
     ) -> None:
-        harness._escalation_queue = EscalationQueue(tmp_path / 'esc')
-        landed_gate = AsyncMock(return_value=True)
-        harness._landed_dispatch_gate = landed_gate
+        harness = await _harness_with_real_merge_worker(
+            merge_lane_harness_factory(tmp_path), scheduler_double,
+        )
+        assert harness._merge_worker is not None
+        outbox = harness._merge_worker._landed_outbox
+        assert outbox is not None
+        main_sha = await harness.git_ops.get_main_sha()
+        record_landing(outbox, _TID, advanced_sha=main_sha)
         request = _recovered_request()
         await _recover(harness, request)
 
-        request.result.set_result(SimpleNamespace(status='done', merge_sha='a' * 40, reason=''))
+        request.result.set_result(SimpleNamespace(status='done', merge_sha=main_sha, reason=''))
         await _drain(harness)
 
-        landed_gate.assert_awaited_once_with(_TID)
+        scheduler_double.mark_done.assert_awaited_once_with(_TID, kind='merged', sha=main_sha)
+        assert outbox.lookup(_TID) is None
+        assert harness._escalation_queue is not None
         assert harness._escalation_queue.get_by_task(_TID, status='pending', level=1) == []
 
     async def test_halting_recovered_request_owns_the_merge_halt(

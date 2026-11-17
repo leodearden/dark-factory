@@ -12,6 +12,7 @@ import pytest
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
+from orchestrator.agents.roles import MERGE_HALT_ESCALATION_CATEGORIES
 from orchestrator.merge_halt_escalation import (
     MERGE_HALT_CATEGORY_BY_STATUS,
     MERGE_HALT_STATUSES,
@@ -97,10 +98,9 @@ class TestHaltStatusesMapToTheirCategory:
         assert frozenset(_EXPECTED_CATEGORY) == MERGE_HALT_STATUSES
 
     def test_every_category_is_one_a_restart_re_owns(self) -> None:
-        # The set orchestrator/src/orchestrator/harness.py::Harness._rehydrate_merge_halt re-owns.
-        assert set(MERGE_HALT_CATEGORY_BY_STATUS.values()) <= {
-            'wip_conflict', 'unmerged_state', 'stash_failed',
-        }
+        # test_roles_merge_halt_safety.py pins this tuple to the set
+        # orchestrator/src/orchestrator/harness.py::Harness._rehydrate_merge_halt re-owns.
+        assert set(MERGE_HALT_CATEGORY_BY_STATUS.values()) <= set(MERGE_HALT_ESCALATION_CATEGORIES)
 
 
 class TestTextCarriesTheOutcomesFacts:
