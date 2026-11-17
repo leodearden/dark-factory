@@ -5,7 +5,8 @@ or names no graph, is task 2115's cross-graph leak. Every group-scoped read —
 ``task_family_census`` among them — filters on ``group_id`` and so cannot see
 such a node; this module counts them per graph and per label. It is read-only by
 construction: every call it makes is ``GraphHandle.ro_query``. The per-node
-manifest and the remedy are ``scripts/migrate_cross_graph_leak.py``'s dry run.
+manifest and the remedy are ``fused-memory/scripts/migrate_cross_graph_leak.py``'s
+dry run.
 """
 from __future__ import annotations
 
@@ -275,7 +276,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "Count nodes whose group_id names another graph, or none — task 2115's "
             'cross-graph leak — per graph and per label. Read-only: this never changes '
             'the graph. For the per-node manifest and the remedy, see '
-            'scripts/migrate_cross_graph_leak.py.'
+            'fused-memory/scripts/migrate_cross_graph_leak.py.'
         ),
     )
     parser.add_argument(

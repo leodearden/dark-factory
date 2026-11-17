@@ -24,7 +24,7 @@ names another graph or no graph at all: task 2115's cross-graph leak. Every
 group-scoped read is blind to such nodes, so this restores the leak signal task 5662
 removed from the task-family census. It is read-only, and it exits non-zero when any
 graph was not read whole, not when leaks are found. The per-node manifest and the
-remedy stay with `scripts/migrate_cross_graph_leak.py`'s dry run.
+remedy stay with `fused-memory/scripts/migrate_cross_graph_leak.py`'s dry run.
 
 Baseline: the CLI was not run against the live store, because ad-hoc access to
 production FalkorDB is `redis-cli` reads only. This is the architect's measurement,
