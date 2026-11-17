@@ -224,17 +224,22 @@ class TestAHealthyProbeIsUnchanged:
 
 
 class TestTheRoutedTargetGateFailsClosedToo:
-    """901 is confirmed not live; the finding is routed to 777, which lingers."""
+    """The finding routes to 777, which lingers.
+
+    Routed past its citations (901, confirmed not live), 777 gets its own
+    probe; cited itself, it reuses the cited loop's answer.
+    """
 
     @staticmethod
-    async def _drive_routed(drive, tmp_path, caplog):
+    async def _drive_routed(drive, tmp_path, caplog, finding):
+        """Return the recon queue's stranded records, the routed records, and the filed logs."""
         orchestrator_root = tmp_path / 'orchestrator-root'
         with (
             held_orchestrator_lock(orchestrator_root),
             caplog.at_level(logging.INFO, logger=_HARNESS_LOGGER),
         ):
-            await drive(
-                [finding_citing('901', routed_to='777')],
+            esc_queue = await drive(
+                [finding],
                 [in_progress_task('901'), in_progress_task('777')],
                 project_root=str(orchestrator_root),
             )
@@ -244,7 +249,7 @@ class TestTheRoutedTargetGateFailsClosedToo:
             if r.name == _HARNESS_LOGGER
             and r.getMessage() == 'reconciliation.finding_task_escalation_filed'
         ]
-        return routed, filed
+        return _stranded(esc_queue), routed, filed
 
     @pytest.mark.asyncio
     async def test_a_routed_target_whose_corroboration_raised_is_filed_marked_unknown(
@@ -253,12 +258,30 @@ class TestTheRoutedTargetGateFailsClosedToo:
         _stub_corroboration(monkeypatch, raising_for=frozenset({'777'}))
         _stub_detector(monkeypatch, lingering=frozenset({'777'}))
 
-        [record], [filed] = await self._drive_routed(drive, tmp_path, caplog)
+        _, [record], [filed] = await self._drive_routed(
+            drive, tmp_path, caplog, finding_citing('901', routed_to='777'),
+        )
 
         assert record.task_id == '777'
         assert json.loads(record.detail)[LIVENESS_UNKNOWN_DETAIL_KEY] == ['777']
         assert (filed.task_id, filed.liveness_unknown) == ('777', True)
         assert filed.levelno == logging.WARNING
+
+    @pytest.mark.asyncio
+    async def test_a_cited_routed_target_whose_corroboration_raised_is_marked_on_both_records(
+        self, drive, tmp_path, monkeypatch, caplog,
+    ):
+        _stub_corroboration(monkeypatch, raising_for=frozenset({'777'}))
+        _stub_detector(monkeypatch, lingering=frozenset({'777'}))
+
+        [stranded], [record], [filed] = await self._drive_routed(
+            drive, tmp_path, caplog, finding_citing('777'),
+        )
+
+        assert json.loads(stranded.detail)[LIVENESS_UNKNOWN_DETAIL_KEY] == ['777']
+        assert record.task_id == '777'
+        assert json.loads(record.detail)[LIVENESS_UNKNOWN_DETAIL_KEY] == ['777']
+        assert (filed.task_id, filed.liveness_unknown) == ('777', True)
 
     @pytest.mark.asyncio
     async def test_a_confirmed_not_live_routed_target_is_filed_unmarked(
@@ -267,7 +290,9 @@ class TestTheRoutedTargetGateFailsClosedToo:
         _stub_corroboration(monkeypatch)
         _stub_detector(monkeypatch, lingering=frozenset({'777'}))
 
-        [record], [filed] = await self._drive_routed(drive, tmp_path, caplog)
+        _, [record], [filed] = await self._drive_routed(
+            drive, tmp_path, caplog, finding_citing('901', routed_to='777'),
+        )
 
         assert record.task_id == '777'
         assert LIVENESS_UNKNOWN_DETAIL_KEY not in json.loads(record.detail)
