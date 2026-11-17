@@ -16,12 +16,42 @@ import pytest
 from _fm_helpers import load_script_module
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
+from fused_memory import memory_metadata
+from fused_memory.memory_metadata import KIND_REGISTRY
+from fused_memory.models.enums import MemoryCategory
+
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _mod = load_script_module(
     Path(__file__).parent.parent / 'scripts' / 'census_memory_metadata.py',
     mod_name='census_memory_metadata',
 )
+
+OBS = MemoryCategory.observations_and_summaries.value
+
+
+def _cell(payloads):
+    census = _mod.CategoryCensus()
+    for payload in payloads:
+        census.add(payload)
+    return census
+
+
+def _cov(collection, n):
+    return {
+        'collection': collection,
+        'collection_points': n,
+        'categories': {OBS: {'expected': n, 'scrolled': n, 'recount': n}},
+    }
+
+
+def _report(payloads_by_project, top_n=50):
+    cells = {project: {OBS: _cell(p)} for project, p in payloads_by_project.items()}
+    cov = {
+        project: _cov(f'fused_{project}', len(p))
+        for project, p in payloads_by_project.items()
+    }
+    return _mod.build_report(cells, cov, top_n=top_n)
 
 
 class TestBuildKindRegistryDrift:
@@ -98,3 +128,48 @@ class TestBuildKindRegistryDrift:
         json.dumps(first)
         assert entries == self.ENTRIES
         assert registry == self.REGISTRY
+
+
+class TestKindRegistryDriftInReport:
+    PAYLOADS = {
+        'dark_factory': [{'kind': 'cycle_summary'}, {'kind': 'not_a_real_kind_xyz'}],
+        'reify': [{'kind': 'cycle_summary'}],
+    }
+
+    def _block(self):
+        return _report(self.PAYLOADS)['kind_registry_drift']
+
+    def test_the_block_is_top_level_beside_registry_coverage(self):
+        report = _report(self.PAYLOADS)
+        assert isinstance(report['kind_registry_drift'], dict)
+        assert 'registry_coverage' in report
+        assert 'kind_registry_drift' not in report['topic_coverage']
+        for project in report['projects'].values():
+            assert 'kind_registry_drift' not in project
+
+    def test_schema_version_records_the_new_block(self):
+        assert _report(self.PAYLOADS)['schema_version'] >= 6
+
+    def test_measured_at_grand_total_grain(self):
+        block = _report({
+            'dark_factory': [{'kind': 'cycle_summary'}],
+            'reify': [{'kind': 'cycle_summary'}],
+        })['kind_registry_drift']
+        assert block['measured_distinct'] == 1
+        assert block['measured_records'] == 2
+
+    def test_the_registry_is_the_imported_object_not_a_copy(self):
+        assert _mod.KIND_REGISTRY is memory_metadata.KIND_REGISTRY
+
+    def test_the_real_registry_is_the_default(self):
+        block = self._block()
+        unregistered = [row['value'] for row in block['unregistered']]
+        assert block['registry_total'] == len(KIND_REGISTRY)
+        assert 'cycle_summary' in KIND_REGISTRY
+        assert 'cycle_summary' not in unregistered
+        assert 'not_a_real_kind_xyz' in unregistered
+
+    def test_deterministic_and_serialisable(self):
+        report = _report(self.PAYLOADS)
+        assert json.loads(json.dumps(report)) == report
+        assert self._block() == self._block()
