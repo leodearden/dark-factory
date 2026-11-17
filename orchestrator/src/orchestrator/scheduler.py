@@ -124,6 +124,7 @@ from orchestrator.recovery_emission import (
     veto_signature,
 )
 from orchestrator.recovery_pins import records_pin_blocked_recovery
+from orchestrator.run_slots import DispatchScope
 from orchestrator.sentinel_l1 import file_sentinel_l1, resolve_sentinel_l1
 from orchestrator.starvation_watchdog import (
     AUTO_PIN_CAP_SENTINEL,
@@ -1144,6 +1145,7 @@ class TickContext:
     stale_ids: set[str] = field(default_factory=set)
     psi_hold: PsiHold | None = None
     dispatch_deferred_emitted: bool = False
+    scope: DispatchScope = DispatchScope.ANY
 
 
 # Sentinel a `_phase_*` method returns to mean "proceed to the next phase in
@@ -6742,13 +6744,14 @@ class Scheduler:
         tasks whose deps are all done and that aren't dispatched or in
         their post-requeue cooldown window. ``_eligible_for_dispatch``
         (UNCHANGED) encapsulates all gates so the pin-dispatch loop below
-        uses the same logic (single source of truth). Always continues.
+        uses the same logic (single source of truth). A task ``ctx.scope``
+        does not admit is dropped first. Always continues.
         """
         candidates: list[dict] = []
         candidate_signals: dict[str, str | None] = {}
         for t in ctx.tasks:
             tid_str = str(t.get('id', ''))
-            if not tid_str:
+            if not tid_str or not ctx.scope.admits(t):
                 continue
             eligible, signal_label = self._eligible_for_dispatch(
                 t, tid_str, ctx.status_map, ctx.tasks_by_id,
@@ -6967,8 +6970,13 @@ class Scheduler:
         blocked pin neither reserves nor reports, as before task 6040.
         Returns ``TickOutcome(TaskAssignment)`` on a successful dispatch,
         else ``_CONTINUE`` to fall through to the scored loop.
+
+        A tick restricted to a scope other than ANY skips this phase, so it
+        neither dispatches a pin the scope does not admit nor releases pin
+        reservations; an admitted pinned task dispatches through
+        ``_phase_select_scored`` as an ordinary candidate.
         """
-        if not self._override_store:
+        if not self._override_store or ctx.scope is not DispatchScope.ANY:
             return _CONTINUE
         queue = self._pin_queue(ctx)
         reservable = tuple(
@@ -7396,12 +7404,16 @@ class Scheduler:
         await self._write_snapshot_best_effort()
         return TickOutcome(None)
 
-    async def acquire_next(self) -> TaskAssignment | None:
+    async def acquire_next(self, scope: DispatchScope = DispatchScope.ANY) -> TaskAssignment | None:
         """Find next eligible task under the value/h scoring model.
 
         Dispatch order is determined by ``_score_candidates()``: tier base is
         dominant, age + CPM (+ continuity) bonuses order tasks within a tier,
         and per-tier slot caps reserve headroom for higher-value work.
+
+        A *scope* other than ANY restricts this tick's dispatch to the tasks
+        the scope admits (the harness passes MAIN_HEALTH_FIX when only the
+        reserved run slot is free).
 
         Returns ``None`` immediately when the scheduler is paused (park-stop).
         No MCP round-trips, no GC, no override snapshots are performed while
@@ -7450,7 +7462,7 @@ class Scheduler:
             # exactly an fm outage/restart.  Defer instead — the next
             # successful tick will drain any still-queued requests safely.
             self._note_fm_read_failure()
-            self._emit_tick_telemetry(None, tick_started, {}, 'get_tasks_failed', None)
+            self._emit_tick_telemetry(None, tick_started, {}, 'get_tasks_failed', None, scope)
             return None
         self._reset_fm_read_failure_streak()
         if not tasks:
@@ -7464,7 +7476,7 @@ class Scheduler:
             self._drain_park_eviction_requests(
                 TickContext(tasks=[], status_map={}, tasks_by_id={})
             )
-            self._emit_tick_telemetry(None, tick_started, {}, 'no_active_tasks', None)
+            self._emit_tick_telemetry(None, tick_started, {}, 'no_active_tasks', None, scope)
             return None
 
         # Status + id indices, built once per tick.
@@ -7493,6 +7505,7 @@ class Scheduler:
             status_map=status_map,
             tasks_by_id=tasks_by_id,
             max_id=max_id,
+            scope=scope,
         )
 
         # Ordering-as-data (task 2236, W10-β): drive the whole tick from
@@ -7539,7 +7552,7 @@ class Scheduler:
             return None
         finally:
             self._emit_tick_telemetry(
-                ctx, tick_started, phase_ms, terminal_phase, assignment,
+                ctx, tick_started, phase_ms, terminal_phase, assignment, scope,
             )
 
     def _emit_tick_telemetry(
@@ -7549,6 +7562,7 @@ class Scheduler:
         phase_ms: dict[str, int],
         terminal_phase: str | None,
         assignment: TaskAssignment | None,
+        scope: DispatchScope,
     ) -> None:
         """Emit one ``scheduler_tick`` event summarising the tick just finished.
 
@@ -7572,6 +7586,7 @@ class Scheduler:
                     'phases': phase_ms,
                     'terminal_phase': terminal_phase,
                     'candidates': len(candidates) if candidates is not None else None,
+                    'scope': scope.value,
                 },
             )
         except Exception:
