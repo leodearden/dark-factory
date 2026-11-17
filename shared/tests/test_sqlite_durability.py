@@ -22,6 +22,8 @@ def test_each_triad_pragma_reads_back_the_value_it_declares(tmp_path, pragma: Sq
     conn = sqlite3.connect(tmp_path / 'spec.db')
     try:
         conn.execute('PRAGMA journal_mode=WAL')
+        conn.execute(f'PRAGMA {pragma.name}=0')
+        assert conn.execute(f'PRAGMA {pragma.name}').fetchone()[0] != pragma.value
         conn.execute(pragma.statement)
         assert conn.execute(f'PRAGMA {pragma.name}').fetchone()[0] == pragma.value
     finally:

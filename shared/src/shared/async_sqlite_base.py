@@ -55,7 +55,12 @@ class CheckpointResult(NamedTuple):
 
     @classmethod
     def unavailable(cls) -> CheckpointResult:
-        """No checkpoint ran: the store has no open connection."""
+        """No checkpoint ran: the store is not open, or its caller mapped a failed checkpoint here.
+
+        The second use is
+        ``fused-memory/src/fused_memory/backends/sqlite_task_backend.py::SqliteTaskBackend.checkpoint_all``,
+        so -1/-1/-1 alone does not tell a closed store from a failure.
+        """
         return cls(-1, -1, -1)
 
 
