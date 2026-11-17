@@ -233,6 +233,35 @@ async def test_a_restart_rebuilds_a_missing_read_horizon_index(journal):
 
 
 @pytest.mark.asyncio
+async def test_a_restart_rebuilds_a_read_horizon_index_whose_predicate_is_stale(journal):
+    aged = await _seed(journal, operation='get_task', kind='read', success=False, age_days=20)
+    _null_operation(journal, aged)
+    await journal.close()
+    with contextlib.closing(sqlite3.connect(journal.db_path)) as conn:
+        conn.execute('DROP INDEX idx_wo_read_horizon_time')
+        conn.execute(
+            'CREATE INDEX idx_wo_read_horizon_time ON write_ops(created_at) '
+            "WHERE kind = 'read' AND operation <> 'search'"
+        )
+
+    restarted = WriteJournal(journal.data_dir)
+    await restarted.initialize()
+    try:
+        assert await prune_write_ops_pass(restarted, WriteJournalConfig(read_retention_days=10)) == 1, (
+            'the restart kept an index whose WHERE no longer matches the read '
+            "horizon's, so INDEXED BY had no query solution and every horizon halted"
+        )
+        assert aged not in _surviving_ids(restarted)
+        with contextlib.closing(sqlite3.connect(restarted.db_path)) as conn:
+            (index_sql,) = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE name = 'idx_wo_read_horizon_time'"
+            ).fetchone()
+        assert index_sql == write_journal.READ_HORIZON_INDEX_SQL
+    finally:
+        await restarted.close()
+
+
+@pytest.mark.asyncio
 async def test_a_search_is_journalled_as_a_read_whatever_kind_it_is_given(journal, caplog):
     config = WriteJournalConfig(read_retention_days=10, search_retention_days=15)
 
