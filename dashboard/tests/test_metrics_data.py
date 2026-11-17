@@ -578,7 +578,14 @@ async def test_memory_24h_ago_cost_does_not_grow_with_out_of_window_history(
 
 
 @pytest.mark.asyncio
-async def test_memory_24h_ago_keeps_rows_at_the_exact_tolerance_edges(metrics_db_path: Path):
+@pytest.mark.parametrize(
+    'now',
+    [FIXED_NOW, FIXED_NOW + timedelta(milliseconds=500)],
+    ids=['whole-second-now', 'sub-second-now'],
+)
+async def test_memory_24h_ago_keeps_rows_at_the_exact_tolerance_edges(
+    metrics_db_path: Path, now: datetime
+):
     _insert_memory_snapshots(
         metrics_db_path,
         [
@@ -588,7 +595,7 @@ async def test_memory_24h_ago_keeps_rows_at_the_exact_tolerance_edges(metrics_db
         ],
     )
 
-    result, _ = await _memory_24h_ago_and_vm_steps(metrics_db_path, FIXED_NOW)
+    result, _ = await _memory_24h_ago_and_vm_steps(metrics_db_path, now)
 
     assert set(result) == {'at-lower-edge', 'at-upper-edge'}
 
