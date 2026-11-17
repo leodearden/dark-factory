@@ -61,8 +61,12 @@ from pathlib import Path
 import pytest
 from _git_fixtures import RepoSeed, build_repo
 from _merge_lane_ratchet_fixtures import (
+    GIT_OPS_RELPATH,
+    WORKER_RELPATH,
     blank_file_entry,
+    corrupt_ledger,
     lane_cluster,
+    ledger_files,
     metrics,
     ratchet,
     source_measures,
@@ -245,7 +249,6 @@ _APPENDIX_A_SRC = (
     'orchestrator/src/orchestrator/warm_lane_pool.py',
     'orchestrator/src/orchestrator/recover_main.py',
 )
-_GIT_OPS = 'orchestrator/src/orchestrator/git_ops.py'
 _APPENDIX_A_TESTS = (
     'orchestrator/tests/_merge_queue_harness.py',
     'orchestrator/tests/conftest.py',
@@ -263,7 +266,7 @@ class TestClusterPathSpec:
 
     def test_cluster_paths_includes_git_ops(self) -> None:
         # Measured but not gated by the file-size ceiling (PRD decision 9).
-        assert _GIT_OPS in lane_cluster.CLUSTER_PATHS
+        assert GIT_OPS_RELPATH in lane_cluster.CLUSTER_PATHS
 
     def test_cluster_paths_includes_the_three_test_paths(self) -> None:
         assert set(_APPENDIX_A_TESTS) <= set(lane_cluster.CLUSTER_PATHS)
@@ -275,7 +278,7 @@ class TestClusterPathSpec:
     def test_cluster_paths_has_exactly_the_appendix_a_entries(self) -> None:
         expected = (
             set(_APPENDIX_A_SRC)
-            | {_GIT_OPS}
+            | {GIT_OPS_RELPATH}
             | set(_APPENDIX_A_TESTS)
             | {_MERGE_LANE_GLOB}
         )
@@ -292,7 +295,7 @@ class TestClusterPathSpec:
         # scheduler and recovery -- not only the merge lane -- and its split is
         # a follow-up PRD. The exemption is scoped to the CEILING; git_ops.py is
         # still ratcheted (pinned by TestSizeCeilingExemptionIsScoped).
-        assert set(lane_cluster.SIZE_CEILING_EXEMPT) == {_GIT_OPS}
+        assert set(lane_cluster.SIZE_CEILING_EXEMPT) == {GIT_OPS_RELPATH}
 
     def test_ceiling_constants(self) -> None:
         assert lane_cluster.FILE_LINE_CEILING == 1500
@@ -430,9 +433,7 @@ class TestTheMeasuresOverTheRealCluster:
         # regenerating the baseline with --write-baseline in the same commit,
         # actually applies. That is where exactness lives; here, only the
         # anti-vacuity property.
-        source = (_REPO_ROOT / 'orchestrator/src/orchestrator/merge_lane/worker.py').read_text(
-            encoding='utf-8'
-        )
+        source = (_REPO_ROOT / WORKER_RELPATH).read_text(encoding='utf-8')
         measures = source_measures.file_size_measures(source, path='merge_queue.py')
         assert measures.lines >= 10000
         assert measures.prose_lines > 0
@@ -469,7 +470,7 @@ class TestTheMeasuresOverTheRealCluster:
         # test_pyproject_pin_matches_the_scripts_requirement and the
         # comparator's params.complexipy_version check already hard-block every
         # other major with a named failure.
-        target = _REPO_ROOT / 'orchestrator/src/orchestrator/merge_lane/worker.py'
+        target = _REPO_ROOT / WORKER_RELPATH
         measures = source_measures.file_cognitive_measures(target)
         assert measures.per_function['SpeculativeMergeWorker::_verifier_loop'] >= 100
         assert measures.per_function['SpeculativeMergeWorker::stop'] >= 50
@@ -480,9 +481,7 @@ class TestTheMeasuresOverTheRealCluster:
         # The PRD Background table's "Maintainability index (radon) | 0" row.
         # Reported, never ratcheted -- but genuinely exercised, so the `radon`
         # dev-group entry is not dead weight.
-        source = (_REPO_ROOT / 'orchestrator/src/orchestrator/merge_lane/worker.py').read_text(
-            encoding='utf-8'
-        )
+        source = (_REPO_ROOT / WORKER_RELPATH).read_text(encoding='utf-8')
         assert source_measures.maintainability_index(source, path='merge_queue.py') == 0.0
 
 
@@ -922,7 +921,7 @@ class TestBuildReport:
         assert report['enumeration']['unreadable'] == []
 
     def test_file_entries_carry_the_five_measures(self, report: dict) -> None:
-        entry = report['files']['orchestrator/src/orchestrator/merge_lane/worker.py']
+        entry = report['files'][WORKER_RELPATH]
         assert set(entry) == {
             'lines',
             'prose_lines',
@@ -938,7 +937,7 @@ class TestBuildReport:
         assert entry['cognitive'] >= 1000
 
     def test_functions_is_a_flat_path_qualname_map(self, report: dict) -> None:
-        key = 'orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::_verifier_loop'
+        key = f'{WORKER_RELPATH}::SpeculativeMergeWorker::_verifier_loop'
         # Floor, not equality (measured 245): a fall is permitted by the
         # ratchet contract -- see test_real_merge_queue_line_count_anchor.
         assert report['functions'][key] >= 100
@@ -1398,19 +1397,6 @@ class TestBaselineIO:
         assert 'baseline.json' in str(excinfo.value)
 
 
-def _ledger_files(ledger: Path) -> dict[str, str]:
-    """Every file in the ledger directory *ledger*, by name -- what a write may not touch."""
-    return {path.name: path.read_text(encoding='utf-8') for path in sorted(ledger.iterdir())}
-
-
-def _corrupt_ledger(tmp_path: Path) -> Path:
-    """A ledger directory holding one entry that cannot be read."""
-    ledger = tmp_path / 'raises'
-    ledger.mkdir()
-    (ledger / 'corrupt.json').write_text('{ not json at all', encoding='utf-8')
-    return ledger
-
-
 class TestWriteBaselineRefusesAnUnauthorizedRaise:
     """The write path is where the ratchet is actually enforceable.
 
@@ -1442,14 +1428,14 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
     ) -> None:
         target = self._seeded(tmp_path)
         current = copy.deepcopy(_ratchet_baseline())
-        current['files'][_MQ]['cognitive'] += 15
+        current['files'][WORKER_RELPATH]['cognitive'] += 15
 
         with pytest.raises(ratchet.UnauthorizedRaise) as excinfo:
             ratchet.write_baseline(target, current)
 
         message = str(excinfo.value)
         assert 'cognitive' in message
-        assert _MQ in message
+        assert WORKER_RELPATH in message
         assert '2133' in message and '2148' in message
         # The refusal must name the sanctioned path, not merely forbid the move.
         assert '--authorize-raise' in message
@@ -1459,7 +1445,7 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
     ) -> None:
         target = self._seeded(tmp_path)
         current = copy.deepcopy(_ratchet_baseline())
-        current['files'][_MQ]['cognitive'] += 15
+        current['files'][WORKER_RELPATH]['cognitive'] += 15
 
         with pytest.raises(ratchet.UnauthorizedRaise) as excinfo:
             ratchet.write_baseline(target, current)
@@ -1478,7 +1464,7 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
         target = self._seeded(tmp_path)
         before = target.read_text(encoding='utf-8')
         current = copy.deepcopy(_ratchet_baseline())
-        current['files'][_MQ]['cognitive'] += 15
+        current['files'][WORKER_RELPATH]['cognitive'] += 15
 
         with pytest.raises(ratchet.UnauthorizedRaise):
             ratchet.write_baseline(target, current)
@@ -1492,8 +1478,8 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
         ('mutate', 'measure'),
         [
             pytest.param(
-                lambda cur: cur['files'][_MQ].__setitem__(
-                    'cognitive', cur['files'][_MQ]['cognitive'] + 1
+                lambda cur: cur['files'][WORKER_RELPATH].__setitem__(
+                    'cognitive', cur['files'][WORKER_RELPATH]['cognitive'] + 1
                 ),
                 'cognitive',
                 id='files',
@@ -1542,7 +1528,7 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
         # Lowering is the POINT. It must cost nothing extra.
         target = self._seeded(tmp_path)
         current = copy.deepcopy(_ratchet_baseline())
-        current['files'][_MQ]['cognitive'] -= 400
+        current['files'][WORKER_RELPATH]['cognitive'] -= 400
 
         written = ratchet.write_baseline(target, current)
         assert written.path == target
@@ -1574,19 +1560,19 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
         target = self._seeded(tmp_path)
         ledger = tmp_path / 'raises'
         first = copy.deepcopy(_ratchet_baseline())
-        first['files'][_MQ]['cognitive'] += 15
+        first['files'][WORKER_RELPATH]['cognitive'] += 15
         ratchet.write_baseline(
             target, first, authorization=self._AUTHORIZATION, ledger=ledger
         )
-        recorded = _ledger_files(ledger)
+        recorded = ledger_files(ledger)
         assert ratchet.load_ledger(ledger)
 
         further = copy.deepcopy(first)
-        further['files'][_MQ]['cognitive'] += 5
+        further['files'][WORKER_RELPATH]['cognitive'] += 5
         with pytest.raises(ratchet.UnauthorizedRaise):
             ratchet.write_baseline(target, further, ledger=ledger)
 
-        assert _ledger_files(ledger) == recorded
+        assert ledger_files(ledger) == recorded
         assert target.read_text(encoding='utf-8') == ratchet.render_baseline(first)
 
     def test_a_plain_regeneration_never_reads_the_ledger(
@@ -1597,12 +1583,12 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
         # by the health of a file it does not touch. load_ledger fails HARD on
         # a malformed entry, so any read at all would redden this.
         target = self._seeded(tmp_path)
-        ledger = _corrupt_ledger(tmp_path)
+        ledger = corrupt_ledger(tmp_path)
         lowered = copy.deepcopy(_ratchet_baseline())
-        lowered['files'][_MQ]['cognitive'] -= 400
+        lowered['files'][WORKER_RELPATH]['cognitive'] -= 400
 
         assert ratchet.write_baseline(target, lowered, ledger=ledger).record is None
-        assert _ledger_files(ledger) == {'corrupt.json': '{ not json at all'}
+        assert ledger_files(ledger) == {'corrupt.json': '{ not json at all'}
 
     def test_unauthorized_raise_is_not_a_metrics_error(self) -> None:
         # The exit ladder: 1 is "a measure rose", 2 is "the instrument broke".
@@ -1649,7 +1635,7 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
     ) -> None:
         target = self._seeded(tmp_path)
         current = copy.deepcopy(_ratchet_baseline())
-        current['functions'][f'{_MQ}::brand_new'] = (
+        current['functions'][f'{WORKER_RELPATH}::brand_new'] = (
             lane_cluster.NEW_FUNCTION_COGNITIVE_CEILING + 1
         )
 
@@ -1660,7 +1646,7 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
             v for v in excinfo.value.violations
             if v.measure == 'new_function_over_ceiling'
         ]
-        assert [v.key for v in breaches] == [f'{_MQ}::brand_new']
+        assert [v.key for v in breaches] == [f'{WORKER_RELPATH}::brand_new']
 
     def test_a_new_file_exactly_at_the_line_ceiling_is_written_without_authorization(
         self, tmp_path: Path
@@ -1684,7 +1670,7 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
         target = self._seeded(tmp_path)
         seed = _ratchet_baseline()
         current = copy.deepcopy(seed)
-        del current['files'][_GIT_OPS]
+        del current['files'][GIT_OPS_RELPATH]
         ratchet.write_baseline(target, current)  # dropping it only LOWERS
         restored = copy.deepcopy(seed)
 
@@ -1693,7 +1679,7 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
 
         assert not [
             v for v in excinfo.value.violations
-            if v.measure == 'new_file_over_ceiling' and v.key == _GIT_OPS
+            if v.measure == 'new_file_over_ceiling' and v.key == GIT_OPS_RELPATH
         ]
 
     def test_an_authorized_ceiling_breach_is_recorded(self, tmp_path: Path) -> None:
@@ -1739,8 +1725,8 @@ class TestAuthorizedRaise:
     def _raised() -> dict:
         """Several measures up across two sections, as task 5342's raise was."""
         current = copy.deepcopy(_ratchet_baseline())
-        current['files'][_MQ]['function_local_imports'] += 2
-        current['files'][_MQ]['cognitive'] += 15
+        current['files'][WORKER_RELPATH]['function_local_imports'] += 2
+        current['files'][WORKER_RELPATH]['cognitive'] += 15
         current['functions'][_VERIFIER_LOOP] += 7
         return current
 
@@ -1821,7 +1807,7 @@ class TestAuthorizedRaise:
             'total:cognitive', 'total:function_local_imports'
         }
         assert all(row['key'] == ratchet.CLUSTER_TOTAL_KEY for row in totals)
-        assert {row['key'] for row in measures} >= {_MQ, _VERIFIER_LOOP}
+        assert {row['key'] for row in measures} >= {WORKER_RELPATH, _VERIFIER_LOOP}
 
     def test_a_size_rise_riding_with_an_authorized_raise_is_not_recorded(
         self, tmp_path: Path
@@ -1888,7 +1874,7 @@ class TestAuthorizedRaise:
         # the real ones harder to read.
         target, ledger = self._seeded(tmp_path)
         lowered = copy.deepcopy(_ratchet_baseline())
-        lowered['files'][_MQ]['cognitive'] -= 400
+        lowered['files'][WORKER_RELPATH]['cognitive'] -= 400
 
         written = ratchet.write_baseline(
             target, lowered, authorization=self._authorization(), ledger=ledger
@@ -1918,7 +1904,7 @@ class TestAuthorizedRaiseLedger:
     def _record(task_id: str, rise: int = 103) -> dict:
         return ratchet.authorization_record(
             ratchet.RaiseAuthorization(task_id=task_id, reason=f'reason {task_id}'),
-            [ratchet.Violation.rose('lines', _MQ, 21550, 21550 + rise)],
+            [ratchet.Violation.rose('lines', WORKER_RELPATH, 21550, 21550 + rise)],
         )
 
     def test_absence_is_empty_here_and_fatal_for_the_baseline(
@@ -2051,9 +2037,7 @@ class TestAuthorizedRaiseLedger:
 # seeded-fixture self-test run in microseconds AND lets the CLI's --check reuse
 # the identical code path this test asserts on (SPOT: one ratchet, not two).
 
-_MQ = 'orchestrator/src/orchestrator/merge_lane/worker.py'
-_GIT_OPS = 'orchestrator/src/orchestrator/git_ops.py'
-_VERIFIER_LOOP = f'{_MQ}::SpeculativeMergeWorker::_verifier_loop'
+_VERIFIER_LOOP = f'{WORKER_RELPATH}::SpeculativeMergeWorker::_verifier_loop'
 _TEST_FILE = 'orchestrator/tests/test_merge_queue.py'
 
 
@@ -2073,20 +2057,20 @@ def _ratchet_baseline() -> dict:
         # test-tree counts are live-only, and this fixture stands in for a
         # committed baseline that the comparator reads.
         'enumeration': {
-            'requested': [_MQ, _GIT_OPS],
-            'resolved': [_MQ, _GIT_OPS],
+            'requested': [WORKER_RELPATH, GIT_OPS_RELPATH],
+            'resolved': [WORKER_RELPATH, GIT_OPS_RELPATH],
             'unreadable': [],
             'complete': True,
         },
         'files': {
-            _MQ: {
+            WORKER_RELPATH: {
                 'lines': 21550,
                 'prose_lines': 9000,
                 'cognitive': 2133,
                 'function_local_imports': 12,
                 'reexport_names': 9,
             },
-            _GIT_OPS: {
+            GIT_OPS_RELPATH: {
                 'lines': 14721,
                 'prose_lines': 6000,
                 'cognitive': 1361,
@@ -2094,7 +2078,7 @@ def _ratchet_baseline() -> dict:
                 'reexport_names': 2,
             },
         },
-        'functions': {_VERIFIER_LOOP: 245, f'{_GIT_OPS}::GitOps::advance_main': 108},
+        'functions': {_VERIFIER_LOOP: 245, f'{GIT_OPS_RELPATH}::GitOps::advance_main': 108},
         'tests': {
             _TEST_FILE: {
                 'patch_targets': ['run_scoped_verification', 'time'],
@@ -2106,7 +2090,7 @@ def _ratchet_baseline() -> dict:
 
 def _bump_file(measure: str):
     def mutate(current: dict) -> None:
-        current['files'][_MQ][measure] += 1
+        current['files'][WORKER_RELPATH][measure] += 1
 
     return mutate
 
@@ -2125,8 +2109,8 @@ def _add_file(measure: str):
 
 def _grow_mq_size(current: dict) -> None:
     """The real task-5342 size shape: worker.py 103 lines and 50 prose lines longer."""
-    current['files'][_MQ]['lines'] += 103
-    current['files'][_MQ]['prose_lines'] += 50
+    current['files'][WORKER_RELPATH]['lines'] += 103
+    current['files'][WORKER_RELPATH]['prose_lines'] += 50
 
 
 #: (test id, mutation, expected violation measure, expected violation key).
@@ -2135,14 +2119,14 @@ def _grow_mq_size(current: dict) -> None:
 #: named violation for it. A measure missing from this table is a measure
 #: nothing proves is actually compared.
 _SEEDS = [
-    ('files.cognitive', _bump_file('cognitive'), 'cognitive', _MQ),
+    ('files.cognitive', _bump_file('cognitive'), 'cognitive', WORKER_RELPATH),
     (
         'files.function_local_imports',
         _bump_file('function_local_imports'),
         'function_local_imports',
-        _MQ,
+        WORKER_RELPATH,
     ),
-    ('files.reexport_names', _bump_file('reexport_names'), 'reexport_names', _MQ),
+    ('files.reexport_names', _bump_file('reexport_names'), 'reexport_names', WORKER_RELPATH),
     (
         'functions',
         lambda cur: cur['functions'].__setitem__(
@@ -2253,12 +2237,12 @@ class TestCheckAgainstBaseline:
         baseline = _ratchet_baseline()
         current = copy.deepcopy(baseline)
         _grow_mq_size(current)
-        current['files'][_MQ]['function_local_imports'] += 1
+        current['files'][WORKER_RELPATH]['function_local_imports'] += 1
 
         violations = ratchet.check_against_baseline(current, baseline)
 
         assert [(v.measure, v.key, v.baseline, v.current) for v in violations] == [
-            ('function_local_imports', _MQ, 12, 13),
+            ('function_local_imports', WORKER_RELPATH, 12, 13),
             ('total:function_local_imports', ratchet.CLUSTER_TOTAL_KEY, 17, 18),
         ]
 
@@ -2277,8 +2261,8 @@ class TestCheckAgainstBaseline:
     def test_lowering_a_measure_is_clean(self) -> None:
         baseline = _ratchet_baseline()
         current = copy.deepcopy(baseline)
-        current['files'][_MQ]['lines'] -= 4000
-        current['files'][_MQ]['cognitive'] -= 400
+        current['files'][WORKER_RELPATH]['lines'] -= 4000
+        current['files'][WORKER_RELPATH]['cognitive'] -= 400
         current['functions'][_VERIFIER_LOOP] = 12
         current['tests'][_TEST_FILE]['private_reads'] = 0
         assert ratchet.check_against_baseline(current, baseline) == []
@@ -2316,7 +2300,7 @@ class TestCeilingsApplyOnlyToNewKeys:
         # makes this a ratchet whose grandfathering can only ever shrink.
         baseline = _ratchet_baseline()
         current = copy.deepcopy(baseline)
-        assert current['files'][_MQ]['lines'] == 21550
+        assert current['files'][WORKER_RELPATH]['lines'] == 21550
         assert ratchet.check_against_baseline(current, baseline) == []
 
     def test_size_ceiling_exemption_covers_git_ops_even_when_new(self) -> None:
@@ -2325,9 +2309,9 @@ class TestCeilingsApplyOnlyToNewKeys:
         # otherwise fire -- an exemption never reached is an exemption never
         # tested.
         baseline = _ratchet_baseline()
-        del baseline['files'][_GIT_OPS]
+        del baseline['files'][GIT_OPS_RELPATH]
         current = copy.deepcopy(baseline)
-        current['files'][_GIT_OPS] = blank_file_entry(lines=14721)
+        current['files'][GIT_OPS_RELPATH] = blank_file_entry(lines=14721)
         assert not [
             v
             for v in ratchet.check_against_baseline(current, baseline)
@@ -2338,7 +2322,7 @@ class TestCeilingsApplyOnlyToNewKeys:
         # The contrast that proves the previous test measured the EXEMPTION and
         # not merely a comparator that never fires.
         baseline = _ratchet_baseline()
-        del baseline['files'][_GIT_OPS]
+        del baseline['files'][GIT_OPS_RELPATH]
         current = copy.deepcopy(baseline)
         current['files']['orchestrator/src/orchestrator/merge_new.py'] = (
             blank_file_entry(lines=14721)
@@ -2354,17 +2338,17 @@ class TestCeilingsApplyOnlyToNewKeys:
         # are still frozen by the RATCHET, so they cannot grow unwatched.
         baseline = _ratchet_baseline()
         current = copy.deepcopy(baseline)
-        current['files'][_GIT_OPS]['cognitive'] += 1
+        current['files'][GIT_OPS_RELPATH]['cognitive'] += 1
         assert [
             v
             for v in ratchet.check_against_baseline(current, baseline)
-            if v.measure == 'cognitive' and v.key == _GIT_OPS
+            if v.measure == 'cognitive' and v.key == GIT_OPS_RELPATH
         ]
 
     def test_a_new_function_over_the_cognitive_ceiling_is_a_violation(self) -> None:
         baseline = _ratchet_baseline()
         current = copy.deepcopy(baseline)
-        current['functions'][f'{_MQ}::brand_new'] = 16
+        current['functions'][f'{WORKER_RELPATH}::brand_new'] = 16
         ceilings = [
             v
             for v in ratchet.check_against_baseline(current, baseline)
@@ -2376,7 +2360,7 @@ class TestCeilingsApplyOnlyToNewKeys:
     def test_a_new_function_exactly_at_the_cognitive_ceiling_is_allowed(self) -> None:
         baseline = _ratchet_baseline()
         current = copy.deepcopy(baseline)
-        current['functions'][f'{_MQ}::brand_new'] = 15
+        current['functions'][f'{WORKER_RELPATH}::brand_new'] = 15
         assert ratchet.check_against_baseline(current, baseline) == []
 
     def test_a_grandfathered_function_at_245_is_clean(self) -> None:
@@ -2404,12 +2388,12 @@ class TestComparatorPreconditions:
         baseline = _ratchet_baseline()
         current = copy.deepcopy(baseline)
         baseline['params']['cluster_paths'] = [
-            p for p in lane_cluster.CLUSTER_PATHS if p != _GIT_OPS
+            p for p in lane_cluster.CLUSTER_PATHS if p != GIT_OPS_RELPATH
         ] + ['orchestrator/src/orchestrator/ghost.py']
         with pytest.raises(ratchet.RatchetError) as excinfo:
             ratchet.check_against_baseline(current, baseline)
         message = str(excinfo.value)
-        assert _GIT_OPS in message
+        assert GIT_OPS_RELPATH in message
         assert 'ghost.py' in message
 
     def test_an_incomplete_enumeration_is_never_silently_compared(self) -> None:
@@ -2431,7 +2415,7 @@ class TestComparatorPreconditions:
         baseline = _ratchet_baseline()
         current = copy.deepcopy(baseline)
         current['enumeration']['complete'] = False
-        current['files'][_MQ]['cognitive'] += 5000
+        current['files'][WORKER_RELPATH]['cognitive'] += 5000
         with pytest.raises(ratchet.RatchetError):
             ratchet.check_against_baseline(current, baseline)
 
@@ -2440,10 +2424,10 @@ class TestViolationShape:
     def test_a_violation_carries_both_numbers_and_a_stable_order(self) -> None:
         baseline = _ratchet_baseline()
         current = copy.deepcopy(baseline)
-        current['files'][_MQ]['function_local_imports'] += 1
-        current['files'][_GIT_OPS]['cognitive'] += 1
+        current['files'][WORKER_RELPATH]['function_local_imports'] += 1
+        current['files'][GIT_OPS_RELPATH]['cognitive'] += 1
         violations = ratchet.check_against_baseline(current, baseline)
-        per_path = [v for v in violations if v.key in (_MQ, _GIT_OPS)]
+        per_path = [v for v in violations if v.key in (WORKER_RELPATH, GIT_OPS_RELPATH)]
         assert len(per_path) == 2
         for violation in per_path:
             assert violation.current == violation.baseline + 1
@@ -2455,7 +2439,7 @@ class TestViolationShape:
     def test_the_comparator_mutates_neither_input(self) -> None:
         baseline = _ratchet_baseline()
         current = copy.deepcopy(baseline)
-        current['files'][_MQ]['cognitive'] += 1
+        current['files'][WORKER_RELPATH]['cognitive'] += 1
         before = (json.dumps(current, sort_keys=True), json.dumps(baseline, sort_keys=True))
         ratchet.check_against_baseline(current, baseline)
         after = (json.dumps(current, sort_keys=True), json.dumps(baseline, sort_keys=True))
@@ -2614,12 +2598,12 @@ class TestCheckCli:
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         doctored = copy.deepcopy(stub_measurement)
-        doctored['files'][_MQ]['cognitive'] -= 10
+        doctored['files'][WORKER_RELPATH]['cognitive'] -= 10
         baseline = tmp_path / 'baseline.json'
         ratchet.write_baseline(baseline, doctored)
         assert metrics.main(['--check', '--baseline', str(baseline)]) == 1
         err = capsys.readouterr().err
-        assert _MQ in err
+        assert WORKER_RELPATH in err
         assert 'cognitive' in err
 
     def test_check_passes_a_tree_whose_size_alone_rose(
@@ -2627,8 +2611,8 @@ class TestCheckCli:
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         doctored = copy.deepcopy(stub_measurement)
-        doctored['files'][_MQ]['lines'] -= 10
-        doctored['files'][_MQ]['prose_lines'] -= 10
+        doctored['files'][WORKER_RELPATH]['lines'] -= 10
+        doctored['files'][WORKER_RELPATH]['prose_lines'] -= 10
         baseline = tmp_path / 'baseline.json'
         ratchet.write_baseline(baseline, doctored)
 
@@ -2694,7 +2678,7 @@ class TestWriteBaselineCli:
         # so "a plain regeneration never depends on that file's health" has to
         # be pinned rather than read off a call site that no longer says it.
         target = tmp_path / 'b.json'
-        ledger = _corrupt_ledger(tmp_path)
+        ledger = corrupt_ledger(tmp_path)
 
         assert metrics.main([
             '--write-baseline', str(target), '--ledger', str(ledger)
@@ -2702,7 +2686,7 @@ class TestWriteBaselineCli:
         assert target.read_text(encoding='utf-8') == ratchet.render_baseline(
             stub_measurement
         )
-        assert _ledger_files(ledger) == {'corrupt.json': '{ not json at all'}
+        assert ledger_files(ledger) == {'corrupt.json': '{ not json at all'}
 
 
 class TestAuthorizeRaiseCli:
@@ -2718,7 +2702,7 @@ class TestAuthorizeRaiseCli:
         target = tmp_path / 'b.json'
         ratchet.write_baseline(target, stub)
         raised = copy.deepcopy(stub)
-        raised['files'][_MQ]['cognitive'] += 15
+        raised['files'][WORKER_RELPATH]['cognitive'] += 15
         return target, tmp_path / 'raises', raised
 
     def test_an_authorized_raise_is_written_and_recorded(
@@ -2759,7 +2743,7 @@ class TestAuthorizeRaiseCli:
         assert metrics.main(['--write-baseline', str(target)]) == 1
 
         err = capsys.readouterr().err
-        assert _MQ in err
+        assert WORKER_RELPATH in err
         assert ratchet.RAISE_REMEDY in err
         assert target.read_text(encoding='utf-8') == before
         assert not ledger.exists()
@@ -2858,7 +2842,7 @@ class TestAuthorizeRaiseCli:
         ledger = tmp_path / 'raises'
         ratchet.write_baseline(target, stub_measurement)
         lowered = copy.deepcopy(stub_measurement)
-        lowered['files'][_MQ]['cognitive'] -= 10
+        lowered['files'][WORKER_RELPATH]['cognitive'] -= 10
         monkeypatch.setattr(lane_cluster, 'build_report', lambda root: copy.deepcopy(lowered))
 
         assert metrics.main([
@@ -2988,7 +2972,7 @@ class TestTheBlockMessageNamesTheAuthorizedPath:
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         doctored = copy.deepcopy(stub_measurement)
-        doctored['files'][_MQ]['cognitive'] -= 10
+        doctored['files'][WORKER_RELPATH]['cognitive'] -= 10
         baseline = tmp_path / 'baseline.json'
         ratchet.write_baseline(baseline, doctored)
 
