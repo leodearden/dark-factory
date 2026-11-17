@@ -520,6 +520,9 @@ class PoolFrozen(Exception):
     reset, and a caller must be able to tell the two apart. The structured
     fields say which accounts are in which state, read at the moment of the
     raise; *scope* is the exhausted model scope, or ``None`` for the fleet.
+    *reserved_account* and *release_at* are set when the one open account is
+    the allowance reserve, refused to this caller until *release_at*
+    (plans/allowance-reserve-by-account-prd.md §6.3).
     """
 
     def __init__(
@@ -529,14 +532,27 @@ class PoolFrozen(Exception):
         capped_account_names: tuple[str, ...],
         auth_failed_account_names: tuple[str, ...],
         scope: str | None = None,
+        reserved_account: str | None = None,
+        release_at: datetime | None = None,
     ):
         self.account_count = account_count
         self.capped_account_names = capped_account_names
         self.auth_failed_account_names = auth_failed_account_names
         self.scope = scope
-        where = f'model scope {scope!r} is exhausted on' if scope else 'no account admissible among'
+        self.reserved_account = reserved_account
+        self.release_at = release_at
+        if reserved_account is not None:
+            until = release_at.isoformat() if release_at is not None else 'its release'
+            what = (
+                f'Usage pool refused the reserve {reserved_account!r} until {until}: '
+                f'no other account is admissible among'
+            )
+        elif scope:
+            what = f'Usage pool frozen: model scope {scope!r} is exhausted on'
+        else:
+            what = 'Usage pool frozen: no account admissible among'
         super().__init__(
-            f'Usage pool frozen: {where} all {account_count} account(s) — '
+            f'{what} all {account_count} account(s) — '
             f'capped: {", ".join(capped_account_names) or "none"}; '
             f'auth-failed: {", ".join(auth_failed_account_names) or "none"}'
         )
@@ -1518,13 +1534,17 @@ class UsageGate:
         reserve = self._config.reserve
         return None if reserve is None else reserve.state
 
-    def _pool_frozen(self, scope: str | None) -> PoolFrozen:
+    def _pool_frozen(
+        self, scope: str | None, refusal: ReserveRefusal | None = None
+    ) -> PoolFrozen:
         """The :class:`PoolFrozen` describing this gate right now."""
         return PoolFrozen(
             account_count=self.account_count,
             capped_account_names=self.capped_account_names,
             auth_failed_account_names=self.auth_failed_account_names,
             scope=scope,
+            reserved_account=refusal.account if refusal is not None else None,
+            release_at=refusal.release_at if refusal is not None else None,
         )
 
     async def _wait_for_any_account_to_reopen(self, deadline: float | None) -> None:

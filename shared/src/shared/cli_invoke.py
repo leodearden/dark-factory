@@ -264,7 +264,9 @@ class AllAccountsCappedException(Exception):
     - ``pool_frozen``: the gate's ``PoolFrozen`` when the deadline was spent
       parked, else ``None``.  It says which accounts were capped and which
       AUTH_FAILED, and the message is built from it, because a pool frozen on
-      rejected credentials is not a cap and will not clear at a reset.
+      rejected credentials is not a cap and will not clear at a reset; nor is
+      a caller refused the allowance reserve (``pool_frozen.reserved_account``
+      set), whose message names the reserve and its release time instead.
     """
 
     def __init__(
@@ -280,10 +282,13 @@ class AllAccountsCappedException(Exception):
         self.label = label
         self.pool_frozen = pool_frozen
         spent = f'after {retries} retries ({elapsed_secs:.1f}s elapsed)'
-        super().__init__(
-            f'{label}: all accounts capped {spent}' if pool_frozen is None
-            else f'{label}: cap-wait deadline spent parked {spent} — {pool_frozen}'
-        )
+        if pool_frozen is None:
+            message = f'{label}: all accounts capped {spent}'
+        elif pool_frozen.reserved_account is not None:
+            message = f'{label}: {pool_frozen} (patience spent waiting {spent})'
+        else:
+            message = f'{label}: cap-wait deadline spent parked {spent} — {pool_frozen}'
+        super().__init__(message)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
