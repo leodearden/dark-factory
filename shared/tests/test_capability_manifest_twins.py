@@ -117,6 +117,12 @@ class TestCheckMdTwin:
         sidecar = _write_pair(tmp_path, _sidecar_yaml('α', 'gamma1'), md)
         assert check_md_twin(sidecar, tmp_path) is None
 
+    def test_capability_names_and_verdicts_are_outside_the_pin(self, tmp_path):
+        md = '## α — the first capability, described in prose\n\n## β — recorded FAIL at authoring time\n'
+        assert not any(token in md for token in ('cap-0', 'cap-1', 'PASS'))
+        sidecar = _write_pair(tmp_path, _sidecar_yaml('α', 'β'), md)
+        assert check_md_twin(sidecar, tmp_path) is None
+
     def test_a_missing_twin_names_both_repo_relative_paths(self, tmp_path):
         sidecar = _write_pair(tmp_path, _sidecar_yaml('α'), None)
         message = check_md_twin(sidecar, tmp_path)
