@@ -38,7 +38,7 @@ from shared.process_identity import ProcessIdentity
 from shared.project_id import PROJECT_ID_ALIASES, fold_project_token
 
 from orchestrator import decision_registry as dr
-from orchestrator import fleet_files
+from orchestrator import fleet_files, session_identity
 from orchestrator import session_registry as sr
 
 # ---------------------------------------------------------------------------
@@ -3660,7 +3660,7 @@ class TestLeaseSlugIsNotASessionRecordKey:
         left-hand side is the REAL lease slug, so the helper must break when
         production's builder changes shape.
         """
-        slug = sr.default_lease_slug(f'watcher-{project}', {sr.SESSION_PID_ENV: str(pid)})
+        slug = sr.default_lease_slug(f'watcher-{project}', {session_identity.SESSION_PID_ENV: str(pid)})
         assert slug is not None  # pid > 0, so the builder always derives here
         return slug
 
@@ -3723,7 +3723,7 @@ def test_resolve_session_pid_falls_back_loudly_to_a_provably_dead_pid(
     env: dict[str, str], caplog: pytest.LogCaptureFixture
 ) -> None:
     with caplog.at_level(logging.WARNING):
-        pid = sr.resolve_session_pid(env)
+        pid = session_identity.resolve_session_pid(env)
 
     # Fallback, never a raise -- and never a pid that merely LOOKS resolved.
     # THE assertion: the degraded pid must be one `pid_alive` reports dead,
@@ -3732,7 +3732,7 @@ def test_resolve_session_pid_falls_back_loudly_to_a_provably_dead_pid(
     # earlier `os.getsid(0)` fallback failed this: the POSIX session leader is
     # the interactive shell, which outlives a crashed `claude`.
     assert pid == 0
-    assert sr.pid_alive(pid) is False
+    assert proc_liveness.pid_alive(pid) is False
     # LOUD, not silent: the repo's loud-over-silent-degradation norm (INV-2).
     warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
     assert warnings
@@ -3763,9 +3763,9 @@ def test_default_lease_slug_reproduces_the_measured_production_slug() -> None:
     ``test_the_unblock_lease_slug_shape_changed_at_4248``, which records that
     asymmetry rather than leaving this docstring to imply it away.
     """
-    assert sr.default_lease_slug('watcher-df', {sr.SESSION_PID_ENV: '1894895'}) == 'watcher-df-1894895'
+    assert sr.default_lease_slug('watcher-df', {session_identity.SESSION_PID_ENV: '1894895'}) == 'watcher-df-1894895'
     assert (
-        sr.default_lease_slug('recon-watcher-df', {sr.SESSION_PID_ENV: '1894895'})
+        sr.default_lease_slug('recon-watcher-df', {session_identity.SESSION_PID_ENV: '1894895'})
         == 'recon-watcher-df-1894895'
     )
 
@@ -3789,7 +3789,7 @@ def test_the_unblock_lease_slug_shape_changed_at_4248() -> None:
     that claim after 4248 are unaffected -- both ends derive the same token.
     """
     name = sr.build_lease_name('unblock', 'df', '2085')
-    derived = sr.default_lease_slug(name, {sr.SESSION_PID_ENV: '1894895'})
+    derived = sr.default_lease_slug(name, {session_identity.SESSION_PID_ENV: '1894895'})
 
     assert derived == 'unblock-df#2085-1894895'
     # The exact string the pre-4248 SKILL.md prescribed, for contrast.
@@ -3846,7 +3846,7 @@ def test_default_lease_slug_passes_a_task_scoped_name_through_verbatim() -> None
     """
     name = sr.build_lease_name('unblock', 'df', '2085')
     assert name == 'unblock-df#2085'
-    assert sr.default_lease_slug(name, {sr.SESSION_PID_ENV: '55'}) == 'unblock-df#2085-55'
+    assert sr.default_lease_slug(name, {session_identity.SESSION_PID_ENV: '55'}) == 'unblock-df#2085-55'
 
 
 def test_a_degraded_pid_lease_still_ages_out_and_is_reaped(

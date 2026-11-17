@@ -17,6 +17,7 @@ from pathlib import Path
 
 import pytest
 
+from orchestrator import session_identity
 from orchestrator import session_registry as sr
 
 pytestmark = pytest.mark.skipif(
@@ -121,7 +122,7 @@ def test_a_shared_host_pid_degrades_the_liveness_pid_to_zero_loudly(
     caplog.set_level(logging.WARNING)
     env = {'CLAUDE_PID': str(shared_host_pid), 'CLAUDE_CODE_SESSION_ID': 'sess-a'}
 
-    assert sr.resolve_session_pid(env) == 0
+    assert session_identity.resolve_session_pid(env) == 0
 
     messages = [r.getMessage() for r in _warnings(caplog)]
     assert any('degraded' in m.lower() and str(shared_host_pid) in m for m in messages)
@@ -163,7 +164,7 @@ def test_a_non_host_session_is_unchanged(caplog: pytest.LogCaptureFixture) -> No
     own = os.getpid()
     env = {'CLAUDE_PID': str(own), 'CLAUDE_CODE_SESSION_ID': 'sess-a'}
 
-    assert sr.resolve_session_pid(env) == own
+    assert session_identity.resolve_session_pid(env) == own
     assert _warnings(caplog) == []
     assert sr.default_lease_slug(_NAME, env) == f'{_NAME}-{own}'
 
@@ -171,7 +172,7 @@ def test_a_non_host_session_is_unchanged(caplog: pytest.LogCaptureFixture) -> No
 def test_a_dead_claude_pid_reads_as_a_plain_session_not_a_host(reaped_child_pid: int) -> None:
     env = {'CLAUDE_PID': str(reaped_child_pid), 'CLAUDE_CODE_SESSION_ID': 'sess-a'}
 
-    assert sr.resolve_session_pid(env) == reaped_child_pid
+    assert session_identity.resolve_session_pid(env) == reaped_child_pid
     assert sr.default_lease_slug(_NAME, env) == f'{_NAME}-{reaped_child_pid}'
 
 

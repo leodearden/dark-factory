@@ -19,6 +19,7 @@ from shared.process_identity import ProcessIdentity
 
 from orchestrator import decision_registry as dr
 from orchestrator import session_hooks as sh
+from orchestrator import session_identity
 from orchestrator import session_registry as sr
 
 # A pid virtually guaranteed dead on any host (the suite-wide idiom; see
@@ -250,7 +251,7 @@ class TestResolveOwnRecordSlug:
     ) -> None:
         caplog.set_level(logging.DEBUG)
 
-        assert sr.resolve_session_pid({'CLAUDE_PID': ''}) == 0
+        assert session_identity.resolve_session_pid({'CLAUDE_PID': ''}) == 0
         assert any(r.levelno == logging.WARNING for r in caplog.records)
 
 
@@ -1057,13 +1058,13 @@ class TestLeaseClaimCliRecordSlug:
         _link_pid(self._PID, 'watcher-own-record', tmp_path)
         monkeypatch.setenv('CLAUDE_PID', str(self._PID))
         calls: list[object] = []
-        real = sr.resolve_session_identity
+        real = session_identity.resolve_session_identity
 
-        def counting(env: Mapping[str, str] | None = None) -> sr.SessionIdentity:
+        def counting(env: Mapping[str, str] | None = None) -> session_identity.SessionIdentity:
             calls.append(env)
             return real(env)
 
-        monkeypatch.setattr(sr, 'resolve_session_identity', counting)
+        monkeypatch.setattr(session_identity, 'resolve_session_identity', counting)
 
         assert sr.main(argv) == 0
 
@@ -1434,7 +1435,7 @@ class TestWriteDecisionRecordSlug:
         message = warning.getMessage()
         assert message.startswith(f'write-decision --id {self._ID} ')
         assert 'BLANK record_slug' in message
-        assert sr.SESSION_PID_ENV in message
+        assert session_identity.SESSION_PID_ENV in message
         assert str(self._PID) in message or not names_the_pid
 
     def test_a_hand_launched_watchers_decision_links_to_its_registry_record(

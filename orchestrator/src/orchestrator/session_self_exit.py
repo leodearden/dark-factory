@@ -26,7 +26,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-from orchestrator import session_registry
+from orchestrator import session_identity, session_registry
 
 # session_registry's import puts this checkout's shared/src on sys.path for the bare shell.
 # isort: split
@@ -193,7 +193,7 @@ def _owner_refusal(bound_pid: int | None, owner_pid: int | None) -> SelfExitRefu
         return SelfExitRefusal.OWNER_PID_UNRESOLVED
     if bound_pid != owner_pid:
         return SelfExitRefusal.OWNER_PID_MISMATCH
-    if session_registry.is_shared_session_host(owner_pid):
+    if session_identity.is_shared_session_host(owner_pid):
         return SelfExitRefusal.SHARED_SESSION_HOST
     return None
 
