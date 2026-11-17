@@ -130,6 +130,7 @@ def _judge(
     open_gate_id: str | None = None,
     existing_canonical_slugs: Sequence[str] = (),
     config: Any = None,
+    waived: frozenset = frozenset(),
 ) -> AutoVerdict:
     """Run the predicate over *members*, every unmentioned fact at its benign value.
 
@@ -151,6 +152,7 @@ def _judge(
         open_gate_id=open_gate_id,
         existing_canonical_slugs=existing_canonical_slugs,
         config=config or _auto_config(),
+        waived=waived,
     )
 
 
@@ -1723,3 +1725,101 @@ class TestReasonCodeClasses:
         predicate = {code.value for code in AutoReasonCode}
 
         assert flow.isdisjoint(predicate)
+
+
+#: A body the banner arm matches, for the waiver tests.
+BANNER_BODY = CORRECTION_BANNER_SPECIMENS['bracketed_bare_stamp']
+
+#: Every code a caller may NOT waive, derived from the one table.
+_UNWAIVABLE_CODES = [
+    code
+    for code, cls in REASON_CODE_CLASSES.items()
+    if cls is not ReasonCodeClass.ADJUDICATOR
+]
+
+
+class TestPredicateWaivers:
+    """``waived``: hazards the caller's adjudicator already judged (K2).
+
+    A waiver is ``(code, subject member id)``. A waived hazard is skipped, and
+    only adjudicator-class codes may be waived; anything else raises.
+    """
+
+    def test_a_waived_banner_hazard_is_skipped(self):
+        members = _members(_member('m1'), _member('m2', content=BANNER_BODY))
+        waiver = (AutoReasonCode.member_carries_correction_banner, 'm2')
+
+        unwaived = _judge(members)
+        waived = _judge(members, waived=frozenset({waiver}))
+
+        assert unwaived.outcome is AutoOutcome.FAIL
+        assert waived.outcome is AutoOutcome.PASS
+        assert waived.retain_ids == ('m1', 'm2')
+
+    def test_a_waiver_covers_only_its_subject(self):
+        members = _members(
+            _member('m1'),
+            _member('m2', content=BANNER_BODY),
+            _member('m3', content=BANNER_BODY),
+        )
+
+        verdict = _judge(
+            members,
+            waived=frozenset({(AutoReasonCode.member_carries_correction_banner, 'm2')}),
+        )
+
+        assert verdict.outcome is AutoOutcome.FAIL
+        banner = _reasons_for(verdict, AutoReasonCode.member_carries_correction_banner)
+        assert [reason.ids for reason in banner] == [('m3',)]
+
+    def test_a_waiver_leaves_another_hazard_on_the_same_member(self):
+        members = _members(
+            _member('m1'),
+            _member('m2', content=BANNER_BODY, superseded_by='0090d639'),
+        )
+
+        verdict = _judge(
+            members,
+            waived=frozenset({(AutoReasonCode.member_carries_correction_banner, 'm2')}),
+        )
+
+        assert verdict.outcome is AutoOutcome.FAIL
+        assert AutoReasonCode.member_carries_correction_metadata in _codes(verdict)
+        assert AutoReasonCode.member_carries_correction_banner not in _codes(verdict)
+
+    def test_a_waiver_for_a_hazard_that_did_not_fire_changes_nothing(self):
+        members = _members(_member('m1'), _member('m2'))
+
+        waived = _judge(
+            members,
+            waived=frozenset({(AutoReasonCode.member_carries_correction_banner, 'm1')}),
+        )
+
+        assert waived == _judge(members)
+
+    @pytest.mark.parametrize('code', _UNWAIVABLE_CODES, ids=lambda code: code.value)
+    def test_a_waiver_outside_the_adjudicator_class_raises(self, code):
+        members = _members(_member('m1'), _member('m2'))
+
+        with pytest.raises(ValueError) as excinfo:
+            _judge(members, waived=frozenset({(code, 'm1')}))
+
+        assert code.value in str(excinfo.value)
+        assert REASON_CODE_CLASSES[code].value in str(excinfo.value)
+
+    def test_the_waiver_check_precedes_the_gate_rung(self):
+        """A mis-wired caller fails on every path, not only past rung 1."""
+        members = _members(_member('m1'), _member('m2'))
+
+        with pytest.raises(ValueError):
+            _judge(
+                members,
+                open_gate_id='5183',
+                waived=frozenset({(AutoReasonCode.mixed_category, 'm1')}),
+            )
+
+    def test_a_waiver_naming_no_reason_code_raises(self):
+        members = _members(_member('m1'), _member('m2'))
+
+        with pytest.raises(ValueError, match='not_a_code'):
+            _judge(members, waived=frozenset({('not_a_code', 'm1')}))
