@@ -4078,7 +4078,7 @@ class TestRefreshWriteDiscipline:
         backend-signal emitter, never a writer.
 
         The session's RUNNING->AWAITING_INPUT flip below is this test's OWN
-        setup write (sr.write_record), standing in for an external actor
+        setup write (session_records.write_record), standing in for an external actor
         (e.g. a T4-T7 hook) -- mirrors TestSignalDontMove's convention. The
         write-discipline snapshot is taken AFTER that flip and BEFORE the
         direct refresh_registry() call, so the diff below isolates exactly

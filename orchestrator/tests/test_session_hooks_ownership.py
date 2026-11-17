@@ -552,7 +552,7 @@ def test_hand_launched_session_unaffected_by_ownership_probe(
     # A hand-launched session (no CLAUDE_SPAWN_SESSION_ID) has nothing to
     # probe and must pay no probe cost at all -- the must-not-be-called
     # idiom, not merely an assertion that the outcome is unchanged. Note
-    # run_session_start legitimately calls sr.read_record itself, so it is
+    # run_session_start legitimately calls session_records.read_record itself, so it is
     # sh._env_slug_is_owned that is booby-trapped here, not the registry.
     def _boom(*_args: object, **_kwargs: object) -> bool:
         raise AssertionError('ownership probe must not run for a hand-launched session')
