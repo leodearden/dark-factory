@@ -116,4 +116,6 @@ From `docs/code-quality.md`:
 - The PSI admission gate still applies to fixes.
 - While the general pool is full and the reserve is free, a tick runs every
   `idle_poll_secs`, at the same cadence and cost as an idle tick
-  (INV-8 `loop-thread-occupancy-bounded`).
+  (INV-8 `loop-thread-occupancy-bounded`). A general slot that frees during
+  such a restricted tick is refilled by an unrestricted tick at once, not
+  after the next poll.

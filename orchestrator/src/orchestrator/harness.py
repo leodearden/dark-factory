@@ -3089,7 +3089,10 @@ class Harness:
                         finally:
                             self._idle_poll_sleeping = False
                         continue
-                    await self._wait_for_slot_turnover()
+                    # A general slot freed during a restricted tick widens the
+                    # scope: tick again now instead of waiting a poll.
+                    if slots.free_scope() is scope:
+                        await self._wait_for_slot_turnover()
                     continue
 
                 sem = await slots.claim(scope, assignment.task)

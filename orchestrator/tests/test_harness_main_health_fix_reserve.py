@@ -32,6 +32,7 @@ from orchestrator.workflow import WorkflowOutcome
 
 _TICK = 0.01
 _SETTLE_TICKS = 10
+_LONG_POLL = 3600.0
 _GENERAL_SLOTS = 18
 _UNIT = 'orchestrator-reserve-test.service'
 
@@ -80,10 +81,14 @@ class _Board:
         self.live_at_start: dict[str, int] = {}
         self.max_live = 0
         self._all_open = False
+        self._inside_next_restricted_tick: Callable[[], Awaitable[None]] | None = None
         real_acquire = scheduler.acquire_next
 
         async def recorded_acquire(scope: DispatchScope = DispatchScope.ANY) -> TaskAssignment | None:
             epoch = self.epoch
+            if scope is DispatchScope.MAIN_HEALTH_FIX and self._inside_next_restricted_tick is not None:
+                action, self._inside_next_restricted_tick = self._inside_next_restricted_tick, None
+                await action()
             assignment = await real_acquire(scope)
             self.ticks.append(_Tick(epoch, scope, assignment.task_id if assignment else None))
             return assignment
@@ -101,6 +106,10 @@ class _Board:
         """Put *tasks* on the board; returns the epoch whose ticks are the first to see them."""
         self.tasks.extend(tasks)
         return self.mark()
+
+    def inside_next_restricted_tick(self, action: Callable[[], Awaitable[None]]) -> None:
+        """Run *action* once, inside the next MAIN_HEALTH_FIX tick, before that tick reads the board."""
+        self._inside_next_restricted_tick = action
 
     def ticks_since(self, epoch: int) -> list[_Tick]:
         return [tick for tick in self.ticks if tick.epoch >= epoch]
@@ -150,13 +159,18 @@ async def _settle() -> None:
 
 
 def _harness(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, reserve: int, tasks: list[dict],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    reserve: int,
+    tasks: list[dict],
+    idle_poll_secs: float = _TICK,
 ) -> tuple[Harness, _Board]:
     config = OrchestratorConfig(
         project_root=tmp_path,
         max_concurrent_tasks=_GENERAL_SLOTS,
         main_health_fix_reserved_slots=reserve,
-        idle_poll_secs=_TICK,
+        idle_poll_secs=idle_poll_secs,
         watcher_supervisor_enabled=False,
         review=ReviewConfig(full_review_on_complete=False),
         psi_admission=PsiAdmissionConfig(enabled=False),
@@ -307,5 +321,29 @@ class TestMainHealthFixReserve:
             assert board.live_at_start[second_fix] == _GENERAL_SLOTS + 1
             first = board.ticks_since(freed)[0]
             assert (first.scope, first.picked) == (DispatchScope.MAIN_HEALTH_FIX, second_fix)
+
+        await _run_driven(h, board, drive)
+
+    async def test_a_general_slot_freed_during_a_restricted_tick_is_refilled_without_waiting_a_poll(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        h, board = _harness(
+            tmp_path, monkeypatch, reserve=1, tasks=_merge_waiters(), idle_poll_secs=_LONG_POLL,
+        )
+        filed: list[int] = []
+
+        async def end_a_merge_waiter_and_file_plain_work() -> None:
+            filed.append(board.file(_plain('70')))
+            board.gates['1'].set()
+            await _until(lambda: board.started('1') and '1' not in board.live, 'merge-waiter 1 ends mid-tick')
+            await _settle()
+
+        board.inside_next_restricted_tick(end_a_merge_waiter_and_file_plain_work)
+
+        async def drive() -> None:
+            await _until(lambda: board.started('70'), 'the freed general slot is refilled before the next poll')
+            [epoch] = filed
+            first = board.ticks_since(epoch)[0]
+            assert (first.scope, first.picked) == (DispatchScope.ANY, '70')
 
         await _run_driven(h, board, drive)
