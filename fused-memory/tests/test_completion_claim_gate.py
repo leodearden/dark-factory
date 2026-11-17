@@ -981,8 +981,8 @@ class TestEmitUnverifiedClaimEscalation:
         payload = json.loads(files[0].read_text())
         assert payload['id'] == esc_id
         assert payload['category'] == 'unverified_completion_claim'
-        assert payload['level'] == 1, (
-            'the filed record, not just the forwarded kwarg, must be born at L1'
+        assert payload['level'] == 0, (
+            'the filed record, not just the forwarded kwarg, must be born at L0'
         )
 
         # The record must be actionable without opening the code or the corpus:
@@ -994,6 +994,41 @@ class TestEmitUnverifiedClaimEscalation:
         assert "observed='in-progress'" in detail, f'must state what was seen: {detail!r}'
         assert "subject='task'" in detail, f'must name the authority: {detail!r}'
         assert 'has been applied' in detail, f'must quote the claim: {detail!r}'
+
+    def test_the_filed_record_is_one_the_info_l0_router_converts_into_a_curator_task(
+        self, tmp_path,
+    ):
+        from fused_memory.services import completion_claim_gate as gate_mod
+
+        pytest.importorskip('escalation')
+        from escalation.classify import INFO_L0_MECHANICAL_ROLES
+        from escalation.disposition import ConvertViaCurator, ExitKind, route_info_l0
+        from escalation.queue import EscalationQueue
+        from shared.project_layout import escalation_queue_dir
+
+        esc_id = gate_mod.emit_unverified_claim_escalation(str(tmp_path), self._flag())
+        assert esc_id is not None
+        record = EscalationQueue(escalation_queue_dir(tmp_path)).get(esc_id)
+        assert record is not None, f'{esc_id!r} must be readable from the project queue'
+
+        # The orchestrator's orphan reaper hands every info L0 to this router;
+        # no task row backs the synthetic anchor, so its status is unknown.
+        decided = route_info_l0(
+            record,
+            task_status=None,
+            exit_kind=ExitKind.ORPHAN,
+            mechanical_roles=INFO_L0_MECHANICAL_ROLES,
+        )
+
+        assert isinstance(decided, ConvertViaCurator), (
+            'the info-L0 router must turn each unverified claim into a curator '
+            'task, so a tracked task checks the claim instead of it closing as '
+            f'info noise; got {decided!r}'
+        )
+        assert decided.payload.spawned_from == 'unverified-claim-5422', (
+            'escalation-watcher self-execute item 11 keys on this provenance'
+        )
+        assert decided.payload.escalation_id == esc_id
 
     def test_dedupes_per_project_and_ref(self, tmp_path):
         """A repeated claim about the SAME ref collapses onto the open record;
@@ -1080,9 +1115,10 @@ class TestDelegatesToTheSharedHelper:
             'write-path noise in front of work that cannot proceed'
         )
         assert seen['project_root'] == str(tmp_path)
-        assert seen['level'] == 1, (
-            'a synthetic per-ref anchor has no steward; an L0 would only wait '
-            'for the orphan-L0 reaper'
+        assert seen['level'] == 0, (
+            'at L0 the info-L0 router converts each claim into a curator task; '
+            'at L1 the auto-watcher has no recipe for this category and closes '
+            'an all-info record as benign'
         )
 
     def test_two_different_refs_get_two_different_anchors(
