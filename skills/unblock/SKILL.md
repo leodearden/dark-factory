@@ -838,7 +838,8 @@ If `merge_cancel` answers an epistemic state on the `request_id` handle (or the 
 **This site's dispositions** — you are deciding whether anything still needs abandoning:
 - a `done` whose sha you hold (a `kind: "found_on_main"` answer's `merge_sha`, or one the ladder yields — an event-store `done`'s `merge_sha` is the record's, not a git proof, so run the ladder for it), or a `landing_unattributable` whose ladder yields a stampable sha → nothing to abandon; proceed to **step 8** with `done_provenance={"kind": "found_on_main", "commit": "<that sha>", "note": "<the note the ladder specifies for that arm>"}`; both fields are required.
 - `never_submitted` or `prior_run_terminal` → nothing in flight to abandon; report `last_outcome` if present.
-- a wait state or a live state → the entry exists, but this server holds no waiter for it, so `merge_cancel` cannot reach it: report it rather than retrying.
+- a live state → the merge is still in flight, so cancel it: `merge_cancel(request_id=<that answer's request_id>)`. The merge lane cancels it by id even when this server holds no waiter for it (`escalation/src/escalation/server.py::merge_cancel`, task 5248). A `cancelled: false` carrying a `code` (`finalize_window`, `train_cancel_unsupported`) is the lane refusing: report that code and the state, never retry into it.
+- a wait state (`journaled_not_live`, `probe_failed`) → no live entry for `merge_cancel` to reach: report it rather than retrying.
 
 Never fall back to direct merge in response to an epistemic answer.
 

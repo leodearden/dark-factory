@@ -397,7 +397,7 @@ mcp__escalation__merge_cancel(request_id="<request_id from submit>")
 The response is `{ cancelled, state, reason }`:
 
 - **`cancelled: true`** with `state: "abandoned"` — a pending waiter was dropped. The merge will not proceed.
-- **`cancelled: false`** — the request was already finalized (terminal), answered an epistemic state, or already cancelled. The `state` and `reason` fields explain why.
+- **`cancelled: false`** — the request was already finalized (terminal), answered an epistemic state, or already cancelled. The `state` and `reason` fields explain why. When it also carries a `code` (`finalize_window`, `train_cancel_unsupported`, `not_live`), the merge lane refused a live request: report the code rather than retrying.
 
 **Important:** `merge_cancel` is the **only** explicit-cancellation path. An MCP client disconnect no longer cancels the merge (durable intent), so an abandoned submission must be cancelled deliberately.
 
