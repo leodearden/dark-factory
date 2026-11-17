@@ -121,6 +121,7 @@ PURE_STDLIB_LEAVES = (
     'timestamps',
     'transcript_archive',
     'verify_admission',
+    'verify_scope_tag',
     'whole_tree_guard_family',
 )
 
