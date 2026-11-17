@@ -23,6 +23,7 @@ from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _git_root_helper import make_git_root
 from shared.cli_invoke import AgentResult
 from shared.testing import make_gate_mock
 
@@ -39,6 +40,7 @@ from fused_memory.reconciliation.cli_stage_runner import (
     STAGE3_DISALLOWED,
 )
 from fused_memory.reconciliation.judge import Judge
+from fused_memory.reconciliation.verify import CodebaseVerifier
 from reconciliation.stubbed_stage_cli import run_stage, run_stage_answered_by
 
 _STAGE_REPORT = AgentResult(success=True, output='{"summary": "s"}')
@@ -149,3 +151,30 @@ async def test_judge_loads_no_settings_claude_md_or_memory_index(tmp_path, monke
     assert kwargs['env_overrides'] == dict(RECONCILIATION_CLI_ENV_OVERRIDES)
     assert kwargs['cwd'] == tmp_path
     assert kwargs['strict_mcp_config'] is True
+
+
+@pytest.mark.asyncio
+async def test_verify_loop_loads_no_settings_claude_md_or_memory_index(tmp_path):
+    git_root = make_git_root(tmp_path)
+
+    with patch(
+        'fused_memory.reconciliation.agent_loop.invoke_with_cap_retry', new_callable=AsyncMock,
+    ) as invoke:
+        invoke.return_value = AgentResult(
+            success=True,
+            output='',
+            structured_output={
+                'verdict': 'confirmed', 'confidence': 1.0, 'evidence': [], 'summary': 's',
+            },
+        )
+        await CodebaseVerifier(ReconciliationConfig()).verify(
+            claim='x.py defines x', codebase_root=git_root,
+        )
+
+    invoke.assert_awaited_once()
+    kwargs = invoke.call_args.kwargs
+    assert kwargs['setting_sources'] == []
+    assert kwargs['env_overrides'] == dict(RECONCILIATION_CLI_ENV_OVERRIDES)
+    assert kwargs['cwd'] == git_root.resolve()
+    assert kwargs['permission_mode'] == 'dontAsk'
+    assert kwargs['available_tools'] == ['Read', 'Grep', 'Glob']
