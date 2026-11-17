@@ -12,10 +12,10 @@ module: it reads harness privates, which the merge-lane ratchet
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -24,6 +24,7 @@ from _orch_helpers import (
     wire_live_status_from_get_task,
     wire_scheduler_liveness_mock,
 )
+from _startup_harness import merge_lane_harness_factory
 from escalation.queue import EscalationQueue
 
 from orchestrator.harness import Harness
@@ -140,25 +141,15 @@ async def _drain(h: Harness) -> None:
     await asyncio.gather(*h._background_tasks)
 
 
-class FakeMergeWorker:
-    def __init__(self, *, halted: bool) -> None:
-        self.is_wip_halted = halted
-        self.halt_owner_esc_id: str | None = None
-
-    def halt_for_wip(self, reason: str) -> None:
-        self.is_wip_halted = True
-        self.halt_owner_esc_id = None
-
-    def set_halt_owner(self, esc_id: str) -> None:
-        assert self.is_wip_halted
-        assert self.halt_owner_esc_id is None
-        self.halt_owner_esc_id = esc_id
-
-    def is_halt_owner(self, esc_id: str) -> bool:
-        return self.halt_owner_esc_id == esc_id
-
-    def unhalt_wip(self, reason: str | None = None) -> None:
-        self.is_wip_halted = False
+async def _harness_with_real_merge_worker(
+    make: Callable[[], Harness], scheduler: MagicMock,
+) -> Harness:
+    """A Harness over the factory's shared escalation dir, holding a real merge worker."""
+    h = make()
+    await h._start_escalation_server()
+    h.scheduler = scheduler
+    await h._start_merge_worker()
+    return h
 
 
 @pytest.mark.asyncio
@@ -195,11 +186,13 @@ class TestRecoveredRequestOutcomeHasAnOwner:
         assert harness._escalation_queue.get_by_task(_TID, status='pending', level=1) == []
 
     async def test_halting_recovered_request_owns_the_merge_halt(
-        self, harness: Harness, scheduler_double: MagicMock, tmp_path: Path,
+        self, tmp_path: Path, scheduler_double: MagicMock,
     ) -> None:
-        harness._escalation_queue = EscalationQueue(tmp_path / 'esc')
-        worker = FakeMergeWorker(halted=True)
-        harness._merge_worker = cast(Any, worker)
+        make = merge_lane_harness_factory(tmp_path)
+        harness = await _harness_with_real_merge_worker(make, scheduler_double)
+        worker = harness._merge_worker
+        assert worker is not None
+        worker.halt_for_wip('park of the main checkout failed')
         request = _recovered_request()
         await _recover(harness, request)
 
@@ -209,16 +202,17 @@ class TestRecoveredRequestOutcomeHasAnOwner:
         ))
         await _drain(harness)
 
+        assert harness._escalation_queue is not None
         [esc] = harness._escalation_queue.get_by_task(_TID, status='pending', level=1)
         assert esc.category == 'stash_failed'
         assert worker.is_halt_owner(esc.id)
         scheduler_double.set_task_status.assert_any_await(_TID, 'blocked')
 
-        restarted = FakeMergeWorker(halted=False)
-        harness._merge_worker = cast(Any, restarted)
-        assert harness._rehydrate_merge_halt() == esc.id
-        assert restarted.is_wip_halted
-        assert restarted.is_halt_owner(esc.id)
+        restarted = await _harness_with_real_merge_worker(make, scheduler_double)
+        assert Harness._rehydrate_merge_halt(restarted) == esc.id
+        assert restarted._merge_worker is not None
+        assert restarted._merge_worker.is_wip_halted
+        assert restarted._merge_worker.is_halt_owner(esc.id)
 
     async def test_shutdown_outcome_leaves_the_task_for_the_next_start(
         self, harness: Harness, scheduler_double: MagicMock, tmp_path: Path,
