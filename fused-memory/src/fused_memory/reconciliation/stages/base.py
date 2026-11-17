@@ -484,13 +484,26 @@ class BaseStage:
     def _archive_stage_transcripts(self, config_dir: TaskConfigDir, run_id: str) -> None:
         """Producer half of recon transcript archival (task 3972).
 
-        COPIES: deleting the source is the teardown half's job
-        (``cli_stage_runner.py::gc_run_config_dir``, which archives before it
-        deletes). Runs on every exit, cancellation included, so each stage's
-        transcript is durable before the run's teardown reaches the dir.
-        ``session_id=None`` archives the whole per-run dir, so subagent
-        transcripts are covered; ``_archive_one``'s mtime-equality skip makes
-        repeats nearly free. Synchronous and total by contract.
+        Copies every transcript in the run's config dir into the archive as
+        each stage exits, cancellation included, so the archive already holds
+        them all by the time the harness writes the run row terminal.
+
+        The case only this copy covers: a kill that runs no ``finally``
+        (SIGKILL, watchdog SIGABRT, OOM) after the row went terminal and before
+        the teardown ``cli_stage_runner.py::gc_run_config_dir`` ran.
+        ``harness.py::ReconciliationHarness.run_full_cycle`` writes the row
+        terminal (``complete_run``, ``_record_*_run``) before its finally-GC,
+        and every recovery pass selects only 'running' rows
+        (``journal.py::ReconciliationJournal.get_stale_runs`` /
+        ``get_running_runs``). Nothing revisits such a dir, so this copy is the
+        only archival its transcripts get. A boot-time orphan sweep over recon
+        config dirs (task 4906) would retire this hook.
+
+        COPIES: deleting the source is the teardown's job, and
+        ``gc_run_config_dir`` archives before it deletes. ``session_id=None``
+        archives the whole per-run dir, so subagent transcripts are covered;
+        ``_archive_one``'s mtime-equality skip makes repeats nearly free.
+        Synchronous and total by contract.
         """
         archive_root = recon_archive_root(self.config)
         if archive_root is None:
