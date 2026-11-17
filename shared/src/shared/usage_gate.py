@@ -590,7 +590,9 @@ class InvokeSlot:
     (``break``, ``continue``, ``return``, exception) unless the slot was
     explicitly settled by :meth:`detect_cap_hit` (returning True),
     :meth:`report` or :meth:`confirm`. The first of those settles the slot's
-    one verdict; a later :meth:`confirm` is a no-op.
+    one verdict; a later :meth:`confirm` is a no-op. That verdict is also when a
+    call on the allowance reserve in its protected window is recorded as
+    ``reserve_served``, with the cost only :meth:`confirm` carries.
 
     Use via :meth:`UsageGate.invoke_slot`::
 
@@ -603,17 +605,20 @@ class InvokeSlot:
         # any other exit: __aexit__ calls release_probe_slot
     """
 
-    __slots__ = ('_gate', 'lease', '_settled', 'scope')
+    __slots__ = ('_gate', 'lease', '_settled', 'scope', 'work_class')
 
     def __init__(
         self,
         gate: UsageGate,
         lease: AccountLease | None,
         scope: str | None = None,
+        *,
+        work_class: WorkClassSource | None = None,
     ) -> None:
         self._gate = gate
         self.lease = lease
         self._settled = False
+        self.work_class = work_class
         # Cap scope for this invocation (PRD task β): the invoked model when it
         # is a scoped-cap model, else None (the general scope). `report` /
         # `detect_cap_hit` forward it to the gate's cap handlers so a scoped
@@ -669,7 +674,7 @@ class InvokeSlot:
             # transition at all: the SCOPED _handle_cap_detected branch
             # (invariant S5) and _handle_near_cap_warning in EITHER scope.
             self._gate.release_probe_slot(self.token)
-            self._settled = True
+            self._settle_with_verdict(None)
         return hit
 
     def confirm(self, cost_usd: float = 0.0) -> None:
@@ -688,7 +693,7 @@ class InvokeSlot:
             return
         self._gate.confirm_account_ok(self.token)
         self._gate.on_agent_complete(cost_usd)
-        self._settled = True
+        self._settle_with_verdict(cost_usd)
 
     def settle(self) -> None:
         """Mark probe state as externally handled.
@@ -697,7 +702,15 @@ class InvokeSlot:
         ``probe_in_flight`` (e.g. ``_handle_cap_detected`` in heuristic
         cap detection).
         """
+        self._settle_with_verdict(None)
+
+    def _settle_with_verdict(self, cost_usd: float | None) -> None:
+        """Settle the slot's one verdict; the only writer of ``_settled = True``."""
+        if self._settled:
+            return
         self._settled = True
+        if self.lease is not None:
+            self._gate._note_reserve_served(self.lease, self.work_class, cost_usd)
 
     def report(self, outcome: InvocationOutcome) -> None:
         """Apply *outcome*'s gate transition and settle the slot, atomically.
@@ -786,7 +799,7 @@ class InvokeSlot:
                 # None` branch deliberately bypasses _transition (invariant S5)
                 # and returns before any phase write, so without this the
                 # PROBE_IN_FLIGHT claim taken by before_invoke() is never
-                # released, and `finally: _settled = True` below also suppresses
+                # released, and settling in the `finally` below also suppresses
                 # invoke_slot()'s __aexit__ safety net — the account is skipped
                 # by before_invoke's predicate forever.
                 self._gate.release_probe_slot(token)
@@ -798,7 +811,7 @@ class InvokeSlot:
             else:
                 self._gate.release_probe_slot(token)
         finally:
-            self._settled = True
+            self._settle_with_verdict(None)
 
 
 class UsageGate:
@@ -1837,6 +1850,21 @@ class UsageGate:
             'release_at': refused.release_at.isoformat(),
         }
 
+    def _note_reserve_served(
+        self, lease: AccountLease, source: WorkClassSource | None, cost_usd: float | None
+    ) -> None:
+        """Record a call on the reserve settling in its protected window (PRD §6.6)."""
+        rule = self._active_reserve_config()
+        if self._cost_store is None or rule is None or lease.name != rule.account:
+            return
+        if rule.in_release_window(self._reserve_now()):
+            return
+        details = work_class_details(resolve_work_class(source), unclassified=source is None)
+        del details['unclassified']
+        self._fire_reserve_event(
+            lease.name, ReserveEvent.SERVED, {**details, 'cost_usd': cost_usd}
+        )
+
     def _reserve_waiter(self) -> asyncio.Event:
         if self._reserve_wake is None:
             self._reserve_wake = asyncio.Event()
@@ -1905,7 +1933,7 @@ class UsageGate:
         lease = await self.before_invoke(
             scope=scope, park=park, max_wait_secs=max_wait_secs, **reserve_kwargs,
         )
-        slot = InvokeSlot(self, lease, scope=scope)
+        slot = InvokeSlot(self, lease, scope=scope, work_class=work_class)
         try:
             yield slot
         finally:
