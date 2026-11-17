@@ -363,6 +363,8 @@ class TestScanContentPrecision:
             'subtask: 2500',
             'sub-task: 2500',
             'subtasks: 2500',
+            'subtask:2500',
+            'sub-task:2500',
         ],
     )
     def test_noise_yields_no_referents(self, content):
@@ -739,11 +741,11 @@ class TestTaskWordIsAsciiOnly:
 
 
 class TestQualifiedRefNeverSpansALineBreak:
-    """The PROJECT-QUALIFIED pattern's colon is padded with '[ \\t]', not '\\s',
-    for the same measured reason as the mention pattern's above: '\\s' matches
-    '\\n', and no real project-qualified reference is written across a line
-    break — while episode bodies routinely carry YAML/'key: value' blocks and
-    hard-wrapped prose, which the '\\s' spelling read as qualified refs.
+    """A PROJECT-QUALIFIED ref never spans a line break, for the same measured
+    reason as the mention pattern's above: no real project-qualified reference
+    is written across a line break, while episode bodies routinely carry
+    YAML/'key: value' blocks and hard-wrapped prose, which a '\\s' pad around
+    the colon read as qualified refs.
 
     Direction of safety: this narrowing REMOVES foreign refs, and for a
     consumer performing destructive edge surgery a false positive
@@ -775,7 +777,7 @@ class TestQualifiedRefNeverSpansALineBreak:
         not projects). This one is a FALSE negative: a real qualified ref that
         hard wrapping split, since wrapping breaks at the space after the colon
         (``textwrap.fill(..., 40)`` produces exactly this string). It is the
-        same '\\s'-vs-'[ \\t]' decision seen from the losing side, and it is
+        same line-break decision seen from the losing side, and it is
         pinned here — and listed in scan_content's KNOWN BLIND SPOTS — so a
         future reader sees the recall loss was weighed rather than missed. It
         is accepted for the reason stated on the pattern: for a consumer doing
@@ -786,20 +788,98 @@ class TestQualifiedRefNeverSpansALineBreak:
         content = 'please see the reference dark_factory:\n2500 for more detail'
         assert scan_content(content, group_id='reify').refs == ()
 
-    def test_same_line_spellings_are_unaffected(self):
-        """Regression guard, green before AND after: the padding still tolerates
-        the spaces and tabs humans actually write around a colon. This is what
-        proves the change narrows ONLY across line breaks and is not an
-        undeclared tightening of human spacing."""
-        for content in (
-            'dark_factory:2500',
-            'dark_factory: 2500',
-            'dark_factory :2500',
-            'dark_factory\t:\t2500',
-        ):
-            assert [r.node_name for r in scan_content(content, group_id='reify').refs] == [
-                'dark_factory:2500'
-            ], content
+    def test_the_tight_same_line_spelling_is_unaffected(self):
+        """Regression guard: refusing the line break must not refuse the tight
+        spelling. Spaced spellings are refused too, by
+        :class:`TestQualifiedRefColonIsUnpadded`."""
+        scan = scan_content('dark_factory:2500', group_id='reify')
+        assert [r.node_name for r in scan.refs] == ['dark_factory:2500']
+
+
+class TestQualifiedRefColonIsUnpadded:
+    """A project-qualified ref in prose is written tight, 'reify:132': a blank on
+    either side of its colon makes 'word: N' prose, never a ref (measured in the
+    S26 PRD §Rationale rehomed, the ο bullet)."""
+
+    @pytest.mark.parametrize(
+        'content',
+        [
+            pytest.param('matched the live plan exactly: 15+4 detaches', id='sighting-6059-exactly'),
+            pytest.param('Follow-ups: 6035', id='sighting-follow-ups'),
+            pytest.param('Related owners: 5308', id='sighting-owners'),
+            pytest.param('Total: 42 items', id='prose-total'),
+            pytest.param('Notes: 2500 items', id='prose-notes'),
+            pytest.param('completed: 1', id='corpus-top'),
+            pytest.param('uniqueness_token: 2026', id='corpus-yaml-key'),
+            pytest.param('KeyError: 0', id='corpus-exception'),
+            pytest.param('fused-memory :8002', id='pad-before-colon'),
+            pytest.param('dark_factory: 2500', id='space-after-colon'),
+            pytest.param('dark_factory :2500', id='space-before-colon'),
+            pytest.param('dark_factory\t:\t2500', id='tab-padded'),
+        ],
+    )
+    @pytest.mark.parametrize('group_id', ['dark_factory', 'reify'])
+    def test_a_spaced_colon_is_not_a_qualified_ref(self, content, group_id):
+        assert scan_content(content, group_id=group_id) == LabelScan()
+
+    def test_a_spaced_colon_number_beside_a_real_mention_mints_nothing(self):
+        scan = scan_content('Task 6183 at the time: 394 linked records', group_id='dark_factory')
+        assert [r.node_name for r in scan.refs] == ['Task 6183']
+        assert scan.ambiguous == ()
+
+    @pytest.mark.parametrize(
+        'known_project_ids',
+        [pytest.param(None, id='permissive'), pytest.param({'dark_factory', 'reify'}, id='registry')],
+    )
+    def test_a_spaced_colon_number_no_longer_contests_a_bare_mention(self, known_project_ids):
+        scan = scan_content(
+            'Task 15 matched exactly: 15',
+            group_id='dark_factory',
+            known_project_ids=known_project_ids,
+        )
+        assert [r.node_name for r in scan.refs] == ['Task 15']
+        assert scan.ambiguous == ()
+
+    @pytest.mark.parametrize(
+        'content',
+        [
+            pytest.param('dark_factory: 4 live, reify: 11 live', id='per-project-live-counts'),
+            pytest.param('dark_factory: 19,409 vs count', id='per-project-thousands-count'),
+        ],
+    )
+    @pytest.mark.parametrize(
+        'known_project_ids',
+        [pytest.param(None, id='permissive'), pytest.param({'dark_factory', 'reify'}, id='registry')],
+    )
+    def test_a_registered_project_count_is_not_a_ref(self, content, known_project_ids):
+        scan = scan_content(content, group_id='dark_factory', known_project_ids=known_project_ids)
+        assert scan == LabelScan()
+
+    def test_a_spaced_genuine_ref_is_a_DELIBERATE_miss(self):
+        """The price of the rule, measured and accepted: every spaced match in
+        the live corpus was prose, so a genuine ref written spaced is lost too.
+        Changing this to a match is a design decision, not a bug fix."""
+        scan = scan_content(
+            'blocked on reify: 2500', group_id='dark_factory', known_project_ids={'reify'}
+        )
+        assert scan.refs == ()
+
+    @pytest.mark.parametrize(
+        ('content', 'expected'),
+        [
+            pytest.param('see reify:132', ['reify:132'], id='tight-foreign'),
+            pytest.param('dark_factory:2500', ['Task 2500'], id='tight-self-qualified'),
+        ],
+    )
+    def test_the_tight_spelling_still_scans(self, content, expected):
+        scan = scan_content(content, group_id='dark_factory')
+        assert [r.node_name for r in scan.refs] == expected
+
+    @pytest.mark.parametrize('name', ['reify: 132', 'Reify : 132'])
+    def test_a_whole_node_name_keeps_its_padded_colon(self, name):
+        referent = parse_node_name(name)
+        assert referent is not None
+        assert referent.node_name == 'reify:132'
 
 
 class TestQualifiedNodeNameNeverSpansALineBreak:
@@ -1295,21 +1375,6 @@ class TestAllPathShapedRegistryIsLoud:
         assert warnings == [], f'A usable registry must stay silent; got {[r.message for r in warnings]}'
 
 
-class TestShapeValidProseMatchesByDesign:
-    """Prose with the '<word>: <number>' shape DOES match — the scanner is
-    deliberately whitespace-tolerant, because that is how humans write a
-    qualified reference. Final precision is delegated to the consumer's own
-    guard (and to the allowlist, when a registry is wired)."""
-
-    def test_prose_colon_number_matches_shape_only(self):
-        scan = scan_content('Total: 42 items', group_id='reify')
-        assert [r.node_name for r in scan.refs] == ['total:42']
-
-    def test_allowlist_removes_the_prose_match(self):
-        scan = scan_content('Total: 42 items', group_id='reify', known_project_ids={'dark_factory'})
-        assert scan.refs == ()
-
-
 class TestScanContentAmbiguityPartition:
     """A task number claimed by BOTH a BARE, unqualified own-project mention
     and a foreign-qualified reference in the same content is genuinely
@@ -1592,7 +1657,6 @@ class TestOneGrammar:
                     '_TASK_NODE_NAME_PATTERN',
                     '_QUALIFIED_NODE_NAME_PATTERN',
                     '_LOCAL_MENTION_PATTERN',
-                    '_QUALIFIED_REF_PATTERN',
                 ),
                 id='one-separator-pad',
             ),
