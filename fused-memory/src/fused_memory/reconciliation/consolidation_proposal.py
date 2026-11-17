@@ -434,6 +434,8 @@ async def record_outcome(
     ledger: ReconLedgerStore,
     record: ReconLedgerRecord,
     outcome: ProposalOutcome,
+    *,
+    retention: timedelta | None = None,
 ) -> bool:
     """Move *record* to ``outcome.state`` with *outcome* on its payload.
 
@@ -442,10 +444,13 @@ async def record_outcome(
     are kept, so :func:`from_ledger_record` still decodes the row; a payload
     that was never a JSON object is kept verbatim under one key instead. An
     executed outcome drops ``expires_at`` so ``ReconLedgerStore.gc`` never
-    reaps it.
+    reaps it. A non-executed outcome lives *retention* past its ``acted_at``
+    when one is passed (PRD consolidation-adjudicator K6), else keeps the
+    row's expiry.
     """
     if outcome.state is ProposalState.PROPOSED:
         raise ValueError('an outcome cannot move a row back to proposed')
+    expires_at = _outcome_expiry(record, outcome, retention)
     payload: dict[str, Any]
     try:
         payload = _payload_object(record)
@@ -456,9 +461,30 @@ async def record_outcome(
         record,
         state=outcome.state.value,
         payload_json=json.dumps(payload),
-        expires_at=None if outcome.executed else record.expires_at,
+        expires_at=expires_at,
     )
     return await ledger.upsert_if_state(moved, existing_state=record.state)
+
+
+def _outcome_expiry(
+    record: ReconLedgerRecord, outcome: ProposalOutcome, retention: timedelta | None,
+) -> str | None:
+    """The ``expires_at`` *record* takes with *outcome*; a bad *retention* raises even when executed."""
+    expiry = record.expires_at if retention is None else _retained_until(outcome.acted_at, retention)
+    return None if outcome.executed else expiry
+
+
+def _retained_until(acted_at: str, retention: timedelta) -> str:
+    """*retention* after *acted_at*, as canonical UTC text, which ``gc`` compares as a string."""
+    if retention <= timedelta(0):
+        raise ValueError(f'retention must be positive, got {retention!r}')
+    try:
+        acted = datetime.fromisoformat(acted_at)
+    except ValueError as exc:
+        raise ValueError(f'acted_at is not an ISO-8601 timestamp: {acted_at!r}') from exc
+    if acted.tzinfo is None:
+        raise ValueError(f'acted_at must be timezone-aware, got naive {acted_at!r}')
+    return (acted + retention).astimezone(UTC).isoformat()
 
 
 def outcome_from_record(record: ReconLedgerRecord) -> ProposalOutcome | None:
