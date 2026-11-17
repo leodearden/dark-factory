@@ -1195,14 +1195,24 @@ class UsageGate:
         self._after_transition_for_reserve(acct, new_phase)
 
     def _after_transition_for_reserve(self, acct: AccountState, new_phase: AccountPhase) -> None:
-        """The reserve's side of a phase edge: the reserve failing authentication is recorded."""
+        """The reserve's side of a phase edge (PRD §6.3 and §6.6).
+
+        Reserve waiters wake when an account other than the reserve becomes
+        available or probing, SIGHUP's reset included, and when the reserve
+        fails authentication, which is also recorded; the reserve's other
+        edges leave them be.
+        """
         rule = self._active_reserve_config()
         if rule is None:
             return
-        if acct.name == rule.account and new_phase == AccountPhase.AUTH_FAILED:
+        if acct.name != rule.account:
+            if new_phase in (AccountPhase.AVAILABLE, AccountPhase.PROBING):
+                self._reserve_waiter().set()
+        elif new_phase == AccountPhase.AUTH_FAILED:
             self._fire_reserve_event(
                 acct.name, ReserveEvent.ACCOUNT_UNAVAILABLE, {'account': acct.name}
             )
+            self._reserve_waiter().set()
 
     async def check_at_startup(self) -> None:
         """No-op: pre-existing caps are detected reactively on first invocation.
