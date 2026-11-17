@@ -11,6 +11,7 @@ from __future__ import annotations
 import copy
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 from codebook_merge_report import clean_merge_report, merge_one, merge_report
@@ -139,14 +140,18 @@ def _sightings_for(holder: dict, session: str) -> list[dict]:
     return [s for s in holder.get("sightings") or [] if s.get("session") == session]
 
 
-def _session_record(record_path: Path, session: str) -> dict:
-    """The one §7.3 coding record in JSONL *record_path* that carries
-    *session*, asserted valid."""
-    records = [
+def _read_coding_records(record_path: Path) -> list[Any]:
+    return [
         json.loads(line)
         for line in record_path.read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
+
+
+def _session_record(record_path: Path, session: str) -> dict:
+    """The one §7.3 coding record in JSONL *record_path* that carries
+    *session*, asserted valid."""
+    records = _read_coding_records(record_path)
     mine = [r for r in records if r.get("session") == session]
     assert len(mine) == 1, (
         f"expected exactly one {session!r} record in {record_path}, found "
@@ -167,6 +172,47 @@ def _live_entry(codebook: dict, entry_id: str) -> dict:
     return entries[0]
 
 
+def _copied_payload_fields(payload: dict) -> dict:
+    return {field: payload[field] for field in _SIGHTING_PAYLOAD_FIELDS if payload.get(field)}
+
+
+def _sighting_drift(expected: dict, sighting: dict) -> dict:
+    """``{field: (expected, carried)}`` for each *expected* field that
+    *sighting* no longer carries verbatim."""
+    return {
+        field: (want, sighting.get(field))
+        for field, want in expected.items()
+        if sighting.get(field) != want
+    }
+
+
+def _assert_originals_survive_and_precede(
+    entry: dict, original_sightings: dict[str, str], annotating_session: str
+) -> None:
+    """Assert every session in *original_sightings* still has its sighting on
+    *entry*, carrying its mapped date, and that *annotating_session*'s
+    sighting follows all of them."""
+    entry_id = entry.get("id")
+    sightings = entry.get("sightings") or []
+    order = {s.get("session"): i for i, s in enumerate(sightings)}
+    for original_session, date in original_sightings.items():
+        assert original_session in order, (
+            f"the {original_session!r} sighting was deleted from {entry_id!r} "
+            "— sightings are immutable dated observations, and a sighting that "
+            "corrects them annotates them rather than retracting them"
+        )
+        original = sightings[order[original_session]]
+        assert original.get("date") == date, (
+            f"the {original_session!r} sighting was re-dated to "
+            f"{original.get('date')!r} (was {date!r}) — a dated observation is "
+            "not editable"
+        )
+    assert order.get(annotating_session, -1) > max(order[s] for s in original_sightings), (
+        f"the {annotating_session!r} sighting is missing from {entry_id!r} or "
+        "does not follow the sightings it annotates"
+    )
+
+
 def _assert_sighting_carries(record: dict, payload: dict, holder: dict) -> None:
     """Assert *holder* carries exactly one sighting for *record*'s session,
     and that it is what the sole writer appends for *payload*: the record's
@@ -178,14 +224,10 @@ def _assert_sighting_carries(record: dict, payload: dict, holder: dict) -> None:
         f"expected exactly one {session!r} sighting on {holder.get('id')!r}, "
         f"found {len(carried)}"
     )
-    expected = {field: record[field] for field in _SIGHTING_HEADER_FIELDS} | {
-        field: payload[field] for field in _SIGHTING_PAYLOAD_FIELDS if payload.get(field)
-    }
-    drift = {
-        field: (want, carried[0].get(field))
-        for field, want in expected.items()
-        if carried[0].get(field) != want
-    }
+    expected = {
+        field: record[field] for field in _SIGHTING_HEADER_FIELDS
+    } | _copied_payload_fields(payload)
+    drift = _sighting_drift(expected, carried[0])
     assert drift == {}, (
         f"the {session!r} sighting on {holder.get('id')!r} no longer matches the "
         "committed record — a committed sighting was rewritten in place "
@@ -290,23 +332,7 @@ def _assert_correction_absorbed(
     )
 
     # (4) NEVER-DELETE and ORDER.
-    sightings = entry.get("sightings") or []
-    order = {s.get("session"): i for i, s in enumerate(sightings)}
-    for original_session, date in original_sightings.items():
-        assert original_session in order, (
-            f"the {original_session!r} sighting was deleted from {entry_id!r} "
-            "— sightings are immutable dated observations, and a correction "
-            "annotates them rather than retracting them"
-        )
-        original = sightings[order[original_session]]
-        assert original.get("date") == date, (
-            f"the {original_session!r} sighting was re-dated to "
-            f"{original.get('date')!r} (was {date!r}) — a dated observation is "
-            "not editable"
-        )
-    assert order[session] > max(order[s] for s in original_sightings), (
-        f"the {session!r} sighting does not follow the sightings it annotates"
-    )
+    _assert_originals_survive_and_precede(entry, original_sightings, session)
 
     # (5) NO-OP — the committed YAML is exactly what the sole writer produces.
     merge = merge_one(codebook, record)
@@ -324,7 +350,7 @@ def _assert_correction_absorbed(
 # ---------------------------------------------------------------------------
 
 _T4892_ENTRY_ID = "guards-assert-unverified-diagnoses"
-_T4892_ORIGINAL_SESSION = "e16af1c5-de98-4252-8504-ce5d13bee3d6"
+_T4892_ORIGINAL_SIGHTING = {"e16af1c5-de98-4252-8504-ce5d13bee3d6": "2026-08-10"}
 _T4892_CORRECTION_SESSION = "task-4892-resume-sysprompt-correction"
 _T4892_CANDIDATE_SESSION = "task-4892-lettered-option-collision"
 _T4892_RECORD_PATH = (
@@ -377,11 +403,7 @@ def test_live_codebook_carries_the_task_4892_corrections(live_codebook):
     so both may legitimately change; each is located by its stable sighting
     session instead.
     """
-    records = [
-        json.loads(line)
-        for line in _T4892_RECORD_PATH.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
+    records = _read_coding_records(_T4892_RECORD_PATH)
     sessions = {r.get("session") for r in records}
     assert {_T4892_CORRECTION_SESSION, _T4892_CANDIDATE_SESSION} <= sessions, (
         f"{_T4892_RECORD_PATH} no longer records both task-4892 corrections: "
@@ -405,11 +427,7 @@ def test_live_codebook_carries_the_task_4892_corrections(live_codebook):
                 "the sole writer must not duplicate a sighting on a re-run — "
                 f"{session!r} appears {len(carried)}x on {carrying[0].get('id')!r}"
             )
-            drift = {
-                field: (payload[field], carried[0].get(field))
-                for field in _SIGHTING_PAYLOAD_FIELDS
-                if payload.get(field) and payload[field] != carried[0].get(field)
-            }
+            drift = _sighting_drift(_copied_payload_fields(payload), carried[0])
             assert drift == {}, (
                 f"the {session!r} sighting on {carrying[0].get('id')!r} no longer "
                 "matches the committed record — a committed sighting was "
@@ -417,24 +435,10 @@ def test_live_codebook_carries_the_task_4892_corrections(live_codebook):
             )
 
     # (2) NEVER-DELETE and (3) ORDER, on the annotated entry.
-    entries = [e for e in live_codebook.get("entries") or [] if e.get("id") == _T4892_ENTRY_ID]
-    assert len(entries) == 1, f"expected exactly one {_T4892_ENTRY_ID!r} entry"
-    sightings = entries[0].get("sightings") or []
-    order = {s.get("session"): i for i, s in enumerate(sightings)}
-
-    assert _T4892_ORIGINAL_SESSION in order, (
-        f"the 2026-08-10 sighting was deleted from {_T4892_ENTRY_ID!r} — "
-        "sightings are immutable dated observations"
-    )
-    original = sightings[order[_T4892_ORIGINAL_SESSION]]
-    assert original.get("date") == "2026-08-10", (
-        f"the {_T4892_ORIGINAL_SESSION!r} sighting was re-dated to "
-        f"{original.get('date')!r} — a dated observation is not editable"
-    )
-    assert order.get(_T4892_CORRECTION_SESSION, -1) > order[_T4892_ORIGINAL_SESSION], (
-        f"the {_T4892_CORRECTION_SESSION!r} sighting is missing from "
-        f"{_T4892_ENTRY_ID!r} or does not follow the 2026-08-10 sighting it "
-        "supersedes — its note points the reader at 'the wording above'"
+    _assert_originals_survive_and_precede(
+        _live_entry(live_codebook, _T4892_ENTRY_ID),
+        _T4892_ORIGINAL_SIGHTING,
+        _T4892_CORRECTION_SESSION,
     )
 
     # (4) NO-OP — the record is already fully absorbed, so re-running the sole
