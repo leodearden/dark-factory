@@ -418,6 +418,9 @@ def _config(
     )
 
 
+_RECORDED_BASE = 'b' * 40
+
+
 def _task_declaring_checks() -> dict[str, Any]:
     """A task record whose metadata declares a delivered check.
 
@@ -429,7 +432,7 @@ def _task_declaring_checks() -> dict[str, Any]:
     """
     return {
         'metadata': {
-            'branch_base_sha': 'b' * 40,
+            'branch_base_sha': _RECORDED_BASE,
             'delivered_checks': [
                 {'name': 'cap', 'kind': 'grep', 'pattern': 'x', 'expect': 'present'},
             ],
@@ -442,9 +445,11 @@ def _confirming_check_runner(refs_run: list[str]) -> Callable[..., Any]:
 
     FALSE before the landing (``<sha>^1``), TRUE at it and at main: the
     contract of ``orchestrator/tests/_landing_evidence_helpers.py::differential_confirms``,
-    which escalation tests cannot import.  Every ref asked about is appended
-    to *refs_run*, so a test can tell a check that never ran from one that
-    ran and declined.
+    which escalation tests cannot import.  The task's recorded base is also
+    "before": the ancestor stand-in has no fork point and reads its tip as
+    already on main, so the branch-tip differential takes that base as its
+    parent leg (task 7836).  Every ref asked about is appended to *refs_run*,
+    so a test can tell a check that never ran from one that ran and declined.
     """
     from orchestrator.delivered_checks import (
         DeliveredCheckResult,
@@ -454,7 +459,7 @@ def _confirming_check_runner(refs_run: list[str]) -> Callable[..., Any]:
         check: dict[str, Any], *, project_root: Any, ref: str = 'main', runner: Any = None,
     ) -> Any:
         refs_run.append(ref)
-        if ref.endswith('^1'):
+        if ref.endswith('^1') or ref == _RECORDED_BASE:
             return DeliveredCheckResult.FAILED
         return DeliveredCheckResult.DELIVERED
 

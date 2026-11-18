@@ -420,7 +420,9 @@ async def _evidence_verdict(
     — is resolved OUT OF BAND by :attr:`TaskMetadataResult.unavailable`, not
     by abusing the third state: the parameter has no fourth value, and
     sending ``None`` here would trade a mild probe-label inaccuracy for a
-    false "unwired" claim in operator-facing prose.
+    false "unwired" claim in operator-facing prose.  The recorded
+    ``branch_base_sha`` is forwarded by both arms, but it is consulted only in
+    DISCOVERY mode for a branch-tip anchor, so the marker arm's copy is inert.
 
     ``fetch`` is taken whole rather than as a bare ``metadata`` dict so the
     "``{}`` is not proof" invariant travels with the data, and so the
@@ -447,6 +449,7 @@ async def _evidence_verdict(
         pattern_template=pattern_template,
         delivered_checks=fetch.metadata.get('delivered_checks') or [],
         checks_enabled=checks_enabled,
+        branch_base_sha=fetch.metadata.get('branch_base_sha'),
     )
     # Plain `str`, never LandingReason — see GitAuthorityVerdict.reason.
     reason = None if verdict.reason is None else str(verdict.reason)
