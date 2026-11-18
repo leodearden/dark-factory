@@ -1032,7 +1032,7 @@ def _task_3294_floor_run(
 
 
 def _merge_breadth_is_full(config: OrchestratorConfig | None) -> bool:
-    """True iff *config* opts into the broad ``merge_verify_breadth='full'`` gate.
+    """True iff *config*'s merge gate breadth is ``'full'``.
 
     A ``None`` *config* (every role='task' caller, and most existing tests)
     is not full: it carries no module registry for
@@ -1086,7 +1086,7 @@ def effective_merge_module_configs(
 
     The empty-registry fallback is a deliberate SAFE DEGRADE: a project with
     no registered modules returns the passed set rather than ``[]``, so the
-    broad gate degrades to today's scoped coverage instead of silently
+    broad gate degrades to the passed (task-scoped) coverage instead of silently
     verifying nothing at the very breadth that exists to verify everything.
     Post-4536 it also serves direct-instantiated configs in tests/evals, which
     never run discovery and whose registry is therefore empty; a zero-module

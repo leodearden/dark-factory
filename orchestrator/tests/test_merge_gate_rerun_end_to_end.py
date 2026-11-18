@@ -292,11 +292,8 @@ def test_ok(p):
 def _loadgroup_detect_output(worktree: Path) -> str:
     """Real ``-n 2 --dist loadgroup`` output of the grouped probe, failing because PROBE_FAIL is set.
 
-    The explicit ``--basetemp`` keeps the probe hermetic. Without it the xdist
-    controller takes the default numbered basetemp, and at exit sweeps every
-    stale ``pytest-N`` dir under the host-shared ``/tmp/pytest-of-<user>`` —
-    a sweep measured outrunning this test's whole timeout on a busy host, with
-    the probe's own two tests already finished in about 2s.
+    The explicit ``--basetemp`` keeps the probe hermetic: it skips the xdist
+    controller's exit-time sweep of the host-shared ``/tmp/pytest-of-<user>``.
     """
     env = {key: value for key, value in os.environ.items() if not key.startswith('PYTEST_')}
     env['PROBE_FAIL'] = '1'
