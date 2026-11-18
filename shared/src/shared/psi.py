@@ -43,6 +43,7 @@ from typing import NamedTuple
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    'ARM_FIELDS',
     'parse_pressure_file',
     'read_pressure',
     'PsiSample',
@@ -324,6 +325,9 @@ chain to ``tripping_metric()``, that site ranks in the older DA-D1 order
 window only — they already agree on the reported DOMAIN (the cfg field
 names), so β changes the order and nothing else.
 """
+
+ARM_FIELDS: frozenset[str] = frozenset(arm.field for arm in _ARMS)
+"""The arm field names of ``_ARMS``: the public, immutable vocabulary projection."""
 
 
 @dataclass(frozen=True)
