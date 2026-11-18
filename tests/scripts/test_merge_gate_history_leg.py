@@ -13,9 +13,11 @@ history subcommand must be accounted for in exactly one way. It carries the
 marker, it is a helper module imported by a marked test file, or it is listed
 in :data:`READS_ONLY_THROWAWAY_REPOS` with the reason every call it makes
 targets a tmp or fixture repo. A helper's history call is invisible from the
-test files that call into it, so each test file importing such a helper is
-held to the same choice: marked, or listed with the reason none of its calls
-into the helper reads the checkout. A test that reaches the checkout's history
+test files that call into it. Listing the helper vouches for every importer.
+A marked importer vouches only for itself, so once a helper is accounted for
+that way each other test file importing it is held to the same choice:
+marked, or listed with the reason none of its calls into the helper reads the
+checkout. A test that reaches the checkout's history
 only through production code, or through a helper's own helper, makes no call
 this sweep can see; mark it by hand.
 
@@ -358,10 +360,15 @@ class Sweep:
         )
 
     def unaccounted_helper_importers(self) -> list[tuple[SweptFile, SweptFile]]:
-        """Each (helper, importer) pair whose importing test file is neither marked nor listed."""
+        """Each importer, neither marked nor listed, of a helper a marked importer accounts for.
+
+        A helper nothing accounts for is the history-reader check's to report; its importers
+        wait on that choice, since listing the helper accounts for all of them.
+        """
         return [
             (helper, importer)
             for helper in self.history_helpers
+            if self.is_helper_of_a_marked_file(helper)
             for importer in self.importing_test_files(helper)
             if MARKER not in importer.markers
             and importer.rel_path not in READS_ONLY_THROWAWAY_REPOS
@@ -635,6 +642,17 @@ def test_a_marked_importer_of_a_history_helper_does_not_vouch_for_an_unmarked_on
     assert not synthetic.reaches_a_history_call(elsewhere)
 
 
+def test_the_importers_of_a_helper_nothing_accounts_for_wait_on_the_helper() -> None:
+    helper = swept_source('pkg/tests/_history.py', _SYNTHETIC_ROOT, _HISTORY_HELPER_SOURCE)
+    importer = swept_source(
+        'pkg/tests/test_reads.py', _SYNTHETIC_ROOT, 'from _history import base\n',
+    )
+    synthetic = Sweep(roots=frozenset({_SYNTHETIC_ROOT}), files=(helper, importer))
+
+    assert synthetic.ways_accounted_for(helper) == []
+    assert synthetic.unaccounted_helper_importers() == []
+
+
 # ─── The live tree ──────────────────────────────────────────────────────────
 
 
@@ -661,7 +679,8 @@ def test_every_history_reader_in_the_gate_is_accounted_for() -> None:
         f'(2) for a helper module, import it from a marked test file, then account for every '
         f'other test file importing it; (3) if every history '
         f'call targets a tmp or fixture repo, add the file to READS_ONLY_THROWAWAY_REPOS '
-        f'with that reason.'
+        f'with that reason. Listing a helper accounts for every test file importing it; do '
+        f'not list its importers too, or they read as stale entries.'
     )
 
 
@@ -675,8 +694,10 @@ def test_every_test_file_importing_a_history_helper_is_accounted_for() -> None:
     assert not unaccounted, (
         f'{len(unaccounted)} merge-gate test file(s) import a helper that shells a git history '
         f'subcommand but are not accounted for:\n' + '\n'.join(unaccounted) + '\n'
-        f'The history call lives in the helper, so a marked test file importing it vouches '
-        f'only for itself. Remedies, one per file: (1) mark every test that hands the helper '
+        f'The history call lives in the helper, and a marked test file importing it vouches '
+        f'only for itself. If every caller hands the helper a tmp or fixture repo, unmark '
+        f'its marked importers and list the helper alone in READS_ONLY_THROWAWAY_REPOS. '
+        f'Otherwise, remedies, one per file: (1) mark every test that hands the helper '
         f'the REAL checkout with @pytest.mark.{MARKER}; (2) if every call into the helper '
         f'targets a tmp or fixture repo, or none reaches its history call, add the file to '
         f'READS_ONLY_THROWAWAY_REPOS with that reason.'
