@@ -834,6 +834,14 @@ def shape_costs(
 # ESCALATIONS
 # ---------------------------------------------------------------------------
 
+_ESCALATION_CARD_FIELDS: tuple[str, ...] = ('id', 'title', 'status')
+"""What ``tab_escalations.jsx::EscalationSidebar`` reads of a card; it reads the prose on demand from ``api/task_prose.py``."""
+
+
+def _escalation_card(row: Mapping[str, Any]) -> dict[str, Any]:
+    """*row*, a ``tasks._shape_task`` row, cut to :data:`_ESCALATION_CARD_FIELDS`."""
+    return {key: row[key] for key in _ESCALATION_CARD_FIELDS}
+
 
 def shape_escalations(
     queues: Mapping[str, Any],
@@ -844,8 +852,9 @@ def shape_escalations(
     """``{ESCALATIONS: {subsections, summary, views}, served_at}`` from ``build_escalation_queues``.
 
     Each row keeps its escalation fields and ``project``, and gains ``task``:
-    its card from *cards* (keyed by ``(subsection id, escalation id)``), wired
-    at *served_at*. Each subsection, and the top level, carries ``views``,
+    its card from *cards* (keyed by ``(subsection id, escalation id)``),
+    projected to :data:`_ESCALATION_CARD_FIELDS` and wired at *served_at*.
+    Each subsection, and the top level, carries ``views``,
     every :class:`~dashboard.data.escalation_corpus.EscalationView` wired the
     same way. A row with no card or a missing view is a wiring bug and raises
     ``DATUM_REQUIRED``.
@@ -864,6 +873,7 @@ def shape_escalations(
                 'task': _wire_served(
                     cards.get((sub_id, esc.get('id'))),
                     f"ESCALATIONS {label} {esc.get('id')} task", served_at,
+                    project=_escalation_card,
                 ),
             }
             for esc in sub.get('escalations') or []

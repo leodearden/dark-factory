@@ -142,8 +142,8 @@ class FleetCensus:
     * 480 held modules, 9 parked tasks, 8 skipped, 17 pinned, 7 recovery
       events in the last hour;
     * the 2026-09-23 per-field accounting put a task description at about
-      2,600 characters (``description`` is not shaped into a task row, but
-      escalation cards embed it).
+      2,600 characters (no budgeted payload ships it: task rows and
+      escalation cards carry no prose).
 
     The sampled and billed histories were measured live on 2026-10-21, and
     the fleet serves each within a few percent of it:
@@ -467,8 +467,8 @@ class _TreeBuilder:
         self, task_id: int, status: TaskStatus, *,
         files: list[str], dependencies: list[int], prd: str | None = None, external: bool = False,
     ) -> dict[str, Any]:
-        # 'notes' stands for every metadata key no row shaper reads; escalation
-        # cards embed the whole metadata, so its size is theirs.
+        # 'notes' stands for every metadata key no row shaper reads; no
+        # budgeted payload ships them.
         metadata: dict[str, Any] = {'files': files, 'notes': self._notes}
         if prd:
             metadata['prd'] = prd
