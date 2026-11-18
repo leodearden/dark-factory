@@ -506,6 +506,7 @@ def describe_partial_ungated_group(group: GateGroup, results: list[dict]) -> dic
             'empty the slug is whole on the legacy value and a re-run finishes '
             'it once the failure is resolved; non-empty, the slug is still '
             'split and a re-run refuses it as slug_collision until the members '
-            'it names are put back by hand (see the module docstring)'
+            'it names are put back by hand (see '
+            'fused-memory/scripts/README_normalize_topic_slugs.md)'
         ),
     }

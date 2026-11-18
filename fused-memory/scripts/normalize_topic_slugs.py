@@ -23,108 +23,8 @@ The jobs differ too: that one STAMPS a topic onto records carrying none;
 this one REWRITES the value of one that already exists.
 
 What is shared is the *fold*.  :func:`fused_memory.topic_slug.derive_topic_slug`
-has one home (INV-5) and both scripts import it, so the two can never disagree
-about what a legacy value becomes.
-
-The migration spans TWO stores
-------------------------------
-Most of the work patches Mem0 record metadata.  But
-``metadata.x_recon_consolidation_gate.topic`` is a Tier-C block on **task**
-metadata — read by ``reconciliation/consolidation_gate.py`` and enforced on
-the ``done`` transition by ``middleware/task_interceptor.py`` — a genuinely
-different store, reached through the MCP server rather than a backend call.
-
-Renaming the memories without moving that block would leave a gate task's
-closure check scrolling a slug no record carries any more: the uncloseable-gate
-trap re-created at a NEW address, which is strictly worse than leaving the
-snake_case slug alone because the operator would then also have to discover
-that this migration caused it.  So the two halves are planned as a pair and
-refused as a pair.
-
-On the live path that promise rests on the GATE CENSUS, not on an operator's
-memory of which topics are gated: ``census_consolidation_gates`` reads every
-gate block out of each named task store, and ``run`` refuses ``--apply``
-unless the census covers every swept project.  A store the census could not
-read is a gap it names, never a silent "no gates here".
-
-Every slug moves all-or-nothing
--------------------------------
-When any member write of a GATED slug fails, ``rename_group`` undoes the
-members that moved, because a gate left on a vacated slug is uncloseable.
-
-An UNGATED slug is undone when its attempt leaves a member on the legacy
-value, because a split slug cannot be finished by re-running: the collision
-guard sees the members on the new slug as incumbents and refuses the
-stragglers as ``slug_collision``.  So the members this run moved are rolled
-back, the report lists the group under ``ungated_partial_rename`` (and the
-residue probe under ``legacy_slug_residue``), and a re-run finishes the move
-once the failure is resolved.  A member that vanished, or that another writer
-moved to a third value, is no longer on the legacy slug: it splits nothing and
-triggers no undo.
-
-The residual is a member the rollback leaves on the new slug: one whose undo
-itself fails (named in ``undo_failures``), or one another writer had already
-put there between plan and apply, which this run never moved and so never
-undoes.  The group's ``on_new_slug_memory_ids`` names every such member, and
-while it is non-empty the slug is still split and a re-run refuses it as
-``slug_collision``.  Finish it by hand: patch each member it names back to the
-legacy value with a metadata-only ``update_memory`` merge, the same patch this
-script issues, and re-run once the straggler's failure is resolved.
-
-Dry run is the default — the operator runbook
---------------------------------------------
-1. **Dry run**, from anywhere, naming the checkout of EACH swept corpus::
-
-       uv run --project fused-memory python \
-           fused-memory/scripts/normalize_topic_slugs.py \
-           --project-root <dark-factory checkout> \
-           --project-root <reify checkout>
-
-   Writes ``plans/topic-slug-normalization-report.{json,md}`` and prints the
-   markdown.  Nothing is modified.  ``--project-root`` REPLACES the default
-   (this checkout alone), so a swept corpus whose checkout is not named is a
-   ``gate_census_incomplete`` gap: the dry run exits 1 and names it.
-   ``--topic <legacy value>`` (repeatable) narrows the write set to the named
-   legacy spellings; it is how one registry topic is normalized without
-   sweeping the whole project.
-
-2. **Read the refusal buckets and resolve them BY HAND.**  ``slug_collision``,
-   ``canonical_collision``, ``topic_unfoldable`` and ``gate_ambiguous`` are
-   the buckets this script deliberately will not decide for you: the first two
-   would merge two topic namespaces (and, in the canonical case, manufacture
-   the second canonical ``_check_canonical_uniqueness`` exists to prevent),
-   the third has no honest fold, so any value the script picked would be a
-   guess written across the whole corpus, and the fourth is a slug carrying
-   more than one consolidation gate, where moving one gate would strand the
-   others.  Also check ``under_enumerated`` / ``scroll_budget_exhausted``: a
-   run with either populated is a LOWER BOUND, and a clean residue probe over
-   it proves nothing.  After an ``--apply``, ``ungated_partial_rename`` lists
-   any slug rolled back because a member's write failed: resolve that failure
-   and re-run.  An entry with non-empty ``on_new_slug_memory_ids`` is still
-   split across both values and needs the hand step described above first.
-
-3. **Apply**, as an OPERATOR, with the same roots::
-
-       ... normalize_topic_slugs.py --apply \
-           --project-root <dark-factory checkout> \
-           --project-root <reify checkout>
-
-   ``--apply`` refuses before scrolling anything (``GateCensusIncomplete``)
-   while any swept project is uncovered or any named root failed to answer.
-   This is an operator action, not an agent one.  The store-mutation preflight
-   fails closed for any process that cannot write mem0's history directory,
-   which is the normal posture inside an agent sandbox — so a dry run is what
-   an agent can deliver, and the deliverable of task 4878 is THIS INSTRUMENT
-   PLUS A VERIFIED DRY RUN, not the live mutation.
-
-4. **Re-measure** with the standing instrument and compare against the
-   committed baseline::
-
-       ... census_memory_metadata.py   # read coverage.topic_coverage.slug_non_conforming
-
-   The report's ``baseline_delta`` block already carries the arithmetic; step 4
-   is how you confirm it against the corpus rather than against this run's own
-   enumeration.
+has one home (INV-5) and both migrations import it (this one through its
+planner), so the two can never disagree about what a legacy value becomes.
 
 Scope boundary
 --------------
@@ -135,6 +35,21 @@ task 3202.  Normalizing the existing corpus is worth doing regardless of
 whether either ever lands: it is what makes an exact-match ``{'topic': T}``
 read return the whole cluster instead of whichever spelling the caller
 guessed.
+
+Where things live
+-----------------
+* The operator runbook (dry run, refusal buckets, apply, re-measure, and the
+  hand remedy for a split slug):
+  ``fused-memory/scripts/README_normalize_topic_slugs.md``.
+* The pure planner:
+  ``fused-memory/src/fused_memory/maintenance/topic_slug_plan.py``.
+* The gate census and gate pairing:
+  ``fused-memory/src/fused_memory/maintenance/topic_slug_gates.py``.
+* The write boundary and the two-store lockstep, including why every slug
+  moves all-or-nothing:
+  ``fused-memory/src/fused_memory/maintenance/topic_slug_lockstep.py``.
+* Here: the corpus enumeration, the residue probe, the sweep (``run``), the
+  report and the CLI.
 """
 from __future__ import annotations
 
