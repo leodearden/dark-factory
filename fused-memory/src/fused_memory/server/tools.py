@@ -54,6 +54,8 @@ from fused_memory.backends.task_projection import (
 )
 from fused_memory.config.reload import apply_reload
 from fused_memory.config.schema import DEFAULT_CONFIG_PATH, FusedMemoryConfig
+from fused_memory.embedder.endpoint_probe import EmbedderEndpointProbe
+from fused_memory.embedder.status import embedder_identity_status
 from fused_memory.mcp_tools.scheduler_state import (
     read_scheduler_events,
     read_scheduler_state,
@@ -1410,6 +1412,7 @@ def create_mcp_server(
     known_projects: dict[str, str] | None = None,
     topic_cluster_store: TopicClusterStore | None = None,
     id_resolver: IdResolver | None = None,
+    embedder_probe: EmbedderEndpointProbe | None = None,
 ) -> FastMCP:
     """Create and configure the FastMCP server with all tools."""
 
@@ -7777,6 +7780,10 @@ def create_mcp_server(
         recipes probe it (skills/_shared/filing-the-trigger-chain.md §2)
         because it comes from the running process, not from main.
 
+        When the server runs the startup embedder probe, the top-level
+        ``embedder`` block reports the probed endpoint, and ``config_overlay``
+        the active config overlay's provenance.
+
         Args:
             project_id: Get stats for a specific project (optional)
         """
@@ -7852,6 +7859,9 @@ def create_mcp_server(
 
         if isinstance(result, dict) and 'error' not in result:
             result['task_metadata_capabilities'] = sorted(TASK_METADATA_CAPABILITIES)
+
+        if embedder_probe is not None and isinstance(result, dict) and 'error' not in result:
+            result.update(embedder_identity_status(memory_service.config, embedder_probe))
 
         return result
 
