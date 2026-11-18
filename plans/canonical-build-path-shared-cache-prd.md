@@ -528,6 +528,8 @@ files (`config.py`, `verify.py`, `harness.py`) are contended, and pinning the ch
   Signal: the scratch workspace built at a second path reports every cacheable unit as a hit and writes a
   `build_cache` event with `mode` `canon`, `backend` `shared`; with the store stopped it reports
   `local_fallback`. Depends on β1. Unlocks η, λ, ι.
+  G7 waiver: no-silent-fail-soft — fallbacks of agent and interactive builds are not reported per build;
+  they are reported per host through verify results, which share the same store (decision 18).
 - **γ. Reify launch sites and the seed** (reify, about 450 lines). C12; boundary row 18.
   Files: `hooks/pre-commit`, `hooks/pre-merge-commit`, `scripts/seed-warm-base-initial.sh`,
   `scripts/ensure-warm-base.sh`, `scripts/seed-warm-lane.sh`, `scripts/refresh-warm-base.sh`,

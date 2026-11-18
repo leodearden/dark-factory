@@ -1,0 +1,367 @@
+# Machine-readable twin of canonical-build-path-shared-cache-prd.capability-manifest.md
+prd: plans/canonical-build-path-shared-cache-prd.md
+schema_version: 1
+signal_leaves:
+- κ
+tasks:
+- label: α
+  task_id: null
+  title: Measure the drafted shape on real reify, on both hosts (operator gate)
+  capabilities:
+  - name: trial-harness
+    binding: 'built here (by the operator): the study''s trial harness at plans/sccache-path-key-study-2026-11-18/trial/ (untracked, beside the study), adapted to the PRD''s shape'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: an experiment on two hosts using untracked study scripts; its record is the gate's resolution
+  - name: real-reify-cross-host-measurement
+    binding: 'built here (by the operator): hit and miss counters on the second host, missed units, read-only server count, a sandboxed agent session behind the bind prefix'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: host measurements recorded in the resolution; not expressible as a check on the dark-factory tree
+- label: δ
+  external_task_id: reify:10228
+  title: Liveness checks see processes inside a mount namespace (reify lib_live_refs.sh)
+  capabilities:
+  - name: namespace-path-translation-shell
+    binding: 'built here: reify scripts/lib_live_refs.sh live_ref_present translates paths through a process''s mount namespace (C11)'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the producer is a reify task; its files are in the reify repository, outside this tree
+- label: β1
+  external_task_id: reify:10229
+  title: 'The primitive: build-directory modes, namespace entry, trampoline'
+  capabilities:
+  - name: measured-shape
+    binding: 'producer:task-α upstream (dark-factory): the drafted shape passes on real reify before the primitive is built'
+    verdict: PASS
+  - name: liveness-before-namespaces
+    binding: 'producer:task-δ upstream: reify''s deletion gates see namespaced processes before anything creates them'
+    verdict: PASS
+  - name: primitive-interface
+    binding: 'built here: reify scripts/canon_run.py with exec, cargo and status (C1-C3), incremental policy end to end'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the producer is a reify task; its files are in the reify repository, outside this tree
+  - name: cargo-trampoline
+    binding: 'built here: reify scripts/canon-bin/cargo with the pass-through list of decision 10'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the producer is a reify task; its files are in the reify repository, outside this tree
+- label: β2
+  external_task_id: reify:10232
+  title: Private sccache server, guard, store relay, local fallback and the build_cache event
+  capabilities:
+  - name: primitive-interface
+    binding: producer:task-β1 upstream
+    verdict: PASS
+  - name: private-cache-server
+    binding: 'built here: a foreground sccache server per outermost invocation on a unix socket (C4)'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the producer is a reify task; its files are in the reify repository, outside this tree
+  - name: store-relay-and-fallback
+    binding: 'built here: probe, loopback relay, watchdog cut-off, local fallback (C5)'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the producer is a reify task; its files are in the reify repository, outside this tree
+  - name: machine-flag-guard
+    binding: 'built here: reify scripts/canon-bin/guard/sccache (decision 20)'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the producer is a reify task; its files are in the reify repository, outside this tree
+  - name: build-cache-event
+    binding: 'built here: one build_cache event per outermost invocation on REIFY_VERIFY_EVENT_LOG (C6)'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the producer is a reify task; its files are in the reify repository, outside this tree
+- label: γ
+  external_task_id: reify:10230
+  title: Hooks and warm-base scripts call the primitive; the seed honours the build-root stamp
+  capabilities:
+  - name: primitive-interface
+    binding: producer:task-β1 upstream
+    verdict: PASS
+  - name: owned-launch-sites
+    binding: 'built here: reify hooks and warm-base scripts run through canon_run.py exec with class verify (C12)'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the producer is a reify task; its files are in the reify repository, outside this tree
+  - name: seed-honours-stamp
+    binding: 'built here: reify scripts/seed-warm-lane.sh skips relocation and relink for a stamped base, and relocates from the canonical path for a lane without the primitive (C12)'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the producer is a reify task; its files are in the reify repository, outside this tree
+- label: ε
+  task_id: null
+  title: Process-liveness scans translate paths through mount namespaces
+  capabilities:
+  - name: process-group-scan
+    binding: '`grep:shared/src/shared/proc_group.py::scan_process_groups_under_path` `grep:orchestrator/src/orchestrator/git_ops.py::GitOps.reap_merge_verify_survivors` wired: the scan feeds the survivor reap, so a positive answer signals processes'
+    verdict: PASS
+  - name: cpu-ticks-probe
+    binding: '`grep:shared/src/shared/proc_group.py::cpu_ticks_under_path` `grep:orchestrator/src/orchestrator/merge_lane/liveness.py::verify_tree_cpu_ticks` wired: the merge progress watch reads working directories only'
+    verdict: PASS
+  - name: shell-library-copy
+    binding: '`grep:orchestrator/scripts/warm-lane/lib_live_refs.sh` `grep:orchestrator/tests/test_live_refs_lib.py` exist: dark-factory''s copy of live_ref_present and its test'
+    verdict: PASS
+  - name: namespace-path-translation
+    binding: 'built here: translation through a process''s mount namespace in proc_group.py and the shell copy (C11)'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ns/mnt
+      paths:
+      - shared/src/shared/proc_group.py
+      expect: present
+- label: ζ
+  task_id: null
+  title: 'Launch wiring: verify legs through the build primitive; sandboxed agents bound before landlock'
+  capabilities:
+  - name: verify-leg-spawn-site
+    binding: '`grep:orchestrator/src/orchestrator/verify.py::run_verification` wired: its nested _run_leg_command starts each leg as /bin/bash -c <string>, after the command rewriters'
+    verdict: PASS
+  - name: offline-lane-launch
+    binding: '`grep:orchestrator/src/orchestrator/offline_lane_runs.py::launch` wired: the offline lane starts its runs here, outside run_verification'
+    verdict: PASS
+  - name: sandbox-wrap-site
+    binding: '`grep:orchestrator/src/orchestrator/agents/sandbox_dispatch.py::wrap_command` `grep:orchestrator/src/orchestrator/agents/invoke.py::_sandbox_wrap` wired: where the landlock helper is placed in front of a sandboxed agent command'
+    verdict: PASS
+  - name: agent-environment
+    binding: '`grep:orchestrator/src/orchestrator/workflow.py::TaskWorkflow._build_agent_env` wired: the environment every agent launch gets'
+    verdict: PASS
+  - name: reloadable-config
+    binding: '`grep:orchestrator/src/orchestrator/config.py::RELOADABLE_FIELDS` exists: a section listed here is hot-reloadable'
+    verdict: PASS
+  - name: vanished-worktree-detection
+    binding: '`grep:orchestrator/src/orchestrator/verify.py::run_main_tip_sweep` wired: its nested _enoent_on_self matches the worktree path in error text'
+    verdict: PASS
+  - name: primitive-interface
+    binding: 'producer:task-β1 upstream (reify): scripts/canon_run.py exec -- <cmd>'
+    verdict: PASS
+  - name: same-file-predecessor
+    binding: 'producer:task-10736 upstream: task-verify lanes α edits config.py and verify.py first'
+    verdict: PASS
+  - name: build-canon-config
+    binding: 'built here: the build_canon section (root, shim_dir, expect_canon) (C8)'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: build_canon
+      paths:
+      - orchestrator/src/orchestrator/config.py
+      expect: present
+  - name: leg-prefix-and-session-bind
+    binding: 'built here: legs started through the primitive; bwrap bind before the landlock helper (C8)'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: canon_run
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+- label: η
+  task_id: null
+  title: build_cache facts on the verify result, the observation log and the degraded-cache alarm
+  capabilities:
+  - name: event-channel-parser
+    binding: '`grep:orchestrator/src/orchestrator/verify_event_channel.py::_channel_from` wired: unknown event names are ignored, so a new event is back-compatible'
+    verdict: PASS
+  - name: result-aggregation
+    binding: '`grep:orchestrator/src/orchestrator/verify.py::_aggregate_results` `grep:orchestrator/src/orchestrator/verify.py::VerifyResult` wired: legs are folded here field by field'
+    verdict: PASS
+  - name: remote-wire
+    binding: '`grep:orchestrator/src/orchestrator/verify_runner.py::result_from_dict` `grep:orchestrator/src/orchestrator/remote_gate.py::wire_fingerprint` wired: the strict decoder and the fingerprint computed from field shapes'
+    verdict: PASS
+  - name: task-verify-tap
+    binding: '`grep:orchestrator/src/orchestrator/task_verify_dispatch.py::TaskVerifyDispatcher.__call__` wired: every task verify, local and remote, returns here'
+    verdict: PASS
+  - name: merge-verify-tap
+    binding: '`grep:orchestrator/src/orchestrator/verify_runner.py::VerifyRunnerPool.dispatch` wired: every merge verify returns here'
+    verdict: PASS
+  - name: late-bound-sinks
+    binding: '`grep:orchestrator/src/orchestrator/harness.py::Harness._start_escalation_server` wired: where the escalation queue exists and sinks are bound'
+    verdict: PASS
+  - name: build-cache-event
+    binding: 'producer:task-β2 upstream (reify): the event the primitive writes'
+    verdict: PASS
+  - name: build-canon-config
+    binding: 'producer:task-ζ upstream: build_canon.expect_canon'
+    verdict: PASS
+  - name: lane-alarm-ladder
+    binding: 'producer:task-10737 upstream: the lane alarm whose ladder is extracted'
+    verdict: PASS
+  - name: build-cache-result-field
+    binding: 'built here: VerifyResult.build_cache folded from the leg events (C9)'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: build_cache
+      paths:
+      - orchestrator/src/orchestrator/verify.py
+      expect: present
+  - name: observation-log
+    binding: 'built here: one row per observed result in data/verify-logs/build-cache-observations.jsonl (C10)'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: build-cache-observations
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: shared-streak-ladder
+    binding: 'built here: one ladder module used by both alarms'
+    verdict: PASS
+    delivered_check:
+      kind: path
+      paths:
+      - orchestrator/src/orchestrator/streak_alarm.py
+      expect: present
+  - name: degraded-cache-alarm
+    binding: 'built here: the alarm under the sentinel __build_cache_degraded__<host> (C10)'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: __build_cache_degraded__
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+- label: θ
+  task_id: null
+  title: Shared cache store service, pruning, drift probe, in-service check and operations notes
+  capabilities:
+  - name: measured-shape
+    binding: 'producer:task-α upstream: the store is proven on real reify before it is installed as a service'
+    verdict: PASS
+  - name: deploy-scripts-home
+    binding: '`grep:scripts/deploy` `grep:scripts/tests` exist: host installers and their tests live here'
+    verdict: PASS
+  - name: store-installer
+    binding: 'built here: scripts/deploy/install_build_cache_store.sh with --check (C13)'
+    verdict: PASS
+    delivered_check:
+      kind: path
+      paths:
+      - scripts/deploy/install_build_cache_store.sh
+      expect: present
+  - name: store-pruner
+    binding: 'built here: scripts/deploy/build_cache_store_prune.py (C13)'
+    verdict: PASS
+    delivered_check:
+      kind: path
+      paths:
+      - scripts/deploy/build_cache_store_prune.py
+      expect: present
+  - name: drift-probe
+    binding: 'built here: scripts/deploy/build_cache_drift_probe.sh (C13)'
+    verdict: PASS
+    delivered_check:
+      kind: path
+      paths:
+      - scripts/deploy/build_cache_drift_probe.sh
+      expect: present
+  - name: in-service-check
+    binding: 'built here: scripts/deploy/check_build_cache_in_service.py, exits 1 / 0 / 2 / 75 (C13)'
+    verdict: PASS
+    delivered_check:
+      kind: path
+      paths:
+      - scripts/deploy/check_build_cache_in_service.py
+      expect: present
+  - name: operations-section
+    binding: 'built here: OPERATIONS.md section on the canonical build path and the shared store'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: reify-canon
+      paths:
+      - OPERATIONS.md
+      expect: present
+- label: λ
+  external_task_id: reify:10231
+  title: 'Interactive sessions: setup-dev installs the trampoline; GUI launch scripts; CLAUDE.md'
+  capabilities:
+  - name: private-cache-server
+    binding: producer:task-β2 upstream
+    verdict: PASS
+  - name: interactive-install
+    binding: 'built here: reify scripts/setup-dev.sh installs the trampoline into ~/.local/share/reify-canon/bin'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the producer is a reify task; its files are in the reify repository, outside this tree
+  - name: gui-launch-at-canon
+    binding: 'built here: reify run-gui.sh and run-gui-dev.sh launch through canon_run.py exec'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the producer is a reify task; its files are in the reify repository, outside this tree
+- label: ι
+  task_id: null
+  title: Enable the canonical build path and shared cache for reify on leo-laptop (operator gate)
+  capabilities:
+  - name: real-reify-cross-host-measurement
+    binding: producer:task-α upstream
+    verdict: PASS
+  - name: private-cache-server
+    binding: producer:task-β2 upstream (reify)
+    verdict: PASS
+  - name: owned-launch-sites
+    binding: producer:task-γ upstream (reify)
+    verdict: PASS
+  - name: namespace-path-translation-shell
+    binding: producer:task-δ upstream (reify)
+    verdict: PASS
+  - name: namespace-path-translation
+    binding: producer:task-ε upstream
+    verdict: PASS
+  - name: leg-prefix-and-session-bind
+    binding: producer:task-ζ upstream
+    verdict: PASS
+  - name: observation-log
+    binding: producer:task-η upstream
+    verdict: PASS
+  - name: degraded-cache-alarm
+    binding: 'producer:task-η upstream: fallbacks after enabling are visible'
+    verdict: PASS
+  - name: store-installer
+    binding: producer:task-θ upstream
+    verdict: PASS
+  - name: in-service-check
+    binding: producer:task-θ upstream
+    verdict: PASS
+  - name: laptop-in-service
+    binding: 'built here (by the operator): the in-service check exits 0 for leo-laptop'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: host state on leo-laptop and reify observation rows; not expressible as a check on the dark-factory tree
+- label: κ
+  task_id: null
+  title: Enable the canonical build path and shared cache for reify on the workstation (operator gate)
+  capabilities:
+  - name: laptop-in-service
+    binding: producer:task-ι upstream
+    verdict: PASS
+  - name: seed-honours-stamp
+    binding: producer:task-γ upstream (reify)
+    verdict: PASS
+  - name: interactive-install
+    binding: producer:task-λ upstream (reify)
+    verdict: PASS
+  - name: workstation-in-service
+    binding: 'built here (by the operator): the in-service check exits 0 for the workstation and an interactive build of main in a never-built worktree shows no workspace-library misses'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: host state on the workstation and reify observation rows; not expressible as a check on the dark-factory tree
