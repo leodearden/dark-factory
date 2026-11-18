@@ -31,6 +31,9 @@ logger = logging.getLogger('legibility.plan_deviation_census')
 RECENT_WINDOW_DAYS = 7
 
 _PLAN_SECTIONS = ('prerequisites', 'steps')
+# Mirrors orchestrator/src/orchestrator/artifacts.py::Plan's confirmation key;
+# the census tests pin it by reading what the real plan-tools server writes.
+_FINALIZED_AT_KEY = '_finalized_at'
 _NOTED_RESOLUTION_CLASSES = frozenset({NOTE_TO_FILE_CLASS, ObservationConsumed.resolution_class})
 _FALLBACK_AGENT_ROLES = frozenset({'implementer'})
 _NOTE_SCAN_CONTEXT = 'plan_deviation_census.read_archived_notes'
@@ -174,27 +177,39 @@ class CensusRecord:
 
 
 @dataclass(frozen=True)
+class FinalizedPlan:
+    task_id: str
+    finalized_at: datetime
+
+
+@dataclass(frozen=True)
 class CorpusRead:
-    """What one reader returned: its records, how many inputs it parsed, and
-    how many inputs or entries it could not use."""
+    """What one reader returned: its records, the finalized plans it saw, how
+    many inputs it parsed, and how many inputs or entries it could not use."""
 
     records: tuple[CensusRecord, ...]
     opened: int
     skipped: int
+    plans: tuple[FinalizedPlan, ...] = ()
 
 
 _NOTHING = CorpusRead(records=(), opened=0, skipped=0)
 _ONE_SKIPPED = CorpusRead(records=(), opened=0, skipped=1)
+_OPENED_AND_SKIPPED = CorpusRead(records=(), opened=1, skipped=1)
 
 
 def _combine(reads: Iterable[CorpusRead]) -> CorpusRead:
     records: list[CensusRecord] = []
+    plans: list[FinalizedPlan] = []
     opened = skipped = 0
     for read in reads:
         records.extend(read.records)
+        plans.extend(read.plans)
         opened += read.opened
         skipped += read.skipped
-    return CorpusRead(records=tuple(records), opened=opened, skipped=skipped)
+    return CorpusRead(
+        records=tuple(records), opened=opened, skipped=skipped, plans=tuple(plans),
+    )
 
 
 def _is_str_in(value: object, allowed: frozenset[str]) -> bool:
@@ -209,13 +224,32 @@ def _utc_stamp(name: str, raw: object) -> datetime | None:
 
 
 def read_plan_deviations(meta_roots: Sequence[Path], *, horizon: datetime) -> CorpusRead:
-    """Every valid deviation entry in ``<root>/*/plan.json`` under each root.
+    """Every valid deviation entry in ``<root>/*/plan.json`` under each root,
+    and each task's finalized plan.
 
     A plan is rewritten on every write, so one last modified before *horizon*
     cannot hold an in-window entry and is skipped without being opened. The
-    task id is the lane directory's name."""
+    task id is the plan document's own ``task_id``, never its directory's
+    name, and one plan seen under several meta directories (``N/`` and
+    ``task-N/``) counts once: identical records collapse, and a task's
+    finalized plan is its latest ``_finalized_at``."""
     cutoff = horizon.timestamp()
-    return _combine(_read_meta_root(root, cutoff) for root in meta_roots)
+    read = _combine(_read_meta_root(root, cutoff) for root in meta_roots)
+    return CorpusRead(
+        records=tuple(dict.fromkeys(read.records)),
+        opened=read.opened,
+        skipped=read.skipped,
+        plans=_latest_per_task(read.plans),
+    )
+
+
+def _latest_per_task(plans: Iterable[FinalizedPlan]) -> tuple[FinalizedPlan, ...]:
+    latest: dict[str, FinalizedPlan] = {}
+    for plan in plans:
+        kept = latest.get(plan.task_id)
+        if kept is None or plan.finalized_at > kept.finalized_at:
+            latest[plan.task_id] = plan
+    return tuple(latest.values())
 
 
 def _read_meta_root(root: Path, cutoff: float) -> CorpusRead:
@@ -254,11 +288,27 @@ def _read_plan(path: Path, cutoff: float) -> CorpusRead:
         logger.debug('cannot read %s: %s', path, exc)
         return _ONE_SKIPPED
     if not isinstance(doc, dict):
-        return CorpusRead(records=(), opened=1, skipped=1)
-    task_id = path.parent.name
+        return _OPENED_AND_SKIPPED
+    task_id = _document_task_id(doc.get('task_id'))
+    if task_id is None:
+        return _OPENED_AND_SKIPPED
     parsed = [_plan_entry(task_id, entry) for entry in _deviation_entries(doc)]
     records = tuple(record for record in parsed if record is not None)
-    return CorpusRead(records=records, opened=1, skipped=len(parsed) - len(records))
+    finalized_at = _utc_stamp(_FINALIZED_AT_KEY, doc.get(_FINALIZED_AT_KEY))
+    return CorpusRead(
+        records=records,
+        opened=1,
+        skipped=len(parsed) - len(records),
+        plans=() if finalized_at is None else (FinalizedPlan(task_id, finalized_at),),
+    )
+
+
+def _document_task_id(raw: object) -> str | None:
+    if isinstance(raw, str):
+        return raw.strip() or None
+    if isinstance(raw, int) and not isinstance(raw, bool):
+        return str(raw)
+    return None
 
 
 def _deviation_entries(doc: Mapping[str, object]) -> Iterator[object]:
