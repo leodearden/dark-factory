@@ -491,9 +491,11 @@ class TestEntityMintStormAlarm:
         return service, clock, emitter
 
     @staticmethod
-    async def _mint(service, agent_id: str | None = 'curator-x'):
+    async def _mint(
+        service, agent_id: str | None = 'curator-x', project_id: str = _PROJECT,
+    ):
         return await service.ensure_entity_node(
-            name=_NAME, project_id=_PROJECT, agent_id=agent_id,
+            name=_NAME, project_id=project_id, agent_id=agent_id,
         )
 
     @pytest.mark.asyncio
@@ -783,6 +785,41 @@ class TestEntityMintStormAlarm:
         assert service.entity_mint_storm_tracked_agents == {
             'curator-0', 'curator-1',
         }
+
+    @pytest.mark.asyncio
+    async def test_one_agent_minting_in_two_projects_files_a_per_project_count(
+        self, stormy,
+    ):
+        """Recon and curator agent ids are project-independent.
+
+        So the count filed into a project's queue must be reproducible from
+        that project's own journal rows, never pooled across projects.
+        """
+        service, _clock, emitter = stormy
+        service.config.entity_mint.storm_threshold = 3
+        service.set_known_projects({
+            'proj_a': '/tmp/df-root-a', 'proj_b': '/tmp/df-root-b',
+        })
+
+        for project_id in ('proj_a', 'proj_a', 'proj_b', 'proj_b'):
+            await self._mint(service, project_id=project_id)
+
+        assert emitter.call_count == 0, (
+            'each project is BELOW the bar; a count pooled across projects '
+            'would page here'
+        )
+
+        await self._mint(service, project_id='proj_b')
+
+        emitter.assert_called_once()
+        args, kwargs = emitter.call_args
+        assert kwargs['project_id'] == 'proj_b'
+        assert kwargs['count'] == 3
+        assert kwargs['agent_id'] == 'curator-x'
+        assert (args[0] if args else kwargs.get('project_root')) == '/tmp/df-root-b'
+        assert service.entity_mint_storm_tracked_agents == {'curator-x'}, (
+            'one agent label, not one per project'
+        )
 
     @pytest.mark.asyncio
     async def test_an_unattributed_mint_labels_as_unattributed(self, stormy):
