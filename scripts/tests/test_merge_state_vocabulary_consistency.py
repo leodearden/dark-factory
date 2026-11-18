@@ -66,7 +66,7 @@ PLACEMENT IS LOAD-BEARING. ``scripts/tests/`` modules must import NO first-party
 package — that is what lets ``uv run --project shared pytest scripts/tests/``
 (``scripts/orchestrator.yaml``'s ``test_command``) satisfy them on a freshly
 synced verify worktree. This module is stdlib-only (``importlib.util``, ``os``,
-``re``, ``subprocess``, ``pathlib``) plus ``pytest``, and it loads
+``re``, ``subprocess``, ``pathlib``, ``typing``) plus ``pytest``, and it loads
 ``shared/src/shared/merge_state.py`` BY ABSOLUTE PATH rather than importing
 ``shared.merge_state``. That second point is load-bearing twice over: an agent
 Bash session typically inherits the MAIN checkout's ``VIRTUAL_ENV`` (see
@@ -90,6 +90,7 @@ import re
 import subprocess
 from collections.abc import Mapping
 from pathlib import Path
+from typing import NamedTuple
 
 import pytest
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
@@ -261,6 +262,31 @@ _PARTITION_RE = re.compile(r"partition=([A-Z][A-Z0-9_]*)")
 _TOKEN_RE = re.compile(r"\b[a-z][a-z0-9_]*\b")
 
 
+class SpanFamily(NamedTuple):
+    """One kind of marked span: its begin and end markers and how a begin names it.
+
+    *name_re*'s first group is the span's name. *known_names*, when set, is the
+    closed set a name must belong to; ``None`` leaves name validation to the caller
+    (escalation/tests/test_merge_status_boundary.py's route family validates its
+    comma-listed keys itself).
+
+    A ``NamedTuple``, not a frozen dataclass: escalation/tests/test_merge_status_boundary.py::_load_alpha_guard
+    executes this module by path without registering it in ``sys.modules``, and
+    dataclass creation under ``from __future__ import annotations`` looks the
+    class's module up there.
+    """
+
+    begin: str
+    end: str
+    name_re: re.Pattern[str]
+    known_names: frozenset[str] | None
+
+
+VOCABULARY_SPANS = SpanFamily(
+    _BEGIN_MARKER, _END_MARKER, _PARTITION_RE, frozenset(_REQUIRED_PARTITIONS)
+)
+
+
 def _opens_inside_html_comment(lines: list[str], index: int, marker_column: int) -> bool:
     """Is the begin marker at ``lines[index][marker_column:]`` inside an HTML comment?
 
@@ -286,8 +312,13 @@ def _opens_inside_html_comment(lines: list[str], index: int, marker_column: int)
     return before.rfind("<!--") > before.rfind("-->")
 
 
-def extract_spans(text: str, *, source: str) -> list[tuple[str, str]]:
-    """Every ``merge-state-vocab`` span in *text*, as ``(partition_name, body)``.
+def extract_spans(
+    text: str, *, source: str, family: SpanFamily = VOCABULARY_SPANS
+) -> list[tuple[str, str]]:
+    """Every *family* span in *text*, as ``(name, body)``.
+
+    The default family is ``merge-state-vocab``, whose name is a partition; another
+    family reuses this scanner and its failure contract rather than a second one.
 
     TWO CARRIERS, one scanner. In markdown the markers ride in HTML comments
     (``<!-- merge-state-vocab:begin partition=X ... -->`` … ``<!-- …:end -->``); in
@@ -317,30 +348,29 @@ def extract_spans(text: str, *, source: str) -> list[tuple[str, str]]:
 
     for index, line in enumerate(lines):
         line_number = index + 1
-        if _BEGIN_MARKER in line:
-            match = _PARTITION_RE.search(line)
+        if family.begin in line:
+            match = family.name_re.search(line)
             assert match is not None, (
-                f"{source}: the `{_BEGIN_MARKER}` marker at line {line_number} names no "
-                f"`partition=<NAME>` (task 4829). A span that does not say which "
-                f"partition it must equal cannot be checked against anything; add "
-                f"`partition=` naming one of {list(_REQUIRED_PARTITIONS)}."
+                f"{source}: the `{family.begin}` marker at line {line_number} carries no "
+                f"name matching `{family.name_re.pattern}` (task 4829). A span that does "
+                f"not say what it pins cannot be checked against anything."
             )
-            partition_name = match.group(1)
+            span_name = match.group(1)
             assert open_span is None, (
-                f"{source}: span `{partition_name}` opens at line {line_number} while "
+                f"{source}: span `{span_name}` opens at line {line_number} while "
                 f"span `{open_span[0]}` (opened at line {open_span[3]}) is still open "
                 f"(task 4829) — spans do not nest. The inner list would be read as part "
                 f"of the outer one, so both comparisons would be wrong. Close the outer "
-                f"span with `{_END_MARKER}` before opening another."
+                f"span with `{family.end}` before opening another."
             )
 
-            marker_column = line.index(_BEGIN_MARKER)
+            marker_column = line.index(family.begin)
             if _opens_inside_html_comment(lines, index, marker_column):
                 close_index = index
                 while close_index < len(lines) and "-->" not in lines[close_index]:
                     close_index += 1
                 assert close_index < len(lines), (
-                    f"{source}: the `<!-- {_BEGIN_MARKER} partition={partition_name}` "
+                    f"{source}: the `<!-- {family.begin} {match.group(0)}` "
                     f"comment opened at line {line_number} is never closed with `-->` "
                     f"(task 4829) — the whole rest of the file would be read as the "
                     f"begin comment's body."
@@ -357,44 +387,43 @@ def extract_spans(text: str, *, source: str) -> list[tuple[str, str]]:
                 # that is fine. The `partition=NAME` fragment that rides along here
                 # is harmless: `NAME` is UPPER_SNAKE and so matches no lowercase
                 # token, and `partition` is in none of the vocabularies.
-                remainder = line[marker_column + len(_BEGIN_MARKER) :]
+                remainder = line[marker_column + len(family.begin) :]
                 body_start = index + 1
 
-            open_span = (partition_name, body_start, remainder, line_number)
-        elif _END_MARKER in line:
+            open_span = (span_name, body_start, remainder, line_number)
+        elif family.end in line:
             assert open_span is not None, (
-                f"{source}: a `{_END_MARKER}` marker at line {line_number} closes no "
-                f"open span (task 4829) — either its `{_BEGIN_MARKER}` was deleted, "
+                f"{source}: a `{family.end}` marker at line {line_number} closes no "
+                f"open span (task 4829) — either its `{family.begin}` was deleted, "
                 f"leaving the list below it unpinned, or the two markers are inverted."
             )
-            partition_name, body_start, remainder, _ = open_span
+            span_name, body_start, remainder, _ = open_span
             body = "\n".join([remainder, *lines[body_start:index]])
-            spans.append((partition_name, body))
+            spans.append((span_name, body))
             open_span = None
 
     if open_span is not None:
         raise AssertionError(
             f"{source}: span `{open_span[0]}` opened at line {open_span[3]} is never "
-            f"closed by a `{_END_MARKER}` marker (task 4829). An unterminated span has "
-            f"no boundary, so every vocabulary token in the rest of the file would join "
-            f"its value set."
+            f"closed by a `{family.end}` marker (task 4829). An unterminated span has "
+            f"no boundary, so the whole rest of the file would be read as its body."
         )
 
     assert spans, (
-        f"{source}: no `{_BEGIN_MARKER} partition=<NAME>` span found at all (task "
-        f"4829). This file is in `PINNED_SITES` because it restates a merge-state "
-        f"vocabulary inline; with the markers gone, its list is free to drift and "
-        f"this guard would report success having checked nothing. Restore the span "
-        f"around the list, or unregister the file if the list is gone."
+        f"{source}: no `{family.begin}` span found at all (task 4829). The caller "
+        f"reads this file because it expects the file to carry such spans; with the "
+        f"markers gone, the text they wrapped is free to drift and the check would "
+        f"report success having checked nothing. Restore the span, or stop reading "
+        f"the file for it if the text is gone."
     )
 
-    unknown = sorted({name for name, _ in spans if name not in _REQUIRED_PARTITIONS})
-    assert not unknown, (
-        f"{source}: span(s) pinned to {unknown!r}, which name no partition of "
-        f"{_repo_relative(_VOCABULARY_MODULE)} (task 4829). Known partitions are "
-        f"{list(_REQUIRED_PARTITIONS)}. A misspelled partition pins the list to "
-        f"nothing at all."
-    )
+    if family.known_names is not None:
+        unknown = sorted({name for name, _ in spans if name not in family.known_names})
+        assert not unknown, (
+            f"{source}: `{family.begin}` span(s) named {unknown!r}, which are not "
+            f"among the known names {sorted(family.known_names)} (task 4829). A "
+            f"misspelled name pins the span to nothing at all."
+        )
     return spans
 
 
@@ -1147,7 +1176,7 @@ def test_extract_spans_reads_only_the_family_it_is_given() -> None:
         extract_spans(
             _TWO_FAMILIES,
             source=_FIXTURE_SOURCE,
-            family=dataclasses.replace(route_family, known_names=frozenset({"done"})),
+            family=route_family._replace(known_names=frozenset({"done"})),
         )
     message = str(excinfo.value)
     assert "merge-status-route:begin" in message
