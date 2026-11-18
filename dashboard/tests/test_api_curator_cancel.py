@@ -9,6 +9,7 @@ Step-by-step TDD:
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Awaitable, Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -17,12 +18,15 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 
+from dashboard.data import memory as memory_data
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 _PATCH_TARGET = 'dashboard.data.memory.mcp_tool_call'
 _INVALIDATE_TARGET = 'dashboard.data.memory.invalidate_session'
+_MCP_TOOL_CALL_SIGNATURE = inspect.signature(memory_data.mcp_tool_call)
 
 
 @dataclass(frozen=True)
@@ -36,9 +40,9 @@ def _cancel_script(outcome: object) -> Callable[..., Awaitable[object]]:
     """Script ``mcp_tool_call`` to raise or return *outcome*, or ``_PerUrl.outcomes[url]``."""
 
     async def _scripted_mcp_tool_call(
-        client: object, url: str, tool_name: str, arguments: object, **kwargs: object
+        client: object, base_url: str, tool_name: str, arguments: object, **kwargs: object
     ) -> object:
-        result = outcome.outcomes[url] if isinstance(outcome, _PerUrl) else outcome
+        result = outcome.outcomes[base_url] if isinstance(outcome, _PerUrl) else outcome
         if isinstance(result, BaseException):
             raise result
         return result
@@ -58,9 +62,17 @@ def _patched_cancel_seams(outcome: object) -> Iterator[tuple[AsyncMock, list[str
         yield mock_mcp, invalidated
 
 
-def _dials(mock_mcp: AsyncMock) -> list[tuple[str, str]]:
-    """Every ``(url, tool)`` the request dialed, in order."""
-    return [(c.args[1], c.args[2]) for c in mock_mcp.call_args_list]
+def _bound_dials(mock_mcp: AsyncMock) -> list[dict[str, object]]:
+    """Every dial's arguments keyed by ``mcp_tool_call`` parameter name, however passed."""
+    return [
+        _MCP_TOOL_CALL_SIGNATURE.bind(*c.args, **c.kwargs).arguments
+        for c in mock_mcp.call_args_list
+    ]
+
+
+def _dials(mock_mcp: AsyncMock) -> list[tuple[object, object]]:
+    """Every ``(base_url, tool_name)`` the request dialed, in order."""
+    return [(d['base_url'], d['tool_name']) for d in _bound_dials(mock_mcp)]
 
 
 # ---------------------------------------------------------------------------
@@ -124,19 +136,15 @@ def test_successful_proxy_forwards_verbatim(client, mcp_result):
     assert resp.status_code == 200
     assert resp.json() == mcp_result
 
-    # The cancel handler must call cancel_ticket exactly once with the correct
-    # args.  The positional destructure below assumes positional invocation.
-    (call,) = mock_mcp.call_args_list
-    _client_arg, url_arg, tool_arg, args_arg = call.args
-    assert tool_arg == 'cancel_ticket'
-    assert args_arg == {'ticket_id': 'tkt_abc'}
     # The URL must be exactly the first entry of the config THIS app resolved,
     # read from app.state rather than from DEFAULT_FUSED_MEMORY_URLS.  The
     # contract under test is "the handler dials the configured URL", not "the
     # configured URL is the packaged default" — test_scaffold.py owns the
     # latter.  Deriving also keeps this green while the suite points
     # DASHBOARD_FUSED_MEMORY_URLS at a dead port (task 5185).
-    assert url_arg == client.app.state.config.fused_memory_urls[0]
+    assert _dials(mock_mcp) == [(client.app.state.config.fused_memory_urls[0], 'cancel_ticket')]
+    (dial,) = _bound_dials(mock_mcp)
+    assert dial['arguments'] == {'ticket_id': 'tkt_abc'}
 
 
 # ---------------------------------------------------------------------------
@@ -247,7 +255,7 @@ def test_two_url_fallback_url0_fails_url1_succeeds(two_url_client):
         'http://localhost:9001': mcp_result,
     })
 
-    with _patched_cancel_seams(outcomes) as (mock_mcp, _invalidated):
+    with _patched_cancel_seams(outcomes) as (mock_mcp, invalidated):
         resp = two_url_client.post(
             '/api/v2/dashboard/curator/cancel',
             json={'ticket_id': 'tkt_abc'},
@@ -260,6 +268,7 @@ def test_two_url_fallback_url0_fails_url1_succeeds(two_url_client):
         ('http://localhost:9000', 'cancel_ticket'),
         ('http://localhost:9001', 'cancel_ticket'),
     ]
+    assert invalidated == ['http://localhost:9000']
 
 
 def test_two_url_not_found_short_circuits_loop(two_url_client):
@@ -271,7 +280,7 @@ def test_two_url_not_found_short_circuits_loop(two_url_client):
     """
     mcp_result = {'error': 'not_found', 'ticket_id': 'tkt_missing'}
 
-    with _patched_cancel_seams(mcp_result) as (mock_mcp, _invalidated):
+    with _patched_cancel_seams(mcp_result) as (mock_mcp, invalidated):
         resp = two_url_client.post(
             '/api/v2/dashboard/curator/cancel',
             json={'ticket_id': 'tkt_missing'},
@@ -281,6 +290,7 @@ def test_two_url_not_found_short_circuits_loop(two_url_client):
     assert resp.json() == mcp_result
     # Only URL[0] must have been called; URL[1] must be skipped
     assert _dials(mock_mcp) == [('http://localhost:9000', 'cancel_ticket')]
+    assert invalidated == []
 
 
 def test_two_url_all_unreachable_returns_502_with_both_urls(two_url_client):
@@ -328,32 +338,3 @@ def test_two_url_all_unreachable_invalidates_each_session_in_order(two_url_clien
     assert resp.status_code == 502
     assert invalidated == urls
 
-
-# ---------------------------------------------------------------------------
-# task-2218 step-7: guard the not_found short-circuit ahead of the pending
-# first_success conversion — an authoritative not_found from url[0] must NOT
-# fan out to url[1].
-# ---------------------------------------------------------------------------
-
-
-def test_cancel_handler_not_found_does_not_fan_out(two_url_client):
-    """not_found from url[0] is authoritative → 404 verbatim; url[1] untouched.
-
-    Regression guard ahead of routing cancel_ticket's loop onto
-    ``mcp_fanout.first_success``: first_success stops at the first ``_call``
-    that does not raise, so a not_found JSONResponse must short-circuit the
-    fan-out exactly like the original for-loop's early
-    ``return JSONResponse(result, 404)`` — cancel_ticket must be dialed
-    exactly once (never falling through to url[1]).
-    """
-    mcp_result = {'error': 'not_found', 'ticket_id': 'tkt_missing'}
-
-    with _patched_cancel_seams(mcp_result) as (mock_mcp, _invalidated):
-        resp = two_url_client.post(
-            '/api/v2/dashboard/curator/cancel',
-            json={'ticket_id': 'tkt_missing'},
-        )
-
-    assert resp.status_code == 404
-    assert resp.json() == mcp_result
-    assert _dials(mock_mcp) == [('http://localhost:9000', 'cancel_ticket')]
