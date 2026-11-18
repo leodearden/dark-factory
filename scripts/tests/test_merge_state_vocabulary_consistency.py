@@ -520,8 +520,9 @@ PINNED_SITES: dict[str, tuple[tuple[str, ...], str]] = {
         "poll terminal set, submit terminal + non-terminal sets",
     ),
     "skills/_shared/merge-status-reasons.md": (
-        ("EPISTEMIC_STATES",),
-        "the epistemic-state list the shared merge_status reason switch opens with",
+        ("EPISTEMIC_STATES", "MERGE_REASONS"),
+        "the epistemic-state list the shared merge_status reason switch opens with, "
+        "and the one-line reason list the switch table follows",
     ),
 }
 
