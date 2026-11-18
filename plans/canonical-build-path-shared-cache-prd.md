@@ -1,6 +1,8 @@
 # One canonical build path and one shared compiler cache for reify
 
-**Status:** active. Authored 2026-11-18 (`/team /prd`, Leo attending).
+**Status:** active. Authored 2026-11-18 (`/team /prd`, Leo attending). Amended the same day: the cache
+policy is one setting per host that covers the warm base and verifies (decision 9), and gate κ measures
+three policies.
 **Code anchors** are cited by symbol and were checked against dark-factory main `0dfdd820f1` and reify
 main `11a5990e46` (2026-11-18). Main moves fast; re-locate symbols at implementation time.
 **Evidence** (all under `plans/sccache-path-key-study-2026-11-18/`): `REPORT.md` (the study, a laptop
@@ -19,8 +21,8 @@ What an operator observes when this lands:
 - A reify task verify on `leo-laptop`, in a worktree that was never built before, compiles nothing the
   workstation has already compiled: its sccache counters show hits where today they show misses, and the
   workstation's build-cache observation log has a row for it with backend `shared`.
-- `cargo build` typed in a fresh interactive worktree of reify's current main finishes without compiling
-  the workspace's libraries, because a merge verify already built them.
+- Under the `shared` policy, `cargo build` typed in a fresh interactive worktree of reify's current main
+  finishes without compiling the workspace's libraries, because a merge verify already built them.
 - When the shared store cannot be reached, builds still pass using a local cache, and one escalation
   appears and clears itself when the store returns.
 
@@ -92,8 +94,8 @@ Standing rule that binds every decision below: a cache must never change a verif
    it. This lets the scheme be switched on per host and per tree with no flag day.
 3. **Reify ships one primitive, `scripts/canon_run.py`** (Python, standard library only). It decides the
    mode of the build directory a command will use (C1), and either runs the command untouched (real-path
-   mode: exactly today's behaviour) or runs it with the worktree at CANON (C3) and, in `shared` policy, a
-   private cache server (C4, C5). It is the only place that knows the store, the server's lifecycle and
+   mode: exactly today's behaviour) or runs it with the worktree at CANON (C3) under the host's cache
+   policy, with a private cache server where the policy uses one (C4, C5). It is the only place that knows the store, the server's lifecycle and
    the cache environment.
 4. **Every launch site that reify or dark-factory owns calls the primitive explicitly; `PATH` is only for
    people and agents typing `cargo`.** A `PATH` shim alone is defeated by `~/.cargo/env` re-ordering `PATH`
@@ -125,14 +127,22 @@ Standing rule that binds every decision below: a cache must never change a verif
    to this tree or a namespace can be entered; otherwise it becomes a real-path directory. A sandboxed
    agent that builds some second tree (a test's scratch workspace) therefore gets a real-path build there,
    not a failure. Only a directory already stamped CANON, where CANON cannot be provided, is refused.
-9. **One cache policy by default, `shared`: sccache with the shared store and no incremental
-   compilation**, for verifies, agents and interactive sessions alike. It is the only policy under which
-   a build reuses the warm base and the cache. Host configuration can set agents or interactive sessions
-   to `incremental` (no sccache, incremental compilation: how agents build today). That policy shares no
-   workspace unit with anything built under `shared`, so its first build in a lane compiles the whole
-   workspace; it exists so the operator can choose it if gate κ measures the edit loop to matter more than
-   the warm start. An invocation whose environment already names a rustc wrapper (every `verify.sh` run)
-   is always `shared`.
+9. **Cache policy is one setting per host, and it covers every build there: verifies, the warm base,
+   agents and interactive sessions.** Cargo puts the incremental setting into each unit's identity, so a
+   build reuses another's work only if both used the same setting; a policy chosen per caller would leave
+   agents reusing nothing from the base, which is today's state (seeded-lane study). The values:
+   - `shared` (default): sccache with the shared store for every crate, incremental compilation off. A
+     build reuses anything already built anywhere. An edited crate and all its dependents compile in full.
+   - `incremental`: no sccache; workspace crates compile incrementally. Fastest rebuild after a small
+     edit in a build directory that already built nearby source (reify measured a touched crate with 23
+     dependents at 16 s against 104 s); nothing to reuse in a directory that has not.
+   - `mixed`: workspace crates compile incrementally and are not cached; registry crates, which cargo
+     never compiles incrementally, use sccache and the shared store.
+   The primitive applies the policy at every cargo invocation, inside the command, so it holds even where
+   a script in between exports its own settings: `verify.sh` always exports `RUSTC_WRAPPER=sccache` and
+   `CARGO_INCREMENTAL=0`. Under a policy other than `shared` the verify plan's printed environment
+   therefore differs from what cargo gets; the event and the journal record the policy in force (C6).
+   Which policy is cheapest for a host is measured, not argued: gate κ runs all three (§9).
 10. **Cargo subcommands that neither build nor run artefacts are passed through; everything else goes to
     the build directory's mode.** The trampoline passes through `metadata`, `locate-project`, `pkgid`,
     `tree`, `search`, `login`, `logout`, `new`, `init`, `add`, `remove`, `update`, `fetch`, `vendor`,
@@ -191,15 +201,15 @@ Standing rule that binds every decision below: a cache must never change a verif
     `config.py::SccacheConfig` describe the host-wide server and are left as they are.
 20. **Machine-dependent compiler flags bypass the cache.** The hosts' CPUs differ; `-march=native`,
     `-mtune=native`, `-mcpu=native` or `-C target-cpu=native` in a compile's arguments (where flags from
-    `RUSTFLAGS` and `CFLAGS` also end up) gives one key and different code. None is in use (S8). In `shared`
-    policy the primitive puts a directory holding one file, a guard named `sccache`, first on `PATH`, so
+    `RUSTFLAGS` and `CFLAGS` also end up) gives one key and different code. None is in use (S8). Where the
+    policy uses sccache the primitive puts a directory holding one file, a guard named `sccache`, first on `PATH`, so
     that `RUSTC_WRAPPER=sccache` and the `cc` crate (which routes C compiles only through a wrapper with
     that file stem) both reach it. The guard runs a flagged compile directly, uncached, counts it, and
     otherwise calls the real sccache by absolute path. Other compiler-steering options (`-fplugin`,
     `-specs=`, profile-guided flags) are not in use and not guarded; trigger to add them: the drift probe
     or a dependency review finds one.
-21. **Key hygiene is the primitive's job in `shared` policy**: it sets `RUSTC_WRAPPER`, `CARGO_INCREMENTAL=0`,
-    one pinned `CARGO_HOME` and `PWD`, and removes presentation-only `CARGO_*` variables. `PWD` matters
+21. **Key hygiene is the primitive's job**: it sets the wrapper and the incremental setting the policy
+    calls for, one pinned `CARGO_HOME` and `PWD`, and removes presentation-only `CARGO_*` variables. `PWD` matters
     because gcc records it in debug information when it names the working directory, which would split C
     keys per tree (critique M8).
 22. **Rollout is per host and per tree, by operator gates** (ι, κ), and reversible in this order: set the
@@ -239,10 +249,9 @@ A build directory outside the worktree (`CARGO_TARGET_DIR` elsewhere) is always 
 |---|---|
 | `canon_run.py exec -- <cmd…>` | Decide the mode. Real path: exec `<cmd>` with the environment untouched. CANON: C3–C6, then exit with the command's status. |
 | `canon_run.py cargo <args…>` | The same for cargo, after the pass-through list of decision 10. |
-| `canon_run.py status` | One JSON object: CANON, whether it is provisioned, host enabled, store reachable, this build directory's mode, the policy for each class. |
+| `canon_run.py status` | One JSON object: CANON, whether it is provisioned, host enabled, store reachable, this build directory's mode, the host's policy. |
 
 Exit 126 means "this command cannot run in the mode its build directory requires"; stderr names the fix.
-The caller's class comes from `REIFY_CANON_CLASS` (`verify`, `agent`; absent means `interactive`).
 `REIFY_CANON_ROOT` overrides CANON, and `REIFY_CANON_HOST_CONFIG` the configuration file, for tests only.
 
 ### C3. Entering CANON
@@ -257,18 +266,31 @@ The caller's class comes from `REIFY_CANON_CLASS` (`verify`, `agent`; absent mea
 - Exported for the command: `REIFY_CANON_ACTIVE` (the tree's device and inode), and
   `REIFY_VERIFY_LEDGER_LANE_DIR` and `REIFY_TS_CACHE_HOME` derived from the real root.
 
-### C4. Cache server (`shared` policy only)
+### C4. Cache environment, by policy
+
+The command's `PATH` starts with two directories of the tree's `scripts/canon-bin/`: `guard/` (holding
+only the guard, named `sccache`) and the trampoline's, then `$HOME/.cargo/bin`. Every cargo started inside
+the command therefore passes through the trampoline, which calls the primitive as a nested invocation;
+that invocation sets the variables below immediately before the real cargo runs, replacing whatever was
+inherited.
+
+| Policy | Server | Set for cargo |
+|---|---|---|
+| `shared` | yes | `RUSTC_WRAPPER=sccache`, `CARGO_INCREMENTAL=0` |
+| `mixed` | yes | `RUSTC_WRAPPER=sccache`, `CARGO_INCREMENTAL=1` (sccache declines an incremental compile, so the client runs it uncached) |
+| `incremental` | no | `RUSTC_WRAPPER` and the sccache variables removed, `CARGO_INCREMENTAL=1` |
+
+In every policy: one pinned `CARGO_HOME`, and presentation-only `CARGO_*` variables removed.
+
+Where there is a server:
 
 - Socket: `SCCACHE_SERVER_UDS=<CANON>/target/.reify-sccache.<pid>.sock`; `SCCACHE_SERVER_PORT` removed.
-- The server is started in the foreground as a child of the primitive, with file descriptors above 2
-  closed and `SCCACHE_IDLE_TIMEOUT=0`, under a host start lock (bounded wait; on timeout it starts anyway).
-  Its environment carries the backend of C5. The primitive waits until the socket answers before running
-  the command, reads the server's counters before stopping it, stops it and removes the socket at exit.
-- The command's environment: the socket, `RUSTC_WRAPPER=sccache` with the guard's directory first on
-  `PATH` and `$HOME/.cargo/bin` after it, `CARGO_INCREMENTAL=0`, the pinned `CARGO_HOME`, the local
-  fallback directory and `SCCACHE_IDLE_TIMEOUT=1800`, and no store variables.
-- In `incremental` policy there is no server; the primitive removes `RUSTC_WRAPPER` and the sccache
-  variables from the command's environment and leaves incremental compilation on.
+- The outermost invocation starts it in the foreground as its child, with file descriptors above 2 closed
+  and `SCCACHE_IDLE_TIMEOUT=0`, under a host start lock (bounded wait; on timeout it starts anyway). Its
+  environment carries the backend of C5. The primitive waits until the socket answers before running the
+  command, reads the server's counters before stopping it, stops it and removes the socket at exit.
+- The command's environment carries the socket, the local fallback directory and
+  `SCCACHE_IDLE_TIMEOUT=1800`, and no store variables.
 
 ### C5. Store, relay and fallback
 
@@ -282,21 +304,29 @@ The caller's class comes from `REIFY_CANON_CLASS` (`verify`, `agent`; absent mea
   start lock removes collisions within a host; a collision across hosts remains possible and is reported
   the same way.
 
-### C6. `build_cache` event on `REIFY_VERIFY_EVENT_LOG`
+### C6. `build_cache` event and the invocation journal
 
-It uses the channel's existing record envelope (reify `docs/prds/v0_6/run-all-runner-infra-harness.md`
-§4 C2). Unknown event names are already ignored by `verify_event_channel.py::_channel_from`. One event
-per outermost invocation on an enabled host:
+The event uses the channel's existing record envelope (reify
+`docs/prds/v0_6/run-all-runner-infra-harness.md` §4 C2). Unknown event names are already ignored by
+`verify_event_channel.py::_channel_from`. One event per outermost invocation on an enabled host, appended
+to `REIFY_VERIFY_EVENT_LOG` when that variable is set:
 
 | Field | Values |
 |---|---|
 | `mode` | `canon`, `real_path` |
+| `policy` | `shared`, `mixed`, `incremental` |
 | `backend` | `shared`, `local_fallback`, `none` (real-path mode, or `incremental` policy) |
 | `reason` | `''`, `store_unreachable`, `store_lost`, `store_not_configured`, `read_only_server`, `legacy_build_dir`, `canon_unavailable` |
 | `hits`, `misses`, `write_errors`, `uncached_machine_flags`, `detached_server` | integers |
+| `wall_secs`, `cpu_secs` | the command's wall time, and the processor time of the command and the server with all their children |
 
 Write errors are reported but are not a degradation signal: two builds writing one key at once is normal
 under a canonical path and counts as a write error (S5).
+
+The same record, with the cargo subcommand, is appended to `<build dir>/.reify-canon-journal.jsonl` for
+every outermost invocation, whoever the caller. It is the record of agent and interactive builds, which
+have no event channel, and the data gate κ compares policies with. The seed removes it from a copied
+build directory.
 
 ### C7. Trampoline and guard (reify `scripts/canon-bin/`)
 
@@ -319,8 +349,8 @@ yaml and never carried in `verify_env`, which the workstation copies to the lapt
 - **Verify legs.** The leg is a shell string run by `/bin/bash -c` inside `verify.py::run_verification`
   (its nested `_run_leg_command`). When `build_canon.root` is set and the worktree holds
   `scripts/canon_run.py`, the process is started as `<python> <worktree>/scripts/canon_run.py exec --
-  /bin/bash -c <string>`, composed where the nice prefix is applied, after the command rewriters, with
-  `REIFY_CANON_CLASS=verify`. The same for `offline_lane_runs.py::launch`. Otherwise unchanged.
+  /bin/bash -c <string>`, composed where the nice prefix is applied, after the command rewriters. The same
+  for `offline_lane_runs.py::launch`. Otherwise unchanged.
 - **Unprefixed leg in a stamped directory.** If a leg is about to run unprefixed (root unset, or the
   worktree has no primitive) and one of the project's `git.reap_build_artifact_dirs` carries the stamp
   file, that directory is removed first and the fact is logged.
@@ -328,8 +358,7 @@ yaml and never carried in `verify_env`, which the workstation copies to the lapt
   `agents/invoke.py::_sandbox_wrap`): when `build_canon.root` is set, the command is prefixed, before the
   landlock helper, with `/usr/bin/bwrap --dev-bind / / --bind <lane> <root> --die-with-parent`. The
   session's working directory and write-set are unchanged. A bwrap that fails is a failed launch.
-- **All agent launches** (`workflow.py::TaskWorkflow._build_agent_env`): `PATH` as above and
-  `REIFY_CANON_CLASS=agent`.
+- **All agent launches** (`workflow.py::TaskWorkflow._build_agent_env`): `PATH` as above.
 - `verify.py::run_main_tip_sweep`'s vanished-worktree detection also recognises `build_canon.root` in error
   text, since compiler errors name CANON for a leg that ran there.
 
@@ -337,7 +366,7 @@ yaml and never carried in `verify_env`, which the workstation copies to the lapt
 
 `verify.py::VerifyResult` gains one optional field `build_cache`: `None`, or a dict with `mode` and
 `backend` (the worst of the run's events: `real_path` before `canon`, `local_fallback` before `shared`),
-`reason` (the first non-empty) and the summed counters. `verify.py::_aggregate_results` folds the legs.
+`policy`, `reason` (the first non-empty) and the summed counters and times. `verify.py::_aggregate_results` folds the legs.
 `verify_runner.py::result_from_dict` accepts the field; `remote_gate.py::wire_fingerprint` is computed from
 field shapes and follows by itself.
 
@@ -352,7 +381,8 @@ the dict) and feeds the alarm.
 
 - **Degraded**: `backend == 'local_fallback'`; or `reason == 'read_only_server'`; or `mode == 'real_path'`
   on a host with `build_canon.expect_canon`.
-- **Healthy**: `mode == 'canon'`, `backend == 'shared'`, `reason == ''`.
+- **Healthy**: `mode == 'canon'`, `reason == ''`, and `backend == 'shared'`, or `backend == 'none'` under
+  `incremental` policy, where no cache is expected.
 - **Neutral**: `build_cache` is `None`, or `real_path` on a host not yet expected to be converted.
   Neutral results neither extend nor reset a streak.
 
@@ -370,14 +400,18 @@ passes the scenario of boundary row 19.
 
 ### C12. Reify launch sites, warm base and seed
 
-- `hooks/pre-commit` and `hooks/pre-merge-commit` run `verify.sh` through `canon_run.py exec` with class
-  `verify`; so do `scripts/seed-warm-base-initial.sh` and `scripts/ensure-warm-base.sh` for their cargo.
+- `hooks/pre-commit` and `hooks/pre-merge-commit` run `verify.sh` through `canon_run.py exec`; so do
+  `scripts/seed-warm-base-initial.sh` and `scripts/ensure-warm-base.sh` for their cargo. The warm base is
+  therefore built under the host's policy, like everything seeded from it.
 - `seed-warm-lane.sh`, when the copied build directory carries the CANON stamp:
   - if the lane's tree holds the primitive: no path relocation and no `env!` relink; leftover socket
-    files are removed;
+    files and the invocation journal are removed;
   - if it does not (a branch from before this work): today's relocation and relink run with CANON as the
     root to rewrite from, and the stamp is removed, so the lane has a real-path directory as it does now.
   With no stamp it behaves as today. `refresh-warm-base.sh` is unchanged apart from ignoring socket files.
+- Changing a host's policy changes every workspace unit's identity. The old units stay in the build
+  directory unused, so a policy change is followed by dropping the merge lane's build directory, which
+  rebuilds the base under the new policy.
 
 ### C13. Host configuration, store service and operator tools
 
@@ -389,7 +423,7 @@ operator gates with the installer's help.
 | `enabled` | bool. False or file absent: fresh build directories are real-path. |
 | `store_url`, `store_user`, `store_password` | the WebDAV endpoint as this host reaches it. Absent: `store_not_configured`. |
 | `fallback_dir`, `fallback_cap` | the local fallback cache: under the user's home, or under `/tmp` when the caller is a sandboxed agent, which can write nowhere else outside its lane. |
-| `policy.agent`, `policy.interactive` | `shared` (default) or `incremental`. |
+| `policy` | `shared` (default), `mixed` or `incremental` (decision 9). One value for every build on the host. |
 
 Dark-factory `scripts/deploy/`:
 
@@ -430,7 +464,7 @@ compiling a C file through `cc`. No row asserts a wall-clock bound.
 | 1 | reify | C1's table, each row; a directory holding only a tree-sitter epoch file and a `.rustc_info.json` | the mode named; that directory is treated as not built in |
 | 2 | reify | pass-through: `metadata`, `install` with no path, `install --path .`, an alias `t`, an unknown plugin | first two untouched; the other three go to the primitive |
 | 3 | reify | argument and environment rewriting | `--manifest-path <real>/Cargo.toml` and `CARGO_TARGET_DIR=<real>/target` become CANON paths; `PWD` is the new directory |
-| 4 | reify | policy selection | class `agent` with `policy.agent = "incremental"` gives no server and no wrapper; the same with `RUSTC_WRAPPER` already set gives `shared` |
+| 4 | reify | policy application: host policy `incremental`, the caller's environment exporting `RUSTC_WRAPPER=sccache` and `CARGO_INCREMENTAL=0` as `verify.sh` does | cargo runs with no wrapper and incremental compilation on; no server is started; the journal row says `incremental` |
 | 5 | reify | guard: `-C target-cpu=native`; a C compile with `-march=native`; an ordinary compile | first two run the compiler directly and are counted; the third calls sccache |
 | 6 | reify | probe fails before start (fake store refusing) | backend `local_fallback`, reason `store_unreachable` |
 | 7 | reify | watchdog with an injected clock and a fake store that stops answering, one transfer in flight | relay closed and the transfer's connection reset after the second failed probe; reason `store_lost`; the command's exit status unchanged |
@@ -443,13 +477,13 @@ compiling a C file through `cc`. No row asserts a wall-clock bound.
 | 14 | reify | nested: a test in tree A runs the primitive on scratch tree B | B gets its own namespace and server; A's server is not used for B |
 | 15 | reify | the command killed by its process group; and a normal exit | no server or compiler process remains; after the normal exit no socket file |
 | 16 | reify | twenty primitives started at once against one store | every server's entries are written, or its event says `read_only_server` |
-| 17 | reify | session binding: the bind prefix, then dark-factory's landlock helper, then `cargo test` through the trampoline, in `incremental` policy (β1) and `shared` policy (β2) | passes at CANON without entering a namespace; the working directory outside cargo is the real path |
+| 17 | reify | session binding: the bind prefix, then dark-factory's landlock helper, then `cargo test` through the trampoline, under `incremental` policy (β1) and under `shared` and `mixed` (β2) | passes at CANON without entering a namespace; the working directory outside cargo is the real path; under `mixed` the workspace crate is compiled incrementally and not cached while the registry crate is a cache hit on the second tree |
 | 18 | reify | seed a lane from a CANON-stamped base with the primitive in the lane's tree; without it; and from an unstamped base | first: no file rewritten, no source touched, the lane's build is all fresh. Second: relocated from CANON, stamp gone, builds at the real path. Third: output identical to today's |
 | 19 | each | a process in a mount namespace with (a) its working directory, (b) only an open file, inside a bound lane, its visible parent killed; plus an unrelated same-user process in a foreign namespace whose root cannot be read | scans report the lane referenced for (a) and (b); CPU ticks are counted for (a); the unrelated process is not reported and is never signalled |
 | 20 | DF | `build_canon.root` unset | the started leg process, its environment and the agent command line identical to today's |
 | 21 | DF | `build_canon.root` set; a worktree with and without the primitive; a stamped build directory in the one without; a sandboxed and an unsandboxed role | leg started through the primitive only where it exists; the stamped directory removed in the other; bind prefix before the landlock helper for the sandboxed role only; `PATH` and class set for both |
 | 22 | both | the real primitive under a real verify leg, with a private store or none | the result's `build_cache` matches the primitive's events; a two-leg run sums the counters; one observation row is written |
-| 23 | DF | results in order: 2 degraded; a third; a healthy one; with the L1 closed by hand, 2 more degraded; 10 consecutive; neutral results interleaved; a `real_path` result with and without `expect_canon`; a `read_only_server` result | L1 at the second; nothing at the third; cleared by the healthy one; refiled; L2 at the tenth with the L1 superseded; neutral changes nothing; `real_path` is degraded only with `expect_canon`; read-only is degraded |
+| 23 | DF | results in order: 2 degraded; a third; a healthy one; with the L1 closed by hand, 2 more degraded; 10 consecutive; neutral results interleaved; a `real_path` result with and without `expect_canon`; a `read_only_server` result; a `backend none` result under `incremental` policy | L1 at the second; nothing at the third; cleared by the healthy one; refiled; L2 at the tenth with the L1 superseded; neutral changes nothing; `real_path` is degraded only with `expect_canon`; read-only is degraded; `none` under `incremental` is healthy |
 | 24 | DF | a result with `build_cache` `None` | neutral; no observation row |
 | 25 | DF | the lane alarm of the task-verify-lanes PRD after the ladder is extracted | that PRD's own boundary row 20 passes unchanged |
 
@@ -473,8 +507,8 @@ compiling a C file through `cc`. No row asserts a wall-clock bound.
 | dark-factory tasks 8338, 8339 | same functions | `proc_group.py::cpu_ticks_under_path`, `merge_lane/liveness.py::verify_tree_cpu_ticks` | those tasks for cost and start-time filtering; ε for namespace translation | pending; rebase whichever lands second |
 | `plans/warm-lane-infra-repatriation-prd.md` (dark-factory tasks 3077, 7865, 3078) | reify's copies of the warm-lane scripts are the ones that run until the flip | `lib_live_refs.sh` in both repositories | δ and ε change both copies | pending |
 | reify PRD `verify-structured-plan-and-role-table` (reify task 9112) | avoided | this PRD changes no line of `verify.sh` | — | pending |
-| reify task 10169 (measure agent builds under the verify's settings at real paths) | adjacent | the policy question of decision 9, measured without the shared cache; gate κ repeats it in CANON mode | task 10169 for its measurement; κ for the policy | pending; no dependency |
-| reify tasks 7429, 9055 (A/B of incremental without sccache against sccache) | their sccache arm changes value | the A/B should run with CANON mode on, or it measures a cache that mostly misses | those tasks | pending, parked |
+| reify task 10169 (measure agent builds under the verify's settings at real paths) | superseded in part | it asks whether agents should build with the verify's settings; decision 9 makes the setting one per host, and gate κ measures the three policies at the canonical path | task 10169 for its own measurement; κ for the policy | pending; no dependency |
+| reify tasks 7429, 9055 (a 14-day A/B of incremental without sccache against sccache on all lanes, through an arm variable `verify.sh` would read) | overlapping | this PRD's host policy is a second way to put a host's builds, verifies included, on either arm, and gate κ runs the comparison first; 7429's other parts (debug information, linker) are untouched | those tasks; their owner decides whether κ's result answers 9055 | pending, parked |
 | reify tasks 10167, 10170, 9054 (seed relocation of dep-info paths; fewer relinked tests; baked paths in `src/` tests) | unnecessary for CANON directories, still needed for real-path lanes | `seed-warm-lane.sh` | those tasks | pending; γ edits the same file, rebase whichever lands second |
 | reify tasks 9317, 9769, 10168, 9603, 10152, 9712 (seed, base stamp and refresh work) | same files | `seed-warm-lane.sh`, `refresh-warm-base.sh`; the base's existing per-generation stamp records where the base tree lives and is unchanged, while this PRD's stamp records where a build directory was built | those tasks | pending; rebase whichever lands second |
 | reify task 9260 (one helper for environment variables infra tests must not inherit) | consumed | the primitive's `REIFY_CANON_*` variables join that list | β1 adds them where the list lives when it is implemented | pending, parked |
@@ -510,26 +544,30 @@ files (`config.py`, `verify.py`, `harness.py`) are contended, and pinning the ch
   lane after its visible parent is killed, `warm-lane-gc.sh` on that scratch lane refuses to delete, and an
   unrelated foreign-namespace process changes nothing. Unlocks β1, ι, κ.
 - **β1. The primitive: modes, namespace entry, trampoline** (reify, about 900 lines). C1–C3, C7's
-  trampoline; decisions 2, 3, 8–10, 12; `incremental` policy end to end; boundary rows 1–4, 9, 11, 12, and
-  17 in `incremental` policy.
+  trampoline, and `incremental` policy of C4 end to end; decisions 2, 3, 8–10, 12; boundary rows 1–4, 9,
+  11, 12, and 17 under `incremental` policy.
   Files: `scripts/canon_run.py` (new), `scripts/canon-bin/cargo` (new), `tests/infra/test_canon_run_units.py`
   and `tests/infra/test_canon_run_host.py` with their `.sh` wrappers (new),
   `tests/infra/run-all-classification.manifest`, `scripts/verify-pipeline-paths.txt`.
-  Signal: `canon_run.py status` prints the mode of a scratch tree's build directory; `cargo test` through
-  the trampoline passes at CANON in `incremental` policy with the stamp written; with the host disabled the
-  same command is byte-identical to plain cargo. Depends on α (cross-project) and δ. Unlocks β2, γ, ζ.
-- **β2. Cache server, guard, store relay, fallback and the event** (reify, about 1,100 lines). C4–C6, C7's
-  guard; decisions 11, 14, 20, 21; boundary rows 5–8, 10, 13–16, and 17 in `shared` policy; the note
+  Signal: `canon_run.py status` prints the mode of a scratch tree's build directory and the host's policy;
+  `cargo test` through the trampoline passes at CANON under `incremental` policy with the stamp written,
+  even when the caller exported `CARGO_INCREMENTAL=0`; with the host disabled the same command is
+  byte-identical to plain cargo. Depends on α (cross-project) and δ. Unlocks β2, γ, ζ.
+- **β2. Cache server, guard, store relay, fallback, the event and the journal** (reify, about 1,200
+  lines). `shared` and `mixed` policy of C4; C5, C6, C7's guard; decisions 11, 14, 20, 21; boundary rows
+  5–8, 10, 13–16, and 17 under `shared` and `mixed`; the note
   `docs/notes/sccache-key-path-sensitivity.md` and the event name added to the channel's contract.
   Files: `scripts/canon_run.py`, `scripts/canon_cache.py` (new), `scripts/canon-bin/guard/sccache` (new),
   `tests/infra/test_canon_cache_units.py` and `tests/infra/test_canon_cache_host.py` with wrappers (new),
   `tests/infra/run-all-classification.manifest`, `docs/notes/sccache-key-path-sensitivity.md`,
   `docs/prds/v0_6/run-all-runner-infra-harness.md`.
-  Signal: the scratch workspace built at a second path reports every cacheable unit as a hit and writes a
-  `build_cache` event with `mode` `canon`, `backend` `shared`; with the store stopped it reports
-  `local_fallback`. Depends on β1. Unlocks η, λ, ι.
-  G7 waiver: no-silent-fail-soft — fallbacks of agent and interactive builds are not reported per build;
-  they are reported per host through verify results, which share the same store (decision 18).
+  Signal: the scratch workspace built at a second path under `shared` policy reports every cacheable unit
+  as a hit and writes a `build_cache` event and a journal row with `mode` `canon`, `backend` `shared` and
+  the command's processor time; with the store stopped it reports `local_fallback`. Depends on β1.
+  Unlocks η, λ, ι.
+  G7 waiver: no-silent-fail-soft — fallbacks of agent and interactive builds raise no escalation of their
+  own; they are journaled per build directory and escalated per host through verify results, which share
+  the same store (decision 18).
 - **γ. Reify launch sites and the seed** (reify, about 450 lines). C12; boundary row 18.
   Files: `hooks/pre-commit`, `hooks/pre-merge-commit`, `scripts/seed-warm-base-initial.sh`,
   `scripts/ensure-warm-base.sh`, `scripts/seed-warm-lane.sh`, `scripts/refresh-warm-base.sh`,
@@ -549,7 +587,7 @@ files (`config.py`, `verify.py`, `harness.py`) are contended, and pinning the ch
   Files: `orchestrator/src/orchestrator/config.py`, `verify.py`, `offline_lane_runs.py`,
   `agents/sandbox_dispatch.py`, `agents/invoke.py`, `workflow.py`, and a test beside each.
   Signal: with `build_canon.root` set, a verify leg on a fixture repository whose primitive is a recording
-  stub shows the stub was started with `exec -- /bin/bash -c …` and class `verify`, and a sandboxed agent
+  stub shows the stub was started with `exec -- /bin/bash -c …`, and a sandboxed agent
   launch shows the bind prefix before the landlock helper; unset, both are identical to today's. Depends
   on β1 (cross-project) and dark-factory task 10736. Unlocks η, ι, κ.
 - **η. `build_cache` facts, the observation log and the degraded-cache alarm** (dark-factory, about 900
@@ -596,17 +634,24 @@ files (`config.py`, `verify.py`, `harness.py`) are contended, and pinning the ch
   store (decisions 14, 15).
   Signal: the in-service check exits 0 for the laptop, and an observation row for a laptop verify shows
   `mode` `canon`, `backend` `shared`. Depends on α, β2, γ, δ, ε, ζ, η, θ.
-- **κ. Enable on the workstation** (dark-factory; operator gate, no code). Write the workstation's host
-  configuration and `build_canon`; reload reify's orchestrator configuration on a commit containing ζ and
-  η; with the merge queue halted and idle, drop the persistent merge lane's build directory so the next
-  merge verify rebuilds the warm base at CANON (one cold build), then release the queue; confirm a newly
-  seeded lane's stamp is CANON and that its agent's first build compiles nothing unchanged; measure agent
-  build cost under `shared` and `incremental` policy on a few tasks and set the policies; run
-  `setup-dev.sh` for interactive shells and launch the GUI once from a CANON build directory; set
-  `expect_canon`; lower the old host cache's cap once the store holds a week of builds. Rollback at any
-  step follows decision 22.
-  Signal, and the goal signal of this PRD: the in-service check exits 0 for the workstation, and a build of
-  current main in a never-built interactive worktree, `shared` policy, shows no workspace-library misses.
+- **κ. Enable on the workstation and choose its policy** (dark-factory; operator gate, no code). Write
+  the workstation's host configuration and `build_canon`; reload reify's orchestrator configuration on a
+  commit containing ζ and η. Then, for each of `shared`, `incremental` and `mixed` in turn: set the host's
+  policy; with the merge queue halted and idle, drop the persistent merge lane's build directory so the
+  next merge verify rebuilds the warm base at CANON under that policy (one cold build each), and release
+  the queue; let a comparable number of tasks run; collect, from the invocation journals of their lanes
+  and from the observation log, processor time per task for agent builds and for verifies, and the cold
+  base build's own. For the two incremental policies also record whether a newly seeded lane's first
+  build reuses the base's incremental state or recompiles the workspace. Choose the policy with the least
+  processor time per task, set it, and rebuild the base once more if it is not the last one measured. Then:
+  confirm a newly seeded lane's stamp is CANON; run `setup-dev.sh` for interactive shells and launch the
+  GUI once from a CANON build directory; set `expect_canon`; lower the old host cache's cap once the store
+  holds a week of builds. Set the laptop to the chosen policy and reset its lanes, since hosts on
+  different policies share at most registry crates. Rollback at any step follows decision 22.
+  Signal, and the goal signal of this PRD: the three policies' measured processor time per task and the
+  choice are recorded in the resolution; the in-service check exits 0 for the workstation; and a build of
+  current main in a never-built interactive worktree shows no registry-library misses, and under `shared`
+  policy no workspace-library misses either.
   Depends on ι, γ, λ.
 
 ## 10. Out of scope
@@ -637,5 +682,11 @@ files (`config.py`, `verify.py`, `harness.py`) are contended, and pinning the ch
    directory or its lane start-log is skipped. Decide at β1.
 5. **The store's size cap and pruning cadence.** Start at 300 GiB and daily; revisit at κ.
 6. **Watchdog probe interval and what counts as slow.** Start at 15 s and 2 s. Decide at β2.
-7. **How the observer reaches `VerifyRunnerPool.dispatch`.** A late-bound process-wide sink avoids editing
+7. **Whether incremental state survives seeding.** A lane's build directory is a copy of the base's. If
+   rustc does not accept the copied incremental state, the two incremental policies recompile the
+   workspace once per lane. Measured at κ, not assumed.
+8. **How the incremental setting is passed.** sccache hashes every `CARGO_*` variable, so setting
+   `CARGO_INCREMENTAL` differently under `mixed` and `shared` also splits registry crates' keys between
+   the two. Passing it as a cargo `--config` argument would not. Decide at β2.
+9. **How the observer reaches `VerifyRunnerPool.dispatch`.** A late-bound process-wide sink avoids editing
    the pool's five construction sites; decide at η against what task 10737 does for its own alarm.
