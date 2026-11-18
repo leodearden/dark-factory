@@ -592,6 +592,45 @@ def test_the_review_carries_integrity_ladder_cost_and_leakage_sections(runs_db, 
     assert dict((u.role, u.count) for u in result.containment.by_role)['merger'] == 2
 
 
+SCOPED_CAP_LEAF = 'usage_cap.scoped_cap_models'
+
+
+def _reload(conn, timestamp, *, restart_required):
+    """Seed one `config_reload` carrying only the key the scan reads."""
+    conn.seed_event(timestamp, 'config_reload', data={'restart_required': restart_required})
+
+
+def test_the_review_carries_the_orchestrator_startups_and_the_reload_to_startup_join(
+    runs_db, scenario
+):
+    runs_db.seed_run(run_id='run-before-apply', started_at=_at(hours=-15))
+    _reload(runs_db, _at(minutes=17, seconds=35), restart_required={
+        SCOPED_CAP_LEAF: {'old': ['claude-fable-5'], 'new': ['claude-fable-5', FABLE]},
+    })
+    runs_db.seed_run(run_id='run-063e9795fcf6', started_at=_at(hours=2, minutes=56))
+    _reload(runs_db, _at(days=13),
+            restart_required={'max_concurrent_tasks': {'old': 8, 'new': 10}})
+    runs_db.seed_run(run_id='run-at-window-end', started_at=END.isoformat())
+
+    result = _review(runs_db, scenario)
+
+    startup = audit_model_admission.OrchestratorStartup(
+        started_at=_at(hours=2, minutes=56), run_id='run-063e9795fcf6',
+    )
+    assert result.orchestrator_startups == (startup,)
+    assert result.restart_required_reloads == (
+        audit_model_admission.RestartRequiredReload(
+            timestamp=_at(minutes=17, seconds=35), leaves=(SCOPED_CAP_LEAF,),
+            first_startup_after=startup,
+        ),
+        audit_model_admission.RestartRequiredReload(
+            timestamp=_at(days=13), leaves=('max_concurrent_tasks',),
+            first_startup_after=None,
+        ),
+    )
+    assert [r.service for r in result.restarts] == ['orchestrator']
+
+
 def _cells(line):
     return [cell.strip() for cell in line.strip().strip('|').split('|')]
 
