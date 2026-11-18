@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import time
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -19,10 +20,19 @@ import pytest
 from _synthetic_proc import synthetic_stat_line
 
 import shared.proc_group as proc_group_module
-from shared.proc_group import pid_running, reap_process_groups, scan_process_groups_under_path
+from shared.proc_group import (
+    cpu_ticks_under_path,
+    pid_running,
+    read_cpu_ticks,
+    reap_process_groups,
+    scan_process_groups_under_path,
+)
 from shared.testing_mount_ns import Hold, namespaced_holder, unreadable_foreign_namespace_process
 
 _MOUNT_POINT = '/opt/canon/ws'
+
+#: Guards against broken infrastructure; not a timing assertion.
+_CPU_TICKS_BACKSTOP_S = 60.0
 
 
 class _FabricatedNamespaces:
@@ -281,3 +291,58 @@ class TestNamespaceTranslationAgainstASyntheticProc:
         )
 
         assert scan_process_groups_under_path(namespaces.lane) == {102}
+
+
+class TestCpuTicksThroughARealMountNamespace:
+    """PRD row 19's CPU signal: a namespaced process with no visible parent counts, by cwd only."""
+
+    def test_a_busy_cwd_through_a_bind_counts_and_an_open_file_does_not(
+        self, tmp_path: Path
+    ) -> None:
+        base = tmp_path.resolve()
+        lane_a, lane_b = base / 'lane-a', base / 'lane-b'
+        with contextlib.ExitStack() as stack:
+            busy = stack.enter_context(namespaced_holder(lane_a, base / 'canon a', Hold.CWD_BUSY))
+            stack.enter_context(namespaced_holder(lane_b, base / 'canon b', Hold.OPEN_FILE))
+            deadline = time.monotonic() + _CPU_TICKS_BACKSTOP_S
+            while not (read_cpu_ticks(Path('/proc') / str(busy.pid)) or 0) > 0:
+                assert time.monotonic() < deadline, f'holder {busy.pid} burned no CPU tick'
+                time.sleep(0.05)
+
+            ticks = cpu_ticks_under_path(lane_a)
+
+            assert ticks is not None and ticks > 0, f'expected a positive count; got {ticks}'
+            assert cpu_ticks_under_path(lane_b) is None, 'an open file is not a cwd'
+
+
+class TestCpuTicksThroughNamespacesAgainstASyntheticProc:
+    """cpu_ticks_under_path translates working directories only, against fabricated namespaces."""
+
+    def test_a_cwd_through_the_mount_point_is_counted(
+        self, namespaces: _FabricatedNamespaces
+    ) -> None:
+        namespaces.add_sandboxed(101, cwd=f'{_MOUNT_POINT}/sub', cpu=(3, 4, 0, 0))
+
+        assert cpu_ticks_under_path(namespaces.lane) == 7
+
+    def test_an_fd_through_the_mount_point_is_not_counted(
+        self, namespaces: _FabricatedNamespaces
+    ) -> None:
+        namespaces.add_sandboxed(101, cwd=f'{_MOUNT_POINT}/sub', cpu=(3, 4, 0, 0))
+        namespaces.add_sandboxed(102, cwd='/', fds=[f'{_MOUNT_POINT}/x'], cpu=(50, 50, 0, 0))
+
+        assert cpu_ticks_under_path(namespaces.lane) == 7
+
+    def test_a_namespace_whose_root_cannot_be_read_is_not_counted(
+        self, namespaces: _FabricatedNamespaces
+    ) -> None:
+        namespaces.add_pid(
+            101,
+            ns=namespaces.other,
+            root=None,
+            mountinfo=namespaces.mountinfo(_MOUNT_POINT),
+            cwd=f'{_MOUNT_POINT}/sub',
+            cpu=(3, 4, 0, 0),
+        )
+
+        assert cpu_ticks_under_path(namespaces.lane) is None
