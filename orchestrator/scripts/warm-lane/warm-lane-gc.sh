@@ -301,10 +301,10 @@
 #     pool at rest never is.
 #     AMENDED by task 8089: the fd/cwd walk is narrowed and live_ref_present
 #     re-measured, superseding the per-call live_ref_present figures above
-#     (~1.9s; ~1.5s cwd/fd, ~0.38s maps) and the ~2-3 min pool figure that
-#     scales with them, which was not re-measured; current per-call figures:
-#     lib_live_refs.sh's MEASURED COST. The ~1ms record read and the ~18ms
-#     _is_reclaimable git pair are unaffected.
+#     (~1.9s; ~1.5s cwd/fd, ~0.38s maps), and so leaving the ~2-3 min pool
+#     figure, which scales with them, stale (not re-measured); current
+#     per-call figures: lib_live_refs.sh's MEASURED COST. The ~1ms record read
+#     and the ~18ms _is_reclaimable git pair are unaffected.
 #   - α reuse: the base symlink is resolved to its concrete gen PER LANE, and
 #     flock -s is held on that gen during that lane's α call (D8 reader-refcount
 #     seam; same contract as the acquire path). If no gen can be pinned the seed
