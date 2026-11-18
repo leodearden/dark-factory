@@ -1745,6 +1745,14 @@ and `git worktree remove --force`.
   `/proc/<pid>/fd`; it reads `ns/mnt`, `mountinfo`, `maps` and paths under
   `root` without listing them. All of its awk is POSIX, since the laptop may
   run mawk.
+- **Not measured on btrfs.** This copy and
+  `shared/src/shared/proc_group.py` keep only the mountinfo lines whose
+  maj:min is the candidate's `st_dev`, and confirm by inode only after that.
+  On btrfs, `stat` may report a per-subvolume anonymous `st_dev` that differs
+  from the maj:min in mountinfo. If it does, no alias survives and the half
+  adds nothing: it fails open, which is how this lib behaved before this delta.
+  The rule was measured only on this host's ext4 (259:6), and the laptop's
+  filesystem is not recorded.
 
 reify's copy gets the same rule from reify-side task δ of that PRD. A re-sync of
 this file must re-apply this hunk along with Deltas 15 and 18.

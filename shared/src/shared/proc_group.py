@@ -853,7 +853,9 @@ def _mount_points_bound_to(entry: Path, identity: _FileIdentity) -> tuple[str, .
 
     None when that namespace's root cannot be read. Only the mounts on *identity*'s device
     are stat'ed, so an unrelated (possibly hung) filesystem is never touched; each is then
-    confirmed by device and inode through ``/proc/<pid>/root``.
+    confirmed by device and inode through ``/proc/<pid>/root``. Not measured on btrfs, where a
+    subvolume's ``st_dev`` may differ from mountinfo's maj:min; there none would be kept, which
+    fails open.
     """
     root = entry / 'root'
     try:

@@ -21,8 +21,8 @@
 #   live_referenced_paths RP...
 #       Batch predicate: print the subset of the given resolved realpaths that
 #       ANY live process references (cwd / open fd / mmap, directly or through
-#       a bind-mount point in another mount namespace). ONE /proc walk for the
-#       WHOLE set.
+#       a bind-mount point in another mount namespace). Each half runs ONCE
+#       for the WHOLE set, never once per candidate.
 #   live_ref_present DIR
 #       Single-candidate predicate: return 0 iff DIR (or a descendant) is
 #       referenced by a live process; 1 otherwise. Short-circuits: the cheaper
@@ -194,9 +194,10 @@ _live_refs_scan_maps() {
 # another mount namespace that sees a candidate at a bind-mount point names it
 # by that mount point, which the two host halves cannot match. The helpers below
 # pass whitespace-free records — pids, "dev:ino" namespace ids, candidate
-# INDEXES, and mount points still in mountinfo's \ooo-escaped form — so only
-# the final rewrite handles real path text. Every awk here is POSIX (no gawk
-# functions, no {n} intervals): the laptop may run mawk.
+# INDEXES, and mount points still in mountinfo's \ooo-escaped form. Real path
+# text appears only in stat's %n output, for the candidates and for the paths
+# _live_refs_aliases confirms, and in the final rewrite. Every awk here is
+# POSIX (no gawk functions, no {n} intervals): the laptop may run mawk.
 
 # The \ooo unescape proc(5) defines for mountinfo, as an awk function.
 _LIVE_REFS_AWK_UNESCAPE='
@@ -349,11 +350,12 @@ _live_refs_scan_namespaces() {
 # live-consumer gate — task 5378, task 5572), print (one per line,
 # deduplicated) the subset that ANY live process references via its cwd
 # symlink, an open fd symlink, or a mmap'd region in /proc/<pid>/maps.
-# Performs exactly ONE /proc symlink walk and ONE /proc/*/maps grep for the
-# WHOLE candidate set — O(/proc) once, NOT once per entry: with N stranded
-# entries the older per-entry scan was O(N × /proc) (a single /proc walk
-# already cost ~84s on a ~1300-process host, and the ENOSPC strand that
-# motivates the reaper can leave many entries at once).
+# Runs each half ONCE for the WHOLE candidate set: one /proc symlink walk, one
+# /proc/*/maps grep, and the namespace half's census stat, representatives stat
+# and one find per namespace binding a candidate. O(/proc) once, NOT once per
+# entry: with N stranded entries the older per-entry scan was O(N × /proc) (a
+# single /proc walk already cost ~84s on a ~1300-process host, and the ENOSPC
+# strand that motivates the reaper can leave many entries at once).
 #
 # The verdict is read from captured OUTPUT, never a pipeline exit status:
 # find/grep over /proc return non-zero on the unavoidable permission-denied
