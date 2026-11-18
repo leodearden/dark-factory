@@ -90,10 +90,11 @@ max_concurrent_tasks: 36
 # orchestrator/tests/test_operational_config_binding.py.
 lock_depth: 12
 
-# HUB-FILE LOCK WIDTH (limit 2 on exactly two files; Leo 2026-10-19). A BOUNDED
-# EXPERIMENT, not a standing setting; max_per_module stays 1 everywhere else.
-# Why: workflow.py and harness.py are the two most contended lock keys, and this
-# is the only lever that lets two orchestrator tasks hold one hub file at once.
+# HUB-FILE LOCK WIDTH (limit 2 on each hub file listed below; Leo 2026-10-19). A
+# BOUNDED EXPERIMENT, not a standing setting; max_per_module stays 1 everywhere else.
+# Why: each hub file is a heavily contended lock key (workflow.py and harness.py
+# were the two most contended; config.py's case is below), and this is the only
+# lever that lets two orchestrator tasks hold one hub file at once.
 # Correctness rests on BRE (acquire-before-edit) + full-workspace merge-verify,
 # as for lock_depth above; the price is paid at rebase/merge time.
 # The experiment, its 14d baseline and the REVERT CLAUSE live in task
@@ -109,8 +110,9 @@ lock_depth: 12
 # Keys are depth-lock_depth paths (4 components, inside lock_depth 12), so they
 # match exactly what ModuleLockTable._limit_for looks up; a deeper key never would.
 # RED TIER: module_overrides is not in RELOADABLE_FIELDS and _limit_for memoises
-# per process, so this takes effect at the next orchestrator restart (the
-# explicit deploy task filed with this carrier), not on reload_config.
+# per process, so each entry takes effect at the next orchestrator restart, not on
+# reload_config: workflow.py and harness.py at the explicit deploy task filed with
+# their carrier, config.py at the next fleet redeploy (it has no deploy task).
 #
 # THE TWO RATCHET JSON PATHS (Leo's ruling 3 of 2026-10-21, task 7298) are
 # UNBOUNDED, not widened: 99 is above any max_concurrent_tasks this repo has run.
