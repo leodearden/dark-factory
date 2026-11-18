@@ -46,7 +46,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
-from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT
+from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT, env_resolving_running_interpreter
 from test_warm_lane_bash_suite import BASH_SUITES
 
 from orchestrator.config import LaneCommand, OrchestratorConfig
@@ -88,8 +88,14 @@ _HOSTILE_ENV_KEYS = frozenset({
 
 
 def _sanitized_env() -> dict[str, str]:
-    """``os.environ`` minus the keys that would contaminate the probe."""
-    return {k: v for k, v in os.environ.items() if k not in _HOSTILE_ENV_KEYS}
+    """``os.environ`` minus the keys that would contaminate the probe.
+
+    The configured command names ``pytest`` bare, which the lane resolves
+    through its daemon's venv ``bin`` on PATH; the probe binds it to this test's
+    interpreter instead of to whatever the launching shell happens to carry.
+    """
+    kept = {k: v for k, v in os.environ.items() if k not in _HOSTILE_ENV_KEYS}
+    return env_resolving_running_interpreter(kept)
 
 
 def _marker_expression(argv: Sequence[str]) -> str | None:
