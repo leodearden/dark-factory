@@ -160,11 +160,12 @@ class WmBackend:
         int. An unparseable/missing id falls through fail-soft to the title
         match.
 
-        NOTE: this exact `split(None, 3)` parse is duplicated (not
-        shared/imported, since this is a cross-package boundary) in
-        `orchestrator/src/orchestrator/session_windows.py::parse_wmctrl_list`
-        -- if the column layout or matching rule here ever changes, mirror
-        the change there too. The integer-identity window-id compare is
+        NOTE: `orchestrator/src/orchestrator/session_windows.py::parse_wmctrl_list`
+        is the orchestrator's parser of the same `split(None, 3)` columns (not
+        shared/imported, since this is a cross-package boundary), with one
+        difference: it keeps titleless (<4-column) lines with empty columns,
+        whereas this loop skips them. If the column layout here ever changes,
+        mirror the change there too. The integer-identity window-id compare is
         likewise mirrored by
         `orchestrator/src/orchestrator/session_windows.py::canonical_window_id`'s
         `int(s, 0)` contract (see `_window_id_int` above).
