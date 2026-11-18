@@ -70,6 +70,10 @@ def _deferred_ids(w: ParkWorld) -> list[str]:
     return [payload['task_id'] for payload in event_payloads(w.store, 'dispatch_deferred')]
 
 
+def _ticks(w: ParkWorld) -> list[dict]:
+    return [payload['data'] for payload in event_payloads(w.store, 'scheduler_tick')]
+
+
 @pytest.mark.asyncio
 async def test_a_held_restricted_tick_still_returns_the_fix(tmp_path, saturated_host):
     w = _world(tmp_path)
@@ -98,3 +102,16 @@ async def test_a_held_default_tick_defers_plain_work_and_dispatches_the_fix(
     assert result is not None and result.task_id == 'F'
     assert not w.scheduler.lock_table.is_held('P')
     assert _deferred_ids(w) == ['P']
+
+
+@pytest.mark.asyncio
+async def test_a_pinned_fix_dispatches_from_the_pin_loop_on_a_held_tick(tmp_path, saturated_host):
+    w = _world(tmp_path, pinned=('F',))
+    await _one_in_flight(w)
+    _board(w, [FILLER, PLAIN, FIX])
+
+    result = await w.scheduler.acquire_next()
+
+    assert result is not None and result.task_id == 'F'
+    assert _ticks(w)[-1]['terminal_phase'] == 'select_pins'
+    assert 'F' not in _deferred_ids(w)
