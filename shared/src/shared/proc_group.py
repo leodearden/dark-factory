@@ -988,8 +988,8 @@ def scan_process_groups_under_path(
         return set()
 
 
-def _cpu_ticks_if_under(entry: Path, root: str, exclude: frozenset[int]) -> int | None:
-    """The CPU ticks of the pid at *entry* if its cwd is at-or-under *root*, outside *exclude*."""
+def _cpu_ticks_if_under(entry: Path, views: _RootViews, exclude: frozenset[int]) -> int | None:
+    """The CPU ticks of the pid at *entry* if its cwd is at-or-under root's *views*, outside *exclude*."""
     fields = read_stat_fields(entry, skip_malformed=True)
     if fields is None or fields.pgrp in exclude:
         return None
@@ -997,7 +997,7 @@ def _cpu_ticks_if_under(entry: Path, root: str, exclude: frozenset[int]) -> int 
         cwd = os.readlink(entry / 'cwd')
     except OSError:
         return None
-    return read_cpu_ticks(entry) if _path_at_or_under(cwd, root) else None
+    return read_cpu_ticks(entry) if _path_at_or_under_any(cwd, views.of(entry)) else None
 
 
 def _cpu_ticks_under_path_unsafe(root: str, exclude: frozenset[int]) -> int | None:
@@ -1006,9 +1006,10 @@ def _cpu_ticks_under_path_unsafe(root: str, exclude: frozenset[int]) -> int | No
         entries = list(_PROC_ROOT.iterdir())
     except OSError:
         return None
+    views = _RootViews(root)
     total: int | None = None
     for entry in entries:
-        ticks = _cpu_ticks_if_under(entry, root, exclude) if entry.name.isdigit() else None
+        ticks = _cpu_ticks_if_under(entry, views, exclude) if entry.name.isdigit() else None
         if ticks is not None:
             total = ticks + (total or 0)
     return total
@@ -1020,6 +1021,9 @@ def cpu_ticks_under_path(
     exclude_pgids: Iterable[int] = frozenset(),
 ) -> int | None:
     """Sum :func:`read_cpu_ticks` over the pids whose cwd is at-or-under *root*.
+
+    The cwd is matched through the scan's mount-namespace views (:class:`_RootViews`), so a
+    process that sees *root* at a bind-mount point in another namespace counts too.
 
     None when no such pid is found or /proc is unavailable, so "no process"
     is never read as "an idle process".  The sum is not monotonic: a process
