@@ -3428,3 +3428,143 @@ class TestDeliveredChecksLeafIsTheCallers:
 
         assert verdict.accepted is True
         assert verdict.rescued_by_delivered_checks is True
+
+
+def _build_landed_capability(repo: _Repo, *, commits: int) -> tuple[str, str]:
+    """``task/6276`` fast-forwarded into main, then its file rewritten there.
+
+    Returns ``(base, tip)``: main before the branch, and the branch tip, which
+    is now an ancestor of main.  The rewrite keeps ``def new_capability`` but
+    drops every line the tip added, so survival rejects the landing.
+    """
+    base = repo.sha('main')
+    repo.git('checkout', '-b', 'task/6276', 'main')
+    tip = repo.commit(
+        'feat(6276): add the capability',
+        {'pkg/cap.py': _numbered('cap', 30) + 'def new_capability():\n    return 1\n'},
+    )
+    if commits == 2:
+        tip = repo.commit(
+            'feat(6276): extend the capability',
+            {'pkg/cap.py': (repo.root / 'pkg/cap.py').read_text() + _numbered('more', 30)},
+        )
+    repo.git('checkout', 'main')
+    repo.git('merge', '--ff-only', 'task/6276')
+    repo.commit(
+        'refactor: rewrite the capability module',
+        {'pkg/cap.py': 'def new_capability():\n    return 2\n'},
+    )
+    return base, tip
+
+
+def _side_commit(repo: _Repo, base: str) -> str:
+    """A commit off *base* that no ``task/6276`` commit descends from."""
+    repo.git('checkout', '-b', 'side', base)
+    side = repo.commit('chore: side work', {'pkg/side.py': _numbered('side', 5)})
+    repo.git('checkout', 'main')
+    return side
+
+
+async def _discover_6276(
+    git_ops: GitOps, tip: str, *, branch_base_sha: str | None = None,
+) -> LandingVerdict:
+    return await validate_landing_evidence(
+        git_ops, '6276', 'task/6276', branch_tip_sha=tip,
+        delivered_checks=[_grep_check()], checks_enabled=True,
+        branch_base_sha=branch_base_sha,
+    )
+
+
+@pytest.mark.asyncio
+class TestDeliveredChecksDifferentialRealGitDiscovery:
+    """The differential's parent leg for a branch tip already on main (task 7836).
+
+    There the fork point from main IS the tip, so the parent leg must come
+    from the recorded ``branch_base_sha`` or, failing that, the tip's first
+    parent, and never from the tip itself.
+    """
+
+    async def test_ff_landed_branch_rescued_from_its_recorded_base(
+        self, real_git_ops: GitOps, real_git_repo: Path,
+    ) -> None:
+        """Two-commit branch fast-forwarded into main, then rewritten there."""
+        repo = _Repo(real_git_repo)
+        base, tip = _build_landed_capability(repo, commits=2)
+        assert repo.is_ancestor(tip, 'main')
+
+        verdict = await _discover_6276(real_git_ops, tip, branch_base_sha=base)
+
+        assert verdict.probe['effect_check_sha'] == tip
+        assert verdict.accepted is True
+        assert verdict.reason == 'ok'
+        assert verdict.method is LandingMethod.citation
+        assert verdict.evidence_sha == tip
+        assert verdict.probe['delivered_checks_outcome'] == 'confirmed'
+        assert verdict.probe['delivered_checks_parent_ref'] == base
+        assert verdict.probe['delivered_checks_baseline'] == 'recorded_branch_base'
+        [leg] = verdict.probe['delivered_checks_legs']
+        assert (leg['parent'], leg['citation'], leg['main']) == (
+            'failed', 'delivered', 'delivered',
+        )
+
+    async def test_single_commit_ff_landing_without_a_record_uses_the_tips_first_parent(
+        self, real_git_ops: GitOps, real_git_repo: Path,
+    ) -> None:
+        """One-commit branch fast-forwarded into main, no recorded base."""
+        repo = _Repo(real_git_repo)
+        _base, tip = _build_landed_capability(repo, commits=1)
+
+        verdict = await _discover_6276(real_git_ops, tip)
+
+        assert verdict.accepted is True
+        assert verdict.probe['delivered_checks_outcome'] == 'confirmed'
+        assert verdict.probe['delivered_checks_parent_ref'] == f'{tip}^1'
+        assert verdict.probe['delivered_checks_baseline'] == 'first_parent'
+
+    @pytest.mark.parametrize('record', ['malformed', 'foreign', 'degenerate'])
+    async def test_an_unusable_record_is_never_trusted(
+        self, real_git_ops: GitOps, real_git_repo: Path, record: str,
+    ) -> None:
+        """A malformed, off-branch or tip-equal record falls through to ``tip^1``."""
+        repo = _Repo(real_git_repo)
+        base, tip = _build_landed_capability(repo, commits=2)
+        recorded = {
+            'malformed': lambda: 'not-a-sha',
+            'foreign': lambda: _side_commit(repo, base),
+            'degenerate': lambda: tip,
+        }[record]()
+
+        verdict = await _discover_6276(real_git_ops, tip, branch_base_sha=recorded)
+
+        assert verdict.reason == 'effect_absent'
+        assert verdict.probe['delivered_checks_parent_ref'] == f'{tip}^1'
+        assert verdict.probe['delivered_checks_baseline'] == 'first_parent'
+        assert verdict.probe['delivered_checks_outcome'] == 'no_signal'
+
+    async def test_a_real_fork_point_outranks_the_record(
+        self, real_git_ops: GitOps, real_git_repo: Path,
+    ) -> None:
+        """Commit 1 landed, commit 2 still only on the branch."""
+        repo = _Repo(real_git_repo)
+        base = repo.sha('main')
+        repo.git('checkout', '-b', 'task/6276', 'main')
+        landed = repo.commit(
+            'feat(6276): add the capability',
+            {'pkg/cap.py': _numbered('cap', 30) + 'def new_capability():\n    return 1\n'},
+        )
+        repo.git('checkout', 'main')
+        repo.git('merge', '--ff-only', 'task/6276')
+        repo.git('checkout', 'task/6276')
+        tip = repo.commit(
+            'feat(6276): extend the capability',
+            {'pkg/cap.py': (repo.root / 'pkg/cap.py').read_text() + _numbered('more', 30)},
+        )
+        repo.git('checkout', 'main')
+
+        verdict = await _discover_6276(real_git_ops, tip, branch_base_sha=base)
+
+        assert verdict.probe['citation'] == landed
+        assert verdict.reason == 'effect_absent'
+        assert verdict.probe['delivered_checks_parent_ref'] == landed
+        assert verdict.probe['delivered_checks_baseline'] == 'fork_point'
+        assert verdict.probe['delivered_checks_outcome'] == 'no_signal'
