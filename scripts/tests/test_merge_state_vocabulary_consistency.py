@@ -811,6 +811,28 @@ Terminal: `done`, `conflict`, `blocked`, `abandoned`, `superseded`, `wip_halted`
 <!-- merge-state-vocab:end -->
 """
 
+# The reason list a MergeReason member landed past: `probe_failed` was not added.
+_SPAN_REASON_MISSING_MEMBER = """\
+<!-- merge-state-vocab:begin partition=MERGE_REASONS -->
+Reasons: `never_submitted`, `prior_run_terminal`, `journaled_not_live`, `coalesce_train_id`, `landing_unattributable`
+<!-- merge-state-vocab:end -->
+"""
+
+# A STATE pasted into the reason list. A reason qualifies a state; it is never one.
+_SPAN_REASON_NAMES_A_STATE = """\
+<!-- merge-state-vocab:begin partition=MERGE_REASONS -->
+Reasons: `never_submitted`, `prior_run_terminal`, `journaled_not_live`, `coalesce_train_id`,
+`landing_unattributable`, `probe_failed`, `unknown`
+<!-- merge-state-vocab:end -->
+"""
+
+# The mirror image: a REASON pasted into an epistemic-state list.
+_SPAN_STATE_NAMES_A_REASON = """\
+<!-- merge-state-vocab:begin partition=EPISTEMIC_STATES -->
+Epistemic: `no_record`, `stale_record`, `journaled`, `unknown`, `probe_failed`
+<!-- merge-state-vocab:end -->
+"""
+
 _SPAN_ABSENT = """\
 # fixture site
 
@@ -872,6 +894,7 @@ def test_load_vocabulary_exposes_every_partition_the_spans_can_name() -> None:
         "EPISTEMIC_STATES",
         "POLL_STOP_STATES",
         "CANCEL_STATES",
+        "MERGE_REASONS",
         "SUBMIT_TERMINAL",
         "SUBMIT_NON_TERMINAL",
     }
@@ -883,18 +906,22 @@ def test_load_vocabulary_exposes_every_partition_the_spans_can_name() -> None:
         )
 
 
-def test_load_vocabulary_values_covers_both_vocabularies() -> None:
+def test_load_vocabulary_values_covers_every_vocabulary() -> None:
     """The union of the partitions is the token filter `extract_values` uses.
 
-    It must span BOTH vocabularies. If it covered only `MergeState`, a POLL span
-    that named a SUBMIT-only value would have that value filtered out before the
-    comparison and the drift would read GREEN — the seeded wrong-vocabulary case
-    below is exactly that failure.
+    It must span all three vocabularies — `MergeState`, `MergeReason` and
+    `MergeSubmitStatus`. If it covered only `MergeState`, a POLL span that named a
+    SUBMIT-only value would have that value filtered out before the comparison
+    and the drift would read GREEN — the seeded wrong-vocabulary case below is
+    exactly that failure. The same holds across the reason vocabulary: a reason
+    named inside a state span (or a state inside the reason span) must survive
+    extraction so it shows up as EXTRA.
     """
     values = vocabulary_values(load_vocabulary())
 
     assert {"done", "abandoned", "superseded", "no_record"} <= values, "POLL members missing"
     assert {"already_merged", "wip_halted", "attached", "error"} <= values, "SUBMIT members missing"
+    assert {"never_submitted", "prior_run_terminal", "probe_failed"} <= values, "REASON members missing"
     assert "failed" not in values, (
         "`failed` is a value the runbooks invented; it appears nowhere in "
         "escalation/src/escalation/server.py (the real value is `error`)"
@@ -929,6 +956,7 @@ def test_load_vocabulary_raises_when_a_partition_is_absent(tmp_path: Path) -> No
         "EPISTEMIC_STATES = frozenset({'unknown'})\n"
         "POLL_STOP_STATES = frozenset({'done'})\n"
         "CANCEL_STATES = frozenset({'done'})\n"
+        "MERGE_REASONS = frozenset({'probe_failed'})\n"
         "SUBMIT_TERMINAL = frozenset({'done'})\n"
         "SUBMIT_NON_TERMINAL = frozenset({'queued'})\n",
         encoding="utf-8",
@@ -978,6 +1006,7 @@ def test_load_vocabulary_does_not_import_the_shared_package(tmp_path: Path) -> N
                 "EPISTEMIC_STATES",
                 "POLL_STOP_STATES",
                 "CANCEL_STATES",
+                "MERGE_REASONS",
                 "SUBMIT_TERMINAL",
                 "SUBMIT_NON_TERMINAL",
             )
@@ -1229,6 +1258,24 @@ def test_assert_span_matches_accepts_an_exact_match() -> None:
             repr(["wip_halted"]),
             id="wrong-vocabulary",
         ),
+        pytest.param(
+            _SPAN_REASON_MISSING_MEMBER,
+            "a reason the list forgot",
+            repr(["probe_failed"]),
+            id="reason-missing-member",
+        ),
+        pytest.param(
+            _SPAN_REASON_NAMES_A_STATE,
+            "a state pasted into the reason list",
+            repr(["unknown"]),
+            id="state-in-reason-span",
+        ),
+        pytest.param(
+            _SPAN_STATE_NAMES_A_REASON,
+            "a reason pasted into an epistemic-state list",
+            repr(["probe_failed"]),
+            id="reason-in-state-span",
+        ),
     ],
 )
 def test_assert_span_matches_rejects_every_drift_shape(
@@ -1365,6 +1412,24 @@ def test_find_unregistered_sites_ignores_the_ambiguous_tokens(tmp_path: Path) ->
     ambiguous = _write_fixture_site(tmp_path, "ambiguous.md", _AMBIGUOUS_SAMPLE)
 
     assert find_unregistered_sites(files=[ambiguous], registry={}, threshold=4) == []
+
+
+def test_find_unregistered_sites_counts_reason_tokens(tmp_path: Path) -> None:
+    """A new runbook restating the REASON vocabulary is caught like one restating states.
+
+    The reason list drifts exactly as the state lists do, so the half of the
+    mechanism that finds a NEW restatement must count reason tokens too —
+    otherwise a freshly written reason switch would sit unpinned and green.
+    """
+    restatement = _write_fixture_site(
+        tmp_path,
+        "reason-restatement.md",
+        ["never_submitted", "prior_run_terminal", "journaled_not_live", "coalesce_train_id"],
+    )
+
+    assert find_unregistered_sites(files=[restatement], registry={}, threshold=4) == [
+        str(restatement)
+    ]
 
 
 def test_find_unregistered_sites_skips_the_declared_rule_sites(tmp_path: Path) -> None:
