@@ -188,21 +188,17 @@ class TestRefusalReasonDoesNotMatter:
 
 
 async def _verify_test_leg_only(
-    worktree: Path, test_command: str, *, project_id: str | None = None, **run_kwargs,
+    worktree: Path, test_command: str, *, project_id: str = '', **run_kwargs,
 ) -> VerifyResult:
     """A scoped role='task' verify of module ``pkg`` with no lint or type leg;
-    *project_id*, when given, names the project slice its scope spawns under."""
-    config = (
-        OrchestratorConfig(verify_use_cgroup_scope=True)
-        if project_id is None
-        else OrchestratorConfig(
-            verify_use_cgroup_scope=True,
-            fused_memory=FusedMemoryConfig(project_id=project_id),
-        )
-    )
+    *project_id*, when given, names the project slice its scope spawns under
+    (empty derives it from ``project_root``, as the config does)."""
     return await run_verification(
         worktree,
-        config,
+        OrchestratorConfig(
+            verify_use_cgroup_scope=True,
+            fused_memory=FusedMemoryConfig(project_id=project_id),
+        ),
         module_config=ModuleConfig(
             prefix='pkg', test_command=test_command,
             lint_command=None, type_check_command=None,

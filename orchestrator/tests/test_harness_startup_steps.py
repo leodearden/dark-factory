@@ -19,6 +19,7 @@ import pytest
 from _startup_harness import STUBBED_STEPS, SYNC_STEPS, UNSTUBBED_STEPS
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
+from shared.psi import resolve_own_cgroup
 
 from orchestrator.artifacts import AgentSession
 from orchestrator.config import TranscriptArchiveConfig
@@ -389,4 +390,4 @@ class TestProjectSliceWeightIsOptIn:
         assert ensure.await_args is not None
         project_id, own_cgroup_path = ensure.await_args.args
         assert project_id == 'test'
-        assert isinstance(own_cgroup_path, str)
+        assert own_cgroup_path == resolve_own_cgroup(None).path
