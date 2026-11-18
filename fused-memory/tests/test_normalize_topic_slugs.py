@@ -22,7 +22,6 @@ import argparse
 import ast
 import contextlib
 import copy
-import dataclasses
 import json
 import sys
 import types
@@ -37,7 +36,13 @@ from _store_mutation_preflight_contract import (
     fail_closed_records,
     neutralise_fixture,
 )
-from _topic_slug_migration_doubles import by_reason, rec
+from _topic_slug_migration_doubles import (
+    by_reason,
+    census_client,
+    gate_task,
+    rec,
+    task_listing,
+)
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.maintenance.topic_slug_plan import Rename, plan_renames
@@ -905,33 +910,6 @@ class TestVerifyOldSlugsDrained:
 # So the halves are planned as a pair and refused as a pair.  Every test below
 # exists to pin one edge of that atomicity.
 
-def _gate_task(
-    task_id: str,
-    topic: str,
-    *,
-    project_id: str = 'dark_factory',
-    project_root: str = '/repo',
-    **block_extras,
-) -> dict:
-    """One gate task as the MCP ``get_task`` read hands it over.
-
-    ``block_extras`` seed the SIBLING keys inside the block (``provenance``,
-    ``considered_and_kept``, ...) — the ones the patch must leave untouched.
-    """
-    block = {'topic': topic}
-    block.update(block_extras)
-    return {
-        'id': task_id,
-        'project_id': project_id,
-        'project_root': project_root,
-        'metadata': {
-            'task_kind': 'deterministic',
-            'always_escalates': True,
-            _mod.GATE_METADATA_KEY: block,
-        },
-    }
-
-
 def _stateful_service(records: dict[str, dict]) -> MagicMock:
     """A ``MemoryService`` double that REMEMBERS what was written to it.
 
@@ -978,214 +956,17 @@ def _client(*, result: object = None, error: Exception | None = None) -> MagicMo
     return client
 
 
-class TestPairGateBlocks:
-    """``pair_gate_blocks(renames, gate_tasks) -> (groups, skips)``.
+class TestGateAmbiguousReachesTheReport:
+    """A ``gate_ambiguous`` refusal fails the run and names every gate.
 
-    Pure.  It decides WHICH renames travel with WHICH gate task, before
-    anything is written, so the pairing is reproducible from the plan alone.
+    The refusal itself is ``pair_gate_blocks``'s and is pinned in
+    ``test_topic_slug_gates.py``; this pins how the script grades and renders it.
     """
-
-    def test_a_gate_on_a_renamed_slug_is_paired_with_it(self):
-        renames = [Rename('dark_factory', 'm1', 'mem0_tombstone_coverage',
-                               'mem0-tombstone-coverage')]
-        gates = [_gate_task('4220', 'mem0_tombstone_coverage')]
-
-        groups, skips = _mod.pair_gate_blocks(renames, gates)
-
-        assert len(groups) == 1
-        assert groups[0].old_topic == 'mem0_tombstone_coverage'
-        assert groups[0].new_topic == 'mem0-tombstone-coverage'
-        assert groups[0].gate_task_id == '4220'
-        assert skips == []
-
-    def test_the_patch_moves_the_topic_and_touches_no_sibling_key(self):
-        provenance = {'report_run': 'r1', 'observed_members': ['a'],
-                      'detector': 'd', 'authoritative': False}
-        kept = [{'id': 'x', 'why': 'peer'}]
-        gates = [_gate_task('4220', 'gate_topic', provenance=provenance,
-                            considered_and_kept=kept)]
-        renames = [Rename('dark_factory', 'm1', 'gate_topic', 'gate-topic')]
-
-        groups, _skips = _mod.pair_gate_blocks(renames, gates)
-
-        assert groups[0].gate_block == {
-            'topic': 'gate-topic',
-            'provenance': provenance,
-            'considered_and_kept': kept,
-        }
-
-    def test_the_patch_does_not_mutate_the_source_task(self):
-        gates = [_gate_task('4220', 'gate_topic', provenance={'a': 1})]
-        renames = [Rename('dark_factory', 'm1', 'gate_topic', 'gate-topic')]
-
-        _mod.pair_gate_blocks(renames, gates)
-
-        assert gates[0]['metadata'][_mod.GATE_METADATA_KEY]['topic'] == 'gate_topic'
-
-    def test_every_rename_on_the_slug_joins_the_group(self):
-        renames = [
-            Rename('dark_factory', f'm{i}', 'gate_topic', 'gate-topic')
-            for i in range(4)
-        ]
-        groups, _skips = _mod.pair_gate_blocks(
-            renames, [_gate_task('4220', 'gate_topic')])
-
-        assert len(groups) == 1
-        assert [r.memory_id for r in groups[0].renames] == ['m0', 'm1', 'm2', 'm3']
-
-    def test_a_rename_with_no_gate_still_forms_a_group(self):
-        """Most topics are not gates; those renames must proceed normally."""
-        renames = [Rename('dark_factory', 'm1', 'plain_topic', 'plain-topic')]
-
-        groups, skips = _mod.pair_gate_blocks(renames, [])
-
-        assert len(groups) == 1
-        assert groups[0].gate_task_id is None
-        assert groups[0].gate_block is None
-        assert skips == []
-
-    def test_a_gate_is_matched_within_its_own_project(self):
-        renames = [Rename('reify', 'm1', 'gate_topic', 'gate-topic')]
-        gates = [_gate_task('4220', 'gate_topic', project_id='dark_factory')]
-
-        groups, skips = _mod.pair_gate_blocks(renames, gates)
-
-        assert groups[0].gate_task_id is None
-        assert by_reason(skips, 'orphan_gate_topic')
-
-    def test_a_gate_whose_slug_matches_no_record_is_an_orphan_not_a_silence(self):
-        gates = [_gate_task('4774', 'ghost_topic')]
-
-        groups, skips = _mod.pair_gate_blocks([], gates)
-
-        assert groups == []
-        orphans = by_reason(skips, 'orphan_gate_topic')
-        assert len(orphans) == 1
-        assert orphans[0]['gate_task_id'] == '4774'
-        assert orphans[0]['gate_topic'] == 'ghost_topic'
-        assert orphans[0]['project_id'] == 'dark_factory'
-
-    def test_a_gate_already_on_a_conforming_slug_is_not_an_orphan(self):
-        """Nothing to migrate is not the same fact as a dangling gate."""
-        groups, skips = _mod.pair_gate_blocks([], [_gate_task('4220', 'good-topic')])
-
-        assert groups == []
-        assert skips == []
-
-    def test_a_gate_task_without_a_block_is_ignored(self):
-        task = {'id': '9', 'project_id': 'dark_factory', 'metadata': {}}
-
-        groups, skips = _mod.pair_gate_blocks([], [task])
-
-        assert (groups, skips) == ([], [])
-
-    def test_groups_are_sorted_for_a_clean_diff(self):
-        renames = [
-            Rename('reify', 'm9', 'z_topic', 'z-topic'),
-            Rename('dark_factory', 'm2', 'b_topic', 'b-topic'),
-            Rename('dark_factory', 'm1', 'a_topic', 'a-topic'),
-        ]
-        groups, _skips = _mod.pair_gate_blocks(renames, [])
-
-        assert [(g.project_id, g.new_topic) for g in groups] == [
-            ('dark_factory', 'a-topic'),
-            ('dark_factory', 'b-topic'),
-            ('reify', 'z-topic'),
-        ]
-
-    def test_the_group_is_frozen(self):
-        groups, _skips = _mod.pair_gate_blocks(
-            [Rename('dark_factory', 'm1', 'a_topic', 'a-topic')], [])
-        assert dataclasses.is_dataclass(groups[0])
-        with pytest.raises(dataclasses.FrozenInstanceError):
-            groups[0].new_topic = 'other'  # type: ignore[misc]
-
-
-class TestAmbiguousGate:
-    """A legacy slug carrying MORE THAN ONE consolidation gate is refused.
-
-    A ``GateGroup`` moves exactly one gate.  Moving one of several would strand
-    the rest on the vacated slug — the uncloseable-gate trap again — so the
-    slug's renames are withheld and both stores stay on the legacy value, the
-    posture ``slug_collision`` already takes.
-    """
-
-    @staticmethod
-    def _gates_on(slug: str, *task_ids: str) -> list[dict]:
-        return [_gate_task(task_id, slug) for task_id in task_ids]
-
-    def test_a_doubly_gated_slug_forms_no_group_and_is_refused_once(self):
-        renames = [
-            Rename('dark_factory', 'm2', 'shared_gate', 'shared-gate'),
-            Rename('dark_factory', 'm1', 'shared_gate', 'shared-gate'),
-        ]
-
-        groups, skips = _mod.pair_gate_blocks(
-            renames, self._gates_on('shared_gate', '7718', '7011'))
-
-        assert groups == []
-        (entry,) = by_reason(skips, 'gate_ambiguous')
-        assert entry['project_id'] == 'dark_factory'
-        assert entry['old_topic'] == 'shared_gate'
-        assert entry['new_topic'] == 'shared-gate'
-        assert entry['gate_task_ids'] == ['7011', '7718']
-        assert entry['memory_ids'] == ['m1', 'm2']
-
-    def test_neither_gate_is_reported_as_an_orphan(self):
-        """They are matched to live records; "matched to no record" would be false."""
-        _groups, skips = _mod.pair_gate_blocks(
-            [Rename('dark_factory', 'm1', 'shared_gate', 'shared-gate')],
-            self._gates_on('shared_gate', '7011', '7718'))
-
-        assert by_reason(skips, 'orphan_gate_topic') == []
-
-    def test_the_refusal_is_per_slug(self):
-        renames = [
-            Rename('dark_factory', 'm1', 'shared_gate', 'shared-gate'),
-            Rename('dark_factory', 'm2', 'plain_topic', 'plain-topic'),
-            Rename('dark_factory', 'm3', 'single_gate', 'single-gate'),
-        ]
-        single = _gate_task('4220', 'single_gate')
-
-        groups, _skips = _mod.pair_gate_blocks(
-            renames, [*self._gates_on('shared_gate', '7011', '7718'), single])
-
-        assert [(g.old_topic, g.gate_task_id) for g in groups] == [
-            ('plain_topic', None),
-            ('single_gate', '4220'),
-        ]
-        unaffected, _ = _mod.pair_gate_blocks(
-            [r for r in renames if r.old_topic != 'shared_gate'], [single])
-        assert groups == unaffected
-
-    def test_the_verdict_does_not_depend_on_gate_order(self):
-        renames = [Rename('dark_factory', 'm1', 'shared_gate', 'shared-gate')]
-        gates = self._gates_on('shared_gate', '7011', '7718')
-
-        for ordered in (gates, list(reversed(gates))):
-            groups, skips = _mod.pair_gate_blocks(renames, ordered)
-
-            assert groups == []
-            (entry,) = by_reason(skips, 'gate_ambiguous')
-            assert entry['gate_task_ids'] == ['7011', '7718']
-
-    def test_gates_in_different_projects_are_not_ambiguous(self):
-        """Gates are keyed per project, as the closure scroll that reads them is."""
-        renames = [Rename('dark_factory', 'm1', 'shared_gate', 'shared-gate')]
-        gates = [
-            _gate_task('4220', 'shared_gate', project_id='dark_factory'),
-            _gate_task('6852', 'shared_gate', project_id='reify'),
-        ]
-
-        groups, skips = _mod.pair_gate_blocks(renames, gates)
-
-        assert [g.gate_task_id for g in groups] == ['4220']
-        assert by_reason(skips, 'gate_ambiguous') == []
 
     def test_the_markdown_artifact_names_every_gate(self):
         _groups, skips = _mod.pair_gate_blocks(
             [Rename('dark_factory', 'm1', 'shared_gate', 'shared-gate')],
-            self._gates_on('shared_gate', '7011', '7718'))
+            [gate_task('7011', 'shared_gate'), gate_task('7718', 'shared_gate')])
 
         rendered = _mod.render_markdown({
             'apply': False,
@@ -1224,7 +1005,7 @@ class TestGateLockstepWriter:
         client = _client()
         group = _one_group(
             [Rename('dark_factory', 'm1', 'gate_topic', 'gate-topic')],
-            [_gate_task('4220', 'gate_topic')])
+            [gate_task('4220', 'gate_topic')])
 
         outcome = await _mod.rename_group(
             service, group, apply=True, client=client)
@@ -1249,7 +1030,7 @@ class TestGateLockstepWriter:
         client = _client()
         group = _one_group(
             [Rename('dark_factory', 'm1', 'gate_topic', 'gate-topic')],
-            [_gate_task('4220', 'gate_topic')])
+            [gate_task('4220', 'gate_topic')])
 
         outcome = await _mod.rename_group(
             service, group, apply=False, client=client)
@@ -1269,7 +1050,7 @@ class TestGateLockstepWriter:
         group = _one_group(
             [Rename('dark_factory', 'm1', 'gate_topic', 'gate-topic'),
              Rename('dark_factory', 'm2', 'gate_topic', 'gate-topic')],
-            [_gate_task('4220', 'gate_topic')])
+            [gate_task('4220', 'gate_topic')])
 
         outcome = await _mod.rename_group(
             service, group, apply=True, client=client)
@@ -1295,7 +1076,7 @@ class TestGateLockstepWriter:
         group = _one_group(
             [Rename('dark_factory', 'm1', 'gate_topic', 'gate-topic'),
              Rename('dark_factory', 'm2', 'gate_topic', 'gate-topic')],
-            [_gate_task('4220', 'gate_topic')])
+            [gate_task('4220', 'gate_topic')])
 
         outcome = await _mod.rename_group(
             service, group, apply=True, client=client)
@@ -1316,7 +1097,7 @@ class TestGateLockstepWriter:
         client = _client(error=RuntimeError('mcp down'))
         group = _one_group(
             [Rename('dark_factory', 'm1', 'gate_topic', 'gate-topic')],
-            [_gate_task('4220', 'gate_topic')])
+            [gate_task('4220', 'gate_topic')])
 
         outcome = await _mod.rename_group(
             service, group, apply=True, client=client)
@@ -1332,7 +1113,7 @@ class TestGateLockstepWriter:
         client = _client(error=RuntimeError('mcp down'))
         group = _one_group(
             [Rename('dark_factory', 'm1', 'gate_topic', 'gate-topic')],
-            [_gate_task('4220', 'gate_topic')])
+            [gate_task('4220', 'gate_topic')])
 
         calls = {'n': 0}
         forward = service.update_memory.side_effect
@@ -1387,7 +1168,7 @@ class TestGateLockstepWriter:
         service = _stateful_service(records)
         group = _one_group(
             [Rename('dark_factory', 'm1', 'gate_topic', 'gate-topic')],
-            [_gate_task('4220', 'gate_topic')])
+            [gate_task('4220', 'gate_topic')])
 
         outcome = await _mod.rename_group(
             service, group, apply=True, client=None)
@@ -1404,7 +1185,7 @@ class TestGateLockstepWriter:
         group = _one_group(
             [Rename('dark_factory', 'm1', 'gate_topic', 'gate-topic'),
              Rename('dark_factory', 'm2', 'gate_topic', 'gate-topic')],
-            [_gate_task('4220', 'gate_topic')])
+            [gate_task('4220', 'gate_topic')])
 
         outcome = await _mod.rename_group(
             service, group, apply=True, client=client)
@@ -1549,213 +1330,6 @@ class TestGateLockstepOutcomesAreGraded:
     def test_an_orphan_gate_does_not_by_itself_fail_the_run(self):
         """A dangling gate predates this sweep; reporting it is the deliverable."""
         assert 'orphan_gate_topic' not in _mod.ERROR_OUTCOMES
-
-
-def _listing(project_id: str, project_root: str, *tasks: dict) -> dict:
-    """One ``get_tasks`` response in the measured live shape."""
-    return {'tasks': list(tasks), 'project_id': project_id, 'project_root': project_root}
-
-
-def _task_row(task_id: object, metadata: object) -> dict:
-    """One task as ``get_tasks`` lists it, carrying fields the census must drop."""
-    return {'id': task_id, 'title': f'task {task_id}', 'status': 'pending',
-            'dependencies': [], 'metadata': metadata}
-
-
-def _census_client(answers: dict[str, object]) -> MagicMock:
-    """A client whose ``get_tasks`` answers per root: a response, or an exception.
-
-    Answers are deep-copied, as a JSON transport would hand them over, so the
-    census can never alias the double's own state.
-    """
-    async def _call_tool(name, payload):
-        assert name == 'get_tasks', name
-        answer = answers[payload['project_root']]
-        if isinstance(answer, BaseException):
-            raise answer
-        return copy.deepcopy(answer)
-
-    client = MagicMock()
-    client.call_tool = AsyncMock(side_effect=_call_tool)
-    return client
-
-
-_GATE_META = {_mod.GATE_METADATA_KEY: {'topic': 'gate_slug'}}
-
-
-class TestConsolidationGateCensus:
-    """``census_consolidation_gates(client, roots) -> GateCensus``.
-
-    The input the lockstep never had on the live path.  Its contract is to
-    state what it could NOT see: a root that cannot be read becomes a
-    structured failure, never a silent gap that reads as "no gates here".
-    """
-
-    @pytest.mark.asyncio
-    async def test_one_unpaged_get_tasks_per_distinct_root(self):
-        client = _census_client({
-            '/df': _listing('dark_factory', '/df'),
-            '/rf': _listing('reify', '/rf'),
-        })
-
-        await _mod.census_consolidation_gates(client, ['/df', '/rf', '/df'])
-
-        assert client.call_tool.await_args_list == [
-            call('get_tasks', {'project_root': '/df'}),
-            call('get_tasks', {'project_root': '/rf'}),
-        ]
-
-    @pytest.mark.asyncio
-    async def test_only_tasks_carrying_a_gate_block_are_kept(self):
-        client = _census_client({'/df': _listing(
-            'dark_factory', '/df',
-            _task_row(1, _GATE_META),
-            _task_row(2, {'task_kind': 'deterministic'}),
-            _task_row(3, 'not-a-dict'),
-            _task_row(4, {_mod.GATE_METADATA_KEY: 'not-a-dict'}),
-            _task_row(5, None),
-        )})
-
-        census = await _mod.census_consolidation_gates(client, ['/df'])
-
-        assert [t['id'] for t in census.tasks] == ['1']
-
-    @pytest.mark.asyncio
-    async def test_a_kept_task_carries_the_server_stamp_and_nothing_else(self):
-        """``project_id``/``project_root`` come off the RESPONSE, never the caller.
-
-        The server normalizes a worktree root to its main checkout and derives
-        the project id from that — the derivation the closure scroll runs
-        under — so recomputing either here would be a second copy free to
-        diverge.
-        """
-        block = {'topic': 'gate_slug', 'provenance': {'report_run': 'r1'}}
-        client = _census_client({'/main/.worktrees/7': _listing(
-            'dark_factory', '/main',
-            _task_row(4220, {_mod.GATE_METADATA_KEY: block, 'task_kind': 'deterministic'}),
-        )})
-
-        census = await _mod.census_consolidation_gates(client, ['/main/.worktrees/7'])
-
-        assert list(census.tasks) == [{
-            'id': '4220',
-            'project_id': 'dark_factory',
-            'project_root': '/main',
-            'metadata': {_mod.GATE_METADATA_KEY: block},
-        }]
-
-    @pytest.mark.asyncio
-    async def test_tasks_are_sorted_by_project_then_id(self):
-        client = _census_client({
-            '/rf': _listing('reify', '/rf', _task_row(20, _GATE_META), _task_row(10, _GATE_META)),
-            '/df': _listing('dark_factory', '/df', _task_row(30, _GATE_META)),
-        })
-
-        census = await _mod.census_consolidation_gates(client, ['/rf', '/df'])
-
-        assert [(t['project_id'], t['id']) for t in census.tasks] == [
-            ('dark_factory', '30'), ('reify', '10'), ('reify', '20'),
-        ]
-
-    @pytest.mark.asyncio
-    async def test_covered_projects_are_the_projects_that_answered(self):
-        client = _census_client({
-            '/df': _listing('dark_factory', '/df'),
-            '/rf': _listing('reify', '/rf'),
-        })
-
-        census = await _mod.census_consolidation_gates(client, ['/df', '/rf'])
-
-        assert census.covered_projects == {'dark_factory', 'reify'}
-        assert list(census.failures) == []
-
-    @pytest.mark.parametrize('answer', [
-        pytest.param({'error': 'no such project root', 'error_type': 'ValidationError'},
-                     id='error-envelope'),
-        pytest.param({'tasks': {'1': {}}, 'project_id': 'ghost', 'project_root': '/bad'},
-                     id='tasks-not-a-list'),
-        pytest.param({'tasks': [], 'project_root': '/bad'}, id='no-project-id'),
-        pytest.param({'tasks': [], 'project_id': 'ghost'}, id='no-project-root'),
-        pytest.param(RuntimeError('get_tasks failed: timed out'), id='raises'),
-    ])
-    @pytest.mark.asyncio
-    async def test_a_root_that_cannot_be_read_is_a_failure_not_a_gap(self, answer):
-        client = _census_client({
-            '/bad': answer,
-            '/df': _listing('dark_factory', '/df', _task_row(1, _GATE_META)),
-        })
-
-        census = await _mod.census_consolidation_gates(client, ['/bad', '/df'])
-
-        (failure,) = census.failures
-        assert failure['reason'] == 'gate_census_incomplete'
-        assert failure['project_root'] == '/bad'
-        assert failure['error']
-        assert census.covered_projects == {'dark_factory'}
-        assert [t['id'] for t in census.tasks] == ['1']
-
-    @pytest.mark.parametrize('answer, cause', [
-        pytest.param({'error': 'no such project root', 'error_type': 'ValidationError'},
-                     'no such project root', id='error-envelope'),
-        pytest.param(RuntimeError('get_tasks failed: timed out'), 'timed out', id='raises'),
-    ])
-    @pytest.mark.asyncio
-    async def test_the_failure_carries_the_cause_it_was_given(self, answer, cause):
-        census = await _mod.census_consolidation_gates(
-            _census_client({'/bad': answer}), ['/bad'])
-
-        (failure,) = census.failures
-        assert cause in failure['error']
-
-    @pytest.mark.asyncio
-    async def test_one_project_answering_from_two_task_stores_is_ambiguous(self):
-        client = _census_client({
-            '/a': _listing('reify', '/a'),
-            '/b': _listing('reify', '/b'),
-            '/df': _listing('dark_factory', '/df'),
-        })
-
-        census = await _mod.census_consolidation_gates(client, ['/a', '/b', '/df'])
-
-        assert census.covered_projects == {'dark_factory'}
-        (failure,) = census.failures
-        assert failure['reason'] == 'gate_census_incomplete'
-        assert failure['project_id'] == 'reify'
-        assert failure['project_root'] == '/b'
-        assert '/a' in failure['error']
-
-    @pytest.mark.asyncio
-    async def test_two_roots_normalized_to_one_store_are_deduplicated(self):
-        """A worktree path and its main checkout are one task store, read twice."""
-        listing = _listing('dark_factory', '/main', _task_row(1, _GATE_META))
-        client = _census_client({'/main/.worktrees/7': listing, '/main': listing})
-
-        census = await _mod.census_consolidation_gates(
-            client, ['/main/.worktrees/7', '/main'])
-
-        assert list(census.failures) == []
-        assert census.covered_projects == {'dark_factory'}
-        assert [t['id'] for t in census.tasks] == ['1']
-
-    @pytest.mark.asyncio
-    async def test_the_census_records_the_roots_it_attempted(self):
-        client = _census_client({
-            '/df': _listing('dark_factory', '/df'),
-            '/bad': RuntimeError('down'),
-        })
-
-        census = await _mod.census_consolidation_gates(client, ['/df', '/bad', '/df'])
-
-        assert list(census.roots) == ['/df', '/bad']
-
-    def test_the_census_is_a_frozen_value(self):
-        census = _mod.GateCensus(
-            roots=('/df',), tasks=(), covered_projects=frozenset({'dark_factory'}),
-            failures=())
-
-        assert dataclasses.is_dataclass(census)
-        with pytest.raises(dataclasses.FrozenInstanceError):
-            census.tasks = ()  # type: ignore[misc]
 
 
 # ===========================================================================
@@ -2213,8 +1787,8 @@ class TestRunRequiresACompleteGateCensus:
         service, _corpus = _run_service({'dark_factory': [_crec('m1', 'legacy_topic')]})
         census = _census(
             covered=('dark_factory', 'reify'),
-            tasks=[_gate_task('6852', 'legacy_topic', project_id='reify'),
-                   _gate_task('6853', 'ghost_topic', project_id='reify')])
+            tasks=[gate_task('6852', 'legacy_topic', project_id='reify'),
+                   gate_task('6853', 'ghost_topic', project_id='reify')])
 
         report = await run_sweep(service, projects=('dark_factory',), gates=census)
 
@@ -2226,7 +1800,7 @@ class TestRunRequiresACompleteGateCensus:
         """A frozenset through ``default=str`` renders in hash order, not a diffable one."""
         service, _corpus = _run_service({'dark_factory': [], 'reify': []})
         census = _census(roots=('/rf', '/df'), covered=('reify', 'dark_factory'),
-                         tasks=[_gate_task('4220', 'good-topic')])
+                         tasks=[gate_task('4220', 'good-topic')])
 
         report = await run_sweep(service, projects=('dark_factory', 'reify'), gates=census)
 
@@ -2295,9 +1869,9 @@ def _real_skip_entry(reason: str) -> dict:
             project_id='dark_factory')[1],
         'gate_ambiguous': lambda: _mod.pair_gate_blocks(
             [Rename('dark_factory', 'm1', 'shared_gate', 'shared-gate')],
-            [_gate_task('7011', 'shared_gate'), _gate_task('7718', 'shared_gate')])[1],
+            [gate_task('7011', 'shared_gate'), gate_task('7718', 'shared_gate')])[1],
         'orphan_gate_topic': lambda: _mod.pair_gate_blocks(
-            [], [_gate_task('4774', 'ghost_topic', project_root='/repo')])[1],
+            [], [gate_task('4774', 'ghost_topic', project_root='/repo')])[1],
     }
     (entry,) = by_reason(producers[reason](), reason)
     return entry
@@ -2423,7 +1997,7 @@ class TestFailedRowsAreListedInTheirBuckets:
 
         report = await run_sweep(
             service, projects=('dark_factory',), apply=True, client=_client(),
-            gates=_census(covered=('dark_factory',), tasks=[_gate_task('4220', 'gate_slug')]))
+            gates=_census(covered=('dark_factory',), tasks=[gate_task('4220', 'gate_slug')]))
 
         assert [r['memory_id'] for r in report['skips']['update_failed']] == ['df2']
         lockstep = report['skips']['gate_lockstep_failed']
@@ -2492,7 +2066,7 @@ class TestPartialUngatedGroup:
         assert entry['failed_memory_ids'] == ['m2']
 
     @pytest.mark.parametrize(('gate_tasks', 'outcomes'), [
-        pytest.param([_gate_task('4220', 'plain_topic')], ('renamed', 'update_failed'), id='gated'),
+        pytest.param([gate_task('4220', 'plain_topic')], ('renamed', 'update_failed'), id='gated'),
         pytest.param([], ('renamed', 'already_normalized'), id='all_stood'),
         pytest.param([], ('update_failed', 'rename_error'), id='none_stood'),
         pytest.param([], ('renamed', 'memory_not_found'), id='straggler_vanished'),
@@ -2932,7 +2506,7 @@ def _stateful_gate_client(tasks: list[dict]) -> MagicMock:
             listed = [t for t in tasks if t['project_root'] == root]
             if not listed:
                 return {'error': f'no task store at {root}', 'error_type': 'ValidationError'}
-            return copy.deepcopy(_listing(listed[0]['project_id'], root, *listed))
+            return copy.deepcopy(task_listing(listed[0]['project_id'], root, *listed))
         assert name == 'update_task', name
         task = by_id.get(str(payload['id']))
         if task is None:
@@ -2973,7 +2547,7 @@ def _e2e_corpus() -> tuple[dict[str, list[dict]], list[dict]]:
             _crec('rf3', None),
         ],
     }
-    gates = [_gate_task('4220', 'gate_slug', project_id='dark_factory')]
+    gates = [gate_task('4220', 'gate_slug', project_id='dark_factory')]
     return records, gates
 
 
@@ -3140,7 +2714,7 @@ class TestEndToEnd:
 def _main_fixture() -> tuple[_FakeCorpus, list[dict], MagicMock]:
     """One gated record, and one client double serving the census and the patch."""
     corpus = _FakeCorpus({'dark_factory': [_crec('df7', 'gate_slug')]})
-    gates = [_gate_task('4220', 'gate_slug', project_id='dark_factory', project_root='/repo')]
+    gates = [gate_task('4220', 'gate_slug', project_id='dark_factory', project_root='/repo')]
     return corpus, gates, _stateful_gate_client(gates)
 
 
@@ -3398,8 +2972,8 @@ class TestTopicSelection:
     def _gated_legacy_a() -> tuple[MagicMock, _FakeCorpus, object]:
         """``legacy_a`` carries a record and a gate; ``other_slug`` only a gate."""
         service, corpus = _run_service({'dark_factory': [_crec('m1', 'legacy_a')]})
-        census = _census(tasks=[_gate_task('4220', 'legacy_a'),
-                                _gate_task('4221', 'other_slug')])
+        census = _census(tasks=[gate_task('4220', 'legacy_a'),
+                                gate_task('4221', 'other_slug')])
         return service, corpus, census
 
     @pytest.mark.asyncio
@@ -3492,7 +3066,7 @@ class TestTopicSelection:
         corpus = _FakeCorpus({'dark_factory': [
             _crec('df1', 'legacy_a'), _crec('df2', 'legacy_b'), _crec('df3', 'legacy_c'),
         ]})
-        client = _census_client({'/repo': _listing('dark_factory', '/repo')})
+        client = census_client({'/repo': task_listing('dark_factory', '/repo')})
         open_memory, open_client, _urls = _openers(corpus, client)
 
         code = _mod.main(
