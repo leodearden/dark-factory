@@ -1223,8 +1223,9 @@ class TestArmMetricStemParity:
     """
 
     def test_every_arm_is_recorded_by_a_table_metric(self):
-        from sampler.metrics import ARM_METRICS
         from shared.psi import ARM_FIELDS
+
+        from sampler.metrics import ARM_METRICS
 
         missing = ARM_FIELDS - set(ARM_METRICS)
         assert not missing, (
@@ -1234,8 +1235,9 @@ class TestArmMetricStemParity:
         )
 
     def test_no_table_arm_is_orphaned(self):
-        from sampler.metrics import ARM_METRICS
         from shared.psi import ARM_FIELDS
+
+        from sampler.metrics import ARM_METRICS
 
         orphans = set(ARM_METRICS) - ARM_FIELDS
         assert not orphans, (
