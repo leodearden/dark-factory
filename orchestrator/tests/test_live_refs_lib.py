@@ -35,7 +35,12 @@ from pathlib import Path
 from typing import IO
 
 import pytest
-from shared.testing_mount_ns import Hold, namespaced_holder, unreadable_foreign_namespace_process
+from shared.testing_mount_ns import (
+    MAP_THEN_CLOSE_FDS,
+    Hold,
+    namespaced_holder,
+    unreadable_foreign_namespace_process,
+)
 
 # Reused from the sibling shipped-script contract, as test_lane_state_lib.py
 # does: the script dir is resolved from __file__, and the env drops the keys
@@ -56,21 +61,7 @@ _VERDICT_LINE = re.compile(r'^rc=(\d+)$', re.M)
 
 _FD_DIR = re.compile(r'/proc/\d+/fd')
 
-#: ``mmap.mmap`` keeps a private dup of the fd it maps, so every fd on the file
-#: is closed afterwards: the mapping is then the helper's only reference to it.
-_MAP_THEN_CLOSE_FDS = """
-import mmap, os, sys, time
-path = sys.argv[1]
-with open(path, 'rb') as mapped:
-    mapping = mmap.mmap(mapped.fileno(), 0, prot=mmap.PROT_READ)
-for fd in os.listdir('/proc/self/fd'):
-    try:
-        if os.readlink(f'/proc/self/fd/{fd}') == path:
-            os.close(int(fd))
-    except OSError:
-        pass
-time.sleep(300)
-"""
+_MAP_THEN_CLOSE_FDS_AND_SLEEP = MAP_THEN_CLOSE_FDS + 'import time\ntime.sleep(300)\n'
 
 
 def _run_sourced(
@@ -221,7 +212,7 @@ class TestReferenceDetection:
 
         proc = helpers(
             cwd=elsewhere,
-            argv=(sys.executable, '-c', _MAP_THEN_CLOSE_FDS, str(mapped)),
+            argv=(sys.executable, '-c', _MAP_THEN_CLOSE_FDS_AND_SLEEP, str(mapped)),
         )
         _wait_until(
             _mapped_with_no_fd_open(proc.pid, mapped),
@@ -299,7 +290,7 @@ class TestMountNamespaceTranslation:
 
 
 class TestScanFootprint:
-    """What a negative verdict, which runs both scan halves, may list."""
+    """What a negative verdict, which runs every scan half, may list."""
 
     def test_a_negative_verdict_lists_only_proc_and_per_process_fd_dirs(
         self, tmp_path: Path,
@@ -343,7 +334,9 @@ class TestScanFootprint:
         )
         assert not offending, (
             'a liveness scan lists only /proc and /proc/<pid>/fd — its verdict '
-            'reads /proc/<pid>/cwd, /proc/<pid>/fd/* and /proc/<pid>/maps, '
-            f'nothing else; it listed {len(offending)} other directories, by '
+            'reads /proc/<pid>/cwd, /proc/<pid>/fd/*, /proc/<pid>/maps, '
+            '/proc/<pid>/ns/mnt, /proc/<pid>/mountinfo and paths under '
+            '/proc/<pid>/root without listing them; it listed '
+            f'{len(offending)} other directories, by '
             f'shape: {shapes.most_common(15)}'
         )

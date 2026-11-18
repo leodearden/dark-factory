@@ -5,15 +5,17 @@ bind-mount point, references it only by that path, and whose visible parent has 
 :func:`unreadable_foreign_namespace_process` starts a same-user process in a foreign mount
 namespace whose root the scanner cannot read. This is the one fixture every dark-factory C11
 implementation's tests use (``shared/tests`` and ``orchestrator/tests``), so it ships in
-``shared`` like :mod:`shared.testing_stdin`. It imports pytest, so only tests may import it.
-Each context manager asserts its scenario's premise before yielding, so a pass can never come
-from an untranslated match, and calls ``pytest.skip`` naming what failed where the host
-cannot build the scenario.
+``shared`` like :mod:`shared.testing_stdin`. Each context manager asserts its scenario's
+premise before yielding, so a pass can never come from an untranslated match, and calls
+``pytest.skip`` naming what failed where the host cannot build the scenario. pytest is
+imported only to skip, so the module imports cleanly outside a test run, like
+:mod:`shared.testing_cli_runner`.
 """
 
 from __future__ import annotations
 
 import contextlib
+import functools
 import os
 import select
 import signal
@@ -25,8 +27,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum, auto
 from pathlib import Path
-
-import pytest
+from typing import NoReturn
 
 from shared.proc_group import process_group_terminated
 
@@ -69,7 +70,10 @@ _READY = "import os\nprint('ready', os.getpid(), flush=True)\n"
 _SLEEP = 'import time\ntime.sleep(600)\n'
 _SPIN = 'import time\nend = time.monotonic() + 600\nwhile time.monotonic() < end:\n    pass\n'
 _OPEN = "import sys\nheld = open(sys.argv[1], 'rb')\n"
-_MAP_THEN_CLOSE_FDS = """
+
+#: Maps the file at ``sys.argv[1]``, then closes every fd on it. ``mmap.mmap`` keeps a private
+#: dup of the fd it maps, so the mapping is then the process's only reference to the file.
+MAP_THEN_CLOSE_FDS = """
 import mmap, os, sys
 path = sys.argv[1]
 with open(path, 'rb') as mapped:
@@ -86,7 +90,7 @@ _HOLDER_SCRIPTS = {
     Hold.CWD: _READY + _SLEEP,
     Hold.CWD_BUSY: _READY + _SPIN,
     Hold.OPEN_FILE: _OPEN + _READY + _SLEEP,
-    Hold.MAPPING: _MAP_THEN_CLOSE_FDS + _READY + _SLEEP,
+    Hold.MAPPING: MAP_THEN_CLOSE_FDS + _READY + _SLEEP,
 }
 
 _UNSHARED_SLEEPER = """
@@ -157,14 +161,14 @@ def unreadable_foreign_namespace_process(cwd: Path) -> Iterator[HeldProcess]:
     try:
         line = _ready_line(child, 'unshared sleeper')
         if line.startswith('refused'):
-            pytest.skip(f'os.unshare(CLONE_NEWUSER | CLONE_NEWNS) refused: {line.strip()}')
+            _skip(f'os.unshare(CLONE_NEWUSER | CLONE_NEWNS) refused: {line.strip()}')
         pid = _parse_ready(line, 'unshared sleeper', child)
         try:
             os.stat(f'/proc/{pid}/root')
         except PermissionError:
             pass
         else:
-            pytest.skip(
+            _skip(
                 f'/proc/{pid}/root of a non-dumpable foreign-namespace process is readable '
                 f'here (CAP_SYS_PTRACE?), so the unreadable-root scenario cannot be built'
             )
@@ -173,9 +177,23 @@ def unreadable_foreign_namespace_process(cwd: Path) -> Iterator[HeldProcess]:
         _kill_group_and_await_termination(child)
 
 
+def _skip(reason: str) -> NoReturn:
+    import pytest
+
+    pytest.skip(reason)
+
+
 def _skip_unless_bwrap_creates_mount_namespaces() -> None:
+    reason = _why_bwrap_cannot_create_mount_namespaces()
+    if reason is not None:
+        _skip(reason)
+
+
+@functools.cache
+def _why_bwrap_cannot_create_mount_namespaces() -> str | None:
+    """Probed once per process: the answer does not change within a test session."""
     if not BWRAP.is_file():
-        pytest.skip(f'{BWRAP} is absent, so no mount namespace can be built')
+        return f'{BWRAP} is absent, so no mount namespace can be built'
     probe = subprocess.run(
         [str(BWRAP), '--dev-bind', '/', '/', '--', sys.executable, '-c', ''],
         cwd='/',
@@ -184,10 +202,11 @@ def _skip_unless_bwrap_creates_mount_namespaces() -> None:
         timeout=_READY_BACKSTOP_S,
     )
     if probe.returncode != 0:
-        pytest.skip(
+        return (
             f'{BWRAP} cannot create a mount namespace here (exit {probe.returncode}): '
             f'{probe.stderr.strip()!r}; e.g. a landlocked session (PRD S9)'
         )
+    return None
 
 
 def _ready_line(child: subprocess.Popen[str], what: str) -> str:
