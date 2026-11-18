@@ -422,7 +422,8 @@ async def _evidence_verdict(
     sending ``None`` here would trade a mild probe-label inaccuracy for a
     false "unwired" claim in operator-facing prose.  The recorded
     ``branch_base_sha`` is forwarded by both arms, but it is consulted only in
-    DISCOVERY mode for a branch-tip anchor, so the marker arm's copy is inert.
+    DISCOVERY mode for a branch-tip anchor already on main, so the marker
+    arm's copy is inert.
 
     ``fetch`` is taken whole rather than as a bare ``metadata`` dict so the
     "``{}`` is not proof" invariant travels with the data, and so the

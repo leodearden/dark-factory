@@ -522,9 +522,11 @@ class DifferentialBaseline(enum.StrEnum):
 
     #: The branch tip's merge base with main, while the tip is still off main.
     fork_point = 'fork_point'
-    #: The task's recorded ``branch_base_sha``, a strict ancestor of the tip.
+    #: The task's recorded ``branch_base_sha``, a strict ancestor of a tip
+    #: already on main.
     recorded_branch_base = 'recorded_branch_base'
-    #: ``<sha>^1``: every non-branch-tip anchor, and the branch tip's last resort.
+    #: ``<sha>^1``: every non-branch-tip anchor, and a branch tip's fallback
+    #: when its fork point is unresolved or no usable record exists.
     first_parent = 'first_parent'
 
 
@@ -1006,7 +1008,7 @@ async def _fork_point(git_ops: GitOps, sha: str) -> str | None:
     except Exception:
         logger.warning(
             'fork-point resolution failed for %s — the delivered-checks '
-            'differential falls back to its next baseline',
+            'differential falls back to its first parent',
             sha, exc_info=True,
         )
         return None
@@ -1030,24 +1032,30 @@ async def _differential_parent_ref(
     already carries any capability an earlier branch commit delivered.  Its
     ladder:
 
-    1. the tip's FORK POINT from main, while that differs from the tip;
-    2. else the recorded ``branch_base_sha``, when :func:`_usable_branch_base`
-       trusts it and it differs from the tip;
-    3. else ``tip^1``.
+    1. fork point from main unresolved: ``tip^1``, the pre-amendment
+       behaviour, a weaker baseline that can only cost an upgrade, never
+       manufacture one;
+    2. fork point differs from the tip, so the tip is still off main: the
+       fork point;
+    3. fork point IS the tip, so the tip is already on main (task 7836): the
+       recorded ``branch_base_sha``, when :func:`_usable_branch_base` trusts
+       it and it differs from the tip;
+    4. otherwise ``tip^1``.
 
     The parent leg never names the anchor itself: a parent equal to the
-    citation leg makes FAILED -> DELIVERED -> DELIVERED impossible, which is
-    exactly what a tip already on main produced, since its fork point IS the
-    tip (task 7836).  The record ranks below a real fork point because a
-    workflow rebase leaves it older than the fork, and preferring it would
-    accept a landing whose later commits never reached main.  Pinned by
+    citation leg makes FAILED -> DELIVERED -> DELIVERED impossible.  The
+    record is the oldest, most permissive baseline, so it is consulted only
+    once the tip is KNOWN to be on main; a tip off main, or of unknown
+    position, never reaches it.  Pinned by
     ``orchestrator/tests/test_landing_evidence.py::TestDeliveredChecksDifferentialRealGitDiscovery``.
     """
     first_parent = (f'{effect_check_sha}^1', DifferentialBaseline.first_parent)
     if not anchor_is_branch_tip:
         return first_parent
     fork = await _fork_point(git_ops, effect_check_sha)
-    if fork is not None and fork != effect_check_sha:
+    if fork is None:
+        return first_parent
+    if fork != effect_check_sha:
         return fork, DifferentialBaseline.fork_point
     recorded = await _usable_branch_base(git_ops, branch_base_sha, effect_check_sha)
     if recorded is not None and recorded != effect_check_sha:
@@ -1074,9 +1082,10 @@ async def _delivered_checks_differential(
     ground truth: run each ``metadata.delivered_checks`` entry at three refs —
 
         PARENT        the pre-branch baseline: ``<sha>^1`` for a merge-commit
-                      or citation anchor; for a branch-tip anchor, a ladder
-                      of fork point, recorded *branch_base_sha*, then
-                      ``^1`` (see :func:`_differential_parent_ref`)
+                      or citation anchor; for a branch-tip anchor, its fork
+                      point while off main, the recorded *branch_base_sha*
+                      once on main, else ``^1`` (see
+                      :func:`_differential_parent_ref`)
         ``<sha>``     the citation itself
         MAIN          current HEAD, named by ``config.main_branch``
 
@@ -2115,8 +2124,9 @@ async def validate_landing_evidence(
             included: omitting it then raises TypeError. The capstone (task
             4500/5297) makes it required together with *delivered_checks*.
         branch_base_sha: The task's raw ``metadata.branch_base_sha``,
-            validated here and consulted only for a branch-tip anchor's
-            differential parent leg (see :func:`_differential_parent_ref`).
+            validated here and consulted only for a branch-tip anchor
+            already on main, as the differential parent leg (see
+            :func:`_differential_parent_ref`).
 
     Returns:
         A :class:`LandingVerdict`.
