@@ -3572,7 +3572,7 @@ class TestProjectIdGuidelineConstants:
 
 
 class TestStagePayloadProjectIdGuideline:
-    """All three stages include the per-stage project_id guideline in their assembled payload."""
+    """All three stages include the shared PROJECT_ID_GUIDELINE, filled in, in their payload footer."""
 
     @pytest.fixture
     def memory_mock(self):

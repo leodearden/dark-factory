@@ -1352,7 +1352,7 @@ This is a focused remediation run. Address ONLY the specific findings listed abo
 1. For each finding: investigate the affected IDs, apply the suggested action, verify the fix.
 2. If a finding cannot be resolved, flag it for Stage 2 with an explanation.
 3. Do NOT perform general consolidation — only fix the listed findings.
-4. State each finding's resolution status (fixed, partially_fixed or unresolved) in your `complete` summary.
+4. State each finding's resolution status, in the vocabulary of the Remediation Mode rules, in your `complete` summary.
 
 {PROJECT_ID_GUIDELINE.format(project_id=self.project_id)}{self._build_project_root_directive()}
 """

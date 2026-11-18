@@ -11,14 +11,15 @@ rather than imported across test modules (house norm).
 from __future__ import annotations
 
 import re
-from unittest.mock import AsyncMock, MagicMock
+from collections.abc import Callable
+from unittest.mock import AsyncMock
 
 import pytest
 
-from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.reconciliation import AssembledPayload, StageId, Watermark
 from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
 from fused_memory.reconciliation.prompts.stage2 import build_stage2_system_prompt
+from fused_memory.reconciliation.stages.base import BaseStage
 from fused_memory.reconciliation.stages.task_knowledge_sync import (
     IntegrityCheck,
     TaskKnowledgeSync,
@@ -28,27 +29,23 @@ from fused_memory.reconciliation.task_filter import (
     is_mixed_temporal_framing,
 )
 from reconciliation.consolidator_fixtures import make_consolidator
+from reconciliation.harness_fixtures import (
+    make_memory_service,
+    make_reconciliation_config,
+)
 
 PROJECT_ID = 'test_proj'
 SCOPE_ROOT = '/tmp/test_proj'
-STAGE1_PAYLOADS = ('stage1_legacy', 'stage1_assembled', 'stage1_remediation')
-ALL_PAYLOADS = (*STAGE1_PAYLOADS, 'stage2', 'stage3')
 
 
 def _deps(project_id: str = PROJECT_ID) -> dict:
-    memory_service = AsyncMock()
-    memory_service.get_episodes = AsyncMock(return_value=[])
-    memory_service.mem0 = AsyncMock()
-    memory_service.mem0.get_all = AsyncMock(return_value={'results': []})
-    memory_service.get_status = AsyncMock(return_value={})
-    memory_service.earliest_unfinished_graphiti_write_start = MagicMock(return_value=None)
     taskmaster = AsyncMock()
     taskmaster.get_tasks.return_value = {'tasks': []}
     return {
-        'memory_service': memory_service,
+        'memory_service': make_memory_service(),
         'taskmaster': taskmaster,
         'journal': AsyncMock(),
-        'config': ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test'),
+        'config': make_reconciliation_config(),
         'scope': ProjectScope(ProjectId(project_id), ProjectRoot(SCOPE_ROOT)),
     }
 
@@ -57,28 +54,40 @@ def _stage1():
     return make_consolidator(project_id=PROJECT_ID, project_root=SCOPE_ROOT)
 
 
+def _stage1_assembled():
+    stage = _stage1()
+    stage.assembled_payload = AssembledPayload(events=[], context_items={})
+    return stage
+
+
+def _stage1_remediation():
+    stage = _stage1()
+    stage.remediation_findings = [{'description': 'test finding'}]
+    return stage
+
+
 def _stage2(project_id: str = PROJECT_ID):
     stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **_deps(project_id))
     stage._current_run_id = 'test-run'
     return stage
 
 
-async def _assembled_payloads() -> dict[str, str]:
-    assembled = _stage1()
-    assembled.assembled_payload = AssembledPayload(events=[], context_items={})
-    remediation = _stage1()
-    remediation.remediation_findings = [{'description': 'test finding'}]
-    stages = {
-        'stage1_legacy': _stage1(),
-        'stage1_assembled': assembled,
-        'stage1_remediation': remediation,
-        'stage2': _stage2(),
-        'stage3': IntegrityCheck(StageId.integrity_check, **_deps()),
-    }
-    return {
-        name: await stage.assemble_payload([], Watermark(project_id=PROJECT_ID), [])
-        for name, stage in stages.items()
-    }
+def _stage3():
+    return IntegrityCheck(StageId.integrity_check, **_deps())
+
+
+_STAGE_FACTORIES: dict[str, Callable[[], BaseStage]] = {
+    'stage1_legacy': _stage1,
+    'stage1_assembled': _stage1_assembled,
+    'stage1_remediation': _stage1_remediation,
+    'stage2': _stage2,
+    'stage3': _stage3,
+}
+
+
+async def _assembled_payload(payload_name: str) -> str:
+    stage = _STAGE_FACTORIES[payload_name]()
+    return await stage.assemble_payload([], Watermark(project_id=PROJECT_ID), [])
 
 
 def _section(text: str, heading: str) -> str:
@@ -88,9 +97,9 @@ def _section(text: str, heading: str) -> str:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('payload_name', ALL_PAYLOADS)
+@pytest.mark.parametrize('payload_name', tuple(_STAGE_FACTORIES))
 async def test_payload_asks_for_no_structured_report(payload_name):
-    payload = (await _assembled_payloads())[payload_name]
+    payload = await _assembled_payload(payload_name)
 
     assert 'structured report' not in payload
 
@@ -98,14 +107,14 @@ async def test_payload_asks_for_no_structured_report(payload_name):
 @pytest.mark.asyncio
 @pytest.mark.parametrize('payload_name', ('stage1_legacy', 'stage1_assembled'))
 async def test_stage1_payload_does_not_ask_for_hand_merging(payload_name):
-    payload = (await _assembled_payloads())[payload_name]
+    payload = await _assembled_payload(payload_name)
 
     assert 'Merge/delete' not in payload
 
 
 @pytest.mark.asyncio
 async def test_stage2_payload_task_steps_do_not_ask_to_delete_tasks():
-    payload = (await _assembled_payloads())['stage2']
+    payload = await _assembled_payload('stage2')
 
     assert 'delete tasks' not in payload[payload.index('## Your Task'):]
 
@@ -121,16 +130,18 @@ def test_stage2_task_accounting_rules_flag_through_no_structured_report():
 @pytest.mark.parametrize('project_id', ('dark_factory', 'autopilot_video'))
 def test_stage2_prompt_asks_for_no_git_history_or_working_tree(project_id):
     prompt = build_stage2_system_prompt(project_id)
+    claim_rules = _section(prompt, '## Verifying specific commit/diff/stamp claims')
 
-    assert 'git log --all' not in prompt
     assert 'current working tree' not in prompt
+    assert 'git grep' not in claim_rules
+    assert 'git log' not in claim_rules
 
 
 def test_no_stage_prompt_asks_for_the_retired_memories_written_counter():
     stages = {
         'stage1': _stage1(),
         **{f'stage2_{pid}': _stage2(pid) for pid in ('dark_factory', 'autopilot_video')},
-        'stage3': IntegrityCheck(StageId.integrity_check, **_deps()),
+        'stage3': _stage3(),
     }
 
     for name, stage in stages.items():
