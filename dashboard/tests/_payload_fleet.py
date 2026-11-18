@@ -467,8 +467,9 @@ class _TreeBuilder:
         self, task_id: int, status: TaskStatus, *,
         files: list[str], dependencies: list[int], prd: str | None = None, external: bool = False,
     ) -> dict[str, Any]:
-        # 'notes' stands for every metadata key no row shaper reads; no
-        # budgeted payload ships them.
+        # 'notes' stands for every metadata key no row shaper reads. No
+        # budgeted payload ships them, so a shaper that starts shipping whole
+        # metadata grows the sweep by their size.
         metadata: dict[str, Any] = {'files': files, 'notes': self._notes}
         if prd:
             metadata['prd'] = prd
