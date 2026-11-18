@@ -6,7 +6,9 @@ tasks:
   title: Extract scripts/source_measures.py; generalise patch_targets; add workspace_domain
   note: 'Move list and importer list widened at decompose (2026-10-05): task 5414
     (done, cdc15a6b56) added PatchCall, patch_calls_in_tree and tracked_files seams
-    and six importers after the PRD''s 92af0716e8 anchor.'
+    and six importers after the PRD''s 92af0716e8 anchor. Task 6941 (2026-11-18) re-pointed
+    the workspace-domain-in-source-measures pattern: workspace_domain was renamed measurement_domain;
+    the task-record half is ticket tkt_0RX4WWCXC90HD7R2ZZ83E41F31.'
   capabilities:
   - name: measures-to-move-exist
     binding: capability→producer (wired) — scripts/merge_lane_metrics.py::file_size_measures_in_tree,
@@ -29,7 +31,7 @@ tasks:
     verdict: PASS
     delivered_check:
       kind: grep
-      pattern: ^def workspace_domain\(
+      pattern: ^def measurement_domain\(
       paths:
       - scripts/source_measures.py
       expect: present
@@ -83,7 +85,9 @@ tasks:
   task_id: 6395
   title: Re-point the landed 5414 census enumeration onto workspace_domain
   note: 'Added at decompose (2026-10-05, lead ruling): task 5414 was done (cdc15a6b56),
-    so its landed Part 2 code is re-pointed instead of the task.'
+    so its landed Part 2 code is re-pointed instead of the task. Task 6941 (2026-11-18)
+    re-pointed the census-reads-workspace-domain pattern: workspace_domain was renamed
+    measurement_domain; the task-record half is ticket tkt_0RX4WWCXC90HD7R2ZZ83E41F31.'
   capabilities:
   - name: census-enumeration-to-replace
     binding: capability→producer (wired) — scripts/suite_census_pinning.py::measure_python_tree
@@ -102,7 +106,7 @@ tasks:
     verdict: PASS
     delivered_check:
       kind: grep
-      pattern: workspace_domain
+      pattern: measurement_domain\(
       paths:
       - scripts/suite_census_pinning.py
       expect: present

@@ -24,6 +24,13 @@ be one enumeration) that the batch re-points the landed code: S1 covers imports 
 and the new leaf S1b covers the enumeration. No action is taken on task 5414. The PRD is
 amended to match (header, decisions 1 and 3, Cross-PRD row, Decomposition plan).
 
+**Amended 2026-11-18 (task 6941).** `scripts/source_measures.py::workspace_domain` is now
+`measurement_domain`, because since task 6921 it also enumerates a single src-layout package.
+The twin's delivered_check patterns for `workspace-domain-in-source-measures` (S1) and
+`census-reads-workspace-domain` (S1b) were re-pointed to `^def measurement_domain\(` and
+`measurement_domain\(`. The task-record half is ticket `tkt_0RX4WWCXC90HD7R2ZZ83E41F31`. The
+capability names and the evidence tables below keep the decompose-time name.
+
 ---
 
 ## S1 — Extract `scripts/source_measures.py`; generalise `patch_targets`; add `workspace_domain`  *(intermediate → S1b, S2; also carries its own signal)*
