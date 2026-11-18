@@ -2,8 +2,10 @@
 
 The INV-4 storm escape for the ``ensure_entity_node`` MCP tool (task 4932).
 This is the FIRE half of the alarm; the counter half is
-``MemoryService._entity_mint_storm_counters``, a per-``(agent_id, project_id)``
-:class:`shared.storm_counter.StormCounter` recording one event per MINT.
+``MemoryService._entity_mint_storm_counters``, an
+:class:`fused_memory.services.agent_project_storm_counters.AgentProjectStormCounters`:
+one :class:`shared.storm_counter.StormCounter` per ``(agent_id, project_id)``,
+recording one event per MINT.
 
 WHY THE MINT BRANCH IS THE ONE THAT NEEDS AN ALARM. Of the tool's four
 outcomes, three create nothing: a resolve returns an existing uuid and makes no

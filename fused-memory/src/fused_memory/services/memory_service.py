@@ -17,7 +17,6 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, assert_never, cast
 
 from graphiti_core.nodes import EpisodeType
-from shared.storm_counter import KeyedStormCounters
 from shared.streak import KeyedStreaks
 
 from fused_memory.backends.graphiti_client import (
@@ -116,6 +115,7 @@ from fused_memory.reconciliation.standing_decision_writer import (
 from fused_memory.routing.classifier import WriteClassifier
 from fused_memory.routing.router import ReadRouter
 from fused_memory.services import mem0_retry_backlog_alarm, mem0_write_retry, overreach_guard
+from fused_memory.services.agent_project_storm_counters import AgentProjectStormCounters
 from fused_memory.services.classification_fallback_alarm import (
     ClassificationFallbackAlarm,
     journal_params,
@@ -2206,9 +2206,7 @@ class MemoryService:
         # service). An alarm bound to either would vanish in exactly the
         # degraded configuration where an unattended rewrite loop is least
         # likely to be noticed any other way.
-        self._mem0_update_storm_counters: KeyedStormCounters[tuple[str, str]] = (
-            KeyedStormCounters()
-        )
+        self._mem0_update_storm_counters = AgentProjectStormCounters()
         self._mem0_update_storm_escalator = Mem0UpdateStormEscalator()
         self.set_known_projects(build_known_projects_map(primary_root=''))
         # INV-4 storm escape for the ensure_entity_node MCP tool (task 4932),
@@ -2218,9 +2216,7 @@ class MemoryService:
         # No escalator OBJECT beside it: `middleware/entity_mint_storm_escalator`
         # is a module FUNCTION taking project_root explicitly, so there is no
         # queue cache to own and no set_known_projects lifecycle to keep in sync.
-        self._entity_mint_storm_counters: KeyedStormCounters[tuple[str, str]] = (
-            KeyedStormCounters()
-        )
+        self._entity_mint_storm_counters = AgentProjectStormCounters()
         # Warn-ONCE latch for a corrupt/absent `entity_mint.storm_*` leaf. The
         # corrupt-leaf branch of `_record_entity_mint` is reached on EVERY mint
         # (unlike the `_known_projects` miss beside it, which only fires at a
@@ -2356,7 +2352,7 @@ class MemoryService:
         agents is a real memory bound on a long-lived server and belongs in the
         interface, as ``UnknownKeyStormDetector.tracked_writers`` argues.
         """
-        return frozenset(agent for agent, _ in self._mem0_update_storm_counters.tracked_keys)
+        return self._mem0_update_storm_counters.tracked_agents
 
     @property
     def entity_mint_storm_tracked_agents(self) -> frozenset[str]:
@@ -2365,7 +2361,7 @@ class MemoryService:
         The same bound as :attr:`mem0_update_storm_tracked_agents`, for the
         entity-mint burst alarm.
         """
-        return frozenset(agent for agent, _ in self._entity_mint_storm_counters.tracked_keys)
+        return self._entity_mint_storm_counters.tracked_agents
 
     def set_planned_registry(self, registry: PlannedEpisodeRegistry) -> None:
         """Wire the planned episode registry into the service."""
@@ -9563,10 +9559,10 @@ class MemoryService:
         # agent_id is caller-supplied and unbounded; KeyedStormCounters sweeps
         # the dormant ones on every record.
         storm = self._mem0_update_storm_counters.record(
-            (label, project_id),
+            label,
+            project_id,
             threshold=threshold,
             window_seconds=float(window_seconds),
-            label=label,
             now=self._mem0_update_storm_time_provider(),
         )
         if storm is None:
@@ -10497,10 +10493,10 @@ class MemoryService:
         # agent_id is caller-supplied and unbounded; KeyedStormCounters sweeps
         # the dormant ones on every record.
         storm = self._entity_mint_storm_counters.record(
-            (label, project_id),
+            label,
+            project_id,
             threshold=threshold,
             window_seconds=float(window_seconds),
-            label=label,
             now=self._entity_mint_storm_time_provider(),
         )
         if storm is None:
