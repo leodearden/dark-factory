@@ -16,7 +16,6 @@ from pathlib import Path
 
 import pytest
 from _eval_write_triage_fixtures import ALIASES_PATH, FIXTURE_PATH, committed_records
-from _eval_write_triage_fixtures import cli_mod as _mod
 from _eval_write_triage_fixtures import scoring_mod as _scoring
 
 
@@ -396,7 +395,7 @@ class TestCommittedJudgeAccuracyReportIsTraceable:
         assert cases.exists(), f'{provenance["cases_path"]} is not committed'
         rows = [json.loads(line) for line in cases.read_text().splitlines()]
         assert len(rows) == provenance['case_count']
-        assert _mod().score_attachments(rows) == report['production_shape']
+        assert _scoring().score_attachments(rows) == report['production_shape']
 
     def test_no_retrieval_came_back_degraded(self) -> None:
         """Each degraded retrieval is a fail-open that measured nothing."""
