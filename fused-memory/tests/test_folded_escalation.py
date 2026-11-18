@@ -1132,6 +1132,9 @@ def _anchors_read_from_their_own_homes() -> dict[str, str]:
     from fused_memory.middleware.curator_escalator import (
         _ANCHOR_TASK_ID as CURATOR_ANCHOR,
     )
+    from fused_memory.middleware.dead_letter_escalator import (
+        _ANCHOR_TASK_ID as DEAD_LETTER_ANCHOR,
+    )
     from fused_memory.middleware.entity_mint_storm_escalator import (
         _ANCHOR_TASK_ID as ENTITY_MINT_ANCHOR,
     )
@@ -1232,6 +1235,7 @@ def _anchors_read_from_their_own_homes() -> dict[str, str]:
         #    squat an anchor and must be in this sweep. ---------------------
         'mem0_update_storm_escalator': MEM0_UPDATE_ANCHOR,
         'entity_mint_storm_escalator': ENTITY_MINT_ANCHOR,
+        'dead_letter_escalator': DEAD_LETTER_ANCHOR,
         'scope_violation_escalator': SCOPE_VIOLATION_ANCHOR,
         'scope_violation_escalator override': SCOPE_OVERRIDE_ANCHOR,
         'scope_violation_escalator budget-misconfig': SCOPE_BUDGET_ANCHOR,
