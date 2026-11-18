@@ -3,15 +3,15 @@
 Four populations are pinned. Task 6036 re-anchored descriptors on BOTH sides: the
 producer task's ``metadata.delivered_checks`` entry in tasks.db AND the sidecar
 the stamper copies it from. Tasks 5256 and 6209 resynced sidecars, sidecar-only, to task
-records that had already been repaired. Task 6941 renamed
-``source_measures.workspace_domain`` to ``measurement_domain`` and re-pointed the
-sidecar half of the two descriptors that grep for it; their task-record half is
-the post-merge operational ticket tkt_0RX4WWCXC90HD7R2ZZ83E41F31. CI can never see
-the tasks.db half, so in every case these pins guard the SIDECAR half: a stale
-sidecar would be re-stamped over the repaired record by the next re-decompose.
-Every resynced and re-pointed producer is done, so those rows are also evaluated
-at HEAD through the runtime grep primitive. They read only tracked files in this
-checkout and open no database. Task 6047 re-pointed a FOREIGN descriptor, warm-lane κ, whose
+records that had already been repaired. Task 6941 renamed the function two
+descriptors grep for to ``source_measures.measurement_domain`` and re-pointed their
+sidecar half; their task-record half is the post-merge operational ticket
+tkt_0RX4WWCXC90HD7R2ZZ83E41F31. CI can never see the tasks.db half, so in every
+case these pins guard the SIDECAR half: a stale sidecar would be re-stamped over
+the repaired record by the next re-decompose. Every resynced and re-pointed
+producer is done, so those rows are also evaluated at HEAD through the runtime
+grep primitive. They read only tracked files in this checkout and open no
+database. Task 6047 re-pointed a FOREIGN descriptor, warm-lane κ, whose
 task-record half lives in reify's store; reify's tree is not this checkout, so
 its non-vacuity is checked behaviourally against committed fixture trees rather
 than at HEAD.
