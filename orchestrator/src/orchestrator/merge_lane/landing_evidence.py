@@ -535,6 +535,21 @@ class DifferentialBaseline(enum.StrEnum):
     unavailable = 'unavailable'
 
 
+@dataclass(frozen=True)
+class BranchTipAnchor:
+    """A differential anchored on the task's BRANCH TIP, with what shows which commits the branch owns.
+
+    Only :func:`validate_landing_evidence` builds one, when it anchors on the
+    branch tip; every other anchor passes none.  *branch_base_sha* is the
+    task's raw ``metadata.branch_base_sha``, still unvalidated.  See
+    :func:`_differential_parent_ref` for how each field is consulted.
+    """
+
+    task_id: str
+    branch_base_sha: str | None
+    pattern_template: str | None
+
+
 #: Category used for BOTH the storm filing and its ``has_open_l1`` dedup
 #: filter.  Its OWN category, deliberately NOT ``'provenance_unattributed'``:
 #: category scoping is load-bearing after the task-4105 incident (see
@@ -1052,19 +1067,14 @@ async def _is_merge_commit(git_ops: GitOps, sha: str) -> bool:
 
 
 async def _differential_parent_ref(
-    git_ops: GitOps,
-    effect_check_sha: str,
-    *,
-    anchor_is_branch_tip: bool,
-    branch_base_sha: str | None,
-    task_id: str,
-    pattern_template: str | None,
+    git_ops: GitOps, effect_check_sha: str, branch_tip: BranchTipAnchor | None,
 ) -> tuple[str | None, DifferentialBaseline]:
     """The ref that stands for "before this landing" in the differential, and
     the rung that named it; None when no ref can.
 
-    ``<sha>^1`` for a MERGE-COMMIT or citation anchor: the first parent is
-    main-before-the-merge, exactly the pre-merge baseline the sequence needs.
+    ``<sha>^1`` for a MERGE-COMMIT or citation anchor (no *branch_tip*): the
+    first parent is main-before-the-merge, exactly the pre-merge baseline the
+    sequence needs.
 
     A BRANCH-TIP anchor's ``^1`` is the branch's own previous commit, which
     already carries any capability an earlier branch commit delivered.  Its
@@ -1092,19 +1102,19 @@ async def _differential_parent_ref(
     ``orchestrator/tests/test_landing_evidence.py::TestDeliveredChecksDifferentialRealGitDiscovery``.
     """
     first_parent = (f'{effect_check_sha}^1', DifferentialBaseline.first_parent)
-    if not anchor_is_branch_tip:
+    if branch_tip is None:
         return first_parent
     fork = await _fork_point(git_ops, effect_check_sha)
     if fork is None:
         return first_parent
     if fork != effect_check_sha:
         return fork, DifferentialBaseline.fork_point
-    recorded = await _usable_branch_base(git_ops, branch_base_sha, effect_check_sha)
+    recorded = await _usable_branch_base(git_ops, branch_tip.branch_base_sha, effect_check_sha)
     if (
         recorded is not None and recorded != effect_check_sha
         and await _range_cites_only(
             git_ops, recorded, effect_check_sha,
-            task_id=task_id, pattern_template=pattern_template,
+            task_id=branch_tip.task_id, pattern_template=branch_tip.pattern_template,
         )
     ):
         return recorded, DifferentialBaseline.recorded_branch_base
@@ -1113,16 +1123,61 @@ async def _differential_parent_ref(
     return first_parent
 
 
+async def _differential_leg(
+    git_ops: GitOps, check: dict[str, Any], *, parent_ref: str, citation_ref: str, main_ref: str,
+) -> tuple[dict[str, Any], bool]:
+    """*check*'s three-leg record for ``probe['delivered_checks_legs']``, and
+    whether it was FAILED at the parent and DELIVERED at the citation and main.
+
+    A non-grep check is an explicit no-signal carve-out, run at no ref: a
+    script check execs against the LIVE CHECKOUT, so running it three times
+    would answer identically each time.
+
+    LAZY import (``# noqa: PLC0415``), mirroring
+    :func:`file_unattributed_landing_escalation`'s ``escalation.models``
+    import: this module deliberately imports nothing from ``orchestrator`` at
+    module level (see the module docstring) because
+    ``orchestrator.delivered_checks`` imports ``orchestrator.git_ops``, and a
+    module-level edge here would re-create the harness<->merge_queue cycle
+    this module was extracted to avoid.
+    """
+    from orchestrator.delivered_checks import (
+        DeliveredCheckResult,
+        run_delivered_check,
+    )
+
+    kind = check.get('kind')
+    if kind != 'grep':
+        verdict = 'script_kind_no_signal' if kind == 'script' else 'unsupported_kind_no_signal'
+        return {'name': check.get('name'), 'kind': kind, 'verdict': verdict}, False
+    results = {}
+    for label, ref in (('parent', parent_ref), ('citation', citation_ref), ('main', main_ref)):
+        results[label] = await run_delivered_check(
+            check, project_root=git_ops.project_root, ref=ref,
+        )
+    made_true = (
+        results['parent'] is DeliveredCheckResult.FAILED
+        and results['citation'] is DeliveredCheckResult.DELIVERED
+        and results['main'] is DeliveredCheckResult.DELIVERED
+    )
+    return {
+        'name': check.get('name'),
+        'kind': kind,
+        'expect': check.get('expect'),
+        'parent': results['parent'].value,
+        'citation': results['citation'].value,
+        'main': results['main'].value,
+        'verdict': _DIFFERENTIAL_CONFIRMED if made_true else 'no_signal',
+    }, made_true
+
+
 async def _delivered_checks_differential(
     git_ops: GitOps,
     effect_check_sha: str,
     delivered_checks: list[dict[str, Any]],
     probe: dict[str, Any],
     *,
-    anchor_is_branch_tip: bool = False,
-    branch_base_sha: str | None = None,
-    task_id: str = '',
-    pattern_template: str | None = None,
+    branch_tip: BranchTipAnchor | None = None,
     enabled: bool,
 ) -> bool:
     """The SECOND accept path: did *effect_check_sha* MAKE a declared
@@ -1134,10 +1189,10 @@ async def _delivered_checks_differential(
     ground truth: run each ``metadata.delivered_checks`` entry at three refs —
 
         PARENT        the pre-branch baseline: ``<sha>^1`` for a merge-commit
-                      or citation anchor; for a branch-tip anchor, its fork
-                      point while off main, the recorded *branch_base_sha*
-                      once on main when every own commit since it cites
-                      *task_id*, else ``^1`` or none (see
+                      or citation anchor; for a *branch_tip* anchor, its fork
+                      point while off main, the recorded ``branch_base_sha``
+                      once on main when every own commit since it cites the
+                      task, else ``^1`` or none (see
                       :func:`_differential_parent_ref`)
         ``<sha>``     the citation itself
         MAIN          current HEAD, named by ``config.main_branch``
@@ -1181,14 +1236,6 @@ async def _delivered_checks_differential(
     pass, review finding).  Nothing is read off *git_ops*: a real
     ``GitOps.config`` is the ``git`` sub-config, which carries no such field.
 
-    LAZY import (``# noqa: PLC0415``), mirroring
-    :func:`file_unattributed_landing_escalation`'s ``escalation.models``
-    import: this module deliberately imports nothing from ``orchestrator`` at
-    module level (see the module docstring) because
-    ``orchestrator.delivered_checks`` imports ``orchestrator.git_ops``, and a
-    module-level edge here would re-create the harness<->merge_queue cycle
-    this module was extracted to avoid.
-
     Writes ``delivered_checks_legs`` (every check's three-leg outcome) and
     ``delivered_checks_outcome`` (a :class:`DifferentialOutcome`) into
     *probe*, so the escalation can say "capability X was made true by this
@@ -1205,64 +1252,23 @@ async def _delivered_checks_differential(
         probe['delivered_checks_outcome'] = DifferentialOutcome.disabled
         return False
 
-    from orchestrator.delivered_checks import (
-        DeliveredCheckResult,
-        run_delivered_check,
-    )
-
     main_ref = _main_ref(git_ops)
     legs: list[dict[str, Any]] = []
     confirmed = False
     try:
         parent_ref, baseline = await _differential_parent_ref(
-            git_ops, effect_check_sha,
-            anchor_is_branch_tip=anchor_is_branch_tip,
-            branch_base_sha=branch_base_sha,
-            task_id=task_id, pattern_template=pattern_template,
+            git_ops, effect_check_sha, branch_tip,
         )
         probe['delivered_checks_parent_ref'] = parent_ref
         probe['delivered_checks_baseline'] = baseline
-        for check in (delivered_checks if parent_ref is not None else ()):
-            kind = check.get('kind')
-            if kind != 'grep':
-                # A script check execs against the LIVE CHECKOUT and takes no
-                # ref, so it cannot express a differential at all: running it
-                # three times would answer identically each time.  Recorded as
-                # an explicit carve-out rather than silently dropped.
-                legs.append({
-                    'name': check.get('name'),
-                    'kind': kind,
-                    'verdict': (
-                        'script_kind_no_signal' if kind == 'script'
-                        else 'unsupported_kind_no_signal'
-                    ),
-                })
-                continue
-            assert parent_ref is not None
-            results = {}
-            for label, ref in (
-                ('parent', parent_ref),
-                ('citation', effect_check_sha),
-                ('main', main_ref),
-            ):
-                results[label] = await run_delivered_check(
-                    check, project_root=git_ops.project_root, ref=ref,
+        if parent_ref is not None:
+            for check in delivered_checks:
+                leg, made_true = await _differential_leg(
+                    git_ops, check,
+                    parent_ref=parent_ref, citation_ref=effect_check_sha, main_ref=main_ref,
                 )
-            made_true = (
-                results['parent'] is DeliveredCheckResult.FAILED
-                and results['citation'] is DeliveredCheckResult.DELIVERED
-                and results['main'] is DeliveredCheckResult.DELIVERED
-            )
-            confirmed = confirmed or made_true
-            legs.append({
-                'name': check.get('name'),
-                'kind': kind,
-                'expect': check.get('expect'),
-                'parent': results['parent'].value,
-                'citation': results['citation'].value,
-                'main': results['main'].value,
-                'verdict': _DIFFERENTIAL_CONFIRMED if made_true else 'no_signal',
-            })
+                legs.append(leg)
+                confirmed = confirmed or made_true
     except Exception as exc:
         # Contained but NOT swallowed (structured-facts-at-failure): the whole
         # differential declines rather than upgrading on partial evidence.
@@ -2266,24 +2272,25 @@ async def validate_landing_evidence(
     # authoritative), or in the defensive case a DISCOVERY caller omitted
     # branch_tip_sha despite citation_on_branch.
     effect_check_sha = citation
-    anchor_is_branch_tip = False
+    branch_tip: BranchTipAnchor | None = None
     if citation_on_branch and branch_tip_sha is not None:
         effect_check_sha = branch_tip_sha
-        anchor_is_branch_tip = True
+        branch_tip = BranchTipAnchor(
+            task_id=task_id, branch_base_sha=branch_base_sha,
+            pattern_template=pattern_template,
+        )
     probe['effect_check_sha'] = effect_check_sha
     if not await git_ops.commit_effect_present_in_main(effect_check_sha):
         await _record_effect_divergence(git_ops, effect_check_sha, probe)
         # SECOND ACCEPT PATH — anchored on the sha the survival check actually
         # ran against, so both modes ask the same question.  Inside the reject
         # branch, so it is structurally upgrade-only (task 3116).  The
-        # branch-tip flag travels with it because it decides what "before this
-        # landing" means: a tip's ^1 is the branch's own previous commit, not
-        # a pre-branch baseline (see _differential_parent_ref).
+        # branch-tip anchor travels with it because it decides what "before
+        # this landing" means: a tip's ^1 is the branch's own previous commit,
+        # not a pre-branch baseline (see _differential_parent_ref).
         if delivered_checks and await _delivered_checks_differential(
             git_ops, effect_check_sha, delivered_checks, probe,
-            anchor_is_branch_tip=anchor_is_branch_tip,
-            branch_base_sha=branch_base_sha, task_id=task_id,
-            pattern_template=pattern_template, enabled=enabled,
+            branch_tip=branch_tip, enabled=enabled,
         ):
             return _accept(citation)
         return _reject(LandingReason.effect_absent)
