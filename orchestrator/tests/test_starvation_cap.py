@@ -273,6 +273,24 @@ class TestChangeRule:
     def test_an_open_alarm_that_is_no_longer_alarming_is_resolved(self, report: CapReport) -> None:
         assert cap_action(report, self.BASE, 'any open detail') is CapAction.RESOLVE
 
+    @pytest.mark.parametrize('open_detail', [None, 'any open detail'], ids=['closed', 'open'])
+    def test_a_cohort_waiting_while_no_lock_is_held_changes_nothing(
+        self, open_detail: str | None,
+    ) -> None:
+        report = _report({'S3': REFUSED, 'S4': DUAL}, {}, {}, locks_held=False)
+
+        assert cap_action(report, self.BASE, open_detail) is CapAction.NONE
+        assert next_baseline(CapAction.NONE, report, self.BASE) == self.BASE
+
+    def test_a_promoted_alarm_suppresses_a_filing_and_is_never_rewritten(self) -> None:
+        news = _wedged('S3', 'S4', holder='9')
+
+        assert is_news(news, self.BASE)
+        assert cap_action(news, self.BASE, None, promoted=True) is CapAction.NONE
+
+    def test_a_promoted_alarm_is_resolved_once_nothing_alarms(self) -> None:
+        assert cap_action(_all_live('S3'), self.BASE, None, promoted=True) is CapAction.RESOLVE
+
 
 class TestNextBaseline:
     BASE = CapBaseline(size=7, modules=frozenset({'hot/x.py'}), subjects=frozenset({'X'}))
@@ -431,6 +449,27 @@ class TestSyncCapL1:
 
         assert _open_cap_l1s(queue) == []
         closed = queue.get(old.id)
+        assert closed is not None
+        assert closed.resolved_by == STARVATION_WATCHDOG_ROLE
+
+    def test_a_parked_cap_alarm_is_left_to_its_human_until_nothing_alarms(
+        self, tmp_path: Path,
+    ) -> None:
+        queue, state = _queue(tmp_path), WatchdogState(None, '/proj')
+        sync_cap_l1(queue, _wedged('S3'), state)
+        [filed] = _open_cap_l1s(queue)
+        queue.park(filed.id, 'held for a human')
+
+        assert sync_cap_l1(queue, _wedged('S3', 'S4', holder='9'), state)
+
+        assert _open_cap_l1s(queue) == []
+        [parked] = queue.get_by_task(AUTO_PIN_CAP_SENTINEL, status='pending')
+        assert (parked.id, parked.level, parked.detail) == (filed.id, 2, filed.detail)
+
+        assert sync_cap_l1(queue, _all_live('S3'), state)
+
+        assert queue.get_by_task(AUTO_PIN_CAP_SENTINEL, status='pending') == []
+        closed = queue.get(filed.id)
         assert closed is not None
         assert closed.resolved_by == STARVATION_WATCHDOG_ROLE
 

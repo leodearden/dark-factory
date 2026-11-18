@@ -3752,7 +3752,8 @@ class Scheduler:
         """Bring the auto-pin cap L1 in line with the waiting cohort (task 9636).
 
         The L1 is open only while the cohort is non-empty and alarming, and
-        names that cohort; ``starvation_cap.py`` holds the rule.  Blockers,
+        names that cohort; a tick with no lock held changes nothing, and
+        ``starvation_cap.py`` holds the rule.  Blockers,
         in-flight slots and held locks are read here with no await between
         them, so the report is one snapshot of the lock state after the
         tick's live status read; each task's blockers are read once per pass.

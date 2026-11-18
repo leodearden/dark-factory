@@ -4,17 +4,22 @@ The cohort is every pin-gate firing the auto-pin cap turned away, waiting for
 a watchdog pin slot.  The L1 reports a CHANGE in that cohort, not the
 standing backlog, and only when the watchdog can point at something a human
 should look at: a blocker whose holder is not live, or a cohort none of whose
-members has a recorded blocker while some task holds a lock.  An empty lock
-table (the first ticks after a restart, before holders re-dispatch) explains
-nothing either way, so it alarms nothing.  The rule, its thresholds and the liveness
-walk are justified in plans/scheduler-dispatch-scoring-and-lock-layer-prd.md
-C4 "Cap L1".
+members has a recorded blocker while some task holds a lock.  A cohort
+waiting while no lock is held (the first ticks after a restart, before
+holders re-dispatch) explains nothing either way, so it changes nothing: an
+open L1 stays open and the baseline stays.  The rule, its thresholds and the
+liveness walk are justified in
+plans/scheduler-dispatch-scoring-and-lock-layer-prd.md C4 "Cap L1".
 
-- FILE when no cap L1 is open, the cohort alarms, and it is news against the
-  last announcement: a new non-live holder, a new module behind a non-live
-  holder, or growth to ``size + max(GROWTH_FLOOR, ceil(GROWTH_RATIO * size))``.
+- FILE when no cap alarm is open, the cohort alarms, and it is news against
+  the last announcement: a new non-live holder, a new module behind a
+  non-live holder, or growth to
+  ``size + max(GROWTH_FLOOR, ceil(GROWTH_RATIO * size))``.
 - REFRESH the open L1 in place whenever the cohort's rendering changes.
-- RESOLVE the open L1 once the cohort no longer alarms.
+- RESOLVE every open cap alarm once the cohort no longer alarms.
+
+A cap alarm promoted past L1 (parked for a human) counts as open, so nothing
+is filed beside it, but it is the human's and is never rewritten.
 
 The rendering carries no ages or counts (each task's ``starvation_detected``
 event holds those), so a refresh happens only on a membership, module or
@@ -161,12 +166,22 @@ def is_news(report: CapReport, baseline: CapBaseline) -> bool:
     )
 
 
-def cap_action(report: CapReport, baseline: CapBaseline, open_detail: str | None) -> CapAction:
-    """What to do with the cap L1, given its open record's detail (None when none is open)."""
+def cap_action(
+    report: CapReport, baseline: CapBaseline, open_detail: str | None, *, promoted: bool = False,
+) -> CapAction:
+    """What to do with the cap alarm.
+
+    *open_detail* is the open L1's detail, None when no L1 is open.
+    *promoted* is whether a cap alarm promoted past L1 is pending.
+    """
+    if report.members and not report.locks_held:
+        return CapAction.NONE
     if not report.alarming:
-        return CapAction.NONE if open_detail is None else CapAction.RESOLVE
+        return CapAction.RESOLVE if open_detail is not None or promoted else CapAction.NONE
     if open_detail is not None:
         return CapAction.NONE if cap_text(report)[1] == open_detail else CapAction.REFRESH
+    if promoted:
+        return CapAction.NONE
     return CapAction.FILE if is_news(report, baseline) else CapAction.NONE
 
 
@@ -241,26 +256,29 @@ def _resolution(report: CapReport) -> str:
 
 
 def sync_cap_l1(queue: EscalationQueue | None, report: CapReport, state: WatchdogState) -> bool:
-    """Bring the cap L1 in line with *report*; whether the queue now reflects it.
+    """Bring the cap alarm in line with *report*; whether the queue now reflects it.
 
     The baseline is recorded only after the queue write succeeds, so a failed
-    write is retried on the next call.  Any open level-1 cap record counts,
-    whoever filed it, so one a previous deploy left is refreshed or resolved
-    rather than duplicated.  Never raises.
+    write is retried on the next call.  Any pending cap record counts,
+    whoever filed it, so an L1 a previous deploy left is refreshed or
+    resolved rather than duplicated.  Never raises.
     """
     if queue is None:
         return True
     try:
-        open_records = queue.get_by_task(AUTO_PIN_CAP_SENTINEL, status='pending', level=1)
-        open_detail = open_records[0].detail if open_records else None
-        action = cap_action(report, state.baseline(), open_detail)
+        pending = queue.get_by_task(AUTO_PIN_CAP_SENTINEL, status='pending')
+        open_l1 = [esc for esc in pending if esc.level == CAP_ALARM.level]
+        action = cap_action(
+            report, state.baseline(), open_l1[0].detail if open_l1 else None,
+            promoted=any(esc.level > CAP_ALARM.level for esc in pending),
+        )
         if action in (CapAction.FILE, CapAction.REFRESH):
             summary, detail = cap_text(report)
             file_or_refresh(
                 queue, CAP_ALARM, summary=summary, detail=detail, filing_claimant_run_id=None,
             )
         elif action is CapAction.RESOLVE:
-            for esc in open_records:
+            for esc in pending:
                 queue.resolve(esc.id, _resolution(report), resolved_by=STARVATION_WATCHDOG_ROLE)
     except Exception:
         logger.warning(

@@ -386,9 +386,11 @@ can point at something a human should look at. Code: `orchestrator/src/orchestra
 - *Alarming.* Some blocker of some member has a non-live holder. Every blocker counts, not only
   the first: a member needs all its modules, so a wedged holder on its second module starves it
   as surely as one on its first. The cohort also alarms when it has members, some task holds a
-  lock, and no member has a recorded blocker, the case the watchdog cannot explain. An empty
-  lock table explains nothing, so it alarms nothing. That case is the first ticks after a
-  restart, before holders re-dispatch.
+  lock, and no member has a recorded blocker, the case the watchdog cannot explain. A cohort
+  waiting while no lock is held explains nothing either way, so it changes nothing: an open
+  alarm stays open and the baseline stays. That case is the first ticks after a restart,
+  before holders re-dispatch. Resolving there would close a standing wedge at every restart,
+  and since a resolve keeps the baseline, the same wedge would never be re-filed.
 - *Liveness* (`orchestrator/src/orchestrator/blocker_liveness.py`). A HELD module's owner must
   be a slot this scheduler process has dispatched and not released (`Scheduler._dispatched`);
   otherwise the reason is `lock_without_slot`, a lock no running slot will release. A dispatched
@@ -404,7 +406,7 @@ can point at something a human should look at. Code: `orchestrator/src/orchestra
   `PARK_FOLLOW_DEPTH` = 3 parks deep (park, park, park, holder). A cycle, a deeper chain, or an
   owner absent from the read or terminal is non-live. A park owner whose modules are all free
   waits only for a run slot, which is live.
-- *FILE* when no cap L1 is open, the cohort alarms, and it is news against the last
+- *FILE* when no cap alarm is open, the cohort alarms, and it is news against the last
   announcement: a new non-live holder, a new module behind a non-live holder (a live
   holder's lock turnover is never news), or growth to
   `size + max(GROWTH_FLOOR, ceil(GROWTH_RATIO × size))` with `GROWTH_FLOOR` = 10 and
@@ -412,8 +414,12 @@ can point at something a human should look at. Code: `orchestrator/src/orchestra
 - *REFRESH* the open L1 in place (same id, `dedupe_count` + 1) whenever its rendering changes.
   The rendering carries no ages or counts, so it changes only with membership, first-blocker
   modules or wedges.
-- *RESOLVE* the open L1, under `orchestrator-starvation-watchdog`, when the cohort empties or no
-  longer alarms.
+- *RESOLVE* every pending cap alarm, at any level, under `orchestrator-starvation-watchdog`, when
+  the cohort empties or no longer alarms.
+- *Promoted.* A cap alarm promoted past L1 and still pending (a parked L2) belongs to its human.
+  It counts as open, so no L1 is filed beside it, and it is never rewritten. It is resolved
+  with the rest once the cohort empties or no longer alarms, as the pre-9636 drain resolved
+  every pending record under the sentinel.
 - *Baseline.* FILE and REFRESH replace the last announcement. A human or watcher close keeps it,
   so a standing cohort files nothing after a "wait" close. A resolve on a wedge clearing keeps
   it, so a flickering heartbeat does not re-file. An empty cohort resets it, so a cohort that
@@ -421,8 +427,8 @@ can point at something a human should look at. Code: `orchestrator/src/orchestra
 - *Drain.* A waiter that is a dispatch candidate this tick but no longer fires a pinning gate
   leaves the cohort, for example after a hot-reload of `skip_threshold`, `idle_secs` or
   `idle_only_secs`. Disabling the watchdog drains it whole. A waiter off the candidate list keeps
-  its place, as the eligibility clock's anchors do. So the L1 is open iff the live cohort is
-  non-empty and alarming.
+  its place, as the eligibility clock's anchors do. So, outside ticks with no lock held, a cap
+  alarm is open iff the live cohort is non-empty and alarming.
 - *Restart durability* (`orchestrator/src/orchestrator/starvation_state.py`). The cohort with each
   member's gate, the lock-refusal counts, the per-task announced set and the last announcement
   live in `scheduler_eligibility.db` beside the eligibility anchors. A restart therefore neither

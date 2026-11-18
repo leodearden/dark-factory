@@ -886,6 +886,29 @@ async def test_a_closed_cap_l1_is_not_refiled_after_a_restart(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('skip_threshold', [50, 150])
+async def test_an_open_cap_l1_stays_open_across_a_restart(
+    tmp_path: Path, skip_threshold: int,
+) -> None:
+    settings = {'skip_threshold': skip_threshold, **CAP_OF_TWO}
+    _prior_cohort_refusals(tmp_path, skip_threshold)
+    rig = _rig(tmp_path, **settings)
+    queue = await _three_starve_behind_a_cap_of_two(rig)
+    [filed] = _open_cap_l1s(queue)
+
+    second = _restart(rig, tmp_path, queue, **settings)
+    assert await second.tick_id() == '0'
+    assert [e.id for e in _open_cap_l1s(queue)] == [filed.id], (
+        'an empty lock table before the holder re-dispatches explains nothing'
+    )
+    for _ in range(_COHORT_SCANS):
+        await second.tick_with_low_winner()
+
+    assert [e.id for e in _open_cap_l1s(queue)] == [filed.id]
+    assert [e.status for e in queue.get_by_task(AUTO_PIN_CAP_SENTINEL)] == ['pending']
+
+
+@pytest.mark.asyncio
 async def test_lock_refusals_survive_a_restart(tmp_path: Path) -> None:
     rig = _rig(tmp_path)
     rig.set_tasks([_seed(), _task('2', 'medium', 'hot/b.py')])
