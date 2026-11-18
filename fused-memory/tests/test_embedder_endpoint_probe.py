@@ -72,7 +72,7 @@ class TestProbeResult:
         assert result.faults == ()
         assert result.ok is True
         assert result.native_width == DIMS
-        assert result.served_models == (MODEL,)
+        assert result.model_served is True
 
     @pytest.mark.parametrize('served_width', [1024, 1536])
     def test_a_width_other_than_the_config_is_a_mismatch(self, endpoint, served_width):
@@ -95,6 +95,7 @@ class TestProbeResult:
         assert fault.kind is ProbeFaultKind.MODEL_NOT_SERVED
         assert fault.expected == MODEL
         assert fault.observed == ('some-other-model',)
+        assert result.model_served is False
 
     def test_an_endpoint_nothing_listens_on_is_unreachable_and_returns_in_bound(self):
         started = time.monotonic()
@@ -174,6 +175,7 @@ class TestEndpointProbeHolder:
         assert block['endpoint'] == endpoint.base_url
         assert block['dimensions'] == DIMS
         await probe.wait()
+        assert set(probe.status_block()) == set(block)
 
     @pytest.mark.asyncio
     async def test_a_finished_probe_reports_ok(self, endpoint):
@@ -186,7 +188,7 @@ class TestEndpointProbeHolder:
         assert block['status'] == 'ok'
         assert block['reachable'] is True
         assert block['native_width'] == DIMS
-        assert block['served_models'] == [MODEL]
+        assert block['model_served'] is True
         assert block['errors'] == []
         assert block['probed_at']
         assert {'model', 'endpoint', 'dimensions'} <= set(block)
@@ -204,3 +206,57 @@ class TestEndpointProbeHolder:
         [error] = block['errors']
         assert error['kind'] == ProbeFaultKind.WIDTH_MISMATCH.value
         json.dumps(block)
+
+    @pytest.mark.asyncio
+    async def test_an_exception_in_the_probe_thread_reports_degraded(self):
+        probe = EmbedderEndpointProbe(_embedder('::not a url::'), timeout_seconds=TIMEOUT)
+
+        probe.start()
+        await probe.wait()
+        block = probe.status_block()
+
+        assert block['status'] == 'degraded'
+        [error] = block['errors']
+        assert error['kind'] == ProbeFaultKind.PROBE_FAILED.value
+        assert block['probed_at']
+
+    @pytest.mark.asyncio
+    async def test_a_degraded_result_is_reprobed_once_it_is_old_enough(self, endpoint):
+        endpoint.embedding_len = 1024
+        probe = EmbedderEndpointProbe(
+            _embedder(endpoint.base_url), timeout_seconds=TIMEOUT, reprobe_after_seconds=0,
+        )
+        probe.start()
+        await probe.wait()
+        endpoint.embedding_len = DIMS
+
+        assert probe.status_block()['status'] == 'degraded'
+        await probe.wait()
+
+        assert probe.status_block()['status'] == 'ok'
+        assert len(endpoint.requests_to('/models')) == 2
+
+    @pytest.mark.asyncio
+    async def test_a_young_degraded_result_is_not_reprobed(self, endpoint):
+        endpoint.embedding_len = 1024
+        probe = EmbedderEndpointProbe(_embedder(endpoint.base_url), timeout_seconds=TIMEOUT)
+        probe.start()
+        await probe.wait()
+
+        probe.status_block()
+        await probe.wait()
+
+        assert len(endpoint.requests_to('/models')) == 1
+
+    @pytest.mark.asyncio
+    async def test_an_ok_result_is_never_reprobed(self, endpoint):
+        probe = EmbedderEndpointProbe(
+            _embedder(endpoint.base_url), timeout_seconds=TIMEOUT, reprobe_after_seconds=0,
+        )
+        probe.start()
+        await probe.wait()
+
+        probe.status_block()
+        await probe.wait()
+
+        assert len(endpoint.requests_to('/models')) == 1

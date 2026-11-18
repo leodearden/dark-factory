@@ -11,7 +11,7 @@ import asyncio
 import json
 import logging
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Any
 
@@ -24,7 +24,16 @@ logger = logging.getLogger(__name__)
 PROBE_TIMEOUT_SECONDS = 10.0
 """Per-request bound; the SDK's own retries are off, so this bounds each call."""
 
+REPROBE_DEGRADED_AFTER_SECONDS = 60.0
+"""A degraded result this old is re-probed when get_status next reads it."""
+
 _PROBE_INPUT = 'fused-memory embedder probe'
+
+
+class ProbeStatus(StrEnum):
+    PENDING = 'pending'
+    OK = 'ok'
+    DEGRADED = 'degraded'
 
 
 class ProbeFaultKind(StrEnum):
@@ -59,26 +68,34 @@ class EmbedderProbeResult:
     dimensions: int
     reachable: bool | None
     """None when the endpoint was never contacted."""
-    served_models: tuple[str, ...]
+    model_served: bool | None
+    """Whether GET /models lists ``model``; None when no listing was read."""
     native_width: int | None
     faults: tuple[EmbedderProbeFault, ...]
-    probed_at: str
+    probed_at: datetime | None
+    """None until a probe has finished."""
+
+    @property
+    def status(self) -> ProbeStatus:
+        if self.probed_at is None:
+            return ProbeStatus.PENDING
+        return ProbeStatus.DEGRADED if self.faults else ProbeStatus.OK
 
     @property
     def ok(self) -> bool:
-        return not self.faults
+        return self.status is ProbeStatus.OK
 
     def as_status(self) -> dict[str, Any]:
         return {
-            'status': 'ok' if self.ok else 'degraded',
+            'status': self.status.value,
             'model': self.model,
             'endpoint': self.endpoint,
             'dimensions': self.dimensions,
             'reachable': self.reachable,
             'native_width': self.native_width,
-            'served_models': list(self.served_models),
+            'model_served': self.model_served,
             'errors': [fault.as_status() for fault in self.faults],
-            'probed_at': self.probed_at,
+            'probed_at': self.probed_at.isoformat() if self.probed_at is not None else None,
         }
 
 
@@ -91,12 +108,26 @@ def _endpoint(embedder: EmbedderConfig) -> str | None:
     return provider.api_url if provider is not None else None
 
 
+def pending_result(embedder: EmbedderConfig) -> EmbedderProbeResult:
+    """The result reported before any probe of ``embedder`` has finished."""
+    return EmbedderProbeResult(
+        model=embedder.model,
+        endpoint=_endpoint(embedder),
+        dimensions=embedder.dimensions,
+        reachable=None,
+        model_served=None,
+        native_width=None,
+        faults=(),
+        probed_at=None,
+    )
+
+
 def _result(
     embedder: EmbedderConfig,
     *,
     reachable: bool | None,
     faults: list[EmbedderProbeFault],
-    served_models: tuple[str, ...] = (),
+    model_served: bool | None = None,
     native_width: int | None = None,
 ) -> EmbedderProbeResult:
     return EmbedderProbeResult(
@@ -104,10 +135,10 @@ def _result(
         endpoint=_endpoint(embedder),
         dimensions=embedder.dimensions,
         reachable=reachable,
-        served_models=served_models,
+        model_served=model_served,
         native_width=native_width,
         faults=tuple(faults),
-        probed_at=datetime.now(UTC).isoformat(),
+        probed_at=datetime.now(UTC),
     )
 
 
@@ -136,15 +167,16 @@ def probe_embedder_endpoint(
 
 def _measure(client: openai.OpenAI, embedder: EmbedderConfig) -> EmbedderProbeResult:
     faults: list[EmbedderProbeFault] = []
+    model_served = None
     try:
         served = tuple(model.id for model in client.models.list())
     except openai.APIConnectionError as exc:
         return _result(embedder, reachable=False, faults=[_unreachable(exc)])
     except openai.APIError as exc:
-        served = ()
         faults.append(_endpoint_error('GET /models', exc))
     else:
-        if embedder.model not in served:
+        model_served = embedder.model in served
+        if not model_served:
             faults.append(EmbedderProbeFault(
                 ProbeFaultKind.MODEL_NOT_SERVED, expected=embedder.model, observed=served,
                 detail='GET /models does not list the configured embedder.model',
@@ -157,7 +189,8 @@ def _measure(client: openai.OpenAI, embedder: EmbedderConfig) -> EmbedderProbeRe
         )
     except openai.APIConnectionError as exc:
         return _result(
-            embedder, reachable=False, faults=[*faults, _unreachable(exc)], served_models=served,
+            embedder, reachable=False, faults=[*faults, _unreachable(exc)],
+            model_served=model_served,
         )
     except openai.APIError as exc:
         faults.append(_endpoint_error('POST /embeddings', exc))
@@ -169,7 +202,8 @@ def _measure(client: openai.OpenAI, embedder: EmbedderConfig) -> EmbedderProbeRe
                 detail='POST /embeddings returned a vector of a width other than embedder.dimensions',
             ))
     return _result(
-        embedder, reachable=True, faults=faults, served_models=served, native_width=native_width,
+        embedder, reachable=True, faults=faults, model_served=model_served,
+        native_width=native_width,
     )
 
 
@@ -189,20 +223,54 @@ def _endpoint_error(request: str, exc: openai.APIError) -> EmbedderProbeFault:
 
 
 class EmbedderEndpointProbe:
-    """Runs the probe once in a worker thread and caches its result for get_status."""
+    """Probes in a worker thread and caches the result for get_status.
+
+    A degraded result is re-probed once it is ``reprobe_after_seconds`` old and
+    get_status reads it, so an endpoint that comes up after fused-memory is
+    reported ok without a restart. An ok result is never re-probed.
+    """
 
     def __init__(
-        self, embedder: EmbedderConfig, *, timeout_seconds: float = PROBE_TIMEOUT_SECONDS,
+        self,
+        embedder: EmbedderConfig,
+        *,
+        timeout_seconds: float = PROBE_TIMEOUT_SECONDS,
+        reprobe_after_seconds: float = REPROBE_DEGRADED_AFTER_SECONDS,
     ) -> None:
         self._embedder = embedder
         self._timeout_seconds = timeout_seconds
+        self._reprobe_after = timedelta(seconds=reprobe_after_seconds)
         self._task: asyncio.Task[EmbedderProbeResult] | None = None
-        self._result: EmbedderProbeResult | None = None
+        self._result = pending_result(embedder)
 
     def start(self) -> None:
         """Schedule the probe on the running loop without awaiting it; idempotent."""
-        if self._task is not None:
-            return
+        if self._task is None:
+            self._launch()
+
+    async def wait(self) -> EmbedderProbeResult:
+        """The cached result once the latest probe has finished."""
+        if self._task is None:
+            raise RuntimeError('EmbedderEndpointProbe.wait() called before start()')
+        await asyncio.wait({self._task})
+        return self._result
+
+    def status_block(self) -> dict[str, Any]:
+        if self._reprobe_due():
+            self._launch()
+        return self._result.as_status()
+
+    def _reprobe_due(self) -> bool:
+        probed_at = self._result.probed_at
+        return (
+            self._result.status is ProbeStatus.DEGRADED
+            and self._task is not None
+            and self._task.done()
+            and probed_at is not None
+            and datetime.now(UTC) - probed_at >= self._reprobe_after
+        )
+
+    def _launch(self) -> None:
         self._task = asyncio.create_task(
             asyncio.to_thread(
                 probe_embedder_endpoint, self._embedder, timeout_seconds=self._timeout_seconds,
@@ -210,28 +278,6 @@ class EmbedderEndpointProbe:
             name='embedder-endpoint-probe',
         )
         self._task.add_done_callback(self._record)
-
-    async def wait(self) -> EmbedderProbeResult | None:
-        """The finished result; None only if the probe task was cancelled."""
-        if self._task is None:
-            raise RuntimeError('EmbedderEndpointProbe.wait() called before start()')
-        await asyncio.wait({self._task})
-        return self._result
-
-    def status_block(self) -> dict[str, Any]:
-        if self._result is not None:
-            return self._result.as_status()
-        return {
-            'status': 'pending',
-            'model': self._embedder.model,
-            'endpoint': _endpoint(self._embedder),
-            'dimensions': self._embedder.dimensions,
-            'reachable': None,
-            'native_width': None,
-            'served_models': [],
-            'errors': [],
-            'probed_at': None,
-        }
 
     def _record(self, task: asyncio.Task[EmbedderProbeResult]) -> None:
         if task.cancelled():
