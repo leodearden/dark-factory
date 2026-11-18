@@ -7,6 +7,7 @@ so the two must agree word for word (INV-10).
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 import re
@@ -671,12 +672,22 @@ _LIVE_PAIR = LinkPair(
 _CREDENTIALED = {AGENT_CREDENTIAL_VAR: 'test-setup-token'}
 
 
-async def _live_edge_verdict(invoke: Invoke) -> LinkVerdict:
-    """The live pair's verdict; capacity skips and auth reds, per shared/tests/_capacity_skip.py."""
+async def _live_edge_verdict(invoke: Invoke, environ: Mapping[str, str]) -> LinkVerdict:
+    """The live pair's verdict; no setup token skips, capacity skips and auth reds.
+
+    The capacity and auth policy is shared/tests/_capacity_skip.py's.
+    """
+    token = environ.get(AGENT_CREDENTIAL_VAR)
+    if not token:
+        pytest.skip(
+            f'the live edge needs a Claude setup token in {AGENT_CREDENTIAL_VAR}, '
+            'not the ambient claude.ai login',
+        )
+    credentialed = functools.partial(invoke, oauth_token=token)
     results: list[AgentResult] = []
 
     async def recording(**kwargs: Any) -> AgentResult:
-        result = await invoke(**kwargs)
+        result = await credentialed(**kwargs)
         results.append(result)
         return result
 
