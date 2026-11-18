@@ -198,8 +198,9 @@ class TestBranchTipLanded:
 @pytest.fixture(autouse=True)
 def _unbound_merge_provenance() -> Iterator[None]:
     """No landed-outbox journal row leaks in: the sweep must decide from git alone."""
-    with patch.object(MergeProvenance, '_outbox', None):
-        yield
+    MergeProvenance._outbox = None
+    yield
+    MergeProvenance._outbox = None
 
 
 @pytest.fixture
