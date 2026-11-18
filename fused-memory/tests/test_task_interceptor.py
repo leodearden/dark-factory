@@ -15,6 +15,7 @@ import pytest_asyncio
 from _curator_helpers import (
     agent_result,
     answer_each_with,
+    curator_always,
     prepared,
     submit_as_one_batch,
     zot_agent_result,
@@ -134,7 +135,7 @@ def test_task_interceptor_has_no_add_task_method():
 
 @pytest.mark.asyncio
 async def test_submit_and_resolve_helper_returns_legacy_shape(
-    interceptor_facade,
+    make_curator_interceptor,
     taskmaster,
 ):
     """_submit_and_resolve returns the same dict shape the old add_task facade returned.
@@ -144,9 +145,11 @@ async def test_submit_and_resolve_helper_returns_legacy_shape(
     """
     from fused_memory.middleware.curator_types import CuratorDecision
 
-    # _mock_curator is defined later in the module; Python resolves at call-time.
-    interceptor_facade._curator = _mock_curator(CuratorDecision(action='create'))
-    result = await _submit_and_resolve(interceptor_facade, '/project', title='Test')
+    result = await _submit_and_resolve(
+        make_curator_interceptor(curator_always(CuratorDecision(action='create'))),
+        '/project',
+        title='Test',
+    )
     # taskmaster.add_task fixture returns {'id': '2', 'title': 'New Task'}
     assert 'id' in result, f'result missing id key: {result}'
     assert 'title' in result, f'result missing title key: {result}'
@@ -649,28 +652,9 @@ async def make_curator_interceptor(
                     await _wt
 
 
-@pytest.fixture
-def curator_interceptor(make_curator_interceptor):
-    return make_curator_interceptor()
-
-
-def _mock_curator(decision: CuratorDecision) -> MagicMock:
-    """Mock TaskCurator returning a fixed decision."""
-    curator = MagicMock()
-    # The per-candidate verdict, so assertions on curator.curate (e.g.
-    # assert_called_once) count the candidates the worker curated.
-    curator.curate = AsyncMock(return_value=decision)
-    answer_each_with(curator, curator.curate)
-    curator.record_task = AsyncMock()
-    curator.reembed_task = AsyncMock()
-    # note_created is a plain sync method on the real TaskCurator.
-    curator.note_created = MagicMock()
-    return curator
-
-
 @pytest.mark.asyncio
 async def test_curator_drop_short_circuits_add_task(
-    curator_interceptor,
+    make_curator_interceptor,
     taskmaster,
 ):
     """A drop decision returns the target_id without calling tm.add_task."""
@@ -679,7 +663,7 @@ async def test_curator_drop_short_circuits_add_task(
         target_id='99',
         justification='already covered by task 99',
     )
-    curator_interceptor._curator = _mock_curator(decision)
+    curator_interceptor = make_curator_interceptor(curator_always(decision))
 
     result = await _submit_and_resolve(
         curator_interceptor,
@@ -696,7 +680,7 @@ async def test_curator_drop_short_circuits_add_task(
 
 @pytest.mark.asyncio
 async def test_curator_combine_updates_target_and_returns_id(
-    curator_interceptor,
+    make_curator_interceptor,
     taskmaster,
 ):
     """A combine decision updates the target via update_task and returns its id."""
@@ -714,7 +698,7 @@ async def test_curator_combine_updates_target_and_returns_id(
         rewritten_task=rewritten,
         justification='same root cause as task 50',
     )
-    curator_interceptor._curator = _mock_curator(decision)
+    curator_interceptor = make_curator_interceptor(curator_always(decision))
 
     result = await _submit_and_resolve(
         curator_interceptor,
@@ -758,12 +742,12 @@ async def test_curator_combine_updates_target_and_returns_id(
 
 @pytest.mark.asyncio
 async def test_curator_create_proceeds_with_add_task(
-    curator_interceptor,
+    make_curator_interceptor,
     taskmaster,
 ):
     """A create decision forwards to tm.add_task normally."""
     decision = CuratorDecision(action='create', justification='genuinely new')
-    curator_interceptor._curator = _mock_curator(decision)
+    curator_interceptor = make_curator_interceptor(curator_always(decision))
 
     result = await _submit_and_resolve(
         curator_interceptor,
@@ -777,7 +761,7 @@ async def test_curator_create_proceeds_with_add_task(
 
 @pytest.mark.asyncio
 async def test_curator_combine_failure_falls_through_to_create(
-    curator_interceptor,
+    make_curator_interceptor,
     taskmaster,
 ):
     """If tm.update_task raises during combine, fall back to creating the task."""
@@ -795,7 +779,7 @@ async def test_curator_combine_failure_falls_through_to_create(
         rewritten_task=rewritten,
         justification='...',
     )
-    curator_interceptor._curator = _mock_curator(decision)
+    curator_interceptor = make_curator_interceptor(curator_always(decision))
     taskmaster.update_task.side_effect = RuntimeError('taskmaster failed')
 
     result = await _submit_and_resolve(
@@ -847,7 +831,7 @@ def audit_dir(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_curator_combine_fingerprint_match_proceeds(
-    curator_interceptor,
+    make_curator_interceptor,
     taskmaster,
     audit_dir,
 ):
@@ -867,7 +851,7 @@ async def test_curator_combine_fingerprint_match_proceeds(
         rewritten_task=rewritten,
         justification='same concern',
     )
-    curator_interceptor._curator = _mock_curator(decision)
+    curator_interceptor = make_curator_interceptor(curator_always(decision))
 
     result = await _submit_and_resolve(curator_interceptor, '/project', title='candidate')
 
@@ -887,7 +871,7 @@ async def test_curator_combine_fingerprint_match_proceeds(
 
 @pytest.mark.asyncio
 async def test_curator_combine_fingerprint_mismatch_aborts(
-    curator_interceptor,
+    make_curator_interceptor,
     taskmaster,
     audit_dir,
 ):
@@ -906,7 +890,7 @@ async def test_curator_combine_fingerprint_mismatch_aborts(
         rewritten_task=rewritten,
         justification='...',
     )
-    curator_interceptor._curator = _mock_curator(decision)
+    curator_interceptor = make_curator_interceptor(curator_always(decision))
 
     result = await _submit_and_resolve(curator_interceptor, '/project', title='Fix x')
 
@@ -919,7 +903,7 @@ async def test_curator_combine_fingerprint_mismatch_aborts(
 
 @pytest.mark.asyncio
 async def test_curator_combine_missing_fingerprint_aborts(
-    curator_interceptor,
+    make_curator_interceptor,
     taskmaster,
     audit_dir,
 ):
@@ -938,7 +922,7 @@ async def test_curator_combine_missing_fingerprint_aborts(
         rewritten_task=rewritten,
         justification='...',
     )
-    curator_interceptor._curator = _mock_curator(decision)
+    curator_interceptor = make_curator_interceptor(curator_always(decision))
 
     result = await _submit_and_resolve(curator_interceptor, '/project', title='Fix x')
 
@@ -949,7 +933,7 @@ async def test_curator_combine_missing_fingerprint_aborts(
 
 @pytest.mark.asyncio
 async def test_curator_combine_target_done_aborts(
-    curator_interceptor,
+    make_curator_interceptor,
     taskmaster,
     audit_dir,
 ):
@@ -980,7 +964,7 @@ async def test_curator_combine_target_done_aborts(
         rewritten_task=rewritten,
         justification='...',
     )
-    curator_interceptor._curator = _mock_curator(decision)
+    curator_interceptor = make_curator_interceptor(curator_always(decision))
 
     result = await _submit_and_resolve(curator_interceptor, '/project', title='Fix x')
 
@@ -994,7 +978,7 @@ async def test_curator_combine_target_done_aborts(
 
 @pytest.mark.asyncio
 async def test_curator_combine_target_cancelled_aborts(
-    curator_interceptor,
+    make_curator_interceptor,
     taskmaster,
     audit_dir,
 ):
@@ -1024,7 +1008,7 @@ async def test_curator_combine_target_cancelled_aborts(
         rewritten_task=rewritten,
         justification='...',
     )
-    curator_interceptor._curator = _mock_curator(decision)
+    curator_interceptor = make_curator_interceptor(curator_always(decision))
 
     result = await _submit_and_resolve(curator_interceptor, '/project', title='Fix x')
 
@@ -1038,7 +1022,7 @@ async def test_curator_combine_target_cancelled_aborts(
 
 @pytest.mark.asyncio
 async def test_curator_combine_target_in_progress_aborts(
-    curator_interceptor,
+    make_curator_interceptor,
     taskmaster,
     audit_dir,
 ):
@@ -1076,7 +1060,7 @@ async def test_curator_combine_target_in_progress_aborts(
         rewritten_task=rewritten,
         justification='...',
     )
-    curator_interceptor._curator = _mock_curator(decision)
+    curator_interceptor = make_curator_interceptor(curator_always(decision))
 
     result = await _submit_and_resolve(curator_interceptor, '/project', title='Fix x')
 
@@ -1089,7 +1073,7 @@ async def test_curator_combine_target_in_progress_aborts(
 
 @pytest.mark.asyncio
 async def test_curator_combine_target_blocked_aborts(
-    curator_interceptor,
+    make_curator_interceptor,
     taskmaster,
     audit_dir,
 ):
@@ -1122,7 +1106,7 @@ async def test_curator_combine_target_blocked_aborts(
         rewritten_task=rewritten,
         justification='...',
     )
-    curator_interceptor._curator = _mock_curator(decision)
+    curator_interceptor = make_curator_interceptor(curator_always(decision))
 
     result = await _submit_and_resolve(curator_interceptor, '/project', title='Fix x')
 
@@ -1138,7 +1122,7 @@ async def test_curator_combine_target_blocked_aborts(
 @pytest.mark.asyncio
 @pytest.mark.parametrize('status', list(TaskStatus))
 async def test_curator_combine_execution_matches_shared_predicate(
-    curator_interceptor,
+    make_curator_interceptor,
     taskmaster,
     audit_dir,
     status: TaskStatus,
@@ -1178,7 +1162,7 @@ async def test_curator_combine_execution_matches_shared_predicate(
         rewritten_task=rewritten,
         justification='same concern',
     )
-    curator_interceptor._curator = _mock_curator(decision)
+    curator_interceptor = make_curator_interceptor(curator_always(decision))
 
     await _submit_and_resolve(curator_interceptor, '/project', title='candidate')
 
@@ -1194,7 +1178,7 @@ async def test_curator_combine_execution_matches_shared_predicate(
 
 @pytest.mark.asyncio
 async def test_curator_combine_not_pending_wins_over_claimed(
-    curator_interceptor,
+    make_curator_interceptor,
     taskmaster,
     audit_dir,
 ):
@@ -1229,7 +1213,7 @@ async def test_curator_combine_not_pending_wins_over_claimed(
         rewritten_task=rewritten,
         justification='...',
     )
-    curator_interceptor._curator = _mock_curator(decision)
+    curator_interceptor = make_curator_interceptor(curator_always(decision))
 
     result = await _submit_and_resolve(curator_interceptor, '/project', title='Fix x')
 
@@ -1243,7 +1227,7 @@ async def test_curator_combine_not_pending_wins_over_claimed(
 
 @pytest.mark.asyncio
 async def test_curator_combine_target_pending_unclaimed_proceeds(
-    curator_interceptor,
+    make_curator_interceptor,
     taskmaster,
     audit_dir,
 ):
@@ -1274,7 +1258,7 @@ async def test_curator_combine_target_pending_unclaimed_proceeds(
         rewritten_task=rewritten,
         justification='same concern',
     )
-    curator_interceptor._curator = _mock_curator(decision)
+    curator_interceptor = make_curator_interceptor(curator_always(decision))
 
     result = await _submit_and_resolve(curator_interceptor, '/project', title='candidate')
 
@@ -1285,7 +1269,7 @@ async def test_curator_combine_target_pending_unclaimed_proceeds(
 
 @pytest.mark.asyncio
 async def test_curator_combine_claimed_pending_target_aborts(
-    curator_interceptor,
+    make_curator_interceptor,
     taskmaster,
     audit_dir,
 ):
@@ -1319,7 +1303,7 @@ async def test_curator_combine_claimed_pending_target_aborts(
         rewritten_task=rewritten,
         justification='...',
     )
-    curator_interceptor._curator = _mock_curator(decision)
+    curator_interceptor = make_curator_interceptor(curator_always(decision))
 
     result = await _submit_and_resolve(curator_interceptor, '/project', title='Fix x')
 
@@ -1329,7 +1313,7 @@ async def test_curator_combine_claimed_pending_target_aborts(
 
 @pytest.mark.asyncio
 async def test_curator_combine_blank_claimant_is_unclaimed(
-    curator_interceptor,
+    make_curator_interceptor,
     taskmaster,
     audit_dir,
 ):
@@ -1362,7 +1346,7 @@ async def test_curator_combine_blank_claimant_is_unclaimed(
         rewritten_task=rewritten,
         justification='same concern',
     )
-    curator_interceptor._curator = _mock_curator(decision)
+    curator_interceptor = make_curator_interceptor(curator_always(decision))
 
     result = await _submit_and_resolve(curator_interceptor, '/project', title='candidate')
 
@@ -1372,7 +1356,7 @@ async def test_curator_combine_blank_claimant_is_unclaimed(
 
 @pytest.mark.asyncio
 async def test_curator_combine_absent_claimant_key_proceeds(
-    curator_interceptor,
+    make_curator_interceptor,
     taskmaster,
     audit_dir,
 ):
@@ -1403,7 +1387,7 @@ async def test_curator_combine_absent_claimant_key_proceeds(
         rewritten_task=rewritten,
         justification='same concern',
     )
-    curator_interceptor._curator = _mock_curator(decision)
+    curator_interceptor = make_curator_interceptor(curator_always(decision))
 
     result = await _submit_and_resolve(curator_interceptor, '/project', title='candidate')
 
@@ -1413,7 +1397,7 @@ async def test_curator_combine_absent_claimant_key_proceeds(
 
 @pytest.mark.asyncio
 async def test_curator_combine_refusal_records_not_pending_reason(
-    curator_interceptor,
+    make_curator_interceptor,
     taskmaster,
     audit_dir,
 ):
@@ -1445,7 +1429,7 @@ async def test_curator_combine_refusal_records_not_pending_reason(
         rewritten_task=rewritten,
         justification='...',
     )
-    curator_interceptor._curator = _mock_curator(decision)
+    curator_interceptor = make_curator_interceptor(curator_always(decision))
 
     await _submit_and_resolve(curator_interceptor, '/project', title='Fix x')
 
@@ -1459,7 +1443,7 @@ async def test_curator_combine_refusal_records_not_pending_reason(
 
 @pytest.mark.asyncio
 async def test_curator_combine_refusal_records_claimed_reason(
-    curator_interceptor,
+    make_curator_interceptor,
     taskmaster,
     audit_dir,
 ):
@@ -1490,7 +1474,7 @@ async def test_curator_combine_refusal_records_claimed_reason(
         rewritten_task=rewritten,
         justification='...',
     )
-    curator_interceptor._curator = _mock_curator(decision)
+    curator_interceptor = make_curator_interceptor(curator_always(decision))
 
     await _submit_and_resolve(curator_interceptor, '/project', title='Fix x')
 
@@ -1528,7 +1512,7 @@ def _combine_into_target_50() -> CuratorDecision:
     ids=['dict', 'json-string'],
 )
 async def test_curator_combine_target_with_branch_base_sha_refuses(
-    curator_interceptor,
+    make_curator_interceptor,
     taskmaster,
     audit_dir,
     caplog,
@@ -1548,7 +1532,7 @@ async def test_curator_combine_target_with_branch_base_sha_refuses(
             'metadata': target_metadata,
         }
     )
-    curator_interceptor._curator = _mock_curator(_combine_into_target_50())
+    curator_interceptor = make_curator_interceptor(curator_always(_combine_into_target_50()))
 
     with caplog.at_level(logging.WARNING, logger='fused_memory.middleware.task_interceptor'):
         result = await _submit_and_resolve(curator_interceptor, '/project', title='candidate')
@@ -1599,7 +1583,7 @@ async def test_curator_combine_target_with_branch_base_sha_refuses(
     ],
 )
 async def test_curator_combine_blank_or_unreadable_branch_base_sha_still_combines(
-    curator_interceptor,
+    make_curator_interceptor,
     taskmaster,
     audit_dir,
     target_extra,
@@ -1608,7 +1592,7 @@ async def test_curator_combine_blank_or_unreadable_branch_base_sha_still_combine
     taskmaster.get_task = AsyncMock(
         return_value={'id': '50', 'status': 'pending', 'title': 'Test Task', **target_extra}
     )
-    curator_interceptor._curator = _mock_curator(_combine_into_target_50())
+    curator_interceptor = make_curator_interceptor(curator_always(_combine_into_target_50()))
 
     result = await _submit_and_resolve(curator_interceptor, '/project', title='candidate')
 
@@ -1630,7 +1614,7 @@ async def test_curator_combine_blank_or_unreadable_branch_base_sha_still_combine
     ids=['not-pending-wins', 'claimed-wins'],
 )
 async def test_curator_combine_branch_refusal_does_not_reclassify_existing_refusals(
-    curator_interceptor,
+    make_curator_interceptor,
     taskmaster,
     audit_dir,
     status,
@@ -1647,7 +1631,7 @@ async def test_curator_combine_branch_refusal_does_not_reclassify_existing_refus
             'metadata': {'branch_base_sha': 'a' * 40},
         }
     )
-    curator_interceptor._curator = _mock_curator(_combine_into_target_50())
+    curator_interceptor = make_curator_interceptor(curator_always(_combine_into_target_50()))
 
     await _submit_and_resolve(curator_interceptor, '/project', title='candidate')
 
@@ -1659,7 +1643,7 @@ async def test_curator_combine_branch_refusal_does_not_reclassify_existing_refus
 
 @pytest.mark.asyncio
 async def test_curator_combine_success_record_carries_no_refused_reason(
-    curator_interceptor,
+    make_curator_interceptor,
     taskmaster,
     audit_dir,
 ):
@@ -1683,7 +1667,7 @@ async def test_curator_combine_success_record_carries_no_refused_reason(
         rewritten_task=rewritten,
         justification='same concern',
     )
-    curator_interceptor._curator = _mock_curator(decision)
+    curator_interceptor = make_curator_interceptor(curator_always(decision))
 
     result = await _submit_and_resolve(curator_interceptor, '/project', title='candidate')
 
@@ -1695,7 +1679,7 @@ async def test_curator_combine_success_record_carries_no_refused_reason(
 
 @pytest.mark.asyncio
 async def test_curator_combine_fingerprint_normalization(
-    curator_interceptor,
+    make_curator_interceptor,
     taskmaster,
     audit_dir,
 ):
@@ -1722,7 +1706,7 @@ async def test_curator_combine_fingerprint_normalization(
         rewritten_task=rewritten,
         justification='normalize',
     )
-    curator_interceptor._curator = _mock_curator(decision)
+    curator_interceptor = make_curator_interceptor(curator_always(decision))
 
     result = await _submit_and_resolve(curator_interceptor, '/project', title='c')
 
@@ -1801,7 +1785,7 @@ def _combine_decision(justification: str, *, fingerprint: str = 'Test Task') -> 
 
 @pytest.mark.asyncio
 async def test_curator_combine_preserves_target_gate_markers(
-    curator_interceptor,
+    make_curator_interceptor,
     taskmaster,
     audit_dir,
 ):
@@ -1825,7 +1809,9 @@ async def test_curator_combine_preserves_target_gate_markers(
         }
     )
     recorded = _record_merged_metadata(taskmaster, existing_raw)
-    curator_interceptor._curator = _mock_curator(_combine_decision('same human gate'))
+    curator_interceptor = make_curator_interceptor(
+        curator_always(_combine_decision('same human gate')),
+    )
 
     result = await _submit_and_resolve(curator_interceptor, '/project', title='dup gate')
 
@@ -1844,7 +1830,7 @@ async def test_curator_combine_preserves_target_gate_markers(
 
 @pytest.mark.asyncio
 async def test_curator_combine_uses_merge_not_replace(
-    curator_interceptor,
+    make_curator_interceptor,
     taskmaster,
     audit_dir,
 ):
@@ -1854,7 +1840,7 @@ async def test_curator_combine_uses_merge_not_replace(
     exact call site if the mode is ever reverted, without needing a gated
     target to reproduce the loss.
     """
-    curator_interceptor._curator = _mock_curator(_combine_decision('mode pin'))
+    curator_interceptor = make_curator_interceptor(curator_always(_combine_decision('mode pin')))
 
     result = await _submit_and_resolve(curator_interceptor, '/project', title='dup')
 
@@ -1872,7 +1858,7 @@ async def test_curator_combine_uses_merge_not_replace(
 
 @pytest.mark.asyncio
 async def test_curator_combine_corrupt_target_metadata_aborts(
-    curator_interceptor,
+    make_curator_interceptor,
     taskmaster,
     audit_dir,
     caplog,
@@ -1910,7 +1896,9 @@ async def test_curator_combine_corrupt_target_metadata_aborts(
         return {'success': True}
 
     taskmaster.update_task = AsyncMock(side_effect=_update)
-    curator_interceptor._curator = _mock_curator(_combine_decision('corrupt target'))
+    curator_interceptor = make_curator_interceptor(
+        curator_always(_combine_decision('corrupt target')),
+    )
 
     with caplog.at_level(logging.WARNING):
         result = await _submit_and_resolve(curator_interceptor, '/project', title='dup')
@@ -1957,7 +1945,7 @@ def _set_target(taskmaster, metadata=None, *, status: str = 'pending') -> str | 
 
 @pytest.mark.asyncio
 async def test_curator_combine_refuses_gated_candidate_into_ungated_target(
-    curator_interceptor,
+    make_curator_interceptor,
     taskmaster,
     audit_dir,
     caplog,
@@ -1972,7 +1960,9 @@ async def test_curator_combine_refuses_gated_candidate_into_ungated_target(
     the correct conservative outcome for a duplicate human gate.
     """
     _set_target(taskmaster, None)
-    curator_interceptor._curator = _mock_curator(_combine_decision('looks like a dup'))
+    curator_interceptor = make_curator_interceptor(
+        curator_always(_combine_decision('looks like a dup')),
+    )
 
     with caplog.at_level(logging.WARNING):
         result = await _submit_and_resolve(
@@ -2005,13 +1995,15 @@ async def test_curator_combine_refuses_gated_candidate_into_ungated_target(
 
 @pytest.mark.asyncio
 async def test_curator_combine_allows_gated_candidate_into_gated_target(
-    curator_interceptor,
+    make_curator_interceptor,
     taskmaster,
     audit_dir,
 ):
     """Gate-into-gate is legitimate dedup — the guard must not refuse it."""
     _set_target(taskmaster, {'task_kind': 'deterministic', 'always_escalates': True})
-    curator_interceptor._curator = _mock_curator(_combine_decision('same gate, dedup'))
+    curator_interceptor = make_curator_interceptor(
+        curator_always(_combine_decision('same gate, dedup')),
+    )
 
     result = await _submit_and_resolve(
         curator_interceptor,
@@ -2027,7 +2019,7 @@ async def test_curator_combine_allows_gated_candidate_into_gated_target(
 
 @pytest.mark.asyncio
 async def test_curator_combine_allows_ungated_candidate_into_gated_target(
-    curator_interceptor,
+    make_curator_interceptor,
     taskmaster,
     audit_dir,
 ):
@@ -2040,7 +2032,9 @@ async def test_curator_combine_allows_ungated_candidate_into_gated_target(
     # the gate semantics under test here are independent of status.
     existing_raw = _set_target(taskmaster, _GATE_TARGET_METADATA)
     recorded = _record_merged_metadata(taskmaster, existing_raw)
-    curator_interceptor._curator = _mock_curator(_combine_decision('folds into the gate'))
+    curator_interceptor = make_curator_interceptor(
+        curator_always(_combine_decision('folds into the gate')),
+    )
 
     result = await _submit_and_resolve(curator_interceptor, '/project', title='ordinary dup')
 
@@ -2051,7 +2045,7 @@ async def test_curator_combine_allows_ungated_candidate_into_gated_target(
 
 @pytest.mark.asyncio
 async def test_curator_combine_gate_predicate_ignores_malformed_metadata(
-    curator_interceptor,
+    make_curator_interceptor,
     taskmaster,
     audit_dir,
 ):
@@ -2062,7 +2056,9 @@ async def test_curator_combine_gate_predicate_ignores_malformed_metadata(
     than turning a malformed blob into a hard failure of the combine path.
     """
     _set_target(taskmaster, None)
-    curator_interceptor._curator = _mock_curator(_combine_decision('malformed candidate'))
+    curator_interceptor = make_curator_interceptor(
+        curator_always(_combine_decision('malformed candidate')),
+    )
 
     result = await _submit_and_resolve(
         curator_interceptor,
@@ -2082,7 +2078,7 @@ async def test_curator_combine_gate_predicate_ignores_malformed_metadata(
     ids=['corrupt-json', 'falsy-list', 'falsy-int', 'falsy-bool'],
 )
 async def test_curator_combine_refusal_names_an_unreadable_target_blob(
-    curator_interceptor,
+    make_curator_interceptor,
     taskmaster,
     audit_dir,
     caplog,
@@ -2105,7 +2101,9 @@ async def test_curator_combine_refusal_names_an_unreadable_target_blob(
     # _set_target json.dumps() whatever it is given; overwrite with a raw
     # value coerce_task_metadata classifies as present-but-unreadable.
     taskmaster.get_task.return_value['metadata'] = raw_target_metadata
-    curator_interceptor._curator = _mock_curator(_combine_decision('unreadable target'))
+    curator_interceptor = make_curator_interceptor(
+        curator_always(_combine_decision('unreadable target')),
+    )
 
     with caplog.at_level(logging.WARNING):
         result = await _submit_and_resolve(
@@ -2215,12 +2213,12 @@ async def test_concurrent_add_task_produces_single_task(
 
 
 @pytest.mark.asyncio
-async def test_note_created_is_called_inside_lock(curator_interceptor, taskmaster):
+async def test_note_created_is_called_inside_lock(make_curator_interceptor, taskmaster):
     """Sanity check: note_created fires on a real create so the next
     waiter's pre-LLM check can see it."""
     decision = CuratorDecision(action='create', justification='novel')
-    curator_mock = _mock_curator(decision)
-    curator_interceptor._curator = curator_mock
+    curator_mock = curator_always(decision)
+    curator_interceptor = make_curator_interceptor(curator_mock)
 
     await _submit_and_resolve(curator_interceptor, '/project', title='Fresh work')
 
@@ -2310,13 +2308,13 @@ _REEMBED_STORED_FILES = {'files': ['src/parser.py', 'tests/test_parser.py']}
     ids=['dict', 'json-string'],
 )
 async def test_update_task_reembed_preserves_metadata_files(
-    curator_interceptor,
+    make_curator_interceptor,
     taskmaster,
     stored_metadata,
 ):
     """The update re-embed carries the stored task's metadata.files and priority."""
-    curator_mock = _mock_curator(CuratorDecision(action='create'))
-    curator_interceptor._curator = curator_mock
+    curator_mock = curator_always(CuratorDecision(action='create'))
+    curator_interceptor = make_curator_interceptor(curator_mock)
     taskmaster.get_task.return_value = {
         'id': '7',
         'status': 'pending',
@@ -2346,12 +2344,12 @@ async def test_update_task_reembed_preserves_metadata_files(
 
 @pytest.mark.asyncio
 async def test_update_task_reembed_skips_blank_stored_title(
-    curator_interceptor,
+    make_curator_interceptor,
     taskmaster,
 ):
     """A stored task whose title is only whitespace is not re-embedded."""
-    curator_mock = _mock_curator(CuratorDecision(action='create'))
-    curator_interceptor._curator = curator_mock
+    curator_mock = curator_always(CuratorDecision(action='create'))
+    curator_interceptor = make_curator_interceptor(curator_mock)
     taskmaster.get_task.return_value = {
         'id': '7',
         'status': 'pending',
@@ -11865,10 +11863,10 @@ async def test_submit_task_returns_the_fixture_payload(
 
 
 @pytest.mark.asyncio
-async def test_index_committed_tasks_records_each_task(curator_interceptor):
+async def test_index_committed_tasks_records_each_task(make_curator_interceptor):
     """Each get_task-shaped dict is turned into a CandidateTask and recorded once."""
-    curator_mock = _mock_curator(CuratorDecision(action='create'))
-    curator_interceptor._curator = curator_mock
+    curator_mock = curator_always(CuratorDecision(action='create'))
+    curator_interceptor = make_curator_interceptor(curator_mock)
 
     t1 = {
         'id': 1,
@@ -11904,14 +11902,14 @@ async def test_index_committed_tasks_records_each_task(curator_interceptor):
 
 
 @pytest.mark.asyncio
-async def test_index_committed_tasks_skips_title_less_task(curator_interceptor):
+async def test_index_committed_tasks_skips_title_less_task(make_curator_interceptor):
     """A task dict without a title is skipped — no record_task call for it.
 
     The curator cannot judge/embed a candidate it cannot read a title from
     (mirrors _build_candidate's None-return contract for title-less kwargs).
     """
-    curator_mock = _mock_curator(CuratorDecision(action='create'))
-    curator_interceptor._curator = curator_mock
+    curator_mock = curator_always(CuratorDecision(action='create'))
+    curator_interceptor = make_curator_interceptor(curator_mock)
 
     good = {'id': 1, 'title': 'Has a title', 'metadata': {}}
     bad = {'id': 2, 'title': '', 'metadata': {}}
@@ -11940,12 +11938,12 @@ async def test_index_committed_tasks_noop_when_curator_disabled(interceptor):
 
 @pytest.mark.asyncio
 async def test_index_committed_tasks_per_task_failure_does_not_abort_batch(
-    curator_interceptor,
+    make_curator_interceptor,
 ):
     """A record_task failure for one task must not prevent the others in the
     same batch from being recorded, and the method itself never raises."""
-    curator_mock = _mock_curator(CuratorDecision(action='create'))
-    curator_interceptor._curator = curator_mock
+    curator_mock = curator_always(CuratorDecision(action='create'))
+    curator_interceptor = make_curator_interceptor(curator_mock)
 
     attempted: list[str] = []
 
@@ -11969,8 +11967,8 @@ async def test_index_committed_tasks_per_task_failure_does_not_abort_batch(
 # commit_planning -> search_tasks acceptance (task 2562 item 1, step-3)
 #
 # Drives the REAL commit_planning + search_tasks MCP tools (not the bare
-# interceptor method exercised above) over the real curator_interceptor
-# with an injected fake in-memory curator, proving the write-time
+# interceptor method exercised above) over a real curator-enabled
+# interceptor built around a fake in-memory curator, proving the write-time
 # indexing seam end-to-end through the actual tool wiring commit_planning
 # uses in production.
 # ─────────────────────────────────────────────────────────────────────
@@ -12046,7 +12044,7 @@ def _committed_task_get_task_side_effect(titles: dict[str, str]):
 
 @pytest.mark.asyncio
 async def test_commit_planning_pending_indexes_batch_findable_via_search_tasks(
-    curator_interceptor, taskmaster, monkeypatch,
+    make_curator_interceptor, taskmaster, monkeypatch,
 ):
     """Acceptance: committing a planning_mode batch to 'pending' makes it
     immediately findable via search_tasks — the regression this task fixes
@@ -12061,7 +12059,7 @@ async def test_commit_planning_pending_indexes_batch_findable_via_search_tasks(
     )
 
     fake_curator = _FakeCorpusCurator()
-    curator_interceptor._curator = fake_curator
+    curator_interceptor = make_curator_interceptor(fake_curator)
 
     taskmaster.get_task = AsyncMock(
         side_effect=_committed_task_get_task_side_effect(
@@ -12092,7 +12090,7 @@ async def test_commit_planning_pending_indexes_batch_findable_via_search_tasks(
 
 @pytest.mark.asyncio
 async def test_commit_planning_cancelled_does_not_index(
-    curator_interceptor, taskmaster, monkeypatch,
+    make_curator_interceptor, taskmaster, monkeypatch,
 ):
     """Negative: a batch committed with target_status='cancelled' is never
     indexed — abandoned/discarded planning batches must not pollute the
@@ -12106,7 +12104,7 @@ async def test_commit_planning_cancelled_does_not_index(
     )
 
     fake_curator = _FakeCorpusCurator()
-    curator_interceptor._curator = fake_curator
+    curator_interceptor = make_curator_interceptor(fake_curator)
 
     taskmaster.get_task = AsyncMock(
         side_effect=_committed_task_get_task_side_effect(
@@ -14499,7 +14497,7 @@ def _premise_refuted_refusal() -> CuratorDecision:
     ids=['blocklist', 'premise-refuted'],
 )
 async def test_refused_ticket_creates_no_task_end_to_end(
-    curator_interceptor, taskmaster, decision_factory, expected_marker,
+    make_curator_interceptor, taskmaster, decision_factory, expected_marker,
 ):
     """THE USER-OBSERVABLE SIGNAL. A candidate refused by a deterministic guard
     must resolve as refused with NO task created and NO task_id — through the
@@ -14509,7 +14507,7 @@ async def test_refused_ticket_creates_no_task_end_to_end(
     guard's refusal was INERT, so the candidate it named was filed anyway.
     """
     decision = decision_factory()
-    curator_interceptor._curator = _mock_curator(decision)
+    curator_interceptor = make_curator_interceptor(curator_always(decision))
 
     submit_result = await curator_interceptor.submit_task(
         '/project',
@@ -14542,7 +14540,7 @@ async def test_batch_sibling_pointing_at_refused_candidate_degrades_to_create(
     at a refused candidate sees task_id=None and must fail OPEN to create —
     refusing one candidate cannot silently discard an unrelated one."""
     refusal = _blocklisted_refusal()
-    mock_curator = _mock_curator(refusal)
+    mock_curator = curator_always(refusal)
     mock_curator.curate_prepared = AsyncMock(return_value=[
         refusal,
         CuratorDecision(
