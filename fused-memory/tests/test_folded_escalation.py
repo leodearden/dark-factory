@@ -25,6 +25,7 @@ import ast
 import asyncio
 import importlib
 import importlib.util
+import inspect
 import json
 import logging
 from collections.abc import Callable
@@ -921,17 +922,39 @@ def _imports_the_helper(tree: ast.AST, package: str) -> bool:
     )
 
 
+def _production_modules_where(predicate: Callable[[ast.AST, str], bool]) -> set[str]:
+    """The dotted name of every production module whose parsed source, read
+    in its own package, satisfies *predicate*."""
+    found: set[str] = set()
+    for path in sorted(_SRC_ROOT.rglob('*.py')):
+        package = path.parent.relative_to(_SRC_ROOT.parent).as_posix().replace('/', '.')
+        if predicate(parse_python_module(path), package):
+            found.add(package if path.stem == '__init__' else f'{package}.{path.stem}')
+    return found
+
+
 def _modules_that_call_the_helper() -> set[str]:
     """The dotted name of every production module that imports the helper.
 
     Over PARSED imports, so prose that merely names the helper cannot count.
     """
-    found: set[str] = set()
-    for path in sorted(_SRC_ROOT.rglob('*.py')):
-        package = path.parent.relative_to(_SRC_ROOT.parent).as_posix().replace('/', '.')
-        if _imports_the_helper(parse_python_module(path), package):
-            found.add(package if path.stem == '__init__' else f'{package}.{path.stem}')
-    return found
+    return _production_modules_where(_imports_the_helper)
+
+
+_QUEUE_DIR_RESOLVER = f'{escalation_queue_dir.__module__}.{escalation_queue_dir.__name__}'
+
+
+def _reaches_the_project_queue(tree: ast.AST, package: str) -> bool:
+    """Whether *tree* imports either route to `<project_root>/data/escalations`:
+    the layout's queue resolver, or the helper that calls it."""
+    return (
+        _QUEUE_DIR_RESOLVER in _imported_targets(tree, package)
+        or _imports_the_helper(tree, package)
+    )
+
+
+def _modules_that_reach_the_project_queue() -> set[str]:
+    return _production_modules_where(_reaches_the_project_queue)
 
 
 def _forwarded_kwargs(filer: _Filer, tmp_path, monkeypatch) -> dict:
@@ -1235,6 +1258,42 @@ _DELIBERATE_ALIASES: tuple[tuple[str, str], ...] = (
 )
 
 
+def _modules_the_sweep_reads() -> set[str]:
+    """The homes `_anchors_read_from_their_own_homes` imports its anchors from,
+    read off its own source so the sweep's membership has one copy."""
+    tree = ast.parse(inspect.getsource(_anchors_read_from_their_own_homes))
+    return {
+        node.module for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.module
+    }
+
+
+#: The modules that reach `<project_root>/data/escalations` but file no anchor
+#: another filer could squat, each with its reason. The census keys on
+#: `escalation_queue_dir` and the `_folded_escalation` helper, the only two
+#: routes to that queue in fused-memory/src. Filers that write only the
+#: reconciliation queue (`config.escalation_queue_dir`) are out of scope: an
+#: anchor on a different queue cannot squat one on this queue.
+_QUEUE_FILERS_OUTSIDE_THE_SWEEP: dict[str, str] = {
+    'fused_memory.middleware._folded_escalation':
+        'the helper itself; every caller passes its own anchor and is swept '
+        'by that constant',
+    'fused_memory.reconciliation.reconciler_escalation':
+        "files under the real task id its caller passes (targeted.py's "
+        'orphaned-descendant and verification-contradicted L1s)',
+    'fused_memory.reconciliation.harness':
+        'its project-queue filer, `_file_finding_task_escalation`, files under '
+        "the finding's real task id; the synthetic `recon-<run_id>` records of "
+        '`_escalate` go to the reconciliation queue, a different store',
+    'fused_memory.reconciliation.backlog_policy':
+        'files `task_id=None` and folds on a content fingerprint, so there is '
+        'no anchor to squat',
+    'fused_memory.reconciliation.bulk_reset_guard':
+        'writes `task_id=None` records under a timestamped id and rate-limits '
+        'in memory, so there is no anchor to squat',
+}
+
+
 class TestNoTwoFilersShareAnAnchor:
     """A SQUATTED anchor is suppressed indefinitely, and reads as calm.
 
@@ -1312,14 +1371,46 @@ class TestNoTwoFilersShareAnAnchor:
             'link_heal run-report',
             'curator_escalator',
             'ticket_janitor curator-bucket',
+            'dead_letter_escalator',
         ):
             assert required in anchors, (
                 f'{required!r} files into the same queue but is absent from '
                 'the anchor sweep'
             )
-        assert len(anchors) >= 25, (
+        assert len(anchors) >= 35, (
             f'the sweep shrank to {len(anchors)} entries; a filer was dropped '
             'rather than renamed'
+        )
+
+    def test_every_module_that_reaches_the_queue_is_swept_or_excluded(self) -> None:
+        """Anti-vacuity against the source tree, not a hand-written list: a
+        new filer on the queue fails here until it is classified."""
+        found = _modules_that_reach_the_project_queue()
+        swept = _modules_the_sweep_reads()
+        excluded = set(_QUEUE_FILERS_OUTSIDE_THE_SWEEP)
+        assert 'fused_memory.middleware.curator_escalator' in found, (
+            f'the queue census found {sorted(found)!r}; it is reading the wrong '
+            'tree or the import shape changed, and would pass vacuously'
+        )
+        assert 'fused_memory.server.write_triage' in swept, (
+            f'the sweep reads {sorted(swept)!r}; its imports could not be read, '
+            'and the census would pass vacuously'
+        )
+
+        unclassified = found - swept - excluded
+        assert not unclassified, (
+            f'{sorted(unclassified)!r} file into <project_root>/data/escalations '
+            'but are neither swept nor excluded. Add each one\'s anchor to '
+            '_anchors_read_from_their_own_homes, or give it a row with its '
+            'reason in _QUEUE_FILERS_OUTSIDE_THE_SWEEP.'
+        )
+        assert not excluded - found, (
+            f'{sorted(excluded - found)!r} no longer reach the queue; drop their '
+            'rows from _QUEUE_FILERS_OUTSIDE_THE_SWEEP'
+        )
+        assert not swept & excluded, (
+            f'{sorted(swept & excluded)!r} are both swept and excluded; one of '
+            'the two is stale'
         )
 
 
