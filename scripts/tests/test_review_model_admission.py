@@ -600,9 +600,12 @@ def _reload(conn, timestamp, *, restart_required):
     conn.seed_event(timestamp, 'config_reload', data={'restart_required': restart_required})
 
 
-def test_the_review_carries_the_orchestrator_startups_and_the_reload_to_startup_join(
-    runs_db, scenario
-):
+def _seed_restart_witness(runs_db):
+    """Startups either side of the window and in it, and two restart-required reloads.
+
+    The scoped-cap reload is loaded by the one startup inside the window; the
+    later reload has no startup after it, since the one at END is out.
+    """
     runs_db.seed_run(run_id='run-before-apply', started_at=_at(hours=-15))
     _reload(runs_db, _at(minutes=17, seconds=35), restart_required={
         SCOPED_CAP_LEAF: {'old': ['claude-fable-5'], 'new': ['claude-fable-5', FABLE]},
@@ -611,6 +614,12 @@ def test_the_review_carries_the_orchestrator_startups_and_the_reload_to_startup_
     _reload(runs_db, _at(days=13),
             restart_required={'max_concurrent_tasks': {'old': 8, 'new': 10}})
     runs_db.seed_run(run_id='run-at-window-end', started_at=END.isoformat())
+
+
+def test_the_review_carries_the_orchestrator_startups_and_the_reload_to_startup_join(
+    runs_db, scenario
+):
+    _seed_restart_witness(runs_db)
 
     result = _review(runs_db, scenario)
 
@@ -680,6 +689,25 @@ def test_the_markdown_renders_the_measured_rates_with_their_denominators(runs_db
     assert steward['promoted share'] == '1/2 (50.0%)'
     roles = {row['role']: row for row in _table_rows(markdown) if 'admitted' in row}
     assert roles['implementer']['admitted'] == 'False'
+
+
+def test_section_3_renders_the_startup_witness_beside_the_service_restart_events(
+    runs_db, scenario
+):
+    _seed_restart_witness(runs_db)
+
+    markdown = review_model_admission.render_markdown(_review(runs_db, scenario))
+
+    section = markdown.split('### 3.')[1].split('### 4.')[0].splitlines()
+    startup_at = _at(hours=2, minutes=56)
+    assert f'| {startup_at} | run-063e9795fcf6 |' in section
+    assert (f'| {_at(minutes=17, seconds=35)} | {SCOPED_CAP_LEAF} | {startup_at} '
+            '| run-063e9795fcf6 |') in section
+    assert f'| {_at(days=13)} | max_concurrent_tasks | none in window | - |' in section
+    assert f'| {_at(days=1)} | orchestrator | merge landed |' in section
+    assert not [line for line in section
+                if 'run-before-apply' in line or 'run-at-window-end' in line]
+    assert 'Service restarts:' not in section
 
 
 def _cli(runs_db_path, escalations, *extra):
