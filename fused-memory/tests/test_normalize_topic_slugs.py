@@ -45,7 +45,9 @@ from _topic_slug_migration_doubles import (
 )
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
+from fused_memory.maintenance.topic_slug_gates import GateCensus, pair_gate_blocks
 from fused_memory.maintenance.topic_slug_plan import Rename, plan_renames
+from fused_memory.reconciliation.consolidation_gate import GATE_METADATA_KEY
 from fused_memory.utils.store_mutation_preflight import StoreMutationUnavailable
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
@@ -964,7 +966,7 @@ class TestGateAmbiguousReachesTheReport:
     """
 
     def test_the_markdown_artifact_names_every_gate(self):
-        _groups, skips = _mod.pair_gate_blocks(
+        _groups, skips = pair_gate_blocks(
             [Rename('dark_factory', 'm1', 'shared_gate', 'shared-gate')],
             [gate_task('7011', 'shared_gate'), gate_task('7718', 'shared_gate')])
 
@@ -984,7 +986,7 @@ class TestGateAmbiguousReachesTheReport:
 
 def _one_group(renames, gate_tasks=()) -> object:
     """The single :class:`GateGroup` a writer test drives, unpacked."""
-    groups, _skips = _mod.pair_gate_blocks(renames, list(gate_tasks))
+    groups, _skips = pair_gate_blocks(renames, list(gate_tasks))
     assert len(groups) == 1, groups
     return groups[0]
 
@@ -1020,7 +1022,7 @@ class TestGateLockstepWriter:
         assert payload['id'] == '4220'
         assert payload['metadata_mode'] == 'merge'
         assert payload['metadata'] == {
-            _mod.GATE_METADATA_KEY: {'topic': 'gate-topic'},
+            GATE_METADATA_KEY: {'topic': 'gate-topic'},
         }
 
     @pytest.mark.asyncio
@@ -1338,7 +1340,7 @@ class TestGateLockstepOutcomesAreGraded:
 
 def _census(*, covered=('dark_factory',), tasks=(), failures=(), roots=('/repo',)) -> object:
     """A ``GateCensus`` built by hand, as ``census_consolidation_gates`` returns one."""
-    return _mod.GateCensus(
+    return GateCensus(
         roots=tuple(roots), tasks=tuple(tasks),
         covered_projects=frozenset(covered), failures=tuple(failures))
 
@@ -1867,10 +1869,10 @@ def _real_skip_entry(reason: str) -> dict:
                 rec('incumbent-canon', 'foo-bar', canonical=True),
             ],
             project_id='dark_factory')[1],
-        'gate_ambiguous': lambda: _mod.pair_gate_blocks(
+        'gate_ambiguous': lambda: pair_gate_blocks(
             [Rename('dark_factory', 'm1', 'shared_gate', 'shared-gate')],
             [gate_task('7011', 'shared_gate'), gate_task('7718', 'shared_gate')])[1],
-        'orphan_gate_topic': lambda: _mod.pair_gate_blocks(
+        'orphan_gate_topic': lambda: pair_gate_blocks(
             [], [gate_task('4774', 'ghost_topic', project_root='/repo')])[1],
     }
     (entry,) = by_reason(producers[reason](), reason)
@@ -2439,10 +2441,13 @@ class TestBaselineDelta:
         assert block['measured_by_project'] == {'dark_factory': 1, 'reify': 2}
 
 
-#: The package modules this suite may import: each reaches no backend.
+#: The package modules this suite may import: none opens a store, a socket or
+#: a MemoryService.
 BACKEND_FREE_MODULES: frozenset[str] = frozenset({
     'fused_memory.utils.store_mutation_preflight',
     'fused_memory.maintenance.topic_slug_plan',
+    'fused_memory.maintenance.topic_slug_gates',
+    'fused_memory.reconciliation.consolidation_gate',
 })
 
 
@@ -2462,9 +2467,9 @@ class TestNoLiveCorpusCountIsPinned:
         so the assertion cannot be satisfied — or defeated — by its own text
         appearing in the file.  This suite loads the script by path and
         injects doubles; it imports only backend-free modules from the
-        package (``BACKEND_FREE_MODULES``), none of which reaches a backend
-        (no Qdrant, no network, no MemoryService).  So there is no seam
-        through which a live corpus could reach an assertion.
+        package (``BACKEND_FREE_MODULES``), none of which opens a store, a
+        socket or a MemoryService.  So there is no seam through which a live
+        corpus could reach an assertion.
         """
         tree = ast.parse(Path(__file__).read_text(encoding='utf-8'))
         imported: set[str] = set()
@@ -2583,7 +2588,7 @@ class TestEndToEnd:
         assert report['skips']['legacy_slug_residue'] == []
         assert corpus.writes == []
         client.call_tool.assert_not_awaited()
-        assert gates[0]['metadata'][_mod.GATE_METADATA_KEY]['topic'] == 'gate_slug'
+        assert gates[0]['metadata'][GATE_METADATA_KEY]['topic'] == 'gate_slug'
 
     @pytest.mark.asyncio
     async def test_an_apply_run_moves_exactly_the_renameable_records(self):
@@ -2623,7 +2628,7 @@ class TestEndToEnd:
             service, projects=('dark_factory', 'reify'), apply=True,
             client=_stateful_gate_client(gates), gates=_e2e_census(gates))
 
-        assert gates[0]['metadata'][_mod.GATE_METADATA_KEY]['topic'] == 'gate-slug'
+        assert gates[0]['metadata'][GATE_METADATA_KEY]['topic'] == 'gate-slug'
         assert [r['outcome'] for r in report['gate_results']] == ['gate_patched']
 
     @pytest.mark.asyncio
@@ -2786,7 +2791,7 @@ class TestMainWiresTheGateLockstep:
 
         report = _written_report(tmp_path)
         assert [row['outcome'] for row in report['gate_results']] == ['gate_patched']
-        assert gates[0]['metadata'][_mod.GATE_METADATA_KEY]['topic'] == 'gate-slug'
+        assert gates[0]['metadata'][GATE_METADATA_KEY]['topic'] == 'gate-slug'
         assert corpus.topic_of('dark_factory', 'df7') == 'gate-slug'
         assert code == 0
 
@@ -2801,7 +2806,7 @@ class TestMainWiresTheGateLockstep:
         assert corpus.scrolls == []
         assert corpus.writes == []
         assert 'update_task' not in _tools_called(client)
-        assert gates[0]['metadata'][_mod.GATE_METADATA_KEY]['topic'] == 'gate_slug'
+        assert gates[0]['metadata'][GATE_METADATA_KEY]['topic'] == 'gate_slug'
         assert not (tmp_path / 'report.json').exists()
         assert not (tmp_path / 'report.md').exists()
 
