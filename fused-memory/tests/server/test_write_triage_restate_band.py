@@ -42,6 +42,7 @@ from fused_memory.server.write_triage import (
 from fused_memory.server.write_triage_judge import (
     CANDIDATE_ID_KEY,
     VERDICT_KEY,
+    judge_write,
     select_judge_candidates,
 )
 from fused_memory.services.memory_service import RRF_K, SearchResults
@@ -203,6 +204,19 @@ class TestAHighBandWriteIsAJudgedWrite:
         judge.assert_not_awaited()
         assert decision.outcome == OUTCOME_RESTATED
         assert decision.canonical_id == 'm1'
+
+    @pytest.mark.asyncio
+    async def test_with_the_judge_disabled_a_high_band_paraphrase_is_stored_uncounted(
+        self,
+    ) -> None:
+        slate = [_result('m1', 0.97, content=_PARAPHRASE)]
+        counter = _counter()
+
+        decision = await _triage(_svc(slate, judge_enabled=False), judge_write, counter)
+
+        assert decision.outcome == OUTCOME_STORED
+        assert decision.canonical_id is None
+        assert counter.live_count() == 0
 
     @pytest.mark.asyncio
     async def test_a_judge_that_raises_on_a_high_band_write_is_one_counted_fail_open(self) -> None:
