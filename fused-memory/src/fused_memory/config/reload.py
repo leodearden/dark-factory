@@ -23,7 +23,7 @@ from typing import Any
 
 from pydantic import BaseModel, ValidationError
 
-from fused_memory.config.overlay import OVERLAY_ALLOWLIST, PROVENANCE_FIELD, MergeMode
+from fused_memory.config.overlay import EMBEDDER_SPACE_UNITS, PROVENANCE_FIELD
 from fused_memory.config.schema import FusedMemoryConfig
 
 # Code-owned allowlist of dotted leaf paths safe to hot-apply in place. Seeded
@@ -322,44 +322,43 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset({
 _ABSENT = '<absent>'
 
 
-_EMBEDDER_IDENTITY_PREFIX = 'embedder.'
+# Any embedder leaf, not only model and dimensions: the overlay provenance
+# vouches for every key the overlay merged, endpoint included, so it must
+# never report a merge the live embedder is still waiting on a restart for.
+_EMBEDDER_SECTION_PREFIX = 'embedder.'
 
-# The leaves whose values are only meaningful in the embedder identity's space:
-# the overlay's calibration units (every non-PER_KEY OVERLAY_ALLOWLIST unit) and
-# the provenance that vouches for them.
-_EMBEDDER_SPACE_UNITS = tuple(
-    unit for unit in OVERLAY_ALLOWLIST if unit.merge is not MergeMode.PER_KEY
-)
+# The leaves that wait with the embedder section: the overlay's embedder-space
+# units and the provenance that vouches for them.
 _EMBEDDER_SPACE_LEAVES: frozenset[str] = frozenset(
     {PROVENANCE_FIELD}
     | {
         f'{unit.section}.{key}'
-        for unit in _EMBEDDER_SPACE_UNITS if unit.keys is not None
+        for unit in EMBEDDER_SPACE_UNITS if unit.keys is not None
         for key in unit.keys
     }
 )
 _EMBEDDER_SPACE_SECTIONS: frozenset[str] = frozenset(
-    unit.section for unit in _EMBEDDER_SPACE_UNITS if unit.keys is None
+    unit.section for unit in EMBEDDER_SPACE_UNITS if unit.keys is None
 )
 
 
-def _follows_embedder_identity(path: str) -> bool:
+def _waits_with_the_embedder(path: str) -> bool:
     return (
         path in _EMBEDDER_SPACE_LEAVES
         or path.split('.', 1)[0] in _EMBEDDER_SPACE_SECTIONS
     )
 
 
-def _hold_embedder_space_with_identity(
+def _hold_embedder_space_while_the_embedder_waits(
     applied_candidates: dict[str, dict[str, Any]],
     restart_required: dict[str, dict[str, Any]],
 ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
-    """Move every embedder-space candidate to restart_required when the identity changed."""
-    if not any(path.startswith(_EMBEDDER_IDENTITY_PREFIX) for path in restart_required):
+    """Move every embedder-space candidate to restart_required when an embedder leaf is there."""
+    if not any(path.startswith(_EMBEDDER_SECTION_PREFIX) for path in restart_required):
         return applied_candidates, restart_required
     held = {
         path: entry for path, entry in applied_candidates.items()
-        if _follows_embedder_identity(path)
+        if _waits_with_the_embedder(path)
     }
     still_applied = {
         path: entry for path, entry in applied_candidates.items() if path not in held
@@ -458,7 +457,7 @@ def diff_config(
                 restart_required[path] = entry
         else:
             unchanged += 1
-    applied_candidates, restart_required = _hold_embedder_space_with_identity(
+    applied_candidates, restart_required = _hold_embedder_space_while_the_embedder_waits(
         applied_candidates, restart_required,
     )
     return ConfigDiff(

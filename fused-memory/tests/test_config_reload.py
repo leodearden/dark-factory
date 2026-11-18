@@ -1319,12 +1319,14 @@ def _calibration(report: str, observations: float) -> dict[str, Any]:
 
 
 class TestOverlayReloadNeverHalfApplies:
-    """Embedder-space values reload only together with the embedder identity.
+    """Embedder-space values reload only together with the embedder section.
 
     A band or calibration is a cosine measured in ONE embedder's space, so
     hot-applying a rewritten band while the embedder change waits for a
     restart would gate writes with cutoffs from a space the live process is
-    not in. Configs are built from temp base and overlay YAML files.
+    not in. The overlay provenance waits too, so it never names a merged key
+    the live process has not applied. Configs are built from temp base and
+    overlay YAML files.
     """
 
     @pytest.fixture
@@ -1396,6 +1398,28 @@ class TestOverlayReloadNeverHalfApplies:
         assert live.config_overlay == before.config_overlay
         assert 'write_triage.candidate_k' in report['applied']
         assert live.write_triage.candidate_k == 30
+
+    def test_an_endpoint_only_change_holds_the_provenance_that_names_it(
+        self, files, live_with_overlay_v1,
+    ):
+        live = live_with_overlay_v1
+        before = live.model_copy(deep=True)
+        self._write_overlay(files.overlay, {
+            'embedder': {'providers': {'openai': {'api_url': 'http://embedder.local/v1'}}},
+            'write_triage': {'t_high': 0.8},
+            'write_triage_project_calibrations': {'A': _calibration('reports/a2.json', 0.7)},
+        }, mtime=1_700_000_100)
+        fresh = FusedMemoryConfig()
+        assert fresh.config_overlay is not None
+        assert 'embedder.providers.openai.api_url' in fresh.config_overlay.merged_keys
+
+        report = apply_reload(live, fresh)
+
+        assert 'embedder.providers' in report['restart_required']
+        for path in _EMBEDDER_SPACE_LEAVES:
+            assert path in report['restart_required']
+        assert live.config_overlay == before.config_overlay
+        assert live.write_triage.t_high == before.write_triage.t_high
 
     def test_the_rule_holds_for_the_tracked_base_alone(self, files):
         live = FusedMemoryConfig()

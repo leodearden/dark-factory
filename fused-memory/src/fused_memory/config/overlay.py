@@ -31,6 +31,9 @@ PROVENANCE_FIELD = 'config_overlay'
 WRITE_TRIAGE_BAND_KEYS: frozenset[str] = frozenset({
     't_high', 't_low', 't_high_by_category', 'calibration_report_path',
 })
+"""The calibrated write_triage keys: the overlay's band unit, and the keys
+scripts/calibrate_write_triage.py derives and may rewrite (every other key in
+the block is a hand-set knob it keeps verbatim)."""
 
 
 class MergeMode(StrEnum):
@@ -44,18 +47,31 @@ class OverlayUnit:
     """One overlayable value group: a top-level section, optionally narrowed to ``keys``.
 
     ``keys=None`` means any key of the section belongs to the unit.
+    ``embedder_space`` marks values measured in one embedder's vector space
+    (cosine bands and calibrations): they mean nothing under another embedder,
+    so a hot reload applies them only together with the embedder section.
     """
 
     section: str
     keys: frozenset[str] | None
     merge: MergeMode
+    embedder_space: bool
 
 
 OVERLAY_ALLOWLIST: tuple[OverlayUnit, ...] = (
-    OverlayUnit('embedder', None, MergeMode.PER_KEY),
-    OverlayUnit('embedder_thresholds', None, MergeMode.REPLACE_UNIT),
-    OverlayUnit('write_triage', WRITE_TRIAGE_BAND_KEYS, MergeMode.REPLACE_UNIT),
-    OverlayUnit('write_triage_project_calibrations', None, MergeMode.REPLACE_EACH_ENTRY),
+    OverlayUnit('embedder', None, MergeMode.PER_KEY, embedder_space=False),
+    OverlayUnit('embedder_thresholds', None, MergeMode.REPLACE_UNIT, embedder_space=True),
+    OverlayUnit(
+        'write_triage', WRITE_TRIAGE_BAND_KEYS, MergeMode.REPLACE_UNIT, embedder_space=True,
+    ),
+    OverlayUnit(
+        'write_triage_project_calibrations', None, MergeMode.REPLACE_EACH_ENTRY,
+        embedder_space=True,
+    ),
+)
+
+EMBEDDER_SPACE_UNITS: tuple[OverlayUnit, ...] = tuple(
+    unit for unit in OVERLAY_ALLOWLIST if unit.embedder_space
 )
 
 _UNIT_BY_SECTION: dict[str, OverlayUnit] = {unit.section: unit for unit in OVERLAY_ALLOWLIST}
