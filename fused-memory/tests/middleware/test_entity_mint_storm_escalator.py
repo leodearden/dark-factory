@@ -1,7 +1,7 @@
 """The INV-4 mint-storm alarm (task 4932): `emit_entity_mint_storm_escalation`.
 
 The FIRE half of the storm escape whose counter half is
-`MemoryService._entity_mint_storm_counters`, a per-`agent_id`
+`MemoryService._entity_mint_storm_counters`, a per-`(agent_id, project_id)`
 `shared.storm_counter.StormCounter` recording one event per MINT.
 
 WHY THIS FILE EXISTS AT ALL. The service-side suite
