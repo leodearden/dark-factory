@@ -363,8 +363,14 @@ things about it are not, and both are prose:
    that would phantom-complete task 51 there.
 
    The tradeoff still favours the widening. At the harness site a false
-   `degenerate` on a landed tip no longer re-dispatches landed work, because
-   `branch_tip_landed` vetoes it; at the lane-abort site it still costs a
+   `degenerate` on a landed tip no longer re-dispatches landed work whose
+   landing brought the tip onto main, because `branch_tip_landed` vetoes it.
+   That landing is either an independent landing sha (a journal row, a
+   citation or a merge marker, never the branch tip itself) or the branch's
+   own `Merge task/N into main` marker. Landed work with neither is still
+   reverted: a fast-forward landing of an uncited tip in a citation-disabled
+   project, or a citation that did not introduce the tip on a branch with no
+   merge marker. At the lane-abort site it still costs a
    deleted, already-on-main branch on EVERY ref of that shape, and the
    measured corpus had 81 of them against zero contrived K6-shaped flips.
    K6 pins the direction of the cost as a KNOWN CONSEQUENCE, not a goal.
