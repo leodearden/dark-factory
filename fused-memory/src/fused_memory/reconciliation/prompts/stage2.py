@@ -283,8 +283,8 @@ aren't in the diff, even if they look topically related or appear in \
 2. **Note-provenance tasks** (no commit recorded): Do NOT write "shipped via X" \
 edges. You MAY write a neutral relationship edge like "Task N references \
 <file>" or "<file> exists in the codebase" ONLY if you have directly verified \
-via the `Read` or `Glob` tool that the file exists at the cited path on the \
-current working tree. If unverified, write a single \
+via the `Read` or `Glob` tool that the file exists at the cited path under \
+this project's `project_root` (use an absolute path). If unverified, write a single \
 `observations_and_summaries` entry quoting the note instead.
 3. **Unknown-provenance tasks** (legacy, no provenance recorded): Do NOT write \
 any file-linked edges. Write at most a single `observations_and_summaries` \
@@ -310,16 +310,20 @@ investigation cycle before it surfaced. Do not repeat this failure mode.
 1. **Verify before you file**: Before embedding, in a FILED TASK's \
 description, any specific code-level claim you attribute to a completed \
 task/commit/ACTION — a metadata key, a stamp like `foo=true`, or a named \
-identifier — you MUST verify the cited token actually exists by running \
-`git grep <token>` and/or `git log --all -S '<token>'` against the current \
-working tree and its full history.
-2. **Absent from both means not fact**: If the token appears in NEITHER the \
-tree NOR history, do NOT state the claim as verified fact. Either drop the \
-specific claim, or mark it explicitly "(unverified — pending human \
-confirmation)" so a human reviews it before it propagates further.
-3. **A history-only hit still verifies**: A token found only in git history \
-(e.g. legitimately removed by a later commit) counts as verified — do not \
-flag a true claim about work that was done and later reverted or removed.
+identifier — you MUST verify the cited token actually exists with the `Grep` \
+tool. This stage has no shell and no commit history, so the files are all you \
+can check. Pass an absolute `path` under the root of the project the claim is \
+about: this project's `project_root` line in the payload or, for a claim about \
+a cross-project task, that project's root in the "Known Projects" section. \
+Never pass a relative path: the stage's working directory is the dark-factory \
+checkout for every project.
+2. **Not found means not fact**: If Grep does not find the token under that \
+root, do NOT state the claim as verified fact. Either drop the specific claim, \
+or mark it explicitly "(unverified — pending human confirmation)" so a human \
+reviews it before it propagates further.
+3. **Removed work reads as absent too**: A claim about work that a later \
+commit removed will also read as absent, so mark it unverified rather than \
+stating it as fact.
 4. **Scope**: This applies to claims about what OTHER (completed) tasks or \
 commits did. It does not apply to your own prospective proposals for new \
 work (e.g. suggesting a new `metadata.foo` field as a next step is not a \
