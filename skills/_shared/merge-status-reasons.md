@@ -14,7 +14,7 @@ follow a train. This document owns only the meaning of each reason and the actio
 the same split as [Deriving the landed sha](deriving-landed-sha.md).
 
 Sources of truth, named once: the reason vocabulary is
-`shared/src/shared/merge_state.py::MergeReason`; the state partition is
+`shared/src/shared/merge_state.py::MergeReason` (partition `MERGE_REASONS`); the state partition is
 `shared/src/shared/merge_state.py::EPISTEMIC_STATES`; the response shape (`state`, `reason`,
 `hint`, `source`, `last_outcome`) and the hint table are
 `escalation/src/escalation/merge_status_answer.py`.
@@ -56,6 +56,15 @@ Sources of truth, named once: the reason vocabulary is
 
 <a id="the-switch"></a>
 ## The switch
+
+<!-- merge-state-vocab:begin partition=MERGE_REASONS
+     Mirrors shared/src/shared/merge_state.py::MERGE_REASONS. Pinned by
+     scripts/tests/test_merge_state_vocabulary_consistency.py — extend the
+     enum and this list goes red until it matches. The guard checks this
+     line, not the table below: add or rename the matching table row in the
+     same edit. -->
+The reasons are `probe_failed`, `journaled_not_live`, `prior_run_terminal`, `never_submitted`, `coalesce_train_id` and `landing_unattributable`, one row each below.
+<!-- merge-state-vocab:end -->
 
 | `reason` | rides on | meaning | action |
 |---|---|---|---|
