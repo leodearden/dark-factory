@@ -40,6 +40,7 @@ from _store_mutation_preflight_contract import (
 from _topic_slug_migration_doubles import by_reason, rec
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
+from fused_memory.maintenance.topic_slug_plan import Rename, plan_renames
 from fused_memory.utils.store_mutation_preflight import StoreMutationUnavailable
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
@@ -483,7 +484,7 @@ def _rename(**overrides) -> object:
         'new_topic': 'legacy-topic',
     }
     fields.update(overrides)
-    return _mod.Rename(**fields)
+    return Rename(**fields)
 
 
 def _call_names(service: AsyncMock) -> list[str]:
@@ -985,7 +986,7 @@ class TestPairGateBlocks:
     """
 
     def test_a_gate_on_a_renamed_slug_is_paired_with_it(self):
-        renames = [_mod.Rename('dark_factory', 'm1', 'mem0_tombstone_coverage',
+        renames = [Rename('dark_factory', 'm1', 'mem0_tombstone_coverage',
                                'mem0-tombstone-coverage')]
         gates = [_gate_task('4220', 'mem0_tombstone_coverage')]
 
@@ -1003,7 +1004,7 @@ class TestPairGateBlocks:
         kept = [{'id': 'x', 'why': 'peer'}]
         gates = [_gate_task('4220', 'gate_topic', provenance=provenance,
                             considered_and_kept=kept)]
-        renames = [_mod.Rename('dark_factory', 'm1', 'gate_topic', 'gate-topic')]
+        renames = [Rename('dark_factory', 'm1', 'gate_topic', 'gate-topic')]
 
         groups, _skips = _mod.pair_gate_blocks(renames, gates)
 
@@ -1015,7 +1016,7 @@ class TestPairGateBlocks:
 
     def test_the_patch_does_not_mutate_the_source_task(self):
         gates = [_gate_task('4220', 'gate_topic', provenance={'a': 1})]
-        renames = [_mod.Rename('dark_factory', 'm1', 'gate_topic', 'gate-topic')]
+        renames = [Rename('dark_factory', 'm1', 'gate_topic', 'gate-topic')]
 
         _mod.pair_gate_blocks(renames, gates)
 
@@ -1023,7 +1024,7 @@ class TestPairGateBlocks:
 
     def test_every_rename_on_the_slug_joins_the_group(self):
         renames = [
-            _mod.Rename('dark_factory', f'm{i}', 'gate_topic', 'gate-topic')
+            Rename('dark_factory', f'm{i}', 'gate_topic', 'gate-topic')
             for i in range(4)
         ]
         groups, _skips = _mod.pair_gate_blocks(
@@ -1034,7 +1035,7 @@ class TestPairGateBlocks:
 
     def test_a_rename_with_no_gate_still_forms_a_group(self):
         """Most topics are not gates; those renames must proceed normally."""
-        renames = [_mod.Rename('dark_factory', 'm1', 'plain_topic', 'plain-topic')]
+        renames = [Rename('dark_factory', 'm1', 'plain_topic', 'plain-topic')]
 
         groups, skips = _mod.pair_gate_blocks(renames, [])
 
@@ -1044,7 +1045,7 @@ class TestPairGateBlocks:
         assert skips == []
 
     def test_a_gate_is_matched_within_its_own_project(self):
-        renames = [_mod.Rename('reify', 'm1', 'gate_topic', 'gate-topic')]
+        renames = [Rename('reify', 'm1', 'gate_topic', 'gate-topic')]
         gates = [_gate_task('4220', 'gate_topic', project_id='dark_factory')]
 
         groups, skips = _mod.pair_gate_blocks(renames, gates)
@@ -1080,9 +1081,9 @@ class TestPairGateBlocks:
 
     def test_groups_are_sorted_for_a_clean_diff(self):
         renames = [
-            _mod.Rename('reify', 'm9', 'z_topic', 'z-topic'),
-            _mod.Rename('dark_factory', 'm2', 'b_topic', 'b-topic'),
-            _mod.Rename('dark_factory', 'm1', 'a_topic', 'a-topic'),
+            Rename('reify', 'm9', 'z_topic', 'z-topic'),
+            Rename('dark_factory', 'm2', 'b_topic', 'b-topic'),
+            Rename('dark_factory', 'm1', 'a_topic', 'a-topic'),
         ]
         groups, _skips = _mod.pair_gate_blocks(renames, [])
 
@@ -1094,7 +1095,7 @@ class TestPairGateBlocks:
 
     def test_the_group_is_frozen(self):
         groups, _skips = _mod.pair_gate_blocks(
-            [_mod.Rename('dark_factory', 'm1', 'a_topic', 'a-topic')], [])
+            [Rename('dark_factory', 'm1', 'a_topic', 'a-topic')], [])
         assert dataclasses.is_dataclass(groups[0])
         with pytest.raises(dataclasses.FrozenInstanceError):
             groups[0].new_topic = 'other'  # type: ignore[misc]
@@ -1115,8 +1116,8 @@ class TestAmbiguousGate:
 
     def test_a_doubly_gated_slug_forms_no_group_and_is_refused_once(self):
         renames = [
-            _mod.Rename('dark_factory', 'm2', 'shared_gate', 'shared-gate'),
-            _mod.Rename('dark_factory', 'm1', 'shared_gate', 'shared-gate'),
+            Rename('dark_factory', 'm2', 'shared_gate', 'shared-gate'),
+            Rename('dark_factory', 'm1', 'shared_gate', 'shared-gate'),
         ]
 
         groups, skips = _mod.pair_gate_blocks(
@@ -1133,16 +1134,16 @@ class TestAmbiguousGate:
     def test_neither_gate_is_reported_as_an_orphan(self):
         """They are matched to live records; "matched to no record" would be false."""
         _groups, skips = _mod.pair_gate_blocks(
-            [_mod.Rename('dark_factory', 'm1', 'shared_gate', 'shared-gate')],
+            [Rename('dark_factory', 'm1', 'shared_gate', 'shared-gate')],
             self._gates_on('shared_gate', '7011', '7718'))
 
         assert by_reason(skips, 'orphan_gate_topic') == []
 
     def test_the_refusal_is_per_slug(self):
         renames = [
-            _mod.Rename('dark_factory', 'm1', 'shared_gate', 'shared-gate'),
-            _mod.Rename('dark_factory', 'm2', 'plain_topic', 'plain-topic'),
-            _mod.Rename('dark_factory', 'm3', 'single_gate', 'single-gate'),
+            Rename('dark_factory', 'm1', 'shared_gate', 'shared-gate'),
+            Rename('dark_factory', 'm2', 'plain_topic', 'plain-topic'),
+            Rename('dark_factory', 'm3', 'single_gate', 'single-gate'),
         ]
         single = _gate_task('4220', 'single_gate')
 
@@ -1158,7 +1159,7 @@ class TestAmbiguousGate:
         assert groups == unaffected
 
     def test_the_verdict_does_not_depend_on_gate_order(self):
-        renames = [_mod.Rename('dark_factory', 'm1', 'shared_gate', 'shared-gate')]
+        renames = [Rename('dark_factory', 'm1', 'shared_gate', 'shared-gate')]
         gates = self._gates_on('shared_gate', '7011', '7718')
 
         for ordered in (gates, list(reversed(gates))):
@@ -1170,7 +1171,7 @@ class TestAmbiguousGate:
 
     def test_gates_in_different_projects_are_not_ambiguous(self):
         """Gates are keyed per project, as the closure scroll that reads them is."""
-        renames = [_mod.Rename('dark_factory', 'm1', 'shared_gate', 'shared-gate')]
+        renames = [Rename('dark_factory', 'm1', 'shared_gate', 'shared-gate')]
         gates = [
             _gate_task('4220', 'shared_gate', project_id='dark_factory'),
             _gate_task('6852', 'shared_gate', project_id='reify'),
@@ -1183,7 +1184,7 @@ class TestAmbiguousGate:
 
     def test_the_markdown_artifact_names_every_gate(self):
         _groups, skips = _mod.pair_gate_blocks(
-            [_mod.Rename('dark_factory', 'm1', 'shared_gate', 'shared-gate')],
+            [Rename('dark_factory', 'm1', 'shared_gate', 'shared-gate')],
             self._gates_on('shared_gate', '7011', '7718'))
 
         rendered = _mod.render_markdown({
@@ -1222,7 +1223,7 @@ class TestGateLockstepWriter:
         service = _stateful_service(records)
         client = _client()
         group = _one_group(
-            [_mod.Rename('dark_factory', 'm1', 'gate_topic', 'gate-topic')],
+            [Rename('dark_factory', 'm1', 'gate_topic', 'gate-topic')],
             [_gate_task('4220', 'gate_topic')])
 
         outcome = await _mod.rename_group(
@@ -1247,7 +1248,7 @@ class TestGateLockstepWriter:
         service = _stateful_service(records)
         client = _client()
         group = _one_group(
-            [_mod.Rename('dark_factory', 'm1', 'gate_topic', 'gate-topic')],
+            [Rename('dark_factory', 'm1', 'gate_topic', 'gate-topic')],
             [_gate_task('4220', 'gate_topic')])
 
         outcome = await _mod.rename_group(
@@ -1266,8 +1267,8 @@ class TestGateLockstepWriter:
         service = _stateful_service(records)
         client = _client()
         group = _one_group(
-            [_mod.Rename('dark_factory', 'm1', 'gate_topic', 'gate-topic'),
-             _mod.Rename('dark_factory', 'm2', 'gate_topic', 'gate-topic')],
+            [Rename('dark_factory', 'm1', 'gate_topic', 'gate-topic'),
+             Rename('dark_factory', 'm2', 'gate_topic', 'gate-topic')],
             [_gate_task('4220', 'gate_topic')])
 
         outcome = await _mod.rename_group(
@@ -1292,8 +1293,8 @@ class TestGateLockstepWriter:
         service = _stateful_service(records)
         client = _client(result={'success': False, 'error': 'done_provenance_via_update_task'})
         group = _one_group(
-            [_mod.Rename('dark_factory', 'm1', 'gate_topic', 'gate-topic'),
-             _mod.Rename('dark_factory', 'm2', 'gate_topic', 'gate-topic')],
+            [Rename('dark_factory', 'm1', 'gate_topic', 'gate-topic'),
+             Rename('dark_factory', 'm2', 'gate_topic', 'gate-topic')],
             [_gate_task('4220', 'gate_topic')])
 
         outcome = await _mod.rename_group(
@@ -1314,7 +1315,7 @@ class TestGateLockstepWriter:
         service = _stateful_service(records)
         client = _client(error=RuntimeError('mcp down'))
         group = _one_group(
-            [_mod.Rename('dark_factory', 'm1', 'gate_topic', 'gate-topic')],
+            [Rename('dark_factory', 'm1', 'gate_topic', 'gate-topic')],
             [_gate_task('4220', 'gate_topic')])
 
         outcome = await _mod.rename_group(
@@ -1330,7 +1331,7 @@ class TestGateLockstepWriter:
         service = _stateful_service(records)
         client = _client(error=RuntimeError('mcp down'))
         group = _one_group(
-            [_mod.Rename('dark_factory', 'm1', 'gate_topic', 'gate-topic')],
+            [Rename('dark_factory', 'm1', 'gate_topic', 'gate-topic')],
             [_gate_task('4220', 'gate_topic')])
 
         calls = {'n': 0}
@@ -1357,7 +1358,7 @@ class TestGateLockstepWriter:
         service = _stateful_service(records)
         client = _client()
         group = _one_group(
-            [_mod.Rename('dark_factory', 'm1', 'plain_topic', 'plain-topic')])
+            [Rename('dark_factory', 'm1', 'plain_topic', 'plain-topic')])
 
         outcome = await _mod.rename_group(
             service, group, apply=True, client=client)
@@ -1371,7 +1372,7 @@ class TestGateLockstepWriter:
         """A run that reaches no gate must not require an MCP handshake."""
         records = _store(('m1', 'plain_topic'))
         group = _one_group(
-            [_mod.Rename('dark_factory', 'm1', 'plain_topic', 'plain-topic')])
+            [Rename('dark_factory', 'm1', 'plain_topic', 'plain-topic')])
 
         outcome = await _mod.rename_group(
             _stateful_service(records), group, apply=True, client=None)
@@ -1385,7 +1386,7 @@ class TestGateLockstepWriter:
         records = _store(('m1', 'gate_topic'))
         service = _stateful_service(records)
         group = _one_group(
-            [_mod.Rename('dark_factory', 'm1', 'gate_topic', 'gate-topic')],
+            [Rename('dark_factory', 'm1', 'gate_topic', 'gate-topic')],
             [_gate_task('4220', 'gate_topic')])
 
         outcome = await _mod.rename_group(
@@ -1401,8 +1402,8 @@ class TestGateLockstepWriter:
         service = _stateful_service(records)
         client = _client(error=RuntimeError('mcp down'))
         group = _one_group(
-            [_mod.Rename('dark_factory', 'm1', 'gate_topic', 'gate-topic'),
-             _mod.Rename('dark_factory', 'm2', 'gate_topic', 'gate-topic')],
+            [Rename('dark_factory', 'm1', 'gate_topic', 'gate-topic'),
+             Rename('dark_factory', 'm2', 'gate_topic', 'gate-topic')],
             [_gate_task('4220', 'gate_topic')])
 
         outcome = await _mod.rename_group(
@@ -1424,8 +1425,8 @@ class TestUngatedGroupRollback:
     @staticmethod
     def _plain_group() -> object:
         return _one_group([
-            _mod.Rename('dark_factory', 'm1', 'plain_topic', 'plain-topic'),
-            _mod.Rename('dark_factory', 'm2', 'plain_topic', 'plain-topic'),
+            Rename('dark_factory', 'm1', 'plain_topic', 'plain-topic'),
+            Rename('dark_factory', 'm2', 'plain_topic', 'plain-topic'),
         ])
 
     @pytest.mark.asyncio
@@ -2278,14 +2279,14 @@ def _bucket_section(rendered: str, bucket: str) -> str:
 def _real_skip_entry(reason: str) -> dict:
     """One skip entry of *reason*, made by the real pure producer that files it."""
     producers = {
-        'topic_unfoldable': lambda: _mod.plan_renames(
+        'topic_unfoldable': lambda: plan_renames(
             [rec('m1', '!!!')], project_id='dark_factory')[1],
-        'record_without_id': lambda: _mod.plan_renames(
+        'record_without_id': lambda: plan_renames(
             [rec('', 'a_b')], project_id='dark_factory')[1],
-        'slug_collision': lambda: _mod.plan_renames(
+        'slug_collision': lambda: plan_renames(
             [rec('m1', 'dup_topic'), rec('m2', 'dup-topic')],
             project_id='dark_factory')[1],
-        'canonical_collision': lambda: _mod.plan_renames(
+        'canonical_collision': lambda: plan_renames(
             [
                 rec('legacy-canon', 'foo_bar', canonical=True),
                 rec('legacy-member', 'foo_bar'),
@@ -2293,7 +2294,7 @@ def _real_skip_entry(reason: str) -> dict:
             ],
             project_id='dark_factory')[1],
         'gate_ambiguous': lambda: _mod.pair_gate_blocks(
-            [_mod.Rename('dark_factory', 'm1', 'shared_gate', 'shared-gate')],
+            [Rename('dark_factory', 'm1', 'shared_gate', 'shared-gate')],
             [_gate_task('7011', 'shared_gate'), _gate_task('7718', 'shared_gate')])[1],
         'orphan_gate_topic': lambda: _mod.pair_gate_blocks(
             [], [_gate_task('4774', 'ghost_topic', project_root='/repo')])[1],
@@ -2312,7 +2313,7 @@ class TestMarkdownHidesNoSkipField:
 
     def test_a_canonical_collision_line_names_both_canonical_id_lists(self):
         entries = by_reason(
-            _mod.plan_renames(
+            plan_renames(
                 [
                     rec('legacy-canon', 'foo_bar', canonical=True),
                     rec('legacy-member', 'foo_bar'),
@@ -2450,7 +2451,7 @@ class TestPartialUngatedGroup:
     @staticmethod
     def _plain_group(gate_tasks=(), *, members: int = 2) -> object:
         return _one_group([
-            _mod.Rename('dark_factory', f'm{n}', 'plain_topic', 'plain-topic')
+            Rename('dark_factory', f'm{n}', 'plain_topic', 'plain-topic')
             for n in range(1, members + 1)
         ], gate_tasks)
 
@@ -2864,6 +2865,13 @@ class TestBaselineDelta:
         assert block['measured_by_project'] == {'dark_factory': 1, 'reify': 2}
 
 
+#: The package modules this suite may import: each reaches no backend.
+BACKEND_FREE_MODULES: frozenset[str] = frozenset({
+    'fused_memory.utils.store_mutation_preflight',
+    'fused_memory.maintenance.topic_slug_plan',
+})
+
+
 class TestNoLiveCorpusCountIsPinned:
     """The one rule this whole section exists to keep.
 
@@ -2879,11 +2887,10 @@ class TestNoLiveCorpusCountIsPinned:
         Checked over the parsed IMPORT statements rather than by substring,
         so the assertion cannot be satisfied — or defeated — by its own text
         appearing in the file.  This suite loads the script by path and
-        injects doubles; the only thing it imports from the package is the
-        store-mutation guard's own module, for its exception type, and that
-        module reaches no backend (no Qdrant, no network, no MemoryService).
-        So there is no seam through which a live corpus could reach an
-        assertion.
+        injects doubles; it imports only backend-free modules from the
+        package (``BACKEND_FREE_MODULES``), none of which reaches a backend
+        (no Qdrant, no network, no MemoryService).  So there is no seam
+        through which a live corpus could reach an assertion.
         """
         tree = ast.parse(Path(__file__).read_text(encoding='utf-8'))
         imported: set[str] = set()
@@ -2895,8 +2902,7 @@ class TestNoLiveCorpusCountIsPinned:
 
         backend_reaching = [
             m for m in imported
-            if m.startswith('fused_memory')
-            and m != 'fused_memory.utils.store_mutation_preflight'
+            if m.startswith('fused_memory') and m not in BACKEND_FREE_MODULES
         ]
         assert not backend_reaching, imported
 
@@ -3328,8 +3334,8 @@ class TestTopicSelection:
             rec('m4', 'plain_legacy'),
         ]
 
-        unnarrowed = _mod.plan_renames(records, project_id='dark_factory')
-        narrowed = _mod.plan_renames(records, project_id='dark_factory',
+        unnarrowed = plan_renames(records, project_id='dark_factory')
+        narrowed = plan_renames(records, project_id='dark_factory',
                                      topics=frozenset({'other_legacy'}))
 
         assert sorted(entry['reason'] for entry in unnarrowed[1]) == [
