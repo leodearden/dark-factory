@@ -27,10 +27,10 @@ Both forms behave identically. When both are set, `--config` wins. If neither is
 | Project | Config file | `project_id` | `project_root` |
 |---------|------------|--------------|----------------|
 | dark-factory | `/home/leo/src/dark-factory/dark-factory-orchestrator.yaml` | `dark_factory` | `/home/leo/src/dark-factory` |
-| reify | `/home/leo/src/reify/orchestrator.yaml` | `reify` | `/home/leo/src/reify` |
-| autopilot-video | `/home/leo/src/autopilot-video/orchestrator-config.yaml` | `autopilot_video` | `/home/leo/src/autopilot-video` |
+| reify | `/home/leo/src/reify/dark-factory-orchestrator.yaml` | `reify` | `/home/leo/src/reify` |
+| autopilot-video | `/home/leo/src/autopilot-video/dark-factory-orchestrator.yaml` | `autopilot_video` | `/home/leo/src/autopilot-video` |
 
-`dark-factory-orchestrator.yaml` (used above by dark-factory) is now the canonical, required top-level config filename for any orchestrator-targeted project — it's the name the dashboard's escalation-URL discovery keys on, and any new project should use it (see "Setting up a new project" below). reify and autopilot-video above still show their historical filenames; that's fine for the orchestrator *binary*, since the `--config` flag (or `ORCH_CONFIG_PATH`) always names the file explicitly — but a non-canonical name is only picked up by dashboard discovery's legacy fallback (which logs a nudge warning) instead of directly.
+`dark-factory-orchestrator.yaml` (used above by every project) is now the canonical, required top-level config filename for any orchestrator-targeted project — it's the name the dashboard's escalation-URL discovery keys on, and any new project should use it (see "Setting up a new project" below).
 
 ## Setting up a new project
 
@@ -50,7 +50,7 @@ Both forms behave identically. When both are set, `--config` wins. If neither is
    type_check_command: "pyright"        # or "cargo check", "tsc --noEmit", etc.
    ```
 
-3. **Add concurrency / model overrides if needed.** The package defaults at `dark-factory/orchestrator/defaults.yaml` cover most cases. Override anything project-specific (e.g. `max_concurrent_tasks`, `lock_depth`, per-role models). See the three existing configs as worked examples.
+3. **Add concurrency / model overrides if needed.** The package defaults at `orchestrator/src/orchestrator/defaults.yaml` cover most cases. Override anything project-specific (e.g. `max_concurrent_tasks`, `lock_depth`, per-role models). See the three existing configs as worked examples.
 
 4. **Task state lives in fused-memory's SQLite** at `<project_root>/.taskmaster/tasks/tasks.db`, created on first write. There is no on-disk `tasks.json` to seed — submit the first task via the MCP `submit_task` tool.
 
@@ -72,7 +72,7 @@ Example contents:
 
 ```bash
 # /home/leo/src/reify/.envrc
-export ORCH_CONFIG_PATH="/home/leo/src/reify/orchestrator.yaml"
+export ORCH_CONFIG_PATH="/home/leo/src/reify/dark-factory-orchestrator.yaml"
 ```
 
 To create one for a new project, copy this pattern and adjust the path. Always use the absolute path — direnv runs the file from the directory, but other tools that re-source it may have a different cwd.
@@ -98,7 +98,7 @@ cd /home/leo/src/reify && direnv allow
 cd /home/leo/src/autopilot-video && direnv allow
 ```
 
-After this, `cd /home/leo/src/reify` automatically exports `ORCH_CONFIG_PATH=/home/leo/src/reify/orchestrator.yaml`, and the orchestrator started from any cwd in that shell will target reify without needing `--config`.
+After this, `cd /home/leo/src/reify` automatically exports `ORCH_CONFIG_PATH=/home/leo/src/reify/dark-factory-orchestrator.yaml`, and the orchestrator started from any cwd in that shell will target reify without needing `--config`.
 
 The install is a one-time, sudo action. **Do not install direnv automatically** — confirm with the user first.
 
@@ -110,12 +110,12 @@ Two options:
    ```bash
    cd /home/leo/src/dark-factory
    uv run --project orchestrator orchestrator run \
-       --config /home/leo/src/reify/orchestrator.yaml
+       --config /home/leo/src/reify/dark-factory-orchestrator.yaml
    ```
 
 2. **Set `ORCH_CONFIG_PATH` for the duration of one shell session**:
    ```bash
-   export ORCH_CONFIG_PATH=/home/leo/src/reify/orchestrator.yaml
+   export ORCH_CONFIG_PATH=/home/leo/src/reify/dark-factory-orchestrator.yaml
    # all subsequent orchestrator invocations in this shell target reify
    ```
 
@@ -161,7 +161,9 @@ module_overrides:
   crates/reify-util: 2           # medium activity
 ```
 
-When the scheduler acquires a lock for a task touching `crates/reify-core/src/foo.rs`, it first normalizes the path to `lock_depth` components (`normalize_lock`; default `lock_depth=2` gives `crates/reify-core`, *not* the first path component `crates`), then resolves the `ModuleConfig` whose registered prefix is the deepest match for that normalized path (`OrchestratorConfig.for_module`, which walks candidate prefixes inward from the full path and returns the most specific one — e.g. it would prefer a config registered at `crates/reify-core` over one at `crates`). It then looks up that same normalized, depth-`lock_depth` path (`crates/reify-core`) in a five-level fallback ladder, using the first hit:
+When the scheduler acquires a lock for a task touching `crates/reify-core/src/foo.rs`, it first normalizes the path to `lock_depth` components (`normalize_lock`; a `lock_depth` of 2 gives `crates/reify-core`, *not* the first path component `crates`), then resolves the `ModuleConfig` whose registered prefix is the deepest match for that normalized path (`OrchestratorConfig.for_module`, which walks candidate prefixes inward from the full path and returns the most specific one — e.g. it would prefer a config registered at `crates/reify-core` over one at `crates`). It then looks up that same normalized, depth-`lock_depth` path (`crates/reify-core`) in a five-level fallback ladder, using the first hit:
+
+The shipped `lock_depth` is 4 (`orchestrator/src/orchestrator/defaults.yaml`); 2 is only the pydantic field default in `config.py`, which `defaults.yaml` overrides. Projects set their own (dark-factory 12, reify 10), and the examples here use 2 for brevity.
 
 1. the resolved module's own `module_overrides[module]`
 2. the top-level config's `module_overrides[module]`
@@ -169,13 +171,13 @@ When the scheduler acquires a lock for a task touching `crates/reify-core/src/fo
 4. the resolved module's `max_per_module`
 5. the top-level config's `max_per_module`
 
-`unlimited_holder_locks` (`prefixes: ["docs/"]`, `root_markdown: true`) matches the key after `normalize_lock`: a key under a listed prefix or equal to that directory itself, and, with `root_markdown`, any key at the repository root ending in `.md` (case-sensitive). The keys stay in every task's lock list; any number of tasks may hold them at once. It is top-level only and restart tier, like `module_overrides`, and it is off unless set. An exact `module_overrides` entry pins one key back to exclusive. The entry must be the key as cut at the project's `lock_depth`: `docs/legibility/census-state.json: 1` works at Dark Factory's depth of 12, while at the default depth of 2 that file's key is `docs/legibility`.
+`unlimited_holder_locks` (`prefixes: ["docs/"]`, `root_markdown: true`) matches the key after `normalize_lock`: a key under a listed prefix or equal to that directory itself, and, with `root_markdown`, any key at the repository root ending in `.md` (case-sensitive). The keys stay in every task's lock list; any number of tasks may hold them at once. It is top-level only and restart tier, like `module_overrides`, and it is off unless set. An exact `module_overrides` entry pins one key back to exclusive. The entry must be the key as cut at the project's `lock_depth`: `docs/legibility/census-state.json: 1` works at Dark Factory's depth of 12, while at a depth of 2 that file's key is `docs/legibility`.
 
 The same limit governs fairness and pin parks. A park counts as a hold by its owner on the parked module, so a request conflicting with it is refused once the requested module is at its limit counting that park; the park also keeps its owner one slot on the parked module itself. So a limit-1 module's park admits no new holder, while a limit-N module still admits N-1 other holders past it (`orchestrator/src/orchestrator/lock_table.py::ModuleLockTable._iter_blocking_park_owners`).
 
 Two depth traps follow from the path being normalized *before* either lookup runs:
 
-- A `module_overrides` key with *more* than `lock_depth` components (e.g. a hypothetical `crates/reify-core/tests` entry under the default `lock_depth=2`) can never match: the lookup key is always truncated to `lock_depth` components first, so a task touching `crates/reify-core/tests/foo.rs` normalizes to `crates/reify-core` and never probes the longer key. This is silent — nothing warns you, so an override pasted in with the wrong number of path components just does nothing (see `analyze_modules.py`'s `# a clipped lock key is not a key` comment).
+- A `module_overrides` key with *more* than `lock_depth` components (e.g. a hypothetical `crates/reify-core/tests` entry under a `lock_depth` of 2) can never match: the lookup key is always truncated to `lock_depth` components first, so a task touching `crates/reify-core/tests/foo.rs` normalizes to `crates/reify-core` and never probes the longer key. This is silent — nothing warns you, so an override pasted in with the wrong number of path components just does nothing (see `analyze_modules.py`'s `# a clipped lock key is not a key` comment).
 - A module *config* (an `orchestrator.yaml`) registered at a prefix deeper than `lock_depth` is likewise unreachable through this scheduler path, but here `load_config` *does* warn when it detects the mismatch. Keep module config prefixes at a depth no greater than `lock_depth`.
 
 ### Picking values: the `analyze_modules` helper
