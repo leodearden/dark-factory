@@ -10,9 +10,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 import pytest_asyncio
 from _curator_helpers import (
-    answer_each_with,
     curator_always,
     curator_double,
+    curator_judging,
     curator_returning,
     serve_existing_task,
     submit_as_one_batch,
@@ -951,9 +951,7 @@ async def test_close_drains_worker_and_closes_store(
         await paused_event.wait()  # blocks until cancelled
         return CuratorDecision(action='create')
 
-    mock_curator = curator_double()
-    mock_curator.curate = blocking_curate
-    answer_each_with(mock_curator, mock_curator.curate)
+    mock_curator = curator_judging(blocking_curate)
 
     ti = TaskInterceptor(
         taskmaster, None, event_buffer, ticket_store=store, curator=mock_curator,
@@ -1454,9 +1452,7 @@ class TestDispatchTicketDecision:
         candidate = CandidateTask(title='New Feature', description='Details here')
         decision = CuratorDecision(action='create', justification='novel')
 
-        mock_curator = MagicMock()
-        mock_curator.note_created = MagicMock()
-        mock_curator.record_task = AsyncMock()
+        mock_curator = curator_double()
 
         taskmaster.add_task = AsyncMock(return_value={'id': '77', 'title': 'New Feature'})
 
@@ -1491,8 +1487,7 @@ class TestDispatchTicketDecision:
 
         add_task_result = {'id': '77', 'title': 'New Feature'}
         taskmaster.add_task = AsyncMock(return_value=add_task_result)
-        mock_curator = MagicMock()
-        mock_curator.record_task = AsyncMock()
+        mock_curator = curator_double()
 
         with patch.object(
             type(interceptor_with_store), '_ensure_taskmaster',
@@ -1587,6 +1582,7 @@ class TestDispatchTicketDecision:
         assert reason is not None and 'combine' in reason
         assert isinstance(result_dict, dict)
         assert result_dict.get('id') == '88'
+        taskmaster.update_task.assert_awaited_once()
         update_kwargs = taskmaster.update_task.await_args.kwargs
         assert update_kwargs['task_id'] == '88'
         assert update_kwargs['title'] == 'Merged'
@@ -1980,7 +1976,7 @@ def _config_without_curator_startup_tasks() -> FusedMemoryConfig:
 
 @pytest_asyncio.fixture
 async def configured_interceptor(taskmaster, event_buffer, ticket_store):
-    """An interceptor whose curator is built for real by ``_get_curator``."""
+    """An interceptor with no injected curator, so ``_get_curator`` builds one lazily."""
     ti = TaskInterceptor(
         taskmaster, None, event_buffer,
         config=_config_without_curator_startup_tasks(), ticket_store=ticket_store,
@@ -2004,9 +2000,11 @@ class TestCuratorUnavailableReasonPersisted:
     """A ticket created with NO curator records why the curator was missing.
 
     This is the path a curator's own degraded-streak alarm cannot see: when
-    ``_get_curator()`` returns None there is no curator left to count. These
-    tests let ``_get_curator`` build the curator for real, because that lazy
-    construction and its recovery are the subject.
+    ``_get_curator()`` returns None there is no curator left to count. The
+    tests built on ``configured_interceptor`` inject no curator, because
+    ``_get_curator``'s lazy construction and its recovery are their subject:
+    ``_get_curator`` runs for real, and where a build is expected it builds a
+    patched ``TaskCurator`` class.
     """
 
     @pytest.mark.asyncio
@@ -2072,8 +2070,7 @@ class TestCuratorUnavailableReasonPersisted:
         """A live curator's ticket dispatched with no decision is not called unavailable."""
         from fused_memory.middleware.curator_types import CandidateTask
 
-        curator = MagicMock()
-        curator.record_task = AsyncMock()
+        curator = curator_double()
         with patch.object(
             type(interceptor_with_store), '_ensure_taskmaster',
             new=AsyncMock(return_value=taskmaster),
