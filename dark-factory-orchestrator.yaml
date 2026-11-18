@@ -100,6 +100,12 @@ lock_depth: 12
 # 7202: a deterministic always_escalates human gate that fires 7 days
 # after the deploy task closes and re-measures. Read it there before changing or
 # keeping this key.
+# config.py joined the two-holder experiment on Leo's ruling of 2026-11-14 (lock
+# hand-off study): the scheduling fixes that were ruled waited on each other for
+# this one file; of its last 70 consecutive pairs of landed changes 1.4% touched
+# overlapping lines and 4.3% came within 10 lines (measured 2026-11-12). The review
+# gate is task 7202, whose amendment of 2026-11-14 covers this file and counts a
+# collision with a co-holder that has already landed.
 # Keys are depth-lock_depth paths (4 components, inside lock_depth 12), so they
 # match exactly what ModuleLockTable._limit_for looks up; a deeper key never would.
 # RED TIER: module_overrides is not in RELOADABLE_FIELDS and _limit_for memoises
@@ -120,6 +126,7 @@ lock_depth: 12
 module_overrides:
   orchestrator/src/orchestrator/workflow.py: 2
   orchestrator/src/orchestrator/harness.py: 2
+  orchestrator/src/orchestrator/config.py: 2
   orchestrator/tests/merge_lane_ratchet_baseline.json: 99
   orchestrator/tests/merge_lane_ratchet_authorized_raises.json: 99
   orchestrator/tests/merge_lane_ratchet_raises/_README.json: 99
