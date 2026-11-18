@@ -2007,7 +2007,7 @@ def test_main_lease_claim_prints_the_slug_line_even_when_it_fails_open(
     def _boom(*_args: object, **_kwargs: object) -> session_leases.LeaseClaim:
         raise OSError('lease substrate on fire')
 
-    monkeypatch.setattr(sr, 'claim_lease', _boom)
+    monkeypatch.setattr(session_leases, 'claim_lease', _boom)
 
     with caplog.at_level(logging.ERROR):
         rc = sr.main(['lease-claim', '--name', 'watcher-df'])
@@ -2433,7 +2433,7 @@ def test_main_lease_claim_is_fail_open_never_stand_down_on_a_fault(
     def _boom(*_args: object, **_kwargs: object) -> session_leases.LeaseClaim:
         raise OSError('lease substrate on fire')
 
-    monkeypatch.setattr(sr, 'claim_lease', _boom)
+    monkeypatch.setattr(session_leases, 'claim_lease', _boom)
 
     with caplog.at_level(logging.ERROR):
         rc = sr.main(

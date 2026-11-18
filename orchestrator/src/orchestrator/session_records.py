@@ -64,7 +64,7 @@ logger = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 1
 
-# 3: session_registry.py::LeaseHolder.record_slug and decision_registry.py::DecisionRecord.record_slug (task 4237).
+# 3: session_leases.py::LeaseHolder.record_slug and decision_registry.py::DecisionRecord.record_slug (task 4237).
 # 4: SessionRecord.self_exit (task 7179).
 # 5: SessionRecord.exit_request and exit_requested_at (task 7193).
 # 6: SessionRecord.claude_launch_session_id (task 6069).

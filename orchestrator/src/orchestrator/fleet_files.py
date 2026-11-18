@@ -72,7 +72,7 @@ def atomic_write_text(path: Path, text: str) -> None:
     decode error is a ``UnicodeDecodeError``, a ``ValueError`` subclass, so it
     lands in that function's ``except`` clause),
     ``decision_registry.py::list_decisions`` and
-    ``session_registry.py::reap_stale_leases`` log and SKIP the file, and
+    ``session_leases.py::reap_stale_leases`` log and SKIP the file, and
     ``decision_registry.py::_mutate_decision`` returns ``None``. (An
     earlier version of this paragraph cited
     ``shared.safe_io.load_json_or_warn``. That helper never reads session,

@@ -1337,7 +1337,7 @@ def _live_fleet_lease() -> dict | None:
     asymmetry is the one the bound itself rests on — honouring a negative age
     makes the lease immortal, since no bound can expire it, while releasing it
     costs at most one collision. Note the deliberate divergence from the repo's
-    OTHER lease (session_registry.LEASE_HEARTBEAT_TTL), which fails toward
+    OTHER lease (session_leases.LEASE_HEARTBEAT_TTL), which fails toward
     KEEPING the lease — that one protects a holder against eviction, this one
     suppresses fleet redeploys.
 

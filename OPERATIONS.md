@@ -885,7 +885,7 @@ pid path: from a shared `claude agents` host, whose pid outlives every session
 it hosts and so cannot vouch for one, or with `$CLAUDE_PID` unset, which since
 4248 also needs an explicit `--slug` to claim at all. The CLI records 0, a
 never-alive sentinel, and logs a WARNING
-(`orchestrator/src/orchestrator/session_registry.py::lease_liveness_pid`).
+(`orchestrator/src/orchestrator/session_identity.py::lease_liveness_pid`).
 Such a lease is protected only by its heartbeat and always reads `orphaned`;
 that is deliberate, because recording some other durable pid (the shell)
 instead would make it unreapable forever.
@@ -894,7 +894,7 @@ instead would make it unreapable forever.
 **refuse** anyone else (`result=refused`, nothing touched), so no session can
 evict another's lease or keep a stranger's alive. The holder is identified by a
 slug the CLI derives afresh on every lease verb
-(`orchestrator/src/orchestrator/session_registry.py::default_lease_slug`;
+(`orchestrator/src/orchestrator/session_leases.py::default_lease_slug`;
 `watcher-df-1430433` is a typical one, and `lease-claim`'s `slug=` line shows
 yours). Pass `--slug` only as an operator override. When the slug cannot be
 derived and no `--slug` is given, all three lease verbs exit 2 naming the
