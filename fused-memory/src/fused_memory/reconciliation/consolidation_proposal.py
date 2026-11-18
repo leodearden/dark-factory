@@ -29,6 +29,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import logging
 import math
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -44,6 +45,8 @@ from fused_memory.reconciliation.recon_ledger import (
     ReconLedgerRecord,
     ReconLedgerStore,
 )
+
+logger = logging.getLogger(__name__)
 
 RECORD_KIND_CONSOLIDATION_PROPOSAL = 'consolidation_proposal'
 #: One row per (project, members key): the adjudicator flow's bounded retry (PRD K4).
@@ -155,10 +158,7 @@ def from_ledger_record(record: ReconLedgerRecord) -> ConsolidationProposal:
     Raises ``ValueError`` naming the offending field: a ledger row's JSON is
     never trusted for shape.
     """
-    if record.record_kind != RECORD_KIND_CONSOLIDATION_PROPOSAL:
-        raise ValueError(
-            f'record_kind {record.record_kind!r} is not {RECORD_KIND_CONSOLIDATION_PROPOSAL!r}'
-        )
+    _require_proposal_record(record)
     payload = _payload_object(record)
 
     member_ids = payload.get(_MEMBER_IDS_KEY)
@@ -180,6 +180,13 @@ def from_ledger_record(record: ReconLedgerRecord) -> ConsolidationProposal:
     )
 
 
+def _require_proposal_record(record: ReconLedgerRecord) -> None:
+    if record.record_kind != RECORD_KIND_CONSOLIDATION_PROPOSAL:
+        raise ValueError(
+            f'record_kind {record.record_kind!r} is not {RECORD_KIND_CONSOLIDATION_PROPOSAL!r}'
+        )
+
+
 def _payload_str(payload: dict[str, Any], key: str) -> str:
     value = payload.get(key)
     if not isinstance(value, str):
@@ -197,10 +204,7 @@ class ProposalRef:
     @classmethod
     def from_record(cls, record: ReconLedgerRecord) -> ProposalRef:
         """The ref to *record*, whose topic is its ``flag_type`` (see ``ConsolidationProposal.ledger_key``)."""
-        if record.record_kind != RECORD_KIND_CONSOLIDATION_PROPOSAL:
-            raise ValueError(
-                f'record_kind {record.record_kind!r} is not {RECORD_KIND_CONSOLIDATION_PROPOSAL!r}'
-            )
+        _require_proposal_record(record)
         return cls(topic=record.flag_type, run_id=record.run_id)
 
     def to_payload(self) -> dict[str, str]:
@@ -529,10 +533,16 @@ def _is_memo_copy(row: ReconLedgerRecord) -> bool:
 
     Fail-safe for an escalation counter: the executor reads the streak on
     every refusal, and a raise here would abort its whole Stage 1 post-step.
+    The row is still logged, because :func:`record_outcome` never writes one
+    that fails to decode.
     """
     try:
         outcome = outcome_from_record(row)
-    except ValueError:
+    except ValueError as exc:
+        logger.warning(
+            'refusal_streak: counting %s/%s/%s as an original; its outcome does not decode: %s',
+            row.record_kind, row.flag_type, row.run_id, exc,
+        )
         return False
     return outcome is not None and outcome.reused_from is not None
 

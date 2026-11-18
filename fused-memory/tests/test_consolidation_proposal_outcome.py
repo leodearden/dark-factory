@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import logging
 from collections.abc import MutableMapping
 from datetime import UTC, datetime, timedelta
 
@@ -250,14 +251,21 @@ _PRE_ADJUDICATOR_OUTCOME = {
 }
 
 
+#: A :func:`_corrupt` value that deletes the key instead of setting it.
+_ABSENT = object()
+
+
 def _corrupt(path, value):
-    """A to_payload() of the adjudicated outcome with one nested key set to *value*."""
+    """A to_payload() of the adjudicated outcome with one nested key set to *value*, or deleted."""
     def corrupted():
         payload = _adjudicated_outcome().to_payload()
         target = payload
         for key in path[:-1]:
             target = target[key]
-        target[path[-1]] = value
+        if value is _ABSENT:
+            del target[path[-1]]
+        else:
+            target[path[-1]] = value
         return payload
     return corrupted
 
@@ -318,8 +326,9 @@ class TestAdjudicatorFlowFields:
             (_corrupt(('reused_from',), {'topic': TOPIC}), 'reused_from'),
             (_corrupt(('adjudication', 'shown'), [{'id': 'x'}]), 'shown'),
             (_corrupt(('adjudication', 'input_tokens'), True), 'input_tokens'),
+            (_corrupt(('adjudication', 'cost_usd'), _ABSENT), 'cost_usd'),
         ],
-        ids=['kept_ids', 'repaired', 'reused_from', 'shown', 'input_tokens'],
+        ids=['kept_ids', 'repaired', 'reused_from', 'shown', 'input_tokens', 'missing_cost_usd'],
     )
     def test_a_malformed_new_field_is_refused_loudly(self, corrupted, key):
         with pytest.raises(ValueError, match=key):
@@ -343,6 +352,20 @@ class TestAdjudicatorFlowFields:
         cut = ShownMember.cut('m1', 'b' * 64, 'x' * 5000)
 
         assert len(cut.text) == SHOWN_TEXT_CHARS
+
+
+class TestProposalRef:
+    @pytest.mark.asyncio
+    async def test_a_proposal_row_refs_its_topic_and_run(self, ledger):
+        record = await _seed(ledger, run_id='run-7')
+
+        assert ProposalRef.from_record(record) == ProposalRef(topic=TOPIC, run_id='run-7')
+
+    def test_a_row_of_another_kind_is_refused(self):
+        other = dataclasses.replace(_row('proposed'), record_kind='cycle_summary')
+
+        with pytest.raises(ValueError, match='cycle_summary'):
+            ProposalRef.from_record(other)
 
 
 class TestExpiry:
@@ -538,6 +561,23 @@ class TestRefusalStreak:
         )
         rows = [undecodable, _acted_row(ProposalState.REFUSED)]
         assert refusal_streak(rows) == 2
+
+    def test_a_memo_copy_whose_adjudication_lacks_a_measure_counts_and_is_logged(self, caplog):
+        outcome = _outcome(
+            ProposalState.REFUSED,
+            reused_from=ProposalRef(topic=TOPIC, run_id='orig'),
+            adjudication=_adjudication(),
+        ).to_payload()
+        del outcome['adjudication']['cost_usd']
+        broken = dataclasses.replace(
+            _row('refused', run_id='run-broken'), payload_json=json.dumps({'outcome': outcome}),
+        )
+
+        with caplog.at_level(logging.WARNING):
+            assert refusal_streak([broken, _acted_row(ProposalState.REFUSED)]) == 2
+
+        assert 'run-broken' in caplog.text
+        assert 'cost_usd' in caplog.text
 
 
 class TestNewestPerTopic:

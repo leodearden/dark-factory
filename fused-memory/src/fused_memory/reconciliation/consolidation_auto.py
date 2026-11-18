@@ -79,8 +79,8 @@ class AutoOutcome(StrEnum):
     unstamped members onto a topic that already has a canonical, touching that
     canonical's content and metadata not at all. ``NOOP`` means there is
     nothing to do (already consolidated, or a human already owns the topic).
-    ``FAIL`` means a hazard fired; each of its reasons is handled as
-    :data:`REASON_CODE_CLASSES` classifies it.
+    ``FAIL`` means a hazard fired; :data:`REASON_CODE_CLASSES` says who
+    decides each of its reasons.
     """
 
     PASS = 'pass'
