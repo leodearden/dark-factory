@@ -5,7 +5,7 @@ signal_leaves:
 - ε
 tasks:
 - label: α
-  task_id: null
+  task_id: 10736
   title: Task-verify lanes on the executing host
   capabilities:
   - name: verify-task-worktree-acquisition-seam
@@ -77,7 +77,7 @@ tasks:
       - orchestrator/tests/test_task_verify_lane.py
       expect: present
 - label: β
-  task_id: null
+  task_id: 10737
   title: Dispatcher record of lane facts and the degraded-lane alarm
   capabilities:
   - name: lane-facts-on-result
@@ -129,7 +129,7 @@ tasks:
       - orchestrator/tests/test_task_verify_integration.py
       expect: present
 - label: γ
-  task_id: null
+  task_id: 10738
   title: Host provisioning script, in-service check and operations notes
   capabilities:
   - name: lane-config-keys
@@ -170,7 +170,7 @@ tasks:
       - OPERATIONS.md
       expect: present
 - label: ε
-  task_id: null
+  task_id: 10739
   title: Enable task-verify lanes for reify on leo-laptop (operator gate)
   capabilities:
   - name: installer
