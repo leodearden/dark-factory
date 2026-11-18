@@ -949,6 +949,47 @@ class TestFormatUnattributedLandingDetail:
         assert 'no delivered_checks' in none_declared
         assert 'cap-x' in evaluated
 
+    @staticmethod
+    def _differential_block(**probe_extra: object) -> str:
+        """The rendered differential paragraph alone, without the raw ``probe:`` dump."""
+        probe = {
+            'task_id': '42', 'diverged_paths': [], 'delivered_checks_state': 'evaluated',
+            'delivered_checks_outcome': 'no_signal', 'delivered_checks_parent_ref': None,
+            'delivered_checks_legs': [],
+        }
+        probe.update(probe_extra)
+        detail = format_unattributed_landing_detail(
+            '42', 'task/42',
+            LandingEvidenceVerdict(
+                accepted=False, evidence_sha=None, reason='effect_absent', probe=probe,
+            ),
+        )[1]
+        [block] = [
+            paragraph for paragraph in detail.split('\n\n')
+            if paragraph.startswith('delivered-checks differential:')
+        ]
+        return block
+
+    def test_detail_names_the_rung_that_chose_the_parent_leg(self) -> None:
+        """Which baseline the differential ran against is runtime data (task 7836)."""
+        block = self._differential_block(
+            delivered_checks_parent_ref='9' * 40,
+            delivered_checks_baseline='recorded_branch_base',
+        )
+
+        assert '9' * 40 in block
+        assert 'recorded_branch_base' in block
+
+    def test_an_unavailable_baseline_reads_apart_from_a_run_that_recorded_none(self) -> None:
+        """A merge-commit tip on main with no trusted record runs no check.
+        Its block must say so, not read like a legacy probe with no baseline
+        and no legs, or an operator needs the raw probe to tell them apart."""
+        unavailable = self._differential_block(delivered_checks_baseline='unavailable')
+        unrecorded = self._differential_block()
+
+        assert unavailable != unrecorded
+        assert 'unavailable' in unavailable
+
 
 class TestFileUnattributedLandingEscalationDedup:
     """Category-scoped L1 dedup (task 3116).

@@ -2816,6 +2816,28 @@ def _render_effect_divergence(
     return block, fragment
 
 
+def _differential_baseline_lines(probe: dict[str, Any]) -> list[str]:
+    """The differential block's parent-leg line, naming the
+    :class:`DifferentialBaseline` rung that chose it; none for a probe that
+    recorded no parent leg.
+
+    An ``unavailable`` baseline gets its own sentence because it ran no
+    check: without one, its block would read like a run whose every check
+    found no signal.
+    """
+    baseline = probe.get('delivered_checks_baseline')
+    if baseline == DifferentialBaseline.unavailable:
+        return [
+            '  no pre-landing baseline (unavailable): the branch tip is a merge '
+            'commit already on main with no trusted branch_base_sha, so no '
+            'check was run'
+        ]
+    parent_ref = probe.get('delivered_checks_parent_ref')
+    if not parent_ref:
+        return []
+    return [f'  pre-landing baseline (the parent leg): {parent_ref} ({baseline})']
+
+
 def _render_delivered_checks_differential(
     verdict: LandingVerdict,
 ) -> str:
@@ -2866,9 +2888,7 @@ def _render_delivered_checks_differential(
             'switch the mark-done delivered-check gate honours).\n\n'
         )
     lines = [f'delivered-checks differential: {outcome}']
-    parent_ref = verdict.probe.get('delivered_checks_parent_ref')
-    if parent_ref:
-        lines.append(f'  pre-landing baseline (the parent leg): {parent_ref}')
+    lines.extend(_differential_baseline_lines(verdict.probe))
     for leg in verdict.probe.get('delivered_checks_legs') or []:
         name = leg.get('name')
         if 'parent' not in leg:
