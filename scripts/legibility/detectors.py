@@ -20,7 +20,7 @@ from typing import Any
 
 from legibility.reingestion import (
     TRICKLE_CODER_PROMPT_OPENER,
-    has_non_human_origin,
+    has_non_dialogue_provenance,
     is_reingested_content,
 )
 
@@ -125,9 +125,10 @@ def _raw_carriers(record: Mapping[str, Any]) -> Iterator[tuple[CarrierKind, str]
 
 def is_non_dialogue_carrier(record: Mapping[str, Any], text: str) -> bool:
     """The ONE question asked of a carrier before it counts as this
-    session's own dialogue: the record half is provenance, the text half is
-    content. The record half covers every carrier the record holds,
-    tool_results included.
+    session's own dialogue: the record half is provenance
+    (:func:`reingestion.has_non_dialogue_provenance` -- a non-human
+    ``origin``, or a headless SDK prompt), the text half is content. The
+    record half covers every carrier the record holds, tool_results included.
 
     Dropping is WHOLE-carrier on every carrier kind, so a genuine literal
     printed beside a harness prompt goes with it. That cost is accepted on
@@ -137,7 +138,7 @@ def is_non_dialogue_carrier(record: Mapping[str, Any], text: str) -> bool:
     of another session). Merely NAMING a harness heading drops nothing,
     because the heading rules are line-anchored.
     """
-    return has_non_human_origin(record) or is_reingested_content(text)
+    return has_non_dialogue_provenance(record) or is_reingested_content(text)
 
 
 DECOY_MARKER = '# decoy-fail'
