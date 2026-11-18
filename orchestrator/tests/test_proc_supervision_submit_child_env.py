@@ -10,116 +10,42 @@ gets nothing injected.
 
 from __future__ import annotations
 
-import asyncio
+import dataclasses
 import importlib.util
 import logging
 import os
 import shlex
 import sys
-from dataclasses import dataclass
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
-from _proc_supervision_doubles import FakeRunner, stub_find_spec
+from _proc_supervision_doubles import (
+    FakeRunner,
+    detached_rp4_plan,
+    fire_like_systemd_run,
+    read_env_probe,
+    stub_find_spec,
+    write_env_probe,
+)
+from _proc_supervision_doubles import tmp_queue_dir as tmp_queue_dir
 from escalation.queue import EscalationQueue
 
 from orchestrator.proc_supervision import (
-    EscalationSpec,
     RestartDisposition,
     RestartOutcome,
     RestartPlan,
 )
 
 _LOGGER = 'orchestrator.proc_supervision'
-_UNSET = '<unset>'
-_TASK_ID = 'task-99'
 _PAYLOAD_RC = 7
-# Inside pytest-timeout's 60s per-test budget, so a wedged child is named by
-# the AssertionError below rather than by an os._exit of the xdist worker
-# (same reasoning as test_deterministic_runner.py::_CHILD_TIMEOUT_SECS).
-_CHILD_TIMEOUT_SECS = 30
-# A strict subset of any real user manager's environment: a unit that works
-# here cannot be leaning on something only the caller's environment supplies.
-_USER_MANAGER_ENV = {'PATH': '/usr/bin:/bin', 'HOME': str(Path.home())}
-
-
-def _env_recording_stub(path: Path, record: Path, exit_code: int) -> Path:
-    """An executable that writes its own ``$PYTHONPATH`` (or :data:`_UNSET`) to *record*."""
-    path.write_text(
-        '#!/bin/sh\n'
-        f'printf %s "${{PYTHONPATH-{_UNSET}}}" > {shlex.quote(str(record))}\n'
-        f'exit {exit_code}\n'
-    )
-    path.chmod(0o755)
-    return path
-
-
-def _systemd_run_env_and_cwd(options: tuple[str, ...]) -> tuple[dict[str, str], str]:
-    """The environment and cwd systemd-run would give the unit for *options*.
-
-    MEASURED in task 3453: ``systemd-run --user`` propagates none of the
-    caller's environment; the unit starts from the user manager's own. That is
-    modelled as :data:`_USER_MANAGER_ENV`, so nothing of this process (its
-    PYTHONPATH, VIRTUAL_ENV or PATH) leaks in. ``--setenv=K=V`` options then
-    set a variable for the whole unit.
-    """
-    env = dict(_USER_MANAGER_ENV)
-    cwd = None
-    for option in options:
-        if option.startswith('--setenv='):
-            key, _, value = option.removeprefix('--setenv=').partition('=')
-            env[key] = value
-        elif option.startswith('--working-directory='):
-            cwd = option.removeprefix('--working-directory=')
-    assert cwd is not None, f'no --working-directory option in {options!r}'
-    return env, cwd
-
-
-async def _fire_like_systemd_run(argv: tuple[str, ...]) -> tuple[int, str]:
-    """Run the registered unit's command now; return ``(rc, combined_output)``."""
-    sh_at = argv.index('/bin/sh')
-    env, cwd = _systemd_run_env_and_cwd(argv[:sh_at])
-    proc = await asyncio.create_subprocess_exec(
-        *argv[sh_at:],
-        env=env,
-        cwd=cwd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
-    )
-    try:
-        out, _ = await asyncio.wait_for(proc.communicate(), timeout=_CHILD_TIMEOUT_SECS)
-    except TimeoutError:
-        proc.kill()
-        try:
-            out, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-        except TimeoutError:
-            out = b''
-        raise AssertionError(
-            f'the fired unit did not exit within {_CHILD_TIMEOUT_SECS}s and was '
-            f'killed. argv: {argv!r}. Output before the kill: '
-            f'{out.decode(errors="replace")!r}'
-        ) from None
-    output = out.decode(errors='replace')
-    rc = proc.returncode
-    assert rc is not None, f'communicate() returned but the child has no exit status: {output!r}'
-    return rc, output
 
 
 def _rp4_plan(workdir: Path, payload: Path) -> RestartPlan:
-    return RestartPlan(
+    return dataclasses.replace(
+        detached_rp4_plan(workdir / 'escalations', with_spec=True),
         script=payload,
-        args=['--foo'],
         cwd=workdir,
-        target_unit='orch.service',
-        own_unit='orch.service',
-        on_failure_escalation=EscalationSpec(
-            queue_dir=str(workdir / 'escalations'),
-            task_id=_TASK_ID,
-            summary='Self-restart fire-time failure',
-        ),
-        verify=None,
-        transient_unit='orch-redeploy-restart-99.service',
-        on_active_secs=10,
     )
 
 
@@ -130,44 +56,44 @@ async def _register(plan: RestartPlan) -> tuple[tuple[str, ...], RestartOutcome]
     return argv, outcome
 
 
-@dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True)
 class _FiredUnit:
-    argv: tuple[str, ...]
     outcome: RestartOutcome
-    payload_pythonpath: str
-    submit_pythonpath: str
+    payload_env: Mapping[str, str]
+    submit_env: Mapping[str, str]
 
 
 async def _fire_failing_deploy(workdir: Path, monkeypatch: pytest.MonkeyPatch) -> _FiredUnit:
-    """Register and fire a deploy whose payload fails, recording each child's PYTHONPATH.
+    """Register and fire a deploy whose payload fails, recording each child's environment.
 
     ``sys.executable`` is patched to a recording stub; this reaches the real
     wrapper because ``RestartPlan`` reads it at execute() time.
     """
-    payload_record = workdir / 'payload.pythonpath'
-    submit_record = workdir / 'submit.pythonpath'
-    payload = _env_recording_stub(workdir / 'payload.sh', payload_record, _PAYLOAD_RC)
+    payload_record = workdir / 'payload.env'
+    submit_record = workdir / 'submit.env'
+    payload = write_env_probe(
+        workdir / 'payload.sh', record_to=payload_record, exit_code=_PAYLOAD_RC,
+    )
     monkeypatch.setattr(
         sys, 'executable',
-        str(_env_recording_stub(workdir / 'stub-python', submit_record, 0)),
+        str(write_env_probe(workdir / 'stub-python', record_to=submit_record, exit_code=0)),
     )
     argv, outcome = await _register(_rp4_plan(workdir, payload))
 
-    rc, output = await _fire_like_systemd_run(argv)
+    rc, output = await fire_like_systemd_run(argv)
 
     assert rc == _PAYLOAD_RC, f'expected the payload rc {_PAYLOAD_RC}, got {rc}: {output!r}'
     assert submit_record.exists(), f'the on-failure submit branch never ran: {output!r}'
     return _FiredUnit(
-        argv=argv,
         outcome=outcome,
-        payload_pythonpath=payload_record.read_text(),
-        submit_pythonpath=submit_record.read_text(),
+        payload_env=read_env_probe(payload_record),
+        submit_env=read_env_probe(submit_record),
     )
 
 
-def _roots(pythonpath: str) -> list[str]:
-    assert pythonpath != _UNSET, 'the submit child received no PYTHONPATH at all'
-    return pythonpath.split(os.pathsep)
+def _roots(env: Mapping[str, str]) -> list[str]:
+    assert 'PYTHONPATH' in env, 'the submit child received no PYTHONPATH at all'
+    return env['PYTHONPATH'].split(os.pathsep)
 
 
 def _resolves(roots: list[str], package: str) -> bool:
@@ -198,11 +124,11 @@ class TestSubmitChildPythonPathScope:
 
         fired = await _fire_failing_deploy(tmp_path, monkeypatch)
 
-        assert fired.payload_pythonpath == _UNSET, (
+        assert 'PYTHONPATH' not in fired.payload_env, (
             'the deploy payload shares the transient unit with the submit child '
-            f'but must not inherit its PYTHONPATH: {fired.payload_pythonpath!r}'
+            f"but must not inherit its PYTHONPATH: {fired.payload_env['PYTHONPATH']!r}"
         )
-        roots = _roots(fired.submit_pythonpath)
+        roots = _roots(fired.submit_env)
         for root in roots:
             assert root, f'no empty PYTHONPATH entry may be supplied: {roots!r}'
             assert Path(root).is_absolute(), (
@@ -234,17 +160,18 @@ class TestSubmitChildPythonPathScope:
     async def test_ambient_pythonpath_resupplied_first_to_submit_child_only(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        sentinel = '/tmp/df 5509 ambient-sentinel'
+        sentinel = '/tmp/df 5509 $x ${HOME} $$'
         monkeypatch.setenv('PYTHONPATH', sentinel)
 
         fired = await _fire_failing_deploy(tmp_path, monkeypatch)
 
-        roots = _roots(fired.submit_pythonpath)
+        roots = _roots(fired.submit_env)
         assert roots[0] == sentinel, (
             "this process's own PYTHONPATH must reach the submit child first and "
-            f'byte-exact: {roots!r}'
+            "byte-exact, through systemd's ExecStart `$` expansion and the shell: "
+            f'{roots!r}'
         )
-        assert fired.payload_pythonpath == _UNSET, fired.payload_pythonpath
+        assert 'PYTHONPATH' not in fired.payload_env, fired.payload_env
 
         monkeypatch.delenv('PYTHONPATH')
         second = tmp_path / 'second'
@@ -252,7 +179,7 @@ class TestSubmitChildPythonPathScope:
 
         refired = await _fire_failing_deploy(second, monkeypatch)
 
-        reroots = _roots(refired.submit_pythonpath)
+        reroots = _roots(refired.submit_env)
         assert reroots, 'with PYTHONPATH unset the resolved-root floor must still be supplied'
         assert sentinel not in reroots, (
             f'the value is recomputed per call, never cached: {reroots!r}'
@@ -270,8 +197,8 @@ class TestSubmitChildPythonPathScope:
         with caplog.at_level(logging.WARNING, logger=_LOGGER):
             fired = await _fire_failing_deploy(tmp_path, monkeypatch)
 
-        assert fired.submit_pythonpath == _UNSET, (
-            f'nothing resolved, so nothing may be injected: {fired.submit_pythonpath!r}'
+        assert 'PYTHONPATH' not in fired.submit_env, (
+            f"nothing resolved, so nothing may be injected: {fired.submit_env['PYTHONPATH']!r}"
         )
         assert any('escalation' in m and 'PYTHONPATH' in m for m in _warnings(caplog)), (
             'an unresolvable submit-child package must be reported by name '
@@ -294,7 +221,7 @@ class TestSubmitChildPythonPathScope:
         with caplog.at_level(logging.WARNING, logger=_LOGGER):
             fired = await _fire_failing_deploy(tmp_path, monkeypatch)
 
-        roots = _roots(fired.submit_pythonpath)
+        roots = _roots(fired.submit_env)
         assert _resolves(roots, 'escalation'), (
             f'the root that DID resolve must still be supplied: {roots!r}'
         )
@@ -309,40 +236,46 @@ class TestSubmitChildPythonPathScope:
     async def test_real_submit_child_files_l2_with_only_the_prefixed_pythonpath(
         self, tmp_path: Path,
     ) -> None:
-        payload = _env_recording_stub(
-            tmp_path / 'payload.sh', tmp_path / 'payload.pythonpath', _PAYLOAD_RC,
-        )
-        argv, _outcome = await _register(_rp4_plan(tmp_path, payload))
+        """Guards that the prefixed command still runs and files the L2 byte-exact.
 
-        rc, output = await _fire_like_systemd_run(argv)
+        Not evidence that the prefix is necessary: an editable-install venv
+        imports the workspace packages with no PYTHONPATH at all. Necessity is
+        pinned by the stub-interpreter cells above.
+        """
+        payload = write_env_probe(
+            tmp_path / 'payload.sh', record_to=tmp_path / 'payload.env', exit_code=_PAYLOAD_RC,
+        )
+        plan = _rp4_plan(tmp_path, payload)
+        assert plan.on_failure_escalation is not None
+        spec = dataclasses.replace(
+            plan.on_failure_escalation, summary='fire-time failure $x ${HOME} $$ end',
+        )
+        argv, _outcome = await _register(dataclasses.replace(plan, on_failure_escalation=spec))
+
+        rc, output = await fire_like_systemd_run(argv)
 
         assert rc == _PAYLOAD_RC, (
             f'expected the payload rc {_PAYLOAD_RC} (97 means the submit failed), '
             f'got {rc}: {output!r}'
         )
-        filed = EscalationQueue(tmp_path / 'escalations').get_by_task(
-            _TASK_ID, agent_role='orchestrator-deterministic',
+        filed = EscalationQueue(Path(spec.queue_dir)).get_by_task(
+            spec.task_id, agent_role=spec.agent_role,
         )
-        assert len(filed) == 1, f'exactly one L2 must be filed, got {filed!r}: {output!r}'
+        assert [e.summary for e in filed] == [spec.summary], (
+            'exactly one L2 must be filed, its summary intact through '
+            f"systemd's ExecStart `$` expansion: {filed!r}: {output!r}"
+        )
 
 
 @pytest.mark.asyncio
 class TestNoSubmitChildNoEnvironment:
-    async def test_no_setenv_when_plan_has_no_escalation_spec(self) -> None:
+    async def test_no_setenv_when_plan_has_no_escalation_spec(
+        self, tmp_queue_dir: Path,
+    ) -> None:
         """A plan with no EscalationSpec has no submit child, so its argv carries
         no --setenv option and stays byte-identical."""
         runner = FakeRunner(returncode=0)
-        plan = RestartPlan(
-            script=Path('/proj/scripts/restart-orchestrator.sh'),
-            args=['--foo'],
-            cwd=Path('/proj'),
-            target_unit='orch.service',
-            own_unit='orch.service',
-            on_failure_escalation=None,
-            verify=None,
-            transient_unit='orch-redeploy-restart-99.service',
-            on_active_secs=10,
-        )
+        plan = detached_rp4_plan(tmp_queue_dir, with_spec=False)
 
         await plan.execute(runner=runner)
 

@@ -5,8 +5,9 @@ like ``_orch_helpers`` -- ``orchestrator/tests/`` has no ``__init__.py``.
 
 One copy each of the subprocess-runner and unit-inspector doubles, the
 canonical detached RP-4 restart plan, the ``find_spec`` stub, the
-``tmp_queue_dir`` escalation queue_dir fixture and the ``read_escalations``
-EscalationQueue read helper, so every proc_supervision test file pins the
+``tmp_queue_dir`` escalation queue_dir fixture, the ``read_escalations``
+EscalationQueue read helper, the environment-recording probe and the model of
+a fired ``systemd-run`` unit, so every proc_supervision test file pins the
 same shapes and degrades import roots the same way. A module using the
 fixture re-exports it by redundant alias
 (``from _proc_supervision_doubles import tmp_queue_dir as tmp_queue_dir``):
@@ -16,8 +17,13 @@ needs no lint suppression.
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
+import re
+import shlex
+from collections.abc import Mapping, Sequence
 from pathlib import Path
+from types import MappingProxyType
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -147,3 +153,102 @@ def stub_find_spec(monkeypatch: pytest.MonkeyPatch, unresolvable: set[str]) -> N
         return real(name, package)
 
     monkeypatch.setattr(importlib.util, 'find_spec', _fake)
+
+
+def write_env_probe(path: Path, *, record_to: Path, exit_code: int) -> Path:
+    """Write an executable ``#!/bin/sh`` stub that ignores argv, records its
+    whole environment into *record_to* (read it back with
+    :func:`read_env_probe`) and exits *exit_code*."""
+    path.write_text(
+        '#!/bin/sh\n'
+        f'env -0 > {shlex.quote(str(record_to))}\n'
+        f'exit {exit_code}\n'
+    )
+    path.chmod(0o755)
+    return path
+
+
+def read_env_probe(record: Path) -> dict[str, str]:
+    """The environment a :func:`write_env_probe` stub ran with."""
+    env = {}
+    for entry in filter(None, record.read_text().split('\0')):
+        name, _, value = entry.partition('=')
+        env[name] = value
+    return env
+
+
+# MEASURED in task 3453: ``systemd-run --user`` propagates none of the caller's
+# environment; the unit starts from the user manager's own. This is a strict
+# subset of any real user manager's environment, so a unit that works here
+# cannot be leaning on something only the caller's environment supplies.
+USER_MANAGER_ENV: Mapping[str, str] = MappingProxyType(
+    {'PATH': '/usr/bin:/bin', 'HOME': str(Path.home())},
+)
+
+# Inside pytest-timeout's 60s per-test budget, so a wedged child is named by
+# the AssertionError below rather than by an os._exit of the xdist worker
+# (same reasoning as test_deterministic_runner.py::_CHILD_TIMEOUT_SECS).
+_FIRED_UNIT_TIMEOUT_SECS = 30
+
+_EXECSTART_EXPANSION = re.compile(r'\$(?:\$|\{([A-Za-z_][A-Za-z0-9_]*)\})')
+
+
+def _systemd_run_unit_env_and_cwd(
+    options: Sequence[str], unit_env: Mapping[str, str],
+) -> tuple[dict[str, str], str]:
+    env = dict(unit_env)
+    cwd = None
+    for option in options:
+        if option.startswith('--setenv='):
+            name, _, value = option.removeprefix('--setenv=').partition('=')
+            env[name] = value
+        elif option.startswith('--working-directory='):
+            cwd = option.removeprefix('--working-directory=')
+    assert cwd is not None, f'no --working-directory option in {options!r}'
+    return env, cwd
+
+
+def _as_systemd_execstart_runs(word: str, env: Mapping[str, str]) -> str:
+    """systemd's ``$$`` -> ``$`` and ``${NAME}`` expansion inside one ExecStart argv word."""
+    return _EXECSTART_EXPANSION.sub(
+        lambda m: '$' if m.group(0) == '$$' else env.get(m.group(1), ''),
+        word,
+    )
+
+
+async def fire_like_systemd_run(
+    argv: Sequence[str], *, unit_env: Mapping[str, str] = USER_MANAGER_ENV,
+) -> tuple[int, str]:
+    """Run a registered ``systemd-run ... /bin/sh -c <wrapped>`` unit now, the
+    way the user manager would fire it; return ``(rc, combined_output)``.
+
+    The command starts from *unit_env* plus any ``--setenv=`` options, never
+    this process's environment; runs in ``--working-directory``; and has each
+    ExecStart word put through systemd's ``$`` expansion first.
+    """
+    sh_at = list(argv).index('/bin/sh')
+    env, cwd = _systemd_run_unit_env_and_cwd(argv[:sh_at], unit_env)
+    proc = await asyncio.create_subprocess_exec(
+        *(_as_systemd_execstart_runs(word, env) for word in argv[sh_at:]),
+        env=env,
+        cwd=cwd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=_FIRED_UNIT_TIMEOUT_SECS)
+    except TimeoutError:
+        proc.kill()
+        try:
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+        except TimeoutError:
+            out = b''
+        raise AssertionError(
+            f'the fired unit did not exit within {_FIRED_UNIT_TIMEOUT_SECS}s and '
+            f'was killed. argv: {argv!r}. Output before the kill: '
+            f'{out.decode(errors="replace")!r}'
+        ) from None
+    output = out.decode(errors='replace')
+    rc = proc.returncode
+    assert rc is not None, f'communicate() returned but the child has no exit status: {output!r}'
+    return rc, output

@@ -9,18 +9,19 @@ Shared proc_supervision test scaffolding lives in _proc_supervision_doubles.
 
 from __future__ import annotations
 
-import re
 import shlex
-from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
 from _proc_supervision_doubles import (
     FakeRunner,
     detached_rp4_plan,
+    fire_like_systemd_run,
     make_fake_inspector,
+    read_env_probe,
     read_escalations,
     stub_find_spec,
+    write_env_probe,
 )
 from _proc_supervision_doubles import tmp_queue_dir as tmp_queue_dir
 from escalation.queue import EscalationQueue
@@ -1238,10 +1239,8 @@ async def _run_rp4_wrapper(
     Returns ``(returncode, combined_output)`` so assertions can quote what the
     child actually printed.
     """
-    import asyncio
+    import dataclasses
     import sys
-
-    from orchestrator.proc_supervision import EscalationSpec, RestartPlan
 
     payload = _write_stub(tmp_path / 'payload.sh', 7)
     monkeypatch.setattr(
@@ -1249,42 +1248,12 @@ async def _run_rp4_wrapper(
     )
 
     runner = FakeRunner(returncode=0)
-    plan = RestartPlan(
-        script=payload,
-        args=['--foo'],
-        cwd=tmp_path,
-        target_unit='orch.service',
-        own_unit='orch.service',
-        on_failure_escalation=EscalationSpec(
-            queue_dir=str(tmp_queue_dir),
-            task_id='task-99',
-            summary='Self-restart fire-time failure',
-        ),
-        verify=None,
-        transient_unit='orch-redeploy-restart-99.service',
-        on_active_secs=10,
+    plan = dataclasses.replace(
+        detached_rp4_plan(tmp_queue_dir, with_spec=True), script=payload, cwd=tmp_path,
     )
     await plan.execute(runner=runner)
-    wrapped = runner.calls[0][0][-1]
 
-    proc = await asyncio.create_subprocess_exec(
-        '/bin/sh', '-c', wrapped,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
-    )
-    out, _ = await proc.communicate()
-    output = out.decode(errors='replace')
-    # `communicate()` has reaped the child, so returncode is always set — but it
-    # is typed `int | None`, so narrow it explicitly.  NOT `proc.returncode or
-    # 0`: that would silently report an unexited child as a clean exit 0, which
-    # is the exact value the success-path caller asserts on.  Same idiom as
-    # shared/tests/test_proc_group.py:524 and the sibling helper in
-    # test_deterministic_runner.py::_run_wrapper_payload.
-    rc = proc.returncode
-    assert rc is not None, (
-        f'communicate() returned but the child has no exit status; output: {output!r}'
-    )
-    return rc, output
+    return await fire_like_systemd_run(runner.calls[0][0])
 
 
 @pytest.mark.asyncio
@@ -1575,30 +1544,6 @@ class TestSubmitChildInterpreterGuarantee:
 # ---------------------------------------------------------------------------
 
 
-def _write_env_probe(path: Path, *, record_to: Path, exit_code: int) -> Path:
-    """Write an executable stub that records ``[$MODE][$PYTHONPATH]`` (or
-    ``unset``) into *record_to*, ignores argv, and exits *exit_code*."""
-    path.write_text(
-        '#!/bin/sh\n'
-        'printf "[%s][%s]" "${MODE-unset}" "${PYTHONPATH-unset}" > '
-        f'{shlex.quote(str(record_to))}\n'
-        f'exit {exit_code}\n'
-    )
-    path.chmod(0o755)
-    return path
-
-
-_SYSTEMD_EXECSTART_EXPANSION = re.compile(r'\$(?:\$|\{([A-Za-z_][A-Za-z0-9_]*)\})')
-
-
-def _as_systemd_execstart_runs(command: str, unit_env: Mapping[str, str]) -> str:
-    """Model systemd's ``$$`` -> ``$`` and ``${NAME}`` expansion inside an ExecStart argv word."""
-    return _SYSTEMD_EXECSTART_EXPANSION.sub(
-        lambda m: '$' if m.group(0) == '$$' else unit_env.get(m.group(1), ''),
-        command,
-    )
-
-
 @pytest.mark.asyncio
 class TestDetachedPayloadCarriesEnv:
     """Each ``RestartPlan.env`` entry becomes a ``KEY=<quoted value>``
@@ -1678,21 +1623,18 @@ class TestDetachedPayloadCarriesEnv:
     async def test_env_reaches_the_payload_but_not_the_submit_child(
         self, tmp_path: Path, tmp_queue_dir: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Executes the REAL wrapper the way the fired unit would: from a bare
-        environment, with a failing payload so the submit child runs too."""
-        import asyncio
+        """Fires the REAL wrapper the way systemd-run would, with a failing
+        payload so the submit child runs too."""
         import dataclasses
         import os
         import sys
 
-        from orchestrator.proc_supervision import _submit_child_pythonpath
-
         payload_saw = tmp_path / 'payload-saw'
         submit_saw = tmp_path / 'submit-saw'
-        payload = _write_env_probe(tmp_path / 'payload.sh', record_to=payload_saw, exit_code=7)
+        payload = write_env_probe(tmp_path / 'payload.sh', record_to=payload_saw, exit_code=7)
         monkeypatch.setattr(
             sys, 'executable',
-            str(_write_env_probe(tmp_path / 'stub-python', record_to=submit_saw, exit_code=0)),
+            str(write_env_probe(tmp_path / 'stub-python', record_to=submit_saw, exit_code=0)),
         )
         plan = dataclasses.replace(
             detached_rp4_plan(tmp_queue_dir, with_spec=True),
@@ -1703,20 +1645,18 @@ class TestDetachedPayloadCarriesEnv:
         runner = FakeRunner(returncode=0)
         await plan.execute(runner=runner)
 
-        proc = await asyncio.create_subprocess_exec(
-            '/bin/sh', '-c',
-            _as_systemd_execstart_runs(runner.calls[0][0][-1], {'HOME': '/home/unit-user'}),
-            env={'PATH': os.environ['PATH']},
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-        )
-        out, _ = await proc.communicate()
+        rc, out = await fire_like_systemd_run(runner.calls[0][0])
 
-        assert proc.returncode == 7, out
-        assert payload_saw.read_text() == '[two $$words ${HOME}][/payload-only]'
-        assert submit_saw.read_text() == f'[unset][{_submit_child_pythonpath()}]', (
+        assert rc == 7, out
+        payload_env = read_env_probe(payload_saw)
+        assert (payload_env.get('MODE'), payload_env.get('PYTHONPATH')) == (
+            'two $$words ${HOME}', '/payload-only',
+        )
+        submit_env = read_env_probe(submit_saw)
+        assert 'MODE' not in submit_env, submit_env
+        assert '/payload-only' not in submit_env.get('PYTHONPATH', '').split(os.pathsep), (
             'the plan env must reach the payload alone; the RP-4 submit child '
-            'keeps only its own PYTHONPATH'
+            f'keeps only its own PYTHONPATH: {submit_env!r}'
         )
 
 

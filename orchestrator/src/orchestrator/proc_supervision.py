@@ -184,7 +184,8 @@ def _submit_child_pythonpath() -> str:
 
 
 def _submit_child_shell_command(spec: EscalationSpec, python_exe: str) -> str:
-    """The ``/bin/sh`` command line that runs the RP-4 submit child.
+    """The ``/bin/sh`` command line that runs the RP-4 submit child, already
+    escaped as an ExecStart literal (:func:`_systemd_execstart_literal`).
 
     PYTHONPATH rides as a shell assignment prefix, so it is scoped to this one
     command and never reaches the deploy payload sharing the unit (task 5509).
@@ -198,8 +199,8 @@ def _submit_child_shell_command(spec: EscalationSpec, python_exe: str) -> str:
             'empty PYTHONPATH systemd-run gives it (per-package causes logged '
             'above)',
         )
-        return command
-    return f'PYTHONPATH={_systemd_execstart_literal(shlex.quote(pythonpath))} {command}'
+        return _systemd_execstart_literal(command)
+    return _systemd_execstart_literal(f'PYTHONPATH={shlex.quote(pythonpath)} {command}')
 
 
 def _warn_if_submit_module_unimportable(transient_unit: str | None) -> None:
