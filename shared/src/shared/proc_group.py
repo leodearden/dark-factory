@@ -76,7 +76,7 @@ import os
 import re
 import signal
 import time
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from enum import Enum, auto
 from pathlib import Path
 from typing import NamedTuple, NewType, Protocol
@@ -778,13 +778,32 @@ def _path_at_or_under(candidate: str, root: str) -> bool:
 
     Boundary-safe: exact equality OR ``startswith(root + os.sep)``, so a
     sibling like ``/x/_merge-verifyXYZ`` never matches root ``/x/_merge-verify``.
-    A root of ``/`` covers every absolute path.
     """
-    return candidate == root or candidate.startswith(root.rstrip(os.sep) + os.sep)
+    return candidate == root or candidate.startswith(root + os.sep)
 
 
-def _path_at_or_under_any(candidate: str, views: tuple[str, ...]) -> bool:
-    return any(_path_at_or_under(candidate, view) for view in views)
+def _path_at_or_under_mount_point(candidate: str, mount_point: str) -> bool:
+    """:func:`_path_at_or_under` for a mount point, where ``/`` covers every absolute path.
+
+    A scan's root bound as a namespace's own root has the mount point ``/``. Only a
+    resolved mount point gets this rule; a queried root of ``/`` keeps the plain one.
+    """
+    if mount_point == os.sep:
+        return candidate.startswith(os.sep)
+    return _path_at_or_under(candidate, mount_point)
+
+
+class _RootNames(NamedTuple):
+    """The paths by which one process names a scan's root: root, and its mount points there."""
+
+    root: str
+    mount_points: tuple[str, ...] = ()
+
+    def cover(self, candidate: str) -> bool:
+        """True iff *candidate* is at-or-under root or one of the mount points binding it."""
+        return _path_at_or_under(candidate, self.root) or any(
+            _path_at_or_under_mount_point(candidate, mp) for mp in self.mount_points
+        )
 
 
 class _FileIdentity(NamedTuple):
@@ -854,32 +873,40 @@ class _RootViews:
     identified, sees root only as root. A process in a foreign namespace also sees it at
     each mount point binding root there, resolved once per namespace for this scan. A
     namespace whose root cannot be read adds no view, and its next pid tries again.
+    *resolve_bindings* finds those mount points through one pid of the namespace.
     """
 
-    def __init__(self, root: str) -> None:
+    def __init__(
+        self,
+        root: str,
+        resolve_bindings: Callable[
+            [Path, _FileIdentity], tuple[str, ...] | None
+        ] = _mount_points_bound_to,
+    ) -> None:
         self._root = root
         self._identity = _file_identity(root)
         self._own_namespace = _mount_namespace(_PROC_ROOT / 'self')
-        self._by_namespace: dict[_FileIdentity, tuple[str, ...]] = {}
+        self._resolve_bindings = resolve_bindings
+        self._by_namespace: dict[_FileIdentity, _RootNames] = {}
 
-    def of(self, entry: Path) -> tuple[str, ...]:
-        """Root's views for the pid at *entry*: root first, then its mount points there."""
-        only_root = (self._root,)
+    def of(self, entry: Path) -> _RootNames:
+        """The names of root for the pid at *entry*."""
+        only_root = _RootNames(self._root)
         if self._identity is None or self._own_namespace is None:
             return only_root
         namespace = _mount_namespace(entry)
         if namespace is None or namespace == self._own_namespace:
             return only_root
         if namespace not in self._by_namespace:
-            bound = _mount_points_bound_to(entry, self._identity)
+            bound = self._resolve_bindings(entry, self._identity)
             if bound is None:
                 return only_root
-            self._by_namespace[namespace] = (self._root, *bound)
+            self._by_namespace[namespace] = _RootNames(self._root, bound)
         return self._by_namespace[namespace]
 
 
-def _pid_references_path_at_or_under(entry: Path, views: tuple[str, ...]) -> bool:
-    """True if the pid at *entry* (=/proc/<pid>) touches a path at-or-under any of *views*.
+def _pid_references_path_at_or_under(entry: Path, names: _RootNames) -> bool:
+    """True if the pid at *entry* (=/proc/<pid>) touches a path at-or-under any of root's *names*.
 
     Short-circuits cheapest-first: cwd, then open fds, then mmap'd pathnames
     from ``maps``.  Every per-pid I/O is wrapped so a vanished or
@@ -891,7 +918,7 @@ def _pid_references_path_at_or_under(entry: Path, views: tuple[str, ...]) -> boo
     """
     # 1. cwd — the most common and cheapest signal (cargo/rustc run in the tree).
     with contextlib.suppress(OSError):
-        if _path_at_or_under_any(os.readlink(entry / 'cwd'), views):
+        if names.cover(os.readlink(entry / 'cwd')):
             return True
 
     # 2. open fds — an open build artifact / lockfile under the tree.
@@ -901,7 +928,7 @@ def _pid_references_path_at_or_under(entry: Path, views: tuple[str, ...]) -> boo
                 target = os.readlink(fd_entry)
             except OSError:
                 continue
-            if _path_at_or_under_any(target, views):
+            if names.cover(target):
                 return True
 
     # 3. mmap'd pathnames — an mmap'd .rlib / .so living under the tree.
@@ -919,7 +946,7 @@ def _pid_references_path_at_or_under(entry: Path, views: tuple[str, ...]) -> boo
         pathname = parts[5]
         if not pathname.startswith('/'):
             continue
-        if _path_at_or_under_any(pathname, views):
+        if names.cover(pathname):
             return True
     return False
 
@@ -997,7 +1024,7 @@ def _cpu_ticks_if_under(entry: Path, views: _RootViews, exclude: frozenset[int])
         cwd = os.readlink(entry / 'cwd')
     except OSError:
         return None
-    return read_cpu_ticks(entry) if _path_at_or_under_any(cwd, views.of(entry)) else None
+    return read_cpu_ticks(entry) if views.of(entry).cover(cwd) else None
 
 
 def _cpu_ticks_under_path_unsafe(root: str, exclude: frozenset[int]) -> int | None:
@@ -1029,7 +1056,7 @@ def cpu_ticks_under_path(
     is never read as "an idle process".  The sum is not monotonic: a process
     exiting removes its ticks, so callers compare samples for CHANGE.
 
-    Deliberately cwd-only: a stat read and a readlink per pid, cheaper than
+    Deliberately cwd-only: a stat read, a namespace stat and a readlink per pid, cheaper than
     :func:`scan_process_groups_under_path`'s fd and maps walk.  Verify
     subprocesses (bash, pytest and its xdist workers, cargo/rustc) run with
     their cwd inside the worktree.  Never raises, like that scan.

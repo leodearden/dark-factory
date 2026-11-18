@@ -19,8 +19,8 @@ from pathlib import Path
 import pytest
 from _synthetic_proc import synthetic_stat_line
 
-import shared.proc_group as proc_group_module
 from shared.proc_group import (
+    _RootViews,
     cpu_ticks_under_path,
     pid_running,
     read_cpu_ticks,
@@ -193,20 +193,20 @@ class TestNamespaceTranslationAgainstASyntheticProc:
         assert scan_process_groups_under_path(namespaces.lane) == {101}
 
     def test_one_namespace_is_resolved_once_per_scan(
-        self, namespaces: _FabricatedNamespaces, monkeypatch: pytest.MonkeyPatch
+        self, namespaces: _FabricatedNamespaces
     ) -> None:
         namespaces.add_sandboxed(101, cwd=f'{_MOUNT_POINT}/sub')
         namespaces.add_sandboxed(102, cwd=f'{_MOUNT_POINT}/sub')
         resolved: list[str] = []
-        real = proc_group_module._mount_points_bound_to
 
-        def counting(entry, identity):
+        def counting(entry: Path, identity: object) -> tuple[str, ...]:
             resolved.append(entry.name)
-            return real(entry, identity)
+            return (_MOUNT_POINT,)
 
-        monkeypatch.setattr('shared.proc_group._mount_points_bound_to', counting)
+        views = _RootViews(str(namespaces.lane), resolve_bindings=counting)
+        names = [views.of(namespaces.proc_root / pid) for pid in ('101', '102')]
 
-        assert scan_process_groups_under_path(namespaces.lane) == {101, 102}
+        assert [n.mount_points for n in names] == [(_MOUNT_POINT,)] * 2
         assert len(resolved) == 1, f'the sandbox namespace was resolved for each of {resolved}'
 
     def test_a_sibling_of_the_mount_point_is_not_found(
@@ -231,6 +231,39 @@ class TestNamespaceTranslationAgainstASyntheticProc:
         )
 
         assert scan_process_groups_under_path(namespaces.lane) == {101}
+
+    @pytest.mark.parametrize(
+        ('unreadable', 'readable'),
+        [pytest.param(101, 102, id='101-unreadable'), pytest.param(102, 101, id='102-unreadable')],
+    )
+    def test_an_unreadable_root_does_not_hide_its_namespace_from_the_next_pid(
+        self, namespaces: _FabricatedNamespaces, unreadable: int, readable: int
+    ) -> None:
+        """One order iterates the unreadable pid first, whatever order the directory lists."""
+        namespaces.add_pid(
+            unreadable, ns=namespaces.sandbox, root=None, mountinfo=namespaces.mountinfo(_MOUNT_POINT)
+        )
+        namespaces.add_sandboxed(readable, cwd=f'{_MOUNT_POINT}/sub')
+
+        assert scan_process_groups_under_path(namespaces.lane) == {readable}
+
+    def test_an_unidentifiable_own_namespace_translates_nothing(
+        self, namespaces: _FabricatedNamespaces
+    ) -> None:
+        (namespaces.proc_root / 'self' / 'ns' / 'mnt').unlink()
+        namespaces.add_sandboxed(101, cwd=f'{_MOUNT_POINT}/sub')
+        namespaces.add_sandboxed(102, cwd=str(namespaces.lane / 'sub'))
+
+        assert scan_process_groups_under_path(namespaces.lane) == {102}
+
+    def test_a_queried_root_of_slash_matches_only_slash_itself(
+        self, namespaces: _FabricatedNamespaces
+    ) -> None:
+        """A mount point of ``/`` covers every path; the queried root keeps its plain prefix rule."""
+        for pid, cwd in ((101, '/'), (102, str(namespaces.lane / 'sub'))):
+            namespaces.add_pid(pid, ns=namespaces.host, root=None, mountinfo='', cwd=cwd)
+
+        assert scan_process_groups_under_path('/') == {101}
 
     def test_a_pid_in_the_scanners_own_namespace_is_not_translated(
         self, namespaces: _FabricatedNamespaces
