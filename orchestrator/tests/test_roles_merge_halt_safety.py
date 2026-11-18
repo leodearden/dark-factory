@@ -282,11 +282,13 @@ def test_safety_rule_names_no_category_outside_the_tuple() -> None:
     by the gate anchor and the forward containment test, so the coverage gap
     here is bounded and deliberate.
     """
-    named = set(re.findall(_CATEGORY_TOKEN_PATTERN, MERGE_HALT_SAFETY_RULE))
-    stale = sorted(named - set(MERGE_HALT_ESCALATION_CATEGORIES))
+    stale = sorted(
+        _registered_categories_named_in(MERGE_HALT_SAFETY_RULE)
+        - set(MERGE_HALT_ESCALATION_CATEGORIES)
+    )
     assert stale == [], (
-        f'MERGE_HALT_SAFETY_RULE names category-shaped token(s) {stale} that '
-        f'are not in MERGE_HALT_ESCALATION_CATEGORIES '
+        f'MERGE_HALT_SAFETY_RULE names registered EscalationCategory value(s) '
+        f'{stale} that are not in MERGE_HALT_ESCALATION_CATEGORIES '
         f'{sorted(MERGE_HALT_ESCALATION_CATEGORIES)}.  Either the category was '
         'dropped from the harness gate and its name is now stale prose in the '
         "steward's rule -- delete it -- or the rule gained a category the gate "
@@ -294,6 +296,32 @@ def test_safety_rule_names_no_category_outside_the_tuple() -> None:
         'escalation that never stops the merge queue.  Do NOT silence this by '
         'widening the tuple; the tuple must equal the gate.'
     )
+
+
+def test_safety_rule_names_no_unregistered_halt_shaped_token() -> None:
+    unregistered = sorted(_unregistered_halt_shaped_tokens(MERGE_HALT_SAFETY_RULE))
+    assert unregistered == [], (
+        f'MERGE_HALT_SAFETY_RULE names token(s) {unregistered} shaped like a '
+        'merge-halt category -- each shares a final segment with a member of '
+        f'{sorted(MERGE_HALT_ESCALATION_CATEGORIES)} -- but none is a '
+        'registered escalation.categories.EscalationCategory value.  It is '
+        'most likely a misspelling the steward would copy into '
+        'escalate_blocker(..., category=...), which EscalationQueue.submit '
+        'then rejects.  Fix the spelling in the rule.'
+    )
+
+
+def test_registry_scan_finds_a_registered_category_of_any_suffix() -> None:
+    text = (
+        f'`{_NON_HALT_CATEGORY}` then x{MERGE_HALT_ESCALATION_CATEGORIES[0]} '
+        f'and {MERGE_HALT_ESCALATION_CATEGORIES[1]}y'
+    )
+    assert _registered_categories_named_in(text) == {_NON_HALT_CATEGORY}
+
+
+def test_halt_shaped_scan_flags_only_unregistered_spellings() -> None:
+    text = '`unmerge_state` `unmerged_state` project_root'
+    assert _unregistered_halt_shaped_tokens(text) == {'unmerge_state'}
 
 
 class TestHaltCategoriesAreBehaviourallyLoadBearing:
