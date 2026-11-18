@@ -1010,6 +1010,10 @@ class TestEmitUnverifiedClaimEscalation:
         assert esc_id is not None
         record = EscalationQueue(escalation_queue_dir(tmp_path)).get(esc_id)
         assert record is not None, f'{esc_id!r} must be readable from the project queue'
+        assert record.level == 0, (
+            'only an info L0 is routed by the info-L0 router, whose curator task '
+            f'is what checks the claim; filed at level={record.level!r}'
+        )
 
         # The orchestrator's orphan reaper hands every info L0 to this router;
         # no task row backs the synthetic anchor, so its status is unknown.
@@ -1022,8 +1026,8 @@ class TestEmitUnverifiedClaimEscalation:
 
         assert isinstance(decided, ConvertViaCurator), (
             'the info-L0 router must turn each unverified claim into a curator '
-            'task, so a tracked task checks the claim instead of it closing as '
-            f'info noise; got {decided!r}'
+            'task, so a tracked task checks the claim, rather than close it as '
+            f'status info or a consumed observation; got {decided!r}'
         )
         assert decided.payload.spawned_from == 'unverified-claim-5422', (
             'escalation-watcher self-execute item 11 keys on this provenance'
@@ -1116,9 +1120,8 @@ class TestDelegatesToTheSharedHelper:
         )
         assert seen['project_root'] == str(tmp_path)
         assert seen['level'] == 0, (
-            'at L0 the info-L0 router converts each claim into a curator task; '
-            'at L1 the auto-watcher has no recipe for this category and closes '
-            'an all-info record as benign'
+            'see TestEmitUnverifiedClaimEscalation::'
+            'test_the_filed_record_is_one_the_info_l0_router_converts_into_a_curator_task'
         )
 
     def test_two_different_refs_get_two_different_anchors(

@@ -828,8 +828,8 @@ _MIGRATED_FILERS: tuple[_Filer, ...] = (
         'completion_claim_gate',
         'fused_memory.services.completion_claim_gate',
         _unverified_claim,
-        # L0 on purpose: the info-L0 router turns each claim into a curator task;
-        # test_completion_claim_gate.py::TestEmitUnverifiedClaimEscalation pins why.
+        # L0 on purpose, for the reason pinned by
+        # fused-memory/tests/test_completion_claim_gate.py::TestEmitUnverifiedClaimEscalation::test_the_filed_record_is_one_the_info_l0_router_converts_into_a_curator_task
         0,
     ),
     _Filer(
@@ -1005,11 +1005,10 @@ class TestEveryFilerPinsItsLevels:
         assert forwarded == filer.escalation_level, (
             f'{filer.label} files at level={forwarded!r}, table says '
             f'{filer.escalation_level!r}. An L0 record under a synthetic anchor '
-            'has no steward, so the orphan-L0 reaper takes it: a non-info L0 is '
-            'promoted to L1 after a delay, an info L0 goes to the info-L0 '
-            'router, which converts it into a curator task. An L1 record '
-            'reaches the escalation watcher at once. If the change is '
-            'deliberate, edit the table and say why in the row.'
+            'has no steward and is routed as file_folded_escalation\'s `level` '
+            'docstring describes; an L1 record reaches the escalation watcher '
+            'at once. If the change is deliberate, edit the table and say why '
+            'in the row.'
         )
 
     def test_the_table_covers_every_module_that_calls_the_helper(self):
@@ -1057,10 +1056,12 @@ class TestEveryFilerPinsItsLevels:
             f.label: f.escalation_level for f in _MIGRATED_FILERS
             if f.escalation_level != 1
         }
-        assert not_l1 == {'markup_tripwire residue': 2, 'completion_claim_gate': 0}, (
+        assert not_l1 == {
+            'markup_tripwire residue': 2, 'completion_claim_gate': 0,
+        }, (
             'L1 is the house escalation level; residue (L2) and '
-            'completion_claim_gate (L0, the info-L0 router converts it into a '
-            f'curator task) are its exceptions. {not_l1!r} says another filer moved'
+            f'completion_claim_gate (L0) are its exceptions. {not_l1!r} says '
+            'another filer moved'
         )
 
 

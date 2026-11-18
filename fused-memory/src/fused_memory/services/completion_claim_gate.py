@@ -1224,7 +1224,7 @@ def emit_unverified_claim_escalation(
         logger=logger,
         log_label='completion_claim_gate',
         context=f'unverified claim about {ref!r}',
-        # L0: the info-L0 router turns each claim into a curator task (see
-        # tests/test_completion_claim_gate.py::TestEmitUnverifiedClaimEscalation).
+        # L0, not the house L1, for the reason pinned by
+        # fused-memory/tests/test_completion_claim_gate.py::TestEmitUnverifiedClaimEscalation::test_the_filed_record_is_one_the_info_l0_router_converts_into_a_curator_task
         level=0,
     )
