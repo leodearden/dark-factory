@@ -772,8 +772,8 @@ class TestTipPassAdoptionSignal:
 
         A green tip is a verified SUPERSET of every prefix member, which is
         what licenses δ's adoption.  An exception proves nothing about anyone,
-        so the exception arm keeps γ's recipe verbatim: suppress the next
-        chain for this task, requeue, land nothing.
+        so the exception arm keeps γ's recipe verbatim: mark the task to verify
+        un-chained, requeue, land nothing.
         """
         from orchestrator.merge_lane.types import InflightStatus
 
@@ -786,8 +786,8 @@ class TestTipPassAdoptionSignal:
         assert res.outcome is None
         assert not item.request.result.done()
         assert '101' in worker._next_dispatch_unchained, (
-            'the one-shot suppression is what makes an infra blip cost exactly '
-            'one non-chained round'
+            'the mark is what makes an infra blip cost an un-chained round, not '
+            'another chain'
         )
         assert queued_request_ids(worker, ALL_LANES) == [
             *(r.request_id for r in queued), item.request.request_id,

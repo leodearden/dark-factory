@@ -1682,9 +1682,6 @@ class TestRunInflightVerifyChainRedirect:
         assert _lane_states(git_ops) == [LaneState.FREE, LaneState.FREE]
         assert worker.worktree_ledger_violations(grace_secs=0.0) == []
         assert worker.speculation_accounting_violations() == []
-        assert worker._next_dispatch_unchained == set(), (
-            'a DROPPED request must not leave an un-chained mark behind'
-        )
 
     async def test_the_unchained_set_starts_empty_on_a_fresh_worker(
         self, git_repo: Path,

@@ -224,6 +224,60 @@ class TestAVoidedVerifyKeepsTheMark:
         )
 
 
+class _SecondSVerifyHangs(_TreeKeyedVerifier):
+    """S's second verify hangs until it is cancelled; every other call is tree-keyed."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.hanging, self.torn_down = asyncio.Event(), asyncio.Event()
+        self._s_calls = 0
+
+    async def run_scoped(
+        self, worktree: Path, config: Any, module_configs: list[Any],
+        task_files: list[str] | None = None, **options: Any,
+    ) -> VerifyResult:
+        if options.get('task_id') == 'S':
+            self._s_calls += 1
+            if self._s_calls == 2:
+                self.hanging.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    self.torn_down.set()
+        return await super().run_scoped(worktree, config, module_configs, task_files, **options)
+
+
+class TestADroppedRequestTakesItsMarkWithIt:
+    """A drop applies no verdict but ends the request, so the mark leaves with it."""
+
+    async def test_a_marked_request_cancelled_mid_verify_lets_its_resubmission_chain(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """S owns a red tip over B1, so both are marked. S's un-chained verify
+        is cancelled by its waiter and the request is dropped; S's
+        resubmission is a new request and chains H1."""
+        scene = _scene(tmp_path, monkeypatch, merge_deep=_deep())
+        reqs = await _requests(scene, 'S', 'B1')
+        verifier = _SecondSVerifyHangs()
+        async with _running(scene, verifier=verifier, remotes=[], speculation_depth=1) as run:
+            verifier.lane = run.lane
+            run.put(reqs['S'], reqs['B1'])
+            await wait_responsive(verifier.hanging.wait(), label="S's un-chained verify hanging")
+            reqs['S'].result.cancel()
+            await wait_responsive(verifier.torn_down.wait(), label="S's verify torn down")
+            assert (await _outcome(reqs['B1'], 'B1')).status == 'done'
+
+            again, h1 = _resubmission(scene, reqs['S']), await _request(scene, 'H1')
+            run.put(again, h1)
+            assert (await _outcome(again, 'resubmitted S')).status == 'blocked'
+            assert (await _outcome(h1, 'H1')).status == 'done'
+        s_chains = [chains for task_id, _files, chains in verifier.calls if task_id == 'S']
+        assert s_chains[0] == [('S', ['B1'])], 'the red tip that marked S'
+        assert s_chains[1] == [('S', ['H1'])], (
+            "dropping S's request cleared the mark, so its resubmission chains H1"
+        )
+
+
 class TestBAChainArmErrorStillTerminates:
     """Task 3185's termination property: one deferred round, then a terminal block."""
 

@@ -8872,7 +8872,7 @@ class SpeculativeMergeWorker:
 
     def _retire_item(self, request_id: str) -> None:
         """Best-effort transition *request_id* to TERMINAL then drop it from
-        ``_live_items``.
+        ``_live_items``, ending the per-task lane state it carried.
 
         Safe to call on an already-TERMINAL or unregistered request_id —
         both are treated as nothing-left-to-retire (no :meth:`_note_transition`
