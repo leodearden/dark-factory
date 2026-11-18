@@ -1472,7 +1472,7 @@ class TestRunVerificationSegmentedAcceptance:
         return result, calls, runs_capture
 
     @pytest.mark.asyncio
-    async def test_an_unrelated_red_no_longer_skips_the_last_segment(self, tmp_path):
+    async def test_an_unrelated_red_no_longer_skips_the_tests_scripts_segment(self, tmp_path):
         """THE acceptance test for esc-3062-2.
 
         `orchestrator` goes red before `tests/scripts/` is reached. Under the

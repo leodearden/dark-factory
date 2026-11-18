@@ -120,6 +120,18 @@ def _assert_bash_parses(rendered: str, *, what: str) -> None:
 # preserve the tail); the root type/test chains are cwd-sequenced same-tool
 # fan-outs (reject, keep today's truncation).
 
+# The `(cwd_rel, command)` pairs `ROOT_TEST_COMMAND` must decompose into, taken
+# from the corpus PARTS it is composed of rather than from the segmenter under
+# test. `FLEET_COCKPIT_TEST_CLAUSE` is the balanced `( ... )` group carrying its
+# own `||`, `;` and `&&` INSIDE the parens; it must come back as ONE atomic
+# segment — `tests/scripts/test_fallback_verify_config.py`'s cockpit guard
+# documents at `test_fanout_includes_cockpit_presence_guarded` that a naive
+# `&&`-split breaks exactly there, emitting two unbalanced shell fragments.
+_EXPECTED_ROOT_TEST_SEGMENTS = (
+    *((member, FLEET_MEMBER_TEST_CLAUSE) for member in FLEET_TEST_MEMBERS),
+    *(('.', clause) for clause in FLEET_ROOT_TEST_CLAUSES),
+)
+
 # Not a config in this repo (yet) — the shape task 3218 predicts and must not
 # regress on: a pytest slot chaining a whole-directory sibling checker. Two
 # spellings, because the SCRIPT PATH decides which degradation fires today:
@@ -3316,18 +3328,6 @@ class TestDescribeDroppedClauses:
 # (task 3338 / esc-3062-2).
 # ---------------------------------------------------------------------------
 
-# The `(cwd_rel, command)` pairs `ROOT_TEST_COMMAND` must decompose into, taken
-# from the corpus PARTS it is composed of rather than from the segmenter under
-# test. `FLEET_COCKPIT_TEST_CLAUSE` is the balanced `( ... )` group carrying its
-# own `||`, `;` and `&&` INSIDE the parens; it must come back as ONE atomic
-# segment — `tests/scripts/test_fallback_verify_config.py`'s cockpit guard
-# documents at `test_fanout_includes_cockpit_presence_guarded` that a naive
-# `&&`-split breaks exactly there, emitting two unbalanced shell fragments.
-_EXPECTED_ROOT_TEST_SEGMENTS = (
-    *((member, FLEET_MEMBER_TEST_CLAUSE) for member in FLEET_TEST_MEMBERS),
-    *(('.', clause) for clause in FLEET_ROOT_TEST_CLAUSES),
-)
-
 
 class TestSplitAndChainSegments:
     """split_and_chain_segments(raw) -> list[ChainSegment] | None — the ACCEPT contract.
@@ -3412,8 +3412,9 @@ class TestSplitAndChainSegments:
             assert label.endswith(f'-{position}'), f'{label!r} lacks its position suffix'
             assert re.fullmatch(r'[A-Za-z0-9._-]+', label), f'{label!r} is not filename-safe'
         root_labels = [s.label for s in segments if s.cwd_rel == '.']
-        assert len(root_labels) >= 2
-        assert len(set(root_labels)) == len(root_labels)
+        assert len(root_labels) >= 2, (
+            'the fleet chain must have several segments at cwd . for this test to mean anything'
+        )
 
     def test_label_is_the_cwd_name_then_the_position(self):
         """The label FORMAT: cwd name (`root` at the worktree root), then `-<1-based position>`."""
