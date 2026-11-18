@@ -93,7 +93,10 @@ timeouts:
 # D8-D11): counts per-step plan deviations under meta_roots (relative to
 # project_root) plus archived note-to-file / observation-consumed escalations,
 # and on a rate rise or a dominant pattern files ONE blocking design_concern on
-# task id plan-deviation-census-<project_id>. Validated per field, never
+# task id plan-deviation-census-<project_id>. Rate arms are records per
+# finalized plan, one per source against its own baseline, and a source still
+# warming up cannot fire; prose_only_min is the prose-only arm's count floor.
+# Validated per field, never
 # failing config load, by
 # scripts/legibility/plan_deviation_census.py::settings_from_mapping. Pinned
 # here, like timeouts:, so a schema-default change cannot silently move it.
