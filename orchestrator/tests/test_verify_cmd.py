@@ -34,10 +34,13 @@ from _verify_config_corpus import (
     FLEET_ROOT_TEST_CLAUSES,
     FLEET_SCRIPTS_TEST_CLAUSE,
     FLEET_TEST_MEMBERS,
+    FLEET_TYPE_CHECK_MEMBERS,
     FM_LINT_COMMAND,
     MODULE_LINT_COMMANDS,
     REPO_ROOT,
+    ROOT_LINT_CHECKER_CLAUSE,
     ROOT_LINT_COMMAND,
+    ROOT_LINT_RUFF_CLAUSE,
     ROOT_TEST_COMMAND,
     ROOT_TYPE_CHECK_COMMAND,
     SCRIPTS_CONFIG_PATH,
@@ -2578,15 +2581,8 @@ class TestSplitChainTail:
     def test_accepts_root_lint_chain(self):
         """dark-factory-orchestrator.yaml::lint_command — one sibling checker clause."""
         prefix, tail = split_chain_tail(ROOT_LINT_COMMAND, 'ruff check')
-        assert prefix == (
-            'uv run ruff check shared escalation fused-memory orchestrator dashboard sampler'
-            ' cockpit client-feed conftest.py df_pytest_isolation.py skills '
-        )
-        assert tail == (
-            '&& python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests'
-            ' escalation/tests fused-memory/tests orchestrator/tests dashboard/tests'
-            ' sampler/tests cockpit/tests client-feed/tests'
-        )
+        assert prefix == ROOT_LINT_RUFF_CLAUSE + ' '
+        assert tail == '&& ' + ROOT_LINT_CHECKER_CLAUSE
         assert prefix + tail == ROOT_LINT_COMMAND
 
     def test_chainless_lint_command_has_no_chain_to_split(self):
@@ -3218,26 +3214,31 @@ class TestDescribeDroppedClauses:
     """
 
     def test_root_type_check_fan_out(self):
-        """The live root ``type_check_command``: 16 segments, 2 retained, 14 dropped.
+        """The live root ``type_check_command``: every clause past the retained pair is dropped.
 
-        The record used to say 13 — every clause in the original — because the
-        keyword sits in segment 1, not segment 0.
-
-        The counts track the live config: it fans pyright out over eight
-        directories today (it was three when this case was written), so
-        ``dropped`` is ``2 * (dirs - 1)`` — a ``cd`` and an ``npx pyright``
-        per directory past the retained first one.
+        Every top-level `` && `` is a clause boundary for the quote-only
+        splitter (the chain carries no quoted `&&`), so the chain has
+        ``count + 1`` clauses, the retained ``cd X && npx pyright`` pair is 2,
+        and ``dropped`` is ``count - 1``. The record used to report ``count``
+        — every clause in the original but one — because the keyword sits in
+        segment 1, not segment 0.
         """
         dropped, fan_out = describe_dropped_clauses(
-            ROOT_TYPE_CHECK_COMMAND, 'cd fused-memory && npx pyright', 'pyright',
+            ROOT_TYPE_CHECK_COMMAND, f'cd {FLEET_TYPE_CHECK_MEMBERS[0]} && npx pyright', 'pyright',
         )
-        assert len(dropped) == 14
+        assert len(dropped) == ROOT_TYPE_CHECK_COMMAND.count(' && ') - 1
         assert fan_out is True
-        assert dropped[0] == 'cd ../orchestrator'
+        assert dropped[0] == f'cd ../{FLEET_TYPE_CHECK_MEMBERS[1]}'
         assert dropped[-1] == 'npx pyright'
 
     def test_root_test_command_fan_out(self):
-        """The live root ``test_command``: 19 segments, 2 retained, 17 dropped.
+        """The live root ``test_command``: every clause past the retained pair is dropped.
+
+        Same rule as the type-check fan-out: ``count + 1`` clauses for
+        ``count`` top-level `` && `` (the cockpit subshell's interior `&&`
+        counts too, since the splitter is quote-only), 2 retained, so
+        ``count - 1`` dropped; the over-report regression would read
+        ``count``.
 
         This is the regression case for review finding 2. Every dropped
         ``uv run pytest tests/ --timeout=300`` clause invokes pytest at an
@@ -3245,9 +3246,9 @@ class TestDescribeDroppedClauses:
         and it is the highest-frequency pytest-slot drop in this repo.
         """
         dropped, fan_out = describe_dropped_clauses(
-            ROOT_TEST_COMMAND, 'cd shared && uv run pytest', 'pytest',
+            ROOT_TEST_COMMAND, f'cd {FLEET_TEST_MEMBERS[0]} && uv run pytest', 'pytest',
         )
-        assert len(dropped) == 17
+        assert len(dropped) == ROOT_TEST_COMMAND.count(' && ') - 1
         assert fan_out is True
 
     @pytest.mark.parametrize(
@@ -3435,17 +3436,8 @@ class TestSplitAndChainSegments:
         """`cd ../orchestrator` resolves against the accumulated cwd, not the root."""
         segments = split_and_chain_segments(ROOT_TYPE_CHECK_COMMAND)
         assert segments is not None
-        assert [s.cwd_rel for s in segments] == [
-            'fused-memory',
-            'orchestrator',
-            'dashboard',
-            'shared',
-            'escalation',
-            'sampler',
-            'cockpit',
-            'client-feed',
-        ]
-        assert [s.command for s in segments] == ['npx pyright'] * 8
+        assert [s.cwd_rel for s in segments] == list(FLEET_TYPE_CHECK_MEMBERS)
+        assert [s.command for s in segments] == ['npx pyright'] * len(FLEET_TYPE_CHECK_MEMBERS)
 
     def test_chain_segment_is_a_frozen_dataclass(self):
         """Segments are inert value objects — the runner must not mutate them."""
