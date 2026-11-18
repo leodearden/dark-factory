@@ -1,6 +1,10 @@
-"""SessionRecord builders shared by the session-record and session-registry test files."""
+"""SessionRecord builders shared by the session-record, -lease, -reaper and -registry test files."""
 
 from __future__ import annotations
+
+import os
+from datetime import datetime, timedelta
+from pathlib import Path
 
 from orchestrator import session_records
 
@@ -57,3 +61,9 @@ def make_record(**overrides: object) -> session_records.SessionRecord:
     }
     fields.update(overrides)
     return session_records.SessionRecord(**fields)
+
+
+def set_mtime(path: Path, now: datetime, age: timedelta) -> None:
+    """Backdate *path*'s mtime to ``now - age``: the heartbeat clock records and leases age by."""
+    ts = (now - age).timestamp()
+    os.utime(path, (ts, ts))

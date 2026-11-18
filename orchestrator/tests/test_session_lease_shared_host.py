@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from orchestrator import session_identity, session_records
+from orchestrator import session_identity, session_leases, session_records
 from orchestrator import session_registry as sr
 
 pytestmark = pytest.mark.skipif(
@@ -25,7 +25,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 _NAME = 'recon-watcher-df'
-_PAST_TTL_SECS = sr.LEASE_HEARTBEAT_TTL.total_seconds() + 60
+_PAST_TTL_SECS = session_leases.LEASE_HEARTBEAT_TTL.total_seconds() + 60
 
 
 @pytest.fixture
@@ -84,8 +84,8 @@ def _hosted_env(
         monkeypatch.setenv('CLAUDE_CODE_SESSION_ID', session_id)
 
 
-def _body(tmp_path: Path, name: str = _NAME) -> sr.LeaseHolder:
-    return sr.LeaseHolder.from_json(sr.lease_path_for_name(name, root=tmp_path).read_text())
+def _body(tmp_path: Path, name: str = _NAME) -> session_leases.LeaseHolder:
+    return session_leases.LeaseHolder.from_json(session_leases.lease_path_for_name(name, root=tmp_path).read_text())
 
 
 def _cli(capsys: pytest.CaptureFixture[str], *argv: str) -> list[str]:
@@ -131,10 +131,10 @@ def test_a_shared_host_pid_degrades_the_liveness_pid_to_zero_loudly(
 def test_hosted_sessions_derive_distinct_session_scoped_slugs(shared_host_pid: int) -> None:
     host = shared_host_pid
 
-    slug_a = sr.default_lease_slug(
+    slug_a = session_leases.default_lease_slug(
         _NAME, {'CLAUDE_PID': str(host), 'CLAUDE_CODE_SESSION_ID': 'sess-a'}
     )
-    slug_b = sr.default_lease_slug(
+    slug_b = session_leases.default_lease_slug(
         _NAME, {'CLAUDE_PID': str(host), 'CLAUDE_CODE_SESSION_ID': 'sess-b'}
     )
 
@@ -156,7 +156,7 @@ def test_a_hosted_slug_is_underivable_without_a_usable_session_id(
     if session_id is not None:
         env['CLAUDE_CODE_SESSION_ID'] = session_id
 
-    assert sr.default_lease_slug(_NAME, env) is None
+    assert session_leases.default_lease_slug(_NAME, env) is None
 
 
 def test_a_non_host_session_is_unchanged(caplog: pytest.LogCaptureFixture) -> None:
@@ -166,14 +166,14 @@ def test_a_non_host_session_is_unchanged(caplog: pytest.LogCaptureFixture) -> No
 
     assert session_identity.resolve_session_pid(env) == own
     assert _warnings(caplog) == []
-    assert sr.default_lease_slug(_NAME, env) == f'{_NAME}-{own}'
+    assert session_leases.default_lease_slug(_NAME, env) == f'{_NAME}-{own}'
 
 
 def test_a_dead_claude_pid_reads_as_a_plain_session_not_a_host(reaped_child_pid: int) -> None:
     env = {'CLAUDE_PID': str(reaped_child_pid), 'CLAUDE_CODE_SESSION_ID': 'sess-a'}
 
     assert session_identity.resolve_session_pid(env) == reaped_child_pid
-    assert sr.default_lease_slug(_NAME, env) == f'{_NAME}-{reaped_child_pid}'
+    assert session_leases.default_lease_slug(_NAME, env) == f'{_NAME}-{reaped_child_pid}'
 
 
 # --- lease verbs through the CLI ---------------------------------------------
@@ -209,7 +209,7 @@ def test_a_sibling_hosted_session_cannot_claim_heartbeat_or_release(
     host = shared_host_pid
     _hosted_env(monkeypatch, tmp_path, pid=host, session_id='sess-a')
     _cli(capsys, 'lease-claim', '--name', _NAME)
-    lease = sr.lease_path_for_name(_NAME, root=tmp_path)
+    lease = session_leases.lease_path_for_name(_NAME, root=tmp_path)
     claimed_body = lease.read_text()
     _hosted_env(monkeypatch, tmp_path, pid=host, session_id='sess-b')
 
@@ -237,7 +237,7 @@ def test_the_owning_hosted_session_heartbeats_quietly_and_releases(
 ) -> None:
     _hosted_env(monkeypatch, tmp_path, pid=shared_host_pid, session_id='sess-a')
     _cli(capsys, 'lease-claim', '--name', _NAME)
-    lease = sr.lease_path_for_name(_NAME, root=tmp_path)
+    lease = session_leases.lease_path_for_name(_NAME, root=tmp_path)
     _age(lease, 600)
     aged_mtime = lease.stat().st_mtime
     caplog.clear()
@@ -260,7 +260,7 @@ def test_a_hosted_lease_is_reaped_after_its_session_stops_heartbeating_while_the
     host = shared_host_pid
     _hosted_env(monkeypatch, tmp_path, pid=host, session_id='sess-a')
     _cli(capsys, 'lease-claim', '--name', _NAME)
-    lease = sr.lease_path_for_name(_NAME, root=tmp_path)
+    lease = session_leases.lease_path_for_name(_NAME, root=tmp_path)
     _age(lease, _PAST_TTL_SECS)
     assert Path(f'/proc/{host}').exists()
 
@@ -293,7 +293,7 @@ def test_a_hosted_claim_without_a_session_id_exits_2_naming_it(
     err = capsys.readouterr().err
     assert 'CLAUDE_CODE_SESSION_ID' in err
     assert '--slug' in err
-    assert not sr.lease_path_for_name(_NAME, root=tmp_path).exists()
+    assert not session_leases.lease_path_for_name(_NAME, root=tmp_path).exists()
 
 
 # --- lease bodies that still carry a running host pid ------------------------
@@ -302,11 +302,11 @@ def test_a_hosted_claim_without_a_session_id_exits_2_naming_it(
 
 
 def _seed_lease(tmp_path: Path, pid: int, name: str = _NAME) -> Path:
-    holder = sr.LeaseHolder(
+    holder = session_leases.LeaseHolder(
         session_slug=f'{name}-{pid}', pid=pid, start_ts='2026-10-01T00:00:00+00:00'
     )
-    sr.claim_lease(name, holder=holder, root=tmp_path)
-    return sr.lease_path_for_name(name, root=tmp_path)
+    session_leases.claim_lease(name, holder=holder, root=tmp_path)
+    return session_leases.lease_path_for_name(name, root=tmp_path)
 
 
 def test_lease_status_reports_a_legacy_host_pid_lease_reclaimable_past_ttl_only(
@@ -316,7 +316,7 @@ def test_lease_status_reports_a_legacy_host_pid_lease_reclaimable_past_ttl_only(
     lease = _seed_lease(tmp_path, host)
     _age(lease, _PAST_TTL_SECS)
 
-    aged = sr.lease_status(_NAME, root=tmp_path)
+    aged = session_leases.lease_status(_NAME, root=tmp_path)
 
     assert aged.holder_pid == host
     assert aged.holder_pid_alive is True
@@ -324,7 +324,7 @@ def test_lease_status_reports_a_legacy_host_pid_lease_reclaimable_past_ttl_only(
 
     _age(lease, 60)
 
-    assert sr.lease_status(_NAME, root=tmp_path).reclaimable is False
+    assert session_leases.lease_status(_NAME, root=tmp_path).reclaimable is False
 
 
 def test_reap_stale_leases_removes_an_aged_legacy_host_pid_lease(
@@ -335,7 +335,7 @@ def test_reap_stale_leases_removes_an_aged_legacy_host_pid_lease(
     _age(aged_lease, _PAST_TTL_SECS)
     _age(fresh_lease, 60)
 
-    assert [r.reason for r in sr.reap_stale_leases(root=tmp_path)] == ['shared_host']
+    assert [r.reason for r in session_leases.reap_stale_leases(root=tmp_path)] == ['shared_host']
     assert not aged_lease.exists()
     assert fresh_lease.is_file()
 
@@ -346,7 +346,7 @@ def test_a_dead_holder_pid_is_reclaimable_past_ttl_only_and_reaped_as_stale_pid(
     lease = _seed_lease(tmp_path, reaped_child_pid)
     _age(lease, 60)
 
-    fresh = sr.lease_status(_NAME, root=tmp_path)
+    fresh = session_leases.lease_status(_NAME, root=tmp_path)
 
     assert fresh.holder_pid == reaped_child_pid
     assert fresh.holder_pid_alive is False
@@ -354,8 +354,8 @@ def test_a_dead_holder_pid_is_reclaimable_past_ttl_only_and_reaped_as_stale_pid(
 
     _age(lease, _PAST_TTL_SECS)
 
-    assert sr.lease_status(_NAME, root=tmp_path).reclaimable is True
-    assert [r.reason for r in sr.reap_stale_leases(root=tmp_path)] == ['stale_pid']
+    assert session_leases.lease_status(_NAME, root=tmp_path).reclaimable is True
+    assert [r.reason for r in session_leases.reap_stale_leases(root=tmp_path)] == ['stale_pid']
     assert not lease.exists()
 
 
@@ -365,22 +365,22 @@ def test_claim_lease_reclaims_an_aged_legacy_host_pid_lease(
     host = shared_host_pid
     lease = _seed_lease(tmp_path, host)
     held_body = lease.read_text()
-    contender = sr.LeaseHolder(
+    contender = session_leases.LeaseHolder(
         session_slug='contender', pid=os.getpid(), start_ts='2026-10-13T00:00:00+00:00'
     )
     _age(lease, 60)
 
-    fresh = sr.claim_lease(_NAME, holder=contender, root=tmp_path)
+    fresh = session_leases.claim_lease(_NAME, holder=contender, root=tmp_path)
 
-    assert fresh.decision is sr.LeaseDecision.STAND_DOWN
+    assert fresh.decision is session_leases.LeaseDecision.STAND_DOWN
     assert f'pid {host} alive' in fresh.message
     assert lease.read_text() == held_body
 
     _age(lease, _PAST_TTL_SECS)
 
-    aged = sr.claim_lease(_NAME, holder=contender, root=tmp_path)
+    aged = session_leases.claim_lease(_NAME, holder=contender, root=tmp_path)
 
-    assert aged.decision is sr.LeaseDecision.ACQUIRED
+    assert aged.decision is session_leases.LeaseDecision.ACQUIRED
     assert _body(tmp_path) == contender
 
 
@@ -393,7 +393,7 @@ def test_an_operator_pid_override_naming_a_host_still_ages_out(
     host = shared_host_pid
     monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
     _cli(capsys, 'lease-claim', '--name', _NAME, '--slug', 'op-token', '--pid', str(host))
-    lease = sr.lease_path_for_name(_NAME, root=tmp_path)
+    lease = session_leases.lease_path_for_name(_NAME, root=tmp_path)
     assert _body(tmp_path).pid == host
     _age(lease, _PAST_TTL_SECS)
 
@@ -404,10 +404,10 @@ def test_an_operator_pid_override_naming_a_host_still_ages_out(
 
 def test_a_running_non_host_holder_is_never_stale(tmp_path: Path) -> None:
     lease = _seed_lease(tmp_path, os.getpid())
-    _age(lease, 10 * sr.LEASE_HEARTBEAT_TTL.total_seconds())
+    _age(lease, 10 * session_leases.LEASE_HEARTBEAT_TTL.total_seconds())
 
-    assert sr.lease_status(_NAME, root=tmp_path).reclaimable is False
-    assert sr.reap_stale_leases(root=tmp_path) == []
+    assert session_leases.lease_status(_NAME, root=tmp_path).reclaimable is False
+    assert session_leases.reap_stale_leases(root=tmp_path) == []
     assert lease.is_file()
 
 
@@ -423,5 +423,5 @@ def test_resolve_own_record_slug_is_none_for_a_shared_host(
     caplog.set_level(logging.DEBUG)
     env = {'CLAUDE_PID': str(shared_host_pid), 'CLAUDE_CODE_SESSION_ID': 'sess-a'}
 
-    assert sr.resolve_own_record_slug(env, root=tmp_path) is None
+    assert session_leases.resolve_own_record_slug(env, root=tmp_path) is None
     assert _warnings(caplog) == []
