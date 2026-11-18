@@ -203,6 +203,7 @@ from __future__ import annotations
 import collections
 import enum
 import logging
+import re
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeGuard
@@ -211,7 +212,7 @@ from escalation.models import Escalation
 from shared.storm_counter import StormCounter
 
 from orchestrator.config import RecoveryEmissionConfig
-from orchestrator.git_ops import _run
+from orchestrator.git_ops import CitationPatternInvalid, _run, task_citation_pattern
 from orchestrator.merge_lane.git_read import git_read
 
 if TYPE_CHECKING:
@@ -523,11 +524,15 @@ class DifferentialBaseline(enum.StrEnum):
     #: The branch tip's merge base with main, while the tip is still off main.
     fork_point = 'fork_point'
     #: The task's recorded ``branch_base_sha``, a strict ancestor of a tip
-    #: already on main.
+    #: already on main whose every own commit since it cites the task.
     recorded_branch_base = 'recorded_branch_base'
     #: ``<sha>^1``: every non-branch-tip anchor, and a branch tip's fallback
     #: when its fork point is unresolved or no usable record exists.
     first_parent = 'first_parent'
+    #: No ref stands for "before this branch": a MERGE-COMMIT tip already on
+    #: main with no trusted record.  Its ``^1`` predates only one side of the
+    #: merge, so the differential runs no check and reports no signal.
+    unavailable = 'unavailable'
 
 
 #: Category used for BOTH the storm filing and its ``has_open_l1`` dedup
@@ -1015,15 +1020,49 @@ async def _fork_point(git_ops: GitOps, sha: str) -> str | None:
     return fork_point if isinstance(fork_point, str) and fork_point else None
 
 
+async def _range_cites_only(
+    git_ops: GitOps, base: str, tip: str, *, task_id: str, pattern_template: str | None,
+) -> bool:
+    """True when ``base..tip`` holds at least one non-merge commit and every
+    non-merge commit's SUBJECT cites *task_id*.
+
+    False for an opted-out (``''``) or invalid citation pattern, and for a
+    stand-in *git_ops* without a git config: ownership cannot be shown.
+    """
+    config = getattr(git_ops, 'config', None)
+    try:
+        pattern = task_citation_pattern(
+            task_id, pattern_template,
+            branch_prefix=config.branch_prefix, main_branch=config.main_branch,
+        )
+    except (AttributeError, CitationPatternInvalid):
+        return False
+    if pattern is None:
+        return False
+    out = await git_read(git_ops, [
+        'git', 'log', '--no-merges', '-z', '--format=%s', f'{base}..{tip}',
+    ])
+    subjects = [subject for subject in out.split('\0') if subject.strip()]
+    cites = re.compile(pattern)
+    return bool(subjects) and all(cites.search(subject) for subject in subjects)
+
+
+async def _is_merge_commit(git_ops: GitOps, sha: str) -> bool:
+    out = await git_read(git_ops, ['git', 'log', '-1', '--format=%P', sha])
+    return len(out.split()) > 1
+
+
 async def _differential_parent_ref(
     git_ops: GitOps,
     effect_check_sha: str,
     *,
     anchor_is_branch_tip: bool,
     branch_base_sha: str | None,
-) -> tuple[str, DifferentialBaseline]:
+    task_id: str,
+    pattern_template: str | None,
+) -> tuple[str | None, DifferentialBaseline]:
     """The ref that stands for "before this landing" in the differential, and
-    the rung that named it.
+    the rung that named it; None when no ref can.
 
     ``<sha>^1`` for a MERGE-COMMIT or citation anchor: the first parent is
     main-before-the-merge, exactly the pre-merge baseline the sequence needs.
@@ -1039,14 +1078,18 @@ async def _differential_parent_ref(
        fork point;
     3. fork point IS the tip, so the tip is already on main (task 7836): the
        recorded ``branch_base_sha``, when :func:`_usable_branch_base` trusts
-       it and it differs from the tip;
-    4. otherwise ``tip^1``.
+       it, it differs from the tip, and every non-merge commit in
+       ``record..tip`` cites the task;
+    4. otherwise ``tip^1`` for a single-parent tip, and no baseline at all
+       for a merge-commit tip.
 
     The parent leg never names the anchor itself: a parent equal to the
     citation leg makes FAILED -> DELIVERED -> DELIVERED impossible.  The
-    record is the oldest, most permissive baseline, so it is consulted only
-    once the tip is KNOWN to be on main; a tip off main, or of unknown
-    position, never reaches it.  Pinned by
+    record is the oldest, most permissive baseline.  The workflow keeps it at
+    the dispatch-time main after an in-place rebase or a merge of main, and
+    then ``record..tip`` carries other tasks' commits, whose capabilities this
+    task must never be credited with: rung 3's citation test is what refuses
+    such a record.  Pinned by
     ``orchestrator/tests/test_landing_evidence.py::TestDeliveredChecksDifferentialRealGitDiscovery``.
     """
     first_parent = (f'{effect_check_sha}^1', DifferentialBaseline.first_parent)
@@ -1058,8 +1101,16 @@ async def _differential_parent_ref(
     if fork != effect_check_sha:
         return fork, DifferentialBaseline.fork_point
     recorded = await _usable_branch_base(git_ops, branch_base_sha, effect_check_sha)
-    if recorded is not None and recorded != effect_check_sha:
+    if (
+        recorded is not None and recorded != effect_check_sha
+        and await _range_cites_only(
+            git_ops, recorded, effect_check_sha,
+            task_id=task_id, pattern_template=pattern_template,
+        )
+    ):
         return recorded, DifferentialBaseline.recorded_branch_base
+    if await _is_merge_commit(git_ops, effect_check_sha):
+        return None, DifferentialBaseline.unavailable
     return first_parent
 
 
@@ -1071,6 +1122,8 @@ async def _delivered_checks_differential(
     *,
     anchor_is_branch_tip: bool = False,
     branch_base_sha: str | None = None,
+    task_id: str = '',
+    pattern_template: str | None = None,
     enabled: bool,
 ) -> bool:
     """The SECOND accept path: did *effect_check_sha* MAKE a declared
@@ -1084,7 +1137,8 @@ async def _delivered_checks_differential(
         PARENT        the pre-branch baseline: ``<sha>^1`` for a merge-commit
                       or citation anchor; for a branch-tip anchor, its fork
                       point while off main, the recorded *branch_base_sha*
-                      once on main, else ``^1`` (see
+                      once on main when every own commit since it cites
+                      *task_id*, else ``^1`` or none (see
                       :func:`_differential_parent_ref`)
         ``<sha>``     the citation itself
         MAIN          current HEAD, named by ``config.main_branch``
@@ -1165,10 +1219,11 @@ async def _delivered_checks_differential(
             git_ops, effect_check_sha,
             anchor_is_branch_tip=anchor_is_branch_tip,
             branch_base_sha=branch_base_sha,
+            task_id=task_id, pattern_template=pattern_template,
         )
         probe['delivered_checks_parent_ref'] = parent_ref
         probe['delivered_checks_baseline'] = baseline
-        for check in delivered_checks:
+        for check in (delivered_checks if parent_ref is not None else ()):
             kind = check.get('kind')
             if kind != 'grep':
                 # A script check execs against the LIVE CHECKOUT and takes no
@@ -2227,7 +2282,8 @@ async def validate_landing_evidence(
         if delivered_checks and await _delivered_checks_differential(
             git_ops, effect_check_sha, delivered_checks, probe,
             anchor_is_branch_tip=anchor_is_branch_tip,
-            branch_base_sha=branch_base_sha, enabled=enabled,
+            branch_base_sha=branch_base_sha, task_id=task_id,
+            pattern_template=pattern_template, enabled=enabled,
         ):
             return _accept(citation)
         return _reject(LandingReason.effect_absent)

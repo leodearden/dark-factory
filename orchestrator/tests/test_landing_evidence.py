@@ -3430,7 +3430,35 @@ class TestDeliveredChecksLeafIsTheCallers:
         assert verdict.rescued_by_delivered_checks is True
 
 
-def _build_landed_capability(repo: _Repo, *, commits: int) -> tuple[str, str]:
+_CAPABILITY_FILE = 'pkg/cap.py'
+_CAPABILITY_CONTENT = _numbered('cap', 30) + 'def new_capability():\n    return 1\n'
+
+
+def _add_capability(repo: _Repo) -> str:
+    """``task/6276``'s first commit: it makes ``def new_capability`` true."""
+    return repo.commit('feat(6276): add the capability', {_CAPABILITY_FILE: _CAPABILITY_CONTENT})
+
+
+def _extend_capability(repo: _Repo) -> str:
+    """``task/6276``'s second commit: lines of its own on top of the first."""
+    current = (repo.root / _CAPABILITY_FILE).read_text()
+    return repo.commit(
+        'feat(6276): extend the capability',
+        {_CAPABILITY_FILE: current + _numbered('more', 30)},
+    )
+
+
+_REWRITTEN_CAPABILITY = 'def new_capability():\n    return 2\n'
+
+
+def _land_and_rewrite(repo: _Repo, rewrites: dict[str, str]) -> None:
+    """Fast-forward ``task/6276`` into main, then rewrite *rewrites* there so survival rejects."""
+    repo.git('checkout', 'main')
+    repo.git('merge', '--ff-only', 'task/6276')
+    repo.commit('refactor: rewrite the modules', rewrites)
+
+
+def _build_landed_capability(repo: _Repo, *, extended: bool) -> tuple[str, str]:
     """``task/6276`` fast-forwarded into main, then its file rewritten there.
 
     Returns ``(base, tip)``: main before the branch, and the branch tip, which
@@ -3439,21 +3467,10 @@ def _build_landed_capability(repo: _Repo, *, commits: int) -> tuple[str, str]:
     """
     base = repo.sha('main')
     repo.git('checkout', '-b', 'task/6276', 'main')
-    tip = repo.commit(
-        'feat(6276): add the capability',
-        {'pkg/cap.py': _numbered('cap', 30) + 'def new_capability():\n    return 1\n'},
-    )
-    if commits == 2:
-        tip = repo.commit(
-            'feat(6276): extend the capability',
-            {'pkg/cap.py': (repo.root / 'pkg/cap.py').read_text() + _numbered('more', 30)},
-        )
-    repo.git('checkout', 'main')
-    repo.git('merge', '--ff-only', 'task/6276')
-    repo.commit(
-        'refactor: rewrite the capability module',
-        {'pkg/cap.py': 'def new_capability():\n    return 2\n'},
-    )
+    tip = _add_capability(repo)
+    if extended:
+        tip = _extend_capability(repo)
+    _land_and_rewrite(repo, {_CAPABILITY_FILE: _REWRITTEN_CAPABILITY})
     return base, tip
 
 
@@ -3465,19 +3482,46 @@ def _build_partly_landed_capability(repo: _Repo) -> tuple[str, str, str]:
     """
     base = repo.sha('main')
     repo.git('checkout', '-b', 'task/6276', 'main')
-    landed = repo.commit(
-        'feat(6276): add the capability',
-        {'pkg/cap.py': _numbered('cap', 30) + 'def new_capability():\n    return 1\n'},
-    )
+    landed = _add_capability(repo)
     repo.git('checkout', 'main')
     repo.git('merge', '--ff-only', 'task/6276')
     repo.git('checkout', 'task/6276')
-    tip = repo.commit(
-        'feat(6276): extend the capability',
-        {'pkg/cap.py': (repo.root / 'pkg/cap.py').read_text() + _numbered('more', 30)},
-    )
+    tip = _extend_capability(repo)
     repo.git('checkout', 'main')
     return base, landed, tip
+
+
+def _build_foreign_capability_under_a_landed_branch(
+    repo: _Repo, *, integrate: str,
+) -> tuple[str, str]:
+    """Another task makes the check true; ``task/6276`` integrates it, lands, and is rewritten.
+
+    ``task/6276`` is cut at the returned base and commits only its own
+    ``pkg/work.py``.  Main then gains task 9999's ``def new_capability``.
+    The branch takes that commit in by *integrate* (``'rebase'`` or
+    ``'merge'``), is fast-forwarded into main, and main rewrites both files,
+    keeping ``def new_capability``, so survival rejects.  Returns ``(base, tip)``: the
+    dispatch-time main the task recorded, which now predates the foreign
+    commit, and the branch tip.
+    """
+    base = repo.sha('main')
+    repo.git('checkout', '-b', 'task/6276', 'main')
+    repo.commit('feat(6276): add the work', {'pkg/work.py': _numbered('work', 30)})
+    repo.git('checkout', 'main')
+    repo.commit(
+        'feat(9999): another task adds the capability',
+        {_CAPABILITY_FILE: _CAPABILITY_CONTENT},
+    )
+    repo.git('checkout', 'task/6276')
+    if integrate == 'rebase':
+        repo.git('rebase', 'main')
+    else:
+        repo.git('merge', '--no-ff', '--no-edit', 'main')
+    tip = repo.sha('HEAD')
+    _land_and_rewrite(
+        repo, {'pkg/work.py': 'rewritten = True\n', _CAPABILITY_FILE: _REWRITTEN_CAPABILITY},
+    )
+    return base, tip
 
 
 class _UnresolvedForkPointGitOps(GitOps):
@@ -3519,7 +3563,7 @@ class TestDeliveredChecksDifferentialRealGitDiscovery:
     ) -> None:
         """Two-commit branch fast-forwarded into main, then rewritten there."""
         repo = _Repo(real_git_repo)
-        base, tip = _build_landed_capability(repo, commits=2)
+        base, tip = _build_landed_capability(repo, extended=True)
         assert repo.is_ancestor(tip, 'main')
 
         verdict = await _discover_6276(real_git_ops, tip, branch_base_sha=base)
@@ -3542,7 +3586,7 @@ class TestDeliveredChecksDifferentialRealGitDiscovery:
     ) -> None:
         """One-commit branch fast-forwarded into main, no recorded base."""
         repo = _Repo(real_git_repo)
-        _base, tip = _build_landed_capability(repo, commits=1)
+        _base, tip = _build_landed_capability(repo, extended=False)
 
         verdict = await _discover_6276(real_git_ops, tip)
 
@@ -3557,7 +3601,7 @@ class TestDeliveredChecksDifferentialRealGitDiscovery:
     ) -> None:
         """A malformed, off-branch or tip-equal record falls through to ``tip^1``."""
         repo = _Repo(real_git_repo)
-        base, tip = _build_landed_capability(repo, commits=2)
+        base, tip = _build_landed_capability(repo, extended=True)
         recorded = {
             'malformed': lambda: 'not-a-sha',
             'foreign': lambda: _side_commit(repo, base),
@@ -3570,6 +3614,32 @@ class TestDeliveredChecksDifferentialRealGitDiscovery:
         assert verdict.probe['delivered_checks_parent_ref'] == f'{tip}^1'
         assert verdict.probe['delivered_checks_baseline'] == 'first_parent'
         assert verdict.probe['delivered_checks_outcome'] == 'no_signal'
+
+    @pytest.mark.parametrize('integrate', ['rebase', 'merge'])
+    async def test_a_record_predating_foreign_commits_is_never_trusted(
+        self, real_git_ops: GitOps, real_git_repo: Path, integrate: str,
+    ) -> None:
+        """A rebased or main-merged branch keeps its dispatch-time record, so
+        ``record..tip`` carries another task's commit: the record falls
+        through, to ``tip^1`` for a rebased tip and to no baseline for a
+        merge-commit tip, and the capability is never credited to this task."""
+        repo = _Repo(real_git_repo)
+        base, tip = _build_foreign_capability_under_a_landed_branch(repo, integrate=integrate)
+        assert repo.is_ancestor(base, tip)
+        assert repo.is_ancestor(tip, 'main')
+
+        verdict = await _discover_6276(real_git_ops, tip, branch_base_sha=base)
+
+        assert verdict.accepted is False
+        assert verdict.reason == 'effect_absent'
+        assert verdict.probe['delivered_checks_outcome'] == 'no_signal'
+        if integrate == 'rebase':
+            assert verdict.probe['delivered_checks_baseline'] == 'first_parent'
+            assert verdict.probe['delivered_checks_parent_ref'] == f'{tip}^1'
+        else:
+            assert verdict.probe['delivered_checks_baseline'] == 'unavailable'
+            assert verdict.probe['delivered_checks_parent_ref'] is None
+            assert verdict.probe['delivered_checks_legs'] == []
 
     async def test_a_real_fork_point_outranks_the_record(
         self, real_git_ops: GitOps, real_git_repo: Path,
