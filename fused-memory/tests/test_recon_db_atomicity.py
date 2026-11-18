@@ -11,12 +11,13 @@ These are cross-store concurrency regressions, not per-store unit tests — each
 needs a SECOND connection to the same file — so they live in one module instead of
 being split across test_journal.py / test_event_buffer.py / test_recon_ledger.py.
 
-The COLLISION arms, a write queued into a read's pinned snapshot, are
-CONSTRUCTED rather than raced.  ``_StatementGate`` parks the store's own read just
-after it pins its snapshot, so each arm is one deterministic run.  Each arm's
-read certifies the pin by not seeing the row the foreign connection committed
-while it was parked, and each positive arm has a legacy control through the same
-helper: the replaced execute + fetchall read, which the same collision kills.
+The COLLISION arms, one per store, each a write queued into a read's pinned
+snapshot, are CONSTRUCTED rather than raced.  ``_StatementGate`` parks the store's
+own read just after it pins its snapshot, so each arm is one deterministic run.
+Each arm's read certifies the pin by not seeing the row the foreign connection
+committed while it was parked, and each positive arm has a legacy control through
+the same helper: the replaced execute + fetchall read, which the same collision
+kills.
 
 MEASURED BASELINES, taken on this task's base commit (2026-09-17), recorded so the
 next reader does not re-derive them:
@@ -32,24 +33,14 @@ it is the CHECKPOINT that raises when another coroutine has a statement in fligh
 the same connection, not the write.  Same defect, same fix; the arms assert neither
 side raises.
 
-TWO GAPS, both deliberate, recorded so a later reader does not mistake either for an
-oversight:
-
-1. There is no ReconLedgerStore COLLISION arm.  One was attempted and measured at
-   0/20 on this base — a multi-hop ``list_suppressions`` read pinned, a foreign
-   commit on the journal's connection, then ``upsert``, at 8,000 rows.  No
-   reproducing shape was found for this store, and an arm that passes on the
-   unfixed code asserts nothing.  The ledger is migrated anyway: it is the third
-   connection to the same file, its checkpoint arm below DOES fail 20/20 today, and
-   its old transaction wrapper carried the same connection-wide rollback.
-
-2. The FAILING-unit half of the connection-wide-rollback regression (one coroutine's
-   failing unit rolls back the CONNECTION, discarding another coroutine's in-flight
-   write, whose own commit then succeeds silently) is pinned at the primitive, in
-   ``shared/tests/test_async_sqlite_base.py``, not here.  It needs a suspension
-   point INSIDE a write unit and no public store method has one; the nearest
-   store-level shape lost 0 of 20 writes when measured.  The CANCELLATION half of
-   the same defect a store method CAN trigger, and is pinned below at the ledger.
+ONE GAP, deliberate, recorded so a later reader does not mistake it for an
+oversight: the FAILING-unit half of the connection-wide-rollback regression (one
+coroutine's failing unit rolls back the CONNECTION, discarding another coroutine's
+in-flight write, whose own commit then succeeds silently) is pinned at the
+primitive, in ``shared/tests/test_async_sqlite_base.py``, not here.  It needs a
+suspension point INSIDE a write unit and no public store method has one; the
+nearest store-level shape lost 0 of 20 writes when measured.  The CANCELLATION half
+of the same defect a store method CAN trigger, and is pinned below at the ledger.
 """
 
 from __future__ import annotations
