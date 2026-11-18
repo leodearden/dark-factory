@@ -364,7 +364,7 @@ source "$SCRIPT_DIR/lib_lane_state.sh"
 
 # The Pass-1 skip-unchanged predicate (lane_seed_unchanged), task 7859. Same
 # guard, same exit 2, for the same reason; ordered after the two above so each
-# missing sibling still names itself (Block A12).
+# missing sibling still names itself (test_warm_lane_gc_native.sh A12).
 if [ ! -f "$SCRIPT_DIR/lib_lane_seed.sh" ]; then
     echo "warm-lane-gc.sh: ERROR — scripts/lib_lane_seed.sh not found next to warm-lane-gc.sh" >&2
     exit 2
@@ -635,7 +635,8 @@ fi
 # The interactive band is honoured per-deployment via REIFY_WARM_LANE_IACT_PREFIX
 # (dark-factory's `git.iact_prefix` is config, not a constant — a deployment that
 # renamed it had the old literal protecting a band it never mints while omitting
-# the band it does, the dangerous direction). Pinned by Block X-band.
+# the band it does, the dangerous direction). Pinned by
+# test_warm_lane_gc_native.sh Block X-band.
 #
 # The `||` is load-bearing, not stylistic: this script runs `set -euo pipefail`,
 # and lane_protect_glob fails LOUD (one [warn] naming the failing stage, EMPTY
@@ -645,7 +646,7 @@ fi
 # line and degrades to the machine-checked static backstop
 # (LANE_PROTECT_GLOB_FALLBACK, gated by
 # orchestrator/tests/test_lane_state_lib.py::TestProtectGlobFallbackDrift) —
-# never an empty glob. Pinned by Block X-degrade.
+# never an empty glob. Pinned by test_warm_lane_gc_native.sh Block X-degrade.
 #
 # An explicit --protect-glob / REIFY_WARM_LANE_GC_PROTECT_GLOB still wins, and
 # short-circuits the bridge before it runs: the render costs one interpreter
@@ -751,11 +752,12 @@ fi
 
 # The clock is read ONCE per invocation, not once per lane.
 #
-# That is NOT the up-front-snapshot TOCTOU Block S-toctou forbids. What that
-# test forbids is hoisting the per-lane RECORD READ — one verdict computed once
-# and then consumed across a 25-40 minute traversal, which is how a lane
-# assigned mid-pass got reset out from under a live agent. The record read stays
-# firmly inside the loop; a THRESHOLD is not a per-lane verdict.
+# That is NOT the up-front-snapshot TOCTOU test_warm_lane_gc_native.sh
+# Block S-toctou forbids. What that test forbids is hoisting the per-lane
+# RECORD READ — one verdict computed once and then consumed across a 25-40
+# minute traversal, which is how a lane assigned mid-pass got reset out from
+# under a live agent. The record read stays firmly inside the loop; a THRESHOLD
+# is not a per-lane verdict.
 #
 # The resulting drift is the pass duration against a days-scale bound, so it
 # cannot flip a verdict at any plausible margin, and it drifts CONSERVATIVE:
@@ -877,7 +879,8 @@ _record_gate_downgrade_reason() {
     # The acute valve is NOT subject to this: --disk-pressure is evaluated
     # FIRST and returns before this leg runs, so no unreadable timestamp can
     # hold the ENOSPC valve shut. That ordering is load-bearing, not incidental
-    # line order — Block S-age-degrade Arm B asserts it directly.
+    # line order — test_warm_lane_gc_native.sh Block S-age-degrade Arm B
+    # asserts it directly.
     #
     # ONE warn per affected lane, and the channel stays anomaly-only: a real
     # producer (LaneLifecycle.transition or LaneLifecycle.refresh_assigned)
@@ -1102,8 +1105,9 @@ _do_reclaim() {
         #     its protect CSV once and consumed it across a sweep that ran
         #     06:32-06:59 BST while _lane-5 dropped OUT of the protect set at
         #     06:32; and that same sweep reset _lane-5 at 20:55Z while a task-5334
-        #     agent session started 20:36Z was live (PRD §2). Block S-toctou goes
-        #     RED against any such hoist.
+        #     agent session started 20:36Z was live (PRD §2).
+        #     test_warm_lane_gc_native.sh Block S-toctou goes RED against any
+        #     such hoist.
         #   - UNDER the flock this loop already holds, so the read and the reset
         #     share one critical section and nothing can reassign the lane
         #     between verdict and action.
