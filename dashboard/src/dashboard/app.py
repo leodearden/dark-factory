@@ -469,7 +469,7 @@ app.include_router(api_quality_routes.router)
 async def index(request: Request) -> HTMLResponse:
     """Serve the React SPA entry point, carrying the asset build it boots with."""
     build = app_asset_build(request.app)
-    html = (_redux_dir / 'index.html').read_text()
+    html = (_redux_dir / 'index.html').read_text(encoding='utf-8')
     return HTMLResponse(inject_page_build(html, build.on_disk() if build else None))
 
 

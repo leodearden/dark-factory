@@ -22,6 +22,7 @@ import dashboard
 from dashboard.asset_build import (
     ASSET_BUILD_ON_DISK_HEADER,
     ASSET_BUILD_STARTED_HEADER,
+    ON_DISK_MAX_AGE_S,
     AssetBuild,
     app_asset_build,
     inject_page_build,
@@ -44,6 +45,22 @@ def _build_tree(root: Path) -> Path:
 @pytest.fixture()
 def tree(tmp_path: Path) -> Path:
     return _build_tree(tmp_path / 'redux')
+
+
+class _ManualClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def pass_max_age(self) -> None:
+        self.now += ON_DISK_MAX_AGE_S
+
+
+@pytest.fixture()
+def clock() -> _ManualClock:
+    return _ManualClock()
 
 
 # --- Section 1: the tree identity and AssetBuild ----------------------------
@@ -103,6 +120,28 @@ def test_adding_a_file_in_a_subdirectory_changes_the_identity(tree: Path) -> Non
     assert tree_identity(tree) != before
 
 
+@pytest.mark.parametrize(
+    'leftover',
+    ['.data.js.swp', '.#data.js', '#data.js#', 'data.js~', 'data.js.orig', 'data.js.rej', 'data.js.bak', 'data.js.swo', 'data.js.tmp'],
+)
+def test_editor_merge_and_patch_leftovers_keep_the_identity(tree: Path, leftover: str) -> None:
+    before = tree_identity(tree)
+
+    (tree / leftover).write_text('not an asset\n')
+    (tree / 'nested' / leftover).write_text('not an asset\n')
+
+    assert tree_identity(tree) == before
+
+
+def test_files_under_a_dot_directory_keep_the_identity(tree: Path) -> None:
+    before = tree_identity(tree)
+
+    (tree / '.cache').mkdir()
+    (tree / '.cache' / 'app.js').write_text('// not shipped\n')
+
+    assert tree_identity(tree) == before
+
+
 def test_file_boundaries_cannot_alias(tmp_path: Path) -> None:
     left = tmp_path / 'left'
     left.mkdir()
@@ -115,24 +154,48 @@ def test_file_boundaries_cannot_alias(tmp_path: Path) -> None:
     assert tree_identity(left) != tree_identity(right)
 
 
-def test_started_stays_fixed_while_on_disk_follows_each_edit(tree: Path) -> None:
-    build = AssetBuild.at_start(tree)
+def test_started_stays_fixed_while_on_disk_follows_each_edit(tree: Path, clock: _ManualClock) -> None:
+    build = AssetBuild(tree, monotonic=clock)
     started = build.started
     assert started == tree_identity(tree)
     assert build.on_disk() == started
 
     (tree / 'data.js').write_text('window.DF_DATA = { first: 1 };\n')
     first_edit = tree_identity(tree)
+    clock.pass_max_age()
 
     assert build.started == started
     assert build.on_disk() == first_edit != started
 
     (tree / 'data.js').write_text('window.DF_DATA = { second: 2 };\n')
     second_edit = tree_identity(tree)
+    clock.pass_max_age()
 
     assert build.started == started
     assert build.on_disk() == second_edit
     assert second_edit not in (started, first_edit)
+
+
+def test_on_disk_answers_from_one_walk_until_max_age_passes(tree: Path, clock: _ManualClock) -> None:
+    build = AssetBuild(tree, monotonic=clock)
+    started = build.started
+
+    (tree / 'data.js').write_text('window.DF_DATA = { burst: true };\n')
+    clock.now += ON_DISK_MAX_AGE_S / 2
+
+    assert build.on_disk() == started
+
+    clock.now += ON_DISK_MAX_AGE_S / 2
+
+    assert build.on_disk() == tree_identity(tree) != started
+
+
+def test_max_age_is_the_injected_one(tree: Path, clock: _ManualClock) -> None:
+    build = AssetBuild(tree, monotonic=clock, max_age_s=0.0)
+
+    (tree / 'data.js').write_text('window.DF_DATA = { immediate: true };\n')
+
+    assert build.on_disk() == tree_identity(tree) != build.started
 
 
 def test_a_missing_root_has_no_identity(tmp_path: Path) -> None:
@@ -188,18 +251,20 @@ def test_every_dashboard_api_response_carries_both_identities(client) -> None:
 
 
 @pytest.fixture()
-def swapped_build(client, tree: Path):
+def swapped_build(client, tree: Path, clock: _ManualClock):
     from dashboard.app import app
 
     original = app_asset_build(app)
     assert original is not None
-    build = AssetBuild.at_start(tree)
+    build = AssetBuild(tree, monotonic=clock)
     install_asset_build(app, build)
     yield build
     install_asset_build(app, original)
 
 
-def test_on_disk_header_follows_a_content_edit_with_no_restart(client, swapped_build: AssetBuild, tree: Path) -> None:
+def test_on_disk_header_follows_a_content_edit_with_no_restart(
+    client, swapped_build: AssetBuild, tree: Path, clock: _ManualClock
+) -> None:
     started = swapped_build.started
     assert started is not None
     target = tree / 'data.js'
@@ -207,9 +272,11 @@ def test_on_disk_header_follows_a_content_edit_with_no_restart(client, swapped_b
 
     before = client.get(_CHEAP_ROUTE)
     target.write_text('window.DF_DATA = { merged: true };\n')
+    clock.pass_max_age()
     edited = client.get(_CHEAP_ROUTE)
     edited_identity = tree_identity(tree)
     target.write_bytes(original_content)
+    clock.pass_max_age()
     restored = client.get(_CHEAP_ROUTE)
 
     assert before.headers[ASSET_BUILD_STARTED_HEADER] == started
@@ -252,9 +319,12 @@ def test_index_injects_the_on_disk_identity_into_its_one_meta(client) -> None:
     assert '/static/redux/app.jsx' in page.text
 
 
-def test_index_injects_the_new_on_disk_identity_with_no_restart(client, swapped_build: AssetBuild, tree: Path) -> None:
+def test_index_injects_the_new_on_disk_identity_with_no_restart(
+    client, swapped_build: AssetBuild, tree: Path, clock: _ManualClock
+) -> None:
     (tree / 'data.js').write_text('window.DF_DATA = { merged: true };\n')
     edited_identity = tree_identity(tree)
+    clock.pass_max_age()
 
     page = client.get('/')
 
