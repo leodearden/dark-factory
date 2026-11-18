@@ -37,6 +37,18 @@ For two commands the resolution is richer than swapping a pronoun, because the f
 - `/prd`'s value is its G1–G6 gates, and a fresh autonomous session can't ask you the questions those gates raise. So **fold in everything from this conversation that bears on them** — the named consumer (G1), the user-observable leaf signal (G2), substrate assumptions (G3), cross-PRD seams (G4), the premise (G6) — so the gates can be satisfied without interrogating an absent human.
 - **Keep the `/prd` wrapper** (unlike `/do`): spawn `/prd <concrete subject + folded-in context>` so the gates run in the fresh session (file-spill as above if long). `/prd` is high-stakes and may still legitimately pause at a gate it genuinely can't resolve from the brief — that's acceptable.
 
+### A human will read it: orient them first
+
+This applies when a person will drive the spawned session or read what it asks or reports. That is any brief that asks the session to bring findings, questions, options or a decision to a human: an investigation told to "get ready to discuss with Leo", a `/team` study, a `/prd` that may pause at a gate. It covers every prompt you compose or rewrite under case 2 or the `/do` and `/prd` subsections above, passed inline or by `--prompt-file`.
+
+It does not apply to case 1. A self-contained command such as `/unblock 8888` still passes verbatim, because its target skill orients its own human. This rule never licenses enriching a case-1 prompt. Nor does it apply to a session whose only reader is the parent that reads its `result.md`, such as a `/review-all` Phase 2 instrument refresh or a programmatic worker.
+
+The human has seen neither this conversation nor, usually, the prompt. They come to the window when the session asks them something, and a `--prompt-file` spawn shows them only the pointer line (`Read <path> and follow it as your brief; ...`). The census found this as finding `fk-c1df06e83aa5` in `docs/legibility/confusion-codebook.yaml`: a spawned `/team` session on 2026-09-21 whose human had to ask for its whole report to be restated. So the brief must do three things:
+
+1. **Open with an orientation written for the human.** In plain language, it says what the original request was (who asked for what, and why), what each task id, escalation id, decision record, PRD or prompt file the brief names actually is, in a clause at its first mention, and what the human will be asked for and why their input is needed.
+2. **Leave no identifier unexplained anywhere in it.** No bare task or escalation ids, option letters, coined labels (such as "sub-shape (ii)" or "P0–P6"), or file paths whose meaning lives only in this conversation. The full list of what must not appear unexplained is the "Plain language" paragraph of `skills/review-all/references/deliberation.md`.
+3. **Tell the session, in so many words, that the human has not read the brief.** Its first message addressed to the human, whether a question, a report or a roster, opens by restating the orientation in a few sentences. Every question or option it puts to the human says what it refers to, never only a label that the brief alone defines.
+
 When in doubt about whether a prompt is self-contained, prefer leaving it untouched and noting the ambiguity, rather than rewriting and risking corruption.
 
 ## Arguments
