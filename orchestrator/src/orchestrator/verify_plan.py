@@ -1036,11 +1036,13 @@ def _task_3294_floor_run(
 
 
 def _merge_breadth_is_full(config: OrchestratorConfig | None) -> bool:
-    """True iff *config* opts into the broad ``merge_verify_breadth='full'`` gate.
+    """True iff *config*'s merge gate breadth is ``'full'``.
 
     A ``None`` *config* (every role='task' caller, and most existing tests)
-    is treated as the shipped default ('scoped') — never accidentally widens
-    to the broad merge gate.
+    is not full: it carries no module registry for
+    :func:`effective_merge_module_configs` to widen to, so it keeps the legacy
+    per-touched-module shape. Every role='task' caller is unaffected either
+    way, because breadth is merge-role-gated.
     """
     return config is not None and config.merge_verify_breadth == 'full'
 
@@ -1088,7 +1090,7 @@ def effective_merge_module_configs(
 
     The empty-registry fallback is a deliberate SAFE DEGRADE: a project with
     no registered modules returns the passed set rather than ``[]``, so the
-    broad gate degrades to today's scoped coverage instead of silently
+    broad gate degrades to the passed (task-scoped) coverage instead of silently
     verifying nothing at the very breadth that exists to verify everything.
     Post-4536 it also serves direct-instantiated configs in tests/evals, which
     never run discovery and whose registry is therefore empty; a zero-module
@@ -1096,9 +1098,9 @@ def effective_merge_module_configs(
     no subprojects" value), routing that case to the INV-1 global gate.
 
     Breadth is asked of :func:`_merge_breadth_is_full` rather than re-read
-    from ``config`` here, so there stays exactly one breadth predicate in the
-    tree (and a ``None`` config keeps degrading to the shipped 'scoped'
-    default instead of raising).
+    from ``config`` here, so this module keeps one breadth predicate (and a
+    ``None`` config, which carries no registry to widen to, returns the
+    passed set unchanged instead of raising).
     """
     if not _merge_breadth_is_full(config):
         return module_configs

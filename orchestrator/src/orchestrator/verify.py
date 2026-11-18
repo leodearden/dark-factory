@@ -9446,7 +9446,7 @@ async def _run_scoped_verification_body(
             # _executed_module_configs_from_plan bridge the module_configs-
             # branch merge+full expansion above uses (PRD Resolved decision
             # 2: the broad gate must be per-module parseable commands, never
-            # the opaque chain). breadth=='scoped' (the shipped default)
+            # the opaque chain). breadth=='scoped' (the explicit per-project opt-down)
             # falls through to the legacy single global call below,
             # byte-identical (R4 rollback golden). This is the
             # merge_verify_workspace=True routing

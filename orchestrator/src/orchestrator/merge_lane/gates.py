@@ -3486,13 +3486,13 @@ def _disjoint_skip_blockers(
         The gate's verdict decomposes over disjoint file sets — i.e. every check
         it runs is diff-scoped.  A whole-tree check violates this by
         construction: its entire premise is that an unrelated file can fail you.
-        Signal used: ``merge_verify_breadth == 'full'``, the EXISTING per-project
-        declaration that the merge gate runs every registered module's suite
-        rather than just the touched ones.  It is a declaration, not a gate name,
-        so this stays project-agnostic.  It is also only a PARTIAL detector of a
-        non-compositional gate (a project whose own verify script runs whole-tree
-        checks internally reads as 'scoped' here — reify is exactly that), which
-        is why P2 below, not P1, is the arm that actually closes the incident.
+        Signal used: ``merge_verify_breadth == 'full'`` (the shipped default,
+        task 7008): the merge gate runs every registered module's suite, not
+        just the touched ones.  A config value, not a gate name, so this stays
+        project-agnostic.  It is only a PARTIAL detector of a non-compositional
+        gate (a project that runs whole-tree checks inside its own verify
+        script but opts down to 'scoped' reads as compositional here), which is
+        why P2 below, not P1, is the arm that actually closes the incident.
 
     P2 (the drift is itself green)
         Main at *rebased_onto* passes the gate on its own.  This premise is
@@ -3526,9 +3526,9 @@ def _disjoint_skip_blockers(
     blockers: list[str] = []
     config = getattr(req, 'config', None)
 
-    # P1 — project-declared whole-tree merge gate.  Deliberately NOT covered by
-    # the kill switch: a project that has declared its merge gate whole-tree has
-    # declared this skip unsound outright, not merely expensive.
+    # P1 — whole-tree merge gate.  Deliberately NOT covered by the kill switch:
+    # a project whose merge gate is whole-tree has made this skip unsound
+    # outright, not merely expensive.
     if getattr(config, 'merge_verify_breadth', None) == 'full':
         blockers.append('whole-tree merge gate (merge_verify_breadth=full)')
 

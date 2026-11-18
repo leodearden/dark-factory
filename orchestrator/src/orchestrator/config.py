@@ -4283,18 +4283,16 @@ class OrchestratorConfig(BaseSettings):
     # configs that do not merge defaults.yaml keep the old fallback behaviour.
     merge_verify_cold_command_timeout_secs: float | None = Field(default=None)
     merge_verify_workspace: bool = Field(default=False)
-    # Staged-rollout gate for the broad merge gate (λ, task 2589).  'scoped'
-    # (default) is the legacy per-touched-module verify plan — byte-identical
-    # rollback path.  'full' makes merge-role (role='merge') verify run EVERY
-    # REGISTERED module's full suite (pytest+ruff+pyright, per configured
-    # command), not just the modules touched by the merging diff — closing
-    # the source-only-diff hole where an untouched sibling module's tests
-    # never ran at merge time.  Restart-only: deliberately NOT in
-    # RELOADABLE_FIELDS, because flipping the gate's breadth mid-process
-    # could split behaviour across an in-flight merge on the most
-    # load-bearing lane.  Flipped 'scoped' → 'full' by the σ capstone and
-    # activated by the τ deterministic-deploy fleet restart.
-    merge_verify_breadth: Literal['scoped', 'full'] = Field(default='scoped')
+    # Breadth of the merge-role (role='merge') verify gate.  'full' (the
+    # shipped default, task 7008) runs EVERY REGISTERED module's full suite
+    # (pytest+ruff+pyright, per configured command) on the merged tree,
+    # whatever the diff touched; 'scoped' is the per-project opt-down to the
+    # legacy per-touched-module plan.  The paired task/merge verify policy is
+    # stated once, in defaults.yaml's merge_verify_breadth comment.
+    # Restart-only: deliberately NOT in RELOADABLE_FIELDS, because flipping
+    # the gate's breadth mid-process could split behaviour across an
+    # in-flight merge on the most load-bearing lane.
+    merge_verify_breadth: Literal['scoped', 'full'] = Field(default='full')
     # Soundness narrowing for the CAS-loop disjoint-delta fast path (the
     # 2026-09-22 whole-tree-drift incident).  ``merge_gates._reverify_rebased_tree``
     # skips the post-rebase re-verify when the branch's touched files and the
@@ -4318,8 +4316,9 @@ class OrchestratorConfig(BaseSettings):
     # behaviour (disjointness alone clears the gate) if the extra re-verifies
     # ever have to be traded away under load; the P1 arm keyed on
     # ``merge_verify_breadth == 'full'`` is NOT covered by this switch,
-    # because a project that has declared a whole-tree gate has declared the
-    # skip unsound outright.
+    # because a project whose merge gate is whole-tree (breadth 'full', the
+    # shipped default unless it opts down to 'scoped') has made the skip
+    # unsound outright.
     #
     # GREEN TIER (see RELOADABLE_FIELDS below, and OPERATIONS.md
     # section "Config reload vs restart").  Unlike its restart-only
