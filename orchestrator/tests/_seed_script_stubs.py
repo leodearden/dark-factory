@@ -18,6 +18,7 @@ from typing import TypeVar
 
 import pytest
 from _git_fixtures import seed_repo
+from _poll_responsive import poll_responsive
 
 from orchestrator.config import GitConfig
 from orchestrator.git_ops import _run
@@ -113,10 +114,8 @@ async def expire_deadline_once(call: Awaitable[T], started: Awaitable[object]) -
     return await task
 
 
-async def wait_until_exists(path: Path, *, within_s: float = 30.0) -> None:
-    async with asyncio.timeout(within_s):
-        while not path.exists():
-            await asyncio.sleep(0.02)
+async def wait_until_exists(path: Path) -> None:
+    await poll_responsive(path.exists, label=f'{path} to exist', interval=0.02)
 
 
 @dataclass(frozen=True)
