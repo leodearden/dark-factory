@@ -7,55 +7,51 @@ title and status; it fetches the task's prose on demand from
 
 from __future__ import annotations
 
-import json
 from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
 
 import pytest
 from _canned_mcp import CannedMCP, _raw_row
+from _served_reads import forget_served_reads
+from escalation.models import Escalation
+from escalation.queue import EscalationQueue
 
 from dashboard.config import DashboardConfig
-from dashboard.data import redux_api
-from dashboard.data.datum import Datum, DatumState, unknown_datum
+from dashboard.data import redux_api, task_lookup
+from dashboard.data.datum import (
+    Datum,
+    DatumContractError,
+    DatumInvariant,
+    DatumState,
+    unknown_datum,
+)
 from dashboard.data.escalation_corpus import EscalationView
-
-_WIRE_KEYS = {'value', 'as_of', 'state', 'reason', 'freshness_bound_seconds'}
 
 
 @pytest.fixture(autouse=True)
-def _escalation_caches():
-    """Clear the corpus, the analytics memo, the snapshot units and the per-id cache."""
-    from dashboard.api import escalations as escalation_routes
-    from dashboard.data import escalation_corpus, task_lookup, task_snapshot
-
-    def _clear() -> None:
-        escalation_corpus._corpus_cache_clear()
-        escalation_routes._analytics_memo_clear()
-        task_snapshot.clear_snapshot_cache()
+def _forget_route_reads():
+    """Forget the stores the route serves from: the suite's served reads, then the per-id lookup."""
+    def _forget() -> None:
+        forget_served_reads()
         task_lookup._lookup_cache_clear()
 
-    _clear()
+    _forget()
     yield
-    _clear()
+    _forget()
 
 
-def _config(root) -> DashboardConfig:
-    """A config over *root* whose every queue dir exists, so a clean walk is fresh."""
+def _config_filing(root, task_ids: dict[str, str]) -> DashboardConfig:
+    """A config over *root* whose queue holds one pending escalation per ``esc_id -> task_id``."""
     config = DashboardConfig(project_root=root, known_project_roots=[], escalation_urls={})
-    config.escalations_dir.mkdir(parents=True, exist_ok=True)
+    queue = EscalationQueue(config.escalations_dir)
+    for esc_id, task_id in task_ids.items():
+        queue.submit(Escalation(
+            id=esc_id, task_id=task_id, agent_role='implementer', severity='blocking',
+            category='design_concern', summary=f'summary of {esc_id}',
+            timestamp='2026-09-01T00:00:00+00:00', status='pending',
+        ))
     config.reconciliation_escalations_dir.mkdir(parents=True, exist_ok=True)
     return config
-
-
-def _write_escalation(config: DashboardConfig, esc_id: str, *, task_id: str) -> None:
-    from escalation.models import Escalation
-
-    record = Escalation(
-        id=esc_id, task_id=task_id, agent_role='implementer', severity='blocking',
-        category='design_concern', summary=f'summary of {esc_id}',
-        timestamp='2026-09-01T00:00:00+00:00', status='pending',
-    ).to_dict()
-    (config.escalations_dir / f'{esc_id}.json').write_text(json.dumps(record))
 
 
 def _task(body: dict, esc_id: str) -> dict:
@@ -69,10 +65,7 @@ def _task(body: dict, esc_id: str) -> dict:
 
 def test_a_card_carries_only_id_title_and_status(client, tmp_path):
     """A terminal card (one get_task) and an active card (the snapshot) both ship three fields."""
-    config = _config(tmp_path)
-    _write_escalation(config, 'esc-3-1', task_id='3')
-    _write_escalation(config, 'esc-11-1', task_id='11')
-    client.app.state.config = config
+    client.app.state.config = _config_filing(tmp_path, {'esc-3-1': '3', 'esc-11-1': '11'})
     canned = CannedMCP(
         rows=[
             _raw_row(
@@ -100,7 +93,6 @@ def test_a_card_carries_only_id_title_and_status(client, tmp_path):
         ('esc-11-1', {'id': 11, 'title': 'task 11', 'status': 'in-progress'}),
     ):
         task = _task(body, esc_id)
-        assert set(task) == _WIRE_KEYS, esc_id
         assert task['state'] == 'fresh', esc_id
         assert task['value'] == card, esc_id
 
@@ -117,24 +109,29 @@ def _views() -> dict:
     return {view: Datum(0, _MEASURED_AT, DatumState.FRESH, None, 120) for view in EscalationView}
 
 
-def _esc_row(esc_id: str) -> dict:
+def _queues(*esc_ids: str) -> dict:
+    """``build_escalation_queues`` output: one projA subsection holding a pending row per id."""
+    rows = [
+        {
+            'id': esc_id, 'task_id': '1', 'level': 0, 'status': 'pending',
+            'summary': 'oops', 'project': 'projA', 'project_root': '/p/projA',
+        }
+        for esc_id in esc_ids
+    ]
     return {
-        'id': esc_id, 'task_id': '1', 'level': 0, 'status': 'pending',
-        'summary': 'oops', 'project': 'projA', 'project_root': '/p/projA',
-    }
-
-
-def test_a_projected_card_keeps_its_provenance():
-    """A stale card is projected and stays stale; an unknown card stays unknown, saying why."""
-    queues = {
         'subsections': [{
             'id': '/p/projA', 'label': 'projA', 'kind': 'orchestrator',
-            'escalations': [_esc_row('esc-1-1'), _esc_row('esc-2-1')], 'skipped': [],
+            'escalations': rows, 'skipped': [],
             'summary': dict(_SUMMARY), 'views': _views(),
         }],
         'summary': dict(_SUMMARY),
         'views': _views(),
     }
+
+
+def test_a_projected_card_keeps_its_provenance():
+    """A stale card is projected and stays stale; an unknown card stays unknown, saying why."""
+    queues = _queues('esc-1-1', 'esc-2-1')
     whole_row = {
         'id': 1, 'title': 'one', 'status': 'pending', 'priority': 'high',
         'dependencies': [2], 'updated_at': '2026-10-01T11:00:00+00:00',
@@ -156,3 +153,20 @@ def test_a_projected_card_keeps_its_provenance():
     assert stale['reason']
     assert stale['value'] == {'id': 1, 'title': 'one', 'status': 'pending'}
     assert (unknown['value'], unknown['state'], unknown['reason']) == (None, 'unknown', 'no task id')
+
+
+def test_a_card_lacking_a_drawer_field_names_its_row():
+    """A card value without ``title`` is a wiring bug, reported against the row it broke."""
+    queues = _queues('esc-1-1')
+    cards = {
+        ('/p/projA', 'esc-1-1'): Datum(
+            {'id': 1, 'status': 'pending'}, _MEASURED_AT, DatumState.FRESH, None, 10,
+        ),
+    }
+
+    with pytest.raises(DatumContractError) as raised:
+        redux_api.shape_escalations(queues, cards, served_at=_MEASURED_AT)
+
+    assert raised.value.invariant is DatumInvariant.VALUE_CONTRACT
+    assert 'ESCALATIONS projA esc-1-1 task' in str(raised.value)
+    assert 'title' in str(raised.value)

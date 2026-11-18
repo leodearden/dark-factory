@@ -838,9 +838,22 @@ _ESCALATION_CARD_FIELDS: tuple[str, ...] = ('id', 'title', 'status')
 """What ``tab_escalations.jsx::EscalationSidebar`` reads of a card; it reads the prose on demand from ``api/task_prose.py``."""
 
 
-def _escalation_card(row: Mapping[str, Any]) -> dict[str, Any]:
-    """*row*, a ``tasks._shape_task`` row, cut to :data:`_ESCALATION_CARD_FIELDS`."""
-    return {key: row[key] for key in _ESCALATION_CARD_FIELDS}
+def _wire_card(card: object, field: str, served_at: datetime) -> dict[str, object]:
+    """*card*, a ``tasks._shape_task`` row's Datum, wired at *served_at* as :data:`_ESCALATION_CARD_FIELDS`.
+
+    A known card lacking one of those fields is a wiring bug and raises
+    ``VALUE_CONTRACT``, naming *field* and the missing keys.
+    """
+    def project(row: Mapping[str, Any]) -> dict[str, Any]:
+        missing = [key for key in _ESCALATION_CARD_FIELDS if key not in row]
+        if missing:
+            raise DatumContractError(
+                DatumInvariant.VALUE_CONTRACT,
+                f'{field} lacks card field(s) {missing}; it holds {sorted(row)}',
+            )
+        return {key: row[key] for key in _ESCALATION_CARD_FIELDS}
+
+    return _wire_served(card, field, served_at, project=project)
 
 
 def shape_escalations(
@@ -857,7 +870,7 @@ def shape_escalations(
     Each subsection, and the top level, carries ``views``,
     every :class:`~dashboard.data.escalation_corpus.EscalationView` wired the
     same way. A row with no card or a missing view is a wiring bug and raises
-    ``DATUM_REQUIRED``.
+    ``DATUM_REQUIRED``; a card lacking a card field raises ``VALUE_CONTRACT``.
 
     ``skipped`` (the queue's unreadable files) and ``summary.skipped_count``
     sit beside the counts they qualify (INV-2), copied so the payload never
@@ -870,10 +883,9 @@ def shape_escalations(
         rows = [
             {
                 **{k: v for k, v in esc.items() if k != 'project_root'},
-                'task': _wire_served(
+                'task': _wire_card(
                     cards.get((sub_id, esc.get('id'))),
                     f"ESCALATIONS {label} {esc.get('id')} task", served_at,
-                    project=_escalation_card,
                 ),
             }
             for esc in sub.get('escalations') or []
