@@ -131,6 +131,25 @@ async def test_the_cli_exposes_exactly_the_granted_tools(tmp_path, marker):
     ]
 
 
+@pytest.mark.asyncio
+async def test_a_cli_grant_naming_an_unregistered_tool_is_dropped_with_a_warning(
+    tmp_path, caplog,
+):
+    argv = [
+        *_lane_argv(tmp_path), '--grants-enforced',
+        '--grant', 'mark_step_done', '--grant', 'renamed_away',
+    ]
+
+    with caplog.at_level(logging.WARNING, logger='orchestrator.mcp.plan_tools'):
+        server = plan_tools.server_from_argv(argv)
+
+    assert await _listed(server) == ['mark_step_done']
+    assert any(
+        record.levelno == logging.WARNING and 'renamed_away' in record.getMessage()
+        for record in caplog.records
+    )
+
+
 @pytest.mark.parametrize('python_executable', ['/venv/bin/python', None])
 def test_the_launcher_always_appends_the_marker_then_sorted_grant_pairs_after_the_root_args(
     tmp_path, python_executable,
@@ -154,7 +173,6 @@ def test_the_launcher_always_appends_the_marker_then_sorted_grant_pairs_after_th
 
 _PLAN_TOOLS_ROLES = [ARCHITECT, IMPLEMENTER, DEBUGGER, SIMPLE_TASK]
 _DEVIATION_RECORDERS = frozenset({IMPLEMENTER.name, DEBUGGER.name})
-_PLAN_TOOLS_PREFIX = 'mcp__plan-tools__'
 
 
 def test_the_plan_tools_family_is_exactly_the_roles_tested_here():
@@ -163,12 +181,30 @@ def test_the_plan_tools_family_is_exactly_the_roles_tested_here():
     ) == sorted(role.name for role in _PLAN_TOOLS_ROLES)
 
 
-@pytest.mark.parametrize('role', _PLAN_TOOLS_ROLES, ids=lambda role: role.name)
-def test_a_roles_grant_is_its_plan_tools_allowlist(role):
-    assert role.plan_tools_grants == {
-        tool.removeprefix(_PLAN_TOOLS_PREFIX)
-        for tool in role.allowed_tools if tool.startswith(_PLAN_TOOLS_PREFIX)
-    }
+@pytest.mark.parametrize(
+    ('role', 'granted', 'withheld'),
+    [
+        pytest.param(
+            ARCHITECT, {'create_plan', 'add_plan_step', 'confirm_plan'},
+            {'mark_step_done', 'record_step_deviation'}, id='architect',
+        ),
+        pytest.param(
+            IMPLEMENTER, {'mark_step_done', 'record_step_deviation', 'report_missing_plan_file'},
+            {'create_plan', 'confirm_plan'}, id='implementer',
+        ),
+        pytest.param(
+            DEBUGGER, {'mark_step_done', 'record_step_deviation', 'report_missing_plan_file'},
+            {'create_plan', 'confirm_plan'}, id='debugger',
+        ),
+        pytest.param(
+            SIMPLE_TASK, {'create_plan', 'confirm_plan', 'mark_step_done'},
+            {'record_step_deviation'}, id='simple_task',
+        ),
+    ],
+)
+def test_a_roles_grant_names_its_plan_tools_and_withholds_the_rest(role, granted, withheld):
+    assert granted <= role.plan_tools_grants
+    assert not withheld & role.plan_tools_grants
 
 
 @pytest.mark.asyncio

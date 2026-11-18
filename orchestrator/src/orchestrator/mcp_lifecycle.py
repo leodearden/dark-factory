@@ -106,8 +106,9 @@ def _stdio_mcp_server(
     """Shared launch-dict factory for stdio MCP servers (task 2482 amendment).
 
     :func:`plan_tools_mcp_server` and :func:`verdict_tools_mcp_server` both
-    delegate here — they differ only by *module_path* and an optional
-    *extra_args* tail (verdict-tools' ``('--verdict-role', role)``), so the
+    delegate here — they differ only by *module_path* and their *extra_args*
+    tail (plan-tools' ``--grants-enforced`` marker and ``--grant`` pairs,
+    verdict-tools' ``('--verdict-role', role)``), so the
     no-uv hot path vs. ``uv --no-sync --frozen`` fallback branch and the
     ``meta_root`` passthrough now live in exactly one place instead of two
     near-identical copies.
@@ -142,9 +143,9 @@ def _stdio_mcp_server(
             ``TaskArtifacts.task_root_for``), passed as ``--task-root``
             right after the ``--meta-root`` pair; ``None`` emits nothing.
         extra_args: Additional tokens appended after the ``--worktree``/
-            ``--meta-root``/``--task-root`` args (e.g. verdict-tools'
-            ``--verdict-role`` pair).  Empty by default — exactly
-            plan-tools' shape.
+            ``--meta-root``/``--task-root`` args: plan-tools'
+            ``--grants-enforced`` marker and ``--grant`` pairs, or
+            verdict-tools' ``--verdict-role`` pair.  Empty by default.
 
     Returns:
         Claude Code MCP server config dict with ``command`` and ``args``.
@@ -200,7 +201,7 @@ def plan_tools_mcp_server(
     supplied, the config launches plan-tools directly via that interpreter
     without involving ``uv`` at all::
 
-        <python_executable> -m orchestrator.mcp.plan_tools --worktree <wt>
+        <python_executable> -m orchestrator.mcp.plan_tools --worktree <wt> [root args] --grants-enforced [--grant <name> ...]
 
     This eliminates the ``uv``-induced startup stalls that caused 0-turn
     ``error_empty_output`` failures under load: ``uv run`` acquires a
@@ -215,9 +216,9 @@ def plan_tools_mcp_server(
 
     **uv fallback (backward-compat, tasks 1775/this):** When
     *python_executable* is ``None`` (default), the existing fast-start form is
-    returned unchanged::
+    returned, with the same arguments after ``-m``::
 
-        uv run --project <orch> --no-sync --frozen python -m orchestrator.mcp.plan_tools --worktree <wt>
+        uv run --project <orch> --no-sync --frozen python -m orchestrator.mcp.plan_tools --worktree <wt> ...
 
     The fallback preserves task 1775's ``TestPlanToolsLaunchFastStart``
     regression tests and serves any caller that cannot supply an interpreter.
@@ -243,8 +244,7 @@ def plan_tools_mcp_server(
             plan-tools server as ``--meta-root``, so the agent-side plan.json
             writer targets the same relocated artifacts root as the
             orchestrator (worktree-lane-lifecycle PRD task ε1). When
-            ``None`` (default), no ``--meta-root`` flag is emitted and args
-            are byte-identical to before this parameter existed.
+            ``None`` (default), no ``--meta-root`` flag is emitted.
         task_root: Optional task-lifetime root passed as ``--task-root``.
         granted_tools: The tool names the launched server exposes. The
             ``--grants-enforced`` marker is always emitted after the root
@@ -286,8 +286,8 @@ def verdict_tools_mcp_server(
     Delegates to the shared :func:`_stdio_mcp_server` helper (task 2482
     amendment) — same direct-interpreter no-uv hot path vs. ``uv --no-sync
     --frozen`` fallback branch, same ``meta_root`` passthrough as
-    :func:`plan_tools_mcp_server`, differing only by module path and the
-    added ``('--verdict-role', role)`` extra-args tail.
+    :func:`plan_tools_mcp_server`, differing only by module path and its
+    ``('--verdict-role', role)`` extra-args tail.
 
     The returned dict carries the shared ``_FASTMCP_STDIO_QUIET_ENV``
     (``FASTMCP_SHOW_SERVER_BANNER='false'`` / ``FASTMCP_CHECK_FOR_UPDATES=

@@ -2327,6 +2327,19 @@ def create_server(
     names stay registered, so an ungranted tool neither lists nor dispatches;
     a granted name this server does not register raises ``ValueError``.
     """
+    mcp, registered = _server_with_every_tool(artifacts)
+    if granted_tools is not None:
+        unknown = sorted(granted_tools - registered)
+        if unknown:
+            raise ValueError(
+                f'plan-tools grant names unregistered tool(s) {unknown}; '
+                f'registered: {sorted(registered)}'
+            )
+        _restrict_to_grant(mcp, registered, granted_tools)
+    return mcp
+
+
+def _server_with_every_tool(artifacts: TaskArtifacts) -> tuple[FastMCP, frozenset[str]]:
     mcp = FastMCP('plan-tools')
     registered: list[str] = []
 
@@ -2999,21 +3012,14 @@ def create_server(
         """
         return _report_missing_plan_file(artifacts, path, reason)
 
-    if granted_tools is not None:
-        _restrict_to_grant(mcp, registered, granted_tools)
-    return mcp
+    return mcp, frozenset(registered)
 
 
-def _restrict_to_grant(mcp: FastMCP, registered: list[str], granted: frozenset[str]) -> None:
-    unknown = sorted(granted - set(registered))
-    if unknown:
-        raise ValueError(
-            f'plan-tools grant names unregistered tool(s) {unknown}; '
-            f'registered: {sorted(registered)}'
-        )
-    for name in registered:
-        if name not in granted:
-            mcp.local_provider.remove_tool(name)
+def _restrict_to_grant(
+    mcp: FastMCP, registered: frozenset[str], granted: frozenset[str],
+) -> None:
+    for name in registered - granted:
+        mcp.local_provider.remove_tool(name)
 
 
 # ---------------------------------------------------------------------------
@@ -3038,20 +3044,30 @@ def server_from_argv(argv: list[str] | None = None) -> FastMCP:
 
     A launch carrying ``--grants-enforced`` or any ``--grant`` exposes only
     the granted tools, so a marked launch with no grant exposes none. A
-    launch carrying neither keeps every tool and logs a WARNING.
-    Why that unmarked case exists: plans/plan-deviation-recording-prd.md D14.
+    granted name this server does not register is dropped with a WARNING,
+    where ``create_server`` raises. A launch carrying neither keeps every
+    tool and logs a WARNING. Why both cases exist:
+    plans/plan-deviation-recording-prd.md D14.
     """
     args = _cli_parser().parse_args(argv)
-    artifacts = _artifacts_from_namespace(args)
-    granted = frozenset(args.grant or ())
-    if args.grants_enforced or granted:
-        return create_server(artifacts, granted)
-    logger.warning(
-        'plan-tools launched without --grants-enforced or any --grant: exposing '
-        'every plan-tools tool, because the launcher predates task 7717. '
-        'Task 10803 removes this path.'
-    )
-    return create_server(artifacts)
+    mcp, registered = _server_with_every_tool(_artifacts_from_namespace(args))
+    granted: frozenset[str] = frozenset(args.grant or ())
+    if not (args.grants_enforced or granted):
+        logger.warning(
+            'plan-tools launched without --grants-enforced or any --grant: exposing '
+            'every plan-tools tool, because the launcher predates task 7717. '
+            'Task 10803 removes this path.'
+        )
+        return mcp
+    unknown = sorted(granted - registered)
+    if unknown:
+        logger.warning(
+            'plan-tools launch grants tool(s) %s that this server does not register: '
+            'dropping them, because the launcher predates their rename or removal.',
+            unknown,
+        )
+    _restrict_to_grant(mcp, registered, granted)
+    return mcp
 
 
 def _cli_parser() -> argparse.ArgumentParser:

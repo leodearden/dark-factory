@@ -456,7 +456,11 @@ so a role granted nothing gets nothing. Dispatches run under `bypassPermissions`
 launch carrying neither the marker nor any grant keeps the full surface and logs a WARNING,
 because it comes from a pre-7717 orchestrator, whose in-memory launcher emits no grant while
 the server child imports the new `plan_tools.py` through the editable install; task 10803
-removes that path once deploy task 10802 has restarted the fleet.
+removes that path once deploy task 10802 has restarted the fleet. The same skew can hand the
+server a `--grant` naming a tool it no longer registers, after a rename or removal, so the CLI
+drops such a grant with a WARNING rather than refusing to start (a server that fails at startup
+is dropped by the Claude CLI, taking every granted tool with it). In-process
+`create_server(granted_tools=...)` still raises on one.
 
 ---
 
