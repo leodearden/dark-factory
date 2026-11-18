@@ -2180,24 +2180,6 @@ class TestTopicSelection:
         assert corpus.topic_of('dark_factory', 'm1') == 'dup_topic'
         assert resolve_exit(report) == 1
 
-    def test_an_unselected_value_gets_no_verdict_of_any_kind(self):
-        records = [
-            rec('m1', '!!!'),
-            rec('', 'no_id'),
-            rec('m2', 'dup_topic'), rec('m3', 'dup-topic'),
-            rec('m4', 'plain_legacy'),
-        ]
-
-        unnarrowed = plan_renames(records, project_id='dark_factory')
-        narrowed = plan_renames(records, project_id='dark_factory',
-                                     topics=frozenset({'other_legacy'}))
-
-        assert sorted(entry['reason'] for entry in unnarrowed[1]) == [
-            'record_without_id', 'slug_collision', 'topic_unfoldable',
-        ]
-        assert [rename.old_topic for rename in unnarrowed[0]] == ['plain_legacy']
-        assert narrowed == ([], [])
-
     @pytest.mark.asyncio
     async def test_only_a_selected_values_id_less_record_is_filed(self):
         """A refusal that is not a collision is narrowed by its legacy value too.

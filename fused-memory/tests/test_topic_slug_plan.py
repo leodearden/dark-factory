@@ -11,7 +11,12 @@ import dataclasses
 import pytest
 from _topic_slug_migration_doubles import by_reason, rec
 
-from fused_memory.maintenance.topic_slug_plan import plan_renames
+from fused_memory.maintenance.topic_slug_plan import (
+    in_selection,
+    is_non_conforming_topic,
+    plan_renames,
+    refuse_invalid_selection,
+)
 
 # ===========================================================================
 # plan_renames — the pure planner
@@ -429,3 +434,97 @@ class TestCanonicalCollision:
         )
         assert by_reason(skips, 'canonical_collision') == []
         assert len(by_reason(skips, 'slug_collision')) == 1
+
+
+# ===========================================================================
+# The --topic selection: which legacy values a plan returns verdicts for
+# ===========================================================================
+
+#: Selections that name no foldable legacy value, each with the text the
+#: refusal must name.  The conforming target slug is the likely typo.
+INVALID_SELECTIONS = [
+    pytest.param(frozenset(), 'empty', id='empty'),
+    pytest.param(frozenset({'legacy-a'}), 'legacy-a', id='conforming-target'),
+    pytest.param(frozenset({'a' * 101}), 'a' * 101, id='no-fold'),
+    pytest.param(frozenset({42}), '42', id='non-str'),
+]
+
+
+class TestTopicSelection:
+    """A selection names LEGACY source values and narrows the verdicts only.
+
+    The collision index stays corpus-wide (see ``TestSlugCollision``); what a
+    selection removes is every verdict about an unselected value.
+    """
+
+    def test_an_unselected_value_gets_no_verdict_of_any_kind(self):
+        records = [
+            rec('m1', '!!!'),
+            rec('', 'no_id'),
+            rec('m2', 'dup_topic'), rec('m3', 'dup-topic'),
+            rec('m4', 'plain_legacy'),
+        ]
+
+        unnarrowed = plan_renames(records, project_id='dark_factory')
+        narrowed = plan_renames(records, project_id='dark_factory',
+                                topics=frozenset({'other_legacy'}))
+
+        assert sorted(entry['reason'] for entry in unnarrowed[1]) == [
+            'record_without_id', 'slug_collision', 'topic_unfoldable',
+        ]
+        assert [rename.old_topic for rename in unnarrowed[0]] == ['plain_legacy']
+        assert narrowed == ([], [])
+
+    @pytest.mark.parametrize(('topics', 'named'), INVALID_SELECTIONS)
+    def test_an_invalid_selection_is_refused(self, topics, named):
+        with pytest.raises(ValueError) as refused:
+            refuse_invalid_selection(topics)
+
+        assert named in str(refused.value)
+
+    @pytest.mark.parametrize(('topics', 'named'), INVALID_SELECTIONS)
+    def test_the_planner_refuses_an_invalid_selection_itself(self, topics, named):
+        """Planning nothing for a typo would read as a clean run to any caller."""
+        with pytest.raises(ValueError) as refused:
+            plan_renames([rec('m1', 'legacy_a')], project_id='dark_factory',
+                         topics=topics)
+
+        assert named in str(refused.value)
+
+    def test_no_selection_is_not_refused(self):
+        assert refuse_invalid_selection(None) is None
+
+    def test_a_drained_legacy_value_is_not_refused(self):
+        """A re-run after a successful ``--apply`` finds the value gone."""
+        drained = frozenset({'drained_legacy'})
+
+        assert refuse_invalid_selection(drained) is None
+        assert plan_renames([rec('m1', 'drained-legacy')], project_id='dark_factory',
+                            topics=drained) == ([], [])
+
+    def test_no_selection_covers_every_value(self):
+        assert in_selection('legacy_a', None)
+        assert in_selection(42, None)
+
+    def test_a_selection_covers_only_its_own_values(self):
+        selection = frozenset({'legacy_a'})
+
+        assert in_selection('legacy_a', selection)
+        assert not in_selection('legacy_b', selection)
+
+    def test_a_non_string_topic_is_never_in_a_selection(self):
+        assert not in_selection(42, frozenset({'42'}))
+
+
+class TestIsNonConformingTopic:
+    """A PRESENT topic the slug rule rejects; an absent one is not this sweep's."""
+
+    @pytest.mark.parametrize(('topic', 'non_conforming'), [
+        pytest.param(None, False, id='absent'),
+        pytest.param('good-topic', False, id='conforming'),
+        pytest.param('legacy_a', True, id='foldable'),
+        pytest.param('!!!', True, id='unfoldable'),
+        pytest.param(42, True, id='non-str'),
+    ])
+    def test_verdict(self, topic, non_conforming):
+        assert is_non_conforming_topic(topic) is non_conforming

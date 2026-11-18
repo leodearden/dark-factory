@@ -149,7 +149,12 @@ def plan_renames(
     Returns:
         ``(renames, skips)`` — frozen :class:`Rename` rows, and report-ready
         skip dicts each carrying a ``reason``.
+
+    Raises:
+        ValueError: *topics* names no foldable legacy value
+            (:func:`refuse_invalid_selection`).
     """
+    refuse_invalid_selection(topics)
     renames: list[Rename] = []
     skips: list[dict] = []
 
