@@ -111,3 +111,11 @@ def test_stage2_task_accounting_rules_flag_through_no_structured_report():
     )
 
     assert 'structured report' not in section
+
+
+@pytest.mark.parametrize('project_id', ('dark_factory', 'autopilot_video'))
+def test_stage2_prompt_asks_for_no_git_history_or_working_tree(project_id):
+    prompt = build_stage2_system_prompt(project_id)
+
+    assert 'git log --all' not in prompt
+    assert 'current working tree' not in prompt
