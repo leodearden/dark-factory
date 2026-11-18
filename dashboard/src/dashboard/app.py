@@ -43,6 +43,7 @@ from dashboard.api import task_prose as api_task_prose_routes
 from dashboard.api import tasks as api_tasks_routes
 from dashboard.api.clock import app_clock, install_clock, live_clock
 from dashboard.api.window import _parse_window, with_window
+from dashboard.asset_build import AssetBuild, AssetBuildHeaders, install_asset_build
 from dashboard.background_loops import PRODUCTION_LOOPS, BackgroundLoops
 from dashboard.config import DashboardConfig
 from dashboard.data import memory as memory_data
@@ -350,6 +351,7 @@ async def lifespan(app: FastAPI, *, loops: BackgroundLoops = PRODUCTION_LOOPS):
     config = DashboardConfig.from_env()
     app.state.config = config
     install_clock(app, live_clock)
+    install_asset_build(app, AssetBuild.at_start(_redux_dir))
     http_client = httpx.AsyncClient(
         follow_redirects=True,
         limits=_build_http_limits(config),
@@ -434,6 +436,7 @@ async def lifespan(app: FastAPI, *, loops: BackgroundLoops = PRODUCTION_LOOPS):
 
 
 app = FastAPI(title='Dark Factory Dashboard', lifespan=lifespan)
+app.add_middleware(AssetBuildHeaders)
 app.mount('/static', StaticFiles(directory=str(_pkg_dir / 'static')), name='static')
 
 # Route table for the handlers extracted out of this file (task 5586). Each
