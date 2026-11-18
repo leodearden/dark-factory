@@ -70,6 +70,71 @@ def with_origin(record: dict, kind: str) -> dict:
     return out
 
 
+def sdk_prompt(text: str, *, entrypoint: str = 'sdk-cli') -> dict:
+    """A user prompt record stamped as Claude Code stamps an SDK-delivered
+    prompt -- promptSource, turnOrigin and userType, with 'isMeta' REMOVED --
+    in the shape sighted 2026-11-18. *entrypoint* 'sdk-cli' is headless
+    ``claude --print`` (shared/src/shared/cli_invoke.py::build_claude_argv);
+    T3 Code's human-typed turns carry 'sdk-ts' or 't3-code' instead
+    (session 790c2455)."""
+    out = user_record(text)
+    out.pop('isMeta', None)
+    out.update(
+        promptSource='sdk', turnOrigin='sdk', userType='external', entrypoint=entrypoint,
+    )
+    return out
+
+
+UNMARKED_HEADLESS_SDK_PROMPTS = (
+    pytest.param(
+        'Task ID: 4384\n'
+        'Worktree: /home/leo/src/dark-factory/.worktrees/4384\n'
+        'Block reason: verify failed three times on the same gate\n'
+        'Detail: (none)\n\n'
+        'Investigate and emit your structured proposal.',
+        id='dry_run_unblock',
+    ),
+    pytest.param(
+        'ITEM p1\n'
+        'CHILD: The merge worker releases the lease before verify returns.\n'
+        'PARENT: Merge-lane leases outlive the verify they guard.',
+        id='link_adjudicator',
+    ),
+    pytest.param(
+        "Task filed in project: 'reify'\n"
+        'Flagged matched path prefixes: orchestrator/src/orchestrator/\n'
+        "Suggested correct project: 'dark_factory'\n\n"
+        'Task title:\n'
+        'Merge worker holds the lease across verify\n',
+        id='path_scope_adjudicator',
+    ),
+    pytest.param(
+        '# Candidate task (not yet created)\n'
+        '  title: Merge worker holds the lease across verify\n'
+        '  priority: low\n'
+        '  spawn_context: agent_followup',
+        id='task_curator_candidate',
+    ),
+)
+"""Machine prompts delivered to headless ``claude --print`` that NO text rule
+recognises, restated and abridged from their builders:
+``orchestrator/src/orchestrator/dry_run_unblock.py::run_dry_run_unblock``
+(session 2bf64b62),
+``fused-memory/src/fused_memory/maintenance/link_adjudicator.py::render_user_prompt``
+(session 169b8d4b),
+``fused-memory/src/fused_memory/middleware/path_scope_adjudicator.py::PathScopeAdjudicator._build_user_prompt``
+and ``fused-memory/src/fused_memory/middleware/task_curator.py::_render_candidate_section``.
+Only the record's provenance can exclude them."""
+
+SDK_GUI_CLIENT_HUMAN_TURNS = (
+    pytest.param("what's the status of the PR?", 'sdk-ts', id='sdk_ts'),
+    pytest.param('do watch it', 't3-code', id='t3_code'),
+)
+"""(text, entrypoint) human turns typed into T3 Code, a GUI client over the
+Agent SDK, verbatim from session 790c2455: promptSource 'sdk' as on a
+headless prompt, told apart only by the entrypoint."""
+
+
 def coder_judgment(note: str = "that's wrong: the watcher re-armed on a stale lease") -> str:
     """A trickle-coder answer as it lands in a transcript: the whole
     judgment on ONE line, shaped after session b203a05c record 22. *note*
