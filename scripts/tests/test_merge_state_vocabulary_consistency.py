@@ -217,7 +217,7 @@ def vocabulary_values(partitions: dict[str, frozenset[str]]) -> frozenset[str]:
     return values
 
 
-# `failed` is NOT a member of either vocabulary — it is a value
+# `failed` is NOT a member of any vocabulary — it is a value
 # `skills/merge-queue/SKILL.md` and `skills/unblock-low-risk/SKILL.md` invented
 # (the real value is `error`). It is listed here anyway so that correcting those
 # files cannot accidentally start counting it.
@@ -356,7 +356,7 @@ def extract_spans(text: str, *, source: str) -> list[tuple[str, str]]:
                 # — and the resulting comparison would send a reader to fix a list
                 # that is fine. The `partition=NAME` fragment that rides along here
                 # is harmless: `NAME` is UPPER_SNAKE and so matches no lowercase
-                # token, and `partition` is in neither vocabulary.
+                # token, and `partition` is in none of the vocabularies.
                 remainder = line[marker_column + len(_BEGIN_MARKER) :]
                 body_start = index + 1
 
@@ -439,8 +439,9 @@ def assert_span_matches(
     Missing and extra are reported SEPARATELY, each as a repr, because the two
     have different fixes: a MISSING value means the prose list is stale (a member
     landed and this copy did not follow — the drift B9 binds), while an EXTRA one
-    is usually a value pasted in from the sibling vocabulary (``already_merged`` in
-    a POLL list) or a value that never existed (``failed``).
+    is usually a value pasted in from a sibling vocabulary (``already_merged`` in
+    a POLL list, a state in the MERGE_REASONS list) or a value that never existed
+    (``failed``).
 
     The message quotes the offending values rather than a phrase about drift: a
     reader cannot act on "the list has drifted" without being told which value.
@@ -462,8 +463,8 @@ def assert_span_matches(
         f"4829). missing={missing!r} extra={extra!r}; span has {sorted(values)!r}, "
         f"partition is {sorted(partition)!r}. A MISSING value means this list did not "
         f"follow a member that landed in the enum; an EXTRA one is usually a value "
-        f"from the sibling vocabulary (`MergeSubmitStatus` values are not "
-        f"`merge_status` states) or one that never existed. Fix the list — the "
+        f"from a sibling vocabulary (a submit status in a poll list, a state in the "
+        f"reason list) or one that never existed. Fix the list — the "
         f"partition is the source of truth."
     )
 

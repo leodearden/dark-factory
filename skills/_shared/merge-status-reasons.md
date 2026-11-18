@@ -60,7 +60,9 @@ Sources of truth, named once: the reason vocabulary is
 <!-- merge-state-vocab:begin partition=MERGE_REASONS
      Mirrors shared/src/shared/merge_state.py::MERGE_REASONS. Pinned by
      scripts/tests/test_merge_state_vocabulary_consistency.py — extend the
-     enum and this list goes red until it matches. -->
+     enum and this list goes red until it matches. The guard checks this
+     line, not the table below: add or rename the matching table row in the
+     same edit. -->
 The reasons are `probe_failed`, `journaled_not_live`, `prior_run_terminal`, `never_submitted`, `coalesce_train_id` and `landing_unattributable`, one row each below.
 <!-- merge-state-vocab:end -->
 
