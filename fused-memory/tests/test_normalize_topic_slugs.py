@@ -23,6 +23,7 @@ import ast
 import contextlib
 import copy
 import json
+import subprocess
 import sys
 import types
 from pathlib import Path
@@ -1715,8 +1716,8 @@ class TestBaselineDelta:
         assert block['measured_by_project'] == {'dark_factory': 1, 'reify': 2}
 
 
-#: The package modules this suite may import: none opens a store, a socket or
-#: a MemoryService.
+#: The package modules this suite and its shared doubles may import.  That
+#: none of them reaches a MemoryService is measured below, not declared.
 BACKEND_FREE_MODULES: frozenset[str] = frozenset({
     'fused_memory.utils.store_mutation_preflight',
     'fused_memory.maintenance.topic_slug_plan',
@@ -1724,6 +1725,30 @@ BACKEND_FREE_MODULES: frozenset[str] = frozenset({
     'fused_memory.maintenance.topic_slug_lockstep',
     'fused_memory.reconciliation.consolidation_gate',
 })
+
+#: The home of ``MemoryService``.  Every factory and server that builds one
+#: imports it at module scope, so a closure that never loads it cannot build one.
+MEMORY_SERVICE_MODULE = 'fused_memory.services.memory_service'
+
+#: Imports every module named on the command line in this fresh interpreter,
+#: then prints the ``fused_memory`` modules that loaded as its last line.
+_IMPORT_CLOSURE_PROBE = '''
+import importlib, json, sys
+for name in sys.argv[1:]:
+    importlib.import_module(name)
+print(json.dumps(sorted(m for m in sys.modules if m.startswith('fused_memory'))))
+'''
+
+
+def _fused_memory_imports(path: Path) -> set[str]:
+    """Every ``fused_memory`` module *path* names in an import statement."""
+    imported: set[str] = set()
+    for node in ast.walk(ast.parse(path.read_text(encoding='utf-8'))):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            imported.add(node.module or '')
+    return {m for m in imported if m.startswith('fused_memory')}
 
 
 class TestNoLiveCorpusCountIsPinned:
@@ -1735,30 +1760,40 @@ class TestNoLiveCorpusCountIsPinned:
     hits it to delete the assertion.
     """
 
-    def test_this_suite_never_reaches_a_live_backend(self):
+    @pytest.mark.parametrize('source', [
+        Path(__file__),
+        Path(__file__).parent / '_topic_slug_migration_doubles.py',
+    ], ids=lambda path: path.name)
+    def test_this_suite_imports_only_backend_free_modules(self, source):
         """The structural reason no live count can be pinned here.
 
         Checked over the parsed IMPORT statements rather than by substring,
         so the assertion cannot be satisfied — or defeated — by its own text
         appearing in the file.  This suite loads the script by path and
-        injects doubles; it imports only backend-free modules from the
-        package (``BACKEND_FREE_MODULES``), none of which opens a store, a
-        socket or a MemoryService.  So there is no seam through which a live
-        corpus could reach an assertion.
+        injects doubles; it and the doubles it shares import only
+        ``BACKEND_FREE_MODULES`` from the package.
         """
-        tree = ast.parse(Path(__file__).read_text(encoding='utf-8'))
-        imported: set[str] = set()
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                imported.update(alias.name for alias in node.names)
-            elif isinstance(node, ast.ImportFrom):
-                imported.add(node.module or '')
+        assert _fused_memory_imports(source) <= BACKEND_FREE_MODULES
 
-        backend_reaching = [
-            m for m in imported
-            if m.startswith('fused_memory') and m not in BACKEND_FREE_MODULES
-        ]
-        assert not backend_reaching, imported
+    def test_no_allowed_module_reaches_a_memory_service(self):
+        """What makes ``BACKEND_FREE_MODULES`` backend-free, measured.
+
+        Their whole import closure loads in a fresh interpreter, so a module
+        an earlier test already imported cannot hide one, and the closure
+        must never load the home of ``MemoryService``.  A module the closure
+        does load (``backends.mem0_client``, for a constant) is unreachable
+        from a test here without an import the check above refuses.
+        """
+        probe = subprocess.run(
+            [sys.executable, '-c', _IMPORT_CLOSURE_PROBE, *sorted(BACKEND_FREE_MODULES)],
+            cwd=SCRIPT_PATH.parent.parent, capture_output=True, text=True,
+            check=False, timeout=120,
+        )
+        assert probe.returncode == 0, probe.stderr
+        loaded = set(json.loads(probe.stdout.splitlines()[-1]))
+
+        assert loaded >= BACKEND_FREE_MODULES
+        assert MEMORY_SERVICE_MODULE not in loaded
 
 
 # ===========================================================================
