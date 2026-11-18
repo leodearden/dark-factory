@@ -30,6 +30,8 @@ from typing import Any, TypeVar
 from audit_model_admission import (
     MERGER_ROLE,
     InvocationRecord,
+    OrchestratorStartup,
+    RestartRequiredReload,
     RoleContainment,
     RoutingRejection,
     RoutingScan,
@@ -461,6 +463,8 @@ class ReviewResult:
     scoped_hits: tuple[tuple[str, int, str], ...]
     unscoped_cap_hits: int
     restarts: tuple[ServiceRestart, ...]
+    orchestrator_startups: tuple[OrchestratorStartup, ...]
+    restart_required_reloads: tuple[RestartRequiredReload, ...]
     containment: RoleContainment
 
 
@@ -534,6 +538,8 @@ def review(
         scoped_hits=scoped_hits_by_account(scoped),
         unscoped_cap_hits=scoped.unscoped_cap_hit_count,
         restarts=scoped.restarts,
+        orchestrator_startups=scoped.orchestrator_startups,
+        restart_required_reloads=scoped.restart_required_reloads,
         containment=roles_on_model(conn, model=model, since=apply, until=end,
                                    expected_roles=expected_roles),
     )
