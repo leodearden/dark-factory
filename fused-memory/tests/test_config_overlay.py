@@ -18,8 +18,14 @@ from typing import Any
 import pytest
 import yaml
 
-from fused_memory.config.overlay import OVERLAY_ENV_VAR, merge_overlay
-from fused_memory.config.schema import FusedMemoryConfig
+from fused_memory.config.overlay import (
+    OVERLAY_ENV_VAR,
+    WRITE_TRIAGE_BAND_KEYS,
+    ConfigOverlayRefused,
+    OverlayRefusalReason,
+    merge_overlay,
+)
+from fused_memory.config.schema import FusedMemoryConfig, WriteTriageConfig
 
 
 def _write_yaml(path: Path, data: Any) -> Path:
@@ -247,3 +253,162 @@ class TestMergeOverlayReplacesTheThresholdGroup:
             'server': {'port': 8002},
         }
         assert base == pristine
+
+
+def _refused(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, overlay_env_value: str,
+) -> ConfigOverlayRefused:
+    """Build the config over a valid base and return the overlay refusal it raises."""
+    _write_yaml(tmp_path / 'base.yaml', {'embedder': BASE_EMBEDDER})
+    monkeypatch.setenv('CONFIG_PATH', str(tmp_path / 'base.yaml'))
+    monkeypatch.setenv(OVERLAY_ENV_VAR, overlay_env_value)
+    with pytest.raises(ConfigOverlayRefused) as excinfo:
+        FusedMemoryConfig()
+    return excinfo.value
+
+
+def _refused_text(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, overlay_text: str,
+) -> ConfigOverlayRefused:
+    overlay_path = tmp_path / 'overlay.yaml'
+    overlay_path.write_text(overlay_text, encoding='utf-8')
+    return _refused(monkeypatch, tmp_path, str(overlay_path))
+
+
+def _assert_refusal(
+    exc: ConfigOverlayRefused,
+    reason: OverlayRefusalReason,
+    path: str,
+    keys: tuple[str, ...] = (),
+) -> None:
+    assert exc.refusal.reason is reason
+    assert exc.refusal.path == path
+    assert exc.refusal.keys == keys
+    message = str(exc)
+    assert reason.value in message
+    assert path in message
+    assert OVERLAY_ENV_VAR in message
+    for key in keys:
+        assert key in message
+
+
+class TestUnreadableOverlaysRefuse:
+    def test_a_missing_file_refuses(self, monkeypatch, tmp_path):
+        absent = str(tmp_path / 'absent.yaml')
+
+        exc = _refused(monkeypatch, tmp_path, absent)
+
+        _assert_refusal(exc, OverlayRefusalReason.FILE_MISSING, absent)
+
+    @pytest.mark.parametrize('value', ['relative/overlay.yaml', ''])
+    def test_a_path_that_is_not_absolute_refuses(self, monkeypatch, tmp_path, value):
+        exc = _refused(monkeypatch, tmp_path, value)
+
+        _assert_refusal(exc, OverlayRefusalReason.PATH_NOT_ABSOLUTE, value)
+
+    def test_unparseable_yaml_refuses(self, monkeypatch, tmp_path):
+        exc = _refused_text(monkeypatch, tmp_path, 'embedder: [unclosed\n')
+
+        _assert_refusal(exc, OverlayRefusalReason.UNPARSEABLE, str(tmp_path / 'overlay.yaml'))
+
+    @pytest.mark.parametrize('text', ['- embedder\n- write_triage\n', 'null\n'])
+    def test_a_document_that_is_not_a_mapping_refuses(self, monkeypatch, tmp_path, text):
+        exc = _refused_text(monkeypatch, tmp_path, text)
+
+        _assert_refusal(exc, OverlayRefusalReason.NOT_A_MAPPING, str(tmp_path / 'overlay.yaml'))
+
+    def test_an_allowlisted_section_that_is_not_a_mapping_refuses(self, monkeypatch, tmp_path):
+        exc = _refused_text(monkeypatch, tmp_path, 'embedder: granite\n')
+
+        _assert_refusal(
+            exc, OverlayRefusalReason.NOT_A_MAPPING, str(tmp_path / 'overlay.yaml'),
+            ('embedder',),
+        )
+
+    @pytest.mark.parametrize('text', ['{}\n', 'embedder: {}\nwrite_triage: {}\n'])
+    def test_an_overlay_that_sets_nothing_refuses(self, monkeypatch, tmp_path, text):
+        exc = _refused_text(monkeypatch, tmp_path, text)
+
+        _assert_refusal(exc, OverlayRefusalReason.EMPTY, str(tmp_path / 'overlay.yaml'))
+
+
+class TestKeysOutsideTheAllowlistRefuse:
+    @pytest.mark.parametrize(
+        ('overlay', 'keys'),
+        [
+            ({'server': {'port': 1}}, ('server',)),
+            ({'write_triage': {'enabled': True}}, ('write_triage.enabled',)),
+            (
+                {'config_overlay': {'path': '/x', 'merged_keys': [], 'mtime': 'now'}},
+                ('config_overlay',),
+            ),
+        ],
+        ids=['forbidden-section', 'non-band-write-triage-key', 'provenance-itself'],
+    )
+    def test_a_key_outside_the_allowlist_refuses(self, monkeypatch, tmp_path, overlay, keys):
+        exc = _refused_text(monkeypatch, tmp_path, yaml.safe_dump(overlay))
+
+        _assert_refusal(
+            exc, OverlayRefusalReason.KEY_OUTSIDE_ALLOWLIST, str(tmp_path / 'overlay.yaml'),
+            keys,
+        )
+
+    def test_allowed_and_forbidden_keys_together_refuse_as_a_whole(self, monkeypatch, tmp_path):
+        overlay = {
+            'embedder': {'model': 'granite-embedding'},
+            'write_triage': {'t_high': 0.8, 'candidate_k': 3},
+            'server': {'port': 1},
+        }
+
+        exc = _refused_text(monkeypatch, tmp_path, yaml.safe_dump(overlay))
+
+        _assert_refusal(
+            exc, OverlayRefusalReason.KEY_OUTSIDE_ALLOWLIST, str(tmp_path / 'overlay.yaml'),
+            ('server', 'write_triage.candidate_k'),
+        )
+
+
+class TestKeysTheSchemaDoesNotKnowRefuse:
+    @pytest.mark.parametrize(
+        ('overlay', 'keys'),
+        [
+            ({'embedder': {'dimension': 768}}, ('embedder.dimension',)),
+            (
+                {'embedder': {'providers': {'openai': {'organization_id': 'org-1'}}}},
+                ('embedder.providers.openai.organization_id',),
+            ),
+            (
+                {
+                    'write_triage_project_calibrations': {
+                        'A': {**_calibration('reports/a.json', observations=0.7), 'typo': 1},
+                    },
+                },
+                ('write_triage_project_calibrations.A.typo',),
+            ),
+            ({'embedder_thresholds': {'near_dup': 0.8}}, ('embedder_thresholds',)),
+        ],
+        ids=['typo', 'retired-key', 'calibration-entry-key', 'section-not-yet-a-field'],
+    )
+    def test_an_unknown_schema_path_refuses(self, monkeypatch, tmp_path, overlay, keys):
+        exc = _refused_text(monkeypatch, tmp_path, yaml.safe_dump(overlay))
+
+        _assert_refusal(
+            exc, OverlayRefusalReason.UNKNOWN_KEY, str(tmp_path / 'overlay.yaml'), keys,
+        )
+
+
+class TestOnlyTheLoaderWritesProvenance:
+    def test_a_base_config_carrying_the_provenance_key_is_refused(self, monkeypatch, tmp_path):
+        _write_yaml(
+            tmp_path / 'base.yaml',
+            {'config_overlay': {'path': '/forged', 'merged_keys': [], 'mtime': 'now'}},
+        )
+        monkeypatch.setenv('CONFIG_PATH', str(tmp_path / 'base.yaml'))
+        monkeypatch.delenv(OVERLAY_ENV_VAR, raising=False)
+
+        with pytest.raises(RuntimeError, match='config_overlay'):
+            FusedMemoryConfig()
+
+
+def test_every_band_key_is_a_write_triage_field():
+    assert WRITE_TRIAGE_BAND_KEYS <= set(WriteTriageConfig.model_fields)
