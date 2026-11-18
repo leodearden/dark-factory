@@ -1,7 +1,9 @@
 """Give this orchestrator's project slice its CPUWeight at startup, when the
 daemon's unit runs directly under that slice.
 
-Contract: docs/cgroup-slice-topology.md.
+The placement check establishes the unit's placement, not the caller's identity;
+the caller opts in through ``Harness.run``'s ``apply_project_slice_weight``.
+Contract: docs/cgroup-slice-topology.md (§Slice weight for the opt-in).
 """
 
 from __future__ import annotations

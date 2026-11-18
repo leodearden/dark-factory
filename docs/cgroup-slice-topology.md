@@ -42,12 +42,21 @@ user@UID.service/
 
 ## How a child finds its project slice
 
-Walk the `0::` path in `/proc/self/cgroup` leaf-upward to the nearest
-`df-*.slice` ancestor. The python side is
-`shared/src/shared/psi.py::resolve_own_cgroup`, and reify's `@own-slice` is the
-bash side. Their shapes are the PRD §6.3 table. No environment variable
-carries the slice name, because it would be a second discovery mechanism for
-the same fact.
+Walk the `0::` path in `/proc/self/cgroup` leaf-upward to the segment EQUAL to
+`project_slice_name(project_id)`. Equivalently, that is the `df-*.slice`
+segment directly under `df.slice`.
+
+It is NOT the nearest `df-*.slice` ancestor. Every governed sub-slice
+(§Governed sub-slices) also matches `df-*.slice` and sits nearer the leaf, so
+"nearest" would resolve `df-reify-governed-agents.slice` and read the wrong
+`cpu.pressure`. This supersedes the "nearest `df-*.slice`" wording PRD §6.3
+once carried; §6.3 row 4 is the governed shape.
+
+The python side is `shared/src/shared/psi.py::resolve_own_cgroup`, and reify's
+`@own-slice` is the bash side, which must apply the same exact-segment rule
+(reify tasks 9998 and 7335). Their shapes are the PRD §6.3 table. No
+environment variable carries the slice name, because it would be a second
+discovery mechanism for the same fact.
 
 ## Governed sub-slices
 
@@ -61,11 +70,20 @@ there is reify task 9998.
 
 Startup step `1c1i`
 (`orchestrator/src/orchestrator/project_slice_weight.py::ensure_project_slice_weight`)
-runs `systemctl --user set-property --runtime <slice> CPUWeight=100`. It does
-so only when the daemon's own leaf cgroup is a `.service` directly under its
-project slice. Otherwise it logs one WARNING and changes nothing. A stale unit
-placement therefore never touches the slice, and neither does a test process
-running inside a verify scope.
+runs `systemctl --user set-property --runtime <slice> CPUWeight=100`. It acts
+only when both of these hold:
+
+- (i) `Harness.run` got `apply_project_slice_weight=True`. Only
+  `orchestrator/src/orchestrator/cli.py::run`, every unit's ExecStart, passes
+  it. This opt-in is what keeps tests off the production slice: agents are
+  children of the daemon and share its service leaf, and so does every pytest
+  they run, `Harness.run` tests included.
+- (ii) The daemon's own leaf cgroup is a `.service` directly under its project
+  slice. This is a ROLLOUT check (was the unit reinstalled with `Slice=`?), not
+  an identity check. When it fails, the step logs one WARNING and changes
+  nothing.
+
+About the property itself:
 
 - 100 is systemd's default. What matters is that the property is present: a
   fresh slice has no `cpu.weight` until some CPU property is set on it.
