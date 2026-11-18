@@ -437,9 +437,10 @@ def diff_config(
     one-sided leaf is still bucketed (never a ``KeyError``) if that symmetry were
     ever broken — see task 2718 review esc-2718-1.
 
-    Embedder-space values (bands, calibrations, overlay provenance) are only
-    meaningful in the space of the embedder identity, so they reload only
-    with it: when an ``embedder.*`` leaf waits for a restart, so do they.
+    Embedder-space values (bands, calibrations) mean nothing outside the
+    embedder's space, and the overlay provenance vouches for the embedder
+    keys it merged, so when an ``embedder.*`` leaf waits for a restart, so
+    do they.
     """
     live_leaves = dict(_iter_leaves(live))
     fresh_leaves = dict(_iter_leaves(fresh))
