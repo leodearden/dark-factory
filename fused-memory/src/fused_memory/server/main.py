@@ -33,7 +33,9 @@ from fused_memory.config.schema import (  # noqa: E402
     DedupOutageDetectorConfig,
     FusedMemoryConfig,
 )
-from fused_memory.embedder.endpoint_probe import EmbedderEndpointProbe  # noqa: E402
+from fused_memory.embedder.endpoint_probe import (  # noqa: E402  # debt: task 10130
+    EmbedderEndpointProbe,
+)
 from fused_memory.maintenance.rebuild_summaries import (  # noqa: E402  # debt: ticket tkt_0RWT5KQG42DBD4GM4C51E2Y7NT
     RebuildResult,
 )
