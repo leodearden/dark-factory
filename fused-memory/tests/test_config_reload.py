@@ -13,6 +13,7 @@ not prose.
 from __future__ import annotations
 
 import asyncio
+import os
 import types
 from pathlib import Path
 from typing import Any
@@ -21,6 +22,7 @@ from unittest.mock import AsyncMock
 import pytest
 import yaml
 
+from fused_memory.config.overlay import OVERLAY_ENV_VAR
 from fused_memory.config.reload import (
     RELOADABLE_FIELDS,
     _iter_leaves,
@@ -1300,3 +1302,127 @@ def test_transcript_archive_reload_reaches_the_live_resolver(leaf, new, expected
     assert path not in report['restart_required']
     assert live.reconciliation is reconciliation
     assert recon_archive_root(reconciliation) == expected_root
+
+
+_EMBEDDER_SPACE_LEAVES = (
+    'write_triage.t_high',
+    'write_triage_project_calibrations',
+    'config_overlay',
+)
+
+
+def _calibration(report: str, observations: float) -> dict[str, Any]:
+    return {
+        'calibration_report_path': report,
+        't_high_by_category': {'observations': observations},
+    }
+
+
+class TestOverlayReloadNeverHalfApplies:
+    """Embedder-space values reload only together with the embedder identity.
+
+    A band or calibration is a cosine measured in ONE embedder's space, so
+    hot-applying a rewritten band while the embedder change waits for a
+    restart would gate writes with cutoffs from a space the live process is
+    not in. Configs are built from temp base and overlay YAML files.
+    """
+
+    @pytest.fixture
+    def files(self, tmp_path, monkeypatch):
+        base = tmp_path / 'config.yaml'
+        overlay = tmp_path / 'overlay.yaml'
+        base.write_text(yaml.safe_dump({
+            'embedder': {'model': 'text-embedding-3-small', 'dimensions': 1536},
+            'write_triage': {'t_high': 0.9, 'candidate_k': 20},
+        }))
+        monkeypatch.setenv('CONFIG_PATH', str(base))
+        return types.SimpleNamespace(base=base, overlay=overlay)
+
+    @staticmethod
+    def _write_overlay(path: Path, data: dict[str, Any], mtime: int) -> None:
+        """Write the overlay with an explicit mtime, so two rewrites inside the
+        filesystem's timestamp granularity still carry distinct provenance."""
+        path.write_text(yaml.safe_dump(data))
+        os.utime(path, (mtime, mtime))
+
+    @pytest.fixture
+    def live_with_overlay_v1(self, files, monkeypatch):
+        self._write_overlay(files.overlay, {
+            'write_triage': {'t_high': 0.85},
+            'write_triage_project_calibrations': {'A': _calibration('reports/a1.json', 0.8)},
+        }, mtime=1_700_000_000)
+        monkeypatch.setenv(OVERLAY_ENV_VAR, str(files.overlay))
+        return FusedMemoryConfig()
+
+    def test_a_bands_only_overlay_rewrite_applies_with_its_provenance(
+        self, files, live_with_overlay_v1,
+    ):
+        live = live_with_overlay_v1
+        self._write_overlay(files.overlay, {
+            'write_triage': {'t_high': 0.8},
+            'write_triage_project_calibrations': {'A': _calibration('reports/a2.json', 0.7)},
+        }, mtime=1_700_000_100)
+        fresh = FusedMemoryConfig()
+
+        report = apply_reload(live, fresh)
+
+        assert report['reloaded'] is True, report['error']
+        for path in _EMBEDDER_SPACE_LEAVES:
+            assert path in report['applied']
+        assert live.write_triage.t_high == 0.8
+        assert live.write_triage_project_calibrations == fresh.write_triage_project_calibrations
+        assert live.config_overlay == fresh.config_overlay
+
+    def test_an_embedder_identity_change_holds_every_embedder_space_leaf(
+        self, files, live_with_overlay_v1,
+    ):
+        live = live_with_overlay_v1
+        before = live.model_copy(deep=True)
+        self._write_overlay(files.overlay, {
+            'embedder': {'model': 'granite-embedding', 'dimensions': 768},
+            'write_triage': {'t_high': 0.8},
+            'write_triage_project_calibrations': {'A': _calibration('reports/a2.json', 0.7)},
+        }, mtime=1_700_000_100)
+        _edit_yaml(files.base, 'write_triage.candidate_k', 30)
+        fresh = FusedMemoryConfig()
+
+        report = apply_reload(live, fresh)
+
+        for path in ('embedder.model', 'embedder.dimensions', *_EMBEDDER_SPACE_LEAVES):
+            assert path in report['restart_required']
+            assert path not in report['applied']
+        assert live.write_triage.t_high == before.write_triage.t_high
+        assert live.write_triage_project_calibrations == before.write_triage_project_calibrations
+        assert live.config_overlay == before.config_overlay
+        assert 'write_triage.candidate_k' in report['applied']
+        assert live.write_triage.candidate_k == 30
+
+    def test_the_rule_holds_for_the_tracked_base_alone(self, files):
+        live = FusedMemoryConfig()
+        _edit_yaml(files.base, 'embedder.dimensions', 768)
+        _edit_yaml(files.base, 'write_triage.t_high', 0.8)
+        fresh = FusedMemoryConfig()
+
+        report = apply_reload(live, fresh)
+
+        assert 'embedder.dimensions' in report['restart_required']
+        assert 'write_triage.t_high' in report['restart_required']
+        assert 'write_triage.t_high' not in report['applied']
+        assert live.write_triage.t_high == 0.9
+
+    @pytest.mark.asyncio
+    async def test_a_refused_overlay_fails_the_reload_closed(
+        self, files, live_with_overlay_v1, monkeypatch,
+    ):
+        svc = AsyncMock()
+        svc.config = live_with_overlay_v1
+        before = svc.config.model_copy(deep=True)
+        monkeypatch.setenv(OVERLAY_ENV_VAR, str(files.overlay.with_name('gone.yaml')))
+
+        server = create_mcp_server(svc)
+        result = await server._tool_manager.call_tool('reload_config', {})
+
+        assert result['reloaded'] is False
+        assert 'file_missing' in result['error']
+        assert result['applied'] == {}
+        assert svc.config == before
