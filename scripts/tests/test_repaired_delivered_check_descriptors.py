@@ -1,14 +1,17 @@
 """Live-corpus pins for repaired capability-manifest delivered_check descriptors.
 
-Three populations are pinned. Task 6036 re-anchored descriptors on BOTH sides: the
+Four populations are pinned. Task 6036 re-anchored descriptors on BOTH sides: the
 producer task's ``metadata.delivered_checks`` entry in tasks.db AND the sidecar
 the stamper copies it from. Tasks 5256 and 6209 resynced sidecars, sidecar-only, to task
-records that had already been repaired. CI can never see the tasks.db half, so
-either way these pins guard the SIDECAR half: a stale sidecar would be
-re-stamped over the repaired record by the next re-decompose. Every resynced
-producer is done, so the resynced rows are also evaluated at HEAD through the
-runtime grep primitive. They read only tracked files in this checkout and open
-no database. Task 6047 re-pointed a FOREIGN descriptor, warm-lane κ, whose
+records that had already been repaired. Task 6941 renamed
+``source_measures.workspace_domain`` to ``measurement_domain`` and re-pointed the
+sidecar half of the two descriptors that grep for it; their task-record half is
+the post-merge operational ticket tkt_0RX4WWCXC90HD7R2ZZ83E41F31. CI can never see
+the tasks.db half, so in every case these pins guard the SIDECAR half: a stale
+sidecar would be re-stamped over the repaired record by the next re-decompose.
+Every resynced and re-pointed producer is done, so those rows are also evaluated
+at HEAD through the runtime grep primitive. They read only tracked files in this
+checkout and open no database. Task 6047 re-pointed a FOREIGN descriptor, warm-lane κ, whose
 task-record half lives in reify's store; reify's tree is not this checkout, so
 its non-vacuity is checked behaviourally against committed fixture trees rather
 than at HEAD.
@@ -112,7 +115,24 @@ _RESYNCED_TO_TASK_RECORD = [
     ),
 ]
 
-_REPAIRED_DESCRIPTORS = [*_REANCHORED, *_RESYNCED_TO_TASK_RECORD]
+# Task 6941: sidecar re-pointed after the rename its pattern names; the task-record
+# half is the post-merge operational ticket tkt_0RX4WWCXC90HD7R2ZZ83E41F31.
+_REPOINTED_AFTER_RENAME = [
+    (
+        "plans/quality-metrics-snapshot-prd.capability-manifest.yaml",
+        6394, "S1", "workspace-domain-in-source-measures",
+        {"kind": "grep", "pattern": r"^def measurement_domain\(", "expect": "present",
+         "paths": ["scripts/source_measures.py"]},
+    ),
+    (
+        "plans/quality-metrics-snapshot-prd.capability-manifest.yaml",
+        6395, "S1b", "census-reads-workspace-domain",
+        {"kind": "grep", "pattern": r"measurement_domain\(", "expect": "present",
+         "paths": ["scripts/suite_census_pinning.py"]},
+    ),
+]
+
+_REPAIRED_DESCRIPTORS = [*_REANCHORED, *_RESYNCED_TO_TASK_RECORD, *_REPOINTED_AFTER_RENAME]
 
 _RETIRED_TO_MANUAL = [
     (
@@ -196,22 +216,24 @@ def test_repaired_sidecar_carries_the_repaired_descriptor(
     )
 
 
-assert all(r[4]["kind"] == "grep" for r in _RESYNCED_TO_TASK_RECORD), (
-    "test_resynced_sidecar_descriptor_delivers_at_head evaluates only grep gates; "
-    "teach it the new kind before adding a non-grep row to _RESYNCED_TO_TASK_RECORD"
+_DONE_PRODUCER_DESCRIPTORS = [*_RESYNCED_TO_TASK_RECORD, *_REPOINTED_AFTER_RENAME]
+assert all(r[4]["kind"] == "grep" for r in _DONE_PRODUCER_DESCRIPTORS), (
+    "test_done_producer_sidecar_descriptor_delivers_at_head evaluates only grep gates; "
+    "teach it the new kind before adding a non-grep row to a done-producer population"
 )
-_RESYNCED_HEADS = [r[:4] for r in _RESYNCED_TO_TASK_RECORD]
+_DONE_PRODUCER_HEADS = [r[:4] for r in _DONE_PRODUCER_DESCRIPTORS]
 
 
 @pytest.mark.parametrize(
     "relpath,task_id,label,capability",
-    _RESYNCED_HEADS,
-    ids=[f"{r[1]}-{r[3]}" for r in _RESYNCED_HEADS],
+    _DONE_PRODUCER_HEADS,
+    ids=[f"{r[1]}-{r[3]}" for r in _DONE_PRODUCER_HEADS],
 )
-def test_resynced_sidecar_descriptor_delivers_at_head(relpath, task_id, label, capability):
-    """Every producer in _RESYNCED_TO_TASK_RECORD is done, so its sidecar gate must
-    deliver at HEAD; _REANCHORED is excluded because it holds a pending producer
-    (5324) whose forward-looking gate legitimately fails at HEAD."""
+def test_done_producer_sidecar_descriptor_delivers_at_head(relpath, task_id, label, capability):
+    """Every producer in _RESYNCED_TO_TASK_RECORD and _REPOINTED_AFTER_RENAME is done,
+    so its sidecar gate must deliver at HEAD; _REANCHORED is excluded because it
+    holds a pending producer (5324) whose forward-looking gate legitimately fails
+    at HEAD."""
     root = checkout_root_or_skip()
     check = _the_one_capability(root, relpath, label, capability).delivered_check
 
