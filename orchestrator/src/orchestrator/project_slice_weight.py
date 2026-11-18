@@ -9,6 +9,7 @@ Contract: docs/cgroup-slice-topology.md (§Slice weight for the opt-in).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import enum
 import logging
 import shutil
@@ -22,8 +23,6 @@ __all__ = ['PROJECT_SLICE_CPU_WEIGHT', 'SliceWeightOutcome', 'ensure_project_sli
 
 PROJECT_SLICE_CPU_WEIGHT = 100
 
-_SET_PROPERTY_TIMEOUT_SECS = 30.0
-
 
 class SliceWeightOutcome(enum.Enum):
     APPLIED = 'applied'
@@ -32,7 +31,7 @@ class SliceWeightOutcome(enum.Enum):
 
 
 async def ensure_project_slice_weight(
-    project_id: str, own_cgroup_path: str,
+    project_id: str, own_cgroup_path: str, *, set_property_timeout_secs: float = 30.0,
 ) -> SliceWeightOutcome:
     """Set ``CPUWeight`` on the project slice when *own_cgroup_path* (the
     process's raw leaf unified cgroup) is a service directly under it.
@@ -48,7 +47,7 @@ async def ensure_project_slice_weight(
             own_cgroup_path, slice_name,
         )
         return SliceWeightOutcome.UNIT_NOT_IN_SLICE
-    failure = await _set_slice_cpu_weight(slice_name)
+    failure = await _set_slice_cpu_weight(slice_name, set_property_timeout_secs)
     if failure is not None:
         logger.warning(
             'could not set CPUWeight=%d on project slice %s: %s',
@@ -64,7 +63,7 @@ def _is_service_directly_under(slice_name: str, own_cgroup_path: str) -> bool:
     return len(parts) >= 2 and parts[-2] == slice_name and parts[-1].endswith('.service')
 
 
-async def _set_slice_cpu_weight(slice_name: str) -> str | None:
+async def _set_slice_cpu_weight(slice_name: str, timeout_secs: float) -> str | None:
     """Run ``systemctl --user set-property --runtime``; the failure cause, or None."""
     if shutil.which('systemctl') is None:
         return 'systemctl not found on PATH'
@@ -78,11 +77,12 @@ async def _set_slice_cpu_weight(slice_name: str) -> str | None:
     except OSError as exc:
         return f'spawn failed: {exc}'
     try:
-        _, stderr = await asyncio.wait_for(proc.communicate(), _SET_PROPERTY_TIMEOUT_SECS)
+        _, stderr = await asyncio.wait_for(proc.communicate(), timeout_secs)
     except TimeoutError:
-        proc.kill()
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
         await proc.wait()
-        return f'timed out after {_SET_PROPERTY_TIMEOUT_SECS:.0f}s'
+        return f'timed out after {timeout_secs:g}s'
     if proc.returncode != 0:
         return f'rc={proc.returncode}: {stderr.decode(errors="replace").strip()}'
     return None
