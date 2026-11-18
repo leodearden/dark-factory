@@ -38,7 +38,7 @@ _HEADER_KEY = ESCALATION_PROJECT_HEADER.lower()
 
 def escalation_project_headers(project_id: str) -> dict[str, str]:
     """The request headers that scope a caller's escalation calls to *project_id*."""
-    if not isinstance(project_id, str) or not project_id:
+    if not project_id:
         raise ValueError(
             f'an escalation project scope needs a non-empty project id, got {project_id!r}'
         )
