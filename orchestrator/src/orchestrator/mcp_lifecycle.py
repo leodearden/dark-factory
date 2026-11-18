@@ -8,6 +8,7 @@ import os
 import sys
 import tempfile
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -191,6 +192,7 @@ def plan_tools_mcp_server(
     python_executable: str | None = None,
     meta_root: Path | None = None,
     task_root: Path | None = None,
+    granted_tools: Iterable[str] = (),
 ) -> dict:
     """Return a stdio MCP server config dict for the plan-tools server.
 
@@ -244,6 +246,10 @@ def plan_tools_mcp_server(
             ``None`` (default), no ``--meta-root`` flag is emitted and args
             are byte-identical to before this parameter existed.
         task_root: Optional task-lifetime root passed as ``--task-root``.
+        granted_tools: The tool names the launched server exposes, passed as
+            one ``--grant <name>`` pair each, sorted, after the root args.
+            The server exposes no tool without a grant
+            (``orchestrator.mcp.plan_tools.server_from_argv``).
 
     Returns:
         Claude Code MCP server config dict with ``command`` and ``args``.
@@ -251,6 +257,9 @@ def plan_tools_mcp_server(
     return _stdio_mcp_server(
         'orchestrator.mcp.plan_tools', orch_project_dir, worktree,
         python_executable=python_executable, meta_root=meta_root, task_root=task_root,
+        extra_args=tuple(
+            token for name in sorted(set(granted_tools)) for token in ('--grant', name)
+        ),
     )
 
 
