@@ -411,4 +411,4 @@ class TestOnlyTheLoaderWritesProvenance:
 
 
 def test_every_band_key_is_a_write_triage_field():
-    assert WRITE_TRIAGE_BAND_KEYS <= set(WriteTriageConfig.model_fields)
+    assert WRITE_TRIAGE_BAND_KEYS.issubset(WriteTriageConfig.model_fields)

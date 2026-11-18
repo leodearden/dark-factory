@@ -16,7 +16,13 @@ from pydantic_settings import (
 from shared.config_models import UsageCapConfig
 
 from fused_memory.config.checkout_anchor import anchor_at_checkout
-from fused_memory.config.overlay import ConfigOverlayProvenance, load_overlay, merge_overlay
+from fused_memory.config.overlay import (
+    OVERLAY_ENV_VAR,
+    PROVENANCE_FIELD,
+    ConfigOverlayProvenance,
+    load_overlay,
+    merge_overlay,
+)
 from fused_memory.config.retired_keys import drop_retired_keys
 
 # The ONE topic-slug namespace (task 3198, PRD D4). Imported from the
@@ -108,7 +114,7 @@ class YamlSettingsSource(PydanticBaseSettingsSource):
         if overlay is None:
             return base
         merged = merge_overlay(base, self._expand(overlay.data, overlay.provenance.path))
-        merged['config_overlay'] = overlay.provenance.model_dump()
+        merged[PROVENANCE_FIELD] = overlay.provenance.model_dump()
         return merged
 
     def _load_base(self) -> dict[str, Any]:
@@ -119,6 +125,11 @@ class YamlSettingsSource(PydanticBaseSettingsSource):
                 raw_config = yaml.safe_load(f) or {}
         except (yaml.YAMLError, OSError) as e:
             raise RuntimeError(f'Failed to load configuration from {self.config_path}: {e}') from e
+        if isinstance(raw_config, dict) and PROVENANCE_FIELD in raw_config:
+            raise RuntimeError(
+                f'{self.config_path} sets the reserved key {PROVENANCE_FIELD!r}. Only the '
+                f'loader writes it, from the overlay {OVERLAY_ENV_VAR} names; remove the key.'
+            )
         return self._expand(raw_config, self.config_path)
 
     def _expand(self, raw_config: Any, source: Path | str) -> Any:
