@@ -56,7 +56,7 @@ from fused_memory.reconciliation.preservation_specimen_guard import (
     maybe_escalate_preservation_suppression_storm,
     maybe_escalate_unresolved_corroboration,
 )
-from fused_memory.reconciliation.prompts import _STAGE1_PROJECT_ID_GUIDELINE
+from fused_memory.reconciliation.prompts import PROJECT_ID_GUIDELINE
 from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
 from fused_memory.reconciliation.recon_pool_map import (
     STAGE1_CYCLE_SUMMARY_RECON_POOL as _STAGE1_CYCLE_SUMMARY_RECON_POOL,
@@ -1108,7 +1108,7 @@ Review the above data and perform memory consolidation:
 3. Cross-store: check for contradictions between stores. Promote solidified patterns.
 4. Flag any items that are relevant to task planning for Stage 2.
 
-{_STAGE1_PROJECT_ID_GUIDELINE.format(project_id=self.project_id)}{self._build_project_root_directive()}"""
+{PROJECT_ID_GUIDELINE.format(project_id=self.project_id)}{self._build_project_root_directive()}"""
 
     async def _fetch_status(self) -> dict:
         """Fetch store status, logging a WARNING and tracking degradation on failure.
@@ -1215,7 +1215,7 @@ Review the above data and perform memory consolidation:
 3. Cross-store: check for contradictions between stores. Promote solidified patterns.
 4. Flag any items that are relevant to task planning for Stage 2.
 
-{_STAGE1_PROJECT_ID_GUIDELINE.format(project_id=self.project_id)}{self._build_project_root_directive()}"""
+{PROJECT_ID_GUIDELINE.format(project_id=self.project_id)}{self._build_project_root_directive()}"""
 
     async def _render_required_sections(self) -> str:
         """Render every inference-bearing payload section, in registry order.
@@ -1354,7 +1354,7 @@ This is a focused remediation run. Address ONLY the specific findings listed abo
 3. Do NOT perform general consolidation — only fix the listed findings.
 4. State each finding's resolution status (fixed, partially_fixed or unresolved) in your `complete` summary.
 
-{_STAGE1_PROJECT_ID_GUIDELINE.format(project_id=self.project_id)}{self._build_project_root_directive()}
+{PROJECT_ID_GUIDELINE.format(project_id=self.project_id)}{self._build_project_root_directive()}
 """
 
 

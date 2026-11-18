@@ -22,12 +22,12 @@ from fused_memory.reconciliation.preservation_specimen_guard import (
     preservation_mem0_filters,
 )
 from fused_memory.reconciliation.prompts import (
-    _STAGE1_PROJECT_ID_GUIDELINE,
     AMEND_AND_EPISODE_TOOLS_BLOCK,
     CITATION_REPAIR_TOOL_BLOCK,
     DUPLICATE_FINDING_SALVAGE_GUIDANCE,
     FLAG_FOR_STAGE2_MARKER_KIND,
     GRAPHITI_QUEUED_GUIDANCE,
+    PROJECT_ID_GUIDELINE,
     REFERENT_DECLARATION_GUIDANCE,
     STALE_KNOWLEDGE_ANNOTATION_NORM,
     get_recon_report_tool_guidance,
@@ -234,7 +234,7 @@ So a manual `get_entity` before/after diff is no longer required to catch THIS f
 Known limitation: an invalidated edge whose node-pair IS restated by a new surviving edge is \
 left untouched (it may be a legitimate contradiction) and still warrants care. This does not \
 weaken the guidance above — still prefer `update_edge`/`refresh_entity_summary` for restated facts.
-- {_STAGE1_PROJECT_ID_GUIDELINE}
+- {PROJECT_ID_GUIDELINE}
 - **Report channel — recon_report MCP tools (PRD γ §9)**: For each inconsistency or finding \
 (including cross-project scope mismatches flagged to Stage 2): \
 {get_recon_report_tool_guidance()}

@@ -69,9 +69,8 @@ from fused_memory.reconciliation.mem0_tombstone import (
     record_mem0_deletion_tombstones,
 )
 from fused_memory.reconciliation.prompts import (
-    _STAGE2_PROJECT_ID_GUIDELINE,
-    _STAGE3_PROJECT_ID_GUIDELINE,
     FLAG_FOR_STAGE2_MARKER_KIND,
+    PROJECT_ID_GUIDELINE,
 )
 from fused_memory.reconciliation.prompts.stage2 import build_stage2_system_prompt
 from fused_memory.reconciliation.recon_pool_map import (
@@ -3920,7 +3919,7 @@ FIRST** — if count > 0, skip the task entirely (no search, no write, no findin
 7. Check if any knowledge implies new tasks should be created or existing tasks unblocked.
 8. Hints on completed tasks are static — don't update them.
 
-{_STAGE2_PROJECT_ID_GUIDELINE.format(project_id=self.project_id)}
+{PROJECT_ID_GUIDELINE.format(project_id=self.project_id)}
 Use project_root="{self.project_root}" for tasks scoped to this project.
 For cross-project routing see "Known Projects" above.
 """
@@ -4220,7 +4219,7 @@ Verify consistency across all three systems:
 4. Record each inconsistency with `mcp__recon-report__add_finding`. Inconsistencies found here \
 will be addressed in the next cycle's Stage 1 and Stage 2.
 
-{_STAGE3_PROJECT_ID_GUIDELINE.format(project_id=self.project_id)}
+{PROJECT_ID_GUIDELINE.format(project_id=self.project_id)}
 Use project_root="{self.project_root}" for tasks scoped to this project.
 """
 

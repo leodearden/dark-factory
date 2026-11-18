@@ -35,11 +35,11 @@ from fused_memory.reconciliation.predicate_contradiction import (
     render_predicate_contradiction_section,
 )
 from fused_memory.reconciliation.prompts import (
-    _STAGE2_PROJECT_ID_GUIDELINE,
     AMEND_AND_EPISODE_TOOLS_BLOCK,
     CITATION_REPAIR_TOOL_BLOCK,
     DUPLICATE_FINDING_SALVAGE_GUIDANCE,
     GRAPHITI_QUEUED_GUIDANCE,
+    PROJECT_ID_GUIDELINE,
     REFERENT_DECLARATION_GUIDANCE,
     STAGE2_SUPPRESS_GUARD_KIND,
     STALE_KNOWLEDGE_ANNOTATION_NORM,
@@ -260,7 +260,7 @@ as full coverage.
 - Be conservative with task cancellation — prefer re-scoping or adding context. When you do \
 cancel, use `set_task_status('cancelled')`; do not route the status change through \
 `update_task` — the server rejects status writes there.
-- {_STAGE2_PROJECT_ID_GUIDELINE}
+- {PROJECT_ID_GUIDELINE}
 - **Report channel — recon_report MCP tools (PRD γ §9)**: For each inconsistency or finding \
 (including cross_project_routing findings emitted above): \
 {get_recon_report_tool_guidance()}

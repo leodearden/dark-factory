@@ -19,36 +19,11 @@ from fused_memory.utils.referent_resolution import render_referent_declaration_g
 
 logger = logging.getLogger(__name__)
 
-# Base template — use {{project_id}} so it survives .format(tools=...) as {project_id}.
-# Each caller then formats with .format(project_id=self.project_id) at runtime.
-_PROJECT_ID_GUIDELINE = (
-    'Always pass project_id="{{project_id}}" when calling fused-memory MCP tools '
-    '({tools}).'
-)
-
-# Stage 1: Memory Consolidator — memory read/write, no task tools
-_STAGE1_PROJECT_ID_GUIDELINE = _PROJECT_ID_GUIDELINE.format(
-    tools=(
-        'search, get_entity, get_episodes, get_status, add_memory, delete_memory, '
-        'update_edge, update_memory, redact_episode_content, delete_episode'
-    )
-)
-
-# Stage 2: Task-Knowledge Sync — full memory + task access. Bulk-creation
-# tools (expand_task / parse_prd) were retired with the Taskmaster cutover;
-# task decomposition now happens via planning_mode + curator only.
-_STAGE2_PROJECT_ID_GUIDELINE = _PROJECT_ID_GUIDELINE.format(
-    tools=(
-        'search, get_entity, get_episodes, add_memory, delete_memory, update_edge, '
-        'update_memory, redact_episode_content, delete_episode, '
-        'get_tasks, get_task, set_task_status, submit_task, resolve_ticket, '
-        'update_task, remove_task, add_dependency, remove_dependency'
-    )
-)
-
-# Stage 3: Integrity Check — read-only, no writes
-_STAGE3_PROJECT_ID_GUIDELINE = _PROJECT_ID_GUIDELINE.format(
-    tools='search, get_entity, get_episodes, get_status, get_tasks, get_task'
+# System prompts interpolate it raw (the model sees {project_id}); footers .format(project_id=...).
+PROJECT_ID_GUIDELINE = (
+    'Pass project_id="{project_id}" on every fused-memory tool that has a project_id '
+    'parameter; tools that read or write tasks take project_root instead (see the '
+    'project_root line).'
 )
 
 # ---------------------------------------------------------------------------
