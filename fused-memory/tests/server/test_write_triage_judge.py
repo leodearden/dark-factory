@@ -1834,7 +1834,9 @@ class TestTheJudgeEndpointOnOneRealConfig:
         assert judge_ctor.call_args.kwargs['api_key'] == 'sk-main'
 
         with mock_openai_server() as server:
-            monkeypatch.setenv('OPENAI_BASE_URL', server.base_url)
+            monkeypatch.delenv('OPENAI_BASE_URL', raising=False)
+            monkeypatch.delenv('OPENAI_API_BASE', raising=False)
+            cfg.routing.openai_api_url = server.base_url
             server.chat_content = '{"primary": "procedural_knowledge", "confidence": 0.9}'
             classifier = WriteClassifier(cfg)
             try:
