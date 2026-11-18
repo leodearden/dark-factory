@@ -216,8 +216,8 @@ finding stops re-escalating every cycle. (2) If no local task is the subject —
 in the target project with no local anchor — then cite_task on the TARGET project would return \
 unknown_project and attach nothing, so this finding has no cited-task anchor and is deduped by its \
 normalised description until an operator registers the project or routes the work.
-- Re-scoping or deleting an existing local task because its scope belongs elsewhere is fine \
-— follow the Authority Model rules for that.
+- Re-scoping or cancelling (set_task_status('cancelled')) an existing local task because its scope \
+belongs elsewhere is fine — follow the Authority Model rules for that.
 
 ## Guidelines
 - Review Stage 1's flagged items first — they identify task-relevant findings.
@@ -472,7 +472,7 @@ After `mcp__fused-memory__resolve_ticket` returns `status="created"` or \
 `tasks_created`: a combined candidate mints no new task id). If `status="refused"`, the candidate was deliberately rejected by a deterministic guard: no task was created, no `task_id` is present, and this is CORRECT — never count it toward `tasks_created`, never retry it, and never flag it as a discrepancy. \
 If `status="pending"` or `status="awaiting_curation"`, the ticket is open, not lost: no `task_id` is present yet, and this is CORRECT — count it toward neither `tasks_created` nor `tasks_combined`, never flag it as a discrepancy, and never re-submit it. Re-poll `resolve_ticket` once with the same ticket, then record the ticket id. \
 Otherwise, if `task_id` is missing from the `resolve_ticket` response, \
-skip the `tasks_created` increment and flag the discrepancy in your structured report. \
+skip the `tasks_created` increment and flag the discrepancy with `mcp__recon-report__add_finding`. \
 `status="failed"` is never counted toward `tasks_created` regardless of whether a \
 `task_id` is present — inspect `reason` and do not retry silently. \
 If the status is anything other than `created`/`combined`/`failed`/`refused`/`cancelled`/`pending`/`awaiting_curation` but a `task_id` \
@@ -488,7 +488,7 @@ is absent. Only increment the relevant task-success counter (e.g., `tasks_reopen
 if `newStatus` matches the requested status. If the response is missing or ambiguous, \
 call `mcp__fused-memory__get_task` with the same task id to confirm. If the confirmed \
 status differs from the requested one, skip the counter increment and flag the \
-discrepancy in your structured report. If the response contains `"no_op": true`, the \
+discrepancy with `mcp__recon-report__add_finding`. If the response contains `"no_op": true`, the \
 task was already in the requested status — treat as a successful no-op (do not \
 increment a success counter, do not flag as a discrepancy). When `task_id` is a \
 comma-separated list, the response is wrapped as `{{"success": bool, "results": \
@@ -521,7 +521,7 @@ automatically by the backend (no pre-write baseline fetch is required). Only inc
 the newly-attached entries — it MUST contain every newly-attached entity and query; it \
 MAY also contain pre-existing entries that were preserved through the union merge. If \
 the returned hints are missing any newly-attached entry, skip the \
-`tasks_hints_updated` increment and flag the discrepancy in your structured report.
+`tasks_hints_updated` increment and flag the discrepancy with `mcp__recon-report__add_finding`.
 
 NEVER combine a `details` rewrite with a metadata append in ONE \
 `mcp__fused-memory__update_task` call. `append` is NOT scoped to metadata: the same \
@@ -536,7 +536,7 @@ a new section to `details`, pass ONLY the new section text with `append=True` an
 the backend do the concatenation — never re-send the existing body. Either way, verify \
 by reading the response's `updated_task.details` field (the post-write body lives \
 THERE — the response has no top-level `details` key) or a follow-up \
-`mcp__fused-memory__get_task`, and flag a duplicated body in your structured report.
+`mcp__fused-memory__get_task`, and flag a duplicated body with `mcp__recon-report__add_finding`.
 
 The additive union above ALSO covers a task whose stored `memory_hints` are in the \
 LEGACY list format (`[{{entity, query}}, ...]`) rather than the canonical \
