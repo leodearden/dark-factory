@@ -1,15 +1,18 @@
 """Real-git fixtures plus stubs of reify's ``seed-warm-lane.sh`` contracts.
 
-Shared by the lane-lock re-entrancy, main-tip-sweep seed-mode and spec-lane
-re-acquire suites, so the one model of how today's seed script takes, refuses
+Shared by the lane-lock re-entrancy, main-tip-sweep seed-mode, spec-lane
+re-acquire and spec-lane cancellation suites, so the one model of how today's seed script takes, refuses
 and accepts an asserted ``<lane_dir>.lock``, and of how each mode treats an
 existing ``<lane_dir>/target``, lives in one place.
 """
 
 from __future__ import annotations
 
+import asyncio
+from dataclasses import dataclass
 from pathlib import Path
 
+import pytest
 from _git_fixtures import seed_repo
 
 from orchestrator.config import GitConfig
@@ -48,10 +51,12 @@ echo seeded > "$lane_dir/target/seeded.bin"
 exit 0
 """
 
-# Models reify seed-warm-lane.sh's MODE SPLIT over an existing <lane_dir>/target.
-TARGET_MODE_SEED_SCRIPT = """#!/usr/bin/env bash
+_BASH_PREAMBLE = """#!/usr/bin/env bash
 set -u
-target="$2/target"
+"""
+
+# Models reify seed-warm-lane.sh's MODE SPLIT over an existing <lane_dir>/target.
+_TARGET_MODE_BODY = """target="$2/target"
 if [ -d "$target" ] && [ -n "$(ls -A "$target")" ]; then
     case "$3" in
         --reset-in-place)
@@ -66,6 +71,56 @@ rmdir "$target" 2>/dev/null || true
 cp -a "$1" "$target"
 exit 0
 """
+
+TARGET_MODE_SEED_SCRIPT = _BASH_PREAMBLE + _TARGET_MODE_BODY
+
+SEED_BLOCK_FILE_ENV = 'SEED_BLOCK_FILE'
+SEED_STARTED_FILE_ENV = 'SEED_STARTED_FILE'
+
+# TARGET_MODE_SEED_SCRIPT that, while armed, half-clones target/ and hangs, so
+# a test can interrupt a seed mid-copy the way a deadline or shutdown does.
+BLOCKING_TARGET_MODE_SEED_SCRIPT = _BASH_PREAMBLE + f"""\
+if [ -n "${{{SEED_BLOCK_FILE_ENV}:-}}" ] && [ -e "${SEED_BLOCK_FILE_ENV}" ]; then
+    mkdir -p "$2/target"
+    echo partial > "$2/target/partial.bin"
+    touch "${{{SEED_STARTED_FILE_ENV}:-$2.seed-started}}"
+    sleep 60
+fi
+""" + _TARGET_MODE_BODY
+
+
+async def wait_until_exists(path: Path, *, within_s: float = 30.0) -> None:
+    async with asyncio.timeout(within_s):
+        while not path.exists():
+            await asyncio.sleep(0.02)
+
+
+@dataclass(frozen=True)
+class SeedBlock:
+    """An armed BLOCKING_TARGET_MODE_SEED_SCRIPT: ``started`` appears once a seed hangs."""
+
+    block_file: Path
+    started: Path
+
+    async def wait_started(self) -> None:
+        await wait_until_exists(self.started)
+
+    def disarm(self) -> None:
+        self.block_file.unlink(missing_ok=True)
+
+
+def arm_seed_block(monkeypatch: pytest.MonkeyPatch, where: Path) -> SeedBlock:
+    """Make every seed run by BLOCKING_TARGET_MODE_SEED_SCRIPT hang until disarmed.
+
+    The seed subprocess inherits ``os.environ`` (shared/git_async.py::run_git),
+    so the environment is the arming channel.
+    """
+    where.mkdir(parents=True, exist_ok=True)
+    block = SeedBlock(block_file=where / 'seed-block', started=where / 'seed-started')
+    block.block_file.touch()
+    monkeypatch.setenv(SEED_BLOCK_FILE_ENV, str(block.block_file))
+    monkeypatch.setenv(SEED_STARTED_FILE_ENV, str(block.started))
+    return block
 
 
 def warm_pool_git_config() -> GitConfig:
