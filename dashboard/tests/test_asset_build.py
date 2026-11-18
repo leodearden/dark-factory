@@ -3,13 +3,16 @@
 Section 1 drives ``tree_identity`` and ``AssetBuild`` over real temp trees,
 with no app and no patching. Section 2 drives the real app: every response
 under ``/api/v2/dashboard/`` carries both identities, and the on-disk one
-follows a content change with no restart.
+follows a content change with no restart. Section 3 covers the page's own
+boot identity, injected into ``/`` at serve time.
 """
 
 from __future__ import annotations
 
+import logging
 import os
 import re
+from html.parser import HTMLParser
 from pathlib import Path
 
 import pytest
@@ -21,6 +24,7 @@ from dashboard.asset_build import (
     ASSET_BUILD_STARTED_HEADER,
     AssetBuild,
     app_asset_build,
+    inject_page_build,
     install_asset_build,
     tree_identity,
 )
@@ -215,3 +219,76 @@ def test_on_disk_header_follows_a_content_edit_with_no_restart(client, swapped_b
     assert edited.headers[ASSET_BUILD_ON_DISK_HEADER] == edited_identity
     assert restored.headers[ASSET_BUILD_STARTED_HEADER] == started
     assert restored.headers[ASSET_BUILD_ON_DISK_HEADER] == started
+
+
+# --- Section 3: the page learns its boot identity from `/` ------------------
+
+
+class _PageBuildMetas(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.contents: list[str | None] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attributes = dict(attrs)
+        if tag == 'meta' and attributes.get('name') == 'df-asset-build':
+            self.contents.append(attributes.get('content'))
+
+
+def _page_build_metas(html: str) -> list[str | None]:
+    parser = _PageBuildMetas()
+    parser.feed(html)
+    return parser.contents
+
+
+def test_index_injects_the_on_disk_identity_into_its_one_meta(client) -> None:
+    page = client.get('/')
+    on_disk = client.get(_CHEAP_ROUTE).headers[ASSET_BUILD_ON_DISK_HEADER]
+
+    assert page.status_code == 200
+    assert page.headers['content-type'].startswith('text/html')
+    assert _page_build_metas(page.text) == [on_disk]
+    assert '<div id="root">' in page.text
+    assert '/static/redux/app.jsx' in page.text
+
+
+def test_index_injects_the_new_on_disk_identity_with_no_restart(client, swapped_build: AssetBuild, tree: Path) -> None:
+    (tree / 'data.js').write_text('window.DF_DATA = { merged: true };\n')
+    edited_identity = tree_identity(tree)
+
+    page = client.get('/')
+
+    assert edited_identity not in (None, swapped_build.started)
+    assert _page_build_metas(page.text) == [edited_identity]
+
+
+def test_raw_static_index_keeps_the_empty_placeholder(client) -> None:
+    raw = client.get('/static/redux/index.html')
+
+    assert raw.status_code == 200
+    assert _page_build_metas(raw.text) == ['']
+
+
+_PLACEHOLDER_PAGE = '<html><head><meta name="df-asset-build" content="" /></head></html>'
+
+
+def test_inject_page_build_fills_the_placeholder() -> None:
+    assert _page_build_metas(inject_page_build(_PLACEHOLDER_PAGE, '0123456789abcdef')) == ['0123456789abcdef']
+
+
+@pytest.mark.parametrize(
+    ('html', 'identity'),
+    [
+        pytest.param('<html><head></head></html>', '0123456789abcdef', id='no placeholder'),
+        pytest.param(_PLACEHOLDER_PAGE.replace('</head>', '<meta name="df-asset-build" content="" /></head>'), '0123456789abcdef', id='two placeholders'),
+        pytest.param(_PLACEHOLDER_PAGE, None, id='no identity'),
+    ],
+)
+def test_inject_page_build_degrades_to_the_unmodified_page_with_a_warning(
+    html: str, identity: str | None, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.WARNING, logger='dashboard.asset_build'):
+        served = inject_page_build(html, identity)
+
+    assert served == html
+    assert [record.levelno for record in caplog.records] == [logging.WARNING]
