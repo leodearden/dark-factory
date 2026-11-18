@@ -459,7 +459,7 @@ class TestRunScopedVerificationReverseDependencyGuards:
     async def test_unmapped_package_source_change_does_not_widen(self, tmp_path: Path):
         """A source-only diff to a package with no reverse-dep map entry widens to nothing."""
         worktree = _build_dashboard_worktree(tmp_path)
-        config = OrchestratorConfig(project_root=worktree)
+        config = OrchestratorConfig(project_root=worktree, merge_verify_breadth='scoped')
         dashboard_mc = ModuleConfig(
             prefix='dashboard',
             test_command=_DASHBOARD_TEST_COMMAND,

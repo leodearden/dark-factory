@@ -1283,9 +1283,8 @@ class TestMergeVerifyBreadthConfig:
     is stated once, in defaults.yaml's merge_verify_breadth comment.
     """
 
-    def test_defaults_to_full(self):
-        config = OrchestratorConfig()
-        assert config.merge_verify_breadth == 'full'
+    def test_pydantic_field_defaults_to_full(self):
+        assert OrchestratorConfig.model_fields['merge_verify_breadth'].default == 'full'
 
     def test_full_override_accepted(self):
         config = OrchestratorConfig(merge_verify_breadth='full')
