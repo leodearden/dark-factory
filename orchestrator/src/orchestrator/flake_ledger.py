@@ -1265,7 +1265,7 @@ NEVER_WIDEN_A_TIMEOUT = (
 RESPONSIBILITY_FIX_ROOT_DEFECT = (
     'You are responsible for finding and fixing the ROOT DEFECT behind this observation'
 )
-RESPONSIBILITY_REMOVE_FROM_LEDGER = (
+RESPONSIBILITY_KEEP_NODE_ID_STABLE = (
     'You do NOT write to the flake ledger, and must not ask anyone to: the ledger '
     'closes this debt cycle itself once it observes this task done. Your part is to '
     'keep the test\'s pytest node-id byte-identical (no rename, no parametrize, no '
@@ -1461,7 +1461,7 @@ def _lane_task_text(row: DebtRow, ctx: DebtContext) -> tuple[str, str]:
         + (f'\n{evidence}' if evidence else '')
         + f'\n'
         f'{RESPONSIBILITY_FIX_ROOT_DEFECT}.\n'
-        f'{RESPONSIBILITY_REMOVE_FROM_LEDGER}.\n'
+        f'{RESPONSIBILITY_KEEP_NODE_ID_STABLE}.\n'
         f'\n'
         f'{NEVER_WIDEN_A_TIMEOUT}\n'
         f'\n'
@@ -1499,7 +1499,7 @@ def _merge_gate_task_text(row: DebtRow, ctx: DebtContext | None) -> tuple[str, s
         f'bug, task 3552). Diagnose before you conclude the test is at fault.\n'
         f'\n'
         f'{RESPONSIBILITY_FIX_ROOT_DEFECT}.\n'
-        f'{RESPONSIBILITY_REMOVE_FROM_LEDGER}.\n'
+        f'{RESPONSIBILITY_KEEP_NODE_ID_STABLE}.\n'
         f'\n'
         f'{NEVER_WIDEN_A_TIMEOUT}\n'
         f'\n'

@@ -15,7 +15,7 @@ from string import Template
 from orchestrator.flake_ledger import (
     NEVER_WIDEN_A_TIMEOUT,
     RESPONSIBILITY_FIX_ROOT_DEFECT,
-    RESPONSIBILITY_REMOVE_FROM_LEDGER,
+    RESPONSIBILITY_KEEP_NODE_ID_STABLE,
     DebtRow,
     DueRow,
 )
@@ -35,7 +35,7 @@ def merge_gate_deflake_description(row: DebtRow) -> str:
         opened_at=row.opened_at,
         open_count=row.open_count,
         responsibility_fix_root_defect=RESPONSIBILITY_FIX_ROOT_DEFECT,
-        responsibility_remove_from_ledger=RESPONSIBILITY_REMOVE_FROM_LEDGER,
+        responsibility_keep_node_id_stable=RESPONSIBILITY_KEEP_NODE_ID_STABLE,
         never_widen_a_timeout=NEVER_WIDEN_A_TIMEOUT,
     )
 

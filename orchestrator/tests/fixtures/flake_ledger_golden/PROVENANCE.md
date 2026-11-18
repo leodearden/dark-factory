@@ -13,7 +13,7 @@ de-flake title) is pinned against a record and not against the code itself.
 Both are `string.Template` texts with no trailing newline. Every variable value
 (test id, project, stamps, counts, commit, head, task id) is a `$placeholder`.
 So are the three instruction constants (`RESPONSIBILITY_FIX_ROOT_DEFECT`,
-`RESPONSIBILITY_REMOVE_FROM_LEDGER`, `NEVER_WIDEN_A_TIMEOUT`): the loader fills
+`RESPONSIBILITY_KEEP_NODE_ID_STABLE`, `NEVER_WIDEN_A_TIMEOUT`): the loader fills
 them from the live `orchestrator.flake_ledger` values, so task 5850 can reword
 those constants without touching these files.
 
