@@ -40,7 +40,7 @@ from legibility_carrier_fixtures import (
     TASK_NOTIFICATION_TEXT,
     TRICKLE_CODER_PREAMBLE,
     UNKNOWN_PROVENANCE_TEXT,
-    UNMARKED_HEADLESS_SDK_PROMPTS,
+    UNMARKED_HEADLESS_SDK_PROMPT_TEXTS,
     WATCHER_ROTATION_PROMPT,
     briefing_text,
     coder_judgment,
@@ -2057,17 +2057,6 @@ def _resume_and_context_block_records():
     ]
 
 
-def _sdk_prompt(text):
-    """A prompt delivered over the SDK, shaped like the steward continuation
-    records sighted in reify session 77fb6617: promptSource and turnOrigin
-    'sdk', no 'origin', and the 'isMeta' key ABSENT rather than False."""
-    rec = _user_text(text)
-    rec.pop('isMeta')
-    rec['promptSource'] = 'sdk'
-    rec['turnOrigin'] = 'sdk'
-    return rec
-
-
 _BLOCKED_LITERAL = 'BLOCKED: merge gate refused the branch'
 
 INJECTED_PROSE_PROMPTS = (
@@ -2293,9 +2282,9 @@ class TestHarnessInjectedTurnFilter:
         # The 77fb6617 shape: two continuation prompts around real dialogue.
         continuation = steward_continuation_prompt(tmp_path)
         records = [
-            _sdk_prompt(continuation),
+            sdk_prompt(continuation, entrypoint=None),
             _user_text('please fix the bug'),
-            _sdk_prompt(continuation),
+            sdk_prompt(continuation, entrypoint=None),
         ]
 
         turns = mod.iter_user_turns(records)
@@ -2314,7 +2303,7 @@ class TestHarnessInjectedTurnFilter:
         prompt = steward_continuation_prompt(
             tmp_path, summary='BLOCKED: merge gate refused the branch',
         )
-        records = [_with_session_meta(_sdk_prompt(prompt)) for _ in range(2)]
+        records = [_with_session_meta(sdk_prompt(prompt, entrypoint=None)) for _ in range(2)]
 
         digest = mod.render_digest(records, agent_class='orchestrated-task')
 
@@ -2329,7 +2318,7 @@ class TestHarnessInjectedTurnFilter:
     def test_injected_prose_prompt_is_excluded_from_iter_user_turns(self, prompt):
         # The 16e1a37b / 2880c011 / 4aaf48b0 shape: the injected prompt is
         # the session's first user record.
-        records = [_sdk_prompt(prompt), _user_text('please fix the bug')]
+        records = [sdk_prompt(prompt, entrypoint=None), _user_text('please fix the bug')]
 
         turns = mod.iter_user_turns(records)
 
@@ -2338,7 +2327,7 @@ class TestHarnessInjectedTurnFilter:
     @pytest.mark.parametrize('prompt', INJECTED_PROSE_PROMPTS)
     def test_render_digest_injected_prose_prompt_session_has_no_gold_section(self, prompt):
         digest = mod.render_digest(
-            [_with_session_meta(_sdk_prompt(prompt))], agent_class='orchestrated-task',
+            [_with_session_meta(sdk_prompt(prompt, entrypoint=None))], agent_class='orchestrated-task',
         )
 
         frontmatter_yaml, _ = _split_frontmatter(digest)
@@ -2662,14 +2651,11 @@ class TestNonHumanOriginFilter:
 # provenance alone, while a human turn typed into an SDK GUI client stays gold.
 # ---------------------------------------------------------------------------
 
-_UNMARKED_HEADLESS_SDK_TEXTS = tuple(str(param.values[0]) for param in UNMARKED_HEADLESS_SDK_PROMPTS)
-
-
 class TestHeadlessSdkPromptFilter:
     def test_headless_prompts_are_excluded_and_dialogue_keeps_its_index(self):
         gui_client_turn = sdk_prompt("what's the status of the PR?", entrypoint='sdk-ts')
         typed_turn = {**_user_text('please fix the bug'), 'promptSource': 'typed', 'entrypoint': 'cli'}
-        records = [sdk_prompt(text) for text in _UNMARKED_HEADLESS_SDK_TEXTS]
+        records = [sdk_prompt(text) for text in UNMARKED_HEADLESS_SDK_PROMPT_TEXTS.values()]
         records += [gui_client_turn, typed_turn]
 
         turns = mod.iter_user_turns(records)
@@ -2682,7 +2668,7 @@ class TestHeadlessSdkPromptFilter:
     def test_render_digest_headless_prompt_session_has_no_gold_section(self):
         records = [
             _with_session_meta(sdk_prompt(f'{text}\nBLOCKED: merge gate refused the branch'))
-            for text in _UNMARKED_HEADLESS_SDK_TEXTS
+            for text in UNMARKED_HEADLESS_SDK_PROMPT_TEXTS.values()
         ]
 
         digest = mod.render_digest(records, agent_class='orchestrated-task')

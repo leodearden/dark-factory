@@ -70,52 +70,52 @@ def with_origin(record: dict, kind: str) -> dict:
     return out
 
 
-def sdk_prompt(text: str, *, entrypoint: str = 'sdk-cli') -> dict:
+def sdk_prompt(text: str, *, entrypoint: str | None = 'sdk-cli') -> dict:
     """A user prompt record stamped as Claude Code stamps an SDK-delivered
     prompt -- promptSource, turnOrigin and userType, with 'isMeta' REMOVED --
-    in the shape sighted 2026-11-18. *entrypoint* 'sdk-cli' is headless
-    ``claude --print`` (shared/src/shared/cli_invoke.py::build_claude_argv);
-    T3 Code's human-typed turns carry 'sdk-ts' or 't3-code' instead
-    (session 790c2455)."""
+    in the shape sighted 2026-11-18.
+
+    The default *entrypoint* 'sdk-cli' is headless ``claude --print``
+    (shared/src/shared/cli_invoke.py::build_claude_argv), which the
+    provenance rule excludes WHATEVER the text says. A test pinning a text
+    marker passes ``entrypoint=None``, which leaves the key out so only the
+    text rules can decide. T3 Code's human-typed turns carry 'sdk-ts' or
+    't3-code' (session 790c2455)."""
     out = user_record(text)
     out.pop('isMeta', None)
-    out.update(
-        promptSource='sdk', turnOrigin='sdk', userType='external', entrypoint=entrypoint,
-    )
+    out.update(promptSource='sdk', turnOrigin='sdk', userType='external')
+    if entrypoint is not None:
+        out['entrypoint'] = entrypoint
     return out
 
 
-UNMARKED_HEADLESS_SDK_PROMPTS = (
-    pytest.param(
+UNMARKED_HEADLESS_SDK_PROMPT_TEXTS: dict[str, str] = {
+    'dry_run_unblock': (
         'Task ID: 4384\n'
         'Worktree: /home/leo/src/dark-factory/.worktrees/4384\n'
         'Block reason: verify failed three times on the same gate\n'
         'Detail: (none)\n\n'
-        'Investigate and emit your structured proposal.',
-        id='dry_run_unblock',
+        'Investigate and emit your structured proposal.'
     ),
-    pytest.param(
+    'link_adjudicator': (
         'ITEM p1\n'
         'CHILD: The merge worker releases the lease before verify returns.\n'
-        'PARENT: Merge-lane leases outlive the verify they guard.',
-        id='link_adjudicator',
+        'PARENT: Merge-lane leases outlive the verify they guard.'
     ),
-    pytest.param(
+    'path_scope_adjudicator': (
         "Task filed in project: 'reify'\n"
         'Flagged matched path prefixes: orchestrator/src/orchestrator/\n'
         "Suggested correct project: 'dark_factory'\n\n"
         'Task title:\n'
-        'Merge worker holds the lease across verify\n',
-        id='path_scope_adjudicator',
+        'Merge worker holds the lease across verify\n'
     ),
-    pytest.param(
+    'task_curator_candidate': (
         '# Candidate task (not yet created)\n'
         '  title: Merge worker holds the lease across verify\n'
         '  priority: low\n'
-        '  spawn_context: agent_followup',
-        id='task_curator_candidate',
+        '  spawn_context: agent_followup'
     ),
-)
+}
 """Machine prompts delivered to headless ``claude --print`` that NO text rule
 recognises, restated and abridged from their builders:
 ``orchestrator/src/orchestrator/dry_run_unblock.py::run_dry_run_unblock``
@@ -125,6 +125,12 @@ recognises, restated and abridged from their builders:
 ``fused-memory/src/fused_memory/middleware/path_scope_adjudicator.py::PathScopeAdjudicator._build_user_prompt``
 and ``fused-memory/src/fused_memory/middleware/task_curator.py::_render_candidate_section``.
 Only the record's provenance can exclude them."""
+
+UNMARKED_HEADLESS_SDK_PROMPTS = tuple(
+    pytest.param(text, id=name) for name, text in UNMARKED_HEADLESS_SDK_PROMPT_TEXTS.items()
+)
+""":data:`UNMARKED_HEADLESS_SDK_PROMPT_TEXTS` as ``pytest.param`` entries
+carrying their own ids, ready to parametrize a single ``text`` argument."""
 
 SDK_GUI_CLIENT_HUMAN_TURNS = (
     pytest.param("what's the status of the PR?", 'sdk-ts', id='sdk_ts'),
