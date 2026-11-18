@@ -450,9 +450,13 @@ through a **new** list `roles.py::_PLAN_DEVIATION_TOOLS`, added to IMPLEMENTER a
 only — not through `_PLAN_STATUS_TOOLS`, which `SIMPLE_TASK` also holds and which would hand
 the tool to a role with no frozen plan and no doctrine. The plan-tools server enforces that
 allowlist by registering only the role's granted tools: `plan_tools.create_server(granted_tools=...)`,
-launched with one `--grant` per name in `AgentRole.plan_tools_grants`, and exposing nothing
-without one. Dispatches run under `bypassPermissions`, where `--allowed-tools` neither hides nor
-denies a tool (task 7717).
+launched with `--grants-enforced` and one `--grant` per name in `AgentRole.plan_tools_grants`,
+so a role granted nothing gets nothing. Dispatches run under `bypassPermissions`, where
+`--allowed-tools` neither hides nor denies a tool (task 7717). 2026-11-18, task 7717 review: a
+launch carrying neither the marker nor any grant keeps the full surface and logs a WARNING,
+because it comes from a pre-7717 orchestrator, whose in-memory launcher emits no grant while
+the server child imports the new `plan_tools.py` through the editable install; task 10803
+removes that path once deploy task 10802 has restarted the fleet.
 
 ---
 
@@ -512,8 +516,8 @@ record_step_deviation(step_id, kind, observed, expected, action_taken,
   `add_plan_step`; the allowlist `roles.py::_PLAN_DEVIATION_TOOLS =
   ['mcp__plan-tools__record_step_deviation']` is added to IMPLEMENTER and DEBUGGER by γ, the
   one leaf that edits `roles.py` — until γ lands the tool exists but no dispatched role holds
-  it. A dispatched plan-tools server registers only its role's granted tools (D14), so a role
-  without the grant can neither list nor call it. `STEP_TYPES` is a public constant in
+  it. A plan-tools server launched by a post-7717 dispatch registers only its role's granted
+  tools (D14), so a role without the grant can neither list nor call it. `STEP_TYPES` is a public constant in
   `plan_tools.py`.
 
 ### 6.3 Census (δ)
