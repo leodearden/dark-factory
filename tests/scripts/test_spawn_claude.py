@@ -56,6 +56,7 @@ from df_pytest_isolation import (
 )
 from orchestrator import (
     session_hooks,  # pyright: ignore[reportAttributeAccessIssue]
+    session_reaper,
     session_records,
     session_registry,  # pyright: ignore[reportAttributeAccessIssue]
 )
@@ -1437,7 +1438,7 @@ def test_registry_write_refresh_reap_two_way_boundary(tmp_path: pathlib.Path) ->
 
     # The real spawn started a detached `reap`; holding its lock waits that
     # out and keeps any other out, so the reap below is the only one.
-    with session_registry.reap_lock(fleet_root):
+    with session_reaper.reap_lock(fleet_root):
         # Backdate the mtime so the refresh's heartbeat bump is unambiguous even
         # on filesystems with coarse mtime resolution.
         backdated_ts = record_path.stat().st_mtime - 100
@@ -1490,11 +1491,11 @@ def test_registry_write_refresh_reap_two_way_boundary(tmp_path: pathlib.Path) ->
         record_path.write_text(dead_record.to_json())
         now = datetime.now(UTC)
         stale_ts = (
-            now - session_registry.NON_TERMINAL_HEARTBEAT_TTL - timedelta(hours=1)
+            now - session_reaper.NON_TERMINAL_HEARTBEAT_TTL - timedelta(hours=1)
         ).timestamp()
         os.utime(record_path, (stale_ts, stale_ts))
 
-        reaped = session_registry.reap_stale_records(root=fleet_root, now=now)
+        reaped = session_reaper.reap_stale_records(root=fleet_root, now=now)
         reaped_by_slug = {r.session_slug: r.reason for r in reaped}
         assert reaped_by_slug.get(dead_record.session_slug) == "stale_pid"
         assert not slug_dir.exists()

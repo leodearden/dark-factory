@@ -1,11 +1,11 @@
 """Tests for orchestrator.session_registry module.
 
-Covers: TTL/pid stale-record reaper matrix; CLI subcommands + fail-soft,
-the lease-* verbs included; the bare-shell entrypoint registry; and the G5
-two-way boundary test (write by a real spawn -> refresh by a simulated hook ->
-reap), exercised jointly with tests/scripts/test_spawn_claude.py's bash-level
-harness. The record schema and store are covered in test_session_records.py,
-the lease library in test_session_leases.py.
+Covers: CLI subcommands + fail-soft, the reap and lease-* verbs included; the
+bare-shell entrypoint registry; and the G5 two-way boundary test (write by a
+real spawn -> refresh by a simulated hook -> reap), exercised jointly with
+tests/scripts/test_spawn_claude.py's bash-level harness. The record schema and
+store are covered in test_session_records.py, the lease library in
+test_session_leases.py, the reaper in test_session_reaper.py.
 """
 
 from __future__ import annotations
@@ -13,7 +13,6 @@ from __future__ import annotations
 import argparse
 import ast
 import dataclasses
-import fcntl
 import importlib.util
 import json
 import logging
@@ -22,22 +21,19 @@ import re
 import socket
 import subprocess
 import sys
-from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
 
 import pytest
 from _decision_fixtures import EVIDENCE, make_decision
-from _process_identity_variants import IdentityVariant, own_identity
+from _process_identity_variants import own_identity
 from _reap_report_wait import await_reap_report
-from _session_record_fixtures import make_record, set_mtime
-from shared.process_identity import ProcessIdentity
+from _session_record_fixtures import make_record, set_mtime, write_t3_record
 from shared.project_id import PROJECT_ID_ALIASES, fold_project_token
 
 from orchestrator import decision_registry as dr
-from orchestrator import fleet_files, session_leases, session_records
+from orchestrator import session_leases, session_reaper, session_records
 from orchestrator import session_registry as sr
 
 # ---------------------------------------------------------------------------
@@ -49,841 +45,6 @@ from orchestrator import session_registry as sr
 _DEAD_PID = 2**31 - 1
 
 _NOW = datetime(2026, 7, 7, 12, 0, 0, tzinfo=UTC)
-
-
-# ---------------------------------------------------------------------------
-# Step-7: TTL / pid stale-record reaper matrix
-# ---------------------------------------------------------------------------
-
-
-def test_ttl_constants_are_module_level_timedeltas() -> None:
-    assert timedelta(hours=24) == sr.TERMINAL_TTL
-    assert timedelta(hours=1) == sr.NON_TERMINAL_HEARTBEAT_TTL
-
-
-def test_reap_removes_terminal_record_past_ttl(tmp_path: Path) -> None:
-    r = make_record(status=session_records.Status.EXITED, launcher_pid=os.getpid())
-    session_records.write_record(r, root=tmp_path)
-    record_path = session_records.record_path_for_slug(r.session_slug, root=tmp_path)
-    set_mtime(record_path, _NOW, sr.TERMINAL_TTL + timedelta(hours=1))
-
-    reaped = sr.reap_stale_records(root=tmp_path, now=_NOW)
-
-    assert len(reaped) == 1
-    assert reaped[0].session_slug == r.session_slug
-    assert reaped[0].reason == 'terminal_ttl'
-    assert reaped[0].path == record_path.parent
-    assert not record_path.parent.exists()
-
-
-def test_reap_keeps_terminal_record_within_ttl(tmp_path: Path) -> None:
-    r = make_record(status=session_records.Status.EXITED, launcher_pid=os.getpid())
-    session_records.write_record(r, root=tmp_path)
-    record_path = session_records.record_path_for_slug(r.session_slug, root=tmp_path)
-    set_mtime(record_path, _NOW, sr.TERMINAL_TTL - timedelta(hours=1))
-
-    reaped = sr.reap_stale_records(root=tmp_path, now=_NOW)
-
-    assert reaped == []
-    assert record_path.is_file()
-
-
-def test_reap_removes_non_terminal_dead_pid_past_heartbeat_ttl(tmp_path: Path) -> None:
-    r = make_record(status=session_records.Status.LAUNCHING, launcher_pid=_DEAD_PID)
-    session_records.write_record(r, root=tmp_path)
-    record_path = session_records.record_path_for_slug(r.session_slug, root=tmp_path)
-    set_mtime(record_path, _NOW, sr.NON_TERMINAL_HEARTBEAT_TTL + timedelta(minutes=1))
-
-    reaped = sr.reap_stale_records(root=tmp_path, now=_NOW)
-
-    assert len(reaped) == 1
-    assert reaped[0].session_slug == r.session_slug
-    assert reaped[0].reason == 'stale_pid'
-    assert not record_path.parent.exists()
-
-
-def test_reap_keeps_non_terminal_live_pid_regardless_of_age(tmp_path: Path) -> None:
-    r = make_record(status=session_records.Status.RUNNING, launcher_pid=os.getpid())
-    session_records.write_record(r, root=tmp_path)
-    record_path = session_records.record_path_for_slug(r.session_slug, root=tmp_path)
-    set_mtime(record_path, _NOW, timedelta(days=30))  # past both TTLs
-
-    reaped = sr.reap_stale_records(root=tmp_path, now=_NOW)
-
-    assert reaped == []
-    assert record_path.is_file()
-
-
-def test_reap_keeps_non_terminal_dead_pid_within_heartbeat_ttl(tmp_path: Path) -> None:
-    r = make_record(status=session_records.Status.LAUNCHING, launcher_pid=_DEAD_PID)
-    session_records.write_record(r, root=tmp_path)
-    record_path = session_records.record_path_for_slug(r.session_slug, root=tmp_path)
-    set_mtime(record_path, _NOW, sr.NON_TERMINAL_HEARTBEAT_TTL - timedelta(minutes=1))
-
-    reaped = sr.reap_stale_records(root=tmp_path, now=_NOW)
-
-    assert reaped == []
-    assert record_path.is_file()
-
-
-def test_reap_removes_corrupt_body_past_heartbeat_ttl(tmp_path: Path) -> None:
-    r = make_record(status=session_records.Status.LAUNCHING, launcher_pid=os.getpid())
-    session_records.write_record(r, root=tmp_path)
-    record_path = session_records.record_path_for_slug(r.session_slug, root=tmp_path)
-    record_path.write_text('{not valid json')
-    set_mtime(record_path, _NOW, sr.NON_TERMINAL_HEARTBEAT_TTL + timedelta(minutes=1))
-
-    reaped = sr.reap_stale_records(root=tmp_path, now=_NOW)
-
-    assert len(reaped) == 1
-    assert reaped[0].session_slug == r.session_slug
-    assert reaped[0].reason == 'corrupt'
-    assert not record_path.parent.exists()
-
-
-def test_reap_removes_missing_body_past_heartbeat_ttl(tmp_path: Path) -> None:
-    """A slug dir with no record.json at all is still reaped by path identity."""
-    r = make_record(status=session_records.Status.LAUNCHING, launcher_pid=os.getpid())
-    session_records.write_record(r, root=tmp_path)
-    record_path = session_records.record_path_for_slug(r.session_slug, root=tmp_path)
-    record_path.unlink()
-    set_mtime(record_path.parent, _NOW, sr.NON_TERMINAL_HEARTBEAT_TTL + timedelta(minutes=1))
-
-    reaped = sr.reap_stale_records(root=tmp_path, now=_NOW)
-
-    assert len(reaped) == 1
-    assert reaped[0].session_slug == r.session_slug
-    assert reaped[0].reason == 'corrupt'
-    assert not record_path.parent.exists()
-
-
-def test_reap_handles_mixed_population_in_one_sweep(tmp_path: Path) -> None:
-    """The reaper's whole point is sweeping many records in one pass; pin that
-    a kept/terminal_ttl/stale_pid/corrupt mix in a single sessions dir reaps
-    exactly the expected subset in one call and leaves survivors untouched.
-    """
-    kept_running = make_record(
-        session_slug='kept-running', status=session_records.Status.RUNNING, launcher_pid=os.getpid()
-    )
-    kept_recent_terminal = make_record(
-        session_slug='kept-recent-terminal', status=session_records.Status.EXITED, launcher_pid=os.getpid()
-    )
-    reap_terminal = make_record(
-        session_slug='reap-terminal', status=session_records.Status.EXITED, launcher_pid=os.getpid()
-    )
-    reap_stale = make_record(
-        session_slug='reap-stale-pid', status=session_records.Status.LAUNCHING, launcher_pid=_DEAD_PID
-    )
-
-    for r in (kept_running, kept_recent_terminal, reap_terminal, reap_stale):
-        session_records.write_record(r, root=tmp_path)
-
-    set_mtime(
-        session_records.record_path_for_slug(kept_running.session_slug, root=tmp_path),
-        _NOW,
-        timedelta(days=30),  # long-lived but a live pid -> kept regardless of age
-    )
-    set_mtime(
-        session_records.record_path_for_slug(kept_recent_terminal.session_slug, root=tmp_path),
-        _NOW,
-        sr.TERMINAL_TTL - timedelta(hours=1),
-    )
-    set_mtime(
-        session_records.record_path_for_slug(reap_terminal.session_slug, root=tmp_path),
-        _NOW,
-        sr.TERMINAL_TTL + timedelta(hours=1),
-    )
-    set_mtime(
-        session_records.record_path_for_slug(reap_stale.session_slug, root=tmp_path),
-        _NOW,
-        sr.NON_TERMINAL_HEARTBEAT_TTL + timedelta(minutes=1),
-    )
-
-    # A corrupt-body record dir, aged past the heartbeat TTL.
-    corrupt_dir = session_records.sessions_dir(root=tmp_path) / 'reap-corrupt'
-    corrupt_dir.mkdir(parents=True)
-    corrupt_record = corrupt_dir / 'record.json'
-    corrupt_record.write_text('{not valid json')
-    set_mtime(corrupt_record, _NOW, sr.NON_TERMINAL_HEARTBEAT_TTL + timedelta(minutes=1))
-
-    reaped = sr.reap_stale_records(root=tmp_path, now=_NOW)
-
-    reaped_by_slug = {r.session_slug: r.reason for r in reaped}
-    assert reaped_by_slug == {
-        'reap-terminal': 'terminal_ttl',
-        'reap-stale-pid': 'stale_pid',
-        'reap-corrupt': 'corrupt',
-    }
-
-    remaining = {p.name for p in session_records.sessions_dir(root=tmp_path).iterdir()}
-    assert remaining == {'kept-running', 'kept-recent-terminal'}
-
-
-def test_reap_continues_sweep_when_one_directory_fails_to_remove(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """A single unreapable directory (permission error, a file held open, an
-    ENOTEMPTY race with a concurrent writer) must not abort the sweep -- a
-    later stale directory in the same sessions dir is still reaped.
-    """
-    poison = make_record(session_slug='poison', status=session_records.Status.EXITED, launcher_pid=os.getpid())
-    victim = make_record(session_slug='victim', status=session_records.Status.EXITED, launcher_pid=os.getpid())
-    for r in (poison, victim):
-        session_records.write_record(r, root=tmp_path)
-        set_mtime(
-            session_records.record_path_for_slug(r.session_slug, root=tmp_path),
-            _NOW,
-            sr.TERMINAL_TTL + timedelta(hours=1),
-        )
-
-    poison_dir = session_records.record_path_for_slug(poison.session_slug, root=tmp_path).parent
-    real_rmtree = sr.shutil.rmtree
-
-    def _flaky_rmtree(path: str | os.PathLike[str], *args: Any, **kwargs: Any) -> None:
-        if Path(path) == poison_dir:
-            raise OSError('simulated ENOTEMPTY race')
-        real_rmtree(path, *args, **kwargs)
-
-    monkeypatch.setattr(sr.shutil, 'rmtree', _flaky_rmtree)
-
-    with caplog.at_level(logging.ERROR):
-        reaped = sr.reap_stale_records(root=tmp_path, now=_NOW)
-
-    assert {r.session_slug for r in reaped} == {'victim'}
-    assert poison_dir.is_dir()  # left behind, not silently claimed as reaped
-    assert any(r.levelno >= logging.ERROR for r in caplog.records)
-
-
-# ---------------------------------------------------------------------------
-# Task 2511 step-5: mark_orphaned_sessions_exited (liveness sweep, Part 2)
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    'status',
-    [session_records.Status.LAUNCHING, session_records.Status.RUNNING, session_records.Status.IDLE, session_records.Status.AWAITING_INPUT],
-)
-def test_mark_orphaned_marks_non_terminal_dead_pid_past_heartbeat_ttl(
-    status: session_records.Status, tmp_path: Path
-) -> None:
-    r = make_record(session_slug='orphan-1', status=status, launcher_pid=_DEAD_PID, exit_code=None)
-    session_records.write_record(r, root=tmp_path)
-    record_path = session_records.record_path_for_slug(r.session_slug, root=tmp_path)
-    set_mtime(record_path, _NOW, sr.NON_TERMINAL_HEARTBEAT_TTL + timedelta(minutes=1))
-
-    marked = sr.mark_orphaned_sessions_exited(root=tmp_path, now=_NOW)
-
-    assert {m.session_slug for m in marked} == {'orphan-1'}
-    assert record_path.parent.is_dir()  # marked, NOT deleted (reap_stale_records' job)
-    assert record_path.is_file()
-    reloaded = session_records.read_record('orphan-1', root=tmp_path)
-    assert reloaded.status == session_records.Status.EXITED
-    assert reloaded.exit_code == sr.ORPHAN_EXIT_CODE
-
-
-def test_mark_orphaned_keeps_non_terminal_live_pid_regardless_of_age(tmp_path: Path) -> None:
-    r = make_record(session_slug='kept-live', status=session_records.Status.RUNNING, launcher_pid=os.getpid())
-    session_records.write_record(r, root=tmp_path)
-    record_path = session_records.record_path_for_slug(r.session_slug, root=tmp_path)
-    set_mtime(record_path, _NOW, timedelta(days=30))  # past both TTLs
-
-    marked = sr.mark_orphaned_sessions_exited(root=tmp_path, now=_NOW)
-
-    assert marked == []
-    assert session_records.read_record('kept-live', root=tmp_path).status == session_records.Status.RUNNING
-
-
-def test_mark_orphaned_keeps_non_terminal_dead_pid_within_heartbeat_ttl(tmp_path: Path) -> None:
-    r = make_record(session_slug='kept-recent', status=session_records.Status.LAUNCHING, launcher_pid=_DEAD_PID)
-    session_records.write_record(r, root=tmp_path)
-    record_path = session_records.record_path_for_slug(r.session_slug, root=tmp_path)
-    set_mtime(record_path, _NOW, sr.NON_TERMINAL_HEARTBEAT_TTL - timedelta(minutes=1))
-
-    marked = sr.mark_orphaned_sessions_exited(root=tmp_path, now=_NOW)
-
-    assert marked == []
-    assert session_records.read_record('kept-recent', root=tmp_path).status == session_records.Status.LAUNCHING
-
-
-def test_mark_orphaned_leaves_already_terminal_record_untouched(tmp_path: Path) -> None:
-    r = make_record(
-        session_slug='already-exited', status=session_records.Status.EXITED, exit_code=0, launcher_pid=_DEAD_PID
-    )
-    session_records.write_record(r, root=tmp_path)
-    record_path = session_records.record_path_for_slug(r.session_slug, root=tmp_path)
-    set_mtime(record_path, _NOW, sr.NON_TERMINAL_HEARTBEAT_TTL + timedelta(days=2))
-
-    marked = sr.mark_orphaned_sessions_exited(root=tmp_path, now=_NOW)
-
-    assert marked == []
-    reloaded = session_records.read_record('already-exited', root=tmp_path)
-    assert reloaded.status == session_records.Status.EXITED
-    assert reloaded.exit_code == 0  # NOT re-stamped with ORPHAN_EXIT_CODE
-
-
-def test_mark_orphaned_preserves_all_other_fields(tmp_path: Path) -> None:
-    r = make_record(
-        session_slug='orphan-fields',
-        status=session_records.Status.RUNNING,
-        launcher_pid=_DEAD_PID,
-        role='unblock',
-        project='df',
-        task_id='2085',
-        result_file='/tmp/whatever/result.md',
-        start_ts='2026-07-07T00:00:00+00:00',
-    )
-    session_records.write_record(r, root=tmp_path)
-    record_path = session_records.record_path_for_slug(r.session_slug, root=tmp_path)
-    set_mtime(record_path, _NOW, sr.NON_TERMINAL_HEARTBEAT_TTL + timedelta(minutes=1))
-
-    sr.mark_orphaned_sessions_exited(root=tmp_path, now=_NOW)
-
-    reloaded = session_records.read_record('orphan-fields', root=tmp_path)
-    assert reloaded.status == session_records.Status.EXITED
-    assert reloaded.exit_code == sr.ORPHAN_EXIT_CODE
-    assert reloaded.role == 'unblock'
-    assert reloaded.project == 'df'
-    assert reloaded.task_id == '2085'
-    assert reloaded.result_file == '/tmp/whatever/result.md'
-    assert reloaded.launcher_pid == _DEAD_PID
-    assert reloaded.start_ts == '2026-07-07T00:00:00+00:00'
-
-
-def test_mark_orphaned_handles_mixed_population_in_one_sweep(tmp_path: Path) -> None:
-    marked_orphan = make_record(
-        session_slug='will-be-marked', status=session_records.Status.RUNNING, launcher_pid=_DEAD_PID
-    )
-    kept_live = make_record(
-        session_slug='kept-live-mix', status=session_records.Status.RUNNING, launcher_pid=os.getpid()
-    )
-    kept_recent = make_record(
-        session_slug='kept-recent-mix', status=session_records.Status.LAUNCHING, launcher_pid=_DEAD_PID
-    )
-    kept_terminal = make_record(
-        session_slug='kept-terminal-mix',
-        status=session_records.Status.EXITED,
-        exit_code=0,
-        launcher_pid=_DEAD_PID,
-    )
-    for r in (marked_orphan, kept_live, kept_recent, kept_terminal):
-        session_records.write_record(r, root=tmp_path)
-
-    set_mtime(
-        session_records.record_path_for_slug('will-be-marked', root=tmp_path),
-        _NOW,
-        sr.NON_TERMINAL_HEARTBEAT_TTL + timedelta(minutes=1),
-    )
-    set_mtime(
-        session_records.record_path_for_slug('kept-live-mix', root=tmp_path),
-        _NOW,
-        timedelta(days=30),
-    )
-    set_mtime(
-        session_records.record_path_for_slug('kept-recent-mix', root=tmp_path),
-        _NOW,
-        sr.NON_TERMINAL_HEARTBEAT_TTL - timedelta(minutes=1),
-    )
-    set_mtime(
-        session_records.record_path_for_slug('kept-terminal-mix', root=tmp_path),
-        _NOW,
-        sr.NON_TERMINAL_HEARTBEAT_TTL + timedelta(days=2),
-    )
-
-    marked = sr.mark_orphaned_sessions_exited(root=tmp_path, now=_NOW)
-
-    assert {m.session_slug for m in marked} == {'will-be-marked'}
-    assert session_records.read_record('will-be-marked', root=tmp_path).status == session_records.Status.EXITED
-    assert session_records.read_record('kept-live-mix', root=tmp_path).status == session_records.Status.RUNNING
-    assert session_records.read_record('kept-recent-mix', root=tmp_path).status == session_records.Status.LAUNCHING
-    reloaded_terminal = session_records.read_record('kept-terminal-mix', root=tmp_path)
-    assert reloaded_terminal.status == session_records.Status.EXITED
-    assert reloaded_terminal.exit_code == 0
-
-
-# ---------------------------------------------------------------------------
-# Task 8125: the pid sweeps judge the launcher by its identity
-# ---------------------------------------------------------------------------
-
-def _launcher_slug(variant: IdentityVariant) -> str:
-    return f'launcher-{variant}'
-
-
-_UNQUALIFIED = 'launcher-unqualified'
-_ELSEWHERE = _launcher_slug(IdentityVariant.OTHER_HOST)
-_JUDGED_DEAD = {_launcher_slug(v) for v in IdentityVariant if v.judged_dead}
-_JUDGED_KEPT = {_launcher_slug(v) for v in IdentityVariant if not v.judged_dead} | {_UNQUALIFIED}
-
-
-def _launcher_identities() -> dict[str, ProcessIdentity | None]:
-    """One record slug per identity, all naming this live test process: only the identity can make one dead."""
-    return {_launcher_slug(v): own_identity(v) for v in IdentityVariant} | {_UNQUALIFIED: None}
-
-
-def _seed_stale_launchers(root: Path) -> None:
-    for slug, identity in _launcher_identities().items():
-        record = make_record(
-            session_slug=slug,
-            status=session_records.Status.RUNNING,
-            launcher_pid=os.getpid(),
-            launcher_identity=identity,
-        )
-        session_records.write_record(record, root=root)
-        set_mtime(
-            session_records.record_path_for_slug(slug, root=root),
-            _NOW,
-            sr.NON_TERMINAL_HEARTBEAT_TTL + timedelta(minutes=1),
-        )
-
-
-def _logged_other_host_skip(caplog: pytest.LogCaptureFixture, sweep: str, subject: str) -> bool:
-    return any(
-        sweep in r.getMessage() and subject in r.getMessage() and 'reason=other_host' in r.getMessage()
-        for r in caplog.records
-        if r.name == sr.__name__ and r.levelno == logging.INFO
-    )
-
-
-class TestPidSweepsJudgeTheLauncherByIdentity:
-    def test_mark_orphaned_marks_exactly_the_launchers_judged_dead(
-        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        _seed_stale_launchers(tmp_path)
-
-        with caplog.at_level(logging.INFO, logger=sr.__name__):
-            marked = sr.mark_orphaned_sessions_exited(root=tmp_path, now=_NOW)
-
-        assert {m.session_slug for m in marked} == _JUDGED_DEAD
-        for slug in _JUDGED_KEPT:
-            assert session_records.read_record(slug, root=tmp_path).status == session_records.Status.RUNNING
-        assert _logged_other_host_skip(caplog, 'mark_orphaned_sessions_exited', _ELSEWHERE)
-
-    def test_reap_stale_records_reaps_exactly_the_launchers_judged_dead(
-        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        _seed_stale_launchers(tmp_path)
-
-        with caplog.at_level(logging.INFO, logger=sr.__name__):
-            reaped = sr.reap_stale_records(root=tmp_path, now=_NOW)
-
-        assert {r.session_slug: r.reason for r in reaped} == dict.fromkeys(
-            _JUDGED_DEAD, 'stale_pid'
-        )
-        for slug in _JUDGED_KEPT:
-            assert session_records.record_path_for_slug(slug, root=tmp_path).is_file()
-        assert _logged_other_host_skip(caplog, 'reap_stale_records', _ELSEWHERE)
-
-
-# ---------------------------------------------------------------------------
-# Task 2934 step-1/2: _normalize_wm_window_id (decimal-vs-hex canonicalization)
-# ---------------------------------------------------------------------------
-
-
-def test_normalize_wm_window_id_decimal_and_padded_hex_collapse_to_same_canonical() -> None:
-    assert sr._normalize_wm_window_id('0x0000001a') == '0x1a'
-    assert sr._normalize_wm_window_id('26') == '0x1a'
-    # The crux: a decimal-captured id and a zero-padded-hex wmctrl id for the
-    # SAME window must compare equal after normalization.
-    assert sr._normalize_wm_window_id('26') == sr._normalize_wm_window_id('0x0000001a')
-
-
-def test_normalize_wm_window_id_already_canonical_round_trips() -> None:
-    assert sr._normalize_wm_window_id('0x1a') == '0x1a'
-
-
-@pytest.mark.parametrize(
-    'raw',
-    [None, '', '   ', '0xZZ', 'nope', '-1'],
-    ids=['none', 'empty', 'whitespace', 'unparseable-hex', 'unparseable-decimal', 'negative'],
-)
-def test_normalize_wm_window_id_unparseable_or_negative_returns_none(raw: str | None) -> None:
-    assert sr._normalize_wm_window_id(raw) is None
-
-
-# ---------------------------------------------------------------------------
-# Task 2934 step-3/4: _wmctrl_live_window_ids (single-probe live-window-id set)
-# ---------------------------------------------------------------------------
-
-
-def _fake_wmctrl_run(
-    stdout_lines: list[str], returncode: int = 0
-) -> Callable[[list[str]], subprocess.CompletedProcess[str]]:
-    """Build a fake ``run`` callable returning a canned ``wmctrl -l`` result."""
-
-    def _run(argv: list[str]) -> subprocess.CompletedProcess[str]:
-        return subprocess.CompletedProcess(
-            argv, returncode=returncode, stdout='\n'.join(stdout_lines)
-        )
-
-    return _run
-
-
-def test_wmctrl_live_window_ids_rc0_multiline_returns_normalized_set() -> None:
-    run = _fake_wmctrl_run(
-        [
-            '0x0000001a  0 host  first window title',
-            '0x2b 1 host second-window-title',
-        ]
-    )
-    assert sr._wmctrl_live_window_ids(run) == {'0x1a', '0x2b'}
-
-
-def test_wmctrl_live_window_ids_collapses_mixed_casing_and_padding() -> None:
-    run = _fake_wmctrl_run(['0X0000002B  0 host  some window'])
-    assert sr._wmctrl_live_window_ids(run) == {'0x2b'}
-
-
-def test_wmctrl_live_window_ids_rc0_empty_stdout_returns_empty_set_not_none() -> None:
-    run = _fake_wmctrl_run([])
-    result = sr._wmctrl_live_window_ids(run)
-    assert result == set()
-    assert result is not None
-
-
-def test_wmctrl_live_window_ids_rc127_missing_binary_returns_none() -> None:
-    run = _fake_wmctrl_run(['0x1a  0 host  irrelevant'], returncode=127)
-    assert sr._wmctrl_live_window_ids(run) is None
-
-
-def test_wmctrl_live_window_ids_rc124_transient_timeout_returns_none() -> None:
-    run = _fake_wmctrl_run(['0x1a  0 host  irrelevant'], returncode=124)
-    assert sr._wmctrl_live_window_ids(run) is None
-
-
-def test_wmctrl_live_window_ids_other_nonzero_rc_returns_none() -> None:
-    run = _fake_wmctrl_run(['0x1a  0 host  irrelevant'], returncode=1)
-    assert sr._wmctrl_live_window_ids(run) is None
-
-
-def test_wmctrl_live_window_ids_run_raising_returns_none() -> None:
-    def _boom(argv: list[str]) -> subprocess.CompletedProcess[str]:
-        raise OSError('wmctrl exploded')
-
-    assert sr._wmctrl_live_window_ids(_boom) is None
-
-
-def test_wmctrl_live_window_ids_titleless_short_line_still_contributes_id() -> None:
-    # No desktop/host/title columns -- id-only leniency: a reaper must fail
-    # toward keeping live sessions, so column-0-only lines still count.
-    run = _fake_wmctrl_run(['0x3c'])
-    assert sr._wmctrl_live_window_ids(run) == {'0x3c'}
-
-
-# ---------------------------------------------------------------------------
-# Task 2934 step-5/6: mark_windowless_wm_sessions_exited (happy path)
-# ---------------------------------------------------------------------------
-
-
-def test_mark_windowless_marks_wm_record_whose_window_id_is_absent(tmp_path: Path) -> None:
-    r = make_record(
-        session_slug='windowless-1',
-        status=session_records.Status.AWAITING_INPUT,
-        display=session_records.Display(kind='wm', wm_title='some title', wm_window_id='0x1a'),
-    )
-    session_records.write_record(r, root=tmp_path)
-    run = _fake_wmctrl_run(['0x0000ff99  0 host  some other window'])
-
-    marked = sr.mark_windowless_wm_sessions_exited(root=tmp_path, run=run)
-
-    assert {m.session_slug for m in marked} == {'windowless-1'}
-    record_path = session_records.record_path_for_slug('windowless-1', root=tmp_path)
-    assert record_path.parent.is_dir()  # marked, NOT deleted
-    assert record_path.is_file()
-    reloaded = session_records.read_record('windowless-1', root=tmp_path)
-    assert reloaded.status == session_records.Status.EXITED
-    assert reloaded.exit_code == sr.ORPHAN_EXIT_CODE
-
-
-def test_mark_windowless_keeps_decimal_captured_id_matching_padded_hex_live_window(
-    tmp_path: Path,
-) -> None:
-    # DECIMAL-vs-hex KEEP: '26' (decimal) is the SAME window as the live,
-    # zero-padded-hex '0x0000001a' wmctrl reports -- must NOT be reaped.
-    r = make_record(
-        session_slug='decimal-kept',
-        status=session_records.Status.RUNNING,
-        display=session_records.Display(kind='wm', wm_title='t', wm_window_id='26'),
-    )
-    session_records.write_record(r, root=tmp_path)
-    run = _fake_wmctrl_run(['0x0000001a  0 host  live window'])
-
-    marked = sr.mark_windowless_wm_sessions_exited(root=tmp_path, run=run)
-
-    assert marked == []
-    assert session_records.read_record('decimal-kept', root=tmp_path).status == session_records.Status.RUNNING
-
-
-def test_mark_windowless_preserves_all_other_fields(tmp_path: Path) -> None:
-    r = make_record(
-        session_slug='windowless-fields',
-        status=session_records.Status.IDLE,
-        role='unblock',
-        project='df',
-        task_id='2085',
-        launcher_pid=os.getpid(),
-        start_ts='2026-07-07T00:00:00+00:00',
-        display=session_records.Display(kind='wm', wm_title='t', wm_window_id='0x1a'),
-    )
-    session_records.write_record(r, root=tmp_path)
-    run = _fake_wmctrl_run(['0x99  0 host  other window'])
-
-    sr.mark_windowless_wm_sessions_exited(root=tmp_path, run=run)
-
-    reloaded = session_records.read_record('windowless-fields', root=tmp_path)
-    assert reloaded.status == session_records.Status.EXITED
-    assert reloaded.exit_code == sr.ORPHAN_EXIT_CODE
-    assert reloaded.role == 'unblock'
-    assert reloaded.project == 'df'
-    assert reloaded.task_id == '2085'
-    assert reloaded.launcher_pid == os.getpid()
-    assert reloaded.start_ts == '2026-07-07T00:00:00+00:00'
-
-
-# ---------------------------------------------------------------------------
-# Task 2934 step-7/8: mark_windowless_wm_sessions_exited fail-soft, scope,
-# and pid/age-independence
-# ---------------------------------------------------------------------------
-
-
-def test_mark_windowless_fail_soft_when_wmctrl_unavailable(tmp_path: Path) -> None:
-    r = make_record(
-        session_slug='no-wmctrl',
-        status=session_records.Status.AWAITING_INPUT,
-        display=session_records.Display(kind='wm', wm_title='t', wm_window_id='0x1a'),
-    )
-    session_records.write_record(r, root=tmp_path)
-    run = _fake_wmctrl_run([], returncode=127)  # missing binary -- no window evidence
-
-    marked = sr.mark_windowless_wm_sessions_exited(root=tmp_path, run=run)
-
-    assert marked == []
-    # A headless run reaps NOTHING, even though this record's window would
-    # (if we could prove it) be gone -- "no evidence" != "window gone".
-    assert session_records.read_record('no-wmctrl', root=tmp_path).status == session_records.Status.AWAITING_INPUT
-
-
-def test_mark_windowless_never_touches_tmux_display(tmp_path: Path) -> None:
-    r = make_record(
-        session_slug='tmux-session',
-        status=session_records.Status.RUNNING,
-        display=session_records.Display(kind='tmux', wm_title='', wm_window_id=None, tmux_target='fleet-df:2'),
-    )
-    session_records.write_record(r, root=tmp_path)
-    run = _fake_wmctrl_run(['0x99  0 host  unrelated'])
-
-    marked = sr.mark_windowless_wm_sessions_exited(root=tmp_path, run=run)
-
-    assert marked == []
-    assert session_records.read_record('tmux-session', root=tmp_path).status == session_records.Status.RUNNING
-
-
-def test_mark_windowless_never_touches_displayless_record(tmp_path: Path) -> None:
-    r = make_record(session_slug='headless', status=session_records.Status.RUNNING, display=None)
-    session_records.write_record(r, root=tmp_path)
-    run = _fake_wmctrl_run(['0x99  0 host  unrelated'])
-
-    marked = sr.mark_windowless_wm_sessions_exited(root=tmp_path, run=run)
-
-    assert marked == []
-    assert session_records.read_record('headless', root=tmp_path).status == session_records.Status.RUNNING
-
-
-def test_mark_windowless_leaves_already_terminal_wm_record_untouched(tmp_path: Path) -> None:
-    r = make_record(
-        session_slug='already-exited-wm',
-        status=session_records.Status.EXITED,
-        exit_code=0,
-        display=session_records.Display(kind='wm', wm_title='t', wm_window_id='0x1a'),
-    )
-    session_records.write_record(r, root=tmp_path)
-    run = _fake_wmctrl_run(['0x99  0 host  unrelated'])  # window gone, but already terminal
-
-    marked = sr.mark_windowless_wm_sessions_exited(root=tmp_path, run=run)
-
-    assert marked == []
-    reloaded = session_records.read_record('already-exited-wm', root=tmp_path)
-    assert reloaded.status == session_records.Status.EXITED
-    assert reloaded.exit_code == 0  # NOT re-stamped with ORPHAN_EXIT_CODE
-
-
-@pytest.mark.parametrize(
-    'wm_window_id', [None, '0xZZ', 'nope'], ids=['none', 'unparseable-hex', 'unparseable-decimal']
-)
-def test_mark_windowless_skips_unparseable_or_missing_window_id(
-    wm_window_id: str | None, tmp_path: Path
-) -> None:
-    r = make_record(
-        session_slug='no-id',
-        status=session_records.Status.RUNNING,
-        display=session_records.Display(kind='wm', wm_title='t', wm_window_id=wm_window_id),
-    )
-    session_records.write_record(r, root=tmp_path)
-    run = _fake_wmctrl_run(['0x99  0 host  unrelated'])
-
-    marked = sr.mark_windowless_wm_sessions_exited(root=tmp_path, run=run)
-
-    assert marked == []
-    assert session_records.read_record('no-id', root=tmp_path).status == session_records.Status.RUNNING
-
-
-def test_mark_windowless_reaps_regardless_of_live_pid_and_fresh_age(tmp_path: Path) -> None:
-    """THE CRUX: window-gone is definitive death evidence, independent of
-    launcher_pid liveness or record age -- proving this sweep reaps exactly
-    the zombies mark_orphaned_sessions_exited's pid/TTL guards currently keep.
-    """
-    r = make_record(
-        session_slug='live-pid-fresh-but-windowless',
-        status=session_records.Status.AWAITING_INPUT,
-        launcher_pid=os.getpid(),  # ALIVE
-        display=session_records.Display(kind='wm', wm_title='t', wm_window_id='0x1a'),
-    )
-    session_records.write_record(r, root=tmp_path)
-    record_path = session_records.record_path_for_slug('live-pid-fresh-but-windowless', root=tmp_path)
-    set_mtime(record_path, _NOW, timedelta(minutes=1))  # far under NON_TERMINAL_HEARTBEAT_TTL
-    run = _fake_wmctrl_run(['0x99  0 host  unrelated'])
-
-    marked = sr.mark_windowless_wm_sessions_exited(root=tmp_path, run=run)
-
-    assert {m.session_slug for m in marked} == {'live-pid-fresh-but-windowless'}
-    reloaded = session_records.read_record('live-pid-fresh-but-windowless', root=tmp_path)
-    assert reloaded.status == session_records.Status.EXITED
-    assert reloaded.exit_code == sr.ORPHAN_EXIT_CODE
-
-
-def test_mark_windowless_handles_mixed_population_in_one_sweep(tmp_path: Path) -> None:
-    windowless_wm = make_record(
-        session_slug='mix-windowless',
-        status=session_records.Status.RUNNING,
-        display=session_records.Display(kind='wm', wm_title='t', wm_window_id='0x1a'),
-    )
-    present_window_wm = make_record(
-        session_slug='mix-present',
-        status=session_records.Status.RUNNING,
-        display=session_records.Display(kind='wm', wm_title='t2', wm_window_id='0x99'),
-    )
-    tmux_session = make_record(
-        session_slug='mix-tmux',
-        status=session_records.Status.RUNNING,
-        display=session_records.Display(kind='tmux', wm_title='', wm_window_id=None, tmux_target='fleet-df:2'),
-    )
-    headless = make_record(session_slug='mix-headless', status=session_records.Status.RUNNING, display=None)
-    terminal_wm = make_record(
-        session_slug='mix-terminal',
-        status=session_records.Status.EXITED,
-        exit_code=0,
-        display=session_records.Display(kind='wm', wm_title='t3', wm_window_id='0x1a'),
-    )
-    for r in (windowless_wm, present_window_wm, tmux_session, headless, terminal_wm):
-        session_records.write_record(r, root=tmp_path)
-
-    run = _fake_wmctrl_run(['0x99  0 host  still-open'])
-
-    marked = sr.mark_windowless_wm_sessions_exited(root=tmp_path, run=run)
-
-    assert {m.session_slug for m in marked} == {'mix-windowless'}
-    assert session_records.read_record('mix-windowless', root=tmp_path).status == session_records.Status.EXITED
-    assert session_records.read_record('mix-present', root=tmp_path).status == session_records.Status.RUNNING
-    assert session_records.read_record('mix-tmux', root=tmp_path).status == session_records.Status.RUNNING
-    assert session_records.read_record('mix-headless', root=tmp_path).status == session_records.Status.RUNNING
-    reloaded_terminal = session_records.read_record('mix-terminal', root=tmp_path)
-    assert reloaded_terminal.status == session_records.Status.EXITED
-    assert reloaded_terminal.exit_code == 0
-
-
-def _call_indexed_wmctrl_run(
-    *results: tuple[int, str],
-    on_call: Mapping[int, Callable[[], None]] | None = None,
-) -> Callable[[list[str]], subprocess.CompletedProcess[str]]:
-    """A fake ``run`` answering call N with ``results[N]``, repeating the last thereafter.
-
-    ``on_call[N]`` runs inside call N, before it answers -- the hook a test
-    uses to land a record write just after one of the sweep's probes.
-    """
-    calls = 0
-
-    def _run(argv: list[str]) -> subprocess.CompletedProcess[str]:
-        nonlocal calls
-        if on_call is not None and calls in on_call:
-            on_call[calls]()
-        returncode, stdout = results[min(calls, len(results) - 1)]
-        calls += 1
-        return subprocess.CompletedProcess(argv, returncode=returncode, stdout=stdout)
-
-    return _run
-
-
-def test_mark_windowless_keeps_a_window_that_appears_after_the_first_probe(
-    tmp_path: Path,
-) -> None:
-    def _set_display_lands() -> None:
-        session_records.write_record(
-            make_record(
-                session_slug='late-window',
-                status=session_records.Status.RUNNING,
-                display=session_records.Display(kind='wm', wm_title='t', wm_window_id='0x1a'),
-            ),
-            root=tmp_path,
-        )
-
-    run = _call_indexed_wmctrl_run(
-        (0, '0x99  0 host  other\n'),
-        (0, '0x1a  0 host  late\n0x99  0 host  other\n'),
-        on_call={0: _set_display_lands},
-    )
-
-    marked = sr.mark_windowless_wm_sessions_exited(root=tmp_path, run=run)
-
-    assert 'late-window' not in {m.session_slug for m in marked}
-    assert session_records.read_record('late-window', root=tmp_path).status == session_records.Status.RUNNING
-
-
-def test_mark_windowless_marks_nothing_when_the_confirming_probe_fails(tmp_path: Path) -> None:
-    session_records.write_record(
-        make_record(
-            session_slug='unconfirmed',
-            status=session_records.Status.RUNNING,
-            display=session_records.Display(kind='wm', wm_title='t', wm_window_id='0x1a'),
-        ),
-        root=tmp_path,
-    )
-    run = _call_indexed_wmctrl_run((0, '0x99  0 host  other\n'), (127, ''))
-
-    marked = sr.mark_windowless_wm_sessions_exited(root=tmp_path, run=run)
-
-    assert marked == []
-    reloaded = session_records.read_record('unconfirmed', root=tmp_path)
-    assert reloaded.status == session_records.Status.RUNNING
-    assert reloaded.exit_code is None
-
-
-def test_mark_windowless_leaves_a_record_rebound_to_a_live_window_after_the_pass(
-    tmp_path: Path,
-) -> None:
-    def _write_wm_record(window_id: str) -> None:
-        session_records.write_record(
-            make_record(
-                session_slug='rebound',
-                status=session_records.Status.RUNNING,
-                display=session_records.Display(kind='wm', wm_title='t', wm_window_id=window_id),
-            ),
-            root=tmp_path,
-        )
-
-    _write_wm_record('0x1a')
-    run = _call_indexed_wmctrl_run(
-        (0, '0x99  0 host  other\n'),
-        (0, '0x2b  0 host  resumed\n0x99  0 host  other\n'),
-        on_call={1: lambda: _write_wm_record('0x2b')},
-    )
-
-    marked = sr.mark_windowless_wm_sessions_exited(root=tmp_path, run=run)
-
-    assert marked == []
-    reloaded = session_records.read_record('rebound', root=tmp_path)
-    assert reloaded.status == session_records.Status.RUNNING
-    assert reloaded.display is not None
-    assert reloaded.display.wm_window_id == '0x2b'
 
 
 # ---------------------------------------------------------------------------
@@ -1288,14 +449,14 @@ def test_launching_returns_while_a_reap_holds_the_lock_and_its_detached_reap_dra
     set_mtime(
         session_records.record_path_for_slug('orphan-o', root=tmp_path),
         datetime.now(UTC),
-        sr.NON_TERMINAL_HEARTBEAT_TTL + timedelta(minutes=1),
+        session_reaper.NON_TERMINAL_HEARTBEAT_TTL + timedelta(minutes=1),
     )
     _write_aged_exited('old-terminal', tmp_path)
     env = {k: v for k, v in os.environ.items() if not k.startswith('CLAUDE_SPAWN_')}
     env.update(_launching_env(tmp_path))
     slug = session_records.build_session_slug('unblock', 'df', '2085', 4242)
 
-    with sr.reap_lock(tmp_path):
+    with session_reaper.reap_lock(tmp_path):
         result = subprocess.run(
             [sys.executable, str(Path(sr.__file__).resolve()), 'launching'],
             env=env,
@@ -1313,7 +474,7 @@ def test_launching_returns_while_a_reap_holds_the_lock_and_its_detached_reap_dra
     await_reap_report(tmp_path)
     orphan = session_records.read_record('orphan-o', root=tmp_path)
     assert orphan.status == session_records.Status.EXITED
-    assert orphan.exit_code == sr.ORPHAN_EXIT_CODE
+    assert orphan.exit_code == session_reaper.ORPHAN_EXIT_CODE
     assert not (session_records.sessions_dir(root=tmp_path) / 'old-terminal').exists()
 
 
@@ -1344,7 +505,7 @@ def test_launchings_detached_reap_leaves_the_callers_cwd_and_drains_its_relative
     env.update(_launching_env(fleet))
     env['CLAUDE_FLEET_ROOT'] = 'fleet'
 
-    with sr.reap_lock(fleet):
+    with session_reaper.reap_lock(fleet):
         result = subprocess.run(
             [sys.executable, str(Path(sr.__file__).resolve()), 'launching'],
             cwd=worktree,
@@ -1394,7 +555,7 @@ def test_main_reap_marks_then_deletes(
     set_mtime(
         session_records.record_path_for_slug('fresh-orphan', root=tmp_path),
         datetime.now(UTC),
-        sr.NON_TERMINAL_HEARTBEAT_TTL + timedelta(minutes=1),
+        session_reaper.NON_TERMINAL_HEARTBEAT_TTL + timedelta(minutes=1),
     )
 
     # A separately-aged terminal record, well past TERMINAL_TTL -- this pass
@@ -1406,7 +567,7 @@ def test_main_reap_marks_then_deletes(
     set_mtime(
         session_records.record_path_for_slug('old-terminal', root=tmp_path),
         datetime.now(UTC),
-        sr.TERMINAL_TTL + timedelta(hours=1),
+        session_reaper.TERMINAL_TTL + timedelta(hours=1),
     )
 
     rc = sr.main(['reap'])
@@ -1416,7 +577,7 @@ def test_main_reap_marks_then_deletes(
     assert fresh_dir.is_dir()  # marked, NOT deleted, this pass
     fresh_reloaded = session_records.read_record('fresh-orphan', root=tmp_path)
     assert fresh_reloaded.status == session_records.Status.EXITED
-    assert fresh_reloaded.exit_code == sr.ORPHAN_EXIT_CODE
+    assert fresh_reloaded.exit_code == session_reaper.ORPHAN_EXIT_CODE
 
     assert not session_records.record_path_for_slug('old-terminal', root=tmp_path).parent.exists()
 
@@ -1428,7 +589,7 @@ def _write_aged_exited(slug: str, root: Path) -> None:
     set_mtime(
         session_records.record_path_for_slug(slug, root=root),
         datetime.now(UTC),
-        sr.TERMINAL_TTL + timedelta(hours=1),
+        session_reaper.TERMINAL_TTL + timedelta(hours=1),
     )
 
 
@@ -1448,7 +609,7 @@ def test_main_reap_drains_every_eligible_record_in_one_call(
     set_mtime(
         session_records.record_path_for_slug('drain-orphan', root=tmp_path),
         datetime.now(UTC),
-        sr.NON_TERMINAL_HEARTBEAT_TTL + timedelta(minutes=1),
+        session_reaper.NON_TERMINAL_HEARTBEAT_TTL + timedelta(minutes=1),
     )
 
     rc = sr.main(['reap'])
@@ -1458,9 +619,9 @@ def test_main_reap_drains_every_eligible_record_in_one_call(
         assert not (session_records.sessions_dir(root=tmp_path) / slug).exists()
     orphan = session_records.read_record('drain-orphan', root=tmp_path)
     assert orphan.status == session_records.Status.EXITED
-    assert orphan.exit_code == sr.ORPHAN_EXIT_CODE
+    assert orphan.exit_code == session_reaper.ORPHAN_EXIT_CODE
 
-    report_path = sr.reap_report_path(tmp_path)
+    report_path = session_reaper.reap_report_path(tmp_path)
     assert report_path.is_file()
     report = json.loads(report_path.read_text())
     requested_at = datetime.fromisoformat(report['requested_at'])
@@ -1494,14 +655,14 @@ def test_main_reap_runs_later_phases_when_one_phase_raises(
     def _boom(*_args: object, **_kwargs: object) -> list[session_records.SessionRecord]:
         raise OSError('mark phase on fire')
 
-    monkeypatch.setattr(sr, 'mark_orphaned_sessions_exited', _boom)
+    monkeypatch.setattr(session_reaper, 'mark_orphaned_sessions_exited', _boom)
     _write_aged_exited('aged-despite-fault', tmp_path)
 
     rc = sr.main(['reap'])
 
     assert rc == 0
     assert not (session_records.sessions_dir(root=tmp_path) / 'aged-despite-fault').exists()
-    phases = json.loads(sr.reap_report_path(tmp_path).read_text())['phases']
+    phases = json.loads(session_reaper.reap_report_path(tmp_path).read_text())['phases']
     [failed] = [phase for phase in phases if phase['name'] == 'mark_orphaned_sessions_exited']
     assert 'OSError' in failed['error']
     assert failed['count'] is None
@@ -1509,7 +670,7 @@ def test_main_reap_runs_later_phases_when_one_phase_raises(
 
 def _write_report_started(root: Path, started_at: datetime) -> str:
     report = json.dumps({'started_at': started_at.isoformat()})
-    sr.reap_report_path(root).write_text(report)
+    session_reaper.reap_report_path(root).write_text(report)
     return report
 
 
@@ -1525,32 +686,13 @@ def test_main_reap_skips_only_when_a_reap_started_after_it_was_requested(
     assert sr.main(['reap']) == 0
 
     assert (session_records.sessions_dir(root=tmp_path) / 'aged').is_dir()
-    assert sr.reap_report_path(tmp_path).read_text() == later
+    assert session_reaper.reap_report_path(tmp_path).read_text() == later
 
     _write_report_started(tmp_path, datetime.now(UTC) - timedelta(hours=1))
 
     assert sr.main(['reap']) == 0
 
     assert not (session_records.sessions_dir(root=tmp_path) / 'aged').exists()
-
-
-def test_reap_lock_is_a_stable_sidecar_under_the_fleet_root(tmp_path: Path) -> None:
-    lock_path = sr.reap_lock_path(tmp_path)
-    with sr.reap_lock(tmp_path):
-        assert lock_path.is_file()
-        assert lock_path.parent == tmp_path
-    assert lock_path.is_file()
-
-
-def test_reap_lock_excludes_another_holder_until_released(tmp_path: Path) -> None:
-    sr.reap_lock_path(tmp_path).touch()
-    fd = os.open(sr.reap_lock_path(tmp_path), os.O_RDWR)
-    try:
-        with sr.reap_lock(tmp_path), pytest.raises(BlockingIOError):
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    finally:
-        os.close(fd)
 
 
 # ---------------------------------------------------------------------------
@@ -1570,13 +712,12 @@ def test_main_reap_marks_windowless_wm_session_before_deleting(
         display=session_records.Display(kind='wm', wm_title='t', wm_window_id='0x1a'),
     )
     session_records.write_record(windowless, root=tmp_path)
-
-    def _fake_wmctrl_list(argv: list[str]) -> subprocess.CompletedProcess[str]:
-        return subprocess.CompletedProcess(
-            argv, returncode=0, stdout='0x99  0 host  still-open window\n'
-        )
-
-    monkeypatch.setattr(sr, '_wmctrl_list', _fake_wmctrl_list)
+    bin_dir = tmp_path / 'bin'
+    bin_dir.mkdir()
+    wmctrl = bin_dir / 'wmctrl'
+    wmctrl.write_text("#!/bin/sh\nprintf '0x99  0 host  still-open window\\n'\n")
+    wmctrl.chmod(0o755)
+    monkeypatch.setenv('PATH', f'{bin_dir}{os.pathsep}{os.environ["PATH"]}')
 
     rc = sr.main(['reap'])
 
@@ -1587,9 +728,7 @@ def test_main_reap_marks_windowless_wm_session_before_deleting(
     assert reloaded_dir.is_dir()
     reloaded = session_records.read_record('reap-windowless', root=tmp_path)
     assert reloaded.status == session_records.Status.EXITED
-    assert reloaded.exit_code == sr.ORPHAN_EXIT_CODE
-
-
+    assert reloaded.exit_code == session_reaper.ORPHAN_EXIT_CODE
 
 
 # ---------------------------------------------------------------------------
@@ -2760,6 +1899,23 @@ _BARE_SHELL_ENTRYPOINTS: tuple[_BareShellEntrypoint, ...] = (
         ),
     ),
     _BareShellEntrypoint(
+        name='session_reaper.py (tier-1: bare shell, NO PYTHONPATH)',
+        path=_SR_PKG_ROOT / 'orchestrator' / 'session_reaper.py',
+        pythonpath=(),
+        shape=_EntrypointShape.SCRIPT,
+        argv=(),
+        probe='from orchestrator import stop_instruction',
+        callers=(
+            'session_registry.py imports this module at module scope as a bare '
+            'sibling and runs the reap verb, and the detached reap every launching '
+            'starts, through it when skills/spawn/spawn-claude.sh and the SKILL.md '
+            'verb lines run session_registry.py by absolute path with no venv, no '
+            'install and no PYTHONPATH. A non-stdlib import here breaks every '
+            'registry verb, and with it every spawn; spawn_t3_lane imports '
+            'orchestrator.session_reaper for its thread sweeps too.'
+        ),
+    ),
+    _BareShellEntrypoint(
         name='session_hooks.py (tier-2: bare shell + PYTHONPATH)',
         path=_SR_PKG_ROOT / 'orchestrator' / 'session_hooks.py',
         # A THIRD distinct shape: script-by-absolute-path WITH PYTHONPATH. Not
@@ -2897,6 +2053,8 @@ _MUST_BE_REJECTED: tuple[tuple[str, str], ...] = (
     ('session_leases.py', 'from orchestrator import stop_instruction'),
     ('session_windows.py', 'import pydantic'),
     ('session_windows.py', 'from orchestrator import stop_instruction'),
+    ('session_reaper.py', 'import pydantic'),
+    ('session_reaper.py', 'from orchestrator import stop_instruction'),
 )
 
 
@@ -3131,14 +2289,15 @@ def _first_bare_importable_sibling(probes: _BareShellProbes) -> str | None:
 
 #: The line a payload is injected after, per entrypoint; any other entrypoint
 #: uses ``from __future__ import annotations``.  session_registry's,
-#: session_records', decision_registry's and decision_cli's payloads go after
-#: their last shared import, so each is judged with the module's own shared/src
-#: bootstrap already applied: that is the environment a later module-scope
-#: import in that file really runs in.
+#: session_records', session_leases', session_reaper's, decision_registry's and
+#: decision_cli's payloads go after their last shared import, so each is judged
+#: with the module's own shared/src bootstrap already applied: that is the
+#: environment a later module-scope import in that file really runs in.
 _INJECTION_ANCHORS: dict[str, str] = {
     'session_registry.py': 'from shared.session_liveness import ',
     'session_records.py': 'from shared.process_identity import ',
     'session_leases.py': 'from shared.proc_liveness import ',
+    'session_reaper.py': 'from shared.session_liveness import ',
     'decision_registry.py': 'from shared.project_id import ',
     'decision_cli.py': 'from shared.project_id import ',
 }
@@ -3245,7 +2404,8 @@ class TestStdlibOnlySelfContainment:
 
     (a) bare-shell executability — ``session_registry``, ``fleet_files``,
         ``decision_registry``, ``decision_cli``, ``session_identity``,
-        ``session_records``, ``session_hooks``, ``session_ownership_probes``,
+        ``session_records``, ``session_leases``, ``session_windows``,
+        ``session_reaper``, ``session_hooks``, ``session_ownership_probes``,
         ``session_self_exit``;
     (b) layering / cycle avoidance — ``routing``, ``stop_instruction``,
         ``fm_retry``, ``agents/triage``, ``fused_memory/config``/``schema``,
@@ -3463,8 +2623,9 @@ class TestStdlibOnlySelfContainment:
 
         fleet_files <- decision_registry <- decision_cli; session_identity and
         session_windows are leaves; fleet_files, session_identity <-
-        session_records; and fleet_files, session_identity, session_records <-
-        session_leases.
+        session_records; fleet_files, session_identity, session_records <-
+        session_leases; and fleet_files, session_records, session_windows <-
+        session_reaper.
 
         Under tier-1 session_registry is ``__main__``, so a module below it
         that imported it back would silently load a second copy rather than
@@ -3504,11 +2665,14 @@ class TestStdlibOnlySelfContainment:
             'session_records': {'fleet_files', 'session_identity'},
             'session_leases': {'fleet_files', 'session_identity', 'session_records'},
             'session_windows': set(),
+            'session_reaper': {'fleet_files', 'session_records', 'session_windows'},
         }
 
         assert {module: sibling_imports(module) for module in expected} == expected
 
-    @pytest.mark.parametrize('extracted', ['session_identity', 'session_leases', 'session_records'])
+    @pytest.mark.parametrize(
+        'extracted', ['session_identity', 'session_leases', 'session_reaper', 'session_records', 'session_windows']
+    )
     def test_no_extracted_name_is_re_exported_from_session_registry(self, extracted):
         """A name moved out of session_registry no longer resolves through it.
 
@@ -3540,9 +2704,9 @@ class TestStdlibOnlySelfContainment:
                 'session_registry.py',
                 (
                     'decision_cli', 'decision_registry', 'fleet_files', 'session_identity',
-                    'session_leases', 'session_records',
+                    'session_leases', 'session_reaper', 'session_records', 'session_windows',
                 ),
-                ('decision_cli', 'session_identity', 'session_leases', 'session_records'),
+                ('decision_cli', 'session_identity', 'session_leases', 'session_reaper', 'session_records'),
                 id='session_registry',
             ),
             pytest.param(
@@ -3815,49 +2979,6 @@ class TestClaudeSessionPointers:
         assert not session_records.write_claude_session_pointer(_SID, '..', root=tmp_path)
         assert not session_records.write_claude_session_pointer(_SID, 'a/b', root=tmp_path)
 
-    def test_reap_removes_pointers_no_record_vouches_for(self, tmp_path: Path) -> None:
-        _bound_record(tmp_path, 'vouched', _SID)
-        _bound_record(tmp_path, 'rebound', 'newer-session')
-        session_records.write_claude_session_pointer(_SID, 'vouched', root=tmp_path)
-        session_records.write_claude_session_pointer('old-session', 'rebound', root=tmp_path)
-        session_records.write_claude_session_pointer('orphan-session', 'gone-record', root=tmp_path)
-        pointers = session_records.claude_session_pointers_dir(tmp_path)
-        (pointers / 'bad name').write_text('vouched')
-        fresh_temp = pointers / f'inflight{fleet_files.ATOMIC_WRITE_TEMP_SUFFIX}'
-        fresh_temp.write_text('vouched')
-
-        removed = sr.reap_stale_session_pointers(root=tmp_path)
-
-        assert {path.name for path in removed} == {'old-session', 'orphan-session', 'bad name'}
-        assert sorted(path.name for path in pointers.iterdir()) == sorted([_SID, fresh_temp.name])
-
-
-def _t3_record(
-    tmp_path: Path,
-    slug: str,
-    thread_id: str | None,
-    *,
-    cwd: str,
-    status: session_records.Status = session_records.Status.RUNNING,
-    kind: str = session_records.DisplayKind.T3.value,
-    environment_id: str | None = None,
-    pointer: bool = False,
-) -> None:
-    session_records.write_record(
-        make_record(
-            session_slug=slug,
-            status=status,
-            cwd=cwd,
-            exit_code=None,
-            display=session_records.Display(
-                kind=kind, t3_thread_id=thread_id, t3_environment_id=environment_id
-            ),
-        ),
-        root=tmp_path,
-    )
-    if pointer and thread_id is not None:
-        assert session_records.write_t3_thread_pointer(thread_id, slug, root=tmp_path)
-
 
 _THREAD = '7d1f0c2a-5b3e-4c8d-9a6f-1e2d3c4b5a69'
 _OTHER_THREAD = 'mcp:launch:' + '0f9e8d7c6b5a49388271605f4e3d2c1b' * 2
@@ -3871,7 +2992,7 @@ class TestT3ThreadPointers:
     def test_a_written_pointer_resolves_while_a_live_t3_record_names_the_thread(
         self, tmp_path: Path
     ) -> None:
-        _t3_record(tmp_path, 'session-df-8124-1', _THREAD, cwd=str(tmp_path))
+        write_t3_record(tmp_path, 'session-df-8124-1', _THREAD, cwd=str(tmp_path))
 
         assert session_records.write_t3_thread_pointer(_THREAD, 'session-df-8124-1', root=tmp_path)
         assert session_records.t3_thread_pointer_path(_THREAD, tmp_path).read_text() == 'session-df-8124-1'
@@ -3890,7 +3011,7 @@ class TestT3ThreadPointers:
     def test_a_record_that_does_not_vouch_resolves_none(
         self, tmp_path: Path, thread_id: str, status: session_records.Status, kind: str
     ) -> None:
-        _t3_record(tmp_path, 'held', thread_id, cwd=str(tmp_path), status=status, kind=kind)
+        write_t3_record(tmp_path, 'held', thread_id, cwd=str(tmp_path), status=status, kind=kind)
         session_records.write_t3_thread_pointer(_THREAD, 'held', root=tmp_path)
 
         assert session_records.resolve_session_slug_for_t3_thread(_THREAD, root=tmp_path) is None
@@ -3912,35 +3033,10 @@ class TestT3ThreadPointers:
         assert not session_records.write_t3_thread_pointer(_THREAD, '..', root=tmp_path)
         assert not session_records.write_t3_thread_pointer(_THREAD, 'a/b', root=tmp_path)
 
-    def test_reap_removes_pointers_no_live_t3_record_vouches_for(self, tmp_path: Path) -> None:
-        ended, gone, moved = (
-            '1a2b3c4d-0000-4000-8000-000000000001',
-            '1a2b3c4d-0000-4000-8000-000000000002',
-            '1a2b3c4d-0000-4000-8000-000000000003',
-        )
-        _t3_record(tmp_path, 'live', _THREAD, cwd=str(tmp_path))
-        _t3_record(tmp_path, 'ended', ended, cwd=str(tmp_path), status=session_records.Status.EXITED)
-        _t3_record(tmp_path, 'moved', _OTHER_THREAD, cwd=str(tmp_path))
-        session_records.write_t3_thread_pointer(_THREAD, 'live', root=tmp_path)
-        session_records.write_t3_thread_pointer(ended, 'ended', root=tmp_path)
-        session_records.write_t3_thread_pointer(gone, 'gone-record', root=tmp_path)
-        session_records.write_t3_thread_pointer(moved, 'moved', root=tmp_path)
-        pointers = session_records.t3_thread_pointers_dir(tmp_path)
-        (pointers / 'bad name').write_text('live')
-        fresh_temp = pointers / f'inflight{fleet_files.ATOMIC_WRITE_TEMP_SUFFIX}'
-        fresh_temp.write_text('live')
-
-        removed = sr.reap_stale_session_pointers(root=tmp_path)
-
-        assert {path.name for path in removed} == {ended, gone, moved, 'bad name'}
-        assert sorted(path.name for path in pointers.iterdir()) == sorted(
-            [_THREAD, fresh_temp.name]
-        )
-
     def test_the_exit_verb_drops_the_pointer_naming_the_exited_record(
         self, tmp_path: Path
     ) -> None:
-        _t3_record(tmp_path, 'held', _THREAD, cwd=str(tmp_path))
+        write_t3_record(tmp_path, 'held', _THREAD, cwd=str(tmp_path))
         session_records.write_t3_thread_pointer(_THREAD, 'held', root=tmp_path)
 
         assert sr.main(['exit', '--record', str(session_records.sessions_dir(tmp_path) / 'held'), '--code', '0']) == 0
@@ -3951,8 +3047,8 @@ class TestT3ThreadPointers:
     def test_the_exit_verb_keeps_a_pointer_another_live_record_holds(
         self, tmp_path: Path
     ) -> None:
-        _t3_record(tmp_path, 'holder', _THREAD, cwd=str(tmp_path))
-        _t3_record(tmp_path, 'bystander', _THREAD, cwd=str(tmp_path))
+        write_t3_record(tmp_path, 'holder', _THREAD, cwd=str(tmp_path))
+        write_t3_record(tmp_path, 'bystander', _THREAD, cwd=str(tmp_path))
         session_records.write_t3_thread_pointer(_THREAD, 'holder', root=tmp_path)
 
         sr.main(['exit', '--record', str(session_records.sessions_dir(tmp_path) / 'bystander'), '--code', '0'])
@@ -3963,298 +3059,10 @@ class TestT3ThreadPointers:
     def test_a_failed_to_start_refresh_drops_the_pointer_naming_the_record(
         self, tmp_path: Path
     ) -> None:
-        _t3_record(tmp_path, 'held', _OTHER_THREAD, cwd=str(tmp_path), pointer=True)
+        write_t3_record(tmp_path, 'held', _OTHER_THREAD, cwd=str(tmp_path), pointer=True)
         record_dir = str(session_records.sessions_dir(tmp_path) / 'held')
 
         assert sr.main(['refresh', '--record', record_dir, '--status', 'failed-to-start']) == 0
 
         assert session_records.read_record('held', root=tmp_path).status == session_records.Status.FAILED_TO_START
         assert not session_records.t3_thread_pointer_path(_OTHER_THREAD, tmp_path).exists()
-
-    def test_folding_a_record_drops_the_pointer_naming_it(self, tmp_path: Path) -> None:
-        _t3_record(tmp_path, 'hand', _THREAD, cwd=str(tmp_path))
-        session_records.write_t3_thread_pointer(_THREAD, 'hand', root=tmp_path)
-
-        assert sr.mark_session_folded('hand', root=tmp_path) is not None
-
-        assert not session_records.t3_thread_pointer_path(_THREAD, tmp_path).exists()
-
-
-_ENVIRONMENT = '3f9a1c2e-5b7d-4e8f-9a0b-1c2d3e4f5a6b'
-_GONE_THREAD = '2c4e6a8b-0d1f-4a3c-9e5b-7d9f1b3d5e70'
-
-
-class _ThreadEnded:
-    """A ``thread_ended`` predicate answering *answer* for every thread, recording each thread asked."""
-
-    def __init__(self, answer: bool = True) -> None:
-        self.answer = answer
-        self.calls: list[str] = []
-
-    def __call__(self, thread_id: str) -> bool:
-        self.calls.append(thread_id)
-        return self.answer
-
-
-class TestMarkT3SessionsExited:
-    def test_marks_only_indexed_records_of_this_environment_whose_thread_is_gone(
-        self, tmp_path: Path
-    ) -> None:
-        foreign_thread, unindexed_thread = (
-            '4e6a8c0d-2f1b-4c5e-8a7d-9b1d3f5a7c92',
-            '6a8c0e2f-4b3d-4e7a-8c9f-1d3f5b7d9e14',
-        )
-        cwd = str(tmp_path)
-        _t3_record(tmp_path, 'listed', _THREAD, cwd=cwd, environment_id=_ENVIRONMENT, pointer=True)
-        _t3_record(tmp_path, 'gone', _GONE_THREAD, cwd=cwd, environment_id=_ENVIRONMENT, pointer=True)
-        _t3_record(
-            tmp_path, 'foreign', foreign_thread, cwd=cwd, environment_id='env-elsewhere', pointer=True
-        )
-        _t3_record(tmp_path, 'unindexed', unindexed_thread, cwd=cwd, environment_id=_ENVIRONMENT)
-
-        marked = sr.mark_t3_sessions_exited(
-            _ENVIRONMENT, frozenset({_THREAD}), root=tmp_path, thread_ended=_ThreadEnded()
-        )
-
-        assert marked == ['gone']
-        gone = session_records.read_record('gone', root=tmp_path)
-        assert (gone.status, gone.exit_code) == (session_records.Status.EXITED, sr.ORPHAN_EXIT_CODE)
-        for slug in ('listed', 'foreign', 'unindexed'):
-            assert session_records.read_record(slug, root=tmp_path).status == session_records.Status.RUNNING
-        assert sorted(path.name for path in session_records.t3_thread_pointers_dir(tmp_path).iterdir()) == (
-            sorted([_THREAD, foreign_thread])
-        )
-
-    def test_a_record_with_no_environment_is_this_environments(self, tmp_path: Path) -> None:
-        _t3_record(tmp_path, 'legacy', _GONE_THREAD, cwd=str(tmp_path), pointer=True)
-
-        assert sr.mark_t3_sessions_exited(
-            _ENVIRONMENT, frozenset(), root=tmp_path, thread_ended=_ThreadEnded()
-        ) == ['legacy']
-
-    def test_a_worktree_bound_record_is_marked_whatever_its_cwd(self, tmp_path: Path) -> None:
-        worktree = tmp_path / 'proj' / '.worktrees' / '8124'
-        _t3_record(
-            tmp_path,
-            'worktree-bound',
-            _GONE_THREAD,
-            cwd=str(worktree),
-            environment_id=_ENVIRONMENT,
-            pointer=True,
-        )
-
-        assert sr.mark_t3_sessions_exited(
-            _ENVIRONMENT, frozenset(), root=tmp_path, thread_ended=_ThreadEnded()
-        ) == ['worktree-bound']
-
-    def test_a_record_written_after_the_listing_is_skipped_unasked(self, tmp_path: Path) -> None:
-        _t3_record(tmp_path, 'just-launched', _GONE_THREAD, cwd=str(tmp_path), pointer=True)
-        listed_at = datetime.now(UTC) - timedelta(minutes=1)
-        thread_ended = _ThreadEnded()
-
-        assert (
-            sr.mark_t3_sessions_exited(
-                _ENVIRONMENT,
-                frozenset(),
-                root=tmp_path,
-                listed_at=listed_at,
-                thread_ended=thread_ended,
-            )
-            == []
-        )
-        assert thread_ended.calls == []
-
-    def test_an_unlisted_thread_not_confirmed_ended_keeps_its_record(self, tmp_path: Path) -> None:
-        _t3_record(
-            tmp_path, 'side-chat', _GONE_THREAD, cwd=str(tmp_path), environment_id=_ENVIRONMENT, pointer=True
-        )
-
-        marked = sr.mark_t3_sessions_exited(
-            _ENVIRONMENT, frozenset(), root=tmp_path, thread_ended=_ThreadEnded(answer=False)
-        )
-
-        assert marked == []
-        assert session_records.read_record('side-chat', root=tmp_path).status == session_records.Status.RUNNING
-        assert session_records.resolve_session_slug_for_t3_thread(_GONE_THREAD, root=tmp_path) == 'side-chat'
-
-    def test_only_this_environments_unlisted_indexed_threads_are_confirmed(
-        self, tmp_path: Path
-    ) -> None:
-        foreign_thread, unindexed_thread = (
-            '4e6a8c0d-2f1b-4c5e-8a7d-9b1d3f5a7c92',
-            '6a8c0e2f-4b3d-4e7a-8c9f-1d3f5b7d9e14',
-        )
-        cwd = str(tmp_path)
-        _t3_record(tmp_path, 'listed', _THREAD, cwd=cwd, environment_id=_ENVIRONMENT, pointer=True)
-        _t3_record(tmp_path, 'gone', _GONE_THREAD, cwd=cwd, environment_id=_ENVIRONMENT, pointer=True)
-        _t3_record(
-            tmp_path, 'foreign', foreign_thread, cwd=cwd, environment_id='env-elsewhere', pointer=True
-        )
-        _t3_record(tmp_path, 'unindexed', unindexed_thread, cwd=cwd, environment_id=_ENVIRONMENT)
-        thread_ended = _ThreadEnded()
-
-        sr.mark_t3_sessions_exited(
-            _ENVIRONMENT, frozenset({_THREAD}), root=tmp_path, thread_ended=thread_ended
-        )
-
-        assert thread_ended.calls == [_GONE_THREAD]
-
-    def test_one_info_line_reports_the_index_entries_scanned(
-        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        for slug, thread in (
-            ('listed', _THREAD),
-            ('also-listed', _OTHER_THREAD),
-            ('gone', _GONE_THREAD),
-        ):
-            _t3_record(tmp_path, slug, thread, cwd=str(tmp_path), pointer=True)
-
-        with caplog.at_level(logging.INFO, logger='orchestrator.session_registry'):
-            sr.mark_t3_sessions_exited(
-                _ENVIRONMENT,
-                frozenset({_THREAD, _OTHER_THREAD}),
-                root=tmp_path,
-                thread_ended=_ThreadEnded(),
-            )
-
-        [line] = [
-            record.getMessage().replace(str(tmp_path), '<root>')
-            for record in caplog.records
-            if record.name == 'orchestrator.session_registry'
-            and record.levelno == logging.INFO
-            and 'mark_t3_sessions_exited' in record.getMessage()
-        ]
-        assert re.search(r'\b3\b', line), line
-
-    @pytest.mark.parametrize(
-        ('routine', 'ended', 'level'),
-        [
-            pytest.param(False, False, logging.INFO, id='launch-sweep-marking-nothing'),
-            pytest.param(True, True, logging.INFO, id='routine-sweep-marking-one'),
-            pytest.param(True, False, logging.DEBUG, id='routine-sweep-marking-nothing'),
-        ],
-    )
-    def test_only_a_routine_sweep_that_marks_nothing_logs_its_line_at_debug(
-        self,
-        tmp_path: Path,
-        caplog: pytest.LogCaptureFixture,
-        routine: bool,
-        ended: bool,
-        level: int,
-    ) -> None:
-        _t3_record(tmp_path, 'gone', _GONE_THREAD, cwd=str(tmp_path), pointer=True)
-
-        with caplog.at_level(logging.DEBUG, logger='orchestrator.session_registry'):
-            sr.mark_t3_sessions_exited(
-                _ENVIRONMENT,
-                frozenset(),
-                root=tmp_path,
-                thread_ended=_ThreadEnded(answer=ended),
-                routine=routine,
-            )
-
-        assert [
-            record.levelno
-            for record in caplog.records
-            if record.name == 'orchestrator.session_registry'
-            and record.getMessage().startswith('mark_t3_sessions_exited: marked')
-        ] == [level]
-
-
-class TestT3RecordsAreExemptFromPidSweeps:
-    def _stale_t3_record(self, tmp_path: Path, status: session_records.Status) -> Path:
-        _t3_record(tmp_path, 't3-quiet', 'th-1', cwd=str(tmp_path), status=status)
-        record = session_records.read_record('t3-quiet', root=tmp_path)
-        record.launcher_pid = _DEAD_PID
-        session_records.write_record(record, root=tmp_path)
-        path = session_records.record_path_for_slug('t3-quiet', root=tmp_path)
-        set_mtime(path, _NOW, sr.TERMINAL_TTL + timedelta(hours=1))
-        return path
-
-    def test_mark_orphaned_skips_a_quiet_t3_record_with_a_dead_launcher(
-        self, tmp_path: Path
-    ) -> None:
-        self._stale_t3_record(tmp_path, session_records.Status.AWAITING_INPUT)
-
-        assert sr.mark_orphaned_sessions_exited(root=tmp_path, now=_NOW) == []
-        assert session_records.read_record('t3-quiet', root=tmp_path).status == session_records.Status.AWAITING_INPUT
-
-    def test_reap_keeps_a_non_terminal_t3_record_with_a_dead_launcher(self, tmp_path: Path) -> None:
-        path = self._stale_t3_record(tmp_path, session_records.Status.RUNNING)
-
-        assert sr.reap_stale_records(root=tmp_path, now=_NOW) == []
-        assert path.is_file()
-        assert not session_records.t3_thread_pointers_dir(tmp_path).exists()
-
-    def test_the_reap_indexes_a_t3_record_whose_thread_no_pointer_holds(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        self._stale_t3_record(tmp_path, session_records.Status.RUNNING)
-        monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
-        monkeypatch.setenv('PATH', str(tmp_path / 'no-bin'))
-
-        assert sr.main(['reap']) == 0
-
-        assert session_records.resolve_session_slug_for_t3_thread('th-1', root=tmp_path) == 't3-quiet'
-        assert session_records.read_record('t3-quiet', root=tmp_path).status == session_records.Status.RUNNING
-
-    def test_indexing_never_moves_a_held_pointer_or_indexes_a_terminal_record(
-        self, tmp_path: Path
-    ) -> None:
-        self._stale_t3_record(tmp_path, session_records.Status.RUNNING)
-        _t3_record(tmp_path, 'holder', 'th-1', cwd=str(tmp_path), pointer=True)
-        _t3_record(tmp_path, 'ended', 'th-2', cwd=str(tmp_path), status=session_records.Status.EXITED)
-
-        assert sr.index_unpointed_t3_records(root=tmp_path) == []
-
-        assert session_records.resolve_session_slug_for_t3_thread('th-1', root=tmp_path) == 'holder'
-        assert not session_records.t3_thread_pointer_path('th-2', tmp_path).exists()
-
-    def test_a_t3_record_displaced_from_its_thread_pointer_is_pid_swept(
-        self, tmp_path: Path
-    ) -> None:
-        self._stale_t3_record(tmp_path, session_records.Status.RUNNING)
-        _t3_record(tmp_path, 'holder', 'th-1', cwd=str(tmp_path), pointer=True)
-
-        reaped = sr.reap_stale_records(root=tmp_path, now=_NOW)
-
-        assert [(r.session_slug, r.reason) for r in reaped] == [('t3-quiet', 'stale_pid')]
-        assert session_records.resolve_session_slug_for_t3_thread('th-1', root=tmp_path) == 'holder'
-
-    def test_mark_orphaned_marks_a_displaced_t3_record_with_a_dead_launcher(
-        self, tmp_path: Path
-    ) -> None:
-        self._stale_t3_record(tmp_path, session_records.Status.AWAITING_INPUT)
-        _t3_record(tmp_path, 'holder', 'th-1', cwd=str(tmp_path), pointer=True)
-
-        marked = sr.mark_orphaned_sessions_exited(root=tmp_path, now=_NOW)
-
-        assert [r.session_slug for r in marked] == ['t3-quiet']
-
-    def test_a_failed_index_write_leaves_the_t3_record_exempt(self, tmp_path: Path) -> None:
-        path = self._stale_t3_record(tmp_path, session_records.Status.RUNNING)
-        session_records.t3_thread_pointers_dir(tmp_path).parent.mkdir(parents=True, exist_ok=True)
-        session_records.t3_thread_pointers_dir(tmp_path).write_text('not a dir')
-
-        assert sr.index_unpointed_t3_records(root=tmp_path) == []
-        assert sr.reap_stale_records(root=tmp_path, now=_NOW) == []
-        assert sr.mark_orphaned_sessions_exited(root=tmp_path, now=_NOW) == []
-        assert path.is_file()
-        assert session_records.read_record('t3-quiet', root=tmp_path).status == session_records.Status.RUNNING
-
-    def test_reap_still_applies_terminal_ttl_to_a_t3_record(self, tmp_path: Path) -> None:
-        self._stale_t3_record(tmp_path, session_records.Status.EXITED)
-
-        reaped = sr.reap_stale_records(root=tmp_path, now=_NOW)
-
-        assert [(r.session_slug, r.reason) for r in reaped] == [('t3-quiet', 'terminal_ttl')]
-
-
-def test_mark_session_folded_stamps_the_fold_code_once(tmp_path: Path) -> None:
-    session_records.write_record(make_record(session_slug='hand', status=session_records.Status.RUNNING), root=tmp_path)
-
-    folded = sr.mark_session_folded('hand', root=tmp_path)
-
-    assert folded is not None
-    assert (folded.status, folded.exit_code) == (session_records.Status.EXITED, sr.FOLDED_EXIT_CODE)
-    assert sr.mark_session_folded('hand', root=tmp_path) is None

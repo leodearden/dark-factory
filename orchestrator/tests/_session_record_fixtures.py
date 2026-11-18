@@ -67,3 +67,29 @@ def set_mtime(path: Path, now: datetime, age: timedelta) -> None:
     """Backdate *path*'s mtime to ``now - age``: the heartbeat clock records and leases age by."""
     ts = (now - age).timestamp()
     os.utime(path, (ts, ts))
+
+
+def write_t3_record(
+    root: Path,
+    slug: str,
+    thread_id: str | None,
+    *,
+    cwd: str,
+    status: session_records.Status = session_records.Status.RUNNING,
+    kind: str = session_records.DisplayKind.T3.value,
+    environment_id: str | None = None,
+    pointer: bool = False,
+) -> None:
+    """Write a t3-display record *slug* bound to *thread_id*; with *pointer*, also index the thread to it."""
+    session_records.write_record(
+        make_record(
+            session_slug=slug,
+            status=status,
+            cwd=cwd,
+            exit_code=None,
+            display=session_records.Display(kind=kind, t3_thread_id=thread_id, t3_environment_id=environment_id),
+        ),
+        root=root,
+    )
+    if pointer and thread_id is not None:
+        assert session_records.write_t3_thread_pointer(thread_id, slug, root=root)

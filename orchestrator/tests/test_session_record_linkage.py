@@ -19,7 +19,7 @@ from shared.process_identity import ProcessIdentity
 
 from orchestrator import decision_registry as dr
 from orchestrator import session_hooks as sh
-from orchestrator import session_identity, session_leases, session_records
+from orchestrator import session_identity, session_leases, session_reaper, session_records
 from orchestrator import session_registry as sr
 
 # A pid virtually guaranteed dead on any host (the suite-wide idiom; see
@@ -265,7 +265,7 @@ class TestReapStaleSessionPointers:
         session_records.write_record(_record(self._SLUG, owner_pid=os.getpid()), root=tmp_path)
         session_records.write_session_pointer(os.getpid(), self._SLUG, root=tmp_path)
 
-        assert sr.reap_stale_session_pointers(root=tmp_path) == []
+        assert session_reaper.reap_stale_session_pointers(root=tmp_path) == []
         assert session_records.session_pointer_path_for_pid(os.getpid(), root=tmp_path).is_file()
 
     def test_a_dead_pids_pointer_is_removed_even_though_its_record_exists(
@@ -275,14 +275,14 @@ class TestReapStaleSessionPointers:
         session_records.write_session_pointer(_DEAD_PID, self._SLUG, root=tmp_path)
         pointer = session_records.session_pointer_path_for_pid(_DEAD_PID, root=tmp_path)
 
-        assert sr.reap_stale_session_pointers(root=tmp_path) == [pointer]
+        assert session_reaper.reap_stale_session_pointers(root=tmp_path) == [pointer]
         assert not pointer.exists()
 
     def test_a_live_pids_pointer_to_a_reaped_record_is_removed(self, tmp_path: Path) -> None:
         session_records.write_session_pointer(os.getpid(), self._SLUG, root=tmp_path)
         pointer = session_records.session_pointer_path_for_pid(os.getpid(), root=tmp_path)
 
-        assert sr.reap_stale_session_pointers(root=tmp_path) == [pointer]
+        assert session_reaper.reap_stale_session_pointers(root=tmp_path) == [pointer]
         assert not pointer.exists()
 
     @pytest.mark.parametrize('content', ['', '  \n', '../escape', 'a/b', '..'])
@@ -291,7 +291,7 @@ class TestReapStaleSessionPointers:
     ) -> None:
         pointer = _write_pointer_raw(os.getpid(), content, tmp_path)
 
-        assert sr.reap_stale_session_pointers(root=tmp_path) == [pointer]
+        assert session_reaper.reap_stale_session_pointers(root=tmp_path) == [pointer]
         assert not pointer.exists()
 
     @pytest.mark.parametrize('name', ['not-a-pid', '0', '-5', '12.5'])
@@ -303,7 +303,7 @@ class TestReapStaleSessionPointers:
         pointer.parent.mkdir(parents=True)
         pointer.write_text(self._SLUG, encoding='utf-8')
 
-        assert sr.reap_stale_session_pointers(root=tmp_path) == [pointer]
+        assert session_reaper.reap_stale_session_pointers(root=tmp_path) == [pointer]
         assert not pointer.exists()
 
     def test_a_writers_in_flight_temp_file_is_left_alone(self, tmp_path: Path) -> None:
@@ -311,7 +311,7 @@ class TestReapStaleSessionPointers:
         temp.parent.mkdir(parents=True)
         temp.write_text(self._SLUG, encoding='utf-8')
 
-        assert sr.reap_stale_session_pointers(root=tmp_path) == []
+        assert session_reaper.reap_stale_session_pointers(root=tmp_path) == []
         assert temp.is_file()
 
     def test_a_temp_file_abandoned_by_a_killed_writer_is_removed(self, tmp_path: Path) -> None:
@@ -321,11 +321,11 @@ class TestReapStaleSessionPointers:
         a_day_ago = (datetime.now(UTC) - timedelta(days=1)).timestamp()
         os.utime(temp, (a_day_ago, a_day_ago))
 
-        assert sr.reap_stale_session_pointers(root=tmp_path) == [temp]
+        assert session_reaper.reap_stale_session_pointers(root=tmp_path) == [temp]
         assert not temp.exists()
 
     def test_an_absent_pointer_dir_is_an_empty_pass(self, tmp_path: Path) -> None:
-        assert sr.reap_stale_session_pointers(root=tmp_path) == []
+        assert session_reaper.reap_stale_session_pointers(root=tmp_path) == []
 
     @pytest.mark.parametrize('variant', list(IdentityVariant))
     def test_a_live_pids_pointer_is_judged_by_its_records_owner_identity(
@@ -337,7 +337,7 @@ class TestReapStaleSessionPointers:
         pointer = session_records.session_pointer_path_for_pid(os.getpid(), root=tmp_path)
         removed = variant.judged_dead
 
-        assert sr.reap_stale_session_pointers(root=tmp_path) == ([pointer] if removed else [])
+        assert session_reaper.reap_stale_session_pointers(root=tmp_path) == ([pointer] if removed else [])
         assert pointer.exists() is not removed
 
     def test_a_dead_pids_pointer_to_a_record_reclaimed_by_a_live_owner_is_removed(
@@ -348,7 +348,7 @@ class TestReapStaleSessionPointers:
         session_records.write_session_pointer(_DEAD_PID, self._SLUG, root=tmp_path)
         pointer = session_records.session_pointer_path_for_pid(_DEAD_PID, root=tmp_path)
 
-        assert sr.reap_stale_session_pointers(root=tmp_path) == [pointer]
+        assert session_reaper.reap_stale_session_pointers(root=tmp_path) == [pointer]
         assert not pointer.exists()
 
     def test_a_live_pids_pointer_to_a_record_owned_by_another_pid_is_judged_by_its_own_pid(
@@ -359,7 +359,7 @@ class TestReapStaleSessionPointers:
         session_records.write_record(owner, root=tmp_path)
         session_records.write_session_pointer(os.getpid(), self._SLUG, root=tmp_path)
 
-        assert sr.reap_stale_session_pointers(root=tmp_path) == []
+        assert session_reaper.reap_stale_session_pointers(root=tmp_path) == []
         assert session_records.session_pointer_path_for_pid(os.getpid(), root=tmp_path).is_file()
 
     def test_a_corrupt_record_reads_unqualified_so_a_live_pids_pointer_is_kept(
@@ -370,7 +370,7 @@ class TestReapStaleSessionPointers:
         record_path.write_text('{not json', encoding='utf-8')
         session_records.write_session_pointer(os.getpid(), self._SLUG, root=tmp_path)
 
-        assert sr.reap_stale_session_pointers(root=tmp_path) == []
+        assert session_reaper.reap_stale_session_pointers(root=tmp_path) == []
         assert session_records.session_pointer_path_for_pid(os.getpid(), root=tmp_path).is_file()
 
     def test_an_entry_that_cannot_be_removed_is_skipped_and_the_pass_continues(
@@ -383,7 +383,7 @@ class TestReapStaleSessionPointers:
         stale.write_text(self._SLUG, encoding='utf-8')
         caplog.set_level(logging.DEBUG)
 
-        assert sr.reap_stale_session_pointers(root=tmp_path) == [stale]
+        assert session_reaper.reap_stale_session_pointers(root=tmp_path) == [stale]
         assert stuck.is_dir()
         assert not stale.exists()
         assert any(str(_DEAD_PID) in r.getMessage() for r in caplog.records)

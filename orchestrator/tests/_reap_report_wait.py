@@ -7,12 +7,12 @@ from pathlib import Path
 
 import pytest
 
-from orchestrator import session_registry as sr
+from orchestrator import session_reaper
 
 
 def await_reap_report(root: Path, *, deadline_secs: float = 120.0) -> None:
     """Poll for ``run_reap``'s report, the detached reap's completion signal."""
-    report_path = sr.reap_report_path(root)
+    report_path = session_reaper.reap_report_path(root)
     deadline = time.monotonic() + deadline_secs
     while not report_path.is_file():
         if time.monotonic() > deadline:
