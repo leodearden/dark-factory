@@ -6,7 +6,7 @@ import asyncio
 import contextlib
 import json
 import logging
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Collection, Sequence
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -16,6 +16,7 @@ from fastmcp import FastMCP
 from fastmcp.server.dependencies import get_http_headers
 from pydantic import Field, ValidationError
 from shared.branch_names import bare_queued_branch_id, canonical_queued_branch_name
+from shared.escalation_project_scope import escalation_project_for
 from shared.eval_lane import eval_lane_provenance
 
 # Fully qualified rather than `from shared import ...`: the module is
@@ -1305,6 +1306,7 @@ def create_server(
     startup_sweep_now: datetime | None = None,
     store_identity: StoreIdentity | None = None,
     prefix_resolver: PrefixResolver | None = None,
+    per_call_projects: Collection[str] = (),
     mismatch_streak_threshold: int = DEFAULT_MISMATCH_STREAK_THRESHOLD,
 ) -> FastMCP:
     """Create the escalation MCP server with all tools registered.
@@ -1378,10 +1380,18 @@ def create_server(
 
     *prefix_resolver* (default None) — ``shared.uuid_prefix_guard``'s
     ``PrefixResolver`` port.  When given, the uuid-prefix guard is registered
-    after the markup guard, scoped to ``store_identity.project_id``.  A server
-    without a project identity (the reconciliation store) forwards a prefixed
-    call unchanged with ``resolver='no_project'`` and never guesses a project;
-    per-call scoping is task 6910.  When omitted, no prefix guard is registered.
+    after the markup guard, scoped to ``store_identity.project_id``; a server
+    without one is scoped per call through *per_call_projects*.  When omitted,
+    no prefix guard is registered.
+
+    *per_call_projects* (default empty) — the project ids a call on a store
+    without its own project (the reconciliation store) may scope the
+    uuid-prefix guard to, by naming one in its ``X-Escalation-Project``
+    request header (``shared/src/shared/escalation_project_scope.py``).  An
+    absent header, or one naming a project outside this set, leaves the call
+    unscoped (``resolver='no_project'``): a project is never guessed.  Passing
+    it with a project identity raises ValueError.  It scopes only the prefix
+    guard.
 
     *mismatch_streak_threshold* (default 5) — how many refused assertions of
     one ``project_root`` within the streak's window file (or fold) ONE
@@ -1543,15 +1553,21 @@ def create_server(
     ))
     # --- Truncated-uuid citations (PRD uuid-prefix-resolution §4-C3) ---
     # After the markup guard, so a parameter it recovers is scanned too (B15).
-    # The project is a registration-time constant: no escalation tool declares
-    # a project_id, and ProjectRootGuard refuses any project_root this store
-    # does not serve. Every tool forwards on ambiguity, because losing an
-    # escalation is worse than the defect.
+    # No escalation tool declares a project_id, and ProjectRootGuard refuses
+    # any project_root this store does not serve, so a project store's own
+    # project is a registration-time constant. A store without one (8103)
+    # scopes each call by the caller's X-Escalation-Project header, and only
+    # to a project in per_call_projects (shared/src/shared/escalation_project_scope.py).
+    # Every tool forwards on ambiguity, because losing an escalation is worse
+    # than the defect.
+    prefix_project_for = escalation_project_for(
+        store_identity.project_id if store_identity is not None else None,
+        per_call_projects,
+    )
     if prefix_resolver is not None:
-        prefix_project = store_identity.project_id if store_identity is not None else None
         mcp.add_middleware(UuidPrefixGuardMiddleware(
             prefix_resolver,
-            lambda _arguments: prefix_project,
+            prefix_project_for,
             exempt_tools=frozenset(),
             forward_on_ambiguity_tools=_ESCALATION_SERVER_TOOL_NAMES,
             escalation_sink=lambda record: file_storm_once(
