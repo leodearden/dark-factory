@@ -463,11 +463,14 @@ class TestReconciliationStoreIsScopedPerCall:
 
         assert resolver.calls == [('reify', PREFIX)]
 
-    def test_per_call_projects_on_a_project_store_is_refused(self, tmp_path: Path):
-        with pytest.raises(ValueError):
+    @pytest.mark.parametrize('resolver', [RecordingResolver(), None], ids=['resolver', 'no-resolver'])
+    def test_per_call_projects_on_a_project_store_is_refused(self, tmp_path: Path, resolver):
+        queue = EscalationQueue(tmp_path / 'esc')
+        identity = project_identity(tmp_path)
+
+        with pytest.raises(ValueError, match='per-call projects'):
             create_server(
-                EscalationQueue(tmp_path / 'esc'), startup_sweep=False,
-                store_identity=project_identity(tmp_path), prefix_resolver=RecordingResolver(),
+                queue, startup_sweep=False, store_identity=identity, prefix_resolver=resolver,
                 per_call_projects={'dark_factory'},
             )
 

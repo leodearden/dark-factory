@@ -1553,13 +1553,9 @@ def create_server(
     ))
     # --- Truncated-uuid citations (PRD uuid-prefix-resolution §4-C3) ---
     # After the markup guard, so a parameter it recovers is scanned too (B15).
-    # No escalation tool declares a project_id, and ProjectRootGuard refuses
-    # any project_root this store does not serve, so a project store's own
-    # project is a registration-time constant. A store without one (8103)
-    # scopes each call by the caller's X-Escalation-Project header, and only
-    # to a project in per_call_projects (shared/src/shared/escalation_project_scope.py).
     # Every tool forwards on ambiguity, because losing an escalation is worse
     # than the defect.
+    # Project scope: shared/src/shared/escalation_project_scope.py::escalation_project_for
     prefix_project_for = escalation_project_for(
         store_identity.project_id if store_identity is not None else None,
         per_call_projects,

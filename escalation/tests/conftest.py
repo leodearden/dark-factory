@@ -432,7 +432,7 @@ def _serve_escalation_mcp_impl():
         mcp = create_server(
             queue, startup_sweep=startup_sweep, dedupe_config=dedupe_config,
             store_identity=store_identity, prefix_resolver=prefix_resolver,
-            **({'per_call_projects': per_call_projects} if per_call_projects else {}),
+            per_call_projects=per_call_projects,
         )
         listener = _bind_escalation_listener()
         port = listener.getsockname()[1]
