@@ -40,6 +40,7 @@ from legibility_carrier_fixtures import (
     TASK_NOTIFICATION_TEXT,
     TRICKLE_CODER_PREAMBLE,
     UNKNOWN_PROVENANCE_TEXT,
+    UNMARKED_HEADLESS_SDK_PROMPTS,
     WATCHER_ROTATION_PROMPT,
     briefing_text,
     coder_judgment,
@@ -48,6 +49,7 @@ from legibility_carrier_fixtures import (
     pre_5356_replan_prompt,
     prior_round_adjudicator_prompt,
     recon_run_review_text,
+    sdk_prompt,
     steward_continuation_prompt,
     with_origin,
 )
@@ -2638,6 +2640,43 @@ class TestNonHumanOriginFilter:
 
         assert mod.iter_user_turns(records) == []
         assert detectors.classify_agent_class(_MAIN_DIR_PATH, records) == 'orchestrated-task'
+
+
+# ---------------------------------------------------------------------------
+# Headless-SDK prompt exclusion (task 6953): a prompt delivered to headless
+# `claude --print` (promptSource 'sdk', entrypoint 'sdk-cli') is excluded by
+# provenance alone, while a human turn typed into an SDK GUI client stays gold.
+# ---------------------------------------------------------------------------
+
+_UNMARKED_HEADLESS_SDK_TEXTS = tuple(param.values[0] for param in UNMARKED_HEADLESS_SDK_PROMPTS)
+
+
+class TestHeadlessSdkPromptFilter:
+    def test_headless_prompts_are_excluded_and_dialogue_keeps_its_index(self):
+        gui_client_turn = sdk_prompt("what's the status of the PR?", entrypoint='sdk-ts')
+        typed_turn = {**_user_text('please fix the bug'), 'promptSource': 'typed', 'entrypoint': 'cli'}
+        records = [sdk_prompt(text) for text in _UNMARKED_HEADLESS_SDK_TEXTS]
+        records += [gui_client_turn, typed_turn]
+
+        turns = mod.iter_user_turns(records)
+
+        assert [(t['index'], t['text']) for t in turns] == [
+            (4, "what's the status of the PR?"),
+            (5, 'please fix the bug'),
+        ]
+
+    def test_render_digest_headless_prompt_session_has_no_gold_section(self):
+        records = [
+            _with_session_meta(sdk_prompt(f'{text}\nBLOCKED: merge gate refused the branch'))
+            for text in _UNMARKED_HEADLESS_SDK_TEXTS
+        ]
+
+        digest = mod.render_digest(records, agent_class='orchestrated-task')
+
+        meta = yaml.safe_load(_split_frontmatter(digest)[0])
+        assert '## User Corrections' not in digest
+        assert meta['n_user_turns'] == 0
+        assert meta['signal_counts'] == dict.fromkeys(mod.SIGNAL_COUNT_KEYS, 0)
 
 
 # ---------------------------------------------------------------------------
