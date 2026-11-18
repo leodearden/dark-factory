@@ -15565,6 +15565,7 @@ class TaskWorkflow:
             self.event_store.emit(
                 EventType.routing_decision,
                 task_id=self.task_id,
+                phase=self.state.value,
                 role=role.name,
                 data={**decision.model_dump(), 'inputs_digest': digest},
             )
