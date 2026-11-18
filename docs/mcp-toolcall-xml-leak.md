@@ -207,7 +207,7 @@ the mis-closed tag in general.
   the tag that was mis-closed".
 
 **One accepted residual survives the 2026-08-25 widening, at the GENERIC boundary
-only.** `shared/src/shared/mcp_markup_middleware.py::MarkupGuardMiddleware._first_markup_argument`
+only.** `shared/src/shared/mcp_markup_middleware.py::MarkupGuardMiddleware._markup_arguments`
 documents it in place: a CROSS-FIELD misclose — a closer naming a *different*
 parameter of the *same* tool — still passes, because that scan calls
 `detect_for(value, param)` with the argument's own name and **no schema**, so
