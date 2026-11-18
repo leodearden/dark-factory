@@ -941,14 +941,16 @@ def _modules_that_call_the_helper() -> set[str]:
     return _production_modules_where(_imports_the_helper)
 
 
-_QUEUE_DIR_RESOLVER = f'{escalation_queue_dir.__module__}.{escalation_queue_dir.__name__}'
+_QUEUE_DIR_HOME = escalation_queue_dir.__module__
+_QUEUE_DIR_RESOLVER = f'{_QUEUE_DIR_HOME}.{escalation_queue_dir.__name__}'
 
 
 def _reaches_the_project_queue(tree: ast.AST, package: str) -> bool:
-    """Whether *tree* imports either route to `<project_root>/data/escalations`:
-    the layout's queue resolver, or the helper that calls it."""
+    """Whether *tree* imports either route to `<project_root>/data/escalations`,
+    in any spelling: the layout's queue resolver or the module that holds it,
+    or the helper that calls it."""
     return (
-        _QUEUE_DIR_RESOLVER in _imported_targets(tree, package)
+        bool(_imported_targets(tree, package) & {_QUEUE_DIR_HOME, _QUEUE_DIR_RESOLVER})
         or _imports_the_helper(tree, package)
     )
 
@@ -1273,11 +1275,15 @@ def _modules_the_sweep_reads() -> set[str]:
 
 
 #: The modules that reach `<project_root>/data/escalations` but file no anchor
-#: another filer could squat, each with its reason. The census keys on
-#: `escalation_queue_dir` and the `_folded_escalation` helper, the only two
-#: routes to that queue in fused-memory/src. Filers that write only the
-#: reconciliation queue (`config.escalation_queue_dir`) are out of scope: an
-#: anchor on a different queue cannot squat one on this queue.
+#: another filer could squat, each with its reason. The census finds the
+#: modules that DIRECTLY import `escalation_queue_dir` or the
+#: `_folded_escalation` helper, one verdict per module. Two filers are
+#: therefore swept by hand, not by the census: a module that forwards its own
+#: anchor through another module's emitter (`markup_guard`, through
+#: `markup_tripwire`'s), and a new anchor added to a module already swept.
+#: Filers that write only the reconciliation queue (`config.escalation_queue_dir`)
+#: are out of scope: an anchor on a different queue cannot squat one on this
+#: queue.
 _QUEUE_FILERS_OUTSIDE_THE_SWEEP: dict[str, str] = {
     'fused_memory.middleware._folded_escalation':
         'the helper itself; every caller passes its own anchor and is swept '
@@ -1363,6 +1369,8 @@ class TestNoTwoFilersShareAnAnchor:
             'journal_growth_alarm file_size',
             'journal_growth_alarm insert_rate',
             'classification_fallback_alarm',
+            'markup_guard storm',
+            'markup_guard residue',
             'mem0_update_storm_escalator',
             'entity_mint_storm_escalator',
             'scope_violation_escalator',
@@ -1416,6 +1424,26 @@ class TestNoTwoFilersShareAnAnchor:
             f'{sorted(swept & excluded)!r} are both swept and excluded; one of '
             'the two is stale'
         )
+
+    @pytest.mark.parametrize('source', [
+        'from shared.project_layout import escalation_queue_dir',
+        'from shared.project_layout import escalation_queue_dir as queue_dir',
+        'from shared import project_layout',
+        'import shared.project_layout',
+        'import shared.project_layout as pl',
+        'from fused_memory.middleware import _folded_escalation',
+    ])
+    def test_the_queue_census_counts_every_import_spelling(self, source):
+        assert _reaches_the_project_queue(ast.parse(source), 'fused_memory.server')
+
+    @pytest.mark.parametrize('source', [
+        'from shared.project_layout import tasks_db',
+        'from shared.project_layout_neighbour import escalation_queue_dir',
+        'from shared import process_identity',
+        'from ..config import escalation_queue_dir',
+    ])
+    def test_the_queue_census_ignores_a_lookalike(self, source):
+        assert not _reaches_the_project_queue(ast.parse(source), 'fused_memory.server')
 
 
 @_needs_escalation
