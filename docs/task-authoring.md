@@ -1569,7 +1569,7 @@ flows) — is exempted from the `unknown_key` scan even though these are not
 (yet) typed `TaskMetadata` fields. This is `_BLESSED_METADATA_KEYS` in
 `shared/src/shared/task_metadata.py`:
 
-<!-- tier-a-blessed-keys-mirror -->
+<!-- tier-a-blessed-keys-mirror:begin -->
 ```
 source, modules, spawn_context, complexity, force_full_path,
 branch_base_sha, _causation_id, dry_run_proposals, reblock_guard,
@@ -1590,7 +1590,7 @@ plan_text_fp, plan_authored_at,
 main_health_signature, superseded_by, cancel_dispositions, trigger_chain,
 predicate_recheck, predicate_verdict
 ```
-<!-- /tier-a-blessed-keys-mirror -->
+<!-- tier-a-blessed-keys-mirror:end -->
 
 This listing is **machine-checked** against the live frozenset by
 `tests/scripts/test_task_authoring_blessed_keys_drift.py` (task 3780), which
@@ -1954,7 +1954,7 @@ new row whose canonical is unblessed fails the suite rather than silently
 re-creating that task's defect, where authors were told to migrate to
 `related_tasks` and still minted a census line.
 
-<!-- tier-b-canonical-keys -->
+<!-- tier-b-canonical-keys:begin -->
 
 | Canonical | Aliases to avoid |
 |---|---|
@@ -1964,7 +1964,7 @@ re-creating that task's defect, where authors were told to migrate to
 | `source_finding_id` | `origin_finding_id`, `origin_finding`, `origin_stage1_finding_id`, `source_finding`, `finding_id` |
 | `superseded_by` | `x_superseded_by`, `x_subsumed_by`, `subsumed_by`, `x_coalesced_into`, `x_replacement` |
 
-<!-- /tier-b-canonical-keys -->
+<!-- tier-b-canonical-keys:end -->
 
 **The finding-provenance row splits into two classes** (ruling:
 `esc-3796-1`, 2026-08-17). `origin_finding_id` is the **retired** alias and

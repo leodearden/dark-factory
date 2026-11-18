@@ -150,9 +150,14 @@ class FleetCensus:
 
     * costs (110,596 bytes at ``window=all``): spend on 189 of the 3,650
       days, 23 (model, role) pairs, 9 accounts, the 200-event cap full;
-    * burndown (989,413 at ``window=90d``): the store reaches back 31 days
-      but holds gap rows, so a root's series averages 1,328 MEASURED rows;
-      the payload scales with that count, not the span;
+    * burndown (950,875 at ``window=90d``, re-measured 2026-11-17 by task
+      6991 once per-project labels became ``label_spans``): 12 projects
+      averaging 1,958 MEASURED rows (1,177 to 2,164) over a union of 2,661
+      labels; the payload scales with that count, not the span. The fleet
+      seeds 2,040 rows per root and serves 952,121. Its union is shorter
+      (2,384 labels), so it needs about 4% more rows per root than live to
+      reach the same bytes. Every third hourly row of the odd roots sits one
+      tick early, so each root's row is about 345 spans (live: 30 to 470);
     * recon (35,216): 50 runs listed, 24 writing agents, 400 buffered events;
     * memory (41,065): 173 memory projects, 18 WAL stores, a day of samples;
     * curator (17,057): no pending tickets, every account capped all day;
@@ -328,7 +333,7 @@ CENSUS = FleetCensus(
         account_events=30,
         cap_reason_len=80,
     ),
-    burndown=BurndownShape(samples_per_root=1330, concurrency_cap=24),
+    burndown=BurndownShape(samples_per_root=2040, concurrency_cap=24, misaligned_hour_every=3),
     memory=MemoryShape(
         projects=173, project_id_len=21, graphiti_nodes=132_790, mem0_memories=85_425,
         wal_stores=(

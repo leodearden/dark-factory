@@ -108,9 +108,6 @@ else:
         'eval_write_triage_live_judge',
     )
 
-# PRD C2' and task 5807 call this at eval_write_triage_judge.py::score_attachments.
-score_attachments = _scoring.score_attachments
-
 
 _RETRIEVAL_PATH = _PACKAGE_ROOT / 'scripts' / 'eval_write_triage_retrieval.py'
 
@@ -278,7 +275,7 @@ def run_judge_eval(
     report = _scoring.build_report(
         scored=scored,
         provenance=run_provenance,
-        production_shape=score_attachments(rows),
+        production_shape=_scoring.score_attachments(rows),
     )
 
     # `markdown_path` was composed (and its collision with `report_path`

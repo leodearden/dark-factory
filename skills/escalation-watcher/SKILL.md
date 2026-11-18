@@ -1203,8 +1203,9 @@ Because no call can block >100 s, top-level submission is safe BY PROTOCOL.
    (`already_merged` is a *submit* status the server collapses to `done` when observed by
    polling — see step 1 and
    `escalation/src/escalation/merge_status_answer.py::map_terminal_state`.)
-   After an orchestrator restart,
-   `{state: 'unknown', hint: 'check git log main'}` → fall back to `git log main` (PRD I3).
+   An epistemic answer describes the server's records, not the merge — switch on its `reason`
+   per [the shared reason switch](../_shared/merge-status-reasons.md#the-switch); never fall
+   back to `git log main`, and never direct-merge on one.
 
 3. **To abandon** a queued entry before it is picked up:
    ```
@@ -1466,8 +1467,10 @@ launch by `task_id` / background-task-id):
   pending, write only the digest line and file no DecisionRecord: whoever took the escalation
   owns it, and the merge carries on.
 - `outcome == "handed_off"`: neither a failure nor an abort. The merge `request_id` it returns
-  is either picked up by the merge worker and still live (merging or verifying), or, when the
-  result also carries `superseded_by`, superseded by a successor that has not resolved yet: an
+  is either still live (picked up by the merge worker, or, from step 9's re-poll hand-off, the
+  entry an `attached` submit joined, which may still be queued), or still
+  answering a wait-state reason (a **WAIT** row of [the shared reason
+  switch](../_shared/merge-status-reasons.md#the-switch)) and so possibly still in flight, or, when the result also carries `superseded_by`, superseded by a successor that has not resolved yet: an
   `mr-*` generation advance or a `coalesce-*` train. Either way the sub-agent did not cancel
   it, did not change the task status, and left the escalation pending. **Never
   `merge_cancel` it**, and never submit another merge for that `task_id`, whichever shape it is:
@@ -1482,7 +1485,7 @@ launch by `task_id` / background-task-id):
   is already charged, and `check` would report `already_attempted`. Keep the `task_id` in flight
   until that run completes; its completion is handled by this same list. **Resume once per B3
   launch:** if a resume-mode run itself returns `handed_off` (its 3 h backstop expired with the
-  merge still live or its successor still unresolved), do not resume again — leave the
+  merge still live, still answering a wait-state reason, or its successor still unresolved), do not resume again — leave the
   escalation pending, write the digest line, and file a DecisionRecord via `write-decision`
   whose `--text` names the `request_id`, the `superseded_by` when present, and the last state.
   Still never cancel. A resume-mode `merged` is handled by the `merged` bullet, and a

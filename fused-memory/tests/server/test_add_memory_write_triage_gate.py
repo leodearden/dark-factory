@@ -7,13 +7,9 @@ memory it restates. Contract C1 is absolute: never lose content, never block a
 write, never edit a canonical.
 
 Harness: an ``AsyncMock`` memory service wired through ``create_mcp_server``,
-invoked via ``server._tool_manager.call_tool('add_memory', {...})``, its config
-and search hits built by ``tests/server/write_triage_harness.py``. One shape
-that bites if copied carelessly:
-
-* ``mock_service.add_memory`` returns an explicit ``MagicMock`` with
-  ``model_dump`` configured; otherwise ``result.model_dump()`` is an unawaited
-  coroutine.
+invoked via ``server._tool_manager.call_tool('add_memory', {...})``, its config,
+search hits and ``add_memory`` result built by
+``tests/server/write_triage_harness.py``.
 
 (The MCP-markup boundary guard task 4458 added is installed in
 ``server/main.py``, NOT in ``create_mcp_server``, so this harness does not run
@@ -72,6 +68,7 @@ from server.write_triage_harness import (
     T_HIGH,
     T_LOW,
     TOPIC_MATCH_CONTENT,
+    configure_pass_through_add_memory,
     configure_triage_config,
     search_candidate,
     topic_cluster,
@@ -88,20 +85,6 @@ _CONTENT = (
 #: A caller-supplied parent id, in the full-UUID shape `memory_metadata`
 #: validates `parent_id` against.
 _EXPLICIT_PARENT = '11111111-2222-3333-4444-555555555555'
-
-
-def _configure_pass_through_add_memory(
-    mock_service: AsyncMock, dump: dict | None = None,
-) -> MagicMock:
-    """Configure ``mock_service.add_memory`` to return a dict-dumpable result."""
-    mem_result = MagicMock()
-    mem_result.model_dump.return_value = dump if dump is not None else {
-        'id': 'new-id',
-        'category': 'procedural_knowledge',
-        'stored_in': ['mem0'],
-    }
-    mock_service.add_memory.return_value = mem_result
-    return mem_result
 
 
 def _install_counter(
@@ -152,7 +135,7 @@ class TestRestatementIsRedirectedNotRejected:
     async def test_a_high_cosine_write_acks_restated_naming_its_canonical(self) -> None:
         mock_service = AsyncMock()
         configure_triage_config(mock_service)
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         mock_service.search.return_value = [search_candidate('m1', 0.97)]
         server = create_mcp_server(mock_service)
 
@@ -178,7 +161,7 @@ class TestRestatementIsRedirectedNotRejected:
         """
         mock_service = AsyncMock()
         configure_triage_config(mock_service)
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         mock_service.search.return_value = [search_candidate('m1', 0.97)]
         server = create_mcp_server(mock_service)
 
@@ -216,7 +199,7 @@ class TestRestatementIsRedirectedNotRejected:
         """
         mock_service = AsyncMock()
         configure_triage_config(mock_service)
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         mock_service.search.return_value = [
             search_candidate('m1', 0.93, store_rank=2),
             search_candidate(
@@ -248,7 +231,7 @@ class TestRestatementIsRedirectedNotRejected:
         """
         mock_service = AsyncMock()
         configure_triage_config(mock_service)
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         mock_service.search.return_value = [search_candidate('m1', 0.97)]
         server = create_mcp_server(mock_service)
 
@@ -261,7 +244,7 @@ class TestRestatementIsRedirectedNotRejected:
         """An attach reroutes the write, it does not rewrite it."""
         mock_service = AsyncMock()
         configure_triage_config(mock_service)
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         mock_service.search.return_value = [search_candidate('m1', 0.97)]
         server = create_mcp_server(mock_service)
 
@@ -277,7 +260,7 @@ class TestRestatementIsRedirectedNotRejected:
         """The parent link is ADDED to the submitted metadata, not swapped for it."""
         mock_service = AsyncMock()
         configure_triage_config(mock_service)
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         mock_service.search.return_value = [search_candidate('m1', 0.97)]
         server = create_mcp_server(mock_service)
 
@@ -301,7 +284,7 @@ class TestRestatementIsRedirectedNotRejected:
         """
         mock_service = AsyncMock()
         configure_triage_config(mock_service)
-        _configure_pass_through_add_memory(mock_service, dump={
+        configure_pass_through_add_memory(mock_service, dump={
             'id': 'child-id',
             'category': 'procedural_knowledge',
             'stored_in': ['mem0'],
@@ -322,7 +305,7 @@ class TestRestatementIsRedirectedNotRejected:
         """No error keys at all — a redirect is a SUCCESS, not a soft failure."""
         mock_service = AsyncMock()
         configure_triage_config(mock_service)
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         mock_service.search.return_value = [search_candidate('m1', 0.97)]
         server = create_mcp_server(mock_service)
 
@@ -341,7 +324,7 @@ class TestRestatementIsRedirectedNotRejected:
         """
         mock_service = AsyncMock()
         configure_triage_config(mock_service)
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         mock_service.search.return_value = [search_candidate('m1', 0.97)]
         server = create_mcp_server(mock_service)
 
@@ -360,7 +343,7 @@ class TestRestatementIsRedirectedNotRejected:
         """
         mock_service = AsyncMock()
         configure_triage_config(mock_service)
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         mock_service.search.return_value = [
             search_candidate('m-low', 0.72, store_rank=1),
             search_candidate('m-best', 0.98, store_rank=2),
@@ -386,7 +369,7 @@ class TestRestatementIsRedirectedNotRejected:
         """
         mock_service = AsyncMock()
         configure_triage_config(mock_service)
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         mock_service.search.return_value = [
             search_candidate('m-other', 0.97, category=MemoryCategory.observations_and_summaries),
         ]
@@ -412,7 +395,7 @@ class TestTheFlagOffPathIsUntouched:
     async def test_a_near_duplicate_write_is_still_rejected(self) -> None:
         mock_service = AsyncMock()
         configure_triage_config(mock_service, enabled=False)
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         mock_service.search.return_value = [search_candidate('m1', 0.97)]
         server = create_mcp_server(mock_service)
 
@@ -429,7 +412,7 @@ class TestTheFlagOffPathIsUntouched:
         configure_triage_config(
             mock_service, enabled=False, topic_clusters=[topic_cluster()],
         )
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         mock_service.search.return_value = []
         server = create_mcp_server(mock_service)
 
@@ -450,7 +433,7 @@ class TestTheFlagOffPathIsUntouched:
         """
         mock_service = AsyncMock()
         configure_triage_config(mock_service, enabled=False)
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         mock_service.search.return_value = []
         server = create_mcp_server(mock_service)
 
@@ -475,7 +458,7 @@ class TestTheFlagOnPathRetiresBothRejectGuards:
     async def test_the_near_duplicate_reject_is_unreachable(self) -> None:
         mock_service = AsyncMock()
         configure_triage_config(mock_service, enabled=True)
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         mock_service.search.return_value = [search_candidate('m1', 0.97)]
         server = create_mcp_server(mock_service)
 
@@ -520,7 +503,7 @@ class TestTheFlagOnPathRetiresBothRejectGuards:
         configure_triage_config(
             mock_service, enabled=True, topic_clusters=[topic_cluster()],
         )
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         mock_service.search.return_value = []
         server = create_mcp_server(mock_service)
 
@@ -543,7 +526,7 @@ class TestTheFlagOnPathRetiresBothRejectGuards:
             configure_triage_config(
                 mock_service, enabled=True, topic_clusters=[topic_cluster()],
             )
-            _configure_pass_through_add_memory(mock_service)
+            configure_pass_through_add_memory(mock_service)
             mock_service.search.return_value = [search_candidate('m1', score)]
             server = create_mcp_server(mock_service)
 
@@ -567,7 +550,7 @@ class TestTheForceStoreArms:
         """
         mock_service = AsyncMock()
         configure_triage_config(mock_service, enabled=True)
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         mock_service.search.return_value = [search_candidate('m1', 0.99)]
         server = create_mcp_server(mock_service)
 
@@ -588,7 +571,7 @@ class TestTheForceStoreArms:
         """
         mock_service = AsyncMock()
         configure_triage_config(mock_service, enabled=True)
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         server = create_mcp_server(mock_service)
 
         await _call(server, metadata={'allow_near_duplicate': True})
@@ -605,7 +588,7 @@ class TestTheForceStoreArms:
         """
         mock_service = AsyncMock()
         configure_triage_config(mock_service, enabled=True)
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         server = create_mcp_server(mock_service)
 
         await _call(
@@ -640,7 +623,7 @@ class TestTheForceStoreArms:
         """
         mock_service = AsyncMock()
         configure_triage_config(mock_service, enabled=True)
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         mock_service.search.return_value = [search_candidate('m1', 0.99)]
         server = create_mcp_server(mock_service)
 
@@ -674,7 +657,7 @@ class TestTheForceStoreArms:
         """
         mock_service = AsyncMock()
         configure_triage_config(mock_service, enabled=True)
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         mock_service.search.return_value = [search_candidate('canonical-A', 0.97)]
         server = create_mcp_server(mock_service)
 
@@ -703,7 +686,7 @@ class TestTheForceStoreArms:
         """
         mock_service = AsyncMock()
         configure_triage_config(mock_service, enabled=True)
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         mock_service.search.return_value = [search_candidate('canonical-A', 0.97)]
         server = create_mcp_server(mock_service)
 
@@ -731,7 +714,7 @@ class TestTheForceStoreArms:
         """
         mock_service = AsyncMock()
         configure_triage_config(mock_service, enabled=True)
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         mock_service.search.return_value = [search_candidate('canonical-A', 0.97)]
         server = create_mcp_server(mock_service)
 
@@ -753,7 +736,7 @@ class TestTheForceStoreArms:
         """
         mock_service = AsyncMock()
         configure_triage_config(mock_service, enabled=True)
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         mock_service.search.return_value = [search_candidate('canonical-A', 0.97)]
         server = create_mcp_server(mock_service)
 
@@ -791,7 +774,7 @@ class TestTheForceStoreArms:
         for outcome in (OUTCOME_RESTATED, OUTCOME_AMENDED, OUTCOME_CONTESTED):
             mock_service = AsyncMock()
             configure_triage_config(mock_service, enabled=True)
-            _configure_pass_through_add_memory(mock_service)
+            configure_pass_through_add_memory(mock_service)
             mock_service.search.return_value = [search_candidate('canonical-A', 0.97)]
             with patch.object(
                 tools, 'triage_write',
@@ -838,7 +821,7 @@ class TestC1HoldsEndToEnd:
         counter = _install_counter(monkeypatch)
         mock_service = AsyncMock()
         configure_triage_config(mock_service, enabled=True)
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         mock_service.search.side_effect = RuntimeError('mem0 unreachable')
         server = create_mcp_server(mock_service)
 
@@ -868,7 +851,7 @@ class TestC1HoldsEndToEnd:
         counter = _install_counter(monkeypatch)
         mock_service = AsyncMock()
         configure_triage_config(mock_service, enabled=True)
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         mock_service.search.return_value = SearchResults(
             [], degraded=True, failed_stores=['mem0'],
         )
@@ -891,7 +874,7 @@ class TestC1HoldsEndToEnd:
         counter = _install_counter(monkeypatch)
         mock_service = AsyncMock()
         configure_triage_config(mock_service, enabled=True)
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         mock_service.search.side_effect = TypeError(
             "search() got an unexpected keyword argument 'categories'"
         )
@@ -985,7 +968,7 @@ class TestC1HoldsEndToEnd:
         for label, wiring in scenarios:
             mock_service = AsyncMock()
             configure_triage_config(mock_service, enabled=True)
-            _configure_pass_through_add_memory(mock_service)
+            configure_pass_through_add_memory(mock_service)
             mock_service.search = wiring['search']
             verdict = wiring.get('verdict')
             forced = (
@@ -1022,7 +1005,7 @@ class TestC1HoldsEndToEnd:
         for score in (0.0, 0.10, 0.69, T_LOW, 0.80, T_HIGH, 0.97, 1.0):
             mock_service = AsyncMock()
             configure_triage_config(mock_service, enabled=True)
-            _configure_pass_through_add_memory(mock_service)
+            configure_pass_through_add_memory(mock_service)
             mock_service.search.return_value = [search_candidate('m1', score)]
             server = create_mcp_server(mock_service)
 
@@ -1058,7 +1041,7 @@ class TestC1HoldsEndToEnd:
         _install_counter(monkeypatch)
         mock_service = AsyncMock()
         configure_triage_config(mock_service, enabled=True)
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         server = create_mcp_server(mock_service)
 
         result = await _call(server, category=category)
@@ -1135,7 +1118,7 @@ class TestTheFailOpenStormReachesAnOperator:
         root.mkdir()
         mock_service = AsyncMock()
         configure_triage_config(mock_service, enabled=True)
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         mock_service.search.side_effect = RuntimeError('mem0 unreachable')
         server = create_mcp_server(
             mock_service, known_projects={_PROJECT_ID: str(root)},
@@ -1180,7 +1163,7 @@ class TestTheFailOpenStormReachesAnOperator:
         _install_counter(monkeypatch)
         mock_service = AsyncMock()
         configure_triage_config(mock_service, enabled=True)
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         mock_service.search.side_effect = RuntimeError('mem0 unreachable')
         return create_mcp_server(
             mock_service,
@@ -1274,7 +1257,7 @@ class TestTheFailOpenStormReachesAnOperator:
             roots[pid].mkdir()
         mock_service = AsyncMock()
         configure_triage_config(mock_service, enabled=True)
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         mock_service.search.side_effect = RuntimeError('mem0 unreachable')
         server = create_mcp_server(
             mock_service,
@@ -1316,7 +1299,7 @@ class TestTheFailOpenStormReachesAnOperator:
         root.mkdir()
         mock_service = AsyncMock()
         configure_triage_config(mock_service, enabled=True)
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         mock_service.search.side_effect = RuntimeError('mem0 unreachable')
         server = create_mcp_server(
             mock_service, known_projects={_PROJECT_ID: str(root)},
@@ -1349,7 +1332,7 @@ class TestTheFailOpenStormReachesAnOperator:
         _install_counter(monkeypatch)
         mock_service = AsyncMock()
         configure_triage_config(mock_service, enabled=True)
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         mock_service.search.side_effect = RuntimeError('mem0 unreachable')
         # A registry that KNOWS this project (so the write-boundary gate lets
         # it through) but maps it to a root with no escalation queue is not
@@ -1538,7 +1521,7 @@ class TestEveryWiredAttachKindReachesThePersistedChild:
         counter = _install_counter(monkeypatch)
         mock_service = AsyncMock()
         configure_triage_config(mock_service, enabled=True)
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         monkeypatch.setattr(
             tools, 'triage_write',
             AsyncMock(return_value=BandDecision(
@@ -1570,7 +1553,7 @@ class TestTheAckDisclosesClippedCandidates:
     async def test_a_retrieval_that_fills_candidate_k_is_on_the_ack(self) -> None:
         mock_service = AsyncMock()
         configure_triage_config(mock_service, candidate_k=1)
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         mock_service.search.return_value = SearchResults([search_candidate('m1', 0.97)])
         server = create_mcp_server(mock_service)
 
@@ -1589,7 +1572,7 @@ class TestTheAckDisclosesClippedCandidates:
         )
         mock_service = AsyncMock()
         configure_triage_config(mock_service)
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         monkeypatch.setattr(tools, 'triage_write', AsyncMock(return_value=BandDecision(
             OUTCOME_RESTATED, 'canonical-A', 0.95, T_HIGH, T_LOW, truncation_facts=facts,
         )))
@@ -1606,7 +1589,7 @@ class TestTheAckDisclosesClippedCandidates:
     async def test_a_decision_with_no_facts_adds_no_key(self) -> None:
         mock_service = AsyncMock()
         configure_triage_config(mock_service)
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         mock_service.search.return_value = SearchResults([search_candidate('m1', 0.97)])
         server = create_mcp_server(mock_service)
 
@@ -1644,7 +1627,7 @@ class TestTheRealJudgeIsWiredAtTheToolSeam:
     def _service(score: float = _MIDDLE_BAND) -> AsyncMock:
         mock_service = AsyncMock()
         configure_triage_config(mock_service, enabled=True)
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         mock_service.search.return_value = [search_candidate('canonical-A', score)]
         return mock_service
 
@@ -1851,7 +1834,7 @@ class TestAVerdictWithNoWiredAttachKindIsVisible:
         counter = _install_counter(monkeypatch)
         mock_service = AsyncMock()
         configure_triage_config(mock_service, enabled=True)
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         monkeypatch.setattr(
             tools, 'triage_write',
             AsyncMock(return_value=BandDecision(
@@ -1890,7 +1873,7 @@ class TestAFailOpenIsMarkedOnTheAck:
     def _service(**search) -> AsyncMock:
         mock_service = AsyncMock()
         configure_triage_config(mock_service, enabled=True)
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         for attr, value in search.items():
             setattr(mock_service.search, attr, value)
         return mock_service
@@ -2018,7 +2001,7 @@ class TestAFailOpenIsMarkedOnTheAck:
     async def test_triage_disabled_is_not_marked(self) -> None:
         mock_service = AsyncMock()
         configure_triage_config(mock_service, enabled=False)
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         mock_service.search.side_effect = RuntimeError('mem0 unreachable')
 
         result = await _call(create_mcp_server(mock_service))
@@ -2043,7 +2026,7 @@ class TestAContestedVerdictLandsAsAFlaggedAmendmentChild:
         """A server whose triage answers `contested` naming *canonical*."""
         mock_service = AsyncMock()
         configure_triage_config(mock_service, enabled=True)
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         monkeypatch.setattr(
             tools, 'triage_write',
             AsyncMock(return_value=BandDecision(
@@ -2187,7 +2170,7 @@ class TestOnlyTriageWritesTheTriageContestMarker:
         """The marker attests a triage contest, not a triage link."""
         mock_service = AsyncMock()
         configure_triage_config(mock_service, enabled=True)
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         monkeypatch.setattr(
             tools, 'triage_write',
             AsyncMock(return_value=BandDecision(
@@ -2215,7 +2198,7 @@ class TestOnlyTriageWritesTheTriageContestMarker:
         """
         mock_service = AsyncMock()
         configure_triage_config(mock_service, enabled=enabled)
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         if enabled:
             mock_service.search.return_value = [search_candidate('canonical-A', 0.97)]
         else:
@@ -2250,7 +2233,7 @@ class TestOnlyTriageWritesTheTriageContestMarker:
         """The marker is not attach-owned, so it does not force-store."""
         mock_service = AsyncMock()
         configure_triage_config(mock_service, enabled=True)
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         mock_service.search.return_value = [search_candidate('canonical-A', 0.97)]
         server = create_mcp_server(mock_service)
 
@@ -2303,7 +2286,7 @@ class TestReconMarkerWritesSkipTriage:
     def _service() -> AsyncMock:
         mock_service = AsyncMock()
         configure_triage_config(mock_service, enabled=True)
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         mock_service.search.return_value = [search_candidate('canonical-A', _MIDDLE_BAND)]
         return mock_service
 

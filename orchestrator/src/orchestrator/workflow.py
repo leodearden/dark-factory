@@ -24,7 +24,9 @@ from typing import TYPE_CHECKING, Any, Literal, NamedTuple, Protocol, TypeVar, c
 
 # escalation.pins is pure and imports only escalation.models, so it is
 # cycle-safe at module top (harness.py imports it the same way);
-# escalation.classify is likewise pure over escalation.models.
+# escalation.classify is likewise pure over escalation.models, and
+# escalation.categories imports nothing from the package.
+from escalation.categories import EscalationCategory
 from escalation.classify import closed_by_non_sweep_resolver
 from escalation.dedupe import submit_or_dedupe
 from escalation.pins import is_queue_handoff, needs_human
@@ -106,6 +108,11 @@ from orchestrator.curator_submit import SubmitBatchResult, submit_task_batch
 from orchestrator.delivered_checks import (
     DeliveredChecksBlock,
     gate_mark_done_on_delivered_checks,
+)
+from orchestrator.dispatch_base import (
+    MergerDisposition,
+    find_base_conflict,
+    settle_base_conflict,
 )
 from orchestrator.dry_run_unblock import (
     investigation_in_flight,
@@ -3140,6 +3147,11 @@ class TaskWorkflow:
             if _mrp is not None:
                 return _mrp
 
+            # Never plan on a resumed base known to conflict with main (task 7736).
+            _settled = await self._settle_conflicting_base()
+            if _settled is not None:
+                return _settled
+
             # ── Lever C: SIMPLE_TASK optimistic path ──────────────────
             # Dispatch a single Sonnet agent that explores, plans (via
             # plan-tools MCP), and implements end-to-end when the task's
@@ -4128,7 +4140,10 @@ class TaskWorkflow:
         for _attempt in range(self.config.max_pre_merge_retries):
             main_before = await self.git_ops.get_main_sha()
             if not await self.git_ops.rebase_onto_main(self.worktree):
-                return False  # true conflict — queue will detect it
+                # Not a conflict verdict: a branch carrying a dispatch-start
+                # merge of main always fails a rebase yet merges cleanly. The
+                # queue's merge-tree probe decides (task 7736).
+                return False
             await self._restamp_branch_base_if_no_own_commits()
             if (
                 self.config.pre_merge_reverify
@@ -13330,17 +13345,48 @@ class TaskWorkflow:
             f'Task {self.task_id}: merge conflicts detected, '
             f'resolving outside queue'
         )
+        # Rebase onto current main so MERGER works on up-to-date state
+        if await self.git_ops.rebase_onto_main(self.worktree):
+            await self._restamp_branch_base_if_no_own_commits()
+        merger_result, verdict = await self._invoke_merger(conflict_details)
+
+        if not merger_result.success or verdict is None:
+            # Fail-safe (I-FAIL-SAFE): an invocation failure, an absent
+            # verdict, or a malformed one all block the merge — a merger
+            # that produces no trustworthy disposition must never proceed.
+            report = merger_failure_report(
+                merger_result, observed_at=datetime.now(UTC).isoformat(),
+            )
+            self._write_merge_failure_review('merger_blocked', report.detail)
+            return await self._mark_blocked(
+                report.reason, detail=report.detail, evidence=report.evidence,
+                suggested_action=report.suggested_action, merge_phase=merge_phase,
+            )
+
+        if verdict['blocked']:
+            reason = self._blocked_verdict_reason(verdict, merger_result)
+            self._write_merge_failure_review('merger_blocked', reason)
+            return await self._mark_blocked(reason, merge_phase=merge_phase)
+
+        # Re-submit to queue (now resolved, needs fresh merge)
+        return await self._submit_to_merge_queue(
+            branch_name, pre_rebased=False, merge_phase=merge_phase,
+        )
+
+    async def _invoke_merger(self, conflicts: str) -> tuple[AgentResult, dict | None]:
+        """Run MERGER on *conflicts*: its result, and its disposition when trustworthy.
+
+        The verdict is ``None`` when the merger wrote none or a malformed one;
+        callers treat that, like a failed invocation, as blocked.
+        """
+        assert self.worktree is not None and self.artifacts is not None
         task_intent = (
             f"Task: {self.task.get('title', '')}\n"
             f"{self.task.get('description', '')}"
         )
         build_prompt = partial(
-            self.briefing.build_merger_prompt, conflict_details, task_intent,
+            self.briefing.build_merger_prompt, conflicts, task_intent,
         )
-
-        # Rebase onto current main so MERGER works on up-to-date state
-        if await self.git_ops.rebase_onto_main(self.worktree):
-            await self._restamp_branch_base_if_no_own_commits()
         # I-FRESH: never consume a stale verdict from a prior invocation on
         # this same worktree (mirrors steward.py's pre-triage clear).
         self.artifacts.clear_verdict('merger')
@@ -13379,29 +13425,71 @@ class TaskWorkflow:
         verdict = envelope.get('verdict') if isinstance(envelope, dict) else None
         if not isinstance(verdict, dict) or not isinstance(verdict.get('blocked'), bool):
             verdict = None
+        return merger_result, verdict
 
+    @staticmethod
+    def _blocked_verdict_reason(verdict: dict, merger_result: AgentResult) -> str:
+        """A blocked verdict's reason, else the merger's output in its place."""
+        return verdict.get('reason') or f'Merger blocked: {merger_result.output[:200]}'
+
+    async def _merger_disposition(self, brief: str) -> MergerDisposition:
+        """The dispatch_base MergerCall: MERGER on *brief*, read fail-safe."""
+        merger_result, verdict = await self._invoke_merger(brief)
         if not merger_result.success or verdict is None:
-            # Fail-safe (I-FAIL-SAFE): an invocation failure, an absent
-            # verdict, or a malformed one all block the merge — a merger
-            # that produces no trustworthy disposition must never proceed.
             report = merger_failure_report(
                 merger_result, observed_at=datetime.now(UTC).isoformat(),
             )
-            self._write_merge_failure_review('merger_blocked', report.detail)
-            return await self._mark_blocked(
-                report.reason, detail=report.detail, evidence=report.evidence,
-                suggested_action=report.suggested_action, merge_phase=merge_phase,
-            )
-
+            return MergerDisposition(resolved=False, reason=report.reason, detail=report.detail)
         if verdict['blocked']:
-            reason = verdict.get('reason') or f'Merger blocked: {merger_result.output[:200]}'
-            self._write_merge_failure_review('merger_blocked', reason)
-            return await self._mark_blocked(reason, merge_phase=merge_phase)
+            return MergerDisposition(
+                resolved=False, reason=self._blocked_verdict_reason(verdict, merger_result),
+            )
+        return MergerDisposition(resolved=True, reason=verdict.get('reason') or '')
 
-        # Re-submit to queue (now resolved, needs fresh merge)
-        return await self._submit_to_merge_queue(
-            branch_name, pre_rebased=False, merge_phase=merge_phase,
+    async def _settle_conflicting_base(self) -> WorkflowOutcome | None:
+        """Merge main into a resumed branch that conflicts with it, or block: see dispatch_base.py."""
+        if self._worktree_external or self._train is not None:
+            return None
+        assert self.worktree is not None and self.artifacts is not None
+        try:
+            conflict = await find_base_conflict(self.git_ops, self.worktree)
+        except Exception:
+            logger.warning(
+                'Task %s: could not probe the resumed branch against main; '
+                'planning on it unchecked', self.task_id, exc_info=True,
+            )
+            return None
+        if conflict is None:
+            return None
+        if self.event_store:
+            self.event_store.emit(
+                EventType.dispatch_base_conflict,
+                task_id=self.task_id,
+                phase=self.state.value,
+                data=conflict.to_event_payload(),
+            )
+        settlement = await settle_base_conflict(
+            self.git_ops, self.worktree, conflict,
+            branch=f'{self.git_ops.config.branch_prefix}{self.task_id}',
+            merger=self._merger_disposition,
         )
+        if not settlement.settled:
+            return await self._mark_blocked(
+                settlement.block_reason(), detail=settlement.block_detail(),
+                category=EscalationCategory.MERGE_NEEDS_REBASE.value,
+                dry_run_spawn=(
+                    DryRunSpawn.NEVER if settlement.declined_by_merger
+                    else DryRunSpawn.OUTSIDE_MERGE_PHASE
+                ),
+            )
+        self.artifacts.update_base_commit(conflict.main_sha)
+        self._base_commit = conflict.main_sha
+        logger.info(
+            'Task %s: merged main %s into the resumed branch at dispatch start '
+            '(conflicts on %s)', self.task_id, conflict.main_sha[:8],
+            ', '.join(conflict.conflicted_paths),
+        )
+        return None
 
     def _submit_halt_owning_escalation(self, esc: Escalation) -> None:
         """Submit a halt-owning escalation and register halt ownership.  Non-waiting.

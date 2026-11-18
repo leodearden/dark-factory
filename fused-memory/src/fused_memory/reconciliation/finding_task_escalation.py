@@ -43,6 +43,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Mapping
+from collections.abc import Set as AbstractSet
 from datetime import datetime, timedelta
 from typing import Any, Protocol
 
@@ -51,10 +52,12 @@ from shared.timestamps import parse_timestamp_or_warn
 __all__ = [
     'FINDING_TASK_ESCALATION_CATEGORY',
     'FINDING_TASK_ESCALATION_LEVEL',
+    'LIVENESS_UNKNOWN_DETAIL_KEY',
     'RoutedRecordView',
     'TerminalRoutedRecordView',
     'build_finding_task_escalation_kwargs',
     'is_routable_task_id',
+    'liveness_unknown_detail',
     'recent_conversion_suppresses_refile',
     'resolve_finding_task_target',
     'routed_record_carries_finding',
@@ -187,6 +190,21 @@ _ESCALATION_SEVERITY = 'info'
 _AGENT_ROLE = 'reconciliation-harness'
 
 _FINDING_FINGERPRINT_KEY = 'finding_fingerprint'
+
+#: Detail key, on both a persistent-finding recon escalation and a routed
+#: finding-task record, listing the task ids whose liveness probe failed: the
+#: record was filed because no id was confirmed live, not because each was
+#: confirmed not live (task 5370).
+LIVENESS_UNKNOWN_DETAIL_KEY = 'liveness_unknown_task_ids'
+
+
+def liveness_unknown_detail(task_ids: AbstractSet[str]) -> dict[str, list[str]]:
+    """The detail entries recording *task_ids* as liveness-unknown.
+
+    *task_ids* sorted under ``LIVENESS_UNKNOWN_DETAIL_KEY``, or no entry at all
+    when it is empty, so a record whose probes all ran carries no such key.
+    """
+    return {LIVENESS_UNKNOWN_DETAIL_KEY: sorted(task_ids)} if task_ids else {}
 
 _ROUTABLE_TASK_ID = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]*')
 
@@ -335,6 +353,7 @@ def build_finding_task_escalation_kwargs(
     run_id: str,
     persistence: int,
     finding_fingerprint: str,
+    target_liveness_unknown: bool = False,
 ) -> dict[str, Any]:
     """Build the ``Escalation(...)`` keyword arguments for *finding*.
 
@@ -370,6 +389,10 @@ def build_finding_task_escalation_kwargs(
       exists to decide.  The finding's OWN ``suggested_action`` text is carried
       in ``detail``.
 
+    *target_liveness_unknown* records that *task_id*'s liveness probe failed:
+    ``detail`` then lists it per :func:`liveness_unknown_detail`.  A routed
+    record is about its one target, so no other id can be marked.
+
     Pure: no I/O, and *finding* is not mutated.
     """
     finding_category = str(finding.get('category') or '') or 'unknown'
@@ -379,24 +402,22 @@ def build_finding_task_escalation_kwargs(
         f'{persistence} cycles): {" ".join(description.split())}'
     )
 
-    detail = json.dumps(
-        {
-            'finding_id': finding.get('finding_id'),
-            'category': finding.get('category'),
-            'severity': finding.get('severity'),
-            'description': finding.get('description'),
-            'suggested_action': finding.get('suggested_action'),
-            'actionable': finding.get('actionable'),
-            'affected_ids': finding.get('affected_ids'),
-            'cited_tasks': finding.get('cited_tasks'),
-            'run_id': run_id,
-            'project_id': project_id,
-            'persistence': persistence,
-            _FINDING_FINGERPRINT_KEY: finding_fingerprint,
-        },
-        default=str,
-        indent=2,
-    )
+    detail_dict: dict[str, Any] = {
+        'finding_id': finding.get('finding_id'),
+        'category': finding.get('category'),
+        'severity': finding.get('severity'),
+        'description': finding.get('description'),
+        'suggested_action': finding.get('suggested_action'),
+        'actionable': finding.get('actionable'),
+        'affected_ids': finding.get('affected_ids'),
+        'cited_tasks': finding.get('cited_tasks'),
+        'run_id': run_id,
+        'project_id': project_id,
+        'persistence': persistence,
+        _FINDING_FINGERPRINT_KEY: finding_fingerprint,
+        **liveness_unknown_detail({task_id} if target_liveness_unknown else frozenset()),
+    }
+    detail = json.dumps(detail_dict, default=str, indent=2)
 
     return {
         'task_id': task_id,

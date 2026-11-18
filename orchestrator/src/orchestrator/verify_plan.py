@@ -39,6 +39,10 @@ from orchestrator.verify_cmd import (
     strip_cwd,
 )
 from orchestrator.verify_evidence import Leg
+from orchestrator.verify_fallback_floor import (
+    fallback_test_floor_reason,
+    has_configured_suite,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1176,6 +1180,9 @@ def _derive_fallback_runs(
     existing_files: list[str],
     config: OrchestratorConfig | None,
     worktree_reader: Callable[[str], str | None],
+    *,
+    role: Literal['merge', 'task'] = 'task',
+    fallback_test_floor: bool = True,
 ) -> list[PlannedRun]:
     """Derive the fallback (no-module_configs) branch's PlannedRuns.
 
@@ -1192,6 +1199,11 @@ def _derive_fallback_runs(
     commit 7c9b316260). CONFTEST always full-suites regardless — a
     directory target is always safe to run, even bare (task-1077 golden,
     commit cb7277926d).
+
+    The fallback test floor (``orchestrator/src/orchestrator/verify_fallback_floor.py::fallback_test_floor_reason``)
+    then replaces that pytest decision with ``config.test_command`` run whole
+    for *role* (unless *fallback_test_floor* is False); rationale:
+    docs/fallback-test-floor.md.
 
     Fidelity caveat: this derives an IDEALIZED D1/D2 record against the flat
     *existing_files* list and *config*'s global commands — it does NOT model
@@ -1252,7 +1264,6 @@ def _derive_fallback_runs(
     lint_command = config.lint_command if config is not None else 'ruff check'
     type_check_command = config.type_check_command if config is not None else 'pyright'
     test_command = config.test_command if config is not None else 'pytest'
-    has_real_suite = bool(test_command) and test_command != 'pytest'
 
     # Guard: content is only consulted by classify_file's STRUCTURAL check, so
     # skip the I/O entirely when there is no type-check command to widen.
@@ -1261,10 +1272,7 @@ def _derive_fallback_runs(
         f: classify_file(f, worktree_reader(f) if need_structural else None)
         for f in py_files
     }
-    conftest_trigger = next((f for f, k in kinds.items() if k is FileKind.CONFTEST), None)
-    test_data_trigger = next((f for f, k in kinds.items() if k is FileKind.TEST_DATA), None)
     structural_trigger = next((f for f, k in kinds.items() if k is FileKind.STRUCTURAL), None)
-    collectable_tests = [f for f, k in kinds.items() if k is FileKind.COLLECTABLE_TEST]
 
     runs: list[PlannedRun] = []
 
@@ -1303,68 +1311,82 @@ def _derive_fallback_runs(
             _FALLBACK_PREFIX, None, ScopeKind.SKIPPED, 'pyright: no type_check_command configured',
         ))
 
-    # -- pytest: D1 (CONFTEST/TEST_DATA -> FULL_SUITE) reconciled against
-    # whether a real suite exists to run full. --
+    pytest_run = _fallback_pytest_decision(kinds, test_command)
+    if fallback_test_floor:
+        floor = fallback_test_floor_reason(
+            existing_files, test_command, role, derived_target=pytest_run.cmd is not None,
+        )
+        if floor is not None:
+            pytest_run = PlannedRun(
+                _FALLBACK_PREFIX, parse_config_command(test_command), ScopeKind.FULL_SUITE, floor,
+            )
+    runs.append(pytest_run)
+
+    return runs
+
+
+def _fallback_pytest_decision(kinds: dict[str, FileKind], test_command: str) -> PlannedRun:
+    """The fallback's diff-derived pytest run: D1 (CONFTEST/TEST_DATA -> FULL_SUITE)
+    reconciled against whether a real suite exists to run full."""
+    conftest_trigger = next((f for f, k in kinds.items() if k is FileKind.CONFTEST), None)
+    test_data_trigger = next((f for f, k in kinds.items() if k is FileKind.TEST_DATA), None)
+    collectable_tests = [f for f, k in kinds.items() if k is FileKind.COLLECTABLE_TEST]
+    has_real_suite = has_configured_suite(test_command)
+
     if conftest_trigger is not None or test_data_trigger is not None:
         if has_real_suite:
             trigger = conftest_trigger if conftest_trigger is not None else test_data_trigger
             kind_word = 'conftest touched' if conftest_trigger is not None else 'test-data module touched'
-            test_cmd = parse_config_command(test_command)
-            runs.append(PlannedRun(
-                _FALLBACK_PREFIX, test_cmd, ScopeKind.FULL_SUITE,
+            return PlannedRun(
+                _FALLBACK_PREFIX, parse_config_command(test_command), ScopeKind.FULL_SUITE,
                 f'pytest: {kind_word} ({trigger}) — full suite required',
-            ))
-        elif conftest_trigger is not None:
+            )
+        if conftest_trigger is not None:
             # No real suite, but a conftest's directory target is always
             # safe to run — never skip it (task-1077 golden cb7277926d).
-            targets = _fallback_pytest_targets(py_files)
-            test_cmd = scope_to(parse_config_command('pytest'), targets)
-            runs.append(PlannedRun(
-                _FALLBACK_PREFIX, test_cmd, ScopeKind.FULL_SUITE,
+            targets = _fallback_pytest_targets(list(kinds))
+            return PlannedRun(
+                _FALLBACK_PREFIX, scope_to(parse_config_command('pytest'), targets),
+                ScopeKind.FULL_SUITE,
                 f'pytest: conftest touched ({conftest_trigger}) — full suite required '
                 '(directory-scoped, no configured suite)',
-            ))
-        else:
-            # Bare-fallback data-module (task-1852 7c9b316260): no real suite
-            # to run and no conftest to anchor a directory target — an
-            # explicit reasoned SKIPPED, never a silent drop.
-            runs.append(PlannedRun(
-                _FALLBACK_PREFIX, None, ScopeKind.SKIPPED,
-                f'pytest: test-data module touched ({test_data_trigger}) — no real suite '
-                'configured (bare pytest default); skipping rather than risking rc=5 '
-                '"no tests ran" (task 1852)',
-            ))
-    elif collectable_tests:
+            )
+        # Bare-fallback data-module (task-1852 7c9b316260): no real suite
+        # to run and no conftest to anchor a directory target — an
+        # explicit reasoned SKIPPED, never a silent drop.
+        return PlannedRun(
+            _FALLBACK_PREFIX, None, ScopeKind.SKIPPED,
+            f'pytest: test-data module touched ({test_data_trigger}) — no real suite '
+            'configured (bare pytest default); skipping rather than risking rc=5 '
+            '"no tests ran" (task 1852)',
+        )
+    if collectable_tests:
         if has_real_suite:
             # Fidelity fix (task γ review, correctness finding): mirrors
             # _build_fallback_config's `config.test_command != 'pytest'`
             # branch, which returns the configured suite VERBATIM (unscoped)
             # whenever ANY trigger is present — collectable tests alone
             # included, not just conftest/test-data. Recording FILE_SCOPED
-            # here (as the else branch below does for the bare-default case)
+            # here (as the branch below does for the bare-default case)
             # would misrepresent what actually executes: a real configured
             # suite is never file-scoped by _build_fallback_config, only
             # ever run verbatim or skipped entirely.
-            test_cmd = parse_config_command(test_command)
-            runs.append(PlannedRun(
-                _FALLBACK_PREFIX, test_cmd, ScopeKind.FULL_SUITE,
+            return PlannedRun(
+                _FALLBACK_PREFIX, parse_config_command(test_command), ScopeKind.FULL_SUITE,
                 'pytest: configured suite runs verbatim for touched test file(s) '
                 '(non-default test_command is never file-scoped)',
-            ))
-        else:
-            test_cmd = scope_to(parse_config_command(test_command or 'pytest'), collectable_tests)
-            runs.append(PlannedRun(
-                _FALLBACK_PREFIX, test_cmd, ScopeKind.FILE_SCOPED,
-                'pytest: file-scoped to touched test file(s)',
-                scoped_targets=tuple(collectable_tests),
-            ))
-    else:
-        runs.append(PlannedRun(
-            _FALLBACK_PREFIX, None, ScopeKind.SKIPPED,
-            'pytest: no collectable test files touched — nothing to run',
-        ))
-
-    return runs
+            )
+        return PlannedRun(
+            _FALLBACK_PREFIX,
+            scope_to(parse_config_command(test_command or 'pytest'), collectable_tests),
+            ScopeKind.FILE_SCOPED,
+            'pytest: file-scoped to touched test file(s)',
+            scoped_targets=tuple(collectable_tests),
+        )
+    return PlannedRun(
+        _FALLBACK_PREFIX, None, ScopeKind.SKIPPED,
+        'pytest: no collectable test files touched — nothing to run',
+    )
 
 
 # Extensions considered "real source" for the TRIVIAL / needs_pipeline_guard_check
@@ -1398,6 +1420,7 @@ def derive_verify_plan(
     role: Literal['merge', 'task'] = 'task',
     *,
     list_pkg_tests: Callable[[str], list[str]] | None = None,
+    fallback_test_floor: bool = True,
 ) -> VerifyPlan:
     """Derive the declarative VerifyPlan for one verify attempt (PRD task γ).
 
@@ -1431,7 +1454,17 @@ def derive_verify_plan(
 
     Fallback branch (*module_configs* empty): a single synthetic
     ``'__fallback__'`` module is derived from *config*'s global commands via
-    :func:`_derive_fallback_runs`.
+    :func:`_derive_fallback_runs`. Its pytest run carries the fallback test
+    floor, as an intent record no production caller acts on:
+    ``orchestrator/src/orchestrator/task_verify_dispatch.py::_TaskVerifyDispatcher._scope_of``
+    and ``scripts/hook_module_checks.py::touched_modules`` read only
+    :func:`executed_module_prefixes`, which the floor cannot change. A caller
+    that reconciles this decision against an executed fallback config must
+    pass *fallback_test_floor* False, as
+    ``orchestrator/src/orchestrator/verify.py::_safe_derive_executed_fallback_plan``
+    does: the execution layer can floor differently (the task-2368 mixed
+    root+subproject shape), so the executed record takes its floor from that
+    layer alone.
 
     Fidelity: this plan is no longer just a decision record on either branch
     (task κ, verify-scope-inversion-prd.md) — by the time it reaches
@@ -1470,7 +1503,10 @@ def derive_verify_plan(
                     list_pkg_tests=list_pkg_tests,
                 ))
         return VerifyPlan(runs=tuple(runs))
-    return VerifyPlan(runs=tuple(_derive_fallback_runs(existing_files, config, worktree_reader)))
+    return VerifyPlan(runs=tuple(_derive_fallback_runs(
+        existing_files, config, worktree_reader, role=role,
+        fallback_test_floor=fallback_test_floor,
+    )))
 
 
 def executed_module_prefixes(plan: VerifyPlan) -> frozenset[str]:
