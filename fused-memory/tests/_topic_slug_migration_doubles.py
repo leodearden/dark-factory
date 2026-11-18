@@ -72,3 +72,91 @@ def census_client(answers: dict[str, object]) -> MagicMock:
     client = MagicMock()
     client.call_tool = AsyncMock(side_effect=_call_tool)
     return client
+
+
+_UNSET = object()
+
+
+def write_boundary_service(
+    *,
+    record: object = _UNSET,
+    update_response: object = _UNSET,
+) -> AsyncMock:
+    """A stateless ``MemoryService`` double for the write boundary.
+
+    Children are configured through ``.return_value`` rather than reassigned
+    to fresh ``AsyncMock``s, because a reassigned child stops propagating into
+    the parent's ``mock_calls`` — and the ORDER of the live re-read relative to
+    the write is one of the things this suite has to pin.
+    """
+    service = AsyncMock()
+    service.get_memory_by_id.return_value = (
+        {'id': 'm1', 'metadata': {'topic': 'legacy_topic'}}
+        if record is _UNSET else record
+    )
+    if update_response is _UNSET:
+        service.update_memory.side_effect = lambda **kwargs: {
+            'status': 'updated',
+            'store': 'mem0',
+            'id': kwargs['memory_id'],
+            'content_amended': False,
+            'metadata_patched': True,
+        }
+    else:
+        service.update_memory.return_value = update_response
+    return service
+
+
+def mcp_client(*, result: object = None, error: Exception | None = None) -> MagicMock:
+    """A ``FusedMemoryClient`` double.  Injected so no test opens a socket."""
+    client = MagicMock()
+    if error is not None:
+        client.call_tool = AsyncMock(side_effect=error)
+    else:
+        client.call_tool = AsyncMock(
+            return_value=result if result is not None
+            else {'id': '4220', 'updated': True, 'message': 'ok'}
+        )
+    return client
+
+
+def result_row(outcome: str, **overrides) -> dict:
+    row = {
+        'project_id': 'dark_factory',
+        'memory_id': 'm1',
+        'old_topic': 'legacy_topic',
+        'new_topic': 'legacy-topic',
+        'outcome': outcome,
+    }
+    row.update(overrides)
+    return row
+
+
+def refuse_writes_to(service: MagicMock, *memory_ids: str) -> None:
+    """Make *service* refuse every write to *memory_ids*, forwarding the rest."""
+    forward = service.update_memory.side_effect
+    refused = set(memory_ids)
+
+    async def _update(**kwargs):
+        if kwargs['memory_id'] in refused:
+            return {'error_type': 'write_refused', 'error': 'refused by test'}
+        return await forward(**kwargs)
+
+    service.update_memory = AsyncMock(side_effect=_update)
+
+
+def fail_writes_moving_back_to(service: MagicMock, memory_id: str, legacy_topic: str) -> None:
+    """Make *service* raise on the write that would put *memory_id* back on *legacy_topic*.
+
+    That write is the rollback of a rename, so this is how a failed undo is
+    staged; every other write is forwarded.
+    """
+    forward = service.update_memory.side_effect
+
+    async def _update(**kwargs):
+        if (kwargs['memory_id'], kwargs['metadata_patch'].get('topic')) == (
+                memory_id, legacy_topic):
+            raise RuntimeError('undo failed')
+        return await forward(**kwargs)
+
+    service.update_memory = AsyncMock(side_effect=_update)
