@@ -183,6 +183,7 @@ class TestAHighBandWriteIsAJudgedWrite:
         decision = await _triage(_svc(slate), judge, counter)
 
         judge.assert_awaited_once()
+        assert judge.await_args is not None
         asked = judge.await_args.kwargs
         assert asked['decision'].outcome == OUTCOME_JUDGE
         assert asked['decision'].canonical_id == 'm1'

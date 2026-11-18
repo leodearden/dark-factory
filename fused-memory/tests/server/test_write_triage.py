@@ -1422,7 +1422,7 @@ class TestAFailOpenNamesTheStageThatGaveUp:
     async def _triage(service, **kwargs):
         counter = TriageFailOpenCounter(time_provider=_Clock())
         return await triage_write(
-            service, content='c', project_id='p', counter=counter, **kwargs,
+            service, content=_RECORD_TEXT, project_id='p', counter=counter, **kwargs,
         )
 
     def _hoisting_service(self, cosine_to_memories: AsyncMock) -> types.SimpleNamespace:
