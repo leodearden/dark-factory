@@ -468,6 +468,9 @@ def _ok(structured_output: Any = None, cost_usd: float = 0.0) -> AgentResult:
     )
 
 
+_ONE_SAME_ANSWER = {'verdicts': [{'id': 'p1', 'verdict': Verdict.SAME.value, 'reason': 'r'}]}
+
+
 @pytest.fixture
 def brief(tmp_path):
     path = tmp_path / 'brief.md'
@@ -588,8 +591,7 @@ class TestPromptVersion:
 class TestConfiguredAdjudicator:
     @pytest.mark.asyncio
     async def test_a_given_brief_names_the_model_and_prompt_every_shard_carries(self, tmp_path):
-        answer = {'verdicts': [{'id': 'p1', 'verdict': Verdict.SAME.value, 'reason': 'r'}]}
-        invoke = FakeInvoke(_ok(structured_output=answer))
+        invoke = FakeInvoke(_ok(structured_output=_ONE_SAME_ANSWER))
         ask = ClaudeShardAsker(
             brief_text=FIXED_BRIEF, brief_path=tmp_path / 'missing.md', invoke=invoke,
         )
@@ -611,8 +613,7 @@ class TestConfiguredAdjudicator:
     async def test_without_a_brief_text_the_brief_is_read_once_at_construction(self, tmp_path):
         brief = tmp_path / 'brief.md'
         brief.write_text(FIXED_BRIEF, encoding='utf-8')
-        answer = {'verdicts': [{'id': 'p1', 'verdict': Verdict.SAME.value, 'reason': 'r'}]}
-        invoke = FakeInvoke(_ok(structured_output=answer))
+        invoke = FakeInvoke(_ok(structured_output=_ONE_SAME_ANSWER))
         config = LinkHealConfig(shard_size=1)
         adjudicate = configured_adjudicator(config, brief_path=brief, invoke=invoke)
         brief.unlink()
@@ -722,8 +723,7 @@ class TestTheLiveEdgeCapacityGuard:
 
     @pytest.mark.asyncio
     async def test_a_successful_reply_is_returned_as_is(self):
-        answer = {'verdicts': [{'id': 'p1', 'verdict': Verdict.SAME.value, 'reason': 'r'}]}
-        invoke = FakeInvoke(_ok(structured_output=answer))
+        invoke = FakeInvoke(_ok(structured_output=_ONE_SAME_ANSWER))
 
         verdict = await _live_edge_verdict(invoke, _CREDENTIALED)
 
@@ -752,8 +752,7 @@ class TestTheLiveEdgeCredentialGuard:
 
     @pytest.mark.asyncio
     async def test_the_setup_token_reaches_the_cli_call(self):
-        answer = {'verdicts': [{'id': 'p1', 'verdict': Verdict.SAME.value, 'reason': 'r'}]}
-        invoke = FakeInvoke(_ok(structured_output=answer))
+        invoke = FakeInvoke(_ok(structured_output=_ONE_SAME_ANSWER))
 
         verdict = await _live_edge_verdict(invoke, {AGENT_CREDENTIAL_VAR: 'tok-1'})
 
