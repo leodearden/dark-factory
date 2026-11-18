@@ -3034,11 +3034,24 @@ def _artifacts_from_args(argv: list[str] | None = None) -> TaskArtifacts:
 
 
 def server_from_argv(argv: list[str] | None = None) -> FastMCP:
-    """The server a stdio launch with *argv* serves: its artifacts, and only
-    the tools named by its repeatable ``--grant``. No ``--grant`` exposes
-    no tool."""
+    """The server a stdio launch with *argv* serves, over its artifacts.
+
+    A launch carrying ``--grants-enforced`` or any ``--grant`` exposes only
+    the granted tools, so a marked launch with no grant exposes none. A
+    launch carrying neither keeps every tool and logs a WARNING.
+    Why that unmarked case exists: plans/plan-deviation-recording-prd.md D14.
+    """
     args = _cli_parser().parse_args(argv)
-    return create_server(_artifacts_from_namespace(args), frozenset(args.grant or ()))
+    artifacts = _artifacts_from_namespace(args)
+    granted = frozenset(args.grant or ())
+    if args.grants_enforced or granted:
+        return create_server(artifacts, granted)
+    logger.warning(
+        'plan-tools launched without --grants-enforced or any --grant: exposing '
+        'every plan-tools tool, because the launcher predates task 7717. '
+        'Task 10803 removes this path.'
+    )
+    return create_server(artifacts)
 
 
 def _cli_parser() -> argparse.ArgumentParser:
@@ -3064,7 +3077,14 @@ def _cli_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         '--grant', action='append', metavar='NAME',
-        help='A tool this launch exposes; repeatable. With none, no tool is exposed.',
+        help='A tool this launch exposes; repeatable.',
+    )
+    parser.add_argument(
+        '--grants-enforced', action='store_true',
+        help=(
+            'Expose only the --grant tools, so none when no grant is given. '
+            'Every launcher from task 7717 on passes it.'
+        ),
     )
     return parser
 
