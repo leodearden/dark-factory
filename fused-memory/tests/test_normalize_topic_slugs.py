@@ -1721,6 +1721,7 @@ BACKEND_FREE_MODULES: frozenset[str] = frozenset({
     'fused_memory.utils.store_mutation_preflight',
     'fused_memory.maintenance.topic_slug_plan',
     'fused_memory.maintenance.topic_slug_gates',
+    'fused_memory.maintenance.topic_slug_lockstep',
     'fused_memory.reconciliation.consolidation_gate',
 })
 

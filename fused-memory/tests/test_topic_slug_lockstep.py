@@ -19,7 +19,7 @@ from _topic_slug_migration_doubles import (
     write_boundary_service,
 )
 
-from fused_memory.maintenance.topic_slug_gates import pair_gate_blocks
+from fused_memory.maintenance.topic_slug_gates import GateGroup, pair_gate_blocks
 from fused_memory.maintenance.topic_slug_lockstep import (
     WRITE_REASON,
     WRITE_SOURCE,
@@ -28,12 +28,13 @@ from fused_memory.maintenance.topic_slug_lockstep import (
     rename_one,
 )
 from fused_memory.maintenance.topic_slug_plan import Rename
+from fused_memory.reconciliation.consolidation_gate import GATE_METADATA_KEY
 
 # ===========================================================================
 # rename_one — the single write boundary
 # ===========================================================================
 
-def _rename(**overrides) -> object:
+def _rename(**overrides) -> Rename:
     fields = {
         'project_id': 'dark_factory',
         'memory_id': 'm1',
@@ -286,7 +287,7 @@ def _store(*topics: tuple[str, str]) -> dict[str, dict]:
     return {mid: {'metadata': {'topic': topic}} for mid, topic in topics}
 
 
-def _one_group(renames, gate_tasks=()) -> object:
+def _one_group(renames, gate_tasks=()) -> GateGroup:
     """The single :class:`GateGroup` a writer test drives, unpacked."""
     groups, _skips = pair_gate_blocks(renames, list(gate_tasks))
     assert len(groups) == 1, groups
@@ -316,6 +317,7 @@ class TestGateLockstepWriter:
 
         assert [r['outcome'] for r in outcome.results] == ['renamed']
         assert records['m1']['metadata']['topic'] == 'gate-topic'
+        assert outcome.gate_row is not None
         assert outcome.gate_row['outcome'] == 'gate_patched'
         # The write is a NARROW merge of the one block, never a whole-blob
         # replace: `update_task` refuses any replace carrying `done_provenance`.
@@ -340,6 +342,7 @@ class TestGateLockstepWriter:
             service, group, apply=False, client=client)
 
         assert [r['outcome'] for r in outcome.results] == ['would_rename']
+        assert outcome.gate_row is not None
         assert outcome.gate_row['outcome'] == 'would_patch_gate'
         assert records['m1']['metadata']['topic'] == 'gate_topic'
         service.update_memory.assert_not_awaited()
@@ -361,6 +364,7 @@ class TestGateLockstepWriter:
 
         assert {r['outcome'] for r in outcome.results} >= {'memory_not_found'}
         client.call_tool.assert_not_awaited()
+        assert outcome.gate_row is not None
         assert outcome.gate_row['outcome'] == 'gate_lockstep_failed'
         assert outcome.gate_row['half'] == 'memory'
         assert outcome.held_entry is None, 'a held gated pair is reported by its gate row'
@@ -385,6 +389,7 @@ class TestGateLockstepWriter:
         outcome = await rename_group(
             service, group, apply=True, client=client)
 
+        assert outcome.gate_row is not None
         assert outcome.gate_row['outcome'] == 'gate_lockstep_failed'
         assert outcome.gate_row['half'] == 'gate'
         assert 'done_provenance_via_update_task' in str(outcome.gate_row['error'])
@@ -406,6 +411,7 @@ class TestGateLockstepWriter:
         outcome = await rename_group(
             service, group, apply=True, client=client)
 
+        assert outcome.gate_row is not None
         assert outcome.gate_row['outcome'] == 'gate_lockstep_failed'
         assert 'mcp down' in str(outcome.gate_row['error'])
         assert records['m1']['metadata']['topic'] == 'gate_topic'
@@ -433,6 +439,7 @@ class TestGateLockstepWriter:
         outcome = await rename_group(
             service, group, apply=True, client=client)
 
+        assert outcome.gate_row is not None
         assert outcome.gate_row['outcome'] == 'gate_lockstep_failed'
         assert outcome.gate_row['undo_failures']
         assert 'undo failed' in str(outcome.gate_row['undo_failures'])
@@ -477,6 +484,7 @@ class TestGateLockstepWriter:
         outcome = await rename_group(
             service, group, apply=True, client=None)
 
+        assert outcome.gate_row is not None
         assert outcome.gate_row['outcome'] == 'gate_lockstep_failed'
         assert records['m1']['metadata']['topic'] == 'gate_topic'
 
@@ -494,6 +502,7 @@ class TestGateLockstepWriter:
         outcome = await rename_group(
             service, group, apply=True, client=client)
 
+        assert outcome.gate_row is not None
         assert outcome.gate_row['outcome'] == 'gate_lockstep_failed'
         assert records['m1']['metadata']['topic'] == 'gate-topic'
         assert records['m2']['metadata']['topic'] == 'gate_topic'
@@ -508,7 +517,7 @@ class TestUngatedGroupRollback:
     """
 
     @staticmethod
-    def _plain_group() -> object:
+    def _plain_group() -> GateGroup:
         return _one_group([
             Rename('dark_factory', 'm1', 'plain_topic', 'plain-topic'),
             Rename('dark_factory', 'm2', 'plain_topic', 'plain-topic'),
@@ -529,6 +538,7 @@ class TestUngatedGroupRollback:
             ('m1', 'ungated_partial_rename', True),
             ('m2', 'update_failed', None),
         ]
+        assert outcome.held_entry is not None
         assert {key: value for key, value in outcome.held_entry.items() if key != 'note'} == {
             'reason': 'ungated_partial_rename',
             'project_id': 'dark_factory',
@@ -554,6 +564,7 @@ class TestUngatedGroupRollback:
         assert records['m1']['metadata']['topic'] == 'plain-topic'
         (m1_row,) = [r for r in outcome.results if r['memory_id'] == 'm1']
         assert m1_row['undone'] is False
+        assert outcome.held_entry is not None
         assert [failure['memory_id'] for failure in outcome.held_entry['undo_failures']] == ['m1']
         assert 'undo failed' in str(outcome.held_entry['undo_failures'])
         assert outcome.held_entry['on_new_slug_memory_ids'] == ['m1']
@@ -576,6 +587,7 @@ class TestUngatedGroupRollback:
         assert records['m1']['metadata']['topic'] == 'plain-topic'
         assert records['m2']['metadata']['topic'] == 'plain_topic'
         entry = outcome.held_entry
+        assert entry is not None
         assert (entry['moved_memory_ids'], entry['failed_memory_ids'],
                 entry['on_new_slug_memory_ids'], entry['undo_failures']) == (
             [], ['m2'], ['m1'], [])
@@ -615,6 +627,7 @@ class TestUngatedGroupRollback:
             ('m1', 'would_rename'), ('m2', 'rename_error'),
         ]
         entry = outcome.held_entry
+        assert entry is not None
         assert (entry['reason'], entry['moved_memory_ids'], entry['failed_memory_ids']) == (
             'ungated_partial_rename', ['m1'], ['m2'])
         assert (entry['on_new_slug_memory_ids'], entry['undo_failures']) == ([], [])
@@ -629,7 +642,7 @@ class TestDescribePartialUngatedGroup:
     """
 
     @staticmethod
-    def _plain_group(gate_tasks=(), *, members: int = 2) -> object:
+    def _plain_group(gate_tasks=(), *, members: int = 2) -> GateGroup:
         return _one_group([
             Rename('dark_factory', f'm{n}', 'plain_topic', 'plain-topic')
             for n in range(1, members + 1)
@@ -646,6 +659,7 @@ class TestDescribePartialUngatedGroup:
         entry = describe_partial_ungated_group(
             self._plain_group(), self._plain_results('renamed', 'update_failed'))
 
+        assert entry is not None
         assert {key: value for key, value in entry.items() if key != 'note'} == {
             'reason': 'ungated_partial_rename',
             'project_id': 'dark_factory',
@@ -660,6 +674,7 @@ class TestDescribePartialUngatedGroup:
         entry = describe_partial_ungated_group(
             self._plain_group(), self._plain_results('would_rename', 'rename_error'))
 
+        assert entry is not None
         assert entry['moved_memory_ids'] == ['m1']
         assert entry['failed_memory_ids'] == ['m2']
         assert entry['failed_outcomes'] == ['rename_error']
@@ -668,6 +683,7 @@ class TestDescribePartialUngatedGroup:
         entry = describe_partial_ungated_group(
             self._plain_group(), self._plain_results('already_normalized', 'update_failed'))
 
+        assert entry is not None
         assert entry['moved_memory_ids'] == []
         assert entry['failed_memory_ids'] == ['m2']
 
@@ -687,6 +703,7 @@ class TestDescribePartialUngatedGroup:
             self._plain_group(members=3),
             self._plain_results('renamed', 'update_failed', 'memory_not_found'))
 
+        assert entry is not None
         assert entry['moved_memory_ids'] == ['m1']
         assert entry['failed_memory_ids'] == ['m2']
         assert entry['failed_outcomes'] == ['update_failed']
