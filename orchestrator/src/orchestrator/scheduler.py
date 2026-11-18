@@ -95,6 +95,7 @@ from orchestrator.lock_table import (
     UncontestedAcquisition,
     one_holder_per_key,
 )
+from orchestrator.main_health_fix_owner import is_main_health_fix
 from orchestrator.mcp_lifecycle import ORCHESTRATOR_MCP_IDENTITY, mcp_call
 from orchestrator.module_charter import derive_modules, sanitize_files_for_persist
 from orchestrator.overrides import OverrideRow, OverrideSource, OverrideStore
@@ -2270,6 +2271,16 @@ class Scheduler:
         if not isinstance(metadata, dict):
             return False
         return metadata.get('task_kind') == 'deterministic'
+
+    @staticmethod
+    def _exempt_from_psi_hold(task: dict) -> bool:
+        """Whether a dispatch-admission hold must still let *task* dispatch.
+
+        A deterministic task is light (DA-D4); a main-health fix is the exit
+        owner of every merge-waiter hold (DA-D10). Both decisions live in
+        docs/prds/dispatch-admission-load-cap.md.
+        """
+        return Scheduler.is_deterministic(task) or is_main_health_fix(task)
 
     async def tasks_by_train(self, train_id: str) -> list[dict]:
         """Return tasks belonging to ``train_id``, sorted ascending by train.order (root→tip).
@@ -7325,11 +7336,10 @@ class Scheduler:
         refused: list[str] = []
         try:
             for _score, task_id, task, pri in scored:
-                if ctx.psi_hold and not self.is_deterministic(task):
-                    # Dispatch-admission gate (DA3): defer this HEAVY candidate —
-                    # deterministic candidates are exempt (DA-D4) and lower-
-                    # ranked exempt/light candidates behind it still get a turn
-                    # (per-candidate `continue`, not a top-level `return None`).
+                if ctx.psi_hold and not self._exempt_from_psi_hold(task):
+                    # Dispatch-admission gate (DA3): a per-candidate `continue`,
+                    # so exempt candidates ranked behind this one (see
+                    # `_exempt_from_psi_hold`) still get a turn.
                     self._note_heavy_deferral(ctx, ctx.psi_hold, task_id)
                     continue
                 modules = self._get_modules(task)
