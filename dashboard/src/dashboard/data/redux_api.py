@@ -37,6 +37,7 @@ from dashboard.data.datum import (
     validate_datum,
 )
 from dashboard.data.escalation_corpus import EscalationView
+from dashboard.data.label_spans import label_spans
 from dashboard.data.merge_queue import DepthSeries, MergeAttempts
 from dashboard.data.outcome_colors import assign_outcome_colors
 from dashboard.data.performance import PerformanceListing
@@ -1056,18 +1057,24 @@ def shape_burndown(
       contributing row is a hole, and a hole anywhere is a hole (None) in the
       total, never a 0.  Each aggregate series is always ``len(labels)``.
     * Each ``BURNDOWN_BY_PROJECT[p]`` block carries that project's OWN
-      measured rows, generally SHORTER than the union row.  Its series are
-      copied verbatim, so they are co-length with that row exactly as far as
-      the caller made them so — :func:`~dashboard.data.burndown.get_burndown_series`
+      measured rows, generally SHORTER than the union row.  It sends that
+      row as ``label_spans`` — half-open ``[start, stop)`` index ranges into
+      ``BURNDOWN['labels']``, in the row's own order — rather than repeating
+      the timestamps.  The client recovers the row with
+      ``static/redux/burndown_bands.js::projectBurndownBlock``, Python with
+      ``data/label_spans.py::labels_from_spans``.  Its series are copied
+      verbatim, so they are co-length with that row exactly as far as the
+      caller made them so — :func:`~dashboard.data.burndown.get_burndown_series`
       appends one value per key per snapshot row, which is what establishes
       the invariant; this function preserves it but does not enforce it (a
       ragged input is passed through unnormalized, with ``completed`` /
       ``velocity`` zeroed by the length guard in ``compute_window_completion``).
 
-    So a consumer must pair per-project values with per-project ``labels``.
-    Pairing them with ``BURNDOWN['labels']`` both overruns the values and
-    index-shifts them onto the wrong timestamps — the defect fixed at the
-    per-project status-mix chart in ``static/redux/tabs.jsx``.
+    So a consumer must pair per-project values with the project's OWN decoded
+    row, never with the union.  Pairing them with ``BURNDOWN['labels']`` both
+    overruns the values and index-shifts them onto the wrong timestamps — the
+    defect fixed at the per-project status-mix chart in
+    ``static/redux/tabs.jsx``.
 
     Per-project rows are deliberately not densified onto the union row: a
     0-fill would assert a measurement that was never taken, and a carried or
@@ -1103,14 +1110,14 @@ def shape_burndown(
         {pid: _newest_label(series) for pid, series in raw.items()}, served_at,
     )
 
+    union_labels = sorted({label for series in raw.values() for label in series.get('labels') or []})
     by_project = {
         pid: _project_block(
-            raw[pid], filled[pid], completions[pid], provenance[pid], served_at,
+            raw[pid], filled[pid], completions[pid], provenance[pid], served_at, union_labels,
         )
         for pid in raw
     }
 
-    union_labels = sorted({label for series in raw.values() for label in series.get('labels') or []})
     aggregate: dict[str, Any] = {
         'labels': union_labels,
         **_carry_last_sum(filled.values(), union_labels),
@@ -1134,11 +1141,14 @@ def _project_block(
     completion: Mapping[str, Any],
     provenance: _Provenance,
     served_at: datetime,
+    union_labels: Sequence[str],
 ) -> dict[str, Any]:
     """One project's own measured rows, its two served Datums and its parity verdict.
 
-    Parity reads the RAW *series*: *filled*'s census fill of a missing split
-    is display-only and never compared against the cap.
+    The rows' labels go out as spans over *union_labels*; everything else is
+    read from the project's own row.  Parity reads the RAW *series*:
+    *filled*'s census fill of a missing split is display-only and never
+    compared against the cap.
     """
     labels = list(series.get('labels') or [])
     columns = {key: list(filled.get(key) or []) for key in _BURNDOWN_KEYS}
@@ -1147,7 +1157,7 @@ def _project_block(
         **{field: completion[field] for field in _COMPLETION_FIELDS},
     }
     return {
-        'labels': labels,
+        'label_spans': label_spans(labels, union_labels),
         **columns,
         'completed_per_day': completion['completed_per_day'],
         'latest': _served_datum(latest, provenance, served_at),
