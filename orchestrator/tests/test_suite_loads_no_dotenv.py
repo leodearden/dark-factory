@@ -32,7 +32,7 @@ def _secret_names_recorded_by_probe(tmp_path: Path, *extra: str) -> list[str]:
 
     run = run_probe_session(
         PROBE, basetemp=basetemp, kill_secs=60, backstop_secs=240, cwd=cwd,
-        drop=('PYTHON_DOTENV_DISABLED', *(name for name in os.environ if is_secret_env_name(name))),
+        drop_env=('PYTHON_DOTENV_DISABLED', *(name for name in os.environ if is_secret_env_name(name))),
         extra=extra,
     )
 
@@ -58,10 +58,9 @@ def test_dotenv_loading_is_off_in_this_test_process(
 ) -> None:
     dotenv_file = tmp_path / '.env'
     dotenv_file.write_text(f'{FIXTURE_POOL_TOKEN}=loaded\n')
-    monkeypatch.setenv(FIXTURE_POOL_TOKEN, 'restored-away-at-teardown')
-    monkeypatch.delenv(FIXTURE_POOL_TOKEN)
+    monkeypatch.setenv(FIXTURE_POOL_TOKEN, 'sentinel')
 
-    dotenv.load_dotenv(dotenv_file)
-    loaded_value = os.environ.get(FIXTURE_POOL_TOKEN)
+    dotenv.load_dotenv(dotenv_file, override=True)
+    value = os.environ.get(FIXTURE_POOL_TOKEN)
 
-    assert loaded_value is None
+    assert value == 'sentinel'
