@@ -17,6 +17,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _agent_result_fakes import make_agent_result as _make_agent_result
 from _orch_helpers import (
     pydantic_spec,
     skip_role_config_layer,
@@ -174,52 +175,6 @@ def _init_git_repo(path) -> str:
     subprocess.run(['git', '-C', p, 'commit', '-m', 'initial commit'], check=True, capture_output=True)
     result = subprocess.run(['git', '-C', p, 'rev-parse', 'HEAD'], check=True, capture_output=True, text=True)
     return result.stdout.strip()
-
-
-def _make_agent_result(*, success=True, cost_usd=0.50, structured_output=None,
-                       subtype='', output='', duration_ms=1000,
-                       timed_out=False, transcript_turns=None, session_id='',
-                       stderr='', turns=0, api_error_status=None,
-                       schema_salvaged=False, output_tokens=None,
-                       ended_awaiting_background=False):
-    # NOTE: duplicated verbatim as
-    # orchestrator/tests/_b3_gate_fixtures.py::make_agent_result (task 2020 review:
-    # code_duplication). Both copies must be extended together whenever
-    # shared.cli_invoke.AgentResult gains/renames a field consumed by
-    # classify_agent_failure(). Out of this task's locked scope: hoisting
-    # both into the existing orchestrator/tests/_orch_helpers.py shared-helper
-    # module (the established convention for cross-suite test helpers in this
-    # package) is a follow-up.
-    r = MagicMock()
-    r.success = success
-    r.cost_usd = cost_usd
-    r.structured_output = structured_output
-    r.subtype = subtype
-    r.output = output
-    r.duration_ms = duration_ms
-    # Faithful diagnostic-field defaults (mirrors shared.cli_invoke.AgentResult).
-    # A bare MagicMock auto-vivifies every unset attribute as a truthy
-    # MagicMock, which would silently corrupt classify_agent_failure()'s
-    # decision rules: .timed_out truthy -> misclassifies every failure as
-    # TIMED_OUT -> infra; .schema_salvaged truthy -> misclassifies a generic
-    # failure as STRUCTURAL instead of UNKNOWN. Setting explicit defaults for
-    # every field classify_agent_failure() consults (including
-    # .output_tokens, read when formatting the MAX_TURNS summary) keeps
-    # these mocks faithful stand-ins for its decision rules.
-    r.timed_out = timed_out
-    r.transcript_turns = transcript_turns
-    r.session_id = session_id
-    r.stderr = stderr
-    r.turns = turns
-    r.api_error_status = api_error_status
-    r.schema_salvaged = schema_salvaged
-    r.output_tokens = output_tokens
-    # task 2761: classify_agent_failure now reads .ended_awaiting_background
-    # (rule 2, above the timed_out rule). A bare MagicMock auto-vivifies it as
-    # a truthy stand-in, which would misclassify every failure as
-    # ENDED_AWAITING_BACKGROUND -> investigation_failed. Default it False.
-    r.ended_awaiting_background = ended_awaiting_background
-    return r
 
 
 def _assert_one_proposal_persist(scheduler) -> None:

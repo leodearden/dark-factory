@@ -11,11 +11,13 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 import pytest
+from _agent_result_fakes import make_agent_result
 from _b3_gate_fixtures import (
-    LOW_RISK_ENTRY,
+    RECORDED_HEAD_SHA,
+    RECORDED_MAIN_SHA,
     fake_git_fresh,
     fake_git_never_called,
-    make_agent_result,
+    low_risk_entry,
 )
 
 # ---------------------------------------------------------------------------
@@ -34,7 +36,7 @@ class TestPostMergeRedMainAbort:
     def test_low_risk_post_merge_reason_aborts_without_git(self):
         """Case 1: low-risk entry with post-merge block_reason -> ABORT, no git called."""
         from orchestrator.b3_gate import ABORT, POST_MERGE_RED_MAIN_REASON_PREFIX, check_proposal
-        entry = {**LOW_RISK_ENTRY, 'block_reason': self._PM_REASON}
+        entry = low_risk_entry(block_reason=self._PM_REASON)
         result = check_proposal(
             entry, worktree='/tmp', category='task_failure',
             run_git=fake_git_never_called, now=self._NOW,
@@ -53,11 +55,10 @@ class TestPostMergeRedMainAbort:
         Documents that the post-merge abort branch fires regardless of risk_label.
         """
         from orchestrator.b3_gate import ABORT, check_proposal
-        entry = {
-            **LOW_RISK_ENTRY,
-            'risk_label': 'human-review-required',
-            'block_reason': self._PM_REASON,
-        }
+        entry = low_risk_entry(
+            risk_label='human-review-required',
+            block_reason=self._PM_REASON,
+        )
         result = check_proposal(
             entry, worktree='/tmp', category='task_failure',
             run_git=fake_git_never_called, now=self._NOW,
@@ -71,7 +72,7 @@ class TestPostMergeRedMainAbort:
         post-merge abort — reaches FRESH exactly as before this change.
         """
         from orchestrator.b3_gate import FRESH, check_proposal
-        entry = {**LOW_RISK_ENTRY, 'block_reason': 'verify exhausted'}
+        entry = low_risk_entry(block_reason='verify exhausted')
         result = check_proposal(
             entry, worktree='/tmp', category='task_failure',
             run_git=fake_git_fresh, now=self._NOW,
@@ -99,8 +100,8 @@ class TestPostMergeRedMainAbort:
         )
         entry = _build_entry(agent_result, reason=reason, budget_usd=5.0)
         # Mirror T1 sha-stamping (dry_run_unblock.py)
-        entry['head_sha'] = 'aaabbbccc'
-        entry['main_sha'] = 'dddeeefff'
+        entry['head_sha'] = RECORDED_HEAD_SHA
+        entry['main_sha'] = RECORDED_MAIN_SHA
 
         result = check_proposal(
             entry, worktree='/tmp', category='task_failure',
@@ -139,7 +140,7 @@ class TestPostMergeRedMainAbort:
             + ': post-merge unscoped type-check failed for orchestrator'
             + ' on abc123456789. error: Type "int | None" is not assignable to "int"'
         )
-        entry = {**LOW_RISK_ENTRY, 'block_reason': production_reason}
+        entry = low_risk_entry(block_reason=production_reason)
         result = check_proposal(
             entry, worktree='/tmp', category='task_failure',
             run_git=fake_git_never_called, now=self._NOW,
@@ -166,7 +167,7 @@ class TestStopInstructionAbort:
     def test_stop_instruction_in_proposal_text_aborts_without_git(self):
         """Case (a): proposal_text carries 'do not apply' -> ABORT, no git called."""
         from orchestrator.b3_gate import ABORT, check_proposal
-        entry = {**LOW_RISK_ENTRY, 'proposal_text': 'Fix it — do not apply until reviewed'}
+        entry = low_risk_entry(proposal_text='Fix it — do not apply until reviewed')
         result = check_proposal(
             entry, worktree='/tmp', category='task_failure',
             run_git=fake_git_never_called, now=self._NOW,
@@ -179,7 +180,7 @@ class TestStopInstructionAbort:
     def test_stop_instruction_in_block_reason_aborts_without_git(self):
         """Case (b): block_reason carries 'human rehearsal' -> ABORT, no git called."""
         from orchestrator.b3_gate import ABORT, check_proposal
-        entry = {**LOW_RISK_ENTRY, 'block_reason': 'this fix requires human rehearsal before merging'}
+        entry = low_risk_entry(block_reason='this fix requires human rehearsal before merging')
         result = check_proposal(
             entry, worktree='/tmp', category='task_failure',
             run_git=fake_git_never_called, now=self._NOW,
@@ -194,7 +195,7 @@ class TestStopInstructionAbort:
         block_reason are benign) -> ABORT, no git called."""
         from orchestrator.b3_gate import ABORT, check_proposal
         result = check_proposal(
-            LOW_RISK_ENTRY, worktree='/tmp', category='task_failure',
+            low_risk_entry(), worktree='/tmp', category='task_failure',
             run_git=fake_git_never_called, now=self._NOW,
             extra_texts=['Task description: please do not apply this change yet.'],
         )
@@ -208,7 +209,7 @@ class TestStopInstructionAbort:
         phrase in proposal_text -> ABORT (stop wins over fresh), and still consumes
         no git (fires before the P1/P2 freshness checks)."""
         from orchestrator.b3_gate import ABORT, check_proposal
-        entry = {**LOW_RISK_ENTRY, 'proposal_text': 'Fix it — do not apply until reviewed'}
+        entry = low_risk_entry(proposal_text='Fix it — do not apply until reviewed')
         result = check_proposal(
             entry, worktree='/tmp', category=None,
             run_git=fake_git_never_called, now=self._NOW,
@@ -221,7 +222,7 @@ class TestStopInstructionAbort:
         """Regression: benign extra_texts under a fresh low-risk entry -> FRESH (unchanged)."""
         from orchestrator.b3_gate import FRESH, check_proposal
         result = check_proposal(
-            LOW_RISK_ENTRY, worktree='/tmp', category=None,
+            low_risk_entry(), worktree='/tmp', category=None,
             run_git=fake_git_fresh, now=self._NOW,
             extra_texts=['deploy the service'],
         )
@@ -255,11 +256,10 @@ class TestStopScanExcludesCapturedOutput:
     )
 
     def _merge_verify_red_entry(self, block_reason):
-        return {
-            **LOW_RISK_ENTRY,
-            'block_class': 'merge_verify_red',
-            'block_reason': block_reason,
-        }
+        return low_risk_entry(
+            block_class='merge_verify_red',
+            block_reason=block_reason,
+        )
 
     def test_ratchet_readme_in_fenced_pytest_output_does_not_trip_the_stop_scan(self):
         from orchestrator.b3_gate import FRESH, check_proposal
@@ -416,12 +416,11 @@ class TestCheckProposalBlockClass:
         """
         from orchestrator.b3_gate import ABORT, check_proposal
         for risk_label in ('low', 'human-review-required'):
-            entry = {
-                **LOW_RISK_ENTRY,
-                'block_class': 'post_merge_red_main',
-                'block_reason': 'verify exhausted',
-                'risk_label': risk_label,
-            }
+            entry = low_risk_entry(
+                block_class='post_merge_red_main',
+                block_reason='verify exhausted',
+                risk_label=risk_label,
+            )
             result = check_proposal(
                 entry, worktree='/tmp', category='task_failure',
                 run_git=fake_git_never_called, now=self._NOW,
@@ -436,7 +435,7 @@ class TestCheckProposalBlockClass:
         fresh git and category=None.
         """
         from orchestrator.b3_gate import FRESH, check_proposal
-        entry = {**LOW_RISK_ENTRY, 'block_class': 'merge_verify_red'}
+        entry = low_risk_entry(block_class='merge_verify_red')
         result = check_proposal(
             entry, worktree='/tmp', category=None,
             run_git=fake_git_fresh, now=self._NOW,
@@ -449,12 +448,11 @@ class TestCheckProposalBlockClass:
         status-sniff is not what fires. Asserts the reason names risk_label.
         """
         from orchestrator.b3_gate import ABORT, check_proposal
-        entry = {
-            **LOW_RISK_ENTRY,
-            'block_class': 'agent_failure',
-            'status': 'investigation_failed',
-            'risk_label': 'human-review-required',
-        }
+        entry = low_risk_entry(
+            block_class='agent_failure',
+            status='investigation_failed',
+            risk_label='human-review-required',
+        )
         result = check_proposal(
             entry, worktree='/tmp', category=None,
             run_git=fake_git_never_called, now=self._NOW,
@@ -471,12 +469,11 @@ class TestCheckProposalBlockClass:
         low-risk, fresh, typed entry must not cause a false abort.
         """
         from orchestrator.b3_gate import FRESH, check_proposal
-        entry = {
-            **LOW_RISK_ENTRY,
-            'block_class': 'merge_verify_red',
-            'status': 'x',
-            'risk_label': 'low',
-        }
+        entry = low_risk_entry(
+            block_class='merge_verify_red',
+            status='x',
+            risk_label='low',
+        )
         result = check_proposal(
             entry, worktree='/tmp', category=None,
             run_git=fake_git_fresh, now=self._NOW,
@@ -490,7 +487,7 @@ class TestCheckProposalBlockClass:
         exactly like today's low-risk fresh entry.
         """
         from orchestrator.b3_gate import FRESH, check_proposal
-        entry = {**LOW_RISK_ENTRY, 'block_class': 'agent_failure'}
+        entry = low_risk_entry(block_class='agent_failure')
         result = check_proposal(
             entry, worktree='/tmp', category=None,
             run_git=fake_git_fresh, now=self._NOW,
@@ -531,11 +528,10 @@ class TestMergeCompletionConsumptionContract:
         aborts at step 2 (risk_label != 'low'), never reaching git.
         """
         from orchestrator.b3_gate import ABORT, check_proposal
-        entry = {
-            **LOW_RISK_ENTRY,
-            'block_class': 'merge_verify_red',
-            'risk_label': 'human-review-required',
-        }
+        entry = low_risk_entry(
+            block_class='merge_verify_red',
+            risk_label='human-review-required',
+        )
         result = check_proposal(
             entry, worktree='/tmp', category='task_failure',
             run_git=fake_git_never_called, now=self._NOW,
@@ -550,7 +546,7 @@ class TestMergeCompletionConsumptionContract:
         file, workflow.py:8608) — is consumable end-to-end at the gate.
         """
         from orchestrator.b3_gate import FRESH, check_proposal
-        entry = {**LOW_RISK_ENTRY, 'block_class': 'merge_verify_red'}
+        entry = low_risk_entry(block_class='merge_verify_red')
         result = check_proposal(
             entry, worktree='/tmp', category='task_failure',
             run_git=fake_git_fresh, now=self._NOW,
@@ -560,11 +556,11 @@ class TestMergeCompletionConsumptionContract:
     def test_post_merge_red_main_entry_hard_aborts(self):
         """(iii) task 1680 retained VERBATIM: a POST_MERGE_RED_MAIN entry
         hard-aborts before risk_label/git checks even with risk_label='low'
-        (LOW_RISK_ENTRY's default) — the merge-completion mode must never
+        (low_risk_entry()'s default) — the merge-completion mode must never
         weaken this highest-blast-radius safety rail.
         """
         from orchestrator.b3_gate import ABORT, check_proposal
-        entry = {**LOW_RISK_ENTRY, 'block_class': 'post_merge_red_main'}
+        entry = low_risk_entry(block_class='post_merge_red_main')
         result = check_proposal(
             entry, worktree='/tmp', category='task_failure',
             run_git=fake_git_never_called, now=self._NOW,

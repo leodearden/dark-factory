@@ -4,24 +4,33 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
-from unittest.mock import MagicMock
+from typing import Any
 
-LOW_RISK_ENTRY = {
-    'proposal_text': 'Fix it',
-    'risk_label': 'low',
-    'files_referenced': ['foo.py'],
-    'block_reason': 'test',
-    'investigated_at': '2026-06-04T09:00:00+00:00',
-    'head_sha': 'aaabbbccc',
-    'main_sha': 'dddeeefff',
-}
+from _git_fixtures import README_SEED, RepoSeed, seed_repo
+
+RECORDED_HEAD_SHA = 'aaabbbccc'
+RECORDED_MAIN_SHA = 'dddeeefff'
+
+
+def low_risk_entry(**overrides: Any) -> dict[str, Any]:
+    """A new low-risk proposal entry on foo.py anchored at the recorded shas, with *overrides* applied."""
+    return {
+        'proposal_text': 'Fix it',
+        'risk_label': 'low',
+        'files_referenced': ['foo.py'],
+        'block_reason': 'test',
+        'investigated_at': '2026-06-04T09:00:00+00:00',
+        'head_sha': RECORDED_HEAD_SHA,
+        'main_sha': RECORDED_MAIN_SHA,
+        **overrides,
+    }
 
 
 def fake_git_fresh(args, cwd):
     """Fake git runner: HEAD == recorded sha, diff is empty (fresh)."""
     if 'rev-parse' in args:
-        return (0, 'aaabbbccc')
-    return (0, '')  # diff empty
+        return (0, RECORDED_HEAD_SHA)
+    return (0, '')
 
 
 def fake_git_never_called(args, cwd):
@@ -29,73 +38,29 @@ def fake_git_never_called(args, cwd):
 
 
 def fake_git_diff_fails(args, cwd):
-    """Fake git runner: rev-parse HEAD succeeds (P1 passes), but diff returns non-zero rc."""
+    """Fake git runner: rev-parse HEAD succeeds (P1 passes), but the footprint diff fails."""
     if 'rev-parse' in args:
-        return (0, 'aaabbbccc')
-    # diff call fails (e.g. bad revision, transient error)
-    return (128, 'fatal: bad revision dddeeefff..main')
+        return (0, RECORDED_HEAD_SHA)
+    return (128, f'fatal: bad revision {RECORDED_MAIN_SHA}..main')
 
 
-def make_agent_result(*, success=True, cost_usd=0.50, structured_output=None,
-                      subtype='', output='', duration_ms=1000,
-                      timed_out=False, transcript_turns=None, session_id='',
-                      stderr='', turns=0, api_error_status=None,
-                      schema_salvaged=False, output_tokens=None,
-                      ended_awaiting_background=False):
-    """Create a minimal MagicMock AgentResult stand-in for _build_entry tests.
+def _git_stdout(repo: Path, *args: str) -> str:
+    return subprocess.run(
+        ['git', '-C', str(repo), *args], check=True, capture_output=True, text=True,
+    ).stdout.strip()
 
-    NOTE: duplicated verbatim in test_dry_run_unblock.py (task 2020 review:
-    code_duplication). Both copies must be extended together whenever
-    shared.cli_invoke.AgentResult gains/renames a field consumed by
-    classify_agent_failure(). Out of this task's locked scope: hoisting both
-    into the existing orchestrator/tests/_orch_helpers.py shared-helper
-    module (the established convention for cross-suite test helpers in this
-    package) is a follow-up.
+
+def diverged_repo(tmp_path: Path, seed: RepoSeed = README_SEED) -> tuple[Path, str, str]:
+    """Seed <tmp_path>/repo from *seed* on main, then check out a 'feature' branch one commit ahead.
+
+    Returns (repo, head_sha, main_sha), where head_sha is the feature commit.
     """
-    r = MagicMock()
-    r.success = success
-    r.cost_usd = cost_usd
-    r.structured_output = structured_output
-    r.subtype = subtype
-    r.output = output
-    r.duration_ms = duration_ms
-    # Faithful diagnostic-field defaults (mirrors shared.cli_invoke.AgentResult).
-    # A bare MagicMock auto-vivifies every unset attribute as a truthy
-    # MagicMock, which would silently corrupt classify_agent_failure()'s
-    # decision rules: .timed_out truthy -> misclassifies every failure as
-    # TIMED_OUT -> infra; .schema_salvaged truthy -> misclassifies a generic
-    # failure as STRUCTURAL instead of UNKNOWN. Setting explicit defaults for
-    # every field classify_agent_failure() consults (including
-    # .output_tokens, read when formatting the MAX_TURNS summary) keeps
-    # these mocks faithful stand-ins for its decision rules.
-    r.timed_out = timed_out
-    r.transcript_turns = transcript_turns
-    r.session_id = session_id
-    r.stderr = stderr
-    r.turns = turns
-    r.api_error_status = api_error_status
-    r.schema_salvaged = schema_salvaged
-    r.output_tokens = output_tokens
-    # task 2761: classify_agent_failure now reads .ended_awaiting_background
-    # (rule 2, above the timed_out rule). A bare MagicMock auto-vivifies it as
-    # a truthy stand-in, which would misclassify every failure as
-    # ENDED_AWAITING_BACKGROUND -> investigation_failed. Default it False.
-    r.ended_awaiting_background = ended_awaiting_background
-    return r
-
-
-def diverge_feature_branch(path: Path) -> str:
-    """Create a feature branch with one extra commit so HEAD != main.
-
-    Returns the new HEAD sha (feature commit).
-    """
-    p = str(path)
-    subprocess.run(['git', '-C', p, 'checkout', '-b', 'feature'],
-                   check=True, capture_output=True)
-    (path / 'extra.txt').write_text('feature work')
-    subprocess.run(['git', '-C', p, 'add', '.'], check=True, capture_output=True)
-    subprocess.run(['git', '-C', p, 'commit', '-m', 'feature commit'],
-                   check=True, capture_output=True)
-    result = subprocess.run(['git', '-C', p, 'rev-parse', 'HEAD'],
-                            check=True, capture_output=True, text=True)
-    return result.stdout.strip()
+    repo = seed_repo(tmp_path / 'repo', seed)
+    main_sha = _git_stdout(repo, 'rev-parse', 'main')
+    _git_stdout(repo, 'checkout', '-b', 'feature')
+    (repo / 'extra.txt').write_text('feature work')
+    _git_stdout(repo, 'add', '.')
+    _git_stdout(repo, 'commit', '-m', 'feature commit')
+    head_sha = _git_stdout(repo, 'rev-parse', 'HEAD')
+    assert head_sha != main_sha
+    return repo, head_sha, main_sha

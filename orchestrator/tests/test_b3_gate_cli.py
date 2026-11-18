@@ -10,13 +10,11 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
-import subprocess
 from datetime import datetime
 from pathlib import Path
 
 import pytest
-from _b3_gate_fixtures import diverge_feature_branch
-from _git_fixtures import seed_repo
+from _b3_gate_fixtures import diverged_repo
 from shared.tasks_db_readonly import TaskDbProblem, TaskDbUnreadable
 
 # ---------------------------------------------------------------------------
@@ -70,14 +68,7 @@ def _seed_fresh_check_scene(tmp_path: Path, *, description: str = '') -> tuple[P
 
     Returns (repo, project_root).
     """
-    repo = tmp_path / 'repo'
-    repo.mkdir()
-    seed_repo(repo)
-    head_sha = diverge_feature_branch(repo)
-    main_sha = subprocess.run(
-        ['git', '-C', str(repo), 'rev-parse', 'main'],
-        check=True, capture_output=True, text=True,
-    ).stdout.strip()
+    repo, head_sha, main_sha = diverged_repo(tmp_path)
 
     root = tmp_path / 'root'
     root.mkdir()
