@@ -5,7 +5,7 @@ signal_leaves:
 - κ
 tasks:
 - label: α
-  task_id: null
+  task_id: 10782
   title: Measure the drafted shape on real reify, on both hosts (operator gate)
   capabilities:
   - name: trial-harness
@@ -103,7 +103,7 @@ tasks:
       kind: manual
       reason: the producer is a reify task; its files are in the reify repository, outside this tree
 - label: ε
-  task_id: null
+  task_id: 10784
   title: Process-liveness scans translate paths through mount namespaces
   capabilities:
   - name: process-group-scan
@@ -125,7 +125,7 @@ tasks:
       - shared/src/shared/proc_group.py
       expect: present
 - label: ζ
-  task_id: null
+  task_id: 10785
   title: 'Launch wiring: verify legs through the build primitive; sandboxed agents bound before landlock'
   capabilities:
   - name: verify-leg-spawn-site
@@ -171,7 +171,7 @@ tasks:
       - orchestrator/src/orchestrator/
       expect: present
 - label: η
-  task_id: null
+  task_id: 10786
   title: build_cache facts on the verify result, the observation log and the degraded-cache alarm
   capabilities:
   - name: event-channel-parser
@@ -237,7 +237,7 @@ tasks:
       - orchestrator/src/orchestrator/
       expect: present
 - label: θ
-  task_id: null
+  task_id: 10787
   title: Shared cache store service, pruning, drift probe, in-service check and operations notes
   capabilities:
   - name: measured-shape
@@ -307,7 +307,7 @@ tasks:
       kind: manual
       reason: the producer is a reify task; its files are in the reify repository, outside this tree
 - label: ι
-  task_id: null
+  task_id: 10788
   title: Enable the canonical build path and shared cache for reify on leo-laptop (operator gate)
   capabilities:
   - name: real-reify-cross-host-measurement
@@ -347,7 +347,7 @@ tasks:
       kind: manual
       reason: host state on leo-laptop and reify observation rows; not expressible as a check on the dark-factory tree
 - label: κ
-  task_id: null
+  task_id: 10789
   title: Enable the canonical build path and shared cache for reify on the workstation (operator gate)
   capabilities:
   - name: laptop-in-service
