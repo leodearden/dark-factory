@@ -14,9 +14,9 @@ import pytest
 import pytest_asyncio
 from _curator_helpers import (
     agent_result,
-    answer_each_with,
     curator_always,
     curator_double,
+    curator_judging,
     prepared,
     submit_as_one_batch,
     zot_agent_result,
@@ -105,6 +105,15 @@ async def event_buffer(tmp_path):
 @pytest.fixture
 def interceptor(taskmaster, reconciler, event_buffer):
     return TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+
+@pytest.fixture
+def make_interceptor(taskmaster, reconciler, event_buffer):
+    """Build the ``interceptor`` fixture's interceptor around the given curator."""
+    def make(curator) -> TaskInterceptor:
+        return TaskInterceptor(taskmaster, reconciler, event_buffer, curator=curator)
+
+    return make
 
 
 @pytest_asyncio.fixture
@@ -631,7 +640,7 @@ async def make_curator_interceptor(
     await store.initialize()
     built: list[TaskInterceptor] = []
 
-    def make(curator=None) -> TaskInterceptor:
+    def make(curator) -> TaskInterceptor:
         interceptor = TaskInterceptor(
             taskmaster,
             reconciler,
@@ -2398,7 +2407,7 @@ async def test_remove_tasks_multi_id_emits_one_event_per_id(
 
 
 @pytest.mark.asyncio
-async def test_remove_tasks_evicts_curator_vectors(taskmaster, reconciler, event_buffer):
+async def test_remove_tasks_evicts_curator_vectors(taskmaster, make_interceptor):
     """remove_tasks() evicts each removed task's vector from the curator
     corpus (Layer A witness-eviction — curator corpus RC1, task 2520)."""
     taskmaster.remove_tasks = AsyncMock(
@@ -2410,7 +2419,7 @@ async def test_remove_tasks_evicts_curator_vectors(taskmaster, reconciler, event
         }
     )
     curator = curator_double()
-    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer, curator=curator)
+    interceptor = make_interceptor(curator)
 
     result = await interceptor.remove_tasks(['5', '6'], '/project')
 
@@ -2427,7 +2436,7 @@ async def test_remove_tasks_evicts_curator_vectors(taskmaster, reconciler, event
 
 @pytest.mark.asyncio
 async def test_remove_tasks_succeeds_when_eviction_raises(
-    taskmaster, reconciler, event_buffer,
+    taskmaster, make_interceptor,
 ):
     """A curator eviction error must not fail the removal itself."""
     taskmaster.remove_tasks = AsyncMock(
@@ -2440,10 +2449,11 @@ async def test_remove_tasks_succeeds_when_eviction_raises(
     )
     curator = curator_double()
     curator.evict_task = AsyncMock(side_effect=RuntimeError('boom'))
-    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer, curator=curator)
+    interceptor = make_interceptor(curator)
 
     result = await interceptor.remove_tasks(['9'], '/project')
 
+    curator.evict_task.assert_awaited_once_with('project', '9')
     assert result == {
         'successful': 1,
         'failed': 0,
@@ -2454,7 +2464,7 @@ async def test_remove_tasks_succeeds_when_eviction_raises(
 
 @pytest.mark.asyncio
 async def test_remove_tasks_evicts_using_ids_when_removed_ids_missing(
-    taskmaster, reconciler, event_buffer,
+    taskmaster, make_interceptor,
 ):
     """When the backend result omits 'removed_ids', eviction falls back to
     the originally requested ids (`result.get('removed_ids') or ids`)."""
@@ -2462,7 +2472,7 @@ async def test_remove_tasks_evicts_using_ids_when_removed_ids_missing(
         return_value={'successful': 2, 'failed': 0, 'message': 'ok'}
     )
     curator = curator_double()
-    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer, curator=curator)
+    interceptor = make_interceptor(curator)
 
     result = await interceptor.remove_tasks(['3', '4'], '/project')
 
@@ -6885,11 +6895,7 @@ async def test_set_task_status_does_not_block_during_add_task_curator(
             justification='ok',
         )
 
-    curator = curator_double()
-    # The per-candidate verdict, so slow_curate is invoked and the
-    # latency-based assertion holds.
-    curator.curate = AsyncMock(side_effect=slow_curate)
-    answer_each_with(curator, curator.curate)
+    curator = curator_judging(slow_curate)
     interceptor = TaskInterceptor(
         taskmaster,
         reconciler,

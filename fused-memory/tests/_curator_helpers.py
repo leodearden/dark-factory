@@ -224,16 +224,26 @@ def curator_double() -> MagicMock:
     return curator
 
 
-def curator_always(decision: CuratorDecision) -> MagicMock:
-    """A curator double for ``TaskInterceptor(curator=...)`` that answers every candidate with *decision*.
+def curator_judging(
+    verdict: Callable[[CandidateTask], Awaitable[CuratorDecision]],
+) -> MagicMock:
+    """A curator double for ``TaskInterceptor(curator=...)`` that judges each candidate with *verdict*.
 
-    Its ``curate`` AsyncMock is the per-candidate verdict, so a test can count
-    the candidates judged.
+    Its ``curate`` AsyncMock wraps *verdict* and is the per-candidate verdict,
+    so a test can count the candidates judged.
     """
     curator = curator_double()
-    curator.curate = AsyncMock(return_value=decision)
+    curator.curate = AsyncMock(side_effect=verdict)
     answer_each_with(curator, curator.curate)
     return curator
+
+
+def curator_always(decision: CuratorDecision) -> MagicMock:
+    """A :func:`curator_judging` double that answers every candidate with *decision*."""
+    async def always(_candidate: CandidateTask) -> CuratorDecision:
+        return decision
+
+    return curator_judging(always)
 
 
 def curator_returning(*decisions: CuratorDecision) -> MagicMock:

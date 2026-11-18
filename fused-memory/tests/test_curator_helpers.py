@@ -11,9 +11,14 @@ from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
-from _curator_helpers import curator_always, curator_double, curator_returning
+from _curator_helpers import (
+    curator_always,
+    curator_double,
+    curator_judging,
+    curator_returning,
+)
 
-from fused_memory.middleware.curator_types import CuratorDecision
+from fused_memory.middleware.curator_types import CandidateTask, CuratorDecision
 from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.middleware.ticket_store import TicketStore
 from fused_memory.reconciliation.event_buffer import EventBuffer
@@ -94,11 +99,41 @@ async def test_curator_returning_answers_its_decisions_in_order(
 
 
 @pytest.mark.asyncio
-async def test_curator_double_is_inert_until_wired():
-    curator = curator_double()
+async def test_curator_judging_hands_each_candidate_to_its_verdict(
+    taskmaster, event_buffer, ticket_store,
+):
+    judged: list[str] = []
 
-    assert await curator.record_task('42', None, 'project') is None
-    assert await curator.reembed_task('42', None, 'project') is None
-    assert await curator.evict_task('42', 'project') is None
-    assert await curator.close() is None
-    curator.note_created('42')
+    async def verdict(candidate: CandidateTask) -> CuratorDecision:
+        judged.append(candidate.title)
+        return CuratorDecision(action='create', justification='novel')
+
+    curator = curator_judging(verdict)
+    interceptor = TaskInterceptor(
+        taskmaster, None, event_buffer, ticket_store=ticket_store, curator=curator,
+    )
+
+    first = await _submit_and_resolve(interceptor, 'First candidate')
+    second = await _submit_and_resolve(interceptor, 'Second candidate')
+    await interceptor.close()
+
+    assert (first['status'], second['status']) == ('created', 'created')
+    assert judged == ['First candidate', 'Second candidate']
+    assert curator.curate.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_curator_double_serves_the_interceptor_without_a_verdict(
+    taskmaster, event_buffer,
+):
+    taskmaster.remove_tasks = AsyncMock(return_value={
+        'successful': 1, 'failed': 0, 'removed_ids': ['42'], 'message': 'ok',
+    })
+    curator = curator_double()
+    interceptor = TaskInterceptor(taskmaster, None, event_buffer, curator=curator)
+
+    await interceptor.remove_tasks(['42'], PROJECT)
+    await interceptor.close()
+
+    curator.evict_task.assert_awaited_once_with('project', '42')
+    curator.close.assert_awaited_once()
