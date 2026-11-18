@@ -112,7 +112,9 @@ From `docs/code-quality.md`:
 
 - A fix whose planned files overlap a merge-waiter's held modules, or a pin
   head's reservation, still waits on module locks. That lock precedence is owned
-  by 10399 item (3) and by 8795.
+  by 10399 item (3) and by 8795. When the pin head is one the PSI hold defers,
+  that wait has no bound; DA-D10 of `docs/prds/dispatch-admission-load-cap.md`
+  records it.
 - Resolved by task 10600: an admitted fix is exempt from the PSI admission
   gate's hold on every tick, in both dispatch loops. The rationale and the load
   bound are DA-D10 of `docs/prds/dispatch-admission-load-cap.md`.
