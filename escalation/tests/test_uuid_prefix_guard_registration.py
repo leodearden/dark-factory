@@ -6,7 +6,8 @@ to ``create_server``'s server, scoped and classed the way C3 rules for this
 server, and that a truncated citation in a real ``escalate_info`` lands
 expanded, forwarded or untouched as the resolver's answer dictates.
 
-Every call goes through ``async with Client(server)``. Middleware is BYPASSED
+Every call goes through a fastmcp ``Client``: in-process, or over real HTTP
+where a request header is the thing under test. Middleware is BYPASSED
 by ``tool.fn(...)`` and ``await tool.run({...})``, so a test written that way
 would pass while running none of the guard.
 """
@@ -22,6 +23,8 @@ from typing import Any
 import httpx
 import pytest
 from fastmcp import Client
+from fastmcp.client.transports import StreamableHttpTransport
+from shared.escalation_project_scope import escalation_project_headers
 from shared.mcp_markup_middleware import MarkupGuardMiddleware
 from shared.toolcall_markup import INVOKE_CLOSER, closer_for
 from shared.uuid_prefix_guard import (
@@ -150,6 +153,21 @@ def meta_of(result) -> dict[str, Any]:
 async def call(server, tool: str, arguments: dict[str, Any]):
     async with Client(server) as client:
         return await client.call_tool(tool, arguments)
+
+
+def call_over_http(base_url: str, tool: str, arguments: dict[str, Any], headers: dict[str, str]):
+    """*tool* called over real HTTP with *headers*, returning the whole result so meta is readable.
+
+    Synchronous, as its callers must be: ``serve_escalation_mcp`` gates
+    readiness with ``asyncio.run``, which cannot run inside a test's loop.
+    """
+
+    async def over_http():
+        transport = StreamableHttpTransport(f'{base_url}/mcp/', headers=headers)
+        async with Client(transport) as client:
+            return await client.call_tool(tool, arguments)
+
+    return asyncio.run(over_http())
 
 
 def _leak(absorbed: str, param: str, value: str) -> str:
@@ -349,6 +367,109 @@ class TestReconciliationStoreIsUnscoped:
         assert esc.detail == CITING_DETAIL
         assert meta_of(result)['uuid_prefix_repair'] == {'resolver': 'no_project'}
         assert resolver.calls == []
+
+
+#: A Stage-2 FIX D blocker, as a reconciliation stage files it on 8103.
+BLOCKER = {
+    'task_id': 'recon-reify',
+    'agent_role': 'recon-stage-2',
+    'category': 'recon_integrity_issue',
+    'summary': 'Stale flag on a task cited by its memory',
+}
+
+
+class TestReconciliationStoreIsScopedPerCall:
+    """The 8103 shape, scoped by the caller's X-Escalation-Project header.
+
+    Proven over REAL HTTP, because get_http_headers() is {} for an in-process
+    Client. Every header is built by escalation_project_headers, the function
+    a reconciliation stage sends with, so client and server must agree.
+    """
+
+    def test_a_reify_scoped_blocker_files_the_full_id(self, tmp_path: Path, serve_escalation_mcp):
+        resolver = RecordingResolver(UNIQUE)
+        base_url, _, queue = serve_escalation_mcp(
+            tmp_path / 'esc', store_identity=reconciliation_identity(tmp_path),
+            prefix_resolver=resolver, per_call_projects=frozenset({'reify', 'dark_factory'}),
+        )
+
+        result = call_over_http(
+            base_url, 'escalate_blocker', {**BLOCKER, 'detail': CITING_DETAIL},
+            escalation_project_headers('reify'),
+        )
+
+        assert resolver.calls == [('reify', PREFIX)]
+        esc = queue.get(result.data['id'])
+        assert esc is not None
+        assert FULL in esc.detail
+        assert meta_of(result)['uuid_prefix_repair']['substitutions'] == [{
+            'field': 'detail', 'path': ['detail'], 'from': PREFIX, 'to': FULL, 'namespace': 'mem0',
+        }]
+
+    def test_an_absent_header_stays_no_project(self, tmp_path: Path, serve_escalation_mcp):
+        resolver = RecordingResolver(UNIQUE)
+        base_url, _, queue = serve_escalation_mcp(
+            tmp_path / 'esc', store_identity=reconciliation_identity(tmp_path),
+            prefix_resolver=resolver, per_call_projects=frozenset({'reify', 'dark_factory'}),
+        )
+
+        result = call_over_http(
+            base_url, 'escalate_blocker', {**BLOCKER, 'detail': CITING_DETAIL}, {},
+        )
+
+        esc = queue.get(result.data['id'])
+        assert esc is not None
+        assert esc.detail == CITING_DETAIL
+        assert meta_of(result)['uuid_prefix_repair'] == {'resolver': 'no_project'}
+        assert resolver.calls == []
+
+    def test_an_unserved_project_stays_no_project_and_warns(
+        self, tmp_path: Path, serve_escalation_mcp, caplog,
+    ):
+        caplog.set_level(logging.WARNING, logger='shared.escalation_project_scope')
+        resolver = RecordingResolver(UNIQUE)
+        base_url, _, queue = serve_escalation_mcp(
+            tmp_path / 'esc', store_identity=reconciliation_identity(tmp_path),
+            prefix_resolver=resolver, per_call_projects=frozenset({'reify'}),
+        )
+
+        result = call_over_http(
+            base_url, 'escalate_blocker', {**BLOCKER, 'detail': CITING_DETAIL},
+            escalation_project_headers('ghost'),
+        )
+
+        esc = queue.get(result.data['id'])
+        assert esc is not None
+        assert esc.detail == CITING_DETAIL
+        assert meta_of(result)['uuid_prefix_repair'] == {'resolver': 'no_project'}
+        assert resolver.calls == []
+        warnings = [
+            record for record in caplog.records
+            if record.name == 'shared.escalation_project_scope' and record.levelno == logging.WARNING
+        ]
+        assert len(warnings) == 1, f'expected one unserved-project warning, found {len(warnings)}'
+        assert 'ghost' in warnings[0].getMessage()
+
+    def test_a_project_store_ignores_the_header(self, tmp_path: Path, serve_escalation_mcp):
+        resolver = RecordingResolver(UNIQUE)
+        base_url, _, _ = serve_escalation_mcp(
+            tmp_path / 'esc', store_identity=project_identity(tmp_path), prefix_resolver=resolver,
+        )
+
+        call_over_http(
+            base_url, 'escalate_blocker', {**BLOCKER, 'detail': CITING_DETAIL},
+            escalation_project_headers('dark_factory'),
+        )
+
+        assert resolver.calls == [('reify', PREFIX)]
+
+    def test_per_call_projects_on_a_project_store_is_refused(self, tmp_path: Path):
+        with pytest.raises(ValueError):
+            create_server(
+                EscalationQueue(tmp_path / 'esc'), startup_sweep=False,
+                store_identity=project_identity(tmp_path), prefix_resolver=RecordingResolver(),
+                per_call_projects={'dark_factory'},
+            )
 
 
 class TestRecoveredParameterIsScanned:
