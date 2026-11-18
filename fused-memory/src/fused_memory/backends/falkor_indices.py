@@ -74,7 +74,9 @@ isolation is also a HAZARD control: ``FalkorDriver.__init__`` fire-and-forgets
 ``build_indices_and_constraints()`` when an event loop is running, so a module
 that could pull a driver into scope risks creating indices merely by being
 imported — destroying esc-3375-1's protected evidence (the current absence of
-indices).  Importing this module performs zero I/O.
+indices).  Importing this module performs zero I/O.  Its two coroutines,
+:func:`read_index_records` and :func:`await_index_catalog_settled`, act only
+on a graph or reader the caller passes in.
 
 β's pure planner, and why RANGE and FULLTEXT are treated asymmetrically
 ----------------------------------------------------------------------
@@ -119,9 +121,12 @@ and a ``RELATES_TO(uuid)`` range index already present):
 
 from __future__ import annotations
 
+import asyncio
 import re
-from collections.abc import Iterator, Sequence
+import time
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
+from types import MappingProxyType
 
 from graphiti_core.driver.driver import GraphProvider
 from graphiti_core.graph_queries import get_fulltext_indices, get_range_indices
@@ -342,13 +347,13 @@ class IndexHeaderShapeError(ValueError):
 
     Subclasses ``ValueError`` so the historical ``list_indices()`` contract
     (``raise ValueError`` on a missing column) is preserved for callers that
-    catch it.  The test-side ``_fm_helpers.IndexHeaderError`` deliberately
+    catch it.  The test-side ``_fm_falkor_live.IndexHeaderError`` deliberately
     subclasses ``AssertionError`` instead, because there a header surprise must
     read as a failed test rather than as an error the suite might swallow.
     """
 
 
-def resolve_header_positions(header, wanted: dict[str, str]) -> dict[str, int]:
+def resolve_header_positions(header, wanted: Mapping[str, str]) -> dict[str, int]:
     """Map each wanted output key to the position of its named FalkorDB column.
 
     The single home for by-name column resolution over a ``CALL db.indexes()``
@@ -393,6 +398,41 @@ def resolve_header_positions(header, wanted: dict[str, str]) -> dict[str, int]:
             'Refusing to return index records with silently-wrong values.'
         )
     return {key: names.index(column) for key, column in wanted.items()}
+
+
+INDEX_CATALOG_QUERY = 'CALL db.indexes()'
+
+#: Names the definition columns only, omitting the ``info`` statistics and the
+#: ``status`` build state, which move with any write on a live graph.
+INDEX_DEFINITION_QUERY = (
+    'CALL db.indexes() YIELD label, properties, types, options, language, stopwords, entitytype '
+    'RETURN label, properties, types, options, language, stopwords, entitytype '
+    'ORDER BY entitytype, label'
+)
+
+#: The output keys of a ``list_indices()`` record, mapped to the FalkorDB
+#: ``CALL db.indexes()`` column names they are read from.
+INDEX_RECORD_COLUMNS: Mapping[str, str] = MappingProxyType({
+    'label': 'label',
+    'field': 'properties',
+    'type': 'types',
+    'entity_type': 'entitytype',
+    'status': 'status',
+})
+
+
+def index_records_from_rows(header, rows) -> list[dict]:
+    """Build ``list_indices()`` records from a ``CALL db.indexes()`` result.
+
+    The single home of the row-to-record build: re-forking it is how the
+    positional read survived.  Columns are resolved by name through
+    :func:`resolve_header_positions` against :data:`INDEX_RECORD_COLUMNS`.
+
+    Raises:
+        IndexHeaderShapeError: The header is malformed or lacks a mapped column.
+    """
+    positions = resolve_header_positions(header, INDEX_RECORD_COLUMNS)
+    return [{key: row[pos] for key, pos in positions.items()} for row in rows or ()]
 
 
 # --- The ACTUAL side: the records ------------------------------------------
@@ -620,16 +660,18 @@ INDEX_STATUS_OPERATIONAL = 'OPERATIONAL'
 class IndexCatalogUnsettledError(RuntimeError):
     """The FalkorDB index catalog did not settle within a caller's budget.
 
-    Raised by :meth:`GraphitiBackend.drop_vector_indices` when a record is still
-    not ``OPERATIONAL`` once its settle budget expires, before anything has been
-    dropped.  Failing closed is the point: an under-construction read can
-    UNDER-report vector indices, and dropping against an index state that was
-    never determined would leave stale fixed-dimension indices behind while the
-    operator believes the rebuild was clean — the silent-fail-soft class
-    ``ensure_indices`` likewise refuses for provisioning (INV-4).
+    Raised by :func:`await_index_catalog_settled` when a record is still not
+    ``OPERATIONAL`` once its settle budget expires, on behalf of
+    :meth:`GraphitiBackend.drop_vector_indices` (before anything has been
+    dropped) and the scratch seed.  Failing closed is the point: an
+    under-construction read can UNDER-report vector indices, and dropping
+    against an index state that was never determined would leave stale
+    fixed-dimension indices behind while the operator believes the rebuild was
+    clean — the silent-fail-soft class ``ensure_indices`` likewise refuses for
+    provisioning (INV-4).
 
     A DISTINCT type, mirroring the ``IndexHeaderError``-vs-timeout split
-    ``tests/_fm_helpers`` makes: "the catalog never settled" and "a DROP
+    ``tests/_fm_falkor_live`` makes: "the catalog never settled" and "a DROP
     statement was rejected" call for different operator actions.  NOT a
     :class:`TimeoutError`, which is an :class:`OSError` subclass on py3.11+ and
     would be swept up by network/driver error handlers.  NOT a
@@ -643,14 +685,15 @@ def unsettled_index_statuses(records) -> list[tuple[object, object]]:
     """Return the ``(label, status)`` of every record that is not yet OPERATIONAL.
 
     The pure predicate behind the settle barrier
+    :func:`await_index_catalog_settled`, which
     :meth:`GraphitiBackend.drop_vector_indices` puts in front of its catalog
-    read.  That docstring is the account of the rebuild window this exists to
-    detect: a stale ``OPERATIONAL`` row beside its ``'[Indexing] N/M: UNDER
-    CONSTRUCTION'`` replacement.  An empty result means the catalog is SETTLED
-    and safe to act on.
+    read.  That method's docstring is the account of the rebuild window this
+    exists to detect: a stale ``OPERATIONAL`` row beside its ``'[Indexing] N/M:
+    UNDER CONSTRUCTION'`` replacement.  An empty result means the catalog is
+    SETTLED and safe to act on.
 
     An EMPTY catalog counts as SETTLED.  This diverges DELIBERATELY from
-    ``tests/_fm_helpers.await_index_operational``, which treats an empty
+    ``tests/_fm_falkor_live.await_index_operational``, which treats an empty
     ``result_set`` as NOT ready.  That is correct for its callers — a fixture
     that just issued CREATE and sees nothing is looking at a create that has not
     registered — and wrong here, because an index-free graph is a legitimate
@@ -707,6 +750,65 @@ def normalize_index_records(records) -> set[IndexSpec]:
     :func:`expected_index_set`; duplicates arriving from two records collapse.
     """
     return {spec for record in records for spec in normalize_index_record(record)}
+
+
+# --- The ACTUAL side: reading and settling a graph's catalog ---------------
+
+
+async def read_index_records(graph) -> list[dict]:
+    """Read *graph*'s ``CALL db.indexes()`` catalog as ``list_indices()`` records.
+
+    The read uses ``GRAPH.RO_QUERY``: FalkorDB accepts this stored-procedure
+    call on the read-only path, validated live in
+    ``tests/test_list_indices_integration.py``.
+    """
+    result = await graph.ro_query(INDEX_CATALOG_QUERY)
+    return index_records_from_rows(result.header, result.result_set)
+
+
+async def await_index_catalog_settled(
+    read_catalog: Callable[[], Awaitable[list[dict]]],
+    *,
+    graph_name: str,
+    timeout_s: float,
+    interval: float = 0.05,
+) -> list[dict]:
+    """Poll *read_catalog* until every record is OPERATIONAL, and return that read.
+
+    It RETURNS the certified records so the caller acts on the very read the
+    barrier validated; settling and then re-reading would leave a gap in which
+    another process's drop could open a new window.  The deadline is checked
+    BEFORE each sleep, so a settled catalog costs one read and no wait.  An
+    empty catalog counts as settled (see :func:`unsettled_index_statuses`).
+
+    *read_catalog* is injected rather than a graph so that
+    ``GraphitiBackend.drop_vector_indices`` keeps reading through its own
+    ``list_indices``; the scratch seed passes :func:`read_index_records` bound
+    to its graph.  *graph_name* only names the graph in the timeout message.
+
+    There is no ``try``/``except``: a driver error, an absent graph (measured:
+    ``Invalid graph operation on empty key``) or a shape error propagates
+    untouched rather than becoming a full-budget block and a misleading timeout.
+
+    Raises:
+        IndexCatalogUnsettledError: Records were still not ``OPERATIONAL`` when
+            *timeout_s* expired.
+        IndexRecordShapeError: A record carried no ``status`` key.
+    """
+    deadline = time.monotonic() + timeout_s
+    while True:
+        records = await read_catalog()
+        unsettled = unsettled_index_statuses(records)
+        if not unsettled:
+            return records
+        if time.monotonic() >= deadline:
+            raise IndexCatalogUnsettledError(
+                f'FalkorDB index catalog for graph {graph_name!r} did not '
+                f'settle within {timeout_s}s; still not OPERATIONAL: '
+                f'{unsettled!r}. Refusing to act on an index state that was '
+                'never determined.'
+            )
+        await asyncio.sleep(interval)
 
 
 # --- β: the PURE provisioning planner (task 3707) --------------------------

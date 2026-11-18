@@ -83,7 +83,11 @@ uncommitted ad-hoc probe.
   the runtime probe, row shaping and the external-dep read.
 - **Terminal window:** in a further fresh process, `?terminal=dark-factory` took
   4.25 s and 3.38 MB in all. The window alone took 0.77 s for 400 rows (0.32 MB),
-  served `lower_bound` as the newest 400 of 4682 terminal rows.
+  served `lower_bound` as the newest 400 of 4682 terminal rows. After task 5950
+  (2026-10-18): the same request serves only the window and served_at — 0.32 MB
+  against 5.25 MB from the pre-5950 handler in the same process, over the
+  service's ten roots, cold, three runs each (2.33–3.02 s against 5.77–6.60 s),
+  the window `lower_bound` as the newest 400 of 5209 in every run.
 - **Against the 2026-09-18 baseline (6.8 s / 16.4 MB):** the cold render is
   39–46 % faster and its payload 81 % smaller. The baseline acquisition was
   0.38 s + 2.49 s + 2.25 s and included terminal rows. The default render no
@@ -405,7 +409,7 @@ pointing at ι (a dependency edge on a `deferred` task would be inert). Task
 | fused-memory `get_statuses` paging (`page_size`, `offset`, `has_more`, ≤ 2000) | called live: dark-factory 5539 statuses in three pages |
 | `tasks.py::fetch_statuses` cost / `fetch_tasks(statuses=…)` real server-side filter | measured table above; memory `fa730a43` |
 | `get_tasks` has **no** id filter; `get_task` per id exists | grep of `fused_memory/server/tools.py` 2026-09-18 (`::get_task`) — hence decision 12's miss path |
-| `app.py::_fanout_probe_completion` is a raw `fetch_tasks` caller by design (healthz) | present; exempted in decision 17 |
+| `app.py::_fanout_probe_completion` is a raw, uncached task-read caller (one row of the unit's row query since task 6321) by design (healthz) | present; exempted in decision 17 |
 | `shared.task_claimant.is_stranded` | present; consumed by `tasks.py::task_is_stranded` |
 | `burndown.py::ensure_snapshot_columns` probe-then-add migration | present; nullable columns expressible (`concurrency_cap INTEGER` precedent) |
 | `static/redux/endpoint_staleness.js` (`STALE_FAILURE_THRESHOLD = 3`), `data.js::DF_DATA.__stale`, `app.jsx::staleNoticesForTab` | present (task 4884) — the endpoint-freshness home this PRD defers to |
@@ -569,18 +573,49 @@ the same file enforces the absence of request-path whole-tree fetches.
 `collect_done_counts`, `_STATUS_MAP` and `dailyDeltas` were deleted by their
 producing leaves and have no name guard.
 
-**The `/healthz` probe reads the whole tree (task 5598, 2026-10-05).** Decision
-17's exemption stays an unnarrowed `fetch_tasks`, the 3.4 s / 29 MB read that
-decision 20 costs. It is paid at most once per 30 s grace lapse, and only while
-something calls `/healthz`. Nothing calls it on a schedule: the watchdog probes
-the shallow `/api/health`, and `scripts/restart-dashboard.sh` calls `/healthz`
-only to wait for readiness after a restart. Two cheaper reads were weighed.
-`fetch_tasks(statuses=[])` never reaches SQL, because fused-memory's
-`sqlite_task_backend.py::_get_tasks_internal` returns before opening a
-connection, so it would not traverse the path the probe exists to test. A
-one-row `fetch_task_page` would cut the transfer but not the server read,
-because `get_tasks` builds the whole list and slices it in memory. At this call
-rate neither earns a change to decision 17.
+**The `/healthz` probe reads one row of the unit's row query (task 6321,
+2026-10-31).** Until task 6321, decision 17's exemption was an unnarrowed
+`fetch_tasks`, the 3.4 s / 29 MB read that decision 20 costs. It is paid at
+most once per 30 s grace lapse, and only while something calls `/healthz`.
+Nothing calls it on a schedule: the watchdog probes the shallow `/api/health`,
+and `scripts/restart-dashboard.sh` calls `/healthz` only to wait for readiness
+after a restart. Task 5598 (2026-10-05) weighed two cheaper reads separately,
+and both findings still hold:
+
+- `fetch_tasks(statuses=[])` never reaches SQL, because fused-memory's
+  `sqlite_task_backend.py::_get_tasks_internal` returns before opening a
+  connection. It would not traverse the path the probe exists to test.
+- A one-row page alone cuts the transfer but not the server read, because
+  `server/tools.py::get_tasks` builds the whole list and slices it in memory.
+
+Combined, they do what neither does alone. With the snapshot unit's own row
+statuses (`task_snapshot.py::ROW_READ_STATUSES`, which `_read_unit` also reads)
+and `page_size=1`, the server runs exactly the unit's row query as
+`WHERE status IN (...)` and ships one row. That is what
+`app.py::_fanout_probe_completion` now reads, through `fetch_task_page`. It
+crosses the same shared client, `mcp_fanout.first_success`, MCP `get_tasks`
+and backend read connection as the request path. Decision 17's contract is
+unchanged: the read is raw and uncached, and is never answered from a stored
+value. The verdict is unchanged too: a completed fan-out is `ok` whatever it
+returned, so only completion ever mattered, not the rows.
+
+`/healthz` deliberately does NOT cross the snapshot unit's latch:
+
+- Inside its TTL, `acquire_snapshot` is answered by the stored unit, which
+  decision 17 forbids.
+- The latch and the unit's refresh are both bounded. Lock acquisition is
+  bounded by `mcp_fanout.py::_LOCK_ACQUIRE_TIMEOUT_SECONDS` and then bypassed
+  (task 4789). Each half of the unit's read runs under `task_snapshot.py::_bounded`.
+  So the wedge class the probe was built for, an unbounded held lock, is
+  closed on both legs. What remains is a substrate hang whose cancellation
+  does not land, and the raw probe already sees that, because it crosses the
+  same client and fan-out.
+- A wedged unit is not silent. It shows up as stale or unknown `Datum`s,
+  DEGRADED banners and `mcp_fanout.py::TTLCache._note_lock_bypass`'s WARNING.
+- A latch-age check would need new instrumentation and a wider `TTLCache`
+  interface, and no observed failure calls for it.
+
+Re-open this only on evidence of a unit wedge that those signals miss.
 
 ## Decomposition plan
 

@@ -23,12 +23,9 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
 
+from fused_memory.middleware.curator_types import CandidateTask
 from fused_memory.utils.safe_yaml import load_yaml_list_file
-
-if TYPE_CHECKING:
-    from fused_memory.middleware.task_curator import CandidateTask
 
 logger = logging.getLogger(__name__)
 _LOG_LABEL = "recon_code_fix_premise_guard"
@@ -239,7 +236,7 @@ def _assertion_holds(assertion: SourceAssertion, source_root: Path) -> bool:
             _LOG_LABEL, target, exc,
         )
         return False
-    except Exception:  # noqa: BLE001 - never raise out of the guard
+    except Exception:  # never raise out of the guard
         logger.warning(
             "%s: unexpected error reading %s — assertion fails open",
             _LOG_LABEL,

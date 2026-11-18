@@ -18,12 +18,15 @@ import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 
 import staleness from '../../src/dashboard/static/redux/endpoint_staleness.js';
+import pollScope from '../../src/dashboard/static/redux/poll_scope.js';
 
 const REDUX = '../../src/dashboard/static/redux/';
 const LOAD_CHAIN = ['datum.js', 'data.js', 'spend_readings.js'].map(name => REDUX + name);
 
 function loadSpendReadings() {
-  globalThis.window = { DF_ENDPOINT_STALENESS: staleness, dispatchEvent() {} };
+  globalThis.window = {
+    DF_ENDPOINT_STALENESS: staleness, DF_POLL_SCOPE: pollScope, dispatchEvent() {},
+  };
   const require = createRequire(import.meta.url);
   for (const specifier of LOAD_CHAIN) delete require.cache[require.resolve(specifier)];
   const [datumApi, , readingsApi] = LOAD_CHAIN.map(specifier => require(specifier));

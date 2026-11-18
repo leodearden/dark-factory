@@ -1,0 +1,11 @@
+[Unit]
+Description=Nightly timer for the shared-repo incremental repack + commit-graph (task 8076)
+
+[Timer]
+# The free slot ahead of the 02:15 link-heal sweep (OPERATIONS.md section 12).
+OnCalendar=*-*-* 02:00:00
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,979 @@
+prd: plans/review-all-s4-verify-run-context-and-runner-contract-prd.md
+schema_version: 1
+signal_leaves:
+- π
+tasks:
+- label: α
+  task_id: 9128
+  title: Failure vocabulary and infra-transient as data; the bare-crash re-run rule; every entry point branches; retire VerifyInfraError
+  note: 'Closes fk-5037fafc755c and fk-09ad1a19f587 (R4 option 1). Lands C2, D16, D17. Ruling S4-5 (a clarification of R4): XDIST_WORKER_CRASH is not infra-transient; both gates re-run a bare crash once
+    (BARE_CRASH_RERUNS) and send a second crash to the fix loop with repeated_crash_report. Subsumes tasks 5506 and 7001. Until γ, failing_legs is read from failing_leg_categories; the bare-crash test leg
+    is rewritten to XDIST_WORKER_CRASH in every context. Depends on S6 ζ (lead ruling: both edit the worker infra-transient region, which task 5040 moves first). Polarity measured at e634cfe658.'
+  capabilities:
+  - name: verify-infra-error-retired
+    binding: anti-inversion (α) — raise sites, handlers, BlockDisposition row and 8 restatements deleted; no comment names it (D14)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: VerifyInfraError
+      paths:
+      - orchestrator/src/
+      expect: absent
+  - name: infra-fault-value
+    binding: capability→producer (α) — InfraFault on VerifyResult (the warm-marker errno)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: class InfraFault
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: sentinels-are-enum-members
+    binding: capability→producer (α) — FailureCategory gains the sentinel members with full CATEGORY_POLICY rows
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: 'MERGE_FLAKE_SUPPRESSED = '
+      paths:
+      - orchestrator/src/orchestrator/verify_categories.py
+      expect: present
+  - name: bare-crash-rerun-rule
+    binding: capability→producer (α) — the one re-run both gates give a bare crash (ruling S4-5, D17)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: BARE_CRASH_RERUNS
+      paths:
+      - orchestrator/src/orchestrator/verify_categories.py
+      expect: present
+  - name: repeated-crash-report
+    binding: capability→producer (α) — one renderer of the second-crash report both gates hand on (D17)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def repeated_crash_report
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: sentinel-disjointness-assert-gone
+    binding: anti-inversion (α) — no separate sentinel sets remain to keep apart
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: _assert_sentinels_disjoint
+      paths:
+      - orchestrator/src/
+      expect: absent
+  - name: archive-reclassified-flag-gone
+    binding: anti-inversion (α) — _archive_attempt_log no longer takes infra_reclassified (task 7001 subsumed)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: infra_reclassified
+      paths:
+      - orchestrator/src/
+      expect: absent
+  - name: review-checkpoint-no-verdict-skip
+    binding: capability→producer (α) — ReviewOutcome.SKIPPED_NO_VERDICT for an infra-transient or bare-crash phase 1
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: SKIPPED_NO_VERDICT
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: category-policy-table-exists
+    binding: substrate — verify_categories.py::CATEGORY_POLICY
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: 'substrate, green by design at e634cfe658: git grep ''CATEGORY_POLICY'' matches verify_categories.py; a present-today grep is vacuous under shared/delivered_check_polarity.py, so it stays
+        out of the dispatch gate'
+  - name: entry-points-branch-on-infra-transient-and-bare-crash
+    binding: produced by α; boundary rows 4–7e observe the workflow, post-rebase, review, eval, merge-lane (one re-run then steward), probe and baseline-probe branches
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: behaviour on crafted crashes and faults; judged by boundary rows, not a grep
+  - name: s6-lifecycle-upstream
+    binding: 'producer: S6 ζ (S6 C2, ItemLifecycle operative) — upstream of α by lead ruling on same-file order in merge_lane/worker.py; through it task 5040 lands first (S6-2 = B); dependency wired at
+      decompose'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: cross-stream same-file ordering prerequisite; its delivered checks belong to S6
+- label: β
+  task_id: 9129
+  title: VerifyContext and ModuleRegistry replace the context kwargs and the private registry channel
+  note: 'Closes fk-0bb03714372a and fk-0c5e73f13485. Lands C1 (S6/S7/S8/S9 consume). C1 site table pins today''s cold rule, timeout track, attempts and warm mark per call site, run_node_ids and TaskVerifyDispatcher''s
+    local leg included. ResourceClass also replaces verify_cache/modes.py::VerifyRole (task 5652). S6 α names verify_budget.resolve_verify_timeout''s keyword merge_cold from the start (lead ruling 2026-11-10); β passes it from the context. Depends on S6
+    ζ (lead ruling: S6''s typed-facts leaves land first on merge_lane/worker.py and gates.py). S6 κ depends on β (C1). Polarity measured at e634cfe658.'
+  capabilities:
+  - name: verify-context-type
+    binding: capability→producer (β) — verify_context.py::VerifyContext with named constructors
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: class VerifyContext
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: resource-class-vocabulary
+    binding: capability→producer (β) — shared/verify_admission.py::ResourceClass
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: class ResourceClass
+      paths:
+      - shared/src/shared/verify_admission.py
+      expect: present
+  - name: merge-flag-retired
+    binding: anti-inversion (β) — is_merge_verify gone from every def, call, spec field and comment; the glob covers the sites task 5040 and S6 α move (the eval corpus under evals/reviewer_trial/corpus
+      is JSON history and is not edited)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: is_merge_verify
+      paths:
+      - orchestrator/src/*.py
+      - orchestrator/src/orchestrator/defaults.yaml
+      expect: absent
+  - name: cold-cache-flag-retired
+    binding: anti-inversion (β) — allow_cold_cache replaced by worktree_provenance
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: allow_cold_cache
+      paths:
+      - orchestrator/src/
+      expect: absent
+  - name: cache-role-spelling-retired
+    binding: anti-inversion (β) — the verify-result cache reads ResourceClass, not its own VerifyRole Literal
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: \bVerifyRole\b
+      paths:
+      - orchestrator/src/
+      expect: absent
+  - name: spec-no-longer-writes-config-private
+    binding: anti-inversion (β) — apply_spec_to_host_config returns a registry instead of writing _module_configs
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: applied\._module_configs
+      paths:
+      - orchestrator/src/
+      expect: absent
+  - name: full-verify-reads-context-registry
+    binding: anti-inversion (β) — run_full_verification no longer reads config._module_configs
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: config\._module_configs is not None
+      paths:
+      - orchestrator/src/
+      expect: absent
+  - name: public-registry-accessor
+    binding: substrate — config.py::OrchestratorConfig.module_configs_or_empty
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: 'substrate, green by design at e634cfe658: git grep ''module_configs_or_empty'' matches config.py; a present-today grep is vacuous under shared/delivered_check_polarity.py, so it stays out
+        of the dispatch gate'
+  - name: site-table-preserved
+    binding: produced by β; boundary row 2b compares every C1 site-table row with pre-β values
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: resolved timeout/attempt counts per call site; a behaviour comparison, not a tree pattern
+  - name: s6-lifecycle-upstream
+    binding: 'producer: S6 ζ (S6 C2, ItemLifecycle operative) — upstream of this leaf by lead ruling on same-file order; dependency wired at decompose'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: cross-stream same-file ordering prerequisite; its delivered checks belong to S6
+- label: γ
+  task_id: 9130
+  title: Per-leg typed outcome on VerifyResult; report, aggregate, cause hint and remote no-verdict read legs
+  note: 'Closes fk-caa8f680e1c2, fk-3b67e8761674, fk-a2fb58789c14. Lands C3 (CheckRun gains leg and tool; LegOutcome.of). One leg vocabulary: verify_evidence.Leg replaces verify.py::LegSlot. Subsumes task
+    5892. High: gate 6698 dependency at decompose. CheckRun.leg replaces label; to_dict() keeps the label key (census bytes unchanged).'
+  capabilities:
+  - name: leg-outcome-type
+    binding: capability→producer (γ) — LegOutcome on VerifyResult.legs
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: class LegOutcome
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: one-leg-vocabulary
+    binding: anti-inversion (γ) — verify.py::LegSlot gone; verify_evidence.Leg is the one leg enum
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: class LegSlot
+      paths:
+      - orchestrator/src/
+      expect: absent
+  - name: failure-report-stops-text-rederivation
+    binding: anti-inversion (γ) — timed-out legs read from LegOutcome, not output text
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '''timed out'' in self\.'
+      paths:
+      - orchestrator/src/
+      expect: absent
+  - name: aggregate-stops-summary-scan
+    binding: anti-inversion (γ) — _aggregate_results merges legs instead of substring-scanning summaries
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '''tests failed'' in r\.summary'
+      paths:
+      - orchestrator/src/
+      expect: absent
+  - name: no-verdict-summary-scan-gone
+    binding: anti-inversion (γ) — RemoteRunner reads LegOutcome.no_verdict_note
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def is_no_verdict_summary
+      paths:
+      - orchestrator/src/
+      expect: absent
+  - name: per-leg-classifier-exists
+    binding: substrate — verify.py::classify_leg
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: 'substrate, green by design at e634cfe658: git grep ''def classify_leg'' matches verify.py; a present-today grep is vacuous under shared/delivered_check_polarity.py, so it stays out of the
+        dispatch gate'
+  - name: wire-fingerprint-registry
+    binding: substrate — remote_gate.py::wire_classes, which γ extends with LegOutcome and InfraFault
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: 'substrate, green by design at e634cfe658: git grep ''def wire_classes'' matches remote_gate.py; a present-today grep is vacuous under shared/delivered_check_polarity.py, so it stays out of
+        the dispatch gate'
+- label: δ
+  task_id: 9131
+  title: One no-source-diff resolver and a typed plan leg
+  note: Closes fk-0f9cace0cd00 and fk-c88f7d3ae54a. PlannedRun.leg replaces the reason-prefix decoding task 5652 moved into verify_plan.py::_LEG_BY_REASON_PREFIX; verify_cache/keys.py reads the field. Moves
+    _emit_trivial_pass_escalated beside the resolver (ruled pre-split move).
+  capabilities:
+  - name: no-source-diff-outcome
+    binding: capability→producer (δ) — verify.py::resolve_no_source_diff returns NoSourceDiffOutcome
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: class NoSourceDiffOutcome
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: typed-plan-leg
+    binding: capability→producer (δ) — verify_plan.py::PlannedRun.leg
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: 'leg: Leg [|] None'
+      paths:
+      - orchestrator/src/orchestrator/verify_plan.py
+      expect: present
+  - name: reason-prefix-routing-gone
+    binding: anti-inversion (δ) — no execution path or cache key decodes a leg from PlannedRun.reason
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: _LEG_BY_REASON_PREFIX
+      paths:
+      - orchestrator/src/
+      expect: absent
+- label: ε
+  task_id: 9160
+  title: The plan executes the fallback branch; delete the second scope engine; final h14 measurement
+  note: 'Closes fk-fac2cb6af858, fk-d99f146ff901, fk-cb29fac47dba, fk-a635d54da4ab. Runs last on verify.py (ruling S4-7); depends on ξ and on task 7041 (out of batch). High: gate 6698 dependency at decompose.'
+  capabilities:
+  - name: fallback-engine-deleted
+    binding: anti-inversion (ε) — _build_fallback_config removed; derive_verify_plan renders fallback commands
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def _build_fallback_config
+      paths:
+      - orchestrator/src/
+      expect: absent
+  - name: quote-blind-chain-grammar-gone
+    binding: anti-inversion (ε) — fallback rescoping uses verify_cmd's quote-aware grammar
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: _AND_CLAUSE_SPLIT_RE
+      paths:
+      - orchestrator/src/
+      - tests/scripts/
+      expect: absent
+  - name: plan-record-reconciliation-gone
+    binding: anti-inversion (ε) — the persisted plan is what ran, so no after-the-fact rebuild
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def _executed_fallback_plan
+      paths:
+      - orchestrator/src/
+      expect: absent
+  - name: quote-aware-chain-primitives
+    binding: substrate — verify_cmd.py::split_and_chain_segments and split_top_level_and
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: 'substrate, green by design at e634cfe658: git grep ''def split_and_chain_segments'' matches verify_cmd.py; a present-today grep is vacuous under shared/delivered_check_polarity.py, so it
+        stays out of the dispatch gate'
+  - name: fallback-test-floor-upstream
+    binding: producer:task-7041 (fallback test floor, pending high) — upstream of ε; dependency wired at decompose; ε's characterization corpus is captured after it lands
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: out-of-batch prerequisite; its own delivered checks belong to task 7041
+  - name: verify-py-measured-under-alarm
+    binding: produced by ε — raw line count and prose share of every verify module recorded in the commit message
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: a measurement recorded at landing, not a tree pattern
+- label: ζ
+  task_id: 9132
+  title: One isolated-rerun policy table; sweep confirm on the ephemeral worktree helper
+  note: Closes the policy half of fk-3756ad2f3357 (task 7918 merged the three command builders into _node_id_test_config at fca89bd55b) and fk-f994995001e5. Subsumes task 6249. Depends on δ (ruling S4-7).
+  capabilities:
+  - name: rerun-site-table
+    binding: capability→producer (ζ) — RerunSite keys the one policy table
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: class RerunSite
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: sweep-confirm-worktree-kind
+    binding: capability→producer (ζ) — WorktreeKind.MAIN_SWEEP_CONFIRM, protected by construction
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: MAIN_SWEEP_CONFIRM
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: hand-rolled-confirm-worktree-gone
+    binding: anti-inversion (ζ) — no inline _mainsweepconfirm- path f-string
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: _mainsweepconfirm-\{
+      paths:
+      - orchestrator/src/
+      expect: absent
+  - name: sweep-prefilter-implementation-gone
+    binding: anti-inversion (ζ) — the prefilter is a RerunSite row
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def _sweep_failure_reproduces_in_isolation
+      paths:
+      - orchestrator/src/
+      expect: absent
+  - name: ephemeral-worktree-helper
+    binding: substrate — git_ops.py::GitOps.ephemeral_worktree (S5 ξ may move it)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: 'substrate, green by design at e634cfe658: git grep ''async def ephemeral_worktree'' matches git_ops.py; a present-today grep is vacuous under shared/delivered_check_polarity.py, so it stays
+        out of the dispatch gate'
+- label: η
+  task_id: 9135
+  title: One merge-verify profile drives both legs
+  note: 'Closes fk-8dbae7d39adc. Lands C7 (spec half); ruling S4-4. Depends on ι1 (same LocalRunner and worker runner construction) and on task 7465 (out of batch). High: gate 6698 dependency at decompose.'
+  capabilities:
+  - name: shared-spec-application
+    binding: capability→producer (η) — verify_spec_shared.py::apply_merge_verify_spec used by LocalRunner and run_merge_verify_on_worktree
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def apply_merge_verify_spec
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: lossless-module-profile
+    binding: capability→producer (η) — ModuleVerifyProfile carries every verdict-relevant ModuleConfig field
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: class ModuleVerifyProfile
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: lossy-reconstruction-gone
+    binding: anti-inversion (η) — verify_runner.py::_module_config_from_command removed
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def _module_config_from_command
+      paths:
+      - orchestrator/src/
+      expect: absent
+  - name: config-field-census-guard
+    binding: substrate — test_merge_verify_config_fidelity.py::MERGE_PATH_CONFIG_READS (task 5295, done; η extends it to per-module fields)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: 'substrate, green by design at e634cfe658: git grep ''MERGE_PATH_CONFIG_READS'' matches orchestrator/tests/test_merge_verify_config_fidelity.py; a present-today grep is vacuous under shared/delivered_check_polarity.py,
+        so it stays out of the dispatch gate'
+  - name: spec-fields-upstream
+    binding: producer:task-7465 (scope_cargo and the config-only globs on MergeVerifySpec, pending) — upstream of η; dependency wired at decompose
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: out-of-batch same-file prerequisite
+- label: θ
+  task_id: 9137
+  title: Host selection and quarantine live only in HostAllocator
+  note: Closes fk-baa454b81f6f. Lands C7 (dispatch half). The harness-built quarantine set (task 6670) stays one object; HostAllocator becomes its only writer and the merge lane's only reader (the
+    worker sites task 5040 moves go through it); HostPool keeps reading it by reference. Deletes build_remote_runners' dead quarantine filter (task 8734 cancelled into θ). Does not widen the quarantine-class
+    conflation task 5291 fixes (it absorbed deferred 3229). The drift action stops naming pool.clear_quarantine. Depends on S6 ζ and S6 λ (lead rulings); same-file edges with 5291 and 7038.
+  capabilities:
+  - name: pool-retired
+    binding: anti-inversion (θ) — VerifyRunnerPool replaced by dispatch_merge_verify
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: class VerifyRunnerPool
+      paths:
+      - orchestrator/src/
+      expect: absent
+  - name: pool-quarantine-state-gone
+    binding: anti-inversion (θ) — no second quarantine set
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: self\._quarantined
+      paths:
+      - orchestrator/src/orchestrator/verify_runner.py
+      expect: absent
+  - name: drift-action-names-escalation-tool
+    binding: anti-inversion (θ) — the drift action names clear_verify_host_quarantine, not the deleted pool method
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: pool\.clear_quarantine
+      paths:
+      - orchestrator/src/
+      expect: absent
+  - name: dead-runner-quarantine-filter-gone
+    binding: anti-inversion (θ) — build_remote_runners no longer filters by a quarantine set no caller passes (task 8734)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: r\.name not in quarantine
+      paths:
+      - orchestrator/src/
+      expect: absent
+  - name: dispatch-function
+    binding: capability→producer (θ) — verify_runner.py::dispatch_merge_verify
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def dispatch_merge_verify
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: allocator-exists
+    binding: substrate — HostAllocator (ο moves it to verify_hosts.py)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: 'substrate, green by design at e634cfe658: git grep ''class HostAllocator'' matches verify_runner.py; a present-today grep is vacuous under shared/delivered_check_polarity.py, so it stays
+        out of the dispatch gate'
+  - name: s6-lifecycle-upstream
+    binding: 'producer: S6 ζ (S6 C2, ItemLifecycle operative) — upstream of this leaf by lead ruling on same-file order; dependency wired at decompose'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: cross-stream same-file ordering prerequisite; its delivered checks belong to S6
+  - name: s6-satellites-upstream
+    binding: 'producer: S6 λ (drift and shadow own their state) — upstream of θ by lead ruling; dependency wired at decompose'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: cross-stream same-file ordering prerequisite
+- label: ι1
+  task_id: 9134
+  title: The VerifyHost seam in place; host required on every verify function
+  note: 'Prepares fk-3e806baf4c6e (carried by ι2 and ξ). Lands C5 in verify.py under ruling S4-1: host required on the entry points, run_node_ids, the six public probes, LocalRunner and every internal helper;
+    no default inside the verify modules; TaskWorkflow, SpeculativeMergeWorker and ReviewCheckpoint resolve VerifyHost.process() once at construction; Harness, verify-merge and verify-task resolve it once;
+    two guards. SubprocessRunner delegates to _run_cmd until ι2. One mechanical shape over 55 test files (449 calls, AST at e634cfe658).'
+  capabilities:
+  - name: verify-host-type
+    binding: capability→producer (ι1) — VerifyHost with the process slot
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: class VerifyHost
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: command-runner-protocol
+    binding: capability→producer (ι1) — VerifyCommandRunner (named apart from offline_lane.py::CommandRunner)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: class VerifyCommandRunner
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: host-seam-guards
+    binding: capability→producer (ι1) — guard 1 (no host default in a verify signature, no VerifyHost.process() call inside a verify module) and guard 2 (no VerifyHost.fresh() in production outside the
+      composition roots), with seeded fixtures (INV-10)
+    verdict: PASS
+    delivered_check:
+      kind: path
+      paths:
+      - orchestrator/tests/test_verify_host_seam.py
+      expect: present
+  - name: one-host-per-process
+    binding: produced by ι1; boundary row 14c observes that the objects Harness builds share the process host
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: object identity across the composition root; judged by row 14c
+- label: ι2
+  task_id: 9138
+  title: Retire every _run_cmd patch site
+  note: Carries fk-3e806baf4c6e (patch half; closes at ξ); priority high by explicit choice. 215 dotted patches in 21 files at e634cfe658, test_verify.py included. Keeps the module-level _run_cmd name until
+    ι3. Same-file edges with tasks 6765 and 7666 on tests/scripts/test_verify_budget_census.py.
+  capabilities:
+  - name: dotted-run-cmd-patches-gone
+    binding: anti-inversion (ι2) — tests inject VerifyHost.fresh(runner=…)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: orchestrator\.verify\._run_cmd
+      paths:
+      - orchestrator/tests/
+      - tests/
+      expect: absent
+  - name: patch-object-run-cmd-gone
+    binding: anti-inversion (ι2) — no patch.object of the private runner
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: patch\.object\([A-Za-z_]+, '_run_cmd'
+      paths:
+      - orchestrator/tests/
+      - tests/
+      expect: absent
+- label: ι3
+  task_id: 9141
+  title: Move the exec region and the host to verify_exec.py and verify_host.py
+  note: Prepares fk-3e806baf4c6e (carried by ι2 and ξ). Subsumes task 7913. harness.py reaches reap_leftover_verify_scopes in its new home. ι3 repoints review_pre_test.py and test_shutdown.py's child-script
+    import.
+  capabilities:
+  - name: exec-module
+    binding: capability→producer (ι3)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: async def reap_leftover_verify_scopes
+      paths:
+      - orchestrator/src/orchestrator/verify_exec.py
+      expect: present
+  - name: host-module
+    binding: capability→producer (ι3)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: class VerifyHost
+      paths:
+      - orchestrator/src/orchestrator/verify_host.py
+      expect: present
+  - name: no-private-runner-in-review-pre-test
+    binding: anti-inversion (ι3) — review_pre_test uses the public runner
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: \b_run_cmd\b
+      paths:
+      - orchestrator/src/orchestrator/review_pre_test.py
+      expect: absent
+- label: κ
+  task_id: 9142
+  title: Owned stores on VerifyHost; the 12 module-level caches and the admission gates go
+  note: Closes fk-126a75a57ca5. Depends on task 5292 (out of batch). Admission waiters reach gates through the host they were given; Harness builds AdmissionWatch with its one process host, so the heartbeat
+    sees the same queue (row 15b).
+  capabilities:
+  - name: flake-record-list-deleted
+    binding: anti-inversion (κ) — _suppressed_flake_records had 0 readers
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: _suppressed_flake_records
+      paths:
+      - orchestrator/src/
+      expect: absent
+  - name: probe-cache-global-gone
+    binding: anti-inversion (κ) — probe verdicts live in a VerifyHost store
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '^_PROBE_CACHE[: =]'
+      paths:
+      - orchestrator/src/
+      expect: absent
+  - name: downgrade-counter-global-gone
+    binding: anti-inversion (κ) — bounded counter on the baseline store
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: _MAIN_PROBE_DOWNGRADE_REPEAT_COUNTS
+      paths:
+      - orchestrator/src/
+      expect: absent
+  - name: admission-gates-global-gone
+    binding: anti-inversion (κ) — admission gates live on VerifyStores
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '^_GATES[: =]'
+      paths:
+      - orchestrator/src/orchestrator/verify_admission_gate.py
+      expect: absent
+  - name: admission-watch-gets-the-host
+    binding: anti-inversion (κ) — AdmissionWatch is built with the process host, never bare
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: AdmissionWatch\(\)
+      paths:
+      - orchestrator/src/
+      expect: absent
+  - name: module-state-guard-exists
+    binding: capability→producer (κ) — the AST mutation-rule guard
+    verdict: PASS
+    delivered_check:
+      kind: path
+      paths:
+      - orchestrator/tests/test_verify_no_module_state.py
+      expect: present
+  - name: module-state-guard-rejects-a-seeded-global
+    binding: rejection-mechanism — produced by κ; the guard's fixture test observes it flag a seeded module that mutates a global
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: rejection quality is judged by the guard's own fixture test
+  - name: admission-watcher-sees-waiters
+    binding: produced by κ; boundary row 15b observes a waiter in the verify_admission_heartbeat payload
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: watcher/waiter agreement is behaviour; judged by row 15b
+- label: λ
+  task_id: 9146
+  title: verify_archive.py and the one attempt-* grammar; the census parses through it
+  note: Closes fk-37d63bf83608. Lands C6 (S25 consumes). Depends on task 6765 (S25 κ). Subsumes task 5673.
+  capabilities:
+  - name: artifact-name-grammar
+    binding: capability→producer (λ) — verify_artifacts.py::ArtifactName (stdlib only)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: class ArtifactName
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: census-private-sanitiser-gone
+    binding: anti-inversion (λ) — the census imports sanitize_prefix and ArtifactName
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def sanitise_prefix
+      paths:
+      - scripts/verify_budget_census.py
+      expect: absent
+  - name: census-binds-checkout
+    binding: capability→producer (λ) — the census binds orchestrator/src for the system python (S25 ε rule)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^import _checkout
+      paths:
+      - scripts/verify_budget_census.py
+      expect: present
+  - name: stamp-format-one-spelling
+    binding: anti-inversion (λ) — ARCHIVE_STAMP_FORMAT replaces the two other spellings
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: _STDERR_ARCHIVE_TS_FMT|_SIDECAR_STAMP_FMT
+      paths:
+      - orchestrator/src/
+      expect: absent
+  - name: sanitiser-copies-gone
+    binding: anti-inversion (λ) — one sanitize_prefix; the check names the files λ edits and excludes verify_artifacts.py, whose sanitize_prefix body is the one home
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: replace\('/', '_'\)\.replace\(' ', '_'\)
+      paths:
+      - orchestrator/src/orchestrator/verify.py
+      - orchestrator/src/orchestrator/verify_runner.py
+      - orchestrator/src/orchestrator/verify_archive.py
+      - orchestrator/src/orchestrator/task_verify_dispatch.py
+      - scripts/verify_budget_census.py
+      - scripts/suite_census_evidence.py
+      expect: absent
+  - name: system-python-binding-for-scripts
+    binding: substrate — scripts/_checkout.py binds every workspace member's src (task 6758, done)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: 'substrate, green by design at e634cfe658: git grep ''MEMBER_SRC'' matches scripts/_checkout.py; a present-today grep is vacuous under shared/delivered_check_polarity.py, so it stays out of
+        the dispatch gate'
+  - name: census-policy-upstream
+    binding: producer:task-6765 (S25 κ, pending) — upstream of λ on scripts/verify_budget_census.py; dependency wired at decompose
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: out-of-batch same-file prerequisite
+- label: μ
+  task_id: 9148
+  title: 'Split I: verify_pytest_output.py and verify_commands.py'
+  note: Prepares fk-73b03674a8e4 (carried by ξ). Moves _worktree_reader first (ruled pre-split move); subsumes task 5895; leaves the fallback-only rescoper for ε.
+  capabilities:
+  - name: pytest-output-module
+    binding: capability→producer (μ) — parse functions move to verify_pytest_output.py
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def parse_pytest_failures
+      paths:
+      - orchestrator/src/orchestrator/verify_pytest_output.py
+      expect: present
+  - name: worktree-reader-moved-down
+    binding: anti-inversion (μ) — breaks the command-string cycle and replaces task_verify_dispatch's copy
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def _worktree_reader
+      paths:
+      - orchestrator/src/orchestrator/verify.py
+      - orchestrator/src/orchestrator/task_verify_dispatch.py
+      expect: absent
+- label: μ0
+  task_id: 9150
+  title: Move the result types to verify_result.py and repoint every importer
+  note: 'complexity=simple; ruling S4-6. One import-line shape over 16 production and 114 test files (AST at e634cfe658). Depends on S6 ζ and S6 μ (lead rulings: the last S6 leaf on worker.py, types.py,
+    gates.py, shadow.py).'
+  capabilities:
+  - name: result-module
+    binding: capability→producer (μ0) — VerifyResult defined below run_verification
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^class VerifyResult
+      paths:
+      - orchestrator/src/orchestrator/verify_result.py
+      expect: present
+  - name: result-left-verify-py
+    binding: anti-inversion (μ0)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^class VerifyResult
+      paths:
+      - orchestrator/src/orchestrator/verify.py
+      expect: absent
+  - name: tests-import-from-result-module
+    binding: anti-inversion (μ0) — single-line imports through orchestrator.verify repointed
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: from orchestrator\.verify import .*\bVerifyResult\b
+      paths:
+      - orchestrator/tests/
+      - tests/
+      expect: absent
+  - name: s6-lifecycle-upstream
+    binding: 'producer: S6 ζ (S6 C2, ItemLifecycle operative) — upstream of this leaf by lead ruling on same-file order; dependency wired at decompose'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: cross-stream same-file ordering prerequisite; its delivered checks belong to S6
+  - name: s6-queries-upstream
+    binding: 'producer: S6 μ (the native lane-query port) — upstream of μ0 by lead ruling; dependency wired at decompose'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: cross-stream same-file ordering prerequisite
+- label: ν
+  task_id: 9153
+  title: 'Split II: verify_leg.py'
+  note: Prepares fk-73b03674a8e4. Moves _load_sample and _xdist_workers down from the discriminator region; merge_verify_command_budget_secs stays in verify.py; resolve_verify_timeout is imported from S6's
+    verify_budget.py, not moved.
+  capabilities:
+  - name: leg-module-holds-run-verification
+    binding: capability→producer (ν)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^async def run_verification
+      paths:
+      - orchestrator/src/orchestrator/verify_leg.py
+      expect: present
+  - name: run-verification-left-verify-py
+    binding: anti-inversion (ν)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^async def run_verification
+      paths:
+      - orchestrator/src/orchestrator/verify.py
+      expect: absent
+- label: ξ
+  task_id: 9156
+  title: 'Split III: verify_main_probe.py and verify_discriminator.py'
+  note: 'Closes fk-73b03674a8e4 and fk-3e806baf4c6e (the last private-name imports become module publics). Priority high: gate 6698 dependency at decompose. Subsumes task 6435. harness.py repointed.'
+  capabilities:
+  - name: probe-module
+    binding: capability→producer (ξ)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^async def run_main_tip_sweep
+      paths:
+      - orchestrator/src/orchestrator/verify_main_probe.py
+      expect: present
+  - name: discriminator-module
+    binding: capability→producer (ξ)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^async def confirm_isolated_rerun_verdict
+      paths:
+      - orchestrator/src/orchestrator/verify_discriminator.py
+      expect: present
+  - name: probe-left-verify-py
+    binding: anti-inversion (ξ)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^async def verify_failure_is_preexisting_on_main
+      paths:
+      - orchestrator/src/orchestrator/verify.py
+      expect: absent
+- label: ο
+  task_id: 9163
+  title: 'verify_runner: dead code, reach-backs, HostAllocator and DriftDetector out'
+  note: Carries fk-e906c4e914c2 (closes at ρ). Keeps run_verdict_parity and its report types for ρ (D15, ruling S4-8). run_unscoped becomes a required keyword; cli.py passes merge_lane/worker.py::PRODUCTION_VERIFIER.run_unscoped_typechecks.
+  capabilities:
+  - name: sccache-dead-code-gone
+    binding: anti-inversion (ο)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def capture_sccache_stats
+      paths:
+      - orchestrator/src/
+      expect: absent
+  - name: cold-warm-delta-dead-code-gone
+    binding: anti-inversion (ο)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: class ColdWarmVerifyDelta
+      paths:
+      - orchestrator/src/
+      expect: absent
+  - name: no-merge-lane-import
+    binding: anti-inversion (ο) — verify_runner imports nothing from orchestrator.merge_lane (matches a parenthesised multi-line import too)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: from orchestrator\.merge_lane
+      paths:
+      - orchestrator/src/orchestrator/verify_runner.py
+      expect: absent
+  - name: drift-module
+    binding: capability→producer (ο) — verify_drift.py::DriftDetector
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: class DriftDetector
+      paths:
+      - orchestrator/src/orchestrator/verify_drift.py
+      expect: present
+- label: ρ
+  task_id: 9166
+  title: The orchestrator verdict-parity command; both escalation actions name it
+  note: New by ruling S4-8 (D15). Closes fk-e906c4e914c2 (the parity code ο kept gets its caller). Defaults to the single divergent SHA; mints and cleans one merge worktree per SHA under merge_verify_lease;
+    exits non-zero on disagreement; both action texts name the command and clear_verify_host_quarantine; OPERATIONS.md documents the procedure. Depends on ο; same-file edges with 5291 and with S6 worker
+    leaves. Priority medium, ~500 LOC (estimate).
+  capabilities:
+  - name: verdict-parity-command
+    binding: capability→producer (ρ) — the orchestrator verdict-parity CLI command
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '''verdict-parity'''
+      paths:
+      - orchestrator/src/orchestrator/cli.py
+      expect: present
+  - name: actions-name-the-command
+    binding: anti-inversion (ρ) — neither escalation action tells operators to run the bare function
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: via run_verdict_parity|\(run_verdict_parity\) and clear
+      paths:
+      - orchestrator/src/
+      expect: absent
+  - name: parity-command-end-to-end
+    binding: capability→producer (ρ) — one end-to-end run against real runners on a fixture repo (row 21)
+    verdict: PASS
+    delivered_check:
+      kind: path
+      paths:
+      - orchestrator/tests/test_verdict_parity_command.py
+      expect: present
+  - name: parity-function-exists
+    binding: substrate — verify_runner.py::run_verdict_parity and render_parity_report
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: 'substrate, green by design at e634cfe658: git grep ''async def run_verdict_parity'' matches verify_runner.py; a present-today grep is vacuous under shared/delivered_check_polarity.py, so
+        it stays out of the dispatch gate'
+  - name: runbook-procedure
+    binding: produced by ρ — OPERATIONS.md gains the re-prove and readmit procedure, including the code-identity caveat
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: prose in the runbook, judged at review
+- label: π
+  task_id: 9169
+  title: 'Integration gate: two-way boundary rows for C1–C7 and D15'
+  note: Signal leaf. Carries no finding key; lands the starred boundary rows and re-runs the rest, row 21 included.
+  capabilities:
+  - name: boundary-suite-exists
+    binding: capability→producer (π)
+    verdict: PASS
+    delivered_check:
+      kind: path
+      paths:
+      - orchestrator/tests/test_verify_contracts_boundary.py
+      expect: present
+  - name: boundary-rows-green
+    binding: produced by π over α…ρ — every row of the PRD's boundary-test sketch passes on main
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: suite outcome on main, judged at the merge gate

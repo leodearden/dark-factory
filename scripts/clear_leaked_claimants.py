@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Census and repair of task-store claimants that own nothing (task 4625).
 
-Two tiers, per docs/prds/claimant-invariant-enforcement.md D3: TERMINAL rows
-carrying any claimant, and HYGIENE rows (an allowlisted non-terminal status)
-carrying a stale one. A dry run is the default: it reports both tiers and never
-dials the MCP server. --apply clears the terminal tier, plus the hygiene tier
-with --repair-hygiene, through set_task_claimant only. The PRD's D6 and its
-task zeta give the rationale for each gate.
+Three tiers. TERMINAL is the alarm tier: a terminal row carrying a claimant
+that no metadata.claimant_exception covers (docs/prds/claimant-invariant-detection.md
+D-5/E-2). LEDGERED is a terminal row whose claimant the C4-E2 ledger covers, a
+sanctioned exception that is reported and never written (task 6777). HYGIENE is
+an allowlisted non-terminal row carrying a stale claimant, per
+docs/prds/claimant-invariant-enforcement.md D3. A dry run is the default: it
+reports every tier and never dials the MCP server. --apply clears the terminal
+tier, plus the hygiene tier with --repair-hygiene, through set_task_claimant
+only. The enforcement PRD's D6 and its task zeta give the rationale for each gate.
 
 Usage:
     python scripts/clear_leaked_claimants.py --project-root ROOT [--project-root ROOT ...]
@@ -32,12 +35,12 @@ from typing import Any, Protocol
 import httpx
 from _task_db_scan import (
     UNREADABLE_STORE_ERRORS,
-    connect_ro,
     decode_metadata,
     format_kv_line,
     tasks_db_path,
 )
 from migrate_metadata_modules_to_files import FusedMemoryClient, write_failure_reason
+from shared.tasks_db_readonly import connect_ro
 
 # Bind shared/ and fused-memory/ to THIS checkout rather than whichever copy an
 # editable install put on sys.path (scripts/audit_manifest_descriptor_drift.py::_SHARED_SRC).
@@ -50,6 +53,7 @@ from fused_memory.mcp_tools.scheduler_state import read_scheduler_state
 from shared.task_claimant import (
     DEFAULT_CLAIMANT_HEARTBEAT_TTL,
     is_stale_hygiene_tier_claimant,
+    ledger_covers_claimant,
     violates_terminal_claimant_invariant,
 )
 
@@ -57,6 +61,19 @@ from shared.task_claimant import (
 class Tier(StrEnum):
     TERMINAL = 'terminal'
     HYGIENE = 'hygiene'
+    LEDGERED = 'ledgered'
+
+
+REPAIRABLE_TIERS: frozenset[Tier] = frozenset({Tier.TERMINAL, Tier.HYGIENE})
+
+
+def _require_repairable(tiers: frozenset[Tier]) -> None:
+    unrepairable = sorted(tier.value for tier in tiers - REPAIRABLE_TIERS)
+    if unrepairable:
+        repairable = sorted(tier.value for tier in REPAIRABLE_TIERS)
+        raise ValueError(
+            f'tiers {unrepairable} cannot be selected for repair; only {repairable} may be'
+        )
 
 
 def classify_tier(task: Mapping, now: datetime) -> Tier | None:
@@ -64,7 +81,7 @@ def classify_tier(task: Mapping, now: datetime) -> Tier | None:
     # terminal predicate takes no TTL, and a missing heartbeat is stranded per
     # shared/src/shared/task_claimant.py::_claimant_liveness_stranded, so it never fails closed.
     if violates_terminal_claimant_invariant(task):
-        return Tier.TERMINAL
+        return Tier.LEDGERED if ledger_covers_claimant(task) else Tier.TERMINAL
     if is_stale_hygiene_tier_claimant(task, now, DEFAULT_CLAIMANT_HEARTBEAT_TTL):
         return Tier.HYGIENE
     return None
@@ -240,11 +257,7 @@ async def _clear_claimant(client: ToolClient, project_root: str, violation: Viol
 
 
 def holder_task_ids(project_root: str) -> frozenset[str]:
-    state = read_scheduler_state(Path(project_root))
-    holders = state.get('current_holders') if isinstance(state, Mapping) else None
-    if not isinstance(holders, Mapping):
-        return frozenset()
-    return frozenset(str(task_id) for task_id in holders.values())
+    return read_scheduler_state(Path(project_root)).holder_task_ids()
 
 
 def observed_delta(
@@ -325,6 +338,7 @@ async def apply_repairs(
     tiers: frozenset[Tier],
     clock: Callable[[], datetime],
 ) -> ApplyReport:
+    _require_repairable(tiers)
     if client is None:
         raise ValueError('apply_repairs writes through an MCP client; none was given')
     root = census.project_root
@@ -386,6 +400,7 @@ async def sweep(
     client: ToolClient | None,
     clock: Callable[[], datetime],
 ) -> SweepResult:
+    _require_repairable(tiers)
     if apply and client is None:
         raise ValueError('an applying sweep writes through an MCP client; none was given')
     projects: list[ProjectReport] = []
@@ -642,7 +657,7 @@ async def _applying_sweep(
 
 
 async def main_async(args: argparse.Namespace) -> int:
-    tiers = frozenset({Tier.TERMINAL, Tier.HYGIENE} if args.repair_hygiene else {Tier.TERMINAL})
+    tiers = REPAIRABLE_TIERS if args.repair_hygiene else frozenset({Tier.TERMINAL})
     if args.apply:
         result = await _applying_sweep(args.server_url, args.project_roots, tiers)
         if result is None:

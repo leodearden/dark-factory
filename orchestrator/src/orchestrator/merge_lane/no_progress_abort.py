@@ -1,16 +1,17 @@
 """The observed facts of one no-progress verify abort, and their two durable renderings.
 
 Abort trigger 3 of the merge worker's in-flight verify fires when no progress
-signal (a live remote dispatch, or new content under the merge worktree) was
-seen for a whole budget. ``NoProgressAbort`` records what was observed at that
-firing; ``event_data`` renders it as the ``merge_verify_progress_abort`` event
-payload and ``terminal_reason`` as the blocked reason of a cap-out. Both state
+signal (a live remote dispatch, a change in the verify process tree's CPU time,
+or new content under the merge worktree) was seen for a whole budget.
+``NoProgressAbort`` records what was observed at that firing; ``event_data``
+renders it as the ``merge_verify_progress_abort`` event payload and
+``terminal_reason`` as the blocked reason of a cap-out. Both state
 observations only: nothing here can tell a dead verify from a slow one, so
 neither rendering claims to.
 
 Every firing counts as a strike towards ``max_strikes``, including on a remote
 lease whose dispatch had already returned. Since task 4579 such an abort means
-the post-dispatch LOCAL work wrote nothing under the merge worktree for a whole
+the post-dispatch LOCAL work showed no CPU or write progress for a whole
 budget, which is the stalled-local-work class the cap bounds; the remote leg's
 health says nothing about it, and not counting would turn a stalled cross-check
 into an unbounded requeue loop holding the verifier host. The event's

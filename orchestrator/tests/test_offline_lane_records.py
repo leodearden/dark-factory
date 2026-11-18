@@ -34,6 +34,7 @@ from orchestrator.offline_lane_records import (
     ProbeResult,
     RunRecord,
     RunRecordStore,
+    StoredPass,
     classify_exit,
     command_key,
     is_well_formed,
@@ -288,6 +289,7 @@ class TestAllocatePass:
     def test_header_only_pass_is_well_formed(self, store: RunRecordStore) -> None:
         lane_pass = store.allocate_pass('unit', Leg.NUMERIC, HEAD)
         loaded = store.load_pass('unit', lane_pass.pass_id)
+        assert lane_pass.directory == store.pass_directory('unit', lane_pass.pass_id)
         assert loaded is not None
         assert (loaded.detect, loaded.confirm, loaded.outcome, loaded.effect) == (None,) * 4
 
@@ -516,31 +518,152 @@ class TestPassesSince:
         assert [p.pass_id for p in store.passes_since('Unit Tests', T0)] == [spaced]
 
 
+class TestStoredPassesSince:
+    SINCE = T0 + timedelta(hours=1)
+
+    def _written_at(self, store: RunRecordStore, clock: _Clock, when: datetime, command: str) -> str:
+        clock.current = when
+        lane_pass = store.allocate_pass(command, Leg.GENERIC, HEAD)
+        store.write_run(lane_pass, _record(command))
+        store.set_pass_blocks(lane_pass, outcome=None, effect={'tests_counted': []})
+        return lane_pass.pass_id
+
+    def _seeded(self, store: RunRecordStore, clock: _Clock) -> dict[str, list[str]]:
+        """Two well-formed passes per command in the window, three bad ones, and what must not be yielded."""
+        self._written_at(store, clock, T0, 'unit')
+        good = {
+            command: [
+                self._written_at(store, clock, self.SINCE + timedelta(minutes=offset, microseconds=250), command)
+                for offset in (10, 20)
+            ]
+            for command in ('unit', 'lint')
+        }
+        not_json = self._written_at(store, clock, self.SINCE + timedelta(minutes=30), 'unit')
+        store.pass_directory('unit', not_json).joinpath('record.json').write_text('{truncated')
+        no_effect = self._written_at(store, clock, self.SINCE + timedelta(minutes=40), 'unit')
+        record_path = store.pass_directory('unit', no_effect) / 'record.json'
+        payload = json.loads(record_path.read_text())
+        del payload['effect']
+        record_path.write_text(json.dumps(payload))
+        deleted = self._written_at(store, clock, self.SINCE + timedelta(minutes=50), 'lint')
+        store.pass_directory('lint', deleted).joinpath('record.json').unlink()
+        (store.root / 'unit' / 'scratch').mkdir()
+        return {'good_unit': good['unit'], 'good_lint': good['lint'], 'bad': [not_json, no_effect, deleted]}
+
+    def test_every_pass_directory_in_the_window_is_yielded_once_in_order(
+        self, store: RunRecordStore, clock: _Clock
+    ) -> None:
+        seeded = self._seeded(store, clock)
+
+        stored = list(store.stored_passes_since(self.SINCE))
+
+        assert [(item.command_key, item.pass_id) for item in stored] == [
+            *[('lint', pass_id) for pass_id in (*seeded['good_lint'], seeded['bad'][2])],
+            *[('unit', pass_id) for pass_id in (*seeded['good_unit'], *seeded['bad'][:2])],
+        ]
+
+    def test_a_well_formed_pass_carries_its_record_and_no_problem(
+        self, store: RunRecordStore, clock: _Clock
+    ) -> None:
+        seeded = self._seeded(store, clock)
+
+        stored = {(item.command_key, item.pass_id): item for item in store.stored_passes_since(self.SINCE)}
+
+        for command in ('unit', 'lint'):
+            for offset, pass_id in zip((10, 20), seeded[f'good_{command}'], strict=True):
+                item = stored[(command_key(command), pass_id)]
+                assert item.problem is None
+                assert item.record == store.load_pass(command, pass_id)
+                assert item.directory == store.pass_directory(command, pass_id)
+                assert item.started_at == self.SINCE + timedelta(minutes=offset)
+                assert item.command_key == command_key(command)
+
+    def test_a_malformed_or_unreadable_record_is_reported_not_skipped(
+        self, store: RunRecordStore, clock: _Clock, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        seeded = self._seeded(store, clock)
+
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.offline_lane_records'):
+            stored = {(item.command_key, item.pass_id): item for item in store.stored_passes_since(self.SINCE)}
+
+        for key in zip(('unit', 'unit', 'lint'), seeded['bad'], strict=True):
+            item = stored[key]
+            assert item.record is None
+            assert item.problem
+            assert str(item.directory / 'record.json') in item.problem
+        assert caplog.records == []
+
+    def test_a_pass_before_the_cut_and_a_stray_directory_are_not_yielded(
+        self, store: RunRecordStore, clock: _Clock
+    ) -> None:
+        self._seeded(store, clock)
+
+        stored = list(store.stored_passes_since(self.SINCE))
+
+        assert all(item.started_at >= self.SINCE for item in stored)
+        assert 'scratch' not in {item.pass_id for item in stored}
+        assert len(stored) == 7
+
+    @pytest.mark.parametrize('with_record', [True, False])
+    def test_a_stored_pass_holds_exactly_one_of_record_or_problem_and_names_what_it_got(
+        self, store: RunRecordStore, clock: _Clock, with_record: bool
+    ) -> None:
+        pass_id = self._written_at(store, clock, self.SINCE, 'unit')
+        record = store.load_pass('unit', pass_id) if with_record else None
+        problem = 'record.json: unreadable' if with_record else None
+
+        with pytest.raises(ValueError, match='exactly one of record or problem') as raised:
+            StoredPass('unit', pass_id, self.SINCE, store.pass_directory('unit', pass_id), record, problem)
+
+        assert f'record is None={not with_record}, problem={problem!r}' in str(raised.value)
+
+    def test_a_store_whose_root_does_not_exist_yields_nothing_and_creates_nothing(
+        self, tmp_path: Path, clock: _Clock
+    ) -> None:
+        absent = tmp_path / 'absent'
+        store = RunRecordStore(absent, clock=clock)
+
+        assert list(store.stored_passes_since(T0)) == []
+        assert not absent.exists()
+
+
 class TestRetention:
-    def _allocate_aged(self, store: RunRecordStore, clock: _Clock, now: datetime, days: int) -> str:
-        clock.current = now - timedelta(days=days)
+    def _allocate_aged(
+        self, store: RunRecordStore, clock: _Clock, now: datetime, age: timedelta
+    ) -> str:
+        clock.current = now - age
         lane_pass = store.allocate_pass('unit', Leg.GENERIC, HEAD)
         store.write_run(lane_pass, _record())
         return lane_pass.pass_id
-
-    def test_retention_is_fourteen_days(self) -> None:
-        assert timedelta(days=14) == RECORD_RETENTION
 
     def test_a_pass_older_than_retention_is_removed_and_a_newer_one_kept(
         self, store: RunRecordStore, clock: _Clock
     ) -> None:
         now = T0 + timedelta(days=30)
-        old = self._allocate_aged(store, clock, now, 15)
-        recent = self._allocate_aged(store, clock, now, 13)
+        old = self._allocate_aged(store, clock, now, RECORD_RETENTION + timedelta(days=1))
+        recent = self._allocate_aged(store, clock, now, RECORD_RETENTION - timedelta(days=1))
 
         assert store.prune(now) == [old]
 
         assert not (store.root / 'unit' / old).exists()
         assert (store.root / 'unit' / recent / 'record.json').is_file()
 
+    def test_a_pass_older_than_fourteen_days_and_younger_than_sixty_survives_a_prune(
+        self, store: RunRecordStore, clock: _Clock
+    ) -> None:
+        now = T0 + timedelta(days=30)
+        fifteen = self._allocate_aged(store, clock, now, timedelta(days=15))
+        fifty_nine = self._allocate_aged(store, clock, now, timedelta(days=59))
+        sixty_one = self._allocate_aged(store, clock, now, timedelta(days=61))
+
+        assert store.prune(now) == [sixty_one]
+
+        assert (store.root / 'unit' / fifteen / 'record.json').is_file()
+        assert (store.root / 'unit' / fifty_nine / 'record.json').is_file()
+
     def test_a_pinned_pass_survives(self, store: RunRecordStore, clock: _Clock) -> None:
         now = T0 + timedelta(days=30)
-        old = self._allocate_aged(store, clock, now, 15)
+        old = self._allocate_aged(store, clock, now, RECORD_RETENTION + timedelta(days=1))
 
         assert store.prune(now, pinned_pass_ids={old}) == []
 
@@ -548,7 +671,7 @@ class TestRetention:
 
     def test_pruning_covers_every_command(self, store: RunRecordStore, clock: _Clock) -> None:
         now = T0 + timedelta(days=30)
-        clock.current = now - timedelta(days=20)
+        clock.current = now - RECORD_RETENTION - timedelta(days=6)
         first = store.allocate_pass('one', Leg.GENERIC, HEAD).pass_id
         second = store.allocate_pass(LEGACY_INFRA_COMMAND, Leg.INFRA, 'fedcba9876').pass_id
 
@@ -565,7 +688,7 @@ class TestRetention:
         self, store: RunRecordStore, clock: _Clock
     ) -> None:
         now = T0 + timedelta(days=30)
-        old = self._allocate_aged(store, clock, now, 15)
+        old = self._allocate_aged(store, clock, now, RECORD_RETENTION + timedelta(days=1))
         (store.root / 'unit' / old / 'record.json').write_text('garbage')
 
         assert store.prune(now) == [old]
@@ -579,8 +702,8 @@ class TestRetention:
         self, store: RunRecordStore, clock: _Clock, caplog: pytest.LogCaptureFixture
     ) -> None:
         now = T0 + timedelta(days=30)
-        stuck = self._allocate_aged(store, clock, now, 15)
-        removable = self._allocate_aged(store, clock, now, 16)
+        stuck = self._allocate_aged(store, clock, now, RECORD_RETENTION + timedelta(days=1))
+        removable = self._allocate_aged(store, clock, now, RECORD_RETENTION + timedelta(days=2))
 
         with _locked_subdirectory(store.root / 'unit' / stuck), caplog.at_level(logging.WARNING):
             assert store.prune(now) == [removable]
@@ -627,38 +750,63 @@ def _add_lane_script(tmp_path: Path, relative_path: str, body: str) -> None:
     script.chmod(0o755)
 
 
-class _PassFailureWatch(logging.Handler):
-    """Remembers the first ``run() pass failed`` line the lane worker logs."""
+#: The worker logs ``run() pass failed`` on ``orchestrator.offline_lane`` and each sub-run line on
+#: ``orchestrator.offline_lane_pass``; their common parent hears both.
+_LANE_LOGGERS = 'orchestrator'
+_SUB_RUN_LOGGER = 'orchestrator.offline_lane_pass'
 
-    MARKER = 'offline-lane: run() pass failed'
+
+class _LaneLogWatch(logging.Handler):
+    """Remembers the first ``run() pass failed`` line the lane worker logs, and every sub-run line."""
+
+    FAILURE_MARKER = 'offline-lane: run() pass failed'
 
     def __init__(self) -> None:
-        super().__init__(logging.ERROR)
-        self.line: str | None = None
+        super().__init__(logging.INFO)
+        self.failure_line: str | None = None
+        self.sub_run_lines: list[str] = []
 
     def emit(self, record: logging.LogRecord) -> None:
         message = record.getMessage()
-        if self.line is None and message.startswith(self.MARKER):
-            self.line = message
+        if record.levelno >= logging.ERROR and self.failure_line is None and message.startswith(self.FAILURE_MARKER):
+            self.failure_line = message
+        if ' sub-run head=' in message and ' ended_by=' in message:
+            self.sub_run_lines.append(message)
+
+    def logged_sub_run(self, label: str) -> bool:
+        return any(line.startswith(f'offline-lane: {label} sub-run head=') for line in self.sub_run_lines)
 
 
-async def _until(done: Callable[[], bool], watch: _PassFailureWatch) -> None:
+async def _until(done: Callable[[], bool], watch: _LaneLogWatch) -> None:
     deadline = time.monotonic() + _PASS_DEADLINE_SECS
     while not done():
-        assert watch.line is None, f'the lane worker logged: {watch.line}'
-        assert time.monotonic() < deadline, 'the lane pass left no record in time'
+        assert watch.failure_line is None, f'the lane worker logged: {watch.failure_line}'
+        assert time.monotonic() < deadline, 'the lane pass left no record, or no awaited sub-run line, in time'
         await asyncio.sleep(0.02)
 
 
-async def _drive_one_pass(worker: OfflineLaneWorker, command: str, until_phase: Phase) -> None:
-    """Drive one lane pass through ``on_post_merge`` + ``run()`` until *command*'s *until_phase* is recorded."""
-    watch = _PassFailureWatch()
-    lane_logger = logging.getLogger('orchestrator.offline_lane')
+async def _drive_one_pass(
+    worker: OfflineLaneWorker, command: str, until_phase: Phase, *, sub_run_label: str | None = None,
+) -> None:
+    """Drive one lane pass through ``on_post_merge`` + ``run()`` until *command*'s *until_phase* is recorded.
+
+    With *sub_run_label*, also until the worker has logged that sub-run's ``ended_by=`` line,
+    which it does only after the seam that wrote the record returns.
+    """
+    watch = _LaneLogWatch()
+    assert sub_run_label is None or logging.getLogger(_SUB_RUN_LOGGER).isEnabledFor(logging.INFO), (
+        'awaiting a sub-run line needs the pass logger at INFO'
+    )
+    lane_logger = logging.getLogger(_LANE_LOGGERS)
     lane_logger.addHandler(watch)
     task = asyncio.create_task(worker.run())
     try:
         await worker.on_post_merge('t', 'base', 'head')
-        await _until(lambda: worker.records.last_record(command, until_phase) is not None, watch)
+        await _until(
+            lambda: worker.records.last_record(command, until_phase) is not None
+            and (sub_run_label is None or watch.logged_sub_run(sub_run_label)),
+            watch,
+        )
     finally:
         lane_logger.removeHandler(watch)
         task.cancel()
@@ -666,9 +814,13 @@ async def _drive_one_pass(worker: OfflineLaneWorker, command: str, until_phase: 
             await task
 
 
-async def _run_one_pass(tmp_path: Path, command: str, *, until_phase: Phase) -> OfflineLaneWorker:
+async def _run_one_pass(
+    tmp_path: Path, command: str, *, until_phase: Phase, until_logged: bool = False,
+) -> OfflineLaneWorker:
     worker = _generic_worker(tmp_path, command)
-    await _drive_one_pass(worker, _LANE_COMMAND, until_phase)
+    await _drive_one_pass(
+        worker, _LANE_COMMAND, until_phase, sub_run_label=_LANE_COMMAND if until_logged else None,
+    )
     return worker
 
 
@@ -686,6 +838,28 @@ def _sub_run_logs(caplog: pytest.LogCaptureFixture, command: str) -> list[str]:
     ]
 
 
+_JUNIT_REPORT = '''<?xml version="1.0" encoding="utf-8"?>
+<testsuites><testsuite name="pytest">
+<testcase classname="tests.test_q" name="test_ok"/>
+<testcase classname="tests.test_q" name="test_skip"><skipped message="no"/></testcase>
+<testcase classname="tests.test_q" name="test_bad"><failure message="boom"/></testcase>
+<testcase classname="tests.test_q.TestK" name="test_c[a b]"/>
+<testcase classname="elsewhere.test_r" name="test_unresolved"/>
+</testsuite></testsuites>
+'''
+
+
+def _child_writing_junit(report: str, output: bytes) -> Callable[..., Any]:
+    """A fake ``create_subprocess_exec`` whose ``sh -c`` child writes *report* where ``--junitxml`` points."""
+
+    async def fake_exec(*argv: str, **kwargs: Any) -> Any:
+        words = shlex.split(argv[-1])
+        Path(words[words.index('--junitxml') + 1]).write_text(report)
+        return await _child_writing(output, returncode=1)(*argv, **kwargs)
+
+    return fake_exec
+
+
 def _seed_pass(tmp_path: Path, age: timedelta) -> Path:
     """Allocate a pass of the lane's generic command that started *age* ago; its directory."""
     started_at = datetime.now(UTC) - age
@@ -701,9 +875,12 @@ class TestLanePassRecords:
     async def test_a_green_pass_records_its_detect_run_and_output(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
-        with caplog.at_level(logging.INFO, logger='orchestrator.offline_lane'):
+        with caplog.at_level(logging.INFO, logger=_SUB_RUN_LOGGER):
             worker = await _run_one_pass(
-                tmp_path, "printf '=== 3 passed in 0.10s ===\\n'; exit 0", until_phase=Phase.DETECT,
+                tmp_path,
+                "printf '=== 3 passed in 0.10s ===\\n'; exit 0",
+                until_phase=Phase.DETECT,
+                until_logged=True,
             )
 
         detect = _current_pass_record(worker).detect
@@ -800,13 +977,14 @@ class TestLanePassRecords:
     async def test_a_signal_ended_run_records_ended_by_signal(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture, command: str, returncode: int
     ) -> None:
-        with caplog.at_level(logging.INFO, logger='orchestrator.offline_lane'):
-            worker = await _run_one_pass(tmp_path, command, until_phase=Phase.CONFIRM)
+        with caplog.at_level(logging.INFO, logger=_SUB_RUN_LOGGER):
+            worker = await _run_one_pass(tmp_path, command, until_phase=Phase.DETECT, until_logged=True)
 
-        detect = _current_pass_record(worker).detect
-        assert detect is not None
-        assert detect.returncode == returncode
-        assert detect.ended_by == EndedBy.SIGNAL
+        record = _current_pass_record(worker)
+        assert record.detect is not None
+        assert record.detect.returncode == returncode
+        assert record.detect.ended_by == EndedBy.SIGNAL
+        assert record.confirm is None
         assert ['ended_by=signal' in line for line in _sub_run_logs(caplog, _LANE_COMMAND)] == [True]
 
     def test_an_allocated_pass_has_its_header_before_any_sub_run(self, tmp_path: Path) -> None:
@@ -846,6 +1024,28 @@ class TestLanePassRecords:
         assert detect.session_complete is True
 
     @pytest.mark.asyncio
+    async def test_a_junit_report_fills_outcomes_keyed_by_node_id(self, tmp_path: Path) -> None:
+        worker = _generic_worker(tmp_path, 'pytest -q tests')
+        cmd = LaneCommand(name=_LANE_COMMAND, command='pytest -q tests', cwd='.')
+        worker.records.allocate_pass(_LANE_COMMAND, Leg.GENERIC, HEAD)
+        (tmp_path / 'wt' / 'tests').mkdir()
+        (tmp_path / 'wt' / 'tests' / 'test_q.py').write_text('')
+
+        with patch(
+            'orchestrator.offline_lane_runs.asyncio.create_subprocess_exec',
+            side_effect=_child_writing_junit(_JUNIT_REPORT, b'1 failed, 3 passed in 0.01s\n'),
+        ):
+            await worker.command_runner(cmd, tmp_path / 'wt', HEAD)
+
+        detect = worker.records.last_record(_LANE_COMMAND, Phase.DETECT)
+        assert detect is not None
+        assert detect.outcomes == {
+            'tests/test_q.py::test_ok': 'passed',
+            'tests/test_q.py::test_skip': 'skipped',
+            'tests/test_q.py::TestK::test_c[a b]': 'passed',
+        }
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         'command', ['make check', 'pytest -q tests && echo done'], ids=['opaque', 'raw-retained-pytest'],
     )
@@ -876,9 +1076,14 @@ class TestLegacyLegRecords:
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
         worker = _lane_worker(tmp_path, offline_lane_infra_enabled=True)
-        _add_lane_script(tmp_path, RUN_ALL_INFRA_SCRIPT, "echo '  RESULT: FAIL (test_x.sh)'\nexit 1")
+        _add_lane_script(
+            tmp_path,
+            RUN_ALL_INFRA_SCRIPT,
+            "echo '  RESULT: PASS (test_ok.sh) [flaky: passed on serial retry]'\n"
+            "echo '  RESULT: FAIL (test_x.sh)'\nexit 1",
+        )
 
-        with caplog.at_level(logging.INFO, logger='orchestrator.offline_lane'):
+        with caplog.at_level(logging.INFO, logger=_SUB_RUN_LOGGER):
             await _drive_one_pass(worker, LEGACY_INFRA_COMMAND, Phase.CONFIRM)
 
         record = _current_pass_record(worker, LEGACY_INFRA_COMMAND)
@@ -888,6 +1093,7 @@ class TestLegacyLegRecords:
             FailureRecord('test_x.sh', 'failed', 'RESULT: FAIL (test_x.sh)'),
         )
         assert record.detect.ids_available is True
+        assert record.detect.outcomes == {'test_ok.sh': 'passed'}
         assert record.confirm is not None
         assert record.confirm.phase == Phase.CONFIRM
         assert ['ended_by=exit' in line for line in _sub_run_logs(caplog, 'infra')] == [True]
@@ -899,17 +1105,18 @@ class TestLegacyLegRecords:
         worker = _lane_worker(tmp_path, offline_lane_infra_enabled=True)
         _add_lane_script(tmp_path, RUN_ALL_INFRA_SCRIPT, 'kill -9 $$')
 
-        with caplog.at_level(logging.INFO, logger='orchestrator.offline_lane'):
-            await _drive_one_pass(worker, LEGACY_INFRA_COMMAND, Phase.CONFIRM)
+        with caplog.at_level(logging.INFO, logger=_SUB_RUN_LOGGER):
+            await _drive_one_pass(worker, LEGACY_INFRA_COMMAND, Phase.DETECT, sub_run_label='infra')
 
         assert ['ended_by=signal' in line for line in _sub_run_logs(caplog, 'infra')] == [True]
+        assert _current_pass_record(worker, LEGACY_INFRA_COMMAND).confirm is None
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        ('body', 'until_phase', 'session_complete', 'ended_by'),
+        ('body', 'session_complete', 'ended_by'),
         [
-            ('exit 0', Phase.DETECT, True, EndedBy.EXIT),
-            ('kill -9 $$', Phase.CONFIRM, False, EndedBy.SIGNAL),
+            ('exit 0', True, EndedBy.EXIT),
+            ('kill -9 $$', False, EndedBy.SIGNAL),
         ],
         ids=['exit', 'signal'],
     )
@@ -918,15 +1125,14 @@ class TestLegacyLegRecords:
         tmp_path: Path,
         caplog: pytest.LogCaptureFixture,
         body: str,
-        until_phase: Phase,
         session_complete: bool,
         ended_by: EndedBy,
     ) -> None:
         worker = _lane_worker(tmp_path, offline_lane_legacy_numeric_enabled=True)
         _add_lane_script(tmp_path, RUN_OFFLINE_DEEP_SCRIPT, body)
 
-        with caplog.at_level(logging.INFO, logger='orchestrator.offline_lane'):
-            await _drive_one_pass(worker, LEGACY_NUMERIC_COMMAND, until_phase)
+        with caplog.at_level(logging.INFO, logger=_SUB_RUN_LOGGER):
+            await _drive_one_pass(worker, LEGACY_NUMERIC_COMMAND, Phase.DETECT, sub_run_label='numeric')
 
         record = _current_pass_record(worker, LEGACY_NUMERIC_COMMAND)
         assert record.leg == Leg.NUMERIC
@@ -934,6 +1140,7 @@ class TestLegacyLegRecords:
         assert record.detect.failures == ()
         assert record.detect.ids_available is False
         assert record.detect.session_complete is session_complete
+        assert record.confirm is None
         assert [f'ended_by={ended_by}' in line for line in _sub_run_logs(caplog, 'numeric')] == [True]
 
 
@@ -944,11 +1151,13 @@ class TestLaneRetention:
     ) -> None:
         expired = _seed_pass(tmp_path, RECORD_RETENTION + timedelta(days=6))
         recent = _seed_pass(tmp_path, timedelta(days=1))
+        month_old = _seed_pass(tmp_path, timedelta(days=30))
 
         await _run_one_pass(tmp_path, 'exit 0', until_phase=Phase.DETECT)
 
         assert not expired.exists()
         assert (recent / 'record.json').is_file()
+        assert (month_old / 'record.json').is_file()
 
     @_needs_file_permissions
     @pytest.mark.asyncio

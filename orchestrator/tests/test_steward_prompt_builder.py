@@ -23,7 +23,7 @@ from shared.cli_invoke import AgentResult
 from shared.testing import make_gate_mock
 from test_steward import _make_escalation, _make_result, _sole_invocation_end_data
 
-from orchestrator.workflow_types import StewardResolved
+from orchestrator.workflow_types import PublishedStewardOutcome, StewardResolved
 
 _SLEEP_PATCH = 'shared.cli_invoke.asyncio.sleep'
 
@@ -225,7 +225,10 @@ class TestDeclinedRunIsNoVerdictOnTheEscalation:
         assert esc.id not in steward._empty_output_counts
         assert steward._session_id == 'sess-live'
         assert steward.metrics.escalations_handled == 1
-        assert isinstance(outcomes.get_nowait(), StewardResolved)
+        published = outcomes.get_nowait()
+        assert isinstance(published, PublishedStewardOutcome)
+        assert published.escalation_id == esc.id
+        assert isinstance(published.outcome, StewardResolved)
         assert _sole_invocation_end_data(steward.event_store.emit)['retry_aborted'] is True
 
     async def test_an_unretried_run_records_retry_aborted_false(self, steward, queue):

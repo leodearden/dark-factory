@@ -57,17 +57,16 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Protocol
 
-from orchestrator.session_registry import (
+from orchestrator.decision_registry import (
     DecisionRecord,
     DecisionState,
-    SessionRecord,
-    Status,
     set_manual_boost,
     update_decision_state,
 )
-from orchestrator.session_registry import (
+from orchestrator.fleet_files import (
     fleet_root as resolve_fleet_root,
 )
+from orchestrator.session_records import SessionRecord, Status
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -143,7 +142,7 @@ def _default_spawn_runner(argv: list[str]) -> None:
     of whether a spawn attempt succeeded.
     """
     try:
-        subprocess.Popen(argv)  # noqa: S603 -- argv is built by build_spawn_argv, not shell text
+        subprocess.Popen(argv)  # argv is built by build_spawn_argv, not shell text
     except OSError:
         _log.exception('spawn_session: failed to launch %r', argv)
 

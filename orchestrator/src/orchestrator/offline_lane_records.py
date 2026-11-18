@@ -20,7 +20,7 @@ from orchestrator.verify_classify import is_external_kill_rc
 
 logger = logging.getLogger(__name__)
 
-RECORD_RETENTION = timedelta(days=14)
+RECORD_RETENTION = timedelta(days=60)
 FIRST_LINE_MAX_CHARS = 300
 
 # Underscored because command_key's alphabet cannot produce '_', so no slug is a
@@ -32,7 +32,6 @@ LEGACY_INFRA_COMMAND = 'legacy_infra'
 LEGACY_COMMANDS: frozenset[str] = frozenset({LEGACY_NUMERIC_COMMAND, LEGACY_INFRA_COMMAND})
 
 _FAILURE_KINDS = frozenset({'failed', 'error'})
-_PROBE_RESULTS = frozenset({'up', 'outage', 'broken'})
 _PASS_ID_TIMESTAMP_FORMAT = '%Y%m%dT%H%M%S'
 _PASS_ID_TIMESTAMP_RE = re.compile(r'^\d{8}T\d{6}(?=-)')
 _SHELL_SIGNAL_RANGE = range(129, 193)
@@ -55,6 +54,17 @@ class Leg(StrEnum):
 class EndedBy(StrEnum):
     EXIT = 'exit'
     SIGNAL = 'signal'
+
+
+class ProbeKind(StrEnum):
+    """A ``ProbeResult.result``: D7's three readings of one outage probe's exit."""
+
+    UP = 'up'
+    OUTAGE = 'outage'
+    BROKEN = 'broken'
+
+
+_PROBE_RESULTS = frozenset(ProbeKind)
 
 
 def classify_exit(returncode: int) -> EndedBy:
@@ -274,6 +284,25 @@ class PassRecord:
     effect: Any | None
 
 
+@dataclass(frozen=True)
+class StoredPass:
+    """One pass directory as stored: its parsed record, or the *problem* that stopped the parse."""
+
+    command_key: str
+    pass_id: str
+    started_at: datetime
+    directory: Path
+    record: PassRecord | None
+    problem: str | None
+
+    def __post_init__(self) -> None:
+        if (self.record is None) == (self.problem is None):
+            raise ValueError(
+                f'{self.directory}: a stored pass carries exactly one of record or problem; '
+                f'got record is None={self.record is None}, problem={self.problem!r}',
+            )
+
+
 def _run_block(payload: Mapping[str, Any], phase: Phase) -> RunRecord | None:
     block = _get_optional(payload, phase.value, dict)
     return None if block is None else RunRecord.from_json(block)
@@ -342,6 +371,15 @@ def _read_payload(path: Path) -> dict[str, Any]:
     return payload
 
 
+def _parsed_record(path: Path) -> tuple[PassRecord | None, str | None]:
+    try:
+        return _pass_from_json(_read_payload(path)), None
+    except LookupError as exc:
+        return None, str(exc)
+    except ValueError as exc:
+        return None, f'malformed run record at {path}: {exc}'
+
+
 def _write_payload(path: Path, payload: Mapping[str, Any]) -> None:
     atomic_write_text(path, json.dumps(payload, indent=2) + '\n', mkdir=True)
 
@@ -361,6 +399,9 @@ class RunRecordStore:
     def now(self) -> datetime:
         return self._clock()
 
+    def pass_directory(self, command: str, pass_id: str) -> Path:
+        return self.root / command_key(command) / pass_id
+
     def allocate_pass(self, command: str, leg: Leg | str, head: str) -> LanePass:
         if Leg(leg) is Leg.GENERIC and command in LEGACY_COMMANDS:
             raise ValueError(f'{command!r} names a legacy leg, not a generic command')
@@ -372,7 +413,7 @@ class RunRecordStore:
             head=head,
             pass_id=pass_id,
             started_at=started_at,
-            directory=self.root / command_key(command) / pass_id,
+            directory=self.pass_directory(command, pass_id),
         )
         _write_payload(
             lane_pass.record_path,
@@ -422,7 +463,7 @@ class RunRecordStore:
         self.write_run(lane_pass, replace(RunRecord.from_json(detect), probe=probe))
 
     def load_pass(self, command: str, pass_id: str) -> PassRecord | None:
-        path = self.root / command_key(command) / pass_id / 'record.json'
+        path = self.pass_directory(command, pass_id) / 'record.json'
         if not path.is_file():
             return None
         try:
@@ -440,6 +481,21 @@ class RunRecordStore:
             record = self.load_pass(command, pass_dir.name)
             if record is not None:
                 yield record
+
+    def stored_passes_since(self, since: datetime) -> Iterator[StoredPass]:
+        """Every pass directory of every command started at or after *since*, by command directory then pass id.
+
+        Unlike :meth:`passes_since` it neither skips nor logs a record it cannot
+        parse: that problem is the caller's to report, as a well-formedness
+        check must see it.
+        """
+        for command_dir in _subdirectories(self.root):
+            for pass_dir in _subdirectories(command_dir):
+                started_at = _pass_started_at(pass_dir.name)
+                if started_at is None or started_at < since:
+                    continue
+                record, problem = _parsed_record(pass_dir / 'record.json')
+                yield StoredPass(command_dir.name, pass_dir.name, started_at, pass_dir, record, problem)
 
     def prune(self, now: datetime, pinned_pass_ids: Collection[str] = ()) -> list[str]:
         cutoff = now - RECORD_RETENTION

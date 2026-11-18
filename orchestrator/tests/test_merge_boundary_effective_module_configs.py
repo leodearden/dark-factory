@@ -60,15 +60,15 @@ from test_verify_merge_flake_suppression import (
 from orchestrator import flake_recorder, verify, verify_plan
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.event_store import EventType
-from orchestrator.merge_gates import PostMergePyrightResult
-from orchestrator.merge_queue import (
+from orchestrator.merge_lane.gates import PostMergePyrightResult
+from orchestrator.merge_lane.queue_store import MergeQueueStore, reconstruct_merge_request
+from orchestrator.merge_lane.types import QueuedBranch
+from orchestrator.merge_lane.worker import (
     MergeOutcome,
     MergeRequest,
     _merge_boundary_module_configs,
     _run_post_merge_verify,
 )
-from orchestrator.merge_queue_store import MergeQueueStore, reconstruct_merge_request
-from orchestrator.merge_types import QueuedBranch
 from orchestrator.verify import VerifyResult
 
 _MERGE_SHA = 'd' * 40
@@ -488,7 +488,7 @@ async def _capture_boundary_consumers(
 
     Returns ``{'spec_arg', 'spec', 'verified', 'config', 'merge_wt'}``.
     """
-    from orchestrator import merge_queue as merge_queue_module
+    from orchestrator.merge_lane import worker as merge_queue_module
 
     config = _make_config(tmp_path, merge_verify_breadth=breadth)
     config._module_configs = dict(registry)
@@ -527,7 +527,7 @@ async def _capture_boundary_consumers(
         captured['spec'] = spec
         return spec
 
-    with patch('orchestrator.merge_queue.build_merge_verify_spec', new=_spy_build):
+    with patch('orchestrator.merge_lane.worker.build_merge_verify_spec', new=_spy_build):
         await _run_post_merge_verify(
             git_ops, req, merge_wt,
             timeouts={}, enospc_retries={},
@@ -818,7 +818,7 @@ class TestMergeBoundaryModuleConfigsWrapper:
     def test_non_empty_passed_set_delegates_to_the_shared_helper(
         self, tmp_path: Path, monkeypatch,
     ):
-        from orchestrator import merge_queue as merge_queue_module
+        from orchestrator.merge_lane import worker as merge_queue_module
 
         config = self._config(tmp_path)
         passed = [_module_config('beta')]
@@ -847,7 +847,7 @@ class TestMergeBoundaryModuleConfigsWrapper:
         policy, so the breadth helper's contract stays untouched (its other
         caller, verify.py's force_workspace branch, still widens an empty
         passed set exactly as it did before γ)."""
-        from orchestrator import merge_queue as merge_queue_module
+        from orchestrator.merge_lane import worker as merge_queue_module
 
         config = self._config(tmp_path)
         calls: list[tuple] = []
@@ -1056,8 +1056,11 @@ class TestRehydratedRequestVerifiesAsWideAsItsOriginal:
         GREEN today and must STAY green.  A task that genuinely has no
         assigned modules reconstructs to ``[]``, the boundary leaves it ``[]``
         (task 3787 γ's deliberate no-widen guard), and the plan takes
-        ``_derive_fallback_runs`` — no FULL_SUITE run at all — even though the
-        SAME nine-module registry is configured and breadth is 'full'.
+        ``_derive_fallback_runs`` — no registered module's FULL_SUITE run —
+        even though the SAME nine-module registry is configured and breadth is
+        'full'. The one FULL_SUITE run is the global fallback's own test floor
+        (tasks 8714/7041): a source-only diff at merge role runs the configured
+        test_command whole.
         """
         config = self._config(tmp_path, 'full')
         original = self._original(
@@ -1072,4 +1075,4 @@ class TestRehydratedRequestVerifiesAsWideAsItsOriginal:
         assert _merge_boundary_module_configs(config, rehydrated.module_configs) == []
         assert _merge_plan_full_suite_prefixes(
             config, rehydrated.module_configs, self._TASK_FILES,
-        ) == [], 'the zero-module task must still take the global-fallback path'
+        ) == ['__fallback__'], 'the zero-module task must still take the global-fallback path'

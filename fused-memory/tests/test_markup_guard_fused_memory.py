@@ -50,6 +50,7 @@ from shared.toolcall_markup import (
     CANONICAL_OPENER_PREFIX,
     closer_for,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.server.main import _install_safe_tool_wrapper
 from fused_memory.server.markup_guard import (
@@ -57,6 +58,8 @@ from fused_memory.server.markup_guard import (
     install_markup_guard,
 )
 from fused_memory.server.tools import create_mcp_server
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _PROJECT_ID = 'dark_factory'
 _PROJECT_ROOT = '/project'
@@ -1001,11 +1004,12 @@ class TestInstallationOrder:
 
 
 class TestReconReportServerIsNotGuarded:
-    """(c) The second ``_install_safe_tool_wrapper`` call site stays bare.
+    """(c) The recon-report server gets no MARKUP guard.
 
-    The recon-report server hosts the cite_* / report tools and no write tools,
-    so it has no write boundary to guard. Asserting that keeps it from being
-    wired by accident when the two call sites are next edited together.
+    It hosts the cite_* / report tools and no write tools, so it has no write
+    boundary to guard. Asserting that keeps it from being wired by accident
+    when the two call sites are next edited together. (It does get the
+    unknown-argument guard: tests/test_unknown_argument_guard_fused_memory.py.)
     """
 
     def _make_config(self) -> Any:
@@ -1353,4 +1357,57 @@ class TestUnrepairableResidueIsPreserved:
 
         assert payload['error_type'] == 'mcp_markup_unrepairable'
         assert payload['escalation_id'] is None
+        mock_service.add_system_record.assert_not_awaited()
+
+
+#: A collapsible HTML block as memory prose quotes it (task 10396). ``details``
+#: is an envelope closer name, but no fused-memory write tool declares a
+#: ``details`` parameter, so its closer terminates no envelope boundary.
+_HTML_DETAILS_BLOCK = (
+    '\x3cdetails>\x3csummary>Measured' + closer_for('summary')
+    + '\x3cpre>rc=0' + closer_for('pre') + closer_for('details')
+)
+_HTML_QUOTING_CONTENT = 'The census page renders\n' + _HTML_DETAILS_BLOCK + '\nper finding.'
+
+
+class TestAQuotedHtmlBlockIsNotALeak:
+    """Task 10396: the boundary passes a quoted HTML closer and still refuses a leak."""
+
+    @pytest.mark.asyncio
+    async def test_add_memory_content_reaches_the_service_unchanged(self):
+        server, mock_service = _build_guarded_server('add_memory')
+
+        await server._tool_manager.call_tool(
+            'add_memory',
+            {
+                'content': _HTML_QUOTING_CONTENT,
+                'category': 'observations_and_summaries',
+                'project_id': _PROJECT_ID,
+            },
+        )
+
+        mock_service.add_memory.assert_awaited_once()
+        assert mock_service.add_memory.await_args.kwargs['content'] == _HTML_QUOTING_CONTENT
+
+    @pytest.mark.asyncio
+    async def test_a_leak_behind_the_quoted_block_is_still_refused(self, tmp_path):
+        """The clean prefix itself carries the quoted closer, so repair() declines;
+        the canonical opener and parameter closers keep the value from being inert."""
+        server, mock_service = _build_guarded_server(
+            'add_system_record', known_projects={_PROJECT_ID: str(tmp_path)}
+        )
+
+        with pytest.raises(ToolError) as exc_info:
+            await server._tool_manager.call_tool(
+                'add_system_record',
+                {
+                    'content': _leaked(_HTML_QUOTING_CONTENT, 'agent_id', _AGENT_ID),
+                    'project_id': _PROJECT_ID,
+                    'category': 'observations_and_summaries',
+                },
+            )
+
+        payload = _payload(exc_info)
+        assert payload['error_type'] == 'mcp_markup_unrepairable'
+        assert payload['field'] == 'content'
         mock_service.add_system_record.assert_not_awaited()

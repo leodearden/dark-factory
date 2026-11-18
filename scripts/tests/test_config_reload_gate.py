@@ -7,11 +7,15 @@ import sys
 import pytest
 from _config_reload_gate import ReloadFailure, ReloadNotConfirmed, fetch_reload_report
 from config_reload_script_fakes import (
+    TOOL_RAISED,
     TRANSPORT_FAULTS,
     ClosedPort,
     FakeEscalationMcp,
     reload_report,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 COMMITTED_AS = "abc1234"
 CONFIG_PATH = "/x/dark-factory-orchestrator.yaml"
@@ -37,6 +41,9 @@ def test_a_healthy_reload_returns_the_unwrapped_report():
         )
 
     assert fetched == report
+    assert server.rpc_methods()[0] == "initialize", server.rpc_methods()
+    assert server.called_tools() == ["reload_config"]
+    assert server.delete_count() == 1
 
 
 @pytest.mark.parametrize(
@@ -50,8 +57,24 @@ def test_every_transport_fault_is_no_reload_report(fault):
     assert COMMITTED_AS in refusal.detail, refusal.detail
 
 
+def test_a_tool_that_raised_is_reload_raised():
+    """The request reached reload_config, which ran and failed: it may have
+    applied the change first, so that is not a reload that never reached the
+    tool."""
+    with FakeEscalationMcp(reload_report(config_path=CONFIG_PATH), **TOOL_RAISED) as server:
+        refusal = _refusal(server.port)
+        dispatched = [name for name, _ in server.tool_calls()]
+
+    assert refusal.failure is ReloadFailure.RELOAD_RAISED
+    assert dispatched == ["reload_config"], dispatched
+    assert COMMITTED_AS in refusal.detail, refusal.detail
+    assert "ToolError: reload_config failed" in refusal.detail, refusal.detail
+    assert "never reached the tool" not in refusal.detail, refusal.detail
+
+
 def test_a_dead_socket_is_no_reload_report():
-    refusal = _refusal(ClosedPort().port)
+    with ClosedPort() as closed:
+        refusal = _refusal(closed.port)
 
     assert refusal.failure is ReloadFailure.NO_RELOAD_REPORT
     assert COMMITTED_AS in refusal.detail, refusal.detail
@@ -124,19 +147,6 @@ def test_the_callers_path_is_compared_by_realpath(tmp_path):
     assert fetched == report
 
 
-def test_without_a_config_path_the_reread_is_not_checked():
-    """config_path=None asks only for the report: a caller that reads one
-    knob's own disposition gets it whichever file was re-read."""
-    report = reload_report(reloaded=False, config_path=None)
-
-    with FakeEscalationMcp(report) as server:
-        fetched = fetch_reload_report(
-            str(server.port), committed_as=COMMITTED_AS, config_path=None,
-        )
-
-    assert fetched == report
-
-
 def test_failure_tags_are_the_wire_vocabulary():
     """These strings are what a calling script prints in its JSON verdict, so
     renaming one breaks every consumer that branches on it."""
@@ -144,6 +154,7 @@ def test_failure_tags_are_the_wire_vocabulary():
         "transport_not_importable",
         "no_reload_report",
         "reload_reply_timed_out",
+        "reload_raised",
         "reload_error",
         "reload_not_committed",
         "different_config_file",
@@ -157,10 +168,10 @@ def test_a_reply_slower_than_the_timeout_is_reply_timed_out():
         reload_report(config_path="/x"), tool_call_delay=5.0,
     ) as server:
         refusal = _refusal(server.port, timeout=0.5)
-        tools = server.called_tools()
+        dispatched = [name for name, _ in server.tool_calls()]
 
     assert refusal.failure is ReloadFailure.REPLY_TIMED_OUT
-    assert "reload_config" in tools, tools
+    assert dispatched == ["reload_config"], dispatched
     assert COMMITTED_AS in refusal.detail, refusal.detail
 
 

@@ -1,11 +1,10 @@
-"""The ``~/.claude`` fallback is opt-out per gate (task 6042).
+"""The ``~/.claude`` fallback is an explicit opt-in per gate (tasks 6042, 8161).
 
 When no roster account resolves a token, ``UsageGate._init_accounts`` adopts
-``~/.claude/.credentials.json`` as a single account named ``default``: the
-operator's own interactive login. For the legibility trickle that is the very
-coupling task 6042 removes, so ``UsageCapConfig.fallback_to_default_credential
-=False`` must leave the pool EMPTY instead. The default keeps the fallback,
-byte-compatible for every existing gate.
+``~/.claude/.credentials.json`` as a single account named ``default`` only if
+``UsageCapConfig.fallback_to_default_credential`` is True: that is the
+operator's own interactive login, which fleet tooling must never ride
+(ruling 2026-11-01). Left unset, the pool stays EMPTY.
 """
 
 from __future__ import annotations
@@ -41,6 +40,14 @@ def unresolvable_roster(monkeypatch):
     ]
 
 
+def test_a_gate_with_the_fallback_unset_resolves_no_account(
+    sentinel_operator_login, unresolvable_roster,
+):
+    gate = UsageGate(UsageCapConfig(accounts=unresolvable_roster))
+
+    assert gate.account_names == ()
+
+
 def test_a_gate_with_the_fallback_disabled_resolves_no_account(
     sentinel_operator_login, unresolvable_roster,
 ):
@@ -51,10 +58,12 @@ def test_a_gate_with_the_fallback_disabled_resolves_no_account(
     assert gate.account_count == 0
 
 
-def test_the_default_still_adopts_the_operator_login_as_one_default_account(
+def test_an_explicit_opt_in_adopts_the_operator_login_as_one_default_account(
     sentinel_operator_login, unresolvable_roster,
 ):
-    gate = UsageGate(UsageCapConfig(accounts=unresolvable_roster))
+    gate = UsageGate(UsageCapConfig(
+        accounts=unresolvable_roster, fallback_to_default_credential=True,
+    ))
 
     assert gate.account_count == 1
     assert gate.active_account_name == 'default'

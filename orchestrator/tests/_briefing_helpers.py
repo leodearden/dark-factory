@@ -97,11 +97,35 @@ def _mcp_search_envelope(results: list[dict]) -> dict:
 
 
 CONTESTING_CHILD_FIXTURES = Path(__file__).parent / 'fixtures' / 'grouped_search_contesting_child'
+SUPERSEDED_CHILD_FIXTURES = Path(__file__).parent / 'fixtures' / 'grouped_search_superseded_child'
+AMENDMENT_BODY_FIXTURES = Path(__file__).parent / 'fixtures' / 'grouped_search_amendment_bodies'
+
+WORST_CASE_AMENDMENT_LIST_CHARS = 41_000
+"""The most one parent's amendment bullets may add to a briefing, about 10k tokens.
+
+Ten listed amendments (``grouped_read.py::AMENDMENT_LIST_CAP``), each cut at
+``write_triage.judge_field_chars`` (4,000) plus its counted elision marker
+(~25) and bullet tag (~45): 10 x (4,000 + ~25 + ~45), about 40.7k chars.
+It bounds those bullets only. The parent's own body and its
+``matched_children`` bodies are uncapped and come on top, so this is not a
+ceiling on what one grouped result adds. Moving the cap, the list cap or the
+render must move this number in view.
+"""
+
+AMENDMENT_BULLET = '  - [amendment · '
+"""How a listed amendment's line opens in a rendered ``# Context`` block."""
 
 
-def recorded_search_text(name: str) -> str:
+def amendment_list_chars(rendered: str) -> int:
+    """The characters *rendered* spends on amendment bullets, each with its newline."""
+    return sum(
+        len(line) + 1 for line in rendered.splitlines() if line.startswith(AMENDMENT_BULLET)
+    )
+
+
+def recorded_search_text(name: str, *, fixtures: Path = CONTESTING_CHILD_FIXTURES) -> str:
     """The recorded ``search`` reply *name*, verbatim; see that directory's PROVENANCE.md."""
-    return (CONTESTING_CHILD_FIXTURES / f'{name}.json').read_text(encoding='utf-8')
+    return (fixtures / f'{name}.json').read_text(encoding='utf-8')
 
 
 def recorded_search_envelope(name: str) -> dict:
@@ -128,8 +152,8 @@ def _grouped_parent(id_: str = 'p1', *, grouped: dict | None = None) -> dict:
 
     Mirrors what ``fused_memory.server.grouped_read.group_search_results``
     emits: the block is hung on a KEPT parent entry at ``entry['grouped']``,
-    with bounded amendment digests under
-    ``amendments`` and full swallowed bodies under ``matched_children``.
+    with amendment entries, their text capped, under ``amendments`` and full
+    swallowed bodies under ``matched_children``.
     """
     entry = _result('x', 'placeholder', metadata=None, source_store='mem0')
     entry['id'] = id_
@@ -142,11 +166,11 @@ def _grouped_parent(id_: str = 'p1', *, grouped: dict | None = None) -> dict:
 def _grouped_block() -> dict:
     return {
         'amendments': [
-            {'id': 'a1', 'digest': 'FOREIGN AMENDMENT BODY', 'created_at': None,
+            {'id': 'a1', 'content': 'FOREIGN AMENDMENT BODY', 'created_at': None,
              'kind': 'amendment', 'metadata': {'src_project': 'reify'}},
-            {'id': 'a2', 'digest': 'NATIVE AMENDMENT BODY', 'created_at': None,
+            {'id': 'a2', 'content': 'NATIVE AMENDMENT BODY', 'created_at': None,
              'kind': 'amendment', 'metadata': {'project_id': 'dark_factory'}},
-            {'id': 'a3', 'digest': 'UNTAGGED AMENDMENT BODY', 'created_at': None,
+            {'id': 'a3', 'content': 'UNTAGGED AMENDMENT BODY', 'created_at': None,
              'kind': 'amendment'},
         ],
         'matched_children': [

@@ -25,6 +25,7 @@ from _tool_surface_classification import assert_pairwise_disjoint
 
 from fused_memory.reconciliation.cli_stage_runner import (
     DISALLOW_CONSOLIDATION_PROPOSALS,
+    DISALLOW_DEFECT_RECORD_WRITES,
     DISALLOW_FUSED_MEMORY_CONTROL_PLANE_WRITES,
     DISALLOW_MEMORY_WRITES,
     DISALLOW_TASK_WRITES,
@@ -66,6 +67,7 @@ _FUSED_MEMORY_DENY_BUCKETS = {
     'DISALLOW_TASK_WRITES': DISALLOW_TASK_WRITES,
     'DISALLOW_FUSED_MEMORY_CONTROL_PLANE_WRITES': DISALLOW_FUSED_MEMORY_CONTROL_PLANE_WRITES,
     'DISALLOW_CONSOLIDATION_PROPOSALS': DISALLOW_CONSOLIDATION_PROPOSALS,
+    'DISALLOW_DEFECT_RECORD_WRITES': DISALLOW_DEFECT_RECORD_WRITES,
 }
 
 _STAGE_LISTS = {
@@ -117,6 +119,17 @@ def test_stage_machinery_mutators_are_denied_in_every_stage():
             assert tool in stage_list, f'{stage_name} must deny {tool}'
 
 
+def test_dead_letter_queue_mutators_are_denied_in_every_stage():
+    """Dead-letter queues are stage machinery: no stage replays or deletes them."""
+    for tool in (
+        f'{FUSED_MEMORY_TOOL_PREFIX}replay_dead_letters',
+        f'{FUSED_MEMORY_TOOL_PREFIX}replay_event_dead_letters',
+        f'{FUSED_MEMORY_TOOL_PREFIX}delete_dead_letters',
+    ):
+        for stage_name, stage_list in _STAGE_LISTS.items():
+            assert tool in stage_list, f'{stage_name} must deny {tool}'
+
+
 def test_add_system_record_is_denied_in_stage3_only():
     """Parity with ``add_memory``: Stages 1 and 2 write memory, Stage 3 does not."""
     tool = f'{FUSED_MEMORY_TOOL_PREFIX}add_system_record'
@@ -136,3 +149,13 @@ def test_commit_planning_is_kept_by_stage2_and_denied_in_stage1_and_stage3():
     assert tool not in STAGE2_DISALLOWED, 'Stage 2 must keep its batch-filing path'
     assert tool in STAGE1_DISALLOWED
     assert tool in STAGE3_DISALLOWED
+
+
+def test_defect_record_writers_are_denied_in_every_stage():
+    """No recon stage writes defect records (plans/defect-tests-prd.md decision 7)."""
+    for tool in (
+        f'{FUSED_MEMORY_TOOL_PREFIX}declare_defect',
+        f'{FUSED_MEMORY_TOOL_PREFIX}record_defect_outcome',
+    ):
+        for stage_name, stage_list in _STAGE_LISTS.items():
+            assert tool in stage_list, f'{stage_name} must deny {tool}'

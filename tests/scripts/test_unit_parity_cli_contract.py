@@ -35,6 +35,9 @@ import types
 from collections.abc import Callable, Mapping
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SCRIPTS_DIR = pathlib.Path(__file__).parents[2] / "scripts"
 
@@ -342,14 +345,18 @@ def _fm_unit(service_lines: tuple[str, ...]) -> str:
     return "[Unit]\nDescription=golden\n\n[Service]\n" + "".join(f"{line}\n" for line in service_lines)
 
 
+# A real fused-memory unit's ExecStartPre runs the FalkorDB AOF gate (task
+# 6330), and the checker reports one that does not; no scenario here is about
+# that rule, so both units carry it.
+FM_EXEC_START_PRE = "ExecStartPre=/usr/bin/python3 /srv/golden/scripts/falkordb_aof_gate.py --compose-file /srv/golden/c.yml"
 FM_CLEAN = _fm_unit(
     (
         *_load("check_fused_memory_unit_parity").REQUIRED_SERVICE_DIRECTIVES,
-        "ExecStartPre=/bin/true",
+        FM_EXEC_START_PRE,
         "ExecStopPost=/bin/true",
     )
 )
-FM_DRIFTED = _fm_unit(("Restart=on-failure", "RestartSec=5", "ExecStartPre=/bin/true"))
+FM_DRIFTED = _fm_unit(("Restart=on-failure", "RestartSec=5", FM_EXEC_START_PRE))
 FM_TEMPLATE_DRIFTED = FM_CLEAN.replace("WatchdogSec=120\n", "")
 
 
@@ -476,6 +483,7 @@ GOLDENS: dict[str, tuple[int, str, str]] = {
             '[fused_memory_unit_parity]   - RestartSteps=4\n'
             '[fused_memory_unit_parity]   - TimeoutStartSec=300\n'
             '[fused_memory_unit_parity]   - TimeoutStopSec=90\n'
+            '[fused_memory_unit_parity]   - KillMode=mixed\n'
             '[fused_memory_unit_parity]   - ExecStopPost=\n'
         ),
         (
@@ -513,6 +521,7 @@ GOLDENS: dict[str, tuple[int, str, str]] = {
             '[fused_memory_unit_parity]   - RestartSteps=4\n'
             '[fused_memory_unit_parity]   - TimeoutStartSec=300\n'
             '[fused_memory_unit_parity]   - TimeoutStopSec=90\n'
+            '[fused_memory_unit_parity]   - KillMode=mixed\n'
             '[fused_memory_unit_parity]   - ExecStopPost=\n'
         ),
         (
@@ -747,7 +756,7 @@ GOLDENS: dict[str, tuple[int, str, str]] = {
     'orchestrator/zero-compared': (
         1,
         (
-            '[orchestrator_unit_parity] [vanished] 16 committed unit(s) not found — nothing was verified for them:\n'
+            '[orchestrator_unit_parity] [vanished] 18 committed unit(s) not found — nothing was verified for them:\n'
             '[orchestrator_unit_parity]   orchestrator-autopilot-video.service: expected committed copy at <TMP>/repo/scripts/orchestrator-autopilot-video.service\n'
             '[orchestrator_unit_parity]   orchestrator-autopilot-video.socket: expected committed copy at <TMP>/repo/scripts/orchestrator-autopilot-video.socket.template\n'
             '[orchestrator_unit_parity]   orchestrator-dark-factory.service: expected committed copy at <TMP>/repo/scripts/orchestrator-dark-factory.service\n'
@@ -762,6 +771,8 @@ GOLDENS: dict[str, tuple[int, str, str]] = {
             '[orchestrator_unit_parity]   orchestrator-reify.socket: expected committed copy at <TMP>/repo/scripts/orchestrator-reify.socket.template\n'
             '[orchestrator_unit_parity]   orchestrator-solar-challenge-platform.service: expected committed copy at <TMP>/repo/scripts/orchestrator-solar-challenge-platform.service\n'
             '[orchestrator_unit_parity]   orchestrator-solar-challenge-platform.socket: expected committed copy at <TMP>/repo/scripts/orchestrator-solar-challenge-platform.socket.template\n'
+            '[orchestrator_unit_parity]   orchestrator-stream-touch.service: expected committed copy at <TMP>/repo/scripts/orchestrator-stream-touch.service\n'
+            '[orchestrator_unit_parity]   orchestrator-stream-touch.socket: expected committed copy at <TMP>/repo/scripts/orchestrator-stream-touch.socket.template\n'
             '[orchestrator_unit_parity]   orchestrator-watchdog.service: expected committed copy at <TMP>/repo/scripts/orchestrator-watchdog.service\n'
             '[orchestrator_unit_parity]   orchestrator-watchdog.timer: expected committed copy at <TMP>/repo/scripts/orchestrator-watchdog.timer\n'
             "[orchestrator_unit_parity] [vanished] The committed unit is this checker's source of truth. Check --repo-root, and whether the unit was renamed or moved (the paths live in UNITS in this script).\n"

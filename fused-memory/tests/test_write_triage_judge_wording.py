@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _fm_helpers import load_script_module
+from _sdk_client_stubs import sdk_client_double
 
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.server import write_triage_judge
@@ -21,6 +22,10 @@ SCRIPTS = Path(__file__).parent.parent / 'scripts'
 
 #: sha256 of ``JUDGE_SYSTEM_PROMPT`` at 16794cdd1d^1, the commit before ψ.
 PRE_PSI_SHA256 = '49be71b5f521643bebf434145a0a300bbf4a1d1b0a3a64faf1e19c4a20df208e'
+
+#: sha256 of ``JUDGE_SYSTEM_PROMPT`` as of 16794cdd1d (ψ, task 6149), the prompt
+#: the committed π and π2 'shipped' arms measured.
+PSI_SHA256 = '312a8c9a7f6ff5fff7d6e8b0af8d327b73e8f860d7025cbac70ceb9b8304cd6a'
 
 
 @functools.cache
@@ -35,10 +40,8 @@ def _sha(text: str) -> str:
 
 
 def _openai_client() -> MagicMock:
-    """A fake ``AsyncOpenAI`` that is its own async context manager, as the SDK is."""
-    client = MagicMock()
-    client.__aenter__ = AsyncMock(return_value=client)
-    client.__aexit__ = AsyncMock(return_value=False)
+    """A fake ``AsyncOpenAI`` whose Responses call answers ``distinct``."""
+    client = sdk_client_double()
     client.responses.create = AsyncMock(return_value=types.SimpleNamespace(
         output_text='{"verdict": "distinct"}',
         usage=types.SimpleNamespace(
@@ -69,6 +72,17 @@ class TestWordings:
 
     def test_the_pre_psi_prompt_is_the_historical_one_byte_for_byte(self) -> None:
         assert _sha(_mod().PRE_PSI_JUDGE_SYSTEM_PROMPT) == PRE_PSI_SHA256
+
+    def test_the_psi_prompt_is_the_historical_one_byte_for_byte(self) -> None:
+        assert _sha(_mod().PSI_JUDGE_SYSTEM_PROMPT) == PSI_SHA256
+
+    def test_while_psi_shipped_each_wording_sent_its_frozen_prompt(self) -> None:
+        assert dict(_mod().PROMPTS_WHILE_PSI_SHIPPED) == {
+            'shipped': _mod().PSI_JUDGE_SYSTEM_PROMPT,
+            'pre-psi': _mod().PRE_PSI_JUDGE_SYSTEM_PROMPT,
+        }
+        with pytest.raises(TypeError):
+            _mod().PROMPTS_WHILE_PSI_SHIPPED['shipped'] = 'x'
 
     def test_shipped_is_the_live_module_prompt_and_differs_from_pre_psi(self) -> None:
         shipped = _mod().system_prompt(_mod().WORDING_SHIPPED)

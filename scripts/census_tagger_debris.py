@@ -4,7 +4,7 @@
 READ-ONLY / REPORT-ONLY: this module and its CLI never mutate a task record,
 an event record, or a plan artifact. Every corpus connection it opens is a
 read-only SQLite URI: the task store goes through
-``_task_db_scan.py::connect_ro``, the same open
+``shared/src/shared/tasks_db_readonly.py::connect_ro``, the same open
 ``audit_wiped_metadata_files.load_task_records`` uses, and the runs.db event log
 through :func:`_connect_readonly`
 (``sqlite3.connect(f"file:{path}?mode=ro", uri=True)``), so the sweep is
@@ -74,14 +74,15 @@ from typing import NamedTuple
 
 import _checkout as _checkout
 
-# Tier 1 — the ONE tasks.db and runs.db locators. Tier 3 — the warn-and-continue per-root
+# Tier 1 — the ONE tasks.db and runs.db locators, and the guard that turns an
+# underivable default root into the no-root exit. Tier 3 — the warn-and-continue per-root
 # loop and the shared no-root message. run_audit_cli is deliberately NOT
 # adopted; the exit-ladder block near main() records why.
 # discover_project_roots comes second-hand through the audit's documented
 # re-export, the same route repair_wiped_metadata_files.py takes.
 from _task_db_scan import (
     NO_PROJECT_ROOT_RESOLVED_MESSAGE,
-    connect_ro,
+    discover_or_report_no_default_root,
     runs_db_path,
     sweep_project_roots,
     tasks_db_path,
@@ -115,6 +116,7 @@ from repair_wiped_metadata_files import TERMINAL_STATUSES
 # The artifact keys on the id spelling its consumers already use: the one
 # project-id rule, never the directory name.
 from shared.project_id import project_id_for_root
+from shared.tasks_db_readonly import connect_ro
 
 # ---------------------------------------------------------------------------
 # The classification vocabulary.
@@ -550,7 +552,8 @@ def classify_record(
 
 # ---------------------------------------------------------------------------
 # Corpus readers. Every connection below is mode=ro: tasks.db through
-# _task_db_scan.connect_ro, runs.db through _connect_readonly.
+# shared/src/shared/tasks_db_readonly.py::connect_ro, runs.db through
+# _connect_readonly.
 # ---------------------------------------------------------------------------
 
 
@@ -558,10 +561,10 @@ def _connect_readonly(path: str) -> sqlite3.Connection:
     """Open the runs.db event log at *path* through a read-only SQLite URI.
 
     The event-log opener only. The task store goes through
-    ``_task_db_scan.py::connect_ro`` instead, whose refusals speak of tasks.db
-    and would mislead about runs.db. Kept as a named helper so the "cannot
-    write" property is testable against the opener itself rather than
-    re-asserted per call site.
+    ``shared/src/shared/tasks_db_readonly.py::connect_ro`` instead, whose
+    refusals speak of tasks.db and would mislead about runs.db. Kept as a named
+    helper so the "cannot write" property is testable against the opener itself
+    rather than re-asserted per call site.
     """
     return sqlite3.connect(f"file:{path}?mode=ro", uri=True)
 
@@ -1429,7 +1432,7 @@ def main(argv: list[str] | None = None) -> int:
     """Sweep the roots, classify every stamp, and publish the artifact pair."""
     args = _build_parser().parse_args(argv)
 
-    roots = discover_project_roots(args.project_roots)
+    roots = discover_or_report_no_default_root(lambda: discover_project_roots(args.project_roots))
     if not roots:
         print(NO_PROJECT_ROOT_RESOLVED_MESSAGE, file=sys.stderr)
         return EXIT_NO_ROOT

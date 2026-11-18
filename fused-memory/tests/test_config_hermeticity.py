@@ -28,6 +28,7 @@ from pathlib import Path
 
 import pytest
 
+from fused_memory.config.checkout_anchor import CHECKOUT_ROOT
 from fused_memory.config.schema import FusedMemoryConfig
 
 #: A value nothing in the tracked config or the schema could ever produce, so
@@ -73,14 +74,23 @@ INTERPOLATED_PATH_LEAVES = (
     ),
 )
 
-#: Each YAML interpolation variable paired with one leaf it drives, as ONE
-#: ``(name, reader)`` value per case: a fixture's ``params`` binds a single
-#: name, so a two-value ``pytest.param`` would not fit both consumers.
+#: Each YAML interpolation variable paired with one leaf it drives and the
+#: directory that leaf's unpinned YAML default is anchored at, as ONE
+#: ``(name, reader, anchor)`` value per case: a fixture's ``params`` binds a
+#: single name, so a multi-value ``pytest.param`` would not fit every consumer.
+#: ``Path()`` is the CWD; ``reconciliation.data_dir`` is anchored at the
+#: checkout at load (``fused_memory/config/checkout_anchor.py``, task 5462).
 INTERPOLATION_VAR_LEAVES = (
-    pytest.param(('PROJECT_ROOT', lambda config: config.taskmaster.project_root), id='project-root'),
-    pytest.param(('QUEUE_DATA_DIR', lambda config: config.queue.data_dir), id='queue-data-dir'),
     pytest.param(
-        ('RECONCILIATION_DATA_DIR', lambda config: config.reconciliation.data_dir),
+        ('PROJECT_ROOT', lambda config: config.taskmaster.project_root, Path()),
+        id='project-root',
+    ),
+    pytest.param(
+        ('QUEUE_DATA_DIR', lambda config: config.queue.data_dir, Path()),
+        id='queue-data-dir',
+    ),
+    pytest.param(
+        ('RECONCILIATION_DATA_DIR', lambda config: config.reconciliation.data_dir, CHECKOUT_ROOT),
         id='reconciliation-data-dir',
     ),
 )
@@ -145,18 +155,19 @@ def test_the_pin_lays_out_tmp_path_as_the_tracked_config_does(interpolation, mon
 
     ``fused-memory/config/config.yaml`` is the home of that layout and
     ``conftest.py::_isolate_fm_config`` mirrors it under ``tmp_path``.  Read
-    with the pin removed, the leaf is the YAML default, relative to the CWD;
-    read with it, the same relative path under ``tmp_path``.  A default edited
-    in one place and not the other fails here instead of drifting silently.
+    with the pin removed, the leaf is the YAML default under its case's
+    anchor (the CWD, or the checkout for ``reconciliation.data_dir``); read
+    with it, the same relative path under ``tmp_path``.  A default edited in
+    one place and not the other fails here instead of drifting silently.
     """
-    name, read_leaf = interpolation
+    name, read_leaf, anchor = interpolation
     pinned = Path(read_leaf(FusedMemoryConfig())).relative_to(tmp_path)
 
     monkeypatch.delenv(name)
     unpinned = FusedMemoryConfig()
 
     assert unpinned.taskmaster is not None
-    assert Path(read_leaf(unpinned)) == pinned
+    assert Path(read_leaf(unpinned)) == anchor / pinned
 
 
 @pytest.mark.parametrize('interpolation', INTERPOLATION_VAR_LEAVES)
@@ -169,7 +180,7 @@ def test_a_test_local_interpolation_override_still_reaches_the_config(
     (``TASKMASTER__PROJECT_ROOT`` and friends) instead: the env layer outranks
     the YAML, so such a pin would override this test's own value.
     """
-    name, read_leaf = interpolation
+    name, read_leaf, _anchor = interpolation
     mine = str(tmp_path / 'mine')
     monkeypatch.setenv(name, mine)
 
@@ -206,7 +217,7 @@ class TestAmbientInterpolationCannotRedirectTheConfig:
     @pytest.fixture(scope='class', autouse=True, params=INTERPOLATION_VAR_LEAVES)
     def redirected_leaf(self, request):
         """Plant one interpolation variable ambiently; hand back its leaf reader."""
-        name, read_leaf = request.param
+        name, read_leaf, _anchor = request.param
         ambient = pytest.MonkeyPatch()
         ambient.setenv(name, PWNED)
         yield read_leaf

@@ -26,6 +26,7 @@ import asyncio
 import contextlib
 
 import pytest
+from _merge_worker_drive import make_real_merge_item
 from _orch_helpers import MERGE_RESULT_TIMEOUT, wait_responsive
 
 # Reuse the γ multi-host test harness (established cross-test-module import
@@ -35,7 +36,6 @@ from _orch_helpers import MERGE_RESULT_TIMEOUT, wait_responsive
 from test_merge_queue_concurrent_verify import (
     _inject_two_host_allocator,
     _make_fake_remote,
-    _make_real_item,
     config,  # noqa: F401 — pytest fixture re-exported from γ harness
     git_config,  # noqa: F401 — pytest fixture re-exported from γ harness
     git_ops,  # noqa: F401 — pytest fixture re-exported from γ harness
@@ -50,7 +50,7 @@ from test_merge_queue_restart_hook import _GatedAdvanceGitOps
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.git_ops import GitOps
-from orchestrator.merge_queue import (
+from orchestrator.merge_lane.worker import (
     MERGE_WORKER_SHUTDOWN_REASON,
     ItemLifecycleState,
     SpeculativeMergeWorker,
@@ -155,7 +155,7 @@ class TestRawCancelTerminatesParkedVerifierLoop:
              ``_pending_verifier_get`` and parks in the fill-ahead race;
           2. releasing the gate hands that race to the verify, so FINALIZE-HEAD
              finalizes the head and the getter survives;
-          3. the next iteration finds ``_redispatch`` empty, the pending getter
+          3. the next iteration finds the redispatch park empty, the pending getter
              not done and ``_inflight`` now empty -- so it falls through to
              FINALIZE-HEAD's ``else:`` and awaits the REUSED getter.
 
@@ -168,13 +168,13 @@ class TestRawCancelTerminatesParkedVerifierLoop:
 
         drive = _drive_fill(worker, allocator)
 
-        item = _make_real_item(git_ops, config, 'rawcancel-a', 'aaa')
+        item = make_real_merge_item(git_ops, config, 'rawcancel-a', 'aaa')
         # Pre-register at the item's TRUE parked state so _note_transition's
         # AWAITING_VERIFY -> DISPATCHING hop finds a registered request_id and
         # files no spurious L1 illegal_lifecycle_transition escalation (task
         # 2169 registry).
         worker._register_item(item, initial=ItemLifecycleState.AWAITING_VERIFY)
-        # QUEUE-sourced, NOT _redispatch: the getter-reuse branch only ever
+        # QUEUE-sourced, NOT the redispatch park: the getter-reuse branch only ever
         # harvests from _verifier_queue.
         await worker._verifier_queue.put(item)
 
@@ -325,8 +325,8 @@ class TestGetterOnlyCancelPreservesQueueItems:
 
         drive = _drive_fill(worker, allocator)
 
-        item_a = _make_real_item(git_ops, config, 'goc-a', 'aaa')
-        item_b = _make_real_item(git_ops, config, 'goc-b', 'bbb')
+        item_a = make_real_merge_item(git_ops, config, 'goc-a', 'aaa')
+        item_b = make_real_merge_item(git_ops, config, 'goc-b', 'bbb')
         worker._register_item(item_a, initial=ItemLifecycleState.AWAITING_VERIFY)
         worker._register_item(item_b, initial=ItemLifecycleState.AWAITING_VERIFY)
 

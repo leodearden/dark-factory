@@ -33,7 +33,8 @@ The DAG has no inversion:
 |---|---|---|
 | Task store shape | **CONFIRMED** via `scripts/tasks_db_schema.py`: `tasks(tag, id, title, description, details, test_strategy, status, priority, metadata, updated_at, claimant_run_id, heartbeat_at, candidate_key)`, `dependencies(tag, task_id, depends_on)`; one tag (`master`) on the live store | β1 pins `tag` and projects by allowlist |
 | Event types | **CONFIRMED** members of `orchestrator/src/orchestrator/event_store.py::EventType` with live rows on 2026-10-14: merge_finalized 4,283; train_merged 58; merge_verify 3,297; workflow_verify 5,936; phase_enter 53,703; phase_exit 53,487; scheduler_paused 15; scheduler_resumed 15; escalation_created 2,675; escalation_resolved 755 | β1's readers have producers that have written in production (INV-13) |
-| `escalation_created.data.level` | **PARTIAL**: present on 452 of 2,675 rows | `waiting_on: leo` only when a recorded level is 2; otherwise `factory` (PRD §4.10 amended; β1's details amended) |
+| `escalation_created.data.level` | **SUPERSEDED** by the escalation queue row below (task 7280). Was **PARTIAL**: present on 452 of 2,675 rows | was: `waiting_on: leo` only when a recorded level is 2; otherwise `factory` (PRD §4.10 amended; β1's details amended) |
+| Escalation queue root records | **CONFIRMED**, measured read-only on 2026-11-02 over `data/escalations/` and its `archive/`: `level` an int on 4,060 of 4,060 records and `task_id` a str on 4,059, with one null (re-measured the same day: 4,062, 4,061 and one null); status only `pending`, `resolved` or `dismissed`; 24 pending at the root, 5 of them at level 2 (later 25 and 6), against 1,811 left open by replaying runs.db (later 1,841) | open escalations come from the queue root (`client-feed/src/client_feed/sources/escalations.py::read_open_escalations`); `waiting_on: leo` fires on a pending level-2 record or a pending member of one (PRD §4.10, §12 2026-11-02) |
 | `review_completed` | **ABSENT** on main (the planned θ) | β1 depends on θ; the feed says `not_recorded` until a row exists |
 | Verify archive | **CONFIRMED**: 2,294 `junit-*.xml.gz` under 1,885 task dirs; task legs archive via `TaskWorkflow._run_scoped_verification_with_infra_retry` (PRD §2 anchor corrected from `_execute_verify_review_loop`); pruning in `verify.py::_prune_archive` at 30 days / 500 MB | β2 reads the archive; copies rows into the feed |
 | junit pytest-only | **CONFIRMED** `orchestrator/src/orchestrator/verify_cmd.py::with_junitxml` is a no-op unless the tool is pytest and the command is structured (a raw-retained pytest chain also gets no junit) | the feed and docs say pytest projects only |
@@ -65,8 +66,8 @@ The DAG has no inversion:
 | γ | degraded heartbeat | producer γ; B19 | grep `degraded` in `publisher.py` |
 | δ | typed refusal reasons | δ's tests B11/B13/B15 | grep `not_in_tree` in `budget.py` |
 | δ | reveal floor | producer δ | grep `reveal_floor_lines` in `budget.py` |
-| ε | criterion marker plugin | producer ε; pytest 9.0.3 | grep `criterion` in `pytest_criterion.py` |
-| ε | no record_property | rejection-style; ε's tests | manual (a grep-absent on a not-yet-existing file is vacuous at main) |
+| ε | criteria map reader (amended 2026-10-16) | producer ε; map producer defect-tests β, upstream | grep `tests\.json` in `criteria.py` |
+| ε | no record_property | now defect-tests β's plugin; β's tests | manual (client-feed ships no pytest plugin) |
 | ε | criteria-results CLI | producer ε | grep `criteria-results` in `cli.py` |
 | ζ | audit-hook confinement test | producer ζ; B1 | grep `addaudithook` in `test_isolation.py` |
 | ζ | default_project_root banned | rejection-style; ζ's ban test | manual (same reason) |
@@ -102,3 +103,48 @@ tasks (the dashboard PRD-lanes PRD measured 255 direct holders on 2026-10-09).
   ε (no `record_property`).
 - The orchestrator does not read `user_observable_signal` / `consumer_ref` / `grammar_confirmed`; they
   are substrate for a future tracking-infra session.
+
+## Revision 2026-10-23: the client defect bridge (PRD §14)
+
+Gate task 7062 (esc-7062-1). Six new blocks in the sidecar, σ1a, σ1b, σ2, σ3, σ4 and σ5, stamped by
+their own `commit_planning`. `signal_leaves` is now `["ζ", "σ3"]`. As of main `384a6dc454`
+(2026-10-23).
+
+Added 2026-11-03 (decision 14, Leo's ruling in scoping-intake `docs/prds/declined-defect-reports.md`): one more block, σ1c (`DefectRuled` in the inbox contract, task 8351). Evidence: σ1a (7402) done, so `client_feed/contract.py`'s union and `parse_inbox_line` exist to extend; `defect_ruled` grepped absent at `06aea7ac01`; the consumer is σ2 (7404, amended, now depending on σ1c) and the writer is the portal's δ (scoping_intake 602), whose `in-v3` fixture σ3 (7407) vendors; the duty's writes exist (`shared.defects.Withdrawal`, `WithdrawalCode.NOT_A_DEFECT`, `Rule`, `Ruling{ruled_by: operator}`; `record_defect_outcome`, `declare_defect`, defect-tests α2 7044 done). Delivered check: `class DefectRuled` present in `contract.py`.
+
+**Verdict summary: 16 bindings, all PASS.**
+
+- 10 are mechanical checks: 8 grep `present` and 2 path `present`.
+- 5 are manual.
+- 1 is a substrate binding with no check.
+- Polarity: every `present` pattern and path is absent on main today. Checked by hand at authoring.
+
+**G3 substrate**, verified by two seats and the critic against code on 2026-10-22/23:
+
+- `shared.defects.mint_portal_ref` and its token/count grammar.
+- `submit_task(planning_mode=True)`, which writes the row `deferred`, bypasses the curator, and runs
+  the creation floor before the planning split.
+- `lookup_defect_ref` and `find_tasks_by_metadata`, which see every status.
+- `commit_planning`.
+- `SyncMcpSession`.
+- The markup guard, which refuses as a `TOOL_ERROR` and is installed only by
+  `fused_memory.server.main._install_tool_dispatch_guards`.
+- The fixture in `fused-memory/tests/test_defect_write_tools.py`, which builds the real tool layer
+  that B36 serves.
+- On the portal side: `DefectReport` in `Block.history`, `FeedBinding.project_id`, `BACKENDS["api"]`,
+  and the docstring of `claude_code.py`.
+
+**G6:**
+
+- No signal asserts a measured number.
+- `filer_grace_seconds` = 600 and σ5's threshold of 10 are policy values, marked provisional in §14.10.
+- Each rejection capability is observed to fire by a named B-row:
+  - the contract's `extra` rejection, B23;
+  - the import boundary, B24;
+  - the lock, B28;
+  - the markup guard, B35 and B36.
+
+**G7:** walked against `docs/legibility/design-invariants.md` in §14.8. There is no hit and no waiver.
+
+**Filed batch:** see the stamped ids in the sidecar. The amendments to ε 6972, ζ 6973 and ι 7057 are
+recorded in PRD §14.8.

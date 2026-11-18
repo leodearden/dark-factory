@@ -772,7 +772,7 @@ class TestReportingIsQuietWhenThereIsNothingToSay:
         Suffixes are letters only and the sizes are 3 and 7 so no digit can
         arrive incidentally from a name.
         """
-        import re  # noqa: PLC0415
+        import re
 
         mod = _mod()
         letters = 'abcdefghijk'

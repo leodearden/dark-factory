@@ -83,7 +83,6 @@ MOVED_SYMBOLS: dict[str, tuple[str, ...]] = {
         'api_escalation_analytics',
     ),
     'dashboard.loops': (
-        '_SAMPLE_INTERVAL_SECONDS',
         '_DOWNSAMPLE_INTERVAL_SECONDS',
         '_CHECKPOINT_INTERVAL_SECONDS',
         '_BurndownStore',

@@ -165,6 +165,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from shared.cli_boundary import LoudArgumentParser, reset_stdout_failure_state, run_cli
+
 from fused_memory.reconciliation import citation_repair
 
 logger = logging.getLogger(__name__)
@@ -175,13 +177,13 @@ logger = logging.getLogger(__name__)
 REPAIRED_BY = 'script:repair_recon_citation'
 
 
-def build_parser() -> argparse.ArgumentParser:
+def build_parser() -> LoudArgumentParser:
     """Construct the CLI argument parser for this script.
 
     Extracted from ``main()`` so tests can assert flag defaults — above all that
     ``--apply`` defaults False — without invoking the live entry point.
     """
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = LoudArgumentParser(description=__doc__)
     parser.add_argument(
         '--target-run-id', dest='target_run_id', required=True,
         help='The COMPLETED run that owns the finding (not your own run)',
@@ -322,13 +324,21 @@ def _startup_error(component: str, exc: BaseException) -> dict[str, Any]:
     }
 
 
+EXIT_RUN_FAILED = 1
+"""A startup failure, any outcome other than a resolved repair or a clean dry
+run, or stdout failed.
+
+Agrees with ``shared.cli_boundary.EXIT_STDOUT_FAILED``.
+"""
+
+
 def exit_code_for(outcome: dict[str, Any]) -> int:
     """0 only for a resolved repair or a clean dry-run; 1 for anything else.
 
     An outcome carrying neither key is a contract break — it exits 1 rather
     than being read as success.
     """
-    return 0 if outcome.get('status') in {'repaired', 'dry_run'} else 1
+    return 0 if outcome.get('status') in {'repaired', 'dry_run'} else EXIT_RUN_FAILED
 
 
 def report(outcome: dict[str, Any]) -> int:
@@ -344,6 +354,14 @@ def report(outcome: dict[str, Any]) -> int:
 
 def main() -> int:
     """CLI entry point."""
+    outcome: dict[str, Any] | None = None
+
+    def _committed_repair() -> str | None:
+        if outcome is not None and outcome.get('status') == 'repaired':
+            return '--apply already committed the repair'
+        return None
+
+    reset_stdout_failure_state(detail=_committed_repair)
     logging.basicConfig(
         level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s',
     )
@@ -351,11 +369,12 @@ def main() -> int:
     args = build_parser().parse_args()
 
     async def _run_live() -> int:
-        from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
-        from fused_memory.reconciliation.journal import (  # noqa: PLC0415
+        nonlocal outcome
+        from fused_memory.config.schema import FusedMemoryConfig
+        from fused_memory.maintenance._utils import maintenance_service
+        from fused_memory.reconciliation.journal import (
             ReconciliationJournal,
         )
-        from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
 
         # Backend construction is INSIDE the cleanup scope: a Qdrant/OpenAI
         # connect failure used to leave the already-opened journal unclosed and
@@ -388,23 +407,17 @@ def main() -> int:
             return report(_startup_error('journal', exc))
 
         try:
-            try:
-                memory = MemoryService(config)
-                await memory.initialize()
-            except Exception as exc:
-                # A ``return`` here still runs the outer ``finally``, which is
-                # what closes the journal on this path. A MemoryService that
-                # failed to initialize is deliberately NOT closed: close() walks
-                # per-backend handles that may not exist yet, so calling it on a
-                # failed init risks a second exception masking the first.
-                return report(_startup_error('memory_service', exc))
-            try:
+            async with contextlib.AsyncExitStack() as stack:
+                try:
+                    _, memory = await stack.enter_async_context(
+                        maintenance_service(config=config),
+                    )
+                except Exception as exc:
+                    # A ``return`` here still runs the outer ``finally``, which
+                    # is what closes the journal on this path; maintenance_service
+                    # has already closed the half-opened service.
+                    return report(_startup_error('memory_service', exc))
                 outcome = await run(args, journal=journal, memory=memory)
-            finally:
-                # Unconditional: MemoryService.close is always defined and is
-                # itself per-backend defensive via _safe_close, so a hasattr
-                # guard here would only hide a genuinely missing method.
-                await memory.close()
         finally:
             await journal.close()
 
@@ -418,4 +431,4 @@ def main() -> int:
 
 
 if __name__ == '__main__':
-    sys.exit(main())
+    sys.exit(run_cli(main))

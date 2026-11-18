@@ -7,6 +7,8 @@ payload shapes and the routing_intent_enforced() env flag.
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 from fused_memory.middleware.routing_intent_guard import routing_intent_finding
@@ -283,8 +285,6 @@ class TestRoutingIntentPayloadsAndFlag:
         be non-blocking). Also emits a greppable 'routing_intent_lint.flagged'
         census WARNING -- the observe-rate-before-flipping-enforcement
         precedent."""
-        import logging
-
         from fused_memory.middleware.routing_intent_guard import routing_intent_warning
 
         finding = self._finding()
@@ -657,3 +657,40 @@ class TestProvenanceStampDoesNotDisarmCodeChangeSuppression:
         )
         assert finding is not None, 'Single-newline continuation is stripped with the stamp'
         assert 'do_not_implement' in finding.markers
+
+
+_SCHEMA_WARNING = 'task_metadata.schema_warning'
+_SOURCE = 'source=routing_intent_guard'
+_DECLARATIVE_DESCRIPTION = 'DO NOT IMPLEMENT this; escalate to a human instead of implementing.'
+
+
+def _discard_lines(caplog) -> list[str]:
+    messages = (r.getMessage() for r in caplog.records)
+    return [m for m in messages if _SCHEMA_WARNING in m and _SOURCE in m]
+
+
+def _finding_for(metadata):
+    return routing_intent_finding(
+        title=None,
+        description=_DECLARATIVE_DESCRIPTION,
+        details=None,
+        task_kind='normal',
+        metadata=metadata,
+    )
+
+
+class TestUnreadableMetadataIsDiscardedLoudly:
+    """Unreadable metadata reads as empty under the shared wire rule, and is logged."""
+
+    def test_malformed_string_behaves_as_absent_and_logs_one_census_line(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            finding = _finding_for('{not json')
+        assert finding is not None
+        assert finding == _finding_for(None)
+        assert len(_discard_lines(caplog)) == 1
+
+    @pytest.mark.parametrize('metadata', [None, ''])
+    def test_absent_metadata_logs_no_census_line(self, metadata, caplog):
+        with caplog.at_level(logging.WARNING):
+            _finding_for(metadata)
+        assert _discard_lines(caplog) == []

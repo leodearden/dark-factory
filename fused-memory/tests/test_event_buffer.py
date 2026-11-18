@@ -1649,8 +1649,7 @@ async def test_migrate_drops_legacy_idx_dw_project(tmp_path):
     """Regression: _migrate() drops the legacy idx_dw_project single-column index.
 
     Seeds an intermediate-migration schema — deferred_writes already has
-    claimed_at and attempt_count (so executescript's CREATE INDEX IF NOT EXISTS
-    idx_dw_project_claimed can succeed), but the old single-column
+    claimed_at and attempt_count, but the old single-column
     idx_dw_project index has not yet been removed.  This represents a DB
     created by a code version that added claimed_at without also dropping the
     now-redundant index.
@@ -1664,9 +1663,8 @@ async def test_migrate_drops_legacy_idx_dw_project(tmp_path):
     db_path = tmp_path / 'legacy.db'
 
     # Seed an intermediate-migration state: the full current column set is
-    # present (claimed_at, attempt_count) so executescript won't fail when it
-    # tries to CREATE INDEX IF NOT EXISTS idx_dw_project_claimed, but the old
-    # single-column index idx_dw_project has NOT been dropped yet.
+    # present (claimed_at, attempt_count), but the old single-column index
+    # idx_dw_project has NOT been dropped yet.
     intermediate_schema = """
     CREATE TABLE deferred_writes (
         id TEXT PRIMARY KEY,
@@ -1698,7 +1696,7 @@ async def test_migrate_drops_legacy_idx_dw_project(tmp_path):
         row = await cursor.fetchone()
     assert row is None, 'idx_dw_project should have been dropped by _migrate()'
 
-    # Replacement covering index must exist (created by executescript or _migrate).
+    # Replacement covering index must exist.
     async with db_inner.execute(
         "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_dw_project_claimed'"
     ) as cursor:
@@ -1706,6 +1704,44 @@ async def test_migrate_drops_legacy_idx_dw_project(tmp_path):
     assert row is not None, 'idx_dw_project_claimed should be present after migration'
 
     await buf.close()
+
+
+@pytest.mark.asyncio
+async def test_initialize_migrates_a_deferred_writes_table_older_than_claimed_at(tmp_path):
+    """A database predating claimed_at opens, keeps its rows, and can claim them.
+
+    The shape is leo-laptop's real reconciliation.db (2026-10-30), whose
+    fused-memory.service crash-looped on ``no such column: claimed_at``.
+    """
+    db_path = tmp_path / 'pre_claimed_at.db'
+    async with aiosqlite.connect(str(db_path)) as db:
+        await db.executescript("""
+        CREATE TABLE deferred_writes (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            content TEXT NOT NULL,
+            category TEXT NOT NULL,
+            metadata TEXT NOT NULL DEFAULT '{}',
+            agent_id TEXT,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX idx_dw_project ON deferred_writes(project_id);
+        INSERT INTO deferred_writes (id, project_id, content, category, created_at)
+            VALUES ('old-row', 'p', 'kept', 'procedural_knowledge', '2026-01-01T00:00:00+00:00');
+        """)
+        await db.commit()
+
+    buf = EventBuffer(db_path=db_path)
+    await buf.initialize()
+    try:
+        assert [row['id'] for row in await buf.claim_deferred_writes('p')] == ['old-row']
+        async with buf._require_access().connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='deferred_writes'"
+            " AND name LIKE 'idx_%'"
+        ) as cursor:
+            assert [row[0] for row in await cursor.fetchall()] == ['idx_dw_project_claimed']
+    finally:
+        await buf.close()
 
 
 @pytest.mark.asyncio

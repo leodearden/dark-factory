@@ -39,14 +39,14 @@ from orchestrator import verify
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 
 # escalation/tests/test_server.py's real shape: a guarded, indented import of
-# orchestrator.merge_queue (escalation/tests/test_server.py:31-34).
+# orchestrator.merge_lane.worker (escalation/tests/test_server.py:31-34).
 _TEST_SERVER_CONTENT = (
     'from __future__ import annotations\n'
     '\n'
     'import pytest\n'
     '\n'
     'try:\n'
-    '    from orchestrator.merge_queue import SpeculativeMergeWorker\n'
+    '    from orchestrator.merge_lane.worker import SpeculativeMergeWorker\n'
     'except ImportError:\n'
     '    SpeculativeMergeWorker = None\n'
 )
@@ -128,8 +128,12 @@ def _build_config(tmp_path: Path) -> OrchestratorConfig:
     ``_module_configs`` is a Pydantic PrivateAttr (config.py:2682), not a
     constructor kwarg — set via direct attribute assignment, the established
     idiom (test_verify.py:5558 et al.).
+
+    Breadth is pinned to ``'scoped'`` because reverse-dependency widening is
+    a scoped-breadth mechanism: under ``'full'`` every registered module's
+    full suite already runs.
     """
-    config = OrchestratorConfig(project_root=tmp_path)
+    config = OrchestratorConfig(project_root=tmp_path, merge_verify_breadth='scoped')
     config._module_configs = {
         'escalation': ModuleConfig(
             prefix='escalation',
@@ -341,7 +345,7 @@ class TestRunScopedVerificationReverseDependencyWidening:
 
         `existing_files` (the `(worktree / f).exists()`-filtered list) drops
         the deleted source path entirely, hiding exactly the class of change
-        most likely to break escalation's `from orchestrator.merge_queue
+        most likely to break escalation's `from orchestrator.merge_lane.worker
         import ...` contract. The trigger gate must key off the RAW
         `task_files` list instead, so a deletion/rename still counts.
         """
@@ -455,7 +459,7 @@ class TestRunScopedVerificationReverseDependencyGuards:
     async def test_unmapped_package_source_change_does_not_widen(self, tmp_path: Path):
         """A source-only diff to a package with no reverse-dep map entry widens to nothing."""
         worktree = _build_dashboard_worktree(tmp_path)
-        config = OrchestratorConfig(project_root=worktree)
+        config = OrchestratorConfig(project_root=worktree, merge_verify_breadth='scoped')
         dashboard_mc = ModuleConfig(
             prefix='dashboard',
             test_command=_DASHBOARD_TEST_COMMAND,

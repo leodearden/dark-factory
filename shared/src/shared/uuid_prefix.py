@@ -104,7 +104,7 @@ def find_prefix_tokens(arguments: Any) -> tuple[PrefixToken, ...]:
     """Return every prefix-shaped token in *arguments*, in document order.
 
     Every string value reachable through dicts AND lists is scanned, not only
-    the top-level ones that ``mcp_markup_middleware.py::_first_markup_argument``
+    the top-level ones that ``mcp_markup_middleware.py::MarkupGuardMiddleware._markup_arguments``
     inspects. D11 is the reason: the DF 4643 instance lives one level down at
     ``metadata.cluster_memory_ids[i]``, and the measured field spread is 20+
     paths, so a top-level-only scan would have missed the incident that

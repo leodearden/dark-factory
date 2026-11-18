@@ -73,7 +73,7 @@ section: every helper it uses lives in systemd_unit_invariants.py and is
 negative-case-owned elsewhere. Task 3763 lifted three of them there rather
 than copying them out of the sibling — `systemctl_user_show` (whose
 four-case parametrized guard stayed put in the sibling, mirroring how
-test_dashboard_service_template.py owns assert_restart_backoff_effective's),
+test_dashboard_unit_restart_policy.py owns assert_restart_backoff_effective's),
 plus `INSTALLED_UNIT_DIR`, `require_installed_unit` and
 `SYSTEMCTL_SKIP_REASON` when this module became their second consumer.
 INSTALLED_UNIT_DIR especially: it mirrors a path written in another
@@ -136,6 +136,7 @@ import pathlib
 import shutil
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from systemd_unit_invariants import (
     INSTALLED_UNIT_DIR,
     SYSTEMCTL_SKIP_REASON,
@@ -144,6 +145,8 @@ from systemd_unit_invariants import (
     restart_directive,
     systemctl_user_show,
 )
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 UNIT_BASENAME = "orchestrator-pump-web-ui.service"
 INSTALLED_UNIT_PATH = INSTALLED_UNIT_DIR / UNIT_BASENAME

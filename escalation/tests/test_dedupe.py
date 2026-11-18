@@ -900,7 +900,7 @@ class TestDedupeConfigForRecon:
 class TestDedupeConfigForContentFingerprint:
     """DedupeConfig.for_content_fingerprint(category) — the unbounded content-fingerprint fold policy."""
 
-    _CATEGORY = 'some_category'
+    _CATEGORY = 'design_concern'
 
     def _make_esc(
         self,
@@ -957,9 +957,9 @@ class TestDedupeConfigForContentFingerprint:
         from escalation.queue import EscalationQueue
 
         queue = EscalationQueue(tmp_path / 'esc')
-        queue.submit(self._make_esc('esc-42-1', category='other_category'))
+        queue.submit(self._make_esc('esc-42-1', category='risk_identified'))
 
-        candidate = self._make_esc('esc-42-2', category='other_category')
+        candidate = self._make_esc('esc-42-2', category='risk_identified')
         cfg = DedupeConfig.for_content_fingerprint(self._CATEGORY)
         assert resolve_dedupe_parent(queue, candidate, cfg) is None
 
@@ -1865,7 +1865,7 @@ class TestFileOrFoldL1:
         kwargs = {
             'project_id': 'p',
             'subject': '3105',
-            'category': 'cat_x',
+            'category': 'design_concern',
             'finding_category': 'fc_a',
             'agent_role': 'role-x',
             'summary': 'S1',
@@ -1890,14 +1890,14 @@ class TestFileOrFoldL1:
         esc = pending[0]
         assert esc.level == 1
         assert esc.severity == 'blocking'
-        assert esc.category == 'cat_x'
+        assert esc.category == 'design_concern'
         assert esc.agent_role == 'role-x'
         assert esc.task_id == '3105'
         assert esc.summary == 'S1'
         assert esc.detail == 'D1'
         # The identity formula live parents on disk were stamped with.
         assert esc.dedupe_fingerprint == compute_content_fingerprint(
-            'cat_x', 'fc_a', ['p:3105'],
+            'design_concern', 'fc_a', ['p:3105'],
         )
 
     def test_recurrence_folds_and_logs_info_on_the_callers_logger(self, queue):

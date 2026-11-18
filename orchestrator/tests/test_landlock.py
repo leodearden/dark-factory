@@ -495,6 +495,7 @@ def _scaffold_git(cwd: Path, *args: str) -> str:
 
 @pytest.mark.skipif(_skip_landlock(), reason=_LANDLOCK_SKIP_REASON)
 @pytest.mark.skipif(_skip_var_tmp(), reason=_VAR_TMP_SKIP_REASON)
+@pytest.mark.spawns_agent_cli
 class TestLandlockSandboxedConflictedMerge:
     """A sandboxed agent resolves a NEW merge conflict and commits it cleanly.
 
@@ -524,7 +525,7 @@ class TestLandlockSandboxedConflictedMerge:
             for var in ('DF_AGENT_CPU_NICE', 'DF_AGENT_CPU_GOVERN'):
                 monkeypatch.delenv(var, raising=False)
             sandbox_dispatch.set_backend('landlock')
-            write_set = compute_write_set(worktree, home=fake_home)
+            write_set = compute_write_set(worktree, task_id='1', home=fake_home)
             extras = [str(p) for p in write_set.writable_paths()]
 
             self._assert_rr_cache_denied(main, worktree, fake_home, extras)

@@ -1,0 +1,36 @@
+{
+  "task_id": "4845",
+  "reason": "net-additive bug fix: quarantine_worktree branch normalization, unregistered-lane relocation and quarantine provenance (QuarantineOutcome), plus their regression tests",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/git_ops.py",
+      "baseline": 1505,
+      "current": 1516
+    },
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/test_crash_recovery.py",
+      "baseline": 286,
+      "current": 288
+    },
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/test_harness_warm_lane_wiring.py",
+      "baseline": 123,
+      "current": 124
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5195,
+      "current": 5206
+    },
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6492,
+      "current": 6495
+    }
+  ]
+}

@@ -59,8 +59,9 @@ All new fields are optional, written only by the census, and validated by `codeb
     - `evidence_source`: always `agent-transcripts`, plus `present-tree` when the verifier confirmed the finding at `as_of_sha`.
     - `sub_area`: null.
     - `verdict` and `disposition`: per C4 and contract §7.
-  - `filed_tickets`: a list of `{ticket: str|null, project_root, run_id, finding_key, task_id: int|null, resolution: created|combined|refused|failed|existing|null, step: key|semantic|curator}`.
+  - `filed_tickets`: a list of `{ticket: str|null, project_root, run_id, finding_key, task_id: int|null, resolution: created|combined|refused|failed|cancelled|existing|null, step: key|semantic|curator}`.
   - `fixed_at_sha`, `accepted_by` (task id).
+  - `sighting_fits`: a list of `{session, exhibits: bool, run_id, reason}`, the census's fit verdict on an attached sighting, at most one per session (`codebook.py::sighting_fit_errors`).
   - `status` gains `accepted` in `codebook.py::STATUSES`.
   - The v1 free-form `filed_tasks` (16 legacy entries, strings or lists) is left untouched. `filed_tickets` is the structured back-link.
 - **Candidate:**
@@ -209,6 +210,7 @@ R9 The coder (Haiku trickle and Sonnet miner) does not receive the fourteen heur
 - **D6 Structural findings are recorded, not filed** (contract §6). The verdict's `route` decides. Today such clusters are filed whenever they recur.
 - **D7 Tickets resolve in-run, with a bound:** `resolve_ticket` per ticket, 300 s in total, before render. The remainder resolve on the next run.
 - **D8 `fixed` requires re-verification.** A back-linked task going `done` queues one verify call at `as_of_sha`, counted against the same verify cap. "Gone" sets `status: fixed` and `fixed_at_sha`. "Present" re-files with `x_supersedes_task` (contract §7, §8 1c). The codebook status is a projection reconciled from the task store on every run, never an independent copy (INV-9).
+  > Amended 2026-10-24 (task 7448): a back-linked task the entry lists in `corrected_by` (written only by a §7.3 correction naming it in `outcome_of_task`) corrected the entry's record rather than its defect, so it decides no status and queues no re-verify; and a census output lands only after the project's `census.landing_gate` passes (`scripts/legibility/landing_gate.py`).
 - **D9 Completion (a) evaluates the observed project only.** Cross-project tickets are reported, but they do not gate.
 - **D10 `scripts/legibility/invariants.py` reads `## INV-<id> \`<slug>\`` headings from a project's own design-invariants doc.** It accepts both the `INV-<n>` and the `INV-<FAMILY>-<n>` id forms. `scripts/tests/test_design_invariants_consistency.py::_HEADING_RE` is replaced by an import of it (INV-5).
 
@@ -321,7 +323,7 @@ L1–L10 are intermediates whose user-observable completion is G's check of a li
   - **Signal:** G (`## Screened` with per-rule counts).
 - **L7: similarity index and pending-candidate adjudication queue** (normal; deps L6; ~1,100 LOC).
   - **Files:** new `scripts/legibility/similarity.py` (embed, cache, nearest, greedy single-link clusters); `config.py::Census` (`adjudication` block); `census.py` (a pre-verify similarity screen as L6's fourth rule; the queue after verify; `SECTION_ADJUDICATION`); tests with a fake embedder seam.
-  - **Behaviour:** D3 and D4. A pending candidate at or above `attach_min_similarity` to an entry is promoted onto it (`attached_by.similarity`). Pending clusters are verified by representative, up to the cap, and the verdict applies to every member (`adjudicated_with`). The singleton gate counts cluster sessions. An embedding failure skips the stage, files one info escalation and is reported (INV-4, INV-11).
+  - **Behaviour:** D3 and D4. A pending candidate at or above `attach_min_similarity` to an entry is promoted onto it (`attached_by.similarity`). Pending clusters are verified by representative, up to the cap, and the verdict applies to every member (`adjudicated_with`). The singleton gate counts cluster sessions. An entry's count includes only its founding, title- or key-attached and fit-confirmed sightings; the rule is `scripts/legibility/sighting_fit.py::counted_sessions`, and a filed entry quotes evidence from those sightings alone. An embedding failure skips the stage, files one info escalation and is reported (INV-4, INV-11).
   - **Tests:** row 12.
   - **Consumers:** the singleton filing gate, report.
   - **Signal:** `similarity.py queue --project-root /home/leo/src/dark-factory` (embedding spend only, no verify) prints the queue depth and the top clusters over the live codebook. G (`## Adjudication` with an audit line per attach).

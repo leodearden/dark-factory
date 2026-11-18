@@ -92,7 +92,7 @@ def _queue_waiter(queue_dir: Path) -> _Waiter:
             with escalation_id_lock(queue_dir, ESC_ID):
                 seen['present'] = lock_path.exists()
                 seen['newcomer_blocked'] = _newcomer_is_blocked(lock_path)
-        except BaseException as exc:  # noqa: BLE001 — surfaced by the caller
+        except BaseException as exc:  # surfaced by the caller
             seen['error'] = exc
 
     thread = threading.Thread(target=waiter, daemon=True)

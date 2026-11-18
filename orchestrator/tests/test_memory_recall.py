@@ -13,19 +13,30 @@ from __future__ import annotations
 import importlib.util
 import json
 import logging
+import re
+from datetime import date, timedelta
 from pathlib import Path
 
 import pytest
 from _briefing_helpers import (
+    AMENDMENT_BODY_FIXTURES,
+    AMENDMENT_BULLET,
+    SUPERSEDED_CHILD_FIXTURES,
+    WORST_CASE_AMENDMENT_LIST_CHARS,
     _edge,
     _grouped_block,
     _grouped_parent,
     _node,
     _result,
+    amendment_list_chars,
     recorded_search_text,
 )
+from shared.elision import elision_marker
+from shared.memory_supersession import SUPERSEDED_BY_METADATA_KEY
 
 from orchestrator.agents.memory_recall import (
+    ENTITY_BLOCK_MAX_EDGES,
+    ENTITY_EDGES_OMITTED_NOTICE,
     FOREIGN_PROJECT_TAG_KEYS,
     MEMORY_CONTEXT_CAVEAT,
     MEMORY_EMPTY_NOTICE,
@@ -292,6 +303,22 @@ class TestForeignTagKeysAndSpelling:
         filtered = _filter([_result('1', 'Fact.', metadata={'project_id': 'reify'})])
         assert (filtered.kept, filtered.dropped) == ((), 1)
 
+    @pytest.mark.parametrize(('raw', 'own'), [
+        ('Know-Live', False),
+        ('know_live', False),
+        ('dark--factory', False),
+        ('Dark_Factory', True),
+        ('  dark_factory  ', True),
+        ('df', False),
+        ('reify', False),
+    ])
+    def test_own_project_is_fused_memorys_project_id_rule(self, raw, own):
+        filtered = filter_foreign_project_results(
+            [_result('1', 'Fact.', metadata={'project_id': raw})], 'dark-factory',
+        )
+
+        assert _ids(filtered.kept) == (['1'] if own else [])
+
     def test_non_string_tag_is_treated_as_untagged(self):
         filtered = _filter([_result('1', 'Fact.', metadata={'project_id': 123})])
 
@@ -394,7 +421,7 @@ class TestGroupedChildrenAreFiltered:
 
     ``group_search_results`` nests child data inside a KEPT parent entry and
     every child renders into the ``# Context`` block, so reading only the
-    TOP-LEVEL tag would let a foreign digest or pinned body through.
+    TOP-LEVEL tag would let a foreign amendment entry or pinned body through.
 
     SCOPE: ``src_project`` is the task-2273 CGL-eta rehome shape — a record
     physically in this project's collection naming a different ORIGIN
@@ -435,7 +462,7 @@ class TestGroupedChildrenAreFiltered:
         """The minimal nested-only case: exactly ONE foreign child, nothing else."""
         filtered = _filter([_grouped_parent(grouped={
             'amendments': [
-                {'id': 'a1', 'digest': 'FOREIGN AMENDMENT BODY', 'created_at': None,
+                {'id': 'a1', 'content': 'FOREIGN AMENDMENT BODY', 'created_at': None,
                  'kind': 'amendment', 'metadata': {'src_project': 'reify'}},
             ],
             'amendment_count': 1,
@@ -468,7 +495,7 @@ class TestGroupedChildrenAreFiltered:
         for spelling in ('dark-factory', 'Dark_Factory', '  dark_factory  '):
             filtered = _filter([_grouped_parent(grouped={
                 'amendments': [
-                    {'id': 'a1', 'digest': 'NATIVE AMENDMENT BODY', 'created_at': None,
+                    {'id': 'a1', 'content': 'NATIVE AMENDMENT BODY', 'created_at': None,
                      'kind': 'amendment', 'metadata': {'project_id': spelling}},
                 ],
                 'amendment_count': 1,
@@ -484,7 +511,7 @@ class TestGroupedChildrenAreFiltered:
         """The same canonicalisation must not let a FOREIGN child through either."""
         filtered = _filter([_grouped_parent(grouped={
             'amendments': [
-                {'id': 'a1', 'digest': 'FOREIGN AMENDMENT BODY', 'created_at': None,
+                {'id': 'a1', 'content': 'FOREIGN AMENDMENT BODY', 'created_at': None,
                  'kind': 'amendment', 'metadata': {'src_project': '  REIFY  '}},
             ],
             'amendment_count': 1,
@@ -504,9 +531,9 @@ class TestGroupedChildrenAreFiltered:
                         source_store='mem0')
         entry['grouped'] = {
             'amendments': [
-                {'id': 'a1', 'digest': 'FOREIGN CHILD ONE', 'kind': 'amendment',
+                {'id': 'a1', 'content': 'FOREIGN CHILD ONE', 'kind': 'amendment',
                  'metadata': {'src_project': 'reify'}},
-                {'id': 'a2', 'digest': 'FOREIGN CHILD TWO', 'kind': 'amendment',
+                {'id': 'a2', 'content': 'FOREIGN CHILD TWO', 'kind': 'amendment',
                  'metadata': {'src_project': 'reify'}},
             ],
             'matched_children': [
@@ -607,9 +634,9 @@ class TestGroupedDescentIsSurgicalAndFailsOpen:
             'amendments': [
                 None,
                 'a bare string',
-                {'id': 'a1', 'digest': 'FOREIGN AMENDMENT BODY', 'kind': 'amendment',
+                {'id': 'a1', 'content': 'FOREIGN AMENDMENT BODY', 'kind': 'amendment',
                  'metadata': {'src_project': 'reify'}},
-                {'id': 'a2', 'digest': 'NATIVE AMENDMENT BODY', 'kind': 'amendment'},
+                {'id': 'a2', 'content': 'NATIVE AMENDMENT BODY', 'kind': 'amendment'},
             ],
             'amendment_count': 4,
         }
@@ -625,7 +652,7 @@ class TestGroupedDescentIsSurgicalAndFailsOpen:
         entry = _result('p1', 'Native canonical.', metadata={'project_id': PROJECT})
         entry['grouped'] = {
             'amendments': [
-                {'id': 'a1', 'digest': 'ODDLY SHAPED BODY', 'kind': 'amendment',
+                {'id': 'a1', 'content': 'ODDLY SHAPED BODY', 'kind': 'amendment',
                  'metadata': 'not a dict'},
             ],
             'amendment_count': 1,
@@ -663,6 +690,65 @@ class TestRenderMemoryResults:
         assert render_memory_results(('stray', silent)) == ''
 
 
+_NEW_ID = '0f6c2a4e-8b1d-4c3e-9a7f-5d2e1b0c9a8f'
+
+
+def _dated(entry: dict) -> dict:
+    entry['category'] = 'preferences_and_norms'
+    entry['created_at'] = '2026-08-15T22:22:49+00:00'
+    return entry
+
+
+class TestSupersededRender:
+    """A superseded entry is tagged in place: never dropped, never reordered."""
+
+    def test_a_superseded_result_names_what_superseded_it(self):
+        entry = _dated(_result(
+            '1', 'Old text.', metadata={SUPERSEDED_BY_METADATA_KEY: _NEW_ID}, source_store='mem0',
+        ))
+
+        assert render_memory_results((entry,)) == (
+            f'- [superseded by {_NEW_ID} · preferences_and_norms · 2026-08-15 · mem0] Old text.'
+        )
+
+    def test_a_superseded_result_keeps_its_place_beside_the_current_one(self):
+        superseded = _dated(_result(
+            '1', 'Old text.', metadata={SUPERSEDED_BY_METADATA_KEY: _NEW_ID}, source_store='mem0',
+        ))
+        current = _dated(_result(_NEW_ID, 'New text.', source_store='mem0'))
+
+        lines = render_memory_results((superseded, current)).splitlines()
+
+        assert [line.rsplit('] ', 1)[1] for line in lines] == ['Old text.', 'New text.']
+        assert 'superseded by' in lines[0]
+        assert 'superseded by' not in lines[1]
+
+    def test_superseded_grouped_children_are_tagged_in_their_nested_bullets(self):
+        """Read from a reply the real ``search`` tool produced; see that fixture's PROVENANCE.md."""
+        reply = parse_search_reply(
+            recorded_search_text('superseded-children', fixtures=SUPERSEDED_CHILD_FIXTURES),
+        )
+        assert isinstance(reply, SearchReply), reply
+
+        lines = render_memory_results(reply.results).splitlines()
+
+        assert len(lines) == 3, lines
+        parent, amendment, sighting = lines
+        assert parent.startswith('- [') and 'superseded by' not in parent, lines
+        assert amendment.startswith(f'  - [superseded by {_NEW_ID} · amendment · '), lines
+        assert sighting.startswith(f'  - [superseded by {_NEW_ID} · sighting · '), lines
+
+    @pytest.mark.parametrize('mark', ['', 123], ids=['empty', 'not-a-str'])
+    def test_an_unreadable_mark_renders_the_plain_tag(self, mark):
+        entry = _dated(_result(
+            '1', 'Old text.', metadata={SUPERSEDED_BY_METADATA_KEY: mark}, source_store='mem0',
+        ))
+
+        assert render_memory_results((entry,)) == (
+            '- [preferences_and_norms · 2026-08-15 · mem0] Old text.'
+        )
+
+
 def _recorded_results(name: str) -> tuple:
     reply = parse_search_reply(recorded_search_text(name))
     assert isinstance(reply, SearchReply), reply
@@ -693,6 +779,74 @@ def _line_index(lines: list[str], predicate) -> int:
     return index
 
 
+_COUNTED_CUT = re.compile(r'…\[\+\d+ chars elided\]$')
+
+#: Where the digest that grouped reads carried before task 7518 cut every amendment.
+_PRE_7518_DIGEST_CHARS = 240
+
+
+def _amendment_body_parent() -> dict:
+    reply = parse_search_reply(
+        recorded_search_text('ten-amendments-over-the-cap', fixtures=AMENDMENT_BODY_FIXTURES),
+    )
+    assert isinstance(reply, SearchReply), reply
+    [parent] = reply.results
+    return parent
+
+
+class TestAmendmentBodyRender:
+    """A parent's amendments render as their text up to the cap, and their bullets are bounded.
+
+    The input is a reply recorded from the real fused-memory ``search`` tool
+    (``fixtures/grouped_search_amendment_bodies/PROVENANCE.md``): one parent
+    with the ten amendments a grouped document lists at most, each longer than
+    the amendment text cap.
+    """
+
+    def test_each_amendment_shows_its_late_detail_and_a_counted_cut(self):
+        lines = render_memory_results((_amendment_body_parent(),)).splitlines()
+
+        bullets = [line for line in lines if line.startswith(AMENDMENT_BULLET)]
+        assert len(bullets) == 10, lines
+        for index, bullet in enumerate(bullets):
+            text = bullet.split('] ', 1)[1]
+            assert text.index(f'DETAIL-{index:02d}') > _PRE_7518_DIGEST_CHARS, text
+            assert _COUNTED_CUT.search(text), text[-60:]
+
+    def test_a_full_amendment_list_renders_within_its_ceiling(self):
+        parent = _amendment_body_parent()
+        amendments = parent['grouped']['amendments']
+
+        listed = amendment_list_chars(render_memory_results((parent,)))
+
+        assert len(amendments) == 10
+        assert listed >= sum(len(child['content']) for child in amendments)
+        assert listed <= WORST_CASE_AMENDMENT_LIST_CHARS, listed
+
+
+class TestThePre7518DigestFallback:
+    """A pre-7518 fused-memory sends an amendment's text as ``digest``, not ``content``.
+
+    ``memory_recall._entry_text`` reads it so a briefing still renders while
+    fused-memory and the orchestrator fleet are redeployed at different times.
+    Ticket tkt_0RWT7YKEWFG8K4RCHPT6ZAQTGK deletes the fallback and this class
+    once both run past task 7518.
+    """
+
+    def test_an_amendment_carrying_only_a_digest_renders_it(self):
+        parent = _grouped_parent(grouped={
+            'amendments': [
+                {'id': 'a1', 'digest': 'PRE-7518 DIGEST BODY', 'created_at': None,
+                 'kind': 'amendment', 'metadata': {'project_id': 'dark_factory'}},
+            ],
+            'amendment_count': 1,
+        })
+
+        rendered = render_memory_results((parent,))
+
+        assert '  - [amendment · undated · mem0] PRE-7518 DIGEST BODY' in rendered, rendered
+
+
 class TestContestingChildRender:
     """A child that contests its parent renders in full, first, and once.
 
@@ -706,7 +860,6 @@ class TestContestingChildRender:
         parent = _grouped_parent_of(results)
         contesting = _amendment(parent, contested=True)
         full_body = _top_level(results, contesting['id'])['content']
-        assert contesting['digest'].endswith('…')
 
         rendered = render_memory_results(results)
 
@@ -716,9 +869,8 @@ class TestContestingChildRender:
         ]
         assert len(contests) == 1, rendered
         assert contests[0].endswith(f'] {full_body}')
-        assert contesting['digest'] not in rendered
 
-    def test_it_renders_ahead_of_the_parents_other_digests(self):
+    def test_it_renders_ahead_of_the_parents_other_amendments(self):
         results = _recorded_results('child-also-matched')
         parent = _grouped_parent_of(results)
         amendments = parent['grouped']['amendments']
@@ -729,7 +881,7 @@ class TestContestingChildRender:
 
         parent_at = _line_index(lines, lambda line: line.endswith(f'] {parent["content"]}'))
         contests_at = _line_index(lines, lambda line: line.startswith(_CONTESTING_BULLET))
-        plain_at = _line_index(lines, lambda line: line.endswith(f'] {plain["digest"]}'))
+        plain_at = _line_index(lines, lambda line: line.endswith(f'] {plain["content"]}'))
         assert parent_at < contests_at < plain_at, lines
 
     def test_the_contesting_child_is_rendered_once(self):
@@ -739,21 +891,48 @@ class TestContestingChildRender:
 
         assert render_memory_results(results).count(full_body) == 1
 
-    def test_a_digest_only_contesting_child_is_still_marked_and_first(self):
+    def test_a_parent_only_contesting_child_renders_in_full_and_first(self):
         results = _recorded_results('only-parent-matched')
         parent = _grouped_parent_of(results)
         contesting = _amendment(parent, contested=True)
         plain = _amendment(parent, contested=False)
+        full_body = _top_level(_recorded_results('child-also-matched'), contesting['id'])['content']
 
-        lines = render_memory_results(results).splitlines()
+        rendered = render_memory_results(results)
 
+        lines = rendered.splitlines()
         contests_at = _line_index(lines, lambda line: line.startswith(_CONTESTING_BULLET))
-        plain_at = _line_index(lines, lambda line: line.endswith(f'] {plain["digest"]}'))
+        plain_at = _line_index(lines, lambda line: line.endswith(f'] {plain["content"]}'))
         assert contests_at < plain_at, lines
-        assert lines[contests_at].endswith(f'] {contesting["digest"]}')
+        assert lines[contests_at].endswith(f'] {full_body}'), lines
+        assert rendered.count(full_body) == 1, rendered
+
+    def test_the_childs_own_hit_outranks_the_capped_grouped_text(self):
+        results = _recorded_results('child-also-matched')
+        parent = _grouped_parent_of(results)
+        contesting = _amendment(parent, contested=True)
+        full_body = _top_level(results, contesting['id'])['content']
+        capped = {**contesting, 'content': full_body[:50] + elision_marker(len(full_body) - 50)}
+        grouped = {
+            **parent['grouped'],
+            'amendments': [
+                capped if child is contesting else child
+                for child in parent['grouped']['amendments']
+            ],
+        }
+        recapped = tuple(
+            {**entry, 'grouped': grouped} if entry is parent else entry for entry in results
+        )
+
+        rendered = render_memory_results(recapped)
+
+        lines = rendered.splitlines()
+        contests_at = _line_index(lines, lambda line: line.startswith(_CONTESTING_BULLET))
+        assert lines[contests_at].endswith(f'] {full_body}'), lines
+        assert 'chars elided]' not in rendered
 
     @pytest.mark.parametrize('name', ['child-also-matched', 'only-parent-matched'])
-    def test_an_uncontested_digest_renders_unchanged(self, name):
+    def test_an_uncontested_amendment_renders_its_text(self, name):
         lines = render_memory_results(_recorded_results(name)).splitlines()
 
         assert (
@@ -797,7 +976,7 @@ class TestContestingChildRender:
         contests_at = _line_index(lines, lambda line: line.startswith(_CONTESTING_BULLET))
         assert ' · graphiti] ' in lines[contests_at], lines
 
-    def test_a_digest_only_contesting_child_renders_under_its_parents_store(self):
+    def test_a_parent_only_contesting_child_renders_under_its_parents_store(self):
         results = _recorded_results('only-parent-matched')
         parent = _grouped_parent_of(results)
         moved = tuple(
@@ -809,6 +988,15 @@ class TestContestingChildRender:
 
         contests_at = _line_index(lines, lambda line: line.startswith(_CONTESTING_BULLET))
         assert ' · graphiti] ' in lines[contests_at], lines
+
+
+def _numbered_facts(count: int) -> list[str]:
+    """Distinct facts, zero-padded so that none is a substring of another."""
+    return [f'Task 3609 fact {i:02d}.' for i in range(count)]
+
+
+def _bullet_lines(lines: list[str]) -> list[str]:
+    return [line for line in lines if line.startswith('- ')]
 
 
 class TestRenderEntityBlock:
@@ -829,6 +1017,116 @@ class TestRenderEntityBlock:
             '**Task 3609** — Project-scopes the briefing context block.',
             '- Task 3609 landed as commit abc123. (2026-09-14)',
             '- Task 3609 is related to task 3212.',
+        ]
+
+    def test_a_summary_equal_to_the_joined_facts_renders_each_fact_once(self):
+        facts = [
+            'Task 3609 project-scopes the briefing context block.',
+            'Task 3609 landed as commit abc123.',
+            'Task 3609 is related to task 3212.',
+        ]
+        summary = '\n'.join(facts)
+        payload = {
+            'nodes': [_node('Task 3609', summary)],
+            'edges': [_edge(fact) for fact in facts] + [_edge(facts[1])],
+        }
+
+        rendered = render_entity_block(payload, 'Task 3609')
+
+        assert [rendered.count(fact) for fact in facts] == [1, 1, 1], rendered
+        assert not _bullet_lines(rendered.splitlines())
+        assert rendered == '**Task 3609** — ' + summary
+
+    def test_a_fact_the_summary_states_mid_line_is_not_repeated(self):
+        fact = 'Task 3609 is related to task 3212.'
+        payload = {
+            'nodes': [_node('Task 3609', f'Task 3609 landed as commit abc123. {fact}')],
+            'edges': [_edge(fact)],
+        }
+
+        assert not _bullet_lines(render_entity_block(payload, 'Task 3609').splitlines())
+
+    def test_a_fact_that_only_prefixes_a_longer_summary_sentence_still_renders(self):
+        payload = {
+            'nodes': [_node('Task 1', 'Task 1 blocks task 20.')],
+            'edges': [_edge('Task 1 blocks task 2')],
+        }
+
+        assert _bullet_lines(render_entity_block(payload, 'Task 1').splitlines()) == [
+            '- Task 1 blocks task 2',
+        ]
+
+    def test_an_edge_the_summary_does_not_contain_still_renders(self):
+        held = 'Task 3609 landed as commit abc123.'
+        payload = {
+            'nodes': [_node('Task 3609', held)],
+            'edges': [_edge(held), _edge('Task 3609 is related to task 3212.')],
+        }
+
+        assert render_entity_block(payload, 'Task 3609').splitlines() == [
+            f'**Task 3609** — {held}',
+            '- Task 3609 is related to task 3212.',
+        ]
+
+    def test_a_fact_carried_by_two_edges_renders_once(self):
+        fact = 'Task 3609 is related to task 3212.'
+        payload = {
+            'nodes': [_node('Task 3609')],
+            'edges': [_edge(fact), _edge(fact, valid_at='2026-09-14T07:58:01+00:00')],
+        }
+
+        lines = render_entity_block(payload, 'Task 3609').splitlines()
+
+        assert _bullet_lines(lines) == [f'- {fact} (2026-09-14)']
+
+    def test_an_n_edge_node_renders_the_cap_and_names_the_rest(self):
+        facts = _numbered_facts(ENTITY_BLOCK_MAX_EDGES + 3)
+        payload = {'nodes': [_node('Task 3609')], 'edges': [_edge(fact) for fact in facts]}
+
+        lines = render_entity_block(payload, 'Task 3609').splitlines()
+
+        assert _bullet_lines(lines) == [f'- {fact}' for fact in facts[:ENTITY_BLOCK_MAX_EDGES]]
+        assert lines[-1] == ENTITY_EDGES_OMITTED_NOTICE.format(count=3, name='Task 3609')
+
+    def test_a_node_at_the_cap_has_no_omission_line(self):
+        facts = _numbered_facts(ENTITY_BLOCK_MAX_EDGES)
+        payload = {'nodes': [_node('Task 3609')], 'edges': [_edge(fact) for fact in facts]}
+
+        lines = render_entity_block(payload, 'Task 3609').splitlines()
+
+        assert len(_bullet_lines(lines)) == ENTITY_BLOCK_MAX_EDGES
+        assert lines[-1].startswith('- '), lines
+
+    def test_the_newest_dated_edges_win_the_cap(self):
+        facts = _numbered_facts(ENTITY_BLOCK_MAX_EDGES + 2)
+        dated = [
+            (fact, f'{date(2026, 9, 1) + timedelta(days=i)}T00:00:00+00:00')
+            for i, fact in enumerate(facts[:ENTITY_BLOCK_MAX_EDGES])
+        ]
+        undated = facts[ENTITY_BLOCK_MAX_EDGES:]
+        payload = {
+            'nodes': [_node('Task 3609')],
+            'edges': [_edge(fact, valid_at=at) for fact, at in dated]
+            + [_edge(fact) for fact in undated],
+        }
+
+        lines = render_entity_block(payload, 'Task 3609').splitlines()
+
+        assert _bullet_lines(lines) == [f'- {fact} ({at[:10]})' for fact, at in reversed(dated)]
+        assert not [line for line in lines if any(fact in line for fact in undated)]
+        assert lines[-1] == ENTITY_EDGES_OMITTED_NOTICE.format(count=2, name='Task 3609')
+
+    def test_a_fact_the_summary_holds_does_not_spend_a_cap_slot(self):
+        held = 'Task 3609 held fact.'
+        others = _numbered_facts(ENTITY_BLOCK_MAX_EDGES)
+        payload = {
+            'nodes': [_node('Task 3609', held)],
+            'edges': [_edge(held)] + [_edge(fact) for fact in others],
+        }
+
+        assert render_entity_block(payload, 'Task 3609').splitlines() == [
+            f'**Task 3609** — {held}',
+            *(f'- {fact}' for fact in others),
         ]
 
     def test_a_fuzzy_neighbour_renders_nothing(self):

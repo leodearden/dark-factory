@@ -1,0 +1,42 @@
+{
+  "task_id": "8524",
+  "reason": "step-8: _remerge carries a RemergeClaim (claim-or-take, release-on-raise, single stamp), _remerge_on_tip stacks on the live tip, fell_to_main replaces the remerge_recovery bool, and a vacated link anywhere below the tip now names tip_vacated - net-additive policy beta work (plans/merge-lane-policy-prd.md D1)",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/remerge_base.py",
+      "baseline": 32,
+      "current": 33
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/remerge_base.py::_fall_to_main_reason",
+      "baseline": 8,
+      "current": 9
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/types.py",
+      "baseline": 90,
+      "current": 91
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+      "baseline": 1947,
+      "current": 1953
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::_remerge",
+      "baseline": 0,
+      "current": 4
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5112,
+      "current": 5120
+    }
+  ]
+}

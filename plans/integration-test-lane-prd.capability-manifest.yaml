@@ -66,3 +66,5 @@ tasks:
       kind: manual
       reason: the deploy + the orchestrator log lines (worker started; qdrant-integration
         sub-run head=...) ARE the check; leaf gates nothing downstream
+signal_leaves:
+- γ

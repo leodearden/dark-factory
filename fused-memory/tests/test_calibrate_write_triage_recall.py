@@ -446,7 +446,7 @@ class TestCommittedRecallIsProductionShaped:
     @functools.cache
     def _committed() -> tuple[str, Path, dict]:
         """config.yaml's `calibration_report_path`, where it resolves, and the report."""
-        import yaml  # noqa: PLC0415
+        import yaml
 
         cls = TestCommittedRecallIsProductionShaped
         named = yaml.safe_load(cls.CONFIG_PATH.read_text())['write_triage'][

@@ -25,7 +25,8 @@ recon-stage-specific either.
   :data:`fused_memory.reconciliation.recon_self_model.EXECUTION_CLASSES`,
   imported rather than redefined so this exemption set can never drift from
   the canonical vocabulary) — an honest non-code declaration is not a
-  mismatch to flag.
+  mismatch to flag. The metadata is read through
+  :func:`fused_memory.middleware.metadata_dict.raw_metadata_dict`.
 - ``metadata.files`` is non-empty (parsed via
   :func:`fused_memory.middleware.lock_charter_guard.extract_files`) — a
   declared code deliverable means this is not a files-less operational ask.
@@ -33,12 +34,8 @@ recon-stage-specific either.
   anywhere across title/description/details, scanned on STAMP-STRIPPED text
   (see "Provenance-stamp carve-out" below) — mirrors
   ``operational_ask_registry._CODE_CHANGE_TITLE_SIGNALS``'s word set,
-  defined locally here rather than imported across the module boundary
-  (this codebase's established convention — see ``routing_intent_guard``,
-  ``execution_class_guard``, ``deterministic_task_guard``, and
-  ``model_overrides_guard``, which each keep their own local
-  ``_parse_metadata`` rather than importing a private helper from a sibling
-  module). Unlike ``operational_ask_registry`` (title-only scope) and like
+  defined locally here rather than imported across the module boundary as a
+  private name. Unlike ``operational_ask_registry`` (title-only scope) and like
   ``routing_intent_guard`` (combined-text scope), this scans the combined
   title + description + details text — the defense against a genuine code
   task whose prose merely MENTIONS operational terminology in passing.
@@ -101,13 +98,13 @@ This module is declaration-only and WARN-ONLY: it never coerces
 
 from __future__ import annotations
 
-import json
 import logging
 import re
 from dataclasses import dataclass
 from typing import Any
 
 from fused_memory.middleware.lock_charter_guard import extract_files
+from fused_memory.middleware.metadata_dict import raw_metadata_dict
 from fused_memory.reconciliation.recon_self_model import EXECUTION_CLASSES
 
 logger = logging.getLogger(__name__)
@@ -229,29 +226,6 @@ class OperationalSuggestionFinding:
     fields: tuple[str, ...]
 
 
-def _parse_metadata(metadata: Any) -> dict:
-    """Return *metadata* as a dict (best-effort; unknown shapes -> {}).
-
-    Mirrors ``routing_intent_guard._parse_metadata`` / ``execution_class_guard
-    ._parse_metadata``: None -> {}; empty string -> {}; dict -> returned
-    as-is; JSON string -> parsed dict (or {} on parse failure / non-dict
-    result); anything else -> {}.
-    """
-    if metadata is None:
-        return {}
-    if isinstance(metadata, dict):
-        return metadata
-    if isinstance(metadata, str):
-        if not metadata:
-            return {}
-        try:
-            parsed = json.loads(metadata)
-        except json.JSONDecodeError:
-            return {}
-        return parsed if isinstance(parsed, dict) else {}
-    return {}
-
-
 def operational_suggestion_finding(
     title: str | None,
     description: str | None,
@@ -276,10 +250,11 @@ def operational_suggestion_finding(
     if task_kind != 'normal':
         return None
 
-    if _parse_metadata(metadata).get('execution_class') in _EXEMPT_EXECUTION_CLASSES:
+    meta = raw_metadata_dict(metadata, source='operational_suggestion_guard')
+    if meta.get('execution_class') in _EXEMPT_EXECUTION_CLASSES:
         return None
 
-    if extract_files(metadata):
+    if extract_files(meta):
         return None
 
     fields: dict[str, str] = {

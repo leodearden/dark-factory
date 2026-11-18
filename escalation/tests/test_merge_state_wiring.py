@@ -48,10 +48,10 @@ try:
         GitConfig,
         OrchestratorConfig,
     )
-    from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+    from orchestrator.merge_lane.types import MergeOutcome
+    from orchestrator.merge_lane.worker import (
         InFlightMergeRegistry,
     )
-    from orchestrator.merge_types import MergeOutcome  # type: ignore[reportMissingImports]
     _ORCHESTRATOR_AVAILABLE = True
 except ImportError:
     _ORCHESTRATOR_AVAILABLE = False
@@ -309,15 +309,21 @@ class TestMergeCancelEmitsCancelStates:
         # superseded is precisely the member DEFECT 1's docstring omitted.
         assert result['state'] == MergeState.superseded
 
-    async def test_no_waiter_live_hit_returns_live_member(self, tmp_path: Path) -> None:
-        server = _server(
-            tmp_path, types.SimpleNamespace(_merge_worker=_live_worker('verifying'))
+    async def test_no_waiter_live_hit_the_lane_refuses_returns_live_member(
+        self, tmp_path: Path,
+    ) -> None:
+        from orchestrator.merge_lane import MergeCancelRefusal, MergeCancelVerdict
+
+        worker = _live_worker('finalizing')
+        worker.cancel_request = lambda request_id: MergeCancelVerdict(
+            request_id, MergeCancelRefusal.FINALIZE_WINDOW,
         )
+        server = _server(tmp_path, types.SimpleNamespace(_merge_worker=worker))
         result = await call_merge_cancel(server, request_id='mr-live')
 
         assert result['cancelled'] is False
         _assert_is_member(result['state'], CANCEL_STATES, 'merge_cancel no-waiter live hit')
-        assert result['state'] == MergeState.verifying
+        assert result['state'] == MergeState.finalizing
 
     async def test_pending_waiter_returns_abandoned_member(self, tmp_path: Path) -> None:
         server = self._queue_server(tmp_path)

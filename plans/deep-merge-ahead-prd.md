@@ -69,9 +69,14 @@ Pending (non-blocking, confirmatory): the study's S/C control re-runs
    its normal sequential path later.
 5. **Failure policy: halve on fail, reset on pass.** Tip fail at depth d →
    next round builds at max(1, ⌊d/2⌋); any pass resets to min(queue, cap).
-   Consecutive failures log-bisect toward the bad item; the floor (d=1) is
+   A red tip names no culprit, so after one the owner and every link each
+   verify un-chained once, on their own tree, before any of them may be
+   chained again (task 10617): the bad item is verified alone and blocks,
+   and the good members land. A request whose outcome is already decided
+   (cancelled or resolved) is never chained. The floor (d=1) is
    byte-identical to today's adjacent verify. No separate rolling-flake
-   suppressor in v1 (halving is the degradation mechanism; revisit in θ).
+   suppressor in v1 (halving bounds the next chain of untested requests;
+   the un-chained round is what isolates the bad item; revisit in θ).
 6. **Cap staging: 6 → 32 ("uncapped-in-practice").** Ship enabled at
    `chain_cap=6` (the study-validated depth), promote to 32 (≥2× max
    observed queue depth; still bounds wall vs the 7200 s timeout) via the
@@ -162,7 +167,9 @@ Phase 3 — observability + rollout:
   `analyze_speculation_depth.py`. Depth histogram + items-per-verify +
   deep-fail rate in the merge report; reader keys on `chain_items`. Signal:
   report renders from live events; reader output matches git-derived truth
-  on fixtures. Prereqs: δ.
+  on fixtures. Prereqs: δ. Landed (task 3188): the merge report is the
+  orchestrator digest's `## Deep merge-ahead chains` section, and
+  `analyze_speculation_depth.py` keys on `chain_items`.
 - **ζ — reify canary enable at cap=6.** Deterministic deploy task
   (`before_done` script: set `merge_deep.chain_cap: 6` in reify's
   `dark-factory-orchestrator.yaml`, commit, reload, assert `applied`).
@@ -201,7 +208,35 @@ Phase 3 — observability + rollout:
 - Landing invariant: tip pass ⇒ walk links in order through the existing
   CAS advance; each landed item gets its normal finalize path + events;
   first CAS failure aborts the walk (remaining items stay queued). Tip fail
-  ⇒ chain discarded, zero queue mutation, head path unaffected.
+  ⇒ chain discarded, zero queue mutation, head path unaffected, and every
+  member's next dispatch verifies un-chained (decision 5).
+- Dispatch contract (task 7720). Before it, the merger took a chain's
+  followers during the tip verify, and production walks logged "landed 0 of
+  N chained link(s)".
+  - **Reservation**: the chain's candidates are reserved from the snapshot
+    to the round's end (`merge_lane/chain_reservation.py`). A reserved
+    request stays buffered but is invisible to the pick, the coalescer and
+    the suffix bounce, so only the walk takes it.
+  - **Time limit**: a confirmed reservation lasts
+    `merge_deep.chain_reservation_timeout_secs` (default 7200, green tier,
+    read at confirm). On expiry the links go back to the ordinary pipeline
+    with a WARNING. The tip verify runs on, and the walk lands only what is
+    still buffered.
+  - **Dead tip**: when the links do not all land (tip fail or raise, abort,
+    expiry, a partial walk, a passed tip torn down before its finalize (the
+    head-failure cascade, or behind a gate-dispatched rebased head)), the tip
+    is recorded dead
+    (`DeadBaseSite.CHAIN_RELEASED`), so INV-3 re-merges or voids anything
+    stacked on it.
+  - **Successor base**: what successors of a chained entry stack on is its
+    chain tip (`remerge_base.py::entry_successor_base`). The next item is
+    merged onto the tip and needs only its own look-ahead permit.
+  - **Look-ahead hold**: when cap>0, the merger waits, before its look-ahead
+    pop, for the dispatch of the speculative item it just queued
+    (`merge_lane/lookahead_hold.py`). The dispatch publishes the successor
+    base above, so the pop cannot take a follower first. With no free host
+    the merger waits and the followers stay buffered. Requests arriving
+    while it waits are buffered too, so the dispatch can chain them.
 - Kill switch: cap=0 ⇒ no chain code executes on any dispatch path
   (byte-identity, asserted by test).
 - Telemetry: `merge_verify.chain_items >= 1` on every merge verify;
@@ -214,13 +249,13 @@ Phase 3 — observability + rollout:
 | Scenario | Preconditions | Postconditions |
 |---|---|---|
 | Tip pass lands full prefix | 4-item clean chain, tip verify green | 4 in-order landings, one verify, `landed_via_chain=4`, audits green |
-| Tip fail leaves queue intact | chain built, tip verify red | zero landings via chain, items still queued, halving state = 2 |
-| Halving walk isolates bad item | item 3 of 6 genuinely red | depths 6→3→1 over rounds; items 1–2 land sequentially at floor; deep resumes after bad item blocks |
+| Tip fail leaves queue intact | chain built, tip verify red | zero landings via chain, items still queued, halving state = 2; no member is chained again before it has verified alone |
+| Red chain isolates bad item | item 3 of 6 genuinely red | one red chain; then each member verifies alone: item 3 blocks, the others land; deep resumes after bad item blocks |
 | Chain conflict truncates silently | item 2 conflicts with item 1 textually | chain = [item 1], no conflict outcome for item 2, item 2 handled sequentially later |
 | Head-fail + tip-pass | head verify red (flake), tip green | full prefix lands (tip authoritative), head verify cancelled |
 | Stale CAS aborts walk | main advanced externally mid-verify | walk aborts at first CAS failure; unlanded items requeue; next round rebuilds |
 | Kill switch byte-identity | cap=0 | dispatch/behavior identical to pre-PRD golden transcript |
-| Deep fails never feed thrash guard | 2 consecutive tip fails | zero blocked MergeOutcomes, `consecutive_merge_thrash` untouched (3003's signature class cannot recur via chains) |
+| Deep fails never feed thrash guard | 2 consecutive tip fails (disjoint members) | zero blocked MergeOutcomes, `consecutive_merge_thrash` untouched (3003's signature class cannot recur via chains) |
 | Lease released on head-cancel | tip pass cancels in-flight head verify | `warm-lane-lock-guard.sh check` (3071's oracle) reads IDLE within one round |
 | Hot-reload | cap 0→6 via reload_config | next dispatch round builds a chain; no restart |
 | Timeout margin | 16-item chain (cap 32) | verify completes ≪ 7200 s or times out cleanly via existing path |
@@ -246,6 +281,7 @@ Phase 3 — observability + rollout:
 3. **η1 predicate thresholds** — exact numeric gates derived from the first
    soak week's baseline; the script owns the comparison per the predicate
    contract. Decide when authoring η1's script.
-4. **`depth` field back-compat** — keep emitting legacy `depth` alongside
-   `chain_items` or retire it. Suggested: keep one release, then retire.
-   Decide in ε.
+4. ~~`depth` field back-compat~~ **RESOLVED 10-20 (ε, task 3188)**: keep
+   emitting legacy `depth` alongside `chain_items` for one release; where both
+   are present `chain_items` is authoritative, and `depth`-only rows are
+   counted, never bucketed. Retirement is owned by task 4767.

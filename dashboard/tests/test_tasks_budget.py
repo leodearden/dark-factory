@@ -3,9 +3,11 @@
 Companion to ``test_healthz_deadline.py::test_healthz_budget_is_structurally
 _deliverable``, and deliberately written in the same idiom: assert on the
 SHIPPED constants (no monkeypatching, no fakes, no event loop), derive every
-count from an introspectable roster rather than hard-coding it, and parse the
-caller-side ceiling out of the source that actually ships rather than
-restating it.
+count from an introspectable roster rather than hard-coding it, and take the
+caller-side ceiling from the code that actually ships rather than restating
+it: the abort data.js arms for /tasks, read by running its production poll
+through ``dashboard/tests/js/_abort_delay_probe.mjs`` rather than parsed out
+of its source.
 
 The bug class this closes is arithmetic, not behavioural: a budget whose
 parts do not fit inside its whole cannot deliver its own degraded payload.
@@ -27,37 +29,19 @@ budget walks into (c), and tightening ``data.js``'s abort to accommodate
 
 from __future__ import annotations
 
-import re
-from pathlib import Path
-
 import pytest
+from _browser_abort import browser_abort_ms
 
 from dashboard.data import active_tasks, mcp_fanout, task_lookup, task_snapshot, tasks
 
 # The tightest real caller of /api/v2/dashboard/tasks is the dashboard's own
-# poll loop, whose fetch wrapper aborts at DEFAULT_TIMEOUT_MS. Parsed out of
-# the shipped source rather than hard-coded, for the same reason the healthz
-# test derives its probe count from _healthz_db_targets(): a hard-coded copy
-# silently stops tracking reality the moment the real value moves.
-_DATA_JS = (
-    Path(active_tasks.__file__).parent.parent / 'static' / 'redux' / 'data.js'
-)
-_ABORT_MS_RE = re.compile(r'DEFAULT_TIMEOUT_MS\s*=\s*(\d+)')
-
-
-def _browser_abort_ms() -> int:
-    """The browser-side fetch abort, in ms, read from the shipped data.js."""
-    source = _DATA_JS.read_text(encoding='utf-8')
-    match = _ABORT_MS_RE.search(source)
-    # A rename of the JS constant must fail LOUDLY here rather than silently
-    # skipping the ceiling check — a check that quietly stops checking is
-    # indistinguishable from a passing one.
-    assert match is not None, (
-        f'could not find DEFAULT_TIMEOUT_MS in {_DATA_JS} — if the constant '
-        'was renamed, update _ABORT_MS_RE; do not delete this assertion, or '
-        'the handler budget loses its only ceiling'
-    )
-    return int(match.group(1))
+# poll loop, whose fetch wrapper aborts the request after the delay data.js
+# arms for it. That delay is measured by running data.js's production poll
+# (dashboard/tests/js/_abort_delay_probe.mjs) rather than hard-coded, for the
+# same reason the healthz test derives its probe count from
+# _healthz_db_targets(): a hard-coded copy silently stops tracking reality the
+# moment the real value moves.
+_TASKS_ENDPOINT = '/api/v2/dashboard/tasks'
 
 
 def test_tasks_budget_is_structurally_deliverable() -> None:
@@ -97,9 +81,9 @@ def test_tasks_budget_is_structurally_deliverable() -> None:
     per_call = task_snapshot.PER_CALL_TIMEOUT
     shared_per_call = tasks.DEFAULT_PER_CALL_TIMEOUT
     calls = task_snapshot.PER_PROJECT_MCP_CALLS
-    per_project = active_tasks._TASKS_PER_PROJECT_BUDGET
-    total = active_tasks._TASKS_TOTAL_BUDGET
-    concurrency = active_tasks._TASKS_ROOT_CONCURRENCY
+    per_project = active_tasks.TASKS_BUDGET.per_project
+    total = active_tasks.TASKS_BUDGET.total
+    concurrency = active_tasks.TASKS_BUDGET.root_concurrency
 
     assert len(calls) > 0, (
         'PER_PROJECT_MCP_CALLS must enumerate the real per-project bounded '
@@ -123,11 +107,12 @@ def test_tasks_budget_is_structurally_deliverable() -> None:
     )
 
     # (c) the handler's degraded payload must survive the browser's abort.
-    abort_ms = _browser_abort_ms()
+    abort_ms = browser_abort_ms(_TASKS_ENDPOINT)
     assert total * 1000 < abort_ms, (
         f'whole-handler budget {total}s ({total * 1000}ms) is not strictly '
-        f'below the browser fetch abort of {abort_ms}ms (data.js '
-        'DEFAULT_TIMEOUT_MS) — the degraded payload would be aborted before '
+        f'below the browser fetch abort of {abort_ms}ms (the abort data.js '
+        f'arms for {_TASKS_ENDPOINT}, per _abort_delay_probe.mjs) — the '
+        'degraded payload would be aborted before '
         'it could be rendered, which is the 15s-behind-a-5s-caller bug that '
         'test_healthz_deadline.py exists to prevent'
     )
@@ -163,7 +148,7 @@ def test_tasks_budget_is_structurally_deliverable() -> None:
 
     # (f) CONCURRENCY: parallel, but bounded.
     assert concurrency > 1, (
-        f'_TASKS_ROOT_CONCURRENCY is {concurrency} — at 1 this is the '
+        f'TASKS_BUDGET.root_concurrency is {concurrency} — at 1 this is the '
         'SEQUENTIAL walk that caused the starvation this constant exists to '
         'fix: with N roots the wall clock is the SUM of the per-root costs, '
         'so the tail roots consistently exhausted _TASKS_TOTAL_BUDGET and '
@@ -171,14 +156,10 @@ def test_tasks_budget_is_structurally_deliverable() -> None:
         'entire point of the constant.'
     )
     assert concurrency <= 8, (
-        f'_TASKS_ROOT_CONCURRENCY is {concurrency} — the walk must stay '
-        'BOUNDED. burndown.py records the measurement: a full fan-out over '
-        'every root hits a SINGLE fused-memory server where the requests '
-        'serialise server-side, on the SAME shared httpx client the 3s render '
-        'polls use, which is "a live httpx.PoolTimeout risk for request-path '
-        'handlers" (see burndown._SNAPSHOT_PAGE_SIZE and '
-        '_fetch_snapshot_tasks). An unbounded gather trades this endpoint\'s '
-        'latency for every other endpoint\'s availability.'
+        f'TASKS_BUDGET.root_concurrency is {concurrency} — the walk must stay '
+        'BOUNDED; see the WHY BOUNDED comment on '
+        'active_tasks._TASKS_ROOT_CONCURRENCY. An unbounded gather trades '
+        'this endpoint\'s latency for every other endpoint\'s availability.'
     )
 
     # (g) at least one project's budget fits inside the whole. See the
@@ -195,8 +176,8 @@ def test_tasks_budget_is_structurally_deliverable() -> None:
     'enclosing_deadline',
     [
         pytest.param(
-            active_tasks._TASKS_PER_PROJECT_BUDGET,
-            id='active_tasks._TASKS_PER_PROJECT_BUDGET',
+            active_tasks.TASKS_BUDGET.per_project,
+            id='active_tasks.TASKS_BUDGET.per_project',
         ),
         pytest.param(
             task_lookup.LOOKUP_BUDGET_SECONDS,
@@ -210,14 +191,14 @@ def test_lock_acquire_bound_is_unreachable_under_each_bounded_caller(
     """Each caller the reachability paragraph names must time out before the lock bound.
 
     One param per enclosing deadline that the paragraph above
-    ``mcp_fanout._LOCK_ACQUIRE_TIMEOUT_SECONDS`` calls unreachable; the
+    ``mcp_fanout.LOCK_ACQUIRE_TIMEOUT_SECONDS`` calls unreachable; the
     derivation lives there, not here.
     """
-    lock_bound = mcp_fanout._LOCK_ACQUIRE_TIMEOUT_SECONDS
+    lock_bound = mcp_fanout.LOCK_ACQUIRE_TIMEOUT_SECONDS
 
     assert lock_bound > enclosing_deadline, (
         f'lock bound {lock_bound}s <= enclosing deadline {enclosing_deadline}s; '
         'see the reachability paragraph above '
-        'mcp_fanout._LOCK_ACQUIRE_TIMEOUT_SECONDS and update it deliberately '
+        'mcp_fanout.LOCK_ACQUIRE_TIMEOUT_SECONDS and update it deliberately '
         'rather than retuning a constant just to pass'
     )

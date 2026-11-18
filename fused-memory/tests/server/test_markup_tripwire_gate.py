@@ -86,7 +86,7 @@ def _pass_through(mock_service: AsyncMock, method: str) -> None:
     An unspecced AsyncMock chains AsyncMock all the way down, so
     ``result.model_dump()`` would be an unawaited coroutine unless the return
     value is an explicit MagicMock (mirrors
-    test_add_memory_near_duplicate_gate.py::_configure_pass_through_add_memory).
+    tests/server/write_triage_harness.py::configure_pass_through_add_memory).
     """
     result = MagicMock()
     result.model_dump.return_value = {'id': 'ok'}

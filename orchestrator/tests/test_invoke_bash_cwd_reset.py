@@ -26,6 +26,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from shared.cli_invoke import resolve_claude_binary
 
 from orchestrator.agents.invoke import invoke_agent
 
@@ -62,6 +63,7 @@ def fake_claude(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Callable[[],
     script.chmod(script.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
     monkeypatch.setenv('PATH', f'{bin_dir}{os.pathsep}{os.environ.get("PATH", "")}')
+    assert resolve_claude_binary() == str(script)
     monkeypatch.setenv('FAKE_CLAUDE_ENV_DUMP', str(dump))
     for var in (_RESET_VAR, 'DF_AGENT_CPU_NICE', 'DF_AGENT_CPU_GOVERN'):
         monkeypatch.delenv(var, raising=False)
@@ -113,6 +115,7 @@ async def _dispatch(
 
 
 @pytest.mark.asyncio
+@pytest.mark.spawns_agent_cli
 @_DISPATCH_PATHS
 async def test_dispatched_claude_session_resets_bash_cwd_by_default(
     fake_claude, tmp_path, sandbox_modules, dispatch_context,
@@ -132,6 +135,7 @@ async def test_dispatched_claude_session_resets_bash_cwd_by_default(
 
 
 @pytest.mark.asyncio
+@pytest.mark.spawns_agent_cli
 @_DISPATCH_PATHS
 async def test_explicit_env_override_wins(
     fake_claude, tmp_path, sandbox_modules, dispatch_context,

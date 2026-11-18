@@ -20,20 +20,23 @@ import asyncio
 import logging
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+from _merge_lane_fakes import lane_scene_config
 from _orch_helpers import make_placeholder_future
+from test_merge_queue_concurrent_verify import _inject_two_host_allocator
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
-from orchestrator.merge_queue import MergeRequest, SpeculativeMergeWorker
-from orchestrator.merge_types import (
+from orchestrator.merge_lane.types import (
     InflightEntry,
     ItemLifecycleState,
     QueuedBranch,
     RealMergeItem,
 )
+from orchestrator.merge_lane.worker import MergeRequest, SpeculativeMergeWorker
 from orchestrator.verify_runner import HostAllocator, HostLease
 
 # ---------------------------------------------------------------------------
@@ -52,7 +55,7 @@ def _make_persistent_config(root: Path, *, persistent: bool) -> OrchestratorConf
         push_after_advance=False,
         persistent_merge_worktree=persistent,
     )
-    return OrchestratorConfig(project_root=root, git=git)
+    return lane_scene_config(root, git)
 
 
 # ---------------------------------------------------------------------------
@@ -82,7 +85,7 @@ class TestPerHostInflightBound:
     )
     def test_ceil_semantics(self, bound: int, hosts: int, expected: int) -> None:
         """The worst-case per-host in-flight count is ceil(bound / hosts)."""
-        from orchestrator.merge_liveness import per_host_inflight_bound  # noqa: PLC0415
+        from orchestrator.merge_lane.liveness import per_host_inflight_bound
 
         assert per_host_inflight_bound(bound, hosts) == expected
 
@@ -103,7 +106,7 @@ class TestPerHostInflightBound:
         spuriously permissive 0 would make the fail-closed startup guard stop
         refusing (and the tripwire stop firing) on a nonsense config.
         """
-        from orchestrator.merge_liveness import per_host_inflight_bound  # noqa: PLC0415
+        from orchestrator.merge_lane.liveness import per_host_inflight_bound
 
         assert per_host_inflight_bound(bound, hosts) == 1
 
@@ -122,13 +125,13 @@ class TestSerialLaneGuardUsesSharedBound:
         Un-refactored, ``ceil(2/1) == 2`` would raise.  A no-raise here proves
         the raise decision reads the helper's return value.
         """
-        from orchestrator.merge_liveness import (  # noqa: PLC0415
+        from orchestrator.merge_lane.liveness import (
             enforce_persistent_worktree_serial_lane,
         )
 
         cfg = _make_persistent_config(tmp_path, persistent=True)
         fake = MagicMock(return_value=1)
-        with patch('orchestrator.merge_liveness.per_host_inflight_bound', fake):
+        with patch('orchestrator.merge_lane.liveness.per_host_inflight_bound', fake):
             result = enforce_persistent_worktree_serial_lane(
                 cfg, merge_ahead_bound=2, num_hosts=1
             )
@@ -157,28 +160,28 @@ class TestCheckSerialLaneTripwire:
 
     def test_single_local_dispatch_at_bound_1_is_not_breached(self) -> None:
         """POSITIVE CONTROL: one local verify at bound=1 is the normal case."""
-        from orchestrator.merge_liveness import check_serial_lane_tripwire  # noqa: PLC0415
+        from orchestrator.merge_lane.liveness import check_serial_lane_tripwire
 
         assessment = check_serial_lane_tripwire(1, merge_ahead_bound=1, num_hosts=1)
         assert assessment.breached is False
 
     def test_second_concurrent_local_dispatch_is_breached(self) -> None:
         """The C4 condition (§9 row 10): 2 local verifies at per-host bound 1."""
-        from orchestrator.merge_liveness import check_serial_lane_tripwire  # noqa: PLC0415
+        from orchestrator.merge_lane.liveness import check_serial_lane_tripwire
 
         assessment = check_serial_lane_tripwire(2, merge_ahead_bound=1, num_hosts=1)
         assert assessment.breached is True
 
     def test_third_local_dispatch_is_also_breached(self) -> None:
         """Fires for EVERY excess dispatch, not just the second."""
-        from orchestrator.merge_liveness import check_serial_lane_tripwire  # noqa: PLC0415
+        from orchestrator.merge_lane.liveness import check_serial_lane_tripwire
 
         assessment = check_serial_lane_tripwire(3, merge_ahead_bound=1, num_hosts=1)
         assert assessment.breached is True
 
     def test_idle_lane_is_not_breached(self) -> None:
         """Zero local verifies in flight cannot breach a bound of 1."""
-        from orchestrator.merge_liveness import check_serial_lane_tripwire  # noqa: PLC0415
+        from orchestrator.merge_lane.liveness import check_serial_lane_tripwire
 
         assessment = check_serial_lane_tripwire(0, merge_ahead_bound=1, num_hosts=1)
         assert assessment.breached is False
@@ -190,7 +193,7 @@ class TestCheckSerialLaneTripwire:
         (orchestrator/src/orchestrator/harness.py::Harness._start_merge_worker),
         where the per-host bound is always 1.
         """
-        from orchestrator.merge_liveness import check_serial_lane_tripwire  # noqa: PLC0415
+        from orchestrator.merge_lane.liveness import check_serial_lane_tripwire
 
         assessment = check_serial_lane_tripwire(1, merge_ahead_bound=2, num_hosts=2)
         assert assessment.breached is False
@@ -198,14 +201,14 @@ class TestCheckSerialLaneTripwire:
 
     def test_multi_host_k2_two_local_verifies_is_breached(self) -> None:
         """K=2 across 2 hosts still allows only ONE verify per host."""
-        from orchestrator.merge_liveness import check_serial_lane_tripwire  # noqa: PLC0415
+        from orchestrator.merge_lane.liveness import check_serial_lane_tripwire
 
         assessment = check_serial_lane_tripwire(2, merge_ahead_bound=2, num_hosts=2)
         assert assessment.breached is True
 
     def test_assessment_carries_the_structured_facts_it_used(self) -> None:
         """INV-2: the payload facts are on the assessment, at the values used."""
-        from orchestrator.merge_liveness import (  # noqa: PLC0415
+        from orchestrator.merge_lane.liveness import (
             SerialLaneAssessment,
             check_serial_lane_tripwire,
         )
@@ -227,7 +230,7 @@ class TestCheckSerialLaneTripwire:
         monkeypatch, which the suite also relies on for
         ``enforce_persistent_worktree_serial_lane``.
         """
-        from orchestrator.merge_liveness import check_serial_lane_tripwire  # noqa: PLC0415
+        from orchestrator.merge_lane.liveness import check_serial_lane_tripwire
 
         monkeypatch.setattr('orchestrator.merge_lane.liveness._MERGE_AHEAD_BOUND', 4)
         assessment = check_serial_lane_tripwire(2)
@@ -236,7 +239,7 @@ class TestCheckSerialLaneTripwire:
 
     def test_unpatched_bound_default_is_the_real_engine_constant(self) -> None:
         """Unpatched, the omitted bound is the real _MERGE_AHEAD_BOUND (1)."""
-        from orchestrator.merge_liveness import check_serial_lane_tripwire  # noqa: PLC0415
+        from orchestrator.merge_lane.liveness import check_serial_lane_tripwire
 
         assessment = check_serial_lane_tripwire(2)
         assert assessment.merge_ahead_bound == 1
@@ -259,18 +262,18 @@ class TestAlarmSerialLaneBreach:
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
         """Breached → exactly one WARNING naming the numbers, and one event."""
-        from _recording_event_store import _RecordingEventStore  # noqa: PLC0415
+        from _recording_event_store import _RecordingEventStore
 
-        from orchestrator.merge_liveness import (  # noqa: PLC0415
+        from orchestrator.merge_lane.liveness import (
             alarm_serial_lane_breach,
             check_serial_lane_tripwire,
         )
 
         assessment = check_serial_lane_tripwire(2, merge_ahead_bound=1, num_hosts=1)
         rec = _RecordingEventStore()
-        # merge_liveness.py:58 binds logger = getLogger('orchestrator.merge_queue'),
+        # merge_liveness.py:58 binds logger = getLogger('orchestrator.merge_lane'),
         # NOT __name__ — filter on that name.
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             result = alarm_serial_lane_breach(
                 assessment,
                 event_store=rec,
@@ -317,16 +320,16 @@ class TestAlarmSerialLaneBreach:
         control MUST filter both channels — do not "helpfully" loosen this one
         or tighten that one to match.
         """
-        from _recording_event_store import _RecordingEventStore  # noqa: PLC0415
+        from _recording_event_store import _RecordingEventStore
 
-        from orchestrator.merge_liveness import (  # noqa: PLC0415
+        from orchestrator.merge_lane.liveness import (
             alarm_serial_lane_breach,
             check_serial_lane_tripwire,
         )
 
         assessment = check_serial_lane_tripwire(1, merge_ahead_bound=1, num_hosts=1)
         rec = _RecordingEventStore()
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             result = alarm_serial_lane_breach(
                 assessment,
                 event_store=rec,
@@ -344,13 +347,13 @@ class TestAlarmSerialLaneBreach:
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
         """A store-less worker still gets the loud log (fail-open on telemetry only)."""
-        from orchestrator.merge_liveness import (  # noqa: PLC0415
+        from orchestrator.merge_lane.liveness import (
             alarm_serial_lane_breach,
             check_serial_lane_tripwire,
         )
 
         assessment = check_serial_lane_tripwire(2, merge_ahead_bound=1, num_hosts=1)
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             result = alarm_serial_lane_breach(
                 assessment, event_store=None, task_id='5326', branch='task/5326'
             )
@@ -363,7 +366,7 @@ class TestAlarmSerialLaneBreach:
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
         """A store whose emit() raises must never wedge the dispatch path."""
-        from orchestrator.merge_liveness import (  # noqa: PLC0415
+        from orchestrator.merge_lane.liveness import (
             alarm_serial_lane_breach,
             check_serial_lane_tripwire,
         )
@@ -371,7 +374,7 @@ class TestAlarmSerialLaneBreach:
         assessment = check_serial_lane_tripwire(2, merge_ahead_bound=1, num_hosts=1)
         hostile = MagicMock()
         hostile.emit = MagicMock(side_effect=RuntimeError('boom'))
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             result = alarm_serial_lane_breach(
                 assessment, event_store=hostile, task_id='5326', branch='task/5326'
             )
@@ -427,7 +430,7 @@ def git_ops(git_config: GitConfig, git_repo: Path) -> GitOps:
 @pytest.fixture
 def config(git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
     """Single-host (no verify_runners) OrchestratorConfig."""
-    return OrchestratorConfig(project_root=git_repo, git=git_config)
+    return lane_scene_config(git_repo, git_config)
 
 
 async def _make_branch_with_file(
@@ -552,17 +555,25 @@ class TestSerialLaneTripwireWiredIntoDispatch:
         assert worker._host_allocator is None
         return worker
 
+    def _two_host_worker(self, git_ops: GitOps, rec):
+        """A worker over local + one remote at K = hosts + 1 = 3 (task 8526)."""
+        worker = SpeculativeMergeWorker(
+            git_ops, asyncio.Queue(), event_store=rec, speculation_depth=3,
+        )
+        _inject_two_host_allocator(worker, SimpleNamespace(name='laptop'))
+        return worker
+
     async def test_single_local_dispatch_emits_nothing(
         self, git_ops: GitOps, config: OrchestratorConfig, caplog: pytest.LogCaptureFixture
     ) -> None:
         """POSITIVE CONTROL: one local dispatch at bound=1 must not trip."""
-        from _recording_event_store import _RecordingEventStore  # noqa: PLC0415
+        from _recording_event_store import _RecordingEventStore
 
         rec = _RecordingEventStore()
         worker = self._bare_worker(git_ops, rec)
         item_a = await _make_merged_item(git_ops, config, '9001')
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             worker._inflight_append(self._local_entry(worker, item_a))
 
         assert self._tripwire_events(rec) == []
@@ -572,14 +583,14 @@ class TestSerialLaneTripwireWiredIntoDispatch:
         self, git_ops: GitOps, config: OrchestratorConfig, caplog: pytest.LogCaptureFixture
     ) -> None:
         """PRD §9 row 10: the second concurrent local verify is the C4 breach."""
-        from _recording_event_store import _RecordingEventStore  # noqa: PLC0415
+        from _recording_event_store import _RecordingEventStore
 
         rec = _RecordingEventStore()
         worker = self._bare_worker(git_ops, rec)
         item_a = await _make_merged_item(git_ops, config, '9002')
         item_b = await _make_merged_item(git_ops, config, '9003')
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             worker._inflight_append(self._local_entry(worker, item_a))
             worker._inflight_append(self._local_entry(worker, item_b))
 
@@ -606,7 +617,7 @@ class TestSerialLaneTripwireWiredIntoDispatch:
         self, git_ops: GitOps, config: OrchestratorConfig
     ) -> None:
         """PRD C4 'no hard block': both entries land, nothing raised, returns None."""
-        from _recording_event_store import _RecordingEventStore  # noqa: PLC0415
+        from _recording_event_store import _RecordingEventStore
 
         rec = _RecordingEventStore()
         worker = self._bare_worker(git_ops, rec)
@@ -627,7 +638,7 @@ class TestSerialLaneTripwireWiredIntoDispatch:
         self, git_ops: GitOps, config: OrchestratorConfig
     ) -> None:
         """Every breach reports — no dedup, no rate-limit, no streak gate."""
-        from _recording_event_store import _RecordingEventStore  # noqa: PLC0415
+        from _recording_event_store import _RecordingEventStore
 
         rec = _RecordingEventStore()
         worker = self._bare_worker(git_ops, rec)
@@ -644,7 +655,7 @@ class TestSerialLaneTripwireWiredIntoDispatch:
         self, git_ops: GitOps, config: OrchestratorConfig
     ) -> None:
         """Only LOCAL leases count — the sanctioned local+remote overlap is legal."""
-        from _recording_event_store import _RecordingEventStore  # noqa: PLC0415
+        from _recording_event_store import _RecordingEventStore
 
         rec = _RecordingEventStore()
         worker = self._bare_worker(git_ops, rec)
@@ -676,7 +687,7 @@ class TestSerialLaneTripwireWiredIntoDispatch:
         test-passing, production-dead detector is the worst possible outcome for
         a detection net.
         """
-        from _recording_event_store import _RecordingEventStore  # noqa: PLC0415
+        from _recording_event_store import _RecordingEventStore
 
         rec = _RecordingEventStore()
         worker = self._bare_worker(git_ops, rec)
@@ -685,7 +696,7 @@ class TestSerialLaneTripwireWiredIntoDispatch:
 
         item_a = await _make_merged_item(git_ops, config, '9013')
         item_b = await _make_merged_item(git_ops, config, '9014')
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             worker._inflight_append(self._local_entry(worker, item_a))
             worker._inflight_append(self._local_entry(worker, item_b))
 
@@ -697,4 +708,39 @@ class TestSerialLaneTripwireWiredIntoDispatch:
         assert events[0][1]['data']['num_hosts'] == 1
 
         # The fail-open log line appearing IS the proof the hook silently died.
+        assert [r for r in caplog.records if _TRIPWIRE_FAILOPEN_MARK in r.getMessage()] == []
+
+    async def test_bound_is_the_host_count_not_the_speculation_depth(
+        self, git_ops: GitOps, config: OrchestratorConfig, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """K = hosts + 1 (task 8526) leaves the per-host bound at 1.
+
+        Leased verifies are bounded by the allocator's one slot per host, so
+        the tripwire is fed the host count: two hosts, speculation_depth 3.
+        Fed K = 3 it would compute per_host = ceil(3/2) = 2 and the second
+        local verify, the task-5326 leak shape, would go unreported.
+        """
+        from _recording_event_store import _RecordingEventStore
+
+        rec = _RecordingEventStore()
+        worker = self._two_host_worker(git_ops, rec)
+
+        item_a = await _make_merged_item(git_ops, config, '9015')
+        item_b = await _make_merged_item(git_ops, config, '9016')
+        item_c = await _make_merged_item(git_ops, config, '9017')
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
+            worker._inflight_append(self._local_entry(worker, item_a))
+            assert self._tripwire_events(rec) == [], 'one local verify is within bound'
+            worker._inflight_append(
+                self._local_entry(worker, item_b, host='laptop', is_local=False)
+            )
+            assert self._tripwire_events(rec) == [], 'local + remote is the legal pair'
+            worker._inflight_append(self._local_entry(worker, item_c))
+
+        events = self._tripwire_events(rec)
+        assert len(events) == 1, f'the second LOCAL verify must breach; got {events!r}'
+        data = events[0][1]['data']
+        assert data['branch'] == '9017'
+        assert (data['local_inflight'], data['per_host_bound']) == (2, 1)
+        assert (data['merge_ahead_bound'], data['num_hosts']) == (2, 2)
         assert [r for r in caplog.records if _TRIPWIRE_FAILOPEN_MARK in r.getMessage()] == []

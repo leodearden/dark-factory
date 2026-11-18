@@ -15,6 +15,7 @@ leaf-module shape and pytest conventions this module copies.
 from __future__ import annotations
 
 import dataclasses
+import operator
 
 import pytest
 
@@ -22,7 +23,7 @@ from fused_memory.utils import canonical_labels
 from fused_memory.utils.canonical_labels import (
     LabelScan,
     Referent,
-    _canonical_allowlist,
+    is_task_vocabulary_qualifier,
     parse_node_name,
     scan_content,
 )
@@ -164,6 +165,11 @@ class TestParseNodeNameMatchesLocalForms:
         assert second is not None
         assert second.node_name == 'Task 132'
 
+    def test_the_whitespace_gap_stays_broad(self):
+        referent = parse_node_name('task\n132')
+        assert referent is not None
+        assert referent.node_name == 'Task 132'
+
 
 class TestParseNodeNameMatchesQualifiedForms:
     """A project-qualified node name parses to a FOREIGN referent whose
@@ -212,6 +218,8 @@ class TestParseNodeNameNonMatches:
             # Task vocabulary is never a project id, in the qualified form too.
             'subtask: 2500',
             'sub-task: 2500',
+            pytest.param('task\n#132', id='hash-separator-never-spans-a-line-break'),
+            pytest.param('task\n:132', id='colon-separator-never-spans-a-line-break'),
         ],
     )
     def test_returns_none(self, name):
@@ -355,6 +363,8 @@ class TestScanContentPrecision:
             'subtask: 2500',
             'sub-task: 2500',
             'subtasks: 2500',
+            'subtask:2500',
+            'sub-task:2500',
         ],
     )
     def test_noise_yields_no_referents(self, content):
@@ -426,18 +436,85 @@ class TestScanContentPrecision:
             ], content
 
 
+class TestScanContentSeesSlugAndBranchSpellings:
+    """The fleet's own hyphen-slug and branch-name spellings (task 6059).
+
+    One unpadded '-' or '/' separator joins the task word to its number, so a
+    slug or branch can never span whitespace or a line break.
+    """
+
+    @pytest.mark.parametrize(
+        'content',
+        [
+            'Merged task-173-fillet-fix today',
+            'branch task/173 merged',
+            'TASK-173 is done',
+            'Tasks/173 notes',
+            "task-173's liveness investigation",
+            'see task-173.',
+        ],
+    )
+    def test_the_spelling_is_a_local_mention(self, content):
+        assert [r.node_name for r in scan_content(content, group_id='reify').refs] == [
+            'Task 173'
+        ]
+
+    @pytest.mark.parametrize(
+        'content',
+        [
+            'sub-task-5',
+            'reify-task-12',
+            'subtask-5',
+            'multitask/3',
+            'task-force 9',
+            'task--5',
+            'task-/5',
+            f'task-{ARABIC_INDIC_THREE}',
+            f'task-12{ARABIC_INDIC_THREE}',
+            'task\n-5',
+        ],
+        ids=[
+            'hyphen-before-the-word',
+            'project-hyphen-before-the-word',
+            'word-char-before-the-word',
+            'word-char-before-a-slash-spelling',
+            'no-digit-after-the-separator',
+            'a-doubled-separator',
+            'mixed-separators',
+            'a-unicode-digit',
+            'a-mixed-digit-run',
+            'a-line-break-is-not-a-separator',
+        ],
+    )
+    def test_a_lookalike_is_not_a_mention(self, content):
+        scan = scan_content(content, group_id='reify')
+        assert scan.refs == ()
+        assert scan.ambiguous == ()
+
+    @pytest.mark.parametrize('name', ['task-173', 'task/173'])
+    def test_the_anchored_node_name_parser_is_not_widened(self, name):
+        """The anchored parser drives node RENAMING, and an entity named
+        'task-173' was never measured as a task node."""
+        assert parse_node_name(name) is None
+
+    def test_a_slug_mention_contests_a_foreign_ref_of_the_same_number(self):
+        scan = scan_content('reify:5 and task-5', group_id='dark_factory')
+        assert scan.refs == ()
+        assert {r.node_name for r in scan.ambiguous} == {'reify:5', 'Task 5'}
+
+
 class TestUnicodeDigitsAreNotTaskNumbers:
     """A task number is written in ASCII digits. Python's ``re`` matches Unicode
     decimal digits with ``\\d`` on str patterns, so 'task \\u0663' parsed as a task
     whose number was that character.
 
-    This is a false POSITIVE against the contract :func:`scan_content` states for
-    itself — PRECISION OVER RECALL, because its consumers perform destructive
-    edge surgery — and it is the OPPOSITE direction from the KNOWN BLIND SPOTS
-    that docstring enumerates (bare-digit names, title references, codename
-    aliases), every one of which is a recall loss. So it is not covered by them:
-    a blind spot silently misses a real referent, while this MINTS one that names
-    nothing.
+    This is a false POSITIVE against the PRECISION OVER RECALL rule the module
+    docstring states, which holds because the scan's consumers perform
+    destructive edge surgery. It is the OPPOSITE direction from the accepted
+    blind spots :func:`scan_content`'s docstring enumerates (bare digits, task
+    titles, list continuations), every one of which is a recall loss. So it is
+    not covered by them: a blind spot silently misses a real referent, while
+    this MINTS one that names nothing.
 
     The DECLARED path already refuses these — referent_resolution._is_task_number
     guards its bare-digit branch with ``text.isascii() and text.isdigit()`` (task
@@ -494,8 +571,8 @@ class TestUnicodeDigitsAreNotTaskNumbers:
 
         Before the fix this parsed to Referent(number='12٣') — a mangled number
         naming no task. What refuses it now is purely '([0-9]+)': the two anchored
-        patterns carry NO '(?!\\d)' clause at all — their right edge is '\\s*$', and a
-        Unicode digit is not '\\s', so the match dies at the anchor either way.
+        patterns carry NO '(?!\\d)' clause at all — their right edge is a pad then
+        '\\Z', and a Unicode digit is neither, so the match dies at the anchor either way.
 
         The lookahead's breadth, and the reason it deliberately stays BROAD while
         the capture narrows, is pinned by the UNANCHORED siblings instead:
@@ -505,7 +582,7 @@ class TestUnicodeDigitsAreNotTaskNumbers:
         assumed: mutating both '([0-9]+)(?!\\d)' occurrences to '([0-9]+)(?![0-9])'
         fails exactly those three and NOT this one, minting Referent(number='12')
         and Referent(project_id='reify', number='12') — the TRUNCATED PREFIX that
-        lookahead's own comment says it exists to prevent, and strictly worse than
+        lookahead exists to prevent, and strictly worse than
         the bug being fixed, since 'Task ٣' is obvious junk while 'Task 12' names
         a REAL node a consumer will happily rename or re-attach edges on. So do
         not trim those three as duplicative of this one: this one survives the
@@ -584,11 +661,11 @@ class TestTaskWordIsAsciiOnly:
     spelled with a lookalike.
 
     ONE thing the narrowing changes BEYOND refusing the lookalike, declared
-    because the module calls this direction dangerous elsewhere: removing a
-    bare mention also removes a CONTEST. ``_LOCAL_MENTION_PATTERN``'s
-    whitespace branch is deliberately left Unicode-broad precisely because
-    narrowing it would mean 'fewer bare mentions ... which means MORE
-    confident splits on prose that pre-3667 refused'. The same is true here —
+    because plans/review-all-s26-memory-service-write-path-and-graph-client-prd.md
+    §Rationale rehomed names this direction of safety: a narrowing that removes
+    a bare mention also removes a CONTEST, which is why
+    ``_LOCAL_MENTION_PATTERN``'s whitespace gap stays Unicode-broad. Fewer bare
+    mentions mean more confident splits. The same is true here —
     and it is acceptable here only because the mention removed was never the
     word 'task', so the contest it created was SPURIOUS, not a genuine
     competing reading. ``test_a_lookalike_mention_no_longer_contests_a_``
@@ -664,11 +741,11 @@ class TestTaskWordIsAsciiOnly:
 
 
 class TestQualifiedRefNeverSpansALineBreak:
-    """The PROJECT-QUALIFIED pattern's colon is padded with '[ \\t]', not '\\s',
-    for the same measured reason as the mention pattern's above: '\\s' matches
-    '\\n', and no real project-qualified reference is written across a line
-    break — while episode bodies routinely carry YAML/'key: value' blocks and
-    hard-wrapped prose, which the '\\s' spelling read as qualified refs.
+    """A PROJECT-QUALIFIED ref never spans a line break, for the same measured
+    reason as the mention pattern's above: no real project-qualified reference
+    is written across a line break, while episode bodies routinely carry
+    YAML/'key: value' blocks and hard-wrapped prose, which a '\\s' pad around
+    the colon read as qualified refs.
 
     Direction of safety: this narrowing REMOVES foreign refs, and for a
     consumer performing destructive edge surgery a false positive
@@ -700,7 +777,7 @@ class TestQualifiedRefNeverSpansALineBreak:
         not projects). This one is a FALSE negative: a real qualified ref that
         hard wrapping split, since wrapping breaks at the space after the colon
         (``textwrap.fill(..., 40)`` produces exactly this string). It is the
-        same '\\s'-vs-'[ \\t]' decision seen from the losing side, and it is
+        same line-break decision seen from the losing side, and it is
         pinned here — and listed in scan_content's KNOWN BLIND SPOTS — so a
         future reader sees the recall loss was weighed rather than missed. It
         is accepted for the reason stated on the pattern: for a consumer doing
@@ -711,20 +788,118 @@ class TestQualifiedRefNeverSpansALineBreak:
         content = 'please see the reference dark_factory:\n2500 for more detail'
         assert scan_content(content, group_id='reify').refs == ()
 
-    def test_same_line_spellings_are_unaffected(self):
-        """Regression guard, green before AND after: the padding still tolerates
-        the spaces and tabs humans actually write around a colon. This is what
-        proves the change narrows ONLY across line breaks and is not an
-        undeclared tightening of human spacing."""
-        for content in (
-            'dark_factory:2500',
-            'dark_factory: 2500',
-            'dark_factory :2500',
-            'dark_factory\t:\t2500',
-        ):
-            assert [r.node_name for r in scan_content(content, group_id='reify').refs] == [
-                'dark_factory:2500'
-            ], content
+    def test_the_tight_same_line_spelling_is_unaffected(self):
+        """Regression guard: refusing the line break must not refuse the tight
+        spelling. Spaced spellings are refused too, by
+        :class:`TestQualifiedRefColonIsUnpadded`."""
+        scan = scan_content('dark_factory:2500', group_id='reify')
+        assert [r.node_name for r in scan.refs] == ['dark_factory:2500']
+
+
+class TestQualifiedRefColonIsUnpadded:
+    """A project-qualified ref in prose is written tight, 'reify:132': a blank on
+    either side of its colon makes 'word: N' prose, never a ref (measured in the
+    S26 PRD §Rationale rehomed, the ο bullet)."""
+
+    @pytest.mark.parametrize(
+        'content',
+        [
+            pytest.param('matched the live plan exactly: 15+4 detaches', id='sighting-6059-exactly'),
+            pytest.param('Follow-ups: 6035', id='sighting-follow-ups'),
+            pytest.param('Related owners: 5308', id='sighting-owners'),
+            pytest.param('Total: 42 items', id='prose-total'),
+            pytest.param('Notes: 2500 items', id='prose-notes'),
+            pytest.param('completed: 1', id='corpus-top'),
+            pytest.param('uniqueness_token: 2026', id='corpus-yaml-key'),
+            pytest.param('KeyError: 0', id='corpus-exception'),
+            pytest.param('fused-memory :8002', id='pad-before-colon'),
+            pytest.param('dark_factory: 2500', id='space-after-colon'),
+            pytest.param('dark_factory :2500', id='space-before-colon'),
+            pytest.param('dark_factory\t:\t2500', id='tab-padded'),
+        ],
+    )
+    @pytest.mark.parametrize('group_id', ['dark_factory', 'reify'])
+    def test_a_spaced_colon_is_not_a_qualified_ref(self, content, group_id):
+        assert scan_content(content, group_id=group_id) == LabelScan()
+
+    def test_a_spaced_colon_number_beside_a_real_mention_mints_nothing(self):
+        scan = scan_content('Task 6183 at the time: 394 linked records', group_id='dark_factory')
+        assert [r.node_name for r in scan.refs] == ['Task 6183']
+        assert scan.ambiguous == ()
+
+    @pytest.mark.parametrize(
+        'known_project_ids',
+        [pytest.param(None, id='permissive'), pytest.param({'dark_factory', 'reify'}, id='registry')],
+    )
+    def test_a_spaced_colon_number_no_longer_contests_a_bare_mention(self, known_project_ids):
+        scan = scan_content(
+            'Task 15 matched exactly: 15',
+            group_id='dark_factory',
+            known_project_ids=known_project_ids,
+        )
+        assert [r.node_name for r in scan.refs] == ['Task 15']
+        assert scan.ambiguous == ()
+
+    @pytest.mark.parametrize(
+        'content',
+        [
+            pytest.param('dark_factory: 4 live, reify: 11 live', id='per-project-live-counts'),
+            pytest.param('dark_factory: 19,409 vs count', id='per-project-thousands-count'),
+        ],
+    )
+    @pytest.mark.parametrize(
+        'known_project_ids',
+        [pytest.param(None, id='permissive'), pytest.param({'dark_factory', 'reify'}, id='registry')],
+    )
+    def test_a_registered_project_count_is_not_a_ref(self, content, known_project_ids):
+        scan = scan_content(content, group_id='dark_factory', known_project_ids=known_project_ids)
+        assert scan == LabelScan()
+
+    def test_a_spaced_genuine_ref_is_a_DELIBERATE_miss(self):
+        """The price of the rule, measured and accepted: every spaced match in
+        the live corpus was prose, so a genuine ref written spaced is lost too.
+        Changing this to a match is a design decision, not a bug fix."""
+        scan = scan_content(
+            'blocked on reify: 2500', group_id='dark_factory', known_project_ids={'reify'}
+        )
+        assert scan.refs == ()
+
+    @pytest.mark.parametrize(
+        'known_project_ids',
+        [pytest.param(None, id='permissive'), pytest.param({'dark_factory', 'reify'}, id='registry')],
+    )
+    def test_a_spaced_genuine_ref_no_longer_contests_its_bare_mention_DELIBERATE_trade(
+        self, known_project_ids
+    ):
+        """Unlike a registry-dropped candidate (:class:`TestNarrowingIsStrictlySubtractive`),
+        a grammar-refused one contests nothing. Measured before this rule, the
+        content scanned as ambiguous ['reify:2500', 'Task 2500'], a no-op for
+        every consumer; now the bare mention stands alone in ``.refs``. Accepted
+        because none of the 1,098 spaced matches in the live corpus was a genuine ref."""
+        scan = scan_content(
+            'reify: 2500 blocks task 2500',
+            group_id='dark_factory',
+            known_project_ids=known_project_ids,
+        )
+        assert [r.node_name for r in scan.refs] == ['Task 2500']
+        assert scan.ambiguous == ()
+
+    @pytest.mark.parametrize(
+        ('content', 'expected'),
+        [
+            pytest.param('see reify:132', ['reify:132'], id='tight-foreign'),
+            pytest.param('dark_factory:2500', ['Task 2500'], id='tight-self-qualified'),
+        ],
+    )
+    def test_the_tight_spelling_still_scans(self, content, expected):
+        scan = scan_content(content, group_id='dark_factory')
+        assert [r.node_name for r in scan.refs] == expected
+
+    @pytest.mark.parametrize('name', ['reify: 132', 'Reify : 132'])
+    def test_a_whole_node_name_keeps_its_padded_colon(self, name):
+        referent = parse_node_name(name)
+        assert referent is not None
+        assert referent.node_name == 'reify:132'
 
 
 class TestQualifiedNodeNameNeverSpansALineBreak:
@@ -870,10 +1045,9 @@ class TestQualifiedNodeNamePaddingIsAsciiSpaceAndTabOnly:
     def test_the_task_node_pattern_keeps_its_broad_padding(self):
         """The contrast that makes the acceptance above coherent rather than
         arbitrary: the LOCAL pattern's '\\s' padding is deliberately NOT
-        narrowed, so the same NBSP spelling still parses there. Measured. This
-        also guards the module docstring's claim that '\\s' padding stays
-        Unicode-broad, which now points at _TASK_NODE_NAME_PATTERN because
-        _QUALIFIED_NODE_NAME_PATTERN no longer has any."""
+        narrowed, so the same NBSP spelling still parses there. Measured. So the
+        local rule's padding stays Unicode-broad '\\s' while the qualified rule's
+        is space or tab only."""
         referent = parse_node_name('task' + NO_BREAK_SPACE + '132')
         assert referent is not None
         assert referent.node_name == 'Task 132'
@@ -961,28 +1135,26 @@ class TestScanContentAllowlist:
         )
         assert [r.node_name for r in scan.refs] == ['Task 7', 'Task 8']
 
-    def test_all_path_shaped_registry_is_permissive_not_fail_closed(self):
+    @pytest.mark.parametrize(
+        'registry',
+        [
+            pytest.param({'-home-leo-bad'}, id='one-path-shaped-entry'),
+            pytest.param({'-home-leo-bad', '-home-leo-other'}, id='several-path-shaped-entries'),
+        ],
+    )
+    def test_all_path_shaped_registry_is_permissive_not_fail_closed(self, registry):
         """A registry whose entries are ALL path-shaped degrades to PERMISSIVE.
 
-        The one-bad-entry case above is only half the contract
-        ``_canonical_allowlist`` states — "one bad entry never disables the
-        whole allowlist". When EVERY entry is skipped the surviving set is
-        empty, and an empty frozenset ``is not None``, so the qualified-ref
-        guard would read "allowlist of nothing" as "allow nothing" and drop
-        every foreign ref — silently disabling the detection this scanner
-        exists to provide. Mirrors ``validate_known_project_id``'s permissive
+        The one-bad-entry case above is only half of it: scan_content skips a
+        path-shaped entry rather than disabling the whole allowlist, and
+        narrows only when a usable entry is left. When EVERY entry is skipped,
+        reading "an allowlist of nothing" as "allow nothing" would drop every
+        foreign ref — silently disabling the detection this scanner exists to
+        provide. Mirrors ``validate_known_project_id``'s permissive
         falsy-registry mode rather than inventing a fail-closed one.
         """
-        scan = scan_content(
-            'see dark_factory:2500', group_id='reify', known_project_ids={'-home-leo-bad'}
-        )
+        scan = scan_content('see dark_factory:2500', group_id='reify', known_project_ids=registry)
         assert [r.node_name for r in scan.refs] == ['dark_factory:2500']
-
-    def test_canonical_allowlist_returns_none_when_every_entry_is_path_shaped(self):
-        """``is None`` SPECIFICALLY, not merely falsy: an empty frozenset is
-        falsy too, and ``allowlist is not None`` is the exact property the
-        qualified-ref filter reads to decide whether to narrow at all."""
-        assert _canonical_allowlist({'-home-leo-bad', '-home-leo-other'}) is None
 
     def test_a_blank_registry_key_also_yields_the_permissive_fallback(self):
         """The path-shaped case is only one of TWO ways the surviving allowlist
@@ -994,10 +1166,6 @@ class TestScanContentAllowlist:
         qualifier), so it is skipped like a path-shaped key and feeds the same
         permissive fallback.
         """
-        assert _canonical_allowlist({'', '-home-leo-bad'}) is None
-
-    def test_blank_registry_key_does_not_drop_foreign_refs_at_the_scan_boundary(self):
-        """The same contract at the boundary a caller actually uses."""
         scan = scan_content(
             'see dark_factory:2500', group_id='reify', known_project_ids={'', '-home-leo-bad'}
         )
@@ -1015,17 +1183,17 @@ class TestScanContentAllowlist:
         assert [r.node_name for r in scan.refs] == ['dark_factory:2500']
 
     def test_a_non_sized_registry_does_not_crash_on_the_degraded_path(self):
-        """The parameter is advertised as "any collection", which invites a
-        generator. A generator is truthy (so it passes the empty-registry
-        guard) but NOT Sized, so counting the entries with a trailing ``len()``
-        would raise TypeError from a memory write path — on the one branch
-        whose whole purpose is to degrade gracefully."""
+        """A generator is a legal registry. It is truthy (so it passes the
+        empty-registry guard) but NOT Sized, so counting the entries with a
+        trailing ``len()`` would raise TypeError from a memory write path — on
+        the one branch whose whole purpose is to degrade gracefully."""
 
         def registry():
             yield '-home-leo-bad'
             yield ''
 
-        assert _canonical_allowlist(registry()) is None
+        scan = scan_content('see dark_factory:2500', group_id='reify', known_project_ids=registry())
+        assert [r.node_name for r in scan.refs] == ['dark_factory:2500']
 
     def test_mixed_registry_still_narrows_after_bad_entries_skipped(self):
         """Regression guard, green before AND after the permissive fallback:
@@ -1179,23 +1347,26 @@ class TestAllPathShapedRegistryIsLoud:
         this line."""
         monkeypatch.setattr(canonical_labels, '_all_path_shaped_warned', False)
         with caplog.at_level('WARNING', logger='fused_memory.utils.canonical_labels'):
-            _canonical_allowlist({'-home-leo-bad'})
+            scan_content('see dark_factory:2500', group_id='reify', known_project_ids={'-home-leo-bad'})
         warnings = [r for r in caplog.records if r.levelname == 'WARNING']
         assert len(warnings) == 1, (
             f'Expected exactly 1 WARNING for an all-path-shaped registry; '
             f'got {len(warnings)}: {[r.message for r in warnings]}'
         )
         # Assert MEANING, not wording: the message must name the consequence
-        # (the filter is now permissive), not merely complain about an input.
-        assert 'permissive' in warnings[0].getMessage().lower()
+        # (the filter is now permissive) and the likely cause (project roots
+        # supplied where ids were expected), not merely complain about an input.
+        message = warnings[0].getMessage().lower()
+        assert 'permissive' in message
+        assert 'roots' in message
 
     def test_warning_is_emitted_only_once_per_process(self, monkeypatch, caplog):
         """Warn-once: a scanner on a write path must not turn one
         misconfiguration into a per-call log storm."""
         monkeypatch.setattr(canonical_labels, '_all_path_shaped_warned', False)
         with caplog.at_level('WARNING', logger='fused_memory.utils.canonical_labels'):
-            _canonical_allowlist({'-home-leo-bad'})
-            _canonical_allowlist({'-home-leo-other'})
+            scan_content('see dark_factory:2500', group_id='reify', known_project_ids={'-home-leo-bad'})
+            scan_content('see dark_factory:2500', group_id='reify', known_project_ids={'-home-leo-other'})
         warnings = [r for r in caplog.records if r.levelname == 'WARNING']
         assert len(warnings) == 1, (
             f'Expected exactly 1 WARNING across two calls (warn-once); '
@@ -1211,7 +1382,7 @@ class TestAllPathShapedRegistryIsLoud:
         misconfigured path is loud."""
         monkeypatch.setattr(canonical_labels, '_all_path_shaped_warned', False)
         with caplog.at_level('WARNING', logger='fused_memory.utils.canonical_labels'):
-            _canonical_allowlist(registry)
+            scan_content('see dark_factory:2500', group_id='reify', known_project_ids=registry)
         warnings = [r for r in caplog.records if r.levelname == 'WARNING']
         assert warnings == [], f'Empty/None registry must stay silent; got {[r.message for r in warnings]}'
 
@@ -1219,24 +1390,9 @@ class TestAllPathShapedRegistryIsLoud:
         """Only the DEGRADED path is loud — a working registry logs nothing."""
         monkeypatch.setattr(canonical_labels, '_all_path_shaped_warned', False)
         with caplog.at_level('WARNING', logger='fused_memory.utils.canonical_labels'):
-            _canonical_allowlist({'dark_factory'})
+            scan_content('see dark_factory:2500', group_id='reify', known_project_ids={'dark_factory'})
         warnings = [r for r in caplog.records if r.levelname == 'WARNING']
         assert warnings == [], f'A usable registry must stay silent; got {[r.message for r in warnings]}'
-
-
-class TestShapeValidProseMatchesByDesign:
-    """Prose with the '<word>: <number>' shape DOES match — the scanner is
-    deliberately whitespace-tolerant, because that is how humans write a
-    qualified reference. Final precision is delegated to the consumer's own
-    guard (and to the allowlist, when a registry is wired)."""
-
-    def test_prose_colon_number_matches_shape_only(self):
-        scan = scan_content('Total: 42 items', group_id='reify')
-        assert [r.node_name for r in scan.refs] == ['total:42']
-
-    def test_allowlist_removes_the_prose_match(self):
-        scan = scan_content('Total: 42 items', group_id='reify', known_project_ids={'dark_factory'})
-        assert scan.refs == ()
 
 
 class TestScanContentAmbiguityPartition:
@@ -1329,6 +1485,13 @@ class TestScanContentAmbiguityPartition:
         assert scan.refs == ()
         assert [r.node_name for r in scan.ambiguous] == ['dark_factory:2500', 'Task 2500']
 
+    def test_a_line_wrapped_bare_mention_still_contests(self):
+        """The whitespace gap spans a line break, because removing a bare
+        mention removes a contest, which is the dangerous direction."""
+        scan = scan_content('reify:5 blocks task\n5', group_id='dark_factory')
+        assert scan.refs == ()
+        assert {r.node_name for r in scan.ambiguous} == {'reify:5', 'Task 5'}
+
 
 class TestSelfQualifiedRefsNeverContestForeignRefs:
     """A SELF-qualified reference ('reify:2500' scanned in group reify) is
@@ -1405,3 +1568,280 @@ class TestUnregisteredKindIsRejectedLoudly:
     def test_error_names_the_registered_kinds(self):
         with pytest.raises(ValueError, match='task'):
             Referent(kind='escalation', number='7')
+
+    def test_the_kind_registry_is_read_only(self):
+        pytest.raises(TypeError, operator.setitem, canonical_labels.KIND_LABELS, 'ticket', 'Ticket')
+
+
+class TestTaskVocabularyQualifier:
+    """The predicate reads a qualifier its caller has already lowercased, so it
+    matches the lowercase task vocabulary only, and only as a whole string."""
+
+    @pytest.mark.parametrize(
+        ('qualifier', 'expected'),
+        [
+            ('task', True),
+            ('tasks', True),
+            ('subtask', True),
+            ('subtasks', True),
+            ('sub_task', True),
+            ('sub_tasks', True),
+            pytest.param('Task', False, id='uppercase-is-not-vocabulary-until-lowercased'),
+            ('TASK', False),
+            pytest.param('taskmaster', False, id='a-project-that-starts-with-task'),
+            ('reify', False),
+            pytest.param('task\n', False, id='fullmatch-refuses-a-trailing-newline'),
+        ],
+    )
+    def test_recognises_exactly_the_task_vocabulary(self, qualifier, expected):
+        assert is_task_vocabulary_qualifier(qualifier) is expected
+
+
+def _parts_at_any_depth(parts):
+    for part in parts:
+        yield part
+        yield from _parts_at_any_depth(getattr(part, 'parts', ()))
+
+
+class TestOneGrammar:
+    """The rules are composed from shared fragment objects at any depth, so a
+    rule or fragment that re-spells a shared fragment inline fails here (row 19
+    of the S26 PRD)."""
+
+    @pytest.mark.parametrize(
+        ('fragment', 'rules'),
+        [
+            pytest.param(
+                '_QUALIFIER',
+                (
+                    '_QUALIFIED_REF_PATTERN',
+                    '_QUALIFIED_NODE_NAME_PATTERN',
+                    '_LOCAL_MENTION_PATTERN',
+                ),
+                id='one-qualifier-class',
+            ),
+            pytest.param(
+                '_REF_LEFT_EDGE',
+                ('_QUALIFIED_REF_PATTERN', '_LOCAL_MENTION_PATTERN'),
+                id='one-qualifier-left-edge',
+            ),
+            pytest.param(
+                '_NUMBER',
+                (
+                    '_TASK_NODE_NAME_PATTERN',
+                    '_QUALIFIED_NODE_NAME_PATTERN',
+                    '_LOCAL_MENTION_PATTERN',
+                    '_LISTED_NUMBER_PATTERN',
+                    '_QUALIFIED_REF_PATTERN',
+                ),
+                id='one-digit-capture',
+            ),
+            pytest.param(
+                '_DIGITS',
+                ('_NUMBER', '_LIST_ITEM'),
+                id='one-digit-run',
+            ),
+            pytest.param(
+                '_NUMBER_END',
+                (
+                    '_LOCAL_MENTION_PATTERN',
+                    '_LISTED_NUMBER_PATTERN',
+                    '_LIST_ITEM',
+                    '_QUALIFIED_REF_PATTERN',
+                ),
+                id='one-right-edge',
+            ),
+            pytest.param(
+                '_TASK_WORD',
+                ('_TASK_NODE_NAME_PATTERN', '_LOCAL_MENTION_PATTERN'),
+                id='one-task-word',
+            ),
+            pytest.param(
+                '_COLON',
+                ('_QUALIFIED_REF_PATTERN', '_QUALIFIED_NODE_NAME_PATTERN'),
+                id='one-colon',
+            ),
+            pytest.param(
+                '_MARK',
+                ('_TASK_NODE_NAME_PATTERN', '_LOCAL_MENTION_PATTERN'),
+                id='one-separator-mark',
+            ),
+            pytest.param(
+                '_GAP',
+                ('_TASK_NODE_NAME_PATTERN', '_LOCAL_MENTION_PATTERN'),
+                id='one-separator-gap',
+            ),
+            pytest.param(
+                '_PAD',
+                (
+                    '_TASK_NODE_NAME_PATTERN',
+                    '_QUALIFIED_NODE_NAME_PATTERN',
+                    '_LOCAL_MENTION_PATTERN',
+                ),
+                id='one-separator-pad',
+            ),
+        ],
+    )
+    def test_each_rule_is_built_from_the_shared_fragment(self, fragment, rules):
+        shared = getattr(canonical_labels, fragment)
+        for rule in rules:
+            parts = getattr(canonical_labels, rule).parts
+            assert any(part is shared for part in _parts_at_any_depth(parts)), (
+                f'{rule} spells {fragment} itself instead of composing the shared fragment'
+            )
+
+
+def _node_names(referents):
+    return [referent.node_name for referent in referents]
+
+
+class TestWordGluedDigitsAreNotTaskNumbers:
+    """A digit run glued to a letter or underscore is a hash or an identifier,
+    not a task number: 'task 8c7e163fcf' once yielded Task 8 (task 10082)."""
+
+    @pytest.mark.parametrize(
+        'content',
+        [
+            'task 8c7e163fcf',
+            'see task-8c7e1 now',
+            'task #12ab',
+            'reify:8c7e163',
+            'Task 115e notes',
+            'task 5_retry',
+        ],
+    )
+    def test_glued_digits_yield_nothing(self, content):
+        scan = scan_content(content, group_id='dark_factory')
+        assert scan.refs == ()
+        assert scan.ambiguous == ()
+
+    def test_a_glued_run_does_not_hide_a_real_mention_beside_it(self):
+        scan = scan_content('task 8c7e163fcf and task 42', group_id='dark_factory')
+        assert _node_names(scan.refs) == ['Task 42']
+
+    @pytest.mark.parametrize(
+        ('content', 'expected'),
+        [
+            ("task-173's", ['Task 173']),
+            ('task 5.', ['Task 5']),
+            ('task 5181-fix', ['Task 5181']),
+            ('task/6059-entities', ['Task 6059']),
+            ('dark_factory:2500)', ['Task 2500']),
+        ],
+    )
+    def test_punctuation_after_the_digits_still_ends_them(self, content, expected):
+        assert _node_names(scan_content(content, group_id='dark_factory').refs) == expected
+
+
+class TestPluralTaskWordReadsTheWholeList:
+    """After the PLURAL task word every listed number is a mention:
+    'tasks 2226 and 2227' once yielded only 2226 (task 10082)."""
+
+    @pytest.mark.parametrize(
+        ('content', 'expected'),
+        [
+            ('tasks 2226 and 2227', ['Task 2226', 'Task 2227']),
+            ('tasks 2226, 2227 and 2228', ['Task 2226', 'Task 2227', 'Task 2228']),
+            ('Tasks 2226, 2227, and 2228', ['Task 2226', 'Task 2227', 'Task 2228']),
+            ('tasks 2207/2210', ['Task 2207', 'Task 2210']),
+            ('tasks #5, #6 and #7', ['Task 5', 'Task 6', 'Task 7']),
+            ('tasks 5 or 6', ['Task 5', 'Task 6']),
+            ('done tasks 3659, 3666, 3669', ['Task 3659', 'Task 3666', 'Task 3669']),
+        ],
+    )
+    def test_every_listed_number_is_a_mention(self, content, expected):
+        assert _node_names(scan_content(content, group_id='dark_factory').refs) == expected
+
+    @pytest.mark.parametrize(
+        'content',
+        [
+            'task 5, 3 files changed',
+            'task 5 and 6',
+            'tasks 5 and the parser',
+            'tasks 5,\n6',
+            'tasks 5 and 6th',
+        ],
+        ids=['singular-comma', 'singular-and', 'non-number', 'line-break', 'glued'],
+    )
+    def test_the_list_stops_where_it_is_not_a_task_list(self, content):
+        assert _node_names(scan_content(content, group_id='dark_factory').refs) == ['Task 5']
+
+    @pytest.mark.parametrize(
+        ('content', 'expected'),
+        [
+            ('Tasks: 12/40 complete', ['Task 12', 'Task 40']),
+            ('tasks 3/5 done', ['Task 3', 'Task 5']),
+        ],
+    )
+    def test_a_progress_fraction_after_the_plural_word_reads_as_a_list(self, content, expected):
+        """Accepted: the slash lists siblings ('tasks 2207/2210'), and the
+        fraction's head number already read as a task before lists were read."""
+        assert _node_names(scan_content(content, group_id='dark_factory').refs) == expected
+
+    def test_every_listed_number_contests_like_a_bare_mention(self):
+        scan = scan_content('reify:2227 versus tasks 2226 and 2227', group_id='dark_factory')
+        assert _node_names(scan.refs) == ['Task 2226']
+        assert _node_names(scan.ambiguous) == ['reify:2227', 'Task 2227']
+
+
+class TestRegisteredProjectNameQualifiesAMention:
+    """With a registry, a registered project's name directly before the task
+    word qualifies the mention: 'Reify task 3674' once bound to the LOCAL Task
+    3674 (task 10082). Without a usable registry nothing changes."""
+
+    REGISTRY = {'dark_factory': '/src/df', 'reify': '/src/reify'}
+
+    def _scan(self, content, *, group_id='dark_factory', known_project_ids=REGISTRY):
+        return scan_content(content, group_id=group_id, known_project_ids=known_project_ids)
+
+    @pytest.mark.parametrize(
+        ('content', 'expected'),
+        [
+            ('Reify task 3674 was cancelled', ['reify:3674']),
+            ('in reify, task 9727 landed', ['reify:9727']),
+            ('Reify tasks 2226 and 2227', ['reify:2226', 'reify:2227']),
+            ('REIFY task 5', ['reify:5']),
+        ],
+    )
+    def test_the_registered_name_qualifies_the_mention(self, content, expected):
+        scan = self._scan(content)
+        assert _node_names(scan.refs) == expected
+        assert scan.ambiguous == ()
+
+    def test_a_self_qualified_prose_mention_never_contests(self):
+        scan = self._scan('dark_factory task 5 and reify:5')
+        assert _node_names(scan.refs) == ['Task 5', 'reify:5']
+        assert scan.ambiguous == ()
+
+    def test_the_own_project_name_keeps_the_mention_local(self):
+        scan = self._scan('Reify task 5181 was cancelled', group_id='reify')
+        assert _node_names(scan.refs) == ['Task 5181']
+
+    def test_a_qualified_and_a_bare_mention_of_one_number_contest(self):
+        scan = self._scan('Reify task 3674; task 3674 is ours')
+        assert scan.refs == ()
+        assert set(_node_names(scan.ambiguous)) == {'reify:3674', 'Task 3674'}
+
+    @pytest.mark.parametrize(
+        'content',
+        [
+            'Completed task 5',
+            'Nowhere task 5',
+            'reify\ntask 5',
+            '/src/reify task 5',
+            'subtasks task 5',
+        ],
+        ids=['unregistered-word', 'unregistered-name', 'line-break', 'path', 'task-vocabulary'],
+    )
+    def test_anything_else_before_the_task_word_stays_local(self, content):
+        assert _node_names(self._scan(content).refs) == ['Task 5']
+
+    @pytest.mark.parametrize('known_project_ids', [None, {}], ids=['no-registry', 'empty'])
+    def test_permissive_mode_is_unchanged(self, known_project_ids):
+        scan = self._scan('Reify task 3674', known_project_ids=known_project_ids)
+        assert _node_names(scan.refs) == ['Task 3674']
+
+    def test_a_hyphen_glued_task_word_is_still_not_a_mention(self):
+        scan = self._scan('reify-task 2500')
+        assert scan.refs == ()
+        assert scan.ambiguous == ()

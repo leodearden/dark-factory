@@ -9,11 +9,16 @@ vocabulary does not know is declined to the caller's default, and the echo
 reports both the request and what was served, so a declined request is
 visible on the page instead of silently relabelled.
 
-The parser is parameterised by vocabulary because the vocabularies differ in
-exactly one respect: ``dashboard.api.burndown`` passes its own
+The parser is parameterised by vocabulary because the day vocabularies differ
+in exactly one respect: ``dashboard.api.burndown`` passes its own
 ``_BURNDOWN_WINDOWS``, whose chip offers ``90d`` where this one offers
 ``all``. Everything else — the decline rule, the default check, the echo —
 is shared.
+
+``dashboard.api.quality``'s ``_QUALITY_WINDOWS`` counts landings, not days,
+so :func:`parse_landing_window` serves a :class:`ServedLandingWindow` whose
+echo names ``landings`` and holds ``None`` for every landing; it shares the
+decline rule and default check with :func:`_parse_window`.
 
 ``_WINDOW_DAYS`` and ``_parse_window`` carry a leading underscore from when
 they were private to ``app.py``; read it as vestigial, not as a private-use
@@ -52,12 +57,25 @@ class ServedWindow:
         return {'requested': self.requested, 'served': self.served, 'days': self.days}
 
 
-def _parse_window(
-    query_params: Mapping[str, str],
-    default: str = '30d',
-    vocabulary: Mapping[str, int] = _WINDOW_DAYS,
-) -> ServedWindow:
-    """Parse ``?window=`` against ``vocabulary``, declining unknown labels to ``default``.
+@dataclass(frozen=True, slots=True)
+class ServedLandingWindow:
+    """A landing-count window: as :class:`ServedWindow`, with ``landings`` in place of ``days``.
+
+    ``landings`` is ``served``'s count of newest landings, ``None`` for every landing.
+    """
+
+    requested: str
+    served: str
+    landings: int | None
+
+    def to_wire(self) -> dict[str, object]:
+        return {'requested': self.requested, 'served': self.served, 'landings': self.landings}
+
+
+def _requested_and_served(
+    query_params: Mapping[str, str], default: str, vocabulary: Mapping[str, object],
+) -> tuple[str, str]:
+    """The ``?window=`` label asked for, and the one served: itself if known, else ``default``.
 
     Raises:
         ValueError: ``default`` is not in ``vocabulary`` — the served window
@@ -68,10 +86,32 @@ def _parse_window(
             f'default window {default!r} is not in the vocabulary {sorted(vocabulary)}'
         )
     requested = query_params.get('window') or default
-    served = requested if requested in vocabulary else default
+    return requested, requested if requested in vocabulary else default
+
+
+def _parse_window(
+    query_params: Mapping[str, str],
+    default: str = '30d',
+    vocabulary: Mapping[str, int] = _WINDOW_DAYS,
+) -> ServedWindow:
+    """Parse ``?window=`` against ``vocabulary``, declining unknown labels to ``default``."""
+    requested, served = _requested_and_served(query_params, default, vocabulary)
     return ServedWindow(requested=requested, served=served, days=vocabulary[served])
 
 
-def with_window(payload: Mapping[str, object], window: ServedWindow) -> dict[str, object]:
+def parse_landing_window(
+    query_params: Mapping[str, str],
+    *,
+    vocabulary: Mapping[str, int | None],
+    default: str,
+) -> ServedLandingWindow:
+    """Parse ``?window=`` against a landing vocabulary, declining unknown labels to ``default``."""
+    requested, served = _requested_and_served(query_params, default, vocabulary)
+    return ServedLandingWindow(requested=requested, served=served, landings=vocabulary[served])
+
+
+def with_window(
+    payload: Mapping[str, object], window: ServedWindow | ServedLandingWindow,
+) -> dict[str, object]:
     """Return ``payload`` plus the ``WINDOW`` echo, leaving ``payload`` untouched."""
     return {**payload, 'WINDOW': window.to_wire()}

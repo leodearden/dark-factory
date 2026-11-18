@@ -20,9 +20,14 @@ Description=Nightly timer for the legibility trickle (%i)
 # DEFERRED night) leaves its target_date in the project's retry backlog,
 # and the next night whose own pass finishes retries the oldest owed
 # date as an extra pass. Bounds and the abandonment rule live in
-# scripts/legibility/trickle_state.py::fold_retry_backlog. Still NOT
-# covered: a night systemd never started at all -- one catch-up fires
-# for several missed nights, so the dates in between are never attempted.
+# scripts/legibility/trickle_state.py::fold_retry_backlog.
+#
+# Since task 6548 a scheduled pass also owes, with 0 attempts, every date
+# between the previous scheduled pass's target and its own
+# (last_scheduled_target_date in trickle-state.json). So a multi-night
+# outage, or a catch-up that starts after UTC midnight, has its skipped
+# dates retried like an unfinished night's, within the same bounds. See
+# scripts/legibility/trickle_state.py::never_run_dates.
 OnCalendar=*-*-* 03:00:00
 Persistent=true
 RandomizedDelaySec=300

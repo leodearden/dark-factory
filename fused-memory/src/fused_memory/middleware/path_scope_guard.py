@@ -19,8 +19,10 @@ the LLM can re-route under the multi-project Stage 2 prompt).
 
 The guard runs on TWO signals with different certainties.  DECLARED files
 (``metadata.files`` &c.) are classified exactly, via
-:meth:`ProjectPrefixRegistry.project_for_path`; PROSE is classified
-heuristically, via :func:`find_paths`.  Because prose cannot distinguish
+:meth:`ProjectPrefixRegistry.attributed_owner`; PROSE is matched
+heuristically, via :func:`find_paths`, and its matched prefixes are attributed
+by the same method.  Relative entries resolve against the filing project's
+root first (task 7515).  Because prose cannot distinguish
 "modifies X" from "merely cites X", the prose branch is gated on the declared
 signal (task 3106).
 
@@ -99,13 +101,10 @@ from __future__ import annotations
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Literal
+from typing import Literal
 
+from fused_memory.middleware.curator_types import CandidateTask
 from fused_memory.middleware.project_prefix_registry import ProjectPrefixRegistry
-
-if TYPE_CHECKING:
-    from fused_memory.middleware.task_curator import CandidateTask
-
 
 # ---------------------------------------------------------------------------
 # Pattern cache
@@ -185,7 +184,7 @@ def _build_pattern(prefixes: tuple[str, ...]) -> re.Pattern[str]:
     this assertion exists to remove.  For the ``submit_task`` path this loses
     no real protection: the interceptor classifies ``metadata.files`` through
     the FILES-certain check (:func:`check_files_for_scope` ->
-    ``registry.project_for_path``), which still hard-rejects a genuinely
+    ``registry.attributed_owner``), which still hard-rejects a genuinely
     DECLARED foreign file and is untouched by this change.
 
     That backstop is specific to that path, and the guarantee is NOT blanket:
@@ -376,13 +375,12 @@ def _aggregate_owner_mismatches(
     """Classify *items* via *owner_of* and collect those owned by another project.
 
     Shared aggregation core for :func:`_resolve_mismatches` (matched
-    prefixes from the regex-over-prose heuristic, classified via
-    :meth:`ProjectPrefixRegistry.project_for_prefix`) and
-    :func:`check_files_for_scope` (concrete file paths, classified via
-    :meth:`ProjectPrefixRegistry.project_for_path`).  The two callers differ
-    only in *what* ``owner_of`` resolves, not in how mismatches are
-    aggregated into a suggested target — factored out here (task 2206
-    review) so that logic can't drift out of sync between them.
+    prefixes from the regex-over-prose heuristic) and
+    :func:`check_files_for_scope` (concrete file paths).  Both classify via
+    :meth:`ProjectPrefixRegistry.attributed_owner`; they differ only in
+    *what* items they pass, not in how mismatches are aggregated into a
+    suggested target — factored out here (task 2206 review) so that logic
+    can't drift out of sync between them.
 
     Returns ``(mismatched_items, suggested_project)``.  An item is
     mismatched when ``owner_of(item)`` returns a project_id other than
@@ -418,10 +416,14 @@ def _resolve_mismatches(
     owner are dropped from the rejection (the registry could not classify
     them — ignoring them keeps the guard conservative).
 
-    Thin wrapper around :func:`_aggregate_owner_mismatches` bound to the
-    prefix-string lookup :meth:`ProjectPrefixRegistry.project_for_prefix`.
+    Thin wrapper around :func:`_aggregate_owner_mismatches` bound to
+    :meth:`ProjectPrefixRegistry.attributed_owner`; a bare prefix such as
+    ``'sessions/'`` normalises to ``'sessions'``, which matches the table
+    exactly as the prefix-string lookup did.
     """
-    return _aggregate_owner_mismatches(matched, project_id, registry.project_for_prefix)
+    return _aggregate_owner_mismatches(
+        matched, project_id, lambda p: registry.attributed_owner(p, project_id),
+    )
 
 
 def check_candidate_for_scope(
@@ -476,12 +478,13 @@ def check_files_for_scope(
 
     CERTAIN counterpart to :func:`check_candidate_for_scope` /
     :func:`check_text_for_scope`: classifies each concrete file path via
-    :meth:`ProjectPrefixRegistry.project_for_path` instead of the heuristic
+    :meth:`ProjectPrefixRegistry.attributed_owner` instead of the heuristic
     regex-over-prose :func:`find_paths`.  That lookup resolves ABSOLUTE
     entries (and ``~/``-prefixed ones) against the registry's known project
-    roots and RELATIVE ones by exact leading-path-component match, so an
-    absolute foreign path is classified identically to its repo-relative
-    spelling (task 3109).  Spellings resolvable only against a base directory
+    roots, and RELATIVE ones against the filing project's own top-level dirs
+    first and then by exact leading-path-component match, so an absolute
+    foreign path is classified identically to its repo-relative spelling
+    (task 3109).  Spellings resolvable only against a base directory
     the registry is not given — ``'../other-repo/x.py'``, ``'~user/...'`` —
     remain UNOWNED and so fail open here, exactly as they did pre-3109; see
     :meth:`ProjectPrefixRegistry._owner_for_absolute_path` for the pinned
@@ -499,22 +502,11 @@ def check_files_for_scope(
     if not registry or not files:
         return PathGuardVerdict(outcome='ok', project_id=project_id)
 
-    mismatched: list[str] = []
-    owners: set[str] = set()
-    first_owner: str | None = None
-    for f in files:
-        owner = registry.project_for_path(f)
-        if owner is None or owner == project_id:
-            continue
-        mismatched.append(f)
-        if first_owner is None:
-            first_owner = owner
-        owners.add(owner)
-
+    mismatched, suggested = _aggregate_owner_mismatches(
+        files, project_id, lambda f: registry.attributed_owner(f, project_id),
+    )
     if not mismatched:
         return PathGuardVerdict(outcome='ok', project_id=project_id)
-
-    suggested = first_owner if len(owners) == 1 else None
     return PathGuardVerdict(
         outcome='rejection',
         project_id=project_id,
@@ -550,15 +542,17 @@ def all_files_foreign_owner(
     Distinct from :func:`check_files_for_scope`, which rejects on ANY foreign
     file: here the submission must be ENTIRELY foreign under a SINGLE owner,
     with NO locally-owned file, before it qualifies.  Reuses
-    :meth:`ProjectPrefixRegistry.project_for_path` exactly as
+    :meth:`ProjectPrefixRegistry.attributed_owner` exactly as
     ``check_files_for_scope`` does — including its resolution of ABSOLUTE
     (and ``~/``-prefixed) entries against the registry's known project roots,
     so an all-absolute foreign file set is tagged just like its repo-relative
     spelling (task 3109), and its residual fail-open spellings
-    (``'../other-repo/x.py'``, ``'~user/...'``), which stay unowned.  Files
-    with no registered owner (``project_for_path`` returns ``None``) are
-    neutral — they neither block nor establish cross-repo (conservative,
-    matching :func:`_aggregate_owner_mismatches`).
+    (``'../other-repo/x.py'``, ``'~user/...'``), which stay unowned.  A
+    relative entry under one of the filer's own top-level dirs is local, so
+    it vetoes the tag (task 7515).  Files with no registered owner
+    (``attributed_owner`` returns ``None``) are neutral — they neither block
+    nor establish cross-repo (conservative, matching
+    :func:`_aggregate_owner_mismatches`).
 
     Returns ``None`` when the registry/*files* are empty, when the FILER
     (*project_id*) is not a registered project, when ANY file is owned by
@@ -576,7 +570,7 @@ def all_files_foreign_owner(
     foreign_owners: set[str] = set()
     first_owner: str | None = None
     for f in files:
-        owner = registry.project_for_path(f)
+        owner = registry.attributed_owner(f, project_id)
         if owner is None:
             continue  # unowned → neutral, never grounds for classification
         if owner == project_id:
@@ -622,12 +616,12 @@ def local_attesting_signals(
     unchanged stamp-plus-advisory path, and never creates a new rejection.
 
     Signals are classified with the CERTAIN
-    :meth:`ProjectPrefixRegistry.project_for_path` lookup, never the
+    :meth:`ProjectPrefixRegistry.attributed_owner` lookup, never the
     heuristic regex-over-prose :func:`find_paths`.  That matters: a declared
     DIRECTORY (``'fused-memory/src'``) and an ABSOLUTE spelling both
     classify correctly here, where the prose scanner's right-boundary
     assertion (task 3120) deliberately misses them.
-    It also means attribution inherits ``project_for_path``'s documented
+    It also means attribution inherits ``attributed_owner``'s documented
     fail-open residue (``'../other-repo/x.py'``, ``'~user/...'``) in the SAFE
     direction: an unclassifiable signal simply fails to attest, so the
     advisory still fires.
@@ -643,7 +637,7 @@ def local_attesting_signals(
         return []
     local: list[str] = []
     for signal in signals:
-        owner = registry.project_for_path(signal)
+        owner = registry.attributed_owner(signal, project_id)
         if owner is None:
             continue  # unowned → neutral
         if owner != project_id:

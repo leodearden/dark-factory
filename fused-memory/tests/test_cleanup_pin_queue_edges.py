@@ -25,6 +25,8 @@ from _store_mutation_preflight_contract import (
     neutralise_fixture,
 )
 
+from fused_memory.utils.store_mutation_preflight import StoreMutationUnavailable
+
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'cleanup_pin_queue_edges.py'
 
 _mod = load_script_module(SCRIPT_PATH, mod_name='cleanup_pin_queue_edges')
@@ -311,7 +313,7 @@ class TestRunApplyStoreMutationPreflight:
         deny(_mod, monkeypatch)
         memory = self._memory()
 
-        with pytest.raises(_mod.StoreMutationUnavailable, match=SENTINEL):
+        with pytest.raises(StoreMutationUnavailable, match=SENTINEL):
             await _mod.run(self._args(tmp_path, apply=True), memory=memory, graph=self._graph())
 
         self._assert_no_mutation(memory)
@@ -322,7 +324,7 @@ class TestRunApplyStoreMutationPreflight:
         graph = self._graph()
         reads = self._record_backend_reads(monkeypatch, graph)
 
-        with pytest.raises(_mod.StoreMutationUnavailable):
+        with pytest.raises(StoreMutationUnavailable):
             await _mod.run(self._args(tmp_path, apply=True), memory=self._memory())
 
         assert reads == []
@@ -337,13 +339,14 @@ class TestRunApplyStoreMutationPreflight:
 
         with (
             caplog.at_level(logging.ERROR, logger='cleanup_pin_queue_edges'),
-            pytest.raises(_mod.StoreMutationUnavailable),
+            pytest.raises(StoreMutationUnavailable),
         ):
             await _mod.run(
                 self._args(tmp_path, apply=True), memory=self._memory(), graph=self._graph()
             )
 
-        assert fail_closed_records(caplog, 'cleanup_pin_queue_edges')
+        (record,) = fail_closed_records(caplog, 'cleanup_pin_queue_edges')
+        assert SENTINEL in record.getMessage()
 
     @pytest.mark.asyncio
     async def test_a_dry_run_is_never_gated_on_write_capability(self, monkeypatch, tmp_path):
@@ -363,8 +366,7 @@ class TestRunApplyStoreMutationPreflight:
         self._assert_no_mutation(memory)
 
     @pytest.mark.asyncio
-    async def test_apply_is_unchanged_when_the_preflight_passes(self, monkeypatch, tmp_path):
-        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', lambda **_kw: None)
+    async def test_apply_is_unchanged_when_the_preflight_passes(self, tmp_path):
         memory = self._memory()
 
         report = await _mod.run(

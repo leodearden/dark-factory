@@ -1,0 +1,30 @@
+{
+  "task_id": "4053",
+  "reason": "Net-additive bug fix: git_ops.py::GitOps::detach_lane_checkout now catches the RuntimeError (incl. WorktreeConflictError) its WIP commit raises on an unmerged index or a rejected commit and returns False without detaching, so Harness._reconcile_lane_checkouts routes a conflicted lane into its existing fail-safe re-pin branches instead of crashing orchestrator startup (task 4053). The total:private_reads rise is the new lane-importing regression file orchestrator/tests/test_lane_checkout_reconcile_conflict.py: all 11 are Harness privates (the sweep under test, Harness._reconcile_lane_checkouts, and the established startup_harness recipe's stubs of run()'s side-effect steps), none are lane internals. Not a refactor that failed.",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/git_ops.py",
+      "baseline": 1482,
+      "current": 1483
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/git_ops.py::GitOps::detach_lane_checkout",
+      "baseline": 1,
+      "current": 2
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5015,
+      "current": 5016
+    },
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6592,
+      "current": 6603
+    }
+  ]
+}

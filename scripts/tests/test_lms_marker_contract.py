@@ -29,6 +29,9 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 #: The literal every artifact of this task must carry.
 MARKER = 'PRD-MARKER:local-memory-models-eval serving'

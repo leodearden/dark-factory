@@ -14,12 +14,24 @@ Documentation=file:///home/leo/src/dark-factory/OPERATIONS.md
 Type=oneshot
 # All logic lives in the committed wrapper script -- the unit itself is a thin
 # systemd shell around it (mirrors
-# scripts/reclaim-orphaned-worktrees.service). The wrapper runs the census
-# and then a DRY-RUN of 3201's retro stamp, in sequence, and always exits 0: a
-# recurring `oneshot` that can fail enters systemd `failed` state and STAYS
-# there, silently stopping the whole nightly job. The census exits 1 by design
+# scripts/reclaim-orphaned-worktrees.service). The wrapper runs the census,
+# then a DRY-RUN of 3201's retro stamp, then lands the regenerated artifacts
+# through the merge queue, in sequence, and always exits 0: a recurring
+# `oneshot` that can fail enters systemd `failed` state and STAYS there,
+# silently stopping the whole nightly job. The census exits 1 by design
 # whenever coverage.complete is false, which is routine on a live corpus.
 WorkingDirectory=/home/leo/src/dark-factory
+# The run waits for its own landing, so it is bounded inside one night; see
+# OPERATIONS.md §12 for why it waits.
+Environment=CENSUS_LANDING_TIMEOUT_SECS=72000
+TimeoutStartSec=82800
+# Persistent=true boot catch-up runs before the login session pushes the user
+# PATH, so uv in ~/.local/bin is unfindable; see
+# scripts/fused-memory-flag-marker-sweep.service for the observed status=127.
+# The wrapper resolves uv itself via scripts/lib/resolve_uv.sh, which also
+# covers a stale installed unit; this line is belt-and-braces for everything
+# else it runs.
+Environment=PATH=/home/leo/.cargo/bin:/home/leo/.local/npm-global/bin:/usr/local/cuda-12.6/bin:/home/leo/.local/bin:/home/leo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
 ExecStart=/home/leo/src/dark-factory/scripts/memory-metadata-coverage-census.sh
 StandardOutput=journal
 StandardError=journal

@@ -37,8 +37,9 @@ barriers, load-bearing rather than defensive.
 The window itself is UNCHANGED, and ``TestDropRebuildWindow`` below still pins
 it; what task 4777 changed is that production no longer walks into it.
 ``fused_memory/backends/graphiti_client.py::GraphitiBackend.drop_vector_indices``
-now reads the catalog through ``GraphitiBackend._await_index_catalog_settled``,
-the production-side barrier, so even a back-to-back second call settles before
+now reads the catalog through
+``fused_memory/backends/falkor_indices.py::await_index_catalog_settled``, the
+production-side barrier, so even a back-to-back second call settles before
 it reads — ``test_a_back_to_back_second_run_settles_without_a_test_side_barrier``
 is the live proof.
 
@@ -58,16 +59,15 @@ import time
 
 import pytest
 import pytest_asyncio
-from _fm_helpers import (
+from _fm_falkor_live import (
     FALKOR_HOST,
     FALKOR_PORT,
     IndexHeaderError,
     await_index_operational,
     falkor_skipif,
-    poll_until,
-    retry_until_observed,
     unique_graph_name,
 )
+from _fm_polling import poll_until, retry_until_observed
 from falkordb.asyncio import FalkorDB
 
 from fused_memory.backends.graphiti_client import GraphitiBackend, _MultiTenantFalkorDriver
@@ -81,10 +81,7 @@ pytestmark = [
     # 10s barrier budgets -- live_vector_graph's build-side barrier (task 3377)
     # plus the post-drop barrier added by task 4748 -- so 15 would make that
     # pathological worst case (10s + 10s) a CERTAIN timeout instead of a rare
-    # flake. fused-memory/pyproject.toml sets timeout_method='thread', whose
-    # handler ends in os._exit(1) and kills the whole xdist worker, which is why
-    # this headroom is not optional. 30 stays well under the pyproject default
-    # of 60. Expected real cost of the added barrier is ~0.2ms on this module's
+    # flake. Expected real cost of the added barrier is ~0.2ms on this module's
     # 1-node fixture graph (one CALL db.indexes() round-trip) -- this is
     # headroom, not spend.
     pytest.mark.timeout(30),
@@ -270,8 +267,9 @@ class TestDropVectorIndicesLive:
             #   redis.exceptions.ResponseError: Unable to drop index on
             #   :Entity(name_embedding): no such index.
             # As of task 4777, drop_vector_indices() opens with
-            # _await_index_catalog_settled() rather than a bare list_indices(),
-            # so pass 2 settles the catalog for itself before reading it and
+            # falkor_indices.await_index_catalog_settled() rather than a bare
+            # list_indices(), so pass 2 settles the catalog for itself before
+            # reading it and
             # cannot see the stale Entity{name_embedding: ['VECTOR']} row.
             # test_a_back_to_back_second_run_settles_without_a_test_side_barrier
             # below is the test that exercises THAT path, with no test-side
@@ -370,11 +368,10 @@ _OBSERVE_ATTEMPTS = 5
 #: Bounding the retry in attempts ALONE is not enough, because the attempt
 #: count multiplies the barrier budgets: 5 attempts x 4 re-opens x 2 barriers
 #: is 240s of budget that a slow-but-SUCCEEDING barrier can walk through
-#: without any of them ever raising. pytest-timeout runs with
-#: timeout_method='thread' here, whose handler ends in os._exit(1) and kills
-#: the whole xdist worker, so "walks past the class mark" is not a test
-#: failure -- it takes unrelated tests down with it. A wall-clock bound is
-#: what makes the class mark below checkable arithmetic instead of a guess.
+#: without any of them ever raising, until it walks past the class mark and
+#: the test reds on a timeout rather than on any barrier's diagnosis. A
+#: wall-clock bound is what makes the class mark below checkable arithmetic
+#: instead of a guess.
 #:
 #: 100s against a measured retry-phase cost of median 0.10s / max 8.20s, i.e.
 #: >12x the worst observed. It binds only when barriers are running tens of
@@ -537,7 +534,7 @@ async def _reopen_rebuild_window(graph, deadline: float | None = None) -> None:
     #
     # A barrier raising here aborts the WHOLE retry -- reopen failures
     # propagate; retry_until_observed only absorbs a falsy OBSERVATION (pinned
-    # by test_fm_helpers.py::TestRetryUntilObserved
+    # by test_fm_polling.py::TestRetryUntilObserved
     # ::test_an_exception_from_reopen_aborts_the_retry_rather_than_being
     # _retried_around). That is deliberate: continuing to observe a window
     # that was never successfully re-opened would burn the budget and then
@@ -637,20 +634,22 @@ class TestReopenRebuildWindowBudget:
         )
 
 
-# 240, overriding the module-level pytest.mark.timeout(30) for THIS CLASS ONLY
+# 300 -- the --timeout fused-memory/orchestrator.yaml passes, the smallest
+# mark that does not invert it (shared/src/shared/testing_timeout_markers.py)
+# -- overriding the module-level pytest.mark.timeout(30) for THIS CLASS ONLY
 # (pytest-timeout resolves via get_closest_marker, so the module mark still
 # correctly governs TestDropVectorIndicesLive above, which runs on the 1-node
 # live_vector_graph and is fast).
 #
 # FAILURE MODE, which is why the number must be derived and not eyeballed.
-# fused-memory/pyproject.toml sets timeout_method='thread', whose handler ends
-# in os._exit(1) -- that kills the whole xdist worker rather than failing one
-# test, taking unrelated tests with it. And pytest-timeout runs here with
-# func_only=False (see the module pytestmark above), so FIXTURE SETUP counts
-# against the mark too. So the mark must sit above the arithmetic worst case
-# of every budget this class can spend, INCLUDING barriers that merely run
-# long while still succeeding -- a 25s barrier inside a 30s budget never
-# raises the clean AssertionError, it just walks the clock.
+# fused-memory/pyproject.toml sets timeout_method='signal', so a breach fails
+# this test red even though every barrier would have succeeded. And
+# pytest-timeout runs here with func_only=False (see the module pytestmark
+# above), so FIXTURE SETUP counts against the mark too. So the mark must sit
+# above the arithmetic worst case of every budget this class can spend,
+# INCLUDING barriers that merely run long while still succeeding -- a 25s
+# barrier inside a 30s budget never raises the clean AssertionError, it just
+# walks the clock.
 #
 # THE ARITHMETIC, worst case, all constants defined above the bulk fixture:
 #
@@ -663,19 +662,19 @@ class TestReopenRebuildWindowBudget:
 #                                                          --------
 #                                                             192s
 #
-# 240 leaves ~48s of slack over that ceiling. The retry phase is the term that
+# 300 leaves ~108s of slack over that ceiling. The retry phase is the term that
 # used to be unbounded: 5 attempts x 4 re-opens x 2 barriers is 240s of budget
 # on its own, which is why _reopen_rebuild_window shrinks each barrier to the
 # wall clock actually left rather than letting the attempt count multiply the
 # per-barrier budget. Whenever any of those constants changes, recompute this
-# sum -- that is the invariant, not the literal 240.
+# sum -- that is the invariant, not the literal 300.
 #
 # MEASURED COST, for contrast with the ceiling above: the realistic post-fix
 # case is ~7s (5 x 2.0s poll + 4 x ~1.3s reopen, reopen measured 1.12-1.42s /
 # median 1.27s, plus the fixture), and 30 consecutive lane-condition trials ran
 # 2.73s min / 3.34s median / 7.64s max in-test. The headroom is for the
 # contended tail, not the expected spend.
-@pytest.mark.timeout(240)
+@pytest.mark.timeout(300)
 class TestDropRebuildWindow:
     """PREMISE PIN for the post-DROP rebuild window — task 4748, de-flaked by task 4972.
 
@@ -754,11 +753,9 @@ class TestDropRebuildWindow:
     measured 10-17x contention multiplier on the 10,000-node build (1.3s
     serial vs 2.87-24.45s under 16-way FalkorDB contention). At 50,000 that
     projects well past any sane barrier budget or pytest timeout, trading a
-    ~7% observation flake for a barrier-timeout flake plus the
-    ``os._exit(1)`` xdist-worker kill that ``timeout_method='thread'`` ends
-    in. Retrying at 10,000 keeps the happy path at ~1.4s and pays only on a
-    miss. 1,000 nodes is likewise rejected: 12/15 (80%) even WITH a
-    5ms-interval/5s-deadline poll.
+    ~7% observation flake for a barrier-timeout flake. Retrying at 10,000
+    keeps the happy path at ~1.4s and pays only on a miss. 1,000 nodes is
+    likewise rejected: 12/15 (80%) even WITH a 5ms-interval/5s-deadline poll.
 
     VALIDATION of the task-4972 fix, all on this branch, FalkorDB module
     v41800, 32 cores:
@@ -788,7 +785,7 @@ class TestDropRebuildWindow:
     * 25 consecutive trials of this test under the lane's exact command,
       loadavg 57-149: 25/25, in-test 1.53s min / 2.10s median / 5.36s max —
       i.e. the raised budgets are pure headroom, not spend, and nothing here
-      comes within 20x of the 240s class mark;
+      comes within 20x of the 300s class mark;
     * the lane's exact confirmation command, loadavg ~99: 63 passed in
       399.29s (63, not 61: the amendment added two deterministic tests for
       the new deadline guard);

@@ -142,9 +142,10 @@ test_command: "uv run --project shared pytest tests/scripts/ --tb=short -q --tim
 #     = mc`), not by command, so a SCOPED verify whose touched files span both
 #     scripts/ and tests/scripts/ also runs it twice.
 #
-# That cuts against this file's own premise — the 1000s budget below is sized
-# for a 2.91x run-to-run spread attributed to host oversubscription, and
-# duplicate execution is itself a contributor to that oversubscription.
+# That cuts against this file's own premise — the budget below was sized
+# (1000s, task 4320; 1600s since task 8402's FAMILY-CEILING FLOOR) for a 2.91x
+# run-to-run spread attributed to host oversubscription, and duplicate
+# execution is itself a contributor to that oversubscription.
 #   CORRECTED IN PLACE (task 4320): this paragraph said "the 600s budget below
 #   ... a ~39% run-to-run spread". Both figures moved when the suite was
 #   re-measured — the budget to 1000s and the measured band to 2.91x
@@ -314,7 +315,7 @@ test_command: "uv run --project shared pytest tests/scripts/ --tb=short -q --tim
 # this one and scripts/ included, for parity with a live member. Read them
 # there; do not restate them here, or the two will drift and only one copy is
 # guarded.
-lint_command: "uv run --project shared ruff check tests/scripts/"
+lint_command: "uv run --project shared ruff check tests/scripts/ && python3 tests/scripts/raw_envelope_literal_guard.py tests/scripts"
 type_check_command: "uv run --project shared pyright tests/scripts/"
 
 # Per-module verify budget. MEASUREMENT PROVENANCE — every recorded run, the
@@ -393,15 +394,18 @@ type_check_command: "uv run --project shared pyright tests/scripts/"
 # SIZING (task 4320). Size against 397.47s — the largest figure across every
 # SERIAL-FORM run above, because the serial form is what the ENV_TRANSIENT
 # recovery runs inside this budget (sizing against the faster parallel form
-# would re-create the false-infra_timeout trap on that recovery path). 1000s is
-# 2.52x it, which is this family's own convention for the multiple (this module
-# sat at 600/233.50 = 2.57x until today; scripts/ sits at 2400/930.59 = 2.58x),
+# would re-create the false-infra_timeout trap on that recovery path). 1000s,
+# the convention-sized figure, is 2.52x it, which is this family's own
+# convention for the multiple (this module sat at 600/233.50 = 2.57x until
+# task 4320; scripts/ sits at 2400/930.59 = 2.58x),
 # and it clears the 700s floor the owning guard DERIVES from the same figure
 # (2 * 397.47 -> 794.94 -> 700) by 1.43x — scripts/ sits at 1.33x above its own.
 # Sizing at exactly 700 would leave 1.76x headroom over the worst run, THINNER
 # than the 2.91x band measured below on byte-identical input, i.e. it would
 # re-create the false-infra_timeout-on-the-green-path failure this per-module
-# budget exists to stop. Still 3.6x under the repo-root 3600s warm ceiling, and
+# budget exists to stop. The declared budget is now the higher FAMILY-CEILING
+# FLOOR (1600s, task 8402; stated in the paragraph just above the key), which
+# is 2.25x under the repo-root 3600s warm ceiling (1000s was 3.6x), and
 # still tight enough to surface a genuine hang in minutes rather than in the ~50
 # the whole-fleet ceiling permits.
 #
@@ -480,7 +484,7 @@ type_check_command: "uv run --project shared pyright tests/scripts/"
 # config.verify_cold_command_timeout_secs (5400) — per the
 # verify._resolve_verify_timeout cascade, cited by SYMBOL, not file:line, since
 # a prior numeric pin here had already rotted onto unrelated code within a week
-# of being written — NOT to the 1000 below, which is the warm budget only. Under
+# of being written — NOT to the 1600 below, which is the warm budget only. Under
 # a merge-role cold verify (this file's commands run VERBATIM under
 # merge_verify_breadth: "full", noted above), the cascade instead consults
 # config.merge_verify_cold_command_timeout_secs (7200) FIRST: that value ships
@@ -490,4 +494,13 @@ type_check_command: "uv run --project shared pyright tests/scripts/"
 # test_tests_scripts_module_config.py::
 # test_tests_scripts_is_a_registered_module_config already records for
 # lock_depth.
-verify_command_timeout_secs: 1000
+#
+# FAMILY-CEILING FLOOR (task 8402). This leg runs whole-tree guard family
+# members, whose per-test ceiling is
+# shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT.
+# A budget below W + that ceiling kills the leg before a member's backstop
+# fires, turning an attributable hang into a retried infra_timeout. So the
+# binding floor is min_leg_budget_for_family(W), above the convention-sized
+# figure of SIZING, and the key below declares exactly that floor. Gated by
+# tests/scripts/test_module_verify_budgets.py::test_every_leg_running_the_family_outlasts_its_ceiling.
+verify_command_timeout_secs: 1600

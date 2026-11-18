@@ -43,7 +43,8 @@ import pytest
 from _canned_mcp import CannedMCP
 from escalation.archive import archive_dir_for_date
 from escalation.classify import effective_benign
-from escalation.models import RESOLUTION_CLASSES, Escalation
+from escalation.models import NOTE_TO_FILE_CLASS, RESOLUTION_CLASSES, Escalation
+from escalation.note_to_file import file_note_to_file
 from escalation.queue import EscalationQueue
 from escalation.server import create_server
 from starlette.testclient import (
@@ -73,6 +74,7 @@ SRC_ROW4 = 'gate-src-row4'          # PENDING (rejected class) → unclassified
 SRC_ROW5 = 'gate-src-row5'          # benign, stamped (L0 age-out auto-dismiss)
 SRC_STRAND = 'gate-src-strand'      # stale-strand, stamped (L0 strand sweep)
 SRC_MOOT = 'gate-src-moot'          # moot-terminal-subject, stamped (via the server)
+SRC_NOTE = 'gate-src-note-to-file'  # note-to-file, stamped (filed resolved by file_note_to_file)
 SRC_SKETCH = 'gate-src-sketch10'    # PENDING, root and archive (PRD sketch #10)
 
 # Deterministic escalation ids (task_id embedded per the esc-{task}-{seq} form).
@@ -85,6 +87,7 @@ ID_ROW4 = 'esc-g4-1'
 ID_ROW5 = 'esc-g5-1'
 ID_STRAND = 'esc-gs-1'
 ID_MOOT = 'esc-gm-1'
+ID_NOTE = 'esc-gnote-1'
 CORRUPT_ID = 'esc-999-1'            # dropped as unparseable JSON at the queue root
 
 # Filed-at timestamps: anchored well before the (real wall-clock) resolved_at
@@ -126,11 +129,11 @@ def _clear_escalation_caches() -> None:
     from dashboard.api.escalations import _analytics_memo_clear
     from dashboard.data.escalation_corpus import _corpus_cache_clear
     from dashboard.data.task_lookup import _lookup_cache_clear
-    from dashboard.data.task_snapshot import _snapshot_cache_clear
+    from dashboard.data.task_snapshot import clear_snapshot_cache
 
     _corpus_cache_clear()
     _analytics_memo_clear()
-    _snapshot_cache_clear()
+    clear_snapshot_cache()
     _lookup_cache_clear()
 
 
@@ -320,8 +323,9 @@ async def _build_every_class_archive(queue: EscalationQueue, server: Any) -> _Li
 
     All go through α's production terminal-write paths: the L0 strand sweep
     (``dismiss_all_pending`` with a strand threshold, the reaper's path) stamps
-    ``'stale-strand'``, and the server's ``resolve_issue`` stamps
-    ``'moot-terminal-subject'`` and every remaining class.
+    ``'stale-strand'``, the server's ``resolve_issue`` stamps
+    ``'moot-terminal-subject'`` and every remaining class except
+    ``'note-to-file'``, which ``file_note_to_file`` files already resolved.
     """
     arch = await _build_live_boundary_archive(queue, server)
 
@@ -341,7 +345,7 @@ async def _build_every_class_archive(queue: EscalationQueue, server: Any) -> _Li
     ))
 
     held = {r.cls for r in arch.records if r.cls is not None}
-    for n, cls in enumerate(sorted(RESOLUTION_CLASSES - held), start=1):
+    for n, cls in enumerate(sorted(RESOLUTION_CLASSES - held - {NOTE_TO_FILE_CLASS}), start=1):
         esc_id, source = f'esc-gx{n}-1', f'gate-src-{cls}'
         _submit_pending(queue, esc_id, f'gx{n}', source, level=0, filed_at=_BASE + timedelta(hours=8 + n))
         await _resolve_via_server(
@@ -350,6 +354,17 @@ async def _build_every_class_archive(queue: EscalationQueue, server: Any) -> _Li
         arch.records.append(_RecordExpectation(
             esc_id, source, 0, 'resolved', cls, 'stamped', resolved_by='interactive',
         ))
+
+    file_note_to_file(queue, Escalation(
+        id=ID_NOTE, task_id='gnote', agent_role=SRC_NOTE, severity='info',
+        category='design_concern', summary=f'boundary gate {ID_NOTE}',
+        timestamp=_iso(_BASE + timedelta(hours=30)), status='pending', level=0,
+        note_to_file=True,
+    ))
+    arch.records.append(_RecordExpectation(
+        ID_NOTE, SRC_NOTE, 0, 'resolved', NOTE_TO_FILE_CLASS, 'stamped',
+        resolved_by='escalation-server',
+    ))
     return arch
 
 
@@ -602,7 +617,7 @@ class TestEndpointOverLiveArchive:
         _assert_origin_matches(entry['origin']['sources'], arch)
 
     def test_row9_malformed_regime_markers_never_500s(self, client, tmp_path, monkeypatch) -> None:
-        import dashboard.data.escalation_analytics as escalation_analytics_module
+        from dashboard.data import quality_markers
 
         _live_archive_sync(tmp_path)
         client.app.state.config = _make_config(tmp_path)
@@ -619,9 +634,7 @@ class TestEndpointOverLiveArchive:
         # never 500: regime_markers empties and parse_failures strictly increases.
         bad_markers = tmp_path / 'bad-regime-markers.yaml'
         bad_markers.write_text('date: [unclosed')
-        monkeypatch.setattr(
-            escalation_analytics_module, '_DEFAULT_REGIME_MARKERS_PATH', bad_markers,
-        )
+        monkeypatch.setattr(quality_markers, 'CURATED_MARKERS_PATH', bad_markers)
         _clear_escalation_caches()
         resp2 = client.get('/api/v2/dashboard/escalation-analytics')
 

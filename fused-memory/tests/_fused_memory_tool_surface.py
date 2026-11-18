@@ -52,6 +52,8 @@ REVIEWED_FUSED_MEMORY_STAGE_SAFE = frozenset(
         'get_task',
         'list_tickets',
         'search_tasks',
+        'find_tasks_by_metadata',
+        'lookup_defect_ref',
         'get_pin_queue',
         'get_scheduler_state',
         'get_scheduler_events',

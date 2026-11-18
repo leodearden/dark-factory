@@ -58,9 +58,11 @@ git always emits English-locale diagnostics. ``git_ops._git_clean_failure_
 is_benign`` substring-matches that English warning text; under a translated
 locale the matcher silently stops recognising it, defeating the R3
 ENOENT-tolerance fix for the 4892-class warm-lane FAULT. Do not "simplify"
-this away.
+this away. A caller whose child must see the caller's own environment (for
+example, a child that forwards the locale onward) passes
+``pin_c_locale=False``.
 
-CANCELLATION SAFETY (tasks 2608, 4155, 6346). If the ``communicate()`` await is
+CANCELLATION SAFETY (tasks 2608, 4155, 6346, 6251). If the ``communicate()`` await is
 interrupted — a caller-side ``asyncio.wait_for``, an outer cancellation, or
 this module's own ``timeout`` — the spawned child would otherwise keep
 running as an orphan holding its stdout/stderr pipes open. For a
@@ -70,9 +72,16 @@ SIGKILLs the child's whole process group, so helpers a script forked die with
 it (task 2608 killed only the direct child), then best-effort reaps the child.
 An interruption during the spawn itself, after the fork but before a Process
 exists, is covered too: the spawn is shielded, then its group is killed (task
-6346). The accepted residual: if the child has already exited and been reaped — a
-script that backgrounded a pipe-holding helper and exited — no signal is sent,
-since its pid may have been recycled (``shared.proc_group``'s house trade-off).
+6346). A script that already exited, leaving a pipe-holding helper, still has
+its group SIGKILLed, through a pidfd held from spawn
+(``shared/src/shared/proc_group.py::open_leader_pidfd``), which names the group
+itself and not its recyclable pgid number (task 6251). The accepted residual:
+(i) a leader that exits and is reaped before the spawn hands control back
+(``shared/src/shared/git_async.py::_spawn_session_leader``), since asyncio's
+child watcher can reap it while the shielded spawn is still in flight, and
+(ii) kernels older than Linux 6.9 or without pidfd support. In both cases no
+signal is sent, since the pid may have been recycled
+(``shared/src/shared/proc_group.py::sigkill_process_group``'s house trade-off).
 
 Each child leads a new session, so it has no controlling terminal: a git
 credential or ssh-passphrase prompt fails fast instead of blocking on a tty.
@@ -96,7 +105,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from weakref import WeakKeyDictionary
 
-from shared.proc_group import sigkill_process_group
+from shared.proc_group import LeaderPidfd, open_leader_pidfd, sigkill_process_group
 
 logger = logging.getLogger(__name__)
 
@@ -153,17 +162,22 @@ def _semaphore_for_running_loop() -> asyncio.Semaphore:
     return sem
 
 
-async def _kill_and_reap(proc: asyncio.subprocess.Process, pgid: int) -> None:
+async def _kill_and_reap(
+    proc: asyncio.subprocess.Process, pgid: int, *, leader_pidfd: LeaderPidfd | None = None,
+) -> None:
     """Best-effort group kill + reap of an interrupted child. Never raises."""
-    sigkill_process_group(proc, pgid)
+    sigkill_process_group(proc, pgid, leader_pidfd=leader_pidfd)
     with contextlib.suppress(BaseException):
         await proc.wait()  # reap is best-effort; never let it mask the original error
 
 
 async def _spawn_session_leader(
-    cmd: Sequence[str], cwd: Path | str | None, *, pipe_stdin: bool,
+    cmd: Sequence[str], cwd: Path | str | None, *, pipe_stdin: bool, pin_c_locale: bool,
 ) -> asyncio.subprocess.Process:
-    """Spawn *cmd* as a new session's leader, its output piped, in the C locale.
+    """Spawn *cmd* as a new session's leader, its output piped.
+
+    With *pin_c_locale* the child runs in the C locale; without it the child
+    inherits ``os.environ`` verbatim.
 
     asyncio's own cleanup for a spawn interrupted after the fork kills only the
     direct child, so an interrupted spawn is waited out and its whole group
@@ -171,7 +185,7 @@ async def _spawn_session_leader(
     """
     # Force a stable C locale so child output is always English and amenable
     # to substring matching (see the module docstring — this is load-bearing).
-    env = {**os.environ, 'LC_ALL': 'C', 'LANG': 'C'}
+    env = {**os.environ, 'LC_ALL': 'C', 'LANG': 'C'} if pin_c_locale else None
     spawn = asyncio.ensure_future(asyncio.create_subprocess_exec(
         *cmd,
         cwd=str(cwd) if cwd is not None else None,
@@ -213,6 +227,7 @@ async def run_git(
     input_text: str | None = None,
     timeout: float | None = None,
     bounded: bool = True,
+    pin_c_locale: bool = True,
 ) -> GitResult:
     """Spawn *cmd* asynchronously and return its :class:`GitResult`.
 
@@ -238,13 +253,16 @@ async def run_git(
         that the bound is sized for short-lived git probes, so a caller
         whose children are long-lived or operator-supplied must pass
         ``False`` rather than park them in the probes' queue.
+    :param pin_c_locale: whether the child runs with ``LC_ALL=C``/``LANG=C``
+        (the default; see "locale is load-bearing" in the module docstring).
+        ``False`` hands the child the caller's environment unchanged.
 
     :raises FileNotFoundError: the binary (or *cwd*) does not exist.
     """
     if not bounded:
-        return await _spawn_and_communicate(cmd, cwd, input_text, timeout)
+        return await _spawn_and_communicate(cmd, cwd, input_text, timeout, pin_c_locale)
     async with _semaphore_for_running_loop():
-        return await _spawn_and_communicate(cmd, cwd, input_text, timeout)
+        return await _spawn_and_communicate(cmd, cwd, input_text, timeout, pin_c_locale)
 
 
 async def _spawn_and_communicate(
@@ -252,10 +270,27 @@ async def _spawn_and_communicate(
     cwd: Path | str | None,
     input_text: str | None,
     timeout: float | None,
+    pin_c_locale: bool,
 ) -> GitResult:
     """The primitive itself, run under the caller's semaphore slot."""
-    proc = await _spawn_session_leader(cmd, cwd, pipe_stdin=input_text is not None)
+    proc = await _spawn_session_leader(
+        cmd, cwd, pipe_stdin=input_text is not None, pin_c_locale=pin_c_locale,
+    )
     pgid = proc.pid  # frozen at spawn: see shared.proc_group's module docstring (task 845)
+    with open_leader_pidfd(proc) as leader_pidfd:
+        return await _communicate_or_kill(proc, pgid, leader_pidfd, cmd, cwd, input_text, timeout)
+
+
+async def _communicate_or_kill(
+    proc: asyncio.subprocess.Process,
+    pgid: int,
+    leader_pidfd: LeaderPidfd | None,
+    cmd: Sequence[str],
+    cwd: Path | str | None,
+    input_text: str | None,
+    timeout: float | None,
+) -> GitResult:
+    """Feed and drain *proc*; an interrupted await kills its whole group, then reaps it."""
     communicate = proc.communicate(
         input=input_text.encode() if input_text is not None else None,
     )
@@ -269,7 +304,7 @@ async def _spawn_and_communicate(
         # the child is still alive: kill + reap it before degrading. This
         # branch DEGRADES (returns a result), so it logs loudly — a silent
         # timeout is indistinguishable from a clean negative answer.
-        await _kill_and_reap(proc, pgid)
+        await _kill_and_reap(proc, pgid, leader_pidfd=leader_pidfd)
         logger.warning(
             'git_async.timeout cmd=%s cwd=%s timeout=%.3fs rc=%s '
             '(child killed and reaped; returning fail-open timed-out result)',
@@ -287,7 +322,7 @@ async def _spawn_and_communicate(
         # Kill + reap so the child's group does not leak (tasks 2608/4155),
         # then propagate the original exception unchanged. No log here: this
         # path re-raises, so it is not a silent fallthrough.
-        await _kill_and_reap(proc, pgid)
+        await _kill_and_reap(proc, pgid, leader_pidfd=leader_pidfd)
         raise
     return GitResult(
         returncode=proc.returncode if proc.returncode is not None else 1,
