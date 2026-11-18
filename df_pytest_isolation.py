@@ -298,8 +298,10 @@ EIGHTH DEFENCE — a mock can never leave a mock-derived directory in the CWD.
 
 ``_df_no_mock_derived_stray_dirs`` fails, and cleans up after, any test that
 leaves a tree such as ``AsyncMock/`` or ``MagicMock/`` in the CWD, the shape
-``Path(mock).mkdir()`` produces.  It is bound into the orchestrator and
-fused-memory test roots, where tasks 3223 and 4592 each committed such a tree.
+``Path(mock).mkdir()`` produces.  Every test-root conftest binds it, as
+``tests/scripts/test_basetemp_git_isolation.py::_REQUIRED_FIXTURE_BINDINGS``
+enforces; tasks 3223 and 4592 committed such trees from the orchestrator and
+fused-memory suites.
 
 Import constraint: STDLIB + PYTEST ONLY.  Every subproject conftest imports this
 module, so it must import cleanly inside every member venv — escalation's lacks
