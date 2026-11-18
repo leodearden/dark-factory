@@ -428,8 +428,8 @@ def _spy_build_chain(
     """Replace ``orchestrator.merge_lane.worker.build_chain`` with a recorder.
 
     Returns the list of recorded call kwargs (``{'git_ops', 'queue_snapshot',
-    'head_merge_commit', 'cap', 'target_depth'}``) — step-11 asserts it stays
-    EMPTY on every declining path; step-13 reads its contents.
+    'head_merge_commit', 'cap', 'target_depth', 'verify_is_local'}``) — step-11
+    asserts it stays EMPTY on every declining path; step-13 reads its contents.
 
     *result* defaults to a ZERO-LINK :class:`ChainResult`, which per its
     docstring never holds a lane — so a stubbed call can never leak one, and
@@ -442,18 +442,22 @@ def _spy_build_chain(
     calls: list[dict] = []
     real = merge_queue.build_chain
 
-    async def _recording(git_ops, queue_snapshot, head_merge_commit, *, cap, target_depth):
+    async def _recording(
+        git_ops, queue_snapshot, head_merge_commit, *, cap, target_depth,
+        verify_is_local: bool = True,
+    ):
         calls.append({
             'git_ops': git_ops,
             'queue_snapshot': tuple(queue_snapshot),
             'head_merge_commit': head_merge_commit,
             'cap': cap,
             'target_depth': target_depth,
+            'verify_is_local': verify_is_local,
         })
         if passthrough:
             return await real(
                 git_ops, queue_snapshot, head_merge_commit,
-                cap=cap, target_depth=target_depth,
+                cap=cap, target_depth=target_depth, verify_is_local=verify_is_local,
             )
         return result if result is not None else ChainResult(links=[], tip=head_merge_commit)
 
@@ -2333,6 +2337,60 @@ class TestDeepDispatchRoundsIntegration:
             )
             if chain is not None and rec['result'].status is not None:
                 red_members |= {rec['item'].request.task_id, *links}
+
+    @pytest.mark.parametrize('owner', ['speculative', 'head'])
+    @pytest.mark.parametrize('locality', ['remote', 'local'])
+    async def test_the_chain_lane_follows_the_verify_hosts_locality(
+        self, tmp_path: Path, monkeypatch, locality: str, owner: str,
+    ):
+        """A remote lease's chain builds in an ephemeral ``_merge-*``; a local one in ``_spec-``.
+
+        Both chain owners reach the builder through the one
+        ``_deep_chain_placement`` call in ``_dispatch_item``: the speculative
+        slot-2 item, and the head alone in the verify frontier (PRD D5).
+        """
+        from orchestrator.verify_runner import HostLease
+        from orchestrator.warm_lane_pool import LaneState
+
+        repo = await _fresh_repo(tmp_path, f'{locality}-{owner}')
+        allocator = (
+            _StubRemoteAllocator(HostLease(
+                name='laptop', runner=_fake_pass_runner(), is_local=False,
+            ))
+            if locality == 'remote' else None
+        )
+        scene = await _make_deep_scene(
+            repo, chain_cap=6, script=[True], monkeypatch=monkeypatch,
+            allocator=allocator,
+        )
+
+        if owner == 'speculative':
+            await scene.round_(tag=locality)
+        else:
+            head_item = _make_item(
+                _make_req('101', '101', scene.config, repo), scene.head,
+                _ephemeral_merge_wt(scene.git_ops, f'{locality}-head'),
+                speculative=False, base_sha=await _rev_parse(repo, 'main'),
+            )
+            entry = await scene.worker._dispatch_item(head_item)
+            assert entry is not None and entry.verify_task is not None
+            await entry.verify_task
+            await scene.release_round(entry)
+
+        chain = scene.calls[-1]['chain']
+        assert chain is not None and chain.links, 'the round must chain'
+        assert chain.lane is not None
+        assert scene.posted[-1]['merge_wt'] == chain.lane, 'the tip verified in the chain lane'
+        assert scene.built[-1]['verify_is_local'] is (locality == 'local')
+        if locality == 'remote':
+            assert scene.lanes == [], 'a remote verify claims no _spec- lane'
+            assert chain.lane.name.startswith('_merge-')
+            assert chain.lane_warm is False
+            assert not chain.lane.exists(), 'the ephemeral chain lane is torn down'
+        else:
+            assert chain.lane.name.startswith('_spec-')
+            assert scene.lanes == [scene.built[-1]['head_merge_commit']]
+        assert all(state is LaneState.FREE for state in _lane_states(scene.git_ops))
 
     async def test_halving_state_walks_down_in_lockstep_with_the_depths(
         self, git_repo: Path, monkeypatch,

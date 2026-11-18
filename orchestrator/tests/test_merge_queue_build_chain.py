@@ -2039,3 +2039,59 @@ class TestBuildChainPhaseVisibility:
         [interrupted] = _merge_lane_messages(caplog, 'build_chain: interrupted')
         assert 'during merge phase' in interrupted
         assert 'built=1' in interrupted
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
+class TestBuildChainLaneLocality:
+    """Where the chain is built follows where its tip will be verified (task 7721).
+
+    A remote host never reads the local lane's ``target/``, so a remote verify
+    builds in a plain ephemeral ``_merge-*`` and pays for no pooled lane or
+    seed, as the ordinary remote path takes no local lane at all.
+    """
+
+    async def _one_link_scene(
+        self, git_repo: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> tuple[GitOps, tuple, str, list[str]]:
+        git_ops = _make_git_ops(git_repo, size=1)
+        config = _make_config(git_repo)
+        await _create_branch_editing(git_repo, 'task/101', 'a.txt', 'edit-101\n')
+        snap = (_make_req('101', '101', config, git_repo),)
+        head = await _rev_parse(git_repo)
+        return git_ops, snap, head, _count_spec_lane_acquires(git_ops, monkeypatch)
+
+    async def test_a_remote_verify_builds_in_an_ephemeral_worktree(
+        self, git_repo: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        git_ops, snap, head, acquires = await self._one_link_scene(git_repo, monkeypatch)
+
+        res = await build_chain(
+            git_ops, snap, head, cap=1, target_depth=1, verify_is_local=False,
+        )
+
+        assert [t for t, _ in res.links] == ['101']
+        assert res.lane is not None and res.lane.name.startswith('_merge-')
+        assert res.lane_warm is False
+        assert acquires == [], 'a remote verify claims no _spec- lane'
+        assert not (res.lane / 'scripts' / 'seed-warm-lane.sh.argv').exists(), (
+            'the seed ran for a lane no remote verify reads'
+        )
+        assert _all_pool_lanes_free(git_ops)
+        await release_chain_build_lane(git_ops, res.lane, warm=res.lane_warm)
+        assert not res.lane.exists()
+
+    async def test_a_local_verify_builds_in_the_warm_spec_lane(
+        self, git_repo: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        git_ops, snap, head, acquires = await self._one_link_scene(git_repo, monkeypatch)
+
+        res = await build_chain(
+            git_ops, snap, head, cap=1, target_depth=1, verify_is_local=True,
+        )
+
+        assert [t for t, _ in res.links] == ['101']
+        assert res.lane == git_ops.worktree_base / '_spec-0'
+        assert res.lane_warm is True
+        assert acquires == [head]
+        await release_chain_build_lane(git_ops, res.lane, warm=res.lane_warm)

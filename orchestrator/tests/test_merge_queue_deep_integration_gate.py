@@ -2268,8 +2268,14 @@ class TestDeepScaleBuild:
         )
 
         # ── ONE scratch lane for the whole build (PRD decision #1) ───────────
-        assert chain.lane is not None and chain.lane.name.startswith('_spec-'), (
-            f'the build must claim a pooled _spec- lane, got {chain.lane!r}'
+        # A remote lease's tip never reads a local target/, so the build takes
+        # a plain ephemeral and no pooled _spec- lane (task 7721).
+        assert chain.lane is not None and chain.lane.name.startswith('_merge-'), (
+            f'a remote-lease build must use an ephemeral _merge- lane, got {chain.lane!r}'
+        )
+        assert chain.lane_warm is False
+        assert scene.lane_acquires == [], (
+            f'a remote-lease build claims no _spec- lane; got {scene.lane_acquires!r}'
         )
         assert len(scene.lane_releases) == 1, (
             f'the chain lane is released EXACTLY once per build; got '
@@ -3709,12 +3715,13 @@ _ROW7_DEEP_FIELDS = (
     'chain_build_ms',
     'chain_items',
     'landed_via_chain',
-    'spec_lane_acquisitions',
     'verified_the_items_own_merge_commit',
 )
-"""Every transcript field the deep path can move.  The control asserts ALL of
-them differ at cap=6 — a control that only checked one could pass while the
-other six were silently inert."""
+"""Every transcript field the deep path can move on this remote-lease scene.
+The control asserts ALL of them differ at cap=6 — a control that only checked
+one could pass while the other five were silently inert.
+``spec_lane_acquisitions`` is not among them: a remote lease's chain builds in
+an ephemeral worktree (task 7721), so it stays 0 at cap=6 too."""
 
 
 @pytest.mark.asyncio
@@ -3838,6 +3845,10 @@ class TestRow7KillSwitchByteIdentity:
                 f'round 1 field {field!r} did not move at cap=6: still '
                 f'{transcript[0][field]!r}'
             )
+        assert transcript[0]['spec_lane_acquisitions'] == 0, (
+            'a remote-lease chain builds in an ephemeral and claims no _spec- '
+            f'lane; got {transcript[0]["spec_lane_acquisitions"]!r}'
+        )
         # The red round diverges STRUCTURALLY, not just numerically: the chain
         # arm requeues without naming a culprit, so it renders no outcome and
         # writes no merge_finalized at all.
