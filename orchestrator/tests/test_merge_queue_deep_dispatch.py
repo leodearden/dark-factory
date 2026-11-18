@@ -1428,21 +1428,21 @@ class TestRunInflightVerifyChainRedirect:
         assert await worker._deep_chain_placement(item) is None
         assert built == [], 'a suppressed task must not pay for a build at all'
 
-    async def test_chain_suppression_is_one_shot_and_self_clearing(
+    async def test_a_returned_verify_does_not_clear_the_mark(
         self, git_repo: Path, monkeypatch,
     ):
-        """One bad round must not disable deep merge-ahead for the task forever.
+        """The mark outlives the un-chained verify's return (task 10723).
 
-        The suppression is discarded at the existing unconditional "the verify
-        returned a result at all" reset site, so a single infra blip costs
-        exactly one non-chained round.
+        A returned result is not yet applied: the head-failure cascade can
+        still void it and re-dispatch the request, which must then verify
+        un-chained again.  The mark clears only when the task's verdict is
+        applied, which test_merge_queue_deep_unchained_mark.py drives through
+        a live lane.
         """
         _git_ops, worker, item, chain, _head = await self._fixture(git_repo)
         _spy_post_merge_verify(monkeypatch, raises=RuntimeError('verify exploded'))
         await worker._run_inflight_verify(item, _local_lease(), chain=chain)
 
-        # The re-dispatch: no chain (suppressed), and the verify returns
-        # normally this time — which is what clears the suppression.
         posted = _spy_post_merge_verify(monkeypatch, outcome=None)
         res = await worker._run_inflight_verify(item, _local_lease())
         assert len(posted) == 1, 'the ordinary arm ran'
@@ -1450,12 +1450,8 @@ class TestRunInflightVerifyChainRedirect:
             await worker._release_or_cleanup(res.merge_wt, spec_warm=res.spec_warm)
 
         built = _spy_build_chain(monkeypatch, passthrough=True)
-        again = await worker._deep_chain_placement(item)
-        assert len(built) == 1, 'chaining is re-enabled after a clean round'
-        assert again is not None
-        await merge_liveness.release_chain_build_lane(
-            _git_ops, again.lane, warm=again.lane_warm,
-        )
+        assert await worker._deep_chain_placement(item) is None
+        assert built == [], 'a returned verify is no applied verdict'
 
     async def test_the_ping_pong_terminates_after_exactly_one_deferred_round(
         self, git_repo: Path, monkeypatch,
@@ -1507,18 +1503,16 @@ class TestRunInflightVerifyChainRedirect:
         assert second.status is not InflightStatus.REQUEUED
         assert second.outcome is outcome
         assert worker._queue.qsize() == 0, 'the terminal round does not requeue'
-        # THE LEAK FENCE: the terminal exit clears the suppression regardless
-        # of which arm produced the error.  Without this, the entry would
-        # linger for the life of the worker (~8h between fleet redeploys) and
-        # silently disable deep merge-ahead for this task_id forever.
-        assert worker._next_dispatch_unchained == set(), (
-            'every terminal exit must clear the un-chained mark'
-        )
+        # The mark this walk leaves clears when that blocked verdict is
+        # applied (task 10723), which this direct drive stops short of:
+        # test_merge_queue_deep_unchained_mark.py::TestBAChainArmErrorStillTerminates
+        # drives the same walk through a live lane to the resubmission that
+        # chains again.
 
-    async def test_a_red_tip_holds_every_member_off_chains_until_it_verified_alone(
+    async def test_a_red_tip_holds_every_member_off_chains_until_its_verdict_is_applied(
         self, git_repo: Path, monkeypatch,
     ):
-        """A red tip names no culprit, so no member chains again until it verified alone.
+        """A red tip names no culprit, so no member chains again before its verdict is applied.
 
         Before task 10617 only the owner was held back: the links stayed at
         the front of the buffer and the next dispatch chained them again, so
@@ -1529,7 +1523,9 @@ class TestRunInflightVerifyChainRedirect:
             builds a chain, and no member is offered as a link;
           * the head-failure cascade cancels a member's own verify before it
             renders anything, so that member stays off every chain;
-          * a member whose own verify RETURNS is chainable again;
+          * a member whose own verify RETURNS stays off too (task 10723): the
+            cascade can still void that result, and only an applied verdict
+            clears the mark (test_merge_queue_deep_unchained_mark.py);
           * and a request whose outcome is decided is never chained, though
             ``merge_cancel`` leaves it buffered until the merger pops it.
 
@@ -1575,10 +1571,12 @@ class TestRunInflightVerifyChainRedirect:
 
         _spy_post_merge_verify(monkeypatch, outcome=None)
         await worker._run_inflight_verify(members[verified_tid], _local_lease())
-        (chainable,) = worker.chain_snapshot()
-        assert chainable.task_id == verified_tid, 'a verdict clears the mark'
+        assert worker.chain_snapshot() == (), 'a returned verify is no applied verdict'
 
-        chainable.result.cancel()
+        unmarked = _make_req('104', '104', config, git_repo, lane='high')
+        worker._intake.replace_lane('high', [unmarked])
+        assert worker.chain_snapshot() == (unmarked,)
+        unmarked.result.cancel()
         assert worker.chain_snapshot() == (), 'a decided request is never chained'
 
     @pytest.mark.parametrize(

@@ -70,9 +70,9 @@ Pending (non-blocking, confirmatory): the study's S/C control re-runs
 5. **Failure policy: halve on fail, reset on pass.** Tip fail at depth d →
    next round builds at max(1, ⌊d/2⌋); any pass resets to min(queue, cap).
    A red tip names no culprit, so after one the owner and every link each
-   verify un-chained once, on their own tree, before any of them may be
-   chained again (task 10617): the bad item is verified alone and blocks,
-   and the good members land. A request whose outcome is already decided
+   verify un-chained, on their own tree, until their own verdict is applied
+   (tasks 10617, 10723; a result the cascade voids is not applied): the bad
+   item is verified alone and blocks, and the good members land. A request whose outcome is already decided
    (cancelled or resolved) is never chained. The floor (d=1) is
    byte-identical to today's adjacent verify. No separate rolling-flake
    suppressor in v1 (halving bounds the next chain of untested requests;

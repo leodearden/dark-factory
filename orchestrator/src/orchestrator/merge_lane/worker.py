@@ -8268,10 +8268,9 @@ class SpeculativeMergeWorker:
         # link, because neither verdict is attributable to any one member.  A
         # marked task is neither a chain owner (`_deep_chain_placement` guard
         # 2b) nor a link (`chain_snapshot`), so its own subset tree gets a
-        # verdict that IS attributable to it.  One-shot: discarded when that
-        # task's own verify returns a result and at the in-verify terminal
-        # exits, beside the `_inflight_dead_verify_aborts.pop` it mirrors.  A
-        # cascade-cancelled verify and a pre-verify terminal exit keep the mark.
+        # verdict that IS attributable to it.  The mark lasts until a verdict
+        # for the task is applied, which is when its request is retired
+        # (`_retire_item`): a verify the cascade cancels or voids keeps it.
         self._next_dispatch_unchained: set[str] = set()
         # task 2828 amend (reviewer_comprehensive, robustness): per-task
         # consecutive contended-lease requeue counter.  Incremented each time
@@ -8885,9 +8884,12 @@ class SpeculativeMergeWorker:
             self._note_transition(request_id, current, ItemLifecycleState.TERMINAL)
         retired = self._live_items.pop(request_id, None)
         if retired is not None:
-            # A request's gate attempts leave the lane with it, whichever exit
-            # it took, so a resubmission starts its own count (task 8525).
-            self._gate_retries.pop(_request_of(retired).task_id, None)
+            # A request's gate attempts and its un-chained mark leave the lane
+            # with it, whichever exit it took, so a resubmission starts its own
+            # count (task 8525) and may chain again (task 10723).
+            task_id = _request_of(retired).task_id
+            self._gate_retries.pop(task_id, None)
+            self._next_dispatch_unchained.discard(task_id)
 
     def _note_requeue(
         self,
@@ -11364,9 +11366,8 @@ class SpeculativeMergeWorker:
              item's OWN subset tree and gets a verdict that IS attributable to
              it.  Sits AFTER the kill switch so the stock path still pays
              nothing, and BEFORE the queue scan so a marked task pays no
-             O(n) walk either.  Strictly ONE-SHOT: the entry is discarded the
-             moment this task's own verify returns a result or its round ends
-             terminally.
+             O(n) walk either.  The mark lasts until the task's verdict is
+             applied (see ``_next_dispatch_unchained`` in ``__init__``).
           3. ``d = self._deep_target_depth(cap, 1 + len(snapshot))``
              -> ``None`` -> ``None``.  Delegates the
              ``min(queue_len, cap, halving_state)`` invariant to
@@ -11406,7 +11407,7 @@ class SpeculativeMergeWorker:
             # Guard 2b: see the docstring. Termination needs no cap: the
             # un-chained re-dispatch verifies the item's OWN tree and, if THAT
             # raises, resolves terminally through the ordinary
-            # generic-exception path (which also discards this entry).
+            # generic-exception path.
             return None
         # ONE snapshot, reused as build_chain's argument below -- see the
         # docstring's step 3. chain_snapshot() is an O(n) walk over every lane
@@ -15098,7 +15099,6 @@ class SpeculativeMergeWorker:
                     # ι=1894 amend: drop stashed drift base — request retired without
                     # landing or conflict detection, so it would otherwise leak forever.
                     self._drift_base.pop(req.request_id, None)
-                    self._next_dispatch_unchained.discard(req.task_id)
                     # MQ-reliability kappa (task 2169): this request never
                     # proceeds past MERGING — retire it here or it leaks in
                     # the registry forever (no Future is ever resolved on
@@ -18014,9 +18014,6 @@ class SpeculativeMergeWorker:
                     # normal-completion exit paths) to keep the dict scoped to
                     # genuinely live/in-flight task_ids on every exit path.
                     self._inflight_dead_verify_aborts.pop(req.task_id, None)
-                    # Bounds the un-chained mark to LIVE task_ids: a DROPPED
-                    # request will never re-dispatch.
-                    self._next_dispatch_unchained.discard(req.task_id)
                     # task 3003 amend (robustness): a NON-defer exit — whatever
                     # contended-lane streak this task had is over, and leaving
                     # its start stamp behind would let a much later, unrelated
@@ -18139,7 +18136,6 @@ class SpeculativeMergeWorker:
                         # growing unboundedly for permanently-blocked
                         # tasks.
                         self._inflight_dead_verify_aborts.pop(req.task_id, None)
-                        self._next_dispatch_unchained.discard(req.task_id)
                         err_outcome = MergeOutcome('blocked', reason=_abort.terminal_reason())
                         if not req.result.done():
                             req.result.set_result(err_outcome)
@@ -18318,7 +18314,6 @@ class SpeculativeMergeWorker:
                 # be abandoned without a requeue; and the dict would grow
                 # unboundedly for permanently-blocked task_ids.
                 self._inflight_dead_verify_aborts.pop(req.task_id, None)
-                self._next_dispatch_unchained.discard(req.task_id)
                 # task 3003 amend (reviewer_comprehensive, test_quality): a
                 # per-worker cap-out ordinal, rendered into the reason below.
                 # See the attribute's comment in __init__ for why the elapsed/
@@ -18483,10 +18478,6 @@ class SpeculativeMergeWorker:
             # cannot linger for a task_id that exits via this path (mirrors
             # the abandoned/DROPPED and busy-loop-capped exit paths).
             self._inflight_dead_verify_aborts.pop(req.task_id, None)
-            # UNCONDITIONAL on purpose: the un-chained re-dispatch of a marked
-            # task is the one that reaches this terminal exit. The chain arm
-            # below RE-ADDS after this discard.
-            self._next_dispatch_unchained.discard(req.task_id)
             # task 2828 amend: terminal 'blocked' exit — drop any contended-lease
             # streak so it never lingers stale for a task that will not re-verify.
             # task 3003: the streak's start stamp is popped in lockstep, else a
@@ -18719,9 +18710,6 @@ class SpeculativeMergeWorker:
         # toward MAX_INFLIGHT_DEAD_VERIFY_ABORTS even though a verify
         # genuinely ran to completion in between.
         self._inflight_dead_verify_aborts.pop(req.task_id, None)
-        # This task's verify returned a result, so its un-chained round is over;
-        # a red tip below re-marks it.
-        self._next_dispatch_unchained.discard(req.task_id)
         # task 2828 amend: the verify actually RAN (lease was acquired), so any
         # prior contended-lease requeue streak for this task is broken — reset it.
         # task 3003: pop the streak's start stamp in lockstep, so the next
