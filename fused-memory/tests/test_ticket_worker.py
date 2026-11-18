@@ -1547,50 +1547,49 @@ class TestDispatchTicketDecision:
         assert result_dict.get('id') == '99'
 
     @pytest.mark.asyncio
-    async def test_dispatch_combine_calls_execute_combine_and_returns_combined(
-        self, interceptor_with_store,
+    async def test_dispatch_combine_rewrites_the_target_and_returns_combined(
+        self, interceptor_with_store, taskmaster,
     ):
-        """action='combine' → calls _execute_combine, returns (combined, target_id, ...)."""
+        """action='combine' → rewrites the target through tm.update_task.
+
+        Returns (combined, target_id, ...).
+        """
         from fused_memory.middleware.curator_types import CandidateTask
 
+        taskmaster.get_task = AsyncMock(
+            return_value={'id': '88', 'title': 'Overlap target', 'status': 'pending'},
+        )
         candidate = CandidateTask(title='Overlap Task')
         rewritten = RewrittenTask(
             title='Merged', description='desc', details='det',
             files_to_modify=[], priority='medium',
         )
         decision = CuratorDecision(
-            action='combine', target_id='88', justification='overlap',
-            rewritten_task=rewritten,
+            action='combine', target_id='88', target_fingerprint='Overlap target',
+            justification='overlap', rewritten_task=rewritten,
         )
 
-        mock_executor = AsyncMock(return_value={'id': '88', 'title': 'Merged'})
-
-        mock_curator = MagicMock()
-        mock_curator.reembed_task = AsyncMock()
-
-        with patch.object(
-            interceptor_with_store, '_execute_combine',
-            new=mock_executor,
-        ):
-            status, task_id, reason, result_dict = (
-                await interceptor_with_store._dispatch_ticket_decision(
-                    ticket_id='tkt_comb',
-                    project_root='/p',
-                    project_id='p',
-                    candidate=candidate,
-                    decision=decision,
-                    kwargs={'title': 'Overlap Task'},
-                    metadata=None,
-                    curator=mock_curator,
-                )
+        status, task_id, reason, result_dict = (
+            await interceptor_with_store._dispatch_ticket_decision(
+                ticket_id='tkt_comb',
+                project_root='/p',
+                project_id='p',
+                candidate=candidate,
+                decision=decision,
+                kwargs={'title': 'Overlap Task'},
+                metadata=None,
+                curator=curator_double(),
             )
+        )
 
         assert status == 'combined'
         assert task_id == '88'
         assert reason is not None and 'combine' in reason
         assert isinstance(result_dict, dict)
         assert result_dict.get('id') == '88'
-        assert mock_executor.await_count == 1
+        update_kwargs = taskmaster.update_task.await_args.kwargs
+        assert update_kwargs['task_id'] == '88'
+        assert update_kwargs['title'] == 'Merged'
 
 
 # ---------------------------------------------------------------------------
