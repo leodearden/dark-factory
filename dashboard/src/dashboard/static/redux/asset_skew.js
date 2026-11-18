@@ -12,17 +12,24 @@
 // THE VERDICT, in precedence order:
 //   - any identity missing or garbled: unknown, and no action;
 //   - S != D: the server predates the code on disk. A banner says a restart is
-//     pending and the page NEVER reloads, because new JS against the old
-//     process's payloads is the reverse skew a reload would create;
+//     pending and the page NEVER reloads: a reload serves D, which still
+//     differs from S, so it would create the reverse skew rather than cure it;
 //   - P != S: the page is stale. It reloads, landing on the build the server
 //     serves;
 //   - otherwise in step.
+//
+// Each state says whether the page differs from the server, and separately
+// whether a reload would bring it onto the server's build. The second is what
+// a retry hint may act on: it is false on a stale server even when the first
+// is true.
 //
 // A RELOAD needs two consecutive distinct observations of the same stale
 // server build, and a sessionStorage stamp bounds it. A page that reloaded
 // within the guard window, or cannot read or write the stamp, shows a banner
 // asking for a reload instead. Once reloading or guarded, the page stays so
-// while it is still stale, and it never calls reload twice.
+// until an observation that is not stale-page; a later stale run confirms
+// afresh and may claim the stamp again. So the stamp spaces reloads at least
+// the guard window apart, and one watcher calls reload at most once.
 //
 // LOAD CONTRACT. It reads no window.DF_* global at load. index.html loads it
 // before the Babel JSX tags, so window.DF_ASSET_SKEW exists before app.jsx
@@ -56,12 +63,23 @@ const ASSET_SKEW_GUARD_KEY = 'df-asset-skew-reloaded-at';
 const ASSET_SKEW_IDENTITY_PATTERN = /^[0-9a-f]{16,64}$/;
 const ASSET_SKEW_CONFIRMATIONS = 2;
 
-const ASSET_SKEW_NOTICES = Object.freeze({
-  [ASSET_SKEW_STATES.staleServer]: Object.freeze({
-    text: 'The dashboard server is running an older build than the code on disk: a restart is pending. '
-      + 'This page stays on the build the server is serving until then.',
+const ASSET_SKEW_RESTART_PENDING = 'The dashboard server is running an older build than the code on disk: a restart is pending. ';
+
+// The stale-server banner, by whether the page matches the server.
+const ASSET_SKEW_STALE_SERVER_NOTICES = Object.freeze({
+  pageMatchesServer: Object.freeze({
+    text: ASSET_SKEW_RESTART_PENDING + 'This page stays on the build the server is serving until then.',
     offersReload: false,
   }),
+  pageDiffersFromServer: Object.freeze({
+    text: ASSET_SKEW_RESTART_PENDING
+      + 'This page is running a different build from the server, so parts of it may fail until then; '
+      + 'reloading will not help.',
+    offersReload: false,
+  }),
+});
+
+const ASSET_SKEW_NOTICES = Object.freeze({
   [ASSET_SKEW_STATES.reloadGuarded]: Object.freeze({
     text: 'The dashboard has been updated since this page loaded. Reload the page to pick up the new build.',
     offersReload: true,
@@ -105,7 +123,8 @@ function assetSkewVerdict(pageBuild, served) {
 }
 
 function assetSkewState(kind, pageDiffersFromServer) {
-  return Object.freeze({ kind, pageDiffersFromServer });
+  const reloadReachesServerBuild = pageDiffersFromServer && kind !== ASSET_SKEW_STATES.staleServer;
+  return Object.freeze({ kind, pageDiffersFromServer, reloadReachesServerBuild });
 }
 
 // Whether this page may reload now. True only once the stamp is written, so a
@@ -129,7 +148,8 @@ function assetSkewClaimReload(storage, now, guardMs) {
 }
 
 // One watcher per page. observe(receipts) takes DF_DATA.__receipt once per poll
-// set and returns the page's state; it calls `reload` at most once, ever.
+// set and returns the page's state: {kind, pageDiffersFromServer,
+// reloadReachesServerBuild}. It calls `reload` at most once, ever.
 function createAssetSkewWatcher({ pageBuild, storage, now, reload, guardMs = ASSET_SKEW_RELOAD_GUARD_MS }) {
   let confirmation = null;
   let latched = null;
@@ -171,8 +191,13 @@ function createAssetSkewWatcher({ pageBuild, storage, now, reload, guardMs = ASS
 
 // The banner for a state, as {text, offersReload}, or null when there is none.
 function assetSkewNotice(state) {
-  if (!state || !Object.hasOwn(ASSET_SKEW_NOTICES, state.kind)) return null;
-  return ASSET_SKEW_NOTICES[state.kind];
+  if (!state) return null;
+  if (state.kind === ASSET_SKEW_STATES.staleServer) {
+    return state.pageDiffersFromServer === true
+      ? ASSET_SKEW_STALE_SERVER_NOTICES.pageDiffersFromServer
+      : ASSET_SKEW_STALE_SERVER_NOTICES.pageMatchesServer;
+  }
+  return Object.hasOwn(ASSET_SKEW_NOTICES, state.kind) ? ASSET_SKEW_NOTICES[state.kind] : null;
 }
 
 // The browser's sessionStorage, or null when there is none. Merely reading
@@ -189,10 +214,8 @@ const ASSET_SKEW_API = {
   ASSET_SKEW_STATES,
   ASSET_SKEW_RELOAD_GUARD_MS,
   ASSET_SKEW_GUARD_KEY,
-  isAssetBuildIdentity,
   pageAssetBuild,
   latestAssetBuild,
-  assetSkewVerdict,
   createAssetSkewWatcher,
   assetSkewNotice,
   assetSkewGuardStorage,

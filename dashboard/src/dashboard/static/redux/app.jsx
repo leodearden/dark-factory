@@ -220,7 +220,7 @@ function App() {
   const staleNotices = staleNoticesForTab({ paths: TAB_POLL_PATHS[tab], stale: DD.__stale || {}, now: Date.now() });
   const loadingNotice = loadingNoticeForTab({ paths: TAB_POLL_PATHS[tab], receipt: DD.__receipt || {}, stale: DD.__stale || {} });
   const skewNotice = assetSkewNotice(assetSkew);
-  const pageDiffersFromServer = assetSkew?.pageDiffersFromServer === true;
+  const reloadReachesServerBuild = assetSkew?.reloadReachesServerBuild === true;
 
   function renderTab() {
     switch (tab) {
@@ -341,7 +341,7 @@ function App() {
             </div>
           )}
           {/* The keyed .body remounts this boundary per tab, so switching tabs retries. */}
-          <RenderFailureBoundary describe={thrown => tabRenderFailureNotice(tabLabel, thrown, pageDiffersFromServer)}
+          <RenderFailureBoundary describe={thrown => tabRenderFailureNotice(tabLabel, thrown, reloadReachesServerBuild)}
                                  testId="tab-render-failure-banner"
                                  className="col-span-12"
                                  style={noticeBannerStyle('var(--bad)')}>{renderTab()}</RenderFailureBoundary>

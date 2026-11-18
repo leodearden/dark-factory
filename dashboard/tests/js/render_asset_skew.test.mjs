@@ -1,7 +1,7 @@
 // The page's asset-skew wiring in app.jsx, rendered in a jsdom window
 // (dom_harness.mjs): the banner above the tab body, the one reload of a stale
-// page, the guarded page's manual reload, and the tab render-failure notice on
-// a page whose build differs from the server's. asset_skew.js's own contract
+// page, the guarded page's manual reload, and the tab render-failure notice,
+// which says to reload only when that reaches the server's build. asset_skew.js's own contract
 // is asset_skew.test.mjs; every expected text here is taken from its public
 // global, never a literal.
 //
@@ -144,26 +144,50 @@ test('a page that reloaded moments ago holds the reload and offers one instead',
   assert.ok(shown[0].querySelector('button'), 'the guarded banner offers a reload control');
 });
 
-test("a tab that throws on a page whose build differs from the server's says to reload it", t => {
-  const PROBE = 'CostsTab probe';
-  const page = openSkewPage(t, {
-    pageBuild: A,
-    open: openContainingWindow,
-    beforeMount: window => {
-      const { DF_DATUM } = window;
-      window.DF_TABS = { ...window.DF_TABS, CostsTab: () => DF_DATUM.assertDatum(42, PROBE) };
-    },
+// A reload helps only a page older than a server that matches the disk. On the
+// reverse skew (P = D = B, S = A) a reload serves B again, so the tab keeps
+// the switch-tabs hint and the banner says a restart is pending.
+for (const [label, pageBuild, started, onDisk, reloadReachesServerBuild] of [
+  ['a page older than the server says to reload it', A, B, B, true],
+  ['a page on the disk build, ahead of a stale server, does not say to reload it', B, A, B, false],
+]) {
+  test(`a tab that throws on ${label}`, t => {
+    const PROBE = 'CostsTab probe';
+    const page = openSkewPage(t, {
+      pageBuild,
+      open: openContainingWindow,
+      beforeMount: window => {
+        const { DF_DATUM } = window;
+        window.DF_TABS = { ...window.DF_TABS, CostsTab: () => DF_DATUM.assertDatum(42, PROBE) };
+      },
+    });
+    const { DF_DATUM, DF_RENDER_FAILURE } = page.window;
+
+    poll(page, started, onDisk);
+    openTab(page, 'Costs');
+
+    const notices = failureNotices(page.root);
+    assert.deepEqual(notices.map(notice => notice.dataset.testid), ['tab-render-failure-banner']);
+    const thrown = caughtFrom(() => DF_DATUM.assertDatum(42, PROBE));
+    const expected = DF_RENDER_FAILURE.tabRenderFailureNotice('Costs', thrown, reloadReachesServerBuild);
+    assert.deepEqual(noticeLines(notices[0]), [expected.text, expected.detail]);
+    assert.deepEqual(page.reloads, []);
+    assertReportsOnlyContainedThrows(page.consoleErrors);
   });
-  const { DF_DATUM, DF_RENDER_FAILURE } = page.window;
+}
 
-  poll(page, B, B);
-  openTab(page, 'Costs');
+test('a page on the disk build, ahead of a stale server, shows the restart-pending banner for a page off the server build', t => {
+  const page = openSkewPage(t, { pageBuild: B });
 
-  const notices = failureNotices(page.root);
-  assert.deepEqual(notices.map(notice => notice.dataset.testid), ['tab-render-failure-banner']);
-  const expected = DF_RENDER_FAILURE.tabRenderFailureNotice('Costs', caughtFrom(() => DF_DATUM.assertDatum(42, PROBE)), true);
-  assert.deepEqual(noticeLines(notices[0]), [expected.text, expected.detail]);
-  assertReportsOnlyContainedThrows(page.consoleErrors);
+  for (let i = 0; i < 4; i += 1) poll(page, A, B);
+
+  const shown = banners(page);
+  assert.equal(shown.length, 1);
+  const expected = noticeFor(page.window, B, A, B);
+  assert.notEqual(expected.text, noticeFor(page.window, A, A, B).text);
+  assert.equal(shown[0].textContent, expected.text);
+  assert.equal(shown[0].querySelector('button'), null);
+  assert.deepEqual(page.reloads, []);
 });
 
 for (const [label, pageBuild, started, onDisk] of [

@@ -92,6 +92,7 @@ test('in step: P = S = D is in-step over many polls, with no reload and no notic
     const state = h.observe(A, A);
     assert.equal(state.kind, ASSET_SKEW_STATES.inStep);
     assert.equal(state.pageDiffersFromServer, false);
+    assert.equal(state.reloadReachesServerBuild, false);
     assert.equal(assetSkewNotice(state), null);
   }
   assert.deepEqual(h.reloads, []);
@@ -108,6 +109,7 @@ test('stale page: the first observation only confirms, writing no stamp', () => 
 
   assert.equal(state.kind, ASSET_SKEW_STATES.confirming);
   assert.equal(state.pageDiffersFromServer, true);
+  assert.equal(state.reloadReachesServerBuild, true);
   assert.deepEqual(h.reloads, []);
   assert.equal(h.storage.items.size, 0);
 });
@@ -120,6 +122,7 @@ test('stale page: a second distinct observation reloads exactly once and stamps 
 
   assert.equal(state.kind, ASSET_SKEW_STATES.reloading);
   assert.equal(state.pageDiffersFromServer, true);
+  assert.equal(state.reloadReachesServerBuild, true);
   assert.deepEqual(h.reloads, [h.clock.now]);
   assert.equal(h.storage.items.get(ASSET_SKEW_GUARD_KEY), String(h.clock.now));
 });
@@ -187,6 +190,7 @@ test('guard: a stamp younger than the guard window holds the reload and says to 
   assert.ok(ASSET_SKEW_RELOAD_GUARD_MS > 2000, 'the harness polls stay inside the guard window');
   assert.equal(state.kind, ASSET_SKEW_STATES.reloadGuarded);
   assert.equal(state.pageDiffersFromServer, true);
+  assert.equal(state.reloadReachesServerBuild, true);
   assert.deepEqual(h.reloads, []);
   const notice = assetSkewNotice(state);
   assert.ok(notice, 'a guarded page tells the operator to reload');
@@ -205,6 +209,38 @@ test('guard: a guarded page stays guarded on later observations', () => {
     assert.equal(h.observe(B, B).kind, ASSET_SKEW_STATES.reloadGuarded);
   }
   assert.deepEqual(h.reloads, []);
+});
+
+// The latch holds only through an unbroken stale run. Any other observation
+// clears it, so a later stale run confirms afresh and the stamp, not the
+// latch, spaces the reloads.
+test('guard: a guarded page that sees another state and goes stale again past the window reloads exactly once', () => {
+  const storage = memoryStorage({ [ASSET_SKEW_GUARD_KEY]: String(START) });
+  const h = harness({ storage });
+  h.observe(B, B);
+  assert.equal(h.observe(B, B).kind, ASSET_SKEW_STATES.reloadGuarded);
+
+  assert.equal(h.observe(A, A).kind, ASSET_SKEW_STATES.inStep);
+  h.clock.now += ASSET_SKEW_RELOAD_GUARD_MS * 2;
+  assert.equal(h.observe(B, B).kind, ASSET_SKEW_STATES.confirming);
+  assert.equal(h.observe(B, B).kind, ASSET_SKEW_STATES.reloading);
+  for (let i = 0; i < 3; i += 1) h.observe(B, B);
+
+  assert.deepEqual(h.reloads, [h.clock.now - 3000]);
+});
+
+test('guard: a page that already reloaded never reloads again, even after another state and the window', () => {
+  const h = harness();
+  h.observe(B, B);
+  assert.equal(h.observe(B, B).kind, ASSET_SKEW_STATES.reloading);
+
+  h.observe(A, A);
+  h.clock.now += ASSET_SKEW_RELOAD_GUARD_MS * 2;
+  h.observe(B, B);
+  const state = h.observe(B, B);
+
+  assert.equal(state.kind, ASSET_SKEW_STATES.reloadGuarded);
+  assert.equal(h.reloads.length, 1);
 });
 
 test('guard: a stamp older than the guard window lets the reload through', () => {
@@ -261,24 +297,44 @@ test('guard: a garbled stamp counts as no stamp, a future one as recent', () => 
 // Stale server: the process predates the disk. A banner, never a reload.
 // ---------------------------------------------------------------------------
 
-test('stale server: S differs from D shows a restart-pending notice and never reloads', () => {
-  for (const [label, pageBuild, differs] of [
-    ['the page matches the server', A, false],
-    ['the page matches the disk', B, true],
-  ]) {
-    const h = harness({ pageBuild });
-
-    for (let i = 0; i < 6; i += 1) {
-      const state = h.observe(A, B);
-      assert.equal(state.kind, ASSET_SKEW_STATES.staleServer, label);
-      assert.equal(state.pageDiffersFromServer, differs, label);
-      const notice = assetSkewNotice(state);
-      assert.ok(notice, label);
-      assert.match(notice.text, /restart/i, label);
-      assert.equal(notice.offersReload, false, label);
-    }
-    assert.deepEqual(h.reloads, [], label);
+// Observes (S = A, D = B) six times from a page booted on `pageBuild`, and
+// returns the one notice every observation carried.
+function staleServerNotice(pageBuild, differs) {
+  const h = harness({ pageBuild });
+  const notices = new Set();
+  for (let i = 0; i < 6; i += 1) {
+    const state = h.observe(A, B);
+    assert.equal(state.kind, ASSET_SKEW_STATES.staleServer, pageBuild);
+    assert.equal(state.pageDiffersFromServer, differs, pageBuild);
+    assert.equal(state.reloadReachesServerBuild, false, pageBuild);
+    notices.add(assetSkewNotice(state));
   }
+  assert.deepEqual(h.reloads, [], pageBuild);
+  assert.equal(notices.size, 1, pageBuild);
+  const [notice] = notices;
+  assert.ok(notice, pageBuild);
+  assert.match(notice.text, /restart/i, pageBuild);
+  assert.equal(notice.offersReload, false, pageBuild);
+  return notice;
+}
+
+test('stale server, page on the server build: a restart-pending notice that the page stays on that build, never a reload', () => {
+  const notice = staleServerNotice(A, false);
+
+  assert.match(notice.text, /stays on the build the server is serving/i);
+});
+
+// The reverse skew: a page loaded after a merge but before the restart runs
+// the on-disk build against the old process. A reload serves the disk build
+// again, so neither the banner nor a tab's retry hint may say it helps.
+test('stale server, page off the server build: the notice says reloading will not help, never a reload', () => {
+  const onDisk = staleServerNotice(B, true);
+  const thirdBuild = staleServerNotice(C, true);
+
+  assert.equal(thirdBuild, onDisk);
+  assert.notEqual(onDisk, staleServerNotice(A, false));
+  assert.match(onDisk.text, /reloading will not help/i);
+  assert.doesNotMatch(onDisk.text, /stays on the build the server is serving/i);
 });
 
 // ---------------------------------------------------------------------------
@@ -315,6 +371,7 @@ test('unknown: missing or garbled served builds take no action', () => {
       const state = h.watcher.observe(receiptsFor(START + i * 1000));
       assert.equal(state.kind, ASSET_SKEW_STATES.unknown, label);
       assert.equal(state.pageDiffersFromServer, false, label);
+      assert.equal(state.reloadReachesServerBuild, false, label);
       assert.equal(assetSkewNotice(state), null, label);
     }
     assert.deepEqual(h.reloads, [], label);
@@ -377,6 +434,16 @@ test('assetSkewGuardStorage is the session storage, or null when reading it thro
 
 test('exports are published identically on module.exports and window.DF_ASSET_SKEW', () => {
   assert.equal(loadedWindow.DF_ASSET_SKEW, skew);
+  assert.deepEqual(Object.keys(skew).sort(), [
+    'ASSET_SKEW_GUARD_KEY',
+    'ASSET_SKEW_RELOAD_GUARD_MS',
+    'ASSET_SKEW_STATES',
+    'assetSkewGuardStorage',
+    'assetSkewNotice',
+    'createAssetSkewWatcher',
+    'latestAssetBuild',
+    'pageAssetBuild',
+  ]);
   for (const name of ['createAssetSkewWatcher', 'assetSkewNotice', 'latestAssetBuild', 'pageAssetBuild', 'assetSkewGuardStorage']) {
     assert.equal(typeof skew[name], 'function', name);
   }

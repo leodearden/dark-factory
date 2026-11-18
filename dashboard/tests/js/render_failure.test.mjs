@@ -284,9 +284,10 @@ for (const [describerName, describe] of DESCRIBERS) {
 
 // ── (g) a page running a different build from the server ───────────────────
 // Switching tabs re-renders the same stale JS, so the advice becomes a reload,
-// and only when the page's build differs from the server's (asset_skew.js).
+// and only when a reload would bring the page onto the server's build
+// (asset_skew.js).
 
-test('(g) a tab that threw on a page whose build differs from the server says to reload, not to switch tabs', () => {
+test('(g) a tab that threw on a page a reload would bring onto the server build says to reload, not to switch tabs', () => {
   const thrown = new TypeError("Cannot read properties of undefined (reading 'length')");
 
   const notice = tabRenderFailureNotice('Burndown', thrown, true);
