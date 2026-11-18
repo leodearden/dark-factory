@@ -2576,6 +2576,25 @@ class TestPinReservationConfig:
         assert live.pin_reservations_enabled is False
 
 
+class TestMainHealthFixReservedSlotsConfig:
+    """Run slots outside max_concurrent_tasks that only a main-health fix may take (task 8480)."""
+
+    @pytest.mark.usefixtures('code_default_config')
+    def test_one_slot_is_reserved_by_default(self):
+        assert OrchestratorConfig().main_health_fix_reserved_slots == 1
+
+    def test_zero_disables_the_reserve(self):
+        assert OrchestratorConfig(main_health_fix_reserved_slots=0).main_health_fix_reserved_slots == 0
+
+    def test_a_negative_reserve_is_rejected(self):
+        with pytest.raises(ValidationError):
+            OrchestratorConfig(main_health_fix_reserved_slots=-1)
+
+    def test_the_reserve_is_restart_only(self):
+        """The run loop builds its RunSlots once, like the max_concurrent_tasks pool beside it."""
+        assert 'main_health_fix_reserved_slots' not in RELOADABLE_FIELDS
+
+
 class TestTransientRequeueBackoffConfig:
     """The two jittered-backoff knobs (task 3317 / PRD contract C3).
 

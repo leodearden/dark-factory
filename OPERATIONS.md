@@ -1992,6 +1992,7 @@ takes no arguments: it always re-reads that process's own
 effect until a full restart):**
 
 - `max_concurrent_tasks`
+- `main_health_fix_reserved_slots`
 - Pool sizes / `verify_runners`
 - `escalation` bind host/port
 - `sandbox.backend`
