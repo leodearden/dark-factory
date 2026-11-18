@@ -1029,11 +1029,10 @@ async def _range_cites_only(
     False for an opted-out (``''``) or invalid citation pattern, and for a
     stand-in *git_ops* without a git config: ownership cannot be shown.
     """
-    config = getattr(git_ops, 'config', None)
     try:
         pattern = task_citation_pattern(
             task_id, pattern_template,
-            branch_prefix=config.branch_prefix, main_branch=config.main_branch,
+            branch_prefix=git_ops.config.branch_prefix, main_branch=git_ops.config.main_branch,
         )
     except (AttributeError, CitationPatternInvalid):
         return False
@@ -1239,6 +1238,7 @@ async def _delivered_checks_differential(
                     ),
                 })
                 continue
+            assert parent_ref is not None
             results = {}
             for label, ref in (
                 ('parent', parent_ref),
