@@ -128,7 +128,7 @@ from orchestrator.recovery_emission import (
 from orchestrator.recovery_pins import records_pin_blocked_recovery
 from orchestrator.sentinel_l1 import file_sentinel_l1, resolve_sentinel_l1
 from orchestrator.starvation_cap import CapReport, cap_report, sync_cap_l1
-from orchestrator.starvation_state import StarvationStateStore, WatchdogState
+from orchestrator.starvation_state import WatchdogState
 from orchestrator.starvation_watchdog import (
     AUTO_PIN_CAP_SENTINEL,
     STARVATION_WATCHDOG_ROLE,
@@ -1581,9 +1581,8 @@ class Scheduler:
         # (lock refusals, announced tasks, the cap cohort and its last
         # announcement).
         self._eligibility = EligibilityClock(eligibility_clock_store, self._project_root)
-        self._watchdog_state = WatchdogState(
-            None if eligibility_clock_store is None
-            else StarvationStateStore(eligibility_clock_store.db_path),
+        self._watchdog_state = WatchdogState.load_from(
+            None if eligibility_clock_store is None else eligibility_clock_store.db_path,
             self._project_root,
         )
         # The continuity probe's one git child (task 3820, PRD C3); git.* is

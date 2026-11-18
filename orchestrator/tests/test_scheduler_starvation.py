@@ -525,11 +525,11 @@ def _prior_cohort_refusals(tmp_path: Path, skip_threshold: int) -> None:
 
     A scan is one tick, and accruing a production-sized threshold one tick at
     a time costs minutes on a loaded host; the durable state is the seam a
-    previous process writes anyway.  The store counts one refusal per listed
+    previous process writes anyway.  The store adds one refusal per listed
     id, so every prior scan lands in one transaction.
     """
     scans = skip_threshold - (_COHORT_SCANS - 1)
-    StarvationStateStore(tmp_path / 'scheduler_eligibility.db').note_scan(
+    StarvationStateStore(tmp_path / 'scheduler_eligibility.db').increment_refusals(
         str(tmp_path), ['S1', 'S2', 'S3'] * scans,
     )
 

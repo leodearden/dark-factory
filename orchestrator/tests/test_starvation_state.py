@@ -30,7 +30,7 @@ def _state(tmp_path: Path, root: str = ROOT) -> WatchdogState:
 
 
 class _BrokenWritesStore(StarvationStateStore):
-    def note_scan(self, project_root: str, task_ids: Iterable[str]) -> None:
+    def increment_refusals(self, project_root: str, task_ids: Iterable[str]) -> None:
         raise sqlite3.OperationalError('disk I/O error')
 
     def announce(self, project_root: str, task_id: str) -> None:
@@ -128,6 +128,24 @@ class TestRestart:
 
         assert _state(tmp_path).baseline() == CapBaseline.EMPTY
 
+    def test_an_unreadable_baseline_restarts_from_the_empty_one(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        state = _state(tmp_path)
+        state.note_scan(['a'])
+        state.record_baseline(BASELINE)
+        conn = sqlite3.connect(str(_db(tmp_path)))
+        with conn:
+            conn.execute("UPDATE cap_announcement SET modules='not json'")
+        conn.close()
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.starvation_state'):
+            restarted = _state(tmp_path)
+
+        assert restarted.baseline() == CapBaseline.EMPTY
+        assert restarted.refusals('a') == 1
+        assert any('not json' in r.getMessage() for r in caplog.records)
+
     def test_a_waiting_row_with_an_unknown_gate_is_skipped(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
     ) -> None:
@@ -181,6 +199,17 @@ class TestForget:
             assert view.announced() == frozenset({'a'})
             assert view.task_ids() == frozenset({'a'})
 
+    def test_waiting_is_a_snapshot_its_reader_may_drop_from(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        state.wait('a', StarvationGate.LOCK_REFUSED)
+        state.wait('b', StarvationGate.DUAL)
+        before = state.waiting()
+
+        state.drop_waiting(tid for tid in state.waiting())
+
+        assert dict(before) == {'a': StarvationGate.LOCK_REFUSED, 'b': StarvationGate.DUAL}
+        assert dict(_state(tmp_path).waiting()) == {}
+
     def test_task_ids_is_the_union_of_every_per_task_fact(self, tmp_path: Path) -> None:
         state = _state(tmp_path)
         state.note_scan(['r'])
@@ -223,14 +252,10 @@ class TestScope:
         assert restarted.refusals('A') == 1
         assert restarted.baseline() == BASELINE
 
-    def test_from_config_uses_the_eligibility_file(self, tmp_path: Path) -> None:
-        from orchestrator.config import OrchestratorConfig
+    def test_load_from_reads_the_file_a_previous_process_wrote(self, tmp_path: Path) -> None:
+        _state(tmp_path).note_scan(['a'])
 
-        config = OrchestratorConfig(project_root=tmp_path)
-        store = StarvationStateStore.from_config(config)
-
-        assert store.db_path == config.eligibility_clock_db_path
-        assert store.db_path.exists()
+        assert WatchdogState.load_from(_db(tmp_path), ROOT).refusals('a') == 1
 
 
 class TestFailOpen:
@@ -267,6 +292,24 @@ class TestFailOpen:
         assert state.task_ids() == frozenset()
         assert state.baseline() == CapBaseline.EMPTY
         assert any(r.levelno == logging.WARNING for r in caplog.records)
+
+    def test_an_unopenable_file_keeps_the_state_in_memory(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        _db(tmp_path).mkdir()
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.starvation_state'):
+            state = WatchdogState.load_from(_db(tmp_path), ROOT)
+        state.note_scan(['a'])
+
+        assert state.refusals('a') == 1
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
+
+    def test_no_file_is_memory_only(self) -> None:
+        state = WatchdogState.load_from(None, ROOT)
+        state.note_scan(['a'])
+
+        assert state.refusals('a') == 1
 
     def test_memory_only_state(self) -> None:
         state = WatchdogState(None, ROOT)

@@ -31,7 +31,6 @@ from typing import ClassVar
 
 from shared.sqlite_sync_base import apply_full_durability_pragmas_sync
 
-from orchestrator.config import OrchestratorConfig
 from orchestrator.starvation_watchdog import StarvationGate
 
 logger = logging.getLogger(__name__)
@@ -99,10 +98,6 @@ class StarvationStateStore:
         finally:
             conn.close()
 
-    @classmethod
-    def from_config(cls, config: OrchestratorConfig) -> StarvationStateStore:
-        return cls(config.eligibility_clock_db_path)
-
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(str(self.db_path))
         apply_full_durability_pragmas_sync(conn, busy_timeout_ms=5000)
@@ -144,8 +139,8 @@ class StarvationStateStore:
             baseline=CapBaseline.EMPTY if baseline is None else _parse_baseline(baseline),
         )
 
-    def note_scan(self, project_root: str, task_ids: Iterable[str]) -> None:
-        """Count one refusal for each of *task_ids*, in one transaction."""
+    def increment_refusals(self, project_root: str, task_ids: Iterable[str]) -> None:
+        """Add one refusal per entry of *task_ids*, in one transaction: a task listed n times gains n."""
         self._write(
             'INSERT INTO lock_refusals (project_root, task_id, refusals) VALUES (?, ?, 1) '
             'ON CONFLICT (project_root, task_id) DO UPDATE SET refusals = refusals + 1',
@@ -213,9 +208,18 @@ def _parse_waiting(rows: Iterable[tuple[str, str]]) -> dict[str, StarvationGate]
 
 def _parse_baseline(row: tuple[int, str, str]) -> CapBaseline:
     size, modules, subjects = row
-    return CapBaseline(
-        size=size, modules=frozenset(json.loads(modules)), subjects=frozenset(json.loads(subjects)),
-    )
+    try:
+        return CapBaseline(
+            size=size,
+            modules=frozenset(json.loads(modules)),
+            subjects=frozenset(json.loads(subjects)),
+        )
+    except (ValueError, TypeError):
+        logger.warning(
+            'starvation state: unreadable cap announcement %r; starting from an empty '
+            'baseline', row, exc_info=True,
+        )
+        return CapBaseline.EMPTY
 
 
 def _best_effort(what: str, write: Callable[[], None]) -> None:
@@ -244,6 +248,21 @@ class WatchdogState:
         self._waiting: dict[str, StarvationGate] = dict(stored.waiting)
         self._baseline = stored.baseline
 
+    @classmethod
+    def load_from(cls, db_path: Path | None, project_root: str) -> WatchdogState:
+        """*project_root*'s state in *db_path*; memory-only when None or when the file cannot be opened."""
+        if db_path is None:
+            return cls(None, project_root)
+        try:
+            store = StarvationStateStore(db_path)
+        except (sqlite3.Error, OSError):
+            logger.warning(
+                'starvation state: cannot open %s; it holds in memory for this process '
+                'only', db_path, exc_info=True,
+            )
+            return cls(None, project_root)
+        return cls(store, project_root)
+
     def _load(self) -> StoredWatchdogState:
         empty = StoredWatchdogState({}, frozenset(), {}, CapBaseline.EMPTY)
         if self._store is None:
@@ -268,7 +287,7 @@ class WatchdogState:
         if not once:
             return
         self._refusals.update(once)
-        self._persist(f'{len(once)} refusal(s)', lambda s, r: s.note_scan(r, once))
+        self._persist(f'{len(once)} refusal(s)', lambda s, r: s.increment_refusals(r, once))
 
     def refusals(self, task_id: str) -> int:
         return self._refusals.get(task_id, 0)
@@ -283,7 +302,7 @@ class WatchdogState:
         self._persist(f'the announcement of {task_id}', lambda s, r: s.announce(r, task_id))
 
     def waiting(self) -> Mapping[str, StarvationGate]:
-        return MappingProxyType(self._waiting)
+        return MappingProxyType(dict(self._waiting))
 
     def wait(self, task_id: str, gate: StarvationGate) -> None:
         if self._waiting.get(task_id) is gate:
