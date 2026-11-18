@@ -173,6 +173,13 @@ class TestBranchTipLanded:
 
         assert await branch_tip_landed(git_ops, 'task/704', tip, landing_sha='0' * 40) is False
 
+    async def test_landing_with_no_first_parent_is_not_landed(
+        self, repo: _Repo, git_ops: GitOps,
+    ) -> None:
+        root = repo.git('rev-list', '--max-parents=0', 'main')
+
+        assert await branch_tip_landed(git_ops, 'task/705', root, landing_sha=root) is False
+
     async def test_no_attributed_landing_falls_back_to_the_branch_merge_marker(
         self, repo: _Repo, git_ops: GitOps,
     ) -> None:
