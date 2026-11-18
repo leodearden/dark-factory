@@ -194,14 +194,6 @@ def wire_live_status_from_get_task(scheduler_mock: MagicMock) -> None:
 # add a second copy -- import this one.
 PYPROJECT_DEFAULT_TIMEOUT = 420
 
-# Headroom a per-test ceiling must keep over its family's measured-under-load
-# worst case.  8x rather than 2x: the breaches these ceilings exist to prevent
-# (xdist worker deaths, in the thread era before task 6354) were observed at
-# loadavg 250-423, one inflation step past the load at which any measurement
-# has been taken.  Rationale and corpus:
-# plans/pytest-per-test-timeout-measurement-2026-09-17.md.
-UNDER_LOAD_HEADROOM_FACTOR = 8
-
 # task 5147: the per-test budget VERIFY passes -- the `--timeout` token in
 # orchestrator/orchestrator.yaml's `test_command`.  A slow test loosens safely
 # by spelling `@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)`; the band it

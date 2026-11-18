@@ -116,6 +116,7 @@ PURE_STDLIB_LEAVES = (
     'testing_reify_layout',
     'testing_repo_wide_tests',
     'testing_streams',
+    'testing_timeout_headroom',
     'testing_timeout_markers',
     'testing_virtual_clock',
     'timestamps',

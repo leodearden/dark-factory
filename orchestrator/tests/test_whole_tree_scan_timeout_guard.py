@@ -75,7 +75,6 @@ import pytest
 from _orch_helpers import (
     ORCH_PYPROJECT,
     PYPROJECT_DEFAULT_TIMEOUT,
-    UNDER_LOAD_HEADROOM_FACTOR,
     VERIFY_CLI_PER_TEST_TIMEOUT,
 )
 from _tree_scan import (
@@ -89,6 +88,7 @@ from _tree_scan import (
 )
 from shared.governed_exceptions import Debt, TaskRef, TicketRef, governed_exceptions
 from shared.pytest_mark_grammar import marker_name, pytestmark_elements, scope_binding
+from shared.testing_timeout_headroom import UNDER_LOAD_HEADROOM_FACTOR
 from shared.testing_timeout_markers import SiteKind, timeout_marker_sites
 from shared.whole_tree_guard_family import (
     WHOLE_TREE_SCAN_TEST_TIMEOUT,
