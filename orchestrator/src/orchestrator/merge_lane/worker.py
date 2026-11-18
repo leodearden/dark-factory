@@ -5077,6 +5077,7 @@ async def build_chain(
     *,
     cap: int,
     target_depth: int,
+    verify_is_local: bool = True,
 ) -> ChainResult:
     """Speculatively merge a prefix of the queue onto the frozen head's tip.
 
@@ -5157,6 +5158,10 @@ async def build_chain(
             kill switch.  Keyword-only, so a call site can never transpose it
             with *target_depth*.
         target_depth: How deep this round actually wants to go.
+        verify_is_local: Whether the chain tip will be verified on this host,
+            from the dispatch's host lease.  It decides which lane the chain is
+            built in; see
+            :func:`~orchestrator.merge_lane.liveness.acquire_chain_build_lane`.
 
     Returns:
         A :class:`~orchestrator.merge_lane.types.ChainResult`.  A non-empty result
@@ -5185,6 +5190,7 @@ async def build_chain(
     try:
         lane, warm = await acquire_chain_build_lane(
             git_ops, queue_snapshot[0].config, head_merge_commit,
+            verify_is_local=verify_is_local,
         )
     except BaseException as exc:
         _log_build_interrupted('acquire', exc, started, depth=depth, built=0, acquire_ms=None)
@@ -11346,6 +11352,7 @@ class SpeculativeMergeWorker:
 
     async def _deep_chain_placement(
         self, item: RealMergeItem, *, frontier_depth: int | None = None,
+        verify_is_local: bool = True,
     ) -> ChainResult | None:
         """Decide whether THIS dispatch should verify a deep CHAIN tip instead
         of the item's own adjacent merge commit (task 3185, PRD γ; task 8527
@@ -11474,7 +11481,9 @@ class SpeculativeMergeWorker:
         candidates = snapshot[:d - 1]
         self._chain_reservations.reserve_candidates(owner, candidates)
         try:
-            result = await self._build_deep_chain(item, snapshot, base, cap=cap, d=d)
+            result = await self._build_deep_chain(
+                item, snapshot, base, cap=cap, d=d, verify_is_local=verify_is_local,
+            )
         except BaseException:
             self._chain_reservations.release(owner.request_id)
             raise
@@ -11492,7 +11501,7 @@ class SpeculativeMergeWorker:
 
     async def _build_deep_chain(
         self, item: RealMergeItem, snapshot: tuple[MergeRequest, ...], base: str,
-        *, cap: int, d: int,
+        *, cap: int, d: int, verify_is_local: bool,
     ) -> ChainResult | None:
         """Build *item*'s chain over *snapshot* onto *base*, bounded by the build
         deadline; None (the adjacent verify) on overrun, error or zero links.
@@ -11518,6 +11527,7 @@ class SpeculativeMergeWorker:
                     base,
                     cap=cap - 1,
                     target_depth=d - 1,
+                    verify_is_local=verify_is_local,
                 )
         except TimeoutError:
             # FAIL-OPEN. An overrun is not a merge fault, so it must not fail
@@ -21561,7 +21571,9 @@ class SpeculativeMergeWorker:
             # `except BaseException` arm is what returns it.  The obligation only
             # begins once `chain` is bound, and from that point to the
             # ensure_future there is still nothing that can raise.
-            chain = await self._deep_chain_placement(item, frontier_depth=depth)
+            chain = await self._deep_chain_placement(
+                item, frontier_depth=depth, verify_is_local=lease.is_local,
+            )
         except BaseException:
             # See the LEASE/PERMIT LEAK GUARD note above the `try`.  Hand back
             # both resources, then re-raise UNCHANGED -- this arm is a resource

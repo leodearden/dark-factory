@@ -1032,6 +1032,8 @@ async def acquire_chain_build_lane(
     git_ops: GitOps,
     config: OrchestratorConfig,
     base_commit: str,
+    *,
+    verify_is_local: bool = True,
 ) -> tuple[Path | None, bool]:
     """Acquire the ONE scratch worktree a deep merge-ahead chain builds in
     (task 3184, PRD β).
@@ -1088,7 +1090,10 @@ async def acquire_chain_build_lane(
     """
     del config  # accepted for seam symmetry; lane choice is git_ops-resident
     try:
-        lane, warm = await git_ops.acquire_spec_lane(base_commit)
+        if verify_is_local:
+            lane, warm = await git_ops.acquire_spec_lane(base_commit)
+        else:
+            lane, warm = await git_ops.create_ephemeral_verify_worktree(base_commit), False
     except Exception:
         logger.warning(
             'acquire_chain_build_lane: lane acquisition failed for %s — '
