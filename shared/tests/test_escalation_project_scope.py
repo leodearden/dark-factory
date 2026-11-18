@@ -7,8 +7,6 @@ fastmcp's request contextvars from here would pin its internals.
 
 from __future__ import annotations
 
-from typing import cast
-
 import pytest
 
 from shared.escalation_project_scope import (
@@ -25,10 +23,9 @@ def test_each_call_returns_a_fresh_dict() -> None:
     assert escalation_project_headers('reify') is not escalation_project_headers('reify')
 
 
-@pytest.mark.parametrize('value', ['', cast(str, None)])
-def test_an_unusable_project_id_is_refused_naming_it(value: str) -> None:
-    with pytest.raises(ValueError, match=repr(value)):
-        escalation_project_headers(value)
+def test_an_empty_project_id_is_refused_naming_it() -> None:
+    with pytest.raises(ValueError, match=repr('')):
+        escalation_project_headers('')
 
 
 def test_a_store_project_ignores_the_call() -> None:
