@@ -61,7 +61,6 @@ REVIEWER_LEG_ID = 'reviewer-comprehensive/workflow'
 AGGREGATE_ROLE = 'harness-info-l0-router'
 FALLBACK_ACTION = 'convert_to_task'
 AGGREGATE_CATEGORY = 'risk_identified'
-CONVERTED_CLASS = 'converted'
 
 
 def router_owns(record: Escalation, *, enabled: bool) -> bool:
@@ -490,7 +489,7 @@ def _close_converted(
     context: RouteContext,
 ) -> Applied:
     via = f' via curator ticket {ticket}' if ticket else ''
-    closed = _close(record, CONVERTED_CLASS, f': converted:{task_id}{via}', ports, context)
+    closed = _close(record, ConvertViaCurator.resolution_class, f': converted:{task_id}{via}', ports, context)
     return replace(closed, ticket=ticket)
 
 

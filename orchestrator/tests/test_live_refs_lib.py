@@ -101,7 +101,7 @@ def _wait_until(predicate: Callable[[], bool], what: str, deadline_s: float = 30
     """Poll *predicate* in 0.05s ticks.
 
     The deadline is a broken-infra backstop, not a timing assertion: the same
-    shape as test_warm_lane_gc.sh::_wait_for_reader_lock.
+    shape as lib_warm_lane_gc_harness.sh::_wait_for_reader_lock.
     """
     deadline = time.monotonic() + deadline_s
     while not predicate():

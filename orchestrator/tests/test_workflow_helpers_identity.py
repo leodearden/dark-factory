@@ -11,7 +11,7 @@ equivalent behaviour. A new promotion group puts its guard here.
 
 Import NO ``orchestrator.*`` lane module here -- only ``_workflow_helpers`` and
 the consumer suites, by bare test name. A lane import (any module in
-``scripts/merge_lane_metrics.py::CLUSTER_PATHS``) enrols this file in the
+``scripts/merge_lane_cluster.py::CLUSTER_PATHS``) enrols this file in the
 merge-lane ratchet sweep, which would count every ``<consumer>._<helper>``
 assertion below as a private read of lane internals.
 """

@@ -49,9 +49,11 @@ function rowTouchesModule(row, module) {
 }
 
 // An abandoned lock is one no live task can release: a park with a dead owner
-// anywhere in its stack, or a holder that has left the active task set while
-// a waiter still queues behind it. Both facts come from the server
-// (has_dead_park, holder_live); `=== false` keeps unknown liveness inert.
+// anywhere in its stack, or holders that have all left the active task set
+// while they fill the key's holder limit, so a waiter queued behind them can
+// never take it. Every fact comes from the server (has_dead_park, holder_live
+// = any holder live, at_holder_limit); `=== false` and `=== true` keep an
+// unknown verdict inert.
 // Deliberately not called "stranded": the Scheduler tab's stranded-parks
 // banner counts dead parks only, and this set adds departed holders.
 //
@@ -59,7 +61,8 @@ function rowTouchesModule(row, module) {
 // column, and it is what lifts a parked row ahead of the rest.
 function lockIsAbandoned(module) {
   return !!module.has_dead_park
-    || (!!module.holder && module.holder_live === false && (module.contention || 0) > 0)
+    || (!!module.holder && module.holder_live === false && module.at_holder_limit === true
+      && (module.contention || 0) > 0)
 }
 
 // The columns: a contended HEAD (a prefix of the contention > 1 modules in

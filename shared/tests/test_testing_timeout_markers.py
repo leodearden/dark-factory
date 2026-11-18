@@ -284,8 +284,8 @@ def test_the_band_edges_are_exactly_where_the_design_puts_them() -> None:
         True,  # 150         -- measured, test_offline_lane_integration.py
         True,  # 180         -- measured, the most common in-band value (34 sites)
         True,  # 299         -- last inverting value
-        False,  # 300        -- WHOLE_TREE_SCAN / the CLI budget
-        False,  # 360        -- loosens under both
+        False,  # 300        -- the CLI budget
+        False,  # 360        -- a slow test's opt-out: at least what verify grants with no marker
         False,  # 960        -- PYTEST_TIMEOUT (warm-lane bash bucket)
     ]
 

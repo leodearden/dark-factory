@@ -2699,9 +2699,9 @@ class TestBulkAndSingleRefreshShareTheEdgePopulation:
         bulk = [q for q in graph.queries if 'RELATES_TO' in q]
 
         graph.queries.clear()
-        # ...and the single-entity refresh.  _DualCorpusGraph's edge corpus is
-        # 4-column (bulk shape); get_valid_edges_for_node reads columns 0..2, so
-        # the rows are harmless here — the claim under test is the predicate.
+        # ...and the single-entity refresh, whose read has its own row shape:
+        # uuid, fact, name, valid_at, invalid_at.
+        graph.edge_rows = [['e1', 'Task 99 depends on Task 98', 'DEPENDS_ON', None, None]]
         await backend.refresh_entity_summary(
             'u1', group_id='test', name='Task 99', old_summary='stale'
         )

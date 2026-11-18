@@ -381,7 +381,7 @@ When unsure, reload first — it's cheap and non-destructive (fail-closed on bad
 
 Every call — success or failure — appends a `config_reload` event row to `runs.db` and fires a WARNING journal line whenever `restart_required` is non-empty or `reloaded=false`, so an AFK operator can audit what happened after the fact.
 
-See `CLAUDE.md`'s "Orchestrator Config Reload" section for the quick-reference tier summary, and `plans/config-hot-reload-prd.md` for the full allowlist and invariants.
+See `OPERATIONS.md` §"Config reload vs restart" for the tier summary, and `plans/config-hot-reload-prd.md` for the full allowlist and invariants.
 
 ---
 

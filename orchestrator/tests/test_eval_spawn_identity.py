@@ -65,6 +65,7 @@ def _recording_invoke(
     MeasurementStage.ASSESSOR,
     MeasurementStage.SYNTHESIZER,
     MeasurementStage.MATCHER,
+    MeasurementStage.LABEL_PROPOSER,
 ])
 async def test_measured_call_declares_the_eval_identity(stage: MeasurementStage) -> None:
     invoke, calls = _recording_invoke(answered({'x': 1}))

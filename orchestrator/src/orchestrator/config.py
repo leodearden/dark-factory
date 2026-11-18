@@ -2507,7 +2507,8 @@ class GitConfig(BaseModel):
         ge=0,
         description=(
             'Extra warm task-lanes allocated ABOVE the derived pool size '
-            '(max_concurrent_tasks); effective pool N = max_concurrent_tasks + '
+            '(max_concurrent_tasks + main_health_fix_reserved_slots); effective '
+            'pool N = max_concurrent_tasks + main_health_fix_reserved_slots + '
             'spare_warm_lanes when warm_lane_pool is on (read once at startup by '
             'Harness, passed to GitOps). Gives acquire headroom so a transient '
             'lane-leak / stuck-ASSIGNED lane does not exhaust the pool and force '
@@ -2523,7 +2524,8 @@ class GitConfig(BaseModel):
             'warm-lane pool on disk at startup (GitOps.prewarm_pool), instead of '
             'letting each _lane-k be created lazily on its first acquire.  Root '
             'cause it addresses: the pool is effective_N = max_concurrent_tasks + '
-            'spare_warm_lanes FREE lanes in memory, but the on-disk git worktree '
+            'main_health_fix_reserved_slots + spare_warm_lanes FREE lanes in '
+            'memory, but the on-disk git worktree '
             'add for each lane happens only in the acquire create-once branch, '
             'lowest-numbered-first — so on a host peaking below effective_N the '
             'spare lanes are never demanded, never created, and the intended '
@@ -3824,6 +3826,10 @@ class OrchestratorConfig(BaseSettings):
 
     # Concurrency
     max_concurrent_tasks: int = Field(default=3)
+    # Run slots outside max_concurrent_tasks that only a main-health fix task may
+    # take, used when every general slot is held; 0 disables. Restart-only (not in
+    # RELOADABLE_FIELDS). Rationale: docs/main-health-fix-run-slot-reserve.md.
+    main_health_fix_reserved_slots: int = Field(default=1, ge=0)
     max_per_module: int = Field(default=1)
     lock_depth: int = Field(default=2)
     module_overrides: dict[str, int] = Field(default_factory=dict)
@@ -4283,18 +4289,16 @@ class OrchestratorConfig(BaseSettings):
     # configs that do not merge defaults.yaml keep the old fallback behaviour.
     merge_verify_cold_command_timeout_secs: float | None = Field(default=None)
     merge_verify_workspace: bool = Field(default=False)
-    # Staged-rollout gate for the broad merge gate (λ, task 2589).  'scoped'
-    # (default) is the legacy per-touched-module verify plan — byte-identical
-    # rollback path.  'full' makes merge-role (role='merge') verify run EVERY
-    # REGISTERED module's full suite (pytest+ruff+pyright, per configured
-    # command), not just the modules touched by the merging diff — closing
-    # the source-only-diff hole where an untouched sibling module's tests
-    # never ran at merge time.  Restart-only: deliberately NOT in
-    # RELOADABLE_FIELDS, because flipping the gate's breadth mid-process
-    # could split behaviour across an in-flight merge on the most
-    # load-bearing lane.  Flipped 'scoped' → 'full' by the σ capstone and
-    # activated by the τ deterministic-deploy fleet restart.
-    merge_verify_breadth: Literal['scoped', 'full'] = Field(default='scoped')
+    # Breadth of the merge-role (role='merge') verify gate.  'full' (the
+    # shipped default, task 7008) runs EVERY REGISTERED module's full suite
+    # (pytest+ruff+pyright, per configured command) on the merged tree,
+    # whatever the diff touched; 'scoped' is the per-project opt-down to the
+    # legacy per-touched-module plan.  The paired task/merge verify policy is
+    # stated once, in defaults.yaml's merge_verify_breadth comment.
+    # Restart-only: deliberately NOT in RELOADABLE_FIELDS, because flipping
+    # the gate's breadth mid-process could split behaviour across an
+    # in-flight merge on the most load-bearing lane.
+    merge_verify_breadth: Literal['scoped', 'full'] = Field(default='full')
     # Soundness narrowing for the CAS-loop disjoint-delta fast path (the
     # 2026-09-22 whole-tree-drift incident).  ``merge_gates._reverify_rebased_tree``
     # skips the post-rebase re-verify when the branch's touched files and the
@@ -4318,8 +4322,9 @@ class OrchestratorConfig(BaseSettings):
     # behaviour (disjointness alone clears the gate) if the extra re-verifies
     # ever have to be traded away under load; the P1 arm keyed on
     # ``merge_verify_breadth == 'full'`` is NOT covered by this switch,
-    # because a project that has declared a whole-tree gate has declared the
-    # skip unsound outright.
+    # because a project whose merge gate is whole-tree (breadth 'full', the
+    # shipped default unless it opts down to 'scoped') has made the skip
+    # unsound outright.
     #
     # GREEN TIER (see RELOADABLE_FIELDS below, and OPERATIONS.md
     # section "Config reload vs restart").  Unlike its restart-only

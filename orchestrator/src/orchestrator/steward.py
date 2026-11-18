@@ -71,6 +71,7 @@ from orchestrator.workflow_types import (
     StewardInterrupted,
     StewardReescalatedL1,
     StewardResolved,
+    WorkflowState,
     classify_failure,
 )
 
@@ -81,11 +82,11 @@ if TYPE_CHECKING:
     from escalation.queue import EscalationQueue
     from shared.config_dir import TaskConfigDir
     from shared.cost_store import CostStore
+    from shared.usage_gate import UsageGate
 
     from orchestrator.agents.briefing import BriefingAssembler
     from orchestrator.config import OrchestratorConfig
     from orchestrator.mcp_lifecycle import McpLifecycle
-    from orchestrator.usage_gate import UsageGate
     from orchestrator.workflow_types import StewardOutcome
 
 logger = logging.getLogger(__name__)
@@ -688,7 +689,7 @@ class TaskSteward:
         if self.event_store:
             self.event_store.emit(
                 EventType.invocation_end,
-                task_id=self.task_id, phase='escalated', role='steward',
+                task_id=self.task_id, phase=WorkflowState.ESCALATED.value, role='steward',
                 cost_usd=result.cost_usd, duration_ms=result.duration_ms,
                 data={
                     'turns': result.turns, 'success': result.success,
@@ -896,6 +897,7 @@ class TaskSteward:
             event_store=self.event_store,
             cost_store=self.cost_store,
             applied_budget_usd=per_invocation_budget,
+            phase=WorkflowState.ESCALATED,
         )
         kwargs: dict = dict(
             prompt=prompt,
@@ -1047,6 +1049,7 @@ class TaskSteward:
             in_memory_task=self.task,
             event_store=self.event_store,
             cost_store=self.cost_store,
+            phase=WorkflowState.ESCALATED,
         )
         remaining = self._remaining_lifetime_budget()
         if remaining <= decision.budget_usd:

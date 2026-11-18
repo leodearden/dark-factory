@@ -294,6 +294,15 @@ child: a gate built in a child sweeps whatever tempdir the child inherits, and
 that child's spawner must pass a private ``TMPDIR``, as
 ``orchestrator/tests/test_sighup.py::_exit_after_hup_then_term`` does.
 
+EIGHTH DEFENCE — a mock can never leave a mock-derived directory in the CWD.
+
+``_df_no_mock_derived_stray_dirs`` fails, and cleans up after, any test that
+leaves a tree such as ``AsyncMock/`` or ``MagicMock/`` in the CWD, the shape
+``Path(mock).mkdir()`` produces.  Every test-root conftest binds it, as
+``tests/scripts/test_basetemp_git_isolation.py::_REQUIRED_FIXTURE_BINDINGS``
+enforces; tasks 3223 and 4592 committed such trees from the orchestrator and
+fused-memory suites.
+
 Import constraint: STDLIB + PYTEST ONLY.  Every subproject conftest imports this
 module, so it must import cleanly inside every member venv — escalation's lacks
 aiosqlite and stubs ``shared`` in ``sys.modules``, so nothing under ``shared/src``
@@ -313,10 +322,12 @@ import enum
 import json
 import math
 import os
+import shutil
 import signal
 import subprocess
 import tempfile
 import time
+import unittest.mock
 import uuid
 import warnings
 from collections.abc import Callable, Iterable, Mapping
@@ -3008,3 +3019,109 @@ def _df_claude_binary_unset(monkeypatch: pytest.MonkeyPatch) -> None:
     still set the variable deliberately.
     """
     monkeypatch.delenv(CLAUDE_BINARY_ENV, raising=False)
+
+
+# ---------------------------------------------------------------------------
+# Mock-derived stray directories (task 5145)
+# ---------------------------------------------------------------------------
+
+
+def _public_mock_classes() -> tuple[type, ...]:
+    public = (getattr(unittest.mock, name) for name in unittest.mock.__all__)
+    return tuple(sorted(
+        (c for c in public if isinstance(c, type) and issubclass(c, unittest.mock.NonCallableMock)),
+        key=lambda cls: cls.__name__,
+    ))
+
+
+# Every one's repr, and so str(), is '<ClassName ...>': the FILE shape a mock
+# passed to sqlite3.connect(str(...)) leaves, PathLike or not.
+STDLIB_MOCK_CLASSES = _public_mock_classes()
+
+
+def mock_fspath_root_names(classes: Iterable[type]) -> tuple[str, ...]:
+    """The sorted leading ``os.fspath()`` components of the PathLike mocks in *classes*.
+
+    A class whose instances are not PathLike contributes nothing.  Raises
+    ValueError for a component that is not a plain class name, because the
+    guard rmtree's ``cwd / name`` and a ``..`` or ``/`` would reach past the CWD.
+    """
+    names = set()
+    for cls in classes:
+        try:
+            fspath = os.fspath(cls())
+        except TypeError:
+            continue
+        name = next(iter(Path(fspath).parts), '')
+        if not name.isidentifier():
+            raise ValueError(
+                f'os.fspath({cls.__qualname__}()) is {fspath!r}, whose leading '
+                f'component {name!r} is not a class name; the stray-dir guard '
+                'would rmtree outside the CWD with it.'
+            )
+        names.add(name)
+    return tuple(sorted(names))
+
+
+# Every MagicMixin-based mock's os.fspath() is '<its own class name>/<mock
+# name>/<id>'. DERIVED from the public stdlib classes, so a Python release that
+# adds one is covered with no edit; on 3.13 that is AsyncMock, MagicMock,
+# NonCallableMagicMock and ThreadingMock. AsyncMock is NOT a MagicMock subclass:
+# it shares MagicMixin, which is why a MagicMock-only list missed it.
+MOCK_FSPATH_ROOT_NAMES = mock_fspath_root_names(STDLIB_MOCK_CLASSES)
+
+
+def mock_derived_stray_dirs(cwd: Path) -> list[Path]:
+    """The mock-derived directory trees directly under *cwd*, in name order."""
+    return [cwd / name for name in MOCK_FSPATH_ROOT_NAMES if (cwd / name).is_dir()]
+
+
+def mock_derived_stray_dir_reason(nodeid: str, strays: list[Path]) -> str | None:
+    """The failure message for *strays* left by test *nodeid*, or None when clean."""
+    if not strays:
+        return None
+    left = ', '.join(map(str, strays))
+    classes = ', '.join(MOCK_FSPATH_ROOT_NAMES)
+    return (
+        f'{nodeid} left mock-derived directories: {left}. '
+        f"unittest.mock's {classes} are valid "
+        "os.PathLike[str] whose os.fspath() is repr-derived "
+        "('<ClassName>/<mock name>/<id>'), so passing one where real code calls "
+        'Path(...).mkdir() creates a real tree under the CWD. Give the mock a '
+        'genuine path (e.g. `git_ops.project_root = tmp_path`) instead of letting '
+        'the attribute auto-spec into a child mock. The stray tree has been '
+        'removed so following tests are unaffected.'
+    )
+
+
+@pytest.fixture(autouse=True)
+def _df_no_mock_derived_stray_dirs(request):
+    """EIGHTH DEFENCE — a mock can never leave a mock-derived directory tree in the CWD.
+
+    Production code that coerces a mock with ``Path()`` and creates directories
+    materialises its repr-derived fspath for real; tasks 3223 (``MagicMock/``)
+    and 4592 (``AsyncMock/``) each landed such a tree in a commit.
+
+    FUNCTION scope, like ``_df_git_env_hermetic``.  The CWD and the trees already
+    in it are captured at SETUP: a test that chdir's without restoring cannot
+    hide its tree, and only a tree that APPEARED during the test is blamed and
+    removed.  So a tree left before the session is never pinned on a test (nor
+    seen until removed by hand; ``.gitignore`` contains it).  Every xdist worker
+    shares one CWD, so the named test is the one whose teardown first saw the
+    tree: usually, not always, the leaker.  Removing it keeps one polluter from
+    failing every later test.
+
+    Deliberately NOT matched: the ``<ClassName ...>`` repr FILE shape.
+    ``.gitignore`` contains it everywhere, and in the orchestrator suite
+    ``orchestrator/tests/conftest.py::_no_mock_repr_stray_entries`` fails a
+    test that leaves one.
+    """
+    cwd = Path.cwd()
+    present_at_setup = set(mock_derived_stray_dirs(cwd))
+    yield
+    strays = [d for d in mock_derived_stray_dirs(cwd) if d not in present_at_setup]
+    for stray in strays:
+        shutil.rmtree(stray, ignore_errors=True)
+    reason = mock_derived_stray_dir_reason(request.node.nodeid, strays)
+    if reason is not None:
+        pytest.fail(reason, pytrace=False)

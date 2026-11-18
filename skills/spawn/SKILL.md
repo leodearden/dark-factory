@@ -170,24 +170,27 @@ A T3 thread outlives the turn that does the work, so a T3-hosted session may end
 
 **The act** is a `t3_thread_organize` call with no `threadId`, which names the calling thread; a thread may organize itself in any runtime mode.
 
-**Which act.** The spawn's `CLAUDE_SPAWN_T3_END` names it, or a skill ending its own session chooses:
+**Which act.** Both acts take the thread out of Leo's ready list, so either one hides whatever the session's last message holds. The spawn's `CLAUDE_SPAWN_T3_END` names the act, or a skill ending its own session chooses:
 
-- **settle** when the thread's own transcript is what Leo reads: an attended `/unblock`, `/prd` author mode, a hand carry, anything that ends awaiting input from him.
-- **archive** when the output lives elsewhere (review-all seats, workers whose output is `result.md`), or after a successful [`handoff`](#handoff--stop-reflect-then-spawn-a-sibling-escalation-watcher).
-- **No act** is the default.
+- **No act**, the default, for any session whose last message is for Leo: an answer, a study or report, a design, a recommendation, decisions or questions for him, or a blocked or abandoned outcome. The thread goes to ready, and he reads it there. Most studies, `/team` runs, `/prd` author sessions and attended `/unblock`s end this way.
+- **settle** only when the work is complete and asks nothing of Leo, but the transcript is worth keeping listed: an attended `/unblock` or hand carry that landed cleanly with `action_needed: none`.
+- **archive** only when the output lives elsewhere and asks nothing of Leo (review-all seats, workers whose output is `result.md` for a parent), or after a successful [`handoff`](#handoff--stop-reflect-then-spawn-a-sibling-escalation-watcher).
+
+**The end check.** A spawned act is the most the session may do, not an order. Before acting, the session asks: does my final message, or `result.md`, ask anything of Leo? That covers a question, a decision, a recommendation waiting on his go, an `action_needed` other than `none`, and an outcome of `blocked` or `abandoned`. If it does, the session takes **no act**, whatever the spawn asked, and its final message says in one line that it stayed in ready for that reason. A handoff predecessor's archive passes the check only when its closing message is the successor's link, the handover path and the lease result and nothing more (its `action_needed` naming the successor does not count). Anything that needs Leo, such as rulings, a brief of what happened while he was away, or parked items, goes into the handover for the successor to raise, or keeps the predecessor out of the archive.
 
 **Steps**, in this order:
 
 1. Make `result.md` final: an `outcome:` other than `in-progress`.
 2. Run `/reflect`, unless it already ran.
-3. Perform the act.
+3. Run the end check above. If anything is for Leo, stop here: no act.
+4. Perform the act.
    - **archive:** mark your own record exited,
      ```
      python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py exit --record <own record dir> --code 0
      ```
      where the record dir is `<fleet_root>/sessions/<slug>` from `self-record` (the recipe above). THEN call `t3_thread_organize` with action `"archive"` as your final tool call, with nothing after it: the detach kills this process, so its success cannot be observed from inside.
    - **settle:** call `t3_thread_organize` with action `"settle"`, read `settlesWhenTurnEnds: true` in its answer, then end the turn with no further tool call and no question pending. The settle applies only if this turn completes normally; a failed or interrupted turn, or one parked on a question, leaves the thread in the inbox. That happens silently and needs nothing further.
-4. **A refused act** (an `OrchestratorMcpFailure` result): write the act and T3's code and message into `result.md`'s `action_needed` once, and do not retry. After a refused archive, this session's next hook event corrects the record already marked exited.
+5. **A refused act** (an `OrchestratorMcpFailure` result): write the act and T3's code and message into `result.md`'s `action_needed` once, and do not retry. After a refused archive, this session's next hook event corrects the record already marked exited.
 
 **What the registry shows.**
 
@@ -254,7 +257,7 @@ When Leo says **"handoff"** (alone, or as "then handoff", "handoff when done"), 
    - **Confirm the successor.** On the T3 lane, read the script's stdout line `record=<dir> t3_thread_id=<id>` and open THAT record's `record.json` (percent-decode `<dir>` first). The successor is confirmed only by exit `0`, a line naming a record (not `none`), and that record carrying `display.t3_thread_id` equal to the line's id with `status: running`. Never look the record up by title: this session's own record carries the same one. On a terminal lane, exit `0` confirms the launch.
    - **Unconfirmed:** a non-zero exit, no line, `record=none`, an unset or different thread id, or a record that is not running (the silent-launch trap of 2026-11-01). Do NOT archive. Write the result file with `outcome: blocked` and `action_needed: queue unwatched; successor spawn failed (<exit code or reason>)`, tell Leo the queue is unwatched, and stop. Don't retry blind.
 5. **Hand back** — only once step 4 confirmed the successor. If this session has a result file (`$CLAUDE_SPAWN_RESULT_FILE`, or via `self-record` on the T3 lane), write it with `outcome: handed-off` and `action_needed` naming the successor. Close with one message: the successor's link (`t3-thread://v1/<thread id>` on the T3 lane, else its record slug), the handover path and lease result if step 2 ran Stopping, and anything left parked in step 1. Then do no further work, except step 6.
-6. **Archive a T3-hosted predecessor.** If this session is a T3 thread, after step 5's result file and closing message run the archive act of [Ending a T3 session](#ending-a-t3-session): the `exit` verb on your own record, then `t3_thread_organize` action `"archive"` as the final tool call. `/reflect` already ran in step 3; do not run it again.
+6. **Archive a T3-hosted predecessor.** If this session is a T3 thread, after step 5's result file and closing message run the archive act of [Ending a T3 session](#ending-a-t3-session), unless its end check keeps the thread in ready (anything left parked in step 1 does): the `exit` verb on your own record, then `t3_thread_organize` action `"archive"` as the final tool call. `/reflect` already ran in step 3; do not run it again.
 
 ## When NOT to use
 

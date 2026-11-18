@@ -24,20 +24,23 @@ from typing import Self
 
 from _orch_helpers import assert_isolated_git_repo, git_env_with_ceiling
 
-_CHECKOUT = Path(__file__).parents[2]
-_SCRIPTS = _CHECKOUT / 'scripts'
-if str(_SCRIPTS) not in sys.path:
-    sys.path.insert(0, str(_SCRIPTS))
+sys.path.insert(0, str(Path(__file__).parents[2] / 'scripts'))
 
-import merge_lane_metrics as metrics  # type: ignore[import-not-found]  # noqa: E402
-import source_measures  # type: ignore[import-not-found]  # noqa: E402
+import merge_lane_cluster as lane_cluster
+import merge_lane_metrics as metrics
+import merge_lane_ratchet as ratchet
+import source_measures
+
+_CHECKOUT = Path(__file__).parents[2]
 
 __all__ = [
     'GATE_IMPORT_CLOSURE',
     'RatchetRepo',
     'a_py_cognitive_raise',
     'blank_file_entry',
+    'lane_cluster',
     'metrics',
+    'ratchet',
     'record',
     'source_measures',
     'synthetic_report',
@@ -45,12 +48,14 @@ __all__ = [
 
 
 #: What either gate script needs beside it to run in a copied checkout: the
-#: gates' git plumbing, the instrument, and the checkout binding with the
-#: pyproject.toml it reads. A suite installing a gate adds only that gate and the
-#: hooks that run it, so a new import is named here once.
+#: gates' git plumbing, the verdict and the measurement stratum it imports (never
+#: the command line), and the checkout binding with the pyproject.toml it reads.
+#: A suite installing a gate adds only that gate and the hooks that run it, so a
+#: new import is named here once.
 GATE_IMPORT_CLOSURE = (
     'scripts/ratchet_revisions.py',
-    'scripts/merge_lane_metrics.py',
+    'scripts/merge_lane_ratchet.py',
+    'scripts/merge_lane_cluster.py',
     'scripts/source_measures.py',
     'scripts/_checkout.py',
     'pyproject.toml',
@@ -205,15 +210,15 @@ class RatchetRepo:
         return target
 
     def write_baseline(self, report: dict) -> Path:
-        return self.write_file(metrics.BASELINE_RELPATH, metrics.render_baseline(report))
+        return self.write_file(ratchet.BASELINE_RELPATH, ratchet.render_baseline(report))
 
     def write_baseline_text(self, text: str) -> Path:
         """Raw bytes, for a blob ``render_baseline`` would never produce."""
-        return self.write_file(metrics.BASELINE_RELPATH, text)
+        return self.write_file(ratchet.BASELINE_RELPATH, text)
 
     def write_entry(self, record: dict) -> str:
         """Record *record* as the writer does; its path, repo-relative."""
-        written = metrics.append_authorization(self.root / metrics.LEDGER_DIR_RELPATH, record)
+        written = ratchet.append_authorization(self.root / ratchet.LEDGER_DIR_RELPATH, record)
         return written.relative_to(self.root).as_posix()
 
     def stage(self, *relpaths: str) -> None:
@@ -232,10 +237,10 @@ class RatchetRepo:
             target.chmod(0o755)
 
 
-def record(raises: list[metrics.Violation], task_id: str = '5722') -> dict:
+def record(raises: list[ratchet.Violation], task_id: str = '5722') -> dict:
     """The ledger record `--authorize-raise <task_id>` appends for *raises*."""
-    return metrics.authorization_record(
-        metrics.RaiseAuthorization(task_id=task_id, reason=f'net-additive {task_id}'),
+    return ratchet.authorization_record(
+        ratchet.RaiseAuthorization(task_id=task_id, reason=f'net-additive {task_id}'),
         raises,
     )
 
@@ -245,10 +250,10 @@ def a_py_cognitive_raise(was: int, now: int, task_id: str) -> dict:
     b_py_cognitive = synthetic_report()['files']['b.py']['cognitive']
     return record(
         [
-            metrics.Violation.rose('cognitive', 'a.py', was, now),
-            metrics.Violation.rose(
+            ratchet.Violation.rose('cognitive', 'a.py', was, now),
+            ratchet.Violation.rose(
                 'total:cognitive',
-                metrics.CLUSTER_TOTAL_KEY,
+                ratchet.CLUSTER_TOTAL_KEY,
                 was + b_py_cognitive,
                 now + b_py_cognitive,
             ),

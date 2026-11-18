@@ -494,7 +494,7 @@ class TestMergeWorkerLaunchedAfterStartup:
 
         h._recover_crashed_tasks = recover_crashed_tasks
 
-        async def first_acquire() -> None:
+        async def first_acquire(*_args: object) -> None:
             loops_at_first_acquire.extend(_merge_worker_loops())
             raise RuntimeError('__stop_sentinel__')
 

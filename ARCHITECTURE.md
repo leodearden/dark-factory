@@ -862,8 +862,11 @@ branch (preferring a snapshot-tip comparison to avoid false negatives),
 performs the merge, and applies a drop-guard. `_run_post_merge_verify` then
 re-runs the verify suite against the new `main` tip through the same
 `VerifyRunnerPool`, bounded by retry budgets for timeouts, disk-full, and
-narrowed-scope retries. `merge_verify_breadth` defaults to `scoped` (touched
-modules only) rather than `full` (whole repo) — see §9 for the caveat.
+narrowed-scope retries. `merge_verify_breadth` defaults to `full` (every
+registered module's full suite at merge); `scoped` (touched modules only) is
+the per-project opt-down, and task verify stays scoped by policy. The paired
+policy is stated in the `merge_verify_breadth` comment of
+`orchestrator/src/orchestrator/defaults.yaml`; see §9 for the cost caveat.
 
 If post-merge verify goes red, the worker classifies whether `main` is
 *genuinely* broken (vs. a transient host issue) via a deferred,
@@ -1111,7 +1114,7 @@ design is in [RECONCILIATION_PLAN.md](RECONCILIATION_PLAN.md).
 | Escalations | `data/escalations/` + `get_pending_escalations`/`get_escalation` | Open L0/L1/L2 escalations, categories, resolution history |
 | Reconciliation findings | `data/reconciliation/`, consumed via `/recon-escalation-watcher` | Integrity findings from the `:8103` queue |
 | Dashboard | `dashboard/src/dashboard/data/*.py` (read-only pool over the same SQLite DBs) | Web UI: active tasks, merge queue, halt state, escalation analytics, task runtime, scheduler state, costs, burndown, recon status |
-| Verify artefacts | `data/verify-logs/<task_id>/` | Per-leg logs + summary JSON for RED verifies; the verify plan (scope decision) and — only under `merge_verify_breadth: full`, not the shipped default — gzipped merge-lane junit reports, both for green AND red, so cost/scope questions get an unconditioned sample. Callers passing no `archive_root` write nothing. Age + size pruned — see OPERATIONS.md §"Reading the verify artefact archive" for the join and counting caveats |
+| Verify artefacts | `data/verify-logs/<task_id>/` | Per-leg logs + summary JSON for RED verifies; the verify plan (scope decision) and — only under `merge_verify_breadth: full` (the shipped default; a project that opts down to `scoped` archives none) — gzipped merge-lane junit reports, both for green AND red, so cost/scope questions get an unconditioned sample. Callers passing no `archive_root` write nothing. Age + size pruned — see OPERATIONS.md §"Reading the verify artefact archive" for the join and counting caveats |
 | journalctl | systemd units (`StandardOutput=journal`) | Raw process logs — the event store is the durable structured record; journalctl is for live tailing and crash forensics |
 
 When debugging, prefer the event store and `get_merge_queue`/
@@ -1160,11 +1163,14 @@ a defense is active when it isn't:
   the same scrub so the target always resolves its own `.venv`. See
   `### Locating installed code` in `CLAUDE.md` for the one-line
   provenance check.
-- **Verify commands default to repo-wide scope in places**, not always
-  scoped strictly to the modules a task touched — `merge_verify_breadth`
-  defaults to `scoped`, but individual verify command derivation can still
-  fall back wider than the minimal touched set: slower than necessary, and
-  a source of unrelated flakiness bleeding into a task's verify result.
+- **Merge verify runs the whole registered suite by default.**
+  `merge_verify_breadth` defaults to `full`, so merge-gate cost scales with
+  the repo, not the diff; a project with a long gate can opt down to
+  `scoped` (see the `merge_verify_breadth` comment in
+  `orchestrator/src/orchestrator/defaults.yaml`). Separately, task-role
+  verify derivation can still fall back wider than the minimal touched set:
+  slower than necessary, and a source of unrelated flakiness bleeding into a
+  task's verify result.
 - **Warm lanes (pre-created, reused worktrees) are off by default.**
   `warm_lane_pool` and the persistent merge/offline-deep worktree options
   all default to `False` in this project's config — every dispatch pays the

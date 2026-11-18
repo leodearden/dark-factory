@@ -16,6 +16,7 @@ from pydantic_settings import (
 from shared.config_models import UsageCapConfig
 
 from fused_memory.config.checkout_anchor import anchor_at_checkout
+from fused_memory.config.retired_keys import drop_retired_keys
 
 # The ONE topic-slug namespace (task 3198, PRD D4). Imported from the
 # stdlib-only leaf, NOT from fused_memory.memory_metadata: that module
@@ -114,6 +115,18 @@ class YamlSettingsSource(PydanticBaseSettingsSource):
             raise RuntimeError(
                 f'Failed to expand environment variables in {self.config_path}: {e}'
             ) from e
+
+
+# --- Shared leaf normalisers ---
+
+def blank_means_inherit(value: str | None) -> str | None:
+    """None for a blank inheriting leaf, its one spelling of inherit.
+
+    Validators apply it when a config is built, and resolvers again at use.
+    """
+    if value is None or not value.strip():
+        return None
+    return value
 
 
 # --- Server ---
@@ -226,10 +239,21 @@ class ServerConfig(BaseModel):
 
 # --- LLM ---
 
+_RETIRED_OPENAI_PROVIDER_KEYS: frozenset[str] = frozenset({'organization_id'})
+
+
 class OpenAIProviderConfig(BaseModel):
     api_key: str | None = None
     api_url: str = 'https://api.openai.com/v1'
-    organization_id: str | None = None
+
+    @model_validator(mode='before')
+    @classmethod
+    def _drop_retired_keys(cls, data: object) -> object:
+        return drop_retired_keys(
+            data,
+            section='llm.providers.openai or embedder.providers.openai',
+            retired=_RETIRED_OPENAI_PROVIDER_KEYS,
+        )
 
 
 class AnthropicProviderConfig(BaseModel):
@@ -409,6 +433,28 @@ class RoutingConfig(BaseModel):
     confidence_threshold: float = Field(default=0.7)
     use_heuristics: bool = Field(default=True)
     llm_fallback: bool = Field(default=True)
+    openai_api_url: str | None = Field(
+        default=None,
+        description=(
+            "The routing LLM's own OpenAI-compatible endpoint, used by "
+            'add_memory auto-classification and read routing. None or blank '
+            'INHERITS llm.providers.openai.api_url, resolved at use by '
+            'routing/openai_client.py::LazyOpenAIClient. Restart-only: each '
+            'owner caches its client.'
+        ),
+    )
+    openai_api_key: str | None = Field(
+        default=None,
+        description=(
+            "The routing LLM's own API key. None or blank INHERITS "
+            'llm.providers.openai.api_key. Restart-only, like openai_api_url.'
+        ),
+    )
+
+    @field_validator('openai_api_url', 'openai_api_key')
+    @classmethod
+    def _blank_leaf_inherits(cls, value: str | None) -> str | None:
+        return blank_means_inherit(value)
 
 
 # --- Queue ---
@@ -571,22 +617,25 @@ class WriteJournalGrowthAlarmConfig(BaseModel):
 
 # --- Taskmaster ---
 
-class TaskmasterConfig(BaseModel):
-    """Configuration for the SQLite-backed task store.
+_RETIRED_TASKMASTER_KEYS: frozenset[str] = frozenset({
+    'transport', 'command', 'args', 'cwd', 'http_url', 'tool_mode',
+})
 
-    The class name is preserved for back-compat with consumers that still
-    import :class:`TaskmasterConfig`. Only ``project_root`` and
-    ``tool_mode`` are read by :class:`SqliteTaskBackend`; the other fields
-    are kept dormant so existing config files don't fail to load.
+
+class TaskmasterConfig(BaseModel):
+    """The server's primary project root, this section's only field.
+
+    ``fused_memory/models/scope.py::configured_primary_root`` normalises it. The
+    class and ``taskmaster:`` section names predate the SQLite cutover. Keys
+    retired with the Taskmaster subprocess are dropped at load with a warning.
     """
 
-    transport: str = Field(default='stdio', description='Unused after SQLite cutover')
-    command: str = Field(default='node', description='Unused after SQLite cutover')
-    args: list[str] = Field(default_factory=list, description='Unused after SQLite cutover')
-    cwd: str = Field(default='')
-    http_url: str = Field(default='')
     project_root: str = Field(default='.')
-    tool_mode: str = Field(default='all')
+
+    @model_validator(mode='before')
+    @classmethod
+    def _drop_retired_keys(cls, data: object) -> object:
+        return drop_retired_keys(data, section='taskmaster', retired=_RETIRED_TASKMASTER_KEYS)
 
 
 # --- Task metadata write-boundary validation (task 2162, W3-β) ---
@@ -2595,6 +2644,16 @@ class CuratorConfig(BaseModel):
             "PURE-GATE instead of the TDD architect. None disables the gate."
         ),
     )
+    registry_load_retry_seconds: float = Field(
+        default=300.0,
+        ge=0,
+        description=(
+            "A guard registry (blocklist, recon-premise, operational-ask) that "
+            "failed to load is retried on the first curation at least this "
+            "many seconds later; 0 retries on every curation. A registry that "
+            "loaded is never reloaded."
+        ),
+    )
 
     @model_validator(mode='after')
     def _validate_deferral_backoff_bounds(self) -> 'CuratorConfig':
@@ -2856,8 +2915,9 @@ class WriteTriageConfig(BaseModel):
             "The judge's OWN endpoint. None INHERITS "
             'llm.providers.<resolved judge provider>.api_url. When set it is '
             "the judge's SDK base_url for whichever provider arm the judge "
-            'resolves, and nothing else reads it: the main LLM arm and '
-            'add_memory auto-classification keep llm.providers.*.api_url. The '
+            'resolves, and nothing else reads it: the main LLM arm keeps '
+            'llm.providers.*.api_url, and add_memory auto-classification uses '
+            'routing.openai_api_url, which inherits it. The '
             'api_key still comes from the provider section. Blank means '
             'inherit. Green-tier hot-reloadable, read live per judge call. See '
             "plans/write-triage-flip-readiness-prd.md C1' (task σ)."
@@ -3028,9 +3088,7 @@ class WriteTriageConfig(BaseModel):
         too means a reload of a blank value reports null rather than an
         applied '' that the judge then silently ignores.
         """
-        if value is None or not value.strip():
-            return None
-        return value
+        return blank_means_inherit(value)
 
     @field_validator('t_high_by_category')
     @classmethod
@@ -3164,6 +3222,38 @@ class Mem0UpdateConfig(BaseModel):
             'preserving half. Green-tier hot-reloadable via reload_config.'
         ),
     )
+    agent_prefix_sanctioned_use: dict[str, str] = Field(
+        default_factory=lambda: {
+            'recon-stage-': (
+                'the reconciliation stage agents, which run automatically as '
+                'agent_id recon-stage-<stage>; no interactive or task-dispatched '
+                'session holds this role'
+            ),
+            'curator-': (
+                'an interactive memory-consolidation curation sitting executing '
+                'the procedure in skills/curate-fused-memories/SKILL.md, adopted '
+                'as curator-<sitting-slug>; read that procedure before any write '
+                'under this prefix'
+            ),
+            'link-heal-': (
+                'the link-heal executor (fused-memory/scripts/link_heal.py), which '
+                'writes metadata-only heals as agent_id link-heal-<run>; no '
+                'session adopts it by hand'
+            ),
+        },
+        description=(
+            'Maps each agent_id prefix to the role that prefix DECLARES. The '
+            'Mem0UpdateNotAuthorized refusal renders it per prefix for the '
+            'refusing arm\'s allowlist only; an allowlisted prefix with no entry '
+            'renders as undocumented, telling the caller not to adopt it. '
+            'Documenting a prefix here is part of the same act as widening '
+            'either allowlist. An entry for an ungranted prefix is inert. A YAML '
+            'value REPLACES this map wholesale, so restate every entry. agent_id '
+            'is self-reported: this text makes the norm legible, not the gate '
+            'enforceable. Green-tier hot-reloadable via reload_config as one '
+            'atomic leaf.'
+        ),
+    )
     storm_threshold: int = Field(
         default=20,
         gt=0,
@@ -3188,6 +3278,24 @@ class Mem0UpdateConfig(BaseModel):
             'read-live-per-record() basis as storm_threshold.'
         ),
     )
+
+    @field_validator('agent_prefix_sanctioned_use')
+    @classmethod
+    def _require_non_blank_sanctioned_uses(
+        cls, value: dict[str, str],
+    ) -> dict[str, str]:
+        for prefix, use in value.items():
+            if not prefix.strip():
+                raise ValueError(
+                    'mem0_update.agent_prefix_sanctioned_use has a blank prefix '
+                    f'key {prefix!r}; every key must name an agent_id prefix'
+                )
+            if not use.strip():
+                raise ValueError(
+                    f'mem0_update.agent_prefix_sanctioned_use[{prefix!r}] is '
+                    'blank; state the role the prefix declares, or remove the entry'
+                )
+        return value
 
 
 class EntityMintConfig(BaseModel):

@@ -34,12 +34,16 @@ if TYPE_CHECKING:
     )
     from orchestrator.merge_lane.intake_buffers import (
         MERGE_WORKER_SHUTDOWN_REASON,
+        is_merge_worker_shutdown,
     )
     from orchestrator.merge_lane.landing_evidence import (
         patch_content_contained,
     )
     from orchestrator.merge_lane.member_redrive import (
         MemberRedriveOutcome,
+    )
+    from orchestrator.merge_lane.outcome_facts import (
+        MergeBlockCategory,
     )
     from orchestrator.merge_lane.ports import (
         ClockPort,
@@ -87,6 +91,7 @@ _INTAKE = 'orchestrator.merge_lane.intake'
 _INTAKE_BUFFERS = 'orchestrator.merge_lane.intake_buffers'
 _LANDING_EVIDENCE = 'orchestrator.merge_lane.landing_evidence'
 _MEMBER_REDRIVE = 'orchestrator.merge_lane.member_redrive'
+_OUTCOME_FACTS = 'orchestrator.merge_lane.outcome_facts'
 _PORTS = 'orchestrator.merge_lane.ports'
 _TYPES = 'orchestrator.merge_lane.types'
 
@@ -114,6 +119,7 @@ _EXPORTS = _ExportTable({
     'MergeRequest': (_TYPES, 'MergeRequest'),
     'GroupMergeRequest': (_TYPES, 'GroupMergeRequest'),
     'MergeOutcome': (_TYPES, 'MergeOutcome'),
+    'MergeBlockCategory': (_OUTCOME_FACTS, 'MergeBlockCategory'),
     'MergeCancelRefusal': (_TYPES, 'MergeCancelRefusal'),
     'MergeCancelVerdict': (_TYPES, 'MergeCancelVerdict'),
     'OperatorMergeCancel': (_TYPES, 'OperatorMergeCancel'),
@@ -126,6 +132,7 @@ _EXPORTS = _ExportTable({
     'DROPPED_PLAN_TARGETS_REASON_PREFIX': (_GATES, 'DROPPED_PLAN_TARGETS_REASON_PREFIX'),
     'MAIN_HEALTH_RED_REASON_PREFIX': (_WORKER, 'MAIN_HEALTH_RED_REASON_PREFIX'),
     'MERGE_WORKER_SHUTDOWN_REASON': (_INTAKE_BUFFERS, 'MERGE_WORKER_SHUTDOWN_REASON'),
+    'is_merge_worker_shutdown': (_INTAKE_BUFFERS, 'is_merge_worker_shutdown'),
     'NEEDS_REBASE_REASON_PREFIX': (_WORKER, 'NEEDS_REBASE_REASON_PREFIX'),
     'PLAN_FILES_NOT_TOUCHED_REASON_PREFIX': (_GATES, 'PLAN_FILES_NOT_TOUCHED_REASON_PREFIX'),
     'POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX': (
@@ -165,6 +172,7 @@ __all__ = [
     'MAIN_HEALTH_RED_REASON_PREFIX',
     'MERGE_WORKER_SHUTDOWN_REASON',
     'MemberRedriveOutcome',
+    'MergeBlockCategory',
     'MergeCancelRefusal',
     'MergeCancelVerdict',
     'MergeLane',
@@ -190,6 +198,7 @@ __all__ = [
     'WaiterRecord',
     'coalesce_or_enqueue_merge_request',
     'enqueue_merge_request',
+    'is_merge_worker_shutdown',
     'patch_content_contained',
     'resolve_dispatch_time_merge_base',
     'retire_cancelled_merge_request',

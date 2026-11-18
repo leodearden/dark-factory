@@ -23,9 +23,11 @@ from shared.eval_lane import eval_lane_provenance
 # not pull fastmcp into every consumer of the base layer.
 from shared.mcp_markup_middleware import (
     FACT_MARKUP_DETECTED,
+    MARKUP_RECURRENCE_ROUTING,
     MARKUP_RESIDUE_ERROR_TYPES,
     MARKUP_STORM_ERROR_TYPE,
     MARKUP_UNRECOVERED_PARAM_ERROR_TYPE,
+    MARKUP_UNRECOVERED_PARAM_OUTCOME_CAVEAT,
     MARKUP_UNREPAIRABLE_ERROR_TYPE,
     MarkupGuardMiddleware,
     RepairPolicy,
@@ -950,8 +952,8 @@ _MARKUP_STORM_ALARM = GuardStormAlarm(
     agent_role=_MARKUP_GUARD_AGENT_ROLE,
     condition='the serialization leak is ACTIVE',
     suggested_action=(
-        'identify the leaking caller from the markup_detected facts and '
-        'report it against plans/toolcall-markup-containment-prd.md'
+        'identify the leaking caller from the markup_detected facts, then '
+        f'{MARKUP_RECURRENCE_ROUTING}'
     ),
 )
 
@@ -1066,8 +1068,9 @@ def _markup_residue_prose(record: dict[str, Any]) -> str:
     produces both.  ``MARKUP_UNREPAIRABLE_ERROR_TYPE`` means the call was
     REFUSED — nothing was written, and the caller was told, so a human may
     reasonably wait for it to resend.  ``MARKUP_UNRECOVERED_PARAM_ERROR_TYPE``
-    means the call was FORWARDED and LANDED without the parameter, and nobody
-    was told: no retry is coming, and the stored record is already wrong.  One
+    means the call was FORWARDED without the parameter, and nobody was told: no
+    retry is coming, and whether the call then succeeded is unknown here
+    (``MARKUP_UNRECOVERED_PARAM_OUTCOME_CAVEAT`` says why).  One
     hardcoded "the call was refused" sentence renders the second kind a record
     that contradicts its own summary three lines above, and the false half is
     the half that changes what an operator does.
@@ -1094,13 +1097,13 @@ def _markup_residue_prose(record: dict[str, Any]) -> str:
         )
     if error_type == MARKUP_UNRECOVERED_PARAM_ERROR_TYPE:
         return (
-            'THE CALL WAS FORWARDED WITHOUT THIS PARAMETER, and it LANDED. The '
-            'value below was recovered from the leak but could not be typed '
-            'against the parameter\'s declared schema, so it was dropped from '
-            'the call rather than passed through untyped. The caller was NOT '
-            'told — nobody is waiting on a retry, and the record that call '
-            'filed is already stored missing this field. The payload below is '
-            'the only surviving copy of it.'
+            'THE CALL WAS FORWARDED WITHOUT THIS PARAMETER. The value below '
+            'was recovered from the leak but could not be typed against the '
+            'parameter\'s declared schema, so it was dropped from the call '
+            'rather than passed through untyped. '
+            f'{MARKUP_UNRECOVERED_PARAM_OUTCOME_CAVEAT} The caller was NOT '
+            'told the value was dropped, so do not wait on a resend of it. The '
+            'payload below is the only surviving copy of it.'
         )
     logger.warning(
         'markup guard: filing an unrecognised residue kind %r — the middleware '
@@ -1493,8 +1496,8 @@ def create_server(
             '',
             'RAW PAYLOAD, VERBATIM AND ENTIRE — the only surviving copy. '
             'Recover it for the caller if it is still needed, then chase the '
-            'harness serialization leak that produced it '
-            '(plans/toolcall-markup-containment-prd.md).',
+            'harness serialization leak that produced it and '
+            f'{MARKUP_RECURRENCE_ROUTING}.',
             '',
             str(record.get('raw_value') or ''),
         ])
@@ -2686,7 +2689,10 @@ def create_server(
         NOTE: resolve_issue itself writes no task status — this call changes
         only the escalation record. The orchestrator harness applies the
         ``target_status`` values above. Table B's consumers are listed in the
-        ``escalation/src/escalation/action_effects.py`` module docstring.
+        ``escalation/src/escalation/action_effects.py`` module docstring. A
+        ``resume`` of a held deterministic pure gate is run by the harness
+        inline, which closes it or re-holds it, instead of being re-pended, see
+        ``orchestrator/src/orchestrator/harness.py::Harness._run_held_pure_gate_inline``.
         """
         if terminate is not None:
             return {
@@ -3186,8 +3192,8 @@ def create_server(
         the reconciliation queue are separate stores), so a caller connected to
         one of them learns nothing about records in the other: confirm which
         queue you are talking to before reading any [] as a gap.  Auditing a
-        ``done`` ``task_kind='deterministic'`` gate task that has
-        ``metadata.gate_escalated_at`` set?  Those records live in the
+        ``done`` ``task_kind='deterministic'`` gate task whose
+        ``done_provenance.kind`` is ``'deterministic-gate'``?  Those records live in the
         ORCHESTRATOR queue — call this tool against THAT server before emitting
         any finding, flag, memory or remediation task claiming the escalation
         record was never written.  (Reconciliation stages are denied this tool
@@ -3264,8 +3270,8 @@ def create_server(
         so a caller connected to one of them learns nothing about records in
         the other: confirm which queue you are talking to before treating
         ``count: 0`` as proof that no record was ever filed. Auditing a
-        ``done`` ``task_kind='deterministic'`` gate task that has
-        ``metadata.gate_escalated_at`` set? Those records live in the
+        ``done`` ``task_kind='deterministic'`` gate task whose
+        ``done_provenance.kind`` is ``'deterministic-gate'``? Those records live in the
         ORCHESTRATOR queue — query THAT server before emitting any finding,
         flag, memory or remediation task claiming the escalation record was
         never written. (Reconciliation stages are denied this tool outright

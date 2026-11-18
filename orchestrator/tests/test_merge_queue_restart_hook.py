@@ -850,38 +850,40 @@ async def test_stop_releases_finalizing_head_worktree_host_slot_and_speculation_
     await queue.put(head)
 
     try:
-        await _wait_for_speculative_head(worker, head)
+        try:
+            await _wait_for_speculative_head(worker, head)
 
-        gate_ahead.set()
-        outcome = await wait_responsive(
-            ahead.result, timeout=REAL_GIT_MERGE_RESULT_TIMEOUT,
-            label='the request ahead of the speculative head to land',
-        )
-        assert outcome.status == 'done', f'Expected the ahead request to land; got {outcome!r}'
+            gate_ahead.set()
+            outcome = await wait_responsive(
+                ahead.result, timeout=REAL_GIT_MERGE_RESULT_TIMEOUT,
+                label='the request ahead of the speculative head to land',
+            )
+            assert outcome.status == 'done', f'Expected the ahead request to land; got {outcome!r}'
 
-        await asyncio.wait_for(
-            verifier.await_entry(2), timeout=REAL_GIT_MERGE_RESULT_TIMEOUT,
-        )
-        await _wait_for_finalizing_head(worker, store, head)
+            await asyncio.wait_for(
+                verifier.await_entry(2), timeout=REAL_GIT_MERGE_RESULT_TIMEOUT,
+            )
+            await _wait_for_finalizing_head(worker, store, head)
 
-        head_entry = next(
-            (e for e in worker.snapshot()['entries'] if e['task_id'] == head.task_id),
-            None,
-        )
-        assert head_entry is not None and head_entry['host'] is not None, (
-            f'the verifying finalize head must be listed with a host: {head_entry!r}'
-        )
-        head_merge_wt = Path(head_entry['worktree']).resolve()
-        host = head_entry['host']
+            head_entry = next(
+                (e for e in worker.snapshot()['entries'] if e['task_id'] == head.task_id),
+                None,
+            )
+            assert head_entry is not None and head_entry['host'] is not None, (
+                f'the verifying finalize head must be listed with a host: {head_entry!r}'
+            )
+            head_merge_wt = Path(head_entry['worktree']).resolve()
+            host = head_entry['host']
 
-        assert _finalize_head_holdings(worker, head_merge_wt, host) == {
-            'worktree_on_disk': True,
-            'worktree_owned': True,
-            'host_slot': 'busy',
-            'verifier_owned_permits': 1,
-        }, 'the verifying finalize head must hold every resource before stop()'
-
-        await worker.stop()
+            assert _finalize_head_holdings(worker, head_merge_wt, host) == {
+                'worktree_on_disk': True,
+                'worktree_owned': True,
+                'host_slot': 'busy',
+                'verifier_owned_permits': 1,
+            }, 'the verifying finalize head must hold every resource before stop()'
+        finally:
+            # The act under test; a finally so a give-up above still stops the worker.
+            await worker.stop()
 
         assert head.result.result() == MergeOutcome(
             'blocked', reason=MERGE_WORKER_SHUTDOWN_REASON,

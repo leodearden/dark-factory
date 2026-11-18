@@ -23,7 +23,11 @@ from shared.cli_invoke import (
 )
 
 from fused_memory.config.schema import ReconciliationConfig
-from fused_memory.reconciliation import _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS
+from fused_memory.reconciliation import (
+    _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS,
+    RECONCILIATION_CLI_ENV_OVERRIDES,
+    RECONCILIATION_CLI_SETTING_SOURCES,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -346,10 +350,11 @@ class AgentLoop:
             # a permission prompt, which keeps the read tools inside cwd unless
             # an allow rule widens them.  This call passes none and reads no
             # settings file, so no user or project allow rule applies either;
-            # one would (measured), and so would managed policy settings.  No
-            # settings file also means the CLI auto-loads no CLAUDE.md.
+            # one would (measured), and so would managed policy settings.
+            # CLAUDE.md and the memory index are kept out by the env overrides.
             permission_mode='dontAsk',
-            setting_sources=[],
+            setting_sources=list(RECONCILIATION_CLI_SETTING_SOURCES),
+            env_overrides=dict(RECONCILIATION_CLI_ENV_OVERRIDES),
             # --tools does not filter MCP, so MCP is closed by the strict empty
             # config.  cwd is the codebase root (tasks 1989/4722), which may
             # hold a live .mcp.json.

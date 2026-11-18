@@ -112,7 +112,7 @@ class TestVocabulary:
     def test_measurement_stage_values(self):
         assert {s.value for s in MeasurementStage} == {
             'architect', 'judge', 'pairwise_judge', 'matcher', 'assessor',
-            'synthesizer',
+            'synthesizer', 'label_proposer',
         }
 
 

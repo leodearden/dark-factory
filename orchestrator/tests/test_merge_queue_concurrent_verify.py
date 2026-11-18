@@ -54,7 +54,6 @@ from _merge_worker_drive import (
     stop_merge_worker,
 )
 from _orch_helpers import (
-    MERGE_GATE_BARRIER_TIMEOUT,
     MERGE_RESULT_TIMEOUT,
     wait_responsive,
 )
@@ -63,10 +62,7 @@ from _verify_result_doubles import (
     format_fail_open_records,
     real_verify_result,
 )
-from _wait_hygiene_scan import (
-    suppressed_result_wait_items,
-    unguarded_worker_teardown_items,
-)
+from _wait_hygiene_scan import suppressed_result_wait_items
 
 from orchestrator.config import GitConfig, OrchestratorConfig, VerifyRunnerConfig
 from orchestrator.event_store import EventType
@@ -83,6 +79,13 @@ from orchestrator.merge_lane.worker import (
 )
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_runner import HostAllocator, HostLease
+
+# Liveness bound for waits on a verify's gate-entry event (task 6436); a hang
+# still fails, just later.  Deliberately departs from
+# _orch_helpers.py::MERGE_GATE_BARRIER_TIMEOUT for this hub: esc-6307-1
+# measured a gate-entry wait at that bound timing out under full-suite xdist
+# load.  The tight `timeout=5.0` gate-entry waits are a deliberate exception.
+GATE_ENTRY_TIMEOUT = MERGE_RESULT_TIMEOUT
 
 # ---------------------------------------------------------------------------
 # (a) Temp-repo GitOps + branch-with-file builders
@@ -787,7 +790,7 @@ class TestRunInflightVerifyAbortPoll:
         verify_future = asyncio.ensure_future(worker._run_inflight_verify(item, lease))
 
         # Wait for the gated runner to enter
-        await asyncio.wait_for(gate_entered.wait(), timeout=45.0)
+        await asyncio.wait_for(gate_entered.wait(), timeout=GATE_ENTRY_TIMEOUT)
 
         # Trigger sole-waiter abandon
         req.result.cancel()
@@ -825,7 +828,7 @@ class TestRunInflightVerifyAbortPoll:
         lease = HostLease(name='slow-wt', runner=gated, is_local=False)
 
         verify_future = asyncio.ensure_future(worker._run_inflight_verify(item, lease))
-        await asyncio.wait_for(gate_entered.wait(), timeout=45.0)
+        await asyncio.wait_for(gate_entered.wait(), timeout=GATE_ENTRY_TIMEOUT)
         req.result.cancel()
         await asyncio.sleep(worker.VERIFY_ABANDON_POLL_SECS * 2)
         gate_release.set()
@@ -861,7 +864,7 @@ class TestRunInflightVerifyAbortPoll:
         lease = HostLease(name='slow-halt', runner=gated, is_local=False)
 
         verify_future = asyncio.ensure_future(worker._run_inflight_verify(item, lease))
-        await asyncio.wait_for(gate_entered.wait(), timeout=45.0)
+        await asyncio.wait_for(gate_entered.wait(), timeout=GATE_ENTRY_TIMEOUT)
 
         worker.operator_halt('test: halt mid-verify')
 
@@ -896,7 +899,7 @@ class TestRunInflightVerifyAbortPoll:
         lease = HostLease(name='slow-halt2', runner=gated, is_local=False)
 
         verify_future = asyncio.ensure_future(worker._run_inflight_verify(item, lease))
-        await asyncio.wait_for(gate_entered.wait(), timeout=45.0)
+        await asyncio.wait_for(gate_entered.wait(), timeout=GATE_ENTRY_TIMEOUT)
 
         worker.operator_halt('test: halt mid-verify')
         await asyncio.sleep(worker.VERIFY_ABANDON_POLL_SECS * 2)
@@ -2050,7 +2053,7 @@ class TestOverlapSignal:
             # N (local) should enter its gated verify quickly
             await wait_responsive(
                 gate_a_entered.wait(),
-                timeout=MERGE_GATE_BARRIER_TIMEOUT,
+                timeout=GATE_ENTRY_TIMEOUT,
                 label='ov-a: local verify entered',
             )
 
@@ -2062,7 +2065,7 @@ class TestOverlapSignal:
                 # task 2376: widened from 3.0s (host-oversubscription flake — a
                 # starved worker missed the deadline while the invariant held;
                 # see the 45.0s convention already used at lines ~2251/4185).
-                await asyncio.wait_for(gate_b_entered.wait(), timeout=45.0)
+                await asyncio.wait_for(gate_b_entered.wait(), timeout=GATE_ENTRY_TIMEOUT)
             except TimeoutError:
                 # Cleanup: release gates so worker can drain cleanly
                 gate_a_release.set()
@@ -2192,7 +2195,7 @@ class TestLastItemOfBurstFinalizes:
             # waiting for either a new queue item or N's verify to complete.
             await wait_responsive(
                 gate_entered.wait(),
-                timeout=MERGE_GATE_BARRIER_TIMEOUT,
+                timeout=GATE_ENTRY_TIMEOUT,
                 label='burst-n: local verify entered',
             )
 
@@ -2320,8 +2323,8 @@ class TestChainInvalidationUnderOverlap:
             # NOTE (task 2350): widened from 15.0s -- fixed real-time deadlines
             # starve under heavy shared-host xdist contention even though the
             # underlying cascade logic is correct (timing flake, not a bug).
-            await asyncio.wait_for(gate_a_entered.wait(), timeout=45.0)
-            await asyncio.wait_for(gate_b_entered.wait(), timeout=45.0)
+            await asyncio.wait_for(gate_a_entered.wait(), timeout=GATE_ENTRY_TIMEOUT)
+            await asyncio.wait_for(gate_b_entered.wait(), timeout=GATE_ENTRY_TIMEOUT)
 
             # N's verify fails
             gate_a_release.set()
@@ -2523,8 +2526,8 @@ class TestChainInvalidationUnderOverlap:
             # Wait for both verifies to enter (true concurrent overlap).
             # NOTE (task 2350): widened timeouts -- fixed real-time deadlines
             # starve under heavy shared-host xdist contention.
-            await asyncio.wait_for(gate_a_entered.wait(), timeout=45.0)
-            await asyncio.wait_for(gate_b_entered.wait(), timeout=45.0)
+            await asyncio.wait_for(gate_a_entered.wait(), timeout=GATE_ENTRY_TIMEOUT)
+            await asyncio.wait_for(gate_b_entered.wait(), timeout=GATE_ENTRY_TIMEOUT)
 
             # N's verify fails
             gate_a_release.set()
@@ -2679,12 +2682,12 @@ class TestHaltAndUnavailable:
             # Wait for both verifies to enter (true concurrent overlap)
             await wait_responsive(
                 gate_a_entered.wait(),
-                timeout=MERGE_GATE_BARRIER_TIMEOUT,
+                timeout=GATE_ENTRY_TIMEOUT,
                 label='halt-a: local verify entered',
             )
             await wait_responsive(
                 gate_b_entered.wait(),
-                timeout=MERGE_GATE_BARRIER_TIMEOUT,
+                timeout=GATE_ENTRY_TIMEOUT,
                 label='halt-b: remote verify entered',
             )
 
@@ -2791,12 +2794,12 @@ class TestHaltAndUnavailable:
             # Wait for both verifies to enter
             await wait_responsive(
                 gate_a_entered.wait(),
-                timeout=MERGE_GATE_BARRIER_TIMEOUT,
+                timeout=GATE_ENTRY_TIMEOUT,
                 label='unav-a: local verify entered',
             )
             await wait_responsive(
                 gate_b_entered.wait(),
-                timeout=MERGE_GATE_BARRIER_TIMEOUT,
+                timeout=GATE_ENTRY_TIMEOUT,
                 label='unav-b: remote verify entered',
             )
 
@@ -3464,8 +3467,8 @@ class TestRunnerUnavailableHeadCascade:
         # NOTE (task 3477): widened from 15.0s -- fixed real-time deadlines
         # starve under heavy shared-host xdist contention even though the
         # underlying cascade logic is correct (timing flake, not a bug).
-        await asyncio.wait_for(gate_a_entered.wait(), timeout=45.0)
-        await asyncio.wait_for(gate_b_entered.wait(), timeout=45.0)
+        await asyncio.wait_for(gate_a_entered.wait(), timeout=GATE_ENTRY_TIMEOUT)
+        await asyncio.wait_for(gate_b_entered.wait(), timeout=GATE_ENTRY_TIMEOUT)
 
         # Both verifies are now in-flight.  Release N's gate → RunnerUnavailable.
         # _finalize_inflight(N) returns False → head-failure cascade fires:
@@ -3755,7 +3758,7 @@ class TestRunInflightVerifyRemoteCancelOnAbort:
         verify_future = asyncio.ensure_future(
             worker._run_inflight_verify(item, lease)
         )
-        await asyncio.wait_for(gate_entered.wait(), timeout=45.0)
+        await asyncio.wait_for(gate_entered.wait(), timeout=GATE_ENTRY_TIMEOUT)
 
         # Trigger abandon.  The abort poll will cancel verify_task
         # (propagating CancelledError into the gated verifier's release wait),
@@ -3996,8 +3999,8 @@ class TestCascadeFiresRemoteCancel:
         # NOTE (task 3477): widened from 15.0s -- fixed real-time deadlines
         # starve under heavy shared-host xdist contention even though the
         # underlying cascade logic is correct (timing flake, not a bug).
-        await asyncio.wait_for(gate_a_entered.wait(), timeout=45.0)
-        await asyncio.wait_for(gate_b_entered.wait(), timeout=45.0)
+        await asyncio.wait_for(gate_a_entered.wait(), timeout=GATE_ENTRY_TIMEOUT)
+        await asyncio.wait_for(gate_b_entered.wait(), timeout=GATE_ENTRY_TIMEOUT)
 
         # N's verify fails → triggers head-failure cascade for N+1
         gate_a_release.set()
@@ -4157,12 +4160,12 @@ class TestCascadeErrorContainment:
             # Wait for both verifies to enter (true concurrent overlap)
             await wait_responsive(
                 gate_a_entered.wait(),
-                timeout=MERGE_GATE_BARRIER_TIMEOUT,
+                timeout=GATE_ENTRY_TIMEOUT,
                 label='cascade-err-a: gate_a_entered',
             )
             await wait_responsive(
                 gate_b_entered.wait(),
-                timeout=MERGE_GATE_BARRIER_TIMEOUT,
+                timeout=GATE_ENTRY_TIMEOUT,
                 label='cascade-err-b: gate_b_entered',
             )
 
@@ -4385,8 +4388,8 @@ class TestCascadeErrorContainment:
             # NOTE (task 2350): widened from 15.0s -- fixed real-time deadlines
             # starve under heavy shared-host xdist contention even though the
             # underlying cascade logic is correct (timing flake, not a bug).
-            await asyncio.wait_for(gate_a_entered.wait(), timeout=45.0)
-            await asyncio.wait_for(gate_b_entered.wait(), timeout=45.0)
+            await asyncio.wait_for(gate_a_entered.wait(), timeout=GATE_ENTRY_TIMEOUT)
+            await asyncio.wait_for(gate_b_entered.wait(), timeout=GATE_ENTRY_TIMEOUT)
 
             # N fails → head-failure cascade fires → in-body cancel_and_release raises.
             gate_a_release.set()
@@ -5260,12 +5263,12 @@ class TestStopDrainSurvivesARaisingRemoteAbort:
             await q.put(req_b)
             await wait_responsive(
                 entered_a.wait(),
-                timeout=MERGE_GATE_BARRIER_TIMEOUT,
+                timeout=GATE_ENTRY_TIMEOUT,
                 label='drain-a: remote verify entered',
             )
             await wait_responsive(
                 entered_b.wait(),
-                timeout=MERGE_GATE_BARRIER_TIMEOUT,
+                timeout=GATE_ENTRY_TIMEOUT,
                 label='drain-b: remote verify entered',
             )
         finally:
@@ -5425,7 +5428,7 @@ class TestRedispatchSpeculativeConservation:
 
             await wait_responsive(
                 gate_a_entered.wait(),
-                timeout=MERGE_GATE_BARRIER_TIMEOUT,
+                timeout=GATE_ENTRY_TIMEOUT,
                 label='rc-a: local verify entered',
             )
 
@@ -5812,12 +5815,12 @@ class TestLoudWaitMigrationRatchet:
     """Enforced invariant, task 4219, ratcheted to zero by task 4846: THIS
     module's own source carries no suppressed result wait -- neither the
     `with contextlib.suppress(TimeoutError):` spelling nor the swallowing
-    `try/except TimeoutError:` spelling -- and every method that waits
-    through `wait_responsive` stops its worker from a `finally:`.
+    `try/except TimeoutError:` spelling. The worker-teardown half (every
+    method that waits through `wait_responsive` stops its worker from a
+    `finally:`) is enforced tree-wide by test_worker_teardown_leak_guard.py.
 
-    No `@pytest.mark.timeout` mark needed: neither of these two methods
-    performs a real await, so `_wait_budget_audit.py::item_wait_budgets`
-    bills each of them 0.0.
+    No `@pytest.mark.timeout` mark needed: this method performs no real
+    await, so `_wait_budget_audit.py::item_wait_budgets` bills it 0.0.
     """
 
     def test_no_suppressed_result_waits(self) -> None:
@@ -5841,23 +5844,4 @@ class TestLoudWaitMigrationRatchet:
             'by-label timeout. Migrate the wait to '
             '`_orch_helpers.wait_responsive` (or, for a bare result future '
             'with no starvation accounting needed, `_await_outcome`).'
-        )
-
-    def test_migrated_methods_stop_worker_in_finally(self) -> None:
-        """No method that calls `wait_responsive` may leave `worker.stop()`
-        outside a `finally:` block (esc-3980-4): `wait_responsive` gives up
-        by raising `_pytest.outcomes.Failed`, so a straight-line body that
-        skips `worker.stop()` on give-up leaks a live merge worker plus its
-        run task into pytest-asyncio teardown -- how one red test used to
-        cascade into unrelated failures elsewhere in the session.
-        """
-        source = Path(__file__).read_text()
-        offenders = unguarded_worker_teardown_items(source)
-
-        assert not offenders, (
-            'The following methods call wait_responsive but do not call '
-            'worker.stop() from inside a finally: block (esc-3980-4 leak '
-            'invariant -- see '
-            '_merge_worker_drive.py::stop_merge_worker):\n'
-            + '\n'.join(f'  - {offender}' for offender in offenders)
         )

@@ -8263,37 +8263,15 @@ class SpeculativeMergeWorker:
         # an unbounded busy-loop.  Cleared on a successful verify for that
         # task so a later transient hang starts counting fresh.
         self._inflight_dead_verify_aborts: dict[str, int] = {}
-        # task 3185 (PRD γ, review fix 3; amend: reviewer_comprehensive
-        # correctness+robustness): per-task ONE-SHOT deep-chain suppression.
-        # Added when `_run_inflight_verify`'s generic exception handler fires
-        # WHILE a chain is in play — an error out of a cumulative tip tree is
-        # not attributable to the dispatching item, so that arm defers rather
-        # than resolving, and a defer that re-chained into the same error would
-        # ping-pong forever.  Membership makes `_deep_chain_placement` decline
-        # for that task, so the re-dispatch verifies the item's OWN subset tree,
-        # whose verdict IS attributable to it.
-        #
-        # A SET, not a counter, and deliberately so.  It was a
-        # `dict[str, int]` guarded by a `MAX_CHAIN_VERIFY_ERRORS` cap until the
-        # amend pass proved that cap UNREACHABLE: the suppression itself means
-        # the very next dispatch for the task carries `chain is None`, so the
-        # count could never exceed 1 and the cap branch was dead code whose
-        # comment described a sequence that cannot occur.  The honest contract
-        # is strictly one-shot chain suppression, and the terminal backstop is
-        # the PRE-EXISTING blocked resolution: the un-chained re-dispatch
-        # verifies the item's own tree, and if THAT raises it resolves
-        # terminally through the ordinary generic-exception path.  The type now
-        # states that structurally rather than by comment.
-        #
-        # Discarded at EVERY exit that ends this task's round — the reset site
-        # ("the verify returned a result at all"), the DROPPED abort, the
-        # busy-loop cap-out, the contended-lease cap-out and the terminal
-        # generic-exception resolution — each in the same statement group as
-        # the `_inflight_dead_verify_aborts.pop` whose lifecycle it mirrors.
-        # That is what bounds the set to genuinely live task_ids instead of
-        # letting an entry linger for the life of the worker (~8h between fleet
-        # redeploys) and silently disable deep merge-ahead for that task.
-        self._chain_error_suppressed: set[str] = set()
+        # Tasks whose NEXT dispatch verifies un-chained (tasks 3185, 10617): a
+        # chain-arm error marks its owner, a red tip marks its owner and every
+        # link, because neither verdict is attributable to any one member.  A
+        # marked task is neither a chain owner (`_deep_chain_placement` guard
+        # 2b) nor a link (`chain_snapshot`), so its own subset tree gets a
+        # verdict that IS attributable to it.  The mark lasts until a verdict
+        # for the task is applied, which is when its request is retired
+        # (`_retire_item`): a verify the cascade cancels or voids keeps it.
+        self._next_dispatch_unchained: set[str] = set()
         # task 2828 amend (reviewer_comprehensive, robustness): per-task
         # consecutive contended-lease requeue counter.  Incremented each time
         # merge_verify_lease raises MergeVerifyLeaseContended and the item is
@@ -8894,7 +8872,7 @@ class SpeculativeMergeWorker:
 
     def _retire_item(self, request_id: str) -> None:
         """Best-effort transition *request_id* to TERMINAL then drop it from
-        ``_live_items``.
+        ``_live_items``, ending the per-task lane state it carried.
 
         Safe to call on an already-TERMINAL or unregistered request_id —
         both are treated as nothing-left-to-retire (no :meth:`_note_transition`
@@ -8906,9 +8884,12 @@ class SpeculativeMergeWorker:
             self._note_transition(request_id, current, ItemLifecycleState.TERMINAL)
         retired = self._live_items.pop(request_id, None)
         if retired is not None:
-            # A request's gate attempts leave the lane with it, whichever exit
-            # it took, so a resubmission starts its own count (task 8525).
-            self._gate_retries.pop(_request_of(retired).task_id, None)
+            # A request's gate attempts and its un-chained mark leave the lane
+            # with it, whichever exit it took, so a resubmission starts its own
+            # count (task 8525) and may chain again (task 10723).
+            task_id = _request_of(retired).task_id
+            self._gate_retries.pop(task_id, None)
+            self._next_dispatch_unchained.discard(task_id)
 
     def _note_requeue(
         self,
@@ -10714,9 +10695,11 @@ class SpeculativeMergeWorker:
 
         **Requests owned by another round are excluded** too (task 7720): a
         link another chain reserves, and a candidate of an in-flight coalesce.
-        Chaining one would duplicate a link or race a stack. That is the twin
-        invariant's second caveat: it holds item for item only while no
-        reservation and no coalesce is live.
+        Chaining one would duplicate a link or race a stack. So are a request
+        whose outcome is already decided (its result future is done) and one
+        whose next dispatch must verify un-chained (task 10617). That is the
+        twin invariant's second caveat: it holds item for item only while none
+        of these is live.
 
         Returns the UNFROZEN suffix only (the lane buffers) — never
         frozen/in-flight items.  The frozen prefix is the immutable head that
@@ -10730,6 +10713,8 @@ class SpeculativeMergeWorker:
                 req for req in self._intake.buffered(lane)
                 if not self._chain_reservations.holds(req.request_id)
                 and req.request_id not in self._coalescing_ids
+                and not req.result.done()
+                and req.task_id not in self._next_dispatch_unchained
             )
         return tuple(items)
 
@@ -11372,19 +11357,17 @@ class SpeculativeMergeWorker:
              green-tier ``reload_config`` — which mutates the held
              :class:`~orchestrator.config.MergeDeepConfig` in place — takes
              effect on the very next dispatch, in both directions.
-          2b. ``task_id in self._chain_error_suppressed`` -> ``None``.  Task
-             3185 review fix 3's LOOP GUARD.  A verify that RAISED on the chain
-             arm was not attributed to this item (the tree was cumulative), so
-             the request was DEFERRED rather than blocked — and a defer that
-             re-chained into the same error would ping-pong forever.  Declining
+          2b. ``task_id in self._next_dispatch_unchained`` -> ``None``.  The
+             LOOP GUARD (tasks 3185, 10617).  A chain-arm error or a red tip
+             was not attributed to this item (the tree was cumulative), so the
+             request was DEFERRED rather than blocked — and a defer that
+             re-chained into the same tree would ping-pong forever.  Declining
              sends the re-dispatch down the ordinary path, where it verifies the
              item's OWN subset tree and gets a verdict that IS attributable to
              it.  Sits AFTER the kill switch so the stock path still pays
-             nothing, and BEFORE the queue scan so a suppressed task pays no
-             O(n) walk either.  Strictly ONE-SHOT: the entry is discarded the
-             moment this task's round ends by ANY route, so a single infra blip
-             costs exactly one non-chained round rather than disabling deep
-             merge-ahead for the task for the life of the worker.
+             nothing, and BEFORE the queue scan so a marked task pays no
+             O(n) walk either.  The mark lasts until the task's verdict is
+             applied (see ``_next_dispatch_unchained`` in ``__init__``).
           3. ``d = self._deep_target_depth(cap, 1 + len(snapshot))``
              -> ``None`` -> ``None``.  Delegates the
              ``min(queue_len, cap, halving_state)`` invariant to
@@ -11420,27 +11403,11 @@ class SpeculativeMergeWorker:
         cap = item.request.config.merge_deep.chain_cap
         if cap <= 0:
             return None
-        if item.request.task_id in self._chain_error_suppressed:
-            # Guard 2b (task 3185 review fix 3): this task's LAST chain-arm
-            # verify raised, and that error was NOT attributed to it -- the
-            # request was deferred rather than blocked. Chaining it again would
-            # rebuild the same chain into the same error, forever. Decline so
-            # the re-dispatch verifies the item's OWN subset tree, whose verdict
-            # IS attributable to it.
-            #
-            # Placed AFTER the kill-switch guard so the stock path still pays
-            # nothing, and BEFORE chain_snapshot() so a suppressed task pays no
-            # O(n) scan either.
-            #
-            # ONE-SHOT BY CONSTRUCTION (amend, reviewer_comprehensive
-            # correctness): this guard is exactly why the old
-            # MAX_CHAIN_VERIFY_ERRORS cap was UNREACHABLE -- it forces the very
-            # next dispatch for the task to `chain is None`, so a second
-            # chain-arm error for it is not reachable and the count could never
-            # exceed 1. The termination argument needs no cap: the un-chained
-            # re-dispatch verifies the item's OWN tree and, if THAT raises,
-            # resolves terminally through the ordinary generic-exception path
-            # (which also discards this entry).
+        if item.request.task_id in self._next_dispatch_unchained:
+            # Guard 2b: see the docstring. Termination needs no cap: the
+            # un-chained re-dispatch verifies the item's OWN tree and, if THAT
+            # raises, resolves terminally through the ordinary
+            # generic-exception path.
             return None
         # ONE snapshot, reused as build_chain's argument below -- see the
         # docstring's step 3. chain_snapshot() is an O(n) walk over every lane
@@ -18047,13 +18014,6 @@ class SpeculativeMergeWorker:
                     # normal-completion exit paths) to keep the dict scoped to
                     # genuinely live/in-flight task_ids on every exit path.
                     self._inflight_dead_verify_aborts.pop(req.task_id, None)
-                    # task 3185 amend (reviewer_comprehensive, robustness):
-                    # the deep-chain suppression set is bounded to LIVE
-                    # task_ids by discarding at every exit that ends this
-                    # task's round, in the same statement group as the sibling
-                    # counter whose lifecycle it mirrors -- here, a DROPPED
-                    # request that will never re-dispatch.
-                    self._chain_error_suppressed.discard(req.task_id)
                     # task 3003 amend (robustness): a NON-defer exit — whatever
                     # contended-lane streak this task had is over, and leaving
                     # its start stamp behind would let a much later, unrelated
@@ -18176,11 +18136,6 @@ class SpeculativeMergeWorker:
                         # growing unboundedly for permanently-blocked
                         # tasks.
                         self._inflight_dead_verify_aborts.pop(req.task_id, None)
-                        # task 3185 amend (reviewer_comprehensive,
-                        # robustness): same statement group, same bounding
-                        # argument -- the dead-verify busy-loop cap-out is a
-                        # terminal 'blocked' for this task_id.
-                        self._chain_error_suppressed.discard(req.task_id)
                         err_outcome = MergeOutcome('blocked', reason=_abort.terminal_reason())
                         if not req.result.done():
                             req.result.set_result(err_outcome)
@@ -18359,10 +18314,6 @@ class SpeculativeMergeWorker:
                 # be abandoned without a requeue; and the dict would grow
                 # unboundedly for permanently-blocked task_ids.
                 self._inflight_dead_verify_aborts.pop(req.task_id, None)
-                # task 3185 amend (reviewer_comprehensive, robustness): same
-                # statement group, same bounding argument -- the contended-lease
-                # cap-out is a terminal 'blocked' for this task_id.
-                self._chain_error_suppressed.discard(req.task_id)
                 # task 3003 amend (reviewer_comprehensive, test_quality): a
                 # per-worker cap-out ordinal, rendered into the reason below.
                 # See the attribute's comment in __init__ for why the elapsed/
@@ -18527,24 +18478,6 @@ class SpeculativeMergeWorker:
             # cannot linger for a task_id that exits via this path (mirrors
             # the abandoned/DROPPED and busy-loop-capped exit paths).
             self._inflight_dead_verify_aborts.pop(req.task_id, None)
-            # task 3185 amend (reviewer_comprehensive, robustness): same
-            # statement group, same argument, and UNCONDITIONAL on purpose.
-            # This is the terminal 'blocked' exit for BOTH arms, and the
-            # un-chained arm is the one that reaches it: a chain-arm error
-            # suppresses chaining, so the re-dispatch runs with `chain is None`
-            # -- and if THAT verify also raises, control lands here. Discarding
-            # only inside the `chain is not None` branch below would leave the
-            # entry behind for the life of the worker (~8h between fleet
-            # redeploys), silently disabling deep merge-ahead for that task_id
-            # forever and growing the set unboundedly for permanently-blocked
-            # tasks. Exactly the leak class the sibling counter's own comments
-            # above exist to prevent.
-            #
-            # Ordering is deliberate: the chain arm below RE-ADDS after this
-            # discard, so a genuine chain-arm error still suppresses the next
-            # round. (Guard 2b means `chain is not None` already implies the
-            # task was not suppressed, so the discard is a no-op on that arm.)
-            self._chain_error_suppressed.discard(req.task_id)
             # task 2828 amend: terminal 'blocked' exit — drop any contended-lease
             # streak so it never lingers stale for a task that will not re-verify.
             # task 3003: the streak's start stamp is popped in lockstep, else a
@@ -18574,25 +18507,11 @@ class SpeculativeMergeWorker:
                 # its internal latch makes a second release a no-op -- adding
                 # one here would be the double-release that latch exists to
                 # absorb.
-                # TERMINATION, without a cap (amend, reviewer_comprehensive
-                # correctness).  Suppression is STRICTLY ONE-SHOT: adding the
-                # task here makes `_deep_chain_placement`'s guard 2b decline on
-                # the very next dispatch, so that re-dispatch verifies the
-                # item's OWN subset tree with `chain is None`.  The ping-pong
-                # therefore terminates after exactly one deferred round -- if
-                # the re-dispatch's verify ALSO raises, it is un-chained, so it
-                # never re-enters this branch and falls straight through to
-                # today's terminal 'blocked' resolution below.
-                #
-                # This replaces a `MAX_CHAIN_VERIFY_ERRORS` counter+cap that the
-                # amend pass proved UNREACHABLE for exactly that reason: guard
-                # 2b meant the count could never exceed 1, so the cap branch was
-                # dead code and its comment described a sequence (N consecutive
-                # un-chained re-dispatches feeding the counter) that cannot
-                # occur.  The backstop is not new -- it is the pre-existing
-                # blocked resolution -- so nothing is lost by naming the guard
-                # what it actually is.
-                self._chain_error_suppressed.add(req.task_id)
+                # TERMINATION, without a cap: guard 2b makes the very next
+                # dispatch verify the item's OWN subset tree un-chained, and
+                # if THAT raises it falls through to the terminal 'blocked'
+                # resolution below.
+                self._next_dispatch_unchained.add(req.task_id)
                 logger.warning(
                     'Task %s: deep tip verify RAISED against tip=%s '
                     '(%s) -- NOT attributed to this task (the tree was '
@@ -18791,13 +18710,6 @@ class SpeculativeMergeWorker:
         # toward MAX_INFLIGHT_DEAD_VERIFY_ABORTS even though a verify
         # genuinely ran to completion in between.
         self._inflight_dead_verify_aborts.pop(req.task_id, None)
-        # task 3185 (PRD γ, review fix 3): same statement group, same argument —
-        # a verify that returned a result at all did NOT raise, so this task's
-        # deep-chain suppression is over.  Discarding here is what makes the
-        # suppression ONE-SHOT and self-clearing: a single infra blip costs
-        # exactly one non-chained round rather than disabling deep merge-ahead
-        # for the task for the life of the worker.
-        self._chain_error_suppressed.discard(req.task_id)
         # task 2828 amend: the verify actually RAN (lease was acquired), so any
         # prior contended-lease requeue streak for this task is broken — reset it.
         # task 3003: pop the streak's start stamp in lockstep, so the next
@@ -18893,8 +18805,11 @@ class SpeculativeMergeWorker:
             logger.info(
                 'Task %s: deep tip verify end (tip=%s, items=%d, passed=False) '
                 '— re-queuing; a red tip names no culprit, so every chained '
-                'item takes its ordinary sequential path',
+                'item next verifies un-chained',
                 req.task_id, merge_commit[:8], _chain_depth,
+            )
+            self._next_dispatch_unchained.update(
+                [req.task_id, *(task_id for task_id, _ in chain.links)],
             )
             # THE chokepoint, not a bare put_nowait: all three of its effects
             # are load-bearing here exactly as they are at the operator-halt

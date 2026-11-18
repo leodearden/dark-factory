@@ -236,7 +236,7 @@ class TestNextHalvingState:
 
 
 class TestHalvingWalkComposition:
-    """The composed walk — the PRD's "Halving walk isolates bad item" row.
+    """The composed walk — the PRD's decision 5 halving policy.
 
     Starting from the reset sentinel at cap=6 / queue_len=10, successive FAILs
     step 6 → 3 → floor(None, no chain), and a PASS anywhere returns the next
@@ -1428,21 +1428,21 @@ class TestRunInflightVerifyChainRedirect:
         assert await worker._deep_chain_placement(item) is None
         assert built == [], 'a suppressed task must not pay for a build at all'
 
-    async def test_chain_suppression_is_one_shot_and_self_clearing(
+    async def test_a_returned_verify_does_not_clear_the_mark(
         self, git_repo: Path, monkeypatch,
     ):
-        """One bad round must not disable deep merge-ahead for the task forever.
+        """The mark outlives the un-chained verify's return (task 10723).
 
-        The suppression is discarded at the existing unconditional "the verify
-        returned a result at all" reset site, so a single infra blip costs
-        exactly one non-chained round.
+        A returned result is not yet applied: the head-failure cascade can
+        still void it and re-dispatch the request, which must then verify
+        un-chained again.  The mark clears only when the task's verdict is
+        applied, which test_merge_queue_deep_unchained_mark.py drives through
+        a live lane.
         """
         _git_ops, worker, item, chain, _head = await self._fixture(git_repo)
         _spy_post_merge_verify(monkeypatch, raises=RuntimeError('verify exploded'))
         await worker._run_inflight_verify(item, _local_lease(), chain=chain)
 
-        # The re-dispatch: no chain (suppressed), and the verify returns
-        # normally this time — which is what clears the suppression.
         posted = _spy_post_merge_verify(monkeypatch, outcome=None)
         res = await worker._run_inflight_verify(item, _local_lease())
         assert len(posted) == 1, 'the ordinary arm ran'
@@ -1450,12 +1450,8 @@ class TestRunInflightVerifyChainRedirect:
             await worker._release_or_cleanup(res.merge_wt, spec_warm=res.spec_warm)
 
         built = _spy_build_chain(monkeypatch, passthrough=True)
-        again = await worker._deep_chain_placement(item)
-        assert len(built) == 1, 'chaining is re-enabled after a clean round'
-        assert again is not None
-        await merge_liveness.release_chain_build_lane(
-            _git_ops, again.lane, warm=again.lane_warm,
-        )
+        assert await worker._deep_chain_placement(item) is None
+        assert built == [], 'a returned verify is no applied verdict'
 
     async def test_the_ping_pong_terminates_after_exactly_one_deferred_round(
         self, git_repo: Path, monkeypatch,
@@ -1479,8 +1475,6 @@ class TestRunInflightVerifyChainRedirect:
         from orchestrator.merge_lane.types import InflightStatus
 
         _git_ops, worker, item, chain, _head = await self._fixture(git_repo)
-        task_id = item.request.task_id
-        assert worker._chain_error_suppressed == set(), 'no stale suppression'
 
         # ── ROUND 1: chained, raises → defer + suppress (no resolution). ──
         _spy_post_merge_verify(monkeypatch, raises=RuntimeError('boom 1'))
@@ -1488,7 +1482,6 @@ class TestRunInflightVerifyChainRedirect:
 
         assert first.status is InflightStatus.REQUEUED
         assert not item.request.result.done()
-        assert worker._chain_error_suppressed == {task_id}
         assert worker._queue.get_nowait() is item.request
 
         # ── The re-dispatch DECLINES to chain, at zero build cost. ──
@@ -1510,13 +1503,81 @@ class TestRunInflightVerifyChainRedirect:
         assert second.status is not InflightStatus.REQUEUED
         assert second.outcome is outcome
         assert worker._queue.qsize() == 0, 'the terminal round does not requeue'
-        # THE LEAK FENCE: the terminal exit clears the suppression regardless
-        # of which arm produced the error.  Without this, the entry would
-        # linger for the life of the worker (~8h between fleet redeploys) and
-        # silently disable deep merge-ahead for this task_id forever.
-        assert worker._chain_error_suppressed == set(), (
-            'every terminal exit must clear the suppression set'
+        # The mark this walk leaves clears when that blocked verdict is
+        # applied (task 10723), which this direct drive stops short of:
+        # test_merge_queue_deep_unchained_mark.py::TestBAChainArmErrorStillTerminates
+        # drives the same walk through a live lane to the resubmission that
+        # chains again.
+
+    async def test_a_red_tip_holds_every_member_off_chains_until_its_verdict_is_applied(
+        self, git_repo: Path, monkeypatch,
+    ):
+        """A red tip names no culprit, so no member chains again before its verdict is applied.
+
+        Before task 10617 only the owner was held back: the links stayed at
+        the front of the buffer and the next dispatch chained them again, so
+        one bad request could redden chain after chain without ever being
+        verified on its own.  Walked here member by member:
+
+          * after the red tip, neither the owner's nor any link's next dispatch
+            builds a chain, and no member is offered as a link;
+          * the head-failure cascade cancels a member's own verify before it
+            renders anything, so that member stays off every chain;
+          * a member whose own verify RETURNS stays off too (task 10723): the
+            cascade can still void that result, and only an applied verdict
+            clears the mark (test_merge_queue_deep_unchained_mark.py);
+          * and a request whose outcome is decided is never chained, though
+            ``merge_cancel`` leaves it buffered until the merger pops it.
+
+        The members' own dispatches use fresh requests for the same tasks: the
+        rule is per task, and the buffered requests stay where they are.
+        """
+        git_ops, worker, item, chain, head = await self._fixture(git_repo)
+        config = item.request.config
+        _spy_post_merge_verify(monkeypatch, outcome=_fail_verify_result())
+        await worker._run_inflight_verify(item, _local_lease(), chain=chain)
+
+        built = _spy_build_chain(monkeypatch, passthrough=True)
+        cancelled_tid, verified_tid = (tid for tid, _mc in chain.links)
+        members = {
+            tid: _make_item(
+                _make_req(tid, tid, config, git_repo), head,
+                _ephemeral_merge_wt(git_ops, f'alone-{tid}'),
+            )
+            for tid in (cancelled_tid, verified_tid)
+        }
+        for member in (item, *members.values()):
+            assert await worker._deep_chain_placement(member) is None
+        assert built == [], 'a member of the red chain pays for no build'
+        assert worker.chain_snapshot() == (), 'and none is offered as a link'
+
+        started = asyncio.Event()
+
+        async def _verify_until_cancelled(*_args, **_kwargs):
+            started.set()
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(
+            'orchestrator.merge_lane.worker._run_post_merge_verify', _verify_until_cancelled,
         )
+        in_flight = asyncio.ensure_future(
+            worker._run_inflight_verify(members[cancelled_tid], _local_lease()),
+        )
+        await started.wait()
+        in_flight.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await in_flight
+        assert worker.chain_snapshot() == (), 'a cancelled verify is no verdict'
+
+        _spy_post_merge_verify(monkeypatch, outcome=None)
+        await worker._run_inflight_verify(members[verified_tid], _local_lease())
+        assert worker.chain_snapshot() == (), 'a returned verify is no applied verdict'
+
+        unmarked = _make_req('104', '104', config, git_repo, lane='high')
+        worker._intake.replace_lane('high', [unmarked])
+        assert worker.chain_snapshot() == (unmarked,)
+        unmarked.result.cancel()
+        assert worker.chain_snapshot() == (), 'a decided request is never chained'
 
     @pytest.mark.parametrize(
         'slot1,cap,depth,expected',
@@ -1621,18 +1682,15 @@ class TestRunInflightVerifyChainRedirect:
         assert _lane_states(git_ops) == [LaneState.FREE, LaneState.FREE]
         assert worker.worktree_ledger_violations(grace_secs=0.0) == []
         assert worker.speculation_accounting_violations() == []
-        assert worker._chain_error_suppressed == set(), (
-            'a DROPPED request must not leave a suppression entry behind'
-        )
 
-    async def test_the_suppression_set_starts_empty_on_a_fresh_worker(
+    async def test_the_unchained_set_starts_empty_on_a_fresh_worker(
         self, git_repo: Path,
     ):
-        """The state exists and is empty at construction (no stale suppression)."""
+        """The state exists and is empty at construction (no stale mark)."""
         git_ops = _make_git_ops(git_repo, size=2)
         worker = _make_worker(git_ops)
 
-        assert worker._chain_error_suppressed == set()
+        assert worker._next_dispatch_unchained == set()
 
     async def test_chain_none_with_a_raising_verify_is_byte_identical_to_today(
         self, git_repo: Path, monkeypatch,
@@ -1661,8 +1719,8 @@ class TestRunInflightVerifyChainRedirect:
         assert res.outcome is outcome
         assert res.status is not InflightStatus.REQUEUED
         assert worker._queue.qsize() == 0, 'no requeue on the ordinary arm'
-        assert worker._chain_error_suppressed == set(), (
-            'the ordinary arm must not leave a suppression entry behind — and '
+        assert worker._next_dispatch_unchained == set(), (
+            'the ordinary arm must not leave an un-chained mark behind — and '
             'this terminal exit clears one even if some earlier round set it'
         )
 
@@ -1860,10 +1918,14 @@ class TestDeepTipVerifyNeverAdopts:
         δ (task 3186) took the PASS arm — see
         test_merge_queue_deep_landing.py::TestTipPassAdoptionSignal for the
         adopting exit's own contract.
+
+        A red tip names no culprit among its links either, so it withholds
+        every link from the next chain (task 10617); an infra error says
+        nothing about the links and leaves them chainable.
         """
         from orchestrator.merge_lane.types import InflightStatus
 
-        _git_ops, worker, item, _chain, res, _store, _q = await self._fixture(
+        _git_ops, worker, item, _chain, res, _store, queued = await self._fixture(
             git_repo, monkeypatch, passed=passed, raises=raises,
         )
 
@@ -1871,8 +1933,11 @@ class TestDeepTipVerifyNeverAdopts:
         assert res.outcome is None, 'a defer renders no MergeOutcome at all'
         assert res.merge_wt is None, 'the chain arm disposes its own worktrees'
         assert not item.request.result.done(), 'a requeue is a defer, not a resolution'
-        assert worker._queue.qsize() == 1
-        assert worker._queue.get_nowait() is item.request
+        assert queued_request_ids(worker) == [
+            *(r.request_id for r in queued), item.request.request_id,
+        ], 'the very request, requeued once, behind the still-buffered links'
+        still_chainable = () if raises is None else tuple(queued)
+        assert worker.chain_snapshot() == still_chainable
 
     @pytest.mark.parametrize(('passed', 'raises'), _NON_ADOPTING_ARMS)
     async def test_emits_no_merge_attempt_and_no_blocked_outcome(
@@ -1925,6 +1990,10 @@ class TestDeepTipVerifyNeverAdopts:
         ], 'the same request OBJECTS, not fresh ones wearing their task ids'
         assert all(not r.result.done() for r in queued)
         assert store.events_of(EventType.merge_attempt) == []
+        assert worker.chain_snapshot() == (), (
+            'every link of the red chain verifies un-chained before it may be '
+            'chained again, so none is offered as a link'
+        )
 
     async def test_tip_pass_resets_the_halving_state(
         self, git_repo: Path, monkeypatch,
@@ -2035,7 +2104,6 @@ class _DeepScene:
         self.released: list[tuple] = []
         self.lanes: list[str] = []
         self._round_no = 0
-
     @property
     def depths(self) -> list[int | None]:
         """The depth ACTUALLY dispatched each round, ``None`` for "no chain".
@@ -2049,15 +2117,18 @@ class _DeepScene:
             for c in self.calls
         ]
 
-    async def round_(self, *, tag: str) -> dict:
+    async def round_(self, *, tag: str, cohort: int = 0) -> dict:
         """Drive ONE full dispatch round through ``_dispatch_item``.
 
-        Returns the recorded ``_run_inflight_verify`` kwargs for the round
-        (plus ``'result'``), after :meth:`release_round`.
+        *cohort* picks the dispatching owner, task ``{cohort+1}01`` (see
+        :func:`_cohort_task_ids`).  Returns the recorded
+        ``_run_inflight_verify`` kwargs for the round (plus ``'result'``),
+        after :meth:`release_round`.
         """
         self._round_no += 1
+        owner = _cohort_task_ids(cohort)[0]
         item = _make_item(
-            _make_req('101', '101', self.config, self.repo), self.head,
+            _make_req(owner, owner, self.config, self.repo), self.head,
             _ephemeral_merge_wt(self.git_ops, f'{tag}-r{self._round_no}'),
         )
         entry = await self.worker._dispatch_item(item)
@@ -2090,11 +2161,24 @@ class _DeepScene:
             await worker._release_or_cleanup(vr.merge_wt, spec_warm=vr.spec_warm)
 
 
+def _cohort_task_ids(cohort: int) -> tuple[str, ...]:
+    """Cohort *cohort*'s owner, then its five followers: ``{cohort+1}01..06``.
+
+    Cohort 0 is task 101 over ``_DEEP_QUEUE``.  A red tip sends its owner and
+    every link to an un-chained verify first, so a walk that must chain again
+    after one dispatches a fresh cohort, whose members no red chain touched.
+    """
+    return tuple(f'{cohort + 1}{n:02d}' for n in range(1, 7))
+
+
 async def _make_deep_scene(
     repo: Path, *, chain_cap: int, script: list[bool] | None, monkeypatch,
-    allocator=None, frontier: int = 0,
+    allocator=None, frontier: int = 0, cohorts: int = 1,
 ) -> _DeepScene:
     """Build a scene whose verify oracle returns *script* verdicts in order.
+
+    *cohorts* buffers the followers of that many cohorts, in cohort order
+    (:func:`_cohort_task_ids`).
 
     *script* is one bool per round (``True`` == the verify passed), or ``None``
     to install no oracle at all and let the REAL ``_run_post_merge_verify``
@@ -2117,14 +2201,15 @@ async def _make_deep_scene(
     git_ops = _make_git_ops(repo, size=2)
     config = _make_config(repo, chain_cap=chain_cap)
     await _create_branch_editing(repo, 'task/101', 'a.txt', 'edit-101\n')
-    for tid in _DEEP_QUEUE:
+    for tid in (*_DEEP_QUEUE, *(t for c in range(1, cohorts) for t in _cohort_task_ids(c))):
         await _create_branch_editing(repo, f'task/{tid}', f'f{tid}.txt', f'edit-{tid}\n')
     head = await _merge_commit_off_main(repo, 'task/101', '101')
     store = _CapturingEventStore()
     worker = _make_worker(git_ops)
     worker._event_store = store
     worker._intake.replace_lane('normal', [
-        _make_req(tid, tid, config, repo) for tid in _DEEP_QUEUE
+        _make_req(tid, tid, config, repo)
+        for c in range(cohorts) for tid in _cohort_task_ids(c)[1:]
     ])
     if allocator is not None:
         worker._host_allocator = allocator
@@ -2212,7 +2297,7 @@ class TestDeepDispatchRoundsIntegration:
     async def test_dispatch_depths_follow_the_halving_walk(
         self, git_repo: Path, monkeypatch,
     ):
-        """PRD row "Halving walk isolates bad item": 6 → 3 → floor → 6.
+        """PRD decision 5's halving walk, through dispatch: 6 → 3 → floor → 6.
 
         Rounds 1-2 fail, so the bisector halves twice and lands on the d=1
         floor, where the gate declines and the pipeline is back on today's
@@ -2223,17 +2308,31 @@ class TestDeepDispatchRoundsIntegration:
         entire life of the worker process, silently, which is precisely the
         failure mode ``next_halving_state``'s ``max(1, ...)`` floor exists to
         prevent one step earlier.
+
+        Each round dispatches a fresh cohort (task 10617): a red tip sends its
+        owner and every link to an un-chained verify first, so the walk can
+        only chain again over members no red chain has touched — and no member
+        of an earlier red chain is ever offered as a link.
         """
         scene = await _make_deep_scene(
             git_repo, chain_cap=6, script=[False, False, True, True],
-            monkeypatch=monkeypatch,
+            monkeypatch=monkeypatch, cohorts=4,
         )
 
-        for _ in range(4):
-            await scene.round_(tag='walk')
+        for cohort in range(4):
+            await scene.round_(tag='walk', cohort=cohort)
 
         assert scene.depths == [6, 3, None, 6]
         assert scene.worker._chain_halving_state is None, 'a pass resets'
+        red_members: set[str] = set()
+        for rec in scene.calls:
+            chain = rec['chain']
+            links = [] if chain is None else [tid for tid, _mc in chain.links]
+            assert red_members.isdisjoint(links), (
+                f'a member of an earlier red chain was chained again: {links!r}'
+            )
+            if chain is not None and rec['result'].status is not None:
+                red_members |= {rec['item'].request.task_id, *links}
 
     async def test_halving_state_walks_down_in_lockstep_with_the_depths(
         self, git_repo: Path, monkeypatch,
@@ -2241,12 +2340,12 @@ class TestDeepDispatchRoundsIntegration:
         """The state AFTER each round, which is what the next round reads."""
         scene = await _make_deep_scene(
             git_repo, chain_cap=6, script=[False, False, True, True],
-            monkeypatch=monkeypatch,
+            monkeypatch=monkeypatch, cohorts=4,
         )
         seen: list[int | None] = []
 
-        for _ in range(4):
-            await scene.round_(tag='state')
+        for cohort in range(4):
+            await scene.round_(tag='state', cohort=cohort)
             seen.append(scene.worker._chain_halving_state)
 
         assert seen == [3, 1, None, None]
@@ -2267,17 +2366,17 @@ class TestDeepDispatchRoundsIntegration:
         flat_repo = await _fresh_repo(tmp_path, 'flat')
         deep = await _make_deep_scene(
             deep_repo, chain_cap=6, script=[False, False, True],
-            monkeypatch=monkeypatch,
+            monkeypatch=monkeypatch, cohorts=3,
         )
-        for _ in range(2):
-            await deep.round_(tag='floor')
+        for cohort in range(2):
+            await deep.round_(tag='floor', cohort=cohort)
         # Snapshot BEFORE the floor round, not after it: rounds 1-2 chained and
         # each took a lane, so a post-hoc count cannot tell the floor round's
         # own work from theirs.
         n_built_before_floor = len(deep.built)
         n_lanes_before_floor = len(deep.lanes)
         n_released_before_floor = len(deep.released)
-        await deep.round_(tag='floor')
+        await deep.round_(tag='floor', cohort=2)
 
         flat = await _make_deep_scene(
             flat_repo, chain_cap=0, script=[True], monkeypatch=monkeypatch,
@@ -2521,11 +2620,11 @@ class TestDeepDispatchRoundsIntegration:
 
         scene = await _make_deep_scene(
             git_repo, chain_cap=6, script=[False, False, True, True],
-            monkeypatch=monkeypatch,
+            monkeypatch=monkeypatch, cohorts=4,
         )
 
-        for _ in range(4):
-            await scene.round_(tag='conserve')
+        for cohort in range(4):
+            await scene.round_(tag='conserve', cohort=cohort)
 
         assert scene.worker.speculation_accounting_violations() == []
         assert scene.worker.worktree_ledger_violations(grace_secs=0.0) == []

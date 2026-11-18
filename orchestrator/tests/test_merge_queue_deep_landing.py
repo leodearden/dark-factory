@@ -157,7 +157,7 @@ def _within_spawn_budget(request, monkeypatch):
     construction.  Nine copies in nine class bodies is the other way to dodge
     that, and a flat SPOT violation in a file already this long.  The opt-in
     is visible on each class, and
-    test_timeout_marker_inversion_guard.py::TestDeepLandingModuleMarkers pins
+    test_spawn_budget_guard.py::TestDeepLandingModuleMarkers pins
     the marker/fixture pairing in BOTH directions.
 
     A WIRE between two shared parts and nothing else: ``count_git_spawns``
@@ -742,13 +742,16 @@ class TestTipPassAdoptionSignal:
         red; it does NOT identify WHICH member broke it, so terminally failing
         any of them would be the same unsound attribution pointing the other
         way — and would feed `consecutive_merge_thrash` a deterministic
-        signature on every retry.
+        signature on every retry.  What changed since γ (task 10617): every
+        member's next dispatch verifies its own tree, so none is chained again.
         """
         from orchestrator.merge_lane.types import InflightStatus
 
         _g, worker, item, _chain, res, store, queued, releases = await self._scene(
             git_repo, monkeypatch, verdict=_red_tip(),
         )
+        assert worker.chain_snapshot() == ()
+        assert await worker._deep_chain_placement(item) is None
 
         assert res.status == InflightStatus.REQUEUED
         assert res.outcome is None, 'a defer renders no MergeOutcome at all'
@@ -769,8 +772,8 @@ class TestTipPassAdoptionSignal:
 
         A green tip is a verified SUPERSET of every prefix member, which is
         what licenses δ's adoption.  An exception proves nothing about anyone,
-        so the exception arm keeps γ's recipe verbatim: suppress the next
-        chain for this task, requeue, land nothing.
+        so the exception arm keeps γ's recipe verbatim: mark the task to verify
+        un-chained, requeue, land nothing.
         """
         from orchestrator.merge_lane.types import InflightStatus
 
@@ -782,9 +785,9 @@ class TestTipPassAdoptionSignal:
         assert res.status == InflightStatus.REQUEUED
         assert res.outcome is None
         assert not item.request.result.done()
-        assert '101' in worker._chain_error_suppressed, (
-            'the one-shot suppression is what makes an infra blip cost exactly '
-            'one non-chained round'
+        assert '101' in worker._next_dispatch_unchained, (
+            'the mark is what makes an infra blip cost an un-chained round, not '
+            'another chain'
         )
         assert queued_request_ids(worker, ALL_LANES) == [
             *(r.request_id for r in queued), item.request.request_id,
@@ -1334,18 +1337,18 @@ class TestStaleCasAbortLeavesTheRestAlone:
                 f'task {tid} emitted more than its own enqueue event'
             )
 
-    async def test_two_consecutive_tip_fails_render_nothing_for_any_link(
+    async def test_a_red_tip_is_never_followed_by_a_second_over_the_same_links(
         self, git_repo: Path, tmp_path: Path, monkeypatch,
     ) -> None:
-        """(b) The same silence across two RED tips in a row.
+        """(b) No pair of red tips over the same links, and silence for every link.
 
-        Two rounds is the interesting number: ``max_consecutive_merge_thrash``
+        Two rounds was the interesting number: ``max_consecutive_merge_thrash``
         defaults to 2, so a pair of identical rendered failures is exactly what
-        would trip the ladder.  The chain arm must produce no such pair.
+        would trip the ladder.  Since task 10617 the pair cannot form: a red tip
+        sends its owner and every link to an un-chained verify first, so the
+        head's re-dispatch builds no chain and no link is offered to any other.
         """
         import dataclasses
-
-        from orchestrator.merge_lane.types import InflightEntry
 
         s = await _prefix_scene_upto_finalize(
             git_repo, tmp_path, monkeypatch, db_name='delta-tipfail.db',
@@ -1355,28 +1358,20 @@ class TestStaleCasAbortLeavesTheRestAlone:
         await worker._finalize_inflight(s['entry'])
         await asyncio.sleep(0)
 
-        # Round 2.  The head was REQUEUED by the fail arm, so it now sits on
-        # `_queue` and is deliberately left there — draining it back into a lane
-        # would make the head a member of its OWN next chain (chain_snapshot
-        # walks lane buffers), which is a different scenario.  Everything the
-        # claim is about — the three links — is still buffered where round 1
-        # left it, so the rebuild sees exactly the prefix it saw before.
+        # The head was REQUEUED by the fail arm, so it now sits on `_queue`,
+        # behind the links still buffered where the red round left them.
         assert queued_request_ids(worker, ALL_LANES)[-1] == s['reqs']['101'].request_id, (
             'the fail arm must have requeued the head, behind the links'
         )
         item2 = dataclasses.replace(
             s['item'], merge_wt=_ephemeral_merge_wt(git_ops, 'tipfail2'),
         )
-        chain2 = await worker._deep_chain_placement(item2)
-        assert chain2 is not None and chain2.links
-        res2 = await worker._run_inflight_verify(item2, _local_lease(), chain=chain2)
-        done2: asyncio.Future = asyncio.get_running_loop().create_future()
-        done2.set_result(res2)
-        await worker._finalize_inflight(InflightEntry(
-            item=item2, lease=_local_lease(), verify_task=done2,  # type: ignore[arg-type]
-            merge_wt=res2.merge_wt, was_speculative=True, chain=chain2,
-        ))
-        await asyncio.sleep(0)
+        assert await worker._deep_chain_placement(item2) is None, (
+            "the head's re-dispatch verifies its own tree, un-chained"
+        )
+        assert [r.task_id for r in worker.chain_snapshot()] == [_DELTA_TRUNCATOR], (
+            'only the truncator, which the red tip never covered, may still chain'
+        )
 
         assert not s['adv'], 'a red tip lands NOTHING via the chain'
         for tid in (*_DELTA_LINKS, _DELTA_TRUNCATOR):

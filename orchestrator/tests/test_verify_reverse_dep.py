@@ -128,8 +128,12 @@ def _build_config(tmp_path: Path) -> OrchestratorConfig:
     ``_module_configs`` is a Pydantic PrivateAttr (config.py:2682), not a
     constructor kwarg — set via direct attribute assignment, the established
     idiom (test_verify.py:5558 et al.).
+
+    Breadth is pinned to ``'scoped'`` because reverse-dependency widening is
+    a scoped-breadth mechanism: under ``'full'`` every registered module's
+    full suite already runs.
     """
-    config = OrchestratorConfig(project_root=tmp_path)
+    config = OrchestratorConfig(project_root=tmp_path, merge_verify_breadth='scoped')
     config._module_configs = {
         'escalation': ModuleConfig(
             prefix='escalation',
@@ -455,7 +459,7 @@ class TestRunScopedVerificationReverseDependencyGuards:
     async def test_unmapped_package_source_change_does_not_widen(self, tmp_path: Path):
         """A source-only diff to a package with no reverse-dep map entry widens to nothing."""
         worktree = _build_dashboard_worktree(tmp_path)
-        config = OrchestratorConfig(project_root=worktree)
+        config = OrchestratorConfig(project_root=worktree, merge_verify_breadth='scoped')
         dashboard_mc = ModuleConfig(
             prefix='dashboard',
             test_command=_DASHBOARD_TEST_COMMAND,

@@ -76,6 +76,11 @@ LIVE_STATE_FRESHNESS_HEADING = f'## {LIVE_STATE_FRESHNESS_TITLE}'
 PRESERVED_SPECIMEN_CORROBORATION_TITLE = 'Preserved-Specimen Corroboration'
 PRESERVED_SPECIMEN_CORROBORATION_HEADING = f'## {PRESERVED_SPECIMEN_CORROBORATION_TITLE}'
 
+#: The Stage 2 summary pre-check section's heading (task 6295), shared with the
+#: Available Tools pointer to it so a rename cannot leave that pointer dangling.
+STAGE2_SUMMARY_PRECHECK_TITLE = 'Pre-Check: Already-Present Stage 2 Summaries'
+STAGE2_SUMMARY_PRECHECK_HEADING = f'## {STAGE2_SUMMARY_PRECHECK_TITLE}'
+
 _CHILD_KIND_NAMES = ' or '.join(f'`{kind}`' for kind in sorted(CHILD_KINDS))
 
 #: The Authority-Model carve-out for child memories (task 6193), exported so
@@ -144,7 +149,7 @@ INCONCLUSIVE, never a definitive absence — `expired` means the run is past the
 retention window, so the row would have been reaped whether or not it was ever written. \
 `run_status` is DIAGNOSTIC context for a finding's evidence line and must NEVER itself \
 decide whether to flag. Use this as the PRIMARY cycle-summary \
-presence check (see ## Pre-Check: Already-Reconstructed Stage 2 Summaries below).
+presence check (see ## {STAGE2_SUMMARY_PRECHECK_TITLE} below).
 
 You do not have access to task *write* tools — task reconciliation is Stage 2's job. \
 `mcp__fused-memory__get_task` is permitted as a read-only verification call (see \
@@ -691,7 +696,7 @@ one cycle of the very suppression you are trying to earn. That relocation cost i
 exactly why the deterministic discovery above, not your citation, is the load-bearing \
 path here.
 
-## Pre-Check: Already-Reconstructed Stage 2 Summaries
+{STAGE2_SUMMARY_PRECHECK_HEADING}
 Before emitting a "missing Stage 2 summary" finding for a run, and before noting the \
 presence of your own prior-run summary in your cycle report, consult the AUTHORITATIVE \
 ledger FIRST for each summary; fall back to the existing Mem0 two-path check ONLY when \
@@ -700,8 +705,9 @@ the ledger read is inconclusive. Each check below verifies a DIFFERENT per-cycle
 
 ### PRIMARY — Ledger presence check (authoritative)
 
-**A. Stage-2-summary reconstruct-trigger** (the actionable "missing Stage 2 summary" \
-finding): \
+**A. Stage-2-summary presence decision** (the actionable "missing Stage 2 summary" \
+finding, which Stage 2 decides against this same ledger, carrying it forward only while \
+the row is still missing — nothing reconstructs it): \
 `mcp__fused-memory__get_cycle_summary_presence(project_id=..., run_id=<run_id>, \
 stage='task_knowledge_sync')`
 - `ledger_available: true` and `present: true` → the Stage 2 summary is present. Do NOT \
@@ -721,15 +727,14 @@ well have run the stage and lost only the ledger write.
 
 **B. Stage 1's own prior-run summary** (presence audit only — the Stage 1 summary is \
 written deterministically by Python (`write_stage1_cycle_summary`) and is never \
-LLM-reconstructed by this stage, so this check never triggers a reconstruction; it only \
-informs your cycle report): \
+LLM-authored, so this check never raises a finding; it only informs your cycle report): \
 `mcp__fused-memory__get_cycle_summary_presence(project_id=..., run_id=<run_id>, \
 stage='memory_consolidator')`
 - `ledger_available: true` and `present: true` → your own prior-run summary is present. \
 No action needed.
 - `present: false` and `expected: true` (`reason: 'missing'`) → your own prior-run \
-summary is genuinely absent. Note this in your cycle report — do NOT attempt to \
-reconstruct it yourself and do NOT emit a missing-summary finding for it; only the \
+summary is genuinely absent. Note this in your cycle report — do NOT author a \
+replacement summary yourself and do NOT emit a missing-summary finding for it; only the \
 Stage-2 case (A) above is actionable.
 - `present: false` and `expected: false` (`reason: 'stage_not_run'`) → that run never \
 reached Stage 1, so no summary was owed. Nothing to note.
@@ -755,8 +760,8 @@ for check A, or `{{'kind': 'cycle_summary', 'run_id': '<run_id>', 'stage': \
 'memory_consolidator'}}` for check B. \
 A return value > 0 means the corresponding summary is present. This path catches summaries \
 that semantic search misses due to low cosine-similarity ranking (confirmed false \
-negative: run 80a85eeb, memory 91e6a3b9 sat at relevance 0.71, triggering wasteful \
-reconstruction; task 1588). \
+negative: run 80a85eeb, memory 91e6a3b9 sat at relevance 0.71, triggering a false \
+missing-summary finding; task 1588). \
 **The `stage` key is REQUIRED here (task 1653):** Stage 1 writes its OWN per-cycle \
 summary under `{{'kind': 'cycle_summary', 'run_id': <run_id>, 'stage': \
 'memory_consolidator'}}` and Stage 2 writes its summary under \
@@ -768,20 +773,20 @@ Always disambiguate by `stage`.
 **Decision rule (fallback only)**: for check A, if EITHER path confirms the Stage 2 \
 summary exists, do NOT emit the missing-summary finding — Stage 2 already wrote the \
 per-cycle summary for that run. Note in your cycle report, e.g. \
-"Stage 2 summary for run_id=<run_id> already present — skipping reconstruction." Only \
+"Stage 2 summary for run_id=<run_id> already present — not emitting the missing-summary \
+finding." Only \
 emit the missing-summary finding when BOTH Path 1 returns no matching content AND Path 2 \
 returns count=0. For check B, apply the same two-path logic to your own summary, but \
 only ever as a report-only note per the audit rule above — never as a finding.
 
 **Tool error handling**: if `count_memories_by_metadata` returns an error (e.g. backend \
-unavailable), treat as inconclusive and do NOT reconstruct — the documented harm is \
-false-positive reconstruction (wasteful duplicate summaries), so bias toward skipping \
-reconstruction on uncertainty. Note the tool error in your cycle report instead.
+unavailable), treat as inconclusive and do NOT emit the missing-summary finding — the \
+documented harm is a false-positive finding (a wasted remediation pass), so bias toward \
+not emitting it on uncertainty. Note the tool error in your cycle report instead.
 
-Rationale: back-to-back remediation passes otherwise trigger double-reconstruction of \
-the same Stage 2 summary, producing duplicate per-cycle entries a later cycle must clean \
-up. The two-path approach eliminates the false-negative risk from semantic-search \
-ranking/limit cutoff. Legacy summaries (written before task 1588) lack \
+Rationale: without this check a summary that exists gets re-flagged as missing, and each \
+such finding burns a remediation pass. The two-path approach eliminates the \
+false-negative risk from semantic-search ranking/limit cutoff. Legacy summaries (written before task 1588) lack \
 `metadata.run_id`, and Stage 2 summaries written before task 9af436fe lack \
 `metadata.stage`, so the Path 2 triple filter returns 0 for them — Path 1 remains their \
 fallback. The ledger PRIMARY check above is the authoritative source of truth going \

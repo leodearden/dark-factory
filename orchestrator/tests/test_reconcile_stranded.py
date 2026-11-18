@@ -15,6 +15,7 @@ from typing import cast
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
+from _harness_store_paths import point_harness_stores_at
 from _landing_evidence_helpers import differential_confirms, landing_reject_rows
 from _orch_helpers import (
     mock_lock_table,
@@ -2652,12 +2653,11 @@ async def test_harness_run_invokes_reconcile_before_scheduler_loop(
     config.review.enabled = False
     config.sandbox.backend = 'auto'
     config.max_concurrent_tasks = 2
+    # Harness.run builds RunSlots from this; a spec'd MagicMock raises TypeError in asyncio.Semaphore.
+    config.main_health_fix_reserved_slots = 1
     config.fused_memory.project_id = 'test'
     config.sandbox.backend = 'auto'
-    # Real Path so OverrideStore.from_config(config) can call .parent.mkdir()
-    # and sqlite3.connect(str(...)) without leaking MagicMock-named files —
-    # Harness.__init__ wires OverrideStore unconditionally (task 1313).
-    config.overrides_db_path = tmp_path / 'overrides.db'
+    point_harness_stores_at(config, tmp_path)
     # No-landings breaker (task 1918): ints are read at construction (deque
     # maxlen); enabled=False keeps run() from spinning up the breaker loop.
     config.no_landings_breaker_enabled = False
@@ -2720,7 +2720,7 @@ async def test_harness_run_invokes_reconcile_before_scheduler_loop(
     h._reconcile_stranded_in_progress = _fake_reconcile
 
     # Track ordering: acquire_next — append then raise to break the loop
-    async def _fake_acquire():
+    async def _fake_acquire(*_args, **_kwargs):
         call_order.append('acquire')
         raise RuntimeError('stop the loop')
     h.scheduler.acquire_next = _fake_acquire

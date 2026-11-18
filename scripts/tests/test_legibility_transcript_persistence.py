@@ -7,11 +7,12 @@ The detector cross-checks fleet session-registry records
 spawn-launched interactive session produced no plausibly-matching
 transcript (the "session ran, no transcript" regression).
 
-Every test injects a tmp ``fleet_root`` (so ``session_registry`` never
+Every test injects a tmp ``fleet_root`` (so ``session_records`` never
 touches the real ``~/.claude`` tree), a tmp ``projects_root``, a FIXED
 ``now``, a written fixture ``legibility.yaml``, and a fake ``poster`` — no
-real ``~/.claude``, no live escalation server, and no dependency on the
-separately-landing ``CLAUDE_CODE_FORCE_SESSION_PERSISTENCE`` preventer.
+real ``~/.claude`` and no live escalation server. Every preventer-guard test
+reads a fixture spawn script except the one that pins the guard against the
+committed ``skills/spawn/spawn-claude.sh``.
 """
 from __future__ import annotations
 
@@ -25,7 +26,7 @@ import pytest
 from legibility import check_transcript_persistence as mod
 from legibility.config import load_config
 
-from orchestrator import session_registry
+from orchestrator import session_records
 
 SCRIPT = Path(__file__).parent.parent / "legibility" / "check_transcript_persistence.py"
 
@@ -58,14 +59,14 @@ def _write_session_record(
     fleet_root: Path,
     slug: str,
     *,
-    status: session_registry.Status,
+    status: session_records.Status,
     prompt: str,
     cwd: str = "/home/leo/src/dark-factory",
     start_ts: datetime | None = None,
     exit_code: int | None = 0,
-) -> session_registry.SessionRecord:
+) -> session_records.SessionRecord:
     """Write a SessionRecord under *fleet_root* via the canonical writer."""
-    rec = session_registry.SessionRecord(
+    rec = session_records.SessionRecord(
         session_slug=slug,
         status=status,
         prompt=prompt,
@@ -73,7 +74,7 @@ def _write_session_record(
         start_ts=_iso(start_ts) if start_ts is not None else _iso(FIXED_NOW),
         exit_code=exit_code,
     )
-    session_registry.write_record(rec, root=fleet_root)
+    session_records.write_record(rec, root=fleet_root)
     return rec
 
 
@@ -127,30 +128,30 @@ def test_find_completed_spawn_records_filters(tmp_path):
 
     # (KEEP) a completed EXITED spawn with a usable prompt, in window.
     _write_session_record(
-        fleet, "good-exited", status=session_registry.Status.EXITED,
+        fleet, "good-exited", status=session_records.Status.EXITED,
         prompt="Investigate the flaky merge on task 2500 and report back.",
         start_ts=FIXED_NOW - timedelta(hours=1),
     )
     # (KEEP) FAILED_TO_START is also terminal.
     _write_session_record(
-        fleet, "good-failed", status=session_registry.Status.FAILED_TO_START,
+        fleet, "good-failed", status=session_records.Status.FAILED_TO_START,
         prompt="Run the unblock skill for df#2085.",
         start_ts=FIXED_NOW - timedelta(hours=5),
     )
     # (EXCLUDE) empty prompt.
     _write_session_record(
-        fleet, "empty-prompt", status=session_registry.Status.EXITED,
+        fleet, "empty-prompt", status=session_records.Status.EXITED,
         prompt="", start_ts=FIXED_NOW - timedelta(hours=1),
     )
     # (EXCLUDE) non-terminal (RUNNING) — transcript may still be flushing.
     _write_session_record(
-        fleet, "still-running", status=session_registry.Status.RUNNING,
+        fleet, "still-running", status=session_records.Status.RUNNING,
         prompt="A long-running interactive session.",
         start_ts=FIXED_NOW - timedelta(hours=1),
     )
     # (EXCLUDE) terminal but older than the 48h lookback window.
     _write_session_record(
-        fleet, "too-old", status=session_registry.Status.EXITED,
+        fleet, "too-old", status=session_records.Status.EXITED,
         prompt="An old completed session outside the window.",
         start_ts=FIXED_NOW - timedelta(hours=72),
     )
@@ -190,9 +191,9 @@ def _spawn_record(
     claude_session_id: str | None = None,
     claude_launch_session_id: str | None = None,
 ):
-    return session_registry.SessionRecord(
+    return session_records.SessionRecord(
         session_slug=slug,
-        status=session_registry.Status.EXITED,
+        status=session_records.Status.EXITED,
         prompt=prompt,
         cwd=cwd,
         start_ts=_iso(FIXED_NOW - timedelta(hours=start_offset_hours)),
@@ -347,9 +348,9 @@ def test_find_missing_transcripts_end_to_end(tmp_path):
     missing = _spawn_record("sess-missing", member_missing, missing_prompt)
 
     # (c) in-flight (non-terminal) spawn with no transcript -> tolerated.
-    inflight = session_registry.SessionRecord(
+    inflight = session_records.SessionRecord(
         session_slug="sess-inflight",
-        status=session_registry.Status.RUNNING,
+        status=session_records.Status.RUNNING,
         prompt="An in-flight interactive session still running.",
         cwd=member_present,
         start_ts=_iso(FIXED_NOW - timedelta(hours=1)),
@@ -1079,7 +1080,7 @@ def _build_fleet_and_projects(tmp_path, *, include_lost: bool):
 
     # completed + transcript present (strong match) -> no finding.
     _write_session_record(
-        fleet, "sess-present", status=session_registry.Status.EXITED,
+        fleet, "sess-present", status=session_records.Status.EXITED,
         prompt=_USABLE_PROMPT, cwd=member_present,
         start_ts=FIXED_NOW - timedelta(hours=1),
     )
@@ -1087,21 +1088,21 @@ def _build_fleet_and_projects(tmp_path, *, include_lost: bool):
 
     # in-flight (non-terminal) -> tolerated, no finding.
     _write_session_record(
-        fleet, "sess-inflight", status=session_registry.Status.RUNNING,
+        fleet, "sess-inflight", status=session_records.Status.RUNNING,
         prompt="An in-flight interactive session still running right now.",
         cwd=member_present, start_ts=FIXED_NOW - timedelta(hours=1),
     )
 
     # foreign-project completed spawn -> excluded (not is_member).
     _write_session_record(
-        fleet, "sess-foreign", status=session_registry.Status.EXITED,
+        fleet, "sess-foreign", status=session_records.Status.EXITED,
         prompt="A completed spawn in a different project entirely, not a member here.",
         cwd=foreign_cwd, start_ts=FIXED_NOW - timedelta(hours=1),
     )
 
     if include_lost:
         _write_session_record(
-            fleet, "sess-lost", status=session_registry.Status.EXITED,
+            fleet, "sess-lost", status=session_records.Status.EXITED,
             prompt=(
                 "Diagnose the stuck reconciliation on task 2701 and summarise "
                 "the root cause."
@@ -1148,8 +1149,8 @@ def test_run_check_healthy_no_escalation(tmp_path):
 
 def test_run_check_preventer_guard_toggles_force_persistence_ok(tmp_path):
     # A tmp spawn-script fixture MISSING the token -> force_persistence_ok False;
-    # a fixture WITH the token -> True. Fixtures only — never the real
-    # committed spawn-claude.sh (which does not carry the token on this branch).
+    # a fixture WITH the token -> True. Fixtures only, so the test controls
+    # the verdict in both directions.
     fleet, projects, config_path = _build_fleet_and_projects(tmp_path, include_lost=False)
 
     missing_token = tmp_path / "spawn-no-token.sh"
@@ -1193,6 +1194,31 @@ def test_main_healthy_returns_zero(tmp_path):
         "--lookback-hours", "48",
     ])
     assert rc == 0
+
+
+def test_main_check_preventer_passes_on_committed_spawn_script(tmp_path, capsys):
+    assert mod.DEFAULT_SPAWN_SCRIPT.is_file(), (
+        f"--check-preventer's default spawn script {mod.DEFAULT_SPAWN_SCRIPT} "
+        "does not exist; the guard would read '' and fail safe on every run"
+    )
+    fleet, projects, config_path = _build_fleet_and_projects(tmp_path, include_lost=False)
+
+    rc = mod.main([
+        "--config", str(config_path),
+        "--fleet-root", str(fleet),
+        "--projects-root", str(projects),
+        "--lookback-hours", "48",
+        "--check-preventer",
+    ])
+
+    captured = capsys.readouterr()
+    assert rc == 0 and "preventer guard present" in captured.out, (
+        "the --check-preventer guard no longer recognises the "
+        "CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1 export in the committed "
+        "skills/spawn/spawn-claude.sh, so an operator's --check-preventer run "
+        f"would false-alarm (rc={rc}, stdout={captured.out!r}, "
+        f"stderr={captured.err!r})"
+    )
 
 
 def test_run_check_enriches_escalation_detail_with_preventer_verdict(tmp_path):

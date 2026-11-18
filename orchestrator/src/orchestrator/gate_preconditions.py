@@ -11,12 +11,12 @@ import logging
 from dataclasses import dataclass
 
 from shared.task_fields import dependency_ids
+from shared.task_metadata import GATE_ESCALATED_PRECONDITIONS_KEY
 
 from orchestrator.dependency_verdict import task_external_deps
 
 logger = logging.getLogger(__name__)
 
-GATE_ESCALATED_PRECONDITIONS_KEY = 'gate_escalated_preconditions'
 _STAMP_SHAPE = (
     "{'dependencies': list[str], 'external_deps': list[str], 'milestone': <milestone or None>}"
 )

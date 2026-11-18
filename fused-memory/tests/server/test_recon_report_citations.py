@@ -2544,16 +2544,16 @@ class TestCiteTaskFoldPurgeRecord(_FoldPurgeRecordHarness):
     @pytest.mark.asyncio
     async def test_record_caps_long_text_and_names_the_truncated_fields(self, store):
         from fused_memory.server.recon_report import (
-            _MAX_FINDING_TEXT_CHARS,
-            _MAX_PURGED_TEXT_CHARS,
-            _TRUNCATION_MARKER,
+            MAX_FINDING_TEXT_CHARS,
+            MAX_PURGED_TEXT_CHARS,
+            RECON_TEXT_TRUNCATION_MARKER,
         )
 
         state, _ = self._make_state(store)
         state.start_report(run_id='run-1', stage='reconciler', project_id='dark_factory')
         anchor_id = self._file_null_task_finding(state, 'short anchor')
-        long_description = 'x' * _MAX_FINDING_TEXT_CHARS
-        long_action = 'y' * _MAX_FINDING_TEXT_CHARS
+        long_description = 'x' * MAX_FINDING_TEXT_CHARS
+        long_action = 'y' * MAX_FINDING_TEXT_CHARS
         loser_id = self._file_null_task_finding(
             state, long_description, suggested_action=long_action,
         )
@@ -2563,13 +2563,13 @@ class TestCiteTaskFoldPurgeRecord(_FoldPurgeRecordHarness):
 
         assert folded.get('existing_finding_id') == anchor_id, folded
         (record,) = _persisted_purge_record_rows(store, 'run-1')['reconciler']['purged_findings']
-        assert record['finding']['description'] == 'x' * _MAX_PURGED_TEXT_CHARS + _TRUNCATION_MARKER
-        assert record['finding']['suggested_action'] == 'y' * _MAX_PURGED_TEXT_CHARS + _TRUNCATION_MARKER
+        assert record['finding']['description'] == 'x' * MAX_PURGED_TEXT_CHARS + RECON_TEXT_TRUNCATION_MARKER
+        assert record['finding']['suggested_action'] == 'y' * MAX_PURGED_TEXT_CHARS + RECON_TEXT_TRUNCATION_MARKER
         assert record['truncated_fields'] == ['description', 'suggested_action']
 
     @pytest.mark.asyncio
     async def test_records_keep_the_first_n_and_count_the_overflow(self, store, caplog):
-        from fused_memory.server.recon_report import _MAX_PURGED_FINDINGS
+        from fused_memory.server.recon_report import MAX_PURGED_FINDINGS
 
         state, _ = self._make_state(store)
         state.start_report(run_id='run-1', stage='reconciler', project_id='dark_factory')
@@ -2578,7 +2578,7 @@ class TestCiteTaskFoldPurgeRecord(_FoldPurgeRecordHarness):
 
         folded_ids = []
         with caplog.at_level(logging.WARNING, logger='fused_memory.server.recon_report'):
-            for i in range(_MAX_PURGED_FINDINGS + 3):
+            for i in range(MAX_PURGED_FINDINGS + 3):
                 loser_id = self._file_null_task_finding(state, f'restatement #{i}')
                 folded = await state.cite_task('run-1', loser_id, 'dark_factory', '2405')
                 assert folded == {
@@ -2590,17 +2590,17 @@ class TestCiteTaskFoldPurgeRecord(_FoldPurgeRecordHarness):
 
         row = _persisted_purge_record_rows(store, 'run-1')['reconciler']
         assert [r['finding']['finding_id'] for r in row['purged_findings']] == (
-            folded_ids[:_MAX_PURGED_FINDINGS]
+            folded_ids[:MAX_PURGED_FINDINGS]
         )
         assert row['purged_findings_overflow'] == 3
 
         warnings = _fold_purge_warnings(caplog)
-        assert len(warnings) == _MAX_PURGED_FINDINGS + 3
+        assert len(warnings) == MAX_PURGED_FINDINGS + 3
         for loser_id, message in zip(folded_ids, warnings, strict=True):
             assert loser_id in message, message
-        for message in warnings[:_MAX_PURGED_FINDINGS]:
+        for message in warnings[:MAX_PURGED_FINDINGS]:
             assert 'structural_copy=kept' in message, message
-        for message in warnings[_MAX_PURGED_FINDINGS:]:
+        for message in warnings[MAX_PURGED_FINDINGS:]:
             assert 'structural_copy=dropped' in message, message
 
     @pytest.mark.asyncio
@@ -2665,13 +2665,13 @@ class TestCiteTaskFoldPurgeRecordPersistence(_FoldPurgeRecordHarness):
 
     @pytest.mark.asyncio
     async def test_overflow_count_survives_a_restart(self, store):
-        from fused_memory.server.recon_report import _MAX_PURGED_FINDINGS
+        from fused_memory.server.recon_report import MAX_PURGED_FINDINGS
 
         state_a, _ = self._make_state(store)
         state_a.start_report(run_id='run-1', stage='reconciler', project_id='dark_factory')
         anchor_id = self._file_null_task_finding(state_a, 'anchor')
         assert 'error' not in await state_a.cite_task('run-1', anchor_id, 'dark_factory', '2405')
-        for i in range(_MAX_PURGED_FINDINGS + 1):
+        for i in range(MAX_PURGED_FINDINGS + 1):
             loser_id = self._file_null_task_finding(state_a, f'restatement #{i}')
             folded = await state_a.cite_task('run-1', loser_id, 'dark_factory', '2405')
             assert folded.get('existing_finding_id') == anchor_id, folded
@@ -2682,7 +2682,7 @@ class TestCiteTaskFoldPurgeRecordPersistence(_FoldPurgeRecordHarness):
 
         after = _persisted_purge_record_rows(store, 'run-1')['reconciler']
         assert after['stats'] == {'k': 1}
-        assert len(after['purged_findings']) == _MAX_PURGED_FINDINGS
+        assert len(after['purged_findings']) == MAX_PURGED_FINDINGS
         assert after['purged_findings_overflow'] == 1
 
     @pytest.mark.asyncio

@@ -70,8 +70,16 @@ from shared.transcript_archive import (
     durable_archive_path,
     set_archival_failure_hook,
 )
+from shared.usage_gate import UsageGate
 
-from orchestrator import cross_repo_gate, delivered_check_owner, recovery_pins, recut_ruling
+from orchestrator import (
+    cross_repo_gate,
+    delivered_check_owner,
+    pure_gate_resolution,
+    recovery_pins,
+    recut_ruling,
+    substrate_gate,
+)
 from orchestrator import digest as digest_mod
 from orchestrator.agent_session_reaper import (
     ReapTally,
@@ -155,6 +163,7 @@ from orchestrator.merge_lane.skew_tripwire import emit_pipeline_landing_tripwire
 from orchestrator.merge_lane.tip_relation import select_recovery_winner
 from orchestrator.merge_lane.worker import (
     reconcile_landed_outbox,
+    reconcile_landed_row,
     reconcile_landed_task,
 )
 from orchestrator.module_charter import derive_modules, sanitize_files_for_persist
@@ -177,6 +186,7 @@ from orchestrator.proc_supervision import EscalationSpec
 from orchestrator.project_slice_weight import ensure_project_slice_weight
 from orchestrator.provenance_conflict import ProvenanceConflictSink
 from orchestrator.quarantine_provenance import QuarantineOutcome
+from orchestrator.recovered_merge_owner import RecoveredMergeOwner
 from orchestrator.recovery_emission import (
     STREAK_CHARGING_SITES,
     LeaveReason,
@@ -201,6 +211,7 @@ from orchestrator.recovery_pins import records_pin_recovery
 from orchestrator.review_checkpoint import ReviewCheckpoint, ReviewReport
 from orchestrator.routing import RoleDefaults
 from orchestrator.routing_dispatch import resolve_and_record_route
+from orchestrator.run_slots import DispatchScope, RunSlots
 from orchestrator.run_store import RunExitReason, RunStore
 from orchestrator.scheduled_deploy_settle import ScheduledDeploySettler
 from orchestrator.scheduler import (
@@ -273,7 +284,6 @@ from orchestrator.task_status import (
     is_infra_held,
 )
 from orchestrator.task_verify_dispatch import TaskVerifyDispatcher, policy_from_config
-from orchestrator.usage_gate import UsageGate
 from orchestrator.verify_admission_watch import ADMISSION_WATCH_INTERVAL_SECS, AdmissionWatch
 from orchestrator.verify_categories import FailureCategory
 from orchestrator.verify_hosts import HostPool, remote_runner_factory, task_verify_hosts
@@ -664,6 +674,14 @@ _WATCHER_ALLOWED_TOOLS: list[str] = [
     # pending L1/L2 it assessed (task 2555) so future rotations can skip
     # re-deriving the same disposition every rotation.
     'mcp__escalation__stamp_triage',
+    # Read-only escalation-record and merge-state reads the skill's Read-only
+    # investigation toolset lists (task 3176); its merge-queue constraint
+    # forbids mutation only. declare_pin is deliberately absent:
+    # skills/escalation-watcher-auto/SKILL.md "Declared pins".
+    'mcp__escalation__get_escalation',
+    'mcp__escalation__get_task_escalation_history',
+    'mcp__escalation__merge_status',
+    'mcp__escalation__get_merge_queue',
     # Fused-memory MCP: read + autonomous dispatch (scope_violation/dependency/cleanup) + filing
     'mcp__fused-memory__get_task',
     'mcp__fused-memory__get_tasks',
@@ -1631,6 +1649,17 @@ REPEND_WHILE_PAUSED_MARKER = (
 )
 
 
+def _deterministic_report(task_id: str, task: dict, outcome: WorkflowOutcome) -> TaskReport:
+    """The TaskReport of a DeterministicRunner run, from a slot or at resolution."""
+    return TaskReport(
+        task_id=task_id,
+        title=task.get('title', ''),
+        outcome=outcome,
+        completed_at=datetime.now(UTC).isoformat(),
+        block_reason='deterministic_gate' if outcome == WorkflowOutcome.BLOCKED else '',
+    )
+
+
 def _repend_while_paused_note(task_id: str, pause_reason: str) -> str:
     return (
         f'{REPEND_WHILE_PAUSED_MARKER} task {task_id} is pending, but dispatch is '
@@ -1663,15 +1692,19 @@ class Harness:
         from orchestrator.agents.sandbox_dispatch import set_backend
         set_backend(config.sandbox.backend)
         self.mcp = McpLifecycle(config)
-        # Size the warm-lane pool from max_concurrent_tasks (D9: read once at startup,
-        # single source of truth). Pass 0 when the knob is off so GitOps leaves
+        # Size the warm-lane pool from every run slot, the main-health-fix reserve
+        # included (D9: read once at startup). Pass 0 when the knob is off so GitOps leaves
         # warm_lane_pool=None — non-dispatch call sites (cli.py verify-merge,
         # recover_main.py, evals/runner.py) default to size=0 and stay on cold path.
         self.git_ops = GitOps(
             config.git,
             config.project_root,
             warm_lane_pool_size=(
-                (config.max_concurrent_tasks + config.git.spare_warm_lanes)
+                (
+                    config.max_concurrent_tasks
+                    + config.main_health_fix_reserved_slots
+                    + config.git.spare_warm_lanes
+                )
                 if config.git.warm_lane_pool else 0
             ),
             # Spec-pool size: K (same as speculation_depth), one warm lane per
@@ -2949,7 +2982,10 @@ class Harness:
             await self._launch_merge_worker_loop()
 
             # 3. Run workflow slots
-            sem = asyncio.Semaphore(self.config.max_concurrent_tasks)
+            slots = RunSlots(
+                self.config.max_concurrent_tasks,
+                self.config.main_health_fix_reserved_slots,
+            )
 
             while True:
                 # If a review checkpoint is running, don't acquire new tasks —
@@ -2960,13 +2996,20 @@ class Harness:
                     )
                     continue
 
+                # A slot is taken before a task is picked, so no picked task
+                # holds its module locks while waiting for one (task 8480).
+                scope = slots.free_scope()
+                if scope is None:
+                    await self._wait_for_slot_turnover()
+                    continue
+
                 # Check daily cost ceilings before dispatching the next task.
                 # On breach, pause_scheduler() is called and acquire_next()
                 # returns None (task-1322 machinery), draining in-flight work
                 # and exiting the run loop cleanly.  Task 1323.
                 await self._enforce_cost_ceilings()
 
-                assignment = await self.scheduler.acquire_next()
+                assignment = await self.scheduler.acquire_next(scope)
 
                 if assignment is None:
                     if not self._live_tasks:
@@ -3060,16 +3103,19 @@ class Harness:
                         finally:
                             self._idle_poll_sleeping = False
                         continue
-                    # Wait for any live task to complete, then retry.
-                    # Timeout ensures newly-added tasks are discovered
-                    # within 15s even when no running task completes.
-                    await asyncio.wait(
-                        set(self._live_tasks), return_when=asyncio.FIRST_COMPLETED,
-                        timeout=15,
-                    )
+                    # A general slot freed during a restricted tick widens the
+                    # scope: tick again now instead of waiting a poll.
+                    if slots.free_scope() is scope:
+                        await self._wait_for_slot_turnover()
                     continue
 
-                await sem.acquire()
+                sem = await slots.claim(scope, assignment.task)
+                if scope is DispatchScope.MAIN_HEALTH_FIX:
+                    logger.info(
+                        'Task %s dispatched on the main-health-fix reserved run '
+                        'slot: every general run slot is held',
+                        assignment.task_id,
+                    )
                 self._launch_slot(assignment, sem, task_reports)
 
             self._compute_tallies(task_reports)
@@ -5744,6 +5790,7 @@ class Harness:
                 self._escalation_queue,
                 self._resolve_task_worktree,
                 heartbeat_ttl=DEFAULT_CLAIMANT_HEARTBEAT_TTL,
+                merge_requests=getattr(self, '_merge_inflight_registry', None),
             )
             self._ground_truth = existing
         return existing
@@ -9380,7 +9427,7 @@ class Harness:
         self,
         task_id: str,
         *,
-        verdict,
+        verdict: cross_repo_gate.CrossRepoVerdict,
     ) -> None:
         """Block a task and file an L1 for a cross-repo BLOCK verdict (misfile or unverifiable).
 
@@ -9406,26 +9453,27 @@ class Harness:
         self,
         task_id: str,
         *,
-        verdict,
+        verdict: substrate_gate.SubstrateVerdict,
     ) -> None:
-        """Block a task and file an L1 escalation for a PASS→FAIL substrate flip.
+        """Block a task and file an L1 for a substrate FLIP verdict (probe-set flip or unverifiable).
 
-        A PASS→FAIL flip means the task's probe-set premise no longer holds on
-        current main; the design_concern class routes it to human/curator judgment
-        (same class as report_false_premise).  Blocking, filing and the
-        category-scoped dedupe live in ``_block_and_file_dispatch_gate_l1``.
+        ``design_concern`` routes it to human/curator judgment (same class as
+        report_false_premise).
+
+        The summary/detail/root cause come from
+        ``orchestrator/src/orchestrator/substrate_gate.py::flip_escalation_text``.
+        Blocking, filing and the dedupe live in
+        ``_block_and_file_dispatch_gate_l1``; the root cause scopes that dedupe,
+        so an open unverified L1 cannot hide a later probe-set flip, nor the
+        reverse.
         """
-        summary = f'SUBSTRATE_FLIP: probe set PASS→FAIL on current main (task {task_id})'
-        detail = (
-            f'Dispatch-time substrate re-check detected a PASS→FAIL flip.\n'
-            f'Verdict: {verdict.verdict!r} | exit_code={verdict.exit_code} | '
-            f'probe_set={verdict.probe_set!r}\n'
-            f'Reason: {verdict.reason}\n'
-            f'The task premise (probe set authored at investigation time) no longer holds '
-            f'on current main — re-spec required before dispatch.'
-        )
+        text = substrate_gate.flip_escalation_text(task_id, verdict)
         await self._block_and_file_dispatch_gate_l1(
-            task_id, category=EscalationCategory.DESIGN_CONCERN, summary=summary, detail=detail,
+            task_id,
+            category=EscalationCategory.DESIGN_CONCERN,
+            summary=text.summary,
+            detail=text.detail,
+            root_cause=text.root_cause,
         )
 
     async def _run_recut_ruling_gate(self, assignment) -> recut_ruling.RecutGateResult:
@@ -9484,6 +9532,7 @@ class Harness:
 
     async def _block_and_file_dispatch_gate_l1(
         self, task_id: str, *, category: str, summary: str, detail: str,
+        root_cause: str = '',
     ) -> None:
         """Block *task_id* and file one category-scoped L1 for a dispatch gate.
 
@@ -9492,7 +9541,8 @@ class Harness:
         - a failed write is logged and the L1 is still filed;
         - with no escalation queue the filing is a logged no-op;
         - the dedupe is ``_file_harness_l1``'s: only an open L1 of *category*
-          suppresses this one, so an L1 for another cause cannot hide it.
+          (carrying *root_cause*, when one is given) suppresses this one, so
+          an L1 for another cause cannot hide it.
         """
         try:
             await self.scheduler.set_task_status(task_id, 'blocked')
@@ -9504,6 +9554,7 @@ class Harness:
             )
         self._file_harness_l1(
             task_id, category=category, summary=summary, detail=detail,
+            root_cause=root_cause,
         )
 
     def _file_harness_l1(
@@ -9620,8 +9671,6 @@ class Harness:
         """
         import asyncio
 
-        from orchestrator import substrate_gate
-
         task_id = assignment.task_id
         gate_path = self.git_ops.worktree_base / f'_substrate-gate-{task_id}'
 
@@ -9689,13 +9738,7 @@ class Harness:
             )
             await self._block_and_escalate_substrate_flip(
                 task_id,
-                verdict=substrate_gate.SubstrateVerdict(
-                    verdict=substrate_gate.FLIP,
-                    exit_code=proc.returncode,
-                    checker_argv=None,
-                    probe_set=None,
-                    reason=reason,
-                ),
+                verdict=substrate_gate.unverifiable_verdict(reason),
             )
             return False
 
@@ -9714,12 +9757,9 @@ class Harness:
                 'substrate_gate: run_substrate_recheck raised for task %s: %s',
                 task_id, exc, exc_info=True,
             )
-            verdict = substrate_gate.SubstrateVerdict(
-                verdict=substrate_gate.FLIP,
-                exit_code=None,
-                checker_argv=None,
-                probe_set=None,
-                reason=f'substrate unverifiable / run_substrate_recheck raised: {exc}',
+            verdict = substrate_gate.unverifiable_verdict(
+                f'substrate unverifiable / run_substrate_recheck raised '
+                f'{type(exc).__name__}: {exc}',
             )
         finally:
             # Always remove the gate worktree — leak is rare and reclaimable, but
@@ -10532,8 +10572,6 @@ class Harness:
             # FLIP, so gating dispatch on any other definition (e.g. one that
             # requires a well-formed descriptor) would let a malformed
             # descriptor skip the gate entirely instead of failing closed.
-            from orchestrator import substrate_gate
-
             if substrate_gate.carries_substrate_probe(assignment.task) and not await self._run_substrate_gate(assignment):
                 # FLIP detected: task is already blocked + escalated inside
                 # the gate.  Return a BLOCKED report so the caller (and
@@ -10879,8 +10917,6 @@ class Harness:
         or a plain DONE report when the gate has been resolved (resume path).
         """
         from datetime import UTC, datetime
-        if self._escalation_queue is None:
-            raise RuntimeError('_escalation_queue must be initialised before dispatching deterministic tasks')
         # Task 2983 fix (b): dispatch-time double-dispatch guard.  The scheduler
         # can re-select a deterministic task off a STALE eligibility snapshot
         # (deterministic tasks hold no module locks and arm no requeue cooldown
@@ -10910,18 +10946,17 @@ class Harness:
                 completed_at=datetime.now(UTC).isoformat(),
                 block_reason='',
             )
-        runner = DeterministicRunner(
+        outcome = await self._deterministic_runner().run(assignment)
+        return _deterministic_report(assignment.task_id, assignment.task, outcome)
+
+    def _deterministic_runner(self) -> DeterministicRunner:
+        """The runner shape both the deterministic slot and the pure-gate resume path use."""
+        if self._escalation_queue is None:
+            raise RuntimeError('_escalation_queue must be initialised before dispatching deterministic tasks')
+        return DeterministicRunner(
             scheduler=self.scheduler,
             escalation_queue=self._escalation_queue,
             predicate_recheck_stall_cap=self.config.deterministic.predicate_recheck_stall_cap,
-        )
-        outcome = await runner.run(assignment)
-        return TaskReport(
-            task_id=assignment.task_id,
-            title=assignment.task.get('title', ''),
-            outcome=outcome,
-            completed_at=datetime.now(UTC).isoformat(),
-            block_reason='deterministic_gate' if outcome == WorkflowOutcome.BLOCKED else '',
         )
 
     async def _find_prior_auto_eval_redos(self, original_id: str) -> list[str]:
@@ -12025,6 +12060,16 @@ class Harness:
     ) -> None:
         """Append, persist, and feed a finished slot's report to review checkpoints."""
         task_reports.append(report)
+        self._persist_task_result(report)
+        if report.outcome == WorkflowOutcome.DONE and self.review_checkpoint:
+            self.review_checkpoint.record_merge(self._task_modules.pop(report.task_id, []))
+            if (self.review_checkpoint.should_trigger()
+                    and self._review_task is None
+                    and not self._draining):
+                self._trigger_review_checkpoint()
+
+    def _persist_task_result(self, report: TaskReport) -> None:
+        """Save *report* to runs.db ``task_results``; a failure is logged, never raised."""
         if self._run_store and self._run_id:
             try:
                 self._run_store.save_task_result(
@@ -12032,12 +12077,6 @@ class Harness:
                 )
             except Exception as e:
                 logger.warning(f'Failed to persist task result {report.task_id}: {e}')
-        if report.outcome == WorkflowOutcome.DONE and self.review_checkpoint:
-            self.review_checkpoint.record_merge(self._task_modules.pop(report.task_id, []))
-            if (self.review_checkpoint.should_trigger()
-                    and self._review_task is None
-                    and not self._draining):
-                self._trigger_review_checkpoint()
 
     def _compute_tallies(self, task_reports: list[TaskReport]) -> None:
         """Fill ``self.report`` aggregates from the collected task reports.
@@ -13593,6 +13632,13 @@ class Harness:
         ``run()`` can thread the recovered requests' branches into
         :meth:`_reap_orphaned_merge_worktrees` (task 2060) — a recovered
         in-flight worktree is re-adopted rather than reaped.
+
+        No workflow awaits a recovered request, so each one's outcome is
+        adopted by
+        ``orchestrator/src/orchestrator/recovered_merge_owner.py::RecoveredMergeOwner``
+        (task 7277): a landing drives the landed-outbox done-write through
+        :meth:`_reconcile_landing`, a durable failure blocks the task and files
+        an L1, and an outcome that halted the merge queue files the halt-owning L1.
         """
         report = await recover_pending_merges(
             self._merge_store,
@@ -13606,6 +13652,13 @@ class Harness:
             enqueue_merge_request=enqueue_merge_request,
             select_recovery_winner=select_recovery_winner,
         )
+        RecoveredMergeOwner(
+            tasks=self.scheduler,
+            escalations=self._escalation_queue,
+            reconcile_landing=self._reconcile_landing,
+            merge_halt=self._merge_worker,
+            event_store=self.event_store,
+        ).adopt(report.get('requests', []), schedule=self._schedule_coro_threadsafe)
         logger.info(
             '_recover_pending_merges: recovered=%d dropped=%d coalesced=%d '
             'journal_corrupt=%s',
@@ -13675,10 +13728,7 @@ class Harness:
             return
         report = await reconcile_landed_outbox(
             self._merge_worker._landed_outbox, self.git_ops, self.scheduler,
-            provenance_conflict_sink=self._provenance_conflict_sink,
-            project_root=str(self.config.project_root),
-            check_timeout_secs=self.config.delivered_checks.check_timeout_secs,
-            delivered_checks_enabled=self.config.delivered_checks.enabled,
+            **self._landed_reconcile_guards(),
         )
         logger.info(
             '_reconcile_landed_outbox: pruned_not_landed=%d marked_done=%d '
@@ -13740,11 +13790,33 @@ class Harness:
             git_ops=self.git_ops,
             scheduler=self.scheduler,
             outbox=self._merge_worker._landed_outbox,
-            provenance_conflict_sink=self._provenance_conflict_sink,
-            project_root=str(self.config.project_root),
-            check_timeout_secs=self.config.delivered_checks.check_timeout_secs,
-            delivered_checks_enabled=self.config.delivered_checks.enabled,
+            **self._landed_reconcile_guards(),
         )
+
+    async def _reconcile_landing(self, task_id: str) -> str | None:
+        """Drive *task_id*'s landed-outbox done-write; its row's disposition, None with no row.
+
+        The disposition is
+        ``orchestrator/src/orchestrator/merge_lane/worker.py::reconcile_landed_row``'s,
+        under the same guards as :meth:`_landed_dispatch_gate`.
+        """
+        outbox = self._merge_worker._landed_outbox if self._merge_worker is not None else None
+        row = outbox.lookup(task_id) if outbox is not None else None
+        if outbox is None or row is None:
+            return None
+        return await reconcile_landed_row(
+            row, git_ops=self.git_ops, scheduler=self.scheduler, outbox=outbox,
+            main_sha=await self.git_ops.get_main_sha(), **self._landed_reconcile_guards(),
+        )
+
+    def _landed_reconcile_guards(self) -> dict[str, Any]:
+        """The RC-2 guards every landed-outbox reconcile passes, so its callers stay in lockstep."""
+        return {
+            'provenance_conflict_sink': self._provenance_conflict_sink,
+            'project_root': str(self.config.project_root),
+            'check_timeout_secs': self.config.delivered_checks.check_timeout_secs,
+            'delivered_checks_enabled': self.config.delivered_checks.enabled,
+        }
 
     async def _read_already_landed_tick_view(self) -> AlreadyLandedTickView:
         return await read_already_landed_tick_view(self.git_ops)
@@ -14686,6 +14758,17 @@ class Harness:
             causes = {}
             self._workflow_cancel_causes = causes
         return causes
+
+    async def _wait_for_slot_turnover(self) -> None:
+        """Wait for a live slot to end, at most idle_poll_secs, so newly filed work is still seen every poll."""
+        live = set(self._live_tasks)
+        if live:
+            await asyncio.wait(
+                live, return_when=asyncio.FIRST_COMPLETED,
+                timeout=self.config.idle_poll_secs,
+            )
+        else:
+            await asyncio.sleep(self.config.idle_poll_secs)
 
     def _launch_slot(
         self, assignment, sem: asyncio.Semaphore, task_reports: list[TaskReport],
@@ -18147,6 +18230,35 @@ class Harness:
             task_id, escalation_id, reason,
         )
 
+    async def _run_held_pure_gate_inline(self, task_id: str, row: dict, escalation) -> bool:
+        """Run a resolved held pure gate's DeterministicRunner inline.
+
+        True means the runner owned this resolution's outcome (closed it,
+        re-held it, or asked again), so the caller must not re-pend; False
+        leaves the caller to re-pend it. Any exception falls back to the re-pend, so the worst case is the old
+        wait for a dispatch slot (task 3638).
+        """
+        try:
+            outcome = await pure_gate_resolution.resume_resolved_pure_gate(
+                self.scheduler, self._deterministic_runner(), task_id, row,
+                now=datetime.now(UTC),
+            )
+        except Exception:
+            logger.warning(
+                'cascade-unblock: inline pure-gate run for task %s via %s raised — '
+                'falling back to the re-pend',
+                task_id, escalation.id, exc_info=True,
+            )
+            return False
+        if outcome is None:
+            return False
+        logger.info(
+            'cascade-unblock: pure gate %s ran at resolution of %s — outcome %s',
+            task_id, escalation.id, outcome,
+        )
+        self._persist_task_result(_deterministic_report(task_id, row, outcome))
+        return True
+
     async def _cascade_unblock_member(self, escalation) -> None:
         """Async helper: re-pend a resolution-resumed task to Table B's target.
 
@@ -18203,6 +18315,10 @@ class Harness:
         Any ``granted_files`` scope grant is delivered BEFORE this method runs,
         by :meth:`_deliver_resume_resolution`, whatever this method then
         decides about the flip — see :meth:`_fold_granted_files`.
+
+        A held deterministic pure gate that passes every gate below is run
+        inline, which closes or re-holds it, instead of being re-pended — see
+        :meth:`_run_held_pure_gate_inline`.
 
         TOCTOU note: these are separate MCP round-trips with no atomic
         compare-and-set, so the window cannot be closed — only narrowed. It is
@@ -18419,6 +18535,9 @@ class Harness:
                 task_id, _late_status, _late.get('claimant_run_id'), status,
                 _resume_target, escalation.resolved_by,
             )
+            return
+
+        if await self._run_held_pure_gate_inline(task_id, _late, escalation):
             return
 
         try:

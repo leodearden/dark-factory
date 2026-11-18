@@ -14,6 +14,7 @@ from pathlib import Path
 from orchestrator.agents.briefing import BriefingAssembler
 from orchestrator.config import OrchestratorConfig
 from orchestrator.escalation_rulings import Ruling
+from orchestrator.review_lineage import RetiredReview
 
 # Bump whenever the block text changes materially, so one id means one briefing.
 REPLAY_FRAME_ID = 'honest-frame-v1'
@@ -78,10 +79,12 @@ class ReplayFramedBriefingAssembler(BriefingAssembler):
         include_prior_proposals: bool = False,
         committed_work: list[dict] | None = None,
         rulings: Sequence[Ruling] = (),
+        retired_reviews: Sequence[RetiredReview] = (),
     ) -> str:
         return await super().build_architect_prompt(
             task, worktree, context,
             include_prior_proposals=include_prior_proposals,
             committed_work=committed_work,
             rulings=rulings,
+            retired_reviews=retired_reviews,
         ) + build_replay_frame_block(self._base_commit)

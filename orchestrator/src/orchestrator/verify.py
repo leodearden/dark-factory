@@ -41,6 +41,7 @@ if TYPE_CHECKING:
     from orchestrator.event_store import EventStore
     from orchestrator.git_ops import GitOps, WorktreeKind
 
+from shared.asyncio_tasks import gather_unwound
 from shared.cgroup_slice import project_slice_name
 from shared.proc_group import terminate_process_group
 from shared.psi import cpu_some10_or_none, read_psi_sample
@@ -48,7 +49,7 @@ from shared.python_env import without_python_env_selection
 from shared.secret_env import without_account_pool
 from shared.verify_admission import acquire_task_slot, is_gated_role, nice_prefix
 
-from orchestrator import verify_evidence, verify_plan
+from orchestrator import verify_evidence, verify_fallback_floor, verify_plan
 from orchestrator.cargo_scope import discover_workspace_crates, files_to_crates
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 
@@ -4391,6 +4392,10 @@ def _build_fallback_config(
     used as-is when it differs from the bare ``pytest`` default so that
     complex flag sequences like ``-m 'not slow' --ignore=tests/e2e`` are not
     mangled by :func:`_scope_to_keyword`'s prefix-then-parse approach.
+    Where no test target is derivable here, the caller's fallback test floor
+    (``orchestrator/src/orchestrator/verify_fallback_floor.py::apply_fallback_test_floor``)
+    may replace the returned ``test_command`` with the configured one whole;
+    see docs/fallback-test-floor.md.
 
     *content_cache*, when given, is threaded into the structural-file content
     read (see :func:`_worktree_reader`) so a file already read through the
@@ -7496,31 +7501,6 @@ def _log_event_channel(label: str, channel: VerifyEventChannel) -> None:
         )
 
 
-_Gathered = TypeVar('_Gathered')
-
-
-async def _gather_unwound(*aws: Awaitable[_Gathered]) -> list[_Gathered]:
-    """``asyncio.gather``, except that it raises only once every child has ended.
-
-    A plain gather raises at its first cancelled or failed child, so a sibling
-    still killing its subprocess would outlive the verify that spawned it.
-    Here, as in a ``TaskGroup``, the other children are cancelled and awaited
-    first; the exception raised is the one the gather raised.  A child already
-    asked to cancel (a cancelled gather asks every child) is not asked again,
-    which would interrupt the kill it is awaiting.
-    """
-    children = [asyncio.ensure_future(aw) for aw in aws]
-    try:
-        return await asyncio.gather(*children)
-    except BaseException:
-        for child in children:
-            if not (isinstance(child, asyncio.Task) and child.cancelling()):
-                child.cancel()
-        if children:
-            await asyncio.wait(children)
-        raise
-
-
 async def run_verification(
     worktree: Path,
     config: OrchestratorConfig,
@@ -8212,7 +8192,7 @@ async def run_verification(
         # `break` below, so it is always bound whenever the loop exits — no
         # pre-loop sentinel scaffolding needed.
         if concurrent:
-            attempt = VerifyAttempt(list(await _gather_unwound(
+            attempt = VerifyAttempt(list(await gather_unwound(
                 _run_or_skip_timed(test_cmd, label=LegSlot.TEST, current_attempt=current_attempt_id),
                 _run_or_skip_timed(lint_cmd, label=LegSlot.LINT, current_attempt=current_attempt_id),
                 _run_or_skip_timed(type_cmd, label=LegSlot.TYPE, current_attempt=current_attempt_id),
@@ -8810,7 +8790,7 @@ async def run_full_verification(
             'Full verification: running %d subprojects in parallel',
             len(module_configs),
         )
-        results = await _gather_unwound(
+        results = await gather_unwound(
             *(
                 run_verification(
                     project_root, config, mc, role=role, max_retries=max_retries,
@@ -9072,8 +9052,9 @@ def _executed_fallback_plan(
     over from the decision unchanged: they answer WHY a tool slot was scoped
     a given way, not WHERE/HOW it actually ran.
 
-    *pytest_reason* is the ONE exception, and it exists because the fallback
-    branch's WHY genuinely changed at the execution layer (task 3513). When
+    *pytest_reason* is the ONE exception: it carries an execution-layer
+    rewrite of the pytest slot (marker widening, task 3513; fallback test
+    floor, task 8714), where the fallback branch's WHY genuinely changed. When
     ``verify_plan.widen_fallback_for_marker_deselection`` proves the decision's
     file-scoped pytest run would collect zero items, the call site drops the
     file targets from the ModuleConfig that is about to EXECUTE; passing that
@@ -9154,9 +9135,12 @@ def _safe_derive_executed_fallback_plan(
     the idealized flat ``'__fallback__'`` decision alone.
     *fallback_pytest_reason* rides along on that same path (and only that
     path — it is meaningless without an *executed_fallback* to reconcile
-    against): it is ``widen_fallback_for_marker_deselection``'s reason, which
-    :func:`_executed_fallback_plan` needs in order to record a marker-deselection
-    widening the executed config already applied. A bug in the
+    against): it is ``widen_fallback_for_marker_deselection``'s or the fallback
+    test floor's reason, which :func:`_executed_fallback_plan` needs in order to
+    record a pytest-slot rewrite the executed config already applied. With an
+    *executed_fallback* the decision is derived before its test floor, so the
+    executed record takes its floor from the execution layer alone; without one
+    the floored decision is returned. A bug in the
     decision layer or this reconciliation — an unforeseen ``VerifyCmd``/
     dataclass edge — must never fail an otherwise-passing verify attempt
     just because its plan couldn't be built. Catches broadly and logs a
@@ -9166,6 +9150,7 @@ def _safe_derive_executed_fallback_plan(
     try:
         plan = verify_plan.derive_verify_plan(
             existing_files, module_configs, config, worktree_reader, role=role,
+            fallback_test_floor=executed_fallback is None,
         )
         if executed_fallback is not None:
             plan = _executed_fallback_plan(
@@ -9471,7 +9456,7 @@ async def _run_scoped_verification_body(
             # _executed_module_configs_from_plan bridge the module_configs-
             # branch merge+full expansion above uses (PRD Resolved decision
             # 2: the broad gate must be per-module parseable commands, never
-            # the opaque chain). breadth=='scoped' (the shipped default)
+            # the opaque chain). breadth=='scoped' (the explicit per-project opt-down)
             # falls through to the legacy single global call below,
             # byte-identical (R4 rollback golden). This is the
             # merge_verify_workspace=True routing
@@ -9533,7 +9518,7 @@ async def _run_scoped_verification_body(
                             plan_dict, worktree, attempt_id=attempt_id,
                             task_id=task_id, archive_root=archive_root,
                         )
-                        results = await _gather_unwound(*(
+                        results = await gather_unwound(*(
                             _verify_module(mc, _test_scope_kind(plan, mc.prefix)) for mc in scoped
                         ))
                         aggregated = _aggregate_results(list(results))
@@ -9719,7 +9704,7 @@ async def _run_scoped_verification_body(
                         'Verification mode: per-subproject fan-out (%d subprojects)',
                         len(module_configs),
                     )
-                    results = await _gather_unwound(*(
+                    results = await gather_unwound(*(
                         _verify_module(mc) for mc in module_configs
                     ))
                     return _aggregate_results(list(results))
@@ -9814,7 +9799,7 @@ async def _run_scoped_verification_body(
                 plan = None
                 plan_dict = None
                 logger.info('Verification mode: subproject-scoped (%d subprojects)', len(module_configs))
-            results = await _gather_unwound(
+            results = await gather_unwound(
                 *(_verify_module(mc, _test_scope_kind(plan, mc.prefix)) for mc in scoped)
             )
             aggregated = _aggregate_results(list(results))
@@ -9911,6 +9896,14 @@ async def _run_scoped_verification_body(
             # is left unwired pending a follow-up that updates the test double.
             fallback = _build_fallback_config(existing_files, config, worktree=worktree)
             if fallback is not None:
+                fallback, floor_reason = verify_fallback_floor.apply_fallback_test_floor(
+                    fallback, existing_files, config.test_command, role,
+                )
+                if floor_reason is not None:
+                    logger.info(
+                        'Fallback test floor: %s — running %r',
+                        floor_reason, fallback.test_command,
+                    )
                 fallback = _apply_cargo_scope(
                     fallback, existing_files, worktree, scope_cargo_enabled,
                 )
@@ -9923,19 +9916,20 @@ async def _run_scoped_verification_body(
                 # rescoped result — so the command's own shape decides. One
                 # reader serves both this probe and the plan derivation below.
                 fallback_reader = _worktree_reader(worktree)
-                fallback, fallback_pytest_reason = (
+                fallback, widen_reason = (
                     verify_plan.widen_fallback_for_marker_deselection(
                         fallback, fallback_reader,
                     )
                 )
-                if fallback_pytest_reason is not None:
+                if widen_reason is not None:
                     # Loud over silent: this is DEGRADATION (the widened run
                     # applies the same addopts, so the trigger files stay
                     # deselected and unrun), not a free coverage upgrade.
                     logger.warning(
                         'Fallback pytest widened to %r — %s',
-                        fallback.test_command, fallback_pytest_reason,
+                        fallback.test_command, widen_reason,
                     )
+                fallback_pytest_reason = widen_reason if widen_reason is not None else floor_reason
                 logger.info('Verification mode: fallback-scoped (%d files)', len(existing_files))
                 # Plan-authoritative execution (task κ,
                 # verify-scope-inversion-prd.md): derive_verify_plan's
@@ -11386,7 +11380,7 @@ async def run_node_ids(
         )
 
     if concurrent_groups:
-        group_statuses = await asyncio.gather(*map(run_group, qualified_by_prefix))
+        group_statuses = await gather_unwound(*map(run_group, qualified_by_prefix))
     else:
         group_statuses = [await run_group(prefix) for prefix in qualified_by_prefix]
     statuses: dict[str, NodeIdStatus] = {}

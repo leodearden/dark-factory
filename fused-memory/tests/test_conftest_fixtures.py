@@ -706,3 +706,15 @@ class TestTheLeaseDirIsolationHasOneDefinition:
         assert not any(
             value is lease_dir_fixture for value in vars(conftest).values()
         )
+
+
+class TestTheMockDerivedStrayDirGuardIsWired:
+    """The shared guard from ``df_pytest_isolation`` is live in this suite (task 5145)."""
+
+    def test_it_is_registered_for_every_test(self, request):
+        assert '_df_no_mock_derived_stray_dirs' in request.fixturenames, (
+            'bind _df_no_mock_derived_stray_dirs from df_pytest_isolation in '
+            'fused-memory/tests/conftest.py (`# noqa: F401 — the binding IS the '
+            'wiring`). Without it a fused-memory run can materialise an AsyncMock/ '
+            'tree silently, which is the task-4592 incident.'
+        )

@@ -1056,8 +1056,11 @@ class TestRehydratedRequestVerifiesAsWideAsItsOriginal:
         GREEN today and must STAY green.  A task that genuinely has no
         assigned modules reconstructs to ``[]``, the boundary leaves it ``[]``
         (task 3787 γ's deliberate no-widen guard), and the plan takes
-        ``_derive_fallback_runs`` — no FULL_SUITE run at all — even though the
-        SAME nine-module registry is configured and breadth is 'full'.
+        ``_derive_fallback_runs`` — no registered module's FULL_SUITE run —
+        even though the SAME nine-module registry is configured and breadth is
+        'full'. The one FULL_SUITE run is the global fallback's own test floor
+        (tasks 8714/7041): a source-only diff at merge role runs the configured
+        test_command whole.
         """
         config = self._config(tmp_path, 'full')
         original = self._original(
@@ -1072,4 +1075,4 @@ class TestRehydratedRequestVerifiesAsWideAsItsOriginal:
         assert _merge_boundary_module_configs(config, rehydrated.module_configs) == []
         assert _merge_plan_full_suite_prefixes(
             config, rehydrated.module_configs, self._TASK_FILES,
-        ) == [], 'the zero-module task must still take the global-fallback path'
+        ) == ['__fallback__'], 'the zero-module task must still take the global-fallback path'

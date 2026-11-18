@@ -65,6 +65,8 @@ only: decompose does not copy them into a task's `metadata.delivered_checks`, wh
 
 ## ε1–ε5 — Tool families moved out of `create_mcp_server` (C6)
 
+Sidecar blocks: ε1 (task 9827: `ops-family-module`, `scheduler-family-module`, `defects-family-module`, `tool-surface-snapshot`), ε2 (task 9828: `task-read-family-module`, `task-write-family-module`), ε3 (task 9829: `memory-read-family-module`, `graph-admin-family-module`, `task-status-facts-leaf`), ε4 (task 9830: `memory-write-family-module`), ε5 (task 9831: `family-registrars`, `curation-moved`, `memory-curation-family-module`). The table below summarizes them across the family.
+
 | Capability | Binding | Verdict |
 |---|---|---|
 | Families separable without family-to-family imports | AST closure graph: every shared closure is a C1 member, the C2 gate, or `reject_ticket_id` / `batched_task_statuses` (leaf modules) | PASS |

@@ -11,10 +11,27 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { caughtFrom } from './_caught.mjs';
-import { allowAsyncAct, click, openWindow, settle, stubFetch } from './_render_helpers.mjs';
-import { buildDashboardWindow, seedDashboardData } from './dom_harness.mjs';
+import {
+  NOTICE_SELECTOR,
+  UNIT_NOTICE_TESTID,
+  allowAsyncAct,
+  assertReportsOnlyContainedThrows,
+  assertSiblingRenders,
+  click,
+  failureNotices,
+  graphNode,
+  mountInsideBoundary,
+  noticeLines,
+  openContainingWindow,
+  openTab,
+  openWindow,
+  settle,
+  stubFetch,
+} from './_render_helpers.mjs';
+import { seedDashboardData } from './dom_harness.mjs';
 import {
   burndownBlock,
+  burndownProjectBlock,
   escalationAnalytics,
   escalationRow,
   escalationsPayload,
@@ -68,10 +85,6 @@ function seedOneTask(window, task) {
 function orchTaskRow(window, container, task) {
   const idText = window.DF_SHELL.taskId(task.id);
   return [...container.querySelectorAll('tbody tr')].find(tr => tr.querySelector('td')?.textContent === idText);
-}
-
-function graphNode(container, task) {
-  return [...container.querySelectorAll('.node')].find(node => node.querySelector('.ttl')?.textContent === task.title);
 }
 
 // By PRD is the Tasks tab's default view, and it draws no graph until a lanes
@@ -167,7 +180,7 @@ function seedBurndown(window, { alarm }) {
   seedDashboardData(window, {
     PROJECTS: [projectRow(PROJECT)],
     BURNDOWN: burndownBlock(vocab, AGGREGATE_SAMPLES, { ...verdict, projects: [PROJECT] }),
-    BURNDOWN_BY_PROJECT: { [PROJECT]: burndownBlock(vocab, PROJECT_SAMPLES, verdict) },
+    BURNDOWN_BY_PROJECT: { [PROJECT]: burndownProjectBlock(vocab, PROJECT_SAMPLES, AGGREGATE_SAMPLES, verdict) },
     __receipt: receiptsFor(window.DF_DATA_LOADER, ['BURNDOWN', 'PROJECTS']),
   });
 }
@@ -180,13 +193,16 @@ function statusMixPanel(container) {
   return panels[0];
 }
 
-// Each view: how to reach it, which block it draws, and the projects its call
-// site hands parityBannerState.
+// Each view: how to reach it, which block it draws, the sample labels its chart
+// lays that block over, and the projects its call site hands parityBannerState.
+// The project's labels are the union's newest PROJECT_SAMPLES, stated here from
+// the seed rather than through the label_spans decoder under test.
 const BURN_VIEWS = [
   {
     view: 'aggregate',
     show() {},
     block: window => window.DF_DATA.BURNDOWN,
+    sampleLabels: window => window.DF_DATA.BURNDOWN.labels,
     bannerProjects: window => window.DF_DATA.BURNDOWN.parity_projects,
   },
   {
@@ -197,6 +213,7 @@ const BURN_VIEWS = [
       click(window, button);
     },
     block: window => window.DF_DATA.BURNDOWN_BY_PROJECT[PROJECT],
+    sampleLabels: window => window.DF_DATA.BURNDOWN.labels.slice(AGGREGATE_SAMPLES - PROJECT_SAMPLES),
     bannerProjects: () => null,
   },
 ];
@@ -219,7 +236,7 @@ function filledPathColors(panel) {
   return [...panel.querySelectorAll('svg path')].map(path => path.getAttribute('fill')).filter(Boolean);
 }
 
-for (const { view, show, block, bannerProjects } of BURN_VIEWS) {
+for (const { view, show, block, sampleLabels, bannerProjects } of BURN_VIEWS) {
   test(`tabs.jsx::BurnTab ${view} view renders one legend entry per burndownLegend item`, t => {
     const harness = openWindow(t);
     seedBurndown(harness.window, { alarm: false });
@@ -249,9 +266,8 @@ for (const { view, show, block, bannerProjects } of BURN_VIEWS) {
     );
 
     const { fmtDateTime } = harness.window.DF_SHELL;
-    const { BURNDOWN, BURNDOWN_BY_PROJECT } = harness.window.DF_DATA;
-    const anySampleLabel = new Set([...BURNDOWN.labels, ...BURNDOWN_BY_PROJECT[PROJECT].labels].map(fmtDateTime));
-    const ownLabels = Array.from(block(harness.window).labels, fmtDateTime);
+    const anySampleLabel = new Set(Array.from(harness.window.DF_DATA.BURNDOWN.labels, fmtDateTime));
+    const ownLabels = Array.from(sampleLabels(harness.window), fmtDateTime);
     assert.deepEqual(
       [...panel.querySelectorAll('svg text')].map(text => text.textContent).filter(text => anySampleLabel.has(text)),
       ownLabels,
@@ -285,6 +301,42 @@ for (const { view, show, block, bannerProjects } of BURN_VIEWS) {
     assert.deepEqual([...panel.querySelectorAll('.badge.bad')], [], `the ${view} view rendered a parity banner with the alarm down`);
   });
 }
+
+function summaryTrendCell(container, projectId) {
+  const table = panelTitled(container, 'Per project · summary').querySelector('table');
+  const trendColumn = [...table.querySelectorAll('thead th')].findIndex(th => th.textContent === 'Trend');
+  assert.ok(trendColumn >= 0, 'the Per project summary table has no Trend column');
+  const row = [...table.querySelectorAll('tbody tr')].find(tr => tr.querySelector('td')?.textContent === projectId);
+  assert.ok(row, `the Per project summary table has no row for ${projectId}`);
+  return row.querySelectorAll('td')[trendColumn];
+}
+
+function pathData(root) {
+  return [...root.querySelectorAll('svg path')].map(path => path.getAttribute('d'));
+}
+
+// The Trend sparkline derives velocity from the project's done series over its
+// labels, and deriveVelocitySeries draws nothing for a missing or mismatched
+// label row, so only a call site that decoded label_spans draws this spark.
+test('tabs.jsx::BurnTab aggregate summary table draws each project Trend sparkline over its own labels', t => {
+  const harness = openWindow(t);
+  seedBurndown(harness.window, { alarm: false });
+  const { container } = harness.mount(harness.window.DF_TABS.BurnTab, BURN_PROPS);
+
+  const { Sparkline, PALETTE, deriveVelocitySeries, defaultSmoothingForWindow, smoothingLabelToSeconds } = harness.window.DF_CHARTS;
+  const ownLabels = harness.window.DF_DATA.BURNDOWN.labels.slice(AGGREGATE_SAMPLES - PROJECT_SAMPLES);
+  const smoothSecs = smoothingLabelToSeconds(defaultSmoothingForWindow(BURN_PROPS.displayWindow));
+  const velocity = deriveVelocitySeries(harness.window.DF_DATA.BURNDOWN_BY_PROJECT[PROJECT].done, ownLabels, smoothSecs);
+  assert.equal(velocity.length, PROJECT_SAMPLES, 'the seeded project must have a velocity sample per own label');
+  const expected = pathData(harness.mount(Sparkline, { values: velocity, color: PALETTE.accent }).container);
+  assert.ok(expected.length > 0, 'a Sparkline of the project velocity drew nothing, so a match proves nothing');
+
+  assert.deepEqual(
+    pathData(summaryTrendCell(container, PROJECT)),
+    expected,
+    `the ${PROJECT} Trend cell must draw the velocity of its ${PROJECT_SAMPLES} own samples`,
+  );
+});
 
 // ── Decision 3: the PINNING chip (pins_recovery.js::pinningBadgeState) ──
 // pins_recovery is three-state on the wire: true, false, or ABSENT (unknown).
@@ -545,59 +597,8 @@ test('tabs.jsx::PerfTab Completion paths gives every slice its own PALETTE.paths
 });
 
 // ── Decision 6: a render throw is contained, and its notice is render_failure.js's ──
-// React's development build reports every throw a boundary catches on
-// console.error: jsdom's report of the replayed throw (its stack, or
-// 'undefined' for a non-Error), then a note naming the boundary that caught
-// it. So these tests cannot assert an empty console. They assert that every
-// report is of a throw RenderFailureBoundary caught, and nothing else.
-
-const CAUGHT_NOTE = 'using the error boundary you provided, ';
-const UNCAUGHT_NOTE = 'Consider adding an error boundary';
-
-function assertReportsOnlyContainedThrows(consoleErrors) {
-  const caughtNotes = consoleErrors.filter(entry => entry.includes(CAUGHT_NOTE));
-  assert.ok(caughtNotes.length > 0, `no throw was reported as caught by a boundary: ${JSON.stringify(consoleErrors)}`);
-  for (const note of caughtNotes) {
-    assert.ok(note.includes(`${CAUGHT_NOTE}RenderFailureBoundary.`), `a boundary other than RenderFailureBoundary caught: ${note}`);
-  }
-  for (const entry of consoleErrors) {
-    assert.ok(!entry.includes(UNCAUGHT_NOTE), `a throw escaped every boundary: ${entry}`);
-    assert.ok(!entry.startsWith('Warning:'), `React warned beside the contained throw: ${entry}`);
-  }
-}
-
-// Like openWindow, but the test asserts the window's reports itself.
-function openContainingWindow(t) {
-  const harness = buildDashboardWindow();
-  t.after(() => harness.close());
-  return harness;
-}
-
-const UNIT_NOTICE_TESTID = 'unit-render-failure-banner';
-const SIBLING_TESTID = 'boundary-sibling';
-
-function noticeLines(notice) {
-  return [...notice.children].map(line => line.textContent);
-}
-
-// The boundary around `child`, beside a sibling that is outside it.
-function mountInsideBoundary(harness, child) {
-  const { React, DF_SHELL, DF_RENDER_FAILURE } = harness.window;
-  const describe = thrown => DF_RENDER_FAILURE.tabRenderFailureNotice('Overview', thrown);
-  const Page = () =>
-    React.createElement(
-      'div',
-      null,
-      React.createElement(DF_SHELL.RenderFailureBoundary, { describe, testId: UNIT_NOTICE_TESTID }, child),
-      React.createElement('span', { 'data-testid': SIBLING_TESTID }, 'outside the boundary'),
-    );
-  const { container } = harness.mount(Page);
-  return { container, describe };
-}
-
-function assertSiblingRenders(container) {
-  assert.equal(container.querySelector(`[data-testid="${SIBLING_TESTID}"]`)?.textContent, 'outside the boundary');
-}
+// _render_helpers.mjs::assertReportsOnlyContainedThrows says why these tests
+// cannot assert an empty console.
 
 test('shell.jsx::RenderFailureBoundary contains a real DatumReading throw and renders its describe() notice', t => {
   const harness = openContainingWindow(t);
@@ -682,8 +683,6 @@ for (const reader of DATUM_READERS) {
 // Every fault lands as a malformed payload a poll could deliver, then App's
 // own re-render signal; nothing patches a component or writes DF_DATA directly.
 
-const NOTICE_SELECTOR = '[data-testid$="-render-failure-banner"]';
-
 // Lands `payloads` as one poll would: each key with its endpoint's receipt.
 function landPayloads(window, payloads) {
   seedDashboardData(window, { ...payloads, __receipt: receiptsFor(window.DF_DATA_LOADER, Object.keys(payloads)) });
@@ -700,22 +699,6 @@ function openPage(t, seed = null) {
 function landPoll(window, payloads) {
   landPayloads(window, payloads);
   window.React.act(() => window.dispatchEvent(new window.Event('df-data-refresh')));
-}
-
-function railButton(root, label) {
-  const button = [...root.querySelectorAll('.rail-nav button')].find(candidate =>
-    [...candidate.children].some(part => part.textContent === label),
-  );
-  assert.ok(button, `the rail has no "${label}" button`);
-  return button;
-}
-
-function openTab(page, label) {
-  click(page.window, railButton(page.root, label));
-}
-
-function failureNotices(root) {
-  return [...root.querySelectorAll(NOTICE_SELECTOR)];
 }
 
 function crumb(root) {
@@ -1429,6 +1412,108 @@ test('tab_tasks.jsx::TaskDetail draws no Module locks section for a task holding
 
   assert.equal(expectedLocksCell(harness.window, task).placeholder, null, 'locksCellState reads this measured project as unknown');
   assert.equal(moduleLocksSection(detail), null, 'a measured project with no locks draws no Module locks section');
+});
+
+// ── The scheduler drawer's lock holders (scheduler_drawer.jsx::HolderEtas) ──
+
+const DRAWER_TASK = schedulerLockRow({ project: PROJECT, taskId: '2', lockSet: ['OPERATIONS.md'] });
+const NO_LOCK_HELD_AGAINST = 'No lock this task needs is held to its limit by other tasks.';
+
+// The drawer's 'Lock holders' section, as SchedulerDrawer renders it for
+// DRAWER_TASK over `module`; null when the drawer draws no such section.
+function drawerLockHolders(harness, module) {
+  const { container } = harness.mount(harness.window.DF_SCHED_DRAWER.SchedulerDrawer, {
+    task: DRAWER_TASK,
+    modules: [module],
+    eventsForTask: null,
+    allRows: [DRAWER_TASK],
+    onClose() {},
+    onSubmitOverride() {},
+  });
+  return [...container.querySelectorAll('.sched-drawer-section')].find(
+    section => section.querySelector('.sched-drawer-section-lbl')?.textContent === 'Lock holders',
+  ) ?? null;
+}
+
+function heldByLines(section) {
+  return [...section.querySelectorAll('div')].filter(div => div.textContent.startsWith('held by'));
+}
+
+const DRAWER_UNBLOCKED_CASES = [
+  {
+    name: 'a key another task holds below its holder limit',
+    module: () => schedulerModule({
+      project: PROJECT, path: 'OPERATIONS.md', holder: '1', holderProject: PROJECT, holders: ['1'], atHolderLimit: false,
+    }),
+  },
+  {
+    name: 'a full key the task itself co-holds',
+    module: () => schedulerModule({
+      project: PROJECT, path: 'OPERATIONS.md', holder: '1', holderProject: PROJECT, holders: ['1', '2'], atHolderLimit: true,
+    }),
+  },
+];
+
+for (const { name, module: buildModule } of DRAWER_UNBLOCKED_CASES) {
+  test(`scheduler_drawer.jsx::SchedulerDrawer never says another task holds ${name} against the task`, t => {
+    const harness = openWindow(t);
+    const module = buildModule();
+    assert.equal(harness.window.DF_SCHED_UTILS.lockHeldAgainst(module, DRAWER_TASK.task_id, PROJECT), false,
+      'lockHeldAgainst reads this module as held against the task, so this fixture tests nothing');
+
+    const section = drawerLockHolders(harness, module);
+    assert.ok(section, "the drawer draws no 'Lock holders' section");
+    assert.deepEqual(heldByLines(section), [], 'the drawer names a holder for a lock that does not block the task');
+    assert.ok(!section.textContent.includes('held by another task'),
+      `the drawer claims the lock is held by another task: ${section.textContent}`);
+    assert.ok(section.textContent.includes(NO_LOCK_HELD_AGAINST), `the drawer does not say why no holder is listed: ${section.textContent}`);
+  });
+}
+
+test('scheduler_drawer.jsx::SchedulerDrawer names the holders of a full key held against the task, and no empty state', t => {
+  const harness = openWindow(t);
+  const { holdersLabel, lockHeldAgainst } = harness.window.DF_SCHED_UTILS;
+  const module = schedulerModule({
+    project: PROJECT, path: 'OPERATIONS.md', holder: '1', holderProject: PROJECT, holders: ['1', '3'], atHolderLimit: true,
+  });
+  assert.equal(lockHeldAgainst(module, DRAWER_TASK.task_id, PROJECT), true,
+    'lockHeldAgainst does not read this module as held against the task, so this fixture tests nothing');
+
+  const section = drawerLockHolders(harness, module);
+  assert.ok(section, "the drawer draws no 'Lock holders' section");
+  const lines = heldByLines(section);
+  assert.equal(lines.length, 1, 'the drawer must draw one held-by line for the one blocking module');
+  const named = holdersLabel(module.holders);
+  assert.ok(lines[0].textContent.includes(named), `the held-by line does not name ${named}: ${lines[0].textContent}`);
+  assert.ok(!section.textContent.includes(NO_LOCK_HELD_AGAINST), 'the drawer draws its empty state beside a blocking holder');
+});
+
+// ── The Orchestrators tab's Locks column puts blocked keys first (tabs.jsx::LocksCell) ──
+
+test('tabs.jsx::LocksCell draws a key held against the task before a key shared below its holder limit', t => {
+  const harness = openWindow(t);
+  const { window } = harness;
+  const task = inProgressTask(false);
+  const shared = schedulerModule({
+    project: PROJECT, path: 'OPERATIONS.md', holder: '1', holderProject: PROJECT, holders: ['1'], atHolderLimit: false,
+  });
+  const full = schedulerModule({ project: PROJECT, path: 'src/taken', holder: '7', holderProject: PROJECT });
+  // The lock set lists the shared key first, so only the blocked-first sort puts the full key ahead.
+  seedTaskWithScheduler(window, task, schedulerSnapshot({
+    rows: [schedulerLockRow({ project: PROJECT, taskId: task.id, lockSet: [shared.path, full.path] })],
+    modules: [shared, full],
+  }));
+  const { lockHeldAgainst } = window.DF_SCHED_UTILS;
+  assert.equal(lockHeldAgainst(full, task.id, PROJECT), true,
+    'lockHeldAgainst does not read the full key as held against the task, so this fixture tests nothing');
+  assert.equal(lockHeldAgainst(shared, task.id, PROJECT), false,
+    'lockHeldAgainst reads the shared key as held against the task, so this fixture tests nothing');
+
+  const { container } = harness.mount(window.DF_TABS.OrchTab, TAB_PROPS);
+  const row = orchTaskRow(window, container, task);
+  assert.ok(row, 'the task never reached the Orchestrators table');
+  const chipPaths = lockChips(row).map(chip => chip.title.split(' · ')[0]);
+  assert.deepEqual(chipPaths, [full.path, shared.path], 'the key held against the task must draw first');
 });
 
 // ── The memory-eval section (tab_memory_evals.jsx::MemoryEvalsSection) ──

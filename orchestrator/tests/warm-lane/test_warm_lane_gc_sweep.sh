@@ -112,8 +112,9 @@ _TMPDIRS+=("$ERR_FILE")
 
 # ── run_sweep: invoke the sweep script, capture OUT/ERR_OUT/RC ────────────────
 #
-# BRIDGE-COST SEAM (task 3292) — the same seam as the sibling gc suite's
-# run_helper; see the long rationale there (tests/warm-lane/test_warm_lane_gc.sh).
+# BRIDGE-COST SEAM (task 3292) — the same seam as the gc suites' shared
+# run_helper; see the long rationale there
+# (tests/warm-lane/lib_warm_lane_gc_harness.sh).
 # Kept as one idiom on purpose so the two files do not drift into two unrelated
 # ones.
 #

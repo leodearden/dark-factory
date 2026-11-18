@@ -248,8 +248,8 @@ class TestGetValidEdgesForNode:
         """Returns list of dicts with uuid/fact/name keys for matching edges."""
         backend = make_backend(mock_config)
         rows = [
-            ['edge-1', 'Alice knows Bob', 'knows'],
-            ['edge-2', 'Alice works at Acme', 'works_at'],
+            ['edge-1', 'Alice knows Bob', 'knows', None, None],
+            ['edge-2', 'Alice works at Acme', 'works_at', None, None],
         ]
         graph = make_graph_mock(rows)
         backend._driver._get_graph = MagicMock(return_value=graph)
@@ -282,7 +282,7 @@ class TestGetValidEdgesForNode:
     async def test_null_fact_defaults_to_empty_string(self, mock_config, make_backend, make_graph_mock):
         """Rows with NULL fact field (row[1] is None) yield fact='' in result dict."""
         backend = make_backend(mock_config)
-        rows = [['edge-1', None, 'knows']]
+        rows = [['edge-1', None, 'knows', None, None]]
         graph = make_graph_mock(rows)
         backend._driver._get_graph = MagicMock(return_value=graph)
         result = await backend.get_valid_edges_for_node('node-uuid-1', group_id='test')
@@ -293,7 +293,7 @@ class TestGetValidEdgesForNode:
     async def test_null_name_defaults_to_empty_string(self, mock_config, make_backend, make_graph_mock):
         """Rows with NULL name field (row[2] is None) yield name='' in result dict."""
         backend = make_backend(mock_config)
-        rows = [['edge-1', 'Alice knows Bob', None]]
+        rows = [['edge-1', 'Alice knows Bob', None, None, None]]
         graph = make_graph_mock(rows)
         backend._driver._get_graph = MagicMock(return_value=graph)
         result = await backend.get_valid_edges_for_node('node-uuid-1', group_id='test')
@@ -396,8 +396,8 @@ class TestGetValidEdgesForNode:
         """
         backend = make_backend(mock_config)
         rows = [
-            ['edge-1', 'same fact', 'rel'],
-            ['edge-1', 'same fact', 'rel'],
+            ['edge-1', 'same fact', 'rel', None, None],
+            ['edge-1', 'same fact', 'rel', None, None],
         ]
         graph = make_graph_mock(rows)
         backend._driver._get_graph = MagicMock(return_value=graph)
@@ -819,8 +819,8 @@ class TestRefreshEntitySummary:
         # a FalkorDB honouring the Cypher pinned below would: the live edge and
         # the restored one.
         graph = make_graph_mock([
-            ['e1', 'Task 99 depends on Task 98', 'DEPENDS_ON'],
-            ['e-restored', 'Task 99 depends on Task 97', 'DEPENDS_ON'],
+            ['e1', 'Task 99 depends on Task 98', 'DEPENDS_ON', None, None],
+            ['e-restored', 'Task 99 depends on Task 97', 'DEPENDS_ON', None, None],
         ])
         backend._driver._get_graph = MagicMock(return_value=graph)
         backend.update_node_summary = AsyncMock()

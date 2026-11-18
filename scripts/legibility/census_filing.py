@@ -19,6 +19,7 @@ from legibility import (
     codebook,
     disposition,
     filing_policy,
+    sighting_fit,
 )
 from legibility import verdict as verdict_mod
 from shared.toolcall_markup import escape_envelope_literals
@@ -145,9 +146,10 @@ def cluster_record(
 
 
 def distinct_sessions(record: Mapping[str, Any]) -> int:
-    """How many distinct sessions *record*'s own sightings carry, whatever its
-    disposition or status: the singleton gate asks only whether a confusion
-    recurred, and this run's verifier has already judged whether it is real."""
+    """How many distinct sessions candidate *record*'s own sightings carry,
+    whatever its disposition: the singleton gate asks only whether a
+    confusion recurred, and this run's verifier has already judged whether it
+    is real. An entry's count is ``sighting_fit.counted_sessions``."""
     return len(set(codebook.sessions_of(record)))
 
 
@@ -171,17 +173,19 @@ _RELEASABLE_ENTRY_STATUSES = frozenset({"open", "partially"})
 retired confusion needs no ticket."""
 
 
-def entry_cluster(cb: dict, entry: dict) -> dict:
+def entry_cluster(cb: Mapping[str, Any], entry: Mapping[str, Any]) -> dict:
     """A fileable cluster rebuilt from codebook *entry*, by ``codebook.entry_field``;
-    its severity and finding identity are the entry's own."""
+    its severity and finding identity are the entry's own. Its evidence is
+    quoted only from the sessions ``sighting_fit.counted_sessions`` counts."""
     sightings = list(entry.get("sightings") or [])
+    counted = sighting_fit.counted_sessions(cb, entry)
     cluster = cluster_record(
         title=entry["title"],
         cause=codebook.entry_field(cb, entry, "cause"),
         area=codebook.entry_field(cb, entry, "area"),
         origin_phase=entry["origin_phase"],
         manifested_phase=entry["manifested_phase"],
-        evidence=[s["evidence_quote"] for s in sightings if s.get("evidence_quote")],
+        evidence=[s["evidence_quote"] for s in sightings if s.get("evidence_quote") and s.get("session") in counted],
         sightings=sightings,
     )
     return {
@@ -218,6 +222,28 @@ class PendingFiling:
         return filing if self.supersedes_task is None else filing.superseding(self.supersedes_task)
 
 
+def _withheld_releasable(cb: Mapping[str, Any]) -> list[dict]:
+    return [
+        entry for entry in cb.get("entries") or []
+        if entry.get(codebook.ENTRY_FILING_KEY) == codebook.ENTRY_FILING_WITHHELD
+        and entry.get("status") in _RELEASABLE_ENTRY_STATUSES
+    ]
+
+
+def withheld_awaiting_count(fileable: Sequence[tuple[dict, str | None]], cb: Mapping[str, Any]) -> list[dict]:
+    """The withheld entries of *cb* still open to filing that no *fileable*
+    cluster, given with the id of the entry it landed on, releases: the ones
+    only their own sighting count can release."""
+    released = {entry_id for _cluster, entry_id in fileable}
+    return [entry for entry in _withheld_releasable(cb) if entry["id"] not in released]
+
+
+def entry_releases(cb: Mapping[str, Any], entry: Mapping[str, Any], sighting_count: int) -> bool:
+    """Whether the gate files withheld *entry* at *sighting_count* counted
+    sessions (``sighting_fit.Releases``)."""
+    return filing_policy.is_fileable(entry_cluster(cb, entry), sighting_count=sighting_count)
+
+
 def filing_queue(fileable: list[tuple[dict, str | None]], cb: dict) -> list[PendingFiling]:
     """Every cluster to file this run, from the post-merge codebook *cb*.
 
@@ -225,20 +251,16 @@ def filing_queue(fileable: list[tuple[dict, str | None]], cb: dict) -> list[Pend
     promoted to this run, the standing promotion its recurrence was routed
     to, or a key attach -- or None, releases that entry when it is releasable
     withheld, so a recurrence files one ticket for its entry, not two. Every
-    other releasable withheld entry that ``filing_policy.is_fileable`` now
-    accepts at its own distinct-session count follows. An entry withheld THIS
-    run is never among them: the gate that withheld it used that same count.
+    other releasable withheld entry that ``entry_releases`` now accepts at
+    its ``sighting_fit.counted_sessions`` count follows. An entry
+    withheld THIS run is never among them: the gate that withheld it counted
+    the same founding sessions.
 
     Each is paired with the entry its back-link lands on: the withheld entry
     it releases, else the entry it was promoted to. A *fileable* cluster was
     verified present at as_of_sha this run; a released withheld entry was
     verified by an earlier run, so it is not."""
-    releasable = [
-        entry for entry in cb.get("entries") or []
-        if entry.get(codebook.ENTRY_FILING_KEY) == codebook.ENTRY_FILING_WITHHELD
-        and entry.get("status") in _RELEASABLE_ENTRY_STATUSES
-    ]
-    releasable_ids = {entry["id"] for entry in releasable}
+    releasable_ids = {entry["id"] for entry in _withheld_releasable(cb)}
 
     queue = []
     for cluster, promoted_entry_id in fileable:
@@ -246,13 +268,9 @@ def filing_queue(fileable: list[tuple[dict, str | None]], cb: dict) -> list[Pend
         queue.append(PendingFiling(
             cluster, withheld_entry_id, withheld_entry_id or promoted_entry_id, verified_present=True,
         ))
-    paired = {pending.withheld_entry_id for pending in queue}
-    for entry in releasable:
-        if entry["id"] in paired:
-            continue
-        cluster = entry_cluster(cb, entry)
-        if filing_policy.is_fileable(cluster, sighting_count=distinct_sessions(entry)):
-            queue.append(PendingFiling(cluster, entry["id"], entry["id"]))
+    for entry in withheld_awaiting_count(fileable, cb):
+        if entry_releases(cb, entry, len(sighting_fit.counted_sessions(cb, entry))):
+            queue.append(PendingFiling(entry_cluster(cb, entry), entry["id"], entry["id"]))
     return queue
 
 

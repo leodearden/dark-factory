@@ -34,8 +34,9 @@ from _workflow_helpers import (
 from escalation.queue import EscalationQueue
 from shared.task_statuses import TaskStatus
 from shared.task_transitions import outcome_allows_status
+from shared.usage_gate import SessionBudgetExhausted
 
-from orchestrator import session_registry
+from orchestrator import session_records
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.agents.roles import ARCHITECT, DEBUGGER, IMPLEMENTER, JUDGE, MERGER
 from orchestrator.artifacts import TaskArtifacts
@@ -6802,8 +6803,6 @@ class TestSessionBudgetExhaustionEscalation:
         self, config, git_ops, task_assignment, monkeypatch, tmp_path
     ):
         """L1 escalation summary carries budget limit and cost-spent figures."""
-        from orchestrator.usage_gate import SessionBudgetExhausted
-
         stub = AgentStub()
         config.usage_cap.session_budget_usd = 0.10
         workflow, _, queue = _build_workflow_with_escalation(
@@ -6863,8 +6862,6 @@ class TestSessionBudgetExhaustionEscalation:
         Before step-4 impl, the detail defaults to the summary string (no separate
         detail is passed to _mark_blocked), so the metric-label assertions fail.
         """
-        from orchestrator.usage_gate import SessionBudgetExhausted
-
         stub = AgentStub()
         config.usage_cap.session_budget_usd = 0.10
         workflow, _, queue = _build_workflow_with_escalation(
@@ -6930,8 +6927,6 @@ class TestFirstInvocationBudgetExhaustion:
           (iii) detail contains 'last_completed_role=n/a'  (new label + default fallback)
           (iv)  summary contains 'last completed role: n/a'  (new summary wording)
         """
-        from orchestrator.usage_gate import SessionBudgetExhausted
-
         stub = AgentStub()
         config.usage_cap.session_budget_usd = 0.10
         workflow, _, queue = _build_workflow_with_escalation(
@@ -8772,7 +8767,7 @@ class TestBuildSpawnEnv:
         (_architect_spawn_session_id stashed), a post-architect role's
         CLAUDE_SPAWN_PARENT_ID is the architect's reconstructed
         SessionStart-hook registry slug -- built via the exact same
-        session_registry.build_session_slug the architect's own hook uses,
+        session_records.build_session_slug the architect's own hook uses,
         so it matches that real record precisely."""
         workflow = self._make_workflow(config, git_ops, task_assignment)
         workflow._architect_spawn_session_id = 'arch-uuid-xyz'
@@ -8780,11 +8775,11 @@ class TestBuildSpawnEnv:
         env = workflow._build_spawn_env(IMPLEMENTER)
 
         assert env['CLAUDE_SPAWN_ROLE'] == 'implementer'
-        assert env['CLAUDE_SPAWN_PARENT_ID'] == session_registry.build_session_slug(
+        assert env['CLAUDE_SPAWN_PARENT_ID'] == session_records.build_session_slug(
             'architect',
             workflow.config.fused_memory.project_id,
             str(workflow.task_id),
-            'arch-uuid-xyz',  # type: ignore[arg-type]  # deliberate str in launcher_pid slot; see session_hooks.hook_session_slug
+            'arch-uuid-xyz',
         )
 
     async def test_architect_still_receives_workflow_root_when_stashed(
@@ -8835,11 +8830,13 @@ class TestBuildSpawnEnv:
         implementer_kwargs = captured_calls[1]
         implementer_spawn_env = implementer_kwargs['spawn_env']
         assert implementer_spawn_env['CLAUDE_SPAWN_ROLE'] == 'implementer'
-        assert implementer_spawn_env['CLAUDE_SPAWN_PARENT_ID'] == session_registry.build_session_slug(
+        architect_session_id = workflow._architect_spawn_session_id
+        assert architect_session_id is not None
+        assert implementer_spawn_env['CLAUDE_SPAWN_PARENT_ID'] == session_records.build_session_slug(
             'architect',
             workflow.config.fused_memory.project_id,
             str(workflow.task_id),
-            workflow._architect_spawn_session_id,  # type: ignore[arg-type]  # deliberate str in launcher_pid slot; see session_hooks.hook_session_slug
+            architect_session_id,
         )
 
 

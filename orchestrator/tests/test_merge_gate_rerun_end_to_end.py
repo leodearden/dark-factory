@@ -290,13 +290,18 @@ def test_ok(p):
 
 
 def _loadgroup_detect_output(worktree: Path) -> str:
-    """Real ``-n 2 --dist loadgroup`` output of the grouped probe, failing because PROBE_FAIL is set."""
+    """Real ``-n 2 --dist loadgroup`` output of the grouped probe, failing because PROBE_FAIL is set.
+
+    The explicit ``--basetemp`` keeps the probe hermetic: it skips the xdist
+    controller's exit-time sweep of the host-shared ``/tmp/pytest-of-<user>``.
+    """
     env = {key: value for key, value in os.environ.items() if not key.startswith('PYTEST_')}
     env['PROBE_FAIL'] = '1'
     completed = subprocess.run(
         [
             sys.executable, '-m', 'pytest', '-n', '2', '--dist', 'loadgroup', '-o', 'addopts=',
-            '-p', 'no:cacheprovider', '--rootdir', str(worktree), '-q', GROUPED_PROBE_REL,
+            '-p', 'no:cacheprovider', '--rootdir', str(worktree),
+            '--basetemp', str(worktree / '.probe-basetemp'), '-q', GROUPED_PROBE_REL,
         ],
         cwd=worktree, env=env, capture_output=True, text=True, check=False,
     )
