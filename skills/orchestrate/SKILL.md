@@ -264,7 +264,7 @@ The orchestrator will:
 
 Each task gets its own git worktree and branch (`task/<id>`). Merges use `--no-ff` to preserve history.
 
-That is one landing per verify, which is the stock pipeline. When `merge_deep.chain_cap > 0` and the queue holds 2 or more mergeable items, a single verify instead covers a **chain** of queued items: the chain is built in one lane by merging them onto the head in submission order, only its tip is verified, and on a pass the whole verified prefix is CAS-landed in submission order — so one passing verify lands several tasks. The shipped default `chain_cap=0` disables this entirely, leaving the pipeline exactly as described above. A tip failure lands nothing via the chain and leaves the queue untouched, and the next round halves its target depth (any pass resets it) — see OPERATIONS.md §5 "Deep merge-ahead chains" and `plans/deep-merge-ahead-prd.md` for the full contract.
+That is one landing per verify, which is the stock pipeline. When `merge_deep.chain_cap > 0` and the queue holds 2 or more mergeable items, a single verify instead covers a **chain** of queued items: the chain is built in one lane by merging them onto the head in submission order, only its tip is verified, and on a pass the whole verified prefix is CAS-landed in submission order — so one passing verify lands several tasks. `chain_cap` is only the kill switch: the shipped default `0` disables this entirely, leaving the pipeline exactly as described above, and any positive value turns it on. How deep a chain goes comes from `merge_deep.depth_table` and the rolling pass estimate. A tip failure lands nothing via the chain; each of its items then verifies alone, so a good one lands and the bad one is blocked. See OPERATIONS.md §5 "Deep merge-ahead chains", `plans/merge-lane-policy-prd.md` D6/D7 and `plans/deep-merge-ahead-prd.md` for the full contract.
 
 The **debugger** is a distinct agent role invoked automatically on each verify failure. It receives the failure report (test output, lint errors, type errors) and makes targeted fixes. The verify→debug loop repeats up to `max_verify_attempts` times (default 5) before the task blocks.
 
@@ -350,7 +350,7 @@ It takes **no path argument** — it always re-reads the process's own `ORCH_CON
 | Scheduler + starvation-watchdog tuning, loop-pass thresholds (`idle_poll_secs`, `orphan_l0_timeout_secs`, watcher-rotation params) | Reload |
 | `review.*` checkpoint knobs, `unblock_auto.*`, `verify_env` | Reload |
 | `git.offline_lane_*` leaf tunables (test threads, poll interval, persist passes, recheck seconds, red-unlanded hours) | Reload |
-| `merge_deep.chain_cap` — the deep merge-ahead chain cap; `0` is the shipped default and the kill switch (mechanism: OPERATIONS.md §5 "Deep merge-ahead chains") | Reload |
+| `merge_deep.*` — deep merge-ahead chains: `chain_cap` is the kill switch (`0`, the shipped default, is off; any positive value is on) and `depth_table` sets depth (mechanism: OPERATIONS.md §5 "Deep merge-ahead chains") | Reload |
 | `max_concurrent_tasks`, pool sizes / `verify_runners`, `escalation` bind host/port, `sandbox.backend`, `project_root`, merge-lane `git.*` structural fields (`branch_prefix`, `main_branch`, `persistent_merge_worktree`, …) | **Restart** — these are startup-baked (semaphores, pool sizes, bound sockets, module globals); reload reports them in `restart_required` without touching the running process |
 | Any code change (not just YAML) | **Restart** — reload only re-reads config, never code |
 

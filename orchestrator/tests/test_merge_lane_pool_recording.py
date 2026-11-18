@@ -31,7 +31,7 @@ from _merge_worker_drive import HEAVY_BARRIER_TEST_TIMEOUT
 from _orch_helpers import wait_responsive
 from _poll_responsive import poll_responsive
 
-from orchestrator.config import GitConfig, MergeDeepConfig
+from orchestrator.config import DepthRow, GitConfig, MergeDeepConfig
 from orchestrator.event_store import EventStore
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_lane import (
@@ -64,7 +64,9 @@ class _Scene:
         self.repo = seed_repo(root / 'repo')
         self.git_ops = GitOps(_GIT, self.repo)
         self.config = lane_scene_config(
-            self.repo, _GIT, merge_deep=MergeDeepConfig(chain_cap=chain_cap),
+            self.repo, _GIT, merge_deep=MergeDeepConfig(
+                chain_cap=chain_cap, depth_table=[DepthRow(0.0, max(chain_cap, 2))],
+            ),
             merge_train_coalesce_enabled=False, verify_host_policy='prefer_local',
         )
         self.db_path = root / 'events.db'

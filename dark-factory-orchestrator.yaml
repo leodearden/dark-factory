@@ -1805,11 +1805,14 @@ psi_admission:           # PRD plans/load-throttle-harmonisation-prd.md §6.2 (2
 # 2026-10-20: carry the flip (carrier 7619) one week after reify's canary 3189.
 # Reify's week was neutral: 122 merge verifies, 95 landings (66 the week before),
 # 2 deep verifies, 1 chain landing, 0 chain-attributed red.
-# STOP RULE: back to 0 if gates per landed item exceed 1.0, or on any
+# Since task 8528 chain_cap is the kill switch only: any positive value turns
+# chains on, and 6 is not a bound. merge_deep.depth_table sets the depth from
+# the rolling per-item pass estimate (plans/merge-lane-policy-prd.md D6/D7); it
+# is left at the code default, [[0.93, 8], [0.85, 4], [0.75, 2]], so no key here.
+# STOP RULE: chain_cap: 0 if gates per landed item exceed 1.0, or on any
 # chain-attributed red main or rebase-conflict cluster. Green tier: reload_config
-# applies a change without a restart; this carry issues none, so 6 goes live at
-# the next restart. The coalesce test this flip once redded pins chain_cap=0
-# since task 7279 (merge 58a69de6a5).
+# applies a change without a restart. The coalesce test this flip once redded
+# pins chain_cap=0 since task 7279 (merge 58a69de6a5).
 merge_deep:
   chain_cap: 6
   # No warm spec pool here, so builds are git-only (8 builds, max 31 s).

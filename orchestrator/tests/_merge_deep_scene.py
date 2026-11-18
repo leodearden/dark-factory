@@ -41,18 +41,20 @@ from typing import Literal, TypedDict
 import pytest
 from _merge_lane_fakes import lane_scene_config
 
-from orchestrator.config import GitConfig, MergeDeepConfig, OrchestratorConfig
+from orchestrator.config import DepthRow, GitConfig, MergeDeepConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_lane import worker as _mq
 from orchestrator.merge_lane.types import (
     CapPermit,
+    DeepPlacement,
     MergeResult,
     QueuedBranch,
     RealMergeItem,
     SpecPermit,
 )
 from orchestrator.merge_lane.worker import MergeRequest, SpeculativeMergeWorker
+from orchestrator.merge_verify_facts import MergeVerifyDispatchFacts
 
 # ── repo fixtures ────────────────────────────────────────────────────────────
 
@@ -152,13 +154,21 @@ def _make_config(
     """Build an OrchestratorConfig whose ``merge_deep.chain_cap`` is *chain_cap*.
 
     ``chain_cap`` defaults to 0 — α's shipped kill switch — so a test that wants
-    the deep path must opt in explicitly, exactly as an operator would.
+    the deep path must opt in explicitly, exactly as an operator would.  The cap
+    is only the switch; a *chain_cap* of 2 or more also pins the one-row depth
+    table ``[(0.0, chain_cap)]``, which bounds every chain at *chain_cap* items.
     """
     return lane_scene_config(
         repo,
         git_config or _make_spec_git_config(),
-        merge_deep=MergeDeepConfig(chain_cap=chain_cap),
+        merge_deep=_deep_config(chain_cap),
     )
+
+
+def _deep_config(chain_cap: int) -> MergeDeepConfig:
+    if chain_cap < 2:
+        return MergeDeepConfig(chain_cap=chain_cap)
+    return MergeDeepConfig(chain_cap=chain_cap, depth_table=[DepthRow(0.0, chain_cap)])
 
 
 # ── MergeRequest / item helpers ──────────────────────────────────────────────
@@ -400,6 +410,24 @@ def _abort_hook_at(call_no: int, *, outcome=None, raises=None, bump_repo=None):
 
 
 # ── verify-lease / runner helpers ────────────────────────────────────────────
+
+
+def _placed_facts(placement: DeepPlacement) -> MergeVerifyDispatchFacts:
+    """The dispatch facts a real dispatch hands ``_run_inflight_verify``
+    beside *placement*'s chain: the depth reason the policy placed it with."""
+    return MergeVerifyDispatchFacts().with_chain_depth_reason(placement.depth_reason)
+
+
+def _verify_row(passed: bool, *, merge_sha: str, basis: str | None = 'no_estimate',
+                attempt: int = 0, chain_items: int = 1) -> dict:
+    """``merge_verify`` row data as the verify runner writes it."""
+    reason = None if basis is None else {
+        'basis': basis, 'pass_estimate': None, 'row': None, 'queue_depth': 1,
+    }
+    return {
+        'passed': passed, 'merge_sha': merge_sha, 'attempt': attempt,
+        'chain_items': chain_items, 'chain_depth_reason': reason,
+    }
 
 
 def _local_lease():

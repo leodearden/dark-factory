@@ -10,6 +10,7 @@ import posixpath
 import re
 import stat
 from dataclasses import dataclass
+from itertools import pairwise
 from pathlib import Path
 from types import UnionType
 from typing import Annotated, Any, Literal, NamedTuple, Union, get_args, get_origin
@@ -1440,6 +1441,15 @@ class VerifyCacheConfig(BaseModel):
         return CacheMode.OFF
 
 
+class DepthRow(NamedTuple):
+    """One ``merge_deep.depth_table`` row: chain ``depth`` items when the
+    rolling per-item pass estimate is at least ``min_pass_estimate``.
+    """
+
+    min_pass_estimate: float
+    depth: int
+
+
 class MergeDeepConfig(BaseModel):
     """Deep merge-ahead chains (task 3183, plans/deep-merge-ahead-prd.md α).
 
@@ -1447,20 +1457,17 @@ class MergeDeepConfig(BaseModel):
     worktree, sequential in-order merges, one verify on the tip) instead of one
     item at a time, so a passing tip lands the whole clean prefix in one round.
 
-    ``chain_cap`` is the single gate for the whole feature. The dispatch contract
-    it feeds (when a chain is built, and how ``target_depth`` is derived) and the
-    cap-staging plan live in the PRD, which is the ONE canonical narrative for
-    both — deliberately not restated here, because β (task 3184, the chain
-    builder) and γ (task 3185, the dispatch gate) are the consumers that
-    implement that contract and may change it.
+    ``chain_cap`` is the KILL SWITCH and nothing else (task 8528): 0 (the
+    shipped default) means no chain code runs on any dispatch path, so
+    behaviour is byte-identical to pre-PRD merging — the ``probe_fraction=0.0``
+    precedent in :class:`SpeculationProbeConfig`. Any positive value turns
+    chains on and bounds nothing. Depth comes from ``depth_table`` through the
+    rolling per-item pass estimate, and every member of a failed chain next
+    verifies alone; plans/merge-lane-policy-prd.md D6/D7 is the one canonical
+    narrative for both, deliberately not restated here.
 
     ``chain_build_timeout_secs`` bounds one chain build (lane acquisition plus
     the merges) inside ``SpeculativeMergeWorker._deep_chain_placement``.
-
-    ``chain_cap=0`` (the shipped default) is the KILL SWITCH: the gate can never
-    open, so no chain code runs on any dispatch path and behaviour is
-    byte-identical to pre-PRD merging — the ``probe_fraction=0.0`` precedent in
-    :class:`SpeculationProbeConfig`.
 
     Plain BaseModel (no ``frozen``, no ``validate_assignment``) so ``_set_leaf``
     can mutate it in place on hot-reload and held references observe the update
@@ -1475,13 +1482,23 @@ class MergeDeepConfig(BaseModel):
         default=0,
         ge=0,
         description=(
-            'Maximum number of queued items a single deep merge-ahead chain may '
-            'contain. 0 (the default) disables the feature entirely -- the kill '
-            'switch: no chain is ever built, so merge behaviour is byte-identical '
-            'to pre-task-3183 behaviour. Must be >= 0; a negative cap is rejected '
-            'at load rather than reaching dispatch. No upper bound is imposed. '
-            'See plans/deep-merge-ahead-prd.md for the dispatch contract this '
-            'gates and for the cap-staging plan.'
+            'Kill switch for deep merge-ahead chains. 0 (the default) disables '
+            'the feature entirely: no chain is ever built, so merge behaviour is '
+            'byte-identical to pre-task-3183 behaviour. Any positive value turns '
+            'chains on; it does not bound chain depth, which depth_table sets. '
+            'Must be >= 0; a negative cap is rejected at load rather than '
+            'reaching dispatch. See plans/merge-lane-policy-prd.md D6/D7.'
+        ),
+    )
+    depth_table: list[DepthRow] = Field(
+        default_factory=lambda: [DepthRow(0.93, 8), DepthRow(0.85, 4), DepthRow(0.75, 2)],
+        description=(
+            'Chain depth by rolling per-item pass estimate: the first row whose '
+            'min_pass_estimate the estimate meets gives the depth, and an '
+            'estimate below every row chains nothing (depth 1). Rows are '
+            '[min_pass_estimate, depth] pairs, thresholds in [0, 1] and depths '
+            '>= 2, both strictly descending. A [0.0, N] row always chains N. '
+            'See plans/merge-lane-policy-prd.md D7.'
         ),
     )
     chain_build_timeout_secs: float = Field(
@@ -1504,6 +1521,39 @@ class MergeDeepConfig(BaseModel):
             'with a WARNING. Read live at each chain\'s confirm; must be > 0.'
         ),
     )
+
+    @field_validator('depth_table', mode='after')
+    @classmethod
+    def _validate_depth_table(cls, table: list[DepthRow]) -> list[DepthRow]:
+        if not table:
+            raise ValueError(
+                'depth_table must not be empty: depth 1 is the implicit else-row '
+                'and chain_cap: 0 is the only kill switch'
+            )
+        out_of_range = [row for row in table if not 0.0 <= row.min_pass_estimate <= 1.0]
+        if out_of_range:
+            raise ValueError(
+                f'depth_table thresholds must lie in [0, 1]; offending rows: {out_of_range!r}'
+            )
+        too_shallow = [row for row in table if row.depth < 2]
+        if too_shallow:
+            raise ValueError(
+                f'depth_table depths must be >= 2 (depth 1 is the implicit '
+                f'else-row); offending rows: {too_shallow!r}'
+            )
+        for column in ('min_pass_estimate', 'depth'):
+            unordered = [
+                later
+                for earlier, later in pairwise(table)
+                if getattr(later, column) >= getattr(earlier, column)
+            ]
+            if unordered:
+                label = 'thresholds' if column == 'min_pass_estimate' else 'depths'
+                raise ValueError(
+                    f'depth_table {label} must be strictly descending; offending '
+                    f'rows: {unordered!r}'
+                )
+        return table
 
 
 class RetentionConfig(BaseModel):
@@ -6808,10 +6858,10 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
     # hot-reloadable with no separate RELOADABLE_FIELDS edit.
     _submodel_leaf_paths('speculation_probe', SpeculationProbeConfig),
     # Deep merge-ahead chains (task 3183, PRD alpha, decision #7) — a new
-    # dedicated submodel, same whole-submodel-group idiom: chain_cap (and any
-    # knob beta/gamma add later) is green-tier hot-reloadable with no separate
-    # RELOADABLE_FIELDS edit, so the cap can be raised, retuned, or killed
-    # (-> 0) without a restart. See MergeDeepConfig for the rest.
+    # dedicated submodel, same whole-submodel-group idiom: chain_cap,
+    # depth_table and any later knob are green-tier hot-reloadable with no
+    # separate RELOADABLE_FIELDS edit, so chains can be turned on, retuned or
+    # killed (chain_cap -> 0) without a restart. See MergeDeepConfig.
     _submodel_leaf_paths('merge_deep', MergeDeepConfig),
     # Verify-result cache (task 5652): read per verify decision, so green tier;
     # each role's mode is its own leaf, so a task-only edit applies alone.

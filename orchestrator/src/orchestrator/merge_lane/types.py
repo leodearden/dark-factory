@@ -30,6 +30,7 @@ from orchestrator.git_ops import MergeResult
 from orchestrator.merge_lane.disposition import MergeFailureDisposition, SkewEvidence
 from orchestrator.merge_lane.outcome_facts import ConflictEvidence, MergeBlockCategory
 from orchestrator.merge_lane.reverify_gate_decision import GateClearance, ReverifyDispatch
+from orchestrator.merge_verify_facts import ChainDepthReason
 from orchestrator.remote_gate import GateIdentityPair, RunnerUnavailableKind
 from orchestrator.verify import VerifyResult, merge_verify_command_budget_secs
 
@@ -1573,6 +1574,21 @@ class ChainResult:
         A 2-link chain is ``depth == 2`` and ``chain_items == 3``.
         """
         return len(self.links)
+
+
+@dataclass(frozen=True)
+class DeepPlacement:
+    """What the deep gate decided for one dispatch: the chain it built, if
+    any, and why the policy chose its depth (``None`` when it was not asked).
+
+    A non-``None`` *chain* holds its scratch lane (see :class:`ChainResult`).
+    """
+
+    chain: ChainResult | None
+    depth_reason: ChainDepthReason | None
+
+
+NO_DEEP_PLACEMENT = DeepPlacement(chain=None, depth_reason=None)
 
 
 class InflightStatus(StrEnum):
