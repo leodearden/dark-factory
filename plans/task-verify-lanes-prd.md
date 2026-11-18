@@ -63,6 +63,8 @@ and ε's completion check cover that.
 3. **Only reify is enabled.** The mechanism is generic and off by default; other projects keep
    throwaway worktrees.
 4. **The kept build directory is in scope**, not a later stage.
+5. **A fallback must not quietly become the normal state.** It escalates above a low
+   threshold, and an escalation closed while the lane is still degraded comes back.
 
 ## 4. Resolved design decisions
 
@@ -113,10 +115,12 @@ and ε's completion check cover that.
    needs no timer. Extending reify's fine-grained trim to lanes is deferred (§10).
 10. **The dispatch record is the single home of lane facts on the workstation.** The pass
     summary is not changed.
-11. **A repeated failure to keep the build directory raises one escalation**, deduplicated by a
-    sentinel and resolved automatically on recovery, following
-    `merge_lane/liveness.py::_alarm_verify_host_skew`. The threshold is a constant, not a
-    config key: nobody has a reason to tune it per project.
+11. **A degraded lane escalates early and keeps escalating** (ruling 5). Two consecutive
+    degraded results file an L1, deduplicated by a sentinel and resolved automatically on
+    recovery, following `merge_lane/liveness.py::_alarm_verify_host_skew`. Ten consecutive
+    raise it to a human (L2). An escalation closed while the lane is still degraded is filed
+    again. The thresholds are constants, not config keys: nobody has a reason to tune them
+    per project.
 12. **Enabling on the laptop is an operator gate**, not a scripted deploy. Three reasons: the
     scripts it runs are created by γ, and `submit_task` rejects a deterministic task whose
     script does not yet exist; it needs reify's orchestrator restarted onto a dark-factory
@@ -220,29 +224,36 @@ remote result leaves the three lane facts and `remote_runner` at their defaults.
 
 ### C9. Degraded-lane alarm
 
-Per remote host, the dispatcher keeps a streak of consecutive remote results that are
-lane-configured (`host_lane` or `host_lane_note` non-empty) with `host_lane_kept` false.
+A remote result is **degraded** when it is lane-configured (`host_lane` or `host_lane_note`
+non-empty) and `host_lane_kept` is false: a throwaway fallback, a dropped or recreated build
+directory, or the first run in a new lane. It is **healthy** when `host_lane_kept` is true, or
+when all three fields are at their defaults (lanes switched off). Per remote host, the
+dispatcher keeps a streak of consecutive degraded results.
 
-- At 5 consecutive (a constant in the alarm module), if no pending record exists for the
-  sentinel `__task_verify_lane_degraded__<host>`, file one L1 escalation: category
-  `infra_issue`, role and severity as `_alarm_verify_host_skew` uses, with the last notes in
-  its detail.
-- A result with `host_lane_kept` true, or a result with all three fields at their defaults
-  (lanes switched off), resets the streak and resolves a pending alarm.
-- The escalation queue is read only when the streak crosses the threshold, when a healthy
-  result follows a streak at or above it, and on the first healthy result per host after the
-  dispatcher starts (an alarm left open across a restart must still clear). Never on every
-  result. Queue calls run off the event-loop thread.
+- **At 2 consecutive**, if no pending record exists for the sentinel
+  `__task_verify_lane_degraded__<host>`, file one L1 escalation: category `infra_issue`, role
+  and severity as `_alarm_verify_host_skew` uses, with the notes of the streak in its detail.
+- **Every 2 further degraded results**, if no pending record exists for the sentinel, file it
+  again. An escalation that anyone closed while the lane is still degraded therefore returns
+  within two results.
+- **At 10 consecutive**, an L2 must be pending for the sentinel: unless one already is, file
+  one born at L2, the way `deterministic_runner.py` files its born-at-L2 escalations (level 2,
+  a severity and sentinel role the server keeps at level 2), and resolve a pending L1 as
+  superseded by it. Closed while still degraded, it returns at L2 after 2 further degraded
+  results.
+- **A healthy result** resets the streak and resolves a pending record at either level.
+- The escalation queue is read only at those points: the thresholds, every second degraded
+  result past the first threshold, a healthy result that follows a streak of 2 or more, and
+  the first healthy result per host after the dispatcher starts (an alarm left open across a
+  restart must still clear). Queue calls run off the event-loop thread.
 - The streak is in memory; a dispatcher restart starts it again.
 - The queue does not exist when the dispatcher is constructed (`Harness.__init__` sets it to
   None; `Harness._start_escalation_server` creates it). The alarm is bound late, the way that
   method binds its other sinks, and does nothing but count while it has no queue.
-- A person who resolves the alarm while the lane is still degraded is not paged again until a
-  healthy result has reset the streak. The operator owns an alarm that stays open because
-  remote results stopped arriving.
 
-The first run in a new lane, and the run after an operator reset, legitimately report
-`host_lane_kept` false; the threshold absorbs them.
+One degraded result is normal after enabling lanes, after an operator reset, and after a
+cancelled verify whose compiles had not drained; the threshold of 2 absorbs exactly one. The
+operator owns an escalation that stays open because remote results stopped arriving.
 
 ### C10. Operator tools
 
@@ -298,7 +309,7 @@ runner's ssh seam, as `orchestrator/tests/test_task_verify_integration.py` does.
 | 17 | host | `verify-lanes status` after row 2 | JSON names the lane as existing, unlocked, with kept directories, marker valid |
 | 18 | dispatcher | remote result with lane facts, plain remote decision | the dispatch record carries the three values |
 | 19 | dispatcher | the same on a cross-checked dispatch and on a red confirmed locally | the dispatch record carries the remote run's three values in both, `remote_runner` names the remote host though `runner` is local, and `recorded_at` parses as a time |
-| 20 | dispatcher | five consecutive lane-configured results with kept false, then a sixth | one L1 with the sentinel, category `infra_issue`; the sixth files nothing; then a kept-true result resolves it; five more kept-false results file a new one; an all-default result resolves that. With an alarm pending and a freshly constructed alarm object (a restart), the first kept-true result resolves it. With no queue bound, five kept-false results file nothing and raise nothing |
+| 20 | dispatcher | consecutive lane-configured results with kept false | the second files one L1 under the sentinel, category `infra_issue`; the third files nothing; a kept-true result resolves it. With the L1 closed by hand and the lane still degraded, two more degraded results file it again. The tenth consecutive degraded result leaves a pending record at L2 and no pending L1 (the L1 is resolved as superseded); an all-default result resolves it. With a record pending and a freshly constructed alarm object (a restart), the first kept-true result resolves it. With no queue bound, ten degraded results file nothing and raise nothing |
 | 21 | both | real command behind the ssh seam, lanes = 1, two dispatches | the second dispatch record shows `host_lane_kept` true |
 
 ## 7. Pre-conditions
@@ -350,7 +361,8 @@ and β the second, and the chain is pinned so they get the lock.
   `test_task_verify_integration.py`.
   Signal: a dispatch record written by the real dispatcher for a lane run carries the lane
   facts, the remote host and a timestamp, on plain, cross-checked and red-confirmed
-  dispatches; five kept-false results file one L1 and a kept-true result resolves it. Depends on α. Unlocks γ's in-service check and ε.
+  dispatches; two consecutive degraded results file one L1, ten leave it at L2, a closed one
+  returns while the lane is still degraded, and a kept-true result resolves it. Depends on α. Unlocks γ's in-service check and ε.
 - **γ. Host provisioning and the in-service check** (about 500 lines). The two scripts of C10
   with tests using fake ssh shims
   (`scripts/tests/test_enable_laptop_persistent_worktree.py` is the pattern) and fixture

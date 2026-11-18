@@ -98,6 +98,9 @@ tasks:
   - name: l1-dedup-and-resolve-precedent
     binding: '`grep:escalation/src/escalation/queue.py::EscalationQueue.has_open_l1` `grep:orchestrator/src/orchestrator/merge_lane/liveness.py::_alarm_verify_host_skew` wired: sentinel dedup and resolve-on-recovery'
     verdict: PASS
+  - name: born-at-l2-filing-precedent
+    binding: '`grep:orchestrator/src/orchestrator/deterministic_runner.py` (its born-at-L2 escalation helpers: level 2 with a sentinel role and severity the server keeps at level 2)'
+    verdict: PASS
   - name: registered-category-infra-issue
     binding: '`grep:escalation/src/escalation/categories.py` (INFRA_ISSUE = ''infra_issue'')'
     verdict: PASS
