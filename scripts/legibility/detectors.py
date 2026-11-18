@@ -126,9 +126,9 @@ def _raw_carriers(record: Mapping[str, Any]) -> Iterator[tuple[CarrierKind, str]
 def is_non_dialogue_carrier(record: Mapping[str, Any], text: str) -> bool:
     """The ONE question asked of a carrier before it counts as this
     session's own dialogue: the record half is provenance
-    (:func:`reingestion.has_non_dialogue_provenance` -- a non-human
-    ``origin``, or a headless SDK prompt), the text half is content. The
-    record half covers every carrier the record holds, tool_results included.
+    (:func:`reingestion.has_non_dialogue_provenance`), the text half is
+    content. The record half covers every carrier the record holds,
+    tool_results included.
 
     Dropping is WHOLE-carrier on every carrier kind, so a genuine literal
     printed beside a harness prompt goes with it. That cost is accepted on

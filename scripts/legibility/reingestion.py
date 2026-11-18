@@ -432,7 +432,8 @@ SDK_PROMPT_SOURCE: str = 'sdk'
 """The Claude Code ``promptSource`` of a prompt delivered over the SDK rather than typed."""
 
 HEADLESS_SDK_ENTRYPOINT: str = 'sdk-cli'
-"""The ``entrypoint`` of headless ``claude --print``, through which every factory dispatch goes."""
+"""The ``entrypoint`` headless ``claude --print`` stamps unless an inherited
+``CLAUDE_CODE_ENTRYPOINT`` overrides it (residual: task 10794)."""
 
 
 def is_headless_sdk_prompt(record: Mapping[str, Any]) -> bool:

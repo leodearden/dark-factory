@@ -495,10 +495,8 @@ def iter_user_turns(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
     Excludes: non-'user' records, isSidechain=True (subagent) turns,
     isMeta=True (system-injected) turns, user records whose content is
-    entirely tool_result blocks, a record whose harness provenance names a
-    non-human producer (:func:`reingestion.has_non_human_origin` -- a background-task
-    notification, an auto-continuation, a coordinator or peer message), a
-    headless SDK-delivered prompt (:func:`reingestion.is_headless_sdk_prompt`), and
+    entirely tool_result blocks, a record whose structured provenance alone
+    marks it as non-dialogue (:func:`reingestion.has_non_dialogue_provenance`), and
     re-ingested machine content (:func:`reingestion.is_reingested_content`): a pasted
     coder judgment, and every harness-injected briefing/prompt/report/
     context-block turn -- the orchestrator briefing, the trickle-coder and
