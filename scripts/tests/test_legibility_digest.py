@@ -2662,7 +2662,7 @@ class TestNonHumanOriginFilter:
 # provenance alone, while a human turn typed into an SDK GUI client stays gold.
 # ---------------------------------------------------------------------------
 
-_UNMARKED_HEADLESS_SDK_TEXTS = tuple(param.values[0] for param in UNMARKED_HEADLESS_SDK_PROMPTS)
+_UNMARKED_HEADLESS_SDK_TEXTS = tuple(str(param.values[0]) for param in UNMARKED_HEADLESS_SDK_PROMPTS)
 
 
 class TestHeadlessSdkPromptFilter:
