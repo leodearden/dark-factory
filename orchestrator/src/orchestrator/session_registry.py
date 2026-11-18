@@ -2,25 +2,25 @@
 
 PRD: plans/session-attention-rail-prd.md T3 (spine root; §4.1-4.2, §4.8, §6 G5).
 
-This module runs the global, cross-project session registry at
-``~/.claude/fleet/sessions/<slug>/record.json``: the reaps, the T7 leases and
-the fleet registry CLI. The record schema and its store live in
-``session_records``, THIS session's identity in ``session_identity``, and the
-decision verbs in ``decision_cli``.
+This module is the fleet registry CLI over the global, cross-project session
+registry at ``~/.claude/fleet/sessions/<slug>/record.json``: the launching,
+exit, refresh, set-display and reap verbs, the lease verbs, and the decision
+verbs through ``decision_cli``. The record schema and its store live in
+``session_records``, the leases in ``session_leases``, the sweeps and reaps in
+``session_reaper``, and THIS session's identity in ``session_identity``.
 
 It imports only the stdlib, this checkout's stdlib-only ``shared`` leaves and
 its stdlib-only siblings, layered so each imports only downward:
-``fleet_files``, ``session_identity`` <- ``session_records`` <-
-``session_registry`` and ``fleet_files`` <- ``decision_registry`` <-
-``decision_cli`` <- ``session_registry``, which also imports ``fleet_files``
-and ``session_identity`` directly. Nothing else from the orchestrator, so it
-can be:
+``fleet_files``, ``session_identity``, ``session_windows`` <-
+``session_records`` / ``session_leases`` / ``session_reaper`` <-
+``session_registry``, and ``decision_registry`` <- ``decision_cli`` <-
+``session_registry``. Nothing else from the orchestrator, so it can be:
 
 - invoked directly by ``skills/spawn/spawn-claude.sh`` and the SKILL.md verb
   lines via an absolute path (no venv/PYTHONPATH/install required: the
   bootstrap below reaches ``shared/src`` from ``__file__``), and
 - imported as ``orchestrator.session_registry`` by downstream Python
-  consumers (T4 verify, T7 leases).
+  consumers.
 """
 
 from __future__ import annotations

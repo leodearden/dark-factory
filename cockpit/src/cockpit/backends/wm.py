@@ -28,7 +28,7 @@ def _window_id_int(raw: str | None) -> int | None:
     NOTE: this parse/canonicalize logic is mirrored (duplicated, not
     shared/imported, since this is a cross-package boundary — cockpit must
     never import orchestrator) in
-    ``orchestrator/src/orchestrator/session_hooks.py::_canonical_window_id``,
+    ``orchestrator/src/orchestrator/session_windows.py::canonical_window_id``,
     which keys on the identical ``int(s, 0)`` contract. Keep the two in sync.
     """
     try:
@@ -162,10 +162,11 @@ class WmBackend:
 
         NOTE: this exact `split(None, 3)` parse is duplicated (not
         shared/imported, since this is a cross-package boundary) in
-        `orchestrator/src/orchestrator/session_hooks.py::_resolve_wm_window_id`
+        `orchestrator/src/orchestrator/session_windows.py::parse_wmctrl_list`
         -- if the column layout or matching rule here ever changes, mirror
         the change there too. The integer-identity window-id compare is
-        likewise mirrored by `session_hooks._canonical_window_id`'s
+        likewise mirrored by
+        `orchestrator/src/orchestrator/session_windows.py::canonical_window_id`'s
         `int(s, 0)` contract (see `_window_id_int` above).
         """
         if not target.wm_title and not target.wm_window_id:
