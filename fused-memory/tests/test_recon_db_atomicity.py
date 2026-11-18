@@ -137,14 +137,17 @@ async def test_each_collision_store_runs_its_statements_on_its_injected_connecti
     """
     data_dir = tmp_path / 'recon'
     db_path = str(data_dir / 'reconciliation.db')
-    journal_tap, buffer_tap = _ConnectTap(), _ConnectTap()
+    journal_tap, buffer_tap, ledger_tap = _ConnectTap(), _ConnectTap(), _ConnectTap()
     journal = ReconciliationJournal(data_dir, connect=journal_tap)
     buffer = EventBuffer(db_path=data_dir / 'reconciliation.db', connect=buffer_tap)
+    ledger = ReconLedgerStore(data_dir / 'reconciliation.db', connect=ledger_tap)
     try:
         for name, store, tap, public_read in (
             ('ReconciliationJournal', journal, journal_tap,
              lambda: journal.get_stale_runs(STALE_CUTOFF_SECONDS)),
             ('EventBuffer', buffer, buffer_tap, lambda: buffer.peek_buffered(PROJECT_ID, 10)),
+            ('ReconLedgerStore', ledger, ledger_tap,
+             lambda: ledger.list_suppressions(PROJECT_ID)),
         ):
             await store.initialize()
             traced: list[str] = []
@@ -157,6 +160,7 @@ async def test_each_collision_store_runs_its_statements_on_its_injected_connecti
             )
             assert traced, f"{name}'s read did not run on the connection its connect opened"
     finally:
+        await ledger.close()
         await buffer.close()
         await journal.close()
 
