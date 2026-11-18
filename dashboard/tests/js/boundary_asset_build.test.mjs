@@ -21,3 +21,15 @@ test('asset build: the receipt carries the build identities the server stamped o
   assert.equal(outcome, 'applied');
   assert.deepEqual(client.window.DF_DATA.__receipt[served.path].assetBuild, served.expected);
 });
+
+test('asset build: the identities the server serves pass the page\'s validator', async () => {
+  const client = loadClient();
+  const served = payload('asset_build_served');
+
+  await applyServed(client, served.path, served.body, { headers: served.headers, receivedAt: RECEIVED_AT });
+
+  assert.deepEqual(client.window.DF_ASSET_SKEW.latestAssetBuild(client.window.DF_DATA.__receipt), {
+    ...served.expected,
+    receivedAt: RECEIVED_AT,
+  });
+});
