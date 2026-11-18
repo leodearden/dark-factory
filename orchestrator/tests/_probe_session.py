@@ -23,7 +23,7 @@ from _orch_helpers import ORCH_DIR, ORCH_PYPROJECT, sanitized_probe_env
 
 def run_probe_session(
     probe: Path, *, basetemp: Path, kill_secs: int, backstop_secs: float,
-    cwd: Path = ORCH_DIR, extra: Sequence[str] = (),
+    cwd: Path = ORCH_DIR, extra: Sequence[str] = (), drop: Sequence[str] = (),
 ) -> subprocess.CompletedProcess[str]:
     smuggled = [arg for arg in extra if arg == '--basetemp' or arg.startswith('--basetemp=')]
     if smuggled:
@@ -39,6 +39,6 @@ def run_probe_session(
             f'--timeout={kill_secs}', '--timeout-method=thread', '-q',
             *extra,
         ],
-        cwd=cwd, env=sanitized_probe_env(), capture_output=True, text=True,
+        cwd=cwd, env=sanitized_probe_env(drop=drop), capture_output=True, text=True,
         timeout=backstop_secs,
     )
