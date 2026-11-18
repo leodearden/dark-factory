@@ -157,6 +157,13 @@ def apply_isolated_env(mp: pytest.MonkeyPatch, root: Path) -> None:
     ``wait_shutdown`` until pytest-timeout fires, blaming whichever test
     happened to be holding the fixture.
 
+    SETS ``DASHBOARD_SAMPLERS`` off, for the same reason the URLs are set:
+    unset means the product default, on.  The samplers' root discovery
+    (dashboard/src/dashboard/data/orchestrator.py::find_running_orchestrators,
+    reached from data/burndown.py::collect_snapshot and
+    data/metrics.py::_sample_orchestrators) ps-scans the real host, and no env
+    var can isolate that.  ``enable_samplers`` below is the opt-in.
+
     A DEFAULT, not a lock, exactly like the paths above: a function-scoped
     ``monkeypatch.setenv`` is created after — and torn down before — the
     session-scoped context, so ``two_url_client`` and any test that overrides
@@ -168,9 +175,21 @@ def apply_isolated_env(mp: pytest.MonkeyPatch, root: Path) -> None:
     """
     mp.setenv('DASHBOARD_PROJECT_ROOT', str(root))
     mp.setenv('DASHBOARD_FUSED_MEMORY_URLS', ','.join(HERMETIC_FUSED_MEMORY_URLS))
+    mp.setenv('DASHBOARD_SAMPLERS', 'off')
     mp.delenv('DASHBOARD_KNOWN_PROJECT_ROOTS', raising=False)
     mp.delenv('RECONCILIATION_DATA_DIR', raising=False)
     mp.delenv('QUEUE_DATA_DIR', raising=False)
+
+
+def enable_samplers(mp: pytest.MonkeyPatch) -> None:
+    """Opt one test whose SUBJECT is a sampler under a lifespan back in.
+
+    Call it after any ``apply_isolated_env`` call in the same test, which would
+    otherwise reset the switch to off.  The caller must stub what the samplers
+    reach (the loops on ``dashboard.app``, or ``dashboard.loops.collect_snapshot``
+    / ``collect_metrics_snapshot``), or the real ones scan the host.
+    """
+    mp.setenv('DASHBOARD_SAMPLERS', 'on')
 
 
 # ---------------------------------------------------------------------------
