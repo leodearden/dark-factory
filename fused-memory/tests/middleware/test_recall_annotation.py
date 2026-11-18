@@ -103,14 +103,14 @@ class TestRegistry:
     )
     def test_without_a_usable_registry_a_text_qualifier_binds_nothing(self, known_projects):
         bindings = bind_tasks(
-            [_note('n1', 'Total: 42 and localhost:6379')],
+            [_note('n1', 'total:42 and localhost:6379')],
             project_id=PROJECT, known_projects=known_projects,
         )
         assert bindings.tasks == ()
 
     def test_without_a_registry_the_own_project_still_qualifies(self):
         bindings = bind_tasks(
-            [_note('n1', 'see dark_factory: 12')], project_id=PROJECT, known_projects={},
+            [_note('n1', 'see dark_factory:12')], project_id=PROJECT, known_projects={},
         )
         assert _refs(bindings) == [_local('12')]
 
