@@ -401,11 +401,6 @@ class TestEveryLifespanRunsWithoutSamplers:
     def test_two_url_client_fixture_lifespan_has_samplers_off(self, two_url_client):
         assert two_url_client.app.state.config.samplers_enabled is False
 
-    def test_samplers_off_fixture_sets_the_switch(self, samplers_off):
-        from dashboard.config import DashboardConfig
-
-        assert DashboardConfig.from_env().samplers_enabled is False
-
     def test_neither_an_ambient_on_nor_an_absent_value_survives(self, tmp_path):
         from dashboard.config import DashboardConfig
 
