@@ -258,6 +258,40 @@ def test_main_set_display_stamps_and_is_preserved(
     assert exited_record.display.tmux_target == 'fleet-df:2'
 
 
+@pytest.mark.parametrize(
+    ('given', 'stored'),
+    [
+        pytest.param('52428807', '0x03200007', id='decimal'),
+        pytest.param('0x3200007', '0x03200007', id='unpadded-hex'),
+        pytest.param('not-a-window', 'not-a-window', id='unparseable-kept-raw'),
+    ],
+)
+def test_main_set_display_stores_the_one_window_id_form(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    given: str,
+    stored: str,
+) -> None:
+    """set-display is a Display.wm_window_id writer, so it writes the PRD D10 form SessionStart writes.
+
+    session_windows.canonical_window_id's padded ``0x%08x``, or the raw value
+    when it does not parse, as session_hooks keeps an unparseable $WINDOWID.
+    """
+    _set_env(monkeypatch, _launching_env(tmp_path))
+    sr.main(['launching'])
+    record_dir = capsys.readouterr().out.strip()
+
+    rc = sr.main(
+        ['set-display', '--record', record_dir, '--kind', 'wm', '--wm-title', 'unblock:df#2085',
+         '--wm-window-id', given]
+    )
+
+    assert rc == 0
+    display = session_records.read_record(Path(record_dir).name, root=tmp_path).display
+    assert display == session_records.Display(kind='wm', wm_title='unblock:df#2085', wm_window_id=stored)
+
+
 # --- identity fallback (parse_spawn_identity) -------------------------------
 
 
@@ -1400,7 +1434,10 @@ def test_main_lease_mutating_verbs_refuse_a_stranger_without_changing_rc(
     assert lines[0] == 'result=refused'
     # The human line must name the REAL holder, so an agent reading stdout
     # learns who owns it rather than only that it was told no.
-    assert 'watcher-df-100' in lines[1]
+    assert re.search(
+        rf'held by watcher-df-100 \(pid {os.getpid()} alive, heartbeat \d+s ago\), not by watcher-df-STRANGER ',
+        lines[1],
+    )
     assert lease_path.read_text() == original_body
 
 
@@ -1420,7 +1457,12 @@ def test_main_lease_mutating_verbs_force_overrides_a_stranger_refusal(
     assert rc == 0
     lines = capsys.readouterr().out.splitlines()
     assert lines[0] == 'result=forced'
-    assert 'watcher-df-100' in lines[1]
+    # The holder is read BEFORE the mutation: a forced release deletes the
+    # lease body, so a read after it could not name the displaced holder.
+    assert re.search(
+        rf'FORCED by watcher-df-STRANGER over holder watcher-df-100 \(pid {os.getpid()} alive, heartbeat \d+s ago\)$',
+        lines[1],
+    )
 
 
 @pytest.mark.parametrize('verb', ['lease-heartbeat', 'lease-release'])
@@ -2706,7 +2748,10 @@ class TestStdlibOnlySelfContainment:
                     'decision_cli', 'decision_registry', 'fleet_files', 'session_identity',
                     'session_leases', 'session_reaper', 'session_records', 'session_windows',
                 ),
-                ('decision_cli', 'session_identity', 'session_leases', 'session_reaper', 'session_records'),
+                (
+                    'decision_cli', 'session_identity', 'session_leases', 'session_reaper', 'session_records',
+                    'session_windows',
+                ),
                 id='session_registry',
             ),
             pytest.param(

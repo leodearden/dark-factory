@@ -10,11 +10,10 @@ verbs through ``decision_cli``. The record schema and its store live in
 ``session_reaper``, and THIS session's identity in ``session_identity``.
 
 It imports only the stdlib, this checkout's stdlib-only ``shared`` leaves and
-its stdlib-only siblings, layered so each imports only downward:
-``fleet_files``, ``session_identity``, ``session_windows`` <-
-``session_records`` / ``session_leases`` / ``session_reaper`` <-
-``session_registry``, and ``decision_registry`` <- ``decision_cli`` <-
-``session_registry``. Nothing else from the orchestrator, so it can be:
+its stdlib-only siblings. Each sibling imports only downward, never this
+module; the graph is pinned by
+``test_session_registry.py::TestStdlibOnlySelfContainment::test_the_extracted_modules_import_only_downward``.
+Nothing else from the orchestrator, so it can be:
 
 - invoked directly by ``skills/spawn/spawn-claude.sh`` and the SKILL.md verb
   lines via an absolute path (no venv/PYTHONPATH/install required: the
@@ -65,7 +64,14 @@ from shared.session_liveness import capture_for_record
 # alone. Each mode is pinned in test_session_registry.py::TestStdlibOnlySelfContainment.
 # TYPE_CHECKING points the type checker at the package arm, the only one it can resolve.
 if TYPE_CHECKING or __package__:
-    from . import decision_cli, session_identity, session_leases, session_reaper, session_records
+    from . import (
+        decision_cli,
+        session_identity,
+        session_leases,
+        session_reaper,
+        session_records,
+        session_windows,
+    )
     from .fleet_files import fleet_root
 else:
     _OWN_DIR = str(Path(__file__).resolve().parent)
@@ -78,6 +84,7 @@ else:
         import session_leases
         import session_reaper
         import session_records
+        import session_windows
         from fleet_files import fleet_root
     finally:
         if _OWN_DIR_BORROWED:
@@ -337,7 +344,7 @@ def _run_set_display(
         root=root,
         kind=kind,
         wm_title=wm_title,
-        wm_window_id=wm_window_id,
+        wm_window_id=session_windows.canonical_window_id(wm_window_id) or wm_window_id,
         tmux_target=tmux_target,
         t3_thread_id=t3_thread_id,
     )
@@ -495,16 +502,16 @@ def _run_lease_mutation(
     assume the wording below branches on it; the RESULT (FORCED vs REFUSED) is
     the only thing that decides what is printed.
     """
-    holder = session_leases.lease_status(name)
+    before = session_leases.lease_status(name)
     result = mutate()
     print(f'result={result.value}')
     if result not in (session_leases.LeaseMutation.REFUSED, session_leases.LeaseMutation.FORCED):
         return
-    holder_slug = holder.holder_slug or '<unreadable lease body>'
-    holder_pid = holder.holder_pid if holder.holder_pid is not None else -1
-    alive_word = 'alive' if holder.holder_pid_alive else 'not running'
+    holder_slug = before.holder_slug or '<unreadable lease body>'
+    holder_pid = before.holder_pid if before.holder_pid is not None else -1
+    alive_word = 'alive' if before.holder_pid_alive else 'not running'
     holder_facts = (
-        f'{holder_slug} (pid {holder_pid} {alive_word}, heartbeat {int(holder.heartbeat_age_secs)}s ago)'
+        f'{holder_slug} (pid {holder_pid} {alive_word}, heartbeat {int(before.heartbeat_age_secs)}s ago)'
     )
     if result is session_leases.LeaseMutation.REFUSED:
         print(

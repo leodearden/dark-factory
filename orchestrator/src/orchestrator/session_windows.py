@@ -5,8 +5,9 @@ parses with base autodetection (``int(raw, 0)``), so a terminal's decimal
 ``$WINDOWID`` and wmctrl's hex column name the same window identically.
 
 It is a stdlib-only leaf: it imports no orchestrator sibling and no ``shared``,
-so ``session_hooks`` (the SessionStart display) and ``session_reaper`` (the
-window sweep) both import it without a cycle. The bare-shell contract is
+so ``session_hooks`` (the SessionStart display), ``session_registry`` (the
+set-display verb) and ``session_reaper`` (the window sweep) all import it
+without a cycle. The bare-shell contract is
 pinned by
 ``orchestrator/tests/test_session_registry.py::TestStdlibOnlySelfContainment``;
 the interface is C6 of
