@@ -22,12 +22,12 @@ from fused_memory.reconciliation.preservation_specimen_guard import (
     preservation_mem0_filters,
 )
 from fused_memory.reconciliation.prompts import (
-    _STAGE1_GRAPHITI_QUEUED_GUIDANCE,
     _STAGE1_PROJECT_ID_GUIDELINE,
     AMEND_AND_EPISODE_TOOLS_BLOCK,
     CITATION_REPAIR_TOOL_BLOCK,
     DUPLICATE_FINDING_SALVAGE_GUIDANCE,
     FLAG_FOR_STAGE2_MARKER_KIND,
+    GRAPHITI_QUEUED_GUIDANCE,
     REFERENT_DECLARATION_GUIDANCE,
     STALE_KNOWLEDGE_ANNOTATION_NORM,
     get_recon_report_tool_guidance,
@@ -369,14 +369,11 @@ needs no escalation read at all: the stamp lives on the task record, which you d
 After calling `mcp__fused-memory__add_memory`, inspect the `memory_ids` field in the \
 response. An empty list means Mem0 deduplicated or filtered the write and no new memory \
 was created — count it as a no-op, not a successful addition. Your stats \
-(`memories_added` / `memories_written`) must reflect actual IDs returned, not calls \
+(`memories_added`) must reflect actual IDs returned, not calls \
 attempted. If a write returns zero IDs and you expected a new memory, either retry with \
 different content or note the deduplication in your report.
 
-Invariant: `len(memory_ids_returned) == memories_written == memories_added`. Both keys \
-must carry the same count and both count only writes where `memory_ids` was non-empty.
-
-{_STAGE1_GRAPHITI_QUEUED_GUIDANCE}
+{GRAPHITI_QUEUED_GUIDANCE}
 
 Note that the stats verifier may report a LOWER final count than you did, because a write \
 you correctly counted can later be dead-lettered by the durable queue after this stage has \

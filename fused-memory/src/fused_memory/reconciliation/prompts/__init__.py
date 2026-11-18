@@ -805,26 +805,14 @@ def render_finding_provenance_section(*, can_file_tasks: bool) -> str:
         + capability_clause
     )
 
-# Shared guidance about the memory_ids=[] + stores_queued=['graphiti'] → graphiti_writes_queued
-# invariant.  Both stages need to teach the LLM not to count async-enqueued Graphiti
-# writes under their `memories_*` stats; only the stat-key tokens differ between stages.
-_GRAPHITI_QUEUED_GUIDANCE_TEMPLATE = (
+# Shared by Stages 1 and 2: async-enqueued Graphiti writes count as graphiti_writes_queued.
+GRAPHITI_QUEUED_GUIDANCE = (
     "Graphiti-only async-enqueued writes show `stores_queued: ['graphiti']` in the response "
     "and return `memory_ids: []` because the write is queued rather than persisted inline. These "
-    "must NOT be counted under {stat_keys_phrase}. Report them instead under "
+    "must NOT be counted under `memories_added`. Report them instead under "
     "a separate `graphiti_writes_queued` stat. The stats verifier enforces this split "
-    "independently and will override any inflated {primary_stat_key} count, but you should "
+    "independently and will override any inflated `memories_added` count, but you should "
     "report it correctly from the start to avoid divergence."
-)
-
-_STAGE1_GRAPHITI_QUEUED_GUIDANCE = _GRAPHITI_QUEUED_GUIDANCE_TEMPLATE.format(
-    stat_keys_phrase="`memories_added` / `memories_written`",
-    primary_stat_key="`memories_added`",
-)
-
-_STAGE2_GRAPHITI_QUEUED_GUIDANCE = _GRAPHITI_QUEUED_GUIDANCE_TEMPLATE.format(
-    stat_keys_phrase="`memories_written`",
-    primary_stat_key="`memories_written`",
 )
 
 # ---------------------------------------------------------------------------

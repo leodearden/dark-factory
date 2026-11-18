@@ -35,11 +35,11 @@ from fused_memory.reconciliation.predicate_contradiction import (
     render_predicate_contradiction_section,
 )
 from fused_memory.reconciliation.prompts import (
-    _STAGE2_GRAPHITI_QUEUED_GUIDANCE,
     _STAGE2_PROJECT_ID_GUIDELINE,
     AMEND_AND_EPISODE_TOOLS_BLOCK,
     CITATION_REPAIR_TOOL_BLOCK,
     DUPLICATE_FINDING_SALVAGE_GUIDANCE,
+    GRAPHITI_QUEUED_GUIDANCE,
     REFERENT_DECLARATION_GUIDANCE,
     STAGE2_SUPPRESS_GUARD_KIND,
     STALE_KNOWLEDGE_ANNOTATION_NORM,
@@ -389,9 +389,9 @@ new information.
 After calling `mcp__fused-memory__add_memory`, inspect the `memory_ids` field in the \
 response. An empty list means Mem0 deduplicated or filtered the write and no new memory \
 was created — count it as a no-op, not a successful addition. Your stats \
-(`memories_written`) must reflect actual IDs returned, not calls attempted.
+(`memories_added`) must reflect actual IDs returned, not calls attempted.
 
-{_STAGE2_GRAPHITI_QUEUED_GUIDANCE}
+{GRAPHITI_QUEUED_GUIDANCE}
 
 **Per-Cycle Counter Schema** — include all six of the following fields in your \
 structured `stats` output (omitting them causes Stage 3's flag-accounting audit to \
