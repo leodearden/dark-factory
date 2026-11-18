@@ -409,6 +409,26 @@ class TestOnlyTheLoaderWritesProvenance:
         with pytest.raises(RuntimeError, match='config_overlay'):
             FusedMemoryConfig()
 
+    @pytest.mark.parametrize(
+        ('variable', 'value'),
+        [
+            ('CONFIG_OVERLAY', '{"path": "/forged", "merged_keys": ["embedder.model"], "mtime": "t"}'),
+            ('CONFIG_OVERLAY__PATH', '/forged'),
+        ],
+        ids=['json', 'nested'],
+    )
+    @pytest.mark.parametrize('real_overlay', [False, True], ids=['no-overlay', 'over-real-overlay'])
+    def test_the_env_layer_carrying_the_provenance_key_is_refused(
+        self, monkeypatch, tmp_path, variable, value, real_overlay,
+    ):
+        monkeypatch.setenv(variable, value)
+
+        with pytest.raises(RuntimeError, match='config_overlay'):
+            _load(
+                monkeypatch, tmp_path, base={'write_triage': BASE_WRITE_TRIAGE},
+                overlay={'write_triage': {'t_high': 0.8}} if real_overlay else None,
+            )
+
 
 def test_every_band_key_is_a_write_triage_field():
     assert WRITE_TRIAGE_BAND_KEYS.issubset(WriteTriageConfig.model_fields)

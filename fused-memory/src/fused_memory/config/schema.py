@@ -126,10 +126,7 @@ class YamlSettingsSource(PydanticBaseSettingsSource):
         except (yaml.YAMLError, OSError) as e:
             raise RuntimeError(f'Failed to load configuration from {self.config_path}: {e}') from e
         if isinstance(raw_config, dict) and PROVENANCE_FIELD in raw_config:
-            raise RuntimeError(
-                f'{self.config_path} sets the reserved key {PROVENANCE_FIELD!r}. Only the '
-                f'loader writes it, from the overlay {OVERLAY_ENV_VAR} names; remove the key.'
-            )
+            raise _provenance_forged(str(self.config_path))
         return self._expand(raw_config, self.config_path)
 
     def _expand(self, raw_config: Any, source: Path | str) -> Any:
@@ -139,6 +136,31 @@ class YamlSettingsSource(PydanticBaseSettingsSource):
             raise RuntimeError(
                 f'Failed to expand environment variables in {source}: {e}'
             ) from e
+
+
+def _provenance_forged(source: str) -> RuntimeError:
+    return RuntimeError(
+        f'{source} sets the reserved key {PROVENANCE_FIELD!r}. Only the loader writes '
+        f'it, from the overlay {OVERLAY_ENV_VAR} names; remove it from {source}.'
+    )
+
+
+class _ProvenanceRefusingSource(PydanticBaseSettingsSource):
+    """``inner``'s values, refused whole if they set the loader-only provenance field."""
+
+    def __init__(self, inner: PydanticBaseSettingsSource, source: str) -> None:
+        super().__init__(inner.settings_cls)
+        self._inner = inner
+        self._source = source
+
+    def get_field_value(self, field: FieldInfo, field_name: str) -> tuple[Any, str, bool]:
+        return self._inner.get_field_value(field, field_name)
+
+    def __call__(self) -> dict[str, Any]:
+        values = self._inner()
+        if PROVENANCE_FIELD in values:
+            raise _provenance_forged(self._source)
+        return values
 
 
 # --- Shared leaf normalisers ---
@@ -3908,8 +3930,8 @@ class FusedMemoryConfig(BaseSettings):
         default=None,
         description=(
             'Provenance of the config overlay merged over the base file, or None '
-            'when no overlay is active. Set by the loader only, never by a config '
-            'file: see fused_memory/config/overlay.py.'
+            'when no overlay is active. Set by the loader only: a config file or '
+            'environment variable setting it is refused. See fused_memory/config/overlay.py.'
         ),
     )
 
@@ -3949,4 +3971,11 @@ class FusedMemoryConfig(BaseSettings):
     ) -> tuple[PydanticBaseSettingsSource, ...]:
         config_path = Path(os.environ.get('CONFIG_PATH', DEFAULT_CONFIG_PATH))
         yaml_settings = YamlSettingsSource(settings_cls, config_path)
-        return (init_settings, env_settings, yaml_settings, dotenv_settings)
+        return (
+            init_settings,
+            _ProvenanceRefusingSource(
+                env_settings, f'the environment ({PROVENANCE_FIELD.upper()}*)',
+            ),
+            yaml_settings,
+            _ProvenanceRefusingSource(dotenv_settings, 'the dotenv file'),
+        )
