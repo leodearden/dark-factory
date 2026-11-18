@@ -304,6 +304,7 @@ def _state(**overrides) -> TrickleState:
         capped=False,
         consecutive_barren_runs=0,
         consecutive_failed_runs=0,
+        consecutive_deferred_runs=2,
         last_productive_at=_T0,
         last_scheduled_target_date=date(2026, 7, 1),
         census_fired=True,
@@ -377,8 +378,8 @@ class TestTrickleStateCodec:
             'schema_version', 'project_id', 'target_date', 'recorded_at',
             'exit_code', 'outcome', 'applied', 'commit_made',
             'budget_suppressed', 'capped', 'consecutive_barren_runs',
-            'consecutive_failed_runs', 'last_productive_at',
-            'last_scheduled_target_date', 'census_fired',
+            'consecutive_failed_runs', 'consecutive_deferred_runs',
+            'last_productive_at', 'last_scheduled_target_date', 'census_fired',
             'census_fire_streak', 'counters', 'retry_backlog',
             'barren_escalated', 'completion_error_streak',
             'completion_escalated',
@@ -512,6 +513,7 @@ class TestPreGammaDocuments:
         assert state.outcome == RunOutcome.BARREN
         assert state.consecutive_barren_runs == 2
         assert state.consecutive_failed_runs == 0
+        assert state.consecutive_deferred_runs == 0
         assert state.capped is False
         assert dict(state.retry_backlog) == {}
         assert state.last_scheduled_target_date is None
@@ -537,9 +539,9 @@ class TestPreGammaDocuments:
         assert read.value.barren_escalated is recorded
 
     @pytest.mark.parametrize('field', [
-        'consecutive_failed_runs', 'capped', 'retry_backlog',
-        'last_scheduled_target_date', 'census_fired', 'census_fire_streak',
-        'completion_error_streak', 'completion_escalated',
+        'consecutive_failed_runs', 'consecutive_deferred_runs', 'capped',
+        'retry_backlog', 'last_scheduled_target_date', 'census_fired',
+        'census_fire_streak', 'completion_error_streak', 'completion_escalated',
     ])
     def test_each_later_additive_field_may_be_absent_alone(
         self, tmp_path, field
@@ -1317,8 +1319,9 @@ class TestRecordRunFailedStreak:
 
 
 class TestRecordRunDeferred:
-    """A night the usage cap deferred observed nothing, so it moves neither
-    streak and owes its date a retry."""
+    """A night the usage cap deferred observed nothing, so it leaves the
+    barren and failed streaks where they were, advances only its own
+    deferred streak, and owes its date a retry."""
 
     @pytest.fixture(autouse=True)
     def _state_root(self, tmp_path, monkeypatch):
@@ -1336,6 +1339,7 @@ class TestRecordRunDeferred:
         assert capped.last_productive_at == prod.last_productive_at
         assert capped.consecutive_barren_runs == 1
         assert capped.consecutive_failed_runs == 0
+        assert capped.consecutive_deferred_runs == 1
         assert capped.census_fired is None
         assert capped.census_fire_streak is not None
         assert capped.census_fire_streak.fires == 2
@@ -1353,6 +1357,33 @@ class TestRecordRunDeferred:
         assert deferred.outcome == RunOutcome.DEFERRED
         assert deferred.consecutive_barren_runs == 2
         assert _record(day=4, budget_skipped=4).consecutive_barren_runs == 3
+
+    def test_consecutive_deferred_nights_count_up(self):
+        assert [
+            _record(day=day, capped=True).consecutive_deferred_runs
+            for day in (1, 2, 3)
+        ] == [1, 2, 3]
+
+    @pytest.mark.parametrize('finisher', [
+        pytest.param(dict(selected_count=2), id='productive'),
+        pytest.param(dict(zero_signal_dropped=3), id='quiet'),
+        pytest.param(dict(budget_skipped=4), id='barren'),
+    ])
+    def test_a_finished_night_resets_the_deferred_streak(self, finisher):
+        _record(day=1, capped=True)
+        _record(day=2, capped=True)
+
+        state = _record(day=3, **finisher)
+        assert state.outcome != RunOutcome.DEFERRED
+        assert state.consecutive_deferred_runs == 0
+
+    def test_a_failed_night_carries_the_deferred_streak(self):
+        """Only a finished pass runs a retry, so a crash neither erases the
+        deferral's progress toward losing owed dates nor adds to it."""
+        _record(day=1, capped=True)
+        _record(day=2, capped=True)
+        assert _record(day=3, exit_code=1).consecutive_deferred_runs == 2
+        assert _record(day=4, capped=True).consecutive_deferred_runs == 3
 
 
 def _fire(anchor: str | None = '2026-08-02', path=_CENSUS_STATE):
