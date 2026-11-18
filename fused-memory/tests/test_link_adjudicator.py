@@ -8,6 +8,7 @@ so the two must agree word for word (INV-10).
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 from collections.abc import Callable, Mapping
@@ -17,6 +18,7 @@ import pytest
 from shared.cap_markers import REAL_CLI_CAP_HIT_MESSAGES, looks_like_capacity_banner
 from shared.cli_invoke import AgentResult, invoke_with_cap_retry, no_mcp_servers_config
 from shared.neutral_cwd import neutral_cli_cwd
+from shared.secret_env import AGENT_CREDENTIAL_VAR
 
 from fused_memory.config.schema import LinkHealConfig
 from fused_memory.maintenance import link_adjudicator
@@ -666,6 +668,8 @@ _LIVE_PAIR = LinkPair(
     parent_text='git stash is unsafe here because the stash stack is shared across all worktrees.',
 )
 
+_CREDENTIALED = {AGENT_CREDENTIAL_VAR: 'test-setup-token'}
+
 
 async def _live_edge_verdict(invoke: Invoke) -> LinkVerdict:
     """The live pair's verdict; capacity skips and auth reds, per shared/tests/_capacity_skip.py."""
@@ -694,13 +698,13 @@ class TestTheLiveEdgeCapacityGuard:
         invoke = FakeInvoke(AgentResult(success=False, output=banner))
 
         with pytest.raises(pytest.skip.Exception, match=re.escape(banner)):
-            await _live_edge_verdict(invoke)
+            await _live_edge_verdict(invoke, _CREDENTIALED)
 
     @pytest.mark.asyncio
     async def test_an_auth_failure_is_not_skipped(self):
         invoke = FakeInvoke(AgentResult(success=False, output='Not logged in · Please run /login'))
 
-        verdict = await _live_edge_verdict(invoke)
+        verdict = await _live_edge_verdict(invoke, _CREDENTIALED)
 
         assert verdict.failed
         assert verdict.failure is AdjudicationFailure.CLI_FAILED
@@ -710,10 +714,41 @@ class TestTheLiveEdgeCapacityGuard:
         answer = {'verdicts': [{'id': 'p1', 'verdict': Verdict.SAME.value, 'reason': 'r'}]}
         invoke = FakeInvoke(_ok(structured_output=answer))
 
-        verdict = await _live_edge_verdict(invoke)
+        verdict = await _live_edge_verdict(invoke, _CREDENTIALED)
 
         assert not verdict.failed
         assert verdict.verdict is Verdict.SAME
+
+
+class TestTheLiveEdgeCredentialGuard:
+    @pytest.mark.asyncio
+    async def test_no_setup_token_skips_before_any_call(self):
+        invoke = FakeInvoke(_ok())
+
+        with pytest.raises(pytest.skip.Exception, match=re.escape(AGENT_CREDENTIAL_VAR)):
+            await _live_edge_verdict(invoke, {})
+
+        assert invoke.calls == []
+
+    @pytest.mark.asyncio
+    async def test_an_empty_setup_token_counts_as_absent(self):
+        invoke = FakeInvoke(_ok())
+
+        with pytest.raises(pytest.skip.Exception, match=re.escape(AGENT_CREDENTIAL_VAR)):
+            await _live_edge_verdict(invoke, {AGENT_CREDENTIAL_VAR: ''})
+
+        assert invoke.calls == []
+
+    @pytest.mark.asyncio
+    async def test_the_setup_token_reaches_the_cli_call(self):
+        answer = {'verdicts': [{'id': 'p1', 'verdict': Verdict.SAME.value, 'reason': 'r'}]}
+        invoke = FakeInvoke(_ok(structured_output=answer))
+
+        verdict = await _live_edge_verdict(invoke, {AGENT_CREDENTIAL_VAR: 'tok-1'})
+
+        assert not verdict.failed
+        (call,) = invoke.calls
+        assert call['oauth_token'] == 'tok-1'
 
 
 @pytest.mark.integration
@@ -722,7 +757,7 @@ class TestTheLiveEdge:
     @pytest.mark.asyncio
     @pytest.mark.timeout(600)
     async def test_a_restatement_gets_a_verdict_from_the_real_cli(self):
-        verdict = await _live_edge_verdict(invoke_with_cap_retry)
+        verdict = await _live_edge_verdict(invoke_with_cap_retry, os.environ)
 
         assert not verdict.failed, verdict
         assert isinstance(verdict.verdict, Verdict)
