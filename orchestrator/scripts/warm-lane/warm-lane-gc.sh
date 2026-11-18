@@ -233,7 +233,8 @@
 #     i.e. not pool lanes, so the orchestrator mints no LaneLifecycle record for
 #     them by construction. A read there would be dead code that returns
 #     `unknown` for every candidate while implying a coverage that does not
-#     exist. live_ref_present remains their liveness guard (Block Q pins it).
+#     exist. live_ref_present remains their liveness guard
+#     (test_warm_lane_gc.sh Block Q pins it).
 #   - Live-reference gate (task 5572, both passes): the inv.2 flock is held only
 #     across the ACQUIRE reseed, NOT across the consumer's long cargo verify
 #     build, so during that build the flock is FREE and always-reclaim would wipe
@@ -353,8 +354,8 @@ source "$SCRIPT_DIR/lib_live_refs.sh"
 # incomplete, the same class as an unknown flag.
 #
 # Ordered AFTER the lib_live_refs.sh guard deliberately: a copy carrying neither
-# sibling must still report the live-refs one first, which is what Block A9's
-# asserted message pins.
+# sibling must still report the live-refs one first, which is what
+# test_warm_lane_gc.sh A9's asserted message pins.
 if [ ! -f "$SCRIPT_DIR/lib_lane_state.sh" ]; then
     echo "warm-lane-gc.sh: ERROR — scripts/lib_lane_state.sh not found next to warm-lane-gc.sh" >&2
     exit 2
@@ -1113,7 +1114,8 @@ _do_reclaim() {
         #     between verdict and action.
         #   - BEFORE both reset branches below (the --disk-pressure rm and the α
         #     reseed), so neither path can bypass the READ — the same "before
-        #     BOTH branches" property Block K5 pins for the live-reference gate.
+        #     BOTH branches" property test_warm_lane_gc.sh Block K5 pins for
+        #     the live-reference gate.
         #     Its VERDICT, however, is advisory under --disk-pressure: see the
         #     downgrade below. Evaluated-before is not the same as
         #     decisive-always, and conflating the two is what let a stranded
