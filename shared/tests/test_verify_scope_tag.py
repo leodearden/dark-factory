@@ -20,6 +20,9 @@ from shared.verify_scope_tag import (
     scope_tag_for,
     verify_scope_unit_name,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _INSTANCE = '0123456789ab'
 _TAG_SHAPE = re.compile(r'^[a-z0-9-]+-[0-9a-f]{8}$')
