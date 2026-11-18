@@ -78,16 +78,24 @@ THE SIGNAL-BINDING CHECK (task 6582). A sidecar's ``signal_leaves`` names the
 blocks whose task status the dashboard reads as the PRD's signal
 (plans/dashboard-prd-lanes-prd.md §4.7, §5.2). A STALE SIGNAL BINDING is a
 signal leaf whose locally bound task is missing from this store, or whose own
-``prd_path`` is not this sidecar's ``prd``. Every such row makes a run dirty;
-what one means and how it is fixed is stated once, in
-``_SIGNAL_BINDING_CAVEAT``. How many leaves were named and how many could be
-checked is in the coverage block, so a run with no signal leaves to check
-never reads as one whose leaves all agreed.
+PRD field does not name this sidecar's ``prd``. The task's field is read as
+the dashboard reads it, by
+``dashboard/src/dashboard/data/prd_attribution.py::coalesce_prd``; it and the
+sidecar's ``prd`` are each keyed by ``::normalise_prd_key`` against the
+absolute project root. The dashboard's own check
+(``dashboard/src/dashboard/data/prd_view.py::signal_of``) compares with the
+key of the PRD the sidecar sits beside instead of its ``prd``, so the two
+verdicts agree only while those name the same PRD. Every such row makes a run
+dirty; what one means and how it is
+fixed is stated once, in ``_SIGNAL_BINDING_CAVEAT``. How many leaves were
+named and how many could be checked is in the coverage block, so a run with no
+signal leaves to check never reads as one whose leaves all agreed.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -116,6 +124,7 @@ from _task_db_scan import (
     run_audit_cli,
     tasks_db_path,
 )
+from dashboard.data.prd_attribution import PrdKey, coalesce_prd, normalise_prd_key
 from shared.tasks_db_readonly import connect_ro
 
 # Bind `shared` to the SAME checkout as this script via a __file__-relative
@@ -126,9 +135,9 @@ from shared.tasks_db_readonly import connect_ro
 # worktree (that is what --manifest-root is for). Same reasoning and same form
 # as audit_combine_gate_marker_loss.py (tasks 2881/2882/3329). The shared.*
 # imports below MUST stay after this insert.
-# The shared.tasks_db_readonly import ABOVE is sound without it: importing
-# _task_db_scan already ran `import _checkout`, which bound this checkout's
-# shared/src.
+# The shared.tasks_db_readonly and dashboard.data.prd_attribution imports
+# ABOVE are sound without it: importing _task_db_scan already ran
+# `import _checkout`, which bound this checkout's member srcs.
 _SHARED_SRC = Path(__file__).resolve().parent.parent / "shared" / "src"
 if str(_SHARED_SRC) not in sys.path:
     sys.path.insert(0, str(_SHARED_SRC))
@@ -244,15 +253,17 @@ class TaskStoreScan(NamedTuple):
     ``manifest_bindings`` feeds the label-binding direction: every task the
     stamper would admit, sorted by numeric task id.
 
-    ``prd_paths`` (each task's non-empty string ``prd_path``) feeds the
-    signal-binding check, taken in the same scan for the same no-straddle
-    reason.
+    ``task_prds`` feeds the signal-binding check, taken in the same scan for
+    the same no-straddle reason. It holds each task's PRD field as
+    ``dashboard/src/dashboard/data/prd_attribution.py::coalesce_prd`` reads it
+    (``prd_path``, else ``prd``, else ``prd_ref``, with any ``#`` or ``§``
+    suffix stripped); a task naming no PRD has no entry.
     """
 
     row_ids: frozenset[int]
     delivered_checks: dict[int, dict[str, dict]]
     manifest_bindings: tuple[ManifestBinding, ...]
-    prd_paths: dict[int, str]
+    task_prds: dict[int, str]
 
 
 def _delivered_check_entries(metadata: dict) -> dict[str, dict]:
@@ -357,7 +368,7 @@ def load_task_store_scan(tasks_db_path: str) -> TaskStoreScan:
     row_ids: set[int] = set()
     delivered_checks: dict[int, dict[str, dict]] = {}
     bindings: list[ManifestBinding] = []
-    prd_paths: dict[int, str] = {}
+    task_prds: dict[int, str] = {}
     conn = connect_ro(tasks_db_path)
     try:
         cursor = conn.execute("SELECT id, status, metadata FROM tasks WHERE tag = 'master'")
@@ -374,9 +385,9 @@ def load_task_store_scan(tasks_db_path: str) -> TaskStoreScan:
             binding = _manifest_binding(tid, status, decoded)
             if binding is not None:
                 bindings.append(binding)
-            prd_path = decoded.get("prd_path")
-            if isinstance(prd_path, str) and prd_path:
-                prd_paths[tid] = prd_path
+            task_prd = coalesce_prd(decoded)
+            if task_prd is not None:
+                task_prds[tid] = task_prd
     finally:
         conn.close()
     bindings.sort(key=lambda binding: binding.task_id)
@@ -384,7 +395,7 @@ def load_task_store_scan(tasks_db_path: str) -> TaskStoreScan:
         row_ids=frozenset(row_ids),
         delivered_checks=delivered_checks,
         manifest_bindings=tuple(bindings),
-        prd_paths=prd_paths,
+        task_prds=task_prds,
     )
 
 
@@ -615,12 +626,15 @@ class UnboundLabel(NamedTuple):
 
 class StaleSignalBinding(NamedTuple):
     """A signal leaf whose locally bound task is missing from this store or
-    carries another ``prd_path`` (plans/dashboard-prd-lanes-prd.md §5.2).
+    names another PRD (plans/dashboard-prd-lanes-prd.md §5.2).
 
     ``reason`` says which: ``'task_missing'`` (no row for ``task_id`` in this
-    store, so ``task_prd`` is None) or ``'prd_mismatch'`` (the task's own
-    ``prd_path``, None when it has none, is not the sidecar's ``prd``).
-    ``manifest`` is repo-relative. ``_asdict()`` feeds the JSON writer.
+    store, so ``task_prd`` is None) or ``'prd_mismatch'`` (the task's own PRD
+    field does not name the sidecar's ``prd``). ``task_prd`` is that field as
+    ``dashboard/src/dashboard/data/prd_attribution.py::coalesce_prd`` reads it
+    (``prd_path``, else ``prd``, else ``prd_ref``, with any ``#`` or ``§``
+    suffix stripped), or None when the task names none. ``manifest`` is
+    repo-relative. ``_asdict()`` feeds the JSON writer.
     """
 
     manifest: str
@@ -644,24 +658,36 @@ def _locally_bound_signal_leaves(doc: CapabilityManifestDoc) -> list[tuple[str, 
     ]
 
 
+def _names_sidecar_prd(task_prd: str | None, sidecar_prd: str, project_root: str) -> bool:
+    """Whether *task_prd* and *sidecar_prd* key to the same PRD under
+    *project_root*, by ``dashboard/src/dashboard/data/prd_attribution.py::normalise_prd_key``.
+    A task naming no PRD, or one outside the root, names no sidecar's PRD."""
+    if task_prd is None:
+        return False
+    task_key = normalise_prd_key(task_prd, project_root)
+    return isinstance(task_key, PrdKey) and task_key == normalise_prd_key(
+        sidecar_prd, project_root)
+
+
 def _stale_signal_bindings(
     relpath: str, sidecar_prd: str, bound_leaves: list[tuple[str, int]],
-    scan: TaskStoreScan,
+    scan: TaskStoreScan, *, project_root: str,
 ) -> list[StaleSignalBinding]:
     """Every one of *bound_leaves* whose task is missing from *scan* or whose
-    ``prd_path`` is not *sidecar_prd*, in the order given.
+    PRD field (``TaskStoreScan.task_prds``) does not name *sidecar_prd* under
+    *project_root*, in the order given.
 
-    The task's PRD is its raw ``prd_path`` compared by exact string: ``prd``
-    and ``prd_ref`` are not read, and no ``#anchor`` or ``§section`` suffix is
-    stripped.
+    *project_root* is the tasks.db owner made absolute, never a separate
+    manifest root: an absolute PRD path in a task names the primary checkout,
+    which is the root the dashboard keys a PRD against.
     """
     rows: list[StaleSignalBinding] = []
     for label, task_id in bound_leaves:
         if task_id not in scan.row_ids:
             reason, task_prd = "task_missing", None
         else:
-            task_prd = scan.prd_paths.get(task_id)
-            if task_prd == sidecar_prd:
+            task_prd = scan.task_prds.get(task_id)
+            if _names_sidecar_prd(task_prd, sidecar_prd, project_root):
                 continue
             reason = "prd_mismatch"
         rows.append(StaleSignalBinding(
@@ -899,7 +925,9 @@ def audit_project(project_root: str, manifest_root: str | None = None) -> Projec
         signal_leaves_named += len(doc.signal_leaves or ())
         signal_leaves_checked += len(bound_signal_leaves)
         stale_signal_bindings.extend(
-            _stale_signal_bindings(relpath, doc.prd, bound_signal_leaves, scan))
+            _stale_signal_bindings(
+                relpath, doc.prd, bound_signal_leaves, scan,
+                project_root=os.path.abspath(root)))
         for task in doc.tasks:
             if task.external_task_id is not None:
                 # ANOTHER project's registry, so absent from THIS project's
@@ -1101,7 +1129,8 @@ _UNBOUND_CAVEAT = (
 _SIGNAL_BINDING_CAVEAT = (
     "  STALE SIGNAL BINDINGS (a row is a signal leaf, named in the sidecar's "
     "signal_leaves, whose locally bound task is missing from this store or "
-    "whose own prd_path is not this sidecar's prd. Unbound and "
+    "whose own PRD field (prd_path, else prd, else prd_ref, read as the "
+    "dashboard reads it) does not name this sidecar's prd. Unbound and "
     "external_task_id leaves are not checked. Fixing a row is a separate, "
     "reviewed edit: re-bind the block's task_id, set the task's prd_path, or "
     "drop the label from signal_leaves):"
