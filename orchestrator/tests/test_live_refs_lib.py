@@ -8,9 +8,15 @@ gate against the SHIPPED lib, never a copy:
 * ``TestReferenceDetection`` pins the verdicts against real helper processes:
   a cwd hit, an open-fd hit, an mmap hit, a miss, the ``_lane-1``/``_lane-10``
   name-prefix boundary and the batch subset.
+* ``TestMountNamespaceTranslation`` pins boundary row 19 of
+  ``plans/canonical-build-path-shared-cache-prd.md``: a process that names a
+  lane only through a bind-mount point in its own mount namespace holds it
+  live, and a foreign namespace whose root cannot be read adds nothing.
 * ``TestScanFootprint`` pins what a negative verdict may read.  The verdict
-  needs only ``/proc/<pid>/cwd``, ``/proc/<pid>/fd/*`` and ``/proc/<pid>/maps``,
-  so the only directories it may list are ``/proc`` and ``/proc/<pid>/fd``.  It
+  reads ``/proc/<pid>/cwd``, ``/proc/<pid>/fd/*``, ``/proc/<pid>/maps``,
+  ``/proc/<pid>/ns/mnt``, ``/proc/<pid>/mountinfo`` and paths under
+  ``/proc/<pid>/root``, and lists no directory but ``/proc`` and
+  ``/proc/<pid>/fd``.  It
   observes the scan's ``getdents64`` calls under strace: a structural property,
   so it carries no wall-clock bound to flake under host load.
 """
@@ -29,6 +35,7 @@ from pathlib import Path
 from typing import IO
 
 import pytest
+from shared.testing_mount_ns import Hold, namespaced_holder, unreadable_foreign_namespace_process
 
 # Reused from the sibling shipped-script contract, as test_lane_state_lib.py
 # does: the script dir is resolved from __file__, and the env drops the keys
@@ -258,6 +265,37 @@ class TestReferenceDetection:
 
         assert proc.returncode == 0, f'stderr={proc.stderr!r}'
         assert set(proc.stdout.splitlines()) == {str(referenced)}
+
+
+class TestMountNamespaceTranslation:
+    """References through a bind-mount point in another mount namespace count."""
+
+    @pytest.mark.parametrize('hold', [Hold.CWD, Hold.OPEN_FILE, Hold.MAPPING])
+    def test_a_hold_through_the_mount_point_is_live(self, tmp_path: Path, hold: Hold) -> None:
+        root = tmp_path.resolve()
+        lane = root / '_lane-1'
+        with namespaced_holder(lane, root / 'canon ws', hold):
+            assert _live_ref_present(lane) == 0
+
+    def test_the_batch_names_only_the_bound_lane_beside_an_unreadable_namespace(
+        self, tmp_path: Path,
+    ) -> None:
+        root = tmp_path.resolve()
+        bound, free = root / '_lane-a', root / '_lane-b'
+        free.mkdir()
+        elsewhere = root / 'elsewhere'
+        elsewhere.mkdir()
+        with (
+            namespaced_holder(bound, root / 'canon a', Hold.CWD),
+            unreadable_foreign_namespace_process(cwd=elsewhere),
+        ):
+            proc = _run_sourced(
+                f'live_referenced_paths {shlex.quote(str(bound))} {shlex.quote(str(free))}'
+            )
+
+            assert proc.returncode == 0, f'stderr={proc.stderr!r}'
+            assert set(proc.stdout.splitlines()) == {str(bound)}
+            assert _live_ref_present(free) == 1
 
 
 class TestScanFootprint:
