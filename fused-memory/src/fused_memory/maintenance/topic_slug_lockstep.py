@@ -128,6 +128,12 @@ async def rename_one(memory_service, rename: Rename, *, apply: bool) -> dict:
     loop, so an exception escaping here would discard everything the sweep had
     already learned; one backend hiccup must cost one report row instead.
 
+    An ``apply=True`` caller must already hold the store-mutation preflight
+    (``fused-memory/src/fused_memory/utils/store_mutation_preflight.py::assert_store_mutation_allowed``),
+    once per run.  It cannot be checked here: the per-record guard above would
+    swallow its refusal into one error row per record, as
+    ``fused-memory/scripts/normalize_topic_slugs.py::run`` explains.
+
     Args:
         memory_service: The injected ``MemoryService``.
         rename: The frozen plan row.
@@ -380,6 +386,9 @@ async def rename_group(
     re-running; see the module docstring's "Every slug moves all-or-nothing".
     A GATED group with no client is the same verdict as a refused gate —
     unable to move it is not permission to leave it behind.
+
+    An ``apply=True`` caller must already hold the store-mutation preflight,
+    once per run, for the reason :func:`rename_one` gives.
 
     Returns:
         A :class:`GroupOutcome`: the member rows, a gated group's gate row,
