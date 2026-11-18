@@ -2366,6 +2366,27 @@ class TestParseMetadataFailurePolicy:
             f'Expected no unknown_key warning for last_blocked_at; got: {offending}'
         )
 
+    @pytest.mark.parametrize(
+        ('key', 'value'),
+        [
+            ('merge_first_enqueued_at', 1751800000.25),
+            ('merge_phase_liveness', {'entered_at': '2026-11-15T00:00:00+00:00'}),
+        ],
+    )
+    def test_merge_lane_stamp_metadata_key_is_blessed(self, key, value):
+        """Merge-lane machine stamps are blessed rather than x_-renamed (task 5281).
+
+        Their census and rationale have one copy, the `_BLESSED_METADATA_KEYS`
+        comment in shared/src/shared/task_metadata.py.
+        """
+        model, warnings = parse_metadata({key: value}, direction='read')
+        offending = [w for w in warnings if w.code == 'unknown_key' and w.field == key]
+        assert offending == [], f'Expected no unknown_key warning for {key}; got: {offending}'
+        assert (model.model_extra or {})[key] == value
+
+        _, write_warnings = parse_metadata({key: value}, direction='write', enforce=True)
+        assert [w for w in write_warnings if w.field == key] == []
+
     def test_pending_since_metadata_keys_are_blessed(self):
         """The scheduler's pending-wait anchor must not census-warn (task 3816).
 

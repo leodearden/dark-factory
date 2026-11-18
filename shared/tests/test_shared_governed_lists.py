@@ -123,6 +123,8 @@ BLESSED_TASK_METADATA_KEYS = governed_exceptions(
     dispositions={
         'cancel_dispositions': Policy('inv12-task-metadata-blessed-keys'),
         'gate_escalated_preconditions': Policy('inv12-task-metadata-blessed-keys'),
+        'merge_first_enqueued_at': Policy('inv12-task-metadata-blessed-keys'),
+        'merge_phase_liveness': Policy('inv12-task-metadata-blessed-keys'),
         'predicate_recheck': Policy('inv12-task-metadata-blessed-keys'),
         'predicate_verdict': Policy('inv12-task-metadata-blessed-keys'),
         'pure_gate_from': Policy('inv12-task-metadata-blessed-keys'),

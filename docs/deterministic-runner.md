@@ -249,7 +249,10 @@ deploy is driven on the script's exit code alone:
 - `rc == 0`: hand off to `_writeback_deploy_success` (empty
   `new_state`, `pid=0` — the same helper the named-target path uses)
   unless `always_escalates=True`, in which case fall through to the
-  gate (act-then-ask) instead, since the script already ran.
+  gate (act-then-ask) instead, since the script already ran. The done
+  write records `done_provenance.kind='deterministic-deploy-unverified'`,
+  with no unit or timestamp evidence; the crash, human-resolution and
+  gate resumes keep that kind (`_deploy_done_kind`).
 - `rc != 0`, the default runner's own per-script timeout
   (`ScriptTimeout` — reported as which signal the teardown actually
   dispatched, carrying an exit code only when the script really produced

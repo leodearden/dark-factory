@@ -220,6 +220,12 @@ class TestRecordedEvidence:
         )
         assert dp.recorded_evidence() == {'kind': 'merged', 'commit': SHA}
 
+    def test_unverified_deploy_records_only_its_kind(self):
+        """No unit was observed, so the kind is the whole record (task 5281)."""
+        dp = DoneProvenance.parse_for_write({'kind': 'deterministic-deploy-unverified'})
+        assert dp.recorded_evidence() == {'kind': 'deterministic-deploy-unverified'}
+        assert 'deterministic-deploy-unverified' not in DoneProvenance.COMMIT_REQUIRED_KINDS
+
     def test_absent_fields_are_omitted(self):
         dp = DoneProvenance.parse_for_write({'kind': 'deterministic-deploy', 'unit': 'u.service'})
         assert dp.recorded_evidence() == {'kind': 'deterministic-deploy', 'unit': 'u.service'}
