@@ -30,7 +30,7 @@ from fused_memory.reconciliation.task_filter import (
 from reconciliation.consolidator_fixtures import make_consolidator
 
 PROJECT_ID = 'test_proj'
-PROJECT_ROOT = '/tmp/test_proj'
+SCOPE_ROOT = '/tmp/test_proj'
 STAGE1_PAYLOADS = ('stage1_legacy', 'stage1_assembled', 'stage1_remediation')
 ALL_PAYLOADS = (*STAGE1_PAYLOADS, 'stage2', 'stage3')
 
@@ -49,12 +49,12 @@ def _deps(project_id: str = PROJECT_ID) -> dict:
         'taskmaster': taskmaster,
         'journal': AsyncMock(),
         'config': ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test'),
-        'scope': ProjectScope(ProjectId(project_id), ProjectRoot(PROJECT_ROOT)),
+        'scope': ProjectScope(ProjectId(project_id), ProjectRoot(SCOPE_ROOT)),
     }
 
 
 def _stage1():
-    return make_consolidator(project_id=PROJECT_ID, project_root=PROJECT_ROOT)
+    return make_consolidator(project_id=PROJECT_ID, project_root=SCOPE_ROOT)
 
 
 def _stage2(project_id: str = PROJECT_ID):
