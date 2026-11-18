@@ -5056,9 +5056,11 @@ async def classify_and_merge(
 #    conflict only with an *unlanded* predecessor, and takes its normal
 #    sequential path later.
 #
-# 2. ONE WORKTREE.  Exactly one ``acquire_chain_build_lane`` per invocation;
-#    the merge loop reuses that lane via ``GitOps.merge_branch_into_worktree``.
-#    (``merge_to_main`` would provision a fresh worktree per item.)
+# 2. ONE WORKTREE.  Exactly one ``acquire_chain_build_lane`` per invocation
+#    (a warm ``_spec-`` lane for a local verify, an ephemeral ``_merge-*`` for
+#    a remote one); the merge loop reuses that lane via
+#    ``GitOps.merge_branch_into_worktree``.  (``merge_to_main`` would provision
+#    a fresh worktree per item.)
 #
 # 3. BASE.  Nothing is merged until the chain-build lane's HEAD is confirmed
 #    to be ``head_merge_commit``: the tip is what δ's ``_land_chain_prefix``
@@ -5118,19 +5120,23 @@ async def build_chain(
     one-worktree and base) this function exists to uphold.
 
     **Caller cost — γ must bound this.**  One call blocks on one lane
-    acquisition (``acquire_spec_lane``: ``git reset --hard``, ``git clean
-    -xfd``, a CoW seed) plus up to *depth* sequential real ``git merge``
-    subprocesses, plus one ``git diff`` per conflicted file on the conflict
-    arm — i.e. ~O(seconds) at ``chain_cap > 0``, with no internal deadline.
-    There is deliberately none here: an internal timeout would abandon a
-    half-built lane mid-``git merge``, and the honest bound belongs to the
-    policy layer.  So when γ (task 3185) wires this in, it must EITHER run
-    the build off the critical dispatch path (a background task whose result
-    is consumed on a later round) OR wrap the call in an
-    :func:`asyncio.timeout` — the ``except BaseException`` arm below already
-    releases the lane on cancellation, so a deadline is safe to impose from
-    outside.  Until then the cost is at least observable: every build that
-    reaches the merge loop logs ``elapsed_ms`` on its one-line summary.
+    acquisition (for a local verify a warm lane's ``git reset --hard``,
+    ``git clean -xfd`` and CoW seed; for a remote one a ``git worktree add``)
+    plus up to *depth* sequential real ``git merge`` subprocesses, plus one
+    ``git diff`` per conflicted file on the conflict arm — i.e. ~O(seconds)
+    at ``chain_cap > 0``, with no internal deadline.  There is deliberately
+    none here: an internal timeout would abandon a half-built lane
+    mid-``git merge``, and the honest bound belongs to the policy layer.  So
+    when γ (task 3185) wires this in, it must EITHER run the build off the
+    critical dispatch path (a background task whose result is consumed on a
+    later round) OR wrap the call in an :func:`asyncio.timeout`.  A deadline
+    is safe to impose from outside: a cancel during acquisition is given
+    back by git_ops.py::GitOps.acquire_spec_lane (warm lane) or
+    git_ops.py::GitOps._create_merge_worktree (ephemeral), and once the lane
+    is held the ``except BaseException`` arm below releases it.  Either way
+    one WARNING, ``build_chain: interrupted during <acquire|merge> phase``,
+    names the phase.  Every build that reaches the merge loop logs
+    ``elapsed_ms``, ``acquire_ms`` and ``merge_ms`` on its one-line summary.
 
     γ took the SECOND option (``_deep_chain_placement`` wraps this in
     ``asyncio.timeout(chain_build_timeout_secs)``), which BOUNDS the dispatch
@@ -11422,6 +11428,13 @@ class SpeculativeMergeWorker:
              intervenes between the bind and the use, so no concurrent dispatch
              can interleave and make the two reads differ.
 
+        *verify_is_local* is the dispatch's host-lease locality.  It picks the
+        lane the chain is built in (and its tip verified in): a warm ``_spec-``
+        lane for a local verify, a plain ephemeral for a remote one, whose host
+        never reads the local ``target/``.  :meth:`_dispatch_item` passes it for
+        both chain owners, the speculative slot-2 item and the head alone in
+        the frontier; the default keeps a direct caller on the local lane.
+
         Never mutates the lane buffers: :meth:`chain_snapshot` is a pure reader
         (it must never pop, transition, or resolve). The chain's candidates are
         RESERVED from the snapshot to the round's end instead (task 7720,
@@ -11516,7 +11529,8 @@ class SpeculativeMergeWorker:
         # plus <=28 s reset/clean, <=30 s lock wait, ~0.5 s per merge). The build
         # blocks _verifier_loop for its whole duration, so this is also the
         # worst-case stall on finalising a green head. A cancel during
-        # acquisition is task 7721's fix, not covered here.
+        # acquisition gives the lane back: see the cancellation paragraph of
+        # git_ops.py::GitOps.acquire_spec_lane.
         chain_build_timeout_secs = item.request.config.merge_deep.chain_build_timeout_secs
         _build_t0 = self._clock.monotonic()
         try:
@@ -21567,10 +21581,12 @@ class SpeculativeMergeWorker:
             # 2: _deep_chain_placement deliberately does not absorb an external
             # cancel), and that does NOT violate the invariant above.  A cancel
             # there lands INSIDE the build, before any ChainResult is returned, so
-            # no lane is ever in this frame's hands -- build_chain's own
-            # `except BaseException` arm is what returns it.  The obligation only
-            # begins once `chain` is bound, and from that point to the
-            # ensure_future there is still nothing that can raise.
+            # no lane is ever in this frame's hands.  During acquisition the
+            # acquirer gives the lane back (GitOps.acquire_spec_lane, or
+            # GitOps._create_merge_worktree for an ephemeral); during the merge
+            # loop build_chain's own `except BaseException` arm does.  The
+            # obligation only begins once `chain` is bound, and from that point
+            # to the ensure_future there is still nothing that can raise.
             chain = await self._deep_chain_placement(
                 item, frontier_depth=depth, verify_is_local=lease.is_local,
             )
