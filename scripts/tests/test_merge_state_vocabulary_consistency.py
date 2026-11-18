@@ -4,9 +4,10 @@ Task 4829 (PRD ``plans/merge-status-durable-non-landed-prd.md``, decision D3,
 behaviour B9). ``shared/src/shared/merge_state.py`` is the single normative copy
 of the two merge wire vocabularies — ``MergeState`` (the POLL vocabulary of
 ``merge_status`` / ``merge_cancel``'s ``state``) and ``MergeSubmitStatus`` (the
-SUBMIT vocabulary of ``merge_request``'s ``status``). Several committed
-artifacts nonetheless restate parts of those vocabularies inline, and none of
-them auto-extends when a member lands.
+SUBMIT vocabulary of ``merge_request``'s ``status``) — and of ``MergeReason``,
+the ``reason`` paired with every epistemic ``state`` (task 6912). Several
+committed artifacts nonetheless restate parts of those vocabularies inline, and
+none of them auto-extends when a member lands.
 
 MEASURED, not predicted. Every restatement below was read off this tree before
 this guard existed:
@@ -25,7 +26,7 @@ this guard existed:
     both named a submit status ``failed`` that appears NOWHERE in the server
     (the real value is ``error``), while omitting six real ones.
 
-This module derives both vocabularies ONCE from the normative module and
+This module derives every vocabulary ONCE from the normative module and
 cross-checks every restatement against it. It never stores its own snapshot of
 the members: a hardcoded list here would be one more lock-step copy, stale on
 the next member exactly like the prose sites were.
@@ -113,13 +114,15 @@ _REQUIRED_PARTITIONS = (
     "EPISTEMIC_STATES",
     "POLL_STOP_STATES",
     "CANCEL_STATES",
+    "MERGE_REASONS",
     "SUBMIT_TERMINAL",
     "SUBMIT_NON_TERMINAL",
 )
 
-# The two vocabularies hold 22 distinct wire values today (13 poll + 14 submit,
-# five spellings shared). A union this small would mean the module stopped
-# parsing, not that the vocabularies shrank — merge states are only ever added.
+# The three vocabularies hold 28 distinct wire values today (13 poll + 14 submit,
+# five spellings shared, + 6 reasons). A union this small would mean the module
+# stopped parsing, not that the vocabularies shrank — merge states are only ever
+# added.
 # The floor is a NON-VACUITY guard on every comparison downstream, kept well
 # below the live count so a deliberate retirement does not go red spuriously.
 _MINIMUM_VOCABULARY_SIZE = 10
@@ -151,7 +154,7 @@ def load_vocabulary(*, path: Path = _VOCABULARY_MODULE) -> dict[str, frozenset[s
     """
     assert path.is_file(), (
         f"the merge-state vocabulary module {path} does not exist (task 4829). This "
-        f"guard derives both wire vocabularies from it on every run, so without it "
+        f"guard derives every vocabulary from it on every run, so without it "
         f"every span comparison below would compare an empty set against an empty "
         f"set and PASS. Either the module moved (update `_VOCABULARY_MODULE`) or "
         f"the worktree is incomplete."
@@ -194,19 +197,21 @@ def load_vocabulary(*, path: Path = _VOCABULARY_MODULE) -> dict[str, frozenset[s
 
 
 def vocabulary_values(partitions: dict[str, frozenset[str]]) -> frozenset[str]:
-    """Every wire value across BOTH vocabularies — the token filter for spans.
+    """Every wire value across all three vocabularies — the token filter for spans.
 
-    The union spans ``MergeState`` AND ``MergeSubmitStatus`` deliberately. Filtering
-    a span by its OWN partition instead would drop an intruder from the sibling
-    vocabulary before the comparison ever ran: a POLL span claiming ``merge_status``
-    returns ``wip_halted`` would read green, which is one of the three defects this
-    task exists to correct.
+    The union spans ``MergeState``, ``MergeReason`` AND ``MergeSubmitStatus``
+    deliberately. Filtering a span by its OWN partition instead would drop an
+    intruder from a sibling vocabulary before the comparison ever ran: a POLL span
+    claiming ``merge_status`` returns ``wip_halted`` would read green, which is one
+    of the three defects task 4829 exists to correct. The same holds for reasons —
+    a reason pasted into a state list, or a state into the reason list, must
+    survive the filter to be reported as EXTRA.
     """
     values = frozenset().union(*partitions.values()) if partitions else frozenset()
     assert len(values) >= _MINIMUM_VOCABULARY_SIZE, (
         f"the loaded vocabulary holds only {len(values)} distinct values "
         f"{sorted(values)!r}, below the non-vacuity floor of "
-        f"{_MINIMUM_VOCABULARY_SIZE} (task 4829). Both wire vocabularies are "
+        f"{_MINIMUM_VOCABULARY_SIZE} (task 4829). All three vocabularies are "
         f"expected; a union this small means the module was parsed but not read."
     )
     return values
@@ -405,7 +410,7 @@ def extract_values(body: str, vocabulary_values: frozenset[str], *, source: str 
 
     Membership filtering is what lets a span carry ordinary English (``— stop
     polling here``) without every noun becoming a phantom member. *vocabulary_values*
-    must be the union of BOTH vocabularies — see ``vocabulary_values()``.
+    must be the union of every vocabulary — see ``vocabulary_values()``.
 
     Raises rather than returning an empty set: an empty set does compare unequal to
     every partition, so the drift would be caught — but reported as "the list lost
@@ -540,15 +545,10 @@ _UNPINNED_RULE_SITES = {
     ),
 }
 
-# Four DISTINCT discriminating tokens is an enumeration, not a discussion.
-#
-# MEASURED on this tree over `git ls-files -- 'skills/*.md'` (42 files):
-# merge-queue 8, escalation-watcher 7, unblock-low-risk 6, orchestrate 6 (the rule
-# site above), unblock 5, review-briefing 2, everything else <= 2. So the threshold
-# sits one token below the lowest registered site and two above the highest
-# unregistered one. (The plan for task 4829 predicted 6/5/5/5 and "<= 2 everywhere
-# else"; the re-measured numbers above are what this tree actually shows, and the
-# sixth site is why `_UNPINNED_RULE_SITES` exists — filed as esc-4829-3.)
+# Four DISTINCT discriminating tokens — state, submit and reason tokens alike — is
+# an enumeration, not a discussion. Per-file counts are not recorded here: they
+# move with every runbook edit, and a stale count reads as a margin that is not
+# there. `test_registry_is_complete` reports each offender's count when it fires.
 _ENUMERATION_THRESHOLD = 4
 
 # BOUNDARY, deliberate and worth stating so a reader does not read it as an
@@ -1197,7 +1197,7 @@ def test_extract_values_keeps_only_vocabulary_members() -> None:
 def test_extract_values_keeps_a_member_of_the_OTHER_vocabulary() -> None:
     """A SUBMIT-only value inside a POLL span SURVIVES extraction.
 
-    Load-bearing, and the reason the filter is the union of both vocabularies
+    Load-bearing, and the reason the filter is the union of every vocabulary
     rather than the span's own partition: filtering by partition would drop the
     intruder before the comparison, and a span claiming `merge_status` returns
     `wip_halted` would read green. Surviving extraction is what makes it show up
