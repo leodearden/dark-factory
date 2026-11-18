@@ -3943,6 +3943,23 @@ _BARE_SHELL_ENTRYPOINTS: tuple[_BareShellEntrypoint, ...] = (
         ),
     ),
     _BareShellEntrypoint(
+        name='session_windows.py (tier-1: bare shell, NO PYTHONPATH)',
+        path=_SR_PKG_ROOT / 'orchestrator' / 'session_windows.py',
+        pythonpath=(),
+        shape=_EntrypointShape.SCRIPT,
+        argv=(),
+        probe='from orchestrator import stop_instruction',
+        callers=(
+            'session_reaper.py imports this module at module scope as a bare '
+            'sibling when skills/spawn/spawn-claude.sh and the SKILL.md verb lines '
+            'run session_registry.py by absolute path with no venv, no install and '
+            'no PYTHONPATH, so a non-stdlib import here breaks the reap verb and '
+            'every verb that loads the reaper; and session_hooks.py imports '
+            'orchestrator.session_windows for the SessionStart display, so it also '
+            'breaks every hook.'
+        ),
+    ),
+    _BareShellEntrypoint(
         name='session_hooks.py (tier-2: bare shell + PYTHONPATH)',
         path=_SR_PKG_ROOT / 'orchestrator' / 'session_hooks.py',
         # A THIRD distinct shape: script-by-absolute-path WITH PYTHONPATH. Not
@@ -4076,6 +4093,8 @@ _MUST_BE_REJECTED: tuple[tuple[str, str], ...] = (
     ('session_identity.py', 'from orchestrator import stop_instruction'),
     ('session_records.py', 'import pydantic'),
     ('session_records.py', 'from orchestrator import stop_instruction'),
+    ('session_windows.py', 'import pydantic'),
+    ('session_windows.py', 'from orchestrator import stop_instruction'),
 )
 
 
@@ -4593,8 +4612,9 @@ class TestStdlibOnlySelfContainment:
     def test_the_extracted_modules_import_only_downward(self):
         """Each module extracted from session_registry imports only below it, never session_registry.
 
-        fleet_files <- decision_registry <- decision_cli; session_identity is a
-        leaf; and fleet_files, session_identity <- session_records.
+        fleet_files <- decision_registry <- decision_cli; session_identity and
+        session_windows are leaves; and fleet_files, session_identity <-
+        session_records.
 
         Under tier-1 session_registry is ``__main__``, so a module below it
         that imported it back would silently load a second copy rather than
@@ -4632,6 +4652,7 @@ class TestStdlibOnlySelfContainment:
             'decision_cli': {'decision_registry'},
             'session_identity': set(),
             'session_records': {'fleet_files', 'session_identity'},
+            'session_windows': set(),
         }
 
         assert {module: sibling_imports(module) for module in expected} == expected
