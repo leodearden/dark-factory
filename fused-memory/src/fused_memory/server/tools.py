@@ -7986,26 +7986,39 @@ def create_mcp_server(
     @mcp.tool()
     @mcp_tool_errors()
     async def get_curator_state() -> dict[str, Any]:
-        """Read-only snapshot of the curator UsageGate's current state.
+        """Read-only snapshot of the curator's operational state: its UsageGate
+        and the load health of its guard registries.
 
-        Returns ``{'paused', 'paused_reason', 'soonest_open_at', 'account_count'}``.
+        Returns ``{'paused', 'paused_reason', 'soonest_open_at', 'account_count',
+        'registries'}``.
         ``paused_reason`` is None when the gate is healthy or unconfigured.
         ``soonest_open_at`` is an ISO 8601 string or None.
         When no gate is wired (curator disabled), returns safe zero-defaults.
 
+        ``registries`` lists each curator guard registry's load state
+        (unconfigured / not_loaded / loaded / failed) with path, entry_count,
+        error and failures, so a guard that failed to load is distinguishable
+        from one that loaded empty. It is empty when no curator has been
+        constructed yet.
+
         The dashboard polls this to surface WHY the curator is paused alongside
         the existing ``capped_now`` indicator.
 
-        Note: the four values are read from the live gate without a lock. During
+        Note: the four gate values are read from the live gate without a lock. During
         a state transition (e.g. ``_on_resume()`` flipping paused → unpaused) the
         snapshot may be momentarily inconsistent; refresh on the next poll.
         """
+        registries = (
+            [h.to_wire() for h in task_interceptor.curator_registry_health()]
+            if task_interceptor is not None else []
+        )
         if curator_usage_gate is None:
             return {
                 'paused': False,
                 'paused_reason': None,
                 'soonest_open_at': None,
                 'account_count': 0,
+                'registries': registries,
             }
         gate = curator_usage_gate
         paused = gate.is_paused
@@ -8017,6 +8030,7 @@ def create_mcp_server(
             'paused_reason': paused_reason,
             'soonest_open_at': soonest_open_at,
             'account_count': gate.account_count,
+            'registries': registries,
         }
 
     @mcp.tool()

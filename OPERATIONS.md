@@ -1284,6 +1284,34 @@ That latency is faster than any real model call.
 Incident, back-test and residual risks:
 [`plans/curator-dedup-outage-2026-08-15-rca.md`](plans/curator-dedup-outage-2026-08-15-rca.md).
 
+### Is a curator guard registry loaded?
+
+The curator's three pre-LLM guards (the cancelled-premise `blocklist`, the
+`recon-premise` registry and the `operational-ask` registry) each read a YAML
+list named by a `curator.*_path` setting. `get_curator_state`'s `registries`
+list gives each one's `state`, with `path`, `entry_count`, `error` and
+`failures`:
+
+- `failed` means that guard fails open: its curations look exactly like a
+  healthy curator with an empty registry. While an orchestrator is running
+  for the project, the curator's startup self-check also files a
+  `curator_registry_load_failed` escalation from `fused-memory/task-curator`,
+  one pending record per project and registry label that folds across
+  restarts
+  (`fused-memory/src/fused_memory/middleware/curator_escalator.py::CuratorEscalator.report_registry_load_failed`).
+  With no orchestrator running it only logs an ERROR, so a missing
+  escalation does not prove the registries loaded.
+- A fix to the file at the reported `path` is picked up, with no restart, by
+  the first curation at least `curator.registry_load_retry_seconds`
+  (default 300) after the failed attempt. A change to the configured path
+  itself needs a fused-memory restart.
+- `loaded` with `entry_count: 0` is a registry that loaded empty, not a
+  failure. `unconfigured` means its path is unset, which disables that
+  guard on purpose. `not_loaded` means it has not been used yet.
+
+The load contract lives in
+`fused-memory/src/fused_memory/middleware/curator_registry.py::CuratorRegistry`.
+
 ### Which resolutions are absorbing refiles?
 
 A resolved or dismissed escalation gains one `refiles_suppressed` each time its

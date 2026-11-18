@@ -2644,6 +2644,16 @@ class CuratorConfig(BaseModel):
             "PURE-GATE instead of the TDD architect. None disables the gate."
         ),
     )
+    registry_load_retry_seconds: float = Field(
+        default=300.0,
+        ge=0,
+        description=(
+            "A guard registry (blocklist, recon-premise, operational-ask) that "
+            "failed to load is retried on the first curation at least this "
+            "many seconds later; 0 retries on every curation. A registry that "
+            "loaded is never reloaded."
+        ),
+    )
 
     @model_validator(mode='after')
     def _validate_deferral_backoff_bounds(self) -> 'CuratorConfig':

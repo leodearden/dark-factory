@@ -53,6 +53,7 @@ from fused_memory.mcp_tools.scheduler_state import (
 from fused_memory.middleware.candidate_key import compute_candidate_key, normalize_title
 from fused_memory.middleware.curation_deferral import DeferReason
 from fused_memory.middleware.curator_escalator import CuratorEscalator
+from fused_memory.middleware.curator_registry import RegistryHealth, RegistryState
 from fused_memory.middleware.curator_types import (
     POOL_SOURCES,
     CandidateTask,
@@ -83,6 +84,7 @@ from fused_memory.middleware.task_curator import (
     _trim_pool,
     flatten_task_tree,
 )
+from fused_memory.utils.safe_yaml import YamlListFileError
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
@@ -1497,6 +1499,122 @@ class TestStartupSelfCheck:
     ):
         monkeypatch.setenv('CLAUDE_BINARY', str(tmp_path / 'no-such-claude'))
         curator = TaskCurator(config=_make_config(), taskmaster=None)
+        assert await curator.startup_self_check(project_id='p', project_root='/x') is False
+
+    @staticmethod
+    def _resolvable_binary(tmp_path, monkeypatch) -> None:
+        binary = tmp_path / 'claude'
+        binary.write_text('#!/bin/sh\nexit 0\n')
+        binary.chmod(0o755)
+        monkeypatch.setenv('CLAUDE_BINARY', str(binary))
+
+    @staticmethod
+    def _registry_config(
+        *,
+        blocklist: Path | None = None,
+        premise: Path | None = None,
+        operational: Path | None = None,
+    ) -> FusedMemoryConfig:
+        cfg = FusedMemoryConfig()
+        cfg.curator = CuratorConfig(
+            cancelled_premise_blocklist_path=None if blocklist is None else str(blocklist),
+            recon_code_fix_premise_registry_path=None if premise is None else str(premise),
+            operational_ask_registry_path=None if operational is None else str(operational),
+        )
+        return cfg
+
+    @staticmethod
+    def _registry_escalator() -> AsyncMock:
+        escalator = AsyncMock()
+        escalator.report_backend_binary_unresolvable = AsyncMock(return_value=None)
+        escalator.report_registry_load_failed = AsyncMock(return_value=None)
+        return escalator
+
+    @pytest.mark.asyncio
+    async def test_failed_registry_load_is_reported_and_escalated(
+        self, tmp_path, monkeypatch, caplog,
+    ):
+        self._resolvable_binary(tmp_path, monkeypatch)
+        escalator = self._registry_escalator()
+        curator = TaskCurator(
+            config=self._registry_config(blocklist=tmp_path / 'missing.yaml'),
+            taskmaster=None, cwd=tmp_path, escalator=escalator,
+        )
+
+        with caplog.at_level(logging.ERROR):
+            ok = await curator.startup_self_check(project_id='p', project_root='/x')
+
+        assert ok is False
+        escalator.report_backend_binary_unresolvable.assert_not_awaited()
+        escalator.report_registry_load_failed.assert_awaited_once()
+        kwargs = escalator.report_registry_load_failed.await_args.kwargs
+        assert kwargs['project_id'] == 'p'
+        assert kwargs['project_root'] == '/x'
+        assert kwargs['health'].label == 'blocklist'
+        assert kwargs['health'].state is RegistryState.FAILED
+        assert any(
+            'blocklist' in r.getMessage()
+            for r in caplog.records
+            if r.levelno >= logging.ERROR
+        )
+
+    @pytest.mark.asyncio
+    async def test_valid_registries_pass_and_are_warmed(self, tmp_path, monkeypatch):
+        self._resolvable_binary(tmp_path, monkeypatch)
+        escalator = self._registry_escalator()
+        config = self._registry_config(
+            blocklist=_make_blocklist_yaml(tmp_path, title_subs=['x'], desc_subs=['y']),
+            premise=_make_premise_registry_yaml(
+                tmp_path, title_subs=['x'], desc_subs=['y'], source_assertions=[],
+            ),
+            operational=_make_operational_registry_yaml(
+                tmp_path, title_subs=['x'], desc_subs=['y'],
+            ),
+        )
+        curator = TaskCurator(
+            config=config, taskmaster=None, cwd=tmp_path, escalator=escalator,
+        )
+
+        ok = await curator.startup_self_check(project_id='p', project_root='/x')
+
+        assert ok is True
+        escalator.report_registry_load_failed.assert_not_awaited()
+        assert [h.state for h in curator.registry_health()] == [RegistryState.LOADED] * 3
+
+    @pytest.mark.asyncio
+    async def test_each_failed_registry_is_escalated(self, tmp_path, monkeypatch):
+        self._resolvable_binary(tmp_path, monkeypatch)
+        escalator = self._registry_escalator()
+        config = self._registry_config(
+            blocklist=tmp_path / 'missing-blocklist.yaml',
+            premise=_make_premise_registry_yaml(
+                tmp_path, title_subs=['x'], desc_subs=['y'], source_assertions=[],
+            ),
+            operational=tmp_path / 'missing-operational.yaml',
+        )
+        curator = TaskCurator(
+            config=config, taskmaster=None, cwd=tmp_path, escalator=escalator,
+        )
+
+        ok = await curator.startup_self_check(project_id='p', project_root='/x')
+
+        assert ok is False
+        labels = [
+            call.kwargs['health'].label
+            for call in escalator.report_registry_load_failed.await_args_list
+        ]
+        assert labels == ['blocklist', 'operational-ask']
+
+    @pytest.mark.asyncio
+    async def test_failed_registry_without_escalator_returns_false(
+        self, tmp_path, monkeypatch,
+    ):
+        self._resolvable_binary(tmp_path, monkeypatch)
+        curator = TaskCurator(
+            config=self._registry_config(blocklist=tmp_path / 'missing.yaml'),
+            taskmaster=None, cwd=tmp_path,
+        )
+
         assert await curator.startup_self_check(project_id='p', project_root='/x') is False
 
 
@@ -5773,49 +5891,43 @@ class TestCancelledPremiseBlocklistLoader:
         assert e.title_substrings == ["search-then-delete", "fix c"]
         assert e.description_substrings == ["fixc_flags_deleted_not_found", "stage1_flag_marker"]
 
-    def test_load_missing_path_returns_empty_and_warns(self, tmp_path, caplog):
-        """(b) Missing file returns [] and emits exactly one WARNING."""
+    def test_load_missing_path_raises(self, tmp_path):
+        """(b) A missing file raises YamlListFileError naming the path."""
         from fused_memory.middleware.cancelled_premise_blocklist import load_blocklist
 
         missing = tmp_path / "does_not_exist.yaml"
-        with caplog.at_level("WARNING"):
-            entries = load_blocklist(missing)
+        with pytest.raises(YamlListFileError) as excinfo:
+            load_blocklist(missing)
 
-        assert entries == []
-        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
-        assert len(warnings) == 1
+        assert excinfo.value.path == missing
+        assert str(excinfo.value) == f"file not found: {missing}"
 
-    def test_load_malformed_yaml_returns_empty_and_warns(self, tmp_path, caplog):
-        """(c) Malformed YAML returns [] and emits exactly one WARNING."""
+    def test_load_malformed_yaml_raises(self, tmp_path):
+        """(c) Malformed YAML raises YamlListFileError."""
         from fused_memory.middleware.cancelled_premise_blocklist import load_blocklist
 
         bad_yaml = tmp_path / "bad.yaml"
         bad_yaml.write_text("key: [unclosed bracket\n: invalid\n", encoding="utf-8")
 
-        with caplog.at_level("WARNING"):
-            entries = load_blocklist(bad_yaml)
+        with pytest.raises(YamlListFileError) as excinfo:
+            load_blocklist(bad_yaml)
 
-        assert entries == []
-        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
-        assert len(warnings) == 1
+        assert excinfo.value.path == bad_yaml
+        assert "YAML parse error" in str(excinfo.value)
 
-    def test_load_undecodable_encoding_returns_empty_and_warns(self, tmp_path, caplog):
-        """(c2) File with bytes that are not valid UTF-8 returns [] and emits
-        exactly one WARNING, on this module's own logger.
-        """
+    def test_load_undecodable_encoding_raises(self, tmp_path):
+        """(c2) A file whose bytes are not valid UTF-8 raises YamlListFileError."""
         from fused_memory.middleware.cancelled_premise_blocklist import load_blocklist
 
         bad_encoding = tmp_path / "bad_encoding.yaml"
         bad_encoding.write_bytes(b"\xff\xfe- name: x\x00")
 
-        with caplog.at_level("WARNING"):
-            entries = load_blocklist(bad_encoding)
+        with pytest.raises(YamlListFileError) as excinfo:
+            load_blocklist(bad_encoding)
 
-        assert entries == []
-        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
-        assert len(warnings) == 1
-        assert str(bad_encoding) in warnings[0].getMessage()
-        assert warnings[0].name == "fused_memory.middleware.cancelled_premise_blocklist"
+        assert excinfo.value.path == bad_encoding
+        assert str(bad_encoding) in str(excinfo.value)
+        assert "UTF-8" in str(excinfo.value)
 
     def test_load_entry_missing_required_field_skips_and_warns(self, tmp_path, caplog):
         """(d) Entry missing title_substrings is skipped with WARNING; well-formed entries returned."""
@@ -6152,9 +6264,13 @@ def _make_blocklist_yaml(tmp_path, title_subs, desc_subs, name="test_entry"):
     return p
 
 
-def _make_config_with_blocklist(blocklist_path_str: str) -> FusedMemoryConfig:
+def _make_config_with_blocklist(
+    blocklist_path_str: str, *, retry_seconds: float | None = None,
+) -> FusedMemoryConfig:
     cfg = FusedMemoryConfig()
     cfg.curator = CuratorConfig(cancelled_premise_blocklist_path=blocklist_path_str)
+    if retry_seconds is not None:
+        cfg.curator.registry_load_retry_seconds = retry_seconds
     return cfg
 
 
@@ -6349,6 +6465,14 @@ def _make_create_mocks():
     return fake_exact_match, fake_corpus, create_result
 
 
+def _blocklist_warnings(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    """Every WARNING naming the blocklist, whichever module logged it."""
+    return [
+        r for r in caplog.records
+        if r.levelno == logging.WARNING and "blocklist" in r.getMessage()
+    ]
+
+
 @pytest.mark.asyncio
 class TestCuratorBlocklistDisabledOrMissing:
     """Blocklist degradation: misconfigured or absent blocklist must not block task creation."""
@@ -6366,19 +6490,15 @@ class TestCuratorBlocklistDisabledOrMissing:
             config=config, taskmaster=None,
             invoke=AsyncMock(return_value=create_result),
         )
-        with caplog.at_level(logging.WARNING, logger="fused_memory.middleware.cancelled_premise_blocklist"), \
+        with caplog.at_level(logging.WARNING), \
              patch.object(curator, "_pre_llm_exact_match", side_effect=fake_exact_match), \
              patch.object(curator, "_build_corpus", side_effect=fake_corpus):
             decision = await curator.curate(candidate, project_id="p", project_root="/x")
 
         assert decision is not None
         assert decision.action == "create"
-        # No WARNING from the blocklist module (path=None is a deliberate opt-out)
-        blocklist_warns = [
-            r for r in caplog.records
-            if r.name == "fused_memory.middleware.cancelled_premise_blocklist"
-            and r.levelno == logging.WARNING
-        ]
+        # No blocklist WARNING (path=None is a deliberate opt-out)
+        blocklist_warns = _blocklist_warnings(caplog)
         assert len(blocklist_warns) == 0, f"Expected no blocklist warnings, got: {blocklist_warns}"
 
     async def test_nonexistent_path_one_warning_then_silent(self, tmp_path, caplog):
@@ -6396,7 +6516,7 @@ class TestCuratorBlocklistDisabledOrMissing:
             config=config, taskmaster=None,
             invoke=AsyncMock(return_value=create_result),
         )
-        with caplog.at_level(logging.WARNING, logger="fused_memory.middleware.cancelled_premise_blocklist"), \
+        with caplog.at_level(logging.WARNING), \
              patch.object(curator, "_pre_llm_exact_match", side_effect=fake_exact_match), \
              patch.object(curator, "_build_corpus", side_effect=fake_corpus):
             decision1 = await curator.curate(candidate, project_id="p", project_root="/x")
@@ -6406,12 +6526,8 @@ class TestCuratorBlocklistDisabledOrMissing:
         assert decision1.action == "create"
         assert decision2 is not None
 
-        # Exactly one WARNING from the blocklist module (not repeated on second call)
-        blocklist_warns = [
-            r for r in caplog.records
-            if r.name == "fused_memory.middleware.cancelled_premise_blocklist"
-            and r.levelno == logging.WARNING
-        ]
+        # Exactly one blocklist WARNING (not repeated on second call)
+        blocklist_warns = _blocklist_warnings(caplog)
         assert len(blocklist_warns) == 1, (
             f"Expected exactly 1 blocklist WARNING on first call only, got {len(blocklist_warns)}"
         )
@@ -6433,7 +6549,7 @@ class TestCuratorBlocklistDisabledOrMissing:
             config=config, taskmaster=None,
             invoke=AsyncMock(return_value=create_result),
         )
-        with caplog.at_level(logging.WARNING, logger="fused_memory.middleware.cancelled_premise_blocklist"), \
+        with caplog.at_level(logging.WARNING), \
              patch.object(curator, "_pre_llm_exact_match", side_effect=fake_exact_match), \
              patch.object(curator, "_build_corpus", side_effect=fake_corpus):
             decision1 = await curator.curate(candidate, project_id="p", project_root="/x")
@@ -6443,12 +6559,8 @@ class TestCuratorBlocklistDisabledOrMissing:
         assert decision1.action == "create"
         assert decision2 is not None
 
-        # Exactly one WARNING from the blocklist module (not repeated)
-        blocklist_warns = [
-            r for r in caplog.records
-            if r.name == "fused_memory.middleware.cancelled_premise_blocklist"
-            and r.levelno == logging.WARNING
-        ]
+        # Exactly one blocklist WARNING (not repeated)
+        blocklist_warns = _blocklist_warnings(caplog)
         assert len(blocklist_warns) == 1, (
             f"Expected exactly 1 blocklist WARNING, got {len(blocklist_warns)}"
         )
@@ -6472,7 +6584,7 @@ class TestCuratorBlocklistDisabledOrMissing:
             config=config, taskmaster=None,
             invoke=AsyncMock(return_value=create_result),
         )
-        with caplog.at_level(logging.WARNING, logger="fused_memory.middleware.cancelled_premise_blocklist"), \
+        with caplog.at_level(logging.WARNING), \
              patch.object(curator, "_pre_llm_exact_match", side_effect=fake_exact_match), \
              patch.object(curator, "_build_corpus", side_effect=fake_corpus):
             decision = await curator.curate(candidate, project_id="p", project_root="/x")
@@ -6480,106 +6592,103 @@ class TestCuratorBlocklistDisabledOrMissing:
         assert decision is not None
         assert decision.action == "create"
         # No WARNING (empty file is a valid config — not a misconfiguration)
-        blocklist_warns = [
-            r for r in caplog.records
-            if r.name == "fused_memory.middleware.cancelled_premise_blocklist"
-            and r.levelno == logging.WARNING
-        ]
+        blocklist_warns = _blocklist_warnings(caplog)
         assert len(blocklist_warns) == 0, f"Expected no blocklist warnings for empty YAML, got: {blocklist_warns}"
 
 
+def _registry_health(curator: TaskCurator, label: str) -> RegistryHealth:
+    [health] = [h for h in curator.registry_health() if h.label == label]
+    return health
+
+
+def _fail_open_warnings(
+    caplog: pytest.LogCaptureFixture, label: str,
+) -> list[logging.LogRecord]:
+    return [
+        r for r in caplog.records
+        if r.levelno >= logging.WARNING
+        and "failing open" in r.getMessage()
+        and label in r.getMessage()
+    ]
+
+
+def _fixc_blocklist_candidate() -> CandidateTask:
+    return CandidateTask(
+        title="Convert FIX C relay-flag deletion: search-then-delete",
+        description="Metric fixc_flags_deleted_not_found is not tracked.",
+    )
+
+
 # ──────────────────────────────────────────────────────────────────────────────
-# task-5007 RED: TestBlocklistLazyLoadRunsOffEventLoop
+# task-5007 RED: TestBlocklistRegistryWiring
 # ──────────────────────────────────────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
-class TestBlocklistLazyLoadRunsOffEventLoop:
-    """Site-specific coverage for _maybe_blocklist_drop's lazy registry load:
-    fail-open behaviour on a loader raise, and the relative-path-without-cwd
-    warning. Both pin the "blocklist" label / cancelled_premise_blocklist_path
-    config-key wiring that is unique to this call site.
+class TestBlocklistRegistryWiring:
+    """_maybe_blocklist_drop is wired to the "blocklist" registry read from
+    cancelled_premise_blocklist_path: a failed load fails open and is retried,
+    and a relative path without cwd warns naming that config key.
 
-    The off-loop thread-identity and concurrent-first-call properties are
-    generic _LazyRegistry.entries behaviour and are pinned once, canonically,
-    by TestPremiseGuardRunsOffEventLoop (task 4201) — duplicating them here
-    would assert the same ~40 lines of _LazyRegistry.entries a third time
-    over (docs/code-quality.md heuristic 11, SPOT).
+    The generic load contract (off-loop, concurrent first calls,
+    cancellation, backoff) is pinned once, canonically, by
+    tests/test_curator_registry.py (docs/code-quality.md heuristic 11, SPOT).
     """
 
-    async def test_blocklist_load_error_fails_open_and_is_attempted_once(
-        self, tmp_path, caplog,
-    ):
-        """RED: a blocklist load that RAISES must fail OPEN, not escape, and
-        must not latch into a permanent failure.
+    async def test_blocklist_failed_load_is_retried(self, tmp_path, caplog):
+        """A missing blocklist fails open with one WARNING and reports FAILED;
+        once the file appears, the next call loads it and refuses."""
+        config = _make_config_with_blocklist(
+            str(tmp_path / "blocklist.yaml"), retry_seconds=0,
+        )
+        curator = TaskCurator(config=config, taskmaster=None)
+        candidate = _fixc_blocklist_candidate()
 
-        Pins the invariant _LazyRegistry.entries enforces: a loader raise —
-        including one originating in asyncio.to_thread itself, not just one
-        load_blocklist's own except clauses catch — must be swallowed into a
-        fail-open None, must log exactly one WARNING naming this guard's
-        "blocklist" label, and must still latch the one-shot contract so no
-        retry storm follows a failed load.
+        with caplog.at_level(logging.WARNING):
+            first = await curator._maybe_blocklist_drop(candidate, candidate.payload_hash())
 
-        Injects the raise directly via side_effect (a counting wrapper that
-        raises) rather than a non-UTF-8 file — this targets
-        asyncio.to_thread's own raise path, which no loader-internal except
-        can ever cover, and stays valid regardless of what exception types
-        load_blocklist itself later learns to catch (see the task-4483
-        collision-risk note in plan.json).
-        """
-        blocklist = _make_blocklist_yaml(
+        assert first is None
+        assert len(_fail_open_warnings(caplog, "blocklist")) == 1
+        assert _registry_health(curator, "blocklist").state is RegistryState.FAILED
+
+        _make_blocklist_yaml(
             tmp_path,
             title_subs=["search-then-delete", "fix c"],
             desc_subs=["fixc_flags_deleted_not_found"],
         )
-        config = _make_config_with_blocklist(str(blocklist))
-        curator = TaskCurator(config=config, taskmaster=None)
+        second = await curator._maybe_blocklist_drop(candidate, candidate.payload_hash())
 
-        candidate = CandidateTask(
-            title="Convert FIX C relay-flag deletion: search-then-delete",
-            description="Metric fixc_flags_deleted_not_found is not tracked.",
+        assert second is not None
+        assert second.action == "refuse"
+        health = _registry_health(curator, "blocklist")
+        assert health.state is RegistryState.LOADED
+        assert health.entry_count == 1
+
+    async def test_blocklist_failed_load_is_not_reread_inside_the_default_backoff(
+        self, tmp_path,
+    ):
+        """The default retry interval bounds re-reads: a file that appears
+        right after a failed load is not picked up on the very next call."""
+        config = _make_config_with_blocklist(str(tmp_path / "blocklist.yaml"))
+        curator = TaskCurator(config=config, taskmaster=None)
+        candidate = _fixc_blocklist_candidate()
+
+        assert await curator._maybe_blocklist_drop(candidate, candidate.payload_hash()) is None
+        _make_blocklist_yaml(
+            tmp_path,
+            title_subs=["search-then-delete", "fix c"],
+            desc_subs=["fixc_flags_deleted_not_found"],
         )
 
-        load_calls = 0
-
-        def counting_raise(path):
-            nonlocal load_calls
-            load_calls += 1
-            raise RuntimeError("boom")
-
-        with patch(
-            "fused_memory.middleware.task_curator.load_blocklist",
-            side_effect=counting_raise,
-        ), caplog.at_level(logging.WARNING):
-            decision1 = await curator._maybe_blocklist_drop(
-                candidate, candidate.payload_hash(),
-            )
-            decision2 = await curator._maybe_blocklist_drop(
-                candidate, candidate.payload_hash(),
-            )
-
-        assert decision1 is None
-        assert decision2 is None
-        assert load_calls == 1  # one-shot contract survives a failed load
-        # "blocklist" + "failing open" is the exact text the shared load
-        # helper's except block emits — narrower than "failing" appearing
-        # somewhere, which would stay green even if this WARNING were
-        # deleted and some unrelated warning fired instead.
-        fail_open_records = [
-            r for r in caplog.records
-            if r.levelno >= logging.WARNING
-            and "failing open" in r.getMessage()
-            and "blocklist" in r.getMessage()
-        ]
-        assert len(fail_open_records) == 1
+        assert await curator._maybe_blocklist_drop(candidate, candidate.payload_hash()) is None
+        assert _registry_health(curator, "blocklist").state is RegistryState.FAILED
 
     async def test_relative_path_without_cwd_warns_naming_config_key(self, caplog):
         """Behaviour-preservation pin: a relative
         cancelled_premise_blocklist_path with no cwd resolves against the
         process CWD and logs a WARNING naming the config key so an operator
-        can identify which field to make absolute. Green today
-        (task_curator.py _maybe_blocklist_drop's lazy-load block); must stay
-        green once this branch moves into the shared _LazyRegistry._resolve.
+        can identify which field to make absolute. The resolution lives in
+        fused_memory/middleware/curator_registry.py::CuratorRegistry.
         """
         config = FusedMemoryConfig()
         config.curator = CuratorConfig(cancelled_premise_blocklist_path="relative/blocklist.yaml")
@@ -6600,6 +6709,43 @@ class TestBlocklistLazyLoadRunsOffEventLoop:
         )
 
 
+@pytest.mark.asyncio
+class TestRegistryHealth:
+    """TaskCurator.registry_health() reports each guard registry's load state,
+    so a registry that failed to load is distinguishable from an empty one."""
+
+    async def test_default_config_reports_three_unconfigured_registries(self):
+        curator = TaskCurator(config=_make_config(), taskmaster=None)
+
+        health = curator.registry_health()
+
+        assert [h.label for h in health] == ["blocklist", "recon-premise", "operational-ask"]
+        assert [h.config_key for h in health] == [
+            "cancelled_premise_blocklist_path",
+            "recon_code_fix_premise_registry_path",
+            "operational_ask_registry_path",
+        ]
+        assert all(h.state is RegistryState.UNCONFIGURED for h in health)
+
+    async def test_configured_registry_is_not_loaded_before_first_use(self, tmp_path):
+        blocklist = _make_blocklist_yaml(tmp_path, title_subs=["x"], desc_subs=["y"])
+        curator = TaskCurator(config=_make_config_with_blocklist(str(blocklist)), taskmaster=None)
+
+        assert _registry_health(curator, "blocklist").state is RegistryState.NOT_LOADED
+
+    async def test_empty_registry_is_loaded_with_zero_entries(self, tmp_path):
+        empty = tmp_path / "blocklist.yaml"
+        empty.write_text("[]\n", encoding="utf-8")
+        curator = TaskCurator(config=_make_config_with_blocklist(str(empty)), taskmaster=None)
+        candidate = _fixc_blocklist_candidate()
+
+        assert await curator._maybe_blocklist_drop(candidate, candidate.payload_hash()) is None
+
+        health = _registry_health(curator, "blocklist")
+        assert health.state is RegistryState.LOADED
+        assert health.entry_count == 0
+
+
 # step-13 RED: TestCancelledPremiseBlocklistPinsFixCRegression
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -6614,8 +6760,7 @@ _SHIPPED_BLOCKLIST_PATH = (
 
 def _load_shipped_blocklist():
     """Load the shipped blocklist, asserting it parsed to something non-empty
-    (a YAML the loader cannot read degrades to [], which would otherwise make
-    every pin below pass vacuously)."""
+    (an empty list would otherwise make every pin below pass vacuously)."""
     from fused_memory.middleware.cancelled_premise_blocklist import load_blocklist
     entries = load_blocklist(_SHIPPED_BLOCKLIST_PATH)
     assert entries, f"Shipped blocklist is empty — path: {_SHIPPED_BLOCKLIST_PATH}"
@@ -7151,9 +7296,13 @@ def _make_premise_registry_yaml(
     return p
 
 
-def _make_config_with_premise_registry(registry_path_str: str) -> FusedMemoryConfig:
+def _make_config_with_premise_registry(
+    registry_path_str: str, *, retry_seconds: float | None = None,
+) -> FusedMemoryConfig:
     cfg = FusedMemoryConfig()
     cfg.curator = CuratorConfig(recon_code_fix_premise_registry_path=registry_path_str)
+    if retry_seconds is not None:
+        cfg.curator.registry_load_retry_seconds = retry_seconds
     return cfg
 
 
@@ -7384,9 +7533,9 @@ class TestCuratorPremiseRefutedDrop:
 
 @pytest.mark.asyncio
 class TestPremiseGuardRunsOffEventLoop:
-    """Tests that _maybe_premise_refuted_drop's blocking filesystem/YAML work
-    (per-candidate live-source re-verification, and the lazy registry load)
-    runs OFF the event-loop thread, so it cannot stall the fused-memory event
+    """Tests that _maybe_premise_refuted_drop's blocking filesystem work
+    (per-candidate live-source re-verification) runs OFF the event-loop
+    thread, so it cannot stall the fused-memory event
     loop or any other coroutine sharing it — e.g. a concurrent project's
     curate() call, since TaskInterceptor._get_curator memoises a single
     TaskCurator while TaskInterceptor._curator_lock is keyed per-project.
@@ -7519,40 +7668,42 @@ class TestPremiseGuardRunsOffEventLoop:
         # module does (verified by grep).
         assert len(fail_open_records) == 1
 
-    async def test_registry_load_runs_off_event_loop(self, tmp_path):
-        """RED: the one-shot lazy registry load must also be offloaded.
 
-        This site is NOT the one task 4201 was filed against, but
-        measurement is what promotes it: load_premise_registry on the
-        shipped 11 KB config/recon_code_fix_premise_registry.yaml measures
-        9,917 us, of which only 21 us is read_text and 8,152 us is
-        pure-Python yaml.safe_load — ~8x the worst per-candidate
-        verification read, and by far the largest single event-loop stall
-        in this method. It runs on the first task submission each
-        fused-memory process sees, while the per-project curator write lock
-        is held. INV-8 (loop-thread-occupancy-bounded,
-        docs/legibility/design-invariants.md) names filesystem work
-        explicitly and gives asyncio.to_thread as the house pattern.
+@pytest.mark.asyncio
+class TestPremiseRegistryWiring:
+    """_maybe_premise_refuted_drop is wired to the "recon-premise" registry
+    read from recon_code_fix_premise_registry_path: a failed load fails open
+    and is retried. The generic load contract is pinned once, canonically, by
+    tests/test_curator_registry.py.
+    """
 
-        Delegates to the REAL load_premise_registry (captured before
-        patching) rather than stubbing a return value: a stub returning []
-        would make the thread-identity assertion vacuous by short-circuiting
-        at ``if not entries: return None`` before ever reaching the match/
-        verify path, and would not exercise a genuine refusal.
-        """
-        import threading
-
-        from fused_memory.middleware.recon_code_fix_premise_guard import (
-            load_premise_registry as real_load_premise_registry,
-        )
-
+    async def test_premise_registry_failed_load_is_retried(self, tmp_path, caplog):
+        """A missing premise registry fails open with one WARNING and reports
+        FAILED; once the file appears, the next call loads it and refuses."""
         source_root = tmp_path / "source_root"
         source_root.mkdir()
         (source_root / "memory_service.py").write_text(
             "def rebuild():\n    filter_by(invalid_at=None)\n", encoding="utf-8",
         )
+        config = _make_config_with_premise_registry(
+            str(tmp_path / "premise_registry.yaml"), retry_seconds=0,
+        )
+        curator = TaskCurator(config=config, taskmaster=None, cwd=source_root)
+        candidate = CandidateTask(
+            title="Fix entity-summary rebuild missing invalid_at filter",
+            description="Rebuild does not check missing invalid_at filter before writing.",
+        )
 
-        registry = _make_premise_registry_yaml(
+        with caplog.at_level(logging.WARNING):
+            first = await curator._maybe_premise_refuted_drop(
+                candidate, candidate.payload_hash(),
+            )
+
+        assert first is None
+        assert len(_fail_open_warnings(caplog, "recon-premise")) == 1
+        assert _registry_health(curator, "recon-premise").state is RegistryState.FAILED
+
+        _make_premise_registry_yaml(
             tmp_path,
             title_subs=["entity-summary rebuild"],
             desc_subs=["invalid_at filter"],
@@ -7560,266 +7711,15 @@ class TestPremiseGuardRunsOffEventLoop:
                 {"file": "memory_service.py", "must_contain": ["invalid_at"]},
             ],
         )
-        config = _make_config_with_premise_registry(str(registry))
-        curator = TaskCurator(config=config, taskmaster=None, cwd=source_root)
-
-        candidate = CandidateTask(
-            title="Fix entity-summary rebuild missing invalid_at filter",
-            description="Rebuild does not check missing invalid_at filter before writing.",
+        second = await curator._maybe_premise_refuted_drop(
+            candidate, candidate.payload_hash(),
         )
 
-        loop_thread_id = threading.get_ident()
-        load_threads: list[int] = []
-
-        def recording_load(path):
-            load_threads.append(threading.get_ident())
-            return real_load_premise_registry(path)
-
-        with patch(
-            "fused_memory.middleware.task_curator.load_premise_registry",
-            side_effect=recording_load,
-        ):
-            decision1 = await curator._maybe_premise_refuted_drop(
-                candidate, candidate.payload_hash(),
-            )
-            decision2 = await curator._maybe_premise_refuted_drop(
-                candidate, candidate.payload_hash(),
-            )
-
-        assert load_threads and all(tid != loop_thread_id for tid in load_threads)
-        assert len(load_threads) == 1  # lazy load, at most once per instance
-        assert decision1 is not None and decision1.action == "refuse"
-        assert decision2 is not None and decision2.action == "refuse"
-
-    async def test_concurrent_first_calls_both_see_loaded_registry(self, tmp_path):
-        """RED: concurrent first calls must not observe a half-loaded registry.
-
-        self._premise_registry_load_attempted is set BEFORE the registry
-        assignment. That ordering was safe only while the load was
-        synchronous — there was no await point between the two. Offloading
-        the load (previous step) inserted one, so a second caller can now
-        see load_attempted=True while self._premise_registry is still None,
-        fall into ``if not entries: return None``, and SILENTLY FAIL OPEN:
-        the guard is skipped and the dead-premise task it exists to refuse
-        gets filed.
-
-        This is reachable, not theoretical:
-        task_interceptor.py::TaskInterceptor._get_curator memoises a SINGLE
-        TaskCurator on self._curator with no project key, while
-        task_interceptor.py::TaskInterceptor._curator_lock is keyed
-        PER-PROJECT — so two projects can be inside curate() concurrently on
-        the same TaskCurator instance.
-
-        Uses a slow load_premise_registry wrapper (sleeps inside the worker
-        thread, off the event loop) to guarantee the second concurrent call
-        enters while the first load is still in flight.
-        """
-        import time
-
-        from fused_memory.middleware.recon_code_fix_premise_guard import (
-            load_premise_registry as real_load_premise_registry,
-        )
-
-        source_root = tmp_path / "source_root"
-        source_root.mkdir()
-        (source_root / "memory_service.py").write_text(
-            "def rebuild():\n    filter_by(invalid_at=None)\n", encoding="utf-8",
-        )
-
-        registry = _make_premise_registry_yaml(
-            tmp_path,
-            title_subs=["entity-summary rebuild"],
-            desc_subs=["invalid_at filter"],
-            source_assertions=[
-                {"file": "memory_service.py", "must_contain": ["invalid_at"]},
-            ],
-        )
-        config = _make_config_with_premise_registry(str(registry))
-        curator = TaskCurator(config=config, taskmaster=None, cwd=source_root)
-
-        candidate = CandidateTask(
-            title="Fix entity-summary rebuild missing invalid_at filter",
-            description="Rebuild does not check missing invalid_at filter before writing.",
-        )
-
-        load_call_count = 0
-
-        def slow_load(path):
-            nonlocal load_call_count
-            load_call_count += 1
-            time.sleep(0.05)  # yields the loop; runs on the to_thread worker
-            return real_load_premise_registry(path)
-
-        with patch(
-            "fused_memory.middleware.task_curator.load_premise_registry",
-            side_effect=slow_load,
-        ):
-            d1, d2 = await asyncio.gather(
-                curator._maybe_premise_refuted_drop(candidate, candidate.payload_hash()),
-                curator._maybe_premise_refuted_drop(candidate, candidate.payload_hash()),
-            )
-
-        assert d1 is not None and d1.action == "refuse"
-        assert d2 is not None and d2.action == "refuse"
-        assert load_call_count == 1
-
-    async def test_registry_load_error_fails_open_and_is_attempted_once(
-        self, tmp_path, caplog,
-    ):
-        """A registry load that RAISES must fail OPEN, and must not latch
-        into a permanent failure.
-
-        This pins THIS METHOD's own except-Exception wrapper around the
-        offloaded load — the last line of defence for
-        _maybe_premise_refuted_drop's "Never raises" contract, whose callers
-        curate() / curate_prepared() invoke it unguarded. Two distinct
-        properties: (a) the exception does not escape, and (b)
-        _premise_registry_load_attempted still latches, so a one-shot
-        failure does not become a permanent one for the life of the process
-        (the flag is set only AFTER a successful assignment, so an unwrapped
-        raise would skip it and re-enter the load on every later call).
-
-        FAULT INJECTION, and why it is a direct raise rather than a real
-        malformed file (changed by task 4483): this test originally wrote
-        the registry as genuinely non-UTF-8 bytes, because
-        load_premise_registry then caught only FileNotFoundError/OSError on
-        read_text and yaml.YAMLError on parse — so UnicodeDecodeError (a
-        ValueError, NOT an OSError) escaped it despite its docstring
-        claiming "The function never raises". Task 4483 closed that gap: the
-        guard module now catches UnicodeDecodeError itself and degrades to
-        [], so a bad-encoding registry no longer reaches this wrapper at all
-        (that path is now covered one layer down, by
-        test_recon_code_fix_premise_guard.py). The wrapper it guards is NOT
-        dead, though: asyncio.to_thread is itself a raise path (thread-pool
-        failure/shutdown), and the guard module's internal excepts cannot
-        cover it. With no naturally-reachable in-process fault left to
-        trigger it, the raise is injected directly — same shape as the
-        sibling test_verification_failure_fails_open above.
-        """
-        source_root = tmp_path / "source_root"
-        source_root.mkdir()
-        (source_root / "memory_service.py").write_text(
-            "def rebuild():\n    filter_by(invalid_at=None)\n", encoding="utf-8",
-        )
-
-        registry = _make_premise_registry_yaml(
-            tmp_path,
-            title_subs=["entity-summary rebuild"],
-            desc_subs=["invalid_at filter"],
-            source_assertions=[
-                {"file": "memory_service.py", "must_contain": ["invalid_at"]},
-            ],
-        )
-
-        config = _make_config_with_premise_registry(str(registry))
-        curator = TaskCurator(config=config, taskmaster=None, cwd=source_root)
-
-        candidate = CandidateTask(
-            title="Fix entity-summary rebuild missing invalid_at filter",
-            description="Rebuild does not check missing invalid_at filter before writing.",
-        )
-
-        load_calls = 0
-
-        def raising_load(path):
-            nonlocal load_calls
-            load_calls += 1
-            raise RuntimeError("registry load exploded")
-
-        with patch(
-            "fused_memory.middleware.task_curator.load_premise_registry",
-            side_effect=raising_load,
-        ), caplog.at_level(logging.WARNING):
-            decision1 = await curator._maybe_premise_refuted_drop(
-                candidate, candidate.payload_hash(),
-            )
-            decision2 = await curator._maybe_premise_refuted_drop(
-                candidate, candidate.payload_hash(),
-            )
-
-        assert decision1 is None
-        assert decision2 is None
-        assert load_calls == 1  # one-shot contract survives a failed load
-        # "recon-premise" + "failing open" is the exact text this method's
-        # registry-load except block emits (see the sibling assertion in
-        # test_verification_failure_fails_open) — narrower than "premise"
-        # appears somewhere, which would stay green even if this WARNING
-        # were deleted and some other premise-related warning fired instead.
-        assert any(
-            "failing open" in r.getMessage() and "recon-premise" in r.getMessage()
-            for r in caplog.records
-            if r.levelno >= logging.WARNING
-        )
-
-    async def test_registry_load_cancellation_does_not_disable_guard(
-        self, tmp_path,
-    ):
-        """GUARD (expected GREEN already): a cancelled load must NOT latch the
-        guard permanently off.
-
-        This locks a property that already holds on the current branch (the
-        attempted flag sits after the assignment, inside the lock, so a
-        CancelledError from the first caller leaves it clear and a later call
-        retries) against the obvious "just settle the flag in a finally"
-        fix for the sibling RED test above. asyncio.CancelledError is a
-        BaseException in Python 3.13, so a `finally` would also latch the
-        flag on cancellation — permanently disabling the premise guard for
-        this TaskCurator instance because one unrelated caller was
-        cancelled mid-load, which is the same transient-becomes-permanent
-        defect class the sibling test exists to close, just with a rarer
-        trigger. The follow-up impl step must keep this test GREEN.
-        """
-        from fused_memory.middleware.recon_code_fix_premise_guard import (
-            load_premise_registry as real_load_premise_registry,
-        )
-
-        source_root = tmp_path / "source_root"
-        source_root.mkdir()
-        (source_root / "memory_service.py").write_text(
-            "def rebuild():\n    filter_by(invalid_at=None)\n", encoding="utf-8",
-        )
-
-        registry = _make_premise_registry_yaml(
-            tmp_path,
-            title_subs=["entity-summary rebuild"],
-            desc_subs=["invalid_at filter"],
-            source_assertions=[
-                {"file": "memory_service.py", "must_contain": ["invalid_at"]},
-            ],
-        )
-        config = _make_config_with_premise_registry(str(registry))
-        curator = TaskCurator(config=config, taskmaster=None, cwd=source_root)
-
-        candidate = CandidateTask(
-            title="Fix entity-summary rebuild missing invalid_at filter",
-            description="Rebuild does not check missing invalid_at filter before writing.",
-        )
-
-        call_count = 0
-
-        def first_call_cancelled(path):
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                raise asyncio.CancelledError()
-            return real_load_premise_registry(path)
-
-        with patch(
-            "fused_memory.middleware.task_curator.load_premise_registry",
-            side_effect=first_call_cancelled,
-        ):
-            with pytest.raises(asyncio.CancelledError):
-                await curator._maybe_premise_refuted_drop(
-                    candidate, candidate.payload_hash(),
-                )
-
-            decision = await curator._maybe_premise_refuted_drop(
-                candidate, candidate.payload_hash(),
-            )
-
-        assert decision is not None
-        assert decision.action == "refuse"
-        assert decision.justification.startswith("recon-premise-refuted:")
+        assert second is not None
+        assert second.action == "refuse"
+        health = _registry_health(curator, "recon-premise")
+        assert health.state is RegistryState.LOADED
+        assert health.entry_count == 1
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -8219,9 +8119,13 @@ def _make_operational_registry_yaml(
     return p
 
 
-def _make_config_with_operational_registry(registry_path_str: str) -> FusedMemoryConfig:
+def _make_config_with_operational_registry(
+    registry_path_str: str, *, retry_seconds: float | None = None,
+) -> FusedMemoryConfig:
     cfg = FusedMemoryConfig()
     cfg.curator = CuratorConfig(operational_ask_registry_path=registry_path_str)
+    if retry_seconds is not None:
+        cfg.curator.registry_load_retry_seconds = retry_seconds
     return cfg
 
 
@@ -8433,24 +8337,17 @@ class TestCuratorMaybeRouteDeterministic:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# task-5007 RED: TestOperationalRegistryLazyLoadRunsOffEventLoop
+# task-5007 RED: TestOperationalRegistryWiring
 # ──────────────────────────────────────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
-class TestOperationalRegistryLazyLoadRunsOffEventLoop:
-    """Site-specific coverage for _maybe_route_deterministic's lazy registry
-    load: fail-open behaviour on a loader raise, and the
-    relative-path-without-cwd warning. Both pin the "operational-ask" label /
-    operational_ask_registry_path config-key wiring that is unique to this
-    call site.
-
-    The off-loop thread-identity and concurrent-first-call properties are
-    generic _LazyRegistry.entries behaviour and are pinned once, canonically,
-    by TestPremiseGuardRunsOffEventLoop (task 4201) — see
-    TestBlocklistLazyLoadRunsOffEventLoop's docstring for the same
-    reasoning; duplicating them here a third time would be a SPOT violation
-    (docs/code-quality.md heuristic 11).
+class TestOperationalRegistryWiring:
+    """_maybe_route_deterministic is wired to the "operational-ask" registry
+    read from operational_ask_registry_path: a failed load fails open and is
+    retried, and a relative path without cwd warns naming that config key.
+    The generic load contract is pinned once, canonically, by
+    tests/test_curator_registry.py.
 
     Candidates here are deliberately UNTAGGED (no execution_class) so they
     match via the title/description substring fallback — a tagged
@@ -8459,77 +8356,48 @@ class TestOperationalRegistryLazyLoadRunsOffEventLoop:
     above) and would make these tests vacuous.
     """
 
-    async def test_operational_registry_load_error_fails_open_and_is_attempted_once(
-        self, tmp_path, caplog,
-    ):
-        """RED: a registry load that RAISES must fail OPEN, not escape, and
-        must not latch into a permanent failure.
-
-        Pins the invariant _LazyRegistry.entries enforces: a loader raise —
-        including one originating in asyncio.to_thread itself, not just one
-        load_operational_registry's own except clauses catch — must be
-        swallowed into a fail-open None, must log exactly one WARNING naming
-        this guard's "operational-ask" label, and must still latch the
-        one-shot contract so no retry storm follows a failed load.
-
-        Injects the raise directly via side_effect rather than a non-UTF-8
-        file — see the equivalent blocklist test's rationale (task-4483
-        collision-risk note in plan.json): this targets asyncio.to_thread's
-        own raise path, which no loader-internal except can ever cover.
-        """
-        registry = _make_operational_registry_yaml(
-            tmp_path,
-            title_subs=["prune_recon_cycle_summaries"],
-            desc_subs=["--apply"],
+    async def test_operational_registry_failed_load_is_retried(self, tmp_path, caplog):
+        """A missing operational-ask registry fails open with one WARNING and
+        reports FAILED; once the file appears, the next call routes."""
+        config = _make_config_with_operational_registry(
+            str(tmp_path / "operational_ask_registry.yaml"), retry_seconds=0,
         )
-        config = _make_config_with_operational_registry(str(registry))
         curator = TaskCurator(config=config, taskmaster=None, cwd=tmp_path)
-
         candidate = CandidateTask(
             title="Run prune_recon_cycle_summaries --apply against live Mem0",
             description="Operational --apply run to collapse pre-existing piles.",
         )
 
-        load_calls = 0
-
-        def counting_raise(path):
-            nonlocal load_calls
-            load_calls += 1
-            raise RuntimeError("boom")
-
-        with patch(
-            "fused_memory.middleware.task_curator.load_operational_registry",
-            side_effect=counting_raise,
-        ), caplog.at_level(logging.WARNING):
-            decision1 = await curator._maybe_route_deterministic(
-                candidate, candidate.payload_hash(),
-            )
-            decision2 = await curator._maybe_route_deterministic(
+        with caplog.at_level(logging.WARNING):
+            first = await curator._maybe_route_deterministic(
                 candidate, candidate.payload_hash(),
             )
 
-        assert decision1 is None
-        assert decision2 is None
-        assert load_calls == 1  # one-shot contract survives a failed load
-        # "operational-ask" + "failing open" is the exact text the shared
-        # load helper's except block emits — narrower than "failing"
-        # appearing somewhere, which would stay green even if this WARNING
-        # were deleted and some unrelated warning fired instead.
-        fail_open_records = [
-            r for r in caplog.records
-            if r.levelno >= logging.WARNING
-            and "failing open" in r.getMessage()
-            and "operational-ask" in r.getMessage()
-        ]
-        assert len(fail_open_records) == 1
+        assert first is None
+        assert len(_fail_open_warnings(caplog, "operational-ask")) == 1
+        assert _registry_health(curator, "operational-ask").state is RegistryState.FAILED
+
+        _make_operational_registry_yaml(
+            tmp_path,
+            title_subs=["prune_recon_cycle_summaries"],
+            desc_subs=["--apply"],
+        )
+        second = await curator._maybe_route_deterministic(
+            candidate, candidate.payload_hash(),
+        )
+
+        assert second is not None
+        assert second.action == "route_deterministic"
+        health = _registry_health(curator, "operational-ask")
+        assert health.state is RegistryState.LOADED
+        assert health.entry_count == 1
 
     async def test_relative_path_without_cwd_warns_naming_config_key(self, caplog):
         """Behaviour-preservation pin: a relative operational_ask_registry_path
         with no cwd resolves against the process CWD and logs a WARNING
         naming the config key so an operator can identify which field to
-        make absolute. Green today (task_curator.py
-        _maybe_route_deterministic's lazy-load block); must stay green once
-        this branch moves into the shared _LazyRegistry._resolve.
+        make absolute. The resolution lives in
+        fused_memory/middleware/curator_registry.py::CuratorRegistry.
         """
         config = FusedMemoryConfig()
         config.curator = CuratorConfig(operational_ask_registry_path="relative/registry.yaml")

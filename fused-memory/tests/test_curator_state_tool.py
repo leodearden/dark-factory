@@ -15,6 +15,10 @@ import pytest
 from shared.config_models import AccountConfig, UsageCapConfig
 from shared.usage_gate import UsageGate
 
+from fused_memory.config.schema import CuratorConfig, FusedMemoryConfig
+from fused_memory.middleware.task_curator import TaskCurator
+from fused_memory.middleware.task_interceptor import TaskInterceptor
+from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.server.tools import create_mcp_server
 
 # ---------------------------------------------------------------------------
@@ -50,6 +54,7 @@ class TestGetCuratorStateNoneGate:
             'paused_reason': None,
             'soonest_open_at': None,
             'account_count': 0,
+            'registries': [],
         }, f'Unexpected result: {result!r}'
 
 
@@ -102,8 +107,61 @@ class TestGetCuratorStateLiveGate:
                 'paused_reason': 'All accounts capped (last: synthetic cap)',
                 'soonest_open_at': '2026-06-01T00:00:00+00:00',
                 'account_count': 1,
+                'registries': [],
             }, f'Unexpected result: {result!r}'
         finally:
             if gate is not None:
                 await gate.shutdown()
             await store.close()
+
+
+# ---------------------------------------------------------------------------
+# task 6622: each curator guard registry's load state
+# ---------------------------------------------------------------------------
+
+
+class TestGetCuratorStateRegistries:
+    """get_curator_state reports each guard registry's load state, so a guard
+    that failed to load is distinguishable from one that loaded empty."""
+
+    @pytest.mark.asyncio
+    async def test_reports_each_registry_state_from_the_wired_curator(self, tmp_path):
+        missing = tmp_path / 'blocklist.yaml'
+        config = FusedMemoryConfig()
+        config.curator = CuratorConfig(cancelled_premise_blocklist_path=str(missing))
+        curator = TaskCurator(config=config, taskmaster=None, cwd=tmp_path)
+        await curator.startup_self_check('p', str(tmp_path))
+        interceptor = TaskInterceptor(
+            None, None, EventBuffer(db_path=None), curator=curator,
+        )
+        server = create_mcp_server(_make_mock_service(), task_interceptor=interceptor)
+
+        result = await server._tool_manager.call_tool('get_curator_state', {})
+
+        registries = result['registries']
+        assert [r['label'] for r in registries] == [
+            'blocklist', 'recon-premise', 'operational-ask',
+        ]
+        blocklist, premise, operational = registries
+        assert blocklist['state'] == 'failed'
+        assert blocklist['path'] == str(missing)
+        assert blocklist['failures'] == 1
+        assert 'file not found' in blocklist['error']
+        assert premise['state'] == 'unconfigured'
+        assert operational['state'] == 'unconfigured'
+        assert result['paused'] is False
+        assert result['paused_reason'] is None
+        assert result['soonest_open_at'] is None
+        assert result['account_count'] == 0
+
+    @pytest.mark.asyncio
+    async def test_reading_state_never_constructs_a_curator(self):
+        interceptor = TaskInterceptor(
+            None, None, EventBuffer(db_path=None), config=FusedMemoryConfig(),
+        )
+        server = create_mcp_server(_make_mock_service(), task_interceptor=interceptor)
+
+        result = await server._tool_manager.call_tool('get_curator_state', {})
+
+        assert result['registries'] == []
+        assert interceptor.curator_registry_health() == ()
