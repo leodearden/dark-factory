@@ -11,8 +11,8 @@ walk are justified in plans/scheduler-dispatch-scoring-and-lock-layer-prd.md
 C4 "Cap L1".
 
 - FILE when no cap L1 is open, the cohort alarms, and it is news against the
-  last announcement: a new non-live holder, a new first-blocker module, or
-  growth to ``size + max(GROWTH_FLOOR, ceil(GROWTH_RATIO * size))``.
+  last announcement: a new non-live holder, a new module behind a non-live
+  holder, or growth to ``size + max(GROWTH_FLOOR, ceil(GROWTH_RATIO * size))``.
 - REFRESH the open L1 in place whenever the cohort's rendering changes.
 - RESOLVE the open L1 once the cohort no longer alarms.
 
@@ -101,8 +101,9 @@ class CapReport:
         return bool(self.wedges) or self.unexplained
 
     @property
-    def modules(self) -> frozenset[str]:
-        return frozenset(m.first_module for m in self.members if m.first_module is not None)
+    def wedged_modules(self) -> frozenset[str]:
+        """The modules the non-live holders block; lock turnover by live holders leaves it unchanged."""
+        return frozenset(w.holder.blocker.module for w in self.wedges)
 
     @property
     def subjects(self) -> frozenset[str]:
@@ -113,7 +114,9 @@ class CapReport:
         return owners
 
     def announced(self) -> CapBaseline:
-        return CapBaseline(size=len(self.members), modules=self.modules, subjects=self.subjects)
+        return CapBaseline(
+            size=len(self.members), modules=self.wedged_modules, subjects=self.subjects,
+        )
 
 
 class CapAction(StrEnum):
@@ -153,7 +156,7 @@ def is_news(report: CapReport, baseline: CapBaseline) -> bool:
     growth_bound = baseline.size + max(GROWTH_FLOOR, math.ceil(GROWTH_RATIO * baseline.size))
     return (
         not report.subjects <= baseline.subjects
-        or not report.modules <= baseline.modules
+        or not report.wedged_modules <= baseline.modules
         or len(report.members) >= growth_bound
     )
 

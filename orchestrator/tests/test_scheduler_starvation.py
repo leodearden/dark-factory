@@ -961,6 +961,21 @@ async def test_a_standing_cohort_files_nothing_after_a_human_close(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+async def test_a_live_holder_taking_a_member_module_files_nothing_after_a_human_close(
+    tmp_path: Path,
+) -> None:
+    rig = _rig(tmp_path, **CAP_OF_TWO)
+    queue = await _capped_after_a_human_close(rig, _task('S4', 'medium', 'aa/z.py', 'hot/d.py'))
+    rig.tasks.append(_task('L', 'high', 'aa/z.py'))
+    rig.live_holders.add('L')
+
+    assert await rig.tick_id() == 'L'
+    await rig.tick_with_low_winner()
+
+    assert _open_cap_l1s(queue) == []
+
+
+@pytest.mark.asyncio
 async def test_the_open_cap_l1_is_refreshed_in_place_as_the_cohort_changes(tmp_path: Path) -> None:
     rig = _rig(tmp_path, **CAP_OF_TWO)
     queue = await _three_starve_behind_a_cap_of_two(rig, _task('S4', 'medium', 'hot/d.py'))

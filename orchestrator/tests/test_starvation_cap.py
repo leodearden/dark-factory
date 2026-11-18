@@ -120,7 +120,7 @@ class TestCapReport:
             CohortMember('S5', REFUSED, None),
         )
         assert report.cap == CAP
-        assert report.modules == frozenset({'hot/d.py', 'hot/e.py'})
+        assert report.wedged_modules == frozenset()
 
     def test_a_non_live_holder_on_the_second_blocker_is_a_wedge(self) -> None:
         second = _held('hot/e.py', 'W')
@@ -223,6 +223,21 @@ class TestChangeRule:
         )
 
         assert cap_action(report, self.BASE, None) is CapAction.FILE
+
+    def test_a_live_holder_taking_a_lower_sorting_module_is_no_news(self) -> None:
+        report = _report(
+            {'S3': REFUSED, 'S4': REFUSED},
+            {
+                'S3': [_held('hot/a.py', 'L'), _held('hot/d.py', '0')],
+                'S4': [_held('hot/d.py', '0')],
+            },
+            {'0': _stale(), 'L': _live()},
+        )
+
+        assert report.members[0].first_module == 'hot/a.py'
+        assert report.wedged_modules == frozenset({'hot/d.py'})
+        assert not is_news(report, self.BASE)
+        assert cap_action(report, self.BASE, None) is CapAction.NONE
 
     def test_a_standing_cohort_files_nothing(self) -> None:
         report = _wedged('S3', 'S4', 'S6')

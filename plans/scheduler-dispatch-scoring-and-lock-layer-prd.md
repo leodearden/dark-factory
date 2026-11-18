@@ -405,7 +405,8 @@ can point at something a human should look at. Code: `orchestrator/src/orchestra
   owner absent from the read or terminal is non-live. A park owner whose modules are all free
   waits only for a run slot, which is live.
 - *FILE* when no cap L1 is open, the cohort alarms, and it is news against the last
-  announcement: a new non-live holder, a new first-blocker module, or growth to
+  announcement: a new non-live holder, a new module behind a non-live holder (a live
+  holder's lock turnover is never news), or growth to
   `size + max(GROWTH_FLOOR, ceil(GROWTH_RATIO × size))` with `GROWTH_FLOOR` = 10 and
   `GROWTH_RATIO` = 0.5.
 - *REFRESH* the open L1 in place (same id, `dedupe_count` + 1) whenever its rendering changes.

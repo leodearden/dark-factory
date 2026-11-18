@@ -67,7 +67,7 @@ _PER_TASK_TABLES = ('lock_refusals', 'watchdog_announced', 'cap_waiting')
 
 @dataclass(frozen=True)
 class CapBaseline:
-    """What the auto-pin cap L1 last announced: cohort size, first-blocker modules, subjects."""
+    """What the auto-pin cap L1 last announced: cohort size, modules behind non-live holders, subjects."""
 
     EMPTY: ClassVar[CapBaseline]
 
