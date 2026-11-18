@@ -226,11 +226,11 @@ triggering Graphiti's edge resolution pipeline which can falsely invalidate acti
 Use `add_memory(category='entities_and_relations')` only for genuinely new relationships \
 that don't correspond to any existing edge.
 - When you do use `add_memory(category='entities_and_relations')` for a genuinely new \
-fact, the fused-memory server now AUTOMATICALLY repairs the most common false invalidation \
+fact, the fused-memory server automatically repairs the most common false invalidation \
 it triggers: a post-write guardrail in `MemoryService._execute_graphiti_write` restores any \
 pre-existing edge that the write invalidated but whose `(source, target)` node-pair is NOT \
 restated by any surviving edge in that same write — a provably-false sibling invalidation. \
-So a manual `get_entity` before/after diff is no longer required to catch THIS failure mode. \
+So no manual `get_entity` before/after diff is needed to catch THIS failure mode. \
 Known limitation: an invalidated edge whose node-pair IS restated by a new surviving edge is \
 left untouched (it may be a legitimate contradiction) and still warrants care. This does not \
 weaken the guidance above — still prefer `update_edge`/`refresh_entity_summary` for restated facts.
@@ -254,11 +254,10 @@ mandatory two-step verification:
 
 **Never construct IDs from truncated sources.** 8-char hex prefixes (e.g. `'2531b4d8'`) \
 appear in search-result snippets and edge reference text but are NOT valid `delete_memory` \
-IDs. `delete_memory` now REJECTS any id that is not a full 36-character UUID, returning a \
+IDs. `delete_memory` REJECTS any id that is not a full 36-character UUID, returning a \
 structured `ValidationError` that names the malformed id and tells you how to resolve the \
 real one — so a truncated prefix fails loudly instead of reporting success. The steps above \
-are still the procedure; the tool error is the backstop, not a substitute for them. \
-(Regression-pinned in fused-memory/tests/test_delete_memory_truncated_uuid.py.)
+are still the procedure; the tool error is the backstop, not a substitute for them.
 
 **The citation gate binds EVERY caller.** A `store='mem0'` `delete_memory` is REFUSED \
 (`error_type='CitationRepointRequired'`) while a live (non-terminal) task still cites the \
@@ -288,8 +287,7 @@ write into any task's metadata — a value like `'re-derive the current canonica
 search(query=...)'`. It is rejected mechanically (`CitationReplacementInvalid`), because \
 re-deriving at read time resolves back to the superseded cluster members the consolidation \
 was collapsing, routing dispatch into exactly the contradictory advice you just removed. \
-Only a concrete UUID forwards. \
-(Regression-pinned in fused-memory/tests/test_delete_memory_citation_guard.py.)
+Only a concrete UUID forwards.
 
 **Where there is no survivor at all, there is exactly one sanctioned bypass.** Some \
 deletes are not consolidations — a plain drop rather than a consolidation, where the entry \
@@ -503,9 +501,8 @@ write, so a persisted edge goes stale within the hour while still reading as cur
 Extraction also produces facts that name no task at all (e.g. "Pin order is set to \
 10."), which no sweep can attribute to a task or drain.
 
-**Do not be the writer**: since task 3853 (the esc-3834-1 ruling) this edge class no \
-longer originates from the MCP override tools, which emit no memory write at all. Do \
-not re-mint it from a pin-queue observation.
+**Do not be the writer**: the MCP override tools emit no memory write, so this edge \
+class does not originate there. Do not re-mint it from a pin-queue observation.
 
 ### Stale task-count snapshot edges — do NOT emit correction findings
 

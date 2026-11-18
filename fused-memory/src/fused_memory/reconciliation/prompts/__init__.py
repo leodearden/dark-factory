@@ -487,7 +487,8 @@ _GATE_CLOSURE_ARCHIVE_GUIDANCE = """\
 Scope: a `done` task with `task_kind='deterministic'` and a `done_provenance.kind` of \
 `deterministic-gate` or `deterministic-milestone`.
 
-Call `mcp__fused-memory__get_task(task_id)` — a READ you do hold. `status == 'done'` \
+Call `mcp__fused-memory__get_task(id=<task_id>, project_root=<project_root>)` — a READ \
+you do hold. `status == 'done'` \
 PLUS `task_kind='deterministic'` PLUS one of those `done_provenance.kind` values IS \
 LEGITIMATE CLOSURE on its own; this rule is primary and sufficient. Since task 3638 \
 `metadata.gate_escalated_at` is removed when a gate closes; older closures may still \

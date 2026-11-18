@@ -829,7 +829,7 @@ through the recon_report channel (`mcp__recon-report__add_finding`); the reconci
 harness owns their persistence-gated escalation path. The sanctioned scope of \
 `escalate_blocker` itself is stated once, under `## Escalation Store Boundary` below.
 
-One of these is now handled for you: the before/after `get_task` self-check \
+The harness enforces one check for you: the before/after `get_task` self-check \
 around a write to a live in-progress task — reading status/`claimant_run_id`/ \
 `heartbeat_at` immediately before and after, and flagging unexpected \
 divergence — is a CODE-ENFORCED harness backstop, not just this prompt's \
