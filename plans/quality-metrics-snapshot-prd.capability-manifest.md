@@ -28,7 +28,7 @@ amended to match (header, decisions 1 and 3, Cross-PRD row, Decomposition plan).
 `measurement_domain`, because since task 6921 it also enumerates a single src-layout package.
 The twin's delivered_check patterns for `workspace-domain-in-source-measures` (S1) and
 `census-reads-workspace-domain` (S1b) were re-pointed to `^def measurement_domain\(` and
-`measurement_domain\(`. The task-record half is ticket `tkt_0RX4WWCXC90HD7R2ZZ83E41F31`. The
+`measurement_domain\(`. The task-record half is task 10791. The
 capability names and the evidence tables below keep the decompose-time name.
 
 ---
