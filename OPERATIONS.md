@@ -1147,7 +1147,10 @@ session:
 | Tool | Use for |
 |---|---|
 | `mcp__escalation__get_pending_escalations` | List open escalations (filter by `level`) |
+| `mcp__escalation__get_escalation` | One full escalation record by id, archive included |
+| `mcp__escalation__get_task_escalation_history` | Every escalation ever filed for one task, archive included; its `count: 0` is attributable to the query, and it answers for this server's queue only |
 | `mcp__escalation__get_merge_queue` | Live merge-queue snapshot: in-flight/queued items, conflict graph, frozen verify prefix |
+| `mcp__escalation__merge_status` | One merge request's state, by `request_id` / `task_id` / `branch` |
 | `mcp__escalation__get_merge_halt_status` | Whether the merge queue is currently halted, and by which escalation |
 | `mcp__escalation__get_task_runtime_state` | Live per-task phase/loop/attempt projection (what a task is doing *right now*) |
 | `mcp__fused-memory__get_tasks` / `get_task` | Full task tree, or one task's full record |
@@ -1155,6 +1158,11 @@ session:
 | `mcp__fused-memory__find_tasks_by_metadata` | Which tasks carry metadata key K (with value V), every status incl. deferred/cancelled — paged |
 | `mcp__fused-memory__get_status` | Backend health, plus `reconciliation_halt` — whether reconciliation is halted, why, since when, and whether the cooldown has expired. Pass no `project_id` for the fleet-wide `halted_projects` list |
 | `mcp__fused-memory__get_queue_stats` | Durable-write-queue counts, plus (per-project) `reconciliation_backlog` **and** `reconciliation_halt` — read both together, see below |
+
+An orchestrator-spawned agent's escalation tools are the ones its grant
+names: the steward's in
+`orchestrator/src/orchestrator/agents/roles.py::STEWARD`, the L1
+rotation's in `orchestrator/src/orchestrator/harness.py::_WATCHER_ALLOWED_TOOLS`.
 
 ### Is reconciliation halted, or just behind?
 

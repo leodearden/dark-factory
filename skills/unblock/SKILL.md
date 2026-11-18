@@ -166,7 +166,10 @@ Read from `<WORKTREE>/.task/`:
 Query the escalation MCP:
 ```
 get_pending_escalations(task_id="<TASK_ID>")
+get_task_escalation_history(task_id="<TASK_ID>", project_root="<PROJECT_ROOT>")
 ```
+The second adds the records already resolved or dismissed on the task — its earlier rulings. An
+empty pending list never means none was filed.
 
 ### 1c. Task status
 ```

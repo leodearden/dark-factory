@@ -1778,6 +1778,14 @@ human-readable rationale; `granted_files` is what actually widens scope — omit
 means the grant exists only as prose and the resumed agent's briefing will not reflect
 the expanded scope.
 
+**Declaring a pin (`mcp__escalation__declare_pin`).** A pin makes `resolve_issue`
+refuse every non-`park` close of a pending record, and there is no un-declare verb.
+Declare one only when something you can name relies on the record staying open — a
+deviation notice you are filing, or an operator gate your resolution records — and
+pass that thing in `declared_by`. Never declare a pin inferred from another record's
+prose: re-escalate it with `escalate_blocker(..., level=1)` as a candidate pin for a
+human to ratify.
+
 ### Review Suggestions
 Post-merge improvement suggestions from automated code reviewers.
 
@@ -1987,8 +1995,11 @@ convert it into a task candidate and then close it:
         'Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep',
         *_ESCALATION_TOOLS,
         'mcp__escalation__resolve_issue',
+        # Scoped by the prompt's "Declaring a pin" paragraph above.
+        'mcp__escalation__declare_pin',
         'mcp__escalation__get_escalation',
         'mcp__escalation__get_pending_escalations',
+        'mcp__escalation__get_task_escalation_history',
         'mcp__escalation__merge_request',
         # Read-only merge-state query. Required, not optional: the rc=1 arm of
         # ANCESTRY_CHECK_INSTRUCTIONS (spliced into this prompt at both
