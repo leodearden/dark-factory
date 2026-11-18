@@ -73,10 +73,10 @@ STATE_SCHEMA_VERSION = 1
 OTHER value as malformed rather than guessing at unknown fields.
 
 Fields added after the first writer are ADDITIVE and do not bump it:
-``consecutive_failed_runs``, ``capped``, ``retry_backlog``,
-``last_scheduled_target_date``, ``census_fired``, ``census_fire_streak``,
-``barren_escalated``, ``completion_error_streak`` and
-``completion_escalated``.
+``consecutive_failed_runs``, ``consecutive_deferred_runs``, ``capped``,
+``retry_backlog``, ``last_scheduled_target_date``, ``census_fired``,
+``census_fire_streak``, ``barren_escalated``, ``completion_error_streak``
+and ``completion_escalated``.
 :meth:`TrickleState.from_json` reads an absent one as its default, and an
 absent ``barren_escalated`` as ``None`` (unrecorded). Bumping for such a
 field would make every live state file read malformed on the first
@@ -625,6 +625,7 @@ class TrickleState:
     capped: bool
     consecutive_barren_runs: int
     consecutive_failed_runs: int
+    consecutive_deferred_runs: int
     last_productive_at: datetime | None
     last_scheduled_target_date: date | None
     census_fired: bool | None
@@ -669,6 +670,9 @@ class TrickleState:
             consecutive_failed_runs=defaulted(
                 doc, 'consecutive_failed_runs', state_docs.as_count, 0
             ),
+            consecutive_deferred_runs=defaulted(
+                doc, 'consecutive_deferred_runs', state_docs.as_count, 0
+            ),
             last_productive_at=defaulted(
                 doc, 'last_productive_at', state_docs.as_datetime, None
             ),
@@ -706,6 +710,7 @@ class TrickleState:
             'capped': self.capped,
             'consecutive_barren_runs': self.consecutive_barren_runs,
             'consecutive_failed_runs': self.consecutive_failed_runs,
+            'consecutive_deferred_runs': self.consecutive_deferred_runs,
             'last_productive_at': isoformat_or_none(self.last_productive_at),
             'last_scheduled_target_date': isoformat_or_none(
                 self.last_scheduled_target_date
@@ -859,19 +864,22 @@ def fold_night(
     nothing. ``state.barren_escalated`` is False here; :func:`write_night`
     records the real value.
 
-    ==========  =============  =============  ======================
-    outcome     barren streak  failed streak  last_productive_at
-    ==========  =============  =============  ======================
-    productive  reset          reset          stamped with recorded_at
-    quiet       reset          reset          carried
-    barren      +1             reset          carried
-    failed      carried        +1             carried
-    deferred    carried        carried        carried
-    ==========  =============  =============  ======================
+    ==========  =============  =============  ===============  ========================
+    outcome     barren streak  failed streak  deferred streak  last_productive_at
+    ==========  =============  =============  ===============  ========================
+    productive  reset          reset          reset            stamped with recorded_at
+    quiet       reset          reset          reset            carried
+    barren      +1             reset          reset            carried
+    failed      carried        +1             carried          carried
+    deferred    carried        carried        +1               carried
+    ==========  =============  =============  ===============  ========================
 
     A failed night is evidence about the run, not about signal; a deferred
-    night coded nothing, so it observed neither. Moving a streak on either
-    would let a crash or cap weather erase a real streak or fake one.
+    night coded nothing, so it observed neither. Moving the barren or
+    failed streak on either would let a crash or cap weather erase a real
+    streak or fake one. A deferred night moves only its own streak, which
+    counts the deferred nights since the last finished one: only a
+    finished pass runs a retry, so a failed night carries it.
 
     A census FIRE against the streak's anchor and path increments
     ``census_fire_streak``, any other FIRE restarts it at 1, a NO-FIRE
@@ -887,7 +895,7 @@ def fold_night(
     counts its date in ``retry_backlog`` (:func:`fold_retry_backlog`)."""
     outcome = run.outcome
     today = run.recorded_at.date()
-    barren_streak, failed_streak = _fold_streaks(prior, outcome)
+    streaks = _fold_streaks(prior, outcome)
     completion_streak = _fold_completion_error_streak(
         0 if prior is None else prior.completion_error_streak, run.census
     )
@@ -916,8 +924,9 @@ def fold_night(
         commit_made=run.commit_made,
         budget_suppressed=run.budget_suppressed,
         capped=run.capped,
-        consecutive_barren_runs=barren_streak,
-        consecutive_failed_runs=failed_streak,
+        consecutive_barren_runs=streaks.barren,
+        consecutive_failed_runs=streaks.failed,
+        consecutive_deferred_runs=streaks.deferred,
         last_productive_at=(
             run.recorded_at if outcome == RunOutcome.PRODUCTIVE
             else None if prior is None
@@ -941,22 +950,36 @@ def fold_night(
     return NightFold(prior, run, state, never_run, MappingProxyType(retry.abandoned))
 
 
-def _fold_streaks(
-    prior: TrickleState | None, outcome: RunOutcome
-) -> tuple[int, int]:
-    """``(consecutive_barren_runs, consecutive_failed_runs)`` after a night
-    with *outcome*."""
-    barren = 0 if prior is None else prior.consecutive_barren_runs
-    failed = 0 if prior is None else prior.consecutive_failed_runs
+class Streaks(NamedTuple):
+    """The consecutive barren, failed and deferred runs a night records."""
+
+    barren: int
+    failed: int
+    deferred: int
+
+
+def _fold_streaks(prior: TrickleState | None, outcome: RunOutcome) -> Streaks:
+    """The streaks after a night with *outcome*, per :func:`fold_night`'s
+    table."""
+    carried = (
+        Streaks(0, 0, 0) if prior is None
+        else Streaks(
+            barren=prior.consecutive_barren_runs,
+            failed=prior.consecutive_failed_runs,
+            deferred=prior.consecutive_deferred_runs,
+        )
+    )
     match outcome:
         case RunOutcome.BARREN:
-            return barren + 1, 0
+            return Streaks(barren=carried.barren + 1, failed=0, deferred=0)
         case RunOutcome.FAILED:
-            return barren, failed + 1
+            return carried._replace(failed=carried.failed + 1)
         case RunOutcome.DEFERRED:
-            return barren, failed
+            return carried._replace(deferred=carried.deferred + 1)
+        case RunOutcome.PRODUCTIVE | RunOutcome.QUIET:
+            return Streaks(0, 0, 0)
         case _:
-            return 0, 0
+            assert_never(outcome)
 
 
 def _schedule_cursor(
