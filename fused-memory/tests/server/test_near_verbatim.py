@@ -1,25 +1,22 @@
 """A write is near-verbatim to a reference only when it adds nothing to it.
 
-Near-verbatim means the same words and symbols, near-identically ordered: only
-case, whitespace and small reorderings may differ. A high character similarity
-is not enough. One changed number, a dropped ``not`` or a flipped operator in a
-long text still scores above the ratio threshold, and each of those changes
-what the text says. Every text here is synthetic.
+Near-verbatim means the same words and symbols in the same order: only case and
+whitespace may differ. A high character similarity is not the test. One changed
+number, a dropped ``not``, a flipped operator or two swapped numbers leave a
+long text almost character-identical, and each changes what the text says.
+Every text here is synthetic.
 """
 
 from __future__ import annotations
 
 import json
+import random
 from collections.abc import Iterator
 
 import pytest
 from _write_triage_calibration_fixtures import CALIBRATION_FIXTURES, FIXTURES_DIR
 
-from fused_memory.server.near_verbatim import (
-    NEAR_VERBATIM_MIN_RATIO,
-    is_near_verbatim,
-    text_similarity,
-)
+from fused_memory.server.near_verbatim import is_near_verbatim
 
 _LONG_ENTRY = (
     'The nightly verify of the ledger service finishes in 14m22s on the shared '
@@ -34,7 +31,9 @@ _LONG_ENTRY = (
     'the gate by hand should invoke the screen script from the checkout root, '
     'never from a package directory, since the script resolves its config '
     'relative to the root. A failed run leaves its log under the task scratch '
-    'directory, and the next run overwrites it.'
+    'directory, and the next run overwrites it. The uploader retries 3 times '
+    'with a 5 second wait, and on the release branch the merge worker runs '
+    'before the hook.'
 )
 _PREPENDED_CORRECTION = 'Correction to the earlier entry: the flag is no longer unset. '
 
@@ -54,17 +53,14 @@ class TestAnUnchangedTextIsNearVerbatim:
 
         assert is_near_verbatim(reflowed, _LONG_ENTRY)
 
+    def test_spacing_beside_a_symbol_does_not_count_as_a_change(self) -> None:
+        assert is_near_verbatim(_with('x > 5', 'x>5'), _LONG_ENTRY)
+
 
 class TestATextThatSaysSomethingNewIsNotNearVerbatim:
 
-    def test_a_changed_measurement_is_not_near_verbatim_though_it_scores_above_the_ratio(
-        self,
-    ) -> None:
-        updated = _with('14m22s', '10m57s')
-
-        assert len(_LONG_ENTRY) >= 900
-        assert text_similarity(updated, _LONG_ENTRY) >= NEAR_VERBATIM_MIN_RATIO
-        assert not is_near_verbatim(updated, _LONG_ENTRY)
+    def test_a_changed_measurement_is_not_near_verbatim(self) -> None:
+        assert not is_near_verbatim(_with('14m22s', '10m57s'), _LONG_ENTRY)
 
     def test_a_prepended_correction_is_not_near_verbatim(self) -> None:
         corrected = _PREPENDED_CORRECTION + _LONG_ENTRY
@@ -82,17 +78,34 @@ class TestATextThatSaysSomethingNewIsNotNearVerbatim:
     def test_a_one_token_change_of_meaning_is_not_near_verbatim(
         self, old: str, new: str,
     ) -> None:
-        changed = _with(old, new)
+        assert not is_near_verbatim(_with(old, new), _LONG_ENTRY)
 
-        assert text_similarity(changed, _LONG_ENTRY) >= NEAR_VERBATIM_MIN_RATIO
-        assert not is_near_verbatim(changed, _LONG_ENTRY)
+    @pytest.mark.parametrize(
+        ('old', 'new'),
+        [
+            pytest.param(
+                'retries 3 times with a 5 second wait',
+                'retries 5 times with a 3 second wait',
+                id='swapped-numbers',
+            ),
+            pytest.param(
+                'the merge worker runs before the hook',
+                'the hook runs before the merge worker',
+                id='swapped-actors',
+            ),
+        ],
+    )
+    def test_a_reordering_of_the_same_tokens_is_not_near_verbatim(
+        self, old: str, new: str,
+    ) -> None:
+        assert not is_near_verbatim(_with(old, new), _LONG_ENTRY)
 
-    def test_a_reordering_that_swaps_the_actors_is_not_near_verbatim(self) -> None:
-        original = 'the merge worker runs before the hook'
-        swapped = 'the hook runs before the merge worker'
+    def test_a_long_text_with_its_words_shuffled_is_not_near_verbatim(self) -> None:
+        words = (_LONG_ENTRY + ' ') * 40
+        shuffled = words.split()
+        random.Random(7155).shuffle(shuffled)
 
-        assert text_similarity(swapped, original) < NEAR_VERBATIM_MIN_RATIO
-        assert not is_near_verbatim(swapped, original)
+        assert not is_near_verbatim(' '.join(shuffled), words)
 
     def test_a_paraphrase_is_not_near_verbatim(self) -> None:
         paraphrase = (
