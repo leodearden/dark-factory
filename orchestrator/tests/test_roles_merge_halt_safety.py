@@ -112,7 +112,7 @@ _GATE_PATTERN = r'esc\.category in \{([^}]*)\}'
 _REGISTERED_CATEGORIES: frozenset[str] = frozenset(
     c.value for c in EscalationCategory
 )
-_SNAKE_CASE_TOKEN_PATTERN = r'\b[a-z][a-z0-9]*(?:_[a-z0-9]+)+\b'
+_SNAKE_CASE_TOKEN_PATTERN = r'\b[a-z][a-z0-9_]*_[a-z0-9]+\b'
 _HALT_CATEGORY_SUFFIXES: frozenset[str] = frozenset(
     c.rsplit('_', 1)[1] for c in MERGE_HALT_ESCALATION_CATEGORIES
 )
@@ -313,8 +313,11 @@ def test_safety_rule_names_no_category_outside_the_tuple() -> None:
         'dropped from the harness gate and its name is now stale prose in the '
         "steward's rule -- delete it -- or the rule gained a category the gate "
         'does not actually halt on, which tells the steward to hands-off an '
-        'escalation that never stops the merge queue.  Do NOT silence this by '
-        'widening the tuple; the tuple must equal the gate.'
+        'escalation that never stops the merge queue.  Or, if neither the gate '
+        'nor the rule changed, a newly registered EscalationCategory value '
+        'coincides with an identifier or word the rule already uses -- rename '
+        'the category or reword the rule.  Do NOT silence this by widening the '
+        'tuple; the tuple must equal the gate.'
     )
 
 
@@ -348,8 +351,11 @@ def test_registry_scan_finds_a_registered_category_of_any_suffix() -> None:
 
 
 def test_halt_shaped_scan_flags_only_unregistered_spellings() -> None:
-    text = '`unmerge_state` `unmerged_state` project_root'
-    assert _unregistered_halt_shaped_tokens(text) == {'unmerge_state'}
+    member = MERGE_HALT_ESCALATION_CATEGORIES[0]
+    head, tail = member.rsplit('_', 1)
+    prefixed, doubled = f'x{member}', f'{head}__{tail}'
+    text = f'`{prefixed}` `{doubled}` `{member}` project_root'
+    assert _unregistered_halt_shaped_tokens(text) == {prefixed, doubled}
 
 
 class TestHaltCategoriesAreBehaviourallyLoadBearing:
