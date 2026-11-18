@@ -4,16 +4,19 @@ An identity is an opaque content hash of every file the page loads. It is
 compared only for equality and never parsed. The server publishes two on
 every ``/api/v2/dashboard/`` response, through :class:`AssetBuildHeaders`:
 the build it started with (``AssetBuild.started``) and the build on disk now
-(``AssetBuild.on_disk()``). A page compares them with the build it booted
-with, in ``static/redux/asset_skew.js``, which holds the verdict rule and
-its rationale (task 10720).
+(``AssetBuild.on_disk()``). The page learns the build it booted with from
+the ``df-asset-build`` meta that :func:`inject_page_build` fills in when
+``/`` is served. It compares the three in ``static/redux/asset_skew.js``,
+which holds the verdict rule and its rationale (task 10720).
 """
 
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import stat
+from html import escape
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -25,6 +28,15 @@ ASSET_BUILD_ON_DISK_HEADER = 'X-DF-Asset-Build-On-Disk'
 
 _IDENTITY_HEX_CHARS = 16
 _DASHBOARD_API_PREFIX = '/api/v2/dashboard/'
+
+logger = logging.getLogger(__name__)
+
+
+def _page_build_meta(identity: str) -> str:
+    return f'<meta name="df-asset-build" content="{escape(identity)}" />'
+
+
+PAGE_BUILD_PLACEHOLDER = _page_build_meta('')
 
 Fingerprint = tuple[tuple[str, int, int], ...]
 
@@ -131,3 +143,22 @@ def _stamp_build(message: Message, build: AssetBuild | None) -> None:
     for name, identity in ((ASSET_BUILD_STARTED_HEADER, build.started), (ASSET_BUILD_ON_DISK_HEADER, build.on_disk())):
         if identity is not None:
             headers.append(name, identity)
+
+
+def inject_page_build(html: str, identity: str | None) -> str:
+    """Fill index.html's one df-asset-build placeholder, or serve the page unmodified.
+
+    An unmodified page carries no identity, so it stays inert: never a 500.
+    """
+    if identity is None:
+        logger.warning('serving / with no asset-build identity: the build on disk is unknown')
+        return html
+    placeholders = html.count(PAGE_BUILD_PLACEHOLDER)
+    if placeholders != 1:
+        logger.warning(
+            'serving / with no asset-build identity: index.html holds %d %s placeholders, not 1',
+            placeholders,
+            PAGE_BUILD_PLACEHOLDER,
+        )
+        return html
+    return html.replace(PAGE_BUILD_PLACEHOLDER, _page_build_meta(identity))
