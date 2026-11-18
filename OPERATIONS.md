@@ -4325,7 +4325,8 @@ exhaustions, each prefixed with the label:
   loud `legibility account pool resolved NO usable accounts` warning naming the
   roster, or with `legibility account pool could not load its roster` when the
   file is unreadable or malformed. The night is still recorded as DEFERRED
-  rather than crashing (task 5635).
+  rather than crashing (task 5635), so after a week of it the trickle health
+  probe's deferred-streak verdict fires.
 - `<label>: no account completed this invocation in one pass over the
   7-account pool and the gate still considers max-c usable — so this is not a
   capacity limit ...`. This is neither weather nor a missing token: every
@@ -4640,6 +4641,22 @@ is how an operator ends up tuning the sampler for a crashed coder:
   at zero the night is simply unfinished and where signal stopped is
   **unknown** (the nightly records its crash sentinel before the digest
   stage, so a `failed` night with nothing selected is ordinary).
+- **deferred streak past recovery** — the usage cap has deferred the coding on
+  `RETRY_MAX_AGE_DAYS` (7) recorded nights since the last finished one
+  (`scripts/legibility/trickle_state.py::deferred_streak_past_recovery`). One
+  deferred night is weather. A week of them has outlasted a weekly cap reset,
+  and the retry backlog can no longer recover its oldest owed date, which the
+  verdict names; each further deferred night loses one more. Read the
+  DEFERRED reason in `journalctl --user -u legibility-trickle@<project>` (the
+  verdict prints the `--since` window). `no pool accounts resolved` is a
+  config fault that never clears on its own (task 5635), and accounts named
+  with credentials rejected need operator action; see the pool exhaustions
+  under "Legibility trickle accounts (03:00)". Only an all-capped pool is weather,
+  and then there is nothing to do. The abandoned dates' sessions stay minable
+  by the census within `census.ledger_retention_days`. A failed streak takes
+  precedence over this verdict, and this verdict takes precedence over the
+  barren ones; it names no door and reports the carried
+  `consecutive_barren_runs`.
 - **`barren` streak** — the run completed and the sampler's doors dropped
   everything. Compare `budgets.max_daily_digest_bytes` against
   `sampling.top_fraction` / `per_stratum_min`; the verdict names which door
@@ -4656,14 +4673,18 @@ is how an operator ends up tuning the sampler for a crashed coder:
   but the last recorded run was `deferred`: the usage cap deferred its
   coding, so it re-observed neither door. The streak is still unresolved.
   There is no crash to clear and no door to name; the deferral clears at the
-  cap reset, so re-read the probe once a run has completed.
+  cap reset, so re-read the probe once a run has completed. This applies only
+  while the deferral is short of recovery: at `consecutive_deferred_runs=7`
+  the deferred-streak verdict above replaces it.
 - **`missing` / `malformed` / stale** — the recorder itself stopped. The
   nightly is not writing state at all, so neither streak means anything yet.
 - **`quiet`** — a legitimately quiet night. Never alarms, by construction.
 - **`deferred`** — a usage-cap night (`coder.is_cap_deferral`): its digests
   were selected and the cap deferred their coding. No action; it self-clears
-  at the reset. It keeps `last_productive_at` and both streaks unchanged and
-  owes its date a retry (see "Retried nights").
+  at the reset. It keeps `last_productive_at`, the barren streak and the
+  failed streak unchanged, adds one to `consecutive_deferred_runs`, and owes
+  its date a retry (see "Retried nights"). A finished night resets
+  `consecutive_deferred_runs` and a failed one carries it.
 - **census fired without advancing** — the census trigger FIREd on at least N
   (default 3) consecutive recorded trickle nights while `last_census_at`
   stayed put, and every such night launches a paid census. A census deferred
@@ -4702,6 +4723,11 @@ mistaken for a gap. When every later night finishes, an outage of up to
 each later night that does not finish costs the oldest owed date. Never-run
 dates already past the window are abandoned in one WARNING,
 `abandoning <n> never-run date(s) <first>..<last>`.
+The progress probe's OK line prints
+`consecutive_deferred_runs=<n> (threshold 7)` and
+`retry_backlog=<n> owed (oldest <date>)` (`retry_backlog=0 owed` when nothing
+is owed), so a growing deferral or backlog is visible before any verdict
+fires.
 
 **The escalation it files.** `task_id=legibility-trickle-health-<project_id>`
 (deliberately distinct from the nightly's own
@@ -4721,7 +4747,9 @@ info escalation, on the first night after deploy, and its detail says why.
 Those silence cases apply to the progress and liveness probes only: a
 census-probe failure **always** posts, because nothing else escalates an
 unadvanced-fire streak. A non-zero exit is the authoritative signal whether or
-not the POST landed.
+not the POST landed. The deferred-streak verdict posts like any other failing
+progress verdict: a deferred night records `barren_escalated: false`, so
+nothing suppresses it.
 
 The nightly escalates when the barren streak reaches its threshold
 (`trickle_state.DEFAULT_MAX_BARREN_RUNS` (3), or
