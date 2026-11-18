@@ -17,6 +17,7 @@ const { writeQueue } = window.DF_MEMORY_READINGS;
 const { todaySpend, spendText } = window.DF_SPEND_READINGS;
 const { DEFAULT_WINDOW: CHIP_DEFAULT_WINDOW, TAB_WINDOWS: CHIP_TAB_WINDOWS, windowForTab, windowEcho, highlightedWindow, pendingWindow } = window.DF_WINDOW_CHIP;
 const { tabRenderFailureNotice, chromeRenderFailureNotice, pageRenderFailureNotice } = window.DF_RENDER_FAILURE;
+const { createAssetSkewWatcher, pageAssetBuild, assetSkewGuardStorage, assetSkewNotice } = window.DF_ASSET_SKEW;
 const DD = window.DF_DATA;
 
 // Tweaks helpers are attached directly to window
@@ -78,6 +79,15 @@ function ChromeBoundary({ region, testId, className, children }) {
   );
 }
 
+// One per page: from each poll set's receipts it decides whether this page,
+// the server and the disk are one build, and reloads a stale page itself.
+const assetSkewWatcher = createAssetSkewWatcher({
+  pageBuild: pageAssetBuild(document),
+  storage: assetSkewGuardStorage(),
+  now: () => Date.now(),
+  reload: () => window.location.reload(),
+});
+
 function App() {
   const [tab, setTab] = uS('overview');
   // Cross-tab handoff for the memory-eval escalation links. The SPA has no
@@ -105,10 +115,15 @@ function App() {
     document.documentElement.style.setProperty('--pad', tw.density === 'compact' ? '8px' : tw.density === 'roomy' ? '16px' : '12px');
   }, [tw.density]);
 
-  // Re-render when the data loader refreshes window.DF_DATA.
+  // Re-render when the data loader refreshes window.DF_DATA. The skew watcher
+  // observes here, in the handler and never in render, because it may reload.
   const [, setDataTick] = uS(0);
+  const [assetSkew, setAssetSkew] = uS(null);
   uE(() => {
-    const onRefresh = () => setDataTick(n => n + 1);
+    const onRefresh = () => {
+      setAssetSkew(assetSkewWatcher.observe(DD.__receipt));
+      setDataTick(n => n + 1);
+    };
     window.addEventListener('df-data-refresh', onRefresh);
     return () => window.removeEventListener('df-data-refresh', onRefresh);
   }, []);
@@ -204,6 +219,8 @@ function App() {
   // endpoints answer: the one loading notice names every path with no receipt yet.
   const staleNotices = staleNoticesForTab({ paths: TAB_POLL_PATHS[tab], stale: DD.__stale || {}, now: Date.now() });
   const loadingNotice = loadingNoticeForTab({ paths: TAB_POLL_PATHS[tab], receipt: DD.__receipt || {}, stale: DD.__stale || {} });
+  const skewNotice = assetSkewNotice(assetSkew);
+  const pageDiffersFromServer = assetSkew?.pageDiffersFromServer === true;
 
   function renderTab() {
     switch (tab) {
@@ -296,6 +313,19 @@ function App() {
               unconditional so the last-good payload refreshOne deliberately
               preserved stays on screen — marked as old, not blanked. Only the
               boundary replaces it, when the tab's own render throws. */}
+          {skewNotice && (
+            <div className="col-span-12"
+                 data-testid="asset-skew-banner"
+                 style={noticeBannerStyle('var(--accent)')}>
+              {skewNotice.text}
+              {skewNotice.offersReload && (
+                <button onClick={() => window.location.reload()}
+                  className="multi" style={{ cursor: 'pointer', marginLeft: 8 }}>
+                  reload
+                </button>
+              )}
+            </div>
+          )}
           {staleNotices.map(notice => (
             <div key={notice.path} className="col-span-12"
                  data-testid="endpoint-stale-banner"
@@ -311,7 +341,7 @@ function App() {
             </div>
           )}
           {/* The keyed .body remounts this boundary per tab, so switching tabs retries. */}
-          <RenderFailureBoundary describe={thrown => tabRenderFailureNotice(tabLabel, thrown)}
+          <RenderFailureBoundary describe={thrown => tabRenderFailureNotice(tabLabel, thrown, pageDiffersFromServer)}
                                  testId="tab-render-failure-banner"
                                  className="col-span-12"
                                  style={noticeBannerStyle('var(--bad)')}>{renderTab()}</RenderFailureBoundary>
