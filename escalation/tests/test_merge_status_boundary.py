@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import importlib.util
+import re
 import subprocess
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextvars import ContextVar
@@ -42,7 +43,14 @@ from orchestrator.merge_lane import (
 from orchestrator.merge_lane import worker as merge_worker
 from orchestrator.merge_lane.intake import register_and_enqueue_merge_request
 from orchestrator.merge_lane.queue_store import MergeQueueStore
-from shared.merge_state import EPISTEMIC_STATES, OUTCOME_STATES, MergeReason, MergeState
+from shared.merge_state import (
+    EPISTEMIC_STATES,
+    LIVE_STATES,
+    MERGE_REASONS,
+    OUTCOME_STATES,
+    MergeReason,
+    MergeState,
+)
 from shared.merge_subject import format_merge_subject
 
 from escalation import git_authority
@@ -628,6 +636,112 @@ async def test_consumer_skill_branches_on_the_server_answer(
         f'{row}: the skip was removed without an implementation; assert each '
         f'consuming skill branches on state={state!r}, reason={reason!r}.'
     )
+
+
+#: The closed disposition vocabulary a route span or switch row states, in bold.
+_DISPOSITIONS = (
+    'WAIT', 'ACCEPT', 'REPORT', 'RESUBMIT', 'FOLLOW THE MEMBERS', 'ABORT', 'HAND OFF',
+    'VERIFY', 'NOT IN FLIGHT HERE', 'FAIL CLOSED',
+)
+_DISPOSITION_RE = re.compile(r'\*\*(' + '|'.join(map(re.escape, _DISPOSITIONS)) + r')\*\*')
+_ROUTABLE_PARTITIONS: Mapping[str, frozenset[MergeState]] = MappingProxyType({
+    'LIVE_STATES': LIVE_STATES,
+})
+_ROUTE_KEYS = frozenset({
+    *(str(state) for state in MergeState),
+    *(str(reason) for reason in MergeReason),
+    *_ROUTABLE_PARTITIONS,
+    *(disposition for disposition in _DISPOSITIONS if ' ' not in disposition),
+})
+_SWITCH_ROW_RE = re.compile(r'^\|\s*`([a-z_]+)`\s*\|')
+
+
+def _families(guard: ModuleType) -> tuple[Any, Any]:
+    """The route and switch span families, built from *guard*'s own SpanFamily."""
+    route = guard.SpanFamily(
+        begin='merge-status-route:begin',
+        end='merge-status-route:end',
+        name_re=re.compile(r'answer=([A-Za-z_]+(?:,[A-Za-z_]+)*)'),
+        known_names=None,
+    )
+    switch = guard.SpanFamily(
+        begin='merge-status-switch:begin',
+        end='merge-status-switch:end',
+        name_re=re.compile(r'of=([A-Z][A-Z0-9_]*)'),
+        known_names=frozenset({'MERGE_REASONS'}),
+    )
+    return route, switch
+
+
+def _single_disposition(text: str, *, source: str, where: str) -> str:
+    found = sorted(set(_DISPOSITION_RE.findall(text)))
+    assert len(found) == 1, (
+        f'{source}: {where} must state exactly one bold disposition of '
+        f'{list(_DISPOSITIONS)}; found {found}'
+    )
+    return found[0]
+
+
+def _routes_in(guard: ModuleType, text: str, *, source: str) -> dict[str, str]:
+    """Every merge-status-route key in *text*, mapped to its span's disposition."""
+    route_family, _ = _families(guard)
+    routes: dict[str, str] = {}
+    for keys, body in guard.extract_spans(text, source=source, family=route_family):
+        where = f'the route span answer={keys}'
+        disposition = _single_disposition(body, source=source, where=where)
+        for key in keys.split(','):
+            assert key in _ROUTE_KEYS, (
+                f'{source}: {where} routes {key!r}, which is no MergeState or MergeReason '
+                f'value, routable partition {sorted(_ROUTABLE_PARTITIONS)} or switch class'
+            )
+            assert key not in routes, f'{source}: {where} routes {key!r} a second time'
+            routes[key] = disposition
+    return routes
+
+
+def _switch_in(guard: ModuleType, text: str, *, source: str) -> dict[MergeReason, str]:
+    """The shared switch's action class for every MergeReason, one table row each."""
+    _, switch_family = _families(guard)
+    spans = guard.extract_spans(text, source=source, family=switch_family)
+    assert len(spans) == 1, f'{source}: {len(spans)} merge-status-switch spans; exactly one expected'
+    (_, body), = spans
+    actions: dict[MergeReason, list[str]] = {}
+    for line in body.splitlines():
+        match = _SWITCH_ROW_RE.match(line)
+        if match is None or match.group(1) not in MERGE_REASONS:
+            continue
+        reason = MergeReason(match.group(1))
+        actions.setdefault(reason, []).append(
+            _single_disposition(line, source=source, where=f'the switch row for {reason}'),
+        )
+    missing = sorted(MERGE_REASONS - actions.keys())
+    duplicated = sorted(reason for reason, found in actions.items() if len(found) > 1)
+    assert not missing and not duplicated, (
+        f'{source}: the merge-status-switch table needs exactly one row per MERGE_REASONS '
+        f'member; missing {missing}, duplicated {duplicated}'
+    )
+    return {reason: found for reason, (found,) in actions.items()}
+
+
+def _resolve(
+    routes: Mapping[str, str],
+    switch: Mapping[MergeReason, str],
+    state: MergeState,
+    reason: MergeReason | None,
+    *,
+    source: str,
+) -> str:
+    """The disposition of the one route key that answers (state, reason)."""
+    if reason is None:
+        candidates = {state, *(name for name, states in _ROUTABLE_PARTITIONS.items() if state in states)}
+    else:
+        candidates = {reason, switch[reason]}
+    matched = sorted(key for key in candidates if key in routes)
+    assert len(matched) == 1, (
+        f'{source}: state={state!s}, reason={reason!s} must be routed by exactly one of '
+        f'{sorted(candidates)}; routed by {matched}'
+    )
+    return routes[matched[0]]
 
 
 @pytest.fixture(scope='module')
