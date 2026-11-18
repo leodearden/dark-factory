@@ -700,14 +700,26 @@ def test_section_3_renders_the_startup_witness_beside_the_service_restart_events
 
     section = markdown.split('### 3.')[1].split('### 4.')[0].splitlines()
     startup_at = _at(hours=2, minutes=56)
-    assert f'| {startup_at} | run-063e9795fcf6 |' in section
-    assert (f'| {_at(minutes=17, seconds=35)} | {SCOPED_CAP_LEAF} | {startup_at} '
-            '| run-063e9795fcf6 |') in section
+    startup_row = f'| {startup_at} | run-063e9795fcf6 |'
+    join_row = (f'| {_at(minutes=17, seconds=35)} | {SCOPED_CAP_LEAF} | {startup_at} '
+                '| run-063e9795fcf6 |')
+    restart_row = f'| {_at(days=1)} | orchestrator | merge landed |'
+    assert startup_row in section
+    assert join_row in section
     assert f'| {_at(days=13)} | max_concurrent_tasks | none in window | - |' in section
-    assert f'| {_at(days=1)} | orchestrator | merge landed |' in section
+    assert restart_row in section
     assert not [line for line in section
                 if 'run-before-apply' in line or 'run-at-window-end' in line]
     assert 'Service restarts:' not in section
+
+    window = f'[{APPLY.isoformat()}, {END.isoformat()})'
+    captions = [
+        next(i for i, line in enumerate(section) if line.startswith(prefix))
+        for prefix in ('Orchestrator startups ', 'Config reloads ', '`service_restart` events ')
+    ]
+    assert all(f'in {window}' in section[i] for i in captions)
+    rows = [section.index(row) for row in (startup_row, join_row, restart_row)]
+    assert captions[0] < rows[0] < captions[1] < rows[1] < captions[2] < rows[2]
 
 
 def _cli(runs_db_path, escalations, *extra):
