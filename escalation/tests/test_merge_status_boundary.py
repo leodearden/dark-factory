@@ -630,6 +630,223 @@ async def test_consumer_skill_branches_on_the_server_answer(
     )
 
 
+@pytest.fixture(scope='module')
+def alpha_guard() -> ModuleType:
+    return _load_alpha_guard()
+
+
+_FIXTURE_SKILL = 'fixture-skill.md'
+
+_ROUTES_GREEN = """\
+<!-- merge-status-route:begin answer=LIVE_STATES,WAIT -->
+A live state or a wait-state reason — **WAIT**: keep polling. Plain ABORT and WAIT_REASONS are prose.
+<!-- merge-status-route:end -->
+<!-- merge-status-route:begin answer=prior_run_terminal -->
+→ **REPORT** `last_outcome` to the human and stop.
+<!-- merge-status-route:end -->
+<!-- merge-status-route:begin answer=never_submitted -->
+→ **RESUBMIT** (go back to step 3).
+<!-- merge-status-route:end -->
+"""
+
+_ROUTES_TWO_KEYWORDS = """\
+<!-- merge-status-route:begin answer=prior_run_terminal -->
+→ **REPORT** `last_outcome`, or **ABORT**.
+<!-- merge-status-route:end -->
+"""
+
+_ROUTES_NO_KEYWORD = """\
+<!-- merge-status-route:begin answer=prior_run_terminal -->
+→ report `last_outcome`; ABORT in plain prose and **WAIT_REASONS** are not keywords.
+<!-- merge-status-route:end -->
+"""
+
+_ROUTES_DUPLICATE_KEY = """\
+<!-- merge-status-route:begin answer=never_submitted -->
+→ **RESUBMIT**.
+<!-- merge-status-route:end -->
+<!-- merge-status-route:begin answer=done,never_submitted -->
+→ **ACCEPT**.
+<!-- merge-status-route:end -->
+"""
+
+_ROUTES_UNKNOWN_KEY = """\
+<!-- merge-status-route:begin answer=never_submited -->
+→ **RESUBMIT**.
+<!-- merge-status-route:end -->
+"""
+
+
+async def test_routes_in_maps_every_key_of_every_route_span(alpha_guard: ModuleType) -> None:
+    routes = _routes_in(alpha_guard, _ROUTES_GREEN, source=_FIXTURE_SKILL)
+
+    assert routes == {
+        'LIVE_STATES': 'WAIT',
+        'WAIT': 'WAIT',
+        'prior_run_terminal': 'REPORT',
+        'never_submitted': 'RESUBMIT',
+    }
+
+
+@pytest.mark.parametrize(
+    ('text', 'keys'),
+    [
+        pytest.param(_ROUTES_TWO_KEYWORDS, 'prior_run_terminal', id='two-keywords'),
+        pytest.param(_ROUTES_NO_KEYWORD, 'prior_run_terminal', id='no-keyword'),
+        pytest.param(_ROUTES_DUPLICATE_KEY, 'never_submitted', id='duplicate-key'),
+        pytest.param(_ROUTES_UNKNOWN_KEY, 'never_submited', id='unknown-key'),
+    ],
+)
+async def test_routes_in_rejects_every_malformed_route(
+    alpha_guard: ModuleType, text: str, keys: str,
+) -> None:
+    with pytest.raises(AssertionError) as excinfo:
+        _routes_in(alpha_guard, text, source=_FIXTURE_SKILL)
+
+    assert _FIXTURE_SKILL in str(excinfo.value)
+    assert keys in str(excinfo.value)
+
+
+_SWITCH_ROWS = {
+    'probe_failed': '| `probe_failed` | `unknown` | a probe raised | **WAIT**: retry on the backoff |',
+    'journaled_not_live': '| `journaled_not_live` | `journaled` | journal holds it | **WAIT**. Never resubmit |',
+    'prior_run_terminal': '| `prior_run_terminal` | `stale_record` | another run | **REPORT** `last_outcome` |',
+    'never_submitted': '| `never_submitted` | `no_record` | no tier holds it | **NOT IN FLIGHT HERE**: consumer decides |',
+    'coalesce_train_id': '| `coalesce_train_id` | `stale_record` | a train | **FOLLOW THE MEMBERS** |',
+    'landing_unattributable': '| `landing_unattributable` | any but `unknown` | on main, unattributed | **VERIFY** at once |',
+}
+
+
+def _switch_fixture(*rows: str, before: str = '', after: str = '') -> str:
+    table = '\n'.join((
+        '| `reason` | rides on | meaning | action |',
+        '|---|---|---|---|',
+        *rows,
+        '| any reason not listed here | — | the vocabulary grew | **FAIL CLOSED**: stop |',
+    ))
+    return (
+        f'{before}<!-- merge-status-switch:begin of=MERGE_REASONS -->\n\n{table}\n\n'
+        f'<!-- merge-status-switch:end -->\n{after}'
+    )
+
+
+_SWITCH_AFTER_REASON_VOCAB = _switch_fixture(
+    *_SWITCH_ROWS.values(),
+    before=(
+        '<!-- merge-state-vocab:begin partition=MERGE_REASONS\n'
+        '     The guard checks this line, not the table below. -->\n'
+        'The reasons are `probe_failed`, `journaled_not_live`, `prior_run_terminal`, '
+        '`never_submitted`, `coalesce_train_id` and `landing_unattributable`.\n'
+        '<!-- merge-state-vocab:end -->\n\n'
+    ),
+    after='\n| `probe_failed` | a later table outside the switch | **ABORT** |\n',
+)
+
+
+async def test_switch_in_maps_every_reason_to_its_action_class(alpha_guard: ModuleType) -> None:
+    switch = _switch_in(alpha_guard, _switch_fixture(*_SWITCH_ROWS.values()), source=_FIXTURE_SKILL)
+
+    assert switch == {
+        MergeReason.probe_failed: 'WAIT',
+        MergeReason.journaled_not_live: 'WAIT',
+        MergeReason.prior_run_terminal: 'REPORT',
+        MergeReason.never_submitted: 'NOT IN FLIGHT HERE',
+        MergeReason.coalesce_train_id: 'FOLLOW THE MEMBERS',
+        MergeReason.landing_unattributable: 'VERIFY',
+    }
+
+
+async def test_switch_in_reads_only_the_switch_span_beside_the_reason_vocabulary(
+    alpha_guard: ModuleType,
+) -> None:
+    switch = _switch_in(alpha_guard, _SWITCH_AFTER_REASON_VOCAB, source=_FIXTURE_SKILL)
+
+    assert switch[MergeReason.probe_failed] == 'WAIT'
+    assert set(switch) == set(MergeReason)
+
+
+@pytest.mark.parametrize(
+    ('text', 'offender'),
+    [
+        pytest.param(
+            _switch_fixture(*(row for reason, row in _SWITCH_ROWS.items() if reason != 'landing_unattributable')),
+            'landing_unattributable',
+            id='missing-row',
+        ),
+        pytest.param(
+            _switch_fixture(*_SWITCH_ROWS.values(), _SWITCH_ROWS['probe_failed']),
+            'probe_failed',
+            id='duplicated-row',
+        ),
+    ],
+)
+async def test_switch_in_requires_exactly_one_row_per_reason(
+    alpha_guard: ModuleType, text: str, offender: str,
+) -> None:
+    with pytest.raises(AssertionError) as excinfo:
+        _switch_in(alpha_guard, text, source=_FIXTURE_SKILL)
+
+    assert _FIXTURE_SKILL in str(excinfo.value)
+    assert offender in str(excinfo.value)
+
+
+_FIXTURE_SWITCH: Mapping[MergeReason, str] = MappingProxyType({
+    MergeReason.probe_failed: 'WAIT',
+    MergeReason.journaled_not_live: 'WAIT',
+    MergeReason.prior_run_terminal: 'REPORT',
+    MergeReason.never_submitted: 'NOT IN FLIGHT HERE',
+    MergeReason.coalesce_train_id: 'FOLLOW THE MEMBERS',
+    MergeReason.landing_unattributable: 'VERIFY',
+})
+
+_FIXTURE_ROUTES: Mapping[str, str] = MappingProxyType({
+    'LIVE_STATES': 'WAIT',
+    'WAIT': 'WAIT',
+    'done': 'ACCEPT',
+    'prior_run_terminal': 'REPORT',
+})
+
+
+@pytest.mark.parametrize(
+    ('state', 'reason', 'expected'),
+    [
+        pytest.param(MergeState.stale_record, MergeReason.prior_run_terminal, 'REPORT', id='by-reason'),
+        pytest.param(MergeState.journaled, MergeReason.journaled_not_live, 'WAIT', id='by-switch-class'),
+        pytest.param(MergeState.queued, None, 'WAIT', id='by-live-partition'),
+        pytest.param(MergeState.done, None, 'ACCEPT', id='by-state'),
+    ],
+)
+async def test_resolve_routes_an_answer_through_exactly_one_key(
+    state: MergeState, reason: MergeReason | None, expected: str,
+) -> None:
+    resolved = _resolve(_FIXTURE_ROUTES, _FIXTURE_SWITCH, state, reason, source=_FIXTURE_SKILL)
+
+    assert resolved == expected
+
+
+@pytest.mark.parametrize(
+    ('routes', 'state', 'reason'),
+    [
+        pytest.param(_FIXTURE_ROUTES, MergeState.no_record, MergeReason.never_submitted, id='no-route'),
+        pytest.param(
+            {**_FIXTURE_ROUTES, 'journaled_not_live': 'ABORT'},
+            MergeState.journaled,
+            MergeReason.journaled_not_live,
+            id='two-routes',
+        ),
+    ],
+)
+async def test_resolve_rejects_an_answer_routed_zero_or_two_times(
+    routes: Mapping[str, str], state: MergeState, reason: MergeReason,
+) -> None:
+    with pytest.raises(AssertionError) as excinfo:
+        _resolve(routes, _FIXTURE_SWITCH, state, reason, source=_FIXTURE_SKILL)
+
+    message = str(excinfo.value)
+    assert _FIXTURE_SKILL in message
+    assert reason in message and _FIXTURE_SWITCH[reason] in message
+
+
 async def test_branch_key_in_the_skills_full_ref_form_resolves_a_prior_run_row(
     world: _World,
 ) -> None:
