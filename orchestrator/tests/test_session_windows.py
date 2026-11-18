@@ -110,8 +110,7 @@ def test_a_four_column_line_parses_to_a_window_with_its_title_intact() -> None:
 def test_a_parsed_window_is_frozen() -> None:
     (window,) = session_windows.parse_wmctrl_list('0x3200007 0 host title')
 
-    with pytest.raises(dataclasses.FrozenInstanceError):
-        window.title = 'other'  # type: ignore[misc]
+    pytest.raises(dataclasses.FrozenInstanceError, setattr, window, 'title', 'other')
 
 
 def test_every_window_id_is_canonical_however_wmctrl_spelled_it() -> None:
@@ -364,5 +363,4 @@ def test_wmctrl_window_probe_resolves_with_the_injected_sleep() -> None:
 def test_a_window_probe_is_frozen() -> None:
     probe = session_windows.wmctrl_window_probe(run=_wmctrl_run([]), sleep=_no_sleep)
 
-    with pytest.raises(dataclasses.FrozenInstanceError):
-        probe.live_window_ids = lambda: None  # type: ignore[misc]
+    pytest.raises(dataclasses.FrozenInstanceError, setattr, probe, 'live_window_ids', lambda: None)
