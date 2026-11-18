@@ -172,7 +172,7 @@ SKIP_BUCKETS: tuple[str, ...] = (
     'record_without_id',
     'slug_collision',
     'canonical_collision',
-    # from rename_one
+    # from fused-memory/src/fused_memory/maintenance/topic_slug_lockstep.py::rename_one
     'memory_not_found',
     'topic_moved_since_plan',
     'update_failed',
@@ -682,9 +682,9 @@ async def run(
 
     # Fail-CLOSED capability preflight: ONE probe per run, ABOVE the scroll.
     #
-    # ``run`` is the choke point precisely because
-    # ``topic_slug_lockstep.rename_one``'s own ``apply`` gate is PER RECORD:
-    # probing there would run the check once per target and -- since
+    # ``run`` is the choke point precisely because the ``apply`` gate of
+    # ``fused-memory/src/fused_memory/maintenance/topic_slug_lockstep.py::rename_one``
+    # is PER RECORD: probing there would run the check once per target and -- since
     # ``StoreMutationUnavailable`` subclasses ``RuntimeError`` -- be swallowed
     # by the per-record ``except Exception`` around the write, downgrading a
     # run-wide environment denial into N error rows inside a report that
@@ -898,9 +898,9 @@ DEFAULT_JSON_OUT = str(_REPO_ROOT / 'plans' / 'topic-slug-normalization-report.j
 DEFAULT_MD_OUT = str(_REPO_ROOT / 'plans' / 'topic-slug-normalization-report.md')
 
 #: Keys a skip line leaves out.  The bucket heading already names the reason
-#: or outcome, and ``response`` is
-#: :func:`topic_slug_lockstep.rename_one`'s whole write envelope, which the
-#: JSON keeps.
+#: or outcome, and ``response`` is the whole write envelope of
+#: ``fused-memory/src/fused_memory/maintenance/topic_slug_lockstep.py::rename_one``,
+#: which the JSON keeps.
 _SKIP_LINE_OMITTED_KEYS: frozenset[str] = frozenset({'reason', 'outcome', 'response'})
 
 

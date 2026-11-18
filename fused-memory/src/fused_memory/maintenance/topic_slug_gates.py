@@ -207,7 +207,8 @@ def pair_gate_blocks(renames, gate_tasks) -> tuple[list[GateGroup], list[dict]]:
 
     A renamed slug carrying MORE THAN ONE gate is refused as
     ``gate_ambiguous``: no group is built, so neither store moves.  A
-    :class:`GateGroup` moves exactly one gate, and :func:`rename_group`'s
+    :class:`GateGroup` moves exactly one gate, and
+    ``fused-memory/src/fused_memory/maintenance/topic_slug_lockstep.py::rename_group``'s
     commit-point argument — the single gate patch is the one atomic write of
     the pair — depends on that.  Moving one of several gates would strand the
     rest on the vacated slug, the same failure as moving none.  Refusing

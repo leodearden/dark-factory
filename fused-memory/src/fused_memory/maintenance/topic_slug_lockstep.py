@@ -16,8 +16,10 @@ that this migration caused it.  So the two halves are planned as a pair and
 refused as a pair.
 
 On the live path that promise rests on the GATE CENSUS, not on an operator's
-memory of which topics are gated: ``census_consolidation_gates`` reads every
-gate block out of each named task store, and the script's ``run`` refuses
+memory of which topics are gated:
+``fused-memory/src/fused_memory/maintenance/topic_slug_gates.py::census_consolidation_gates``
+reads every gate block out of each named task store, and
+``fused-memory/scripts/normalize_topic_slugs.py::run`` refuses
 ``--apply`` unless the census covers every swept project.  A store the census
 could not read is a gap it names, never a silent "no gates here".
 
@@ -99,7 +101,7 @@ async def rename_one(memory_service, rename: Rename, *, apply: bool) -> dict:
     """Move one record's topic, or report precisely why it was not moved.
 
     The only function here that writes.  Order is copied from
-    ``retro_stamp_topics.stamp_one`` and is load-bearing:
+    ``fused-memory/scripts/retro_stamp_topics.py::stamp_one`` and is load-bearing:
 
     1. **live re-read** (``get_memory_by_id``).  The plan's ids come off a
        scroll that may be minutes old on a corpus orchestrators are writing

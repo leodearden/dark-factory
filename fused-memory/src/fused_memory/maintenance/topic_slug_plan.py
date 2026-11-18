@@ -26,7 +26,9 @@ class Rename:
         project_id: The corpus this record lives in.  Carried on the row
             rather than inferred at the write, because collisions are scoped
             per project and the report interleaves both defaults.
-        memory_id: The Mem0 record id — how :func:`rename_one` addresses it.
+        memory_id: The Mem0 record id — how
+            ``fused-memory/src/fused_memory/maintenance/topic_slug_lockstep.py::rename_one``
+            addresses it.
         old_topic: The raw non-conforming value, verbatim.  Needed to detect
             a record whose topic moved between the plan and the write, and to
             probe the legacy slug for residue afterwards.
@@ -169,12 +171,14 @@ def plan_renames(
     #   sources_by_target     which legacy values want to fold onto a target
     #
     # *occupied_topics* / *canonical_ids_by_topic* carry the incumbents that
-    # are NOT in *records*.  ``enumerate_topic_bearing`` discards conforming
-    # records to keep a corpus sweep affordable, so on the live path the
-    # incumbent a fold would collide with has already been thrown away by the
-    # time this function runs — and a collision guard that cannot see the
-    # incumbent silently degrades into a namespace merger.  Tests that pass a
-    # complete record set (conforming rows included) need neither argument.
+    # are NOT in *records*.
+    # ``fused-memory/scripts/normalize_topic_slugs.py::enumerate_topic_bearing``
+    # discards conforming records to keep a corpus sweep affordable, so on
+    # the live path the incumbent a fold would collide with has already been
+    # thrown away by the time this function runs — and a collision guard that
+    # cannot see the incumbent silently degrades into a namespace merger.
+    # Tests that pass a complete record set (conforming rows included) need
+    # neither argument.
     observed_topics: set[str] = set(occupied_topics or ())
     canonical_ids_by_topic = {
         topic: list(ids) for topic, ids in (canonical_ids_by_topic or {}).items()
@@ -215,7 +219,8 @@ def plan_renames(
     # second — leaving the corpus in a state determined by iteration order, and
     # half-merged.  Deciding here, against the whole record set, makes the
     # verdict a property of the CORPUS instead.  Same posture, same reason, as
-    # ``retro_stamp_topics.stamp_one``'s ``stray_canonical_on_member``.
+    # ``fused-memory/scripts/retro_stamp_topics.py::stamp_one``'s
+    # ``stray_canonical_on_member``.
     collisions: dict[str, dict] = {}
     for record in records:
         metadata = record.get('metadata') or {}
