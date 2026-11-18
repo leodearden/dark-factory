@@ -184,10 +184,13 @@ def apply_isolated_env(mp: pytest.MonkeyPatch, root: Path) -> None:
 def enable_samplers(mp: pytest.MonkeyPatch) -> None:
     """Opt one test whose SUBJECT is a sampler under a lifespan back in.
 
-    Call it after any ``apply_isolated_env`` call in the same test, which would
-    otherwise reset the switch to off.  The caller must stub what the samplers
-    reach (the loops on ``dashboard.app``, or ``dashboard.loops.collect_snapshot``
-    / ``collect_metrics_snapshot``), or the real ones scan the host.
+    It starts all three samplers: burndown, metrics and quality.  Call it after
+    any ``apply_isolated_env`` call in the same test, which would otherwise
+    reset the switch to off.  Only burndown and metrics discover roots by
+    ps-scanning the host, so the caller must stub what those two reach (the
+    loops on ``dashboard.app``, or ``dashboard.loops.collect_snapshot`` /
+    ``collect_metrics_snapshot``).  Quality reads ``config.all_project_roots``,
+    which ``apply_isolated_env`` already isolates.
     """
     mp.setenv('DASHBOARD_SAMPLERS', 'on')
 

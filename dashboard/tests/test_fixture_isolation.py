@@ -392,7 +392,8 @@ class TestEveryLifespanRunsWithoutSamplers:
     That scan (dashboard/src/dashboard/data/orchestrator.py::find_running_orchestrators)
     reaches the operator's real roots and no env var can isolate it, so
     ``apply_isolated_env`` turns the samplers off for every lifespan in the
-    suite, and ``enable_samplers`` is the one opt-in.
+    suite.  ``enable_samplers`` opts a test back in; test_lifespan_samplers.py
+    states ``DASHBOARD_SAMPLERS`` itself, because the switch is its subject.
     """
 
     def test_client_fixture_lifespan_has_samplers_off(self, client):
