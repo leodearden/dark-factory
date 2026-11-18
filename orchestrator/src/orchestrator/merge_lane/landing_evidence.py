@@ -1098,7 +1098,10 @@ async def _differential_parent_ref(
     the dispatch-time main after an in-place rebase or a merge of main, and
     then ``record..tip`` carries other tasks' commits, whose capabilities this
     task must never be credited with: rung 3's citation test is what refuses
-    such a record.  Pinned by
+    such a record.  It cannot tell a foreign commit from the factory's own
+    uncited ones (``wip: amendment round N``, ``chore: save WIP before …``),
+    so those refuse the record too, by decision: the landing falls to rung 4,
+    which can cost an upgrade but never manufacture one.  Pinned by
     ``orchestrator/tests/test_landing_evidence.py::TestDeliveredChecksDifferentialRealGitDiscovery``.
     """
     first_parent = (f'{effect_check_sha}^1', DifferentialBaseline.first_parent)

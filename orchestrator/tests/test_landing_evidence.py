@@ -3480,13 +3480,15 @@ def _add_capability(repo: _Repo) -> str:
     return repo.commit('feat(6276): add the capability', {_CAPABILITY_FILE: _CAPABILITY_CONTENT})
 
 
-def _extend_capability(repo: _Repo) -> str:
-    """``task/6276``'s second commit: lines of its own on top of the first."""
+_OWN_EXTENSION = 'feat(6276): extend the capability'
+#: The subject ``TaskWorkflow._commit_amendment_wip`` gives a factory WIP save: it cites no task.
+_WIP_EXTENSION = 'wip: amendment round 1'
+
+
+def _extend_capability(repo: _Repo, subject: str = _OWN_EXTENSION) -> str:
+    """``task/6276``'s second commit, titled *subject*: lines of its own on top of the first."""
     current = (repo.root / _CAPABILITY_FILE).read_text()
-    return repo.commit(
-        'feat(6276): extend the capability',
-        {_CAPABILITY_FILE: current + _numbered('more', 30)},
-    )
+    return repo.commit(subject, {_CAPABILITY_FILE: current + _numbered('more', 30)})
 
 
 _REWRITTEN_CAPABILITY = 'def new_capability():\n    return 2\n'
@@ -3499,18 +3501,20 @@ def _land_and_rewrite(repo: _Repo, rewrites: dict[str, str]) -> None:
     repo.commit('refactor: rewrite the modules', rewrites)
 
 
-def _build_landed_capability(repo: _Repo, *, extended: bool) -> tuple[str, str]:
+def _build_landed_capability(repo: _Repo, *, extension: str | None) -> tuple[str, str]:
     """``task/6276`` fast-forwarded into main, then its file rewritten there.
 
-    Returns ``(base, tip)``: main before the branch, and the branch tip, which
-    is now an ancestor of main.  The rewrite keeps ``def new_capability`` but
-    drops every line the tip added, so survival rejects the landing.
+    The branch is :func:`_add_capability`, then, unless *extension* is None,
+    an :func:`_extend_capability` commit titled *extension*.  Returns
+    ``(base, tip)``: main before the branch, and the branch tip, which is now
+    an ancestor of main.  The rewrite keeps ``def new_capability`` but drops
+    every line the tip added, so survival rejects the landing.
     """
     base = repo.sha('main')
     repo.git('checkout', '-b', 'task/6276', 'main')
     tip = _add_capability(repo)
-    if extended:
-        tip = _extend_capability(repo)
+    if extension is not None:
+        tip = _extend_capability(repo, extension)
     _land_and_rewrite(repo, {_CAPABILITY_FILE: _REWRITTEN_CAPABILITY})
     return base, tip
 
@@ -3604,7 +3608,7 @@ class TestDeliveredChecksDifferentialRealGitDiscovery:
     ) -> None:
         """Two-commit branch fast-forwarded into main, then rewritten there."""
         repo = _Repo(real_git_repo)
-        base, tip = _build_landed_capability(repo, extended=True)
+        base, tip = _build_landed_capability(repo, extension=_OWN_EXTENSION)
         assert repo.is_ancestor(tip, 'main')
 
         verdict = await _discover_6276(real_git_ops, tip, branch_base_sha=base)
@@ -3627,7 +3631,7 @@ class TestDeliveredChecksDifferentialRealGitDiscovery:
     ) -> None:
         """One-commit branch fast-forwarded into main, no recorded base."""
         repo = _Repo(real_git_repo)
-        _base, tip = _build_landed_capability(repo, extended=False)
+        _base, tip = _build_landed_capability(repo, extension=None)
 
         verdict = await _discover_6276(real_git_ops, tip)
 
@@ -3642,7 +3646,7 @@ class TestDeliveredChecksDifferentialRealGitDiscovery:
     ) -> None:
         """A malformed, off-branch or tip-equal record falls through to ``tip^1``."""
         repo = _Repo(real_git_repo)
-        base, tip = _build_landed_capability(repo, extended=True)
+        base, tip = _build_landed_capability(repo, extension=_OWN_EXTENSION)
         recorded = {
             'malformed': lambda: 'not-a-sha',
             'foreign': lambda: _side_commit(repo, base),
@@ -3681,6 +3685,24 @@ class TestDeliveredChecksDifferentialRealGitDiscovery:
             assert verdict.probe['delivered_checks_baseline'] == 'unavailable'
             assert verdict.probe['delivered_checks_parent_ref'] is None
             assert verdict.probe['delivered_checks_legs'] == []
+
+    async def test_the_tasks_own_uncited_wip_commit_refuses_the_record(
+        self, real_git_ops: GitOps, real_git_repo: Path,
+    ) -> None:
+        """A pinned limit, not a defect: a factory WIP save cites no task, so
+        rung 3 cannot tell it from a foreign commit and refuses the record.
+        The differential falls back to ``tip^1``, which already carries the
+        capability, so a genuine landing reads no_signal (never a false accept)."""
+        repo = _Repo(real_git_repo)
+        base, tip = _build_landed_capability(repo, extension=_WIP_EXTENSION)
+
+        verdict = await _discover_6276(real_git_ops, tip, branch_base_sha=base)
+
+        assert verdict.accepted is False
+        assert verdict.reason == 'effect_absent'
+        assert verdict.probe['delivered_checks_baseline'] == 'first_parent'
+        assert verdict.probe['delivered_checks_parent_ref'] == f'{tip}^1'
+        assert verdict.probe['delivered_checks_outcome'] == 'no_signal'
 
     async def test_a_real_fork_point_outranks_the_record(
         self, real_git_ops: GitOps, real_git_repo: Path,
