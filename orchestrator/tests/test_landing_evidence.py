@@ -3457,6 +3457,36 @@ def _build_landed_capability(repo: _Repo, *, commits: int) -> tuple[str, str]:
     return base, tip
 
 
+def _build_partly_landed_capability(repo: _Repo) -> tuple[str, str, str]:
+    """``task/6276`` with commit 1 fast-forwarded into main and commit 2 not.
+
+    Returns ``(base, landed, tip)``: main before the branch, commit 1 (now an
+    ancestor of main) and commit 2, which is still only on the branch.
+    """
+    base = repo.sha('main')
+    repo.git('checkout', '-b', 'task/6276', 'main')
+    landed = repo.commit(
+        'feat(6276): add the capability',
+        {'pkg/cap.py': _numbered('cap', 30) + 'def new_capability():\n    return 1\n'},
+    )
+    repo.git('checkout', 'main')
+    repo.git('merge', '--ff-only', 'task/6276')
+    repo.git('checkout', 'task/6276')
+    tip = repo.commit(
+        'feat(6276): extend the capability',
+        {'pkg/cap.py': (repo.root / 'pkg/cap.py').read_text() + _numbered('more', 30)},
+    )
+    repo.git('checkout', 'main')
+    return base, landed, tip
+
+
+class _UnresolvedForkPointGitOps(GitOps):
+    """A real GitOps whose fork-point query fails, as a broken ``git merge-base`` would."""
+
+    async def merge_base_with_main(self, ref: str) -> str | None:
+        return None
+
+
 def _side_commit(repo: _Repo, base: str) -> str:
     """A commit off *base* that no ``task/6276`` commit descends from."""
     repo.git('checkout', '-b', 'side', base)
@@ -3546,20 +3576,7 @@ class TestDeliveredChecksDifferentialRealGitDiscovery:
     ) -> None:
         """Commit 1 landed, commit 2 still only on the branch."""
         repo = _Repo(real_git_repo)
-        base = repo.sha('main')
-        repo.git('checkout', '-b', 'task/6276', 'main')
-        landed = repo.commit(
-            'feat(6276): add the capability',
-            {'pkg/cap.py': _numbered('cap', 30) + 'def new_capability():\n    return 1\n'},
-        )
-        repo.git('checkout', 'main')
-        repo.git('merge', '--ff-only', 'task/6276')
-        repo.git('checkout', 'task/6276')
-        tip = repo.commit(
-            'feat(6276): extend the capability',
-            {'pkg/cap.py': (repo.root / 'pkg/cap.py').read_text() + _numbered('more', 30)},
-        )
-        repo.git('checkout', 'main')
+        base, landed, tip = _build_partly_landed_capability(repo)
 
         verdict = await _discover_6276(real_git_ops, tip, branch_base_sha=base)
 
@@ -3567,4 +3584,23 @@ class TestDeliveredChecksDifferentialRealGitDiscovery:
         assert verdict.reason == 'effect_absent'
         assert verdict.probe['delivered_checks_parent_ref'] == landed
         assert verdict.probe['delivered_checks_baseline'] == 'fork_point'
+        assert verdict.probe['delivered_checks_outcome'] == 'no_signal'
+
+    async def test_an_unresolved_fork_point_never_promotes_the_record(
+        self, real_git_ops: GitOps, real_git_repo: Path,
+    ) -> None:
+        """Commit 2 off main, fork point unresolvable: the record stays unconsulted."""
+        repo = _Repo(real_git_repo)
+        base, _landed, tip = _build_partly_landed_capability(repo)
+        assert not repo.is_ancestor(tip, 'main')
+
+        verdict = await _discover_6276(
+            _UnresolvedForkPointGitOps(real_git_ops.config, real_git_repo),
+            tip, branch_base_sha=base,
+        )
+
+        assert verdict.accepted is False
+        assert verdict.reason == 'effect_absent'
+        assert verdict.probe['delivered_checks_parent_ref'] == f'{tip}^1'
+        assert verdict.probe['delivered_checks_baseline'] == 'first_parent'
         assert verdict.probe['delivered_checks_outcome'] == 'no_signal'
