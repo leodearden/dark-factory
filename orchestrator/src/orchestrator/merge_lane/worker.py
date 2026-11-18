@@ -272,6 +272,7 @@ from orchestrator.remote_gate import GateIdentityPair, RunnerUnavailableKind
 from orchestrator.scheduler import StaleEvidenceRejection
 from orchestrator.task_priority import TaskPriorityLookup
 from orchestrator.task_status import WORKFLOW_PRESERVE_STATUSES
+from orchestrator.teardown import complete_despite_cancellation
 from orchestrator.unblock_types import BlockClass
 from orchestrator.verify import (
     FlakeObservationSink,
@@ -5181,9 +5182,14 @@ async def build_chain(
     # read off the snapshot rather than taken as a parameter: every
     # MergeRequest carries one, and that is the established idiom (see
     # merge_liveness._acquire_warm_verify_worktree).
-    lane, warm = await acquire_chain_build_lane(
-        git_ops, queue_snapshot[0].config, head_merge_commit,
-    )
+    try:
+        lane, warm = await acquire_chain_build_lane(
+            git_ops, queue_snapshot[0].config, head_merge_commit,
+        )
+    except BaseException as exc:
+        _log_build_interrupted('acquire', exc, started, depth=depth, built=0, acquire_ms=None)
+        raise
+    acquired = time.monotonic()
     if lane is None:
         return ChainResult(links=[], tip=head_merge_commit)
 
@@ -5262,11 +5268,18 @@ async def build_chain(
             links.append((req.task_id, res.merge_commit))
             link_request_ids.append(req.request_id)
             tip = res.merge_commit
-    except BaseException:
+    except BaseException as exc:
         # A cancellation mid-build must not strand a pool lane in ASSIGNED
         # (mirrors merge_to_main's except BaseException cleanup).
-        await release_chain_build_lane(git_ops, lane, warm=warm)
+        _log_build_interrupted(
+            'merge', exc, started,
+            depth=depth, built=len(links), acquire_ms=int((acquired - started) * 1000),
+        )
+        await complete_despite_cancellation(
+            release_chain_build_lane(git_ops, lane, warm=warm),
+        )
         raise
+    merged = time.monotonic()
 
     # One line per chain build, not per item — this runs on the dispatch path.
     # Logged BEFORE the empty-links return so every build that reached the
@@ -5288,9 +5301,10 @@ async def build_chain(
     logger.log(
         logging.WARNING if truncated_reason in CHAIN_FAULT_REASONS else logging.INFO,
         'build_chain: depth=%d built=%d tip=%s truncated_at=%s reason=%s '
-        'lane=%s elapsed_ms=%d',
+        'lane=%s elapsed_ms=%d acquire_ms=%d merge_ms=%d',
         depth, len(links), tip[:8], truncated_at, truncated_reason, lane.name,
         (time.monotonic() - started) * 1000,
+        (acquired - started) * 1000, (merged - acquired) * 1000,
     )
 
     if not links:
@@ -5306,6 +5320,23 @@ async def build_chain(
         links=links, tip=tip,
         truncated_at=truncated_at, truncated_reason=truncated_reason,
         lane=lane, lane_warm=warm, link_request_ids=tuple(link_request_ids),
+    )
+
+
+def _log_build_interrupted(
+    phase: Literal['acquire', 'merge'], exc: BaseException, started: float, *,
+    depth: int, built: int, acquire_ms: int | None,
+) -> None:
+    """The one WARNING naming the :func:`build_chain` phase *exc* cut short.
+
+    A deadline surfaces one frame up as a bare ``TimeoutError`` that cannot
+    see the phase; *exc* still propagates unchanged.
+    """
+    logger.warning(
+        'build_chain: interrupted during %s phase after %d ms '
+        '(%s; depth=%d built=%d acquire_ms=%s)',
+        phase, (time.monotonic() - started) * 1000, type(exc).__name__,
+        depth, built, acquire_ms,
     )
 
 

@@ -6752,8 +6752,10 @@ class GitOps:
         depends on lane history.
 
         **Cold-fallback path** (inv.6: a fault never blocks the scheduler):
-            Knob off or pool exhausted returns a cold worktree with warm=False,
-            logged at DEBUG.  A fault while holding a lane goes through
+            Knob off or pool exhausted returns a cold worktree with warm=False.
+            Knob off is the configured state and logs at DEBUG; an exhausted
+            pool degrades a verify that was meant to be warm, so it logs at
+            INFO.  A fault while holding a lane goes through
             :meth:`_spec_lane_cold_fallback`, which logs at WARNING.
 
         **Cancellation and errors**: any other exit between ``try_acquire``
@@ -6783,7 +6785,7 @@ class GitOps:
         lane = await pool.try_acquire()
         if lane is None:
             # Pool exhausted — inv.6: cold ephemeral fallback, never block.
-            logger.debug(
+            logger.info(
                 'acquire_spec_lane: pool exhausted — cold fallback for %s',
                 merge_commit[:8],
             )
