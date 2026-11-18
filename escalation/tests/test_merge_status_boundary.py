@@ -672,7 +672,7 @@ async def test_consumer_skill_branches_on_the_server_answer(
         for skill in sorted(_CONSUMER_SKILLS)
     }
 
-    assert dispositions == expected, row
+    assert dispositions == dict(expected), row
 
 
 async def test_every_scene_has_a_consumer_row() -> None:
