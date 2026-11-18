@@ -99,6 +99,7 @@ PURE_STDLIB_LEAVES = (
     'secret_env',
     'secret_redaction',
     'session_liveness',
+    'sqlite_durability',
     'streak',
     'task_claimant',
     'task_created_at',
