@@ -1458,7 +1458,8 @@ class TestDeferredStreakPastRecovery:
             for record in _warnings(caplog)
             if (match := _ABANDONED_DATE.search(record.getMessage()))
         ] == lost
-        assert dict(trickle_state.read_prior('dark_factory').retry_backlog) == {}
+        final = trickle_state.read_prior('dark_factory')
+        assert final is not None and dict(final.retry_backlog) == {}
 
 
 def _fire(anchor: str | None = '2026-08-02', path=_CENSUS_STATE):
