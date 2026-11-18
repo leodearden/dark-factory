@@ -5,7 +5,7 @@ schema_version: 1
 signal_leaves: ["γ", "ε"]
 tasks:
   - label: "α"
-    task_id: null
+    task_id: 10758
     title: "Show merge verifies in flight in a Verifying now panel"
     note: "Interim live panel before 8528; its task-id decided-link flag is retired by γ (PRD D18, D24)."
     capabilities:
@@ -58,7 +58,7 @@ tasks:
           kind: manual
           reason: "Rendering states pinned by L3, L4 and the jsdom states; the flag text is interim (γ replaces it), so a text grep would pin a copy γ retires."
   - label: "β"
-    task_id: null
+    task_id: 10759
     title: "Record merge-chain rounds and culprit searches as events"
     note: "Fix at decompose: ChainDepthBasis lives in orchestrator merge_verify_facts.py on 8528's branch and shared never imports orchestrator, so β moves the enum into shared (one home) for merge_chain.py's basis field."
     capabilities:
@@ -150,7 +150,7 @@ tasks:
           kind: manual
           reason: "Behaviour of the script over fixture stores; H21 and H23 run it."
   - label: "γ"
-    task_id: null
+    task_id: 10761
     title: "Serve the round view in the merge snapshot and render it"
     capabilities:
       - name: "ledger-round-lookup"
@@ -207,7 +207,7 @@ tasks:
           kind: manual
           reason: "L5 asserts the decided member renders; the retired flag's wording is α's choice, so an absent-grep would pin unknown text."
   - label: "δ"
-    task_id: null
+    task_id: 10760
     title: "Count bisect rounds apart in chain telemetry"
     capabilities:
       - name: "shared-telemetry-module-and-card"
@@ -244,7 +244,7 @@ tasks:
           paths: ["scripts/tests/test_chain_telemetry_agreement.py"]
           expect: present
   - label: "ε"
-    task_id: null
+    task_id: 10762
     title: "Show chain rounds and culprit searches in a Chain rounds panel"
     capabilities:
       - name: "runs-read-model"
