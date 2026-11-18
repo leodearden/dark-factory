@@ -1,7 +1,9 @@
 """The static/redux asset-build identity: what it is, and where the server publishes it.
 
 Section 1 drives ``tree_identity`` and ``AssetBuild`` over real temp trees,
-with no app and no patching.
+with no app and no patching. Section 2 drives the real app: every response
+under ``/api/v2/dashboard/`` carries both identities, and the on-disk one
+follows a content change with no restart.
 """
 
 from __future__ import annotations
@@ -11,8 +13,20 @@ import re
 from pathlib import Path
 
 import pytest
+from _dashboard_routes import dashboard_get_paths
 
-from dashboard.asset_build import AssetBuild, tree_identity
+import dashboard
+from dashboard.asset_build import (
+    ASSET_BUILD_ON_DISK_HEADER,
+    ASSET_BUILD_STARTED_HEADER,
+    AssetBuild,
+    app_asset_build,
+    install_asset_build,
+    tree_identity,
+)
+
+_PACKAGE_REDUX_DIR = Path(dashboard.__file__).parent / 'static' / 'redux'
+_CHEAP_ROUTE = '/api/v2/dashboard/memory-graphs'
 
 
 def _build_tree(root: Path) -> Path:
@@ -139,3 +153,65 @@ def test_an_unreadable_root_has_no_identity(tree: Path) -> None:
         assert build.on_disk() is None
     finally:
         unreadable.chmod(0o644)
+
+
+# --- Section 2: every dashboard API response carries both identities --------
+
+
+def _with_dummy_parameters(templated_path: str) -> str:
+    return re.sub(r'\{[^}]+\}', '1', templated_path)
+
+
+def test_every_dashboard_api_response_carries_both_identities(client) -> None:
+    expected = tree_identity(_PACKAGE_REDUX_DIR)
+    assert expected is not None
+    routes = dashboard_get_paths()
+    assert routes.literal and routes.templated
+
+    responses = {path: client.get(path) for path in routes.literal}
+    for templated in routes.templated:
+        responses[templated] = client.get(_with_dummy_parameters(templated))
+    unknown = client.get('/api/v2/dashboard/no-such-endpoint')
+    invalid_post = client.post('/api/v2/dashboard/curator/cancel', json={})
+    assert unknown.status_code == 404
+    assert invalid_post.status_code == 400
+    responses['unknown path'] = unknown
+    responses['invalid POST'] = invalid_post
+
+    for label, resp in responses.items():
+        assert resp.headers.get(ASSET_BUILD_STARTED_HEADER) == expected, label
+        assert resp.headers.get(ASSET_BUILD_ON_DISK_HEADER) == expected, label
+
+
+@pytest.fixture()
+def swapped_build(client, tree: Path):
+    from dashboard.app import app
+
+    original = app_asset_build(app)
+    assert original is not None
+    build = AssetBuild.at_start(tree)
+    install_asset_build(app, build)
+    yield build
+    install_asset_build(app, original)
+
+
+def test_on_disk_header_follows_a_content_edit_with_no_restart(client, swapped_build: AssetBuild, tree: Path) -> None:
+    started = swapped_build.started
+    assert started is not None
+    target = tree / 'data.js'
+    original_content = target.read_bytes()
+
+    before = client.get(_CHEAP_ROUTE)
+    target.write_text('window.DF_DATA = { merged: true };\n')
+    edited = client.get(_CHEAP_ROUTE)
+    edited_identity = tree_identity(tree)
+    target.write_bytes(original_content)
+    restored = client.get(_CHEAP_ROUTE)
+
+    assert before.headers[ASSET_BUILD_STARTED_HEADER] == started
+    assert before.headers[ASSET_BUILD_ON_DISK_HEADER] == started
+    assert edited.headers[ASSET_BUILD_STARTED_HEADER] == started
+    assert edited_identity not in (None, started)
+    assert edited.headers[ASSET_BUILD_ON_DISK_HEADER] == edited_identity
+    assert restored.headers[ASSET_BUILD_STARTED_HEADER] == started
+    assert restored.headers[ASSET_BUILD_ON_DISK_HEADER] == started
