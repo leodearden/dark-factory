@@ -6751,10 +6751,17 @@ class GitOps:
         and delta-touches sources against the base commit, so freshness never
         depends on lane history.
 
-        **Cold-fallback path** (inv.6: never raises, never blocks the scheduler):
+        **Cold-fallback path** (inv.6: a fault never blocks the scheduler):
             Knob off or pool exhausted returns a cold worktree with warm=False,
             logged at DEBUG.  A fault while holding a lane goes through
             :meth:`_spec_lane_cold_fallback`, which logs at WARNING.
+
+        **Cancellation and errors**: any other exit between ``try_acquire``
+        and the warm return, such as a caller's deadline or shutdown cancel,
+        or a :class:`WorktreeMissing` from a lane whose directory vanished,
+        gives the lane back and then propagates.  A seed killed that way
+        leaves ``target/`` half-cloned; the next acquire's
+        ``--fresh-checkout`` re-seed replaces it.
 
         Args:
             merge_commit: The merge commit SHA to check out in the spec lane.
@@ -6783,6 +6790,24 @@ class GitOps:
             wt = await self.create_ephemeral_verify_worktree(merge_commit)
             return wt, False
 
+        try:
+            fault = await self._ready_spec_lane(lane, merge_commit)
+        except BaseException:
+            await complete_despite_cancellation(pool.release(lane))
+            raise
+        if fault is not None:
+            return await self._spec_lane_cold_fallback(pool, lane, merge_commit, fault)
+        return lane, True
+
+    async def _ready_spec_lane(self, lane: Path, merge_commit: str) -> str | None:
+        """Check the acquired *lane* out at *merge_commit* and re-seed it.
+
+        The create-once or reset-in-place and the inv.8 re-seed that
+        :meth:`acquire_spec_lane` describes.  Returns None when the lane is
+        warm and ready, else the fault reason for
+        :meth:`_spec_lane_cold_fallback`.  The lane stays ASSIGNED either way;
+        giving it back is the caller's.
+        """
         # ── Create-once or reset-in-place ────────────────────────────────────
         if not await self._is_registered_worktree(lane):
             # Create-once: serialized via _spec_wt_create_lock so that the K>1
@@ -6823,10 +6848,9 @@ class GitOps:
                         self.mark_pool_storage_present()
                     else:
                         self._note_pool_storage_absent()
-                        return await self._spec_lane_cold_fallback(
-                            pool, lane, merge_commit,
+                        return (
                             'create-once refused: pool storage absent/unmounted '
-                            f'at {self.worktree_base}',
+                            f'at {self.worktree_base}'
                         )
                 # Self-heal a stale unregistered directory first
                 # (mirrors reset_persistent_merge_worktree's self-heal pattern).
@@ -6838,9 +6862,7 @@ class GitOps:
                     cwd=self.project_root,
                 )
                 if rc != 0:
-                    return await self._spec_lane_cold_fallback(
-                        pool, lane, merge_commit, f'worktree add failed (rc={rc}, err={err!r})',
-                    )
+                    return f'worktree add failed (rc={rc}, err={err!r})'
                 logger.info(
                     'acquire_spec_lane: created %s (HEAD=%s)', lane, merge_commit[:8],
                 )
@@ -6852,16 +6874,12 @@ class GitOps:
                 cwd=lane,
             )
             if rc != 0:
-                return await self._spec_lane_cold_fallback(
-                    pool, lane, merge_commit, f'reset --hard failed (rc={rc}, err={err!r})',
-                )
+                return f'reset --hard failed (rc={rc}, err={err!r})'
             ok, err = await self._clean_lane_retaining_artifacts(
                 lane, caller='acquire_spec_lane',
             )
             if not ok:
-                return await self._spec_lane_cold_fallback(
-                    pool, lane, merge_commit, f'git clean failed (err={err!r})',
-                )
+                return f'git clean failed (err={err!r})'
             logger.info(
                 'acquire_spec_lane: reset %s to HEAD=%s', lane, merge_commit[:8],
             )
@@ -6869,10 +6887,8 @@ class GitOps:
         # ── inv.8: ALWAYS re-seed target/ from the current warm base ─────────
         rc = await self._seed_warm_lane(lane, '--fresh-checkout')
         if rc != 0:
-            return await self._spec_lane_cold_fallback(
-                pool, lane, merge_commit, f'seed failed (rc={rc})',
-            )
-        return lane, True
+            return f'seed failed (rc={rc})'
+        return None
 
     async def _spec_lane_cold_fallback(
         self, pool: WarmLanePool, lane: Path, merge_commit: str, reason: str,
@@ -6882,7 +6898,7 @@ class GitOps:
             'acquire_spec_lane: %s for %s — releasing lane; speculative verify '
             'of %s runs COLD', reason, lane, merge_commit[:8],
         )
-        await pool.release(lane)
+        await complete_despite_cancellation(pool.release(lane))
         return await self.create_ephemeral_verify_worktree(merge_commit), False
 
     async def release_spec_lane(self, lane: Path, *, warm: bool) -> None:
@@ -13192,6 +13208,10 @@ class GitOps:
         not defensive: five archived occurrences under ``data/verify-logs``
         (tasks 3692, 3420, 3869, 4215, 4545) blocked a merge outright on a
         single non-zero rc here.
+
+        An add interrupted by a cancel or an exception is torn down through
+        :meth:`cleanup_merge_worktree` before propagating, since no caller
+        can clean a path this call never returned.
         """
         import uuid
         merge_id = uuid.uuid4().hex[:8]
@@ -13215,9 +13235,13 @@ class GitOps:
             checkout_ref = base_sha.strip()
 
         # Detached worktree avoids "branch already checked out" error
-        rc, out, err, attempts = await self._worktree_add_with_retry(
-            merge_wt, checkout_ref, label='_create_merge_worktree',
-        )
+        try:
+            rc, out, err, attempts = await self._worktree_add_with_retry(
+                merge_wt, checkout_ref, label='_create_merge_worktree',
+            )
+        except BaseException:
+            await complete_despite_cancellation(self.cleanup_merge_worktree(merge_wt))
+            raise
         if rc != 0:
             # The `Failed to create merge worktree: ` PREFIX is load-bearing
             # beyond this module: other test modules construct it verbatim to
