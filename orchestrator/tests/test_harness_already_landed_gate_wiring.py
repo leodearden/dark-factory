@@ -1609,6 +1609,12 @@ _ARMS = [
     pytest.param('content', id='content-equivalent-arm'),
 ]
 
+#: The arms that validate in DISCOVERY mode; the marker arm is CANDIDATE mode.
+_DISCOVERY_ARMS = [
+    pytest.param('ancestry', id='ancestry-arm'),
+    pytest.param('content', id='content-equivalent-arm'),
+]
+
 _ARM_REASON = {
     'ancestry': 'dispatch-gate-already-on-main',
     'marker': 'dispatch-gate-marker-found',
@@ -2898,6 +2904,24 @@ class TestAlreadyLandedGateDeliveredChecksWiring:
 
         assert spy.await_args is not None
         assert spy.await_args.kwargs.get('delivered_checks') == []
+
+    @pytest.mark.parametrize('arm', _DISCOVERY_ARMS)
+    async def test_a_discovery_arm_forwards_the_recorded_branch_base(
+        self, mock_orch_config, arm,
+    ) -> None:
+        """The branch-tip differential's recorded-base rung is fed (task 7836)."""
+        h, _meta = _arm_harness(
+            mock_orch_config, arm,
+            metadata={'branch_base_sha': _BRANCH_BASE_SHA, 'delivered_checks': [_DC_CHECK]},
+        )
+        spy = AsyncMock(wraps=validate_landing_evidence)
+
+        with patch('orchestrator.harness.validate_landing_evidence', spy), \
+             patch(_GATE_TARGET, AsyncMock(return_value=None)):
+            await h._already_landed_dispatch_gate('42')
+
+        assert spy.await_args is not None
+        assert spy.await_args.kwargs.get('branch_base_sha') == _BRANCH_BASE_SHA
 
     @pytest.mark.parametrize('arm', _ARMS)
     async def test_a_differential_rescue_stamps_and_discloses_it(
