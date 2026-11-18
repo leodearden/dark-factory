@@ -55,8 +55,11 @@ function receiptsAt(receivedAt, started, onDisk, path = '/api/v2/dashboard/memor
 }
 
 // A watcher over injected storage, clock and reload. `observe(started, onDisk)`
-// lands one new poll, each with a newer receivedAt.
-function harness({ pageBuild = A, storage = memoryStorage(), guardMs } = {}) {
+// lands one new poll, each with a newer receivedAt. An explicit `pageBuild:
+// undefined` is kept, not defaulted, so the garbled-page cases can pass it.
+function harness(options = {}) {
+  const { storage = memoryStorage(), guardMs } = options;
+  const pageBuild = 'pageBuild' in options ? options.pageBuild : A;
   const clock = { now: START };
   const reloads = [];
   const watcher = createAssetSkewWatcher({
