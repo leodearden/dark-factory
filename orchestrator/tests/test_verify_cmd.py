@@ -29,6 +29,11 @@ from _serial_recovery_helpers import (
 from _verify_config_corpus import (
     DASHBOARD_LINT_COMMAND,
     DF_CONFIG_PATH,
+    FLEET_COCKPIT_TEST_CLAUSE,
+    FLEET_MEMBER_TEST_CLAUSE,
+    FLEET_ROOT_TEST_CLAUSES,
+    FLEET_SCRIPTS_TEST_CLAUSE,
+    FLEET_TEST_MEMBERS,
     FM_LINT_COMMAND,
     MODULE_LINT_COMMANDS,
     REPO_ROOT,
@@ -1617,7 +1622,7 @@ class TestSubshellClauseIntegrity:
 
         RED at baseline for the same reason as
         ``test_cockpit_subshell_stays_parseable`` above: at baseline
-        ``split_and_chain_segments`` still returns all 9 segments (it has no
+        ``split_and_chain_segments`` still returns every segment (it has no
         reason to refuse — the chain itself is well-formed `&&`-separated
         shell, just one segment's *content* happens to be unparseable), with
         the cockpit segment individually failing ``bash -n``. So segmenting
@@ -1629,7 +1634,7 @@ class TestSubshellClauseIntegrity:
         recovered = render(serial_pytest(parse_config_command(ROOT_TEST_COMMAND)))
         segments = split_and_chain_segments(recovered)
         assert segments is not None
-        assert len(segments) == 10
+        assert len(segments) == len(_EXPECTED_ROOT_TEST_SEGMENTS)
         for segment in segments:
             _assert_bash_parses(segment.command, what=f'segment {segment.label!r}')
 
@@ -3310,12 +3315,17 @@ class TestDescribeDroppedClauses:
 # (task 3338 / esc-3062-2).
 # ---------------------------------------------------------------------------
 
-# Segment 7 of `ROOT_TEST_COMMAND`: a balanced `( ... )` group carrying its own
-# `||`, `;` and `&&` INSIDE the parens. It must come back as ONE atomic segment
-# — `tests/scripts/test_fallback_verify_config.py`'s cockpit guard documents at
-# `test_fanout_includes_cockpit_presence_guarded` that a naive `&&`-split breaks
-# exactly here, emitting two unbalanced shell fragments (a spurious RED).
-_COCKPIT_GROUP = '( [ -d cockpit ] || exit 0; cd cockpit && uv run pytest tests/ --timeout=300 )'
+# The `(cwd_rel, command)` pairs `ROOT_TEST_COMMAND` must decompose into, taken
+# from the corpus PARTS it is composed of rather than from the segmenter under
+# test. `FLEET_COCKPIT_TEST_CLAUSE` is the balanced `( ... )` group carrying its
+# own `||`, `;` and `&&` INSIDE the parens; it must come back as ONE atomic
+# segment — `tests/scripts/test_fallback_verify_config.py`'s cockpit guard
+# documents at `test_fanout_includes_cockpit_presence_guarded` that a naive
+# `&&`-split breaks exactly there, emitting two unbalanced shell fragments.
+_EXPECTED_ROOT_TEST_SEGMENTS = (
+    *((member, FLEET_MEMBER_TEST_CLAUSE) for member in FLEET_TEST_MEMBERS),
+    *(('.', clause) for clause in FLEET_ROOT_TEST_CLAUSES),
+)
 
 
 class TestSplitAndChainSegments:
@@ -3330,46 +3340,37 @@ class TestSplitAndChainSegments:
     """
 
     def test_root_test_command_yields_one_segment_per_subproject(self):
-        """The committed fleet chain decomposes into its 10 runnable clauses.
+        """The committed fleet chain decomposes into its runnable clauses.
 
-        Seven `cd <subproject> && pytest` pairs, the cockpit subshell, the
-        `tests/scripts/` clause — the one esc-3062-2 reports never ran because
-        an earlier subproject's red short-circuited the shell — and the
-        `tests/repo_guards/` clause last.
+        One `cd <subproject> && pytest` pair per member, then the clauses run
+        at the root after `cd ..`: the cockpit subshell, the `tests/scripts/`
+        clause — the one esc-3062-2 reports never ran because an earlier
+        subproject's red short-circuited the shell — and `tests/repo_guards/`.
         """
         segments = split_and_chain_segments(ROOT_TEST_COMMAND)
         assert segments is not None
-        assert len(segments) == 10
-        assert [s.cwd_rel for s in segments] == [
-            'shared',
-            'escalation',
-            'orchestrator',
-            'fused-memory',
-            'dashboard',
-            'sampler',
-            'client-feed',
-            '.',
-            '.',
-            '.',
-        ]
+        assert [(s.cwd_rel, s.command) for s in segments] == list(_EXPECTED_ROOT_TEST_SEGMENTS)
 
     def test_cockpit_subshell_is_one_atomic_segment(self):
         """The `( ... )` group is never split on its interior `&&`."""
         segments = split_and_chain_segments(ROOT_TEST_COMMAND)
         assert segments is not None
-        assert segments[7].command == _COCKPIT_GROUP
-        assert segments[7].cwd_rel == '.'
+        positions = [i for i, s in enumerate(segments) if s.command == FLEET_COCKPIT_TEST_CLAUSE]
+        assert len(positions) == 1, f'expected exactly one cockpit segment, at {positions}'
+        (cockpit,) = positions
+        assert segments[cockpit].cwd_rel == '.'
         # A subshell's own `cd cockpit` never escapes it, so the NEXT segment
         # is still at the worktree root.
-        assert segments[8].cwd_rel == '.'
+        assert cockpit + 1 < len(segments), 'the cockpit subshell must not end the chain'
+        assert segments[cockpit + 1].cwd_rel == '.'
 
-    def test_final_tests_scripts_segment_is_recovered_intact(self):
+    def test_tests_scripts_segment_is_recovered_intact(self):
         """The clause esc-3062-2 is about, addressable on its own."""
         segments = split_and_chain_segments(ROOT_TEST_COMMAND)
         assert segments is not None
-        assert segments[8].command == (
-            'uv run --project shared pytest tests/scripts/ scripts/tests/ --timeout=300'
-        )
+        assert [s.command for s in segments if 'tests/scripts/' in s.command] == [
+            FLEET_SCRIPTS_TEST_CLAUSE,
+        ]
 
     @pytest.mark.parametrize(
         'raw',
@@ -3398,28 +3399,28 @@ class TestSplitAndChainSegments:
     def test_labels_are_unique_and_filename_safe(self):
         """Labels become per-segment streamed-log filenames, so they must not collide.
 
-        Three segments share cwd `.` here (the cockpit subshell,
-        `tests/scripts/` and `tests/repo_guards/`), so the index suffix is what keeps
-        ``attempt-N.__fallback__.test.<label>.log`` distinct.
+        Every clause after `cd ..` shares cwd `.` (the cockpit subshell,
+        `tests/scripts/`, `tests/repo_guards/`), so the position suffix is what
+        keeps ``attempt-N.__fallback__.test.<label>.log`` distinct.
         """
         segments = split_and_chain_segments(ROOT_TEST_COMMAND)
         assert segments is not None
         labels = [s.label for s in segments]
-        assert labels == [
-            'shared-1',
-            'escalation-2',
-            'orchestrator-3',
-            'fused-memory-4',
-            'dashboard-5',
-            'sampler-6',
-            'client-feed-7',
-            'root-8',
-            'root-9',
-            'root-10',
-        ]
         assert len(set(labels)) == len(labels)
-        for label in labels:
+        for position, label in enumerate(labels, start=1):
+            assert label.endswith(f'-{position}'), f'{label!r} lacks its position suffix'
             assert re.fullmatch(r'[A-Za-z0-9._-]+', label), f'{label!r} is not filename-safe'
+        root_labels = [s.label for s in segments if s.cwd_rel == '.']
+        assert len(root_labels) >= 2
+        assert len(set(root_labels)) == len(root_labels)
+
+    def test_label_is_the_cwd_name_then_the_position(self):
+        """The label FORMAT: cwd name (`root` at the worktree root), then `-<1-based position>`."""
+        segments = split_and_chain_segments(
+            'cd a && pytest x && cd ../b-c && pytest y && cd .. && pytest z && pytest w'
+        )
+        assert segments is not None
+        assert [s.label for s in segments] == ['a-1', 'b-c-2', 'root-3', 'root-4']
 
     def test_root_lint_command_yields_two_root_cwd_segments(self):
         """A chain with no `cd` at all still segments — both clauses at the root."""
@@ -3509,11 +3510,11 @@ class TestSplitAndChainSegmentsRefuses:
 
     def test_control_operators_inside_a_paren_group_are_not_refusals(self):
         """The cockpit clause's own `||` and `;` live at depth 1 — accepted, atomic."""
-        raw = f'cd shared && uv run pytest tests/ && cd .. && {_COCKPIT_GROUP}'
+        raw = f'cd shared && uv run pytest tests/ && cd .. && {FLEET_COCKPIT_TEST_CLAUSE}'
         segments = split_and_chain_segments(raw)
         assert segments is not None
         assert [s.cwd_rel for s in segments] == ['shared', '.']
-        assert segments[1].command == _COCKPIT_GROUP
+        assert segments[1].command == FLEET_COCKPIT_TEST_CLAUSE
 
     def test_quoted_control_operators_are_not_refusals(self):
         """A `|`/`;`/`&&` inside quotes is an ARGUMENT, never an operator."""
@@ -3693,7 +3694,7 @@ class TestSplitAndChainSegmentsRefuses:
         assert split_and_chain_segments(bad) is None
         good = split_and_chain_segments(ROOT_TEST_COMMAND)
         assert good is not None
-        assert len(good) == 10
+        assert len(good) == len(_EXPECTED_ROOT_TEST_SEGMENTS)
 
 
 class TestSplitAndChainSegmentsLiveConfigDrift:
