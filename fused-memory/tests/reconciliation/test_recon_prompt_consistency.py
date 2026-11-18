@@ -10,6 +10,7 @@ rather than imported across test modules (house norm).
 
 from __future__ import annotations
 
+import re
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -21,6 +22,10 @@ from fused_memory.reconciliation.prompts.stage2 import build_stage2_system_promp
 from fused_memory.reconciliation.stages.task_knowledge_sync import (
     IntegrityCheck,
     TaskKnowledgeSync,
+)
+from fused_memory.reconciliation.task_filter import (
+    is_count_snapshot,
+    is_mixed_temporal_framing,
 )
 from reconciliation.consolidator_fixtures import make_consolidator
 
@@ -77,7 +82,7 @@ async def _assembled_payloads() -> dict[str, str]:
 
 
 def _section(text: str, heading: str) -> str:
-    start = text.index(heading)
+    start = text.index(f'\n{heading}') + 1
     end = text.find('\n## ', start + len(heading))
     return text[start:] if end == -1 else text[start:end]
 
@@ -130,3 +135,15 @@ def test_no_stage_prompt_asks_for_the_retired_memories_written_counter():
 
     for name, stage in stages.items():
         assert 'memories_written' not in stage.get_system_prompt(), name
+
+
+def test_stage1_update_edge_example_fact_passes_the_add_memory_write_guard():
+    section = _section(
+        make_consolidator().get_system_prompt(), '## update_edge Temporal Limitation',
+    )
+    examples = re.findall(r'`"(As of [^"`]+)"`', section)
+
+    assert examples
+    for example in examples:
+        assert is_count_snapshot(example) is False, example
+        assert is_mixed_temporal_framing(example) is False, example
