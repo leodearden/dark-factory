@@ -37,7 +37,7 @@ def fleet_root(root: Path | str | None = None) -> Path:
 ATOMIC_WRITE_TEMP_SUFFIX = '.tmp'
 """Suffix of ``atomic_write_text``'s in-flight temp file. A sweep that visits
 every entry of a dir the registries write into
-(``session_registry.py::reap_stale_session_pointers``) keys on it to leave a
+(``session_reaper.py::reap_stale_session_pointers``) keys on it to leave a
 concurrent writer's temp file alone."""
 
 

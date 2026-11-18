@@ -38,7 +38,13 @@ from pathlib import Path
 from typing import Any, TypeGuard
 from urllib.parse import quote
 
-from orchestrator import session_records, session_registry, spawn_t3_provider, t3_mcp_client
+from orchestrator import (
+    session_reaper,
+    session_records,
+    session_registry,
+    spawn_t3_provider,
+    t3_mcp_client,
+)
 from orchestrator.session_ownership_probes import ProcessTree
 
 MESSAGE_CHAR_LIMIT = 120_000
@@ -719,7 +725,7 @@ def _record_vouching_for(
 
 def _fold(hand: session_records.SessionRecord, root: Path) -> None:
     try:
-        session_registry.mark_session_folded(hand.session_slug, root=root)
+        session_reaper.mark_session_folded(hand.session_slug, root=root)
     except (OSError, session_records.CorruptSessionRecord) as exc:
         logger.warning('cannot fold hand-launched record %s: %s', hand.session_slug, exc)
 
@@ -1024,7 +1030,7 @@ def _sweep_listed_threads(client: t3_mcp_client.T3McpClient, *, routine: bool) -
         logger.warning('t3 session sweep skipped: no complete thread listing of this environment')
         return
     try:
-        session_registry.mark_t3_sessions_exited(
+        session_reaper.mark_t3_sessions_exited(
             client.environment_id,
             frozenset(map(str, thread_ids)),
             listed_at=listed_at,

@@ -383,7 +383,7 @@ def list_decisions(root: Path | str | None = None) -> list[DecisionRecord]:
     """Read every decision under decisions_dir. Missing dir -> [] (no raise).
 
     A single corrupt or foreign ``*.json`` file is skipped (logged at ERROR)
-    rather than aborting the whole read -- mirrors session_registry.py::reap_stale_records'
+    rather than aborting the whole read -- mirrors session_reaper.py::reap_stale_records'
     corrupt-body handling, so one bad file never breaks the cockpit's
     whole-queue read.
     """
