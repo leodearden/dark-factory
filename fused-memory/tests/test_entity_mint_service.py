@@ -810,13 +810,17 @@ class TestEntityMintStormAlarm:
         )
 
         await self._mint(service, project_id='proj_b')
+        await self._mint(service, project_id='proj_a')
 
-        emitter.assert_called_once()
-        args, kwargs = emitter.call_args
-        assert kwargs['project_id'] == 'proj_b'
-        assert kwargs['count'] == 3
-        assert kwargs['agent_id'] == 'curator-x'
-        assert (args[0] if args else kwargs.get('project_root')) == '/tmp/df-root-b'
+        def filed(call):
+            args, kwargs = call
+            project_root = args[0] if args else kwargs.get('project_root')
+            return project_root, kwargs['project_id'], kwargs['agent_id'], kwargs['count']
+
+        assert [filed(call) for call in emitter.call_args_list] == [
+            ('/tmp/df-root-b', 'proj_b', 'curator-x', 3),
+            ('/tmp/df-root-a', 'proj_a', 'curator-x', 3),
+        ], 'each project breaches on its own count and files into its own root'
         assert service.entity_mint_storm_tracked_agents == {'curator-x'}, (
             'one agent label, not one per project'
         )
