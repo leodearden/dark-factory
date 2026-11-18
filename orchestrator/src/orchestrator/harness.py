@@ -77,6 +77,7 @@ from orchestrator import (
     pure_gate_resolution,
     recovery_pins,
     recut_ruling,
+    substrate_gate,
 )
 from orchestrator import digest as digest_mod
 from orchestrator.agent_session_reaper import (
@@ -9416,7 +9417,7 @@ class Harness:
         self,
         task_id: str,
         *,
-        verdict,
+        verdict: cross_repo_gate.CrossRepoVerdict,
     ) -> None:
         """Block a task and file an L1 for a cross-repo BLOCK verdict (misfile or unverifiable).
 
@@ -9442,26 +9443,27 @@ class Harness:
         self,
         task_id: str,
         *,
-        verdict,
+        verdict: substrate_gate.SubstrateVerdict,
     ) -> None:
-        """Block a task and file an L1 escalation for a PASS→FAIL substrate flip.
+        """Block a task and file an L1 for a substrate FLIP verdict (probe-set flip or unverifiable).
 
-        A PASS→FAIL flip means the task's probe-set premise no longer holds on
-        current main; the design_concern class routes it to human/curator judgment
-        (same class as report_false_premise).  Blocking, filing and the
-        category-scoped dedupe live in ``_block_and_file_dispatch_gate_l1``.
+        ``design_concern`` routes it to human/curator judgment (same class as
+        report_false_premise).
+
+        The summary/detail/root cause come from
+        ``orchestrator/src/orchestrator/substrate_gate.py::flip_escalation_text``.
+        Blocking, filing and the dedupe live in
+        ``_block_and_file_dispatch_gate_l1``; the root cause scopes that dedupe,
+        so an open unverified L1 cannot hide a later probe-set flip, nor the
+        reverse.
         """
-        summary = f'SUBSTRATE_FLIP: probe set PASS→FAIL on current main (task {task_id})'
-        detail = (
-            f'Dispatch-time substrate re-check detected a PASS→FAIL flip.\n'
-            f'Verdict: {verdict.verdict!r} | exit_code={verdict.exit_code} | '
-            f'probe_set={verdict.probe_set!r}\n'
-            f'Reason: {verdict.reason}\n'
-            f'The task premise (probe set authored at investigation time) no longer holds '
-            f'on current main — re-spec required before dispatch.'
-        )
+        text = substrate_gate.flip_escalation_text(task_id, verdict)
         await self._block_and_file_dispatch_gate_l1(
-            task_id, category=EscalationCategory.DESIGN_CONCERN, summary=summary, detail=detail,
+            task_id,
+            category=EscalationCategory.DESIGN_CONCERN,
+            summary=text.summary,
+            detail=text.detail,
+            root_cause=text.root_cause,
         )
 
     async def _run_recut_ruling_gate(self, assignment) -> recut_ruling.RecutGateResult:
@@ -9520,6 +9522,7 @@ class Harness:
 
     async def _block_and_file_dispatch_gate_l1(
         self, task_id: str, *, category: str, summary: str, detail: str,
+        root_cause: str = '',
     ) -> None:
         """Block *task_id* and file one category-scoped L1 for a dispatch gate.
 
@@ -9528,7 +9531,8 @@ class Harness:
         - a failed write is logged and the L1 is still filed;
         - with no escalation queue the filing is a logged no-op;
         - the dedupe is ``_file_harness_l1``'s: only an open L1 of *category*
-          suppresses this one, so an L1 for another cause cannot hide it.
+          (carrying *root_cause*, when one is given) suppresses this one, so
+          an L1 for another cause cannot hide it.
         """
         try:
             await self.scheduler.set_task_status(task_id, 'blocked')
@@ -9540,6 +9544,7 @@ class Harness:
             )
         self._file_harness_l1(
             task_id, category=category, summary=summary, detail=detail,
+            root_cause=root_cause,
         )
 
     def _file_harness_l1(
@@ -9656,8 +9661,6 @@ class Harness:
         """
         import asyncio
 
-        from orchestrator import substrate_gate
-
         task_id = assignment.task_id
         gate_path = self.git_ops.worktree_base / f'_substrate-gate-{task_id}'
 
@@ -9725,13 +9728,7 @@ class Harness:
             )
             await self._block_and_escalate_substrate_flip(
                 task_id,
-                verdict=substrate_gate.SubstrateVerdict(
-                    verdict=substrate_gate.FLIP,
-                    exit_code=proc.returncode,
-                    checker_argv=None,
-                    probe_set=None,
-                    reason=reason,
-                ),
+                verdict=substrate_gate.unverifiable_verdict(reason),
             )
             return False
 
@@ -9750,12 +9747,9 @@ class Harness:
                 'substrate_gate: run_substrate_recheck raised for task %s: %s',
                 task_id, exc, exc_info=True,
             )
-            verdict = substrate_gate.SubstrateVerdict(
-                verdict=substrate_gate.FLIP,
-                exit_code=None,
-                checker_argv=None,
-                probe_set=None,
-                reason=f'substrate unverifiable / run_substrate_recheck raised: {exc}',
+            verdict = substrate_gate.unverifiable_verdict(
+                f'substrate unverifiable / run_substrate_recheck raised '
+                f'{type(exc).__name__}: {exc}',
             )
         finally:
             # Always remove the gate worktree — leak is rare and reclaimable, but
@@ -10568,8 +10562,6 @@ class Harness:
             # FLIP, so gating dispatch on any other definition (e.g. one that
             # requires a well-formed descriptor) would let a malformed
             # descriptor skip the gate entirely instead of failing closed.
-            from orchestrator import substrate_gate
-
             if substrate_gate.carries_substrate_probe(assignment.task) and not await self._run_substrate_gate(assignment):
                 # FLIP detected: task is already blocked + escalated inside
                 # the gate.  Return a BLOCKED report so the caller (and
