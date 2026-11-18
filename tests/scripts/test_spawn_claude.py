@@ -56,6 +56,7 @@ from df_pytest_isolation import (
 )
 from orchestrator import (
     session_hooks,  # pyright: ignore[reportAttributeAccessIssue]
+    session_records,
     session_registry,  # pyright: ignore[reportAttributeAccessIssue]
 )
 
@@ -1135,7 +1136,7 @@ def test_prompt_file_launches_a_pointer_prompt_recorded_as_the_prompt(
     result = _run_spawn(env, tmp_path, prompt_args=("--prompt-file", str(brief)))
 
     assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
-    record = session_registry.SessionRecord.from_json(
+    record = session_records.SessionRecord.from_json(
         _find_one_record(pathlib.Path(env["CLAUDE_FLEET_ROOT"])).read_text()
     )
     captured = capture_file.read_text()
@@ -1350,8 +1351,8 @@ def test_spawn_writes_session_record_lifecycle(
 
     fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
     record_path = _find_one_record(fleet_root)
-    record = session_registry.SessionRecord.from_json(record_path.read_text())
-    assert record.status == session_registry.Status.EXITED
+    record = session_records.SessionRecord.from_json(record_path.read_text())
+    assert record.status == session_records.Status.EXITED
     assert record.exit_code == exit_code
 
 
@@ -1431,8 +1432,8 @@ def test_registry_write_refresh_reap_two_way_boundary(tmp_path: pathlib.Path) ->
     fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
     record_path = _find_one_record(fleet_root)
     slug_dir = record_path.parent
-    written = session_registry.SessionRecord.from_json(record_path.read_text())
-    assert written.status == session_registry.Status.EXITED
+    written = session_records.SessionRecord.from_json(record_path.read_text())
+    assert written.status == session_records.Status.EXITED
 
     # The real spawn started a detached `reap`; holding its lock waits that
     # out and keeps any other out, so the reap below is the only one.
@@ -1454,9 +1455,9 @@ def test_registry_write_refresh_reap_two_way_boundary(tmp_path: pathlib.Path) ->
             f"refresh must update the SAME record.json path (same key), "
             f"found: {refreshed_paths}"
         )
-        refreshed = session_registry.SessionRecord.from_json(record_path.read_text())
+        refreshed = session_records.SessionRecord.from_json(record_path.read_text())
         assert refreshed.session_slug == written.session_slug
-        assert refreshed.status == session_registry.Status.RUNNING
+        assert refreshed.status == session_records.Status.RUNNING
         assert record_path.stat().st_mtime > backdated_ts, (
             "refresh must bump the record's mtime heartbeat"
         )
@@ -1465,18 +1466,18 @@ def test_registry_write_refresh_reap_two_way_boundary(tmp_path: pathlib.Path) ->
         # (the T6 hand-launched-capture path -- no spawn-claude.sh write exists
         # for this slug at all).
         absent_slug = "unblock-df-999-424242"
-        assert not session_registry.record_path_for_slug(absent_slug, root=fleet_root).is_file()
+        assert not session_records.record_path_for_slug(absent_slug, root=fleet_root).is_file()
 
-        upserted = session_registry.refresh_record(
-            absent_slug, root=fleet_root, status=session_registry.Status.AWAITING_INPUT,
+        upserted = session_records.refresh_record(
+            absent_slug, root=fleet_root, status=session_records.Status.AWAITING_INPUT,
         )
         assert upserted.session_slug == absent_slug
-        assert upserted.status == session_registry.Status.AWAITING_INPUT
-        assert upserted.schema_version == session_registry.SCHEMA_VERSION
+        assert upserted.status == session_records.Status.AWAITING_INPUT
+        assert upserted.schema_version == session_records.SCHEMA_VERSION
         assert upserted.start_ts, "an upserted record must still get a populated start_ts"
-        upserted_path = session_registry.record_path_for_slug(absent_slug, root=fleet_root)
+        upserted_path = session_records.record_path_for_slug(absent_slug, root=fleet_root)
         assert upserted_path.is_file()
-        assert session_registry.read_record(absent_slug, root=fleet_root) == upserted
+        assert session_records.read_record(absent_slug, root=fleet_root) == upserted
 
         # --- The hook-refreshed record still reaps correctly -------------------
         # Force a guaranteed-dead launcher_pid (the real spawn's own $$ has
@@ -1484,7 +1485,7 @@ def test_registry_write_refresh_reap_two_way_boundary(tmp_path: pathlib.Path) ->
         # racy under PID reuse) and age it past the non-terminal heartbeat TTL,
         # so it reaps via the stale_pid rule now that its status is RUNNING
         # (non-terminal) after the hook's refresh.
-        dead_record = session_registry.SessionRecord.from_json(record_path.read_text())
+        dead_record = session_records.SessionRecord.from_json(record_path.read_text())
         dead_record.launcher_pid = _DEAD_PID
         record_path.write_text(dead_record.to_json())
         now = datetime.now(UTC)
@@ -1599,8 +1600,8 @@ def test_failed_to_start_detected_on_detached_exit0(tmp_path: pathlib.Path) -> N
 
         fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
         record_path = _find_one_record(fleet_root)
-        record = session_registry.SessionRecord.from_json(record_path.read_text())
-        assert record.status == session_registry.Status.FAILED_TO_START, (
+        record = session_records.SessionRecord.from_json(record_path.read_text())
+        assert record.status == session_records.Status.FAILED_TO_START, (
             f"expected registry status failed-to-start, got {record.status}"
         )
 
@@ -2156,7 +2157,7 @@ def test_transcript_appearance_suppresses_flag(tmp_path: pathlib.Path) -> None:
     transcript evidence is available from t~0, long before the sentinel can
     possibly exist, and _started_watchdog (which polls continuously and
     returns on first evidence) observes only the transcript. <enc> is COMPUTED
-    by session_registry.encode_cwd (the canonical: every '/', '.' and '_' maps
+    by session_records.encode_cwd (the canonical: every '/', '.' and '_' maps
     to '-', case preserved) rather than restated in prose or hand-copied here
     -- see the comment at the assignment below for why.
 
@@ -2191,7 +2192,7 @@ def test_transcript_appearance_suppresses_flag(tmp_path: pathlib.Path) -> None:
     # test_legibility_inventory.py's TestEncoderLockstep, so calling it gives
     # this fixture a real oracle transitively. (A hard-coded literal, the
     # strongest option, is not available: tmp_path is generated per run.)
-    enc = session_registry.encode_cwd(str(tmp_path))
+    enc = session_records.encode_cwd(str(tmp_path))
 
     # Fake claude: write the transcript file immediately (mirroring a real
     # Claude Code session creating ~/.claude/projects/<enc>/*.jsonl the moment
@@ -2237,8 +2238,8 @@ def test_transcript_appearance_suppresses_flag(tmp_path: pathlib.Path) -> None:
 
     fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
     record_path = _find_one_record(fleet_root)
-    record = session_registry.SessionRecord.from_json(record_path.read_text())
-    assert record.status == session_registry.Status.EXITED, (
+    record = session_records.SessionRecord.from_json(record_path.read_text())
+    assert record.status == session_records.Status.EXITED, (
         f"expected registry status exited, got {record.status}"
     )
 
@@ -2309,8 +2310,8 @@ def test_foreground_claude_descendant_suppresses_flag_without_transcript(
 
     fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
     record_path = _find_one_record(fleet_root)
-    record = session_registry.SessionRecord.from_json(record_path.read_text())
-    assert record.status == session_registry.Status.EXITED, (
+    record = session_records.SessionRecord.from_json(record_path.read_text())
+    assert record.status == session_records.Status.EXITED, (
         f"expected registry status exited, got {record.status}"
     )
 
@@ -2398,10 +2399,10 @@ def test_live_claude_without_transcript_is_not_flagged_when_payload_is_not_the_l
     )
 
     fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
-    record = session_registry.SessionRecord.from_json(
+    record = session_records.SessionRecord.from_json(
         _find_one_record(fleet_root).read_text()
     )
-    assert record.status == session_registry.Status.EXITED, (
+    assert record.status == session_records.Status.EXITED, (
         f"expected registry status exited, got {record.status}"
     )
     assert record.exit_code == 0
@@ -2439,10 +2440,10 @@ def test_tmux_lane_payload_that_never_runs_is_still_flagged(
     )
 
     fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
-    record = session_registry.SessionRecord.from_json(
+    record = session_records.SessionRecord.from_json(
         _find_one_record(fleet_root).read_text()
     )
-    assert record.status == session_registry.Status.FAILED_TO_START, (
+    assert record.status == session_records.Status.FAILED_TO_START, (
         f"expected registry status failed-to-start, got {record.status}"
     )
 
@@ -2549,8 +2550,8 @@ def test_normal_spawn_exit0_not_flagged(tmp_path: pathlib.Path) -> None:
 
     fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
     record_path = _find_one_record(fleet_root)
-    record = session_registry.SessionRecord.from_json(record_path.read_text())
-    assert record.status == session_registry.Status.EXITED, (
+    record = session_records.SessionRecord.from_json(record_path.read_text())
+    assert record.status == session_records.Status.EXITED, (
         f"expected registry status exited, got {record.status}"
     )
 
@@ -2586,7 +2587,7 @@ def test_spawn_exports_result_file_and_session_writes_it(
 
     fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
     record_path = _find_one_record(fleet_root)
-    record = session_registry.SessionRecord.from_json(record_path.read_text())
+    record = session_records.SessionRecord.from_json(record_path.read_text())
 
     expected_result_file = str(record_path.parent / "result.md")
     assert record.result_file == expected_result_file, (
@@ -2626,7 +2627,7 @@ def test_spawn_appends_result_handback_trailer_to_prompt(
 
     fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
     record_path = _find_one_record(fleet_root)
-    record = session_registry.SessionRecord.from_json(record_path.read_text())
+    record = session_records.SessionRecord.from_json(record_path.read_text())
     assert record.result_file, "expected a populated result_file on the record"
 
     captured_prompt = capture_file.read_text()
@@ -2760,7 +2761,7 @@ def test_trailer_outcome_line_mirrors_result_outcomes(tmp_path: pathlib.Path) ->
     captured = _spawn_capturing_prompt(tmp_path)
 
     spelled = tuple(_trailer_header_fields(captured)["outcome"].split("|"))
-    assert spelled == session_registry.RESULT_OUTCOMES
+    assert spelled == session_records.RESULT_OUTCOMES
 
 
 def test_trailer_asks_for_a_checkpoint_outcome_and_reflect(tmp_path: pathlib.Path) -> None:
@@ -2797,10 +2798,10 @@ def test_self_exit_input_stamps_the_record_and_gates_the_marker_instruction(
     assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
     assert tmux_used.exists() is (backend == "tmux")
     record_path = _find_one_record(pathlib.Path(env["CLAUDE_FLEET_ROOT"]))
-    record = session_registry.SessionRecord.from_json(record_path.read_text())
+    record = session_records.SessionRecord.from_json(record_path.read_text())
     assert record.self_exit is expected
     assert ("exit-requested" in prompt_file.read_text()) is expected
-    marker = record_path.parent / session_registry.EXIT_REQUESTED_FILENAME
+    marker = record_path.parent / session_records.EXIT_REQUESTED_FILENAME
     if expected:
         assert marker.read_text() == _FAKE_SESSION_ID
     else:
@@ -3020,7 +3021,7 @@ def test_spawn_exports_session_and_parent_ids(tmp_path: pathlib.Path) -> None:
 
     fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
     record_path = _find_one_record(fleet_root)
-    record = session_registry.SessionRecord.from_json(record_path.read_text())
+    record = session_records.SessionRecord.from_json(record_path.read_text())
 
     captured = _parse_captured_env(capture_file)
     assert captured.get("SESSION") == record.session_slug, (
@@ -3055,7 +3056,7 @@ def test_spawn_parent_id_empty_for_human_root(tmp_path: pathlib.Path) -> None:
 
     fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
     record_path = _find_one_record(fleet_root)
-    record = session_registry.SessionRecord.from_json(record_path.read_text())
+    record = session_records.SessionRecord.from_json(record_path.read_text())
 
     captured = _parse_captured_env(capture_file)
     assert captured.get("SESSION") == record.session_slug
@@ -3328,8 +3329,8 @@ def test_tmux_backend_routes_and_runs_session(
     fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
     record_path = _find_one_record(fleet_root)
     assert record_path.exists(), "the session record must persist after exit"
-    record = session_registry.SessionRecord.from_json(record_path.read_text())
-    assert record.status == session_registry.Status.EXITED, (
+    record = session_records.SessionRecord.from_json(record_path.read_text())
+    assert record.status == session_records.Status.EXITED, (
         f"expected registry status exited, got {record.status}"
     )
     assert record.exit_code == exit_code
@@ -3375,7 +3376,7 @@ def test_tmux_backend_stamps_display_record(tmp_path: pathlib.Path) -> None:
 
     fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
     record_path = _find_one_record(fleet_root)
-    record = session_registry.SessionRecord.from_json(record_path.read_text())
+    record = session_records.SessionRecord.from_json(record_path.read_text())
 
     assert record.display is not None, (
         "expected a stamped display on a successful tmux-lane spawn"
@@ -3525,7 +3526,7 @@ def test_sibling_mode_parents_at_shared_ancestor(tmp_path: pathlib.Path) -> None
     assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
 
     record_path = _find_one_record(fleet_root)
-    record = session_registry.SessionRecord.from_json(record_path.read_text())
+    record = session_records.SessionRecord.from_json(record_path.read_text())
 
     assert captured.get("SESSION") == record.session_slug, (
         f"expected the child's own new session_slug, got {captured!r}"
@@ -3687,8 +3688,8 @@ def test_sibling_mode_is_fire_and_forget(tmp_path: pathlib.Path) -> None:
 
     fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
     record_path = _find_one_record(fleet_root)
-    record = session_registry.SessionRecord.from_json(record_path.read_text())
-    assert record.status == session_registry.Status.RUNNING, (
+    record = session_records.SessionRecord.from_json(record_path.read_text())
+    assert record.status == session_records.Status.RUNNING, (
         f"expected a best-effort refresh to RUNNING, got {record.status}"
     )
 
@@ -3754,8 +3755,8 @@ def test_sibling_mode_foreground_emulator_is_fire_and_forget(tmp_path: pathlib.P
 
     fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
     record_path = _find_one_record(fleet_root)
-    record = session_registry.SessionRecord.from_json(record_path.read_text())
-    assert record.status == session_registry.Status.RUNNING, (
+    record = session_records.SessionRecord.from_json(record_path.read_text())
+    assert record.status == session_records.Status.RUNNING, (
         f"expected a best-effort refresh to RUNNING, got {record.status}"
     )
 
@@ -3900,7 +3901,7 @@ def test_spawn_unsets_inherited_launch_inputs_from_child_env(
     # Not over-broad: this child's OWN computed values must survive.
     fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
     record_path = _find_one_record(fleet_root)
-    record = session_registry.SessionRecord.from_json(record_path.read_text())
+    record = session_records.SessionRecord.from_json(record_path.read_text())
     assert captured.get("CLAUDE_SPAWN_SESSION_ID") == record.session_slug, (
         f"the child must still see its own new session slug "
         f"{record.session_slug!r}, got {captured!r}"
@@ -4183,7 +4184,7 @@ def test_sanitization_preserves_launcher_stamped_record_identity(
 
     fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
     record_path = _find_one_record(fleet_root)
-    record = session_registry.SessionRecord.from_json(record_path.read_text())
+    record = session_records.SessionRecord.from_json(record_path.read_text())
     assert record.role == "implementer", (
         f"the launching write runs before/outside $inner, so the payload's "
         f"unset must not disturb the stamped role, got {record.role!r}"
@@ -4373,8 +4374,8 @@ def test_mac_terminal_sibling_launches_child_without_setsid(
 
     fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
     record_path = _find_one_record(fleet_root)
-    record = session_registry.SessionRecord.from_json(record_path.read_text())
-    assert record.status == session_registry.Status.RUNNING, (
+    record = session_records.SessionRecord.from_json(record_path.read_text())
+    assert record.status == session_records.Status.RUNNING, (
         f"expected a best-effort refresh to RUNNING, got {record.status}"
     )
     # ...and, given the started-marker assertion above, that RUNNING stamp is
@@ -4511,8 +4512,8 @@ def test_custom_launcher_sibling_launches_child_on_a_setsid_free_host(
 
     fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
     record_path = _find_one_record(fleet_root)
-    record = session_registry.SessionRecord.from_json(record_path.read_text())
-    assert record.status == session_registry.Status.RUNNING, (
+    record = session_records.SessionRecord.from_json(record_path.read_text())
+    assert record.status == session_records.Status.RUNNING, (
         f"expected a best-effort refresh to RUNNING, got {record.status}"
     )
 
@@ -4565,8 +4566,8 @@ def test_mac_terminal_sibling_open_failure_yields_127_not_a_running_record(
 
     fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
     record_path = _find_one_record(fleet_root)
-    record = session_registry.SessionRecord.from_json(record_path.read_text())
-    assert record.status == session_registry.Status.LAUNCHING, (
+    record = session_records.SessionRecord.from_json(record_path.read_text())
+    assert record.status == session_records.Status.LAUNCHING, (
         f"a session that never launched must not be stamped RUNNING -- the "
         f"record must stay LAUNCHING for the stale-pid reaper, got "
         f"{record.status}"
@@ -4654,7 +4655,7 @@ def test_zero_length_sentinel_never_yields_empty_code_or_nonnumeric_exit(
     # leaves the record stale rather than absent.
     fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
     record_path = _find_one_record(fleet_root)
-    record = session_registry.SessionRecord.from_json(record_path.read_text())
+    record = session_records.SessionRecord.from_json(record_path.read_text())
     assert record.exit_code == 127, (
         f"the session record must carry a well-formed integer exit code, got "
         f"{record.exit_code!r} (status {record.status}).\n{observed}"
@@ -4711,7 +4712,7 @@ def test_non_numeric_sentinel_is_rejected_like_an_empty_one(
 
     fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
     record_path = _find_one_record(fleet_root)
-    record = session_registry.SessionRecord.from_json(record_path.read_text())
+    record = session_records.SessionRecord.from_json(record_path.read_text())
     assert record.exit_code == 127, (
         f"the session record must carry a well-formed integer exit code, got "
         f"{record.exit_code!r} (status {record.status}).\n{context}"
@@ -4795,7 +4796,7 @@ def test_late_settling_sentinel_recovers_the_sessions_own_code_not_127(
 
     fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
     record_path = _find_one_record(fleet_root)
-    record = session_registry.SessionRecord.from_json(record_path.read_text())
+    record = session_records.SessionRecord.from_json(record_path.read_text())
     assert record.exit_code == SESSION_EXIT_CODE, (
         f"the session record must carry the session's own exit code, got "
         f"{record.exit_code!r} (status {record.status}).\n{context}"
@@ -5089,7 +5090,7 @@ class _T3Lane:
         self._launched = True
         message = str(arguments.get("message", ""))
         if self.scenario["writes_transcript"]:
-            transcripts = pathlib.Path(self.env["CLAUDE_PROJECTS_DIR"]) / session_registry.encode_cwd(str(self.cwd))
+            transcripts = pathlib.Path(self.env["CLAUDE_PROJECTS_DIR"]) / session_records.encode_cwd(str(self.cwd))
             transcripts.mkdir(parents=True, exist_ok=True)
             line = {"type": "user", "message": {"role": "user", "content": message}}
             (transcripts / f"{self.scenario['sid']}.jsonl").write_text(json.dumps(line) + "\n")
@@ -5169,10 +5170,10 @@ class _T3Lane:
     def record_dir(self) -> str:
         return str(_find_one_record(pathlib.Path(self.env["CLAUDE_FLEET_ROOT"])).parent)
 
-    def record(self) -> session_registry.SessionRecord:
+    def record(self) -> session_records.SessionRecord:
         records = self.records()
         assert len(records) == 1, f"expected exactly one record.json, found {records}"
-        return session_registry.SessionRecord.from_json(records[0].read_text())
+        return session_records.SessionRecord.from_json(records[0].read_text())
 
 
 @pytest.fixture
@@ -5207,7 +5208,7 @@ def test_wm_backend_takes_the_emulator_path(t3_lane: _T3Lane) -> None:
     result = t3_lane.run()
 
     assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
-    assert t3_lane.record().status == session_registry.Status.EXITED
+    assert t3_lane.record().status == session_records.Status.EXITED
     assert not t3_lane.calls(), "the wm backend must never call T3"
 
 
@@ -5355,7 +5356,7 @@ def test_t3_thread_that_fails_before_running_is_failed_to_start(t3_lane: _T3Lane
     result = t3_lane.run()
 
     assert result.returncode == 144, f"stderr: {result.stderr.decode()}"
-    assert t3_lane.record().status == session_registry.Status.FAILED_TO_START
+    assert t3_lane.record().status == session_records.Status.FAILED_TO_START
 
 
 def test_t3_child_mode_finishes_on_the_threads_result_file_and_records_the_exit(t3_lane: _T3Lane) -> None:
@@ -5366,7 +5367,7 @@ def test_t3_child_mode_finishes_on_the_threads_result_file_and_records_the_exit(
 
     assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
     record = t3_lane.record()
-    assert (record.status, record.exit_code) == (session_registry.Status.EXITED, 0)
+    assert (record.status, record.exit_code) == (session_records.Status.EXITED, 0)
     assert t3_lane.registry_exit_calls() == [["exit", "--record", t3_lane.record_dir(), "--code", "0"]]
     assert record.claude_session_id == t3_lane.scenario["sid"], "await-started must bind the transcript"
     (launch,) = t3_lane.started_threads()
@@ -5383,7 +5384,7 @@ def test_t3_child_mode_finishes_when_the_thread_is_archived(t3_lane: _T3Lane) ->
 
     assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
     record = t3_lane.record()
-    assert (record.status, record.exit_code) == (session_registry.Status.EXITED, 0)
+    assert (record.status, record.exit_code) == (session_records.Status.EXITED, 0)
     assert t3_lane.registry_exit_calls() == [["exit", "--record", t3_lane.record_dir(), "--code", "0"]]
 
 
@@ -5408,7 +5409,7 @@ def test_t3_child_mode_wait_fault_reports_a_lost_join_and_records_no_exit(t3_lan
     assert result.returncode == 127, f"stderr: {stderr}"
     assert "JOIN LOST" in stderr and f"{_T3_THREAD_ID} may still be running" in stderr
     assert t3_lane.record_dir() in stderr
-    assert t3_lane.record().status == session_registry.Status.RUNNING
+    assert t3_lane.record().status == session_records.Status.RUNNING
     assert t3_lane.registry_exit_calls() == [], "a lost join must not write an exit code"
 
 
@@ -5420,7 +5421,7 @@ def test_t3_sibling_mode_returns_with_a_running_t3_record(t3_lane: _T3Lane) -> N
 
     assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
     record = t3_lane.record()
-    assert record.status == session_registry.Status.RUNNING
+    assert record.status == session_records.Status.RUNNING
     assert record.display is not None and record.display.kind == "t3"
     assert record.display.t3_environment_id == ENVIRONMENT_ID
     (launch,) = t3_lane.started_threads()
@@ -5448,7 +5449,7 @@ def test_t3_sibling_spawn_names_its_stamped_record_on_stdout(t3_lane: _T3Lane, f
     assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
     assert _named_successor(result) == {"record": t3_lane.record_dir(), "t3_thread_id": _T3_THREAD_ID}
     record = t3_lane.record()
-    assert record.status == session_registry.Status.RUNNING
+    assert record.status == session_records.Status.RUNNING
     assert record.display is not None and record.display.t3_thread_id == _T3_THREAD_ID
 
 
@@ -5559,16 +5560,16 @@ def _set_end_of_work_inputs(env: dict[str, str], t3_end: str | None, self_exit: 
     (None, None, None, False),
     ("none", None, None, False),
     ("", None, None, False),
-    ("settle", None, session_registry.T3End.SETTLE, False),
-    ("archive", None, session_registry.T3End.ARCHIVE, True),
-    (None, "1", session_registry.T3End.ARCHIVE, True),
-    ("archive", "1", session_registry.T3End.ARCHIVE, True),
+    ("settle", None, session_records.T3End.SETTLE, False),
+    ("archive", None, session_records.T3End.ARCHIVE, True),
+    (None, "1", session_records.T3End.ARCHIVE, True),
+    ("archive", "1", session_records.T3End.ARCHIVE, True),
 ])
 def test_t3_lane_resolves_the_end_of_work_act_into_the_record_and_the_trailer(
     t3_lane: _T3Lane,
     t3_end: str | None,
     self_exit: str | None,
-    expected_end: session_registry.T3End | None,
+    expected_end: session_records.T3End | None,
     expected_self_exit: bool,
 ) -> None:
     t3_lane.env["CLAUDE_SPAWN_MODE"] = "sibling"
@@ -5632,7 +5633,7 @@ def test_tmux_lane_notes_once_that_t3_end_does_not_apply_and_stamps_nothing(tmp_
     stderr = result.stderr.decode()
     assert result.returncode == 0, f"stderr: {stderr}"
     assert len([line for line in stderr.splitlines() if "CLAUDE_SPAWN_T3_END" in line]) == 1, stderr
-    record = session_registry.SessionRecord.from_json(
+    record = session_records.SessionRecord.from_json(
         _find_one_record(pathlib.Path(env["CLAUDE_FLEET_ROOT"])).read_text()
     )
     assert record.t3_end is None
@@ -5665,24 +5666,24 @@ _PREDECESSOR_THREAD_ID = "thread-predecessor"
 def _seed_watcher_record(lane: _T3Lane, slug_pid: int, **fields: Any) -> pathlib.Path:
     """Write an escalation-watcher record titled like the handoff's successor under the lane's fleet root."""
     root = lane.env["CLAUDE_FLEET_ROOT"]
-    slug = session_registry.build_session_slug("escalation-watcher", "df", None, slug_pid)
-    session_registry.write_record(session_registry.SessionRecord(
+    slug = session_records.build_session_slug("escalation-watcher", "df", None, slug_pid)
+    session_records.write_record(session_records.SessionRecord(
         session_slug=slug, title=_HANDOFF_TITLE, role="escalation-watcher", project="df",
         launcher_pid=os.getpid(), **fields,
     ), root=root)
-    return session_registry.record_path_for_slug(slug, root=root).parent
+    return session_records.record_path_for_slug(slug, root=root).parent
 
 
 def _seed_predecessor(lane: _T3Lane) -> pathlib.Path:
     return _seed_watcher_record(
-        lane, os.getpid(), status=session_registry.Status.RUNNING, start_ts="2026-11-02T00:00:00+00:00",
-        display=session_registry.Display(kind="t3", t3_thread_id=_PREDECESSOR_THREAD_ID),
+        lane, os.getpid(), status=session_records.Status.RUNNING, start_ts="2026-11-02T00:00:00+00:00",
+        display=session_records.Display(kind="t3", t3_thread_id=_PREDECESSOR_THREAD_ID),
     )
 
 
 def _seed_older_namesake(lane: _T3Lane) -> pathlib.Path:
     return _seed_watcher_record(
-        lane, os.getppid(), status=session_registry.Status.LAUNCHING, start_ts="2026-11-01T00:00:00+00:00",
+        lane, os.getppid(), status=session_records.Status.LAUNCHING, start_ts="2026-11-01T00:00:00+00:00",
     )
 
 
@@ -5702,9 +5703,9 @@ def test_t3_handoff_confirms_the_successor_the_spawn_named_and_exits_the_predece
     named_dir = pathlib.Path(named["record"])
     assert named_dir not in (own_dir, decoy_dir)
     root = t3_lane.env["CLAUDE_FLEET_ROOT"]
-    successor = session_registry.read_record(named_dir.name, root=root)
+    successor = session_records.read_record(named_dir.name, root=root)
     assert successor.title == _HANDOFF_TITLE
-    assert successor.status == session_registry.Status.RUNNING
+    assert successor.status == session_records.Status.RUNNING
     assert successor.display is not None and successor.display.t3_thread_id == named["t3_thread_id"] == _T3_THREAD_ID
 
     exit_verb = subprocess.run(
@@ -5713,5 +5714,5 @@ def test_t3_handoff_confirms_the_successor_the_spawn_named_and_exits_the_predece
     )
 
     assert exit_verb.returncode == 0, exit_verb.stderr.decode()
-    own = session_registry.read_record(own_dir.name, root=root)
-    assert (own.status, own.exit_code) == (session_registry.Status.EXITED, 0)
+    own = session_records.read_record(own_dir.name, root=root)
+    assert (own.status, own.exit_code) == (session_records.Status.EXITED, 0)

@@ -12,7 +12,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 import pytest
-from orchestrator import session_registry as sr
+from orchestrator import session_records
 
 
 def _make_record(**overrides):
@@ -22,7 +22,7 @@ def _make_record(**overrides):
     """
     fields: dict = {
         'session_slug': 'unblock-df-2085-4242',
-        'status': sr.Status.RUNNING,
+        'status': session_records.Status.RUNNING,
         'title': 'unblock:df#2085 slug',
         'role': 'unblock',
         'project': 'df',
@@ -30,31 +30,31 @@ def _make_record(**overrides):
         'start_ts': '2026-07-07T00:00:00+00:00',
     }
     fields.update(overrides)
-    return sr.SessionRecord(**fields)
+    return session_records.SessionRecord(**fields)
 
 
 class TestStateGlyph:
     def test_awaiting_input_is_blocked_glyph(self):
         from cockpit.panes.session_table import state_glyph
 
-        assert state_glyph(sr.Status.AWAITING_INPUT) == '⏸'
+        assert state_glyph(session_records.Status.AWAITING_INPUT) == '⏸'
 
     def test_running_and_launching_are_working_glyph(self):
         from cockpit.panes.session_table import state_glyph
 
-        assert state_glyph(sr.Status.RUNNING) == '⚙'
-        assert state_glyph(sr.Status.LAUNCHING) == '⚙'
+        assert state_glyph(session_records.Status.RUNNING) == '⚙'
+        assert state_glyph(session_records.Status.LAUNCHING) == '⚙'
 
     def test_idle_is_idle_glyph(self):
         from cockpit.panes.session_table import state_glyph
 
-        assert state_glyph(sr.Status.IDLE) == '✓'
+        assert state_glyph(session_records.Status.IDLE) == '✓'
 
     def test_exited_and_failed_to_start_are_dead_glyph(self):
         from cockpit.panes.session_table import state_glyph
 
-        assert state_glyph(sr.Status.EXITED) == '☠'
-        assert state_glyph(sr.Status.FAILED_TO_START) == '☠'
+        assert state_glyph(session_records.Status.EXITED) == '☠'
+        assert state_glyph(session_records.Status.FAILED_TO_START) == '☠'
 
     def test_accepts_wire_string_too(self):
         from cockpit.panes.session_table import state_glyph
@@ -144,20 +144,20 @@ class TestCountOutstandingChildren:
 
         parent = _make_record(session_slug='parent-1')
         running_child = _make_record(
-            session_slug='child-running', parent_session_id='parent-1', status=sr.Status.RUNNING
+            session_slug='child-running', parent_session_id='parent-1', status=session_records.Status.RUNNING
         )
         awaiting_child = _make_record(
             session_slug='child-awaiting',
             parent_session_id='parent-1',
-            status=sr.Status.AWAITING_INPUT,
+            status=session_records.Status.AWAITING_INPUT,
         )
         exited_child = _make_record(
-            session_slug='child-exited', parent_session_id='parent-1', status=sr.Status.EXITED
+            session_slug='child-exited', parent_session_id='parent-1', status=session_records.Status.EXITED
         )
         failed_child = _make_record(
             session_slug='child-failed',
             parent_session_id='parent-1',
-            status=sr.Status.FAILED_TO_START,
+            status=session_records.Status.FAILED_TO_START,
         )
         all_records = [parent, running_child, awaiting_child, exited_child, failed_child]
 
@@ -178,7 +178,7 @@ class TestCountOutstandingChildren:
         unrelated_child = _make_record(
             session_slug='child-of-other',
             parent_session_id='parent-2',
-            status=sr.Status.RUNNING,
+            status=session_records.Status.RUNNING,
         )
 
         all_records = [parent, other_parent, unrelated_child]
@@ -209,12 +209,12 @@ class TestOrderSessions:
 
         old_running = _make_record(
             session_slug='old-running',
-            status=sr.Status.RUNNING,
+            status=session_records.Status.RUNNING,
             start_ts=datetime(2020, 1, 1, tzinfo=UTC).isoformat(),
         )
         young_awaiting = _make_record(
             session_slug='young-awaiting',
-            status=sr.Status.AWAITING_INPUT,
+            status=session_records.Status.AWAITING_INPUT,
             start_ts=datetime(2026, 7, 7, tzinfo=UTC).isoformat(),
         )
 
@@ -225,12 +225,12 @@ class TestOrderSessions:
     def test_state_rank_ordering(self):
         from cockpit.panes.session_table import order_sessions
 
-        awaiting = _make_record(session_slug='s-awaiting', status=sr.Status.AWAITING_INPUT)
-        running = _make_record(session_slug='s-running', status=sr.Status.RUNNING)
-        launching = _make_record(session_slug='s-launching', status=sr.Status.LAUNCHING)
-        idle = _make_record(session_slug='s-idle', status=sr.Status.IDLE)
-        exited = _make_record(session_slug='s-exited', status=sr.Status.EXITED)
-        failed = _make_record(session_slug='s-failed', status=sr.Status.FAILED_TO_START)
+        awaiting = _make_record(session_slug='s-awaiting', status=session_records.Status.AWAITING_INPUT)
+        running = _make_record(session_slug='s-running', status=session_records.Status.RUNNING)
+        launching = _make_record(session_slug='s-launching', status=session_records.Status.LAUNCHING)
+        idle = _make_record(session_slug='s-idle', status=session_records.Status.IDLE)
+        exited = _make_record(session_slug='s-exited', status=session_records.Status.EXITED)
+        failed = _make_record(session_slug='s-failed', status=session_records.Status.FAILED_TO_START)
 
         ordered = order_sessions([failed, exited, idle, launching, running, awaiting])
         ranks = [r.session_slug for r in ordered]
@@ -247,12 +247,12 @@ class TestOrderSessions:
 
         newer = _make_record(
             session_slug='newer',
-            status=sr.Status.RUNNING,
+            status=session_records.Status.RUNNING,
             start_ts=datetime(2026, 7, 7, tzinfo=UTC).isoformat(),
         )
         older = _make_record(
             session_slug='older',
-            status=sr.Status.RUNNING,
+            status=session_records.Status.RUNNING,
             start_ts=datetime(2026, 7, 1, tzinfo=UTC).isoformat(),
         )
 
@@ -265,10 +265,10 @@ class TestOrderSessions:
 
         has_ts = _make_record(
             session_slug='has-ts',
-            status=sr.Status.RUNNING,
+            status=session_records.Status.RUNNING,
             start_ts=datetime(2026, 7, 7, tzinfo=UTC).isoformat(),
         )
-        no_ts = _make_record(session_slug='no-ts', status=sr.Status.RUNNING, start_ts='')
+        no_ts = _make_record(session_slug='no-ts', status=session_records.Status.RUNNING, start_ts='')
 
         ordered = order_sessions([no_ts, has_ts])
 
@@ -280,11 +280,11 @@ class TestOrderSessions:
 
         focusable = _make_record(
             session_slug='focusable',
-            status=sr.Status.RUNNING,
-            display=sr.Display(kind='wm', wm_title='t'),
+            status=session_records.Status.RUNNING,
+            display=session_records.Display(kind='wm', wm_title='t'),
         )
         headless = _make_record(
-            session_slug='headless', status=sr.Status.RUNNING, display=None
+            session_slug='headless', status=session_records.Status.RUNNING, display=None
         )
 
         for order in ([headless, focusable], [focusable, headless]):
@@ -299,14 +299,14 @@ class TestOrderSessions:
 
         older_headless = _make_record(
             session_slug='older-headless',
-            status=sr.Status.RUNNING,
+            status=session_records.Status.RUNNING,
             display=None,
             start_ts=datetime(2026, 7, 1, tzinfo=UTC).isoformat(),
         )
         newer_focusable = _make_record(
             session_slug='newer-focusable',
-            status=sr.Status.RUNNING,
-            display=sr.Display(kind='wm', wm_title='t'),
+            status=session_records.Status.RUNNING,
+            display=session_records.Display(kind='wm', wm_title='t'),
             start_ts=datetime(2026, 7, 7, tzinfo=UTC).isoformat(),
         )
         records = [newer_focusable, older_headless]
@@ -328,13 +328,13 @@ class TestOrderSessions:
 
         headless_blocked = _make_record(
             session_slug='headless-blocked',
-            status=sr.Status.AWAITING_INPUT,
+            status=session_records.Status.AWAITING_INPUT,
             display=None,
         )
         focusable_running = _make_record(
             session_slug='focusable-running',
-            status=sr.Status.RUNNING,
-            display=sr.Display(kind='wm', wm_title='t'),
+            status=session_records.Status.RUNNING,
+            display=session_records.Display(kind='wm', wm_title='t'),
         )
 
         ordered = order_sessions([focusable_running, headless_blocked], focus_first=True)
@@ -352,14 +352,14 @@ class TestOrderSessions:
 
         newer = _make_record(
             session_slug='newer',
-            status=sr.Status.RUNNING,
-            display=sr.Display(kind='wm', wm_title='t'),
+            status=session_records.Status.RUNNING,
+            display=session_records.Display(kind='wm', wm_title='t'),
             start_ts=datetime(2026, 7, 7, tzinfo=UTC).isoformat(),
         )
         older = _make_record(
             session_slug='older',
-            status=sr.Status.RUNNING,
-            display=sr.Display(kind='wm', wm_title='t'),
+            status=session_records.Status.RUNNING,
+            display=session_records.Display(kind='wm', wm_title='t'),
             start_ts=datetime(2026, 7, 1, tzinfo=UTC).isoformat(),
         )
 
@@ -378,18 +378,18 @@ class TestFilterLiveSessions:
     def test_terminal_statuses_are_dropped(self):
         from cockpit.panes.session_table import filter_live_sessions
 
-        exited = _make_record(session_slug='s-exited', status=sr.Status.EXITED)
-        failed = _make_record(session_slug='s-failed', status=sr.Status.FAILED_TO_START)
+        exited = _make_record(session_slug='s-exited', status=session_records.Status.EXITED)
+        failed = _make_record(session_slug='s-failed', status=session_records.Status.FAILED_TO_START)
 
         assert filter_live_sessions([exited, failed]).visible == []
 
     def test_non_terminal_statuses_are_all_kept(self):
         from cockpit.panes.session_table import filter_live_sessions
 
-        awaiting = _make_record(session_slug='s-awaiting', status=sr.Status.AWAITING_INPUT)
-        running = _make_record(session_slug='s-running', status=sr.Status.RUNNING)
-        launching = _make_record(session_slug='s-launching', status=sr.Status.LAUNCHING)
-        idle = _make_record(session_slug='s-idle', status=sr.Status.IDLE)
+        awaiting = _make_record(session_slug='s-awaiting', status=session_records.Status.AWAITING_INPUT)
+        running = _make_record(session_slug='s-running', status=session_records.Status.RUNNING)
+        launching = _make_record(session_slug='s-launching', status=session_records.Status.LAUNCHING)
+        idle = _make_record(session_slug='s-idle', status=session_records.Status.IDLE)
         records = [awaiting, running, launching, idle]
 
         kept = filter_live_sessions(records).visible
@@ -406,10 +406,10 @@ class TestFilterLiveSessions:
     def test_relative_order_of_kept_records_is_preserved(self):
         from cockpit.panes.session_table import filter_live_sessions
 
-        awaiting = _make_record(session_slug='s-awaiting', status=sr.Status.AWAITING_INPUT)
-        exited = _make_record(session_slug='s-exited', status=sr.Status.EXITED)
-        running = _make_record(session_slug='s-running', status=sr.Status.RUNNING)
-        idle = _make_record(session_slug='s-idle', status=sr.Status.IDLE)
+        awaiting = _make_record(session_slug='s-awaiting', status=session_records.Status.AWAITING_INPUT)
+        exited = _make_record(session_slug='s-exited', status=session_records.Status.EXITED)
+        running = _make_record(session_slug='s-running', status=session_records.Status.RUNNING)
+        idle = _make_record(session_slug='s-idle', status=session_records.Status.IDLE)
         ordered_input = [awaiting, exited, running, idle]
 
         kept = filter_live_sessions(ordered_input).visible
@@ -428,7 +428,7 @@ class TestFilterLiveSessions:
         from cockpit.panes.session_table import filter_live_sessions
 
         records = [
-            _make_record(session_slug=f's-{i}', status=sr.Status.RUNNING) for i in range(5)
+            _make_record(session_slug=f's-{i}', status=session_records.Status.RUNNING) for i in range(5)
         ]
 
         kept = filter_live_sessions(records, cap=3).visible
@@ -439,7 +439,7 @@ class TestFilterLiveSessions:
         from cockpit.panes.session_table import _DEFAULT_VISIBLE_CAP, filter_live_sessions
 
         records = [
-            _make_record(session_slug=f's-{i}', status=sr.Status.RUNNING)
+            _make_record(session_slug=f's-{i}', status=session_records.Status.RUNNING)
             for i in range(_DEFAULT_VISIBLE_CAP + 10)
         ]
 
@@ -457,7 +457,7 @@ class TestFilterLiveSessions:
         from cockpit.panes.session_table import filter_live_sessions
 
         records = [
-            _make_record(session_slug=f's-{i}', status=sr.Status.RUNNING) for i in range(5)
+            _make_record(session_slug=f's-{i}', status=session_records.Status.RUNNING) for i in range(5)
         ]
 
         view = filter_live_sessions(records, cap=3)
@@ -472,11 +472,11 @@ class TestFilterLiveSessions:
         from cockpit.panes.session_table import filter_live_sessions
 
         records = [
-            _make_record(session_slug='live-0', status=sr.Status.RUNNING),
-            _make_record(session_slug='dead-0', status=sr.Status.EXITED),
-            _make_record(session_slug='live-1', status=sr.Status.IDLE),
-            _make_record(session_slug='dead-1', status=sr.Status.FAILED_TO_START),
-            _make_record(session_slug='dead-2', status=sr.Status.EXITED),
+            _make_record(session_slug='live-0', status=session_records.Status.RUNNING),
+            _make_record(session_slug='dead-0', status=session_records.Status.EXITED),
+            _make_record(session_slug='live-1', status=session_records.Status.IDLE),
+            _make_record(session_slug='dead-1', status=session_records.Status.FAILED_TO_START),
+            _make_record(session_slug='dead-2', status=session_records.Status.EXITED),
         ]
 
         view = filter_live_sessions(records)
@@ -488,7 +488,7 @@ class TestFilterLiveSessions:
         from cockpit.panes.session_table import filter_live_sessions
 
         records = [
-            _make_record(session_slug=f's-{i}', status=sr.Status.RUNNING) for i in range(4)
+            _make_record(session_slug=f's-{i}', status=session_records.Status.RUNNING) for i in range(4)
         ]
 
         view = filter_live_sessions(records, cap=10)
@@ -501,7 +501,7 @@ class TestFilterLiveSessions:
         from cockpit.panes.session_table import filter_live_sessions
 
         records = [
-            _make_record(session_slug=f's-{i}', status=sr.Status.RUNNING) for i in range(6)
+            _make_record(session_slug=f's-{i}', status=session_records.Status.RUNNING) for i in range(6)
         ]
 
         for cap in range(0, 9):
@@ -552,7 +552,7 @@ class TestFocusMarker:
     def test_record_with_display_is_focusable(self):
         from cockpit.panes.session_table import focus_marker, is_focusable
 
-        record = _make_record(display=sr.Display(kind='wm', wm_title='t'))
+        record = _make_record(display=session_records.Display(kind='wm', wm_title='t'))
 
         assert is_focusable(record) is True
         assert focus_marker(record) == '▸'
@@ -573,7 +573,7 @@ class TestFocusMarker:
         from cockpit.panes.session_table import _FALLBACK_GLYPH, _GLYPHS, focus_marker
 
         status_vocabulary = set(_GLYPHS.values()) | {_FALLBACK_GLYPH}
-        focusable = focus_marker(_make_record(display=sr.Display(kind='wm')))
+        focusable = focus_marker(_make_record(display=session_records.Display(kind='wm')))
         headless = focus_marker(_make_record(display=None))
 
         assert focusable != headless
@@ -586,7 +586,7 @@ class TestFocusMarker:
         must never be mislabelled unactionable (fail-soft, PRD §2)."""
         from cockpit.panes.session_table import focus_marker, is_focusable
 
-        record = _make_record(display=sr.Display(kind='weird', wm_title='t'))
+        record = _make_record(display=session_records.Display(kind='weird', wm_title='t'))
 
         assert is_focusable(record) is True
         assert focus_marker(record) == '▸'
@@ -594,9 +594,9 @@ class TestFocusMarker:
     @pytest.mark.parametrize(
         'display',
         [
-            sr.Display(kind='wm', wm_title='t'),
-            sr.Display(kind='tmux', tmux_target='sess:0.1'),
-            sr.Display(kind='weird', wm_title='t'),
+            session_records.Display(kind='wm', wm_title='t'),
+            session_records.Display(kind='tmux', tmux_target='sess:0.1'),
+            session_records.Display(kind='weird', wm_title='t'),
             None,
         ],
         ids=['wm', 'tmux', 'unrecognized-kind', 'headless'],
