@@ -518,6 +518,44 @@ class TestAcquireSpecLaneFallback:
             )
         assert result is not None
 
+    async def test_exhaustion_cold_fallback_is_logged_at_info_naming_the_commit(
+        self, spec_git_repo: Path, caplog: pytest.LogCaptureFixture,
+    ):
+        """A speculative verify that goes cold because the pool is full is visible at INFO."""
+        caplog.set_level(logging.DEBUG, logger='orchestrator.git_ops')
+        await _add_recording_seed_to_repo(spec_git_repo)
+        git_ops = GitOps(
+            _make_spec_git_config(on=True), spec_git_repo,
+            merge_spec_warm_lane_pool_size=1,
+        )
+        _, merge_commit, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=spec_git_repo)
+        merge_commit = merge_commit.strip()
+        await git_ops.acquire_spec_lane(merge_commit)
+        caplog.clear()
+
+        await git_ops.acquire_spec_lane(merge_commit)
+
+        exhausted = [r for r in caplog.records if 'pool exhausted' in r.getMessage()]
+        assert exhausted, 'no record names the pool exhaustion'
+        assert all(r.levelno >= logging.INFO for r in exhausted), (
+            'a cold fallback on an exhausted spec pool must be visible at INFO'
+        )
+        assert any(merge_commit[:8] in r.getMessage() for r in exhausted)
+
+    async def test_knob_off_cold_path_stays_below_info(
+        self, spec_git_repo: Path, caplog: pytest.LogCaptureFixture,
+    ):
+        """No spec pool configured is not a degradation: no INFO line per chain build."""
+        caplog.set_level(logging.DEBUG, logger='orchestrator.git_ops')
+        git_ops = GitOps(_make_spec_git_config(on=False), spec_git_repo)
+        _, merge_commit, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=spec_git_repo)
+
+        await git_ops.acquire_spec_lane(merge_commit.strip())
+
+        absent = [r for r in caplog.records if 'spec pool absent' in r.getMessage()]
+        assert absent
+        assert all(r.levelno < logging.INFO for r in absent)
+
 
 # ===========================================================================
 # Step-11: RED — GitOps.release_spec_lane

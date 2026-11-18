@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from pathlib import Path
 from typing import Literal
 
@@ -51,6 +52,11 @@ from _merge_deep_scene import (
 )
 from _merge_deep_scene import git_repo as git_repo
 from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT
+from _seed_script_stubs import (
+    BLOCKING_TARGET_MODE_SEED_SCRIPT,
+    arm_seed_block,
+    expire_deadline_once,
+)
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
@@ -1927,3 +1933,109 @@ class TestBuildChainLaneBase:
         assert res.lane is not None
         assert await _rev_parse(res.lane, f'{res.links[0][1]}^1') == head
         await release_chain_build_lane(git_ops, res.lane, warm=res.lane_warm)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# task 7721: an interrupted build names its phase; a finished one times both
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _merge_lane_messages(caplog: pytest.LogCaptureFixture, prefix: str) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.getMessage().startswith(prefix)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
+class TestBuildChainPhaseVisibility:
+    """Which phase a deadline cut short, and what each phase of a build cost.
+
+    ``_deep_chain_placement``'s timeout surfaces as a bare ``TimeoutError``
+    one frame up, which cannot see whether the lane acquisition (seed) or
+    the merge loop was running, so ``build_chain`` says so itself.
+    """
+
+    async def _two_link_scene(self, git_repo: Path) -> tuple[GitOps, tuple, str]:
+        git_ops = _make_git_ops(git_repo)
+        config = _make_config(git_repo)
+        await _create_branch_editing(git_repo, 'task/101', 'a.txt', 'edit-101\n')
+        await _create_branch_editing(git_repo, 'task/102', 'b.txt', 'edit-102\n')
+        snap = (
+            _make_req('101', '101', config, git_repo),
+            _make_req('102', '102', config, git_repo),
+        )
+        return git_ops, snap, await _rev_parse(git_repo)
+
+    async def test_summary_line_times_the_acquire_and_merge_phases(
+        self, git_repo: Path, caplog: pytest.LogCaptureFixture,
+    ):
+        caplog.set_level(logging.INFO, logger='orchestrator.merge_lane')
+        git_ops, snap, head = await self._two_link_scene(git_repo)
+
+        res = await build_chain(git_ops, snap, head, cap=2, target_depth=2)
+
+        assert res.depth == 2
+        [summary] = _merge_lane_messages(caplog, 'build_chain: depth=')
+        timings = re.search(r'elapsed_ms=(\d+) acquire_ms=(\d+) merge_ms=(\d+)', summary)
+        assert timings, summary
+        elapsed, acquire, merge = map(int, timings.groups())
+        assert acquire + merge <= elapsed
+        await release_chain_build_lane(git_ops, res.lane, warm=res.lane_warm)
+
+    async def test_deadline_during_acquisition_frees_the_lane_and_names_the_phase(
+        self, git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        await _commit_seed_script(
+            git_repo, BLOCKING_TARGET_MODE_SEED_SCRIPT, 'blocking seed-warm-lane.sh',
+        )
+        git_ops, snap, head = await self._two_link_scene(git_repo)
+        git_ops.warm_lane_base_target_path.mkdir(parents=True)
+        (git_ops.warm_lane_base_target_path / 'generation').write_text('1')
+        block = arm_seed_block(monkeypatch, tmp_path / 'seed-block')
+        caplog.set_level(logging.WARNING, logger='orchestrator.merge_lane')
+
+        with pytest.raises(TimeoutError):
+            await expire_deadline_once(
+                build_chain(git_ops, snap, head, cap=2, target_depth=2),
+                block.wait_started(),
+            )
+
+        assert _all_pool_lanes_free(git_ops), 'a deadline in the seed stranded the lane'
+        [interrupted] = _merge_lane_messages(caplog, 'build_chain: interrupted')
+        assert 'during acquire phase' in interrupted
+        assert 'TimeoutError' in interrupted or 'CancelledError' in interrupted
+
+        block.disarm()
+        res = await build_chain(git_ops, snap, head, cap=2, target_depth=2)
+        assert res.depth == 2
+        assert res.lane == git_ops.worktree_base / '_spec-0'
+        assert res.lane_warm is True
+        await release_chain_build_lane(git_ops, res.lane, warm=res.lane_warm)
+
+    async def test_deadline_during_the_merge_loop_frees_the_lane_and_names_the_phase(
+        self, git_repo: Path, monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        git_ops, snap, head = await self._two_link_scene(git_repo)
+        real = git_ops.merge_branch_into_worktree
+        second_merge = asyncio.Event()
+
+        async def _stall_the_second(worktree: Path, branch: str):
+            if branch == '102':
+                second_merge.set()
+                await asyncio.sleep(60)
+            return await real(worktree, branch)
+
+        monkeypatch.setattr(git_ops, 'merge_branch_into_worktree', _stall_the_second)
+        caplog.set_level(logging.WARNING, logger='orchestrator.merge_lane')
+
+        with pytest.raises(TimeoutError):
+            await expire_deadline_once(
+                build_chain(git_ops, snap, head, cap=2, target_depth=2),
+                second_merge.wait(),
+            )
+
+        assert _all_pool_lanes_free(git_ops)
+        [interrupted] = _merge_lane_messages(caplog, 'build_chain: interrupted')
+        assert 'during merge phase' in interrupted
+        assert 'built=1' in interrupted

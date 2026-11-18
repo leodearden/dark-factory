@@ -24,6 +24,7 @@ from _seed_script_stubs import (
     SeedBlock,
     arm_seed_block,
     commit_seed_script,
+    expire_deadline_once,
     make_seed_test_repo,
     wait_until_exists,
     warm_pool_git_config,
@@ -59,17 +60,8 @@ async def _cancel_once_started(
 async def _deadline_once_started(
     call: Coroutine[Any, Any, object], block: SeedBlock,
 ) -> None:
-    deadline = asyncio.timeout(None)
-
-    async def under_deadline() -> None:
-        async with deadline:
-            await call
-
-    task = asyncio.ensure_future(under_deadline())
-    await block.wait_started()
-    deadline.reschedule(asyncio.get_running_loop().time())
     with pytest.raises(TimeoutError):
-        await task
+        await expire_deadline_once(call, block.wait_started())
 
 
 @pytest.mark.asyncio

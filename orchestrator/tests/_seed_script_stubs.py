@@ -1,22 +1,28 @@
 """Real-git fixtures plus stubs of reify's ``seed-warm-lane.sh`` contracts.
 
 Shared by the lane-lock re-entrancy, main-tip-sweep seed-mode, spec-lane
-re-acquire and spec-lane cancellation suites, so the one model of how today's seed script takes, refuses
-and accepts an asserted ``<lane_dir>.lock``, and of how each mode treats an
-existing ``<lane_dir>/target``, lives in one place.
+re-acquire and spec-lane cancellation suites, so the one model of how today's
+seed script takes, refuses and accepts an asserted ``<lane_dir>.lock``, and of
+how each mode treats an existing ``<lane_dir>/target``, lives in one place.
+The blocking variant and :func:`expire_deadline_once` let a test interrupt a
+seed partway through.
 """
 
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TypeVar
 
 import pytest
 from _git_fixtures import seed_repo
 
 from orchestrator.config import GitConfig
 from orchestrator.git_ops import _run
+
+T = TypeVar('T')
 
 # Models TODAY's reify script (post-5354 + post-5568): it takes
 # ${LANE_DIR}.lock itself unless told the caller already holds it, and refuses
@@ -87,6 +93,24 @@ if [ -n "${{{SEED_BLOCK_FILE_ENV}:-}}" ] && [ -e "${SEED_BLOCK_FILE_ENV}" ]; the
     sleep 60
 fi
 """ + _TARGET_MODE_BODY
+
+
+async def expire_deadline_once(call: Awaitable[T], started: Awaitable[object]) -> T:
+    """Await *call* under an ``asyncio.timeout`` that expires as soon as *started* completes.
+
+    Lands a real deadline at a known point inside *call* (a hung seed, a
+    stalled merge) instead of guessing a duration; raises ``TimeoutError``.
+    """
+    deadline = asyncio.timeout(None)
+
+    async def under_deadline() -> T:
+        async with deadline:
+            return await call
+
+    task = asyncio.ensure_future(under_deadline())
+    await started
+    deadline.reschedule(asyncio.get_running_loop().time())
+    return await task
 
 
 async def wait_until_exists(path: Path, *, within_s: float = 30.0) -> None:
