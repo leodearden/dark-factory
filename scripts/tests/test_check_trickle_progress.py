@@ -988,3 +988,20 @@ def test_the_ok_line_prints_an_empty_retry_backlog(tmp_path, monkeypatch):
     assert "consecutive_deferred_runs=0 " in result.stdout
     assert f"{_EMPTY_BACKLOG}," in result.stdout
     _assert_no_git(git_marker)
+
+
+def test_a_deferred_streak_with_a_hand_emptied_backlog_names_no_date(
+    tmp_path, monkeypatch
+):
+    threshold = trickle_state.UNRECOVERABLE_DEFERRED_RUNS
+    _seed(tmp_path, monkeypatch, outcomes=["deferred"] * threshold)
+    _rewrite_state("dark_factory", lambda doc: doc.update(retry_backlog={}))
+
+    result, git_marker = _run_probe(tmp_path, "dark_factory", 3)
+
+    assert result.returncode == 1, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert "no owed date is recorded" in result.stderr
+    assert _EMPTY_BACKLOG in result.stderr
+    _assert_no_git(git_marker)
