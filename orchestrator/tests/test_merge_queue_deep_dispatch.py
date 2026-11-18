@@ -2121,19 +2121,29 @@ class _DeepScene:
             for c in self.calls
         ]
 
-    async def round_(self, *, tag: str, cohort: int = 0) -> dict:
+    async def round_(
+        self, *, tag: str, cohort: int = 0, speculative: bool = True,
+    ) -> dict:
         """Drive ONE full dispatch round through ``_dispatch_item``.
 
         *cohort* picks the dispatching owner, task ``{cohort+1}01`` (see
-        :func:`_cohort_task_ids`).  Returns the recorded
-        ``_run_inflight_verify`` kwargs for the round (plus ``'result'``),
-        after :meth:`release_round`.
+        :func:`_cohort_task_ids`).  *speculative* picks its slot, as for
+        :func:`_make_item`: the default is the slot-2 item, and
+        ``speculative=False`` the head, based on REAL main, since a stale
+        base would fire ``_dispatch_item``'s staleness re-merge and leave no
+        later round chaining.  Returns the recorded ``_run_inflight_verify``
+        kwargs for the round (plus ``'result'``), after :meth:`release_round`.
         """
         self._round_no += 1
         owner = _cohort_task_ids(cohort)[0]
-        item = _make_item(
-            _make_req(owner, owner, self.config, self.repo), self.head,
-            _ephemeral_merge_wt(self.git_ops, f'{tag}-r{self._round_no}'),
+        req = _make_req(owner, owner, self.config, self.repo)
+        merge_wt = _ephemeral_merge_wt(self.git_ops, f'{tag}-r{self._round_no}')
+        item = (
+            _make_item(req, self.head, merge_wt) if speculative
+            else _make_item(
+                req, self.head, merge_wt,
+                speculative=False, base_sha=await _rev_parse(self.repo, 'main'),
+            )
         )
         entry = await self.worker._dispatch_item(item)
         assert entry is not None, 'dispatch must not decline: a host is free'
@@ -2364,18 +2374,7 @@ class TestDeepDispatchRoundsIntegration:
             allocator=allocator,
         )
 
-        if owner == 'speculative':
-            await scene.round_(tag=locality)
-        else:
-            head_item = _make_item(
-                _make_req('101', '101', scene.config, repo), scene.head,
-                _ephemeral_merge_wt(scene.git_ops, f'{locality}-head'),
-                speculative=False, base_sha=await _rev_parse(repo, 'main'),
-            )
-            entry = await scene.worker._dispatch_item(head_item)
-            assert entry is not None and entry.verify_task is not None
-            await entry.verify_task
-            await scene.release_round(entry)
+        await scene.round_(tag=locality, speculative=owner == 'speculative')
 
         chain = scene.calls[-1]['chain']
         assert chain is not None and chain.links, 'the round must chain'

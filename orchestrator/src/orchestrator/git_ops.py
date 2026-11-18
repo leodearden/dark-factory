@@ -6758,11 +6758,16 @@ class GitOps:
             INFO.  A fault while holding a lane goes through
             :meth:`_spec_lane_cold_fallback`, which logs at WARNING.
 
+        **Vanished lane directory**: a lane still registered whose directory
+        is gone has its registration removed and takes the create-once path,
+        so a pool that hands out its first FREE lane does not re-draw a
+        broken one forever.
+
         **Cancellation and errors**: any other exit between ``try_acquire``
         and the warm return, such as a caller's deadline or shutdown cancel,
-        or a :class:`WorktreeMissing` from a lane whose directory vanished,
-        gives the lane back and then propagates.  A seed killed that way
-        leaves ``target/`` half-cloned; the next acquire's
+        or a :class:`WorktreeMissing` from a lane whose directory vanished
+        mid-reset, gives the lane back and then propagates.  A seed killed
+        that way leaves ``target/`` half-cloned; the next acquire's
         ``--fresh-checkout`` re-seed replaces it.
 
         Args:
@@ -6770,7 +6775,9 @@ class GitOps:
 
         Returns:
             ``(lane_path, True)`` when the warm spec lane is ready;
-            ``(cold_path, False)`` on pool exhaustion or any failure (inv.6).
+            ``(cold_path, False)`` on knob-off, pool exhaustion or a detected
+            fault (inv.6).  Exceptions propagate after the lane is released
+            (see Cancellation and errors).
         """
         pool = self.spec_warm_lane_pool
         if pool is None:
@@ -6811,7 +6818,7 @@ class GitOps:
         giving it back is the caller's.
         """
         # ── Create-once or reset-in-place ────────────────────────────────────
-        if not await self._is_registered_worktree(lane):
+        if not await self._spec_lane_registered(lane):
             fault = await self._create_spec_lane(lane, merge_commit)
             if fault is not None:
                 return fault
@@ -6838,6 +6845,30 @@ class GitOps:
         if rc != 0:
             return f'seed failed (rc={rc})'
         return None
+
+    async def _spec_lane_registered(self, lane: Path) -> bool:
+        """Whether *lane* is a registered worktree whose directory is in place.
+
+        A registration whose directory vanished is removed (scoped to *lane*,
+        never a repo-wide prune) so :meth:`_create_spec_lane` can add it
+        afresh; if that removal fails, the create's ``git worktree add``
+        fails too and the acquire falls back cold.
+        """
+        if not await self._is_registered_worktree(lane):
+            return False
+        if lane.is_dir():
+            return True
+        rc, _, err = await _run(
+            ['git', 'worktree', 'remove', '--force', str(lane)],
+            cwd=self.project_root,
+        )
+        logger.warning(
+            'acquire_spec_lane: %s is registered but its directory is gone — '
+            'removing the registration to re-create it (git worktree remove '
+            'rc=%d, err=%r)',
+            lane, rc, err,
+        )
+        return False
 
     async def _create_spec_lane(self, lane: Path, merge_commit: str) -> str | None:
         """Create-once: register *lane* at *merge_commit*; None, or the fault reason."""

@@ -5181,12 +5181,9 @@ async def build_chain(
         # acquisition, no subprocess.
         return ChainResult(links=[], tip=head_merge_commit)
 
-    # Wall-clock for the whole build, reported on the summary line below.  The
-    # cost is real and invisible from the signature: one lane acquisition
-    # (`git reset --hard` + `git clean -xfd` + a CoW seed) plus up to `depth`
-    # sequential `git merge` subprocesses, plus — on the conflict arm — a
-    # `get_conflict_details` that spawns one `git diff` per conflicted file.
-    # Measured from before the acquisition so the lane reset is included.
+    # Wall-clock for the whole build, reported on the summary line below; the
+    # docstring's Caller-cost note lists what it spends.  Measured from before
+    # the acquisition so the lane provisioning is included.
     started = time.monotonic()
 
     # Exactly one lane for the whole chain (invariant 2 above).  `config` is
@@ -5322,7 +5319,9 @@ async def build_chain(
     if not links:
         # An empty result never holds a lane, so a caller that skips the
         # release on the empty path cannot leak one.
-        await release_chain_build_lane(git_ops, lane, warm=warm)
+        await complete_despite_cancellation(
+            release_chain_build_lane(git_ops, lane, warm=warm),
+        )
         return ChainResult(
             links=[], tip=tip,
             truncated_at=truncated_at, truncated_reason=truncated_reason,
@@ -11522,15 +11521,15 @@ class SpeculativeMergeWorker:
         Its candidates are reserved for the whole call (task 7720), so no other
         consumer of the lane buffers can take one mid-build.
         """
-        # Bound on the whole build: lane acquisition (git reset/clean, the CoW
-        # re-seed of target/) plus the merges; no cargo. The 1800 s default sits
-        # above reify's measured whole-process p99 (seeds, n=401 over
-        # 2026-10-15..30: p99 899 s, last 7 d 1003 s, week 44 1168 s, max 1272 s;
-        # plus <=28 s reset/clean, <=30 s lock wait, ~0.5 s per merge). The build
-        # blocks _verifier_loop for its whole duration, so this is also the
-        # worst-case stall on finalising a green head. A cancel during
-        # acquisition gives the lane back: see the cancellation paragraph of
-        # git_ops.py::GitOps.acquire_spec_lane.
+        # Bound on the whole build: one lane acquisition (a warm lane's
+        # reset/clean and CoW re-seed of target/ for a local verify, a `git
+        # worktree add` for a remote one) plus the merges; no cargo. The 1800 s
+        # default sits above reify's measured whole-process p99 (seeds, n=401
+        # over 2026-10-15..30: p99 899 s, last 7 d 1003 s, week 44 1168 s, max
+        # 1272 s; plus <=28 s reset/clean, <=30 s lock wait, ~0.5 s per merge).
+        # The build blocks _verifier_loop for its whole duration, so this is
+        # also the worst-case stall on finalising a green head. A cancel during
+        # acquisition gives the lane back: see build_chain's Caller-cost note.
         chain_build_timeout_secs = item.request.config.merge_deep.chain_build_timeout_secs
         _build_t0 = self._clock.monotonic()
         try:

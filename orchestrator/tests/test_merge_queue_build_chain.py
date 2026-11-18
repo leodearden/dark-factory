@@ -39,6 +39,7 @@ from pathlib import Path
 from typing import Literal
 
 import pytest
+from _interrupt_points import expire_deadline_once
 from _merge_deep_scene import (
     _commit_seed_script,
     _count_spec_lane_acquires,
@@ -52,11 +53,7 @@ from _merge_deep_scene import (
 )
 from _merge_deep_scene import git_repo as git_repo
 from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT
-from _seed_script_stubs import (
-    BLOCKING_TARGET_MODE_SEED_SCRIPT,
-    arm_seed_block,
-    expire_deadline_once,
-)
+from _seed_script_stubs import BLOCKING_TARGET_MODE_SEED_SCRIPT, arm_seed_block
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
@@ -2003,7 +2000,9 @@ class TestBuildChainPhaseVisibility:
         assert _all_pool_lanes_free(git_ops), 'a deadline in the seed stranded the lane'
         [interrupted] = _merge_lane_messages(caplog, 'build_chain: interrupted')
         assert 'during acquire phase' in interrupted
-        assert 'TimeoutError' in interrupted or 'CancelledError' in interrupted
+        assert 'CancelledError' in interrupted, (
+            'asyncio.timeout converts the cancel at its own boundary, one frame up'
+        )
 
         block.disarm()
         res = await build_chain(git_ops, snap, head, cap=2, target_depth=2)
