@@ -1609,11 +1609,9 @@ _ARMS = [
     pytest.param('content', id='content-equivalent-arm'),
 ]
 
-#: The arms that validate in DISCOVERY mode; the marker arm is CANDIDATE mode.
-_DISCOVERY_ARMS = [
-    pytest.param('ancestry', id='ancestry-arm'),
-    pytest.param('content', id='content-equivalent-arm'),
-]
+#: The arms that validate in CANDIDATE mode; every other arm is DISCOVERY mode.
+_CANDIDATE_ARMS = frozenset({'marker'})
+_DISCOVERY_ARMS = [arm for arm in _ARMS if arm.values[0] not in _CANDIDATE_ARMS]
 
 _ARM_REASON = {
     'ancestry': 'dispatch-gate-already-on-main',
@@ -2918,7 +2916,7 @@ class TestAlreadyLandedGateDeliveredChecksWiring:
 
         with patch('orchestrator.harness.validate_landing_evidence', spy), \
              patch(_GATE_TARGET, AsyncMock(return_value=None)):
-            await h._already_landed_dispatch_gate('42')
+            await _GateProbe(h).decide('42')
 
         assert spy.await_args is not None
         assert spy.await_args.kwargs.get('branch_base_sha') == _BRANCH_BASE_SHA
