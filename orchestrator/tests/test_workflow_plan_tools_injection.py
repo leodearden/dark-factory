@@ -108,7 +108,8 @@ class TestInjectPlanToolsMcp:
 
     def test_args_carry_one_grant_pair_per_granted_name(self):
         """The role's plan-tools allowlist reaches the server as one
-        '--grant <name>' pair each, so it exposes nothing else (task 7717)."""
+        '--grant <name>' pair each, behind one '--grants-enforced' marker, so
+        it exposes nothing else (task 7717)."""
 
         out = _inject_plan_tools_mcp(None, Path('/wt'), IMPLEMENTER, task_root=_TASK_ROOT)
 
@@ -116,3 +117,4 @@ class TestInjectPlanToolsMcp:
         grants = [args[i + 1] for i, token in enumerate(args) if token == '--grant']
         assert sorted(grants) == sorted(IMPLEMENTER.plan_tools_grants)
         assert len(grants) == len(set(grants))
+        assert args.count('--grants-enforced') == 1

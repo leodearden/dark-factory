@@ -7,6 +7,7 @@ allowlist holds only because the server registers nothing outside it.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import pytest
@@ -97,14 +98,31 @@ def _lane_argv(tmp_path: Path) -> list[str]:
 
 
 @pytest.mark.asyncio
-async def test_the_cli_exposes_nothing_without_a_grant(tmp_path):
-    assert await _listed(plan_tools.server_from_argv(_lane_argv(tmp_path))) == []
+async def test_an_unmarked_cli_launch_keeps_the_full_surface_and_warns(
+    tmp_path, artifacts, caplog,
+):
+    with caplog.at_level(logging.WARNING, logger='orchestrator.mcp.plan_tools'):
+        server = plan_tools.server_from_argv(_lane_argv(tmp_path))
+
+    assert await _listed(server) == await _listed(plan_tools.create_server(artifacts))
+    assert any(
+        record.levelno == logging.WARNING and '--grants-enforced' in record.getMessage()
+        for record in caplog.records
+    )
 
 
 @pytest.mark.asyncio
-async def test_the_cli_exposes_exactly_the_granted_tools(tmp_path):
+async def test_a_marked_cli_launch_with_no_grant_exposes_nothing(tmp_path):
+    argv = [*_lane_argv(tmp_path), '--grants-enforced']
+
+    assert await _listed(plan_tools.server_from_argv(argv)) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('marker', [[], ['--grants-enforced']], ids=['unmarked', 'marked'])
+async def test_the_cli_exposes_exactly_the_granted_tools(tmp_path, marker):
     argv = [
-        *_lane_argv(tmp_path),
+        *_lane_argv(tmp_path), *marker,
         '--grant', 'mark_step_done', '--grant', 'record_step_deviation',
     ]
 
@@ -114,7 +132,7 @@ async def test_the_cli_exposes_exactly_the_granted_tools(tmp_path):
 
 
 @pytest.mark.parametrize('python_executable', ['/venv/bin/python', None])
-def test_the_launcher_appends_sorted_grant_pairs_after_the_root_args(
+def test_the_launcher_always_appends_the_marker_then_sorted_grant_pairs_after_the_root_args(
     tmp_path, python_executable,
 ):
     roots = {
@@ -130,7 +148,7 @@ def test_the_launcher_appends_sorted_grant_pairs_after_the_root_args(
         python_executable=python_executable, granted_tools={'b', 'a'}, **roots,
     )
 
-    assert plain['args'][-2:] == ['--task-root', str(roots['task_root'])]
+    assert plain['args'][-3:] == ['--task-root', str(roots['task_root']), '--grants-enforced']
     assert granted['args'] == [*plain['args'], '--grant', 'a', '--grant', 'b']
 
 
@@ -167,6 +185,7 @@ async def test_a_dispatch_exposes_exactly_its_roles_plan_tools_allowlist(tmp_pat
     )
     assert config is not None
     args = config['mcpServers']['plan-tools']['args']
+    assert args.count('--grants-enforced') == 1
     launch = args.index('orchestrator.mcp.plan_tools')
     assert args[launch - 1] == '-m'
     server = plan_tools.server_from_argv(args[launch + 1:])

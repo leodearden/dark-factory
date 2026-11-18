@@ -2009,6 +2009,7 @@ class TestRunArchitectEval:
             '--worktree', str(Path('/fake/wt')),
             '--meta-root', str(expected_meta_root),
             '--task-root', str(expected_meta_root),
+            '--grants-enforced',
             *[
                 token for name in sorted(ARCHITECT.plan_tools_grants)
                 for token in ('--grant', name)
