@@ -11029,13 +11029,14 @@ class GitOps:
     async def merge_base_with_main(self, ref: str) -> str | None:
         """Return *ref*'s FORK POINT from ``config.main_branch``, or None.
 
-        "Where did this branch leave main?", which is the only honest
-        pre-branch baseline for a BRANCH TIP.  ``<tip>^1`` is not that: it is
-        the branch's own previous work commit, so a differential anchored on
-        it asks whether the branch's LAST commit delivered a capability rather
-        than whether the BRANCH did.  See
-        :func:`~orchestrator.merge_lane.landing_evidence._delivered_checks_differential`,
-        the caller this exists for (amendment pass, review finding).
+        "Where did this branch leave main?", the honest pre-branch baseline
+        for a BRANCH TIP while *ref* is still outside main's history.
+        ``<tip>^1`` is not that: it is the branch's own previous work commit,
+        so a differential anchored on it asks whether the branch's LAST commit
+        delivered a capability rather than whether the BRANCH did.  For a ref
+        already on main the answer is *ref* itself, which is why the
+        differential then falls back to the task's recorded base; see
+        ``merge_lane/landing_evidence.py::_differential_parent_ref``.
 
         None on any git failure or an unresolvable ref — callers must treat it
         as "no baseline available" and degrade, never substitute a guess.

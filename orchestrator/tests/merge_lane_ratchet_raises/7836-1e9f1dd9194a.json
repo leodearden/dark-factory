@@ -1,0 +1,18 @@
+{
+  "task_id": "7836",
+  "reason": "cognitive rise of the DISCOVERY ancestor-tip collapse fix: the differential's branch-tip baseline ladder gains a recorded-base rung, plus _usable_branch_base (shared with _no_op_question rung 1) and _fork_point extracted from _differential_parent_ref",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/landing_evidence.py",
+      "baseline": 173,
+      "current": 178
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5339,
+      "current": 5344
+    }
+  ]
+}
