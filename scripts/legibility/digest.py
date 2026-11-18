@@ -550,7 +550,7 @@ def _yaml_dquote(value: Any) -> str:
     return f'"{escaped}"'
 
 
-DIGEST_INSTRUMENT_VERSION: int = 7
+DIGEST_INSTRUMENT_VERSION: int = 8
 """Which generation of this instrument produced a given digest.
 
 BUMP POLICY: increment whenever a signal detector or the gold-turn
@@ -581,6 +581,9 @@ keys do NOT bump it.
   7 -- the prior-round adjudicator, escalation-watcher rotation and retired
        pre-5356 replan prompt markers (reingestion.HARNESS_PROMPT_MARKERS,
        task 7441), consulted by the gold-turn filter and every dialogue carrier.
+  8 -- the headless-SDK prompt record rule (reingestion.is_headless_sdk_prompt,
+       task 6953), consulted with the non-human-origin rule by the gold-turn
+       filter and every dialogue carrier.
 
 This answers ``plans/confusion-census-2026-07-31.md:151`` (Sec 6): the
 next census must be able to tell a pre-fix trace from a live regression.
