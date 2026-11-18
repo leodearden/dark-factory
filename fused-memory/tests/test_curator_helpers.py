@@ -18,7 +18,7 @@ from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.middleware.ticket_store import TicketStore
 from fused_memory.reconciliation.event_buffer import EventBuffer
 
-PROJECT_ROOT = '/project'
+PROJECT = '/project'
 
 
 @pytest.fixture
@@ -47,10 +47,10 @@ async def ticket_store(tmp_path):
 
 
 async def _submit_and_resolve(interceptor: TaskInterceptor, title: str) -> dict:
-    response = await interceptor.submit_task(PROJECT_ROOT, title=title)
+    response = await interceptor.submit_task(PROJECT, title=title)
     assert 'ticket' in response, f'submit_task returned no ticket: {response!r}'
     return await interceptor.resolve_ticket(
-        response['ticket'], PROJECT_ROOT, timeout_seconds=10.0,
+        response['ticket'], PROJECT, timeout_seconds=10.0,
     )
 
 
