@@ -752,28 +752,24 @@ def due_retries(state: TrickleState, *, today: date) -> tuple[date, ...]:
 
 
 # ---------------------------------------------------------------------------
-# Deferred policy — the deferred streak the retry backlog cannot recover
+# Recovery policy — the owed date the retry backlog can no longer recover
 # ---------------------------------------------------------------------------
 
-UNRECOVERABLE_DEFERRED_RUNS = RETRY_MAX_AGE_DAYS
-"""The shortest deferred streak whose oldest owed date is lost even when
-every later night finishes.
+def unrecoverable_owed_date(state: TrickleState) -> date | None:
+    """The oldest date *state* owes that the next night's fold abandons as
+    outside the age window, or ``None`` when every owed date can still be
+    recovered. The bound is :data:`RETRY_MAX_AGE_DAYS`'s; retries run
+    oldest first, so no later date is retried older than this one.
 
-A deferred night retries nothing, so the oldest date of a k-night deferred
-streak is first retried at age k+1. The window keeps ages up to
-:data:`RETRY_MAX_AGE_DAYS`, so a streak of that length loses its oldest
-date, and each further deferred night loses one more. Not a
-``legibility.yaml`` field or a probe argument: it is a consequence of the
-retry policy, not a separate knob. One deferred night is weather (task
-4736), and a streak this long has outlasted a weekly cap reset; the
-operator reading is in OPERATIONS.md §"Legibility trickle health probe
-(04:30)"."""
-
-
-def deferred_streak_past_recovery(state: TrickleState) -> bool:
-    """Whether *state*'s deferred streak has reached
-    :data:`UNRECOVERABLE_DEFERRED_RUNS`."""
-    return state.consecutive_deferred_runs >= UNRECOVERABLE_DEFERRED_RUNS
+    It reads the backlog, not a streak: deferred and failed nights both
+    leave dates unretried, and a manual pass is not a calendar night. One
+    deferred night is weather (task 4736); the operator reading of a loss
+    is in OPERATIONS.md §"Legibility trickle health probe (04:30)"."""
+    if not state.retry_backlog:
+        return None
+    oldest = min(state.retry_backlog)
+    next_night = state.recorded_at.date() + timedelta(days=1)
+    return None if _within_window(oldest, next_night) else oldest
 
 
 # ---------------------------------------------------------------------------

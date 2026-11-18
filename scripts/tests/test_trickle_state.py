@@ -32,7 +32,6 @@ import inspect
 import json
 import os
 import pwd
-import re
 import shutil
 import subprocess
 import tempfile
@@ -1387,63 +1386,106 @@ class TestRecordRunDeferred:
         assert _record(day=4, capped=True).consecutive_deferred_runs == 3
 
 
-_ABANDONED_DATE = re.compile(
-    r'trickle retry backlog: abandoning (\d{4}-\d{2}-\d{2}) for project='
-)
+_PASS_KINDS: dict[str, dict[str, Any]] = {
+    'P': dict(exit_code=0, capped=False, commit_made=True),
+    'D': dict(exit_code=0, capped=True, commit_made=False),
+    'F': dict(exit_code=1, capped=False, commit_made=False),
+}
+"""A night's kind as one letter: productive, deferred by the usage cap, or
+failed."""
 
 
-def _scheduled_night(night: int, *, capped: bool) -> trickle_state.NightRun:
-    """The *night*-th scheduled pass in production shape: it covers
-    ``_d(1)`` plus *night* days and is recorded the next day at 03:00."""
+def _scheduled_night(night: int, kind: str) -> trickle_state.NightRun:
+    """The *night*-th scheduled pass in production shape, of *kind* (a key
+    of :data:`_PASS_KINDS`): it covers ``_d(1)`` plus *night* days and is
+    recorded the next day at 03:00."""
     target = _d(1) + timedelta(days=night)
     return trickle_state.NightRun(
         target_date=target,
         recorded_at=datetime.combine(
             target + timedelta(days=1), datetime.min.time(), UTC
         ).replace(hour=3),
-        exit_code=0,
         counters=_counters(selected_count=1),
         census=None,
-        commit_made=not capped,
-        capped=capped,
         scheduled=True,
+        **_PASS_KINDS[kind],
     )
 
 
-class TestDeferredStreakPastRecovery:
-    """The deferred streak the retry backlog can no longer recover: the one
-    a cap deferral has to reach before the progress probe calls it more
-    than weather."""
+class TestUnrecoverableOwedDate:
+    """The owed date the retry backlog can no longer recover: what an
+    unfinished run of nights must cost before the progress probe calls it
+    more than weather."""
 
     @pytest.fixture(autouse=True)
     def _state_root(self, tmp_path, monkeypatch):
         monkeypatch.setenv(trickle_state.STATE_ROOT_ENV, str(tmp_path))
 
-    @pytest.mark.parametrize('below', [2, 1, 0, -1])
-    def test_past_recovery_at_or_past_the_threshold(self, below):
-        streak = trickle_state.UNRECOVERABLE_DEFERRED_RUNS - below
-        state = _state(consecutive_deferred_runs=streak)
-        assert trickle_state.deferred_streak_past_recovery(state) is (below <= 0)
-
-    @pytest.mark.parametrize('short_by, lost', [
-        pytest.param(1, [], id='one-short'),
-        pytest.param(0, ['2026-07-01'], id='at-the-threshold'),
-    ])
-    def test_the_threshold_is_the_shortest_deferred_streak_the_backlog_cannot_recover(
-        self, caplog, short_by, lost
+    @pytest.mark.parametrize('short_of_window', [2, 1, 0, -1])
+    def test_the_oldest_owed_date_is_lost_once_the_next_night_is_past_the_window(
+        self, short_of_window
     ):
-        """Deferred nights, then finished ones each running the nightly's
-        retries, through the real writer: the streak one night short of the
-        threshold loses nothing, and the threshold loses its first date."""
-        deferred_nights = trickle_state.UNRECOVERABLE_DEFERRED_RUNS - short_by
+        """The streaks are not read: a finished last night can still leave
+        an owed date the window has passed."""
+        oldest = _T0.date() - timedelta(
+            days=trickle_state.RETRY_MAX_AGE_DAYS - short_of_window
+        )
+        state = _state(
+            retry_backlog={oldest: 1, _T0.date(): 1},
+            consecutive_deferred_runs=0,
+            consecutive_failed_runs=0,
+        )
+
+        lost = trickle_state.unrecoverable_owed_date(state)
+
+        assert lost == (oldest if short_of_window <= 0 else None)
+
+    def test_an_empty_backlog_loses_nothing_whatever_the_deferred_streak(self):
+        state = _state(
+            retry_backlog={},
+            consecutive_deferred_runs=trickle_state.RETRY_MAX_AGE_DAYS + 3,
+        )
+        assert trickle_state.unrecoverable_owed_date(state) is None
+
+    @pytest.mark.parametrize('pattern, loses_first_target', [
+        pytest.param(
+            'D' * (trickle_state.RETRY_MAX_AGE_DAYS - 1), False,
+            id='deferral-one-night-short',
+        ),
+        pytest.param(
+            'D' * trickle_state.RETRY_MAX_AGE_DAYS, True,
+            id='deferral-of-the-window',
+        ),
+        pytest.param(
+            'DDDF' + 'D' * (trickle_state.RETRY_MAX_AGE_DAYS - 4), True,
+            id='crash-inside-the-deferral',
+        ),
+        pytest.param(
+            'D' * (trickle_state.RETRY_MAX_AGE_DAYS - 1) + 'F', True,
+            id='crash-after-the-deferral',
+        ),
+    ])
+    def test_it_names_the_date_the_real_writer_goes_on_to_abandon(
+        self, caplog, pattern, loses_first_target
+    ):
+        """Unfinished nights, then finished ones each running the nightly's
+        retries, through the real writer: the date named after the
+        unfinished nights is exactly the one later abandoned."""
+        lost = [_d(1)] if loses_first_target else []
         with caplog.at_level('WARNING'):
-            for night in range(deferred_nights + 12):
-                run = _scheduled_night(night, capped=night < deferred_nights)
+            for night, kind in enumerate(pattern):
+                trickle_state.record_run(
+                    'dark_factory', _scheduled_night(night, kind),
+                    barren_escalated=False,
+                )
+            after = trickle_state.read_prior('dark_factory')
+            assert after is not None
+            predicted = trickle_state.unrecoverable_owed_date(after)
+            for night in range(len(pattern), len(pattern) + 12):
+                run = _scheduled_night(night, 'P')
                 state = trickle_state.record_run(
                     'dark_factory', run, barren_escalated=False
                 )
-                if run.capped:
-                    continue
                 for owed in trickle_state.due_retries(
                     state, today=run.recorded_at.date()
                 ):
@@ -1453,11 +1495,14 @@ class TestDeferredStreakPastRecovery:
                         commit_made=True,
                     )
 
-        assert [
-            match.group(1)
-            for record in _warnings(caplog)
-            if (match := _ABANDONED_DATE.search(record.getMessage()))
-        ] == lost
+        assert ([] if predicted is None else [predicted]) == lost
+        assert len(
+            _warnings_naming(caplog, 'trickle retry backlog: abandoning')
+        ) == len(lost)
+        assert all(
+            _warnings_naming(caplog, f'abandoning {owed.isoformat()} ')
+            for owed in lost
+        )
         final = trickle_state.read_prior('dark_factory')
         assert final is not None and dict(final.retry_backlog) == {}
 

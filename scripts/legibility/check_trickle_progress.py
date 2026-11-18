@@ -33,13 +33,13 @@ inferred-absent from a missing commit. Decision 7's rationale is
 satisfied, not circumvented.
 
 Every failure verdict is DISTINCT: never-recorded vs unreadable vs
-stale-recorder vs FAILED streak vs a DEFERRED streak past recovery vs
-barren streak vs a barren streak CARRIED FORWARD under a crashed or a
+stale-recorder vs FAILED streak vs an owed date PAST RECOVERY vs barren
+streak vs a barren streak CARRIED FORWARD under a crashed or a
 cap-deferred run, and each names ITS OWN remedy — a barren streak the
-specific door it left by, a failed streak the journal, a deferred streak
-the journal's DEFERRED reason and no door, a streak carried under a crash
-the journal first and no door at all, one carried under a deferral a
-completed run and no door. Each
+specific door it left by, a failed streak the journal, an owed date past
+recovery the journal's DEFERRED reason and no door, a streak carried under
+a crash the journal first and no door at all, one carried under a
+deferral a completed run and no door. Each
 verdict on a readable record, and the OK line, prints the recorded
 ``barren_escalated`` (True, False, or ``unrecorded`` before the field
 existed), so an operator can read whether the nightly escalated. A probe that
@@ -52,13 +52,15 @@ A run can flow signal IN and still break downstream, which is why
 ``failed`` is an outcome of its own: ``selected_count > 0`` answers "did
 signal flow", never "did the night finish". A ``deferred`` night (the usage
 cap deferred its coding) is weather: it reads OK on its own and moves only
-its own streak, which fails once the retry backlog can no longer recover it
-(``trickle_state.deferred_streak_past_recovery``).
+its own streak. It owes its date a retry, and the probe fails once the
+retry backlog can no longer recover an owed date
+(``trickle_state.unrecoverable_owed_date``).
 """
 from __future__ import annotations
 
 import sys
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 
 # The deterministic runner EXECs a bound predicate directly
@@ -143,10 +145,10 @@ def _judge(
     Freshness comes first because a recorder that stopped writing leaves a
     record that still reads healthy. The failed streak comes before the
     barren one because the barren streak is carried across failed runs, so
-    during a failure window it is stale by construction. The deferred
-    streak comes before the barren one because the barren-under-deferral
-    verdict's "clears at the cap reset" is false once the deferral is past
-    recovery."""
+    during a failure window it is stale by construction. An owed date past
+    recovery comes before the barren streak because the
+    barren-under-deferral verdict's "clears at the cap reset" is false once
+    a deferral has lost a date."""
     age_hours = trickle_state.recorded_age_hours(state)
     if age_hours > limits.max_age_hours:
         return _fail(
@@ -158,8 +160,9 @@ def _judge(
         )
     if state.consecutive_failed_runs >= limits.max_failed_runs:
         return _fail(_failed_streak_verdict(project_id, path, state, limits))
-    if trickle_state.deferred_streak_past_recovery(state):
-        return _fail(_deferred_streak_verdict(project_id, path, state))
+    lost = trickle_state.unrecoverable_owed_date(state)
+    if lost is not None:
+        return _fail(_past_recovery_verdict(project_id, path, state, lost))
     if trickle_state.barren_streak_due(state, limits.max_barren_runs):
         return _fail(_barren_streak_verdict(project_id, path, state, limits))
 
@@ -170,7 +173,8 @@ def _judge(
         f'(threshold {limits.max_barren_runs}), '
         f'consecutive_failed_runs={state.consecutive_failed_runs} '
         f'(threshold {limits.max_failed_runs}), '
-        f'{_deferred_streak_fact(state)}, {_retry_backlog_fact(state)}, '
+        f'consecutive_deferred_runs={state.consecutive_deferred_runs}, '
+        f'{_retry_backlog_fact(state)}, '
         f'last_productive_at={trickle_state.isoformat_or_none(state.last_productive_at)}, '
         f'{_escalation_fact(state)}.'
     )
@@ -214,35 +218,32 @@ def _failed_streak_verdict(
     )
 
 
-def _deferred_streak_verdict(
-    project_id: str, path: Path, state: trickle_state.TrickleState,
+def _past_recovery_verdict(
+    project_id: str, path: Path, state: trickle_state.TrickleState, lost: date,
 ) -> str:
-    streak = state.consecutive_deferred_runs
-    recoverable = trickle_state.UNRECOVERABLE_DEFERRED_RUNS - 1
-    if state.retry_backlog:
-        loss = (
-            f'so the oldest owed date ({min(state.retry_backlog).isoformat()}) '
-            f'can no longer be recovered, and each further deferred night '
-            f'loses one more'
-        )
-    else:
-        loss = (
-            'and no owed date is recorded, so none can be named as lost; each '
-            'further deferred night still loses its own date'
-        )
+    """A loss can follow deferred nights, failed ones or both, so the
+    verdict names every unfinished streak and the last run's outcome."""
+    since_days = (state.recorded_at.date() - lost).days + 1
     return (
-        f'ERROR: legibility trickle for {project_id}: the usage cap has '
-        f'deferred the coding on {streak} runs since the last finished one, '
-        f'{_deferred_streak_fact(state)}. One deferred night is weather, '
-        f'which the next cap reset ends; a streak this long has outlasted a '
-        f'weekly reset, so this deferral is probably not clearing on its own. The '
-        f'retry backlog recovers at most {recoverable} consecutive deferred '
-        f'nights, {loss}. Remedy: read journalctl --user -u '
-        f"legibility-trickle@{project_id} --since '{streak + 1} days ago' for "
-        f'the DEFERRED reason. `no pool accounts resolved` is a config fault '
-        f"that never clears on its own (check the unit's EnvironmentFile), and "
-        f'accounts named there with credentials rejected need operator '
-        f'action; only an all-capped pool is weather. '
+        f'ERROR: legibility trickle for {project_id}: the retry backlog can '
+        f'no longer recover owed date {lost.isoformat()}. The next night '
+        f'abandons it as older than the {trickle_state.RETRY_MAX_AGE_DAYS}-day '
+        f'retry window, and each further night that does not finish loses '
+        f'one more. Since the last finished run: consecutive_deferred_runs='
+        f'{state.consecutive_deferred_runs} (coding the usage cap deferred), '
+        f'consecutive_failed_runs={state.consecutive_failed_runs}, and a last '
+        f'recorded outcome of {state.outcome.value!r} with exit_code='
+        f'{state.exit_code}. One '
+        f'deferred night is weather, which the next cap reset ends; a date '
+        f'is lost only after about a week of passes that did not finish, '
+        f'which has outlasted a weekly reset, so the cause is probably not '
+        f'clearing on its own. Remedy: read journalctl --user -u '
+        f"legibility-trickle@{project_id} --since '{since_days} days ago' for "
+        f'the DEFERRED reason, and for a failed run its error. `no pool '
+        f'accounts resolved` is a config fault that never clears on its own '
+        f"(check the unit's EnvironmentFile), and accounts named there with "
+        f'credentials rejected need operator action; only an all-capped pool '
+        f'is weather. '
         f'consecutive_barren_runs={state.consecutive_barren_runs}, '
         f'{_retry_backlog_fact(state)}, '
         f'last_productive_at={trickle_state.isoformat_or_none(state.last_productive_at)}. '
@@ -308,19 +309,17 @@ def _barren_streak_verdict(
             )
 
 
-def _deferred_streak_fact(state: trickle_state.TrickleState) -> str:
-    return (
-        f'consecutive_deferred_runs={state.consecutive_deferred_runs} '
-        f'(threshold {trickle_state.UNRECOVERABLE_DEFERRED_RUNS})'
-    )
-
-
 def _retry_backlog_fact(state: trickle_state.TrickleState) -> str:
-    """How many target dates are owed a retry, and the oldest of them."""
+    """How many target dates are owed a retry, the oldest of them, and the
+    age window that bounds their recovery."""
     owed = len(state.retry_backlog)
     if not owed:
         return 'retry_backlog=0 owed'
-    return f'retry_backlog={owed} owed (oldest {min(state.retry_backlog).isoformat()})'
+    return (
+        f'retry_backlog={owed} owed (oldest '
+        f'{min(state.retry_backlog).isoformat()}, window '
+        f'{trickle_state.RETRY_MAX_AGE_DAYS} days)'
+    )
 
 
 def _escalation_fact(state: trickle_state.TrickleState) -> str:

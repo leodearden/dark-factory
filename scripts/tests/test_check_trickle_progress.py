@@ -105,7 +105,9 @@ def _seed(tmp_path, monkeypatch, *, outcomes, project_id="dark_factory",
     """Build a real state file by driving record_run for each entry in
     *outcomes* (a key of :data:`_SEED_OUTCOMES`). The LAST entry's
     recorded_at is *recorded_at* (default: now), so freshness is exercised
-    against the real writer. The entries whose positions are in
+    against the real writer. Each entry covers the day before the one it is
+    recorded on, as the scheduled pass does, so an owed date ages as it does
+    live. The entries whose positions are in
     *escalated_on* record ``barren_escalated=True``; every other one False.
 
     The state root stays SET for the remainder of the test. It is the same
@@ -138,7 +140,7 @@ def _seed(tmp_path, monkeypatch, *, outcomes, project_id="dark_factory",
         state = trickle_state.record_run(
             project_id,
             trickle_state.NightRun(
-                target_date=at.date(),
+                target_date=at.date() - timedelta(days=1),
                 recorded_at=at,
                 exit_code=entry_exit_code,
                 counters=trickle_state.RunCounters(**full),
@@ -857,27 +859,34 @@ def test_a_barren_streak_carried_under_a_deferred_night_names_the_deferral(
 
 
 # ---------------------------------------------------------------------------
-# The deferred streak (task 6998)
+# An owed date past recovery (task 6998)
 # ---------------------------------------------------------------------------
 
 _EMPTY_BACKLOG = "retry_backlog=0 owed"
+_WINDOW = trickle_state.RETRY_MAX_AGE_DAYS
 
 
 def _backlog_fact(state):
     """The retry-backlog fact the probe prints for *state*'s backlog."""
     oldest = min(state.retry_backlog).isoformat()
-    return f"retry_backlog={len(state.retry_backlog)} owed (oldest {oldest})"
+    return (
+        f"retry_backlog={len(state.retry_backlog)} owed "
+        f"(oldest {oldest}, window {_WINDOW} days)"
+    )
 
 
-def test_a_deferred_streak_past_recovery_is_its_own_verdict(
-    tmp_path, monkeypatch
-):
-    """One deferred night is weather; a streak the retry backlog can no
-    longer recover is not, and its remedy is the journal's DEFERRED reason,
-    never a barren door or a crash."""
-    threshold = trickle_state.UNRECOVERABLE_DEFERRED_RUNS
+def _assert_no_barren_door_or_crash(stderr):
+    assert "max_daily_digest_bytes" not in stderr
+    assert "top_fraction" not in stderr
+    assert "has not COMPLETED" not in stderr
+
+
+def test_an_owed_date_past_recovery_is_its_own_verdict(tmp_path, monkeypatch):
+    """One deferred night is weather; a deferral the retry backlog can no
+    longer recover from is not, and its remedy is the journal's DEFERRED
+    reason, never a barren door or a crash."""
     state = _seed(
-        tmp_path, monkeypatch, outcomes=["productive"] + ["deferred"] * threshold
+        tmp_path, monkeypatch, outcomes=["productive"] + ["deferred"] * _WINDOW
     )
     assert state is not None and state.last_productive_at is not None
 
@@ -887,28 +896,29 @@ def test_a_deferred_streak_past_recovery_is_its_own_verdict(
         f"stdout={result.stdout!r} stderr={result.stderr!r}"
     )
     stderr = result.stderr
-    assert "deferred" in stderr
     assert "usage cap" in stderr
-    assert f"consecutive_deferred_runs={threshold}" in stderr
-    assert f"(threshold {threshold})" in stderr
-    assert min(state.retry_backlog).isoformat() in stderr
+    assert (
+        f"can no longer recover owed date {min(state.retry_backlog).isoformat()}"
+        in stderr
+    )
+    assert f"{_WINDOW}-day retry window" in stderr
+    assert f"consecutive_deferred_runs={_WINDOW} " in stderr
+    assert "consecutive_failed_runs=0," in stderr
     assert "journalctl" in stderr
     assert "no pool accounts resolved" in stderr
     assert (
         f"last_productive_at={state.last_productive_at.isoformat()}" in stderr
     )
     assert "barren_escalated=False" in stderr
-    assert "max_daily_digest_bytes" not in stderr
-    assert "top_fraction" not in stderr
-    assert "has not COMPLETED" not in stderr
+    _assert_no_barren_door_or_crash(stderr)
     _assert_no_git(git_marker)
 
 
-def test_a_deferred_streak_short_of_recovery_reads_ok(tmp_path, monkeypatch):
+def test_a_deferral_the_backlog_still_recovers_reads_ok(tmp_path, monkeypatch):
     """Leo's directive (task 4736): all-accounts-capped is weather, so a
-    streak the backlog still recovers reads OK, with the streak and the
+    deferral that has lost no owed date reads OK, with the streak and the
     owed dates visible on the OK line."""
-    short = trickle_state.UNRECOVERABLE_DEFERRED_RUNS - 1
+    short = _WINDOW - 1
     state = _seed(tmp_path, monkeypatch, outcomes=["deferred"] * short)
     assert state is not None and len(state.retry_backlog) == short
 
@@ -919,24 +929,50 @@ def test_a_deferred_streak_short_of_recovery_reads_ok(tmp_path, monkeypatch):
     )
     stdout = result.stdout
     assert "last run was deferred" in stdout
-    assert (
-        f"consecutive_deferred_runs={short} "
-        f"(threshold {trickle_state.UNRECOVERABLE_DEFERRED_RUNS})" in stdout
-    )
+    assert f"consecutive_deferred_runs={short}," in stdout
     assert _backlog_fact(state) in stdout
     assert _EMPTY_BACKLOG not in stdout
     _assert_no_git(git_marker)
 
 
-def test_the_deferred_verdict_takes_precedence_over_a_barren_streak_carried_under_it(
+def test_a_crash_inside_the_deferral_does_not_hide_the_loss(
     tmp_path, monkeypatch
 ):
-    """The barren-under-deferral verdict says the deferral clears at the cap
-    reset, which is false for a deferral past recovery."""
-    threshold = trickle_state.UNRECOVERABLE_DEFERRED_RUNS
+    """One failed night is under the failed-streak threshold and leaves the
+    deferred streak short of the window, yet it retried nothing either, so
+    the backlog has still lost its oldest date."""
+    state = _seed(
+        tmp_path, monkeypatch,
+        outcomes=["productive"] + ["deferred"] * 3 + ["failed"]
+        + ["deferred"] * (_WINDOW - 4),
+    )
+    assert state is not None
+
+    result, git_marker = _run_probe(tmp_path, "dark_factory", 3)
+
+    assert result.returncode == 1, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    stderr = result.stderr
+    assert (
+        f"can no longer recover owed date {min(state.retry_backlog).isoformat()}"
+        in stderr
+    )
+    assert f"consecutive_deferred_runs={_WINDOW - 1} " in stderr
+    assert "consecutive_failed_runs=1," in stderr
+    assert "no pool accounts resolved" in stderr
+    _assert_no_barren_door_or_crash(stderr)
+    _assert_no_git(git_marker)
+
+
+def test_a_loss_recorded_on_a_failed_night_names_the_crash(
+    tmp_path, monkeypatch
+):
+    """The last night crashed, so the verdict says so and points the
+    journal read at its error as well as at the DEFERRED reason."""
     _seed(
         tmp_path, monkeypatch,
-        outcomes=["barren-budget"] * 3 + ["deferred"] * threshold,
+        outcomes=["productive"] + ["deferred"] * (_WINDOW - 1) + ["failed"],
     )
 
     result, git_marker = _run_probe(tmp_path, "dark_factory", 3)
@@ -945,7 +981,29 @@ def test_the_deferred_verdict_takes_precedence_over_a_barren_streak_carried_unde
         f"stdout={result.stdout!r} stderr={result.stderr!r}"
     )
     stderr = result.stderr
-    assert f"consecutive_deferred_runs={threshold}" in stderr
+    assert "last recorded outcome of 'failed' with exit_code=1" in stderr
+    assert "consecutive_failed_runs=1," in stderr
+    assert "for a failed run its error" in stderr
+    _assert_no_git(git_marker)
+
+
+def test_the_past_recovery_verdict_takes_precedence_over_a_barren_streak_carried_under_it(
+    tmp_path, monkeypatch
+):
+    """The barren-under-deferral verdict says the deferral clears at the cap
+    reset, which is false for a deferral that has lost a date."""
+    _seed(
+        tmp_path, monkeypatch,
+        outcomes=["barren-budget"] * 3 + ["deferred"] * _WINDOW,
+    )
+
+    result, git_marker = _run_probe(tmp_path, "dark_factory", 3)
+
+    assert result.returncode == 1, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    stderr = result.stderr
+    assert f"consecutive_deferred_runs={_WINDOW} " in stderr
     assert "no pool accounts resolved" in stderr
     assert "clears at the cap reset" not in stderr
     assert "consecutive_barren_runs=3" in stderr
@@ -953,17 +1011,17 @@ def test_the_deferred_verdict_takes_precedence_over_a_barren_streak_carried_unde
     _assert_no_git(git_marker)
 
 
-def test_the_failed_verdict_takes_precedence_over_the_deferred_streak(
+def test_the_failed_verdict_takes_precedence_over_an_owed_date_past_recovery(
     tmp_path, monkeypatch
 ):
-    """A failed night carries the deferred streak, so it still stands at the
-    threshold; the crash is the more specific fault."""
-    threshold = trickle_state.UNRECOVERABLE_DEFERRED_RUNS
+    """Two crashes are the more specific fault, even once the backlog has
+    lost a date."""
     state = _seed(
         tmp_path, monkeypatch,
-        outcomes=["deferred"] * threshold + ["failed", "failed"],
+        outcomes=["deferred"] * _WINDOW + ["failed", "failed"],
     )
-    assert state is not None and state.consecutive_deferred_runs == threshold
+    assert state is not None
+    assert trickle_state.unrecoverable_owed_date(state) is not None
 
     result, git_marker = _run_probe(tmp_path, "dark_factory", 3)
 
@@ -985,23 +1043,22 @@ def test_the_ok_line_prints_an_empty_retry_backlog(tmp_path, monkeypatch):
     assert result.returncode == 0, (
         f"stdout={result.stdout!r} stderr={result.stderr!r}"
     )
-    assert "consecutive_deferred_runs=0 " in result.stdout
+    assert "consecutive_deferred_runs=0," in result.stdout
     assert f"{_EMPTY_BACKLOG}," in result.stdout
     _assert_no_git(git_marker)
 
 
-def test_a_deferred_streak_with_a_hand_emptied_backlog_names_no_date(
-    tmp_path, monkeypatch
-):
-    threshold = trickle_state.UNRECOVERABLE_DEFERRED_RUNS
-    _seed(tmp_path, monkeypatch, outcomes=["deferred"] * threshold)
+def test_a_deferred_streak_with_nothing_owed_reads_ok(tmp_path, monkeypatch):
+    """The verdict reads the backlog, not the streak: with no owed date
+    there is nothing to lose, however long the deferral."""
+    _seed(tmp_path, monkeypatch, outcomes=["deferred"] * _WINDOW)
     _rewrite_state("dark_factory", lambda doc: doc.update(retry_backlog={}))
 
     result, git_marker = _run_probe(tmp_path, "dark_factory", 3)
 
-    assert result.returncode == 1, (
+    assert result.returncode == 0, (
         f"stdout={result.stdout!r} stderr={result.stderr!r}"
     )
-    assert "no owed date is recorded" in result.stderr
-    assert _EMPTY_BACKLOG in result.stderr
+    assert f"consecutive_deferred_runs={_WINDOW}," in result.stdout
+    assert f"{_EMPTY_BACKLOG}," in result.stdout
     _assert_no_git(git_marker)
