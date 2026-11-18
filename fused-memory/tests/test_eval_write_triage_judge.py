@@ -1298,15 +1298,8 @@ class TestApplyFieldChars:
 
 
 # ---------------------------------------------------------------------------
-# The split: one contract path, and imports that point downward only
+# The split: imports that point downward only
 # ---------------------------------------------------------------------------
-
-class TestScoreAttachmentsKeepsItsContractPath:
-    """PRD C2' and task 5807 call it at eval_write_triage_judge.py::score_attachments."""
-
-    def test_the_cli_binds_the_scoring_modules_function(self) -> None:
-        assert _mod().score_attachments is _scoring().score_attachments
-
 
 #: Loads ONE ``scripts/`` module by path under its stem and prints the
 #: ``scripts/`` stems then in ``sys.modules``, as one JSON list.

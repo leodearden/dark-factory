@@ -376,10 +376,9 @@ cost and scope with a red-conditioned sample.
 
 Three things a census must not assume:
 
-- **Junit exists only under `merge_verify_breadth: full`.** The shipped
-  default (`config.py`) is `scoped`; this repo's
-  `dark-factory-orchestrator.yaml` opts in. A project on the default
-  archives plans and logs but no junit at all.
+- **Junit exists only under `merge_verify_breadth: full`.** That is the
+  shipped default (`orchestrator/src/orchestrator/defaults.yaml`). A project
+  that opts down to `scoped` archives plans and logs but no junit at all.
 - **The stem joins per-ATTEMPT, not per-module.** Merge verifies carry no
   attempt id, so their files stem at `attempt-1`. Logs and junit carry a
   `.<module>` infix; the plan does not — under per-module fan-out one plan
@@ -817,9 +816,10 @@ list `/home/leo`) and step 7 (the canary feed).
 
 - Test and criteria evidence exists for pytest projects only: junit
   injection is pytest-only (PRD §2).
-- Per-test results for merge runs exist only when the client project's
-  `dark-factory-orchestrator.yaml` sets `merge_verify_breadth: full`.
-  Otherwise only task legs carry `test_results`.
+- Per-test results for merge runs exist unless the client project's
+  `dark-factory-orchestrator.yaml` opts down to
+  `merge_verify_breadth: scoped`. On such a project only task legs carry
+  `test_results`.
 
 ---
 
@@ -1147,7 +1147,10 @@ session:
 | Tool | Use for |
 |---|---|
 | `mcp__escalation__get_pending_escalations` | List open escalations (filter by `level`) |
+| `mcp__escalation__get_escalation` | One full escalation record by id, archive included |
+| `mcp__escalation__get_task_escalation_history` | Every escalation ever filed for one task, archive included; its `count: 0` is attributable to the query, and it answers for this server's queue only |
 | `mcp__escalation__get_merge_queue` | Live merge-queue snapshot: in-flight/queued items, conflict graph, frozen verify prefix |
+| `mcp__escalation__merge_status` | One merge request's state, by `request_id` / `task_id` / `branch` |
 | `mcp__escalation__get_merge_halt_status` | Whether the merge queue is currently halted, and by which escalation |
 | `mcp__escalation__get_task_runtime_state` | Live per-task phase/loop/attempt projection (what a task is doing *right now*) |
 | `mcp__fused-memory__get_tasks` / `get_task` | Full task tree, or one task's full record |
@@ -1155,6 +1158,11 @@ session:
 | `mcp__fused-memory__find_tasks_by_metadata` | Which tasks carry metadata key K (with value V), every status incl. deferred/cancelled — paged |
 | `mcp__fused-memory__get_status` | Backend health, plus `reconciliation_halt` — whether reconciliation is halted, why, since when, and whether the cooldown has expired. Pass no `project_id` for the fleet-wide `halted_projects` list |
 | `mcp__fused-memory__get_queue_stats` | Durable-write-queue counts, plus (per-project) `reconciliation_backlog` **and** `reconciliation_halt` — read both together, see below |
+
+An orchestrator-spawned agent's escalation tools are the ones its grant
+names: the steward's in
+`orchestrator/src/orchestrator/agents/roles.py::STEWARD`, the L1
+rotation's in `orchestrator/src/orchestrator/harness.py::_WATCHER_ALLOWED_TOOLS`.
 
 ### Is reconciliation halted, or just behind?
 
@@ -1984,6 +1992,7 @@ takes no arguments: it always re-reads that process's own
 effect until a full restart):**
 
 - `max_concurrent_tasks`
+- `main_health_fix_reserved_slots`
 - Pool sizes / `verify_runners`
 - `escalation` bind host/port
 - `sandbox.backend`
@@ -2398,8 +2407,17 @@ Every resolved invocation emits a `routing_decision` event (model, effort,
 budget, turns, which layer set the model, which rule matched, any
 rejections) and mirrors the latest decision onto the task's own
 `metadata.routing` — a bounded history (last 5), a routing-tier counter,
-and a `simple_saturated` flag. Today this is what you read directly
-(`routing_decision` events, `metadata.routing` per task) — there is not
+and a `simple_saturated` flag. The event row's `phase` column carries the
+workflow phase the invocation ran in (the live phase inside a task
+workflow, `escalated` for steward and triage, `blocked` for unblock_auto),
+so a per-role cap or cost cohort splits by phase from `runs.db` alone; it
+is NULL for the project-level deep_reviewer and the batch module_tagger.
+In-workflow roles, the steward and unblock_auto also emit an
+`invocation_end` row with the same phase. Triage emits none, and its
+`routing_decision` row is written before the lifetime-budget check, so the
+row also exists when that check skips the triage. Today this is
+what you read directly (`routing_decision` events, `metadata.routing` per
+task) — there is not
 yet an auto-escalating retry ladder or a rendered rollup panel; see below.
 
 ### Adaptive-routing substrate (not yet active)

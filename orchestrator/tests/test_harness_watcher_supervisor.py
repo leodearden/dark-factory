@@ -27,6 +27,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _orch_helpers import _init_harness_state_for_test
+from _roles_helpers import tool_is_granted
 from escalation.models import RESOLUTION_CLASSES
 from escalation.queue import EscalationQueue
 from shared.project_layout import escalation_queue_dir
@@ -3148,6 +3149,12 @@ class TestWatcherSupervisorLoopRecoveryResolvesL2:
 # ---------------------------------------------------------------------------
 
 _FILING_PAIR = ('mcp__fused-memory__submit_task', 'mcp__fused-memory__resolve_ticket')
+_RECORD_AND_MERGE_STATE_READS = (
+    'mcp__escalation__get_escalation',
+    'mcp__escalation__get_task_escalation_history',
+    'mcp__escalation__merge_status',
+    'mcp__escalation__get_merge_queue',
+)
 
 
 class TestWatcherAllowedTools:
@@ -3210,6 +3217,33 @@ class TestWatcherAllowedTools:
             f'{tool} must not be in _WATCHER_DISALLOWED_TOOLS — that would '
             'silently blind the drain to archived L2s (task 3999); '
             f'current list: {_WATCHER_DISALLOWED_TOOLS}'
+        )
+
+    def test_escalation_record_and_merge_state_reads_are_granted(self) -> None:
+        """SKILL.md's Read-only investigation toolset lists these reads; its
+        single-record read calls get_escalation and its task_failure handler
+        reads merge_status.failure_diagnostic (task 3176)."""
+        for tool in _RECORD_AND_MERGE_STATE_READS:
+            assert tool in _WATCHER_ALLOWED_TOOLS, (
+                f'{tool} must be in _WATCHER_ALLOWED_TOOLS: SKILL.md\'s Read-only '
+                f'investigation toolset lists it (task 3176); current list: '
+                f'{_WATCHER_ALLOWED_TOOLS}'
+            )
+            assert tool not in _WATCHER_DISALLOWED_TOOLS, (
+                f'{tool} must not be in _WATCHER_DISALLOWED_TOOLS: SKILL.md\'s '
+                f'Read-only investigation toolset lists it (task 3176); current '
+                f'list: {_WATCHER_DISALLOWED_TOOLS}'
+            )
+
+    def test_declare_pin_is_not_granted(self) -> None:
+        """Wildcard-aware: an `mcp__escalation__*` grant would cover it too."""
+        assert not tool_is_granted(
+            'mcp__escalation__declare_pin', set(_WATCHER_ALLOWED_TOOLS),
+        ), (
+            'mcp__escalation__declare_pin must not be granted to the rotation, '
+            'directly or by an mcp__escalation__* wildcard: see '
+            'skills/escalation-watcher-auto/SKILL.md "Declared pins" (task 3176); '
+            f'current list: {_WATCHER_ALLOWED_TOOLS}'
         )
 
     def test_filing_pair_is_granted(self) -> None:
@@ -3316,11 +3350,13 @@ class TestWatcherSkillDrainProtocol:
             for token in re.findall(r'mcp__[a-z-]+__[a-z0-9_]+', block)
         }
         assert called, 'found no MCP tool calls in SKILL.md code blocks'
-        ungranted = sorted(called - set(_WATCHER_ALLOWED_TOOLS))
+        granted = set(_WATCHER_ALLOWED_TOOLS)
+        ungranted = sorted(t for t in called if not tool_is_granted(t, granted))
         assert not ungranted, (
             'SKILL.md code blocks call MCP tools missing from '
-            '_WATCHER_ALLOWED_TOOLS; --allowed-tools is an allowlist, so each '
-            f'call is permission-denied (a silent no-op): {ungranted}'
+            '_WATCHER_ALLOWED_TOOLS; grant them in '
+            'harness.py::_WATCHER_ALLOWED_TOOLS or reword the skill: '
+            f'{ungranted}'
         )
 
     def test_drain_rebuilds_already_promoted_archive_inclusively(self) -> None:
@@ -3404,6 +3440,7 @@ class TestWatcherSkillDrainProtocol:
 # ---------------------------------------------------------------------------
 
 _READ_ONLY_GRANTED_MCP_TOOLS = frozenset({
+    *_RECORD_AND_MERGE_STATE_READS,
     'mcp__escalation__get_pending_escalations',
     'mcp__escalation__get_task_escalations',
     'mcp__fused-memory__get_task',

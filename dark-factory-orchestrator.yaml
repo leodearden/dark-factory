@@ -1520,7 +1520,9 @@ recovery_emission:
 #
 # merge_verify_breadth: "full" makes merge-role verify run every REGISTERED
 # module's full suite instead of only the touched modules (Resolved decision
-# 5 in the PRD) — the λ knob, defaulting to "scoped" in defaults.yaml.
+# 5 in the PRD). "full" is also the shipped default since task 7008
+# (defaults.yaml); the key is declared here so this repo's whole-tree gate
+# does not depend on the shipped default.
 #
 # merge_train_former_enabled / merge_train_coalesce_enabled /
 # merge_train_max_members: turn on the train former + retroactive

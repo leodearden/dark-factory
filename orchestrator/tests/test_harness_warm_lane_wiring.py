@@ -51,6 +51,7 @@ def _make_config(
     warm_lane_pool: bool,
     spare_warm_lanes: int = 0,
     warm_lane_prewarm: bool = False,
+    main_health_fix_reserved_slots: int = 0,
     tmp_path: Path,
 ) -> OrchestratorConfig:
     """Build a minimal OrchestratorConfig with the given warm-lane settings."""
@@ -61,6 +62,7 @@ def _make_config(
     return OrchestratorConfig(
         project_root=repo,
         max_concurrent_tasks=max_concurrent_tasks,
+        main_health_fix_reserved_slots=main_health_fix_reserved_slots,
         git=GitConfig(
             warm_lane_pool=warm_lane_pool,
             spare_warm_lanes=spare_warm_lanes,
@@ -161,6 +163,31 @@ class TestHarnessWarmLaneWiring:
             max_concurrent_tasks=4,
             warm_lane_pool=False,
             spare_warm_lanes=5,
+            tmp_path=tmp_path,
+        )
+        harness = _build_harness(config)
+
+        assert harness.git_ops.warm_lane_pool is None
+
+    def test_main_health_fix_reserve_adds_to_pool_size(self, tmp_path: Path):
+        """Every run slot needs a lane, the main-health-fix reserve included (task 8480)."""
+        config = _make_config(
+            max_concurrent_tasks=7,
+            warm_lane_pool=True,
+            spare_warm_lanes=2,
+            main_health_fix_reserved_slots=1,
+            tmp_path=tmp_path,
+        )
+        harness = _build_harness(config)
+
+        assert harness.git_ops.warm_lane_pool is not None
+        assert harness.git_ops.warm_lane_pool.size == 10  # 7 + 1 + 2
+
+    def test_main_health_fix_reserve_no_effect_when_pool_off(self, tmp_path: Path):
+        config = _make_config(
+            max_concurrent_tasks=7,
+            warm_lane_pool=False,
+            main_health_fix_reserved_slots=1,
             tmp_path=tmp_path,
         )
         harness = _build_harness(config)

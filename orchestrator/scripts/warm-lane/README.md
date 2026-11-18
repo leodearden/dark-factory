@@ -343,7 +343,7 @@ overlooked, because the deferral was measured; the resolution is appended to it.
   un-writable, and its failure mode is the severe direction.
 
   The observable payoff is delivered and pinned in both directions (Block X-band
-  in `orchestrator/tests/warm-lane/test_warm_lane_gc.sh`: with
+  in `orchestrator/tests/warm-lane/test_warm_lane_gc_native.sh`: with
   `REIFY_WARM_LANE_IACT_PREFIX=_myiact-`, a `_myiact-` worktree survives and a
   stock `_iact-` one no longer does). The `||` fallback is no longer a contract
   either — Block X-degrade exercises it in situ. Re-measured wall-clock for the
@@ -866,7 +866,7 @@ changes. Adding a render there would double the cost on the one production path
 that runs from a systemd timer, for no behaviour change. `lib_lane_state.sh`'s
 header previously named it as an intended caller; that has been corrected.
 
-**Pinned by** Block X in `orchestrator/tests/warm-lane/test_warm_lane_gc.sh` —
+**Pinned by** Block X in `orchestrator/tests/warm-lane/test_warm_lane_gc_native.sh` —
 X-band for the payoff (`REIFY_WARM_LANE_IACT_PREFIX` moves which band is
 protected, asserted in both directions) and X-degrade for the `||`. Suite
 wall-clock and the test-side cost mitigation: `orchestrator/tests/warm-lane/README.md`.
@@ -1023,12 +1023,12 @@ knob was added — gc.sh is project-agnostic, and its knobs are flags plus
 `REIFY_WARM_LANE_GC_*` env vars, per every sibling.
 
 **Pinned by** Blocks S-pressure, S-age, S-age-degrade, A11 and A11-boundary in
-`orchestrator/tests/warm-lane/test_warm_lane_gc.sh` — A11e-A11k pin the
+`orchestrator/tests/warm-lane/test_warm_lane_gc_native.sh` — A11e-A11k pin the
 validation matrix above (A11l is its non-vacuity control) and A11-boundary pins
 that a misconfigured bound reclaims NOTHING rather than half a pool; the fourth global by
 `orchestrator/tests/test_lane_state_lib.py::TestLaneStateReadPublishesUpdatedAt`;
-the 14-vs-7.0 ordering by the drift gate named above. **Block K5 is the other
-half of S-pressure's contract** — K5 pins that `--disk-pressure` still HONOURS
+the 14-vs-7.0 ordering by the drift gate named above. **Block K5 (in
+`test_warm_lane_gc.sh`) is the other half of S-pressure's contract** — K5 pins that `--disk-pressure` still HONOURS
 the live-reference gate, S-pressure that it DOWNGRADES the record gate, and the
 downgrade is only safe because the gate K5 pins is still standing.
 
@@ -1255,12 +1255,12 @@ This is patched here, not upstream, for the reason Delta 7 gives under "Why
 patch here rather than upstream to reify". reify's copies still carry the
 pipelines.
 
-**Pinned by** these cases in the ported suites under `orchestrator/tests/warm-lane/`:
+**Pinned by** these cases in the suites under `orchestrator/tests/warm-lane/`:
 
 - provision N4
 - disk-guard A10
 - gc-sweep G6g
-- gc A11m/A11n
+- gc-native (`test_warm_lane_gc_native.sh`) A11m/A11n
 - audit A3/A4
 - degenerate-ref U8
 
@@ -1481,7 +1481,7 @@ every reify lane therefore also resets as today, visible as
 
 **Pinned by:**
 
-- `orchestrator/tests/warm-lane/test_warm_lane_gc.sh` Block V (V1-V9) and A12;
+- `orchestrator/tests/warm-lane/test_warm_lane_gc_native.sh` Block V (V1-V9) and A12;
 - `test_warm_lane_gc_sweep.sh` Block Z (Z1-Z6).
 
 ### Delta 15 — `lib_live_refs.sh`: the fd/cwd pass enumerates only `/proc/<pid>/cwd` and `/proc/<pid>/fd`
@@ -1567,7 +1567,7 @@ report `age_source=dir-mtime`.
   refusal, the zero-resident warn, and the record clock against real
   `LaneRecord.to_json()` records
 - `orchestrator/tests/test_lane_state_lib.py::TestLaneStateEpoch`
-- the gc suite's existing S-age-degrade block, for the refactored gate
+- `test_warm_lane_gc_native.sh`'s existing S-age-degrade block, for the refactored gate
 - audit Block N, whose orphan-stale records are now stamped 90 minutes back
   to match their backdated dirs
 

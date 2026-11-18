@@ -6,7 +6,7 @@ A spawned session that has finished touches ``exit-requested`` in its record
 dir. On a proven-owner Stop, ``SelfExit.evaluate`` checks every precondition
 and returns the ``ExitRequest`` the hook stamps in its one write;
 ``SelfExit.enact`` then signals the owning ``claude`` and deletes the marker.
-Stdlib plus the ``shared`` leaves below the ``session_registry`` import, whose
+Stdlib plus the ``shared`` leaves below the ``session_records`` import, whose
 bootstrap appends shared/src: ``session_hooks.py`` imports this at module scope
 and runs from a bare shell with only ``PYTHONPATH=orchestrator/src``, pinned by
 ``orchestrator/tests/test_session_registry.py::TestStdlibOnlySelfContainment``.
@@ -26,10 +26,11 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-from orchestrator import session_registry
+from orchestrator import session_identity, session_records
 
-# session_registry's import puts this checkout's shared/src on sys.path for the bare shell.
+# session_records' import puts this checkout's shared/src on sys.path for the bare shell.
 # isort: split
+from shared.proc_liveness import pid_alive
 from shared.process_identity import Liveness
 from shared.session_liveness import judge
 
@@ -59,12 +60,12 @@ class SelfExitRefusal(StrEnum):
 class SelfExitEvaluation:
     """One Stop event's decision, and the marker it was made from."""
 
-    request: session_registry.ExitRequest
+    request: session_records.ExitRequest
     marker: Path
 
-    def stamp(self, record: session_registry.SessionRecord) -> None:
+    def stamp(self, record: session_records.SessionRecord) -> None:
         record.exit_request = self.request
-        if self.request.state is session_registry.ExitRequestState.ATTEMPTED:
+        if self.request.state is session_records.ExitRequestState.ATTEMPTED:
             record.exit_requested_at = self.request.at
 
 
@@ -76,24 +77,24 @@ class SelfExit:
 
     def evaluate(
         self,
-        record: session_registry.SessionRecord,
+        record: session_records.SessionRecord,
         hook_input: Mapping[str, Any],
         *,
         owner_pid: int | None,
         root: Path | str | None,
     ) -> SelfExitEvaluation | None:
         """The evaluation to stamp, or None when the record dir holds no marker."""
-        record_dir = session_registry.record_path_for_slug(record.session_slug, root=root).parent
-        marker = record_dir / session_registry.EXIT_REQUESTED_FILENAME
+        record_dir = session_records.record_path_for_slug(record.session_slug, root=root).parent
+        marker = record_dir / session_records.EXIT_REQUESTED_FILENAME
         present, marker_session_id = _read_marker(marker)
         if not present:
             return None
         refusal = _first_refusal(record, hook_input, owner_pid=owner_pid, record_dir=record_dir)
         if refusal is None:
-            state, reason = session_registry.ExitRequestState.ATTEMPTED, None
+            state, reason = session_records.ExitRequestState.ATTEMPTED, None
         else:
-            state, reason = session_registry.ExitRequestState.REFUSED, refusal.value
-        request = session_registry.ExitRequest(
+            state, reason = session_records.ExitRequestState.REFUSED, refusal.value
+        request = session_records.ExitRequest(
             state=state,
             reason=reason,
             pid=owner_pid,
@@ -105,7 +106,7 @@ class SelfExit:
     def enact(
         self,
         evaluation: SelfExitEvaluation,
-        record: session_registry.SessionRecord,
+        record: session_records.SessionRecord,
         root: Path | str | None,
     ) -> None:
         """Signal the owner of an ATTEMPTED evaluation, then delete its marker; a refusal is a no-op.
@@ -114,14 +115,14 @@ class SelfExit:
         write and the marker stays, so the next Stop retries.
         """
         request = evaluation.request
-        if request.state is not session_registry.ExitRequestState.ATTEMPTED:
+        if request.state is not session_records.ExitRequestState.ATTEMPTED:
             return
         assert request.pid is not None, 'an unresolved owner pid is refused, never attempted'
         try:
             self.kill(request.pid, signal.SIGINT)
         except (OSError, OverflowError) as exc:
             record.exit_request = replace(
-                request, state=session_registry.ExitRequestState.KILL_FAILED, reason=_kill_failure_reason(exc),
+                request, state=session_records.ExitRequestState.KILL_FAILED, reason=_kill_failure_reason(exc),
             )
             _write_kill_failed(record, root)
             return
@@ -141,7 +142,7 @@ def _read_marker(marker: Path) -> tuple[bool, str | None]:
 
 
 def _first_refusal(
-    record: session_registry.SessionRecord,
+    record: session_records.SessionRecord,
     hook_input: Mapping[str, Any],
     *,
     owner_pid: int | None,
@@ -170,21 +171,21 @@ def _first_refusal(
 
 def _outcome_refusal(record_dir: Path) -> SelfExitRefusal | None:
     try:
-        text = (record_dir / session_registry.RESULT_FILENAME).read_text(encoding='utf-8', errors='replace')
+        text = (record_dir / session_records.RESULT_FILENAME).read_text(encoding='utf-8', errors='replace')
     except OSError:
         return SelfExitRefusal.RESULT_UNREADABLE
-    if session_registry.parse_result_outcome(text) in session_registry.TERMINAL_RESULT_OUTCOMES:
+    if session_records.parse_result_outcome(text) in session_records.TERMINAL_RESULT_OUTCOMES:
         return None
     return SelfExitRefusal.OUTCOME_NOT_TERMINAL
 
 
-def _host_refusal(record: session_registry.SessionRecord) -> SelfExitRefusal | None:
+def _host_refusal(record: session_records.SessionRecord) -> SelfExitRefusal | None:
     """An owner on another host is never compared with, nor signalled as, a local pid."""
     identity = record.claude_owner_identity
     owner_pid = record.claude_owner_pid
     if identity is None or owner_pid is None:
         return None
-    verdict = judge(identity, owner_pid, pid_alive=session_registry.pid_alive)
+    verdict = judge(identity, owner_pid, pid_alive=pid_alive)
     return SelfExitRefusal.OTHER_HOST if verdict is Liveness.OTHER_HOST else None
 
 
@@ -193,7 +194,7 @@ def _owner_refusal(bound_pid: int | None, owner_pid: int | None) -> SelfExitRefu
         return SelfExitRefusal.OWNER_PID_UNRESOLVED
     if bound_pid != owner_pid:
         return SelfExitRefusal.OWNER_PID_MISMATCH
-    if session_registry.is_shared_session_host(owner_pid):
+    if session_identity.is_shared_session_host(owner_pid):
         return SelfExitRefusal.SHARED_SESSION_HOST
     return None
 
@@ -220,9 +221,9 @@ def _kill_failure_reason(exc: OSError | OverflowError) -> str:
     return type(exc).__name__
 
 
-def _write_kill_failed(record: session_registry.SessionRecord, root: Path | str | None) -> None:
+def _write_kill_failed(record: session_records.SessionRecord, root: Path | str | None) -> None:
     try:
-        session_registry.write_record(record, root=root)
+        session_records.write_record(record, root=root)
     except OSError:
         logger.warning('kill_failed stamp for session %s could not be written', record.session_slug, exc_info=True)
 

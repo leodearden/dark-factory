@@ -11,6 +11,7 @@ import pytest
 from capability_manifest_twins import check_md_twin, md_twin_path, unmentioned_labels
 from pydantic import ValidationError
 
+from shared.capability_manifest import load_capability_manifest
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
@@ -115,6 +116,14 @@ class TestCheckMdTwin:
     def test_a_twin_mentioning_every_label_passes(self, tmp_path):
         md = '## α — first\n\n| Γ1 | cap-1 | PASS |\n'
         sidecar = _write_pair(tmp_path, _sidecar_yaml('α', 'gamma1'), md)
+        assert check_md_twin(sidecar, tmp_path) is None
+
+    def test_capability_names_and_verdicts_are_outside_the_pin(self, tmp_path):
+        md = '## α — the first capability, described in prose\n\n## β — recorded FAIL at authoring time\n'
+        sidecar = _write_pair(tmp_path, _sidecar_yaml('α', 'β'), md)
+        capabilities = [cap for task in load_capability_manifest(sidecar).tasks for cap in task.capabilities]
+        assert capabilities
+        assert not any(cap.name in md or cap.verdict in md for cap in capabilities)
         assert check_md_twin(sidecar, tmp_path) is None
 
     def test_a_missing_twin_names_both_repo_relative_paths(self, tmp_path):

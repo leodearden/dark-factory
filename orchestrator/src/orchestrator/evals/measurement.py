@@ -53,6 +53,7 @@ class MeasurementStage(StrEnum):
     MATCHER = 'matcher'
     ASSESSOR = 'assessor'
     SYNTHESIZER = 'synthesizer'
+    LABEL_PROPOSER = 'label_proposer'
 
 
 def _eval_spawn_env(stage: MeasurementStage) -> dict[str, str]:

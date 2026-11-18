@@ -6,13 +6,15 @@ above the transport.  Only a server that is genuinely slow to answer exercises
 that seam.  Built on stdlib ``http.server`` for the reason
 ``_mock_openai_server.py`` gives: no HTTP-mock library is installed.
 
-Collection meta-ops (create) run one after another under a single lock, as a
-real Qdrant runs them.  The latency of a create, of a payload-index create
+Collection meta-ops (create and delete) run one after another under a single
+lock, as a real Qdrant runs them.  The latency of a create, of a delete
+(``DELETE /collections/{name}``), of a payload-index create
 (``PUT /collections/{name}/index``), of a point upsert
 (``PUT /collections/{name}/points``) and of a point retrieve
 (``POST /collections/{name}/points``) is set per collection; the latency of a
 collection list (``GET /collections``), which names no collection, is one
-scalar.  Every latency is waited out on :attr:`StubQdrantServer.release_event`
+scalar.  A point count (``POST /collections/{name}/points/count``) answers at
+once, with a canned count per collection.  Every latency is waited out on :attr:`StubQdrantServer.release_event`
 rather than slept, so a test can end the wait early and no handler thread
 outlives the server.
 
@@ -55,6 +57,11 @@ def _already_exists(name: str) -> dict[str, Any]:
     return _error(f'Wrong input: Collection `{name}` already exists!')
 
 
+def _not_found(name: str) -> dict[str, Any]:
+    """Qdrant's 404 body for a request naming a collection that does not exist."""
+    return _error(f"Not found: Collection `{name}` doesn't exist!")
+
+
 class StubQdrantServer:
     """Handle yielded by :func:`stub_qdrant_server`."""
 
@@ -62,6 +69,7 @@ class StubQdrantServer:
         self,
         *,
         create_delay_s: Mapping[str, float],
+        delete_delay_s: Mapping[str, float],
         index_delay_s: Mapping[str, float],
         upsert_delay_s: Mapping[str, float],
         retrieve_delay_s: Mapping[str, float],
@@ -69,20 +77,24 @@ class StubQdrantServer:
         preexisting: Iterable[str],
         conflict_on_create: Iterable[str],
         create_status: Mapping[str, int],
+        point_counts: Mapping[str, int],
     ) -> None:
         self.url = ''
         self.release_event = threading.Event()
         """Set it to finish every pending and future delayed request without its delay."""
         self._create_delay_s = dict(create_delay_s)
+        self._delete_delay_s = dict(delete_delay_s)
         self._index_delay_s = dict(index_delay_s)
         self._upsert_delay_s = dict(upsert_delay_s)
         self._retrieve_delay_s = dict(retrieve_delay_s)
         self._list_collections_delay_s = list_collections_delay_s
         self._conflict_on_create = frozenset(conflict_on_create)
         self._create_status = dict(create_status)
+        self._point_counts = dict(point_counts)
         self._state_lock = threading.Lock()
         self._meta_op_lock = threading.Lock()
         self._create_requests: Counter[str] = Counter()
+        self._delete_requests: Counter[str] = Counter()
         self._exists_requests: Counter[str] = Counter()
         self._upsert_requests: Counter[str] = Counter()
         self._create_bodies: dict[str, list[dict[str, Any]]] = {}
@@ -98,6 +110,11 @@ class StubQdrantServer:
         """How many ``PUT /collections/{name}`` requests the server has received."""
         with self._state_lock:
             return self._create_requests[name]
+
+    def deletes(self, name: str) -> int:
+        """How many ``DELETE /collections/{name}`` requests the server has received."""
+        with self._state_lock:
+            return self._delete_requests[name]
 
     def create_bodies(self, name: str) -> list[dict[str, Any]]:
         """The parsed JSON body of every ``PUT /collections/{name}``, in arrival order."""
@@ -186,12 +203,27 @@ class StubQdrantServer:
                 return 409, _already_exists(name)
             if name in self._conflict_on_create:
                 self._created_event(name).set()
+                self.release_event.wait(self._create_delay_s.get(name, 0.0))
                 return 409, _already_exists(name)
             if name in self._create_status:
                 return self._create_status[name], _error(f'stub rejected the create of `{name}`')
             self.release_event.wait(self._create_delay_s.get(name, 0.0))
             self._created_event(name).set()
             return 200, _ok(True)
+
+    def _delete(self, name: str) -> tuple[int, dict[str, Any]]:
+        with self._state_lock:
+            self._delete_requests[name] += 1
+        with self._meta_op_lock:
+            self.release_event.wait(self._delete_delay_s.get(name, 0.0))
+            existed = self._exists(name)
+            self._created_event(name).clear()
+            return 200, _ok(existed)
+
+    def _count(self, name: str) -> tuple[int, dict[str, Any]]:
+        if not self._exists(name):
+            return 404, _not_found(name)
+        return 200, _ok({'count': self._point_counts.get(name, 0)})
 
     def _create_index(self, name: str) -> tuple[int, dict[str, Any]]:
         with self._state_lock:
@@ -226,12 +258,16 @@ class StubQdrantServer:
                 return self._check_exists(name)
             case 'PUT', ['collections', name]:
                 return self._create(name, body)
+            case 'DELETE', ['collections', name]:
+                return self._delete(name)
             case 'PUT', ['collections', name, 'index']:
                 return self._create_index(name)
             case 'PUT', ['collections', name, 'points']:
                 return self._upsert(name)
             case 'POST', ['collections', name, 'points']:
                 return self._retrieve(name)
+            case 'POST', ['collections', name, 'points', 'count']:
+                return self._count(name)
         return 404, _error(f'stub has no route for {method} {path}')
 
 
@@ -263,7 +299,7 @@ def _make_handler(state: StubQdrantServer) -> type[BaseHTTPRequestHandler]:
             self.end_headers()
             self.wfile.write(payload)
 
-        do_GET = do_PUT = do_POST = _serve
+        do_GET = do_PUT = do_POST = do_DELETE = _serve
 
     return Handler
 
@@ -283,6 +319,7 @@ def stub_qdrant_server(
     *,
     host: str = '127.0.0.1',
     create_delay_s: Mapping[str, float] | None = None,
+    delete_delay_s: Mapping[str, float] | None = None,
     index_delay_s: Mapping[str, float] | None = None,
     upsert_delay_s: Mapping[str, float] | None = None,
     retrieve_delay_s: Mapping[str, float] | None = None,
@@ -290,22 +327,27 @@ def stub_qdrant_server(
     preexisting: Iterable[str] = (),
     conflict_on_create: Iterable[str] = (),
     create_status: Mapping[str, int] | None = None,
+    point_counts: Mapping[str, int] | None = None,
 ) -> Iterator[StubQdrantServer]:
     """Serve the stub on an ephemeral port of loopback address *host*.
 
-    *create_delay_s* is how long a create of each named collection takes, and
-    *index_delay_s*, *upsert_delay_s* and *retrieve_delay_s* how long a
-    payload-index create on, a point upsert into, or a point retrieve from, it
-    takes; a retrieve always answers no points.
+    *create_delay_s* is how long a create of each named collection takes,
+    *delete_delay_s* how long a delete of it takes, and *index_delay_s*,
+    *upsert_delay_s* and *retrieve_delay_s* how long a payload-index create on,
+    a point upsert into, or a point retrieve from, it takes; a retrieve always
+    answers no points.
     *list_collections_delay_s* is how long every ``GET /collections`` takes.
     *preexisting* collections exist from the start.  A create of a collection
     in *conflict_on_create* answers 409 AND leaves it created, as when another
-    creator wins between an exists check and the create.  A create of a
+    creator wins between an exists check and the create; the collection is
+    present at once and the 409 follows its create delay.  A create of a
     collection in *create_status* answers that error status and leaves it
-    absent.
+    absent.  *point_counts* is what a point count of each named collection
+    answers while it exists (0 for one not named).
     """
     state = StubQdrantServer(
         create_delay_s=create_delay_s or {},
+        delete_delay_s=delete_delay_s or {},
         index_delay_s=index_delay_s or {},
         upsert_delay_s=upsert_delay_s or {},
         retrieve_delay_s=retrieve_delay_s or {},
@@ -313,6 +355,7 @@ def stub_qdrant_server(
         preexisting=preexisting,
         conflict_on_create=conflict_on_create,
         create_status=create_status or {},
+        point_counts=point_counts or {},
     )
     httpd = _QuietServer((host, 0), _make_handler(state))
     bound_host, port = httpd.server_address[:2]

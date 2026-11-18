@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 from _cockpit_session_records import make_record
-from orchestrator import session_registry as sr
+from orchestrator import session_records
 
 from cockpit.app import CockpitApp
 
@@ -257,7 +257,7 @@ class TestSpawnTree:
         parent = make_record(session_slug='parent-1', parent_session_id=None)
         child = make_record(session_slug='child-1', parent_session_id='parent-1')
         for r in (parent, child):
-            sr.write_record(r, root=tmp_path)
+            session_records.write_record(r, root=tmp_path)
 
         app = CockpitApp(fleet_root=tmp_path, poll_interval=0.05)
         async with app.run_test() as pilot:
@@ -286,15 +286,15 @@ class TestSpawnTree:
         running_child = make_record(
             session_slug='child-running',
             parent_session_id='parent-1',
-            status=sr.Status.RUNNING,
+            status=session_records.Status.RUNNING,
         )
         exited_child = make_record(
             session_slug='child-exited',
             parent_session_id='parent-1',
-            status=sr.Status.EXITED,
+            status=session_records.Status.EXITED,
         )
         for r in (parent, running_child, exited_child):
-            sr.write_record(r, root=tmp_path)
+            session_records.write_record(r, root=tmp_path)
 
         app = CockpitApp(fleet_root=tmp_path, poll_interval=0.05)
         async with app.run_test() as pilot:
@@ -326,8 +326,8 @@ class TestSpawnTreeEnterFocus:
         from cockpit.backends import DisplayTarget, FakeBackend
         from cockpit.panes.spawn_tree import SpawnTree, SpawnTreeScreen
 
-        parent_display = sr.Display(kind='wm', wm_title='parent title')
-        child_display = sr.Display(kind='wm', wm_title='child title')
+        parent_display = session_records.Display(kind='wm', wm_title='parent title')
+        child_display = session_records.Display(kind='wm', wm_title='child title')
         parent = make_record(
             session_slug='parent-1', parent_session_id=None, display=parent_display
         )
@@ -335,7 +335,7 @@ class TestSpawnTreeEnterFocus:
             session_slug='child-1', parent_session_id='parent-1', display=child_display
         )
         for r in (parent, child):
-            sr.write_record(r, root=tmp_path)
+            session_records.write_record(r, root=tmp_path)
 
         backend = FakeBackend()
         app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05)
@@ -370,7 +370,7 @@ class TestSpawnTreeEnterFocus:
             session_slug='child-1', parent_session_id='parent-1', display=None
         )
         for r in (parent, child):
-            sr.write_record(r, root=tmp_path)
+            session_records.write_record(r, root=tmp_path)
 
         backend = FakeBackend()
         app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05)
@@ -430,8 +430,8 @@ class TestSpawnTreeEnterFocus:
         from cockpit.backends import DisplayTarget, FakeBackend
         from cockpit.panes.spawn_tree import SpawnTree, SpawnTreeScreen
 
-        parent_display = sr.Display(kind='wm', wm_title='parent title')
-        child_display = sr.Display(kind='wm', wm_title='child title')
+        parent_display = session_records.Display(kind='wm', wm_title='parent title')
+        child_display = session_records.Display(kind='wm', wm_title='child title')
         parent = make_record(
             session_slug='parent-1', parent_session_id=None, display=parent_display
         )
@@ -439,7 +439,7 @@ class TestSpawnTreeEnterFocus:
             session_slug='child-1', parent_session_id='parent-1', display=child_display
         )
         for r in (parent, child):
-            sr.write_record(r, root=tmp_path)
+            session_records.write_record(r, root=tmp_path)
 
         backend = FakeBackend()
         app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05)
@@ -462,7 +462,7 @@ class TestSpawnTreeEnterFocus:
             # containing the highlighted child -- deterministically: the
             # child's record.json is gone from disk, so this scan (like
             # any later background poll tick) can only ever find parent-1.
-            shutil.rmtree(sr.record_path_for_slug('child-1', root=tmp_path).parent)
+            shutil.rmtree(session_records.record_path_for_slug('child-1', root=tmp_path).parent)
             app.refresh_registry()
             await pilot.pause()
             # sanity: the simulated poll tick actually dropped the child,

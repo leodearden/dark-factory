@@ -9,7 +9,7 @@ cyclic parent_session_id must degrade gracefully, never raise or hang.
 from __future__ import annotations
 
 import pytest
-from orchestrator import session_registry as sr
+from orchestrator import session_records
 
 from cockpit.panes.spawn_tree import build_spawn_forest, is_outstanding
 
@@ -18,7 +18,7 @@ def _make_record(**overrides):
     """Mirrors _cockpit_session_records.py::make_record and test_session_table.py::_make_record."""
     fields: dict = {
         'session_slug': 'unblock-df-2085-4242',
-        'status': sr.Status.RUNNING,
+        'status': session_records.Status.RUNNING,
         'title': 'unblock:df#2085 slug',
         'role': 'unblock',
         'project': 'df',
@@ -26,7 +26,7 @@ def _make_record(**overrides):
         'start_ts': '2026-07-07T00:00:00+00:00',
     }
     fields.update(overrides)
-    return sr.SessionRecord(**fields)
+    return session_records.SessionRecord(**fields)
 
 
 def _find_node(forest, slug):
@@ -53,10 +53,10 @@ class TestBuildSpawnForest:
     def test_renders_parent_child_structure(self):
         root = _make_record(session_slug='root-1', parent_session_id=None)
         child1 = _make_record(
-            session_slug='child-1', parent_session_id='root-1', status=sr.Status.RUNNING
+            session_slug='child-1', parent_session_id='root-1', status=session_records.Status.RUNNING
         )
         child2 = _make_record(
-            session_slug='child-2', parent_session_id='root-1', status=sr.Status.RUNNING
+            session_slug='child-2', parent_session_id='root-1', status=session_records.Status.RUNNING
         )
 
         forest = build_spawn_forest([root, child1, child2])
@@ -84,15 +84,15 @@ class TestBuildSpawnForest:
 
 class TestIsOutstanding:
     def test_non_terminal_statuses_are_outstanding(self):
-        running = _make_record(status=sr.Status.RUNNING)
-        awaiting = _make_record(status=sr.Status.AWAITING_INPUT)
+        running = _make_record(status=session_records.Status.RUNNING)
+        awaiting = _make_record(status=session_records.Status.AWAITING_INPUT)
 
         assert is_outstanding(running) is True
         assert is_outstanding(awaiting) is True
 
     def test_terminal_statuses_are_not_outstanding(self):
-        exited = _make_record(status=sr.Status.EXITED)
-        failed = _make_record(status=sr.Status.FAILED_TO_START)
+        exited = _make_record(status=session_records.Status.EXITED)
+        failed = _make_record(status=session_records.Status.FAILED_TO_START)
 
         assert is_outstanding(exited) is False
         assert is_outstanding(failed) is False
@@ -105,9 +105,9 @@ class TestIsOutstanding:
 
 class TestOutstandingFlag:
     def test_non_terminal_child_is_outstanding(self):
-        root = _make_record(session_slug='root-1', parent_session_id=None, status=sr.Status.IDLE)
+        root = _make_record(session_slug='root-1', parent_session_id=None, status=session_records.Status.IDLE)
         child = _make_record(
-            session_slug='child-1', parent_session_id='root-1', status=sr.Status.RUNNING
+            session_slug='child-1', parent_session_id='root-1', status=session_records.Status.RUNNING
         )
 
         forest = build_spawn_forest([root, child])
@@ -117,7 +117,7 @@ class TestOutstandingFlag:
     def test_terminal_child_is_not_outstanding(self):
         root = _make_record(session_slug='root-1', parent_session_id=None)
         child = _make_record(
-            session_slug='child-1', parent_session_id='root-1', status=sr.Status.EXITED
+            session_slug='child-1', parent_session_id='root-1', status=session_records.Status.EXITED
         )
 
         forest = build_spawn_forest([root, child])
@@ -133,7 +133,7 @@ class TestOutstandingFlag:
         test -- see test_orphan_promoted_root_is_outstanding_when_non_terminal
         and test_cycle_promoted_root_is_outstanding_when_non_terminal."""
         root = _make_record(
-            session_slug='root-1', parent_session_id=None, status=sr.Status.RUNNING
+            session_slug='root-1', parent_session_id=None, status=session_records.Status.RUNNING
         )
 
         forest = build_spawn_forest([root])
@@ -146,7 +146,7 @@ class TestOutstandingFlag:
         it stays outstanding when non-terminal -- unlike a natural root,
         which is never outstanding."""
         orphan = _make_record(
-            session_slug='orphan-1', parent_session_id='ghost-parent', status=sr.Status.RUNNING
+            session_slug='orphan-1', parent_session_id='ghost-parent', status=session_records.Status.RUNNING
         )
 
         forest = build_spawn_forest([orphan])
@@ -161,7 +161,7 @@ class TestOutstandingFlag:
         `and is_outstanding(record)` conjunct against a degenerate
         `outstanding = parent_session_id is not None`."""
         orphan = _make_record(
-            session_slug='orphan-1', parent_session_id='ghost-parent', status=sr.Status.EXITED
+            session_slug='orphan-1', parent_session_id='ghost-parent', status=session_records.Status.EXITED
         )
 
         forest = build_spawn_forest([orphan])
@@ -201,7 +201,7 @@ class TestOutstandingFlag:
         test_self_parented_record_does_not_vanish_or_hang in
         TestForestTotality for this same case's totality guarantee)."""
         selfie = _make_record(
-            session_slug='selfie-1', parent_session_id='selfie-1', status=sr.Status.RUNNING
+            session_slug='selfie-1', parent_session_id='selfie-1', status=session_records.Status.RUNNING
         )
 
         forest = build_spawn_forest([selfie])

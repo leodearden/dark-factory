@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-from orchestrator import session_registry as sr
+from orchestrator import session_records
 
 
-def make_record(**overrides) -> sr.SessionRecord:
+def make_record(**overrides) -> session_records.SessionRecord:
     """Mirrors test_registry_reader.py::_make_record's convention."""
     fields: dict = {
         'session_slug': 'unblock-df-2085-4242',
-        'status': sr.Status.RUNNING,
+        'status': session_records.Status.RUNNING,
         'title': 'unblock:df#2085 slug',
         'role': 'unblock',
         'project': 'df',
@@ -17,4 +17,4 @@ def make_record(**overrides) -> sr.SessionRecord:
         'start_ts': '2026-07-07T00:00:00+00:00',
     }
     fields.update(overrides)
-    return sr.SessionRecord(**fields)
+    return session_records.SessionRecord(**fields)

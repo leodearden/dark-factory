@@ -77,7 +77,8 @@ def _git_config() -> GitConfig:
 
 def _make_orch_config(repo: Path, *, max_concurrent_tasks: int) -> OrchestratorConfig:
     return OrchestratorConfig(
-        project_root=repo, max_concurrent_tasks=max_concurrent_tasks, git=_git_config(),
+        project_root=repo, max_concurrent_tasks=max_concurrent_tasks,
+        main_health_fix_reserved_slots=0, git=_git_config(),
     )
 
 

@@ -6,7 +6,7 @@ import pytest
 from _cockpit_session_records import make_record
 from _cockpit_tree_snapshot import snapshot_tree
 from orchestrator import decision_registry as dr
-from orchestrator import session_registry as sr
+from orchestrator import session_records
 
 from cockpit.app import CockpitApp
 
@@ -70,10 +70,10 @@ class TestCopyAction:
 
         awaiting = make_record(
             session_slug='awaiting-1',
-            status=sr.Status.AWAITING_INPUT,
-            question=sr.Question(text='Which host?', asked_at='2026-07-07T00:00:00+00:00'),
+            status=session_records.Status.AWAITING_INPUT,
+            question=session_records.Question(text='Which host?', asked_at='2026-07-07T00:00:00+00:00'),
         )
-        sr.write_record(awaiting, root=tmp_path)
+        session_records.write_record(awaiting, root=tmp_path)
 
         backend = FakeBackend()
         copy_runner = RecordingCopyRunner()
@@ -119,10 +119,10 @@ class TestCopyAction:
 
         awaiting = make_record(
             session_slug='awaiting-99',
-            status=sr.Status.AWAITING_INPUT,
-            question=sr.Question(text='Which region?', asked_at='2026-07-07T00:00:00+00:00'),
+            status=session_records.Status.AWAITING_INPUT,
+            question=session_records.Question(text='Which region?', asked_at='2026-07-07T00:00:00+00:00'),
         )
-        sr.write_record(awaiting, root=tmp_path)
+        session_records.write_record(awaiting, root=tmp_path)
 
         backend = FakeBackend()
         copy_runner = RecordingCopyRunner()

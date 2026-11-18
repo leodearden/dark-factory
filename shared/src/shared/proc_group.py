@@ -127,10 +127,16 @@ class StatFields(NamedTuple):
 class MalformedStatLine(ValueError):
     """A ``/proc/<pid>/stat`` that was read but does not parse."""
 
-    def __init__(self, path: Path, text: str) -> None:
+    def __init__(
+        self,
+        path: Path,
+        text: str,
+        reason: str = "not a 'pid (comm) state ppid pgrp ...' stat line",
+    ) -> None:
         self.path = path
         self.text = text
-        super().__init__(f"{path}: not a 'pid (comm) state ppid pgrp ...' stat line: {text!r}")
+        self.reason = reason
+        super().__init__(f'{path}: {reason}: {text!r}')
 
 
 def _stat_tail(path: Path, text: str) -> tuple[str, list[str]]:
@@ -201,6 +207,21 @@ def read_session_id(entry: Path) -> int | None:
         return session
     except (OSError, ValueError):
         return None
+
+
+def parse_start_ticks(path: Path, text: str) -> int:
+    """Start time (stat field 22, clock ticks after boot) of *text*, read from *path*.
+
+    Raises MalformedStatLine unless the field is a non-negative decimal integer.
+    """
+    _comm, fields = _stat_tail(path, text)
+    # stat field 22, counted from the pid; fields[0] is field 3, state.
+    start_ticks = fields[19] if len(fields) > 19 else ''
+    if not start_ticks.isdecimal():
+        raise MalformedStatLine(
+            path, text, f'stat field 22 (start_ticks) is {start_ticks!r}, not a decimal integer'
+        )
+    return int(start_ticks)
 
 
 def unified_cgroup_path(cgroup_text: str) -> str | None:

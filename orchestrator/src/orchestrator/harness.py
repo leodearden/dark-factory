@@ -161,6 +161,7 @@ from orchestrator.merge_lane.skew_tripwire import emit_pipeline_landing_tripwire
 from orchestrator.merge_lane.tip_relation import select_recovery_winner
 from orchestrator.merge_lane.worker import (
     reconcile_landed_outbox,
+    reconcile_landed_row,
     reconcile_landed_task,
 )
 from orchestrator.module_charter import derive_modules, sanitize_files_for_persist
@@ -182,6 +183,7 @@ from orchestrator.pause_policy import (
 from orchestrator.proc_supervision import EscalationSpec
 from orchestrator.provenance_conflict import ProvenanceConflictSink
 from orchestrator.quarantine_provenance import QuarantineOutcome
+from orchestrator.recovered_merge_owner import RecoveredMergeOwner
 from orchestrator.recovery_emission import (
     STREAK_CHARGING_SITES,
     LeaveReason,
@@ -206,6 +208,7 @@ from orchestrator.recovery_pins import records_pin_recovery
 from orchestrator.review_checkpoint import ReviewCheckpoint, ReviewReport
 from orchestrator.routing import RoleDefaults
 from orchestrator.routing_dispatch import resolve_and_record_route
+from orchestrator.run_slots import DispatchScope, RunSlots
 from orchestrator.run_store import RunExitReason, RunStore
 from orchestrator.scheduled_deploy_settle import ScheduledDeploySettler
 from orchestrator.scheduler import (
@@ -668,6 +671,14 @@ _WATCHER_ALLOWED_TOOLS: list[str] = [
     # pending L1/L2 it assessed (task 2555) so future rotations can skip
     # re-deriving the same disposition every rotation.
     'mcp__escalation__stamp_triage',
+    # Read-only escalation-record and merge-state reads the skill's Read-only
+    # investigation toolset lists (task 3176); its merge-queue constraint
+    # forbids mutation only. declare_pin is deliberately absent:
+    # skills/escalation-watcher-auto/SKILL.md "Declared pins".
+    'mcp__escalation__get_escalation',
+    'mcp__escalation__get_task_escalation_history',
+    'mcp__escalation__merge_status',
+    'mcp__escalation__get_merge_queue',
     # Fused-memory MCP: read + autonomous dispatch (scope_violation/dependency/cleanup) + filing
     'mcp__fused-memory__get_task',
     'mcp__fused-memory__get_tasks',
@@ -1678,15 +1689,19 @@ class Harness:
         from orchestrator.agents.sandbox_dispatch import set_backend
         set_backend(config.sandbox.backend)
         self.mcp = McpLifecycle(config)
-        # Size the warm-lane pool from max_concurrent_tasks (D9: read once at startup,
-        # single source of truth). Pass 0 when the knob is off so GitOps leaves
+        # Size the warm-lane pool from every run slot, the main-health-fix reserve
+        # included (D9: read once at startup). Pass 0 when the knob is off so GitOps leaves
         # warm_lane_pool=None — non-dispatch call sites (cli.py verify-merge,
         # recover_main.py, evals/runner.py) default to size=0 and stay on cold path.
         self.git_ops = GitOps(
             config.git,
             config.project_root,
             warm_lane_pool_size=(
-                (config.max_concurrent_tasks + config.git.spare_warm_lanes)
+                (
+                    config.max_concurrent_tasks
+                    + config.main_health_fix_reserved_slots
+                    + config.git.spare_warm_lanes
+                )
                 if config.git.warm_lane_pool else 0
             ),
             # Spec-pool size: K (same as speculation_depth), one warm lane per
@@ -2963,7 +2978,10 @@ class Harness:
             await self._launch_merge_worker_loop()
 
             # 3. Run workflow slots
-            sem = asyncio.Semaphore(self.config.max_concurrent_tasks)
+            slots = RunSlots(
+                self.config.max_concurrent_tasks,
+                self.config.main_health_fix_reserved_slots,
+            )
 
             while True:
                 # If a review checkpoint is running, don't acquire new tasks —
@@ -2974,13 +2992,20 @@ class Harness:
                     )
                     continue
 
+                # A slot is taken before a task is picked, so no picked task
+                # holds its module locks while waiting for one (task 8480).
+                scope = slots.free_scope()
+                if scope is None:
+                    await self._wait_for_slot_turnover()
+                    continue
+
                 # Check daily cost ceilings before dispatching the next task.
                 # On breach, pause_scheduler() is called and acquire_next()
                 # returns None (task-1322 machinery), draining in-flight work
                 # and exiting the run loop cleanly.  Task 1323.
                 await self._enforce_cost_ceilings()
 
-                assignment = await self.scheduler.acquire_next()
+                assignment = await self.scheduler.acquire_next(scope)
 
                 if assignment is None:
                     if not self._live_tasks:
@@ -3074,16 +3099,19 @@ class Harness:
                         finally:
                             self._idle_poll_sleeping = False
                         continue
-                    # Wait for any live task to complete, then retry.
-                    # Timeout ensures newly-added tasks are discovered
-                    # within 15s even when no running task completes.
-                    await asyncio.wait(
-                        set(self._live_tasks), return_when=asyncio.FIRST_COMPLETED,
-                        timeout=15,
-                    )
+                    # A general slot freed during a restricted tick widens the
+                    # scope: tick again now instead of waiting a poll.
+                    if slots.free_scope() is scope:
+                        await self._wait_for_slot_turnover()
                     continue
 
-                await sem.acquire()
+                sem = await slots.claim(scope, assignment.task)
+                if scope is DispatchScope.MAIN_HEALTH_FIX:
+                    logger.info(
+                        'Task %s dispatched on the main-health-fix reserved run '
+                        'slot: every general run slot is held',
+                        assignment.task_id,
+                    )
                 self._launch_slot(assignment, sem, task_reports)
 
             self._compute_tallies(task_reports)
@@ -5758,6 +5786,7 @@ class Harness:
                 self._escalation_queue,
                 self._resolve_task_worktree,
                 heartbeat_ttl=DEFAULT_CLAIMANT_HEARTBEAT_TTL,
+                merge_requests=getattr(self, '_merge_inflight_registry', None),
             )
             self._ground_truth = existing
         return existing
@@ -13601,6 +13630,13 @@ class Harness:
         ``run()`` can thread the recovered requests' branches into
         :meth:`_reap_orphaned_merge_worktrees` (task 2060) — a recovered
         in-flight worktree is re-adopted rather than reaped.
+
+        No workflow awaits a recovered request, so each one's outcome is
+        adopted by
+        ``orchestrator/src/orchestrator/recovered_merge_owner.py::RecoveredMergeOwner``
+        (task 7277): a landing drives the landed-outbox done-write through
+        :meth:`_reconcile_landing`, a durable failure blocks the task and files
+        an L1, and an outcome that halted the merge queue files the halt-owning L1.
         """
         report = await recover_pending_merges(
             self._merge_store,
@@ -13614,6 +13650,13 @@ class Harness:
             enqueue_merge_request=enqueue_merge_request,
             select_recovery_winner=select_recovery_winner,
         )
+        RecoveredMergeOwner(
+            tasks=self.scheduler,
+            escalations=self._escalation_queue,
+            reconcile_landing=self._reconcile_landing,
+            merge_halt=self._merge_worker,
+            event_store=self.event_store,
+        ).adopt(report.get('requests', []), schedule=self._schedule_coro_threadsafe)
         logger.info(
             '_recover_pending_merges: recovered=%d dropped=%d coalesced=%d '
             'journal_corrupt=%s',
@@ -13683,10 +13726,7 @@ class Harness:
             return
         report = await reconcile_landed_outbox(
             self._merge_worker._landed_outbox, self.git_ops, self.scheduler,
-            provenance_conflict_sink=self._provenance_conflict_sink,
-            project_root=str(self.config.project_root),
-            check_timeout_secs=self.config.delivered_checks.check_timeout_secs,
-            delivered_checks_enabled=self.config.delivered_checks.enabled,
+            **self._landed_reconcile_guards(),
         )
         logger.info(
             '_reconcile_landed_outbox: pruned_not_landed=%d marked_done=%d '
@@ -13748,11 +13788,33 @@ class Harness:
             git_ops=self.git_ops,
             scheduler=self.scheduler,
             outbox=self._merge_worker._landed_outbox,
-            provenance_conflict_sink=self._provenance_conflict_sink,
-            project_root=str(self.config.project_root),
-            check_timeout_secs=self.config.delivered_checks.check_timeout_secs,
-            delivered_checks_enabled=self.config.delivered_checks.enabled,
+            **self._landed_reconcile_guards(),
         )
+
+    async def _reconcile_landing(self, task_id: str) -> str | None:
+        """Drive *task_id*'s landed-outbox done-write; its row's disposition, None with no row.
+
+        The disposition is
+        ``orchestrator/src/orchestrator/merge_lane/worker.py::reconcile_landed_row``'s,
+        under the same guards as :meth:`_landed_dispatch_gate`.
+        """
+        outbox = self._merge_worker._landed_outbox if self._merge_worker is not None else None
+        row = outbox.lookup(task_id) if outbox is not None else None
+        if outbox is None or row is None:
+            return None
+        return await reconcile_landed_row(
+            row, git_ops=self.git_ops, scheduler=self.scheduler, outbox=outbox,
+            main_sha=await self.git_ops.get_main_sha(), **self._landed_reconcile_guards(),
+        )
+
+    def _landed_reconcile_guards(self) -> dict[str, Any]:
+        """The RC-2 guards every landed-outbox reconcile passes, so its callers stay in lockstep."""
+        return {
+            'provenance_conflict_sink': self._provenance_conflict_sink,
+            'project_root': str(self.config.project_root),
+            'check_timeout_secs': self.config.delivered_checks.check_timeout_secs,
+            'delivered_checks_enabled': self.config.delivered_checks.enabled,
+        }
 
     async def _read_already_landed_tick_view(self) -> AlreadyLandedTickView:
         return await read_already_landed_tick_view(self.git_ops)
@@ -14694,6 +14756,17 @@ class Harness:
             causes = {}
             self._workflow_cancel_causes = causes
         return causes
+
+    async def _wait_for_slot_turnover(self) -> None:
+        """Wait for a live slot to end, at most idle_poll_secs, so newly filed work is still seen every poll."""
+        live = set(self._live_tasks)
+        if live:
+            await asyncio.wait(
+                live, return_when=asyncio.FIRST_COMPLETED,
+                timeout=self.config.idle_poll_secs,
+            )
+        else:
+            await asyncio.sleep(self.config.idle_poll_secs)
 
     def _launch_slot(
         self, assignment, sem: asyncio.Semaphore, task_reports: list[TaskReport],

@@ -40,7 +40,11 @@ from fused_memory.models.reconciliation import (
     VerdictAction,
     VerdictSeverity,
 )
-from fused_memory.reconciliation import _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS
+from fused_memory.reconciliation import (
+    _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS,
+    RECONCILIATION_CLI_ENV_OVERRIDES,
+    RECONCILIATION_CLI_SETTING_SOURCES,
+)
 from fused_memory.reconciliation.journal import ReconciliationJournal
 from fused_memory.reconciliation.prompts.judge import JUDGE_SYSTEM_PROMPT
 
@@ -763,12 +767,12 @@ Review this run and provide your verdict as JSON.
                 max_turns=_JUDGE_CLI_MAX_TURNS,
                 permission_mode='bypassPermissions',
                 timeout_seconds=float(self.config.judge_cli_timeout_seconds),
-                # Task 1989 (sweep verdict): kept at explore_codebase_root, NOT
-                # switched to a neutral cwd. JUDGE_SYSTEM_PROMPT rates factual
-                # grounding/proportionality ("were codebase verifications used
-                # when appropriate?"), which plausibly draws on the auto-loaded
-                # CLAUDE.md's project architecture context.
+                # Kept at explore_codebase_root (task 1989) so judge transcripts stay
+                # under the projects dir they are read from. It loads no CLAUDE.md,
+                # settings or memory index (reconciliation/__init__.py).
                 cwd=Path(self.config.explore_codebase_root),
+                setting_sources=list(RECONCILIATION_CLI_SETTING_SOURCES),
+                env_overrides=dict(RECONCILIATION_CLI_ENV_OVERRIDES),
                 cap_wait_sanity_secs=_RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS,
             )
         except AllAccountsCappedException as e:

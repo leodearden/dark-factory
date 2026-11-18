@@ -32,7 +32,7 @@ logger = logging.getLogger('legibility.inventory')
 
 
 def encode_cwd(cwd: str) -> str:
-    """Mirror ``session_registry.encode_cwd``'s encoding of Claude Code's dir naming.
+    """Mirror ``session_records.encode_cwd``'s encoding of Claude Code's dir naming.
 
     ``/``, ``.`` AND ``_`` all map to ``-``; ``-`` passes through and CASE
     IS PRESERVED (the encoder does not lowercase). Validated against 738
@@ -42,7 +42,7 @@ def encode_cwd(cwd: str) -> str:
     complete over the observed domain, and unverified outside it.
 
     This is a hand-written mirror of the canonical implementation,
-    ``orchestrator.session_registry.encode_cwd`` (named, not line-cited, so
+    ``orchestrator.session_records.encode_cwd`` (named, not line-cited, so
     this docstring doesn't drift as that file evolves). It is duplicated
     rather than imported because this module is deliberately self-contained
     — its ``__main__`` bootstrap puts only ``scripts/`` on ``sys.path``, so

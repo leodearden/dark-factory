@@ -11,7 +11,7 @@ import pytest
 from _cockpit_session_records import make_record
 from _cockpit_tree_snapshot import snapshot_tree
 from orchestrator import decision_registry as dr
-from orchestrator import session_registry as sr
+from orchestrator import session_records
 
 from cockpit.app import CockpitApp
 
@@ -159,8 +159,8 @@ class TestThreadedScanReachesUI:
     async def test_worker_result_reaches_table_and_writes_nothing(self, tmp_path):
         from cockpit.panes.session_table import SessionTable
 
-        first = make_record(session_slug='thread-1', status=sr.Status.RUNNING)
-        sr.write_record(first, root=tmp_path)
+        first = make_record(session_slug='thread-1', status=session_records.Status.RUNNING)
+        session_records.write_record(first, root=tmp_path)
 
         # A large poll_interval keeps on_mount's own set_interval timer from
         # firing a second, uncontrolled worker mid-test -- the only scan
@@ -171,8 +171,8 @@ class TestThreadedScanReachesUI:
             table = app.query_one(SessionTable)
             assert table.row_count == 1
 
-            second = make_record(session_slug='thread-2', status=sr.Status.AWAITING_INPUT)
-            sr.write_record(second, root=tmp_path)
+            second = make_record(session_slug='thread-2', status=session_records.Status.AWAITING_INPUT)
+            session_records.write_record(second, root=tmp_path)
 
             before = snapshot_tree(tmp_path)
             # sanity: prove the snapshot actually captured the seeded files,
@@ -317,7 +317,7 @@ class TestALatePollCannotRegressAFresherScan:
     ):
         from cockpit.panes.session_table import SessionTable
 
-        sr.write_record(make_record(session_slug='r-1'), root=tmp_path)
+        session_records.write_record(make_record(session_slug='r-1'), root=tmp_path)
         reader = _HoldingDecisionsReader()
         app = CockpitApp(fleet_root=tmp_path, poll_interval=60, decisions_reader=reader)
         async with app.run_test() as pilot:
@@ -326,7 +326,7 @@ class TestALatePollCannotRegressAFresherScan:
             assert table.row_count == 1
 
             async with _poll_held_after_its_read(app, reader):
-                sr.write_record(make_record(session_slug='r-2'), root=tmp_path)
+                session_records.write_record(make_record(session_slug='r-2'), root=tmp_path)
                 app.refresh_registry()
                 await pilot.pause()
                 assert table.row_count == 2
@@ -334,7 +334,7 @@ class TestALatePollCannotRegressAFresherScan:
             await pilot.pause()
             assert table.row_count == 2, 'the late poll regressed the view'
 
-            sr.write_record(make_record(session_slug='r-3'), root=tmp_path)
+            session_records.write_record(make_record(session_slug='r-3'), root=tmp_path)
             app._poll_registry()
             await app.workers.wait_for_complete()
             await pilot.pause()
@@ -498,7 +498,7 @@ class TestInFlightScanCannotUndoAKeypressWrite:
             queue.move_cursor(row=queue.get_row_index('decision:dec-b'))
             await pilot.pause()
 
-            sr.write_record(make_record(session_slug='running-1'), root=tmp_path)
+            session_records.write_record(make_record(session_slug='running-1'), root=tmp_path)
             async with _poll_held_after_its_read(app, reader):
                 await pilot.press('b')
                 await pilot.pause()

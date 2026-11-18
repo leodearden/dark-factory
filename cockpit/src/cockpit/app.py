@@ -66,7 +66,7 @@ from orchestrator.decision_registry import (
 from orchestrator.fleet_files import (
     fleet_root as resolve_fleet_root,
 )
-from orchestrator.session_registry import SessionRecord, Status
+from orchestrator.session_records import SessionRecord, Status
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding

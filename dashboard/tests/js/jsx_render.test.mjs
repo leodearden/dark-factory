@@ -31,6 +31,7 @@ import {
 import { seedDashboardData } from './dom_harness.mjs';
 import {
   burndownBlock,
+  burndownProjectBlock,
   escalationAnalytics,
   escalationRow,
   escalationsPayload,
@@ -179,7 +180,7 @@ function seedBurndown(window, { alarm }) {
   seedDashboardData(window, {
     PROJECTS: [projectRow(PROJECT)],
     BURNDOWN: burndownBlock(vocab, AGGREGATE_SAMPLES, { ...verdict, projects: [PROJECT] }),
-    BURNDOWN_BY_PROJECT: { [PROJECT]: burndownBlock(vocab, PROJECT_SAMPLES, verdict) },
+    BURNDOWN_BY_PROJECT: { [PROJECT]: burndownProjectBlock(vocab, PROJECT_SAMPLES, AGGREGATE_SAMPLES, verdict) },
     __receipt: receiptsFor(window.DF_DATA_LOADER, ['BURNDOWN', 'PROJECTS']),
   });
 }
@@ -192,13 +193,16 @@ function statusMixPanel(container) {
   return panels[0];
 }
 
-// Each view: how to reach it, which block it draws, and the projects its call
-// site hands parityBannerState.
+// Each view: how to reach it, which block it draws, the sample labels its chart
+// lays that block over, and the projects its call site hands parityBannerState.
+// The project's labels are the union's newest PROJECT_SAMPLES, stated here from
+// the seed rather than through the label_spans decoder under test.
 const BURN_VIEWS = [
   {
     view: 'aggregate',
     show() {},
     block: window => window.DF_DATA.BURNDOWN,
+    sampleLabels: window => window.DF_DATA.BURNDOWN.labels,
     bannerProjects: window => window.DF_DATA.BURNDOWN.parity_projects,
   },
   {
@@ -209,6 +213,7 @@ const BURN_VIEWS = [
       click(window, button);
     },
     block: window => window.DF_DATA.BURNDOWN_BY_PROJECT[PROJECT],
+    sampleLabels: window => window.DF_DATA.BURNDOWN.labels.slice(AGGREGATE_SAMPLES - PROJECT_SAMPLES),
     bannerProjects: () => null,
   },
 ];
@@ -231,7 +236,7 @@ function filledPathColors(panel) {
   return [...panel.querySelectorAll('svg path')].map(path => path.getAttribute('fill')).filter(Boolean);
 }
 
-for (const { view, show, block, bannerProjects } of BURN_VIEWS) {
+for (const { view, show, block, sampleLabels, bannerProjects } of BURN_VIEWS) {
   test(`tabs.jsx::BurnTab ${view} view renders one legend entry per burndownLegend item`, t => {
     const harness = openWindow(t);
     seedBurndown(harness.window, { alarm: false });
@@ -261,9 +266,8 @@ for (const { view, show, block, bannerProjects } of BURN_VIEWS) {
     );
 
     const { fmtDateTime } = harness.window.DF_SHELL;
-    const { BURNDOWN, BURNDOWN_BY_PROJECT } = harness.window.DF_DATA;
-    const anySampleLabel = new Set([...BURNDOWN.labels, ...BURNDOWN_BY_PROJECT[PROJECT].labels].map(fmtDateTime));
-    const ownLabels = Array.from(block(harness.window).labels, fmtDateTime);
+    const anySampleLabel = new Set(Array.from(harness.window.DF_DATA.BURNDOWN.labels, fmtDateTime));
+    const ownLabels = Array.from(sampleLabels(harness.window), fmtDateTime);
     assert.deepEqual(
       [...panel.querySelectorAll('svg text')].map(text => text.textContent).filter(text => anySampleLabel.has(text)),
       ownLabels,
@@ -297,6 +301,42 @@ for (const { view, show, block, bannerProjects } of BURN_VIEWS) {
     assert.deepEqual([...panel.querySelectorAll('.badge.bad')], [], `the ${view} view rendered a parity banner with the alarm down`);
   });
 }
+
+function summaryTrendCell(container, projectId) {
+  const table = panelTitled(container, 'Per project · summary').querySelector('table');
+  const trendColumn = [...table.querySelectorAll('thead th')].findIndex(th => th.textContent === 'Trend');
+  assert.ok(trendColumn >= 0, 'the Per project summary table has no Trend column');
+  const row = [...table.querySelectorAll('tbody tr')].find(tr => tr.querySelector('td')?.textContent === projectId);
+  assert.ok(row, `the Per project summary table has no row for ${projectId}`);
+  return row.querySelectorAll('td')[trendColumn];
+}
+
+function pathData(root) {
+  return [...root.querySelectorAll('svg path')].map(path => path.getAttribute('d'));
+}
+
+// The Trend sparkline derives velocity from the project's done series over its
+// labels, and deriveVelocitySeries draws nothing for a missing or mismatched
+// label row, so only a call site that decoded label_spans draws this spark.
+test('tabs.jsx::BurnTab aggregate summary table draws each project Trend sparkline over its own labels', t => {
+  const harness = openWindow(t);
+  seedBurndown(harness.window, { alarm: false });
+  const { container } = harness.mount(harness.window.DF_TABS.BurnTab, BURN_PROPS);
+
+  const { Sparkline, PALETTE, deriveVelocitySeries, defaultSmoothingForWindow, smoothingLabelToSeconds } = harness.window.DF_CHARTS;
+  const ownLabels = harness.window.DF_DATA.BURNDOWN.labels.slice(AGGREGATE_SAMPLES - PROJECT_SAMPLES);
+  const smoothSecs = smoothingLabelToSeconds(defaultSmoothingForWindow(BURN_PROPS.displayWindow));
+  const velocity = deriveVelocitySeries(harness.window.DF_DATA.BURNDOWN_BY_PROJECT[PROJECT].done, ownLabels, smoothSecs);
+  assert.equal(velocity.length, PROJECT_SAMPLES, 'the seeded project must have a velocity sample per own label');
+  const expected = pathData(harness.mount(Sparkline, { values: velocity, color: PALETTE.accent }).container);
+  assert.ok(expected.length > 0, 'a Sparkline of the project velocity drew nothing, so a match proves nothing');
+
+  assert.deepEqual(
+    pathData(summaryTrendCell(container, PROJECT)),
+    expected,
+    `the ${PROJECT} Trend cell must draw the velocity of its ${PROJECT_SAMPLES} own samples`,
+  );
+});
 
 // ── Decision 3: the PINNING chip (pins_recovery.js::pinningBadgeState) ──
 // pins_recovery is three-state on the wire: true, false, or ABSENT (unknown).
