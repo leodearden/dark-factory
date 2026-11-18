@@ -354,7 +354,8 @@ archive is a rolling ~30 days; the metric needs 28. Metric: **records per finali
 each window. The denominator is the number of distinct tasks whose latest `_finalized_at`
 falls in the window, read from the same `plan.json` corpus; the mtime pre-filter stays valid,
 because finalizing writes the file. A window without a finalized plan fires no rate arm.
-Per-day means stay in the evidence as context only: a per-day rate rises with planning volume
+Plan-step records with no finalized plan anywhere in the corpus mean the plan read broke: the
+journal line names that break and is logged at WARNING. Per-day means stay in the evidence as context only: a per-day rate rises with planning volume
 alone. One rate-arm mechanism serves two kinds of arm. `rate-rise[<source>]`, one per record
 source, compares that source against its own baseline. It fires when the trailing 7-day
 per-plan rate exceeds `rate_rise_factor` (default 2.0) × the preceding 21 days' per-plan rate
@@ -376,7 +377,14 @@ task-keyed, a reused lane overwrote the previous task's plan) is neutralised by 
 normalisation: a lane overwrite deletes a plan's `_finalized_at` and its deviations in the same
 file, so the numerator and the denominator thin together. The escalation arm divides an
 archive-complete numerator by that thinned denominator, which inflates its baseline and can only
-suppress a fire. `Verdict(fire, reasons,
+suppress a fire. The 11-18 ruling's addendum (a) offered "per finalized plan, or per recording
+task" for the kind-pattern denominator too. Both were considered and declined: its denominator
+is the 7-day kinded records instead. A share is already invariant to planning volume, because
+doubling plans at a constant kind mix leaves every share unchanged, and that is the addendum's
+acceptance. On the 11-18 records, a share per recording task would fire (never_checked_fact in
+0.62 of 212 recording tasks, against a record share of 0.44). A per-plan figure would be a rate
+under a key named `pattern_share`. The share's real defect was pooling: kindless escalation
+records diluted it. `Verdict(fire, reasons,
 evidence)` is *modelled on* `census_trigger.Decision(fire, reasons)` — the `evidence` list
 is new, and is what carries the structured counts (INV-2 `structured-facts-at-failure`).
 

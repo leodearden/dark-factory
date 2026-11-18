@@ -1218,6 +1218,31 @@ def test_run_reports_plan_document_task_ids_not_directory_names(tmp_path):
     assert sorted(entry['task_id'] for entry in top['top_task_ids']) == ['9001', '9002']
 
 
+@pytest.mark.parametrize(
+    ('deviations', 'prefix'), [(1, _NO_FIRE_PREFIX), (12, _FIRE_PREFIX)], ids=['no-fire', 'fire'],
+)
+def test_run_plan_step_records_without_any_finalized_plan_warn_naming_the_break(
+    tmp_path, caplog, deviations, prefix,
+):
+    caplog.set_level(logging.DEBUG, logger=_LOGGER)
+    _write_plan(
+        _meta_root(tmp_path), '7002',
+        steps=[[
+            _deviation(recorded_at=NOW - timedelta(days=1, minutes=n), kind='wrong_inference')
+            for n in range(deviations)
+        ]],
+    )
+
+    line = _run(tmp_path, _FakeCallTool())
+
+    assert line.startswith(prefix)
+    assert (
+        f'reader break: {deviations} plan-step record(s) but no plan with a readable '
+        '_finalized_at' in line
+    )
+    assert [record.levelno for record in _census_records(caplog)] == [logging.WARNING]
+
+
 def test_run_reports_a_warming_up_source_in_a_firing_run(tmp_path):
     _write_positive_control(tmp_path)
     _write_escalation(tmp_path / 'data' / 'escalations', _escalation(

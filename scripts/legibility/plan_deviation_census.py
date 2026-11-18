@@ -800,18 +800,36 @@ def _census_line(
     verdict = evaluate(
         [*plan_corpus.records, *notes.records], plans=plan_corpus.plans, now=now, config=settings,
     )
-    summary = (
-        f'{"; ".join(verdict.reasons)}; corpus: {len(plan_corpus.records)} plan-step + '
-        f'{len(notes.records)} escalation record(s), {len(plan_corpus.plans)} finalized '
-        f'plan(s), {plan_corpus.skipped + notes.skipped} skipped'
-    )
+    reader_break = _reader_break(plan_corpus)
+    summary = '; '.join((
+        *verdict.reasons,
+        f'corpus: {len(plan_corpus.records)} plan-step + {len(notes.records)} escalation '
+        f'record(s), {len(plan_corpus.plans)} finalized plan(s), '
+        f'{plan_corpus.skipped + notes.skipped} skipped',
+        *(() if reader_break is None else (reader_break,)),
+    ))
     if not verdict.fire:
-        return f'{_LINE_PREFIX}: NO-FIRE -- {summary}', False
+        return f'{_LINE_PREFIX}: NO-FIRE -- {summary}', reader_break is not None
     disposition = _dispose(
         verdict, project_id=cfg.project_id, settings=settings, now=now,
         call_tool=call_tool, state_path=state_path,
     )
-    return f'{_LINE_PREFIX}: FIRE -- {summary}; {disposition.text}', disposition.degraded
+    return (
+        f'{_LINE_PREFIX}: FIRE -- {summary}; {disposition.text}',
+        disposition.degraded or reader_break is not None,
+    )
+
+
+def _reader_break(plan_corpus: CorpusRead) -> str | None:
+    """A deviation is recorded on a finalized plan, so plan-step records with
+    no finalized plan at all mean the plan read broke and every rate arm is
+    blind."""
+    if not plan_corpus.records or plan_corpus.plans:
+        return None
+    return (
+        f'reader break: {len(plan_corpus.records)} plan-step record(s) but no plan with a '
+        f'readable {_FINALIZED_AT_KEY}, so every rate arm is blind'
+    )
 
 
 def _dispose(
