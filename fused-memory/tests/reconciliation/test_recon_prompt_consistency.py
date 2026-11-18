@@ -52,8 +52,8 @@ def _stage1():
     return make_consolidator(project_id=PROJECT_ID, project_root=PROJECT_ROOT)
 
 
-def _stage2():
-    stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **_deps())
+def _stage2(project_id: str = PROJECT_ID):
+    stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **_deps(project_id))
     stage._current_run_id = 'test-run'
     return stage
 
@@ -119,3 +119,14 @@ def test_stage2_prompt_asks_for_no_git_history_or_working_tree(project_id):
 
     assert 'git log --all' not in prompt
     assert 'current working tree' not in prompt
+
+
+def test_no_stage_prompt_asks_for_the_retired_memories_written_counter():
+    stages = {
+        'stage1': _stage1(),
+        **{f'stage2_{pid}': _stage2(pid) for pid in ('dark_factory', 'autopilot_video')},
+        'stage3': IntegrityCheck(StageId.integrity_check, **_deps()),
+    }
+
+    for name, stage in stages.items():
+        assert 'memories_written' not in stage.get_system_prompt(), name
