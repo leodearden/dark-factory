@@ -17,6 +17,7 @@ from typing import Any
 
 import pytest
 import yaml
+from _config_overlay_files import calibration
 
 from fused_memory.config.overlay import (
     OVERLAY_ENV_VAR,
@@ -76,8 +77,6 @@ BASE_WRITE_TRIAGE = {
 }
 
 
-def _calibration(report: str, **cutoffs: float) -> dict[str, Any]:
-    return {'calibration_report_path': report, 't_high_by_category': dict(cutoffs)}
 
 
 class TestEmbedderMergesPerKey:
@@ -130,14 +129,14 @@ class TestProjectCalibrationsReplaceEachEntry:
     def test_an_overlaid_entry_replaces_its_base_entry_and_others_survive(
         self, monkeypatch, tmp_path,
     ):
-        base_b = _calibration('reports/b.json', observations=0.85)
-        overlay_a = _calibration('reports/a-granite.json', observations=0.7)
+        base_b = calibration('reports/b.json', observations=0.85)
+        overlay_a = calibration('reports/a-granite.json', observations=0.7)
         config = _load(
             monkeypatch,
             tmp_path,
             base={
                 'write_triage_project_calibrations': {
-                    'A': _calibration(
+                    'A': calibration(
                         'reports/a.json', observations=0.9, procedural_knowledge=0.8,
                     ),
                     'B': base_b,
@@ -212,7 +211,7 @@ class TestProvenance:
                 },
                 'write_triage': {'t_high': 0.8},
                 'write_triage_project_calibrations': {
-                    'A': _calibration('reports/a.json', observations=0.7),
+                    'A': calibration('reports/a.json', observations=0.7),
                 },
             },
         )
@@ -380,7 +379,7 @@ class TestKeysTheSchemaDoesNotKnowRefuse:
             (
                 {
                     'write_triage_project_calibrations': {
-                        'A': {**_calibration('reports/a.json', observations=0.7), 'typo': 1},
+                        'A': {**calibration('reports/a.json', observations=0.7), 'typo': 1},
                     },
                 },
                 ('write_triage_project_calibrations.A.typo',),

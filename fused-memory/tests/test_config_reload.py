@@ -13,7 +13,6 @@ not prose.
 from __future__ import annotations
 
 import asyncio
-import os
 import types
 from pathlib import Path
 from typing import Any
@@ -21,6 +20,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 import yaml
+from _config_overlay_files import calibration, write_overlay
 
 from fused_memory.config.overlay import OVERLAY_ENV_VAR
 from fused_memory.config.reload import (
@@ -1311,13 +1311,6 @@ _EMBEDDER_SPACE_LEAVES = (
 )
 
 
-def _calibration(report: str, observations: float) -> dict[str, Any]:
-    return {
-        'calibration_report_path': report,
-        't_high_by_category': {'observations': observations},
-    }
-
-
 class TestOverlayReloadNeverHalfApplies:
     """Embedder-space values reload only together with the embedder section.
 
@@ -1340,18 +1333,11 @@ class TestOverlayReloadNeverHalfApplies:
         monkeypatch.setenv('CONFIG_PATH', str(base))
         return types.SimpleNamespace(base=base, overlay=overlay)
 
-    @staticmethod
-    def _write_overlay(path: Path, data: dict[str, Any], mtime: int) -> None:
-        """Write the overlay with an explicit mtime, so two rewrites inside the
-        filesystem's timestamp granularity still carry distinct provenance."""
-        path.write_text(yaml.safe_dump(data))
-        os.utime(path, (mtime, mtime))
-
     @pytest.fixture
     def live_with_overlay_v1(self, files, monkeypatch):
-        self._write_overlay(files.overlay, {
+        write_overlay(files.overlay, {
             'write_triage': {'t_high': 0.85},
-            'write_triage_project_calibrations': {'A': _calibration('reports/a1.json', 0.8)},
+            'write_triage_project_calibrations': {'A': calibration('reports/a1.json', observations=0.8)},
         }, mtime=1_700_000_000)
         monkeypatch.setenv(OVERLAY_ENV_VAR, str(files.overlay))
         return FusedMemoryConfig()
@@ -1360,9 +1346,9 @@ class TestOverlayReloadNeverHalfApplies:
         self, files, live_with_overlay_v1,
     ):
         live = live_with_overlay_v1
-        self._write_overlay(files.overlay, {
+        write_overlay(files.overlay, {
             'write_triage': {'t_high': 0.8},
-            'write_triage_project_calibrations': {'A': _calibration('reports/a2.json', 0.7)},
+            'write_triage_project_calibrations': {'A': calibration('reports/a2.json', observations=0.7)},
         }, mtime=1_700_000_100)
         fresh = FusedMemoryConfig()
 
@@ -1380,10 +1366,10 @@ class TestOverlayReloadNeverHalfApplies:
     ):
         live = live_with_overlay_v1
         before = live.model_copy(deep=True)
-        self._write_overlay(files.overlay, {
+        write_overlay(files.overlay, {
             'embedder': {'model': 'granite-embedding', 'dimensions': 768},
             'write_triage': {'t_high': 0.8},
-            'write_triage_project_calibrations': {'A': _calibration('reports/a2.json', 0.7)},
+            'write_triage_project_calibrations': {'A': calibration('reports/a2.json', observations=0.7)},
         }, mtime=1_700_000_100)
         _edit_yaml(files.base, 'write_triage.candidate_k', 30)
         fresh = FusedMemoryConfig()
@@ -1404,10 +1390,10 @@ class TestOverlayReloadNeverHalfApplies:
     ):
         live = live_with_overlay_v1
         before = live.model_copy(deep=True)
-        self._write_overlay(files.overlay, {
+        write_overlay(files.overlay, {
             'embedder': {'providers': {'openai': {'api_url': 'http://embedder.local/v1'}}},
             'write_triage': {'t_high': 0.8},
-            'write_triage_project_calibrations': {'A': _calibration('reports/a2.json', 0.7)},
+            'write_triage_project_calibrations': {'A': calibration('reports/a2.json', observations=0.7)},
         }, mtime=1_700_000_100)
         fresh = FusedMemoryConfig()
         assert fresh.config_overlay is not None

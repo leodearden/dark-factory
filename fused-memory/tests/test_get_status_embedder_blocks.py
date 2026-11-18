@@ -7,7 +7,6 @@ service is an AsyncMock with a fixed backend status, holding a real
 ``FusedMemoryConfig`` built from temp base and overlay YAML.
 """
 
-import os
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
@@ -16,6 +15,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import yaml
+from _config_overlay_files import write_overlay
 from _mock_openai_server import MockOpenAIServer, mock_openai_server
 
 from fused_memory.config.overlay import OVERLAY_ENV_VAR
@@ -54,9 +54,7 @@ def base(tmp_path, monkeypatch, endpoint) -> Path:
 def _write_overlay(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, data: dict[str, Any], mtime: int,
 ) -> Path:
-    path = tmp_path / 'overlay.yaml'
-    path.write_text(yaml.safe_dump(data))
-    os.utime(path, (mtime, mtime))
+    path = write_overlay(tmp_path / 'overlay.yaml', data, mtime=mtime)
     monkeypatch.setenv(OVERLAY_ENV_VAR, str(path))
     return path
 
