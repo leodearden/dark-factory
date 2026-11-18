@@ -162,6 +162,7 @@ const NON_ERROR_THROWABLES = [
 // Every describer, with the label its text must carry (null: none to carry).
 const DESCRIBERS = [
   ['tab', (thrown) => tabRenderFailureNotice('Merge', thrown), 'Merge'],
+  ['tab on a stale page', (thrown) => tabRenderFailureNotice('Merge', thrown, true), 'Merge'],
   ['chrome', (thrown) => chromeRenderFailureNotice('toolbar', thrown), 'toolbar'],
   ['page', pageRenderFailureNotice, null],
 ];
@@ -280,3 +281,32 @@ for (const [describerName, describe] of DESCRIBERS) {
     assert.ok(Object.isFrozen(describe(new Error('x'))));
   });
 }
+
+// ── (g) a page running a different build from the server ───────────────────
+// Switching tabs re-renders the same stale JS, so the advice becomes a reload,
+// and only when the page's build differs from the server's (asset_skew.js).
+
+test('(g) a tab that threw on a page whose build differs from the server says to reload, not to switch tabs', () => {
+  const thrown = new TypeError("Cannot read properties of undefined (reading 'length')");
+
+  const notice = tabRenderFailureNotice('Burndown', thrown, true);
+
+  assertNoticeShape(notice);
+  assert.ok(notice.text.includes('Burndown'), notice.text);
+  assert.match(notice.text, /reload the page/i);
+  assert.match(notice.text, /different dashboard build/i);
+  assert.ok(!notice.text.includes('switch tabs'), notice.text);
+  assert.equal(notice.detail, tabRenderFailureNotice('Burndown', thrown).detail);
+});
+
+test('(g) with no build difference, or none stated, the tab notice is unchanged', () => {
+  const thrown = new TypeError('x');
+
+  const unstated = tabRenderFailureNotice('Burndown', thrown);
+
+  assert.deepEqual(tabRenderFailureNotice('Burndown', thrown, false), unstated);
+  for (const notTrue of [undefined, null, 'true', 1, {}]) {
+    assert.deepEqual(tabRenderFailureNotice('Burndown', thrown, notTrue), unstated, String(notTrue));
+  }
+  assert.ok(unstated.text.includes('switch tabs to retry this one'), unstated.text);
+});
