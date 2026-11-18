@@ -1,10 +1,11 @@
 """Regression-guard tests for _inject_plan_tools_mcp() wiring in workflow.py.
 
 Verifies the two genuinely new behaviors of _inject_plan_tools_mcp():
-1. _inject_plan_tools_mcp(None, worktree, task_root=...) creates an mcpServers dict with a
-   'plan-tools' entry equal to
+1. _inject_plan_tools_mcp(None, worktree, role, task_root=...) creates an mcpServers dict
+   with a 'plan-tools' entry equal to
    plan_tools_mcp_server(_ORCH_PROJECT_DIR, worktree, python_executable=sys.executable,
-   meta_root=_meta_root_for_worktree(worktree), task_root=task_root)
+   meta_root=_meta_root_for_worktree(worktree), task_root=task_root,
+   granted_tools=role.plan_tools_grants)
    (single source of truth — no-uv hot path + worktree propagation guaranteed
    transitively; task 1776).  The 'command' key must equal sys.executable (not 'uv').
 2. A pre-existing server entry (e.g. fused-memory) is preserved alongside the
@@ -20,6 +21,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+from orchestrator.agents.roles import IMPLEMENTER
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.mcp_lifecycle import plan_tools_mcp_server
 from orchestrator.workflow import (
@@ -61,12 +63,13 @@ class TestInjectPlanToolsMcp:
         meta_root=_meta_root_for_worktree(wt) (task 2258, W11-ε1)."""
 
         wt = Path('/wt')
-        out = _inject_plan_tools_mcp(None, wt, task_root=_TASK_ROOT)
+        out = _inject_plan_tools_mcp(None, wt, IMPLEMENTER, task_root=_TASK_ROOT)
 
         assert 'mcpServers' in out
         expected = plan_tools_mcp_server(
             _ORCH_PROJECT_DIR, wt, python_executable=sys.executable,
             meta_root=_meta_root_for_worktree(wt), task_root=_TASK_ROOT,
+            granted_tools=IMPLEMENTER.plan_tools_grants,
         )
         assert out['mcpServers']['plan-tools'] == expected
         # Explicit command assertion: must be the venv interpreter, not 'uv'.
@@ -78,7 +81,7 @@ class TestInjectPlanToolsMcp:
         orchestrator uses (task 3155)."""
 
         wt = Path('/base/wt')
-        out = _inject_plan_tools_mcp(None, wt, task_root=_TASK_ROOT)
+        out = _inject_plan_tools_mcp(None, wt, IMPLEMENTER, task_root=_TASK_ROOT)
 
         args = out['mcpServers']['plan-tools']['args']
         idx = args.index('--meta-root')
@@ -95,10 +98,21 @@ class TestInjectPlanToolsMcp:
                 'fused-memory': {'type': 'http', 'url': 'http://x/mcp'},
             },
         }
-        out = _inject_plan_tools_mcp(existing, Path('/wt'), task_root=_TASK_ROOT)
+        out = _inject_plan_tools_mcp(existing, Path('/wt'), IMPLEMENTER, task_root=_TASK_ROOT)
 
         assert 'fused-memory' in out['mcpServers'], (
             f"Expected 'fused-memory' preserved, got {list(out['mcpServers'])}"
         )
         assert out['mcpServers']['fused-memory'] == {'type': 'http', 'url': 'http://x/mcp'}
         assert 'plan-tools' in out['mcpServers']
+
+    def test_args_carry_one_grant_pair_per_granted_name(self):
+        """The role's plan-tools allowlist reaches the server as one
+        '--grant <name>' pair each, so it exposes nothing else (task 7717)."""
+
+        out = _inject_plan_tools_mcp(None, Path('/wt'), IMPLEMENTER, task_root=_TASK_ROOT)
+
+        args = out['mcpServers']['plan-tools']['args']
+        grants = [args[i + 1] for i, token in enumerate(args) if token == '--grant']
+        assert sorted(grants) == sorted(IMPLEMENTER.plan_tools_grants)
+        assert len(grants) == len(set(grants))

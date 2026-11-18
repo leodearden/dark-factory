@@ -14,8 +14,10 @@ from fastmcp import Client
 from fastmcp.exceptions import ToolError
 
 from orchestrator import mcp_lifecycle
+from orchestrator.agents.roles import ARCHITECT, DEBUGGER, IMPLEMENTER, ROLES, SIMPLE_TASK
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.mcp import plan_tools
+from orchestrator.workflow import compose_invocation_mcp_config
 
 _DEVIATION_ARGS = {
     'step_id': 'step-1', 'kind': 'wrong_inference', 'observed': 'o', 'expected': 'e',
@@ -130,3 +132,51 @@ def test_the_launcher_appends_sorted_grant_pairs_after_the_root_args(
 
     assert plain['args'][-2:] == ['--task-root', str(roots['task_root'])]
     assert granted['args'] == [*plain['args'], '--grant', 'a', '--grant', 'b']
+
+
+_PLAN_TOOLS_ROLES = [ARCHITECT, IMPLEMENTER, DEBUGGER, SIMPLE_TASK]
+_DEVIATION_RECORDERS = frozenset({IMPLEMENTER.name, DEBUGGER.name})
+_PLAN_TOOLS_PREFIX = 'mcp__plan-tools__'
+
+
+def test_the_plan_tools_family_is_exactly_the_roles_tested_here():
+    assert sorted(
+        role.name for role in ROLES.values() if 'plan_tools' in role.mcp_families
+    ) == sorted(role.name for role in _PLAN_TOOLS_ROLES)
+
+
+@pytest.mark.parametrize('role', _PLAN_TOOLS_ROLES, ids=lambda role: role.name)
+def test_a_roles_grant_is_its_plan_tools_allowlist(role):
+    assert role.plan_tools_grants == {
+        tool.removeprefix(_PLAN_TOOLS_PREFIX)
+        for tool in role.allowed_tools if tool.startswith(_PLAN_TOOLS_PREFIX)
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('role', _PLAN_TOOLS_ROLES, ids=lambda role: role.name)
+async def test_a_dispatch_exposes_exactly_its_roles_plan_tools_allowlist(tmp_path, role):
+    worktree = tmp_path / '.worktrees' / '_lane-3'
+    worktree.mkdir(parents=True)
+    artifacts = TaskArtifacts.for_task(worktree, '42')
+    artifacts.init('42', 'X', 'desc')
+    await _seed_plan(artifacts)
+    config = compose_invocation_mcp_config(
+        role, mcp=None, escalation_url=None, cwd=worktree, task_root=artifacts.task_root,
+        strict_mcp_config=False,
+    )
+    assert config is not None
+    args = config['mcpServers']['plan-tools']['args']
+    launch = args.index('orchestrator.mcp.plan_tools')
+    assert args[launch - 1] == '-m'
+    server = plan_tools.server_from_argv(args[launch + 1:])
+
+    assert await _listed(server) == sorted(role.plan_tools_grants)
+    async with Client(server) as client:
+        if role.name in _DEVIATION_RECORDERS:
+            result = await client.call_tool('record_step_deviation', _DEVIATION_ARGS)
+            assert result.data['status'] == 'ok'
+        else:
+            with pytest.raises(ToolError, match='Unknown tool'):
+                await client.call_tool('record_step_deviation', _DEVIATION_ARGS)
+    assert len(_step_deviations(artifacts)) == (role.name in _DEVIATION_RECORDERS)
