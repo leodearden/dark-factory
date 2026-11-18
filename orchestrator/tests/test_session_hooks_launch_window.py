@@ -341,8 +341,8 @@ def test_owner_stop_is_not_withheld_from_a_still_launching_record(
     # Ruling item 4-iii. The launch-window withholding suppressed status AND
     # the pending question for EVERY event, including the legitimate
     # owner's. A SessionStart killed by _HOOK_TIMEOUT_SECS (reachable:
-    # _resolve_wm_window_id's own docstring prices the pathological wmctrl
-    # case at ~10.8s against a 10s budget) writes nothing, so the record
+    # session_windows.py::resolve_window_id_by_title's docstring prices the
+    # pathological wmctrl case at ~10.8s against a 10s budget) writes nothing, so the record
     # stays LAUNCHING+unbound and the session went invisible for its whole
     # life. An event whose OWNER_PPID matches must write.
     slug = 'session-cockpit-4193004'
