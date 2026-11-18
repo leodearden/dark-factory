@@ -16,6 +16,7 @@ from _curator_helpers import (
     agent_result,
     answer_each_with,
     curator_always,
+    curator_double,
     prepared,
     submit_as_one_batch,
     zot_agent_result,
@@ -2171,8 +2172,8 @@ async def test_concurrent_add_task_produces_single_task(
         event_buffer,
         config=curator_enabled_config,
         ticket_store=store,
+        curator=real_curator,
     )
-    interceptor._curator = real_curator
 
     # Give each add_task its own unique task_id. First call creates '100',
     # second (if it ever reaches tm.add_task) would create '101'.
@@ -2397,7 +2398,7 @@ async def test_remove_tasks_multi_id_emits_one_event_per_id(
 
 
 @pytest.mark.asyncio
-async def test_remove_tasks_evicts_curator_vectors(interceptor, taskmaster):
+async def test_remove_tasks_evicts_curator_vectors(taskmaster, reconciler, event_buffer):
     """remove_tasks() evicts each removed task's vector from the curator
     corpus (Layer A witness-eviction — curator corpus RC1, task 2520)."""
     taskmaster.remove_tasks = AsyncMock(
@@ -2408,15 +2409,14 @@ async def test_remove_tasks_evicts_curator_vectors(interceptor, taskmaster):
             'message': 'ok',
         }
     )
-    mock_curator = AsyncMock()
-    mock_curator.evict_task = AsyncMock()
-    interceptor._get_curator = AsyncMock(return_value=mock_curator)
+    curator = curator_double()
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer, curator=curator)
 
     result = await interceptor.remove_tasks(['5', '6'], '/project')
 
-    assert mock_curator.evict_task.await_count == 2
-    mock_curator.evict_task.assert_any_await('project', '5')
-    mock_curator.evict_task.assert_any_await('project', '6')
+    assert curator.evict_task.await_count == 2
+    curator.evict_task.assert_any_await('project', '5')
+    curator.evict_task.assert_any_await('project', '6')
     assert result == {
         'successful': 2,
         'failed': 0,
@@ -2426,7 +2426,9 @@ async def test_remove_tasks_evicts_curator_vectors(interceptor, taskmaster):
 
 
 @pytest.mark.asyncio
-async def test_remove_tasks_succeeds_when_eviction_raises(interceptor, taskmaster):
+async def test_remove_tasks_succeeds_when_eviction_raises(
+    taskmaster, reconciler, event_buffer,
+):
     """A curator eviction error must not fail the removal itself."""
     taskmaster.remove_tasks = AsyncMock(
         return_value={
@@ -2436,9 +2438,9 @@ async def test_remove_tasks_succeeds_when_eviction_raises(interceptor, taskmaste
             'message': 'ok',
         }
     )
-    mock_curator = AsyncMock()
-    mock_curator.evict_task = AsyncMock(side_effect=RuntimeError('boom'))
-    interceptor._get_curator = AsyncMock(return_value=mock_curator)
+    curator = curator_double()
+    curator.evict_task = AsyncMock(side_effect=RuntimeError('boom'))
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer, curator=curator)
 
     result = await interceptor.remove_tasks(['9'], '/project')
 
@@ -2452,30 +2454,29 @@ async def test_remove_tasks_succeeds_when_eviction_raises(interceptor, taskmaste
 
 @pytest.mark.asyncio
 async def test_remove_tasks_evicts_using_ids_when_removed_ids_missing(
-    interceptor, taskmaster,
+    taskmaster, reconciler, event_buffer,
 ):
     """When the backend result omits 'removed_ids', eviction falls back to
     the originally requested ids (`result.get('removed_ids') or ids`)."""
     taskmaster.remove_tasks = AsyncMock(
         return_value={'successful': 2, 'failed': 0, 'message': 'ok'}
     )
-    mock_curator = AsyncMock()
-    mock_curator.evict_task = AsyncMock()
-    interceptor._get_curator = AsyncMock(return_value=mock_curator)
+    curator = curator_double()
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer, curator=curator)
 
     result = await interceptor.remove_tasks(['3', '4'], '/project')
 
-    assert mock_curator.evict_task.await_count == 2
-    mock_curator.evict_task.assert_any_await('project', '3')
-    mock_curator.evict_task.assert_any_await('project', '4')
+    assert curator.evict_task.await_count == 2
+    curator.evict_task.assert_any_await('project', '3')
+    curator.evict_task.assert_any_await('project', '4')
     assert result == {'successful': 2, 'failed': 0, 'message': 'ok'}
 
 
 @pytest.mark.asyncio
 async def test_remove_tasks_succeeds_without_curator(interceptor, taskmaster):
-    """When no curator is configured (_get_curator() returns None — the
-    default `interceptor` fixture has no curator config, so this is exercised
-    without patching), removal still succeeds and no eviction is attempted."""
+    """When the interceptor holds no curator (the default `interceptor`
+    fixture injects none and has no curator config), removal still succeeds
+    and no eviction is attempted."""
     taskmaster.remove_tasks = AsyncMock(
         return_value={
             'successful': 1,
@@ -6318,6 +6319,9 @@ async def test_get_curator_schedules_startup_self_check(
     Scheduled as a background task, alongside the backfill check, so a curator
     construction is never delayed by a PATH lookup — and so a self-check that
     somehow misbehaves cannot take add_task down with it.
+
+    Calls the private ``_get_curator`` directly because its lazy build is the
+    subject; an injected curator would bypass it.
     """
     cfg = FusedMemoryConfig()
     cfg.taskmaster = TaskmasterConfig(project_root=str(tmp_path))
@@ -6353,6 +6357,11 @@ def _config_without_curator_startup_tasks() -> FusedMemoryConfig:
 async def test_get_curator_forwards_the_borrowed_cost_store(
     taskmaster, reconciler, event_buffer,
 ):
+    """The lazily built curator borrows the interceptor's usage gate and cost store.
+
+    Calls the private ``_get_curator`` directly because its lazy build is the
+    subject; an injected curator would bypass it.
+    """
     gate = MagicMock()
     store = MagicMock()
     interceptor = TaskInterceptor(
@@ -6372,6 +6381,11 @@ async def test_get_curator_forwards_the_borrowed_cost_store(
 async def test_get_curator_forwards_no_cost_store_by_default(
     taskmaster, reconciler, event_buffer,
 ):
+    """With no cost store given, the lazily built curator gets none.
+
+    Calls the private ``_get_curator`` directly because its lazy build is the
+    subject; an injected curator would bypass it.
+    """
     interceptor = TaskInterceptor(
         taskmaster, reconciler, event_buffer, config=_config_without_curator_startup_tasks(),
     )
@@ -6857,13 +6871,6 @@ async def test_set_task_status_does_not_block_during_add_task_curator(
 
     store = TicketStore(tmp_path / 'split_lock_tickets.db')
     await store.initialize()
-    interceptor = TaskInterceptor(
-        taskmaster,
-        reconciler,
-        event_buffer,
-        config=curator_enabled_config,
-        ticket_store=store,
-    )
 
     # Bumped from 2.0s to widen the absolute discrimination gap between the
     # status_elapsed budget below and CURATOR_LATENCY_S*0.9, giving more
@@ -6878,15 +6885,19 @@ async def test_set_task_status_does_not_block_during_add_task_curator(
             justification='ok',
         )
 
-    curator = MagicMock()
+    curator = curator_double()
     # The per-candidate verdict, so slow_curate is invoked and the
     # latency-based assertion holds.
     curator.curate = AsyncMock(side_effect=slow_curate)
     answer_each_with(curator, curator.curate)
-    curator.record_task = AsyncMock()
-    curator.reembed_task = AsyncMock()
-    curator.note_created = MagicMock()
-    interceptor._curator = curator
+    interceptor = TaskInterceptor(
+        taskmaster,
+        reconciler,
+        event_buffer,
+        config=curator_enabled_config,
+        ticket_store=store,
+        curator=curator,
+    )
 
     start = asyncio.get_event_loop().time()
 
@@ -15905,15 +15916,17 @@ class TestZotDuplicateSweepWithoutOrchestrator:
         project_id = resolve_project_id(project_root)
         taskmaster.add_task = AsyncMock(return_value={'id': _NEW_TASK_ID, 'title': 'Re-filed'})
         taskmaster.get_statuses = AsyncMock(return_value={_DUP_TASK_ID: 'pending'})
+        curator = await self._build_curator(project_id)
         interceptor = TaskInterceptor(
             taskmaster, reconciler, event_buffer,
             config=_curator_cfg(), ticket_store=ticket_store, escalator=CuratorEscalator(),
+            curator=curator,
         )
-        yield interceptor, project_root, project_id
+        yield interceptor, project_root
         await interceptor.close()
 
     @staticmethod
-    async def _install_curator(interceptor, project_id: str):
+    async def _build_curator(project_id: str) -> TaskCurator:
         """A real curator whose LLM hangs and whose escalator finds no orchestrator.
 
         The corpus is the scored fake, so the sweep finds the existing task.
@@ -15931,7 +15944,7 @@ class TestZotDuplicateSweepWithoutOrchestrator:
         curator.prepare_candidate = AsyncMock(side_effect=bundle_for)
         curator.record_task = corpus.record_task
         curator.search_corpus = corpus.search_corpus
-        interceptor._curator = curator
+        return curator
 
     @staticmethod
     async def _assert_stamped_but_not_escalated(taskmaster, ticket_store, ticket_id, project_root):
@@ -15945,8 +15958,7 @@ class TestZotDuplicateSweepWithoutOrchestrator:
 
     @pytest.mark.asyncio
     async def test_the_worker_path(self, setup, taskmaster, ticket_store):
-        interceptor, project_root, project_id = setup
-        await self._install_curator(interceptor, project_id)
+        interceptor, project_root = setup
 
         submitted = await interceptor.submit_task(
             project_root, title='Re-filed gate fix', description='same fix again',
