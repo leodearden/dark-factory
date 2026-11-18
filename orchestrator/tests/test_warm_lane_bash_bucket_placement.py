@@ -47,7 +47,7 @@ from pathlib import Path
 
 import pytest
 from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT
-from test_warm_lane_bash_suite import PORTED_TESTS
+from test_warm_lane_bash_suite import BASH_SUITES
 
 from orchestrator.config import LaneCommand, OrchestratorConfig
 
@@ -64,12 +64,12 @@ DF_CONFIG_PATH = REPO_ROOT / 'dark-factory-orchestrator.yaml'
 #: The marker whose placement this module governs.
 BUCKET = 'warm_lane_bash'
 
-#: Items in ``test_warm_lane_bash_suite.py`` that are NOT one-per-ported-script:
+#: Items in ``test_warm_lane_bash_suite.py`` that are NOT one-per-bash-suite:
 #: ``test_manifest_matches_disk``, ``test_required_host_tools_are_present``,
 #: ``test_script_dir_resolution_ignores_the_env_override`` and
 #: ``test_every_invocable_script_has_ported_coverage``.  Held separately so the
-#: expected collection count tracks ``PORTED_TESTS`` automatically when PRD
-#: leaves δ/δ2/ε add ports, rather than going stale as a hard-coded total.
+#: expected collection count tracks ``BASH_SUITES`` automatically when a bash
+#: suite is added, rather than going stale as a hard-coded total.
 STRUCTURAL_GUARD_ITEMS = 4
 
 #: Environment keys stripped from the collection probe's subprocess.
@@ -288,11 +288,11 @@ def test_the_configured_lane_command_actually_collects_the_bucket(
         line for line in proc.stdout.splitlines()
         if 'test_warm_lane_bash_suite.py::' in line
     ]
-    expected = len(PORTED_TESTS) + STRUCTURAL_GUARD_ITEMS
+    expected = len(BASH_SUITES) + STRUCTURAL_GUARD_ITEMS
     assert len(collected) == expected, (
         f'lane entry {entry.name!r} collected {len(collected)} items from the '
         f'warm-lane driver, expected {expected} '
-        f'({len(PORTED_TESTS)} ported scripts + {STRUCTURAL_GUARD_ITEMS} '
+        f'({len(BASH_SUITES)} bash suites + {STRUCTURAL_GUARD_ITEMS} '
         f'structural guards). A zero here is the silent-no-coverage failure '
         f'this module exists to catch; a mismatch means the driver grew or lost '
         f'items and STRUCTURAL_GUARD_ITEMS needs a deliberate update.\n{context}'

@@ -437,11 +437,11 @@ print(render_protect_glob(default_protected_prefixes(band), owned=sys.argv[1:]))
 # systemd timer, for no behaviour change; it is deliberately not a caller.
 #
 # The `||` contract above is therefore an OBSERVED behaviour now, not a claim:
-# Block X-degrade in orchestrator/tests/warm-lane/test_warm_lane_gc.sh drives a
-# RELOCATED copy of gc.sh whose resolved repo root carries no dark-factory
-# checkout, so this function really does return non-zero there, and the block
-# asserts that gc.sh — which runs `set -euo pipefail` — degrades to
-# LANE_PROTECT_GLOB_FALLBACK with exactly one [warn] instead of aborting its
+# Block X-degrade in orchestrator/tests/warm-lane/test_warm_lane_gc_native.sh
+# drives a RELOCATED copy of gc.sh whose resolved repo root carries no
+# dark-factory checkout, so this function really does return non-zero there,
+# and the block asserts that gc.sh — which runs `set -euo pipefail` — degrades
+# to LANE_PROTECT_GLOB_FALLBACK with exactly one [warn] instead of aborting its
 # sweep. A future caller that FORGETS the `||` still aborts; that hazard is
 # unchanged, it is just no longer unexercised in-tree.
 lane_protect_glob() {
