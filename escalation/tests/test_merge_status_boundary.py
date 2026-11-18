@@ -607,6 +607,160 @@ _UNBLOCK_SKILL = 'skills/unblock/SKILL.md'
 _UNBLOCK_LOW_RISK_SKILL = 'skills/unblock-low-risk/SKILL.md'
 _CONSUMER_SKILLS = frozenset({_MERGE_QUEUE_SKILL, _UNBLOCK_SKILL, _UNBLOCK_LOW_RISK_SKILL})
 _SHARED_SWITCH = 'skills/_shared/merge-status-reasons.md'
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _read(relative_path: str) -> str:
+    return (_REPO_ROOT / relative_path).read_text(encoding='utf-8')
+
+
+def _load_alpha_guard() -> ModuleType:
+    """A private copy of alpha's guard module, never registered in sys.modules."""
+    path = _REPO_ROOT / 'scripts' / 'tests' / 'test_merge_state_vocabulary_consistency.py'
+    spec = importlib.util.spec_from_file_location('_merge_state_guard_for_b9', path)
+    assert spec is not None and spec.loader is not None, path
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.fixture(scope='module')
+def alpha_guard() -> ModuleType:
+    return _load_alpha_guard()
+
+
+#: The closed disposition vocabulary a route span or switch row states, in bold.
+_DISPOSITIONS = (
+    'WAIT', 'ACCEPT', 'REPORT', 'RESUBMIT', 'FOLLOW THE MEMBERS', 'ABORT', 'HAND OFF',
+    'VERIFY', 'NOT IN FLIGHT HERE', 'FAIL CLOSED',
+)
+_DISPOSITION_RE = re.compile(r'\*\*(' + '|'.join(map(re.escape, _DISPOSITIONS)) + r')\*\*')
+_ROUTABLE_PARTITIONS: Mapping[str, frozenset[MergeState]] = MappingProxyType({
+    'LIVE_STATES': LIVE_STATES,
+})
+_SWITCH_ROW_RE = re.compile(r'^\|\s*`([a-z_]+)`\s*\|')
+
+
+def _families(guard: ModuleType) -> tuple[Any, Any]:
+    """The route and switch span families, built from *guard*'s own SpanFamily."""
+    route = guard.SpanFamily(
+        begin='merge-status-route:begin',
+        end='merge-status-route:end',
+        name_re=re.compile(r'answer=([A-Za-z_]+(?:,[A-Za-z_]+)*)(?=\s|-->|$)'),
+        known_names=None,
+        registry='`_CONSUMER_SKILLS` in escalation/tests/test_merge_status_boundary.py',
+    )
+    switch = guard.SpanFamily(
+        begin='merge-status-switch:begin',
+        end='merge-status-switch:end',
+        name_re=re.compile(r'of=([A-Z][A-Z0-9_]*)'),
+        known_names=frozenset({'MERGE_REASONS'}),
+        registry='`_SHARED_SWITCH` in escalation/tests/test_merge_status_boundary.py',
+    )
+    return route, switch
+
+
+def _single_disposition(text: str, *, source: str, where: str) -> str:
+    found = sorted(set(_DISPOSITION_RE.findall(text)))
+    assert len(found) == 1, (
+        f'{source}: {where} must state exactly one bold disposition of '
+        f'{list(_DISPOSITIONS)}; found {found}'
+    )
+    return found[0]
+
+
+def _switch_in(guard: ModuleType, text: str, *, source: str) -> dict[MergeReason, str]:
+    """The shared switch's action class for every MergeReason, one table row each."""
+    _, switch_family = _families(guard)
+    spans = guard.extract_spans(text, source=source, family=switch_family)
+    assert len(spans) == 1, f'{source}: {len(spans)} merge-status-switch spans; exactly one expected'
+    (_, body), = spans
+    actions: dict[MergeReason, list[str]] = {}
+    for line in body.splitlines():
+        match = _SWITCH_ROW_RE.match(line)
+        if match is None or match.group(1) not in MERGE_REASONS:
+            continue
+        reason = MergeReason(match.group(1))
+        actions.setdefault(reason, []).append(
+            _single_disposition(line, source=source, where=f'the switch row for {reason}'),
+        )
+    missing = sorted(MERGE_REASONS - actions.keys())
+    duplicated = sorted(reason for reason, found in actions.items() if len(found) > 1)
+    assert not missing and not duplicated, (
+        f'{source}: the merge-status-switch table needs exactly one row per MERGE_REASONS '
+        f'member; missing {missing}, duplicated {duplicated}'
+    )
+    return {reason: found for reason, (found,) in actions.items()}
+
+
+def _state_keys(state: MergeState) -> frozenset[str]:
+    """The route keys a reason-less answer consults: its state and each routable partition holding it."""
+    return frozenset({state, *(name for name, states in _ROUTABLE_PARTITIONS.items() if state in states)})
+
+
+def _reason_keys(switch: Mapping[MergeReason, str], reason: MergeReason) -> frozenset[str]:
+    """The route keys an answer carrying *reason* consults: the reason and its switch action class."""
+    return frozenset({reason, switch[reason]})
+
+
+def _candidates(
+    switch: Mapping[MergeReason, str], state: MergeState, reason: MergeReason | None,
+) -> frozenset[str]:
+    """The route keys that answer (state, reason)."""
+    return _state_keys(state) if reason is None else _reason_keys(switch, reason)
+
+
+def _routable_keys(switch: Mapping[MergeReason, str]) -> frozenset[str]:
+    """Every route key some merge_status answer consults.
+
+    Only an outcome state is answered without a reason; every epistemic state carries
+    one (shared/src/shared/merge_state.py::MergeReason), so it is routed by that reason.
+    """
+    return frozenset().union(
+        *map(_state_keys, OUTCOME_STATES),
+        *(_reason_keys(switch, reason) for reason in MergeReason),
+    )
+
+
+def _routes_in(
+    guard: ModuleType, text: str, switch: Mapping[MergeReason, str], *, source: str,
+) -> dict[str, str]:
+    """Every merge-status-route key in *text*, mapped to its span's disposition."""
+    route_family, _ = _families(guard)
+    routable = _routable_keys(switch)
+    routes: dict[str, str] = {}
+    for keys, body in guard.extract_spans(text, source=source, family=route_family):
+        where = f'the route span answer={keys}'
+        disposition = _single_disposition(body, source=source, where=where)
+        for key in keys.split(','):
+            assert key in routable, (
+                f'{source}: {where} routes {key!r}, which no merge_status answer consults. '
+                f'A route key is an outcome state, a routable partition '
+                f'{sorted(_ROUTABLE_PARTITIONS)}, a MergeReason value or a switch action '
+                f'class {sorted(set(switch.values()))}; an epistemic state always carries '
+                f'a reason and is routed by it'
+            )
+            assert key not in routes, f'{source}: {where} routes {key!r} a second time'
+            routes[key] = disposition
+    return routes
+
+
+def _resolve(
+    routes: Mapping[str, str],
+    switch: Mapping[MergeReason, str],
+    state: MergeState,
+    reason: MergeReason | None,
+    *,
+    source: str,
+) -> str:
+    """The disposition of the one route key that answers (state, reason)."""
+    candidates = _candidates(switch, state, reason)
+    matched = sorted(key for key in candidates if key in routes)
+    assert len(matched) == 1, (
+        f'{source}: state={state!s}, reason={reason!s} must be routed by exactly one of '
+        f'{sorted(candidates)}; routed by {matched}'
+    )
+    return routes[matched[0]]
 
 
 def _per_skill(*, merge_queue: str, unblock: str, unblock_low_risk: str) -> Mapping[str, str]:
@@ -644,10 +798,6 @@ _CONSUMER_BRANCHES = (
 )
 
 
-def _read(relative_path: str) -> str:
-    return (_REPO_ROOT / relative_path).read_text(encoding='utf-8')
-
-
 @pytest.mark.parametrize(
     ('row', 'state', 'reason', 'expected'),
     [pytest.param(*branch, id=branch[0]) for branch in _CONSUMER_BRANCHES],
@@ -667,7 +817,8 @@ async def test_consumer_skill_branches_on_the_server_answer(
     switch = _switch_in(alpha_guard, _read(_SHARED_SWITCH), source=_SHARED_SWITCH)
     dispositions = {
         skill: _resolve(
-            _routes_in(alpha_guard, _read(skill), source=skill), switch, state, reason, source=skill,
+            _routes_in(alpha_guard, _read(skill), switch, source=skill),
+            switch, state, reason, source=skill,
         )
         for skill in sorted(_CONSUMER_SKILLS)
     }
@@ -675,122 +826,41 @@ async def test_consumer_skill_branches_on_the_server_answer(
     assert dispositions == dict(expected), row
 
 
+async def test_every_route_a_consumer_skill_carries_is_checked_by_a_row(
+    alpha_guard: ModuleType,
+) -> None:
+    switch = _switch_in(alpha_guard, _read(_SHARED_SWITCH), source=_SHARED_SWITCH)
+    checked = frozenset().union(
+        *(_candidates(switch, state, reason) for _, state, reason, _ in _CONSUMER_BRANCHES),
+    )
+
+    unchecked = {
+        skill: keys
+        for skill in sorted(_CONSUMER_SKILLS)
+        if (keys := sorted(set(_routes_in(alpha_guard, _read(skill), switch, source=skill)) - checked))
+    }
+
+    assert not unchecked, (
+        f'route keys no _CONSUMER_BRANCHES row consults, by skill: {unchecked}. Such a '
+        f'span looks pinned but is checked by nothing: add a row whose answer consults '
+        f'the key, or unwrap the span'
+    )
+
+
 async def test_every_scene_has_a_consumer_row() -> None:
     assert {row for row, *_ in _CONSUMER_BRANCHES} == set(_SCENES)
 
 
-#: The closed disposition vocabulary a route span or switch row states, in bold.
-_DISPOSITIONS = (
-    'WAIT', 'ACCEPT', 'REPORT', 'RESUBMIT', 'FOLLOW THE MEMBERS', 'ABORT', 'HAND OFF',
-    'VERIFY', 'NOT IN FLIGHT HERE', 'FAIL CLOSED',
-)
-_DISPOSITION_RE = re.compile(r'\*\*(' + '|'.join(map(re.escape, _DISPOSITIONS)) + r')\*\*')
-_ROUTABLE_PARTITIONS: Mapping[str, frozenset[MergeState]] = MappingProxyType({
-    'LIVE_STATES': LIVE_STATES,
-})
-_ROUTE_KEYS = frozenset({
-    *(str(state) for state in MergeState),
-    *(str(reason) for reason in MergeReason),
-    *_ROUTABLE_PARTITIONS,
-    *(disposition for disposition in _DISPOSITIONS if ' ' not in disposition),
-})
-_SWITCH_ROW_RE = re.compile(r'^\|\s*`([a-z_]+)`\s*\|')
-
-
-def _families(guard: ModuleType) -> tuple[Any, Any]:
-    """The route and switch span families, built from *guard*'s own SpanFamily."""
-    route = guard.SpanFamily(
-        begin='merge-status-route:begin',
-        end='merge-status-route:end',
-        name_re=re.compile(r'answer=([A-Za-z_]+(?:,[A-Za-z_]+)*)'),
-        known_names=None,
-    )
-    switch = guard.SpanFamily(
-        begin='merge-status-switch:begin',
-        end='merge-status-switch:end',
-        name_re=re.compile(r'of=([A-Z][A-Z0-9_]*)'),
-        known_names=frozenset({'MERGE_REASONS'}),
-    )
-    return route, switch
-
-
-def _single_disposition(text: str, *, source: str, where: str) -> str:
-    found = sorted(set(_DISPOSITION_RE.findall(text)))
-    assert len(found) == 1, (
-        f'{source}: {where} must state exactly one bold disposition of '
-        f'{list(_DISPOSITIONS)}; found {found}'
-    )
-    return found[0]
-
-
-def _routes_in(guard: ModuleType, text: str, *, source: str) -> dict[str, str]:
-    """Every merge-status-route key in *text*, mapped to its span's disposition."""
-    route_family, _ = _families(guard)
-    routes: dict[str, str] = {}
-    for keys, body in guard.extract_spans(text, source=source, family=route_family):
-        where = f'the route span answer={keys}'
-        disposition = _single_disposition(body, source=source, where=where)
-        for key in keys.split(','):
-            assert key in _ROUTE_KEYS, (
-                f'{source}: {where} routes {key!r}, which is no MergeState or MergeReason '
-                f'value, routable partition {sorted(_ROUTABLE_PARTITIONS)} or switch class'
-            )
-            assert key not in routes, f'{source}: {where} routes {key!r} a second time'
-            routes[key] = disposition
-    return routes
-
-
-def _switch_in(guard: ModuleType, text: str, *, source: str) -> dict[MergeReason, str]:
-    """The shared switch's action class for every MergeReason, one table row each."""
-    _, switch_family = _families(guard)
-    spans = guard.extract_spans(text, source=source, family=switch_family)
-    assert len(spans) == 1, f'{source}: {len(spans)} merge-status-switch spans; exactly one expected'
-    (_, body), = spans
-    actions: dict[MergeReason, list[str]] = {}
-    for line in body.splitlines():
-        match = _SWITCH_ROW_RE.match(line)
-        if match is None or match.group(1) not in MERGE_REASONS:
-            continue
-        reason = MergeReason(match.group(1))
-        actions.setdefault(reason, []).append(
-            _single_disposition(line, source=source, where=f'the switch row for {reason}'),
-        )
-    missing = sorted(MERGE_REASONS - actions.keys())
-    duplicated = sorted(reason for reason, found in actions.items() if len(found) > 1)
-    assert not missing and not duplicated, (
-        f'{source}: the merge-status-switch table needs exactly one row per MERGE_REASONS '
-        f'member; missing {missing}, duplicated {duplicated}'
-    )
-    return {reason: found for reason, (found,) in actions.items()}
-
-
-def _resolve(
-    routes: Mapping[str, str],
-    switch: Mapping[MergeReason, str],
-    state: MergeState,
-    reason: MergeReason | None,
-    *,
-    source: str,
-) -> str:
-    """The disposition of the one route key that answers (state, reason)."""
-    if reason is None:
-        candidates = {state, *(name for name, states in _ROUTABLE_PARTITIONS.items() if state in states)}
-    else:
-        candidates = {reason, switch[reason]}
-    matched = sorted(key for key in candidates if key in routes)
-    assert len(matched) == 1, (
-        f'{source}: state={state!s}, reason={reason!s} must be routed by exactly one of '
-        f'{sorted(candidates)}; routed by {matched}'
-    )
-    return routes[matched[0]]
-
-
-@pytest.fixture(scope='module')
-def alpha_guard() -> ModuleType:
-    return _load_alpha_guard()
-
-
 _FIXTURE_SKILL = 'fixture-skill.md'
+
+_FIXTURE_SWITCH: Mapping[MergeReason, str] = MappingProxyType({
+    MergeReason.probe_failed: 'WAIT',
+    MergeReason.journaled_not_live: 'WAIT',
+    MergeReason.prior_run_terminal: 'REPORT',
+    MergeReason.never_submitted: 'NOT IN FLIGHT HERE',
+    MergeReason.coalesce_train_id: 'FOLLOW THE MEMBERS',
+    MergeReason.landing_unattributable: 'VERIFY',
+})
 
 _ROUTES_GREEN = """\
 <!-- merge-status-route:begin answer=LIVE_STATES,WAIT -->
@@ -831,9 +901,27 @@ _ROUTES_UNKNOWN_KEY = """\
 <!-- merge-status-route:end -->
 """
 
+_ROUTES_SPACED_KEYS = """\
+<!-- merge-status-route:begin answer=prior_run_terminal, never_submitted -->
+→ **ABORT**.
+<!-- merge-status-route:end -->
+"""
+
+_ROUTES_EPISTEMIC_STATE = """\
+<!-- merge-status-route:begin answer=stale_record -->
+→ **RESUBMIT**.
+<!-- merge-status-route:end -->
+"""
+
+_ROUTES_CONSUMER_DISPOSITION = """\
+<!-- merge-status-route:begin answer=ACCEPT -->
+→ **ACCEPT**.
+<!-- merge-status-route:end -->
+"""
+
 
 async def test_routes_in_maps_every_key_of_every_route_span(alpha_guard: ModuleType) -> None:
-    routes = _routes_in(alpha_guard, _ROUTES_GREEN, source=_FIXTURE_SKILL)
+    routes = _routes_in(alpha_guard, _ROUTES_GREEN, _FIXTURE_SWITCH, source=_FIXTURE_SKILL)
 
     assert routes == {
         'LIVE_STATES': 'WAIT',
@@ -844,22 +932,25 @@ async def test_routes_in_maps_every_key_of_every_route_span(alpha_guard: ModuleT
 
 
 @pytest.mark.parametrize(
-    ('text', 'keys'),
+    ('text', 'offender'),
     [
         pytest.param(_ROUTES_TWO_KEYWORDS, 'prior_run_terminal', id='two-keywords'),
         pytest.param(_ROUTES_NO_KEYWORD, 'prior_run_terminal', id='no-keyword'),
         pytest.param(_ROUTES_DUPLICATE_KEY, 'never_submitted', id='duplicate-key'),
         pytest.param(_ROUTES_UNKNOWN_KEY, 'never_submited', id='unknown-key'),
+        pytest.param(_ROUTES_SPACED_KEYS, 'merge-status-route:begin', id='spaced-keys'),
+        pytest.param(_ROUTES_EPISTEMIC_STATE, 'stale_record', id='epistemic-state'),
+        pytest.param(_ROUTES_CONSUMER_DISPOSITION, 'ACCEPT', id='consumer-disposition'),
     ],
 )
 async def test_routes_in_rejects_every_malformed_route(
-    alpha_guard: ModuleType, text: str, keys: str,
+    alpha_guard: ModuleType, text: str, offender: str,
 ) -> None:
     with pytest.raises(AssertionError) as excinfo:
-        _routes_in(alpha_guard, text, source=_FIXTURE_SKILL)
+        _routes_in(alpha_guard, text, _FIXTURE_SWITCH, source=_FIXTURE_SKILL)
 
     assert _FIXTURE_SKILL in str(excinfo.value)
-    assert keys in str(excinfo.value)
+    assert offender in str(excinfo.value)
 
 
 _SWITCH_ROWS = {
@@ -901,14 +992,7 @@ _SWITCH_AFTER_REASON_VOCAB = _switch_fixture(
 async def test_switch_in_maps_every_reason_to_its_action_class(alpha_guard: ModuleType) -> None:
     switch = _switch_in(alpha_guard, _switch_fixture(*_SWITCH_ROWS.values()), source=_FIXTURE_SKILL)
 
-    assert switch == {
-        MergeReason.probe_failed: 'WAIT',
-        MergeReason.journaled_not_live: 'WAIT',
-        MergeReason.prior_run_terminal: 'REPORT',
-        MergeReason.never_submitted: 'NOT IN FLIGHT HERE',
-        MergeReason.coalesce_train_id: 'FOLLOW THE MEMBERS',
-        MergeReason.landing_unattributable: 'VERIFY',
-    }
+    assert switch == dict(_FIXTURE_SWITCH)
 
 
 async def test_switch_in_reads_only_the_switch_span_beside_the_reason_vocabulary(
@@ -944,15 +1028,6 @@ async def test_switch_in_requires_exactly_one_row_per_reason(
     assert _FIXTURE_SKILL in str(excinfo.value)
     assert offender in str(excinfo.value)
 
-
-_FIXTURE_SWITCH: Mapping[MergeReason, str] = MappingProxyType({
-    MergeReason.probe_failed: 'WAIT',
-    MergeReason.journaled_not_live: 'WAIT',
-    MergeReason.prior_run_terminal: 'REPORT',
-    MergeReason.never_submitted: 'NOT IN FLIGHT HERE',
-    MergeReason.coalesce_train_id: 'FOLLOW THE MEMBERS',
-    MergeReason.landing_unattributable: 'VERIFY',
-})
 
 _FIXTURE_ROUTES: Mapping[str, str] = MappingProxyType({
     'LIVE_STATES': 'WAIT',
@@ -1066,19 +1141,8 @@ _SEEDS: Mapping[str, _VocabularySeed] = MappingProxyType({
     ),
 })
 
-_REPO_ROOT = Path(__file__).resolve().parents[2]
 _MEMBER_ANCHOR = "    unknown = 'unknown'\n"
 _PARTITION_ANCHOR = 'OUTCOME_STATES = LIVE_STATES | TERMINAL_STATES\n'
-
-
-def _load_alpha_guard() -> ModuleType:
-    """A private copy of alpha's guard module, never registered in sys.modules."""
-    path = _REPO_ROOT / 'scripts' / 'tests' / 'test_merge_state_vocabulary_consistency.py'
-    spec = importlib.util.spec_from_file_location('_merge_state_guard_for_b9', path)
-    assert spec is not None and spec.loader is not None, path
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
 
 
 def _seeded_vocabulary(tmp_path: Path, seed: str) -> Path:

@@ -62,16 +62,15 @@ WHAT THIS GUARD DELIBERATELY DOES NOT PIN.
     ``escalation/src/escalation/server.py::_map_terminal_state``; a copy here
     would be exactly the second home the normative module exists to remove.
 
-PLACEMENT IS LOAD-BEARING. ``scripts/tests/`` modules must import NO first-party
-package — that is what lets ``uv run --project shared pytest scripts/tests/``
-(``scripts/orchestrator.yaml``'s ``test_command``) satisfy them on a freshly
-synced verify worktree. This module is stdlib-only (``importlib.util``, ``os``,
-``re``, ``subprocess``, ``pathlib``, ``typing``) plus ``pytest``, and it loads
-``shared/src/shared/merge_state.py`` BY ABSOLUTE PATH rather than importing
-``shared.merge_state``. That second point is load-bearing twice over: an agent
-Bash session typically inherits the MAIN checkout's ``VIRTUAL_ENV`` (see
-``CLAUDE.md``, "Locating installed code"), so a plain import could pin THIS
-worktree's SKILL.md files against MAIN's vocabulary.
+PLACEMENT IS LOAD-BEARING. ``scripts/tests/`` modules must import no first-party
+package beyond ``shared``, the one that ``uv run --project shared pytest
+scripts/tests/`` (``scripts/orchestrator.yaml``'s ``test_command``) installs —
+that is what lets it satisfy them on a freshly synced verify worktree. Even so,
+this module loads ``shared/src/shared/merge_state.py`` BY ABSOLUTE PATH rather
+than importing ``shared.merge_state``, because an agent Bash session typically
+inherits the MAIN checkout's ``VIRTUAL_ENV`` (see ``CLAUDE.md``, "Locating
+installed code"), so a plain import could pin THIS worktree's SKILL.md files
+against MAIN's vocabulary.
 
 EXTRACTOR CONTRACT. Every extractor below raises a loud ``AssertionError``
 naming its ``source`` rather than returning an empty result. An extractor that
@@ -268,7 +267,9 @@ class SpanFamily(NamedTuple):
     *name_re*'s first group is the span's name. *known_names*, when set, is the
     closed set a name must belong to; ``None`` leaves name validation to the caller
     (escalation/tests/test_merge_status_boundary.py's route family validates its
-    comma-listed keys itself).
+    comma-listed keys itself). *registry* names the list of files read for this
+    family's spans, and its owner; every extraction failure cites it, so the
+    reader knows which list to fix or unregister a file from.
 
     A ``NamedTuple``, not a frozen dataclass: escalation/tests/test_merge_status_boundary.py::_load_alpha_guard
     executes this module by path without registering it in ``sys.modules``, and
@@ -280,10 +281,15 @@ class SpanFamily(NamedTuple):
     end: str
     name_re: re.Pattern[str]
     known_names: frozenset[str] | None
+    registry: str
 
 
 VOCABULARY_SPANS = SpanFamily(
-    _BEGIN_MARKER, _END_MARKER, _PARTITION_RE, frozenset(_REQUIRED_PARTITIONS)
+    _BEGIN_MARKER,
+    _END_MARKER,
+    _PARTITION_RE,
+    frozenset(_REQUIRED_PARTITIONS),
+    "this guard's `PINNED_SITES`, task 4829",
 )
 
 
@@ -345,6 +351,11 @@ def extract_spans(
     lines = text.splitlines()
     spans: list[tuple[str, str]] = []
     open_span: tuple[str, int, str, int] | None = None
+    registry_note = f"({family.registry})"
+    name_one_of = (
+        "" if family.known_names is None
+        else f" Name one of {sorted(family.known_names)}."
+    )
 
     for index, line in enumerate(lines):
         line_number = index + 1
@@ -352,15 +363,15 @@ def extract_spans(
             match = family.name_re.search(line)
             assert match is not None, (
                 f"{source}: the `{family.begin}` marker at line {line_number} carries no "
-                f"name matching `{family.name_re.pattern}` (task 4829). A span that does "
-                f"not say what it pins cannot be checked against anything."
+                f"name matching `{family.name_re.pattern}` {registry_note}. A span that does "
+                f"not say what it pins cannot be checked against anything.{name_one_of}"
             )
             span_name = match.group(1)
             assert open_span is None, (
                 f"{source}: span `{span_name}` opens at line {line_number} while "
                 f"span `{open_span[0]}` (opened at line {open_span[3]}) is still open "
-                f"(task 4829) — spans do not nest. The inner list would be read as part "
-                f"of the outer one, so both comparisons would be wrong. Close the outer "
+                f"{registry_note} — spans do not nest. The inner span would be read as part "
+                f"of the outer one, so both checks would be wrong. Close the outer "
                 f"span with `{family.end}` before opening another."
             )
 
@@ -372,7 +383,7 @@ def extract_spans(
                 assert close_index < len(lines), (
                     f"{source}: the `<!-- {family.begin} {match.group(0)}` "
                     f"comment opened at line {line_number} is never closed with `-->` "
-                    f"(task 4829) — the whole rest of the file would be read as the "
+                    f"{registry_note} — the whole rest of the file would be read as the "
                     f"begin comment's body."
                 )
                 remainder = lines[close_index].split("-->", 1)[1]
@@ -384,9 +395,11 @@ def extract_spans(
                 # the values of a single-line span such as
                 # `merge-state-vocab:begin partition=CANCEL_STATES 'done' | 'unknown'`
                 # — and the resulting comparison would send a reader to fix a list
-                # that is fine. The `partition=NAME` fragment that rides along here
-                # is harmless: `NAME` is UPPER_SNAKE and so matches no lowercase
-                # token, and `partition` is in none of the vocabularies.
+                # that is fine. The marker's name fragment rides along here too. In
+                # the vocabulary family that `partition=NAME` is harmless: `NAME` is
+                # UPPER_SNAKE and so matches no lowercase token, and `partition` is
+                # in none of the vocabularies. Another family's reader must tolerate
+                # its own name fragment in a bare-carrier body.
                 remainder = line[marker_column + len(family.begin) :]
                 body_start = index + 1
 
@@ -394,8 +407,8 @@ def extract_spans(
         elif family.end in line:
             assert open_span is not None, (
                 f"{source}: a `{family.end}` marker at line {line_number} closes no "
-                f"open span (task 4829) — either its `{family.begin}` was deleted, "
-                f"leaving the list below it unpinned, or the two markers are inverted."
+                f"open span {registry_note} — either its `{family.begin}` was deleted, "
+                f"leaving the text below it unpinned, or the two markers are inverted."
             )
             span_name, body_start, remainder, _ = open_span
             body = "\n".join([remainder, *lines[body_start:index]])
@@ -405,23 +418,23 @@ def extract_spans(
     if open_span is not None:
         raise AssertionError(
             f"{source}: span `{open_span[0]}` opened at line {open_span[3]} is never "
-            f"closed by a `{family.end}` marker (task 4829). An unterminated span has "
+            f"closed by a `{family.end}` marker {registry_note}. An unterminated span has "
             f"no boundary, so the whole rest of the file would be read as its body."
         )
 
     assert spans, (
-        f"{source}: no `{family.begin}` span found at all (task 4829). The caller "
-        f"reads this file because it expects the file to carry such spans; with the "
+        f"{source}: no `{family.begin}` span found at all {registry_note}. The file is "
+        f"registered there because it is expected to carry such spans; with the "
         f"markers gone, the text they wrapped is free to drift and the check would "
-        f"report success having checked nothing. Restore the span, or stop reading "
-        f"the file for it if the text is gone."
+        f"report success having checked nothing. Restore the span, or unregister the "
+        f"file if the text is gone."
     )
 
     if family.known_names is not None:
         unknown = sorted({name for name, _ in spans if name not in family.known_names})
         assert not unknown, (
             f"{source}: `{family.begin}` span(s) named {unknown!r}, which are not "
-            f"among the known names {sorted(family.known_names)} (task 4829). A "
+            f"among the known names {sorted(family.known_names)} {registry_note}. A "
             f"misspelled name pins the span to nothing at all."
         )
     return spans
@@ -1161,6 +1174,7 @@ def test_extract_spans_reads_only_the_family_it_is_given() -> None:
         end="merge-status-route:end",
         name_re=re.compile(r"answer=([A-Za-z_]+(?:,[A-Za-z_]+)*)"),
         known_names=None,
+        registry="a fixture route registry",
     )
 
     vocabulary_spans = extract_spans(_TWO_FAMILIES, source=_FIXTURE_SOURCE)
@@ -1181,12 +1195,13 @@ def test_extract_spans_reads_only_the_family_it_is_given() -> None:
     message = str(excinfo.value)
     assert "merge-status-route:begin" in message
     assert "prior_run_terminal,never_submitted" in message
+    assert "a fixture route registry" in message and "PINNED_SITES" not in message
 
 
 @pytest.mark.parametrize(
     ("text", "case", "expected_fragment"),
     [
-        pytest.param(_SPAN_ABSENT, "no span at all", _FIXTURE_SOURCE, id="no-span"),
+        pytest.param(_SPAN_ABSENT, "no span at all", "PINNED_SITES", id="no-span"),
         pytest.param(_SPAN_UNTERMINATED, "unterminated span", "TERMINAL_STATES", id="unterminated"),
         pytest.param(_SPAN_NESTED, "nested span", "LIVE_STATES", id="nested"),
         pytest.param(_SPAN_UNOPENED_END, "end without begin", _FIXTURE_SOURCE, id="unopened-end"),
@@ -1196,7 +1211,7 @@ def test_extract_spans_reads_only_the_family_it_is_given() -> None:
             "TERMINAL_STATUSES",
             id="unknown-partition",
         ),
-        pytest.param(_SPAN_NO_PARTITION, "no partition= at all", _FIXTURE_SOURCE, id="no-partition"),
+        pytest.param(_SPAN_NO_PARTITION, "no partition= at all", "TERMINAL_STATES", id="no-partition"),
     ],
 )
 def test_extract_spans_rejects_every_malformed_span(
