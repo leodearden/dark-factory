@@ -3,7 +3,8 @@
 Every general run slot holds a merge-waiter that cannot land until main is
 healed.  A main-health fix filed in that state must dispatch on the reserved
 slot at the next tick, while the loop picks nothing, and so locks nothing,
-whenever every slot is held.
+whenever every slot is held.  The replay also runs with the dispatch-admission
+gate on and the host saturated, where the fix must still take the reserve.
 
 The scheduler is a REAL ``Scheduler`` over an in-test task list.  The slot
 body is stubbed at its one seam, ``_run_slot``: each slot is a merge-waiter
@@ -22,6 +23,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _orch_helpers import HermeticMcpSession, wait_responsive
+from shared.psi import PsiSample
 
 from orchestrator.config import OrchestratorConfig, PsiAdmissionConfig, ReviewConfig
 from orchestrator.harness import Harness, TaskReport
@@ -35,6 +37,7 @@ _SETTLE_TICKS = 10
 _LONG_POLL = 3600.0
 _GENERAL_SLOTS = 18
 _UNIT = 'orchestrator-reserve-test.service'
+_GATE_OFF = PsiAdmissionConfig(enabled=False)
 
 
 def _task(tid: str, priority: str, *, signature: str | None = None) -> dict:
@@ -57,6 +60,17 @@ def _plain(tid: str, priority: str = 'medium') -> dict:
 
 def _fix(tid: str) -> dict:
     return _task(tid, 'high', signature=f'sig-{tid}')
+
+
+_IDLE_PSI = PsiSample(cpu_some10=0.0, mem_some10=0.0, mem_full10=0.0, io_some10=0.0, read_ok=True)
+_SATURATED_PSI = PsiSample(cpu_some10=0.0, mem_some10=0.0, mem_full10=5.0, io_some10=0.0, read_ok=True)
+
+
+@dataclass
+class _HostPsi:
+    """The host PSI reading every dispatch tick sees; a test changes it mid-run."""
+
+    sample: PsiSample = _IDLE_PSI
 
 
 @dataclass(frozen=True)
@@ -165,6 +179,7 @@ def _harness(
     reserve: int,
     tasks: list[dict],
     idle_poll_secs: float = _TICK,
+    psi_admission: PsiAdmissionConfig = _GATE_OFF,
 ) -> tuple[Harness, _Board]:
     config = OrchestratorConfig(
         project_root=tmp_path,
@@ -173,7 +188,7 @@ def _harness(
         idle_poll_secs=idle_poll_secs,
         watcher_supervisor_enabled=False,
         review=ReviewConfig(full_review_on_complete=False),
-        psi_admission=PsiAdmissionConfig(enabled=False),
+        psi_admission=psi_admission,
     )
     scheduler = Scheduler(config, mcp_session=HermeticMcpSession())
     board = _Board(scheduler, tasks, monkeypatch)
@@ -249,6 +264,31 @@ class TestMainHealthFixReserve:
             filed = board.file(_plain('50', 'critical'), _fix('60'))
 
             await _until(lambda: board.started('60'), 'the fix starts on the reserve')
+            assert board.live_at_start['60'] == _GENERAL_SLOTS + 1
+            first = board.ticks_since(filed)[0]
+            assert (first.scope, first.picked) == (DispatchScope.MAIN_HEALTH_FIX, '60')
+
+            await _settle()
+            assert not board.started('50')
+            assert not board.holds_locks('50')
+
+        await _run_driven(h, board, drive)
+
+    async def test_fix_filed_while_host_psi_is_saturated_still_dispatches_on_the_reserve(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        host = _HostPsi()
+        monkeypatch.setattr('orchestrator.scheduler.read_psi_sample', lambda *, project_id=None: host.sample)
+        h, board = _harness(
+            tmp_path, monkeypatch, reserve=1, tasks=_merge_waiters(), psi_admission=PsiAdmissionConfig(),
+        )
+
+        async def drive() -> None:
+            await _saturate(board)
+            host.sample = _SATURATED_PSI
+            filed = board.file(_plain('50', 'critical'), _fix('60'))
+
+            await _until(lambda: board.started('60'), 'the fix starts on the reserve under a PSI hold')
             assert board.live_at_start['60'] == _GENERAL_SLOTS + 1
             first = board.ticks_since(filed)[0]
             assert (first.scope, first.picked) == (DispatchScope.MAIN_HEALTH_FIX, '60')
