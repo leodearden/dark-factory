@@ -95,6 +95,7 @@ from df_pytest_isolation import (  # noqa: E402
 )
 
 from fused_memory.backends.graphiti_client import GraphitiBackend  # noqa: E402
+from fused_memory.config.overlay import OVERLAY_ENV_VAR  # noqa: E402
 from fused_memory.config.schema import (  # noqa: E402
     EmbedderConfig,
     EmbedderProvidersConfig,
@@ -304,9 +305,13 @@ def _isolate_fm_config(monkeypatch, tmp_path):
     since mutating ``os.environ`` while iterating it raises.  The YAML's own
     interpolation surface, which pydantic never sees, is covered by the
     path-leaf pin above: ``setenv`` overwrites an inherited value.
+    ``OVERLAY_ENV_VAR`` is a fourth env surface the model-field-derived scrub
+    cannot see, and operators export it during the embedder soak, so it is
+    deleted by name.
     """
     for inherited in [name for name in os.environ if _reads_as_a_config_override(name)]:
         monkeypatch.delenv(inherited, raising=False)
+    monkeypatch.delenv(OVERLAY_ENV_VAR, raising=False)
 
     for name, layout in _FM_CONFIG_PATH_INTERPOLATIONS.items():
         monkeypatch.setenv(name, str(tmp_path / layout))
