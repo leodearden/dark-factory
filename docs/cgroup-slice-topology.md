@@ -119,3 +119,16 @@ code. Until the reinstall, a project's verify scopes sit under its slice while
 its daemon is still in `app.slice`. In that window step `1c1i` logs its
 WARNING, naming the daemon's actual cgroup, and the unit parity checker
 reports the installed copies as drift.
+
+Two more effects last until the reinstall:
+
+- The sampler's leaf set switches to slices that hold only verify work.
+  `sampler/src/sampler/metrics.py::discover_pressure_cgroups` falls back to
+  `orchestrator-*.service` leaves only when no `df-*.slice` exists, so from the
+  first verify scope on it stops sampling the daemons and their agents. Task
+  5220's `df-*.slice` calibration therefore waits on task 9985 as well as on
+  this one.
+- `df.slice` holds only verify work, at systemd's default weight, against
+  `app.slice`, which still holds every daemon, its agents and the desktop.
+  That is not the verify-versus-agent split task 5206 tuned, when verify scopes
+  and daemons were siblings in `app.slice`.
