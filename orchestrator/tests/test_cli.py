@@ -582,6 +582,25 @@ class TestRunUntilIdleFlag:
         )
 
 
+class TestRunAppliesProjectSliceWeight:
+    """`orchestrator run`, every unit's ExecStart, is the one caller that opts
+    into startup step 1c1i (docs/cgroup-slice-topology.md §Slice weight)."""
+
+    def test_run_requests_the_project_slice_weight(self, monkeypatch):
+        fake_report = MagicMock()
+        fake_report.blocked = 0
+        fake_report.summary.return_value = 'ok'
+        fake_harness = _wire_run_with_fake_harness(monkeypatch, fake_report)
+
+        result = CliRunner().invoke(main, ['run', '--config', '/dev/null'])
+
+        assert result.exit_code == 0, result.output
+        assert fake_harness.run.call_args.kwargs.get('apply_project_slice_weight') is True, (
+            f'run must pass apply_project_slice_weight=True; '
+            f'kwargs={fake_harness.run.call_args.kwargs!r}'
+        )
+
+
 class TestRunSweepsOrphanedSpawnTempFiles:
     """run() sweeps orphaned agent-spawn temp files once, before building the Harness,
     and a failing sweep never blocks startup."""
