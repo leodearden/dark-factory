@@ -1,0 +1,60 @@
+{
+  "task_id": "7721",
+  "reason": "Net-additive bug fix and observability, not a failed refactor. git_ops.py::GitOps::_create_merge_worktree +1: the except-BaseException arm that tears down a _merge-* whose git worktree add was cancelled (no caller can clean a path it was never returned); acquire_spec_lane's release-on-any-exit guard is offset by moving its body into _ready_spec_lane/_create_spec_lane. merge_lane/liveness.py::acquire_chain_build_lane +2: the verify_is_local branch (remote lease builds in create_ephemeral_verify_worktree, local in acquire_spec_lane), the one provisioning seam that branch belongs in. merge_lane/worker.py::build_chain +1: the except-BaseException arm around lane acquisition that logs which phase a deadline interrupted. tests/test_merge_queue_deep_dispatch.py private_reads +1: the new dispatch-level remote/local x speculative/head test drives the head-alone round through worker._dispatch_item, the same seam the file's existing head-round test uses.",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/git_ops.py",
+      "baseline": 1538,
+      "current": 1539
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/git_ops.py::GitOps::_create_merge_worktree",
+      "baseline": 3,
+      "current": 4
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/liveness.py",
+      "baseline": 65,
+      "current": 67
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/liveness.py::acquire_chain_build_lane",
+      "baseline": 2,
+      "current": 4
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+      "baseline": 1969,
+      "current": 1970
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py::build_chain",
+      "baseline": 17,
+      "current": 18
+    },
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/test_merge_queue_deep_dispatch.py",
+      "baseline": 136,
+      "current": 137
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5339,
+      "current": 5343
+    },
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6438,
+      "current": 6439
+    }
+  ]
+}

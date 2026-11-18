@@ -6812,62 +6812,9 @@ class GitOps:
         """
         # ── Create-once or reset-in-place ────────────────────────────────────
         if not await self._is_registered_worktree(lane):
-            # Create-once: serialized via _spec_wt_create_lock so that the K>1
-            # initial warm-up burst does not issue concurrent `git worktree add`
-            # calls against the same repo-level git lock (which would cause
-            # transient failures and a burst of cold fallbacks at warm-up time).
-            # Reset-in-place acquires (already-registered path below) are
-            # per-lane and don't contend, so no lock is needed there.
-            async with self._spec_wt_create_lock:
-                # Pool ownership is per-lane exclusive (try_acquire assigns a
-                # unique lane to exactly one caller), so no double-check is needed
-                # here — we're the only caller that can be creating this lane.
-                # The lock purely serializes the repo-level git worktree add
-                # against other lanes' concurrent first-time creates.
-                # Pool-storage-absent discriminator (task 2099). This is the
-                # PRIMARY guard for the spec pool — unlike acquire_warm_lane,
-                # acquire_spec_lane has no task-2061 base-health pre-gate, and
-                # without this check `git worktree add --detach` below would
-                # create a shadow lane on the rootfs skeleton during a
-                # mount-down window. Same missing-vs-empty distinction as
-                # acquire_warm_lane's create-once discriminator: base MISSING
-                # => genuinely fresh host => allow create; base EXISTS but
-                # `.pool-root` absent => suspected unmounted mountpoint =>
-                # refuse (release lane, cold fallback).
-                if self.worktree_base.exists() and not self.pool_storage_present():
-                    if self._pool_storage_bootstrap_ok():
-                        # First-seed bootstrap (task 2099 review-fix): the CoW
-                        # seed base is present & non-empty INSIDE worktree_base,
-                        # proving the mount is up — a missing sentinel here is a
-                        # fresh host, not an unmounted mountpoint. Mark it now so
-                        # subsequent acquisitions see storage present, then fall
-                        # through to the normal create (the seed re-marks it).
-                        logger.info(
-                            'acquire_spec_lane: create-once — .pool-root absent '
-                            'but warm base present under %s; first-seed bootstrap '
-                            '(marking sentinel, proceeding)', self.worktree_base,
-                        )
-                        self.mark_pool_storage_present()
-                    else:
-                        self._note_pool_storage_absent()
-                        return (
-                            'create-once refused: pool storage absent/unmounted '
-                            f'at {self.worktree_base}'
-                        )
-                # Self-heal a stale unregistered directory first
-                # (mirrors reset_persistent_merge_worktree's self-heal pattern).
-                if lane.exists():
-                    await remove_tree(lane)
-                lane.parent.mkdir(parents=True, exist_ok=True)
-                rc, _, err = await _run(
-                    ['git', 'worktree', 'add', '--detach', str(lane), merge_commit],
-                    cwd=self.project_root,
-                )
-                if rc != 0:
-                    return f'worktree add failed (rc={rc}, err={err!r})'
-                logger.info(
-                    'acquire_spec_lane: created %s (HEAD=%s)', lane, merge_commit[:8],
-                )
+            fault = await self._create_spec_lane(lane, merge_commit)
+            if fault is not None:
+                return fault
         else:
             # Reset-in-place: mirror reset_persistent_merge_worktree's exact sequence
             # (git reset --hard + ONE git clean with all -e flags in a single pass).
@@ -6890,6 +6837,66 @@ class GitOps:
         rc = await self._seed_warm_lane(lane, '--fresh-checkout')
         if rc != 0:
             return f'seed failed (rc={rc})'
+        return None
+
+    async def _create_spec_lane(self, lane: Path, merge_commit: str) -> str | None:
+        """Create-once: register *lane* at *merge_commit*; None, or the fault reason."""
+        # Create-once: serialized via _spec_wt_create_lock so that the K>1
+        # initial warm-up burst does not issue concurrent `git worktree add`
+        # calls against the same repo-level git lock (which would cause
+        # transient failures and a burst of cold fallbacks at warm-up time).
+        # Reset-in-place acquires (_ready_spec_lane's already-registered path)
+        # are per-lane and don't contend, so no lock is needed there.
+        async with self._spec_wt_create_lock:
+            # Pool ownership is per-lane exclusive (try_acquire assigns a
+            # unique lane to exactly one caller), so no double-check is needed
+            # here — we're the only caller that can be creating this lane.
+            # The lock purely serializes the repo-level git worktree add
+            # against other lanes' concurrent first-time creates.
+            # Pool-storage-absent discriminator (task 2099). This is the
+            # PRIMARY guard for the spec pool — unlike acquire_warm_lane,
+            # acquire_spec_lane has no task-2061 base-health pre-gate, and
+            # without this check `git worktree add --detach` below would
+            # create a shadow lane on the rootfs skeleton during a
+            # mount-down window. Same missing-vs-empty distinction as
+            # acquire_warm_lane's create-once discriminator: base MISSING
+            # => genuinely fresh host => allow create; base EXISTS but
+            # `.pool-root` absent => suspected unmounted mountpoint =>
+            # refuse (release lane, cold fallback).
+            if self.worktree_base.exists() and not self.pool_storage_present():
+                if self._pool_storage_bootstrap_ok():
+                    # First-seed bootstrap (task 2099 review-fix): the CoW
+                    # seed base is present & non-empty INSIDE worktree_base,
+                    # proving the mount is up — a missing sentinel here is a
+                    # fresh host, not an unmounted mountpoint. Mark it now so
+                    # subsequent acquisitions see storage present, then fall
+                    # through to the normal create (the seed re-marks it).
+                    logger.info(
+                        'acquire_spec_lane: create-once — .pool-root absent '
+                        'but warm base present under %s; first-seed bootstrap '
+                        '(marking sentinel, proceeding)', self.worktree_base,
+                    )
+                    self.mark_pool_storage_present()
+                else:
+                    self._note_pool_storage_absent()
+                    return (
+                        'create-once refused: pool storage absent/unmounted '
+                        f'at {self.worktree_base}'
+                    )
+            # Self-heal a stale unregistered directory first
+            # (mirrors reset_persistent_merge_worktree's self-heal pattern).
+            if lane.exists():
+                await remove_tree(lane)
+            lane.parent.mkdir(parents=True, exist_ok=True)
+            rc, _, err = await _run(
+                ['git', 'worktree', 'add', '--detach', str(lane), merge_commit],
+                cwd=self.project_root,
+            )
+            if rc != 0:
+                return f'worktree add failed (rc={rc}, err={err!r})'
+            logger.info(
+                'acquire_spec_lane: created %s (HEAD=%s)', lane, merge_commit[:8],
+            )
         return None
 
     async def _spec_lane_cold_fallback(
