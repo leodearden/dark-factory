@@ -602,40 +602,81 @@ async def test_unknown_is_produced_by_b8_alone(world: _World, row: str) -> None:
     assert (response['state'] == MergeState.unknown) == (row == 'B8'), (row, response)
 
 
-_CONSUMER_HALF_DEFERRED = (
-    'The consuming-skill half of rows B1-B8 is OUT until PRD task delta (4832) '
-    "lands: Leo's ruling of 2026-10-07 (task 4834 amendment). Delta rewrites "
-    'skills/merge-queue, unblock and unblock-low-risk SKILL.md to branch on '
-    '`reason`, which is what this half asserts; follow-up ticket '
-    'tkt_0RVWJQW34EP6CKTRG37TMAW247.'
+_MERGE_QUEUE_SKILL = 'skills/merge-queue/SKILL.md'
+_UNBLOCK_SKILL = 'skills/unblock/SKILL.md'
+_UNBLOCK_LOW_RISK_SKILL = 'skills/unblock-low-risk/SKILL.md'
+_CONSUMER_SKILLS = frozenset({_MERGE_QUEUE_SKILL, _UNBLOCK_SKILL, _UNBLOCK_LOW_RISK_SKILL})
+_SHARED_SWITCH = 'skills/_shared/merge-status-reasons.md'
+
+
+def _per_skill(*, merge_queue: str, unblock: str, unblock_low_risk: str) -> Mapping[str, str]:
+    return MappingProxyType({
+        _MERGE_QUEUE_SKILL: merge_queue,
+        _UNBLOCK_SKILL: unblock,
+        _UNBLOCK_LOW_RISK_SKILL: unblock_low_risk,
+    })
+
+
+_WAIT_EVERYWHERE = _per_skill(merge_queue='WAIT', unblock='WAIT', unblock_low_risk='WAIT')
+_PRIOR_RUN_TERMINAL = _per_skill(merge_queue='REPORT', unblock='REPORT', unblock_low_risk='ABORT')
+
+#: Each row's server answer and each consumer's disposition of it (task 4832's dispositions).
+_CONSUMER_BRANCHES = (
+    ('B1', MergeState.stale_record, MergeReason.prior_run_terminal, _PRIOR_RUN_TERMINAL),
+    ('B2', MergeState.queued, None, _WAIT_EVERYWHERE),
+    ('B3', MergeState.journaled, MergeReason.journaled_not_live, _WAIT_EVERYWHERE),
+    (
+        'B4', MergeState.no_record, MergeReason.never_submitted,
+        _per_skill(merge_queue='RESUBMIT', unblock='RESUBMIT', unblock_low_risk='ABORT'),
+    ),
+    (
+        'B5', MergeState.done, None,
+        _per_skill(merge_queue='ACCEPT', unblock='ACCEPT', unblock_low_risk='ACCEPT'),
+    ),
+    (
+        'B6', MergeState.stale_record, MergeReason.coalesce_train_id,
+        _per_skill(
+            merge_queue='FOLLOW THE MEMBERS', unblock='FOLLOW THE MEMBERS', unblock_low_risk='ABORT',
+        ),
+    ),
+    ('B7', MergeState.stale_record, MergeReason.prior_run_terminal, _PRIOR_RUN_TERMINAL),
+    ('B8', MergeState.unknown, MergeReason.probe_failed, _WAIT_EVERYWHERE),
 )
 
-_CONSUMER_BRANCHES = (
-    ('B1', MergeState.stale_record, MergeReason.prior_run_terminal),
-    ('B2', MergeState.queued, None),
-    ('B3', MergeState.journaled, MergeReason.journaled_not_live),
-    ('B4', MergeState.no_record, MergeReason.never_submitted),
-    ('B5', MergeState.done, None),
-    ('B6', MergeState.stale_record, MergeReason.coalesce_train_id),
-    ('B7', MergeState.stale_record, MergeReason.prior_run_terminal),
-    ('B8', MergeState.unknown, MergeReason.probe_failed),
-)
+
+def _read(relative_path: str) -> str:
+    return (_REPO_ROOT / relative_path).read_text(encoding='utf-8')
 
 
 @pytest.mark.parametrize(
-    ('row', 'state', 'reason'),
-    [
-        pytest.param(*branch, id=branch[0], marks=pytest.mark.skip(reason=_CONSUMER_HALF_DEFERRED))
-        for branch in _CONSUMER_BRANCHES
-    ],
+    ('row', 'state', 'reason', 'expected'),
+    [pytest.param(*branch, id=branch[0]) for branch in _CONSUMER_BRANCHES],
 )
 async def test_consumer_skill_branches_on_the_server_answer(
-    row: str, state: MergeState, reason: MergeReason | None,
+    world: _World,
+    alpha_guard: ModuleType,
+    row: str,
+    state: MergeState,
+    reason: MergeReason | None,
+    expected: Mapping[str, str],
 ) -> None:
-    pytest.fail(
-        f'{row}: the skip was removed without an implementation; assert each '
-        f'consuming skill branches on state={state!r}, reason={reason!r}.'
-    )
+    scene = await _SCENES[row](world)
+    response = await _poll(scene.server, **scene.key)
+    assert (response['state'], response.get('reason')) == (state, reason), (row, response)
+
+    switch = _switch_in(alpha_guard, _read(_SHARED_SWITCH), source=_SHARED_SWITCH)
+    dispositions = {
+        skill: _resolve(
+            _routes_in(alpha_guard, _read(skill), source=skill), switch, state, reason, source=skill,
+        )
+        for skill in sorted(_CONSUMER_SKILLS)
+    }
+
+    assert dispositions == expected, row
+
+
+async def test_every_scene_has_a_consumer_row() -> None:
+    assert {row for row, *_ in _CONSUMER_BRANCHES} == set(_SCENES)
 
 
 #: The closed disposition vocabulary a route span or switch row states, in bold.
@@ -1024,13 +1065,6 @@ _SEEDS: Mapping[str, _VocabularySeed] = MappingProxyType({
         'LIVE_STATES', f'LIVE_STATES = LIVE_STATES | {{MergeState.{_SEED_MEMBER}}}\n',
     ),
 })
-
-_CONSUMER_SKILLS = frozenset({
-    'skills/merge-queue/SKILL.md',
-    'skills/unblock/SKILL.md',
-    'skills/unblock-low-risk/SKILL.md',
-})
-
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _MEMBER_ANCHOR = "    unknown = 'unknown'\n"
