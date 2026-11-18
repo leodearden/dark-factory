@@ -52,8 +52,8 @@ def saturated_host(monkeypatch):
     )
 
 
-def _world(tmp_path: Path, *, pinned: tuple[str, ...] = ()) -> ParkWorld:
-    return park_world(tmp_path, pinned=pinned, psi_admission=PsiAdmissionConfig())
+def _world(tmp_path: Path) -> ParkWorld:
+    return park_world(tmp_path, psi_admission=PsiAdmissionConfig())
 
 
 def _board(w: ParkWorld, tasks: list[dict]) -> None:
@@ -106,8 +106,9 @@ async def test_a_held_default_tick_defers_plain_work_and_dispatches_the_fix(
 
 @pytest.mark.asyncio
 async def test_a_pinned_fix_dispatches_from_the_pin_loop_on_a_held_tick(tmp_path, saturated_host):
-    w = _world(tmp_path, pinned=('F',))
+    w = _world(tmp_path)
     await _one_in_flight(w)
+    w.overrides.set_override(w.root, 'F', pinned=True)
     _board(w, [FILLER, PLAIN, FIX])
 
     result = await w.scheduler.acquire_next()
