@@ -11,12 +11,13 @@ legibility state root conftest.py's autouse fixture installs.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 from collections.abc import Sequence
 from dataclasses import replace
-from datetime import UTC, date, datetime, timedelta, tzinfo
+from datetime import UTC, date, datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from typing import Any
 
@@ -24,9 +25,12 @@ import pytest
 import yaml
 from escalation.disposition import ObservationConsumed
 from escalation.models import NOTE_TO_FILE_CLASS, Escalation
+from fastmcp import Client
 from legibility import alarm, nightly, state_docs, trickle_state
 from legibility import config as config_mod
 from legibility import plan_deviation_census as mod
+from orchestrator.artifacts import TaskArtifacts
+from orchestrator.mcp import plan_tools
 from shared.plan_deviation import DEVIATION_KINDS, DeviationRecord
 from shared.testing_mcp_stub import StubMcpServer
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
@@ -215,6 +219,9 @@ def _set_mtime(path: Path, mtime: datetime) -> None:
     os.utime(path, (mtime.timestamp(), mtime.timestamp()))
 
 
+_DOC_TASK_ID = object()
+
+
 def _write_plan(
     root: Path,
     lane: str,
@@ -222,13 +229,16 @@ def _write_plan(
     steps: Sequence[Sequence[object]] = (),
     prerequisites: Sequence[Sequence[object]] = (),
     mtime: datetime = NOW,
+    task_id: object = _DOC_TASK_ID,
+    finalized_at: datetime | None = None,
 ) -> Path:
     """A plan.json under ``<root>/<lane>/`` whose items each carry one
-    ``deviations`` list; its ``task_id`` deliberately differs from *lane*."""
+    ``deviations`` list. Its ``task_id`` defaults to ``doc-<lane>``, which
+    deliberately differs from *lane*; any other value is written verbatim,
+    and ``None`` omits the key."""
     path = root / lane / 'plan.json'
     path.parent.mkdir(parents=True, exist_ok=True)
-    doc = {
-        'task_id': f'doc-{lane}',
+    doc: dict[str, object] = {
         'prerequisites': [
             {'id': f'pre-{n}', 'deviations': list(entries)}
             for n, entries in enumerate(prerequisites, start=1)
@@ -238,6 +248,12 @@ def _write_plan(
             for n, entries in enumerate(steps, start=1)
         ],
     }
+    if task_id is _DOC_TASK_ID:
+        doc['task_id'] = f'doc-{lane}'
+    elif task_id is not None:
+        doc['task_id'] = task_id
+    if finalized_at is not None:
+        doc['_finalized_at'] = finalized_at.isoformat()
     path.write_text(json.dumps(doc), encoding='utf-8')
     _set_mtime(path, mtime)
     return path
@@ -273,15 +289,15 @@ def test_plan_reader_reads_step_and_prerequisite_deviations_across_roots(tmp_pat
 
     assert _sorted(corpus.records) == [
         mod.CensusRecord(
-            task_id='101', recorded_at=pre_at, kind='other', prose_only=True,
+            task_id='doc-101', recorded_at=pre_at, kind='other', prose_only=True,
             source=mod.RecordSource.PLAN_STEP,
         ),
         mod.CensusRecord(
-            task_id='101', recorded_at=step_at, kind='wrong_inference', prose_only=False,
+            task_id='doc-101', recorded_at=step_at, kind='wrong_inference', prose_only=False,
             source=mod.RecordSource.PLAN_STEP,
         ),
         mod.CensusRecord(
-            task_id='102', recorded_at=other_at, kind='never_checked_fact', prose_only=False,
+            task_id='doc-102', recorded_at=other_at, kind='never_checked_fact', prose_only=False,
             source=mod.RecordSource.PLAN_STEP,
         ),
     ]
@@ -304,7 +320,7 @@ def test_plan_reader_skips_files_older_than_the_horizon_without_opening_them(tmp
 
     corpus = mod.read_plan_deviations([root], horizon=HORIZON)
 
-    assert [record.task_id for record in corpus.records] == ['203']
+    assert [record.task_id for record in corpus.records] == ['doc-203']
     assert corpus.opened == 1
     assert corpus.skipped == 0
 
@@ -329,7 +345,7 @@ def test_plan_reader_counts_bad_files_and_bad_entries_without_aborting(tmp_path)
 
     assert corpus.records == (
         mod.CensusRecord(
-            task_id='303', recorded_at=kept_at, kind='prediction_falsified',
+            task_id='doc-303', recorded_at=kept_at, kind='prediction_falsified',
             prose_only=False, source=mod.RecordSource.PLAN_STEP,
         ),
     )
@@ -341,6 +357,144 @@ def test_plan_reader_absent_root_is_an_empty_corpus(tmp_path):
     corpus = mod.read_plan_deviations([tmp_path / 'no-such-root'], horizon=HORIZON)
 
     assert corpus == mod.CorpusRead(records=(), opened=0, skipped=0)
+
+
+def test_plan_reader_keys_a_reused_lane_by_its_plan_documents_task(tmp_path):
+    root = _meta_root(tmp_path)
+    a_at = NOW - timedelta(days=2)
+    b_at = NOW - timedelta(days=1)
+    _write_plan(root, 'task-A', task_id='A', steps=[[_deviation(recorded_at=a_at)]])
+    _write_plan(
+        root, '_lane-3', task_id='B',
+        steps=[[_deviation(recorded_at=b_at, kind='other')]],
+    )
+
+    corpus = mod.read_plan_deviations([root], horizon=HORIZON)
+
+    assert _sorted(corpus.records) == [
+        mod.CensusRecord(
+            task_id='A', recorded_at=a_at, kind='wrong_inference', prose_only=False,
+            source=mod.RecordSource.PLAN_STEP,
+        ),
+        mod.CensusRecord(
+            task_id='B', recorded_at=b_at, kind='other', prose_only=False,
+            source=mod.RecordSource.PLAN_STEP,
+        ),
+    ]
+
+
+def test_plan_reader_counts_one_plan_under_two_directory_names_once(tmp_path):
+    root = _meta_root(tmp_path)
+    finalized_at = NOW - timedelta(days=3)
+    entries = [
+        _deviation(recorded_at=NOW - timedelta(days=2)),
+        _deviation(recorded_at=NOW - timedelta(days=1), kind='other', prose_only=True),
+    ]
+    for lane in ('77', 'task-77'):
+        _write_plan(root, lane, task_id='77', steps=[entries], finalized_at=finalized_at)
+
+    corpus = mod.read_plan_deviations([root], horizon=HORIZON)
+
+    assert len(corpus.records) == 2
+    assert {record.task_id for record in corpus.records} == {'77'}
+    assert corpus.plans == (mod.FinalizedPlan(task_id='77', finalized_at=finalized_at),)
+    assert corpus.opened == 2
+    assert corpus.skipped == 0
+
+
+def test_plan_reader_keeps_the_later_finalization_of_one_task(tmp_path):
+    root = _meta_root(tmp_path)
+    earlier, later = NOW - timedelta(days=5), NOW - timedelta(days=2)
+    _write_plan(root, 'task-77', task_id='77', finalized_at=later)
+    _write_plan(root, '77', task_id=77, finalized_at=earlier)
+
+    corpus = mod.read_plan_deviations([root], horizon=HORIZON)
+
+    assert corpus.plans == (mod.FinalizedPlan(task_id='77', finalized_at=later),)
+
+
+@pytest.mark.parametrize('task_id', [None, '', '   ', True, 3.5, ['77'], {'id': '77'}])
+def test_plan_reader_skips_a_plan_without_a_usable_task_id(tmp_path, task_id):
+    root = _meta_root(tmp_path)
+    _write_plan(
+        root, '401', task_id=task_id, finalized_at=NOW - timedelta(days=1),
+        steps=[[_deviation(recorded_at=NOW - timedelta(days=1))]],
+    )
+
+    corpus = mod.read_plan_deviations([root], horizon=HORIZON)
+
+    assert corpus == mod.CorpusRead(records=(), opened=1, skipped=1)
+
+
+def test_plan_reader_reads_an_integer_task_id_and_strips_a_string_one(tmp_path):
+    root = _meta_root(tmp_path)
+    at = NOW - timedelta(days=1)
+    _write_plan(root, '_lane-1', task_id=411, steps=[[_deviation(recorded_at=at)]])
+    _write_plan(root, '_lane-2', task_id=' 412 ', steps=[[_deviation(recorded_at=at)]])
+
+    corpus = mod.read_plan_deviations([root], horizon=HORIZON)
+
+    assert sorted(record.task_id for record in corpus.records) == ['411', '412']
+
+
+def test_plan_reader_returns_one_utc_finalized_plan_per_finalized_document(tmp_path):
+    root = _meta_root(tmp_path)
+    offset = timezone(timedelta(hours=-5))
+    finalized_at = datetime(2026, 10, 20, 9, 30, tzinfo=offset)
+    at = NOW - timedelta(days=1)
+    _write_plan(root, '421', task_id='421', finalized_at=finalized_at)
+    _write_plan(root, '422', task_id='422', steps=[[_deviation(recorded_at=at)]])
+    unparseable = _write_plan(root, '423', task_id='423', steps=[[_deviation(recorded_at=at)]])
+    doc = json.loads(unparseable.read_text(encoding='utf-8'))
+    unparseable.write_text(json.dumps({**doc, '_finalized_at': 'not-a-date'}), encoding='utf-8')
+    _set_mtime(unparseable, NOW)
+
+    corpus = mod.read_plan_deviations([root], horizon=HORIZON)
+
+    (plan,) = corpus.plans
+    assert plan == mod.FinalizedPlan(task_id='421', finalized_at=finalized_at)
+    assert plan.finalized_at.utcoffset() == timedelta(0)
+    assert sorted(record.task_id for record in corpus.records) == ['422', '423']
+    assert corpus.skipped == 0
+
+
+async def _plan_and_deviate(worktree: Path, task_id: str, kind: str) -> None:
+    artifacts = TaskArtifacts.for_task(worktree, task_id)
+    artifacts.init(task_id, f'title {task_id}', 'description')
+    async with Client(plan_tools.create_server(artifacts)) as client:
+        for tool, arguments in (
+            ('create_plan', {
+                'task_id': task_id, 'title': f'title {task_id}', 'analysis': 'analysis',
+                'files': ['scripts/x.py'],
+            }),
+            ('add_plan_step', {'step_id': 'step-1', 'step_type': 'test', 'description': 'd'}),
+            ('confirm_plan', {}),
+            ('record_step_deviation', {
+                'step_id': 'step-1', 'kind': kind, 'observed': 'o', 'expected': 'e',
+                'action_taken': 'a',
+            }),
+        ):
+            result = await client.call_tool(tool, arguments)
+            assert result.data['status'] == 'ok', (tool, result.data)
+
+
+def test_plan_reader_reads_what_plan_tools_writes_for_two_tasks_on_one_lane(tmp_path):
+    """The real producer: two tasks planned and deviated in turn on ONE lane
+    worktree each keep their own deviation and finalized plan."""
+    worktree = tmp_path / '.worktrees' / '_lane-3'
+    worktree.mkdir(parents=True)
+    asyncio.run(_plan_and_deviate(worktree, 'A', 'wrong_inference'))
+    asyncio.run(_plan_and_deviate(worktree, 'B', 'never_checked_fact'))
+    now = datetime.now(UTC)
+
+    corpus = mod.read_plan_deviations([_meta_root(tmp_path)], horizon=now - timedelta(days=28))
+
+    assert sorted((record.task_id, record.kind) for record in corpus.records) == [
+        ('A', 'wrong_inference'), ('B', 'never_checked_fact'),
+    ]
+    assert sorted(plan.task_id for plan in corpus.plans) == ['A', 'B']
+    for plan in corpus.plans:
+        assert now - timedelta(minutes=5) < plan.finalized_at <= now
 
 
 def _escalation(
