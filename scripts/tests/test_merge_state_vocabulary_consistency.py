@@ -787,6 +787,18 @@ Terminal: `done`, `conflict`, `blocked`, `abandoned`, `superseded`
 <!-- merge-state-vocab:end -->
 """
 
+# Two marker FAMILIES side by side: a vocabulary span and a route span of the
+# shape escalation/tests/test_merge_status_boundary.py reads. Each family's
+# extraction must see only its own span.
+_TWO_FAMILIES = """\
+<!-- merge-state-vocab:begin partition=LIVE_STATES -->
+Live: `queued`, `verifying`, `gate`, `finalizing`
+<!-- merge-state-vocab:end -->
+<!-- merge-status-route:begin answer=prior_run_terminal,never_submitted -->
+Every other answer → **ABORT**. Never resubmit.
+<!-- merge-status-route:end -->
+"""
+
 # ── seeded violations ──────────────────────────────────────────────────────
 # Each is a shape a prose list actually developed on this tree, or the shape a
 # future edit would develop. B9 binds the REJECTION, so each must be OBSERVED
@@ -1107,6 +1119,39 @@ def test_extract_spans_reads_every_span_in_order() -> None:
     assert [name for name, _ in spans] == ["LIVE_STATES", "TERMINAL_STATES"]
     assert "verifying" in spans[0][1]
     assert "abandoned" in spans[1][1]
+
+
+def test_extract_spans_reads_only_the_family_it_is_given() -> None:
+    """One scanner, several marker families; the default is the vocabulary family.
+
+    A second family reuses this extractor's loud-failure contract rather than a
+    second markdown scanner, and the default keeps every existing caller unchanged.
+    """
+    route_family = SpanFamily(
+        begin="merge-status-route:begin",
+        end="merge-status-route:end",
+        name_re=re.compile(r"answer=([A-Za-z_]+(?:,[A-Za-z_]+)*)"),
+        known_names=None,
+    )
+
+    vocabulary_spans = extract_spans(_TWO_FAMILIES, source=_FIXTURE_SOURCE)
+    route_spans = extract_spans(_TWO_FAMILIES, source=_FIXTURE_SOURCE, family=route_family)
+
+    assert [name for name, _ in vocabulary_spans] == ["LIVE_STATES"]
+    assert [name for name, _ in route_spans] == ["prior_run_terminal,never_submitted"]
+    route_body = route_spans[0][1]
+    assert "**ABORT**" in route_body
+    assert "merge-state-vocab" not in route_body and "finalizing" not in route_body
+
+    with pytest.raises(AssertionError) as excinfo:
+        extract_spans(
+            _TWO_FAMILIES,
+            source=_FIXTURE_SOURCE,
+            family=dataclasses.replace(route_family, known_names=frozenset({"done"})),
+        )
+    message = str(excinfo.value)
+    assert "merge-status-route:begin" in message
+    assert "prior_run_terminal,never_submitted" in message
 
 
 @pytest.mark.parametrize(
