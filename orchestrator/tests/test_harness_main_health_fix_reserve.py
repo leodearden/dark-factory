@@ -277,6 +277,7 @@ class TestMainHealthFixReserve:
     async def test_fix_filed_while_host_psi_is_saturated_still_dispatches_on_the_reserve(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        assert _SATURATED_PSI.saturated(PsiAdmissionConfig()), 'premise: the sample trips the gate'
         host = _HostPsi()
         monkeypatch.setattr('orchestrator.scheduler.read_psi_sample', lambda *, project_id=None: host.sample)
         h, board = _harness(

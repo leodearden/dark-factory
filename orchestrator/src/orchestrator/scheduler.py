@@ -6976,6 +6976,9 @@ class Scheduler:
         ``orchestrator/pin_reservation.py``'s module docstring.
         :meth:`_bound_pin_reservations` enforces that bound at phase start
         (so a PSI-held tick still applies it) and after each head reserves.
+        A pin the PSI hold defers keeps the reservation that bound left it,
+        so it still counts as a head: an exempt pin behind it then never
+        reserves only to be displaced in the same tick.
         Every lock-blocked pin also reports ``pin_blocked``
         (:meth:`_note_pin_blocked`).  With ``pin_reservations_enabled`` off, a
         blocked pin neither reserves nor reports, as before task 6040.
@@ -7005,6 +7008,8 @@ class Scheduler:
                 # once-per-tick decision/helper the scored loop uses below,
                 # so both loops share one hold and one event.
                 self._note_heavy_deferral(ctx, ctx.psi_hold, pin.task_id)
+                if self.lock_table.reservation_source(pin.task_id) is ReservationSource.PIN:
+                    heads += 1
                 continue
             modules = self._get_modules(pin.task)
             if self.lock_table.try_acquire(pin.task_id, modules):
