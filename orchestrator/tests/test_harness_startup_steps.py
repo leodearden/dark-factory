@@ -25,6 +25,7 @@ from orchestrator.config import TranscriptArchiveConfig
 from orchestrator.event_store import EventType
 from orchestrator.harness import Harness
 from orchestrator.merge_lane.liveness import MergeLivenessConfigError
+from orchestrator.project_slice_weight import SliceWeightOutcome
 from orchestrator.startup_steps import (
     STARTUP_STEP_SENTINEL_PREFIX,
     EntryFailures,
@@ -53,10 +54,16 @@ class StartupHarness:
     sync_stubs: Mapping[str, MagicMock]
 
 
-def _stub_table_steps(h: Harness) -> tuple[dict[str, AsyncMock], dict[str, MagicMock]]:
-    stubs = {attr: AsyncMock() for _step, attr in STUBBED_STEPS if attr not in SYNC_STEPS}
-    stubs['_recover_pending_merges'] = AsyncMock(return_value={'requests': []})
-    sync_stubs = {attr: MagicMock() for attr in SYNC_STEPS}
+def _stub_table_steps(
+    h: Harness, real_attrs: frozenset[str] = frozenset(),
+) -> tuple[dict[str, AsyncMock], dict[str, MagicMock]]:
+    stubs = {
+        attr: AsyncMock() for _step, attr in STUBBED_STEPS
+        if attr not in SYNC_STEPS and attr not in real_attrs
+    }
+    if '_recover_pending_merges' not in real_attrs:
+        stubs['_recover_pending_merges'] = AsyncMock(return_value={'requests': []})
+    sync_stubs = {attr: MagicMock() for attr in SYNC_STEPS if attr not in real_attrs}
     for attr, stub in {**stubs, **sync_stubs}.items():
         setattr(h, attr, stub)
     h._tag_task_modules = AsyncMock()
@@ -67,12 +74,14 @@ def _stub_table_steps(h: Harness) -> tuple[dict[str, AsyncMock], dict[str, Magic
 @pytest.fixture
 def make_startup_harness(
     tmp_path: Path, mock_orch_config: MagicMock,
-) -> Callable[[], StartupHarness]:
-    """Build Harnesses whose run() reaches finish_startup over one shared tmp_path."""
+) -> Callable[..., StartupHarness]:
+    """Build Harnesses whose run() reaches finish_startup over one shared tmp_path.
+
+    The table steps named in *real_attrs* keep their real methods."""
     mock_orch_config.max_concurrent_tasks = 2
     mock_orch_config.fused_memory.project_id = 'test'
 
-    def make() -> StartupHarness:
+    def make(*, real_attrs: frozenset[str] = frozenset()) -> StartupHarness:
         with patch('orchestrator.harness.McpLifecycle') as mock_mcp_cls, \
              patch('orchestrator.harness.Scheduler'), \
              patch('orchestrator.harness.BriefingAssembler'):
@@ -92,7 +101,7 @@ def make_startup_harness(
         h._stop_escalation_server = AsyncMock()
         h._start_merge_worker = AsyncMock()
         h._stop_merge_worker = AsyncMock()
-        stubs, sync_stubs = _stub_table_steps(h)
+        stubs, sync_stubs = _stub_table_steps(h, real_attrs)
 
         scheduler = MagicMock()
         scheduler.get_statuses = AsyncMock(return_value=({'1': 'pending'}, None))
@@ -348,3 +357,36 @@ class TestZombieSidecarReaperSiting:
         assert h.event_store is not None
         reaped = h.event_store.fetch_events_by_type(EventType.sidecar_reaped)
         assert [row['task_id'] for row in reaped] == ['8']
+
+
+@pytest.mark.asyncio
+class TestProjectSliceWeightIsOptIn:
+    """Step 1c1i acts only on the daemon's opt-in (docs/cgroup-slice-topology.md §Slice weight)."""
+
+    _REAL_STEP = frozenset({'_ensure_project_slice_weight'})
+
+    async def test_a_default_run_never_touches_the_project_slice(
+        self, make_startup_harness,
+    ) -> None:
+        h = make_startup_harness(real_attrs=self._REAL_STEP).harness
+        ensure = AsyncMock(return_value=SliceWeightOutcome.APPLIED)
+
+        with patch('orchestrator.harness.ensure_project_slice_weight', ensure):
+            await h.run(prd_path=None, dry_run=True)
+
+        ensure.assert_not_awaited()
+
+    async def test_the_opt_in_reaches_the_project_slice_weight(
+        self, make_startup_harness,
+    ) -> None:
+        h = make_startup_harness(real_attrs=self._REAL_STEP).harness
+        ensure = AsyncMock(return_value=SliceWeightOutcome.APPLIED)
+
+        with patch('orchestrator.harness.ensure_project_slice_weight', ensure):
+            await h.run(prd_path=None, dry_run=True, apply_project_slice_weight=True)
+
+        ensure.assert_awaited_once()
+        assert ensure.await_args is not None
+        project_id, own_cgroup_path = ensure.await_args.args
+        assert project_id == 'test'
+        assert isinstance(own_cgroup_path, str)
