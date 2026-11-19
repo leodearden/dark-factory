@@ -208,6 +208,39 @@ class TestNoObservations:
         assert report["verdict"] == "no_observations"
 
 
+class TestObservationsUnreadable:
+    def test_a_directory_is_an_io_failure_not_a_degraded_cache(
+        self, tmp_path: Path
+    ) -> None:
+        directory = tmp_path / "observations-dir"
+        directory.mkdir()
+        code, report, _ = run_check(directory)
+        assert code == 74
+        assert report["verdict"] == "observations_unreadable"
+        assert str(directory) in report["reason"]
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root reads a mode-000 file")
+    def test_permission_denied_is_an_io_failure(self, tmp_path: Path) -> None:
+        observations = write_observations(tmp_path, healthy_rows(3))
+        observations.chmod(0)
+        try:
+            code, report, _ = run_check(observations)
+        finally:
+            observations.chmod(0o600)
+        assert code == 74
+        assert report["verdict"] == "observations_unreadable"
+
+    def test_beats_a_canon_mismatch(self, tmp_path: Path) -> None:
+        directory = tmp_path / "observations-dir"
+        directory.mkdir()
+        status = write_status(tmp_path, "/opt/reify-canon/other")
+        code, report, _ = run_check(
+            directory, "--canon-root", CANON, "--status-json", str(status)
+        )
+        assert code == 74
+        assert report["verdict"] == "observations_unreadable"
+
+
 class TestNotYet:
     def test_too_few_healthy_rows(self, tmp_path: Path) -> None:
         code, report, _ = run_check(write_observations(tmp_path, healthy_rows(2)))
@@ -300,3 +333,14 @@ class TestUsage:
         observations = write_observations(tmp_path, healthy_rows(3))
         code, _, _ = run_check(observations, min_runs="0")
         assert code == 64
+
+    def test_help_prints_the_exit_table(self) -> None:
+        proc = subprocess.run(
+            [sys.executable, "-I", str(SCRIPT), "--help"],
+            capture_output=True,
+            text=True,
+            timeout=CLI_TIMEOUT,
+        )
+        assert proc.returncode == 0
+        table_rows = [line.split()[0] for line in proc.stdout.splitlines() if line[:4].strip().isdigit()]
+        assert table_rows == ["74", "1", "0", "2", "75", "64"]

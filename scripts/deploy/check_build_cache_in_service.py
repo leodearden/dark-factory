@@ -9,6 +9,8 @@ plans/canonical-build-path-shared-cache-prd.md.
 
 The table is evaluated in order and the first match wins:
 
+  74  the --observations file exists but cannot be read (a directory, or
+      permission denied): the check has no input, so it judges nothing
   1   --canon-root differs from ``canon_root`` in the --status-json file
       (or that file is unreadable or lacks the key), or the latest row is
       degraded
@@ -43,6 +45,7 @@ EXIT_IN_SERVICE = 0
 EXIT_DEGRADED = 1
 EXIT_NO_OBSERVATIONS = 2
 EXIT_USAGE = 64
+EXIT_OBSERVATIONS_UNREADABLE = 74
 EXIT_NOT_YET = 75
 
 _LOG_PREFIX = "check_build_cache_in_service:"
@@ -61,6 +64,7 @@ class Verdict(enum.Enum):
     IN_SERVICE = "in_service"
     NO_OBSERVATIONS = "no_observations"
     NOT_YET = "not_yet"
+    OBSERVATIONS_UNREADABLE = "observations_unreadable"
 
 
 EXIT_CODE_OF = {
@@ -69,6 +73,7 @@ EXIT_CODE_OF = {
     Verdict.IN_SERVICE: EXIT_IN_SERVICE,
     Verdict.NO_OBSERVATIONS: EXIT_NO_OBSERVATIONS,
     Verdict.NOT_YET: EXIT_NOT_YET,
+    Verdict.OBSERVATIONS_UNREADABLE: EXIT_OBSERVATIONS_UNREADABLE,
 }
 
 
@@ -158,26 +163,37 @@ def _parse_row(line: str) -> tuple[str, Observation] | None:
     return None if observation is None else (host, observation)
 
 
+def _host_rows(
+    lines: Iterable[str], host: str, since: datetime
+) -> tuple[list[Observation], int]:
+    observations: list[Observation] = []
+    malformed = 0
+    for line in lines:
+        if not line.strip():
+            continue
+        parsed = _parse_row(line)
+        if parsed is None:
+            malformed += 1
+            continue
+        row_host, observation = parsed
+        if row_host == host and observation.time >= since:
+            observations.append(observation)
+    return observations, malformed
+
+
 def read_observations(
     path: Path, host: str, since: datetime
 ) -> tuple[list[Observation], int]:
-    """The host's rows at or after *since*, in file order, and the malformed-line count."""
-    if not path.exists():
+    """The host's rows at or after *since*, in file order, and the malformed-line count.
+
+    An absent file holds no rows. Any other OSError (a directory, permission
+    denied) propagates: the caller reports it, never as "no observations".
+    """
+    try:
+        with path.open(encoding="utf-8", errors="replace") as lines:
+            return _host_rows(lines, host, since)
+    except FileNotFoundError:
         return [], 0
-    observations: list[Observation] = []
-    malformed = 0
-    with path.open(encoding="utf-8", errors="replace") as lines:
-        for line in lines:
-            if not line.strip():
-                continue
-            parsed = _parse_row(line)
-            if parsed is None:
-                malformed += 1
-                continue
-            row_host, observation = parsed
-            if row_host == host and observation.time >= since:
-                observations.append(observation)
-    return observations, malformed
 
 
 def latest_of(observations: Sequence[Observation]) -> Observation | None:
@@ -205,7 +221,10 @@ def decide(
     observations: Sequence[Observation],
     min_runs: int,
     canon_mismatch: str | None,
+    observations_error: str | None,
 ) -> tuple[Verdict, str]:
+    if observations_error is not None:
+        return Verdict.OBSERVATIONS_UNREADABLE, observations_error
     if canon_mismatch is not None:
         return Verdict.CANON_MISMATCH, canon_mismatch
     latest = latest_of(observations)
@@ -276,7 +295,8 @@ def _positive_int(text: str) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = _UsageExitParser(
         prog="check_build_cache_in_service.py",
-        description="Exit 1/0/2/75 per PRD C13: is the host's shared build cache in service?",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--observations", type=Path, required=True)
     parser.add_argument("--host", required=True)
@@ -294,13 +314,18 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--canon-root and --status-json are given together or not at all")
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
-    observations, malformed = read_observations(args.observations, args.host, args.since)
+    observations_error = None
+    try:
+        observations, malformed = read_observations(args.observations, args.host, args.since)
+    except OSError as exc:
+        observations, malformed = [], 0
+        observations_error = f"cannot read the observations in {args.observations}: {exc}"
     canon_mismatch = (
         None
         if args.canon_root is None
         else canon_mismatch_reason(args.canon_root, args.status_json)
     )
-    verdict, reason = decide(observations, args.min_runs, canon_mismatch)
+    verdict, reason = decide(observations, args.min_runs, canon_mismatch, observations_error)
     exit_code = EXIT_CODE_OF[verdict]
     counts = {
         health: sum(1 for observation in observations if observation.health is health)
