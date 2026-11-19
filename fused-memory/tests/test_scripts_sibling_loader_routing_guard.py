@@ -30,8 +30,11 @@ LOADER_FACTORIES = frozenset({'spec_from_file_location', 'spec_from_loader', 'So
 # same file is still caught.
 EXEMPT_LOADERS = frozenset(
     {
-        # Different policy; migration owned by pending task 7123.
-        # Deliberately execs a fresh copy and never registers it.
+        # Permanent: execs migrate_cross_graph_leak FRESH and never registers
+        # it, because that file's run() is this script's only store-mutation
+        # guard, and a cached sys.modules entry must not decide which guard
+        # runs. Pinned by
+        # tests/test_cgl_eta_auto_apply_impl.py::TestInheritedStoreMutationPreflight.
         ('cgl_eta_auto_apply_impl.py', '_load_migrate'),
     }
 )
