@@ -9,7 +9,9 @@ handlers make from it, and :func:`open_fleet_client` points the real app at
 it. Only the seams are faked: the ``mcp_tool_call`` binding in every module
 that imported it, and the ``ps`` scan that discovers running orchestrators.
 Every shaper above them is the production one, so a field added to a row
-shows up here as bytes.
+shows up here as bytes. A request in :data:`_UNLANDED_BY_PATH` is measured as
+a polled dashboard serves it: :func:`get_landed` re-requests it until every
+read its route waits on has landed.
 
 Content is deterministic ASCII filler at the census lengths. Two runs serve
 byte-identical rows; only the instants the app stamps itself vary, and those
@@ -20,12 +22,12 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import time
 from collections import Counter
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
-from functools import partial
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import ModuleType
@@ -62,6 +64,7 @@ from _runs_db_fixture import runs_db_path
 from _served_reads import forget_served_reads
 from _tasks_db_fixture import task_row, write_tasks_db
 from fastapi.testclient import TestClient
+from httpx import Response
 from shared.project_id import normalize_project_id, project_id_for_root
 from shared.quality_series.git_lines import ModuleLines
 from shared.quality_series.landings import GitCrossCheck
@@ -71,13 +74,15 @@ from shared.task_statuses import TERMINAL, TaskStatus
 import dashboard.app
 from dashboard.config import DashboardConfig
 from dashboard.data import task_lookup
-from dashboard.data.escalation_corpus import corpus_queues, reconciliation_queue, serve_corpus
+from dashboard.data.datum import DatumState
+from dashboard.data.escalation_corpus import corpus_queues, reconciliation_queue
 from dashboard.data.memory import mcp_tool_call
 from dashboard.data.orchestrator import find_running_orchestrators
 from dashboard.data.quality_snapshots import BASELINE_HOME, ComputedDiff, DiffState, RootScan
 from dashboard.data.quality_store import QualitySample, write_snapshot_scan
 from dashboard.data.scheduler import _scheduler_cache_clear
 from dashboard.loops import _QualityStore
+from dashboard.payload_budgets import EndpointBudget
 
 
 @dataclass(frozen=True)
@@ -111,6 +116,10 @@ class RootCensus:
     merges: int = 0
     trains: int = 0
     prds: int = 1
+
+    @property
+    def holds_tasks(self) -> bool:
+        return any(self.active.values()) or any(self.terminal.values())
 
 
 @dataclass(frozen=True)
@@ -955,20 +964,56 @@ def _bindings_of(target: object, name: str, known: frozenset[str]) -> list[Modul
     return found
 
 
-def _land_corpus_walk(client: TestClient, config: DashboardConfig) -> None:
-    """Walk the escalation corpus once in the app's own loop, unbounded, as a running dashboard has.
+def _unlanded_prd_views(payload: Mapping[str, Any], fleet: FleetCensus) -> dict[str, str]:
+    """Each root the census populates whose served ``PRD_VIEW`` is not yet fresh, as ``state: reason``."""
+    views = payload['PRD_VIEW']
+    populated = (root.label for root in fleet.roots if root.holds_tasks)
+    return {
+        label: f"{views[label]['state']}: {views[label]['reason']}"
+        for label in populated if views[label]['state'] != DatumState.FRESH
+    }
 
-    ``/prds`` waits
-    ``dashboard/src/dashboard/api/prds.py::REQUEST_READS_WAIT_SECONDS`` on the
-    walk and serves every root UNKNOWN when it misses. The fleet's first walk takes
-    several seconds, so without one landed walk the request's measured size
-    would depend on whether an earlier request had happened to walk it.
+
+_UNLANDED_BY_PATH: Mapping[str, Callable[[Mapping[str, Any], FleetCensus], Mapping[str, str]]] = {
+    '/api/v2/dashboard/prds': _unlanded_prd_views,
+}
+"""The swept paths whose route waits a bounded time on reads that land for the next poll.
+
+Each maps to what its served payload still lacks, keyed by root; empty once landed.
+"""
+
+LANDING_DEADLINE_SECONDS = 120.0
+"""How long :func:`get_landed` polls before failing; well inside pytest's per-test timeout."""
+
+_LANDING_POLL_SECONDS = 0.05
+
+
+def get_landed(client: TestClient, entry: EndpointBudget, fleet: FleetCensus = CENSUS) -> Response:
+    """*entry*'s request as a polled dashboard serves it, once every read its route waits on has landed.
+
+    A path outside :data:`_UNLANDED_BY_PATH`, or an answer other than 200, is
+    returned from the first request. Otherwise the request is repeated until
+    nothing is unlanded, and that response is returned. A shielded read lands
+    for the next poll however loaded the host is, so one still unlanded at
+    :data:`LANDING_DEADLINE_SECONDS` never will.
     """
-    assert client.portal is not None, 'the corpus is walked inside a live TestClient'
-    corpus = client.portal.call(partial(
-        serve_corpus, corpus_queues(config), now=datetime.now(UTC), wait_seconds=None,
-    ))
-    assert corpus.value is not None, f'the fleet\'s escalation corpus walk answered no value: {corpus.reason}'
+    unlanded_in = _UNLANDED_BY_PATH.get(entry.path)
+    deadline = time.monotonic() + LANDING_DEADLINE_SECONDS
+    while True:
+        resp = client.get(entry.path, params=dict(entry.query))
+        if unlanded_in is None or resp.status_code != 200:
+            return resp
+        unlanded = unlanded_in(resp.json(), fleet)
+        if not unlanded:
+            return resp
+        if time.monotonic() >= deadline:
+            raise AssertionError(
+                f'{entry.url_suffix()}\'s waited reads never landed within '
+                f'{LANDING_DEADLINE_SECONDS:.0f}s. That is fixture rot or a read that never '
+                'completes, not host load. Still unlanded:\n'
+                + '\n'.join(f'  {label}: {why}' for label, why in sorted(unlanded.items()))
+            )
+        time.sleep(_LANDING_POLL_SECONDS)
 
 
 def _clear_caches() -> None:
@@ -1013,7 +1058,6 @@ def open_fleet_client(fleet: FleetCensus = CENSUS) -> Iterator[TestClient]:
             try:
                 with TestClient(app) as client:
                     app.state.config = config
-                    _land_corpus_walk(client, config)
                     yield client
             finally:
                 _clear_caches()
