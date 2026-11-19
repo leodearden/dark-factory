@@ -2421,7 +2421,7 @@ class TestSpeculativeMergeWorker:
         """_run_inflight_verify raising must resolve N's Future and release the slot.
 
         γ structural note: the γ restructuring replaced _verify_and_advance (the old
-        single-method verify+CAS) with _dispatch_item + _run_inflight_verify + _finalize_inflight.
+        single-method verify+CAS) with VerifyDispatcher.dispatch + _run_inflight_verify + _finalize_inflight.
         The new _verifier_loop no longer calls _verify_and_advance; it calls
         _run_inflight_verify via asyncio.ensure_future, awaits the task in
         _finalize_inflight, and catches unexpected exceptions in the finalize-head
@@ -4047,7 +4047,7 @@ class TestSpeculativeMergeWorker:
 
         # token2 is discarded by the n_failed short-circuit and replaced by
         # worker._remerge's mocked return value — it must be a REAL item
-        # (immediate_outcome=None), not DECIDED: _dispatch_item's
+        # (immediate_outcome=None), not DECIDED: VerifyDispatcher.dispatch's
         # immediate-outcome branch returns a passthrough entry BEFORE the
         # chain-invalidation check ever runs, so a DECIDED token2 would skip
         # _remerge entirely. merge_wt/merge_result content is unread on the
@@ -4538,7 +4538,7 @@ class TestSpeculativeMergeWorker:
         via an in-flight worker predecessor.  To exercise the genuine stale-base
         pickup-rebase (the original intent), we use a SINGLE non-speculative request
         and advance main OUT-OF-BAND between the merger building it (base=M0) and the
-        verifier dispatching it.  We interpose on `_dispatch_item` to land a disjoint
+        verifier dispatching it.  We interpose on `VerifyDispatcher.dispatch` to land a disjoint
         commit on main exactly once before the first dispatch, so at pickup
         base_sha==M0 != current_main==M1 → Mechanism 2 fires (speculative=False).
 
@@ -4640,7 +4640,7 @@ class TestSpeculativeMergeWorker:
         successor built behind an in-flight worker predecessor now ATTACHes
         speculatively (base never stale), so the genuine stale-base pickup-rebase
         is exercised with a SINGLE non-speculative request and an OUT-OF-BAND main
-        advance interposed on `_dispatch_item`.
+        advance interposed on `VerifyDispatcher.dispatch`.
 
         N+1 is built against M0 with pre_rebased=True and skip_verify=False
         (task-1724: the build-time skip fast path is removed entirely).  At pickup
@@ -22673,7 +22673,7 @@ class TestSnapshotInflightCollection:
         surfaces in snapshot() as a 'dispatching' entry (task 2435 kappa-b:
         closes the task-2068 census gap).
 
-        DISPATCHING brackets `await self._dispatch_item(item)` (mq:9203-9214,
+        DISPATCHING brackets `await self.VerifyDispatcher.dispatch(item)` (mq:9203-9214,
         9571-9580) — the item is off the redispatch park/_verifier_queue but not yet
         appended to _inflight. Historically this window was covered only by
         the census-only `_dispatching_item` field, which snapshot()'s

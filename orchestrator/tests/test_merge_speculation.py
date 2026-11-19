@@ -1857,7 +1857,7 @@ class TestLateArrivalFailCascade:
     GREEN after step-2: B is a speculative descendant of A; the existing
     cascade in _verifier_loop (7608-7721) finds B in _inflight, cancels its
     verify, re-merges against actual main, re-dispatches through the redispatch park,
-    and emits speculative_discard reason=previous_failed via _dispatch_item.
+    and emits speculative_discard reason=previous_failed via VerifyDispatcher.dispatch.
     """
 
     async def test_predecessor_fail_cascades_to_late_arrival(
@@ -2011,7 +2011,7 @@ class TestLateArrivalFailCascade:
         # ── DONE-WHEN 4(a): speculative_merge event for B (B was dispatched
         #    speculatively against A's commit — only present after step-2).
         #
-        #    NOTE: speculative_discard is emitted in _dispatch_item only when a
+        #    NOTE: speculative_discard is emitted in VerifyDispatcher.dispatch only when a
         #    speculative item is re-dispatched from the redispatch park with _n_failed=True
         #    (single-host path). In the two-host cascade path, the remerged item
         #    has speculative=False (_remerge sets speculative=False), so

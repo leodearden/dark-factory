@@ -1745,7 +1745,7 @@ class _GateScene:
             ),  # type: ignore[arg-type]
             merge_wt=wt,
             was_speculative=speculative,
-            # Mirrors `_dispatch_item`: the box is built alongside the entry and
+            # Mirrors `VerifyDispatcher.dispatch`: the box is built alongside the entry and
             # seeded with the item's own ephemeral, so a head running the REAL
             # `_run_inflight_verify` has somewhere for a warm swap to publish.
             verify_wt=VerifyWorktreeHandle(merge_wt=wt),

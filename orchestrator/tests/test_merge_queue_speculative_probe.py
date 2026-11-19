@@ -16,8 +16,8 @@ Covers:
   step-12 GREEN — built-depth introspection implementation
   step-13 RED   — SpeculativeMergeWorker._probe_verify_placement(item)
   step-14 GREEN — worker placement implementation
-  step-15 RED   — _dispatch_item integration: byte-identical default + probe label
-  step-16 GREEN — _dispatch_item integration + _record_verify_outcome wiring
+  step-15 RED   — VerifyDispatcher.dispatch integration: byte-identical default + probe label
+  step-16 GREEN — VerifyDispatcher.dispatch integration + _record_verify_outcome wiring
 
 GOAL (PHASE-1, sibling of 2340 calibration): let the EXISTING second verify
 slot occasionally target a DEEPER already-built speculative stack (cumulative
@@ -804,7 +804,7 @@ class TestProbeVerifyPlacement:
 
     def test_default_config_byte_identical(self):
         """probe_fraction=0.0 (the default) -> None, unconditionally --
-        _dispatch_item's caller falls through to the unchanged
+        VerifyDispatcher.dispatch's caller falls through to the unchanged
         _verify_frontier_depth() path.
         """
         worker = _make_bare_worker()
@@ -913,7 +913,7 @@ class TestProbeVerifyPlacement:
 
 
 # ---------------------------------------------------------------------------
-# step-15 RED / step-16 GREEN: _dispatch_item integration
+# step-15 RED / step-16 GREEN: VerifyDispatcher.dispatch integration
 # ---------------------------------------------------------------------------
 
 
@@ -944,7 +944,7 @@ def _make_dispatch_ready_item(
     """Build a dispatch-ready RealMergeItem with a REAL result Future.
 
     Unlike ``_make_probe_item``'s bare ``MagicMock`` result,
-    ``_dispatch_item``'s ``_request_abandoned()`` guard calls
+    ``VerifyDispatcher.dispatch``'s ``_request_abandoned()`` guard calls
     ``req.result.cancelled()`` -- a MagicMock call is always truthy, which
     would incorrectly short-circuit dispatch down the pre-dispatch-abandon
     path -- so this needs a genuine (never-cancelled) asyncio.Future.
@@ -965,18 +965,18 @@ def _make_dispatch_ready_item(
 
 @pytest.mark.asyncio
 class TestDispatchItemProbeWiring:
-    """_dispatch_item's depth/probe_base computation (task 2359 step-16) --
+    """VerifyDispatcher.dispatch's depth/probe_base computation (task 2359 step-16) --
     proof via a stand-in ``_run_inflight_verify`` capturing its kwargs
     (mirrors test_merge_queue_verify_base_invariant.py's
     TestDispatchRefreshesLastKnownMainSha harness style: a fake local
     HostAllocator + a fully-replaced ``_run_inflight_verify`` -- no real
     verify/runner/event-store machinery needed since this proves ONLY the
-    ``_dispatch_item`` -> ``_run_inflight_verify`` call-site wiring; task
+    ``VerifyDispatcher.dispatch`` -> ``_run_inflight_verify`` call-site wiring; task
     2340's own tests already exhaustively cover depth's forwarding from
     ``_run_inflight_verify`` through to the emitted ``merge_verify`` event).
 
     RED until step-16 GREEN wires ``_probe_verify_placement()`` into
-    ``_dispatch_item`` and adds the ``probe_base`` param to
+    ``VerifyDispatcher.dispatch`` and adds the ``probe_base`` param to
     ``_run_inflight_verify``.
     """
 
@@ -989,7 +989,7 @@ class TestDispatchItemProbeWiring:
 
         captured: dict = {}
 
-        # **_kw absorbs telemetry kwargs _dispatch_item forwards but this
+        # **_kw absorbs telemetry kwargs VerifyDispatcher.dispatch forwards but this
         # test does not assert on (task 3185 added chain_items), so a
         # future additive kwarg cannot break these probe assertions.
         async def _fake_run_inflight_verify(item, lease, depth=None, probe_base=None, **_kw):
@@ -1030,7 +1030,7 @@ class TestDispatchItemProbeWiring:
 
         captured: dict = {}
 
-        # **_kw absorbs telemetry kwargs _dispatch_item forwards but this
+        # **_kw absorbs telemetry kwargs VerifyDispatcher.dispatch forwards but this
         # test does not assert on (task 3185 added chain_items), so a
         # future additive kwarg cannot break these probe assertions.
         async def _fake_run_inflight_verify(item, lease, depth=None, probe_base=None, **_kw):

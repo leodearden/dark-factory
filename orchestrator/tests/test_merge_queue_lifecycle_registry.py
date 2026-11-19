@@ -550,7 +550,7 @@ class TestMergerVerifierHandoffRegistersAwaitingVerify:
 @pytest.mark.asyncio
 class TestRequeueToQueuedSites:
     """The 3 ``_queue.put_nowait(req)`` requeue sites (pre-dispatch
-    operator-halt in ``_dispatch_item``, mid-verify operator-halt in
+    operator-halt in ``VerifyDispatcher.dispatch``, mid-verify operator-halt in
     ``_run_inflight_verify``, and the head-failure cascade's downstream
     self-requeue) must transition a TRACKED item's registry entry back to
     QUEUED, and the SAME request_id must be able to re-arm/re-drain through
@@ -558,7 +558,7 @@ class TestRequeueToQueuedSites:
     duplicate-register ``ValueError`` or a spurious escalation (task 2169
     step-5).
 
-    Targets the pre-dispatch operator-halt branch of ``_dispatch_item``
+    Targets the pre-dispatch operator-halt branch of ``VerifyDispatcher.dispatch``
     directly (bare worker, no real ``worker.run()`` loop) — mirrors
     test_merge_queue_request_liveness.py::TestOperatorHaltRequeueNoFalseAlarm's
     bare-item pattern, which drives the SAME branch on an UNREGISTERED item
@@ -1255,7 +1255,7 @@ class TestRequeueRequestHelperContract:
 
 # ---------------------------------------------------------------------------
 # step-7 RED / step-8 GREEN: verifier DISPATCH-FILL + blocking-get wiring —
-# AWAITING_VERIFY/REDISPATCH_PARKED -> DISPATCHING at BOTH _dispatch_item call
+# AWAITING_VERIFY/REDISPATCH_PARKED -> DISPATCHING at BOTH VerifyDispatcher.dispatch call
 # sites (DISPATCH-FILL's get_nowait/redispatch-popleft branch and the
 # blocking-get branch), DISPATCHING -> VERIFYING at _inflight_append,
 # DISPATCHING -> REDISPATCH_PARKED on the no-host appendleft (both call
@@ -1268,16 +1268,16 @@ class TestRequeueRequestHelperContract:
 class TestVerifierDispatchFillRegistersDispatching:
     """Every path through the verifier's DISPATCH-FILL / blocking-get dispatch
     call sites must transition the registry into DISPATCHING before calling
-    ``_dispatch_item``, then onward to VERIFYING (real dispatch),
+    ``VerifyDispatcher.dispatch``, then onward to VERIFYING (real dispatch),
     REDISPATCH_PARKED (no host free), or MERGING (dispatch-time staleness
     remerge) — not just the legacy ``_dispatching_item``/``_remerging_item``
     census fields, which cover only a subset of these paths (task 2169
     step-7).
 
     RED until step-8 GREEN wires ``_note_transition`` at both
-    ``_dispatch_item`` call sites in ``_verifier_loop``, at
+    ``VerifyDispatcher.dispatch`` call sites in ``_verifier_loop``, at
     ``_inflight_append``, at the two no-host ``request_redispatch(item, front=True)``
-    sites, and around the dispatch-time remerge inside ``_dispatch_item``.
+    sites, and around the dispatch-time remerge inside ``VerifyDispatcher.dispatch``.
     """
 
     async def test_single_item_progresses_through_dispatching_to_verifying(
@@ -1396,8 +1396,8 @@ class TestVerifierDispatchFillRegistersDispatching:
     ) -> None:
         """An item already sitting in ``_verifier_queue`` when the loop is
         entered is fetched by DISPATCH-FILL's ``get_nowait()`` branch (the
-        FIRST ``_dispatch_item`` call site). With zero free hosts forced,
-        ``_dispatch_item`` returns None and the item bounces onto
+        FIRST ``VerifyDispatcher.dispatch`` call site). With zero free hosts forced,
+        ``VerifyDispatcher.dispatch`` returns None and the item bounces onto
         the redispatch park — this must transition
         AWAITING_VERIFY -> DISPATCHING -> REDISPATCH_PARKED, not just set
         the legacy ``_dispatching_item`` field.
@@ -1454,7 +1454,7 @@ class TestVerifierDispatchFillRegistersDispatching:
     ) -> None:
         """An item that arrives AFTER the verifier loop is already blocked on
         ``_verifier_queue.get()`` (DISPATCH-FILL found nothing and fell
-        through) is dispatched via the SECOND ``_dispatch_item`` call site.
+        through) is dispatched via the SECOND ``VerifyDispatcher.dispatch`` call site.
         With zero free hosts forced, this must also transition
         AWAITING_VERIFY -> DISPATCHING -> REDISPATCH_PARKED — this call site
         has no legacy ``_dispatching_item`` coverage at all today.
@@ -1521,7 +1521,7 @@ class TestVerifierDispatchFillRegistersDispatching:
         self, git_ops: GitOps, config: OrchestratorConfig,
     ) -> None:
         """The dispatch-time staleness remerge window (Mechanism 2, inside
-        ``_dispatch_item``) must be observed at MERGING, then transition
+        ``VerifyDispatcher.dispatch``) must be observed at MERGING, then transition
         back to DISPATCHING before the (now fresh) item proceeds to a normal
         dispatch — mirrors test_merge_queue.py's
         test_verify_pickup_rebases_when_main_advanced's OOB-advance
@@ -2456,7 +2456,7 @@ class TestStopMidFlightRetiresEveryContainer:
 
 # ---------------------------------------------------------------------------
 # step-11 RED / step-12 GREEN (continued): the two abandon/detach-drop sites
-# — the merger's own pre-merge drop-on-detect, and _dispatch_item's own
+# — the merger's own pre-merge drop-on-detect, and VerifyDispatcher.dispatch's own
 # pre-dispatch abandon branch — must retire the registry even though neither
 # ever resolves a Future (the waiter already cancelled it).
 # ---------------------------------------------------------------------------
@@ -2521,7 +2521,7 @@ class TestAbandonPredispatchRetiresRegistry:
     async def test_dispatch_item_predispatch_abandon_retires_registry(
         self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
     ) -> None:
-        """``_dispatch_item``'s own pre-dispatch abandon branch — the waiter
+        """``VerifyDispatcher.dispatch``'s own pre-dispatch abandon branch — the waiter
         cancelled the Future before the item reached a host — is currently
         DISPATCHING and returns an ABANDONED_PREDISPATCH passthrough entry
         with the Future already done (cancelled).
@@ -2839,7 +2839,7 @@ class TestRegistrySnapshotAgreementAtSamplingPoints:
     cannot see an entry the census invents or one the registry has lost.
 
     The DISPATCHING window was the one former exception: an item mid
-    ``_dispatch_item`` was census-only, deliberately absent from
+    ``VerifyDispatcher.dispatch`` was census-only, deliberately absent from
     ``snapshot()['entries']`` (task 2068). Task 2435 (kappa-b) closed the
     gap, so the DISPATCHING sample below asserts presence exactly like
     every other sampling point here.
@@ -3053,7 +3053,7 @@ class TestMultiItemPipelineToQuiescenceNoLeaks:
 # ends sits at index 0, so the entry R under test is at index >= 1 and cannot
 # reach head-of-line while H verifies. R's verify task is created BEFORE its
 # entry and is handed an InflightEntrySlot that the entry fills, as
-# `_dispatch_item` does.
+# `VerifyDispatcher.dispatch` does.
 # ---------------------------------------------------------------------------
 
 _VACATE_TRIGGERS = ('operator_halt', 'no_progress', 'lane_contended', 'abandon')
@@ -3339,7 +3339,7 @@ class TestRunInflightVerifyRequeuesOnlyThroughVacate:
             '        self._requeue_request(item.request)\n'
             '\n'
             'class SpeculativeMergeWorker:\n'
-            '    async def _dispatch_item(self, item):\n'
+            '    async def VerifyDispatcher.dispatch(self, item):\n'
             '        self._requeue_request(item.request)\n'
         )
         assert _verify_exit_vacate_bypasses(src) == []

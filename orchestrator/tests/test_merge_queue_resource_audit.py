@@ -546,7 +546,7 @@ class TestFinalizeHeadSpeculativeAccounting:
 # task 2096: dispatch-gap (in-dispatch item) speculative permit accounting
 #
 # _verifier_loop's DISPATCH-FILL pops an item off the redispatch park/_verifier_queue
-# then `entry = await self._dispatch_item(item)` — the item is off the queue
+# then `entry = await self.VerifyDispatcher.dispatch(item)` — the item is off the queue
 # but not yet appended to _inflight during that await (host-acquisition git
 # calls, in-dispatch speculative-remerge). A speculative item's `.speculative`
 # is stable across this await (Mechanism-2's chain-remerge is skipped for

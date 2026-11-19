@@ -1811,7 +1811,7 @@ async def _head_and_prefix_scene(
     head_entry = InflightEntry(
         item=head_item, lease=head_lease, verify_task=head_task,  # type: ignore[arg-type]
         merge_wt=head_item.merge_wt, was_speculative=head_speculative,
-        # Mirrors `_dispatch_item`: the box is built alongside the entry and
+        # Mirrors `VerifyDispatcher.dispatch`: the box is built alongside the entry and
         # seeded with the item's own ephemeral, so a scene whose head runs the
         # REAL `_run_inflight_verify` has somewhere for the warm swap to publish.
         verify_wt=VerifyWorktreeHandle(merge_wt=head_item.merge_wt),
@@ -3271,7 +3271,7 @@ class TestChainWalkConsumesNoPermits:
 # step-13 RED — δ END TO END: the task's USER-OBSERVABLE signal
 #
 # Everything above pins a seam.  This class is the only place the seams are
-# driven the way production drives them — `_dispatch_item` →
+# driven the way production drives them — `VerifyDispatcher.dispatch` →
 # `_deep_chain_placement` → `_run_inflight_verify` → `_finalize_inflight` →
 # the walk — against a real repo whose main really moves.
 #

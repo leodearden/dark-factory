@@ -444,7 +444,7 @@ def _fake_local_allocator() -> MagicMock:
 
 @pytest.mark.asyncio
 class TestDispatchRefreshesLastKnownMainSha:
-    """The ε=1890 §5.3 dispatch guard in `_dispatch_item` refreshes the cached
+    """The ε=1890 §5.3 dispatch guard in `VerifyDispatcher.dispatch` refreshes the cached
     main SHA from its own already-fetched fresh `get_main_sha()` result
     (task 2357 DEFECT 2), so the main snapshot() feeds two_layer_invariants
     never lags the dispatch's view.
@@ -735,7 +735,7 @@ class TestAdvisoryContractRegressionPins:
     ) -> None:
         """(c) NO LEASE LEAK — the trap any future enforcement must solve.
 
-        The guard sits AFTER `allocator.acquire()` in `_dispatch_item`, so a
+        The guard sits AFTER `allocator.acquire()` in `VerifyDispatcher.dispatch`, so a
         bare `return None` inserted at the guard would leak the host lease:
         acquired, never released, never attached to a returned entry.  Pin
         both halves — the lease is acquired and NOT released/cancelled, and it

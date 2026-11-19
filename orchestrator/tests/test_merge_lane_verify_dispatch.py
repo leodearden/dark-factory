@@ -683,6 +683,7 @@ class TestDispatch:
     ) -> None:
         dispatcher = scene.dispatcher(FakeVerifier(passes()))
         item = dataclasses.replace(await scene.merged_item(), permit=SpecPermit())
+        scene.ports.main = item.base_sha
         scene.ports.placement_error = asyncio.CancelledError()
 
         with pytest.raises(asyncio.CancelledError):

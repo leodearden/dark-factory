@@ -1800,7 +1800,7 @@ class TestFinalizeInflightNonPass:
 class TestSingleHostSerialByteIdentical:
     """SINGLE-HOST serial byte-identical via the restructured _verifier_loop.
 
-    RED until step-16 GREEN restructures _verifier_loop, adds _dispatch_item,
+    RED until step-16 GREEN restructures _verifier_loop, adds VerifyDispatcher.dispatch,
     and makes _verify_and_advance a thin compat shim.
 
     The two structural tests (test_dispatch_item_method_exists and
@@ -1810,7 +1810,7 @@ class TestSingleHostSerialByteIdentical:
     """
 
     # ------------------------------------------------------------------
-    # RED marker 1: _dispatch_item must exist on the class
+    # RED marker 1: VerifyDispatcher.dispatch must exist on the class
     # ------------------------------------------------------------------
 
     async def test_dispatch_item_method_exists(self, git_ops: GitOps) -> None:
@@ -5335,7 +5335,7 @@ class TestRedispatchSpeculativeConservation:
     test_merge_queue_resource_audit.py.
 
     MECHANISM — the production route to a speculative item on
-    the redispatch park: ``_dispatch_item`` passes its ``free_host_count()``
+    the redispatch park: ``VerifyDispatcher.dispatch`` passes its ``free_host_count()``
     guard, then a concurrent non-loop acquirer takes the free slot before its
     ``acquire()``.  That acquirer is
     ``orchestrator/src/orchestrator/merge_drift.py::_run_drift_check``, which

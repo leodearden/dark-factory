@@ -2,7 +2,7 @@
 ``test_merge_queue_dispatch_fill_redispatch.py`` by task 5030 (PRD
 ``plans/merge-lane-quality-prd.md`` task γ7).
 
-It installs fake ``_dispatch_item``/``_finalize_inflight`` methods on a worker
+It installs fake ``VerifyDispatcher.dispatch``/``_finalize_inflight`` methods on a worker
 so a test can start ``_verifier_loop()`` itself and observe the loop's control
 flow with no real git merge or verify underneath. That is exactly the coupling
 γ7 removed from its own tests, which now drive a real lane through its public
@@ -40,7 +40,7 @@ from orchestrator.verify_runner import HostAllocator
 class _FillDrive:
     """Recording state installed onto a worker by :func:`_drive_fill`.
 
-    ``dispatched``       : items passed to the stubbed ``_dispatch_item``, in
+    ``dispatched``       : items passed to the stubbed ``VerifyDispatcher.dispatch``, in
                             call order.
     ``first_dispatched``: set inside the stub once the FIRST call's lease is
                             held (i.e. after ``allocator.acquire()`` returns
@@ -62,7 +62,7 @@ class _FillDrive:
 
 
 def _drive_fill(worker: SpeculativeMergeWorker, allocator: HostAllocator) -> _FillDrive:
-    """Install recording ``_dispatch_item``/``_finalize_inflight`` stubs on *worker*.
+    """Install recording ``VerifyDispatcher.dispatch``/``_finalize_inflight`` stubs on *worker*.
 
     Keeps the fill loop's REAL control flow (item acquisition order,
     ``_note_transition``, ``_inflight_append``, the DISPATCH-FILL guard,

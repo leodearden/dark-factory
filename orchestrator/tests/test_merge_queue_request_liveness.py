@@ -556,7 +556,7 @@ class TestOperatorHaltRequeueNoFalseAlarm:
     explicit ``on_requeued`` hook, a request parked on ``_queue`` for a long
     halt would eventually false-alarm even though it is not actually stuck.
 
-    Drives the pre-dispatch operator-halt branch of ``_dispatch_item``
+    Drives the pre-dispatch operator-halt branch of ``VerifyDispatcher.dispatch``
     directly (bare worker, no real ``worker.run()`` loop) — one of the 3
     ``put_nowait`` requeue sites; step-14 wires ``on_requeued`` at all 3.
 

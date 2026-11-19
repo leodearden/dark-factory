@@ -1703,7 +1703,7 @@ class ItemLifecycleState(StrEnum):
 
     Normalizes today's FOUR redundant state encodings — container
     membership across the five queues (``_queue``/the lane buffers/
-    ``_verifier_queue``/the redispatch park/``_dispatch_item``), the free-form
+    ``_verifier_queue``/the redispatch park/``VerifyDispatcher.dispatch``), the free-form
     ``InflightEntry.phase: str`` field (deleted by task lambda / task 2173 —
     phase is now derived via ``SpeculativeMergeWorker._entry_phase()``), the
     :class:`InflightStatus` sentinel enum above, and the four worker transient side-fields
@@ -1724,7 +1724,7 @@ class ItemLifecycleState(StrEnum):
     that never had a phase-string form, so there is no existing raw string
     for them to stay compatible with.
 
-    The live pipeline (``_dispatch_item``) also sets phase values this enum
+    The live pipeline (``VerifyDispatcher.dispatch``) also sets phase values this enum
     does NOT model, so task kappa's downstream repoint is a value REMAP for
     these, not a mechanical rename:
 
@@ -1766,7 +1766,7 @@ class VerifyWorktreeHandle:
     """The worktree ``VerifyDispatcher.run_inflight_verify`` is ACTUALLY verifying in (task 3186).
 
     A one-field mutable box, and the shape is forced by construction order:
-    ``_dispatch_item`` creates the verify task BEFORE it builds the
+    ``VerifyDispatcher.dispatch`` creates the verify task BEFORE it builds the
     :class:`InflightEntry` that wraps it, so the coroutine cannot simply be
     handed the entry to write back into.  The box is created first, passed to
     the verify as a keyword-only kwarg, and stored on the entry — so both ends
@@ -2046,7 +2046,7 @@ class InflightEntry:
                          them in submission order
     verify_result  : set when the verify has completed (pass=None; fail=VerifyResult)
     status         : optional sentinel.  ABANDONED_PREDISPATCH / REQUEUED_PREDISPATCH are
-                     set by _dispatch_item; DROPPED / REQUEUED by the entry's own verify
+                     set by VerifyDispatcher.dispatch; DROPPED / REQUEUED by the entry's own verify
                      when it vacates the entry (see :attr:`vacated`, task 4582);
                      VERIFIED_PENDING_LANDING by the verify when it releases the
                      lease at its verdict (task 8526).
@@ -2171,7 +2171,7 @@ class InflightEntry:
 
 @dataclass(frozen=True)
 class NoHost:
-    """``_dispatch_item`` found no free verify host: park ``item``.
+    """``VerifyDispatcher.dispatch`` found no free verify host: park ``item``.
 
     ``item`` is what the dispatch produced, so a dispatch-time re-merge's
     replacement rather than the item it superseded, and its merger-ahead cap
@@ -2193,7 +2193,7 @@ class InflightEntrySlot:
     """The :class:`InflightEntry` wrapping a verify, handed to that verify (task 4582).
 
     Built empty before the verify task for the reason
-    :class:`VerifyWorktreeHandle` gives, and filled by ``_dispatch_item`` once
+    :class:`VerifyWorktreeHandle` gives, and filled by ``VerifyDispatcher.dispatch`` once
     the entry exists, before the verify first runs, so a verify that requeues
     or drops its request vacates its OWN entry, and publishes its base facts
     onto it.

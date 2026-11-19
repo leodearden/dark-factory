@@ -633,7 +633,7 @@ class TestDeepChainPlacementBuild:
         The generic ``except Exception`` arm's contract, and the sibling of the
         deadline test above: a non-``TimeoutError`` blowing out of
         ``build_chain`` degrades to today's adjacent verify (``None``) rather
-        than propagating into ``_dispatch_item``.  Loud, not silent — a
+        than propagating into ``VerifyDispatcher.dispatch``.  Loud, not silent — a
         ``logger.exception`` is required, since a silent fail-soft is what the
         no-silent-fail-soft design invariant forbids.
 
@@ -732,7 +732,7 @@ class TestDeepChainPlacementBuild:
         (3.11+), so a ``CancelledError`` that escapes the context manager can
         ONLY be an external cancellation of the verifier-loop task.  Catching
         it alongside ``TimeoutError`` CONSUMES the cancel request: the coroutine
-        returns ``None`` and ``_dispatch_item`` runs on as if nothing happened
+        returns ``None`` and ``VerifyDispatcher.dispatch`` runs on as if nothing happened
         — breaking the "CancelledError is never absorbed" invariant
         ``_verifier_loop`` states.
 
@@ -787,9 +787,9 @@ class TestDeepChainPlacementBuild:
     ):
         """REVIEW FIX 2, where the real hazard lives: the ENCLOSING task.
 
-        ``_deep_chain_placement`` is awaited inline by ``_dispatch_item``, which
+        ``_deep_chain_placement`` is awaited inline by ``VerifyDispatcher.dispatch``, which
         the verifier loop runs as a task.  If the cancel is swallowed down in
-        the placement, ``_dispatch_item`` sails on past it and
+        the placement, ``VerifyDispatcher.dispatch`` sails on past it and
         ``ensure_future(self._verify_dispatch.run_inflight_verify(...))`` launches a whole
         verify for a dispatch that was cancelled — so the observable is not
         just "the exception vanished" but "work happened after the cancel".
@@ -1046,7 +1046,7 @@ class TestRunInflightVerifyChainRedirect:
         — which is why a deliberately wrong ``chain_items=99`` is passed here
         and 3 is still required.  That is what makes the emitted unit
         frontier-independent by construction, so it cannot silently regress if
-        ``_dispatch_item``'s own derivation ever changes again.
+        ``VerifyDispatcher.dispatch``'s own derivation ever changes again.
         """
         _git_ops, worker, item, chain, _head, _facts = await self._fixture(git_repo, frontier=1)
         posted = _spy_post_merge_verify(monkeypatch)
@@ -1789,7 +1789,7 @@ class TestDeepTipVerifyNeverAdopts:
 # step-19: RED — the task's USER-OBSERVABLE SIGNAL, as one integration class.
 #
 # Everything above pins a seam in isolation. This class is the only place the
-# seams are driven the way production drives them — `_dispatch_item` →
+# seams are driven the way production drives them — `VerifyDispatcher.dispatch` →
 # `_deep_chain_placement` → `_run_inflight_verify` → the chain policy → the
 # NEXT round's `_deep_chain_placement` — because γ's whole thesis is a
 # multi-ROUND property: a tip verdict changes what the next dispatch builds.
@@ -1860,13 +1860,13 @@ class _DeepScene:
     async def round_(
         self, *, tag: str, cohort: int = 0, speculative: bool = True,
     ) -> dict:
-        """Drive ONE full dispatch round through ``_dispatch_item``.
+        """Drive ONE full dispatch round through ``VerifyDispatcher.dispatch``.
 
         *cohort* picks the dispatching owner, task ``{cohort+1}01`` (see
         :func:`_cohort_task_ids`).  *speculative* picks its slot, as for
         :func:`_make_item`: the default is the slot-2 item, and
         ``speculative=False`` the head, based on REAL main, since a stale
-        base would fire ``_dispatch_item``'s staleness re-merge and leave no
+        base would fire ``VerifyDispatcher.dispatch``'s staleness re-merge and leave no
         later round chaining.  Returns the recorded ``_run_inflight_verify``
         kwargs for the round (plus ``'result'``), after :meth:`release_round`.
         """
@@ -1942,10 +1942,10 @@ async def _make_deep_scene(
     idiom already at test_merge_queue_depth_telemetry.py:477-482
     (``_worker_with_frontier`` + ``_sentinel_entry``) and at this module's
     ``TestRunInflightVerifyChainRedirect._fixture``.  It has to be STUBBED
-    rather than driven: ``_dispatch_item`` never appends to ``_inflight`` (the
+    rather than driven: ``VerifyDispatcher.dispatch`` never appends to ``_inflight`` (the
     only ``self._inflight.append`` is ``_inflight_append``, merge_queue.py:15693,
     which only the MERGER loop calls), so a scene driven purely through
-    ``_dispatch_item`` has a structurally empty frontier and every
+    ``VerifyDispatcher.dispatch`` has a structurally empty frontier and every
     ``frontier + 1`` arithmetic is observationally identical to a flat ``1``.
     """
     git_ops = _make_git_ops(repo, size=2)
@@ -2094,7 +2094,7 @@ class TestDeepDispatchRoundsIntegration:
         """A remote lease's chain builds in an ephemeral ``_merge-*``; a local one in ``_spec-``.
 
         Both chain owners reach the builder through the one
-        ``_deep_chain_placement`` call in ``_dispatch_item``: the speculative
+        ``_deep_chain_placement`` call in ``VerifyDispatcher.dispatch``: the speculative
         slot-2 item, and the head alone in the verify frontier (PRD D5).
         """
         from orchestrator.verify_runner import HostLease
@@ -2211,7 +2211,7 @@ class TestDeepDispatchRoundsIntegration:
         # frontier, so it is deep at frontier-0 and a flat 1 at frontier-2.
         #
         # base_sha is REAL MAIN, deliberately: a slot-1 item is merged onto
-        # main, and a stale base would fire _dispatch_item's Mechanism-2
+        # main, and a stale base would fire VerifyDispatcher.dispatch's Mechanism-2
         # staleness re-merge, which sets `_remerge_occurred` and makes every
         # LATER speculative round re-merge as `chain_invalidated` — arriving at
         # _deep_chain_placement non-speculative, so no round after this one

@@ -6,11 +6,11 @@ Covers:
   step-11 RED   — depth/speculative plumbing: run_post_merge_verify's
                   pool.dispatch forwarding + _run_inflight_verify caller wiring
   step-12 GREEN — thread depth/speculative through run_post_merge_verify /
-                  _run_inflight_verify / _dispatch_item
+                  _run_inflight_verify / VerifyDispatcher.dispatch
   step-13 RED   — speculative_merge event carries depth
   step-14 GREEN — classify_and_merge threads worker._verify_frontier_depth()
                   into the speculative_merge _emit_speculative call
-  amend         — TestDispatchItemDepthAheadOfItem: _dispatch_item reads the
+  amend         — TestDispatchItemDepthAheadOfItem: VerifyDispatcher.dispatch reads the
                   frozen-frontier count BEFORE the dispatching item joins it
                   (review followup: reviewer_comprehensive/test_coverage)
 
@@ -367,7 +367,7 @@ class TestRunInflightVerifyDepthWiring:
 
 
 # ---------------------------------------------------------------------------
-# step-9 RED / step-10 GREEN (task 3185, PRD γ): _dispatch_item computes a
+# step-9 RED / step-10 GREEN (task 3185, PRD γ): VerifyDispatcher.dispatch computes a
 # TRUTHFUL chain_items and threads it through _run_inflight_verify.
 #
 # chain_items is a fact about the TREE ACTUALLY VERIFIED, so it is derived from
@@ -410,7 +410,7 @@ class TestRunInflightVerifyChainItemsWiring:
 
 @pytest.mark.asyncio
 class TestDispatchItemComputesTruthfulChainItems:
-    """_dispatch_item emits chain_items in CHAIN-ITEM units: a flat 1.
+    """VerifyDispatcher.dispatch emits chain_items in CHAIN-ITEM units: a flat 1.
 
     A dispatch contributes exactly one chain item — the dispatching item
     itself, chain item #1 — and only the deep-chain arm of
@@ -434,7 +434,7 @@ class TestDispatchItemComputesTruthfulChainItems:
     async def _dispatch_kwargs(
         self, tmp_path: Path, *, frontier: int, speculative: bool, probe=None,
     ) -> dict:
-        """Drive _dispatch_item far enough to capture _run_inflight_verify's kwargs."""
+        """Drive VerifyDispatcher.dispatch far enough to capture _run_inflight_verify's kwargs."""
         from orchestrator.verify_runner import HostLease
 
         config = _make_bare_config()
