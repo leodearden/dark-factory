@@ -74,7 +74,7 @@ class DispatchCustody:
 
 @dataclass(frozen=True)
 class VerifyFrontier:
-    """Read-only views of the verify frontier, the entries frozen ahead of a
+    """Views of the verify frontier (no lane-state writes), the entries frozen ahead of a
     new dispatch (μ, the sole writer of the in-flight deque)."""
 
     has_inflight_verify: Callable[[], bool]

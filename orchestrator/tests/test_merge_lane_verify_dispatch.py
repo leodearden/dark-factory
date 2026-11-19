@@ -30,6 +30,7 @@ from _merge_lane_fakes import (
     passes,
     raises,
 )
+from _orch_helpers import wait_responsive
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, MergeVerifyLeaseContended
@@ -419,7 +420,7 @@ class TestRunInflightVerify:
         item = await scene.merged_item()
 
         running = asyncio.ensure_future(dispatcher.run_inflight_verify(item, _local_lease()))
-        await asyncio.wait_for(entered.wait(), timeout=30.0)
+        await wait_responsive(entered.wait(), label='the verify entered its run')
         scene.halt.operator_halt('test halt')
         result = await asyncio.wait_for(running, timeout=30.0)
 
@@ -433,7 +434,7 @@ class TestRunInflightVerify:
         item = await scene.merged_item()
 
         running = asyncio.ensure_future(dispatcher.run_inflight_verify(item, _local_lease()))
-        await asyncio.wait_for(entered.wait(), timeout=30.0)
+        await wait_responsive(entered.wait(), label='the verify entered its run')
         scene.ports.abandoned = True
         result = await asyncio.wait_for(running, timeout=30.0)
 
@@ -484,7 +485,7 @@ class TestRunInflightVerify:
         lease = HostLease(name='laptop', runner=cast(Any, remote), is_local=False)
 
         running = asyncio.ensure_future(dispatcher.run_inflight_verify(item, lease))
-        await asyncio.wait_for(entered.wait(), timeout=30.0)
+        await wait_responsive(entered.wait(), label='the verify entered its run')
         running.cancel()
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(running, timeout=30.0)
