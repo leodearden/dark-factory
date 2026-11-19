@@ -2436,6 +2436,38 @@ class TestRecordRunScheduleCursor:
         assert dict(retried.retry_backlog) == {}
 
 
+class TestScheduleReached:
+    """``schedule_reached(prior, *, target_date)`` (task 7025): whether the
+    recorded schedule cursor already reached *target_date*, so a scheduled
+    pass over it re-targets a date an earlier scheduled pass covered."""
+
+    @pytest.fixture(autouse=True)
+    def _state_root(self, tmp_path, monkeypatch):
+        monkeypatch.setenv(trickle_state.STATE_ROOT_ENV, str(tmp_path))
+
+    def test_no_predecessor_has_not_reached_any_date(self):
+        assert trickle_state.schedule_reached(None, target_date=_d(3)) is False
+
+    def test_a_manual_predecessor_carries_no_cursor(self):
+        prior = _record(day=3)
+
+        assert trickle_state.schedule_reached(prior, target_date=_d(3)) is False
+
+    @pytest.mark.parametrize(('target_day', 'reached'), [
+        pytest.param(3, True, id='the-catch-up-date-re-targeted'),
+        pytest.param(2, True, id='behind-the-cursor'),
+        pytest.param(4, False, id='the-next-night'),
+    ])
+    def test_a_scheduled_predecessor_reached_its_own_date(
+        self, target_day, reached
+    ):
+        prior = _record(day=3, scheduled=True)
+
+        assert trickle_state.schedule_reached(
+            prior, target_date=_d(target_day)
+        ) is reached
+
+
 class TestDueRetries:
     """``due_retries(state, *, today)`` — the reader the nightly calls, so
     the backlog's policy stays inside trickle_state."""
