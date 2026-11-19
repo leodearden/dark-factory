@@ -16,6 +16,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+#### Cross-graph leak census (task 6849)
+
+`python -m fused_memory.maintenance.cross_graph_leak_census [--group-id G] [--json]`
+counts, per graph and per label (`Entity`, `Episodic`), the nodes whose `group_id`
+names another graph or no graph at all: task 2115's cross-graph leak. Every
+group-scoped read is blind to such nodes, so this restores the leak signal task 5662
+removed from the task-family census. It is read-only, and it exits non-zero when any
+graph was not read whole, not when leaks are found. The per-node manifest and the
+remedy stay with `fused-memory/scripts/migrate_cross_graph_leak.py`'s dry run.
+
+Both censuses now share one completeness rule, `graph_sweep.sweep_complete`. A sweep
+that read no graph at all, such as an empty listing from a wrong `FALKORDB_URI`, now
+reports `complete=False` and exits 1. This is a change for
+`python -m fused_memory.maintenance.task_family_census`, which used to exit 0 there.
+
+Baseline: the CLI was not run against the live store, because ad-hoc access to
+production FalkorDB is `redis-cli` reads only. This is the architect's measurement,
+taken on 2026-11-17 with read-only `GRAPH.RO_QUERY` via `redis-cli` inside
+`docker-falkordb-1`. Leaked `Entity` nodes: 0 in each of reify, dark_factory,
+know_live, knowlive, market_predictor and pump_web_ui. Foreign `Episodic` residue
+(CGL's EPISODIC_SKIP): dark_factory 78, reify 114, know_live 39.
+
 #### Weekly duplicate-cluster report with a consecutive-run regrowth diff (task 3136)
 
 A new systemd user timer, `scripts/fused-memory-duplicate-audit.timer` (Sun 06:30),

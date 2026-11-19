@@ -10,14 +10,19 @@ test_event_queue.py.
 
 from __future__ import annotations
 
+import sqlite3
 import uuid
 from datetime import UTC, datetime
+from unittest.mock import ANY, patch
+
+from shared import sqlite_sync_base
 
 from fused_memory.models.reconciliation import (
     EventSource,
     EventType,
     ReconciliationEvent,
 )
+from fused_memory.reconciliation import event_journal as event_journal_module
 from fused_memory.reconciliation.event_journal import EventJournal
 
 
@@ -92,5 +97,28 @@ def test_mark_processed_removes_only_that_row(tmp_path):
         journal.mark_processed(first.id)
         remaining = journal.load_unprocessed()
         assert [e.id for e in remaining] == [second.id]
+    finally:
+        journal.close()
+
+
+def test_the_journal_applies_the_shared_durability_pragmas(tmp_path):
+    """EventJournal configures its connection through the shared sync helper.
+
+    A ``wraps=`` spy rather than a stub: the journal applies its pragmas in
+    ``__init__``, so the real helper must still run for the store to work.
+    """
+    with patch.object(
+        event_journal_module,
+        'apply_full_durability_pragmas_sync',
+        wraps=sqlite_sync_base.apply_full_durability_pragmas_sync,
+    ) as spy:
+        journal = EventJournal(tmp_path / 'event_journal.db')
+    try:
+        spy.assert_called_once_with(ANY, busy_timeout_ms=5000)
+        assert isinstance(spy.call_args.args[0], sqlite3.Connection)
+
+        event = _make_event()
+        journal.append(event)
+        assert [e.id for e in journal.load_unprocessed()] == [event.id]
     finally:
         journal.close()

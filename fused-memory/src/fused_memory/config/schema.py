@@ -117,6 +117,18 @@ class YamlSettingsSource(PydanticBaseSettingsSource):
             ) from e
 
 
+# --- Shared leaf normalisers ---
+
+def blank_means_inherit(value: str | None) -> str | None:
+    """None for a blank inheriting leaf, its one spelling of inherit.
+
+    Validators apply it when a config is built, and resolvers again at use.
+    """
+    if value is None or not value.strip():
+        return None
+    return value
+
+
 # --- Server ---
 
 # Mirrors fused_memory.server.main._FORCE_EXIT_BUDGET and
@@ -421,6 +433,28 @@ class RoutingConfig(BaseModel):
     confidence_threshold: float = Field(default=0.7)
     use_heuristics: bool = Field(default=True)
     llm_fallback: bool = Field(default=True)
+    openai_api_url: str | None = Field(
+        default=None,
+        description=(
+            "The routing LLM's own OpenAI-compatible endpoint, used by "
+            'add_memory auto-classification and read routing. None or blank '
+            'INHERITS llm.providers.openai.api_url, resolved at use by '
+            'routing/openai_client.py::LazyOpenAIClient. Restart-only: each '
+            'owner caches its client.'
+        ),
+    )
+    openai_api_key: str | None = Field(
+        default=None,
+        description=(
+            "The routing LLM's own API key. None or blank INHERITS "
+            'llm.providers.openai.api_key. Restart-only, like openai_api_url.'
+        ),
+    )
+
+    @field_validator('openai_api_url', 'openai_api_key')
+    @classmethod
+    def _blank_leaf_inherits(cls, value: str | None) -> str | None:
+        return blank_means_inherit(value)
 
 
 # --- Queue ---
@@ -628,6 +662,9 @@ class TaskMetadataConfig(BaseModel):
 
 # --- Mem0 metadata write-boundary validation (task 3195, leaf β) ---
 
+_RETIRED_MEMORY_METADATA_KEYS: frozenset[str] = frozenset({'enforce_kind_registry'})
+
+
 class MemoryMetadataConfig(BaseModel):
     """Governs ``MemoryService``'s write-boundary validation of Mem0 ``metadata``.
 
@@ -642,13 +679,17 @@ class MemoryMetadataConfig(BaseModel):
 
     ``extra='forbid'`` so a mistyped leaf fails loud at config load/reload
     rather than silently doing nothing: under ``extra='ignore'`` an operator
-    who typed ``enforce_kind_regsitry`` would get a silently-dropped key and
-    believe enforcement was on.
+    who typed ``enfroce`` would get a silently-dropped key and believe
+    enforcement was on.
+
+    ``enforce_kind_registry`` was retired by task 5266 (PRD §10 OQ1 option
+    (b): ``kind`` membership never rejects); a config still carrying it loads with a
+    ``retired key(s)`` WARNING.
 
     Reload tier: ``reload.py``'s ``RELOADABLE_FIELDS`` is an opt-IN allowlist,
     so every leaf here is restart-required by default and none is listed. That
-    is correct for BOTH pairs, not just the enforce flags — the storm-tuning
-    leaves are read once when ``MemoryService.__init__`` constructs the
+    is correct for the ``enforce`` flag and the storm-tuning leaves alike —
+    the storm-tuning leaves are read once when ``MemoryService.__init__`` constructs the
     ``UnknownKeyStormDetector``, so they are captured by value and a hot
     reload genuinely would not take effect. Allowlisting them would advertise
     a reload that silently does nothing.
@@ -663,21 +704,6 @@ class MemoryMetadataConfig(BaseModel):
             'validation violations emit a memory_metadata.schema_warning log '
             'line and the write proceeds; True rejects the write with '
             'MemoryMetadataValidationError. Not hot-reloadable.'
-        ),
-    )
-    enforce_kind_registry: bool = Field(
-        default=False,
-        description=(
-            'RED-TIER / restart-only: whether an unknown metadata.kind is '
-            'FATAL (rejectable) rather than census-only. Carved out from '
-            "`enforce` and left OFF even after `enforce` flips, because it is "
-            'specifically this check whose safety premise leaf α measured '
-            'FALSE: PRD D3 assumed kind writers are in-repo code + prompts, '
-            'but 242 of the 329 live kind values are singletons, i.e. the '
-            'population is agent-invented free text and open in practice. '
-            'Flipping this on day one would turn every newly invented kind '
-            'into a hard memory-write failure on the live fleet. See PRD §10 '
-            'open question 1. Not hot-reloadable.'
         ),
     )
     unknown_key_storm_threshold: int = Field(
@@ -709,6 +735,11 @@ class MemoryMetadataConfig(BaseModel):
             'the detector.'
         ),
     )
+
+    @model_validator(mode='before')
+    @classmethod
+    def _drop_retired_keys(cls, data: object) -> object:
+        return drop_retired_keys(data, section='memory_metadata', retired=_RETIRED_MEMORY_METADATA_KEYS)
 
 
 # --- Task status transition authority (task 2175, rho1b) ---
@@ -2610,6 +2641,16 @@ class CuratorConfig(BaseModel):
             "PURE-GATE instead of the TDD architect. None disables the gate."
         ),
     )
+    registry_load_retry_seconds: float = Field(
+        default=300.0,
+        ge=0,
+        description=(
+            "A guard registry (blocklist, recon-premise, operational-ask) that "
+            "failed to load is retried on the first curation at least this "
+            "many seconds later; 0 retries on every curation. A registry that "
+            "loaded is never reloaded."
+        ),
+    )
 
     @model_validator(mode='after')
     def _validate_deferral_backoff_bounds(self) -> 'CuratorConfig':
@@ -2871,8 +2912,9 @@ class WriteTriageConfig(BaseModel):
             "The judge's OWN endpoint. None INHERITS "
             'llm.providers.<resolved judge provider>.api_url. When set it is '
             "the judge's SDK base_url for whichever provider arm the judge "
-            'resolves, and nothing else reads it: the main LLM arm and '
-            'add_memory auto-classification keep llm.providers.*.api_url. The '
+            'resolves, and nothing else reads it: the main LLM arm keeps '
+            'llm.providers.*.api_url, and add_memory auto-classification uses '
+            'routing.openai_api_url, which inherits it. The '
             'api_key still comes from the provider section. Blank means '
             'inherit. Green-tier hot-reloadable, read live per judge call. See '
             "plans/write-triage-flip-readiness-prd.md C1' (task σ)."
@@ -3043,9 +3085,7 @@ class WriteTriageConfig(BaseModel):
         too means a reload of a blank value reports null rather than an
         applied '' that the judge then silently ignores.
         """
-        if value is None or not value.strip():
-            return None
-        return value
+        return blank_means_inherit(value)
 
     @field_validator('t_high_by_category')
     @classmethod

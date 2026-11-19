@@ -10,12 +10,13 @@
   and it captures a name directly before the task word, 'Reify task 3674', which
   qualifies the mention only when it names a registered project.
 - _LISTED_NUMBER_PATTERN: one number inside that list.
-- _QUALIFIED_REF_PATTERN: a project-qualified mention, 'see dark_factory: 2500'.
+- _QUALIFIED_REF_PATTERN: a project-qualified mention, 'see dark_factory:2500'.
 
 Precision over recall: the pads around '#' and ':' are space or tab, never a
-line break; the task word and the digits are ASCII; and the right edge refuses
-any word character, so a mixed digit run or a hash such as '8c7e163' yields
-nothing. One accepted loss: '/' lists after the plural word ('tasks 2207/2210'),
+line break; a qualified ref in prose takes no pad at its colon at all, because
+'word: N' is prose, while a whole node name's colon may be padded; the task
+word and the digits are ASCII; and the right edge refuses any word character,
+so a mixed digit run or a hash such as '8c7e163' yields nothing. One accepted loss: '/' lists after the plural word ('tasks 2207/2210'),
 so a progress fraction there ('tasks 3/5 done') reads as two tasks; its head
 number was already one before lists were read. The measured cases live in
 tests/test_canonical_labels.py, and the reasons in
@@ -84,7 +85,8 @@ _PAD = _Fragment(r'[ \t]*')
 _BLANKS = _Fragment(r'[ \t]+')
 _WIDE_PAD = _Fragment(r'\s*')
 _GAP = _Fragment(r'\s+')
-_COLON = _Fragment(_PAD, ':', _PAD)
+_COLON = _Fragment(':')
+_PADDED_COLON = _Fragment(_PAD, _COLON, _PAD)
 _MARK = _Fragment(_PAD, '[#:]', _PAD)
 _SEPARATOR = _either(_MARK, _GAP)
 _MENTION_SEPARATOR = _either(_MARK, _GAP, r'[-/]')
@@ -107,7 +109,9 @@ _PROSE_QUALIFIER = _Fragment('(?:', _REF_LEFT_EDGE, _QUALIFIER, ',?', _BLANKS, '
 _TASK_NODE_NAME_PATTERN = _compile(
     _WIDE_PAD, _TASK_WORD, _SEPARATOR, _NUMBER, _WIDE_PAD, anchored=True
 )
-_QUALIFIED_NODE_NAME_PATTERN = _compile(_PAD, _QUALIFIER, _COLON, _NUMBER, _PAD, anchored=True)
+_QUALIFIED_NODE_NAME_PATTERN = _compile(
+    _PAD, _QUALIFIER, _PADDED_COLON, _NUMBER, _PAD, anchored=True
+)
 _TASK_VOCABULARY_QUALIFIER = _compile(r'(sub_?)?tasks?', anchored=True)
 _LOCAL_MENTION_PATTERN = _compile(
     _PROSE_QUALIFIER,
@@ -271,8 +275,9 @@ def scan_content(
     mints a referent from an unregistered qualifier, and a dropped candidate
     keeps the contest it creates with a bare mention of its number. A
     path-shaped *group_id* yields an empty scan. Accepted blind spots: bare digits, task titles, non-ASCII
-    digits or lookalike letters, a qualified ref hard-wrapped across a line
-    break, and a list after the singular task word.
+    digits or lookalike letters, a qualified ref spaced around its colon
+    ('reify: 132') or hard-wrapped across a line break, and a list after the
+    singular task word.
     """
     if not content:
         return LabelScan()

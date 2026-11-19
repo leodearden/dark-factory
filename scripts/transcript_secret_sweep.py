@@ -6,8 +6,12 @@ factory project it walks the agent-transcript archive (``*.jsonl``, including
 archive staging copies a hard kill stranded), the verify logs and the
 offline-lane logs (``LOG_SUFFIXES``: ``*.log``, ``*.json``, junit ``*.xml``
 and gzipped junit ``*.xml.gz``), and it walks ``~/.claude/projects`` for
-transcripts. A ``*.log`` is matched for the raw value as well as its
-JSON-escaped form; transcripts and ``*.json`` for the JSON-escaped form only.
+transcripts and pytest's per-user base temp (``pytest_base_temp``) for the
+environment dumps env-capturing tests leave there, by name
+(``PYTEST_ENV_DUMP_SUFFIXES``). A ``*.log``, a ``*.bin`` and an ``env-dump``
+are matched for the raw value as well as its JSON-escaped form; transcripts
+and ``*.json`` for the JSON-escaped form only. A value a log cut short is
+matched by its prefix (``shared.secret_redaction.MIN_TRUNCATED_PREFIX_LEN``).
 Gzipped junit is redacted by decompressing, replacing and
 recompressing it, and XML gets an entity-escaped placeholder so a report still
 parses; a ``.gz`` that does not decompress is reported unreadable and left as
@@ -19,7 +23,12 @@ be appending to. A sweep that redacted or refused anything files one
 ``risk_identified`` info escalation, and a sweep that could not run, found a
 required root absent, could not read an orchestrator unit or found no unit
 naming a project root files one ``infra_issue`` info escalation naming each
-shortfall. Nothing it prints or files carries a value. Operator view:
+shortfall. A dry run (``--dry-run``) rewrites and files nothing and lists what
+a real run would redact under ``matched``. On a host with no orchestrator
+units (the laptop), ``--host-configs-dir`` takes project roots from its verify
+configs, whose transcript archive is not required (a verify host archives no
+agent transcripts), and ``--no-escalation`` leaves the record line as the only
+report. Nothing it prints or files carries a value. Operator view:
 ``OPERATIONS.md`` §12.
 """
 
@@ -31,16 +40,20 @@ import dataclasses
 import datetime
 import enum
 import functools
+import getpass
 import json
 import os
 import stat
 import sys
+import tempfile
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol
 
 try:
     import orchestrator_projects
+    import yaml
     from dashboard.config import DashboardConfig
     from shared.mcp_post import mcp_server_base
     from shared.mcp_session import SyncMcpSession
@@ -58,6 +71,7 @@ try:
         FileRedaction,
         Markup,
         Needle,
+        preview_redaction,
         redact_in_place,
         redaction_needles,
     )
@@ -78,15 +92,24 @@ NO_SECRETS_CAUSE = 'no secret-bearing values in the environment'
 SHORTFALL_TASK_ID = 'transcript-secret-sweep-shortfall'
 TRANSCRIPT_SUFFIXES = ('.jsonl', '.jsonl' + STAGING_SUFFIX)
 LOG_SUFFIXES = ('.log', '.json', '.xml', '.xml.gz')
+PYTEST_ENV_DUMP_SUFFIXES = (
+    'env-dump', 'env-dump.json', 'env.bin', 'env.json', 'capture.json', 'capture.jsonl', 'state.json',
+)
 
 _FORMATS: tuple[tuple[str, Markup, Codec], ...] = (
     ('.xml.gz', Markup.XML, Codec.GZIP),
     ('.xml', Markup.XML, Codec.PLAIN),
     ('.log', Markup.TEXT, Codec.PLAIN),
+    ('.bin', Markup.TEXT, Codec.PLAIN),
+    ('env-dump', Markup.TEXT, Codec.PLAIN),
 )
 
 PostEscalation = Callable[[dict[str, object]], object]
 NeedlesByMarkup = Mapping[Markup, Sequence[Needle]]
+
+
+class Redact(Protocol):
+    def __call__(self, path: Path, needles: Sequence[Needle], *, codec: Codec) -> FileRedaction: ...
 
 
 @dataclass(frozen=True)
@@ -102,10 +125,11 @@ class SweepConfig:
     now: datetime.datetime
     min_age_secs: float = DEFAULT_MIN_AGE_SECS
     unswept: tuple[str, ...] = ()
+    dry_run: bool = False
 
 
 @dataclass(frozen=True)
-class RedactedFile:
+class FileHits:
     path: Path
     counts: Mapping[str, int]
 
@@ -122,13 +146,16 @@ class _Verdict(enum.Enum):
     DEFERRED = 'deferred'
     UNREADABLE = 'unreadable'
     NOT_A_FILE = 'not-a-file'
+    VANISHED = 'vanished'
 
 
 @dataclass(frozen=True)
 class SweepResult:
     ok: bool
     cause: str | None = None
-    redacted: tuple[RedactedFile, ...] = ()
+    dry_run: bool = False
+    redacted: tuple[FileHits, ...] = ()
+    matched: tuple[FileHits, ...] = ()
     refused: tuple[RefusedFileLine, ...] = ()
     deferred: tuple[Path, ...] = ()
     unreadable: tuple[Path, ...] = ()
@@ -149,7 +176,9 @@ class SweepResult:
         return {
             'ok': self.ok,
             'cause': self.cause,
-            'redacted': [{'path': str(f.path), 'counts': dict(f.counts)} for f in self.redacted],
+            'dry_run': self.dry_run,
+            'redacted': _hits_record(self.redacted),
+            'matched': _hits_record(self.matched),
             'refused': [{'path': str(f.path), 'var': f.var, 'line': f.line_number} for f in self.refused],
             'deferred': [str(path) for path in self.deferred],
             'unreadable': [str(path) for path in self.unreadable],
@@ -160,26 +189,96 @@ class SweepResult:
         }
 
 
-def swept_trees(project_roots: Iterable[Path], claude_projects_dir: Path) -> tuple[SweptTree, ...]:
+def _hits_record(files: Iterable[FileHits]) -> list[dict[str, object]]:
+    return [{'path': str(f.path), 'counts': dict(f.counts)} for f in files]
+
+
+def pytest_base_temp() -> Path:
+    return Path(tempfile.gettempdir()) / f'pytest-of-{getpass.getuser()}'
+
+
+@dataclass(frozen=True)
+class HostConfigProblem:
+    path: Path
+    reason: str
+
+
+@dataclass(frozen=True)
+class HostConfigScan:
+    """The ``project_root`` each host config names, and each config (or the dir) that names none."""
+
+    roots: tuple[Path, ...] = ()
+    problems: tuple[HostConfigProblem, ...] = ()
+
+
+class _UnusableHostConfig(Exception):
+    pass
+
+
+def scan_host_configs(configs_dir: Path) -> HostConfigScan:
+    if not configs_dir.is_dir():
+        return HostConfigScan(problems=(HostConfigProblem(configs_dir, 'not a directory of host configs'),))
+    roots: list[Path] = []
+    problems: list[HostConfigProblem] = []
+    for config in sorted(path for path in configs_dir.glob('*.yaml') if path.is_file()):
+        try:
+            roots.append(_project_root_of(config))
+        except _UnusableHostConfig as exc:
+            problems.append(HostConfigProblem(config, str(exc)))
+    return HostConfigScan(tuple(roots), tuple(problems))
+
+
+def _project_root_of(config: Path) -> Path:
+    try:
+        loaded = yaml.safe_load(config.read_text())
+    except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:
+        raise _UnusableHostConfig(f'unreadable ({type(exc).__name__})') from exc
+    root = loaded.get('project_root') if isinstance(loaded, dict) else None
+    if not isinstance(root, str) or not Path(root).is_absolute():
+        raise _UnusableHostConfig('names no absolute project_root')
+    return Path(root).resolve()
+
+
+def swept_trees(
+    project_roots: Iterable[Path],
+    claude_projects_dir: Path,
+    *,
+    verify_host_roots: Iterable[Path] = (),
+    pytest_tmp_dir: Path | None = None,
+) -> tuple[SweptTree, ...]:
+    """The trees to sweep. An orchestrated project's transcript archive is required; a verify host's
+    (``verify_host_roots``, the laptop's host configs) is not, since it archives no agent transcripts."""
+    orchestrated = tuple(dict.fromkeys(project_roots))
+    verify_only = tuple(root for root in dict.fromkeys(verify_host_roots) if root not in orchestrated)
     per_project = (
         tree
-        for root in project_roots
-        for tree in (
-            SweptTree(agent_transcripts_dir(root), TRANSCRIPT_SUFFIXES, required=True),
-            SweptTree(verify_logs_dir(root), LOG_SUFFIXES, required=False),
-            SweptTree(offline_lane_dir(root), LOG_SUFFIXES, required=False),
-        )
+        for roots, archive_required in ((orchestrated, True), (verify_only, False))
+        for root in roots
+        for tree in _project_trees(root, archive_required=archive_required)
     )
-    return (*per_project, SweptTree(claude_projects_dir, TRANSCRIPT_SUFFIXES, required=True))
+    pytest_tree = (
+        () if pytest_tmp_dir is None else (SweptTree(pytest_tmp_dir, PYTEST_ENV_DUMP_SUFFIXES, required=False),)
+    )
+    return (*per_project, SweptTree(claude_projects_dir, TRANSCRIPT_SUFFIXES, required=True), *pytest_tree)
+
+
+def _project_trees(root: Path, *, archive_required: bool) -> tuple[SweptTree, ...]:
+    return (
+        SweptTree(agent_transcripts_dir(root), TRANSCRIPT_SUFFIXES, required=archive_required),
+        SweptTree(verify_logs_dir(root), LOG_SUFFIXES, required=False),
+        SweptTree(offline_lane_dir(root), LOG_SUFFIXES, required=False),
+    )
 
 
 def run(
     config: SweepConfig,
     *,
     environ: Mapping[str, str],
-    post_escalation: PostEscalation,
+    post_escalation: PostEscalation | None,
 ) -> SweepResult:
     result = _sweep(config, environ)
+    if config.dry_run or post_escalation is None:
+        return result
     errors: list[str] = []
     for arguments in _escalations(result, config.now):
         if (error := _posting_error(post_escalation, arguments)) is not None:
@@ -190,7 +289,10 @@ def run(
 def _sweep(config: SweepConfig, environ: Mapping[str, str]) -> SweepResult:
     secrets = secret_env_values(environ)
     needles = {markup: redaction_needles(secrets, markup=markup) for markup in Markup}
-    result = _scan(config, needles) if needles[Markup.JSON] else SweepResult(ok=False, cause=NO_SECRETS_CAUSE)
+    if needles[Markup.JSON]:
+        result = _scan(config, needles)
+    else:
+        result = SweepResult(ok=False, cause=NO_SECRETS_CAUSE, dry_run=config.dry_run)
     missing = tuple(tree.root for tree in config.trees if tree.required and not tree.root.is_dir())
     return dataclasses.replace(result, missing=missing, unswept=config.unswept)
 
@@ -211,17 +313,18 @@ def _posting_error(post_escalation: PostEscalation, arguments: dict[str, object]
 
 def _scan(config: SweepConfig, needles: NeedlesByMarkup) -> SweepResult:
     cutoff_ns = int((config.now.timestamp() - config.min_age_secs) * 1e9)
-    redacted: list[RedactedFile] = []
+    redact: Redact = preview_redaction if config.dry_run else redact_in_place
+    hits: list[FileHits] = []
     refused: list[RefusedFileLine] = []
     deferred: list[Path] = []
     unreadable: list[Path] = []
     clean = 0
     for path in _swept_files(config.trees, unreadable):
-        outcome = _sweep_file(path, needles, cutoff_ns)
+        outcome = _sweep_file(path, needles, cutoff_ns, redact)
         match outcome:
             case FileRedaction():
                 if outcome.redacted:
-                    redacted.append(RedactedFile(path, outcome.counts))
+                    hits.append(FileHits(path, outcome.counts))
                 refused.extend(RefusedFileLine(path, line.var, line.line_number) for line in outcome.refused)
             case _Verdict.CLEAN:
                 clean += 1
@@ -229,11 +332,13 @@ def _scan(config: SweepConfig, needles: NeedlesByMarkup) -> SweepResult:
                 deferred.append(path)
             case _Verdict.UNREADABLE:
                 unreadable.append(path)
-            case _Verdict.NOT_A_FILE:
+            case _Verdict.NOT_A_FILE | _Verdict.VANISHED:
                 pass
     return SweepResult(
         ok=True,
-        redacted=tuple(redacted),
+        dry_run=config.dry_run,
+        redacted=() if config.dry_run else tuple(hits),
+        matched=tuple(hits) if config.dry_run else (),
         refused=tuple(refused),
         deferred=tuple(deferred),
         unreadable=tuple(unreadable),
@@ -243,7 +348,8 @@ def _scan(config: SweepConfig, needles: NeedlesByMarkup) -> SweepResult:
 
 def _swept_files(trees: Iterable[SweptTree], unreadable: list[Path]) -> Iterator[Path]:
     def note_unlistable(error: OSError) -> None:
-        unreadable.append(Path(error.filename))
+        if not isinstance(error, FileNotFoundError):
+            unreadable.append(Path(error.filename))
 
     for tree in trees:
         if not tree.root.is_dir():
@@ -262,9 +368,13 @@ def _format_of(name: str) -> tuple[Markup, Codec]:
     return Markup.JSON, Codec.PLAIN
 
 
-def _sweep_file(path: Path, needles: NeedlesByMarkup, cutoff_ns: int) -> FileRedaction | _Verdict:
+def _sweep_file(
+    path: Path, needles: NeedlesByMarkup, cutoff_ns: int, redact: Redact
+) -> FileRedaction | _Verdict:
     try:
         st = os.lstat(path)
+    except FileNotFoundError:
+        return _Verdict.VANISHED
     except OSError:
         return _Verdict.UNREADABLE
     if not stat.S_ISREG(st.st_mode):
@@ -273,9 +383,11 @@ def _sweep_file(path: Path, needles: NeedlesByMarkup, cutoff_ns: int) -> FileRed
         return _Verdict.DEFERRED
     markup, codec = _format_of(path.name)
     try:
-        redaction = redact_in_place(path, needles[markup], codec=codec)
+        redaction = redact(path, needles[markup], codec=codec)
     except FileChangedDuringRedaction:
         return _Verdict.DEFERRED
+    except FileNotFoundError:
+        return _Verdict.VANISHED
     except (CorruptCompressedFile, OSError):
         return _Verdict.UNREADABLE
     finally:
@@ -361,11 +473,11 @@ def _post_escalate_info(url: str | None, arguments: dict[str, object]) -> object
 
 
 def _unit_shortfall(
-    targets: Sequence[orchestrator_projects.ProjectTarget],
+    roots: Sequence[Path],
     unit_scan: orchestrator_projects.UnitScan,
     units_dir: Path,
 ) -> tuple[str, ...]:
-    unenumerated = () if targets else (f'{units_dir}: no orchestrator unit names a project root to sweep',)
+    unenumerated = () if roots else (f'{units_dir}: no orchestrator unit names a project root to sweep',)
     return (*unit_scan.problems, *unenumerated)
 
 
@@ -373,11 +485,12 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             'Redact live secret values from agent transcripts, verify logs and offline-lane logs '
-            'already on disk.'
+            'already on disk, or with --dry-run list what is still there.'
         ),
         epilog=(
-            'Exit 0: the sweep covered every required root. Exit 2: it could not run or could not cover '
-            'a required root (it files an infra_issue escalation), or an escalation was not filed.'
+            'Exit 0: the sweep covered every required root (a dry run\'s answer is the record\'s "matched" '
+            'list). Exit 2: it could not run or could not cover a required root (it files an infra_issue '
+            'escalation, unless --dry-run or --no-escalation), or an escalation was not filed.'
         ),
     )
     orchestrator_projects.add_arguments(parser)
@@ -386,6 +499,12 @@ def _parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help='the interactive sessions\' transcript dir (default: ~/.claude/projects)',
+    )
+    parser.add_argument(
+        '--pytest-tmp-dir',
+        type=Path,
+        default=None,
+        help="pytest's per-user base temp, swept for environment dumps (default: <tmpdir>/pytest-of-<user>)",
     )
     parser.add_argument(
         '--escalation-url',
@@ -398,23 +517,50 @@ def _parser() -> argparse.ArgumentParser:
         default=DEFAULT_MIN_AGE_SECS,
         help=f'skip files modified more recently than this (default: {DEFAULT_MIN_AGE_SECS:g})',
     )
+    parser.add_argument(
+        '--dry-run',
+        action='store_true',
+        help='rewrite nothing and file no escalation; list the files a real run would redact under "matched"',
+    )
+    parser.add_argument(
+        '--host-configs-dir',
+        type=Path,
+        default=None,
+        help='also sweep the project_root each DIR/*.yaml names (a host with no orchestrator units, '
+        'e.g. ~/.config/orchestrator on the laptop)',
+    )
+    parser.add_argument(
+        '--no-escalation',
+        action='store_true',
+        help='file no escalation; the record line is the only report (a host with no escalation server)',
+    )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     targets, unit_scan = orchestrator_projects.targets_from_args(args)
+    host_scan = scan_host_configs(args.host_configs_dir) if args.host_configs_dir else HostConfigScan()
+    for problem in host_scan.problems:
+        print(f'transcript_secret_sweep.py: {problem.path}: {problem.reason}', file=sys.stderr)
+    unit_roots = [target.root for target in targets]
     claude_projects = args.claude_projects_dir or Path.home() / '.claude' / 'projects'
     config = SweepConfig(
-        trees=swept_trees([target.root for target in targets], claude_projects),
+        trees=swept_trees(
+            unit_roots,
+            claude_projects,
+            verify_host_roots=host_scan.roots,
+            pytest_tmp_dir=args.pytest_tmp_dir or pytest_base_temp(),
+        ),
         now=datetime.datetime.now(datetime.UTC),
         min_age_secs=args.min_age_secs,
-        unswept=_unit_shortfall(targets, unit_scan, args.units_dir),
+        unswept=_unit_shortfall([*unit_roots, *host_scan.roots], unit_scan, args.units_dir),
+        dry_run=args.dry_run,
     )
     result = run(
         config,
         environ=os.environ,
-        post_escalation=functools.partial(_post_escalate_info, args.escalation_url),
+        post_escalation=None if args.no_escalation else functools.partial(_post_escalate_info, args.escalation_url),
     )
     print(json.dumps(result.record(), sort_keys=True))
     for line in result.shortfall:

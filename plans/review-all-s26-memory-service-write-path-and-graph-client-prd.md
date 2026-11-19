@@ -1517,8 +1517,16 @@ leaves a pointer `plans/review-all-s26-memory-service-write-path-and-graph-clien
   original on a second redirect (5612 widening); `reassign_edge` keeps the uuid (task 3009).
 - Topic pin placement (η): after RRF sort and the category filter so the pin displaces the lowest-ranked
   survivor and never a filtered row; the window stays exactly `limit` long (task 3111, esc-3111-2).
-- The label grammar's precision rules (ο): `[ \t]` not `\s` around separators because `\s` matches a
-  newline (tasks 4123, 4850); ASCII task word, no `IGNORECASE`, because Unicode case folding accepts
+- The label grammar's precision rules (ο): `[ \t]` not `\s` around the separators that take a pad, because
+  `\s` matches a newline (tasks 4123, 4850); a prose qualified ref's colon takes no pad at all (task 6826):
+  over 26,863 distinct live texts from the `fused-memory/calibration` corpora the spaced form matched 1,098
+  times with 0 task refs, the 9 naming a registered project all per-project counts ('dark_factory: 4
+  live'), while the tight form matched 63 registered refs, all genuine; the accepted loss, a spaced genuine
+  ref ('reify: 132'), is pinned as a deliberate miss in `test_canonical_labels.py`; a grammar-refused
+  candidate, unlike a registry-dropped one, contests nothing, so a spaced genuine ref beside a bare
+  mention of its number releases that mention into the refs ('reify: 2500 blocks task 2500' scans as
+  `Task 2500`, pinned as a deliberate trade), accepted on the same 0-of-1,098 measurement; the node-name
+  colon stays padded because a whole node name carries no prose lead-in; ASCII task word, no `IGNORECASE`, because Unicode case folding accepts
   U+017F/U+212A (task 4850); `[0-9]` not `\d` (task 4174); the task-vocabulary qualifier fullmatches a
   caller-lowercased string; per-clause measured false-positive cases live as parametrised test ids in
   `test_canonical_labels.py`. Direction of safety: a narrowing that removes a foreign ref is safe, but one

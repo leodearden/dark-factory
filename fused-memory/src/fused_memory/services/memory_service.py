@@ -87,7 +87,6 @@ from fused_memory.models.reconciliation import (
     EventSource,
     EventType,
     ReconciliationEvent,
-    StageAgentOutcome,
 )
 from fused_memory.models.scope import (
     Scope,
@@ -113,6 +112,7 @@ from fused_memory.reconciliation.standing_decision_constants import (
 from fused_memory.reconciliation.standing_decision_writer import (
     expire_entity_standing_decision,
 )
+from fused_memory.reconciliation.summary_pool import decode_cycle_summary_agent_outcome
 from fused_memory.routing.classifier import WriteClassifier
 from fused_memory.routing.router import ReadRouter
 from fused_memory.services import mem0_retry_backlog_alarm, mem0_write_retry, overreach_guard
@@ -879,9 +879,7 @@ async def _apply_memory_metadata_validation(
     dropped by task GC; it yields the loop, which is the property that
     matters.
     """
-    violations = validate_memory_metadata(
-        meta, enforce_kind_registry=config.enforce_kind_registry
-    )
+    violations = validate_memory_metadata(meta)
 
     # parent_id LIVENESS (leaf δ). Gated on the SHAPE check having passed —
     # `validate_memory_metadata` emits `invalid_parent_id_shape` under the
@@ -985,9 +983,7 @@ async def _apply_memory_metadata_validation(
         before = dict(baseline)
         already = {
             (v.key, v.code)
-            for v in validate_memory_metadata(
-                before, enforce_kind_registry=config.enforce_kind_registry
-            )
+            for v in validate_memory_metadata(before)
         }
         violations = [
             v for v in violations
@@ -8929,11 +8925,8 @@ class MemoryService:
             # be trusted as a suppression signal for Stage 3 (task 2652
             # amendment).
             remediation = raw_remediation if isinstance(raw_remediation, bool) else None
-            raw_outcome = payload.get('agent_outcome') if isinstance(payload, dict) else None
-            try:
-                agent_outcome = StageAgentOutcome(raw_outcome).value
-            except ValueError:
-                agent_outcome = None
+            decoded = decode_cycle_summary_agent_outcome(record)
+            agent_outcome = decoded.value if decoded is not None else None
 
         reason, expected, run_status = await self._classify_summary_absence(
             journal,

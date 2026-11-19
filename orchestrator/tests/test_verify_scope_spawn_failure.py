@@ -25,12 +25,14 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from _fake_systemd_run import fake_systemd_run as fake_systemd_run
 from _merge_lane_fakes import FakeVerifier, VerifyScript
+from _real_project_slice import RealProjectSlice
+from _real_project_slice import real_project_slice as real_project_slice
 
-from orchestrator.config import ModuleConfig, OrchestratorConfig
-from orchestrator.merge_lane.worker import (
+from orchestrator.config import FusedMemoryConfig, ModuleConfig, OrchestratorConfig
+from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
+from orchestrator.merge_lane.verify_failure_outcome import (
     TRANSIENT_INFRA_REASON_PREFIX,
-    _DryRunInvestigationHandles,
-    _run_post_merge_verify,
+    DryRunInvestigationHandles,
 )
 from orchestrator.verify import (
     CheckRun,
@@ -186,12 +188,17 @@ class TestRefusalReasonDoesNotMatter:
 
 
 async def _verify_test_leg_only(
-    worktree: Path, test_command: str, **run_kwargs,
+    worktree: Path, test_command: str, *, project_id: str = '', **run_kwargs,
 ) -> VerifyResult:
-    """A scoped role='task' verify of module ``pkg`` with no lint or type leg."""
+    """A scoped role='task' verify of module ``pkg`` with no lint or type leg;
+    *project_id*, when given, names the project slice its scope spawns under
+    (empty derives it from ``project_root``, as the config does)."""
     return await run_verification(
         worktree,
-        OrchestratorConfig(verify_use_cgroup_scope=True),
+        OrchestratorConfig(
+            verify_use_cgroup_scope=True,
+            fused_memory=FusedMemoryConfig(project_id=project_id),
+        ),
         module_config=ModuleConfig(
             prefix='pkg', test_command=test_command,
             lint_command=None, type_check_command=None,
@@ -318,8 +325,12 @@ def _systemd_user_available() -> bool:
 class TestRealLauncher:
 
     @pytest.mark.asyncio
-    async def test_started_scope_keeps_its_own_verdict(self, worktree):
-        result = await _verify_test_leg_only(worktree, 'exit 3')
+    async def test_started_scope_keeps_its_own_verdict(
+        self, worktree, real_project_slice: RealProjectSlice,
+    ):
+        result = await _verify_test_leg_only(
+            worktree, 'exit 3', project_id=real_project_slice.project_id,
+        )
         assert result.passed is False
         assert result.category != FailureCategory.ENV_TRANSIENT, result.summary
 
@@ -361,11 +372,11 @@ class TestMergeLaneHoldsScopeSpawnFailure:
         verifier = FakeVerifier(default=VerifyScript(result=spawn_failed))
         timeouts: dict[str, int] = {}
 
-        outcome = await _run_post_merge_verify(
+        outcome = await run_post_merge_verify(
             _make_git_ops(), _make_req(tmp_path), MagicMock(),
             timeouts=timeouts, enospc_retries={},
             max_timeouts=2, max_enospc=1,
-            dry_run_handles=_DryRunInvestigationHandles(scheduler=MagicMock()),
+            dry_run_handles=DryRunInvestigationHandles(scheduler=MagicMock()),
             verifier=verifier,
         )
 
@@ -382,7 +393,7 @@ class TestMergeLaneHoldsScopeSpawnFailure:
         spawn_failed = await _scoped_cockpit_merge_verify(worktree)
         verifier = FakeVerifier(sequence=[VerifyScript(result=spawn_failed)])
 
-        outcome = await _run_post_merge_verify(
+        outcome = await run_post_merge_verify(
             _make_git_ops(), _make_req(tmp_path), MagicMock(),
             timeouts={}, enospc_retries={},
             max_timeouts=2, max_enospc=1,

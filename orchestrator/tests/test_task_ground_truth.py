@@ -23,6 +23,7 @@ Covers:
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import json
 import os
@@ -44,6 +45,7 @@ from shared.deploy_state import DeployPhase
 from shared.task_claimant import DEFAULT_CLAIMANT_HEARTBEAT_TTL, compose_claimant_run_id
 
 from orchestrator.artifacts import TaskArtifacts
+from orchestrator.merge_lane import InFlightMergeRegistry
 from orchestrator.merge_lane.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
 from orchestrator.task_ground_truth import (
     BranchState,
@@ -486,12 +488,15 @@ def _make_ground_truth(
     worktree_resolver=None,
     now_fn=None,
     heartbeat_ttl: timedelta | None = None,
+    merge_requests: InFlightMergeRegistry | None = None,
 ) -> TaskGroundTruth:
     kwargs = {}
     if now_fn is not None:
         kwargs['now_fn'] = now_fn
     if heartbeat_ttl is not None:
         kwargs['heartbeat_ttl'] = heartbeat_ttl
+    if merge_requests is not None:
+        kwargs['merge_requests'] = merge_requests
     return TaskGroundTruth(
         git_ops or _fake_git_ops(),
         scheduler or _fake_scheduler(),
@@ -1934,6 +1939,73 @@ class TestRecoveryFor:
         assert report.live_claimant is not None
         assert report.live_claimant.source == ClaimantSource.DB
         assert action == RecoveryAction.LEAVE
+
+
+# ---------------------------------------------------------------------------
+# task 7277 — an in-flight merge request (e.g. one recovered from the journal
+# at startup, whose submitting process is dead) is a live claimant.
+# ---------------------------------------------------------------------------
+
+
+def _ground_truth_with_stale_db_claimant(
+    registry: InFlightMergeRegistry,
+) -> TaskGroundTruth:
+    """Task '40' in-progress, its DB claimant 60 minutes stale, unheld, branch EXISTS_OFF_MAIN."""
+    task = {
+        'status': 'in-progress',
+        'claimant_run_id': 'run-1/session-1/pid=1',
+        'heartbeat_at': '2026-07-12T11:00:00+00:00',
+        'metadata': {},
+    }
+    return _make_ground_truth(
+        git_ops=_fake_git_ops(is_ancestor=False, branch_sha='b' * 40),
+        scheduler=_fake_scheduler(is_actively_held=False, task=task),
+        escalation_queue=_fake_escalation_queue(),
+        now_fn=lambda: datetime(2026, 7, 12, 12, 0, 0, tzinfo=UTC),
+        heartbeat_ttl=timedelta(minutes=10),
+        merge_requests=registry,
+    )
+
+
+@pytest.mark.asyncio
+class TestInFlightMergeRequestIsALiveClaimant:
+    async def test_recovered_request_in_flight_leaves_the_task(self) -> None:
+        registry = InFlightMergeRegistry()
+        registry.acquire(
+            '40', '40', asyncio.get_running_loop().create_future(),
+            request_id='mr-recovered', source='recovery',
+        )
+
+        report, action = await _ground_truth_with_stale_db_claimant(registry).recovery_for('40')
+
+        assert report.live_claimant is not None
+        assert report.live_claimant.source == ClaimantSource.MERGE_REQUEST
+        assert report.live_claimant.run_id is None
+        assert action == RecoveryAction.LEAVE
+
+    async def test_ownership_ends_when_the_request_finalizes(self) -> None:
+        registry = InFlightMergeRegistry()
+        future = asyncio.get_running_loop().create_future()
+        registry.acquire('40', '40', future, request_id='mr-recovered', source='recovery')
+        future.set_result(None)
+        await asyncio.sleep(0)
+
+        report, action = await _ground_truth_with_stale_db_claimant(registry).recovery_for('40')
+
+        assert report.live_claimant is None
+        assert action == RecoveryAction.REVERT_TO_PENDING
+
+    async def test_another_tasks_request_does_not_make_this_task_live(self) -> None:
+        registry = InFlightMergeRegistry()
+        registry.acquire(
+            '41', '41', asyncio.get_running_loop().create_future(),
+            request_id='mr-other', source='recovery',
+        )
+
+        report, action = await _ground_truth_with_stale_db_claimant(registry).recovery_for('40')
+
+        assert report.live_claimant is None
+        assert action == RecoveryAction.REVERT_TO_PENDING
 
 
 # ---------------------------------------------------------------------------

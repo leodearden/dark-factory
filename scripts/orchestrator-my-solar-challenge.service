@@ -27,6 +27,8 @@ StartLimitBurst=10
 
 [Service]
 Type=simple
+# Per-project cgroup slice: docs/cgroup-slice-topology.md
+Slice=df-solar_challenge.slice
 # CWD must be dark-factory so `uv run --project orchestrator` can resolve the
 # orchestrator/ project dir (its pyproject lives only under this repo). The
 # app's load_dotenv() then reads /home/leo/src/dark-factory/.env.

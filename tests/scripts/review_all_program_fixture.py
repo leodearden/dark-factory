@@ -28,8 +28,8 @@ STATE_PATH = PROGRAM_DIR / 'state.py'
 STATE_MODULE_NAME = 'review_all_program_state'
 FAKE_STORE_PATH = FIXTURE_DIR / 'fake_store.py'
 FAKE_STORE_START_TIMEOUT_SECS = 30
-SESSION_REGISTRY_PATH = REPO_ROOT / 'orchestrator' / 'src' / 'orchestrator' / 'session_registry.py'
-SESSION_REGISTRY_MODULE_NAME = 'review_all_program_session_registry'
+SESSION_RECORDS_PATH = REPO_ROOT / 'orchestrator' / 'src' / 'orchestrator' / 'session_records.py'
+SESSION_RECORDS_MODULE_NAME = 'review_all_program_session_records'
 
 
 def load_state() -> types.ModuleType:
@@ -51,19 +51,19 @@ def load_state() -> types.ModuleType:
 
 
 
-def load_session_registry() -> types.ModuleType:
-    """This checkout's ``orchestrator/session_registry.py``, loaded by path once and cached.
+def load_session_records() -> types.ModuleType:
+    """This checkout's ``orchestrator/session_records.py``, loaded by path once and cached.
 
-    Loaded by path so a suite takes the registry's vocabulary from this
-    checkout, not from whichever ``orchestrator`` the venv resolves.
+    Loaded by path so a suite takes the record vocabulary from this checkout,
+    not from whichever ``orchestrator`` the venv resolves.
     """
-    if SESSION_REGISTRY_MODULE_NAME not in sys.modules:
-        spec = importlib.util.spec_from_file_location(SESSION_REGISTRY_MODULE_NAME, SESSION_REGISTRY_PATH)
-        assert spec is not None and spec.loader is not None, SESSION_REGISTRY_PATH
+    if SESSION_RECORDS_MODULE_NAME not in sys.modules:
+        spec = importlib.util.spec_from_file_location(SESSION_RECORDS_MODULE_NAME, SESSION_RECORDS_PATH)
+        assert spec is not None and spec.loader is not None, SESSION_RECORDS_PATH
         module = importlib.util.module_from_spec(spec)
-        sys.modules[SESSION_REGISTRY_MODULE_NAME] = module
+        sys.modules[SESSION_RECORDS_MODULE_NAME] = module
         spec.loader.exec_module(module)
-    return sys.modules[SESSION_REGISTRY_MODULE_NAME]
+    return sys.modules[SESSION_RECORDS_MODULE_NAME]
 
 @dataclass(frozen=True)
 class FakeStore:

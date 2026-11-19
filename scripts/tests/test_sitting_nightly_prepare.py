@@ -494,6 +494,18 @@ def test_the_only_bash_allowed_is_git_show_git_log_and_the_two_prepare_subcomman
     assert mod.PREPARE_COMMAND.endswith(' scripts/sitting/prepare_sitting.py')
 
 
+def test_the_prepare_command_never_syncs_the_shared_root_venv():
+    """The nightly run is confined to this command, so it must not reinstall into the shared root .venv.
+
+    Rationale: tests/scripts/test_uv_run_venv_isolation.py.
+    """
+    tokens = mod.PREPARE_COMMAND.split()
+    assert tokens[:2] == ['uv', 'run']
+    run_flags = tokens[2:tokens.index('python')]
+    assert '--no-sync' in run_flags
+    assert not {'--frozen', '--locked'} & set(run_flags)
+
+
 def test_every_allowed_git_read_has_its_output_flag_denied(tmp_path, pool):
     fake = _fake_claude(tmp_path)
 

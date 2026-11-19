@@ -1,6 +1,6 @@
 """Tests for orchestrator.recover_main CLI — step-7 RED.
 
-Mirrors test_b3_gate.py's CLI-invocation + JSON-parse pattern:
+Mirrors test_b3_gate_cli.py's CLI-invocation + JSON-parse pattern:
 monkeypatch recover_red_main to return a known result, capture stdout,
 json.loads it, assert required keys.
 """

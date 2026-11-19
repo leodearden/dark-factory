@@ -3,12 +3,15 @@
 # Invoked by scripts/transcript-secret-sweep.service's ExecStart (systemd
 # .timer-driven, nightly 02:30).
 #
-# Runs scripts/transcript_secret_sweep.py over every factory project's
-# agent-transcript archive, verify logs and offline-lane logs (gzipped junit
-# included), and over ~/.claude/projects. The sweep matches the
+# Runs scripts/transcript_secret_sweep.py over the trees
+# scripts/transcript_secret_sweep.py::swept_trees names. The sweep matches the
 # secret values ITS OWN environment holds, so this wrapper sources $REPO/.env
 # (the same file the orchestrators load) before running it. Nothing here
 # echoes an environment value.
+#
+# Arguments are forwarded to the sweep: leo-laptop's drop-in
+# (scripts/transcript-secret-sweep.laptop.conf) adds --host-configs-dir and
+# --no-escalation, and a hand run can add --dry-run.
 #
 # ALWAYS EXITS 0. A recurring oneshot that exits non-zero enters systemd
 # `failed` state and stays there, silently stopping the timer (the lesson in
@@ -48,8 +51,8 @@ else
 fi
 
 if [ "$sweep_rc" -eq 0 ]; then
-    echo "transcript-secret-sweep: sweeping agent transcripts and verify/offline-lane logs for live secret values"
-    "${SWEEP_CMD[@]}" "$REPO/scripts/transcript_secret_sweep.py"
+    echo "transcript-secret-sweep: sweeping for live secret values"
+    "${SWEEP_CMD[@]}" "$REPO/scripts/transcript_secret_sweep.py" "$@"
     sweep_rc=$?
 fi
 if [ "$sweep_rc" -ne 0 ]; then

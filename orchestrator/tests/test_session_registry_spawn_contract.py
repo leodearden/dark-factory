@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from orchestrator import session_records
 from orchestrator import session_registry as sr
 
 _UNSET = object()
@@ -26,18 +27,18 @@ class TestResultOutcomeVocabulary:
         ('---\nchanged: x\n---\noutcome: done\n', None),
     ])
     def test_header_outcome_or_none(self, text, expected):
-        assert sr.parse_result_outcome(text) == expected
+        assert session_records.parse_result_outcome(text) == expected
 
     def test_parser_returns_the_typed_outcome(self):
-        assert sr.parse_result_outcome('outcome: in-progress\n') is sr.ResultOutcome.IN_PROGRESS
+        assert session_records.parse_result_outcome('outcome: in-progress\n') is session_records.ResultOutcome.IN_PROGRESS
 
     def test_outcomes_are_spelled_in_trailer_order(self):
-        assert sr.RESULT_OUTCOMES == ('done', 'blocked', 'abandoned', 'handed-off', 'in-progress')
+        assert session_records.RESULT_OUTCOMES == ('done', 'blocked', 'abandoned', 'handed-off', 'in-progress')
 
     def test_owning_outcomes_are_terminal_and_only_the_checkpoint_is_not(self):
-        assert sr.OWNING_OUTCOMES <= sr.TERMINAL_RESULT_OUTCOMES
-        assert frozenset(sr.RESULT_OUTCOMES) - {sr.ResultOutcome.IN_PROGRESS} == sr.TERMINAL_RESULT_OUTCOMES
-        assert {'done', 'handed-off'} == sr.OWNING_OUTCOMES
+        assert session_records.OWNING_OUTCOMES <= session_records.TERMINAL_RESULT_OUTCOMES
+        assert frozenset(session_records.RESULT_OUTCOMES) - {session_records.ResultOutcome.IN_PROGRESS} == session_records.TERMINAL_RESULT_OUTCOMES
+        assert {'done', 'handed-off'} == session_records.OWNING_OUTCOMES
 
 
 def _set_launch_env(
@@ -72,13 +73,13 @@ def _launch(
     self_exit: object = _UNSET,
     *,
     t3_end: object = _UNSET,
-) -> tuple[str, sr.SessionRecord]:
+) -> tuple[str, session_records.SessionRecord]:
     """Run the ``launching`` verb as spawn-claude.sh does; return the printed record dir and the record."""
     launcher_pid = _set_launch_env(monkeypatch, fleet_root, self_exit=self_exit, t3_end=t3_end)
     assert sr.main(['launching']) == 0
     record_dir = capsys.readouterr().out.strip()
-    slug = sr.build_session_slug('prd', 'df', '7179', launcher_pid)
-    return record_dir, sr.read_record(slug, root=fleet_root)
+    slug = session_records.build_session_slug('prd', 'df', '7179', launcher_pid)
+    return record_dir, session_records.read_record(slug, root=fleet_root)
 
 
 class TestSelfExitInput:
@@ -95,32 +96,32 @@ class TestSelfExitInput:
 
         assert sr.main(['exit', '--record', record_dir, '--code', '0']) == 0
 
-        exited = sr.read_record(launched.session_slug, root=tmp_path)
-        assert exited.status == sr.Status.EXITED
+        exited = session_records.read_record(launched.session_slug, root=tmp_path)
+        assert exited.status == session_records.Status.EXITED
         assert exited.self_exit is True
 
 
 class TestSelfExitField:
     def test_defaults_off(self):
-        assert sr.SessionRecord(session_slug='s', status=sr.Status.LAUNCHING).self_exit is False
+        assert session_records.SessionRecord(session_slug='s', status=session_records.Status.LAUNCHING).self_exit is False
 
     def test_a_record_written_before_the_field_existed_reads_off(self):
-        assert sr.SessionRecord.from_dict({'session_slug': 's', 'status': 'launching'}).self_exit is False
+        assert session_records.SessionRecord.from_dict({'session_slug': 's', 'status': 'launching'}).self_exit is False
 
     @pytest.mark.parametrize(('stored', 'expected'), [
         ('true', False), (1, False), ('yes', False), (None, False), (True, True),
     ])
     def test_only_a_json_true_reads_on(self, stored, expected):
-        data = sr.SessionRecord(session_slug='s', status=sr.Status.EXITED).to_dict()
+        data = session_records.SessionRecord(session_slug='s', status=session_records.Status.EXITED).to_dict()
         data['self_exit'] = stored
 
-        assert sr.SessionRecord.from_dict(data).self_exit is expected
+        assert session_records.SessionRecord.from_dict(data).self_exit is expected
 
 
 class TestT3EndInput:
     @pytest.mark.parametrize(('value', 'self_exit', 'expected'), [
-        ('settle', _UNSET, sr.T3End.SETTLE),
-        ('archive', '1', sr.T3End.ARCHIVE),
+        ('settle', _UNSET, session_records.T3End.SETTLE),
+        ('archive', '1', session_records.T3End.ARCHIVE),
         ('', _UNSET, None),
         ('none', _UNSET, None),
         (_UNSET, _UNSET, None),
@@ -153,66 +154,66 @@ class TestT3EndInput:
 
         assert sr.main(['exit', '--record', record_dir, '--code', '0']) == 0
 
-        exited = sr.read_record(launched.session_slug, root=tmp_path)
-        assert exited.status == sr.Status.EXITED
+        exited = session_records.read_record(launched.session_slug, root=tmp_path)
+        assert exited.status == session_records.Status.EXITED
         assert exited.exit_code == 0
-        assert exited.t3_end is sr.T3End.ARCHIVE
+        assert exited.t3_end is session_records.T3End.ARCHIVE
 
 
 class TestT3EndField:
     def test_defaults_to_no_act(self):
-        assert sr.SessionRecord(session_slug='s', status=sr.Status.LAUNCHING).t3_end is None
+        assert session_records.SessionRecord(session_slug='s', status=session_records.Status.LAUNCHING).t3_end is None
 
     def test_a_record_written_before_the_field_existed_reads_none(self):
-        assert sr.SessionRecord.from_dict({'session_slug': 's', 'status': 'launching'}).t3_end is None
+        assert session_records.SessionRecord.from_dict({'session_slug': 's', 'status': 'launching'}).t3_end is None
 
-    @pytest.mark.parametrize(('act', 'wire'), [(sr.T3End.SETTLE, 'settle'), (sr.T3End.ARCHIVE, 'archive'), (None, None)])
+    @pytest.mark.parametrize(('act', 'wire'), [(session_records.T3End.SETTLE, 'settle'), (session_records.T3End.ARCHIVE, 'archive'), (None, None)])
     def test_is_stored_as_its_wire_string(self, act, wire):
-        stored = sr.SessionRecord(session_slug='s', status=sr.Status.LAUNCHING, t3_end=act).to_dict()['t3_end']
+        stored = session_records.SessionRecord(session_slug='s', status=session_records.Status.LAUNCHING, t3_end=act).to_dict()['t3_end']
 
         assert stored == wire
         assert type(stored) is type(wire)
 
     @pytest.mark.parametrize(('stored', 'expected'), [
-        ('settle', sr.T3End.SETTLE), ('archive', sr.T3End.ARCHIVE),
+        ('settle', session_records.T3End.SETTLE), ('archive', session_records.T3End.ARCHIVE),
         ('none', None), ('Settle', None), (1, None), (True, None), ({}, None),
     ])
     def test_only_a_member_wire_string_reads_back_as_an_act(self, stored, expected):
-        data = sr.SessionRecord(session_slug='s', status=sr.Status.EXITED).to_dict()
+        data = session_records.SessionRecord(session_slug='s', status=session_records.Status.EXITED).to_dict()
         data['t3_end'] = stored
 
-        assert sr.SessionRecord.from_dict(data).t3_end is expected
+        assert session_records.SessionRecord.from_dict(data).t3_end is expected
 
 
 _AT = '2026-10-23T00:00:00+00:00'
 
 
-def _kill_failed_record() -> sr.SessionRecord:
-    return sr.SessionRecord(
+def _kill_failed_record() -> session_records.SessionRecord:
+    return session_records.SessionRecord(
         session_slug='s',
-        status=sr.Status.IDLE,
-        exit_request=sr.ExitRequest(
-            state=sr.ExitRequestState.KILL_FAILED, reason='ESRCH', pid=7193001, at=_AT, marker_session_id='uuid-a',
+        status=session_records.Status.IDLE,
+        exit_request=session_records.ExitRequest(
+            state=session_records.ExitRequestState.KILL_FAILED, reason='ESRCH', pid=7193001, at=_AT, marker_session_id='uuid-a',
         ),
         exit_requested_at=_AT,
     )
 
 
-def _stored(**body: object) -> sr.SessionRecord:
-    data = sr.SessionRecord(session_slug='s', status=sr.Status.IDLE).to_dict()
+def _stored(**body: object) -> session_records.SessionRecord:
+    data = session_records.SessionRecord(session_slug='s', status=session_records.Status.IDLE).to_dict()
     data.update(body)
-    return sr.SessionRecord.from_dict(data)
+    return session_records.SessionRecord.from_dict(data)
 
 
 class TestExitRequestField:
     def test_defaults_to_no_evaluation(self):
-        record = sr.SessionRecord(session_slug='s', status=sr.Status.IDLE)
+        record = session_records.SessionRecord(session_slug='s', status=session_records.Status.IDLE)
 
         assert record.exit_request is None
         assert record.exit_requested_at is None
 
     def test_a_record_written_before_the_fields_existed_reads_none(self):
-        record = sr.SessionRecord.from_dict({'session_slug': 's', 'status': 'idle'})
+        record = session_records.SessionRecord.from_dict({'session_slug': 's', 'status': 'idle'})
 
         assert record.exit_request is None
         assert record.exit_requested_at is None
@@ -220,8 +221,8 @@ class TestExitRequestField:
     def test_round_trips_losslessly(self):
         record = _kill_failed_record()
 
-        assert sr.SessionRecord.from_dict(record.to_dict()) == record
-        assert sr.SessionRecord.from_json(record.to_json()) == record
+        assert session_records.SessionRecord.from_dict(record.to_dict()) == record
+        assert session_records.SessionRecord.from_json(record.to_json()) == record
 
     def test_is_stored_as_wire_scalars(self):
         assert _kill_failed_record().to_dict()['exit_request'] == {
@@ -229,7 +230,7 @@ class TestExitRequestField:
         }
 
     def test_state_wire_values(self):
-        assert {state.value for state in sr.ExitRequestState} == {'refused', 'attempted', 'kill_failed'}
+        assert {state.value for state in session_records.ExitRequestState} == {'refused', 'attempted', 'kill_failed'}
 
     @pytest.mark.parametrize('stored', [
         'attempted', [], {'state': 'exploded', 'reason': None, 'pid': 7193001, 'at': _AT}, {},

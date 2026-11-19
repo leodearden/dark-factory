@@ -68,6 +68,7 @@ from fused_memory.reconciliation.finding_task_escalation import (
     FINDING_TASK_ESCALATION_CATEGORY,
     build_finding_task_escalation_kwargs,
     is_routable_task_id,
+    liveness_unknown_detail,
     recent_conversion_suppresses_refile,
     resolve_finding_task_target,
     routed_record_carries_finding,
@@ -271,11 +272,6 @@ _DEAD_OWNER_STORM_FINDING: dict[str, Any] = {
 # escalates within a watchable window (≈ 10–180 minutes depending on cycle
 # duration), long enough to filter transient findings.
 _INTEGRITY_FINDING_RECURRENCE_THRESHOLD = 4
-
-#: Detail key on a persistent-finding escalation listing the cited task ids
-#: whose liveness probe failed: the escalation filed because none was confirmed
-#: live, not because each was confirmed not live (task 5370).
-LIVENESS_UNKNOWN_DETAIL_KEY = 'liveness_unknown_task_ids'
 
 # Task 3049 amendment: hard ceiling on the EFFECTIVE value of
 # config.max_backlog_remediation_deferrals, derived from the threshold above so
@@ -2742,7 +2738,8 @@ class ReconciliationHarness:
 
         *liveness_unknown* says the target is filed because its liveness probe
         failed, not because it was confirmed not live (task 5370). It marks the
-        WARNING-level filed log line; the record's detail does not carry it.
+        WARNING-level filed log line, and the record's detail lists the target
+        under ``LIVENESS_UNKNOWN_DETAIL_KEY``.
         """
         # Mirrors _escalate's guard: on ImportError the module-level names are
         # left UNBOUND (not set to None as in targeted.py), so `HAS_ESCALATION`
@@ -2883,6 +2880,7 @@ class ReconciliationHarness:
                     run_id=run_id,
                     persistence=persistence,
                     finding_fingerprint=fingerprint,
+                    target_liveness_unknown=liveness_unknown,
                 ),
             )
             esc_id: str = queue.submit(esc)
@@ -5882,11 +5880,12 @@ class ReconciliationHarness:
                                 },
                             )
                         else:
-                            escalation_detail = {**finding, 'persistence': persistence}
+                            escalation_detail = {
+                                **finding,
+                                'persistence': persistence,
+                                **liveness_unknown_detail(liveness_unknown),
+                            }
                             if liveness_unknown:
-                                escalation_detail[LIVENESS_UNKNOWN_DETAIL_KEY] = sorted(
-                                    liveness_unknown
-                                )
                                 logger.warning(
                                     'reconciliation.integrity_escalation_liveness_unknown',
                                     extra={

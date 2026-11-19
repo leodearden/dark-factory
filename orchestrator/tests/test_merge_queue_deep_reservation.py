@@ -41,7 +41,7 @@ from _merge_lane_fakes import (
 from _orch_helpers import MERGE_GATE_BARRIER_TIMEOUT, MERGE_RESULT_TIMEOUT, wait_responsive
 from test_merge_lane_coalesce_admission import _TrainHooks
 
-from orchestrator.config import GitConfig, MergeDeepConfig, OrchestratorConfig
+from orchestrator.config import DepthRow, GitConfig, MergeDeepConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_lane import MergeLane, MergeOutcome, MergeRequest, QueuedBranch
@@ -88,9 +88,12 @@ def _scene(
 
 
 def _deep(chain_cap: int = 3, *, reservation_timeout: float = 1e9) -> MergeDeepConfig:
+    """Deep chains switched on by *chain_cap* and bounded at that many items by
+    the one-row depth table ``[(0.0, chain_cap)]``."""
     return MergeDeepConfig(
         chain_cap=chain_cap, chain_build_timeout_secs=300,
         chain_reservation_timeout_secs=reservation_timeout,
+        depth_table=[DepthRow(0.0, max(chain_cap, 2))],
     )
 
 

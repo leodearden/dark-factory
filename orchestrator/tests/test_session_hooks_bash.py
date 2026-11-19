@@ -13,7 +13,7 @@ from _process_tree_fakes import claude_process_tree
 from _session_hook_fixtures import assert_hook_env_isolated, isolate_hook_env, owner_ppid_env
 
 from orchestrator import session_hooks as sh
-from orchestrator import session_registry as sr
+from orchestrator import session_records
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _HOOKS_DIR = _REPO_ROOT / 'skills' / 'spawn' / 'hooks'
@@ -62,14 +62,14 @@ def test_session_start_sh_then_notification_sh_flip_status(tmp_path: Path) -> No
     assert start_result.returncode == 0
 
     slug = sh.hook_session_slug(hook_input, env={})
-    record = sr.read_record(slug, root=tmp_path)
-    assert record.status == sr.Status.RUNNING
+    record = session_records.read_record(slug, root=tmp_path)
+    assert record.status == session_records.Status.RUNNING
 
     notification_result = _run_hook_script('notification.sh', hook_input, tmp_path)
     assert notification_result.returncode == 0
 
-    record = sr.read_record(slug, root=tmp_path)
-    assert record.status == sr.Status.AWAITING_INPUT
+    record = session_records.read_record(slug, root=tmp_path)
+    assert record.status == session_records.Status.AWAITING_INPUT
 
 
 # ---------------------------------------------------------------------------
@@ -85,8 +85,8 @@ def test_session_start_sh_converges_onto_pre_written_launching_record(tmp_path: 
     # RUNNING via the real session-start.sh entrypoint -- with a DIFFERENT
     # Claude Code session_id -- when CLAUDE_SPAWN_SESSION_ID=S is in env.
     slug = 'session-cockpit-3215099'
-    sr.write_record(
-        sr.SessionRecord(session_slug=slug, status=sr.Status.LAUNCHING, launcher_pid=3215099),
+    session_records.write_record(
+        session_records.SessionRecord(session_slug=slug, status=session_records.Status.LAUNCHING, launcher_pid=3215099),
         root=tmp_path,
     )
     hook_input = {'session_id': 'uuid-bash-convergence', 'cwd': '/home/leo/src/dark-factory'}
@@ -99,10 +99,10 @@ def test_session_start_sh_converges_onto_pre_written_launching_record(tmp_path: 
     )
 
     assert result.returncode == 0
-    record = sr.read_record(slug, root=tmp_path)
-    assert record.status == sr.Status.RUNNING
+    record = session_records.read_record(slug, root=tmp_path)
+    assert record.status == session_records.Status.RUNNING
     # No separate uuid-keyed duplicate.
-    dirs = list(sr.sessions_dir(root=tmp_path).iterdir())
+    dirs = list(session_records.sessions_dir(root=tmp_path).iterdir())
     assert len(dirs) == 1
     assert dirs[0].name == slug
 
@@ -117,9 +117,9 @@ def test_nested_compact_cannot_invert_ownership(tmp_path: Path) -> None:
     # agent behaviour with no hook fault.
     slug = 'session-cockpit-4400010'
     env = owner_ppid_env(slug, 4400500)
-    sr.write_record(
-        sr.SessionRecord(
-            session_slug=slug, status=sr.Status.LAUNCHING, launcher_pid=4400010,
+    session_records.write_record(
+        session_records.SessionRecord(
+            session_slug=slug, status=session_records.Status.LAUNCHING, launcher_pid=4400010,
             result_file='/tmp/result-4400010.md',
         ),
         root=tmp_path,
@@ -128,18 +128,18 @@ def test_nested_compact_cannot_invert_ownership(tmp_path: Path) -> None:
     # bash, so it may claim the record.
     owner = {'session_id': 'uuid-owner', 'cwd': '/home/leo/src/dark-factory'}
     sh.run_session_start(owner, env, root=tmp_path, process_tree=claude_process_tree(4400501, 4400500))
-    assert sr.read_record(slug, root=tmp_path).claude_owner_pid is not None
+    assert session_records.read_record(slug, root=tmp_path).claude_owner_pid is not None
 
     # A DIFFERENT process (the nested claude) presenting an auto-compact.
     nested_tree = claude_process_tree(999_001, 4400500)
     nested = {'session_id': 'uuid-nested', 'cwd': '/home/leo/src/dark-factory', 'source': 'compact'}
     sh.run_session_start(nested, env, root=tmp_path, process_tree=nested_tree)
 
-    spawner = sr.read_record(slug, root=tmp_path)
+    spawner = session_records.read_record(slug, root=tmp_path)
     assert spawner.claude_session_id == 'uuid-owner'      # NOT rebound
     assert spawner.result_file == '/tmp/result-4400010.md'
     forked_slug = sh.hook_session_slug(nested, env, root=tmp_path, process_tree=nested_tree)
-    forked = sr.read_record(forked_slug, root=tmp_path)
+    forked = session_records.read_record(forked_slug, root=tmp_path)
     assert forked.claude_session_id == 'uuid-nested'
 
 
@@ -153,8 +153,8 @@ def test_owner_auto_compact_still_converges_on_its_own_record(
     # pid => the re-mint is forgiven and the record stays converged.
     slug = 'session-cockpit-4400011'
     env = owner_ppid_env(slug, 4400510)
-    sr.write_record(
-        sr.SessionRecord(session_slug=slug, status=sr.Status.LAUNCHING, launcher_pid=4400011),
+    session_records.write_record(
+        session_records.SessionRecord(session_slug=slug, status=session_records.Status.LAUNCHING, launcher_pid=4400011),
         root=tmp_path,
     )
     tree = claude_process_tree(4400511, 4400510)
@@ -164,8 +164,8 @@ def test_owner_auto_compact_still_converges_on_its_own_record(
     remint = {'session_id': 'uuid-owner-2', 'cwd': '/home/leo/src/dark-factory', 'source': 'compact'}
     sh.run_session_start(remint, env, root=tmp_path, process_tree=tree)
 
-    assert sr.read_record(slug, root=tmp_path).claude_session_id == 'uuid-owner-2'
-    assert len(list(sr.sessions_dir(root=tmp_path).iterdir())) == 1
+    assert session_records.read_record(slug, root=tmp_path).claude_session_id == 'uuid-owner-2'
+    assert len(list(session_records.sessions_dir(root=tmp_path).iterdir())) == 1
 
 
 def test_legacy_record_without_owner_pid_adopts_rather_than_splitting_the_owner(
@@ -182,9 +182,9 @@ def test_legacy_record_without_owner_pid_adopts_rather_than_splitting_the_owner(
     # mismatches (see the test below).
     slug = 'session-cockpit-4400012'
     env = {'CLAUDE_SPAWN_SESSION_ID': slug}
-    sr.write_record(
-        sr.SessionRecord(
-            session_slug=slug, status=sr.Status.RUNNING, launcher_pid=4400012,
+    session_records.write_record(
+        session_records.SessionRecord(
+            session_slug=slug, status=session_records.Status.RUNNING, launcher_pid=4400012,
             claude_session_id='uuid-owner',  # bound, but no owner pid
         ),
         root=tmp_path,
@@ -192,8 +192,8 @@ def test_legacy_record_without_owner_pid_adopts_rather_than_splitting_the_owner(
     remint = {'session_id': 'uuid-other', 'cwd': '/home/leo/src/dark-factory', 'source': 'compact'}
     sh.run_session_start(remint, env, root=tmp_path)
 
-    assert sr.read_record(slug, root=tmp_path).claude_session_id == 'uuid-other'
-    assert len(list(sr.sessions_dir(root=tmp_path).iterdir())) == 1
+    assert session_records.read_record(slug, root=tmp_path).claude_session_id == 'uuid-other'
+    assert len(list(session_records.sessions_dir(root=tmp_path).iterdir())) == 1
 
 
 def test_unresolvable_current_owner_pid_adopts_rather_than_splitting_the_owner(
@@ -206,9 +206,9 @@ def test_unresolvable_current_owner_pid_adopts_rather_than_splitting_the_owner(
     # to read. Unprovable again means adopt.
     slug = 'session-cockpit-4400013'
     env = {'CLAUDE_SPAWN_SESSION_ID': slug}
-    sr.write_record(
-        sr.SessionRecord(
-            session_slug=slug, status=sr.Status.RUNNING, launcher_pid=4400013,
+    session_records.write_record(
+        session_records.SessionRecord(
+            session_slug=slug, status=session_records.Status.RUNNING, launcher_pid=4400013,
             claude_session_id='uuid-owner', claude_owner_pid=4400099,
         ),
         root=tmp_path,
@@ -216,5 +216,5 @@ def test_unresolvable_current_owner_pid_adopts_rather_than_splitting_the_owner(
     remint = {'session_id': 'uuid-owner-2', 'cwd': '/home/leo/src/dark-factory', 'source': 'compact'}
     sh.run_session_start(remint, env, root=tmp_path, process_tree=claude_process_tree(None))
 
-    assert sr.read_record(slug, root=tmp_path).claude_session_id == 'uuid-owner-2'
-    assert len(list(sr.sessions_dir(root=tmp_path).iterdir())) == 1
+    assert session_records.read_record(slug, root=tmp_path).claude_session_id == 'uuid-owner-2'
+    assert len(list(session_records.sessions_dir(root=tmp_path).iterdir())) == 1

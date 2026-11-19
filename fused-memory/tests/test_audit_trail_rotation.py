@@ -641,12 +641,7 @@ class TestRollupRecord:
             'x_previous_archive_memory_id': 'prior-archive-0',
         }
         assert memory_metadata.classify_unknown_keys(dict(plan.archive_metadata)) == []
-        assert (
-            memory_metadata.validate_memory_metadata(
-                dict(plan.archive_metadata), enforce_kind_registry=True
-            )
-            == []
-        )
+        assert memory_metadata.validate_memory_metadata(dict(plan.archive_metadata)) == []
 
     def test_first_archive_has_no_previous_archive(self):
         _, plan = self._size_rotated()

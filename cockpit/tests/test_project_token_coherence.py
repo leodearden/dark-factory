@@ -22,7 +22,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 from orchestrator import decision_registry as dr
-from orchestrator import session_registry as sr
+from orchestrator import session_records
 
 _NOW = datetime(2026, 7, 7, tzinfo=UTC)
 
@@ -38,16 +38,16 @@ _CANONICAL = 'dark_factory'
 
 def _seed_fleet(tmp_path):
     """Write one awaiting-input session and one OPEN decision, spelled apart."""
-    sr.write_record(
-        sr.SessionRecord(
+    session_records.write_record(
+        session_records.SessionRecord(
             session_slug='unblock-df-2085-4242',
-            status=sr.Status.AWAITING_INPUT,
+            status=session_records.Status.AWAITING_INPUT,
             title='unblock:df#2085 slug',
             role='unblock',
             project=_SESSION_SPELLING,
             task_id='2085',
             start_ts='2026-07-07T00:00:00+00:00',
-            question=sr.Question(text='Which port?', asked_at='2026-07-07T00:00:00+00:00'),
+            question=session_records.Question(text='Which port?', asked_at='2026-07-07T00:00:00+00:00'),
         ),
         root=tmp_path,
     )

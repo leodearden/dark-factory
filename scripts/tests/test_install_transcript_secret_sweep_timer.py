@@ -287,8 +287,11 @@ def _recorder(tmp_path: Path) -> Path:
     return recorder
 
 
-def _run_wrapper(tmp_path: Path, **env: str | None) -> tuple[subprocess.CompletedProcess[str], dict | None]:
-    """Run the wrapper over a tmp repo; an *env* value of None removes that key. The record is None if never written."""
+def _run_wrapper(
+    tmp_path: Path, *args: str, **env: str | None
+) -> tuple[subprocess.CompletedProcess[str], dict | None]:
+    """Run the wrapper over a tmp repo, forwarding *args*; an *env* value of None removes that key. The record is
+    None if never written."""
     repo = tmp_path / 'repo'
     repo.mkdir(exist_ok=True)
     (repo / '.env').write_text(f'{_FAKE_POOL_VAR}=fake-wrapper-token-' + 'w' * 30 + '\n')
@@ -301,7 +304,9 @@ def _run_wrapper(tmp_path: Path, **env: str | None) -> tuple[subprocess.Complete
         **env,
     }
     full_env = {k: v for k, v in merged.items() if v is not None}
-    completed = subprocess.run(['bash', str(WRAPPER)], env=full_env, capture_output=True, text=True, timeout=60)
+    completed = subprocess.run(
+        ['bash', str(WRAPPER), *args], env=full_env, capture_output=True, text=True, timeout=60,
+    )
     return completed, json.loads(record.read_text()) if record.exists() else None
 
 
@@ -311,6 +316,15 @@ def test_the_wrapper_runs_the_sweep_from_its_repo(tmp_path):
     assert completed.returncode == 0, completed.stderr
     assert recorded is not None, completed.stderr
     assert recorded['argv'] == [f'{tmp_path / "repo"}/scripts/transcript_secret_sweep.py']
+
+
+def test_the_wrapper_forwards_its_arguments(tmp_path):
+    completed, recorded = _run_wrapper(tmp_path, '--dry-run', '--host-configs-dir', '/x')
+
+    assert completed.returncode == 0, completed.stderr
+    assert recorded['argv'] == [
+        f'{tmp_path / "repo"}/scripts/transcript_secret_sweep.py', '--dry-run', '--host-configs-dir', '/x',
+    ]
 
 
 def test_the_wrapper_sources_the_repo_env_so_the_sweep_sees_live_values(tmp_path):

@@ -1963,7 +1963,8 @@ def test_prune_write_ops_takes_every_bound_from_its_caller():
     assert defaulted == [], (
         'RED: prune_write_ops re-grew a default for '
         f'{defaulted} — that is a second copy of a number whose home is '
-        'config/schema.py::WriteJournalConfig, and server/main.py already '
+        'config/schema.py::WriteJournalConfig, and '
+        'services/write_ops_retention.py::prune_write_ops_pass already '
         'passes all six from there.'
     )
 

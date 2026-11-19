@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
 import pytest  # pyright: ignore[reportMissingImports]
 
 from orchestrator import session_hooks as sh
+from orchestrator import session_records
 from orchestrator import session_registry as sr
 
 _SPAWN_ENV_VARS = (
@@ -97,6 +99,14 @@ def test_sibling_linked_worktree_resolves_to_main_checkout(acme: Path, tmp_path:
     assert _cwd_project(worktree) == 'acme'
 
 
+def test_symlinked_cwd_names_the_checkout_it_resolves_to(acme: Path, tmp_path: Path) -> None:
+    """A spawn's logical cwd and a hook's physical cwd name one project."""
+    _mkdir(acme / 'orchestrator')
+    link = tmp_path / 'acme-link'
+    link.symlink_to(acme)
+    assert _cwd_project(link / 'orchestrator') == 'acme'
+
+
 def test_relative_gitfile_resolves_against_the_gitfile_directory(acme: Path, tmp_path: Path) -> None:
     """The layout ``git worktree add --relative-paths`` writes, hand-built for gits that predate it."""
     admin = _mkdir(acme / '.git' / 'worktrees' / 'x')
@@ -110,6 +120,12 @@ def test_submodule_resolves_to_its_own_checkout(acme: Path, tmp_path: Path) -> N
     upstream = _init_repo(tmp_path / 'upstream')
     _git(acme, '-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', str(upstream), 'vendor/widget')
     assert _cwd_project(_mkdir(acme / 'vendor' / 'widget' / 'src')) == 'widget'
+
+
+def test_bare_backed_worktree_resolves_to_its_own_checkout(acme: Path, tmp_path: Path) -> None:
+    _git(tmp_path, 'clone', '-q', '--bare', str(acme), str(tmp_path / 'acme.git'))
+    _add_worktree(tmp_path / 'acme.git', tmp_path / 'bare-wt', 'bwt')
+    assert _cwd_project(_mkdir(tmp_path / 'bare-wt' / 'src')) == 'bare-wt'
 
 
 def test_directory_outside_any_repo_keeps_its_basename(tmp_path: Path) -> None:
@@ -127,6 +143,35 @@ def test_unresolvable_gitfile_falls_back_to_the_checkout_holding_it(tmp_path: Pa
     odd = _mkdir(tmp_path / 'odd')
     (odd / '.git').write_text(gitfile_content.format(tmp_path=tmp_path))
     assert _cwd_project(_mkdir(odd / 'sub')) == 'odd'
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason='root searches a mode-000 directory')
+def test_gitdir_under_an_unsearchable_directory_falls_back_to_the_checkout_holding_it(tmp_path: Path) -> None:
+    odd = _mkdir(tmp_path / 'odd')
+    locked = tmp_path / 'locked'
+    _mkdir(locked / 'gd')
+    (odd / '.git').write_text(f'gitdir: {locked}/gd\n')
+    sub = _mkdir(odd / 'sub')
+    locked.chmod(0)
+    try:
+        assert _cwd_project(sub) == 'odd'
+    finally:
+        locked.chmod(0o755)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason='root searches a mode-000 directory')
+def test_unsearchable_directory_inside_a_checkout_still_names_the_checkout(acme: Path) -> None:
+    locked = _mkdir(acme / 'locked')
+    sub = _mkdir(locked / 'sub')
+    locked.chmod(0)
+    try:
+        assert _cwd_project(sub) == 'acme'
+    finally:
+        locked.chmod(0o755)
+
+
+def test_nul_byte_cwd_keeps_its_basename(tmp_path: Path) -> None:
+    assert _cwd_project(f'{tmp_path}/scr\x00atch') == 'scr\x00atch'
 
 
 def test_relative_cwd_is_not_resolved_against_the_process_cwd(acme: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -162,9 +207,9 @@ def test_launching_names_the_record_for_the_main_checkout(
     rc = sr.main(['launching'])
 
     assert rc == 0
-    slug = sr.build_session_slug('session', 'acme', None, 4242)
+    slug = session_records.build_session_slug('session', 'acme', None, 4242)
     assert Path(capsys.readouterr().out.strip()).name == slug
-    assert sr.read_record(slug, root=fleet).project == 'acme'
+    assert session_records.read_record(slug, root=fleet).project == 'acme'
 
 
 def test_hand_launched_hooks_converge_on_one_record_named_for_the_repo(acme: Path, tmp_path: Path) -> None:
@@ -175,8 +220,8 @@ def test_hand_launched_hooks_converge_on_one_record_named_for_the_repo(acme: Pat
     sh.run_session_start({'session_id': 'sess-5181', 'cwd': str(start_cwd)}, env={}, root=fleet)
     sh.run_stop({'session_id': 'sess-5181', 'cwd': str(stop_cwd)}, env={}, root=fleet)
 
-    slug = sr.build_session_slug('session', 'acme', None, 'sess-5181')  # type: ignore[arg-type]
-    assert [entry.name for entry in sr.sessions_dir(fleet).iterdir()] == [slug]
-    record = sr.read_record(slug, root=fleet)
+    slug = session_records.build_session_slug('session', 'acme', None, 'sess-5181')
+    assert [entry.name for entry in session_records.sessions_dir(fleet).iterdir()] == [slug]
+    record = session_records.read_record(slug, root=fleet)
     assert record.project == 'acme'
-    assert record.status == sr.Status.IDLE
+    assert record.status == session_records.Status.IDLE

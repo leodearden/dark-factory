@@ -2947,11 +2947,11 @@ class TestCoalesceAfterHealthyMerge:
         two candidates.  That is a healthy outcome, not a lost train: every
         item lands, through the chain, and no train forms.
         """
-        from orchestrator.config import MergeDeepConfig
+        from orchestrator.config import DepthRow, MergeDeepConfig
         from orchestrator.git_ops import _run
 
         deep_config = coalesce_config.model_copy(
-            update={'merge_deep': MergeDeepConfig(chain_cap=6)},
+            update={'merge_deep': MergeDeepConfig(chain_cap=6, depth_table=[DepthRow(0.0, 6)])},
         )
         async with _healthy_burst(git_ops, deep_config, tmp_path) as burst:
             all_reqs = {'hm0': burst.warm_req, **burst.follower_reqs}

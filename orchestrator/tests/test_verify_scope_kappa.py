@@ -45,7 +45,11 @@ from typing import Literal
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from _verify_config_corpus import ROOT_LINT_COMMAND, ROOT_TYPE_CHECK_COMMAND
+from _verify_config_corpus import (
+    ROOT_LINT_CHECKER_CLAUSE,
+    ROOT_LINT_COMMAND,
+    ROOT_TYPE_CHECK_COMMAND,
+)
 from test_verify import _canned_passing_result, _real_worktree_reader, _write_guard_script
 from test_verify_plan import (  # reused by this module's byte-identical goldens (steps 3/7/9)
     DATA_MODULE_DIFF,
@@ -1040,10 +1044,7 @@ class TestFallbackPlanAuthorityGoldens:
         # LINT: ruff is file-scoped AND reprojected into the fallback uv
         # project, while the trailing sibling-checker clause survives verbatim.
         assert executed[0].lint_command == (
-            f'uv run --project shared ruff check {test_path}'
-            ' && python3 fused-memory/scripts/check_bare_magicmock_config.py '
-            'shared/tests escalation/tests fused-memory/tests orchestrator/tests dashboard/tests'
-            ' sampler/tests cockpit/tests client-feed/tests'
+            f'uv run --project shared ruff check {test_path} && {ROOT_LINT_CHECKER_CLAUSE}'
         )
         assert 'check_bare_magicmock_config' in (executed[0].lint_command or '')
         # TYPE: a cd-sequenced same-tool fan-out still truncates at the keyword.

@@ -4023,7 +4023,7 @@ class TestMemoryMetadataConfig:
 
     A direct sibling of ``TaskMetadataConfig``: same top-level placement, same
     warn-by-default posture, same RED-TIER/restart-only wording on the enforce
-    flags. PRD D3 names that precedent explicitly ("census first, tiers later"),
+    flag. PRD D3 names that precedent explicitly ("census first, tiers later"),
     so this section follows it rather than inventing a second shape.
     """
 
@@ -4053,23 +4053,17 @@ class TestMemoryMetadataConfig:
         assert 'memory_metadata' not in ReconciliationConfig.model_fields
 
     def test_defaults_are_warn_mode(self):
-        """Both enforce flags default OFF.
-
-        This is the census-refuted-premise safety default, not timidity: leaf
-        α measured 242 of 329 live `kind` values as singletons, so a day-one
-        strict reject would turn every newly invented kind into a hard
-        memory-write failure on the live fleet.
-        """
+        """The ``enforce`` flag defaults OFF: a fatal shape violation censuses
+        and the write proceeds until the corpus is normalized (PRD §9 ε)."""
         cfg = FusedMemoryConfig().memory_metadata
         assert cfg.enforce is False
-        assert cfg.enforce_kind_registry is False
         assert cfg.unknown_key_storm_threshold == 50
         assert cfg.unknown_key_storm_window_seconds == 300
 
     def test_extra_keys_are_forbidden(self):
         """A mistyped leaf must fail LOUD at config load/reload.
 
-        With ``extra='ignore'`` an operator who typed ``enforce_kind_regsitry``
+        With ``extra='ignore'`` an operator who typed ``enfroce``
         would get a silently-ignored key and believe enforcement was on — the
         no-silent-fail-soft invariant applied to the config surface.
         """
@@ -4096,14 +4090,10 @@ class TestMemoryMetadataConfig:
         # loaded config.yaml actually reaches the model, and a splat makes
         # pyright widen every sibling field's type to the dict's value type,
         # producing a type error per section of FusedMemoryConfig.
-        cfg = FusedMemoryConfig.model_validate(
-            {'memory_metadata': {'enforce': True, 'enforce_kind_registry': True}}
-        )
+        cfg = FusedMemoryConfig.model_validate({'memory_metadata': {'enforce': True}})
         assert cfg.memory_metadata.enforce is True
-        assert cfg.memory_metadata.enforce_kind_registry is True
 
-    @pytest.mark.parametrize('field', ['enforce', 'enforce_kind_registry'])
-    def test_enforce_flags_are_restart_only(self, field):
+    def test_enforce_flag_is_restart_only(self):
         """RED TIER, asserted behaviourally rather than as a doc blurb.
 
         The operator-facing promise is not that some `description=` string
@@ -4133,16 +4123,16 @@ class TestMemoryMetadataConfig:
         #    test_non_allowlisted_leaf_lands_in_restart_required`.
         live = FusedMemoryConfig()
         fresh = FusedMemoryConfig()
-        old = getattr(live.memory_metadata, field)
+        old = live.memory_metadata.enforce
         # `object.__setattr__` is the established idiom in test_config_reload:
         # it bypasses the validation/assignment wrapper so the diff sees a raw
         # differing leaf.
-        object.__setattr__(fresh.memory_metadata, field, not old)
+        object.__setattr__(fresh.memory_metadata, 'enforce', not old)
 
         d = diff_config(live, fresh)
 
-        assert d.restart_required[f'memory_metadata.{field}'] == {'old': old, 'new': not old}
-        assert f'memory_metadata.{field}' not in d.applied_candidates
+        assert d.restart_required['memory_metadata.enforce'] == {'old': old, 'new': not old}
+        assert 'memory_metadata.enforce' not in d.applied_candidates
 
 
 # ── max_backlog_remediation_deferrals (task 3049) ────────────────────

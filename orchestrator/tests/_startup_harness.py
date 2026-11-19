@@ -30,6 +30,7 @@ STUBBED_STEPS: tuple[tuple[str, str], ...] = (
     ('1c0b', '_file_restored_pause_escalation'),
     ('1c1g', '_run_interactive_worktree_reaper_pass'),
     ('1c1h', '_run_leftover_verify_scope_reaper_pass'),
+    ('1c1i', '_ensure_project_slice_weight'),
     ('2c', '_recover_crashed_tasks'),
     ('2c2', '_reconcile_lane_checkouts'),
     ('2c3-streak-alarms', '_inherit_pending_streak_alarms'),

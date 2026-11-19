@@ -1,7 +1,7 @@
 """cockpit.registry_reader — pure-consumer read path over the C1 session registry.
 
 Fleet Cockpit C5a (plans/fleet-cockpit-prd.md §9). Imports the frozen
-orchestrator.session_registry contract (PRD §6 G5: consumers import, never
+orchestrator.session_records contract (PRD §6 G5: consumers import, never
 re-derive the record shape). This module is read-only: it never calls
 write_record/write_decision/update_decision_state/set_manual_boost.
 
@@ -31,7 +31,7 @@ import logging
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
-from orchestrator import decision_registry, session_registry
+from orchestrator import decision_registry, session_records
 from shared.project_id import fold_project_token
 
 logger = logging.getLogger(__name__)
@@ -54,7 +54,7 @@ _SNAPSHOT_FIELDS = (
 
 
 def _canonicalize_project(
-    record: session_registry.SessionRecord | decision_registry.DecisionRecord,
+    record: session_records.SessionRecord | decision_registry.DecisionRecord,
 ) -> None:
     """Fold *record*'s ``.project`` onto its canonical spelling, in place.
 
@@ -66,7 +66,7 @@ def _canonicalize_project(
     cannot drift apart. Both are plain mutable dataclasses carrying a
     ``.project``; nothing else about them is touched.
 
-    In place, because both callers hand over a record ``session_registry``
+    In place, because both callers hand over a record ``session_records``
     has just parsed for them and that this module exclusively owns --
     mirroring ``migrate_decision_project_tokens``' own
     ``record.project = ...`` idiom.
@@ -89,7 +89,7 @@ def _canonicalize_project(
 
 def _read_record_soft(
     slug: str, root: Path | str | None, *, caller: str
-) -> session_registry.SessionRecord | None:
+) -> session_records.SessionRecord | None:
     """Read *slug*'s record.json, fail-soft: return None instead of raising.
 
     Shared by scan_sessions and SessionScanner.scan (below) so the fail-soft
@@ -115,8 +115,8 @@ def _read_record_soft(
     title is display text while the project token is a join key.
     """
     try:
-        record = session_registry.read_record(slug, root=root)
-    except (FileNotFoundError, session_registry.CorruptSessionRecord):
+        record = session_records.read_record(slug, root=root)
+    except (FileNotFoundError, session_records.CorruptSessionRecord):
         logger.warning('%s: skipping unreadable record for %s', caller, slug, exc_info=True)
         return None
     _canonicalize_project(record)
@@ -157,7 +157,7 @@ def scan_decisions(root: Path | str | None = None) -> list[decision_registry.Dec
     return decisions
 
 
-def scan_sessions(root: Path | str | None = None) -> list[session_registry.SessionRecord]:
+def scan_sessions(root: Path | str | None = None) -> list[session_records.SessionRecord]:
     """Return every readable SessionRecord under ``sessions_dir(root)``.
 
     Mirrors reap_stale_records' identity-from-path iterdir loop: an absent
@@ -165,11 +165,11 @@ def scan_sessions(root: Path | str | None = None) -> list[session_registry.Sessi
     vanished record.json is logged and skipped rather than aborting the
     scan of the remaining slugs (fail-soft, PRD §2).
     """
-    base = session_registry.sessions_dir(root)
+    base = session_records.sessions_dir(root)
     if not base.is_dir():
         return []
 
-    records: list[session_registry.SessionRecord] = []
+    records: list[session_records.SessionRecord] = []
     for slug_dir in sorted(base.iterdir()):
         if not slug_dir.is_dir():
             continue
@@ -214,9 +214,9 @@ class SessionScanner:
 
     def __init__(self, root: Path | str | None = None) -> None:
         self._root = root
-        self._cache: dict[str, tuple[int, int, session_registry.SessionRecord]] = {}
+        self._cache: dict[str, tuple[int, int, session_records.SessionRecord]] = {}
 
-    def scan(self) -> list[session_registry.SessionRecord]:
+    def scan(self) -> list[session_records.SessionRecord]:
         """Return every readable SessionRecord under sessions_dir(root).
 
         Mirrors scan_sessions' fail-soft iterdir + read_record loop (see its
@@ -250,18 +250,18 @@ class SessionScanner:
         in turn and is fail-soft skipped exactly like scan_sessions, rather
         than propagating out of scan() uncaught.
         """
-        base = session_registry.sessions_dir(self._root)
+        base = session_records.sessions_dir(self._root)
         if not base.is_dir():
             self._cache = {}
             return []
 
-        records: list[session_registry.SessionRecord] = []
-        new_cache: dict[str, tuple[int, int, session_registry.SessionRecord]] = {}
+        records: list[session_records.SessionRecord] = []
+        new_cache: dict[str, tuple[int, int, session_records.SessionRecord]] = {}
         for slug_dir in sorted(base.iterdir()):
             if not slug_dir.is_dir():
                 continue
             slug = slug_dir.name
-            record_path = session_registry.record_path_for_slug(slug, root=self._root)
+            record_path = session_records.record_path_for_slug(slug, root=self._root)
             try:
                 record_stat = record_path.stat()
                 stat_key: tuple[int, int] | None = (
@@ -299,13 +299,13 @@ class SessionScannerProtocol(Protocol):
     internals for no reason.
     """
 
-    def scan(self) -> list[session_registry.SessionRecord]:
+    def scan(self) -> list[session_records.SessionRecord]:
         """Return the current readable SessionRecord set."""
         ...
 
 
 def build_snapshot(
-    records: list[session_registry.SessionRecord],
+    records: list[session_records.SessionRecord],
 ) -> dict[str, tuple]:
     """Map session_slug -> a hashable tuple of substantive display fields.
 

@@ -630,16 +630,23 @@ end this session."
     end_of_work_lead="When all work, result.md and /reflect are complete and no
 background task of yours is still running, follow
 \"Ending a T3 session\" in $REPO_ROOT/skills/spawn/SKILL.md (its T3 lane section):"
+    end_of_work_check="This act is the most you may do, not an order: first run
+the end check in \"Ending a T3 session\". If your final message or result.md asks
+anything of Leo (a question, a decision, a recommendation awaiting his go,
+an action_needed other than none, or a blocked or abandoned outcome), take
+no act, so the thread stays in his ready list, and say so in one line."
     case "$t3_end" in
       archive)
         end_of_work_trailer="This session was spawned to end by archiving its own T3 thread.
-${end_of_work_lead} mark your own record exited, then call the
+${end_of_work_check}
+Otherwise, ${end_of_work_lead} mark your own record exited, then call the
 t3_thread_organize MCP tool with action \"archive\" and no threadId as your
 final tool call."
         ;;
       settle)
         end_of_work_trailer="This session was spawned to end by settling its own T3 thread.
-${end_of_work_lead} call the t3_thread_organize MCP tool with action
+${end_of_work_check}
+Otherwise, ${end_of_work_lead} call the t3_thread_organize MCP tool with action
 \"settle\" and no threadId, then end the turn with no further tool call
 and no question pending."
         ;;

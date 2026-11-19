@@ -7,7 +7,7 @@ run over a frozen population of writes. For every write the arm attached, the
 pair (write, the record its judge named) is looked up in a blind verdict
 corpus, and the arm is scored on what the raters said about that pair.
 
-It is not ``eval_write_triage_judge.py::score_attachments``. That function
+It is not ``eval_write_triage_scoring.py::score_attachments``. That function
 asks whether the attach target is the fixture's canonical record, a
 fixture-strict hit rate that feeds the judge-accuracy report. This module asks
 whether raters agree the write belongs under the record the judge chose. They

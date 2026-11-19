@@ -33,6 +33,7 @@ class EscalationCategory(StrEnum):
     CURATOR_BACKEND_BINARY_UNRESOLVABLE = 'curator_backend_binary_unresolvable'
     CURATOR_CONSECUTIVE_DEGRADED = 'curator_consecutive_degraded'
     CURATOR_FAILURE = 'curator_failure'
+    CURATOR_REGISTRY_LOAD_FAILED = 'curator_registry_load_failed'
     CURATOR_SCHEMA_TOOL_DENIED = 'curator_schema_tool_denied'
     CURATOR_ZERO_OUTPUT_HANG = 'curator_zero_output_hang'
     CURATOR_ZOT_DUPLICATE = 'curator_zot_duplicate'

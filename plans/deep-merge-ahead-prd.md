@@ -67,17 +67,21 @@ Pending (non-blocking, confirmatory): the study's S/C control re-runs
    position j truncates the chain to j−1 and **must not** fire item j's
    conflict path — j may conflict with an *unlanded* predecessor; it takes
    its normal sequential path later.
-5. **Failure policy: halve on fail, reset on pass.** Tip fail at depth d →
+5. **Failure policy: halve on fail, reset on pass.** The halving is
+   superseded by plans/merge-lane-policy-prd.md D7 (task 8528): depth comes
+   from the pass-rate table. The un-chained mark below stands
+   (plans/merge-lane-policy-prd.md D6). Tip fail at depth d →
    next round builds at max(1, ⌊d/2⌋); any pass resets to min(queue, cap).
    A red tip names no culprit, so after one the owner and every link each
-   verify un-chained once, on their own tree, before any of them may be
-   chained again (task 10617): the bad item is verified alone and blocks,
-   and the good members land. A request whose outcome is already decided
+   verify un-chained, on their own tree, until their own verdict is applied
+   (tasks 10617, 10723; a result the cascade voids is not applied): the bad
+   item is verified alone and blocks, and the good members land. A request whose outcome is already decided
    (cancelled or resolved) is never chained. The floor (d=1) is
    byte-identical to today's adjacent verify. No separate rolling-flake
    suppressor in v1 (halving bounds the next chain of untested requests;
    the un-chained round is what isolates the bad item; revisit in θ).
-6. **Cap staging: 6 → 32 ("uncapped-in-practice").** Ship enabled at
+6. **Cap staging: 6 → 32 ("uncapped-in-practice").** Superseded by
+   plans/merge-lane-policy-prd.md D7 (task 8528). Ship enabled at
    `chain_cap=6` (the study-validated depth), promote to 32 (≥2× max
    observed queue depth; still bounds wall vs the 7200 s timeout) via the
    milestone-predicate gate (η1/η2). `chain_cap=0` (the default) is the kill
@@ -204,7 +208,8 @@ Phase 3 — observability + rollout:
   outcomes; ~O(seconds).
 - Dispatch invariant: chain built iff slot 2 free ∧ cap>0 ∧ queue≥2;
   `target_depth = min(len(queue), cap, halving_state)`;
-  halving_state: fail(d)→max(1,⌊d/2⌋), pass→min(queue, cap).
+  halving_state: fail(d)→max(1,⌊d/2⌋), pass→min(queue, cap). (Depth and
+  halving superseded by plans/merge-lane-policy-prd.md D7, task 8528.)
 - Landing invariant: tip pass ⇒ walk links in order through the existing
   CAS advance; each landed item gets its normal finalize path + events;
   first CAS failure aborts the walk (remaining items stay queued). Tip fail
@@ -249,7 +254,7 @@ Phase 3 — observability + rollout:
 | Scenario | Preconditions | Postconditions |
 |---|---|---|
 | Tip pass lands full prefix | 4-item clean chain, tip verify green | 4 in-order landings, one verify, `landed_via_chain=4`, audits green |
-| Tip fail leaves queue intact | chain built, tip verify red | zero landings via chain, items still queued, halving state = 2; no member is chained again before it has verified alone |
+| Tip fail leaves queue intact | chain built, tip verify red | zero landings via chain, items still queued; no member is chained again before it has verified alone |
 | Red chain isolates bad item | item 3 of 6 genuinely red | one red chain; then each member verifies alone: item 3 blocks, the others land; deep resumes after bad item blocks |
 | Chain conflict truncates silently | item 2 conflicts with item 1 textually | chain = [item 1], no conflict outcome for item 2, item 2 handled sequentially later |
 | Head-fail + tip-pass | head verify red (flake), tip green | full prefix lands (tip authoritative), head verify cancelled |

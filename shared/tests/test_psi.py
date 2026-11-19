@@ -703,13 +703,17 @@ class TestReadRunqueueRatio:
 
 
 # PRD `plans/load-throttle-harmonisation-prd.md` §6.3 is the SINGLE HOME of
-# these two cgroup shapes; reify's rho2 builds the same strings on the bash
+# these cgroup shapes; reify's rho2 builds the same strings on the bash
 # side, so the two implementations are pinned against one table rather than
 # against each other (INV-5, accepted with executed parity as the mirror).
 # Constructed here exactly as that table spells them.
 CGROUP_UNDER_SLICE = (
     '0::/user.slice/user-1000.slice/user@1000.service/'
     'df.slice/df-x.slice/df-verify-x-0123456789ab.scope\n'
+)
+CGROUP_IN_GOVERNED_SUB_SLICE = (
+    '0::/user.slice/user-1000.slice/user@1000.service/'
+    'df.slice/df-x.slice/df-x-governed.slice/df-x-governed-agents.slice/run-u1.scope\n'
 )
 CGROUP_NO_SLICE = (
     '0::/user.slice/user-1000.slice/user@1000.service/app.slice/orchestrator-x.service\n'
@@ -731,7 +735,7 @@ def _clear_own_cgroup_cache():
 
 
 class TestResolveOwnCgroup:
-    """PRD §6.3 rows 1-2: parse the 0:: path, walk leaf-upward for
+    """PRD §6.3 rows 1, 2 and 4: parse the 0:: path, walk leaf-upward for
     df-<project_id>.slice, else the leaf itself; derive the sysfs path."""
 
     def _cgroup_file(self, tmp_path, text, name='cgroup'):
@@ -751,6 +755,19 @@ class TestResolveOwnCgroup:
 
         assert own.path == SLICE_PATH
         assert own.path.endswith('df-x.slice')
+        assert own.pressure_path == tmp_path / 'sys' / SLICE_PATH.lstrip('/') / 'cpu.pressure'
+
+    def test_row_4_governed_sub_slice_resolves_to_the_project_slice(self, tmp_path):
+        """§6.3 row 4 — the project slice, not the nearer governed sub-slice."""
+        from shared.psi import resolve_own_cgroup
+
+        own = resolve_own_cgroup(
+            'x',
+            proc_cgroup_path=self._cgroup_file(tmp_path, CGROUP_IN_GOVERNED_SUB_SLICE),
+            cgroup_root=tmp_path / 'sys',
+        )
+
+        assert own.path == SLICE_PATH
         assert own.pressure_path == tmp_path / 'sys' / SLICE_PATH.lstrip('/') / 'cpu.pressure'
 
     def test_row_2_falls_back_to_the_leaf_unit(self, tmp_path):
@@ -801,6 +818,21 @@ class TestResolveOwnCgroup:
         )
 
         assert own.path == '/user.slice/df.slice/df-dark_factory.slice'
+
+    def test_dashed_project_id_resolves_to_the_shared_rule_slice(self, tmp_path):
+        from shared.psi import resolve_own_cgroup
+
+        text = (
+            '0::/user.slice/user-1000.slice/user@1000.service/'
+            'df.slice/df-my_proj.slice/df-verify-x-0123abcd-0123456789ab.scope\n'
+        )
+        own = resolve_own_cgroup(
+            'my-proj',
+            proc_cgroup_path=self._cgroup_file(tmp_path, text),
+            cgroup_root=tmp_path / 'sys',
+        )
+
+        assert own.path.endswith('/df-my_proj.slice')
 
     def test_prefers_the_v2_line_on_a_hybrid_host(self, tmp_path):
         """Tolerance for co-present cgroup-v1 lines. Explicitly NOT a §6.3

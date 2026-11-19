@@ -24,7 +24,7 @@ from review_all_program_cli import FIXTURE_RETURNS, RUN_ID, ProgramEnv, load_pro
 from review_all_program_fixture import (
     FIXTURE_DIR,
     FakeStore,
-    load_session_registry,
+    load_session_records,
     running_fake_store,
 )
 from shared.process_identity import ProcessIdentity, capture
@@ -559,7 +559,7 @@ def test_a_final_return_the_lead_already_applied_is_not_applied_again(b10: Progr
     assert _ledger(b10) == ledger
 
 
-REGISTRY = load_session_registry()
+RECORDS = load_session_records()
 EXIT_REQUESTED_AT = '2026-10-19T10:30:00Z'
 LIVE_STANDING_LABELS = {
     (True, 'exited'): 'final',
@@ -610,11 +610,11 @@ def _reaped_pid() -> int:
 
 
 @pytest.mark.parametrize('status', ['exited', 'idle'])
-@pytest.mark.parametrize('outcome', REGISTRY.RESULT_OUTCOMES)
+@pytest.mark.parametrize('outcome', RECORDS.RESULT_OUTCOMES)
 def test_a_hand_back_is_final_iff_its_outcome_is_terminal_and_its_record_exited(
     s2: ProgramEnv, outcome: Any, status: str,
 ) -> None:
-    terminal = outcome in REGISTRY.TERMINAL_RESULT_OUTCOMES
+    terminal = outcome in RECORDS.TERMINAL_RESULT_OUTCOMES
     put_written_record(s2, result_md(str(outcome)), status=status)
 
     proc = watch(s2)

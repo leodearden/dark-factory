@@ -71,7 +71,7 @@ the contract §11 human-gate task.
 cd fused-memory/docker && docker-compose up -d
 
 # Python environment
-cd fused-memory && uv sync
+uv sync --all-packages    # from the repo root
 
 # Required env vars (inherit from shell):
 # OPENAI_API_KEY  (for embeddings; ANTHROPIC_API_KEY is NOT needed — agents use OAuth)
@@ -88,7 +88,7 @@ production FalkorDB".
 ### Locating installed code
 
 The uv workspace has ONE root `.venv` per tree — `<project_root>/.venv` (CPython
-3.13.9, uv 0.11.6 in the main checkout). None of the seven workspace members
+3.13.9, uv 0.11.6 in the main checkout). No workspace member
 carries its own. A task worktree gets an INDEPENDENT root `.venv`, not a share
 of main's, once it has been cold-verified — `verify_cold_preprovision_command`
 (`uv sync --all-packages && npm ci …`) runs *inside* the worktree, and such a
@@ -260,7 +260,7 @@ orchestrator/src/orchestrator. Note: your current working directory is
 ## Memory Usage
 
 ### When to read memory
-- **Session start** — search for project context, recent decisions, active conventions
+- **Session start** — build the briefing in `/memory` → "Context Briefing" (`.claude/commands/memory.md`): the conventions of the area you will work in, and the context of your task.
 - **Encountering unfamiliar entities** — `get_entity` to understand relationships
 - **Before architectural decisions** — search for prior decisions and rationale
 - **Tasks with memory_hints** — only if you can actually see them. `metadata.memory_hints`
@@ -369,8 +369,8 @@ the task-author pin is in `docs/task-authoring.md`.
 ## Session Lifecycle
 
 ### Starting a session
-1. Search memory for project context: `search(query="project overview and current status", project_id="dark_factory")`
-2. Check task tree: `get_tasks(project_root="/home/leo/src/dark-factory")`
+1. Build the context briefing in `/memory` → "Context Briefing" (`.claude/commands/memory.md`). Its query phrasing has one home, `shared/src/shared/briefing_queries.py`; this file does not restate it. There is no project-overview search: for orientation read the documents that section's "Two queries are absent on purpose" paragraph names.
+2. Read task state narrowly, as item 3 of that section says. Never call `get_tasks` without `statuses` and `fields`.
 3. If working on a specific task, read it with `get_task` — and if it carries
    `memory_hints`, execute the hint queries. This works in an **interactive** session;
    an orchestrator-dispatched task agent holds no `get_task` and cannot do it (see

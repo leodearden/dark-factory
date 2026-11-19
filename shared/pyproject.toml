@@ -113,7 +113,7 @@ filterwarnings = [
 # test, across every suite and both inifile-resolution modes under real fleet
 # load, measured 45.48s (orchestrator/tests/test_hard_v2_fixture_pool.py,
 # root-bound); times the 8x headroom factor whose rationale is
-# orchestrator/tests/_orch_helpers.py::UNDER_LOAD_HEADROOM_FACTOR = 363.84,
+# shared/src/shared/testing_timeout_headroom.py::UNDER_LOAD_HEADROOM_FACTOR = 363.84,
 # rounded up to a whole minute = 420. Marked tests are excluded by design,
 # including the slower repo-wide scans in
 # fused-memory/tests/test_check_bare_magicmock_config.py, which carry their own

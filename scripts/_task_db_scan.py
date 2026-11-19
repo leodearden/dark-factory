@@ -13,10 +13,14 @@ importable-by-sibling-scripts only. It hosts three tiers:
 
 * **Tier 1, discovery** (:func:`tasks_db_path`, :func:`runs_db_path`,
   :func:`decode_metadata`, :func:`resolve_project_roots`,
-  :func:`discover_project_roots`, :func:`discover_db_paths`) — adopted by ALL
+  :func:`discover_project_roots`, :func:`discover_db_paths`,
+  :func:`discover_or_report_no_default_root`) — adopted by ALL
   FOUR sweep scripts, plus ``census_tagger_debris.py`` (task 4525). The store
   paths and the known/default roots delegate to ``shared.project_layout``
-  (task 6713). :func:`decode_metadata` is the exception to "adopted by all four": it is
+  (task 6713). :func:`discover_or_report_no_default_root` is the CLI-side guard
+  that Tiers 2 and 3, the census and the repair script wrap around discovery,
+  reporting on stderr rather than discovering.
+  :func:`decode_metadata` is the exception to "adopted by all four": it is
   adopted by the scripts that decode a ``metadata`` column, among them the
   audit scripts ``audit_combine_gate_marker_loss.py`` and
   ``audit_manifest_descriptor_drift.py`` (task 4782) and
@@ -73,10 +77,12 @@ THE THIRD COPY OF THE TIER-3 SKELETON, AND WHY IT STAYS OUT (task 3817).
 ``audit_wiped_metadata_files.py`` — keeps its own ``EXIT_*`` ladder and its own
 per-root skip loop inside ``main_async`` instead of adopting
 :func:`run_audit_cli`. That is a decision, not an oversight. It reaches Tier 1
-discovery only second-hand, through the ``discover_project_roots`` re-export in
-``audit_wiped_metadata_files.py``. Its ONE direct import from this module is
+discovery second-hand, through the ``discover_project_roots`` re-export in
+``audit_wiped_metadata_files.py``. Its TWO direct imports from this module are
 :data:`UNREADABLE_STORE_ERRORS`, so its per-root loop skips exactly what this
-tier skips. Four things Tier 3 cannot express, each measured in the source:
+tier skips, and :func:`discover_or_report_no_default_root`, so an underivable
+default root takes its no-root exit as it does here. Four things Tier 3 cannot
+express, each measured in the source:
 
 1. ``main_async`` is ``async`` and awaits ``repair_project`` (itself
    ``async def``), while :func:`run_audit_cli` and :func:`sweep_project_roots`
@@ -143,6 +149,7 @@ from typing import Any, NamedTuple
 
 import _checkout as _checkout
 from shared.project_layout import (
+    CheckoutRootError,
     StrPath,
     default_project_root,
     known_project_roots,
@@ -213,6 +220,10 @@ def resolve_project_roots(
     filter on different things: :func:`discover_db_paths` drops a missing
     ``tasks.db``, while :func:`discover_project_roots` drops the ROOT owning
     one.
+
+    Raises ``shared.project_layout.CheckoutRootError`` when neither
+    *project_roots* nor the env names a root and the default cannot be
+    derived, because this copy sits in no git checkout.
     """
     if project_roots is not None:
         return list(project_roots)
@@ -233,8 +244,8 @@ def discover_project_roots(
     ``DASHBOARD_KNOWN_PROJECT_ROOTS`` (comma-separated, read from *env*,
     defaulting to the real ``os.environ``) > the dark-factory default root.
 
-    A root whose ``tasks.db`` does not exist is silently dropped — this never
-    raises on a missing or not-yet-set-up project.
+    A missing store is dropped silently; an underivable default root raises
+    ``CheckoutRootError`` (see :func:`resolve_project_roots`).
     """
     return [
         root
@@ -254,8 +265,8 @@ def discover_db_paths(
     ``DASHBOARD_KNOWN_PROJECT_ROOTS`` (read from *env*, defaulting to the
     real ``os.environ`` when *env* is None) > the dark-factory default root.
 
-    A resolved db path that does not exist on disk is silently skipped —
-    this never raises on a missing/not-yet-set-up project.
+    A missing store is dropped silently; an underivable default root raises
+    ``CheckoutRootError`` (see :func:`resolve_project_roots`).
     """
     if explicit_dbs is not None:
         candidates = list(explicit_dbs)
@@ -266,6 +277,18 @@ def discover_db_paths(
         ]
 
     return [path for path in candidates if os.path.exists(path)]
+
+
+def discover_or_report_no_default_root(discover: Callable[[], list[str]]) -> list[str]:
+    """What *discover* finds, or [] after saying on stderr why the default project root could not be derived.
+
+    The CLI tiers map [] to their exit-2 no-root outcome.
+    """
+    try:
+        return discover()
+    except CheckoutRootError as exc:
+        print(f"the dark-factory default project root could not be derived: {exc}", file=sys.stderr)
+        return []
 
 
 # ---------------------------------------------------------------------------
@@ -448,7 +471,9 @@ def run_scan_cli(
     """
     args = parser.parse_args(argv)
 
-    db_paths = discover_db_paths(explicit_dbs=args.dbs, project_roots=args.project_roots)
+    db_paths = discover_or_report_no_default_root(
+        lambda: discover_db_paths(explicit_dbs=args.dbs, project_roots=args.project_roots)
+    )
     if not db_paths:
         print(NO_DB_RESOLVED_MESSAGE, file=sys.stderr)
         return 2
@@ -628,7 +653,9 @@ def run_audit_cli(
     args = parser.parse_args(argv)
 
     # dest="project_roots" is the PARSER CONTRACT above, not an accident.
-    roots = discover_project_roots(project_roots=args.project_roots)
+    roots = discover_or_report_no_default_root(
+        lambda: discover_project_roots(project_roots=args.project_roots)
+    )
 
     if on_roots is not None:
         on_roots(roots, args)

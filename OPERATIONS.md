@@ -376,10 +376,9 @@ cost and scope with a red-conditioned sample.
 
 Three things a census must not assume:
 
-- **Junit exists only under `merge_verify_breadth: full`.** The shipped
-  default (`config.py`) is `scoped`; this repo's
-  `dark-factory-orchestrator.yaml` opts in. A project on the default
-  archives plans and logs but no junit at all.
+- **Junit exists only under `merge_verify_breadth: full`.** That is the
+  shipped default (`orchestrator/src/orchestrator/defaults.yaml`). A project
+  that opts down to `scoped` archives plans and logs but no junit at all.
 - **The stem joins per-ATTEMPT, not per-module.** Merge verifies carry no
   attempt id, so their files stem at `attempt-1`. Logs and junit carry a
   `.<module>` infix; the plan does not — under per-module fan-out one plan
@@ -817,9 +816,10 @@ list `/home/leo`) and step 7 (the canary feed).
 
 - Test and criteria evidence exists for pytest projects only: junit
   injection is pytest-only (PRD §2).
-- Per-test results for merge runs exist only when the client project's
-  `dark-factory-orchestrator.yaml` sets `merge_verify_breadth: full`.
-  Otherwise only task legs carry `test_results`.
+- Per-test results for merge runs exist unless the client project's
+  `dark-factory-orchestrator.yaml` opts down to
+  `merge_verify_breadth: scoped`. On such a project only task legs carry
+  `test_results`.
 
 ---
 
@@ -1147,7 +1147,10 @@ session:
 | Tool | Use for |
 |---|---|
 | `mcp__escalation__get_pending_escalations` | List open escalations (filter by `level`) |
+| `mcp__escalation__get_escalation` | One full escalation record by id, archive included |
+| `mcp__escalation__get_task_escalation_history` | Every escalation ever filed for one task, archive included; its `count: 0` is attributable to the query, and it answers for this server's queue only |
 | `mcp__escalation__get_merge_queue` | Live merge-queue snapshot: in-flight/queued items, conflict graph, frozen verify prefix |
+| `mcp__escalation__merge_status` | One merge request's state, by `request_id` / `task_id` / `branch` |
 | `mcp__escalation__get_merge_halt_status` | Whether the merge queue is currently halted, and by which escalation |
 | `mcp__escalation__get_task_runtime_state` | Live per-task phase/loop/attempt projection (what a task is doing *right now*) |
 | `mcp__fused-memory__get_tasks` / `get_task` | Full task tree, or one task's full record |
@@ -1155,6 +1158,11 @@ session:
 | `mcp__fused-memory__find_tasks_by_metadata` | Which tasks carry metadata key K (with value V), every status incl. deferred/cancelled — paged |
 | `mcp__fused-memory__get_status` | Backend health, plus `reconciliation_halt` — whether reconciliation is halted, why, since when, and whether the cooldown has expired. Pass no `project_id` for the fleet-wide `halted_projects` list |
 | `mcp__fused-memory__get_queue_stats` | Durable-write-queue counts, plus (per-project) `reconciliation_backlog` **and** `reconciliation_halt` — read both together, see below |
+
+An orchestrator-spawned agent's escalation tools are the ones its grant
+names: the steward's in
+`orchestrator/src/orchestrator/agents/roles.py::STEWARD`, the L1
+rotation's in `orchestrator/src/orchestrator/harness.py::_WATCHER_ALLOWED_TOOLS`.
 
 ### Is reconciliation halted, or just behind?
 
@@ -1276,6 +1284,69 @@ That latency is faster than any real model call.
 Incident, back-test and residual risks:
 [`plans/curator-dedup-outage-2026-08-15-rca.md`](plans/curator-dedup-outage-2026-08-15-rca.md).
 
+### Is a curator guard registry loaded?
+
+The curator's three pre-LLM guards (the cancelled-premise `blocklist`, the
+`recon-premise` registry and the `operational-ask` registry) each read a YAML
+list named by a `curator.*_path` setting. `get_curator_state`'s `registries`
+list gives each one's `state`, with `path`, `entry_count`, `error` and
+`failures`:
+
+- `failed` means that guard fails open: its curations look exactly like a
+  healthy curator with an empty registry. While an orchestrator is running
+  for the project, the curator's startup self-check also files a
+  `curator_registry_load_failed` escalation from `fused-memory/task-curator`,
+  one pending record per project and registry label that folds across
+  restarts
+  (`fused-memory/src/fused_memory/middleware/curator_escalator.py::CuratorEscalator.report_registry_load_failed`).
+  With no orchestrator running it only logs an ERROR, so a missing
+  escalation does not prove the registries loaded.
+- A fix to the file at the reported `path` is picked up, with no restart, by
+  the first curation at least `curator.registry_load_retry_seconds`
+  (default 300) after the failed attempt. A change to the configured path
+  itself needs a fused-memory restart.
+- `loaded` with `entry_count: 0` is a registry that loaded empty, not a
+  failure. `unconfigured` means its path is unset, which disables that
+  guard on purpose. `not_loaded` means it has not been used yet.
+
+The load contract lives in
+`fused-memory/src/fused_memory/middleware/curator_registry.py::CuratorRegistry`.
+
+### Which resolutions are absorbing refiles?
+
+A resolved or dismissed escalation gains one `refiles_suppressed` each time its
+resolution suppresses an identical refile. What the counter means, and why it
+never escalates, is in
+`escalation/src/escalation/queue.py::EscalationQueue.note_suppressed_refile`.
+Two producers bump it, both on the per-project orchestrator queue
+`<project_root>/data/escalations`, not the reconciliation queue:
+
+- `orchestrator/src/orchestrator/merge_lane/landing_evidence.py::file_unattributed_landing_escalation`:
+  `provenance_unattributed`, keyed on `citation_sha`.
+- `fused-memory/src/fused_memory/reconciliation/harness.py::ReconciliationHarness._file_finding_task_escalation`:
+  `recon_task_finding`, with no `citation_sha`.
+
+List them from the repo root. The command is read-only; add `--json` for
+machine output:
+
+    uv run --directory escalation python -m escalation.refile_absorption --queue-dir <project_root>/data/escalations
+
+Each project has its own queue, so for the fleet:
+
+    for q in /home/leo/src/*/data/escalations; do echo "== $q"; uv run --directory escalation python -m escalation.refile_absorption --queue-dir "$q"; done
+
+- **Reading it.** Rows come largest count first. The last line,
+  `total_absorbed=… records=… scanned=… skipped_vanished=… skipped_unreadable=… skipped_unparsable=…`,
+  always prints. A non-zero `skipped_*` is records the scan lost, not noise;
+  stderr names each unreadable or unparsable file. Open a row with
+  `mcp__escalation__get_escalation(<id>)` for the full record. Exit 2 means
+  `--queue-dir` is not a directory.
+- **Limits.** The counter is a lifetime total per record, not windowed. It is
+  deliberately unthresholded, so nothing pages on it and this query is how you
+  hear about it. A record whose dated archive subdir has been pruned
+  (`escalation/src/escalation/archive.py::prune_archive`) is gone, so the
+  listing covers only what the archive still holds.
+
 ---
 
 ## 5. Unblocking work
@@ -1352,46 +1423,51 @@ order. One passing verify can therefore land k items — and it is not a
 statistical bet, because the suite that passed ran on the exact cumulative
 tree being landed.
 
-**The knob.** `merge_deep.chain_cap` bounds how many queued items one chain
-may contain. The shipped default is **`0`**, which is the **kill switch**:
-the gate can never open, so no chain code executes on any dispatch path and
-merging is byte-identical to pre-feature behaviour. Every `merge_deep` leaf
-is green-tier hot-reloadable (see [§6](#6-config-reload-vs-restart)), so
-enabling, retuning and killing the feature are each one `reload_config`
-away — no restart, no drained queue.
+**The knob.** `merge_deep.chain_cap` is the **kill switch** and nothing
+more: `0` is off, and any positive value is on. It no longer bounds how deep
+a chain goes. The stock default is `0`. At `0` the gate can never open, so
+no chain code executes on any dispatch path and merging is byte-identical to
+pre-feature behaviour.
+Every `merge_deep` leaf, `depth_table` included, is green-tier
+hot-reloadable (see [§6](#6-config-reload-vs-restart)), so enabling,
+retuning and killing the feature are each one `reload_config` away — no
+restart, no drained queue.
 
-**Cap staging is a plan, not a live value.** `plans/deep-merge-ahead-prd.md`
-decision 6 stages the cap `6` → `32` (the study-validated depth, then
-"uncapped in practice"), but that rollout is owned by tasks ζ (reify canary
-at 6), η1 (the 7-day predicate) and η2 (promote to 32), and the cap is
-per-project config. The stock default is still `0` everywhere. To learn
-whether chains are live on a unit, read that project's
-`dark-factory-orchestrator.yaml` — do not infer `6` from the PRD.
+**Depth comes from the pass estimate, not a cap.** Cap staging is retired:
+task 3191 (promote the cap to 32) is cancelled, and task 3190 was superseded
+on 2026-11-17. Each round's depth is read off `merge_deep.depth_table`
+(shipped: one row per depth from 12, at an estimate of 0.992, down to 3, at 0.75; below the
+last row, one item; the rows and their derivation are in `plans/merge-lane-policy-prd.md` D7)
+against the rolling per-item pass estimate over the last 30 tip verdicts of
+the rounds the policy sized, and is never more than the queue holds. The
+window lives in memory and is seeded at worker start from the newest
+`merge_verify` rows.
+To learn whether chains are live on a unit, read that project's
+`dark-factory-orchestrator.yaml`.
 
-**Failure policy: halve on fail, reset on pass.** A tip failure says nothing
-about *which* item broke, so the next round targets `max(1, ⌊d/2⌋)` against
-the depth actually built, and consecutive failures log-bisect (6 → 3 → 1)
-toward the bad item. **Any** pass resets the state. Each round recomputes
-`target_depth = min(queue_len, chain_cap, halving_state)` afresh, so a reset
-re-derives the target from the queue as it is *now* rather than replaying a
-stale length. At the `d=1` floor no chain is built at all and the round
-takes today's adjacent verify — the floor is byte-identical **by
-construction**, not by careful mimicry. A failed tip lands nothing *via the
-chain* and mutates the queue not at all: its items stay queued and take
-their normal sequential path. The round is not therefore a zero-landing
-round — the head is never chained, so its own verify proceeds untouched and
-can still land in that same round; the head's verdict is discarded only on a
-tip **pass**, where the tip's tree strictly contains it.
+**Failure policy: each member verifies alone.** A tip failure says nothing
+about *which* item broke, so the failed tip lands nothing, its owner is
+requeued, and the owner and every link are marked. A marked task is neither
+chained nor offered as a link: its next verify covers its own tree alone. A
+passer lands and the bad item is blocked with its findings. The mark lasts
+until the task's request leaves the lane (landed, blocked or dropped), so a
+verify the cascade cancels or voids does not clear it. Requests that are not
+marked keep chaining at the table's depth. A chain verify that RAISES is not
+a verdict: it marks its owner the same way (task 3185). Each `merge_verify`
+row's `chain_depth_reason` records the basis, the estimate, the table row
+and the queue depth; it is null when the policy did not size the round (a
+marked task, a dispatch that may not chain, the kill switch), and such a
+round does not feed the pass estimate.
 
 **What you do with it.** To stop chains on a live unit, set `chain_cap: 0`
 and `reload_config`; that is the whole intervention, and it takes effect on
-the next dispatch round. To judge whether to raise it, read the `--chains`
-report (see
+the next dispatch round. To judge whether to deepen or shallow the table,
+read the `--chains` report (see
 [§"Reading the merge-lane throughput baseline"](#reading-the-merge-lane-throughput-baseline)).
-The authoritative contract — the dispatch and landing invariants,
-truncate-at-conflict semantics, and the stale-CAS abort — is
-`plans/deep-merge-ahead-prd.md`; this section is the operator's summary of
-it, not a second copy.
+The authoritative contracts are `plans/merge-lane-policy-prd.md` D6/D7 for
+depth and the failure policy, and `plans/deep-merge-ahead-prd.md` for the dispatch and
+landing invariants, truncate-at-conflict semantics and the stale-CAS abort;
+this section is the operator's summary of them, not a second copy.
 
 **Deploying a knob flip.** `scripts/merge-deep-set-cap.sh`, like its sibling
 `scripts/merge-pytest-n-ab-switch.sh`, lands its yaml edit through the
@@ -1915,9 +1991,10 @@ takes no arguments: it always re-reads that process's own
   `tests/scripts/test_merge_gate_history_leg.py::test_the_leg_runs_exactly_the_roots_that_own_marked_tests`
   keeps the leg's segments on the packages that own marked tests. Green-tier
   for the same reason as `merge_gate_history_pure`.
-- `merge_deep.chain_cap` (the deep merge-ahead chain cap — see
+- `merge_deep.*`, including `chain_cap` and `depth_table` (deep merge-ahead
+  chains — see
   [§"Deep merge-ahead chains"](#deep-merge-ahead-chains-merge_deepchain_cap);
-  `0` is the shipped default and the feature's kill switch). Green-tier on
+  `chain_cap` is the feature's kill switch, `0` off). Green-tier on
   purpose, for the reason the `config_key_census.*` bullet above and the
   `mem0_update.enabled` bullet below both give: a kill switch you can only
   pull by restarting the unit is not a kill switch. Enable, retune and
@@ -1949,6 +2026,7 @@ takes no arguments: it always re-reads that process's own
 effect until a full restart):**
 
 - `max_concurrent_tasks`
+- `main_health_fix_reserved_slots`
 - Pool sizes / `verify_runners`
 - `escalation` bind host/port
 - `sandbox.backend`
@@ -2363,8 +2441,17 @@ Every resolved invocation emits a `routing_decision` event (model, effort,
 budget, turns, which layer set the model, which rule matched, any
 rejections) and mirrors the latest decision onto the task's own
 `metadata.routing` — a bounded history (last 5), a routing-tier counter,
-and a `simple_saturated` flag. Today this is what you read directly
-(`routing_decision` events, `metadata.routing` per task) — there is not
+and a `simple_saturated` flag. The event row's `phase` column carries the
+workflow phase the invocation ran in (the live phase inside a task
+workflow, `escalated` for steward and triage, `blocked` for unblock_auto),
+so a per-role cap or cost cohort splits by phase from `runs.db` alone; it
+is NULL for the project-level deep_reviewer and the batch module_tagger.
+In-workflow roles, the steward and unblock_auto also emit an
+`invocation_end` row with the same phase. Triage emits none, and its
+`routing_decision` row is written before the lifetime-budget check, so the
+row also exists when that check skips the triage. Today this is
+what you read directly (`routing_decision` events, `metadata.routing` per
+task) — there is not
 yet an auto-escalating retry ladder or a rendered rollup panel; see below.
 
 ### Adaptive-routing substrate (not yet active)
@@ -3884,7 +3971,7 @@ declared registry and its `LoadState`-aware detector).
 |---|---|---|
 | 02:00 | Shared-repo incremental repack + commit-graph (every orchestrator root, one at a time) | `shared-repo-git-maintenance.timer` |
 | 02:15 | link-heal sweep (adjudicate new triage children; records + report; writes gated) | `fused-memory-link-heal.timer` |
-| 02:30 | Transcript secret sweep | `transcript-secret-sweep.timer` |
+| 02:30 | Transcript secret sweep (leo-laptop runs its own copy) | `transcript-secret-sweep.timer` |
 | 03:00 | Legibility trickle coder | `legibility-trickle@.timer` |
 | 03:15 | Scheduled memory evals (produce, judge, file `eval_regression`); runs for hours because of e6, see its section | `fused-memory-memory-eval.timer` |
 | 03:30 | fused-memory flag-marker drain | `fused-memory-flag-marker-sweep.timer` |
@@ -4099,17 +4186,30 @@ everything already on disk.
   `*.xml.gz`. A `*.xml.gz` is redacted by decompressing it, replacing the
   value and recompressing it, with mode and mtime kept. These logs were added
   after failing pytest env assertions printed live tokens into them (task
-  10144). `~/.claude/projects` is still scanned for transcripts only. The
-  transcript archive and `~/.claude/projects` are required roots;
-  `data/verify-logs` and `data/orchestrator/offline-lane` are optional,
-  because most projects have no offline lane and a project has no verify logs
-  before its first verify. The full tree list, with each root's
-  required flag, is `scripts/transcript_secret_sweep.py::swept_trees`.
+  10144). `~/.claude/projects` is still scanned for transcripts only. Last,
+  it scans pytest's per-user base temp (`/tmp/pytest-of-<user>`,
+  `--pytest-tmp-dir`), where env-capturing tests leave raw environment
+  dumps, but only files named like one
+  (`scripts/transcript_secret_sweep.py::PYTEST_ENV_DUMP_SUFFIXES`). Reading
+  every file there is not cheap: the 2026-11-15 run read 821,808 files, and
+  every one of its hits had one of those names. A file or directory pytest
+  prunes mid-walk is passed over, not reported unreadable. An orchestrated
+  project's transcript archive and `~/.claude/projects` are required roots;
+  `data/verify-logs`, `data/orchestrator/offline-lane` and the pytest base
+  temp are optional, because most projects have no offline lane, a project
+  has no verify logs before its first verify, and a host that has not run
+  pytest has no base temp. The full tree list, with each root's required
+  flag, is `scripts/transcript_secret_sweep.py::swept_trees`.
 - **What it matches.** Only the live values the sweep's own environment holds.
   The wrapper sources the repo `.env` for them. It never matches a token-shaped
   pattern. A value is matched in the form the file holds it: JSON-escaped in
-  `*.jsonl` and `*.json`, raw or JSON-escaped in a `*.log`, and entity-escaped
-  in junit text and attribute values. Each hit is replaced in place, by the
+  `*.jsonl` and `*.json`, raw or JSON-escaped in a `*.log`, a `*.bin` or an
+  `env-dump`, and entity-escaped in junit text and attribute values. A value a
+  log cut short is matched too: at least
+  `shared/src/shared/secret_redaction.py::MIN_TRUNCATED_PREFIX_LEN` leading
+  characters of it, followed by `...`, `…` or a closing quote or bracket (in
+  the file's escaped form), are replaced by a placeholder of the same length.
+  Each hit is replaced in place, by the
   2026-10-11 method: a
   `<redacted:VAR>` placeholder padded with `x` to the same length, mode and
   mtime kept, no backup. In XML the placeholder is entity-escaped
@@ -4137,18 +4237,50 @@ everything already on disk.
   signal. A failing night re-files: one escalation per night until it is
   fixed. The archive directory is created when a project archives its first
   transcript, so a newly onboarded project reports its archive missing until
-  then; that shortfall clears itself. The wrapper resolves `uv` via `scripts/lib/resolve_uv.sh`, so a
-  boot catch-up run without the login PATH still finds it.
+  then; that shortfall clears itself. A root a host config names
+  (`--host-configs-dir`, the laptop) has no archive requirement: a verify host
+  archives no agent transcripts, and none of the laptop's four roots had an
+  archive when measured on 2026-11-19. Under `--dry-run` or `--no-escalation`
+  a shortfall is printed and exits 2 but is not filed. The wrapper resolves
+  `uv` via `scripts/lib/resolve_uv.sh`, so a boot catch-up run without the
+  login PATH still finds it.
 - **What it skips.** Files modified in the last 15 minutes, which a live
   session or test run may still be appending to. The next night picks them up.
+- **A dry run.** `--dry-run` rewrites nothing and files nothing. Its record
+  line lists under `matched` every file a real run would redact, with
+  per-variable counts. The wrapper forwards its arguments and sources `.env`,
+  so on the workstation run
+  `/home/leo/src/dark-factory/scripts/transcript-secret-sweep.sh --dry-run`.
+  After a real run, a dry run should list nothing.
 
 Installing it is a post-merge deterministic deploy
 (`scripts/install-transcript-secret-sweep-timer.sh`, which kicks no immediate
 run). For a run now: `systemctl --user start transcript-secret-sweep.service`.
+
 At archive time a refused redaction is counted like any other archival
 failure (`transcript_archive: failed to redact` WARNING), and the transcript is
 held rather than archived with its value. At teardown, its other lines are
 still redacted in place.
+
+**On leo-laptop.** The laptop runs the same timer, service and wrapper from
+its own checkout. They are installed from the workstation by
+`scripts/deploy/install_laptop_transcript_secret_sweep.sh`, a post-merge
+deterministic deploy (run it with `--check` first). The laptop sweep sources
+the laptop's own `.env`, which holds a different slice of the pool, so no
+value crosses the wire. A drop-in (`scripts/transcript-secret-sweep.laptop.conf`)
+adds two flags:
+
+- `--host-configs-dir /home/leo/.config/orchestrator`, because the laptop has
+  no orchestrator units. Its verify configs there name its project roots.
+- `--no-escalation`, because the escalation server binds 127.0.0.1 on the
+  workstation. Laptop findings are therefore in the laptop journal only:
+  `ssh leo-laptop journalctl --user -u transcript-secret-sweep.service`.
+
+It is a user timer, so it fires only while leo's user manager runs. Lingering
+was off on the laptop when measured on 2026-11-16, and `Persistent=true`
+catches up a missed night. A laptop dry run:
+`ssh leo-laptop 'PATH=$HOME/.local/bin:$PATH /home/leo/src/dark-factory/scripts/transcript-secret-sweep.sh --host-configs-dir /home/leo/.config/orchestrator --no-escalation --dry-run'`
+(uv is not on a non-login ssh PATH).
 
 ### Legibility trickle accounts (03:00)
 
@@ -4946,6 +5078,23 @@ the file** rather than silently truncated. Measured on the committed file
 run, so ~470 KiB once the retention window is full** — the bound the cap
 buys, worth knowing before reading the per-night figure below, because the
 file is rewritten whole every night rather than appended to in place.
+
+**Reading the `kind` vocabulary drift block.** The JSON's top-level
+`kind_registry_drift` (schema 6) and the markdown's `## Kind vocabulary drift`
+score the live `kind` population against the frozen
+`memory_metadata.KIND_REGISTRY`. `unregistered` lists live values that are not
+in the registry; `absent_from_corpus` lists registry values with no live
+record. A growing unregistered count is the **expected** steady state: PRD §10
+open question 1 was ruled option (b), so `kind` membership only warns (a
+non-str `kind` is still a fatal type defect under `memory_metadata.enforce`).
+Do not top up the registry, regenerate the frozen oracle fixture, or file a
+"registry is stale" task. What is worth a look is a step change in `unregistered_records`
+concentrated on a few values. That means a first-party writer started emitting
+an unregistered kind, as `fused-memory/scripts/cleanup_pin_queue_edges.py` does
+with `pin_queue_edge_cleanup_audit`. The trend is
+`git log -p plans/memory-metadata-census-report.md`. The old
+`memory_metadata.enforce_kind_registry` key is retired: a fused-memory config
+still carrying it loads with a `retired key(s)` WARNING, so delete the line.
 
 **What landing all three nightly costs, stated rather than assumed.** The
 two report artifacts are full rewrites every run (measured: JSON 1.04 MiB /

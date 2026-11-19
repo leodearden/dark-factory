@@ -26,7 +26,7 @@ asserts set equality between every span and its partition.  Same convention as
 ``CONTRIBUTING.md``'s ``lint-command-mirror`` block.
 
 This module is intentionally PURE: it defines the three vocabularies and the
-poll and submit partitions only.  It holds no mapping between them and no
+poll, reason and submit partitions only.  It holds no mapping between them and no
 I/O — the raw-status -> ``MergeState`` collapse belongs to
 ``escalation/src/escalation/merge_status_answer.py::map_terminal_state``, and
 duplicating it here would create the second home this module exists to remove.
@@ -54,6 +54,7 @@ import enum
 __all__ = [
     'MergeState',
     'MergeReason',
+    'MERGE_REASONS',
     'LIVE_STATES',
     'TERMINAL_STATES',
     'OUTCOME_STATES',
@@ -188,6 +189,11 @@ class MergeReason(enum.StrEnum):
     landing_unattributable = 'landing_unattributable'
     #: A probe raised; the only reason ``unknown`` may carry.
     probe_failed = 'probe_failed'
+
+
+#: The whole REASON vocabulary as a partition the scripts/tests drift guard can
+#: cite by name (a ``partition=`` marker only accepts UPPER_SNAKE).
+MERGE_REASONS = frozenset(MergeReason)
 
 
 class MergeSubmitStatus(enum.StrEnum):

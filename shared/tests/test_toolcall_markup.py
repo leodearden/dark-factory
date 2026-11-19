@@ -342,7 +342,7 @@ class TestTheWidenedGateCostsWhatItClaims:
     def test_a_param_outside_the_tag_name_shape_never_becomes_a_needle(self, param):
         """(3) The cache-thrash bound, and the coherence argument behind it.
 
-        ``param`` is CALLER-CONTROLLED: ``_first_markup_argument`` passes each
+        ``param`` is CALLER-CONTROLLED: ``_markup_arguments`` passes each
         key of the caller's ``arguments`` mapping straight through, so a caller
         sending unknown argument names would otherwise evict the bounded
         ``_widened_re`` cache with a fresh ``re.compile`` per name.

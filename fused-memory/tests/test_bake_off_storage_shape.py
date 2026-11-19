@@ -1226,9 +1226,7 @@ class TestBetaVocabularyConformance:
 
         for shape in _mod().ARM_SHAPES:
             for record in _arm(shape):
-                violations = validate_memory_metadata(
-                    dict(record.metadata), enforce_kind_registry=True
-                )
+                violations = validate_memory_metadata(dict(record.metadata))
                 fatal = [v for v in violations if v.fatal]
                 assert not fatal, f'{shape}/{record.record_id}: {fatal}'
 

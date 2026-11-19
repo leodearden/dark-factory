@@ -45,6 +45,38 @@ class BaseRelation(StrEnum):
     STALE = 'stale'
 
 
+class ChainDepthBasis(StrEnum):
+    """What the deep policy chose a verify's chain depth from."""
+
+    #: The first depth-table row the rolling per-item pass estimate meets.
+    PASS_ESTIMATE = 'pass_estimate'
+    #: The window held no verdicts, so the first row applied.
+    NO_ESTIMATE = 'no_estimate'
+
+
+@dataclasses.dataclass(frozen=True)
+class ChainDepthReason:
+    """Why one dispatch verified the chain depth it did.
+
+    *row* is the ``(min_pass_estimate, depth)`` row that applied, if any;
+    *queue_depth* counts the dispatching request and the chainable ones
+    queued behind it.
+    """
+
+    basis: ChainDepthBasis
+    pass_estimate: float | None
+    row: tuple[float, int] | None
+    queue_depth: int
+
+    def wire(self) -> dict[str, object]:
+        return {
+            'basis': self.basis.value,
+            'pass_estimate': self.pass_estimate,
+            'row': None if self.row is None else list(self.row),
+            'queue_depth': self.queue_depth,
+        }
+
+
 @dataclasses.dataclass(frozen=True)
 class ChainMembers:
     """The requests one verify covers, as built: the dispatching one, then its chain links."""
@@ -62,24 +94,33 @@ class ChainMembers:
 @dataclasses.dataclass(frozen=True)
 class MergeVerifyDispatchFacts:
     """The allocation decision and base a single verify dispatch ran under,
-    and the requests it covers.
+    the requests it covers, and why the deep policy chose its depth.
 
-    The two ``chain_*`` keys are written only when *members* is known.
+    The two ``chain_*`` member keys are written only when *members* is known.
+    ``chain_depth_reason`` is always written, null when the dispatch never
+    consulted the deep policy.
     """
 
     runner_reason: RunnerReason | None = None
     base_relation: BaseRelation | None = None
     members: ChainMembers | None = None
+    chain_depth_reason: ChainDepthReason | None = None
 
     def event_fields(self) -> dict[str, object]:
         return {
             'runner_reason': _wire(self.runner_reason),
             'base_relation': _wire(self.base_relation),
+            'chain_depth_reason': (
+                None if self.chain_depth_reason is None else self.chain_depth_reason.wire()
+            ),
             **_member_fields(self.members),
         }
 
     def covering(self, members: ChainMembers) -> MergeVerifyDispatchFacts:
         return dataclasses.replace(self, members=members)
+
+    def with_chain_depth_reason(self, reason: ChainDepthReason | None) -> MergeVerifyDispatchFacts:
+        return dataclasses.replace(self, chain_depth_reason=reason)
 
     def as_retry(self) -> MergeVerifyDispatchFacts:
         return dataclasses.replace(self, runner_reason=RunnerReason.RETRY_HELD_HOST)
