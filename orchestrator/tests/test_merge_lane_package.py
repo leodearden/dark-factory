@@ -370,7 +370,7 @@ class _RecordingStub:
 
 def _recording_production_verifier() -> tuple[ProductionVerifier, dict[str, _RecordingStub]]:
     stubs = {field.name: _RecordingStub() for field in dataclasses.fields(ProductionVerifier)}
-    resolvers = {name: (lambda stub=stub: stub) for name, stub in stubs.items()}
+    resolvers: dict[str, Any] = {name: (lambda stub=stub: stub) for name, stub in stubs.items()}
     return ProductionVerifier(**resolvers), stubs
 
 
