@@ -51,7 +51,9 @@ omitted:
   use the alias only for ``.raises``, never ``.mark``, so this is a real but
   currently-inert gap;
 * sibling packages (shared, fused-memory, escalation) have their own markers
-  (e.g. ``integration``) and no equivalent guard.
+  (e.g. ``integration``) and no equivalent guard, except for ``defect`` and
+  ``criterion``: ``TestDefectMarkersRegisteredInEveryMember`` requires both in
+  the root pyproject and in every ``[tool.uv.workspace]`` member's.
 
 This module is built in two halves, in that order: unit tests of the pure
 static helpers against synthetic strings/trees (``TestAppliedMarkerNames``,
@@ -68,7 +70,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 import pytest
-from _orch_helpers import ORCH_PYPROJECT
+from _orch_helpers import ORCH_DIR, ORCH_PYPROJECT
 from _tree_scan import (
     ORCHESTRATOR_TESTS,
     TESTS_DIR,
@@ -634,3 +636,54 @@ class TestMarkerRegistrationDrift:
             'set — tests/conftest.py may have stopped registering it '
             '(task 2418).'
         )
+
+
+_ROOT_PYPROJECT = ORCH_DIR.parent / 'pyproject.toml'
+_DEFECT_TEST_MARKERS = frozenset({'defect', 'criterion'})
+_MEMBERS_NAMED_BY_THE_TASK = frozenset({
+    'client-feed', 'cockpit', 'dashboard', 'escalation',
+    'fused-memory', 'orchestrator', 'sampler', 'shared',
+})
+
+
+def _load_toml(path: Path) -> dict:
+    with path.open('rb') as handle:
+        return tomllib.load(handle)
+
+
+def _workspace_members() -> list[str]:
+    return _load_toml(_ROOT_PYPROJECT)['tool']['uv']['workspace']['members']
+
+
+class TestDefectMarkersRegisteredInEveryMember:
+    """``defect`` and ``criterion`` are registered in every pytest config of the workspace.
+
+    The injected plugin registers both at run time, but a local run has no
+    plugin, so each member registers them itself (plans/defect-tests-prd.md
+    decision 19). The member list is read from the root pyproject's
+    ``[tool.uv.workspace]`` table, never hard-coded.
+    """
+
+    def test_root_and_every_member_register_both_markers(self):
+        pyprojects = [_ROOT_PYPROJECT] + [
+            ORCH_DIR.parent / member / 'pyproject.toml' for member in _workspace_members()
+        ]
+        registered_by_file = {
+            str(path.relative_to(ORCH_DIR.parent)): _registered_marker_names(
+                _load_toml(path)['tool']['pytest']['ini_options'].get('markers', []),
+            )
+            for path in pyprojects
+        }
+        missing = {
+            name: sorted(_DEFECT_TEST_MARKERS - registered)
+            for name, registered in registered_by_file.items()
+            if _DEFECT_TEST_MARKERS - registered
+        }
+        assert missing == {}, (
+            f'These pyprojects do not register the defect-test markers: {missing!r}. '
+            'Add the missing entries to [tool.pytest.ini_options].markers.'
+        )
+
+    def test_the_member_list_is_not_vacuous(self):
+        absent = _MEMBERS_NAMED_BY_THE_TASK - set(_workspace_members())
+        assert not absent, f'workspace members {sorted(absent)} were not read from {_ROOT_PYPROJECT}'
