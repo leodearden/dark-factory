@@ -1861,6 +1861,7 @@
     "orchestrator/tests/test_run_thin_warm_lane_live_ref.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_script_warnings.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_seed_lane_lock_reentrancy.py": {"patch_targets": [], "private_reads": 1},
+    "orchestrator/tests/test_seed_script_stubs.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_session_resume_integration_gate.py": {"patch_targets": [], "private_reads": 114},
     "orchestrator/tests/test_spec_lane_cancellation.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_spec_lane_reacquire.py": {"patch_targets": [], "private_reads": 0},
