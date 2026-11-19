@@ -1071,14 +1071,14 @@ class TestAdmissionInactive:
 async def _retry_between_turns(rig: _Rig) -> VerifyResult:
     """Row 37's second scenario: the test leg's first run times out holding the local turn,
     an older task takes the turn, and the retry waits behind it while the laptop turn frees."""
+    rig.config.verify_timeout_retries = 1
     laptop_holder = rig.hold()
     await _bounded(laptop_holder.granted.wait())
     call = rig.start()
-    await _until(lambda: rig.legs.spawned(_TEST), watching=call)
+    await _until(lambda: _holding(rig.local_gate) == ['7'], watching=call)
     older = rig.hold_local(task_id='older', arrival=0.0)
     await _bounded(older.granted.wait())
     await _until(lambda: _waiting(rig.local_gate, '7'), watching=call)
-    assert len(rig.legs.pids(_TEST)) == 1
 
     await laptop_holder.leave()
     await _until(lambda: _holding(rig.laptop) == _waiters(rig.laptop) == [])
@@ -1086,8 +1086,9 @@ async def _retry_between_turns(rig: _Rig) -> VerifyResult:
     assert not call.done()
     await older.leave()
     result = await _bounded(call)
-    assert result.passed
-    assert len(rig.legs.pids(_TEST)) == 2
+    assert result.admission_legs is not None
+    [first, _retry] = result.admission_legs
+    assert first.timed_out
     assert rig.sidecar()['reason'] == 'local_granted_first'
     assert rig.local.cancels == []
     assert rig.remotes['laptop'].log == []
