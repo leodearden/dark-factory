@@ -690,6 +690,7 @@ _MQ_ZERO_THROUGHPUT: TrainThroughput = {
 _MQ_MEASURED_QUEUE = {
     'in_queue': Datum(0, MQ_SERVED_AT, DatumState.FRESH, None, 30),
     'live_probe_configured': True,
+    'runs_db_present': True,
     'speculative': _mq_read({'hit_count': 0, 'discard_count': 0, 'total': 0, 'hit_rate': None}),
     'recent_total': _mq_read(0),
     'depth_timeseries': _mq_read({'labels': [], 'values': [], 'bucket_minutes': 15}),
@@ -2236,6 +2237,10 @@ class TestShapeMergeQueueServedDatums:
     @pytest.mark.parametrize('configured', [True, False])
     def test_live_probe_configured_is_carried_verbatim(self, configured):
         assert _shaped(live_probe_configured=configured)['live_probe_configured'] is configured
+
+    @pytest.mark.parametrize('present', [True, False])
+    def test_runs_db_present_is_carried_verbatim(self, present):
+        assert _shaped(runs_db_present=present)['runs_db_present'] is present
 
     def test_there_is_no_active_approximate_key(self):
         assert 'active_approximate' not in _shaped(active_approximate=True)
