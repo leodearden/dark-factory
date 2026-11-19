@@ -1070,7 +1070,9 @@ class TestAdmissionInactive:
 
 async def _retry_between_turns(rig: _Rig) -> VerifyResult:
     """Row 37's second scenario: the test leg's first run times out holding the local turn,
-    an older task takes the turn, and the retry waits behind it while the laptop turn frees."""
+    an older task takes the turn, and the retry waits behind it while the laptop turn frees.
+    One timeout retry is pinned, so exactly two test-leg turns are granted, and the verdict
+    is green or a pure timeout: load can make a trivial leg overrun, never fail."""
     rig.config.verify_timeout_retries = 1
     laptop_holder = rig.hold()
     await _bounded(laptop_holder.granted.wait())
@@ -1086,6 +1088,7 @@ async def _retry_between_turns(rig: _Rig) -> VerifyResult:
     assert not call.done()
     await older.leave()
     result = await _bounded(call)
+    assert result.passed or result.timed_out
     assert result.admission_legs is not None
     [first, _retry] = result.admission_legs
     assert first.timed_out
