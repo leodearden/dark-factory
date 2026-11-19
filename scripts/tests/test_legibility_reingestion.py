@@ -15,7 +15,6 @@ from legibility import coder, reingestion
 from legibility_carrier_fixtures import (
     CENSUS_MEMORY_CONTEXT_TURN,
     CENSUS_QUOTE_OF_THE_ESCALATION_PAYLOAD,
-    HUMAN_TURNS_NAMING_A_CENSUS_PROMPT,
     HUMAN_TURNS_NAMING_AN_INJECTED_PROMPT,
     NON_HUMAN_ORIGIN_IDS,
     NON_HUMAN_ORIGIN_TURNS,
@@ -269,10 +268,6 @@ class TestHarnessInjectedTurnFilter:
 
     @pytest.mark.parametrize('text', HUMAN_TURNS_NAMING_AN_INJECTED_PROMPT)
     def test_human_turn_naming_an_injected_prompt_is_retained(self, text):
-        assert reingestion.is_harness_injected_turn(text) is False
-
-    @pytest.mark.parametrize('text', HUMAN_TURNS_NAMING_A_CENSUS_PROMPT)
-    def test_human_turn_naming_a_census_prompt_is_retained(self, text):
         assert reingestion.is_harness_injected_turn(text) is False
 
     def test_human_turn_quoting_the_census_sighting_is_retained(self):

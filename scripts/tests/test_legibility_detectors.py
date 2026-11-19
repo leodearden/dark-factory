@@ -766,37 +766,24 @@ class TestAgentClassEvidence:
 
 _ORCHESTRATED_TASK_PREAMBLE = 'Task ID: 6925\nWorktree: /home/leo/src/dark-factory/.worktrees/6925'
 
+_FOREIGN_MARKER_LINES = [
+    pytest.param(_ORCHESTRATED_TASK_PREAMBLE, id='orchestrated_task'),
+    pytest.param('<command-message>recon-escalation-watcher</command-message>', id='watcher'),
+    pytest.param('You are a Memory Consolidator agent operating in sleep mode.', id='recon'),
+    pytest.param('You are the task curator for the dark-factory orchestrator.', id='curator_classifier'),
+]
+
+_INSTRUMENT_PROMPT_BUILDERS = [
+    pytest.param(_coder_prompt, id='trickle_coder'),
+    pytest.param(census_verifier_prompt, id='census_verifier'),
+    pytest.param(census_synthesis_prompt, id='census_synthesis'),
+]
+
 
 class TestLegibilityInstrumentSessions:
-    @pytest.mark.parametrize(
-        'digest_line',
-        [
-            _ORCHESTRATED_TASK_PREAMBLE,
-            '<command-message>recon-escalation-watcher</command-message>',
-            'You are a Memory Consolidator agent operating in sleep mode.',
-            'You are the task curator for the dark-factory orchestrator.',
-        ],
-        ids=['orchestrated_task', 'watcher', 'recon', 'curator_classifier'],
-    )
-    def test_a_trickle_coder_prompt_is_classified_by_its_opener_not_its_embedded_digest(
-        self, digest_line,
-    ):
-        assert _classify(user_record(_coder_prompt(digest_line))) is AgentClass.LEGIBILITY_INSTRUMENT
-
-    @pytest.mark.parametrize(
-        'build_prompt', [census_verifier_prompt, census_synthesis_prompt], ids=['verifier', 'synthesis'],
-    )
-    @pytest.mark.parametrize(
-        'foreign_line',
-        [
-            _ORCHESTRATED_TASK_PREAMBLE,
-            '<command-message>recon-escalation-watcher</command-message>',
-            'You are a Memory Consolidator agent operating in sleep mode.',
-            'You are the task curator for the dark-factory orchestrator.',
-        ],
-        ids=['orchestrated_task', 'watcher', 'recon', 'curator_classifier'],
-    )
-    def test_a_census_prompt_is_classified_by_its_opener_not_its_embedded_clusters(
+    @pytest.mark.parametrize('build_prompt', _INSTRUMENT_PROMPT_BUILDERS)
+    @pytest.mark.parametrize('foreign_line', _FOREIGN_MARKER_LINES)
+    def test_an_instrument_prompt_is_classified_by_its_opener_not_the_text_it_embeds(
         self, foreign_line, build_prompt,
     ):
         assert _classify(user_record(build_prompt(foreign_line))) is AgentClass.LEGIBILITY_INSTRUMENT

@@ -442,23 +442,27 @@ HUMAN_TURNS_NAMING_AN_INJECTED_PROMPT = (
         'why is the autonomous escalation watcher re-arming twice per rotation?',
         id='watcher',
     ),
-)
-"""Human turns that name the adjudicator, replan and watcher prompts without
-carrying their opening sentences, so they stay dialogue. Each is a
-``pytest.param`` carrying its own id, ready to parametrize a single ``text``
-argument."""
-
-
-HUMAN_TURNS_NAMING_A_CENSUS_PROMPT = (
     pytest.param(
         'why does the periodic-census verifier keep hunting for transcripts with find?',
-        id='verifier',
+        id='census_verifier',
     ),
     pytest.param(
         'the census synthesis writer dropped my correction again',
-        id='synthesis',
+        id='census_synthesis',
+    ),
+    pytest.param(
+        'why does "You are the periodic-census verifier for the dark-factory '
+        'agent-confusion …" run find over the whole disk?',
+        id='census_verifier_opener_quote',
+    ),
+    pytest.param(
+        'the PRD quotes "You are the periodic-census synthesis writer for the '
+        'dark-factory agent-confusion …" — why does it drop my corrections?',
+        id='census_synthesis_opener_quote',
     ),
 )
-"""Human turns that name the census verifier and synthesis prompts without
-carrying their opening sentences, so they stay dialogue. Shaped like
-``HUMAN_TURNS_NAMING_AN_INJECTED_PROMPT``."""
+"""Human turns that name or quote the harness prose prompts without carrying
+a whole marker, so they stay dialogue. The opener quotes stop one word short
+of their marker, as ``CENSUS_QUOTE_OF_THE_ESCALATION_PAYLOAD`` does, so a
+shortened marker turns them red. Each is a ``pytest.param`` carrying its own
+id, ready to parametrize a single ``text`` argument."""
