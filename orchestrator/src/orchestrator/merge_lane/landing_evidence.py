@@ -39,7 +39,8 @@ subject-anchored citation discovery) and ``git_ops.commit_effect_present_in_main
 since task 3116 a threshold LINE-SURVIVAL test, not byte-identity) — an
 inline-per-site shape that let two of the five sites (the merge-marker path
 and the coalesce re-drive) ship WITHOUT the effect-present guard at all (the
-task-1175 clobber: a reverted merge still read as a genuine landing) and let
+task-1175 clobber: a merge marker whose branch netted no change still read as
+a genuine landing) and let
 two more lean on a silent ``x or <fallback-sha>`` expression that fabricated
 provenance when discovery came up empty.
 
@@ -152,7 +153,8 @@ it.
   no-ff merge commit is NOT a no-op — task 2675 made
   ``commit_effect_present_in_main`` merge-aware, so it diffs each of the
   merge commit's non-first parents' content against current main HEAD,
-  correctly catching a reverted no-ff merge (the task-1175 shape). Used by
+  correctly catching a reverted no-ff merge, and an empty-net-diff one (the
+  task-1175 shape) through its empty-touched-set fail-safe. Used by
   the coalesce re-drive and the workflow recovery guard. A citation miss
   first tries one upgrade-only fallback
   (:func:`_content_equivalence_anchor`, task 4862); it is inert for an
@@ -861,7 +863,7 @@ class LandingVerdict:
 
         The rescue discriminant for every reader in this package.  A rescued
         accept's ``evidence_sha`` IS on main but its effect is ABSENT at main
-        HEAD — the task-1175 shape FIX 1' guards — so ``accepted``/
+        HEAD — the shape FIX 1' guards — so ``accepted``/
         ``evidence_sha`` alone cannot tell it from a fully-guarded accept (see
         :func:`_delivered_checks_differential`).  Equality, not truthiness:
         ``no_signal`` and ``disabled`` are truthy yet only reach a reject.
@@ -2141,8 +2143,8 @@ async def validate_landing_evidence(
     # both is_ancestor directions is still a genuine landing; hard-rejecting
     # it caused a close<->refile ping-pong (the auto-watcher closes the
     # benign L1, the gate re-opens it) that never self-resolved. The FIX 1'
-    # effect-present guard below stays the real gate against a reverted
-    # (task-1175) landing.
+    # effect-present guard below stays the real gate against a reverted or
+    # empty-net-diff (task-1175) landing.
     citation_on_branch = await git_ops.is_ancestor(citation, branch)
 
     # FIX 1' effect-present guard (task 2500/2675): ancestry alone doesn't

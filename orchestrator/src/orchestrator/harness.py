@@ -6857,12 +6857,11 @@ class Harness:
             # attribution is already established by recovery_for's
             # ground-truth report, so only the effect-present guard
             # remains. Previously this check was gated on ``on_main`` only,
-            # so a branch-deleted merge marker whose effect had been
-            # reverted at current main HEAD skipped it entirely and was
-            # stamped done unconditionally (the task-1175 clobber,
-            # reproduced inside this sweep). No escalation on reject here
-            # by design; the reject is recorded as a landing_evidence_rejected
-            # event before any revert (task 4496).
+            # so the marker sub-case skipped the guard and an empty-net-diff
+            # merge marker was stamped done: the task-1175 shape, which was
+            # a re-derivation clobber rather than a revert. No escalation on
+            # reject here by design; the reject is recorded as a
+            # landing_evidence_rejected event before any revert (task 4496).
             #
             # The live branch tip is diagnostic only — CANDIDATE mode never
             # reads it for the decision — but it must be captured before a
@@ -14146,8 +14145,9 @@ class Harness:
                     return False
                 # CANDIDATE mode (task 2678): the marker's subject match
                 # already attributes this landing to task_id — only the
-                # FIX 1' effect-present guard remains, closing the task-1175
-                # clobber (a reverted merge previously stamped done anyway).
+                # FIX 1' effect-present guard remains.  Before it, an
+                # empty-net-diff marker (the task-1175 shape) was stamped
+                # done anyway.
                 verdict = await validate_landing_evidence(
                     self.git_ops, task_id, branch,
                     branch_tip_sha=None,

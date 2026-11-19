@@ -381,10 +381,9 @@ class TestReconcileOneStrandedGroundTruthMarkDone:
 # task 2678 extends this refinement to the GONE_WITH_MERGE_MARKER sub-case
 # too (routed through validate_landing_evidence in CANDIDATE mode on
 # report.branch_state.sha, applied uniformly to both sub-cases): previously
-# the inline check here was gated on ``on_main``, so a branch-deleted merge
-# marker whose effect had been reverted at current main HEAD skipped the
-# guard entirely and was stamped done unconditionally — the task-1175
-# clobber shape, reproduced inside this sweep.
+# the inline check here was gated on ``on_main``, so the marker sub-case
+# skipped the guard and an empty-net-diff merge marker was stamped done —
+# the task-1175 shape, a re-derivation clobber rather than a revert.
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
