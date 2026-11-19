@@ -263,6 +263,13 @@ _strict_max() {
     return 0
 }
 
+# _py_json_check <json> <python3-arg>...
+# Feeds <json> to python3 on stdin; why it is shaped this way:
+# orchestrator/tests/warm-lane/README.md "Delta 11".
+_py_json_check() {
+    printf '%s' "$1" | python3 "${@:2}"
+}
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Block B — ASSIGNED/FREE probe + LIVE + headroom counts
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1975,5 +1982,25 @@ assert "Q8: HEADROOM reports free=1 and reclaimable=1 (the shared lane's freed c
 
 kill "$Q_SHARED_PID" "$Q_EXCL_PID" 2>/dev/null || true
 _BGPIDS=()  # clear so cleanup doesn't double-kill
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Block R — JSON checkers run isolated from their own directory
+# ──────────────────────────────────────────────────────────────────────────────
+echo ""
+echo "--- Block R: JSON checkers run isolated from their own directory ---"
+
+R_DIR="$(mktemp -d /tmp/test-warm-lane-audit-r-XXXXXX)"
+_TMPDIRS+=("$R_DIR")
+printf '%s\n' 'import sys' 'sys.stderr.write("poisoned json.py imported\n")' 'raise SystemExit(97)' > "$R_DIR/json.py"
+printf '%s\n' 'import json, sys' 'assert json.load(sys.stdin) == {"r": 1}' > "$R_DIR/check.py"
+
+_r_from_dir() { (cd "$1" && shift && _py_json_check "$@"); }
+
+assert "R0: without isolation the sibling json.py shadows the stdlib json (exit 97; non-vacuity control)" \
+    bash -c 'printf "%s" "{\"r\": 1}" | python3 "$1"; [ "$?" -eq 97 ]' _ "$R_DIR/check.py"
+assert "R1: a checker script run by _py_json_check imports the stdlib json, not its directory's json.py" \
+    _py_json_check '{"r": 1}' "$R_DIR/check.py"
+assert "R2: a -c checker run by _py_json_check from the poisoned cwd imports the stdlib json" \
+    _r_from_dir "$R_DIR" '{"r": 1}' -c 'import json, sys; assert json.load(sys.stdin) == {"r": 1}'
 
 test_summary
