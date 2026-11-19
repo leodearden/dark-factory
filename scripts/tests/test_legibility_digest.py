@@ -1075,6 +1075,20 @@ class TestTrickleCoderSessionDigest:
 
         assert yaml.safe_load(frontmatter_yaml)['instrument_version'] >= 7
 
+    def test_frontmatter_instrument_version_is_at_or_past_the_census_prompt_generation(self):
+        """A version floor only. Generation 8 is the first whose gold section
+        and dialogue carriers exclude the periodic-census verifier and
+        synthesis prompts. The exclusion itself is pinned by the
+        TestHarnessInjectedTurnFilter census tests, e.g.
+        test_render_digest_census_instrument_session_has_no_gold_section."""
+        digest = mod.render_digest(
+            [_with_session_meta(_user_text('please fix the bug'))], agent_class='interactive',
+        )
+
+        frontmatter_yaml, _ = _split_frontmatter(digest)
+
+        assert yaml.safe_load(frontmatter_yaml)['instrument_version'] >= 8
+
 
 # ---------------------------------------------------------------------------
 # find_retry_loops — same tool name + canonical (sort_keys) input signature
