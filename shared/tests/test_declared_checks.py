@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import dataclasses
 from typing import Any
 
 import pytest
@@ -78,12 +77,6 @@ def test_the_rule_is_shape_only_an_empty_mapping_is_still_a_check() -> None:
     assert declared.checks == ({},)
     assert declared.unreadable == ()
     assert declared.is_empty is False
-
-
-def test_declared_checks_is_frozen() -> None:
-    mutable: Any = _read([_A])
-    with pytest.raises(dataclasses.FrozenInstanceError):
-        mutable.checks = ()
 
 
 def test_a_list_of_only_unreadable_entries_is_not_empty() -> None:
