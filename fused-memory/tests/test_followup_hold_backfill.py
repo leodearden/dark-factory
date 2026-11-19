@@ -9,6 +9,7 @@ from __future__ import annotations
 import ast
 import logging
 import pathlib
+from collections.abc import Sequence
 from typing import Any
 
 import pytest
@@ -72,7 +73,7 @@ async def test_the_backfill_holds_every_matching_pending_followup_in_one_event(s
     prior = {task_id: _dependencies(await _row(stack, task_id)) for task_id in matching}
     untouched_before = {task_id: await _row(stack, task_id) for task_id in untouched}
 
-    count = await stack.interceptor.backfill_followup_holds(stack.root)
+    count = await stack.interceptor.backfill_followup_holds(stack.root, known_roots=[stack.root])
 
     assert count == 3
     [holder] = await _holder_ids(stack)
@@ -91,10 +92,10 @@ async def test_the_backfill_holds_every_matching_pending_followup_in_one_event(s
 @pytest.mark.asyncio
 async def test_a_second_backfill_adds_nothing_and_still_reports(stack: Stack) -> None:
     matching, _untouched = await _seed_stock(stack)
-    await stack.interceptor.backfill_followup_holds(stack.root)
+    await stack.interceptor.backfill_followup_holds(stack.root, known_roots=[stack.root])
     held = {task_id: _dependencies(await _row(stack, task_id)) for task_id in matching}
 
-    count = await stack.interceptor.backfill_followup_holds(stack.root)
+    count = await stack.interceptor.backfill_followup_holds(stack.root, known_roots=[stack.root])
 
     assert count == 0
     for task_id in matching:
@@ -106,7 +107,7 @@ async def test_a_second_backfill_adds_nothing_and_still_reports(stack: Stack) ->
 async def test_with_nothing_to_hold_no_holder_is_minted(stack: Stack) -> None:
     await stack.seed('Medium agent follow-up', dict(_FOLLOWUP), priority='medium')
 
-    count = await stack.interceptor.backfill_followup_holds(stack.root)
+    count = await stack.interceptor.backfill_followup_holds(stack.root, known_roots=[stack.root])
 
     assert count == 0
     assert await _holder_ids(stack) == []
@@ -138,7 +139,7 @@ async def test_the_backfill_leaves_unheld_every_followup_an_unheld_task_waits_on
     await _seed_depending(stack, 'Done task on X4', x4, status='done')
     waited_on_before = {task_id: await _row(stack, task_id) for task_id in (x, x2, x5)}
 
-    count = await stack.interceptor.backfill_followup_holds(stack.root)
+    count = await stack.interceptor.backfill_followup_holds(stack.root, known_roots=[stack.root])
 
     assert count == 4
     [holder] = await _holder_ids(stack)
@@ -149,6 +150,35 @@ async def test_the_backfill_leaves_unheld_every_followup_an_unheld_task_waits_on
     for task_id, before in waited_on_before.items():
         assert await _row(stack, task_id) == before, task_id
     assert [event['count'] for event in await stack.events(EventType.followup_hold_backfilled)] == [4]
+
+
+async def _seed_dependent_in(
+    stack: Stack, project_root: str, title: str, depends_on: str, **fields: str,
+) -> None:
+    created = await stack.backend.add_task(project_root=project_root, title=title, metadata='{}', **fields)
+    await stack.backend.add_dependency(str(created['id']), depends_on, project_root)
+
+
+@pytest.mark.asyncio
+async def test_a_followup_another_project_waits_on_is_not_held(stack: Stack) -> None:
+    other_root = str(pathlib.Path(stack.root).parent / 'other')
+    this_project = resolve_project_id(stack.root)
+    x = await stack.seed('Low follow-up X', dict(_FOLLOWUP), priority='low')
+    z = await stack.seed('Low follow-up Z', dict(_FOLLOWUP), priority='low')
+    await _seed_dependent_in(stack, other_root, 'Pending task waiting on X', f'{this_project}:{x}')
+    await _seed_dependent_in(
+        stack, other_root, 'Deferred task on Z', f'{this_project}:{z}', status='deferred',
+    )
+    x_before = await _row(stack, x)
+
+    count = await stack.interceptor.backfill_followup_holds(
+        stack.root, known_roots=[stack.root, other_root],
+    )
+
+    assert count == 1
+    [holder] = await _holder_ids(stack)
+    assert holder in _dependencies(await _row(stack, z))
+    assert await _row(stack, x) == x_before
 
 
 def test_the_backfill_is_enabled_by_default() -> None:
@@ -164,10 +194,12 @@ def test_the_backfill_can_be_switched_off() -> None:
 class _RecordingBackfiller:
     def __init__(self, failing: set[str]) -> None:
         self.seen: list[str] = []
+        self.known_roots: list[list[str]] = []
         self._failing = failing
 
-    async def backfill_followup_holds(self, project_root: str) -> int:
+    async def backfill_followup_holds(self, project_root: str, *, known_roots: Sequence[str]) -> int:
         self.seen.append(project_root)
+        self.known_roots.append(list(known_roots))
         if project_root in self._failing:
             raise RuntimeError(f'store unreadable under {project_root}')
         return 2
@@ -191,7 +223,9 @@ async def test_startup_backfills_every_real_root_and_isolates_a_failure(
 
     await server_main._backfill_followup_holds(FusedMemoryConfig(), backfiller, startup_roots.values())
 
-    assert backfiller.seen == [startup_roots['first'], startup_roots['broken'], startup_roots['last']]
+    real_roots = [startup_roots['first'], startup_roots['broken'], startup_roots['last']]
+    assert backfiller.seen == real_roots
+    assert backfiller.known_roots == [real_roots] * len(real_roots)
     warned = [record for record in caplog.records if record.levelno == logging.WARNING]
     failed = [record for record in caplog.records if record.levelno == logging.ERROR]
     assert any(startup_roots['phantom'] in record.getMessage() for record in warned), warned
