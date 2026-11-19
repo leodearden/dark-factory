@@ -19,17 +19,34 @@
 // THE CLIENT NEVER ALTERS A SERVED COUNT. Each project's `in_queue` is the
 // server's Datum — the live probe, or its own sampled history's last value,
 // stale and saying why — and its `speculative`, `recent_total`, `depth` and
-// `attempts` are its runs.db window reads, unknown when that read failed. The only envelopes built
-// here are datum.js's own: a receipt stamp, an unknown placeholder, and a
-// combined total in which a hole anywhere is a hole in the sum.
+// `attempts` are its runs.db window reads, unknown when that read failed. The
+// only envelopes built here are datum.js's own: a receipt stamp, an unknown
+// placeholder, and a combined total. A lower-bound total over the readable
+// projects that names the unread ones is a combination, not an alteration.
 //
-// AN IN-QUEUE TOTAL'S SCOPE IS THE PROBED PROJECTS. A project the server serves
-// with `live_probe_configured: false` has no queue this dashboard can read (a
+// A RUNS.DB TOTAL'S SCOPE IS THE PROJECTS WITH A RUNS.DB FILE. A project served
+// `runs_db_present: false` has no runs.db to read, now or ever, so it is
+// outside every speculative, attempts and latency total and spark rather than
+// a hole that blanks them for good. A runs.db that exists but did not read IS
+// a hole: its own datum says why.
+//
+// AN IN-QUEUE TOTAL'S SCOPE IS THE PROBED PROJECTS. A project served
+// `live_probe_configured: false` has no queue this dashboard can read (a
 // configured root may run no orchestrator), so it is outside every in-queue
-// total and spark rather than a hole that blanks them for good. A probed
-// project that cannot be read IS a hole: its own datum says why. The
-// speculative and attempts totals are NOT so scoped: their counts come from
-// each project's runs.db, which that probe has no bearing on.
+// total and spark. A probed project whose probe fails stays in scope: with a
+// sample in its history it counts stale, and without one (a stopped
+// orchestrator) it is a hole. The two scopes are independent: the probe has no
+// bearing on runs.db, nor runs.db on the probe.
+//
+// A HOLE IN SCOPE MAKES A TOTAL A LOWER BOUND. The in-queue, attempts and
+// worst-p95 totals combine monotonically (a sum, a max), so the readable
+// projects' total is a true '≥' of the whole: it is served lower_bound and
+// totalHint names the unreadable projects. The hit rate is the exception: a
+// ratio over a subset bounds the whole neither way, so a hole there is still a
+// hole in the rate.
+//
+// SPARKS KEEP THE BLANK-ON-HOLE RULE. A spark over only the readable projects
+// draws a dip that never happened, and a shape has no '≥' to carry.
 
 // Module scope, no fallback, RENAMED — see the CANONICAL note in datum.js's
 // header.
@@ -37,6 +54,8 @@ const {
   servedDatum: servedQueueDatum,
   unknownDatum: unknownQueueDatum,
   combinedDatum: combineQueueDatums,
+  lowerBoundCombinedDatum: lowerBoundQueueDatums,
+  missingParts: missingQueueParts,
   EM_DASH: QUEUE_EM_DASH,
 } = window.DF_DATUM;
 
@@ -54,14 +73,23 @@ function queueEntries(data) {
   return data.MERGE_QUEUE || {};
 }
 
-// `projects` null means every project the payload carries. A project the
-// payload does not carry stays in scope, so a total over it is a hole.
-function queueScope(data, projects) {
+// `projects` null means every project the payload carries; a project whose
+// entry serves *flag* false is outside the scope. A project the payload does
+// not carry stays in scope, so a total over it is a hole.
+function scopeFlagged(data, projects, flag) {
   const entries = queueEntries(data);
   return (projects === null ? Object.keys(entries) : projects).filter(project => {
     const entry = entries[project];
-    return !entry || entry.live_probe_configured !== false;
+    return !entry || entry[flag] !== false;
   });
+}
+
+function queueScope(data, projects) {
+  return scopeFlagged(data, projects, 'live_probe_configured');
+}
+
+function runsDbScope(data, projects) {
+  return scopeFlagged(data, projects, 'runs_db_present');
 }
 
 // *project*'s served *field* Datum, stamped with this endpoint's receipt.
@@ -79,7 +107,7 @@ function projectInQueue(data, project) {
 
 function inQueueOver(data, projects) {
   if (!queueReceipts(data)[MERGE_QUEUE_ENDPOINT]) return unknownQueueDatum(QUEUE_NOT_YET_FETCHED);
-  return combineQueueDatums(
+  return lowerBoundQueueDatums(
     queueScope(data, projects).map(project => [project, projectInQueue(data, project)]),
     counts => counts.reduce((sum, n) => sum + n, 0),
     'no project in scope has a live get_merge_queue probe configured',
@@ -129,30 +157,38 @@ function recentTotal(data, project) {
 }
 
 // The speculative counts summed over `projects` (null: every payload project).
-// A window with no attempts has no rate, so the total is a hole rather than 0%.
+// Strict: a hole anywhere is a hole in the rate. A window with no attempts has
+// no rate, so the total is a hole rather than 0%.
 function speculativeOver(data, projects) {
-  const total = runsDbOver(data, projects, projectSpeculative, sumSpeculativeCounts);
+  const total = runsDbOver(data, projects, projectSpeculative, sumSpeculativeCounts, combineQueueDatums);
   if (total.state !== 'unknown' && total.value.total === 0) {
-    return unknownQueueDatum('no speculative attempts in this window');
+    return unknownQueueDatum(alsoReading('no speculative attempts in this window', total));
   }
   return total;
 }
 
-// Every payload project for a null scope; the runs.db readings are not scoped
-// to the probed projects.
-function runsDbScope(data, projects) {
-  return projects === null ? Object.keys(queueEntries(data)) : projects;
-}
-
-// Each in-scope project's `reader` Datum, combined: a hole before the
-// endpoint's first receipt, and a hole anywhere in scope is a hole in it.
-function runsDbOver(data, projects, reader, combine) {
+// Each in-scope project's `reader` Datum, folded by `combine` under the
+// `combineParts` hole policy; a hole before the endpoint's first receipt.
+function runsDbOver(data, projects, reader, combine, combineParts) {
   if (!queueReceipts(data)[MERGE_QUEUE_ENDPOINT]) return unknownQueueDatum(QUEUE_NOT_YET_FETCHED);
-  return combineQueueDatums(
+  return combineParts(
     runsDbScope(data, projects).map(project => [project, reader(data, project)]),
     combine,
-    'no project is in scope',
+    'no project in scope has a runs.db',
   );
+}
+
+// *why*, then *total*'s own reason, so a hole the total read past stays named.
+function alsoReading(why, total) {
+  return total.reason ? why + '; ' + total.reason : why;
+}
+
+// A tile's hint: what its total covered, then the projects it could not read;
+// undefined when there is neither.
+function totalHint(total, covered) {
+  const missing = missingQueueParts(total);
+  const parts = [covered, missing.length > 0 ? missing.join(', ') + ' unreadable' : null].filter(Boolean);
+  return parts.length > 0 ? parts.join(' · ') : undefined;
 }
 
 function sumSpeculativeCounts(parts) {
@@ -187,6 +223,7 @@ function attemptCount(attempts) {
 function attemptsOver(data, projects) {
   return runsDbOver(
     data, projects, projectAttempts, parts => parts.reduce((sum, part) => sum + attemptCount(part), 0),
+    lowerBoundQueueDatums,
   );
 }
 
@@ -210,9 +247,9 @@ function attemptsHistory(data, projects) {
 // The worst p95 over the in-scope projects whose window holds a timed attempt,
 // and how many did. No timed project has no worst centile: a hole, not 0.
 function worstP95Over(data, projects) {
-  const worst = runsDbOver(data, projects, projectAttempts, worstTimedP95);
+  const worst = runsDbOver(data, projects, projectAttempts, worstTimedP95, lowerBoundQueueDatums);
   if (worst.state !== 'unknown' && worst.value.timed_projects === 0) {
-    return unknownQueueDatum('no timed merges in this window');
+    return unknownQueueDatum(alsoReading('no timed merges in this window', worst));
   }
   return worst;
 }
@@ -265,6 +302,7 @@ const MERGE_QUEUE_API = {
   attemptsOver,
   attemptsHistory,
   worstP95Over,
+  totalHint,
 };
 
 if (typeof module !== 'undefined' && module.exports) {
