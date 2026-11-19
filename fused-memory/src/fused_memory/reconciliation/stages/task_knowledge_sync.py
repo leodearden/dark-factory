@@ -114,6 +114,7 @@ from fused_memory.reconciliation.task_filter import (
     render_active_section,
     render_retained_done_tasks,
     select_done_since_boundary,
+    tree_unavailable_notice,
 )
 from fused_memory.reconciliation.tree_read_instant import resolve_tree_read_instant
 from fused_memory.utils.async_utils import gather_collect
@@ -4052,6 +4053,7 @@ class TaskKnowledgeSync(BaseStage):
         stage1_report = prior_reports[0] if prior_reports else None
 
         filtered, tree_read_at = await self._resolve_task_tree()
+        unavailable = tree_unavailable_notice(filtered)
 
         # Defensive invariant check (task-782): see _check_filtered_tree_invariant.
         self._check_filtered_tree_invariant(filtered)
@@ -4076,7 +4078,9 @@ class TaskKnowledgeSync(BaseStage):
             )
 
         proactive_sample_section = ''
-        if not self.remediation_mode:
+        if not self.remediation_mode and unavailable is not None:
+            proactive_sample_section = f'\n### Proactive Task Sample\n{unavailable}\n'
+        elif not self.remediation_mode:
             # Pool intentionally excludes unknown-status tasks (dropped by
             # filter_task_tree) and caps done_tasks at MAX_DONE_TASKS_RETAINED.
             sample = _select_proactive_sample(
@@ -4100,7 +4104,9 @@ class TaskKnowledgeSync(BaseStage):
         # `not self.remediation_mode` — mirrors proactive_sample_section
         # (remediation is a focused second pass, not general sync).
         done_audit_section = ''
-        if not self.remediation_mode:
+        if not self.remediation_mode and unavailable is not None:
+            done_audit_section = f'\n### Done-Task Completion-Memory Audit\n{unavailable}\n'
+        elif not self.remediation_mode:
             boundary = watermark.last_task_change_timestamp
             audit_tasks = select_done_since_boundary(filtered.all_done_tasks, boundary)
             total_audit = len(audit_tasks)
