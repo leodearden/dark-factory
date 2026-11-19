@@ -39,7 +39,7 @@ forgets:
   / ``leaked_fleet_heartbeat_reason``), directly testable without a nested
   pytest run;
 * that BOTH fixtures are actually armed in the process running this file —
-  defined, shaped session/autouse, and registered by a conftest binding — since
+  defined, shaped session/autouse, and registered by a conftest's arm call — since
   every pure-helper test above stays green against a dead defence; and
 * what a violation DOES to a run, through a real nested pytest session: the
   process exits non-zero even though every one of its tests passed.
@@ -638,8 +638,8 @@ class TestBothFixturesAreLiveInThisRun:
 
     Everything above tests pure functions against ``tmp_path`` dirs; all of it
     would stay green if neither fixture were ever loaded by any conftest — the
-    ``# noqa: F401`` bindings in ``conftest.py`` and ``scripts/tests/conftest.py``
-    could be deleted and only this class would notice.  That is the difference
+    ``arm_fleet_dir_isolation(config)`` calls in ``conftest.py`` and
+    ``scripts/tests/conftest.py`` could be deleted and only this class would notice.  That is the difference
     between a wired defence and a dead one, and a silently-dead guard is the
     exact failure mode this whole task family exists to prevent.
 
@@ -674,21 +674,21 @@ class TestBothFixturesAreLiveInThisRun:
 
     @pytest.mark.parametrize('name', [_REDIRECT_NAME, _GUARD_NAME])
     def test_the_fixture_is_registered_in_this_run(self, name: str, request) -> None:
-        """The conftest binding is real WIRING, not a dormant definition.
+        """The conftest's arm call is real WIRING, not a dormant definition.
 
-        pytest only collects fixtures bound into a conftest's namespace, which is
-        why this module's fixtures are imported there under
-        ``# noqa: F401 — the binding IS the wiring``.  Deleting that import
-        breaks nothing visible except this assertion.
+        pytest only collects fixtures a plugin or conftest registers, which is
+        why each test-root conftest calls ``arm_fleet_dir_isolation(config)`` from its
+        ``pytest_configure``. Deleting that call breaks nothing visible except
+        this assertion.
         """
         try:
             request.getfixturevalue(name)
         except pytest.FixtureLookupError:
             pytest.fail(
-                f'{name} is not registered for this rootdir. Wire the test-root '
-                'conftest to import it from df_pytest_isolation '
-                '(`# noqa: F401 — the binding IS the wiring`); without that, this '
-                'whole suite runs with no live-fleet defence.',
+                f'{name} is not registered for this rootdir. Call '
+                'arm_fleet_dir_isolation(config) from the test-root conftest\'s '
+                'pytest_configure; without that, this whole suite runs with no '
+                'live-fleet defence.',
                 pytrace=False,
             )
 

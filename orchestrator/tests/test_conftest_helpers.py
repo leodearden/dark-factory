@@ -784,8 +784,8 @@ class TestTheMockDerivedStrayDirGuardIsWired:
 
     def test_it_is_registered_for_every_test(self, request):
         assert '_df_no_mock_derived_stray_dirs' in request.fixturenames, (
-            'bind _df_no_mock_derived_stray_dirs from df_pytest_isolation in '
-            'orchestrator/tests/conftest.py (`# noqa: F401 — the binding IS the '
-            'wiring`). Without it an orchestrator run can materialise an '
+            'call arm_test_root_isolation(config) from '
+            'orchestrator/tests/conftest.py\'s pytest_configure, which arms '
+            '_df_no_mock_derived_stray_dirs. Without it an orchestrator run can materialise an '
             'AsyncMock/ or MagicMock/ tree silently (tasks 3223 and 4592).'
         )

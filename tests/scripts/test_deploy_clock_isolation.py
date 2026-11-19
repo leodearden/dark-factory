@@ -1218,21 +1218,21 @@ class TestGuardIsLiveInThisRun:
         assert marker.autouse is True, 'the guard must be autouse — nothing requests it'
 
     def test_the_guard_fixture_is_registered_in_this_run(self, request) -> None:
-        """The conftest binding is real WIRING, not a dormant definition.
+        """The conftest's arm call is real WIRING, not a dormant definition.
 
-        pytest only collects fixtures bound into a conftest's namespace, which
-        is why df_pytest_isolation's fixtures are imported there under
-        ``# noqa: F401 — the binding IS the wiring``. Deleting that import
-        breaks nothing visible except this assertion.
+        pytest only collects fixtures a plugin or conftest registers, which is
+        why each test-root conftest calls ``arm_test_root_isolation(config)`` from its
+        ``pytest_configure``. Deleting that call breaks nothing visible except
+        this assertion.
         """
         try:
             request.getfixturevalue(_GUARD_NAME)
         except pytest.FixtureLookupError:
             pytest.fail(
-                f'{_GUARD_NAME} is not registered for this rootdir. Wire the '
-                'test-root conftest to import it from df_pytest_isolation '
-                '(`# noqa: F401 — the binding IS the wiring`); without that, '
-                'this whole suite runs with no deploy-clock guard.',
+                f'{_GUARD_NAME} is not registered for this rootdir. Call '
+                'arm_test_root_isolation(config) from the test-root conftest\'s '
+                'pytest_configure; without that, this whole suite runs with no '
+                'deploy-clock guard.',
                 pytrace=False,
             )
 
