@@ -71,7 +71,11 @@ dev = [
 ]
 
 [tool.pytest.ini_options]
-markers = ["integration: live CLI tests requiring OAuth accounts (deselect: -m 'not integration')"]
+markers = [
+    "integration: live CLI tests requiring OAuth accounts (deselect: -m 'not integration')",
+    "defect(ref): this test reproduces the declared defect <ref>; the binding is read statically by shared/src/shared/defect_enumerator.py (plans/defect-tests-prd.md decision 8). Not deselected by default.",
+    "criterion(id): this test evidences acceptance criterion <id> (plans/client-feed-prd.md §7.7). Not deselected by default.",
+]
 addopts = "-m 'not integration'"
 asyncio_mode = "auto"
 filterwarnings = [

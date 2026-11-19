@@ -65,6 +65,8 @@ docstring-code-format = true
 [tool.pytest.ini_options]
 markers = [
     "smoke: live smoke tests requiring a real X11/tmux host (DISPLAY, wmctrl/xdotool/xprop/tmux, python3-tk); deselect: -m 'not smoke'",
+    "defect(ref): this test reproduces the declared defect <ref>; the binding is read statically by shared/src/shared/defect_enumerator.py (plans/defect-tests-prd.md decision 8). Not deselected by default.",
+    "criterion(id): this test evidences acceptance criterion <id> (plans/client-feed-prd.md §7.7). Not deselected by default.",
 ]
 # PARALLEL TEST EXECUTION (task 5408). Spelling and flag ORDER copy
 # fused-memory/pyproject.toml verbatim (`-n auto --dist loadgroup -m 'not

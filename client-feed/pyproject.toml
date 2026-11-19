@@ -50,6 +50,10 @@ indent-style = "space"
 docstring-code-format = true
 
 [tool.pytest.ini_options]
+markers = [
+    "defect(ref): this test reproduces the declared defect <ref>; the binding is read statically by shared/src/shared/defect_enumerator.py (plans/defect-tests-prd.md decision 8). Not deselected by default.",
+    "criterion(id): this test evidences acceptance criterion <id> (plans/client-feed-prd.md §7.7). Not deselected by default.",
+]
 asyncio_mode = "auto"
 # timeout/timeout_method: the fleet-wide value (plans/pytest-per-test-timeout-measurement-2026-09-17.md)
 # and rationale (shared/pyproject.toml, tests/scripts/test_timeout_method_policy.py).
