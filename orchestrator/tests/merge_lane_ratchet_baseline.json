@@ -1648,6 +1648,7 @@
     "orchestrator/tests/test_merge_queue_supervisor.py": {"patch_targets": [], "private_reads": 72},
     "orchestrator/tests/test_merge_queue_train_attribution.py": {"patch_targets": ["worker._finalize_advanced_merge", "worker._run_post_merge_verify"], "private_reads": 9},
     "orchestrator/tests/test_merge_queue_two_layer_integration.py": {"patch_targets": [], "private_reads": 47},
+    "orchestrator/tests/test_merge_queue_undead_speculative_base.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_merge_queue_verifier_raw_cancel.py": {"patch_targets": [], "private_reads": 21},
     "orchestrator/tests/test_merge_queue_verify_base_invariant.py": {"patch_targets": [], "private_reads": 42},
     "orchestrator/tests/test_merge_queue_verify_retry.py": {"patch_targets": ["worker.VerifyRunnerPool", "worker._kill_probe_process_tree", "worker._probe_nextest_planned", "worker._run_probe_cmd"], "private_reads": 23},
