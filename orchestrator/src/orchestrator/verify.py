@@ -10233,6 +10233,8 @@ async def verify_failure_is_preexisting_on_main(
         ``(False, '')`` (fail-safe) for any of:
           - Main probe passes (break is task-own).
           - Different signature (break is task-own or different inherited break).
+          - A ``no_tests_ran`` failure: a property of the diff's fallback
+            scoping, never of main, so it is never probed (task 7041).
           - ``git_ops.get_main_sha()`` fails or returns empty.
           - ``git worktree add --detach`` fails after retries.
           - Any unexpected exception during probing.
@@ -10300,6 +10302,8 @@ async def verify_failure_is_preexisting_on_main(
             return (hint or '').strip().lower()
 
     try:
+        if failing_result.category == verify_fallback_floor.NO_TESTS_RAN_CATEGORY:
+            return False, ''
         # Resolve the current main SHA.
         try:
             main_sha: str = await git_ops.get_main_sha()  # type: ignore[union-attr]
