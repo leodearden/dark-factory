@@ -7,13 +7,12 @@ predicate is measured exactly as a restarted orchestrator measures it.
 from __future__ import annotations
 
 import logging
-import subprocess
 from pathlib import Path
 
 import pytest
+from _checkout_hygiene_fixtures import dirty_tracked_file, leave_unmerged, run_git
 from _git_fixtures import seed_repo
-from _orch_helpers import git_env_with_ceiling
-from df_pytest_isolation import git_redirect_env
+from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from test_halt_owner import _FakeMergeWorker, _make_wip_esc
 
@@ -26,31 +25,6 @@ _GIT_CONFIG = GitConfig(
     worktree_dir='.worktrees', push_after_advance=False,
 )
 _LOGGER = 'orchestrator.merge_halt_rehydration'
-
-
-def _git(cwd: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
-    env = git_env_with_ceiling(cwd)
-    for key in git_redirect_env(env):
-        del env[key]
-    return subprocess.run(
-        ['git', *args], cwd=cwd, env=env, check=check, capture_output=True, text=True,
-    )
-
-
-def _leave_unmerged(checkout: Path, side: str) -> None:
-    """Leave README.md unmerged (UU) in *checkout*'s index via a real conflicting merge."""
-    _git(checkout, 'checkout', '-q', '-b', side)
-    (checkout / 'README.md').write_text(f'# {side}\n')
-    _git(checkout, 'commit', '-qam', side)
-    _git(checkout, 'checkout', '-q', '-')
-    (checkout / 'README.md').write_text('# ours\n')
-    _git(checkout, 'commit', '-qam', 'ours')
-    merge = _git(checkout, 'merge', side, check=False)
-    assert merge.returncode != 0, merge.stdout
-
-
-def _dirty(checkout: Path) -> None:
-    (checkout / 'README.md').write_text('# uncommitted WIP\n')
 
 
 @pytest.fixture
@@ -102,7 +76,7 @@ async def test_conflict_markers_in_project_root_keep_the_halt(
     repo: Path, queue: EscalationQueue,
 ):
     esc = _make_wip_esc(queue, '4843')
-    _leave_unmerged(repo, 'side')
+    leave_unmerged(repo, 'side')
     worker = _FakeMergeWorker()
 
     owner = await _rehydrate(queue, repo, worker)
@@ -120,7 +94,7 @@ async def test_tracked_wip_in_project_root_keeps_the_halt(
     repo: Path, queue: EscalationQueue,
 ):
     esc = _make_wip_esc(queue, '3457', category='stash_failed')
-    _dirty(repo)
+    dirty_tracked_file(repo)
     worker = _FakeMergeWorker()
 
     owner = await _rehydrate(queue, repo, worker)
@@ -134,8 +108,8 @@ async def test_task_worktree_conflict_over_a_clean_project_root_is_released(
     tmp_path: Path, repo: Path, queue: EscalationQueue,
 ):
     task_worktree = tmp_path / 'task-worktree'
-    _git(repo, 'worktree', 'add', '-q', '-b', 'task/4843', str(task_worktree))
-    _leave_unmerged(task_worktree, 'side-4843')
+    run_git(repo, 'worktree', 'add', '-q', '-b', 'task/4843', str(task_worktree))
+    leave_unmerged(task_worktree, 'side-4843')
     esc = _make_wip_esc(queue, '4843', worktree=str(task_worktree))
     worker = _FakeMergeWorker()
 
@@ -153,10 +127,10 @@ async def test_task_worktree_conflict_over_a_dirty_project_root_re_owns_the_halt
     tmp_path: Path, repo: Path, queue: EscalationQueue,
 ):
     task_worktree = tmp_path / 'task-worktree'
-    _git(repo, 'worktree', 'add', '-q', '-b', 'task/4843', str(task_worktree))
-    _leave_unmerged(task_worktree, 'side-4843')
+    run_git(repo, 'worktree', 'add', '-q', '-b', 'task/4843', str(task_worktree))
+    leave_unmerged(task_worktree, 'side-4843')
     esc = _make_wip_esc(queue, '4843', worktree=str(task_worktree))
-    _dirty(repo)
+    dirty_tracked_file(repo)
     worker = _FakeMergeWorker()
 
     owner = await _rehydrate(queue, repo, worker)
@@ -191,7 +165,7 @@ async def test_released_record_never_re_arms(repo: Path, queue: EscalationQueue)
     esc = _make_wip_esc(queue, '4843')
     first = queue.release_merge_halt(esc.id, note='clean at an earlier restart')
     assert first is not None
-    _dirty(repo)
+    dirty_tracked_file(repo)
     worker = _FakeMergeWorker()
 
     owner = await _rehydrate(queue, repo, worker)
@@ -210,7 +184,7 @@ async def test_several_holding_records_keep_the_advisory_and_the_newest_owner(
 ):
     _make_wip_esc(queue, '7001', timestamp='2026-05-27T09:00:00+00:00')
     newest = _make_wip_esc(queue, '7002', timestamp='2026-05-27T10:00:00+00:00')
-    _dirty(repo)
+    dirty_tracked_file(repo)
     worker = _FakeMergeWorker()
 
     with caplog.at_level(logging.WARNING, logger=_LOGGER):
@@ -239,6 +213,46 @@ async def test_several_records_over_a_clean_project_root_are_all_released(
         record = queue.get(esc.id)
         assert record is not None
         assert record.halt_released_at is not None
+
+
+class _FirstReleaseFails:
+    """HaltRecords whose first release raises OSError; it records every id it is asked for."""
+
+    def __init__(self) -> None:
+        self.attempted: list[str] = []
+
+    def release_merge_halt(self, escalation_id: str, *, note: str) -> Escalation | None:
+        self.attempted.append(escalation_id)
+        if len(self.attempted) == 1:
+            raise OSError('escalation dir is read-only')
+        return None
+
+
+@pytest.mark.asyncio
+async def test_a_failed_release_stamp_is_logged_and_the_rest_are_still_released(
+    repo: Path, queue: EscalationQueue, caplog: pytest.LogCaptureFixture,
+):
+    older = _make_wip_esc(queue, '7001', timestamp='2026-05-27T09:00:00+00:00')
+    newer = _make_wip_esc(queue, '7002', timestamp='2026-05-27T10:00:00+00:00')
+    records = _FirstReleaseFails()
+    worker = _FakeMergeWorker()
+
+    with caplog.at_level(logging.WARNING, logger=_LOGGER):
+        owner = await rehydrate_merge_halt(
+            queue.get_pending(),
+            probe=GitOps(_GIT_CONFIG, repo),
+            worker=worker,
+            records=records,
+        )
+
+    assert owner is None
+    assert not worker.is_wip_halted
+    assert sorted(records.attempted) == sorted([older.id, newer.id])
+    assert any(
+        'Could not stamp the merge-halt release' in r.getMessage()
+        and records.attempted[0] in r.getMessage()
+        for r in caplog.records
+    ), [r.getMessage() for r in caplog.records]
 
 
 @pytest.mark.asyncio

@@ -54,11 +54,18 @@ _SCENE_GIT = GitConfig(
 _REAL_STARTUP_STEPS = UNSTUBBED_STEPS | {'1c0a'}
 
 
-def merge_lane_harness_factory(tmp_path: Path) -> Callable[[], Harness]:
+def merge_lane_harness_factory(
+    tmp_path: Path, *, real_steps: frozenset[str] = frozenset(),
+) -> Callable[[], Harness]:
     """Build Harnesses over ONE seeded repo, each running the real 1b and 1c0a.
 
+    *real_steps* names further ``STUBBED_STEPS`` steps each Harness keeps real.
     A later Harness sees the journal and runs.db an earlier one left.
     """
+    unknown = real_steps - {step for step, _attr in STUBBED_STEPS}
+    if unknown:
+        raise ValueError(f'not stubbed startup steps: {sorted(unknown)}')
+    kept_real = _REAL_STARTUP_STEPS | real_steps
     repo = seed_repo(tmp_path / 'repo')
 
     def make() -> Harness:
@@ -75,7 +82,7 @@ def merge_lane_harness_factory(tmp_path: Path) -> Callable[[], Harness]:
         h._start_escalation_server = AsyncMock(side_effect=start_escalation_server)
         h._stop_escalation_server = AsyncMock()
         for step, attr in STUBBED_STEPS:
-            if step not in _REAL_STARTUP_STEPS:
+            if step not in kept_real:
                 setattr(h, attr, MagicMock() if attr in SYNC_STEPS else AsyncMock())
         h._tag_task_modules = AsyncMock()
         h._tag_prd_metadata = AsyncMock()

@@ -204,7 +204,7 @@ class TestRecoveredRequestOutcomeHasAnOwner:
     async def test_halting_recovered_request_owns_the_merge_halt(
         self, tmp_path: Path, scheduler_double: MagicMock,
     ) -> None:
-        make = merge_lane_harness_factory(tmp_path)
+        make = merge_lane_harness_factory(tmp_path, real_steps=frozenset({'1c0'}))
         harness = await harness_with_real_merge_worker(make, scheduler_double)
         worker = harness._merge_worker
         assert worker is not None
@@ -226,7 +226,7 @@ class TestRecoveredRequestOutcomeHasAnOwner:
 
         (harness.git_ops.project_root / 'README.md').write_text('# unparked WIP\n')
         restarted = await harness_with_real_merge_worker(make, scheduler_double)
-        assert await Harness._rehydrate_merge_halt(restarted) == esc.id
+        assert await restarted._rehydrate_merge_halt() == esc.id
         assert restarted._merge_worker is not None
         assert restarted._merge_worker.is_wip_halted
         assert restarted._merge_worker.is_halt_owner(esc.id)
