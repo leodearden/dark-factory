@@ -76,12 +76,17 @@ async def test_a_new_collection_is_created_at_the_configured_width_under_cosine_
 async def test_a_create_overrunning_the_write_budget_raises_a_timeout_naming_it_and_the_next_call_adopts_the_server_completed_collection(
     config, target,
 ):
-    config.queue.backend_write_timeout_seconds = budget = 0.5
-    with stub_qdrant_server(create_delay_s={target: 2 * budget}, list_collections_delay_s=2 * budget) as stub:
-        async with backend_against(stub.url, config) as backend:
+    squeezed = config.model_copy(deep=True)
+    squeezed.queue.backend_write_timeout_seconds = budget = 0.5
+    with stub_qdrant_server(
+        create_delay_s={target: 2 * budget},
+        list_collections_delay_s=2 * budget,  # mem0's construction-time listing, held past the squeezed budget
+    ) as stub:
+        async with backend_against(stub.url, squeezed) as backend:
             with pytest.raises(TimeoutError, match=re.escape(f'Mem0 create_collection timed out after {budget}s')):
                 await backend.get(MEMORY_ID, SCOPE)
-            assert stub.wait_created(target, timeout=10)
+        assert stub.wait_created(target, timeout=10)
+        async with backend_against(stub.url, config) as backend:
             assert await backend.get(MEMORY_ID, SCOPE) is None
         assert stub.creates(target) == 1
 
