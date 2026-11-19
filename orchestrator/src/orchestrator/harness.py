@@ -40,6 +40,7 @@ from shared.cli_invoke import (
 )
 from shared.config_dir import CONFIG_DIR_PREFIX
 from shared.cost_store import CostStore
+from shared.declared_checks import declared_checks
 from shared.elision import elide_at_word
 from shared.eval_lane import eval_lane_provenance
 from shared.loop_stall import LoopStallMonitor
@@ -1604,17 +1605,6 @@ def _extract_tagger_entries(payload: Any) -> list:
         else:
             break
     return payload if isinstance(payload, list) else []
-
-
-def _declared_delivered_checks(metadata: Mapping[str, Any] | None) -> list[dict[str, Any]]:
-    """The task's declared ``delivered_checks`` for ``validate_landing_evidence``.
-
-    Never None, which that function reads as "call site unwired".  A failed
-    metadata read yields ``[]``: the checks can only upgrade a reject, so that
-    is the fail-safe direction (the same trade as
-    ``escalation/src/escalation/git_authority.py::_evidence_verdict``).
-    """
-    return list((metadata or {}).get('delivered_checks') or [])
 
 
 def _already_landed_gate_shape(*, has_open_escalation: bool | None) -> str:
@@ -6871,7 +6861,7 @@ class Harness:
                 self.git_ops, tid, branch,
                 branch_tip_sha=branch_tip_sha,
                 candidate_sha=report.branch_state.sha,
-                delivered_checks=_declared_delivered_checks(metadata),
+                delivered_checks=list(declared_checks(metadata).checks),
                 checks_enabled=self.config.delivered_checks.enabled,
             )
             self._landing_rejects.observe(
@@ -14157,7 +14147,7 @@ class Harness:
                     self.git_ops, task_id, branch,
                     branch_tip_sha=None,
                     candidate_sha=marker,
-                    delivered_checks=_declared_delivered_checks(metadata),
+                    delivered_checks=list(declared_checks(metadata).checks),
                     checks_enabled=self.config.delivered_checks.enabled,
                 )
                 if not verdict.accepted:

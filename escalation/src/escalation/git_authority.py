@@ -51,6 +51,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from shared.branch_names import bare_queued_branch_id, canonical_queued_branch_name
+from shared.declared_checks import declared_checks
 from shared.merge_state import MergeState
 from shared.task_read import TaskAbsent, TaskFound
 
@@ -454,7 +455,7 @@ async def _evidence_verdict(
         git_ops, tid, full_branch,
         branch_tip_sha=None,
         candidate_sha=candidate_sha,
-        delivered_checks=fetch.metadata.get('delivered_checks') or [],
+        delivered_checks=list(declared_checks(fetch.metadata).checks),
         checks_enabled=checks_enabled,
     )
     # Plain `str`, never LandingReason — see GitAuthorityVerdict.reason.

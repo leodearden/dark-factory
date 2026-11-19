@@ -2853,7 +2853,7 @@ class TestAlreadyLandedGateDeliveredChecksWiring:
 
         with patch('orchestrator.harness.validate_landing_evidence', spy), \
              patch(_GATE_TARGET, AsyncMock(return_value=None)):
-            await h._already_landed_dispatch_gate('42')
+            await _GateProbe(h).decide('42')
 
         assert spy.await_args is not None
         assert spy.await_args.kwargs.get('delivered_checks') == forwarded
