@@ -827,6 +827,86 @@ operator must manually set the dependent back to `pending` to reopen it —
 resolving the escalation records the human decision but does not by itself
 unblock the task.
 
+### 3.4 The follow-up holder (`metadata.followup_holder`)
+
+Each project has at most one **follow-up holder**: a task that never
+dispatches. Low-priority follow-ups wait behind it, parked by an ordinary
+local dependency edge, until a promotion removes that edge. The contract is
+`plans/follow-up-filing-shape-prd.md` §3 decisions 9–15 and §4.3. The one
+implementation is `fused-memory/src/fused_memory/middleware/followup_hold.py`.
+
+**The hold rule** (`followup_hold.py::hold_scope`). A task is held if all of
+these are true:
+
+- it was filed as a follow-up: `metadata.source == 'agent-followup'` or
+  `metadata.spawn_context == 'review_suggestions'`;
+- its priority is `low` or `polish`;
+- its `task_kind` is `normal` or absent;
+- it carries none of `execution_class`, `prd_path`, `x_finding_key` or
+  `human_decomposed`.
+
+Every planning-mode birth carries `human_decomposed`, so a PRD decompose is
+never held. Neither is a task that a finding cites. To keep a follow-up out
+of the hold, file it at a higher priority, or attach the finding key or PRD
+that makes it wanted.
+
+**Held means a dependency edge on the holder.** The edge decides whether a
+task is held now. `metadata.followup_hold`
+(`{holder, held_at, promoted?}`) is the record of the hold, and it stays on
+the task after a promotion as history. A held task can also carry other
+dependencies; the edges compose by AND.
+
+**Hold at filing.** A ticket-path `submit_task` that the rule matches is
+created already held. The holder id is appended to its `dependencies`, and
+its `followup_hold` record is written in the same `add_task`, so the
+scheduler never sees it ready. A `followup_held {task_id, holder_id}` event
+is journaled beside `task_created`. The holder is minted the first time a
+project needs one.
+
+**The backfill.** Each fused-memory start runs the hold over every known
+project before the server serves
+(`fused-memory/src/fused_memory/server/main.py::_backfill_followup_holds`,
+walking the primary root plus `DASHBOARD_KNOWN_PROJECT_ROOTS`). It holds
+every `pending` task the rule matches unless the task already depends on the
+holder or already carries a `followup_hold` record, so a promoted or released
+task is never re-held and a second start holds nothing. Each task's edge and
+record land in one backend write, with no `task_modified` event. Each
+project emits exactly one `followup_hold_backfilled {project_id, count}`
+event, even when `count` is 0. One project's failure is logged at ERROR and
+does not block startup or the other projects. The config key
+`followup_hold.backfill_enabled` (default `true`) is restart-only.
+
+**The holder's shape.** It is a deterministic pure gate:
+`task_kind='deterministic'`, `always_escalates=true`,
+`execution_class='decision'`, priority `low`, no dependencies, a
+`deferred_watch` text, and the marker `metadata.followup_holder`
+(`{project_id, minted_at}`). The store's marker is the only record of which
+task is the holder. If a lookup finds two live markers in one project, it
+raises `DuplicateFollowupHolderError` naming both ids and holds nothing. The
+holder is never a curator pool entry or a combine target.
+
+**Protection.** A `cancelled` or `done` dependency counts as satisfied, so one
+status write on the holder would release the whole held backlog at once.
+
+- `set_task_status` refuses `done`, `cancelled` and `deferred` on the holder
+  unless `release_holder` is the literal `true`. Releasing is a human act.
+- `update_task` refuses a write that strips `followup_holder`, strips
+  `deferred_watch` or sets `trigger_met` on the holder. That covers a
+  `replace` that leaves either key out; an unchanged echo passes.
+
+Both refusals return error `followup_holder_protected`
+(`followup_hold.py::FollowupHolderProtectedError`). The error carries the
+holder's `held_count`, the number of active tasks that depend on it, and a
+`protection` field naming the rule that refused. Each refusal journals a
+`followup_holder_protected` event. `release_holder` is ignored on any task
+other than the holder.
+
+**Promotion** removes a held task's holder edge and stamps
+`followup_hold.promoted {by, at, ref}`, where `by` is one of `dependent`,
+`citation`, `combine`, `pack`, `rider` or `human`. It belongs to task 8418;
+see `plans/follow-up-filing-shape-prd.md` §3 decision 14 and §4.3. Held does
+not expire: there is no age-out (decision 15).
+
 ---
 
 ## 4. Fast path (`metadata.complexity`)
@@ -1717,6 +1797,19 @@ architect and implementer filers bundle (`plans/follow-up-filing-shape-prd.md`
 §4.1 and §3 decisions 1 and 3–5). As for `shared.defects`, the registration is
 an import side effect of `shared.followup_items`, so a process that never
 imports it would census the key as `unknown_key`.
+
+`followup_holder` and `followup_hold` are the follow-up holder's marker and a
+held task's record (§3.4). Both are registered submodels
+(`shared/src/shared/followup_hold_records.py::FollowupHolder` and
+`::FollowupHold`, cardinality dict), registered in
+`shared/src/shared/task_metadata.py` itself, so every process that parses
+task metadata knows them. Both are machine-written only and deliberately not
+Tier-A blessed. Only `fused-memory/src/fused_memory/middleware/followup_hold.py`
+writes them: the mint writes the marker, and the hold at filing and the
+startup backfill write the record. A held task's `followup_hold.promoted`
+(`by` one of `dependent`, `citation`, `combine`, `pack`, `rider`, `human`) is
+the history of its release. The dependency edge on the holder, not this
+record, decides whether the task is held now.
 
 `claimant_exception` is the machine ledger entry
 `{claimant_run_id, target_status, agent_id, tag, stamped_at}`. The

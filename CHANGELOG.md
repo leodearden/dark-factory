@@ -16,6 +16,33 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+#### Low follow-ups are held behind a per-project follow-up holder (task 8417)
+
+`submit_task` now files a low or polish agent follow-up or reviewer suggestion
+already held: it is created with a dependency edge on its project's follow-up
+holder, a never-dispatching deterministic gate minted on first need, so it is
+never ready on its own. Tasks carrying `execution_class`, `prd_path`,
+`x_finding_key` or `human_decomposed` (every planning-mode birth) are not held.
+Promotion, which releases held tasks one at a time, is task 8418. See
+`docs/task-authoring.md` §3.4.
+
+- New config key `followup_hold.backfill_enabled`, default `true`,
+  restart-only. The first fused-memory start after deploy holds the existing
+  pending follow-up stock of every known project before serving. A second
+  start holds nothing.
+- `set_task_status` gained `release_holder` (strict bool, default `false`).
+  `done`, `cancelled` or `deferred` on a holder is refused with
+  `followup_holder_protected` unless it is the literal `true`, because that
+  write releases every held follow-up at once. `update_task` refuses, with the
+  same error, a write that strips the holder's `followup_holder` or
+  `deferred_watch` or sets its `trigger_met`.
+- Three new event types: `followup_held {task_id, holder_id}` per held filing,
+  `followup_hold_backfilled {project_id, count}` once per project per start
+  (count possibly 0), and `followup_holder_protected {holder_id,
+  attempted_status, protection, held_count}` per refusal.
+- `followup_holder` and `followup_hold` are registered metadata submodels in
+  `shared/src/shared/followup_hold_records.py`, written only by fused-memory.
+
 #### Cross-graph leak census (task 6849)
 
 `python -m fused_memory.maintenance.cross_graph_leak_census [--group-id G] [--json]`
