@@ -14,8 +14,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from test_workflow_already_done import _AD_DC_CHECK, _arm_already_done_fixture, _arm_queue
 
-from orchestrator.merge_lane.landing_evidence import validate_reported_landing
-from orchestrator.workflow import WorkflowOutcome
+from orchestrator.workflow import WorkflowOutcome, validate_reported_landing
 
 _VALIDATE_TARGET = 'orchestrator.workflow.validate_reported_landing'
 
