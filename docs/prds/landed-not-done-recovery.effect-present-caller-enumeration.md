@@ -278,7 +278,12 @@ tasks 3103 and 3916.
 
 ## 7. What ε repointed, and which sites keep the legacy policy (task 4648)
 
-ε re-pointed sites and changed no producer. Measured on task 4648's tree. Each
+ε re-pointed sites. It changed one producer in one place: it narrowed
+`branch_work_landed`'s evidence tier to patch-id only, so a later main commit
+that merely repeats the tip's subject is no longer stamped as the task's
+landing (esc-4648-5; the reason is in
+`orchestrator/src/orchestrator/merge_lane/landing_evidence.py::_resolve_main_reachable_evidence`'s
+docstring). Measured on task 4648's tree. Each
 verdict's `LandingMethod` says which policy decided it: `patch_id` is the
 non-decaying contract, while `merge_marker` and `citation` (or
 `content_equivalence` when DISCOVERY's citation-miss fallback accepts) are the
@@ -288,7 +293,7 @@ is pinned by a test so it cannot drift silently.
 | Site (`path::symbol`) | Producer | `LandingMethod` | Ruling and why | Pinning test |
 |---|---|---|---|---|
 | `orchestrator/src/orchestrator/harness.py::Harness._already_landed_dispatch_gate`, ancestry arm (live tip is an ancestor of main) | `branch_work_landed` | `patch_id` | **IN**, repointed. D1 names the dispatch gate. A reject files no escalation; it is recorded as a `landing_evidence_rejected` row. | `orchestrator/tests/test_already_landed_gate_patch_id.py::TestAncestryArmDecidesByPatchId` |
-| the same function, off-main-tip arm (live tip is not an ancestor of main) | `branch_work_landed` | `patch_id` | **IN**, repointed. The `branch_content_in_main` entry condition (§2, site 4) is deleted, so every live non-ancestor tip is now examined. `no_attribution` escalates; every other reject is recorded at `LandingRejectSite.already_landed_gate_off_main_tip`. A multi-commit squash landing is no longer caught (see "The squash residual" below). | `orchestrator/tests/test_already_landed_gate_patch_id.py::TestOffMainTipArmDecidesByPatchId`; the escalation is pinned by `orchestrator/tests/test_harness_already_landed_gate_wiring.py::TestAlreadyLandedDispatchGateContentEquivalence` |
+| the same function, off-main-tip arm (live tip is not an ancestor of main) | `branch_work_landed` | `patch_id` | **IN**, repointed. The `branch_content_in_main` entry condition (§2, site 4) is deleted, so every live non-ancestor tip is now examined. `no_attribution` escalates; every other reject is recorded at `LandingRejectSite.already_landed_gate_off_main_tip`. A multi-commit squash landing is no longer caught (see "The squash residual" below). | `orchestrator/tests/test_already_landed_gate_patch_id.py::TestOffMainTipArmDecidesByPatchId`; the escalation is pinned by `orchestrator/tests/test_harness_already_landed_gate_wiring.py::TestAlreadyLandedDispatchGateOffMainTipArmDispositions::test_an_unattributed_landing_escalates_no_mark_done` |
 | the same function, branch-deleted marker arm | `validate_landing_evidence` CANDIDATE | `merge_marker` | **Kept.** A deleted ref leaves no live tip for `branch_work_landed` to judge, and the marker is the only evidence there is. | `orchestrator/tests/test_harness_already_landed_gate_wiring.py::TestAlreadyLandedDispatchGateMarkerPath::test_the_marker_arm_keeps_the_merge_marker_policy` |
 | `escalation/src/escalation/git_authority.py::_ancestor_arm` → `::_branch_work_landed_arm` (Tier-3.5) | `branch_work_landed` | `patch_id` | **IN**, repointed. D1 names Tier-3.5. The degeneracy guard and the `''` citation opt-out still run first. | `escalation/tests/test_git_authority.py::TestProbeLandingAncestorArmDecidesByBranchWorkLanded` |
 | `escalation/src/escalation/git_authority.py::_branch_work_landed_arm` (Tier-3.5, live tip not an ancestor of main) | `branch_work_landed` | `patch_id` | **IN**, already repointed by task 4887. | `escalation/tests/test_git_authority.py::TestProbeLandingPatchIdArm` |
@@ -333,7 +338,9 @@ single-commit squash is still caught, because its patch-id equals the one
 commit's. The residual is accepted, not overlooked. A non-decaying squash
 detector, such as comparing the patch-id of the branch's combined
 `merge-base..tip` range against single commits on main, would be a producer
-change, and ε only re-points sites. The byte-identity check that used to catch
+change, and ε only re-points sites (its one producer edit, the esc-4648-5
+patch-id-only narrowing above, removed a wrong attribution and added no
+detector). The byte-identity check that used to catch
 squashes is exactly the decay ε retires (B1). Pinned by
 `orchestrator/tests/test_already_landed_gate_patch_id.py::TestOffMainTipArmDecidesByPatchId::test_a_multi_commit_squash_landing_reads_as_unlanded_and_dispatches`.
 

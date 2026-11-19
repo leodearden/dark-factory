@@ -441,8 +441,11 @@ class LandingReason(enum.StrEnum):
     legacy code reaching a formatter that cannot explain it renders
     ``'Unrecognized reason code: ...'`` into an L1 body a human reads.  Leaf
     epsilon (task 4648) repointed the sites in its scope to
-    :func:`branch_work_landed` and left the producers as they were, so the
-    legacy three now mark exactly the sites that keep the legacy policy
+    :func:`branch_work_landed`.  Its one producer edit narrowed that
+    producer's evidence tier to patch-id only (esc-4648-5; the reason is
+    :func:`_resolve_main_reachable_evidence`'s docstring) and left
+    :func:`validate_landing_evidence` as it was, so the legacy three now mark
+    exactly the sites that keep the legacy policy
     (``docs/prds/landed-not-done-recovery.effect-present-caller-enumeration.md`` §7).
     """
 
@@ -2952,11 +2955,14 @@ def file_unattributed_landing_escalation(
     near-verbatim copy of this filing boilerplate, differing only in
     ``agent_role``).
 
-    Called by every site that found a positive landing signal (a merge
-    marker, branch content equivalent to main, or an on-main coalesce
-    member) but whose :func:`validate_landing_evidence` verdict came back
-    rejected — an unattributed or effect-absent landing that must not be
-    silently stamped done (the task-1175 clobber this task closes).
+    Called by every site that found a positive landing signal but no
+    attributable one: a merge marker or an on-main coalesce member whose
+    :func:`validate_landing_evidence` verdict came back rejected (an
+    unattributed or effect-absent landing), or the dispatch gate's
+    off-main-tip arm, whose :func:`branch_work_landed` verdict is
+    ``no_attribution`` (the branch's commits are patch-id present on main,
+    but nothing attributes them).  Neither may be silently stamped done (the
+    task-1175 clobber this task closes).
     Escalate-instead-of-stamp is deliberately non-status-blocking: the
     caller leaves the task/member row pending (or flips it to pending) and
     it is re-evaluated next tick. The caller's open-L1 veto stops it re-filing,
@@ -2993,7 +2999,9 @@ def file_unattributed_landing_escalation(
     (CANDIDATE = the candidate sha; DISCOVERY = the discovered citation) and
     stays ``None`` for a ``no_citation`` reject, which returns before the
     citation is ever assigned — so that arm carries no identity by
-    construction.
+    construction.  Neither does :func:`branch_work_landed`'s
+    ``no_attribution``, so after its L1 is resolved the gate's next tick
+    refiles it (follow-up ticket tkt_0RX5SZAFHBEV57JWSVYJR86F95).
 
     **The CITATION is the identity, deliberately NOT the effect-check anchor**
     (task 4499, amendment pass — recorded here so the next reader does not have

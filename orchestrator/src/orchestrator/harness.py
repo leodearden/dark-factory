@@ -14428,12 +14428,14 @@ class Harness:
         """Best-effort, dedup-guarded L1 escalation for unattributable
         landing evidence (task 2678, INV-5).
 
-        Filed by the already-landed re-derivation sites that found a
-        positive landing signal (a merge marker, or branch content
-        equivalent to main) but whose :func:`validate_landing_evidence`
-        verdict came back rejected — an unattributed or effect-absent
-        landing that must not be silently stamped done (the task-1175
-        clobber this task closes). Escalate-instead-of-stamp is
+        Filed by the dispatch gate's two arms that found a positive landing
+        signal but no attributable one: the marker arm, whose
+        :func:`validate_landing_evidence` verdict came back rejected (an
+        unattributed or effect-absent landing), and the off-main-tip arm,
+        whose :func:`branch_work_landed` verdict is ``no_attribution`` (the
+        branch's commits are patch-id present on main, but nothing attributes
+        them to the task).  Neither may be silently stamped done (the
+        task-1175 clobber task 2678 closed). Escalate-instead-of-stamp is
         deliberately non-status-blocking: the task row is simply left
         pending and re-evaluated next tick. While this L1 is open the gate's
         any-level veto stops it re-deriving the evidence and re-filing, but
