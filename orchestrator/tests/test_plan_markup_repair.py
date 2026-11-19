@@ -10,14 +10,9 @@ from __future__ import annotations
 import copy
 from types import MappingProxyType
 
+import _plan_markup_fixtures
 from _markup_helpers import INVOKE_CLOSER, closer, param_opener
-from _plan_markup_fixtures import (
-    DECISION_PROSE,
-    corrupt_plan,
-    isolate_the_refusal_memo,  # noqa: F401 — autouse; pytest resolves it by name
-    on_disk,
-    plan_artifacts,  # noqa: F401 — a fixture, requested by test parameter name
-)
+from _plan_markup_fixtures import DECISION_PROSE, corrupt_plan, on_disk
 from shared.toolcall_markup import detect
 
 from orchestrator.mcp.plan_markup_repair import (
@@ -26,6 +21,10 @@ from orchestrator.mcp.plan_markup_repair import (
     read_plan_repaired,
     repair_plan_fields,
 )
+
+#: pytest finds a fixture by its name in the requesting module's namespace.
+plan_artifacts = _plan_markup_fixtures.plan_artifacts
+isolate_the_refusal_memo = _plan_markup_fixtures.isolate_the_refusal_memo
 
 RATIONALE_PROSE = 'A rationale the harness folded into the decision before it.'
 
