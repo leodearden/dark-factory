@@ -1516,12 +1516,18 @@ def _owner_mismatches(
     rows: Sequence[tuple[str, str, str, str, TaskRef | TicketRef | None, str]],
 ) -> list[str]:
     """One message per row whose owner is not the type its disposition fixes."""
-    return [
-        f'{relpath}::{qualname}::{content_hash}: disposition {disposition!r} takes a '
-        f'{OWNER_TYPE_BY_DISPOSITION[disposition].__name__} owner, found {owner!r}'
-        for relpath, qualname, content_hash, disposition, owner, _why in rows
-        if not isinstance(owner, OWNER_TYPE_BY_DISPOSITION[disposition])
-    ]
+    mismatches = []
+    for relpath, qualname, content_hash, disposition, owner, _why in rows:
+        key = f'{relpath}::{qualname}::{content_hash}'
+        owner_type = OWNER_TYPE_BY_DISPOSITION.get(disposition)
+        if owner_type is None:
+            mismatches.append(f'{key}: unknown disposition {disposition!r}')
+        elif not isinstance(owner, owner_type):
+            mismatches.append(
+                f'{key}: disposition {disposition!r} takes a '
+                f'{owner_type.__name__} owner, found {owner!r}'
+            )
+    return mismatches
 
 
 class TestAllowlistHygiene:
@@ -1538,8 +1544,8 @@ class TestAllowlistHygiene:
 
     def test_every_entry_carries_a_justification(self):
         """"existing" is not a reason.  An accepted row must say what makes the
-        cost acceptable (cached, startup-only, measured cheap); a filed row must
-        name its task."""
+        cost acceptable (cached, startup-only, measured cheap); a filed or
+        to_file row's owner is its owner column, not this prose."""
         for relpath, qualname, _hash, _disposition, _owner, why in AUDITED_SITES:
             assert why.strip(), f'{relpath}::{qualname} has an empty justification'
             assert len(why.strip()) > 40, (
@@ -1564,6 +1570,7 @@ class TestAllowlistHygiene:
             _row('filed', None),
             _row('to_file', TaskRef(1)),
             _row('accepted', TaskRef(5270)),
+            _row('retired', None),
         ]
         right = [
             _row('accepted', None),
@@ -1580,11 +1587,9 @@ class TestAllowlistHygiene:
         mismatches = _owner_mismatches(AUDITED_SITES)
         assert mismatches == [], (
             'Each row carries the owner its disposition fixes in '
-            'OWNER_TYPE_BY_DISPOSITION: an accepted row carries None and borrows '
-            'the INV-12 default; a filed row carries TaskRef(<task>); a to_file '
-            "row carries TicketRef('tkt_...'). The value must equal the row's "
-            'override in tests/repo_guards/test_repo_guards_governed_lists.py'
-            '::LOOP_BLOCKING_LEDGER.\n  ' + '\n  '.join(mismatches)
+            'OWNER_TYPE_BY_DISPOSITION: an accepted row carries None; a filed row '
+            "carries TaskRef(<task>); a to_file row carries TicketRef('tkt_...')."
+            '\n  ' + '\n  '.join(mismatches) + '\n\n' + _INV12_OVERRIDE_POINTER
         )
 
     def test_content_hashes_are_well_formed(self):
