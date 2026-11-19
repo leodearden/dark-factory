@@ -684,7 +684,7 @@ class TestTheLeaseDirIsolationHasOneDefinition:
         assert definitions == [self.HOME], (
             f'{definitions} define the fixture themselves; import the one '
             f'definition instead — `from _fm_helpers import '
-            f'lease_dir_fixture  # noqa: F401`'
+            f'lease_dir_fixture as lease_dir_fixture`'
         )
 
     def test_an_importing_module_really_gets_the_isolation(self, lease_dir):
