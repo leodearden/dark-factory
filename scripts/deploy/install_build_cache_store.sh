@@ -20,15 +20,17 @@ set -euo pipefail
 #   1. Read-only preflight: rclone on PATH, /usr/bin/python3, lingering on
 #      (else the user manager stops with the last session), a tailscale IPv4
 #      address that is not 0.0.0.0, a numeric port and cap.
-#   2. --check stops here after checking the installed store: every leaf
+#   2. --check stops here after checking the installed store: every store
 #      directory, the credentials file's mode, the pruner copy, each unit file
 #      against its render, the units' states, and on both addresses a 401
 #      without credentials and a 404 for a missing key with them.
-#   3. Apply: pre-create the 4,368 leaf dirs <k0>/<k1>/<k2> (concurrent first
-#      writes into a new directory fail), create the credentials once, copy
-#      the pruner, write each unit only when its text differs, daemon-reload,
-#      enable both, restart the store only when its unit or credentials
-#      changed or it is not running, wait for it to answer, then run step 2.
+#   3. Apply: pre-create the 4,368 directories down to the 4,096 <k0>/<k1>/<k2>
+#      leaves (concurrent first writes into a new directory fail), create the
+#      credentials once, copy the pruner, write each unit only when its text
+#      differs, daemon-reload, enable both, restart the store only when its
+#      unit changed, the credentials differ from those it was last started
+#      with (their digest, kept in ~/.local/state/build-cache-store), or it
+#      is not running, wait for it to answer, then run step 2.
 #   --host-config: validate every value by enumeration or pattern (none may
 #      hold a quote, backslash or control character, so the TOML needs no
 #      escaping), then write the seven keys 0600 through a temp file and mv.
@@ -70,12 +72,14 @@ PRUNER_SRC="$SCRIPT_DIR/build_cache_store_prune.py"
 LIB_DIR="$HOME/.local/lib/build-cache-store"
 PRUNER="$LIB_DIR/build_cache_store_prune.py"
 UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/build-cache-store"
+STARTED_CREDENTIALS_DIGEST="$STATE_DIR/started-credentials.sha256"
 STORE_UNIT="build-cache-store.service"
 PRUNE_UNIT="build-cache-store-prune.service"
 PRUNE_TIMER="build-cache-store-prune.timer"
 HOST_PYTHON="/usr/bin/python3"
 STORE_USER="reify-canon"
-LEAF_COUNT=4368
+STORE_DIR_COUNT=4368
 WAIT_SECS=20
 
 usage() { echo "Usage: $(basename "$0") [--check] [--host-config]" >&2; }
@@ -130,7 +134,9 @@ preflight() {
     [ "$linger" = "yes" ] \
         || die "Linger=$linger for $user: the store would stop with the last session (sudo loginctl enable-linger $user); nothing was changed"
 
-    ts_out="$(tailscale ip -4 2>&1)" || die "tailscale ip -4 failed: $ts_out; nothing was changed"
+    # stdout only: tailscale warns on stderr (a client/daemon version skew),
+    # which passes through to ours instead of becoming the address.
+    ts_out="$(tailscale ip -4)" || die "tailscale ip -4 failed (its stderr is above); nothing was changed"
     TS_ADDR="${ts_out%%$'\n'*}"
     is_dotted_ipv4 "$TS_ADDR" \
         || die "tailscale ip -4 printed no IPv4 address ('$TS_ADDR'); nothing was changed"
@@ -151,7 +157,7 @@ render_store_unit() {
     cat <<EOF
 [Unit]
 Description=Shared build-cache store for reify's canonical build path (rclone serve webdav)
-After=network-online.target tailscaled.service
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -216,7 +222,7 @@ http_status() {
 CHECK_FAILURES=0
 check_failed() { echo "[install_build_cache_store] CHECK FAILED: $*" >&2; CHECK_FAILURES=$((CHECK_FAILURES + 1)); }
 
-check_leaf_dirs() {
+check_store_dirs() {
     if [ ! -d "$STORE_DIR" ]; then
         check_failed "store directory $STORE_DIR is missing"
         return
@@ -231,7 +237,7 @@ check_leaf_dirs() {
             done
         done
     done
-    [ "$missing" -eq 0 ] || check_failed "$missing of $LEAF_COUNT leaf directories are missing under $STORE_DIR"
+    [ "$missing" -eq 0 ] || check_failed "$missing of $STORE_DIR_COUNT store directories are missing under $STORE_DIR"
 }
 
 check_credentials() {
@@ -283,7 +289,7 @@ check_http() {
 
 store_check() {
     CHECK_FAILURES=0
-    check_leaf_dirs
+    check_store_dirs
     check_credentials
     if ! cmp -s "$PRUNER_SRC" "$PRUNER"; then
         check_failed "the pruner copy $PRUNER is missing or differs from $PRUNER_SRC"
@@ -456,19 +462,22 @@ wait_for_store() {
 
 apply() {
     mkdir -p "$STORE_DIR"/{0,1,2,3,4,5,6,7,8,9,a,b,c,d,e,f}/{0,1,2,3,4,5,6,7,8,9,a,b,c,d,e,f}/{0,1,2,3,4,5,6,7,8,9,a,b,c,d,e,f}
-    log "store directory $STORE_DIR holds its $LEAF_COUNT leaf directories"
+    log "store directory $STORE_DIR holds its $STORE_DIR_COUNT directories"
 
-    local credentials_created="no"
     if [ ! -f "$CREDENTIALS" ]; then
         (
             umask 077
             mkdir -p "$(dirname "$CREDENTIALS")"
             printf 'RCLONE_USER=%s\nRCLONE_PASS=%s\n' "$STORE_USER" "$(random_hex 24)" >"$CREDENTIALS"
         )
-        credentials_created="yes"
         log "created credentials $CREDENTIALS"
     fi
     chmod 600 "$CREDENTIALS"
+    local credentials_digest started_digest=""
+    read -r credentials_digest _ < <(sha256sum "$CREDENTIALS")
+    if [ -f "$STARTED_CREDENTIALS_DIGEST" ]; then
+        started_digest="$(<"$STARTED_CREDENTIALS_DIGEST")"
+    fi
 
     if ! cmp -s "$PRUNER_SRC" "$PRUNER"; then
         install -D -m 0755 "$PRUNER_SRC" "$PRUNER"
@@ -488,14 +497,16 @@ apply() {
     if [ "$timer_changed" = "yes" ]; then
         systemctl --user restart "$PRUNE_TIMER"
     fi
-    if [ "$store_changed" = "yes" ] || [ "$credentials_created" = "yes" ] \
+    if [ "$store_changed" = "yes" ] || [ "$credentials_digest" != "$started_digest" ] \
         || ! systemctl --user is-active --quiet "$STORE_UNIT"; then
         systemctl --user restart "$STORE_UNIT"
-        log "(re)started $STORE_UNIT"
+        wait_for_store
+        (umask 077 && mkdir -p "$STATE_DIR" && printf '%s\n' "$credentials_digest" >"$STARTED_CREDENTIALS_DIGEST")
+        log "(re)started $STORE_UNIT with the credentials in $CREDENTIALS"
     else
-        log "$STORE_UNIT unchanged and running; not restarted"
+        log "$STORE_UNIT unchanged and running with these credentials; not restarted"
+        wait_for_store
     fi
-    wait_for_store
 }
 
 if [ "$TARGET" = "host_config" ]; then

@@ -366,6 +366,7 @@ class TestPrune:
 
 _TAILSCALE_SHIM = """\
 if [ "${1:-}" = ip ] && [ "${2:-}" = -4 ]; then
+  [ -z "${FAKE_TS_WARNING:-}" ] || printf '%s\\n' "$FAKE_TS_WARNING" >&2
   printf '%s\\n' "${FAKE_TS_ADDR-127.0.0.2}"
   exit 0
 fi
@@ -522,6 +523,8 @@ class TestStoreInstall:
         text = installed.unit_text(STORE_UNIT)
         lines = text.splitlines()
         assert "Restart=always" in lines
+        assert "StartLimitIntervalSec=0" in lines
+        assert not [line for line in lines if line.startswith("After=")]
         assert "Environment=RCLONE_CONFIG=/dev/null" in lines
         assert installed.auth()[1] not in text
 
@@ -562,6 +565,32 @@ class TestStoreInstall:
         rerun_calls = installed.systemctl_calls()[calls_before:]
         assert not [call for call in rerun_calls if "restart" in call]
 
+    @pytest.mark.parametrize("change", ["rotate", "recreate"])
+    def test_changed_credentials_restart_the_store(
+        self, installed: StoreWorld, change: str
+    ) -> None:
+        old_user, old_password = installed.auth()
+        if change == "rotate":
+            installed.credentials_file.write_text(
+                f"RCLONE_USER={old_user}\nRCLONE_PASS=rotated-0123abcd\n"
+            )
+        else:
+            installed.credentials_file.unlink()
+        calls_before = len(installed.systemctl_calls())
+
+        proc = installed.install()
+
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        new_auth = installed.auth()
+        assert new_auth[1] != old_password
+        rerun_calls = installed.systemctl_calls()[calls_before:]
+        assert ["--user", "restart", STORE_UNIT] in rerun_calls
+        url = f"http://127.0.0.1:{installed.port}/0/0/0/{os.urandom(8).hex()}"
+        body = os.urandom(512)
+        assert http_request("PUT", url, new_auth, body)[0] in (200, 201, 204)
+        assert http_request("GET", url, new_auth) == (200, body)
+        assert http_request("GET", url, (old_user, old_password))[0] == 401
+
     def test_check_detects_a_drifted_unit(self, installed: StoreWorld) -> None:
         with (installed.unit_dir / STORE_UNIT).open("a") as unit:
             unit.write("# hand edit\n")
@@ -601,6 +630,32 @@ class TestStoreRefusals:
         assert proc.returncode == 1
         assert named in proc.stderr
         assert list(store_world.home.iterdir()) == []
+        assert store_world.mutations() == []
+
+    @pytest.mark.parametrize(
+        "leaf", ["build cache store", "store%h"], ids=["space", "percent-specifier"]
+    )
+    def test_a_store_dir_no_unit_line_can_hold_is_refused(
+        self, store_world: StoreWorld, tmp_path: Path, leaf: str
+    ) -> None:
+        store_world.stub_rclone()
+        store_dir = tmp_path / leaf
+        proc = store_world.install(BUILD_CACHE_STORE_DIR=str(store_dir))
+        assert proc.returncode == 1
+        assert "BUILD_CACHE_STORE_DIR" in proc.stderr
+        assert not store_dir.exists()
+        assert list(store_world.home.iterdir()) == []
+        assert store_world.mutations() == []
+
+    def test_a_tailscale_warning_on_stderr_is_not_the_address(
+        self, store_world: StoreWorld
+    ) -> None:
+        store_world.stub_rclone()
+        warning = "Warning: client version 1.90.1 != tailscaled server version 1.88.0"
+        proc = store_world.install("--check", FAKE_TS_WARNING=warning)
+        assert f"preflight OK: rclone at {store_world.bin}/rclone" in proc.stdout
+        assert f"tailscale {FAKE_TAILSCALE_ADDR}," in proc.stdout
+        assert warning in proc.stderr
         assert store_world.mutations() == []
 
     def test_unexpected_argument_exits_two(self, store_world: StoreWorld) -> None:
