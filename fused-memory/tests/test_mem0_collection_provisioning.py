@@ -11,6 +11,7 @@ server went on to complete.
 from __future__ import annotations
 
 import asyncio
+import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -75,12 +76,11 @@ async def test_a_new_collection_is_created_at_the_configured_width_under_cosine_
 async def test_a_create_overrunning_the_write_budget_raises_a_timeout_naming_it_and_the_next_call_adopts_the_server_completed_collection(
     config, target,
 ):
-    config.queue.backend_write_timeout_seconds = 0.5
-    with stub_qdrant_server(create_delay_s={target: 3.0}) as stub:
+    config.queue.backend_write_timeout_seconds = budget = 0.5
+    with stub_qdrant_server(create_delay_s={target: 2 * budget}, list_collections_delay_s=2 * budget) as stub:
         async with backend_against(stub.url, config) as backend:
-            with pytest.raises(TimeoutError, match=r'Mem0 create_collection timed out after 0\.5s'):
+            with pytest.raises(TimeoutError, match=re.escape(f'Mem0 create_collection timed out after {budget}s')):
                 await backend.get(MEMORY_ID, SCOPE)
-            stub.release_event.set()
             assert stub.wait_created(target, timeout=10)
             assert await backend.get(MEMORY_ID, SCOPE) is None
         assert stub.creates(target) == 1
