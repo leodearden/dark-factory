@@ -1,0 +1,23 @@
+window 60.4s  psi cpu some avg10=34.04  procs_running=52
+bucket                 family         nice role       procs     run    wait  stall%
+other                  other             0 -           1393    3.27    2.53     44%
+other                  xdist-worker      0 -             16    1.15    2.07     64%
+df                     pytest-master    10 -             18    0.74    0.82     53%
+verify-scope:dark-factory pytest-master    15 task          14    0.34    0.58     63%
+verify-scope:dark-factory other             0 -              3    0.72    0.09     11%
+verify-scope:dark-factory xdist-worker     15 task           8    0.44    0.35     44%
+other                  claude-cli        0 -             29    0.05    0.29     86%
+verify-scope:solar-challenge pytest-master    15 task           2    0.26    0.04     13%
+other                  orch-main         0 -             14    0.15    0.14     48%
+verify-scope:dark-factory pytest-master     5 merge          4    0.11    0.13     54%
+df                     claude-cli       10 -              7    0.04    0.14     78%
+df                     orch-main         0 -              2    0.09    0.09     48%
+other                  pytest-master    19 background     6    0.13    0.05     30%
+other                  other           -20 -            134    0.14    0.04     23%
+df                     other             0 -             12    0.03    0.09     76%
+reify                  orch-main         0 -              2    0.07    0.04     35%
+reify                  claude-cli       10 -              3    0.04    0.07     63%
+other                  pytest-master     0 -              3    0.02    0.07     82%
+df                     claude-cli        0 -              3    0.02    0.05     72%
+other                  claude-cli       10 -              2    0.03    0.04     57%
+{"psi_cpu_some_avg10": "34.04", "procs_running": "52", "window_s": 60.4, "df_agents": {"run_cores": 0.06, "wait_cores": 0.2, "stall_pct": 77}, "df_merge_workers": {"run_cores": 0.11, "wait_cores": 0.13, "stall_pct": 54}, "df_task_workers": {"run_cores": 0.79, "wait_cores": 0.93, "stall_pct": 54}, "df_background_workers": {"run_cores": 0.0, "wait_cores": 0.0, "stall_pct": null}, "reify_agents": {"run_cores": 0.04, "wait_cores": 0.07, "stall_pct": 63}, "reify_merge_verify": {"run_cores": 0.01, "wait_cores": 0.01, "stall_pct": 37}, "reify_task_verify": {"run_cores": 0.0, "wait_cores": 0.0, "stall_pct": null}}
