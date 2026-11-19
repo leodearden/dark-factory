@@ -262,10 +262,11 @@ class TestReviewCheckpointInvocationRecord:
 
     async def _drive(
         self, monkeypatch, result: AgentResult, *, backend: str = 'claude',
+        clock: Callable[[], float] = time.monotonic,
     ) -> tuple[dict, dict]:
         """Run one focused review on *backend* returning *result*; give back
         ``(save_invocation kwargs, invoke_with_cap_retry kwargs)``."""
-        checkpoint = _make_checkpoint()
+        checkpoint = _make_checkpoint(clock=clock)
         checkpoint.config.backends.deep_reviewer = backend
         cost_store = MagicMock()
         cost_store.save_invocation = AsyncMock()
@@ -336,6 +337,18 @@ class TestReviewCheckpointInvocationRecord:
         )
         assert invoke_kw['max_budget_usd'] == 10.0
         assert save_kw['capped_reason'] == 'budget'
+
+    async def test_recorded_duration_is_measured_on_the_injected_clock(self, monkeypatch):
+        ticks = itertools.count()
+        save_kw, _ = await self._drive(
+            monkeypatch,
+            AgentResult(
+                success=True, output='', subtype='success',
+                structured_output=_REVIEW_PAYLOAD,
+            ),
+            clock=lambda: 100.0 + 2.5 * next(ticks),
+        )
+        assert save_kw['duration_ms'] > 0 and save_kw['duration_ms'] % 2500 == 0
 
     async def test_normal_review_is_not_capped(self, monkeypatch):
         save_kw, _ = await self._drive(
