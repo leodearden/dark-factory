@@ -1359,11 +1359,10 @@ class TestCollectSnapshotTaskSourceAndCap:
     """The collector persists the rows' live/stranded split and stamps the cap.
 
     The split needs the claimant columns only ``get_tasks`` rows carry; the
-    concurrency cap — the run-slot capacity, ``max_concurrent_tasks +
-    main_health_fix_reserved_slots`` — is read once per root and stored ON the
-    row because it varies across restarts and projects: resolving it at render
-    time would compare a historical in-progress census against today's cap and
-    mislabel both directions.
+    concurrency cap — the run-slot capacity, ``read_run_slot_capacity`` — is
+    read once per root and stored ON the row because it varies across restarts
+    and projects: resolving it at render time would compare a historical
+    in-progress census against today's cap and mislabel both directions.
     """
 
     @pytest.mark.asyncio

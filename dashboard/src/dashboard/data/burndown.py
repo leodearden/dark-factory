@@ -10,8 +10,8 @@ cached unit ``/api/v2/dashboard/tasks`` serves — never a whole-tree read. The
 unit's census gives the nine ``TaskStatus`` member columns; its rows give the
 ``in_progress_live`` / ``in_progress_stranded`` split and ``in_progress_rows``
 (task 5591). ``concurrency_cap`` is the run-slot capacity
-(``max_concurrent_tasks + main_health_fix_reserved_slots``) as it stood AT
-SNAPSHOT TIME, ``NULL`` when unknown (task 3543).
+(``dashboard/src/dashboard/data/orchestrator.py::read_run_slot_capacity``) as
+it stood AT SNAPSHOT TIME, ``NULL`` when unknown (task 3543).
 
 A row is written only from a unit whose two halves are both FRESH at the
 collector's instant; see :func:`collect_snapshot`.
@@ -101,8 +101,10 @@ CREATE TABLE IF NOT EXISTS snapshots (
     -- before task 5591, of in_progress_rows (below) on one written since.
     in_progress_live     INTEGER NOT NULL DEFAULT 0,
     in_progress_stranded INTEGER NOT NULL DEFAULT 0,
-    -- Run-slot capacity (max_concurrent_tasks + main_health_fix_reserved_slots)
-    -- in force AT SNAPSHOT TIME. Nullable on purpose:
+    -- Run-slot capacity in force AT SNAPSHOT TIME, as read by
+    -- dashboard/src/dashboard/data/orchestrator.py::read_run_slot_capacity; a
+    -- row written before task 10594 holds max_concurrent_tasks alone, without
+    -- the main-health reserve. Nullable on purpose:
     -- NULL means "cap unknown", which is not a breach. Storing 0 instead would
     -- read as a cap of zero and alarm on every snapshot. The cap is restart-
     -- only (red-tier), but a burndown window spans restarts and the cap also
@@ -306,9 +308,8 @@ def _row_for_root(
         logger.debug('Snapshot unit for %s is not wholly fresh: %s', root, reason)
         return _gap_row(root, ts, reason)
     # One cap read per ROOT: it touches the filesystem, and the value is a
-    # per-project scalar stored on the row because the run-slot capacity
-    # (max_concurrent_tasks + main_health_fix_reserved_slots) varies across
-    # restarts and across projects — see BURNDOWN_SCHEMA.
+    # per-project scalar stored on the row because the run-slot capacity varies
+    # across restarts and across projects — see BURNDOWN_SCHEMA.
     cap = read_run_slot_capacity(root)
     # The same live-vs-cap comparison compute_parity_alarm makes (PRD decision 9).
     live = measurement.in_progress_live
@@ -776,9 +777,9 @@ def compute_parity_alarm(series: Mapping[str, Any]) -> dict[str, Any]:
 
     **Each snapshot is judged against the cap stored on THAT snapshot**, never
     against one "current" cap applied across history.  The cap is the run-slot
-    capacity (``max_concurrent_tasks + main_health_fix_reserved_slots``); both
-    keys are restart-only (red-tier), but a burndown window spans restarts, so it
-    is still TIME-VARYING across the window: re-deriving a single cap would forgive
+    capacity (``dashboard/src/dashboard/data/orchestrator.py::read_run_slot_capacity``),
+    which is restart-only (red-tier), but a burndown window spans restarts, so it is
+    still TIME-VARYING across the window: re-deriving a single cap would forgive
     a real past breach after a cap raise, and invent a fictional one after a cut.
 
     The numerator is the rows' live count, not the census ``in_progress``
