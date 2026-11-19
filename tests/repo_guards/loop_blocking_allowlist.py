@@ -56,7 +56,10 @@ Each entry is a 6-tuple::
                   ``filed`` with the resolved task's ``TaskRef`` -- a ``filed``
                   row naming a ticket would point at a decision that has not
                   been made yet.
-``justification`` non-empty prose saying WHY, never the owner's home.
+``justification`` non-empty prose saying WHY.  It may narrate how the row
+                  came to its owner (the ticket a task grew from), but never
+                  says who owns it now: the ``owner`` column is the only home
+                  of that, and the only one the gates check.
                   ``accepted`` must say what makes the cost acceptable (cached
                   / startup-only / measured cheap), not merely that the call
                   exists.
@@ -179,8 +182,8 @@ _ESCALATE_ARCHIVE_SCAN_WHY = (
     'their original hashes rather than being deleted as fixed. '
     'The helper deliberately '
     'lives under fused-memory/src/ so the scanner can still follow '
-    'that reach; see TestScanHelperStaysInGateScope. STILL OWNED '
-    'BY TASK 5270, which owns the full offload -- do not file '
+    'that reach; see TestScanHelperStaysInGateScope. The owner '
+    'owns the full offload -- do not file '
     'again: task 4484 step-9\'s ticket '
     'tkt_0RT7QXR5AXGWVADW9T3S4DPC2M became task 5072, coalesced '
     'into 5270. 5072\'s text counts 9 callers; the 10th, '
@@ -239,12 +242,13 @@ _COMBINE_AUDIT_APPEND_WHY = (
     'storm, was moved onto a dedicated writer thread by task 6085.'
 )
 
-#: Task 6089: who owns the measured-cheap ``resolve`` rows its widening added.
+#: Task 6089: what the owner of the measured-cheap ``resolve`` rows its
+#: widening added must do with them.
 _CHEAP_RESOLVE_OWNER_WHY = (
-    ' OWNED BY TASK 7572, created from task 6089\'s follow-up ticket '
-    'tkt_0RW94QBGG9RSRP47XQXGGV1KFK. Under the INV-12 day-one ruling '
+    ' Task 6089\'s follow-up ticket tkt_0RW94QBGG9RSRP47XQXGGV1KFK became '
+    'task 7572. Under the INV-12 day-one ruling '
     '(esc-5603-1) a measured-cheap site is no longer a resting state in this '
-    'ledger, so 7572 offloads it (asyncio.to_thread, or anyio.Path.resolve '
+    'ledger, so the owner offloads it (asyncio.to_thread, or anyio.Path.resolve '
     'for a Path) and deletes the row, or obtains a per-row Policy ruling.'
 )
 
@@ -291,10 +295,10 @@ _RUN_CONFIG_DIR_GC_WHY = (
     'gc_run_config_dir is documented as synchronous by contract, because an '
     'await is a cancellation point and SIGTERM-driven teardown is exactly '
     'what would then skip the archive-then-delete. An offload must keep the '
-    'teardown unskippable. OWNED BY TASK 5270: task 4484\'s ticket '
+    'teardown unskippable. Do not file again: task 4484\'s ticket '
     'tkt_0RT88VW7RRECTHNCVTJXD6M5RJ was combined into task 5072, which '
     'was coalesced into 5270. '
-    'NOT A ROW, NOT 5270\'s: the producer half of the same archival runs '
+    'NOT A ROW, NOT PART OF THESE ROWS\' FIX: the producer half of the same archival runs '
     'on the loop thread too, in stages/base.py::'
     'BaseStage._archive_stage_transcripts from BaseStage.run\'s finally on '
     'every stage exit -- shared.transcript_archive.archive_task_transcripts '
@@ -565,8 +569,8 @@ AUDITED_SITES: list[tuple[str, str, str, str, TaskRef | TicketRef | None, str]] 
         'for the category fold (so it grows with the pending queue), '
         'then make_id\'s fcntl.flock over an fsync\'d counter write and '
         'submit\'s fsync\'d record write. The flock wait is bounded only '
-        'by another process\'s hold. OWNED BY '
-        'TASK 5270 -- do not file again: added to its scope 2026-09-16 '
+        'by another process\'s hold. Do not file again: added to '
+        'task 5270\'s scope 2026-09-16 '
         'beside the _escalate cluster, whose fix shape (offload the '
         'filer) it shares.',
     ),
@@ -680,8 +684,8 @@ AUDITED_SITES: list[tuple[str, str, str, str, TaskRef | TicketRef | None, str]] 
         'accepted',
         None,
         _DECLARED_FILES_STAT_WHY
-        + ' Task 5270 already owns this coroutine\'s is_orchestrator_live_for '
-        'row (ticket-derived task 5077): if 5270 offloads the whole sweep, '
+        + ' This coroutine\'s is_orchestrator_live_for row (b9609c7cf5b4) '
+        'has its own owner: if that owner offloads the whole sweep, '
         'delete this row with it.',
     ),
 
@@ -787,8 +791,8 @@ AUDITED_SITES: list[tuple[str, str, str, str, TaskRef | TicketRef | None, str]] 
         'It cannot simply hop threads: the store keeps sqlite3 '
         'check_same_thread at its default because its add_memory-path '
         'reader is sync, so the connection must be opened on the loop '
-        'thread that uses it. Owned with the other accepted rows by task '
-        '5270 (the ledger default, docs/legibility/inv12-day-one-rulings.md). '
+        'thread that uses it. Owned with the other accepted rows by the '
+        'LOOP_BLOCKING_LEDGER default (docs/legibility/inv12-day-one-rulings.md). '
         'If it ever moves onto a request or reload path, the content_hash '
         'changes and the gate re-asks.',
     ),
