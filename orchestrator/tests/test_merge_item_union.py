@@ -170,7 +170,7 @@ async def test_decided_item_dispatches_as_passthrough(
         request=req, immediate_outcome=outcome, base_sha='deadbeef', speculative=False,
     )
 
-    entry = await worker._dispatch_item(item)
+    entry = await worker.verify_dispatch.dispatch(item)
     assert isinstance(entry, InflightEntry)
     assert entry.verify_task is None, 'DecidedItem must dispatch with no real verify task'
     assert entry.lease is None, 'DecidedItem passthrough must not hold a host lease'
@@ -202,7 +202,7 @@ async def test_decided_item_already_delivered_skips_double_set_result(
         request=req, immediate_outcome=conflict_outcome, base_sha='deadbeef',
         speculative=False, already_delivered=True,
     )
-    entry = await worker._dispatch_item(item)
+    entry = await worker.verify_dispatch.dispatch(item)
     assert isinstance(entry, InflightEntry)
     assert entry.passthrough_outcome is conflict_outcome
 
@@ -261,7 +261,7 @@ async def test_train_handoff_decided_item_passthrough_no_drift(
     main_before = await git_ops.get_main_sha()
     slots_available_before = worker.snapshot()['speculation']['slot_available']
 
-    entry = await worker._dispatch_item(item)
+    entry = await worker.verify_dispatch.dispatch(item)
     assert isinstance(entry, InflightEntry)
     assert entry.verify_task is None
     assert entry.was_speculative is False

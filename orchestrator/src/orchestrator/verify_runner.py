@@ -184,7 +184,7 @@ __all__ = [
 ]
 
 # Sentinel category constants — encode an unscoped-gate failure inside a
-# VerifyResult so _run_post_merge_verify can branch byte-identically.
+# VerifyResult so merge_lane/post_merge_verify.py::run_post_merge_verify can branch byte-identically.
 UNSCOPED_TYPECHECK_FAILED_CATEGORY = 'unscoped_typecheck_failed'
 UNSCOPED_TYPECHECK_TIMEOUT_CATEGORY = 'unscoped_typecheck_timeout'
 
@@ -332,7 +332,7 @@ class MergeVerifySpec:
                           its nextest filter files are UNTRACKED files in the
                           dispatching host's merge_wt, which the git-pushed merge
                           SHA does not carry. That env is therefore never shipped:
-                          merge_lane/worker.py::_run_post_merge_verify builds it
+                          merge_lane/post_merge_verify.py::run_post_merge_verify builds it
                           only for a LOCAL dispatch (runner is None), so a REMOTE
                           retry runs FULL and is charged to the legacy (full)
                           retry budget, not the narrowed one. Pinned by

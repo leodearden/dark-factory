@@ -633,7 +633,7 @@ class TestDeepChainPlacementBuild:
         The generic ``except Exception`` arm's contract, and the sibling of the
         deadline test above: a non-``TimeoutError`` blowing out of
         ``build_chain`` degrades to today's adjacent verify (``None``) rather
-        than propagating into ``_dispatch_item``.  Loud, not silent — a
+        than propagating into ``VerifyDispatcher.dispatch``.  Loud, not silent — a
         ``logger.exception`` is required, since a silent fail-soft is what the
         no-silent-fail-soft design invariant forbids.
 
@@ -732,7 +732,7 @@ class TestDeepChainPlacementBuild:
         (3.11+), so a ``CancelledError`` that escapes the context manager can
         ONLY be an external cancellation of the verifier-loop task.  Catching
         it alongside ``TimeoutError`` CONSUMES the cancel request: the coroutine
-        returns ``None`` and ``_dispatch_item`` runs on as if nothing happened
+        returns ``None`` and ``VerifyDispatcher.dispatch`` runs on as if nothing happened
         — breaking the "CancelledError is never absorbed" invariant
         ``_verifier_loop`` states.
 
@@ -787,10 +787,10 @@ class TestDeepChainPlacementBuild:
     ):
         """REVIEW FIX 2, where the real hazard lives: the ENCLOSING task.
 
-        ``_deep_chain_placement`` is awaited inline by ``_dispatch_item``, which
+        ``_deep_chain_placement`` is awaited inline by ``VerifyDispatcher.dispatch``, which
         the verifier loop runs as a task.  If the cancel is swallowed down in
-        the placement, ``_dispatch_item`` sails on past it and
-        ``ensure_future(self._run_inflight_verify(...))`` launches a whole
+        the placement, ``VerifyDispatcher.dispatch`` sails on past it and
+        ``ensure_future(self._verify_dispatch.run_inflight_verify(...))`` launches a whole
         verify for a dispatch that was cancelled — so the observable is not
         just "the exception vanished" but "work happened after the cancel".
         """
@@ -812,7 +812,7 @@ class TestDeepChainPlacementBuild:
             _ephemeral_merge_wt(scene.git_ops, 'cancel-dispatch'),
         )
 
-        task = asyncio.ensure_future(scene.worker._dispatch_item(item))
+        task = asyncio.ensure_future(scene.worker.verify_dispatch.dispatch(item))
         await asyncio.wait_for(entered.wait(), timeout=60)
         task.cancel()
         await asyncio.wait([task])
@@ -933,7 +933,7 @@ class TestDeepChainPlacementBuild:
 #     for a speculative item with the lane pool on (merge_liveness.py:715-731).
 #     Spied on the GitOps INSTANCE via ``_count_spec_lane_acquires``, which is
 #     not a module reach-back at all.
-#   * ``worker._verify_attempt_count`` — staged and committed INSIDE that
+#   * ``worker.verify_dispatch.verify_attempts()`` — staged and committed INSIDE that
 #     block, and the driver of the periodic cold-verify safety valve.
 
 
@@ -996,7 +996,7 @@ class TestRunInflightVerifyChainRedirect:
         git_ops, worker, item, chain, head, _facts = await self._fixture(git_repo)
         posted = _spy_post_merge_verify(monkeypatch)
 
-        await worker._run_inflight_verify(item, _local_lease(), chain=chain)
+        await worker.verify_dispatch.run_inflight_verify(item, _local_lease(), chain=chain)
 
         assert len(posted) == 1
         assert posted[0]['merge_sha'] == chain.tip
@@ -1024,12 +1024,12 @@ class TestRunInflightVerifyChainRedirect:
         # excluded and this list counts only what the VERIFY would take.
         lanes = _count_spec_lane_acquires(git_ops, monkeypatch)
         _spy_post_merge_verify(monkeypatch)
-        before = worker._verify_attempt_count
+        before = worker.verify_dispatch.verify_attempts()
 
-        await worker._run_inflight_verify(item, _local_lease(), chain=chain)
+        await worker.verify_dispatch.run_inflight_verify(item, _local_lease(), chain=chain)
 
         assert lanes == [], 'chain arm must not acquire a second verify lane'
-        assert worker._verify_attempt_count == before, (
+        assert worker.verify_dispatch.verify_attempts() == before, (
             'the attempt counter is staged INSIDE the warm-swap block, so a '
             'bypassed block must leave the cold-verify safety valve untouched'
         )
@@ -1046,12 +1046,12 @@ class TestRunInflightVerifyChainRedirect:
         — which is why a deliberately wrong ``chain_items=99`` is passed here
         and 3 is still required.  That is what makes the emitted unit
         frontier-independent by construction, so it cannot silently regress if
-        ``_dispatch_item``'s own derivation ever changes again.
+        ``VerifyDispatcher.dispatch``'s own derivation ever changes again.
         """
         _git_ops, worker, item, chain, _head, _facts = await self._fixture(git_repo, frontier=1)
         posted = _spy_post_merge_verify(monkeypatch)
 
-        await worker._run_inflight_verify(
+        await worker.verify_dispatch.run_inflight_verify(
             item, _local_lease(), chain=chain, chain_items=99,  # deliberately wrong
         )
 
@@ -1080,7 +1080,7 @@ class TestRunInflightVerifyChainRedirect:
         released = _spy_chain_lane_release(monkeypatch)
         assert _lane_states(git_ops) == [LaneState.ASSIGNED, LaneState.FREE]
 
-        await worker._run_inflight_verify(item, _local_lease(), chain=chain)
+        await worker.verify_dispatch.run_inflight_verify(item, _local_lease(), chain=chain)
 
         assert released == [(chain.lane, chain.lane_warm)], 'exactly one release'
         assert _lane_states(git_ops) == [LaneState.FREE, LaneState.FREE]
@@ -1113,7 +1113,7 @@ class TestRunInflightVerifyChainRedirect:
         _seed_window(worker, tmp_path, [seeded])
         _spy_post_merge_verify(monkeypatch, outcome=outcome)
 
-        await worker._run_inflight_verify(
+        await worker.verify_dispatch.run_inflight_verify(
             item, _local_lease(), chain=chain, dispatch_facts=facts,
         )
 
@@ -1145,7 +1145,7 @@ class TestRunInflightVerifyChainRedirect:
         _spy_post_merge_verify(monkeypatch, raises=RuntimeError('verify exploded'))
         released = _spy_chain_lane_release(monkeypatch)
 
-        res = await worker._run_inflight_verify(
+        res = await worker.verify_dispatch.run_inflight_verify(
             item, _local_lease(), chain=chain, dispatch_facts=facts,
         )
 
@@ -1191,7 +1191,7 @@ class TestRunInflightVerifyChainRedirect:
         _git_ops, worker, item, chain, _head, _facts = await self._fixture(git_repo)
         _spy_post_merge_verify(monkeypatch, raises=RuntimeError('verify exploded'))
 
-        await worker._run_inflight_verify(item, _local_lease(), chain=chain)
+        await worker.verify_dispatch.run_inflight_verify(item, _local_lease(), chain=chain)
 
         built = _spy_build_chain(monkeypatch, passthrough=True)
         assert (await worker._deep_chain_placement(item)).chain is None
@@ -1210,10 +1210,10 @@ class TestRunInflightVerifyChainRedirect:
         """
         _git_ops, worker, item, chain, _head, _facts = await self._fixture(git_repo)
         _spy_post_merge_verify(monkeypatch, raises=RuntimeError('verify exploded'))
-        await worker._run_inflight_verify(item, _local_lease(), chain=chain)
+        await worker.verify_dispatch.run_inflight_verify(item, _local_lease(), chain=chain)
 
         posted = _spy_post_merge_verify(monkeypatch, outcome=None)
-        res = await worker._run_inflight_verify(item, _local_lease())
+        res = await worker.verify_dispatch.run_inflight_verify(item, _local_lease())
         assert len(posted) == 1, 'the ordinary arm ran'
         if res.merge_wt is not None:
             await worker._release_or_cleanup(res.merge_wt, spec_warm=res.spec_warm)
@@ -1247,7 +1247,7 @@ class TestRunInflightVerifyChainRedirect:
 
         # ── ROUND 1: chained, raises → defer + suppress (no resolution). ──
         _spy_post_merge_verify(monkeypatch, raises=RuntimeError('boom 1'))
-        first = await worker._run_inflight_verify(item, _local_lease(), chain=chain)
+        first = await worker.verify_dispatch.run_inflight_verify(item, _local_lease(), chain=chain)
 
         assert first.status is InflightStatus.REQUEUED
         assert not item.request.result.done()
@@ -1260,7 +1260,7 @@ class TestRunInflightVerifyChainRedirect:
 
         # ── ROUND 2: un-chained, raises too → today's terminal resolution. ──
         _spy_post_merge_verify(monkeypatch, raises=RuntimeError('boom 2'))
-        second = await worker._run_inflight_verify(item, _local_lease())
+        second = await worker.verify_dispatch.run_inflight_verify(item, _local_lease())
 
         assert item.request.result.done(), (
             'the un-chained round is the backstop: its verify ran against the '
@@ -1304,7 +1304,7 @@ class TestRunInflightVerifyChainRedirect:
         git_ops, worker, item, chain, head, _facts = await self._fixture(git_repo)
         config = item.request.config
         _spy_post_merge_verify(monkeypatch, outcome=_fail_verify_result())
-        await worker._run_inflight_verify(item, _local_lease(), chain=chain)
+        await worker.verify_dispatch.run_inflight_verify(item, _local_lease(), chain=chain)
 
         built = _spy_build_chain(monkeypatch, passthrough=True)
         cancelled_tid, verified_tid = (tid for tid, _mc in chain.links)
@@ -1327,10 +1327,10 @@ class TestRunInflightVerifyChainRedirect:
             await asyncio.Event().wait()
 
         monkeypatch.setattr(
-            'orchestrator.merge_lane.worker._run_post_merge_verify', _verify_until_cancelled,
+            'orchestrator.merge_lane.verify_dispatch.run_post_merge_verify', _verify_until_cancelled,
         )
         in_flight = asyncio.ensure_future(
-            worker._run_inflight_verify(members[cancelled_tid], _local_lease()),
+            worker.verify_dispatch.run_inflight_verify(members[cancelled_tid], _local_lease()),
         )
         await started.wait()
         in_flight.cancel()
@@ -1339,7 +1339,7 @@ class TestRunInflightVerifyChainRedirect:
         assert worker.chain_snapshot() == (), 'a cancelled verify is no verdict'
 
         _spy_post_merge_verify(monkeypatch, outcome=None)
-        await worker._run_inflight_verify(members[verified_tid], _local_lease())
+        await worker.verify_dispatch.run_inflight_verify(members[verified_tid], _local_lease())
         assert worker.chain_snapshot() == (), 'a returned verify is no applied verdict'
 
         unmarked = _make_req('104', '104', config, git_repo, lane='high')
@@ -1356,14 +1356,14 @@ class TestRunInflightVerifyChainRedirect:
         start-up seed (test_merge_lane_chain_policy.py)."""
         _git_ops, worker, item, chain, _head, facts = await self._fixture(git_repo)
         _spy_post_merge_verify(monkeypatch, outcome=_fail_verify_result())
-        await worker._run_inflight_verify(
+        await worker.verify_dispatch.run_inflight_verify(
             item, _local_lease(), chain=chain, dispatch_facts=facts,
         )
 
         placement = await worker._deep_chain_placement(item)
         assert placement == NO_DEEP_PLACEMENT
         _spy_post_merge_verify(monkeypatch, outcome=None)
-        res = await worker._run_inflight_verify(
+        res = await worker.verify_dispatch.run_inflight_verify(
             item, _local_lease(), dispatch_facts=_placed_facts(placement),
         )
         if res.merge_wt is not None:
@@ -1394,18 +1394,18 @@ class TestRunInflightVerifyChainRedirect:
 
         git_ops, worker, item, chain, _head, _facts = await self._fixture(git_repo)
         released = _spy_chain_lane_release(monkeypatch)
-        monkeypatch.setattr(type(worker), 'VERIFY_ABANDON_POLL_SECS', 0.01)
+        monkeypatch.setattr(type(worker.verify_dispatch), 'VERIFY_ABANDON_POLL_SECS', 0.01)
 
         async def _slow_verify(_git_ops, _req, _merge_wt, **_kw):
             await asyncio.sleep(30)
 
         monkeypatch.setattr(
-            'orchestrator.merge_lane.worker._run_post_merge_verify', _slow_verify,
+            'orchestrator.merge_lane.verify_dispatch.run_post_merge_verify', _slow_verify,
         )
         # The sole waiter gives up: this is what _request_abandoned reads.
         item.request.result.cancel()
 
-        res = await worker._run_inflight_verify(item, _local_lease(), chain=chain)
+        res = await worker.verify_dispatch.run_inflight_verify(item, _local_lease(), chain=chain)
 
         assert res.status is InflightStatus.DROPPED
         assert len(released) == 1, (
@@ -1443,7 +1443,7 @@ class TestRunInflightVerifyChainRedirect:
         )
         _spy_post_merge_verify(monkeypatch, raises=RuntimeError('verify exploded'))
 
-        res = await worker._run_inflight_verify(item, _local_lease())
+        res = await worker.verify_dispatch.run_inflight_verify(item, _local_lease())
 
         assert item.request.result.done(), 'no chain: the ordinary terminal path'
         outcome = item.request.result.result()
@@ -1474,7 +1474,7 @@ class TestRunInflightVerifyChainRedirect:
             lambda wt: cleaned.append(wt) or asyncio.sleep(0),
         )
 
-        res = await worker._run_inflight_verify(item, _local_lease(), chain=chain)
+        res = await worker.verify_dispatch.run_inflight_verify(item, _local_lease(), chain=chain)
         return worker, ephemeral, cleaned, res
 
     @pytest.mark.parametrize(('passed', 'raises'), _NON_ADOPTING_ARMS)
@@ -1542,15 +1542,15 @@ class TestRunInflightVerifyChainRedirect:
         lanes = _count_spec_lane_acquires(git_ops, monkeypatch)
         posted = _spy_post_merge_verify(monkeypatch)
         released = _spy_chain_lane_release(monkeypatch)
-        before = worker._verify_attempt_count
+        before = worker.verify_dispatch.verify_attempts()
 
-        res = await worker._run_inflight_verify(item, _local_lease())
+        res = await worker.verify_dispatch.run_inflight_verify(item, _local_lease())
 
         assert lanes == [item.merge_result.merge_commit], (
             'the ordinary path still routes a speculative LOCAL verify through '
             'the warm-swap block into a _spec- lane'
         )
-        assert worker._verify_attempt_count == before + 1
+        assert worker.verify_dispatch.verify_attempts() == before + 1
         assert posted[0]['merge_sha'] == head == item.merge_result.merge_commit
         assert posted[0]['chain_items'] == 1, 'default: a one-item tree'
         assert released == [], 'no chain, nothing to release'
@@ -1630,7 +1630,7 @@ class TestDeepTipVerifyNeverAdopts:
         )
         main_before = await _rev_parse(git_repo, 'main')
 
-        res = await worker._run_inflight_verify(
+        res = await worker.verify_dispatch.run_inflight_verify(
             item, _local_lease(), chain=chain, dispatch_facts=_placed_facts(placement),
         )
 
@@ -1789,7 +1789,7 @@ class TestDeepTipVerifyNeverAdopts:
 # step-19: RED — the task's USER-OBSERVABLE SIGNAL, as one integration class.
 #
 # Everything above pins a seam in isolation. This class is the only place the
-# seams are driven the way production drives them — `_dispatch_item` →
+# seams are driven the way production drives them — `VerifyDispatcher.dispatch` →
 # `_deep_chain_placement` → `_run_inflight_verify` → the chain policy → the
 # NEXT round's `_deep_chain_placement` — because γ's whole thesis is a
 # multi-ROUND property: a tip verdict changes what the next dispatch builds.
@@ -1860,13 +1860,13 @@ class _DeepScene:
     async def round_(
         self, *, tag: str, cohort: int = 0, speculative: bool = True,
     ) -> dict:
-        """Drive ONE full dispatch round through ``_dispatch_item``.
+        """Drive ONE full dispatch round through ``VerifyDispatcher.dispatch``.
 
         *cohort* picks the dispatching owner, task ``{cohort+1}01`` (see
         :func:`_cohort_task_ids`).  *speculative* picks its slot, as for
         :func:`_make_item`: the default is the slot-2 item, and
         ``speculative=False`` the head, based on REAL main, since a stale
-        base would fire ``_dispatch_item``'s staleness re-merge and leave no
+        base would fire ``VerifyDispatcher.dispatch``'s staleness re-merge and leave no
         later round chaining.  Returns the recorded ``_run_inflight_verify``
         kwargs for the round (plus ``'result'``), after :meth:`release_round`.
         """
@@ -1881,7 +1881,7 @@ class _DeepScene:
                 speculative=False, base_sha=await _rev_parse(self.repo, 'main'),
             )
         )
-        entry = await self.worker._dispatch_item(item)
+        entry = await self.worker.verify_dispatch.dispatch(item)
         assert entry is not None, 'dispatch must not decline: a host is free'
         assert entry.verify_task is not None
         await entry.verify_task
@@ -1931,7 +1931,7 @@ async def _make_deep_scene(
     (:func:`_cohort_task_ids`).
 
     *script* is one bool per round (``True`` == the verify passed), or ``None``
-    to install no oracle at all and let the REAL ``_run_post_merge_verify``
+    to install no oracle at all and let the REAL ``run_post_merge_verify``
     run — which is what drives the true ``merge_verify`` emission site.  When
     *allocator* is given it is installed on the worker BEFORE first use, so
     ``_ensure_host_allocator``'s cache check (merge_queue.py:10288) short-
@@ -1942,10 +1942,10 @@ async def _make_deep_scene(
     idiom already at test_merge_queue_depth_telemetry.py:477-482
     (``_worker_with_frontier`` + ``_sentinel_entry``) and at this module's
     ``TestRunInflightVerifyChainRedirect._fixture``.  It has to be STUBBED
-    rather than driven: ``_dispatch_item`` never appends to ``_inflight`` (the
+    rather than driven: ``VerifyDispatcher.dispatch`` never appends to ``_inflight`` (the
     only ``self._inflight.append`` is ``_inflight_append``, merge_queue.py:15693,
     which only the MERGER loop calls), so a scene driven purely through
-    ``_dispatch_item`` has a structurally empty frontier and every
+    ``VerifyDispatcher.dispatch`` has a structurally empty frontier and every
     ``frontier + 1`` arithmetic is observationally identical to a flat ``1``.
     """
     git_ops = _make_git_ops(repo, size=2)
@@ -1968,10 +1968,10 @@ async def _make_deep_scene(
     scene = _DeepScene(git_ops, config, worker, head, repo, store)
 
     # ── the round recorder, installed ONCE ───────────────────────────────────
-    # Once, not per round: re-wrapping `worker._run_inflight_verify` each round
+    # Once, not per round: re-wrapping `worker.verify_dispatch.run_inflight_verify` each round
     # would capture the PREVIOUS round's recorder as `real` and nest the
     # wrappers one deeper every round.
-    real_verify = worker._run_inflight_verify
+    real_verify = worker.verify_dispatch.run_inflight_verify
 
     async def _recording(_item, _lease, **kwargs):
         rec = dict(kwargs)
@@ -1980,7 +1980,7 @@ async def _make_deep_scene(
         rec['result'] = await real_verify(_item, _lease, **kwargs)
         return rec['result']
 
-    monkeypatch.setattr(worker, '_run_inflight_verify', _recording)
+    monkeypatch.setattr(worker.verify_dispatch, 'run_inflight_verify', _recording)
     scene.built = _spy_build_chain(monkeypatch, passthrough=True)
     scene.released = _spy_chain_lane_release(monkeypatch)
     scene.lanes = _count_spec_lane_acquires(git_ops, monkeypatch)
@@ -1994,7 +1994,7 @@ async def _make_deep_scene(
             return None if passed else MergeOutcome('blocked', reason='Verification failed: red')
 
         monkeypatch.setattr(
-            'orchestrator.merge_lane.worker._run_post_merge_verify', _oracle,
+            'orchestrator.merge_lane.verify_dispatch.run_post_merge_verify', _oracle,
         )
     return scene
 
@@ -2094,7 +2094,7 @@ class TestDeepDispatchRoundsIntegration:
         """A remote lease's chain builds in an ephemeral ``_merge-*``; a local one in ``_spec-``.
 
         Both chain owners reach the builder through the one
-        ``_deep_chain_placement`` call in ``_dispatch_item``: the speculative
+        ``_deep_chain_placement`` call in ``VerifyDispatcher.dispatch``: the speculative
         slot-2 item, and the head alone in the verify frontier (PRD D5).
         """
         from orchestrator.verify_runner import HostLease
@@ -2211,8 +2211,8 @@ class TestDeepDispatchRoundsIntegration:
         # frontier, so it is deep at frontier-0 and a flat 1 at frontier-2.
         #
         # base_sha is REAL MAIN, deliberately: a slot-1 item is merged onto
-        # main, and a stale base would fire _dispatch_item's Mechanism-2
-        # staleness re-merge, which sets `_remerge_occurred` and makes every
+        # main, and a stale base would fire VerifyDispatcher.dispatch's Mechanism-2
+        # staleness re-merge, which raises `VerifyDispatcher.chain_invalidated` and makes every
         # LATER speculative round re-merge as `chain_invalidated` — arriving at
         # _deep_chain_placement non-speculative, so no round after this one
         # would chain at all and the whole scene would go quietly vacuous.
@@ -2221,7 +2221,7 @@ class TestDeepDispatchRoundsIntegration:
             _ephemeral_merge_wt(scene.git_ops, 'ev-head'), speculative=False,
             base_sha=await _rev_parse(repo, 'main'),
         )
-        entry = await scene.worker._dispatch_item(head_item)
+        entry = await scene.worker.verify_dispatch.dispatch(head_item)
         assert entry is not None and entry.verify_task is not None
         await entry.verify_task
         # A chained head's links go back too, or the speculative rounds find none.
@@ -2327,7 +2327,7 @@ class TestDeepDispatchRoundsIntegration:
             _ephemeral_merge_wt(scene.git_ops, 'can-head'), speculative=False,
             base_sha=await _rev_parse(repo, 'main'),
         )
-        entry = await scene.worker._dispatch_item(head_item)
+        entry = await scene.worker.verify_dispatch.dispatch(head_item)
         assert entry is not None and entry.verify_task is not None
         await entry.verify_task
         await scene.worker._host_allocator.release(entry.lease)

@@ -4165,7 +4165,7 @@ def create_server(
         D1, following the same caller-vouched-bool shape as *verified_green*
         above).  Threaded onto the ``MergeRequest`` the worker dequeues so it
         is visible on ``req`` inside the worker's retry path
-        (``_run_post_merge_verify``).  Default ``False`` is a strict no-op —
+        (``orchestrator/merge_lane/post_merge_verify.py::run_post_merge_verify``).  Default ``False`` is a strict no-op —
         the retry-set primitive that consumes this flag ships separately
         (reify, PRD task D2), so today every value leaves behavior unchanged.
 

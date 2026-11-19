@@ -31,6 +31,7 @@ from orchestrator.merge_lane import MergeOutcome, MergeRequest, QueuedBranch
 from orchestrator.merge_lane.disposition import MergeFailureDisposition
 from orchestrator.merge_lane.gates import _reverify_rebased_tree, note_queue_verified_main_tip
 from orchestrator.merge_lane.main_health_probe import MAIN_HEALTH_RED_REASON_PREFIX
+from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
 from orchestrator.merge_lane.reverify_gate_decision import (
     MAX_RECORDED_OVERLAP_PATHS,
     GateClearance,
@@ -39,10 +40,7 @@ from orchestrator.merge_lane.reverify_gate_decision import (
     ReverifyGateReason,
     emit_reverify_gate_decision,
 )
-from orchestrator.merge_lane.worker import (
-    TRANSIENT_INFRA_REASON_PREFIX,
-    _run_post_merge_verify,
-)
+from orchestrator.merge_lane.verify_failure_outcome import TRANSIENT_INFRA_REASON_PREFIX
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_categories import FailureCategory
 
@@ -388,7 +386,7 @@ async def _rebased_merge(
 
 @dataclasses.dataclass
 class _CountedVerify:
-    """``_run_post_merge_verify`` on *verifier* and the scene's store, noting each call's leg."""
+    """``run_post_merge_verify`` on *verifier* and the scene's store, noting each call's leg."""
 
     store: EventStore
     verifier: FakeVerifier
@@ -396,7 +394,7 @@ class _CountedVerify:
 
     async def __call__(self, *args: Any, **kwargs: Any) -> MergeOutcome | None:
         self.history_legs.append(kwargs.get('history_leg_command'))
-        return await _run_post_merge_verify(
+        return await run_post_merge_verify(
             *args, verifier=self.verifier, event_store=self.store, **kwargs,
         )
 

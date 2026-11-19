@@ -193,7 +193,7 @@ async def classify_main_health_red(
     Latency: the first failing merge per ``(main_sha, category, cause_hint)``
     tuple pays a full probe build/test cost, bounded by the same
     ``merge_verify_cold_command_timeout_secs`` / ``verify_cold_command_timeout_secs``
-    timeout that ``_run_post_merge_verify`` uses (inherited via
+    timeout that ``merge_lane/post_merge_verify.py::run_post_merge_verify`` uses (inherited via
     ``run_scoped_verification``'s config lookup — the probe runs with
     ``max_retries=0`` so a hung probe cannot stall the worker beyond one
     timeout window).  Subsequent merges with the same signature hit the
@@ -217,7 +217,7 @@ async def classify_main_health_red(
 @dataclasses.dataclass(frozen=True)
 class MainHealthProbeHandles:
     """Opaque bundle carrying the worker's ``background_tasks`` set so the
-    deferred main-health probe survives ``_run_post_merge_verify`` returning
+    deferred main-health probe survives ``merge_lane/post_merge_verify.py::run_post_merge_verify`` returning
     (task 2564, reify 5067 merge-slot-stall fix).
 
     A DISTINCT bundle from the dry-run investigation's handles (not reused)
@@ -229,11 +229,11 @@ class MainHealthProbeHandles:
     and is drained by the worker's existing shutdown drain
     (``SpeculativeMergeWorker.stop``).
 
-    Only ``SpeculativeMergeWorker._lane_post_merge_verify``, which serves the
+    Only ``VerifyDispatcher.post_merge_verify``, which serves the
     in-flight verify and the single-branch gate re-verify, passes a live
     instance (task 2564 step-16, task 6278).  The solo-reverify and train
     callers — and any bare test caller — pass ``None`` (the default), so
-    ``_run_post_merge_verify`` keeps running the main-health probe
+    ``merge_lane/post_merge_verify.py::run_post_merge_verify`` keeps running the main-health probe
     SYNCHRONOUSLY exactly as it did before task 2564.
 
     ``auto_heal`` (task 2564 step-22) is an optional callback threaded
@@ -294,7 +294,7 @@ async def _run_deferred_main_health_probe(
     :class:`~orchestrator.verify_runner.HostLease` — so it never acquires
     or holds a merge host slot.  *origin_is_local* RECORDS, but does not
     STEER, where the triggering post-merge verify ran (derived by the
-    caller from the ``runner`` ``_run_post_merge_verify`` received:
+    caller from the ``runner`` ``merge_lane/post_merge_verify.py::run_post_merge_verify`` received:
     ``None``/local-lease is local, ``RemoteRunner.is_local=False`` is
     remote — defaults to ``True`` so any caller not yet threading this
     value is treated as local); the probe itself ALWAYS runs locally
@@ -491,7 +491,7 @@ def spawn_main_health_probe(
     ``_spawn_merge_verify_dry_run``'s ``handles is None`` guard) — every
     call site invokes this unconditionally and relies on this internal check,
     so the solo-reverify and train (its gate re-verify included)
-    ``_run_post_merge_verify`` callers (which pass no handles) are guaranteed
+    ``merge_lane/post_merge_verify.py::run_post_merge_verify`` callers (which pass no handles) are guaranteed
     no-ops.
 
     Applies the SAME three cheap guards :func:`classify_main_health_red`
@@ -519,7 +519,7 @@ def spawn_main_health_probe(
     dedup).  Returns ``False`` when no probe is in flight: *handles* is
     ``None``, a guard skipped classification, or spawning itself raised.
     Task 2564 amendment (reviewer_comprehensive finding 1): the caller
-    (``_run_post_merge_verify``) uses this to decide whether the
+    (``merge_lane/post_merge_verify.py::run_post_merge_verify``) uses this to decide whether the
     provisional task-fault outcome should carry
     ``MAIN_HEALTH_PROBE_PENDING_NOTE`` — a caller cannot otherwise tell
     "classification skipped, confirmed task fault" apart from "classification

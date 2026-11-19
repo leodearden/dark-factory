@@ -149,7 +149,7 @@ async def drive_runner_unavailable(
     lease = HostLease(name=RUNNER_UNAVAILABLE_HOST, runner=fake_runner, is_local=False)
 
     with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
-        result = await worker._run_inflight_verify(item, lease)
+        result = await worker.verify_dispatch.run_inflight_verify(item, lease)
 
     records = [
         r for r in caplog.records

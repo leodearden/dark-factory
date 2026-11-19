@@ -21,7 +21,7 @@ REAL vs FAKED
 -------------
 REAL (composed as the genuine article, never hand-seeded): GitOps over a
 real git repo; ``derive_verify_plan``, ``classify_failure``, ``check_proposal``,
-``_run_post_merge_verify``, ``VerifyCmd`` + its mutators, ``VerifyAttempt``,
+``run_post_merge_verify``, ``VerifyCmd`` + its mutators, ``VerifyAttempt``,
 and ``ephemeral_worktree`` itself.
 
 FAKED (boundary only — the ssh/build/agent edges, never the decision layer):
@@ -95,12 +95,9 @@ from orchestrator.b3_gate import ABORT, FRESH, POST_MERGE_RED_MAIN_REASON_PREFIX
 from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.dry_run_unblock import run_dry_run_unblock
 from orchestrator.git_ops import PROTECTED_PREFIXES, GitOps, WorktreeKind, _run
-from orchestrator.merge_lane.worker import (
-    MergeRequest,
-    QueuedBranch,
-    _DryRunInvestigationHandles,
-    _run_post_merge_verify,
-)
+from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
+from orchestrator.merge_lane.verify_failure_outcome import DryRunInvestigationHandles
+from orchestrator.merge_lane.worker import MergeRequest, QueuedBranch
 from orchestrator.unblock_types import BlockClass, BlockRecord
 from orchestrator.verify import (
     CheckRun,
@@ -770,7 +767,7 @@ class _RealInvestigationVerifier(FakeVerifier):
 class TestMergeVerifyBlockProducesGateableProposal:
     """Scenario 9 — GOLDEN: a merge-verify RED (generic task-fault, non-timeout)
 
-    must, via the REAL (unpatched) _run_post_merge_verify + run_dry_run_unblock,
+    must, via the REAL (unpatched) run_post_merge_verify + run_dry_run_unblock,
     write a dry_run_proposals[] entry with block_class=MERGE_VERIFY_RED that
     b3_gate.check_proposal accepts as non-ABORT (B4) — closing the coverage
     gap where merge_queue's post-merge-verify block path produced a
@@ -783,11 +780,11 @@ class TestMergeVerifyBlockProducesGateableProposal:
     so the generic task-fault branch is reached rather than main-health-red),
     and orchestrator.dry_run_unblock.invoke_agent (-> a low-risk structured
     proposal). Everything else — GitOps, the real git_repo, the real
-    _run_post_merge_verify block path, the fire-and-forget spawn,
+    run_post_merge_verify block path, the fire-and-forget spawn,
     run_dry_run_unblock's own git-anchor capture, and check_proposal — runs
     for real.
 
-    RED until step-16 imports _run_post_merge_verify/_DryRunInvestigationHandles
+    RED until step-16 imports run_post_merge_verify/DryRunInvestigationHandles
     from orchestrator.merge_lane.worker, check_proposal/ABORT from
     orchestrator.b3_gate, BlockClass from orchestrator.unblock_types,
     VerifyResult from orchestrator.verify, and _RecordingScheduler/
@@ -802,7 +799,7 @@ class TestMergeVerifyBlockProducesGateableProposal:
         merge_wt.mkdir()
 
         scheduler = _RecordingScheduler({'dry_run_proposals': []})
-        handles = _DryRunInvestigationHandles(scheduler=scheduler)
+        handles = DryRunInvestigationHandles(scheduler=scheduler)
 
         compile_error_result = VerifyResult(
             passed=False,
@@ -847,7 +844,7 @@ class TestMergeVerifyBlockProducesGateableProposal:
                     return_value=True,
                 ),
             ):
-                outcome = await _run_post_merge_verify(
+                outcome = await run_post_merge_verify(
                     git_ops, req, merge_wt,
                     timeouts={},
                     enospc_retries={},

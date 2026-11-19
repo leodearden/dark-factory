@@ -12,7 +12,7 @@ Covers:
   * ``assemble_retry_verify_env`` — INV-3 tree-OID corroboration gate.
   * ``_load_reify_attempt_sidecar`` — the drift tripwire pinned to the REAL
     bytes reify writes (task 3059).
-  * ``_run_post_merge_verify`` wiring under ``req.retry_failed_only``.
+  * ``run_post_merge_verify`` wiring under ``req.retry_failed_only``.
 """
 from __future__ import annotations
 
@@ -445,7 +445,7 @@ def test_build_retry_verify_env_empty_subsets_still_write_files(tmp_path: Path) 
 
 
 # ---------------------------------------------------------------------------
-# _run_post_merge_verify wiring.  Guarded by req.retry_failed_only; the retry env
+# run_post_merge_verify wiring.  Guarded by req.retry_failed_only; the retry env
 # is merged into MergeVerifySpec.verify_env inside the classified-infra-transient
 # RETRY branch (task 3059) — never before the first dispatch, which would narrow
 # attempt-0 itself.  Driven on the LOCAL path (runner=None) so task 2822's
@@ -1310,7 +1310,7 @@ async def test_build_attempt0_payload_none_when_probe_fails(tmp_path: Path) -> N
 
 
 # ---------------------------------------------------------------------------
-# _run_post_merge_verify wiring — the task's HEADLINE user-observable signal
+# run_post_merge_verify wiring — the task's HEADLINE user-observable signal
 # (task 3059, step 19).
 #
 # The shipped D2 built the retry env BEFORE the first dispatch, from a
@@ -1424,9 +1424,9 @@ async def _run_wiring(
     enospc_retries: dict[str, int] | None = None,
     runner: MagicMock | None = None,
 ):
-    """Drive _run_post_merge_verify with a recording pool; LOCAL unless *runner* is given."""
+    """Drive run_post_merge_verify with a recording pool; LOCAL unless *runner* is given."""
+    from orchestrator.merge_lane import post_merge_verify as pmv
     from orchestrator.merge_lane import retry_verify_env as rve
-    from orchestrator.merge_lane import worker as mq
 
     pool_cls, specs = _recording_pool(results)
     git_ops = git_ops if git_ops is not None else _make_git_ops_mock()
@@ -1435,12 +1435,12 @@ async def _run_wiring(
         return list(_PROBED_PLANNED)
 
     with (
-        patch.object(mq, 'VerifyRunnerPool', pool_cls),
+        patch.object(pmv, 'VerifyRunnerPool', pool_cls),
         patch.object(
             rve, '_probe_nextest_planned', probe if probe is not None else _default_probe
         ),
     ):
-        outcome = await mq._run_post_merge_verify(
+        outcome = await pmv.run_post_merge_verify(
             git_ops, req, merge_wt,
             timeouts={}, enospc_retries=enospc_retries if enospc_retries is not None else {},
             max_timeouts=2, max_enospc=max_enospc,
@@ -1643,7 +1643,7 @@ async def test_a_non_narrowing_payload_keeps_the_legacy_budget(tmp_path: Path) -
 
 
 def _remote_runner_double() -> MagicMock:
-    """A remote VerifyRunner stand-in; it flips _run_post_merge_verify onto its remote fork."""
+    """A remote VerifyRunner stand-in; it flips run_post_merge_verify onto its remote fork."""
     runner = MagicMock()
     runner.name = 'laptop'
     runner.is_local = False

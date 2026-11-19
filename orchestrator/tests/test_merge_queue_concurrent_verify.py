@@ -4,7 +4,7 @@ This module covers γ-specific tests that require multi-host verify infrastructu
 Tests are grouped per plan step:
 
   pre-1  SCAFFOLD — shared fixtures/helpers (git repo, gated runner, fake remote)
-  step-1 RED      — _run_post_merge_verify(runner=<fake>) + runner=None byte-identical
+  step-1 RED      — run_post_merge_verify(runner=<fake>) + runner=None byte-identical
   step-3 RED      — _inflight/redispatch-park/_n_failed/_remerge_occurred attrs + InflightEntry
   step-5 RED      — _run_inflight_verify happy paths (LOCAL + REMOTE lease)
   step-7 RED      — _run_inflight_verify abort-poll (abandon + halt)
@@ -72,6 +72,7 @@ from orchestrator.merge_lane.types import QueuedBranch, RemergeBase, RemergeReas
 from orchestrator.merge_lane.verify_cancellation import VerifyCancel, VerifyCancelCause
 from orchestrator.merge_lane.worker import (
     MERGE_WORKER_SHUTDOWN_REASON,
+    PRODUCTION_VERIFIER,
     MergeOutcome,
     MergeRequest,
     SpeculativeItem,
@@ -436,13 +437,13 @@ def _inject_host_allocator(
 
 
 # ---------------------------------------------------------------------------
-# step-1 RED: _run_post_merge_verify(runner=<fake>) wiring
+# step-1 RED: run_post_merge_verify(runner=<fake>) wiring
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 class TestRunPostMergeVerifyRunnerParam:
-    """_run_post_merge_verify(runner=<fake>) dispatches on the injected runner;
+    """run_post_merge_verify(runner=<fake>) dispatches on the injected runner;
     runner=None (default) stays LOCAL-ONLY byte-identical.
 
     RED until step-2 GREEN adds the runner= keyword arg.
@@ -458,19 +459,20 @@ class TestRunPostMergeVerifyRunnerParam:
 
     async def test_remote_runner_dispatched_when_runner_provided(self, tmp_path: Path) -> None:
         """runner=<fake remote> → pool is [runner], fake.run_merge_verify called."""
-        from orchestrator.merge_lane.worker import _run_post_merge_verify
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
 
         fake_remote = _make_fake_remote('laptop')
         config = OrchestratorConfig(git=GitConfig(main_branch='main'))
         req = make_merge_request('t1', 'task/t1', tmp_path, config)
         git_ops = self._make_git_ops_mock()
 
-        outcome = await _run_post_merge_verify(
+        outcome = await run_post_merge_verify(
             git_ops, req, tmp_path,
             timeouts={}, enospc_retries={},
             max_timeouts=2, max_enospc=1,
             merge_sha='abc123',
             runner=fake_remote,  # RED: this param doesn't exist yet
+            verifier=PRODUCTION_VERIFIER,
         )
 
         assert outcome is None  # verify passed
@@ -478,13 +480,13 @@ class TestRunPostMergeVerifyRunnerParam:
 
     async def test_runner_none_uses_local_runner_byte_identical(self, tmp_path: Path) -> None:
         """runner=None (default) → LocalRunner pool, byte-identical to today."""
-        from orchestrator.merge_lane.worker import _run_post_merge_verify
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
 
         config = OrchestratorConfig(git=GitConfig(main_branch='main'))
         req = make_merge_request('t2', 'task/t2', tmp_path, config)
         git_ops = self._make_git_ops_mock()
 
-        outcome = await _run_post_merge_verify(
+        outcome = await run_post_merge_verify(
             git_ops, req, tmp_path,
             timeouts={}, enospc_retries={},
             max_timeouts=2, max_enospc=1,
@@ -498,7 +500,7 @@ class TestRunPostMergeVerifyRunnerParam:
     async def test_merge_verify_event_carries_runner_name_when_remote(self, tmp_path: Path) -> None:
         """merge_verify event runner field == injected runner's name, not 'local'."""
         from orchestrator.event_store import EventStore
-        from orchestrator.merge_lane.worker import _run_post_merge_verify
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
 
         fake_remote = _make_fake_remote('laptop')
         config = OrchestratorConfig(git=GitConfig(main_branch='main'))
@@ -514,13 +516,14 @@ class TestRunPostMergeVerifyRunnerParam:
             def emit(self, event_type, *, task_id=None, phase=None, data=None, **kw):  # type: ignore[override]
                 emitted.append({'event_type': event_type, 'data': data or {}})
 
-        await _run_post_merge_verify(
+        await run_post_merge_verify(
             git_ops, req, tmp_path,
             timeouts={}, enospc_retries={},
             max_timeouts=2, max_enospc=1,
             merge_sha='abc123',
             runner=fake_remote,   # RED: this param doesn't exist yet
             event_store=_FakeEventStore(),
+            verifier=PRODUCTION_VERIFIER,
         )
 
         merge_verify_events = [
@@ -537,7 +540,7 @@ class TestRunPostMergeVerifyRunnerParam:
 
 
 class TestInflightStateAttrs:
-    """SpeculativeMergeWorker exposes _inflight/redispatch-park/_n_failed/_remerge_occurred.
+    """SpeculativeMergeWorker exposes _inflight/redispatch-park/_n_failed.
     InflightEntry dataclass is importable from merge_queue.
 
     RED until step-4 GREEN adds the dataclass and initialises the attrs.
@@ -563,11 +566,6 @@ class TestInflightStateAttrs:
         """_n_failed starts False."""
         worker = self._make_worker(git_ops)
         assert worker._n_failed is False
-
-    def test_remerge_occurred_is_false(self, git_ops: GitOps) -> None:
-        """_remerge_occurred starts False."""
-        worker = self._make_worker(git_ops)
-        assert worker._remerge_occurred is False
 
     def test_inflight_entry_importable(self) -> None:
         """InflightEntry is importable from merge_queue."""
@@ -639,10 +637,10 @@ class TestRunInflightVerifyHappyPath:
         fake_local.is_local = True
         lease = HostLease(name='local', runner=fake_local, is_local=True)
 
-        count_before = worker._verify_attempt_count
-        result = await worker._run_inflight_verify(item, lease)  # RED: method doesn't exist
+        count_before = worker.verify_dispatch.verify_attempts()
+        result = await worker.verify_dispatch.run_inflight_verify(item, lease)  # RED: method doesn't exist
 
-        assert worker._verify_attempt_count == count_before + 1
+        assert worker.verify_dispatch.verify_attempts() == count_before + 1
         assert result.outcome is None  # pass
 
     async def test_local_lease_verify_phase_set_to_verifying(
@@ -660,7 +658,7 @@ class TestRunInflightVerifyHappyPath:
         lease = HostLease(name='local', runner=fake_local, is_local=True)
 
 
-        result = await worker._run_inflight_verify(item, lease)
+        result = await worker.verify_dispatch.run_inflight_verify(item, lease)
 
         # After completion result.outcome is None (pass)
         assert result.outcome is None
@@ -681,11 +679,11 @@ class TestRunInflightVerifyHappyPath:
         fake_remote = _make_fake_remote('laptop')
         lease = HostLease(name='laptop', runner=fake_remote, is_local=False)
 
-        count_before = worker._verify_attempt_count
-        result = await worker._run_inflight_verify(item, lease)  # RED: method doesn't exist
+        count_before = worker.verify_dispatch.verify_attempts()
+        result = await worker.verify_dispatch.run_inflight_verify(item, lease)  # RED: method doesn't exist
 
         # REMOTE path: warm-swap NOT run → attempt count unchanged
-        assert worker._verify_attempt_count == count_before
+        assert worker.verify_dispatch.verify_attempts() == count_before
         # runner.run_merge_verify called (remote dispatch path)
         fake_remote.run_merge_verify.assert_called_once()
         # outcome is None (pass)
@@ -704,7 +702,7 @@ class TestRunInflightVerifyHappyPath:
         fake_remote = _make_fake_remote('laptop2')
         lease = HostLease(name='laptop2', runner=fake_remote, is_local=False)
 
-        result = await worker._run_inflight_verify(item, lease)
+        result = await worker.verify_dispatch.run_inflight_verify(item, lease)
 
         assert result.merge_wt is not None
 
@@ -781,13 +779,13 @@ class TestRunInflightVerifyAbortPoll:
         )
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, q)
-        worker.VERIFY_ABANDON_POLL_SECS = 0.02  # fast polling for tests
+        worker.verify_dispatch.VERIFY_ABANDON_POLL_SECS = 0.02  # fast polling for tests
         worker._register_owned_merge_worktree(item.merge_wt)
 
         lease = HostLease(name='slow-abandon', runner=gated, is_local=False)
 
         # Start verify in background (gated runner blocks until gate_release)
-        verify_future = asyncio.ensure_future(worker._run_inflight_verify(item, lease))
+        verify_future = asyncio.ensure_future(worker.verify_dispatch.run_inflight_verify(item, lease))
 
         # Wait for the gated runner to enter
         await asyncio.wait_for(gate_entered.wait(), timeout=GATE_ENTRY_TIMEOUT)
@@ -796,7 +794,7 @@ class TestRunInflightVerifyAbortPoll:
         req.result.cancel()
 
         # Give poll loop a chance to fire (step-6: will not detect — no loop)
-        await asyncio.sleep(worker.VERIFY_ABANDON_POLL_SECS * 2)
+        await asyncio.sleep(worker.verify_dispatch.VERIFY_ABANDON_POLL_SECS * 2)
 
         # Release gate so RED case doesn't hang
         gate_release.set()
@@ -822,15 +820,15 @@ class TestRunInflightVerifyAbortPoll:
         )
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, q)
-        worker.VERIFY_ABANDON_POLL_SECS = 0.02
+        worker.verify_dispatch.VERIFY_ABANDON_POLL_SECS = 0.02
         worker._register_owned_merge_worktree(item.merge_wt)
 
         lease = HostLease(name='slow-wt', runner=gated, is_local=False)
 
-        verify_future = asyncio.ensure_future(worker._run_inflight_verify(item, lease))
+        verify_future = asyncio.ensure_future(worker.verify_dispatch.run_inflight_verify(item, lease))
         await asyncio.wait_for(gate_entered.wait(), timeout=GATE_ENTRY_TIMEOUT)
         req.result.cancel()
-        await asyncio.sleep(worker.VERIFY_ABANDON_POLL_SECS * 2)
+        await asyncio.sleep(worker.verify_dispatch.VERIFY_ABANDON_POLL_SECS * 2)
         gate_release.set()
 
         result = await verify_future
@@ -858,17 +856,17 @@ class TestRunInflightVerifyAbortPoll:
         )
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, q)
-        worker.VERIFY_ABANDON_POLL_SECS = 0.02
+        worker.verify_dispatch.VERIFY_ABANDON_POLL_SECS = 0.02
         worker._register_owned_merge_worktree(item.merge_wt)
 
         lease = HostLease(name='slow-halt', runner=gated, is_local=False)
 
-        verify_future = asyncio.ensure_future(worker._run_inflight_verify(item, lease))
+        verify_future = asyncio.ensure_future(worker.verify_dispatch.run_inflight_verify(item, lease))
         await asyncio.wait_for(gate_entered.wait(), timeout=GATE_ENTRY_TIMEOUT)
 
         worker.operator_halt('test: halt mid-verify')
 
-        await asyncio.sleep(worker.VERIFY_ABANDON_POLL_SECS * 2)
+        await asyncio.sleep(worker.verify_dispatch.VERIFY_ABANDON_POLL_SECS * 2)
         # Release gate so RED case doesn't hang
         gate_release.set()
 
@@ -893,16 +891,16 @@ class TestRunInflightVerifyAbortPoll:
         )
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, q)
-        worker.VERIFY_ABANDON_POLL_SECS = 0.02
+        worker.verify_dispatch.VERIFY_ABANDON_POLL_SECS = 0.02
         worker._register_owned_merge_worktree(item.merge_wt)
 
         lease = HostLease(name='slow-halt2', runner=gated, is_local=False)
 
-        verify_future = asyncio.ensure_future(worker._run_inflight_verify(item, lease))
+        verify_future = asyncio.ensure_future(worker.verify_dispatch.run_inflight_verify(item, lease))
         await asyncio.wait_for(gate_entered.wait(), timeout=GATE_ENTRY_TIMEOUT)
 
         worker.operator_halt('test: halt mid-verify')
-        await asyncio.sleep(worker.VERIFY_ABANDON_POLL_SECS * 2)
+        await asyncio.sleep(worker.verify_dispatch.VERIFY_ABANDON_POLL_SECS * 2)
         gate_release.set()
 
         await verify_future
@@ -989,7 +987,7 @@ class TestRunInflightVerifyRunnerUnavailable:
         lease = HostLease(name='dead-laptop', runner=dead_remote, is_local=False)
 
         # Should not raise — RunnerUnavailable is caught internally
-        result = await worker._run_inflight_verify(item, lease)
+        result = await worker.verify_dispatch.run_inflight_verify(item, lease)
 
         # GREEN: status sentinel set, merge_wt preserved for re-dispatch
         # RED: status=None (generic except catches RunnerUnavailable)
@@ -1016,7 +1014,7 @@ class TestRunInflightVerifyRunnerUnavailable:
 
         lease = HostLease(name='dead-laptop2', runner=dead_remote, is_local=False)
 
-        result = await worker._run_inflight_verify(item, lease)
+        result = await worker.verify_dispatch.run_inflight_verify(item, lease)
 
         # GREEN: merge_wt intact — item re-dispatched on another host with wt intact
         # RED: merge_wt=None (generic exception handler cleans it)
@@ -1802,7 +1800,7 @@ class TestFinalizeInflightNonPass:
 class TestSingleHostSerialByteIdentical:
     """SINGLE-HOST serial byte-identical via the restructured _verifier_loop.
 
-    RED until step-16 GREEN restructures _verifier_loop, adds _dispatch_item,
+    RED until step-16 GREEN restructures _verifier_loop, adds VerifyDispatcher.dispatch,
     and makes _verify_and_advance a thin compat shim.
 
     The two structural tests (test_dispatch_item_method_exists and
@@ -1812,22 +1810,14 @@ class TestSingleHostSerialByteIdentical:
     """
 
     # ------------------------------------------------------------------
-    # RED marker 1: _dispatch_item must exist on the class
+    # RED marker 1: VerifyDispatcher.dispatch must exist on the class
     # ------------------------------------------------------------------
 
     async def test_dispatch_item_method_exists(self, git_ops: GitOps) -> None:
-        """_dispatch_item is a callable on SpeculativeMergeWorker.
-
-        RED: method not yet added (step-16 adds it).
-        GREEN: step-16 adds _dispatch_item.
-        """
+        """The worker's verify dispatcher exposes ``dispatch`` (task 5040)."""
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, q)
-        assert callable(getattr(worker, '_dispatch_item', None)), (
-            '_dispatch_item not found on SpeculativeMergeWorker — '
-            'restructured loop not yet added (step-16). '
-            'RED: None (missing). GREEN: callable after step-16.'
-        )
+        assert callable(getattr(worker.verify_dispatch, 'dispatch', None))
 
     # ------------------------------------------------------------------
     # RED marker 2: _verifier_loop must update self._n_failed on the instance
@@ -2650,7 +2640,7 @@ class TestHaltAndUnavailable:
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, q, verifier=verifier)
         _inject_two_host_allocator(worker, gated_remote)
-        worker.VERIFY_ABANDON_POLL_SECS = 0.01  # fast abort-poll for determinism
+        worker.verify_dispatch.VERIFY_ABANDON_POLL_SECS = 0.01  # fast abort-poll for determinism
 
         loop = asyncio.get_running_loop()
         req_a = MergeRequest(
@@ -3610,7 +3600,7 @@ class TestRunInflightVerifyRemoteCancelOnAbort:
         )
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, q)
-        worker.VERIFY_ABANDON_POLL_SECS = 0.02
+        worker.verify_dispatch.VERIFY_ABANDON_POLL_SECS = 0.02
         worker._register_owned_merge_worktree(item.merge_wt)
 
         lease = HostLease(name='rca-abandon', runner=gated, is_local=False)
@@ -3623,7 +3613,7 @@ class TestRunInflightVerifyRemoteCancelOnAbort:
             return 0
         gated.cancel_verify = AsyncMock(side_effect=_signaling_cancel)
 
-        verify_future = asyncio.ensure_future(worker._run_inflight_verify(item, lease))
+        verify_future = asyncio.ensure_future(worker.verify_dispatch.run_inflight_verify(item, lease))
 
         # Wait for the gated runner to enter verify
         await asyncio.wait_for(gate_entered.wait(), timeout=5.0)
@@ -3671,7 +3661,7 @@ class TestRunInflightVerifyRemoteCancelOnAbort:
         )
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, q)
-        worker.VERIFY_ABANDON_POLL_SECS = 0.02
+        worker.verify_dispatch.VERIFY_ABANDON_POLL_SECS = 0.02
         worker._register_owned_merge_worktree(item.merge_wt)
 
         lease = HostLease(name='rca-halt', runner=gated, is_local=False)
@@ -3688,7 +3678,7 @@ class TestRunInflightVerifyRemoteCancelOnAbort:
 
         gated.cancel_verify = AsyncMock(side_effect=_record_cancel)
 
-        verify_future = asyncio.ensure_future(worker._run_inflight_verify(item, lease))
+        verify_future = asyncio.ensure_future(worker.verify_dispatch.run_inflight_verify(item, lease))
         await asyncio.wait_for(gate_entered.wait(), timeout=5.0)
 
         worker.operator_halt('test: halt mid-verify')
@@ -3736,7 +3726,7 @@ class TestRunInflightVerifyRemoteCancelOnAbort:
         gate_entered = asyncio.Event()
 
         # Gated scoped verify, injected through the worker's verifier port, so
-        # the local arm blocks inside _run_post_merge_verify until released.
+        # the local arm blocks inside run_post_merge_verify until released.
         verifier = _GatedVerifier(
             entered={None: gate_entered}, default=hangs_until(gate_release),
         )
@@ -3746,7 +3736,7 @@ class TestRunInflightVerifyRemoteCancelOnAbort:
         )
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, q, verifier=verifier)
-        worker.VERIFY_ABANDON_POLL_SECS = 0.02
+        worker.verify_dispatch.VERIFY_ABANDON_POLL_SECS = 0.02
         worker._register_owned_merge_worktree(item.merge_wt)
 
         # LOCAL lease — runner is a MagicMock that has cancel_verify as AsyncMock
@@ -3756,7 +3746,7 @@ class TestRunInflightVerifyRemoteCancelOnAbort:
         lease = HostLease(name='local', runner=mock_runner, is_local=True)
 
         verify_future = asyncio.ensure_future(
-            worker._run_inflight_verify(item, lease)
+            worker.verify_dispatch.run_inflight_verify(item, lease)
         )
         await asyncio.wait_for(gate_entered.wait(), timeout=GATE_ENTRY_TIMEOUT)
 
@@ -5345,7 +5335,7 @@ class TestRedispatchSpeculativeConservation:
     test_merge_queue_resource_audit.py.
 
     MECHANISM — the production route to a speculative item on
-    the redispatch park: ``_dispatch_item`` passes its ``free_host_count()``
+    the redispatch park: ``VerifyDispatcher.dispatch`` passes its ``free_host_count()``
     guard, then a concurrent non-loop acquirer takes the free slot before its
     ``acquire()``.  That acquirer is
     ``orchestrator/src/orchestrator/merge_drift.py::_run_drift_check``, which

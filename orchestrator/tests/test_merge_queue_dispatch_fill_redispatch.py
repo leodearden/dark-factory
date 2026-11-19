@@ -543,7 +543,7 @@ class TestHostFreedWhileHeadVerifies:
         self, git_ops: GitOps, config: OrchestratorConfig,
     ) -> None:
         async with _running_lane(git_ops, config) as lane:
-            lane.worker.VERIFY_ABANDON_POLL_SECS = _FAST_POLL_SECS
+            lane.worker.verify_dispatch.VERIFY_ABANDON_POLL_SECS = _FAST_POLL_SECS
             await lane.allocator.quarantine_and_release(_remote_lease(lane))
 
             await lane.enqueue(LONG_HEAD)
@@ -587,7 +587,7 @@ class TestHostFreedWhileHeadVerifies:
         async with _running_lane(
             git_ops, prefer_remote, remote=_unavailable_once_remote,
         ) as lane:
-            lane.worker.VERIFY_ABANDON_POLL_SECS = _FAST_POLL_SECS
+            lane.worker.verify_dispatch.VERIFY_ABANDON_POLL_SECS = _FAST_POLL_SECS
             await lane.enqueue(LONG_HEAD)
             await lane.enqueue(WAITER)
             await lane.settle(
@@ -628,7 +628,7 @@ class TestHostFreedWhileHeadVerifies:
         must dispatch it with no further submission to wake the loop.
         """
         async with _running_lane(git_ops, config) as lane:
-            lane.worker.VERIFY_ABANDON_POLL_SECS = _FAST_POLL_SECS
+            lane.worker.verify_dispatch.VERIFY_ABANDON_POLL_SECS = _FAST_POLL_SECS
             await lane.allocator.quarantine_and_release(_remote_lease(lane))
             drift_check_lease = lane.allocator.acquire_local(lambda: lane.remote)
             assert drift_check_lease is not None
@@ -738,7 +738,7 @@ class TestHostFreedWhileHeadVerifies:
         """
         prefer_local = config.model_copy(update={'verify_host_policy': 'prefer_local'})
         async with _running_lane(git_ops, prefer_local, remote=_unavailable_once_remote) as lane:
-            lane.worker.VERIFY_ABANDON_POLL_SECS = _FAST_POLL_SECS
+            lane.worker.verify_dispatch.VERIFY_ABANDON_POLL_SECS = _FAST_POLL_SECS
             resolved: list[str] = []
 
             async def _enqueue_tracked(task_id: str) -> None:
@@ -817,7 +817,7 @@ class TestHostFreedWhileHeadVerifies:
         prefer_local = config.model_copy(update={'verify_host_policy': 'prefer_local'})
         wire_shape_remote = functools.partial(_unavailable_once_remote, kind='wire_shape')
         async with _running_lane(git_ops, prefer_local, remote=wire_shape_remote) as lane:
-            lane.worker.VERIFY_ABANDON_POLL_SECS = _FAST_POLL_SECS
+            lane.worker.verify_dispatch.VERIFY_ABANDON_POLL_SECS = _FAST_POLL_SECS
             await lane.enqueue(HEAD)
             await lane.settle(
                 lambda: _hosts_of(lane) == {'local': [HEAD]},
@@ -979,7 +979,7 @@ class TestGateReverifyDoesNotParkTheLoop:
     ) -> None:
         verifier = _GateVerifier()
         async with _running_lane(git_ops, config, verifier=verifier) as lane:
-            lane.worker.VERIFY_ABANDON_POLL_SECS = _FAST_POLL_SECS
+            lane.worker.verify_dispatch.VERIFY_ABANDON_POLL_SECS = _FAST_POLL_SECS
             head, _drift = await _gate_head(lane, verifier)
             assert _hosts_of(lane) == {'local': [GATED_HEAD]}, lane.observed()
             progress = lane.worker.snapshot()['verify_in_progress']
@@ -1007,7 +1007,7 @@ class TestGateReverifyDoesNotParkTheLoop:
     ) -> None:
         verifier = _GateVerifier()
         async with _running_lane(git_ops, config, verifier=verifier) as lane:
-            lane.worker.VERIFY_ABANDON_POLL_SECS = _FAST_POLL_SECS
+            lane.worker.verify_dispatch.VERIFY_ABANDON_POLL_SECS = _FAST_POLL_SECS
             head, drift = await _gate_head(lane, verifier)
             waiter = await lane.enqueue(GATE_WAITER)
             await lane.settle(
@@ -1044,7 +1044,7 @@ class TestGateReverifyDoesNotParkTheLoop:
             gate_result=fails(category='test_failure', summary='gate re-verify red').result,
         )
         async with _running_lane(git_ops, config, verifier=verifier) as lane:
-            lane.worker.VERIFY_ABANDON_POLL_SECS = _FAST_POLL_SECS
+            lane.worker.verify_dispatch.VERIFY_ABANDON_POLL_SECS = _FAST_POLL_SECS
             head, _drift = await _gate_head(lane, verifier)
             waiter = await lane.enqueue(GATE_WAITER)
             await lane.settle(
@@ -1072,7 +1072,7 @@ class TestGateReverifyDoesNotParkTheLoop:
         async with _running_lane(
             git_ops, config, verifier=verifier, extra_remote_names=('laptop2',),
         ) as lane:
-            lane.worker.VERIFY_ABANDON_POLL_SECS = _FAST_POLL_SECS
+            lane.worker.verify_dispatch.VERIFY_ABANDON_POLL_SECS = _FAST_POLL_SECS
             head, _drift = await _gate_head(lane, verifier)
             waiter = await lane.enqueue(GATE_WAITER)
             await lane.settle(
@@ -1101,7 +1101,7 @@ class TestGateReverifyDoesNotParkTheLoop:
     ) -> None:
         verifier = _GateVerifier()
         async with _running_lane(git_ops, config, verifier=verifier) as lane:
-            lane.worker.VERIFY_ABANDON_POLL_SECS = _FAST_POLL_SECS
+            lane.worker.verify_dispatch.VERIFY_ABANDON_POLL_SECS = _FAST_POLL_SECS
             head, _drift = await _gate_head(lane, verifier)
             await _land_another_foreign_commit(lane.git_ops.project_root)
             second_drift = await lane.git_ops.get_main_sha()
@@ -1146,7 +1146,7 @@ class TestGateReverifyDoesNotParkTheLoop:
     ) -> None:
         verifier = _GateVerifier()
         async with _running_lane(git_ops, config, verifier=verifier) as lane:
-            lane.worker.VERIFY_ABANDON_POLL_SECS = _FAST_POLL_SECS
+            lane.worker.verify_dispatch.VERIFY_ABANDON_POLL_SECS = _FAST_POLL_SECS
             head, drift = await _gate_head(lane, verifier)
             assert lane.run_task is not None
 

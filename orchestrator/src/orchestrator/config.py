@@ -4418,7 +4418,7 @@ class OrchestratorConfig(BaseSettings):
     # local RunnerUnavailable -> fail-safe (trust the remote green, emit
     # verify_cross_check_inconclusive).  Default True is safety-first per the
     # loud-over-silent norm AND provably INERT on main today: reify's
-    # verify_runners is not yet enabled, so _run_post_merge_verify always gets
+    # verify_runners is not yet enabled, so merge_lane/post_merge_verify.py::run_post_merge_verify always gets
     # runner=None (local dispatch path) and the ``runner is not None``
     # cross-check branch never executes — zero behaviour change until Lever C
     # is turned on.  UNLIKE its restart-only merge_verify_workspace /

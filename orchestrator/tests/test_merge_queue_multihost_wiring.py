@@ -2,7 +2,7 @@
 
 Covers:
   - _build_remote_runners helper (step-5 RED / step-6 GREEN)
-  - _run_post_merge_verify pool wiring + dispatching-host scope derivation
+  - run_post_merge_verify pool wiring + dispatching-host scope derivation
     + cold-shadow guard (step-7 RED / step-8 GREEN)
   - _run_drift_check + _maybe_run_drift_check + land-hook integration
     (step-9 RED / step-10 GREEN)
@@ -235,7 +235,7 @@ class TestBuildRemoteRunnersGatePaths:
 
 
 # ---------------------------------------------------------------------------
-# Helpers for _run_post_merge_verify / _run_cold_shadow_verify tests
+# Helpers for run_post_merge_verify / _run_cold_shadow_verify tests
 # ---------------------------------------------------------------------------
 
 
@@ -346,28 +346,28 @@ class _BodyVerifier(FakeVerifier):
 
 
 # ---------------------------------------------------------------------------
-# step-7: _run_post_merge_verify pool wiring + scope derivation + cold-shadow guard — RED
+# step-7: run_post_merge_verify pool wiring + scope derivation + cold-shadow guard — RED
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 class TestRunPostMergeVerifyPoolWiring:
-    """_run_post_merge_verify builds a multi-runner pool when verify_runners are configured."""
+    """run_post_merge_verify builds a multi-runner pool when verify_runners are configured."""
 
     async def test_pool_includes_remote_runner(self, tmp_path):
-        """β decision 6: _run_post_merge_verify is LOCAL-ONLY even when verify_runners configured.
+        """β decision 6: run_post_merge_verify is LOCAL-ONLY even when verify_runners configured.
 
         The remote is NOT in the pool (slot accounting is γ's job).
         Runner in the merge_verify event must be 'local'.
         """
-        from orchestrator.merge_lane.worker import _run_post_merge_verify
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
 
         config = probe_free_orch_config(verify_runners=[_make_runner_cfg('laptop')])
         req = merge_request_for_verify(config, task_files=['src/foo.py'], worktree=tmp_path)
         git_ops = git_ops_mock_for_verify()
         es = _RecordingEventStore()
 
-        outcome = await _run_post_merge_verify(
+        outcome = await run_post_merge_verify(
             git_ops, req, tmp_path,
             timeouts={}, enospc_retries={},
             max_timeouts=2, max_enospc=1,
@@ -384,7 +384,7 @@ class TestRunPostMergeVerifyPoolWiring:
 
     async def test_dispatching_host_derives_task_files_when_enabled_runners(self, tmp_path):
         """With enabled runner + task_files=None, derivation runs on dispatching host."""
-        from orchestrator.merge_lane.worker import _run_post_merge_verify
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
 
         config = probe_free_orch_config(verify_runners=[_make_runner_cfg('laptop')])
         req = merge_request_for_verify(config, task_files=None, worktree=tmp_path)
@@ -398,7 +398,7 @@ class TestRunPostMergeVerifyPoolWiring:
         # computes it.
         verifier = _RecordingVerifier()
 
-        await _run_post_merge_verify(
+        await run_post_merge_verify(
             git_ops, req, merge_wt,
             timeouts={}, enospc_retries={},
             max_timeouts=2, max_enospc=1,
@@ -412,9 +412,9 @@ class TestRunPostMergeVerifyPoolWiring:
         assert verifier.scoped_calls[0]['task_files'] == ('src/x.py',)
 
     async def test_gate_no_derivation_when_no_enabled_runners(self, tmp_path):
-        """With no enabled runners + task_files=None, _run_post_merge_verify does NOT
+        """With no enabled runners + task_files=None, run_post_merge_verify does NOT
         proactively call _derive_task_files_from_git (Lever C gate — byte-identical path)."""
-        from orchestrator.merge_lane.worker import _run_post_merge_verify
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
 
         config = probe_free_orch_config(verify_runners=[])  # Lever C off
         req = merge_request_for_verify(config, task_files=None, worktree=tmp_path)
@@ -427,7 +427,7 @@ class TestRunPostMergeVerifyPoolWiring:
 
         verifier = _RecordingVerifier()
 
-        await _run_post_merge_verify(
+        await run_post_merge_verify(
             git_ops, req, merge_wt,
             timeouts={}, enospc_retries={},
             max_timeouts=2, max_enospc=1,
@@ -443,14 +443,14 @@ class TestRunPostMergeVerifyPoolWiring:
 
 
 # ---------------------------------------------------------------------------
-# Task 2307 step-5 RED: _run_post_merge_verify recognizes alpha's flock-
+# Task 2307 step-5 RED: run_post_merge_verify recognizes alpha's flock-
 # contention discriminant -> files born-at-L2 + blocks the merge.
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 class TestRunPostMergeVerifyFlockContention:
-    """_run_post_merge_verify recognizes the flock-contention VerifyResult (task 2307 step-5).
+    """run_post_merge_verify recognizes the flock-contention VerifyResult (task 2307 step-5).
 
     RED until step-6 GREEN threads escalation_queue and adds the recognition
     branch to the `if not verify.passed:` block.
@@ -463,7 +463,7 @@ class TestRunPostMergeVerifyFlockContention:
         return stub
 
     async def test_contention_result_blocks_and_files_born_at_l2(self, tmp_path):
-        from orchestrator.merge_lane.worker import _run_post_merge_verify
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
         from orchestrator.verify_runner import make_flock_contention_result
 
         config = probe_free_orch_config()
@@ -474,13 +474,14 @@ class TestRunPostMergeVerifyFlockContention:
         )
         fake_eq = _FakeEscalationQueue(open_l1=False)
 
-        outcome = await _run_post_merge_verify(
+        outcome = await run_post_merge_verify(
             git_ops, req, tmp_path,
             timeouts={}, enospc_retries={},
             max_timeouts=2, max_enospc=1,
             merge_sha='abc123',
             runner=stub_remote,
             escalation_queue=fake_eq,
+            verifier=PRODUCTION_VERIFIER,
         )
 
         # (1) merge is blocked, tagged with the contention category
@@ -500,7 +501,7 @@ class TestRunPostMergeVerifyFlockContention:
 
     async def test_non_contention_failure_invariant_no_escalation(self, tmp_path):
         """INVARIANT: a plain non-contention passed=False result files no escalation."""
-        from orchestrator.merge_lane.worker import _run_post_merge_verify
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
 
         config = probe_free_orch_config()
         req = merge_request_for_verify(config, task_files=['src/foo.py'], worktree=tmp_path)
@@ -512,13 +513,14 @@ class TestRunPostMergeVerifyFlockContention:
         stub_remote = self._make_stub_remote(plain_fail)
         fake_eq = _FakeEscalationQueue(open_l1=False)
 
-        outcome = await _run_post_merge_verify(
+        outcome = await run_post_merge_verify(
             git_ops, req, tmp_path,
             timeouts={}, enospc_retries={},
             max_timeouts=2, max_enospc=1,
             merge_sha='abc123',
             runner=stub_remote,
             escalation_queue=fake_eq,
+            verifier=PRODUCTION_VERIFIER,
         )
 
         assert outcome is not None
@@ -527,7 +529,7 @@ class TestRunPostMergeVerifyFlockContention:
 
     async def test_contention_result_none_safe_without_escalation_queue(self, tmp_path):
         """NONE-SAFE: a contention result with escalation_queue omitted still blocks, no raise."""
-        from orchestrator.merge_lane.worker import _run_post_merge_verify
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
         from orchestrator.verify_runner import make_flock_contention_result
 
         config = probe_free_orch_config()
@@ -537,13 +539,14 @@ class TestRunPostMergeVerifyFlockContention:
             make_flock_contention_result(host='leo-laptop', holder_pgid=4242, waiter_pgid=4343)
         )
 
-        outcome = await _run_post_merge_verify(
+        outcome = await run_post_merge_verify(
             git_ops, req, tmp_path,
             timeouts={}, enospc_retries={},
             max_timeouts=2, max_enospc=1,
             merge_sha='abc123',
             runner=stub_remote,
             # escalation_queue omitted — must default to None and not raise
+            verifier=PRODUCTION_VERIFIER,
         )
 
         assert outcome is not None
@@ -552,25 +555,25 @@ class TestRunPostMergeVerifyFlockContention:
 
 @pytest.mark.asyncio
 class TestRunPostMergeVerifyLocalOnly:
-    """β step-17: _run_post_merge_verify is LOCAL-ONLY for all direct callers (decision 6)."""
+    """β step-17: run_post_merge_verify is LOCAL-ONLY for all direct callers (decision 6)."""
 
     async def test_post_merge_verify_dispatches_to_local_not_remote(self, tmp_path):
         """With enabled_verify_runners set, the verify still dispatches to 'local' (β decision 6).
 
         This is the inversion of the shipped prefer-remote behaviour.  Before β the pool
         included the remote, so the emitted runner was 'laptop'.  After β the pool is
-        local-only: the remote is NEVER dispatched from _run_post_merge_verify directly.
+        local-only: the remote is NEVER dispatched from run_post_merge_verify directly.
 
         Fails on current main (today routes to 'laptop') — RED for step-17.
         """
-        from orchestrator.merge_lane.worker import _run_post_merge_verify
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
 
         config = probe_free_orch_config(verify_runners=[_make_runner_cfg('laptop')])
         req = merge_request_for_verify(config, task_files=['src/foo.py'], worktree=tmp_path)
         git_ops = git_ops_mock_for_verify()
         es = _RecordingEventStore()
 
-        outcome = await _run_post_merge_verify(
+        outcome = await run_post_merge_verify(
             git_ops, req, tmp_path,
             timeouts={}, enospc_retries={},
             max_timeouts=2, max_enospc=1,
@@ -583,7 +586,7 @@ class TestRunPostMergeVerifyLocalOnly:
         assert 'merge_verify' in es.types()
         # β decision 6: must be 'local', NOT 'laptop'
         assert es.field('runner') == ['local'], (
-            "β: _run_post_merge_verify must dispatch to 'local' even when verify_runners is set "
+            "β: run_post_merge_verify must dispatch to 'local' even when verify_runners is set "
             f"(got: {es.field('runner')!r})"
         )
 
@@ -633,7 +636,7 @@ class TestCrossCheckHoldsLaneLockLease:
         import contextlib as _contextlib
 
         from orchestrator.event_store import EventStore
-        from orchestrator.merge_lane.worker import _run_post_merge_verify
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
 
         config = _cross_check_config()
         # task_files non-None → dispatching-host derivation is skipped.
@@ -667,7 +670,7 @@ class TestCrossCheckHoldsLaneLockLease:
             def emit(self, event_type, *, task_id=None, phase=None, data=None, **kw):
                 pass
 
-        outcome = await _run_post_merge_verify(
+        outcome = await run_post_merge_verify(
             git_ops, req, merge_wt,
             timeouts={}, enospc_retries={},
             max_timeouts=2, max_enospc=1,
@@ -701,7 +704,7 @@ class TestCrossCheckHoldsLaneLockLease:
         import contextlib as _contextlib
 
         from orchestrator.event_store import EventStore
-        from orchestrator.merge_lane.worker import _run_post_merge_verify
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
 
         # Warm-lane regime OFF → the lease must be SKIPPED (no contenders to
         # exclude). Cross-check itself stays ON so the verify still fires.
@@ -735,7 +738,7 @@ class TestCrossCheckHoldsLaneLockLease:
             def emit(self, event_type, *, task_id=None, phase=None, data=None, **kw):
                 pass
 
-        outcome = await _run_post_merge_verify(
+        outcome = await run_post_merge_verify(
             git_ops, req, merge_wt,
             timeouts={}, enospc_retries={},
             max_timeouts=2, max_enospc=1,
@@ -772,7 +775,7 @@ class TestCrossCheckLeaseContentionFailsSafe:
     adjacent RunnerUnavailable fail-safe + DriftDetector Invariant 5).
 
     step-5 RED: today MergeVerifyLeaseContended has NO handler in the
-    cross-check, so it propagates out of _run_post_merge_verify — the call
+    cross-check, so it propagates out of run_post_merge_verify — the call
     RAISES instead of returning None.
     """
 
@@ -781,7 +784,7 @@ class TestCrossCheckLeaseContentionFailsSafe:
 
         from orchestrator.event_store import EventStore
         from orchestrator.git_ops import MergeVerifyLeaseContended
-        from orchestrator.merge_lane.worker import _run_post_merge_verify
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
         from orchestrator.verify_cancel import lane_lock_path
 
         config = _cross_check_config()
@@ -814,14 +817,14 @@ class TestCrossCheckLeaseContentionFailsSafe:
         quarantine: set[str] = set()
         fake_eq = _FakeEscalationQueue(open_l1=False)
 
-        outcome = await _run_post_merge_verify(
+        outcome = await run_post_merge_verify(
             git_ops, req, merge_wt,
             timeouts={}, enospc_retries={},
             max_timeouts=2, max_enospc=1,
             event_store=FakeEventStore(),
             merge_sha='abc123',
             runner=fake_remote,
-            quarantine=quarantine.add,
+            quarantine_divergent=quarantine.add,
             escalation_queue=fake_eq,
             verifier=verifier,
         )
@@ -1626,7 +1629,7 @@ class TestRunInflightVerifyRunnerUnavailableSpecWarm:
         # A LOCAL lease verifies through the injected port (the pool wraps
         # verifier.run_scoped in its LocalRunner), so scripting the port to
         # raise is how a local-lease RU is reached without substituting
-        # _run_post_merge_verify.
+        # run_post_merge_verify.
         worker = SpeculativeMergeWorker(
             git_ops=git_ops, queue=q,
             verifier=FakeVerifier(default=raises(
@@ -1645,7 +1648,7 @@ class TestRunInflightVerifyRunnerUnavailableSpecWarm:
         fake_local = runner_double('local', is_local=True)
         lease = HostLease(name='local', runner=fake_local, is_local=True)
 
-        result = await worker._run_inflight_verify(item, lease)
+        result = await worker.verify_dispatch.run_inflight_verify(item, lease)
 
         assert result.status == 'RUNNER_UNAVAILABLE'
         assert result.merge_wt == lane, 'the warm lane is the worktree handed to the chokepoint'
@@ -1680,7 +1683,7 @@ class TestRunInflightVerifyRunnerUnavailableSpecWarm:
         )
         lease = HostLease(name='leo-laptop', runner=fake_runner, is_local=False)
 
-        result = await worker._run_inflight_verify(item, lease)
+        result = await worker.verify_dispatch.run_inflight_verify(item, lease)
 
         assert result.status == 'RUNNER_UNAVAILABLE'
         assert result.merge_wt == cold_wt
@@ -1689,7 +1692,7 @@ class TestRunInflightVerifyRunnerUnavailableSpecWarm:
 
 # ---------------------------------------------------------------------------
 # Task 2307 step-7 RED: production wiring — _run_inflight_verify threads the
-# worker's escalation queue into _run_post_merge_verify, so a laptop-side
+# worker's escalation queue into run_post_merge_verify, so a laptop-side
 # flock-contention VerifyResult can reach the born-at-L2 alarm (step-6).
 # ---------------------------------------------------------------------------
 
@@ -1740,7 +1743,7 @@ class TestRunInflightVerifyThreadsEscalationQueue:
         )
         lease = HostLease(name='leo-laptop', runner=fake_runner, is_local=False)
 
-        await worker._run_inflight_verify(item, lease)
+        await worker.verify_dispatch.run_inflight_verify(item, lease)
 
         assert len(worker_eq.submitted) == 1, (
             '_run_inflight_verify must pass escalation_queue=self._escalation_queue '
@@ -2177,7 +2180,7 @@ class TestAlarmVerifyWorktreeContention:
     """
 
     def _call(self, eq, *, host='leo-laptop', holder_pgid: int | None = 4242, waiter_pgid: int | None = 4343):
-        from orchestrator.merge_lane.worker import _alarm_verify_worktree_contention
+        from orchestrator.merge_lane.verify_failure_outcome import _alarm_verify_worktree_contention
         _alarm_verify_worktree_contention(
             eq, host=host, holder_pgid=holder_pgid, waiter_pgid=waiter_pgid,
         )
@@ -2213,7 +2216,9 @@ class TestAlarmVerifyWorktreeContention:
         assert eq.submitted[0].category == 'verify_worktree_contention'
 
     def test_escalation_task_id_is_per_host_sentinel(self):
-        from orchestrator.merge_lane.worker import _verify_worktree_contention_sentinel
+        from orchestrator.merge_lane.verify_failure_outcome import (
+            _verify_worktree_contention_sentinel,
+        )
         eq = _FakeEscalationQueue(open_l1=False)
         self._call(eq, host='leo-laptop')
         assert eq.submitted[0].task_id == _verify_worktree_contention_sentinel('leo-laptop')
@@ -4147,7 +4152,7 @@ class TestLocalQuarantineIsLoud:
 
 @pytest.mark.asyncio
 class TestRunPostMergeVerifyRemoteStderrWiring:
-    """_run_post_merge_verify passes archive_root into the remote pool (task 1920 step-9/10)."""
+    """run_post_merge_verify passes archive_root into the remote pool (task 1920 step-9/10)."""
 
     async def test_remote_stderr_archived_under_data_verify_logs(self, tmp_path):
         """runner=RemoteRunner + failing result → stderr archived to
@@ -4156,7 +4161,7 @@ class TestRunPostMergeVerifyRemoteStderrWiring:
         Fails now: merge_queue.py:897-901 builds VerifyRunnerPool without archive_root
         so dispatch threads archive_root=None and no file is written.
         """
-        from orchestrator.merge_lane.worker import _run_post_merge_verify
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
         from orchestrator.verify import VerifyResult
         from orchestrator.verify_runner import result_to_json
 
@@ -4204,13 +4209,14 @@ class TestRunPostMergeVerifyRemoteStderrWiring:
             def emit(self, event_type, *, task_id=None, phase=None, data=None, **kw):
                 pass  # swallow events for this test
 
-        await _run_post_merge_verify(
+        await run_post_merge_verify(
             git_ops, req, tmp_path,
             timeouts={}, enospc_retries={},
             max_timeouts=2, max_enospc=1,
             event_store=FakeEventStore(),
             merge_sha='abc123',
             runner=remote_runner,
+            verifier=PRODUCTION_VERIFIER,
         )
 
         # Assert: exactly one file under data/verify-logs/<task_id>/
@@ -4451,7 +4457,7 @@ class TestQuarantineUnreachableHostChokepoint:
 
 # ---------------------------------------------------------------------------
 # 3043/step-7 RED: _run_inflight_verify must never orphan its inner
-# _run_post_merge_verify task (INV-C)
+# run_post_merge_verify task (INV-C)
 # ---------------------------------------------------------------------------
 
 
@@ -4472,7 +4478,7 @@ class TestRunInflightVerifyNeverOrphansVerifyTask:
     ``BaseException`` caught by NONE of the method's handlers
     (``except RunnerUnavailable``, ``except (MergeVerifyLeaseContended,
     MergeVerifyLeaseHeld)``, ``except Exception``), so the outer ends CANCELLED
-    while the INNER ``_run_post_merge_verify`` keeps running against the down
+    while the INNER ``run_post_merge_verify`` keeps running against the down
     host.  When it finally raises, nobody retrieves the exception: no
     VerifyResult, no quarantine, no tracker entry — the host is stranded out of
     the pool with nothing for the reprobe sweep to re-adopt.
@@ -4489,7 +4495,7 @@ class TestRunInflightVerifyNeverOrphansVerifyTask:
             git_ops=git_ops, queue=q,
             verifier=verifier if verifier is not None else FakeVerifier(),
         )
-        worker.VERIFY_ABANDON_POLL_SECS = 0.01
+        worker.verify_dispatch.VERIFY_ABANDON_POLL_SECS = 0.01
 
         merge_result = MagicMock()
         merge_result.merge_commit = 'abc123def456789abc1'
@@ -4510,7 +4516,7 @@ class TestRunInflightVerifyNeverOrphansVerifyTask:
         The verify BODY is the seam here: a remote lease dispatches
         ``runner=<this runner>``, which builds a single-runner pool with no
         local anchor to fall back on — so whatever *on_verify* does happens
-        inside the REAL inner ``_run_post_merge_verify`` task, which is the
+        inside the REAL inner ``run_post_merge_verify`` task, which is the
         task the orphan guard is about.  ``runner.entered`` collects that
         inner task, so a caller can wait for the dispatch instead of scanning
         the loop for a stand-in coroutine's name.
@@ -4531,13 +4537,13 @@ class TestRunInflightVerifyNeverOrphansVerifyTask:
         return HostLease(name=name, runner=runner, is_local=False)
 
     def _pending_inner_verifies(self) -> list:
-        """Pending tasks still running the inner _run_post_merge_verify."""
+        """Pending tasks still running the inner run_post_merge_verify."""
         out = []
         for t in asyncio.all_tasks():
             if t.done() or t is asyncio.current_task():
                 continue
             coro = getattr(t, 'get_coro', lambda: None)()
-            if '_run_post_merge_verify' in getattr(coro, '__qualname__', ''):
+            if 'run_post_merge_verify' in getattr(coro, '__qualname__', ''):
                 out.append(t)
         return out
 
@@ -4559,7 +4565,7 @@ class TestRunInflightVerifyNeverOrphansVerifyTask:
 
         if dispatched is None:
             dispatched = getattr(lease.runner, 'entered', [])
-        outer = asyncio.ensure_future(worker._run_inflight_verify(item, lease))
+        outer = asyncio.ensure_future(worker.verify_dispatch.run_inflight_verify(item, lease))
         for _ in range(200):
             await asyncio.sleep(0.01)
             if dispatched or worker._host_quarantine.quarantined_hosts():
@@ -4595,7 +4601,7 @@ class TestRunInflightVerifyNeverOrphansVerifyTask:
         inner = lease.runner.entered
         assert inner, 'the verify never reached the host'
         assert inner[0].done(), (
-            'inner _run_post_merge_verify task outlived the cancelled outer '
+            'inner run_post_merge_verify task outlived the cancelled outer '
             'coroutine — this is the Task-350 orphan'
         )
         assert self._pending_inner_verifies() == []
@@ -4725,7 +4731,7 @@ class TestRunInflightVerifyNeverOrphansVerifyTask:
             raise RunnerUnavailable(_INCIDENT_RU_MSG)
 
         worker, item = self._make_worker_and_item(tmp_path)
-        result = await worker._run_inflight_verify(
+        result = await worker.verify_dispatch.run_inflight_verify(
             item, self._remote_lease(on_verify=_unavailable),
         )
 
@@ -4747,7 +4753,7 @@ class TestRunInflightVerifyNeverOrphansVerifyTask:
             raise RunnerUnavailable(_INCIDENT_RU_MSG)
 
         worker, item = self._make_worker_and_item(tmp_path)
-        await worker._run_inflight_verify(
+        await worker.verify_dispatch.run_inflight_verify(
             item, self._remote_lease(on_verify=_unavailable),
         )
 
@@ -4891,12 +4897,12 @@ class TestOrphanGuardPreservesCancellation:
                 raise
 
         worker, item = self._make_worker_and_item(tmp_path)
-        worker.ORPHAN_REAP_TIMEOUT_SECS = 0.05
+        worker.verify_dispatch.ORPHAN_REAP_TIMEOUT_SECS = 0.05
         lease = self._remote_lease(on_verify=_unkillable)
         started = lease.runner.entered
 
         try:
-            outer = asyncio.ensure_future(worker._run_inflight_verify(item, lease))
+            outer = asyncio.ensure_future(worker.verify_dispatch.run_inflight_verify(item, lease))
             for _ in range(200):
                 await asyncio.sleep(0.01)
                 if started:
@@ -4937,14 +4943,14 @@ class TestOrphanGuardPreservesCancellation:
                 raise
 
         worker, item = self._make_worker_and_item(tmp_path)
-        worker.ORPHAN_REAP_TIMEOUT_SECS = 0.05
+        worker.verify_dispatch.ORPHAN_REAP_TIMEOUT_SECS = 0.05
         lease = self._remote_lease(on_verify=_unkillable)
         started = lease.runner.entered
 
         try:
             with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
                 outer = asyncio.ensure_future(
-                    worker._run_inflight_verify(item, lease)
+                    worker.verify_dispatch.run_inflight_verify(item, lease)
                 )
                 for _ in range(200):
                     await asyncio.sleep(0.01)

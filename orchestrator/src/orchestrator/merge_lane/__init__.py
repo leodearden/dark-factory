@@ -28,6 +28,7 @@ if TYPE_CHECKING:
         POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
         POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX,
     )
+    from orchestrator.merge_lane.inflight_verify import resolve_dispatch_time_merge_base
     from orchestrator.merge_lane.intake import (
         coalesce_or_enqueue_merge_request,
         enqueue_merge_request,
@@ -57,6 +58,9 @@ if TYPE_CHECKING:
         ProductionVerifier,
         VerifyPort,
     )
+    from orchestrator.merge_lane.post_merge_verify import (
+        TRIVIAL_PASS_MAIN_RED_REASON_PREFIX,
+    )
     from orchestrator.merge_lane.types import (
         DiskGuardOutcome,
         EscalationRecord,
@@ -70,6 +74,9 @@ if TYPE_CHECKING:
         QueuedBranch,
         WaiterRecord,
     )
+    from orchestrator.merge_lane.verify_failure_outcome import (
+        TRANSIENT_INFRA_REASON_PREFIX,
+    )
     from orchestrator.merge_lane.worker import (
         ABANDONED_REASON_PREFIX,
         NEEDS_REBASE_REASON_PREFIX,
@@ -77,10 +84,7 @@ if TYPE_CHECKING:
         TRAIN_PARTIAL_FLIP_REASON_PREFIX,
         TRAIN_REBASE_CONFLICT_REASON_PREFIX,
         TRAIN_VERIFY_FAILED_REASON_PREFIX,
-        TRANSIENT_INFRA_REASON_PREFIX,
-        TRIVIAL_PASS_MAIN_RED_REASON_PREFIX,
         WORKTREE_MISSING_REASON_PREFIX,
-        resolve_dispatch_time_merge_base,
         retire_cancelled_merge_request,
     )
     from orchestrator.merge_lane.worker import (
@@ -90,13 +94,16 @@ if TYPE_CHECKING:
 _WORKER = 'orchestrator.merge_lane.worker'
 _GATES = 'orchestrator.merge_lane.gates'
 _INTAKE = 'orchestrator.merge_lane.intake'
+_INFLIGHT_VERIFY = 'orchestrator.merge_lane.inflight_verify'
 _INTAKE_BUFFERS = 'orchestrator.merge_lane.intake_buffers'
 _LANDING_EVIDENCE = 'orchestrator.merge_lane.landing_evidence'
 _MAIN_HEALTH_PROBE = 'orchestrator.merge_lane.main_health_probe'
 _MEMBER_REDRIVE = 'orchestrator.merge_lane.member_redrive'
 _OUTCOME_FACTS = 'orchestrator.merge_lane.outcome_facts'
 _PORTS = 'orchestrator.merge_lane.ports'
+_POST_MERGE_VERIFY = 'orchestrator.merge_lane.post_merge_verify'
 _TYPES = 'orchestrator.merge_lane.types'
+_VERIFY_FAILURE_OUTCOME = 'orchestrator.merge_lane.verify_failure_outcome'
 
 
 class _ExportTable(dict[str, tuple[str, str]]):
@@ -116,7 +123,7 @@ _EXPORTS = _ExportTable({
     'coalesce_or_enqueue_merge_request': (_INTAKE, 'coalesce_or_enqueue_merge_request'),
     'enqueue_merge_request': (_INTAKE, 'enqueue_merge_request'),
     'retire_cancelled_merge_request': (_WORKER, 'retire_cancelled_merge_request'),
-    'resolve_dispatch_time_merge_base': (_WORKER, 'resolve_dispatch_time_merge_base'),
+    'resolve_dispatch_time_merge_base': (_INFLIGHT_VERIFY, 'resolve_dispatch_time_merge_base'),
     'patch_content_contained': (_LANDING_EVIDENCE, 'patch_content_contained'),
     'MemberRedriveOutcome': (_MEMBER_REDRIVE, 'MemberRedriveOutcome'),
     'MergeRequest': (_TYPES, 'MergeRequest'),
@@ -146,8 +153,12 @@ _EXPORTS = _ExportTable({
     'TRAIN_PARTIAL_FLIP_REASON_PREFIX': (_WORKER, 'TRAIN_PARTIAL_FLIP_REASON_PREFIX'),
     'TRAIN_REBASE_CONFLICT_REASON_PREFIX': (_WORKER, 'TRAIN_REBASE_CONFLICT_REASON_PREFIX'),
     'TRAIN_VERIFY_FAILED_REASON_PREFIX': (_WORKER, 'TRAIN_VERIFY_FAILED_REASON_PREFIX'),
-    'TRANSIENT_INFRA_REASON_PREFIX': (_WORKER, 'TRANSIENT_INFRA_REASON_PREFIX'),
-    'TRIVIAL_PASS_MAIN_RED_REASON_PREFIX': (_WORKER, 'TRIVIAL_PASS_MAIN_RED_REASON_PREFIX'),
+    'TRANSIENT_INFRA_REASON_PREFIX': (
+        _VERIFY_FAILURE_OUTCOME, 'TRANSIENT_INFRA_REASON_PREFIX',
+    ),
+    'TRIVIAL_PASS_MAIN_RED_REASON_PREFIX': (
+        _POST_MERGE_VERIFY, 'TRIVIAL_PASS_MAIN_RED_REASON_PREFIX',
+    ),
     'WORKTREE_MISSING_REASON_PREFIX': (_WORKER, 'WORKTREE_MISSING_REASON_PREFIX'),
     'VerifyPort': (_PORTS, 'VerifyPort'),
     'ClockPort': (_PORTS, 'ClockPort'),

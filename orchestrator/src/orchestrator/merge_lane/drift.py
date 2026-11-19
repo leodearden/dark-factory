@@ -405,7 +405,7 @@ async def _run_drift_check(
             # divergence class.  Forcing task_files=None runs the complete
             # workspace gate (verify.py task_files=None path) on both hosts so a
             # genuine divergence is observable.  This deliberately does NOT
-            # derive/scope task_files (unlike _run_post_merge_verify's serial-lane
+            # derive/scope task_files (unlike merge_lane/post_merge_verify.py::run_post_merge_verify's serial-lane
             # dispatching-host derivation) — the derivation gate is intentionally
             # dropped here.  task_files_tuple stays None so BOTH the spec and the
             # LocalRunner below run the whole suite.

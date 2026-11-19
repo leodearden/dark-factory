@@ -1313,7 +1313,7 @@ async def reap_leaked_claimant_heartbeats() -> int:
     un-retrieved ``TypeError`` from ``asyncio.sleep(<MagicMock>)`` onto the
     shared loop. Either way pytest attributes the fallout to a later, innocent
     test (observed victim: ``TestB7SingleHostNewPath``'s serial-order
-    assertion, which sees a spurious extra ``_dispatch_item`` call).
+    assertion, which sees a spurious extra ``VerifyDispatcher.dispatch`` call).
 
     Like ``reap_leaked_ticket_workers`` (task 2737) — and unlike
     ``MergeWorker.run`` (task 1907) — the loop just blocks on ``asyncio.sleep``
