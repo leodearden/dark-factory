@@ -21,8 +21,10 @@ StartLimitBurst=10
 
 [Service]
 Type=simple
-# Per-project cgroup slice: docs/cgroup-slice-topology.md
+# Per-project cgroup slice; memory-only delegation, started in daemon/: docs/cgroup-slice-topology.md
 Slice=df-stream_touch.slice
+Delegate=memory
+DelegateSubgroup=daemon
 # CWD must be dark-factory so `uv run --project orchestrator` resolves the
 # orchestrator package (its pyproject lives only under that repo).
 WorkingDirectory=/home/leo/src/dark-factory
