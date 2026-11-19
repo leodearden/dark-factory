@@ -37,7 +37,8 @@ import functools
 import posixpath
 import re
 import tomllib
-from collections.abc import Callable, Iterable, Mapping
+import unicodedata
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
 
 import pytest
@@ -272,6 +273,53 @@ def imported_module_stems(tree: ast.Module) -> frozenset[str]:
     return frozenset(stems)
 
 
+# ─── The text prefilter ─────────────────────────────────────────────────────
+
+_GIT_OR_MARKER_NAMES = ('git', MARKER)
+_ESCAPE_SPELLING_A_LETTER_OF_GIT = re.compile(
+    r'\\(?:x6[79]|x74|u00(?:6[79]|74)|U000000(?:6[79]|74)|1(?:47|51)|164|N|\r|\n)'
+)
+_BETWEEN_ADJACENT_LITERALS = r"""['"](?:[\s'"rRuUfF]|\\\n|#[^\n]*)*['"]"""
+_GIT_SPLIT_ACROSS_ADJACENT_LITERALS = re.compile(
+    f'g{_BETWEEN_ADJACENT_LITERALS}it'
+    f'|gi{_BETWEEN_ADJACENT_LITERALS}t'
+    f'|g{_BETWEEN_ADJACENT_LITERALS}i{_BETWEEN_ADJACENT_LITERALS}t'
+)
+
+
+def _mentions_any(source: str, words: Iterable[str]) -> bool:
+    """Whether a word is in *source* as written or as the parser compares identifiers (NFKC)."""
+    words = tuple(words)
+    if any(word in source for word in words):
+        return True
+    return not source.isascii() and any(
+        word in unicodedata.normalize('NFKC', source) for word in words
+    )
+
+
+def may_hold_a_history_call_or_marker(source: str) -> bool:
+    """False proves :func:`history_calls` and :func:`applied_marker_names` find nothing in *source*.
+
+    Every detected call needs the word ``git`` (an argv's first element, a helper callee
+    ``git``/``*_git``, a shelled ``git log ...`` string) and every marker the name
+    :data:`MARKER`, which contains it. A callee or marker is an identifier, so the word is
+    in the NFKC-normalised text. A string constant is not normalised but can be written
+    without the contiguous word: through an escape that spells one of its letters
+    (``'\\x67it'``), a backslash-newline continuation, or adjacent literals (``'g' 'it'``).
+    Each such form admits the file, so the filter only ever over-admits.
+    """
+    return (
+        _mentions_any(source, _GIT_OR_MARKER_NAMES)
+        or _ESCAPE_SPELLING_A_LETTER_OF_GIT.search(source) is not None
+        or _GIT_SPLIT_ACROSS_ADJACENT_LITERALS.search(source) is not None
+    )
+
+
+def may_import_any_of(source: str, stems: Iterable[str]) -> bool:
+    """False proves *source* imports none of *stems*: an import names each stem as an identifier."""
+    return _mentions_any(source, stems)
+
+
 # ─── The gate's test roots ──────────────────────────────────────────────────
 
 
@@ -315,11 +363,18 @@ def gate_test_roots(module_configs: Mapping[str, ModuleConfig]) -> frozenset[Gat
 
 @dataclasses.dataclass(frozen=True)
 class SweptFile:
+    """What the sweep learned of one gate file.
+
+    ``imported_history_modules`` holds only the stems of the sweep's history-calling
+    non-test modules that this file imports, and is empty for a non-test file: the one
+    question asked of imports is which test files import a history helper.
+    """
+
     rel_path: str
     root: GateTestRoot
     calls: tuple[HistoryCall, ...]
-    markers: frozenset[str]
-    imports: frozenset[str]
+    carries_marker: bool
+    imported_history_modules: frozenset[str]
 
     @property
     def is_test_module(self) -> bool:
@@ -329,6 +384,10 @@ class SweptFile:
     def stem(self) -> str:
         return posixpath.splitext(posixpath.basename(self.rel_path))[0]
 
+    @property
+    def is_history_module(self) -> bool:
+        return bool(self.calls) and not self.is_test_module
+
 
 @dataclasses.dataclass(frozen=True)
 class Sweep:
@@ -337,26 +396,29 @@ class Sweep:
 
     @functools.cached_property
     def marked(self) -> tuple[SweptFile, ...]:
-        return tuple(swept for swept in self.files if MARKER in swept.markers)
+        return tuple(swept for swept in self.files if swept.carries_marker)
 
     @functools.cached_property
     def history_helpers(self) -> tuple[SweptFile, ...]:
         """Non-test modules whose history calls run on whatever repo an importer hands them."""
         return tuple(
             swept for swept in self.files
-            if swept.calls and not swept.is_test_module
-            and swept.rel_path not in READS_ONLY_THROWAWAY_REPOS
+            if swept.is_history_module and swept.rel_path not in READS_ONLY_THROWAWAY_REPOS
         )
 
     def importing_test_files(self, helper: SweptFile) -> tuple[SweptFile, ...]:
+        assert helper.is_history_module, (
+            f'{helper.rel_path} makes no history call, so the sweep never resolved who imports it'
+        )
         return tuple(
             swept for swept in self.files
-            if swept.is_test_module and swept.root == helper.root and helper.stem in swept.imports
+            if swept.is_test_module and swept.root == helper.root
+            and helper.stem in swept.imported_history_modules
         )
 
     def is_helper_of_a_marked_file(self, swept: SweptFile) -> bool:
-        return not swept.is_test_module and any(
-            MARKER in importer.markers for importer in self.importing_test_files(swept)
+        return swept.is_history_module and any(
+            importer.carries_marker for importer in self.importing_test_files(swept)
         )
 
     def unaccounted_helper_importers(self) -> list[tuple[SweptFile, SweptFile]]:
@@ -370,7 +432,7 @@ class Sweep:
             for helper in self.history_helpers
             if self.is_helper_of_a_marked_file(helper)
             for importer in self.importing_test_files(helper)
-            if MARKER not in importer.markers
+            if not importer.carries_marker
             and importer.rel_path not in READS_ONLY_THROWAWAY_REPOS
         ]
 
@@ -381,7 +443,7 @@ class Sweep:
 
     def ways_accounted_for(self, swept: SweptFile) -> list[str]:
         ways = []
-        if MARKER in swept.markers:
+        if swept.carries_marker:
             ways.append(f'marked {MARKER}')
         if self.is_helper_of_a_marked_file(swept):
             ways.append('a helper imported by a marked test file')
@@ -393,32 +455,84 @@ class Sweep:
         return {swept.rel_path: swept for swept in self.files}
 
 
-def swept_source(rel_path: str, root: GateTestRoot, source: str) -> SweptFile:
-    tree = ast.parse(source)
-    return SweptFile(
-        rel_path=rel_path, root=root, calls=tuple(history_calls(tree)),
-        markers=applied_marker_names(tree), imports=imported_module_stems(tree),
+@dataclasses.dataclass(frozen=True)
+class SweepSource:
+    """A gate file to sweep and how to read its text, which the sweep reads once per phase."""
+
+    rel_path: str
+    root: GateTestRoot
+    read: Callable[[], str]
+
+
+def text_source(rel_path: str, root: GateTestRoot, text: str) -> SweepSource:
+    return SweepSource(rel_path=rel_path, root=root, read=lambda: text)
+
+
+def _unreadable_file_error(source: SweepSource, exc: Exception) -> AssertionError:
+    return AssertionError(
+        f'{source.rel_path} could not be read or parsed by the history-reader sweep: {exc!r}. '
+        f'A skipped file would make this guard vacuous for it.'
     )
 
 
-def _sweep_file(path: Path, root: GateTestRoot) -> SweptFile:
-    rel_path = path.relative_to(REPO_ROOT).as_posix()
+def _text_of(source: SweepSource) -> str:
     try:
-        return swept_source(rel_path, root, path.read_text())
-    except (SyntaxError, OSError) as exc:
-        raise AssertionError(
-            f'{rel_path} could not be read or parsed by the history-reader sweep: {exc!r}. '
-            f'A skipped file would make this guard vacuous for it.'
-        ) from exc
+        return source.read()
+    except OSError as exc:
+        raise _unreadable_file_error(source, exc) from exc
 
 
-def sweep(roots: frozenset[GateTestRoot]) -> Sweep:
-    files = [
-        _sweep_file(path, root)
+def _tree_of(source: SweepSource, text: str) -> ast.Module:
+    try:
+        return ast.parse(text)
+    except SyntaxError as exc:
+        raise _unreadable_file_error(source, exc) from exc
+
+
+def _scan_for_history(source: SweepSource) -> SweptFile:
+    """Phase 1: the file's history calls and marker, parsed only if its text can hold one."""
+    text = _text_of(source)
+    calls: tuple[HistoryCall, ...] = ()
+    carries_marker = False
+    if may_hold_a_history_call_or_marker(text):
+        tree = _tree_of(source, text)
+        calls = tuple(history_calls(tree))
+        carries_marker = _mentions_any(text, (MARKER,)) and MARKER in applied_marker_names(tree)
+    return SweptFile(
+        rel_path=source.rel_path, root=source.root, calls=calls, carries_marker=carries_marker,
+        imported_history_modules=frozenset(),
+    )
+
+
+def _with_imported_history_modules(
+    source: SweepSource, scanned: SweptFile, history_modules: frozenset[str],
+) -> SweptFile:
+    """Phase 2: a test file's imports of *history_modules*, parsed only if its text names one."""
+    if not scanned.is_test_module:
+        return scanned
+    text = _text_of(source)
+    if not may_import_any_of(text, history_modules):
+        return scanned
+    imported = imported_module_stems(_tree_of(source, text)) & history_modules
+    return dataclasses.replace(scanned, imported_history_modules=imported)
+
+
+def sweep_sources(roots: frozenset[GateTestRoot], sources: Sequence[SweepSource]) -> Sweep:
+    scanned = [_scan_for_history(source) for source in sources]
+    history_modules = frozenset(swept.stem for swept in scanned if swept.is_history_module)
+    files = tuple(
+        _with_imported_history_modules(source, swept, history_modules)
+        for source, swept in zip(sources, scanned, strict=True)
+    )
+    return Sweep(roots=roots, files=files)
+
+
+def sweep(roots: frozenset[GateTestRoot], repo_root: Path = REPO_ROOT) -> Sweep:
+    return sweep_sources(roots, [
+        SweepSource(rel_path=path.relative_to(repo_root).as_posix(), root=root, read=path.read_text)
         for root in sorted(roots, key=lambda root: root.path)
-        for path in sorted((REPO_ROOT / root.path).rglob('*.py'))
-    ]
-    return Sweep(roots=roots, files=tuple(files))
+        for path in sorted((repo_root / root.path).rglob('*.py'))
+    ])
 
 
 @functools.cache
@@ -613,28 +727,38 @@ _SYNTHETIC_ROOT = GateTestRoot(path='pkg/tests', pytest_config='pkg/pyproject.to
 _HISTORY_HELPER_SOURCE = "def base(root):\n    return _git(root, 'merge-base', 'main', 'HEAD')\n"
 
 
-def test_a_file_that_never_spells_git_still_records_its_imports() -> None:
-    swept = swept_source(
+def _swept(*sources: SweepSource) -> Sweep:
+    return sweep_sources(frozenset(source.root for source in sources), sources)
+
+
+def test_a_file_that_never_spells_git_is_still_found_as_an_importer() -> None:
+    helper = text_source('pkg/tests/_history.py', _SYNTHETIC_ROOT, _HISTORY_HELPER_SOURCE)
+    importer = text_source(
         'pkg/tests/test_versions.py', _SYNTHETIC_ROOT, 'from _history import versions\n',
     )
-    assert '_history' in swept.imports
+    synthetic = _swept(helper, importer)
+    swept_helper, swept_importer = synthetic.files
+
+    assert swept_importer.calls == ()
+    assert synthetic.importing_test_files(swept_helper) == (swept_importer,)
 
 
 def test_a_marked_importer_of_a_history_helper_does_not_vouch_for_an_unmarked_one() -> None:
-    helper = swept_source('pkg/tests/_history.py', _SYNTHETIC_ROOT, _HISTORY_HELPER_SOURCE)
-    marked = swept_source(
-        'pkg/tests/test_reads.py', _SYNTHETIC_ROOT,
-        f'import pytest\nfrom _history import base\npytestmark = pytest.mark.{MARKER}\n',
-    )
-    unmarked = swept_source(
-        'pkg/tests/test_also_reads.py', _SYNTHETIC_ROOT, 'from _history import base\n',
-    )
     other_root = GateTestRoot(path='other/tests', pytest_config=None)
-    elsewhere = swept_source('other/tests/test_other.py', other_root, 'from _history import base\n')
-    synthetic = Sweep(
-        roots=frozenset({_SYNTHETIC_ROOT, other_root}),
-        files=(helper, marked, unmarked, elsewhere),
+    synthetic = _swept(
+        text_source('pkg/tests/_history.py', _SYNTHETIC_ROOT, _HISTORY_HELPER_SOURCE),
+        text_source(
+            'pkg/tests/test_reads.py', _SYNTHETIC_ROOT,
+            f'import pytest\nfrom _history import base\npytestmark = pytest.mark.{MARKER}\n',
+        ),
+        text_source(
+            'pkg/tests/test_also_reads.py', _SYNTHETIC_ROOT, 'from _history import base\n',
+        ),
+        text_source('other/tests/test_other.py', other_root, 'from _history import base\n'),
     )
+    files = synthetic.by_path()
+    helper, unmarked = files['pkg/tests/_history.py'], files['pkg/tests/test_also_reads.py']
+    elsewhere = files['other/tests/test_other.py']
 
     assert synthetic.ways_accounted_for(helper) == ['a helper imported by a marked test file']
     assert synthetic.unaccounted_helper_importers() == [(helper, unmarked)]
@@ -643,14 +767,177 @@ def test_a_marked_importer_of_a_history_helper_does_not_vouch_for_an_unmarked_on
 
 
 def test_the_importers_of_a_helper_nothing_accounts_for_wait_on_the_helper() -> None:
-    helper = swept_source('pkg/tests/_history.py', _SYNTHETIC_ROOT, _HISTORY_HELPER_SOURCE)
-    importer = swept_source(
-        'pkg/tests/test_reads.py', _SYNTHETIC_ROOT, 'from _history import base\n',
+    synthetic = _swept(
+        text_source('pkg/tests/_history.py', _SYNTHETIC_ROOT, _HISTORY_HELPER_SOURCE),
+        text_source('pkg/tests/test_reads.py', _SYNTHETIC_ROOT, 'from _history import base\n'),
     )
-    synthetic = Sweep(roots=frozenset({_SYNTHETIC_ROOT}), files=(helper, importer))
+    helper = synthetic.by_path()['pkg/tests/_history.py']
 
     assert synthetic.ways_accounted_for(helper) == []
     assert synthetic.unaccounted_helper_importers() == []
+
+
+def test_importers_are_resolved_only_for_a_module_that_makes_a_history_call() -> None:
+    synthetic = _swept(
+        text_source('pkg/tests/_plain.py', _SYNTHETIC_ROOT, 'VALUE = 1\n'),
+        text_source('pkg/tests/test_uses.py', _SYNTHETIC_ROOT, 'from _plain import VALUE\n'),
+    )
+    with pytest.raises(AssertionError, match='makes no history call'):
+        synthetic.importing_test_files(synthetic.by_path()['pkg/tests/_plain.py'])
+
+
+# ─── The prefilter must not blind the guard ─────────────────────────────────
+
+_SPELLINGS_OF_A_HISTORY_CALL = [
+    pytest.param("subprocess.run(['git', 'log', '-1'])", 'log', id='argv-list'),
+    pytest.param("subprocess.run(('git', '-C', str(root), 'merge-base', 'a', 'b'))", 'merge-base', id='argv-tuple'),
+    pytest.param("_git(root, 'rev-list', 'HEAD')", 'rev-list', id='underscore-helper'),
+    pytest.param("def f(self):\n    return self._git('describe', '--tags')\n", 'describe', id='method'),
+    pytest.param("run_git(root, 'log')", 'log', id='suffixed-helper'),
+    pytest.param("git(root, 'log')", 'log', id='bare-helper'),
+    pytest.param("run('git log -1 --format=%H')", 'log', id='shelled'),
+    pytest.param("run(f'git -C {root} merge-base HEAD main')", 'merge-base', id='shelled-in-f-string'),
+    pytest.param("\uff47\uff49\uff54(root, 'log')", 'log', id='full-width-helper-identifier'),
+    pytest.param("run_\uff47\uff49\uff54(root, 'log')", 'log', id='full-width-helper-suffix'),
+    pytest.param(r"subprocess.run(['\x67it', 'log'])", 'log', id='escaped-argv-program'),
+    pytest.param(r"subprocess.run(['\u0067it', 'log'])", 'log', id='unicode-escaped-argv-program'),
+    pytest.param(r"subprocess.run(['\147it', 'log'])", 'log', id='octal-escaped-argv-program'),
+    pytest.param(r"subprocess.run(['\N{LATIN SMALL LETTER G}it', 'log'])", 'log', id='named-escape'),
+    pytest.param("subprocess.run(['g' 'it', 'log'])", 'log', id='adjacent-literals-argv'),
+    pytest.param("subprocess.run(['gi'\n    't', 'log'])", 'log', id='adjacent-literals-across-lines'),
+    pytest.param(
+        "subprocess.run(['g'  # the program\n    'i'\n    't', 'log'])", 'log',
+        id='adjacent-literals-around-a-comment',
+    ),
+    pytest.param("run('g' 'it log -1')", 'log', id='shelled-across-adjacent-literals'),
+    pytest.param("run(f'g' f'it log {x}')", 'log', id='shelled-across-adjacent-f-strings'),
+    pytest.param("run('g\\\nit log -1')", 'log', id='shelled-across-a-line-continuation'),
+    pytest.param("run(r'g' 'it log')", 'log', id='raw-prefixed-adjacent-literal'),
+]
+
+
+@pytest.mark.parametrize(('source', 'subcommand'), _SPELLINGS_OF_A_HISTORY_CALL)
+def test_the_real_sweep_reports_a_history_call_however_it_is_spelled(
+    source: str, subcommand: str, tmp_path: Path,
+) -> None:
+    (tmp_path / 'pkg/tests').mkdir(parents=True)
+    (tmp_path / 'pkg/tests/_reads.py').write_text(source)
+
+    (swept,) = sweep(frozenset({_SYNTHETIC_ROOT}), repo_root=tmp_path).files
+
+    assert [call.subcommand for call in swept.calls] == [subcommand]
+    assert swept.calls == tuple(history_calls(ast.parse(source)))
+
+
+def _escapes_spelling(letter: str) -> list[str]:
+    code = ord(letter)
+    return [
+        f'\\x{code:02x}', f'\\u{code:04x}', f'\\U{code:08x}', f'\\{code:o}',
+        f'\\N{{LATIN SMALL LETTER {letter.upper()}}}',
+    ]
+
+
+@pytest.mark.parametrize('position', range(len('git')))
+def test_the_real_sweep_reports_a_call_whose_program_is_escaped_in_any_one_letter(
+    position: int, tmp_path: Path,
+) -> None:
+    (tmp_path / 'pkg/tests').mkdir(parents=True)
+    for index, escape in enumerate(_escapes_spelling('git'[position])):
+        program = 'git'[:position] + escape + 'git'[position + 1:]
+        source = f"subprocess.run(['{program}', 'log'])\n"
+        (tmp_path / f'pkg/tests/_reads_{index}.py').write_text(source)
+
+    swept = sweep(frozenset({_SYNTHETIC_ROOT}), repo_root=tmp_path)
+
+    assert [[call.subcommand for call in file.calls] for file in swept.files] == [['log']] * 5
+
+
+@pytest.mark.parametrize(
+    'marker_spelling',
+    [
+        pytest.param(f'pytest.mark.{MARKER}', id='attribute'),
+        pytest.param(f'pytest.mark.{MARKER}()', id='call'),
+        pytest.param(f'pytest.mark.{MARKER.replace("r", chr(0xFF52), 1)}', id='full-width-identifier'),
+    ],
+)
+def test_the_real_sweep_sees_the_marker_in_a_file_that_makes_no_call(
+    marker_spelling: str, tmp_path: Path,
+) -> None:
+    (tmp_path / 'pkg/tests').mkdir(parents=True)
+    (tmp_path / 'pkg/tests/test_marked.py').write_text(
+        f'import pytest\npytestmark = {marker_spelling}\n'
+    )
+
+    (swept,) = sweep(frozenset({_SYNTHETIC_ROOT}), repo_root=tmp_path).files
+
+    assert swept.calls == ()
+    assert swept.carries_marker
+
+
+def test_the_real_sweep_finds_every_importer_of_a_history_helper(tmp_path: Path) -> None:
+    sources = {
+        '_history.py': _HISTORY_HELPER_SOURCE,
+        'test_from_import.py': 'from _history import base\n',
+        'test_plain_import.py': 'import _history\n',
+        'test_dotted_import.py': 'import pkg.tests._history as history\n',
+        'test_nested_import.py': 'def test_it():\n    from . import _history\n',
+        'test_full_width_import.py': 'from _\uff48istory import base\n',
+        'test_other_helper.py': 'from _other import base\n',
+        'test_mentions_only.py': '# _history is not imported here\nNAME = "_history"\n',
+    }
+    (tmp_path / 'pkg/tests').mkdir(parents=True)
+    for name, source in sources.items():
+        (tmp_path / 'pkg/tests' / name).write_text(source)
+
+    swept = sweep(frozenset({_SYNTHETIC_ROOT}), repo_root=tmp_path)
+    helper = swept.by_path()['pkg/tests/_history.py']
+
+    assert sorted(importer.stem for importer in swept.importing_test_files(helper)) == [
+        'test_dotted_import', 'test_from_import', 'test_full_width_import',
+        'test_nested_import', 'test_plain_import',
+    ]
+
+
+def test_a_file_with_no_git_in_it_yields_no_call_and_is_not_parsed(tmp_path: Path) -> None:
+    (tmp_path / 'pkg/tests').mkdir(parents=True)
+    (tmp_path / 'pkg/tests/test_never_parsed.py').write_text('def broken(:\n')
+
+    (swept,) = sweep(frozenset({_SYNTHETIC_ROOT}), repo_root=tmp_path).files
+
+    assert swept.calls == ()
+    assert not swept.carries_marker
+
+
+def test_an_unparseable_file_that_may_hold_a_history_call_fails_the_sweep(tmp_path: Path) -> None:
+    (tmp_path / 'pkg/tests').mkdir(parents=True)
+    (tmp_path / 'pkg/tests/_reads.py').write_text("def broken(:\n    _git(root, 'log')\n")
+
+    with pytest.raises(AssertionError, match='_reads.py could not be read or parsed'):
+        sweep(frozenset({_SYNTHETIC_ROOT}), repo_root=tmp_path)
+
+
+def test_an_unparseable_test_file_naming_a_history_helper_fails_the_sweep(tmp_path: Path) -> None:
+    (tmp_path / 'pkg/tests').mkdir(parents=True)
+    (tmp_path / 'pkg/tests/_history.py').write_text(_HISTORY_HELPER_SOURCE)
+    (tmp_path / 'pkg/tests/test_uses.py').write_text('from _history import (\n')
+
+    with pytest.raises(AssertionError, match='test_uses.py could not be read or parsed'):
+        sweep(frozenset({_SYNTHETIC_ROOT}), repo_root=tmp_path)
+
+
+@pytest.mark.parametrize(
+    'source',
+    [
+        pytest.param('x = 1\n', id='nothing'),
+        pytest.param('import os\nprint("a\\nb", os.sep)\n', id='harmless-escape'),
+        pytest.param('names = ["msg", "item"]\n', id='strings-separated-by-a-comma'),
+        pytest.param(r"print('\x1b[0m \u2014 \n')" + '\n', id='escapes-spelling-no-letter-of-git'),
+        pytest.param('a = "msg"\nb = "item"\n', id='strings-on-separate-statements'),
+        pytest.param('import pytest\npytestmark = pytest.mark.slow\n', id='another-marker'),
+    ],
+)
+def test_a_source_that_cannot_spell_git_is_not_admitted(source: str) -> None:
+    assert not may_hold_a_history_call_or_marker(source)
 
 
 # ─── The live tree ──────────────────────────────────────────────────────────
@@ -734,7 +1021,7 @@ def test_no_file_is_both_marked_and_allowlisted() -> None:
     files = _live_sweep().by_path()
     both = [
         rel_path for rel_path in READS_ONLY_THROWAWAY_REPOS
-        if rel_path in files and MARKER in files[rel_path].markers
+        if rel_path in files and files[rel_path].carries_marker
     ]
     assert not both, both
 
