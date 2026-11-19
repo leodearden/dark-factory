@@ -378,7 +378,8 @@ def _ancestor_git_ops(*, tip: str) -> types.SimpleNamespace:
     """A live ref whose tip is an ancestor of main.
 
     Past its own guards the ancestor arm asks ``branch_work_landed``, which a
-    stub cannot answer; pair this with :func:`_stub_landing_producer`.
+    stub cannot answer; pair this with
+    :func:`_landing_verdicts.stub_landing_producer`.
     """
     return _probe_git_ops(
         resolve_branch_sha=AsyncMock(

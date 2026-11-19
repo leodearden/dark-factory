@@ -2,21 +2,26 @@
 
 Architecturally parallel to task 2156's landed-outbox dispatch gate
 (test_harness_landed_dispatch_gate_wiring.py), but this gate consults LIVE
-GIT STATE (ancestry + content-equivalence) rather than the durable
-LandedOutbox, so it also catches OUT-OF-BAND landings that never went
+GIT STATE (ancestry, and patch-id containment of a live tip) rather than the
+durable LandedOutbox, so it also catches OUT-OF-BAND landings that never went
 through this orchestrator's own merge queue: a sibling direct-merge, a prior
 orchestrator run, or a rebase/manual landing.  A multi-commit squash is the
 residual the patch-id repoint accepted (task 4648), pinned in
 test_already_landed_gate_patch_id.py.
 
-Covers:
-  step-3  (RED)  Ancestry happy-path: is_ancestor True + citation present +
-                 not degenerate -> flips to done, returns True.
-  step-5  (RED)  Ancestry-path false-positive guards: open-L1 veto,
-                 degenerate-branch veto, missing-citation veto.
-  step-7  (RED)  Branch-deleted merge-marker path: marker found (and not
-                 stale) -> flips to done; stale marker (ancestor of
-                 branch_base_sha) -> vetoes the flip.
+Covers the gate's three arms and the vetoes around them:
+  - ancestry arm (live tip an ancestor of main): an accepted
+    ``branch_work_landed`` verdict flips the task to done; every refused
+    verdict is recorded, never escalated, and the task dispatches.
+  - off-main-tip arm (live tip not an ancestor): the same producer decides;
+    ``no_attribution`` escalates and every other reject is recorded.
+  - branch-deleted merge-marker arm: a marker flips through
+    ``validate_landing_evidence`` CANDIDATE; a marker that predates this
+    incarnation (an ancestor of ``branch_base_sha``) vetoes the flip.
+  - the any-level escalation veto, the arbitration holds, the
+    delivered-checks guard and the transition-gated emissions.
+The producer is stubbed here (``landing_producer``); real git drives it in
+test_already_landed_gate_patch_id.py.
 
 Mirrors test_harness_landed_dispatch_gate_wiring.py's ``_build_harness``
 bare-harness construction helper exactly.
@@ -245,32 +250,6 @@ class TestAlreadyLandedDispatchGateAncestryDelegatesToHelper:
     BEFORE the producer is consulted; everything after them, from the
     degenerate-branch guard to attribution, is the producer's.
     """
-
-    async def test_the_producer_is_called_with_the_arms_contract(
-        self, mock_orch_config, landing_producer: AsyncMock,
-    ) -> None:
-        h = _wired_ancestry_harness(mock_orch_config)
-        metadata = {'branch_base_sha': '9' * 40}
-        h.scheduler.get_task = AsyncMock(return_value={'id': '42', 'metadata': metadata})
-        queue = MagicMock()
-        queue.get_by_task = MagicMock(return_value=[])
-        h._escalation_queue = queue
-        validate = AsyncMock()
-
-        with patch('orchestrator.harness.validate_landing_evidence', validate):
-            result = await h._already_landed_dispatch_gate('42')
-
-        assert result is True
-        validate.assert_not_awaited()
-        landing_producer.assert_awaited_once()
-        call = landing_producer.await_args
-        assert call is not None
-        assert call.args == (h.git_ops, '42', 'task/42')
-        assert call.kwargs['branch_tip_sha'] == _TIP_SHA
-        assert call.kwargs['metadata'] == metadata
-        assert call.kwargs['pattern_template'] is h.git_ops.config.commit_citation_pattern
-        assert call.kwargs['escalation_queue'] is queue
-        assert call.kwargs['recovery_emission'] is h.config.recovery_emission
 
     async def test_rejected_verdict_returns_false_no_mark_done(
         self, mock_orch_config, landing_producer: AsyncMock,
@@ -753,8 +732,12 @@ def _wired_off_main_tip_harness(
 
 
 @pytest.mark.asyncio
-class TestAlreadyLandedDispatchGateContentEquivalence:
-    """The off-main-tip arm: a squash, rebase or manual landing, or none at all.
+class TestAlreadyLandedDispatchGateOffMainTipArmDispositions:
+    """The off-main-tip arm: a rebase or manual landing, or none at all.
+
+    One test per disposition: escalate an unattributed landing, stamp an
+    attributed one, dispatch a branch that did not land.  A multi-commit
+    squash reads as not landed (test_already_landed_gate_patch_id.py).
 
     ``is_ancestor(branch, main)`` is False and the branch exists in every
     sub-case, so only the off-main-tip arm can produce a result.  It decides
@@ -835,7 +818,7 @@ class TestAlreadyLandedDispatchGateContentEquivalence:
 class TestAlreadyLandedDispatchGateGetMainShaFallbackGrepGuard:
     """Source-level guard (task 2678): the silent
     ``citation or await self.git_ops.get_main_sha()`` fallback must be
-    fully deleted from the content-equivalence path, not merely made
+    fully deleted from the off-main-tip path, not merely made
     unreachable — a future edit must not resurrect it as dead code.
     """
 
@@ -944,7 +927,7 @@ class TestAlreadyLandedDispatchGateStaleEvidenceConflict:
         ]
         assert len(conflicts_after) == 1, 'must not file a duplicate escalation'
 
-    async def test_content_equivalence_path_gates_and_does_not_reattempt(
+    async def test_off_main_tip_path_gates_and_does_not_reattempt(
         self, mock_orch_config, tmp_path, landing_producer: AsyncMock,
     ) -> None:
         from escalation.queue import EscalationQueue
@@ -1428,7 +1411,7 @@ class TestAlreadyLandedDispatchGateInstall:
 # TestAlreadyLandedGateDeliveredChecksGuard (task 3057 — step-3 RED / step-4 GREEN)
 #
 # Seam 2 of the eleven attribution-shaped mark-done seams. This gate's three
-# evidence arms (git ancestry / merge marker / content equivalence) each prove
+# evidence arms (git ancestry / merge marker / off-main tip) each prove
 # only that SOMETHING of this branch reached main — never that THIS task's
 # declared capability survived to it. All three are covered, in one
 # parametrized matrix, so no single arm can regress unguarded.
@@ -1440,7 +1423,7 @@ _GATE_TARGET = 'orchestrator.harness.gate_mark_done_on_delivered_checks'
 _ARMS = [
     pytest.param('ancestry', id='ancestry-arm'),
     pytest.param('marker', id='marker-arm'),
-    pytest.param('content', id='content-equivalent-arm'),
+    pytest.param('off_main_tip', id='off-main-tip-arm'),
 ]
 
 #: The arms that validate a merge marker in CANDIDATE mode; every other arm
@@ -1451,7 +1434,7 @@ _LIVE_TIP_ARMS = [arm for arm in _ARMS if arm.values[0] not in _CANDIDATE_ARMS]
 _ARM_REASON = {
     'ancestry': 'dispatch-gate-already-on-main',
     'marker': 'dispatch-gate-marker-found',
-    'content': 'dispatch-gate-content-equivalent',
+    'off_main_tip': 'dispatch-gate-content-equivalent',
 }
 
 _MARKER_SHA = 'b' * 40
@@ -1460,7 +1443,7 @@ _BRANCH_BASE_SHA = '9' * 40
 _ARM_EVIDENCE_SHA = {
     'ancestry': _LANDED_SHA,
     'marker': _MARKER_SHA,
-    'content': _LANDED_SHA,
+    'off_main_tip': _LANDED_SHA,
 }
 
 _DC_CHECK = {'name': 'cap-x', 'kind': 'grep', 'pattern': 'SomePattern', 'expect': 'present'}
@@ -1487,7 +1470,7 @@ def _arm_harness(
             marker_is_ancestor_of_base=False,
         )
         base_meta = {'branch_base_sha': _BRANCH_BASE_SHA}
-    elif arm == 'content':
+    elif arm == 'off_main_tip':
         h = _wired_off_main_tip_harness(mock_orch_config)
         base_meta = {}
     else:  # pragma: no cover - guard against a typo in the parametrization
@@ -2785,6 +2768,43 @@ class TestAlreadyLandedGateOffMainTipArm:
         assert row['data']['site'] == 'already_landed_gate_ancestry'
         assert row['data']['reason'] == 'git_error'
         assert row['data']['git_error_stage'] == 'patch_id_containment'
+
+
+@pytest.mark.asyncio
+class TestAlreadyLandedGateLiveTipArmsProducerContract:
+    """Both live-tip arms hand ``branch_work_landed`` the same contract (task 4648).
+
+    ``escalation_queue`` and ``recovery_emission`` arm the producer's
+    ``git_error`` storm escape, so an arm that dropped either would disarm
+    that alarm with no other test failing.
+    """
+
+    @pytest.mark.parametrize('arm', _LIVE_TIP_ARMS)
+    async def test_the_producer_is_called_with_the_arms_contract(
+        self, mock_orch_config, landing_producer: AsyncMock, arm: str,
+    ) -> None:
+        h, metadata = _arm_harness(
+            mock_orch_config, arm, metadata={'branch_base_sha': _BRANCH_BASE_SHA},
+        )
+        queue = MagicMock()
+        queue.get_by_task = MagicMock(return_value=[])
+        h._escalation_queue = queue
+        validate = AsyncMock()
+
+        with patch('orchestrator.harness.validate_landing_evidence', validate):
+            result = await h._already_landed_dispatch_gate('42')
+
+        assert result is True
+        validate.assert_not_awaited()
+        landing_producer.assert_awaited_once()
+        call = landing_producer.await_args
+        assert call is not None
+        assert call.args == (h.git_ops, '42', 'task/42')
+        assert call.kwargs['branch_tip_sha'] == _TIP_SHA
+        assert call.kwargs['metadata'] == metadata
+        assert call.kwargs['pattern_template'] is h.git_ops.config.commit_citation_pattern
+        assert call.kwargs['escalation_queue'] is queue
+        assert call.kwargs['recovery_emission'] is h.config.recovery_emission
 
 
 # ---------------------------------------------------------------------------

@@ -222,19 +222,6 @@ class TestAncestryArmDecidesByPatchId:
             'already_landed_gate_ancestry', 'no_attribution', 'patch_id',
         )
 
-    @pytest.mark.parametrize('build', [build_no_op_landing, build_degenerate_branch])
-    async def test_every_row_this_arm_writes_names_the_patch_id_policy(
-        self, mock_orch_config: Any, repo: LandingRepo, tmp_path: Path, build: Any,
-    ) -> None:
-        """The per-site policy pin: the ancestry arm's verdicts come from ``branch_work_landed``."""
-        gate = WiredGate(mock_orch_config, build(repo), tmp_path)
-
-        await gate.run()
-
-        rows = gate.rejects()
-        assert rows
-        assert {row['method'] for row in rows} == {'patch_id'}
-
 
 class TestOffMainTipArmDecidesByPatchId:
     """The arm taken when the live branch tip is NOT an ancestor of main.
