@@ -90,7 +90,7 @@ own components can be a confusion's fix surface. Its project_root names the
 MAIN checkout even when the census runs from a worktree."""
 
 
-def _synthesis_prompt(brief: synthesis.Brief, *, quality_block: str) -> str:
+def synthesis_prompt(brief: synthesis.Brief, *, quality_block: str) -> str:
     """Prompt for the real Fable synthesize_fn: observations on this run's new
     and re-observed findings (*brief*), as the C6 document ``synthesis.parse``
     validates, judged against *quality_block* (``code_quality.guidance``)."""
@@ -125,7 +125,7 @@ def build_synthesize_fn(invoke):
     quality_block = code_quality.guidance()
 
     def _synthesize_fn(brief: synthesis.Brief, *, model: str) -> str:
-        return invoke(_synthesis_prompt(brief, quality_block=quality_block), model)
+        return invoke(synthesis_prompt(brief, quality_block=quality_block), model)
 
     return _synthesize_fn
 
@@ -388,7 +388,7 @@ def main(argv: list[str] | None = None, *, poster: alarm.Poster | None = None) -
     # passed relative by an operator. An unresolved relative root would make
     # the stage cwd binding below vacuous (cwd="." IS the launcher's cwd —
     # exactly the bug that binding exists to close) and would silently falsify
-    # census_verify.py::_verify_prompt's "ABSOLUTE paths only" contract, since it
+    # census_verify.py::verify_prompt's "ABSOLUTE paths only" contract, since it
     # interpolates str(project_root) straight into the prompt. One resolve()
     # at the CLI boundary makes the prompt text, the subprocess cwd and all
     # four output paths name the same absolute tree.
