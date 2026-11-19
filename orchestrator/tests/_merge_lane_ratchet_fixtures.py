@@ -23,7 +23,11 @@ import sys
 from pathlib import Path
 from typing import Self
 
-from _orch_helpers import assert_isolated_git_repo, git_env_with_ceiling
+from _orch_helpers import (
+    assert_isolated_git_repo,
+    env_resolving_running_interpreter,
+    git_env_with_ceiling,
+)
 
 sys.path.insert(0, str(Path(__file__).parents[2] / 'scripts'))
 
@@ -159,7 +163,8 @@ class RatchetRepo:
         # FIRST, before any subprocess: a rejected root must write nothing.
         assert_isolated_git_repo(root)
         self.root = root
-        self.env = git_env_with_ceiling(root)
+        # The real hooks a case installs run a bare `python3` that must import `shared`.
+        self.env = env_resolving_running_interpreter(git_env_with_ceiling(root))
 
     @staticmethod
     def _init_main(tmp_path: Path) -> Path:
