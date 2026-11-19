@@ -2264,7 +2264,7 @@ class TaskInterceptor:
                 trigger=MintTrigger.DONE_WRITE,
             )
 
-    async def backfill_followup_holds(self, project_root: str) -> int:
+    async def backfill_followup_holds(self, project_root: str, *, known_roots: Sequence[str]) -> int:
         """Hold the project's pending follow-up stock behind its holder; see ``followup_hold.backfill``."""
 
         async def emit(event_type: EventType, payload: Mapping[str, object]) -> None:
@@ -2276,6 +2276,7 @@ class TaskInterceptor:
             holders=self._followup_holders,
             write_lock=self._write_lock(resolve_project_id(project_root)),
             emit=emit,
+            known_roots=known_roots,
         )
 
     async def remint_broken_recurrence_chains(self, project_root: str) -> tuple[MintOutcome, ...]:

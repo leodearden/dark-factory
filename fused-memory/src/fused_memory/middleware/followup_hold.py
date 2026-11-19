@@ -8,7 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Iterator, Mapping, Sequence
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, ClassVar, Final
@@ -19,6 +19,8 @@ from shared.followup_hold_records import (
     FollowupHold,
     FollowupHolder,
 )
+from shared.project_id import normalize_project_id
+from shared.task_metadata import ExternalDep
 from shared.task_metadata_wire import coerce_task_metadata
 from shared.task_statuses import ACTIVE, TaskStatus
 
@@ -70,6 +72,7 @@ _BACKFILL_FIELDS: Final = (
     'dependencies',
     *(f'metadata.{key}' for key in (*_HOLD_SCOPE_KEYS, FOLLOWUP_HOLD_METADATA_KEY)),
 )
+_EXTERNAL_DEPS_FIELDS: Final = ('id', 'metadata.external_deps')
 _METADATA_SOURCE: Final = 'followup_hold'
 
 
@@ -345,6 +348,7 @@ async def backfill(
     holders: FollowupHolders,
     write_lock: asyncio.Lock,
     emit: BackfillEmit,
+    known_roots: Sequence[str],
 ) -> int:
     """Decision 12: hold every pending task the hold rule matches that was never held, and report once.
 
@@ -352,11 +356,12 @@ async def backfill(
     no journal row and no ``task_modified`` event. A task that already carries a ``followup_hold``
     record was promoted or released and is never re-held. A pending follow-up that an active,
     non-deferred task outside the stock waits on, directly or through other stock tasks, is left
-    unheld, because nothing would promote it. One ``followup_hold_backfilled`` event is emitted per
+    unheld, because nothing would promote it; ``known_roots`` are the projects whose
+    ``external_deps`` can cite this one. One ``followup_hold_backfilled`` event is emitted per
     call, its count possibly 0, so a reader can tell the backfill ran.
     """
     async with write_lock:
-        held = await _hold_stock(tm, project_root, holders)
+        held = await _hold_stock(tm, project_root, holders, known_roots)
     await emit(
         EventType.followup_hold_backfilled,
         {'project_id': resolve_project_id(project_root), 'count': held},
@@ -364,9 +369,12 @@ async def backfill(
     return held
 
 
-async def _hold_stock(tm: TaskBackendProtocol, project_root: str, holders: FollowupHolders) -> int:
+async def _hold_stock(
+    tm: TaskBackendProtocol, project_root: str, holders: FollowupHolders, known_roots: Sequence[str],
+) -> int:
     candidates = await _unheld_stock(tm, project_root)
-    waited_on = await _waited_on(tm, project_root, frozenset(int(task['id']) for task in candidates))
+    candidate_ids = frozenset(int(task['id']) for task in candidates)
+    waited_on = await _waited_on(tm, project_root, candidate_ids, known_roots)
     stock = [task for task in candidates if int(task['id']) not in waited_on]
     if not stock:
         return 0
@@ -397,13 +405,16 @@ async def _unheld_stock(tm: TaskBackendProtocol, project_root: str) -> list[dict
 
 
 async def _waited_on(
-    tm: TaskBackendProtocol, project_root: str, candidate_ids: frozenset[int],
+    tm: TaskBackendProtocol, project_root: str, candidate_ids: frozenset[int], known_roots: Sequence[str],
 ) -> frozenset[int]:
     """The candidates a task waiting now depends on, directly or through other candidates."""
     if not candidate_ids:
         return frozenset()
     edges = await tm.get_dependency_edges(project_root)
-    seeds = await _cited_by_waiting_dependents(tm, project_root, candidate_ids, edges)
+    seeds = (
+        await _cited_by_waiting_dependents(tm, project_root, candidate_ids, edges)
+        | await _cited_by_other_projects(tm, project_root, known_roots)
+    )
     return _dependency_closure(seeds, edges, within=candidate_ids)
 
 
@@ -426,6 +437,40 @@ async def _cited_by_waiting_dependents(
         for dependent, cited in cited_by.items() if statuses.get(str(dependent)) in _WAITING_STATUSES
         for candidate in cited
     )
+
+
+async def _cited_by_other_projects(
+    tm: TaskBackendProtocol, project_root: str, known_roots: Sequence[str],
+) -> frozenset[int]:
+    """This project's task ids that a waiting task in another known project names in ``external_deps``.
+
+    A failed read of another project propagates, so the backfill never holds blind.
+    """
+    project_id = resolve_project_id(project_root)
+    cited: set[int] = set()
+    for root in known_roots:
+        if resolve_project_id(root) == project_id:
+            continue
+        waiting = await tm.get_tasks(root, statuses=sorted(_WAITING_STATUSES), fields=_EXTERNAL_DEPS_FIELDS)
+        cited.update(
+            task_id for task in waiting['tasks'] for task_id in _external_citations(task, project_id)
+        )
+    return frozenset(cited)
+
+
+def _external_citations(task: Mapping[str, object], project_id: str) -> Iterator[int]:
+    """The ids of ``project_id`` tasks that *task* cites; an entry the scheduler cannot resolve cites nothing."""
+    entries = raw_metadata_dict(task.get('metadata'), source=_METADATA_SOURCE).get('external_deps')
+    for entry in entries if isinstance(entries, list) else ():
+        if not isinstance(entry, str):
+            continue
+        try:
+            dependency = ExternalDep.parse(entry)
+            task_id = int(dependency.task_id)
+        except ValueError:
+            continue
+        if normalize_project_id(dependency.project_id) == project_id:
+            yield task_id
 
 
 def _dependency_closure(

@@ -12,7 +12,7 @@ import socket
 import sys
 import threading
 import time
-from collections.abc import Awaitable, Callable, Iterable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
@@ -86,7 +86,7 @@ if TYPE_CHECKING:
     class _FollowupHoldBackfiller(Protocol):
         """What the startup follow-up hold backfill calls on the task interceptor."""
 
-        async def backfill_followup_holds(self, project_root: str) -> int: ...
+        async def backfill_followup_holds(self, project_root: str, *, known_roots: Sequence[str]) -> int: ...
 
 # Logging
 LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -1731,23 +1731,33 @@ async def _backfill_followup_holds(
     """Hold each known project's pending follow-up stock behind its holder, before serving.
 
     One project's failure is logged and never blocks startup or the other
-    projects (plans/follow-up-filing-shape-prd.md §3 decision 12).
+    projects (plans/follow-up-filing-shape-prd.md §3 decision 12). Every
+    project's backfill reads every real root, since another project can wait
+    on its follow-ups.
     """
-    from fused_memory.models.scope import is_phantom_project_root
-
     if not config.followup_hold.backfill_enabled:
         logger.info('  Follow-up hold backfill: disabled (followup_hold.backfill_enabled)')
         return
-    for root in project_roots:
-        if await asyncio.to_thread(is_phantom_project_root, root):
-            logger.warning('  Follow-up hold backfill: skipping %s, not a directory', root)
-            continue
+    real_roots = await _real_project_roots(project_roots)
+    for root in real_roots:
         try:
-            held = await interceptor.backfill_followup_holds(root)
+            held = await interceptor.backfill_followup_holds(root, known_roots=real_roots)
         except Exception:
             logger.exception('  Follow-up hold backfill failed for %s', root)
             continue
         logger.info('  Follow-up hold backfill: held %d task(s) in %s', held, root)
+
+
+async def _real_project_roots(project_roots: Iterable[str]) -> tuple[str, ...]:
+    from fused_memory.models.scope import is_phantom_project_root
+
+    real_roots: list[str] = []
+    for root in project_roots:
+        if await asyncio.to_thread(is_phantom_project_root, root):
+            logger.warning('  Follow-up hold backfill: skipping %s, not a directory', root)
+        else:
+            real_roots.append(root)
+    return tuple(real_roots)
 
 
 async def _run_checkpoint_cycle(targets: list[tuple[str, object]]) -> None:
