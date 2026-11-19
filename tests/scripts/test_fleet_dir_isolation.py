@@ -904,71 +904,100 @@ def _nested_adoption_run(
     )
 
 
-class TestTheAdoptBranchHoldsInARealSession:
-    """Two roots, one session, one redirect."""
+def _assert_both_roots_yield_the_one_redirect_the_env_var_holds(
+    root: Path, sub_root_conftest: str, *, suspect: str,
+) -> None:
+    """Run the two-root session wired by *sub_root_conftest* and assert ONE redirect.
 
-    @pytest.mark.parametrize(
-        'sub_root_conftest',
-        [_ADOPTION_CONFTEST, _ARMING_CONFTEST],
-        ids=['import-binding', 'arming'],
+    Asserts the PROPERTY, not the mechanism: whatever the wiring does
+    internally, both roots must agree on ONE directory and that directory must
+    be what ``ORCH_FLEET_DIR`` holds while each root's tests run. Both halves
+    are load-bearing -- agreeing on a path neither root exported would satisfy
+    the first one alone. *suspect* names the mechanism the caller pins, so a
+    red run points at it.
+    """
+    result = _nested_adoption_run(root, sub_root_conftest)
+    combined = result.stdout + result.stderr
+
+    assert result.returncode == 0, (
+        f'the two-root nested session exited {result.returncode}: a per-root '
+        'identity assertion failed or the session never reached its tests -- '
+        f'{suspect}. stdout={result.stdout!r} stderr={result.stderr!r}'
     )
+    assert '3 passed' in combined, (
+        'the nested session did not run all three modules, so it proves '
+        f'nothing about two roots sharing one redirect. output={combined!r}'
+    )
+
+    records = {
+        p.name: p.read_text().splitlines()
+        for p in sorted((root / 'observed').iterdir())
+    }
+    assert set(records) == {'a-first', 'a-second', 'b-only'}, records
+
+    yielded = {name: rec[0] for name, rec in records.items()}
+    env_seen = {name: rec[1] for name, rec in records.items()}
+
+    assert len(set(yielded.values())) == 1, (
+        'the two roots yielded DIFFERENT redirects, so at least one is '
+        'handing its tests a directory the env var does not name -- '
+        f'{suspect}. yielded={yielded!r}'
+    )
+    assert set(env_seen.values()) == set(yielded.values()), (
+        'every root agreed on a directory that is not what ORCH_FLEET_DIR '
+        'actually held, so a spawned script would read somewhere else '
+        f'entirely. yielded={yielded!r} env={env_seen!r}'
+    )
+
+
+class TestTheAdoptBranchHoldsInARealSession:
+    """Two roots, two instances of the redirect, one session, one redirect."""
+
     def test_both_roots_yield_the_one_redirect_the_env_var_holds(
-        self, tmp_path: Path, sub_root_conftest: str,
+        self, tmp_path: Path,
     ) -> None:
         """The end-to-end proof of ``_df_fleet_dir_redirect``'s adopt branch.
 
-        Asserts the PROPERTY, not the mechanism: whatever the two instances do
-        internally, they must agree on ONE directory and that directory must be
-        what ``ORCH_FLEET_DIR`` holds while each root's tests run. Both halves
-        are load-bearing -- agreeing on a path neither root exported would
-        satisfy the first one alone.
-
-        Without adoption this fails on the recorded paths (``fleet-dir0`` vs
-        ``fleet-dir1`` under one basetemp, which is verbatim what 4398
-        reported) and, when the A-B-A order holds, on the nested run's own exit
-        code as well.
+        Each sub-root imports the fixture into its conftest, so the session
+        holds two instances of it. Without adoption this fails on the recorded
+        paths (``fleet-dir0`` vs ``fleet-dir1`` under one basetemp, which is
+        verbatim what 4398 reported) and, when the A-B-A order holds, on the
+        nested run's own exit code as well.
 
         Note the nested session INHERITS this session's ``ORCH_FLEET_DIR``,
         which points into the OUTER basetemp -- so the first instance correctly
         REFUSES it (a previous run's value is never adoptable) and mktemps, and
-        under import binding only the second adopts: the create path and the
-        adopt path in one run. Under arming, both roots arm the one fixture, so
-        the same assertions pin that the production wiring still yields one
-        redirect.
+        only the second adopts: the create path and the adopt path in one run.
         """
-        root = tmp_path / 'two-roots'
-        result = _nested_adoption_run(root, sub_root_conftest)
-        combined = result.stdout + result.stderr
-
-        assert result.returncode == 0, (
-            'a two-root nested session failed its own per-root identity '
-            'assertions -- the redirect fixture is clobbering across roots '
-            f'again (task 4398). stdout={result.stdout!r} '
-            f'stderr={result.stderr!r}'
-        )
-        assert '3 passed' in combined, (
-            'the nested session did not run all three modules, so it proves '
-            f'nothing about two live instances. output={combined!r}'
+        _assert_both_roots_yield_the_one_redirect_the_env_var_holds(
+            tmp_path / 'two-roots', _ADOPTION_CONFTEST,
+            suspect=(
+                "_df_fleet_dir_redirect's adopt branch is not running, so its "
+                'two instances clobber each other across roots (task 4398)'
+            ),
         )
 
-        records = {
-            p.name: p.read_text().splitlines()
-            for p in sorted((root / 'observed').iterdir())
-        }
-        assert set(records) == {'a-first', 'a-second', 'b-only'}, records
 
-        yielded = {name: rec[0] for name, rec in records.items()}
-        env_seen = {name: rec[1] for name, rec in records.items()}
+class TestArmingFromTwoRootsYieldsOneRedirect:
+    """The production wiring: two roots arm the redirect, one session, one redirect."""
 
-        assert len(set(yielded.values())) == 1, (
-            'the two roots yielded DIFFERENT redirects, so at least one is '
-            'handing its tests a directory the env var does not name -- the '
-            f'adopt branch is not running. yielded={yielded!r}'
-        )
-        assert set(env_seen.values()) == set(yielded.values()), (
-            'every root agreed on a directory that is not what ORCH_FLEET_DIR '
-            'actually held, so a spawned script would read somewhere else '
-            f'entirely. yielded={yielded!r} env={env_seen!r}'
+    def test_both_roots_yield_the_one_redirect_the_env_var_holds(
+        self, tmp_path: Path,
+    ) -> None:
+        """Each sub-root calls ``arm_fleet_dir_isolation`` as the real roots do.
+
+        ``arm_fixtures`` registers the redirect once per session by plugin
+        name, so the second root's arm call is a no-op and the session holds a
+        single instance. If that idempotency broke, the second call would
+        register a duplicate plugin and abort the session at configure time.
+        """
+        _assert_both_roots_yield_the_one_redirect_the_env_var_holds(
+            tmp_path / 'two-roots', _ARMING_CONFTEST,
+            suspect=(
+                'check that arm_fixtures still registers each fixture once per '
+                'session by plugin name, and that arm_fleet_dir_isolation still '
+                'arms _df_fleet_dir_redirect'
+            ),
         )
 
 
