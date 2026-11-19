@@ -23,6 +23,8 @@ from legibility.detectors import AgentClass, SignalClass
 from legibility_carrier_fixtures import (
     PROSE_QUOTING_THE_SCHEMA,
     briefing_text,
+    census_synthesis_prompt,
+    census_verifier_prompt,
     coder_judgment,
     json_fenced,
 )
@@ -592,6 +594,12 @@ class TestReingestedContentIsNotScored:
         pytest.param([_assistant_texts(coder_judgment(_LITERAL_LINE))], id='coder_judgment'),
         pytest.param([_assistant_texts(json_fenced(coder_judgment(_LITERAL_LINE)))], id='json_fenced_coder_judgment'),
         pytest.param([_trickle_coder_prompt_turn()], id='trickle_coder_prompt'),
+        pytest.param(
+            [_user_turn(census_verifier_prompt(*_SIGNAL_LITERALS))], id='census_verifier_prompt',
+        ),
+        pytest.param(
+            [_user_turn(census_synthesis_prompt(_LITERAL_LINE))], id='census_synthesis_prompt',
+        ),
         pytest.param([_user_turn(briefing_text(_LITERAL_LINE))], id='briefing'),
         pytest.param(
             [_origin_stamped(_user_turn(_LITERAL_LINE), 'task-notification')],

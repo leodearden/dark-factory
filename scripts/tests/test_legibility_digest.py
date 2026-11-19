@@ -34,6 +34,7 @@ from legibility import inventory as inventory_mod
 from legibility_carrier_fixtures import (
     CENSUS_MEMORY_CONTEXT_TURN,
     CENSUS_QUOTE_OF_THE_ESCALATION_PAYLOAD,
+    HUMAN_TURNS_NAMING_A_CENSUS_PROMPT,
     HUMAN_TURNS_NAMING_AN_INJECTED_PROMPT,
     NON_HUMAN_ORIGIN_IDS,
     NON_HUMAN_ORIGIN_TURNS,
@@ -42,6 +43,8 @@ from legibility_carrier_fixtures import (
     UNKNOWN_PROVENANCE_TEXT,
     WATCHER_ROTATION_PROMPT,
     briefing_text,
+    census_synthesis_prompt,
+    census_verifier_prompt,
     coder_judgment,
     json_fenced,
     merger_prompt,
@@ -2065,6 +2068,17 @@ INJECTED_PROSE_PROMPTS = (
 """The generation-7 harness prose prompts. Two carry a df_guard literal in
 their review free text, which must not count as this session's signal."""
 
+CENSUS_INSTRUMENT_PROMPTS = (
+    pytest.param(
+        census_verifier_prompt(_BLOCKED_LITERAL, 'cat: x: No such file or directory'),
+        id='census_verifier',
+    ),
+    pytest.param(census_synthesis_prompt(_BLOCKED_LITERAL), id='census_synthesis'),
+)
+"""The generation-8 periodic-census instrument prompts. Each embeds a cluster
+quoting other sessions' signal literals, which must not count as this
+session's signal."""
+
 
 class TestHarnessInjectedTurnFilter:
     def test_briefing_shaped_turn_is_excluded_by_content(self):
@@ -2334,6 +2348,33 @@ class TestHarnessInjectedTurnFilter:
 
     @pytest.mark.parametrize('text', HUMAN_TURNS_NAMING_AN_INJECTED_PROMPT)
     def test_human_turn_naming_an_injected_prompt_stays_gold(self, text):
+        turns = mod.iter_user_turns([_user_text(text)])
+
+        assert [t['text'] for t in turns] == [text]
+
+    @pytest.mark.parametrize('prompt', CENSUS_INSTRUMENT_PROMPTS)
+    def test_census_instrument_prompt_is_excluded_from_iter_user_turns(self, prompt):
+        records = [_sdk_prompt(prompt), _user_text('please fix the bug')]
+
+        turns = mod.iter_user_turns(records)
+
+        assert [(t['index'], t['text']) for t in turns] == [(1, 'please fix the bug')]
+
+    @pytest.mark.parametrize('prompt', CENSUS_INSTRUMENT_PROMPTS)
+    def test_render_digest_census_instrument_session_has_no_gold_section(self, prompt):
+        digest = mod.render_digest(
+            [_with_session_meta(_sdk_prompt(prompt))], agent_class='legibility-instrument',
+        )
+
+        frontmatter_yaml, _ = _split_frontmatter(digest)
+        meta = yaml.safe_load(frontmatter_yaml)
+
+        assert '## User Corrections' not in digest
+        assert meta['n_user_turns'] == 0
+        assert meta['signal_counts'] == dict.fromkeys(mod.SIGNAL_COUNT_KEYS, 0)
+
+    @pytest.mark.parametrize('text', HUMAN_TURNS_NAMING_A_CENSUS_PROMPT)
+    def test_human_turn_naming_a_census_prompt_stays_gold(self, text):
         turns = mod.iter_user_turns([_user_text(text)])
 
         assert [t['text'] for t in turns] == [text]

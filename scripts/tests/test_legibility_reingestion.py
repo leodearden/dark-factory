@@ -15,6 +15,7 @@ from legibility import coder, reingestion
 from legibility_carrier_fixtures import (
     CENSUS_MEMORY_CONTEXT_TURN,
     CENSUS_QUOTE_OF_THE_ESCALATION_PAYLOAD,
+    HUMAN_TURNS_NAMING_A_CENSUS_PROMPT,
     HUMAN_TURNS_NAMING_AN_INJECTED_PROMPT,
     NON_HUMAN_ORIGIN_IDS,
     NON_HUMAN_ORIGIN_TURNS,
@@ -22,6 +23,8 @@ from legibility_carrier_fixtures import (
     UNKNOWN_PROVENANCE_TEXT,
     WATCHER_ROTATION_PROMPT,
     briefing_text,
+    census_synthesis_prompt,
+    census_verifier_prompt,
     coder_judgment,
     json_fenced,
     merger_prompt,
@@ -249,6 +252,14 @@ class TestHarnessInjectedTurnFilter:
         # records carry no origin and no isMeta, so only this text rule sees them.
         assert reingestion.is_harness_injected_turn(prior_round_adjudicator_prompt()) is True
 
+    def test_census_verifier_prompt_is_excluded_lockstep(self):
+        # LOCKSTEP via the REAL builder: the cluster JSON it embeds quotes
+        # other sessions' signal, which must never count as this session's.
+        assert reingestion.is_harness_injected_turn(census_verifier_prompt()) is True
+
+    def test_census_synthesis_prompt_is_excluded_lockstep(self):
+        assert reingestion.is_harness_injected_turn(census_synthesis_prompt()) is True
+
     def test_pre_5356_replan_prompt_is_excluded(self):
         # A RETIRED shape held for the archived corpus, so it is restated, not built.
         assert reingestion.is_harness_injected_turn(pre_5356_replan_prompt()) is True
@@ -258,6 +269,10 @@ class TestHarnessInjectedTurnFilter:
 
     @pytest.mark.parametrize('text', HUMAN_TURNS_NAMING_AN_INJECTED_PROMPT)
     def test_human_turn_naming_an_injected_prompt_is_retained(self, text):
+        assert reingestion.is_harness_injected_turn(text) is False
+
+    @pytest.mark.parametrize('text', HUMAN_TURNS_NAMING_A_CENSUS_PROMPT)
+    def test_human_turn_naming_a_census_prompt_is_retained(self, text):
         assert reingestion.is_harness_injected_turn(text) is False
 
     def test_human_turn_quoting_the_census_sighting_is_retained(self):
