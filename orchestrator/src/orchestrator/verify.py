@@ -103,6 +103,7 @@ from orchestrator.verify_cmd import (
     _XDIST_N_FLAGS as _XDIST_N_FLAGS,  # re-exported for test_verify_load_stamp.py
 )
 from orchestrator.verify_cmd import (
+    DEFECT_PLUGIN_DIR,
     ChainSegment,
     ToolKind,
     VerifyCmd,
@@ -5416,6 +5417,7 @@ def _target_subprocess_env(
     extra: dict[str, str] | None,
     *,
     worktree: Path | None = None,
+    defect_plugin: bool = False,
 ) -> dict[str, str]:
     """Build the subprocess env for a TARGET project's verify/build/test spawn.
 
@@ -5448,6 +5450,12 @@ def _target_subprocess_env(
     aimed at a pyproject declaring no ``[tool.ruff]`` it silently falls back to
     ruff's built-in defaults — a false green.  See pyproject.toml's
     ``[tool.ruff]`` decision block.)
+
+    When *defect_plugin* is set (a test leg injecting ``-p _df_defect_plugin``),
+    ``DEFECT_PLUGIN_DIR`` is MERGED into ``PYTHONPATH`` after the overlay, never
+    assigned: appended last, once, so a caller's own ``PYTHONPATH`` survives, and
+    the directory holds only the plugin module, so it shadows nothing
+    (plans/defect-tests-prd.md decision 19, B21).
     """
     env = {
         k: v
@@ -5467,7 +5475,18 @@ def _target_subprocess_env(
         env['RUFF_CACHE_DIR'] = str(Path(worktree) / '.ruff_cache')
     if extra:
         env.update(extra)
+    if defect_plugin:
+        env['PYTHONPATH'] = _pythonpath_with_plugin_dir(env.get('PYTHONPATH'))
     return env
+
+
+def _pythonpath_with_plugin_dir(pythonpath: str | None) -> str:
+    plugin_dir = str(DEFECT_PLUGIN_DIR)
+    if not pythonpath:
+        return plugin_dir
+    if plugin_dir in pythonpath.split(os.pathsep):
+        return pythonpath
+    return f'{pythonpath}{os.pathsep}{plugin_dir}'
 
 
 # ``ruff check --show-settings`` prints ``Settings path: "<abs path>"`` as its
@@ -6264,6 +6283,7 @@ async def _run_cmd(
     cpu_weight: int | None = None,
     memory_properties: tuple[str, ...] = (),
     clock_stop: ClockStopConfig | None = None,
+    defect_plugin: bool = False,
 ) -> tuple[int, str, bool]:
     """Run a shell command, return (returncode, combined output, timed_out).
 
@@ -6362,7 +6382,9 @@ async def _run_cmd(
     # Pinned by test_verify_ruff_config_boundary.py::
     # test_segmented_chain_anchors_each_segment_at_its_own_cwd — kept on one
     # line so the name greps.
-    subprocess_env: dict[str, str] = _target_subprocess_env(env, worktree=cwd)
+    subprocess_env: dict[str, str] = _target_subprocess_env(
+        env, worktree=cwd, defect_plugin=defect_plugin,
+    )
 
     proc = None
     pgid: int | None = None
