@@ -142,7 +142,7 @@ class TestAlreadyLandedDispatchGateAncestryHappyPath:
         anchored on the verdict's evidence sha, and returns True so the
         scheduler withholds dispatch this tick.
         """
-        h: Any = _build_harness(mock_orch_config)
+        h = _build_harness(mock_orch_config)
         h.git_ops = MagicMock()
         h.git_ops.resolve_branch_sha = AsyncMock(return_value=_TIP_SHA)
         h.git_ops.is_ancestor = AsyncMock(return_value=True)
@@ -170,7 +170,7 @@ def _wired_ancestry_harness(mock_orch_config) -> Harness:
     ``landing_producer`` accepts; each guard test overrides exactly one input
     to trip its veto.
     """
-    h: Any = _build_harness(mock_orch_config)
+    h = _build_harness(mock_orch_config)
     h.git_ops = MagicMock()
     h.git_ops.resolve_branch_sha = AsyncMock(return_value=_TIP_SHA)
     h.git_ops.is_ancestor = AsyncMock(return_value=True)
@@ -206,7 +206,7 @@ class TestAlreadyLandedDispatchGateAncestryGuards:
     async def test_a_refused_verdict_vetoes_the_flip(
         self, mock_orch_config, landing_producer: AsyncMock, reason: LandingReason,
     ) -> None:
-        h: Any = _wired_ancestry_harness(mock_orch_config)
+        h = _wired_ancestry_harness(mock_orch_config)
         file_escalation = MagicMock()
         h._file_unattributed_landing_escalation = file_escalation
         landing_producer.return_value = _refused_verdict(reason)
@@ -223,7 +223,7 @@ class TestAlreadyLandedDispatchGateAncestryGuards:
         """The producer, not the gate, chooses the anchor: a citing merge
         commit or patch-id twin on main, never the live tip itself.
         """
-        h: Any = _wired_ancestry_harness(mock_orch_config)
+        h = _wired_ancestry_harness(mock_orch_config)
         merge_commit_sha = 'c' * 40
         landing_producer.return_value = _landed_verdict(merge_commit_sha)
 
@@ -247,7 +247,7 @@ class TestAlreadyLandedDispatchGateAncestryDelegatesToHelper:
     async def test_the_producer_is_called_with_the_arms_contract(
         self, mock_orch_config, landing_producer: AsyncMock,
     ) -> None:
-        h: Any = _wired_ancestry_harness(mock_orch_config)
+        h = _wired_ancestry_harness(mock_orch_config)
         metadata = {'branch_base_sha': '9' * 40}
         h.scheduler.get_task = AsyncMock(return_value={'id': '42', 'metadata': metadata})
         queue = MagicMock()
@@ -666,7 +666,7 @@ class TestAlreadyLandedDispatchGateMarkerPath:
         is recorded in
         ``docs/prds/landed-not-done-recovery.effect-present-caller-enumeration.md`` §7.
         """
-        h: Any = _wired_marker_harness(
+        h = _wired_marker_harness(
             mock_orch_config,
             marker_sha='b' * 40,
             branch_base_sha='e' * 40,
@@ -722,7 +722,7 @@ def _wired_off_main_tip_harness(
     previously adjudicated.  With *tmp_path*, the event store and the
     recovery-emission config are real, as in :func:`_emitting_harness`.
     """
-    h: Any = _build_harness(mock_orch_config)
+    h = _build_harness(mock_orch_config)
     h.git_ops = MagicMock()
     h.git_ops.resolve_branch_sha = AsyncMock(return_value=_TIP_SHA)
     h.git_ops.is_ancestor = AsyncMock(return_value=False)
@@ -768,7 +768,7 @@ class TestAlreadyLandedDispatchGateContentEquivalence:
         and files exactly one 'provenance_unattributed' escalation carrying
         the branch and the reason.
         """
-        h: Any = _wired_off_main_tip_harness(mock_orch_config)
+        h = _wired_off_main_tip_harness(mock_orch_config)
         mark = cast(AsyncMock, h._mark_in_progress_done)
         queue = cast(MagicMock, h._escalation_queue)
         landing_producer.return_value = _refused_verdict(
@@ -799,7 +799,7 @@ class TestAlreadyLandedDispatchGateContentEquivalence:
         citing commit, else the tip's patch-id twin), never main HEAD, and no
         escalation is filed.
         """
-        h: Any = _wired_off_main_tip_harness(mock_orch_config)
+        h = _wired_off_main_tip_harness(mock_orch_config)
         mark = cast(AsyncMock, h._mark_in_progress_done)
         landing_producer.return_value = _landed_verdict(evidence_sha)
 
@@ -820,7 +820,7 @@ class TestAlreadyLandedDispatchGateContentEquivalence:
         """No landing at all: the gate returns False so the task dispatches
         normally this tick, with no escalation and no mark_done.
         """
-        h: Any = _wired_off_main_tip_harness(mock_orch_config)
+        h = _wired_off_main_tip_harness(mock_orch_config)
         landing_producer.return_value = _not_contained()
 
         result = await h._already_landed_dispatch_gate('42')
@@ -953,7 +953,7 @@ class TestAlreadyLandedDispatchGateStaleEvidenceConflict:
         # done-write — only then can the stale-evidence rejection this test
         # exercises fire from mark_done.
         landing_producer.return_value = _landed_verdict('c' * 40)
-        h: Any = _wired_off_main_tip_harness(mock_orch_config)
+        h = _wired_off_main_tip_harness(mock_orch_config)
         _let_mark_in_progress_done_run_for_real(h, tmp_path)
         h._escalation_queue = EscalationQueue(tmp_path / 'esc')
         h._provenance_conflict_sink = ProvenanceConflictSink(
@@ -1383,7 +1383,7 @@ class TestAlreadyLandedDispatchGateBranchExistencePreFilter:
         own internal gate would just return None anyway since the branch ref
         still exists — and the gate must not stamp.
         """
-        h: Any = _wired_off_main_tip_harness(mock_orch_config)
+        h = _wired_off_main_tip_harness(mock_orch_config)
         marker_search = AsyncMock(return_value=None)
         h.git_ops.find_merge_marker = marker_search
         mark = cast(AsyncMock, h._mark_in_progress_done)
@@ -2712,7 +2712,7 @@ class TestAlreadyLandedGateOffMainTipArm:
     async def test_an_unattributed_landing_escalates_and_dispatches(
         self, mock_orch_config, tmp_path, landing_producer: AsyncMock,
     ) -> None:
-        h: Any = _wired_off_main_tip_harness(mock_orch_config, tmp_path)
+        h = _wired_off_main_tip_harness(mock_orch_config, tmp_path)
         file_escalation = MagicMock()
         h._file_unattributed_landing_escalation = file_escalation
         mark = cast(AsyncMock, h._mark_in_progress_done)
@@ -2745,7 +2745,7 @@ class TestAlreadyLandedGateOffMainTipArm:
         self, mock_orch_config, tmp_path, landing_producer: AsyncMock,
         reason: LandingReason,
     ) -> None:
-        h: Any = _wired_off_main_tip_harness(mock_orch_config, tmp_path)
+        h = _wired_off_main_tip_harness(mock_orch_config, tmp_path)
         file_escalation = MagicMock()
         h._file_unattributed_landing_escalation = file_escalation
         mark = cast(AsyncMock, h._mark_in_progress_done)
@@ -2764,7 +2764,7 @@ class TestAlreadyLandedGateOffMainTipArm:
         self, mock_orch_config, tmp_path, landing_producer: AsyncMock,
     ) -> None:
         """git_error is a claim about the detector, so it is never recorded as not_landed."""
-        h: Any = _emitting_harness(mock_orch_config, tmp_path)
+        h = _emitting_harness(mock_orch_config, tmp_path)
         file_escalation = MagicMock()
         h._file_unattributed_landing_escalation = file_escalation
         landing_producer.return_value = _refused_verdict(

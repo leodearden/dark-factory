@@ -99,19 +99,18 @@ class WiredGate:
              patch('orchestrator.harness.Scheduler'), \
              patch('orchestrator.harness.BriefingAssembler'):
             self.harness = Harness(mock_orch_config)
-        h: Any = self.harness
-        h.event_store = EventStore(tmp_path / 'runs.db', 'run-test')
-        h.scheduler.get_task = AsyncMock(
+        self.harness.event_store = EventStore(tmp_path / 'runs.db', 'run-test')
+        self.harness.scheduler.get_task = AsyncMock(
             return_value={'id': TASK_ID, 'metadata': sc.metadata},
         )
         self.mark = AsyncMock()
-        h._mark_in_progress_done = self.mark
+        self.harness._mark_in_progress_done = self.mark
         self.queue = MagicMock()
         self.queue.get_by_task = MagicMock(return_value=[])
         self.queue.has_open_l1 = MagicMock(return_value=False)
         self.queue.find_terminal_by_citation = MagicMock(return_value=None)
         self.queue.make_id = MagicMock(return_value=f'esc-{TASK_ID}-1')
-        h._escalation_queue = self.queue
+        self.harness._escalation_queue = self.queue
 
     async def run(self) -> bool:
         return await self.harness._already_landed_dispatch_gate(TASK_ID)
