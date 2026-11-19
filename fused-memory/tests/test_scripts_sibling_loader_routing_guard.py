@@ -31,8 +31,6 @@ LOADER_FACTORIES = frozenset({'spec_from_file_location', 'spec_from_loader', 'So
 EXEMPT_LOADERS = frozenset(
     {
         # Different policy; migration owned by pending task 7123.
-        # Raises FixtureError rather than ImportError when there is no spec.
-        ('bake_off_storage_shape.py', '_load_sibling_script'),
         # Deliberately execs a fresh copy and never registers it.
         ('cgl_eta_auto_apply_impl.py', '_load_migrate'),
     }
