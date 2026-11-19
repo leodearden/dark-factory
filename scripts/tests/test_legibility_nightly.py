@@ -34,6 +34,7 @@ from legibility import (
     codebook,
     digest,
     invariants,
+    layout,
     nightly,
     plan_deviation_census,
     session_ledger,
@@ -5866,7 +5867,8 @@ class TestNeverRunDates:
 
 class TestScheduledPassOverAReachedDate:
     """The 03:00 pass after a post-midnight catch-up re-targets the date the
-    catch-up already ran, so it skips the sessions the ledger holds."""
+    catch-up already ran, so it codes only the selected sessions the ledger
+    does not hold."""
 
     def test_a_scheduled_pass_re_targeting_a_reached_date_skips_ledgered_sessions(
         self, tmp_path,
@@ -5901,6 +5903,41 @@ class TestScheduledPassOverAReachedDate:
         prompts: list[str] = []
 
         runner.night(13, 'productive', invoke=_counting_invoke(prompts))
+
+        assert len(prompts) == 1
+
+    def test_a_re_targeting_pass_codes_no_clone_of_a_session_the_catch_up_coded(
+        self, tmp_path,
+    ):
+        runner = _NightRunner(tmp_path)
+        _write_transcript(
+            runner.projects_root / _encode_cwd(runner.work_cwd) / 'session-13-clone.jsonl',
+            cwd=runner.work_cwd, timestamp='2026-07-13T11:00:00Z',
+            session_id='session-13-clone',
+        )
+        first: list[str] = []
+        runner.scheduled_night(13, 'productive', invoke=_counting_invoke(first))
+        assert len(first) == 1
+        cb_before = layout.codebook_path(runner.repo).read_text()
+        subjects_before = _commit_subjects(runner.repo)
+        again: list[str] = []
+
+        runner.scheduled_night(13, 'productive', invoke=_counting_invoke(again))
+
+        assert again == []
+        assert layout.codebook_path(runner.repo).read_text() == cb_before
+        assert _commit_subjects(runner.repo) == subjects_before
+        assert runner.recorded()['outcome'] == 'productive'
+        assert runner.recorded()['counters']['selected_count'] == 1
+
+    def test_a_re_targeting_pass_after_a_deferred_catch_up_codes_the_night(
+        self, tmp_path,
+    ):
+        runner = _NightRunner(tmp_path)
+        runner.scheduled_night(13, 'capped')
+        prompts: list[str] = []
+
+        runner.scheduled_night(13, 'productive', invoke=_counting_invoke(prompts))
 
         assert len(prompts) == 1
 
