@@ -85,11 +85,17 @@ from orchestrator.merge_lane.dead_base_ledger import (
     VoidPoint,
 )
 from orchestrator.merge_lane.dispatch_ports import (
+    ChainPlanning,
+    DeadBases,
     DispatchCustody,
-    DispatchSpeculation,
+    DispatchRemerge,
     DispatchWorktrees,
     LaneVerifyContext,
     LeaseContention,
+    MainTip,
+    MergerAnchor,
+    SpeculationPermits,
+    VerifyFrontier,
     VerifyRetryBudgets,
 )
 from orchestrator.merge_lane.disposition import (
@@ -6071,51 +6077,63 @@ class SpeculativeMergeWorker:
                 note_transition=lambda rid, before, after, live: self._note_transition(
                     rid, before, after, live_obj=live,
                 ),
-                has_inflight_verify=lambda: any(e.in_verify_frontier for e in self._inflight),
                 release_at_verdict=lambda verify, slot: self._verify_releasing_at_verdict(
                     verify, slot,
                 ),
             ),
-            speculation=DispatchSpeculation(
-                mark_next_dispatch_unchained=lambda ids: self._next_dispatch_unchained.update(ids),
-                end_chain_reservation=lambda rid: self._end_chain_reservation(
-                    rid, all_landed=False,
+            frontier=VerifyFrontier(
+                has_inflight_verify=lambda: any(e.in_verify_frontier for e in self._inflight),
+                frontier_depth=lambda: self._verify_frontier_depth(),
+                frontier_base_commits=lambda: self._frontier_base_commits(),
+                verify_base_divergence=lambda item, main: (
+                    self._verify_base_divergence_at_dispatch(item, main)
+                ),
+            ),
+            chain_planning=ChainPlanning(
+                probe_placement=lambda item: self._probe_verify_placement(item),
+                deep_chain_placement=lambda item, depth, is_local: self._deep_chain_placement(
+                    item, frontier_depth=depth, verify_is_local=is_local,
                 ),
                 note_tip_result=lambda reason, depth, out: self._note_tip_result(
                     reason, depth, out,
                 ),
+                mark_next_dispatch_unchained=lambda ids: self._next_dispatch_unchained.update(ids),
+                end_chain_reservation=lambda rid: self._end_chain_reservation(
+                    rid, all_landed=False,
+                ),
+            ),
+            permits=SpeculationPermits(
                 release_cap_permit=lambda permit: self._merge_ahead_ledger.release(permit),
                 release_permit=lambda permit: self._speculation_ledger.release(permit),
+            ),
+            remerge=DispatchRemerge(
                 previous_failed=lambda: self._n_failed,
-                has_dead_bases=lambda: bool(self._dead_base_commits),
-                main_sha_or_empty=lambda reader: self._main_sha_or_empty(reader),
-                chain_dead_link=lambda item, main: self._chain_dead_link(item, main),
                 claim_remerge_base=lambda item, main, permit: self._claim_remerge_base(
                     item, main, permit,
                 ),
+                emit_stale_discard=lambda task_id, reason, anchor: self._emit_speculative(
+                    EventType.speculative_discard, task_id, reason=reason, **anchor.to_wire(),
+                ),
+                remerge=lambda req, started, claim: self._remerge(req, started, claim=claim),
+            ),
+            main_tip=MainTip(
+                main_sha_or_empty=lambda reader: self._main_sha_or_empty(reader),
+                note_main_sha=lambda sha: self._intake.note_main_sha(sha),
+            ),
+            dead_bases=DeadBases(
+                has_dead_bases=lambda: bool(self._dead_base_commits),
+                chain_dead_link=lambda item, main: self._chain_dead_link(item, main),
                 emit_dead_base_discard=lambda req, item, dead, point, anchor: (
                     self._emit_dead_base_discard(req, item, dead, point=point, anchor=anchor)
-                ),
-                emit_speculative=lambda event, task_id, **data: self._emit_speculative(
-                    event, task_id, **data,
                 ),
                 record_item_commit_dead=lambda item, site, notify: self._record_item_commit_dead(
                     item, site, notify_merger=notify,
                 ),
-                remerge=lambda req, started, claim: self._remerge(req, started, claim=claim),
+            ),
+            merger=MergerAnchor(
                 notify_merger_of_dead=lambda shas: self._notify_merger_of_dead(shas),
                 reanchor_merger_on=lambda dead, replacement: self._reanchor_merger_on(
                     dead, replacement,
-                ),
-                note_main_sha=lambda sha: self._intake.note_main_sha(sha),
-                verify_base_divergence=lambda item, main: (
-                    self._verify_base_divergence_at_dispatch(item, main)
-                ),
-                frontier_base_commits=lambda: self._frontier_base_commits(),
-                probe_placement=lambda item: self._probe_verify_placement(item),
-                frontier_depth=lambda: self._verify_frontier_depth(),
-                deep_chain_placement=lambda item, depth, is_local: self._deep_chain_placement(
-                    item, frontier_depth=depth, verify_is_local=is_local,
                 ),
             ),
             worktrees=DispatchWorktrees(

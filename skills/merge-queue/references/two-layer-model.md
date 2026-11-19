@@ -482,9 +482,9 @@ API as one-statement delegators.
 ### 7.9 The verify modules — hosts, post-merge verify, in-flight verify and the dispatcher (merge-lane-quality κ, task 5040)
 
 Task 5040 moved the lane's verify execution out of `merge_lane/worker.py` into nine modules, and
-none imports the worker. The concerns the dispatcher does not own (request custody, speculation,
-merge worktrees, lease contention) reach it through the four ports of `dispatch_ports.py`, each
-built by the worker as callables that re-read its live members.
+none imports the worker. The concerns the dispatcher does not own reach it through the ports of
+`dispatch_ports.py`, one concern each, built by the worker as callables that re-read its live
+members.
 
 | Module | Purpose |
 |--------|---------|
@@ -496,7 +496,7 @@ built by the worker as callables that re-read its live members.
 | `merge_lane/verify_failure_outcome.py` | Turn a red post-merge verify into the blocked `MergeOutcome` it earns (`red_verify_outcome`, `verify_hit_enospc`) |
 | `merge_lane/inflight_verify.py` | `InflightVerifyRun`: one dispatched item's verify on its held lease, polled for a verdict or one of the three mid-run abandonments (the interrupts live here), then settled |
 | `merge_lane/verify_dispatch.py` | `VerifyDispatcher`: dispatch a merged item onto a free host, launch its in-flight verify, bind every post-merge verify to the lane context, run a parked gate's history leg; owns the verify tuning, attempt counts and the chain-invalidation flag |
-| `merge_lane/dispatch_ports.py` | `DispatchCustody` (toward μ), `DispatchSpeculation` (λ), `DispatchWorktrees` (ν), `LeaseContention` (ξ), `LaneVerifyContext`, `VerifyRetryBudgets` |
+| `merge_lane/dispatch_ports.py` | Request and entry custody `DispatchCustody` and the verify frontier `VerifyFrontier` (toward μ); `ChainPlanning`, `SpeculationPermits`, `DispatchRemerge` and `MainTip` (λ); the INV-3 dead-base ledger `DeadBases`; the merger's held base `MergerAnchor`; `DispatchWorktrees` (ν); `LeaseContention` (ξ); `LaneVerifyContext`, `VerifyRetryBudgets` |
 
 Former worker symbols and their homes:
 

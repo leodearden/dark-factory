@@ -32,15 +32,20 @@ from _merge_lane_fakes import (
 )
 
 from orchestrator.config import GitConfig, OrchestratorConfig
-from orchestrator.event_store import EventType
 from orchestrator.git_ops import GitOps, MergeVerifyLeaseContended
 from orchestrator.merge_lane.dead_base_ledger import DeadBaseSite, VoidPoint
 from orchestrator.merge_lane.dispatch_ports import (
+    ChainPlanning,
+    DeadBases,
     DispatchCustody,
-    DispatchSpeculation,
+    DispatchRemerge,
     DispatchWorktrees,
     LaneVerifyContext,
     LeaseContention,
+    MainTip,
+    MergerAnchor,
+    SpeculationPermits,
+    VerifyFrontier,
     VerifyRetryBudgets,
 )
 from orchestrator.merge_lane.halt import HaltState
@@ -156,42 +161,66 @@ class _Ports:
             note_transition=lambda rid, before, after, live: self.record(
                 'note_transition', before, after,
             ),
-            has_inflight_verify=lambda: self.in_verify,
             release_at_verdict=self._release_at_verdict,
         )
 
-    def speculation(self) -> DispatchSpeculation:
-        return DispatchSpeculation(
+    def frontier(self) -> VerifyFrontier:
+        return VerifyFrontier(
+            has_inflight_verify=lambda: self.in_verify,
+            frontier_depth=lambda: 0,
+            frontier_base_commits=lambda: (set(), set()),
+            verify_base_divergence=lambda item, main: None,
+        )
+
+    def chain_planning(self) -> ChainPlanning:
+        return ChainPlanning(
+            probe_placement=lambda item: None,
+            deep_chain_placement=self._deep_chain_placement,
+            note_tip_result=lambda reason, depth, out: self.record('note_tip_result', depth),
             mark_next_dispatch_unchained=lambda ids: self.record('unchained', tuple(ids)),
             end_chain_reservation=lambda rid: self.record('end_chain_reservation', rid),
-            note_tip_result=lambda reason, depth, out: self.record('note_tip_result', depth),
+        )
+
+    def permits(self) -> SpeculationPermits:
+        return SpeculationPermits(
             release_cap_permit=lambda permit: self.record('release_cap_permit'),
             release_permit=lambda permit: self.record('release_permit'),
+        )
+
+    def remerge(self) -> DispatchRemerge:
+        return DispatchRemerge(
             previous_failed=lambda: self.previous_failed,
-            has_dead_bases=lambda: self.dead_link is not None,
-            main_sha_or_empty=self._main_sha,
-            chain_dead_link=lambda item, main: self.dead_link,
             claim_remerge_base=lambda item, main, permit: RemergeClaim(
                 anchor=RemergeBase(tip=None, reason=RemergeReason.NO_TIP), permit=None,
             ),
+            emit_stale_discard=lambda task_id, reason, anchor: self.record(
+                'emit_stale_discard', reason,
+            ),
+            remerge=self._remerge,
+        )
+
+    def main_tip(self) -> MainTip:
+        return MainTip(
+            main_sha_or_empty=self._main_sha,
+            note_main_sha=lambda sha: self.record('note_main_sha'),
+        )
+
+    def dead_bases(self) -> DeadBases:
+        return DeadBases(
+            has_dead_bases=lambda: self.dead_link is not None,
+            chain_dead_link=lambda item, main: self.dead_link,
             emit_dead_base_discard=lambda req, item, dead, point, anchor: self.record(
                 'emit_dead_base_discard', dead, point,
-            ),
-            emit_speculative=lambda event, task_id, **data: self.record(
-                'emit_speculative', event, data['reason'],
             ),
             record_item_commit_dead=lambda item, site, notify: self.record(
                 'record_item_commit_dead', site, notify,
             ),
-            remerge=self._remerge,
+        )
+
+    def merger(self) -> MergerAnchor:
+        return MergerAnchor(
             notify_merger_of_dead=lambda shas: self.record('notify_merger_of_dead'),
             reanchor_merger_on=lambda dead, replacement: self.record('reanchor_merger_on'),
-            note_main_sha=lambda sha: self.record('note_main_sha'),
-            verify_base_divergence=lambda item, main: None,
-            frontier_base_commits=lambda: (set(), set()),
-            probe_placement=lambda item: None,
-            frontier_depth=lambda: 0,
-            deep_chain_placement=self._deep_chain_placement,
         )
 
     def worktrees(self) -> DispatchWorktrees:
@@ -269,7 +298,13 @@ class _Scene:
                 ),
             ),
             custody=ports.custody(),
-            speculation=ports.speculation(),
+            frontier=ports.frontier(),
+            chain_planning=ports.chain_planning(),
+            permits=ports.permits(),
+            remerge=ports.remerge(),
+            main_tip=ports.main_tip(),
+            dead_bases=ports.dead_bases(),
+            merger=ports.merger(),
             worktrees=ports.worktrees(),
             contention=ports.contention(),
         )
@@ -507,7 +542,7 @@ _OUT_OF_REMERGE = ('note_transition', ItemLifecycleState.MERGING, ItemLifecycleS
 
 
 def _stale_discards(ports: _Ports) -> list[str]:
-    return [call[2] for call in ports.calls if call[0] == 'emit_speculative']
+    return [call[1] for call in ports.calls if call[0] == 'emit_stale_discard']
 
 
 @pytest.mark.asyncio
@@ -634,7 +669,6 @@ class TestDispatch:
         entry = await dispatcher.dispatch(item)
 
         assert _stale_discards(scene.ports) == [reason]
-        assert ('emit_speculative', EventType.speculative_discard, reason) in scene.ports.calls
         assert ('record_item_commit_dead', DeadBaseSite.STALE_DISCARD, False) in scene.ports.calls
         assert scene.ports.names().count('note_transition') == 2
         assert isinstance(entry, InflightEntry) and entry.passthrough_outcome is not None
@@ -703,8 +737,9 @@ _HOMES = {
         'resolve_dispatch_time_merge_base',
     ),
     'orchestrator.merge_lane.dispatch_ports': (
-        'DispatchCustody', 'DispatchSpeculation', 'DispatchWorktrees', 'LeaseContention',
-        'LaneVerifyContext', 'VerifyRetryBudgets',
+        'DispatchCustody', 'VerifyFrontier', 'ChainPlanning', 'SpeculationPermits',
+        'DispatchRemerge', 'MainTip', 'DeadBases', 'MergerAnchor', 'DispatchWorktrees',
+        'LeaseContention', 'LaneVerifyContext', 'VerifyRetryBudgets',
     ),
 }
 _GONE_FROM_WORKER_MODULE = (

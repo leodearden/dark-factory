@@ -21,15 +21,20 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 from orchestrator.config import OrchestratorConfig
-from orchestrator.event_store import EventType
 from orchestrator.git_ops import GitOps
 from orchestrator.merge_lane.dead_base_ledger import DeadBaseSite, VoidPoint
 from orchestrator.merge_lane.dispatch_ports import (
+    ChainPlanning,
+    DeadBases,
     DispatchCustody,
-    DispatchSpeculation,
+    DispatchRemerge,
     DispatchWorktrees,
     LaneVerifyContext,
     LeaseContention,
+    MainTip,
+    MergerAnchor,
+    SpeculationPermits,
+    VerifyFrontier,
 )
 from orchestrator.merge_lane.halt import HaltState
 from orchestrator.merge_lane.inflight_verify import (
@@ -85,12 +90,11 @@ class _DeadBase:
     """INV-3 at dispatch: the item's base is a known-dead commit, *dead_link*."""
 
     dead_link: str
+    dead_bases: DeadBases
     site: ClassVar[DeadBaseSite] = DeadBaseSite.DISPATCH_VOID
 
-    def announce(
-        self, speculation: DispatchSpeculation, item: RealMergeItem, anchor: RemergeBase,
-    ) -> None:
-        speculation.emit_dead_base_discard(
+    def announce(self, item: RealMergeItem, anchor: RemergeBase) -> None:
+        self.dead_bases.emit_dead_base_discard(
             item.request, item, self.dead_link, VoidPoint.DISPATCH, anchor,
         )
         logger.info(
@@ -105,15 +109,11 @@ class _StaleMerge:
     """Mechanism 2: the item was merged onto a base that is no longer the one to verify on."""
 
     reason: str
+    remerge: DispatchRemerge
     site: ClassVar[DeadBaseSite] = DeadBaseSite.STALE_DISCARD
 
-    def announce(
-        self, speculation: DispatchSpeculation, item: RealMergeItem, anchor: RemergeBase,
-    ) -> None:
-        speculation.emit_speculative(
-            EventType.speculative_discard, item.request.task_id,
-            reason=self.reason, **anchor.to_wire(),
-        )
+    def announce(self, item: RealMergeItem, anchor: RemergeBase) -> None:
+        self.remerge.emit_stale_discard(item.request.task_id, self.reason, anchor)
         logger.info(
             'Task %s: discarding stale merge (%s), re-merging (%s)',
             item.request.task_id, self.reason, anchor.reason.value,
@@ -219,7 +219,13 @@ class VerifyDispatcher:
         halt: HaltState,
         lane_context: LaneVerifyContext,
         custody: DispatchCustody,
-        speculation: DispatchSpeculation,
+        frontier: VerifyFrontier,
+        chain_planning: ChainPlanning,
+        permits: SpeculationPermits,
+        remerge: DispatchRemerge,
+        main_tip: MainTip,
+        dead_bases: DeadBases,
+        merger: MergerAnchor,
         worktrees: DispatchWorktrees,
         contention: LeaseContention,
     ) -> None:
@@ -230,7 +236,13 @@ class VerifyDispatcher:
         self._halt = halt
         self._lane_context = lane_context
         self._custody = custody
-        self._speculation = speculation
+        self._frontier = frontier
+        self._chain_planning = chain_planning
+        self._permits = permits
+        self._remerge = remerge
+        self._main_tip = main_tip
+        self._dead_bases = dead_bases
+        self._merger = merger
         self._worktrees = worktrees
         self._chain_invalidated = False
         self._counters = InflightVerifyCounters()
@@ -241,7 +253,7 @@ class VerifyDispatcher:
             tuning=self,
             counters=self._counters,
             custody=custody,
-            speculation=speculation,
+            chain_planning=chain_planning,
             worktrees=worktrees,
             contention=contention,
             event_store=lane_context.event_store,
@@ -360,7 +372,7 @@ class VerifyDispatcher:
     def _release_cap_permit(self, item: SpeculativeItem) -> SpeculativeItem:
         """Mechanism 1: hand the merger-ahead cap back on drain, before any branching."""
         if isinstance(item, RealMergeItem) and item.cap_permit is not None:
-            self._speculation.release_cap_permit(item.cap_permit)
+            self._permits.release_cap_permit(item.cap_permit)
             return dataclasses.replace(item, cap_permit=None)
         return item
 
@@ -392,7 +404,7 @@ class VerifyDispatcher:
         item, so a replacement carries the permit its claim decided.
         """
         was_speculative = item.speculative
-        in_verify = self._custody.has_inflight_verify()
+        in_verify = self._frontier.has_inflight_verify()
         main_sha = await self._dispatch_main_sha(item, in_verify)
         cause = self._remerge_cause(item, main_sha, in_verify)
         if cause is not None:
@@ -416,13 +428,13 @@ class VerifyDispatcher:
         Mechanism 2 only for a non-speculative, non-group item with no verify
         in flight, so the steady speculative path reads no main at all.
         """
-        needs_main = self._speculation.has_dead_bases() or (
+        needs_main = self._dead_bases.has_dead_bases() or (
             not in_verify and not item.speculative
             and not isinstance(item.request, GroupMergeRequest)
         )
         if not needs_main:
             return ''
-        return await self._speculation.main_sha_or_empty('dispatch chain check')
+        return await self._main_tip.main_sha_or_empty('dispatch chain check')
 
     def _remerge_cause(
         self, item: RealMergeItem, main_sha: str, in_verify: bool,
@@ -436,13 +448,13 @@ class VerifyDispatcher:
         item stacked on an in-flight predecessor is the head-failure
         cascade's to re-merge.
         """
-        dead_link = self._speculation.chain_dead_link(item, main_sha) if main_sha else None
+        dead_link = self._dead_bases.chain_dead_link(item, main_sha) if main_sha else None
         if dead_link is not None:
-            return _DeadBase(dead_link)
+            return _DeadBase(dead_link, self._dead_bases)
         if in_verify:
             return None
         reason = self._stale_merge_reason(item, main_sha)
-        return None if reason is None else _StaleMerge(reason)
+        return None if reason is None else _StaleMerge(reason, self._remerge)
 
     def _stale_merge_reason(self, item: RealMergeItem, main_sha: str) -> str | None:
         """Mechanism 2's reason, or None.
@@ -453,7 +465,7 @@ class VerifyDispatcher:
         the ``main_advanced`` check rather than comparing against ''.
         """
         if item.speculative:
-            if self._speculation.previous_failed():
+            if self._remerge.previous_failed():
                 return 'previous_failed'
             return 'chain_invalidated' if self._chain_invalidated else None
         if isinstance(item.request, GroupMergeRequest) or not main_sha:
@@ -474,9 +486,9 @@ class VerifyDispatcher:
             req.request_id, ItemLifecycleState.DISPATCHING, ItemLifecycleState.MERGING, req,
         )
         await self._worktrees.cleanup_owned(item.merge_wt)
-        claim = self._speculation.claim_remerge_base(item, main_sha, item.permit)
-        cause.announce(self._speculation, item, claim.anchor)
-        self._speculation.record_item_commit_dead(item, cause.site, False)
+        claim = self._remerge.claim_remerge_base(item, main_sha, item.permit)
+        cause.announce(item, claim.anchor)
+        self._dead_bases.record_item_commit_dead(item, cause.site, False)
         replacement = await self._remerge_at_dispatch(item, claim)
         self._custody.note_transition(
             req.request_id, ItemLifecycleState.MERGING, ItemLifecycleState.DISPATCHING,
@@ -491,13 +503,13 @@ class VerifyDispatcher:
         *item*'s commit (D2): it re-points at the replacement, or at the live
         tip when the re-merge raises."""
         try:
-            replacement = await self._speculation.remerge(
+            replacement = await self._remerge.remerge(
                 item.request, item.started_monotonic, claim,
             )
         except BaseException:
-            self._speculation.notify_merger_of_dead((item.merge_result.merge_commit or '',))
+            self._merger.notify_merger_of_dead((item.merge_result.merge_commit or '',))
             raise
-        self._speculation.reanchor_merger_on(item, replacement)
+        self._merger.reanchor_merger_on(item, replacement)
         return replacement
 
     async def _discard_unlaunched_replacement(self, replacement: RealMergeItem) -> None:
@@ -505,10 +517,10 @@ class VerifyDispatcher:
         ever held, and record its commit dead so a merger re-pointed onto it moves off."""
         if replacement.permit is not None:
             with contextlib.suppress(BaseException):
-                self._speculation.release_permit(replacement.permit)
+                self._permits.release_permit(replacement.permit)
         with contextlib.suppress(BaseException):
             await self._worktrees.cleanup_owned(replacement.merge_wt)
-        self._speculation.record_item_commit_dead(replacement, DeadBaseSite.DISPATCH_VOID, True)
+        self._dead_bases.record_item_commit_dead(replacement, DeadBaseSite.DISPATCH_VOID, True)
 
     async def _launch(
         self, item: RealMergeItem, allocator: HostAllocator, was_speculative: bool,
@@ -535,7 +547,7 @@ class VerifyDispatcher:
                 await allocator.release(lease)
             if item.permit is not None:
                 with contextlib.suppress(BaseException):
-                    self._speculation.release_permit(item.permit)
+                    self._permits.release_permit(item.permit)
             raise
         return self._start_verify(item, lease, placement, was_speculative)
 
@@ -554,7 +566,7 @@ class VerifyDispatcher:
         build is released by the builder, before any chain reaches this frame.
         """
         divergence, guard_main = await self._observe_verify_base(item)
-        stacked_on, rebased_heads = self._speculation.frontier_base_commits()
+        stacked_on, rebased_heads = self._frontier.frontier_base_commits()
         facts = MergeVerifyDispatchFacts(
             runner_reason=lease.reason,
             base_relation=classify_base_relation(
@@ -562,9 +574,9 @@ class VerifyDispatcher:
                 stacked_on=stacked_on, rebased_heads=rebased_heads,
             ),
         )
-        probe = self._speculation.probe_placement(item)
-        depth = probe.depth if probe is not None else self._speculation.frontier_depth()
-        deep = await self._speculation.deep_chain_placement(item, depth, lease.is_local)
+        probe = self._chain_planning.probe_placement(item)
+        depth = probe.depth if probe is not None else self._frontier.frontier_depth()
+        deep = await self._chain_planning.deep_chain_placement(item, depth, lease.is_local)
         return _Placement(
             facts=facts.with_chain_depth_reason(deep.depth_reason),
             depth=depth,
@@ -586,8 +598,8 @@ class VerifyDispatcher:
         guard_main: str | None = None
         with contextlib.suppress(Exception):
             guard_main = await self._git_ops().get_main_sha()
-            self._speculation.note_main_sha(guard_main)
-            divergence = self._speculation.verify_base_divergence(item, guard_main)
+            self._main_tip.note_main_sha(guard_main)
+            divergence = self._frontier.verify_base_divergence(item, guard_main)
         return divergence, guard_main
 
     def _start_verify(

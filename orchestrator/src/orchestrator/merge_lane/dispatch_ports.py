@@ -1,13 +1,16 @@
 """The ports the verify dispatcher reaches its not-yet-extracted neighbours through.
 
 Each port groups the operations of one concern the dispatcher does not own,
-named for the module that will own it: request and entry custody (lifecycle
-and landing), speculation, merge-worktree ownership, and merge-verify-lane
-contention, plus the lane-wide context every post-merge verify inherits.
-The worker builds each as callables that re-read its live members on every
-call (the ``merge_lane/intake_buffers.py::IntakeLifecycle`` precedent), so a
-member replaced on the worker instance is still the one the dispatcher
-reaches; a later extraction replaces one port with its module object.
+and names the module that will own it: request and entry custody and the
+verify frontier (lifecycle and landing, μ); chain planning, the speculation
+permit ledgers, the dispatch-time re-merge and main as the lane last saw it
+(speculation, λ); the INV-3 dead-base ledger; the merger's held base; the
+merge worktrees (ν); and merge-verify-lane contention (ξ); plus the
+lane-wide context every post-merge verify inherits. The worker builds each
+as callables that re-read its live members on every call (the
+``merge_lane/intake_buffers.py::IntakeLifecycle`` precedent), so a member
+replaced on the worker instance is still the one the dispatcher reaches; a
+later extraction replaces one port with its module object.
 """
 from __future__ import annotations
 
@@ -42,7 +45,7 @@ from orchestrator.verify_runner import HostLease, RunnerUnavailable
 @dataclass(frozen=True)
 class DispatchCustody:
     """Who holds a dispatched request and its in-flight entry, and how a verify
-    hands either back: drop, requeue, bench its host, or adopt its head."""
+    hands either back: drop, requeue, bench its host, or adopt its head (μ)."""
 
     request_abandoned: Callable[[MergeRequest], bool]
     note_verify_completed: Callable[[object, InflightEntrySlot | None, HostLease | None], None]
@@ -62,8 +65,6 @@ class DispatchCustody:
         [str, ItemLifecycleState, ItemLifecycleState, SpeculativeItem | MergeRequest], None,
     ]
     """``(request_id, before, after, live_obj)``: one lifecycle-registry move."""
-    has_inflight_verify: Callable[[], bool]
-    """Whether any entry is in the verify frontier."""
     release_at_verdict: Callable[
         [Callable[[], Awaitable[InflightVerifyResult]], InflightEntrySlot],
         Awaitable[InflightVerifyResult],
@@ -72,44 +73,31 @@ class DispatchCustody:
 
 
 @dataclass(frozen=True)
-class DispatchSpeculation:
-    """The deep-chain policy state a verify's verdict feeds."""
+class VerifyFrontier:
+    """Read-only views of the verify frontier, the entries frozen ahead of a
+    new dispatch (μ, the sole writer of the in-flight deque)."""
 
+    has_inflight_verify: Callable[[], bool]
+    """Whether any entry is in the verify frontier."""
+    frontier_depth: Callable[[], int]
+    frontier_base_commits: Callable[[], tuple[set[str], set[str]]]
+    """``(stacked_on, rebased_heads)`` of the frozen verify frontier."""
+    verify_base_divergence: Callable[[SpeculativeItem, str], VerifyBaseDivergence | None]
+    """The frozen-tip detector: it observes, logs and escalates, never refuses."""
+
+
+@dataclass(frozen=True)
+class ChainPlanning:
+    """Where a dispatch verifies and the deep-chain policy state its verdict
+    feeds (λ, ``ChainPlanner``)."""
+
+    probe_placement: Callable[[RealMergeItem], ProbeAttribution | None]
+    deep_chain_placement: Callable[[RealMergeItem, int, bool], Awaitable[DeepPlacement]]
+    """``(item, frontier_depth, verify_is_local)``; an external cancel propagates."""
+    note_tip_result: Callable[[ChainDepthReason | None, int, MergeOutcome | None], None]
     mark_next_dispatch_unchained: Callable[[Iterable[str]], None]
     end_chain_reservation: Callable[[str], None]
     """End the owner's chain reservation as not all landed."""
-    note_tip_result: Callable[[ChainDepthReason | None, int, MergeOutcome | None], None]
-    release_cap_permit: Callable[[CapPermit], None]
-    release_permit: Callable[[SpecPermit], None]
-    previous_failed: Callable[[], bool]
-    """Whether the last head result was a failure."""
-    has_dead_bases: Callable[[], bool]
-    main_sha_or_empty: Callable[[str], Awaitable[str]]
-    """``(reader)``: main, or '' with the failed read logged against *reader*."""
-    chain_dead_link: Callable[[SpeculativeItem, str], str | None]
-    claim_remerge_base: Callable[[RealMergeItem, str, SpecPermit | None], RemergeClaim]
-    emit_dead_base_discard: Callable[
-        [MergeRequest, SpeculativeItem, str, VoidPoint, RemergeBase], None,
-    ]
-    """``(req, item, dead_link, point, anchor)``."""
-    emit_speculative: Callable[..., None]
-    """``(event_type, task_id, **data)``: one speculation event row."""
-    record_item_commit_dead: Callable[[SpeculativeItem, DeadBaseSite, bool], None]
-    """``(item, site, notify_merger)``."""
-    remerge: Callable[[MergeRequest, float | None, RemergeClaim], Awaitable[SpeculativeItem]]
-    """``(req, started_monotonic, claim)``: re-merge *req* onto the claim's anchor."""
-    notify_merger_of_dead: Callable[[Collection[str]], None]
-    reanchor_merger_on: Callable[[RealMergeItem, SpeculativeItem], None]
-    """``(superseded, replacement)``: re-point a merger holding the superseded commit."""
-    note_main_sha: Callable[[str], None]
-    verify_base_divergence: Callable[[SpeculativeItem, str], VerifyBaseDivergence | None]
-    """The frozen-tip detector: it observes, logs and escalates, never refuses."""
-    frontier_base_commits: Callable[[], tuple[set[str], set[str]]]
-    """``(stacked_on, rebased_heads)`` of the frozen verify frontier."""
-    probe_placement: Callable[[RealMergeItem], ProbeAttribution | None]
-    frontier_depth: Callable[[], int]
-    deep_chain_placement: Callable[[RealMergeItem, int, bool], Awaitable[DeepPlacement]]
-    """``(item, frontier_depth, verify_is_local)``; an external cancel propagates."""
 
 
 class ProbeAttribution(Protocol):
@@ -120,6 +108,63 @@ class ProbeAttribution(Protocol):
 
     @property
     def base(self) -> str: ...
+
+
+@dataclass(frozen=True)
+class SpeculationPermits:
+    """The merge-ahead cap and speculation-slot ledgers a dispatched item's
+    permits go back to (λ, the permit ledgers)."""
+
+    release_cap_permit: Callable[[CapPermit], None]
+    release_permit: Callable[[SpecPermit], None]
+
+
+@dataclass(frozen=True)
+class DispatchRemerge:
+    """Whether a merge went stale under speculation, and its re-merge onto a
+    claimed base (λ, ``Speculator``)."""
+
+    previous_failed: Callable[[], bool]
+    """Whether the last head result was a failure."""
+    claim_remerge_base: Callable[[RealMergeItem, str, SpecPermit | None], RemergeClaim]
+    emit_stale_discard: Callable[[str, str, RemergeBase], None]
+    """``(task_id, reason, anchor)``: the ``speculative_discard`` row of a stale merge."""
+    remerge: Callable[[MergeRequest, float | None, RemergeClaim], Awaitable[SpeculativeItem]]
+    """``(req, started_monotonic, claim)``: re-merge *req* onto the claim's anchor."""
+
+
+@dataclass(frozen=True)
+class MainTip:
+    """Main as the lane reads it and last saw it (λ, via the suffix tracker)."""
+
+    main_sha_or_empty: Callable[[str], Awaitable[str]]
+    """``(reader)``: main, or '' with the failed read logged against *reader*."""
+    note_main_sha: Callable[[str], None]
+
+
+@dataclass(frozen=True)
+class DeadBases:
+    """The INV-3 dead-base ledger: commits that will never reach main, and the
+    voids of items built on one (``merge_lane/dead_base_ledger.py::DeadBaseLedger``)."""
+
+    has_dead_bases: Callable[[], bool]
+    chain_dead_link: Callable[[SpeculativeItem, str], str | None]
+    emit_dead_base_discard: Callable[
+        [MergeRequest, SpeculativeItem, str, VoidPoint, RemergeBase], None,
+    ]
+    """``(req, item, dead_link, point, anchor)``."""
+    record_item_commit_dead: Callable[[SpeculativeItem, DeadBaseSite, bool], None]
+    """``(item, site, notify_merger)``."""
+
+
+@dataclass(frozen=True)
+class MergerAnchor:
+    """The base the merger holds to stack its next look-ahead on
+    (``merge_lane/speculation_controller.py::SpeculationController``)."""
+
+    notify_merger_of_dead: Callable[[Collection[str]], None]
+    reanchor_merger_on: Callable[[RealMergeItem, SpeculativeItem], None]
+    """``(superseded, replacement)``: re-point a merger holding the superseded commit."""
 
 
 @dataclass(frozen=True)

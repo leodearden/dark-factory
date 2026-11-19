@@ -27,8 +27,8 @@ from typing import Any, Protocol
 from orchestrator.event_store import EventStore
 from orchestrator.git_ops import GitOps, MergeVerifyLeaseContended, MergeVerifyLeaseHeld, _run
 from orchestrator.merge_lane.dispatch_ports import (
+    ChainPlanning,
     DispatchCustody,
-    DispatchSpeculation,
     DispatchWorktrees,
     LeaseContention,
     VerifyRetryBudgets,
@@ -175,7 +175,7 @@ class InflightVerifyLane:
     tuning: InflightVerifyTuning
     counters: InflightVerifyCounters
     custody: DispatchCustody
-    speculation: DispatchSpeculation
+    chain_planning: ChainPlanning
     worktrees: DispatchWorktrees
     contention: LeaseContention
     event_store: Callable[[], EventStore | None]
@@ -673,7 +673,7 @@ class InflightVerifyRun:
         lane.contention.clear_streak(req.task_id)
         if self._chain is None:
             return self._resolve_blocked(MergeOutcome('blocked', reason=f'Verification error: {exc}'))
-        lane.speculation.mark_next_dispatch_unchained([req.task_id])
+        lane.chain_planning.mark_next_dispatch_unchained([req.task_id])
         logger.warning(
             'Task %s: deep tip verify RAISED against tip=%s '
             '(%s) -- NOT attributed to this task (the tree was '
@@ -760,7 +760,7 @@ class InflightVerifyRun:
         and drops the item's ephemeral worktree; the adopting exit hands that
         worktree to finalize instead (task 3186)."""
         if self._chain is not None and not self._chain_adopting:
-            self._lane.speculation.end_chain_reservation(self._req.request_id)
+            self._lane.chain_planning.end_chain_reservation(self._req.request_id)
         await self._release_chain_lane()
         if not self._chain_adopting:
             await self._drop_chain_item_ephemeral_wt()
@@ -818,7 +818,7 @@ class InflightVerifyRun:
         lane, req, chain = self._lane, self._req, self._chain
         assert chain is not None
         chain_depth = 1 + len(chain.links)
-        lane.speculation.note_tip_result(self._dispatch_facts.chain_depth_reason, chain_depth, out)
+        lane.chain_planning.note_tip_result(self._dispatch_facts.chain_depth_reason, chain_depth, out)
         if self._chain_adopting:
             logger.info(
                 'Task %s: deep tip verify end (tip=%s, items=%d, passed=True) '
@@ -834,7 +834,7 @@ class InflightVerifyRun:
             'item next verifies un-chained',
             req.task_id, self._merge_commit[:8], chain_depth,
         )
-        lane.speculation.mark_next_dispatch_unchained(
+        lane.chain_planning.mark_next_dispatch_unchained(
             [req.task_id, *(task_id for task_id, _ in chain.links)],
         )
         await lane.custody.requeue_from_verify(self._item, self._slot)
@@ -844,7 +844,7 @@ class InflightVerifyRun:
         """Feed the pass estimate (a round the deep policy sized but did not
         chain still counts), then pass with the warm shadow baseline, fail,
         or report a low-disk skip."""
-        self._lane.speculation.note_tip_result(self._dispatch_facts.chain_depth_reason, 1, out)
+        self._lane.chain_planning.note_tip_result(self._dispatch_facts.chain_depth_reason, 1, out)
         task_id, merge = self._req.task_id, self._merge_commit[:8]
         if out is None:
             logger.info(f'Task {task_id}: verify end (merge={merge}, passed=True)')
