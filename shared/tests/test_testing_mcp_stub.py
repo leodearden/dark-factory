@@ -95,6 +95,12 @@ class TestStateful:
         assert resp.status_code == 400
         assert "Missing session ID" in resp.json()["error"]["message"]
 
+    def test_a_call_without_a_session_is_recorded_but_not_delivered(self):
+        with StubMcpServer(stateful=True) as server:
+            _post(server, TOOLS_CALL)
+            assert len(server.requests) == 1
+            assert server.delivered_arguments("update_task") == ()
+
     def test_initialize_mints_the_session_id(self):
         with StubMcpServer(stateful=True) as server:
             resp = _post(server, INITIALIZE)
@@ -177,6 +183,55 @@ class TestEitherMode:
         assert refused.status_code == 503
         assert served.status_code == 200
         assert decode_mcp_response_body(served)["result"]["structuredContent"]
+
+
+def _tool_call(name: str, arguments: dict) -> dict:
+    return _request("tools/call", {"name": name, "arguments": arguments}, request_id=2)
+
+
+@pytest.mark.parametrize("stateful", [False, True], ids=["stateless", "stateful"])
+class TestDeliveredArguments:
+    """A delivery is a tools/call past every transport refusal, whatever the tool answered."""
+
+    def test_served_calls_are_returned_per_tool_in_arrival_order(self, stateful):
+        with StubMcpServer(stateful=stateful) as server:
+            session_id = _open_session(server)
+            _post(server, _tool_call("update_task", {"id": "7"}), session_id=session_id)
+            _post(server, _tool_call("get_task", {"id": "9"}), session_id=session_id)
+            _post(server, _tool_call("update_task", {"id": "8"}), session_id=session_id)
+            assert server.delivered_arguments("update_task") == ({"id": "7"}, {"id": "8"})
+            assert server.delivered_arguments("get_task") == ({"id": "9"},)
+            assert server.delivered_arguments("initialize") == ()
+
+    def test_redirected_and_unacceptable_calls_are_recorded_but_not_delivered(self, stateful):
+        with StubMcpServer(stateful=stateful) as server:
+            session_id = _open_session(server)
+            arrived_before = len(server.requests)
+            headers = dict(MCP_POST_HEADERS)
+            if session_id is not None:
+                headers["mcp-session-id"] = session_id
+            redirected = httpx.post(
+                f"{server.url}/mcp/", json=TOOLS_CALL, headers=headers, follow_redirects=False,
+            )
+            del headers["Accept"]
+            unacceptable = httpx.post(f"{server.url}/mcp", json=TOOLS_CALL, headers=headers)
+            assert (redirected.status_code, unacceptable.status_code) == (307, 406)
+            assert len(server.requests) == arrived_before + 2
+            assert server.delivered_arguments("update_task") == ()
+
+    def test_a_gateway_503_is_not_delivered_and_the_served_retry_is(self, stateful):
+        with StubMcpServer(stateful=stateful, unavailable_tool_calls=1) as server:
+            session_id = _open_session(server)
+            _post(server, _tool_call("update_task", {"id": "refused"}), session_id=session_id)
+            _post(server, _tool_call("update_task", {"id": "served"}), session_id=session_id)
+            assert server.delivered_arguments("update_task") == ({"id": "served"},)
+
+    def test_a_scripted_failure_answer_is_still_delivered(self, stateful):
+        with StubMcpServer(stateful=stateful, answer=StubAnswer.IS_ERROR) as server:
+            session_id = _open_session(server)
+            resp = _post(server, TOOLS_CALL, session_id=session_id)
+            assert decode_mcp_response_body(resp)["result"]["isError"] is True
+            assert server.delivered_arguments("update_task") == ({"id": "7"},)
 
 
 @pytest.mark.parametrize("stateful", [False, True], ids=["stateless", "stateful"])
