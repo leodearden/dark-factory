@@ -14102,6 +14102,7 @@ class Harness:
                 pattern_template=self.git_ops.config.commit_citation_pattern,
                 delivered_checks=_declared_delivered_checks(metadata),
                 checks_enabled=self.config.delivered_checks.enabled,
+                branch_base_sha=metadata.get('branch_base_sha'),
             )
             # 'pending' is the structural status of every gate candidate.
             self._landing_rejects.observe(
@@ -14193,6 +14194,7 @@ class Harness:
                 pattern_template=self.git_ops.config.commit_citation_pattern,
                 delivered_checks=_declared_delivered_checks(metadata),
                 checks_enabled=self.config.delivered_checks.enabled,
+                branch_base_sha=metadata.get('branch_base_sha'),
             )
             if not verdict.accepted:
                 self._file_unattributed_landing_escalation(task_id, branch, verdict)

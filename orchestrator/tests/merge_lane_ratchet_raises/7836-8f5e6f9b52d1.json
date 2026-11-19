@@ -1,0 +1,18 @@
+{
+  "task_id": "7836",
+  "reason": "review fix (task 7836 amendment): the delivered-checks differential's escalation block now names the baseline rung and states plainly when an unavailable baseline ran no check, one new branch in the new _differential_baseline_lines; the same amendment pass lowered landing_evidence.py cognitive 185 -> 182 one commit earlier",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/landing_evidence.py",
+      "baseline": 182,
+      "current": 183
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5348,
+      "current": 5349
+    }
+  ]
+}

@@ -1048,6 +1048,24 @@ class TestMergeStatusGitAuthority:
             f'got: {calls[0].kwargs.get("delivered_checks")!r}'
         )
 
+    async def test_ancestor_arm_forwards_the_recorded_branch_base(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """DISCOVERY arm: the recorded base reaches the differential (task 7836)."""
+        calls = _record_validate_landing_evidence(monkeypatch)
+        declared = [{'kind': 'grep', 'pattern': 'def foo', 'expect': 'present'}]
+        server, _ = self._ancestor_arm_server(
+            tmp_path, '7836', tip='a' * 40, citation='c' * 40,
+            metadata={'branch_base_sha': 'b' * 40, 'delivered_checks': declared},
+        )
+
+        await call_merge_status(server, task_id='7836')
+
+        assert len(calls) == 1, (
+            f'Expected exactly one validate_landing_evidence call, got: {calls}'
+        )
+        assert calls[0].kwargs['branch_base_sha'] == 'b' * 40
+
     async def test_ancestor_arm_forwards_empty_list_never_none(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

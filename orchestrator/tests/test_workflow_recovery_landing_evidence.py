@@ -144,13 +144,13 @@ class TestFallbackStampsTheTasksOwnCitation:
         assert outcome is None
         f.mark_done.assert_not_awaited()
 
-    async def test_validates_the_tasks_own_branch_tip_checks_and_pattern(
+    async def test_validates_the_tasks_own_branch_tip_base_checks_and_pattern(
         self, tmp_path: Path, guard: _Guard, note: str, tip: str,
     ) -> None:
         """DISCOVERY mode, shaped like the harness dispatch gate's ancestry arm."""
         f = _fixture(tmp_path)
         checks = [{'name': 'cap-x', 'kind': 'grep', 'pattern': 'y', 'expect': 'present'}]
-        f.wf.task['metadata'] = {'delivered_checks': checks}
+        f.wf.task['metadata'] = {'delivered_checks': checks, 'branch_base_sha': 'b' * 40}
         validate = AsyncMock(return_value=SimpleNamespace(
             accepted=False, evidence_sha=None, reason='no_citation',
         ))
@@ -166,6 +166,7 @@ class TestFallbackStampsTheTasksOwnCitation:
         assert kwargs['branch_tip_sha'] == tip
         assert kwargs['pattern_template'] == f.wf.git_ops.config.commit_citation_pattern
         assert kwargs['delivered_checks'] == checks
+        assert kwargs['branch_base_sha'] == 'b' * 40
         assert 'candidate_sha' not in kwargs
 
     @pytest.mark.parametrize('enabled', [True, False])
