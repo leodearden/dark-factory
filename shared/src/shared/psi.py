@@ -370,10 +370,10 @@ class PsiSample:
     def _tripping_arms(self, cfg) -> Iterator[_Arm]:
         """Yield the arms of ``_ARMS`` this sample trips, in D10 rank order."""
         for arm in _ARMS:
-            # Absence means "arm off", so a v1-shaped cfg cannot raise inside the
-            # dispatch gate. The rename hazard is guarded on the config side:
-            # orchestrator/tests/test_config_psi_admission_reload.py::
-            # TestPsiAdmissionArmVocabulary pins these arm fields to the config's.
+            # Absence means arm off; `saturated` documents why. The rename hazard
+            # is guarded on the config side, where
+            # orchestrator/tests/test_config_psi_admission_reload.py::TestPsiAdmissionArmVocabulary
+            # pins these arm fields to the config's.
             threshold = getattr(cfg, arm.field, None)
             if threshold is None:
                 continue
