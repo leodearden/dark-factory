@@ -3168,6 +3168,41 @@ class TestCrossVerifyTaskCounts:
         assert result['available'] is False
         assert result['consistent'] is True
 
+    def test_an_unavailable_tree_is_never_a_divergence_against_a_live_census(self):
+        tree = FilteredTaskTree(unavailable_reason=TaskTreeUnavailableReason.fetch_error)
+        statuses = {str(i): 'done' for i in range(5)}
+        statuses.update({str(i): 'pending' for i in range(5, 10)})
+
+        result = cross_verify_task_counts(tree, statuses)
+
+        assert result['available'] is True
+        assert result['consistent'] is True
+        assert result['total_mismatch'] is False
+        assert result['done_mismatch'] is False
+        assert result['authoritative']['total'] == 10
+        assert result['authoritative']['done'] == 5
+        assert result['tree'] is None
+        assert result['tree_unavailable_reason'] == 'fetch_error'
+
+    def test_an_unavailable_tree_without_a_census_reports_the_reason(self):
+        tree = FilteredTaskTree(unavailable_reason=TaskTreeUnavailableReason.fetch_error)
+
+        result = cross_verify_task_counts(tree, None)
+
+        assert result['available'] is False
+        assert result['consistent'] is True
+        assert result['tree'] is None
+        assert result['tree_unavailable_reason'] == 'fetch_error'
+
+    def test_a_fetched_tree_reports_its_counts_and_no_unavailable_reason(self):
+        tree = FilteredTaskTree(total_count=10, done_count=5)
+        statuses = {str(i): 'done' for i in range(5)}
+        statuses.update({str(i): 'pending' for i in range(5, 10)})
+
+        for result in (cross_verify_task_counts(tree, statuses), cross_verify_task_counts(tree, {})):
+            assert result['tree_unavailable_reason'] is None
+            assert result['tree'] == {'total': 10, 'done': 5}
+
 
 # ---------------------------------------------------------------------------
 # diff_status_correction — step-1 (RED) / step-2 (GREEN); step-3 (RED) / step-4 (GREEN)
