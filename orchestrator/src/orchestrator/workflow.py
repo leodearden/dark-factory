@@ -12951,10 +12951,12 @@ class TaskWorkflow:
         # case the gate exists for.  Steward mediation (e.g. mutating plan.json
         # to silence the gate) would undermine the safeguard, so skip the L0
         # steward path entirely and submit an L1 immediately.
-        from orchestrator.merge_lane import POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX
+        from orchestrator.merge_lane import (
+            MAIN_HEALTH_RED_REASON_PREFIX,
+            POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX,
+        )
         from orchestrator.merge_lane.worker import (
             DROPPED_PLAN_TARGETS_REASON_PREFIX,
-            MAIN_HEALTH_RED_REASON_PREFIX,
             POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
             TRANSIENT_INFRA_REASON_PREFIX,
         )

@@ -21,15 +21,17 @@ from _orch_helpers import make_placeholder_future
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore
 from orchestrator.git_ops import GitOps
+from orchestrator.merge_lane.main_health_probe import (
+    MAIN_HEALTH_RED_REASON_PREFIX,
+    MainHealthProbeHandles,
+    _build_main_health_outcome,
+    _main_health_fingerprint,
+)
 from orchestrator.merge_lane.types import QueuedBranch
 from orchestrator.merge_lane.worker import (
-    MAIN_HEALTH_RED_REASON_PREFIX,
     TRANSIENT_INFRA_REASON_PREFIX,
     MergeOutcome,
     MergeRequest,
-    _build_main_health_outcome,
-    _main_health_fingerprint,
-    _MainHealthProbeHandles,
     _run_post_merge_verify,
 )
 from orchestrator.verify import _PROBE_CACHE, VerifyResult
@@ -211,7 +213,7 @@ def test_make_req_works_with_no_current_event_loop(tmp_path: Path) -> None:
 class TestBuildMainHealthOutcomeHelper:
     """Step-1 (RED): _build_main_health_outcome(verify, probe_sha) must produce
     a MergeOutcome with parity to the inline construction previously in
-    _classify_main_health_red (merge_queue.py:746-762) — task 2564 extracts it
+    classify_main_health_red (merge_queue.py:746-762) — task 2564 extracts it
     into a pure helper so the synchronous and deferred probe paths cannot
     diverge in their reason/fingerprint/failure_category/failure_cause_hint
     composition."""
@@ -591,7 +593,7 @@ class TestDedupeFingerprrintAndCacheReuse:
 
 
 # ---------------------------------------------------------------------------
-# Fail-safe branches in _classify_main_health_red (suggestion 3)
+# Fail-safe branches in classify_main_health_red (suggestion 3)
 # ---------------------------------------------------------------------------
 
 
@@ -611,10 +613,10 @@ class TestClassifyFailSafeBranches:
 
         Driven through the REAL probe: get_main_sha is its very first await,
         so an exploding git handle sends it down its own documented
-        crash-fail-safe (``(False, '')``), which _classify_main_health_red
+        crash-fail-safe (``(False, '')``), which classify_main_health_red
         then reads as "not preexisting". That is the whole public contract —
         a probe that dies never takes the merge down with it. The narrower
-        pin on _classify_main_health_red's own ``except Exception`` is gone
+        pin on classify_main_health_red's own ``except Exception`` is gone
         with the patch that used to force it: that branch cannot be reached
         through the real collaborator, whose entire body is wrapped in
         ``except Exception: return False, ''``, so the only thing that ever
@@ -707,7 +709,7 @@ class TestMainHealthFingerprintWarning:
     def test_fingerprint_failure_emits_warning(self, caplog) -> None:
         import logging
 
-        from orchestrator.merge_lane.worker import _main_health_fingerprint
+        from orchestrator.merge_lane.main_health_probe import _main_health_fingerprint
 
         with (
             patch(
@@ -770,7 +772,7 @@ class TestMainHealthDeferralCore:
             return MAIN_SHA  # pragma: no cover - never reached in this test
 
         git_ops.get_main_sha = AsyncMock(side_effect=_blocked_main_sha)
-        handles = _MainHealthProbeHandles(background_tasks=set())
+        handles = MainHealthProbeHandles(background_tasks=set())
 
         async def _run() -> tuple[MergeOutcome | None, list[asyncio.Task]]:
             outcome = await asyncio.wait_for(
@@ -927,7 +929,7 @@ class TestSyncPathAndSentinelPreservation:
         req = _make_req('99', tmp_path / 'task-wt', config)
         (tmp_path / 'task-wt').mkdir()
 
-        handles = _MainHealthProbeHandles(background_tasks=set())
+        handles = MainHealthProbeHandles(background_tasks=set())
         # A preexisting verdict is pre-seeded for this result's signature, so
         # a sentinel branch that fell through to the main-health branch would
         # return main-health-red instead of its own outcome below.
@@ -1427,7 +1429,7 @@ class TestBaselineEnrichmentNeedsACompleteBaseline:
 
     @staticmethod
     def _sync_config(tmp_path: Path) -> OrchestratorConfig:
-        # escalate_preexisting=False short-circuits _classify_main_health_red,
+        # escalate_preexisting=False short-circuits classify_main_health_red,
         # leaving the enrichment's peek as the only baseline reader.
         return _make_config(tmp_path, escalate_preexisting=False, merge_verify_breadth='full')
 
@@ -1488,7 +1490,7 @@ class TestBaselineEnrichmentNeedsACompleteBaseline:
         merge_wt.mkdir()
         req = _make_req('5627', tmp_path / 'task-wt', config)
         (tmp_path / 'task-wt').mkdir()
-        handles = _MainHealthProbeHandles(background_tasks=set())
+        handles = MainHealthProbeHandles(background_tasks=set())
         never = asyncio.Event()
 
         # The detached probe parks on its worktree, so it can neither finish

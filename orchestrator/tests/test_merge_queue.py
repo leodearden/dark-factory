@@ -13821,7 +13821,7 @@ class TestRunPostMergeVerify:
         timed_out_result.type_output = ''
 
         verifier = _ScriptedVerifier(answers=[VerifyScript(result=timed_out_result)])
-        with patch('orchestrator.merge_lane.worker._classify_main_health_red', AsyncMock(return_value=None)):
+        with patch('orchestrator.merge_lane.worker.classify_main_health_red', AsyncMock(return_value=None)):
             result = await _run_post_merge_verify(
                 git_ops, req, merge_wt,
                 timeouts={}, enospc_retries={},
@@ -13856,7 +13856,7 @@ class TestRunPostMergeVerify:
         test_fail_result.type_output = ''
 
         verifier = _ScriptedVerifier(answers=[VerifyScript(result=test_fail_result)])
-        with patch('orchestrator.merge_lane.worker._classify_main_health_red', AsyncMock(return_value=None)):
+        with patch('orchestrator.merge_lane.worker.classify_main_health_red', AsyncMock(return_value=None)):
             result = await _run_post_merge_verify(
                 git_ops, req, merge_wt,
                 timeouts={}, enospc_retries={},
@@ -13902,11 +13902,11 @@ class TestRunPostMergeVerify:
         )
         with (
             patch(
-                'orchestrator.merge_lane.worker._build_attempt0_payload',
+                'orchestrator.merge_lane.worker.build_attempt0_payload',
                 AsyncMock(return_value=object()),
             ),
             patch(
-                'orchestrator.merge_lane.worker._assemble_retry_verify_env',
+                'orchestrator.merge_lane.worker.assemble_retry_verify_env',
                 AsyncMock(return_value={'REIFY_VERIFY_RETRY_SCOPE': 'failed_only'}),
             ),
         ):
@@ -13958,11 +13958,11 @@ class TestRunPostMergeVerify:
         verifier = _ScriptedVerifier(answers=[VerifyScript(result=test_failure_result)])
         with (
             patch(
-                'orchestrator.merge_lane.worker._build_attempt0_payload',
+                'orchestrator.merge_lane.worker.build_attempt0_payload',
                 AsyncMock(return_value=object()),
             ),
             patch(
-                'orchestrator.merge_lane.worker._assemble_retry_verify_env',
+                'orchestrator.merge_lane.worker.assemble_retry_verify_env',
                 AsyncMock(return_value={'REIFY_VERIFY_RETRY_SCOPE': 'failed_only'}),
             ),
         ):
@@ -14019,11 +14019,11 @@ class TestRunPostMergeVerify:
         )
         with (
             patch(
-                'orchestrator.merge_lane.worker._build_attempt0_payload',
+                'orchestrator.merge_lane.worker.build_attempt0_payload',
                 AsyncMock(return_value=object()),
             ),
             patch(
-                'orchestrator.merge_lane.worker._assemble_retry_verify_env',
+                'orchestrator.merge_lane.worker.assemble_retry_verify_env',
                 AsyncMock(return_value={'REIFY_VERIFY_RETRY_SCOPE': 'failed_only'}),
             ),
         ):
@@ -14058,7 +14058,7 @@ class TestRunPostMergeVerify:
         invariant: the larger narrowed budget is gated on ACTUAL narrowing
         (the D2 producer applying retry_env), not on the raw
         req.retry_failed_only flag. With the flag on but NO sidecar present
-        in merge_wt, the real (unstubbed) _build_attempt0_payload returns
+        in merge_wt, the real (unstubbed) build_attempt0_payload returns
         None (task 3059), narrowed stays False, and the retry must still use
         the small legacy enospc_retries/max_enospc budget even though a
         generous max_narrowed=5 is supplied.
@@ -14119,11 +14119,11 @@ class TestRunPostMergeVerify:
         verifier = _ScriptedVerifier(answers=[VerifyScript(result=infra_result)])
         with (
             patch(
-                'orchestrator.merge_lane.worker._build_attempt0_payload',
+                'orchestrator.merge_lane.worker.build_attempt0_payload',
                 AsyncMock(return_value=object()),
             ),
             patch(
-                'orchestrator.merge_lane.worker._assemble_retry_verify_env',
+                'orchestrator.merge_lane.worker.assemble_retry_verify_env',
                 AsyncMock(return_value={'REIFY_VERIFY_RETRY_SCOPE': 'failed_only'}),
             ),
         ):
@@ -14176,11 +14176,11 @@ class TestRunPostMergeVerify:
         )
         with (
             patch(
-                'orchestrator.merge_lane.worker._build_attempt0_payload',
+                'orchestrator.merge_lane.worker.build_attempt0_payload',
                 AsyncMock(return_value=object()),
             ),
             patch(
-                'orchestrator.merge_lane.worker._assemble_retry_verify_env',
+                'orchestrator.merge_lane.worker.assemble_retry_verify_env',
                 AsyncMock(return_value={'REIFY_VERIFY_RETRY_SCOPE': 'failed_only'}),
             ),
         ):
@@ -20975,7 +20975,7 @@ class TestRunPostMergeVerifyRouting:
         )
 
         verifier = _ScriptedVerifier(answers=[VerifyScript(result=failed_result)])
-        with patch('orchestrator.merge_lane.worker._classify_main_health_red', AsyncMock(return_value=None)) as mock_mh:
+        with patch('orchestrator.merge_lane.worker.classify_main_health_red', AsyncMock(return_value=None)) as mock_mh:
             result = await _run_post_merge_verify(
                 git_ops, req, merge_wt,
                 timeouts={}, enospc_retries={},
@@ -21013,7 +21013,7 @@ class TestRunPostMergeVerifyRouting:
             answers=[VerifyScript(result=passed_scoped)],
             gates=[broken_gate],
         )
-        with patch('orchestrator.merge_lane.worker._classify_main_health_red', AsyncMock()) as mock_mh:
+        with patch('orchestrator.merge_lane.worker.classify_main_health_red', AsyncMock()) as mock_mh:
             result = await _run_post_merge_verify(
                 git_ops, req, merge_wt,
                 timeouts={}, enospc_retries={},

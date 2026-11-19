@@ -430,7 +430,7 @@ def _inject_host_allocator(
     allocator_cls: type[HostAllocator] = HostAllocator,
 ) -> HostAllocator:
     """Inject a HostAllocator over local plus every one of *fake_remotes*."""
-    allocator = allocator_cls(list(fake_remotes), quarantine=worker._runner_quarantine)
+    allocator = worker._host_quarantine.allocator_over(fake_remotes, factory=allocator_cls)
     worker._host_allocator = allocator
     return allocator
 

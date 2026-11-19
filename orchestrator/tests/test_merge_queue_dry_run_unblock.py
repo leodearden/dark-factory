@@ -45,8 +45,8 @@ from orchestrator.dry_run_unblock import investigation_task_name
 from orchestrator.event_store import EventType
 from orchestrator.git_ops import GitOps
 from orchestrator.git_ops import _run as _run_git
+from orchestrator.merge_lane.main_health_probe import MAIN_HEALTH_RED_REASON_PREFIX
 from orchestrator.merge_lane.worker import (
-    MAIN_HEALTH_RED_REASON_PREFIX,
     PRODUCTION_CLOCK,
     PRODUCTION_VERIFIER,
     TRANSIENT_INFRA_REASON_PREFIX,
@@ -466,7 +466,7 @@ class TestUnscopedTypecheckFailedSpawns:
             # real scoped verification in a real `_mainprobe-` worktree.
             with (
                 patch(
-                    'orchestrator.merge_lane.worker.verify_failure_is_preexisting_on_main',
+                    'orchestrator.merge_lane.main_health_probe.verify_failure_is_preexisting_on_main',
                     new=AsyncMock(return_value=(True, MAIN_SHA)),
                 ),
             ):

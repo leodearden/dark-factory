@@ -124,8 +124,8 @@ from orchestrator import verify, verify_plan
 from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_lane import MergeLane
+from orchestrator.merge_lane.main_health_probe import MAIN_HEALTH_RED_REASON_PREFIX
 from orchestrator.merge_lane.worker import (
-    MAIN_HEALTH_RED_REASON_PREFIX,
     TRANSIENT_INFRA_REASON_PREFIX,
     MergeOutcome,
     _run_post_merge_verify,
@@ -738,7 +738,7 @@ class TestRow5WhollyPreexistingMainHealthRedAndCacheHit:
         shared_git_ops = _make_git_ops(tmp_path)
         probe_spy = AsyncMock(wraps=verify_failure_is_preexisting_on_main)
         with patch(
-            'orchestrator.merge_lane.worker.verify_failure_is_preexisting_on_main',
+            'orchestrator.merge_lane.main_health_probe.verify_failure_is_preexisting_on_main',
             new=probe_spy,
         ):
             outcome1 = await _drive_merge_gate(

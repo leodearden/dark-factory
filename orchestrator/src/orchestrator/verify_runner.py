@@ -327,7 +327,7 @@ class MergeVerifySpec:
                           home (INV-9), and the file to read before assuming what a
                           key here means.
                           The failed-only retry env from
-                          orchestrator/src/orchestrator/merge_lane/worker.py::_build_retry_verify_env
+                          orchestrator/src/orchestrator/merge_lane/retry_verify_env.py::_build_retry_verify_env
                           has path-valued keys that cannot resolve remotely:
                           its nextest filter files are UNTRACKED files in the
                           dispatching host's merge_wt, which the git-pushed merge
@@ -4296,7 +4296,8 @@ class HostAllocator:
     -----------------
     The quarantine set is passed by reference so HostAllocator-driven
     (RunnerUnavailable) and DriftDetector-driven quarantines share one
-    source of truth with the worker's _runner_quarantine set.
+    source of truth with the lane's quarantine set
+    (``merge_lane/host_quarantine.py::HostQuarantine``).
     ``clear_quarantine(name)`` discards from this same set; because it is
     shared by reference the host immediately becomes acquire_remote()-eligible
     again without an orchestrator restart.  This is the re-engagement
@@ -4421,8 +4422,8 @@ class HostAllocator:
         """Remove a host from the shared quarantine set (idempotent).
 
         Mirrors :meth:`VerifyRunnerPool.clear_quarantine`.  Because the
-        quarantine set is shared by reference with the worker's
-        ``_runner_quarantine``, discarding *name* here immediately makes the
+        quarantine set is shared by reference with
+        ``merge_lane/host_quarantine.py::HostQuarantine``, discarding *name* here immediately makes the
         host eligible for :meth:`acquire_remote` again — no restart required.
 
         Clearing a name that is not in the quarantine (including names that
@@ -4480,8 +4481,8 @@ class HostAllocator:
         """Return True if host *name* is currently quarantined.
 
         Mirrors :meth:`VerifyRunnerPool.is_quarantined`.  Because the
-        quarantine set is shared **by reference** with the worker's
-        ``_runner_quarantine``, this reflects every writer of that set — not
+        quarantine set is shared **by reference** with
+        ``merge_lane/host_quarantine.py::HostQuarantine``, this reflects every writer of that set — not
         just :meth:`quarantine_and_release`, but also the DriftDetector-driven
         verdict-divergence quarantines and the land-time per-land cross-check,
         which add names to the worker's set directly without going through the
@@ -4492,7 +4493,7 @@ class HostAllocator:
         a slot lookup, so it answers for unmanaged names too (False for one
         that was never quarantined).  That is precisely why it exists
         alongside :meth:`host_states`: its production caller is
-        ``SpeculativeMergeWorker._host_states_block``'s **orphan** arm (task
+        ``merge_lane/host_quarantine.py::HostQuarantine.host_states``'s **orphan** arm (task
         3275), which classifies RU-tracked hosts that have no slot in this
         allocator.  :meth:`host_states` structurally cannot answer for those —
         it enumerates ``_slots`` — so the two are complementary, not redundant.
@@ -4650,8 +4651,8 @@ class HostAllocator:
         is quarantined.
 
         Used by the auto-reprobe path (task 1795) to identify candidates for
-        health probing: only RU-quarantined hosts (those also in the worker's
-        ``_runner_unavailable`` tracker) are ultimately probed and cleared.
+        health probing: only RU-quarantined hosts (those also in
+        ``merge_lane/host_quarantine.py::HostQuarantine``'s RunnerUnavailable tracker) are ultimately probed and cleared.
         """
         return [
             (name, runner)

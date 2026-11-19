@@ -127,8 +127,8 @@ ALLOWLIST_ENTRIES: list[tuple[str, str, str, str]] = [
         "bare return avoids infinite escalation loop inside done-callback",
     ),
     (
-        "orchestrator/src/orchestrator/merge_lane/worker.py",
-        "_classify_main_health_red",
+        "orchestrator/src/orchestrator/merge_lane/main_health_probe.py",
+        "classify_main_health_red",
         "92b98f5b67f9",
         "pre-existing optional probe helper: exception during health check "
         "returns None (no proposal); callers handle None gracefully",

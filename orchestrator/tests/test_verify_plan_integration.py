@@ -828,7 +828,7 @@ class TestMergeVerifyBlockProducesGateableProposal:
             reqs.append(req)
             with (
                 patch(
-                    'orchestrator.merge_lane.worker.verify_failure_is_preexisting_on_main',
+                    'orchestrator.merge_lane.main_health_probe.verify_failure_is_preexisting_on_main',
                     new=AsyncMock(return_value=(False, '')),
                 ),
                 patch(

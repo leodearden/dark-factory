@@ -18,7 +18,6 @@ import dataclasses
 import enum
 import functools
 import itertools
-import json
 import logging
 import math
 import os
@@ -43,7 +42,6 @@ from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple, Protocol
 
-from escalation.dedupe import DedupeConfig, content_fingerprint_key, submit_or_dedupe
 from escalation.models import Escalation
 from shared.mcp_post import open_mcp_client, post_mcp_tool_call
 
@@ -57,7 +55,6 @@ from orchestrator.dry_run_unblock import (
 )
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.flake_recorder import (
-    record_flake_observation,
     record_merge_flake_suppression,
 )
 from orchestrator.git_ops import (
@@ -117,6 +114,7 @@ from orchestrator.merge_lane.gates import (
 )
 from orchestrator.merge_lane.halt import HaltState
 from orchestrator.merge_lane.history_leg import HistoryLegRunner
+from orchestrator.merge_lane.host_quarantine import HostQuarantine
 from orchestrator.merge_lane.intake import (
     MERGE_LANES,
     enqueue_merge_request,
@@ -137,11 +135,6 @@ from orchestrator.merge_lane.liveness import (
     INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS,
     VerifyProgressWatch,
     _acquire_warm_verify_worktree,
-    _alarm_verify_host_skew,
-    _alarm_verify_host_unreachable,
-    _clear_verify_host_skew,
-    _clear_verify_host_skew_of_an_earlier_process,
-    _clear_verify_host_unreachable,
     _safety_valve_due,
     acquire_chain_build_lane,
     alarm_serial_lane_breach,
@@ -151,6 +144,13 @@ from orchestrator.merge_lane.liveness import (
     verify_tree_cpu_ticks,
 )
 from orchestrator.merge_lane.lookahead_hold import LookaheadHold
+from orchestrator.merge_lane.main_health_probe import (
+    MAIN_HEALTH_RED_REASON_PREFIX,
+    MainHealthProbeHandles,
+    classify_main_health_red,
+    file_main_health_escalation,
+    spawn_main_health_probe,
+)
 from orchestrator.merge_lane.member_redrive import MemberRedriveOutcome, MemberRedriver
 from orchestrator.merge_lane.no_progress_abort import NoProgressAbort, emit_no_progress_abort
 from orchestrator.merge_lane.outcome_facts import ConflictEvidence, MergeBlockCategory
@@ -180,18 +180,16 @@ from orchestrator.merge_lane.request_ledger import (
     RequestLedger,
     report_stuck_requests,
 )
+from orchestrator.merge_lane.retry_verify_env import (
+    assemble_retry_verify_env,
+    build_attempt0_payload,
+)
 from orchestrator.merge_lane.reverify_gate_decision import GateClearance, ReverifyDispatch
 from orchestrator.merge_lane.shadow import (
     _alarm_warm_shadow_unparseable,
     _maybe_schedule_shadow_compare,
     _run_cold_shadow_verify,
-    build_fail_fast_map,
     build_warm_shadow_results,
-    did_not_pass_subset,
-    nextest_filter_ids,
-    parse_nextest_list_planned,
-    parse_per_test_results,
-    select_failed_run_all_members,
 )
 from orchestrator.merge_lane.speculation_controller import (
     LiveTip,
@@ -207,7 +205,6 @@ from orchestrator.merge_lane.train_selection import select_train_members
 from orchestrator.merge_lane.types import (
     CHAIN_FAULT_REASONS,
     NO_DEEP_PLACEMENT,
-    UNTRACKED_HOST_WIRE,
     CapPermit,
     ChainResult,
     ChainTruncationReason,
@@ -238,7 +235,6 @@ from orchestrator.merge_lane.types import (
     PendingGate,
     QueuedBranch,
     RealMergeItem,
-    RecoveryEvidence,
     RelaneOutcome,
     RemergeBase,
     SoloVerifyResult,
@@ -251,11 +247,9 @@ from orchestrator.merge_lane.types import (
     VerifyInFlight,
     VerifyInFlightKind,
     VerifyWorktreeHandle,
-    _HostUnavailability,
     fell_to_main,
     item_merge_wt,
     lease_activity,
-    quarantine_class,
     remote_dispatch_live,
 )
 from orchestrator.merge_lane.verify_base_detector import (
@@ -277,14 +271,12 @@ from orchestrator.merge_verify_facts import (
     RunnerReason,
     classify_base_relation,
 )
-from orchestrator.remote_gate import GateIdentityPair, RunnerUnavailableKind
 from orchestrator.scheduler import StaleEvidenceRejection
 from orchestrator.task_priority import TaskPriorityLookup
 from orchestrator.task_status import WORKFLOW_PRESERVE_STATUSES
 from orchestrator.teardown import complete_despite_cancellation
 from orchestrator.unblock_types import BlockClass
 from orchestrator.verify import (
-    FlakeObservationSink,
     VerifyResult,
     _derive_task_files_from_git,
     cached_main_baseline_failing_ids,
@@ -294,16 +286,13 @@ from orchestrator.verify import (
     red_module_prefixes_of,
     run_scoped_verification,
     seed_main_baseline,
-    verify_failure_is_preexisting_on_main,
 )
 from orchestrator.verify_cancel import elide_middle
 from orchestrator.verify_categories import (
     INDETERMINATE_VERDICT_CATEGORIES,
     INFRA_TRANSIENT_CATEGORIES,
-    PREEXISTING_BREAK_SKIP_CATEGORIES,
 )
 from orchestrator.verify_classify import reports_disk_full
-from orchestrator.verify_hosts import build_remote_runners as _build_remote_runners
 from orchestrator.verify_plan import effective_merge_module_configs
 from orchestrator.verify_runner import (
     UNSCOPED_TYPECHECK_TIMEOUT_CATEGORY,
@@ -321,7 +310,6 @@ from orchestrator.verify_runner import (
 
 if TYPE_CHECKING:
     from orchestrator.config import ModuleConfig, OrchestratorConfig
-    from orchestrator.flake_ledger import FlakeSuppression
 
 logger = logging.getLogger('orchestrator.merge_lane')
 
@@ -481,19 +469,6 @@ pattern-match this prefix to distinguish a fully-clean landing
 cleanup."""
 
 
-MAIN_HEALTH_RED_REASON_PREFIX = 'Main-health red: merge verify failure reproduces on bare main'
-"""Prefix of the ``MergeOutcome.reason`` string emitted when the post-merge
-verify failure is classified as a pre-existing break already present on bare
-main HEAD — i.e. not introduced by this task's merge.
-
-The workflow ``_submit_to_merge_queue`` pattern-matches this prefix and routes
-the outcome to a single dedup'd L1 escalation (``escalate_to_human=True``,
-``category='preexisting_main_break'``), skipping the steward entirely.  The
-steward operates in-branch and cannot fix a broken main; routing each
-concurrent failing merge to the steward would cause an ~85 min-per-task
-livelock for every task whose verify runs against a red main."""
-
-
 TRIVIAL_PASS_MAIN_RED_REASON_PREFIX = (
     'Trivial-pass withheld: config-only merge would advance main over a '
     'known-red state'
@@ -532,19 +507,19 @@ MAIN_HEALTH_PROBE_PENDING_NOTE = (
 """Appended, in brackets, to the provisional task-fault
 ``MergeOutcome.reason`` that :func:`_run_post_merge_verify` returns in
 DEFERRED mode (``main_health_probe_handles`` is not ``None``) whenever
-:func:`_spawn_main_health_probe` reports a probe is actually in flight for
+:func:`spawn_main_health_probe` reports a probe is actually in flight for
 this failure.
 
 Lets a steward/human reading the surviving reason string distinguish
 "still being classified off-path" from a confirmed task fault — the
 SYNCHRONOUS path (``main_health_probe_handles`` is ``None``) never appends
-this note because :func:`_classify_main_health_red` has, by construction,
+this note because :func:`classify_main_health_red` has, by construction,
 already definitively ruled out a pre-existing break by the time the
 task-fault reason is built.  Not appended when the deferred probe itself
 would be skipped (feature disabled / timed-out verify / a
 :data:`PREEXISTING_BREAK_SKIP_CATEGORIES` category) since those cases are
 confirmed task faults in both modes — see
-:func:`_spawn_main_health_probe`'s return value."""
+:func:`spawn_main_health_probe`'s return value."""
 
 
 # ---------------------------------------------------------------------------
@@ -740,145 +715,12 @@ PRODUCTION_VERIFIER: VerifyPort = ProductionVerifier(
     post_merge_pyright=lambda: _check_post_merge_pyright,
     post_merge_equivalence=lambda: _check_post_merge_equivalence,
     disk_guard=lambda: _ensure_verify_disk_space,
-    cold_shadow_verify=lambda: functools.partial(
-        _run_cold_shadow_verify, verifier=PRODUCTION_VERIFIER,
-    ),
+    cold_shadow_verify=lambda: _run_cold_shadow_verify,
     dry_run=lambda: run_dry_run_unblock,
 )
 PRODUCTION_CLOCK: ClockPort = ProductionClock(
     content_mtime=lambda: newest_content_mtime, cpu_ticks=lambda: verify_tree_cpu_ticks,
 )
-
-
-def _main_health_fingerprint(category: str, cause_hint: str, probe_sha: str) -> str:
-    """Compose a dedupe fingerprint for a preexisting-main-break outcome.
-
-    Lazy-imports compute_preexisting_main_break_fingerprint from workflow so
-    merge_queue→workflow is a deferred import (no module-level cycle).
-    Fail-safe: returns '' when the import or composition raises.
-    """
-    try:
-        from orchestrator.workflow import compute_preexisting_main_break_fingerprint
-        return compute_preexisting_main_break_fingerprint(category, cause_hint, probe_sha)
-    except Exception:
-        logger.warning(
-            'main-health fingerprint composition failed '
-            '(category=%s cause_hint=%s probe_sha=%s) — '
-            'returning empty fingerprint (dedupe disabled for this outcome)',
-            category, cause_hint, probe_sha,
-            exc_info=True,
-        )
-        return ''
-
-
-def _build_main_health_outcome(verify: VerifyResult, probe_sha: str) -> MergeOutcome:
-    """Build the main-health-red ``MergeOutcome`` for a confirmed pre-existing break.
-
-    Pure function — no I/O, no side effects, no event emission.  Extracted
-    (task 2564) from :func:`_classify_main_health_red` so the reason /
-    fingerprint / ``failure_category`` / ``failure_cause_hint`` composition is
-    shared verbatim between the synchronous probe path
-    (``_classify_main_health_red``) and the deferred off-critical-path probe
-    (``_run_deferred_main_health_probe``) — the two can never diverge.
-
-    *probe_sha* is the bare-main SHA the probe actually tested against (fed
-    into the dedupe fingerprint so concurrent failing merges against the same
-    main HEAD fold to one escalation parent).
-    """
-    detail = verify.failure_report()
-    suffix = (verify.cause_hint or verify.summary or '')[:160]
-    reason = (
-        f'{MAIN_HEALTH_RED_REASON_PREFIX} '
-        f'(category={verify.category!r}): {suffix}'
-    )
-    if detail:
-        reason = f'{reason}\n\n{detail}'
-    return MergeOutcome(
-        'blocked',
-        reason=reason,
-        failure_category=verify.category,
-        failure_cause_hint=verify.cause_hint,
-        dedupe_fingerprint=_main_health_fingerprint(
-            verify.category or '', verify.cause_hint, probe_sha,
-        ),
-        disposition=MergeFailureDisposition.MAIN_RED,
-    )
-
-
-def _main_probe_flake_sink(
-    req: MergeRequest,
-    *,
-    event_store: EventStore | None,
-    escalation_queue: Any,
-) -> FlakeObservationSink:
-    """Where the main-health classifier's task-mu fork records a flake it
-    suppressed: the flake ledger, attributed to *req*'s task and to the main
-    SHA the isolated re-run ran on, with the INV-4 storm streak reached
-    through the recorder."""
-    async def sink(observation: FlakeSuppression, main_sha: str) -> None:
-        await record_flake_observation(
-            observation,
-            project_root=req.config.project_root,
-            project_id=req.config.fused_memory.project_id,
-            merge_sha=main_sha,
-            task_id=req.task_id,
-            event_store=event_store,
-            escalation_queue=escalation_queue,
-        )
-    return sink
-
-
-async def _classify_main_health_red(
-    git_ops: GitOps,
-    req: MergeRequest,
-    verify: VerifyResult,
-    event_store: EventStore | None = None,
-    *,
-    escalation_queue: Any = None,
-) -> MergeOutcome | None:
-    """Probe whether *verify* is a pre-existing break already on bare main HEAD.
-
-    Returns a :class:`MergeOutcome` with reason starting with
-    :data:`MAIN_HEALTH_RED_REASON_PREFIX` when the break is confirmed
-    pre-existing.  Returns ``None`` to fall through to the normal task-fault
-    outcome.
-
-    Guards (short-circuit to None before calling the probe):
-    - ``req.config.escalate_preexisting_main_break`` is False
-    - ``verify.timed_out`` is True (non-deterministic; re-probing is wasteful)
-    - ``verify.category`` is in :data:`PREEXISTING_BREAK_SKIP_CATEGORIES`
-      (infra_timeout / flock_error — inherently flaky)
-
-    Latency: the first failing merge per ``(main_sha, category, cause_hint)``
-    tuple pays a full probe build/test cost, bounded by the same
-    ``merge_verify_cold_command_timeout_secs`` / ``verify_cold_command_timeout_secs``
-    timeout that ``_run_post_merge_verify`` uses (inherited via
-    ``run_scoped_verification``'s config lookup — the probe runs with
-    ``max_retries=0`` so a hung probe cannot stall the worker beyond one
-    timeout window).  Subsequent merges with the same signature hit the
-    ``_PROBE_CACHE`` and pay only a ``get_main_sha()`` round-trip.
-    """
-    if not req.config.escalate_preexisting_main_break:
-        return None
-    if verify.timed_out:
-        return None
-    if (verify.category or '') in PREEXISTING_BREAK_SKIP_CATEGORIES:
-        return None
-    try:
-        is_preexisting, probe_sha = await verify_failure_is_preexisting_on_main(
-            req.worktree, req.config, req.module_configs, req.task_files,
-            verify, git_ops,
-            flake_sink=_main_probe_flake_sink(
-                req, event_store=event_store, escalation_queue=escalation_queue,
-            ),
-        )
-    except Exception:
-        return None
-    if not is_preexisting:
-        return None
-    outcome = _build_main_health_outcome(verify, probe_sha)
-    _emit_merge_attempt(event_store, req.task_id, OutcomeKind.main_health_red)
-    return outcome
 
 
 def _render_skew_surfaces(
@@ -1247,1103 +1089,12 @@ def _spawn_merge_verify_dry_run(
         )
 
 
-@dataclasses.dataclass(frozen=True)
-class _MainHealthProbeHandles:
-    """Opaque bundle carrying the worker's ``background_tasks`` set so the
-    deferred main-health probe survives ``_run_post_merge_verify`` returning
-    (task 2564, reify 5067 merge-slot-stall fix).
-
-    A DISTINCT bundle from :class:`_DryRunInvestigationHandles` (not reused)
-    — the main-health probe's ownership is independent of the dry-run
-    investigation's, which keeps the shape minimal and future-friendly for
-    the sibling host-affinity / warm-probe work.  ``background_tasks`` is the
-    SAME ``set`` instance the worker stores at ``self._background_tasks`` —
-    a spawned probe task's strong ref lives exactly as long as the worker
-    and is drained by the worker's existing shutdown drain
-    (``SpeculativeMergeWorker.stop``).
-
-    Only ``SpeculativeMergeWorker._lane_post_merge_verify``, which serves the
-    in-flight verify and the single-branch gate re-verify, passes a live
-    instance (task 2564 step-16, task 6278).  The solo-reverify and train
-    callers — and any bare test caller — pass ``None`` (the default), so
-    ``_run_post_merge_verify`` keeps running the main-health probe
-    SYNCHRONOUSLY exactly as it did before task 2564.
-
-    ``auto_heal`` (task 2564 step-22) is an optional callback threaded
-    through to :func:`_run_deferred_main_health_probe`: when a confirmed,
-    still-fresh pre-existing break is found, the probe routes to it
-    (``await auto_heal(outcome, req)``) INSTEAD of filing the
-    escalation-only fallback.  ``None`` (the default) preserves the
-    escalation-only behaviour for every bare/test caller.  Only the
-    production call site passes
-    ``SpeculativeMergeWorker._auto_heal_main_health_deferred`` (task 2564
-    step-24).
-    """
-
-    background_tasks: set[asyncio.Task] = dataclasses.field(default_factory=set)
-    auto_heal: (
-        Callable[[MergeOutcome, MergeRequest], Awaitable[None]] | None
-    ) = None
-
-
-async def _run_deferred_main_health_probe(
-    git_ops: GitOps,
-    req: MergeRequest,
-    verify: VerifyResult,
-    *,
-    escalation_queue: Any = None,
-    event_store: EventStore | None = None,
-    auto_heal: Callable[[MergeOutcome, MergeRequest], Awaitable[None]] | None = None,
-    origin_is_local: bool = True,
-) -> None:
-    """Off-critical-path main-health classification (task 2564).
-
-    LEASE-SAFETY & HOST-AFFINITY (task 2565): this probe is a leaseless,
-    local-only detective classifier.  It verifies via the local
-    ``_mainprobe-`` ephemeral worktree and ``run_scoped_verification`` —
-    never :class:`~orchestrator.verify_runner.HostAllocator`,
-    :class:`~orchestrator.verify_runner.RemoteRunner`, or
-    :class:`~orchestrator.verify_runner.HostLease` — so it never acquires
-    or holds a merge host slot.  *origin_is_local* RECORDS, but does not
-    STEER, where the triggering post-merge verify ran (derived by the
-    caller from the ``runner`` :func:`_run_post_merge_verify` received:
-    ``None``/local-lease is local, ``RemoteRunner.is_local=False`` is
-    remote — defaults to ``True`` so any caller not yet threading this
-    value is treated as local); the probe itself ALWAYS runs locally
-    regardless of *origin_is_local*.  Remote-affinity (probing on the
-    failing verify's origin host) is deliberately rejected: the probe's
-    verdict drives a queue-halting born-at-L2 escalation and a "fix main"
-    auto-heal, a correctness-critical global decision that must answer "is
-    main broken on the trust anchor?" — reproducing a host-specific
-    toolchain/env/flock/disk quirk from a remote host onto that same host's
-    main would falsely conclude main is red, and would re-introduce the
-    remote-lease / orphaned-remote-build hazards task 1757's
-    ``_abort_remote_verify`` teardown exists to avoid.  See
-    :func:`verify_failure_is_preexisting_on_main` for the full contract.
-
-    Spawned by :func:`_spawn_main_health_probe` as a DETACHED task with no
-    awaiter, so every externally-visible effect must come from what this
-    coroutine does internally (emitting the ``main_health_red`` signal,
-    filing a dedup'd escalation) — its return value is always discarded.
-
-    Re-applies the SAME three cheap guards :func:`_spawn_main_health_probe`
-    already applied before spawning (defense in depth for any future direct
-    caller — mirrors :func:`_classify_main_health_red`'s guard block):
-
-    - ``req.config.escalate_preexisting_main_break`` is ``False``
-    - ``verify.timed_out`` is ``True``
-    - ``verify.category`` is in :data:`PREEXISTING_BREAK_SKIP_CATEGORIES`
-
-    Calls :func:`verify_failure_is_preexisting_on_main` directly (rather than
-    :func:`_classify_main_health_red`) so it can capture ``probe_sha`` for
-    the staleness check below.  A raising probe is caught and logged — this
-    is a detached background task with no awaiter, so a swallowed exception
-    here is the ONLY way it would ever be observed.
-
-    Staleness re-check: the probe can run for minutes off the critical
-    path, during which main may have advanced (e.g. a hotfix that already
-    fixed the break).  ``probe_sha`` is the exact bare-main HEAD the probe
-    actually tested against, so equality against a freshly-resolved
-    ``git_ops.get_main_sha()`` is the precise freshness predicate.  Fails
-    safe (skips the escalation, logging at ``info``) when the re-resolve
-    raises, comes back empty, or disagrees with ``probe_sha`` — a
-    genuinely-still-broken main will simply be re-probed and re-surfaced by
-    the next failing merge.
-
-    This re-check is best-effort, not atomic (task 2564 amendment,
-    reviewer_comprehensive finding 2): a narrow TOCTOU window remains
-    between the ``get_main_sha()`` equality check above passing and the
-    escalation actually being filed below — or, when *auto_heal* is wired,
-    between that check and whatever further awaits the ``auto_heal``
-    callback performs — during which main could advance again.  Left
-    unguarded deliberately: the fingerprint-keyed ``submit_or_dedupe`` fold
-    (see :func:`_file_main_health_escalation`) makes a single
-    just-superseded escalation harmless — it collapses into any existing
-    parent and the parent resolves once the real fix lands — so closing
-    this window is not worth the added complexity.
-
-    On a confirmed, still-fresh pre-existing break: builds the outcome via
-    :func:`_build_main_health_outcome` and emits the ``main_health_red``
-    merge-attempt signal (task 2564 step-22: BEFORE the branch below, so the
-    signal fires whichever branch is taken), recording *origin_is_local* as
-    the ``origin_host``/``probe_host`` telemetry pair (task 2565 —
-    ``probe_host`` is always ``'local'``; see the LEASE-SAFETY &
-    HOST-AFFINITY note above) so the deliberate local-only placement
-    decision is OBSERVABLE even when the triggering verify ran remote.
-    Then, if *auto_heal* is supplied, routes the outcome to it
-    (``await auto_heal(outcome, req)``)
-    INSTEAD of filing an escalation directly — the callback owns filing
-    (see :func:`SpeculativeMergeWorker._auto_heal_main_health_deferred`,
-    which files the halt-owner escalation itself).  Otherwise (the default,
-    every bare/test caller) falls back to the pre-existing escalation-only
-    behaviour via :func:`_file_main_health_escalation`.
-    """
-    if not req.config.escalate_preexisting_main_break:
-        return
-    if verify.timed_out:
-        return
-    if (verify.category or '') in PREEXISTING_BREAK_SKIP_CATEGORIES:
-        return
-    try:
-        is_preexisting, probe_sha = await verify_failure_is_preexisting_on_main(
-            req.worktree, req.config, req.module_configs, req.task_files,
-            verify, git_ops,
-            flake_sink=_main_probe_flake_sink(
-                req, event_store=event_store, escalation_queue=escalation_queue,
-            ),
-        )
-    except Exception:
-        logger.warning(
-            'Task %s: deferred main-health probe failed', req.task_id,
-            exc_info=True,
-        )
-        return
-    if not is_preexisting:
-        return
-
-    try:
-        current_main_sha = await git_ops.get_main_sha()
-    except Exception:
-        logger.warning(
-            'Task %s: deferred main-health probe: get_main_sha() re-resolve '
-            'failed; skipping escalation (stale-check fail safe)',
-            req.task_id,
-            exc_info=True,
-        )
-        return
-    if not current_main_sha or current_main_sha != probe_sha:
-        logger.info(
-            'Task %s: deferred main-health probe: main advanced since the '
-            'probe ran (probe_sha=%s, current=%s); skipping escalation '
-            '(stale-check fail safe)',
-            req.task_id, probe_sha, current_main_sha,
-        )
-        return
-
-    outcome = _build_main_health_outcome(verify, probe_sha)
-    _emit_merge_attempt(
-        event_store, req.task_id, OutcomeKind.main_health_red,
-        origin_host='local' if origin_is_local else 'remote',
-        probe_host='local',
-    )
-    if auto_heal is not None:
-        await auto_heal(outcome, req)
-    else:
-        _file_main_health_escalation(
-            escalation_queue, req, outcome,
-            suggested_action=MainHealthNextAction.NO_FIX_OWNER,
-        )
-
-
-def _file_main_health_escalation(
-    escalation_queue: Any,
-    req: MergeRequest,
-    outcome: MergeOutcome,
-    *,
-    suggested_action: MainHealthNextAction,
-    detail: str | None = None,
-) -> str | None:
-    """File (or fold) a dedup'd ``preexisting_main_break`` escalation for a
-    confirmed pre-existing main-red *outcome* (task 2564).  *detail* defaults
-    to ``outcome.reason``.
-
-    Returns the id of the SURVIVING (parent) escalation, or ``None`` when
-    *escalation_queue* is None.  A folded submission returns the PARENT's id
-    (the child is absorbed via ``attach_dedupe_child`` and never becomes
-    independently addressable) — callers that need to register lane-halt
-    ownership (:func:`SpeculativeMergeWorker._auto_heal_main_health_deferred`)
-    must reference the parent, not the folded child.  Existing callers that
-    ignore the return value are unaffected (backward-compatible addition).
-
-    Every caller names its bounded next action from
-    :class:`~orchestrator.main_health_actions.MainHealthNextAction`.  The
-    record is filed at L1 because its consumer is escalation-watcher-auto,
-    never a steward: a steward cannot fix main, and L0s are dismissed by
-    the blocking task's own cleanup and at restart.
-
-    Folds via ``submit_or_dedupe`` using the SAME inf-window
-    content-fingerprint :class:`~escalation.dedupe.DedupeConfig`
-    ``workflow.py::TaskWorkflow._file_main_health_l1`` uses (categories=
-    ``('preexisting_main_break',)``), so every worker- and workflow-filed
-    merge-lane L1 for one ``(category, cause_hint, probe_sha)`` signature
-    collapses into one parent, race-free; the task-verify L0 for that break stays separate
-    (dedupe never folds across ladder levels). Falls back to a plain
-    ``queue.submit`` when *outcome* carries no fingerprint (the fail-safe
-    ``''`` path of :func:`_main_health_fingerprint`).
-    """
-    if escalation_queue is None:
-        return None
-
-    fp = outcome.dedupe_fingerprint or None
-    esc = Escalation(
-        id=escalation_queue.make_id(req.task_id),
-        task_id=req.task_id,
-        agent_role='orchestrator',
-        severity='blocking',
-        category='preexisting_main_break',
-        summary=outcome.reason[:200],
-        detail=outcome.reason if detail is None else detail,
-        suggested_action=suggested_action,
-        dedupe_fingerprint=fp,
-        level=1,
-    )
-    if fp:
-        submit_result = submit_or_dedupe(
-            escalation_queue,
-            esc,
-            DedupeConfig(
-                infra_dedupe_enabled=True,
-                infra_dedupe_window_secs=float('inf'),
-                infra_dedupe_categories=('preexisting_main_break',),
-                key_fn=content_fingerprint_key,
-            ),
-        )
-        return submit_result.get('parent_id') or submit_result.get('id') or esc.id
-    escalation_queue.submit(esc)
-    return esc.id
-
-
-def _spawn_main_health_probe(
-    handles: _MainHealthProbeHandles | None,
-    git_ops: GitOps,
-    req: MergeRequest,
-    verify: VerifyResult,
-    *,
-    escalation_queue: Any = None,
-    event_store: EventStore | None = None,
-    origin_is_local: bool = True,
-) -> bool:
-    """Fire-and-forget: spawn the deferred (off-critical-path) main-health
-    classification for a post-merge-verify failure.
-
-    *origin_is_local* (task 2565) is forwarded unchanged into the spawned
-    :func:`_run_deferred_main_health_probe` coroutine — it only RECORDS
-    where the triggering post-merge verify ran (for the ``origin_host``/
-    ``probe_host`` telemetry pair); the probe itself always classifies
-    locally regardless of this value.  Defaults to ``True`` (local) so
-    every caller not yet threading the signal is treated as local.
-
-    None-safe: no-ops when *handles* is ``None`` (mirrors
-    :func:`_spawn_merge_verify_dry_run`'s ``handles is None`` guard) — every
-    call site invokes this unconditionally and relies on this internal check,
-    so the solo-reverify and train (its gate re-verify included)
-    ``_run_post_merge_verify`` callers (which pass no handles) are guaranteed
-    no-ops.
-
-    Applies the SAME three cheap guards :func:`_classify_main_health_red`
-    applies before probing (task 2564 step-6 — kept byte-identical to that
-    function's guard block so the deferred path never probes a case the
-    synchronous path would have skipped):
-
-    - ``req.config.escalate_preexisting_main_break`` is ``False``
-    - ``verify.timed_out`` is ``True`` (non-deterministic; re-probing is wasteful)
-    - ``verify.category`` is in :data:`PREEXISTING_BREAK_SKIP_CATEGORIES`
-      (infra_timeout / flock_error — inherently flaky)
-
-    Also dedupes in-flight: skips the spawn when a not-done task named
-    ``f'main-health-probe-{req.task_id}'`` is already registered in
-    ``handles.background_tasks`` (mirrors
-    :func:`_spawn_merge_verify_dry_run`'s in-flight dedup guard) — a rapid
-    sequence of failing merges for the same task must not pile up duplicate
-    probes.
-
-    Registers the spawned task into ``handles.background_tasks`` with a
-    discard done-callback, named ``f'main-health-probe-{req.task_id}'`` so
-    :class:`SpeculativeMergeWorker`'s existing ``self._background_tasks``
-    shutdown drain cancels it deterministically on stop — no new drain code
-    is needed.
-
-    Returns ``True`` when, as a result of this call, a main-health probe is
-    (or remains) in flight for *req.task_id* — *handles* were provided, none
-    of the three cheap guards above skipped classification, and either a new
-    probe task was just spawned or one was already running (in-flight
-    dedup).  Returns ``False`` when no probe is in flight: *handles* is
-    ``None``, a guard skipped classification, or spawning itself raised.
-    Task 2564 amendment (reviewer_comprehensive finding 1): the caller
-    (:func:`_run_post_merge_verify`) uses this to decide whether the
-    provisional task-fault outcome should carry
-    :data:`MAIN_HEALTH_PROBE_PENDING_NOTE` — a caller cannot otherwise tell
-    "classification skipped, confirmed task fault" apart from "classification
-    deferred, verdict pending" from the reason string alone.
-    """
-    if handles is None:
-        return False
-    if not req.config.escalate_preexisting_main_break:
-        return False
-    if verify.timed_out:
-        return False
-    if (verify.category or '') in PREEXISTING_BREAK_SKIP_CATEGORIES:
-        return False
-    task_name = f'main-health-probe-{req.task_id}'
-    if any(
-        t.get_name() == task_name and not t.done()
-        for t in handles.background_tasks
-    ):
-        logger.debug(
-            'Task %s: main-health probe already in progress, skipping '
-            'duplicate spawn',
-            req.task_id,
-        )
-        return True
-    try:
-        task = asyncio.create_task(
-            _run_deferred_main_health_probe(
-                git_ops, req, verify,
-                escalation_queue=escalation_queue, event_store=event_store,
-                auto_heal=handles.auto_heal,
-                origin_is_local=origin_is_local,
-            ),
-            name=task_name,
-        )
-        handles.background_tasks.add(task)
-        task.add_done_callback(handles.background_tasks.discard)
-    except Exception as exc:
-        logger.warning(
-            'Task %s: failed to spawn main-health probe: %s',
-            req.task_id, exc,
-        )
-        return False
-    return True
-
-
 # Dedup sentinel task_id for fix (b)'s per-land cross-check divergence escalation
 # (task 2822) — mirrors verify_runner.py's _DRIFT_SENTINEL / this module's
 # _RESOURCE_AUDIT_SENTINEL.  A single open L1 per episode keeps a run of divergent
-# lands from flooding the queue; the caller-owned quarantine set does the per-host
+# lands from flooding the queue; the caller-owned quarantine sink does the per-host
 # withholding.
 _CROSS_CHECK_SENTINEL = '__verify_cross_check__'
-
-
-# ---------------------------------------------------------------------------
-# Failed-only merge-verify retry PRODUCER (PRD verify-retry-failed-only D2).
-#
-# When ``MergeRequest.retry_failed_only`` is set (D1, task 2833), this
-# orchestrator produces the retry contract that reify's verify.sh (α/β/γ)
-# consumes.  These REIFY_VERIFY_RETRY_* / REIFY_RUN_ALL_MEMBER_SUBSET /
-# REIFY_GUI_RETRY_SPECS env keys are BRAND NEW — this producer defines them:
-#
-# OWNERSHIP (task 3059).  DF owns the subset CONTENT end to end: it is derived
-# from attempt-0's OWN VerifyResult (per-test verdicts + failed run_all members)
-# unioned with a DF-run ``cargo nextest list`` planned probe — see
-# :func:`_build_attempt0_payload`.  The ONLY thing sourced from reify is the
-# attempt-0 pin: ``tree_oid`` and ``profiles``, read from the sidecar reify
-# actually writes at ``target/reify-verify-attempt.json`` (reify tasks
-# 5287/5548 — see :data:`_REIFY_ATTEMPT_SIDECAR_RELPATH`).  There is no
-# cross-repo obligation for the subset itself; a missing or stale sidecar
-# simply routes the retry to a FULL verify.
-#
-#   REIFY_VERIFY_RETRY_NEXTEST_FILTER_FILE_DEBUG    absolute path to a newline
-#   REIFY_VERIFY_RETRY_NEXTEST_FILTER_FILE_RELEASE  file of EXACT {did-not-pass}
-#                                                   nextest ids for that cargo
-#                                                   profile (one id per line).
-#                                                   Files (not env values) because
-#                                                   a subset can be thousands of
-#                                                   ids — too large for an env.
-#   REIFY_RUN_ALL_MEMBER_SUBSET   SPACE-delimited {failed run_all members}.
-#   REIFY_GUI_RETRY_SPECS         SPACE-delimited {failed gui spec files}.
-#
-#     SPACE, not comma — reify WORD-SPLITS both values:
-#       verify.sh:2579  _mk_ra_toks=(${REIFY_RUN_ALL_MEMBER_SUBSET})
-#       verify.sh:2141  for _gui_retry_tok in $_gui_retry_specs
-#     and the gui shell-safety allowlist is [A-Za-z0-9._/ -], which EXCLUDES
-#     ','.  A comma-joined gui value is therefore rejected wholesale (loud full
-#     fallback, :2156) and a comma-joined run_all value collapses into one
-#     unmatchable token.
-#
-#     An EMPTY value is the deliberate SAFE fallback meaning "run this suite in
-#     FULL", never "run nothing": verify.sh:2545 and :2127 both gate the subset
-#     on the value being non-empty.
-#   REIFY_VERIFY_RETRY_TREE_OID   the attempt-0-pinned content-tree OID, taken
-#                                 from reify's own ``git rev-parse HEAD:`` stamp
-#                                 in target/reify-verify-attempt.json and
-#                                 corroborated against DF's independent
-#                                 get_head_tree_hash read (INV-3); reify then
-#                                 re-checks it a third time from its side.
-#   REIFY_VERIFY_RETRY_SCOPE      always 'failed_only' — the retry-scope marker.
-#
-# The dict is merged into the dispatched MergeVerifySpec.verify_env, and the
-# filter files are written into THIS host's merge_wt, the shared persistent
-# merge-verify lane reify's verify.sh reads: LOCAL dispatch only (see
-# verify_runner.py::MergeVerifySpec).
-# ---------------------------------------------------------------------------
-
-# Subdir under merge_wt holding the per-profile nextest filter files.
-_RETRY_FILTER_SUBDIR = '.reify-verify-retry'
-
-# DF-side MIRROR of reify's REIFY_VERIFY_RETRY_MAX_SUBSET storm-escape ceiling
-# (verify.sh:1703, default 5000).  reify refuses to narrow a profile whose
-# subset reaches it and runs that profile in FULL — so a subset at or above the
-# ceiling is not a narrowed retry, and DF must not charge it to the larger
-# narrowed budget.  Mirrored (not read from reify) because this is a DF-side
-# COST decision; a drift in reify's default only makes DF conservative.
-_REIFY_VERIFY_RETRY_MAX_SUBSET = 5000
-
-
-def _materially_narrows(planned: Sequence[str], subset: Sequence[str]) -> bool:
-    """True when ``subset`` is a REAL, reify-acceptable reduction of ``planned``.
-
-    Three ways a produced subset fails to narrow anything, all of which make
-    reify run the profile in FULL:
-
-    * **empty** — reify's per-profile "retry refused: no subset" fallback fires
-      (``verify.sh:1698``);
-    * **the whole plan** — reachable whenever attempt-0 reds before any test
-      line is emitted (compile-gate red, ``env_transient``,
-      ``semaphore_timeout``): ``parse_per_test_results`` returns ``{}``, so
-      every planned test is ``'not-started'``;
-    * **at/over the ceiling** — reify rejects it wholesale
-      (:data:`_REIFY_VERIFY_RETRY_MAX_SUBSET`).
-
-    Each is SAFE (the retry runs everything), but calling any of them
-    "narrowed" is a lie with a price: the caller would switch to the larger
-    ``MAX_POST_MERGE_VERIFY_NARROWED_RETRIES`` budget on the premise that a
-    narrowed retry is cheap, so the merge lane would pay TWO full re-verifies
-    where the legacy ``max_enospc`` budget paid one.
-    """
-    return (
-        bool(subset)
-        and len(subset) < len(planned)
-        and len(subset) <= _REIFY_VERIFY_RETRY_MAX_SUBSET
-    )
-
-
-def _build_retry_verify_env(
-    *,
-    nextest_subset_debug: list[str],
-    nextest_subset_release: list[str],
-    run_all_members: list[str],
-    gui_specs: list[str],
-    tree_oid: str,
-    filter_dir: Path,
-) -> dict[str, str]:
-    """Write the per-profile nextest filter files and build the REIFY_* env dict.
-
-    Writes ``nextest-retry-debug.filter`` / ``nextest-retry-release.filter`` (one
-    exact test id per line, deterministic order preserved from the passed lists)
-    into ``filter_dir/.reify-verify-retry`` and returns the env dict documented
-    in the module comment above.  ``run_all_members`` and ``gui_specs`` ship as
-    SPACE-delimited env values (reify word-splits both, and the gui allowlist
-    excludes ','); the nextest subsets ship as file paths.
-
-    Callers must pass nextest ids already mapped through
-    :func:`nextest_filter_ids` — this function writes the lines verbatim.
-
-    Args:
-        nextest_subset_debug: {did-not-pass} nextest ids for the debug profile.
-        nextest_subset_release: {did-not-pass} nextest ids for the release profile.
-        run_all_members: {failed} run_all member ids (pass-through, not transformed).
-        gui_specs: {failed} gui spec files (pass-through, not transformed).
-        tree_oid: attempt-0-pinned content-tree OID (REIFY_VERIFY_RETRY_TREE_OID).
-        filter_dir: directory the filter files are written under (the
-            dispatching host's merge_wt; produced for a local dispatch only).
-
-    Returns:
-        The REIFY_VERIFY_RETRY_* env dict to merge into MergeVerifySpec.verify_env.
-    """
-    retry_dir = Path(filter_dir) / _RETRY_FILTER_SUBDIR
-    retry_dir.mkdir(parents=True, exist_ok=True)
-
-    debug_file = retry_dir / 'nextest-retry-debug.filter'
-    release_file = retry_dir / 'nextest-retry-release.filter'
-    debug_file.write_text('\n'.join(nextest_subset_debug))
-    release_file.write_text('\n'.join(nextest_subset_release))
-
-    return {
-        'REIFY_VERIFY_RETRY_NEXTEST_FILTER_FILE_DEBUG': str(debug_file),
-        'REIFY_VERIFY_RETRY_NEXTEST_FILTER_FILE_RELEASE': str(release_file),
-        # SPACE-delimited: reify word-splits both, and the gui allowlist
-        # excludes ',' outright.  See the module comment above.
-        'REIFY_RUN_ALL_MEMBER_SUBSET': ' '.join(run_all_members),
-        'REIFY_GUI_RETRY_SPECS': ' '.join(gui_specs),
-        'REIFY_VERIFY_RETRY_TREE_OID': tree_oid,
-        'REIFY_VERIFY_RETRY_SCOPE': 'failed_only',
-    }
-
-
-@dataclasses.dataclass(frozen=True)
-class _Attempt0Payload:
-    """The attempt-0 result the failed-only retry is constructed from.
-
-    **DF CONSTRUCTS this** (see :func:`_build_attempt0_payload`) from attempt-0's
-    own ``VerifyResult.test_output`` plus a ``cargo nextest list`` planned probe.
-    Only the tree-OID pin and the profile list come from reify's sidecar
-    (:data:`_REIFY_ATTEMPT_SIDECAR_RELPATH`); the subset CONTENT is DF-owned end
-    to end.  Passing it as an explicit parameter keeps the subset/env/gate logic
-    pure and fully unit-testable.
-
-    Fields:
-        tree_oid: attempt-0-pinned content-tree OID the retry is corroborated
-            against (INV-3) — reify's ``git rev-parse HEAD:`` stamp.
-        profiles: the cargo profiles attempt-0 PLANNED to run, in reify's order.
-        debug_planned / debug_verdicts: the debug-profile nextest plan
-            (authoritative full set) and the parsed attempt-0 verdicts (RUN tests
-            only) — combined via :func:`build_fail_fast_map`.
-        release_planned / release_verdicts: same, for the release profile.
-        run_all_members: {failed} run_all member ids (pass-through).
-        gui_specs: {failed} gui spec files (pass-through).
-    """
-
-    tree_oid: str
-    profiles: tuple[str, ...]
-    debug_planned: list[str]
-    debug_verdicts: dict[str, str]
-    release_planned: list[str]
-    release_verdicts: dict[str, str]
-    run_all_members: list[str]
-    gui_specs: list[str]
-
-
-async def _assemble_retry_verify_env(
-    git_ops: GitOps,
-    req: MergeRequest,
-    merge_wt: Path,
-    attempt0: _Attempt0Payload,
-) -> dict[str, str] | None:
-    """INV-3 tree-OID corroboration gate → the retry env, or None for full verify.
-
-    **Two INDEPENDENT reads of the same fact** (belt-and-suspenders):
-
-    1. DF's own ground truth — ``git_ops.get_head_tree_hash(merge_wt)``;
-    2. reify's own ``git rev-parse HEAD:`` stamp, carried in
-       ``attempt0.tree_oid`` from its ``target/reify-verify-attempt.json``
-       sidecar (:func:`_load_reify_attempt_sidecar`).
-
-    A disagreement (rebased tree) or an unreadable OID (None — an ABSENCE of
-    corroboration, not a match) fails safe: log a WARNING and return None so the
-    caller leaves the spec untouched and the existing ``_reverify_rebased_tree``
-    (M4) route runs a FULL re-verify.  reify then independently re-checks the
-    same pin from its own side (verify.sh's ``_RETRY_SUBSET_ELIGIBLE`` guard), so
-    the tree is corroborated on both sides of the seam.
-
-    On a match, builds the per-profile {did-not-pass} nextest subsets via
-    :func:`build_fail_fast_map` → :func:`did_not_pass_subset`, then maps them
-    through :func:`nextest_filter_ids` at the write boundary so the filter files
-    carry nextest's ``test(=...)`` domain while the internal plan/verdict space
-    stays uniform.  Failed run_all members / gui specs pass through unchanged.
-
-    **Third gate: the subset must actually narrow something.** A subset that is
-    empty, equal to the whole plan, or over reify's storm-escape ceiling makes
-    reify run the profile in FULL — so returning an env dict for it would let
-    the caller charge a full re-verify to the larger narrowed-retry budget.  See
-    :func:`_materially_narrows`.
-
-    Args:
-        git_ops: GitOps for DF's own tree-OID read.
-        req: the merge request (for ``task_id`` in log lines).
-        merge_wt: the merge worktree — both the tree-OID probe target and the
-            filter-file directory.
-        attempt0: the DF-constructed attempt-0 payload.
-
-    Returns:
-        The REIFY_VERIFY_RETRY_* env dict on a corroborated tree whose subset
-        materially narrows, else None.
-    """
-    current = await git_ops.get_head_tree_hash(merge_wt)
-    if current is None or current != attempt0.tree_oid:
-        logger.warning(
-            'Task %s: retry tree OID %r does not match attempt-0 %r '
-            '(rebased or unknown tree) — falling back to full verify '
-            '(M4 _reverify_rebased_tree route)',
-            req.task_id, current, attempt0.tree_oid,
-        )
-        return None
-
-    debug_subset = did_not_pass_subset(
-        build_fail_fast_map(attempt0.debug_planned, attempt0.debug_verdicts)
-    )
-    release_subset = did_not_pass_subset(
-        build_fail_fast_map(attempt0.release_planned, attempt0.release_verdicts)
-    )
-
-    # MATERIAL-NARROWING gate: a retry that narrows NOTHING must not be called
-    # narrowed.  `narrowed` is what unlocks the larger MAX_POST_MERGE_VERIFY_
-    # NARROWED_RETRIES budget, on the premise that a narrowed retry re-runs only
-    # the {did-not-pass} subset and is therefore cheap.  When that premise is
-    # false (see :func:`_materially_narrows`) the lane would pay TWO FULL
-    # re-verifies where the legacy max_enospc budget paid one — a real
-    # worst-case regression for exactly the infra-transient class this branch
-    # handles.  Returning None here routes the caller to the legacy budget AND
-    # leaves `spec` untouched, so nothing about the retry changes except its
-    # accounting.  Both profiles are checked because only the FIRST one is ever
-    # populated and the payload does not name which that was.
-    if not (
-        _materially_narrows(attempt0.debug_planned, debug_subset)
-        or _materially_narrows(attempt0.release_planned, release_subset)
-    ):
-        logger.warning(
-            'Task %s: failed-only retry would narrow NOTHING '
-            '(nextest debug %d/%d, release %d/%d; ceiling %d) — reify would run '
-            'these profiles in full anyway, so this is charged to the legacy '
-            'budget as a FULL retry, not the narrowed one',
-            req.task_id,
-            len(debug_subset), len(attempt0.debug_planned),
-            len(release_subset), len(attempt0.release_planned),
-            _REIFY_VERIFY_RETRY_MAX_SUBSET,
-        )
-        return None
-
-    # Per-suite sizes at the narrowing site, so the cost premise behind the
-    # larger narrowed budget is auditable from the log rather than inferred.
-    logger.info(
-        'Task %s: narrowed failed-only retry — nextest debug %d/%d, '
-        'release %d/%d, run_all %d, gui %d',
-        req.task_id,
-        len(debug_subset), len(attempt0.debug_planned),
-        len(release_subset), len(attempt0.release_planned),
-        len(attempt0.run_all_members), len(attempt0.gui_specs),
-    )
-
-    # Map into nextest's matcher domain ONLY here, at the single write boundary:
-    # a filter file of full "<binary-id> <test-name>" parse keys is non-empty
-    # (so reify's "retry refused: no subset" fallback never fires) yet matches
-    # ZERO tests — a FALSE-GREEN retry.  See :func:`nextest_filter_ids`.
-    return _build_retry_verify_env(
-        nextest_subset_debug=nextest_filter_ids(debug_subset),
-        nextest_subset_release=nextest_filter_ids(release_subset),
-        run_all_members=list(attempt0.run_all_members),
-        gui_specs=list(attempt0.gui_specs),
-        tree_oid=current,
-        filter_dir=merge_wt,
-    )
-
-
-# reify's attempt-0 sidecar — the REAL one, relative to the worktree root.
-#
-# Producer: reify ``scripts/verify.sh`` ``add_test_passes()``, which stamps it as
-# its FIRST plan line so the pin survives a RED psi-gate / compile-gate / nextest
-# pole (reify task 5548).  ``verify.sh:738`` defines the path as
-# ``_ATTEMPT_SIDECAR_PATH="${REIFY_VERIFY_ATTEMPT_SIDECAR:-target/reify-verify-attempt.json}"``.
-#
-# Schema (exactly three keys; see tests/fixtures/reify_verify_retry/ for the
-# verbatim captured bytes and PROVENANCE.md)::
-#
-#     {"tree_oid": "<git rev-parse HEAD:>",
-#      "profiles": "debug release",          # SPACE-DELIMITED STRING, not a list
-#      "timestamp": "2026-07-30T04:56:41Z"}
-#
-# ``profiles`` records what the attempt PLANNED to run — because the stamp
-# precedes the test poles, it is NEVER proof that a profile actually executed.
-# That is precisely why only the FIRST profile may be narrowed (see
-# :func:`_build_attempt0_payload`).
-#
-# ``tree_oid`` is reify's own ``git rev-parse HEAD:`` — the same value DF's
-# ``git_ops.get_head_tree_hash`` produces, which is what makes the INV-3
-# corroboration two genuinely INDEPENDENT reads rather than one read twice.
-_REIFY_ATTEMPT_SIDECAR_RELPATH = 'target/reify-verify-attempt.json'
-
-# The cargo profiles DF can emit a per-profile nextest filter-file env key for.
-# A `profiles` value naming anything outside this set aborts to a full verify:
-# there is no REIFY_VERIFY_RETRY_NEXTEST_FILTER_FILE_<X> key for a third
-# profile, so DF could not satisfy reify's "a filter file for EVERY profile
-# named in `profiles`, or fall back to a full verify" obligation
-# (verify.sh:219-230), and silently ignoring it would narrow a profile whose
-# attempt-0 pass never ran.
-_KNOWN_REIFY_PROFILES = frozenset({'debug', 'release'})
-
-
-@dataclasses.dataclass(frozen=True)
-class _ReifyAttemptSidecar:
-    """The parsed contents of reify's ``target/reify-verify-attempt.json``.
-
-    Fields:
-        tree_oid: reify's ``git rev-parse HEAD:`` stamp for the attempt-0 tree.
-        profiles: the cargo profiles attempt-0 PLANNED to run, in the order
-            reify named them (the sidecar's space-delimited ``profiles``
-            string, split).  Never proof a profile executed.
-    """
-
-    tree_oid: str
-    profiles: tuple[str, ...]
-
-
-def _load_reify_attempt_sidecar(merge_wt: Path) -> _ReifyAttemptSidecar | None:
-    """Tolerantly load reify's attempt-0 sidecar from ``merge_wt``.
-
-    Never raises.  Returns None — routing the caller to a FULL verify — when the
-    sidecar is absent, unreadable, not JSON, not an object, missing ``tree_oid``,
-    carries an empty/whitespace-only ``profiles``, or names a profile outside
-    :data:`_KNOWN_REIFY_PROFILES`.
-
-    Args:
-        merge_wt: the merge worktree root the sidecar path is relative to.
-
-    Returns:
-        The parsed :class:`_ReifyAttemptSidecar`, or None.
-    """
-    path = Path(merge_wt) / _REIFY_ATTEMPT_SIDECAR_RELPATH
-    try:
-        raw = path.read_text()
-    except OSError:
-        # An absent sidecar is an ordinary outcome (non-reify project, or a
-        # verify that died before add_test_passes) — no warning, just full.
-        return None
-    try:
-        data = json.loads(raw)
-    except (ValueError, TypeError) as exc:
-        logger.warning(
-            'reify attempt-0 sidecar at %s is not valid JSON (%s) — full verify',
-            path, exc,
-        )
-        return None
-    if not isinstance(data, dict) or 'tree_oid' not in data:
-        logger.warning(
-            'reify attempt-0 sidecar at %s missing tree_oid / not an object '
-            '— full verify', path,
-        )
-        return None
-
-    tree_oid = str(data['tree_oid'])
-    # `profiles` is a SPACE-DELIMITED STRING in reify's real bytes, not a list.
-    raw_profiles = data.get('profiles')
-    profiles = tuple(raw_profiles.split()) if isinstance(raw_profiles, str) else ()
-    if not profiles:
-        logger.warning(
-            'reify attempt-0 sidecar at %s has empty/unparseable profiles %r '
-            '— full verify', path, raw_profiles,
-        )
-        return None
-    unknown = [p for p in profiles if p not in _KNOWN_REIFY_PROFILES]
-    if unknown:
-        logger.warning(
-            'reify attempt-0 sidecar at %s names unsupported profile(s) %r '
-            '(DF has no per-profile filter-file env key for them, so it cannot '
-            'satisfy reify\'s every-profile obligation) — full verify',
-            path, unknown,
-        )
-        return None
-    return _ReifyAttemptSidecar(tree_oid=tree_oid, profiles=profiles)
-
-
-# Bounds the planned-set probe so it can NEVER wedge the merge lane.  In a warm
-# merge lane the binaries are already built, so `nextest list` links and lists in
-# seconds; this ceiling only matters on a cold lane where the probe would have to
-# compile — and there, timing out into a full verify is the correct outcome.
-#
-# That "warm ⇒ seconds" premise is only true if the probe runs under the SAME
-# build environment as the verify (the shared sccache backend et al) — which is
-# why `verify_env` is threaded all the way down to the spawn.  Without it the
-# probe compiles cold on exactly the lanes this capability targets.
-_NEXTEST_LIST_PROBE_TIMEOUT_SECS = 300
-
-# Per-signal grace for the timeout path's group kill (SIGTERM, then SIGKILL).
-# Kept short: the probe is a `nextest list`, so there is nothing to flush.
-_PROBE_KILL_GRACE_SECS = 2.0
-
-# How much of a failed probe's stderr is carried into the WARNING.  Enough to
-# tell 'cargo-nextest not installed' from 'unknown flag' from 'workspace failed
-# to compile' from 'lockfile out of date' (structured-facts-at-failure, see
-# docs/legibility/design-invariants.md); short enough that a runaway build log
-# cannot flood the orchestrator log.
-_PROBE_STDERR_TAIL_CHARS = 500
-
-
-def _stderr_tail(stderr: str) -> str:
-    """Last :data:`_PROBE_STDERR_TAIL_CHARS` of ``stderr``, or an explicit marker."""
-    tail = stderr.strip()[-_PROBE_STDERR_TAIL_CHARS:]
-    return tail if tail else '<empty>'
-
-
-async def _kill_probe_process_tree(
-    proc: asyncio.subprocess.Process, pgid: int
-) -> None:
-    """Terminate the probe's whole process GROUP via the shared helper.
-
-    ``cargo nextest list`` spawns ``rustc`` / build-script children that a bare
-    ``proc.kill()`` leaves running.  Since the probe exists precisely to be
-    bounded (:data:`_NEXTEST_LIST_PROBE_TIMEOUT_SECS`), leaking compiles into
-    the merge lane on the timeout path would defeat the ceiling.
-
-    Delegates to :func:`shared.proc_group.terminate_process_group` — the
-    repo's single blessed SIGTERM→SIGKILL group-kill (landed on main; see also
-    ``verify.py``) — rather than re-implementing it.  ``pgid`` MUST be the value
-    captured immediately after the ``start_new_session=True`` spawn (where
-    ``pgid == proc.pid`` by POSIX guarantee): calling ``os.getpgid(proc.pid)``
-    here instead would be unsafe, because by this point the process may already
-    have been reaped and its pid recycled onto an unrelated group.
-    """
-    from shared.proc_group import terminate_process_group
-
-    await terminate_process_group(proc, pgid, grace_secs=_PROBE_KILL_GRACE_SECS)
-
-
-async def _run_probe_cmd(
-    argv: list[str],
-    *,
-    cwd: Path,
-    timeout_secs: float,
-    env: Mapping[str, str] | None = None,
-) -> tuple[int, str, str]:
-    """Run ``argv`` in ``cwd``, returning ``(returncode, stdout, stderr)``.
-
-    A thin, separately-patchable subprocess seam: it exists so
-    :func:`_probe_nextest_planned` can be unit-tested hermetically without
-    shelling out.  Raises :class:`TimeoutError` on timeout and :class:`OSError`
-    (incl. :class:`FileNotFoundError`) on spawn failure — the caller converts
-    both into a fail-safe ``None``.
-
-    ``env`` carries the verify's OWN environment overrides
-    (``MergeVerifySpec.verify_env`` — the shared sccache backend:
-    ``RUSTC_WRAPPER``, ``SCCACHE_*``, ``CARGO_INCREMENTAL``, …) layered OVER
-    ``os.environ``.  Threading it is load-bearing, not cosmetic: on a lane where
-    the sccache wrapper is *why* the merge worktree is warm, a probe run without
-    it compiles from scratch — burning minutes of lane CPU/disk and usually
-    timing out, i.e. silently degrading every narrowed retry to a full verify
-    while still paying the probe cost.  ``None`` inherits the orchestrator
-    environment unchanged (the legacy behaviour, kept for direct/test callers).
-
-    stderr is CAPTURED rather than discarded so the caller's failure WARNING can
-    name the actual reason instead of a bare exit code.
-    """
-    proc = await asyncio.create_subprocess_exec(
-        *argv,
-        cwd=str(cwd),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        env=({**os.environ, **env} if env else None),
-        # Own session/process group so the timeout path can kill the whole build
-        # tree — see :func:`_kill_probe_process_tree`.
-        start_new_session=True,
-    )
-    # Capture the pgid NOW, while proc is guaranteed alive and unreaped: with
-    # start_new_session=True, pgid == proc.pid by POSIX guarantee.  Reading it
-    # later (os.getpgid) could hit a recycled pid and signal a stranger.
-    pgid = proc.pid
-    try:
-        stdout, stderr = await asyncio.wait_for(
-            proc.communicate(), timeout=timeout_secs
-        )
-    except (TimeoutError, asyncio.CancelledError):
-        # Hard-bounded: a cancelled communicate() can leave proc.wait() pending
-        # on still-open pipe transports, so the cleanup itself gets a ceiling.
-        # Never trade a probe timeout for an unbounded await in the merge lane.
-        with contextlib.suppress(Exception):
-            await asyncio.wait_for(
-                _kill_probe_process_tree(proc, pgid),
-                timeout=_PROBE_KILL_GRACE_SECS * 3,
-            )
-        raise
-    return (
-        proc.returncode or 0,
-        stdout.decode('utf-8', errors='replace'),
-        stderr.decode('utf-8', errors='replace'),
-    )
-
-
-# Planned-set source: DECISION (task 3059).
-#
-# Candidate (a) — THIS: a `cargo nextest list` probe run in the warm merge lane.
-# Chosen because the binaries are already built there, so it links and lists
-# WITHOUT compiling; it is DF-owned (no cross-repo obligation — which is the
-# whole point of this leaf); and it emits ids in exactly
-# `parse_per_test_results`' key space, so `build_fail_fast_map` composes with no
-# translation.
-#
-# Candidate (b) — the warm shadow baseline's prior full per-test map — is NOT
-# VIABLE: `data/orchestrator/warm_verify_shadow.json` persists only
-# `ShadowCompareState` cadence fields (merges_since_last_shadow,
-# last_shadow_run_at).  The full per-test map lives in-process only
-# (`_warm_capture` → `build_warm_shadow_results`) and is gone by the next merge.
-#
-# Candidate (c) — a reify-emitted planned list — is the phantom cross-repo
-# dependency this leaf exists to DELETE.  Re-introducing it would recreate the
-# exact "DONE producer ≠ wired at the seam" failure.
-#
-# KNOWN IMPRECISION, and why it is safe: DF cannot reproduce reify's per-pass
-# selector (`--workspace` vs `$AFFECTED_ALL_FLAGS` vs `$_RELEASE_ALL_FLAGS`) or
-# its heavy-exclude filterset, so this probe may return a SUPERSET of what
-# attempt-0 actually planned.  A superset only adds extra 'not-started' ids to
-# the retry subset — it runs MORE tests, never FEWER — and reify's
-# `REIFY_VERIFY_RETRY_MAX_SUBSET` ceiling (default 5000) is the storm escape if
-# it ever approaches the whole suite.
-#
-# THE INVARIANT: ``None`` is NEVER treated as an empty plan.  It routes to a
-# FULL verify.  Narrowing on a partial plan would silently skip every test the
-# probe failed to see.
-async def _probe_nextest_planned(
-    merge_wt: Path,
-    profile: str,
-    *,
-    timeout_secs: float,
-    verify_env: Mapping[str, str] | None = None,
-) -> list[str] | None:
-    """Probe the merge lane for the ``profile``'s planned nextest set.
-
-    Totally fail-safe: any non-zero exit, empty/unparseable stdout, timeout, or
-    spawn failure returns ``None`` (→ full verify), logging a WARNING that names
-    the profile and the reason (including a bounded stderr tail on a non-zero
-    exit, so 'cargo-nextest absent' is distinguishable from 'workspace failed to
-    compile').
-
-    Args:
-        merge_wt: the warm merge worktree to run the probe in.
-        profile: ``'debug'`` or ``'release'`` — selects the ``--release`` flag.
-        timeout_secs: hard ceiling on the probe.
-        verify_env: the verify's own env overrides (``MergeVerifySpec.verify_env``)
-            so the probe models the SAME build the verify performs — notably the
-            shared sccache backend that is why a warm lane is warm.  See
-            :func:`_run_probe_cmd`.
-
-    Returns:
-        Planned test ids in :func:`parse_per_test_results`' key space, or None.
-    """
-    argv = ['cargo', 'nextest', 'list', '--workspace', '--message-format', 'json']
-    if profile == 'release':
-        argv.append('--release')
-
-    try:
-        rc, stdout, stderr = await _run_probe_cmd(
-            argv, cwd=Path(merge_wt), timeout_secs=timeout_secs, env=verify_env
-        )
-    except TimeoutError:
-        logger.warning(
-            'nextest list probe for profile %r timed out after %ss — full verify',
-            profile, timeout_secs,
-        )
-        return None
-    except OSError as exc:
-        # FileNotFoundError (no cargo on PATH) is the common shape here.
-        logger.warning(
-            'nextest list probe for profile %r could not run (%s) — full verify',
-            profile, exc,
-        )
-        return None
-
-    if rc != 0:
-        logger.warning(
-            'nextest list probe for profile %r exited %s — full verify '
-            '(stderr tail: %s)',
-            profile, rc, _stderr_tail(stderr),
-        )
-        return None
-    if not stdout.strip():
-        logger.warning(
-            'nextest list probe for profile %r produced empty stdout — full verify',
-            profile,
-        )
-        return None
-
-    planned = parse_nextest_list_planned(stdout)
-    if planned is None:
-        logger.warning(
-            'nextest list probe for profile %r produced unparseable stdout '
-            '— full verify', profile,
-        )
-    return planned
-
-
-async def _build_attempt0_payload(
-    merge_wt: Path,
-    verify: VerifyResult,
-    *,
-    verify_env: Mapping[str, str] | None = None,
-) -> _Attempt0Payload | None:
-    """Build the retry payload from attempt-0's OWN result — no cross-repo handoff.
-
-    Sources, all DF-owned except the two pins:
-
-    * ``verify.test_output`` → per-test verdicts (:func:`parse_per_test_results`);
-      the {failed} run_all members → :func:`select_failed_run_all_members`;
-    * a ``cargo nextest list`` probe → the authoritative planned set;
-    * reify's sidecar → ONLY ``tree_oid`` (the INV-3 pin) and ``profiles``.
-
-    **Profile attribution — the load-bearing rule.** ``verify.test_output`` is a
-    single blended blob across BOTH nextest passes, and the verdict key
-    (``"<binary-id> <test-name>"``) does not carry the profile.  So a ``pass``
-    observed in profile 1 is INDISTINGUISHABLE from a test that never ran in
-    profile 2.  ``verify.sh:219-230`` makes "never narrow a profile that never
-    ran" DF's seam obligation.  Therefore **only the FIRST profile named in the
-    sidecar is narrowed**; every later profile gets an empty subset, which reify
-    turns into its loud per-profile "retry refused: no subset" FULL fallback.
-
-    Under fail-fast the red lands in the first (debug) pass, which is where the
-    savings are, so the capability still fires meaningfully.
-
-    Fail-safe throughout: a None from the sidecar loader or from the first
-    profile's probe returns None, routing the caller to a FULL verify.
-
-    Args:
-        merge_wt: the merge worktree (sidecar location and probe cwd).
-        verify: attempt-0's own failing :class:`VerifyResult`.
-        verify_env: attempt-0's own ``MergeVerifySpec.verify_env``, threaded to
-            the probe so it models the SAME build (sccache backend et al).
-
-    Returns:
-        The constructed :class:`_Attempt0Payload`, or None for a full verify.
-    """
-    sidecar = _load_reify_attempt_sidecar(merge_wt)
-    if sidecar is None:
-        return None
-
-    # Only the FIRST profile can be narrowed — see the rule above.
-    first = sidecar.profiles[0]
-    planned = await _probe_nextest_planned(
-        merge_wt,
-        first,
-        timeout_secs=_NEXTEST_LIST_PROBE_TIMEOUT_SECS,
-        verify_env=verify_env,
-    )
-    if planned is None:
-        # Never narrow on a partial plan: an unknown plan cannot distinguish
-        # "this test passed" from "this test was never listed".
-        return None
-
-    verdicts = parse_per_test_results(verify.test_output)
-
-    # PLAN-COVERAGE gate: the probe must SEE everything attempt-0 saw fail.
-    #
-    # `build_fail_fast_map` iterates `planned` only and documents "keys present
-    # in verdicts but not in planned are ignored".  So a test attempt-0 reported
-    # FAIL/TIMEOUT that the probe did not list is silently DROPPED from the
-    # retry subset — the retry then never re-runs the actual failure and reports
-    # PASS.  A FALSE GREEN, the worst outcome available here.
-    #
-    # The comment above claims the probe returns a SUPERSET of attempt-0's plan
-    # (`--workspace` ⊇ reify's `-p` selectors).  That holds TODAY by coincidence
-    # of reify's flags; a future `--all-features` / `--all-targets` /
-    # `--cargo-profile` change on reify's side would break it with no signal.
-    # This is the one form of plan-incompleteness DF can detect IN-PROCESS, so
-    # the module's standing rule — never narrow on an incomplete plan — is
-    # enforced here rather than assumed.
-    #
-    # Only nextest-shaped keys ("<binary-id> <test-name>", hence the space) are
-    # comparable: `parse_per_test_results` also emits bare libtest paths, which
-    # `cargo nextest list` never produces and which are not evidence of drift.
-    planned_ids = set(planned)
-    uncovered = sorted(
-        key
-        for key, verdict in verdicts.items()
-        if verdict != 'pass' and ' ' in key and key not in planned_ids
-    )
-    if uncovered:
-        logger.warning(
-            'nextest list probe for profile %r did not cover %d did-not-pass '
-            'id(s) attempt-0 observed (%s%s) — the probed plan is INCOMPLETE, '
-            'so narrowing would silently drop the real failure; full verify',
-            first, len(uncovered), ', '.join(uncovered[:5]),
-            ', …' if len(uncovered) > 5 else '',
-        )
-        return None
-    # A later profile's planned set is never even requested — it could not be
-    # used, and probing it would cost a `nextest list` for nothing.
-    per_profile: dict[str, tuple[list[str], dict[str, str]]] = {
-        p: ([], {}) for p in _KNOWN_REIFY_PROFILES
-    }
-    per_profile[first] = (planned, verdicts)
-
-    return _Attempt0Payload(
-        tree_oid=sidecar.tree_oid,
-        profiles=sidecar.profiles,
-        debug_planned=per_profile['debug'][0],
-        debug_verdicts=per_profile['debug'][1],
-        release_planned=per_profile['release'][0],
-        release_verdicts=per_profile['release'][1],
-        run_all_members=select_failed_run_all_members(verify.test_output, verify.run_all_failed_members),
-        # Deliberately empty (task 3059): no real reify gui failure log was
-        # available to pin a fixture to, and authoring one from prose is the
-        # drift class this leaf corrects.  verify.sh:2127-2158 treats an empty
-        # value as "run the FULL gui suite" — unambiguously safe.
-        gui_specs=[],
-    )
 
 
 def _merge_boundary_module_configs(
@@ -2515,13 +1266,13 @@ async def _run_post_merge_verify(
     merge_sha: str = '',
     on_result: Callable[[VerifyResult], None] | None = None,
     shadow_baseline_sink: dict[str, str] | None = None,
-    quarantine: set[str] | None = None,
+    quarantine: Callable[[str], None] | None = None,
     keep_worktrees: Collection[Path] | None = None,
     runner: VerifyRunner | None = None,
     escalation_queue: Any = None,
     halt_hook: Callable[[str], None] | None = None,
     dry_run_handles: _DryRunInvestigationHandles | None = None,
-    main_health_probe_handles: _MainHealthProbeHandles | None = None,
+    main_health_probe_handles: MainHealthProbeHandles | None = None,
     depth: int | None = None,
     speculative: bool | None = None,
     chain_items: int = 1,
@@ -2635,10 +1386,10 @@ async def _run_post_merge_verify(
             ``SpeculativeMergeWorker._lane_post_merge_verify``, which serves
             the in-flight verify and the single-branch gate re-verify, passes
             a live bundle, at which point a main-health-eligible failure
-            SKIPS the synchronous ``_classify_main_health_red`` probe,
+            SKIPS the synchronous ``classify_main_health_red`` probe,
             returns the provisional task-fault outcome immediately, and
             spawns the classification as a detached background task via
-            :func:`_spawn_main_health_probe` — so the caller's
+            :func:`spawn_main_health_probe` — so the caller's
             ``verify_task`` (and the merge slot / host lease it holds) is
             freed within seconds of the verdict instead of blocking on a
             full local verify build bounded only by the cold timeout.
@@ -2843,10 +1594,11 @@ async def _run_post_merge_verify(
     # runs on its leased host (_leased_train_verify).
     # runner=<RemoteRunner> → pool=[runner] (no LocalRunner); warm-swap is skipped
     # (per-host persistent worktree — handled by γ's _run_inflight_verify caller).
-    # The caller-owned `quarantine` set is the divergence-quarantine sink for
-    # fix (b)'s per-land cross-check below (task 2822): on a remote PASS / local
-    # trust-anchor FAIL split we add runner.name to it so the shared HostAllocator
-    # drops the host.  None is treated as "no quarantine sink" (module-level and
+    # The caller-owned `quarantine` callable is the divergence-quarantine sink
+    # for fix (b)'s per-land cross-check below (task 2822): on a remote PASS /
+    # local trust-anchor FAIL split we hand it runner.name, and the lane's
+    # HostQuarantine.quarantine_divergent takes the host out of the shared
+    # HostAllocator's pool.  None is treated as "no quarantine sink" (module-level and
     # test callers that pass nothing) — the cross-check still fails closed, it
     # just records no host name.
     if runner is not None:
@@ -2986,18 +1738,19 @@ async def _run_post_merge_verify(
             # written — which would have narrowed attempt-0 ITSELF had the file
             # existed.  The causal chain now reads:
             #
-            #   attempt-0 result -> _build_attempt0_payload (DF-owned: this
+            #   attempt-0 result -> build_attempt0_payload (DF-owned: this
             #   result's per-test verdicts + a `cargo nextest list` planned
             #   probe, with only the tree-OID pin and the profile list from
             #   reify's target/reify-verify-attempt.json) -> INV-3 tree-OID
-            #   corroboration (_assemble_retry_verify_env) -> narrowed retry.
+            #   corroboration (assemble_retry_verify_env) -> narrowed retry.
             #
             # Guarded by req.retry_failed_only (D1, task 2833) so the flag-off /
             # legacy path is byte-identical (D1's strict no-op guarantee).  Every
             # fail-safe route — unreadable/malformed sidecar, a probe that could
             # not produce a plan, a probe whose plan does not COVER attempt-0's
             # observed failures, a rebased or uncorroborated tree, or a subset
-            # that would not materially narrow (_materially_narrows) — returns
+            # that would not materially narrow
+            # (merge_lane/retry_verify_env.py::_materially_narrows) — returns
             # None and leaves `spec` untouched, so the retry runs FULL via the
             # existing _reverify_rebased_tree (M4) semantics AND stays on the
             # legacy budget.  A REMOTE dispatch (runner is not None) skips the
@@ -3011,11 +1764,11 @@ async def _run_post_merge_verify(
                 # shared sccache backend et al).  Threading it makes the
                 # `cargo nextest list` probe model the same build the verify
                 # performs — without it a warm lane's probe compiles cold.
-                attempt0 = await _build_attempt0_payload(
+                attempt0 = await build_attempt0_payload(
                     merge_wt, verify, verify_env=spec.verify_env
                 )
                 if attempt0 is not None:
-                    retry_env = await _assemble_retry_verify_env(
+                    retry_env = await assemble_retry_verify_env(
                         git_ops, req, merge_wt, attempt0
                     )
                     if retry_env is not None:
@@ -3375,7 +2128,7 @@ async def _run_post_merge_verify(
                         f'suspected red main'
                     )
                 if quarantine is not None:
-                    quarantine.add(runner.name)
+                    quarantine(runner.name)
                 if (
                     escalation_queue is not None
                     and not escalation_queue.has_open_l1(_CROSS_CHECK_SENTINEL)
@@ -3588,7 +2341,7 @@ async def _run_post_merge_verify(
         # probe-handles bundle):
         # unchanged behaviour from before this task.
         if main_health_probe_handles is None:
-            main_health_outcome = await _classify_main_health_red(
+            main_health_outcome = await classify_main_health_red(
                 git_ops, req, verify, event_store,
                 escalation_queue=escalation_queue,
             )
@@ -3606,7 +2359,7 @@ async def _run_post_merge_verify(
         # (G4, task 2564); a cold cache or failing_test_ids=None (OPAQUE/
         # scoped/degraded) keeps today's wording (B3). The wholly-preexisting
         # case (new_ids empty) is routed to MAIN_HEALTH_RED by
-        # _classify_main_health_red / _run_deferred_main_health_probe; this
+        # classify_main_health_red / _run_deferred_main_health_probe; this
         # enrichment fires only for a non-empty new-ids set, so it never
         # contradicts that routing.
         new_ids: frozenset[str] | None = None
@@ -3711,7 +2464,7 @@ async def _run_post_merge_verify(
         # The return value tells us whether a probe is actually in flight —
         # as opposed to a cheap guard having already confirmed this really
         # is a plain task fault in both modes (see
-        # _spawn_main_health_probe's docstring).  Task 2564 amendment
+        # spawn_main_health_probe's docstring).  Task 2564 amendment
         # (reviewer_comprehensive finding 1): only in the former case do we
         # annotate the provisional reason as pending reclassification, so a
         # steward/human reading it can tell "still being classified
@@ -3729,7 +2482,7 @@ async def _run_post_merge_verify(
         # verify_failure_is_preexisting_on_main); this only makes the
         # placement decision observable in the main_health_red telemetry.
         origin_is_local = runner is None or getattr(runner, 'is_local', True)
-        probe_pending = _spawn_main_health_probe(
+        probe_pending = spawn_main_health_probe(
             main_health_probe_handles, git_ops, req, verify,
             escalation_queue=escalation_queue, event_store=event_store,
             origin_is_local=origin_is_local,
@@ -4391,11 +3144,6 @@ def _leased_by_host(rows: Iterable[LeaseRow]) -> dict[str, list[str]]:
     return _task_ids_by_host(row for row in rows if row.holds_lease)
 
 
-def _ssh_targets_by_runner(config: OrchestratorConfig) -> Mapping[str, str]:
-    """``{runner name: ssh_host}`` of *config*'s enabled verify runners."""
-    return {r.name: r.ssh_host for r in config.enabled_verify_runners}
-
-
 def _lease_part(row: LeaseRow) -> str:
     """``host=task_id``, annotated ``(activity[,quarantined])`` unless it counts verifying."""
     occupant = f'{row.host}={row.task_id}'
@@ -4483,7 +3231,7 @@ class _TrainMergeHost(Protocol):
     _event_store: EventStore | None
     _verifier: VerifyPort
     _clock: ClockPort
-    _runner_quarantine: set[str]
+    _host_quarantine: HostQuarantine
     _escalation_queue: Any
 
     # ── Per-task counters (mutated by shared helpers) ─────────────────────
@@ -4510,10 +3258,6 @@ class _TrainMergeHost(Protocol):
 
     # ── verify hosts ──────────────────────────────────────────────────────
     def _ensure_host_allocator(self, config: OrchestratorConfig) -> HostAllocator: ...
-    def _quarantine_unreachable_host(
-        self, host: str, reason: str, now: float, *,
-        kind: RunnerUnavailableKind = 'transport', identity: GateIdentityPair | None = None,
-    ) -> None: ...
     def bench_unavailable_runner(self, name: str, exc: RunnerUnavailable) -> None: ...
     async def _cancel_and_release_tracked(self, lease: HostLease | None) -> bool: ...
     async def _teardown_verify_task(
@@ -6186,7 +4930,7 @@ async def _leased_train_verify(
         max_narrowed=worker.MAX_POST_MERGE_VERIFY_NARROWED_RETRIES,
         narrowed_retries=worker._post_merge_verify_narrowed_retries,
         event_store=worker._event_store,
-        quarantine=worker._runner_quarantine,
+        quarantine=worker._host_quarantine.quarantine_divergent,
         halt_hook=worker.operator_halt,
         escalation_queue=worker._escalation_queue,
         verifier=worker._verifier,
@@ -7724,7 +6468,7 @@ class SpeculativeMergeWorker:
     # the did-not-pass subset (cheap per retry), unlike the ENOSPC budget
     # which bounds a full re-verify.  LIVE in production (task 3059): the
     # retry payload is built in-process from attempt-0's OWN VerifyResult
-    # (_build_attempt0_payload), so a retry_failed_only=True request that
+    # (build_attempt0_payload), so a retry_failed_only=True request that
     # corroborates its tree OID gets this budget, not the small
     # MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES one.  A request whose payload
     # cannot be built or corroborated still falls back to the ENOSPC budget —
@@ -7835,25 +6579,6 @@ class SpeculativeMergeWorker:
     # under both.  Class attribute so tests monkeypatch it small (mirrors
     # MAX_INFLIGHT_DEAD_VERIFY_ABORTS).
     MAX_CONTENDED_LEASE_DEFER_SECS: float = 14400.0
-    # task 3043 amend (reviewer_comprehensive, efficiency): rate limit for the
-    # reprobe sweep's "still unreachable" record.  A host that is permanently
-    # gone — a laptop removed from the fleet, the reify 2026-07-25 shape —
-    # stays in the RU tracker forever while _reprobe_loop sweeps every
-    # verify_host_reprobe_interval_s (120 s), so an unconditional INFO per
-    # sweep is ~720 identical lines/day.  Unbounded repetition of an
-    # UNCHANGING fact is what destroys the greppability the decision logging
-    # exists to buy, so the record is INFO for the first few sweeps of an
-    # episode, INFO again on any CHANGE (a new streak), and thereafter at most
-    # one INFO per period — DEBUG in between, so nothing is ever actually
-    # dropped.  Recovery / park-skip / unresolvable-runner records are
-    # TRANSITIONS (at most one per episode) and are never throttled.
-    # Class attributes so tests can monkeypatch them (mirrors
-    # MAX_INFLIGHT_DEAD_VERIFY_ABORTS).
-    REPROBE_STILL_DOWN_INFO_SWEEPS: int = 3
-    REPROBE_STILL_DOWN_INFO_PERIOD_SECS: float = 1800.0
-    # How often _reprobe_loop launches the remotes' detached gate reapers
-    # (task 6565, design D2: at most hourly per process).
-    GATE_REAP_INTERVAL_SECS: float = 3600.0
     # task 3043 amend (reviewer_comprehensive, robustness): upper bound on
     # _run_inflight_verify's orphan-guard reap.  The guard cancels its inner
     # _run_post_merge_verify task and awaits it in a `finally` on a
@@ -8055,12 +6780,6 @@ class SpeculativeMergeWorker:
         task_priority: TaskPriorityLookup | None = None,
     ):
         self._git_ops = git_ops
-        # Task 6565: handed to every RemoteRunner this worker builds.
-        self._deployed_sha = deployed_sha
-        # Task 6565: every verify runner named in config, enabled or not; at
-        # start (run) the worker resolves the bench L1s a previous process
-        # left open for them.  A host since dropped from config is not covered.
-        self._verify_hosts = tuple(verify_hosts)
         self._queue = queue
         self._event_store = event_store
         # Task η (AFK coverage gap): harness-owned handles for the
@@ -8374,69 +7093,33 @@ class SpeculativeMergeWorker:
         # retired by task ο (RealMergeItem carries no such escape hatch). Never
         # reset so the counter covers the full worker lifetime (cross-submission).
         self._verify_attempt_count: int = 0
-        # Lever C drift detective: land counter and in-memory quarantine set.
-        # _drift_land_count increments on every 'done' land; _runner_quarantine
-        # is the set of remote runner names that have been quarantined by
-        # DriftDetector.check in _run_drift_check.  Both are additive across
-        # submissions; the dedup'd L1 escalation in DriftDetector is the
-        # durable cross-restart protection.  None-safe: initialised here so
-        # bare-worker tests that don't set up remotes stay green.
-        #
-        # RESTART RE-TRUST WINDOW: an injected *runner_quarantine* is owned by
-        # the harness for the PROCESS lifetime (task 6670, PRD
-        # plans/remote-task-leg-verify-prd.md decision 4, §12 Q4), shared by
-        # reference with the task path's HostPool, so it survives an
-        # in-process worker rebuild; the RU tracker below stays this worker's.
-        # It still resets to empty on a process restart: a remote that
-        # diverged (remote PASS / local FAIL) becomes re-eligible then.  The
-        # dedup'd L1 blocking escalation (submitted by DriftDetector before
-        # quarantine) is the cross-restart guard: an open
-        # verify_drift_divergence L1 halts the merge queue across restart via
-        # the normal EscalationQueue gate, so the re-trusted remote's verdict
-        # is never authoritative for real merges until the escalation is
-        # resolved.  Rely on that coupling rather than persisting the set.
+        # Lever C drift detective: land counter.  _drift_land_count increments
+        # on every 'done' land; the remote runners DriftDetector.check
+        # quarantines in _run_drift_check go to HostQuarantine's set below.
+        # Additive across submissions; the dedup'd L1 escalation in
+        # DriftDetector is the durable cross-restart protection.
         self._drift_land_count: int = 0
-        self._runner_quarantine: set[str] = (
-            set() if runner_quarantine is None else runner_quarantine
+        # The lane's remote verify hosts out of the pool (tasks 1795, 3043,
+        # 6565), and the sole lane-side writer of the shared quarantine set
+        # and the per-host RunnerUnavailable tracker.  An injected
+        # *runner_quarantine* is the harness's process-lifetime set (task
+        # 6670).  Its resolvers re-read the live attributes because tests
+        # re-assign them after construction.
+        self._host_quarantine = HostQuarantine(
+            clock=self._clock,
+            allocator=lambda: self._host_allocator,
+            event_store=lambda: self._event_store,
+            escalation_queue=lambda: self._escalation_queue,
+            deployed_sha=deployed_sha,
+            verify_hosts=verify_hosts,
+            quarantine=runner_quarantine,
+            host_holder_reader=host_holder_reader,
+            on_host_readmitted=on_host_readmitted,
         )
-        # Task 6670: the harness's reader of task-path holds per remote host,
-        # shown as task_held_by on the snapshot's host rows, and its hook for
-        # a readmission (readmit_host), so the task pool re-offers the host.
-        self._host_holder_reader = host_holder_reader
-        self._on_host_readmitted = on_host_readmitted
-        # Per-host RunnerUnavailable streak tracker (task 1795).  Keyed by
-        # runner name; entries created on first failure, popped on recovery.
-        # Used by _record_runner_unavailable / _record_runner_recovered to fire
-        # a dedup'd escalation and auto-reprobe on recovery.  None-safe at call
-        # sites: only populated when remote runners are configured.
-        self._runner_unavailable: dict[str, _HostUnavailability] = {}
-        # Thresholds for firing / probing (copies of config knobs set by
-        # _ensure_host_allocator; defaults keep bare-worker tests green).
-        # Override in tests to drive threshold logic synchronously (mirrors
-        # _heartbeat_interval_s precedent).
-        self._unreachable_escalate_after_n: int = 3
-        self._unreachable_escalate_after_secs: float = 600.0
+        # How often _reprobe_loop runs HostQuarantine.sweep (copy of the
+        # config knob set by _ensure_host_allocator; the default keeps
+        # bare-worker tests green).
         self._reprobe_interval_s: float = 120.0
-        # {runner name: configured ssh_host}, the target the unreachability
-        # alarm names (task 5290); set alongside the knobs above.
-        self._runner_ssh_targets: Mapping[str, str] = {}
-        # Rate-limit state for the reprobe sweep's "still unreachable" record
-        # (task 3043 amend).  {host: (last_info_at, last_streak, sweeps_seen)}.
-        # A host that
-        # is permanently gone stays tracked forever and the sweep runs every
-        # _reprobe_interval_s (120 s), so an unconditional INFO per sweep is
-        # ~720 identical lines/day — unbounded repetition of an unchanging fact,
-        # which degrades exactly the greppability the decision logging buys.
-        # Written only by _reprobe_quarantined_hosts; popped in lockstep with
-        # the tracker entry by _record_runner_recovered, so it cannot outlive
-        # the episode it describes.
-        self._reprobe_last_info: dict[str, tuple[float, int, int]] = {}
-        # Skew benches opened per (host, deployed sha) across tracker episodes
-        # (task 6565, design D6).  A readmit pops the tracker entry, so the
-        # count that makes a host's second skew bench sticky lives here.
-        self._skew_benches: dict[tuple[str, str | None], int] = {}
-        # When _reap_idle_gates last launched the remote gate reapers.
-        self._last_gate_reap_at: float | None = None
         # In-flight drift-detective asyncio.Tasks.  asyncio keeps only a WEAK
         # reference to running tasks, so without a strong ref here the drift
         # detective can be GC'd mid-run and a remote-PASS / local-FAIL
@@ -9441,9 +8124,10 @@ class SpeculativeMergeWorker:
         call, once ``project_root`` is available, produces the fully-populated
         cached allocator rather than re-using an empty one.
 
-        The allocator shares ``self._runner_quarantine`` by reference so
-        HostAllocator-driven (RunnerUnavailable) and DriftDetector-driven
-        quarantines share one source of truth.
+        :meth:`HostQuarantine.allocator_over` builds it over the lane's one
+        quarantine set, shared by reference, so HostAllocator-driven
+        (RunnerUnavailable) and DriftDetector-driven quarantines share one
+        source of truth.
 
         The remotes are the constructor's ``remote_runners`` when it was given
         them, and are built from *config* otherwise.
@@ -9453,765 +8137,27 @@ class SpeculativeMergeWorker:
         project_root = getattr(self._git_ops, 'project_root', None)
         if project_root is not None:
             remotes = list(self._remote_runners) if self._remote_runners is not None else (
-                self._remote_runners_from(config, project_root)
+                self._host_quarantine.remote_runners_from(config, project_root)
             )
-            self._host_allocator = HostAllocator(
-                remotes, quarantine=self._runner_quarantine
-            )
-            # Copy config knobs onto worker attrs so operator config drives
-            # production while __init__ defaults keep bare-worker tests green
-            # (mirrors _heartbeat_interval_s precedent).
-            self._unreachable_escalate_after_n = (
-                config.verify_host_unreachable_escalate_after_n
-            )
-            self._unreachable_escalate_after_secs = (
-                config.verify_host_unreachable_escalate_after_secs
-            )
+            self._host_allocator = self._host_quarantine.allocator_over(remotes)
+            # Copy config knobs so operator config drives production while
+            # __init__ defaults keep bare-worker tests green (mirrors
+            # _heartbeat_interval_s precedent).
+            self._host_quarantine.adopt_config(config)
             self._reprobe_interval_s = config.verify_host_reprobe_interval_s
-            self._runner_ssh_targets = _ssh_targets_by_runner(config)
             return self._host_allocator
         # project_root unavailable: return a transient empty-remote allocator
         # without caching so a subsequent call with project_root set builds the
         # fully-populated instance.
-        return HostAllocator([], quarantine=self._runner_quarantine)
-
-    def _remote_runners_from(self, config: OrchestratorConfig, cwd: Path) -> list:
-        """The config's remote runners, gated on this process's deployed sha.
-
-        A config with enabled runners needs that sha: without it there is no
-        gate to dispatch through, and a remote verify must never fall back to
-        a shared remote tree (task 6565, design D2).  ``cli.py::run`` refuses
-        to start in that state, so this raise is the second line.
-
-        Unfiltered by quarantine (task 6670): the allocator reads the shared
-        set at acquire, and a host benched before this build must still get
-        a slot, or its row is an orphan the reprobe cannot re-adopt.
-        """
-        enabled = [r.name for r in config.enabled_verify_runners]
-        if not enabled:
-            return []
-        if self._deployed_sha is None:
-            raise RuntimeError(
-                f'merge worker has enabled verify_runners {enabled} but no deployed '
-                'sha to gate them on (task 6565); start it with Harness(deployed_sha=...)'
-            )
-        return _build_remote_runners(config, cwd, deployed_sha=self._deployed_sha)
-
-    # ── per-host RunnerUnavailable tracker (tasks 1795, 6565) ────────────
-
-    def _record_runner_unavailable(
-        self, host: str, reason: str, now: float, *,
-        kind: RunnerUnavailableKind = 'transport', identity: GateIdentityPair | None = None,
-    ) -> bool:
-        """Record one RunnerUnavailable of *kind* for *host* and return whether to escalate.
-
-        Creates a new ``_HostUnavailability`` entry on the first call, then
-        increments ``streak`` on each subsequent call.  ``first_unavailable_at``
-        is fixed to the first-call timestamp so duration can be computed later.
-
-        A 'skew'-class *kind* (:func:`quarantine_class`) sets the entry's kind,
-        reason and identity, and when it opens a skew bench it counts toward
-        the host's sticky bound (:meth:`_open_skew_bench`).  A 'transport' RU
-        never downgrades a skew entry: it refreshes the reason of a transport
-        entry only.
-
-        Returns whether the caller should alarm: the entry's
-        :meth:`_HostUnavailability.alarm_due` against this worker's streak and
-        time thresholds, the same predicate the reprobe sweep re-asserts
-        (task 5290).  The alarm helpers' ``has_open_l1`` dedup prevents
-        re-submitting.
-        """
-        entry = self._runner_unavailable.setdefault(
-            host, _HostUnavailability(streak=0, first_unavailable_at=now, reason=reason),
-        )
-        entry.streak += 1
-        if quarantine_class(kind) == 'skew':
-            if quarantine_class(entry.kind) == 'ru':
-                self._open_skew_bench(host, entry)
-            entry.kind, entry.reason, entry.identity = kind, reason, identity
-        elif quarantine_class(entry.kind) == 'ru':
-            entry.reason = reason
-        return entry.alarm_due(
-            now,
-            after_n=self._unreachable_escalate_after_n,
-            after_secs=self._unreachable_escalate_after_secs,
-        )
-
-    def _open_skew_bench(self, host: str, entry: _HostUnavailability) -> None:
-        """Count a new skew bench of *host* on this deployed sha; the second is sticky.
-
-        Every bench after the first follows a passing probe (a readmit is what
-        closed the previous one), so the second bench means the cause survives
-        a passing probe: re-admitting again would only spend another verify
-        (design D6).  A failing reprobe opens no bench and so never counts.
-        """
-        key = (host, self._deployed_code_sha())
-        self._skew_benches[key] = self._skew_benches.get(key, 0) + 1
-        entry.sticky = self._skew_benches[key] >= 2
-
-    def _record_runner_recovered(self, host: str) -> None:
-        """Clear the unavailability tracker entry for *host* (idempotent).
-
-        After this call, a subsequent ``_record_runner_unavailable`` starts a
-        fresh episode with ``streak=1`` and a new ``first_unavailable_at``.
-
-        The reprobe sweep's still-unreachable rate-limit state is popped in
-        lockstep (task 3043 amend), so the next downtime episode for this host
-        logs its first sweeps at INFO again instead of inheriting the previous
-        episode's throttle.
-        """
-        self._runner_unavailable.pop(host, None)
-        self._reprobe_last_info.pop(host, None)
-
-    def _local_host_name(self) -> str:
-        """Name of the local (trust-anchor) host, per the allocator when present.
-
-        Reads :attr:`HostAllocator.local_name` (O(1)) rather than scanning
-        ``host_states()`` for the ``is_local`` flag, which materialised one
-        dict per host on every call (task 3043 amend).
-        """
-        if isinstance(self._host_allocator, HostAllocator):
-            return self._host_allocator.local_name
-        return 'local'
-
-    def _quarantine_unreachable_host(
-        self, host: str, reason: str, now: float, *,
-        kind: RunnerUnavailableKind = 'transport', identity: GateIdentityPair | None = None,
-    ) -> None:
-        """Quarantine *host* for a RunnerUnavailable of *kind* AND record it (tasks 3043, 6565).
-
-        The ONE chokepoint every RunnerUnavailable bench goes through, so the
-        design-D6 policy (:func:`quarantine_class`, :func:`escalation_policy`,
-        no downgrade, the sticky bound) is applied in one place; a skew-class
-        bench also emits ``verify_host_skew``.
-
-        INV-A — **a host is never removed from the acquirable pool for an
-        unreachability reason without a ``_runner_unavailable`` entry.**
-        :meth:`_reprobe_quarantined_hosts` can only re-adopt hosts it can see in
-        that tracker, so a quarantine without a record is a permanent strand:
-        the host stops being dispatched to and nothing can ever re-probe it,
-        until an orchestrator restart rebuilds the allocator.
-
-        Recovery from task 1795 was gated on a fragile *conjunction* — a host
-        was re-adoptable only if it was in BOTH the shared quarantine set and
-        the tracker — which three real paths violate: an orphaned verify task
-        whose ``RunnerUnavailable`` escapes after the outer coroutine was
-        cancelled, a ``cancel_and_release`` that leaves the slot PARKED against
-        a down host, and any future quarantine site that forgets to record.
-        Funnelling every RU-class quarantine through this ONE method makes the
-        invariant checkable by reading a single function instead of auditing N
-        call sites for a two-piece state update.
-
-        Order: quarantine first (so ``acquire_remote`` stops handing the host
-        out immediately — ``_runner_quarantine`` is shared BY REFERENCE with the
-        allocator, so this needs no allocator rebuild and no restart), then
-        record, then alarm.  Streak / ``first_unavailable_at`` / reason
-        semantics are DELEGATED to :meth:`_record_runner_unavailable` so they
-        are identical across this path and the existing RUNNER_UNAVAILABLE
-        finalize path, and the L1 alarm keeps the existing
-        ``has_open_l1`` dedup (at most one open alarm per host at a time).
-
-        Local is a no-op *for state*: it is the trust anchor, is never
-        quarantined, and has no remote to probe for recovery.  It is NOT a
-        silent no-op (task 3043 amend): the previous RUNNER_UNAVAILABLE
-        finalize path recorded a local lease unconditionally, so returning
-        without a word here would make "the trust anchor reported itself
-        unavailable" vanish entirely — the silent degradation this repo's
-        loud-over-silent norm and the no-silent-fail-soft design invariant
-        rule out.  A WARNING keeps the event greppable while preserving the
-        never-quarantine-local rule.  None-safe throughout — with no allocator
-        the tracker entry is still written, so recovery remains possible once
-        one exists.
-        """
-        if host == self._local_host_name():
-            logger.warning(
-                'RU-class quarantine requested for the LOCAL trust-anchor host %r '
-                '(reason: %s) — ignoring; local is never quarantined',
-                host, reason,
-            )
-            return
-
-        self._runner_quarantine.add(host)
-
-        _should_escalate = self._record_runner_unavailable(
-            host, reason, now, kind=kind, identity=identity,
-        )
-        entry = self._runner_unavailable[host]
-        if quarantine_class(kind) == 'skew':
-            self._emit_skew_bench(host, entry)
-        if _should_escalate:
-            self._alarm_host(host, entry, now - entry.first_unavailable_at)
+        return self._host_quarantine.allocator_over([])
 
     def bench_unavailable_runner(self, name: str, exc: RunnerUnavailable) -> None:
-        """Bench remote *name* for *exc*, by its kind: the ``on_unavailable`` sink.
-
-        Pools, drift checks and the train fallback hand a RunnerUnavailable
-        here; it goes through :meth:`_quarantine_unreachable_host`.
-        """
-        self._quarantine_unreachable_host(
-            name, str(exc), self._clock.now(), kind=exc.kind, identity=exc.identity,
-        )
-
-    def _deployed_code_sha(self) -> str | None:
-        return self._deployed_sha.sha if self._deployed_sha is not None else None
-
-    def _emit_skew_bench(self, host: str, entry: _HostUnavailability) -> None:
-        if self._event_store is None:
-            return
-        self._event_store.emit(EventType.verify_host_skew, data={
-            'host': host, 'kind': entry.kind, 'reason': entry.reason,
-            'sticky': entry.sticky, 'code_sha': self._deployed_code_sha(),
-            'identity': entry.identity.to_wire() if entry.identity is not None else None,
-        })
-
-    def _alarm_host(self, host: str, entry: _HostUnavailability, duration_s: float) -> None:
-        """File the dedup'd L1 for *host*'s bench, in its quarantine class's category."""
-        if quarantine_class(entry.kind) == 'skew':
-            _alarm_verify_host_skew(
-                self._escalation_queue, host, entry,
-                code_sha=self._deployed_code_sha(), duration_s=duration_s,
-            )
-            return
-        _alarm_verify_host_unreachable(
-            self._escalation_queue,
-            host,
-            entry.reason,
-            streak=entry.streak,
-            duration_s=duration_s,
-            ssh_target=self._runner_ssh_targets.get(host),
-            event_store=self._event_store,
-        )
-
-    def _host_states_block(self, now: float) -> list[dict]:
-        """Per-host slot state + quarantine classification for :meth:`snapshot`.
-
-        One dict per host the allocator manages, in allocator order (local
-        first), then one per **orphan** RU-tracked host (see below), each with
-        a **uniform schema** — every key always present, ``None`` where not
-        applicable::
-
-            {name, is_local, slot_state, quarantined, quarantine_class,
-             unavailable_since, unavailable_secs, streak, reason,
-             kind, sticky, identity, task_held_by}
-
-        *now* is the snapshot's own clock (``time.time()``), passed in so
-        ``unavailable_secs`` is measured against the same instant as every
-        other relative age in the snapshot (``entries[].age_secs``,
-        ``verify_in_progress.age_secs``) rather than against a second,
-        slightly-later read of the wall clock.
-
-        The allocator owns slot state and quarantine membership
-        (:meth:`~orchestrator.verify_runner.HostAllocator.host_states`); the
-        RunnerUnavailable streak tracker is worker-owned, so the RU enrichment
-        is applied here rather than pushed down into the allocator.
-
-        Notes
-        -----
-        - ``quarantine_class`` of a quarantined host is the tracked entry's
-          :func:`quarantine_class` — ``'ru'`` (re-probed by ``ssh true``) or
-          ``'skew'`` (re-probed by ensure-gate, task 6565) — or
-          ``'divergence'`` for an untracked one, held for verdict divergence
-          and cleared only by an operator.  Tracker membership is the same
-          predicate the tracker-driven :meth:`_reprobe_quarantined_hosts`
-          loops on, and :meth:`probe_host` dispatches on the same function, so
-          this snapshot and the reprobe can never disagree.  ``kind``,
-          ``sticky`` and ``identity`` (``GateIdentityPair.to_wire()``) come
-          from the entry too, so a skew bench shows both gate identities.
-        - ``unavailable_since`` / ``unavailable_secs`` / ``streak`` / ``reason``
-          are populated whenever the host is RU-tracked, **independent of
-          quarantine**, so a host accumulating failures below the quarantine
-          threshold is visible too.  ``unavailable_since`` is the absolute
-          epoch (for cross-log correlation); ``unavailable_secs`` is the
-          derived *relative* downtime — ``max(0.0, now - first_unavailable_at)``
-          — which is the operationally interesting form ("how long has this
-          host been down") and matches how every other time-valued field in
-          the snapshot is expressed.  Clamped at 0 so a clock step backwards
-          cannot surface a negative duration.
-        - **Orphan RU entries.** ``_runner_unavailable`` is only pruned on
-          recovery (:meth:`_record_runner_recovered`), while the allocator is
-          built once and cached for the worker's lifetime, so a host that
-          leaves the managed set (renamed/removed remote) can keep a live RU
-          streak that no allocator slot corresponds to.  Those names are
-          appended after the managed hosts with ``slot_state=None``
-          (``None`` = "not allocator-managed", keeping the non-null slot
-          vocabulary exactly :data:`~orchestrator.verify_runner._SLOT_WIRE`)
-          and ``is_local=False``, so an orphaned streak is never invisible —
-          that blind spot is the same class of gap this block exists to close.
-          Quarantine membership for them is read via
-          :meth:`~orchestrator.verify_runner.HostAllocator.is_quarantined`,
-          which answers from the shared-by-reference quarantine set and so
-          works for names the allocator does not manage —
-          :meth:`~orchestrator.verify_runner.HostAllocator.host_states` cannot
-          answer it, since an orphan has no slot to report.  Consequence:
-          ``len(hosts)`` equals ``occupancy.hosts_total`` **plus** the number
-          of orphan entries; with no orphans (the steady state) the two agree.
-        - The ``isinstance`` gate is a TYPE check, not a defensive fail-soft:
-          :meth:`_ensure_host_allocator` always constructs a real
-          :class:`~orchestrator.verify_runner.HostAllocator` and nothing else is
-          ever assigned in production, so the ``[]`` branch is unreachable
-          there.  It exists solely because ``_host_allocator`` carries a
-          ``MagicMock`` double at 79 assignment sites across 15 test files;
-          those doubles answer every attribute, so ``hasattr``/duck-typing
-          would let them crash or inject garbage into this read-only path.
-        - ``task_held_by`` is the harness's task-hold reading for the host
-          (``'task:<id>[,task:<id>]'``), else None.  It is independent of
-          ``slot_state``: a task turn on a remote host takes no merge slot
-          (task 6670, hosts are symmetric).
-        - ``[]`` therefore also means "allocator not built yet (no verify
-          dispatched)".  Deliberately NOT a fabricated ``local`` entry — an
-          absent allocator is a distinct fact from an idle one.
-        """
-        if not isinstance(self._host_allocator, HostAllocator):
-            return []
-        holders = self._host_holder_reader() if self._host_holder_reader is not None else {}
-
-        def _entry(name: str, *, is_local: bool, slot_state: str | None,
-                   quarantined: bool) -> dict:
-            ru = self._runner_unavailable.get(name)
-            return {
-                'name': name,
-                'is_local': is_local,
-                'slot_state': slot_state,
-                'quarantined': quarantined,
-                'quarantine_class': (
-                    (quarantine_class(ru.kind) if ru is not None else 'divergence')
-                    if quarantined else None
-                ),
-                **(ru.to_wire(now) if ru is not None else UNTRACKED_HOST_WIRE),
-                'task_held_by': holders.get(name),
-            }
-
-        out: list[dict] = [
-            _entry(
-                st['name'],
-                is_local=st['is_local'],
-                slot_state=st['slot_state'],
-                quarantined=bool(st['quarantined']),
-            )
-            for st in self._host_allocator.host_states()
-        ]
-        # Orphan RU entries: RU-tracked hosts with no allocator slot. Appended
-        # after the managed hosts so the allocator's own ordering (local first,
-        # then remotes in declaration order) is untouched; sorted for a stable
-        # snapshot across calls.
-        _managed = {h['name'] for h in out}
-        for _orphan in sorted(set(self._runner_unavailable) - _managed):
-            out.append(_entry(
-                _orphan,
-                is_local=False,
-                slot_state=None,
-                quarantined=self._host_allocator.is_quarantined(_orphan),
-            ))
-        return out
-
-    async def _reprobe_quarantined_hosts(self, now: float) -> None:
-        """Probe each RU-**tracked** remote host and re-engage it on recovery.
-
-        Called periodically by :meth:`_reprobe_loop`.  Candidacy is **tracker-
-        driven** (task 3043): the sweep iterates ``self._runner_unavailable``
-        and resolves a runner for each tracked host, rather than iterating the
-        allocator's quarantine set and then requiring a tracker entry.
-
-        Why the inversion.  The old conjunction ("in the quarantine set AND in
-        the tracker") made recovery reachable only when two pieces of state
-        happened to agree, and three real paths violate that agreement, each
-        stranding a host permanently — non-acquirable, yet structurally
-        invisible to this sweep:
-
-        - an orphaned inner verify task whose ``RunnerUnavailable`` escapes
-          after the outer coroutine was cancelled (in neither);
-        - a ``cancel_and_release`` against a down host, which leaves the slot
-          PARKED and non-acquirable *without* adding the host to the quarantine
-          set (in neither, yet out of the pool);
-        - any future quarantine site that forgets to record.
-
-        A single positive condition ("the tracker says this host is
-        unavailable, so probe it") covers **both** the RUNNER_UNAVAILABLE
-        VerifyResult path and those escaping-exception / PARKED-strand paths.
-        The INV-A chokepoint :meth:`_quarantine_unreachable_host` guarantees
-        the tracker entry exists for every RU-class removal from the pool.
-
-        Per host:
-
-        1. Probes via :meth:`probe_host` — ``runner.health()`` for an 'ru'
-           bench, ensure-gate for a 'skew' one; a sticky bench is not probed.
-        2. **On success** (host recovered): if the slot is PARKED and the runner
-           exposes ``probe_clean``, re-admission additionally requires a clean
-           probe — PARK means "the cancel RPC failed, so a stale verify may
-           still be running there", and freeing the slot on mere reachability
-           could double-dispatch onto a host still churning on the previous
-           merge.  A dirty host stays tracked and parked so the NEXT sweep
-           retries it.  A PARKED host whose runner does NOT expose the optional
-           probe is re-admitted on reachability alone but **loudly** (WARNING) —
-           see the inline note: refusing would make it permanently
-           non-acquirable, and the arm is unreachable against a real
-           ``HostAllocator``.  Otherwise the host is **re-admitted** via
-           ``allocator.readmit`` — which un-quarantines *and* un-PARKs; plain
-           ``clear_quarantine`` cannot recover a PARKED slot, since
-           ``acquire_remote`` additionally requires ``_SLOT_FREE`` — then
-           :meth:`readmit_host` resets the tracker and resolves the alarms on
-           the evidence the probe named.
-        3. **On failure** (host still unreachable): re-asserts the alarm while
-           :meth:`_HostUnavailability.alarm_due` holds (dedup'd via
-           ``has_open_l1``), so a resolve issued while the host still fails its
-           probe — on an occupancy read, say — is re-opened on the next sweep:
-           recovery is a measurement (the probe), never a proxy (task 5290).
-           Probing before alarming avoids a spurious open→immediate-resolve L1
-           churn for a host that recovers in the same cycle it would have tripped
-           the time-based threshold.
-
-        **Correctness invariant (Invariant 5)**: hosts quarantined for verdict
-        divergence — by :class:`DriftDetector`'s sampled parity check OR by the
-        land-time per-land cross-check in :func:`_run_post_merge_verify` (task
-        2822 fix b, which adds ``runner.name`` to the same worker-owned
-        ``_runner_quarantine`` set) — are never in ``self._runner_unavailable``,
-        so tracker-driven candidacy excludes them **by construction** rather
-        than by an explicit skip.  Clearing either on mere SSH reachability
-        would bypass the verdict parity gate; both stay quarantined until an
-        operator re-proves the host and clears it explicitly.
-
-        Runner resolution deliberately uses ``getattr`` + a
-        ``quarantined_remote_runners()`` fallback rather than the
-        ``isinstance(_host_allocator, HostAllocator)`` gate used elsewhere in
-        this class: the reprobe suites drive this method through lightweight
-        allocator doubles that are not ``HostAllocator`` instances, and an
-        isinstance gate would make the sweep a silent no-op for them.
-
-        The tracker is iterated as a **snapshot** because the sweep mutates it
-        (``_record_runner_recovered``).  Per-host exceptions are caught so one
-        host's failure cannot abort the sweep for the remaining hosts.
-
-        **Observability.** Every decision emits exactly one single-line record
-        naming the host — recovered, still-unreachable, park-safety skip,
-        unresolvable-runner (WARNING), and the allocator-missing early return
-        while hosts are tracked (WARNING) — so grepping the orchestrator log
-        for a host name answers "did the reprobe loop consider this host, and
-        what did it decide?".  That question was unanswerable during the reify
-        2026-07-25 incident, whose post-mortem had to argue from the *absence*
-        of dispatch attempts.  This complements task 3275's snapshot/heartbeat
-        observability, which reports per-host STATE but not this sweep's
-        decisions.  Deliberately **silent** when the tracker is empty: the
-        healthy steady state runs every ``verify_host_reprobe_interval_s``
-        (120 s) and must not become log noise.
-
-        For the same reason the **still-unreachable** record — the only one
-        that repeats for an unchanging state — is rate-limited to
-        ``REPROBE_STILL_DOWN_INFO_SWEEPS`` INFO lines per episode, plus one on
-        any streak change, plus one per ``REPROBE_STILL_DOWN_INFO_PERIOD_SECS``
-        thereafter; suppressed sweeps drop to DEBUG rather than vanishing (task
-        3043 amend).  Every other record is a TRANSITION, at most one per
-        episode, and is never throttled.
-        """
-        if self._host_allocator is None:
-            # Silent when nothing is tracked (the common "no verify dispatched
-            # yet" case at a 120 s cadence); loud when hosts ARE tracked, since
-            # then this early return is the reason none of them can recover.
-            if self._runner_unavailable:
-                logger.warning(
-                    'reprobe: no host allocator built, but %d host(s) are tracked '
-                    'unavailable (%s) — none can be re-probed or re-admitted this sweep',
-                    len(self._runner_unavailable),
-                    ', '.join(sorted(self._runner_unavailable)),
-                )
-            return
-
-        # Loop-INVARIANT fallback map, hoisted out of the per-host loop and
-        # built AT MOST ONCE per sweep, lazily on the first `remote_runner`
-        # miss (task 3043 amend).  Against a real HostAllocator `remote_runner`
-        # always resolves, so this stays None and costs nothing; only the
-        # legacy-double path pays, and it now pays O(n_quarantined) per sweep
-        # instead of per tracked host.
-        _fallback_runners: dict[str, Any] | None = None
-        _resolve = getattr(self._host_allocator, 'remote_runner', None)
-
-        for name, entry in list(self._runner_unavailable.items()):
-            try:
-                # Resolve a runner for a host that may NOT be in the quarantine
-                # set — the strand shape `quarantined_remote_runners()`
-                # structurally cannot report.  Fallback keeps pre-existing
-                # allocator doubles (which predate `remote_runner`) working.
-                runner = _resolve(name) if _resolve is not None else None
-                if runner is None:
-                    if _fallback_runners is None:
-                        _fallback_runners = dict(
-                            self._host_allocator.quarantined_remote_runners()
-                        )
-                    runner = _fallback_runners.get(name)
-
-                downtime_s = now - entry.first_unavailable_at
-
-                if runner is None:
-                    logger.warning(
-                        'reprobe: host %r is tracked unavailable (down %.0fs) but has '
-                        'no resolvable runner handle — it is stranded out of the verify '
-                        'pool and cannot be re-probed',
-                        name,
-                        downtime_s,
-                    )
-                    continue
-
-                # Probe first so a host that recovers in the same cycle it would
-                # have tripped the time-based threshold goes directly to the
-                # recovery path, avoiding a spurious open→immediate-resolve L1.
-                evidence = await self.probe_host(name, runner)
-                if evidence is not None:
-                    await self._readmit_benched_host(name, runner, now, evidence=evidence)
-                else:
-                    self._note_host_still_out(name, entry, now)
-            except Exception:
-                logger.exception(
-                    'reprobe_quarantined_hosts: unexpected error probing %r; skipping',
-                    name,
-                )
-
-    async def probe_host(self, name: str, runner: Any) -> RecoveryEvidence | None:
-        """The evidence that tracked host *name* has recovered, or None (design D6, task 5290).
-
-        An 'ru' bench answers ``runner.health()`` (``ssh true``), giving
-        ``SSH_HEALTH_PROBE``.  A 'skew' bench answers ``runner.ensure_gate()``
-        — publish, build or reuse the gate, handshake — giving ``ENSURE_GATE``,
-        so a host only comes back once it can run this dispatcher's gate.  A
-        sticky bench is never probed: it waits for an operator clear or a
-        restart.
-        """
-        entry = self._runner_unavailable[name]
-        if entry.sticky:
-            return None
-        if quarantine_class(entry.kind) == 'ru':
-            return await self._ssh_health_evidence(runner)
-        try:
-            await runner.ensure_gate(event_store=self._event_store)
-        except RunnerUnavailable as exc:
-            logger.info('reprobe: ensure-gate for skew-benched host %r failed (%s): %s',
-                        name, exc.kind, exc)
-            return None
-        return RecoveryEvidence.ENSURE_GATE
-
-    @staticmethod
-    async def _ssh_health_evidence(runner: Any) -> RecoveryEvidence | None:
-        return RecoveryEvidence.SSH_HEALTH_PROBE if await runner.health() else None
-
-    async def _readmit_benched_host(
-        self, name: str, runner: Any, now: float, *, evidence: RecoveryEvidence,
-    ) -> bool:
-        """Re-admit *name* on *evidence* unless its PARKED slot is not yet clean.
-
-        PARK means "the cancel RPC failed, so a stale verify may still be
-        running there", so a PARKED slot is freed only on a clean
-        ``probe_clean()``; a dirty host stays tracked and parked for the next
-        sweep.  Returns whether the host was re-admitted.
-        """
-        _is_parked = getattr(self._host_allocator, 'is_parked', None)
-        _was_parked = bool(_is_parked(name)) if _is_parked is not None else False
-        _park_epoch = getattr(self._host_allocator, 'park_epoch', None)
-        _probed_epoch = _park_epoch(name) if _park_epoch is not None else None
-        entry = self._runner_unavailable.get(name)
-        downtime_s = now - entry.first_unavailable_at if entry is not None else 0.0
-        if _was_parked and not await self._parked_slot_is_clean(name, runner, downtime_s):
-            return False
-        if not self.readmit_host(name, now=now, evidence=evidence, expect_epoch=_probed_epoch):
-            return False
-        logger.info(
-            'reprobe: host %r recovered after %.0fs down — re-admitted to '
-            'the verify pool (slot un-PARKed: %s)',
-            name,
-            downtime_s,
-            _was_parked,
-        )
-        return True
-
-    async def _parked_slot_is_clean(self, name: str, runner: Any, downtime_s: float) -> bool:
-        _probe_clean = getattr(runner, 'probe_clean', None)
-        if _probe_clean is None:
-            # FAIL-OPEN, but never SILENTLY (task 3043 amend).  Refusing would
-            # make such a host PERMANENTLY non-acquirable; and against a real
-            # HostAllocator it is unreachable, since cancel_and_release (the
-            # only PARK writer) calls probe_clean() on that very path.
-            logger.warning(
-                'reprobe: host %r is reachable again after %.0fs and its '
-                'slot is PARKED, but its runner (%s) exposes no '
-                'probe_clean() — re-admitting on reachability ALONE; a '
-                'stale verify could still be running there',
-                name,
-                downtime_s,
-                type(runner).__name__,
-            )
-            return True
-        if await _probe_clean():
-            return True
-        logger.info(
-            'reprobe: host %r is reachable again after %.0fs but its '
-            'slot stays PARKED pending a clean probe (a stale verify '
-            'may still be running there); retrying next sweep',
-            name,
-            downtime_s,
-        )
-        return False
-
-    def _note_host_still_out(self, name: str, entry: _HostUnavailability, now: float) -> None:
-        """Log a failed reprobe (rate-limited) and re-assert the alarm while it is due."""
-        downtime_s = now - entry.first_unavailable_at
-        # Rate-limited (task 3043 amend): this is the one record that repeats
-        # forever for a permanently-gone host.  INFO for the first
-        # REPROBE_STILL_DOWN_INFO_SWEEPS sweeps of an episode, INFO on any
-        # CHANGE (a new streak), then at most one INFO per
-        # REPROBE_STILL_DOWN_INFO_PERIOD_SECS.  Suppressed sweeps log at DEBUG.
-        _last_at, _last_streak, _sweeps = self._reprobe_last_info.get(
-            name, (None, None, 0)
-        )
-        _at_info = (
-            _last_at is None
-            or _sweeps < self.REPROBE_STILL_DOWN_INFO_SWEEPS
-            or entry.streak != _last_streak
-            or (now - _last_at) >= self.REPROBE_STILL_DOWN_INFO_PERIOD_SECS
-        )
-        logger.log(
-            logging.INFO if _at_info else logging.DEBUG,
-            'reprobe: host %r still unavailable (%s%s) after %.0fs down '
-            '(streak=%d) — staying out of the verify pool',
-            name,
-            quarantine_class(entry.kind),
-            ', sticky' if entry.sticky else '',
-            downtime_s,
-            entry.streak,
-        )
-        self._reprobe_last_info[name] = (
-            now if _at_info else (_last_at if _last_at is not None else now),
-            entry.streak,
-            _sweeps + 1,
-        )
-        if entry.alarm_due(
-            now,
-            after_n=self._unreachable_escalate_after_n,
-            after_secs=self._unreachable_escalate_after_secs,
-        ):
-            self._alarm_host(name, entry, downtime_s)
-
-    def readmit_host(
-        self, name: str, *, now: float, evidence: RecoveryEvidence,
-        expect_epoch: int | None = None,
-    ) -> bool:
-        """Return remote *name* to the verify pool and close its bench: THE readmit.
-
-        Un-quarantines and un-PARKs it (``allocator.readmit``, refused when the
-        park episode moved past *expect_epoch*), drops its tracker entry, and
-        resolves its pending unreachability and skew alarms on the named
-        *evidence* (task 5290).  The reprobe sweep calls
-        it after a passing :meth:`probe_host`, and keeps the per-(host, sha)
-        skew count that makes the next skew bench sticky;
-        :meth:`clear_host_quarantine` (the operator clear) calls it without a
-        probe and then resets that count, as a restart does.  A readmission
-        then calls the harness's ``on_host_readmitted`` hook, fault-isolated,
-        so the task pool re-offers the host (task 6670).  Returns whether the
-        host was re-admitted.
-        """
-        _readmit = getattr(self._host_allocator, 'readmit', None)
-        if _readmit is None:
-            if self._host_allocator is None:
-                return False
-            self._host_allocator.clear_quarantine(name)
-        elif not _readmit(name, expect_epoch=expect_epoch):
-            return False
-        entry = self._runner_unavailable.get(name)
-        downtime_s = now - entry.first_unavailable_at if entry is not None else 0.0
-        self._record_runner_recovered(name)
-        _clear_verify_host_unreachable(
-            self._escalation_queue, self._event_store, name,
-            downtime_s=downtime_s, evidence=evidence,
-        )
-        _clear_verify_host_skew(
-            self._escalation_queue, self._event_store, name,
-            downtime_s=downtime_s, evidence=evidence,
-        )
-        self._notify_host_readmitted(name)
-        return True
-
-    def _notify_host_readmitted(self, name: str) -> None:
-        """Tell the harness *name* is back; a task-pool fault never undoes the readmission."""
-        if self._on_host_readmitted is None:
-            return
-        try:
-            self._on_host_readmitted(name)
-        except Exception:
-            logger.exception(
-                'on_host_readmitted hook raised for re-admitted verify host %r; '
-                'the merge-lane readmission stands', name,
-            )
+        """Bench remote *name* for *exc*: the ``on_unavailable`` sink pools, drift and trains hold."""
+        self._host_quarantine.bench(name, exc)
 
     async def clear_host_quarantine(self, name: str) -> dict[str, Any]:
-        """The operator clear (escalation tool ``clear_verify_host_quarantine``).
-
-        Re-admits remote *name* whatever benched it — an 'ru' or 'skew' bench,
-        sticky or not, or a verdict-divergence quarantine — without probing
-        its health; a PARKED slot is still freed only once ``probe_clean()``
-        finds no stale verify there.  Like a restart, a clear resets the
-        host's skew count, so its next skew bench is a first one again
-        (design D6: sticky lasts until a restart or an operator clear).
-        Returns ``{host, cleared, quarantine_class, was_sticky}`` plus
-        ``reason`` when nothing was cleared.
-        """
-        entry = self._runner_unavailable.get(name)
-        quarantined = name in self._runner_quarantine
-        result: dict[str, Any] = {
-            'host': name,
-            'cleared': False,
-            'quarantine_class': (
-                quarantine_class(entry.kind) if entry is not None
-                else 'divergence' if quarantined else None
-            ),
-            'was_sticky': bool(entry is not None and entry.sticky),
-        }
-        runner = (
-            self._host_allocator.remote_runner(name)
-            if isinstance(self._host_allocator, HostAllocator) else None
-        )
-        if runner is None:
-            return {**result, 'reason': f'{name!r} is not a remote verify host of this worker'}
-        if entry is None and not quarantined:
-            return {**result, 'reason': f'{name!r} is not benched'}
-        if not await self._readmit_benched_host(
-            name, runner, self._clock.now(), evidence=RecoveryEvidence.OPERATOR_CLEAR,
-        ):
-            return {
-                **result,
-                'reason': 'its slot is PARKED and a stale verify may still be running there',
-            }
-        self._skew_benches.pop((name, self._deployed_code_sha()), None)
-        return {**result, 'cleared': True}
-
-    def _clear_bench_alarms_of_an_earlier_process(self) -> None:
-        """Resolve the skew L1s a previous process left open for this worker's verify hosts.
-
-        A restart clears every bench (design D6), so at start no bench of
-        this process exists yet and any open skew L1 is its predecessor's.
-        Covers the hosts named in config (``verify_hosts``); fault-isolated,
-        since a queue error must never stop the worker starting.
-        """
-        for host in self._verify_hosts:
-            try:
-                _clear_verify_host_skew_of_an_earlier_process(
-                    self._escalation_queue, host, code_sha=self._deployed_code_sha(),
-                )
-            except Exception:
-                logger.exception('could not resolve the earlier skew L1 of host %r', host)
-
-    async def _reap_idle_gates(self, now: float) -> None:
-        """At most hourly, launch the detached gate reaper of each remote in the pool (design D2).
-
-        A benched host (tracked unavailable, or quarantined for any reason,
-        verdict divergence included) is skipped.
-        """
-        if not isinstance(self._host_allocator, HostAllocator):
-            return
-        last = self._last_gate_reap_at
-        if last is not None and now - last < self.GATE_REAP_INTERVAL_SECS:
-            return
-        self._last_gate_reap_at = now
-        for name in self._host_allocator.host_names:
-            runner = self._host_allocator.remote_runner(name)
-            benched = name in self._runner_unavailable or self._host_allocator.is_quarantined(name)
-            if runner is not None and not benched:
-                await runner.reap_idle_gates()
+        """The operator clear (escalation tool ``clear_verify_host_quarantine``): :meth:`HostQuarantine.clear`."""
+        return await self._host_quarantine.clear(name)
 
     # ── owned-worktree liveness ledger ───────────────────────────────────
 
@@ -12457,7 +10403,7 @@ class SpeculativeMergeWorker:
             task_id=entry.item.request.task_id,
             request_id=entry.item.request.request_id,
             activity=activity,
-            host_quarantined=host in self._runner_quarantine,
+            host_quarantined=self._host_quarantine.is_quarantined(host),
         )
 
     def _hosts_total(self) -> int:
@@ -12539,7 +10485,7 @@ class SpeculativeMergeWorker:
             steady state).  This is what makes an under-full `verifying N/M
             hosts` line diagnosable; the five causes and their discriminators:
               - RU-quarantined         : quarantine_class == 'ru' (auto-recovers
-                                         via _reprobe_quarantined_hosts)
+                                         via HostQuarantine.sweep)
               - skew-quarantined       : quarantine_class == 'skew' (re-probed by
                                          ensure-gate unless sticky; identity
                                          carries both gate identities)
@@ -12840,7 +10786,7 @@ class SpeculativeMergeWorker:
             # Backward-compatible (no collision with the existing key set);
             # pure synchronous read via HostAllocator.host_states() — no await,
             # no I/O.  [] when the allocator has not been built yet.
-            'hosts': self._host_states_block(now),
+            'hosts': self._host_quarantine.host_states(now),
             # δ/1889 additive key: per-suffix conflict relation (backward-compatible).
             # Populated by recompute_suffix_conflict_graph() after each drain.
             # Read here synchronously — no await; the expensive async build is
@@ -13064,7 +11010,7 @@ class SpeculativeMergeWorker:
             :attr:`RESOURCE_AUDIT_LOG_COALESCE_CAP_POLLS`.
           * DEBUG on the polls in between — suppressed, never DROPPED, so a
             debug-level operator still sees every poll (mirrors
-            :meth:`_reprobe_quarantined_hosts`'s precedent).
+            :meth:`HostQuarantine.sweep`'s precedent).
           * one INFO ``... audit clear ...`` line on the violating → clean
             transition, so the END of a condition is greppable rather than
             inferred from an absence of lines.
@@ -13165,8 +11111,8 @@ class SpeculativeMergeWorker:
         #   INFO     the clear line, on the violating -> clean transition.
         #
         # The INFO/DEBUG split is one logger.log(level_expr, fmt, ...) call
-        # with a single format string — the idiom _reprobe_quarantined_hosts
-        # (above, task 3043 amend) already uses for the same problem.
+        # with a single format string — the idiom HostQuarantine's reprobe
+        # sweep (task 3043 amend) already uses for the same problem.
         self._resource_audit_log_gate.cap_polls = self.RESOURCE_AUDIT_LOG_COALESCE_CAP_POLLS
         decision = self._resource_audit_log_gate.observe(
             _resource_audit_fingerprint(violations), now,
@@ -13183,7 +11129,7 @@ class SpeculativeMergeWorker:
         else:
             # An unchanged repeat. Due repeats report; the polls between them
             # are NOT dropped, only demoted to DEBUG (mirrors the
-            # _reprobe_last_info precedent above). The violation strings are
+            # HostQuarantine._reprobe_last_info precedent). The violation strings are
             # deliberately omitted so this branch formats nothing eagerly.
             logger.log(
                 logging.INFO if decision.should_log else logging.DEBUG,
@@ -13262,7 +11208,7 @@ class SpeculativeMergeWorker:
         — one of the three 2026-07 incidents where a stuck merge queue was
         diagnosed only by hand-correlating a ``verifying N/M hosts`` line
         against allocator internals.  ``<class>`` is ``ru`` or ``skew``
-        (re-probed by :meth:`_reprobe_quarantined_hosts`) or ``divergence``
+        (re-probed by :meth:`HostQuarantine.sweep`) or ``divergence``
         (operator-cleared only).
 
         The ``depth == 0`` no-op gate above is UNCHANGED: a fully idle pipeline
@@ -13316,7 +11262,7 @@ class SpeculativeMergeWorker:
         _deg = [h for h in snap['hosts'] if h['quarantined']]
         _deg_suffix = ''
         if _deg:
-            # No `or <fallback>` on quarantine_class: _host_states_block sets it
+            # No `or <fallback>` on quarantine_class: HostQuarantine.host_states sets it
             # to exactly 'ru', 'skew' or 'divergence' whenever quarantined is True (and
             # _deg filters on that), so a fallback would be unreachable dead code
             # that quietly papered over an invariant break. If the invariant ever
@@ -13418,37 +11364,13 @@ class SpeculativeMergeWorker:
 
         Runs independently of the merger/verifier loops so it fires even when
         those are idle.  Wakes every ``_reprobe_interval_s`` seconds and runs
-        three steps: the tracker-driven :meth:`_reprobe_quarantined_hosts`
-        first, then :meth:`_reprobe_untracked_parked_slots`, the backstop for
-        PARKED hosts with no tracker entry, then the at-most-hourly
-        :meth:`_reap_idle_gates`.
-
-        Each step is fault-isolated: an unexpected exception is logged and
-        swallowed (same pattern as _heartbeat_loop), so a probe bug can neither
-        crash the worker nor disable the other steps.
+        one :meth:`HostQuarantine.sweep`, which fault-isolates each of its
+        steps, so a probe bug can neither crash the worker nor disable the
+        other steps.
         """
         while self._running:
             await self._clock.sleep(self._reprobe_interval_s)
-            try:
-                await self._reprobe_quarantined_hosts(self._clock.now())
-            except Exception:
-                logger.exception('reprobe_quarantined_hosts: unexpected error in loop')
-            try:
-                await self._reprobe_untracked_parked_slots()
-            except Exception:
-                logger.exception('reprobe_untracked_parked_slots: unexpected error in loop')
-            try:
-                await self._reap_idle_gates(self._clock.now())
-            except Exception:
-                logger.exception('reap_idle_gates: unexpected error in loop')
-
-    async def _reprobe_untracked_parked_slots(self) -> None:
-        """Free PARKED hosts the tracker sweep cannot see; tracked ones stay its job."""
-        if not isinstance(self._host_allocator, HostAllocator):
-            return
-        await self._host_allocator.reprobe_parked_slots(
-            exclude=frozenset(self._runner_unavailable),
-        )
+            await self._host_quarantine.sweep(self._clock.now())
 
     # ── supervisor (task 1857) ───────────────────────────────────────────
 
@@ -13716,7 +11638,7 @@ class SpeculativeMergeWorker:
         self._spawn_loop('merger')
         self._spawn_loop('verifier')
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
-        self._clear_bench_alarms_of_an_earlier_process()
+        self._host_quarantine.clear_bench_alarms_of_an_earlier_process()
         self._reprobe_task = asyncio.create_task(self._reprobe_loop())
         try:
             await self._loops_finished.wait()
@@ -16956,14 +14878,14 @@ class SpeculativeMergeWorker:
         so a stale verify process may still be running there — but it writes
         **only** ``_slots``: the host is NOT added to ``_quarantine``, so
         ``quarantined_remote_runners()`` never yields it and
-        :meth:`_reprobe_quarantined_hosts` has no tracker entry to re-adopt.
+        :meth:`HostQuarantine.sweep` has no tracker entry to re-adopt.
         The host is then silently non-acquirable forever.  That is how the
         laptop went to "verifying 1/2 hosts" with ZERO dispatch attempts for
         3+ h and stayed there until an orchestrator restart rebuilt the
         allocator.
 
         So: detect the PARK and route it through
-        :meth:`_quarantine_unreachable_host`, which upholds INV-A (quarantine
+        :meth:`HostQuarantine.quarantine_unreachable`, which upholds INV-A (quarantine
         implies tracked) and thereby hands recovery to the reprobe sweep.
         ``cancel_and_release``'s own PARK-on-exhaustion semantics are
         deliberately UNTOUCHED — pinned by
@@ -16978,7 +14900,7 @@ class SpeculativeMergeWorker:
         already PARKED, still records the strand and then propagates unchanged.
 
         The PARKED read is gated on ``isinstance(..., HostAllocator)`` — the
-        house pattern task 3275 established at :meth:`_host_states_block`,
+        house pattern task 3275 established at :meth:`HostQuarantine.host_states`,
         because ``_host_allocator`` carries a ``MagicMock`` at ~79 assignment
         sites across 15 test files and a duck-typed ``is_parked`` would let
         every one of those doubles fabricate a quarantine.  Local leases are
@@ -17014,7 +14936,7 @@ class SpeculativeMergeWorker:
                 and self._host_allocator.is_parked(lease.name)
             )
             if _parked:
-                self._quarantine_unreachable_host(
+                self._host_quarantine.quarantine_unreachable(
                     lease.name,
                     f'verify cancel/probe failed against {lease.name!r} — '
                     'host slot PARKED (presumed unreachable)',
@@ -17267,7 +15189,7 @@ class SpeculativeMergeWorker:
         owner = await ensure_main_fix_owner(
             self.main_fix_filer, brk, project_root=str(req.config.project_root),
         )
-        _file_main_health_escalation(
+        file_main_health_escalation(
             self._escalation_queue, req, outcome,
             suggested_action=owner.next_action(otherwise),
             detail=owner.escalation_detail(outcome.reason),
@@ -17287,7 +15209,7 @@ class SpeculativeMergeWorker:
         lane, submits/folds the dedup'd halt-owner escalation, registers
         lane-halt ownership, and spawns a HIGH-lane fix task.  Called from the
         deferred main-health probe (:func:`_run_deferred_main_health_probe`,
-        via the ``auto_heal`` callback on :class:`_MainHealthProbeHandles`)
+        via the ``auto_heal`` callback on :class:`MainHealthProbeHandles`)
         once it confirms a still-fresh pre-existing break — this is the ONLY
         production path that can reach a main-health-red outcome, since the
         provisional outcome returned to the caller is always task-fault (see
@@ -17337,7 +15259,7 @@ class SpeculativeMergeWorker:
             owner = await ensure_main_fix_owner(
                 self.main_fix_filer, brk, project_root=str(req.config.project_root),
             )
-            _file_main_health_escalation(
+            file_main_health_escalation(
                 self._escalation_queue, req, outcome,
                 suggested_action=owner.behind_halt_action(
                     heal_attempted=self.auto_heal_registry.attempts(sig) > 0,
@@ -17346,7 +15268,7 @@ class SpeculativeMergeWorker:
             )
             return
 
-        esc_id = _file_main_health_escalation(
+        esc_id = file_main_health_escalation(
             self._escalation_queue, req, outcome,
             suggested_action=MainHealthNextAction.AUTO_HEAL_IN_FLIGHT,
         )
@@ -17396,7 +15318,7 @@ class SpeculativeMergeWorker:
             max_narrowed=self.MAX_POST_MERGE_VERIFY_NARROWED_RETRIES,
             narrowed_retries=self._post_merge_verify_narrowed_retries,
             event_store=self._event_store,
-            quarantine=self._runner_quarantine,
+            quarantine=self._host_quarantine.quarantine_divergent,
             escalation_queue=self._escalation_queue,
             # task 2886 fix 3 (PRD §3.4 / decision 4): thread the synchronous
             # all-lane halt so a CONCLUDED cross-check divergence stops the
@@ -17406,7 +15328,7 @@ class SpeculativeMergeWorker:
             # detector; the halt is synchronous only to precede further lands.
             halt_hook=self.operator_halt,
             dry_run_handles=self._dry_run_handles,
-            main_health_probe_handles=_MainHealthProbeHandles(
+            main_health_probe_handles=MainHealthProbeHandles(
                 background_tasks=self._background_tasks,
                 auto_heal=self._auto_heal_main_health_deferred,
             ),
@@ -18445,7 +16367,7 @@ class SpeculativeMergeWorker:
             # ended CANCELLED while the inner kept pushing to the down host, and
             # when it finally raised there was no VerifyResult, no quarantine
             # and no tracker entry — the host was stranded out of the verify
-            # pool with nothing for _reprobe_quarantined_hosts to re-adopt.
+            # pool with nothing for HostQuarantine.sweep to re-adopt.
             #
             # Provably additive: the three deliberate abort branches already do
             # cancel() + suppress(BaseException): await, so clause 1 is a no-op
@@ -19756,7 +17678,7 @@ class SpeculativeMergeWorker:
                 # open alarm per host per downtime episode regardless of how
                 # many RU events accumulate.
                 #
-                # Routed through the _quarantine_unreachable_host chokepoint
+                # Routed through the HostQuarantine.quarantine_unreachable chokepoint
                 # (task 3043) so this path and the two strand paths (orphaned
                 # verify task, PARKED-slot release) share ONE implementation of
                 # "quarantine implies tracked".  quarantine_and_release above
@@ -19764,7 +17686,7 @@ class SpeculativeMergeWorker:
                 # quarantine set + tracker + alarm, and adding an
                 # already-quarantined name to that set is a no-op.
                 if entry.lease is not None:
-                    self._quarantine_unreachable_host(
+                    self._host_quarantine.quarantine_unreachable(
                         entry.lease.name,
                         vr.reason or '<unknown>',
                         self._clock.now(),
@@ -19942,7 +17864,7 @@ class SpeculativeMergeWorker:
                 # digest.merge_disposition_counts (task 2384) is non-sentinel
                 # on the production path.  MAIN_RED is excluded because it
                 # already emitted 'main_health_red' when the outcome was built
-                # (see _classify_main_health_red, above).
+                # (see classify_main_health_red, above).
                 #
                 # Amendment (task 3178 — the separately-reviewed widening the
                 # round-2 note below deferred).  Keyed on GATHERED EVIDENCE
