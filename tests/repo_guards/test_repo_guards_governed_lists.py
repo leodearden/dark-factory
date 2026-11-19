@@ -7,7 +7,6 @@ live container, so a container that grows an entry fails this suite at
 collection until the new entry has a disposition.
 """
 
-import re
 from collections import Counter
 from collections.abc import Iterable
 
@@ -17,7 +16,14 @@ import loop_blocking_allowlist
 import pytest
 import silent_fallthrough_allowlist
 import test_design_invariants_consistency as design_invariants_consistency
-from shared.governed_exceptions import Debt, Policy, TaskRef, TicketRef, governed_exceptions
+from shared.governed_exceptions import (
+    Debt,
+    Disposition,
+    Policy,
+    TaskRef,
+    TicketRef,
+    governed_exceptions,
+)
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
@@ -128,25 +134,13 @@ LOOP_BLOCKING_LEDGER = governed_exceptions(
     },
 )
 
-_OWNER_TYPE_BY_LEDGER_DISPOSITION = {'accepted': None, 'filed': TaskRef, 'to_file': TicketRef}
-
-
-def _override_follows_row(
-    owner_type: type[TaskRef] | type[TicketRef] | None, override: object, justification: str
-) -> bool:
-    if owner_type is None:
-        return override is None
-    if not isinstance(override, Debt) or not isinstance(override.owner, owner_type):
-        return False
-    return re.search(rf'\b{re.escape(str(override.owner.id))}\b', justification) is not None
-
-
-def _loop_blocking_mismatch(row: tuple[str, str, str, str, str], key: str) -> str | None:
-    disposition, justification = row[3], row[4]
-    override = LOOP_BLOCKING_LEDGER.overrides.get(key)
-    if _override_follows_row(_OWNER_TYPE_BY_LEDGER_DISPOSITION[disposition], override, justification):
+def _loop_blocking_mismatch(
+    key: str, owner: TaskRef | TicketRef | None, override: Disposition | None
+) -> str | None:
+    expected = None if owner is None else Debt(owner)
+    if override == expected:
         return None
-    return f'{key}: ledger disposition {disposition!r}, override found {override!r}'
+    return f'{key}: ledger owner {owner!r}, expected override {expected!r}, found {override!r}'
 
 
 _OVERRIDE_TYPE_BY_ARCHIVAL_DISPOSITION = {

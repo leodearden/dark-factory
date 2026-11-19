@@ -33,27 +33,33 @@ row whose reason is "existing" is a silent waiver that defeats the point.
 
 Entry schema
 ------------
-Each entry is a 5-tuple::
+Each entry is a 6-tuple::
 
-    (relpath, qualname, content_hash, disposition, justification)
+    (relpath, qualname, content_hash, disposition, owner, justification)
 
 ``relpath``       repo-relative posix path of the CALLING module
 ``qualname``      dotted qualname of the enclosing coroutine
 ``content_hash``  ``sha256(ast.unparse(call_node))[:12]`` -- recompute with the
                   scanner when the call changes
 ``disposition``   one of :data:`DISPOSITIONS`
-``justification`` non-empty prose.  ``accepted`` must say what makes the cost
-                  acceptable (cached / startup-only / measured cheap), not
-                  merely that the call exists.  ``filed`` must name the task id.
-                  ``to_file`` names the TICKET task 4484 step-9 filed for it.
-                  ``submit_task`` returns a ticket, not a task id: the curator
-                  decides create / combine / drop asynchronously, so no task id
-                  exists at filing time.  These rows therefore stay ``to_file``
-                  rather than ``filed``, which must name a real task id --
-                  ``test_filed_entries_name_their_task`` enforces that, and a
-                  ``filed`` row naming a ticket would point at a decision that
-                  has not been made yet.  Flip a row to ``filed`` and swap in
-                  the task id once its ticket resolves.
+``owner``         who will remove the row, of the type
+                  :data:`OWNER_TYPE_BY_DISPOSITION` fixes for its disposition:
+                  ``None`` for ``accepted``, ``TaskRef(<task>)`` for ``filed``,
+                  ``TicketRef('tkt_...')`` for ``to_file``.
+                  ``test_every_entry_owner_matches_its_disposition`` enforces
+                  the type.  A ``to_file`` row's ticket is the one task 4484
+                  step-9 filed for it: ``submit_task`` returns a ticket, not a
+                  task id, because the curator decides create / combine / drop
+                  asynchronously, so no task id exists at filing time.  A
+                  ticket-owned row therefore stays ``to_file`` with its
+                  ``TicketRef`` until the ticket resolves, then flips to
+                  ``filed`` with the resolved task's ``TaskRef`` -- a ``filed``
+                  row naming a ticket would point at a decision that has not
+                  been made yet.
+``justification`` non-empty prose saying WHY, never the owner's home.
+                  ``accepted`` must say what makes the cost acceptable (cached
+                  / startup-only / measured cheap), not merely that the call
+                  exists.
 
 Keys are ``(relpath, qualname, content_hash)`` -- deliberately NOT line
 numbers, which drift on every unrelated edit above the site and would make
@@ -118,17 +124,27 @@ scanned, 90 findings (80 before; census section 4d).
 
 from __future__ import annotations
 
-#: The fixed disposition vocabulary.  No inline ``# inv8-ok:`` source-comment
-#: marker exists as an alternative: this ledger has to exist anyway for the
-#: ratchet, so a marker at the site would be a second home for the same fact
-#: with nothing reconciling them (INV-9) -- and writing one would mean editing
-#: the very runtime files tasks 4201 and 3778 were holding in the merge lane.
-#: A reader at a site follows test_loop_blocking_gate.py to the row that says why.
-DISPOSITIONS = frozenset({
-    'accepted',  # measured cheap, cached, or startup-only -- say WHICH
-    'filed',     # an existing task owns it -- justification carries the id
-    'to_file',   # confirmed defect; a task 4484 step-9 ticket is named
-})
+from collections.abc import Mapping
+from types import MappingProxyType, NoneType
+
+from shared.governed_exceptions import TaskRef, TicketRef
+
+#: The fixed disposition vocabulary, each with the type its rows' owner must
+#: have; an accepted row has no owner and borrows the INV-12 default.  No
+#: inline ``# inv8-ok:`` source-comment marker exists as an alternative: this
+#: ledger has to exist anyway for the ratchet, so a marker at the site would be
+#: a second home for the same fact with nothing reconciling them (INV-9) -- and
+#: writing one would mean editing the very runtime files tasks 4201 and 3778
+#: were holding in the merge lane.  A reader at a site follows
+#: test_loop_blocking_gate.py to the row that says why.
+OWNER_TYPE_BY_DISPOSITION: Mapping[str, type[TaskRef] | type[TicketRef] | type[None]] = (
+    MappingProxyType({
+        'accepted': NoneType,  # cheap, cached or startup-only (say WHICH); no owner
+        'filed': TaskRef,      # the task that owns it
+        'to_file': TicketRef,  # the confirmed defect's task 4484 step-9 ticket
+    })
+)
+DISPOSITIONS = frozenset(OWNER_TYPE_BY_DISPOSITION)
 
 #: The shared justification of every ``ReconciliationHarness._escalate`` row.
 _ESCALATE_ARCHIVE_SCAN_WHY = (
@@ -280,8 +296,8 @@ _RUN_CONFIG_DIR_GC_WHY = (
     '(mtime-equality skip) 0.5 ms.'
 )
 
-#: ``(relpath, qualname, content_hash, disposition, justification)``.
-AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
+#: ``(relpath, qualname, content_hash, disposition, owner, justification)``.
+AUDITED_SITES: list[tuple[str, str, str, str, TaskRef | TicketRef | None, str]] = [
 
     # ---- backends/sqlite_task_backend.py ----
     (
@@ -289,6 +305,7 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'SqliteTaskBackend._get_write_access',
         '14c6bfa75f63',
         'accepted',
+        None,
         _MKDIR_ON_STORE_OPEN_WHY,
     ),
     (
@@ -296,6 +313,7 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'SqliteTaskBackend.get_statuses_fresh',
         '09007f79712d',
         'accepted',
+        None,
         _FIXED_STAT_GUARD_WHY,
     ),
 
@@ -305,6 +323,7 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'SeedManager.seed',
         '43bbc3406b55',
         'accepted',
+        None,
         'ACCEPTED, no server loop to stall: SeedManager.seed reaches '
         'load_guardrail_payloads\'s exists() inside a one-shot maintenance '
         'CLI driven by asyncio.run in its __main__ block. Nothing under '
@@ -318,6 +337,7 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'read_scheduler_events',
         '09007f79712d',
         'accepted',
+        None,
         _FIXED_STAT_GUARD_WHY,
     ),
     (
@@ -325,6 +345,7 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'read_scheduler_events',
         '14947dd93734',
         'filed',
+        TaskRef(7572),
         _PATH_RESOLVE_GUARD_WHY,
     ),
 
@@ -334,6 +355,7 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'TaskInterceptor._apply_status_transition',
         'c387b27712b9',
         'accepted',
+        None,
         _DECLARED_FILES_STAT_WHY,
     ),
     (
@@ -341,6 +363,7 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'TaskInterceptor._execute_combine',
         '0a7e982628a1',
         'accepted',
+        None,
         _COMBINE_AUDIT_APPEND_WHY,
     ),
     (
@@ -348,6 +371,7 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'TaskInterceptor._execute_combine',
         'ab64655040c9',
         'accepted',
+        None,
         _COMBINE_AUDIT_APPEND_WHY,
     ),
 
@@ -357,6 +381,7 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'TaskCurator._invoke_curator',
         '2be781b317a0',
         'filed',
+        TaskRef(7572),
         'ROOT CAUSE (one debt, bounded by an LLM call): _invoke_curator reaches '
         '_resolve_curator_prompt -> self._prompt_store.resolve(...). The '
         'scanner matches the method name resolve, but the receiver is '
@@ -379,6 +404,7 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'TicketStore.initialize',
         'f485b909e349',
         'accepted',
+        None,
         _MKDIR_ON_STORE_OPEN_WHY,
     ),
 
@@ -388,6 +414,7 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'run_stage_via_cli',
         'aa09bf369631',
         'accepted',
+        None,
         _FIXED_STAT_GUARD_WHY,
     ),
 
@@ -397,6 +424,7 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'EventQueue.start',
         'd325858ad5fe',
         'accepted',
+        None,
         _MKDIR_ON_STORE_OPEN_WHY,
     ),
 
@@ -406,6 +434,7 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'ReconciliationHarness._recover_one_run',
         'f05da1451b63',
         'filed',
+        TaskRef(5270),
         _RUN_CONFIG_DIR_GC_WHY,
     ),
     (
@@ -413,6 +442,7 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'ReconciliationHarness._persist_stage_reports_then_gc_config_dir',
         'f05da1451b63',
         'filed',
+        TaskRef(5270),
         _RUN_CONFIG_DIR_GC_WHY,
     ),
     (
@@ -420,6 +450,7 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'ReconciliationHarness._recover_stale_runs',
         '0787c60051a4',
         'filed',
+        TaskRef(5270),
         _ESCALATE_ARCHIVE_SCAN_WHY,
     ),
     (
@@ -427,6 +458,7 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'ReconciliationHarness._recover_stale_runs',
         'cc7999e2d4b6',
         'filed',
+        TaskRef(5270),
         _ESCALATE_ARCHIVE_SCAN_WHY,
     ),
     (
@@ -434,6 +466,7 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'ReconciliationHarness._record_failed_run',
         '652fc88d57ad',
         'filed',
+        TaskRef(5270),
         _ESCALATE_ARCHIVE_SCAN_WHY,
     ),
     (
@@ -441,6 +474,7 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'ReconciliationHarness._maybe_escalate_stale_task_count_snapshot',
         '560696057da1',
         'filed',
+        TaskRef(5270),
         _ESCALATE_ARCHIVE_SCAN_WHY,
     ),
     (
@@ -448,6 +482,7 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'ReconciliationHarness._maybe_remediate',
         '1fbc50761be3',
         'filed',
+        TaskRef(5270),
         _ESCALATE_ARCHIVE_SCAN_WHY,
     ),
     (
@@ -455,6 +490,7 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'ReconciliationHarness._maybe_remediate',
         '51ec3ffac666',
         'filed',
+        TaskRef(5270),
         _ESCALATE_ARCHIVE_SCAN_WHY,
     ),
     (
@@ -462,6 +498,7 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'ReconciliationHarness._maybe_remediate',
         '8c9728223345',
         'filed',
+        TaskRef(5270),
         _ESCALATE_ARCHIVE_SCAN_WHY,
     ),
     (
@@ -469,6 +506,7 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'ReconciliationHarness._run_remediation_pass',
         'c5a47e52ad4b',
         'to_file',
+        TicketRef('tkt_0RT7RJKQ0WXB0T87F8TJ7RTGQH'),
         'ROOT CAUSE (one defect, 2 rows): _run_remediation_pass reads the '
         'orchestrator state files inline on the loop thread '
         '(read_scheduler_state -> read_bytes and orchestrator_started_at '
@@ -480,14 +518,14 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'in the resolved_fps build, not at an orchestrator state file. '
         '5550 offloaded that scan via asyncio.to_thread, the finding went '
         'stale, and the row was deleted with the fix -- these two survive '
-        'unfixed.'
-        ' Ticket: tkt_0RT7RJKQ0WXB0T87F8TJ7RTGQH.',
+        'unfixed.',
     ),
     (
         'fused-memory/src/fused_memory/reconciliation/harness.py',
         'ReconciliationHarness._run_remediation_pass',
         '9e5ae6eb2503',
         'to_file',
+        TicketRef('tkt_0RT7RJKQ0WXB0T87F8TJ7RTGQH'),
         'ROOT CAUSE (one defect, 2 rows): _run_remediation_pass reads the '
         'orchestrator state files inline on the loop thread '
         '(read_scheduler_state -> read_bytes and orchestrator_started_at '
@@ -499,14 +537,14 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'in the resolved_fps build, not at an orchestrator state file. '
         '5550 offloaded that scan via asyncio.to_thread, the finding went '
         'stale, and the row was deleted with the fix -- these two survive '
-        'unfixed.'
-        ' Ticket: tkt_0RT7RJKQ0WXB0T87F8TJ7RTGQH.',
+        'unfixed.',
     ),
     (
         'fused-memory/src/fused_memory/reconciliation/harness.py',
         'ReconciliationHarness._run_remediation_pass',
         'edd9a8720cf9',
         'filed',
+        TaskRef(5270),
         'ROOT CAUSE: _file_finding_task_escalation, the orchestrator-queue '
         'counterpart of _escalate that task 4821 added after this census '
         'ran, is sync end to end on the loop thread -- the '
@@ -526,6 +564,7 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'ReconciliationHarness._run_remediation_pass',
         'a4c939b65449',
         'filed',
+        TaskRef(5270),
         _ESCALATE_ARCHIVE_SCAN_WHY,
     ),
     (
@@ -533,6 +572,7 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'ReconciliationHarness._run_remediation_pass',
         'ec953752e2f1',
         'filed',
+        TaskRef(5270),
         _ESCALATE_ARCHIVE_SCAN_WHY,
     ),
 
@@ -542,6 +582,7 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'ReconciliationJournal.initialize',
         '863ff109dbaf',
         'accepted',
+        None,
         _MKDIR_ON_STORE_OPEN_WHY,
     ),
 
@@ -551,6 +592,7 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'ReconLedgerStore.initialize',
         'f485b909e349',
         'accepted',
+        None,
         _MKDIR_ON_STORE_OPEN_WHY,
     ),
 
@@ -560,18 +602,19 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         '_write_task_count_snapshot',
         'e08ddda37175',
         'to_file',
+        TicketRef('tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ'),
         'SAME ROOT CAUSE as the server/tools.py::_normalize_project_root '
         'cluster: a cold miss in models/scope.py::resolve_main_checkout '
         'runs subprocess.run(git) on the loop thread; _MAIN_CHECKOUT_CACHE '
         'makes it cold-miss-only. Filed together with that cluster by task '
-        '4484 step-9, since one fix closes both.'
-        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
+        '4484 step-9, since one fix closes both.',
     ),
     (
         'fused-memory/src/fused_memory/reconciliation/stages/task_knowledge_sync.py',
         '_run_briefing_known_gaps_script',
         'a23d01e12b5a',
         'accepted',
+        None,
         _FIXED_STAT_GUARD_WHY,
     ),
     (
@@ -579,6 +622,7 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         '_run_briefing_known_gaps_script',
         '39a6fb8ac63e',
         'accepted',
+        None,
         _FIXED_STAT_GUARD_WHY,
     ),
 
@@ -588,18 +632,19 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'read_live_override_state',
         '7ebd882c849b',
         'to_file',
+        TicketRef('tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ'),
         'SAME ROOT CAUSE as the server/tools.py::_normalize_project_root '
         'cluster: a cold miss in models/scope.py::resolve_main_checkout '
         'runs subprocess.run(git) on the loop thread; _MAIN_CHECKOUT_CACHE '
         'makes it cold-miss-only. Filed together with that cluster by task '
-        '4484 step-9, since one fix closes both.'
-        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
+        '4484 step-9, since one fix closes both.',
     ),
     (
         'fused-memory/src/fused_memory/reconciliation/stale_priority_override_edge_sweep.py',
         'read_live_override_state',
         '09007f79712d',
         'accepted',
+        None,
         _FIXED_STAT_GUARD_WHY,
     ),
 
@@ -609,19 +654,20 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'TargetedReconciler._sweep_cancelled_descendants',
         'b9609c7cf5b4',
         'to_file',
+        TicketRef('tkt_0RT7RKWJG17W03JRC947R8FZZN'),
         '_sweep_cancelled_descendants reaches is_orchestrator_live_for, '
         'which read_texts the orchestrator state file on the loop thread. '
         'Task 3778 mentions is_orchestrator_live_for in its Part 3(a) '
         'hoisting discussion but reconciliation/targeted.py is not in its '
         'metadata.files, so this caller is nobody\'s today. Follow-up filed '
-        'by task 4484 step-9.'
-        ' Ticket: tkt_0RT7RKWJG17W03JRC947R8FZZN.',
+        'by task 4484 step-9.',
     ),
     (
         'fused-memory/src/fused_memory/reconciliation/targeted.py',
         'TargetedReconciler._sweep_cancelled_descendants',
         'f06e6adb6bbd',
         'accepted',
+        None,
         _DECLARED_FILES_STAT_WHY
         + ' Task 5270 already owns this coroutine\'s is_orchestrator_live_for '
         'row (ticket-derived task 5077): if 5270 offloads the whole sweep, '
@@ -634,6 +680,7 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'CodebaseVerifier.verify',
         'ab04e5fd6d64',
         'accepted',
+        None,
         _FIXED_STAT_GUARD_WHY,
     ),
 
@@ -643,6 +690,7 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'DurableWriteQueue.initialize',
         'c57d271d306d',
         'accepted',
+        None,
         _MKDIR_ON_STORE_OPEN_WHY,
     ),
 
@@ -652,6 +700,7 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'detect_live_workflow',
         'b9609c7cf5b4',
         'accepted',
+        None,
         'ACCEPTED, measured cheap: is_orchestrator_live_for is one '
         'read_text of the small data/orchestrator/orchestrator.lock file '
         'plus an os.kill(pid, 0) probe -- no subprocess -- measured at '
@@ -671,6 +720,7 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'OverreachShadowStore.open_read_only',
         'fa698adde643',
         'filed',
+        TaskRef(7572),
         _PATH_RESOLVE_GUARD_WHY,
     ),
 
@@ -680,6 +730,7 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'PlannedEpisodeRegistry.initialize',
         'c57d271d306d',
         'accepted',
+        None,
         _MKDIR_ON_STORE_OPEN_WHY,
     ),
 
@@ -689,6 +740,7 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'WriteJournal.initialize',
         '863ff109dbaf',
         'accepted',
+        None,
         _MKDIR_ON_STORE_OPEN_WHY,
     ),
 
@@ -698,6 +750,7 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'run_server',
         '06814d9a4e68',
         'accepted',
+        None,
         'ACCEPTED: run_server calls configured_known_projects_map '
         '(models/scope.py -- Path.resolve() of the primary root, then '
         'open() and yaml.safe_load of each project manifest; the sweep '
@@ -713,6 +766,7 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'run_server',
         '91313b9744f3',
         'accepted',
+        None,
         'ACCEPTED, startup only: run_server reaches '
         'build_topic_cluster_store -> TopicClusterStore.open(), a sync '
         'SQLite open (mkdir, connect, schema, hydrate) matched by the method '
@@ -732,6 +786,7 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'run_server',
         '8a884f86a26c',
         'filed',
+        TaskRef(7572),
         _STARTUP_PATH_RESOLVE_WHY,
     ),
     (
@@ -739,6 +794,7 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'run_server',
         'f6a7ff40db1f',
         'filed',
+        TaskRef(7572),
         _STARTUP_PATH_RESOLVE_WHY,
     ),
     (
@@ -746,6 +802,7 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'run_server',
         '43c97372205c',
         'filed',
+        TaskRef(7572),
         _STARTUP_PATH_RESOLVE_WHY,
     ),
 
@@ -755,6 +812,7 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         '_open_overrides_db',
         '14c6bfa75f63',
         'accepted',
+        None,
         _MKDIR_ON_STORE_OPEN_WHY,
     ),
     (
@@ -762,6 +820,7 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         '_connect_overrides_db',
         '14c6bfa75f63',
         'accepted',
+        None,
         _MKDIR_ON_STORE_OPEN_WHY,
     ),
     (
@@ -769,6 +828,7 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         '_open_park_eviction_db',
         '14c6bfa75f63',
         'accepted',
+        None,
         _MKDIR_ON_STORE_OPEN_WHY,
     ),
     (
@@ -776,6 +836,7 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         '_checkpoint_overrides_db_if_exists',
         '051cd59d92be',
         'accepted',
+        None,
         _FIXED_STAT_GUARD_WHY,
     ),
     (
@@ -783,6 +844,7 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'create_mcp_server.submit_task',
         '32c0a08cd635',
         'accepted',
+        None,
         _FIXED_STAT_GUARD_WHY,
     ),
     (
@@ -790,6 +852,7 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'create_mcp_server.get_tasks',
         '81d0d2709341',
         'to_file',
+        TicketRef('tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ'),
         'ROOT CAUSE (one defect, 22 rows): every MCP handler taking a '
         'project_root calls the nested sync _normalize_project_root, which '
         'reaches models/scope.py::resolve_main_checkout -> '
@@ -800,14 +863,14 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'not act on. 22 rows, one fix: offload or pre-warm '
         'resolve_main_checkout once. Rows are kept per-site so a 23rd '
         'handler cannot be added silently under a blessed 22. Follow-up '
-        'filed by task 4484 step-9.'
-        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
+        'filed by task 4484 step-9.',
     ),
     (
         'fused-memory/src/fused_memory/server/tools.py',
         'create_mcp_server.get_statuses',
         '81d0d2709341',
         'to_file',
+        TicketRef('tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ'),
         'ROOT CAUSE (one defect, 22 rows): every MCP handler taking a '
         'project_root calls the nested sync _normalize_project_root, which '
         'reaches models/scope.py::resolve_main_checkout -> '
@@ -818,14 +881,14 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'not act on. 22 rows, one fix: offload or pre-warm '
         'resolve_main_checkout once. Rows are kept per-site so a 23rd '
         'handler cannot be added silently under a blessed 22. Follow-up '
-        'filed by task 4484 step-9.'
-        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
+        'filed by task 4484 step-9.',
     ),
     (
         'fused-memory/src/fused_memory/server/tools.py',
         'create_mcp_server.get_external_statuses',
         '81d0d2709341',
         'to_file',
+        TicketRef('tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ'),
         'ROOT CAUSE (one defect, 22 rows): every MCP handler taking a '
         'project_root calls the nested sync _normalize_project_root, which '
         'reaches models/scope.py::resolve_main_checkout -> '
@@ -836,14 +899,14 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'not act on. 22 rows, one fix: offload or pre-warm '
         'resolve_main_checkout once. Rows are kept per-site so a 23rd '
         'handler cannot be added silently under a blessed 22. Follow-up '
-        'filed by task 4484 step-9.'
-        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
+        'filed by task 4484 step-9.',
     ),
     (
         'fused-memory/src/fused_memory/server/tools.py',
         'create_mcp_server.get_task',
         '81d0d2709341',
         'to_file',
+        TicketRef('tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ'),
         'ROOT CAUSE (one defect, 22 rows): every MCP handler taking a '
         'project_root calls the nested sync _normalize_project_root, which '
         'reaches models/scope.py::resolve_main_checkout -> '
@@ -854,14 +917,14 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'not act on. 22 rows, one fix: offload or pre-warm '
         'resolve_main_checkout once. Rows are kept per-site so a 23rd '
         'handler cannot be added silently under a blessed 22. Follow-up '
-        'filed by task 4484 step-9.'
-        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
+        'filed by task 4484 step-9.',
     ),
     (
         'fused-memory/src/fused_memory/server/tools.py',
         'create_mcp_server.set_task_status',
         '81d0d2709341',
         'to_file',
+        TicketRef('tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ'),
         'ROOT CAUSE (one defect, 22 rows): every MCP handler taking a '
         'project_root calls the nested sync _normalize_project_root, which '
         'reaches models/scope.py::resolve_main_checkout -> '
@@ -872,14 +935,14 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'not act on. 22 rows, one fix: offload or pre-warm '
         'resolve_main_checkout once. Rows are kept per-site so a 23rd '
         'handler cannot be added silently under a blessed 22. Follow-up '
-        'filed by task 4484 step-9.'
-        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
+        'filed by task 4484 step-9.',
     ),
     (
         'fused-memory/src/fused_memory/server/tools.py',
         'create_mcp_server.set_task_claimant',
         '81d0d2709341',
         'to_file',
+        TicketRef('tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ'),
         'ROOT CAUSE (one defect, 22 rows): every MCP handler taking a '
         'project_root calls the nested sync _normalize_project_root, which '
         'reaches models/scope.py::resolve_main_checkout -> '
@@ -890,14 +953,14 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'not act on. 22 rows, one fix: offload or pre-warm '
         'resolve_main_checkout once. Rows are kept per-site so a 23rd '
         'handler cannot be added silently under a blessed 22. Follow-up '
-        'filed by task 4484 step-9.'
-        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
+        'filed by task 4484 step-9.',
     ),
     (
         'fused-memory/src/fused_memory/server/tools.py',
         'create_mcp_server.submit_task',
         '81d0d2709341',
         'to_file',
+        TicketRef('tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ'),
         'ROOT CAUSE (one defect, 22 rows): every MCP handler taking a '
         'project_root calls the nested sync _normalize_project_root, which '
         'reaches models/scope.py::resolve_main_checkout -> '
@@ -908,14 +971,14 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'not act on. 22 rows, one fix: offload or pre-warm '
         'resolve_main_checkout once. Rows are kept per-site so a 23rd '
         'handler cannot be added silently under a blessed 22. Follow-up '
-        'filed by task 4484 step-9.'
-        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
+        'filed by task 4484 step-9.',
     ),
     (
         'fused-memory/src/fused_memory/server/tools.py',
         'create_mcp_server.resolve_ticket',
         '81d0d2709341',
         'to_file',
+        TicketRef('tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ'),
         'ROOT CAUSE (one defect, 22 rows): every MCP handler taking a '
         'project_root calls the nested sync _normalize_project_root, which '
         'reaches models/scope.py::resolve_main_checkout -> '
@@ -926,14 +989,14 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'not act on. 22 rows, one fix: offload or pre-warm '
         'resolve_main_checkout once. Rows are kept per-site so a 23rd '
         'handler cannot be added silently under a blessed 22. Follow-up '
-        'filed by task 4484 step-9.'
-        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
+        'filed by task 4484 step-9.',
     ),
     (
         'fused-memory/src/fused_memory/server/tools.py',
         'create_mcp_server.list_tickets',
         '81d0d2709341',
         'to_file',
+        TicketRef('tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ'),
         'ROOT CAUSE (one defect, 22 rows): every MCP handler taking a '
         'project_root calls the nested sync _normalize_project_root, which '
         'reaches models/scope.py::resolve_main_checkout -> '
@@ -944,14 +1007,14 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'not act on. 22 rows, one fix: offload or pre-warm '
         'resolve_main_checkout once. Rows are kept per-site so a 23rd '
         'handler cannot be added silently under a blessed 22. Follow-up '
-        'filed by task 4484 step-9.'
-        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
+        'filed by task 4484 step-9.',
     ),
     (
         'fused-memory/src/fused_memory/server/tools.py',
         'create_mcp_server.search_tasks',
         '81d0d2709341',
         'to_file',
+        TicketRef('tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ'),
         'ROOT CAUSE (one defect, 22 rows): every MCP handler taking a '
         'project_root calls the nested sync _normalize_project_root, which '
         'reaches models/scope.py::resolve_main_checkout -> '
@@ -962,14 +1025,14 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'not act on. 22 rows, one fix: offload or pre-warm '
         'resolve_main_checkout once. Rows are kept per-site so a 23rd '
         'handler cannot be added silently under a blessed 22. Follow-up '
-        'filed by task 4484 step-9.'
-        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
+        'filed by task 4484 step-9.',
     ),
     (
         'fused-memory/src/fused_memory/server/tools.py',
         'create_mcp_server.commit_planning',
         '81d0d2709341',
         'to_file',
+        TicketRef('tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ'),
         'ROOT CAUSE (one defect, 22 rows): every MCP handler taking a '
         'project_root calls the nested sync _normalize_project_root, which '
         'reaches models/scope.py::resolve_main_checkout -> '
@@ -980,14 +1043,14 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'not act on. 22 rows, one fix: offload or pre-warm '
         'resolve_main_checkout once. Rows are kept per-site so a 23rd '
         'handler cannot be added silently under a blessed 22. Follow-up '
-        'filed by task 4484 step-9.'
-        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
+        'filed by task 4484 step-9.',
     ),
     (
         'fused-memory/src/fused_memory/server/tools.py',
         'create_mcp_server.update_task',
         '81d0d2709341',
         'to_file',
+        TicketRef('tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ'),
         'ROOT CAUSE (one defect, 22 rows): every MCP handler taking a '
         'project_root calls the nested sync _normalize_project_root, which '
         'reaches models/scope.py::resolve_main_checkout -> '
@@ -998,14 +1061,14 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'not act on. 22 rows, one fix: offload or pre-warm '
         'resolve_main_checkout once. Rows are kept per-site so a 23rd '
         'handler cannot be added silently under a blessed 22. Follow-up '
-        'filed by task 4484 step-9.'
-        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
+        'filed by task 4484 step-9.',
     ),
     (
         'fused-memory/src/fused_memory/server/tools.py',
         'create_mcp_server.remove_task',
         '81d0d2709341',
         'to_file',
+        TicketRef('tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ'),
         'ROOT CAUSE (one defect, 22 rows): every MCP handler taking a '
         'project_root calls the nested sync _normalize_project_root, which '
         'reaches models/scope.py::resolve_main_checkout -> '
@@ -1016,14 +1079,14 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'not act on. 22 rows, one fix: offload or pre-warm '
         'resolve_main_checkout once. Rows are kept per-site so a 23rd '
         'handler cannot be added silently under a blessed 22. Follow-up '
-        'filed by task 4484 step-9.'
-        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
+        'filed by task 4484 step-9.',
     ),
     (
         'fused-memory/src/fused_memory/server/tools.py',
         'create_mcp_server.add_dependency',
         '81d0d2709341',
         'to_file',
+        TicketRef('tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ'),
         'ROOT CAUSE (one defect, 22 rows): every MCP handler taking a '
         'project_root calls the nested sync _normalize_project_root, which '
         'reaches models/scope.py::resolve_main_checkout -> '
@@ -1034,14 +1097,14 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'not act on. 22 rows, one fix: offload or pre-warm '
         'resolve_main_checkout once. Rows are kept per-site so a 23rd '
         'handler cannot be added silently under a blessed 22. Follow-up '
-        'filed by task 4484 step-9.'
-        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
+        'filed by task 4484 step-9.',
     ),
     (
         'fused-memory/src/fused_memory/server/tools.py',
         'create_mcp_server.remove_dependency',
         '81d0d2709341',
         'to_file',
+        TicketRef('tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ'),
         'ROOT CAUSE (one defect, 22 rows): every MCP handler taking a '
         'project_root calls the nested sync _normalize_project_root, which '
         'reaches models/scope.py::resolve_main_checkout -> '
@@ -1052,14 +1115,14 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'not act on. 22 rows, one fix: offload or pre-warm '
         'resolve_main_checkout once. Rows are kept per-site so a 23rd '
         'handler cannot be added silently under a blessed 22. Follow-up '
-        'filed by task 4484 step-9.'
-        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
+        'filed by task 4484 step-9.',
     ),
     (
         'fused-memory/src/fused_memory/server/tools.py',
         'create_mcp_server.set_task_priority_override',
         '81d0d2709341',
         'to_file',
+        TicketRef('tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ'),
         'ROOT CAUSE (one defect, 22 rows): every MCP handler taking a '
         'project_root calls the nested sync _normalize_project_root, which '
         'reaches models/scope.py::resolve_main_checkout -> '
@@ -1070,14 +1133,14 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'not act on. 22 rows, one fix: offload or pre-warm '
         'resolve_main_checkout once. Rows are kept per-site so a 23rd '
         'handler cannot be added silently under a blessed 22. Follow-up '
-        'filed by task 4484 step-9.'
-        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
+        'filed by task 4484 step-9.',
     ),
     (
         'fused-memory/src/fused_memory/server/tools.py',
         'create_mcp_server.clear_task_priority_override',
         '81d0d2709341',
         'to_file',
+        TicketRef('tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ'),
         'ROOT CAUSE (one defect, 22 rows): every MCP handler taking a '
         'project_root calls the nested sync _normalize_project_root, which '
         'reaches models/scope.py::resolve_main_checkout -> '
@@ -1088,14 +1151,14 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'not act on. 22 rows, one fix: offload or pre-warm '
         'resolve_main_checkout once. Rows are kept per-site so a 23rd '
         'handler cannot be added silently under a blessed 22. Follow-up '
-        'filed by task 4484 step-9.'
-        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
+        'filed by task 4484 step-9.',
     ),
     (
         'fused-memory/src/fused_memory/server/tools.py',
         'create_mcp_server.reorder_pin_queue',
         '81d0d2709341',
         'to_file',
+        TicketRef('tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ'),
         'ROOT CAUSE (one defect, 22 rows): every MCP handler taking a '
         'project_root calls the nested sync _normalize_project_root, which '
         'reaches models/scope.py::resolve_main_checkout -> '
@@ -1106,14 +1169,14 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'not act on. 22 rows, one fix: offload or pre-warm '
         'resolve_main_checkout once. Rows are kept per-site so a 23rd '
         'handler cannot be added silently under a blessed 22. Follow-up '
-        'filed by task 4484 step-9.'
-        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
+        'filed by task 4484 step-9.',
     ),
     (
         'fused-memory/src/fused_memory/server/tools.py',
         'create_mcp_server.get_pin_queue',
         '81d0d2709341',
         'to_file',
+        TicketRef('tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ'),
         'ROOT CAUSE (one defect, 22 rows): every MCP handler taking a '
         'project_root calls the nested sync _normalize_project_root, which '
         'reaches models/scope.py::resolve_main_checkout -> '
@@ -1124,14 +1187,14 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'not act on. 22 rows, one fix: offload or pre-warm '
         'resolve_main_checkout once. Rows are kept per-site so a 23rd '
         'handler cannot be added silently under a blessed 22. Follow-up '
-        'filed by task 4484 step-9.'
-        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
+        'filed by task 4484 step-9.',
     ),
     (
         'fused-memory/src/fused_memory/server/tools.py',
         'create_mcp_server.get_scheduler_state',
         '81d0d2709341',
         'to_file',
+        TicketRef('tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ'),
         'ROOT CAUSE (one defect, 22 rows): every MCP handler taking a '
         'project_root calls the nested sync _normalize_project_root, which '
         'reaches models/scope.py::resolve_main_checkout -> '
@@ -1142,14 +1205,14 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'not act on. 22 rows, one fix: offload or pre-warm '
         'resolve_main_checkout once. Rows are kept per-site so a 23rd '
         'handler cannot be added silently under a blessed 22. Follow-up '
-        'filed by task 4484 step-9.'
-        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
+        'filed by task 4484 step-9.',
     ),
     (
         'fused-memory/src/fused_memory/server/tools.py',
         'create_mcp_server.get_scheduler_events',
         '81d0d2709341',
         'to_file',
+        TicketRef('tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ'),
         'ROOT CAUSE (one defect, 22 rows): every MCP handler taking a '
         'project_root calls the nested sync _normalize_project_root, which '
         'reaches models/scope.py::resolve_main_checkout -> '
@@ -1160,14 +1223,14 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'not act on. 22 rows, one fix: offload or pre-warm '
         'resolve_main_checkout once. Rows are kept per-site so a 23rd '
         'handler cannot be added silently under a blessed 22. Follow-up '
-        'filed by task 4484 step-9.'
-        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
+        'filed by task 4484 step-9.',
     ),
     (
         'fused-memory/src/fused_memory/server/tools.py',
         'create_mcp_server.request_park_eviction',
         '81d0d2709341',
         'to_file',
+        TicketRef('tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ'),
         'ROOT CAUSE (one defect, 22 rows): every MCP handler taking a '
         'project_root calls the nested sync _normalize_project_root, which '
         'reaches models/scope.py::resolve_main_checkout -> '
@@ -1178,14 +1241,14 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'not act on. 22 rows, one fix: offload or pre-warm '
         'resolve_main_checkout once. Rows are kept per-site so a 23rd '
         'handler cannot be added silently under a blessed 22. Follow-up '
-        'filed by task 4484 step-9.'
-        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
+        'filed by task 4484 step-9.',
     ),
     (
         'fused-memory/src/fused_memory/server/tools.py',
         'create_mcp_server.request_park_eviction',
         'a0b1b5c60eed',
         'filed',
+        TaskRef(7572),
         _PATH_RESOLVE_GUARD_WHY,
     ),
     (
@@ -1193,18 +1256,18 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'create_mcp_server.find_tasks_by_metadata',
         '81d0d2709341',
         'to_file',
+        TicketRef('tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ'),
         'SAME ROOT CAUSE as the server/tools.py::_normalize_project_root '
         'cluster above, added deliberately as its 23rd handler by task '
         '6385: the cold-miss-only subprocess.run(git) in '
         'models/scope.py::resolve_main_checkout, memoised by '
         '_MAIN_CHECKOUT_CACHE. Offloading it here alone would diverge from '
-        'the 22 siblings that one shared fix closes together.'
-        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
+        'the 22 siblings that one shared fix closes together.',
     ),
 ]
 
 #: Derived, never hand-maintained beside the rows -- a second list would drift.
 ALLOWLIST_KEYS: list[tuple[str, str, str]] = [
     (relpath, qualname, content_hash)
-    for relpath, qualname, content_hash, _disposition, _justification in AUDITED_SITES
+    for relpath, qualname, content_hash, _disposition, _owner, _justification in AUDITED_SITES
 ]
