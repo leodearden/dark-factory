@@ -17,7 +17,7 @@ with the task path's HostPool, which is outside the lane.
 """
 from __future__ import annotations
 
-import dataclasses
+import copy
 import logging
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
@@ -255,7 +255,7 @@ class HostQuarantine:
     def unavailability(self, name: str) -> _HostUnavailability | None:
         """A copy of *name*'s open RunnerUnavailable episode, or None when it has none."""
         entry = self._runner_unavailable.get(name)
-        return None if entry is None else dataclasses.replace(entry)
+        return None if entry is None else copy.copy(entry)
 
     def unavailable_hosts(self) -> frozenset[str]:
         """Every host with an open RunnerUnavailable episode."""
