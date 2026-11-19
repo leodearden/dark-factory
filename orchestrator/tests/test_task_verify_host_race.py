@@ -24,7 +24,7 @@ import logging
 import os
 import shlex
 import subprocess
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Collection
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, TypeVar
@@ -92,9 +92,12 @@ def _alive(pid: int) -> bool:
     return True
 
 
-def _pending_tasks() -> set[asyncio.Task[Any]]:
+def _pending_tasks(*, excluding: Collection[asyncio.Task[Any]] = ()) -> set[asyncio.Task[Any]]:
     current = asyncio.current_task()
-    return {t for t in asyncio.all_tasks() if t is not current and not t.done()}
+    return {
+        t for t in asyncio.all_tasks()
+        if t is not current and t not in excluding and not t.done()
+    }
 
 
 async def _bounded(awaitable: Awaitable[_T], timeout: float = 30.0) -> _T:
@@ -113,9 +116,8 @@ async def _until(
             raise AssertionError('the call finished before reaching the awaited state')
         return False
 
-    await poll_responsive(
-        reached, timeout=_STATE_WAIT_SECS, label=f'_until({predicate.__qualname__})',
-    )
+    name = getattr(predicate, '__qualname__', repr(predicate))
+    await poll_responsive(reached, timeout=_STATE_WAIT_SECS, label=f'_until({name})')
 
 
 async def _no_sleep(_seconds: float) -> None:
@@ -517,7 +519,8 @@ async def _assert_cancelled_call_unwound(rig: _Rig, before: set[asyncio.Task[Any
     assert all(task is not None and task.done() for task in rig.local.tasks)
     assert rig.local.cancels == [1]
     test_task = asyncio.current_task()
-    await _until(lambda: _pending_tasks() - before - {test_task} == set())
+    assert test_task is not None
+    await _until(lambda: _pending_tasks(excluding={test_task}) - before == set())
 
 
 def _assert_unwound(rig: _Rig, *, laptop_holders: list[str], local_holders: list[str]) -> None:
