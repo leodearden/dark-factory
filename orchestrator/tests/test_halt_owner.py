@@ -48,6 +48,7 @@ def _make_wip_esc(
     *,
     category: str = 'wip_conflict',
     timestamp: str | None = None,
+    worktree: str | None = None,
 ) -> Escalation:
     kwargs: dict = dict(
         id=queue.make_id(task_id),
@@ -59,6 +60,7 @@ def _make_wip_esc(
         detail='detail',
         suggested_action='manual_intervention',
         level=1,
+        worktree=worktree,
     )
     if timestamp is not None:
         kwargs['timestamp'] = timestamp
