@@ -189,46 +189,7 @@ class TestInvokeWiresEnsureSandboxDirs:
     async def test_claude_fleet_exists_before_sandbox_extras_built(
         self, tmp_path, monkeypatch,
     ):
-        # A real git repo + linked worktree — the _invoke prologue needs
-        # config/git_ops/scheduler/briefing, and cwd must be a worktree.
-        repo = tmp_path / 'repo'
-        repo.mkdir()
-        _init_git_repo(repo)
-        config = OrchestratorConfig(
-            project_root=repo,
-            max_concurrent_tasks=1,
-            git=GitConfig(
-                main_branch='main',
-                branch_prefix='task/',
-                remote='origin',
-                worktree_dir='.worktrees',
-            ),
-        )
-        git_ops = GitOps(config.git, config.project_root)
-        wt_info = await git_ops.create_worktree('42')
-        cwd = wt_info.path
-
-        assignment = TaskAssignment(
-            task_id='42',
-            task={
-                'id': '42',
-                'title': 'X',
-                'description': 'Y',
-                'status': 'pending',
-                'metadata': {'files': ['README']},
-                'dependencies': [],
-            },
-            modules=['README'],
-        )
-        workflow = TaskWorkflow(
-            assignment=assignment,
-            config=config,
-            git_ops=git_ops,
-            scheduler=FakeScheduler(),  # type: ignore[arg-type]
-            briefing=FakeBriefing(),  # type: ignore[arg-type]
-            mcp=None,
-        )
-        workflow.artifacts = None  # skip write_agent_session
+        workflow, cwd = await _task42_workflow(tmp_path, metadata_files=['README'])
 
         # Hermetic write-set: ONLY claude_fleet is materialized on disk, under
         # tmp_path — NEVER the real ~/.claude. Patch compute_write_set so the
@@ -254,19 +215,7 @@ class TestInvokeWiresEnsureSandboxDirs:
 
         monkeypatch.setattr(WriteSet, 'writable_paths', _recording_writable_paths)
 
-        # Pin the backend to the 'none' escape hatch so _guard_sandbox returns
-        # without raising, independent of host landlock/bwrap availability.
-        saved_backend = sandbox_dispatch.get_backend()
-        sandbox_dispatch.set_backend('none')
-        try:
-            with patch(
-                'orchestrator.workflow.invoke_with_cap_retry',
-                new_callable=AsyncMock,
-                return_value=AgentResult(success=True, output=''),
-            ) as mock_cap_retry:
-                await workflow._invoke(IMPLEMENTER, fixed_prompt('PROMPT'), cwd)
-        finally:
-            sandbox_dispatch.set_backend(saved_backend)
+        mock_cap_retry = await _invoke_unconfined(workflow, IMPLEMENTER, cwd)
 
         # The sandboxed dispatch actually reached invoke_with_cap_retry (the
         # sandbox branch ran to completion).
@@ -286,12 +235,12 @@ class TestInvokeWiresEnsureSandboxDirs:
         assert claude_fleet.is_dir()
 
 
-async def _invoke_sandboxed(
-    tmp_path: Path, monkeypatch, *, role, plan: dict, metadata_files: list[str],
-    write_set: WriteSet,
-) -> list[dict[str, object]]:
-    """Drive the real ``_invoke`` sandbox branch for task 42 with
-    ``compute_write_set`` replaced by a recorder; return its kwargs per call."""
+async def _task42_workflow(
+    tmp_path: Path, *, metadata_files: list[str],
+) -> tuple[TaskWorkflow, Path]:
+    """A fully-constructed TaskWorkflow for task 42 over a real repo and
+    linked worktree — the ``_invoke`` prologue needs config/git_ops/scheduler/
+    briefing, and cwd must be a worktree. Returns the workflow and its cwd."""
     repo = tmp_path / 'repo'
     repo.mkdir()
     _init_git_repo(repo)
@@ -299,17 +248,23 @@ async def _invoke_sandboxed(
         project_root=repo,
         max_concurrent_tasks=1,
         git=GitConfig(
-            main_branch='main', branch_prefix='task/', remote='origin',
+            main_branch='main',
+            branch_prefix='task/',
+            remote='origin',
             worktree_dir='.worktrees',
         ),
     )
     git_ops = GitOps(config.git, config.project_root)
-    cwd = (await git_ops.create_worktree('42')).path
+    wt_info = await git_ops.create_worktree('42')
     assignment = TaskAssignment(
         task_id='42',
         task={
-            'id': '42', 'title': 'X', 'description': 'Y', 'status': 'pending',
-            'metadata': {'files': metadata_files}, 'dependencies': [],
+            'id': '42',
+            'title': 'X',
+            'description': 'Y',
+            'status': 'pending',
+            'metadata': {'files': metadata_files},
+            'dependencies': [],
         },
         modules=['README'],
     )
@@ -321,16 +276,15 @@ async def _invoke_sandboxed(
         briefing=FakeBriefing(),  # type: ignore[arg-type]
         mcp=None,
     )
-    workflow.artifacts = None
-    workflow.plan = plan
+    workflow.artifacts = None  # skip write_agent_session
+    return workflow, wt_info.path
 
-    calls: list[dict[str, object]] = []
 
-    def _record(_cwd: Path, **kwargs: object) -> WriteSet:
-        calls.append(kwargs)
-        return write_set
-
-    monkeypatch.setattr('orchestrator.workflow.compute_write_set', _record)
+async def _invoke_unconfined(workflow: TaskWorkflow, role, cwd: Path) -> AsyncMock:
+    """Run ``workflow._invoke`` with ``invoke_with_cap_retry`` mocked away and
+    the backend pinned to the 'none' escape hatch, so ``_guard_sandbox``
+    returns without raising, independent of host landlock/bwrap availability.
+    Returns the ``invoke_with_cap_retry`` mock."""
     saved_backend = sandbox_dispatch.get_backend()
     sandbox_dispatch.set_backend('none')
     try:
@@ -338,11 +292,30 @@ async def _invoke_sandboxed(
             'orchestrator.workflow.invoke_with_cap_retry',
             new_callable=AsyncMock,
             return_value=AgentResult(success=True, output=''),
-        ):
+        ) as mock_cap_retry:
             await workflow._invoke(role, fixed_prompt('PROMPT'), cwd)
     finally:
         sandbox_dispatch.set_backend(saved_backend)
-    return calls
+    return mock_cap_retry
+
+
+async def _declared_files_seen(
+    tmp_path: Path, monkeypatch, *, role, plan: dict, metadata_files: list[str],
+    write_set: WriteSet,
+) -> list[object]:
+    """The ``declared_files`` each ``compute_write_set`` call received while
+    ``_invoke`` ran *role* for task 42; the stub returns *write_set*."""
+    workflow, cwd = await _task42_workflow(tmp_path, metadata_files=metadata_files)
+    workflow.plan = plan
+    seen: list[object] = []
+
+    def _record(_cwd: Path, **kwargs: object) -> WriteSet:
+        seen.append(kwargs['declared_files'])
+        return write_set
+
+    monkeypatch.setattr('orchestrator.workflow.compute_write_set', _record)
+    await _invoke_unconfined(workflow, role, cwd)
+    return seen
 
 
 @pytest.mark.asyncio
@@ -352,12 +325,12 @@ class TestInvokeForwardsDeclaredFiles:
     fast path (no plan yet) depends on for the docs-only main grant."""
 
     async def test_plan_files_win_over_metadata_files(self, tmp_path, monkeypatch):
-        calls = await _invoke_sandboxed(
+        seen = await _declared_files_seen(
             tmp_path, monkeypatch, role=IMPLEMENTER,
             plan={'files': ['docs/a.md']}, metadata_files=['x.py'],
             write_set=_make_write_set(claude_fleet=tmp_path / 'fleet'),
         )
-        assert [c['declared_files'] for c in calls] == [['docs/a.md']]
+        assert seen == [['docs/a.md']]
 
     async def test_simple_task_without_plan_falls_back_to_metadata_files(
         self, tmp_path, monkeypatch, caplog,
@@ -366,12 +339,12 @@ class TestInvokeForwardsDeclaredFiles:
             _docs_grant_write_set(), claude_fleet=tmp_path / 'fleet',
         )
         with caplog.at_level(logging.INFO, logger='orchestrator.workflow'):
-            calls = await _invoke_sandboxed(
+            seen = await _declared_files_seen(
                 tmp_path, monkeypatch, role=SIMPLE_TASK,
                 plan={}, metadata_files=['docs/a.md'], write_set=granted,
             )
 
-        assert [c['declared_files'] for c in calls] == [['docs/a.md']]
+        assert seen == [['docs/a.md']]
         grant_logs = [
             r.getMessage() for r in caplog.records
             if r.levelno == logging.INFO and '/main/docs/a.md' in r.getMessage()
