@@ -557,9 +557,11 @@ def shape_merge_queue(
     ``recent`` is capped), ``speculative``, ``active`` (the live probe's
     entries), ``in_queue``, ``live_probe_configured`` (false keeps the
     project out of the client's multi-project in-queue totals),
-    ``active_spark``, ``halt``, ``train_events``, ``train_throughput``.
-    ``depth``, ``attempts``, ``in_queue``, ``speculative``, ``recent_total``,
-    ``train_throughput`` and ``live_probe_configured`` are required: the
+    ``runs_db_present`` (false keeps the project out of the client's runs.db
+    totals), ``active_spark``, ``halt``, ``train_events``,
+    ``train_throughput``. ``depth``, ``attempts``, ``in_queue``,
+    ``speculative``, ``recent_total``, ``train_throughput``,
+    ``live_probe_configured`` and ``runs_db_present`` are required: the
     route resolves them for every project.
 
     ``depth``, ``attempts``, ``in_queue``, ``speculative``, ``recent_total``,
@@ -603,6 +605,7 @@ def shape_merge_queue(
             'active': _titled(data.get('active'), f'{label}.active'),
             'in_queue': _served(data.get('in_queue'), f'{label}.in_queue'),
             'live_probe_configured': bool(data['live_probe_configured']),
+            'runs_db_present': bool(data['runs_db_present']),
             'active_spark': {
                 'labels': list(spark.get('labels') or []),
                 'values': list(spark.get('values') or []),
