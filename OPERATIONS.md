@@ -3971,7 +3971,7 @@ declared registry and its `LoadState`-aware detector).
 |---|---|---|
 | 02:00 | Shared-repo incremental repack + commit-graph (every orchestrator root, one at a time) | `shared-repo-git-maintenance.timer` |
 | 02:15 | link-heal sweep (adjudicate new triage children; records + report; writes gated) | `fused-memory-link-heal.timer` |
-| 02:30 | Transcript secret sweep | `transcript-secret-sweep.timer` |
+| 02:30 | Transcript secret sweep (leo-laptop runs its own copy) | `transcript-secret-sweep.timer` |
 | 03:00 | Legibility trickle coder | `legibility-trickle@.timer` |
 | 03:15 | Scheduled memory evals (produce, judge, file `eval_regression`); runs for hours because of e6, see its section | `fused-memory-memory-eval.timer` |
 | 03:30 | fused-memory flag-marker drain | `fused-memory-flag-marker-sweep.timer` |
@@ -4181,13 +4181,25 @@ everything already on disk.
   `*.xml.gz`. A `*.xml.gz` is redacted by decompressing it, replacing the
   value and recompressing it, with mode and mtime kept. These logs were added
   after failing pytest env assertions printed live tokens into them (task
-  10144). `~/.claude/projects` is still scanned for transcripts only. The
-  full tree list is `scripts/transcript_secret_sweep.py::swept_trees`.
+  10144). `~/.claude/projects` is still scanned for transcripts only. Last,
+  it scans pytest's per-user base temp (`/tmp/pytest-of-<user>`,
+  `--pytest-tmp-dir`), where env-capturing tests leave raw environment
+  dumps, but only files named like one
+  (`scripts/transcript_secret_sweep.py::PYTEST_ENV_DUMP_SUFFIXES`). Reading
+  every file there is not cheap: the 2026-11-15 run read 821,808 files, and
+  every one of its hits had one of those names. A file or directory pytest
+  prunes mid-walk is passed over, not reported unreadable. The full tree list
+  is `scripts/transcript_secret_sweep.py::swept_trees`.
 - **What it matches.** Only the live values the sweep's own environment holds.
   The wrapper sources the repo `.env` for them. It never matches a token-shaped
   pattern. A value is matched in the form the file holds it: JSON-escaped in
-  `*.jsonl` and `*.json`, raw or JSON-escaped in a `*.log`, and entity-escaped
-  in junit text and attribute values. Each hit is replaced in place, by the
+  `*.jsonl` and `*.json`, raw or JSON-escaped in a `*.log`, a `*.bin` or an
+  `env-dump`, and entity-escaped in junit text and attribute values. A value a
+  log cut short is matched too: at least
+  `shared/src/shared/secret_redaction.py::MIN_TRUNCATED_PREFIX_LEN` leading
+  characters of it, followed by `...`, `…` or a closing quote or bracket (in
+  the file's escaped form), are replaced by a placeholder of the same length.
+  Each hit is replaced in place, by the
   2026-10-11 method: a
   `<redacted:VAR>` placeholder padded with `x` to the same length, mode and
   mtime kept, no backup. In XML the placeholder is entity-escaped
@@ -4207,14 +4219,41 @@ everything already on disk.
   record line and left as found.
 - **What it skips.** Files modified in the last 15 minutes, which a live
   session or test run may still be appending to. The next night picks them up.
+- **A dry run.** `--dry-run` rewrites nothing and files nothing. Its record
+  line lists under `matched` every file a real run would redact, with
+  per-variable counts. The wrapper forwards its arguments and sources `.env`,
+  so on the workstation run
+  `/home/leo/src/dark-factory/scripts/transcript-secret-sweep.sh --dry-run`.
+  After a real run, a dry run should list nothing.
 
 Installing it is a post-merge deterministic deploy
 (`scripts/install-transcript-secret-sweep-timer.sh`, which kicks no immediate
 run). For a run now: `systemctl --user start transcript-secret-sweep.service`.
+
 At archive time a refused redaction is counted like any other archival
 failure (`transcript_archive: failed to redact` WARNING), and the transcript is
 held rather than archived with its value. At teardown, its other lines are
 still redacted in place.
+
+**On leo-laptop.** The laptop runs the same timer, service and wrapper from
+its own checkout. They are installed from the workstation by
+`scripts/deploy/install_laptop_transcript_secret_sweep.sh`, a post-merge
+deterministic deploy (run it with `--check` first). The laptop sweep sources
+the laptop's own `.env`, which holds a different slice of the pool, so no
+value crosses the wire. A drop-in (`scripts/transcript-secret-sweep.laptop.conf`)
+adds two flags:
+
+- `--host-configs-dir /home/leo/.config/orchestrator`, because the laptop has
+  no orchestrator units. Its verify configs there name its project roots.
+- `--no-escalation`, because the escalation server binds 127.0.0.1 on the
+  workstation. Laptop findings are therefore in the laptop journal only:
+  `ssh leo-laptop journalctl --user -u transcript-secret-sweep.service`.
+
+It is a user timer, so it fires only while leo's user manager runs. Lingering
+was off on the laptop when measured on 2026-11-16, and `Persistent=true`
+catches up a missed night. A laptop dry run:
+`ssh leo-laptop 'PATH=$HOME/.local/bin:$PATH /home/leo/src/dark-factory/scripts/transcript-secret-sweep.sh --host-configs-dir /home/leo/.config/orchestrator --no-escalation --dry-run'`
+(uv is not on a non-login ssh PATH).
 
 ### Legibility trickle accounts (03:00)
 
