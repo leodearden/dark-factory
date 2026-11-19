@@ -1,29 +1,36 @@
 """Shared landing-evidence helper for already-landed re-derivation sites (task 2678).
 
-SEVEN always-on call sites re-derive "has this task's work already landed on
-main?" from live git state before stamping a task ``done`` (re-measured
-2026-08-25 and re-verified 2026-08-29; this list said "five" until task 4647
-recounted it, and the two it omitted were the pair that never had a
-``Harness`` or worker method to be named after).  Each is cited by ENCLOSING
-SYMBOL rather than by line, because a line pin into these two files rots
-within days:
+These always-on call sites re-derive "has this task's work already landed on
+main?" from live git state before stamping a task ``done``.  The list was
+re-measured 2026-08-25, re-verified 2026-08-29 and updated by task 4648, which
+repointed sites 1 and 3 and added site 8.  It said "five" until task
+4647 recounted it: the two it omitted were the pair that never had a
+``Harness`` or worker method to be named after.  Each site is cited by
+ENCLOSING SYMBOL rather than by line, because a line pin into these files
+rots within days:
 
   1. ``orchestrator/src/orchestrator/harness.py::Harness._already_landed_dispatch_gate``'s
-     ancestry path
-  2. the same function's branch-deleted merge-marker path
-  3. the same function's content-equivalence fallback — the third and last of
-     its three ``validate_landing_evidence`` calls, the one gated by
-     ``branch_content_in_main``
+     ancestry arm, which calls :func:`branch_work_landed`
+  2. the same function's branch-deleted merge-marker arm
+  3. the same function's off-main-tip arm, which calls
+     :func:`branch_work_landed`.  It was the content-equivalence fallback
+     gated by ``branch_content_in_main`` until task 4648.
   4. the stranded-in-progress sweep
      (``orchestrator/src/orchestrator/harness.py::Harness._reconcile_one_stranded``)
   5. ``orchestrator/src/orchestrator/merge_lane/member_redrive.py::MemberRedriver.redrive``
      (the parked-member re-drive)
-  6. and 7. the escalation server's
-     ``escalation/src/escalation/server.py::merge_status`` query, both
-     git-authority arms — a read-only report rather than a recovery action,
-     which is why it is easy to miss when counting "sites that stamp a task
-     done", and why it is nonetheless a site: it shows a human the same
-     verdict the other five act on.
+  6. and 7. the escalation server's ``merge_status`` git-authority tier,
+     ``escalation/src/escalation/git_authority.py::_marker_arm`` and
+     ``::_ancestor_arm`` (task 4887).  It is a read-only report rather than a
+     recovery action, which is why it is easy to miss when counting "sites
+     that stamp a task done".  It is nonetheless a site: it shows a human
+     the same verdict the other sites act on.
+  8. ``orchestrator/src/orchestrator/workflow.py::TaskWorkflow._discovered_landing_sha``,
+     the workflow recovery guard (task 4704)
+
+Which policy each site keeps, and why, is recorded in
+``docs/prds/landed-not-done-recovery.effect-present-caller-enumeration.md``
+§7 rather than restated here.
 
 Prior to task 2678 each site inlined its own subset of two primitives landed
 by task 2675 (dep δ): ``git_ops.find_task_citation_commit`` (FIX 2,
@@ -32,7 +39,8 @@ subject-anchored citation discovery) and ``git_ops.commit_effect_present_in_main
 since task 3116 a threshold LINE-SURVIVAL test, not byte-identity) — an
 inline-per-site shape that let two of the five sites (the merge-marker path
 and the coalesce re-drive) ship WITHOUT the effect-present guard at all (the
-task-1175 clobber: a reverted merge still read as a genuine landing) and let
+task-1175 clobber: a merge marker whose branch netted no change still read as
+a genuine landing) and let
 two more lean on a silent ``x or <fallback-sha>`` expression that fabricated
 provenance when discovery came up empty.
 
@@ -108,8 +116,8 @@ citation + effect-present policy) — and they share every observable:
 - :attr:`LandingVerdict.method` as the EXPLICIT mode/policy discriminator —
   the shape the PRD's epsilon bullet mandates in place of two functions a
   consumer must tell apart by which one it happened to call.  It is what lets
-  epsilon distinguish a verdict from the non-decaying patch-id contract from
-  one produced by the effect-present policy it is retiring.
+  a consumer distinguish a verdict from the non-decaying patch-id contract
+  from one produced by the legacy effect-present policy.
 
 ``validate_landing_evidence`` is therefore best read as a MODE over that
 family rather than as a separate helper: its two arms set
@@ -145,18 +153,19 @@ it.
   no-ff merge commit is NOT a no-op — task 2675 made
   ``commit_effect_present_in_main`` merge-aware, so it diffs each of the
   merge commit's non-first parents' content against current main HEAD,
-  correctly catching a reverted no-ff merge (the task-1175 shape). Used by
-  the ancestry path, the content-equivalence fallback, and the coalesce
-  re-drive. A citation miss first tries one upgrade-only fallback
+  correctly catching a reverted no-ff merge, and an empty-net-diff one (the
+  task-1175 shape) through its empty-touched-set fail-safe. Used by
+  the coalesce re-drive and the workflow recovery guard. A citation miss
+  first tries one upgrade-only fallback
   (:func:`_content_equivalence_anchor`, task 4862); it is inert for an
-  ancestor-of-main tip, so only the non-ancestor content-equivalence arm can
+  ancestor-of-main tip, so only a caller holding a non-ancestor tip can
   reach its accept.
 - **CANDIDATE** (``candidate_sha`` given) — attribution was already
   established by the caller (a merge-marker subject match, or a stranded-
   sweep ground-truth report): skip citation discovery and the lineage guard
   entirely, and apply ONLY the FIX 1' effect-present guard to
-  ``candidate_sha``. Used by the merge-marker path and the stranded-
-  in-progress sweep.
+  ``candidate_sha``. Used by the dispatch gate's and Tier-3.5's merge-marker
+  arms and by the stranded-in-progress sweep.
 
 A second shared predicate lives here for the same INV-5 reason (task 3103):
 :func:`branch_is_degenerate` (with its :func:`is_valid_sha_40` helper) answers
@@ -167,10 +176,11 @@ every already-landed re-derivation. Both were previously private to
 and ``merge_request`` fast-path unguarded against a branch parked at an OLD
 main commit: such a branch IS an ancestor of main and is NOT at main's tip,
 so an ancestry-only check answers a confident ``done`` against a commit
-containing none of the task's work. Consumers: ``harness.py`` (×3 sites, via
-the ``Harness._branch_is_degenerate`` delegation), ``escalation/server.py``
-``merge_status`` (both git-authority arms) and ``merge_request``'s
-``already_merged`` fast-path.
+containing none of the task's work. Consumers: ``harness.py`` (×2 sites, via
+the ``Harness._branch_is_degenerate`` delegation),
+``escalation/git_authority.py::_ancestor_arm``, ``merge_request``'s
+``already_merged`` fast-path, and :func:`branch_work_landed` itself, which
+judges degeneracy for every site it decides.
 
 Also shared here (INV-5): :func:`format_unattributed_landing_detail` renders
 a rejected verdict into a human-facing ``(summary, detail)`` pair, and
@@ -430,7 +440,13 @@ class LandingReason(enum.StrEnum):
     would be two authorities that must be kept in step forever, and because a
     legacy code reaching a formatter that cannot explain it renders
     ``'Unrecognized reason code: ...'`` into an L1 body a human reads.  Leaf
-    epsilon retires the legacy three when it repoints the consumers.
+    epsilon (task 4648) repointed the sites in its scope to
+    :func:`branch_work_landed`.  Its one producer edit narrowed that
+    producer's evidence tier to patch-id only (esc-4648-5; the reason is
+    :func:`_resolve_main_reachable_evidence`'s docstring) and left
+    :func:`validate_landing_evidence` as it was, so the legacy three now mark
+    exactly the sites that keep the legacy policy
+    (``docs/prds/landed-not-done-recovery.effect-present-caller-enumeration.md`` §7).
     """
 
     #: Accepted — the branch's work is attributably present on main.
@@ -454,10 +470,11 @@ class LandingReason(enum.StrEnum):
     #: being unlanded.  No consumer may collapse it into ``not_landed``.
     git_error = 'git_error'
 
-    #: Legacy (``validate_landing_evidence`` accept).  Epsilon retires it.
+    #: Legacy (``validate_landing_evidence`` accept).
     ok = 'ok'
     #: Legacy (``validate_landing_evidence`` DISCOVERY miss).  The Contract's
-    #: spelling is :attr:`no_attribution`; epsilon flips the emitted value.
+    #: spelling is :attr:`no_attribution`, which :func:`branch_work_landed`
+    #: emits.
     no_citation = 'no_citation'
     #: Legacy (``validate_landing_evidence`` survival reject, FIX 1').
     effect_absent = 'effect_absent'
@@ -472,8 +489,9 @@ class LandingMethod(enum.StrEnum):
     demands in place of two separate functions: it maps one-to-one onto the
     production attribution paths, so any consumer can read which policy
     decided a verdict — in particular whether it came from the NON-DECAYING
-    patch-id contract or from the legacy effect-present policy epsilon is
-    retiring at the landing-detection sites.
+    patch-id contract or from the legacy effect-present policy.  Which
+    landing-detection site carries which method is recorded in
+    ``docs/prds/landed-not-done-recovery.effect-present-caller-enumeration.md`` §7.
     """
 
     #: :func:`branch_work_landed` — ``git cherry`` patch-id equivalence.  The
@@ -885,7 +903,7 @@ class LandingVerdict:
 
         The rescue discriminant for every reader in this package.  A rescued
         accept's ``evidence_sha`` IS on main but its effect is ABSENT at main
-        HEAD — the task-1175 shape FIX 1' guards — so ``accepted``/
+        HEAD — the shape FIX 1' guards — so ``accepted``/
         ``evidence_sha`` alone cannot tell it from a fully-guarded accept (see
         :func:`_delivered_checks_differential`).  Equality, not truthiness:
         ``no_signal`` and ``disabled`` are truthy yet only reach a reject.
@@ -1305,7 +1323,13 @@ async def _resolve_main_reachable_evidence(
        main-reachable by construction; no extra reachability check is needed
        (and none is done, which is what keeps this leg off the decaying
        path-set predicates — see :func:`branch_work_landed`).
-    2. **Patch-id equivalent** — :func:`_patch_id_equivalent_on_main`.
+    2. **Patch-id equivalent** — :func:`_patch_id_equivalent_on_main`, by
+       patch-id ONLY.  ``find_equivalent_commit``'s unique-subject tier is
+       excluded because its hit need not carry *head*'s diff: on a reseeded
+       ancestor tip (containment is vacuous there) one later main commit
+       repeating the tip's subject would otherwise be stamped as this task's
+       landing (esc-4648-5, the narrowing task 4862 applied to the content
+       fallback).
 
     Returns ``None`` when NEITHER tier resolves.  The caller turns that into
     :attr:`LandingReason.no_attribution` rather than accepting: anchoring on
@@ -1332,11 +1356,11 @@ async def _resolve_main_reachable_evidence(
         probe['citation'] = citation
         probe['evidence_source'] = 'citation'
         return citation
-    return await _patch_id_equivalent_on_main(git_ops, head, probe, patch_id_only=False)
+    return await _patch_id_equivalent_on_main(git_ops, head, probe)
 
 
 async def _patch_id_equivalent_on_main(
-    git_ops: GitOps, head: str, probe: dict[str, Any], *, patch_id_only: bool,
+    git_ops: GitOps, head: str, probe: dict[str, Any],
 ) -> str | None:
     """The commit on main whose diff is patch-id equivalent to *head*'s, or None.
 
@@ -1344,12 +1368,11 @@ async def _patch_id_equivalent_on_main(
     ``project_root``, whose HEAD is main.  The map it builds is keyed on
     ``git patch-id --stable``, so the sha it returns is the commit on main
     whose diff is equivalent to *head*'s — the replayed twin a rebase landing
-    produces.  It carries its own refuse-to-guess posture (an ambiguous
-    patch-id, or an ambiguous subject in its tier-2 fallback, yields ``None``
-    rather than an arbitrary pick), which is inherited here deliberately.
-    *patch_id_only* drops that subject tier, whose hit need not carry
-    *head*'s diff: :func:`_content_equivalence_anchor` sets it, and
-    :func:`_resolve_main_reachable_evidence` keeps both tiers.
+    produces.  An ambiguous patch-id yields ``None`` rather than an arbitrary
+    pick, a refuse-to-guess posture inherited here deliberately.  The search
+    is patch-id ONLY: ``find_equivalent_commit``'s subject tier is never
+    used, because its hit need not carry *head*'s diff, and every caller
+    anchors provenance on the answer.
     """
     base = await git_ops.merge_base_with_main(head)
     probe['merge_base'] = base
@@ -1361,7 +1384,7 @@ async def _patch_id_equivalent_on_main(
         return None
 
     equivalent = await git_ops.find_equivalent_commit(
-        git_ops.project_root, base, head, patch_id_only=patch_id_only,
+        git_ops.project_root, base, head, patch_id_only=True,
     )
     probe['evidence_source'] = (
         'patch_id_equivalent' if equivalent else 'no_equivalent_on_main'
@@ -1571,7 +1594,9 @@ def _accept_verdict(
     ``reason`` is explicit and not defaulted because the two producers accept
     under DIFFERENT codes — :attr:`LandingReason.landed` for the Contract's
     patch-id producer, the legacy :attr:`LandingReason.ok` for
-    :func:`validate_landing_evidence` until epsilon repoints its consumers.
+    :func:`validate_landing_evidence`, whose callers are exactly the sites
+    that keep the legacy policy
+    (``docs/prds/landed-not-done-recovery.effect-present-caller-enumeration.md`` §7).
     Defaulting it would let a caller silently emit the other one's spelling.
     """
     return _stamped_verdict(
@@ -2041,9 +2066,7 @@ async def _content_equivalence_anchor(
         if not await git_ops.branch_content_in_main(branch_tip_sha):
             probe['content_fallback'] = 'not_content_equivalent'
             return None
-        anchor = await _patch_id_equivalent_on_main(
-            git_ops, branch_tip_sha, probe, patch_id_only=True,
-        )
+        anchor = await _patch_id_equivalent_on_main(git_ops, branch_tip_sha, probe)
     except Exception as exc:
         probe['content_fallback'] = 'error'
         probe['content_fallback_error'] = repr(exc)
@@ -2110,18 +2133,18 @@ async def validate_landing_evidence(
     (task 4647).  ``'ok'`` on accept, ``'no_citation'`` on a DISCOVERY miss and
     ``'effect_absent'`` on a survival reject — now as :class:`LandingReason`
     members, which are genuine ``str`` subclasses, so every incumbent
-    comparison against a plain string holds and none of the seven production
-    call sites needs an edit.
+    comparison against a plain string holds and no production call site
+    needed an edit.
 
-    ``no_attribution`` is the Contract's RENAME of ``no_citation``, and it is
-    REGISTERED in :class:`LandingReason` today while this function keeps
-    emitting the old spelling.  Registration is the load-bearing half: it is
-    what guarantees that when leaf epsilon flips the emitted value, no
-    escalation can render the literal ``'Unrecognized reason code'`` into an
-    L1 body — the vocabulary and its operator-facing prose already cover both
-    spellings.  Flipping the EMITTED value is epsilon's edit, made together
-    with repointing the consumers, and doing it here would break the pins in
-    five test files for no gain.
+    ``no_attribution`` is the Contract's RENAME of ``no_citation``.  Both are
+    REGISTERED in :class:`LandingReason`, so the vocabulary and its
+    operator-facing prose cover both spellings, and no escalation can render
+    the literal ``'Unrecognized reason code'`` into an L1 body.  Leaf epsilon
+    (task 4648) did not flip this function's emitted value.  It repointed
+    the sites in its scope to :func:`branch_work_landed`, which emits the
+    Contract's spellings, so the legacy spellings now mark exactly the sites
+    that keep the legacy policy
+    (``docs/prds/landed-not-done-recovery.effect-present-caller-enumeration.md`` §7).
 
     Args:
         git_ops: A ``GitOps`` instance (or a duck-typed stand-in exposing
@@ -2168,18 +2191,23 @@ async def validate_landing_evidence(
             unwired site's only live effect is the escalation text "this call
             site is unwired"). The call sites are owned by other tasks:
 
-              task 4496  harness.py x4 (three ``_already_landed_dispatch_gate``
-                         arms + ``_reconcile_one_stranded``) — WIRED
-              task 4497  merge_queue.py x1 (the coalesce re-drive)
-              task 4498  escalation/server.py x2 (``merge_status``'s
-                         git-authority arms)
+              task 4496  harness.py x2 (``_already_landed_dispatch_gate``'s
+                         marker arm + ``_reconcile_one_stranded``) — WIRED
+              task 4497  merge_lane/member_redrive.py x1 (the coalesce
+                         re-drive)
+              task 4498  escalation/git_authority.py x1
+                         (``_evidence_verdict``, the marker arm) — WIRED
+              task 4704  workflow.py x1
+                         (``TaskWorkflow._discovered_landing_sha``) — WIRED
               task 4500  CAPSTONE — flips this parameter to REQUIRED and
-                         keyword-only once all seven are wired, so no future
+                         keyword-only once all five are wired, so no future
                          caller can inherit the default silently
 
+            Task 4648 took the count from seven to five by moving the
+            dispatch gate's two live-branch arms to :func:`branch_work_landed`.
             If ``delivered_checks_state == 'unwired'`` is still appearing in
             escalations after 4500 has landed, that is the bug: one of the
-            seven sites regressed to the default.
+            five sites regressed to the default.
         checks_enabled: The project's ``delivered_checks.enabled`` leaf,
             the kill switch's only source (a real ``GitOps.config`` carries no
             ``delivered_checks``). False disarms the second accept path,
@@ -2215,9 +2243,8 @@ async def validate_landing_evidence(
         return _reject_verdict(reason, probe=probe, method=method)
 
     def _accept(evidence_sha: str) -> LandingVerdict:
-        # LEGACY spelling, deliberately.  See this function's docstring: the
-        # Contract's codes are REGISTERED in LandingReason today and epsilon
-        # flips the EMITTED value when it repoints the consumers.
+        # LEGACY spelling, deliberately: it marks a legacy-policy site.  See
+        # this function's docstring.
         return _accept_verdict(
             evidence_sha, reason=LandingReason.ok, probe=probe, method=method,
         )
@@ -2256,8 +2283,8 @@ async def validate_landing_evidence(
     # both is_ancestor directions is still a genuine landing; hard-rejecting
     # it caused a close<->refile ping-pong (the auto-watcher closes the
     # benign L1, the gate re-opens it) that never self-resolved. The FIX 1'
-    # effect-present guard below stays the real gate against a reverted
-    # (task-1175) landing.
+    # effect-present guard below stays the real gate against a reverted or
+    # empty-net-diff (task-1175) landing.
     citation_on_branch = await git_ops.is_ancestor(citation, branch)
 
     # FIX 1' effect-present guard (task 2500/2675): ancestry alone doesn't
@@ -2928,11 +2955,14 @@ def file_unattributed_landing_escalation(
     near-verbatim copy of this filing boilerplate, differing only in
     ``agent_role``).
 
-    Called by every site that found a positive landing signal (a merge
-    marker, branch content equivalent to main, or an on-main coalesce
-    member) but whose :func:`validate_landing_evidence` verdict came back
-    rejected — an unattributed or effect-absent landing that must not be
-    silently stamped done (the task-1175 clobber this task closes).
+    Called by every site that found a positive landing signal but no
+    attributable one: a merge marker or an on-main coalesce member whose
+    :func:`validate_landing_evidence` verdict came back rejected (an
+    unattributed or effect-absent landing), or the dispatch gate's
+    off-main-tip arm, whose :func:`branch_work_landed` verdict is
+    ``no_attribution`` (the branch's commits are patch-id present on main,
+    but nothing attributes them).  Neither may be silently stamped done (the
+    task-1175 clobber this task closes).
     Escalate-instead-of-stamp is deliberately non-status-blocking: the
     caller leaves the task/member row pending (or flips it to pending) and
     it is re-evaluated next tick. The caller's open-L1 veto stops it re-filing,
@@ -2969,7 +2999,9 @@ def file_unattributed_landing_escalation(
     (CANDIDATE = the candidate sha; DISCOVERY = the discovered citation) and
     stays ``None`` for a ``no_citation`` reject, which returns before the
     citation is ever assigned — so that arm carries no identity by
-    construction.
+    construction.  Neither does :func:`branch_work_landed`'s
+    ``no_attribution``, so after its L1 is resolved the gate's next tick
+    refiles it (follow-up ticket tkt_0RX5SZAFHBEV57JWSVYJR86F95).
 
     **The CITATION is the identity, deliberately NOT the effect-check anchor**
     (task 4499, amendment pass — recorded here so the next reader does not have

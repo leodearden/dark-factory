@@ -25,6 +25,7 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+from _landing_verdicts import stub_landing_producer
 from _rebased_landing_git import (
     add_main_merged_branch,
     add_net_empty_branch,
@@ -373,16 +374,18 @@ def _probe_git_ops(**overrides: Any) -> types.SimpleNamespace:
     return stub
 
 
-def _ancestor_git_ops(
-    *, tip: str, citation: str | None = None, effect_present: bool = True,
-) -> types.SimpleNamespace:
+def _ancestor_git_ops(*, tip: str) -> types.SimpleNamespace:
+    """A live ref whose tip is an ancestor of main.
+
+    Past its own guards the ancestor arm asks ``branch_work_landed``, which a
+    stub cannot answer; pair this with
+    :func:`_landing_verdicts.stub_landing_producer`.
+    """
     return _probe_git_ops(
         resolve_branch_sha=AsyncMock(
             side_effect=lambda b: tip if b.startswith('task/') else _MAIN
         ),
         is_ancestor=AsyncMock(return_value=True),
-        find_task_citation_commit=AsyncMock(return_value=citation),
-        commit_effect_present_in_main=AsyncMock(return_value=effect_present),
     )
 
 
@@ -491,15 +494,19 @@ def _force_differential_confirm(monkeypatch: pytest.MonkeyPatch) -> None:
 class TestProbeLanding:
     """The tier, called directly — no MCP server, no request_id."""
 
-    async def test_ancestor_arm_accept(self, tmp_path: Path) -> None:
+    async def test_ancestor_arm_accept(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        stub_landing_producer(monkeypatch, 'landed', evidence_sha='c' * 40)
+
         verdict = await probe_landing(
-            _ancestor_git_ops(tip='a' * 40, citation='c' * 40), '900',
+            _ancestor_git_ops(tip='a' * 40), '900',
             orch_config=_config(tmp_path),
             harness=_harness(read=TaskFound({'metadata': {'branch_base_sha': 'b' * 40}})),
         )
 
         assert verdict.outcome is GitAuthorityOutcome.found_on_main
-        assert verdict.merge_sha == 'c' * 40, 'merge_sha is the CITATION commit on main'
+        assert verdict.merge_sha == 'c' * 40, "merge_sha is the producer's evidence on main"
         assert verdict.arm is GitAuthorityArm.ancestor
         assert verdict.citation_gate_skipped is False, (
             'the gate RAN here — the flag is the discriminator a provenance '
@@ -525,15 +532,16 @@ class TestProbeLanding:
     @pytest.mark.parametrize('make_git_ops', [
         pytest.param(lambda: _marker_git_ops(marker='d' * 40), id='marker'),
         pytest.param(
-            lambda: _ancestor_git_ops(tip='a' * 40, citation='c' * 40), id='ancestor',
+            lambda: _ancestor_git_ops(tip='a' * 40), id='ancestor',
         ),
     ])
     @pytest.mark.parametrize('key', ['801', 'task/801'], ids=['bare', 'prefixed'])
     async def test_metadata_is_read_by_the_bare_task_id_for_either_key_shape(
-        self, tmp_path: Path, key: str,
+        self, tmp_path: Path, key: str, monkeypatch: pytest.MonkeyPatch,
         make_git_ops: Callable[[], types.SimpleNamespace],
     ) -> None:
         """probe_landing derives the task id it reads metadata by from either key shape."""
+        stub_landing_producer(monkeypatch, 'landed', evidence_sha='c' * 40)
         git_ops = make_git_ops()
         harness = _harness(read=TaskFound({'metadata': {'branch_base_sha': 'b' * 40}}))
 
@@ -560,7 +568,7 @@ class TestProbeLanding:
         stamps.
         """
         tip = 'a' * 40
-        git_ops = _ancestor_git_ops(tip=tip, citation=None)
+        git_ops = _ancestor_git_ops(tip=tip)
 
         verdict = await probe_landing(
             git_ops, '904', orch_config=_config(tmp_path, commit_citation_pattern=''),
@@ -578,38 +586,52 @@ class TestProbeLanding:
         assert verdict.reason is None
         git_ops.find_task_citation_commit.assert_not_called()
 
-    async def test_ancestor_effect_absent_is_landed_unconfirmed(
-        self, tmp_path: Path
+    async def test_ancestor_no_attribution_is_landed_unconfirmed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """THE MEASURED 95.4% COMMON CASE, and the reason both outcomes exist.
+        """The reason both outcomes exist.
 
-        A citing commit was FOUND on main — git positively established this
-        branch's work landed — and only effect-survival failed.  Reporting
-        that as ``no_signal`` would claim we know nothing, which is false.
+        The producer proved the branch's work is on main and could not
+        attribute it to the task.  Reporting that as ``no_signal`` would
+        claim we know nothing, which is false.
         """
-        verdict = await probe_landing(
-            _ancestor_git_ops(tip='a' * 40, citation='c' * 40, effect_present=False),
-            '901', orch_config=_config(tmp_path),
-            harness=_harness(read=TaskFound({'metadata': {'branch_base_sha': 'b' * 40}})),
-        )
+        stub_landing_producer(monkeypatch, 'no_attribution')
 
-        assert verdict.outcome is GitAuthorityOutcome.landed_unconfirmed
-        assert verdict.reason == 'effect_absent'
-        assert verdict.evidence_sha == 'c' * 40
-        assert verdict.merge_sha is None, 'merge_sha is for ACCEPTED landings only'
-
-    async def test_ancestor_no_citation_is_landed_unconfirmed(
-        self, tmp_path: Path
-    ) -> None:
         verdict = await probe_landing(
-            _ancestor_git_ops(tip='a' * 40, citation=None), '3031',
+            _ancestor_git_ops(tip='a' * 40), '3031',
             orch_config=_config(tmp_path),
             harness=_harness(read=TaskFound({'metadata': {'branch_base_sha': 'b' * 40}})),
         )
 
         assert verdict.outcome is GitAuthorityOutcome.landed_unconfirmed
-        assert verdict.reason == 'no_citation'
+        assert verdict.arm is GitAuthorityArm.ancestor
+        assert verdict.reason == 'no_attribution'
         assert verdict.evidence_sha is None
+        assert verdict.merge_sha is None, 'merge_sha is for ACCEPTED landings only'
+
+    @pytest.mark.parametrize(('reason', 'outcome'), [
+        ('not_landed', GitAuthorityOutcome.no_signal),
+        ('no_op_landing', GitAuthorityOutcome.no_signal),
+        ('degenerate_branch', GitAuthorityOutcome.no_signal),
+        ('git_error', GitAuthorityOutcome.probe_failed),
+    ])
+    async def test_ancestor_arm_maps_every_other_reject(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        reason: str, outcome: GitAuthorityOutcome,
+    ) -> None:
+        """No landing established is ``no_signal``; a detector that could not
+        look is ``probe_failed``, never a negative."""
+        stub_landing_producer(monkeypatch, reason)
+
+        verdict = await probe_landing(
+            _ancestor_git_ops(tip='a' * 40), '3031',
+            orch_config=_config(tmp_path),
+            harness=_harness(read=TaskFound({'metadata': {'branch_base_sha': 'b' * 40}})),
+        )
+
+        assert verdict.outcome is outcome
+        assert verdict.arm is GitAuthorityArm.ancestor
+        assert verdict.reason == reason
         assert verdict.merge_sha is None
 
     async def test_marker_effect_absent_is_landed_unconfirmed(
@@ -632,13 +654,13 @@ class TestProbeLanding:
     # made reachable for the first time.
     #
     # ``_evidence_verdict`` passes ``delivered_checks=`` into
-    # ``validate_landing_evidence``; it is the only production call site
-    # that has ever done so.  That activates the SECOND ACCEPT PATH which
-    # sits INSIDE the ``commit_effect_present_in_main(...) is False``
-    # branch in BOTH modes, so a ``found_on_main`` with a populated
-    # ``merge_sha`` can now name a landing whose effect is ABSENT at main
-    # HEAD — the task-1175 reverted-landing shape the FIX 1' guard exists
-    # to catch.
+    # ``validate_landing_evidence``.  That activates the SECOND ACCEPT
+    # PATH which sits INSIDE the ``commit_effect_present_in_main(...) is
+    # False`` branch, so a ``found_on_main`` with a populated ``merge_sha``
+    # can name a landing whose effect is ABSENT at main HEAD.  Since task
+    # 4648 only the marker arm reaches ``_evidence_verdict``; the live-ref
+    # arms are decided by ``branch_work_landed``, which never consults the
+    # checks, so they can never be rescued.
     #
     # The differential is forced through the DEFINING module
     # (``orchestrator.merge_lane.landing_evidence``), the same way
@@ -650,50 +672,45 @@ class TestProbeLanding:
     # returning a hand-built accepted verdict would not.
     # ---------------------------------------------------------------
 
-    async def test_ancestor_arm_accept_rescued_by_delivered_checks(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    @pytest.mark.parametrize(('reason', 'outcome'), [
+        ('landed', GitAuthorityOutcome.found_on_main),
+        ('no_attribution', GitAuthorityOutcome.landed_unconfirmed),
+    ])
+    async def test_the_ancestor_arm_is_never_rescued_by_delivered_checks(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        reason: str, outcome: GitAuthorityOutcome,
     ) -> None:
-        """Effect ABSENT, accepted anyway — and the verdict says which.
+        """A task declaring checks, and a differential that WOULD confirm.
 
-        Same git facts as
-        ``test_ancestor_effect_absent_is_landed_unconfirmed`` above; the
-        ONLY differences are a task that declares delivered_checks and a
-        differential that confirms.  Without
-        ``rescued_by_delivered_checks`` this verdict is byte-identical to
-        the fully-guarded accept two tests up, and a provenance writer
-        stamping ``merge_sha`` cannot tell a live landing from a reverted
-        one.
+        The ancestor arm's producer never consults the checks, so its accept
+        stays fully guarded and its reject stays a reject.
         """
         _force_differential_confirm(monkeypatch)
+        stub_landing_producer(
+            monkeypatch, reason, evidence_sha='c' * 40 if reason == 'landed' else None,
+        )
 
         verdict = await probe_landing(
-            _ancestor_git_ops(tip='a' * 40, citation='c' * 40, effect_present=False),
-            '907', orch_config=_config(tmp_path),
+            _ancestor_git_ops(tip='a' * 40), '907', orch_config=_config(tmp_path),
             harness=_harness(read=TaskFound(_task_declaring_checks())),
         )
 
-        assert verdict.outcome is GitAuthorityOutcome.found_on_main, (
-            'precondition: the differential must actually rescue the reject, '
-            'otherwise this pins nothing'
-        )
-        assert verdict.merge_sha == 'c' * 40
+        assert verdict.outcome is outcome
         assert verdict.arm is GitAuthorityArm.ancestor
-        assert verdict.rescued_by_delivered_checks is True
-        assert verdict.citation_gate_skipped is False, (
-            'the two weakenings are INDEPENDENT — the citation gate ran and '
-            'passed here; only the effect-present guarantee was traded away'
-        )
-        assert verdict.merge_sha_fully_guarded is False
+        assert verdict.rescued_by_delivered_checks is False
+        assert verdict.merge_sha_fully_guarded is (outcome is GitAuthorityOutcome.found_on_main)
 
     async def test_marker_arm_accept_rescued_by_delivered_checks(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The CANDIDATE-mode half of the same rescue.
+        """Effect ABSENT, accepted anyway — and the verdict says which.
 
-        Both arms are pinned because the two ``_accept`` calls are at
-        different lines in different modes of ``validate_landing_evidence``
-        — a fix that carries the signal through one does not imply the
-        other.
+        Same git facts as ``test_marker_effect_absent_is_landed_unconfirmed``
+        above; the ONLY differences are a task that declares delivered_checks
+        and a differential that confirms.  Without
+        ``rescued_by_delivered_checks`` this verdict is byte-identical to a
+        fully-guarded accept, and a provenance writer stamping ``merge_sha``
+        cannot tell a live landing from one main no longer carries.
         """
         _force_differential_confirm(monkeypatch)
 
@@ -712,22 +729,18 @@ class TestProbeLanding:
         assert verdict.merge_sha_fully_guarded is False
 
     @pytest.mark.parametrize('enabled', [True, False])
-    @pytest.mark.parametrize('arm', ['ancestor', 'marker'])
-    async def test_the_project_kill_switch_governs_the_rescue_in_both_arms(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, arm: str, enabled: bool,
+    async def test_the_project_kill_switch_governs_the_marker_arms_rescue(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, enabled: bool,
     ) -> None:
         """``delivered_checks.enabled`` reaches the differential from orch_config.
 
         The REAL differential runs, with only its leaf check runner faked,
         because the kill switch lives inside it.  A real ``GitOps.config`` is
         the ``git`` sub-config and cannot carry the leaf, so the probe must
-        pass it from the project config in both arms.
+        pass it from the project config.  The marker arm is the only one that
+        reaches the differential (task 4648).
         """
-        git_ops = (
-            _ancestor_git_ops(tip='a' * 40, citation='c' * 40, effect_present=False)
-            if arm == 'ancestor'
-            else _marker_git_ops(marker='d' * 40, effect_present=False)
-        )
+        git_ops = _marker_git_ops(marker='d' * 40, effect_present=False)
         git_ops.project_root = tmp_path
         refs_run: list[str] = []
         monkeypatch.setattr(
@@ -768,13 +781,13 @@ class TestProbeLanding:
         _force_differential_confirm(monkeypatch)
 
         verdict = await probe_landing(
-            _ancestor_git_ops(tip='a' * 40, citation='c' * 40, effect_present=True),
+            _marker_git_ops(marker='d' * 40, effect_present=True),
             '909', orch_config=_config(tmp_path),
             harness=_harness(read=TaskFound(_task_declaring_checks())),
         )
 
         assert verdict.outcome is GitAuthorityOutcome.found_on_main
-        assert verdict.merge_sha == 'c' * 40
+        assert verdict.merge_sha == 'd' * 40
         assert verdict.rescued_by_delivered_checks is False
         assert verdict.merge_sha_fully_guarded is True
 
@@ -788,7 +801,7 @@ class TestProbeLanding:
         claiming a rescue here would be a fabricated provenance fact.
         """
         verdict = await probe_landing(
-            _ancestor_git_ops(tip='a' * 40, citation=None), '910',
+            _ancestor_git_ops(tip='a' * 40), '910',
             orch_config=_config(tmp_path, commit_citation_pattern=''),
             harness=_harness(read=TaskFound(_task_declaring_checks())),
         )
@@ -805,7 +818,7 @@ class TestProbeLanding:
         'git_ops,task,label',
         [
             (
-                _ancestor_git_ops(tip='b' * 40, citation='c' * 40),
+                _ancestor_git_ops(tip='b' * 40),
                 {'metadata': {'branch_base_sha': 'b' * 40}},
                 'degenerate branch — tip still at its creation point',
             ),
@@ -919,15 +932,17 @@ class TestProbeLanding:
         assert 'merge_status' not in caplog.text
 
     async def test_site_reaches_the_metadata_fetch(
-        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """The label is threaded THROUGH to ``task_metadata``, not just used
         by the wrapper — a scheduler fault under a reconciler probe is logged
         against the reconciler.
         """
+        stub_landing_producer(monkeypatch, 'landed', evidence_sha='c' * 40)
         with caplog.at_level(logging.WARNING):
             verdict = await probe_landing(
-                _ancestor_git_ops(tip='a' * 40, citation='c' * 40), '4651',
+                _ancestor_git_ops(tip='a' * 40), '4651',
                 orch_config=_config(tmp_path), harness=_harness(raises=True),
                 site='landed_reconciler',
             )
@@ -940,7 +955,7 @@ class TestProbeLanding:
         assert 'merge_status' not in caplog.text
 
     async def test_metadata_unavailable_is_threaded_onto_the_verdict(
-        self, tmp_path: Path
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """THE G7 PAYLOAD, and it can only be pinned here.
 
@@ -950,16 +965,17 @@ class TestProbeLanding:
         that one's scheduler raises: the outcome is identical and the flag is
         not.
         """
+        stub_landing_producer(monkeypatch, 'landed', evidence_sha='c' * 40)
         healthy = await probe_landing(
-            _ancestor_git_ops(tip='a' * 40, citation='c' * 40), '906',
+            _ancestor_git_ops(tip='a' * 40), '906',
             orch_config=_config(tmp_path), harness=_harness(read=TaskFound({'metadata': {}})),
         )
         faulted = await probe_landing(
-            _ancestor_git_ops(tip='a' * 40, citation='c' * 40), '906',
+            _ancestor_git_ops(tip='a' * 40), '906',
             orch_config=_config(tmp_path), harness=_harness(raises=True),
         )
 
-        assert healthy.outcome is faulted.outcome, (
+        assert healthy.outcome is faulted.outcome is GitAuthorityOutcome.found_on_main, (
             'precondition: the fault must not change the OUTCOME, only the flag'
         )
         assert healthy.metadata_unavailable is False
@@ -1227,6 +1243,203 @@ class TestProbeLandingPatchIdArm:
 
         assert overridden.merge_sha == landing.main_tip, overridden
         assert default.merge_sha == squash, default
+
+
+def _write_and_commit(root: Path, subject: str, files: dict[str, str]) -> str:
+    for name, body in files.items():
+        (root / name).write_text(body)
+    landing_git(root, 'add', *files)
+    landing_git(root, 'commit', '-m', subject)
+    return landing_git(root, 'rev-parse', 'HEAD')
+
+
+def _lines(stem: str, count: int) -> str:
+    return ''.join(f'{stem} line {n}\n' for n in range(count))
+
+
+def _merged_landing_then_same_path_churn(root: Path, task_id: str) -> tuple[str, str]:
+    """``task/<task_id>`` merged ``--no-ff`` into main, then main rewrites its paths.
+
+    Three later main commits each replace every line the task added, which is
+    the churn a decaying effect-present check reads as "reverted".  Returns
+    ``(merge_sha, branch_base_sha)``.
+    """
+    branch = f'task/{task_id}'
+    new_repo(root)
+    base = landing_git(root, 'rev-parse', 'main')
+    landing_git(root, 'checkout', '-b', branch)
+    _write_and_commit(root, f'feat({task_id}): add the module', {'work.py': _lines('feature', 40)})
+    _write_and_commit(root, f'test({task_id}): cover the module', {'helper.py': _lines('helper', 30)})
+    landing_git(root, 'checkout', 'main')
+    landing_git(root, 'merge', '--no-ff', '-m', f'Merge {branch} into main', branch)
+    merge_sha = landing_git(root, 'rev-parse', 'main')
+    for n in range(3):
+        _write_and_commit(root, f'refactor: churn {n}', {
+            'work.py': _lines(f'churn {n}', 40), 'helper.py': _lines(f'churn {n}', 30),
+        })
+    return merge_sha, base
+
+
+def _spy_on_landing_producers(monkeypatch: pytest.MonkeyPatch) -> tuple[AsyncMock, AsyncMock]:
+    """Delegating spies on the DEFINING module's two landing producers.
+
+    ``git_authority`` imports both per call, so patching
+    ``orchestrator.merge_lane.landing_evidence`` is what its arms resolve.
+    Returns ``(branch_work_landed, validate_landing_evidence)``.
+    """
+    from orchestrator.merge_lane import landing_evidence
+    work_landed = AsyncMock(wraps=landing_evidence.branch_work_landed)
+    validate = AsyncMock(wraps=landing_evidence.validate_landing_evidence)
+    monkeypatch.setattr(landing_evidence, 'branch_work_landed', work_landed)
+    monkeypatch.setattr(landing_evidence, 'validate_landing_evidence', validate)
+    return work_landed, validate
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures('fresh_landing_tally')
+class TestProbeLandingAncestorArmDecidesByBranchWorkLanded:
+    """A live tip that IS an ancestor of main, decided by the non-decaying producer.
+
+    Task 4648 repoints the ancestor arm from ``validate_landing_evidence``'s
+    effect-present DISCOVERY policy to ``branch_work_landed``, the same
+    producer the patch-id arm uses.  Its degeneracy guard and the ``''``
+    citation opt-out still run first.  Which policy each landing-detection
+    site keeps is recorded in
+    ``docs/prds/landed-not-done-recovery.effect-present-caller-enumeration.md`` §7.
+    """
+
+    async def test_a_merged_landing_survives_same_path_churn(self, tmp_path: Path) -> None:
+        merge_sha, base = _merged_landing_then_same_path_churn(tmp_path / 'repo', '4648')
+
+        verdict = await _probe_repo(tmp_path / 'repo', '4648', metadata={'branch_base_sha': base})
+
+        assert verdict.outcome is GitAuthorityOutcome.found_on_main, verdict
+        assert verdict.arm is GitAuthorityArm.ancestor
+        assert verdict.merge_sha == merge_sha
+        assert verdict.merge_sha_fully_guarded is True
+        assert verdict.rescued_by_delivered_checks is False
+
+    async def test_a_reseeded_tip_matched_only_by_a_later_subject_is_unconfirmed(
+        self, tmp_path: Path,
+    ) -> None:
+        """esc-4648-5: a later main commit repeating the tip's subject is not its landing."""
+        repo = tmp_path / 'repo'
+        new_repo(repo)
+        base = landing_git(repo, 'rev-parse', 'main')
+        foreign = landing_commit(repo, 'chore: tidy the census', 'census.md')
+        landing_git(repo, 'branch', 'task/77', foreign)
+        landing_commit(repo, 'chore: tidy the census', 'census-next.md')
+
+        verdict = await _probe_repo(repo, '77', metadata={'branch_base_sha': base})
+
+        assert verdict.outcome is GitAuthorityOutcome.landed_unconfirmed, verdict
+        assert verdict.arm is GitAuthorityArm.ancestor
+        assert verdict.merge_sha is None
+
+    async def test_the_ancestor_arm_asks_branch_work_landed_not_the_effect_present_gate(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _merge_sha, base = _merged_landing_then_same_path_churn(tmp_path / 'repo', '4648')
+        metadata = {'branch_base_sha': base}
+        work_landed, validate = _spy_on_landing_producers(monkeypatch)
+
+        await _probe_repo(tmp_path / 'repo', '4648', metadata=metadata)
+
+        work_landed.assert_awaited_once()
+        assert work_landed.await_args is not None
+        assert work_landed.await_args.kwargs['pattern_template'] is None, (
+            "the project's git.commit_citation_pattern, None here, is forwarded as-is"
+        )
+        assert work_landed.await_args.kwargs['metadata'] == metadata
+        validate.assert_not_awaited()
+
+    async def test_the_citation_opt_out_still_answers_at_the_tip_without_the_producer(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _merge_sha, base = _merged_landing_then_same_path_churn(tmp_path / 'repo', '4648')
+        tip = landing_git(tmp_path / 'repo', 'rev-parse', 'task/4648')
+        work_landed, _validate = _spy_on_landing_producers(monkeypatch)
+
+        verdict = await _probe_repo(
+            tmp_path / 'repo', '4648', metadata={'branch_base_sha': base},
+            commit_citation_pattern='',
+        )
+
+        assert verdict.outcome is GitAuthorityOutcome.found_on_main, verdict
+        assert verdict.arm is GitAuthorityArm.ancestor
+        assert verdict.merge_sha == tip
+        assert verdict.citation_gate_skipped is True
+        work_landed.assert_not_awaited()
+
+    async def test_a_degenerate_ancestor_tip_is_no_signal(self, tmp_path: Path) -> None:
+        repo = tmp_path / 'repo'
+        new_repo(repo)
+        base = landing_git(repo, 'rev-parse', 'main')
+        landing_git(repo, 'branch', 'task/4648', base)
+        landing_commit(repo, 'chore: main moves on', 'later.txt')
+
+        verdict = await _probe_repo(repo, '4648', metadata={'branch_base_sha': base})
+
+        assert verdict.outcome is GitAuthorityOutcome.no_signal, verdict
+        assert verdict.merge_sha is None
+
+    async def test_a_raising_producer_degrades_to_probe_failed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _merge_sha, base = _merged_landing_then_same_path_churn(tmp_path / 'repo', '4648')
+        monkeypatch.setattr(
+            'orchestrator.merge_lane.landing_evidence.branch_work_landed',
+            AsyncMock(side_effect=RuntimeError('producer exploded')),
+        )
+
+        verdict = await _probe_repo(tmp_path / 'repo', '4648', metadata={'branch_base_sha': base})
+
+        assert verdict.outcome is GitAuthorityOutcome.probe_failed, verdict
+        assert verdict.merge_sha is None
+
+
+def _merged_landing_then_ref_deleted(root: Path, task_id: str) -> tuple[str, str]:
+    """``task/<task_id>`` merged ``--no-ff`` into main, then its ref deleted.
+
+    Only the ``Merge task/<task_id> into main`` marker is left to find.
+    Returns ``(merge_sha, branch_base_sha)``.
+    """
+    branch = f'task/{task_id}'
+    new_repo(root)
+    base = landing_git(root, 'rev-parse', 'main')
+    landing_git(root, 'checkout', '-b', branch)
+    _write_and_commit(root, f'feat({task_id}): add the module', {'work.py': _lines('feature', 40)})
+    landing_git(root, 'checkout', 'main')
+    landing_git(root, 'merge', '--no-ff', '-m', f'Merge {branch} into main', branch)
+    landing_git(root, 'branch', '-D', branch)
+    return landing_git(root, 'rev-parse', 'main'), base
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures('fresh_landing_tally')
+class TestProbeLandingMarkerArmKeepsTheCandidatePolicy:
+    async def test_a_deleted_ref_marker_is_checked_as_the_candidate(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The marker arm stays on ``validate_landing_evidence`` CANDIDATE (task 4648).
+
+        A deleted ref leaves no live tip for ``branch_work_landed`` to judge,
+        so the marker itself is the candidate the effect-present policy
+        checks, and the producer the live-ref arms use is never asked.  The
+        ruling is recorded in
+        ``docs/prds/landed-not-done-recovery.effect-present-caller-enumeration.md`` §7.
+        """
+        merge_sha, base = _merged_landing_then_ref_deleted(tmp_path / 'repo', '4648')
+        work_landed, validate = _spy_on_landing_producers(monkeypatch)
+
+        verdict = await _probe_repo(tmp_path / 'repo', '4648', metadata={'branch_base_sha': base})
+
+        assert verdict.outcome is GitAuthorityOutcome.found_on_main, verdict
+        assert verdict.arm is GitAuthorityArm.marker
+        validate.assert_awaited_once()
+        assert validate.await_args is not None
+        assert validate.await_args.kwargs['candidate_sha'] == merge_sha
+        work_landed.assert_not_awaited()
 
 
 class TestGitAuthorityVerdict:

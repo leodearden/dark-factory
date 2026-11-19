@@ -11337,11 +11337,17 @@ class GitOps:
         - **Merge commit** (2+ parents; task 2675 FIX 1′) — the old plain
           ``diff-tree`` touched-set is empty by git's own default
           behavior for merge commits, which used to make this primitive
-          return True *unconditionally* for every merge (the task-1175
-          "reverted merge" blind spot: a ``Merge task/1175 into main``
-          marker exists and the merge commit is an ancestor of main
-          forever, but a later commit on main removed the deliverable —
-          effect NOT present, yet the old code said True).  Instead this
+          return True *unconditionally* for every merge.  Task 1175's
+          ``Merge task/1175 into main`` marker was read that way, but it
+          was not a revert: its branch had an empty net diff, so nothing
+          was ever on main to remove, and the old code still said True.
+          This probe catches that shape through its empty-touched-set
+          fail-safe, the ``'empty_branch_merge'`` failure on
+          :class:`CommitEffectProbe`.
+          ``docs/prds/landed-not-done-recovery.md`` §"The revert
+          measurement" has the measurement, and
+          ``plans/found-on-main-provenance-integrity-prd.md`` calls the
+          event a re-derivation clobber.  Instead this
           diffs EVERY non-first parent's (each merged branch's) content
           against current main, requiring ALL of them to still be present
           (task 2675 amendment — octopus-merge safety, so a later revert
@@ -11645,7 +11651,7 @@ class GitOps:
         # .patch fixtures all hit it.  Worse, the loss was ASYMMETRIC — a
         # revert of exactly those lines went unseen, so a half-reverted
         # deliverable measured 1.0 survival and read as a clean landing.
-        # That is a false ACCEPT on the task-1175 revert class this check
+        # That is a false ACCEPT on the post-hoc revert class this check
         # exists to catch, the one direction it must never take.
         #
         # Everything before the first '@@' is header; after it, a leading
@@ -12109,11 +12115,17 @@ class GitOps:
         - **Merge commit** (2+ parents; task 2675 FIX 1′) — the old plain
           ``diff-tree`` touched-set is empty by git's own default
           behavior for merge commits, which used to make this primitive
-          return True *unconditionally* for every merge (the task-1175
-          "reverted merge" blind spot: a ``Merge task/1175 into main``
-          marker exists and the merge commit is an ancestor of main
-          forever, but a later commit on main removed the deliverable —
-          effect NOT present, yet the old code said True).  Instead this
+          return True *unconditionally* for every merge.  Task 1175's
+          ``Merge task/1175 into main`` marker was read that way, but it
+          was not a revert: its branch had an empty net diff, so nothing
+          was ever on main to remove, and the old code still said True.
+          This probe catches that shape through its empty-touched-set
+          fail-safe, the ``'empty_branch_merge'`` failure on
+          :class:`CommitEffectProbe`.
+          ``docs/prds/landed-not-done-recovery.md`` §"The revert
+          measurement" has the measurement, and
+          ``plans/found-on-main-provenance-integrity-prd.md`` calls the
+          event a re-derivation clobber.  Instead this
           diffs EVERY non-first parent's (each merged branch's) content
           against current main, requiring ALL of them to still be present
           (task 2675 amendment — octopus-merge safety, so a later revert

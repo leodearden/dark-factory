@@ -152,7 +152,9 @@ from orchestrator.merge_lane import enqueue_merge_request
 from orchestrator.merge_lane.landed_outbox import MergeProvenance
 from orchestrator.merge_lane.landing_evidence import (
     LandingEvidenceVerdict,
+    LandingReason,
     branch_is_degenerate,
+    branch_work_landed,
     file_unattributed_landing_escalation,
     found_on_main_note,
     is_valid_sha_40,
@@ -6855,12 +6857,11 @@ class Harness:
             # attribution is already established by recovery_for's
             # ground-truth report, so only the effect-present guard
             # remains. Previously this check was gated on ``on_main`` only,
-            # so a branch-deleted merge marker whose effect had been
-            # reverted at current main HEAD skipped it entirely and was
-            # stamped done unconditionally (the task-1175 clobber,
-            # reproduced inside this sweep). No escalation on reject here
-            # by design; the reject is recorded as a landing_evidence_rejected
-            # event before any revert (task 4496).
+            # so the marker sub-case skipped the guard and an empty-net-diff
+            # merge marker was stamped done: the task-1175 shape, which was
+            # a re-derivation clobber rather than a revert. No escalation on
+            # reject here by design; the reject is recorded as a
+            # landing_evidence_rejected event before any revert (task 4496).
             #
             # The live branch tip is diagnostic only — CANDIDATE mode never
             # reads it for the decision — but it must be captured before a
@@ -13851,32 +13852,35 @@ class Harness:
         consults LIVE GIT STATE rather than the durable LandedOutbox, so it
         also catches landings that never went through this orchestrator's
         merge queue: a sibling direct-merge, a prior orchestrator run, or a
-        squash/rebase/manual landing.  Installed as
+        rebase/manual landing (not a multi-commit squash; see the off-main-tip
+        arm below).  Installed as
         ``self.scheduler._already_landed_gate``.
 
         **Cheap pre-filter** (task 2313 review): ``resolve_branch_sha`` is
         resolved ONCE up front — a single ``git rev-parse --verify`` — so
         the common per-tick case (a branch that doesn't exist yet, or
-        doesn't exist any more) skips ``is_ancestor`` and
-        ``branch_content_in_main`` entirely instead of spawning subprocesses
-        that would only fail through to False.  When the branch is absent,
-        only the merge-marker search runs, since that's the one check that's
+        doesn't exist any more) skips ``is_ancestor`` and the landing
+        producer entirely instead of spawning subprocesses that would only
+        fail through to False.  When the branch is absent, only the
+        merge-marker search runs, since that's the one check that's
         meaningful without a live ref; ``find_merge_marker``'s own internal
         gate already returns None whenever the branch ref still exists, so
         calling it in the branch-exists case would always be a wasted
-        no-op.  The task-citation lookup is likewise deferred into the two
-        branches that actually consume it (ancestry and content-equivalence)
-        rather than hoisted, so the common not-landed path never pays for
-        it.
+        no-op.  The live-branch arms both judge that one resolved tip.
 
-        Ancestry-path guards mirror ``_reconcile_one_stranded``'s own guard
-        sequence so this gate can never flip a false positive: an open
-        escalation at ANY level is a deliberate handoff (never
-        second-guessed); a degenerate branch (tip == branch_base_sha)
-        carries zero task work, so ``is_ancestor`` returning True is a
-        trivial false "already on main" signal; and a missing citation
-        rejects the zero-commit-branch shape where no commit on main
-        actually cites this task.
+        An open escalation at ANY level is a deliberate handoff, never
+        second-guessed by a flip.  Past that veto, the ancestry path (live tip
+        an ancestor of main) hands the whole landing decision to
+        :func:`~orchestrator.merge_lane.landing_evidence.branch_work_landed`,
+        the non-decaying patch-id producer, on the tip resolved here.  Its
+        guards run in a normative order, each refusing a shape the next would
+        wrongly accept: a degenerate branch (tip == branch_base_sha) carries
+        zero task work, so ``is_ancestor`` returning True is a trivial false
+        "already on main" signal; a no-op landing merged an empty net diff;
+        containment asks whether the branch's own commits are patch-id
+        present on main; and attribution anchors the stamp on a commit citing
+        the task, else on the tip's patch-id twin.  Every reject on this path
+        is recorded, never escalated, and the task dispatches.
 
         **Any-level escalation veto** (task 3534, PRD
         ``plans/task-escalation-state-graph-prd.md`` eta-0 / spec
@@ -13939,24 +13943,27 @@ class Harness:
         incarnation (branch deleted + re-created under the same task id)
         and vetoes the flip.
 
-        The content-equivalence fallback catches landings that are NOT
-        ancestors of main (squashed/rebased/manually-applied) by comparing
-        the branch's actual changed files against main
-        (:meth:`~orchestrator.git_ops.GitOps.branch_content_in_main`).  It
-        delegates to :func:`~orchestrator.merge_lane.landing_evidence.validate_landing_evidence`
-        (DISCOVERY mode, task 2678) to discover and attribute the citation
-        commit and anchors on it; a content-equivalent landing that carries
-        no task-citing commit (or whose citation's effect is no longer
-        present at main HEAD) is no longer silently anchored on main HEAD —
-        it escalates instead via ``_file_unattributed_landing_escalation``.
-        **Accepted risk**: this path can false-positive
-        on a branch whose completed-so-far files coincidentally match
-        main's independent content while the rest of the task's scope is
-        still unfinished — the primitive only sees the branch's own diff
-        footprint, not the task's intended full scope.  This is a
-        deliberate tradeoff to catch genuine squash/rebase/manual landings
-        (see :meth:`~orchestrator.git_ops.GitOps.branch_content_in_main`'s
-        docstring for the accepted-risk rationale).
+        The off-main-tip arm catches landings whose live tip is NOT an
+        ancestor of main (rebased, cherry-picked, or a single-commit squash).
+        It does NOT catch a squash of a multi-commit branch: the squash
+        commit's one patch-id matches none of the branch's commits, so the
+        producer answers ``not_landed`` and the task dispatches.  That residual
+        is accepted, not overlooked (enumeration doc §7).  The same producer
+        decides it, by patch-id containment of the branch's own
+        non-merge commits plus attribution (a commit citing the task, else
+        the tip's patch-id twin on main), and the stamp anchors on that
+        evidence, never on main HEAD.  Why later commits on main cannot undo
+        that answer is the producer's non-decay invariant, stated once in
+        :func:`~orchestrator.merge_lane.landing_evidence.branch_work_landed`.
+        Its ``no_attribution`` reject means the work IS on main but nothing
+        attributes it to this task, so it escalates via
+        ``_file_unattributed_landing_escalation`` rather than stamp
+        unattributed provenance; every other reject is recorded at
+        :attr:`~orchestrator.landing_reject_emission.LandingRejectSite.already_landed_gate_off_main_tip`
+        and the task dispatches.  **Accepted risk**: containment sees only the
+        commits the branch carries, not the task's intended full scope, so a
+        branch whose completed-so-far commits landed while the rest of the
+        task is unfinished reads as landed.
 
         **done_evidence_stale short-circuit** (task 2677): if any of the
         three flip attempts below hits ``_mark_in_progress_done`` and that
@@ -13997,8 +14004,8 @@ class Harness:
         rows the veto already fetched.
 
         **Delivered-capability guard** (task 3057, seam 2 of eleven): all
-        three evidence arms above — git ancestry, merge marker, content
-        equivalence — prove only that SOMETHING of this branch reached main.
+        three evidence arms above — git ancestry, merge marker, off-main tip
+        — prove only that SOMETHING of this branch reached main.
         None of them proves that THIS task's declared capability
         (``metadata.delivered_checks``) survived to it, which is exactly the
         hollow-done shape ``check_found_on_main_spurious_rate.py`` audits. So
@@ -14021,9 +14028,8 @@ class Harness:
 
         The guard sits DOWNSTREAM of every existing veto (the task-2677
         ``should_skip`` memo, the durable ``arbitration_pending`` hold, the
-        any-level escalation pin, the degenerate-branch check, and each
-        arm's ``validate_landing_evidence`` verdict), so a landing that is
-        being refused anyway never pays for check work.
+        any-level escalation pin, and each arm's landing verdict), so a
+        landing that is being refused anyway never pays for check work.
 
         **Per-tick inputs** (task 4900): ``task`` is the scheduler's candidate
         dict, so the gate re-reads it via ``scheduler.get_task`` only when it
@@ -14058,10 +14064,9 @@ class Harness:
         # (task_id, reopen_at) rejected as done_evidence_stale by
         # _mark_in_progress_done below — the sink's in-memory memo makes
         # that terminal-for-this-tick. Short-circuit BEFORE the git-ancestry
-        # work (is_ancestor / find_task_citation_commit /
-        # commit_effect_present_in_main are each a subprocess) rather than
-        # re-deriving the same contested evidence and re-attempting the
-        # already-doomed write every dispatch tick.
+        # work (is_ancestor and the landing producers each run subprocesses)
+        # rather than re-deriving the same contested evidence and
+        # re-attempting the already-doomed write every dispatch tick.
         if self._provenance_conflict_sink.should_skip(
             task_id, reopen_at=metadata.get('reopen_at'),
         ):
@@ -14089,20 +14094,15 @@ class Harness:
         if branch_tip_sha is not None and await self.git_ops.is_ancestor(
             branch, self.git_ops.config.main_branch,
         ):
-            if await self._branch_is_degenerate(branch, metadata):
-                return False
-            # Delegates FIX 2 citation-lineage + FIX 1' effect-present to the
-            # shared helper (task 2678, INV-5) — see
-            # orchestrator.merge_lane.landing_evidence's module docstring for the full
-            # DISCOVERY-mode contract (citation discovery, both-direction
-            # lineage guard, branch-tip-or-citation effect anchor).
-            verdict = await validate_landing_evidence(
+            # The whole decision belongs to the non-decaying patch-id producer
+            # (task 4648), judged on the SAME tip resolved above.
+            verdict = await branch_work_landed(
                 self.git_ops, task_id, branch,
                 branch_tip_sha=branch_tip_sha,
+                metadata=metadata,
                 pattern_template=self.git_ops.config.commit_citation_pattern,
-                delivered_checks=_declared_delivered_checks(metadata),
-                checks_enabled=self.config.delivered_checks.enabled,
-                branch_base_sha=metadata.get('branch_base_sha'),
+                escalation_queue=self._escalation_queue,
+                recovery_emission=self.config.recovery_emission,
             )
             # 'pending' is the structural status of every gate candidate.
             self._landing_rejects.observe(
@@ -14114,8 +14114,10 @@ class Harness:
                 # No escalation by design (task 4496), but not silent: the
                 # reject is a transition-gated landing_evidence_rejected event
                 # (orchestrator/src/orchestrator/landing_reject_emission.py).
-                # False DISPATCHES the task, so a false effect_absent here is
-                # an agent redoing landed work — the event makes that countable.
+                # False DISPATCHES the task, so a false negative here is an
+                # agent redoing landed work — the event makes that countable.
+                # git_error is recorded under its own reason, never as
+                # not_landed, and the producer's storm escape escalates it.
                 return False
             if await self._delivered_checks_block(
                 task_id, metadata, site='dispatch-gate-already-on-main',
@@ -14148,8 +14150,9 @@ class Harness:
                     return False
                 # CANDIDATE mode (task 2678): the marker's subject match
                 # already attributes this landing to task_id — only the
-                # FIX 1' effect-present guard remains, closing the task-1175
-                # clobber (a reverted merge previously stamped done anyway).
+                # FIX 1' effect-present guard remains.  Before it, an
+                # empty-net-diff marker (the task-1175 shape) was stamped
+                # done anyway.
                 verdict = await validate_landing_evidence(
                     self.git_ops, task_id, branch,
                     branch_tip_sha=None,
@@ -14180,46 +14183,50 @@ class Harness:
                 return True
             return False
 
-        if await self.git_ops.branch_content_in_main(branch):
-            # DISCOVERY mode (task 2678): delegates citation discovery + FIX 2
-            # lineage + FIX 1' effect-present to the shared helper, exactly
-            # like the ancestry path above. The prior silent
-            # ``citation or get_main_sha()`` fallback fabricated an anchor
-            # from main HEAD whenever no citation was found; that is now a
-            # rejected verdict ('no_citation') that escalates instead of
-            # stamping done.
-            verdict = await validate_landing_evidence(
-                self.git_ops, task_id, branch,
-                branch_tip_sha=branch_tip_sha,
-                pattern_template=self.git_ops.config.commit_citation_pattern,
-                delivered_checks=_declared_delivered_checks(metadata),
-                checks_enabled=self.config.delivered_checks.enabled,
-                branch_base_sha=metadata.get('branch_base_sha'),
-            )
-            if not verdict.accepted:
-                self._file_unattributed_landing_escalation(task_id, branch, verdict)
-                return False
-            if await self._delivered_checks_block(
-                task_id, metadata, site='dispatch-gate-content-equivalent',
-            ) is not None:
-                return False
-            held = self._escalation_hold_before_flip(
-                task_id, metadata, recheck=recheck_before_flip,
-            )
-            if held is not None:
-                return held
-            await self._mark_in_progress_done(
-                task_id, verdict.evidence_sha,
-                found_on_main_note(
-                    'reconcile: pre-dispatch check found content-equivalent '
-                    'landing on main (squash/rebase/manual)',
-                    verdict,
-                ),
-                'dispatch-gate-content-equivalent',
-            )
-            return True
-
-        return False
+        # A live tip that is NOT an ancestor of main: a rebase or manual
+        # landing, or no landing at all (a multi-commit squash reads as
+        # none).  The same producer decides, on the same tip (task 4648).
+        verdict = await branch_work_landed(
+            self.git_ops, task_id, branch,
+            branch_tip_sha=branch_tip_sha,
+            metadata=metadata,
+            pattern_template=self.git_ops.config.commit_citation_pattern,
+            escalation_queue=self._escalation_queue,
+            recovery_emission=self.config.recovery_emission,
+        )
+        if verdict.reason == LandingReason.no_attribution:
+            # The work IS on main but nothing attributes it to this task; it
+            # must not be stamped unattributed, so a human decides.
+            self._file_unattributed_landing_escalation(task_id, branch, verdict)
+            return False
+        self._landing_rejects.observe(
+            verdict, event_store=self.event_store,
+            site=LandingRejectSite.already_landed_gate_off_main_tip,
+            task_id=task_id, task_status='pending',
+        )
+        if not verdict.accepted:
+            # The recorded negative (git_error recorded as itself, and
+            # escalated by the producer's storm escape): the task dispatches.
+            return False
+        if await self._delivered_checks_block(
+            task_id, metadata, site='dispatch-gate-content-equivalent',
+        ) is not None:
+            return False
+        held = self._escalation_hold_before_flip(
+            task_id, metadata, recheck=recheck_before_flip,
+        )
+        if held is not None:
+            return held
+        await self._mark_in_progress_done(
+            task_id, verdict.evidence_sha,
+            found_on_main_note(
+                'reconcile: pre-dispatch check found content-equivalent '
+                'landing on main (squash/rebase/manual)',
+                verdict,
+            ),
+            'dispatch-gate-content-equivalent',
+        )
+        return True
 
     def _read_pending_escalation_rows(
         self, queue: EscalationQueue, task_id: str,
@@ -14421,12 +14428,14 @@ class Harness:
         """Best-effort, dedup-guarded L1 escalation for unattributable
         landing evidence (task 2678, INV-5).
 
-        Filed by the already-landed re-derivation sites that found a
-        positive landing signal (a merge marker, or branch content
-        equivalent to main) but whose :func:`validate_landing_evidence`
-        verdict came back rejected — an unattributed or effect-absent
-        landing that must not be silently stamped done (the task-1175
-        clobber this task closes). Escalate-instead-of-stamp is
+        Filed by the dispatch gate's two arms that found a positive landing
+        signal but no attributable one: the marker arm, whose
+        :func:`validate_landing_evidence` verdict came back rejected (an
+        unattributed or effect-absent landing), and the off-main-tip arm,
+        whose :func:`branch_work_landed` verdict is ``no_attribution`` (the
+        branch's commits are patch-id present on main, but nothing attributes
+        them to the task).  Neither may be silently stamped done (the
+        task-1175 clobber task 2678 closed). Escalate-instead-of-stamp is
         deliberately non-status-blocking: the task row is simply left
         pending and re-evaluated next tick. While this L1 is open the gate's
         any-level veto stops it re-deriving the evidence and re-filing, but

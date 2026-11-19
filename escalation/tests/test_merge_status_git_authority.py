@@ -24,6 +24,7 @@ from unittest.mock import AsyncMock
 from unittest.mock import call as mock_call
 
 import pytest
+from _landing_verdicts import stub_landing_producer
 from _merge_tool_calls import call_merge_request, call_merge_status
 from _rebased_landing_git import (
     add_unlanded_branch,
@@ -77,11 +78,13 @@ def _stub_git_ops(**overrides) -> types.SimpleNamespace:
         # stub.find_merge_marker is an AsyncMock(return_value=None) by default
 
     ``find_task_citation_commit`` / ``commit_effect_present_in_main`` are the
-    two sub-methods ``validate_landing_evidence`` calls (task 3103's citation
-    gate).  They MUST be present by default: without them the SimpleNamespace
-    raises AttributeError inside the Tier-3.5 fire-safe wrapper, which
-    swallows it and degrades every ancestor/marker-arm test to a misleading
-    ``unknown`` that looks like a passing guard.  The defaults are the
+    two sub-methods ``validate_landing_evidence`` calls, which only the
+    marker arm still reaches (task 4648).  They MUST be present by default:
+    without them the SimpleNamespace raises AttributeError inside the
+    Tier-3.5 fire-safe wrapper, which swallows it and degrades every
+    marker-arm test to a misleading ``unknown`` that looks like a passing
+    guard.  The live-ref arms ask ``branch_work_landed``, which a stub test
+    replaces with :func:`stub_landing_producer`.  The defaults are the
     conservative pair — no citation found (so the gate rejects unless a test
     opts in) and effect present (so the FIX 1' guard is not what a test
     accidentally trips over).
@@ -273,14 +276,16 @@ class TestMergeStatusGitAuthority:
 
     # ── step-1: is_ancestor live-branch path ─────────────────────────────────
 
-    async def test_live_branch_on_main_returns_done(self, tmp_path: Path) -> None:
+    async def test_live_branch_on_main_returns_done(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         """When tip is not None and is_ancestor(tip, 'main') → state='done'/found_on_main.
 
         Verifies:
         - state == 'done', kind == 'found_on_main', generation == 1
-        - merge_sha == the citation commit discovered on main (task 3103; this
-          assertion used to pin ``merge_sha == tip``, the documented
-          ``found_on_main_response`` wart that the citation gate retires)
+        - merge_sha == the evidence ``branch_work_landed`` anchors on (task
+          4648; task 3103 retired the ``merge_sha == tip`` wart this
+          assertion used to pin)
         - the (tip, 'main') ancestry call is made
         - find_merge_marker was NOT called (cheaper-common-path ordering: skip
           the find_merge_marker scan when the branch ref is still live)
@@ -288,6 +293,7 @@ class TestMergeStatusGitAuthority:
         tip = 'a' * 40
         main_sha = 'm' * 40  # distinct from tip so the tip != main_tip guard passes
         citation = 'c' * 40
+        stub_landing_producer(monkeypatch, 'landed', evidence_sha=citation)
         rsb = AsyncMock(side_effect=lambda b: tip if b == 'task/123' else main_sha)
         ia = AsyncMock(return_value=True)
         fmm = AsyncMock(return_value=None)
@@ -295,8 +301,6 @@ class TestMergeStatusGitAuthority:
             resolve_branch_sha=rsb,
             is_ancestor=ia,
             find_merge_marker=fmm,
-            find_task_citation_commit=AsyncMock(return_value=citation),
-            commit_effect_present_in_main=AsyncMock(return_value=True),
         )
         stub_harness = _stub_harness(stub_git)
         esc_queue = EscalationQueue(tmp_path / 'esc')
@@ -313,10 +317,7 @@ class TestMergeStatusGitAuthority:
         )
         assert result.get('generation') == 1, f'Expected generation=1, got: {result}'
 
-        # Verify routing: the (tip, 'main') ancestry call is made.  Not
-        # assert_called_ONCE_with: validate_landing_evidence legitimately makes
-        # a second is_ancestor(citation, branch) call to classify the
-        # effect-present anchor.
+        # Verify routing: the (tip, 'main') ancestry call is made.
         assert (tip, 'main') in [c.args for c in ia.call_args_list], (
             f'Expected an is_ancestor(tip, main) call, got: {ia.call_args_list}'
         )
@@ -673,8 +674,6 @@ class TestMergeStatusGitAuthority:
         tid: str,
         *,
         tip: str,
-        citation: str | None = None,
-        effect_present: bool = True,
         metadata: dict[str, Any] | None = None,
         faulty_read_task: AsyncMock | None = None,
         commit_citation_pattern: str | None = None,
@@ -682,6 +681,8 @@ class TestMergeStatusGitAuthority:
         """Build a server whose branch is a NON-degenerate ancestor of main.
 
         Returns ``(server, stub_git)`` so callers can assert on the stubs.
+        Past its own guards the arm asks ``branch_work_landed``, which a
+        caller stubs with :func:`stub_landing_producer` (task 4648).
         """
         main_sha = 'm' * 40
         stub_git = _stub_git_ops(
@@ -689,8 +690,6 @@ class TestMergeStatusGitAuthority:
                 side_effect=lambda b: tip if b == f'task/{tid}' else main_sha
             ),
             is_ancestor=AsyncMock(return_value=True),
-            find_task_citation_commit=AsyncMock(return_value=citation),
-            commit_effect_present_in_main=AsyncMock(return_value=effect_present),
         )
         stub_harness = _stub_harness(
             stub_git, metadata=metadata, faulty_read_task=faulty_read_task,
@@ -706,19 +705,23 @@ class TestMergeStatusGitAuthority:
         return server, stub_git
 
     async def test_reseeded_ancestor_branch_without_citation_returns_unattributable(
-        self, tmp_path: Path
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """A re-seeded branch with no citing commit on main must be unattributable.
+        """A re-seeded branch with nothing attributing it must be unattributable.
 
         The 11-of-64 class the degeneracy predicate MISSES: a warm lane
         re-seeded the branch ref to a NEWER main commit after creation, so
         ``tip != branch_base_sha`` and the branch reads as non-degenerate —
-        yet it still carries zero of the task's own work.  Only the citation
-        gate catches this, which is why neither guard ships alone.
+        yet it still carries zero of the task's own work.  Only the
+        producer's attribution tier catches this (``no_attribution``), which
+        is why neither guard ships alone.  The producer is stubbed here; that
+        its patch-id-only attribution really refuses the shape is pinned in
+        real git by ``test_git_authority.py::TestProbeLandingAncestorArmDecidesByBranchWorkLanded``
+        (esc-4648-5).
         """
-        tip = 'a' * 40
-        server, stub_git = self._ancestor_arm_server(
-            tmp_path, '3031', tip=tip, citation=None,
+        producer = stub_landing_producer(monkeypatch, 'no_attribution')
+        server, _ = self._ancestor_arm_server(
+            tmp_path, '3031', tip='a' * 40,
             metadata={'branch_base_sha': 'b' * 40},   # != tip → non-degenerate
         )
 
@@ -728,23 +731,23 @@ class TestMergeStatusGitAuthority:
             f'Uncited ancestor branch must be no_record, got: {result}'
         )
         assert result.get('reason') == MergeReason.landing_unattributable, f'got: {result}'
-        stub_git.find_task_citation_commit.assert_awaited_once()
+        producer.assert_awaited_once()
 
     async def test_cited_ancestor_branch_returns_done_with_evidence_sha(
-        self, tmp_path: Path
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """TRUE POSITIVE: a cited, effect-present landing still resolves done.
+        """TRUE POSITIVE: an attributed landing resolves done.
 
-        merge_sha must be the CITATION commit found on main, not the branch
-        tip — this pins the fix to the documented ``found_on_main_response``
-        wart (for a --no-ff merge the branch tip is a different commit from
-        the one on main).
+        merge_sha must be the commit on main the producer anchors on, not the
+        branch tip — this pins the fix to the documented
+        ``found_on_main_response`` wart (for a --no-ff merge the branch tip is
+        a different commit from the one on main).
         """
         tip = 'a' * 40
         citation = 'c' * 40
+        stub_landing_producer(monkeypatch, 'landed', evidence_sha=citation)
         server, _ = self._ancestor_arm_server(
-            tmp_path, '900', tip=tip, citation=citation, effect_present=True,
-            metadata={'branch_base_sha': 'b' * 40},
+            tmp_path, '900', tip=tip, metadata={'branch_base_sha': 'b' * 40},
         )
 
         result = await call_merge_status(server, task_id='900')
@@ -756,30 +759,38 @@ class TestMergeStatusGitAuthority:
             f'not the branch tip ({tip!r}); got: {result.get("merge_sha")!r}'
         )
 
-    async def test_cited_ancestor_branch_effect_absent_returns_unattributable(
-        self, tmp_path: Path
+    async def test_cited_ancestor_branch_effect_absent_still_returns_done(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """FIX 1' (task-1175 shape): a reverted landing must not read as done."""
-        server, _ = self._ancestor_arm_server(
-            tmp_path, '901', tip='a' * 40, citation='c' * 40, effect_present=False,
-            metadata={'branch_base_sha': 'b' * 40},
+        """The ancestor arm no longer reads effect survival (task 4648).
+
+        Main's later edits to the landed paths cannot unland it: that is
+        ``docs/prds/landed-not-done-recovery.md`` D1's non-decay contract,
+        which ``branch_work_landed`` keeps.  The effect-present probe is
+        wired to answer "absent" and must never be asked; only the
+        deleted-branch marker arm still asks it
+        (``test_marker_effect_absent_returns_unattributable``).  The real-git
+        pin is ``test_git_authority.py``'s
+        ``TestProbeLandingAncestorArmDecidesByBranchWorkLanded``.
+        """
+        stub_landing_producer(monkeypatch, 'landed', evidence_sha='c' * 40)
+        server, stub_git = self._ancestor_arm_server(
+            tmp_path, '901', tip='a' * 40, metadata={'branch_base_sha': 'b' * 40},
         )
+        stub_git.commit_effect_present_in_main = AsyncMock(return_value=False)
 
         result = await call_merge_status(server, task_id='901')
 
-        assert result.get('state') == 'no_record', (
-            f'A citation whose effect is absent at main HEAD must be no_record, '
-            f'got: {result}'
-        )
-        assert result.get('reason') == MergeReason.landing_unattributable, f'got: {result}'
+        assert result.get('state') == 'done', f'Expected done, got: {result}'
+        assert result.get('merge_sha') == 'c' * 40, f'got: {result}'
+        stub_git.commit_effect_present_in_main.assert_not_awaited()
 
     async def test_absent_branch_base_sha_without_citation_returns_unattributable(
-        self, tmp_path: Path
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Metadata {} fails OPEN out of degeneracy — the citation gate decides."""
-        server, _ = self._ancestor_arm_server(
-            tmp_path, '902', tip='a' * 40, citation=None, metadata={},
-        )
+        """Metadata {} fails OPEN out of degeneracy — the producer decides."""
+        producer = stub_landing_producer(monkeypatch, 'no_attribution')
+        server, _ = self._ancestor_arm_server(tmp_path, '902', tip='a' * 40, metadata={})
 
         result = await call_merge_status(server, task_id='902')
 
@@ -787,9 +798,11 @@ class TestMergeStatusGitAuthority:
             f'No branch_base_sha and no citation must be no_record, got: {result}'
         )
         assert result.get('reason') == MergeReason.landing_unattributable, f'got: {result}'
+        assert producer.await_args is not None
+        assert producer.await_args.kwargs['metadata'] == {}
 
     async def test_absent_branch_base_sha_with_citation_returns_done(
-        self, tmp_path: Path
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Pre-#1226 backward compat: no base sha, but a real citation → done.
 
@@ -798,10 +811,8 @@ class TestMergeStatusGitAuthority:
         is positively attributable on main.
         """
         citation = 'c' * 40
-        server, _ = self._ancestor_arm_server(
-            tmp_path, '903', tip='a' * 40, citation=citation, effect_present=True,
-            metadata={},
-        )
+        stub_landing_producer(monkeypatch, 'landed', evidence_sha=citation)
+        server, _ = self._ancestor_arm_server(tmp_path, '903', tip='a' * 40, metadata={})
 
         result = await call_merge_status(server, task_id='903')
 
@@ -811,18 +822,20 @@ class TestMergeStatusGitAuthority:
         )
 
     async def test_citation_pattern_disabled_still_returns_done(
-        self, tmp_path: Path
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """commit_citation_pattern='' is the documented per-project opt-out.
 
         find_task_citation_commit honours '' by returning None for
-        everything, so running the gate would reject unconditionally and turn
+        everything, and an ancestor tip has no patch-id twin to fall back on,
+        so asking the producer would find every landing unattributed and turn
         Tier 3.5 into dead code for projects without citation conventions.
-        The gate is skipped entirely; the degeneracy guard still applies.
+        The producer is skipped entirely; the degeneracy guard still applies.
         """
         tip = 'a' * 40
+        producer = stub_landing_producer(monkeypatch, 'no_attribution')
         server, stub_git = self._ancestor_arm_server(
-            tmp_path, '904', tip=tip, citation=None,
+            tmp_path, '904', tip=tip,
             metadata={'branch_base_sha': 'b' * 40},
             commit_citation_pattern='',
         )
@@ -837,22 +850,24 @@ class TestMergeStatusGitAuthority:
             f'disabled, got: {result.get("merge_sha")!r}'
         )
         stub_git.find_task_citation_commit.assert_not_called()
+        producer.assert_not_awaited()
 
     async def test_citation_pattern_none_uses_default(
-        self, tmp_path: Path
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """None means "use the built-in default" and is NOT the opt-out."""
-        server, stub_git = self._ancestor_arm_server(
-            tmp_path, '905', tip='a' * 40, citation=None,
+        producer = stub_landing_producer(monkeypatch, 'no_attribution')
+        server, _ = self._ancestor_arm_server(
+            tmp_path, '905', tip='a' * 40,
             metadata={'branch_base_sha': 'b' * 40},
             commit_citation_pattern=None,
         )
 
         await call_merge_status(server, task_id='905')
 
-        stub_git.find_task_citation_commit.assert_awaited_once_with(
-            '905', pattern_template=None,
-        )
+        producer.assert_awaited_once()
+        assert producer.await_args is not None
+        assert producer.await_args.kwargs['pattern_template'] is None
 
     @pytest.mark.parametrize(
         'faulty_read_task',
@@ -860,14 +875,18 @@ class TestMergeStatusGitAuthority:
         ids=['reports_failure', 'raises'],
     )
     @pytest.mark.parametrize(
-        ('citation', 'expected_state', 'expected_reason'),
-        [('c' * 40, 'done', None), (None, 'no_record', MergeReason.landing_unattributable)],
+        ('landing', 'expected_state', 'expected_reason'),
+        [
+            ('landed', 'done', None),
+            ('no_attribution', 'no_record', MergeReason.landing_unattributable),
+        ],
         ids=['cited', 'uncited'],
     )
     async def test_scheduler_fault_still_applies_citation_gate(
         self,
         tmp_path: Path,
-        citation: str | None,
+        monkeypatch: pytest.MonkeyPatch,
+        landing: str,
         expected_state: str,
         expected_reason: MergeReason | None,
         faulty_read_task: Callable[[], AsyncMock],
@@ -876,11 +895,13 @@ class TestMergeStatusGitAuthority:
 
         The metadata lookup's own try/except is nested inside the Tier-3.5
         fire-safe wrapper precisely so a failing read_task cannot swallow the
-        citation gate along with the degeneracy check.
+        producer's attribution tier along with the degeneracy check.
         """
+        producer = stub_landing_producer(
+            monkeypatch, landing, evidence_sha='c' * 40 if landing == 'landed' else None,
+        )
         server, _ = self._ancestor_arm_server(
-            tmp_path, '906', tip='a' * 40, citation=citation, effect_present=True,
-            faulty_read_task=faulty_read_task(),
+            tmp_path, '906', tip='a' * 40, faulty_read_task=faulty_read_task(),
         )
 
         result = await call_merge_status(server, task_id='906')
@@ -890,6 +911,8 @@ class TestMergeStatusGitAuthority:
             f'Expected {expected_state} with a failing scheduler, got: {result}'
         )
         assert result.get('reason') == expected_reason, f'got: {result}'
+        assert producer.await_args is not None
+        assert producer.await_args.kwargs['metadata'] == {}
 
     # ── task 3103: marker-arm veto + CANDIDATE-mode landing evidence ─────────
 
@@ -1013,89 +1036,54 @@ class TestMergeStatusGitAuthority:
         )
         assert result.get('reason') == MergeReason.landing_unattributable, f'got: {result}'
 
-    # ── task 4498: delivered_checks wiring at both git-authority arms ────────
+    # ── task 4498: delivered_checks wiring at the marker arm ─────────────────
     #
     # ``validate_landing_evidence``'s ``delivered_checks`` parameter is
     # THREE-STATE and the states are not interchangeable: ``None`` is the
     # documented 'unwired' sentinel (recorded as
     # ``probe['delivered_checks_state']``), while ``[]`` means "wired, and
-    # this task declares no checks".  That function's own docstring names
-    # these two arms as task 4498's, and task 4500 as the capstone that flips
-    # the parameter to required + keyword-only once all seven sites are wired,
-    # warning: "If ``delivered_checks_state == 'unwired'`` is still appearing
-    # in escalations after 4500 has landed, that is the bug: one of the seven
-    # sites regressed to the default."  Each arm is pinned INDEPENDENTLY —
-    # they are separate call sites and either can regress alone.
+    # this task declares no checks".  Task 4500 is the capstone that flips
+    # the parameter to required + keyword-only, and an 'unwired' state seen
+    # after it lands means a site regressed to the default.  Since task 4648
+    # the marker arm is this module's only ``validate_landing_evidence``
+    # site: the ancestor arm decides by ``branch_work_landed``, which takes no
+    # delivered checks, and the two ancestor tests below pin that it makes no
+    # validator call under the same two metadata shapes.
 
-    async def test_ancestor_arm_forwards_declared_delivered_checks(
+    async def test_ancestor_arm_with_declared_checks_makes_no_validator_call(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """DISCOVERY arm: a task's declared checks reach the validator."""
+        """Declared checks and the recorded base (task 7836) reach the producer in its metadata."""
         calls = _record_validate_landing_evidence(monkeypatch)
+        producer = stub_landing_producer(monkeypatch, 'landed', evidence_sha='c' * 40)
         declared = [{'kind': 'grep', 'pattern': 'def foo', 'expect': 'present'}]
+        metadata = {'branch_base_sha': 'b' * 40, 'delivered_checks': declared}
         server, _ = self._ancestor_arm_server(
-            tmp_path, '4498', tip='a' * 40, citation='c' * 40,
-            metadata={'branch_base_sha': 'b' * 40, 'delivered_checks': declared},
+            tmp_path, '4498', tip='a' * 40, metadata=metadata,
         )
 
         await call_merge_status(server, task_id='4498')
 
-        assert len(calls) == 1, (
-            f'Expected exactly one validate_landing_evidence call, got: {calls}'
-        )
-        assert calls[0].kwargs['delivered_checks'] == declared, (
-            f"Ancestor arm must forward the task's declared delivered_checks, "
-            f'got: {calls[0].kwargs.get("delivered_checks")!r}'
-        )
+        assert calls == [], f'The ancestor arm must not call the validator, got: {calls}'
+        assert producer.await_args is not None
+        assert producer.await_args.kwargs['metadata'] == metadata
 
-    async def test_ancestor_arm_forwards_the_recorded_branch_base(
+    async def test_ancestor_arm_with_unavailable_metadata_makes_no_validator_call(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """DISCOVERY arm: the recorded base reaches the differential (task 7836)."""
+        """An unavailable metadata fetch fails open to ``{}`` for the producer."""
         calls = _record_validate_landing_evidence(monkeypatch)
-        declared = [{'kind': 'grep', 'pattern': 'def foo', 'expect': 'present'}]
+        producer = stub_landing_producer(monkeypatch, 'landed', evidence_sha='c' * 40)
         server, _ = self._ancestor_arm_server(
-            tmp_path, '7836', tip='a' * 40, citation='c' * 40,
-            metadata={'branch_base_sha': 'b' * 40, 'delivered_checks': declared},
-        )
-
-        await call_merge_status(server, task_id='7836')
-
-        assert len(calls) == 1, (
-            f'Expected exactly one validate_landing_evidence call, got: {calls}'
-        )
-        assert calls[0].kwargs['branch_base_sha'] == 'b' * 40
-
-    async def test_ancestor_arm_forwards_empty_list_never_none(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """DISCOVERY arm: an unavailable metadata fetch still reads as WIRED.
-
-        The load-bearing assertion.  With no ``.scheduler`` on the harness the
-        metadata fetch fails open to ``{}``, so there is no ``delivered_checks``
-        key to forward — but the site IS wired, and must therefore pass ``[]``
-        rather than the ``None`` that would make it report
-        ``delivered_checks_state == 'unwired'`` to task 4500.
-        """
-        calls = _record_validate_landing_evidence(monkeypatch)
-        server, _ = self._ancestor_arm_server(
-            tmp_path, '4499', tip='a' * 40, citation='c' * 40,
+            tmp_path, '4499', tip='a' * 40,
             metadata=None,   # no .scheduler at all → metadata fetch yields {}
         )
 
         await call_merge_status(server, task_id='4499')
 
-        assert len(calls) == 1, (
-            f'Expected exactly one validate_landing_evidence call, got: {calls}'
-        )
-        forwarded = calls[0].kwargs['delivered_checks']
-        assert forwarded == [], (
-            f'Ancestor arm must forward [], got: {forwarded!r}'
-        )
-        assert forwarded is not None, (
-            'None is the documented UNWIRED sentinel — a wired site must never '
-            'send it, or task 4500 loses the signal it acts on'
-        )
+        assert calls == [], f'The ancestor arm must not call the validator, got: {calls}'
+        assert producer.await_args is not None
+        assert producer.await_args.kwargs['metadata'] == {}
 
     async def test_marker_arm_forwards_declared_delivered_checks(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1123,8 +1111,11 @@ class TestMergeStatusGitAuthority:
     ) -> None:
         """CANDIDATE arm: an unavailable metadata fetch still reads as WIRED.
 
-        Same load-bearing assertion as the ancestor arm's, pinned separately
-        because these are two independent call sites.
+        The load-bearing assertion.  With no ``.scheduler`` on the harness the
+        metadata fetch fails open to ``{}``, so there is no ``delivered_checks``
+        key to forward — but the site IS wired, and must therefore pass ``[]``
+        rather than the ``None`` that would make it report
+        ``delivered_checks_state == 'unwired'`` to task 4500.
         """
         calls = _record_validate_landing_evidence(monkeypatch)
         server, _ = self._marker_arm_server(
@@ -1308,8 +1299,10 @@ class TestMergeStatusGitAuthorityIntegration:
         A warm lane reset the branch ref FORWARD to a newer main commit after
         creation, so ``tip != branch_base_sha`` and the branch reads as
         non-degenerate — yet it still carries zero of the task's own work and
-        no commit on main cites it.  Only the citation gate catches this
-        class, which is why both guards ship together.
+        no commit on main cites it.  ``branch_work_landed`` finds the tip
+        contained (it is an ancestor of main) but nothing attributes it to
+        the task, so it answers ``no_attribution``.  Only that attribution
+        tier catches this class, which is why both guards ship together.
         """
         tid = '3031'
         branch = f'task/{tid}'
@@ -1388,11 +1381,11 @@ class TestMergeStatusGitAuthorityIntegration:
         merge the branch tip is NOT a commit on main's first-parent chain, so
         provenance stamped from it pointed at the wrong commit.
 
-        The citation gate now returns ``verdict.evidence_sha``.
-        ``merge_to_main`` writes the canonical ``Merge task/<id> into main``
-        subject, which ``DEFAULT_COMMIT_CITATION_PATTERN`` matches, so the
-        evidence sha IS the merge commit — the honest provenance anchor the
-        runbooks stamp.
+        The tier now returns ``branch_work_landed``'s ``evidence_sha``, which
+        its citation tier finds first.  ``merge_to_main`` writes the canonical
+        ``Merge task/<id> into main`` subject, which
+        ``DEFAULT_COMMIT_CITATION_PATTERN`` matches, so the evidence sha IS the
+        merge commit — the honest provenance anchor the runbooks stamp.
 
         Sequence:
         1. Create worktree for task '771', commit a file.
@@ -1470,37 +1463,22 @@ class TestMergeStatusGitAuthorityIntegration:
     async def test_landed_then_file_edited_on_main_returns_done(
         self, tmp_path: Path, git_ops: GitOps, orch_config: OrchestratorConfig  # type: ignore[reportInvalidTypeForm]
     ) -> None:
-        """Pins the task-3116 flip: a landed-then-EDITED task now reads ``done``.
+        """A landed-then-EDITED task reads ``done``.
 
         The task genuinely landed — merged with ``--no-ff``, cited on main,
         never reverted — and a LATER unrelated commit then EXTENDED a file the
-        landing touched.  This used to answer ``unknown``; it now answers
-        ``done`` / ``found_on_main``.
+        landing touched.
 
-        Why it used to fail: the gate's third guard is
-        ``commit_effect_present_in_main``, which for a merge commit anchors on
-        the merged parent's fork point and, until task 3116, required the
-        touched paths to be BYTE-IDENTICAL between that parent and current
-        main.  That is strictly stronger than "was not reverted" — ANY
-        subsequent edit to a touched path read as effect-absent.  Measured
-        across the full corpus that rejected 95.4% of all landed merges, a
-        third of them within 24h, so the tier carried almost no information.
-
-        What task 3116 part (b) changed: byte-identity was replaced by a
-        SURVIVAL test — the lines the branch ADDED must still be present at
-        main HEAD (paired with a removed-lines-still-absent check, so a revert
-        that also adds lines cannot sneak through — the task-1175 hole).  Here
-        the later commit only APPENDS a line to ``772.py``; every line the
-        branch added survives verbatim, so the effect IS present and the tier
-        can now say ``done`` honestly.
-
-        This test is the positive half of the pair that keeps the tier
-        MEASURED.  Its negative twin,
-        ``test_cited_ancestor_branch_effect_absent_returns_unattributable``,
-        is a GENUINE revert and must stay ``landing_unattributable``.  The two
-        answering DIFFERENTLY is precisely the signal that the tightening
-        worked; if this one ever regresses to ``landing_unattributable``, the
-        survival predicate has collapsed back into byte-identity.
+        History: this once answered ``unknown``, because the ancestor arm's
+        effect-present guard required the touched paths to be BYTE-IDENTICAL
+        between the merged parent and current main, which rejected 95.4% of
+        landed merges.  Task 3116 relaxed that to line survival.  Task 4648
+        then moved the arm off effect presence altogether: it is decided by
+        ``branch_work_landed``, which finds the tip contained by ancestry and
+        attributes it to the merge commit's citation, so no later edit to the
+        landed paths can unland it.  The non-decay pin under heavier churn is
+        ``test_git_authority.py``'s
+        ``TestProbeLandingAncestorArmDecidesByBranchWorkLanded``.
         """
         tid = '772'
 
@@ -1532,8 +1510,7 @@ class TestMergeStatusGitAuthorityIntegration:
         assert rc == 0, f'later edit failed: {err!r}'
 
         # --- Preconditions: this is a GENUINE landing, not a degenerate or
-        # uncited branch — so a non-done answer below can only come from the
-        # effect-present half of the citation gate. ---
+        # uncited branch. ---
         assert await git_ops.is_ancestor(f'task/{tid}', 'main'), (
             'precondition: the landed branch must be an ancestor of main'
         )
@@ -1542,9 +1519,8 @@ class TestMergeStatusGitAuthorityIntegration:
             f'precondition: main must still cite the task via the merge '
             f'commit, got citation={citation!r}'
         )
-        # Post-3116: the later commit only APPENDS, so every line the branch
-        # added survives at main HEAD and the effect reads as PRESENT.  Before
-        # task 3116 part (b) this asserted the opposite (byte-identity).
+        # The legacy effect-present probe agrees the landing survives an
+        # append-only edit; the ancestor arm no longer asks it (task 4648).
         assert await git_ops.commit_effect_present_in_main(
             merge_result.merge_commit
         ), (
