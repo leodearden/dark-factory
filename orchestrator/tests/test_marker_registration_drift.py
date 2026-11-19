@@ -670,7 +670,7 @@ class TestDefectMarkersRegisteredInEveryMember:
         ]
         registered_by_file = {
             str(path.relative_to(ORCH_DIR.parent)): _registered_marker_names(
-                _load_toml(path)['tool']['pytest']['ini_options'].get('markers', []),
+                _load_toml(path).get('tool', {}).get('pytest', {}).get('ini_options', {}).get('markers', []),
             )
             for path in pyprojects
         }

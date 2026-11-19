@@ -454,9 +454,10 @@ _ALLOWED_RENAMERS = {
         '``<junit>.tests.json`` collection map and the ``--df-defect-outcomes`` '
         'file from one designated writer via mkstemp + os.replace, so a '
         'consumer (verify.py::_archive_junit_report, ζ1, client-feed) never '
-        'reads a torn map. No test pins the stdlib-only import set: '
-        'shared/tests/test_df_defect_plugin.py runs the plugin under '
-        'sys.executable, where ``shared`` IS importable. The name is not one '
+        'reads a torn map. shared/tests/test_df_defect_plugin.py pins the '
+        'stdlib-only import set: every run puts an unimportable ``shared`` '
+        'ahead of the plugin directory on PYTHONPATH (TestTargetsWithoutShared). '
+        'The name is not one '
         'test_atomic_write_text_helpers_only_delegate inspects, so this entry '
         'silences no delegate check. A migration candidate only if targets ever '
         'gain ``shared``. Added by task 7045.',
