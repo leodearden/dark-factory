@@ -1330,7 +1330,9 @@ def run_nightly(
     pass moves the schedule cursor. A ``RETRY`` pass, run by
     :func:`run_scheduled_night` after the ``SCHEDULED`` one, skips sessions
     the session ledger already holds, never evaluates the census trigger,
-    and records through *retry_recorder*.
+    and records through *retry_recorder*. A ``SCHEDULED`` pass whose
+    *target_date* the recorded schedule cursor already reached
+    (:func:`trickle_state.schedule_reached`) skips those sessions too.
 
     The pass ends with one INFO line, :meth:`NightlyResult.journal_line`.
     """
@@ -1391,10 +1393,28 @@ def _ledgered_sessions(cfg: LegibilityConfig) -> frozenset[str]:
     if snapshot.state is session_ledger.LedgerState.UNREADABLE:
         logger.warning(
             'legibility trickle: session ledger unreadable, so no already-coded '
-            'session is skipped this retry: %s',
+            'session is skipped this pass: %s',
             snapshot.error,
         )
     return snapshot.sessions
+
+
+def _skips_ledgered_sessions(
+    cfg: LegibilityConfig, pass_kind: PassKind, target_date: date,
+) -> bool:
+    """A retry, and a scheduled pass over a date the schedule already
+    reached, skip what the session ledger holds."""
+    match pass_kind:
+        case PassKind.RETRY:
+            return True
+        case PassKind.SCHEDULED:
+            return trickle_state.schedule_reached(
+                trickle_state.read_prior(cfg.project_id), target_date=target_date,
+            )
+        case PassKind.MANUAL:
+            return False
+        case _:
+            assert_never(pass_kind)
 
 
 def _nothing_sampled() -> sampling.SampleResult:
@@ -1484,10 +1504,13 @@ def _select_stage(
     *,
     rendered: dict[tuple, str],
 ) -> sampling.SampleResult:
-    """The night's sample; a retry skips the sessions the ledger holds.
-    *rendered* is the render cache the digest stage reuses."""
+    """The night's sample, without the sessions the ledger holds when
+    :func:`_skips_ledgered_sessions` says so. *rendered* is the render cache
+    the digest stage reuses."""
     skip_sessions = (
-        _ledgered_sessions(cfg) if pass_kind is PassKind.RETRY else frozenset()
+        _ledgered_sessions(cfg)
+        if _skips_ledgered_sessions(cfg, pass_kind, target_date)
+        else frozenset()
     )
     return selector(
         cfg, projects_root if projects_root is not None else DEFAULT_PROJECTS_ROOT,
