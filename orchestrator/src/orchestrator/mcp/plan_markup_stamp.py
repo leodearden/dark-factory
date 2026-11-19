@@ -471,7 +471,7 @@ _PENDING_LOCK = threading.Lock()
 # So it is held here and adopted by the plan ``_create_plan`` is about to write.
 #
 # PROCESS-GLOBAL STATE IS THE ESTABLISHED SHAPE HERE, not an invention:
-# ``plan_tools._REPORTED_REFUSALS`` is exactly this, with an autouse fixture
+# ``plan_markup_repair._REPORTED_REFUSALS`` is exactly this, with an autouse fixture
 # clearing it per test — which a consumer of THIS buffer must do too, or one
 # test's buffered refusal inflates the next one's count.
 #

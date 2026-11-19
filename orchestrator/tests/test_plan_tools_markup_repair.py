@@ -68,7 +68,7 @@ from orchestrator.artifacts import (
     ArtifactWriteError,
     TaskArtifacts,
 )
-from orchestrator.mcp import plan_tools
+from orchestrator.mcp import plan_markup_repair, plan_tools
 
 # ---------------------------------------------------------------------------
 # The four REAL specimen shapes, measured on the 28 corrupted live plans.
@@ -293,11 +293,10 @@ def _plan_writing_tool_names(registered: frozenset[str] | None = None) -> tuple[
     survivor's own body, never a substring scan of the source text. A text
     scan would be actively WRONG here: this module's own comments and
     docstrings mention these method names in prose repeatedly — including this
-    very docstring. Measured on plan_tools, ``_repair_one_field`` discusses
-    ``write_plan`` and ``create_server`` discusses ``mark_step_committed``,
-    neither calling the method it names; a substring match would classify both
-    as writers. Other guards happen to exclude those two as well, which is
-    exactly the point — the AST walk is what makes the classification CORRECT
+    very docstring. Measured on plan_tools, ``create_server`` discusses
+    ``mark_step_committed`` without calling it; a substring match would
+    classify it as a writer. Other guards happen to exclude it as well, which
+    is exactly the point — the AST walk is what makes the classification CORRECT
     rather than accidentally correct, and it is the guard that survives a
     future helper that is artifacts-first, ``_``-prefixed, and merely
     discusses a write.
@@ -997,8 +996,8 @@ class TestRepairableFieldTable:
         assert derived, 'the derived candidate set must not be empty'
 
         floor = {n for n in _registered_plan_tool_names() if not n.startswith('report_')}
-        floor.update(plan_tools._COLLECTION_SCHEMA_TOOL.values())
         for record in plan_tools._REPAIRABLE_PLAN_FIELDS:
+            floor.add(record.tool)
             floor.update(record.also_written_by)
 
         assert floor <= derived, (
@@ -1189,6 +1188,12 @@ class TestRepairableFieldTable:
 # step-3 — the pure repair pass over the DOMINANT trailing-residue shape.
 # ---------------------------------------------------------------------------
 
+
+def _repair_under_server_table(plan: dict) -> tuple[dict, list[dict]]:
+    """The repair pass under plan-tools' own field table."""
+    return plan_markup_repair.repair_plan_fields(plan, plan_tools._REPAIRABLE_PLAN_FIELDS)
+
+
 #: The trailing shape on a step/prerequisite ``description``. Built here rather
 #: than in the specimen block because the same field name serves two tools.
 _TRAILING_DESCRIPTION = (
@@ -1252,7 +1257,7 @@ class TestRepairPlanFieldsTrailing:
         plan = corrupt_plan()
         plan['design_decisions'][0]['rationale'] = TRAILING_RATIONALE
 
-        repaired, facts = plan_tools._repair_plan_fields(plan)
+        repaired, facts = _repair_under_server_table(plan)
 
         decision = repaired['design_decisions'][0]
         assert decision['rationale'] == _RATIONALE_PROSE
@@ -1282,7 +1287,7 @@ class TestRepairPlanFieldsTrailing:
         plan = corrupt_plan()
         plan['design_decisions'][0]['rationale'] = TRAILING_RATIONALE
 
-        repaired, _facts = plan_tools._repair_plan_fields(plan)
+        repaired, _facts = _repair_under_server_table(plan)
 
         assert plan['design_decisions'][0]['rationale'] == TRAILING_RATIONALE, (
             'the caller\'s dict must not be mutated in place — the write-back '
@@ -1295,7 +1300,7 @@ class TestRepairPlanFieldsTrailing:
         plan = corrupt_plan()
         plan['reuse'][1]['how'] = TRAILING_HOW
 
-        repaired, facts = plan_tools._repair_plan_fields(plan)
+        repaired, facts = _repair_under_server_table(plan)
 
         assert repaired['reuse'][1]['how'] == _HOW_PROSE
         assert repaired['reuse'][0]['how'] == 'Clean reuse prose.'
@@ -1328,7 +1333,7 @@ class TestRepairPlanFieldsTrailing:
         plan = corrupt_plan()
         plan[collection][index][field] = poisoned
 
-        repaired, facts = plan_tools._repair_plan_fields(plan)
+        repaired, facts = _repair_under_server_table(plan)
 
         assert repaired[collection][index][field] == clean
         assert detect(repaired[collection][index][field]) is None
@@ -1342,7 +1347,7 @@ class TestRepairPlanFieldsTrailing:
     def test_top_level_field_reports_collection_and_index_none(self):
         plan = corrupt_plan(analysis=_TRAILING_ANALYSIS)
 
-        repaired, facts = plan_tools._repair_plan_fields(plan)
+        repaired, facts = _repair_under_server_table(plan)
 
         assert repaired['analysis'] == 'Clean analysis prose describing the approach.'
         assert len(facts) == 1
@@ -1360,7 +1365,7 @@ class TestRepairPlanFieldsTrailing:
         plan = corrupt_plan(design_decisions=decisions)
         before = dict(_all_strings(plan))
 
-        repaired, facts = plan_tools._repair_plan_fields(plan)
+        repaired, facts = _repair_under_server_table(plan)
 
         assert len(facts) == 4
         assert [f['index'] for f in facts] == [0, 1, 2, 3]
@@ -1379,7 +1384,7 @@ class TestRepairPlanFieldsTrailing:
     def test_clean_plan_is_returned_unchanged_with_no_facts(self):
         plan = corrupt_plan()
 
-        repaired, facts = plan_tools._repair_plan_fields(plan)
+        repaired, facts = _repair_under_server_table(plan)
 
         assert facts == []
         assert repaired == plan
@@ -1397,12 +1402,12 @@ class TestRepairPlanFieldsTrailing:
         copies: list = []
         real_deepcopy = copy.deepcopy
         monkeypatch.setattr(
-            plan_tools.copy,
+            copy,
             'deepcopy',
             lambda obj, *a, **kw: (copies.append(obj), real_deepcopy(obj, *a, **kw))[1],
         )
 
-        repaired, facts = plan_tools._repair_plan_fields(plan)
+        repaired, facts = _repair_under_server_table(plan)
 
         assert facts == []
         assert copies == [], 'a clean plan was deep-copied for nothing'
@@ -1418,12 +1423,12 @@ class TestRepairPlanFieldsTrailing:
         copies: list = []
         real_deepcopy = copy.deepcopy
         monkeypatch.setattr(
-            plan_tools.copy,
+            copy,
             'deepcopy',
             lambda obj, *a, **kw: (copies.append(obj), real_deepcopy(obj, *a, **kw))[1],
         )
 
-        repaired, facts = plan_tools._repair_plan_fields(plan)
+        repaired, facts = _repair_under_server_table(plan)
 
         assert len(facts) == 1
         assert copies == [plan]
@@ -1445,7 +1450,7 @@ class TestRepairPlanFieldsTrailing:
         plan = corrupt_plan()
         plan[collection][index][field] = poisoned
 
-        repaired, facts = plan_tools._repair_plan_fields(plan)
+        repaired, facts = _repair_under_server_table(plan)
 
         new_value = repaired[collection][index][field]
         assert poisoned.startswith(new_value)
@@ -1460,7 +1465,7 @@ class TestRepairPlanFieldsTrailing:
         plan['steps'][0]['description'] = _TRAILING_DESCRIPTION
         plan['analysis'] = _TRAILING_ANALYSIS
 
-        _repaired, facts = plan_tools._repair_plan_fields(plan)
+        _repaired, facts = _repair_under_server_table(plan)
 
         assert len(facts) == 4
         for fact in facts:
@@ -1500,7 +1505,7 @@ class TestRepairPlanFieldsRefuses:
         plan = corrupt_plan()
         plan['design_decisions'][0]['decision'] = PROSE_QUOTED
 
-        repaired, facts = plan_tools._repair_plan_fields(plan)
+        repaired, facts = _repair_under_server_table(plan)
 
         assert repaired['design_decisions'][0]['decision'] == PROSE_QUOTED
         # Nothing was shaved off the end: all three quoted sentinels survive.
@@ -1522,7 +1527,7 @@ class TestRepairPlanFieldsRefuses:
         plan = corrupt_plan()
         plan['reuse'][0]['how'] = _DOUBLY_CORRUPT_HOW
 
-        repaired, facts = plan_tools._repair_plan_fields(plan)
+        repaired, facts = _repair_under_server_table(plan)
 
         assert repaired['reuse'][0]['how'] == _DOUBLY_CORRUPT_HOW
         assert len(facts) == 1
@@ -1544,7 +1549,7 @@ class TestRepairPlanFieldsRefuses:
         plan['design_decisions'][0]['decision'] = PROSE_QUOTED
         before = dict(_all_strings(plan))
 
-        repaired, _facts = plan_tools._repair_plan_fields(plan)
+        repaired, _facts = _repair_under_server_table(plan)
 
         assert dict(_all_strings(repaired)) == before
 
@@ -1558,8 +1563,8 @@ class TestRepairPlanFieldsRefuses:
         return plan
 
     def test_is_deterministic_across_repeated_runs(self):
-        first_plan, first_facts = plan_tools._repair_plan_fields(self._mixed_plan())
-        second_plan, second_facts = plan_tools._repair_plan_fields(self._mixed_plan())
+        first_plan, first_facts = _repair_under_server_table(self._mixed_plan())
+        second_plan, second_facts = _repair_under_server_table(self._mixed_plan())
 
         assert first_plan == second_plan
         assert first_facts == second_facts
@@ -1572,8 +1577,8 @@ class TestRepairPlanFieldsRefuses:
         (zero further 'repaired' facts) while still reporting the residue that
         was, and remains, unrepairable.
         """
-        once, first_facts = plan_tools._repair_plan_fields(self._mixed_plan())
-        twice, second_facts = plan_tools._repair_plan_fields(once)
+        once, first_facts = _repair_under_server_table(self._mixed_plan())
+        twice, second_facts = _repair_under_server_table(once)
 
         assert twice == once
         assert [f for f in second_facts if f['outcome'] == 'repaired'] == []
@@ -1587,7 +1592,7 @@ class TestRepairPlanFieldsRefuses:
         plan = corrupt_plan()
         plan['design_decisions'][0]['rationale'] = value
 
-        repaired, facts = plan_tools._repair_plan_fields(plan)
+        repaired, facts = _repair_under_server_table(plan)
 
         assert facts == []
         assert repaired['design_decisions'][0]['rationale'] == value
@@ -1599,7 +1604,7 @@ class TestRepairPlanFieldsRefuses:
         plan['reuse'].append('not a dict at all')
         plan['steps'] = 'not a list at all'
 
-        repaired, facts = plan_tools._repair_plan_fields(plan)
+        repaired, facts = _repair_under_server_table(plan)
 
         assert facts == []
         assert 'rationale' not in repaired['design_decisions'][0]
@@ -1640,7 +1645,7 @@ class TestRepairPlanFieldsAbsorbedSibling:
     def test_recovers_into_an_empty_sibling(self):
         plan = _absorbed_decision(rationale='')
 
-        repaired, facts = plan_tools._repair_plan_fields(plan)
+        repaired, facts = _repair_under_server_table(plan)
 
         item = repaired['design_decisions'][0]
         assert item['decision'] == DECISION_PROSE
@@ -1660,7 +1665,7 @@ class TestRepairPlanFieldsAbsorbedSibling:
         plan = _absorbed_decision()
         assert 'rationale' not in plan['design_decisions'][0]
 
-        repaired, facts = plan_tools._repair_plan_fields(plan)
+        repaired, facts = _repair_under_server_table(plan)
 
         item = repaired['design_decisions'][0]
         assert item['decision'] == DECISION_PROSE
@@ -1672,7 +1677,7 @@ class TestRepairPlanFieldsAbsorbedSibling:
     def test_whitespace_only_sibling_counts_as_a_hole(self):
         plan = _absorbed_decision(rationale='   \n\t  ')
 
-        repaired, facts = plan_tools._repair_plan_fields(plan)
+        repaired, facts = _repair_under_server_table(plan)
 
         item = repaired['design_decisions'][0]
         assert item['decision'] == DECISION_PROSE
@@ -1703,7 +1708,7 @@ class TestRepairPlanFieldsAbsorbedSibling:
             }],
         )
 
-        repaired, facts = plan_tools._repair_plan_fields(plan)
+        repaired, facts = _repair_under_server_table(plan)
 
         item = repaired['design_decisions'][0]
         assert item['rationale'] == authored, (
@@ -1741,7 +1746,7 @@ class TestRepairPlanFieldsAbsorbedSibling:
             }],
         )
 
-        repaired, facts = plan_tools._repair_plan_fields(plan)
+        repaired, facts = _repair_under_server_table(plan)
 
         item = repaired['design_decisions'][0]
         assert item['rationale'] == authored, (
@@ -1775,7 +1780,7 @@ class TestRepairPlanFieldsAbsorbedSibling:
             }],
         )
 
-        repaired, facts = plan_tools._repair_plan_fields(plan)
+        repaired, facts = _repair_under_server_table(plan)
 
         item = repaired['design_decisions'][0]
         assert item['rationale'] == authored
@@ -1792,7 +1797,7 @@ class TestRepairPlanFieldsAbsorbedSibling:
         """
         plan = _absorbed_decision(rationale=_AUTHORED_RATIONALE)
 
-        repaired, facts = plan_tools._repair_plan_fields(plan)
+        repaired, facts = _repair_under_server_table(plan)
 
         item = repaired['design_decisions'][0]
         assert item['rationale'] == _AUTHORED_RATIONALE
@@ -1808,7 +1813,7 @@ class TestRepairPlanFieldsAbsorbedSibling:
     def test_recovered_value_is_always_a_slice_of_the_original(self, sibling):
         plan = _absorbed_decision(rationale=sibling)
 
-        repaired, facts = plan_tools._repair_plan_fields(plan)
+        repaired, facts = _repair_under_server_table(plan)
 
         item = repaired['design_decisions'][0]
         assert facts[0]['outcome'] == 'repaired'
@@ -1863,7 +1868,7 @@ class TestRecoveryTargetsAreRealPlanKeys:
         """Measured before the fix: ``plan['files']`` came back a ``str``."""
         plan = corrupt_plan(title=_ABSORBED_FILES_TITLE, files=[])
 
-        repaired, facts = plan_tools._repair_plan_fields(plan)
+        repaired, facts = _repair_under_server_table(plan)
 
         assert isinstance(repaired['files'], list), (
             'a recovered path string replaced the files LIST — the lock charter '
@@ -1880,7 +1885,7 @@ class TestRecoveryTargetsAreRealPlanKeys:
         original = ['orchestrator/src/orchestrator/mcp/plan_tools.py']
         plan = corrupt_plan(title=_ABSORBED_FILES_TITLE, files=list(original))
 
-        repaired, facts = plan_tools._repair_plan_fields(plan)
+        repaired, facts = _repair_under_server_table(plan)
 
         assert repaired['files'] == original
         assert repaired['title'] == _ABSORBED_FILES_TITLE
@@ -1902,7 +1907,7 @@ class TestRecoveryTargetsAreRealPlanKeys:
         }
         plan = corrupt_plan(steps=[step])
 
-        repaired, facts = plan_tools._repair_plan_fields(plan)
+        repaired, facts = _repair_under_server_table(plan)
 
         item = repaired['steps'][0]
         assert 'step_type' not in item, f'junk key written: {sorted(item)}'
@@ -1922,7 +1927,7 @@ class TestRecoveryTargetsAreRealPlanKeys:
         }
         plan = corrupt_plan(prerequisites=[prereq])
 
-        repaired, facts = plan_tools._repair_plan_fields(plan)
+        repaired, facts = _repair_under_server_table(plan)
 
         item = repaired['prerequisites'][0]
         assert 'prereq_id' not in item, f'junk key written: {sorted(item)}'
@@ -1967,7 +1972,7 @@ class TestRecoveryTargetsAreRealPlanKeys:
             design_decisions=decisions,
         )
 
-        repaired, _facts = plan_tools._repair_plan_fields(plan)
+        repaired, _facts = _repair_under_server_table(plan)
 
         assert set(repaired) <= observed[None], (
             f'top-level junk keys: {sorted(set(repaired) - observed[None])}'
@@ -1990,7 +1995,7 @@ class TestRecoveryTargetsAreRealPlanKeys:
         plan['steps'][0]['description'] = _TRAILING_DESCRIPTION
         plan['analysis'] = _TRAILING_ANALYSIS
 
-        repaired, facts = plan_tools._repair_plan_fields(plan)
+        repaired, facts = _repair_under_server_table(plan)
 
         assert [f['outcome'] for f in facts] == ['repaired'] * 4
         assert all(f['recovered_params'] == [] for f in facts)
@@ -2003,7 +2008,7 @@ class TestRecoveryTargetsAreRealPlanKeys:
         """``rationale`` IS a declared target, so step-7's recovery is intact."""
         plan = _absorbed_decision(rationale='')
 
-        repaired, facts = plan_tools._repair_plan_fields(plan)
+        repaired, facts = _repair_under_server_table(plan)
 
         item = repaired['design_decisions'][0]
         assert item['decision'] == DECISION_PROSE
@@ -2119,7 +2124,7 @@ def _fact_payloads(caplog) -> list[dict]:
     """
     payloads = []
     for record in caplog.records:
-        if record.name != plan_tools.__name__ or record.levelno < logging.WARNING:
+        if record.name != plan_markup_repair.__name__ or record.levelno < logging.WARNING:
             continue
         payloads.append(json.loads(record.getMessage()))
     return payloads
@@ -2260,7 +2265,7 @@ class TestReadPlanRepaired:
         plan['design_decisions'][0]['decision'] = PROSE_QUOTED
         plan_artifacts.write_plan(plan)
 
-        with caplog.at_level(logging.DEBUG, logger=plan_tools.__name__):
+        with caplog.at_level(logging.DEBUG, logger=plan_markup_repair.__name__):
             _, first = plan_tools._read_plan_repaired(plan_artifacts)
             first_warnings = len(_fact_payloads(caplog))
             _, second = plan_tools._read_plan_repaired(plan_artifacts)
@@ -2276,7 +2281,7 @@ class TestReadPlanRepaired:
         debug_payloads = [
             json.loads(r.getMessage())
             for r in caplog.records
-            if r.name == plan_tools.__name__ and r.levelno == logging.DEBUG
+            if r.name == plan_markup_repair.__name__ and r.levelno == logging.DEBUG
         ]
         assert [p['field'] for p in debug_payloads] == ['decision']
 
@@ -2323,7 +2328,7 @@ class TestReadPlanRepaired:
         risk hiding a field that got RE-corrupted between calls.
         """
         _seed_mixed_plan(plan_artifacts)
-        with caplog.at_level(logging.WARNING, logger=plan_tools.__name__):
+        with caplog.at_level(logging.WARNING, logger=plan_markup_repair.__name__):
             _, first = plan_tools._read_plan_repaired(plan_artifacts)
         assert sorted(f['outcome'] for f in first) == ['repaired', 'unrepairable']
 
@@ -2343,7 +2348,7 @@ class TestReadPlanRepaired:
     ):
         _seed_mixed_plan(plan_artifacts)
 
-        with caplog.at_level(logging.WARNING, logger=plan_tools.__name__):
+        with caplog.at_level(logging.WARNING, logger=plan_markup_repair.__name__):
             _, facts = plan_tools._read_plan_repaired(plan_artifacts)
 
         payloads = _fact_payloads(caplog)
@@ -2361,7 +2366,7 @@ class TestReadPlanRepaired:
         plan['reuse'][1]['how'] = TRAILING_HOW
         plan_artifacts.write_plan(plan)
 
-        with caplog.at_level(logging.WARNING, logger=plan_tools.__name__):
+        with caplog.at_level(logging.WARNING, logger=plan_markup_repair.__name__):
             plan_tools._read_plan_repaired(plan_artifacts)
 
         payload = _fact_payloads(caplog)[0]
@@ -2377,11 +2382,11 @@ class TestReadPlanRepaired:
         """One fact per log record — never a multi-line blob to reassemble."""
         _seed_mixed_plan(plan_artifacts)
 
-        with caplog.at_level(logging.WARNING, logger=plan_tools.__name__):
+        with caplog.at_level(logging.WARNING, logger=plan_markup_repair.__name__):
             plan_tools._read_plan_repaired(plan_artifacts)
 
         messages = [
-            r.getMessage() for r in caplog.records if r.name == plan_tools.__name__
+            r.getMessage() for r in caplog.records if r.name == plan_markup_repair.__name__
         ]
         assert messages
         for message in messages:
@@ -2444,13 +2449,13 @@ class TestReadPlanRepaired:
 
         monkeypatch.setattr(TaskArtifacts, 'write_plan_model', boom)
 
-        with caplog.at_level(logging.WARNING, logger=plan_tools.__name__):
+        with caplog.at_level(logging.WARNING, logger=plan_markup_repair.__name__):
             plan, facts = plan_tools._read_plan_repaired(plan_artifacts)
 
         assert plan['design_decisions'][0]['rationale'] == _RATIONALE_PROSE
         assert any(f['outcome'] == 'repaired' for f in facts)
         assert 'disk on fire' in caplog.text, 'the write failure must be LOUD'
-        assert plan_tools._MARKUP_WRITE_FAILED_EVENT in caplog.text, (
+        assert plan_markup_repair._MARKUP_WRITE_FAILED_EVENT in caplog.text, (
             'the failure must be a STRUCTURED fact, not just prose'
         )
 
@@ -2505,22 +2510,22 @@ class TestUnresolvableLocatorIsNeverMemoized:
         fact = _unresolvable_refusal_fact()
         plan_path = tmp_path / 'plan.json'
 
-        with caplog.at_level(logging.DEBUG, logger=plan_tools.__name__):
-            first = plan_tools._report_markup_facts(plan_path, plan, [fact])
-            second = plan_tools._report_markup_facts(plan_path, plan, [fact])
+        with caplog.at_level(logging.DEBUG, logger=plan_markup_repair.__name__):
+            first = plan_markup_repair._report_markup_facts(plan_path, plan, [fact])
+            second = plan_markup_repair._report_markup_facts(plan_path, plan, [fact])
 
         assert first == [fact]
         assert second == [fact], (
             'an unresolvable locator must be reported every time, not '
             'suppressed on the second call'
         )
-        assert set() == plan_tools._REPORTED_REFUSALS, (
+        assert set() == plan_markup_repair._REPORTED_REFUSALS, (
             'no key that means nothing may ever be recorded'
         )
         assert len(_fact_payloads(caplog)) == 2, 'both calls must log at WARNING'
         debug_records = [
             r for r in caplog.records
-            if r.name == plan_tools.__name__ and r.levelno == logging.DEBUG
+            if r.name == plan_markup_repair.__name__ and r.levelno == logging.DEBUG
         ]
         assert debug_records == [], (
             'an unresolvable refusal must never be suppressed to DEBUG'
@@ -2543,16 +2548,16 @@ class TestUnresolvableLocatorIsNeverMemoized:
         fact = _unresolvable_refusal_fact(index=0, field='not_a_real_field')
         plan_path = tmp_path / 'plan.json'
 
-        with caplog.at_level(logging.DEBUG, logger=plan_tools.__name__):
-            first = plan_tools._report_markup_facts(plan_path, plan, [fact])
-            second = plan_tools._report_markup_facts(plan_path, plan, [fact])
+        with caplog.at_level(logging.DEBUG, logger=plan_markup_repair.__name__):
+            first = plan_markup_repair._report_markup_facts(plan_path, plan, [fact])
+            second = plan_markup_repair._report_markup_facts(plan_path, plan, [fact])
 
         assert first == [fact]
         assert second == [], (
             'a resolvable locator whose field is legitimately absent must '
             'still converge to silence on repeat, unlike a broken locator'
         )
-        assert len(plan_tools._REPORTED_REFUSALS) == 1
+        assert len(plan_markup_repair._REPORTED_REFUSALS) == 1
 
 
 # ---------------------------------------------------------------------------

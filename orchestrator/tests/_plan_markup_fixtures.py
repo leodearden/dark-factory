@@ -22,7 +22,7 @@ import json
 import pytest
 
 from orchestrator.artifacts import TaskArtifacts
-from orchestrator.mcp import plan_tools
+from orchestrator.mcp import plan_markup_repair
 
 #: The clean ``design_decisions[0].decision`` every specimen is built around.
 DECISION_PROSE = (
@@ -54,9 +54,9 @@ def isolate_the_refusal_memo():
     suite order-independent instead of making a later test depend on whether an
     earlier one happened to report the same locator.
     """
-    plan_tools._REPORTED_REFUSALS.clear()
+    plan_markup_repair._REPORTED_REFUSALS.clear()
     yield
-    plan_tools._REPORTED_REFUSALS.clear()
+    plan_markup_repair._REPORTED_REFUSALS.clear()
 
 
 def corrupt_plan(**overrides) -> dict:

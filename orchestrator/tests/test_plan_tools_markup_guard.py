@@ -81,7 +81,13 @@ from shared.mcp_markup_middleware import (
 from shared.toolcall_markup import ENVELOPE_LITERALS, MARKUP_OVERRIDE_KEY, detect, repair
 
 from orchestrator.artifacts import TaskArtifacts
-from orchestrator.mcp import markup_journal, markup_sink, plan_markup_stamp, plan_tools
+from orchestrator.mcp import (
+    markup_journal,
+    markup_sink,
+    plan_markup_repair,
+    plan_markup_stamp,
+    plan_tools,
+)
 from orchestrator.workflow import _is_gating_escalation
 
 # ---------------------------------------------------------------------------
@@ -143,9 +149,9 @@ def _clear_reported_refusals():
     It is PROCESS-global memo state owned by the read-time path, so a refusal
     reported by one test would otherwise be suppressed in the next.
     """
-    plan_tools._REPORTED_REFUSALS.clear()
+    plan_markup_repair._REPORTED_REFUSALS.clear()
     yield
-    plan_tools._REPORTED_REFUSALS.clear()
+    plan_markup_repair._REPORTED_REFUSALS.clear()
 
 
 @pytest.fixture(autouse=True)
