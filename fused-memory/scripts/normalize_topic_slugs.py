@@ -1501,8 +1501,8 @@ def load_mcp_client_class() -> type:
     would be a second thing to keep in step with the server.
 
     Lazy so the pure planner, the pairing and the CLI parser stay importable
-    with no HTTP dependency, and so the tests — which inject a double — never
-    reach this function at all.
+    with no HTTP dependency, and so the behavioural tests can inject a double
+    in its place.
     """
     return load_mcp_client_module().FusedMemoryClient
 
