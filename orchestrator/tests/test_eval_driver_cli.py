@@ -19,8 +19,8 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
-import orchestrator.cli as cli_module
 import orchestrator.cli_config as cli_config
+import orchestrator.evals.cli as eval_cli_module
 import orchestrator.evals.runner as runner_module
 from orchestrator.cli import main
 from orchestrator.config import OrchestratorConfig
@@ -321,7 +321,7 @@ def _arch_ofat_results():
 
 class TestEmitCompositeReportArchitectSurface:
     def test_architect_result_set_emits_both_tables(self, capsys):
-        cli_module._emit_composite_report(_arch_ofat_results(), {})
+        eval_cli_module._emit_composite_report(_arch_ofat_results(), {})
 
         out = capsys.readouterr().out
         assert 'composite report:' in out
@@ -339,7 +339,7 @@ class TestEmitCompositeReportArchitectSurface:
         )
 
         results = _arch_ofat_results()
-        cli_module._emit_composite_report(results, {})
+        eval_cli_module._emit_composite_report(results, {})
 
         out = capsys.readouterr().out
         assert format_plan_quality_table(build_plan_quality_report(results)) in out
@@ -353,7 +353,7 @@ class TestEmitCompositeReportArchitectSurface:
             _mk_result('e2e-opus-opus', role='end_to_end', composite=0.85),
             _mk_result('e2e-sonnet-sonnet', role='end_to_end', composite=0.70),
         ]
-        cli_module._emit_composite_report(results, {})
+        eval_cli_module._emit_composite_report(results, {})
 
         out = capsys.readouterr().out
         assert 'plan_quality report:' not in out

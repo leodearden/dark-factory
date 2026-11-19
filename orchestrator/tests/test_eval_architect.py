@@ -3661,7 +3661,7 @@ def _fake_eval_result(**over):
 
 
 def _dispatch_single_eval(cfg, capsys, arch_metrics=None):
-    """Drive ``cli._run_single_eval`` with a resolved config, both runners patched.
+    """Drive ``orchestrator.evals.cli._run_single_eval`` with a resolved config, both runners patched.
 
     ``get_config_by_name`` is patched to return ``cfg`` so the dispatch is
     exercised purely on ``cfg.role``. ``arch_metrics`` overrides the fake
@@ -3675,8 +3675,7 @@ def _dispatch_single_eval(cfg, capsys, arch_metrics=None):
     and installing a SIGHUP handler). ``None`` is the ungated campaign, which is
     what every routing/echo case here already meant.
     """
-    from orchestrator import cli
-    from orchestrator.evals import eval_gate
+    from orchestrator.evals import cli, eval_gate
 
     arch_result = _fake_eval_result(
         config_name=cfg.name,
@@ -3706,7 +3705,7 @@ def _dispatch_single_eval(cfg, capsys, arch_metrics=None):
 
 
 def _dispatch_mixed_eval(cfgs, capsys, *, gate=None, raise_on: str | None = None):
-    """Drive ``cli._run_single_eval`` over a MIXED config list, gate seam patched.
+    """Drive ``orchestrator.evals.cli._run_single_eval`` over a MIXED config list, gate seam patched.
 
     The sibling of :func:`_dispatch_single_eval` for the CAMPAIGN question
     (task 4427): ``_run_single_eval``'s ``for cfg in configs`` loop is a second,
@@ -3721,8 +3720,7 @@ def _dispatch_mixed_eval(cfgs, capsys, *, gate=None, raise_on: str | None = None
     the loop" from "torn down between configs". ``raise_on=<config name>`` makes
     that config's executor raise, which propagates out of ``asyncio.run``.
     """
-    from orchestrator import cli
-    from orchestrator.evals import eval_gate
+    from orchestrator.evals import cli, eval_gate
 
     def _make(metrics):
         async def fake(_task_path, cfg, *_a, usage_gate=_NO_INJECTED_GATE, **_k):
@@ -4726,7 +4724,7 @@ class TestArchitectEvalInjectedGate:
 # The per-cell gate above is correct but STATELESS across cells: cell N+1
 # re-leases the account cell N proved capped, paying a wasted invocation plus a
 # cooldown every time. ``campaign_usage_gate`` hoists construction+teardown to
-# whoever loops the cells (the μ stage functions and ``cli._run_single_eval``),
+# whoever loops the cells (the μ stage functions and ``evals.cli._run_single_eval``),
 # so ONE cap-state view serves the whole campaign.
 #
 # The hoist rests on one load-bearing premise: the ``usage_cap`` a cell would
