@@ -7,7 +7,17 @@ from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
-from cgroup_weight_share import CgroupWindow, Claim, Snapshot, fair_shares, measure, read_tree
+from cgroup_weight_share import (
+    CgroupWindow,
+    Claim,
+    Snapshot,
+    fair_shares,
+    host_share,
+    main,
+    measure,
+    read_tree,
+    share_chain,
+)
 
 
 def test_every_claimant_oversubscribed_splits_by_weight():
@@ -88,12 +98,15 @@ class FakeHost:
 
 
 def write_reify_host(host: FakeHost, *, core_windows: Mapping[str, float], wait_windows: Mapping[int, float]) -> None:
-    """One counter state: cumulative CPU per cgroup and wait per thread, in core-windows."""
+    """One counter state: cumulative CPU per cgroup and wait per thread, in core-windows.
+
+    The service has no cpu.weight, as when its parent does not delegate the cpu controller.
+    """
     def usage(rel: str) -> int:
-        return int(core_windows.get(rel, 0.0) * USEC_PER_CORE_WINDOW)
+        return round(core_windows.get(rel, 0.0) * USEC_PER_CORE_WINDOW)
 
     host.cgroup('.', usage_usec=usage('.'))
-    host.cgroup(SERVICE, usage_usec=usage(SERVICE), weight=100)
+    host.cgroup(SERVICE, usage_usec=usage(SERVICE))
     host.cgroup(DF_SLICE, usage_usec=usage(DF_SLICE), weight=100)
     host.cgroup(REIFY_SLICE, usage_usec=usage(REIFY_SLICE), weight=100)
     host.cgroup(MERGE, usage_usec=usage(MERGE), weight=100, tids=(11, 12, 13))
@@ -101,7 +114,7 @@ def write_reify_host(host: FakeHost, *, core_windows: Mapping[str, float], wait_
     host.cgroup(APP_SLICE, usage_usec=usage(APP_SLICE), weight=100)
     host.cgroup(DAEMON, usage_usec=usage(DAEMON), weight=100, tids=(31,))
     for tid, waited in wait_windows.items():
-        host.thread(tid, wait_ns=int(waited * NS_PER_CORE_WINDOW))
+        host.thread(tid, wait_ns=round(waited * NS_PER_CORE_WINDOW))
 
 
 @pytest.fixture
@@ -196,3 +209,115 @@ def test_readings_and_windows_are_frozen(host, windows):
         snapshot.readings[MERGE].usage_usec = 0  # type: ignore[misc]
     with pytest.raises(dataclasses.FrozenInstanceError):
         windows[MERGE].used_cores = 0.0  # type: ignore[misc]
+
+
+def measure_reify_host(
+    host: FakeHost,
+    *,
+    core_windows: Mapping[str, float],
+    wait_windows: Mapping[int, float],
+    idle_scopes: tuple[str, ...] = (),
+) -> dict[str, CgroupWindow]:
+    write_reify_host(host, core_windows={}, wait_windows={tid: 0.0 for tid in wait_windows})
+    for rel in idle_scopes:
+        host.cgroup(rel, usage_usec=0, weight=100)
+    before = host.snapshot()
+    write_reify_host(host, core_windows=core_windows, wait_windows=wait_windows)
+    return measure(before, host.snapshot(), WINDOW_S)
+
+
+CONTENDED_CORES = {
+    '.': 26.6, SERVICE: 26.6, DF_SLICE: 13.3, REIFY_SLICE: 13.3,
+    MERGE: 8.0, TASK: 5.3, APP_SLICE: 13.3, DAEMON: 13.3,
+}
+CONTENDED_WAITS = {11: 6.0, 12: 6.0, 21: 14.7, 31: 10.0}
+
+
+@pytest.fixture
+def contended(host: FakeHost) -> list:
+    """Merge wants 8+12=20 and task wants 5.3+14.7=20 of a slice that got 13.3 cores."""
+    windows = measure_reify_host(host, core_windows=CONTENDED_CORES, wait_windows=CONTENDED_WAITS)
+    return share_chain(windows, MERGE)
+
+
+def test_chain_walks_from_the_leaf_to_the_root_child(contended):
+    assert [level.path for level in contended] == [MERGE, REIFY_SLICE, DF_SLICE, SERVICE]
+
+
+def test_merge_scope_fair_share_is_100_to_33_against_its_task_sibling(contended):
+    merge = contended[0]
+    assert merge.used_cores == pytest.approx(8.0)
+    assert merge.parent_used_cores == pytest.approx(13.3)
+    assert merge.share_of_parent == pytest.approx(8.0 / 13.3)
+    assert merge.fair_cores == pytest.approx(10.0)
+    assert merge.used_vs_fair == pytest.approx(0.8)
+
+
+def test_slice_level_splits_what_the_service_got_by_weight(contended):
+    df_slice = contended[2]
+    assert df_slice.share_of_parent == pytest.approx(0.5)
+    assert df_slice.fair_cores == pytest.approx(13.3)
+    assert df_slice.used_vs_fair == pytest.approx(1.0)
+
+
+def test_idle_sibling_does_not_dilute_the_merge_scope(host):
+    windows = measure_reify_host(
+        host,
+        core_windows=CONTENDED_CORES,
+        wait_windows=CONTENDED_WAITS,
+        idle_scopes=(f'{REIFY_SLICE}/idle.scope',),
+    )
+    assert share_chain(windows, MERGE)[0].fair_cores == pytest.approx(10.0)
+
+
+def test_level_whose_siblings_lack_weight_has_no_entitlement(contended):
+    service = contended[-1]
+    assert service.fair_cores is None
+    assert service.used_vs_fair is None
+    assert service.share_of_parent == pytest.approx(1.0)
+
+
+def test_unknown_leaf_raises_key_error_naming_it(windows):
+    with pytest.raises(KeyError, match='nope.scope'):
+        share_chain(windows, f'{REIFY_SLICE}/nope.scope')
+
+
+def test_host_share_is_the_product_of_shares_down_the_chain(contended):
+    assert host_share(contended) == pytest.approx((8.0 / 13.3) * 1.0 * 0.5 * 1.0)
+
+
+def test_chain_level_is_frozen(contended):
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        contended[0].fair_cores = 0.0  # type: ignore[misc]
+
+
+@pytest.mark.parametrize('seconds', [0.0, -1.0])
+def test_measure_refuses_a_window_without_positive_length(host, seconds):
+    write_reify_host(host, core_windows={}, wait_windows={})
+    snapshot = host.snapshot()
+    with pytest.raises(ValueError, match=str(seconds)):
+        measure(snapshot, snapshot, seconds)
+
+
+def cli_args(host: FakeHost, chain: str) -> list[str]:
+    return [
+        '--cgroup-root', str(host.cgroup_root), '--proc-root', str(host.proc_root),
+        '--window', '0.01', '--chain', chain,
+    ]
+
+
+def test_cli_prints_a_header_and_one_row_per_chain_level(host, capsys):
+    write_reify_host(host, core_windows={}, wait_windows={})
+    assert main(cli_args(host, MERGE)) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert 'procs_running/nproc ?' in lines[0]
+    chain_rows = [line for line in lines if line.split()[:1] in ([MERGE], [REIFY_SLICE], [DF_SLICE], [SERVICE])]
+    assert len(chain_rows) == 4
+    assert any(line.startswith('host_share') for line in lines)
+
+
+def test_cli_rejects_a_chain_path_absent_from_the_tree(host, capsys):
+    write_reify_host(host, core_windows={}, wait_windows={})
+    missing = f'{REIFY_SLICE}/nope.scope'
+    assert main(cli_args(host, missing)) == 2
+    assert missing in capsys.readouterr().err
