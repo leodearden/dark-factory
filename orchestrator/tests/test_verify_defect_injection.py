@@ -1,13 +1,19 @@
 """Verify's injection of the ``_df_defect_plugin`` pytest plugin (plans/defect-tests-prd.md decision 19).
 
 Part 1 covers the ``verify_cmd`` mutator and the constants that name where the
-plugin is imported from.
+plugin is imported from. Part 2 covers the PYTHONPATH merge in the target
+subprocess env. Every Part 2 test sets or deletes PYTHONPATH itself, because a
+verify run of this suite carries the plugin directory once this lands.
 """
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
 import pytest
 
+from orchestrator.verify import _run_cmd, _target_subprocess_env
 from orchestrator.verify_cmd import (
     DEFECT_PLUGIN_DIR,
     DEFECT_PLUGIN_MODULE,
@@ -89,3 +95,74 @@ class TestPluginLocation:
     def test_the_named_module_is_in_the_named_directory(self):
         assert DEFECT_PLUGIN_DIR.name == '_pytest_inject'
         assert (DEFECT_PLUGIN_DIR / f'{DEFECT_PLUGIN_MODULE}.py').is_file()
+
+
+_DIR = str(DEFECT_PLUGIN_DIR)
+
+
+class TestPythonpathMerge:
+    def test_off_passes_ambient_through(self, monkeypatch):
+        monkeypatch.setenv('PYTHONPATH', '/a')
+        assert _target_subprocess_env(None)['PYTHONPATH'] == '/a'
+
+    def test_off_leaves_absent_absent(self, monkeypatch):
+        monkeypatch.delenv('PYTHONPATH', raising=False)
+        assert 'PYTHONPATH' not in _target_subprocess_env(None)
+
+    def test_on_with_none_is_the_dir_alone(self, monkeypatch):
+        monkeypatch.delenv('PYTHONPATH', raising=False)
+        assert _target_subprocess_env(None, defect_plugin=True)['PYTHONPATH'] == _DIR
+
+    def test_on_appends_after_ambient_entries(self, monkeypatch):
+        monkeypatch.setenv('PYTHONPATH', os.pathsep.join(['/a', '/b']))
+        env = _target_subprocess_env(None, defect_plugin=True)
+        assert env['PYTHONPATH'] == os.pathsep.join(['/a', '/b', _DIR])
+
+    def test_on_merges_after_the_caller_overlay(self, monkeypatch):
+        monkeypatch.setenv('PYTHONPATH', '/a')
+        env = _target_subprocess_env({'PYTHONPATH': '/x', 'FOO': '1'}, defect_plugin=True)
+        assert env['PYTHONPATH'] == os.pathsep.join(['/x', _DIR])
+        assert env['FOO'] == '1'
+
+    @pytest.mark.parametrize('source', ['ambient', 'extra'])
+    def test_on_does_not_duplicate_a_present_dir(self, monkeypatch, source):
+        value = os.pathsep.join(['/a', _DIR])
+        if source == 'ambient':
+            monkeypatch.setenv('PYTHONPATH', value)
+            env = _target_subprocess_env(None, defect_plugin=True)
+        else:
+            monkeypatch.delenv('PYTHONPATH', raising=False)
+            env = _target_subprocess_env({'PYTHONPATH': value}, defect_plugin=True)
+        assert env['PYTHONPATH'] == value
+
+    def test_on_with_empty_ambient_is_the_dir_alone(self, monkeypatch):
+        monkeypatch.setenv('PYTHONPATH', '')
+        assert _target_subprocess_env(None, defect_plugin=True)['PYTHONPATH'] == _DIR
+
+    def test_every_other_key_is_unchanged(self, monkeypatch, tmp_path):
+        monkeypatch.setenv('PYTHONPATH', '/a')
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '/leaked')
+        off = _target_subprocess_env({'FOO': '1'}, worktree=tmp_path)
+        on = _target_subprocess_env({'FOO': '1'}, worktree=tmp_path, defect_plugin=True)
+        off.pop('PYTHONPATH')
+        on.pop('PYTHONPATH')
+        assert on == off
+        assert on['RUFF_CACHE_DIR'] == str(tmp_path / '.ruff_cache')
+        assert on['PYTHONUNBUFFERED'] == '1'
+        assert 'ORCH_CONFIG_PATH' not in on
+
+
+class TestRunCmdForwardsTheFlag:
+    @pytest.mark.asyncio
+    async def test_on_reaches_the_child(self, monkeypatch, tmp_path: Path):
+        monkeypatch.delenv('PYTHONPATH', raising=False)
+        rc, output, _ = await _run_cmd('printf %s "$PYTHONPATH"', tmp_path, 60.0, defect_plugin=True)
+        assert rc == 0
+        assert output.endswith(_DIR)
+
+    @pytest.mark.asyncio
+    async def test_off_does_not(self, monkeypatch, tmp_path: Path):
+        monkeypatch.delenv('PYTHONPATH', raising=False)
+        rc, output, _ = await _run_cmd('printf %s "$PYTHONPATH"', tmp_path, 60.0)
+        assert rc == 0
+        assert not output.endswith(_DIR)
