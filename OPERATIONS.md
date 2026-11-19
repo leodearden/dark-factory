@@ -4707,6 +4707,12 @@ mistaken for a gap. When every later night finishes, an outage of up to
 each later night that does not finish costs the oldest owed date. Never-run
 dates already past the window are abandoned in one WARNING,
 `abandoning <n> never-run date(s) <first>..<last>`.
+The 03:00 scheduled pass after a post-midnight catch-up re-targets the date
+the catch-up already ran. Because the schedule cursor has already reached
+that date, that pass skips sessions the session ledger holds, as a retry
+does, and so re-codes only what the catch-up did not land (task 7025;
+`scripts/legibility/trickle_state.py::schedule_reached`). A manual `--date`
+pass still re-codes everything.
 
 **The escalation it files.** `task_id=legibility-trickle-health-<project_id>`
 (deliberately distinct from the nightly's own
