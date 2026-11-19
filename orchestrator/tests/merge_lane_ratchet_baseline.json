@@ -1499,7 +1499,7 @@
     "orchestrator/tests/test_halt_owner.py": {"patch_targets": [], "private_reads": 55},
     "orchestrator/tests/test_harness.py": {"patch_targets": ["liveness.TOUCH_MISS_TOLERANCE", "worker.SpeculativeMergeWorker.run"], "private_reads": 23},
     "orchestrator/tests/test_harness_abandoned_merge_deferred_wiring.py": {"patch_targets": [], "private_reads": 4},
-    "orchestrator/tests/test_harness_already_landed_gate_wiring.py": {"patch_targets": [], "private_reads": 285},
+    "orchestrator/tests/test_harness_already_landed_gate_wiring.py": {"patch_targets": [], "private_reads": 268},
     "orchestrator/tests/test_harness_claimant_clear.py": {"patch_targets": [], "private_reads": 17},
     "orchestrator/tests/test_harness_fleet_drain.py": {"patch_targets": [], "private_reads": 5},
     "orchestrator/tests/test_harness_host_pool.py": {"patch_targets": ["liveness.INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS"], "private_reads": 36},
