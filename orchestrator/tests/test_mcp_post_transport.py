@@ -11,8 +11,10 @@ So these tests drive a REAL ``httpx.AsyncClient`` over a real socket to
 ``shared.testing_mcp_stub.StubMcpServer``, which answers ``/mcp/`` with a 307
 and a POST lacking a JSON Accept with a 406, as the live fused-memory server
 does.  They assert the resulting STATE the server recorded: which requests
-arrived, and which ``tools/call`` it delivered past those refusals.  Only the
-``follow_redirects`` tests patch ``httpx.AsyncClient``, with the
+arrived off ``/mcp``, and which ``tools/call`` its tool layer answered past
+those refusals.  The stub's 406 is the one definition of the Accept contract,
+so an answered call is the proof the client sent it.  Only the tests that
+assert on client construction patch ``httpx.AsyncClient``, with the
 constructor-kwargs recorder from ``_mcp_client_recorder``.
 """
 
@@ -40,22 +42,6 @@ def client_factory():
 
 def _arrived_paths(server: StubMcpServer) -> list[str]:
     return [r.path for r in server.requests]
-
-
-def _off_endpoint_paths(server: StubMcpServer) -> list[str]:
-    return [path for path in _arrived_paths(server) if path != '/mcp']
-
-
-def _assert_every_request_accepted_json(server: StubMcpServer) -> None:
-    """Every request that ARRIVED must have declared it accepts JSON."""
-    arrived = server.requests
-    assert arrived, 'no request reached the server at all'
-    bad = [(r.path, r.headers.get('accept', '')) for r in arrived
-           if 'application/json' not in r.headers.get('accept', '')]
-    assert bad == [], (
-        'every MCP POST must send Accept: application/json (the live server '
-        f'answers 406 without it); these did not: {bad!r}'
-    )
 
 
 def make_workflow(*, tmp_path, mcp_url, task_id='4023', plan=None):
@@ -92,19 +78,19 @@ async def test_completion_write_actually_reaches_the_mcp_endpoint(tmp_path, serv
     """THE regression: the add_memory tools/call must land at /mcp.
 
     Under the pre-fix code the client targets /mcp/ with follow_redirects
-    unset, so the server records ZERO delivered tools/call — while the HTTP
+    unset, so the server answers ZERO tools/call — while the HTTP
     exchange itself reports a perfectly successful 307.
     """
     wf = make_workflow(tmp_path=tmp_path, mcp_url=server.url)
 
     await wf._write_completion_to_memory()
 
-    add_memory_calls = server.delivered_arguments('add_memory')
+    add_memory_calls = server.tool_call_arguments('add_memory')
     assert len(add_memory_calls) == 1, (
-        'expected exactly one add_memory tools/call DELIVERED at /mcp; got '
+        'expected exactly one add_memory tools/call ANSWERED at /mcp; got '
         f'{len(add_memory_calls)}. arrived at {_arrived_paths(server)!r}'
     )
-    assert _off_endpoint_paths(server) == []
+    assert server.off_endpoint_paths == ()
 
 
 @pytest.mark.asyncio
@@ -114,8 +100,8 @@ async def test_completion_write_never_targets_the_redirecting_slash_path(tmp_pat
 
     await wf._write_completion_to_memory()
 
-    assert _off_endpoint_paths(server) == [], (
-        f'POSTed off /mcp, e.g. to the redirecting /mcp/ path: {_off_endpoint_paths(server)!r}'
+    assert server.off_endpoint_paths == (), (
+        f'POSTed off /mcp, e.g. to the redirecting /mcp/ path: {server.off_endpoint_paths!r}'
     )
 
 
@@ -138,15 +124,15 @@ async def test_completion_write_sends_the_mcp_accept_header(tmp_path, server):
 
     Without ``Accept: application/json``, a POST that reaches /mcp is refused
     406 — so dropping the slash alone would merely relocate the silent loss.
+    The stub answers that 406 itself, so an answered call proves the header.
     """
     wf = make_workflow(tmp_path=tmp_path, mcp_url=server.url)
 
     await wf._write_completion_to_memory()
 
-    _assert_every_request_accepted_json(server)
-    assert server.delivered_arguments('add_memory') != (), (
+    assert server.tool_call_arguments('add_memory') != (), (
         'the POST was refused 406 for a missing/!json Accept header — the write '
-        'still did not land'
+        f'still did not land. arrived at {_arrived_paths(server)!r}'
     )
 
 
@@ -181,12 +167,12 @@ async def test_decisions_write_delivers_every_decision_to_the_mcp_endpoint(tmp_p
 
     await wf._write_decisions_to_memory()
 
-    calls = server.delivered_arguments('add_memory')
+    calls = server.tool_call_arguments('add_memory')
     assert len(calls) == len(DECISIONS), (
-        f'expected {len(DECISIONS)} delivered add_memory calls, got {len(calls)}. '
+        f'expected {len(DECISIONS)} answered add_memory calls, got {len(calls)}. '
         f'arrived at {_arrived_paths(server)!r}'
     )
-    assert _off_endpoint_paths(server) == []
+    assert server.off_endpoint_paths == ()
     # The decision text must survive the trip, not merely the envelope.
     delivered_text = ' '.join(args['content'] for args in calls)
     for decision in DECISIONS:
@@ -230,7 +216,7 @@ async def test_decisions_write_client_follows_redirects_and_accepts_json(
         await wf._write_decisions_to_memory()
 
     client_factory.assert_follows_redirects()
-    _assert_every_request_accepted_json(server)
+    assert len(server.tool_call_arguments('add_memory')) == len(DECISIONS)
 
 
 # ---------------------------------------------------------------------------
@@ -254,12 +240,12 @@ async def test_suggestions_write_delivers_to_the_mcp_endpoint(tmp_path, server):
 
     await wf._write_suggestions_to_memory(_reviews_with(3))
 
-    calls = server.delivered_arguments('add_memory')
+    calls = server.tool_call_arguments('add_memory')
     assert len(calls) == 3, (
-        f'expected 3 delivered add_memory calls, got {len(calls)}. '
+        f'expected 3 answered add_memory calls, got {len(calls)}. '
         f'arrived at {_arrived_paths(server)!r}'
     )
-    assert _off_endpoint_paths(server) == []
+    assert server.off_endpoint_paths == ()
 
 
 @pytest.mark.asyncio
@@ -269,7 +255,7 @@ async def test_suggestions_write_caps_at_five_delivered_calls(tmp_path, server):
 
     await wf._write_suggestions_to_memory(_reviews_with(9))
 
-    assert len(server.delivered_arguments('add_memory')) == 5
+    assert len(server.tool_call_arguments('add_memory')) == 5
 
 
 @pytest.mark.asyncio
@@ -282,7 +268,7 @@ async def test_suggestions_write_client_follows_redirects_and_accepts_json(
         await wf._write_suggestions_to_memory(_reviews_with(2))
 
     client_factory.assert_follows_redirects()
-    _assert_every_request_accepted_json(server)
+    assert len(server.tool_call_arguments('add_memory')) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -329,13 +315,13 @@ async def test_merge_worker_submit_lands_at_the_mcp_endpoint(tmp_path, server):
 
     await worker._post_submit_tasks([FIX_TASK_ARGS])
 
-    calls = server.delivered_arguments('submit_task')
+    calls = server.tool_call_arguments('submit_task')
     assert len(calls) == 1, (
-        f'expected 1 submit_task delivered at /mcp, got {len(calls)}. '
+        f'expected 1 submit_task answered at /mcp, got {len(calls)}. '
         f'arrived at {_arrived_paths(server)!r}'
     )
     assert calls[0] == FIX_TASK_ARGS
-    assert _off_endpoint_paths(server) == []
+    assert server.off_endpoint_paths == ()
 
 
 @pytest.mark.asyncio
@@ -348,11 +334,11 @@ async def test_merge_worker_client_follows_redirects_and_accepts_json(
         await worker._post_submit_tasks([FIX_TASK_ARGS])
 
     client_factory.assert_follows_redirects()
-    _assert_every_request_accepted_json(server)
+    assert len(server.tool_call_arguments('submit_task')) == 1
 
 
 @pytest.mark.asyncio
-async def test_merge_worker_submit_is_still_none_safe(tmp_path, server, client_factory):
+async def test_merge_worker_submit_is_still_none_safe(tmp_path, client_factory):
     """The documented ``self._mcp is None`` guard must survive the fix."""
     worker = _make_merge_worker(tmp_path, mcp_url=None)
 
@@ -360,4 +346,3 @@ async def test_merge_worker_submit_is_still_none_safe(tmp_path, server, client_f
         await worker._post_submit_tasks([FIX_TASK_ARGS])
 
     assert client_factory.ctor_kwargs == [], 'a None _mcp must construct no client at all'
-    assert server.requests == (), 'a None _mcp must produce no HTTP traffic at all'

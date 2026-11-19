@@ -37,7 +37,7 @@ def _make_cap_workflow(
     *,
     max_amendment_rounds: int = 1,
     escalation_queue: EscalationQueue | MagicMock | None = None,
-    mcp_url: str = 'http://localhost:8002',
+    mcp_url: str = 'http://mcp.invalid:8002',
 ) -> TaskWorkflow:
     """A workflow whose next blocking review reaches the review-cycle cap."""
     wf = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj', task_id=TASK_ID).wf
@@ -167,7 +167,7 @@ async def test_esc_4223_1_shape_one_blocking_eight_suggestions(tmp_path: Path):
         for key in ('description', 'location', 'suggested_fix'):
             assert suggestion[key] in esc.detail
 
-    submits = server.delivered_arguments('submit_task')
+    submits = server.tool_call_arguments('submit_task')
     assert len(submits) == 8
     metadata = [arguments['metadata'] for arguments in submits]
     assert {m['escalation_id'] for m in metadata} == {f'review-suggestions-{TASK_ID}'}
@@ -186,7 +186,7 @@ async def test_refused_submissions_escalate_as_undelivered(tmp_path: Path):
             outcome = await wf._execute_verify_review_loop()
 
     assert outcome == WorkflowOutcome.ESCALATED
-    assert len(server.delivered_arguments('submit_task')) == 2
+    assert len(server.tool_call_arguments('submit_task')) == 2
     [esc] = [e for e in queue.get_by_task(TASK_ID) if e.category == 'review_issues']
     assert '[suggestions → undelivered]' in esc.summary
     for suggestion in suggestions:

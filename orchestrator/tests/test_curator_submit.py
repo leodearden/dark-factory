@@ -75,7 +75,7 @@ async def test_a_ticket_reply_is_a_delivery() -> None:
     assert result.all_delivered is True
     assert result.tickets == ('tkt_A',)
     assert result.failures == ()
-    assert server.delivered_arguments('submit_task') == (arguments,)
+    assert server.tool_call_arguments('submit_task') == (arguments,)
 
 
 @pytest.mark.asyncio

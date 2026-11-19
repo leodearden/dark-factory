@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+from typing import cast
 
 import httpx
 import pytest
@@ -95,11 +96,15 @@ class TestStateful:
         assert resp.status_code == 400
         assert "Missing session ID" in resp.json()["error"]["message"]
 
-    def test_a_call_without_a_session_is_recorded_but_not_delivered(self):
+    @pytest.mark.parametrize(
+        ("session_id", "status"), [(None, 400), ("never-minted", 404)], ids=["missing", "unknown"],
+    )
+    def test_a_call_outside_a_session_is_recorded_but_not_a_tool_call(self, session_id, status):
         with StubMcpServer(stateful=True) as server:
-            _post(server, TOOLS_CALL)
+            resp = _post(server, TOOLS_CALL, session_id=session_id)
+            assert resp.status_code == status
             assert len(server.requests) == 1
-            assert server.delivered_arguments("update_task") == ()
+            assert server.tool_call_arguments("update_task") == ()
 
     def test_initialize_mints_the_session_id(self):
         with StubMcpServer(stateful=True) as server:
@@ -174,6 +179,16 @@ class TestEitherMode:
         with pytest.raises(dataclasses.FrozenInstanceError):
             setattr(first, frozen_field, "/elsewhere")
 
+    def test_off_endpoint_paths_names_every_request_not_addressed_to_mcp(self, stateful):
+        with StubMcpServer(stateful=stateful) as server:
+            _post(server, INITIALIZE)
+            httpx.post(
+                f"{server.url}/mcp/", json=INITIALIZE, headers=MCP_POST_HEADERS,
+                follow_redirects=False,
+            )
+            httpx.post(f"{server.url}/elsewhere", json=INITIALIZE, headers=MCP_POST_HEADERS)
+            assert server.off_endpoint_paths == ("/mcp/", "/elsewhere")
+
 
     def test_unavailable_tool_calls_are_503_then_served(self, stateful):
         with StubMcpServer(stateful=stateful, unavailable_tool_calls=1) as server:
@@ -189,49 +204,83 @@ def _tool_call(name: str, arguments: dict) -> dict:
     return _request("tools/call", {"name": name, "arguments": arguments}, request_id=2)
 
 
-@pytest.mark.parametrize("stateful", [False, True], ids=["stateless", "stateful"])
-class TestDeliveredArguments:
-    """A delivery is a tools/call past every transport refusal, whatever the tool answered."""
+TOOLS_CALL_NOTIFICATION = {"jsonrpc": "2.0", "method": "tools/call", "params": TOOLS_CALL["params"]}
+NO_ACCEPT = {"Content-Type": "application/json"}
 
-    def test_served_calls_are_returned_per_tool_in_arrival_order(self, stateful):
+
+@pytest.mark.parametrize("stateful", [False, True], ids=["stateless", "stateful"])
+class TestToolCallArguments:
+    """A tool call is a tools/call the tool layer answered, whatever it answered."""
+
+    def test_answered_calls_are_returned_per_tool_in_arrival_order(self, stateful):
         with StubMcpServer(stateful=stateful) as server:
             session_id = _open_session(server)
             _post(server, _tool_call("update_task", {"id": "7"}), session_id=session_id)
             _post(server, _tool_call("get_task", {"id": "9"}), session_id=session_id)
             _post(server, _tool_call("update_task", {"id": "8"}), session_id=session_id)
-            assert server.delivered_arguments("update_task") == ({"id": "7"}, {"id": "8"})
-            assert server.delivered_arguments("get_task") == ({"id": "9"},)
-            assert server.delivered_arguments("initialize") == ()
+            assert server.tool_call_arguments("update_task") == ({"id": "7"}, {"id": "8"})
+            assert server.tool_call_arguments("get_task") == ({"id": "9"},)
+            assert server.tool_call_arguments("initialize") == ()
 
-    def test_redirected_and_unacceptable_calls_are_recorded_but_not_delivered(self, stateful):
-        with StubMcpServer(stateful=stateful) as server:
+    @pytest.mark.parametrize(
+        ("answer", "path", "body", "headers", "status"),
+        [
+            pytest.param(StubAnswer.OK, "/mcp/", TOOLS_CALL, MCP_POST_HEADERS, 307, id="slash-307"),
+            pytest.param(StubAnswer.OK, "/mcp", TOOLS_CALL, NO_ACCEPT, 406, id="unacceptable-406"),
+            pytest.param(StubAnswer.OK, "/elsewhere", TOOLS_CALL, MCP_POST_HEADERS, 404, id="off-endpoint-404"),
+            pytest.param(StubAnswer.REDIRECT_307, "/mcp", TOOLS_CALL, MCP_POST_HEADERS, 307, id="scripted-307"),
+            pytest.param(
+                StubAnswer.OK, "/mcp", TOOLS_CALL_NOTIFICATION, MCP_POST_HEADERS, 202, id="notification-202",
+            ),
+        ],
+    )
+    def test_a_request_no_tool_answers_is_recorded_but_not_a_tool_call(
+        self, stateful, answer, path, body, headers, status,
+    ):
+        with StubMcpServer(stateful=stateful, answer=answer) as server:
             session_id = _open_session(server)
             arrived_before = len(server.requests)
+            headers = dict(headers)
+            if session_id is not None:
+                headers["mcp-session-id"] = session_id
+            resp = httpx.post(f"{server.url}{path}", json=body, headers=headers, follow_redirects=False)
+            assert resp.status_code == status
+            assert len(server.requests) == arrived_before + 1
+            assert server.tool_call_arguments("update_task") == ()
+
+    def test_a_scripted_redirect_followed_to_the_limit_is_never_a_tool_call(self, stateful):
+        with StubMcpServer(stateful=stateful, answer=StubAnswer.REDIRECT_307) as server:
+            session_id = _open_session(server)
             headers = dict(MCP_POST_HEADERS)
             if session_id is not None:
                 headers["mcp-session-id"] = session_id
-            redirected = httpx.post(
-                f"{server.url}/mcp/", json=TOOLS_CALL, headers=headers, follow_redirects=False,
-            )
-            del headers["Accept"]
-            unacceptable = httpx.post(f"{server.url}/mcp", json=TOOLS_CALL, headers=headers)
-            assert (redirected.status_code, unacceptable.status_code) == (307, 406)
-            assert len(server.requests) == arrived_before + 2
-            assert server.delivered_arguments("update_task") == ()
+            with pytest.raises(httpx.TooManyRedirects):
+                httpx.post(f"{server.url}/mcp", json=TOOLS_CALL, headers=headers, follow_redirects=True)
+            assert server.tool_call_arguments("update_task") == ()
 
-    def test_a_gateway_503_is_not_delivered_and_the_served_retry_is(self, stateful):
+    def test_a_gateway_503_is_not_a_tool_call_and_the_answered_retry_is(self, stateful):
         with StubMcpServer(stateful=stateful, unavailable_tool_calls=1) as server:
             session_id = _open_session(server)
             _post(server, _tool_call("update_task", {"id": "refused"}), session_id=session_id)
-            _post(server, _tool_call("update_task", {"id": "served"}), session_id=session_id)
-            assert server.delivered_arguments("update_task") == ({"id": "served"},)
+            _post(server, _tool_call("update_task", {"id": "answered"}), session_id=session_id)
+            assert server.tool_call_arguments("update_task") == ({"id": "answered"},)
 
-    def test_a_scripted_failure_answer_is_still_delivered(self, stateful):
+    def test_a_scripted_failure_answer_is_still_a_tool_call(self, stateful):
         with StubMcpServer(stateful=stateful, answer=StubAnswer.IS_ERROR) as server:
             session_id = _open_session(server)
             resp = _post(server, TOOLS_CALL, session_id=session_id)
             assert decode_mcp_response_body(resp)["result"]["isError"] is True
-            assert server.delivered_arguments("update_task") == ({"id": "7"},)
+            assert server.tool_call_arguments("update_task") == ({"id": "7"},)
+
+    def test_editing_returned_arguments_cannot_rewrite_the_record(self, stateful):
+        arguments = {"id": "7", "metadata": {"files": ["a.py"]}}
+        with StubMcpServer(stateful=stateful) as server:
+            session_id = _open_session(server)
+            _post(server, _tool_call("update_task", arguments), session_id=session_id)
+            [returned] = server.tool_call_arguments("update_task")
+            cast(dict, returned)["id"] = "edited"
+            returned["metadata"]["files"].append("b.py")
+            assert server.tool_call_arguments("update_task") == (arguments,)
 
 
 @pytest.mark.parametrize("stateful", [False, True], ids=["stateless", "stateful"])

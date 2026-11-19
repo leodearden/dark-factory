@@ -15,9 +15,9 @@ client-side fault injector whose one good reply cannot come from a socket.
 
 Real sockets rather than patching a client's modules: the session header, path
 and Accept a client sends are wire facts the server observes in
-:attr:`StubMcpServer.requests`, and :meth:`StubMcpServer.delivered_arguments`
-names the tool calls that got past the stub's own refusals, so no client
-internals are pinned. Pure stdlib,
+:attr:`StubMcpServer.requests`, and :meth:`StubMcpServer.tool_call_arguments`
+names the calls its tool layer answered, past the stub's own refusals, so no
+client internals are pinned. Pure stdlib,
 registered in ``shared/tests/test_pure_stdlib_leaves.py``.
 """
 
@@ -130,7 +130,7 @@ class StubMcpServer:
         self._tools = tools
         self._lock = threading.Lock()
         self._requests: list[RecordedRequest] = []
-        self._deliveries: list[tuple[str, Any]] = []
+        self._tool_calls: list[tuple[str, str]] = []
         self._minted: list[str] = []
         self._open: set[str] = set()
         self._httpd: ThreadingHTTPServer | None = None
@@ -174,10 +174,21 @@ class StubMcpServer:
         with self._lock:
             return tuple(self._requests)
 
-    def delivered_arguments(self, tool_name: str) -> tuple[Any, ...]:
-        """*tool_name*'s calls past every transport refusal; the answer may still be a scripted failure."""
+    @property
+    def off_endpoint_paths(self) -> tuple[str, ...]:
+        """Paths of the arrived requests not addressed to ``/mcp``, such as the redirecting ``/mcp/``."""
         with self._lock:
-            return tuple(arguments for name, arguments in self._deliveries if name == tool_name)
+            return tuple(r.path for r in self._requests if r.path != _ENDPOINT)
+
+    def tool_call_arguments(self, tool_name: str) -> tuple[Mapping[str, Any], ...]:
+        """Arguments of each *tool_name* call the tool layer answered, in arrival order.
+
+        Transport refusals, a scripted ``REDIRECT_307`` among them, and
+        notifications are not tool calls; a scripted failure answer is. Each
+        read is a fresh copy.
+        """
+        with self._lock:
+            return tuple(json.loads(text) for name, text in self._tool_calls if name == tool_name)
 
     @property
     def minted_session_ids(self) -> tuple[str, ...]:
@@ -211,13 +222,7 @@ class StubMcpServer:
         session_id, refusal = self._session_for(message['method'], request.headers)
         if refusal is not None:
             return refusal
-        if message['method'] == 'tools/call':
-            self._record_delivery(message.get('params', {}))
         return self._answer_message(message, session_id)
-
-    def _record_delivery(self, params: Mapping[str, Any]) -> None:
-        with self._lock:
-            self._deliveries.append((params.get('name', ''), params.get('arguments', {})))
 
     def _refuse_media(self, accept: str) -> _Reply | None:
         has_json, has_sse = _accepted_media(accept)
@@ -277,16 +282,28 @@ class StubMcpServer:
         if 'id' not in message:
             return _Reply(202, session_id=session_id)
         method = message['method']
-        if method == 'tools/call' and self._answer is not StubAnswer.OK:
-            return self._scripted(message, session_id)
+        if method == 'tools/call':
+            return self._answer_tool_call(message, session_id)
         if method == 'initialize':
             return self._frame(message, self._initialize_result(message), session_id)
-        if method == 'tools/call':
-            return self._frame(message, self._tool_result(message.get('params', {})), session_id)
         if method == 'tools/list':
             return self._frame(message, {'tools': []}, session_id)
         error = {'code': _METHOD_NOT_FOUND, 'message': 'Method not found'}
         return self._frame(message, None, session_id, error=error)
+
+    def _answer_tool_call(self, message: dict, session_id: str | None) -> _Reply:
+        if self._answer is StubAnswer.REDIRECT_307:
+            return _Reply(307, location=_ENDPOINT, session_id=session_id)
+        params = message.get('params', {})
+        self._record_tool_call(params)
+        if self._answer is not StubAnswer.OK:
+            return self._scripted(message, session_id)
+        return self._frame(message, self._tool_result(params), session_id)
+
+    def _record_tool_call(self, params: Mapping[str, Any]) -> None:
+        arguments_text = json.dumps(params.get('arguments', {}))
+        with self._lock:
+            self._tool_calls.append((params.get('name', ''), arguments_text))
 
     def _scripted(self, message: dict, session_id: str | None) -> _Reply:
         match self._answer:
@@ -301,12 +318,10 @@ class StubMcpServer:
                 return _Reply(200, b'Internal Server Error', 'text/plain', session_id=session_id)
             case StubAnswer.EMPTY_202:
                 return _Reply(202, session_id=session_id)
-            case StubAnswer.REDIRECT_307:
-                return _Reply(307, location=_ENDPOINT, session_id=session_id)
             case StubAnswer.JSON_RPC_ERROR:
                 error = {'code': _INVALID_PARAMS, 'message': 'Invalid params: scripted stub failure'}
                 return self._frame(message, None, session_id, error=error)
-        raise AssertionError(f'{self._answer} is not a scripted failure')
+        raise AssertionError(f'{self._answer} is not a scripted tool-layer failure')
 
     def _initialize_result(self, message: dict) -> dict:
         requested = message.get('params', {}).get('protocolVersion', '2025-03-26')

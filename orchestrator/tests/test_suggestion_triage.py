@@ -30,7 +30,7 @@ from orchestrator.workflow import StewardInterrupted, WorkflowOutcome
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_workflow(*, escalation_queue=None, escalation_event=None, mcp_url='http://localhost:8002'):
+def _make_workflow(*, escalation_queue=None, escalation_event=None, mcp_url='http://mcp.invalid:8002'):
     """Build a minimal TaskWorkflow-like object with the methods under test."""
     from orchestrator.workflow import TaskWorkflow
 
@@ -1550,8 +1550,8 @@ class TestCuratorSubmitTransport:
     discarded submissions: they patch ``httpx.AsyncClient.post`` and inspect
     the body, which cannot distinguish a delivered POST from one absorbed by
     the ``/mcp/`` -> ``/mcp`` 307.  These drive a real client over a real
-    socket to ``StubMcpServer`` instead, which records what arrived and what it
-    delivered.  The older tests are left intact — they were never wrong, only
+    socket to ``StubMcpServer`` instead, which records what arrived and which
+    tool calls it answered.  The older tests are left intact — they were never wrong, only
     insufficient.
     """
 
@@ -1577,14 +1577,12 @@ class TestCuratorSubmitTransport:
             wf = _make_workflow(mcp_url=server.url)
             await self._route(wf, self._suggestions())
 
-        arrived = [r.path for r in server.requests]
-        calls = server.delivered_arguments('submit_task')
+        calls = server.tool_call_arguments('submit_task')
         assert len(calls) == 1, (
-            f'expected 1 submit_task delivered at /mcp, got {len(calls)}. arrived at {arrived!r}'
+            f'expected 1 submit_task answered at /mcp, got {len(calls)}. '
+            f'arrived at {[r.path for r in server.requests]!r}'
         )
-        assert [path for path in arrived if path != '/mcp'] == [], (
-            'POSTed off /mcp, e.g. to the redirecting /mcp/'
-        )
+        assert server.off_endpoint_paths == (), 'POSTed off /mcp, e.g. to the redirecting /mcp/'
 
     @pytest.mark.asyncio
     async def test_client_is_constructed_with_follow_redirects(self):
