@@ -40,7 +40,7 @@ def resolve_main_sha(worktree: Path) -> str:
         return result.stdout.strip()
     except (subprocess.SubprocessError, OSError) as exc:
         logger.warning(
-            'Failed to resolve main SHA for blocking_dependency report: %s', exc
+            'resolve_main_sha: git rev-parse main failed in %s: %s', worktree, exc
         )
         return ''
 

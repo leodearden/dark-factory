@@ -56,6 +56,24 @@ def no_repo(tmp_path: Path) -> Path:
 
 FABRICATED_SHA = 'deadbeef' * 5
 
+INFRA_FAULTS = pytest.mark.parametrize(
+    'exc',
+    [subprocess.TimeoutExpired(cmd=['git'], timeout=10), OSError('no git binary')],
+    ids=['timeout', 'oserror'],
+)
+
+
+def _fail_git_call(monkeypatch, argv_word: str, exc: Exception) -> None:
+    """Make every ``git`` call whose argv names *argv_word* raise *exc*."""
+    real_run = subprocess.run
+
+    def _fake_run(argv, **kwargs):
+        if argv_word in argv:
+            raise exc
+        return real_run(argv, **kwargs)
+
+    monkeypatch.setattr(subprocess, 'run', _fake_run)
+
 
 class TestShaBranchReachability:
     def test_head_is_reachable(self, repo):
@@ -73,24 +91,13 @@ class TestShaBranchReachability:
         assert sha_branch_reachability(no_repo, FABRICATED_SHA) is Reachability.UNKNOWN
 
     @pytest.mark.parametrize('failing_probe', ['rev-parse', 'merge-base'])
-    @pytest.mark.parametrize(
-        'exc',
-        [subprocess.TimeoutExpired(cmd=['git'], timeout=10), OSError('no git binary')],
-        ids=['timeout', 'oserror'],
-    )
+    @INFRA_FAULTS
     def test_either_probe_blowing_up_is_unknown(
         self, repo, monkeypatch, failing_probe, exc,
     ):
         """An infra fault in either probe is never a verdict about the sha."""
         head = _git(repo, 'rev-parse', 'HEAD')
-        real_run = subprocess.run
-
-        def _fake_run(argv, **kwargs):
-            if failing_probe in argv:
-                raise exc
-            return real_run(argv, **kwargs)
-
-        monkeypatch.setattr(subprocess, 'run', _fake_run)
+        _fail_git_call(monkeypatch, failing_probe, exc)
 
         assert sha_branch_reachability(repo, head) is Reachability.UNKNOWN
 
@@ -112,3 +119,9 @@ class TestResolveMainSha:
 
     def test_outside_any_repository_is_empty(self, no_repo):
         assert resolve_main_sha(no_repo) == ''
+
+    @INFRA_FAULTS
+    def test_git_blowing_up_is_empty(self, repo, monkeypatch, exc):
+        _fail_git_call(monkeypatch, 'rev-parse', exc)
+
+        assert resolve_main_sha(repo) == ''

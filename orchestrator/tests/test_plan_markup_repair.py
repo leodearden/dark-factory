@@ -72,6 +72,17 @@ class TestRepairPlanFields:
         assert facts[0]['recovered_params'] == ['rationale']
         assert plan == before
 
+    def test_a_refused_value_is_reported_under_the_injected_tool(self):
+        quoted = 'The harness ends the call with ' + INVOKE_CLOSER + ' and then keeps going.'
+        plan = corrupt_plan(design_decisions=[{'decision': quoted, 'rationale': ''}])
+
+        repaired, facts = repair_plan_fields(plan, TABLE)
+
+        assert repaired['design_decisions'][0]['decision'] == quoted
+        assert [(f['outcome'], f['tool'], f['field']) for f in facts] == [
+            ('unrepairable', 'record_choice', 'decision'),
+        ]
+
     def test_a_field_the_table_does_not_list_is_left_alone(self):
         plan = _poisoned_analysis()
         analysis = plan['analysis']
