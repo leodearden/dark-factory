@@ -15,7 +15,11 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import pytest
 from cli_subprocess_timeout import cli_timeout_from_env
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SCRIPT = (
     Path(__file__).resolve().parents[1] / "deploy" / "check_build_cache_in_service.py"

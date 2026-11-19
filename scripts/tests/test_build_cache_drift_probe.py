@@ -19,6 +19,9 @@ from typing import Any
 import pytest
 from cli_subprocess_timeout import cli_timeout_from_env
 from laptop_battery_guard_fixtures import write_shims
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 PROBE = Path(__file__).resolve().parents[1] / "deploy" / "build_cache_drift_probe.sh"
 CLI_TIMEOUT = cli_timeout_from_env("BUILD_CACHE_DRIFT_PROBE_TEST_TIMEOUT")

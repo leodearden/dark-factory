@@ -33,6 +33,9 @@ from typing import Any
 import pytest
 from cli_subprocess_timeout import cli_timeout_from_env
 from laptop_battery_guard_fixtures import write_shims
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 DEPLOY = Path(__file__).resolve().parents[1] / "deploy"
 PRUNER = DEPLOY / "build_cache_store_prune.py"
