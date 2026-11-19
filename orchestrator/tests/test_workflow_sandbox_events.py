@@ -18,6 +18,7 @@ exercised here.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -32,7 +33,7 @@ from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps
 from orchestrator.scheduler import TaskAssignment
-from orchestrator.workflow import IMPLEMENTER, TaskWorkflow
+from orchestrator.workflow import IMPLEMENTER, SIMPLE_TASK, TaskWorkflow
 from orchestrator.workflow_types import WorkflowState, WorkflowStateMachine
 
 
@@ -47,9 +48,9 @@ def _make_bare_workflow(
     return wf
 
 
-def _make_write_set(**overrides: Path) -> WriteSet:
+def _make_write_set(**overrides: Path | tuple[Path, ...]) -> WriteSet:
     """A WriteSet from dummy Paths — digest() depends only on writable_paths()."""
-    fields: dict[str, Path] = dict(
+    base = WriteSet(
         worktree=Path('/wt'),
         task_meta=Path('/base/.task-meta/wt'),
         task_root=Path('/base/.task-meta/task-2909'),
@@ -62,8 +63,14 @@ def _make_write_set(**overrides: Path) -> WriteSet:
         tmp=Path('/tmp'),
         dev=Path('/dev'),
     )
-    fields.update(overrides)
-    return WriteSet(**fields)
+    return dataclasses.replace(base, **overrides)
+
+
+def _docs_grant_write_set() -> WriteSet:
+    return _make_write_set(
+        docs_main_git=Path('/main/.git'),
+        docs_main_paths=(Path('/main/docs/a.md'), Path('/main/CLAUDE.md')),
+    )
 
 
 class TestEmitSandboxApplied:
@@ -100,6 +107,21 @@ class TestEmitSandboxApplied:
         assert events[0]['data']['backend'] == 'none'
         assert events[0]['data']['digest'] == write_set.digest()
         assert events[0]['role'] == 'debugger'
+
+    def test_docs_main_grant_adds_its_paths_to_the_payload(self, tmp_path):
+        store = EventStore(tmp_path / 'events.db', 'run')
+        wf = _make_bare_workflow(event_store=store)
+        write_set = _docs_grant_write_set()
+
+        wf._emit_sandbox_applied('simple_task', 'landlock', write_set)
+
+        events = store.fetch_events_by_type(EventType.sandbox_applied)
+        assert len(events) == 1
+        assert events[0]['data'] == {
+            'backend': 'landlock',
+            'digest': write_set.digest(),
+            'docs_main_paths': ['/main/docs/a.md', '/main/CLAUDE.md'],
+        }
 
     def test_no_event_store_is_a_noop(self, tmp_path):
         wf = _make_bare_workflow(event_store=None)
@@ -216,7 +238,7 @@ class TestInvokeWiresEnsureSandboxDirs:
         hermetic = _make_write_set(claude_fleet=claude_fleet)
         assert not claude_fleet.exists()
         monkeypatch.setattr(
-            'orchestrator.workflow.compute_write_set', lambda _cwd, *, task_id, task_root: hermetic,
+            'orchestrator.workflow.compute_write_set', lambda _cwd, **_kw: hermetic,
         )
 
         # Spy: record whether claude_fleet already exists on disk at the moment
@@ -262,3 +284,98 @@ class TestInvokeWiresEnsureSandboxDirs:
         )
         # And the dir is actually materialized on disk after dispatch.
         assert claude_fleet.is_dir()
+
+
+async def _invoke_sandboxed(
+    tmp_path: Path, monkeypatch, *, role, plan: dict, metadata_files: list[str],
+    write_set: WriteSet,
+) -> list[dict[str, object]]:
+    """Drive the real ``_invoke`` sandbox branch for task 42 with
+    ``compute_write_set`` replaced by a recorder; return its kwargs per call."""
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    _init_git_repo(repo)
+    config = OrchestratorConfig(
+        project_root=repo,
+        max_concurrent_tasks=1,
+        git=GitConfig(
+            main_branch='main', branch_prefix='task/', remote='origin',
+            worktree_dir='.worktrees',
+        ),
+    )
+    git_ops = GitOps(config.git, config.project_root)
+    cwd = (await git_ops.create_worktree('42')).path
+    assignment = TaskAssignment(
+        task_id='42',
+        task={
+            'id': '42', 'title': 'X', 'description': 'Y', 'status': 'pending',
+            'metadata': {'files': metadata_files}, 'dependencies': [],
+        },
+        modules=['README'],
+    )
+    workflow = TaskWorkflow(
+        assignment=assignment,
+        config=config,
+        git_ops=git_ops,
+        scheduler=FakeScheduler(),  # type: ignore[arg-type]
+        briefing=FakeBriefing(),  # type: ignore[arg-type]
+        mcp=None,
+    )
+    workflow.artifacts = None
+    workflow.plan = plan
+
+    calls: list[dict[str, object]] = []
+
+    def _record(_cwd: Path, **kwargs: object) -> WriteSet:
+        calls.append(kwargs)
+        return write_set
+
+    monkeypatch.setattr('orchestrator.workflow.compute_write_set', _record)
+    saved_backend = sandbox_dispatch.get_backend()
+    sandbox_dispatch.set_backend('none')
+    try:
+        with patch(
+            'orchestrator.workflow.invoke_with_cap_retry',
+            new_callable=AsyncMock,
+            return_value=AgentResult(success=True, output=''),
+        ):
+            await workflow._invoke(role, fixed_prompt('PROMPT'), cwd)
+    finally:
+        sandbox_dispatch.set_backend(saved_backend)
+    return calls
+
+
+@pytest.mark.asyncio
+class TestInvokeForwardsDeclaredFiles:
+    """``_invoke`` hands ``compute_write_set`` the task's declared files: the
+    plan's ``files``, else ``metadata.files`` — the fallback the SIMPLE_TASK
+    fast path (no plan yet) depends on for the docs-only main grant."""
+
+    async def test_plan_files_win_over_metadata_files(self, tmp_path, monkeypatch):
+        calls = await _invoke_sandboxed(
+            tmp_path, monkeypatch, role=IMPLEMENTER,
+            plan={'files': ['docs/a.md']}, metadata_files=['x.py'],
+            write_set=_make_write_set(claude_fleet=tmp_path / 'fleet'),
+        )
+        assert [c['declared_files'] for c in calls] == [['docs/a.md']]
+
+    async def test_simple_task_without_plan_falls_back_to_metadata_files(
+        self, tmp_path, monkeypatch, caplog,
+    ):
+        granted = dataclasses.replace(
+            _docs_grant_write_set(), claude_fleet=tmp_path / 'fleet',
+        )
+        with caplog.at_level(logging.INFO, logger='orchestrator.workflow'):
+            calls = await _invoke_sandboxed(
+                tmp_path, monkeypatch, role=SIMPLE_TASK,
+                plan={}, metadata_files=['docs/a.md'], write_set=granted,
+            )
+
+        assert [c['declared_files'] for c in calls] == [['docs/a.md']]
+        grant_logs = [
+            r.getMessage() for r in caplog.records
+            if r.levelno == logging.INFO and '/main/docs/a.md' in r.getMessage()
+        ]
+        assert grant_logs, [r.getMessage() for r in caplog.records]
+        assert '42' in grant_logs[0]
+        assert SIMPLE_TASK.name in grant_logs[0]
