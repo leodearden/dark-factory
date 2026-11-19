@@ -367,8 +367,8 @@ the same for an embedding arm's copy, re-embed and index transitions.
 - A search that overruns its read budget stops `embed-run` and `run`: they exit
   1 with its `TimeoutError` and write no `run.json`. The timeout is never
   counted in `query_failures` or read as a miss, because the budget spans the
-  arm's query embedding and FalkorDB's search legs, so it is not the arm's. The
-  arm's own query latency is measured by `query-embed-latency-p95` against the
+  query embedding and FalkorDB's search legs, so it is not the arm's. The arm's
+  own query latency is measured by `query-embed-latency-p95` against the
   envelope. Before re-running, remove the scratch graph it left with
   `teardown --arm-spec S`, adding `--collection` for an embedding arm's replica.
 - The harness never sets graphiti's `SEMAPHORE_LIMIT`, whose env name collides
