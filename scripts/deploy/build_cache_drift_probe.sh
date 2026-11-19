@@ -20,8 +20,12 @@
 # (esc-10782-1). The module list is derived from <checkout>/Cargo.lock each
 # run: every registry crate's [package.metadata.system-deps] entries, read
 # from its source under $CARGO_HOME/registry/src, plus the pkg-config names in
-# x11-dl's build.rs. cargo.registry-sources-missing names any locked registry
-# crate whose source is not on this host, whose modules the list then lacks.
+# x11-dl's build.rs. #info.cargo.registry-sources-missing names any locked
+# registry crate whose source is not on this host. It is informational: which
+# sources a host holds depends on what it last fetched (a Linux build never
+# downloads windows-* or objc2-* crates), not on a cache-key input. A missing
+# crate that declares system-deps still shows in the comparison, because its
+# pkg-config.<module> lines are absent on that host only.
 # Whole-system package or module lists are not compared: hosts legitimately
 # differ in hundreds of unrelated ones.
 #
@@ -143,7 +147,7 @@ for package in tomllib.loads(lock.read_text()).get('package', []):
         missing.append(f"{package['name']}-{package['version']}")
     else:
         modules.update(probed_modules(source, package['name']))
-print(f"cargo.registry-sources-missing\t{' '.join(sorted(missing))}")
+print(f"#info.cargo.registry-sources-missing\t{' '.join(sorted(missing))}")
 for module in sorted(modules):
     version = pkg_config('--modversion', module)
     value = 'ABSENT' if version is None else f"{version}; libdir={pkg_config('--variable=libdir', module)}"

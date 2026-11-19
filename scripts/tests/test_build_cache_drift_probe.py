@@ -37,7 +37,6 @@ REQUIRED_LINES = {
     "cc1plus",
     "as",
     "dpkg.toolchain",
-    "cargo.registry-sources-missing",
 }
 
 FIXTURE_MODULES = {"glib-2.0", "gobject-2.0", "gtk+-3.0", "gtk-3.0-fallback", "x11", "xscrnsaver", "zlib"}
@@ -352,7 +351,18 @@ class TestDriftProbe:
         assert derived == FIXTURE_MODULES | {"slvs"}
         assert lines["pkg-config.glib-2.0"] == "2.80.0; libdir=/usr/lib/glib-2.0"
         assert lines["pkg-config.xscrnsaver"] == "ABSENT"
-        assert lines["cargo.registry-sources-missing"] == "winapi-0.3.9"
+        assert lines["#info.cargo.registry-sources-missing"] == "winapi-0.3.9"
+
+    def test_a_fetched_source_without_system_deps_changes_no_compared_line(
+        self, world: ProbeWorld
+    ) -> None:
+        before = world.probe()
+        winapi = world.home / ".cargo" / "registry" / "src" / "index.crates.io-1949cf8c6b5b557f" / "winapi-0.3.9"
+        winapi.mkdir()
+        (winapi / "Cargo.toml").write_text('[package]\nname = "winapi"\nversion = "0.3.9"\n')
+        after = world.probe()
+        assert changed_lines(before, after) == set()
+        assert after["#info.cargo.registry-sources-missing"] == ""
 
     def test_a_module_going_present_changes_only_its_line(self, world: ProbeWorld) -> None:
         before = world.probe()

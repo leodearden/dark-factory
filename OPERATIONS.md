@@ -2121,9 +2121,12 @@ the laptop only (libxss-dev, esc-10782-1). The module list is derived from the
 checkout's `Cargo.lock` on every run: each locked registry crate's
 `[package.metadata.system-deps]` entries, read from its source under
 `$CARGO_HOME/registry/src`, plus the pkg-config names in x11-dl's `build.rs`.
-`cargo.registry-sources-missing` names locked registry crates whose source is
-not on that host; the module list then lacks their entries, so a difference on
-that line means running `cargo fetch` in the reify checkout first. Whole-system
+`#info.cargo.registry-sources-missing` names locked registry crates whose
+source is not on that host. It is informational and never compared: it lists
+what the host has not fetched, mostly target-specific crates a Linux build
+never downloads. If a missing crate declares system-deps, its
+`pkg-config.<module>` lines are absent on that host only, so the diff shows
+it. Run `cargo fetch` in the reify checkout on that host and probe again. Whole-system
 package and module lists are not compared, because the hosts legitimately
 differ in hundreds of unrelated packages. A probe of a checkout with no
 `Cargo.lock` exits 2.
