@@ -1835,10 +1835,11 @@ class TestMainSuppressesBanner:
 # mark_step_committed — pre-satisfy a plan step at AUTHORING time, guarded by a
 # REAL `git cat-file -e <sha>` existence check (task 3030 / PRD Contract A1).
 #
-# Driven against a REAL temp git repo, NOT a monkeypatched _sha_exists_on_branch:
-# a stubbed always-True guard would mask the corroborate-before-acting invariant,
-# so the bogus-sha "plan unchanged" assertion only has teeth when a real repo
-# distinguishes a resolving sha from a non-resolving one.
+# Driven against a REAL temp git repo, NOT a monkeypatched
+# branch_probes.sha_exists_on_branch: a stubbed always-True guard would mask the
+# corroborate-before-acting invariant, so the bogus-sha "plan unchanged"
+# assertion only has teeth when a real repo distinguishes a resolving sha from a
+# non-resolving one.
 # ---------------------------------------------------------------------------
 
 

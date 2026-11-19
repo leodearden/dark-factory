@@ -88,7 +88,7 @@ def _seed_self_name_plan(artifacts) -> dict:
 class TestSelfNameCloserIsSeenByTheReadRepair:
     """Epsilon's lazy read-repair was gated on a predicate that could not see it.
 
-    ``_carries_markup`` is the cheap prefilter that decides whether the repair
+    ``plan_markup_repair.carries_markup`` is the cheap prefilter that decides whether the repair
     pass runs at all, and it asked the param-free ``detect``. A plan whose only
     damage is a field mis-closed with its OWN name-echoing tag therefore looked
     CLEAN: the prefilter returned False, the deep copy never happened, and the
@@ -98,7 +98,7 @@ class TestSelfNameCloserIsSeenByTheReadRepair:
 
     The repairer behind that gate was correct for them the whole time. Unlike
     the middleware boundary, this site pays NOTHING to be fully schema-aware:
-    the walk already yields the ``_PlanField`` record, so ``record.field`` and
+    the walk already yields the ``PlanField`` record, so ``record.field`` and
     ``record.schema_params`` are both in hand from the DECLARED table.
     """
 
