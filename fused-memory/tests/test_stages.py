@@ -5645,7 +5645,7 @@ class TestBriefingKnownGapsRefresh:
 
     @pytest.mark.asyncio
     async def test_an_unavailable_injected_tree_does_not_suppress_the_dedup_fetch(
-        self, mock_deps, tmp_path,
+        self, mock_deps, tmp_path, caplog,
     ):
         """An unknown injected tree is not 'no pending tasks': the hook fetches its own tree to dedup."""
         scripts_dir = tmp_path / 'scripts'
@@ -5679,6 +5679,7 @@ class TestBriefingKnownGapsRefresh:
                 'fused_memory.reconciliation.stages.base.run_stage_via_cli',
                 new=AsyncMock(return_value=StageResult(success=True, report={'summary': 'ok'})),
             ),
+            caplog.at_level(logging.INFO, logger=_TKS_LOGGER),
         ):
             await stage.run(
                 events=[],
@@ -5687,8 +5688,12 @@ class TestBriefingKnownGapsRefresh:
                 run_id='test-run-unavailable-tree',
             )
 
+        queued_records = [
+            r for r in caplog.records
+            if r.name == _TKS_LOGGER and r.getMessage() == 'briefing_refresh_tasks_queued'
+        ]
+        assert [getattr(r, 'skipped_ids', None) for r in queued_records] == [['1751']]
         mock_deps['taskmaster'].add_task.assert_not_called()
-        mock_deps['taskmaster'].get_tasks.assert_any_await(project_root=str(tmp_path))
 
     @pytest.mark.asyncio
     async def test_run_swallows_helper_failure(self, mock_deps, tmp_path, caplog):
