@@ -7564,6 +7564,36 @@ class TestFailedTreeFetchReachesStagesAsUnavailable:
         assert '0 active shown' not in payload
         assert f'### Recently Completed Tasks\n{notice}\n' in payload
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('reason', _PUBLICLY_REACHABLE_FETCH_FAILURES)
+    async def test_stage2_tree_sample_sections_say_unavailable(
+        self, journal, event_buffer, mock_memory_service, monkeypatch, reason,
+    ):
+        payload = await _stage2_payload_after_failed_fetch(
+            journal, event_buffer, mock_memory_service, monkeypatch, reason,
+        )
+
+        notice = f'Task tree unavailable: {reason.value}'
+        assert f'### Proactive Task Sample\n{notice}' in payload
+        assert f'### Done-Task Completion-Memory Audit\n{notice}' in payload
+        assert '### Proactive Task Sample (0 tasks)' not in payload
+        assert '(0 since last cycle)' not in payload
+
+    @pytest.mark.asyncio
+    async def test_a_fetched_empty_project_still_renders_an_empty_sample(
+        self, journal, event_buffer, mock_memory_service, monkeypatch,
+    ):
+        taskmaster = AsyncMock()
+        taskmaster.get_tasks.return_value = {'tasks': []}
+        taskmaster.get_statuses_fresh.return_value = {}
+
+        payload = await _stage2_payload_after_full_cycle(
+            journal, event_buffer, mock_memory_service, monkeypatch, taskmaster,
+        )
+
+        assert '### Proactive Task Sample (0 tasks)' in payload
+        assert 'Task tree unavailable' not in payload
+
 
 # ── Tests for task 455: harness wires filtered_task_tree into stages ──────────
 
