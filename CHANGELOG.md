@@ -28,8 +28,9 @@ Promotion, which releases held tasks one at a time, is task 8418. See
 
 - New config key `followup_hold.backfill_enabled`, default `true`,
   restart-only. The first fused-memory start after deploy holds the existing
-  pending follow-up stock of every known project before serving. A second
-  start holds nothing.
+  pending follow-up stock of every known project before serving, except a
+  follow-up that an active, non-deferred task in any known project waits on,
+  directly or through other stock follow-ups. A second start holds nothing.
 - `set_task_status` gained `release_holder` (strict bool, default `false`).
   `done`, `cancelled` or `deferred` on a holder is refused with
   `followup_holder_protected` unless it is the literal `true`, because that

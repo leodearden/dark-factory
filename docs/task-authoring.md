@@ -869,7 +869,17 @@ project before the server serves
 walking the primary root plus `DASHBOARD_KNOWN_PROJECT_ROOTS`). It holds
 every `pending` task the rule matches unless the task already depends on the
 holder or already carries a `followup_hold` record, so a promoted or released
-task is never re-held and a second start holds nothing. Each task's edge and
+task is never re-held and a second start holds nothing. It also leaves unheld
+any pending follow-up that an active, non-deferred task waits on, directly or
+through other stock follow-ups, whether that task is in the same project or in
+another known project that cites it in `metadata.external_deps`
+(`fused-memory/src/fused_memory/middleware/followup_hold.py::backfill`). Such
+a wait existed before the hold, and none of promotion's triggers
+(`plans/follow-up-filing-shape-prd.md` §3 decision 14) fires for it, so
+holding the follow-up would jam its dependent silently. An edge between two
+follow-ups the backfill holds stays held, since promotion's closure releases
+them together. If the backfill cannot read a known project's store, that
+project's backfill fails rather than holding blind. Each task's edge and
 record land in one backend write, with no `task_modified` event. Each
 project emits exactly one `followup_hold_backfilled {project_id, count}`
 event, even when `count` is 0. One project's failure is logged at ERROR and
