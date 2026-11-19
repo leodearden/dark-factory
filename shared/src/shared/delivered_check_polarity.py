@@ -1238,7 +1238,7 @@ def extract_delivered_checks(metadata: object) -> list[dict[str, Any]]:
     * the decoded mapping → the ``checks`` of
       ``shared/src/shared/declared_checks.py::declared_checks``
 
-    That function is the SPEC this is kept in sync with, and it is
+    ``extract_files`` is the SPEC this is kept in sync with, and it is
     DUPLICATED rather than imported for one structural reason: it lives in
     ``fused_memory``, and ``shared`` must not import ``fused_memory`` (the
     dependency runs the other way — this module exists in ``shared``

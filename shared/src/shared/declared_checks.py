@@ -1,7 +1,7 @@
 """The one reader of a task's declared ``metadata.delivered_checks``.
 
 Reading rule: absent, ``None`` or any falsy value declares nothing. A list or tuple is split
-element-wise, order kept: mappings go to ``checks``, everything else to ``unreadable``. Any other
+element-wise, order kept: dicts go to ``checks``, everything else to ``unreadable``. Any other
 truthy value (a bare dict, a str, an int) is one ``unreadable`` entry and is never iterated.
 
 The split is on shape only; descriptor validation stays in
