@@ -17,8 +17,11 @@ from dotenv import load_dotenv
 
 from orchestrator.config import ConfigRequiredError, OrchestratorConfig, load_config
 
+CONFIG_OPTION_HELP_PREFIX = (
+    'Path to orchestrator config YAML (REQUIRED unless ORCH_CONFIG_PATH is set).'
+)
 CONFIG_OPTION_HELP = (
-    'Path to orchestrator config YAML (REQUIRED unless ORCH_CONFIG_PATH is set). '
+    f'{CONFIG_OPTION_HELP_PREFIX} '
     'Selects the target project — sets project_root and fused_memory.project_id.'
 )
 

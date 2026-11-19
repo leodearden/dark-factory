@@ -9,13 +9,12 @@ from typing import Any
 import click
 from shared.project_layout import runs_db, tasks_db
 
-from orchestrator.cli_config import pass_config
+from orchestrator.cli_config import CONFIG_OPTION_HELP_PREFIX, pass_config
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.main_checkout_defaults import cli_default
 from orchestrator.routing import RoleDefaults, RouteInputs, RoutingDecision, resolve_route
 from orchestrator.shadow_types import ShadowShape
 
-_SHORT_CONFIG_HELP = 'Path to orchestrator config YAML (REQUIRED unless ORCH_CONFIG_PATH is set).'
 PACKAGED_TASKS_DIR = Path(__file__).parent / 'tasks'
 
 eval_cli = click.Group('eval-cli')
@@ -615,7 +614,7 @@ def _run_confirm_driver(
 
 
 @eval_cli.command('eval-ofat')
-@pass_config(help=_SHORT_CONFIG_HELP)
+@pass_config(help=CONFIG_OPTION_HELP_PREFIX)
 @click.option('--tasks-dir', type=click.Path(path_type=Path), default=None,
               help='Fixture dir (default: orchestrator/evals/tasks)')
 @click.option('--trials', type=int, default=1,
@@ -639,7 +638,7 @@ def eval_ofat_cmd(config, tasks_dir, trials, max_parallel, timeout):
 
 
 @eval_cli.command('eval-matrix')
-@pass_config(help=_SHORT_CONFIG_HELP)
+@pass_config(help=CONFIG_OPTION_HELP_PREFIX)
 @click.option('--tasks-dir', type=click.Path(path_type=Path), default=None,
               help='Fixture dir (default: orchestrator/evals/tasks)')
 @click.option('--trials', type=int, default=1,
@@ -662,7 +661,7 @@ def eval_matrix_cmd(config, tasks_dir, trials, max_parallel, timeout):
 
 
 @eval_cli.command('eval-confirm')
-@pass_config(help=_SHORT_CONFIG_HELP)
+@pass_config(help=CONFIG_OPTION_HELP_PREFIX)
 @click.option('--arch', required=True,
               help='Winning architect config name (e.g. architect-opus-high)')
 @click.option('--impl', required=True,
@@ -694,7 +693,7 @@ def eval_shadow():
 
 
 @eval_shadow.command('report')
-@pass_config(help=_SHORT_CONFIG_HELP)
+@pass_config(help=CONFIG_OPTION_HELP_PREFIX)
 @click.option('--shape', type=click.Choice([s.value for s in ShadowShape]),
               default=ShadowShape.IMPLEMENTER.value, show_default=True,
               help='Cell shape to report.')

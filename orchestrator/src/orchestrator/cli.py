@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
 import click
 from shared.spawn_temp_files import sweep_orphaned_spawn_temp_files
 
-from orchestrator.cli_config import load_program_dotenv, pass_config
+from orchestrator.cli_config import CONFIG_OPTION_HELP_PREFIX, load_program_dotenv, pass_config
 from orchestrator.config import OrchestratorConfig
 from orchestrator.config_census_ignore import audit_census_ignore_entries
 from orchestrator.evals.cli import eval_cli
@@ -1178,9 +1178,8 @@ def gate_identity():
 @click.option('--request-id', required=True,
               help='Request ID passed to the verify-merge or verify-task invocation '
                    'to cancel; the worktree that run recorded is reaped too.')
-@pass_config(help='Path to orchestrator config YAML (REQUIRED unless ORCH_CONFIG_PATH '
-                  'is set). Selects the target project — determines worktree_base for '
-                  'the pgid-file lookup.')
+@pass_config(help=f'{CONFIG_OPTION_HELP_PREFIX} Selects the target project — determines '
+                  'worktree_base for the pgid-file lookup.')
 def cancel_verify(request_id: str, config: OrchestratorConfig):
     """Kill the verify-merge or verify-task tree identified by --request-id and exit 0.
 
