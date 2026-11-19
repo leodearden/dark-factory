@@ -182,8 +182,8 @@ async def test_refused_submissions_escalate_as_undelivered(tmp_path: Path):
 
     with StubMcpServer(stateful=False, payload=refusal) as server:
         wf = _make_cap_workflow(tmp_path, escalation_queue=queue, mcp_url=server.url)
-        wf._review = AsyncMock(return_value=_blocking(suggestions))  # type: ignore[method-assign]
-        outcome = await wf._execute_verify_review_loop()
+        with patch.object(wf, '_review', AsyncMock(return_value=_blocking(suggestions))):
+            outcome = await wf._execute_verify_review_loop()
 
     assert outcome == WorkflowOutcome.ESCALATED
     assert len(server.delivered_arguments('submit_task')) == 2
