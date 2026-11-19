@@ -166,6 +166,29 @@ def test_the_delivered_check_arm_is_unsatisfied_only_on_a_failed_check(
     assert verdict == expected
 
 
+@pytest.mark.parametrize(
+    ('declaration', 'expected'),
+    [
+        (
+            {'name': 'cap', 'kind': 'grep', 'pattern': 'X', 'expect': 'present'},
+            DepsVerdict.unknown(DepKind.DELIVERED_CHECK),
+        ),
+        ({}, SATISFIED),
+    ],
+    ids=['bare-dict-is-still-gated', 'empty-dict-declares-nothing'],
+)
+def test_the_delivered_check_arm_gates_every_non_empty_declaration(declaration, expected):
+    dep = {'id': 'D', 'status': 'done', 'metadata': {'delivered_checks': declaration}}
+    verdict = deps_verdict(
+        _dependent('D'),
+        {'D': 'done'},
+        {},
+        delivered_check_cache={},
+        terminal_dep_records={'D': dep},
+    )
+    assert verdict == expected
+
+
 def test_a_local_dependency_without_a_status_is_unsatisfied():
     assert deps_verdict(_dependent('D'), {}) == DepsVerdict.unsatisfied(DepKind.LOCAL)
 
