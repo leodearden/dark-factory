@@ -155,27 +155,32 @@ def host_share(levels: Iterable[ChainLevel]) -> float:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    """Print each window; exit 2 if any --chain was absent from some window, after printing the rest."""
     args = _parse_args(argv)
+    chain_missing = False
     for _ in range(args.repeat):
         before = read_tree(args.cgroup_root, args.proc_root)
         time.sleep(args.window)
         after = read_tree(args.cgroup_root, args.proc_root)
         elapsed = after.taken_at - before.taken_at
         windows = measure(before, after, elapsed)
-        missing = [chain for chain in args.chain if chain not in windows]
-        if missing:
-            for chain in missing:
-                print(f'--chain {chain}: not in the measured tree under {args.cgroup_root}', file=sys.stderr)
-            return 2
         print(_header(elapsed, args.proc_root))
         _print_table(_sibling_rows(windows, args.min_cores))
         for chain in args.chain:
-            levels = share_chain(windows, chain)
-            print(f'chain {chain}')
-            _print_table([CHAIN_COLUMNS, *(_chain_row(level) for level in levels)])
-            print(f'host_share {host_share(levels):.4f}')
-        print()
-    return 0
+            if chain in windows:
+                _print_chain(share_chain(windows, chain), chain)
+            else:
+                chain_missing = True
+                sys.stdout.flush()
+                print(f'--chain {chain}: not in the measured tree under {args.cgroup_root}', file=sys.stderr)
+        print(flush=True)
+    return 2 if chain_missing else 0
+
+
+def _print_chain(levels: Sequence[ChainLevel], leaf: str) -> None:
+    print(f'chain {leaf}')
+    _print_table([CHAIN_COLUMNS, *(_chain_row(level) for level in levels)])
+    print(f'host_share {host_share(levels):.4f}')
 
 
 def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:

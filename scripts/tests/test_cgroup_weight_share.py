@@ -316,8 +316,10 @@ def test_cli_prints_a_header_and_one_row_per_chain_level(host, capsys):
     assert any(line.startswith('host_share') for line in lines)
 
 
-def test_cli_rejects_a_chain_path_absent_from_the_tree(host, capsys):
+def test_cli_reports_a_chain_path_absent_from_the_tree_and_still_prints_the_window(host, capsys):
     write_reify_host(host, core_windows={}, wait_windows={})
     missing = f'{REIFY_SLICE}/nope.scope'
     assert main(cli_args(host, missing)) == 2
-    assert missing in capsys.readouterr().err
+    captured = capsys.readouterr()
+    assert missing in captured.err
+    assert 'procs_running/nproc' in captured.out
