@@ -43,7 +43,6 @@ from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple, Protocol
 
-from escalation.dedupe import DedupeConfig, content_fingerprint_key, submit_or_dedupe
 from escalation.models import Escalation
 from shared.mcp_post import open_mcp_client, post_mcp_tool_call
 
@@ -57,7 +56,6 @@ from orchestrator.dry_run_unblock import (
 )
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.flake_recorder import (
-    record_flake_observation,
     record_merge_flake_suppression,
 )
 from orchestrator.git_ops import (
@@ -147,6 +145,13 @@ from orchestrator.merge_lane.liveness import (
     verify_tree_cpu_ticks,
 )
 from orchestrator.merge_lane.lookahead_hold import LookaheadHold
+from orchestrator.merge_lane.main_health_probe import (
+    MAIN_HEALTH_RED_REASON_PREFIX,
+    MainHealthProbeHandles,
+    classify_main_health_red,
+    file_main_health_escalation,
+    spawn_main_health_probe,
+)
 from orchestrator.merge_lane.member_redrive import MemberRedriveOutcome, MemberRedriver
 from orchestrator.merge_lane.no_progress_abort import NoProgressAbort, emit_no_progress_abort
 from orchestrator.merge_lane.outcome_facts import ConflictEvidence, MergeBlockCategory
@@ -275,7 +280,6 @@ from orchestrator.task_status import WORKFLOW_PRESERVE_STATUSES
 from orchestrator.teardown import complete_despite_cancellation
 from orchestrator.unblock_types import BlockClass
 from orchestrator.verify import (
-    FlakeObservationSink,
     VerifyResult,
     _derive_task_files_from_git,
     cached_main_baseline_failing_ids,
@@ -285,13 +289,11 @@ from orchestrator.verify import (
     red_module_prefixes_of,
     run_scoped_verification,
     seed_main_baseline,
-    verify_failure_is_preexisting_on_main,
 )
 from orchestrator.verify_cancel import elide_middle
 from orchestrator.verify_categories import (
     INDETERMINATE_VERDICT_CATEGORIES,
     INFRA_TRANSIENT_CATEGORIES,
-    PREEXISTING_BREAK_SKIP_CATEGORIES,
 )
 from orchestrator.verify_classify import reports_disk_full
 from orchestrator.verify_plan import effective_merge_module_configs
@@ -311,7 +313,6 @@ from orchestrator.verify_runner import (
 
 if TYPE_CHECKING:
     from orchestrator.config import ModuleConfig, OrchestratorConfig
-    from orchestrator.flake_ledger import FlakeSuppression
 
 logger = logging.getLogger('orchestrator.merge_lane')
 
@@ -471,19 +472,6 @@ pattern-match this prefix to distinguish a fully-clean landing
 cleanup."""
 
 
-MAIN_HEALTH_RED_REASON_PREFIX = 'Main-health red: merge verify failure reproduces on bare main'
-"""Prefix of the ``MergeOutcome.reason`` string emitted when the post-merge
-verify failure is classified as a pre-existing break already present on bare
-main HEAD — i.e. not introduced by this task's merge.
-
-The workflow ``_submit_to_merge_queue`` pattern-matches this prefix and routes
-the outcome to a single dedup'd L1 escalation (``escalate_to_human=True``,
-``category='preexisting_main_break'``), skipping the steward entirely.  The
-steward operates in-branch and cannot fix a broken main; routing each
-concurrent failing merge to the steward would cause an ~85 min-per-task
-livelock for every task whose verify runs against a red main."""
-
-
 TRIVIAL_PASS_MAIN_RED_REASON_PREFIX = (
     'Trivial-pass withheld: config-only merge would advance main over a '
     'known-red state'
@@ -522,19 +510,19 @@ MAIN_HEALTH_PROBE_PENDING_NOTE = (
 """Appended, in brackets, to the provisional task-fault
 ``MergeOutcome.reason`` that :func:`_run_post_merge_verify` returns in
 DEFERRED mode (``main_health_probe_handles`` is not ``None``) whenever
-:func:`_spawn_main_health_probe` reports a probe is actually in flight for
+:func:`spawn_main_health_probe` reports a probe is actually in flight for
 this failure.
 
 Lets a steward/human reading the surviving reason string distinguish
 "still being classified off-path" from a confirmed task fault — the
 SYNCHRONOUS path (``main_health_probe_handles`` is ``None``) never appends
-this note because :func:`_classify_main_health_red` has, by construction,
+this note because :func:`classify_main_health_red` has, by construction,
 already definitively ruled out a pre-existing break by the time the
 task-fault reason is built.  Not appended when the deferred probe itself
 would be skipped (feature disabled / timed-out verify / a
 :data:`PREEXISTING_BREAK_SKIP_CATEGORIES` category) since those cases are
 confirmed task faults in both modes — see
-:func:`_spawn_main_health_probe`'s return value."""
+:func:`spawn_main_health_probe`'s return value."""
 
 
 # ---------------------------------------------------------------------------
@@ -736,137 +724,6 @@ PRODUCTION_VERIFIER: VerifyPort = ProductionVerifier(
 PRODUCTION_CLOCK: ClockPort = ProductionClock(
     content_mtime=lambda: newest_content_mtime, cpu_ticks=lambda: verify_tree_cpu_ticks,
 )
-
-
-def _main_health_fingerprint(category: str, cause_hint: str, probe_sha: str) -> str:
-    """Compose a dedupe fingerprint for a preexisting-main-break outcome.
-
-    Lazy-imports compute_preexisting_main_break_fingerprint from workflow so
-    merge_queue→workflow is a deferred import (no module-level cycle).
-    Fail-safe: returns '' when the import or composition raises.
-    """
-    try:
-        from orchestrator.workflow import compute_preexisting_main_break_fingerprint
-        return compute_preexisting_main_break_fingerprint(category, cause_hint, probe_sha)
-    except Exception:
-        logger.warning(
-            'main-health fingerprint composition failed '
-            '(category=%s cause_hint=%s probe_sha=%s) — '
-            'returning empty fingerprint (dedupe disabled for this outcome)',
-            category, cause_hint, probe_sha,
-            exc_info=True,
-        )
-        return ''
-
-
-def _build_main_health_outcome(verify: VerifyResult, probe_sha: str) -> MergeOutcome:
-    """Build the main-health-red ``MergeOutcome`` for a confirmed pre-existing break.
-
-    Pure function — no I/O, no side effects, no event emission.  Extracted
-    (task 2564) from :func:`_classify_main_health_red` so the reason /
-    fingerprint / ``failure_category`` / ``failure_cause_hint`` composition is
-    shared verbatim between the synchronous probe path
-    (``_classify_main_health_red``) and the deferred off-critical-path probe
-    (``_run_deferred_main_health_probe``) — the two can never diverge.
-
-    *probe_sha* is the bare-main SHA the probe actually tested against (fed
-    into the dedupe fingerprint so concurrent failing merges against the same
-    main HEAD fold to one escalation parent).
-    """
-    detail = verify.failure_report()
-    suffix = (verify.cause_hint or verify.summary or '')[:160]
-    reason = (
-        f'{MAIN_HEALTH_RED_REASON_PREFIX} '
-        f'(category={verify.category!r}): {suffix}'
-    )
-    if detail:
-        reason = f'{reason}\n\n{detail}'
-    return MergeOutcome(
-        'blocked',
-        reason=reason,
-        failure_category=verify.category,
-        failure_cause_hint=verify.cause_hint,
-        dedupe_fingerprint=_main_health_fingerprint(
-            verify.category or '', verify.cause_hint, probe_sha,
-        ),
-        disposition=MergeFailureDisposition.MAIN_RED,
-    )
-
-
-def _main_probe_flake_sink(
-    req: MergeRequest,
-    *,
-    event_store: EventStore | None,
-    escalation_queue: Any,
-) -> FlakeObservationSink:
-    """Where the main-health classifier's task-mu fork records a flake it
-    suppressed: the flake ledger, attributed to *req*'s task and to the main
-    SHA the isolated re-run ran on, with the INV-4 storm streak reached
-    through the recorder."""
-    async def sink(observation: FlakeSuppression, main_sha: str) -> None:
-        await record_flake_observation(
-            observation,
-            project_root=req.config.project_root,
-            project_id=req.config.fused_memory.project_id,
-            merge_sha=main_sha,
-            task_id=req.task_id,
-            event_store=event_store,
-            escalation_queue=escalation_queue,
-        )
-    return sink
-
-
-async def _classify_main_health_red(
-    git_ops: GitOps,
-    req: MergeRequest,
-    verify: VerifyResult,
-    event_store: EventStore | None = None,
-    *,
-    escalation_queue: Any = None,
-) -> MergeOutcome | None:
-    """Probe whether *verify* is a pre-existing break already on bare main HEAD.
-
-    Returns a :class:`MergeOutcome` with reason starting with
-    :data:`MAIN_HEALTH_RED_REASON_PREFIX` when the break is confirmed
-    pre-existing.  Returns ``None`` to fall through to the normal task-fault
-    outcome.
-
-    Guards (short-circuit to None before calling the probe):
-    - ``req.config.escalate_preexisting_main_break`` is False
-    - ``verify.timed_out`` is True (non-deterministic; re-probing is wasteful)
-    - ``verify.category`` is in :data:`PREEXISTING_BREAK_SKIP_CATEGORIES`
-      (infra_timeout / flock_error — inherently flaky)
-
-    Latency: the first failing merge per ``(main_sha, category, cause_hint)``
-    tuple pays a full probe build/test cost, bounded by the same
-    ``merge_verify_cold_command_timeout_secs`` / ``verify_cold_command_timeout_secs``
-    timeout that ``_run_post_merge_verify`` uses (inherited via
-    ``run_scoped_verification``'s config lookup — the probe runs with
-    ``max_retries=0`` so a hung probe cannot stall the worker beyond one
-    timeout window).  Subsequent merges with the same signature hit the
-    ``_PROBE_CACHE`` and pay only a ``get_main_sha()`` round-trip.
-    """
-    if not req.config.escalate_preexisting_main_break:
-        return None
-    if verify.timed_out:
-        return None
-    if (verify.category or '') in PREEXISTING_BREAK_SKIP_CATEGORIES:
-        return None
-    try:
-        is_preexisting, probe_sha = await verify_failure_is_preexisting_on_main(
-            req.worktree, req.config, req.module_configs, req.task_files,
-            verify, git_ops,
-            flake_sink=_main_probe_flake_sink(
-                req, event_store=event_store, escalation_queue=escalation_queue,
-            ),
-        )
-    except Exception:
-        return None
-    if not is_preexisting:
-        return None
-    outcome = _build_main_health_outcome(verify, probe_sha)
-    _emit_merge_attempt(event_store, req.task_id, OutcomeKind.main_health_red)
-    return outcome
 
 
 def _render_skew_surfaces(
@@ -1233,365 +1090,6 @@ def _spawn_merge_verify_dry_run(
             'Task %s: failed to spawn merge-verify dry-run investigation: %s',
             req.task_id, exc,
         )
-
-
-@dataclasses.dataclass(frozen=True)
-class _MainHealthProbeHandles:
-    """Opaque bundle carrying the worker's ``background_tasks`` set so the
-    deferred main-health probe survives ``_run_post_merge_verify`` returning
-    (task 2564, reify 5067 merge-slot-stall fix).
-
-    A DISTINCT bundle from :class:`_DryRunInvestigationHandles` (not reused)
-    — the main-health probe's ownership is independent of the dry-run
-    investigation's, which keeps the shape minimal and future-friendly for
-    the sibling host-affinity / warm-probe work.  ``background_tasks`` is the
-    SAME ``set`` instance the worker stores at ``self._background_tasks`` —
-    a spawned probe task's strong ref lives exactly as long as the worker
-    and is drained by the worker's existing shutdown drain
-    (``SpeculativeMergeWorker.stop``).
-
-    Only ``SpeculativeMergeWorker._lane_post_merge_verify``, which serves the
-    in-flight verify and the single-branch gate re-verify, passes a live
-    instance (task 2564 step-16, task 6278).  The solo-reverify and train
-    callers — and any bare test caller — pass ``None`` (the default), so
-    ``_run_post_merge_verify`` keeps running the main-health probe
-    SYNCHRONOUSLY exactly as it did before task 2564.
-
-    ``auto_heal`` (task 2564 step-22) is an optional callback threaded
-    through to :func:`_run_deferred_main_health_probe`: when a confirmed,
-    still-fresh pre-existing break is found, the probe routes to it
-    (``await auto_heal(outcome, req)``) INSTEAD of filing the
-    escalation-only fallback.  ``None`` (the default) preserves the
-    escalation-only behaviour for every bare/test caller.  Only the
-    production call site passes
-    ``SpeculativeMergeWorker._auto_heal_main_health_deferred`` (task 2564
-    step-24).
-    """
-
-    background_tasks: set[asyncio.Task] = dataclasses.field(default_factory=set)
-    auto_heal: (
-        Callable[[MergeOutcome, MergeRequest], Awaitable[None]] | None
-    ) = None
-
-
-async def _run_deferred_main_health_probe(
-    git_ops: GitOps,
-    req: MergeRequest,
-    verify: VerifyResult,
-    *,
-    escalation_queue: Any = None,
-    event_store: EventStore | None = None,
-    auto_heal: Callable[[MergeOutcome, MergeRequest], Awaitable[None]] | None = None,
-    origin_is_local: bool = True,
-) -> None:
-    """Off-critical-path main-health classification (task 2564).
-
-    LEASE-SAFETY & HOST-AFFINITY (task 2565): this probe is a leaseless,
-    local-only detective classifier.  It verifies via the local
-    ``_mainprobe-`` ephemeral worktree and ``run_scoped_verification`` —
-    never :class:`~orchestrator.verify_runner.HostAllocator`,
-    :class:`~orchestrator.verify_runner.RemoteRunner`, or
-    :class:`~orchestrator.verify_runner.HostLease` — so it never acquires
-    or holds a merge host slot.  *origin_is_local* RECORDS, but does not
-    STEER, where the triggering post-merge verify ran (derived by the
-    caller from the ``runner`` :func:`_run_post_merge_verify` received:
-    ``None``/local-lease is local, ``RemoteRunner.is_local=False`` is
-    remote — defaults to ``True`` so any caller not yet threading this
-    value is treated as local); the probe itself ALWAYS runs locally
-    regardless of *origin_is_local*.  Remote-affinity (probing on the
-    failing verify's origin host) is deliberately rejected: the probe's
-    verdict drives a queue-halting born-at-L2 escalation and a "fix main"
-    auto-heal, a correctness-critical global decision that must answer "is
-    main broken on the trust anchor?" — reproducing a host-specific
-    toolchain/env/flock/disk quirk from a remote host onto that same host's
-    main would falsely conclude main is red, and would re-introduce the
-    remote-lease / orphaned-remote-build hazards task 1757's
-    ``_abort_remote_verify`` teardown exists to avoid.  See
-    :func:`verify_failure_is_preexisting_on_main` for the full contract.
-
-    Spawned by :func:`_spawn_main_health_probe` as a DETACHED task with no
-    awaiter, so every externally-visible effect must come from what this
-    coroutine does internally (emitting the ``main_health_red`` signal,
-    filing a dedup'd escalation) — its return value is always discarded.
-
-    Re-applies the SAME three cheap guards :func:`_spawn_main_health_probe`
-    already applied before spawning (defense in depth for any future direct
-    caller — mirrors :func:`_classify_main_health_red`'s guard block):
-
-    - ``req.config.escalate_preexisting_main_break`` is ``False``
-    - ``verify.timed_out`` is ``True``
-    - ``verify.category`` is in :data:`PREEXISTING_BREAK_SKIP_CATEGORIES`
-
-    Calls :func:`verify_failure_is_preexisting_on_main` directly (rather than
-    :func:`_classify_main_health_red`) so it can capture ``probe_sha`` for
-    the staleness check below.  A raising probe is caught and logged — this
-    is a detached background task with no awaiter, so a swallowed exception
-    here is the ONLY way it would ever be observed.
-
-    Staleness re-check: the probe can run for minutes off the critical
-    path, during which main may have advanced (e.g. a hotfix that already
-    fixed the break).  ``probe_sha`` is the exact bare-main HEAD the probe
-    actually tested against, so equality against a freshly-resolved
-    ``git_ops.get_main_sha()`` is the precise freshness predicate.  Fails
-    safe (skips the escalation, logging at ``info``) when the re-resolve
-    raises, comes back empty, or disagrees with ``probe_sha`` — a
-    genuinely-still-broken main will simply be re-probed and re-surfaced by
-    the next failing merge.
-
-    This re-check is best-effort, not atomic (task 2564 amendment,
-    reviewer_comprehensive finding 2): a narrow TOCTOU window remains
-    between the ``get_main_sha()`` equality check above passing and the
-    escalation actually being filed below — or, when *auto_heal* is wired,
-    between that check and whatever further awaits the ``auto_heal``
-    callback performs — during which main could advance again.  Left
-    unguarded deliberately: the fingerprint-keyed ``submit_or_dedupe`` fold
-    (see :func:`_file_main_health_escalation`) makes a single
-    just-superseded escalation harmless — it collapses into any existing
-    parent and the parent resolves once the real fix lands — so closing
-    this window is not worth the added complexity.
-
-    On a confirmed, still-fresh pre-existing break: builds the outcome via
-    :func:`_build_main_health_outcome` and emits the ``main_health_red``
-    merge-attempt signal (task 2564 step-22: BEFORE the branch below, so the
-    signal fires whichever branch is taken), recording *origin_is_local* as
-    the ``origin_host``/``probe_host`` telemetry pair (task 2565 —
-    ``probe_host`` is always ``'local'``; see the LEASE-SAFETY &
-    HOST-AFFINITY note above) so the deliberate local-only placement
-    decision is OBSERVABLE even when the triggering verify ran remote.
-    Then, if *auto_heal* is supplied, routes the outcome to it
-    (``await auto_heal(outcome, req)``)
-    INSTEAD of filing an escalation directly — the callback owns filing
-    (see :func:`SpeculativeMergeWorker._auto_heal_main_health_deferred`,
-    which files the halt-owner escalation itself).  Otherwise (the default,
-    every bare/test caller) falls back to the pre-existing escalation-only
-    behaviour via :func:`_file_main_health_escalation`.
-    """
-    if not req.config.escalate_preexisting_main_break:
-        return
-    if verify.timed_out:
-        return
-    if (verify.category or '') in PREEXISTING_BREAK_SKIP_CATEGORIES:
-        return
-    try:
-        is_preexisting, probe_sha = await verify_failure_is_preexisting_on_main(
-            req.worktree, req.config, req.module_configs, req.task_files,
-            verify, git_ops,
-            flake_sink=_main_probe_flake_sink(
-                req, event_store=event_store, escalation_queue=escalation_queue,
-            ),
-        )
-    except Exception:
-        logger.warning(
-            'Task %s: deferred main-health probe failed', req.task_id,
-            exc_info=True,
-        )
-        return
-    if not is_preexisting:
-        return
-
-    try:
-        current_main_sha = await git_ops.get_main_sha()
-    except Exception:
-        logger.warning(
-            'Task %s: deferred main-health probe: get_main_sha() re-resolve '
-            'failed; skipping escalation (stale-check fail safe)',
-            req.task_id,
-            exc_info=True,
-        )
-        return
-    if not current_main_sha or current_main_sha != probe_sha:
-        logger.info(
-            'Task %s: deferred main-health probe: main advanced since the '
-            'probe ran (probe_sha=%s, current=%s); skipping escalation '
-            '(stale-check fail safe)',
-            req.task_id, probe_sha, current_main_sha,
-        )
-        return
-
-    outcome = _build_main_health_outcome(verify, probe_sha)
-    _emit_merge_attempt(
-        event_store, req.task_id, OutcomeKind.main_health_red,
-        origin_host='local' if origin_is_local else 'remote',
-        probe_host='local',
-    )
-    if auto_heal is not None:
-        await auto_heal(outcome, req)
-    else:
-        _file_main_health_escalation(
-            escalation_queue, req, outcome,
-            suggested_action=MainHealthNextAction.NO_FIX_OWNER,
-        )
-
-
-def _file_main_health_escalation(
-    escalation_queue: Any,
-    req: MergeRequest,
-    outcome: MergeOutcome,
-    *,
-    suggested_action: MainHealthNextAction,
-    detail: str | None = None,
-) -> str | None:
-    """File (or fold) a dedup'd ``preexisting_main_break`` escalation for a
-    confirmed pre-existing main-red *outcome* (task 2564).  *detail* defaults
-    to ``outcome.reason``.
-
-    Returns the id of the SURVIVING (parent) escalation, or ``None`` when
-    *escalation_queue* is None.  A folded submission returns the PARENT's id
-    (the child is absorbed via ``attach_dedupe_child`` and never becomes
-    independently addressable) — callers that need to register lane-halt
-    ownership (:func:`SpeculativeMergeWorker._auto_heal_main_health_deferred`)
-    must reference the parent, not the folded child.  Existing callers that
-    ignore the return value are unaffected (backward-compatible addition).
-
-    Every caller names its bounded next action from
-    :class:`~orchestrator.main_health_actions.MainHealthNextAction`.  The
-    record is filed at L1 because its consumer is escalation-watcher-auto,
-    never a steward: a steward cannot fix main, and L0s are dismissed by
-    the blocking task's own cleanup and at restart.
-
-    Folds via ``submit_or_dedupe`` using the SAME inf-window
-    content-fingerprint :class:`~escalation.dedupe.DedupeConfig`
-    ``workflow.py::TaskWorkflow._file_main_health_l1`` uses (categories=
-    ``('preexisting_main_break',)``), so every worker- and workflow-filed
-    merge-lane L1 for one ``(category, cause_hint, probe_sha)`` signature
-    collapses into one parent, race-free; the task-verify L0 for that break stays separate
-    (dedupe never folds across ladder levels). Falls back to a plain
-    ``queue.submit`` when *outcome* carries no fingerprint (the fail-safe
-    ``''`` path of :func:`_main_health_fingerprint`).
-    """
-    if escalation_queue is None:
-        return None
-
-    fp = outcome.dedupe_fingerprint or None
-    esc = Escalation(
-        id=escalation_queue.make_id(req.task_id),
-        task_id=req.task_id,
-        agent_role='orchestrator',
-        severity='blocking',
-        category='preexisting_main_break',
-        summary=outcome.reason[:200],
-        detail=outcome.reason if detail is None else detail,
-        suggested_action=suggested_action,
-        dedupe_fingerprint=fp,
-        level=1,
-    )
-    if fp:
-        submit_result = submit_or_dedupe(
-            escalation_queue,
-            esc,
-            DedupeConfig(
-                infra_dedupe_enabled=True,
-                infra_dedupe_window_secs=float('inf'),
-                infra_dedupe_categories=('preexisting_main_break',),
-                key_fn=content_fingerprint_key,
-            ),
-        )
-        return submit_result.get('parent_id') or submit_result.get('id') or esc.id
-    escalation_queue.submit(esc)
-    return esc.id
-
-
-def _spawn_main_health_probe(
-    handles: _MainHealthProbeHandles | None,
-    git_ops: GitOps,
-    req: MergeRequest,
-    verify: VerifyResult,
-    *,
-    escalation_queue: Any = None,
-    event_store: EventStore | None = None,
-    origin_is_local: bool = True,
-) -> bool:
-    """Fire-and-forget: spawn the deferred (off-critical-path) main-health
-    classification for a post-merge-verify failure.
-
-    *origin_is_local* (task 2565) is forwarded unchanged into the spawned
-    :func:`_run_deferred_main_health_probe` coroutine — it only RECORDS
-    where the triggering post-merge verify ran (for the ``origin_host``/
-    ``probe_host`` telemetry pair); the probe itself always classifies
-    locally regardless of this value.  Defaults to ``True`` (local) so
-    every caller not yet threading the signal is treated as local.
-
-    None-safe: no-ops when *handles* is ``None`` (mirrors
-    :func:`_spawn_merge_verify_dry_run`'s ``handles is None`` guard) — every
-    call site invokes this unconditionally and relies on this internal check,
-    so the solo-reverify and train (its gate re-verify included)
-    ``_run_post_merge_verify`` callers (which pass no handles) are guaranteed
-    no-ops.
-
-    Applies the SAME three cheap guards :func:`_classify_main_health_red`
-    applies before probing (task 2564 step-6 — kept byte-identical to that
-    function's guard block so the deferred path never probes a case the
-    synchronous path would have skipped):
-
-    - ``req.config.escalate_preexisting_main_break`` is ``False``
-    - ``verify.timed_out`` is ``True`` (non-deterministic; re-probing is wasteful)
-    - ``verify.category`` is in :data:`PREEXISTING_BREAK_SKIP_CATEGORIES`
-      (infra_timeout / flock_error — inherently flaky)
-
-    Also dedupes in-flight: skips the spawn when a not-done task named
-    ``f'main-health-probe-{req.task_id}'`` is already registered in
-    ``handles.background_tasks`` (mirrors
-    :func:`_spawn_merge_verify_dry_run`'s in-flight dedup guard) — a rapid
-    sequence of failing merges for the same task must not pile up duplicate
-    probes.
-
-    Registers the spawned task into ``handles.background_tasks`` with a
-    discard done-callback, named ``f'main-health-probe-{req.task_id}'`` so
-    :class:`SpeculativeMergeWorker`'s existing ``self._background_tasks``
-    shutdown drain cancels it deterministically on stop — no new drain code
-    is needed.
-
-    Returns ``True`` when, as a result of this call, a main-health probe is
-    (or remains) in flight for *req.task_id* — *handles* were provided, none
-    of the three cheap guards above skipped classification, and either a new
-    probe task was just spawned or one was already running (in-flight
-    dedup).  Returns ``False`` when no probe is in flight: *handles* is
-    ``None``, a guard skipped classification, or spawning itself raised.
-    Task 2564 amendment (reviewer_comprehensive finding 1): the caller
-    (:func:`_run_post_merge_verify`) uses this to decide whether the
-    provisional task-fault outcome should carry
-    :data:`MAIN_HEALTH_PROBE_PENDING_NOTE` — a caller cannot otherwise tell
-    "classification skipped, confirmed task fault" apart from "classification
-    deferred, verdict pending" from the reason string alone.
-    """
-    if handles is None:
-        return False
-    if not req.config.escalate_preexisting_main_break:
-        return False
-    if verify.timed_out:
-        return False
-    if (verify.category or '') in PREEXISTING_BREAK_SKIP_CATEGORIES:
-        return False
-    task_name = f'main-health-probe-{req.task_id}'
-    if any(
-        t.get_name() == task_name and not t.done()
-        for t in handles.background_tasks
-    ):
-        logger.debug(
-            'Task %s: main-health probe already in progress, skipping '
-            'duplicate spawn',
-            req.task_id,
-        )
-        return True
-    try:
-        task = asyncio.create_task(
-            _run_deferred_main_health_probe(
-                git_ops, req, verify,
-                escalation_queue=escalation_queue, event_store=event_store,
-                auto_heal=handles.auto_heal,
-                origin_is_local=origin_is_local,
-            ),
-            name=task_name,
-        )
-        handles.background_tasks.add(task)
-        task.add_done_callback(handles.background_tasks.discard)
-    except Exception as exc:
-        logger.warning(
-            'Task %s: failed to spawn main-health probe: %s',
-            req.task_id, exc,
-        )
-        return False
-    return True
 
 
 # Dedup sentinel task_id for fix (b)'s per-land cross-check divergence escalation
@@ -2509,7 +2007,7 @@ async def _run_post_merge_verify(
     escalation_queue: Any = None,
     halt_hook: Callable[[str], None] | None = None,
     dry_run_handles: _DryRunInvestigationHandles | None = None,
-    main_health_probe_handles: _MainHealthProbeHandles | None = None,
+    main_health_probe_handles: MainHealthProbeHandles | None = None,
     depth: int | None = None,
     speculative: bool | None = None,
     chain_items: int = 1,
@@ -2623,10 +2121,10 @@ async def _run_post_merge_verify(
             ``SpeculativeMergeWorker._lane_post_merge_verify``, which serves
             the in-flight verify and the single-branch gate re-verify, passes
             a live bundle, at which point a main-health-eligible failure
-            SKIPS the synchronous ``_classify_main_health_red`` probe,
+            SKIPS the synchronous ``classify_main_health_red`` probe,
             returns the provisional task-fault outcome immediately, and
             spawns the classification as a detached background task via
-            :func:`_spawn_main_health_probe` — so the caller's
+            :func:`spawn_main_health_probe` — so the caller's
             ``verify_task`` (and the merge slot / host lease it holds) is
             freed within seconds of the verdict instead of blocking on a
             full local verify build bounded only by the cold timeout.
@@ -3577,7 +3075,7 @@ async def _run_post_merge_verify(
         # probe-handles bundle):
         # unchanged behaviour from before this task.
         if main_health_probe_handles is None:
-            main_health_outcome = await _classify_main_health_red(
+            main_health_outcome = await classify_main_health_red(
                 git_ops, req, verify, event_store,
                 escalation_queue=escalation_queue,
             )
@@ -3595,7 +3093,7 @@ async def _run_post_merge_verify(
         # (G4, task 2564); a cold cache or failing_test_ids=None (OPAQUE/
         # scoped/degraded) keeps today's wording (B3). The wholly-preexisting
         # case (new_ids empty) is routed to MAIN_HEALTH_RED by
-        # _classify_main_health_red / _run_deferred_main_health_probe; this
+        # classify_main_health_red / _run_deferred_main_health_probe; this
         # enrichment fires only for a non-empty new-ids set, so it never
         # contradicts that routing.
         new_ids: frozenset[str] | None = None
@@ -3700,7 +3198,7 @@ async def _run_post_merge_verify(
         # The return value tells us whether a probe is actually in flight —
         # as opposed to a cheap guard having already confirmed this really
         # is a plain task fault in both modes (see
-        # _spawn_main_health_probe's docstring).  Task 2564 amendment
+        # spawn_main_health_probe's docstring).  Task 2564 amendment
         # (reviewer_comprehensive finding 1): only in the former case do we
         # annotate the provisional reason as pending reclassification, so a
         # steward/human reading it can tell "still being classified
@@ -3718,7 +3216,7 @@ async def _run_post_merge_verify(
         # verify_failure_is_preexisting_on_main); this only makes the
         # placement decision observable in the main_health_red telemetry.
         origin_is_local = runner is None or getattr(runner, 'is_local', True)
-        probe_pending = _spawn_main_health_probe(
+        probe_pending = spawn_main_health_probe(
             main_health_probe_handles, git_ops, req, verify,
             escalation_queue=escalation_queue, event_store=event_store,
             origin_is_local=origin_is_local,
@@ -16425,7 +15923,7 @@ class SpeculativeMergeWorker:
         owner = await ensure_main_fix_owner(
             self.main_fix_filer, brk, project_root=str(req.config.project_root),
         )
-        _file_main_health_escalation(
+        file_main_health_escalation(
             self._escalation_queue, req, outcome,
             suggested_action=owner.next_action(otherwise),
             detail=owner.escalation_detail(outcome.reason),
@@ -16445,7 +15943,7 @@ class SpeculativeMergeWorker:
         lane, submits/folds the dedup'd halt-owner escalation, registers
         lane-halt ownership, and spawns a HIGH-lane fix task.  Called from the
         deferred main-health probe (:func:`_run_deferred_main_health_probe`,
-        via the ``auto_heal`` callback on :class:`_MainHealthProbeHandles`)
+        via the ``auto_heal`` callback on :class:`MainHealthProbeHandles`)
         once it confirms a still-fresh pre-existing break — this is the ONLY
         production path that can reach a main-health-red outcome, since the
         provisional outcome returned to the caller is always task-fault (see
@@ -16495,7 +15993,7 @@ class SpeculativeMergeWorker:
             owner = await ensure_main_fix_owner(
                 self.main_fix_filer, brk, project_root=str(req.config.project_root),
             )
-            _file_main_health_escalation(
+            file_main_health_escalation(
                 self._escalation_queue, req, outcome,
                 suggested_action=owner.behind_halt_action(
                     heal_attempted=self.auto_heal_registry.attempts(sig) > 0,
@@ -16504,7 +16002,7 @@ class SpeculativeMergeWorker:
             )
             return
 
-        esc_id = _file_main_health_escalation(
+        esc_id = file_main_health_escalation(
             self._escalation_queue, req, outcome,
             suggested_action=MainHealthNextAction.AUTO_HEAL_IN_FLIGHT,
         )
@@ -16564,7 +16062,7 @@ class SpeculativeMergeWorker:
             # detector; the halt is synchronous only to precede further lands.
             halt_hook=self.operator_halt,
             dry_run_handles=self._dry_run_handles,
-            main_health_probe_handles=_MainHealthProbeHandles(
+            main_health_probe_handles=MainHealthProbeHandles(
                 background_tasks=self._background_tasks,
                 auto_heal=self._auto_heal_main_health_deferred,
             ),
@@ -19100,7 +18598,7 @@ class SpeculativeMergeWorker:
                 # digest.merge_disposition_counts (task 2384) is non-sentinel
                 # on the production path.  MAIN_RED is excluded because it
                 # already emitted 'main_health_red' when the outcome was built
-                # (see _classify_main_health_red, above).
+                # (see classify_main_health_red, above).
                 #
                 # Amendment (task 3178 — the separately-reviewed widening the
                 # round-2 note below deferred).  Keyed on GATHERED EVIDENCE
