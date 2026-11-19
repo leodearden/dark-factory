@@ -1,5 +1,6 @@
-"""How an orchestrator CLI command obtains its configuration.
+"""How an orchestrator CLI program obtains its configuration.
 
+``load_program_dotenv`` fills the process env from ``.env`` for a program run.
 ``pass_config`` gives a command its ``--config`` option and calls it with the
 loaded :class:`~orchestrator.config.OrchestratorConfig`; it holds the one
 handler for a missing config.
@@ -12,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import click
+from dotenv import load_dotenv
 
 from orchestrator.config import ConfigRequiredError, OrchestratorConfig, load_config
 
@@ -21,6 +23,11 @@ CONFIG_OPTION_HELP = (
 )
 
 CommandCallback = Callable[..., Any]
+
+
+def load_program_dotenv() -> None:
+    """Load .env into os.environ for a program run of the CLI; importing a CLI module never does."""
+    load_dotenv()
 
 
 def pass_config(help: str = CONFIG_OPTION_HELP) -> Callable[[CommandCallback], CommandCallback]:
