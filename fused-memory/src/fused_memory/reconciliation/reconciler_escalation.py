@@ -31,7 +31,7 @@ EscalationQueueFactory = Callable[[Path], 'EscalationQueue']
 # factory is None and every escalation path degrades to its logged no-op or veto.
 try:
     from escalation.models import Escalation  # type: ignore[import-untyped]
-    from escalation.pins import classify_pins  # type: ignore[import-untyped]
+    from escalation.pins import classify_pins
     from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
     INSTALLED_ESCALATION_QUEUE_FACTORY: EscalationQueueFactory | None = EscalationQueue
 except ImportError:  # pragma: no cover — exercised only in minimal envs
