@@ -9,7 +9,7 @@ import logging
 import os
 import time
 import uuid as uuid_mod
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -31,7 +31,8 @@ from shared.task_metadata import TASK_METADATA_CAPABILITIES
 from shared.task_statuses import ACTIVE
 from shared.task_statuses import TERMINAL as TERMINAL_STATUSES
 from shared.task_submit import is_ticket_id, looks_like_task_id
-from shared.uuid_prefix_guard import Namespace, Resolution, ResolverUnavailable
+from shared.uuid_prefix import strip_uuid_prefix_override
+from shared.uuid_prefix_guard import Namespace, PrefixResolver, Resolution, ResolverUnavailable
 
 from fused_memory.backends.defect_records import (
     DefectEventInvalid,
@@ -727,6 +728,26 @@ def _canonicalize_project_id_arg(project_id: str) -> tuple[str, dict[str, str] |
 _AMBIGUOUS_UUID_PREFIX = 'ambiguous_uuid_prefix'
 
 
+def per_use_id_resolver(
+    memory_service: MemoryService, id_resolver: IdResolver | None = None,
+) -> Callable[[], IdResolver]:
+    """The ``IdResolver`` for the NEXT resolution: *id_resolver* when injected, else one built from *memory_service*.
+
+    Built per use: the resolver is stateless and its factory reads the
+    service's CURRENT config, so a hot reload of the Mem0 read timeout or
+    collection prefix applies to the next resolution.
+    """
+    return lambda: id_resolver or IdResolver.for_memory_service(memory_service)
+
+
+def per_use_prefix_resolver(
+    memory_service: MemoryService, id_resolver: IdResolver | None = None,
+) -> PrefixResolver:
+    """:func:`per_use_id_resolver`'s ``resolve_prefix``: the uuid-prefix guard's and /resolve-prefix's resolver."""
+    resolver = per_use_id_resolver(memory_service, id_resolver)
+    return lambda project_id, prefix: resolver().resolve_prefix(project_id, prefix)
+
+
 @dataclass(frozen=True)
 class _ResolvedId:
     """The prefix named exactly one live id in the tool's namespace: read *full_id*."""
@@ -1415,11 +1436,7 @@ def create_mcp_server(
 
     mcp = FastMCP('Fused Memory', instructions=FUSED_MEMORY_INSTRUCTIONS)
 
-    def _resolver() -> IdResolver:
-        # Built per use: the resolver is stateless and its factory reads the
-        # service's CURRENT config, so a hot reload of the read timeout or
-        # collection prefix applies to the next resolution.
-        return id_resolver or IdResolver.for_memory_service(memory_service)
+    _resolver = per_use_id_resolver(memory_service, id_resolver)
     _taskmaster_configured = task_interceptor is not None
     _task_facts_reader: TaskFactsReader | None = task_interceptor
 
@@ -1696,9 +1713,7 @@ def create_mcp_server(
 
     # POST /resolve-prefix: the uuid-prefix resolver for out-of-process callers (PRD C5).
     register_resolve_prefix_route(
-        mcp,
-        lambda project_id, prefix: _resolver().resolve_prefix(project_id, prefix),
-        known_projects=_kp,
+        mcp, per_use_prefix_resolver(memory_service, id_resolver), known_projects=_kp,
     )
 
     # ------------------------------------------------------------------
@@ -3301,7 +3316,10 @@ def create_mcp_server(
         # for _causation_id/source and never forwards it to the store, so the
         # write-time flag cannot reach persistence by this path. Kept so a future
         # metadata pass-through cannot silently start persisting it.
+        # The uuid-prefix guard forwards allow_uuid_prefix the same way, so it
+        # is stripped here too.
         metadata = strip_markup_override(metadata)
+        metadata = strip_uuid_prefix_override(metadata)
         if temporal_context is not None and temporal_context not in _VALID_TEMPORAL_CONTEXTS:
             return {
                 'error': (
@@ -3720,7 +3738,10 @@ def create_mcp_server(
         # DF 3083 is the closed predecessor. Only the override STRIP remains a
         # tool-body responsibility, because the guard forwards allow_mcp_markup
         # UNCHANGED to a tool that declares `metadata`.
+        # The uuid-prefix guard forwards allow_uuid_prefix the same way, so it
+        # is stripped here too.
         metadata = strip_markup_override(metadata)
+        metadata = strip_uuid_prefix_override(metadata)
         if (
             category == 'temporal_facts'
             and isinstance(agent_id, str)
@@ -4340,7 +4361,10 @@ def create_mcp_server(
         # the single point where the caller's `metadata` becomes persisted
         # state: stripping here cannot be bypassed by a later edit that adds
         # another persistence path off `cleaned_meta`.
+        # The uuid-prefix guard forwards allow_uuid_prefix the same way, so it
+        # is stripped here too.
         metadata = strip_markup_override(metadata)
+        metadata = strip_uuid_prefix_override(metadata)
         causation_id, source, cleaned_meta = _extract_causation(metadata, agent_id)
         result = await memory_service.add_system_record(
             content=content,
@@ -6237,7 +6261,10 @@ def create_mcp_server(
         # the single point where the caller's `metadata` becomes persisted
         # state: stripping here cannot be bypassed by a later edit that adds
         # another persistence path off `cleaned_meta`.
+        # The uuid-prefix guard forwards allow_uuid_prefix the same way, so it
+        # is stripped here too.
         metadata = strip_markup_override(metadata)
+        metadata = strip_uuid_prefix_override(metadata)
         causation_id, source, cleaned_meta = _extract_causation(metadata, agent_id)
 
         # (3) CITATION PRE-FLIGHT over the whole delete set — the same gate
@@ -9438,7 +9465,10 @@ def create_mcp_server(
         # because the guard forwards allow_mcp_markup UNCHANGED to a tool that
         # declares `metadata` — deleting this line would persist a write-time
         # control flag into the task metadata vocabulary.
+        # The uuid-prefix guard forwards allow_uuid_prefix the same way, so it
+        # is stripped here too.
         metadata = strip_markup_override(metadata)
+        metadata = strip_uuid_prefix_override(metadata)
 
         # Lock-charter guard γ: reject directory strings in metadata.files
         # before forwarding to the interceptor. Covers both the normal curator
@@ -10582,7 +10612,10 @@ def create_mcp_server(
         # matching submit_task call site above. Same reason as there: the text
         # reaches the description parser DF 3083 proved mis-parses silently. Only
         # the override STRIP remains a tool-body responsibility.
+        # The uuid-prefix guard forwards allow_uuid_prefix the same way, so it
+        # is stripped here too.
         metadata = strip_markup_override(metadata)
+        metadata = strip_uuid_prefix_override(metadata)
 
         _dirs = directory_locks(extract_files(metadata))
         if _dirs:

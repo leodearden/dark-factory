@@ -100,7 +100,7 @@ async def _served_fused_memory(
         await ticket_store.initialize()
     interceptor = TaskInterceptor(backend, None, event_buffer, ticket_store=ticket_store)
     server = create_mcp_server(AsyncMock(), task_interceptor=interceptor)
-    _install_tool_dispatch_guards(server, known_projects={})
+    _install_tool_dispatch_guards(server, known_projects={}, prefix_resolver=None)
     server_config = ServerConfig()
     server.settings.stateless_http = server_config.stateless_http
     server.settings.json_response = server_config.json_response
