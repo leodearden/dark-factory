@@ -2041,7 +2041,6 @@ _EXPECTED_WALL_CLOCK_DEBT_PATHS = frozenset({
     'orchestrator/tests/test_merge_queue_restart_hook.py',
     'orchestrator/tests/test_offline_lane_records.py',
     'orchestrator/tests/test_remote_gate.py',
-    'orchestrator/tests/test_task_verify_host_race.py',
     'orchestrator/tests/test_verify.py',
     'orchestrator/tests/test_verify_admission_cancel_release.py',
     'orchestrator/tests/test_verify_admission_executor_bypass.py',
