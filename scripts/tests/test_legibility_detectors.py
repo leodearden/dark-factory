@@ -18,6 +18,8 @@ from legibility_carrier_fixtures import (
     TRICKLE_CODER_PREAMBLE,
     assistant_record,
     briefing_text,
+    census_synthesis_prompt,
+    census_verifier_prompt,
     coder_judgment,
     json_fenced,
     text_block,
@@ -781,6 +783,24 @@ class TestLegibilityInstrumentSessions:
     ):
         assert _classify(user_record(_coder_prompt(digest_line))) is AgentClass.LEGIBILITY_INSTRUMENT
 
+    @pytest.mark.parametrize(
+        'build_prompt', [census_verifier_prompt, census_synthesis_prompt], ids=['verifier', 'synthesis'],
+    )
+    @pytest.mark.parametrize(
+        'foreign_line',
+        [
+            _ORCHESTRATED_TASK_PREAMBLE,
+            '<command-message>recon-escalation-watcher</command-message>',
+            'You are a Memory Consolidator agent operating in sleep mode.',
+            'You are the task curator for the dark-factory orchestrator.',
+        ],
+        ids=['orchestrated_task', 'watcher', 'recon', 'curator_classifier'],
+    )
+    def test_a_census_prompt_is_classified_by_its_opener_not_its_embedded_clusters(
+        self, foreign_line, build_prompt,
+    ):
+        assert _classify(user_record(build_prompt(foreign_line))) is AgentClass.LEGIBILITY_INSTRUMENT
+
     def test_later_carriers_do_not_reclassify_an_instrument_session(self):
         records = [
             user_record(_coder_prompt('nothing quoted')),
@@ -863,6 +883,22 @@ _SHAPES = [
             assistant_record(text_block(coder_judgment())),
         ],
         'legibility-instrument', id='trickle_coder_session',
+    ),
+    pytest.param(
+        '-home-leo-src-dark-factory',
+        [
+            user_record(census_verifier_prompt(_ORCHESTRATED_TASK_PREAMBLE)),
+            assistant_record(text_block('{"verified": true}')),
+        ],
+        'legibility-instrument', id='census_verifier_session',
+    ),
+    pytest.param(
+        '-home-leo-src-dark-factory',
+        [
+            user_record(census_synthesis_prompt(_ORCHESTRATED_TASK_PREAMBLE)),
+            assistant_record(text_block('{"new": [], "re_observed": []}')),
+        ],
+        'legibility-instrument', id='census_synthesis_session',
     ),
 ]
 

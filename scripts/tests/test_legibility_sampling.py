@@ -706,15 +706,25 @@ class TestSamplerReingestedContentParity:
         assert {name: digested[name] for name in _TEXT_CLASSES} == dict.fromkeys(_TEXT_CLASSES, 0)
 
 
+def _trickle_coder_instrument_prompt() -> str:
+    return coder.build_prompt(digest_text='- (turn 1) ok', codebook_index='', invariant_slugs=())
+
+
 class TestLegibilityInstrumentStratum:
-    def test_an_instrument_session_with_signal_is_sampled_in_its_own_stratum(self, tmp_path):
+    @pytest.mark.parametrize(
+        'build_prompt',
+        [_trickle_coder_instrument_prompt, census_verifier_prompt, census_synthesis_prompt],
+        ids=['trickle_coder', 'census_verifier', 'census_synthesis'],
+    )
+    def test_an_instrument_session_with_signal_is_sampled_in_its_own_stratum(
+        self, tmp_path, build_prompt,
+    ):
         encoded = tmp_path / '-home-leo-src-dark-factory'
         encoded.mkdir()
-        coder_prompt = coder.build_prompt(
-            digest_text='- (turn 1) ok', codebook_index='', invariant_slugs=(),
-        )
         sessions = [
-            _session_on_disk(encoded, 'coder-run', [_user_turn(coder_prompt), _tool_error_record()]),
+            _session_on_disk(
+                encoded, 'instrument-run', [_user_turn(build_prompt()), _tool_error_record()],
+            ),
             _session_on_disk(encoded, 'interactive-run', [_clean_record(0), _not_found_record()]),
         ]
         config = _sampling_config()
