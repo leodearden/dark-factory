@@ -50,6 +50,7 @@ from orchestrator.merge_lane.landing_evidence import (
     LandingMethod,
     LandingReason,
     LandingVerdict,
+    format_unattributed_landing_detail,
     validate_landing_evidence,
 )
 from orchestrator.scheduler import TaskAssignment
@@ -2780,6 +2781,120 @@ class TestAlreadyLandedGateAncestryRejectEmission:
         runner.assert_not_awaited()
         [row] = landing_reject_rows(h.event_store)
         assert 'delivered_checks_outcome' not in row['data']
+
+
+# ---------------------------------------------------------------------------
+# task 4648 — the OFF-MAIN-TIP arm: a live tip that is not an ancestor of main.
+#
+# It decides by branch_work_landed, as the ancestry arm does.  Only
+# no_attribution escalates (the work is on main but cannot be attributed);
+# every other reject is recorded at its own site and the task dispatches.
+# ---------------------------------------------------------------------------
+
+
+def _wired_off_main_tip_harness(mock_orch_config, tmp_path: Path) -> Harness:
+    """A harness whose live tip resolves but is NOT an ancestor of main.
+
+    The branch exists, so the merge-marker search must never run; it is wired
+    to fail loudly if it does.  The event store and the recovery-emission
+    config are real, as in :func:`_emitting_harness`.
+    """
+    h: Any = _build_harness(mock_orch_config)
+    h.git_ops = MagicMock()
+    h.git_ops.resolve_branch_sha = AsyncMock(return_value=_TIP_SHA)
+    h.git_ops.is_ancestor = AsyncMock(return_value=False)
+    h.git_ops.find_merge_marker = AsyncMock(
+        side_effect=AssertionError('a live branch never reaches the marker search'),
+    )
+    h.git_ops.config.branch_prefix = 'task/'
+    h.git_ops.config.main_branch = 'main'
+    h.scheduler.get_task = AsyncMock(return_value={'id': '42', 'metadata': {}})
+    h._mark_in_progress_done = AsyncMock()
+    h._escalation_queue = None
+    h.event_store = EventStore(tmp_path / 'runs.db', 'run-test')
+    h.config.recovery_emission = RecoveryEmissionConfig()
+    return h
+
+
+#: The off-main-tip arm's non-escalating rejects.
+_OFF_MAIN_TIP_RECORDED = [
+    LandingReason.not_landed,
+    LandingReason.degenerate_branch,
+    LandingReason.no_op_landing,
+    LandingReason.git_error,
+]
+
+
+@pytest.mark.asyncio
+class TestAlreadyLandedGateOffMainTipArm:
+    async def test_an_unattributed_landing_escalates_and_dispatches(
+        self, mock_orch_config, tmp_path, landing_producer: AsyncMock,
+    ) -> None:
+        h: Any = _wired_off_main_tip_harness(mock_orch_config, tmp_path)
+        file_escalation = MagicMock()
+        h._file_unattributed_landing_escalation = file_escalation
+        mark = cast(AsyncMock, h._mark_in_progress_done)
+        verdict = _refused_verdict(LandingReason.no_attribution)
+        landing_producer.return_value = verdict
+
+        assert await h._already_landed_dispatch_gate('42') is False
+
+        file_escalation.assert_called_once_with('42', 'task/42', verdict)
+        mark.assert_not_awaited()
+
+    async def test_the_escalation_body_renders_the_patch_id_verdict(self) -> None:
+        """FAIL BINDING: a no_attribution patch-id verdict renders into a full L1 body.
+
+        Manifest row 'rejected-verdict-carries-structured-facts-for-the-
+        escalating-arms': the probe's facts and the reason's own explanation
+        both reach the detail, so the escalation stays actionable.
+        """
+        verdict = _refused_verdict(LandingReason.no_attribution)
+
+        _summary, detail = format_unattributed_landing_detail('42', 'task/42', verdict)
+
+        assert _TIP_SHA in detail
+        assert 'the work IS on main, but no commit cites the task' in detail
+        assert 'Unrecognized reason code' not in detail
+
+    @pytest.mark.parametrize('reason', _OFF_MAIN_TIP_RECORDED)
+    async def test_every_other_reject_is_recorded_not_escalated(
+        self, mock_orch_config, tmp_path, landing_producer: AsyncMock,
+        reason: LandingReason,
+    ) -> None:
+        h: Any = _wired_off_main_tip_harness(mock_orch_config, tmp_path)
+        file_escalation = MagicMock()
+        h._file_unattributed_landing_escalation = file_escalation
+        mark = cast(AsyncMock, h._mark_in_progress_done)
+        landing_producer.return_value = _refused_verdict(reason)
+
+        assert await h._already_landed_dispatch_gate('42') is False
+
+        file_escalation.assert_not_called()
+        mark.assert_not_awaited()
+        [row] = landing_reject_rows(h.event_store)
+        assert row['data']['site'] == 'already_landed_gate_off_main_tip'
+        assert row['data']['reason'] == str(reason)
+        assert row['data']['method'] == 'patch_id'
+
+    async def test_git_error_on_the_ancestry_arm_is_recorded_as_itself(
+        self, mock_orch_config, tmp_path, landing_producer: AsyncMock,
+    ) -> None:
+        """git_error is a claim about the detector, so it is never recorded as not_landed."""
+        h: Any = _emitting_harness(mock_orch_config, tmp_path)
+        file_escalation = MagicMock()
+        h._file_unattributed_landing_escalation = file_escalation
+        landing_producer.return_value = _refused_verdict(
+            LandingReason.git_error, git_error_stage='patch_id_containment',
+        )
+
+        assert await h._already_landed_dispatch_gate('42') is False
+
+        file_escalation.assert_not_called()
+        [row] = landing_reject_rows(h.event_store)
+        assert row['data']['site'] == 'already_landed_gate_ancestry'
+        assert row['data']['reason'] == 'git_error'
+        assert row['data']['git_error_stage'] == 'patch_id_containment'
 
 
 # ---------------------------------------------------------------------------

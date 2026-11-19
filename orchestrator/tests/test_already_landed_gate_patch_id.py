@@ -8,8 +8,12 @@ against must hold one layer up, at the gate:
 
 * **B1** a landing churned by later same-path commits on main is still stamped.
 * **B2** a sync-merge tip is stamped without ever computing a main-history diff.
+* **B3** a rebase landing (rewritten shas, no citation, tip NOT an ancestor of
+  main) churned by later same-path commits is stamped on its patch-id twin.
 * **B4** a no-op landing and **B6** a degenerate branch are refused, and
   recorded as ``landing_evidence_rejected`` rows at the ancestry site.
+* **B5** a genuinely unlanded branch is refused without an escalation, and
+  recorded at the off-main-tip site.
 
 Every repository is a genuine throwaway one built by ``_landing_git_scenarios``;
 the gate runs over the REAL ``GitOps`` ``Harness.__init__`` builds for it.  Only
@@ -36,7 +40,9 @@ from _landing_git_scenarios import (
     build_degenerate_branch,
     build_merged_landing,
     build_no_op_landing,
+    build_rebased_landing,
     build_sync_merge_branch,
+    build_unlanded_branch,
     numbered_lines,
 )
 
@@ -210,3 +216,47 @@ class TestAncestryArmDecidesByPatchId:
         rows = gate.rejects()
         assert rows
         assert {row['method'] for row in rows} == {'patch_id'}
+
+
+class TestOffMainTipArmDecidesByPatchId:
+    """The arm taken when the live branch tip is NOT an ancestor of main.
+
+    It used to be entered only when the branch's touched paths were
+    byte-identical on main, a condition later same-path commits break.
+    """
+
+    async def test_b3_a_churned_rebase_landing_is_stamped_on_its_twin(
+        self, mock_orch_config: Any, repo: LandingRepo, tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        sc = build_rebased_landing(repo)
+        advance_main_touching_same_paths(sc, 3, rewrite=True)
+        gate = WiredGate(mock_orch_config, sc, tmp_path)
+        content_check = gate.spy(monkeypatch, 'branch_content_in_main')
+
+        assert await gate.run() is True
+
+        gate.mark.assert_awaited_once_with(
+            TASK_ID, sc.landed_sha, ANY, 'dispatch-gate-content-equivalent',
+        )
+        assert gate.rejects() == []
+        gate.queue.submit.assert_not_called()
+        assert content_check.await_count == 0
+
+    async def test_b5_an_unlanded_branch_is_refused_without_an_escalation(
+        self, mock_orch_config: Any, repo: LandingRepo, tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        sc = build_unlanded_branch(repo)
+        gate = WiredGate(mock_orch_config, sc, tmp_path)
+        content_check = gate.spy(monkeypatch, 'branch_content_in_main')
+
+        assert await gate.run() is False
+
+        gate.mark.assert_not_awaited()
+        gate.queue.submit.assert_not_called()
+        [row] = gate.rejects()
+        assert (row['site'], row['reason'], row['method']) == (
+            'already_landed_gate_off_main_tip', 'not_landed', 'patch_id',
+        )
+        assert content_check.await_count == 0
