@@ -1045,7 +1045,7 @@ def shape_burndown(
     UNKNOWN.  The aggregate is as of its OLDEST contribution, STALE when any
     project is carried or the newest sample is past the bound, and a
     LOWER_BOUND when a listed project has nothing measured —
-    ``static/redux/datum.js::combinedDatum``'s rules, applied where the
+    ``static/redux/datum.js::lowerBoundCombinedDatum``'s rules, applied where the
     aggregate is built.  A forecast absent for want of 7 days of history is
     UNKNOWN.  Every reason is built from the data alone, so shaping one
     series at two instants past the bound gives one payload.
@@ -1223,7 +1223,7 @@ def _burndown_provenance(
 def _aggregate_provenance(
     as_of: datetime, carried: Mapping[str, str], unmeasured: list[str], age_reason: str | None,
 ) -> _Provenance:
-    """The total's provenance by ``static/redux/datum.js::combinedDatum``'s rules.
+    """The total's provenance by ``static/redux/datum.js::lowerBoundCombinedDatum``'s rules.
 
     As of the oldest contribution; LOWER_BOUND over STALE over FRESH; one
     reason part per carried or unmeasured project, and one for the newest
