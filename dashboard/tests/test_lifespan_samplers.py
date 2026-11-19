@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 import httpx
 import pytest
-from _dashboard_helpers import app_running, apply_isolated_env
+from _dashboard_helpers import app_with_loops, apply_isolated_env
 from fastapi import FastAPI
 from starlette.testclient import TestClient
 
@@ -54,7 +54,7 @@ def _recording_loops() -> tuple[BackgroundLoops, Counter[str], dict[str, list[Ca
 
 def _run_one_lifespan() -> Counter[str]:
     loops, starts, _ = _recording_loops()
-    with TestClient(app_running(loops)):
+    with TestClient(app_with_loops(loops)):
         pass
     return starts
 
@@ -91,7 +91,7 @@ def test_the_switch_is_read_from_the_lifespans_own_config(
     """
     monkeypatch.setenv('DASHBOARD_SAMPLERS', 'off')
     loops, starts, _ = _recording_loops()
-    app = app_running(loops)
+    app = app_with_loops(loops)
     swapped = DashboardConfig(project_root=tmp_path / 'other', samplers_enabled=True)
     swaps: list[DashboardConfig] = []
 
@@ -116,7 +116,7 @@ def test_the_quality_loop_is_handed_the_lifespans_own_store_and_config(
     """An interleaving config on app.state must not reach the quality loop or its store."""
     monkeypatch.delenv('DASHBOARD_SAMPLERS', raising=False)
     loops, starts, calls = _recording_loops()
-    app = app_running(loops)
+    app = app_with_loops(loops)
     swapped = DashboardConfig(project_root=tmp_path / 'other')
     swaps: list[DashboardConfig] = []
 

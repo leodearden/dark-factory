@@ -257,8 +257,10 @@ async def drain(*tasks: asyncio.Task[Any]) -> None:
 # enough, then cancel it": drive_loop_until for any loop, drive_metrics_loop
 # for _metrics_loop against a recorded collect_metrics_snapshot.  Their
 # contract is pinned by test_metrics_loop_harness.py.  IDLE_BACKGROUND_LOOPS
-# and app_running are the other direction: a whole lifespan, with the loops
-# it starts chosen by the test.
+# and app_with_loops are the other direction: a whole lifespan, with the loops
+# it starts chosen by the test.  Tests choose a lifespan's background loops
+# through ``lifespan``'s ``loops`` argument, never by patching names on
+# ``dashboard.app``.
 # ---------------------------------------------------------------------------
 
 
@@ -348,18 +350,12 @@ IDLE_BACKGROUND_LOOPS = BackgroundLoops(
 )
 """Background loops that return at once, for a lifespan whose loops are not under test.
 
-Tests choose a lifespan's background loops through ``lifespan``'s ``loops``
-argument, never by patching names on ``dashboard.app``; derive a variant with
-``dataclasses.replace(IDLE_BACKGROUND_LOOPS, metrics=...)``.
+Derive a variant with ``dataclasses.replace(IDLE_BACKGROUND_LOOPS, metrics=...)``.
 """
 
 
-def app_running(loops: BackgroundLoops) -> FastAPI:
-    """A fresh app whose every lifespan starts *loops* instead of the production ones.
-
-    Tests choose a lifespan's background loops through ``lifespan``'s ``loops``
-    argument, never by patching names on ``dashboard.app``.
-    """
+def app_with_loops(loops: BackgroundLoops) -> FastAPI:
+    """A fresh app whose every lifespan starts *loops* instead of the production ones."""
     return FastAPI(lifespan=functools.partial(lifespan, loops=loops))
 
 

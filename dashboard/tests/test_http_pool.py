@@ -1352,14 +1352,9 @@ class TestWiringTheReaperKeepsTheExitPathGuarantee:
                 'dashboard.app.reap_detached_refreshes',
                 new=AsyncMock(side_effect=RuntimeError(self._BOOM)),
             ),
-            patch('dashboard.loops.collect_snapshot', new=AsyncMock(return_value=None)),
-            patch(
-                'dashboard.loops.collect_metrics_snapshot',
-                new=AsyncMock(return_value=None),
-            ),
             pytest.raises(RuntimeError, match=self._BOOM),
         ):
-            async with lifespan(app):
+            async with lifespan(app, loops=IDLE_BACKGROUND_LOOPS):
                 pass
 
         assert app.state.http_client.is_closed, (

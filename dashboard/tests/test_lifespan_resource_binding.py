@@ -42,7 +42,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
-from _dashboard_helpers import IDLE_BACKGROUND_LOOPS, app_running, drive_metrics_loop
+from _dashboard_helpers import IDLE_BACKGROUND_LOOPS, app_with_loops, drive_metrics_loop
 from fastapi import FastAPI
 from starlette.testclient import TestClient
 
@@ -81,7 +81,7 @@ def test_nested_lifespans_each_get_their_own_pool_and_client(
             }
         )
 
-    app = app_running(replace(IDLE_BACKGROUND_LOOPS, metrics=_recording_metrics_loop))
+    app = app_with_loops(replace(IDLE_BACKGROUND_LOOPS, metrics=_recording_metrics_loop))
     with TestClient(app) as _outer:
         outer_pool = app.state.db
         outer_http = app.state.http_client
@@ -230,7 +230,7 @@ def test_lifespan_binds_burndown_loop_to_the_config_it_built(
     ) -> None:
         recorded.append(config)
 
-    app = app_running(replace(IDLE_BACKGROUND_LOOPS, burndown=_recording_burndown_loop))
+    app = app_with_loops(replace(IDLE_BACKGROUND_LOOPS, burndown=_recording_burndown_loop))
     with (
         patch('dashboard.app._build_http_limits', new=_swapping_limits),
         patch.object(_BurndownStore, 'open', _recording_open),
