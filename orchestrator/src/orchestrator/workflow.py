@@ -14842,7 +14842,7 @@ class TaskWorkflow:
         if sandbox_modules is not None:
             write_set = compute_write_set(
                 cwd, task_id=self.task_id, task_root=self._artifact_roots(cwd)[1],
-                declared_files=self._task_files or (self.task.get('metadata') or {}).get('files'),
+                declared_files=self._task_files or task_metadata.get('files'),
             )
             if write_set.docs_main_paths:
                 logger.info(

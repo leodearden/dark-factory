@@ -13,6 +13,7 @@ from orchestrator.agents.docs_scope import (
     DOCS_TOP_LEVEL_DIRS,
     docs_only_paths,
     is_docs_path,
+    is_in_docs_tree,
 )
 
 
@@ -48,6 +49,16 @@ class TestIsDocsPath:
     ])
     def test_non_docs(self, rel: str) -> None:
         assert is_docs_path(PurePosixPath(rel)) is False
+
+
+class TestIsInDocsTree:
+    @pytest.mark.parametrize('rel', ['docs', 'docs/prds', 'docs/img/diagram.png'])
+    def test_under_a_top_level_docs_dir(self, rel: str) -> None:
+        assert is_in_docs_tree(PurePosixPath(rel)) is True
+
+    @pytest.mark.parametrize('rel', ['CLAUDE.md', 'plans/x.md', 'src/docs', 'notes.md/sub'])
+    def test_docs_suffix_or_nested_docs_component_is_not_enough(self, rel: str) -> None:
+        assert is_in_docs_tree(PurePosixPath(rel)) is False
 
 
 class TestDocsOnlyPaths:

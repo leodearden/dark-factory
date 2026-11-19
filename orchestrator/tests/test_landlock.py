@@ -349,12 +349,14 @@ class TestLandlockFileGrant:
     ):
         docs = scaffold / 'docs'
         granted = docs / 'granted.md'
+        staged = scaffold / 'wt' / '.task' / 'staged.md'
         script = ' ; '.join([
             f'(printf appended >> {granted} && echo granted_ok)',
             f'(printf x >> {docs}/sibling.md 2>/dev/null || echo sibling_denied)',
             f'(printf x > {docs}/new.md 2>/dev/null || echo create_denied)',
-            f'((printf x > {granted}.tmp && mv {granted}.tmp {granted}) 2>/dev/null'
-            ' || echo rename_denied)',
+            f'(printf x > {granted}.tmp 2>/dev/null || echo tmp_create_denied)',
+            f'(printf replaced > {staged} && echo staged_ok)',
+            f'(mv {staged} {granted} 2>/dev/null || echo rename_denied)',
         ])
 
         result = self._run(scaffold, script, [str(granted)])
@@ -367,8 +369,11 @@ class TestLandlockFileGrant:
         assert (docs / 'sibling.md').read_text() == 'sibling\n'
         assert 'create_denied' in result.stdout
         assert not (docs / 'new.md').exists()
-        assert 'rename_denied' in result.stdout
+        assert 'tmp_create_denied' in result.stdout
         assert not (docs / 'granted.md.tmp').exists()
+        assert 'staged_ok' in result.stdout
+        assert 'rename_denied' in result.stdout
+        assert staged.exists()
 
     def test_missing_writable_path_is_skipped_loudly(self, scaffold: Path):
         missing = scaffold / 'docs' / 'absent.md'

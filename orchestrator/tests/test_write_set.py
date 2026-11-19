@@ -21,6 +21,7 @@ Test coverage:
 from __future__ import annotations
 
 import dataclasses
+import os
 import subprocess
 from pathlib import Path
 
@@ -565,27 +566,89 @@ class TestDocsMainGrant:
         ws = self._ws(worktree, tmp_home, ['docs'])
         assert ws.docs_main_paths == (docs_root / 'docs',)
 
-    @pytest.mark.parametrize('declared', [
-        'BRAND-NEW.md',
-        '.taskmaster/notes.md',
-        'docs/link.md',
-        'docs/out.md',
+    def test_new_file_nested_in_docs_grants_its_nearest_existing_docs_dir(
+        self, docs_root: Path, worktree: Path, tmp_home: Path,
+    ):
+        ws = self._ws(worktree, tmp_home, ['docs/a/b/c.md'])
+        assert ws.docs_main_paths == (docs_root / 'docs',)
+
+    @pytest.mark.parametrize(('declared', 'reason'), [
+        ('BRAND-NEW.md', 'not strictly inside'),
+        ('docs/out.md', 'not strictly inside'),
+        ('.taskmaster/notes.md', '.taskmaster, which is never granted'),
+        ('docs/link.md', '.taskmaster, which is never granted'),
+        ('.git/notes.md', '.git, which is never granted'),
+        ('src/pkg/NOTES.md', 'outside a top-level docs dir'),
+        ('docs/existing.md/x.md', 'nearest existing ancestor'),
+        ('docs/fifo.md', 'not a regular file or directory'),
     ])
-    def test_refused_path_is_warned_and_not_granted(
-        self, declared: str, docs_root: Path, worktree: Path, tmp_home: Path,
+    def test_refused_path_is_warned_with_its_reason_and_not_granted(
+        self, declared: str, reason: str, docs_root: Path, worktree: Path, tmp_home: Path,
         tmp_path: Path, caplog: pytest.LogCaptureFixture,
     ):
         (docs_root / 'docs' / 'link.md').symlink_to(docs_root / '.taskmaster' / 'tasks.db')
         outside = tmp_path / 'outside.md'
         outside.write_text('outside\n')
         (docs_root / 'docs' / 'out.md').symlink_to(outside)
+        (docs_root / '.git' / 'notes.md').write_text('notes\n')
+        (docs_root / 'src' / 'pkg').mkdir()
+        os.mkfifo(docs_root / 'docs' / 'fifo.md')
 
         with caplog.at_level('WARNING', logger='orchestrator.agents.write_set'):
             ws = self._ws(worktree, tmp_home, ['docs/existing.md', declared])
 
         assert ws.docs_main_paths == (docs_root / 'docs' / 'existing.md',)
+        warnings = [r.getMessage() for r in caplog.records if r.levelname == 'WARNING']
+        assert any(declared in m and reason in m for m in warnings), warnings
+
+    def test_nothing_in_or_over_the_configured_lane_base_is_granted(
+        self, docs_root: Path, tmp_home: Path, caplog: pytest.LogCaptureFixture,
+    ):
+        lanes = docs_root / 'lanes'
+        lanes.mkdir()
+        lane = lanes / '2905'
+        _git(['worktree', 'add', '-b', 'task/2905', str(lane), 'main'], docs_root)
+        meta = TaskArtifacts.task_root_for(lanes, '77')
+        meta.mkdir(parents=True)
+        (meta / 'plan.md').write_text('plan\n')
+        declared = ['docs/existing.md', 'lanes/2905/README.md', 'lanes/.task-meta/task-77/plan.md']
+
+        with caplog.at_level('WARNING', logger='orchestrator.agents.write_set'):
+            ws = compute_write_set(lane, task_id='2905', home=tmp_home, declared_files=declared)
+
+        assert ws.docs_main_paths == (docs_root / 'docs' / 'existing.md',)
+        warnings = [r.getMessage() for r in caplog.records if r.levelname == 'WARNING']
+        for rel in declared[1:]:
+            assert any(rel in m and 'which is never granted' in m for m in warnings), warnings
+
+    def test_lane_base_holding_the_project_root_beside_its_lanes_still_grants(
+        self, docs_root: Path, tmp_home: Path,
+    ):
+        lane = docs_root.parent / '2906'
+        _git(['worktree', 'add', '-b', 'task/2906', str(lane), 'main'], docs_root)
+
+        ws = compute_write_set(
+            lane, task_id='2906', home=tmp_home, declared_files=['docs/existing.md'],
+        )
+
+        assert ws.docs_main_paths == (docs_root / 'docs' / 'existing.md',)
+
+    def test_common_dir_not_named_git_makes_no_grant(
+        self, tmp_path: Path, tmp_home: Path, caplog: pytest.LogCaptureFixture,
+    ):
+        common = tmp_path / 'common.git'
+        (common / 'worktrees' / 'lane').mkdir(parents=True)
+        lane = tmp_path / 'lanes' / 'lane'
+        lane.mkdir(parents=True)
+        (lane / '.git').write_text(f'gitdir: {common}/worktrees/lane\n')
+
+        with caplog.at_level('WARNING', logger='orchestrator.agents.write_set'):
+            ws = compute_write_set(lane, task_id='2904', home=tmp_home, declared_files=['CLAUDE.md'])
+
+        assert ws.docs_main_git is None
+        assert ws.docs_main_paths == ()
         assert any(
-            r.levelname == 'WARNING' and declared in r.getMessage() for r in caplog.records
+            'is not a <project_root>/.git' in r.getMessage() for r in caplog.records
         ), [r.getMessage() for r in caplog.records]
 
     def test_every_path_refused_makes_no_grant_at_all(
@@ -602,6 +665,14 @@ class TestDocsMainGrant:
         with pytest.raises(ValueError, match='docs_main_paths') as excinfo:
             dataclasses.replace(ws, docs_main_paths=(docs_root / 'CLAUDE.md',))
         assert 'docs_main_git' in str(excinfo.value)
+
+    @pytest.mark.parametrize('rel', ['.taskmaster/tasks.db', '.git/config', '.'])
+    def test_ungrantable_path_violates_the_invariant(
+        self, rel: str, docs_root: Path, worktree: Path, tmp_home: Path,
+    ):
+        ws = self._ws(worktree, tmp_home, _DOCS_ONLY)
+        with pytest.raises(ValueError, match='ungrantable'):
+            dataclasses.replace(ws, docs_main_paths=((docs_root / rel).resolve(),))
 
     def test_git_without_paths_violates_the_invariant(
         self, docs_root: Path, worktree: Path, tmp_home: Path,

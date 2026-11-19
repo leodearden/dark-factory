@@ -12,10 +12,12 @@ DOCS_SUFFIXES = frozenset({'.md', '.yaml', '.yml'})
 DOCS_TOP_LEVEL_DIRS = frozenset({'docs'})
 
 
+def is_in_docs_tree(rel: PurePosixPath) -> bool:
+    return bool(rel.parts) and rel.parts[0] in DOCS_TOP_LEVEL_DIRS
+
+
 def is_docs_path(rel: PurePosixPath) -> bool:
-    return rel.suffix in DOCS_SUFFIXES or (
-        bool(rel.parts) and rel.parts[0] in DOCS_TOP_LEVEL_DIRS
-    )
+    return rel.suffix in DOCS_SUFFIXES or is_in_docs_tree(rel)
 
 
 def _relative_path(entry: object) -> PurePosixPath | None:
