@@ -853,9 +853,13 @@ _C4_KEYS = (
 
 def test_verify_prompt_embeds_the_quality_definition_and_asks_for_the_c4_verdict(tmp_path):
     fake_invoke = make_fake_invoke(default=_verdict())
-    census_verify.build_verify_fn(str(tmp_path), fake_invoke)(_clusters(1), model="sonnet")
+    [cluster] = _clusters(1)
+    census_verify.build_verify_fn(str(tmp_path), fake_invoke)([cluster], model="sonnet")
     prompt = fake_invoke.calls[0]["prompt"]
 
+    assert prompt == census_verify.verify_prompt(
+        cluster, project_root=str(tmp_path), quality_block=code_quality.guidance(),
+    )
     assert quality_block_of(prompt) == code_quality.guidance()
     assert prompt.startswith("You are the periodic-census verifier")
     for key in _C4_KEYS:

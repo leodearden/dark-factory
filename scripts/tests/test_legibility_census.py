@@ -7507,6 +7507,7 @@ def test_synthesis_prompt_embeds_the_quality_definition_the_c6_reply_and_the_bri
     [call] = fake_invoke.calls
     prompt = call["prompt"]
     assert (reply, call["model"]) == ("the raw reply", "fable")
+    assert prompt == mod.synthesis_prompt(brief, quality_block=code_quality.guidance())
     assert quality_block_of(prompt) == code_quality.guidance()
     assert synthesis.reply_instructions() in prompt
     assert json.dumps(brief.to_record()) in prompt
