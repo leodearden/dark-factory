@@ -118,6 +118,7 @@ from fused_memory.reconciliation.task_count_snapshot_cadence import (
 from fused_memory.reconciliation.task_filter import (
     FilteredTaskTree,
     TaskTreeUnavailableReason,
+    available_tree,
     cross_verify_task_counts,
     diff_status_correction,
     filter_task_tree,
@@ -1423,7 +1424,7 @@ class ReconciliationHarness:
         if not os.path.isabs(project_root):
             logger.warning(
                 '_fetch_filtered_task_tree rejected non-absolute project_root %r'
-                ' — cannot fetch tasks; Stage 2 will see empty tree',
+                ' — cannot fetch tasks; Stage 2 will see the tree as unavailable',
                 project_root,
             )
             return FilteredTaskTree(unavailable_reason=TaskTreeUnavailableReason.non_absolute_project_root)
@@ -5391,8 +5392,9 @@ class ReconciliationHarness:
             # worktree/branch of their own — routed to DeterministicRunner) do too —
             # which status alone cannot express since 'blocked' is deliberately not in
             # ORCH_LIVE_INELIGIBLE_STATUSES (a normal blocked task may legitimately
-            # auto-unblock mid-pipeline). remediation_tree is always a valid
-            # FilteredTaskTree (degrades to empty on fetch failure), so this is safe.
+            # auto-unblock mid-pipeline). A failed fetch yields a tree carrying an
+            # unavailable_reason and no tasks; available_tree maps it to None, and
+            # the map is then empty.
             #
             # Task 2964 consolidated the former parallel status_by_id/task_kind_by_id
             # scalar maps into this one: the gate now also needs `metadata` (for
@@ -5410,12 +5412,18 @@ class ReconciliationHarness:
             # so status/task_kind/pure_gate/corroborated all degrade to the pre-2031
             # status-blind, fail-safe-toward-live values for that one id, not a new
             # failure mode.
+            fetched_remediation_tree = available_tree(remediation_tree)
+            remediation_tasks: list[dict] = (
+                []
+                if fetched_remediation_tree is None
+                else [
+                    *fetched_remediation_tree.active_tasks,
+                    *fetched_remediation_tree.done_tasks,
+                    *fetched_remediation_tree.cancelled_tasks,
+                ]
+            )
             task_by_id: dict[str, dict] = {}
-            for t in (
-                list(remediation_tree.active_tasks)
-                + list(remediation_tree.done_tasks)
-                + list(remediation_tree.cancelled_tasks)
-            ):
+            for t in remediation_tasks:
                 if not isinstance(t, dict) or t.get('id') is None:
                     continue
                 task_by_id[str(t.get('id'))] = t
@@ -5983,9 +5991,10 @@ class ReconciliationHarness:
                                 #
                                 # `task_by_id and ...` is load-bearing, and is
                                 # the ONE place this gate deliberately fails
-                                # OPEN.  `_fetch_filtered_task_tree` degrades to
-                                # an EMPTY tree whenever taskmaster is disabled
-                                # or the fetch fails, and an empty map is not
+                                # OPEN.  `_fetch_filtered_task_tree` returns a
+                                # tree carrying an unavailable_reason and no
+                                # tasks whenever taskmaster is disabled or the
+                                # fetch fails, so the map is empty, and that is not
                                 # evidence that a task is absent — it is evidence
                                 # that we do not know.  Treating "no tree" as
                                 # "no such task" would silently switch this whole

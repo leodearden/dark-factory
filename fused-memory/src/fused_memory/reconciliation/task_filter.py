@@ -21,7 +21,7 @@ from __future__ import annotations
 import heapq
 import re
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
@@ -897,19 +897,6 @@ class TaskTreeUnavailableReason(StrEnum):
     fetch_error = 'fetch_error'
 
 
-_TREE_CONTENT_FIELDS: tuple[str, ...] = (
-    'active_tasks',
-    'done_tasks',
-    'cancelled_tasks',
-    'all_done_tasks',
-    'done_count',
-    'cancelled_count',
-    'other_count',
-    'total_count',
-    'max_task_id',
-)
-
-
 @dataclass
 class FilteredTaskTree:
     """Result of filter_task_tree(): active tasks plus aggregate counts.
@@ -958,9 +945,9 @@ class FilteredTaskTree:
         if self.unavailable_reason is None:
             return
         carried = {
-            name: value
-            for name in _TREE_CONTENT_FIELDS
-            if (value := getattr(self, name))
+            f.name: value
+            for f in fields(self)
+            if f.name != 'unavailable_reason' and (value := getattr(self, f.name))
         }
         if carried:
             details = ', '.join(f'{name}={value!r}' for name, value in carried.items())

@@ -4051,7 +4051,7 @@ class TaskKnowledgeSync(BaseStage):
         stage1_report = prior_reports[0] if prior_reports else None
 
         filtered, tree_read_at = await self._resolve_task_tree()
-        unavailable = tree_unavailable_notice(filtered)
+        unavailable_notice = tree_unavailable_notice(filtered)
 
         # Defensive invariant check (task-782): see _check_filtered_tree_invariant.
         self._check_filtered_tree_invariant(filtered)
@@ -4076,20 +4076,24 @@ class TaskKnowledgeSync(BaseStage):
             )
 
         proactive_sample_section = ''
-        if not self.remediation_mode and unavailable is not None:
-            proactive_sample_section = f'\n### Proactive Task Sample\n{unavailable}\n'
-        elif not self.remediation_mode:
-            # Pool intentionally excludes unknown-status tasks (dropped by
-            # filter_task_tree) and caps done_tasks at MAX_DONE_TASKS_RETAINED.
-            sample = _select_proactive_sample(
-                itertools.chain(
-                    filtered.active_tasks, filtered.done_tasks, filtered.cancelled_tasks
-                ),
-                self.MIN_TASK_SAMPLE,
-            )
-            proactive_sample_section = (
-                f'\n### Proactive Task Sample ({len(sample)} tasks)\n{format_task_list(sample)}\n'
-            )
+        if not self.remediation_mode:
+            if unavailable_notice is not None:
+                proactive_sample_section = (
+                    f'\n### Proactive Task Sample\n{unavailable_notice}\n'
+                )
+            else:
+                # Pool intentionally excludes unknown-status tasks (dropped by
+                # filter_task_tree) and caps done_tasks at MAX_DONE_TASKS_RETAINED.
+                sample = _select_proactive_sample(
+                    itertools.chain(
+                        filtered.active_tasks, filtered.done_tasks, filtered.cancelled_tasks
+                    ),
+                    self.MIN_TASK_SAMPLE,
+                )
+                proactive_sample_section = (
+                    f'\n### Proactive Task Sample ({len(sample)} tasks)\n'
+                    f'{format_task_list(sample)}\n'
+                )
 
         # Done-Task Completion-Memory Audit — enumerate EVERY task that
         # transitioned to `done` inside the task-change window, which starts when
@@ -4102,39 +4106,42 @@ class TaskKnowledgeSync(BaseStage):
         # `not self.remediation_mode` — mirrors proactive_sample_section
         # (remediation is a focused second pass, not general sync).
         done_audit_section = ''
-        if not self.remediation_mode and unavailable is not None:
-            done_audit_section = f'\n### Done-Task Completion-Memory Audit\n{unavailable}\n'
-        elif not self.remediation_mode:
-            boundary = watermark.last_task_change_timestamp
-            audit_tasks = select_done_since_boundary(filtered.all_done_tasks, boundary)
-            total_audit = len(audit_tasks)
-            boundary_label = (
-                boundary.isoformat()
-                if boundary is not None
-                else 'no prior full-run boundary (first cycle — all done tasks in scope)'
-            )
-            # select_done_since_boundary sorts most-recent-first (and parse-failures
-            # to the front), so a clip drops only the oldest tasks.
-            audit_body = render_capped_task_list(
-                audit_tasks,
-                cap=self.MAX_DONE_AUDIT_RENDERED,
-                cap_name='MAX_DONE_AUDIT_RENDERED',
-                omitted_noun='done task(s) since the boundary',
-                dropped_first='the oldest since-boundary tasks',
-                log_event='reconciliation.done_task_audit_render_capped',
-                log_extra={
-                    'project_id': self.project_id,
-                    'run_id': self._current_run_id,
-                    'total_since_boundary': total_audit,
-                    'boundary': boundary_label,
-                },
-            )
-            done_audit_section = (
-                f'\n### Done-Task Completion-Memory Audit '
-                f'({total_audit} since last cycle)\n'
-                f'Boundary (previous full run started): {boundary_label}\n'
-                f'{audit_body}'
-            )
+        if not self.remediation_mode:
+            if unavailable_notice is not None:
+                done_audit_section = (
+                    f'\n### Done-Task Completion-Memory Audit\n{unavailable_notice}\n'
+                )
+            else:
+                boundary = watermark.last_task_change_timestamp
+                audit_tasks = select_done_since_boundary(filtered.all_done_tasks, boundary)
+                total_audit = len(audit_tasks)
+                boundary_label = (
+                    boundary.isoformat()
+                    if boundary is not None
+                    else 'no prior full-run boundary (first cycle — all done tasks in scope)'
+                )
+                # select_done_since_boundary sorts most-recent-first (and parse-failures
+                # to the front), so a clip drops only the oldest tasks.
+                audit_body = render_capped_task_list(
+                    audit_tasks,
+                    cap=self.MAX_DONE_AUDIT_RENDERED,
+                    cap_name='MAX_DONE_AUDIT_RENDERED',
+                    omitted_noun='done task(s) since the boundary',
+                    dropped_first='the oldest since-boundary tasks',
+                    log_event='reconciliation.done_task_audit_render_capped',
+                    log_extra={
+                        'project_id': self.project_id,
+                        'run_id': self._current_run_id,
+                        'total_since_boundary': total_audit,
+                        'boundary': boundary_label,
+                    },
+                )
+                done_audit_section = (
+                    f'\n### Done-Task Completion-Memory Audit '
+                    f'({total_audit} since last cycle)\n'
+                    f'Boundary (previous full run started): {boundary_label}\n'
+                    f'{audit_body}'
+                )
 
         # Every blocked gate, not the MIN_TASK_SAMPLE survivors: in-progress tasks
         # sort ahead of blocked ones and evict them from the sample. Remediation-gated
