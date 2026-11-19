@@ -2292,7 +2292,7 @@ def arm_fixtures(config: pytest.Config, *fixtures: Callable[..., object]) -> Non
     call, so a conftest needs no binding of the fixture itself.
     """
     for fixture in fixtures:
-        name = fixture_marker(fixture).name or fixture.__name__
+        name = getattr(fixture, 'name', None) or fixture.__name__
         plugin_name = f'df-isolation:{name}'
         if not config.pluginmanager.has_plugin(plugin_name):
             config.pluginmanager.register(type(plugin_name, (), {name: fixture}), plugin_name)
