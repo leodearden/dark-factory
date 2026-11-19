@@ -5975,16 +5975,15 @@ class TestLaneSceneVerifyIsNotCalledDead:
         The in-flight abort poll measures its no-progress budget off the
         FakeClock's ``monotonic()``, which the lane's own periodic loops push
         forward by far more than a poll per real second, so that budget buys
-        no dependable real time. What keeps a verify alive is content progress under its merge
-        worktree, as a healthy verify shows. With the budget shrunk to ten
-        polls, a verify parked for a real second must still run once, not be
-        called dead and requeued.
+        no dependable real time. With the budget shrunk to ten polls, a lane
+        built by ``make_lane`` with no clock must still run a verify parked
+        for a real second once, not call it dead and requeue it.
         """
         wt = await _make_branch_with_file(git_ops, 'slow-verify', 'sv.py', 'x = 1\n')
         gate = asyncio.Event()
         verifier = FakeVerifier(default=dataclasses.replace(passes(), release=gate))
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        lane = make_lane(git_ops, queue, verifier=verifier, clock=healthy_verify_clock())
+        lane = make_lane(git_ops, queue, verifier=verifier)
         lane.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS = 10 * lane.VERIFY_ABANDON_POLL_SECS
 
         async with running_lane(lane) as run:
