@@ -32,12 +32,18 @@ import os
 import re
 import secrets
 import sys
-import tempfile
 import tomllib
 import urllib.error
 import urllib.request
 from collections.abc import Mapping
 from pathlib import Path
+
+# Bind scripts/ to THIS checkout, so _checkout binds this checkout's shared.
+# A bare sys.path call, the one statement ruff's E402 lets an import follow.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+import _checkout as _checkout
+from shared.safe_io import atomic_write_text
 
 EXIT_OK = 0
 EXIT_FAILED = 1
@@ -151,17 +157,11 @@ def _read_existing(path: Path) -> dict[str, object]:
     return tomllib.loads(path.read_text(encoding="utf-8"))
 
 
-def _write_atomically(path: Path, text: str) -> None:
+def _write_private(path: Path, text: str) -> None:
+    """Write *text* to *path* atomically, mode 0600, creating missing directories 0700."""
     os.umask(0o077)
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as out:
-            out.write(text)
-        os.replace(tmp, path)
-    except BaseException:
-        Path(tmp).unlink(missing_ok=True)
-        raise
+    atomic_write_text(path, text, mode=0o600)
 
 
 def _log_transitions(existing: Mapping[str, object], config: Mapping[str, object]) -> None:
@@ -213,7 +213,7 @@ def write(args: argparse.Namespace) -> int:
         _log.error("%s nothing was written to %s", _LOG_PREFIX, path)
         return EXIT_FAILED
     _log_transitions(existing, config)
-    _write_atomically(path, render(config))
+    _write_private(path, render(config))
     _log.info(
         "%s wrote %s: enabled=%s policy=%s store_url=%s",
         _LOG_PREFIX,
