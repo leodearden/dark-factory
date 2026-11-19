@@ -18,6 +18,7 @@ from fused_memory.reconciliation.task_filter import (
     FilteredTaskTree,
     TaskTreeUnavailableReason,
     _render_task_line,
+    available_tree,
     cross_verify_task_counts,
     detect_census_inconsistency,
     diff_status_correction,
@@ -1368,6 +1369,23 @@ class TestUnavailableTaskTree:
         assert 'unavailable_reason' in message
         assert 'fetch_error' in message
         assert field_name in message
+
+    def test_available_tree_of_an_unset_tree_is_none(self):
+        assert available_tree(None) is None
+
+    @pytest.mark.parametrize('reason', list(TaskTreeUnavailableReason))
+    def test_available_tree_of_an_unavailable_tree_is_none(self, reason):
+        assert available_tree(FilteredTaskTree(unavailable_reason=reason)) is None
+
+    @pytest.mark.parametrize(
+        'tasks',
+        [[], [{'id': 1, 'status': 'pending'}]],
+        ids=['empty', 'one-active'],
+    )
+    def test_available_tree_returns_a_fetched_tree_itself(self, tasks):
+        fetched = filter_task_tree({'tasks': tasks})
+
+        assert available_tree(fetched) is fetched
 
 
 class TestFilterTaskTreeDoneAndCancelledLists:
