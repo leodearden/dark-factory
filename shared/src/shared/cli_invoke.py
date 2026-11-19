@@ -19,6 +19,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import IO, TYPE_CHECKING, Any, Protocol, TypeGuard, TypeVar
 
+from shared.claude_executable import ClaudeLaunchSurface, claude_executable, override_var
 from shared.cost_store import CapReason
 from shared.proc_group import snapshot_process_group, terminate_process_group
 from shared.process_cost import ProcessCostBasis, derive_process_cost, next_resume_prior
@@ -113,25 +114,6 @@ _WATCHDOG_SLOW_READ_WARN_SECS = 1.0
 _DEFAULT_CAP_WAIT_SANITY_SECS = 14 * 86400  # 14 days: outer sanity bound for patient cap waits
 _CAP_WAIT_LOG_INTERVAL_SECS = 600.0  # emit at most one cap_wait log per ~10 min
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Claude backend binary resolution.
-#
-# WHY THIS EXISTS: argv[0] used to be the hardcoded bare PATH name 'claude',
-# resolved by the kernel against whatever PATH the spawning process happened
-# to inherit. On 2026-08-13→08-18 the fused-memory systemd user unit pinned no
-# Environment=PATH=, its inherited user-manager PATH lacked ~/.local/bin, and
-# so every curator LLM call raised FileNotFoundError for 80+ hours — with no
-# log line naming the binary that could not be found.
-#
-# _CLAUDE_BINARY_ENV_VAR is the operator escape hatch: an absolute path here
-# removes PATH from the equation entirely, and is the remediation the
-# unresolvable-binary escalation recommends.
-# ─────────────────────────────────────────────────────────────────────────────
-_CLAUDE_BINARY_ENV_VAR = 'CLAUDE_BINARY'
-# The historical argv[0]. Kept as the fallback so an environment that never
-# sets _CLAUDE_BINARY_ENV_VAR and does have `claude` on PATH is byte-identical
-# to the pre-task-4448 behaviour.
-_DEFAULT_CLAUDE_BINARY = 'claude'
 CAP_HIT_RESUME_PROMPT = (
     'Your previous run was interrupted by a usage limit. '
     'Continue where you left off and complete your task.'
@@ -212,11 +194,12 @@ __all__ = [
 
 
 def claude_binary_spec() -> str:
-    """Return the Claude CLI binary spec: the ``CLAUDE_BINARY`` override, else ``'claude'``.
+    """Return the fleet's Claude CLI binary spec: the ``CLAUDE_BINARY`` override, else ``'claude'``.
 
-    An empty ``CLAUDE_BINARY`` is treated as unset rather than as an empty
-    argv[0], so ``CLAUDE_BINARY=`` in a systemd unit or a shell profile
-    degrades to the default instead of producing an unspawnable command.
+    The fleet surface of ``shared/src/shared/claude_executable.py::claude_executable``
+    over ``os.environ``; an empty ``CLAUDE_BINARY`` counts as unset there, so
+    ``CLAUDE_BINARY=`` in a systemd unit or a shell profile degrades to the
+    default instead of producing an unspawnable argv[0].
 
     The spec may be a bare name (resolved against PATH) or an absolute path.
     Setting it to an absolute path is the remediation for the 2026-08-13→08-18
@@ -226,7 +209,7 @@ def claude_binary_spec() -> str:
 
     Never raises.
     """
-    return os.environ.get(_CLAUDE_BINARY_ENV_VAR) or _DEFAULT_CLAUDE_BINARY
+    return claude_executable(ClaudeLaunchSurface.FLEET, os.environ)
 
 
 def resolve_claude_binary() -> str | None:
@@ -3494,7 +3477,7 @@ def build_claude_argv(
             'claude binary %r does not resolve on PATH — spawning it will fail. '
             'Set %s to an absolute path, or pin Environment=PATH= in the unit. '
             'PATH=%s',
-            _spec, _CLAUDE_BINARY_ENV_VAR, os.environ.get('PATH'),
+            _spec, override_var(ClaudeLaunchSurface.FLEET), os.environ.get('PATH'),
         )
     cmd = [_resolved or _spec, '--print', '--output-format', 'json']
 
