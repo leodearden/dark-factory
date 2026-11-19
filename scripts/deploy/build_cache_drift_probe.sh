@@ -18,17 +18,51 @@
 # The checkout defaults to $REIFY_ROOT, else $HOME/src/reify; exit 2 if it is
 # not a directory. REIFY_PROBE_DEEP=1 adds the header-closure digest of the
 # two hand-written C++ wrappers (cc -M, preprocess only).
+#
+# REIFY_PROBE_LIST=dev-packages or =pkg-config-modules prints, instead of the
+# probe, the listing that the dpkg.dev-packages or pkg-config.modules line
+# digests, one name=version per line, so diffing two hosts' listings names
+# the package. It needs no checkout. The host trees digested are
+# $REIFY_PROBE_OCCT_INCLUDE (default /usr/include/opencascade),
+# $REIFY_PROBE_DEPS_ROOT (default /opt/reify-deps) and
+# $REIFY_PROBE_SLVS_HEADER (default /usr/include/slvs.h).
 set -u
 export LC_ALL=C
+OCCT_INCLUDE="${REIFY_PROBE_OCCT_INCLUDE:-/usr/include/opencascade}"
+DEPS="${REIFY_PROBE_DEPS_ROOT:-/opt/reify-deps}"
+SLVS_HEADER="${REIFY_PROBE_SLVS_HEADER:-/usr/include/slvs.h}"
+dig() { sha256sum | cut -c1-16; }
+emit() { printf '%s\t%s\n' "$1" "${2//$'\n'/ }"; }
+filehash() { [ -e "$1" ] && sha256sum "$(readlink -f "$1")" | cut -c1-16 || echo ABSENT; }
+dev_packages() {
+  local status
+  status="$(dpkg-query -W -f '${db:Status-Abbrev} ${Package}=${Version}\n' 2>/dev/null)"
+  printf '%s\n' "$status" | awk '$1 == "ii" && $2 ~ /^[^=]*-dev=/ { print $2 }' | sort
+}
+pkg_config_modules() {
+  local modules
+  modules="$(pkg-config --list-all 2>/dev/null)"
+  printf '%s\n' "$modules" | while read -r m _; do
+    [ -z "$m" ] || printf '%s=%s\n' "$m" "$(pkg-config --modversion "$m" 2>&1)"
+  done | sort
+}
+
+case "${REIFY_PROBE_LIST:-}" in
+  '') ;;
+  dev-packages) dev_packages; exit 0 ;;
+  pkg-config-modules) pkg_config_modules; exit 0 ;;
+  *)
+    echo "build_cache_drift_probe: REIFY_PROBE_LIST=$REIFY_PROBE_LIST is not dev-packages or pkg-config-modules" >&2
+    exit 2
+    ;;
+esac
+
 R="${1:-${REIFY_ROOT:-$HOME/src/reify}}"
 if [ ! -d "$R" ]; then
   echo "build_cache_drift_probe: $R is not a directory (the reify checkout)" >&2
   exit 2
 fi
 cd "$R" || exit 2   # rust-toolchain.toml pins 1.96.0 only under the repo; elsewhere rustup serves the default toolchain
-dig() { sha256sum | cut -c1-16; }
-emit() { printf '%s\t%s\n' "$1" "${2//$'\n'/ }"; }
-filehash() { [ -e "$1" ] && sha256sum "$(readlink -f "$1")" | cut -c1-16 || echo ABSENT; }
 
 # ---- Rust side (rustc binary + sysroot are key inputs; std rlibs ship with the sysroot)
 RUSTC=${RUSTC:-$(rustup which rustc 2>/dev/null || command -v rustc)}
@@ -48,18 +82,17 @@ emit cc1 "$(filehash "$(cc -print-prog-name=cc1)")"
 emit cc1plus "$(filehash "$(c++ -print-prog-name=cc1plus)")"
 emit as "$(filehash "$(command -v as)")"
 emit dpkg.toolchain "$(dpkg-query -W -f '${Package}=${Version} ' libc6-dev libstdc++-13-dev libgcc-13-dev linux-libc-dev g++-13 gcc-13 cpp-13 binutils 2>&1)"
-dpkg_status="$(dpkg-query -W -f '${db:Status-Abbrev} ${Package}=${Version}\n' 2>/dev/null)"
-emit dpkg.dev-packages "$(printf '%s\n' "$dpkg_status" | awk '$1 == "ii" && $2 ~ /^[^=]*-dev=/ { print $2 }' | sort | dig)"
+emit dpkg.dev-packages "$(dev_packages | dig)"
 
 # ---- headers that reach preprocessed output
 emit dpkg.occt "$(dpkg-query -W -f '${Package}=${Version}\n' 'libocct*' 2>/dev/null | sort | dig)"
-emit occt.include.tree "$(find /usr/include/opencascade -type f -print0 2>/dev/null | sort -z | xargs -0 sha256sum | cut -d' ' -f1 | dig)"
-emit reify-deps.conda-meta "$(ls /opt/reify-deps/conda-meta 2>/dev/null | grep -v '^history$' | dig)"
-emit reify-deps.static-archives "$(find /opt/reify-deps/lib /opt/reify-deps/manifold/lib -maxdepth 1 -name '*.a' -print0 2>/dev/null | sort -z | xargs -0 sha256sum | cut -d' ' -f1 | dig)"
+emit occt.include.tree "$(find "$OCCT_INCLUDE" -type f -print0 2>/dev/null | sort -z | xargs -0 sha256sum | cut -d' ' -f1 | dig)"
+emit reify-deps.conda-meta "$(ls "$DEPS/conda-meta" 2>/dev/null | grep -v '^history$' | dig)"
+emit reify-deps.static-archives "$(find "$DEPS/lib" "$DEPS/manifold/lib" -maxdepth 1 -name '*.a' -print0 2>/dev/null | sort -z | xargs -0 sha256sum | cut -d' ' -f1 | dig)"
 if [ "${REIFY_PROBE_DEEP:-0}" = 1 ]; then
-  for w in occt:/usr/include/opencascade openvdb:/opt/reify-deps/include; do
+  for w in "occt:$OCCT_INCLUDE" "openvdb:$DEPS/include"; do
     k=${w%%:*}; inc=${w#*:}
-    emit "deps.$k.header-closure" "$(c++ -std=c++17 -M -MG -I"$inc" -isystem /opt/reify-deps/include -I"$R/crates/reify-kernel-$k/cpp" \
+    emit "deps.$k.header-closure" "$(c++ -std=c++17 -M -MG -I"$inc" -isystem "$DEPS/include" -I"$R/crates/reify-kernel-$k/cpp" \
        "$R/crates/reify-kernel-$k/cpp/${k}_wrapper.cpp" 2>/dev/null | tr -d '\\ ' | tr '\n' ' ' | tr ' ' '\n' | grep '^/' | sort -u | xargs sha256sum 2>/dev/null | cut -d' ' -f1 | dig)"
   done
 fi
@@ -78,11 +111,8 @@ print(' '.join(out))
 EOF
 )"
 slvs_version="$(pkg-config --modversion slvs 2>&1)"
-emit pkg-config.slvs "${slvs_version%%$'\n'*}; header=$(test -e /usr/include/slvs.h && echo y || echo n)"
-pc_modules="$(pkg-config --list-all 2>/dev/null)"
-emit pkg-config.modules "$(printf '%s\n' "$pc_modules" | while read -r m _; do
-  [ -z "$m" ] || printf '%s=%s\n' "$m" "$(pkg-config --modversion "$m" 2>&1)"
-done | sort | dig)"
+emit pkg-config.slvs "${slvs_version%%$'\n'*}; header=$(test -e "$SLVS_HEADER" && echo y || echo n)"
+emit pkg-config.modules "$(pkg_config_modules | dig)"
 emit tree-sitter.cli "$(command -v tree-sitter >/dev/null && { tree-sitter --version; filehash "$(command -v tree-sitter)"; } | tr '\n' ' ' || echo ABSENT)"
 
 # ---- ambient knobs that must be absent or equal

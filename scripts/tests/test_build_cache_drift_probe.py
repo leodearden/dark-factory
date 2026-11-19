@@ -5,11 +5,13 @@ It prints one `name<TAB>value` line per input that reaches a reify sccache key
 controlled environment: PATH is a shim bin before /usr/bin:/bin, HOME is
 scratch, and no compiler variable is set. The compilers, rustc, dpkg-query,
 pkg-config and sccache are shims whose answers the tests change one at a
-time; the host trees it digests read-only (/usr/include, /opt/reify-deps) are
-real and stay put between two runs.
+time. The host trees it digests (the OCCT headers, /opt/reify-deps and the
+slvs header) are small scratch trees named by the probe's REIFY_PROBE_*
+variables, so no run reads the real ones.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 import sys
@@ -157,6 +159,27 @@ esac
         write_python_shim(self.bin, "dpkg-query", self.dpkg_state, _DPKG_QUERY)
         write_python_shim(self.bin, "pkg-config", self.pkg_config_state, _PKG_CONFIG)
 
+        host = tmp_path / "host"
+        self.occt_include = host / "opencascade"
+        self.occt_include.mkdir(parents=True)
+        (self.occt_include / "Standard.hxx").write_text("// occt 7.8\n")
+        (self.occt_include / "gp_Pnt.hxx").write_text("// point\n")
+        self.deps_root = host / "reify-deps"
+        for relative in ("lib", "manifold/lib", "conda-meta"):
+            (self.deps_root / relative).mkdir(parents=True)
+        (self.deps_root / "lib" / "libopenvdb.a").write_bytes(b"openvdb v1")
+        (self.deps_root / "manifold" / "lib" / "libmanifold.a").write_bytes(b"manifold v1")
+        (self.deps_root / "conda-meta" / "tbb-2022.0.json").write_text("{}")
+        (self.deps_root / "conda-meta" / "history").write_text("")
+        self.slvs_header = host / "slvs.h"
+        self.env = {
+            "PATH": f"{self.bin}:/usr/bin:/bin",
+            "HOME": str(self.home),
+            "REIFY_PROBE_OCCT_INCLUDE": str(self.occt_include),
+            "REIFY_PROBE_DEPS_ROOT": str(self.deps_root),
+            "REIFY_PROBE_SLVS_HEADER": str(self.slvs_header),
+        }
+
     def set_packages(self, packages: list[dict[str, str]]) -> None:
         self.dpkg_state.write_text(json.dumps({"packages": packages}))
 
@@ -169,10 +192,10 @@ esac
     def modules(self) -> dict[str, str]:
         return json.loads(self.pkg_config_state.read_text())["modules"]
 
-    def run(self, *args: str) -> subprocess.CompletedProcess[str]:
+    def run(self, *args: str, **env: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             ["/bin/bash", str(PROBE), *args],
-            env={"PATH": f"{self.bin}:/usr/bin:/bin", "HOME": str(self.home)},
+            env={**self.env, **env},
             cwd=self.home,
             capture_output=True,
             text=True,
@@ -235,6 +258,38 @@ class TestDriftProbe:
         )
         assert changed_lines(before, world.probe()) == {"dpkg.dev-packages"}
 
+    def test_a_removed_but_configured_dev_package_changes_nothing(
+        self, world: ProbeWorld
+    ) -> None:
+        before = world.probe()
+        world.set_packages(
+            [*world.packages(), {"status": "rc ", "package": "libxss-dev", "version": "1:1.2.3-1build3"}]
+        )
+        assert changed_lines(before, world.probe()) == set()
+
+    @pytest.mark.parametrize(
+        ("change", "line"),
+        [
+            ("occt-header", "occt.include.tree"),
+            ("static-archive", "reify-deps.static-archives"),
+            ("conda-package", "reify-deps.conda-meta"),
+            ("slvs-header", "pkg-config.slvs"),
+        ],
+    )
+    def test_a_host_tree_change_changes_only_its_line(
+        self, world: ProbeWorld, change: str, line: str
+    ) -> None:
+        before = world.probe()
+        if change == "occt-header":
+            (world.occt_include / "Standard.hxx").write_text("// occt 7.9\n")
+        elif change == "static-archive":
+            (world.deps_root / "manifold" / "lib" / "libmanifold.a").write_bytes(b"manifold v2")
+        elif change == "conda-package":
+            (world.deps_root / "conda-meta" / "zstd-1.5.json").write_text("{}")
+        else:
+            world.slvs_header.write_text("/* slvs */\n")
+        assert changed_lines(before, world.probe()) == {line}
+
     def test_a_pkg_config_module_changes_only_the_module_line(
         self, world: ProbeWorld
     ) -> None:
@@ -248,6 +303,28 @@ class TestDriftProbe:
         world.probe()
         assert tree_snapshot(world.reify) == reify_before
         assert tree_snapshot(world.home) == home_before
+
+    @pytest.mark.parametrize(
+        ("listing", "line", "expected"),
+        [
+            ("dev-packages", "dpkg.dev-packages", ["libc6-dev=2.39-0ubuntu8.6", "libx11-dev=2:1.8.7-1build1"]),
+            ("pkg-config-modules", "pkg-config.modules", ["x11=1.8.7", "zlib=1.3"]),
+        ],
+    )
+    def test_a_listing_is_what_its_line_digests(
+        self, world: ProbeWorld, listing: str, line: str, expected: list[str]
+    ) -> None:
+        proc = world.run(REIFY_PROBE_LIST=listing)
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout.splitlines() == expected
+        digest = hashlib.sha256(proc.stdout.encode()).hexdigest()[:16]
+        assert world.probe()[line] == digest
+
+    def test_an_unknown_listing_exits_two(self, world: ProbeWorld) -> None:
+        proc = world.run(str(world.reify), REIFY_PROBE_LIST="everything")
+        assert proc.returncode == 2
+        assert proc.stdout == ""
+        assert "REIFY_PROBE_LIST" in proc.stderr
 
     def test_a_missing_reify_checkout_exits_two(self, world: ProbeWorld, tmp_path: Path) -> None:
         proc = world.run(str(tmp_path / "no-such-reify"))
