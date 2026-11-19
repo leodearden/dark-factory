@@ -2709,7 +2709,7 @@ def _neutralise_prewarm_startup(harness: Harness) -> None:
     harness._load_persisted_scheduler_pause = AsyncMock()
     harness._dismiss_stale_escalations = AsyncMock()
     harness._file_dirty_tree_escalation = AsyncMock()
-    harness._rehydrate_merge_halt = MagicMock()
+    harness._rehydrate_merge_halt = AsyncMock()
     harness._recover_pending_merges = AsyncMock(return_value={})
     harness._reap_orphaned_merge_worktrees = AsyncMock()
     harness._reconcile_landed_outbox = AsyncMock()

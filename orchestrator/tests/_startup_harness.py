@@ -40,8 +40,7 @@ STUBBED_STEPS: tuple[tuple[str, str], ...] = (
     ('2g', '_run_scheduled_deploy_settle_pass'),
 )
 SYNC_STEPS = frozenset({
-    '_rehydrate_merge_halt', '_file_restored_pause_escalation',
-    '_inherit_pending_streak_alarms',
+    '_file_restored_pause_escalation', '_inherit_pending_streak_alarms',
 })
 #: Table steps the fixtures run for real against their mocked services.
 UNSTUBBED_STEPS = frozenset({'1b', '1b-crash-loop', '2f'})
