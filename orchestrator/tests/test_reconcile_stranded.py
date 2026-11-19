@@ -710,18 +710,19 @@ _ArrangeEffectAbsent = Callable[[Harness, str, pytest.MonkeyPatch], None]
 
 @pytest.mark.asyncio
 class TestReconcileSweepKeepsTheMergeMarkerPolicy:
-    @pytest.mark.parametrize('arrange', [
-        pytest.param(_on_main_effect_absent, id='on_main'),
+    @pytest.mark.parametrize(('arrange', 'status'), [
+        pytest.param(_on_main_effect_absent, 'in-progress', id='on_main'),
         pytest.param(
             lambda harness, tid, monkeypatch: _blocked_marker_effect_absent(
                 harness, tid, 'c8' * 20, monkeypatch,
             ),
+            'blocked',
             id='merge_marker',
         ),
     ])
     async def test_the_reject_row_names_the_merge_marker_method(
         self, harness: Harness, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-        arrange: _ArrangeEffectAbsent,
+        arrange: _ArrangeEffectAbsent, status: str,
     ):
         """Both sub-cases keep ``validate_landing_evidence`` CANDIDATE (task 4648).
 
@@ -735,7 +736,7 @@ class TestReconcileSweepKeepsTheMergeMarkerPolicy:
         store = _bind_event_store(harness, tmp_path)
         arrange(harness, tid, monkeypatch)
 
-        await harness._reconcile_stranded_in_progress()
+        await _reconcile_stranded(harness, tid, status)
 
         [row] = landing_reject_rows(store)
         assert row['data']['site'] == 'reconcile_sweep'

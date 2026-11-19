@@ -1,0 +1,24 @@
+{
+  "task_id": "4648",
+  "reason": "Task 4648 step-7 adds per-site policy pins (G7): characterisation tests asserting which LandingMethod each legacy landing site carries. The coalesce re-drive pin wraps orchestrator.merge_lane.member_redrive.validate_landing_evidence to read the verdict the site produced (+1 patch target). The dispatch gate's marker-arm pin drives the gate through _already_landed_dispatch_gate, as every test in that file does, and reads the escalated verdict off _file_unattributed_landing_escalation (+2 private reads). Net-additive tests, not a refactor that failed.",
+  "measures": [
+    {
+      "measure": "patch_targets",
+      "key": "orchestrator/tests/test_merge_lane_member_redrive.py",
+      "baseline": 0,
+      "current": 1
+    },
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/test_harness_already_landed_gate_wiring.py",
+      "baseline": 261,
+      "current": 263
+    },
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6354,
+      "current": 6356
+    }
+  ]
+}
