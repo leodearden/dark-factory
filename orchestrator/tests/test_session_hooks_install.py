@@ -156,7 +156,7 @@ def _init_primary_checkout_with_hooks(tmp_path: Path) -> Path:
 
 def _init_primary_checkout_with_partial_hooks(tmp_path: Path) -> Path:
     """Like ``_init_primary_checkout_with_hooks`` but deliberately omits one
-    script, so the resolved candidate dir exists (git succeeds) yet fails the
+    script, so the resolved candidate dir exists yet fails the
     ``all(...is_file())`` completeness guard in ``_hooks_script_dir``."""
     primary = tmp_path / 'primary'
     primary.mkdir()
@@ -206,7 +206,7 @@ def test_hooks_script_dir_falls_back_when_candidate_missing_a_script(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """git resolves fine and the candidate dir exists, but it is missing one
+    """The main checkout resolves and the candidate dir exists, but it is missing one
     of the three hook scripts -- the ``all(...is_file())`` guard must reject
     it and fall back to parents[3] rather than returning the incomplete
     candidate (e.g. an installed/partial checkout where skills/spawn/hooks is
@@ -236,35 +236,34 @@ def test_hooks_script_dir_falls_back_to_parents3_when_not_a_git_checkout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fake_file = _fake_session_hooks_path(tmp_path)
+    assert not any((ancestor / '.git').exists() for ancestor in fake_file.parents), (
+        f'fixture premise: no ancestor of {fake_file} may hold .git'
+    )
     monkeypatch.setattr(sh, '__file__', str(fake_file))
-    # Hermetic regardless of ambient git topology: cap git's upward .git
-    # search at tmp_path so this test's "not a git checkout" premise holds
-    # even if /tmp (or some ancestor) happens to sit inside a real repo.
-    monkeypatch.setenv('GIT_CEILING_DIRECTORIES', str(tmp_path))
 
     resolved = sh._hooks_script_dir()
 
     assert resolved == fake_file.resolve().parents[3] / 'skills' / 'spawn' / 'hooks'
 
 
-def test_hooks_script_dir_falls_back_when_git_common_dir_is_empty(
+def test_hooks_script_dir_resolves_to_primary_checkout_without_git_on_path(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Distinct fallback path from the not-a-git-checkout case above: git
-    itself succeeds (returncode 0) but reports an empty/blank
-    --git-common-dir, which must also degrade to the parents[3] fallback."""
-    fake_file = _fake_session_hooks_path(tmp_path)
+    primary = _init_primary_checkout_with_hooks(tmp_path)
+    worktree = tmp_path / 'worktree-nogit'
+    subprocess.run(
+        ['git', 'worktree', 'add', '-q', str(worktree), '-b', 'wt-nogit'],
+        cwd=primary,
+        check=True,
+    )
+    fake_file = _fake_session_hooks_path(worktree)
     monkeypatch.setattr(sh, '__file__', str(fake_file))
-
-    def _fake_run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-        return subprocess.CompletedProcess(cmd, returncode=0, stdout='   \n', stderr='')
-
-    monkeypatch.setattr(subprocess, 'run', _fake_run)
+    monkeypatch.setenv('PATH', '')
 
     resolved = sh._hooks_script_dir()
 
-    assert resolved == fake_file.resolve().parents[3] / 'skills' / 'spawn' / 'hooks'
+    assert resolved == (primary / 'skills' / 'spawn' / 'hooks').resolve()
 
 
 # ---------------------------------------------------------------------------
