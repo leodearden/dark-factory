@@ -18,6 +18,14 @@ from cgroup_weight_share import (
     read_tree,
     share_chain,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
+
+
+def assert_read_only(instance: object, field: str) -> None:
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        setattr(instance, field, getattr(instance, field))
 
 
 def test_every_claimant_oversubscribed_splits_by_weight():
@@ -56,9 +64,7 @@ def test_no_claimants_yields_empty_shares():
 
 
 def test_claim_is_frozen():
-    claim = Claim(100, 1.0)
-    with pytest.raises(dataclasses.FrozenInstanceError):
-        claim.weight = 33  # type: ignore[misc]
+    assert_read_only(Claim(100, 1.0), 'weight')
 
 
 SERVICE = 'user@1000.service'
@@ -203,12 +209,9 @@ def test_cgroup_present_in_only_one_snapshot_is_dropped(host):
 
 def test_readings_and_windows_are_frozen(host, windows):
     snapshot = host.snapshot()
-    with pytest.raises(dataclasses.FrozenInstanceError):
-        snapshot.taken_at = 0.0  # type: ignore[misc]
-    with pytest.raises(dataclasses.FrozenInstanceError):
-        snapshot.readings[MERGE].usage_usec = 0  # type: ignore[misc]
-    with pytest.raises(dataclasses.FrozenInstanceError):
-        windows[MERGE].used_cores = 0.0  # type: ignore[misc]
+    assert_read_only(snapshot, 'taken_at')
+    assert_read_only(snapshot.readings[MERGE], 'usage_usec')
+    assert_read_only(windows[MERGE], 'used_cores')
 
 
 def measure_reify_host(
@@ -287,8 +290,7 @@ def test_host_share_is_the_product_of_shares_down_the_chain(contended):
 
 
 def test_chain_level_is_frozen(contended):
-    with pytest.raises(dataclasses.FrozenInstanceError):
-        contended[0].fair_cores = 0.0  # type: ignore[misc]
+    assert_read_only(contended[0], 'fair_cores')
 
 
 @pytest.mark.parametrize('seconds', [0.0, -1.0])
