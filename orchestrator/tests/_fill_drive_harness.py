@@ -28,6 +28,7 @@ import dataclasses
 from typing import Any
 from unittest.mock import MagicMock
 
+from orchestrator.merge_lane.types import NoHost
 from orchestrator.merge_lane.worker import (
     InflightEntry,
     MergeOutcome,
@@ -74,11 +75,11 @@ def _drive_fill(worker: SpeculativeMergeWorker, allocator: HostAllocator) -> _Fi
     """
     drive = _FillDrive()
 
-    async def _fake_dispatch_item(item: Any) -> InflightEntry | None:
+    async def _fake_dispatch_item(item: Any) -> InflightEntry | NoHost:
         drive.dispatched.append(item)
         lease = await allocator.acquire(lambda: MagicMock(), policy='prefer_local')
         if lease is None:
-            return None
+            return NoHost(item)
         # Signal only after the lease is confirmed held, not merely
         # requested: a waiter on first_dispatched/second_dispatched must
         # observe free_host_count() already reflecting this dispatch. This

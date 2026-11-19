@@ -520,7 +520,8 @@ class TestDispatch:
         entry = await dispatcher.dispatch(item)
 
         assert scene.ports.names()[0] == 'release_cap_permit'
-        assert isinstance(entry, InflightEntry) and entry.item.cap_permit is None
+        assert isinstance(entry, InflightEntry)
+        assert isinstance(entry.item, RealMergeItem) and entry.item.cap_permit is None
 
     async def test_a_predispatch_abandon_cleans_up_and_retires_the_request(self, scene: _Scene) -> None:
         dispatcher = scene.dispatcher(FakeVerifier(passes()))

@@ -420,7 +420,7 @@ class TestDispatchErrorChokepoint:
         item.permit = permit
         calls = _spy_on_resolve_and_release(worker)
 
-        async def _raising_dispatch(_item: Any) -> Any:
+        async def _raising_dispatch(item: Any) -> Any:
             raise Exception('boom')
 
         worker.verify_dispatch.dispatch = _raising_dispatch
@@ -465,7 +465,7 @@ class TestDispatchErrorChokepoint:
         worker._register_owned_merge_worktree(item.merge_wt)
         calls = _spy_on_resolve_and_release(worker)
 
-        async def _cancelling_dispatch(_item: Any) -> Any:
+        async def _cancelling_dispatch(item: Any) -> Any:
             raise asyncio.CancelledError()
 
         worker.verify_dispatch.dispatch = _cancelling_dispatch
@@ -499,7 +499,7 @@ class TestDispatchErrorChokepoint:
         item.permit = permit
         calls = _spy_on_resolve_and_release(worker)
 
-        async def _raising_dispatch(_item: Any) -> Any:
+        async def _raising_dispatch(item: Any) -> Any:
             raise Exception('boom')
 
         worker.verify_dispatch.dispatch = _raising_dispatch
@@ -587,7 +587,7 @@ class TestPassthroughFinalizeErrorChokepoint:
         item, entry = _make_decided_item_and_entry(req, was_speculative=True)
         calls = _spy_on_resolve_and_release(worker)
 
-        async def _passthrough_dispatch(_item: Any) -> Any:
+        async def _passthrough_dispatch(item: Any) -> Any:
             return entry
 
         async def _raising_finalize(_entry: Any) -> Any:
@@ -640,7 +640,7 @@ class TestPassthroughFinalizeErrorChokepoint:
         item, entry = _make_decided_item_and_entry(req, was_speculative=True)
         calls = _spy_on_resolve_and_release(worker)
 
-        async def _passthrough_dispatch(_item: Any) -> Any:
+        async def _passthrough_dispatch(item: Any) -> Any:
             return entry
 
         async def _cancelling_finalize(_entry: Any) -> Any:
@@ -706,7 +706,7 @@ class TestFinalizeHeadErrorChokepoint:
             permit=permit,
         )
 
-        async def _dispatch_returns_entry(_item: Any) -> Any:
+        async def _dispatch_returns_entry(item: Any) -> Any:
             return entry
 
         async def _raising_finalize(_entry: Any) -> Any:
@@ -811,7 +811,7 @@ class TestFinalizeHeadErrorChokepoint:
             was_speculative=True,
         )
 
-        async def _dispatch_returns_entry(_item: Any) -> Any:
+        async def _dispatch_returns_entry(item: Any) -> Any:
             return entry
 
         async def _cancelling_finalize(_entry: Any) -> Any:

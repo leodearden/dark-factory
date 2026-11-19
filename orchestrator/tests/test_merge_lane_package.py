@@ -363,7 +363,7 @@ class _RecordingStub:
     def __init__(self) -> None:
         self.calls: list[_Call] = []
 
-    async def __call__(self, *args: Any, **options: Any) -> dict[str, str]:
+    async def __call__(self, *args: Any, **options: Any) -> Any:
         self.calls.append(_Call(args, options))
         return {}
 
