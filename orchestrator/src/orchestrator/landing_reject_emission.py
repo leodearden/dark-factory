@@ -1,17 +1,26 @@
 """Landing-evidence rejects that file no escalation, recorded as events.
 
 Task 4496.  **This docstring is the canonical WHY**; ``EventType.
-landing_evidence_rejected`` and the two harness call sites carry a pointer
-here, not a copy.
+landing_evidence_rejected`` and the harness call sites carry a pointer here,
+not a copy.
 
-Two ``validate_landing_evidence`` call sites reject without escalating, by
-design: the already-landed dispatch gate's ANCESTRY arm and the reconcile
-sweep's MARK_DONE_WITH_PROVENANCE arm.  Before this module both rejects left
-no durable trace.  That is not harmless at the gate: its ``False`` means
-DISPATCH, so a false ``effect_absent`` there sends an agent to redo work that
-already landed.  The ``landing_evidence_rejected`` row makes the reject rate
-countable, which is the prerequisite for deciding later whether an escalation
-or a persistence threshold is warranted.
+Three landing-detection call sites reject without escalating, by design, one
+:class:`LandingRejectSite` each:
+
+- the already-landed dispatch gate's ANCESTRY arm (a live tip that is an
+  ancestor of main), deciding by ``branch_work_landed``;
+- the same gate's OFF-MAIN-TIP arm (a live tip that is not), also deciding by
+  ``branch_work_landed``.  It escalates ``no_attribution``, the reject whose
+  work is on main but cannot be attributed, instead of recording it, and
+  records every other reject (task 4648);
+- the reconcile sweep's MARK_DONE_WITH_PROVENANCE arm, deciding by
+  ``validate_landing_evidence``.
+
+Before this module these rejects left no durable trace.  That is not harmless
+at the gate: its ``False`` means DISPATCH, so a false negative there sends an
+agent to redo work that already landed.  The ``landing_evidence_rejected`` row
+makes the reject rate countable, which is the prerequisite for deciding later
+whether an escalation or a persistence threshold is warranted.
 
 CADENCE.  One row per NEW or CHANGED signature ``(reason, citation,
 effect_check_sha)`` per ``(site, task_id)``; identical repeats are silent.
@@ -60,6 +69,7 @@ __all__ = ['LandingRejectRecorder', 'LandingRejectSite', 'landing_reject_payload
 
 class LandingRejectSite(enum.StrEnum):
     already_landed_gate_ancestry = 'already_landed_gate_ancestry'
+    already_landed_gate_off_main_tip = 'already_landed_gate_off_main_tip'
     reconcile_sweep = 'reconcile_sweep'
 
 

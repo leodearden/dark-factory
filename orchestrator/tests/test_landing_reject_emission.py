@@ -183,7 +183,7 @@ class TestLandingRejectRecorder:
         recorder.release('42')
 
         assert [_observe(recorder, _reject(), store, site=site) for site in LandingRejectSite] == [
-            True, True,
+            True, True, True,
         ]
         assert _observe(recorder, _reject(), store, task_id='43') is False
 
