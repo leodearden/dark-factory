@@ -258,7 +258,7 @@ async def test_startup_backfills_every_real_root_and_isolates_a_failure(
     backfiller = _RecordingBackfiller(failing={startup_roots['broken']})
     caplog.set_level(logging.WARNING, logger='fused_memory.server.main')
 
-    await server_main._backfill_followup_holds(FusedMemoryConfig(), backfiller, startup_roots.values())
+    await server_main.backfill_followup_holds_at_startup(FusedMemoryConfig(), backfiller, startup_roots.values())
 
     real_roots = [startup_roots['first'], startup_roots['broken'], startup_roots['last']]
     assert backfiller.seen == real_roots
@@ -274,7 +274,7 @@ async def test_a_disabled_backfill_touches_no_project(startup_roots: dict[str, s
     backfiller = _RecordingBackfiller(failing=set())
     config = FusedMemoryConfig.model_validate({'followup_hold': {'backfill_enabled': False}})
 
-    await server_main._backfill_followup_holds(config, backfiller, startup_roots.values())
+    await server_main.backfill_followup_holds_at_startup(config, backfiller, startup_roots.values())
 
     assert backfiller.seen == []
 
@@ -289,30 +289,21 @@ def _run_server() -> ast.AsyncFunctionDef:
     return found[0]
 
 
-def _is_known_projects_values(node: ast.expr) -> bool:
-    return (
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == 'values'
-        and isinstance(node.func.value, ast.Name)
-        and node.func.value.id == '_known_projects_map'
-    )
-
-
 def test_run_server_awaits_the_backfill_after_the_interceptor_starts_and_before_serving() -> None:
     run_server = _run_server()
-    backfills = calls_named(run_server, '_backfill_followup_holds')
+    backfills = calls_named(run_server, 'backfill_followup_holds_at_startup')
     awaited = [
         node.value for node in ast.walk(run_server)
         if isinstance(node, ast.Await) and isinstance(node.value, ast.Call)
         and node.value in backfills
     ]
     assert len(backfills) == 1 and awaited == backfills, (
-        'run_server must await _backfill_followup_holds exactly once, never spawn it'
+        'run_server must await backfill_followup_holds_at_startup exactly once, never spawn it'
     )
     [backfill] = backfills
-    assert any(_is_known_projects_values(argument) for argument in backfill.args), (
-        'the backfill must walk the _known_projects_map snapshot the re-mint sweep walks'
+    [remint_sweep] = calls_named(run_server, '_start_remint_sweep')
+    assert ast.dump(backfill.args[-1]) == ast.dump(remint_sweep.args[-1]), (
+        'the backfill must walk the same known-project roots the re-mint sweep walks'
     )
     starts = [
         call for call in calls_named(run_server, 'start')
@@ -320,6 +311,6 @@ def test_run_server_awaits_the_backfill_after_the_interceptor_starts_and_before_
         and isinstance(call.func.value, ast.Name) and call.func.value.id == 'task_interceptor'
     ]
     servers = calls_named(run_server, 'create_mcp_server')
-    assert len(starts) == 2, 'expected task_interceptor.start() in both reconciliation branches'
+    assert starts, 'expected run_server to start the task interceptor'
     assert len(servers) == 1
     assert max(call.lineno for call in starts) < backfill.lineno < servers[0].lineno

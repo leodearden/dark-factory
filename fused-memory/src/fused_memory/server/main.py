@@ -1017,7 +1017,7 @@ async def run_server():
         _wire_audit_trail_archive(task_interceptor, memory_service)
 
     if taskmaster is not None:
-        await _backfill_followup_holds(config, task_interceptor, _known_projects_map.values())
+        await backfill_followup_holds_at_startup(config, task_interceptor, _known_projects_map.values())
 
     # Machine-derived topic clusters (task 3135). Built in both branches above
     # and never gated on reconciliation.enabled or the autoseed leaf: both of
@@ -1723,7 +1723,7 @@ def _start_remint_sweep(
     )
 
 
-async def _backfill_followup_holds(
+async def backfill_followup_holds_at_startup(
     config: FusedMemoryConfig,
     interceptor: _FollowupHoldBackfiller,
     project_roots: Iterable[str],

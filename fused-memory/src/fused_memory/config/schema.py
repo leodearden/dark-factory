@@ -669,7 +669,7 @@ class FollowupHoldConfig(BaseModel):
             'RESTART-ONLY: when True, each fused-memory start holds every pending '
             'follow-up the hold rule matches behind its project\'s holder, once per '
             'known project, before the server serves (server/main.py::'
-            '_backfill_followup_holds). A second start adds nothing.'
+            'backfill_followup_holds_at_startup). A second start adds nothing.'
         ),
     )
 

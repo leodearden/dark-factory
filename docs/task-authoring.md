@@ -868,7 +868,7 @@ its mint journals a `task_created` event with `source:
 
 **The backfill.** Each fused-memory start runs the hold over every known
 project before the server serves
-(`fused-memory/src/fused_memory/server/main.py::_backfill_followup_holds`,
+(`fused-memory/src/fused_memory/server/main.py::backfill_followup_holds_at_startup`,
 walking the primary root plus `DASHBOARD_KNOWN_PROJECT_ROOTS`). It holds
 every `pending` task the rule matches unless the task already depends on the
 holder or already carries a `followup_hold` record, so a promoted or released
