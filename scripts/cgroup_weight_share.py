@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import datetime
+import errno
 import math
 import os
 import posixpath
@@ -21,8 +22,8 @@ from shared.psi import read_runqueue_ratio
 
 USEC_PER_S = 1e6
 NS_PER_S = 1e9
-SIBLING_COLUMNS = ('path', 'weight', 'used', 'wait', 'wanted', 'share_of_parent', 'fair', 'used/fair')
-CHAIN_COLUMNS = ('path', 'weight', 'used', 'parent_used', 'share_of_parent', 'fair', 'used/fair')
+SIBLING_COLUMNS = ('path', 'weight', 'used', 'wait', 'wanted', 'unattributed', 'share_of_parent', 'fair', 'used/fair')
+CHAIN_COLUMNS = ('path', 'weight', 'used', 'parent_used', 'unattributed', 'share_of_parent', 'fair', 'used/fair')
 
 
 @dataclasses.dataclass(frozen=True)
@@ -113,6 +114,7 @@ class ChainLevel:
     weight: int | None
     used_cores: float
     parent_used_cores: float
+    unattributed_cores: float
     share_of_parent: float
     fair_cores: float | None
     used_vs_fair: float | None
@@ -131,19 +133,25 @@ def share_chain(windows: Mapping[str, CgroupWindow], leaf: str) -> list[ChainLev
 
 
 def _level(windows: Mapping[str, CgroupWindow], path: str) -> ChainLevel:
-    """Water-fill the parent's actual usage among path and its siblings, by weight, capped at each one's wanted."""
+    """Water-fill what path and its siblings together used among them, by weight, capped at each one's wanted.
+
+    The parent's CPU that no sibling present in both snapshots accounts for is unattributed and not
+    theirs to split: a child that started or ended inside the window, or the parent's own threads.
+    """
     parent = _parent(path)
     siblings = {other: window for other, window in windows.items() if other != '.' and _parent(other) == parent}
+    parent_used = windows[parent].used_cores
+    unattributed = max(parent_used - sum(window.used_cores for window in siblings.values()), 0.0)
     claims = {other: Claim(window.weight, window.wanted_cores) for other, window in siblings.items()}
-    shares = fair_shares(windows[parent].used_cores, claims)
+    shares = fair_shares(parent_used - unattributed, claims)
     fair = None if shares is None else shares[path]
     used = windows[path].used_cores
-    parent_used = windows[parent].used_cores
     return ChainLevel(
         path=path,
         weight=windows[path].weight,
         used_cores=used,
         parent_used_cores=parent_used,
+        unattributed_cores=unattributed,
         share_of_parent=used / parent_used if parent_used else 0.0,
         fair_cores=fair,
         used_vs_fair=used / fair if fair else None,
@@ -155,11 +163,17 @@ def host_share(levels: Iterable[ChainLevel]) -> float:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Print each window; exit 2 if any --chain was absent from some window, after printing the rest."""
+    """Print each window; exit 2 if any --chain was absent from some window, after printing the rest.
+
+    Exit 2 at once if --cgroup-root holds no readable cgroup.
+    """
     args = _parse_args(argv)
     chain_missing = False
     for _ in range(args.repeat):
         before = read_tree(args.cgroup_root, args.proc_root)
+        if not before.readings:
+            print(f'no readable cgroup under {args.cgroup_root}', file=sys.stderr)
+            return 2
         time.sleep(args.window)
         after = read_tree(args.cgroup_root, args.proc_root)
         elapsed = after.taken_at - before.taken_at
@@ -213,15 +227,19 @@ def _sibling_row(windows: Mapping[str, CgroupWindow], path: str) -> tuple[str, .
         _number(window.wait_cores), _number(window.wanted_cores),
     )
     if path == '.':
-        return (*measured, '-', '-', '-')
+        return (*measured, '-', '-', '-', '-')
     level = _level(windows, path)
-    return (*measured, _number(level.share_of_parent), _number(level.fair_cores), _number(level.used_vs_fair))
+    return (
+        *measured, _number(level.unattributed_cores), _number(level.share_of_parent),
+        _number(level.fair_cores), _number(level.used_vs_fair),
+    )
 
 
 def _chain_row(level: ChainLevel) -> tuple[str, ...]:
     return (
         level.path, _number(level.weight), _number(level.used_cores), _number(level.parent_used_cores),
-        _number(level.share_of_parent), _number(level.fair_cores), _number(level.used_vs_fair),
+        _number(level.unattributed_cores), _number(level.share_of_parent), _number(level.fair_cores),
+        _number(level.used_vs_fair),
     )
 
 
@@ -248,9 +266,15 @@ def _read_counters(cgroup_root: Path) -> Iterator[tuple[str, tuple[int, int | No
             usage_usec = _read_usage_usec(directory / 'cpu.stat')
             weight = _read_weight(directory / 'cpu.weight')
             tids = [int(tid) for tid in (directory / 'cgroup.threads').read_text().split()]
-        except OSError:
-            continue  # the cgroup was removed mid-walk
+        except OSError as error:
+            if not _removed_mid_walk(error):
+                raise
+            continue
         yield directory.relative_to(cgroup_root).as_posix(), (usage_usec, weight, tids)
+
+
+def _removed_mid_walk(error: OSError) -> bool:
+    return isinstance(error, FileNotFoundError) or error.errno == errno.ENODEV
 
 
 def _read_usage_usec(cpu_stat: Path) -> int:

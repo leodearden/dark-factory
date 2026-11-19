@@ -2,10 +2,13 @@
 from __future__ import annotations
 
 import dataclasses
+import itertools
+import os
 import shutil
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 
+import cgroup_weight_share
 import pytest
 from cgroup_weight_share import (
     CgroupWindow,
@@ -207,6 +210,14 @@ def test_cgroup_present_in_only_one_snapshot_is_dropped(host):
     assert f'{REIFY_SLICE}/new.scope' not in windows
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason='root reads a mode-000 file')
+def test_unreadable_cgroup_is_an_error_not_a_removed_cgroup(host):
+    write_reify_host(host, core_windows={}, wait_windows={})
+    (host.cgroup_root / TASK / 'cpu.stat').chmod(0)
+    with pytest.raises(PermissionError):
+        host.snapshot()
+
+
 def test_readings_and_windows_are_frozen(host, windows):
     snapshot = host.snapshot()
     assert_read_only(snapshot, 'taken_at')
@@ -273,6 +284,30 @@ def test_idle_sibling_does_not_dilute_the_merge_scope(host):
     assert share_chain(windows, MERGE)[0].fair_cores == pytest.approx(10.0)
 
 
+def test_cpu_of_a_sibling_gone_by_the_window_end_is_unattributed_not_split(host):
+    gone = f'{REIFY_SLICE}/gone.scope'
+    write_reify_host(host, core_windows={}, wait_windows={tid: 0.0 for tid in CONTENDED_WAITS})
+    host.cgroup(gone, usage_usec=0, weight=100)
+    before = host.snapshot()
+    shutil.rmtree(host.cgroup_root / gone)
+    with_gone_cpu = {path: CONTENDED_CORES[path] + 4.0 for path in ('.', SERVICE, DF_SLICE, REIFY_SLICE)}
+    write_reify_host(host, core_windows={**CONTENDED_CORES, **with_gone_cpu}, wait_windows=CONTENDED_WAITS)
+    merge, reify_slice, *_ = share_chain(measure(before, host.snapshot(), WINDOW_S), MERGE)
+    assert merge.unattributed_cores == pytest.approx(4.0)
+    assert merge.fair_cores == pytest.approx(10.0)
+    assert merge.used_vs_fair == pytest.approx(0.8)
+    assert reify_slice.unattributed_cores == pytest.approx(0.0)
+
+
+def test_siblings_read_ahead_of_their_parent_split_only_what_the_parent_used(host):
+    windows = measure_reify_host(
+        host, core_windows={**CONTENDED_CORES, REIFY_SLICE: 13.0}, wait_windows=CONTENDED_WAITS,
+    )
+    merge = share_chain(windows, MERGE)[0]
+    assert merge.unattributed_cores == 0.0
+    assert merge.fair_cores == pytest.approx(13.0 * 100 / 133)
+
+
 def test_level_whose_siblings_lack_weight_has_no_entitlement(contended):
     service = contended[-1]
     assert service.fair_cores is None
@@ -301,11 +336,67 @@ def test_measure_refuses_a_window_without_positive_length(host, seconds):
         measure(snapshot, snapshot, seconds)
 
 
-def cli_args(host: FakeHost, chain: str) -> list[str]:
+def cli_args(host: FakeHost, *chains: str) -> list[str]:
     return [
-        '--cgroup-root', str(host.cgroup_root), '--proc-root', str(host.proc_root),
-        '--window', '0.01', '--chain', chain,
+        '--cgroup-root', str(host.cgroup_root), '--proc-root', str(host.proc_root), '--window', '0.01',
+        *itertools.chain.from_iterable(('--chain', chain) for chain in chains),
     ]
+
+
+def script_reads(monkeypatch: pytest.MonkeyPatch, *after_each_read: Callable[[], None]) -> None:
+    """main's reads land WINDOW_S apart, and after the n-th read the host moves to its n-th next state."""
+    real_read_tree = cgroup_weight_share.read_tree
+    read_count = itertools.count()
+    next_states = iter(after_each_read)
+
+    def read_tree(cgroup_root: Path, proc_root: Path) -> Snapshot:
+        snapshot = dataclasses.replace(real_read_tree(cgroup_root, proc_root), taken_at=next(read_count) * WINDOW_S)
+        next(next_states, lambda: None)()
+        return snapshot
+
+    monkeypatch.setattr(cgroup_weight_share, 'read_tree', read_tree)
+
+
+def sibling_table(out: str) -> dict[str, list[str]]:
+    rows: dict[str, list[str]] = {}
+    for line in out.splitlines()[1:]:
+        if not line or line.startswith('chain '):
+            break
+        path, *cells = line.split()
+        rows[path] = cells
+    return rows
+
+
+IDLE = f'{REIFY_SLICE}/idle.scope'
+
+
+def run_contended_cli(host: FakeHost, monkeypatch: pytest.MonkeyPatch, *args: str) -> int:
+    write_reify_host(host, core_windows={}, wait_windows={tid: 0.0 for tid in CONTENDED_WAITS})
+    host.cgroup(IDLE, usage_usec=0, weight=100)
+    script_reads(monkeypatch, lambda: write_reify_host(host, core_windows=CONTENDED_CORES, wait_windows=CONTENDED_WAITS))
+    return main([*cli_args(host), *args])
+
+
+def test_cli_sibling_table_puts_each_cgroup_against_its_weight_fair_share(host, monkeypatch, capsys):
+    assert run_contended_cli(host, monkeypatch) == 0
+    table = sibling_table(capsys.readouterr().out)
+    assert table['path'] == [
+        'weight', 'used', 'wait', 'wanted', 'unattributed', 'share_of_parent', 'fair', 'used/fair',
+    ]
+    assert table['.'] == ['-', '26.60', '36.70', '63.30', '-', '-', '-', '-']
+    assert table[SERVICE] == ['-', '26.60', '36.70', '63.30', '0.00', '1.00', '-', '-']
+    assert table[MERGE] == ['100', '8.00', '12.00', '20.00', '0.00', '0.60', '10.00', '0.80']
+
+
+@pytest.mark.parametrize(('min_cores', 'hidden'), [
+    ([], {IDLE}),
+    (['--min-cores', '0'], set()),
+    (['--min-cores', '21'], {IDLE, MERGE, TASK}),
+])
+def test_cli_hides_cgroups_wanting_fewer_than_min_cores(host, monkeypatch, capsys, min_cores, hidden):
+    assert run_contended_cli(host, monkeypatch, *min_cores) == 0
+    every_cgroup = {'.', SERVICE, DF_SLICE, REIFY_SLICE, MERGE, TASK, IDLE, APP_SLICE, DAEMON}
+    assert set(sibling_table(capsys.readouterr().out)) == {'path'} | (every_cgroup - hidden)
 
 
 def test_cli_prints_a_header_and_one_row_per_chain_level(host, capsys):
@@ -313,9 +404,10 @@ def test_cli_prints_a_header_and_one_row_per_chain_level(host, capsys):
     assert main(cli_args(host, MERGE)) == 0
     lines = capsys.readouterr().out.splitlines()
     assert 'procs_running/nproc ?' in lines[0]
-    chain_rows = [line for line in lines if line.split()[:1] in ([MERGE], [REIFY_SLICE], [DF_SLICE], [SERVICE])]
-    assert len(chain_rows) == 4
-    assert any(line.startswith('host_share') for line in lines)
+    chain_table = lines[lines.index(f'chain {MERGE}') + 1:]
+    assert chain_table[0].split()[:5] == ['path', 'weight', 'used', 'parent_used', 'unattributed']
+    assert [row.split()[0] for row in chain_table[1:5]] == [MERGE, REIFY_SLICE, DF_SLICE, SERVICE]
+    assert chain_table[5].startswith('host_share')
 
 
 def test_cli_reports_a_chain_path_absent_from_the_tree_and_still_prints_the_window(host, capsys):
@@ -325,3 +417,25 @@ def test_cli_reports_a_chain_path_absent_from_the_tree_and_still_prints_the_wind
     captured = capsys.readouterr()
     assert missing in captured.err
     assert 'procs_running/nproc' in captured.out
+
+
+def test_cli_keeps_window_one_chain_when_the_scope_ends_before_window_two(host, monkeypatch, capsys):
+    write_reify_host(host, core_windows={}, wait_windows={})
+    script_reads(monkeypatch, lambda: None, lambda: shutil.rmtree(host.cgroup_root / MERGE))
+    assert main([*cli_args(host, MERGE), '--repeat', '2']) == 2
+    captured = capsys.readouterr()
+    lines = captured.out.splitlines()
+    headers = [index for index, line in enumerate(lines) if line.startswith('# ')]
+    chains = [index for index, line in enumerate(lines) if line == f'chain {MERGE}']
+    assert len(headers) == 2
+    assert len(chains) == 1
+    assert headers[0] < chains[0] < headers[1]
+    assert MERGE in captured.err
+
+
+def test_cli_refuses_a_cgroup_root_with_no_readable_cgroup(tmp_path, capsys):
+    missing = tmp_path / 'no-cgroup'
+    assert main(['--cgroup-root', str(missing), '--proc-root', str(tmp_path), '--window', '0.01']) == 2
+    captured = capsys.readouterr()
+    assert str(missing) in captured.err
+    assert captured.out == ''
