@@ -86,7 +86,6 @@ import inspect
 import json
 import logging
 import re
-import subprocess
 import sys
 from collections.abc import Awaitable, Callable, Iterator, Mapping
 from datetime import UTC, datetime
@@ -106,7 +105,14 @@ from shared.toolcall_markup import detect_for, only_inert_html_closers, repair
 
 from orchestrator import plan_descope, quarantine_provenance
 from orchestrator.artifacts import Plan, PlanConfirmation, PlanState, TaskArtifacts
-from orchestrator.mcp import foreign_task_meta, markup_journal, markup_sink, plan_markup_stamp
+from orchestrator.mcp import (
+    branch_probes,
+    foreign_task_meta,
+    markup_journal,
+    markup_sink,
+    plan_markup_stamp,
+)
+from orchestrator.mcp.branch_probes import Reachability
 from orchestrator.scope_drift import InvalidScopeRequest, ScopeRequest, pending_scope_paths
 
 logger = logging.getLogger(__name__)
@@ -1429,14 +1435,14 @@ def _mark_step_done(
     # written any repair back to disk, so the reject path must still report it
     # via _with_markup_repairs like every other exit.
     #
-    # Fail-OPEN on 'unknown', deliberately asymmetric to _mark_step_committed's
-    # fail-CLOSED reuse of _sha_exists_on_branch: this caller is an implementer
+    # Fail-OPEN on UNKNOWN, deliberately asymmetric to _mark_step_committed's
+    # fail-CLOSED branch_probes.sha_exists_on_branch: this caller is an implementer
     # recording work it JUST committed, so a false reject would leave the step
     # `pending` while its code sits on the branch — inviting a re-implementation
     # on top of a correct one, the exact harm the guard exists to prevent. The
     # degradation is logged at WARNING rather than passing silently.
-    reachability = _sha_branch_reachability(artifacts.worktree, commit_sha)
-    if reachability == 'unreachable':
+    reachability = branch_probes.sha_branch_reachability(artifacts.worktree, commit_sha)
+    if reachability is Reachability.UNREACHABLE:
         return _with_markup_repairs(
             {
                 'status': 'error',
@@ -1449,7 +1455,7 @@ def _mark_step_done(
             },
             markup_facts,
         )
-    if reachability == 'unknown':
+    if reachability is Reachability.UNKNOWN:
         logger.warning(
             'mark_step_done(%r, %r): on-branch reachability check could not '
             'run (no usable git repo at %s); recording the sha unverified',
@@ -1924,121 +1930,6 @@ def _report_missing_plan_file(
     return {'status': 'ok', 'path': request.path, 'pending': pending}
 
 
-def _resolve_main_sha(worktree: Path) -> str:
-    """Return the current ``main`` HEAD SHA visible from *worktree*.
-
-    Falls back to an empty string on git failure — the workflow side
-    treats an empty ``main_sha_at_report`` as "advance check skipped".
-    """
-    try:
-        result = subprocess.run(
-            ['git', 'rev-parse', 'main'],
-            cwd=str(worktree),
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        return result.stdout.strip()
-    except (subprocess.SubprocessError, OSError) as exc:
-        logger.warning(
-            'Failed to resolve main SHA for blocking_dependency report: %s', exc
-        )
-        return ''
-
-
-def _sha_exists_on_branch(worktree: Path, sha: str) -> bool:
-    """Return True iff *sha* is reachable from HEAD in the repo at *worktree*.
-
-    A real ``git merge-base --is-ancestor <sha> HEAD`` reachability check
-    (returncode 0 == *sha* is an ancestor of — or equal to — HEAD), run in the
-    worktree cwd. This is the machine-checked corroborate-before-acting guard
-    for ``mark_step_committed`` (INV-1/INV-3): the architect must be UNABLE to
-    pre-satisfy a plan step against a commit that does not resolve on the
-    current branch.
-
-    Note we check reachability (``--is-ancestor``), NOT mere object existence
-    (``git cat-file -e``): in this repo's shared/multi-worktree object store a
-    commit from another task's branch — or a dangling/unreachable object —
-    exists in the object DB yet is NOT on this branch. ``--is-ancestor`` returns
-    non-zero (exit 1 for a real-but-unreachable commit, 128 for a bad object)
-    for both, so the guard matches its advertised on-branch contract. It
-    deliberately does NOT prove the step's semantics — VERIFY remains the gate.
-    Mirrors :func:`_resolve_main_sha`'s subprocess shape (cwd=worktree,
-    timeout=10, OSError/SubprocessError -> safe ``False``).
-
-    Implemented as the fail-CLOSED projection of :func:`_sha_branch_reachability`
-    (task 3651): ``'reachable'`` is the only True, so both ``'unreachable'`` and
-    ``'unknown'`` collapse into this function's existing ``False``, which is
-    behaviour-preserving and keeps ONE copy of the probe — a future change to
-    the argv, the cwd or the timeout cannot now be made to one caller and
-    forgotten at the other. The fail-CLOSED reading is deliberate and stays
-    here: a pre-satisfaction guard that cannot check must refuse, the opposite
-    of :func:`_mark_step_done`'s fail-OPEN treatment of ``'unknown'``.
-    """
-    return _sha_branch_reachability(worktree, sha) == 'reachable'
-
-
-def _sha_branch_reachability(worktree: Path, sha: str) -> str:
-    """Tri-state reachability probe for *sha*: ``'reachable' | 'unreachable' | 'unknown'`` (task 3651).
-
-    THE ONE PROBE. :func:`_sha_exists_on_branch` is now a thin fail-CLOSED
-    projection of this function (``== 'reachable'``), so the argv, the cwd and
-    the ``timeout=10`` are stated once and both callers move together. What
-    this function adds over that boolean is a THIRD outcome the projection
-    folds into its bare ``False``: "the check could not run at all". That
-    distinction is what lets :func:`_mark_step_done` fail OPEN on an infra
-    fault while still rejecting a sha the branch genuinely does not carry.
-
-    Two probes, in order:
-
-    1. ``git rev-parse --git-dir`` — is there a usable repo at *worktree*? A
-       non-zero rc (or an ``OSError``/``SubprocessError``) means git or the
-       worktree is unavailable, which is an INFRA fault and says nothing about
-       the sha: return ``'unknown'``.
-    2. ``git merge-base --is-ancestor <sha> HEAD`` — rc 0 -> ``'reachable'``;
-       ANY other rc -> ``'unreachable'``. Folding rc 1 (a real commit that is
-       not an ancestor) and rc 128 (a bad/fabricated object) together is
-       correct here precisely because probe 1 already proved the repo healthy —
-       see :func:`_sha_exists_on_branch`'s docstring for those two return
-       codes. An ``OSError``/``SubprocessError`` on this call -> ``'unknown'``.
-
-    :func:`_mark_step_committed` keeps calling :func:`_sha_exists_on_branch`
-    rather than this function directly: a fail-CLOSED architect guard has no
-    use for the third state, and that function's docstring is where the
-    INV-1/INV-3 corroborate-before-acting rationale lives.
-    """
-    try:
-        health = subprocess.run(
-            ['git', 'rev-parse', '--git-dir'],
-            cwd=str(worktree),
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if health.returncode != 0:
-            return 'unknown'
-    except (subprocess.SubprocessError, OSError) as exc:
-        logger.warning(
-            'Reachability probe: no usable git repo at %s (%s)', worktree, exc
-        )
-        return 'unknown'
-    try:
-        result = subprocess.run(
-            ['git', 'merge-base', '--is-ancestor', sha, 'HEAD'],
-            cwd=str(worktree),
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-    except (subprocess.SubprocessError, OSError) as exc:
-        logger.warning(
-            'Reachability probe failed for sha %r: %s', sha, exc
-        )
-        return 'unknown'
-    return 'reachable' if result.returncode == 0 else 'unreachable'
-
-
 def _mark_step_committed(
     artifacts: TaskArtifacts,
     step_id: str,
@@ -2064,7 +1955,7 @@ def _mark_step_committed(
     convention (so ``status=='error'``/substring assertions hold) and add
     ``ok:False`` so callers can branch uniformly on ``ok``.
     """
-    if not _sha_exists_on_branch(artifacts.worktree, sha):
+    if not branch_probes.sha_exists_on_branch(artifacts.worktree, sha):
         return {
             'ok': False,
             'status': 'error',
@@ -2581,9 +2472,9 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
 
         *commit_sha* MUST be reachable from HEAD on the current branch — it is
         checked with a real ``git merge-base --is-ancestor`` before anything is
-        written (``plan_tools.py::_sha_branch_reachability``). A sha the branch
-        does not carry is REJECTED with ``{'status': 'error'}`` and the step is
-        left untouched. On rejection: COMMIT the work first, then call again
+        written (``orchestrator/mcp/branch_probes.py::sha_branch_reachability``).
+        A sha the branch does not carry is REJECTED with
+        ``{'status': 'error'}`` and the step is left untouched. On rejection: COMMIT the work first, then call again
         with the sha that commit produced — never retry with a guessed or
         invented one. An ABBREVIATED sha is fine and always has been: the
         already-committed-WIP notice in your briefing shows 12-char short
@@ -2811,7 +2702,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         # `.task-meta` base, NOT the worktree. `artifacts.worktree` is always
         # correct, legacy or relocated (see TaskArtifacts.__init__).
         worktree = artifacts.worktree
-        main_sha = _resolve_main_sha(worktree)
+        main_sha = branch_probes.resolve_main_sha(worktree)
         return _report_blocking_dependency(
             artifacts, depends_on_task_id, reason, main_sha,
         )

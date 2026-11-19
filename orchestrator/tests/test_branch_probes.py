@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 from _git_fixtures import seed_repo
+
 from orchestrator.mcp.branch_probes import (
     Reachability,
     resolve_main_sha,

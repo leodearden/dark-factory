@@ -1932,7 +1932,7 @@ class TestWhereTheRecordLands:
         this branch would silently file every record under the CWD.
         """
         monkeypatch.setattr(
-            plan_tools.subprocess, 'run',
+            subprocess, 'run',
             lambda *a, **k: subprocess.CompletedProcess(a, 0, stdout='  \n', stderr=''),
         )
 
