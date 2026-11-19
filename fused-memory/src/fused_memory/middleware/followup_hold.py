@@ -5,25 +5,41 @@ curator_types.py imports this module, so it must keep importing only the stdlib 
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import json
+import logging
+from collections.abc import Mapping, Sequence
+from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any, ClassVar, Final
+from typing import TYPE_CHECKING, Any, ClassVar, Final
 
 from shared.followup_hold_records import (
     FOLLOWUP_HOLD_METADATA_KEY,
     FOLLOWUP_HOLDER_METADATA_KEY,
     FollowupHold,
+    FollowupHolder,
 )
 from shared.task_metadata_wire import coerce_task_metadata
-from shared.task_statuses import TaskStatus
+from shared.task_statuses import ACTIVE, TaskStatus
 
-from fused_memory.backends.task_backend_errors import TASKMASTER_TOOL_ERROR, TaskmasterError
+from fused_memory.backends.task_backend_errors import (
+    TASKMASTER_TOOL_ERROR,
+    TaskmasterError,
+    TaskNotFoundError,
+)
 from fused_memory.middleware.metadata_dict import raw_metadata_dict
+from fused_memory.models.scope import resolve_project_id
+
+if TYPE_CHECKING:
+    from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     'HELD_PRIORITIES',
     'PROTECTED_STATUSES',
+    'DuplicateFollowupHolderError',
     'FollowupHolderProtectedError',
+    'FollowupHolders',
     'HolderProtection',
     'hold_at_create',
     'hold_scope',
@@ -68,7 +84,7 @@ def hold_scope(metadata: object, priority: object) -> bool:
 
 def hold_at_create(
     kwargs: Mapping[str, object], metadata: object, holder_id: int, *, held_at: str,
-) -> tuple[dict[str, object], dict[str, object]]:
+) -> tuple[dict[str, Any], dict[str, Any]]:
     """The ``add_task`` arguments and metadata of a task born held: the holder edge and its record."""
     record = FollowupHold(holder=holder_id, held_at=held_at)
     held_metadata = {
@@ -88,6 +104,100 @@ def _with_holder_edge(dependencies: object, holder_id: int) -> str:
     if str(holder_id) not in named:
         named.append(str(holder_id))
     return ','.join(named)
+
+
+_HOLDER_WATCH = (
+    'The follow-up holder never dispatches: it only parks held low follow-ups behind one '
+    'dependency edge until each is promoted (plans/follow-up-filing-shape-prd.md §4.3).'
+)
+_HOLDER_DESCRIPTION = (
+    "This project's follow-up holder. Low-priority agent follow-ups and reviewer suggestions are "
+    'filed depending on it, so they wait here until a citation, a combine, a pack or a human '
+    'promotes them.'
+)
+_HOLDER_DETAILS = (
+    'Minted by fused-memory (plans/follow-up-filing-shape-prd.md §4.3). It is a deterministic pure '
+    'gate with deferred_watch set, so it never dispatches. set_task_status refuses done, cancelled '
+    'and deferred on it unless release_holder=True is passed, because that releases every held '
+    'follow-up at once. See docs/task-authoring.md §3.4.'
+)
+
+
+class DuplicateFollowupHolderError(TaskmasterError):
+    """More than one live task carries the holder marker: the one-holder invariant is already broken."""
+
+    def __init__(self, project_id: str, holder_ids: Sequence[int]) -> None:
+        self.project_id = project_id
+        self.holder_ids = tuple(holder_ids)
+        named = ', '.join(str(holder_id) for holder_id in self.holder_ids)
+        super().__init__(
+            TASKMASTER_TOOL_ERROR,
+            f'project {project_id} has more than one live follow-up holder (tasks {named}); '
+            f'nothing was held. Release all but one with release_holder=True.',
+        )
+
+
+class FollowupHolders:
+    """Each project's holder id, memoised; the store's marker stays the authority for which task it is."""
+
+    def __init__(self) -> None:
+        self._by_root: dict[str, int] = {}
+
+    async def ensure_holder(self, tm: TaskBackendProtocol, project_root: str) -> int:
+        """The project's live holder, minted on first need.
+
+        The caller holds the project's write lock, so lookup-then-mint is atomic. A memo hit is
+        re-read, so a released or removed holder is never served.
+        """
+        remembered = self._by_root.get(project_root)
+        if remembered is not None and await _is_live_holder(tm, project_root, remembered):
+            return remembered
+        holder_id = await _live_holder(tm, project_root)
+        if holder_id is None:
+            holder_id = await _mint_holder(tm, project_root)
+        self._by_root[project_root] = holder_id
+        return holder_id
+
+
+async def _is_live_holder(tm: TaskBackendProtocol, project_root: str, holder_id: int) -> bool:
+    try:
+        row = await tm.get_task(str(holder_id), project_root)
+    except TaskNotFoundError:
+        return False
+    return is_holder(row) and row.get('status') in ACTIVE
+
+
+async def _live_holder(tm: TaskBackendProtocol, project_root: str) -> int | None:
+    found = await tm.find_tasks_by_metadata(
+        project_root, FOLLOWUP_HOLDER_METADATA_KEY, statuses=sorted(ACTIVE), limit=2,
+    )
+    holder_ids = [int(row['task_id']) for row in found['results']]
+    if len(holder_ids) > 1:
+        raise DuplicateFollowupHolderError(resolve_project_id(project_root), holder_ids)
+    return holder_ids[0] if holder_ids else None
+
+
+async def _mint_holder(tm: TaskBackendProtocol, project_root: str) -> int:
+    project_id = resolve_project_id(project_root)
+    marker = FollowupHolder(project_id=project_id, minted_at=datetime.now(UTC).isoformat())
+    metadata = {
+        'task_kind': 'deterministic',
+        'always_escalates': True,
+        'execution_class': 'decision',
+        'deferred_watch': _HOLDER_WATCH,
+        FOLLOWUP_HOLDER_METADATA_KEY: marker.model_dump(mode='json'),
+    }
+    created = await tm.add_task(
+        project_root=project_root,
+        title=f'Follow-up holder ({project_id})',
+        description=_HOLDER_DESCRIPTION,
+        details=_HOLDER_DETAILS,
+        priority='low',
+        metadata=json.dumps(metadata),
+    )
+    holder_id = int(created['id'])
+    logger.info('followup_hold: minted follow-up holder task %s for project %s', holder_id, project_id)
+    return holder_id
 
 
 class HolderProtection(StrEnum):

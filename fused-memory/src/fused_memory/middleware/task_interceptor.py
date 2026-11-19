@@ -109,7 +109,12 @@ from fused_memory.middleware.done_provenance import (
     provenance_stamp_now,
     validate_done_provenance,
 )
-from fused_memory.middleware.followup_hold import is_holder
+from fused_memory.middleware.followup_hold import (
+    FollowupHolders,
+    hold_at_create,
+    hold_scope,
+    is_holder,
+)
 from fused_memory.middleware.live_task_write_guard import (
     FileFindingFn,
     guarded_recon_task_write,
@@ -637,6 +642,7 @@ class TaskInterceptor:
         self._proc_root = proc_root
         self.reconciler = targeted_reconciler
         self.buffer = event_buffer
+        self._followup_holders = FollowupHolders()
         # WP-B: when an event queue is wired in, journalling is fire-and-forget
         # via the background drainer. If None, fall back to inline buffer.push
         # — preserves the legacy call pattern for tests that haven't yet been
@@ -4940,11 +4946,17 @@ class TaskInterceptor:
             }
 
         tm = await self._ensure_taskmaster()
-        metadata_json: str | None = None
-        if metadata:
-            metadata_json = metadata if isinstance(metadata, str) else json.dumps(metadata)
 
         async with self._write_lock(project_id):
+            held_by: int | None = None
+            if hold_scope(metadata, kwargs.get('priority')):
+                held_by = await self._followup_holders.ensure_holder(tm, project_root)
+                kwargs, metadata = hold_at_create(
+                    kwargs, metadata, held_by, held_at=datetime.now(UTC).isoformat(),
+                )
+            metadata_json: str | None = None
+            if metadata:
+                metadata_json = metadata if isinstance(metadata, str) else json.dumps(metadata)
             try:
                 try:
                     result = await tm.add_task(
@@ -4998,6 +5010,8 @@ class TaskInterceptor:
             status = TicketStatus.CREATED
             reason = _create_reason(decision, curator_unavailable=curator_unavailable)
             result_dict = dict(result)
+            if held_by is not None:
+                result_dict['held_by'] = str(held_by)
 
             if metadata_json and task_id_str and not atomic_metadata_written:
                 try:
@@ -5559,6 +5573,12 @@ class TaskInterceptor:
                             {'operation': 'add_task', 'task_id': task_id},
                         )
                         await self._journal(event)
+                        if result_dict is not None and 'held_by' in result_dict:
+                            await self._journal(self._make_event(
+                                EventType.followup_held,
+                                t.project_root,
+                                {'task_id': task_id, 'holder_id': result_dict['held_by']},
+                            ))
 
                     self._signal_ticket_event(t.ticket_id)
 
