@@ -1283,12 +1283,12 @@ Review the above data and perform memory consolidation:
         the payload tight, matching _build_task_tree_section's pattern.  The
         snapshot is retained for :meth:`run`'s citation guard.  A tree with no
         active task yields a real, empty snapshot, because an absent section
-        tells this stage that no task is live; only an unset tree leaves it
-        None, and the guard inert.  Claimant heartbeats are aged at
+        tells this stage that no task is live; only an unset or unavailable
+        tree leaves it None, and the guard inert.  Claimant heartbeats are aged at
         ``filtered_task_tree_fetched_at``, the instant the tree was read, not
         at render time (task 6027).
         """
-        if self.filtered_task_tree is None:
+        if self.filtered_task_tree is None or self.filtered_task_tree.unavailable_reason is not None:
             return ''
         claims_read_at = resolve_tree_read_instant(
             self.filtered_task_tree_fetched_at,
