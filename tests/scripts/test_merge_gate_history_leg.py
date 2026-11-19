@@ -77,6 +77,7 @@ READS_ONLY_THROWAWAY_REPOS: Mapping[str, str] = {
         'run_git is patched; each git argv is a mocked CompletedProcess or side-effect input'
     ),
     'orchestrator/tests/_dispatch_base_scene.py': _SEEDS_ITS_OWN_REPO,
+    'orchestrator/tests/_landing_git_scenarios.py': '_Repo wraps the tmp_path git_repo fixture',
     'orchestrator/tests/test_atomic_train_merge.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_branch_base.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_branch_stack.py': _SEEDS_ITS_OWN_REPO,
