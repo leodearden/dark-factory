@@ -1916,8 +1916,8 @@ scripts/deploy/install_build_cache_store.sh --check  # read-only; exit 0 = healt
 
 It installs, as user units in `~/.config/systemd/user`:
 
-- `~/.cache/build-cache-store`, with its 4,368 leaf directories `<k0>/<k1>/<k2>`
-  pre-created;
+- `~/.cache/build-cache-store`, with its 4,368 directories down to the 4,096
+  `<k0>/<k1>/<k2>` leaves pre-created;
 - `build-cache-store.service`: `rclone serve webdav` on port **4227**, bound to
   127.0.0.1 and the tailscale address only, `Restart=always`;
 - `~/.config/build-cache-store/credentials` (mode 0600, `RCLONE_USER=` and
@@ -1928,19 +1928,31 @@ It installs, as user units in `~/.config/systemd/user`:
 
 Preflight writes nothing and refuses when lingering is off, when
 `tailscale ip -4` gives no address or `0.0.0.0`, or when rclone is not on
-`PATH`. A re-run writes only what differs. It restarts the store only when the
-store's unit or credentials changed or it is not running, so it never cuts
-in-flight builds. `--check` also reports a hand-edited unit as drift.
-Overrides: `BUILD_CACHE_STORE_PORT`, `BUILD_CACHE_STORE_CAP_BYTES`,
-`BUILD_CACHE_STORE_DIR`, `BUILD_CACHE_STORE_CREDENTIALS`.
+`PATH`. A re-run writes only what differs. It restarts the store only when its
+unit changed, when the credentials differ from those it was last started with
+(their digest is kept in `~/.local/state/build-cache-store/`), or when it is
+not running, so a re-run that changes nothing never cuts in-flight builds. To rotate the
+password, edit `RCLONE_PASS=` in the credentials file and re-run the
+installer, then re-run `--host-config` on each host. `--check` also reports a
+hand-edited unit as drift. Overrides: `BUILD_CACHE_STORE_PORT`,
+`BUILD_CACHE_STORE_CAP_BYTES`, `BUILD_CACHE_STORE_DIR`,
+`BUILD_CACHE_STORE_CREDENTIALS`.
+
+Boot order rests on `Restart=always`, not on unit ordering. A user manager
+cannot see `tailscaled.service` or `network-online.target`, so the unit has no
+`After=`. Until tailscaled assigns its address, rclone fails to bind it, and
+that failure takes the loopback address down too. The unit retries every 2 s,
+and `StartLimitIntervalSec=0` keeps a slow tailscale start from tripping the
+start limit.
 
 ### The host configuration file
 
 `~/.config/reify-canon/host.toml`, mode 0600, is read by reify's primitive
 (`REIFY_CANON_HOST_CONFIG` overrides the path). Its seven keys are C13's:
 `enabled`, `store_url`, `store_user`, `store_password`, `fallback_dir`,
-`fallback_cap` and `policy`. The installer's `--host-config` mode writes it and
-installs no store:
+`fallback_cap` and `policy`. The keys, their defaults and their value rules
+have one home, `scripts/deploy/reify_canon_host_config.py`. The installer's
+`--host-config` mode calls it to write the file, and installs no store:
 
 ```bash
 REIFY_CANON_ENABLED=true REIFY_CANON_POLICY=shared \
@@ -1948,20 +1960,22 @@ REIFY_CANON_ENABLED=true REIFY_CANON_POLICY=shared \
 scripts/deploy/install_build_cache_store.sh --check --host-config
 ```
 
-| Variable | Default |
+| Variable | Key |
 |---|---|
-| `REIFY_CANON_ENABLED` | `false` (`true` or `false`) |
-| `REIFY_CANON_POLICY` | `shared` (`shared`, `mixed` or `incremental`) |
-| `BUILD_CACHE_STORE_URL` | `http://127.0.0.1:4227` |
-| `BUILD_CACHE_STORE_CREDENTIALS` | `~/.config/build-cache-store/credentials`, the source of `store_user` and `store_password` |
-| `REIFY_CANON_FALLBACK_DIR` | `~/.cache/reify-canon/sccache-fallback` |
-| `REIFY_CANON_FALLBACK_CAP` | `50G` |
+| `REIFY_CANON_ENABLED` | `enabled` |
+| `REIFY_CANON_POLICY` | `policy` |
+| `BUILD_CACHE_STORE_URL` | `store_url` |
+| `REIFY_CANON_FALLBACK_DIR` | `fallback_dir` |
+| `REIFY_CANON_FALLBACK_CAP` | `fallback_cap` |
+| `BUILD_CACHE_STORE_CREDENTIALS` | the file `store_user` and `store_password` are always read from |
 
-Every run writes all seven keys from these variables, so pass every value you
-want kept. A run with defaults writes `enabled = false` and can only roll a host
-back. `--check --host-config` checks the file's mode, keys and values. It then
-proves the store accepts this host's credentials over `store_url`: 404 for a
-missing key with them, 401 without.
+An unset variable keeps the existing file's value, so a re-run changes only
+what you pass, and each change is logged old -> new. Defaults apply only where
+there is no file yet. Among them, `enabled = false` and a loopback `store_url`,
+which is why the laptop passes `BUILD_CACHE_STORE_URL`. `--check --host-config`
+checks the file's mode, keys and values under the same rules. It then proves
+the store accepts this host's credentials over `store_url`: 404 for a missing
+key with them, 401 without.
 
 On the laptop, copy the workstation's credentials file, then point at the
 workstation's tailscale address:
@@ -1985,8 +1999,11 @@ To enable:
    `build_canon.shim_dir: ~/.local/share/reify-canon/bin` (absolute) in the
    host's own reify orchestrator yaml, never in `verify_env`. Apply with
    `mcp__escalation__reload_config`; the section is hot-reloadable.
-4. Reset the host's task-verify lanes and merge lane so their build
-   directories are recreated at CANON.
+4. Reset the host's task-verify lanes so their build directories are
+   recreated at CANON: `orchestrator verify-lanes reset --config <host yaml>`
+   (task-verify-lanes PRD C10; exit 3 means a busy lane was skipped, so re-run
+   it). Then drop the merge lane's build directory, as in
+   [Rebuilding the warm base](#rebuilding-the-warm-base).
 5. Once verifies have run, compare the drift probe on both hosts and run the
    in-service check. Only when it exits 0, set `build_canon.expect_canon: true`.
 
@@ -1994,7 +2011,7 @@ To disable or roll back, follow PRD decision 22's order:
 
 1. Write host.toml with `enabled = false` (`--host-config` with
    `REIFY_CANON_ENABLED=false`). New build directories are then real-path.
-2. Rebuild the warm base.
+2. Rebuild the warm base ([below](#rebuilding-the-warm-base)).
 3. Only then unset `build_canon.root` and `expect_canon`, and reload.
 
 Existing CANON directories keep working throughout. A leg about to run
@@ -2002,16 +2019,27 @@ unprefixed in a CANON-stamped directory gets a fresh build directory (C8).
 
 ### Changing a host's policy
 
-1. Re-run `--host-config` with the new `REIFY_CANON_POLICY` and every other
-   value as before, including `REIFY_CANON_ENABLED=true`.
-2. Halt the merge queue (`mcp__escalation__halt_merge_queue`) and wait for it
-   to be idle.
-3. Drop the merge lane's build directory, so the next merge verify rebuilds the
-   warm base under the new policy.
-4. Release the queue (`mcp__escalation__unhalt_merge_queue`).
+1. Re-run `--host-config` with the new `REIFY_CANON_POLICY`; every other value
+   is kept.
+2. [Rebuild the warm base](#rebuilding-the-warm-base) under the new policy.
 
 Every workspace unit's identity changes with the policy (C12). Old units are
 never reused, which is why the base is dropped.
+
+### Rebuilding the warm base
+
+The persistent merge lane's build directory is what the warm base is refreshed
+from, so dropping it rebuilds the base under the host's current host.toml:
+
+1. Halt the merge queue (`mcp__escalation__halt_merge_queue`) and wait for it
+   to be idle.
+2. In reify's main checkout, `rm -rf .worktrees/_merge-verify/target`.
+3. Release the queue (`mcp__escalation__unhalt_merge_queue`).
+
+The next merge verify builds it cold, through `canon_run.py exec` (C12). On
+landing, reify's `scripts/refresh-warm-base.sh` refreshes
+`$REIFY_WARM_LANE_MOUNT/base/target` from it. To rebuild before the next
+merge, run reify's `scripts/seed-warm-base-initial.sh` between steps 2 and 3.
 
 ### Reading observations
 
@@ -2035,30 +2063,18 @@ scripts/deploy/check_build_cache_in_service.py \
   --canon-root /opt/reify-canon/ws --status-json <file holding canon_run.py status output>
 ```
 
-The table is evaluated in order and the first match wins:
-
-| Exit | Meaning |
-|---|---|
-| 1 | `--canon-root` differs from the status JSON's `canon_root` (or the file is unreadable or lacks the key), or the latest observation is degraded |
-| 0 | at least N healthy observations since `--since`, and the latest is healthy |
-| 2 | no observation for the host since `--since`: nothing is producing them |
-| 75 | anything else: too few healthy yet, or the latest is neutral |
-| 64 | usage error |
-
-Rows are classified per C10 without `expect_canon`, so a `real_path` row is
-neutral and real-path rows can never produce a pass. A `--since` without an
-offset is UTC. Stdout is one JSON line carrying `verdict`, the counts, `latest`
-and `per_policy` sums of runs, hits, misses and cpu_secs.
+Exit 0 means in service. PRD C13 specifies the exit table.
+`check_build_cache_in_service.py --help` prints it, with the order it is
+evaluated in and the tool's own codes for a usage error and an unreadable
+observations file. Stdout is one JSON line carrying `verdict`, the counts,
+`latest` and `per_policy` sums of runs, hits, misses and cpu_secs.
 
 ### The alarm
 
 Each executing host has the sentinel `__build_cache_degraded__<host>`, category
-`infra_issue`. It goes to L1 at 2 consecutive degraded results, is refiled
-every 2, and goes to L2 at 10. A healthy result clears it; a neutral one neither
-extends nor resets the streak. Degraded (C10) means `backend` `local_fallback`,
-`reason` `read_only_server`, or `mode` `real_path` on a host with
-`build_canon.expect_canon`. When it fires: run `--check` on the workstation,
-`--check --host-config` on the host, and read that host's latest rows.
+`infra_issue`. Its ladder is PRD decision 18's, and "degraded" is defined by
+C10. When it fires: run `--check` on the workstation and
+`--check --host-config` on the host, then read that host's latest rows.
 
 ### Pruning
 
@@ -2095,10 +2111,11 @@ diff /tmp/drift-<workstation>.tsv /tmp/drift-leo-laptop.tsv
 Zero differences outside `#info` lines are required before gates ι and κ. α
 found libxss-dev installed on the laptop only (esc-10782-1); `dpkg.dev-packages`
 and `pkg-config.modules` show that kind of difference as a digest. To name the
-package, diff this listing from both hosts:
+package, diff the listing behind each line, taken on both hosts:
 
 ```bash
-dpkg-query -W -f '${db:Status-Abbrev} ${Package}=${Version}\n' | awk '$1 == "ii" && $2 ~ /-dev=/ { print $2 }' | sort
+REIFY_PROBE_LIST=dev-packages scripts/deploy/build_cache_drift_probe.sh > /tmp/dev-$(hostname).txt
+REIFY_PROBE_LIST=pkg-config-modules scripts/deploy/build_cache_drift_probe.sh > /tmp/pc-$(hostname).txt
 ```
 
 `REIFY_PROBE_DEEP=1` adds the digests of the C++ wrappers' header closures.
