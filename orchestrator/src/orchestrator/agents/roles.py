@@ -818,16 +818,19 @@ INSIDE this worktree, by contrast, IS writable, including files never
 listed in the plan's assigned scope — nothing in the sandbox stops you
 from editing outside scope, and nothing else detects it either.
 
-One exception: when every file the task declares is a docs file
-(classification: `orchestrator/src/orchestrator/agents/docs_scope.py`),
-the sandbox ALSO grants the main checkout's `.git` and exactly those
-declared paths there. It exists so that a project whose own instructions
-prescribe a hook-gated direct-to-main docs commit can be followed; use it
-only when those instructions say so. Commit with the hooks running, never
-`--no-verify`. A declared file there can be edited in place, or created
-under an existing subdirectory, but a new top-level file cannot be
-created. `.taskmaster/`, the hook scripts and every undeclared file stay
-read-only.
+One exception: when every file the task declares is a docs file (a `.md`,
+`.yaml` or `.yml` file, or anything under a top-level `docs/`), the
+sandbox ALSO grants the main checkout's `.git` and those declared paths
+there: an existing file itself, or, for a file that does not exist yet,
+its nearest existing directory, but only one under `docs/`. It exists so
+that a project whose own instructions prescribe a hook-gated
+direct-to-main docs commit can be followed; use it only when those
+instructions say so. Commit with the hooks running, never `--no-verify`,
+and never run `git stash`: the grant makes the stash ref, which every
+checkout shares, writable. A new file outside `docs/` cannot be created
+in the main checkout. Outside `.git` and those grants the main checkout
+stays read-only, including `.taskmaster/` and the hook scripts when they
+live outside `.git`.
 
 Staying within the plan's assigned files is therefore your responsibility,
 not the sandbox's.

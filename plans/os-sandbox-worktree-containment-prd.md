@@ -169,15 +169,20 @@ admin name (`.git` file → `gitdir`), main-repo common `.git` dir, task id,
 | `~/.claude/hooks/state/` | RW | hook state (α1 may drop — see D5) |
 | `/tmp/`, `/dev/` | RW | orchestrator temp files, pytest FIFO, verify-slot semaphores, device nodes |
 | *conditional:* `<project_root>/.git/` | RW | docs-only tasks only — the hook-gated direct-main docs commit (§Docs-only main grant) |
-| *conditional:* each declared docs path: a file grant if it exists, else its nearest existing in-root ancestor dir | RW | docs-only tasks only — the edits that commit lands |
+| *conditional:* each declared docs path: a file grant if it exists, else its nearest existing ancestor dir, only when that dir lies in a top-level `docs/` | RW | docs-only tasks only — the edits that commit lands |
 | **Everything else** — `<main>` tree, sibling worktrees, other tasks' `.task-meta/`, `~/.claude` remainder, `.git` root (`packed-refs`, `config`, `HEAD`), `refs/heads/main`, `~/.local/share/uv` | **RO**, unless the docs-only rows apply | the containment |
 
 The two conditional rows exist only when
 `orchestrator/src/orchestrator/agents/docs_scope.py::docs_only_paths(declared_files)`
 is non-empty, where the declared files are the plan's `files`, else the
-task's `metadata.files`. `project_root` itself, `.git`, `.taskmaster` and
-`.worktrees` are never granted as docs paths. Both rows are absent by
-default, so a non-docs invocation's write set and digest are unchanged.
+task's `metadata.files`. `project_root` itself is never granted as a docs
+path, and neither is any path that lies in or contains `.git`,
+`.taskmaster`, the lane base (the worktree's parent, from
+`git.worktree_dir`) or the `.task-meta` base, so rows 2 and 2b stay the
+only `.task-meta` grants. A base that holds the project root beside its
+lanes is exempt, since its lanes already lie outside the root. `WriteSet`
+re-checks that containment when it is built. Both rows are absent by default, so a non-docs invocation's write
+set and digest are unchanged.
 
 Invariants:
 - The set is computed per invocation from the assigned worktree/lane — a 2505
@@ -236,10 +241,30 @@ measured on this host (kernel 7.0, landlock ABI 8, 2026-11-13):
   `{.git dir, one docs file}`; the only denied write was reify's fail-open
   verify ledger (`data/verify-logs`).
 
-Residual, named rather than glossed: `--no-verify` stays reachable (reify's
-`hooks/reference-transaction` is the backstop), and for a docs-only
-invocation `.git/config`, the `.git/hooks` link, other lanes' admin dirs and
-every ref are writable. The hook scripts themselves stay read-only (row 21).
+A directory grant can therefore only be a directory under `docs/`, and a
+new docs file anywhere else (a new top-level `NEW.md`, a new
+`plans/x.md`, a new `src/pkg/NOTES.md`) is refused with a warning rather
+than widening the grant to a non-docs directory.
+
+Residual, named rather than glossed:
+- `--no-verify` stays reachable; reify's `hooks/reference-transaction` is
+  the backstop.
+- A new file's directory grant exposes every file in that `docs/`
+  directory, not only the declared one. They are all docs files.
+- For a docs-only invocation, `.git/config`, the `.git/hooks` entry, other
+  lanes' admin dirs and every ref are writable. That includes `refs/stash`,
+  a single ref every checkout shares and the merge worker's advance path
+  consumes (incident `13674d3c68`). So a `git stash` in the agent's own
+  worktree, which the sandbox denies otherwise, succeeds and lands on the
+  shared stack. The role prompt forbids it, but nothing enforces that.
+- The hook scripts stay read-only only when they live outside `.git`
+  (`core.hooksPath`, or a `.git/hooks` symlink, as in dark-factory and
+  reify; row 21). A project with real files in `.git/hooks/` has them
+  writable under the grant.
+- The grant is gated on the declared files alone. Every docs-only task in
+  every project gets it, including projects whose docs tasks land through
+  the merge queue, and no project setting turns it off.
+
 Each grant is recorded as `docs_main_paths` on that invocation's
 `sandbox_applied` event.
 
