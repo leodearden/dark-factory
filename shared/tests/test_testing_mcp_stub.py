@@ -15,7 +15,7 @@ import pytest
 
 from shared.mcp_post import MCP_POST_HEADERS, decode_mcp_response_body
 from shared.mcp_session import McpCallError, McpFailureKind, SyncMcpSession
-from shared.testing_mcp_stub import RecordedRequest, StubAnswer, StubMcpServer
+from shared.testing_mcp_stub import RecordedRequest, StubAnswer, StubMcpServer, tool_reply_body
 
 PAYLOAD = {"success": True, "id": "7"}
 
@@ -336,3 +336,27 @@ class TestToolsHandler:
 
         assert excinfo.value.kind is McpFailureKind.TOOL_ERROR
         assert "KeyError" in str(excinfo.value)
+
+
+class TestToolReplyBody:
+    """``tool_reply_body`` is the very body the stub serves for an OK tools/call."""
+
+    def test_the_stateless_answer_is_the_body(self):
+        with StubMcpServer(stateful=False, payload=PAYLOAD) as server:
+            resp = _post(server, TOOLS_CALL)
+        assert resp.json() == tool_reply_body(PAYLOAD, request_id=TOOLS_CALL["id"])
+
+    def test_the_stateful_sse_frame_carries_the_body(self):
+        with StubMcpServer(stateful=True, payload=PAYLOAD) as server:
+            session_id = _open_session(server)
+            resp = _post(server, TOOLS_CALL, session_id=session_id)
+        assert decode_mcp_response_body(resp) == tool_reply_body(PAYLOAD, request_id=TOOLS_CALL["id"])
+
+    def test_a_handlers_answer_is_the_body(self):
+        answer = {"tasks": [{"id": 1}]}
+        with StubMcpServer(stateful=False, tools=lambda name, arguments: answer) as server:
+            resp = _post(server, TOOLS_CALL)
+        assert resp.json() == tool_reply_body(answer, request_id=TOOLS_CALL["id"])
+
+    def test_the_request_id_defaults_to_one(self):
+        assert tool_reply_body(PAYLOAD)["id"] == 1
