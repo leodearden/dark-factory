@@ -14,6 +14,8 @@ against must hold one layer up, at the gate:
   recorded as ``landing_evidence_rejected`` rows at the ancestry site.
 * **B5** a genuinely unlanded branch is refused without an escalation, and
   recorded at the off-main-tip site.
+* A multi-commit branch SQUASH-landed onto main reads as **B5** too: the
+  residual the repoint accepted, pinned so it stays deliberate.
 
 Every repository is a genuine throwaway one built by ``_landing_git_scenarios``;
 the gate runs over the REAL ``GitOps`` ``Harness.__init__`` builds for it.  Only
@@ -41,6 +43,7 @@ from _landing_git_scenarios import (
     build_merged_landing,
     build_no_op_landing,
     build_rebased_landing,
+    build_squashed_landing,
     build_sync_merge_branch,
     build_unlanded_branch,
     numbered_lines,
@@ -259,3 +262,25 @@ class TestOffMainTipArmDecidesByPatchId:
             'already_landed_gate_off_main_tip', 'not_landed', 'patch_id',
         )
         assert content_check.await_count == 0
+
+    async def test_a_multi_commit_squash_landing_reads_as_unlanded_and_dispatches(
+        self, mock_orch_config: Any, repo: LandingRepo, tmp_path: Path,
+    ) -> None:
+        """The accepted residual: per-commit patch-ids cannot see a squash.
+
+        The squash commit cites the task and carries all of the branch's work,
+        but its one patch-id matches neither branch commit.  Catching it would
+        need a producer change (§7 of the caller enumeration), so the gate
+        refuses it like any unlanded branch and the task dispatches.
+        """
+        sc = build_squashed_landing(repo)
+        gate = WiredGate(mock_orch_config, sc, tmp_path)
+
+        assert await gate.run() is False
+
+        gate.mark.assert_not_awaited()
+        gate.queue.submit.assert_not_called()
+        [row] = gate.rejects()
+        assert (row['site'], row['reason'], row['method']) == (
+            'already_landed_gate_off_main_tip', 'not_landed', 'patch_id',
+        )

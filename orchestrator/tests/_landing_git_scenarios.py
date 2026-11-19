@@ -20,6 +20,9 @@ dispatch gate, Tier-3.5) can rebuild exactly the producer's shapes:
 * **B6** degenerate branch — a tip equal to the recorded ``branch_base_sha``
   (:func:`build_degenerate_branch`).
 
+One builder is not a boundary row but a residual the producer accepts: a
+multi-commit branch squash-merged onto main (:func:`build_squashed_landing`).
+
 Both isolation guards from ``_orch_helpers`` are applied to every repository
 (esc-3072-3): ``assert_isolated_git_repo`` runs BEFORE any subprocess, so a
 rejected root writes nothing anywhere, and ``git_env_with_ceiling`` caps git's
@@ -321,6 +324,27 @@ def build_unlanded_branch(repo: LandingRepo, *, branch: str = BRANCH) -> Scenari
 
     sc = Scenario(
         repo=repo, branch=branch, branch_base_sha=base, landed_sha=None,
+        metadata={'branch_base_sha': base},
+    )
+    sc.refresh()
+    assert sc.branch_tip_sha == tip
+    return sc
+
+
+def build_squashed_landing(repo: LandingRepo, *, branch: str = BRANCH) -> Scenario:
+    """The two-commit branch SQUASH-merged onto main as one citing commit.
+
+    The tip is not an ancestor of main, and the single squash commit's
+    patch-id matches neither branch commit, so per-commit patch-id
+    containment reads this landing as absent.  It is the residual the
+    dispatch gate's repoint accepted (task 4648), built so a test pins it.
+    """
+    base, tip = seed_branch(repo, branch=branch)
+    repo.git('merge', '--squash', branch)
+    squash = repo.commit(f'feat({TASK_ID}): squash-land the feature module')
+
+    sc = Scenario(
+        repo=repo, branch=branch, branch_base_sha=base, landed_sha=squash,
         metadata={'branch_base_sha': base},
     )
     sc.refresh()

@@ -13852,7 +13852,8 @@ class Harness:
         consults LIVE GIT STATE rather than the durable LandedOutbox, so it
         also catches landings that never went through this orchestrator's
         merge queue: a sibling direct-merge, a prior orchestrator run, or a
-        squash/rebase/manual landing.  Installed as
+        rebase/manual landing (not a multi-commit squash; see the off-main-tip
+        arm below).  Installed as
         ``self.scheduler._already_landed_gate``.
 
         **Cheap pre-filter** (task 2313 review): ``resolve_branch_sha`` is
@@ -13943,8 +13944,12 @@ class Harness:
         and vetoes the flip.
 
         The off-main-tip arm catches landings whose live tip is NOT an
-        ancestor of main (squashed/rebased/manually-applied).  The same
-        producer decides it, by patch-id containment of the branch's own
+        ancestor of main (rebased, cherry-picked, or a single-commit squash).
+        It does NOT catch a squash of a multi-commit branch: the squash
+        commit's one patch-id matches none of the branch's commits, so the
+        producer answers ``not_landed`` and the task dispatches.  That residual
+        is accepted, not overlooked (enumeration doc §7).  The same producer
+        decides it, by patch-id containment of the branch's own
         non-merge commits plus attribution (a commit citing the task, else
         the tip's patch-id twin on main), and the stamp anchors on that
         evidence, never on main HEAD.  Why later commits on main cannot undo
@@ -14178,8 +14183,8 @@ class Harness:
                 return True
             return False
 
-        # A live tip that is NOT an ancestor of main: a squash, rebase or
-        # manual landing, or no landing at all.  The same producer decides,
+        # A live tip that is NOT an ancestor of main: a rebase or manual
+        # landing, or no landing at all (a multi-commit squash reads as none).  The same producer decides,
         # on the same tip (task 4648).
         verdict = await branch_work_landed(
             self.git_ops, task_id, branch,

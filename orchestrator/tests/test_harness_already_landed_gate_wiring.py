@@ -5,7 +5,9 @@ Architecturally parallel to task 2156's landed-outbox dispatch gate
 GIT STATE (ancestry + content-equivalence) rather than the durable
 LandedOutbox, so it also catches OUT-OF-BAND landings that never went
 through this orchestrator's own merge queue: a sibling direct-merge, a prior
-orchestrator run, or a squash/rebase/manual landing.
+orchestrator run, or a rebase/manual landing.  A multi-commit squash is the
+residual the patch-id repoint accepted (task 4648), pinned in
+test_already_landed_gate_patch_id.py.
 
 Covers:
   step-3  (RED)  Ancestry happy-path: is_ancestor True + citation present +
