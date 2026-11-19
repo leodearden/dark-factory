@@ -80,12 +80,16 @@ async def test_a_create_overrunning_the_write_budget_raises_a_timeout_naming_it_
     squeezed.queue.backend_write_timeout_seconds = budget = 0.5
     with stub_qdrant_server(
         create_delay_s={target: 2 * budget},
-        list_collections_delay_s=2 * budget,  # mem0's construction-time listing, held past the squeezed budget
+        # mem0 lists collections while it builds an instance: held past the squeeze,
+        # so the next call fails outright, not flakily, if it ever inherits the squeeze.
+        list_collections_delay_s=2 * budget,
     ) as stub:
         async with backend_against(stub.url, squeezed) as backend:
             with pytest.raises(TimeoutError, match=re.escape(f'Mem0 create_collection timed out after {budget}s')):
                 await backend.get(MEMORY_ID, SCOPE)
-        assert stub.wait_created(target, timeout=10)
+        assert stub.wait_created(target, timeout=10), (
+            f'create never completed server-side; creates received={stub.creates(target)}'
+        )
         async with backend_against(stub.url, config) as backend:
             assert await backend.get(MEMORY_ID, SCOPE) is None
         assert stub.creates(target) == 1
