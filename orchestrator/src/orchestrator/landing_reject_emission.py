@@ -23,18 +23,23 @@ makes the reject rate countable, which is the prerequisite for deciding later
 whether an escalation or a persistence threshold is warranted.
 
 CADENCE.  One row per NEW or CHANGED signature ``(reason, citation,
-effect_check_sha)`` per ``(site, task_id)``; identical repeats are silent.
-Two edges release a task's memo so its next reject re-announces: an accepted
-verdict at the same site, and ``LandingRejectRecorder.release``, which the
-harness calls when it dispatches the task.  So the COUNTING UNIT at the gate
+effect_check_sha, branch_tip_sha)`` per ``(site, task_id)``; identical repeats
+are silent.  Two edges release a task's memo so its next reject re-announces:
+an accepted verdict at the same site, and ``LandingRejectRecorder.release``,
+which the harness calls when it dispatches the task.  The off-main-tip arm's
+``no_attribution`` is escalated, never observed, so it neither writes a row
+nor releases the memo: a reject that follows it re-announces only if its
+signature differs or a dispatch released it.  So the COUNTING UNIT at the gate
 is one row per signature per dispatch the reject let through (the wasted-
 dispatch count an escalation threshold would read), never one per tick.  The
 gate runs for every dispatch candidate on every tick and the sweep re-visits
 a blocked task every sweep, so unconditional rows would be the INV-4 storm
 ``orchestrator/src/orchestrator/recovery_emission.py::should_emit_event``
 already documents for this very gate.  The signature leaves out the survival
-numbers, so an ordinary main advance does not re-emit; a moved branch tip
-(``effect_check_sha``) is a new fact and does.  The memo is in-memory and
+numbers, so an ordinary main advance does not re-emit; a moved branch tip is
+a new fact and does.  ``branch_tip_sha`` carries that move at every site,
+because both producers seed it and ``branch_work_landed`` seeds no
+``effect_check_sha`` and no reject ``citation``.  The memo is in-memory and
 non-durable (a restart re-arms it), bounded by one small tuple per task
 rejected and since neither accepted nor dispatched.  It records only a row
 handed to the store: no store, a payload that cannot be built or a raising
@@ -88,7 +93,7 @@ def landing_reject_payload(
     return data
 
 
-_Signature = tuple[str, str | None, str | None]
+_Signature = tuple[str, str | None, str | None, str | None]
 
 
 class LandingRejectRecorder:
@@ -107,6 +112,7 @@ class LandingRejectRecorder:
             str(verdict.reason),
             verdict.probe.get('citation'),
             verdict.probe.get('effect_check_sha'),
+            verdict.probe.get('branch_tip_sha'),
         )
 
     def observe(
