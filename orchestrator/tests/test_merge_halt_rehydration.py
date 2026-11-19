@@ -130,7 +130,7 @@ async def test_tracked_wip_in_project_root_keeps_the_halt(
 
 
 @pytest.mark.asyncio
-async def test_task_worktree_conflict_never_owns_the_queue_halt(
+async def test_task_worktree_conflict_over_a_clean_project_root_is_released(
     tmp_path: Path, repo: Path, queue: EscalationQueue,
 ):
     task_worktree = tmp_path / 'task-worktree'
@@ -146,6 +146,26 @@ async def test_task_worktree_conflict_never_owns_the_queue_halt(
     released = queue.get(esc.id)
     assert released is not None
     assert released.halt_released_at is not None
+
+
+@pytest.mark.asyncio
+async def test_task_worktree_conflict_over_a_dirty_project_root_re_owns_the_halt(
+    tmp_path: Path, repo: Path, queue: EscalationQueue,
+):
+    task_worktree = tmp_path / 'task-worktree'
+    _git(repo, 'worktree', 'add', '-q', '-b', 'task/4843', str(task_worktree))
+    _leave_unmerged(task_worktree, 'side-4843')
+    esc = _make_wip_esc(queue, '4843', worktree=str(task_worktree))
+    _dirty(repo)
+    worker = _FakeMergeWorker()
+
+    owner = await _rehydrate(queue, repo, worker)
+
+    assert owner == esc.id
+    assert worker.is_wip_halted
+    held = queue.get(esc.id)
+    assert held is not None
+    assert held.halt_released_at is None
 
 
 @pytest.mark.asyncio
