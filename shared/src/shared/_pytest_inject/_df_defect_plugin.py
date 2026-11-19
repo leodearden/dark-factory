@@ -73,15 +73,30 @@ import sys
 import tempfile
 import types
 from collections.abc import Generator, Iterable, Iterator
-from typing import Any
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 import pytest
+
+if TYPE_CHECKING:
+    from typing import TypeGuard
 
 DEFECT_MARKER = 'defect'
 CRITERION_MARKER = 'criterion'
 COLLECTION_MAP_SUFFIX = '.tests.json'
 
 _WORKEROUTPUT_PREFIX = '_df_defect_plugin.'
+
+
+@runtime_checkable
+class _XdistWorkerConfig(Protocol):
+    """An xdist worker's config: xdist sets ``workeroutput`` beside ``workerinput`` and ships it after sessionfinish."""
+
+    workerinput: dict[str, Any]
+    workeroutput: dict[str, Any]
+
+
+def _is_xdist_worker(config: pytest.Config) -> TypeGuard[_XdistWorkerConfig]:
+    return isinstance(config, _XdistWorkerConfig)
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
@@ -119,15 +134,10 @@ class _HandOff:
         self.payload.update(getattr(node, 'workeroutput', {}).get(self._key, {}))
 
     def pytest_sessionfinish(self, session: pytest.Session) -> None:
-        if hasattr(self._config, 'workerinput'):
-            _ship_to_controller(self._config, self._key, self.payload)
+        if _is_xdist_worker(self._config):
+            self._config.workeroutput[self._key] = self.payload
         else:
             _write_atomically(self._target, self.payload)
-
-
-def _ship_to_controller(config: pytest.Config, key: str, payload: dict[str, Any]) -> None:
-    """xdist sets ``workeroutput`` beside ``workerinput`` and sends it to the controller after sessionfinish."""
-    vars(config)['workeroutput'][key] = payload
 
 
 class _CollectionMap(_HandOff):
