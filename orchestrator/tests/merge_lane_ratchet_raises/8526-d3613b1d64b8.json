@@ -1,0 +1,12 @@
+{
+  "task_id": "8526",
+  "reason": "Amendment to task 8526 (reviewer suggestions 5 and 6): the paired write of 'released at its verdict' (status VERIFIED_PENDING_LANDING plus verdict_host) moved out of worker.py::SpeculativeMergeWorker::_release_lease_at_verdict into one writer, types.py::InflightEntry::release_lease_at_verdict, which refuses a missing lease with a named ValueError (+1); and the host of an entry's verify, held or released, became one property, InflightEntry::verify_host (+1 for its lease-or-verdict_host choice), read by the snapshot entries, the restart drain and the occupancy row. worker.py fell by 3 (1971 -> 1968): snapshot's and the drain's inline lease-name ternaries are gone and _entry_row (3 -> 2) no longer re-checks the status beside verdict_host. The cluster total falls by 1; only types.py's per-file cognitive moves 93 -> 95.",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/types.py",
+      "baseline": 93,
+      "current": 95
+    }
+  ]
+}

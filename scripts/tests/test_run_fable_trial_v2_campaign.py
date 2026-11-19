@@ -25,6 +25,9 @@ from pathlib import Path
 
 import pytest
 import run_fable_trial_v2_campaign as mod
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _PRE_SIGMA = (mod.MARKER_KEY,)
 """``drop_metrics`` argument for a cell that PREDATES eval-revival σ (task 3628).
@@ -63,12 +66,14 @@ def _cell(
     that needs the pre-σ shape must therefore ask for it with
     ``drop_metrics=_PRE_SIGMA``. Do not pass the same key in both.
     """
-    from orchestrator.evals.metrics import EvalMetrics
+    from orchestrator.evals.metrics import EvalMetrics, RoleUnderTest
     from orchestrator.evals.results import EvalResult
 
     m = EvalMetrics(
         plan_quality=plan_quality,
-        role_under_test=role_under_test,
+        role_under_test=(
+            RoleUnderTest(role_under_test) if role_under_test is not None else None
+        ),
         plan_steps=plan_steps,
         cost_usd=cost_usd,
         judge_cost_usd=judge_cost_usd,
@@ -369,12 +374,13 @@ def test_summary_rows_match_the_report_layer_field_for_field():
 
     ``cap_excluded`` / ``no_plan`` / ``plan_rate`` / ``mean_plan_quality`` are
     the report layer's per-config accumulator (tasks 3118/3302/3379), built on
-    the SHARED ``_plan_rate`` and ``_mean_plan_quality`` reductions precisely so
-    two adjacent surfaces cannot give contradictory answers about the same
-    quantity. Re-deriving any of them in this driver would create exactly that
-    second surface. This test pins the equality field for field.
+    the SHARED ``cell_admission.plan_rate`` and
+    ``cell_admission.mean_plan_quality`` reductions precisely so two adjacent
+    surfaces cannot give contradictory answers about the same quantity.
+    Re-deriving any of them in this driver would create exactly that second
+    surface. This test pins the equality field for field.
     """
-    from orchestrator.evals.report import build_plan_quality_report
+    from orchestrator.evals.plan_quality_report import build_plan_quality_report
 
     results = _mixed_results()
     rows = mod.summarize_candidates(results)
@@ -482,12 +488,15 @@ def test_marker_present_counts_per_candidate():
 
 
 def test_only_architect_cells_are_counted():
-    """An implementer cell carrying the marker is ignored, even under the same config.
+    """An implementer or end_to_end cell carrying the marker is ignored, even under the same config.
 
-    An implementer run never invokes the plan judge, so it cannot have been
-    judged without a reference; counting it would inflate the very number that
-    bounds how far ``plan_quality`` may be trusted.
+    Neither run invokes the plan judge, so it cannot have been judged without a
+    reference; counting it would inflate the very number that bounds how far
+    ``plan_quality`` may be trusted. An enum-valued architect cell counts like a
+    string-valued one.
     """
+    from orchestrator.evals.metrics import RoleUnderTest
+
     results = [
         _cell('f1', 'A', plan_quality=0.8, plan_steps=5,
               extra_metrics={'judged_without_reference': False}),
@@ -495,11 +504,15 @@ def test_only_architect_cells_are_counted():
               extra_metrics={'judged_without_reference': False}),
         _cell('f3', 'A', role_under_test='implementer',
               extra_metrics={'judged_without_reference': True}),
+        _cell('f4', 'A', role_under_test=RoleUnderTest.ARCHITECT, plan_quality=0.8,
+              plan_steps=5, extra_metrics={'judged_without_reference': True}),
+        _cell('f5', 'A', role_under_test=RoleUnderTest.END_TO_END,
+              extra_metrics={'judged_without_reference': True}),
     ]
 
     rows = {r['config_name']: r for r in mod.summarize_candidates(results)}
 
-    assert {name: row[mod.MARKER_KEY] for name, row in rows.items()} == {'A': 0}
+    assert {name: row[mod.MARKER_KEY] for name, row in rows.items()} == {'A': 1}
 
 
 def test_rendered_table_marks_unmeasured_loudly():
@@ -1340,14 +1353,14 @@ def test_uniform_corpora_are_unchanged():
 # recipe re-runs cap-tainted fixtures, so a post-σ re-run writes keyed cells
 # beside older keyless ones. Two operator-facing surfaces, built inside one
 # function from one input, contradicting each other about one quantity is exactly
-# what ``report.py``:334-340 and ``metrics.py`` assert three times over must not
-# happen — "two consumers of one field must not answer the same question
-# differently".
+# what ``cell_admission.py::judged_without_reference`` and ``metrics.py`` assert
+# three times over must not happen — "two consumers of one field must not answer
+# the same question differently".
 
 
 def _report_entries(results):
     """The report layer's per-config accumulator, keyed by ``config_name``."""
-    from orchestrator.evals.report import build_plan_quality_report
+    from orchestrator.evals.plan_quality_report import build_plan_quality_report
 
     return {c['config_name']: c for c in build_plan_quality_report(results)['configs']}
 

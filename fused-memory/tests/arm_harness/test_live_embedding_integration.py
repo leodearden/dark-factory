@@ -13,16 +13,16 @@ from collections.abc import AsyncIterator, Iterable
 from typing import Any
 
 import pytest
-from _fm_helpers import FALKOR_HOST, FALKOR_PORT, await_index_operational, falkor_skipif
+from _fm_falkor_live import FALKOR_HOST, FALKOR_PORT, await_index_operational, falkor_skipif
 from falkordb.asyncio import FalkorDB
 from falkordb.asyncio.graph import AsyncGraph
 from graphiti_core.embedder import EmbedderClient
 
 from arm_harness._fakes import PROTECTED_GRAPHS, embedding_spec
-from arm_harness.test_live_replay_integration import (
+from arm_harness._protected_graphs import (
     CONCURRENT_TEST_GRAPH_PREFIXES,
-    INDEX_DEFINITION_QUERY,
-    _protected_index_definitions,
+    index_definitions,
+    protected_index_definitions,
 )
 from fused_memory.arm_harness.arm_backend import build_scratch_indices, scratch_graphiti_backend
 from fused_memory.arm_harness.arm_embedder import ArmEmbedder, EmbedSettings
@@ -102,10 +102,6 @@ async def _index_builder(base: FusedMemoryConfig) -> AsyncIterator[Any]:
         await backend.close()
 
 
-async def _definitions(graph: AsyncGraph) -> list[Any]:
-    return (await graph.ro_query(INDEX_DEFINITION_QUERY)).result_set
-
-
 async def _vectors(graph: AsyncGraph) -> dict[str, list[float]]:
     return {key: list(vector) for key, vector in (await graph.ro_query(VECTORS_CYPHER)).result_set}
 
@@ -126,13 +122,13 @@ async def test_a_copy_is_re_embedded_and_moved_through_both_index_configurations
     client = FalkorDB(host=FALKOR_HOST, port=FALKOR_PORT)
     reference, copy = _scratch_name(), _scratch_name()
     graphs_before = set(await client.list_graphs())
-    protected_before = await _protected_index_definitions(client, graphs_before)
+    protected_before = await protected_index_definitions(client, graphs_before)
     base = _base(mock_config)
     try:
         async with _index_builder(base) as builder:
             source = client.select_graph(reference)
             await _seed_reference(source, reference, builder)
-            source_definitions = await _definitions(source)
+            source_definitions = await index_definitions(source)
 
             # (2) COPY keeps the topology; whether it carries the source's index catalog
             await copy_reference_graph(client, reference, copy)
@@ -141,7 +137,7 @@ async def test_a_copy_is_re_embedded_and_moved_through_both_index_configurations
             assert topology_hash(*await read_topology(target, copy)) == topology_hash(
                 *reference_topology
             )
-            assert await _definitions(target) == source_definitions, (
+            assert await index_definitions(target) == source_definitions, (
                 'GRAPH.COPY no longer carries the source index catalog'
             )
 
@@ -186,7 +182,7 @@ async def test_a_copy_is_re_embedded_and_moved_through_both_index_configurations
                 target, copy, IndexConfiguration.EMBEDDING_ONLY
             )
             assert bare.passed, bare.detail
-            assert await _definitions(source) == source_definitions
+            assert await index_definitions(source) == source_definitions
 
             # (5) with-indices: ensure_indices rebuilds, and the fulltext probe agrees
             await build_scratch_indices(builder, copy)
@@ -200,7 +196,7 @@ async def test_a_copy_is_re_embedded_and_moved_through_both_index_configurations
             with contextlib.suppress(Exception):
                 await delete_scratch_graph(client, name)
         graphs_after = set(await client.list_graphs())
-        protected_after = await _protected_index_definitions(client, graphs_after)
+        protected_after = await protected_index_definitions(client, graphs_after)
         await client.aclose()
 
     # (6) only scratch graphs came and went; no protected graph's index catalog moved

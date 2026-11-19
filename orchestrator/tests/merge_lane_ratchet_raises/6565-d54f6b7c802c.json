@@ -1,0 +1,114 @@
+{
+  "task_id": "6565",
+  "reason": "Net-additive feature (remote gate): the merge lane gains per-sha gate checkouts on the verify host, the gate-identity handshake, the skew bench class with its sticky/reprobe handling, the deployed-sha heartbeat and a worker-start sweep of a predecessor's skew L1s (liveness.py, types.py, worker.py, drift.py); test_merge_queue_multihost_wiring.py gains three private reads at the allocator seam. New capability and new guards, not a refactor that failed.",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/drift.py::_build_remote_runners",
+      "baseline": 3,
+      "current": 4
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/liveness.py",
+      "baseline": 49,
+      "current": 60
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/types.py",
+      "baseline": 70,
+      "current": 74
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+      "baseline": 2205,
+      "current": 2221
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::_quarantine_unreachable_host",
+      "baseline": 2,
+      "current": 3
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::_record_runner_unavailable",
+      "baseline": 2,
+      "current": 5
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::_reprobe_loop",
+      "baseline": 5,
+      "current": 7
+    },
+    {
+      "measure": "lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/liveness.py",
+      "baseline": 1181,
+      "current": 1342
+    },
+    {
+      "measure": "lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/types.py",
+      "baseline": 1915,
+      "current": 1974
+    },
+    {
+      "measure": "lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+      "baseline": 22326,
+      "current": 22539
+    },
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/test_merge_queue_multihost_wiring.py",
+      "baseline": 358,
+      "current": 361
+    },
+    {
+      "measure": "prose_lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/liveness.py",
+      "baseline": 625,
+      "current": 656
+    },
+    {
+      "measure": "prose_lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/types.py",
+      "baseline": 989,
+      "current": 1012
+    },
+    {
+      "measure": "prose_lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+      "baseline": 12540,
+      "current": 12601
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 4887,
+      "current": 4913
+    },
+    {
+      "measure": "total:lines",
+      "key": "<cluster>",
+      "baseline": 57620,
+      "current": 58047
+    },
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6558,
+      "current": 6567
+    },
+    {
+      "measure": "total:prose_lines",
+      "key": "<cluster>",
+      "baseline": 31688,
+      "current": 31801
+    }
+  ]
+}

@@ -70,8 +70,11 @@ import verify_command_invariants as vci
 from module_budget_family import min_budget
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.module_charter import derive_modules
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from orchestrator import verify, verify_cmd, verify_plan
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 
@@ -232,10 +235,11 @@ _PYTEST = vci.PYTEST
 # compares by SET EQUALITY, not membership — fails naming two flag values as
 # missing directories.
 #
-# The worked precedent is test_skills_module_config_decision.py::
-# _PYTEST_VALUE_FLAGS, which already contains both and is why that guard's
-# target-EXISTS check never went red on the same change. Deliberately NOT
-# widened to that guard's full table: a flag listed here that no command this
+# The worked precedent is verify_command_invariants.py::PYTEST_VALUE_FLAGS,
+# which already contains both and is why
+# test_skills_module_config_decision.py's target-EXISTS check, which passes
+# it, never went red on the same change. Deliberately NOT widened to that
+# full table: a flag listed here that no command this
 # file parses actually uses would read as coverage of a command shape this file
 # never sees, which is the same objection the _NARROWING_FLAGS comment below
 # records against copying ruff's spellings to pyright. This file's ruff and
@@ -394,8 +398,8 @@ def _targets(cmd: str, keyword: str, *, value_flags: frozenset[str] = frozenset(
     side only and that guard went red reporting two flag values as scripts
     suites. Supplying the set is the repair ``vci.positional_targets``' own
     docstring names ("Widening the set is the caller's call"), and the precedent
-    is already in this directory as ``test_skills_module_config_decision.py::
-    _PYTEST_VALUE_FLAGS``.
+    is already in this directory as ``verify_command_invariants.py::
+    PYTEST_VALUE_FLAGS``.
 
     THE TWO ALTERNATIVES WERE REJECTED. Loosening that assertion to membership
     would discard the BIDIRECTIONAL claim it exists to hold — widening either

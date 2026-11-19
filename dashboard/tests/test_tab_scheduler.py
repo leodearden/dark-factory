@@ -14,7 +14,7 @@ from __future__ import annotations
 import re
 
 import pytest
-from _dashboard_helpers import extract_function_body, strip_js_comments
+from _jsx_source_helpers import destructure_bindings, extract_function_body, strip_js_comments
 from _lock_chip_matrix import chip_classes_over_the_matrix
 
 
@@ -551,6 +551,20 @@ def test_cell_state_classifies_through_the_one_lock_classifier(scheduler_heatmap
     assert token not in body, f'cellStateFor still reads or returns `{token}`'
 
 
+def test_modules_view_asks_is_lock_holder_who_waits(tab_scheduler_jsx_body):
+    """ModulesView's waiters leave out a key's holders by asking isLockHolder, not by restating it.
+
+    isLockHolder's behaviour is executed by test_lock_chip_state.py. No jsdom
+    test mounts the Scheduler tab, so this call is pinned at the source seam,
+    as cellStateFor's is above. The drawer's blockingModules and the
+    Orchestrators tab's LocksCell are rendered by
+    dashboard/tests/js/jsx_render.test.mjs instead.
+    """
+    body = strip_js_comments(extract_function_body(tab_scheduler_jsx_body, 'ModulesView'))
+    assert re.search(r'\bisLockHolder\s*\(', body), 'ModulesView does not call isLockHolder'
+    assert 'm.holder !== r.task_id' not in body, 'ModulesView still restates the holder test `m.holder !== r.task_id`'
+
+
 def test_scheduler_heatmap_derives_no_park_map(scheduler_heatmap_jsx_body):
     """The server's modules[].parked_by is the park answer; no client re-derivation."""
     assert 'parkedByModule' not in _heatmap_body(scheduler_heatmap_jsx_body), (
@@ -676,8 +690,6 @@ def test_scheduler_tab_renders_degraded_projects_distinctly(tab_scheduler_jsx_bo
     WIRING assertion rather than a prose pin — a mention in the banner's own
     explanatory comment cannot satisfy it.
     """
-    from _dashboard_helpers import destructure_bindings
-
     body = strip_js_comments(extract_function_body(tab_scheduler_jsx_body, 'SchedulerTab'))
 
     match = re.search(r'const\s*\{(.*?)\}\s*=\s*sched\s*;', body, re.S)

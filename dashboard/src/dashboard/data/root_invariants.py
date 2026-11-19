@@ -24,8 +24,8 @@ from dashboard.data.claimant_invariants import (
     read_claimant_candidates,
 )
 from dashboard.data.escalation_corpus import PendingEscalations
-from dashboard.data.mcp_fanout import project_label
 from dashboard.data.recurrence_gauge import ChainEntry, classify_chains, read_chain_rows
+from dashboard.project_labels import ProjectLabels
 
 _COUNT_SQL = 'SELECT COUNT(*) FROM tasks'
 
@@ -51,10 +51,10 @@ class RootInvariants:
         if problem is not None:
             raise ValueError(f'RootInvariants status {self.status.value!r}: {problem}')
 
-    def to_wire(self) -> dict[str, Any]:
+    def to_wire(self, labels: ProjectLabels) -> dict[str, Any]:
         return {
             'root': str(self.root),
-            'project': project_label(self.root),
+            'project': labels.of(self.root),
             'status': self.status.value,
             'error': self.error,
             'rows_scanned': self.rows_scanned,

@@ -40,7 +40,7 @@ from orchestrator.offline_lane_runs import (
 from orchestrator.verify import (
     FailureKind,
     PytestFailure,
-    _serial_pytest_str,
+    _serial_confirm_pytest_str,
     _with_junitxml_str,
     _with_pytest_timeout_str,
     node_ids_of,
@@ -195,7 +195,7 @@ def serial_confirm_command(
 ) -> str:
     """The narrowed confirm of *ids*: serial, with a per-test timeout, writing junit to *junit_path*."""
     narrowed = _narrowed(cmd, ids)
-    serial = _serial_pytest_str(narrowed, invocation_dir=invocation_dir) or narrowed
+    serial = _serial_confirm_pytest_str(narrowed, invocation_dir=invocation_dir) or narrowed
     timed = _with_pytest_timeout_str(serial, CONFIRM_TEST_TIMEOUT_SECS) or serial
     return _with_junitxml_str(timed, str(junit_path)) or timed
 
@@ -262,14 +262,25 @@ class _Verdict(StrEnum):
     INCONCLUSIVE = 'inconclusive'
 
 
+class InconclusiveReason(StrEnum):
+    CONFIRM_KIND_DIFFERS = 'confirm_kind_differs'
+    CONFIRM_DID_NOT_PASS = 'confirm_did_not_pass'
+    CONFIRM_SESSION_INCOMPLETE = 'confirm_session_incomplete'
+
+
+def inconclusive_reason(node: str, rerun: RunRecord) -> InconclusiveReason | None:
+    """Why *rerun* leaves *node*, which it did not reproduce, inconclusive; ``None`` when it clears it."""
+    if any(failure.node == node for failure in rerun.failures):
+        return InconclusiveReason.CONFIRM_KIND_DIFFERS
+    if rerun.outcomes is not None:
+        return None if rerun.outcomes.get(node) == 'passed' else InconclusiveReason.CONFIRM_DID_NOT_PASS
+    return None if rerun.session_complete else InconclusiveReason.CONFIRM_SESSION_INCOMPLETE
+
+
 def _verdict(node: str, reproduced: set[str], rerun: RunRecord) -> _Verdict:
     if node in reproduced:
         return _Verdict.REPRODUCED
-    if any(failure.node == node for failure in rerun.failures):
-        return _Verdict.INCONCLUSIVE
-    if rerun.outcomes is not None:
-        return _Verdict.CLEARED if rerun.outcomes.get(node) == 'passed' else _Verdict.INCONCLUSIVE
-    return _Verdict.CLEARED if rerun.session_complete else _Verdict.INCONCLUSIVE
+    return _Verdict.CLEARED if inconclusive_reason(node, rerun) is None else _Verdict.INCONCLUSIVE
 
 
 def _nodes_with(verdicts: Mapping[str, _Verdict], wanted: _Verdict) -> tuple[str, ...]:
@@ -328,7 +339,7 @@ async def _confirm_generic(
         command = serial_confirm_command(cmd, ids, invocation_dir=run_cwd, junit_path=junit_path)
     else:
         junit_path = None
-        command = _serial_pytest_str(cmd.command, invocation_dir=run_cwd) or cmd.command
+        command = _serial_confirm_pytest_str(cmd.command, invocation_dir=run_cwd) or cmd.command
     launched = await runner(
         [*nice_prefix('background'), 'sh', '-c', command],
         cwd=run_cwd,

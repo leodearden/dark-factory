@@ -5,10 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import uuid as uuid_mod
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -25,8 +23,11 @@ from shared.cli_invoke import (
 )
 
 from fused_memory.config.schema import ReconciliationConfig
-from fused_memory.models.reconciliation import JournalEntry
-from fused_memory.reconciliation import _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS
+from fused_memory.reconciliation import (
+    _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS,
+    RECONCILIATION_CLI_ENV_OVERRIDES,
+    RECONCILIATION_CLI_SETTING_SOURCES,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -82,10 +83,6 @@ def _cli_failure_payload(origin: str, text: str) -> dict:
     return {'warning': 'no_tool_calls', 'text': text, 'warning_origin': origin}
 
 
-class CircuitBreakerError(Exception):
-    """Raised when mutation count exceeds the per-stage limit."""
-
-
 @dataclass
 class ToolDefinition:
     """Wraps a tool the agent can call."""
@@ -94,9 +91,6 @@ class ToolDefinition:
     description: str
     parameters: dict  # JSON Schema
     function: Callable  # Async callable
-    is_mutation: bool = False
-    target_system: str = ''  # 'graphiti', 'mem0', 'taskmaster'
-    get_before_state: Callable | None = None
 
     def to_anthropic_schema(self) -> ToolParam:
         return {
@@ -134,8 +128,6 @@ class AgentLoop:
         self.tools = tools
         self.terminal_tool = terminal_tool
         self.cli_tools: tuple[str, ...] = tuple(cli_tools)
-        self._journal_entries: list[JournalEntry] = []
-        self._mutation_count: int = 0
         self.llm_call_count: int = 0
         self.token_count: int = 0
         self._usage_gate = usage_gate
@@ -146,12 +138,10 @@ class AgentLoop:
         # Resolved once here so `self.cwd` is always a Path.
         self.cwd: Path = Path(cwd) if cwd is not None else Path(config.explore_codebase_root)
 
-    async def run(self, initial_payload: str) -> tuple[dict, list[JournalEntry]]:
-        """Execute agent loop. Returns (terminal_tool_args, journal_entries)."""
+    async def run(self, initial_payload: str) -> dict:
+        """Execute the agent loop. Returns the terminal tool's arguments, or a warning payload."""
         if self.config.agent_llm_provider == 'claude_cli':
-            # Nothing executes in-process on this transport, so the journal
-            # stays empty.
-            return await self._call_claude_cli(initial_payload), self._journal_entries
+            return await self._call_claude_cli(initial_payload)
 
         messages: list[dict[str, Any]] = [
             {'role': 'user', 'content': initial_payload},
@@ -165,12 +155,11 @@ class AgentLoop:
             # Check for terminal tool in tool_use blocks
             tool_use_blocks = [b for b in response.content if b.type == 'tool_use']
             text_blocks = [b for b in response.content if b.type == 'text']
-            reasoning_text = '\n'.join(b.text for b in text_blocks).strip()
 
             if not tool_use_blocks:
                 # No tool calls — agent stopped
                 text = ' '.join(b.text for b in text_blocks) if text_blocks else ''
-                return {'warning': 'no_tool_calls', 'text': text}, self._journal_entries
+                return {'warning': 'no_tool_calls', 'text': text}
 
             tool_results = []
             terminal_result = None
@@ -186,14 +175,12 @@ class AgentLoop:
                     break
 
                 try:
-                    result = await self._execute_tool(block, reasoning=reasoning_text)
+                    result = await self._execute_tool(block)
                     tool_results.append({
                         'type': 'tool_result',
                         'tool_use_id': block.id,
                         'content': json.dumps(result) if not isinstance(result, str) else result,
                     })
-                except CircuitBreakerError:
-                    raise
                 except Exception as e:
                     logger.error(f'Tool {block.name} failed: {e}')
                     tool_results.append({
@@ -204,16 +191,16 @@ class AgentLoop:
                     })
 
             if terminal_result is not None:
-                return terminal_result, self._journal_entries
+                return terminal_result
 
             # Append assistant message and tool results
             messages.append({'role': 'assistant', 'content': response.content})
             messages.append({'role': 'user', 'content': tool_results})
 
-        return {'warning': 'max_steps_reached'}, self._journal_entries
+        return {'warning': 'max_steps_reached'}
 
-    async def _execute_tool(self, tool_block: Any, reasoning: str = '') -> Any:
-        """Execute a tool call, journal if mutation."""
+    async def _execute_tool(self, tool_block: Any) -> Any:
+        """Execute a tool call."""
         tool_name = tool_block.name
         tool_args = tool_block.input or {}
 
@@ -221,19 +208,6 @@ class AgentLoop:
             return {'error': f'Unknown tool: {tool_name}'}
 
         tool = self.tools[tool_name]
-
-        before_state = None
-        if tool.is_mutation:
-            self._mutation_count += 1
-            if self._mutation_count > self.config.max_mutations_per_stage:
-                raise CircuitBreakerError(
-                    f'Exceeded {self.config.max_mutations_per_stage} mutations in stage'
-                )
-            if tool.get_before_state:
-                try:
-                    before_state = await tool.get_before_state(**tool_args)
-                except Exception:
-                    before_state = None
 
         try:
             result = await asyncio.wait_for(
@@ -243,20 +217,6 @@ class AgentLoop:
         except TimeoutError:
             logger.warning(f'Tool {tool_name} timed out after {self.config.tool_timeout_seconds}s')
             result = {'error': f'Tool {tool_name} timed out after {self.config.tool_timeout_seconds}s'}
-
-        if tool.is_mutation:
-            self._journal_entries.append(
-                JournalEntry(
-                    id=str(uuid_mod.uuid4()),
-                    timestamp=datetime.now(UTC),
-                    operation=tool_name,
-                    target_system=tool.target_system,
-                    before_state=before_state,
-                    after_state=_safe_serialize(result),
-                    reasoning=reasoning,
-                    evidence=[],
-                )
-            )
 
         return result
 
@@ -390,10 +350,11 @@ class AgentLoop:
             # a permission prompt, which keeps the read tools inside cwd unless
             # an allow rule widens them.  This call passes none and reads no
             # settings file, so no user or project allow rule applies either;
-            # one would (measured), and so would managed policy settings.  No
-            # settings file also means the CLI auto-loads no CLAUDE.md.
+            # one would (measured), and so would managed policy settings.
+            # CLAUDE.md and the memory index are kept out by the env overrides.
             permission_mode='dontAsk',
-            setting_sources=[],
+            setting_sources=list(RECONCILIATION_CLI_SETTING_SOURCES),
+            env_overrides=dict(RECONCILIATION_CLI_ENV_OVERRIDES),
             # --tools does not filter MCP, so MCP is closed by the strict empty
             # config.  cwd is the codebase root (tasks 1989/4722), which may
             # hold a live .mcp.json.
@@ -472,15 +433,3 @@ class _ToolUseBlock:
     name: str
     input: dict
     type: str = field(default='tool_use', repr=False)
-
-
-def _safe_serialize(obj: Any) -> dict | None:
-    """Safely convert an object to a dict for journaling."""
-    if obj is None:
-        return None
-    if isinstance(obj, dict):
-        return obj
-    try:
-        return json.loads(json.dumps(obj, default=str))
-    except (TypeError, ValueError):
-        return {'repr': str(obj)}

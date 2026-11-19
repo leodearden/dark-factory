@@ -1,0 +1,18 @@
+{
+  "task_id": "9908",
+  "reason": "Net zero against main: the first-submission age rule moves from merge_lane/intake_buffers.py::_aging_key (cognitive 1 -> 0) to merge_lane/types.py::MergeRequest.first_enqueued_at (+1) so the picker and the merge-pool recording read one rule (heuristic 11) instead of the picker importing a telemetry module.",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/types.py",
+      "baseline": 92,
+      "current": 93
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5194,
+      "current": 5195
+    }
+  ]
+}

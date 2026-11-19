@@ -1,10 +1,9 @@
 """Role-prompt guidance: an earlier `cd` can move every later relative path.
 
-`orchestrator/src/orchestrator/agents/roles.py::_BASH_CAPABLE_ROLE_PREAMBLE`
+`orchestrator/src/orchestrator/agents/harness_guidance.py::BASH_CAPABLE_ROLE_PREAMBLE`
 splices `BASH_CWD_ANCHOR_GUIDANCE` into every role holding unqualified `Bash`.
-It is a leaf module, imported downward by roles.py, only so that already
-oversized file does not grow further. Provenance: reify #7924 via task 5971;
-dark_factory codebook entry-cand-20260729-4.
+It is a leaf module, imported downward by harness_guidance.py. Provenance:
+reify #7924 via task 5971; dark_factory codebook entry-cand-20260729-4.
 
 The mechanical half is
 `orchestrator/src/orchestrator/agents/invoke.py::apply_bash_cwd_reset_env`.

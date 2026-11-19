@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _live_merge_worker import REAL_GIT_MERGE_RESULT_TIMEOUT, running_merge_worker
+from _merge_lane_fakes import lane_scene_config
 from _merge_lane_verifier_doubles import ScriptedVerifier
 from _orch_helpers import make_placeholder_future, wait_responsive
 
@@ -73,7 +74,7 @@ def _make_persistent_config(git_repo: Path, *, persistent: bool) -> Orchestrator
         push_after_advance=False,
         persistent_merge_worktree=persistent,
     )
-    return OrchestratorConfig(project_root=git_repo, git=git)
+    return lane_scene_config(git_repo, git)
 
 
 async def _make_branch_with_file(
@@ -129,7 +130,7 @@ def _make_config(
         persistent_merge_worktree=persistent,
         persistent_merge_worktree_safety_valve_every_n=safety_valve,
     )
-    return OrchestratorConfig(project_root=tmp_path, git=git)
+    return lane_scene_config(tmp_path, git)
 
 
 # ---------------------------------------------------------------------------
@@ -163,7 +164,7 @@ class TestEnforcePersistentWorktreeSerialLane:
     def test_knob_on_bound_1_no_raise(self, tmp_path: Path):
         """persistent_merge_worktree=True + merge_ahead_bound=1 → no raise."""
         from orchestrator.merge_lane.liveness import (
-            enforce_persistent_worktree_serial_lane,  # noqa: PLC0415
+            enforce_persistent_worktree_serial_lane,
         )
 
         cfg = _make_config(tmp_path, persistent=True)
@@ -174,7 +175,7 @@ class TestEnforcePersistentWorktreeSerialLane:
     def test_knob_off_bound_gt1_no_raise(self, tmp_path: Path):
         """persistent_merge_worktree=False + merge_ahead_bound=2 → guard inert."""
         from orchestrator.merge_lane.liveness import (
-            enforce_persistent_worktree_serial_lane,  # noqa: PLC0415
+            enforce_persistent_worktree_serial_lane,
         )
 
         cfg = _make_config(tmp_path, persistent=False)
@@ -428,7 +429,7 @@ class TestPersistentWorktreeVerifyRouting:
 
 def _is_registered_worktree(wt_path: Path, repo: Path) -> bool:
     """Return True if wt_path appears in `git worktree list --porcelain`."""
-    import subprocess  # noqa: PLC0415
+    import subprocess
     result = subprocess.run(
         ['git', 'worktree', 'list', '--porcelain'],
         cwd=str(repo),
@@ -517,7 +518,7 @@ class TestSafetyValveIntegration:
             persistent_merge_worktree=True,
             persistent_merge_worktree_safety_valve_every_n=1,
         )
-        cfg = OrchestratorConfig(project_root=git_repo, git=cfg_git)
+        cfg = lane_scene_config(git_repo, cfg_git)
 
         wt = await _make_branch_with_file(git_ops, 'valve-test', 'valve.py', 'z = 3\n')
         req = _make_merge_request('valve-test', 'valve-test', wt, cfg)

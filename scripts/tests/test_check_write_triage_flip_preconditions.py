@@ -41,7 +41,10 @@ from pathlib import Path
 from types import ModuleType
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from write_triage_attach_fixtures import write_fake_triage
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _HERE = Path(__file__).resolve().parent
 _REPO_ROOT = _HERE.parents[1]
@@ -1787,7 +1790,7 @@ def _run_gate(
     """Execute the gate script DIRECTLY, as DeterministicRunner does.
 
     ``resolve_interpreter=True`` UNSETS the env seam so the gate's own ladder
-    ($REPO/.venv/bin/python3, then `uv run --frozen --project ...`) decides. Those
+    ($REPO/.venv/bin/python3, then `uv run --no-sync --project ...`) decides. Those
     are the branches that run in production; with the seam always set they were
     never executed by any test, so a quoting regression there would ship green
     and surface only as an `exit 127` UNVERIFIABLE on the real gate.
@@ -2027,7 +2030,7 @@ class TestFlipPreconditionsScript:
         """$REPO is interpolated into a command word list, so it must be quoted.
 
         The resolved interpreter is deliberately word-split (the seam may carry
-        a command LIST such as `uv run --frozen --project ... python`), which
+        a command LIST such as `uv run --no-sync --project ... python`), which
         used to break silently the moment $REPO contained a space — the
         interpreter path split into pieces and the gate reported UNVERIFIABLE
         on a judge that passes.

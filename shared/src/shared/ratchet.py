@@ -22,7 +22,7 @@ every comparison, one entry per line in sorted order, and rendering the whole
 text before touching the destination.  Converging the two renderers is a later
 task's to make; reading this as an oversight would be wrong.
 
-``shared/tests/silent_fallthrough_scan.py::reconcile_against_allowlist`` and
+``tests/repo_guards/silent_fallthrough_scan.py::reconcile_against_allowlist`` and
 the loop-blocking ledger are the natural future adopters of this kernel.  The
 PRD names them and deliberately does not schedule them: their unblessed half
 returns site OBJECTS in original order, which is not Counter subtraction and
@@ -135,7 +135,7 @@ WHY THE RULE LIVES IN THE FILE.  A baseline keyed by content digests is
 unreviewable by content — a reviewer looking at the diff sees hex — so the only
 handle they have on it is a statement, at the top of the file they opened, of
 what a legal change to it looks like.  The
-``scripts/merge_lane_metrics.py::BASELINE_README`` convention, matched rather
+``scripts/merge_lane_ratchet.py::BASELINE_README`` convention, matched rather
 than imported (D13)."""
 
 
@@ -275,7 +275,7 @@ class Enumeration:
             parameter change to whoever sees the red.
         complete: Whether the scan read everything it set out to.  ``complete``
             plus a NAMED ``unreadable`` list is the repo's settled INV-11 shape,
-            not an invention — ``scripts/merge_lane_metrics.py::Enumeration``
+            not an invention — ``scripts/merge_lane_cluster.py::Enumeration``
             and ``fused-memory/scripts/census_memory_metadata.py`` both carry
             it.  A bare count would lose the names a refusal message needs.
         unreadable: What the scan skipped, by name.  Non-empty is a
@@ -399,7 +399,7 @@ def _require_comparable(current: Enumeration, baseline: Enumeration) -> None:
 
     ``complete is True`` is an IDENTITY test, not truthiness: an absent or
     unpopulated flag must refuse rather than read as "probably fine", which is
-    the spelling ``scripts/merge_lane_metrics.py::_require_complete_enumeration``
+    the spelling ``scripts/merge_lane_ratchet.py::_require_complete_enumeration``
     uses for the same reason.
 
     The params comparison passes :data:`_ABSENT` to both ``.get`` calls because
@@ -500,7 +500,7 @@ def _render_counts(counts: Mapping[str, int]) -> str:
     """Render the counts block with ONE key per line, in sorted order.
 
     Written here rather than hoisted out of
-    ``scripts/merge_lane_metrics.py::_render_section`` because D13 puts that
+    ``scripts/merge_lane_ratchet.py::_render_section`` because D13 puts that
     file out of scope for this batch and other tasks are about to change it,
     and because its renderer is a hybrid shaped by a different on-disk schema.
     Converging the two is a later task's to make; this is a recorded choice,

@@ -29,6 +29,7 @@ from shared.cli_invoke import (
 )
 from shared.config_dir import TaskConfigDir
 from shared.testing import make_gate_mock
+from shared.testing_resume_rejection import measured_resume_rejection
 
 _INVOKE_PATCH = 'shared.cli_invoke.invoke_claude_agent'
 _SLEEP_PATCH = 'shared.cli_invoke.asyncio.sleep'
@@ -98,7 +99,7 @@ class _Trigger:
 _FRESH_TRIGGERS = {
     'cap-hit-no-session': _Trigger(first=_cap_banner(), detect_cap_hit=[True, False]),
     'failed-resume': _Trigger(
-        first=AgentResult(success=False, output='resume broke', cost_usd=0.5),
+        first=measured_resume_rejection('sess-caller'),
         invoke_kwargs={'resume_session_id': 'sess-caller'},
     ),
     'auth-failed': _Trigger(
@@ -259,10 +260,10 @@ class TestBuilderReturningNoneCancelsTheRetry:
 
     async def test_none_returns_the_last_attempt_unretried_and_never_a_success(self):
         gate = self._two_account_gate()
-        exit_zero_banner = AgentResult(success=True, output='usage limit', cost_usd=0.0)
+        capped_attempt = _cap_banner()
         builder = AsyncMock(return_value=None)
         with (
-            patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[exit_zero_banner]) as inv,
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[capped_attempt]) as inv,
             patch(_SLEEP_PATCH, new_callable=AsyncMock),
         ):
             result = await invoke_with_cap_retry(
@@ -271,7 +272,7 @@ class TestBuilderReturningNoneCancelsTheRetry:
 
         assert inv.await_count == 1
         builder.assert_awaited_once_with()
-        assert result is exit_zero_banner
+        assert result is capped_attempt
         assert result.retry_aborted is True
         assert result.success is False
         assert result.account_name == 'acct-first'

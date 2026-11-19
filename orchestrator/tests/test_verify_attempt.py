@@ -13,6 +13,7 @@ Test coverage:
   step-1: CheckRun — field exposure, .skipped() classmethod, .to_dict() schema
   step-3: VerifyAttempt — derived-property truth table (passed/any_timed_out/
           pure_timeout_failure) + .test/.lint/.type label accessors
+  task 5624: CheckRun.carried_over and VerifyAttempt.with_rerun/wall_secs
 """
 
 from __future__ import annotations
@@ -29,7 +30,7 @@ class TestCheckRun:
     """
 
     def test_fields_exposed(self):
-        from orchestrator.verify import CheckRun  # noqa: PLC0415
+        from orchestrator.verify import CheckRun
 
         run = CheckRun(
             label='test',
@@ -49,7 +50,7 @@ class TestCheckRun:
         assert run.duration_secs == 1.5
 
     def test_skipped_classmethod(self):
-        from orchestrator.verify import CheckRun  # noqa: PLC0415
+        from orchestrator.verify import CheckRun
 
         run = CheckRun.skipped('lint')
         assert run.label == 'lint'
@@ -61,7 +62,7 @@ class TestCheckRun:
         assert run.duration_secs == 0.0
 
     def test_to_dict_schema_keys_exact(self):
-        from orchestrator.verify import CheckRun  # noqa: PLC0415
+        from orchestrator.verify import CheckRun
 
         run = CheckRun(
             label='test',
@@ -75,11 +76,11 @@ class TestCheckRun:
         d = run.to_dict()
         assert set(d) == {
             'label', 'cmd', 'rc', 'output', 'timed_out', 'started_at', 'duration_secs',
-            'segments', 'load', 'slot_wait_secs', 'admission',
+            'segments', 'load', 'slot_wait_secs', 'admission', 'carried_over',
         }
 
     def test_to_dict_started_at_passthrough_when_not_none(self):
-        from orchestrator.verify import CheckRun  # noqa: PLC0415
+        from orchestrator.verify import CheckRun
 
         run = CheckRun(
             label='test', cmd='uv run pytest', rc=0, output='',
@@ -94,13 +95,13 @@ class TestCheckRun:
         ``None``, so ``_persist_attempt_logs``/``_build_summary_payload``
         (which write it straight into JSON) see the same shape as before.
         """
-        from orchestrator.verify import CheckRun  # noqa: PLC0415
+        from orchestrator.verify import CheckRun
 
         run = CheckRun.skipped('lint')
         assert run.to_dict()['started_at'] == ''
 
     def test_to_dict_all_values_roundtrip(self):
-        from orchestrator.verify import CheckRun  # noqa: PLC0415
+        from orchestrator.verify import CheckRun
 
         run = CheckRun(
             label='type', cmd='uv run pyright', rc=2, output='err',
@@ -118,7 +119,28 @@ class TestCheckRun:
             'load': None,
             'slot_wait_secs': None,
             'admission': None,
+            'carried_over': False,
         }
+
+    def test_carried_over_defaults_to_false(self):
+        """Task 5624: a check is this attempt's own run unless with_rerun says otherwise."""
+        from orchestrator.verify import CheckRun
+
+        run = CheckRun(
+            label='test', cmd='uv run pytest', rc=0, output='',
+            timed_out=False, started_at='ts', duration_secs=1.5,
+        )
+        assert run.carried_over is False
+        assert CheckRun.skipped('lint').carried_over is False
+
+    def test_a_check_that_never_ran_cannot_be_carried_over(self):
+        from orchestrator.verify import CheckRun
+
+        with pytest.raises(ValueError, match=r"'lint'.*never ran.*cannot be carried over"):
+            CheckRun(
+                label='lint', cmd=None, rc=0, output='', timed_out=False,
+                started_at=None, duration_secs=0.0, carried_over=True,
+            )
 
     def test_to_dict_serialises_the_admitted_leg(self):
         """Task 5628: the admitted leg the test leg's slot wait ended in."""
@@ -169,7 +191,7 @@ class TestCheckRunSegments:
 
     def test_segments_defaults_to_none(self):
         """Every pre-3338 construction site stays valid — it is the LAST field."""
-        from orchestrator.verify import CheckRun  # noqa: PLC0415
+        from orchestrator.verify import CheckRun
 
         run = CheckRun(
             label='test',
@@ -185,7 +207,7 @@ class TestCheckRunSegments:
 
     def test_skipped_leaves_segments_none(self):
         """A module_config skip ran no command at all, so it ran no segments."""
-        from orchestrator.verify import CheckRun  # noqa: PLC0415
+        from orchestrator.verify import CheckRun
 
         assert CheckRun.skipped('test').segments is None
 
@@ -197,7 +219,7 @@ class TestCheckRunSegments:
         JSON, so anything that needs its own serialisation step is a second
         place for the shape to drift.
         """
-        from orchestrator.verify import CheckRun  # noqa: PLC0415
+        from orchestrator.verify import CheckRun
 
         segments = [
             {
@@ -261,7 +283,7 @@ class TestCheckRunLoad:
 
     def test_load_defaults_to_none(self):
         """Every pre-3353 construction site stays valid — it is the LAST field."""
-        from orchestrator.verify import CheckRun  # noqa: PLC0415
+        from orchestrator.verify import CheckRun
 
         run = CheckRun(
             label='test',
@@ -277,7 +299,7 @@ class TestCheckRunLoad:
 
     def test_load_is_positionally_last(self):
         """`segments` keeps its slot, so a positional caller passing it still works."""
-        from orchestrator.verify import CheckRun  # noqa: PLC0415
+        from orchestrator.verify import CheckRun
 
         run = CheckRun('test', 'cmd', 0, '', False, 'ts', 1.5, [{'index': 1}])
         assert run.segments == [{'index': 1}]
@@ -285,13 +307,13 @@ class TestCheckRunLoad:
 
     def test_skipped_leaves_load_none(self):
         """A module_config skip ran no command, so it ran under no load."""
-        from orchestrator.verify import CheckRun  # noqa: PLC0415
+        from orchestrator.verify import CheckRun
 
         assert CheckRun.skipped('test').load is None
         assert CheckRun.skipped('test').to_dict()['load'] is None
 
     def test_load_round_trips_through_to_dict_unchanged(self):
-        from orchestrator.verify import CheckRun  # noqa: PLC0415
+        from orchestrator.verify import CheckRun
 
         load = {
             'start': {'cpu_some10': 2.5, 'cpu_some60': 1.8, 'runqueue_ratio': 0.75},
@@ -311,7 +333,7 @@ class TestCheckRunLoad:
 
 def _run(label, rc=0, timed_out=False, cmd='cmd', output='', started_at='ts', duration_secs=1.0):
     """Build a CheckRun with sane defaults, overriding only what a case cares about."""
-    from orchestrator.verify import CheckRun  # noqa: PLC0415
+    from orchestrator.verify import CheckRun
 
     return CheckRun(
         label=label, cmd=cmd, rc=rc, output=output, timed_out=timed_out,
@@ -331,7 +353,7 @@ class TestVerifyAttempt:
 
     def test_all_passing_including_a_skipped_check(self):
         """(a) Three rc=0 legs, one of them skipped -> clean pass, no timeout signal."""
-        from orchestrator.verify import CheckRun, VerifyAttempt  # noqa: PLC0415
+        from orchestrator.verify import CheckRun, VerifyAttempt
 
         attempt = VerifyAttempt(checks=[
             _run('test', rc=0),
@@ -348,7 +370,7 @@ class TestVerifyAttempt:
         means `timed_out=(not passed and pure_timeout_failure)` can never be
         False while this is classified as a pure timeout (the 2048 drift
         this task removes structurally)."""
-        from orchestrator.verify import VerifyAttempt  # noqa: PLC0415
+        from orchestrator.verify import VerifyAttempt
 
         attempt = VerifyAttempt(checks=[
             _run('test', rc=1, timed_out=True),
@@ -363,7 +385,7 @@ class TestVerifyAttempt:
         """(c) test has a REAL (non-timeout) failure; type times out ->
         pure_timeout_failure must be False, since not every non-zero rc is
         attributable to a timeout."""
-        from orchestrator.verify import VerifyAttempt  # noqa: PLC0415
+        from orchestrator.verify import VerifyAttempt
 
         attempt = VerifyAttempt(checks=[
             _run('test', rc=1, timed_out=False),
@@ -376,7 +398,7 @@ class TestVerifyAttempt:
     def test_lint_only_pure_timeout(self):
         """(d) A single-check attempt where that lone check timed out is
         still a pure timeout."""
-        from orchestrator.verify import VerifyAttempt  # noqa: PLC0415
+        from orchestrator.verify import VerifyAttempt
 
         attempt = VerifyAttempt(checks=[_run('lint', rc=1, timed_out=True)])
         assert attempt.pure_timeout_failure is True
@@ -387,7 +409,7 @@ class TestVerifyAttempt:
         by run_verification as `[c.label for c in attempt.checks if
         c.timed_out]`) preserves `checks` order rather than e.g. sorting or
         dropping duplicates."""
-        from orchestrator.verify import VerifyAttempt  # noqa: PLC0415
+        from orchestrator.verify import VerifyAttempt
 
         attempt = VerifyAttempt(checks=[
             _run('test', rc=1, timed_out=True),
@@ -404,7 +426,7 @@ class TestVerifyAttempt:
         construction a future caller could make) must fail loudly on
         `.test` rather than raising a bare StopIteration from the
         underlying `next()` call."""
-        from orchestrator.verify import VerifyAttempt  # noqa: PLC0415
+        from orchestrator.verify import VerifyAttempt
 
         attempt = VerifyAttempt(checks=[_run('lint', rc=0)])
         with pytest.raises(KeyError, match="no check labeled 'test'"):
@@ -415,7 +437,7 @@ class TestVerifyAttempt:
         the per-leg consumer sites (env-recovery, _summarize_checks call
         sites, xdist gate, VerifyResult construction) read through these
         instead of the old parallel scalar locals."""
-        from orchestrator.verify import VerifyAttempt  # noqa: PLC0415
+        from orchestrator.verify import VerifyAttempt
 
         test_run = _run('test', cmd='uv run pytest')
         lint_run = _run('lint', cmd='uv run ruff')
@@ -424,3 +446,106 @@ class TestVerifyAttempt:
         assert attempt.test is test_run
         assert attempt.lint is lint_run
         assert attempt.type is type_run
+
+
+def _first_pass(type_run=None):
+    """A first pass whose test leg failed: test rc=4, lint 3.0s green, type 5.0s green."""
+    from orchestrator.verify import LegSlot, VerifyAttempt
+
+    return VerifyAttempt(checks=[
+        _run(LegSlot.TEST, rc=4, output='usage error', started_at='t0', duration_secs=1.0),
+        _run(LegSlot.LINT, rc=0, output='lint ok', started_at='t1', duration_secs=3.0),
+        type_run or _run(LegSlot.TYPE, rc=0, output='type ok', started_at='t2', duration_secs=5.0),
+    ])
+
+
+class TestVerifyAttemptRerun:
+    """Task 5624: the env-recovery retry re-runs only the test leg, so the
+    attempt it produces marks lint/type as carried over from the first pass.
+
+    The verdict properties still read every check (a carried-over leg's result
+    is this attempt's result for that leg); only the attempt's own wall time
+    excludes the legs it did not run.
+    """
+
+    def test_with_rerun_returns_a_new_attempt_carrying_the_other_legs(self):
+        from orchestrator.verify import LegSlot
+
+        first = _first_pass()
+        new_test = _run(LegSlot.TEST, rc=0, started_at='t9', duration_secs=0.5)
+
+        rerun = first.with_rerun(new_test)
+
+        assert rerun is not first
+        assert first.lint.carried_over is False
+        assert first.type.carried_over is False
+        assert rerun.test is new_test
+        assert rerun.test.carried_over is False
+        for carried, original in ((rerun.lint, first.lint), (rerun.type, first.type)):
+            assert carried.carried_over is True
+            assert (carried.rc, carried.output, carried.started_at, carried.duration_secs) == (
+                original.rc, original.output, original.started_at, original.duration_secs,
+            )
+
+    def test_with_rerun_leaves_a_skipped_check_skipped(self):
+        from orchestrator.verify import CheckRun, LegSlot
+
+        first = _first_pass(type_run=CheckRun.skipped(LegSlot.TYPE))
+
+        rerun = first.with_rerun(_run(LegSlot.TEST, rc=0))
+
+        assert rerun.type.cmd is None
+        assert rerun.type.carried_over is False
+
+    def test_with_rerun_of_a_label_the_attempt_lacks_raises_keyerror(self):
+        from orchestrator.verify import LegSlot, VerifyAttempt
+
+        attempt = VerifyAttempt(checks=[_run(LegSlot.TEST, rc=4), _run(LegSlot.LINT)])
+
+        with pytest.raises(KeyError, match="no check labeled 'type'"):
+            attempt.with_rerun(_run(LegSlot.TYPE))
+
+    def test_with_rerun_of_a_label_outside_the_leg_vocabulary_raises_keyerror(self):
+        with pytest.raises(KeyError, match="no check labeled 'bogus'"):
+            _first_pass().with_rerun(_run('bogus'))
+
+    def test_a_carried_over_failure_still_fails_the_attempt(self):
+        from orchestrator.verify import LegSlot, VerifyAttempt
+
+        first = VerifyAttempt(checks=[
+            _run(LegSlot.TEST, rc=4), _run(LegSlot.LINT, rc=1), _run(LegSlot.TYPE, rc=0),
+        ])
+
+        rerun = first.with_rerun(_run(LegSlot.TEST, rc=0))
+
+        assert rerun.passed is False
+        assert rerun.pure_timeout_failure is False
+
+    def test_a_timed_out_rerun_over_green_carried_legs_is_a_pure_timeout(self):
+        from orchestrator.verify import LegSlot
+
+        rerun = _first_pass().with_rerun(_run(LegSlot.TEST, rc=1, timed_out=True))
+
+        assert rerun.any_timed_out is True
+        assert rerun.pure_timeout_failure is True
+
+    def test_a_green_rerun_over_green_carried_legs_passes(self):
+        from orchestrator.verify import LegSlot
+
+        rerun = _first_pass().with_rerun(_run(LegSlot.TEST, rc=0))
+
+        assert rerun.passed is True
+
+    def test_wall_secs_of_a_first_pass_is_max_concurrent_and_sum_serial(self):
+        first = _first_pass()
+
+        assert first.wall_secs(concurrent=True) == pytest.approx(5.0)
+        assert first.wall_secs(concurrent=False) == pytest.approx(9.0)
+
+    def test_wall_secs_after_a_rerun_excludes_the_carried_legs(self):
+        from orchestrator.verify import LegSlot
+
+        rerun = _first_pass().with_rerun(_run(LegSlot.TEST, rc=0, duration_secs=0.5))
+
+        assert rerun.wall_secs(concurrent=True) == pytest.approx(0.5)
+        assert rerun.wall_secs(concurrent=False) == pytest.approx(0.5)

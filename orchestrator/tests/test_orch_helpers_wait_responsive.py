@@ -132,9 +132,9 @@ class TestWaitResponsiveDefaultCapScalesWithNominal:
     Reviewer finding on esc-3980-3: while the default was the flat
     ``RESPONSIVE_WAIT_WALL_CAP`` (90s), a site passing
     ``timeout=MERGE_GATE_BARRIER_TIMEOUT`` (15s) could consume 90s of wall
-    clock while ``_call_wait_budget`` in test_merge_queue_concurrent_verify.py
-    billed it ``min(15 * RESPONSIVE_WAIT_STRETCH, 90)`` = 30s.  That made the
-    AST auditor an UNDER-count rather than an upper bound, and let the true
+    clock while ``_wait_budget_audit.py::_call_wait_budget`` billed it
+    ``min(15 * RESPONSIVE_WAIT_STRETCH, 90)`` = 30s.  That made the AST
+    auditor an UNDER-count rather than an upper bound, and let the true
     worst case for TestLateArrivalCleanCAS overrun its
     ``@pytest.mark.timeout`` -- an ``os._exit()`` of the xdist worker.
 

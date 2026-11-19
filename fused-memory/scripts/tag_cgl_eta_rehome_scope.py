@@ -86,10 +86,7 @@ from fused_memory.maintenance.rehome_scope_tag import (
     scope_tag_for,
 )
 from fused_memory.models.scope import Scope
-from fused_memory.utils.store_mutation_preflight import (
-    StoreMutationUnavailable,
-    assert_store_mutation_allowed,
-)
+from fused_memory.utils.store_mutation_preflight import assert_store_mutation_allowed
 
 logger = logging.getLogger('tag_cgl_eta_rehome_scope')
 
@@ -302,7 +299,7 @@ async def apply_tags(
                     decision['id'], decision['new_content'], scope,
                     metadata=provenance_metadata,
                 )
-            except Exception as exc:  # noqa: BLE001 -- best-effort, mirrors apply_prune
+            except Exception as exc:  # best-effort, mirrors apply_prune
                 logger.warning(
                     'tag_cgl_eta_rehome_scope: failed to update memory %s '
                     '(project %s): %s',
@@ -352,8 +349,8 @@ async def run(
     generated_at = datetime.now(UTC).isoformat()
 
     if known_projects_map is None:
-        from fused_memory.config.schema import FusedMemoryConfig as _FMC  # noqa: PLC0415
-        from fused_memory.models.scope import build_known_projects_map  # noqa: PLC0415
+        from fused_memory.config.schema import FusedMemoryConfig as _FMC
+        from fused_memory.models.scope import build_known_projects_map
         cfg = _FMC()
         known_projects_map = build_known_projects_map(
             cfg.taskmaster.project_root if cfg.taskmaster else '',
@@ -406,22 +403,16 @@ async def run(
     # probe inside it would be downgraded into N warnings while the updates
     # proceeded.
     if args.apply:
-        try:
-            assert_store_mutation_allowed(operation='tag_cgl_eta_rehome_scope --apply')
-        except StoreMutationUnavailable:
-            logger.error(
-                'tag_cgl_eta_rehome_scope: --apply NOT started (fail-closed) '
-                "-- this process cannot write mem0's history directory, so "
+        assert_store_mutation_allowed(
+            operation='tag_cgl_eta_rehome_scope --apply',
+            logger=logger,
+            extra_detail=(
                 'each tag would rewrite a record and then fail to record the '
-                'change, leaving the rehome pool half-tagged and its '
-                'provenance metadata unreconstructable. No record was tagged '
-                'and nothing was mutated. Route the tagging through the '
-                'fused-memory MCP server (the unsandboxed owner of the '
-                'store), or re-run from an unsandboxed operator shell. To '
-                'obtain the tag report safely from anywhere, re-run without '
-                '--apply.'
-            )
-            raise
+                'change, leaving the rehome pool half-tagged and its provenance '
+                'metadata unreconstructable. No record was tagged and nothing was '
+                'mutated.'
+            ),
+        )
 
     # Scan + classify every selected project.
     decisions_by_project: dict[str, list[dict[str, Any]]] = {}
@@ -547,21 +538,16 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.config:
-        import os  # noqa: PLC0415
+        import os
         os.environ['CONFIG_PATH'] = str(args.config)
 
     async def _run_live() -> int:
-        from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
-        from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+        from fused_memory.config.schema import FusedMemoryConfig
+        from fused_memory.maintenance._utils import maintenance_service
 
         config = FusedMemoryConfig()
-        memory = MemoryService(config)
-        await memory.initialize()
-        try:
+        async with maintenance_service(config=config) as (_, memory):
             report = await run(args, memory=memory)
-        finally:
-            if hasattr(memory, 'close'):
-                await memory.close()
         return 1 if report.get('aborted') else 0
 
     return asyncio.run(_run_live())

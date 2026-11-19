@@ -12,24 +12,27 @@ class SuggestionDisposition(StrEnum):
     """What each value tells the steward about where the suggestions went.
 
     NONE: the review carried no suggestions to route.
-    DEDUPED: this TaskWorkflow instance had already routed a byte-identical
-    set as its most recent batch, so nothing was re-sent.
-    CURATOR: one ``submit_task`` post per suggestion was scheduled,
-    fire-and-forget; a delivery failure is logged by ``shared.mcp_post``
-    (task 4023), never reported back.
+    DEDUPED: this TaskWorkflow instance had already DELIVERED a
+    byte-identical set as its most recent batch, so nothing was re-sent.
+    CURATOR: every suggestion was accepted by ``submit_task`` and holds a
+    curator ticket.
+    UNDELIVERED: ``submit_task`` was attempted but at least one suggestion
+    got no curator ticket; a WARNING per suggestion names the reason, and the
+    ``review_issues`` detail carries the content.
     ESCALATION_QUEUE: no MCP transport, so the batch was filed as an info
     escalation for steward triage.
     DROPPED: no MCP transport and no escalation queue; only a WARNING log
     records the batch.
-    ERROR: scoping or scheduling raised before the batch reached any sink,
-    so the ``review_issues`` detail is its only copy.  Out-of-delta
-    suggestions, which the amendment-delta scope routes on its own, are not
-    part of the batch and may already be with the curator.
+    ERROR: scoping or routing raised before submission, so the
+    ``review_issues`` detail is its only copy.  Out-of-delta suggestions,
+    which the amendment-delta scope routes on its own, are not part of the
+    batch and may already be with the curator.
     """
 
     NONE = 'none'
     DEDUPED = 'deduped'
     CURATOR = 'curator'
+    UNDELIVERED = 'undelivered'
     ESCALATION_QUEUE = 'escalation_queue'
     DROPPED = 'dropped'
     ERROR = 'error'

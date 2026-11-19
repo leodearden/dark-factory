@@ -11,14 +11,15 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from orchestrator import session_registry as sr
+from orchestrator import decision_registry as dr
+from orchestrator import session_records
 
 
 def _make_session(**overrides):
     """Mirrors test_app.py/test_decision_queue.py's _make_record convention."""
     fields: dict = {
         'session_slug': 'unblock-df-2085-4242',
-        'status': sr.Status.RUNNING,
+        'status': session_records.Status.RUNNING,
         'title': 'unblock:df#2085 slug',
         'role': 'unblock',
         'project': 'df',
@@ -26,7 +27,7 @@ def _make_session(**overrides):
         'start_ts': '2026-07-07T00:00:00+00:00',
     }
     fields.update(overrides)
-    return sr.SessionRecord(**fields)
+    return session_records.SessionRecord(**fields)
 
 
 def _make_decision(**overrides):
@@ -38,7 +39,7 @@ def _make_decision(**overrides):
         'filed_at': '2026-07-07T00:00:00+00:00',
     }
     fields.update(overrides)
-    return sr.DecisionRecord(**fields)
+    return dr.DecisionRecord(**fields)
 
 
 class TestMergeWeightEdits:
@@ -158,7 +159,7 @@ class TestKnownProjectsOffersCanonicalNamesOnly:
     as the reason it stopped short of this work.
 
     The fold is applied to all three input channels locally and is
-    deliberately redundant with the upstream folds: normalize_project_token
+    deliberately redundant with the upstream folds: fold_project_token
     is idempotent, so it costs nothing, and it makes the guarantee LOCAL to
     the picker rather than contingent on three remote callers (CockpitApp's
     scanner is a DI seam -- a fake or future scanner can hand this function

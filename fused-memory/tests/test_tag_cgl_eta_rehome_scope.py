@@ -20,6 +20,8 @@ from _store_mutation_preflight_contract import (
     neutralise_fixture,
 )
 
+from fused_memory.utils.store_mutation_preflight import StoreMutationUnavailable
+
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'tag_cgl_eta_rehome_scope.py'
 
 
@@ -507,7 +509,7 @@ class TestRunApplyStoreMutationPreflight:
         memory = self._make_memory()
 
         with pytest.raises(
-            _mod.StoreMutationUnavailable, match=SENTINEL
+            StoreMutationUnavailable, match=SENTINEL
         ):
             await _mod.run(
                 self._args(apply=True),
@@ -530,7 +532,7 @@ class TestRunApplyStoreMutationPreflight:
         deny(_mod, monkeypatch)
         memory = self._make_memory()
 
-        with pytest.raises(_mod.StoreMutationUnavailable):
+        with pytest.raises(StoreMutationUnavailable):
             await _mod.run(
                 self._args(apply=True),
                 memory=memory,
@@ -560,9 +562,8 @@ class TestRunApplyStoreMutationPreflight:
         memory.mem0.update.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_apply_is_unchanged_when_the_preflight_passes(self, monkeypatch):
+    async def test_apply_is_unchanged_when_the_preflight_passes(self):
         """Happy path: a writable environment tags exactly as before."""
-        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', lambda **_kw: None)
         memory = self._make_memory()
 
         report = await _mod.run(
@@ -639,7 +640,7 @@ class TestRunApplyStoreMutationPreflight:
 
         with (
             caplog.at_level(logging.ERROR),
-            pytest.raises(_mod.StoreMutationUnavailable),
+            pytest.raises(StoreMutationUnavailable),
         ):
             await _mod.run(
                 self._args(apply=True),
@@ -647,7 +648,8 @@ class TestRunApplyStoreMutationPreflight:
                 known_projects_map=self._known_map(),
             )
 
-        assert fail_closed_records(caplog, 'tag_cgl_eta_rehome_scope'), (
+        (record,) = fail_closed_records(caplog, 'tag_cgl_eta_rehome_scope')
+        assert SENTINEL in record.getMessage(), (
             'nothing else explains this traceback -- the guard site must log '
             'the fail-closed diagnosis before raising; got: '
             f'{[rec.getMessage() for rec in caplog.records]}'

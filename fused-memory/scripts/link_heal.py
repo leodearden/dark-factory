@@ -1,22 +1,32 @@
 #!/usr/bin/env python3
-"""Heal hand-linked mem0 records from a verdict corpus or the link adjudicator.
+"""Heal hand-linked mem0 records from a verdict corpus, the link adjudicator, or
+the deterministic rows alone.
 
 The contract is plans/write-triage-link-healing-prd.md H1 and H2.
 
 Usage:
     python fused-memory/scripts/link_heal.py [--config PATH] [--server-url URL] COMMAND
 
-    plan (--from-corpus PATH | --from-adjudicator [--project P ...]) [--out PATH]
+    plan (--from-corpus PATH | --from-adjudicator [--project P ...]
+          | --deterministic [--project P ...]) [--out PATH]
         Decide every live link, ledger the heals, and write the plan document.
         Writes nothing to the store. --from-adjudicator asks the link
         adjudicator about the links of each --project (default: the server's
         own project) that no deterministic row decides and that it has not
         judged at their current texts, and ledgers its verdicts.
-    apply [--from-adjudicator] [--approved-plan-sha SHA256]
-        Heal the pending plan of the corpus (default) or of the adjudicator,
-        oldest first. With the sha of the pending plan document, every pending
-        heal is applied and the per-run cap is lifted. When the adjudications
-        behind the pending heals pass a share ceiling, nothing is written.
+        --deterministic plans only the heals the deterministic rows decide (a
+        dangling parent, an orchestrator completion record linked as a child)
+        across each --project, asks no verdict source, and reports every other
+        link unexamined.
+    apply [--from-adjudicator | --deterministic | --sweep] [--approved-plan-sha SHA256]
+        Heal the pending plan of the corpus (default), of the adjudicator, of
+        the deterministic rows or of the scheduled sweep, oldest first. With
+        the sha of the pending plan document, every pending heal is applied and
+        the per-run cap is lifted.
+        When the adjudications behind the pending heals pass a share ceiling,
+        nothing is written. --sweep is refused while link_heal.writes is off,
+        and any sweep heal whose verdict came from an adjudicator with no
+        passing calibration is withheld, not written.
     undo --run RUN_ID
         Take back every heal one apply run applied. RUN_ID may be its first 8 characters.
         A run with no heal still applied (a plan run, an undo run, an apply run
@@ -24,10 +34,24 @@ Usage:
     status [--limit N]
         List recent runs, and the latest plan of each source with its document,
         sha and whether it is still the pending plan. Never creates the ledger.
+    sweep [--since ISO_DATETIME] [--project P ...] [--dry-run]
+        The scheduled sweep: plan from the adjudicator over the links whose
+        child was created since the last complete sweep (or since
+        --since, which needs a UTC offset), staging only
+        link_heal.sweep_actions, across each --project (default:
+        link_heal.projects, else the home project). It then heals what it
+        staged only when link_heal.writes is on, --dry-run is absent and the
+        adjudicator's exact model and prompt have a passing calibration. It
+        writes a JSON and Markdown report under the reports dir and files an
+        info escalation naming it.
+    calibrate --ratings PATH --items PATH
+        Score the adjudicator against blind-rated pairs (the soak's
+        adjudications.jsonl and items_all.json), record the result for its
+        model and prompt, and write a report. A failed calibration is escalated.
 
 Exit codes: 0 when the run is complete, or partial only by the cap or stale
-skips; 1 when a heal, read or adjudication failed or the run stopped; 2 when
-the command was refused before any run started.
+skips; 1 when a heal, read or adjudication failed, the run stopped, or a
+calibration failed; 2 when the command was refused before any run started.
 """
 
 from __future__ import annotations
@@ -35,12 +59,14 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import sys
-from collections.abc import AsyncIterator, Callable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -48,7 +74,20 @@ from fused_memory.backends.mem0_client import Mem0Backend
 from fused_memory.config.schema import FusedMemoryConfig, TaskmasterConfig
 from fused_memory.maintenance._utils import override_config_path
 from fused_memory.maintenance.link_adjudicator import LinkAdjudicator, configured_adjudicator
-from fused_memory.maintenance.link_heal import CorpusFormatError, LinkBasis, load_corpus_bases
+from fused_memory.maintenance.link_heal import (
+    CorpusFormatError,
+    LinkBasis,
+    RunCounts,
+    load_corpus_bases,
+)
+from fused_memory.maintenance.link_heal_calibration import (
+    CalibrationInputError,
+    CalibrationItem,
+    CalibrationReport,
+    CalibrationSettings,
+    load_soak_population,
+    run_calibration,
+)
 from fused_memory.maintenance.link_heal_executor import (
     ApprovalMismatch,
     FoldedEscapeFiler,
@@ -72,7 +111,9 @@ from fused_memory.maintenance.link_heal_ledger import (
     RunRow,
     RunSource,
     UnknownRun,
+    plan_document_path,
 )
+from fused_memory.maintenance.link_heal_report import run_headline
 from fused_memory.maintenance.link_heal_store import (
     CensusFailed,
     LinkCensus,
@@ -82,6 +123,7 @@ from fused_memory.maintenance.link_heal_store import (
     ToolCaller,
     server_tool_caller,
 )
+from fused_memory.maintenance.link_heal_sweep import SweepReport, SweepSettings, run_sweep
 from fused_memory.models.scope import resolve_project_id
 
 EXIT_OK = 0
@@ -91,8 +133,11 @@ EXIT_REFUSED = 2
 NO_WRITING_RUN = 'no link-heal run has written here'
 STATUS_COUNTS = (
     'planned', 'applied', 'failed', 'skipped_stale', 'skipped_cap', 'adjudication_failed',
+    'withheld_uncalibrated', 'superseded',
 )
-PLAN_SOURCES = (RunSource.CORPUS, RunSource.ADJUDICATOR)
+PLAN_SOURCES = (
+    RunSource.CORPUS, RunSource.ADJUDICATOR, RunSource.DETERMINISTIC, RunSource.SWEEP,
+)
 
 
 def load_config(config_path: str | None) -> FusedMemoryConfig:
@@ -103,6 +148,14 @@ def load_config(config_path: str | None) -> FusedMemoryConfig:
 
 def config_ledger_dir(config: FusedMemoryConfig) -> Path:
     return Path(config.reconciliation.data_dir).resolve()
+
+
+def config_reports_dir(config: FusedMemoryConfig) -> Path:
+    return config_ledger_dir(config) / 'link-heal-reports'
+
+
+def utc_now() -> datetime:
+    return datetime.now(UTC)
 
 
 def home_project_root(config: FusedMemoryConfig) -> str:
@@ -129,7 +182,9 @@ class LinkHealEnv:
     """What a command reaches beyond its arguments. The defaults are production's.
 
     ``home_root_for`` names the server's own project: escapes file into its queue,
-    and a run with no project of its own probes it.
+    and a run with no project of its own probes it. ``reports_dir_for`` is where
+    sweep and calibration reports go; ``now`` is the clock a sweep's window ends at
+    and both kinds of report are dated by.
     """
 
     config_loader: Callable[[str | None], FusedMemoryConfig] = load_config
@@ -142,6 +197,8 @@ class LinkHealEnv:
     ledger_dir_for: Callable[[FusedMemoryConfig], Path] = config_ledger_dir
     home_root_for: Callable[[FusedMemoryConfig], str] = home_project_root
     adjudicator_for: Callable[[FusedMemoryConfig], LinkAdjudicator] = config_adjudicator
+    reports_dir_for: Callable[[FusedMemoryConfig], Path] = config_reports_dir
+    now: Callable[[], datetime] = utc_now
 
 
 class Refused(Exception):
@@ -150,7 +207,7 @@ class Refused(Exception):
 
 REFUSALS = (
     Refused, RunLockHeld, ApprovalMismatch, UnknownRun, AmbiguousRun, NothingToUndo,
-    CorpusFormatError, CensusFailed,
+    CorpusFormatError, CensusFailed, CalibrationInputError,
 )
 
 
@@ -164,31 +221,74 @@ def build_parser() -> argparse.ArgumentParser:
     )
     commands = parser.add_subparsers(dest='command', required=True)
     plan = commands.add_parser(
-        'plan', help='ledger the heals a corpus or the adjudicator supports; no writes',
+        'plan',
+        help='ledger the heals a corpus, the adjudicator or the deterministic rows support; no writes',
     )
     source = plan.add_mutually_exclusive_group(required=True)
     source.add_argument('--from-corpus', type=Path, metavar='PATH')
     source.add_argument('--from-adjudicator', action='store_true')
+    source.add_argument(
+        '--deterministic', action='store_true',
+        help=(
+            'plan only the heals the deterministic rows decide, a dangling parent or an '
+            'orchestrator completion record linked as a child; asks no verdict source, so '
+            'every other link is unexamined'
+        ),
+    )
     plan.add_argument(
         '--project', action='append', dest='projects', metavar='PROJECT',
-        help='with --from-adjudicator: a project to plan (repeatable; default: the home project)',
+        help=(
+            'with --from-adjudicator or --deterministic: a project to plan '
+            '(repeatable; default: the home project)'
+        ),
     )
     plan.add_argument('--out', type=Path, metavar='PATH', help='where to write the plan')
     apply = commands.add_parser('apply', help='heal the pending plan')
-    apply.add_argument(
-        '--from-adjudicator', action='store_true', help="heal the adjudicator's pending plan",
+    apply_source = apply.add_mutually_exclusive_group()
+    apply_source.add_argument(
+        '--from-adjudicator', dest='source', action='store_const', const=RunSource.ADJUDICATOR,
+        help="heal the adjudicator's pending plan",
     )
+    apply_source.add_argument(
+        '--deterministic', dest='source', action='store_const', const=RunSource.DETERMINISTIC,
+        help="heal the deterministic rows' pending plan",
+    )
+    apply_source.add_argument(
+        '--sweep', dest='source', action='store_const', const=RunSource.SWEEP,
+        help="heal the scheduled sweep's pending plan, e.g. a backlog with --approved-plan-sha",
+    )
+    apply.set_defaults(source=RunSource.CORPUS)
     apply.add_argument('--approved-plan-sha', metavar='SHA256')
     undo = commands.add_parser('undo', help="take back an apply run's heals")
     undo.add_argument('--run', required=True, metavar='RUN_ID')
     status = commands.add_parser('status', help='list recent runs')
     status.add_argument('--limit', type=int, default=10)
+    sweep = commands.add_parser(
+        'sweep', help='the scheduled sweep: adjudicate new links, record, report; writes gated',
+    )
+    sweep.add_argument(
+        '--since', metavar='ISO_DATETIME',
+        help='examine children created since then, with a UTC offset (default: the last sweep)',
+    )
+    sweep.add_argument(
+        '--project', action='append', dest='projects', metavar='PROJECT',
+        help='a project to sweep (repeatable; default: link_heal.projects, else the home project)',
+    )
+    sweep.add_argument('--dry-run', action='store_true', help='record and report; never write')
+    calibrate = commands.add_parser(
+        'calibrate', help='score the adjudicator against blind-rated pairs; no writes',
+    )
+    calibrate.add_argument('--ratings', type=Path, required=True, metavar='PATH')
+    calibrate.add_argument('--items', type=Path, required=True, metavar='PATH')
     return parser
 
 
 def exit_code(report: RunReport) -> int:
     """0 when complete or partial only by the cap or stale skips; 1 otherwise."""
-    counts = report.counts
+    return _counts_exit_code(report.counts)
+
+
+def _counts_exit_code(counts: RunCounts) -> int:
     failed = (
         counts.failed,
         counts.read_failed,
@@ -207,6 +307,45 @@ def report_document(report: RunReport) -> dict[str, Any]:
         'plan_sha256': report.plan_sha256,
         'counts': report.counts.as_json(),
     }
+
+
+def sweep_document(report: SweepReport) -> dict[str, Any]:
+    view = report.view
+    return {
+        **run_headline(view),
+        'outcome': 'complete' if report.complete else 'partial',
+        'report_path': str(report.report_path),
+        'report_json': str(report.json_path),
+        'escalation_id': report.escalation_id,
+        'report_unwritten': report.report_unwritten,
+        'counts': {
+            'plan': view.plan.counts.as_json(),
+            'apply': None if view.apply is None else view.apply.counts.as_json(),
+        },
+    }
+
+
+def calibration_document(report: CalibrationReport) -> dict[str, Any]:
+    return {
+        'run_id': report.run_id,
+        'passed': report.passed,
+        'failures': [failure.describe() for failure in report.result.failures],
+        'report_path': str(report.markdown_path),
+        'report_json': str(report.json_path),
+        'escalation_id': report.escalation_id,
+    }
+
+
+@dataclass(frozen=True)
+class CommandOutcome:
+    """What a run command prints, and the code it exits with."""
+
+    document: Mapping[str, Any]
+    code: int
+
+    @classmethod
+    def of_run(cls, report: RunReport) -> CommandOutcome:
+        return cls(report_document(report), exit_code(report))
 
 
 def render_status(ledger_path: Path, limit: int) -> str:
@@ -306,7 +445,7 @@ def _load_corpus(path: Path) -> tuple[LinkBasis, ...]:
 
 def _plan_path_for(out: Path | None, ledger_dir: Path) -> Callable[[str], Path]:
     if out is None:
-        return lambda run_id: ledger_dir / f'link-heal-plan-{run_id[:8]}.json'
+        return lambda run_id: plan_document_path(ledger_dir, run_id)
     plan_path = out.absolute()
     if not plan_path.parent.is_dir():
         raise Refused(
@@ -318,14 +457,21 @@ def _plan_path_for(out: Path | None, ledger_dir: Path) -> Callable[[str], Path]:
 async def _plan(args: argparse.Namespace, session: _Session) -> RunReport:
     if args.from_adjudicator:
         return await _plan_from_adjudicator(args, session)
+    if args.deterministic:
+        return await _plan_deterministic(args, session)
     if args.projects:
-        raise Refused('--project applies only to --from-adjudicator')
+        raise Refused('--project applies only to --from-adjudicator and --deterministic')
     return await _plan_from_corpus(args, session)
+
+
+def _named_projects(args: argparse.Namespace, session: _Session) -> list[str]:
+    """Each --project once, in the order named; the home project when none is."""
+    return list(dict.fromkeys(args.projects or [resolve_project_id(session.home_root)]))
 
 
 async def _plan_from_adjudicator(args: argparse.Namespace, session: _Session) -> RunReport:
     plan_path_for = _plan_path_for(args.out, session.ledger_dir)
-    projects = list(dict.fromkeys(args.projects or [resolve_project_id(session.home_root)]))
+    projects = _named_projects(args, session)
     await session.probe(projects[0])
     async with session.env.census_for(session.config) as census:
         return await run_adjudicator_plan(
@@ -335,6 +481,23 @@ async def _plan_from_adjudicator(args: argparse.Namespace, session: _Session) ->
             ledger=session.ledger,
             limits=session.limits,
             projects=projects,
+            plan_path_for=plan_path_for,
+        )
+
+
+async def _plan_deterministic(args: argparse.Namespace, session: _Session) -> RunReport:
+    plan_path_for = _plan_path_for(args.out, session.ledger_dir)
+    projects = _named_projects(args, session)
+    await session.probe(projects[0])
+    async with session.env.census_for(session.config) as census:
+        return await run_plan(
+            (),
+            store=session.store,
+            census=census,
+            ledger=session.ledger,
+            limits=session.limits,
+            projects=projects,
+            source=RunSource.DETERMINISTIC,
             plan_path_for=plan_path_for,
         )
 
@@ -359,14 +522,18 @@ async def _plan_from_corpus(args: argparse.Namespace, session: _Session) -> RunR
 
 
 async def _apply(args: argparse.Namespace, session: _Session) -> RunReport:
-    source = RunSource.ADJUDICATOR if args.from_adjudicator else RunSource.CORPUS
-    await session.probe(_first_project(session.ledger.pending_actions(source)))
+    if args.source is RunSource.SWEEP and not session.config.link_heal.writes:
+        raise Refused(
+            'apply --sweep: sweep heals are written only while link_heal.writes is on; '
+            'no run was started',
+        )
+    await session.probe(_first_project(session.ledger.pending_actions(args.source)))
     return await run_apply(
         store=session.store,
         ledger=session.ledger,
         limits=session.limits,
         filer=FoldedEscapeFiler(session.home_root),
-        source=source,
+        source=args.source,
         approved_plan_sha256=args.approved_plan_sha,
     )
 
@@ -379,12 +546,108 @@ async def _undo(args: argparse.Namespace, session: _Session) -> RunReport:
     )
 
 
-_RUN_COMMANDS = {'plan': _plan, 'apply': _apply, 'undo': _undo}
+def _since(text: str | None, now: datetime) -> datetime | None:
+    """--since as an aware datetime before *now*; refused otherwise."""
+    if text is None:
+        return None
+    try:
+        since = datetime.fromisoformat(text)
+    except ValueError as exc:
+        raise Refused(f'--since {text!r} is not an ISO datetime ({exc})') from exc
+    if since.tzinfo is None:
+        raise Refused(
+            f'--since {text!r} has no UTC offset; give one, e.g. 2026-10-11T00:00:00+00:00',
+        )
+    if since >= now:
+        raise Refused(f'--since {since.isoformat()} is not before now ({now.isoformat()})')
+    return since
+
+
+def _sweep_settings(args: argparse.Namespace, session: _Session) -> SweepSettings:
+    """The sweep's settings over each --project, else link_heal.projects, else the home project."""
+    named = args.projects or session.config.link_heal.projects
+    projects = list(dict.fromkeys(named or [resolve_project_id(session.home_root)]))
+    try:
+        return SweepSettings.from_config(
+            session.config.link_heal, projects=projects, dry_run=args.dry_run,
+        )
+    except ValueError as exc:
+        raise Refused(str(exc)) from exc
+
+
+async def _sweep(args: argparse.Namespace, session: _Session) -> CommandOutcome:
+    now = session.env.now()
+    since = _since(args.since, now)
+    settings = _sweep_settings(args, session)
+    await session.probe(settings.projects[0])
+    async with session.env.census_for(session.config) as census:
+        report = await run_sweep(
+            adjudicate=session.env.adjudicator_for(session.config),
+            store=session.store,
+            census=census,
+            ledger=session.ledger,
+            limits=session.limits,
+            settings=settings,
+            filer=FoldedEscapeFiler(session.home_root),
+            reports_dir=session.env.reports_dir_for(session.config),
+            now=now,
+            since=since,
+        )
+    code = max(_counts_exit_code(run.counts) for run in report.view.runs)
+    if report.report_unwritten is not None:
+        code = EXIT_FAILED
+    return CommandOutcome(sweep_document(report), code)
+
+
+def _calibration_input(ratings: Path, items: Path) -> tuple[tuple[CalibrationItem, ...], str]:
+    """The rated population, and the sha256 naming the two files it was read from."""
+    try:
+        population = load_soak_population(ratings, items)
+        digest = hashlib.sha256()
+        for path in (ratings, items):
+            digest.update(hashlib.sha256(path.read_bytes()).digest())
+    except OSError as exc:
+        raise Refused(f'cannot read the calibration input: {exc}') from exc
+    return population, digest.hexdigest()
+
+
+async def _calibrate(args: argparse.Namespace, session: _Session) -> CommandOutcome:
+    population, population_sha256 = _calibration_input(args.ratings, args.items)
+    report = await run_calibration(
+        population,
+        adjudicate=session.env.adjudicator_for(session.config),
+        ledger=session.ledger,
+        settings=CalibrationSettings.from_config(session.config.link_heal),
+        filer=FoldedEscapeFiler(session.home_root),
+        reports_dir=session.env.reports_dir_for(session.config),
+        population_sha256=population_sha256,
+        now=session.env.now(),
+    )
+    return CommandOutcome(calibration_document(report), EXIT_OK if report.passed else EXIT_FAILED)
+
+
+_RunCommand = Callable[[argparse.Namespace, _Session], Awaitable[CommandOutcome]]
+
+
+def _heal_run(command: Callable[[argparse.Namespace, _Session], Awaitable[RunReport]]) -> _RunCommand:
+    """*command*, its one run reported the way every heal run is."""
+    async def outcome(args: argparse.Namespace, session: _Session) -> CommandOutcome:
+        return CommandOutcome.of_run(await command(args, session))
+    return outcome
+
+
+_RUN_COMMANDS: Mapping[str, _RunCommand] = {
+    'plan': _heal_run(_plan),
+    'apply': _heal_run(_apply),
+    'undo': _heal_run(_undo),
+    'sweep': _sweep,
+    'calibrate': _calibrate,
+}
 
 
 async def _run_command(
     args: argparse.Namespace, config: FusedMemoryConfig, env: LinkHealEnv, ledger_dir: Path,
-) -> RunReport:
+) -> CommandOutcome:
     server_url = args.server_url or f'http://127.0.0.1:{config.server.port}'
     ledger_dir.mkdir(parents=True, exist_ok=True)
     with RunLock(ledger_dir / LOCK_FILENAME):
@@ -412,12 +675,12 @@ async def run(argv: Sequence[str], env: LinkHealEnv) -> int:
         print(render_status(ledger_dir / LEDGER_FILENAME, args.limit))
         return EXIT_OK
     try:
-        report = await _run_command(args, config, env, ledger_dir)
+        outcome = await _run_command(args, config, env, ledger_dir)
     except REFUSALS as refusal:
         print(f'link-heal {args.command} refused: {refusal}', file=sys.stderr)
         return EXIT_REFUSED
-    print(json.dumps(report_document(report), indent=2, sort_keys=True))
-    return exit_code(report)
+    print(json.dumps(outcome.document, indent=2, sort_keys=True))
+    return outcome.code
 
 
 def main() -> int:

@@ -23,9 +23,12 @@ Shape contract (returned by collect_scheduler_state):
 
     modules: list[dict]  — one per unique module path that appears in any lock set:
         path        str
-        holder      str | None   task_id of in-flight holder, or None
+        holders     list[str]    every in-flight holder's task_id, sorted
+        holder      str | None   holders[0], for display, or None
+        at_holder_limit bool     True iff the holders fill the key's holder limit
         holder_live bool | None  True/False iff a holder exists and the live set
-                                 is known; None otherwise (unknown, never departed)
+                                 is known (True when ANY holder is live); None
+                                 otherwise (unknown, never departed)
         contention  int          count of tasks whose lock_set includes this path
         sorted by contention desc, ties broken alphabetically by path
 
@@ -71,6 +74,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -85,8 +89,11 @@ from shared.scheduler_state import (
 
 from dashboard.config import DashboardConfig
 from dashboard.data.active_tasks import collect_tasks_with_counts
-from dashboard.data.mcp_fanout import TTLCache, fanout_label, first_success, project_label
+from dashboard.data.datum import Datum, DatumState, unknown_datum
+from dashboard.data.lock_contention import key_holders_in, lock_wanters
+from dashboard.data.mcp_fanout import TTLCache, fanout_label, first_success
 from dashboard.data.memory import mcp_tool_call
+from dashboard.data.served_read import ServedRead
 from dashboard.data.task_snapshot import SnapshotHealth, classify
 from dashboard.data.utils import resolve_now
 
@@ -160,8 +167,95 @@ _scheduler_cache: TTLCache[tuple[tuple, str]] = TTLCache(
 )
 
 
+SCHEDULER_STATE_TTL_SECONDS: float = 5.0
+"""Age below which a root's scheduler state is served without a new read: the collection's own TTL."""
+
+SCHEDULER_STATE_FRESHNESS_BOUND_SECONDS = 30
+"""The scheduler-state Datum's freshness bound, six TTLs."""
+
+SCHEDULER_STATE_READ_TIMEOUT = 45.0
+"""Whole-read bound on one root's ``get_scheduler_state``, across every URL.
+
+Above the Scheduler tab's handler deadline (``TASKS_BUDGET.total``, 20 s) and
+the browser's 30 s fetch abort, so the bound never cuts short an answer the tab
+could have delivered: its offline classification is the one it had before the
+read was bounded. It still ends a hung read, so the cache's single flight is
+freed.
+"""
+
+SCHEDULER_STATE_REQUEST_WAIT_SECONDS = 4.0
+"""Longest a ``/prds`` request waits on an in-flight scheduler-state read before
+it is served the last good state (or unknown); the read still lands for the next poll."""
+
+_scheduler_state: ServedRead[str, SchedulerStateSnapshot] = ServedRead(
+    ttl_seconds=lambda: SCHEDULER_STATE_TTL_SECONDS,
+    freshness_bound_seconds=SCHEDULER_STATE_FRESHNESS_BOUND_SECONDS,
+)
+
+
+async def acquire_scheduler_state(
+    client: httpx.AsyncClient,
+    config: DashboardConfig,
+    root: str | os.PathLike[str],
+    *,
+    now: datetime,
+    wait_seconds: float | None = None,
+) -> Datum[SchedulerStateSnapshot]:
+    """*root*'s scheduler state, read through the first URL that answers.
+
+    The one access path to the scheduler state for the Scheduler tab and the
+    PRD view's contention line. The Datum is measured at the *now* of the
+    request whose read it is; the snapshot keeps the file's own
+    ``snapshot_at``. A reply that is not a snapshot is a ``lower_bound``
+    empty snapshot; every URL failing is unknown, or the last good snapshot
+    ``stale``.
+    """
+    labels = config.project_labels
+    bound = SCHEDULER_STATE_FRESHNESS_BOUND_SECONDS
+
+    async def call(url: str) -> Datum[SchedulerStateSnapshot]:
+        reply = await mcp_tool_call(client, url, 'get_scheduler_state', {'project_root': str(root)})
+        try:
+            return Datum(SchedulerStateSnapshot.from_json(reply), now, DatumState.FRESH, None, bound)
+        except MalformedSnapshotError as exc:
+            logger.warning(
+                'get_scheduler_state[%s] reply is not a scheduler snapshot; '
+                'showing the project as online but empty: %s',
+                labels.of(root), exc,
+            )
+            return Datum(
+                SchedulerStateSnapshot.empty(), now, DatumState.LOWER_BOUND,
+                f'get_scheduler_state reply did not parse as a scheduler snapshot: {exc}', bound,
+            )
+
+    def every_url_failed(errors: list[str]) -> Datum[SchedulerStateSnapshot]:
+        return unknown_datum(f'get_scheduler_state failed on every URL: {"; ".join(errors)}', bound)
+
+    async def read() -> Datum[SchedulerStateSnapshot]:
+        try:
+            return await asyncio.wait_for(
+                first_success(
+                    config.fused_memory_urls, call,
+                    log_label=fanout_label('get_scheduler_state', root, labels),
+                    offline_result=every_url_failed,
+                ),
+                SCHEDULER_STATE_READ_TIMEOUT,
+            )
+        except TimeoutError:
+            return unknown_datum(
+                f'get_scheduler_state exceeded its {SCHEDULER_STATE_READ_TIMEOUT}s budget', bound,
+            )
+
+    return await _scheduler_state.serve(str(root), read, now=now, wait_seconds=wait_seconds)
+
+
+def clear_scheduler_state() -> None:
+    """Forget every root's scheduler state (test/admin hook)."""
+    _scheduler_state.clear()
+
+
 def _scheduler_cache_clear() -> None:
-    """Clear the scheduler snapshot TTL cache and reset its refresh lock.
+    """Clear the scheduler snapshot TTL cache, its refresh lock, and the scheduler state.
 
     Test/admin hook.  Delegates to ``TTLCache.clear()``, which resets both
     the stored entry and the per-key ``asyncio.Lock`` — preventing "got
@@ -170,6 +264,7 @@ def _scheduler_cache_clear() -> None:
     test functions.
     """
     _scheduler_cache.clear()
+    clear_scheduler_state()
 
 
 async def get_scheduler_snapshot(
@@ -223,39 +318,41 @@ async def get_scheduler_snapshot(
 
 def _module_contention_counts(
     rows: list[dict],
-    current_holders: Mapping[str, str],
+    snapshot: SchedulerStateSnapshot,
     *,
     project: str | None = None,
     park_stacks: _ParkStacks | None = None,
     live_task_ids: set[str] | None = None,
 ) -> list[dict]:
-    """Build a sorted module-contention list from task rows and current holders.
+    """Build a sorted module-contention list from task rows and the snapshot's lock holders.
 
     For each module path that appears in any task's ``lock_set`` **or** in
     ``park_stacks`` keys, count how many live tasks include it and attach park
-    ownership data.
+    ownership data.  Counting and holder resolution are
+    ``dashboard/src/dashboard/data/lock_contention.py``'s, the rule the PRD
+    view's contention line shares.
 
-    The holder for a module is resolved via the shared hierarchical prefix rule
+    A module's holders are resolved via the shared hierarchical prefix rule
     (``modules_conflict``), not dict-equality, so a holder key that is a
     sub-``lock_depth`` parent of the module still matches.  Both *rows*'
-    ``lock_set`` and *current_holders* keys are normalized module locks.
+    ``lock_set`` and the snapshot's held keys are normalized module locks.
     The same rule is used to match *park_stacks* keys to contended paths so
     park and holder resolution stay consistent.
 
     Args:
         rows:            Task row dicts, each with ``task_id`` and ``lock_set``
                          (normalized module locks).
-        current_holders: ``{module_path: task_id}`` from the scheduler snapshot
-                         (module keys normalized to lock_depth).
+        snapshot:        The project's scheduler snapshot: who holds each key
+                         (``holders_by_key``) and its holder limit
+                         (``holder_limit``), module keys normalized to lock_depth.
         project:         Optional project label to tag each module entry with.
                          Module paths are NOT globally unique (two projects can
                          each have ``src/utils.py``), so we propagate the
                          owning project label on every module so the merge
                          step can key by ``(project, path)`` without conflating
                          unrelated contention.  When set and a holder exists,
-                         ``holder_project`` is also populated — the snapshot's
-                         ``current_holders`` map only contains task_ids from
-                         the same project root.
+                         ``holder_project`` is also populated — the snapshot
+                         only names task_ids from the same project root.
         park_stacks:     Optional ``{module_key: [entry, ...]}`` from
                          ``snapshot.park_stacks``.  Each stack is in
                          bottom→top order (``stack[-1]`` is the active top).
@@ -271,12 +368,16 @@ def _module_contention_counts(
                          ``park_stacks`` is also ``None``.
 
     Returns:
-        ``[{path, holder, contention, project, holder_project, holder_live,
-            parked_by, parked_by_project, parked_owner_live, park_stack}, ...]``
+        ``[{path, holders, holder, at_holder_limit, contention, project,
+            holder_project, holder_live, parked_by, parked_by_project,
+            parked_owner_live, park_stack}, ...]``
         sorted by contention descending, ties broken alphabetically by path.
 
-        holder_live  bool | None  True/False iff a holder exists and
-                     *live_task_ids* was supplied
+        holders          list[str]    every task holding a conflicting key, sorted
+        holder           str | None   holders[0], for display
+        at_holder_limit  bool         True iff the holders fill the key's limit
+        holder_live      bool | None  True iff ANY holder is in *live_task_ids*;
+                         None unless a holder exists and *live_task_ids* was supplied
 
         New additive fields (inert when *park_stacks* is ``None``):
           parked_by        str | None  active-top park owner (stack[-1]) if any
@@ -284,10 +385,7 @@ def _module_contention_counts(
           parked_owner_live bool       True iff parked_by is in live_task_ids
           park_stack       list[dict]  stack entries each enriched with ``live``
     """
-    counts: dict[str, int] = {}
-    for row in rows:
-        for path in row.get('lock_set') or []:
-            counts[path] = counts.get(path, 0) + 1
+    counts = lock_wanters(row.get('lock_set') or [] for row in rows)
 
     # All paths to produce entries for: contended paths ∪ park_stacks keys.
     # A fully-stranded module (dead park, no live waiters) has no entry in
@@ -311,21 +409,14 @@ def _module_contention_counts(
     }
     all_paths = contended_paths | park_only_keys
 
+    holders_of = key_holders_in(snapshot)
     result: list[dict] = []
     for path in all_paths:
         count = counts.get(path, 0)
-        # Resolve the holder via the shared hierarchical prefix rule rather than
-        # dict-equality.  Both *path* (a normalized module key) and the
-        # current_holders keys are normalized to lock_depth, so the common case
-        # is an exact match — but a holder key with fewer than lock_depth
-        # components (a sub-depth parent) still conflicts with this child
-        # module, and modules_conflict catches it where `.get(path)` would miss.
-        holder = next(
-            (tid for mod, tid in current_holders.items() if modules_conflict(mod, path)),
-            None,
-        )
+        held = holders_of(path)
+        holder = held.holders[0] if held.holders else None
         holder_live = (
-            (holder in live_task_ids)
+            any(h in live_task_ids for h in held.holders)
             if (holder is not None and live_task_ids is not None)
             else None
         )
@@ -356,14 +447,16 @@ def _module_contention_counts(
 
         result.append({
             'path': path,
+            'holders': list(held.holders),
             'holder': holder,
+            'at_holder_limit': held.at_limit,
             'contention': count,
             # `project` scopes this module entry; `holder_project` qualifies
             # the holder task_id since taskmaster ids are project-scoped.
             'project': project,
             'holder_project': project if holder else None,
-            # The holder's liveness against the same live_task_ids that sets
-            # parked_owner_live; None when unknown.
+            # Whether any holder is live, against the same live_task_ids that
+            # sets parked_owner_live; None when unknown.
             'holder_live': holder_live,
             # Park ownership — additive fields; inert when park_stacks is None.
             'parked_by': parked_by,
@@ -435,7 +528,7 @@ def _stranded_park_rows(
     Args:
         park_stacks:   ``{module_key: [entry, ...]}`` from the scheduler
                        snapshot; entry fields are owned by
-                       ``orchestrator/src/orchestrator/scheduler.py::ModuleLockTable.snapshot_park_stacks``.
+                       ``orchestrator/src/orchestrator/lock_table.py::ModuleLockTable.snapshot_park_stacks``.
         live_task_ids: Set of task_ids present in the active-tasks snapshot
                        (``{r['task_id'] for r in rows}``).  Owners in this
                        set are live and are skipped.
@@ -696,12 +789,12 @@ async def collect_scheduler_state(
                           ``rows`` and ``modules``: with no task rows, no
                           owner's liveness is known.
 
-    Snapshot data is joined to its root by position, so two roots sharing a
-    basename keep their own pin queue, park stacks and ``project_root``; the
-    label-keyed outputs (task rows, sparkline and recovery keys, module
-    contention) still collapse them.
+    Snapshot data is joined to its root by position. Every label-keyed output
+    is keyed by labels unique across the configured roots
+    (``dashboard/project_labels.py::ProjectLabels``).
     """
     effective_now = resolve_now(now)
+    labels = config.project_labels
     since = effective_now - timedelta(hours=1)
 
     # Fetch active tasks (for lock sets and titles).
@@ -717,24 +810,19 @@ async def collect_scheduler_state(
     # Determine which project roots still need querying
     roots_to_query = [
         root for root in config.all_project_roots
-        if project_label(root) not in offline_projects
+        if labels.of(root) not in offline_projects
     ]
 
     async def _one_project(root) -> tuple[SchedulerStateSnapshot | None, list[dict], list[dict]]:
         """Fetch snapshot + skip events + recovery events for one project root.
 
-        Delegates the per-URL failover to ``mcp_fanout.first_success``: URLs
-        are tried sequentially and the first success wins; on a transport
-        error or soft failure the failing URL's cached MCP session is
-        invalidated and the next URL is tried.
-
-        Simplicity trade-off: if the snapshot call succeeds on url1 but either
-        events call raises, the whole TRIPLE is re-issued against url2 rather
-        than retrying only the failing leg — all three calls live inside one
-        ``_call(url)`` coroutine, so a failure anywhere in it re-runs all three
-        on the next URL.  This amplifies load slightly on the surviving URL but
-        keeps the retry logic single-axis; the calls are idempotent and small,
-        so the re-fetch is cheap.
+        The snapshot is :func:`acquire_scheduler_state`'s datum, which fails
+        over across URLs on its own. The two events calls share one
+        ``mcp_fanout.first_success`` of their own: URLs are tried sequentially
+        and the first URL answering both wins; on a transport error or soft
+        failure the failing URL's cached MCP session is invalidated and the
+        next URL is tried. A snapshot from url1 can therefore be paired with
+        events from url2; both replicas read the same root's files.
 
         The two events calls are deliberately SEPARATE requests rather than one
         widened ``event_types`` list — see ``_RECOVERY_EVENTS_LIMIT``: sharing
@@ -749,9 +837,10 @@ async def collect_scheduler_state(
         transport failure).  Returns ``(None, [], [])`` when every URL fails;
         the ``None`` sentinel lets the caller distinguish *offline* from
         *online-but-empty* so a legitimately quiescent project is never
-        misclassified as offline.
+        misclassified as offline. A ``stale`` snapshot is a failed latest read
+        (its TTL sits far inside its bound), so it is offline too.
         """
-        label = project_label(root)
+        label = labels.of(root)
 
         async def _fetch_events(
             url: str, event_types: list[str], limit: int, kind: str,
@@ -789,22 +878,11 @@ async def collect_scheduler_state(
                 )
             return events
 
-        async def _call(url: str) -> tuple[SchedulerStateSnapshot, list[dict], list[dict]]:
-            reply = await mcp_tool_call(
-                client,
-                url,
-                'get_scheduler_state',
-                {'project_root': str(root)},
-            )
-            try:
-                snapshot = SchedulerStateSnapshot.from_json(reply)
-            except MalformedSnapshotError as exc:
-                logger.warning(
-                    'get_scheduler_state[%s] reply is not a scheduler snapshot; '
-                    'showing the project as online but empty: %s',
-                    label, exc,
-                )
-                snapshot = SchedulerStateSnapshot.empty()
+        state = await acquire_scheduler_state(client, config, root, now=effective_now)
+        if state.value is None or state.state is DatumState.STALE:
+            return None, [], []
+
+        async def _call(url: str) -> tuple[list[dict], list[dict]]:
             skip_events = await _fetch_events(
                 url, _SKIP_EVENT_TYPES, _SCHEDULER_EVENTS_LIMIT, 'skip',
             )
@@ -812,19 +890,18 @@ async def collect_scheduler_state(
                 url, list(_RECOVERY_EVENT_TYPES), _RECOVERY_EVENTS_LIMIT,
                 'recovery',
             )
-            return snapshot, skip_events, recovery_events
+            return skip_events, recovery_events
 
-        snapshot, skip_events, recovery_events = await first_success(
+        events = await first_success(
             config.fused_memory_urls,
             _call,
-            # String-identical to the former f'get_scheduler_state[{label}]' —
-            # fanout_label's basename form IS project_label's. Routed through
-            # the helper so all four fan-out sites share one definition of the
-            # per-project-root throttle-key convention (see its docstring).
-            log_label=fanout_label('get_scheduler_state', root),
-            offline_result=lambda errs: (None, [], []),
+            log_label=fanout_label('get_scheduler_events', root, labels),
+            offline_result=lambda errs: None,
         )
-        return snapshot, skip_events, recovery_events
+        if events is None:
+            return None, [], []
+        skip_events, recovery_events = events
+        return state.value, skip_events, recovery_events
 
     # Fan out to all project roots concurrently (mirrors metrics.py pattern)
     per_project_results = await asyncio.gather(
@@ -846,7 +923,7 @@ async def collect_scheduler_state(
     # present-with-[] means "read succeeded, no sweeps", absent means offline.
     all_recovery_events: dict[str, list[dict]] = {}
 
-    # Paired by position: two roots may share a basename.
+    # Paired by position: the root, not its label, is each result's identity.
     for root, result in zip(roots_to_query, per_project_results, strict=True):
         if isinstance(result, BaseException):
             logger.warning(
@@ -854,7 +931,7 @@ async def collect_scheduler_state(
             )
             continue
         snapshot, skip_events, recovery_events = result
-        label = project_label(root)
+        label = labels.of(root)
 
         # None snapshot means every URL failed (offline); an empty one means
         # online-but-empty.
@@ -878,7 +955,7 @@ async def collect_scheduler_state(
             uid = task.get('id') or ''
             # uid format: 'project/T-NNN' → raw_id = 'NNN'
             try:
-                raw_id = uid.split('/T-', 1)[1]
+                raw_id = uid.rsplit('/T-', 1)[1]
             except (IndexError, AttributeError):
                 raw_id = uid
             enriched.append({
@@ -892,7 +969,7 @@ async def collect_scheduler_state(
             })
 
         # Compose rows — normalize footprints to the scheduler's lock_depth so
-        # row lock_set values match the snapshot's current_holders keys.  Older
+        # row lock_set values match the snapshot's held keys.  Older
         # snapshots without lock_depth degrade to the default depth of 2.
         depth = snapshot.lock_depth if snapshot.lock_depth is not None else _DEFAULT_LOCK_DEPTH
         rows = _compose_rows(enriched, snapshot, depth, now=effective_now)
@@ -915,7 +992,7 @@ async def collect_scheduler_state(
         # get an entry (contention: 0) and every module entry carries
         # parked_by/park_stack (PRD §5 read-seam contract, task γ B1/B2).
         modules = _module_contention_counts(
-            rows, snapshot.current_holders,
+            rows, snapshot,
             project=label,
             park_stacks=park_stacks,
             live_task_ids=live_task_ids,
@@ -1028,6 +1105,8 @@ def _merge_module_lists(
             merged[key]['contention'] += m['contention']
             if m.get('holder'):
                 merged[key]['holder'] = m['holder']
+                merged[key]['holders'] = m['holders']
+                merged[key]['at_holder_limit'] = m['at_holder_limit']
                 # holder_project must travel with holder so the React side
                 # can build the composite ${holder_project}/${holder} key
                 # used to look up sparklines and joined row metadata.

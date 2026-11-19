@@ -514,8 +514,8 @@ manifest.
 | `plans/client-feed-prd.md` ε 6972, §3, §7.7, decision 17 | this → other | the injected plugin's collection map `<junit>.tests.json` `{nodeid: {defects, criterion}}`; β1 also owns the `criterion` marker registration | this PRD (β1); paired edit and 6972 amendment made at decompose (client-feed §12, 2026-10-16) | amended; 6972 depends on β1 |
 | `plans/client-feed-prd.md` display | this → other | `cases[].defects`, `defects_results` fold, `not_recorded` | this PRD (ι) | queued |
 | `plans/client-feed-prd.md` θ 6967 | both | `review_completed.by_kind` counts | client-feed θ, amended at decompose | at decompose |
-| client-feed PRD **revision** (unwritten) | other → this | `defect_reported` inbox event + privileged filer calling `submit_task`/`declare_defect` with `origin: client` | client-feed revision (ruling 6) | human gate ν |
-| `~/src/scoping-intake/docs/prds/client-portal.md` | other → this | report id and criterion id exposed to the revision's filer | portal PRD, one-line amendment via ν | via ν |
+| client-feed PRD revision, `plans/client-feed-prd.md` §14 (written 2026-10-23 at gate ν) | other → this | `defect_reported` inbox line + the privileged filer, filing through `submit_task` (`planning_mode`) with the declaration at creation, `origin: client`; `declare_defect` is not needed | client-feed §14 (σ1a–σ5) | queued |
+| `~/src/scoping-intake/docs/prds/client-portal.md` | other → this | report id (`block`, `report`) and criterion id in the `defect_reported` line; raw text stays in the portal | portal PRD, amended 2026-10-23 (ξ1, ξ2, π, ρ) | queued |
 | `plans/flake-ledger-prd.md` §6 | both | a defect-marked test is ineligible for any quarantine lane; suppression does not shrink the ratchet | this PRD (rule); flake-ledger gets the reciprocal sentence (θ2) | queued |
 | `docs/quality-findings-contract.md` §8 | this → other | filed **correctness** findings declare `defects` with `ref = finding:<fk>` | this PRD (θ2, one pointer sentence) | queued |
 | task 7008 | other → this | full merge breadth gives "run on every later version" and merge-run junit | task 7008 | pending |

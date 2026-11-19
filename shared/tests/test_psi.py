@@ -15,6 +15,10 @@ from typing import Any
 
 import pytest
 
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
+
 # ---------------------------------------------------------------------------
 # Helpers / fixtures (same shapes as sampler/tests/test_load_metrics.py)
 # ---------------------------------------------------------------------------
@@ -699,13 +703,17 @@ class TestReadRunqueueRatio:
 
 
 # PRD `plans/load-throttle-harmonisation-prd.md` §6.3 is the SINGLE HOME of
-# these two cgroup shapes; reify's rho2 builds the same strings on the bash
+# these cgroup shapes; reify's rho2 builds the same strings on the bash
 # side, so the two implementations are pinned against one table rather than
 # against each other (INV-5, accepted with executed parity as the mirror).
 # Constructed here exactly as that table spells them.
 CGROUP_UNDER_SLICE = (
     '0::/user.slice/user-1000.slice/user@1000.service/'
     'df.slice/df-x.slice/df-verify-x-0123456789ab.scope\n'
+)
+CGROUP_IN_GOVERNED_SUB_SLICE = (
+    '0::/user.slice/user-1000.slice/user@1000.service/'
+    'df.slice/df-x.slice/df-x-governed.slice/df-x-governed-agents.slice/run-u1.scope\n'
 )
 CGROUP_NO_SLICE = (
     '0::/user.slice/user-1000.slice/user@1000.service/app.slice/orchestrator-x.service\n'
@@ -727,7 +735,7 @@ def _clear_own_cgroup_cache():
 
 
 class TestResolveOwnCgroup:
-    """PRD §6.3 rows 1-2: parse the 0:: path, walk leaf-upward for
+    """PRD §6.3 rows 1, 2 and 4: parse the 0:: path, walk leaf-upward for
     df-<project_id>.slice, else the leaf itself; derive the sysfs path."""
 
     def _cgroup_file(self, tmp_path, text, name='cgroup'):
@@ -747,6 +755,19 @@ class TestResolveOwnCgroup:
 
         assert own.path == SLICE_PATH
         assert own.path.endswith('df-x.slice')
+        assert own.pressure_path == tmp_path / 'sys' / SLICE_PATH.lstrip('/') / 'cpu.pressure'
+
+    def test_row_4_governed_sub_slice_resolves_to_the_project_slice(self, tmp_path):
+        """§6.3 row 4 — the project slice, not the nearer governed sub-slice."""
+        from shared.psi import resolve_own_cgroup
+
+        own = resolve_own_cgroup(
+            'x',
+            proc_cgroup_path=self._cgroup_file(tmp_path, CGROUP_IN_GOVERNED_SUB_SLICE),
+            cgroup_root=tmp_path / 'sys',
+        )
+
+        assert own.path == SLICE_PATH
         assert own.pressure_path == tmp_path / 'sys' / SLICE_PATH.lstrip('/') / 'cpu.pressure'
 
     def test_row_2_falls_back_to_the_leaf_unit(self, tmp_path):
@@ -797,6 +818,21 @@ class TestResolveOwnCgroup:
         )
 
         assert own.path == '/user.slice/df.slice/df-dark_factory.slice'
+
+    def test_dashed_project_id_resolves_to_the_shared_rule_slice(self, tmp_path):
+        from shared.psi import resolve_own_cgroup
+
+        text = (
+            '0::/user.slice/user-1000.slice/user@1000.service/'
+            'df.slice/df-my_proj.slice/df-verify-x-0123abcd-0123456789ab.scope\n'
+        )
+        own = resolve_own_cgroup(
+            'my-proj',
+            proc_cgroup_path=self._cgroup_file(tmp_path, text),
+            cgroup_root=tmp_path / 'sys',
+        )
+
+        assert own.path.endswith('/df-my_proj.slice')
 
     def test_prefers_the_v2_line_on_a_hybrid_host(self, tmp_path):
         """Tolerance for co-present cgroup-v1 lines. Explicitly NOT a §6.3
@@ -1387,3 +1423,37 @@ class TestLiveSignal:
         )
         assert sample.own_cgroup
         assert live.startswith(sample.own_cgroup)
+
+
+class TestCpuSome10OrNone:
+    """The one mapping from a sample to host CPU pressure as a ledger records it."""
+
+    @staticmethod
+    def _sample(cpu_some10: float, *, read_ok: bool):
+        from shared.psi import PsiSample
+
+        return PsiSample(cpu_some10=cpu_some10, mem_some10=0.0, mem_full10=0.0, io_some10=0.0, read_ok=read_ok)
+
+    def test_a_healthy_read_maps_to_its_cpu_some10(self):
+        from shared.psi import cpu_some10_or_none
+
+        assert cpu_some10_or_none(self._sample(12.5, read_ok=True)) == 12.5
+
+    def test_a_real_idle_reading_is_kept_as_zero(self):
+        from shared.psi import cpu_some10_or_none
+
+        value = cpu_some10_or_none(self._sample(0.0, read_ok=True))
+
+        assert value == 0.0
+        assert value is not None
+
+    @pytest.mark.parametrize('cpu_some10', [0.0, 3.25, 99.0])
+    def test_a_failed_read_maps_to_none_never_zero(self, cpu_some10):
+        from shared.psi import cpu_some10_or_none
+
+        assert cpu_some10_or_none(self._sample(cpu_some10, read_ok=False)) is None
+
+    def test_it_is_public(self):
+        import shared.psi
+
+        assert 'cpu_some10_or_none' in shared.psi.__all__

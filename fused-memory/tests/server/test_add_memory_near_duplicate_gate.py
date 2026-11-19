@@ -16,24 +16,12 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-# Shared note fixtures, owned by the pure-matcher suite. Imported rather than
-# copied so the two suites cannot drift: an edit to the straddling note (e.g.
-# adding or removing a phrase hit) must move BOTH the matcher assertions there
-# and the whole-tool assertions here, instead of leaving one silently
-# exercising a different scenario (task 3054, reviewer: duplication).
-#
-# The bare import resolves because fused-memory/tests/conftest.py inserts the
-# tests dir onto sys.path (the same mechanism that makes `from _fm_helpers
-# import X` work), and pytest loads a conftest by PATH regardless of import
-# mode. Do NOT reason about this from pytest's rootdir/prepend behaviour: the
-# repo-root pyproject.toml sets `--import-mode=importlib`, under which a test
-# file's own directory is NOT put on sys.path, so a root-bound run would fail
-# at collection without that insert. Verified green under -n0, under xdist,
-# standalone, and root-bound via `pytest -c pyproject.toml` from the repo root.
-from test_config_schema import (
-    MERGE_BASE_NEGATIVE_CONTROL_NOTE,
-    STRADDLING_WRITE_FIXTURE,
-)
+# One shared note drives both this whole-tool suite and the pure-matcher suite
+# in test_config_schema.py, so an edit to it moves both and neither can drift
+# (task 3054). The bare import resolves because fused-memory/tests/conftest.py
+# inserts the tests dir onto sys.path, which the repo-root
+# `--import-mode=importlib` run needs.
+from _fm_helpers import MERGE_BASE_NEGATIVE_CONTROL_NOTE, STRADDLING_WRITE_FIXTURE
 
 from fused_memory.config.schema import (
     Mem0UpdateConfig,
@@ -46,6 +34,7 @@ from fused_memory.server.topic_cluster_store import TopicClusterStore, derive_to
 from fused_memory.utils.clip_disclosure import TRUNCATION_FACTS_KEY
 from server.write_triage_harness import (
     TOPIC_MATCH_CONTENT,
+    configure_pass_through_add_memory,
     configure_reject_guard_config,
     configure_triage_config,
     search_candidate,
@@ -59,19 +48,6 @@ _EXISTING_DUPLICATE = f'{_CONTENT} (existing entry)'
 # A peer for `consolidate_memories`' `retain` arm (task 3134). Full 36-char
 # UUID: the op refuses anything shorter by name, per slot.
 _RETAINED_PEER = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
-
-
-def _configure_pass_through_add_memory(mock_service: AsyncMock) -> None:
-    """Configure mock_service.add_memory to return a dict-dumpable result.
-
-    Mirrors test_add_memory_snapshot_gate.py: an unspecced AsyncMock's default
-    return value chains AsyncMock all the way down, so ``result.model_dump()``
-    would itself be an unawaited coroutine unless the return value is an
-    explicit MagicMock with model_dump configured.
-    """
-    mem_result = MagicMock()
-    mem_result.model_dump.return_value = {'id': 'ok'}
-    mock_service.add_memory.return_value = mem_result
 
 
 class TestAddMemoryNearDuplicateGate:
@@ -143,7 +119,7 @@ class TestAddMemoryNearDuplicateGate:
         """A search match scoring well below the threshold does not block the write."""
         mock_service = AsyncMock()
         mock_service.search.return_value = [search_candidate(id_='m1', score=0.50)]
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         server = create_mcp_server(mock_service)
 
         result = await server._tool_manager.call_tool(
@@ -170,7 +146,7 @@ class TestAddMemoryNearDuplicateGate:
         """
         mock_service = AsyncMock()
         mock_service.search.return_value = [search_candidate(id_='m1', score=0.97)]
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         server = create_mcp_server(mock_service)
 
         result = await server._tool_manager.call_tool(
@@ -198,7 +174,7 @@ class TestAddMemoryNearDuplicateGate:
         """
         mock_service = AsyncMock()
         mock_service.search.return_value = [search_candidate(id_='m1', score=0.97)]
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         server = create_mcp_server(mock_service)
 
         result = await server._tool_manager.call_tool(
@@ -222,7 +198,7 @@ class TestAddMemoryNearDuplicateGate:
         """A search error must never block the write — fail-open, not fail-closed."""
         mock_service = AsyncMock()
         mock_service.search.side_effect = TimeoutError('search backend unavailable')
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         server = create_mcp_server(mock_service)
 
         result = await server._tool_manager.call_tool(
@@ -257,7 +233,7 @@ class TestAddMemoryNearDuplicateGate:
         mock_service.search.side_effect = TypeError(
             "search() got an unexpected keyword argument 'stores'"
         )
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         server = create_mcp_server(mock_service)
 
         result = await server._tool_manager.call_tool(
@@ -281,7 +257,7 @@ class TestAddMemoryNearDuplicateGate:
         """No candidate results at all → no match → write proceeds."""
         mock_service = AsyncMock()
         mock_service.search.return_value = []
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         server = create_mcp_server(mock_service)
 
         result = await server._tool_manager.call_tool(
@@ -309,7 +285,7 @@ class TestAddMemoryNearDuplicateGate:
         """
         mock_service = AsyncMock()
         mock_service.search.return_value = [search_candidate(id_='m1', score=0.97)]
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         server = create_mcp_server(mock_service)
 
         await server._tool_manager.call_tool(
@@ -342,7 +318,7 @@ class TestAddMemoryNearDuplicateGate:
         """
         mock_service = AsyncMock()
         mock_service.search.return_value = [search_candidate(id_='m1', score=0.97)]
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         server = create_mcp_server(mock_service)
 
         result = await server._tool_manager.call_tool(
@@ -381,7 +357,7 @@ class TestAddMemoryNearDuplicateGate:
         """
         mock_service = AsyncMock()
         mock_service.search.return_value = [search_candidate(id_='m1', score=0.97)]
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         server = create_mcp_server(mock_service)
 
         result = await server._tool_manager.call_tool(
@@ -415,7 +391,7 @@ class TestAddMemoryNearDuplicateGate:
         """
         mock_service = AsyncMock()
         mock_service.search.return_value = []
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         server = create_mcp_server(mock_service)
         content = (
             'Before writing to write_queue.db verify the path; the merge '
@@ -514,7 +490,7 @@ class TestAddMemoryNearDuplicateGateConfig:
             near_dup_threshold=0.92,
         )
         mock_service.search.return_value = [search_candidate(id_='m1', score=0.97)]
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         server = create_mcp_server(mock_service)
 
         result = await server._tool_manager.call_tool(
@@ -547,7 +523,7 @@ class TestAddMemoryNearDuplicateGateConfig:
             near_dup_threshold=0.99,
         )
         mock_service.search.return_value = [search_candidate(id_='m1', score=0.97)]
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         server = create_mcp_server(mock_service)
 
         result = await server._tool_manager.call_tool(
@@ -627,7 +603,7 @@ class TestAddMemoryTopicClusterGate:
             topic_clusters=[topic_cluster()],
         )
         mock_service.search.return_value = []
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         server = create_mcp_server(mock_service)
 
         result = await server._tool_manager.call_tool(
@@ -675,7 +651,7 @@ class TestAddMemoryTopicClusterGate:
             topic_clusters=[topic_cluster()],
         )
         mock_service.search.return_value = []
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         server = create_mcp_server(mock_service)
 
         result = await server._tool_manager.call_tool(
@@ -722,7 +698,7 @@ class TestAddMemoryTopicClusterGate:
             near_dup_threshold=0.92,
             topic_clusters=[topic_cluster()],
         )
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         server = create_mcp_server(mock_service)
 
         result = await server._tool_manager.call_tool(
@@ -757,7 +733,7 @@ class TestAddMemoryTopicClusterGate:
             topic_clusters=[topic_cluster()],
         )
         mock_service.search.return_value = []
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         server = create_mcp_server(mock_service)
 
         result = await server._tool_manager.call_tool(
@@ -796,7 +772,7 @@ class TestAddMemoryTopicClusterGate:
             near_dup_threshold=0.92,
             topic_clusters=[topic_cluster()],
         )
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         server = create_mcp_server(mock_service)
 
         result = await server._tool_manager.call_tool(
@@ -830,7 +806,7 @@ class TestAddMemoryTopicClusterGate:
             near_dup_threshold=0.92,
             topic_clusters=[topic_cluster()],
         )
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         server = create_mcp_server(mock_service)
 
         result = await server._tool_manager.call_tool(
@@ -876,7 +852,7 @@ class TestAddMemoryTopicClusterGate:
             topic_clusters=[],
         )
         mock_service.search.return_value = []
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         server = create_mcp_server(mock_service)
 
         result = await server._tool_manager.call_tool(
@@ -911,7 +887,7 @@ class TestAddMemoryTopicClusterGate:
             near_dup_threshold=0.92,
             topic_clusters=[topic_cluster()],
         )
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         server = create_mcp_server(mock_service)
 
         result = await server._tool_manager.call_tool(
@@ -950,7 +926,7 @@ class TestAddMemoryTopicClusterGate:
             mock_service, near_dup_threshold=0.92, topic_clusters=[topic_cluster()],
         )
         mock_service.search.return_value = []
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         server = create_mcp_server(mock_service)
 
         result = await server._tool_manager.call_tool(
@@ -1003,7 +979,7 @@ class TestAddMemorySufficientPhraseGate:
         mock_service = AsyncMock()
         self._configure_real_clusters(mock_service)
         mock_service.search.return_value = []
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         server = create_mcp_server(mock_service)
 
         result = await server._tool_manager.call_tool(
@@ -1040,7 +1016,7 @@ class TestAddMemorySufficientPhraseGate:
         mock_service = AsyncMock()
         self._configure_real_clusters(mock_service)
         mock_service.search.return_value = []
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         server = create_mcp_server(mock_service)
 
         result = await server._tool_manager.call_tool(
@@ -1076,7 +1052,7 @@ class TestAddMemorySufficientPhraseGate:
         """
         mock_service = AsyncMock()
         self._configure_real_clusters(mock_service)
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         server = create_mcp_server(mock_service)
 
         result = await server._tool_manager.call_tool(
@@ -1101,7 +1077,7 @@ class TestAddMemorySufficientPhraseGate:
         mock_service = AsyncMock()
         self._configure_real_clusters(mock_service)
         mock_service.search.return_value = []
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         server = create_mcp_server(mock_service)
 
         result = await server._tool_manager.call_tool(
@@ -1286,7 +1262,7 @@ def _derived_guard_service() -> AsyncMock:
         topic_clusters=[],
     )
     mock_service.search.return_value = []
-    _configure_pass_through_add_memory(mock_service)
+    configure_pass_through_add_memory(mock_service)
     return mock_service
 
 

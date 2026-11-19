@@ -58,10 +58,11 @@ import time
 from collections.abc import Collection
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any, ClassVar, assert_type
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _gate_fixtures import gated_remote_runner
 from _merge_lane_fakes import (
     FakeVerifier,
     VerifyScript,
@@ -74,8 +75,6 @@ from _orch_helpers import PYPROJECT_DEFAULT_TIMEOUT, wait_responsive
 from test_merge_queue_concurrent_verify import (
     _inject_two_host_allocator,
     _make_branch_with_file,
-    _timeout_mark_offenders,
-    _worst_per_method_wait_budget,
 )
 
 from orchestrator.config import GitConfig, OrchestratorConfig
@@ -87,6 +86,7 @@ from orchestrator.merge_lane.liveness import (
     check_merge_liveness_margin,
     enforce_persistent_worktree_serial_lane,
 )
+from orchestrator.merge_lane.ports import ClockPort
 from orchestrator.merge_lane.types import QueuedBranch
 from orchestrator.merge_lane.worker import PRODUCTION_CLOCK, MergeRequest
 from orchestrator.verify import VerifyResult
@@ -868,7 +868,7 @@ class TestK2ConcurrencyAndAdvanceOrder:
 def _make_persistent_config(tmp_path: Any) -> OrchestratorConfig:
     """OrchestratorConfig with git.persistent_merge_worktree=True."""
     git = GitConfig(persistent_merge_worktree=True)
-    return OrchestratorConfig(project_root=tmp_path, git=git)
+    return lane_scene_config(tmp_path, git)
 
 
 def _make_liveness_config(
@@ -918,7 +918,7 @@ class TestStartupGuards:
         )
 
         # num_hosts=1, bound=2 → per_host = ceil(2/1) = 2 > 1 → raises
-        import pytest as _pytest  # noqa: PLC0415
+        import pytest as _pytest
         with _pytest.raises(PersistentWorktreeConfigError):
             enforce_persistent_worktree_serial_lane(
                 cfg_persistent, merge_ahead_bound=2, num_hosts=1
@@ -1176,7 +1176,7 @@ _LANE_STOP_TIMEOUT = 30.0
 
 #: Per-test ceiling for the host capstone, whose methods settle a real-git lane
 #: through several ``wait_responsive`` waits and a reprobe sweep.  Sized above
-#: the budget ``TestTimeoutMarkCoverage`` recomputes from this module's own
+#: the budget test_wait_budget_coverage_guard.py recomputes from this module's
 #: source rather than from any figure written here, and never below
 #: ``PYPROJECT_DEFAULT_TIMEOUT``.  Why a mark at all: pytest-timeout's thread
 #: method ``os._exit()``s the xdist worker on expiry, and ``--max-worker-restart=0``
@@ -1345,7 +1345,7 @@ class _ShortSleepClock:
     honestly -- only the cadence is compressed.
     """
 
-    _CAP_SECS = 0.02
+    CAP_SECS = 0.02
 
     def now(self) -> float:
         return time.time()
@@ -1353,19 +1353,49 @@ class _ShortSleepClock:
     def monotonic(self) -> float:
         return time.monotonic()
 
-    def newest_content_mtime(self, root: Path) -> float | None:  # noqa: ARG002
+    def newest_content_mtime(self, root: Path) -> float | None:
+        return None
+
+    def verify_cpu_ticks(self, root: Path) -> int | None:
         return None
 
     async def sleep(self, secs: float) -> None:
-        await asyncio.sleep(min(secs, self._CAP_SECS))
+        await asyncio.sleep(min(secs, self.CAP_SECS))
 
-    async def wait_for_any(self, aws: Collection[Any], timeout: float) -> set[Any]:
+    async def wait_for_any(
+        self, aws: Collection[asyncio.Future[Any]], timeout: float,
+    ) -> set[asyncio.Future[Any]]:
         # UNCAPPED, unlike the sleep above: capping it would re-check the
         # lane's halt and abandonment branches ~500x more often and reorder
         # the halt-vs-verify interleaving this file's capstone measures. So
         # this one method wants production semantics exactly, and delegates
         # rather than restating them.
         return await PRODUCTION_CLOCK.wait_for_any(aws, timeout)
+
+
+_SHORT_SLEEP_CLOCK_IS_A_CLOCK_PORT: ClockPort = _ShortSleepClock()
+
+
+class TestShortSleepClockWaitsForAny:
+    """``wait_for_any`` keeps the whole timeout that ``sleep`` caps.
+
+    The ``assert_type`` pins the precise signature, which the conformance pin
+    above cannot: an ``Any``-typed method still satisfies the Protocol.
+    """
+
+    @pytest.mark.asyncio
+    async def test_an_unfinished_wait_runs_its_whole_timeout_not_the_sleep_cap(self) -> None:
+        cap = _ShortSleepClock.CAP_SECS
+        forever = asyncio.create_task(asyncio.Event().wait())
+        try:
+            started = time.monotonic()
+            done = await _ShortSleepClock().wait_for_any({forever}, timeout=10 * cap)
+            assert_type(done, set[asyncio.Future[Any]])
+            assert done == set()
+            assert time.monotonic() - started > 5 * cap
+        finally:
+            forever.cancel()
+            await asyncio.gather(forever, return_exceptions=True)
 
 
 class _HostEscalationQueue:
@@ -1406,7 +1436,7 @@ class _HostEscalationQueue:
     def submit(self, esc: Any) -> None:
         self.submitted.append(esc)
 
-    def get_by_task(self, task_id: str, status: str | None = None, **kw: Any) -> list[Any]:  # noqa: ARG002
+    def get_by_task(self, task_id: str, status: str | None = None, **kw: Any) -> list[Any]:
         return self._open_l1s(task_id)
 
     def resolve(self, esc_id: str, resolution: str, **kw: Any) -> None:
@@ -1445,6 +1475,7 @@ class _FlakyRemoteRunner:
         self.verified: list[str] = []
         self.health_calls = 0
         self.entered = False
+        self.unavailable_raised = 0
 
     async def health(self) -> bool:
         self.health_calls += 1
@@ -1457,6 +1488,7 @@ class _FlakyRemoteRunner:
             self.entered = True
             await self.verify_gate.wait()
         if not self.reachable:
+            self.unavailable_raised += 1
             raise RunnerUnavailable(_INCIDENT_RU)
         self.verified.append(merge_sha)
         return _make_result(True)
@@ -1509,7 +1541,7 @@ class TestUnreachableHostCapstone:
     """
 
     @staticmethod
-    async def _strand_the_laptop(lane, queue, git_ops, config, verifier, gate):
+    async def _strand_the_laptop(lane, queue, git_ops, config, verifier, gate, laptop):
         """Park the local anchor, then push a request onto the down laptop.
 
         ``acquire()`` hands out the local host first, so the only way to put
@@ -1523,11 +1555,11 @@ class TestUnreachableHostCapstone:
         req_b = await _submitted(git_ops, config, 'ru-b', 'ru_b.py', 'b = 2\n')
         await queue.put(req_b)
         await _until(
-            lambda: 'leo-laptop' in lane.snapshot()['occupancy']['inflight_by_host'],
-            what='the second request to be dispatched to the laptop',
+            lambda: laptop.unavailable_raised >= 1,
+            what="the second request's verify to reach the down laptop",
         )
-        # The RU verdict is only ADJUDICATED when the head of the in-flight
-        # deque finalizes, so release the parked anchor before waiting on it.
+        # Release the parked anchor so both requests can land, then wait for
+        # the quarantine as the settled state.
         gate.set()
         await _until(
             lambda: bool(_host_row(lane, 'leo-laptop').get('quarantined')),
@@ -1550,7 +1582,7 @@ class TestUnreachableHostCapstone:
             verifier=verifier, escalation_queue=escalations, event_store=events,
         ) as (lane, queue):
             req_a, req_b = await self._strand_the_laptop(
-                lane, queue, host_git_ops, host_config, verifier, gate,
+                lane, queue, host_git_ops, host_config, verifier, gate, laptop,
             )
 
             # (1) the strand is RECORDED and legible in the public host census --
@@ -1594,7 +1626,7 @@ class TestUnreachableHostCapstone:
             verifier=verifier, escalation_queue=escalations, event_store=events,
         ) as (lane, queue):
             req_a, req_b = await self._strand_the_laptop(
-                lane, queue, host_git_ops, host_config, verifier, gate,
+                lane, queue, host_git_ops, host_config, verifier, gate, laptop,
             )
             await wait_responsive(req_a.result, label='stranded-laptop A resolves')
             await wait_responsive(req_b.result, label='stranded-laptop B resolves')
@@ -1666,7 +1698,7 @@ class TestUnreachableHostCapstone:
             verifier=verifier, escalation_queue=escalations, event_store=events,
         ) as (lane, queue):
             req_a, req_b = await self._strand_the_laptop(
-                lane, queue, host_git_ops, config, verifier, gate,
+                lane, queue, host_git_ops, config, verifier, gate, laptop,
             )
 
             row = _host_row(lane, 'leo-laptop')
@@ -1681,6 +1713,12 @@ class TestUnreachableHostCapstone:
 
             assert (await wait_responsive(req_a.result, label='A lands')).status == 'done'
             assert (await wait_responsive(req_b.result, label='B lands')).status == 'done'
+
+            settled = _host_row(lane, 'leo-laptop')
+            assert settled['streak'] == 1, (
+                f'one RU must be recorded exactly once, at bench time or at finalize: {settled!r}'
+            )
+            assert escalations.of_category('verify_host_unreachable') == [], escalations.submitted
 
     async def test_repeated_alarm_opportunities_still_produce_exactly_one_l1(
         self, host_git_ops: GitOps, host_config: OrchestratorConfig,
@@ -1707,7 +1745,7 @@ class TestUnreachableHostCapstone:
             verifier=verifier, escalation_queue=escalations, event_store=events,
         ) as (lane, queue):
             req_a, req_b = await self._strand_the_laptop(
-                lane, queue, host_git_ops, config, verifier, gate,
+                lane, queue, host_git_ops, config, verifier, gate, laptop,
             )
             await wait_responsive(req_a.result, label='A lands')
             await wait_responsive(req_b.result, label='B lands')
@@ -1813,6 +1851,52 @@ class TestUnreachableHostCapstone:
                 req_a.result, label='A resolves past the PARK',
             )).status != 'done'
 
+    async def test_a_slot_parked_outside_the_lane_is_unparked_by_the_backstop_without_a_restart(
+        self, host_git_ops: GitOps, host_config: OrchestratorConfig,
+    ) -> None:
+        """A PARK the lane never recorded still recovers, with no restart.
+
+        A caller outside the merge lane -- a host pool sharing the allocator --
+        parks the laptop through the allocator's own ``cancel_and_release``.
+        Nothing tracks or quarantines it, so the tracker-driven reprobe sweep
+        cannot see it.  The ``_slots``-driven backstop must free it once it
+        probes clean, and must declare no recovery for capacity that was never
+        declared lost.
+        """
+        escalations = _HostEscalationQueue()
+        events = _RecordingEventStore()
+        laptop = _FlakyRemoteRunner(reachable=False)
+
+        async def no_sleep(_secs: float) -> None:
+            return None
+
+        async with _lane_with_remote(
+            host_git_ops, host_config, laptop,
+            verifier=FakeVerifier(), escalation_queue=escalations, event_store=events,
+        ) as (lane, _queue):
+            alloc = _inject_two_host_allocator(lane, laptop)
+            lease = alloc.acquire_remote()
+            assert lease is not None and lease.name == 'leo-laptop'
+            await alloc.cancel_and_release(lease, sleep=no_sleep, max_attempts=1)
+
+            row = _host_row(lane, 'leo-laptop')
+            assert row['slot_state'] == 'parked', row
+            assert row['quarantine_class'] is None and row['streak'] is None, (
+                f'precondition: the PARK must be untracked by the lane: {row!r}'
+            )
+
+            laptop.reachable = True
+            await _until(
+                lambda: _host_row(lane, 'leo-laptop').get('slot_state') == 'free',
+                what='the backstop sweep to un-PARK the untracked laptop',
+            )
+
+            relet = alloc.acquire_remote()
+            assert relet is not None and relet.name == 'leo-laptop'
+            await alloc.release(relet)
+            assert events.events_of(EventType.verify_host_recovered) == [], events.events
+            assert escalations.submitted == [], escalations.submitted
+
     async def test_stop_leaves_no_lane_background_task_running(
         self, host_git_ops: GitOps, host_config: OrchestratorConfig,
     ) -> None:
@@ -1867,7 +1951,7 @@ class TestUnreachableHostCapstone:
             verifier=verifier, escalation_queue=escalations, event_store=events,
         ) as (lane, queue):
             req_a, req_b = await self._strand_the_laptop(
-                lane, queue, host_git_ops, host_config, verifier, gate,
+                lane, queue, host_git_ops, host_config, verifier, gate, laptop,
             )
             await wait_responsive(req_a.result, label='stranded-laptop A resolves')
             await wait_responsive(req_b.result, label='stranded-laptop B resolves')
@@ -1909,20 +1993,11 @@ def _xcheck_config(*, project_root: Path, cross_check: bool = True) -> Orchestra
     """OrchestratorConfig with the fix-(b) knob explicit, rooted at the caller's
     sandboxed *project_root* — the cross-check LocalRunner's archive_root and
     the runs.db path both derive from it.
-
-    ``escalate_preexisting_main_break=False`` is the FIRST guard both
-    ``_classify_main_health_red`` and ``_spawn_main_health_probe`` apply
-    (merge_queue.py -- the two share a byte-identical guard block), so a
-    config that declines pre-existing-break classification is the operator
-    knob that keeps the probe out of these tests.  The cross-check verdict
-    itself is unaffected: main-health classification runs only AFTER a
-    failure has been adopted.
     """
-    return OrchestratorConfig(
-        git=GitConfig(main_branch='main'),
-        project_root=project_root,
+    return lane_scene_config(
+        project_root,
+        GitConfig(main_branch='main'),
         verify_cross_check_remote_green=cross_check,
-        escalate_preexisting_main_break=False,
     )
 
 
@@ -1949,7 +2024,7 @@ def _xcheck_git_ops() -> MagicMock:
     mock.get_main_sha = AsyncMock(return_value='main-sha')
     mock.get_free_disk_bytes = AsyncMock(return_value=100 * 1024 ** 3)
     mock.cleanup_merge_worktree = AsyncMock()
-    mock.create_throwaway_verify_worktree = AsyncMock(return_value='/repo/_throwaway')
+    mock.create_ephemeral_verify_worktree = AsyncMock(return_value='/repo/_throwaway')
     return mock
 
 
@@ -2389,16 +2464,15 @@ class TestTwoHostFalseGreenCapstone:
         import json
 
         from orchestrator.verify_runner import (
-            RemoteRunner,
             build_merge_verify_spec,
             result_to_json,
             run_merge_verify_on_worktree,
         )
 
         # Dispatching host runs the FULL merge-gate profile.
-        full_config = OrchestratorConfig(
-            git=GitConfig(main_branch='main'),
-            project_root=tmp_path,
+        full_config = lane_scene_config(
+            tmp_path,
+            GitConfig(main_branch='main'),
             merge_verify_workspace=True,
             merge_verify_breadth='full',
         )
@@ -2424,7 +2498,7 @@ class TestTwoHostFalseGreenCapstone:
                 return (0, '', '')
             return next(_it)
 
-        runner = RemoteRunner(
+        runner = gated_remote_runner(
             name='leo-laptop', ssh_host='leo-laptop.local', git_remote='origin',
             cwd='/repo', run=fake_run, id_factory=lambda: 'cap-id',
         )
@@ -2898,71 +2972,11 @@ class TestIndeterminateLocalLegDoesNotVeto:
         assert es.events_of(EventType.verify_cross_check_mismatch)
 
 
-# ===========================================================================
-# Task 5030 amendment: the timeout-mark guard, generalised to THIS module.
-# ===========================================================================
-
-
-class TestTimeoutMarkCoverage:
-    """Enforced invariant: every class in THIS module must have its computed
-    worst-case per-method wait budget cleared by the timeout it actually
-    runs under -- its own ``@pytest.mark.timeout`` mark if it has one, else
-    the ambient budget (see ``_timeout_mark_offenders``).
-
-    Task 3492 built this guard, and task 5030 gave test_merge_speculation.py
-    its own copy -- but both resolve ``Path(__file__)`` against their own
-    source, so neither reaches this module.  That mattered here the moment
-    γ7 replaced this file's mock-driven host tests with real-git lane-settling
-    polls: ``TestUnreachableHostCapstone`` went from trivially fast to a
-    computed budget above the ambient default, with no mark anywhere in the
-    file.
-
-    The helpers are IMPORTED from test_merge_queue_concurrent_verify rather
-    than reimplemented: they are deliberately pure (source text in, offender
-    list out, class resolver injected as ``globals().get``) precisely so they
-    can be driven with foreign input, and a third copy would be free to drift
-    from the marks it audits.
-
-    The computed budget is a conservative FLOOR over call SHAPES: it bills
-    ``wait_responsive`` / ``asyncio.wait_for`` / ``_await_outcome`` sites and
-    nothing else, so this module's ``_until(...)`` polls -- which do bound
-    their own budget, through ``wait_responsive`` one frame down -- are not
-    counted. An unrecognised shape can only under-count, never fabricate a
-    wait, so a class this guard passes may still deserve a wider mark than the
-    floor demands; a class it fails is genuinely under-marked.
-    """
-
-    def test_heavy_wait_classes_carry_adequate_timeout_mark(self) -> None:
-        """Every Test* class's computed worst-case per-method wait budget
-        must be cleared by the timeout it actually runs under (its own mark
-        if it has one, else the ambient budget).
-
-        Recomputes every class's budget from source on each run -- the
-        single source of those figures, so none is restated beside a mark.
-        """
-        source = Path(__file__).read_text()
-        budgets = _worst_per_method_wait_budget(source)
-        offenders = _timeout_mark_offenders(budgets, globals().get)
-
-        assert not offenders, (
-            'The following classes have a computed worst-case per-method '
-            'wait budget that the timeout they actually run under (their '
-            'own mark if they have one, else the ambient budget) does not '
-            'clear:\n'
-            + '\n'.join(f'  - {offender}' for offender in offenders)
-            + '\n\nConsequence: pytest-timeout\'s thread method os._exit()s '
-            'the xdist worker under --max-worker-restart=0, so a '
-            'slow-but-correct run reports as a worker death instead of a '
-            'clean per-test failure -- strictly worse than the flake being '
-            'fixed. Add @pytest.mark.timeout(HOST_CAPSTONE_TEST_TIMEOUT) '
-            'directly above each offending class.'
-        )
-
-
 class TestHostCapstoneTimeoutConstant:
     """HOST_CAPSTONE_TEST_TIMEOUT is a literal held up by the never-narrow floor.
 
-    The per-class WAIT floor is TestTimeoutMarkCoverage's job, not this one's.
+    Whether each marked test's waits fit under it is checked per item by
+    test_wait_budget_coverage_guard.py, not here.
     """
 
     def test_never_narrows_the_ini_default(self) -> None:

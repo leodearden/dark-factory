@@ -40,6 +40,8 @@ __all__ = [
 
 _RECORD_CONFIG = ConfigDict(frozen=True, extra='ignore')
 
+_EXCLUSIVE = 1
+
 
 class MalformedSnapshotError(ValueError):
     """The input to ``SchedulerStateSnapshot.from_json`` is not a snapshot's wire form."""
@@ -98,7 +100,14 @@ class RequeueCooldown(BaseModel):
 class SchedulerStateSnapshot(BaseModel):
     """``parks`` maps each owner to the modules it tops; ``park_stacks`` maps each
     module to its whole stack, bottom to top, as open entry records; ``lock_depth``
-    is the depth the producer normalises lock keys to.
+    is the depth the producer normalises lock keys to. ``pause_class`` is the wire
+    value of ``orchestrator/src/orchestrator/pause_policy.py::PauseClass`` (shared
+    cannot import orchestrator), ``None`` when not paused. ``held_by_task`` maps
+    each holding task to its sorted lock keys and names every holder of a shared
+    key, while ``current_holders`` names one holder per key, for display.
+    ``holder_limits`` maps each held key to the producer lock table's holder
+    limit (a very large int for a key taking unlimited holders), so a reader
+    compares ``len(holders) >= limit``.
 
     Frozen means no field can be reassigned. The mappings are plain dicts that
     validation copies from its input, so a snapshot never aliases its producer's
@@ -115,9 +124,12 @@ class SchedulerStateSnapshot(BaseModel):
     pin_queue: tuple[PinQueueEntry, ...] = ()
     overrides: Mapping[str, OverrideRecord] = Field(default_factory=dict)
     current_holders: Mapping[str, str] = Field(default_factory=dict)
+    held_by_task: Mapping[str, tuple[str, ...]] = Field(default_factory=dict)
+    holder_limits: Mapping[str, int] = Field(default_factory=dict)
     lock_depth: StrictInt | None = None
     is_paused: bool = False
     pause_reason: str | None = None
+    pause_class: str | None = None
     requeue_cooldowns: Mapping[str, RequeueCooldown] = Field(default_factory=dict)
     snapshot_at: AwareDatetime | None = None
 
@@ -142,3 +154,35 @@ class SchedulerStateSnapshot(BaseModel):
 
     def to_json(self) -> dict[str, Any]:
         return self.model_dump(mode='json')
+
+    def holder_task_ids(self) -> frozenset[str]:
+        """Every task id the snapshot names as holding a lock key.
+
+        ``held_by_task`` names every holder of a shared key. ``current_holders``
+        names one per key, and is all an older producer writes; the union
+        reads either producer.
+        """
+        return frozenset(self.held_by_task) | frozenset(self.current_holders.values())
+
+    def holders_by_key(self) -> dict[str, frozenset[str]]:
+        """Every task holding each held lock key.
+
+        Inverts ``held_by_task`` and unions ``current_holders``, the same
+        fallback ``holder_task_ids`` reads: an older producer writes only
+        ``current_holders``, and a newer one derives it from ``held_by_task``.
+        """
+        holders: dict[str, set[str]] = {}
+        for task_id, keys in self.held_by_task.items():
+            for key in keys:
+                holders.setdefault(key, set()).add(task_id)
+        for key, task_id in self.current_holders.items():
+            holders.setdefault(key, set()).add(task_id)
+        return {key: frozenset(ids) for key, ids in holders.items()}
+
+    def holder_limit(self, key: str) -> int:
+        """The holder limit published for *key*, else exclusive.
+
+        Exclusive is how every reader treated a held key before limits were
+        published, so an older producer reads as it always did.
+        """
+        return self.holder_limits.get(key, _EXCLUSIVE)

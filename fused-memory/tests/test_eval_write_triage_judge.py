@@ -38,7 +38,6 @@ from _eval_write_triage_fixtures import cli_mod as _mod
 from _eval_write_triage_fixtures import corpus as _corpus
 from _eval_write_triage_fixtures import crossed_retrieved_plan as _crossed_retrieved_plan
 from _eval_write_triage_fixtures import live as _live
-from _eval_write_triage_fixtures import live_judge_mod as _live_judge
 from _eval_write_triage_fixtures import one_cluster_corpus as _one_cluster_corpus
 from _eval_write_triage_fixtures import rec as _rec
 from _eval_write_triage_fixtures import scored as _scored
@@ -46,6 +45,8 @@ from _eval_write_triage_fixtures import scoring_mod as _scoring
 from _eval_write_triage_fixtures import slate as _slate
 from _eval_write_triage_fixtures import wording_mod as _wording
 
+from fused_memory.models.enums import SourceStore
+from fused_memory.models.memory import MemoryResult
 from fused_memory.server.write_triage import (
     OUTCOME_AMENDED,
     OUTCOME_CONTESTED,
@@ -53,6 +54,7 @@ from fused_memory.server.write_triage import (
     OUTCOME_RESTATED,
     OUTCOME_STORED,
 )
+from fused_memory.server.write_triage_judge import JudgePromptElisions, judge_prompt_elisions
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'eval_write_triage_judge.py'
 
@@ -457,14 +459,14 @@ class TestRunResolvesTheJudgeConfigIntoProvenance:
 
     @staticmethod
     def _service():
-        from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+        from fused_memory.config.schema import FusedMemoryConfig
 
         return types.SimpleNamespace(config=FusedMemoryConfig())
 
     def test_provenance_records_the_effective_candidate_cap(
         self, tmp_path: Path, monkeypatch,
     ) -> None:
-        from fused_memory.server import write_triage_judge  # noqa: PLC0415
+        from fused_memory.server import write_triage_judge
 
         captured = self._captured(tmp_path, monkeypatch)
         expected = write_triage_judge.resolve_judge_candidate_count(self._service())
@@ -474,7 +476,7 @@ class TestRunResolvesTheJudgeConfigIntoProvenance:
     def test_provenance_records_the_effective_field_width(
         self, tmp_path: Path, monkeypatch,
     ) -> None:
-        from fused_memory.server import write_triage_judge  # noqa: PLC0415
+        from fused_memory.server import write_triage_judge
 
         captured = self._captured(tmp_path, monkeypatch)
         expected = write_triage_judge.resolve_judge_field_chars(self._service())
@@ -490,7 +492,7 @@ class TestRunResolvesTheJudgeConfigIntoProvenance:
     def test_provenance_records_whether_the_judge_arm_was_live(
         self, tmp_path: Path, monkeypatch,
     ) -> None:
-        from fused_memory.server import write_triage_judge  # noqa: PLC0415
+        from fused_memory.server import write_triage_judge
 
         captured = self._captured(tmp_path, monkeypatch)
         expected = write_triage_judge.resolve_judge_enabled(self._service())
@@ -506,7 +508,7 @@ class TestRunResolvesTheJudgeConfigIntoProvenance:
         off, so every case is answered without a provider call and the report
         still looks like a measurement.
         """
-        from fused_memory.server import write_triage_judge  # noqa: PLC0415
+        from fused_memory.server import write_triage_judge
 
         monkeypatch.setattr(
             write_triage_judge, 'resolve_judge_enabled', lambda service: False,
@@ -571,7 +573,7 @@ class TestRunResolvesTheJudgeConfigIntoProvenance:
     def test_provenance_records_the_system_prompt_it_measured(
         self, tmp_path: Path, monkeypatch,
     ) -> None:
-        from fused_memory.server.write_triage_judge import (  # noqa: PLC0415
+        from fused_memory.server.write_triage_judge import (
             JUDGE_SYSTEM_PROMPT,
         )
 
@@ -787,8 +789,8 @@ class TestABareDryRunCannotReachTheCommittedArtifact:
     def test_a_bare_dry_run_leaves_both_committed_artifacts_byte_identical(
         self, tmp_path: Path, monkeypatch,
     ) -> None:
-        import sys  # noqa: PLC0415
-        import tempfile  # noqa: PLC0415
+        import sys
+        import tempfile
 
         fixture = tmp_path / 'synthetic_corpus.jsonl'
         fixture.write_text(
@@ -841,7 +843,7 @@ class TestABareDryRunCannotReachTheCommittedArtifact:
         Given a fixture that does not exist, so a refusal ordered after the
         fixture load would surface as `FileNotFoundError` instead.
         """
-        import sys  # noqa: PLC0415
+        import sys
 
         monkeypatch.setattr(sys, 'argv', [
             'eval_write_triage_judge.py', '--fixture', str(tmp_path / 'absent.jsonl'),
@@ -1080,7 +1082,7 @@ class TestTheAttachTargetIsTheJudgedCandidate:
     """A judged attach lands on the candidate the verdict NAMED, hoisted.
 
     `write_triage.py::_apply_judge_verdict` files a middle-band attach against
-    `_canonical_id_of(named record)`, and against the band winner only when
+    `canonical_id_of(named record)`, and against the band winner only when
     the verdict named nothing. The row's `attach_target_*` describe that
     record, so `score_attachments` scores production's attach.
     """
@@ -1252,7 +1254,7 @@ class TestApplyFieldChars:
 
     @staticmethod
     def _resolved(config) -> int:
-        from fused_memory.server.write_triage_judge import (  # noqa: PLC0415
+        from fused_memory.server.write_triage_judge import (
             resolve_judge_field_chars,
         )
 
@@ -1260,7 +1262,7 @@ class TestApplyFieldChars:
 
     @staticmethod
     def _config():
-        from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+        from fused_memory.config.schema import FusedMemoryConfig
 
         return FusedMemoryConfig()
 
@@ -1272,11 +1274,13 @@ class TestApplyFieldChars:
     def test_zero_means_no_elision_rather_than_everything_elided(self) -> None:
         config = self._config()
         text = 'x' * 20_000
-        slate = [types.SimpleNamespace(id='a', content=text)]
+        slate = [MemoryResult(id='a', content=text, source_store=SourceStore.mem0)]
         assert _mod().apply_field_chars(config, 0) == 0
         width = self._resolved(config)
         assert width >= len(text)
-        assert _live_judge()._elision_flags(text, slate, width) == (False, {'a': False})
+        assert judge_prompt_elisions(text, slate, field_chars=width) == JudgePromptElisions(
+            entry=False, candidates={'a': False},
+        )
 
     def test_a_negative_width_is_refused_rather_than_recorded(self) -> None:
         """The resolver would fall back to the default, so provenance would lie."""
@@ -1292,22 +1296,10 @@ class TestApplyFieldChars:
         assert _mod().apply_field_chars(config, None) == self._resolved(config) == 4_000
         assert config.write_triage.judge_field_chars == before
 
-    def test_the_elision_flags_follow_the_width(self) -> None:
-        long_text = 'y' * 5_000
-        slate = [types.SimpleNamespace(id='a', content=long_text)]
-        assert _live_judge()._elision_flags(long_text, slate, 1_200) == (True, {'a': True})
-
 
 # ---------------------------------------------------------------------------
-# The split: one contract path, and imports that point downward only
+# The split: imports that point downward only
 # ---------------------------------------------------------------------------
-
-class TestScoreAttachmentsKeepsItsContractPath:
-    """PRD C2' and task 5807 call it at eval_write_triage_judge.py::score_attachments."""
-
-    def test_the_cli_binds_the_scoring_modules_function(self) -> None:
-        assert _mod().score_attachments is _scoring().score_attachments
-
 
 #: Loads ONE ``scripts/`` module by path under its stem and prints the
 #: ``scripts/`` stems then in ``sys.modules``, as one JSON list.

@@ -1,0 +1,30 @@
+{
+  "task_id": "3774",
+  "reason": "Net-additive main-health fix: worker.py::_file_main_health_escalation files at level 1 and takes a required MainHealthNextAction (call-site plumbing across the four worker filings); test_merge_queue_auto_heal.py gains one regression test for the workflow auto-heal halt owner surviving its own block, driven through _submit_to_merge_queue, which reads one private seam. Not a refactor that failed.",
+  "measures": [
+    {
+      "measure": "lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+      "baseline": 22539,
+      "current": 22547
+    },
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/test_merge_queue_auto_heal.py",
+      "baseline": 43,
+      "current": 44
+    },
+    {
+      "measure": "total:lines",
+      "key": "<cluster>",
+      "baseline": 58047,
+      "current": 58055
+    },
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6567,
+      "current": 6568
+    }
+  ]
+}

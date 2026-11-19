@@ -13,11 +13,13 @@ from __future__ import annotations
 import abc
 import asyncio
 import contextlib
-from collections.abc import AsyncIterator, Iterable
+from collections.abc import AsyncIterator, Iterable, Sequence
 from pathlib import Path
 from typing import Any, NamedTuple, Self
 
 import aiosqlite
+
+from shared.sqlite_durability import DURABILITY_TRIAD, require_wal_journal_mode
 
 __all__ = [
     'apply_wal_pragmas',
@@ -44,8 +46,21 @@ class CheckpointResult(NamedTuple):
     checkpointed: int
 
     @classmethod
+    def from_pragma_rows(cls, rows: Iterable[Sequence[Any]]) -> CheckpointResult:
+        """The one parser of the pragma's result, and the one home of the no-row policy."""
+        row = next(iter(rows), None)
+        if row is None:
+            raise RuntimeError('PRAGMA wal_checkpoint returned no rows')
+        return cls(int(row[0]), int(row[1]), int(row[2]))
+
+    @classmethod
     def unavailable(cls) -> CheckpointResult:
-        """No checkpoint ran: the store has no open connection, or the pragma returned no row."""
+        """No checkpoint ran: the store is not open, or its caller mapped a failed checkpoint here.
+
+        The second use is
+        ``fused-memory/src/fused_memory/backends/sqlite_task_backend.py::SqliteTaskBackend.checkpoint_all``,
+        so -1/-1/-1 alone does not tell a closed store from a failure.
+        """
         return cls(-1, -1, -1)
 
 
@@ -59,9 +74,7 @@ async def apply_wal_pragmas(conn: aiosqlite.Connection, *, busy_timeout_ms: int)
     """
     async with conn.execute('PRAGMA journal_mode=WAL') as cur:
         row = await cur.fetchone()
-    if row is None or row[0] != 'wal':
-        got = row[0] if row is not None else None
-        raise RuntimeError(f'Failed to enable WAL journal mode (got {got!r})')
+    require_wal_journal_mode(row)
     if busy_timeout_ms != 0:
         await conn.execute(f'PRAGMA busy_timeout={busy_timeout_ms}')
 
@@ -71,19 +84,8 @@ async def apply_full_durability_pragmas(
 ) -> None:
     """Configure WAL mode, busy_timeout, and the Phase 3 durability triad.
 
-    Delegates to ``apply_wal_pragmas`` for WAL + busy_timeout, then sets the
-    three additional PRAGMAs that harden crash durability across all
-    fused-memory SQLite stores:
-
-    - ``synchronous=FULL`` (2): fsync per-commit; eliminates corruption on
-      unexpected shutdown without relying on WAL-checkpoint timing.
-    - ``wal_autocheckpoint=100``: auto-checkpoint after every 100 WAL pages to
-      bound WAL growth under normal load.
-    - ``journal_size_limit=67108864`` (64 MiB): caps the WAL file size to
-      prevent unbounded disk use during high-write bursts.
-
-    See ``docs/task-recovery-2026-05-13/`` for the production incident that
-    drove this convention across all fused-memory SQLite stores.
+    Delegates to ``apply_wal_pragmas`` for WAL + busy_timeout, then applies
+    ``shared/src/shared/sqlite_durability.py::DURABILITY_TRIAD``.
 
     Args:
         conn: An open aiosqlite connection.
@@ -91,13 +93,8 @@ async def apply_full_durability_pragmas(
             Pass 0 to skip setting the busy_timeout pragma entirely.
     """
     await apply_wal_pragmas(conn, busy_timeout_ms=busy_timeout_ms)
-    # synchronous=FULL: per-commit fsync. Cost is ~1-5ms/commit; the
-    # win is crash durability without relying on WAL checkpoints. See
-    # docs/task-recovery-2026-05-13/ for the prod incident that drove
-    # this change across all fused-memory SQLite stores.
-    await conn.execute('PRAGMA synchronous=FULL')
-    await conn.execute('PRAGMA wal_autocheckpoint=100')
-    await conn.execute('PRAGMA journal_size_limit=67108864')
+    for pragma in DURABILITY_TRIAD:
+        await conn.execute(pragma.statement)
 
 
 async def connect_daemon(database: str | Path, **kwargs) -> aiosqlite.Connection:
@@ -170,6 +167,7 @@ class AtomicConnection:
         self._connection = connection
         self._lock = asyncio.Lock()
         self._holder: asyncio.Task | None = None
+        self._closed = False
 
     @property
     def connection(self) -> aiosqlite.Connection:
@@ -275,37 +273,33 @@ class AtomicConnection:
     async def checkpoint(self) -> CheckpointResult:
         """Run ``PRAGMA wal_checkpoint(TRUNCATE)`` as one atomic access.
 
-        Returns :meth:`CheckpointResult.unavailable` when the pragma yields no
-        row.  This family — the fused-memory stores driven by
-        ``fused-memory/src/fused_memory/server/main.py::_run_checkpoint_cycle`` —
-        answers "no checkpoint ran" with that sentinel, never a raise: the cycle
-        unpacks the tuple and logs raises separately, so a benign empty result
-        must not read as a checkpoint failure on every affected tick.
-
-        :meth:`AsyncSqliteBase.checkpoint` (dashboard, ``cost_store``) raises
-        ``RuntimeError`` on the identical condition instead, and both live in
-        this one module.  Read both before moving a store from one to the other:
-        the swap turns "raises on an impossible pragma result" into "returns a
-        sentinel that unpacks as three ints" with no type or test signal.
+        Raises ``RuntimeError`` when the pragma yields no row, the same as
+        :meth:`AsyncSqliteBase.checkpoint`.  A store that is not open is
+        answered by :meth:`checkpoint_or_unavailable`.
         """
         async with self._held('checkpoint()'):
-            rows = list(
-                await self._connection.execute_fetchall('PRAGMA wal_checkpoint(TRUNCATE)')
-            )
-        if not rows:
-            return CheckpointResult.unavailable()
-        row = rows[0]
-        return CheckpointResult(int(row[0]), int(row[1]), int(row[2]))
+            rows = await self._connection.execute_fetchall('PRAGMA wal_checkpoint(TRUNCATE)')
+        return CheckpointResult.from_pragma_rows(rows)
 
     async def close(self) -> None:
         """Truncate the WAL best-effort, then close the wrapped connection.
 
-        Taking the lock means a unit already in flight commits first rather
-        than being cut off mid-transaction.
+        A unit already in flight commits first.  A cancellation that lands
+        during the checkpoint (a caller's close budget running out on a loaded
+        host) still shuts the connection: ``stop()`` queues the close behind
+        the in-flight checkpoint without waiting for it.  Once a close has
+        taken the lock, a later close is a no-op.
         """
         async with self._held('close()'):
-            with contextlib.suppress(Exception):
-                await self._connection.execute_fetchall('PRAGMA wal_checkpoint(TRUNCATE)')
+            if self._closed:
+                return
+            self._closed = True
+            try:
+                with contextlib.suppress(Exception):
+                    await self._connection.execute_fetchall('PRAGMA wal_checkpoint(TRUNCATE)')
+            except BaseException:
+                self._connection.stop()
+                raise
             await self._connection.close()
 
     @staticmethod
@@ -344,12 +338,11 @@ class AsyncSqliteBase(abc.ABC):
             ...
 
     **Durability**: ``open()`` calls :func:`apply_full_durability_pragmas` on
-    every subclass, applying the Phase 3 triad (``synchronous=FULL``,
-    ``wal_autocheckpoint=100``, ``journal_size_limit=64 MiB``) — see
-    ``docs/task-recovery-2026-05-13/`` for the production incident that
-    mandated this convention.  A future subclass that needs WAL-only semantics
-    (e.g. an ephemeral or test store) must override ``open()`` and bypass
-    ``apply_full_durability_pragmas``; no class-level opt-out toggle exists.
+    every subclass, applying
+    ``shared/src/shared/sqlite_durability.py::DURABILITY_TRIAD``.  A future
+    subclass that needs WAL-only semantics (e.g. an ephemeral or test store)
+    must override ``open()`` and bypass ``apply_full_durability_pragmas``; no
+    class-level opt-out toggle exists.
     """
 
     def __init__(self, db_path: Path, *, busy_timeout_ms: int = 5000) -> None:
@@ -421,17 +414,7 @@ class AsyncSqliteBase(abc.ABC):
             RuntimeError: If the store has not been opened.
             RuntimeError: If ``PRAGMA wal_checkpoint(TRUNCATE)`` returns no rows
                 (unexpected; SQLite always returns a row for this pragma).
-
-        Note:
-            :meth:`AtomicConnection.checkpoint` — the fused-memory store family
-            — answers that same no-rows case with
-            :meth:`CheckpointResult.unavailable` instead.  Two opposite
-            contracts under one name in one module: a store moving between
-            them changes behaviour silently, so read both first.
         """
-        conn = self._require_conn()
-        async with conn.execute('PRAGMA wal_checkpoint(TRUNCATE)') as cursor:
-            row = await cursor.fetchone()
-        if row is None:
-            raise RuntimeError('PRAGMA wal_checkpoint returned no rows')
-        return CheckpointResult(int(row[0]), int(row[1]), int(row[2]))
+        return CheckpointResult.from_pragma_rows(
+            await self._require_conn().execute_fetchall('PRAGMA wal_checkpoint(TRUNCATE)')
+        )

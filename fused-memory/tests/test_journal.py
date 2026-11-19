@@ -2,14 +2,17 @@
 
 import asyncio
 import json
+import sqlite3
 import uuid
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 import pytest_asyncio
+from pydantic import ValidationError
 
 from fused_memory.models.reconciliation import (
-    JournalEntry,
+    JudgeInvocation,
     JudgeVerdict,
     ReconciliationRun,
     RunStatus,
@@ -25,6 +28,33 @@ from fused_memory.reconciliation.journal import (
     ReconciliationJournal,
 )
 from fused_memory.services.memory_service import MemoryService
+
+_LEGACY_JOURNAL_ENTRIES_DDL = """
+CREATE TABLE journal_entries (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    stage TEXT,
+    timestamp TEXT NOT NULL,
+    operation TEXT NOT NULL,
+    target_system TEXT NOT NULL,
+    before_state TEXT,
+    after_state TEXT,
+    reasoning TEXT DEFAULT '',
+    evidence TEXT DEFAULT '[]'
+);
+CREATE INDEX idx_journal_run ON journal_entries(run_id);
+"""
+
+
+def _schema_names(db_path: Path, kind: str) -> set[str]:
+    conn = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True)
+    try:
+        rows = conn.execute(
+            'SELECT name FROM sqlite_master WHERE type = ?', (kind,),
+        ).fetchall()
+    finally:
+        conn.close()
+    return {name for (name,) in rows}
 
 
 @pytest_asyncio.fixture
@@ -90,27 +120,58 @@ async def test_run_lifecycle(journal):
 
 
 @pytest.mark.asyncio
-async def test_journal_entries(journal):
-    run_id = str(uuid.uuid4())
-    entry = JournalEntry(
-        id=str(uuid.uuid4()),
-        run_id=run_id,
-        stage=StageId.memory_consolidator,
-        timestamp=datetime.now(UTC),
-        operation='delete_memory',
-        target_system='mem0',
-        before_state={'id': '123', 'content': 'old'},
-        after_state=None,
-        reasoning='Duplicate found',
-        evidence=[{'query': 'test', 'match': True}],
-    )
-    await journal.add_entry(entry)
+async def test_fresh_schema_creates_exactly_this_table_set(journal):
+    """The tables ReconciliationJournal.initialize() creates, read from the DB file.
 
-    entries = await journal.get_entries(run_id)
-    assert len(entries) == 1
-    assert entries[0].operation == 'delete_memory'
-    assert entries[0].before_state == {'id': '123', 'content': 'old'}
-    assert entries[0].evidence == [{'query': 'test', 'match': True}]
+    A tripwire on schema drift: the dashboard, a separate process, reads
+    these tables directly, so adding or dropping one must show up here.
+    The set cannot show that each table has a live producer (INV-13); whoever
+    adds a table owes that check.  recon_ledger shares the file but is
+    created by ReconLedgerStore, not by the journal.  judge_invocations is
+    written by Judge._record_cli_invocation (task 6573); sqlite_sequence is
+    SQLite's own, created by judge_invocations' AUTOINCREMENT.
+    """
+    db_path = journal.data_dir / 'reconciliation.db'
+
+    assert _schema_names(db_path, 'table') == {
+        'watermarks',
+        'runs',
+        'judge_verdicts',
+        'event_buffer',
+        'reconciliation_locks',
+        'burst_state',
+        'chunk_boundaries',
+        'run_actions',
+        'halt_state',
+        'judge_pending',
+        'judge_invocations',
+        'sqlite_sequence',
+    }
+
+
+@pytest.mark.asyncio
+async def test_initialize_drops_the_retired_journal_entries_table(journal, tmp_path):
+    """A reconciliation.db created before task 5890 loses the retired journal_entries table, and its index, on initialize."""
+    legacy_dir = tmp_path / 'legacy_recon'
+    legacy_dir.mkdir()
+    legacy_db = legacy_dir / 'reconciliation.db'
+    conn = sqlite3.connect(legacy_db)
+    try:
+        conn.executescript(_LEGACY_JOURNAL_ENTRIES_DDL)
+    finally:
+        conn.close()
+
+    legacy = ReconciliationJournal(legacy_dir)
+    try:
+        await legacy.initialize()
+    finally:
+        await legacy.close()
+
+    assert 'journal_entries' not in _schema_names(legacy_db, 'table')
+    assert 'idx_journal_run' not in _schema_names(legacy_db, 'index')
+    assert _schema_names(legacy_db, 'table') == _schema_names(
+        journal.data_dir / 'reconciliation.db', 'table',
+    )
 
 
 @pytest.mark.asyncio
@@ -196,6 +257,116 @@ async def test_add_verdict_atomically_clears_pending_marker(journal):
     assert run_id in {v.run_id for v in verdicts}
 
 
+_ARMED_CHECK = 'SELECT COUNT(*), MAX(completed_at) FROM judge_invocations'
+_TRIPWIRE_COUNT = 'SELECT COUNT(*) FROM judge_invocations WHERE ended_error_max_turns = 1'
+_TRIPWIRE_FIRST = (
+    'SELECT ji.completed_at, ji.run_id, r.project_id, ji.schema_salvaged, ji.num_turns,'
+    ' ji.rejected_tool_calls FROM judge_invocations ji LEFT JOIN runs r ON r.id = ji.run_id'
+    ' WHERE ji.ended_error_max_turns = 1 ORDER BY ji.completed_at LIMIT 1'
+)
+
+
+def _read_only_rows(db_path: Path, query: str) -> list[tuple]:
+    conn = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True)
+    try:
+        return conn.execute(query).fetchall()
+    finally:
+        conn.close()
+
+
+def _invocation(**overrides) -> JudgeInvocation:
+    fields = {
+        'run_id': 'run-1',
+        'completed_at': datetime.now(UTC),
+        'ended_error_max_turns': False,
+        'schema_salvaged': False,
+        'num_turns': 2,
+        'rejected_tool_calls': 0,
+    }
+    return JudgeInvocation(**(fields | overrides))
+
+
+class TestJudgeInvocations:
+    """The judge_invocations table behind the turn-cap tripwire (task 6573).
+
+    Read back through a read-only sqlite3 connection with the same queries
+    OPERATIONS.md gives the operator, so the recipe is pinned against the
+    real schema.
+    """
+
+    @pytest.mark.asyncio
+    async def test_armed_check_then_round_trip(self, journal):
+        db_path = journal.data_dir / 'reconciliation.db'
+        assert _read_only_rows(db_path, _ARMED_CHECK) == [(0, None)]
+
+        first_at = datetime(2026, 11, 15, 12, 0, tzinfo=UTC)
+        second_at = first_at + timedelta(minutes=5)
+        await journal.record_judge_invocation(_invocation(
+            run_id='run-hit', completed_at=first_at,
+            ended_error_max_turns=True, schema_salvaged=True, num_turns=4, rejected_tool_calls=2,
+        ))
+        await journal.record_judge_invocation(_invocation(
+            run_id='run-ok', completed_at=second_at,
+            ended_error_max_turns=False, num_turns=None, rejected_tool_calls=None,
+        ))
+        await journal.close()
+
+        assert _read_only_rows(
+            db_path,
+            'SELECT run_id, completed_at, ended_error_max_turns, schema_salvaged, num_turns,'
+            ' rejected_tool_calls FROM judge_invocations ORDER BY completed_at',
+        ) == [
+            ('run-hit', first_at.isoformat(), 1, 1, 4, 2),
+            ('run-ok', second_at.isoformat(), 0, 0, None, None),
+        ]
+        assert _read_only_rows(db_path, _ARMED_CHECK) == [(2, second_at.isoformat())]
+        assert _read_only_rows(db_path, _TRIPWIRE_COUNT) == [(1,)]
+        assert _read_only_rows(db_path, _TRIPWIRE_FIRST) == [
+            (first_at.isoformat(), 'run-hit', None, 1, 4, 2),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_initialize_adds_the_table_to_an_existing_db(self, tmp_path):
+        data_dir = tmp_path / 'existing_recon'
+        before = ReconciliationJournal(data_dir)
+        await before.initialize()
+        await before.close()
+        conn = sqlite3.connect(data_dir / 'reconciliation.db')
+        try:
+            conn.execute('DROP TABLE judge_invocations')
+            conn.commit()
+        finally:
+            conn.close()
+
+        after = ReconciliationJournal(data_dir)
+        await after.initialize()
+        try:
+            await after.record_judge_invocation(_invocation())
+        finally:
+            await after.close()
+
+        assert _read_only_rows(data_dir / 'reconciliation.db', _ARMED_CHECK)[0][0] == 1
+
+    @pytest.mark.parametrize('field', ['num_turns', 'rejected_tool_calls'])
+    def test_model_rejects_negative_counts(self, field):
+        with pytest.raises(ValidationError):
+            _invocation(**{field: -1})
+
+    def test_model_rejects_a_zero_turn_count(self):
+        with pytest.raises(ValidationError):
+            _invocation(num_turns=0)
+
+    def test_model_requires_schema_salvaged(self):
+        fields = _invocation().model_dump(exclude={'schema_salvaged'})
+        with pytest.raises(ValidationError):
+            JudgeInvocation.model_validate(fields)
+
+    def test_model_is_frozen(self):
+        invocation = _invocation()
+        with pytest.raises(ValidationError):
+            invocation.num_turns = 5
+
+
 @pytest.mark.asyncio
 async def test_recent_runs(journal):
     for i in range(3):
@@ -263,73 +434,6 @@ async def test_get_running_runs_returns_all_running_regardless_of_age(journal):
 
 
 @pytest.mark.asyncio
-async def test_interrupted_status_roundtrips_and_get_interrupted_runs(journal):
-    """complete_run(run_id, 'interrupted') persists RunStatus.interrupted and
-    stamps completed_at (the interrupt instant); get_interrupted_runs() returns
-    exactly the interrupted rows, excluding running/failed/completed."""
-    interrupted = ReconciliationRun(
-        id=str(uuid.uuid4()),
-        project_id='test-project',
-        run_type=RunType.full,
-        trigger_reason='unit-test',
-        started_at=datetime.now(UTC),
-        status=RunStatus.running,
-        instance_id='instance-interrupted',
-    )
-    still_running = ReconciliationRun(
-        id=str(uuid.uuid4()),
-        project_id='test-project',
-        run_type=RunType.full,
-        trigger_reason='unit-test',
-        started_at=datetime.now(UTC),
-        status=RunStatus.running,
-        instance_id='instance-running',
-    )
-    failed = ReconciliationRun(
-        id=str(uuid.uuid4()),
-        project_id='test-project',
-        run_type=RunType.full,
-        trigger_reason='unit-test',
-        started_at=datetime.now(UTC),
-        status=RunStatus.running,
-    )
-    completed = ReconciliationRun(
-        id=str(uuid.uuid4()),
-        project_id='test-project',
-        run_type=RunType.full,
-        trigger_reason='unit-test',
-        started_at=datetime.now(UTC),
-        status=RunStatus.running,
-    )
-    await journal.start_run(interrupted)
-    await journal.start_run(still_running)
-    await journal.start_run(failed)
-    await journal.start_run(completed)
-    await journal.complete_run(interrupted.id, 'interrupted')
-    await journal.complete_run(failed.id, 'failed')
-    await journal.complete_run(completed.id, 'completed')
-
-    # Roundtrip: status persists as interrupted and completed_at (the interrupt
-    # instant, later reused as the resume freshness clock) is stamped.
-    loaded = await journal.get_run(interrupted.id)
-    assert loaded is not None
-    assert loaded.status == RunStatus.interrupted
-    assert loaded.completed_at is not None
-
-    # get_interrupted_runs returns exactly the interrupted row, mapping
-    # instance_id/session snapshot faithfully, and excludes every other status.
-    interrupted_runs = await journal.get_interrupted_runs()
-    interrupted_ids = {r.id for r in interrupted_runs}
-    assert interrupted_ids == {interrupted.id}, (
-        f'Expected exactly the interrupted run; got ids={interrupted_ids!r}'
-    )
-    assert still_running.id not in interrupted_ids
-    assert failed.id not in interrupted_ids
-    assert completed.id not in interrupted_ids
-    assert interrupted_runs[0].instance_id == 'instance-interrupted'
-
-
-@pytest.mark.asyncio
 async def test_runs_table_has_session_columns(journal):
     """A freshly-initialized runs table exposes session_id, stage_cursor, attempt."""
     db = journal._require_access().connection
@@ -367,7 +471,7 @@ async def test_record_run_session_persists_and_increments_attempt(journal):
     assert loaded.stage_cursor == 'memory_consolidator'
     assert loaded.attempt == 1
 
-    # Same snapshot is visible via the _row_to_run recovery read path (σ).
+    # Same snapshot is visible via the _row_to_run recovery read path.
     running = {r.id: r for r in await journal.get_running_runs()}
     assert running[run_id].session_id == 'S1'
     assert running[run_id].stage_cursor == 'memory_consolidator'
@@ -1210,29 +1314,6 @@ class TestCompleteRunIfStatus:
         assert after.completed_at == owners_row.completed_at
 
     @pytest.mark.asyncio
-    async def test_interrupted_expected_status_is_honoured(self, journal):
-        refused_id = await self._seed(journal, RunStatus.interrupted)
-        applied_id = await self._seed(journal, RunStatus.interrupted)
-
-        refused = await journal.complete_run_if_status(
-            refused_id,
-            expected_status=RunStatus.running,
-            status=RunStatus.failed,
-            stage_reports={},
-        )
-        applied = await journal.complete_run_if_status(
-            applied_id,
-            expected_status=RunStatus.interrupted,
-            status=RunStatus.failed,
-            stage_reports={},
-        )
-
-        assert refused is False
-        assert (await journal.get_run(refused_id)).status == RunStatus.interrupted
-        assert applied is True
-        assert (await journal.get_run(applied_id)).status == RunStatus.failed
-
-    @pytest.mark.asyncio
     async def test_unknown_run_id_refuses_without_raising(self, journal):
         assert (
             await journal.complete_run_if_status(
@@ -1272,6 +1353,29 @@ class TestCompleteRunIfStatus:
         assert after_text == before_text
         assert after.status == before.status
         assert after.completed_at == before.completed_at
+
+
+class TestIsRunCompleted:
+    """The journal's one answer to whether a run durably completed."""
+
+    @pytest.mark.asyncio
+    async def test_a_run_journaled_completed_answers_true(self, journal):
+        run_id = await TestCompleteRunIfStatus._seed(journal, RunStatus.completed)
+
+        assert await journal.is_run_completed(run_id) is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'status', [RunStatus.running, RunStatus.failed]
+    )
+    async def test_a_run_in_any_other_status_answers_false(self, journal, status):
+        run_id = await TestCompleteRunIfStatus._seed(journal, status)
+
+        assert await journal.is_run_completed(run_id) is False
+
+    @pytest.mark.asyncio
+    async def test_an_unknown_run_id_answers_false_without_raising(self, journal):
+        assert await journal.is_run_completed('nonexistent-id') is False
 
 
 class TestUpdateRunStageReportsPreservesCitationRepairs:
@@ -1588,14 +1692,15 @@ class TestGetRunStageExecution:
     async def test_resumed_reports_whether_the_run_was_adopted_for_resume(
         self, journal
     ):
-        """``status`` alone cannot tell a settled run from one that is running
-        again: ``harness.py::_resume_interrupted_runs`` adopts an interrupted
-        run and ``run_full_cycle`` marks it running only on the in-memory
-        object, leaving the column ``'interrupted'``. The adopt pass does
-        persist its ``_resume`` bookkeeping first, so that key is the one
-        durable signal that the blob may be a stale mid-flight snapshot, and
-        the projection surfaces it rather than making every caller re-parse
-        ``stage_reports`` to find out."""
+        """``status`` alone cannot tell a settled legacy row from one that was
+        running again: before task 5514 retired resume, the startup
+        adopt-and-resume pass took over an interrupted run and
+        ``run_full_cycle`` marked it running only on the in-memory object,
+        leaving the column ``'interrupted'``. The adopt pass did persist its
+        ``_resume`` bookkeeping first, so that key is the one durable signal
+        that the blob may be a stale mid-flight snapshot, and the projection
+        surfaces it rather than making every caller re-parse ``stage_reports``
+        to find out."""
         settled = str(uuid.uuid4())
         await self._start(journal, settled)
         await journal.update_run_stage_reports(settled, {'_error': {'error': 'boom'}})
@@ -1662,12 +1767,13 @@ class TestGetRunStageExecution:
     async def test_interrupted_settles_only_when_it_was_never_adopted(
         self, journal, adopted, settled
     ):
-        """``interrupted`` is the one terminal status a run can leave: the
-        adopt-and-resume pass persists its ``_resume`` bookkeeping and then
-        re-runs the run behind a status column only ``complete_run`` ever
-        writes. So the SAME terminal status means "finished account" or
-        "executing again" depending on that key, and the projection — not its
-        caller — is what knows the difference."""
+        """``interrupted`` was the one terminal status a run could leave: the
+        adopt-and-resume pass (retired by task 5514) persisted its ``_resume``
+        bookkeeping and then re-ran the run behind a status column only
+        ``complete_run`` ever writes. So on a legacy row the SAME terminal
+        status means "finished account" or "was executing again" depending on
+        that key, and the projection — not its caller — is what knows the
+        difference."""
         run_id = str(uuid.uuid4())
         await self._start(journal, run_id)
         if adopted:

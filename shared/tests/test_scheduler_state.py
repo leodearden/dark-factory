@@ -8,6 +8,7 @@ producer writes exactly these keys and every reader parses them.
 from __future__ import annotations
 
 import json
+import sys
 from datetime import UTC, datetime
 from typing import Any
 
@@ -32,9 +33,12 @@ _SNAPSHOT_KEYS = {
     'pin_queue',
     'overrides',
     'current_holders',
+    'held_by_task',
+    'holder_limits',
     'lock_depth',
     'is_paused',
     'pause_reason',
+    'pause_class',
     'requeue_cooldowns',
     'snapshot_at',
 }
@@ -76,9 +80,12 @@ def _populated() -> SchedulerStateSnapshot:
             ),
         },
         current_holders={'mod/a': 'T7'},
+        held_by_task={'T6': ('mod/a',), 'T7': ('mod/a',)},
+        holder_limits={'mod/a': sys.maxsize},
         lock_depth=3,
         is_paused=True,
         pause_reason='operator halt',
+        pause_class='operator',
         requeue_cooldowns={
             'T1': RequeueCooldown(
                 armed_secs=31.25,
@@ -110,9 +117,12 @@ class TestEmpty:
             'pin_queue': [],
             'overrides': {},
             'current_holders': {},
+            'held_by_task': {},
+            'holder_limits': {},
             'lock_depth': None,
             'is_paused': False,
             'pause_reason': None,
+            'pause_class': None,
             'requeue_cooldowns': {},
             'snapshot_at': None,
         }
@@ -183,9 +193,12 @@ class TestWireShape:
         assert wire['skip_counts'] == {'T3': 2}
         assert wire['effective_priorities'] == {'T3': 'high'}
         assert wire['current_holders'] == {'mod/a': 'T7'}
+        assert wire['held_by_task'] == {'T6': ['mod/a'], 'T7': ['mod/a']}
+        assert wire['holder_limits'] == {'mod/a': sys.maxsize}
         assert wire['lock_depth'] == 3
         assert wire['is_paused'] is True
         assert wire['pause_reason'] == 'operator halt'
+        assert wire['pause_class'] == 'operator'
 
 
 class TestRollingRestart:
@@ -201,6 +214,13 @@ class TestRollingRestart:
         assert 'added_by_a_newer_producer' not in parsed.to_json()
         assert 'added_nested' not in parsed.to_json()['parks']['P']
 
+    def test_older_producer_without_pause_class_reads_none(self) -> None:
+        wire = _populated().to_json()
+        del wire['pause_class']
+        parsed = SchedulerStateSnapshot.from_json(wire)
+        assert parsed.is_paused is True
+        assert parsed.pause_class is None
+
     def test_older_producer_missing_keys_fill_with_defaults(self) -> None:
         parsed = SchedulerStateSnapshot.from_json({'current_holders': {'m': '7'}})
         assert parsed.snapshot_at is None
@@ -208,6 +228,66 @@ class TestRollingRestart:
             **SchedulerStateSnapshot.empty().to_json(),
             'current_holders': {'m': '7'},
         }
+
+
+class TestHolderTaskIds:
+    def test_every_holder_of_a_shared_key_is_named(self) -> None:
+        snap = SchedulerStateSnapshot.from_json({
+            'current_holders': {'docs/shared.md': 'B'},
+            'held_by_task': {'A': ['docs/shared.md'], 'B': ['docs/shared.md']},
+        })
+        assert snap.holder_task_ids() == frozenset({'A', 'B'})
+
+    def test_an_older_producer_without_held_by_task_reads_current_holders(self) -> None:
+        snap = SchedulerStateSnapshot.from_json({'current_holders': {'m': '7', 'n': '8'}})
+        assert snap.held_by_task == {}
+        assert snap.holder_task_ids() == frozenset({'7', '8'})
+
+    def test_no_holders_names_no_task(self) -> None:
+        assert SchedulerStateSnapshot.empty().holder_task_ids() == frozenset()
+
+
+class TestHoldersByKey:
+    def test_every_holder_of_each_held_key_is_named(self) -> None:
+        snap = SchedulerStateSnapshot.from_json({
+            'current_holders': {'docs/shared.md': 'B', 'src/x.py': 'B'},
+            'held_by_task': {'A': ['docs/shared.md'], 'B': ['docs/shared.md', 'src/x.py']},
+        })
+        assert snap.holders_by_key() == {
+            'docs/shared.md': frozenset({'A', 'B'}),
+            'src/x.py': frozenset({'B'}),
+        }
+
+    def test_an_older_producer_without_held_by_task_reads_current_holders(self) -> None:
+        snap = SchedulerStateSnapshot.from_json({'current_holders': {'k': '7'}})
+        assert snap.holders_by_key() == {'k': frozenset({'7'})}
+
+    def test_no_holders_maps_no_key(self) -> None:
+        assert SchedulerStateSnapshot.empty().holders_by_key() == {}
+
+
+class TestHolderLimit:
+    @pytest.mark.parametrize('limit', [1, 2, sys.maxsize])
+    def test_a_published_limit_is_read(self, limit: int) -> None:
+        snap = SchedulerStateSnapshot.from_json({'holder_limits': {'k': limit}})
+        assert snap.holder_limit('k') == limit
+
+    def test_a_key_without_a_published_limit_reads_exclusive(self) -> None:
+        snap = SchedulerStateSnapshot.from_json({
+            'current_holders': {'k': '7'},
+            'holder_limits': {'other': sys.maxsize},
+        })
+        assert snap.holder_limit('k') == 1
+
+    def test_an_older_producer_that_published_no_limits_reads_exclusive(self) -> None:
+        snap = SchedulerStateSnapshot.from_json({'current_holders': {'k': '7'}})
+        assert snap.holder_limits == {}
+        assert snap.holder_limit('k') == 1
+
+    def test_an_unlimited_limit_survives_a_json_text_hop(self) -> None:
+        snap = SchedulerStateSnapshot(holder_limits={'k': sys.maxsize})
+        parsed = SchedulerStateSnapshot.from_json(json.loads(json.dumps(snap.to_json())))
+        assert parsed.holder_limit('k') == sys.maxsize
 
 
 class TestMalformedInput:
@@ -234,6 +314,14 @@ class TestMalformedInput:
     def test_current_holder_must_be_a_string(self) -> None:
         with pytest.raises(MalformedSnapshotError):
             SchedulerStateSnapshot.from_json({'current_holders': {'m': 7}})
+
+    def test_held_by_task_lock_keys_must_be_strings(self) -> None:
+        with pytest.raises(MalformedSnapshotError):
+            SchedulerStateSnapshot.from_json({'held_by_task': {'T1': [7]}})
+
+    def test_holder_limits_must_be_ints(self) -> None:
+        with pytest.raises(MalformedSnapshotError):
+            SchedulerStateSnapshot.from_json({'holder_limits': {'k': 'many'}})
 
 
 class TestFrozen:

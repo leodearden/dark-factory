@@ -1,0 +1,36 @@
+{
+  "task_id": "3918",
+  "reason": "task 3918: get_files_touched_in_branch error contract, gate touched_set_error arm, unmeasured_delivery diagnosis",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/gates.py",
+      "baseline": 360,
+      "current": 363
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/gates.py::_check_plan_files_touched_in_branch",
+      "baseline": 37,
+      "current": 39
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/gates.py::_resolve_already_landed_branch",
+      "baseline": 17,
+      "current": 18
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5238,
+      "current": 5281
+    },
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6479,
+      "current": 6481
+    }
+  ]
+}

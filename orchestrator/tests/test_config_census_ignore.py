@@ -13,12 +13,14 @@ cover the new entry grammar, the violation taxonomy, and citation liveness.
 """
 
 import json
+import logging
 import sqlite3
 from pathlib import Path
 from typing import Any
 
 import pytest
 import yaml
+from shared.tasks_db_readonly import TaskDbProblem, TaskDbUnreadable
 
 from orchestrator.config_census_ignore import (
     CensusIgnoreFinding,
@@ -29,6 +31,8 @@ from orchestrator.config_census_ignore import (
     parse_census_ignore_entries,
     read_task_statuses,
 )
+
+_CENSUS_IGNORE_LOGGER = 'orchestrator.config_census_ignore'
 
 
 def _spec(reason: str | None, pattern: str = 'a.b') -> CensusIgnoreSpec:
@@ -283,8 +287,8 @@ def test_no_specs_yields_no_findings():
 
 # --- (c) citation liveness ----------------------------------------------------
 #
-# Policy adopted from the module docstring §"Standing invariants" of
-# fused-memory/src/fused_memory/reconciliation/stale_status_snapshot_edge_sweep.py
+# Policy adopted from docs/stale-status-snapshot-sweep.md §"Standing invariants"
+# (the stale status-snapshot edge sweep)
 # — invalidate ONLY on a positively-terminal answer, so the audit can under-fire
 # but can never invent a violation out of missing data.  check-config is an
 # offline tool routinely pointed at another project's YAML from a machine
@@ -369,9 +373,32 @@ def test_read_task_statuses_returns_none_and_never_raises(tmp_path, broken):
     assert read_task_statuses(tmp_path) is None
 
 
+def test_read_task_statuses_warns_with_the_refusal_for_a_stub_store(tmp_path, caplog):
+    db = tmp_path / '.taskmaster' / 'tasks' / 'tasks.db'
+    db.parent.mkdir(parents=True)
+    db.write_bytes(b'')
+    with caplog.at_level(logging.DEBUG, logger=_CENSUS_IGNORE_LOGGER):
+        assert read_task_statuses(tmp_path) is None
+    refusal = str(TaskDbUnreadable(db.resolve(), TaskDbProblem.EMPTY_STUB))
+    assert any(
+        r.levelno == logging.WARNING and refusal in r.getMessage() for r in caplog.records
+    )
+
+
+@pytest.mark.parametrize('absent', ['missing_dir', 'missing_db'])
+def test_read_task_statuses_absent_store_stays_below_warning(tmp_path, caplog, absent):
+    """Absence is ROUTINE: check-config is pointed at configs whose project
+    store is not on this machine, so it must not WARN."""
+    if absent == 'missing_db':
+        (tmp_path / '.taskmaster' / 'tasks').mkdir(parents=True)
+    with caplog.at_level(logging.DEBUG, logger=_CENSUS_IGNORE_LOGGER):
+        assert read_task_statuses(tmp_path) is None
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
 def test_read_task_statuses_does_not_mutate_the_store(tmp_path):
     """Opened strictly read-only (mode=ro) — a lint must never mutate the store
-    it measures.  Mirrors sandbox_soak._connect_ro / b3_gate."""
+    it measures.  Opens through shared.tasks_db_readonly.connect_ro."""
     db = _seed_tasks_db(tmp_path)
     before = db.stat().st_mtime_ns
     read_task_statuses(tmp_path)

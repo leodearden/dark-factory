@@ -40,6 +40,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple
 
+from shared.cgroup_slice import project_slice_name
+
 logger = logging.getLogger(__name__)
 
 __all__ = [
@@ -47,6 +49,7 @@ __all__ = [
     'read_pressure',
     'PsiSample',
     'read_psi_sample',
+    'cpu_some10_or_none',
     'RunqueueReading',
     'read_runqueue_ratio',
     'OwnCgroup',
@@ -190,8 +193,9 @@ def resolve_own_cgroup(
     """Resolve the reading process's own cgroup and its cpu.pressure file.
 
     Read the ``0::`` (unified-hierarchy) path from ``proc_cgroup_path`` and
-    walk it leaf-upward: the first segment equal to ``df-<project_id>.slice``
-    wins, else the leaf itself. Shapes are owned by PRD
+    walk it leaf-upward: the first segment equal to the project's slice name
+    (``shared/src/shared/cgroup_slice.py::project_slice_name``) wins, else the
+    leaf itself. Shapes are owned by PRD
     ``plans/load-throttle-harmonisation-prd.md`` §6.3, which is also the home
     of the parity fixtures this is tested against.
 
@@ -221,8 +225,8 @@ def resolve_own_cgroup(
         if not path:
             raise ValueError('0:: line carries no cgroup path')
         segments = path.split('/')
-        if project_id is not None:
-            slice_name = f'df-{project_id}.slice'
+        if project_id:
+            slice_name = project_slice_name(project_id)
             for depth in range(len(segments), 0, -1):
                 if segments[depth - 1] == slice_name:
                     path = '/'.join(segments[:depth])
@@ -534,3 +538,8 @@ def read_psi_sample(
         own_read_ok=own.read_ok,
         cpu_some60=host.cpu_some60,
     )
+
+
+def cpu_some10_or_none(sample: PsiSample) -> float | None:
+    """Host CPU pressure as a ledger records it: ``None`` means the host read failed; ``0.0`` is a real reading."""
+    return sample.cpu_some10 if sample.read_ok else None

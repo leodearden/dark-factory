@@ -47,10 +47,10 @@ class TestGatedKindFamily:
         expected = {k for k in declared if k.startswith('deterministic-')}
 
         assert frozenset(expected) == DETERMINISTIC_PROVENANCE_KINDS, (
-            'the gated family must be derived from DoneProvenance.kind, so a 5th '
+            'the gated family must be derived from DoneProvenance.kind, so a new '
             'deterministic kind added to the Literal is gated BY DEFAULT'
         )
-        assert len(DETERMINISTIC_PROVENANCE_KINDS) == 4
+        assert len(DETERMINISTIC_PROVENANCE_KINDS) == 5
 
     @pytest.mark.parametrize('kind', ['merged', 'found_on_main', 'operational-verified'])
     def test_non_deterministic_kinds_are_not_gated(self, kind):

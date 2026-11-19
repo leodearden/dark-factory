@@ -107,7 +107,7 @@ tasks:
     verdict: PASS
     delivered_check:
       kind: grep
-      pattern: execute_retain_consolidation\(
+      pattern: await apply_retain_arm\(
       paths:
       - fused-memory/src/fused_memory/server/tools.py
       expect: present
@@ -116,7 +116,7 @@ tasks:
     verdict: PASS
     delivered_check:
       kind: grep
-      pattern: canonical_content is None
+      pattern: '^\s+if canonical_content is (not )?None:'
       paths:
       - fused-memory/src/fused_memory/services/consolidation_ops.py
       expect: present

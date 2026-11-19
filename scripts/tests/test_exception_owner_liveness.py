@@ -226,6 +226,14 @@ def test_terminal_deferred_and_empty_statuses_are_dead(status):
         ),
         ({'status': 'pending'}, TicketOutcome(TicketState.PENDING, 'pending', None, None)),
         (
+            {'status': 'pending', 'ticket': 't', 'reason': 'wait_timeout'},
+            TicketOutcome(TicketState.PENDING, 'pending', None, 'wait_timeout'),
+        ),
+        (
+            {'status': 'awaiting_curation', 'ticket': 't', 'reason': 'curation-deferred: x'},
+            TicketOutcome(TicketState.PENDING, 'awaiting_curation', None, 'curation-deferred: x'),
+        ),
+        (
             {'status': 'failed', 'reason': 'unknown_ticket', 'task_id': None},
             TicketOutcome(TicketState.DEAD, 'failed', None, 'unknown_ticket'),
         ),
@@ -252,6 +260,7 @@ def test_ticket_outcome_parses_each_wire_shape(result, expected):
     [
         {'error': 'connection refused', 'error_type': 'ConnectionError'},
         {'status': 'failed', 'reason': 'server_closed', 'task_id': None},
+        {'status': 'pending', 'ticket': 't', 'reason': 'store_unavailable'},
         {'status': 'failed', 'reason': 'ticket_store not configured', 'task_id': None},
         {'status': 'created'},
         {'status': 'created', 'task_id': 'abc'},

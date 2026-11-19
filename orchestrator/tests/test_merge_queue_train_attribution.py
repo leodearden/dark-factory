@@ -314,6 +314,31 @@ class TestReverifyMemberSoloContract:
         # advance_main must NEVER be called
         git_ops.advance_main.assert_not_called()
 
+    async def test_the_escalation_queue_reaches_the_post_merge_verify(self) -> None:
+        """Task 3788: a main-probe flake suppressed during a solo re-verify must be
+        able to file the INV-4 storm escalation, so the queue is forwarded."""
+        from orchestrator.merge_lane.worker import reverify_member_solo
+
+        config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
+        config.git.branch_prefix = 'task/'
+        escalation_queue = MagicMock()
+        post_merge_verify = AsyncMock(return_value=None)
+
+        with patch('orchestrator.merge_lane.worker._run_post_merge_verify', new=post_merge_verify):
+            await reverify_member_solo(
+                git_ops=_make_git_ops_mock(),
+                member_id='b2',
+                solo_wt=Path('/tmp/fake-solo-wt-queue'),
+                solo_branch='_solo-b2',
+                tip_sha='abc123',
+                config=config,
+                task_files=None,
+                module_configs=[],
+                escalation_queue=escalation_queue,
+            )
+
+        assert post_merge_verify.call_args.kwargs['escalation_queue'] is escalation_queue
+
     async def test_solo_worktree_cleaned_up_on_pass(self) -> None:
         """Pass-path: worktree+branch are RETAINED (handed off to _attribute_train_failure).
 

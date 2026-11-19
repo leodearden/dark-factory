@@ -524,7 +524,7 @@ class TestPlanFromSlates:
             _cases_mod().plan_from_slates(self._records(), [], provenance={})
 
     def test_a_hoisted_child_counts_as_the_canonical_on_the_slate(self) -> None:
-        """`_canonical_id_of` hoists a sighting to its parent, so a slate
+        """`canonical_id_of` hoists a sighting to its parent, so a slate
         holding only the CHILD still shows the model the match."""
         slates = [
             _slate('c1-dup-1', candidates=[_live('child', canonical_id='c1-canon')],

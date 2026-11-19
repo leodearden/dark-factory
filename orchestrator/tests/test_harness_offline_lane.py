@@ -39,6 +39,13 @@ async def _until(done: Callable[[], bool]) -> None:
         assert time.monotonic() < deadline, 'the harness-built lane worker did not get there in time'
         await asyncio.sleep(0.02)
 
+
+async def _no_open_lane_tasks(name: str, arguments: dict, **_kwargs) -> dict:
+    """The task store as the lane's lookup sees it with no open lane task; every other tool answers nothing."""
+    if name == 'find_tasks_by_metadata':
+        return {'results': [], 'pagination': {'has_more': False}}
+    return {}
+
 # ---------------------------------------------------------------------------
 # Fixture
 # ---------------------------------------------------------------------------
@@ -108,7 +115,7 @@ class TestOfflineLaneWiring:
         harness.git_ops.is_ancestor_checked = AsyncMock(return_value=True)
         submit_task = AsyncMock(return_value=SubmittedTask('7001', 'deferred'))
         harness.scheduler.submit_task = submit_task
-        harness.scheduler.dispatch_tool = AsyncMock(return_value={})
+        harness.scheduler.dispatch_tool = AsyncMock(side_effect=_no_open_lane_tasks)
         git = harness.config.git
         git.offline_lane_enabled = True
         git.persistent_offline_deep_worktree = True

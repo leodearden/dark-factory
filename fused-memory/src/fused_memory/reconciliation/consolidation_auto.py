@@ -4,11 +4,14 @@ Task 5237. Implements PRD ``plans/memory-auto-consolidation-prd.md`` contract
 C2 (:func:`evaluate_auto_predicate` — rules on whether a proposed near-duplicate
 cluster may be consolidated with no human in the loop) and contract C3
 (:func:`build_auto_canonical` — the ONE home of auto-consolidated canonical
-text).
+text). ``plans/consolidation-adjudicator-prd.md`` K1 and K2 add who decides each
+reason code (:data:`REASON_CODE_CLASSES`) and the predicate's waivers.
 
 Import-leaf rule
 ----------------
-This module imports **only the standard library**, and must keep doing so.
+This module imports **only the standard library**, plus the stdlib-only
+``shared.memory_supersession`` constant and the stdlib-only
+``fused_memory.canonical_marker`` leaf, and must keep doing so.
 :class:`~fused_memory.config.schema.ConsolidationAutoConfig` is referenced under
 ``TYPE_CHECKING`` only, so importing this module never loads config, pydantic,
 yaml or the mem0 SDK. That is a STRICTLY STRONGER property than its sibling leaf
@@ -17,9 +20,9 @@ records a MEASURED hard import cycle from a careless import of exactly this kind
 (``config/schema.py`` -> ``memory_metadata`` -> ``backends.mem0_client`` ->
 ``config.schema``, raising ``ImportError: cannot import name
 'FusedMemoryConfig'``). ``tests/test_consolidation_auto.py`` pins the property in
-a fresh interpreter; if you add a runtime ``fused_memory`` import here, this
-module's import cost becomes a whole config build and the cycle above is one
-edit away.
+a fresh interpreter; if you add any other runtime ``fused_memory`` import here,
+this module's import cost becomes a whole config build and the cycle above is
+one edit away.
 
 Two properties a reader must not get wrong
 ------------------------------------------
@@ -42,7 +45,12 @@ from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
+
+from shared.memory_supersession import SUPERSEDED_BY_METADATA_KEY
+
+from fused_memory.canonical_marker import is_canonical
 
 if TYPE_CHECKING:  # pragma: no cover - a runtime import here would cost the leaf
     from fused_memory.config.schema import ConsolidationAutoConfig
@@ -50,12 +58,15 @@ if TYPE_CHECKING:  # pragma: no cover - a runtime import here would cost the lea
 __all__ = [
     'CORRECTION_BANNER_RE',
     'CORRECTION_METADATA_KEYS',
+    'REASON_CODE_CLASSES',
     'UNREADABLE',
     'AutoOutcome',
     'AutoProposal',
     'AutoReason',
     'AutoReasonCode',
     'AutoVerdict',
+    'FlowReasonCode',
+    'ReasonCodeClass',
     'build_auto_canonical',
     'evaluate_auto_predicate',
 ]
@@ -68,7 +79,8 @@ class AutoOutcome(StrEnum):
     unstamped members onto a topic that already has a canonical, touching that
     canonical's content and metadata not at all. ``NOOP`` means there is
     nothing to do (already consolidated, or a human already owns the topic).
-    ``FAIL`` means a hazard fired and the cluster goes to a human.
+    ``FAIL`` means a hazard fired; :data:`REASON_CODE_CLASSES` says who
+    decides each of its reasons.
     """
 
     PASS = 'pass'
@@ -106,6 +118,66 @@ class AutoReasonCode(StrEnum):
     incumbent_canonical_stripped = 'incumbent_canonical_stripped'
     already_consolidated = 'already_consolidated'
     no_retained_members = 'no_retained_members'
+
+
+class ReasonCodeClass(StrEnum):
+    """Who decides a reason code (``plans/consolidation-adjudicator-prd.md`` K1).
+
+    ``NO_OP``: nothing to do; the code is a fact or a disclosure.
+    ``REPAIR``: the executor drops the offending member and re-runs the predicate.
+    ``RETRY``: a read did not answer; the proposal is tried again, boundedly.
+    ``REFUSE``: code refuses the proposal; no model is asked.
+    ``ADJUDICATOR``: a measured judgement the LLM adjudicator makes.
+    """
+
+    NO_OP = 'no_op'
+    REPAIR = 'repair'
+    RETRY = 'retry'
+    REFUSE = 'refuse'
+    ADJUDICATOR = 'adjudicator'
+
+
+#: The ONE home of K1's partition. A lookup of an unclassified code raises
+#: ``KeyError`` at use; ``tests/test_consolidation_auto.py`` checks totality.
+REASON_CODE_CLASSES: Mapping[AutoReasonCode, ReasonCodeClass] = MappingProxyType({
+    AutoReasonCode.already_gated: ReasonCodeClass.NO_OP,
+    AutoReasonCode.already_consolidated: ReasonCodeClass.NO_OP,
+    AutoReasonCode.incumbent_canonical_stripped: ReasonCodeClass.NO_OP,
+    AutoReasonCode.member_not_found: ReasonCodeClass.REPAIR,
+    AutoReasonCode.member_different_topic: ReasonCodeClass.REPAIR,
+    AutoReasonCode.member_already_canonical: ReasonCodeClass.REPAIR,
+    AutoReasonCode.proposal_category_mismatch: ReasonCodeClass.REPAIR,
+    AutoReasonCode.member_unreadable: ReasonCodeClass.RETRY,
+    AutoReasonCode.canonical_count_unavailable: ReasonCodeClass.RETRY,
+    AutoReasonCode.member_id_repeated: ReasonCodeClass.REFUSE,
+    AutoReasonCode.no_retained_members: ReasonCodeClass.REFUSE,
+    AutoReasonCode.mixed_category: ReasonCodeClass.REFUSE,
+    AutoReasonCode.canonical_category_mismatch: ReasonCodeClass.REFUSE,
+    AutoReasonCode.multiple_canonicals: ReasonCodeClass.REFUSE,
+    AutoReasonCode.canonical_count_contradicted: ReasonCodeClass.REFUSE,
+    AutoReasonCode.member_carries_correction_metadata: ReasonCodeClass.REFUSE,
+    AutoReasonCode.canonical_carries_correction: ReasonCodeClass.REFUSE,
+    AutoReasonCode.slug_near_collision: ReasonCodeClass.REFUSE,
+    AutoReasonCode.member_carries_correction_banner: ReasonCodeClass.ADJUDICATOR,
+})
+
+
+class FlowReasonCode(StrEnum):
+    """Reasons the flow rules AROUND the predicate give a proposal.
+
+    K1's keep and size rules and K4's memo and bounded retry. Kept apart from
+    :class:`AutoReasonCode` because every member of that enum must be produced
+    by the predicate itself (``TestEveryReasonCodeIsExercised``). Both land in
+    one flat ``reason_codes`` tuple on the ledger row, so no value here may
+    equal an ``AutoReasonCode`` value.
+    """
+
+    too_few_members_after_repair = 'too_few_members_after_repair'
+    too_many_members_to_adjudicate = 'too_many_members_to_adjudicate'
+    too_few_kept = 'too_few_kept'
+    closure_failed_previously = 'closure_failed_previously'
+    unreadable = 'unreadable'
+    adjudicator_failed = 'adjudicator_failed'
 
 
 @dataclass(frozen=True)
@@ -197,11 +269,14 @@ UNREADABLE = _Unreadable()
 #: ``superseded_by`` 32, ``corrects_memory_id`` 17, ``corrects`` 6,
 #: ``stale_pre_fix_state`` 2.
 #:
-#: None of these is registered vocabulary today — ``memory_metadata`` censuses
-#: all of them as unknown keys — which is why they are enumerated here as
-#: observed corpus facts rather than imported from a registry that does not
-#: carry them. The arm is REFUSAL-ONLY, so widening it can only make the
-#: predicate more conservative and can never grant a pass.
+#: None of those six is registered vocabulary today — ``memory_metadata``
+#: censuses all of them as unknown keys — which is why they are enumerated here
+#: as observed corpus facts rather than imported from a registry that does not
+#: carry them. The supersession mark is the one key in the set that this
+#: codebase defines (``shared.memory_supersession``) and fused-memory itself
+#: writes, via ``services/supersession_mark.py::mark_superseded``. The arm is
+#: REFUSAL-ONLY, so widening it can only make the predicate more conservative
+#: and can never grant a pass.
 CORRECTION_METADATA_KEYS: frozenset[str] = frozenset({
     'corrects',
     'superseded_by',
@@ -209,6 +284,7 @@ CORRECTION_METADATA_KEYS: frozenset[str] = frozenset({
     'corrects_memory_id',
     'corrected_by_run',
     'corrected_at',
+    SUPERSEDED_BY_METADATA_KEY,
 })
 
 #: Body text marking a record as corrected, superseded or retracted.
@@ -316,7 +392,7 @@ def _is_incumbent(record: object, topic: str) -> bool:
     hazard instead.
     """
     metadata = _metadata(record)
-    return metadata.get('canonical') is True and metadata.get('topic') == topic
+    return is_canonical(metadata) and metadata.get('topic') == topic
 
 
 def _member_categories(
@@ -512,7 +588,7 @@ def _member_hazards(
         # incumbent stays exempt, so this code and the canonical-level codes
         # remain disjoint. `member_different_topic` is an `elif` because this
         # detail already names the foreign topic: one fact, one code.
-        if metadata.get('canonical') is True and not _is_incumbent(record, proposal.topic):
+        if is_canonical(metadata) and not _is_incumbent(record, proposal.topic):
             reasons.append(
                 AutoReason(
                     code=AutoReasonCode.member_already_canonical,
@@ -789,6 +865,32 @@ def _slug_hazards(
     return reasons
 
 
+def _require_adjudicator_waivers(waived: frozenset[tuple[AutoReasonCode, str]]) -> None:
+    """Raise unless every waiver names an adjudicator-class code (K2).
+
+    Every offender is collected into one error, an unknown code included, so a
+    mis-wired caller learns all of them at once.
+    """
+    offenders = sorted(
+        (str(code), str(subject), str(REASON_CODE_CLASSES.get(code, 'unclassified')))
+        for code, subject in waived
+        if REASON_CODE_CLASSES.get(code) is not ReasonCodeClass.ADJUDICATOR
+    )
+    if offenders:
+        named = '; '.join(
+            f'{code} for {subject} (class {cls})' for code, subject, cls in offenders
+        )
+        raise ValueError(f'only adjudicator-class codes may be waived: {named}')
+
+
+def _is_waived(reason: AutoReason, waived: frozenset[tuple[AutoReasonCode, str]]) -> bool:
+    """Is every record *reason* names waived under its code?
+
+    A reason naming no record can never be waived.
+    """
+    return bool(reason.ids) and all((reason.code, member_id) in waived for member_id in reason.ids)
+
+
 def evaluate_auto_predicate(
     proposal: AutoProposal,
     *,
@@ -797,6 +899,7 @@ def evaluate_auto_predicate(
     open_gate_id: str | None,
     existing_canonical_slugs: Sequence[str],
     config: ConsolidationAutoConfig,
+    waived: frozenset[tuple[AutoReasonCode, str]] = frozenset(),
 ) -> AutoVerdict:
     """Rule on whether *proposal* may be consolidated with no human in the loop.
 
@@ -821,6 +924,11 @@ def evaluate_auto_predicate(
        topic's canonical state undecidable here — and a *proposal* whose
        declared ``category`` contradicts the one its members share, which would
        otherwise reach the executor as the minted canonical's own category.
+       A hazard the caller listed in *waived* — ``(code, subject member id)``,
+       derived from its adjudicator's judgement (PRD
+       ``plans/consolidation-adjudicator-prd.md`` K2) — is skipped. Only
+       adjudicator-class codes may be waived; any other waiver raises
+       ``ValueError`` before rung 1. The verdict does not echo waived hazards.
     3. An incumbent canonical of THIS topic named in the member list is
        STRIPPED from the retained set and disclosed.
     4. ``already_consolidated`` -> NOOP, judged over the RETAINED set.
@@ -852,6 +960,8 @@ def evaluate_auto_predicate(
     deleted twice, or a canonical minted over nothing. C1 is not the only door
     into this predicate, so those two are refused here as well.
     """
+    _require_adjudicator_waivers(waived)
+
     # Rung 1. Evaluated before the hazard arm on purpose: when a human already
     # holds the topic, what the members look like is not this function's
     # business, and reporting a hazard here would invite a second filing on a
@@ -883,9 +993,13 @@ def evaluate_auto_predicate(
     # One flat concatenation, so collecting every offender is structural rather
     # than remembered: no arm can short-circuit another.
     hazards = [
-        *_member_hazards(proposal, members),
-        *_canonical_hazards(proposal, members, canonical_count),
-        *_slug_hazards(proposal, existing_canonical_slugs, config.slug_collision_jaccard),
+        reason
+        for reason in (
+            *_member_hazards(proposal, members),
+            *_canonical_hazards(proposal, members, canonical_count),
+            *_slug_hazards(proposal, existing_canonical_slugs, config.slug_collision_jaccard),
+        )
+        if not _is_waived(reason, waived)
     ]
     if hazards:
         return AutoVerdict(

@@ -1,9 +1,8 @@
 """Role-prompt guidance: a check refutes a claim only in the claim's own execution context.
 
-`orchestrator/src/orchestrator/agents/roles.py::_BASH_CAPABLE_ROLE_PREAMBLE`
+`orchestrator/src/orchestrator/agents/harness_guidance.py::BASH_CAPABLE_ROLE_PREAMBLE`
 splices `PREMISE_REFUTATION_GUIDANCE` into every role holding unqualified
-`Bash`. It is a leaf module, imported downward by roles.py, only so that
-already oversized file does not grow further.
+`Bash`. It is a leaf module, imported downward by harness_guidance.py.
 
 THIS CONSTANT IS THE SINGLE NORMATIVE STATEMENT OF THE RULE. Skills that
 restate it point here; correct the rule here.

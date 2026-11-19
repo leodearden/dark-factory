@@ -16,12 +16,19 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
+from escalation.models import Escalation
 from shared.cost_store import _SCHEMA as _COST_SCHEMA
 from shared.cost_store import CostStore
 
 import orchestrator.digest as digest
 from orchestrator.event_store import EventStore
+from orchestrator.lane_record_divergence import (
+    LANE_RECORD_DIVERGENCE,
+    DivergenceStreak,
+    LaneDivergence,
+)
 from orchestrator.run_store import RunStore
+from orchestrator.starvation_watchdog import STARVATION_WATCHDOG_ROLE
 
 
 class TestUpdateEwa:
@@ -386,6 +393,36 @@ class TestCountDoneInWindow:
         assert count == 2, f"Expected 2 done in window via relative path; got {count}"
         warnings = [r for r in caplog.records if r.levelno >= logging.WARNING and r.name == 'orchestrator.digest']
         assert not warnings, f"Relative path with existing DB must not WARNING; got: {[r.message for r in warnings]}"
+
+    def test_query_form_counts_on_an_open_connection(self, tmp_path: Path) -> None:
+        """The connection-taking form counts what the fail-open form counts and
+        leaves the connection it was handed open."""
+        db_path = tmp_path / 'events.db'
+        _seed_events_db_direct(db_path)
+        window = ('2026-05-10T00:00:00+00:00', '2026-05-10T23:59:59+00:00')
+
+        conn = sqlite3.connect(db_path)
+        try:
+            count = digest.query_count_done_in_window(conn, *window)
+            assert count == 2
+            assert count == digest.count_done_in_window(db_path, *window)
+            assert conn.execute('SELECT 1').fetchone() == (1,)
+        finally:
+            conn.close()
+
+    def test_query_form_raises_on_a_schema_less_db(self, tmp_path: Path) -> None:
+        """A missing events table raises instead of reading as zero done."""
+        db_path = tmp_path / 'schema-less.db'
+        sqlite3.connect(str(db_path)).close()
+
+        conn = sqlite3.connect(db_path)
+        try:
+            with pytest.raises(sqlite3.OperationalError, match='no such table'):
+                digest.query_count_done_in_window(
+                    conn, '2026-05-10T00:00:00+00:00', '2026-05-10T23:59:59+00:00',
+                )
+        finally:
+            conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -913,6 +950,72 @@ class TestRenderDigestMarkdown:
         md = digest.render_digest_markdown(inputs)
         assert '## Stale lane assignments\n_none_\n' in md
 
+    def test_lane_record_divergence_defaults_empty(self) -> None:
+        assert _make_digest_inputs().lane_record_divergence == ()
+
+    def test_lane_record_divergence_section_lists_each_divergence(self) -> None:
+        first_seen = _datetime(2026, 11, 9, 10, 0, tzinfo=UTC)
+        divergences = (
+            LaneDivergence(
+                lane='_lane-3', map_task_ids=('5260',), record_state=None,
+                record_task_id=None,
+                streak=DivergenceStreak(
+                    consecutive_digests=2, first_seen=first_seen,
+                    last_seen=first_seen + timedelta(hours=2),
+                ),
+            ),
+            LaneDivergence(
+                lane='_lane-9', map_task_ids=('4211',), record_state=None,
+                record_task_id=None, streak=DivergenceStreak.starting(first_seen),
+            ),
+        )
+        inputs = _make_digest_inputs()
+        inputs.lane_record_divergence = divergences
+
+        heading, *body = _lane_record_divergence_section(
+            digest.render_digest_markdown(inputs),
+        )
+
+        assert heading.startswith('## ') and LANE_RECORD_DIVERGENCE in heading
+        assert body[:2] == [f'- {d.render()}' for d in divergences]
+
+    def test_lane_record_divergence_section_clean(self) -> None:
+        inputs = _make_digest_inputs()
+        inputs.lane_record_divergence = ()
+
+        _, first = _lane_record_divergence_section(
+            digest.render_digest_markdown(inputs),
+        )[:2]
+
+        assert first == '_none_'
+
+    def test_lane_record_divergence_section_unavailable(self) -> None:
+        inputs = _make_digest_inputs()
+        inputs.lane_record_divergence = None
+
+        _, first = _lane_record_divergence_section(
+            digest.render_digest_markdown(inputs),
+        )[:2]
+
+        assert first != '_none_'
+        assert 'unavailable' in first
+
+    def test_lane_record_divergence_section_follows_stale_lanes(self) -> None:
+        md = digest.render_digest_markdown(_make_digest_inputs())
+        (heading, *_) = _lane_record_divergence_section(md)
+
+        assert md.index('## Stale lane assignments') < md.index(heading)
+
+
+def _lane_record_divergence_section(md: str) -> list[str]:
+    """The lane-record-divergence heading line and every line after it."""
+    lines = md.splitlines()
+    (start,) = [
+        i for i, line in enumerate(lines)
+        if line.startswith('## ') and LANE_RECORD_DIVERGENCE in line
+    ]
+    return lines[start:]
+
 
 # ---------------------------------------------------------------------------
 # TestWriteDigestEntry (step-13)
@@ -1192,6 +1295,68 @@ class TestModelRoleRollupCore:
         )
         assert rollup.rows == []
 
+    def test_query_form_equals_the_fail_open_wrapper(self, tmp_path: Path) -> None:
+        """On a readable store the connection-taking form and the fail-open
+        form return the same rollup, turn-cap saturation included, and the
+        connection-taking form leaves the connection it was handed open."""
+        db_path = tmp_path / 'runs.db'
+        _seed_rollup_runs_db(db_path)
+        run_id = 'run-test'
+        window = ('2026-05-10T00:00:00+00:00', '2026-05-10T23:59:59+00:00')
+        _insert_task_result(db_path, run_id=run_id, task_id='t1', outcome='done')
+        _insert_invocation(
+            db_path, run_id=run_id, task_id='t1', model='sonnet', role='implementer',
+            cost_usd=2.0, capped=False, completed_at='2026-05-10T08:00:00+00:00',
+        )
+        _insert_event(
+            db_path, run_id=run_id, task_id='t1', event_type='routing_decision',
+            role='implementer', data={'max_turns': 30}, timestamp='2026-05-10T07:59:00+00:00',
+        )
+        _insert_event(
+            db_path, run_id=run_id, task_id='t1', event_type='invocation_end',
+            role='implementer', data={'turns': 30}, timestamp='2026-05-10T08:00:00+00:00',
+        )
+
+        conn = sqlite3.connect(db_path)
+        try:
+            rollup = digest.query_model_role_rollup(conn, *window)
+            assert conn.execute('SELECT 1').fetchone() == (1,)
+        finally:
+            conn.close()
+
+        assert rollup.rows
+        assert rollup.turn_cap_saturation
+        assert rollup == digest.model_role_rollup(db_path, *window)
+
+    @pytest.mark.parametrize('table', ['events', 'invocations', 'task_results'])
+    def test_query_form_raises_on_a_missing_table(self, tmp_path: Path, table: str) -> None:
+        """Each table the rollup reads is required: dropping any one raises
+        naming it, rather than yielding an empty or partial rollup."""
+        db_path = tmp_path / 'runs.db'
+        _seed_rollup_runs_db(db_path)
+
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.execute(f'DROP TABLE {table}')
+            conn.commit()
+            with pytest.raises(sqlite3.OperationalError, match=table):
+                digest.query_model_role_rollup(
+                    conn, '2026-05-10T00:00:00+00:00', '2026-05-10T23:59:59+00:00',
+                )
+        finally:
+            conn.close()
+
+    def test_schema_less_db_still_returns_an_empty_rollup(self, tmp_path: Path) -> None:
+        """The path-taking form keeps failing open on a store with no tables."""
+        db_path = tmp_path / 'schema-less.db'
+        sqlite3.connect(str(db_path)).close()
+
+        rollup = digest.model_role_rollup(
+            db_path, '2026-05-10T00:00:00+00:00', '2026-05-10T23:59:59+00:00',
+        )
+
+        assert rollup == digest.ModelRoleRollup()
+
 
 class TestModelRoleRollupTurnCapSaturation:
     """Tests for digest.model_role_rollup(...).turn_cap_saturation (step-3/4)."""
@@ -1308,3 +1473,34 @@ class TestRenderDigestRollupSection:
         md = digest.render_digest_markdown(inputs)  # must not raise
         assert '## Per-(model×role) rollup' in md
         assert '_none_' in md
+
+
+# ---------------------------------------------------------------------------
+# Which escalations feed the EWA numerator (task 3821)
+# ---------------------------------------------------------------------------
+
+
+def _escalation_by(agent_role: str, level: int) -> Escalation:
+    return Escalation(
+        id=f'esc-T1-{level}',
+        task_id='T1',
+        agent_role=agent_role,
+        severity='info',
+        category='risk_identified',
+        summary='summary',
+        detail='detail',
+        suggested_action='manual_investigation',
+        level=level,
+    )
+
+
+class TestCountsTowardEwaNumerator:
+    @pytest.mark.parametrize('level', [0, 1])
+    def test_a_starvation_watchdog_alarm_is_an_observation_not_a_fault(self, level: int) -> None:
+        esc = _escalation_by(STARVATION_WATCHDOG_ROLE, level)
+        assert digest.counts_toward_ewa_numerator(esc) is False
+
+    @pytest.mark.parametrize('role', ['implementer', 'orchestrator-scheduler', 'steward'])
+    def test_every_other_role_counts(self, role: str) -> None:
+        assert digest.counts_toward_ewa_numerator(_escalation_by(role, 0)) is True
+

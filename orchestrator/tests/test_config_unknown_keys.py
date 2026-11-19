@@ -174,11 +174,10 @@ def test_load_config_clean_config_empty_census(tmp_path, monkeypatch):
     assert config.unknown_key_census == []
 
 
-def test_direct_construction_yields_empty_census(tmp_path, monkeypatch):
+@pytest.mark.usefixtures("code_default_config")
+def test_direct_construction_yields_empty_census():
     """A directly-constructed OrchestratorConfig() never ran load_config, so the
     census sentinel stays None and the property normalizes to []."""
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv('ORCH_CONFIG_PATH', '')
     config = OrchestratorConfig()
     assert config.unknown_key_census == []
 
@@ -469,9 +468,8 @@ def test_load_config_stashes_both_censuses(tmp_path, monkeypatch):
     )
 
 
-def test_direct_construction_yields_empty_ignored_census(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+@pytest.mark.usefixtures("code_default_config")
+def test_direct_construction_yields_empty_ignored_census():
     assert OrchestratorConfig().ignored_key_census == []
 
 

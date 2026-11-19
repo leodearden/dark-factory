@@ -9,20 +9,29 @@ returns True) and assert the guard:
   - populates _inherited_break_info with category + dedupe_fingerprint
 
 Separate tests cover the non-inherited (fall-through) paths, flag-off, and
-the infra_timeout / flock_error skip-set.
+the infra_timeout / flock_error skip-set.  The escalation-filing tests drive
+the real VERIFY-branch call site through ``_execute_verify_review_loop``.
 """
 from __future__ import annotations
 
 import asyncio
+from contextlib import AbstractContextManager, ExitStack
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
+
+from escalation.queue import EscalationQueue
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps
+from orchestrator.main_health_actions import MainHealthNextAction
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.verify import VerifyResult
-from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
+from orchestrator.workflow import (
+    TaskWorkflow,
+    WorkflowOutcome,
+    compute_preexisting_main_break_fingerprint,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -104,6 +113,42 @@ def _make_workflow(
     # Stub rebase so it doesn't touch git
     workflow._inter_iteration_rebase = AsyncMock(return_value=None)
     return workflow
+
+
+def _make_workflow_with_queue(tmp_path: Path) -> tuple[TaskWorkflow, EscalationQueue]:
+    """An ownerless workflow (no merge worker) filing into a real escalation queue."""
+    worktree = tmp_path / 'task-wt'
+    worktree.mkdir()
+    workflow = _make_workflow(_make_config(tmp_path), worktree)
+    queue = EscalationQueue(tmp_path / 'escalations')
+    workflow.escalation_queue = queue
+    return workflow, queue
+
+
+def _block_at_the_verify_call_site(
+    workflow: TaskWorkflow, *also: AbstractContextManager,
+) -> WorkflowOutcome:
+    """Run the execute/verify/review loop past a stubbed EXECUTE into an inherited verify break."""
+
+    async def _drive() -> WorkflowOutcome:
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(
+                workflow, '_execute_iterations',
+                new=AsyncMock(return_value=WorkflowOutcome.PLANNED),
+            ))
+            stack.enter_context(patch(
+                'orchestrator.workflow.run_scoped_verification',
+                new=AsyncMock(return_value=COMPILE_ERROR_RESULT),
+            ))
+            stack.enter_context(patch(
+                'orchestrator.workflow.verify_failure_is_preexisting_on_main',
+                new=AsyncMock(return_value=(True, MAIN_SHA)),
+            ))
+            for context in also:
+                stack.enter_context(context)
+            return await workflow._execute_verify_review_loop()
+
+    return asyncio.run(_drive())
 
 
 # ---------------------------------------------------------------------------
@@ -289,72 +334,36 @@ class TestVerifyDebugfixLoopSiblingFix:
 
 
 # ---------------------------------------------------------------------------
-# Test 4 — call-site routing: _inherited_break_info -> _mark_blocked with
-#           dedupe_fingerprint; escalation has correct fields
+# Test 4 — the real VERIFY-branch call site files the steward-facing L0
 # ---------------------------------------------------------------------------
 
 
 class TestInheritedBreakEscalationFiling:
-    """Step-13 / test-expectation #5 + invariant d: escalation has right severity/category."""
+    """The inherited-break L0 is a cross-task-folded, level-0 'blocking' record that
+    asks its steward to re-run the failures in isolation before deferring to a fix owner."""
 
-    def test_call_site_routes_inherited_break_to_mark_blocked(
+    def test_inherited_break_files_a_steward_l0_asking_for_an_isolated_rerun(
         self, tmp_path: Path,
     ) -> None:
-        """_mark_blocked(dedupe_fingerprint=...) produces severity='blocking', level=0,
-        category='preexisting_main_break', non-empty dedupe_fingerprint.
-        scheduler.set_task_status called exactly once with 'blocked'.
-        """
         from escalation.models import BORN_AT_L2_SEVERITIES
-        from escalation.queue import EscalationQueue
 
-        config = _make_config(tmp_path)
-        worktree = tmp_path / 'task-wt'
-        worktree.mkdir()
-        workflow = _make_workflow(config, worktree)
+        workflow, queue = _make_workflow_with_queue(tmp_path)
 
-        # Wire real EscalationQueue
-        eq = EscalationQueue(tmp_path / 'escalations')
-        workflow.escalation_queue = eq
+        outcome = _block_at_the_verify_call_site(workflow)
 
-        fp = 'sha256-deadbeef' * 2
-
-        async def _drive():
-            # The call site will read _inherited_break_info and pass dedupe_fingerprint
-            # to _mark_blocked.  Until step-14 wires this, _mark_blocked lacks the param.
-            return await workflow._mark_blocked(
-                "Verify failure is preexisting on main (category='compile_error'): ...",
-                detail='type error detail',
-                category='preexisting_main_break',
-                suggested_action='await_preexisting_main_hotfix',
-                dedupe_fingerprint=fp,
-            )
-
-        asyncio.run(_drive())
-
-        # Scheduler.set_task_status must have been called with 'blocked'
-        workflow.scheduler.set_task_status.assert_called()  # type: ignore[union-attr]
-        call_args = workflow.scheduler.set_task_status.call_args  # type: ignore[union-attr]
-        assert 'blocked' in str(call_args), (
-            f'set_task_status should be called with blocked; got {call_args}'
+        assert outcome == WorkflowOutcome.BLOCKED
+        set_task_status = workflow.scheduler.set_task_status
+        assert isinstance(set_task_status, AsyncMock)
+        set_task_status.assert_any_await(workflow.task_id, 'blocked')
+        [esc] = queue.get_by_task(workflow.task_id, level=0)
+        assert esc.level == 0
+        assert esc.severity == 'blocking'
+        assert esc.severity not in BORN_AT_L2_SEVERITIES
+        assert esc.category == 'preexisting_main_break'
+        assert esc.dedupe_fingerprint == compute_preexisting_main_break_fingerprint(
+            'compile_error', COMPILE_ERROR_RESULT.cause_hint, MAIN_SHA,
         )
-
-        # One L0 escalation filed for the inherited break (steward may also
-        # add an L1 in the follow-on flow; filter to the L0 to assert our fields)
-        filed_l0 = eq.get_by_task(workflow.task_id, level=0)
-        assert len(filed_l0) >= 1, f'Expected at least 1 L0 escalation; got {filed_l0}'
-        esc = filed_l0[0]
-
-        assert esc.severity == 'blocking', f'severity must be blocking; got {esc.severity}'
-        assert esc.severity not in BORN_AT_L2_SEVERITIES, (
-            f'Must NOT be born-at-L2; got severity={esc.severity!r}'
-        )
-        assert getattr(esc, 'level', 0) == 0, f'level must be 0; got {esc.level}'
-        assert esc.category == 'preexisting_main_break', (
-            f'category must be preexisting_main_break; got {esc.category!r}'
-        )
-        assert esc.dedupe_fingerprint == fp, (
-            f'dedupe_fingerprint must be {fp!r}; got {esc.dedupe_fingerprint!r}'
-        )
+        assert esc.suggested_action == MainHealthNextAction.STEWARD_RERUN_IN_ISOLATION
 
 
 class TestCrossTaskInheritedBreakDedup:
@@ -432,7 +441,7 @@ class TestCrossTaskInheritedBreakDedup:
                 category='preexisting_main_break',
                 summary='Verify failure is preexisting on main',
                 detail='TS2769 type error',
-                suggested_action='await_preexisting_main_hotfix',
+                suggested_action=MainHealthNextAction.STEWARD_RERUN_IN_ISOLATION,
             )
             esc.dedupe_fingerprint = fp
             return esc
@@ -492,100 +501,24 @@ class TestCrossTaskInheritedBreakDedup:
 
 
 class TestFingerprintExceptionFallback:
-    """Suggestion 4: when compute_content_fingerprint raises, fp is '' and
-    _mark_blocked uses the raw-submit branch (no submit_or_dedupe fold) while
-    still filing the L0 with the correct category/severity.
+    """When compute_content_fingerprint raises, the call site still files the steward L0,
+    raw-submitted (no submit_or_dedupe fold) with its category, severity and action intact."""
 
-    Two complementary tests:
-      (a) Loop-level guard: compute_content_fingerprint raises -> loop returns BLOCKED
-          and _inherited_break_info['fingerprint'] == ''.
-      (b) _mark_blocked raw-submit branch: dedupe_fingerprint='' routes to raw submit,
-          escalation is still filed with correct severity/category and falsy fp.
-    """
+    def test_a_raising_fingerprint_files_the_steward_l0_raw(self, tmp_path: Path) -> None:
+        workflow, queue = _make_workflow_with_queue(tmp_path)
 
-    def test_fingerprint_exception_yields_empty_fp_and_blocked(
-        self, tmp_path: Path,
-    ) -> None:
-        """When compute_content_fingerprint raises inside the guard, fp=='' and the
-        loop still returns BLOCKED with _inherited_break_info populated.
-        """
-        config = _make_config(tmp_path)
-        worktree = tmp_path / 'task-wt'
-        worktree.mkdir()
-        workflow = _make_workflow(config, worktree)
-
-        async def _run_loop() -> WorkflowOutcome:
-            with (
-                patch('orchestrator.workflow.run_scoped_verification',
-                      new=AsyncMock(return_value=COMPILE_ERROR_RESULT)),
-                # Helper returns preexisting + SHA so the guard is entered.
-                patch('orchestrator.workflow.verify_failure_is_preexisting_on_main',
-                      new=AsyncMock(return_value=(True, MAIN_SHA))),
-                # Fingerprint computation raises — fp falls back to ''.
-                # Must patch at source (escalation.dedupe) since workflow uses a
-                # lazy 'from escalation.dedupe import compute_content_fingerprint'
-                # inside the try block, which rebinds the current value at call time.
-                patch(
-                    'escalation.dedupe.compute_content_fingerprint',
-                    side_effect=RuntimeError('fingerprint computation failed'),
-                ),
-            ):
-                return await workflow._verify_debugfix_loop()
-
-        outcome = asyncio.run(_run_loop())
-
-        assert outcome == WorkflowOutcome.BLOCKED, (
-            f'Loop must still return BLOCKED when fingerprint raises; got {outcome}'
-        )
-        info = workflow._inherited_break_info  # type: ignore[attr-defined]
-        assert info is not None, '_inherited_break_info must be set even on fp exception'
-        assert info.get('fingerprint') == '', (
-            f'fingerprint must be empty string on exception; got {info.get("fingerprint")!r}'
-        )
-        assert info.get('category') == 'preexisting_main_break', (
-            f'category must still be preexisting_main_break; got {info!r}'
+        outcome = _block_at_the_verify_call_site(
+            workflow,
+            # Patched at its source: workflow imports it lazily at call time.
+            patch(
+                'escalation.dedupe.compute_content_fingerprint',
+                side_effect=RuntimeError('fingerprint computation failed'),
+            ),
         )
 
-    def test_empty_fp_takes_raw_submit_branch_in_mark_blocked(
-        self, tmp_path: Path,
-    ) -> None:
-        """_mark_blocked(dedupe_fingerprint='') routes via raw-submit (not submit_or_dedupe),
-        still files an L0 escalation with severity='blocking' and the correct category.
-        The empty fp means no fold occurs and dedupe_fingerprint stays falsy on the filed esc.
-        """
-        from escalation.queue import EscalationQueue
-
-        config = _make_config(tmp_path)
-        worktree = tmp_path / 'task-wt'
-        worktree.mkdir()
-        workflow = _make_workflow(config, worktree)
-
-        eq = EscalationQueue(tmp_path / 'escalations')
-        workflow.escalation_queue = eq
-
-        async def _drive():
-            return await workflow._mark_blocked(
-                "Verify failure is preexisting on main (category='compile_error'): ...",
-                detail='type error detail',
-                category='preexisting_main_break',
-                suggested_action='await_preexisting_main_hotfix',
-                dedupe_fingerprint='',  # empty — must take raw-submit branch
-            )
-
-        asyncio.run(_drive())
-
-        # L0 must still be filed even with empty fp
-        filed_l0 = eq.get_by_task(workflow.task_id, level=0)
-        assert len(filed_l0) >= 1, (
-            f'L0 escalation must be filed via raw-submit even when fp is empty; '
-            f'got {filed_l0!r}'
-        )
-        esc = filed_l0[0]
-        assert esc.severity == 'blocking', f'severity must be blocking; got {esc.severity}'
-        assert esc.category == 'preexisting_main_break', (
-            f'category must be preexisting_main_break; got {esc.category!r}'
-        )
-        # Empty fp → raw-submit → no fold, dedupe_fingerprint must be falsy
-        assert not esc.dedupe_fingerprint, (
-            f'Raw-submit should leave dedupe_fingerprint falsy; got {esc.dedupe_fingerprint!r}'
-        )
+        assert outcome == WorkflowOutcome.BLOCKED
+        [esc] = queue.get_by_task(workflow.task_id, level=0)
+        assert not esc.dedupe_fingerprint
+        assert esc.category == 'preexisting_main_break'
+        assert esc.severity == 'blocking'
+        assert esc.suggested_action == MainHealthNextAction.STEWARD_RERUN_IN_ISOLATION

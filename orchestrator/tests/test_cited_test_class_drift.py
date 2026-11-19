@@ -53,11 +53,11 @@ from pathlib import Path
 from typing import NamedTuple, cast
 
 import pytest
-from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 # This file rglob('*.py')s both corpora, so it belongs to the whole-tree-scan
 # family. The ceiling's derivation lives at its single canonical home,
-# _orch_helpers.py::WHOLE_TREE_SCAN_TEST_TIMEOUT; the module-level mark is
+# shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT; the module-level mark is
 # REQUIRED by test_whole_tree_scan_timeout_guard.py, which recomputes its
 # scanner census from source on every run and checks this mark's VALUE.
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)

@@ -190,16 +190,23 @@ for the whole fleet. Entry: `fused-memory/src/fused_memory/server/main.py`
   load-sampler unit. Discovers orchestrator instances by reading each
   registered project's `dark-factory-orchestrator.yaml` (`escalation.port`);
   reads fused-memory and its own SQLite DBs read-only.
+- **Client feed publisher** — `client-feed@<name>.service`, one instance per
+  client project; setup-host renders the template and enables none. It reads
+  that project's `tasks.db` and `runs.db` read-only, its verify archive, its
+  git objects and its `in/` directory, and writes only its `out/`. Invariant
+  and contract: `plans/client-feed-prd.md` §8 and §7. Operating it:
+  [OPERATIONS.md](OPERATIONS.md) §"Client feed".
 - **`scripts/orchestrator-watchdog.py`** — a systemd-timer oneshot
   (`OnBootSec=30`, `OnUnitActiveSec=60`). Its liveness pass TCP-probes each
   orchestrator's escalation port and revives a wedged unit immediately; its
   separate staleness pass *intends* at most one fleet-wide redeploy per 8
   hours (shared clock file `data/orchestrator/last_redeploy_orchestrator.json`,
   plus an in-flight lease), delegating to
-  `scripts/restart-all-orchestrators.sh --drain`, a two-stage drain that
-  halts merge admission and holds each unit's restart while a merge verify is
-  in flight, until it ends or passes its own deadline (a sweep-wide cap bounds
-  the wait; units on pre-5371 code keep the old merge-idle gate). Full
+  `scripts/restart-all-orchestrators.sh --drain`, a two-stage drain that,
+  as the sweep reaches each unit, halts its merge admission and holds its
+  restart while one of its merge verifies is in flight, until it ends or
+  passes its own deadline (a per-unit cap and a sweep-wide ceiling bound the
+  wait; units on pre-5371 code keep the old merge-idle gate). Full
   redeploy story (liveness vs. staleness vs. coordinator) in
   [OPERATIONS.md](OPERATIONS.md).
 
@@ -342,7 +349,12 @@ Tasks reach the queue through `mcp__fused-memory__submit_task`
   (`{"ticket": "tkt_..."}`) and returns immediately; an async `TaskCurator`
   (`fused-memory/src/fused_memory/middleware/task_curator.py`) dedupes,
   combines, or creates the real task row in the SQLite backend
-  (`<project_root>/.taskmaster/tasks/tasks.db`).
+  (`<project_root>/.taskmaster/tasks/tasks.db`). When the curator cannot judge
+  a submission (the reasons are
+  `fused-memory/src/fused_memory/middleware/curation_deferral.py::DeferReason`),
+  the ticket parks as `awaiting_curation` and the ticket janitor retries it
+  until it gets a verdict; every create the curator did not judge is marked
+  `metadata.dedupe_skipped`.
 - **`planning_mode=True` path.** Used by `/prd` batch decomposition: writes
   the task directly in status `deferred`, bypassing the curator, so a whole
   batch of interdependent tasks can be authored and wired together (deps,
@@ -354,16 +366,16 @@ fire-and-forget follow-up tasks via `submit_task` as they work.
 
 ### 3.3 Scheduler tick
 
-`Scheduler.acquire_next()` runs a **21-phase pipeline** every tick
+`Scheduler.acquire_next()` runs a **22-phase pipeline** every tick
 (`orchestrator/src/orchestrator/scheduler.py`, `_TICK_PHASE_ORDER`):
 
 ```
-backfill_dep_status → backfill_terminal_dep_records → drain_park_eviction →
-park_gc → stale_sweep → cooldown_gc → redispatch_stranded_blocked →
-external_dep_policy → delivered_check_gate → stamp_milestone →
-override_snapshot_gc → reserve_now → override_diff → compute_priorities →
-build_candidates → landed_outbox_gate → starvation → empty_candidate_gate →
-psi_gate → select_pins → select_scored
+backfill_dep_status → backfill_terminal_dep_records → stale_sweep →
+cooldown_gc → redispatch_stranded_blocked → external_dep_policy →
+delivered_check_gate → drain_park_eviction → park_gc → stamp_milestone →
+override_snapshot_gc → compute_priorities → reserve_now → override_diff →
+build_candidates → landed_outbox_gate → already_landed_gate → starvation →
+empty_candidate_gate → psi_gate → select_pins → select_scored
 ```
 
 The first phase that short-circuits ends the tick early; otherwise
@@ -419,9 +431,11 @@ For a normal task, `TaskWorkflow._drive()`
    `integration test`, `design ... new`, `implement ... new feature`) and
    `metadata.force_full_path` isn't set, `_run_simple_task()` runs: **one**
    Sonnet agent (role `simple_task`) explores, plans, implements, and
-   commits in a single session. Success falls through to VERIFY; a terminal
-   outcome (done/blocked) ends the workflow there; anything else discards
-   the plan and runs the full architect path instead.
+   commits in a single session. Success falls through to VERIFY; any other
+   verdict ends the dispatch there — done, blocked, or a requeue when the
+   plan's file scope needs a module lock another task holds. Only a give-up
+   (no plan, no step marked done, agent failure) discards the plan and runs
+   the full architect path instead.
 3. **PLAN.** `architect` explores the codebase, verifies its premises, and
    builds a step-by-step TDD plan (alternating test-step, implementation-
    step) via plan-tools (`create_plan`/`add_plan_step`/`confirm_plan`).
@@ -444,7 +458,12 @@ For a normal task, `TaskWorkflow._drive()`
    `max_amendment_rounds`). Independently, every `review.interval` merges
    (default 40), a `ReviewCheckpoint` runs `deep_reviewer` across recently-
    merged modules for cross-task integration issues, filing its own
-   tasks/escalations if it finds any.
+   tasks/escalations if it finds any. Before its Phase 1 verification the
+   checkpoint runs any project-declared `review.pre_test_commands` (e.g.
+   rebuilding the frontend bundles e2e tests serve) in the main checkout,
+   fail-soft: a failed or timed-out command is reported to the reviewer and
+   in the saved report, never aborting the review
+   (`orchestrator/src/orchestrator/review_pre_test.py`).
 7. **MERGE.** `_submit_to_merge_queue()` hands the branch to the merge lane
    (§5).
 8. **DONE.** `_finalise_merged_done()` refreshes `metadata.files` from the
@@ -482,21 +501,52 @@ what decides whether its row stays `in-progress` or lands in `blocked`:
   steward_max_timeouts_per_escalation` windows for a steward that keeps
   invoking its agent — bounded by the steward's own attempt ceilings, which is
   the property that makes it INV-7 `holds-owned-and-bounded`-legal. A record
-  that is born-at-L2 (severity `critical`/`urgent`) or at `level ≥ 2`
+  that is born-at-L2 (severity `critical`/`urgent`) or a non-info record at
+  `level ≥ 2` (the predicate is `escalation/src/escalation/pins.py::needs_human`)
   short-circuits the wait immediately: the orchestrator does not hold a slot
   waiting on a human. This now covers **every** phase, MERGE entry included —
   `_handle_merge_gate_escalations`
   (`orchestrator/src/orchestrator/workflow.py`) replaced the old
   steward-less bail, which returned `ESCALATED` with no steward, no wait and no
   status write, leaving `in-progress` + NULL claimant + an open gating record
-  with nothing running to advance it (task 3536 / PRD γ1 / spec §8-E1).
+  with nothing running to advance it (task 3536 / PRD γ1 / spec §8-E1). An
+  info L2 never short-circuits the wait, in any phase.
 - **(b) Blocked exit.** When the wait concludes without resolution — idle-window
   expiry, steward re-escalation, or a gating record still open on the
   single-shot re-check — `_mark_blocked` parks the row `blocked` and frees the
-  slot. The open escalation record then *is* the ownership token and the wake
+  slot. The block reason names the hand-off that fired: 'Steward re-escalated
+  to human' only when this wait's steward filed the hand-off
+  (`orchestrator/src/orchestrator/workflow.py::_StewardReescalated`), otherwise
+  'Gated by open L2 <ids>; no steward applicable' (`_NoStewardApplicable`,
+  which also lists the L1 ids when an L1 hand-off ended the wait). The open
+  escalation record then *is* the ownership token and the wake
   edge: resolving it re-pends the task (§6). The gate predicate itself
   (`_is_gating_escalation`) is untouched stop-the-line either way — nothing
-  merges past an open gating record.
+  merges past an open gating record. An info record is never a gating record
+  at any level, because the predicate consults `needs_human`, so a green,
+  reviewed branch whose only open records are info merges.
+
+**Info notes have a consumer chain, not a gate.** An `escalate_info` record
+(severity `info`) never moves the workflow to `ESCALATED`, never gates, never
+short-circuits the wait, and never vetoes recovery: the recovery sites read
+`classify_pins`, where info is non-pinning (§3.7). Its consumers, in order:
+
+1. The comprehensive reviewer. It is briefed with its own task's open
+   agent-filed notes and returns a `note_dispositions` list in its verdict,
+   which `TaskWorkflow._apply_note_dispositions` applies through
+   `orchestrator/src/orchestrator/escalation_router.py::apply_reviewer_disposition`.
+2. A steward that is already running for a blocking record.
+3. The info-L0 router, run as the `disposition_info_l0s` entry of
+   `TaskWorkflow._on_terminal_cleanups` — after `stop_steward`, before
+   `release_lane` — on DONE, MERGE_DEFERRED, BLOCKED/ESCALATED and CANCELLED
+   exits. A requeued (or plan-only) exit leaves its notes pending for the
+   next incarnation's reviewer, and the orphan reaper backstops them (§6).
+
+The post-merge success tail starts a steward only for a pending blocking L0
+(`TaskWorkflow._pending_steward_l0s`). The decision table is
+`escalation/src/escalation/disposition.py::route_info_l0`, and the rationale
+is [plans/info-l0-disposition-router-prd.md](plans/info-l0-disposition-router-prd.md)
+D1–D3 and D7.
 
 Which exit status each outcome must write is specified normatively in
 [docs/task-escalation-state-spec.md](docs/task-escalation-state-spec.md) §4
@@ -538,7 +588,7 @@ and are not restated here.
     `_file_stop_instruction_and_block`,
     `_file_curator_adjudication_missing_and_block`,
     `_file_milestone_gate_and_block`,
-    `_file_milestone_check_failed_and_block`). Each wraps the status write in
+    `_file_predicate_escalation_and_block`). Each wraps the status write in
     `try`/`except` and *log-and-swallows* a failure (the escalation is already
     durable), so it can file the record and still not write `blocked`. These
     are also the `pending → blocked` edge §3.8 depends on — no workflow, and
@@ -617,8 +667,16 @@ and are not restated here.
     below, a dead-filer L0 does not suppress that re-file.
   - **Both blocked-arm predicates** carry the `MERGE_REMEDIABLE_ESC_CATEGORIES`
     relaxation, so a record set made up entirely of `stranded_blocked`
-    records does not veto the merge it asks for. They differ on exactly one
-    input: a dead-filer L0 holds the done-flip but not the recovery.
+    records does not veto the merge it asks for. The recovery predicate
+    applies it only while no record needs a human
+    (`escalation/src/escalation/pins.py::needs_human`): a re-dispatch would
+    meet the workflow gate that stops on that record, and the off-main
+    verified-green submit goes straight to the merge queue and would merge
+    past it, which repend-PRD D4 stop-the-line forbids (task 6145). They differ
+    on exactly three inputs: a dead-filer L0 holds the done-flip but not the
+    recovery; a lone `preexisting_main_break` record holds the recovery but
+    not the on-main done-flip; and a human-held `stranded_blocked` record
+    holds the recovery but not the done-flip.
   - **Owned-record question.** `Harness._reconcile_one_stranded`'s re-file
     dedup asks `records_would_duplicate_a_handoff`, which counts a dead-filer
     L0 even though it does not pin: the orphan-L0 reaper will promote it, so a
@@ -656,7 +714,7 @@ and are not restated here.
   blocked-arm upgrade clauses would move again on the next sweep —
   `orchestrator/src/orchestrator/recovery_pins.py::records_pin_blocked_recovery`
   is False, because it is pinned only by merge-remediable `stranded_blocked`
-  records or only by dead-filer L0s — would not be at rest in `blocked`, so it
+  records that no human holds, or only by dead-filer L0s — would not be at rest in `blocked`, so it
   is held at `LEAVE` instead. The write is observe-before-enforce, gated by
   `convert_to_blocked_enforce`
   (`orchestrator/src/orchestrator/config.py::OrchestratorConfig`). With it
@@ -670,11 +728,12 @@ and are not restated here.
   quarantines, then reaps, `.worktrees/*` directories left behind by a
   crashed or killed workflow.
 - **Orphaned L0 records.** A *separate* sweep,
-  `Harness._reap_orphan_l0_escalations` (`harness.py`), promotes to L1 any L0
+  `Harness._reap_orphan_l0_escalations` (`harness.py`), takes any L0
   escalation *record* older than `orphan_l0_timeout_secs` whose **filing**
-  incarnation is provably dead, judged by the classifier's L0 liveness link
-  (§6). A newer live workflow on the same task does not keep a prior
-  incarnation's L0 alive. The two are easily conflated — one reaps
+  incarnation is provably dead, judged by the classifier's L0 liveness link:
+  it routes a note the info-L0 router owns through that router and promotes
+  any other record to L1 (§6 has the full predicate). A newer live workflow
+  on the same task does not keep a prior incarnation's L0 alive. The two are easily conflated — one reaps
   directories, the other reaps queue rows.
 - **Retry caps** bound every retryable failure mode (`requeue_cap=3`,
   `transient_requeue_cap=10`, `max_consecutive_infra_resumes=3`,
@@ -697,6 +756,9 @@ This expresses auto-deploys, act-then-ask gates, pure human gates, and (via
 [docs/task-authoring.md](docs/task-authoring.md)'s "Deterministic tasks" and
 "Milestones" sections for the full field reference; that's task-author-facing
 configuration, not architecture, so it isn't repeated here.
+The runner's internal dispatch state machine (idempotency and quiescence,
+the `before_done` sub-paths, the pure gate's proof ladder) is documented in
+[docs/deterministic-runner.md](docs/deterministic-runner.md).
 
 ---
 
@@ -720,7 +782,7 @@ matter most for reasoning about safety:
 
 | Role | Stage | Purpose | Model / effort / budget / turns |
 |---|---|---|---|
-| `architect` | PLAN | Explores the codebase, verifies premises, builds the TDD plan | opus / max / $15 / 100 |
+| `architect` | PLAN | Explores the codebase, verifies premises, builds the TDD plan | opus / xhigh / $15 / 180 |
 | `implementer` | EXECUTE | RED test → GREEN implementation → commit, per plan step; sandboxed | sonnet / max / $10 / 80 (routed to opus above ~12 steps or ~3 modules) |
 | `debugger` | VERIFY failure loop | Fixes test/lint/typecheck failures with minimal changes; sandboxed | sonnet / max / $5 / 50 |
 | `reviewer_comprehensive` | REVIEW | Sole reviewer: test quality, reuse, architecture, performance, robustness; read-only | opus / high / $5 / 30 (config resolves `reviewer_comprehensive` → the `reviewer` config key) |
@@ -800,8 +862,11 @@ branch (preferring a snapshot-tip comparison to avoid false negatives),
 performs the merge, and applies a drop-guard. `_run_post_merge_verify` then
 re-runs the verify suite against the new `main` tip through the same
 `VerifyRunnerPool`, bounded by retry budgets for timeouts, disk-full, and
-narrowed-scope retries. `merge_verify_breadth` defaults to `scoped` (touched
-modules only) rather than `full` (whole repo) — see §9 for the caveat.
+narrowed-scope retries. `merge_verify_breadth` defaults to `full` (every
+registered module's full suite at merge); `scoped` (touched modules only) is
+the per-project opt-down, and task verify stays scoped by policy. The paired
+policy is stated in the `merge_verify_breadth` comment of
+`orchestrator/src/orchestrator/defaults.yaml`; see §9 for the cost caveat.
 
 If post-merge verify goes red, the worker classifies whether `main` is
 *genuinely* broken (vs. a transient host issue) via a deferred,
@@ -820,7 +885,11 @@ path, snapshotting `main` at run start and coalescing advances — it never
 gates a merge, and defaults to disabled (`git.offline_lane_enabled: false`). Each pass writes a record; each failing
 test is a per-test episode that is filed as one fix task once reproduced on
 `git.offline_lane_persist_passes` spaced passes, with one bounded level-1
-escalation if the fix stays unlanded. A command that declares an outage probe
+escalation if the fix stays unlanded. Every non-outage red pass is recorded in
+the flake ledger at call site `offline_lane`, and a cleared test, or a held red
+that failed and passed at one head with no fix task filed, owes flake debt
+whose de-flake task the ledger's drain files (`plans/offline-lane-red-path-prd.md`
+D6). A command that declares an outage probe
 (`outage_probe`) runs it after a red detection, and a probe that exits 75
 naming a dependency makes the pass an outage, which is escalated, not filed.
 The lane re-runs the probe alone until it passes, then closes its own
@@ -829,7 +898,20 @@ runbook in `OPERATIONS.md`).
 Operators can inspect and pause the merge lane directly: `get_merge_queue()`
 gives a live snapshot (lane states, conflict graph, frozen prefix, metrics)
 that the event store alone can't reconstruct; `halt_merge_queue`/
-`unhalt_merge_queue`/`get_merge_halt_status` are operator-only controls.
+`unhalt_merge_queue`/`get_merge_halt_status` are operator-only controls, as is
+`merge_relane`, which moves a request still waiting for the merger (or a
+coalesced member's whole train) between the normal and high lanes.
+
+A remote verify host never runs whatever code its checkout happens to hold.
+Each dispatcher pushes its own deployed commit to the host as `refs/gate/<sha>`
+and verifies in an immutable per-sha gate checkout built from it
+(`orchestrator/src/orchestrator/remote_gate.py`, `remote_gate/ensure-gate.sh`),
+reached through the host's `orchestrator` shim via `ORCH_GATE_BIN`. Before any
+verify is spent a `gate-identity` handshake compares the gate's commit and
+verify-wire fingerprint with the dispatcher's. A host that fails it, or whose
+verify yields no usable verdict, is benched in the `skew` class (distinct from
+an unreachable `ru` bench) and re-admitted by a passing `ensure-gate`; see
+`OPERATIONS.md` §"Reading a verify-host bench".
 
 ---
 
@@ -840,7 +922,8 @@ Every escalation is one row in a single model
 by `level`:
 
 ```
-L0  level=0   producer: agent             consumer: steward (per-task, interactive-equivalent review)
+L0  level=0   producer: agent             consumer: blocking → steward (per-task, interactive-equivalent review)
+                                                    info     → reviewer → running steward → info-L0 router
 L1  level=1   producer: steward/workflow  consumer: escalation-watcher-auto (automated triage)
 L2  level=2   producer: auto-watcher      consumer: human (direct — bypasses the auto-watcher)
 ```
@@ -858,8 +941,10 @@ flowchart LR
 
 - **L0.** A per-task `TaskSteward` — a single, persistent Claude session
   across every escalation that task ever raises, with a lifetime budget (§4)
-  — the first responder for any workflow failure.
-- **L0 → L1.** Two routes. Automatically,
+  — the first responder for any workflow failure. An info L0 is consumed by
+  the chain in §3.6, not by the steward ladder.
+- **L0 → L1.** Two routes for a blocking record, and a third for info.
+  Automatically,
   `TaskSteward._auto_escalate_to_human` files a fresh `level=1` escalation and
   dismisses the L0 when the steward exhausts its budget, hits a
   retry/timeout/empty-output cap, or finds its worktree missing at preflight.
@@ -879,8 +964,38 @@ flowchart LR
   filer's liveness — unless it is `info` severity, which never pins at any
   level. `TaskSteward._auto_escalate_to_human`
   (`orchestrator/src/orchestrator/steward.py`) carries the L0's severity onto
-  the L1. A separate orphan sweep (`Harness._reap_orphan_l0_escalations`)
-  promotes to L1 an aged L0 whose filing incarnation is dead (§3.7).
+  the L1. The third route, for info only, is the info-L0 router filing its
+  own L1s. A work-shaped note it cannot convert into a task is dismissed and promoted to
+  one fallback L1 under agent_role `harness-info-l0-router` with
+  suggested_action `convert_to_task`, with the author's text kept in
+  `detail`. The router also files one status-info aggregate L1 per mechanical
+  class per sweep. OPERATIONS.md §5 "Info notes, deliberate holds, and the
+  info-L0 router" says how to read both.
+
+  *Orphan sweep and restart amnesty, as built*
+  ([plans/info-l0-disposition-router-prd.md](plans/info-l0-disposition-router-prd.md)
+  D6/D7). The orphan sweep (`Harness._reap_orphan_l0_escalations`) acts only
+  on L0s older than `orphan_l0_timeout_secs`, and dismisses an eval-lane
+  record outright. The rest split on whether the info-L0 router owns the
+  record (`orchestrator/src/orchestrator/escalation_router.py::router_owns`:
+  an info L0 outside the eval lane, while `info_l0_router_enabled` is on). A
+  router-owned note already held on a curator ticket is finished first, even
+  with a live workflow. Otherwise the sweep skips a record while a workflow
+  attends the task (`_escalation_events`) or the scheduler holds it
+  (`Scheduler.is_actively_held`), unless `classify_pins` proves the filing
+  incarnation gone (§3.7). A router-owned record is then routed
+  (`escalation_router.py::InfoL0Sweep`, exit kind `orphan`). A record the
+  router does not own (every blocking record, and any info record while
+  `info_l0_router_enabled` is off) keeps the old path: covered-by-open-L1
+  dismissal (`EscalationQueue.dismiss_if_covered`), the done-step-commit
+  rebase-superseded dismissal, then verbatim promotion to L1 with
+  `manual_intervention`. The done-step tripwire files `info`, so that middle
+  arm is reached only with the router off. The startup amnesty
+  `Harness._dismiss_stale_escalations` first routes the router-owned notes
+  and finishes their holds (`_route_info_l0s_across_restart`, exit kind
+  `restart`). Its `dismiss_all_pending` then keeps those notes for the
+  reaper, so only L0s the router does not own are dismissed and counted as
+  stale strands.
 - **L1 auto-watcher.** A repeatedly-spawned Claude CLI rotation (§2.1) that
   only launches when there's an actionable pending L1, running the
   `escalation-watcher-auto` skill.
@@ -888,7 +1003,14 @@ flowchart LR
   updating a root-cause-deduplicated `level=2` escalation whose `members`
   list references the contributing L1 escalation ids (which stay at level
   1). Promotion is gated to the watcher's own identity or an unauthenticated
-  (human) caller.
+  (human) caller. A promote with `severity` omitted over a cluster whose
+  members are all info is refused —
+  `{'status': 'refused', 'code': 'info_only_cluster', …}` — and nothing is
+  minted or folded (`escalation/src/escalation/server.py::promote_to_l2`). The
+  auto-watcher then closes the members at L1, or re-issues with an explicit
+  blocking severity when its RCA judges the cluster collectively blocking
+  (the rung is in `skills/escalation-watcher-auto/SKILL.md`, "Info-only
+  cluster"), so the L2 queue holds no inherited-info records.
 - **Born-at-L2.** `escalate_blocker`/`escalate_info` called with severity
   `critical` or `urgent` are stamped `level=2` immediately — but **only**
   when the filer's `agent_role` is a recognized harness sentinel (e.g.
@@ -992,7 +1114,7 @@ design is in [RECONCILIATION_PLAN.md](RECONCILIATION_PLAN.md).
 | Escalations | `data/escalations/` + `get_pending_escalations`/`get_escalation` | Open L0/L1/L2 escalations, categories, resolution history |
 | Reconciliation findings | `data/reconciliation/`, consumed via `/recon-escalation-watcher` | Integrity findings from the `:8103` queue |
 | Dashboard | `dashboard/src/dashboard/data/*.py` (read-only pool over the same SQLite DBs) | Web UI: active tasks, merge queue, halt state, escalation analytics, task runtime, scheduler state, costs, burndown, recon status |
-| Verify artefacts | `data/verify-logs/<task_id>/` | Per-leg logs + summary JSON for RED verifies; the verify plan (scope decision) and — only under `merge_verify_breadth: full`, not the shipped default — gzipped merge-lane junit reports, both for green AND red, so cost/scope questions get an unconditioned sample. Callers passing no `archive_root` write nothing. Age + size pruned — see OPERATIONS.md §"Reading the verify artefact archive" for the join and counting caveats |
+| Verify artefacts | `data/verify-logs/<task_id>/` | Per-leg logs + summary JSON for RED verifies; the verify plan (scope decision) and — only under `merge_verify_breadth: full` (the shipped default; a project that opts down to `scoped` archives none) — gzipped merge-lane junit reports, both for green AND red, so cost/scope questions get an unconditioned sample. Callers passing no `archive_root` write nothing. Age + size pruned — see OPERATIONS.md §"Reading the verify artefact archive" for the join and counting caveats |
 | journalctl | systemd units (`StandardOutput=journal`) | Raw process logs — the event store is the durable structured record; journalctl is for live tailing and crash forensics |
 
 When debugging, prefer the event store and `get_merge_queue`/
@@ -1027,20 +1149,28 @@ a defense is active when it isn't:
   effect of the verify test leg's `cd <module> && uv run pytest`
   (`orchestrator/src/orchestrator/verify.py::_preprovision_shared_venv`).
   Either way, there's no `.venv` at all before that first cold verify.
-  The real edge: an agent's Bash subprocess inherits a copy of the
-  orchestrator's environment, including main's `VIRTUAL_ENV`
-  (`orchestrator/src/orchestrator/agents/invoke.py`), so a first-party
+  The real edge: an interactive session's shell keeps its launching
+  shell's environment, often main's `VIRTUAL_ENV`, so a first-party
   `import` there can resolve main's editable source instead of the
-  worktree's edits. Verify is unaffected —
-  `orchestrator/src/orchestrator/verify.py::_target_subprocess_env` strips
-  `VIRTUAL_ENV` so the target always resolves its own `.venv`. See
+  worktree's edits. A dispatched agent's shell carries no Python-env
+  selection (`shared/src/shared/python_env.py::without_python_env_selection`,
+  which Claude spawns reach via
+  `shared/src/shared/secret_env.py::agent_subprocess_env`; task 7399), so it
+  meets this only by naming main's `.venv/bin/python` in a
+  worktree with no `.venv` yet; its bare `python` is the system
+  interpreter. Verify is unaffected —
+  `orchestrator/src/orchestrator/verify.py::_target_subprocess_env` applies
+  the same scrub so the target always resolves its own `.venv`. See
   `### Locating installed code` in `CLAUDE.md` for the one-line
   provenance check.
-- **Verify commands default to repo-wide scope in places**, not always
-  scoped strictly to the modules a task touched — `merge_verify_breadth`
-  defaults to `scoped`, but individual verify command derivation can still
-  fall back wider than the minimal touched set: slower than necessary, and
-  a source of unrelated flakiness bleeding into a task's verify result.
+- **Merge verify runs the whole registered suite by default.**
+  `merge_verify_breadth` defaults to `full`, so merge-gate cost scales with
+  the repo, not the diff; a project with a long gate can opt down to
+  `scoped` (see the `merge_verify_breadth` comment in
+  `orchestrator/src/orchestrator/defaults.yaml`). Separately, task-role
+  verify derivation can still fall back wider than the minimal touched set:
+  slower than necessary, and a source of unrelated flakiness bleeding into a
+  task's verify result.
 - **Warm lanes (pre-created, reused worktrees) are off by default.**
   `warm_lane_pool` and the persistent merge/offline-deep worktree options
   all default to `False` in this project's config — every dispatch pays the

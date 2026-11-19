@@ -11,6 +11,7 @@ import asyncio
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
+from dashboard.api.clock import app_clock
 from dashboard.config import DashboardConfig
 from dashboard.data import memory as memory_data
 from dashboard.data import redux_api
@@ -20,7 +21,6 @@ from dashboard.data.metrics import (
     get_memory_sparks,
     get_queue_pending_series,
 )
-from dashboard.data.utils import resolve_now
 
 router = APIRouter()
 
@@ -46,7 +46,8 @@ async def api_memory(request: Request) -> JSONResponse:
     config: DashboardConfig = request.app.state.config
     pool: DbPool = request.app.state.db
     metrics_db = await pool.get(config.metrics_db)
-    render_at = resolve_now(None)
+    clock = app_clock(request.app)
+    render_at = clock()
     status, raw_queue, sparks, queue_spark, delta_24h, wal = await asyncio.gather(
         memory_data.get_memory_status(
             http_client, config, timeout=_MEMORY_ENDPOINT_TIMEOUT_SECONDS,
@@ -54,16 +55,16 @@ async def api_memory(request: Request) -> JSONResponse:
         memory_data.get_queue_stats(
             http_client, config, timeout=_MEMORY_ENDPOINT_TIMEOUT_SECONDS,
         ),
-        get_memory_sparks(metrics_db, days=1),
-        get_queue_pending_series(metrics_db, days=1),
-        get_memory_24h_ago(metrics_db),
+        get_memory_sparks(metrics_db, days=1, now=render_at),
+        get_queue_pending_series(metrics_db, days=1, now=render_at),
+        get_memory_24h_ago(metrics_db, now=render_at),
         memory_data.get_wal_status(
             http_client, config, timeout=_MEMORY_ENDPOINT_TIMEOUT_SECONDS,
         ),
     )
     # Resolved AFTER the fan-out, as api/merge_queue.py::api_merge_queue
     # does: every as_of above was stamped at or before this instant.
-    served_at = resolve_now(None)
+    served_at = clock()
     return JSONResponse(
         redux_api.shape_memory(
             status,

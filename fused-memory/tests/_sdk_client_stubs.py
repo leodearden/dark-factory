@@ -10,7 +10,8 @@ def sdk_client_double() -> MagicMock:
 
     The real SDK clients' ``__aenter__`` returns self and their ``close()`` is a
     coroutine; a bare ``MagicMock`` binds a FRESH child on ``async with`` and its
-    ``close()`` cannot be awaited.
+    ``close()`` cannot be awaited. Its ``__aexit__`` returns False, as theirs
+    does, so an exception raised inside ``async with`` propagates.
     """
     client = MagicMock()
     client.__aenter__ = AsyncMock(return_value=client)

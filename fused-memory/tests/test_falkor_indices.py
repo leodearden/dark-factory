@@ -46,6 +46,7 @@ from collections import OrderedDict, defaultdict
 from unittest.mock import MagicMock
 
 import pytest
+from _falkor_index_doubles import LIVE_HEADER, TRAP_PRESENT
 from graphiti_core.driver.driver import GraphProvider
 from graphiti_core.graph_queries import get_fulltext_indices, get_range_indices
 
@@ -938,7 +939,7 @@ class TestUnsettledIndexStatuses:
         ]
 
     def test_empty_catalog_is_settled(self):
-        """DELIBERATE divergence from ``_fm_helpers.await_index_operational``,
+        """DELIBERATE divergence from ``_fm_falkor_live.await_index_operational``,
         which treats an empty ``result_set`` as NOT ready.
 
         An index-free graph is a legitimate production steady state, so a drop on
@@ -969,21 +970,13 @@ class TestUnsettledIndexStatuses:
         assert 'status' in message
 
 
-# --- The MEASURED live CALL db.indexes() shape -----------------------------
+# --- The MEASURED live CALL db.indexes() rows ------------------------------
 #
-# Measured read-only 2026-08-06 via
-#   docker exec docker-falkordb-1 redis-cli GRAPH.RO_QUERY dark_factory "CALL db.indexes()"
-# and via a raw falkordb.asyncio client on the ro path.  No graphiti driver was
-# constructed and no index was created, dropped or modified anywhere.
-#
-# The header is 9 two-tuples; note that `entitytype` is index 6 and `options` is
-# index 3.  That gap is the defect these tests pin: list_indices() bound
+# From the same read-only 2026-08-06 measurement as
+# _falkor_index_doubles.py::LIVE_HEADER, whose column order these rows follow.
+# In that header `entitytype` is index 6 and `options` is index 3; that gap is
+# the defect TestListIndicesColumnBinding pins: list_indices() bound
 # entity_type to row[3].
-
-LIVE_HEADER = [
-    [1, 'label'], [1, 'properties'], [1, 'types'], [1, 'options'], [1, 'language'],
-    [1, 'stopwords'], [1, 'entitytype'], [1, 'status'], [1, 'info'],
-]
 
 LIVE_ROW_RELATES_TO = [
     'RELATES_TO',
@@ -1020,8 +1013,8 @@ class TestResolveHeaderPositions:
     ``summarize_index_health`` — share one implementation rather than each
     re-forking the build-names / check-missing / ``.index()`` sequence.  A
     re-forked copy is how the positional read survived in the first place.
-    (``_fm_helpers.await_index_operational`` still carries its own copy; it is
-    outside task 3706's locked scope and is filed as a follow-up.)
+    (``_fm_falkor_live.await_index_operational`` resolves its ``status`` column
+    through this helper too.)
     """
 
     def test_resolves_every_wanted_key_to_its_named_column(self):
@@ -1095,7 +1088,7 @@ class TestListIndicesColumnBinding:
     PRESENCE, never the value.
 
     By-name resolution — not a corrected index — is the fix, mirroring
-    ``_fm_helpers.await_index_operational``, which resolves ``status`` by name
+    ``_fm_falkor_live.await_index_operational``, which resolves ``status`` by name
     precisely so a FalkorDB column reorder fails loudly instead of silently
     reading the wrong column.  ``test_by_name_resolution_survives_a_column_reorder``
     is what a merely-positional fix cannot pass.
@@ -1159,7 +1152,7 @@ class TestListIndicesColumnBinding:
     ):
         """Never return a record with a silently-wrong or absent value (INV-2/INV-4).
 
-        Mirrors ``_fm_helpers.IndexHeaderError``: a shape change means the caller
+        Mirrors ``_fm_falkor_live.IndexHeaderError``: a shape change means the caller
         cannot be trusted at all, so it fails closed and names what it saw.
         """
         header_without_entitytype = [c for c in LIVE_HEADER if c[1] != 'entitytype']
@@ -1485,17 +1478,8 @@ class TestVectorDropStatement:
         assert 'RELATIONSHIP' in str(excinfo.value)
 
 
-#: The trap state esc-3375-1 protected as evidence: an ``Entity(uuid)`` and a
-#: ``RELATES_TO(uuid)`` range index, and nothing else.  Every composite range
-#: statement upstream emits for those two labels is rejected wholesale against it.
-_TRAP_PRESENT = {
-    ('Entity', 'NODE', 'uuid', 'RANGE'),
-    ('RELATES_TO', 'RELATIONSHIP', 'uuid', 'RANGE'),
-}
-
-
 def _trap_missing() -> set:
-    return expected_index_set() - _TRAP_PRESENT
+    return expected_index_set() - TRAP_PRESENT
 
 
 class TestPlanIndexStatements:

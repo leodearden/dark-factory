@@ -20,6 +20,7 @@ from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventStore
 from orchestrator.harness import Harness
 from orchestrator.merge_lane.worker import NoLandingsCircuitBreaker
+from orchestrator.pause_policy import PauseClass
 from orchestrator.run_store import RunStore
 
 # Role tag used by the breaker escalation (must match implementation)
@@ -96,7 +97,7 @@ class TestHarnessNoLandingsFire:
         floor=10_000_000 > disk values (180k–200k) so disk-pressure gate
         (last_free < floor) is satisfied and the trip fires.
         """
-        harness, _rs, _escalations = _make_harness(
+        harness, run_store, _escalations = _make_harness(
             tmp_path, window=3, floor=10_000_000,
         )
         _stub_merge_worker(harness, landings_total=5)  # landings stay flat
@@ -110,6 +111,12 @@ class TestHarnessNoLandingsFire:
 
         assert harness.scheduler.is_paused, (
             'scheduler should be paused after trip window'
+        )
+        assert harness.scheduler.pause_class is PauseClass.NO_LANDINGS
+        run_store.save_scheduler_pause.assert_called_once()
+        assert (
+            run_store.save_scheduler_pause.call_args.kwargs['pause_class']
+            is PauseClass.NO_LANDINGS
         )
 
     @pytest.mark.asyncio

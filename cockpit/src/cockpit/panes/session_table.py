@@ -4,7 +4,7 @@ Resolves PRD open-Q4 (failed-spawn/gone-window glyph set): the six Status
 members fold into four glyphs -- awaiting-input is "blocked on you",
 running/launching are "working", idle is "idle", and exited/
 failed-to-start are "dead". An unrecognized/foreign status degrades to
-'?' rather than raising (additive-safe, mirroring session_registry's own
+'?' rather than raising (additive-safe, mirroring session_records's own
 no-coerce policy for spawn_mode/display).
 """
 
@@ -13,7 +13,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from orchestrator.session_registry import TERMINAL_STATUSES, SessionRecord, Status
+from orchestrator.session_records import TERMINAL_STATUSES, SessionRecord, Status
 from textual.widgets import DataTable
 from textual.widgets.data_table import RowDoesNotExist
 

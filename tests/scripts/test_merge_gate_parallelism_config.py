@@ -48,8 +48,11 @@ import pytest
 # insertion this directory relies on under --import-mode=importlib.
 import verify_command_invariants as vci
 from orchestrator.config import ModuleConfig
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from orchestrator import verify_cmd
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -202,13 +205,12 @@ def test_parallel_member_addopts_declare_xdist_with_loadgroup(member: str) -> No
 def test_parallel_member_addopts_do_not_copy_max_worker_restart(member: str) -> None:
     """No parallelised member copies ``--max-worker-restart`` across.
 
-    The flag is required exactly where ``timeout_method = "thread"`` is set —
-    orchestrator and fused-memory — and that invariant, with its
-    executable reproduction, lives in ``test_xdist_worker_restart_policy.py``.
-    Copying it here would look like completing the family, but these members
-    run ``timeout_method = "signal"``: a timeout raises inside the test and the
-    worker survives, so the case the flag exists for does not arise from their
-    cap, and task 5408 declined to widen it to them without a measured need.
+    orchestrator and fused-memory run ``timeout_method = "signal"`` and keep the
+    flag, for the reason recorded at
+    ``test_xdist_worker_restart_policy.py::RESTART_DISABLED_CONFIGS``, which
+    pins it beside its executable reproduction. Copying it here would look like
+    completing the family, but these members have not been given it: task 5408
+    found no measured need, and declined to widen it without one.
     """
     offenders = [
         token
@@ -217,12 +219,11 @@ def test_parallel_member_addopts_do_not_copy_max_worker_restart(member: str) -> 
     ]
     assert not offenders, (
         f"{member}/pyproject.toml's addopts declares {offenders!r} (task 5408). "
-        'That flag is required only where timeout_method = "thread" is set '
-        '(orchestrator, fused-memory — see '
-        'test_xdist_worker_restart_policy.py). This member runs '
-        'timeout_method = "signal", where a timeout raises inside the test and '
-        'the worker survives, so the case the flag exists for does not arise '
-        'from its cap. Do not widen it here without a measured need'
+        'orchestrator and fused-memory run timeout_method = "signal" and keep '
+        'that flag, for the reason recorded at '
+        'test_xdist_worker_restart_policy.py::RESTART_DISABLED_CONFIGS. This '
+        'member has not been given it, because no measured need was found. Do '
+        'not widen it here without one'
     )
 
 
@@ -840,11 +841,12 @@ PYRIGHT_PROBE_GROUP = 'pyright_threads_probe'
 # so a wedged pyright surfaces as a TimeoutExpired carrying its captured output
 # rather than as pytest's axe carrying nothing.
 #
-# Those markers are 120s, which TIGHTENS rather than raises: the scripts verify
-# leg passes --timeout=300 on the command line, and a probe that checks ONE
-# trivially clean file has no business taking two minutes even behind a uv
-# resolve and a node startup on a loaded 32-core host. Failing at 2 minutes with
-# pyright's own captured output beats consuming the full 300s to say nothing.
+# This bound, not the marker, is what fails a wedged pyright fast: a probe that
+# checks ONE trivially clean file has no business taking 100s even behind a uv
+# resolve and a node startup on a loaded host. The markers sit at verify's own
+# --timeout=300, because a marker between 60 and that budget would clamp the
+# merge-gating leg rather than loosen it; why is in
+# shared/src/shared/testing_timeout_markers.py.
 PROBE_SUBPROCESS_TIMEOUT_SECS = 100
 
 _PROBE_SRC = 'def f(x: int) -> int:\n    return x + 1\n'
@@ -945,7 +947,7 @@ def test_pyright_long_pole_modules_pass_threads_eight(
 
 
 @pytest.mark.xdist_group(PYRIGHT_PROBE_GROUP)
-@pytest.mark.timeout(120)
+@pytest.mark.timeout(300)
 def test_the_configured_pyright_actually_accepts_threads_eight(
     tmp_path: pathlib.Path,
     discover_module_configs: Callable[[], dict[str, ModuleConfig]],
@@ -983,7 +985,7 @@ def test_the_configured_pyright_actually_accepts_threads_eight(
 
 
 @pytest.mark.xdist_group(PYRIGHT_PROBE_GROUP)
-@pytest.mark.timeout(120)
+@pytest.mark.timeout(300)
 def test_pyright_refuses_threads_together_with_stats(
     tmp_path: pathlib.Path,
     discover_module_configs: Callable[[], dict[str, ModuleConfig]],

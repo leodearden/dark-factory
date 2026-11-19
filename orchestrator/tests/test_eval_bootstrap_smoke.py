@@ -91,12 +91,14 @@ def _venv_python_stub(
     stub.chmod(stub.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
 
 
-def _run_smoke(results_dir: Path) -> subprocess.CompletedProcess:
+def _run_smoke(
+    results_dir: Path, fixture: str = 'df_task_12',
+) -> subprocess.CompletedProcess:
     env = {
         **os.environ,
         'SMOKE_SKIP_EVAL': '1',
         'SMOKE_RESULTS_DIR': str(results_dir),
-        'SMOKE_FIXTURE': 'df_task_12',
+        'SMOKE_FIXTURE': fixture,
     }
     return subprocess.run(
         ['bash', str(SCRIPT)],
@@ -406,3 +408,122 @@ def test_at_least_one_verified_implementer_passes(tmp_path):
         f'expected PASS, got rc={proc.returncode}\nSTDOUT:\n{proc.stdout}\n'
         f'STDERR:\n{proc.stderr}'
     )
+
+
+# ---------------------------------------------------------------------------
+# task 6774 — the smoke lists cells through scripts/list_eval_cells.py, so a
+# cell is whatever orchestrator/src/orchestrator/evals/results.py::ResultStore
+# recognises, never a shell glob's guess at the filename grammar.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    'architect_name',
+    ['df_task_12__architect-x.json', 'df_task_12__architect-x__r1__extra.json'],
+    ids=['legacy-two-segment', 'four-segment'],
+)
+def test_a_name_outside_the_cell_grammar_is_not_a_result(tmp_path, architect_name):
+    results = tmp_path / 'results'
+    results.mkdir()
+    wt = tmp_path / 'impl-wt'
+    _venv_python_stub(wt, 'Python 3.13.5')
+    _write_result(results, architect_name, _arch_result())
+    _write_result(results, 'df_task_12__opus-high__r2.json', _impl_result(str(wt)))
+
+    proc = _run_smoke(results)
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode != 0, f'expected FAIL:\n{combined}'
+    assert 'BUG 1' in combined
+
+
+def test_a_failing_cell_listing_aborts_before_any_assertion(tmp_path):
+    results = tmp_path / 'results'
+    results.mkdir()
+
+    proc = _run_smoke(results, fixture='--bogus')
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode != 0, f'expected FAIL:\n{combined}'
+    assert 'SMOKE PASS' not in combined
+    assert 'BUG 1' not in combined
+
+
+def _fake_uv(bin_dir: Path) -> None:
+    """A ``uv`` standing in for the paid eval-ofat run: it writes its argv, one
+    argument per line, to ``$FAKE_UV_ARGV`` and copies every
+    ``$FAKE_UV_FRESH_CELLS/*.json`` into ``$SMOKE_RESULTS_DIR``."""
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    uv = bin_dir / 'uv'
+    uv.write_text(
+        '#!/usr/bin/env bash\n'
+        'printf "%s\\n" "$@" > "$FAKE_UV_ARGV"\n'
+        'shopt -s nullglob\n'
+        'for f in "$FAKE_UV_FRESH_CELLS"/*.json; do cp "$f" "$SMOKE_RESULTS_DIR/"; done\n'
+        'exit 0\n'
+    )
+    uv.chmod(uv.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+
+
+def _run_smoke_live(
+    results_dir: Path, fresh_dir: Path, bin_dir: Path,
+) -> subprocess.CompletedProcess:
+    """Run the smoke's live path with :func:`_fake_uv` first on PATH.
+
+    ``SMOKE_CONFIG`` names a config that does not exist, so a real ``uv`` reached
+    some other way fails at config load instead of starting a paid run; the
+    recorded argv then proves the fake is what stood in for Phase 1."""
+    argv_record = bin_dir / 'uv-argv'
+    missing_config = bin_dir / 'no-such-orchestrator-config.yaml'
+    env = {k: v for k, v in os.environ.items() if k != 'SMOKE_SKIP_EVAL'}
+    env.update({
+        'PATH': f'{bin_dir}{os.pathsep}{env.get("PATH", "")}',
+        'FAKE_UV_ARGV': str(argv_record),
+        'FAKE_UV_FRESH_CELLS': str(fresh_dir),
+        'SMOKE_CONFIG': str(missing_config),
+        'SMOKE_RESULTS_DIR': str(results_dir),
+        'SMOKE_FIXTURE': 'df_task_12',
+    })
+    proc = subprocess.run(
+        ['bash', str(SCRIPT)],
+        capture_output=True, text=True, env=env, timeout=120,
+    )
+    uv_argv = argv_record.read_text().splitlines()
+    assert 'eval-ofat' in uv_argv
+    assert str(missing_config) in uv_argv
+    return proc
+
+
+def test_live_run_asserts_only_over_fresh_cells(tmp_path):
+    results = tmp_path / 'results'
+    fresh = tmp_path / 'fresh'
+    results.mkdir()
+    fresh.mkdir()
+    bin_dir = tmp_path / 'bin'
+    _fake_uv(bin_dir)
+    wt = tmp_path / 'impl-wt'
+    _venv_python_stub(wt, 'Python 3.13.5')
+    _write_result(results, 'df_task_12__architect-x__old.json', _arch_result(plan_steps=0))
+    _write_result(fresh, 'df_task_12__architect-x__new.json', _arch_result())
+    _write_result(fresh, 'df_task_12__opus-high__new2.json', _impl_result(str(wt)))
+
+    proc = _run_smoke_live(results, fresh, bin_dir)
+    assert proc.returncode == 0, (
+        f'expected PASS, got rc={proc.returncode}\nSTDOUT:\n{proc.stdout}\n'
+        f'STDERR:\n{proc.stderr}'
+    )
+
+
+def test_live_run_with_no_fresh_cells_fails(tmp_path):
+    results = tmp_path / 'results'
+    fresh = tmp_path / 'fresh'
+    results.mkdir()
+    fresh.mkdir()
+    bin_dir = tmp_path / 'bin'
+    _fake_uv(bin_dir)
+    wt = tmp_path / 'impl-wt'
+    _venv_python_stub(wt, 'Python 3.13.5')
+    _write_result(results, 'df_task_12__architect-x__r1.json', _arch_result())
+    _write_result(results, 'df_task_12__opus-high__r2.json', _impl_result(str(wt)))
+
+    proc = _run_smoke_live(results, fresh, bin_dir)
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode != 0, f'expected FAIL:\n{combined}'
+    assert 'BUG 1' in combined

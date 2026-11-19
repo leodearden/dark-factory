@@ -82,21 +82,30 @@ commit_planning(project_root="<project_root>", task_ids=f"{completion['task_id']
 
 Commit at once only when every task the run will file already exists. A run whose
 tasks are filed by later `/prd` sessions (a program) leaves both tasks uncommitted
-(`deferred`) until the program's FILED table is complete, then commits; the completion
-gate's measure covers only tasks carrying `x_finding_run`, so committing early would let
-it pass on the first few tickets and fire the human gate before the structural work is
-filed.
+(`deferred`) until the program's FILED table is complete; the completion gate's measure
+covers only tasks carrying `x_finding_run`, so committing early would let it pass on the
+first few tickets and fire the human gate before the structural work is filed. Before the
+filing session ends, give each held task a real record:
+`set_task_status(id=<task>, status="deferred", deferral={"kind": "until_condition",
+"condition": "<program> FILED table complete"}, project_root="<project_root>")`, and
+confirm the response echoes `deferral` (no echo means the server predates the deferral
+gate: the hold is unrecorded, so re-stamp it after fused-memory restarts). Release them
+once the FILED table is complete with `set_task_status(id="<completion>,<human gate>",
+status="pending")`: `commit_planning` refuses a re-stamped hold (`not_planning_hold`).
+Recipe: `docs/task-authoring.md` §9 "Deferring a task".
 
 ## 4. Interim form (one task)
 
 The human gate from §3, with `"milestone": {"mode": "delayed", "after_secs": 259200}` added
 to its metadata, filed with `planning_mode=True` and left uncommitted (`deferred`) until its
-dependencies exist. Then `add_dependency(id=<human gate>, depends_on=<task>)` for each `high`
+dependencies exist; held past its filing session, it is re-stamped `until_condition` with the
+echo check, as in §3. Then `add_dependency(id=<human gate>, depends_on=<task>)` for each `high`
 or `critical` task the run filed — for a run whose tasks are filed by later `/prd` sessions,
 each session adds its own as it files. If the run filed none of those, depend on every task
-it filed. Only when the program's FILED table is complete: `commit_planning(task_ids="<human
-gate>")`. A delayed milestone with no dependencies anchors at once, so the gate is never
-committed bare.
+it filed. Only when the program's FILED table is complete: `set_task_status(id="<human gate>",
+status="pending")` (or `commit_planning(task_ids="<human gate>")` while it still holds only
+its `planning` record). A delayed milestone with no dependencies anchors at once, so the gate
+is never committed bare.
 
 ## 5. Superseding an open chain
 

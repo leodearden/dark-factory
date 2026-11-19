@@ -16,6 +16,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _tool_calls import call_tool
 
 # TEST-TIME only import: dark-factory-shared is already a declared workspace
 # dependency of escalation/pyproject.toml, so this resolves without adding a new
@@ -80,8 +81,7 @@ class _FakeHarness:
 
 
 async def _call_release(server, **kwargs: Any) -> dict[str, Any]:
-    tool = await server.get_tool('release_workflow')
-    return await tool.fn(**kwargs)
+    return await call_tool(server, 'release_workflow', **kwargs)
 
 
 # DERIVED from the canonical vocabulary, not hand-copied: the whole point of the
@@ -469,7 +469,7 @@ async def test_release_workflow_real_slot_exit_parks_blocked(
     - parked='blocked' (scheduler.get_status='in-progress' → parked to blocked)
     - scheduler.set_task_status called once with (tid, 'blocked')
     """
-    from unittest.mock import MagicMock, patch  # noqa: PLC0415
+    from unittest.mock import MagicMock, patch
 
     from orchestrator.harness import Harness  # type: ignore[reportMissingImports]
     from orchestrator.scheduler import TaskAssignment  # type: ignore[reportMissingImports]
@@ -529,6 +529,7 @@ async def test_release_workflow_real_slot_exit_parks_blocked(
     h._merge_worker = None  # type: ignore[assignment]
     h._merge_inflight_registry = None  # type: ignore[assignment]
     h.cost_store = None  # type: ignore[assignment]
+    h._task_verify_dispatcher = MagicMock()
 
     # _collect_slot_report / _apply_retry_cap
     h._run_store = None  # type: ignore[assignment]

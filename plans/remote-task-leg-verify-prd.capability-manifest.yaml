@@ -168,7 +168,7 @@ tasks:
         record
   - name: dispatcher-substrate
     binding: substrate — verify_plan.py::derive_verify_plan, git_ops.py::GitOps.has_uncommitted_work,
-      verify_runner.py::RemoteRunner.sync_if_stale and verify_categories.py INFRA_TRANSIENT_CATEGORIES
+      verify_runner.py::RemoteRunner.ensure_gate and verify_categories.py INFRA_TRANSIENT_CATEGORIES
       all present on main.
     verdict: PASS
     delivered_check:
@@ -184,43 +184,104 @@ tasks:
       kind: manual
       reason: release discipline is asserted by executed boundary rows 13, 14 and
         21
-- label: δ1
-  task_id: 6670
-  title: Harness-owned HostAllocator + HostPool, injected into the merge worker (HUB
-    carry, stage 1)
-  note: 'Decompose re-scope: δ1 builds the quarantine set, allocator and pool in Harness.__init__
-    and injects the allocator, quarantine set and held_by reader into the worker;
-    the TaskVerifyDispatcher and the build_workflow wiring move to δ2, because the
-    dispatcher needs the config-backed policy reader δ2 adds. Ratchet raise on merge_lane/worker.py
-    authorised in the same commit.'
+- label: γ2
+  task_id: 7977
+  title: One task-slot mechanism on every host
+  note: Amendment of 2026-10-31 (PRD decisions 14 and 16). Changes γ's landed HostPool.
   capabilities:
-  - name: merge-lane-wants-host
-    binding: capability→producer — δ1 adds SpeculativeMergeWorker.merge_lane_wants_host
-      reading _redispatch, _verifier_queue, _pending_verifier_get and _merge_ahead_ledger.live
-      (all present on main in merge_lane/worker.py).
+  - name: merge-demand-gone
+    binding: γ landed MergeDemand in verify_hosts.py; γ2 deletes it, since the roles
+      share no slot (decision 16).
     verdict: PASS
     delivered_check:
       kind: grep
-      pattern: def merge_lane_wants_host\(
+      pattern: MergeDemand
+      paths:
+      - orchestrator/src/orchestrator/verify_hosts.py
+      expect: absent
+  - name: plan-keyword-on-scoped-verify
+    binding: capability→producer — γ2 adds the admission_plan keyword to
+      verify.py::run_scoped_verification, whose plan stamp is present on main.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: admission_plan[:] .*AdmissionPlan \| None'? = None
+      paths:
+      - orchestrator/src/orchestrator/verify.py
+      expect: present
+  - name: granted-plan-read
+    binding: capability→producer — γ2 adds PlanLatch to verify_admission_gate.py and
+      marks it from the returned grant; rows 26, 27, 37, 38 and 44 exercise it.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^class PlanLatch[(:]
+      paths:
+      - orchestrator/src/orchestrator/verify_admission_gate.py
+      expect: present
+  - name: gate-pause-and-wake
+    binding: capability→producer — γ2 adds AdmissionGate.redispatch and lets a policy
+      report slots=0; row 32 exercises it.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def redispatch\(
+      paths:
+      - orchestrator/src/orchestrator/verify_admission_gate.py
+      expect: present
+  - name: per-request-probe
+    binding: γ2 scopes RemoteRunner.probe_clean to the probed request; row 46 exercises it.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: behaviour pinned by boundary row 46
+  - name: publish-retry
+    binding: γ2 adds one retry to RemoteRunner.publish_sha for a non-transport failure,
+      because two roles publishing one sha collide on cannot-lock-ref; row 47 exercises it.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: behaviour pinned by boundary row 47
+  - name: safe-withdrawal
+    binding: AdmissionGate._leave, _recorded_admission_plan and _reap are present on
+      main, a probe confirmed the cancel, and rows 26, 31 and 35 exercise it.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: behaviour pinned by boundary rows 26, 31 and 35
+- label: δ
+  task_id: 6670
+  title: Host health, config keys, workflow port and dispatcher wiring (HUB carry; δ1 and δ2
+    merged 2026-11-01)
+  note: 'δ1 (rescoped 2026-10-31 by decision 16 to host health) and δ2 (config keys,
+    policy reader, dispatcher construction, workflow port, workflow_verify.runner) merged
+    into task 6670 on 2026-11-01; task 6671 cancelled.'
+  capabilities:
+  - name: bench-before-first-merge
+    binding: capability→producer — δ1 adds public ensure_host_allocator over the worker's
+      lazy build (present on main) and wires the pool's on_unavailable through it to
+      6565's bench_unavailable_runner (present on main), so task-path RU enters the
+      reprobe sweep with no merge yet dispatched (critic F1).
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def ensure_host_allocator\(
       paths:
       - orchestrator/src/orchestrator/merge_lane/
       expect: present
-  - name: public-ru-tracker-entry
-    binding: capability→producer — δ1 adds note_runner_unavailable / note_runner_recovered
-      over the existing private _quarantine_unreachable_host, _record_runner_unavailable
-      and _record_runner_recovered (present on main), so task-path RU enters the reprobe
-      sweep (critic F1).
+  - name: readmission-wakes-the-gate
+    binding: capability→producer — δ1 calls an injected on_host_readmitted from
+      _readmit_probed_host (present on main); row 32 exercises it.
     verdict: PASS
     delivered_check:
       kind: grep
-      pattern: def note_runner_unavailable\(
+      pattern: on_host_readmitted
       paths:
       - orchestrator/src/orchestrator/merge_lane/
       expect: present
   - name: harness-owns-pool
-    binding: capability→producer (wired) — δ1 constructs HostPool (γ, upstream) in
-      harness.py::Harness.__init__ and injects the allocator through harness.py::Harness._start_merge_worker
-      (present on main).
+    binding: capability→producer (wired) — δ1 constructs HostPool (γ2, upstream) in
+      harness.py::Harness.__init__ (present on main).
     verdict: PASS
     delivered_check:
       kind: grep
@@ -228,15 +289,6 @@ tasks:
       paths:
       - orchestrator/src/orchestrator/harness.py
       expect: present
-- label: δ2
-  task_id: 6671
-  title: Workflow consumer, config keys and harness dispatcher wiring (HUB carry,
-    stage 2)
-  note: 'Decompose re-scope: δ2 also owns the config-backed TaskVerifyPolicy reader
-    (task_verify_dispatch.py), constructs the dispatcher in harness.py and passes
-    task_verify= at the harness.py build_workflow call; defaults.yaml carries the
-    new keys. Depends on 6580 (one task-role verify site left).'
-  capabilities:
   - name: task-verify-config-keys
     binding: capability→producer — δ2 adds verify_task_host_policy, verify_task_remote_modules
       (+ validator), verify_task_remote_cross_check_every_n, verify_task_remote_red_confirms_locally
@@ -286,12 +338,12 @@ tasks:
       reason: payload population is asserted by boundary row 17, not greppable
 - label: ι
   task_id: 6672
-  title: Integration gate — all 25 boundary rows against the real Harness, worker,
+  title: Integration gate — all 32 end-to-end boundary rows (the other 20 are pinned at γ2) against the real Harness, worker,
     workflow and verify-task CLI
   capabilities:
   - name: integration-module
     binding: capability→producer — ι creates orchestrator/tests/test_task_verify_integration.py;
-      every leg it drives (α β γ δ1 δ2) is in its transitive dependency closure.
+      every leg it drives (α β γ γ2 δ) is in its transitive dependency closure.
     verdict: PASS
     delivered_check:
       kind: path
@@ -299,11 +351,11 @@ tasks:
       - orchestrator/tests/test_task_verify_integration.py
       expect: present
   - name: boundary-sketch-green-e2e
-    binding: DAG-direction — all producers upstream (β, γ, δ2 direct; α, δ1 transitive).
+    binding: DAG-direction — all producers upstream (β, γ, δ direct; α, γ2 transitive).
     verdict: PASS
     delivered_check:
       kind: manual
-      reason: the task IS the check suite; its signal is the 25 executed rows
+      reason: the task IS the check suite; its signal is the 32 executed rows
 - label: ε
   task_id: 6673
   title: DF rollout, parity window and the post-6580 baseline (operator gate)

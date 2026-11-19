@@ -9,6 +9,7 @@ read, an injected clock and a real escalation queue.  The pure rules are
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 from dataclasses import replace
 from pathlib import Path
@@ -22,170 +23,63 @@ from _lane_episode_fakes import (
     HEAD1,
     HEAD2,
     HEAD3,
-    LANE_COMMAND,
+    T0,
     A,
     B,
     C,
-    Clock,
-    FakeAncestry,
-    FakeLedgerClient,
-    StoreWrites,
+    Lane,
+    _episode,
     _episodes_path,
-    _run,
+    _record,
 )
+from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from shared.task_submit import SubmitFailed, SubmittedTask, SubmittedTicket
 
-from orchestrator.config import OrchestratorConfig
-from orchestrator.offline_lane_confirm import (
-    Confirmed,
-    ConfirmMode,
-    Unconfirmable,
-    UnconfirmableReason,
-)
 from orchestrator.offline_lane_episode_state import (
-    CommandRecord,
-    Episode,
+    EPISODE_RETENTION,
     EpisodeStore,
-    PassEffect,
-    PassObservation,
     unconfirmable_node,
 )
-from orchestrator.offline_lane_episodes import LaneEngine, TickResult
+from orchestrator.offline_lane_episodes import TICK_FAILURES_BEFORE_ESCALATION, TickResult
 from orchestrator.offline_lane_escalations import (
     STUCK_FILING_CATEGORY,
+    TICK_FAILURE_CATEGORY,
     UNLANDED_RED_CATEGORY,
     escalation_state,
-    sentinel_task_id,
 )
 from orchestrator.offline_lane_filing import EvidenceNote
 from orchestrator.offline_lane_records import (
     LEGACY_NUMERIC_COMMAND,
-    RunRecord,
-    RunRecordStore,
+    command_key,
 )
 
 # --- the engine: observe and tick over fakes ----------------------------------------
 
 
 class FailingOnceQueue(EscalationQueue):
-    def __init__(self, queue_dir: Path) -> None:
+    """A real queue whose calls named in ``fail_once`` each raise once, the next time they are made."""
+
+    def __init__(self, queue_dir: Path, *fail_once: str) -> None:
         super().__init__(queue_dir)
-        self.failures_left = 1
+        self.fail_once = set(fail_once)
+
+    def _maybe_fail(self, call: str) -> None:
+        if call in self.fail_once:
+            self.fail_once.discard(call)
+            raise OSError(f'queue {call} failed: queue directory unwritable')
 
     def submit(self, escalation):
-        if self.failures_left:
-            self.failures_left -= 1
-            raise OSError('queue directory unwritable')
+        self._maybe_fail('submit')
         return super().submit(escalation)
 
+    def amend(self, escalation_id, **framing):
+        self._maybe_fail('amend')
+        return super().amend(escalation_id, **framing)
 
-class Lane:
-    """A lane command's passes, written as real run records and observed by a real engine."""
-
-    def __init__(self, tmp_path: Path, *, client: bool = True, queue: EscalationQueue | None | bool = True) -> None:
-        self.tmp_path = tmp_path
-        self.log: list[str] = []
-        self.clock = Clock()
-        self.client = FakeLedgerClient(self.log)
-        self.ancestry = FakeAncestry()
-        self.queue = EscalationQueue(tmp_path / 'queue') if queue is True else (queue or None)
-        self.records = RunRecordStore(tmp_path, clock=self.clock)
-        self._with_client = client
-        self.engine = self.restarted()
-
-    def restarted(self) -> LaneEngine:
-        self.engine = LaneEngine(
-            OrchestratorConfig(project_root=self.tmp_path),
-            self.ancestry,
-            task_client=self.client if self._with_client else None,
-            escalation_queue=self.queue,
-            now=self.clock,
-        )
-        return self.engine
-
-    async def _observe(
-        self,
-        head: str,
-        outcome: Confirmed | Unconfirmable | None,
-        detect: RunRecord,
-        confirm: RunRecord | None,
-        notes: tuple[EvidenceNote, ...] = (),
-        *,
-        command: str = COMMAND,
-        leg: str = 'generic',
-    ) -> PassEffect:
-        lane_pass = self.records.allocate_pass(command, leg, head)
-        detect = replace(detect, command=command, leg=leg)
-        self.records.write_run(lane_pass, detect)
-        if confirm is not None:
-            self.records.write_run(lane_pass, replace(confirm, command=command, leg=leg))
-        observation = PassObservation(
-            command=command,
-            leg=leg,
-            head=head,
-            pass_id=lane_pass.pass_id,
-            started_at=lane_pass.started_at,
-            detect=detect,
-            confirm=confirm,
-            outcome=outcome,
-            fix_task_priority='medium' if leg == 'generic' else 'high',
-            notes=notes,
-            lane_command=LANE_COMMAND if leg == 'generic' else None,
-        )
-        return await self.engine.observe(observation)
-
-    async def red(
-        self,
-        reproduced: tuple[str, ...] = (A,),
-        cleared: tuple[str, ...] = (),
-        inconclusive: tuple[str, ...] = (),
-        *,
-        head: str = HEAD1,
-        outcomes: dict[str, str] | None = None,
-        command: str = COMMAND,
-        leg: str = 'generic',
-    ) -> PassEffect:
-        at = self.clock()
-        detect = _run('detect', head, at, failing=(*reproduced, *cleared, *inconclusive), outcomes=outcomes)
-        confirm = _run('confirm', head, at, failing=reproduced)
-        outcome = Confirmed(ConfirmMode.NARROWED, reproduced, cleared, inconclusive)
-        return await self._observe(head, outcome, detect, confirm, command=command, leg=leg)
-
-    async def green(self, *, head: str = HEAD1) -> PassEffect:
-        return await self._observe(head, None, _run('detect', head, self.clock()), None)
-
-    async def unconfirmable(self, *, head: str = HEAD1, notes: tuple[EvidenceNote, ...] = ()) -> PassEffect:
-        at = self.clock()
-        outcome = Unconfirmable(UnconfirmableReason.CONFIRM_EXITED_NONZERO_NAMING_NO_TEST, '2')
-        detect = _run('detect', head, at, failing=(A,))
-        return await self._observe(head, outcome, detect, _run('confirm', head, at, returncode=2), notes)
-
-    async def spaced_red(self, *nodes: str, minutes: float = 30, **fields: Any) -> PassEffect:
-        self.clock.advance(minutes=minutes)
-        return await self.red(nodes or (A,), **fields)
-
-    async def tick(self, *, head: str = HEAD1) -> TickResult:
-        return await self.engine.tick(head=head)
-
-    def stored(self, command: str = COMMAND) -> CommandRecord:
-        return EpisodeStore(self.tmp_path, clock=self.clock).load(command)
-
-    def episode(self, node: str = A) -> Episode:
-        return self.stored().episodes[node]
-
-    def pending(self, category: str) -> list:
-        sentinel = sentinel_task_id(COMMAND)
-        return [e for e in self.queue.get_pending() if e.task_id == sentinel and e.category == category] if self.queue else []
-
-    def lane_metadata(self, index: int = -1) -> dict[str, Any]:
-        return self.client.submitted[index]['metadata']['x_offline_lane']
-
-    def watch_writes(self) -> StoreWrites:
-        writes = StoreWrites(self.tmp_path, self.clock, self.log)
-        self.clock.observers.append(writes.sample)
-        self.client.observers.append(writes.sample)
-        return writes
+    def resolve(self, escalation_id, resolution, *args, **kwargs):
+        self._maybe_fail('resolve')
+        return super().resolve(escalation_id, resolution, *args, **kwargs)
 
 
 @pytest.mark.asyncio
@@ -544,9 +438,9 @@ async def test_a_legacy_leg_filing_reproduces_with_the_leg_script(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_scenario_21_an_unreadable_store_with_an_open_task_costs_at_most_one_duplicate(tmp_path, caplog):
+async def test_scenario_21_an_unreadable_store_with_an_open_task_adopts_it_and_files_no_duplicate(tmp_path, caplog):
     lane = Lane(tmp_path)
-    await _filed(lane)
+    first = await _filed(lane)
     _episodes_path(tmp_path).write_text('{ not json')
 
     with caplog.at_level(logging.WARNING):
@@ -555,7 +449,8 @@ async def test_scenario_21_an_unreadable_store_with_an_open_task_costs_at_most_o
         await lane.spaced_red()
 
     assert any(r.levelno >= logging.WARNING for r in caplog.records)
-    assert len(lane.client.submitted) == 2
+    assert len(lane.client.submitted) == 1
+    assert lane.episode().covering_task_id == first
 
 
 @pytest.mark.asyncio
@@ -569,7 +464,8 @@ async def test_the_six_filing_writes_happen_in_order(tmp_path):
     writes.sample()
 
     assert lane.log == [
-        'write', 'write', 'submit_task', 'write', 'commit_planning', 'get_task', 'write', 'write',
+        'write', 'write', 'find_tasks_by_metadata', 'submit_task', 'write', 'commit_planning', 'get_task',
+        'write', 'write',
     ]
     states = [
         (e.filing_due, e.covering_task_id, e.planning_committed)
@@ -705,7 +601,7 @@ async def test_with_no_escalation_queue_nothing_is_raised_and_nothing_raises(tmp
 
 @pytest.mark.asyncio
 async def test_a_failed_unlanded_escalation_write_is_retried_at_the_next_qualifying_pass(tmp_path):
-    lane = Lane(tmp_path, queue=FailingOnceQueue(tmp_path / 'queue'))
+    lane = Lane(tmp_path, queue=FailingOnceQueue(tmp_path / 'queue', 'submit'))
     await _filed(lane)
     raised: list[tuple[str, ...]] = []
 
@@ -1012,3 +908,410 @@ async def test_no_recheck_for_a_test_already_held_at_the_threshold(tmp_path):
     lane.clock.advance(minutes=31)
 
     assert (await lane.tick()).commands_due == ()
+
+
+# --- R13: an open lane fix task that covers the test is adopted, not duplicated ------
+
+PRE_CUTOVER = {'spawn_context': 'offline_lane_red', 'failing_tests': [A]}
+
+
+def _engine_filed(command: str = COMMAND, nodes: tuple[str, ...] = (A,)) -> dict[str, Any]:
+    return {'spawn_context': 'offline_lane_red', 'x_offline_lane': {'command': command, 'nodes': list(nodes)}}
+
+
+@pytest.mark.parametrize(
+    ('status', 'metadata'),
+    [('in-progress', PRE_CUTOVER), ('pending', _engine_filed())],
+    ids=['pre-cutover', 'engine-filed'],
+)
+@pytest.mark.asyncio
+async def test_r13_an_open_lane_task_covering_the_test_is_adopted_and_nothing_is_filed(tmp_path, status, metadata):
+    lane = Lane(tmp_path)
+    lane.client.set_status('850', status, **metadata)
+    await lane.red()
+
+    effect = await lane.spaced_red()
+
+    episode = lane.episode()
+    assert lane.client.submitted == []
+    assert effect.tasks_filed == ()
+    assert (episode.covering_task_id, episode.planning_committed, episode.filing_due) == ('850', True, False)
+    assert (episode.filing_failure, episode.filed_at) == (None, lane.clock())
+    assert '850' in episode.prior_task_ids
+    assert lane.client.tasks['850']['status'] == status
+    assert 'commit_planning' not in lane.log
+
+
+@pytest.mark.parametrize(
+    ('status', 'metadata'),
+    [
+        ('pending', _engine_filed(command='nightly-deep')),
+        ('pending', _engine_filed(nodes=(B,))),
+        ('pending', {'spawn_context': 'merge_skew', 'failing_tests': [A]}),
+        ('done', PRE_CUTOVER),
+        ('cancelled', PRE_CUTOVER),
+        ('deferred', PRE_CUTOVER),
+    ],
+    ids=['another-command', 'another-test', 'not-a-lane-task', 'done', 'cancelled', 'deferred'],
+)
+@pytest.mark.asyncio
+async def test_r13_a_task_that_is_not_open_or_does_not_cover_the_test_is_not_adopted(tmp_path, status, metadata):
+    lane = Lane(tmp_path)
+    lane.client.set_status('850', status, **metadata)
+    await lane.red()
+
+    effect = await lane.spaced_red()
+
+    assert len(lane.client.submitted) == 1
+    assert effect.tasks_filed == ('7001',)
+    assert lane.episode().covering_task_id == '7001'
+
+
+@pytest.mark.asyncio
+async def test_r13_a_group_submits_only_the_tests_no_open_task_covers(tmp_path):
+    lane = Lane(tmp_path)
+    lane.client.set_status('850', 'pending', **PRE_CUTOVER)
+    await lane.red((A, B))
+
+    effect = await lane.spaced_red(A, B)
+
+    assert len(lane.client.submitted) == 1
+    assert lane.lane_metadata()['nodes'] == [B]
+    assert effect.tasks_filed == ('7001',)
+    assert (lane.episode(A).covering_task_id, lane.episode(B).covering_task_id) == ('850', '7001')
+
+
+@pytest.mark.asyncio
+async def test_r13_a_failed_lookup_files_nothing_and_the_tick_files_once_it_reads(tmp_path):
+    lane = Lane(tmp_path)
+    lane.client.lookup_error = ConnectionError('task store unreachable')
+    await lane.red()
+
+    effect = await lane.spaced_red()
+    submitted_while_down = len(lane.client.submitted)
+    due = lane.episode()
+    lane.client.lookup_error = None
+    lane.clock.advance(minutes=1)
+    tick = await lane.tick()
+
+    assert (effect.tasks_filed, submitted_while_down) == ((), 0)
+    assert (due.filing_due, due.covering_task_id) == (True, None)
+    assert 'lookup' in (due.filing_failure or '')
+    assert 'task store unreachable' in (due.filing_failure or '')
+    assert tick.tasks_filed == ('7001',)
+    assert len(lane.client.submitted) == 1
+
+
+@pytest.mark.asyncio
+async def test_r13_an_unreadable_open_candidate_files_nothing_and_the_stuck_record_names_it(tmp_path):
+    lane = Lane(tmp_path)
+    lane.client.set_status('850', 'pending', **PRE_CUTOVER)
+    lane.client.unreadable.add('850')
+    await lane.red()
+
+    effect = await lane.spaced_red()
+    episode = lane.episode()
+    lane.clock.advance(minutes=30)
+    await lane.tick()
+
+    assert lane.client.submitted == []
+    assert effect.tasks_filed == ()
+    assert (episode.filing_due, episode.covering_task_id) == (True, None)
+    assert '850' in (episode.filing_failure or '')
+    (stuck,) = lane.pending(STUCK_FILING_CATEGORY)
+    assert 'open lane task 850 unreadable' in stuck.detail
+
+
+@pytest.mark.asyncio
+async def test_r13_a_pass_or_tick_looks_up_the_open_lane_tasks_once_for_all_its_filings(tmp_path):
+    lane = Lane(tmp_path)
+    lane.client.fail_submissions(*['server busy'] * 4)
+    await lane.red()
+    await lane.spaced_red()
+    await lane.spaced_red(A, B)
+    pass_start = len(lane.log)
+    await lane.spaced_red(A, B)
+    in_pass = lane.log[pass_start:]
+    tick_start = len(lane.log)
+    tick = await lane.tick()
+    in_tick = lane.log[tick_start:]
+
+    assert (in_pass.count('find_tasks_by_metadata'), in_pass.count('submit_task')) == (1, 2)
+    assert (in_tick.count('find_tasks_by_metadata'), in_tick.count('submit_task')) == (1, 2)
+    assert tick.tasks_filed == ('7001', '7002')
+
+
+@pytest.mark.asyncio
+async def test_r13_an_adopted_task_still_red_a_day_on_raises_one_unlanded_record(tmp_path):
+    lane = Lane(tmp_path)
+    lane.client.set_status('850', 'pending', **PRE_CUTOVER)
+    await lane.red()
+    await lane.spaced_red()
+
+    for _ in range(10):
+        await lane.spaced_red(minutes=150)
+
+    (record,) = lane.pending(UNLANDED_RED_CATEGORY)
+    assert '850' in record.summary
+    assert lane.client.submitted == []
+
+
+# --- R14: a cold command record takes its last pass and green head from the run records
+
+
+@pytest.mark.asyncio
+async def test_r14_a_cold_record_takes_its_last_green_head_from_the_run_records_before_the_pass(tmp_path):
+    lane = Lane(tmp_path)
+    lane.unobserved(HEAD0)
+    lane.clock.advance(minutes=30)
+    lane.unobserved(HEAD1, failing=(A,))
+    lane.clock.advance(minutes=30)
+
+    await lane.red(head=HEAD2)
+    started, stored = lane.episode(A), lane.stored()
+    await lane.spaced_red(head=HEAD2)
+
+    assert (started.last_green_head, stored.last_green_head) == (HEAD0, HEAD0)
+    assert lane.lane_metadata()['last_green_head'] == HEAD0
+    description = lane.client.submitted[0]['description']
+    assert f'Suspect range (last all-green head..first red head): {HEAD0}..{HEAD2}' in description
+
+
+@pytest.mark.asyncio
+async def test_r14_the_seeded_last_pass_answers_r1_for_a_test_it_passed(tmp_path):
+    lane = Lane(tmp_path)
+    lane.unobserved(HEAD0)
+    lane.clock.advance(minutes=30)
+    lane.unobserved(HEAD1, failing=(B,), outcomes={A: 'passed', B: 'failed'})
+    lane.clock.advance(minutes=30)
+
+    await lane.red((A, B), head=HEAD2)
+
+    assert (lane.episode(A).last_green_head, lane.episode(B).last_green_head) == (HEAD1, HEAD0)
+
+
+@pytest.mark.asyncio
+async def test_r14_with_no_run_records_before_the_pass_the_green_head_stays_unknown(tmp_path):
+    lane = Lane(tmp_path)
+
+    await lane.red(head=HEAD2)
+
+    assert (lane.episode(A).last_green_head, lane.stored().last_green_head) == (None, None)
+
+
+def _listable(directory: Path) -> bool:
+    try:
+        os.listdir(directory)
+    except PermissionError:
+        return False
+    return True
+
+
+@pytest.mark.asyncio
+async def test_r14_an_unlistable_run_record_directory_seeds_nothing_and_the_pass_still_applies(tmp_path, caplog):
+    lane = Lane(tmp_path)
+    lane.unobserved(HEAD0)
+    lane.clock.advance(minutes=30)
+    command_dir = lane.records.root / command_key(COMMAND)
+    command_dir.chmod(0o300)
+    try:
+        if _listable(command_dir):
+            pytest.skip('this user lists a directory whose mode forbids it')
+        with caplog.at_level(logging.ERROR):
+            effect = await lane.red(head=HEAD2)
+    finally:
+        command_dir.chmod(0o700)
+
+    assert effect.episodes_started == (A,)
+    assert (lane.episode(A).last_green_head, lane.stored().last_green_head) == (None, None)
+    assert lane.stored().last_pass_id is not None
+    assert any(
+        r.levelno == logging.ERROR and 'run records unreadable, no history seeded' in r.getMessage()
+        for r in caplog.records
+    )
+
+
+# --- R15: a command whose tick raises is logged and skipped, the other commands go on --------
+
+BROKEN = 'broken'
+
+
+def _plant_broken(lane: Lane) -> None:
+    """A stored record whose due filing has no counted pass, so every tick of it raises in the filing's
+    evidence check; planted before any other command's pass, so it comes first in the store's commands."""
+    broken = _episode(A, counted_passes=(), filing_due=True, filing_due_since=T0, reproduce='pytest -m integration tests')
+    EpisodeStore(lane.tmp_path, clock=lane.clock).save(replace(_record(broken), command=BROKEN))
+    lane.restarted()
+
+
+@pytest.mark.asyncio
+async def test_one_command_whose_record_makes_its_tick_raise_leaves_the_other_commands_ticked(tmp_path, caplog):
+    lane = Lane(tmp_path)
+    _plant_broken(lane)
+    await lane.red()
+    lane.clock.advance(minutes=30)
+
+    with caplog.at_level(logging.ERROR, logger='orchestrator.offline_lane_episodes'):
+        tick = await lane.tick()
+
+    assert tick.commands_due == (COMMAND,)
+    assert any(
+        r.levelno == logging.ERROR and all(text in r.getMessage() for text in (BROKEN, 'ValueError', 'counted pass'))
+        for r in caplog.records
+    )
+    assert lane.stored(BROKEN).episodes[A].filing_due is True
+
+
+@pytest.mark.asyncio
+async def test_a_command_failing_every_tick_keeps_one_level_one_record_resolved_at_its_first_clean_tick(tmp_path):
+    lane = Lane(tmp_path)
+    assert lane.queue is not None
+    _plant_broken(lane)
+    for _ in range(TICK_FAILURES_BEFORE_ESCALATION - 1):
+        await lane.tick()
+    assert lane.pending(TICK_FAILURE_CATEGORY, command=BROKEN) == []
+
+    await lane.tick()
+    (record,) = lane.pending(TICK_FAILURE_CATEGORY, command=BROKEN)
+    assert record.level == 1
+    assert BROKEN in record.summary and 'ValueError' in record.summary
+    assert 'a lane fix task needs at least one test, each with a counted pass' in record.detail
+
+    await lane.tick()
+    assert [e.id for e in lane.pending(TICK_FAILURE_CATEGORY, command=BROKEN)] == [record.id]
+
+    lane.client.set_status('850', 'pending', **_engine_filed(command=BROKEN))
+    await lane.tick()
+
+    assert escalation_state(lane.queue, record.id) == 'resolved'
+    assert lane.pending(TICK_FAILURE_CATEGORY, command=BROKEN) == []
+    assert lane.stored(BROKEN).episodes[A].covering_task_id == '850'
+
+
+@pytest.mark.asyncio
+async def test_with_no_escalation_queue_a_failing_command_is_only_logged(tmp_path, caplog):
+    lane = Lane(tmp_path, queue=None)
+    _plant_broken(lane)
+
+    for in_a_row in range(1, TICK_FAILURES_BEFORE_ESCALATION + 2):
+        caplog.clear()
+        with caplog.at_level(logging.ERROR, logger='orchestrator.offline_lane_episodes'):
+            await lane.tick()
+        assert any(
+            r.levelno == logging.ERROR and f'{BROKEN}: tick failed ({in_a_row} in a row)' in r.getMessage()
+            for r in caplog.records
+        )
+
+
+async def _ticked_to_its_tick_failure_record(lane: Lane) -> Escalation:
+    """The broken command's one pending tick-failure record, after a run of failed ticks long enough to file it."""
+    for _ in range(TICK_FAILURES_BEFORE_ESCALATION):
+        await lane.tick()
+    (record,) = lane.pending(TICK_FAILURE_CATEGORY, command=BROKEN)
+    return record
+
+
+def _broken_ticks_clean(lane: Lane, clean: bool) -> None:
+    """With R13's lookup failing, the broken command's filing is not attempted, so its tick runs clean."""
+    lane.client.lookup_error = RuntimeError('task store unreachable') if clean else None
+
+
+def _logged(caplog: pytest.LogCaptureFixture, text: str) -> bool:
+    return any(r.levelno == logging.ERROR and BROKEN in r.getMessage() and text in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_a_record_resolved_while_the_command_still_fails_is_filed_afresh_at_its_next_failed_tick(tmp_path):
+    lane = Lane(tmp_path)
+    assert lane.queue is not None
+    _plant_broken(lane)
+    first = await _ticked_to_its_tick_failure_record(lane)
+
+    lane.queue.resolve(first.id, 'operator: looked at it', resolved_by='operator')
+    await lane.tick()
+
+    (second,) = lane.pending(TICK_FAILURE_CATEGORY, command=BROKEN)
+    assert second.id != first.id
+    _broken_ticks_clean(lane, True)
+    await lane.tick()
+    assert escalation_state(lane.queue, second.id) == 'resolved'
+
+
+@pytest.mark.asyncio
+async def test_a_failed_filing_or_amend_of_the_tick_failure_record_is_logged_and_retried_at_the_next_failed_tick(
+    tmp_path, caplog,
+):
+    queue = FailingOnceQueue(tmp_path / 'queue', 'submit')
+    lane = Lane(tmp_path, queue=queue)
+    _plant_broken(lane)
+    with caplog.at_level(logging.ERROR, logger='orchestrator.offline_lane_episodes'):
+        for _ in range(TICK_FAILURES_BEFORE_ESCALATION):
+            await lane.tick()
+    assert lane.pending(TICK_FAILURE_CATEGORY, command=BROKEN) == []
+    assert _logged(caplog, 'tick-failure escalation not maintained')
+
+    await lane.tick()
+    (record,) = lane.pending(TICK_FAILURE_CATEGORY, command=BROKEN)
+    caplog.clear()
+    queue.fail_once.add('amend')
+    with caplog.at_level(logging.ERROR, logger='orchestrator.offline_lane_episodes'):
+        await lane.tick()
+    assert _logged(caplog, 'tick-failure escalation not maintained')
+
+    await lane.tick()
+    assert [e.id for e in lane.pending(TICK_FAILURE_CATEGORY, command=BROKEN)] == [record.id]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_resolve_of_the_tick_failure_record_is_retried_at_the_next_clean_tick(tmp_path, caplog):
+    queue = FailingOnceQueue(tmp_path / 'queue')
+    lane = Lane(tmp_path, queue=queue)
+    _plant_broken(lane)
+    record = await _ticked_to_its_tick_failure_record(lane)
+
+    queue.fail_once.add('resolve')
+    _broken_ticks_clean(lane, True)
+    with caplog.at_level(logging.ERROR, logger='orchestrator.offline_lane_episodes'):
+        await lane.tick()
+    assert escalation_state(queue, record.id) == 'pending'
+    assert _logged(caplog, f'tick-failure record {record.id} not resolved')
+
+    await lane.tick()
+    assert escalation_state(queue, record.id) == 'resolved'
+
+
+@pytest.mark.asyncio
+async def test_a_failure_run_after_a_failed_resolve_amends_the_record_the_resolve_left_pending(tmp_path):
+    queue = FailingOnceQueue(tmp_path / 'queue')
+    lane = Lane(tmp_path, queue=queue)
+    _plant_broken(lane)
+    record = await _ticked_to_its_tick_failure_record(lane)
+    queue.fail_once.add('resolve')
+    _broken_ticks_clean(lane, True)
+    await lane.tick()
+
+    lane.clock.advance(minutes=1)
+    _broken_ticks_clean(lane, False)
+    for _ in range(TICK_FAILURES_BEFORE_ESCALATION):
+        await lane.tick()
+
+    (amended,) = lane.pending(TICK_FAILURE_CATEGORY, command=BROKEN)
+    assert amended.id == record.id
+    assert lane.clock().isoformat() in amended.amendments[-1]['detail']
+    _broken_ticks_clean(lane, True)
+    await lane.tick()
+    assert escalation_state(queue, record.id) == 'resolved'
+
+
+@pytest.mark.asyncio
+async def test_a_failing_command_whose_record_expires_from_the_store_has_its_tick_failure_record_resolved(tmp_path):
+    lane = Lane(tmp_path)
+    assert lane.queue is not None
+    _plant_broken(lane)
+    record = await _ticked_to_its_tick_failure_record(lane)
+
+    lane.clock.advance(seconds=EPISODE_RETENTION.total_seconds() + 60)
+    await lane.tick()
+
+    assert BROKEN not in EpisodeStore(lane.tmp_path, clock=lane.clock).commands()
+    assert escalation_state(lane.queue, record.id) == 'resolved'

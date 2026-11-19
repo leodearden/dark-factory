@@ -15,7 +15,8 @@ from pathlib import Path
 
 import pytest
 import pytest_asyncio
-from _fm_helpers import _init_git_repo, make_db_without_claimant_columns
+from _fm_git_repos import _init_git_repo
+from _fm_helpers import make_db_without_claimant_columns
 
 from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
 from fused_memory.config.schema import TaskmasterConfig
@@ -110,8 +111,12 @@ async def test_csv_terminal_write_clears_every_id(interceptor, backend, root):
 async def test_non_terminal_write_preserves_claimant(status, interceptor, backend, root):
     heartbeat = _now_iso()
     task_id = await _claimed_in_progress(interceptor, backend, root, heartbeat=heartbeat)
+    deferral = (
+        {'kind': 'until_condition', 'condition': 'non-terminal write keeps the claimant'}
+        if status == 'deferred' else None
+    )
 
-    result = await interceptor.set_task_status(task_id, status, root)
+    result = await interceptor.set_task_status(task_id, status, root, deferral=deferral)
 
     assert 'error' not in result, result
     task = await backend.get_task(task_id, project_root=root)

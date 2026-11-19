@@ -32,8 +32,8 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-import shared.safe_io as _safe_io
 from _lane_episode_fakes import Clock, FakeLedgerClient
+from _merge_lane_fakes import lane_scene_config
 from _orch_helpers import make_placeholder_future, pydantic_spec
 from escalation.models import Escalation
 
@@ -342,10 +342,10 @@ class TestStewardGuardsAreTaskScoped:
 # ---------------------------------------------------------------------------
 
 def _merge_config(project_root: Path):
-    from orchestrator.config import GitConfig, OrchestratorConfig
-    return OrchestratorConfig(
-        project_root=project_root,
-        git=GitConfig(
+    from orchestrator.config import GitConfig
+    return lane_scene_config(
+        project_root,
+        GitConfig(
             main_branch='main',
             branch_prefix='task/',
             remote='origin',
@@ -377,7 +377,7 @@ def _merge_worker(project_root: Path | None, config):
     ``os.fspath()`` is repr-derived, so letting the attribute auto-spec would
     have the worker materialise a real ``MagicMock/`` tree the moment it
     persisted anything — the task-3223 incident conftest's
-    ``_no_mock_derived_stray_dirs`` fence exists for.
+    ``_df_no_mock_derived_stray_dirs`` fence exists for.
     """
     from orchestrator.merge_lane.types import TrainCallbacks
     from orchestrator.merge_lane.worker import SpeculativeMergeWorker
@@ -595,14 +595,15 @@ class TestOfflineLaneEpisodeRecordSurvivesRedeploy:
         episode = host.record().episodes[_LANE_NODE]
         assert (episode.planning_committed, episode.filing_due) == (True, False)
 
-    async def test_an_unreadable_record_costs_at_most_one_duplicate_and_says_so(
+    async def test_an_unreadable_record_files_no_duplicate_while_its_task_is_open_and_says_so(
         self, tmp_path: Path, caplog,
     ):
-        """Scenario 21: the record is lost while its task is open."""
+        """Scenario 21: the record is lost while its task is open, so the task is found by its metadata."""
         host = _LaneHost(tmp_path)
         first = host.process()
         await first.red_pass()
         await first.red_pass()
+        filed = host.record().episodes[_LANE_NODE].covering_task_id
         episodes_file = guard_state.guard_path(tmp_path, EPISODES_FILE)
         assert episodes_file is not None
         episodes_file.write_text('{ not json', encoding='utf-8')
@@ -612,35 +613,39 @@ class TestOfflineLaneEpisodeRecordSurvivesRedeploy:
         for _ in range(4):
             await redeployed.red_pass()
 
-        assert len(host.store.submitted) == 2
+        assert len(host.store.submitted) == 1
+        assert host.record().episodes[_LANE_NODE].covering_task_id == filed
         assert any(
             record.levelno >= logging.WARNING and EPISODES_FILE in record.getMessage()
             for record in caplog.records
         )
 
     @pytest.mark.parametrize(
-        ('idle', 'submitted'),
-        [(timedelta(days=14) - timedelta(minutes=1), 1), (timedelta(days=14), 2)],
+        ('idle', 'looked_up'),
+        [(timedelta(days=14) - timedelta(minutes=1), False), (timedelta(days=14), True)],
         ids=['kept', 'expired'],
     )
     async def test_the_record_expires_fourteen_days_after_its_last_write(
-        self, tmp_path: Path, idle: timedelta, submitted: int,
+        self, tmp_path: Path, idle: timedelta, looked_up: bool,
     ):
         """Kept, the binding still covers the test, so two spaced reds file
-        nothing; expired, the record is gone and they file a fresh task that
-        names no prior one."""
+        nothing and look nothing up; expired, the record is gone, and the two
+        spaced reds find the still-open task by its metadata and adopt it."""
         host = _LaneHost(tmp_path)
         first = host.process()
         await first.red_pass()
         await first.red_pass()
+        filed = host.record().episodes[_LANE_NODE].covering_task_id
+        del host.store.log[:]
 
         host.clock.advance(seconds=idle.total_seconds())
         redeployed = host.process()
         await redeployed.red_pass(minutes=0)
         await redeployed.red_pass()
 
-        assert len(host.store.submitted) == submitted
-        assert host.store.submitted[-1]['metadata']['x_offline_lane']['prior_task_ids'] == []
+        assert len(host.store.submitted) == 1
+        assert host.record().episodes[_LANE_NODE].covering_task_id == filed
+        assert ('find_tasks_by_metadata' in host.store.log) is looked_up
 
 
 # ---------------------------------------------------------------------------
@@ -690,21 +695,10 @@ async def _tick(scheduler, tasks: list[dict]) -> str | None:
     return assignment.task_id if assignment is not None else None
 
 
-def _spy_on_guard_writes(monkeypatch) -> list:
-    calls: list = []
-    real = _safe_io.atomic_write_text
-
-    def recorder(path, text, **kwargs):
-        calls.append(path)
-        return real(path, text, **kwargs)
-
-    monkeypatch.setattr(_safe_io, 'atomic_write_text', recorder)
-    return calls
-
-
 class TestResurrectionAnchorSurvivesRedeploy:
-    """``_update_age_anchors`` is driven directly, so the assertion is about
-    the anchor and nothing else."""
+    """A second Scheduler on the same ``project_root`` restores the age
+    anchors the first recorded.  The anchor rules themselves are pinned in
+    test_age_anchors.py."""
 
     def test_a_resurrected_task_does_not_re_acquire_its_age_bonus(self, guard_clock):
         """On main the fresh scheduler anchors '100' to ``int('100')``, giving
@@ -712,67 +706,13 @@ class TestResurrectionAnchorSurvivesRedeploy:
         queue over genuinely-old pending tasks once per redeploy, and its
         victims are the starvation watchdog's own."""
         first = _scheduler()
-        first._update_age_anchors([_task('100', pending_since=_FILED)], _MAX_ID)
-        first._update_age_anchors([_task('100', pending_since=_REOPENED)], _MAX_ID)
+        first.age_anchors.observe([_task('100', pending_since=_FILED)], _MAX_ID)
+        first.age_anchors.observe([_task('100', pending_since=_REOPENED)], _MAX_ID)
 
         redeployed = _scheduler()
-        redeployed._update_age_anchors([_task('100', pending_since=_REOPENED)], _MAX_ID)
+        redeployed.age_anchors.observe([_task('100', pending_since=_REOPENED)], _MAX_ID)
 
-        assert redeployed._compute_age('100', _MAX_ID) == 0
-
-    def test_a_genuinely_old_pending_task_keeps_its_age(self, guard_clock):
-        """The property the fix must not break."""
-        redeployed = _scheduler()
-        redeployed._update_age_anchors([_task('200')], _MAX_ID)
-
-        assert redeployed._compute_age('200', _MAX_ID) == _MAX_ID - 200
-
-    def test_a_non_numeric_id_anchors_to_max_id_either_way(self, guard_clock):
-        """Pins the third branch across the change."""
-        first = _scheduler()
-        first._update_age_anchors([_task('epic-a', status='cancelled')], _MAX_ID)
-
-        redeployed = _scheduler()
-        redeployed._update_age_anchors([_task('epic-a')], _MAX_ID)
-        redeployed._update_age_anchors([_task('epic-b')], _MAX_ID)
-
-        assert redeployed._compute_age('epic-a', _MAX_ID) == 0
-        assert redeployed._compute_age('epic-b', _MAX_ID) == 0
-
-    @pytest.mark.asyncio
-    async def test_a_cold_start_writes_once_and_a_steady_state_tick_not_at_all(
-        self, guard_clock, monkeypatch,
-    ):
-        """The two halves of one property, measured from the same spy.
-
-        The COLD START is a first tick that finds N stamps changed while the
-        process was down, inline on the event loop.  Its N resets are
-        batched, so it pays one write rather than N writes of an N-entry file.
-        The STEADY STATE re-observes the same ids every ~15s, which is
-        the difference between a quiet guard and a file rewritten ~5,760 times
-        a day.  Spying from BEFORE the first call is what makes the cold start
-        assertable at all.
-        """
-        ids = range(1000, 1200)
-        first = _scheduler()
-        await _tick(first, [_task(str(tid), 'in-progress', _FILED) for tid in ids])
-        await _tick(first, [_task('99', 'in-progress')])
-
-        cold_start = [_task(str(tid), pending_since=_REOPENED) for tid in ids]
-        scheduler = _scheduler()
-
-        writes = _spy_on_guard_writes(monkeypatch)
-        scheduler._update_age_anchors(cold_start, _MAX_ID)
-
-        assert len(writes) == 1, (
-            f'a cold start of {len(cold_start)} observations must be one write,'
-            f' got {len(writes)}'
-        )
-
-        writes.clear()
-        scheduler._update_age_anchors(cold_start, _MAX_ID)
-
-        assert writes == [], 'a re-observation of an unchanged observation must be silent'
+        assert redeployed.age_anchors.age('100', _MAX_ID) == 0
 
     @pytest.mark.asyncio
     async def test_the_guard_expires(self, guard_clock):
@@ -788,8 +728,8 @@ class TestResurrectionAnchorSurvivesRedeploy:
         guard_clock[0] = _T0 + timedelta(days=31)
 
         redeployed = _scheduler()
-        redeployed._update_age_anchors([_task('100', pending_since=_REOPENED)], _MAX_ID)
-        assert redeployed._compute_age('100', _MAX_ID) == _MAX_ID - 100
+        redeployed.age_anchors.observe([_task('100', pending_since=_REOPENED)], _MAX_ID)
+        assert redeployed.age_anchors.age('100', _MAX_ID) == _MAX_ID - 100
 
     @pytest.mark.asyncio
     async def test_any_write_within_the_ttl_keeps_an_in_fetch_record_alive(self, guard_clock):
@@ -812,12 +752,17 @@ class TestStaleSweepRecordingSurvivesRedeploy:
     """``_phase_stale_sweep`` is the other write site and must be covered too."""
 
     async def test_a_swept_anchor_is_restored_after_a_restart(self, guard_clock):
+        """The day-20 tick's observation writes nothing, so only the sweep's
+        departure refreshes '300''s day-0 record past its day-30 expiry."""
         first = _scheduler()
-        first._pending_anchor['300'] = 5
+        first.age_anchors.observe([_task('300', pending_since=_FILED), _task('99')], _MAX_ID)
+        first.age_anchors.observe([_task('300', pending_since=_REOPENED), _task('99')], 1000)
+        guard_clock[0] = _T0 + timedelta(days=20)
         await _tick(first, [_task('99')])
+        guard_clock[0] = _T0 + timedelta(days=40)
 
         redeployed = _scheduler()
-        redeployed._update_age_anchors([_task('300')], _MAX_ID)
-        assert redeployed._compute_age('300', _MAX_ID) == _MAX_ID - 5, (
+        redeployed.age_anchors.observe([_task('300', pending_since=_REOPENED)], _MAX_ID)
+        assert redeployed.age_anchors.age('300', _MAX_ID) == _MAX_ID - 1000, (
             'absence from the fetch is not a cancellation (D3)'
         )

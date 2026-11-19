@@ -1,0 +1,18 @@
+{
+  "task_id": "5305",
+  "reason": "A guard, not growth (task 5305 review amendment, reviewer_comprehensive suggestion 5, heuristic 10): MergeIntake.replace_lane now calls the single-writer owner port, assert_merger_owns('_lane_buffers'), before it rebuilds a lane, as buffer_owned_request, pop_next_pickable and remove_buffered already do. It was the one undocumented lane-buffer writer that skipped the guard, and the gap was carried unchanged from base. Its only production caller, the worker's _maybe_coalesce_waiting_singles, runs on the merger task, so production behaviour is unchanged. The debug assert stays off in production and on in the test suite. intake_buffers.py lines 735 -> 736 and total:lines 57534 -> 57535 are that one line. Every other measure holds.",
+  "measures": [
+    {
+      "measure": "lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/intake_buffers.py",
+      "baseline": 735,
+      "current": 736
+    },
+    {
+      "measure": "total:lines",
+      "key": "<cluster>",
+      "baseline": 57534,
+      "current": 57535
+    }
+  ]
+}

@@ -1,0 +1,30 @@
+{
+  "task_id": "8267",
+  "reason": "Net-additive (task 8267): per-entry isolation tests for startup sweeps 2c/2e/2d/2c2 and run()-level startup-step fault injection. The rises are tests calling the private Harness sweeps under test (no public seam) and a new run()-level test file enrolled by importing MergeLivenessConfigError; partly offset by deleting the obsolete startup_harness fixture.",
+  "measures": [
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/test_crash_recovery.py",
+      "baseline": 285,
+      "current": 286
+    },
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/test_orphan_reaper.py",
+      "baseline": 22,
+      "current": 23
+    },
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/test_reconcile_stranded.py",
+      "baseline": 192,
+      "current": 196
+    },
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6445,
+      "current": 6462
+    }
+  ]
+}

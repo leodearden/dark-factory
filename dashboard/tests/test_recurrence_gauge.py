@@ -13,6 +13,7 @@ from typing import Any
 
 import pytest
 from _tasks_db_fixture import task_row, write_tasks_db
+from shared.milestone_rearm import rearmed_milestone
 from shared.task_statuses import TaskStatus
 from shared.task_tags import DEFAULT_TAG
 
@@ -20,6 +21,7 @@ from dashboard.data.db import DbPool
 from dashboard.data.escalation_corpus import PendingEscalations
 from dashboard.data.recurrence_gauge import ChainEntry, ChainState, chain_state, classify_chains
 from dashboard.data.root_invariants import scan_root_invariants
+from dashboard.project_labels import ProjectLabels
 
 NOW = datetime(2026, 10, 12, 12, 0, tzinfo=UTC)
 HOUR = timedelta(hours=1)
@@ -103,8 +105,13 @@ def test_a_naive_fire_time_is_read_as_utc(at, expected):
 
 @pytest.mark.parametrize(
     'milestone',
-    [None, {'mode': 'delayed', 'after_secs': 60}, {'mode': 'dated', 'at': 'not-a-date'}],
-    ids=['absent', 'delayed', 'unparseable'],
+    [
+        None,
+        {'mode': 'delayed', 'after_secs': 60},
+        {'mode': 'dated', 'at': 'not-a-date'},
+        {'mode': 'dated', 'at': (NOW + HOUR).isoformat(), 'scheduled_fire_at': 'not-a-date'},
+    ],
+    ids=['absent', 'delayed', 'unparseable', 'unparseable-scheduled'],
 )
 def test_an_unreadable_fire_time_is_overdue(milestone):
     task = _with_milestone(link(1, 'pending'), milestone)
@@ -135,6 +142,22 @@ def test_every_status_resolves_to_exactly_one_state(status, at):
 )
 def test_extreme_fire_times_and_intervals_still_resolve(at, interval_secs, expected):
     assert chain_state(link(1, 'pending', at, interval_secs=interval_secs), now=NOW) is expected
+
+
+def _rearming_link(link_id: int, scheduled: datetime) -> dict[str, Any]:
+    """A pending link whose predicate re-arm moved its check to NOW + 1h, past *scheduled*."""
+    milestone = rearmed_milestone(
+        {'mode': 'dated', 'at': scheduled.isoformat()}, (NOW + HOUR).isoformat(),
+    )
+    return _with_milestone(link(link_id, 'pending', interval_secs=3600), milestone)
+
+
+@pytest.mark.parametrize(
+    ('scheduled', 'expected'),
+    [(NOW - 2 * HOUR, ChainState.OVERDUE), (NOW - timedelta(minutes=30), ChainState.SCHEDULED)],
+)
+def test_a_rearming_link_is_judged_by_its_scheduled_fire_time(scheduled, expected):
+    assert chain_state(_rearming_link(1, scheduled), now=NOW) is expected
 
 
 def raw(task: dict[str, Any]) -> dict[str, Any]:
@@ -266,6 +289,12 @@ def test_an_entry_without_a_fire_time_or_escalation_lookup_on_the_wire():
     assert wire['pending_escalation_ids'] is None
 
 
+def test_a_rearming_links_entry_reports_its_scheduled_fire_time():
+    scheduled = NOW - 2 * HOUR
+    (entry,) = _classify(_rearming_link(4, scheduled))
+    assert (entry.state, entry.at) == (ChainState.OVERDUE, scheduled.isoformat())
+
+
 def _db_path(root: Path) -> Path:
     return root / '.taskmaster' / 'tasks' / 'tasks.db'
 
@@ -284,7 +313,7 @@ async def _scan_root(root: Path, rows: list[dict[str, Any]]) -> dict[str, Any]:
         )
     finally:
         await pool.close_all()
-    return record.to_wire()
+    return record.to_wire(ProjectLabels.of_roots(()))
 
 
 async def test_an_ok_root_lists_its_chains_with_their_states(tmp_path):
@@ -321,7 +350,7 @@ async def test_an_unopened_root_makes_no_chain_claim(tmp_path):
     record = await scan_root_invariants(
         root, _db_path(root), None, now=NOW, pending_escalations=PendingEscalations({})
     )
-    assert record.to_wire()['chains'] is None
+    assert record.to_wire(ProjectLabels.of_roots(()))['chains'] is None
 
 
 async def test_an_unchanged_database_is_scanned_once_and_classified_at_each_now(tmp_path):

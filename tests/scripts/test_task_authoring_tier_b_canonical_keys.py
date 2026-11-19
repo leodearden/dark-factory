@@ -56,9 +56,8 @@ this guard constrains the Canonical column only. Parser BEHAVIOUR for the
 individual keys is pinned by ``shared/tests/test_task_metadata.py``; neither
 implies the other.
 
-Marker plumbing lives in ``task_authoring_marker_span.marked_span`` (task 4999),
-shared with the task-3780 guard next door; read that module for why the markers
-are explicit and why every failure is loud.
+The marked span comes from ``tests/scripts/verify_command_invariants.py::marked_body``,
+whose ``marked_span`` docstring says why every marker failure is loud.
 """
 from __future__ import annotations
 
@@ -66,19 +65,19 @@ import pathlib
 import re
 
 import pytest
+import verify_command_invariants as vci
 from shared.task_metadata import _BLESSED_METADATA_KEYS
-from task_authoring_marker_span import marked_span
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 
 TASK_AUTHORING_PATH = REPO_ROOT / "docs" / "task-authoring.md"
 
-# The full HTML-comment forms, not the bare slug: `marked_span` requires the two
-# literals not to overlap as substrings, and the bare slug sits inside both.
 # Distinct slug from the `tier-a-blessed-keys-mirror` pair higher up the same
 # document — the two marker pairs are independent.
-MARKER_BEGIN = "<!-- tier-b-canonical-keys -->"
-MARKER_END = "<!-- /tier-b-canonical-keys -->"
+MARKER_SLUG = "tier-b-canonical-keys"
 
 # `key` — every backtick-quoted name in a cell. Deliberately matched globally
 # per cell rather than treating a cell as one key: see `_canonical_keys`.
@@ -91,17 +90,16 @@ _SEPARATOR = re.compile(r"^\|[\s:|-]+\|$")
 def _table_rows(markdown_text):
     """The markdown table rows between the Tier-B markers, header/separator dropped.
 
-    Everything below the ``marked_span`` call is this guard's OWN table-content
-    extraction; it raises loudly rather than returning ``[]`` for the same reason
-    ``marked_span`` does.
+    Everything below the ``vci.marked_body`` call is this guard's OWN
+    table-content extraction; it raises loudly rather than returning ``[]`` for
+    the same reason ``vci.marked_body`` does.
     """
-    marked = marked_span(
+    marked = vci.marked_body(
         markdown_text,
-        MARKER_BEGIN,
-        MARKER_END,
-        doc_path="docs/task-authoring.md",
-        task="task 4303",
-        delimits="the Tier-B table",
+        slug=MARKER_SLUG,
+        source="docs/task-authoring.md",
+        label="the Tier-B table",
+        task="4303",
     )
     rows = [
         line.strip()
@@ -120,7 +118,7 @@ def _table_rows(markdown_text):
     rows = [row for row in rows if _BACKTICKED.search(row)]
 
     assert rows, (
-        f"the table between {MARKER_BEGIN!r} and {MARKER_END!r} in "
+        f"the table inside the {MARKER_SLUG!r} marker in "
         f"docs/task-authoring.md has no key-bearing rows (task 4303) — this "
         f"invariant would pass vacuously against an empty table"
     )
@@ -162,8 +160,8 @@ def _canonical_keys(markdown_text):
             f"prevent.\n"
             f"Remedy: backtick the canonical spelling in the first cell. If the row "
             f"genuinely nominates no canonical key, it does not belong inside the "
-            f"{MARKER_BEGIN!r} span — move it below {MARKER_END!r} with the other "
-            f"deliberately-unpinned prose."
+            f"{MARKER_SLUG!r} span — move it below '<!-- {MARKER_SLUG}:end -->' "
+            f"with the other deliberately-unpinned prose."
         )
         names.extend(in_row)
     return names
@@ -176,14 +174,14 @@ def _canonical_keys(markdown_text):
 _HAPPY_DOC = """\
 Some preamble prose naming `zeta`, deliberately outside the marker.
 
-<!-- tier-b-canonical-keys -->
+<!-- tier-b-canonical-keys:begin -->
 
 | Canonical | Aliases to avoid |
 |---|---|
 | `alpha` + `beta` | `alfa`, `bta` |
 | `gamma` | `gama` |
 
-<!-- /tier-b-canonical-keys -->
+<!-- tier-b-canonical-keys:end -->
 
 Qualifying paragraphs mentioning `eta`, deliberately outside the marker and
 therefore unpinned.
@@ -191,50 +189,27 @@ therefore unpinned.
 
 _NO_BEGIN_MARKER_DOC = """\
 | `alpha` | `alfa` |
-<!-- /tier-b-canonical-keys -->
-"""
-
-_NO_END_MARKER_DOC = """\
-<!-- tier-b-canonical-keys -->
-| `alpha` | `alfa` |
-"""
-
-_DUPLICATE_MARKER_DOC = """\
-<!-- tier-b-canonical-keys -->
-| `alpha` | `alfa` |
-<!-- /tier-b-canonical-keys -->
-
-## A later section
-
-<!-- tier-b-canonical-keys -->
-| `gamma` | `gama` |
-<!-- /tier-b-canonical-keys -->
-"""
-
-_INVERTED_MARKER_DOC = """\
-<!-- /tier-b-canonical-keys -->
-| `alpha` | `alfa` |
-<!-- tier-b-canonical-keys -->
+<!-- tier-b-canonical-keys:end -->
 """
 
 _BARE_CANONICAL_CELL_DOC = """\
-<!-- tier-b-canonical-keys -->
+<!-- tier-b-canonical-keys:begin -->
 
 | Canonical | Aliases to avoid |
 |---|---|
 | `alpha` | `alfa` |
 | the delta family | `dleta`, `delt` |
 
-<!-- /tier-b-canonical-keys -->
+<!-- tier-b-canonical-keys:end -->
 """
 
 _EMPTY_TABLE_DOC = """\
-<!-- tier-b-canonical-keys -->
+<!-- tier-b-canonical-keys:begin -->
 
 | Canonical | Aliases to avoid |
 |---|---|
 
-<!-- /tier-b-canonical-keys -->
+<!-- tier-b-canonical-keys:end -->
 
 Prose naming `alpha` outside the marker, which must NOT be picked up.
 """
@@ -269,45 +244,38 @@ def test_canonical_keys_ignores_names_outside_the_marker():
     assert "alfa" not in keys and "gama" not in keys
 
 
-@pytest.mark.parametrize(
-    "markdown_text, case",
-    [
-        (_NO_BEGIN_MARKER_DOC, "missing begin marker"),
-        (_NO_END_MARKER_DOC, "missing end marker"),
-        (_DUPLICATE_MARKER_DOC, "duplicated marker pair"),
-        (_INVERTED_MARKER_DOC, "inverted markers"),
-        (_EMPTY_TABLE_DOC, "marked span holds no key-bearing rows"),
-    ],
-)
-def test_canonical_keys_fails_loudly_on_a_broken_marker(markdown_text, case):
-    """A broken marker must raise, never return an empty list.
+def _assert_names_this_guard(excinfo):
+    message = str(excinfo.value)
+    assert "tier-b-canonical-keys" in message
+    assert "task-authoring.md" in message
+    assert "4303" in message
 
-    A silent ``[]`` would turn the invariant below green while pinning nothing —
-    the vacuity failure that makes a guard worse than no guard, because the suite
-    still reports success.
 
-    The message must tell a human what to restore and where, so the assertions
-    check the marker slug, the doc path and this guard's task are all named. That
-    is not prose-wording pedantry: ``doc_path`` and ``task`` are ARGUMENTS
-    threaded into ``marked_span``, so a copy-paste from the task-3780 caller next
-    door would otherwise leave all 11 tests here green while sending every
-    broken-marker reader to the wrong guard and the wrong document. Identifiers
-    only, so any rewording of the shared message templates stays green.
+def test_canonical_keys_names_its_marker_document_and_task_on_a_missing_marker():
+    """A missing opening marker raises, naming this guard's slug, document and task.
+
+    The malformed-marker shapes are the shared helper's contract, pinned once in
+    `test_verify_command_invariants.py`; this pins only that the wrapper passes
+    this guard's slug, source and task to it.
     """
     with pytest.raises(AssertionError) as excinfo:
-        _canonical_keys(markdown_text)
+        _canonical_keys(_NO_BEGIN_MARKER_DOC)
 
-    message = str(excinfo.value)
-    assert "tier-b-canonical-keys" in message, case
-    assert "task-authoring.md" in message, case
-    assert "4303" in message, case
+    _assert_names_this_guard(excinfo)
+
+
+def test_canonical_keys_refuses_a_table_with_no_key_bearing_rows():
+    """The header rows make the span non-blank, so `_table_rows`' own assertion must refuse it."""
+    with pytest.raises(AssertionError) as excinfo:
+        _canonical_keys(_EMPTY_TABLE_DOC)
+
+    _assert_names_this_guard(excinfo)
 
 
 def test_canonical_keys_fails_loudly_on_a_row_naming_no_canonical_key():
     """A row that survives the filter but yields NO canonical name must raise.
 
-    NOT a broken-marker case, which is why it is a sibling test rather than a
-    sixth parametrization above: the markers are intact, the span is populated,
+    NOT a broken-marker case: the markers are intact, the span is populated,
     and the extractor returns a perfectly plausible non-empty list. That is what
     makes this the nastier failure of the two — the guard stays GREEN while one
     Tier-B row is silently unpinned.

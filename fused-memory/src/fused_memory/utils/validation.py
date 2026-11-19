@@ -339,10 +339,6 @@ class PathShapedProjectIdError(ValueError):
     """
 
 
-# Exists only for server/tools.py's import; retires with ticket tkt_0RVP2CC33JWTGSYBHCTT9BQT3T. Do not use.
-_to_underscore_canonical = normalize_project_id
-
-
 def canonicalize_project_id(raw: str) -> str:
     """Return ``shared.project_id.normalize_project_id(raw)``, the one
     project-id rule, after refusing path-shaped input.

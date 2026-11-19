@@ -47,10 +47,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
-from fused_memory.utils.store_mutation_preflight import (
-    StoreMutationUnavailable,
-    assert_store_mutation_allowed,
-)
+from fused_memory.utils.store_mutation_preflight import assert_store_mutation_allowed
 
 logger = logging.getLogger('invalidate_shipping_edges')
 
@@ -86,15 +83,15 @@ class EdgeCandidate:
         }
 
 
-async def _find_shipping_edges(graphiti, project_id: str) -> list[EdgeCandidate]:
+async def find_shipping_edges(graphiti, project_id: str, *, op: str) -> list[EdgeCandidate]:
     """Cypher query for RELATES_TO edges with 'shipped via' in fact and no invalid_at."""
-    graph = graphiti._graph_for(project_id)
+    graph = graphiti.graph_access.graph(project_id)
     cypher = (
         'MATCH ()-[e:RELATES_TO]->() '
         'WHERE e.fact CONTAINS "shipped via" AND e.invalid_at IS NULL '
         'RETURN e.uuid, e.fact'
     )
-    result = await graph.ro_query(cypher)
+    result = await graph.ro_query(cypher, op=op)
     edges: list[EdgeCandidate] = []
     for row in result.result_set or []:
         uuid, fact = row[0], row[1]
@@ -206,41 +203,34 @@ async def _run(args: argparse.Namespace) -> int:
     # so a write-denied environment would report a clean exit over a
     # half-applied invalidation.
     #
-    # ``logging.basicConfig`` already ran above, so this error is emitted.
+    # ``logging.basicConfig`` already ran above, so the guard's refusal record
+    # is emitted.
     if args.apply:
-        try:
-            assert_store_mutation_allowed(
-                operation='invalidate_fabricated_shipping_edges --apply'
-            )
-        except StoreMutationUnavailable:
-            logger.error(
-                'invalidate_fabricated_shipping_edges: --apply NOT started '
-                "(fail-closed) -- this process cannot write mem0's history "
-                'directory, so each invalidation would supersede its edge and '
-                'then fail to record the change, leaving the fabricated-edge '
-                'sweep half-applied with no trace of which edges were already '
-                'retired. Nothing was scanned and nothing was mutated, and no '
-                'client was opened. Route the invalidations through the '
-                'fused-memory MCP server (the unsandboxed owner of the store), '
-                'or re-run from an unsandboxed operator shell. To obtain the '
-                'candidate report safely from anywhere, re-run without --apply.'
-            )
-            raise
+        assert_store_mutation_allowed(
+            operation='invalidate_fabricated_shipping_edges --apply',
+            logger=logger,
+            extra_detail=(
+                'each invalidation would supersede its edge and then fail to '
+                'record the change, leaving the fabricated-edge sweep half-applied '
+                'with no trace of which edges were already retired. Nothing was '
+                'scanned and nothing was mutated, and no client was opened.'
+            ),
+        )
 
-    import os  # noqa: PLC0415
+    import os
 
-    from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend  # noqa: PLC0415
-    from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
-    from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+    from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
+    from fused_memory.config.schema import FusedMemoryConfig
+    from fused_memory.maintenance._utils import maintenance_service
 
     if args.config:
         os.environ['CONFIG_PATH'] = str(args.config)
 
     config = FusedMemoryConfig()
-    memory = MemoryService(config)
-    await memory.initialize()
-    try:
-        candidates = await _find_shipping_edges(memory.graphiti, args.project)
+    async with maintenance_service(config=config) as (_, memory):
+        candidates = await find_shipping_edges(
+            memory.graphiti, args.project, op='invalidate_fabricated_shipping_edges',
+        )
         logger.info('Found %d candidate shipping-edge(s) in %s',
                     len(candidates), args.project)
 
@@ -286,9 +276,6 @@ async def _run(args: argparse.Namespace) -> int:
             except Exception as e:
                 logger.error('Failed to invalidate %s: %s', c.edge_uuid, e)
         return 0
-    finally:
-        if hasattr(memory, 'close'):
-            await memory.close()
 
 
 def main() -> int:

@@ -62,7 +62,7 @@ from pathlib import Path
 from typing import IO, TYPE_CHECKING
 
 from orchestrator import offline_lane_confirm, offline_lane_runs
-from orchestrator.offline_lane_episodes import LaneEngine
+from orchestrator.offline_lane_episodes import LaneEngine, LaneTaskClient
 from orchestrator.offline_lane_pass import (
     ConfirmSeam,
     DetectSeam,
@@ -76,7 +76,6 @@ if TYPE_CHECKING:
     from escalation.queue import EscalationQueue
 
     from orchestrator.config import LaneCommand, OrchestratorConfig
-    from orchestrator.flake_ledger import FlakeLedgerTaskClient
     from orchestrator.git_ops import GitOps
 
 logger = logging.getLogger(__name__)
@@ -138,7 +137,7 @@ class OfflineLaneWorker:
         infra_runner: SuiteRunner | None = None,
         command_runner: CommandRunner | None = None,
         confirm: ConfirmSeam | None = None,
-        task_client: FlakeLedgerTaskClient | None = None,
+        task_client: LaneTaskClient | None = None,
         escalation_queue: EscalationQueue | None = None,
         pass_outcome_hooks: Sequence[PassOutcomeHook] = (),
         now: Callable[[], datetime] | None = None,
@@ -286,14 +285,14 @@ class OfflineLaneWorker:
         self._last_run_head = head
 
     async def _poll_tick(self) -> None:
-        """The idle poll: the engine's tick, then the backstop for a missed advance, else the due rechecks."""
+        """The idle poll: the backstop for a missed advance, armed before the engine's tick can raise, then the due rechecks."""
         head = await self.git_ops.get_main_sha()
         if not head:
             return
-        result = await self._engine.tick(head=head)
         if head != self._last_run_head:
             self._dirty = True
-        elif result.commands_due and not self._dirty:
+        result = await self._engine.tick(head=head)
+        if result.commands_due and not self._dirty:
             await self._recheck(head, result.commands_due)
 
     async def _recheck(self, head: str, commands: Collection[str]) -> None:

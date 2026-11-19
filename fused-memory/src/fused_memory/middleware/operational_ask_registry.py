@@ -69,12 +69,9 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
 
+from fused_memory.middleware.curator_types import CandidateTask
 from fused_memory.utils.safe_yaml import load_yaml_list_file
-
-if TYPE_CHECKING:
-    from fused_memory.middleware.task_curator import CandidateTask
 
 logger = logging.getLogger(__name__)
 _LOG_LABEL = "operational_ask_registry"
@@ -97,20 +94,14 @@ class OperationalAskEntry:
 
 
 def load_operational_registry(path: Path | None) -> list[OperationalAskEntry]:
-    """Load the operational-ask registry from a YAML file; never raises.
+    """Load the operational-ask registry from a YAML file.
 
-    File-level failures (unset path, missing / unreadable / undecodable file,
-    invalid YAML, non-list document) degrade to [] as specified by
-    fused_memory/utils/safe_yaml.py::load_yaml_list_file. Malformed individual
-    entries are skipped with one WARNING each.
+    An unset path yields []. Raises YamlListFileError
+    (fused_memory/utils/safe_yaml.py::load_yaml_list_file) on a file-level
+    failure; malformed entries are skipped with one WARNING each.
     """
     entries: list[OperationalAskEntry] = []
-    for item in load_yaml_list_file(
-        path,
-        logger=logger,
-        label=_LOG_LABEL,
-        consequence="registry disabled",
-    ):
+    for item in load_yaml_list_file(path):
         if not isinstance(item, dict):
             logger.warning(
                 "%s: skipping non-dict entry in %s: %r",
@@ -187,8 +178,8 @@ _CODE_CHANGE_TITLE_SIGNALS: tuple[str, ...] = ("fix", "bug", "crash", "implement
 # boundary operational_routing_guard.inject_operational_routing (task β)
 # coerces every tagged operational/decision ask to a deterministic PURE-GATE
 # on the submit path, so re-routing here would be a second coercion site
-# (INV-5). Mirrors operational_routing_guard._COERCED_EXECUTION_CLASSES =
-# {'operational', 'decision'} for symmetry; spelled out explicitly (NOT
+# (INV-5). Mirrors the keys of operational_routing_guard._TRIGGER_BY_EXECUTION_CLASS
+# = {'operational', 'decision'} for symmetry; spelled out explicitly (NOT
 # derived by subtracting 'code_tdd' from recon_self_model.EXECUTION_CLASSES)
 # so a future code-oriented execution class added there is not silently swept
 # into the skip set. 'code_tdd' is intentionally excluded — a code_tdd-tagged

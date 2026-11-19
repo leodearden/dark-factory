@@ -9,9 +9,10 @@ CONNECTION INVENTORY.  The backend opens three kinds of connection per project:
   one that commits and rolls back.  It carries both hazards of
   ``plans/recon-sqlite-database-locked-rca-2026-09-16.md`` (a pinned read and a
   connection-wide rollback) and is the one these arms cover;
-* the cached autocommit READ connection — never writes and never rolls back
-  anyone's write, and is already serialised by ``_read_lock`` /
-  ``_fresh_read_conn`` (task 2694's pin-healing guard).  Out of scope;
+* the cached autocommit READ connection — behind ``AtomicConnection`` too
+  (task 6502), but it never writes and never rolls back anyone's write, so
+  neither hazard applies to it.  Its freshness is covered in
+  ``test_sqlite_task_backend.py``.  Out of scope;
 * ``get_statuses_fresh``'s per-call connection — never shared.  Out of scope.
 
 MEASURED BASELINES, taken on this task's base commit (2026-10-08):
