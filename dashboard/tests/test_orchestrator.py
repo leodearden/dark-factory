@@ -7,6 +7,11 @@ from pathlib import Path
 
 import pytest
 
+from dashboard.data.orchestrator import (
+    _ORCHESTRATOR_DEFAULT_MAIN_HEALTH_FIX_RESERVED_SLOTS,
+    _ORCHESTRATOR_DEFAULT_MAX_CONCURRENT_TASKS,
+)
+
 
 @pytest.fixture()
 def no_mcp(monkeypatch):
@@ -799,12 +804,12 @@ class TestDiscoverOrchestratorsIsProcessDiscoveryOnly:
             )
 
 
-class TestReadMaxConcurrentTasks:
-    """Tests for ``read_max_concurrent_tasks`` — the general pool only.
+class TestRunSlotCapacityConfigRules:
+    """Config resolution and slot-count coercion behind ``read_run_slot_capacity``.
 
-    These pin the config resolution and slot-count coercion rules that
-    ``read_run_slot_capacity`` (the parity alarm's denominator, tested in
-    ``TestReadRunSlotCapacity``) shares, through the simpler one-key reader.
+    Pinned through ``max_concurrent_tasks`` with the reserve written as 0
+    (:attr:`NO_RESERVE`), so each expected capacity is exactly the general-slot
+    value under test; ``TestReadRunSlotCapacity`` pins how the reserve adds in.
 
     The contract mirrors this module's ``_read_project_root_from_config``
     sibling: ``yaml.safe_load``, never raise, return ``None`` for anything
@@ -817,6 +822,8 @@ class TestReadMaxConcurrentTasks:
     """
 
     LOGGER = 'dashboard.data.orchestrator'
+    CANONICAL = 'dark-factory-orchestrator.yaml'
+    NO_RESERVE = 'main_health_fix_reserved_slots: 0\n'
 
     @staticmethod
     def _write(path: Path, text: str) -> None:
@@ -827,19 +834,19 @@ class TestReadMaxConcurrentTasks:
 
     def test_canonical_config_yields_cap(self, tmp_path):
         """The canonical CLAUDE.md filename is what discovery keys on first."""
-        from dashboard.data.orchestrator import read_max_concurrent_tasks
+        from dashboard.data.orchestrator import read_run_slot_capacity
 
-        self._write(tmp_path / 'dark-factory-orchestrator.yaml', 'max_concurrent_tasks: 24\n')
+        self._write(tmp_path / self.CANONICAL, 'max_concurrent_tasks: 24\n' + self.NO_RESERVE)
 
-        assert read_max_concurrent_tasks(tmp_path) == 24
+        assert read_run_slot_capacity(tmp_path) == 24
 
     def test_accepts_str_project_root(self, tmp_path):
         """Callers hold roots as Path, but a str must not blow up."""
-        from dashboard.data.orchestrator import read_max_concurrent_tasks
+        from dashboard.data.orchestrator import read_run_slot_capacity
 
-        self._write(tmp_path / 'dark-factory-orchestrator.yaml', 'max_concurrent_tasks: 8\n')
+        self._write(tmp_path / self.CANONICAL, 'max_concurrent_tasks: 8\n' + self.NO_RESERVE)
 
-        assert read_max_concurrent_tasks(str(tmp_path)) == 8
+        assert read_run_slot_capacity(str(tmp_path)) == 8
 
     def test_same_size_edit_is_picked_up(self, tmp_path):
         """An edit that keeps the file's size, as ``24`` -> ``16`` does, is still seen.
@@ -850,32 +857,32 @@ class TestReadMaxConcurrentTasks:
         """
         import os
 
-        from dashboard.data.orchestrator import read_max_concurrent_tasks
+        from dashboard.data.orchestrator import read_run_slot_capacity
 
-        config_file = tmp_path / 'dark-factory-orchestrator.yaml'
-        self._write(config_file, 'max_concurrent_tasks: 24\n')
-        before = read_max_concurrent_tasks(tmp_path)
+        config_file = tmp_path / self.CANONICAL
+        self._write(config_file, 'max_concurrent_tasks: 24\n' + self.NO_RESERVE)
+        before = read_run_slot_capacity(tmp_path)
 
         later_ns = config_file.stat().st_mtime_ns + 1_000_000
-        config_file.write_text('max_concurrent_tasks: 16\n')
+        config_file.write_text('max_concurrent_tasks: 16\n' + self.NO_RESERVE)
         os.utime(config_file, ns=(later_ns, later_ns))
-        after = read_max_concurrent_tasks(tmp_path)
+        after = read_run_slot_capacity(tmp_path)
 
         assert (before, after) == (24, 16)
 
     def test_ignores_unrelated_top_level_keys(self, tmp_path):
-        """A real config carries many keys; only max_concurrent_tasks is read."""
-        from dashboard.data.orchestrator import read_max_concurrent_tasks
+        """A real config carries many keys; only the two slot counts are read."""
+        from dashboard.data.orchestrator import read_run_slot_capacity
 
         self._write(
-            tmp_path / 'dark-factory-orchestrator.yaml',
+            tmp_path / self.CANONICAL,
             'project_root: /home/leo/src/dark-factory\n'
             'max_concurrent_tasks: 24\n'
             'escalation:\n'
-            '  port: 9101\n',
+            '  port: 9101\n' + self.NO_RESERVE,
         )
 
-        assert read_max_concurrent_tasks(tmp_path) == 24
+        assert read_run_slot_capacity(tmp_path) == 24
 
     def test_zero_cap_is_a_real_value_not_unknown(self, tmp_path):
         """A cap of 0 ("dispatch nothing") is a legal config and is preserved.
@@ -885,11 +892,11 @@ class TestReadMaxConcurrentTasks:
         returning None would report that genuine breach as "unknown".
         Only *negative* caps are nonsense and rejected (see below).
         """
-        from dashboard.data.orchestrator import read_max_concurrent_tasks
+        from dashboard.data.orchestrator import read_run_slot_capacity
 
-        self._write(tmp_path / 'dark-factory-orchestrator.yaml', 'max_concurrent_tasks: 0\n')
+        self._write(tmp_path / self.CANONICAL, 'max_concurrent_tasks: 0\n' + self.NO_RESERVE)
 
-        assert read_max_concurrent_tasks(tmp_path) == 0
+        assert read_run_slot_capacity(tmp_path) == 0
 
     # ---- legacy-spelling precedence ----------------------------------
 
@@ -899,29 +906,70 @@ class TestReadMaxConcurrentTasks:
     )
     def test_legacy_spellings_honoured_as_fallback(self, tmp_path, legacy_name):
         """Each legacy spelling from config._LEGACY_CONFIG_NAMES still resolves."""
-        from dashboard.data.orchestrator import read_max_concurrent_tasks
+        from dashboard.data.orchestrator import read_run_slot_capacity
 
-        self._write(tmp_path / legacy_name, 'max_concurrent_tasks: 12\n')
+        self._write(tmp_path / legacy_name, 'max_concurrent_tasks: 12\n' + self.NO_RESERVE)
 
-        assert read_max_concurrent_tasks(tmp_path) == 12
+        assert read_run_slot_capacity(tmp_path) == 12
 
     def test_legacy_precedence_order_is_first_match_wins(self, tmp_path):
         """The documented order is orchestrator.yaml, then -config, then subdir."""
-        from dashboard.data.orchestrator import read_max_concurrent_tasks
+        from dashboard.data.orchestrator import read_run_slot_capacity
 
-        self._write(tmp_path / 'orchestrator.yaml', 'max_concurrent_tasks: 11\n')
-        self._write(tmp_path / 'orchestrator-config.yaml', 'max_concurrent_tasks: 22\n')
-        self._write(tmp_path / 'orchestrator/config.yaml', 'max_concurrent_tasks: 33\n')
+        self._write(tmp_path / 'orchestrator.yaml', 'max_concurrent_tasks: 11\n' + self.NO_RESERVE)
+        self._write(
+            tmp_path / 'orchestrator-config.yaml', 'max_concurrent_tasks: 22\n' + self.NO_RESERVE
+        )
+        self._write(
+            tmp_path / 'orchestrator/config.yaml', 'max_concurrent_tasks: 33\n' + self.NO_RESERVE
+        )
 
-        assert read_max_concurrent_tasks(tmp_path) == 11
+        assert read_run_slot_capacity(tmp_path) == 11
+
+    def test_first_readable_legacy_config_is_authoritative(self, tmp_path, caplog):
+        """A readable legacy file's answer is final, exactly as the canonical file's is.
+
+        Its malformed reserve makes the capacity unknown.  A later legacy
+        spelling never supplies a number in its place: that would follow a
+        WARNING calling the capacity unknown with a capacity read from a file
+        the orchestrator is not running from.
+        """
+        import logging
+
+        from dashboard.data.orchestrator import read_run_slot_capacity
+
+        self._write(
+            tmp_path / 'orchestrator.yaml',
+            'max_concurrent_tasks: 10\nmain_health_fix_reserved_slots: lots\n',
+        )
+        self._write(
+            tmp_path / 'orchestrator-config.yaml', 'max_concurrent_tasks: 40\n' + self.NO_RESERVE
+        )
+
+        with caplog.at_level(logging.WARNING, logger=self.LOGGER):
+            result = read_run_slot_capacity(tmp_path)
+
+        assert result is None, f'a later legacy file must not stand in (got {result!r})'
+        assert [r for r in caplog.records if r.levelno == logging.WARNING]
+
+    def test_unreadable_legacy_config_falls_through_to_the_next(self, tmp_path):
+        """Only a legacy file that does not parse to a mapping is passed over."""
+        from dashboard.data.orchestrator import read_run_slot_capacity
+
+        self._write(tmp_path / 'orchestrator.yaml', 'max_concurrent_tasks: [unclosed\n')
+        self._write(
+            tmp_path / 'orchestrator-config.yaml', 'max_concurrent_tasks: 12\n' + self.NO_RESERVE
+        )
+
+        assert read_run_slot_capacity(tmp_path) == 12
 
     def test_canonical_beats_legacy(self, tmp_path):
-        from dashboard.data.orchestrator import read_max_concurrent_tasks
+        from dashboard.data.orchestrator import read_run_slot_capacity
 
-        self._write(tmp_path / 'dark-factory-orchestrator.yaml', 'max_concurrent_tasks: 24\n')
-        self._write(tmp_path / 'orchestrator.yaml', 'max_concurrent_tasks: 99\n')
+        self._write(tmp_path / self.CANONICAL, 'max_concurrent_tasks: 24\n' + self.NO_RESERVE)
+        self._write(tmp_path / 'orchestrator.yaml', 'max_concurrent_tasks: 99\n' + self.NO_RESERVE)
 
-        assert read_max_concurrent_tasks(tmp_path) == 24
+        assert read_run_slot_capacity(tmp_path) == 24
 
     def test_present_canonical_is_authoritative_even_without_the_key(self, tmp_path):
         """A canonical config that omits the key must NOT be masked by a legacy file.
@@ -929,21 +977,15 @@ class TestReadMaxConcurrentTasks:
         Same rule config.discover_root_escalation_url documents: once the
         canonical file exists on disk it is authoritative, so a stale legacy
         spelling can never silently supply a cap the live config dropped.  The
-        omitted key resolves to the orchestrator's own default — never to the
-        legacy file's 99.
+        omitted key resolves to the orchestrator's own default of 24 — never
+        to the legacy file's 99.
         """
-        from dashboard.data.orchestrator import (
-            _ORCHESTRATOR_DEFAULT_MAX_CONCURRENT_TASKS,
-            read_max_concurrent_tasks,
-        )
+        from dashboard.data.orchestrator import read_run_slot_capacity
 
-        self._write(tmp_path / 'dark-factory-orchestrator.yaml', 'project_root: /somewhere\n')
-        self._write(tmp_path / 'orchestrator.yaml', 'max_concurrent_tasks: 99\n')
+        self._write(tmp_path / self.CANONICAL, 'project_root: /somewhere\n' + self.NO_RESERVE)
+        self._write(tmp_path / 'orchestrator.yaml', 'max_concurrent_tasks: 99\n' + self.NO_RESERVE)
 
-        cap = read_max_concurrent_tasks(tmp_path)
-
-        assert cap == _ORCHESTRATOR_DEFAULT_MAX_CONCURRENT_TASKS
-        assert cap != 99, 'a stale legacy file must never supply the live config’s cap'
+        assert read_run_slot_capacity(tmp_path) == 24
 
     # ---- defaults.yaml layering --------------------------------------
 
@@ -952,37 +994,28 @@ class TestReadMaxConcurrentTasks:
 
         ``orchestrator.config`` builds its effective config as
         ``_deep_merge(_load_defaults(), project_config)``, and defaults.yaml
-        sets ``max_concurrent_tasks``.  A project whose YAML omits the key is
-        therefore running under that cap — two of the live configs under
+        sets ``max_concurrent_tasks: 24``.  A project whose YAML omits the key
+        is therefore running under that cap — two of the live configs under
         /home/leo/src do exactly this.  Reporting them as capless would drop
         them out of the parity alarm entirely and reproduce the very E12
         silent miss this feature exists to eliminate.
         """
-        from dashboard.data.orchestrator import (
-            _ORCHESTRATOR_DEFAULT_MAX_CONCURRENT_TASKS,
-            read_max_concurrent_tasks,
-        )
+        from dashboard.data.orchestrator import read_run_slot_capacity
 
         self._write(
-            tmp_path / 'dark-factory-orchestrator.yaml',
-            'project_root: /somewhere\nescalation:\n  port: 9101\n',
+            tmp_path / self.CANONICAL,
+            'project_root: /somewhere\nescalation:\n  port: 9101\n' + self.NO_RESERVE,
         )
 
-        cap = read_max_concurrent_tasks(tmp_path)
-
-        assert cap == _ORCHESTRATOR_DEFAULT_MAX_CONCURRENT_TASKS
-        assert cap is not None, 'an omitted key is not unknown — the default is in force'
+        assert read_run_slot_capacity(tmp_path) == 24
 
     def test_omitted_key_in_a_legacy_config_also_yields_the_default(self, tmp_path):
         """Defaults layering is a property of the orchestrator, not of a filename."""
-        from dashboard.data.orchestrator import (
-            _ORCHESTRATOR_DEFAULT_MAX_CONCURRENT_TASKS,
-            read_max_concurrent_tasks,
-        )
+        from dashboard.data.orchestrator import read_run_slot_capacity
 
-        self._write(tmp_path / 'orchestrator.yaml', 'project_root: /somewhere\n')
+        self._write(tmp_path / 'orchestrator.yaml', 'project_root: /somewhere\n' + self.NO_RESERVE)
 
-        assert read_max_concurrent_tasks(tmp_path) == _ORCHESTRATOR_DEFAULT_MAX_CONCURRENT_TASKS
+        assert read_run_slot_capacity(tmp_path) == 24
 
     def test_explicit_null_is_malformed_not_absent(self, tmp_path, caplog):
         """``max_concurrent_tasks:`` with no value is a config DEFECT, not an omission.
@@ -994,27 +1027,32 @@ class TestReadMaxConcurrentTasks:
         """
         import logging
 
-        from dashboard.data.orchestrator import read_max_concurrent_tasks
+        from dashboard.data.orchestrator import read_run_slot_capacity
 
-        self._write(tmp_path / 'dark-factory-orchestrator.yaml', 'max_concurrent_tasks:\n')
+        self._write(tmp_path / self.CANONICAL, 'max_concurrent_tasks:\n' + self.NO_RESERVE)
 
         with caplog.at_level(logging.WARNING, logger=self.LOGGER):
-            assert read_max_concurrent_tasks(tmp_path) is None
+            assert read_run_slot_capacity(tmp_path) is None
         assert [r for r in caplog.records if r.levelno == logging.WARNING], (
             'a config no orchestrator can load must be logged, not silently defaulted'
         )
 
     @pytest.mark.parametrize(
-        ('key', 'restated_name'),
+        ('key', 'restated'),
         [
-            ('max_concurrent_tasks', '_ORCHESTRATOR_DEFAULT_MAX_CONCURRENT_TASKS'),
-            (
+            pytest.param(
+                'max_concurrent_tasks',
+                _ORCHESTRATOR_DEFAULT_MAX_CONCURRENT_TASKS,
+                id='max_concurrent_tasks',
+            ),
+            pytest.param(
                 'main_health_fix_reserved_slots',
-                '_ORCHESTRATOR_DEFAULT_MAIN_HEALTH_FIX_RESERVED_SLOTS',
+                _ORCHESTRATOR_DEFAULT_MAIN_HEALTH_FIX_RESERVED_SLOTS,
+                id='main_health_fix_reserved_slots',
             ),
         ],
     )
-    def test_restated_default_matches_orchestrator_defaults_yaml(self, key, restated_name):
+    def test_restated_default_matches_orchestrator_defaults_yaml(self, key, restated):
         """FORMAT COUPLING guard: each restated default must not drift.
 
         This module deliberately does not import the ``orchestrator`` package
@@ -1026,9 +1064,6 @@ class TestReadMaxConcurrentTasks:
         """
         import yaml
 
-        import dashboard.data.orchestrator as orchestrator_module
-
-        restated = getattr(orchestrator_module, restated_name)
         defaults = (
             Path(__file__).resolve().parents[2]
             / 'orchestrator' / 'src' / 'orchestrator' / 'defaults.yaml'
@@ -1039,49 +1074,48 @@ class TestReadMaxConcurrentTasks:
         upstream = (yaml.safe_load(defaults.read_text()) or {}).get(key)
 
         assert upstream == restated, (
-            f'{defaults} sets {key}={upstream!r}, but '
-            f'dashboard.data.orchestrator.{restated_name} restates '
-            f'{restated!r} — update the constant (FORMAT COUPLING item 2)'
+            f'{defaults} sets {key}={upstream!r}, but dashboard.data.orchestrator '
+            f'restates {restated!r} — update its constant (FORMAT COUPLING item 2)'
         )
 
     # ---- ${VAR:default} expansion ------------------------------------
 
     def test_env_var_default_expanded_before_int_coercion(self, tmp_path, monkeypatch):
-        from dashboard.data.orchestrator import read_max_concurrent_tasks
+        from dashboard.data.orchestrator import read_run_slot_capacity
 
         monkeypatch.delenv('DF_TEST_MAX_TASKS', raising=False)
         self._write(
-            tmp_path / 'dark-factory-orchestrator.yaml',
-            'max_concurrent_tasks: "${DF_TEST_MAX_TASKS:24}"\n',
+            tmp_path / self.CANONICAL,
+            'max_concurrent_tasks: "${DF_TEST_MAX_TASKS:24}"\n' + self.NO_RESERVE,
         )
 
-        assert read_max_concurrent_tasks(tmp_path) == 24
+        assert read_run_slot_capacity(tmp_path) == 24
 
     def test_env_var_value_overrides_default(self, tmp_path, monkeypatch):
-        from dashboard.data.orchestrator import read_max_concurrent_tasks
+        from dashboard.data.orchestrator import read_run_slot_capacity
 
         monkeypatch.setenv('DF_TEST_MAX_TASKS', '6')
         self._write(
-            tmp_path / 'dark-factory-orchestrator.yaml',
-            'max_concurrent_tasks: "${DF_TEST_MAX_TASKS:24}"\n',
+            tmp_path / self.CANONICAL,
+            'max_concurrent_tasks: "${DF_TEST_MAX_TASKS:24}"\n' + self.NO_RESERVE,
         )
 
-        assert read_max_concurrent_tasks(tmp_path) == 6
+        assert read_run_slot_capacity(tmp_path) == 6
 
     def test_unset_env_var_with_no_default_is_unknown(self, tmp_path, monkeypatch, caplog):
         """``${VAR}`` with VAR unset expands to '' — unknown, not 0."""
         import logging
 
-        from dashboard.data.orchestrator import read_max_concurrent_tasks
+        from dashboard.data.orchestrator import read_run_slot_capacity
 
         monkeypatch.delenv('DF_TEST_MAX_TASKS', raising=False)
         self._write(
-            tmp_path / 'dark-factory-orchestrator.yaml',
-            'max_concurrent_tasks: "${DF_TEST_MAX_TASKS}"\n',
+            tmp_path / self.CANONICAL,
+            'max_concurrent_tasks: "${DF_TEST_MAX_TASKS}"\n' + self.NO_RESERVE,
         )
 
         with caplog.at_level(logging.WARNING, logger=self.LOGGER):
-            assert read_max_concurrent_tasks(tmp_path) is None
+            assert read_run_slot_capacity(tmp_path) is None
         assert [r for r in caplog.records if r.levelno == logging.WARNING], (
             'an unusable cap value must be logged, not dropped silently'
         )
@@ -1089,35 +1123,35 @@ class TestReadMaxConcurrentTasks:
     # ---- unknown / unusable -> None ----------------------------------
 
     def test_missing_config_is_none(self, tmp_path):
-        from dashboard.data.orchestrator import read_max_concurrent_tasks
+        from dashboard.data.orchestrator import read_run_slot_capacity
 
-        assert read_max_concurrent_tasks(tmp_path) is None
+        assert read_run_slot_capacity(tmp_path) is None
 
     def test_missing_project_root_is_none(self, tmp_path):
-        from dashboard.data.orchestrator import read_max_concurrent_tasks
+        from dashboard.data.orchestrator import read_run_slot_capacity
 
-        assert read_max_concurrent_tasks(tmp_path / 'no-such-root') is None
+        assert read_run_slot_capacity(tmp_path / 'no-such-root') is None
 
     def test_unparseable_yaml_is_none(self, tmp_path):
-        from dashboard.data.orchestrator import read_max_concurrent_tasks
+        from dashboard.data.orchestrator import read_run_slot_capacity
 
-        self._write(tmp_path / 'dark-factory-orchestrator.yaml', 'max_concurrent_tasks: [unclosed\n')
+        self._write(tmp_path / self.CANONICAL, 'max_concurrent_tasks: [unclosed\n')
 
-        assert read_max_concurrent_tasks(tmp_path) is None
+        assert read_run_slot_capacity(tmp_path) is None
 
     def test_non_dict_top_level_is_none(self, tmp_path):
-        from dashboard.data.orchestrator import read_max_concurrent_tasks
+        from dashboard.data.orchestrator import read_run_slot_capacity
 
-        self._write(tmp_path / 'dark-factory-orchestrator.yaml', '- a\n- b\n')
+        self._write(tmp_path / self.CANONICAL, '- a\n- b\n')
 
-        assert read_max_concurrent_tasks(tmp_path) is None
+        assert read_run_slot_capacity(tmp_path) is None
 
     def test_empty_file_is_none(self, tmp_path):
-        from dashboard.data.orchestrator import read_max_concurrent_tasks
+        from dashboard.data.orchestrator import read_run_slot_capacity
 
-        self._write(tmp_path / 'dark-factory-orchestrator.yaml', '')
+        self._write(tmp_path / self.CANONICAL, '')
 
-        assert read_max_concurrent_tasks(tmp_path) is None
+        assert read_run_slot_capacity(tmp_path) is None
 
     # An ABSENT key is deliberately NOT in this "unknown" section: it resolves
     # to the orchestrator's default, pinned by
@@ -1146,27 +1180,29 @@ class TestReadMaxConcurrentTasks:
         """
         import logging
 
-        from dashboard.data.orchestrator import read_max_concurrent_tasks
+        from dashboard.data.orchestrator import read_run_slot_capacity
 
         self._write(
-            tmp_path / 'dark-factory-orchestrator.yaml',
-            f'max_concurrent_tasks: {yaml_value}\n',
+            tmp_path / self.CANONICAL,
+            f'max_concurrent_tasks: {yaml_value}\n' + self.NO_RESERVE,
         )
 
         with caplog.at_level(logging.WARNING, logger=self.LOGGER):
-            result = read_max_concurrent_tasks(tmp_path)
+            result = read_run_slot_capacity(tmp_path)
 
         assert result is None, f'{label} must not be accepted as a cap (got {result!r})'
         warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
-        assert warnings, f'{label} must emit a WARNING naming the bad value'
+        assert any('max_concurrent_tasks' in r.getMessage() for r in warnings), (
+            f'{label} must emit a WARNING naming max_concurrent_tasks'
+        )
 
     def test_numeric_string_is_accepted(self, tmp_path):
         """A quoted YAML scalar is how ``${VAR:default}`` configs spell an int."""
-        from dashboard.data.orchestrator import read_max_concurrent_tasks
+        from dashboard.data.orchestrator import read_run_slot_capacity
 
-        self._write(tmp_path / 'dark-factory-orchestrator.yaml', "max_concurrent_tasks: '24'\n")
+        self._write(tmp_path / self.CANONICAL, "max_concurrent_tasks: '24'\n" + self.NO_RESERVE)
 
-        assert read_max_concurrent_tasks(tmp_path) == 24
+        assert read_run_slot_capacity(tmp_path) == 24
 
     # ---- never raises ------------------------------------------------
 
@@ -1176,7 +1212,7 @@ class TestReadMaxConcurrentTasks:
         A raise here would take down a burndown collection cycle for every
         project, which is strictly worse than an unknown cap.
         """
-        from dashboard.data.orchestrator import read_max_concurrent_tasks
+        from dashboard.data.orchestrator import read_run_slot_capacity
 
         cases = [
             'max_concurrent_tasks: [unclosed\n',
@@ -1188,20 +1224,20 @@ class TestReadMaxConcurrentTasks:
         ]
         for text in cases:
             root = tmp_path / f'case{cases.index(text)}'
-            self._write(root / 'dark-factory-orchestrator.yaml', text)
-            result = read_max_concurrent_tasks(root)
+            self._write(root / self.CANONICAL, text)
+            result = read_run_slot_capacity(root)
             assert result is None or isinstance(result, int)
 
     def test_config_path_is_a_directory_does_not_raise(self, tmp_path):
         """``dark-factory-orchestrator.yaml`` existing as a DIRECTORY is not a crash."""
-        from dashboard.data.orchestrator import read_max_concurrent_tasks
+        from dashboard.data.orchestrator import read_run_slot_capacity
 
-        (tmp_path / 'dark-factory-orchestrator.yaml').mkdir()
-        self._write(tmp_path / 'orchestrator.yaml', 'max_concurrent_tasks: 7\n')
+        (tmp_path / self.CANONICAL).mkdir()
+        self._write(tmp_path / 'orchestrator.yaml', 'max_concurrent_tasks: 7\n' + self.NO_RESERVE)
 
         # The canonical name is not a readable FILE, so resolution falls through
         # to the legacy spelling rather than exploding on IsADirectoryError.
-        assert read_max_concurrent_tasks(tmp_path) == 7
+        assert read_run_slot_capacity(tmp_path) == 7
 
 
 class TestReadRunSlotCapacity:
@@ -1211,9 +1247,9 @@ class TestReadRunSlotCapacity:
     ``main_health_fix_reserved_slots`` slots only a main-health fix may take
     (``docs/main-health-fix-run-slot-reserve.md``). A fix running on the
     reserve is legitimate, so the alarm must judge live in-progress against
-    the sum. Both keys come from the ONE config file the shared resolution
-    picks, layered over the orchestrator's restated defaults; either key
-    being unusable makes the whole capacity unknown.
+    the sum. Both keys come from the ONE config file resolution picks,
+    layered over the orchestrator's defaults (24 general slots, a reserve of
+    1); either key being unusable makes the whole capacity unknown.
 
     Both keys are restart-only, yet the capacity is TIME-VARYING across a
     burndown window, which spans restarts; the collector therefore reads it
@@ -1239,16 +1275,11 @@ class TestReadRunSlotCapacity:
         assert read_run_slot_capacity(tmp_path) == 37
 
     def test_omitted_reserve_is_the_orchestrator_default_not_unknown(self, tmp_path):
-        from dashboard.data.orchestrator import (
-            _ORCHESTRATOR_DEFAULT_MAIN_HEALTH_FIX_RESERVED_SLOTS,
-            read_run_slot_capacity,
-        )
+        from dashboard.data.orchestrator import read_run_slot_capacity
 
         self._write(tmp_path / self.CANONICAL, 'max_concurrent_tasks: 36\n')
 
-        assert read_run_slot_capacity(tmp_path) == (
-            36 + _ORCHESTRATOR_DEFAULT_MAIN_HEALTH_FIX_RESERVED_SLOTS
-        )
+        assert read_run_slot_capacity(tmp_path) == 37
 
     def test_zero_reserve_leaves_exactly_the_general_slots(self, tmp_path):
         from dashboard.data.orchestrator import read_run_slot_capacity
@@ -1261,18 +1292,11 @@ class TestReadRunSlotCapacity:
         assert read_run_slot_capacity(tmp_path) == 36
 
     def test_config_carrying_neither_key_sums_both_defaults(self, tmp_path):
-        from dashboard.data.orchestrator import (
-            _ORCHESTRATOR_DEFAULT_MAIN_HEALTH_FIX_RESERVED_SLOTS,
-            _ORCHESTRATOR_DEFAULT_MAX_CONCURRENT_TASKS,
-            read_run_slot_capacity,
-        )
+        from dashboard.data.orchestrator import read_run_slot_capacity
 
         self._write(tmp_path / self.CANONICAL, 'project_root: /somewhere\n')
 
-        assert read_run_slot_capacity(tmp_path) == (
-            _ORCHESTRATOR_DEFAULT_MAX_CONCURRENT_TASKS
-            + _ORCHESTRATOR_DEFAULT_MAIN_HEALTH_FIX_RESERVED_SLOTS
-        )
+        assert read_run_slot_capacity(tmp_path) == 25
 
     @pytest.mark.parametrize(
         ('label', 'yaml_value'),
@@ -1329,17 +1353,12 @@ class TestReadRunSlotCapacity:
 
     def test_both_keys_come_from_the_one_authoritative_file(self, tmp_path):
         """A legacy reserve is never mixed with the canonical general slots."""
-        from dashboard.data.orchestrator import (
-            _ORCHESTRATOR_DEFAULT_MAIN_HEALTH_FIX_RESERVED_SLOTS,
-            read_run_slot_capacity,
-        )
+        from dashboard.data.orchestrator import read_run_slot_capacity
 
         self._write(tmp_path / self.CANONICAL, 'max_concurrent_tasks: 36\n')
         self._write(tmp_path / 'orchestrator.yaml', 'main_health_fix_reserved_slots: 5\n')
 
-        assert read_run_slot_capacity(tmp_path) == (
-            36 + _ORCHESTRATOR_DEFAULT_MAIN_HEALTH_FIX_RESERVED_SLOTS
-        )
+        assert read_run_slot_capacity(tmp_path) == 37
 
     def test_legacy_only_config_supplies_both_keys(self, tmp_path):
         from dashboard.data.orchestrator import read_run_slot_capacity

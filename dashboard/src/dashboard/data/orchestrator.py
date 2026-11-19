@@ -33,9 +33,8 @@ the upstream format changes, this module must be updated by hand.
    Anyone renaming the ``run`` command or its ``--prd``/``--config`` flags
    must update ``find_running_orchestrators`` to match.
 
-2. Config DEFAULTS layering (:func:`read_run_slot_capacity`,
-   :func:`read_max_concurrent_tasks`) — the orchestrator's effective config
-   is ``_deep_merge(_load_defaults(), project_config)``
+2. Config DEFAULTS layering (:func:`read_run_slot_capacity`) — the
+   orchestrator's effective config is ``_deep_merge(_load_defaults(), project_config)``
    (``orchestrator/src/orchestrator/config.py``), so a key a project's YAML
    omits is still in force from ``orchestrator/src/orchestrator/defaults.yaml``.
    Reading a project YAML alone therefore misreports the parity DENOMINATOR.
@@ -63,7 +62,7 @@ import asyncio
 import logging
 import re
 import subprocess
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from pathlib import Path
 from types import MappingProxyType
 
@@ -184,7 +183,7 @@ def _load_config_mapping(path: Path) -> Mapping[str, object] | None:
 # ``orchestrator/src/orchestrator/defaults.yaml``'s ``max_concurrent_tasks``
 # and ``main_health_fix_reserved_slots``, which ``orchestrator.config``
 # deep-merges UNDER every project config. A project that omits either key
-# therefore runs with these values, not with none — so the readers must layer
+# therefore runs with these values, not with none — so the reader must layer
 # them the same way or the parity alarm misjudges those projects (the exact
 # E12 miss it exists to catch). ``dashboard/tests/test_orchestrator.py``
 # asserts both constants against that file whenever the orchestrator source is
@@ -192,43 +191,38 @@ def _load_config_mapping(path: Path) -> Mapping[str, object] | None:
 _ORCHESTRATOR_DEFAULT_MAX_CONCURRENT_TASKS = 24
 _ORCHESTRATOR_DEFAULT_MAIN_HEALTH_FIX_RESERVED_SLOTS = 1
 
-_KEY_ABSENT = object()
-"""Sentinel: the config mapping has no such slot-count key at all.
 
-Distinct from an explicit ``key:`` (YAML null). Absent means "the
-orchestrator's own default applies"; an explicit null is a config defect —
-``OrchestratorConfig`` types both fields ``int``, so such a config fails
-validation and no orchestrator runs from it at all.
-"""
-
-
-def _coerce_slot_count(key: str, value: object, default: int, path: Path) -> int | None:
-    """Coerce the raw value of slot-count *key* to a usable count, or ``None``.
+def _coerce_slot_count(
+    data: Mapping[str, object], key: str, default: int, path: Path
+) -> int | None:
+    """Read slot-count *key* from *data* (parsed from *path*) as a usable count, or ``None``.
 
     ``None`` means UNKNOWN, which the parity alarm must never conflate with
     "not breaching", and is reserved STRICTLY for "the value is malformed". A
     malformed value logs a WARNING naming the key, the value and the file,
     because that is a config defect an operator needs to see.
 
-    An ABSENT key (*value* is :data:`_KEY_ABSENT`) is not unknown: the
-    orchestrator deep-merges ``defaults.yaml`` under the project config, so
-    the project runs with *default*. Returning ``None`` here would exclude the
-    whole project from the parity alarm — of the live configs under
-    ``/home/leo/src``, two omit ``max_concurrent_tasks``.
+    An ABSENT key is not unknown: the orchestrator deep-merges
+    ``defaults.yaml`` under the project config, so the project runs with
+    *default*. Returning ``None`` here would exclude the whole project from
+    the parity alarm — of the live configs under ``/home/leo/src``, two omit
+    ``max_concurrent_tasks``.
 
     Boundaries:
 
+    * An explicit YAML null (``key:`` with no value) is MALFORMED, not absent:
+      ``OrchestratorConfig`` types both slot counts ``int``, so such a config
+      fails validation and no orchestrator runs from it at all.
     * ``bool`` is rejected explicitly — it is an ``int`` subclass, so a bare
       ``isinstance(value, int)`` would silently read ``true`` as 1.
     * ``0`` is KEPT as a real count ("dispatch nothing" / "no reserve").
       Tasks still in-progress against a 0 cap are a genuine breach; reporting
       that as unknown would hide it.
     * Negative counts are nonsense and rejected.
-    * An explicit YAML null is MALFORMED, not absent — see :data:`_KEY_ABSENT`.
     * A numeric *string* is accepted after ``${VAR:default}`` expansion —
       that is how a config spells an env-driven int.
     """
-    if value is _KEY_ABSENT:
+    if key not in data:
         logger.debug(
             'No %s in %s — applying the orchestrator default of %d '
             '(defaults.yaml is merged under every project config)',
@@ -238,6 +232,7 @@ def _coerce_slot_count(key: str, value: object, default: int, path: Path) -> int
         )
         return default
 
+    value = data[key]
     if isinstance(value, bool):
         count = None
     elif isinstance(value, int):
@@ -253,7 +248,7 @@ def _coerce_slot_count(key: str, value: object, default: int, path: Path) -> int
 
     if count is None or count < 0:
         logger.warning(
-            'Ignoring unusable %s %r in %s — treating the concurrency cap as unknown',
+            'Ignoring unusable %s %r in %s — treating the run-slot capacity as unknown',
             key,
             value,
             path,
@@ -262,46 +257,26 @@ def _coerce_slot_count(key: str, value: object, default: int, path: Path) -> int
     return count
 
 
-def _general_slots(data: Mapping[str, object], path: Path) -> int | None:
-    return _coerce_slot_count(
-        'max_concurrent_tasks',
-        data.get('max_concurrent_tasks', _KEY_ABSENT),
-        _ORCHESTRATOR_DEFAULT_MAX_CONCURRENT_TASKS,
-        path,
-    )
-
-
-def _run_slot_capacity(data: Mapping[str, object], path: Path) -> int | None:
-    general = _general_slots(data, path)
-    reserved = _coerce_slot_count(
-        'main_health_fix_reserved_slots',
-        data.get('main_health_fix_reserved_slots', _KEY_ABSENT),
-        _ORCHESTRATOR_DEFAULT_MAIN_HEALTH_FIX_RESERVED_SLOTS,
-        path,
-    )
-    if general is None or reserved is None:
-        return None
-    return general + reserved
-
-
-def _read_slot_count(
+def _resolve_orchestrator_config(
     project_root: Path | str,
-    count_of: Callable[[Mapping[str, object], Path], int | None],
-) -> int | None:
-    """Apply *count_of* to *project_root*'s resolved orchestrator config mapping.
+) -> tuple[Path, Mapping[str, object]] | None:
+    """Find *project_root*'s orchestrator config: its path and parsed mapping.
 
-    ``None`` is reserved for a config that is ABSENT or unreadable, or for
-    which *count_of* answers ``None`` (a malformed value). Every key
-    *count_of* reads comes from the ONE resolved file, so values from two
-    different files are never combined.
+    ``None`` means no config file exists, or the authoritative one cannot be
+    read as a mapping.
+
+    The resolved file is authoritative for EVERY key read from it: a key it
+    omits takes the orchestrator default and a key it spells badly is
+    unknown, but neither is ever supplied by another file. Mixing two files
+    would describe an orchestrator that runs from neither.
 
     Resolution mirrors ``dashboard.config.discover_root_escalation_url`` and
     reuses its filename constants so the two cannot fork: the canonical
     ``dark-factory-orchestrator.yaml`` is authoritative once it exists on
-    disk (a live config must not be masked by a stale legacy file — including
-    when it omits a key, where the default applies rather than the legacy
-    file's value), and only its outright absence falls through to
-    ``_LEGACY_CONFIG_NAMES`` in order, taking the first usable one.
+    disk (a live config must not be masked by a stale legacy file), and only
+    its outright absence falls through to ``_LEGACY_CONFIG_NAMES`` in order,
+    where the first one that parses to a mapping is authoritative the same
+    way.
 
     Unlike that startup-time discovery helper, the legacy-spelling nudge here
     is logged at DEBUG, not WARNING: this runs every collection cycle
@@ -317,32 +292,22 @@ def _read_slot_count(
     canonical = root / _CANONICAL_CONFIG_NAME
     if canonical.is_file():
         data = _load_config_mapping(canonical)
-        if data is None:
-            return None
-        return count_of(data, canonical)
+        return None if data is None else (canonical, data)
 
     for legacy_name in _LEGACY_CONFIG_NAMES:
         legacy_path = root / legacy_name
         if not legacy_path.is_file():
             continue
         data = _load_config_mapping(legacy_path)
-        if data is None:
-            continue
-        count = count_of(data, legacy_path)
-        if count is not None:
+        if data is not None:
             logger.debug(
-                'Project %s: read slot counts from legacy config path %s (expected %s)',
+                'Project %s: using legacy config path %s (expected %s)',
                 root.name,
                 legacy_path,
                 _CANONICAL_CONFIG_NAME,
             )
-            return count
+            return legacy_path, data
     return None
-
-
-def read_max_concurrent_tasks(project_root: Path | str) -> int | None:
-    """Read *project_root*'s general task pool (``max_concurrent_tasks``), or ``None``."""
-    return _read_slot_count(project_root, _general_slots)
 
 
 def read_run_slot_capacity(project_root: Path | str) -> int | None:
@@ -363,15 +328,30 @@ def read_run_slot_capacity(project_root: Path | str) -> int | None:
     after a raise and invent one after a cut. Callers must treat ``None`` as
     UNKNOWN, never as "not breaching".
 
-    A readable config that OMITS either key gets the orchestrator's own
-    default for it (:data:`_ORCHESTRATOR_DEFAULT_MAX_CONCURRENT_TASKS`,
+    Both keys come from the one file :func:`_resolve_orchestrator_config`
+    picks. One it OMITS gets the orchestrator's own default
+    (:data:`_ORCHESTRATOR_DEFAULT_MAX_CONCURRENT_TASKS`,
     :data:`_ORCHESTRATOR_DEFAULT_MAIN_HEALTH_FIX_RESERVED_SLOTS`), because
     ``orchestrator.config`` deep-merges ``defaults.yaml`` under every project
     config. Either key being malformed makes the whole capacity unknown:
     dropping only a bad reserve would understate capacity and false-alarm.
-    Resolution is :func:`_read_slot_count`'s.
     """
-    return _read_slot_count(project_root, _run_slot_capacity)
+    resolved = _resolve_orchestrator_config(project_root)
+    if resolved is None:
+        return None
+    path, data = resolved
+    general = _coerce_slot_count(
+        data, 'max_concurrent_tasks', _ORCHESTRATOR_DEFAULT_MAX_CONCURRENT_TASKS, path
+    )
+    reserved = _coerce_slot_count(
+        data,
+        'main_health_fix_reserved_slots',
+        _ORCHESTRATOR_DEFAULT_MAIN_HEALTH_FIX_RESERVED_SLOTS,
+        path,
+    )
+    if general is None or reserved is None:
+        return None
+    return general + reserved
 
 
 def find_running_orchestrators() -> list[dict]:
