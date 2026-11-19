@@ -39,6 +39,7 @@ from fused_memory.models.reconciliation import (
     ReconciliationRun,
     RunStatus,
     RunType,
+    StageId,
     StageReport,
 )
 from fused_memory.models.scope import (
@@ -55,7 +56,14 @@ from fused_memory.reconciliation.cli_stage_runner import (
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.harness import BacklogIterator
 from fused_memory.reconciliation.known_projects_section import render_known_projects_section
+from fused_memory.reconciliation.stages.base import BaseStage
+from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
+from fused_memory.reconciliation.stages.task_knowledge_sync import IntegrityCheck
 from fused_memory.reconciliation.task_count_snapshot_cadence import SNAPSHOT_WRITTEN_STAT_KEY
+from fused_memory.reconciliation.task_filter import (
+    ACTIVE_TASK_TREE_HEADER,
+    TaskTreeUnavailableReason,
+)
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
@@ -6869,6 +6877,7 @@ class TestHarnessFetchFilteredTaskTree:
         assert result.done_count == 2
         assert len(result.done_tasks) == 2  # main's FilteredTaskTree retains done task dicts
         assert result.cancelled_count == 1
+        assert result.unavailable_reason is None
         harness.taskmaster.get_tasks.assert_called_once_with(project_root='/abs/path')  # type: ignore[union-attr,attr-defined]
 
     @pytest.mark.asyncio
@@ -6894,6 +6903,7 @@ class TestHarnessFetchFilteredTaskTree:
         assert isinstance(result, FilteredTaskTree)
         assert result.active_tasks == []
         assert result.total_count == 0
+        assert result.unavailable_reason is TaskTreeUnavailableReason.fetch_error
 
         # Must have logged a warning containing BOTH the project_root and exception message
         assert any(
@@ -6923,6 +6933,7 @@ class TestHarnessFetchFilteredTaskTree:
 
         assert isinstance(result, FilteredTaskTree)
         assert result.active_tasks == []
+        assert result.unavailable_reason is TaskTreeUnavailableReason.taskmaster_disabled
 
     @pytest.mark.asyncio
     async def test_returns_empty_when_empty_project_root(
@@ -6940,6 +6951,7 @@ class TestHarnessFetchFilteredTaskTree:
 
         assert isinstance(result, FilteredTaskTree)
         assert result.active_tasks == []
+        assert result.unavailable_reason is TaskTreeUnavailableReason.empty_project_root
         harness.taskmaster.get_tasks.assert_not_called()  # type: ignore[union-attr,attr-defined]
 
     @pytest.mark.asyncio
@@ -6973,6 +6985,7 @@ class TestHarnessFetchFilteredTaskTree:
         assert isinstance(result, FilteredTaskTree)
         assert result.active_tasks == []
         assert result.total_count == 0
+        assert result.unavailable_reason is TaskTreeUnavailableReason.non_absolute_project_root
 
         # (b) taskmaster.get_tasks must NOT be called (pre-check short-circuit)
         harness.taskmaster.get_tasks.assert_not_called()  # type: ignore[union-attr,attr-defined]
@@ -7474,6 +7487,82 @@ class TestHarnessFetchFilteredTaskTree:
         assert result_b.active_tasks == []
         assert result_b.done_count == 0
         assert result_b.cancelled_count == 0
+
+
+def _empty_stage_report(stage_id: StageId) -> StageReport:
+    now = datetime.now(UTC)
+    return StageReport(stage=stage_id, started_at=now, completed_at=now)
+
+
+async def _stage2_payload_after_full_cycle(
+    journal, event_buffer, memory_service, monkeypatch, taskmaster,
+) -> str:
+    """The real Stage 2 payload that run_full_cycle assembles, with no stage reaching an LLM."""
+    payloads: dict[StageId, str] = {}
+
+    async def canned_run(self, events, watermark, prior_reports, run_id, model=None, **_kw):
+        return _empty_stage_report(self.stage_id)
+
+    async def assemble_then_report(self, events, watermark, prior_reports, run_id, **_kw):
+        payloads[self.stage_id] = await self.assemble_payload(events, watermark, prior_reports)
+        return _empty_stage_report(self.stage_id)
+
+    monkeypatch.setattr(MemoryConsolidator, 'run', canned_run)
+    monkeypatch.setattr(IntegrityCheck, 'run', canned_run)
+    monkeypatch.setattr(BaseStage, 'run', assemble_then_report)
+
+    harness = make_harness(
+        journal=journal,
+        event_buffer=event_buffer,
+        memory_service=memory_service,
+        taskmaster=taskmaster,
+        config=make_harness_config(judge_enabled=False),
+        known_projects={'test-project': '/tmp/test-project'},
+    )
+    await harness.run_full_cycle('test-project', 'test-trigger', events=[_make_event()])
+    return payloads[StageId.task_knowledge_sync]
+
+
+async def _stage2_payload_after_failed_fetch(
+    journal, event_buffer, memory_service, monkeypatch, reason: TaskTreeUnavailableReason,
+) -> str:
+    taskmaster = None
+    if reason is TaskTreeUnavailableReason.fetch_error:
+        taskmaster = AsyncMock()
+        taskmaster.get_tasks.side_effect = RuntimeError('connection refused')
+        taskmaster.get_statuses_fresh.return_value = {}
+    return await _stage2_payload_after_full_cycle(
+        journal, event_buffer, memory_service, monkeypatch, taskmaster,
+    )
+
+
+_PUBLICLY_REACHABLE_FETCH_FAILURES = [
+    TaskTreeUnavailableReason.taskmaster_disabled,
+    TaskTreeUnavailableReason.fetch_error,
+]
+
+
+class TestFailedTreeFetchReachesStagesAsUnavailable:
+    """A failed task-tree fetch reaches Stage 2 as 'unavailable', never as an empty project.
+
+    Only taskmaster_disabled and fetch_error are reachable through run_full_cycle:
+    ProjectScope rejects an empty or relative root before any fetch, so the other two
+    reasons are pinned in TestHarnessFetchFilteredTaskTree.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('reason', _PUBLICLY_REACHABLE_FETCH_FAILURES)
+    async def test_stage2_task_tree_slots_say_unavailable(
+        self, journal, event_buffer, mock_memory_service, monkeypatch, reason,
+    ):
+        payload = await _stage2_payload_after_failed_fetch(
+            journal, event_buffer, mock_memory_service, monkeypatch, reason,
+        )
+
+        notice = f'Task tree unavailable: {reason.value}'
+        assert f'{ACTIVE_TASK_TREE_HEADER}\n{notice}\n' in payload
+        assert '0 active shown' not in payload
+        assert f'### Recently Completed Tasks\n{notice}\n' in payload
 
 
 # ── Tests for task 455: harness wires filtered_task_tree into stages ──────────
