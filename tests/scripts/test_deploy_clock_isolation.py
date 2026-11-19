@@ -46,7 +46,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
 
-from nested_pytest_session import binding_conftest, run_nested_pytest  # noqa: E402
+from nested_pytest_session import arming_conftest, run_nested_pytest  # noqa: E402
 
 import df_pytest_isolation  # noqa: E402
 from df_pytest_isolation import (  # noqa: E402
@@ -1435,7 +1435,7 @@ def _nested_run(tmp_path: Path, *, scenario: str) -> subprocess.CompletedProcess
     """
     assert scenario in _NESTED_SCENARIOS, scenario
     return run_nested_pytest(tmp_path / scenario, {
-        'conftest.py': binding_conftest(_GUARD_NAME),
+        'conftest.py': arming_conftest(_GUARD_NAME),
         'test_forgetful.py': _nested_test_source(scenario=scenario),
     })
 
@@ -1605,7 +1605,7 @@ class TestTheGuardAttributesTheStampEndToEnd:
         """
         monkeypatch.setenv('PYTEST_ADDOPTS', '-n 2 --dist each')
         result = run_nested_pytest(tmp_path / 'xdist', {
-            'conftest.py': binding_conftest(_GUARD_NAME),
+            'conftest.py': arming_conftest(_GUARD_NAME),
             'test_xdist_stamp.py': _xdist_test_source(),
         })
         combined = result.stdout + result.stderr

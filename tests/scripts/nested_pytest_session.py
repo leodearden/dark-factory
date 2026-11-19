@@ -15,7 +15,7 @@ imported by every subproject's conftest, which would then load a test-only
 harness into every session.
 
 The conftest template and the runner share this file because they are coupled.
-:func:`binding_conftest`'s ``sys.path.insert(0, parent)`` resolves the guard
+:func:`arming_conftest`'s ``sys.path.insert(0, parent)`` resolves the guard
 only because :func:`run_nested_pytest` puts the module's copy at the nested
 root.
 """
@@ -54,12 +54,12 @@ _NESTED_INI = '[pytest]\n'
 _HARNESS_FILES = frozenset({'pytest.ini', 'df_pytest_isolation.py'})
 
 
-def binding_conftest(fixture_name: str, *, setup: str = '') -> str:
-    """Source for a nested root conftest that binds *fixture_name* from the copy.
+def arming_conftest(fixture_name: str, *, setup: str = '') -> str:
+    """Source for a nested root conftest that arms *fixture_name* from the copy.
 
-    The binding IS the wiring: importing the fixture into a conftest is what
-    registers it for the nested session. *setup* runs after the copy is
-    importable and before the binding.
+    Arms it the way every real test root does, from ``pytest_configure`` through
+    ``df_pytest_isolation.arm_fixtures``. *setup* runs at conftest import, after
+    the copy is importable and before the arming.
     """
     return (
         'import sys\n'
@@ -68,7 +68,11 @@ def binding_conftest(fixture_name: str, *, setup: str = '') -> str:
         'sys.path.insert(0, str(Path(__file__).resolve().parent))\n'
         '\n'
         f'{setup}'
-        f'from df_pytest_isolation import {fixture_name}  # noqa: F401\n'
+        'import df_pytest_isolation\n'
+        '\n'
+        '\n'
+        'def pytest_configure(config):\n'
+        f'    df_pytest_isolation.arm_fixtures(config, df_pytest_isolation.{fixture_name})\n'
     )
 
 

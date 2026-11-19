@@ -70,7 +70,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
 
-from nested_pytest_session import binding_conftest, run_nested_pytest  # noqa: E402
+from nested_pytest_session import arming_conftest, run_nested_pytest  # noqa: E402
 
 import df_pytest_isolation  # noqa: E402
 from df_pytest_isolation import (  # noqa: E402
@@ -745,10 +745,10 @@ def _nested_conftest_source(*, preexisting: bool) -> str:
         if preexisting
         else ''
     )
-    return binding_conftest(_GUARD_NAME, setup=f"""\
+    return arming_conftest(_GUARD_NAME, setup=f"""\
 import df_pytest_isolation
 
-# Repoint the guard at THIS tmp tree before binding it. The fixture reads the
+# Repoint the guard at THIS tmp tree before arming it. The fixture reads the
 # module global at call time, so this is what keeps the nested run away from the
 # real machine-global fleet directory.
 df_pytest_isolation.LIVE_FLEET_DIR = Path(__file__).resolve().parent / 'fleet'

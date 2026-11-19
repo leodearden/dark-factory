@@ -50,7 +50,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from nested_pytest_session import (  # noqa: E402
     NESTED_SESSION_TIMEOUT_SECS,
-    binding_conftest,
+    arming_conftest,
     run_nested_pytest,
 )
 
@@ -1229,7 +1229,7 @@ def _nested_run(
     leaking test spawns.
     """
     return run_nested_pytest(root, {
-        'conftest.py': binding_conftest(_GUARD_NAME),
+        'conftest.py': arming_conftest(_GUARD_NAME),
         _LEAKER_NAME: _NESTED_LEAKER,
         'test_forgetful.py': _nested_test_source(leaks=leaks, entrypoint=entrypoint),
         **(extra_files or {}),

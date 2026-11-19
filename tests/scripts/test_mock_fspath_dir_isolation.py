@@ -27,7 +27,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
 
 from nested_pytest_session import (  # noqa: E402  # debt: task 6997
-    binding_conftest,
+    arming_conftest,
     run_nested_pytest,
 )
 
@@ -242,7 +242,7 @@ def _nested_run(
 ):
     source = f'import os\nfrom pathlib import Path\n{imports}\n\ndef test_leaks():\n{body}\n'
     return run_nested_pytest(root, {
-        'conftest.py': binding_conftest(_GUARD_NAME),
+        'conftest.py': arming_conftest(_GUARD_NAME),
         'test_x.py': source,
         **(extra_files or {}),
     })
