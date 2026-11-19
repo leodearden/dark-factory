@@ -30,6 +30,7 @@ from orchestrator.merge_lane.shadow import (
     _WARM_COLD_SHADOW_UNPARSEABLE_SENTINEL,
     ShadowCompareDiff,
     ShadowCompareState,
+    _alarm_warm_shadow_unparseable,
     _load_shadow_compare_state,
     _nextest_reported_test_count,
     _run_shadow_compare,
@@ -45,7 +46,6 @@ from orchestrator.merge_lane.worker import (
     MergeRequest,
     QueuedBranch,
     SpeculativeMergeWorker,
-    _alarm_warm_shadow_unparseable,
     _maybe_schedule_shadow_compare,
 )
 from orchestrator.verify import VerifyResult

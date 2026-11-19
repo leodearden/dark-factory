@@ -2450,7 +2450,7 @@ class TestSpeculativeMergeWorker:
 
         # γ: patch _run_inflight_verify (the verify half of the new split) instead of
         # _verify_and_advance (which is now only a compat shim not called by the loop).
-        original_riv = worker._run_inflight_verify
+        original_riv = worker.verify_dispatch.run_inflight_verify
         call_count = 0
 
         async def mock_riv(item, lease, **kwargs):  # type: ignore[no-untyped-def]
@@ -2460,7 +2460,7 @@ class TestSpeculativeMergeWorker:
                 raise RuntimeError('Unexpected verifier error')
             return await original_riv(item, lease, **kwargs)
 
-        worker._run_inflight_verify = mock_riv  # type: ignore[method-assign]
+        worker.verify_dispatch.run_inflight_verify = mock_riv
 
         req_n = _make_request('vex-n', 'vex-n', wt_n, config)
         req_n1 = _make_request('vex-n1', 'vex-n1', wt_n1, config)
@@ -5988,7 +5988,7 @@ class TestLaneSceneVerifyIsNotCalledDead:
         verifier = FakeVerifier(default=dataclasses.replace(passes(), release=gate))
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         lane = make_lane(git_ops, queue, verifier=verifier, clock=healthy_verify_clock())
-        lane.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS = 10 * lane.VERIFY_ABANDON_POLL_SECS
+        lane.verify_dispatch.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS = 10 * lane.verify_dispatch.VERIFY_ABANDON_POLL_SECS
 
         async with running_lane(lane) as run:
             req = _make_request('slow-verify', 'slow-verify', wt, config)
@@ -8862,7 +8862,7 @@ class TestSpeculativeMergeWorkerLedgerAwarePrune:
             captured.update(kwargs)
             return None  # verify passes
 
-        with patch('orchestrator.merge_lane.worker.run_post_merge_verify', _recording_verify):
+        with patch('orchestrator.merge_lane.verify_dispatch.run_post_merge_verify', _recording_verify):
             req = _make_request('ledger-snap', 'ledger-snap', wt, config)
             await queue.put(req)
             outcome = await wait_responsive(req.result, label='ledger-snap: MergeOutcome')
@@ -18472,7 +18472,7 @@ class TestSMWGenerationChain:
         finalize_mock = AsyncMock(return_value=MergeOutcome('done', merge_sha='adv-sha'))
 
         with (
-            patch('orchestrator.merge_lane.worker.run_post_merge_verify', AsyncMock(return_value=None)),
+            patch('orchestrator.merge_lane.verify_dispatch.run_post_merge_verify', AsyncMock(return_value=None)),
             patch('orchestrator.merge_lane.worker._finalize_advanced_merge', finalize_mock),
         ):
             advanced = await drive_verify_and_advance(worker, item)
@@ -19672,7 +19672,7 @@ class TestSoftCancelMidVerify:
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, queue)
         # Fast poll so the test doesn't take seconds — abort within ~0.01 s.
-        worker.VERIFY_ABANDON_POLL_SECS = 0.01  # type: ignore[attr-defined]
+        worker.verify_dispatch.VERIFY_ABANDON_POLL_SECS = 0.01
 
         req = _make_request('sc-a', 'sc-a', wt, config)
         registry = InFlightMergeRegistry()
@@ -19864,7 +19864,7 @@ class TestSoftCancelMidVerify:
 
         with (
             patch(
-                'orchestrator.merge_lane.worker.run_post_merge_verify',
+                'orchestrator.merge_lane.verify_dispatch.run_post_merge_verify',
                 AsyncMock(return_value=MergeOutcome('blocked', reason='test failed')),
             ),
             caplog.at_level(logging.INFO, logger='orchestrator.merge_lane'),
@@ -19929,7 +19929,7 @@ class TestSoftCancelMidVerify:
 
         with (
             patch(
-                'orchestrator.merge_lane.worker.run_post_merge_verify',
+                'orchestrator.merge_lane.verify_dispatch.run_post_merge_verify',
                 AsyncMock(return_value=MergeOutcome(
                     'blocked', reason='low disk space', verify_skipped=True,
                 )),
@@ -20632,7 +20632,7 @@ class TestOperatorHalt:
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, queue)
-        worker.VERIFY_ABANDON_POLL_SECS = 0.01  # type: ignore[attr-defined]
+        worker.verify_dispatch.VERIFY_ABANDON_POLL_SECS = 0.01
 
         req = _make_request('op-halt', 'op-halt', wt, config)
         item = RealMergeItem(
@@ -20726,7 +20726,7 @@ class TestOperatorHalt:
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, queue)
-        worker.VERIFY_ABANDON_POLL_SECS = 0.01  # type: ignore[attr-defined]
+        worker.verify_dispatch.VERIFY_ABANDON_POLL_SECS = 0.01
 
         req = _make_request('wip-noabort', 'wip-noabort', wt, config)
         item = RealMergeItem(

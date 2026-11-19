@@ -833,7 +833,7 @@ class TestB5OperatorHalt:
             git_ops, q, verifier=ScriptedVerifier(_gated_local),
         )
         _inject_two_host_allocator(worker, gated_remote)
-        worker.VERIFY_ABANDON_POLL_SECS = 0.01  # fast abort-polls for determinism
+        worker.verify_dispatch.VERIFY_ABANDON_POLL_SECS = 0.01  # fast abort-polls for determinism
 
         # Spy on _remerge: halt MUST NOT trigger chain-invalidation re-merge
         _original_remerge = worker._remerge

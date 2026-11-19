@@ -792,9 +792,9 @@ class TestOnRequeuedIsAlwaysPairedWithNoteRequeue:
             git_ops, queue, verifier=verifier, escalation_queue=fake_eq,
             clock=clock,
         )
-        worker.VERIFY_ABANDON_POLL_SECS = 0.02
-        worker.INFLIGHT_VERIFY_PROGRESS_PROBE_SECS = 0.02
-        worker.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS = 0.2
+        worker.verify_dispatch.VERIFY_ABANDON_POLL_SECS = 0.02
+        worker.verify_dispatch.INFLIGHT_VERIFY_PROGRESS_PROBE_SECS = 0.02
+        worker.verify_dispatch.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS = 0.2
 
         ledger_rids: list[str] = []
         registry_rids: list[str] = []
@@ -824,7 +824,7 @@ class TestOnRequeuedIsAlwaysPairedWithNoteRequeue:
         worker._register_owned_merge_worktree(item_cl.merge_wt)
         worker._register_item(item_cl, initial=ItemLifecycleState.VERIFYING)
         vr_cl = await asyncio.wait_for(
-            worker._run_inflight_verify(item_cl, lease), timeout=15.0,
+            worker.verify_dispatch.run_inflight_verify(item_cl, lease), timeout=15.0,
         )
         assert vr_cl.status == InflightStatus.REQUEUED, f'{vr_cl!r}'
 
@@ -840,9 +840,9 @@ class TestOnRequeuedIsAlwaysPairedWithNoteRequeue:
             'is waiting on something other than the clock it measures its '
             'no-progress budget against'
         )
-        assert set(clock.waits) == {worker.VERIFY_ABANDON_POLL_SECS}, (
+        assert set(clock.waits) == {worker.verify_dispatch.VERIFY_ABANDON_POLL_SECS}, (
             f'every ClockPort.wait_for_any must wait exactly '
-            f'VERIFY_ABANDON_POLL_SECS ({worker.VERIFY_ABANDON_POLL_SECS}s): '
+            f'VERIFY_ABANDON_POLL_SECS ({worker.verify_dispatch.VERIFY_ABANDON_POLL_SECS}s): '
             f'{clock.waits!r}'
         )
 
@@ -853,7 +853,7 @@ class TestOnRequeuedIsAlwaysPairedWithNoteRequeue:
         worker._register_owned_merge_worktree(item_dv.merge_wt)
         worker._register_item(item_dv, initial=ItemLifecycleState.VERIFYING)
         vr_dv = await asyncio.wait_for(
-            worker._run_inflight_verify(item_dv, lease), timeout=15.0,
+            worker.verify_dispatch.run_inflight_verify(item_dv, lease), timeout=15.0,
         )
         assert vr_dv.status == InflightStatus.REQUEUED, f'{vr_dv!r}'
 
@@ -3113,10 +3113,10 @@ async def _verify_exit_scene(
     worker = make_lane(
         git_ops, queue, verifier=verifier, escalation_queue=fake_eq, clock=FakeClock(),
     )
-    worker.VERIFY_ABANDON_POLL_SECS = 0.02
-    worker.INFLIGHT_VERIFY_PROGRESS_PROBE_SECS = 0.02
+    worker.verify_dispatch.VERIFY_ABANDON_POLL_SECS = 0.02
+    worker.verify_dispatch.INFLIGHT_VERIFY_PROGRESS_PROBE_SECS = 0.02
     if trigger == 'no_progress':
-        worker.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS = 0.2
+        worker.verify_dispatch.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS = 0.2
     allocator = MagicMock()
     allocator.cancel_and_release = (
         AsyncMock(return_value=True) if cancel_and_release is None else cancel_and_release
@@ -3143,7 +3143,7 @@ async def _verify_exit_scene(
     lease = HostLease(name='local', runner=local_runner, is_local=True)
     slot = InflightEntrySlot()
     verify_task = asyncio.ensure_future(
-        worker._run_inflight_verify(item, lease, entry_slot=slot),
+        worker.verify_dispatch.run_inflight_verify(item, lease, entry_slot=slot),
     )
     entry = InflightEntry(
         item=item,
@@ -3347,23 +3347,23 @@ class TestRunInflightVerifyRequeuesOnlyThroughVacate:
     def test_scanner_returns_empty_on_unparseable_source(self) -> None:
         assert _verify_exit_vacate_bypasses('def broken(:\n') == []
 
-    def test_run_inflight_verify_requeues_and_drops_only_through_vacate(self) -> None:
-        import orchestrator.merge_lane.worker as _mq  # module-local import convention
+    def test_the_inflight_verify_requeues_and_drops_only_through_custody(self) -> None:
+        """The in-flight verify moved to merge_lane/inflight_verify.py, where it
+        reaches requests only through the custody port: no bare requeue or
+        retire anywhere in the module, and both vacating wrappers in use."""
+        import orchestrator.merge_lane.inflight_verify as _iv  # module-local import convention
 
-        source = Path(inspect.getfile(_mq)).read_text()
-        offenders = _verify_exit_vacate_bypasses(source)
-        assert offenders == [], (
-            '_run_inflight_verify must give a request back through '
-            '`await self._requeue_from_verify(item)` and drop it through '
-            '`await self._drop_from_verify(item)`, which hand the host lease back '
-            'and mark the InflightEntry first. Bare calls: '
-            f'{offenders!r}'
+        tree = ast.parse(Path(inspect.getfile(_iv)).read_text())
+        bypasses = [
+            ast.unparse(call) for attr in _VERIFY_EXIT_BYPASSES for call in _attr_calls(tree, attr)
+        ]
+        assert bypasses == [], (
+            'the in-flight verify must give a request back through the custody '
+            "port's requeue_from_verify and drop it through drop_from_verify, "
+            f'which vacate the InflightEntry first. Bare calls: {bypasses!r}'
         )
-        routed = _calls_inside_run_inflight_verify(source, '_requeue_from_verify')
-        assert routed, (
-            'no _requeue_from_verify call found inside _run_inflight_verify — '
-            'the scan is mis-wired or the method moved'
-        )
+        assert _attr_calls(tree, 'requeue_from_verify'), 'the scan is mis-wired or the verify moved'
+        assert _attr_calls(tree, 'drop_from_verify'), 'the scan is mis-wired or the verify moved'
 
 
 # The render-once property is pinned through public submission in

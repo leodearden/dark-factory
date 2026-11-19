@@ -38,6 +38,7 @@ from orchestrator.merge_lane.disposition import (
     MergeFailureDisposition,
     SkewEvidence,
 )
+from orchestrator.merge_lane.inflight_verify import resolve_dispatch_time_merge_base
 from orchestrator.merge_lane.main_health_probe import (
     MAIN_HEALTH_RED_REASON_PREFIX,
     classify_main_health_red,
@@ -47,7 +48,6 @@ from orchestrator.merge_lane.types import OutcomeKind, QueuedBranch
 from orchestrator.merge_lane.worker import (
     MergeOutcome,
     MergeRequest,
-    resolve_dispatch_time_merge_base,
 )
 from orchestrator.verify import VerifyResult
 

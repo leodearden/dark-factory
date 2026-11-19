@@ -1488,7 +1488,7 @@ class TestCascadeErrorChokepoint:
             git_ops, q, verifier=ScriptedVerifier(_gated_local),
         )
         _inject_two_host_allocator(worker, gated_remote)
-        worker.VERIFY_ABANDON_POLL_SECS = 0.01  # fast abort-poll for determinism
+        worker.verify_dispatch.VERIFY_ABANDON_POLL_SECS = 0.01  # fast abort-poll for determinism
         calls = _spy_on_resolve_and_release(worker)
 
         loop = asyncio.get_running_loop()

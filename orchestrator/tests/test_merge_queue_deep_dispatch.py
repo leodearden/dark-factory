@@ -790,7 +790,7 @@ class TestDeepChainPlacementBuild:
         ``_deep_chain_placement`` is awaited inline by ``_dispatch_item``, which
         the verifier loop runs as a task.  If the cancel is swallowed down in
         the placement, ``_dispatch_item`` sails on past it and
-        ``ensure_future(self._run_inflight_verify(...))`` launches a whole
+        ``ensure_future(self._verify_dispatch.run_inflight_verify(...))`` launches a whole
         verify for a dispatch that was cancelled — so the observable is not
         just "the exception vanished" but "work happened after the cancel".
         """
@@ -933,7 +933,7 @@ class TestDeepChainPlacementBuild:
 #     for a speculative item with the lane pool on (merge_liveness.py:715-731).
 #     Spied on the GitOps INSTANCE via ``_count_spec_lane_acquires``, which is
 #     not a module reach-back at all.
-#   * ``worker._verify_attempt_count`` — staged and committed INSIDE that
+#   * ``worker.verify_dispatch.verify_attempts()`` — staged and committed INSIDE that
 #     block, and the driver of the periodic cold-verify safety valve.
 
 
@@ -996,7 +996,7 @@ class TestRunInflightVerifyChainRedirect:
         git_ops, worker, item, chain, head, _facts = await self._fixture(git_repo)
         posted = _spy_post_merge_verify(monkeypatch)
 
-        await worker._run_inflight_verify(item, _local_lease(), chain=chain)
+        await worker.verify_dispatch.run_inflight_verify(item, _local_lease(), chain=chain)
 
         assert len(posted) == 1
         assert posted[0]['merge_sha'] == chain.tip
@@ -1024,12 +1024,12 @@ class TestRunInflightVerifyChainRedirect:
         # excluded and this list counts only what the VERIFY would take.
         lanes = _count_spec_lane_acquires(git_ops, monkeypatch)
         _spy_post_merge_verify(monkeypatch)
-        before = worker._verify_attempt_count
+        before = worker.verify_dispatch.verify_attempts()
 
-        await worker._run_inflight_verify(item, _local_lease(), chain=chain)
+        await worker.verify_dispatch.run_inflight_verify(item, _local_lease(), chain=chain)
 
         assert lanes == [], 'chain arm must not acquire a second verify lane'
-        assert worker._verify_attempt_count == before, (
+        assert worker.verify_dispatch.verify_attempts() == before, (
             'the attempt counter is staged INSIDE the warm-swap block, so a '
             'bypassed block must leave the cold-verify safety valve untouched'
         )
@@ -1051,7 +1051,7 @@ class TestRunInflightVerifyChainRedirect:
         _git_ops, worker, item, chain, _head, _facts = await self._fixture(git_repo, frontier=1)
         posted = _spy_post_merge_verify(monkeypatch)
 
-        await worker._run_inflight_verify(
+        await worker.verify_dispatch.run_inflight_verify(
             item, _local_lease(), chain=chain, chain_items=99,  # deliberately wrong
         )
 
@@ -1080,7 +1080,7 @@ class TestRunInflightVerifyChainRedirect:
         released = _spy_chain_lane_release(monkeypatch)
         assert _lane_states(git_ops) == [LaneState.ASSIGNED, LaneState.FREE]
 
-        await worker._run_inflight_verify(item, _local_lease(), chain=chain)
+        await worker.verify_dispatch.run_inflight_verify(item, _local_lease(), chain=chain)
 
         assert released == [(chain.lane, chain.lane_warm)], 'exactly one release'
         assert _lane_states(git_ops) == [LaneState.FREE, LaneState.FREE]
@@ -1113,7 +1113,7 @@ class TestRunInflightVerifyChainRedirect:
         _seed_window(worker, tmp_path, [seeded])
         _spy_post_merge_verify(monkeypatch, outcome=outcome)
 
-        await worker._run_inflight_verify(
+        await worker.verify_dispatch.run_inflight_verify(
             item, _local_lease(), chain=chain, dispatch_facts=facts,
         )
 
@@ -1145,7 +1145,7 @@ class TestRunInflightVerifyChainRedirect:
         _spy_post_merge_verify(monkeypatch, raises=RuntimeError('verify exploded'))
         released = _spy_chain_lane_release(monkeypatch)
 
-        res = await worker._run_inflight_verify(
+        res = await worker.verify_dispatch.run_inflight_verify(
             item, _local_lease(), chain=chain, dispatch_facts=facts,
         )
 
@@ -1191,7 +1191,7 @@ class TestRunInflightVerifyChainRedirect:
         _git_ops, worker, item, chain, _head, _facts = await self._fixture(git_repo)
         _spy_post_merge_verify(monkeypatch, raises=RuntimeError('verify exploded'))
 
-        await worker._run_inflight_verify(item, _local_lease(), chain=chain)
+        await worker.verify_dispatch.run_inflight_verify(item, _local_lease(), chain=chain)
 
         built = _spy_build_chain(monkeypatch, passthrough=True)
         assert (await worker._deep_chain_placement(item)).chain is None
@@ -1210,10 +1210,10 @@ class TestRunInflightVerifyChainRedirect:
         """
         _git_ops, worker, item, chain, _head, _facts = await self._fixture(git_repo)
         _spy_post_merge_verify(monkeypatch, raises=RuntimeError('verify exploded'))
-        await worker._run_inflight_verify(item, _local_lease(), chain=chain)
+        await worker.verify_dispatch.run_inflight_verify(item, _local_lease(), chain=chain)
 
         posted = _spy_post_merge_verify(monkeypatch, outcome=None)
-        res = await worker._run_inflight_verify(item, _local_lease())
+        res = await worker.verify_dispatch.run_inflight_verify(item, _local_lease())
         assert len(posted) == 1, 'the ordinary arm ran'
         if res.merge_wt is not None:
             await worker._release_or_cleanup(res.merge_wt, spec_warm=res.spec_warm)
@@ -1247,7 +1247,7 @@ class TestRunInflightVerifyChainRedirect:
 
         # ── ROUND 1: chained, raises → defer + suppress (no resolution). ──
         _spy_post_merge_verify(monkeypatch, raises=RuntimeError('boom 1'))
-        first = await worker._run_inflight_verify(item, _local_lease(), chain=chain)
+        first = await worker.verify_dispatch.run_inflight_verify(item, _local_lease(), chain=chain)
 
         assert first.status is InflightStatus.REQUEUED
         assert not item.request.result.done()
@@ -1260,7 +1260,7 @@ class TestRunInflightVerifyChainRedirect:
 
         # ── ROUND 2: un-chained, raises too → today's terminal resolution. ──
         _spy_post_merge_verify(monkeypatch, raises=RuntimeError('boom 2'))
-        second = await worker._run_inflight_verify(item, _local_lease())
+        second = await worker.verify_dispatch.run_inflight_verify(item, _local_lease())
 
         assert item.request.result.done(), (
             'the un-chained round is the backstop: its verify ran against the '
@@ -1304,7 +1304,7 @@ class TestRunInflightVerifyChainRedirect:
         git_ops, worker, item, chain, head, _facts = await self._fixture(git_repo)
         config = item.request.config
         _spy_post_merge_verify(monkeypatch, outcome=_fail_verify_result())
-        await worker._run_inflight_verify(item, _local_lease(), chain=chain)
+        await worker.verify_dispatch.run_inflight_verify(item, _local_lease(), chain=chain)
 
         built = _spy_build_chain(monkeypatch, passthrough=True)
         cancelled_tid, verified_tid = (tid for tid, _mc in chain.links)
@@ -1327,10 +1327,10 @@ class TestRunInflightVerifyChainRedirect:
             await asyncio.Event().wait()
 
         monkeypatch.setattr(
-            'orchestrator.merge_lane.worker.run_post_merge_verify', _verify_until_cancelled,
+            'orchestrator.merge_lane.verify_dispatch.run_post_merge_verify', _verify_until_cancelled,
         )
         in_flight = asyncio.ensure_future(
-            worker._run_inflight_verify(members[cancelled_tid], _local_lease()),
+            worker.verify_dispatch.run_inflight_verify(members[cancelled_tid], _local_lease()),
         )
         await started.wait()
         in_flight.cancel()
@@ -1339,7 +1339,7 @@ class TestRunInflightVerifyChainRedirect:
         assert worker.chain_snapshot() == (), 'a cancelled verify is no verdict'
 
         _spy_post_merge_verify(monkeypatch, outcome=None)
-        await worker._run_inflight_verify(members[verified_tid], _local_lease())
+        await worker.verify_dispatch.run_inflight_verify(members[verified_tid], _local_lease())
         assert worker.chain_snapshot() == (), 'a returned verify is no applied verdict'
 
         unmarked = _make_req('104', '104', config, git_repo, lane='high')
@@ -1356,14 +1356,14 @@ class TestRunInflightVerifyChainRedirect:
         start-up seed (test_merge_lane_chain_policy.py)."""
         _git_ops, worker, item, chain, _head, facts = await self._fixture(git_repo)
         _spy_post_merge_verify(monkeypatch, outcome=_fail_verify_result())
-        await worker._run_inflight_verify(
+        await worker.verify_dispatch.run_inflight_verify(
             item, _local_lease(), chain=chain, dispatch_facts=facts,
         )
 
         placement = await worker._deep_chain_placement(item)
         assert placement == NO_DEEP_PLACEMENT
         _spy_post_merge_verify(monkeypatch, outcome=None)
-        res = await worker._run_inflight_verify(
+        res = await worker.verify_dispatch.run_inflight_verify(
             item, _local_lease(), dispatch_facts=_placed_facts(placement),
         )
         if res.merge_wt is not None:
@@ -1394,18 +1394,18 @@ class TestRunInflightVerifyChainRedirect:
 
         git_ops, worker, item, chain, _head, _facts = await self._fixture(git_repo)
         released = _spy_chain_lane_release(monkeypatch)
-        monkeypatch.setattr(type(worker), 'VERIFY_ABANDON_POLL_SECS', 0.01)
+        monkeypatch.setattr(type(worker.verify_dispatch), 'VERIFY_ABANDON_POLL_SECS', 0.01)
 
         async def _slow_verify(_git_ops, _req, _merge_wt, **_kw):
             await asyncio.sleep(30)
 
         monkeypatch.setattr(
-            'orchestrator.merge_lane.worker.run_post_merge_verify', _slow_verify,
+            'orchestrator.merge_lane.verify_dispatch.run_post_merge_verify', _slow_verify,
         )
         # The sole waiter gives up: this is what _request_abandoned reads.
         item.request.result.cancel()
 
-        res = await worker._run_inflight_verify(item, _local_lease(), chain=chain)
+        res = await worker.verify_dispatch.run_inflight_verify(item, _local_lease(), chain=chain)
 
         assert res.status is InflightStatus.DROPPED
         assert len(released) == 1, (
@@ -1443,7 +1443,7 @@ class TestRunInflightVerifyChainRedirect:
         )
         _spy_post_merge_verify(monkeypatch, raises=RuntimeError('verify exploded'))
 
-        res = await worker._run_inflight_verify(item, _local_lease())
+        res = await worker.verify_dispatch.run_inflight_verify(item, _local_lease())
 
         assert item.request.result.done(), 'no chain: the ordinary terminal path'
         outcome = item.request.result.result()
@@ -1474,7 +1474,7 @@ class TestRunInflightVerifyChainRedirect:
             lambda wt: cleaned.append(wt) or asyncio.sleep(0),
         )
 
-        res = await worker._run_inflight_verify(item, _local_lease(), chain=chain)
+        res = await worker.verify_dispatch.run_inflight_verify(item, _local_lease(), chain=chain)
         return worker, ephemeral, cleaned, res
 
     @pytest.mark.parametrize(('passed', 'raises'), _NON_ADOPTING_ARMS)
@@ -1542,15 +1542,15 @@ class TestRunInflightVerifyChainRedirect:
         lanes = _count_spec_lane_acquires(git_ops, monkeypatch)
         posted = _spy_post_merge_verify(monkeypatch)
         released = _spy_chain_lane_release(monkeypatch)
-        before = worker._verify_attempt_count
+        before = worker.verify_dispatch.verify_attempts()
 
-        res = await worker._run_inflight_verify(item, _local_lease())
+        res = await worker.verify_dispatch.run_inflight_verify(item, _local_lease())
 
         assert lanes == [item.merge_result.merge_commit], (
             'the ordinary path still routes a speculative LOCAL verify through '
             'the warm-swap block into a _spec- lane'
         )
-        assert worker._verify_attempt_count == before + 1
+        assert worker.verify_dispatch.verify_attempts() == before + 1
         assert posted[0]['merge_sha'] == head == item.merge_result.merge_commit
         assert posted[0]['chain_items'] == 1, 'default: a one-item tree'
         assert released == [], 'no chain, nothing to release'
@@ -1630,7 +1630,7 @@ class TestDeepTipVerifyNeverAdopts:
         )
         main_before = await _rev_parse(git_repo, 'main')
 
-        res = await worker._run_inflight_verify(
+        res = await worker.verify_dispatch.run_inflight_verify(
             item, _local_lease(), chain=chain, dispatch_facts=_placed_facts(placement),
         )
 
@@ -1968,10 +1968,10 @@ async def _make_deep_scene(
     scene = _DeepScene(git_ops, config, worker, head, repo, store)
 
     # ── the round recorder, installed ONCE ───────────────────────────────────
-    # Once, not per round: re-wrapping `worker._run_inflight_verify` each round
+    # Once, not per round: re-wrapping `worker.verify_dispatch.run_inflight_verify` each round
     # would capture the PREVIOUS round's recorder as `real` and nest the
     # wrappers one deeper every round.
-    real_verify = worker._run_inflight_verify
+    real_verify = worker.verify_dispatch.run_inflight_verify
 
     async def _recording(_item, _lease, **kwargs):
         rec = dict(kwargs)
@@ -1980,7 +1980,7 @@ async def _make_deep_scene(
         rec['result'] = await real_verify(_item, _lease, **kwargs)
         return rec['result']
 
-    monkeypatch.setattr(worker, '_run_inflight_verify', _recording)
+    monkeypatch.setattr(worker.verify_dispatch, 'run_inflight_verify', _recording)
     scene.built = _spy_build_chain(monkeypatch, passthrough=True)
     scene.released = _spy_chain_lane_release(monkeypatch)
     scene.lanes = _count_spec_lane_acquires(git_ops, monkeypatch)
@@ -1994,7 +1994,7 @@ async def _make_deep_scene(
             return None if passed else MergeOutcome('blocked', reason='Verification failed: red')
 
         monkeypatch.setattr(
-            'orchestrator.merge_lane.worker.run_post_merge_verify', _oracle,
+            'orchestrator.merge_lane.verify_dispatch.run_post_merge_verify', _oracle,
         )
     return scene
 

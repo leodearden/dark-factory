@@ -480,7 +480,7 @@ class TestDispatchDeadBaseRecheck:
         worker._record_dead_base(_DEAD, killer=_KILLER)
         worker._host_allocator = _fake_local_allocator()  # one free local slot
         worker._cleanup_owned_merge_worktree = AsyncMock()  # type: ignore[method-assign]
-        worker._run_inflight_verify = AsyncMock(  # type: ignore[method-assign]
+        worker.verify_dispatch.run_inflight_verify = AsyncMock(
             return_value=InflightVerifyResult(outcome=None, merge_wt=Path('/fake/merge-wt')),
         )
         # _remerge returns a DecidedItem so the post-remerge passthrough returns
@@ -511,7 +511,7 @@ class TestDispatchDeadBaseRecheck:
         remerge.assert_awaited_once()          # re-merged despite _has_inflight_verify True
         # The live head's commit is the tip the replacement is claimed onto.
         assert _remerge_claim(remerge).anchor == RemergeBase('headc', RemergeReason.LIVE_TIP)
-        worker._run_inflight_verify.assert_not_called()  # NO verify burned on the dead base
+        worker.verify_dispatch.run_inflight_verify.assert_not_called()  # NO verify burned on the dead base
         voided = store.speculative_events(EventType.verdict_voided)
         assert len(voided) == 1
         assert voided[0]['data']['dead_link'] == _DEAD
@@ -533,7 +533,7 @@ class TestDispatchDeadBaseRecheck:
         worker._host_allocator = allocator
         worker._cleanup_owned_merge_worktree = AsyncMock()  # type: ignore[method-assign]
         worker._remerge = AsyncMock()  # type: ignore[method-assign]
-        worker._run_inflight_verify = AsyncMock(  # type: ignore[method-assign]
+        worker.verify_dispatch.run_inflight_verify = AsyncMock(
             return_value=InflightVerifyResult(outcome=None, merge_wt=Path('/fake/merge-wt')),
         )
 
@@ -553,7 +553,7 @@ class TestDispatchDeadBaseRecheck:
         await entry.verify_task
 
         worker._remerge.assert_not_awaited()             # intact chain → no remerge
-        worker._run_inflight_verify.assert_called_once()  # verify launched normally
+        worker.verify_dispatch.run_inflight_verify.assert_called_once()  # verify launched normally
         assert store.speculative_events(EventType.verdict_voided) == []
 
 
@@ -662,7 +662,7 @@ class TestCascadeStragglerCaughtComposition:
         worker._abort_remote_verify = AsyncMock()  # type: ignore[method-assign]
         cascade_remerge = _make_remerge_to_decided_stub()
         monkeypatch.setattr(worker, '_remerge', cascade_remerge)
-        worker._run_inflight_verify = AsyncMock(  # type: ignore[method-assign]
+        worker.verify_dispatch.run_inflight_verify = AsyncMock(
             return_value=InflightVerifyResult(outcome=None, merge_wt=Path('/fake/merge-wt')),
         )
 
@@ -718,7 +718,7 @@ class TestCascadeStragglerCaughtComposition:
         # Caught at dispatch: re-merged under a claim, NO verify burned.
         remerge.assert_awaited_once()
         _remerge_claim(remerge)
-        worker._run_inflight_verify.assert_not_called()
+        worker.verify_dispatch.run_inflight_verify.assert_not_called()
         voided = store.speculative_events(EventType.verdict_voided)[voided_before:]
         assert len(voided) == 1
         assert voided[0]['data']['dead_link'] == _DOWN_C
@@ -817,7 +817,7 @@ def _dispatching_worker(
     worker = _make_worker(git_ops, event_store=store)
     worker._host_allocator = _fake_local_allocator()
     monkeypatch.setattr(worker, '_cleanup_owned_merge_worktree', AsyncMock())
-    monkeypatch.setattr(worker, '_run_inflight_verify', AsyncMock(
+    monkeypatch.setattr(worker.verify_dispatch, 'run_inflight_verify', AsyncMock(
         return_value=InflightVerifyResult(outcome=None, merge_wt=Path('/fake/merge-wt')),
     ))
     return worker

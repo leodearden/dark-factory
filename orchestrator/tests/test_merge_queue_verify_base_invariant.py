@@ -473,7 +473,7 @@ class TestDispatchRefreshesLastKnownMainSha:
         assert isinstance(item, RealMergeItem)  # narrow union arm for item.merge_wt (pyright)
 
         worker._host_allocator = _fake_local_allocator()
-        worker._run_inflight_verify = AsyncMock(  # type: ignore[method-assign]
+        worker.verify_dispatch.run_inflight_verify = AsyncMock(
             return_value=InflightVerifyResult(outcome=None, merge_wt=item.merge_wt)
         )
 
@@ -513,7 +513,7 @@ class TestDispatchRefreshesLastKnownMainSha:
         )
         assert isinstance(item, RealMergeItem)  # narrow union arm for item.merge_wt (pyright)
         worker._host_allocator = _fake_local_allocator()
-        worker._run_inflight_verify = AsyncMock(  # type: ignore[method-assign]
+        worker.verify_dispatch.run_inflight_verify = AsyncMock(
             return_value=InflightVerifyResult(outcome=None, merge_wt=item.merge_wt)
         )
 
@@ -547,7 +547,7 @@ class TestDispatchRefreshesLastKnownMainSha:
         )
         assert isinstance(item, RealMergeItem)  # narrow union arm for item.merge_wt (pyright)
         worker._host_allocator = _fake_local_allocator()
-        worker._run_inflight_verify = AsyncMock(  # type: ignore[method-assign]
+        worker.verify_dispatch.run_inflight_verify = AsyncMock(
             return_value=InflightVerifyResult(outcome=None, merge_wt=item.merge_wt)
         )
 
@@ -667,7 +667,7 @@ class TestAdvisoryContractRegressionPins:
 
         allocator = _fake_local_allocator()
         worker._host_allocator = allocator
-        worker._run_inflight_verify = AsyncMock(  # type: ignore[method-assign]
+        worker.verify_dispatch.run_inflight_verify = AsyncMock(
             return_value=InflightVerifyResult(outcome=None, merge_wt=item.merge_wt)
         )
 
@@ -710,7 +710,7 @@ class TestAdvisoryContractRegressionPins:
         )
         assert isinstance(item, RealMergeItem)
         worker._host_allocator = _fake_local_allocator()
-        worker._run_inflight_verify = AsyncMock(  # type: ignore[method-assign]
+        worker.verify_dispatch.run_inflight_verify = AsyncMock(
             return_value=InflightVerifyResult(outcome=None, merge_wt=item.merge_wt)
         )
 
@@ -755,7 +755,7 @@ class TestAdvisoryContractRegressionPins:
         assert isinstance(item, RealMergeItem)
         allocator = _fake_local_allocator()
         worker._host_allocator = allocator
-        worker._run_inflight_verify = AsyncMock(  # type: ignore[method-assign]
+        worker.verify_dispatch.run_inflight_verify = AsyncMock(
             return_value=InflightVerifyResult(outcome=None, merge_wt=item.merge_wt)
         )
 
@@ -796,7 +796,7 @@ class TestAdvisoryContractRegressionPins:
         )
         assert isinstance(item, RealMergeItem)
         worker._host_allocator = _fake_local_allocator()
-        worker._run_inflight_verify = AsyncMock(  # type: ignore[method-assign]
+        worker.verify_dispatch.run_inflight_verify = AsyncMock(
             return_value=InflightVerifyResult(outcome=None, merge_wt=item.merge_wt)
         )
 
@@ -829,7 +829,7 @@ async def _straggler_dispatch(
     worker = _make_worker(git_ops)
     worker._host_allocator = _fake_local_allocator()
     monkeypatch.setattr(worker, '_cleanup_owned_merge_worktree', AsyncMock())
-    monkeypatch.setattr(worker, '_run_inflight_verify', AsyncMock(
+    monkeypatch.setattr(worker.verify_dispatch, 'run_inflight_verify', AsyncMock(
         return_value=InflightVerifyResult(outcome=None, merge_wt=Path('/fake/merge-wt')),
     ))
     _, tip_item = await _make_merged_item(git_ops, config, 'task/vb-tip', 'vb_tip.py', 't=1\n')

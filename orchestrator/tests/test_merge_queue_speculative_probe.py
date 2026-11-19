@@ -997,7 +997,7 @@ class TestDispatchItemProbeWiring:
             captured['probe_base'] = probe_base
             return InflightVerifyResult(outcome=None, merge_wt=item.merge_wt)
 
-        worker._run_inflight_verify = _fake_run_inflight_verify
+        worker.verify_dispatch.run_inflight_verify = _fake_run_inflight_verify
         config = _make_probe_config(probe_fraction=0.0)
         item = _make_dispatch_ready_item(
             config=config, merge_wt=tmp_path, merge_commit='c-dispatch',
@@ -1038,7 +1038,7 @@ class TestDispatchItemProbeWiring:
             captured['probe_base'] = probe_base
             return InflightVerifyResult(outcome=None, merge_wt=item.merge_wt)
 
-        worker._run_inflight_verify = _fake_run_inflight_verify
+        worker.verify_dispatch.run_inflight_verify = _fake_run_inflight_verify
         config = _make_probe_config(probe_fraction=1.0, probe_depths=[2])
         item = _make_dispatch_ready_item(
             config=config, merge_wt=tmp_path, merge_commit='c-dispatch',
@@ -1103,10 +1103,10 @@ class TestRunInflightVerifyProbeBaseWiring:
         worker = SpeculativeMergeWorker(git_ops=MagicMock(), queue=asyncio.Queue())
 
         with patch(
-            'orchestrator.merge_lane.worker.run_post_merge_verify',
+            'orchestrator.merge_lane.verify_dispatch.run_post_merge_verify',
             _fake_run_post_merge_verify,
         ):
-            await worker._run_inflight_verify(
+            await worker.verify_dispatch.run_inflight_verify(
                 item, lease, depth=2, probe_base='deep-tip-commit',  # RED: no probe_base kwarg yet
             )
 
@@ -1154,9 +1154,9 @@ class TestRunInflightVerifyProbeBaseWiring:
         worker = SpeculativeMergeWorker(git_ops=MagicMock(), queue=asyncio.Queue())
 
         with patch(
-            'orchestrator.merge_lane.worker.run_post_merge_verify',
+            'orchestrator.merge_lane.verify_dispatch.run_post_merge_verify',
             _fake_run_post_merge_verify,
         ):
-            await worker._run_inflight_verify(item, lease, depth=1)
+            await worker.verify_dispatch.run_inflight_verify(item, lease, depth=1)
 
         assert captured.get('main_sha') == 'items-own-base-sha'

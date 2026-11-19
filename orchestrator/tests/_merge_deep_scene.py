@@ -552,7 +552,7 @@ def _spy_post_merge_verify(monkeypatch, outcome=None, *, raises=None) -> list[di
         return outcome
 
     monkeypatch.setattr(
-        'orchestrator.merge_lane.worker.run_post_merge_verify', _recording,
+        'orchestrator.merge_lane.verify_dispatch.run_post_merge_verify', _recording,
     )
     return calls
 
@@ -591,6 +591,9 @@ def _spy_chain_lane_release(monkeypatch) -> list[tuple]:
 
     monkeypatch.setattr(
         'orchestrator.merge_lane.worker.release_chain_build_lane', _recording,
+    )
+    monkeypatch.setattr(
+        'orchestrator.merge_lane.inflight_verify.release_chain_build_lane', _recording,
     )
     return calls
 

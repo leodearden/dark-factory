@@ -642,10 +642,10 @@ class TestRunInflightVerifyHappyPath:
         fake_local.is_local = True
         lease = HostLease(name='local', runner=fake_local, is_local=True)
 
-        count_before = worker._verify_attempt_count
-        result = await worker._run_inflight_verify(item, lease)  # RED: method doesn't exist
+        count_before = worker.verify_dispatch.verify_attempts()
+        result = await worker.verify_dispatch.run_inflight_verify(item, lease)  # RED: method doesn't exist
 
-        assert worker._verify_attempt_count == count_before + 1
+        assert worker.verify_dispatch.verify_attempts() == count_before + 1
         assert result.outcome is None  # pass
 
     async def test_local_lease_verify_phase_set_to_verifying(
@@ -663,7 +663,7 @@ class TestRunInflightVerifyHappyPath:
         lease = HostLease(name='local', runner=fake_local, is_local=True)
 
 
-        result = await worker._run_inflight_verify(item, lease)
+        result = await worker.verify_dispatch.run_inflight_verify(item, lease)
 
         # After completion result.outcome is None (pass)
         assert result.outcome is None
@@ -684,11 +684,11 @@ class TestRunInflightVerifyHappyPath:
         fake_remote = _make_fake_remote('laptop')
         lease = HostLease(name='laptop', runner=fake_remote, is_local=False)
 
-        count_before = worker._verify_attempt_count
-        result = await worker._run_inflight_verify(item, lease)  # RED: method doesn't exist
+        count_before = worker.verify_dispatch.verify_attempts()
+        result = await worker.verify_dispatch.run_inflight_verify(item, lease)  # RED: method doesn't exist
 
         # REMOTE path: warm-swap NOT run → attempt count unchanged
-        assert worker._verify_attempt_count == count_before
+        assert worker.verify_dispatch.verify_attempts() == count_before
         # runner.run_merge_verify called (remote dispatch path)
         fake_remote.run_merge_verify.assert_called_once()
         # outcome is None (pass)
@@ -707,7 +707,7 @@ class TestRunInflightVerifyHappyPath:
         fake_remote = _make_fake_remote('laptop2')
         lease = HostLease(name='laptop2', runner=fake_remote, is_local=False)
 
-        result = await worker._run_inflight_verify(item, lease)
+        result = await worker.verify_dispatch.run_inflight_verify(item, lease)
 
         assert result.merge_wt is not None
 
@@ -784,13 +784,13 @@ class TestRunInflightVerifyAbortPoll:
         )
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, q)
-        worker.VERIFY_ABANDON_POLL_SECS = 0.02  # fast polling for tests
+        worker.verify_dispatch.VERIFY_ABANDON_POLL_SECS = 0.02  # fast polling for tests
         worker._register_owned_merge_worktree(item.merge_wt)
 
         lease = HostLease(name='slow-abandon', runner=gated, is_local=False)
 
         # Start verify in background (gated runner blocks until gate_release)
-        verify_future = asyncio.ensure_future(worker._run_inflight_verify(item, lease))
+        verify_future = asyncio.ensure_future(worker.verify_dispatch.run_inflight_verify(item, lease))
 
         # Wait for the gated runner to enter
         await asyncio.wait_for(gate_entered.wait(), timeout=GATE_ENTRY_TIMEOUT)
@@ -799,7 +799,7 @@ class TestRunInflightVerifyAbortPoll:
         req.result.cancel()
 
         # Give poll loop a chance to fire (step-6: will not detect — no loop)
-        await asyncio.sleep(worker.VERIFY_ABANDON_POLL_SECS * 2)
+        await asyncio.sleep(worker.verify_dispatch.VERIFY_ABANDON_POLL_SECS * 2)
 
         # Release gate so RED case doesn't hang
         gate_release.set()
@@ -825,15 +825,15 @@ class TestRunInflightVerifyAbortPoll:
         )
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, q)
-        worker.VERIFY_ABANDON_POLL_SECS = 0.02
+        worker.verify_dispatch.VERIFY_ABANDON_POLL_SECS = 0.02
         worker._register_owned_merge_worktree(item.merge_wt)
 
         lease = HostLease(name='slow-wt', runner=gated, is_local=False)
 
-        verify_future = asyncio.ensure_future(worker._run_inflight_verify(item, lease))
+        verify_future = asyncio.ensure_future(worker.verify_dispatch.run_inflight_verify(item, lease))
         await asyncio.wait_for(gate_entered.wait(), timeout=GATE_ENTRY_TIMEOUT)
         req.result.cancel()
-        await asyncio.sleep(worker.VERIFY_ABANDON_POLL_SECS * 2)
+        await asyncio.sleep(worker.verify_dispatch.VERIFY_ABANDON_POLL_SECS * 2)
         gate_release.set()
 
         result = await verify_future
@@ -861,17 +861,17 @@ class TestRunInflightVerifyAbortPoll:
         )
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, q)
-        worker.VERIFY_ABANDON_POLL_SECS = 0.02
+        worker.verify_dispatch.VERIFY_ABANDON_POLL_SECS = 0.02
         worker._register_owned_merge_worktree(item.merge_wt)
 
         lease = HostLease(name='slow-halt', runner=gated, is_local=False)
 
-        verify_future = asyncio.ensure_future(worker._run_inflight_verify(item, lease))
+        verify_future = asyncio.ensure_future(worker.verify_dispatch.run_inflight_verify(item, lease))
         await asyncio.wait_for(gate_entered.wait(), timeout=GATE_ENTRY_TIMEOUT)
 
         worker.operator_halt('test: halt mid-verify')
 
-        await asyncio.sleep(worker.VERIFY_ABANDON_POLL_SECS * 2)
+        await asyncio.sleep(worker.verify_dispatch.VERIFY_ABANDON_POLL_SECS * 2)
         # Release gate so RED case doesn't hang
         gate_release.set()
 
@@ -896,16 +896,16 @@ class TestRunInflightVerifyAbortPoll:
         )
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, q)
-        worker.VERIFY_ABANDON_POLL_SECS = 0.02
+        worker.verify_dispatch.VERIFY_ABANDON_POLL_SECS = 0.02
         worker._register_owned_merge_worktree(item.merge_wt)
 
         lease = HostLease(name='slow-halt2', runner=gated, is_local=False)
 
-        verify_future = asyncio.ensure_future(worker._run_inflight_verify(item, lease))
+        verify_future = asyncio.ensure_future(worker.verify_dispatch.run_inflight_verify(item, lease))
         await asyncio.wait_for(gate_entered.wait(), timeout=GATE_ENTRY_TIMEOUT)
 
         worker.operator_halt('test: halt mid-verify')
-        await asyncio.sleep(worker.VERIFY_ABANDON_POLL_SECS * 2)
+        await asyncio.sleep(worker.verify_dispatch.VERIFY_ABANDON_POLL_SECS * 2)
         gate_release.set()
 
         await verify_future
@@ -992,7 +992,7 @@ class TestRunInflightVerifyRunnerUnavailable:
         lease = HostLease(name='dead-laptop', runner=dead_remote, is_local=False)
 
         # Should not raise — RunnerUnavailable is caught internally
-        result = await worker._run_inflight_verify(item, lease)
+        result = await worker.verify_dispatch.run_inflight_verify(item, lease)
 
         # GREEN: status sentinel set, merge_wt preserved for re-dispatch
         # RED: status=None (generic except catches RunnerUnavailable)
@@ -1019,7 +1019,7 @@ class TestRunInflightVerifyRunnerUnavailable:
 
         lease = HostLease(name='dead-laptop2', runner=dead_remote, is_local=False)
 
-        result = await worker._run_inflight_verify(item, lease)
+        result = await worker.verify_dispatch.run_inflight_verify(item, lease)
 
         # GREEN: merge_wt intact — item re-dispatched on another host with wt intact
         # RED: merge_wt=None (generic exception handler cleans it)
@@ -2653,7 +2653,7 @@ class TestHaltAndUnavailable:
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, q, verifier=verifier)
         _inject_two_host_allocator(worker, gated_remote)
-        worker.VERIFY_ABANDON_POLL_SECS = 0.01  # fast abort-poll for determinism
+        worker.verify_dispatch.VERIFY_ABANDON_POLL_SECS = 0.01  # fast abort-poll for determinism
 
         loop = asyncio.get_running_loop()
         req_a = MergeRequest(
@@ -3613,7 +3613,7 @@ class TestRunInflightVerifyRemoteCancelOnAbort:
         )
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, q)
-        worker.VERIFY_ABANDON_POLL_SECS = 0.02
+        worker.verify_dispatch.VERIFY_ABANDON_POLL_SECS = 0.02
         worker._register_owned_merge_worktree(item.merge_wt)
 
         lease = HostLease(name='rca-abandon', runner=gated, is_local=False)
@@ -3626,7 +3626,7 @@ class TestRunInflightVerifyRemoteCancelOnAbort:
             return 0
         gated.cancel_verify = AsyncMock(side_effect=_signaling_cancel)
 
-        verify_future = asyncio.ensure_future(worker._run_inflight_verify(item, lease))
+        verify_future = asyncio.ensure_future(worker.verify_dispatch.run_inflight_verify(item, lease))
 
         # Wait for the gated runner to enter verify
         await asyncio.wait_for(gate_entered.wait(), timeout=5.0)
@@ -3674,7 +3674,7 @@ class TestRunInflightVerifyRemoteCancelOnAbort:
         )
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, q)
-        worker.VERIFY_ABANDON_POLL_SECS = 0.02
+        worker.verify_dispatch.VERIFY_ABANDON_POLL_SECS = 0.02
         worker._register_owned_merge_worktree(item.merge_wt)
 
         lease = HostLease(name='rca-halt', runner=gated, is_local=False)
@@ -3691,7 +3691,7 @@ class TestRunInflightVerifyRemoteCancelOnAbort:
 
         gated.cancel_verify = AsyncMock(side_effect=_record_cancel)
 
-        verify_future = asyncio.ensure_future(worker._run_inflight_verify(item, lease))
+        verify_future = asyncio.ensure_future(worker.verify_dispatch.run_inflight_verify(item, lease))
         await asyncio.wait_for(gate_entered.wait(), timeout=5.0)
 
         worker.operator_halt('test: halt mid-verify')
@@ -3749,7 +3749,7 @@ class TestRunInflightVerifyRemoteCancelOnAbort:
         )
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, q, verifier=verifier)
-        worker.VERIFY_ABANDON_POLL_SECS = 0.02
+        worker.verify_dispatch.VERIFY_ABANDON_POLL_SECS = 0.02
         worker._register_owned_merge_worktree(item.merge_wt)
 
         # LOCAL lease — runner is a MagicMock that has cancel_verify as AsyncMock
@@ -3759,7 +3759,7 @@ class TestRunInflightVerifyRemoteCancelOnAbort:
         lease = HostLease(name='local', runner=mock_runner, is_local=True)
 
         verify_future = asyncio.ensure_future(
-            worker._run_inflight_verify(item, lease)
+            worker.verify_dispatch.run_inflight_verify(item, lease)
         )
         await asyncio.wait_for(gate_entered.wait(), timeout=GATE_ENTRY_TIMEOUT)
 

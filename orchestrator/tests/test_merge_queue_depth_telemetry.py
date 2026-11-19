@@ -359,7 +359,7 @@ class TestRunInflightVerifyDepthWiring:
             verifier=FakeVerifier(),
         )
 
-        await worker._run_inflight_verify(item, lease, depth=2)
+        await worker.verify_dispatch.run_inflight_verify(item, lease, depth=2)
 
         (event,) = es.events_of(EventType.merge_verify)
         assert event['data']['depth'] == 2
@@ -390,7 +390,7 @@ class TestRunInflightVerifyChainItemsWiring:
             verifier=FakeVerifier(),
         )
 
-        await worker._run_inflight_verify(item, lease, **verify_kwargs)
+        await worker.verify_dispatch.run_inflight_verify(item, lease, **verify_kwargs)
 
         (event,) = es.events_of(EventType.merge_verify)
         return event['data']
@@ -460,7 +460,7 @@ class TestDispatchItemComputesTruthfulChainItems:
                 outcome=None, merge_wt=None, status=InflightStatus.REQUEUED,
             )
 
-        worker._run_inflight_verify = _fake_run_inflight_verify  # type: ignore[method-assign]
+        worker.verify_dispatch.run_inflight_verify = _fake_run_inflight_verify
         lease = HostLease(name='laptop', runner=_fake_pass_runner(), is_local=False)
         worker._acquire_host_lease_for = AsyncMock(  # type: ignore[method-assign]
             return_value=(lease, None),

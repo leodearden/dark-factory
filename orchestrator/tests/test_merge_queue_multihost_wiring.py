@@ -1648,7 +1648,7 @@ class TestRunInflightVerifyRunnerUnavailableSpecWarm:
         fake_local = runner_double('local', is_local=True)
         lease = HostLease(name='local', runner=fake_local, is_local=True)
 
-        result = await worker._run_inflight_verify(item, lease)
+        result = await worker.verify_dispatch.run_inflight_verify(item, lease)
 
         assert result.status == 'RUNNER_UNAVAILABLE'
         assert result.merge_wt == lane, 'the warm lane is the worktree handed to the chokepoint'
@@ -1683,7 +1683,7 @@ class TestRunInflightVerifyRunnerUnavailableSpecWarm:
         )
         lease = HostLease(name='leo-laptop', runner=fake_runner, is_local=False)
 
-        result = await worker._run_inflight_verify(item, lease)
+        result = await worker.verify_dispatch.run_inflight_verify(item, lease)
 
         assert result.status == 'RUNNER_UNAVAILABLE'
         assert result.merge_wt == cold_wt
@@ -1743,7 +1743,7 @@ class TestRunInflightVerifyThreadsEscalationQueue:
         )
         lease = HostLease(name='leo-laptop', runner=fake_runner, is_local=False)
 
-        await worker._run_inflight_verify(item, lease)
+        await worker.verify_dispatch.run_inflight_verify(item, lease)
 
         assert len(worker_eq.submitted) == 1, (
             '_run_inflight_verify must pass escalation_queue=self._escalation_queue '
@@ -4495,7 +4495,7 @@ class TestRunInflightVerifyNeverOrphansVerifyTask:
             git_ops=git_ops, queue=q,
             verifier=verifier if verifier is not None else FakeVerifier(),
         )
-        worker.VERIFY_ABANDON_POLL_SECS = 0.01
+        worker.verify_dispatch.VERIFY_ABANDON_POLL_SECS = 0.01
 
         merge_result = MagicMock()
         merge_result.merge_commit = 'abc123def456789abc1'
@@ -4565,7 +4565,7 @@ class TestRunInflightVerifyNeverOrphansVerifyTask:
 
         if dispatched is None:
             dispatched = getattr(lease.runner, 'entered', [])
-        outer = asyncio.ensure_future(worker._run_inflight_verify(item, lease))
+        outer = asyncio.ensure_future(worker.verify_dispatch.run_inflight_verify(item, lease))
         for _ in range(200):
             await asyncio.sleep(0.01)
             if dispatched or worker._host_quarantine.quarantined_hosts():
@@ -4731,7 +4731,7 @@ class TestRunInflightVerifyNeverOrphansVerifyTask:
             raise RunnerUnavailable(_INCIDENT_RU_MSG)
 
         worker, item = self._make_worker_and_item(tmp_path)
-        result = await worker._run_inflight_verify(
+        result = await worker.verify_dispatch.run_inflight_verify(
             item, self._remote_lease(on_verify=_unavailable),
         )
 
@@ -4753,7 +4753,7 @@ class TestRunInflightVerifyNeverOrphansVerifyTask:
             raise RunnerUnavailable(_INCIDENT_RU_MSG)
 
         worker, item = self._make_worker_and_item(tmp_path)
-        await worker._run_inflight_verify(
+        await worker.verify_dispatch.run_inflight_verify(
             item, self._remote_lease(on_verify=_unavailable),
         )
 
@@ -4897,12 +4897,12 @@ class TestOrphanGuardPreservesCancellation:
                 raise
 
         worker, item = self._make_worker_and_item(tmp_path)
-        worker.ORPHAN_REAP_TIMEOUT_SECS = 0.05
+        worker.verify_dispatch.ORPHAN_REAP_TIMEOUT_SECS = 0.05
         lease = self._remote_lease(on_verify=_unkillable)
         started = lease.runner.entered
 
         try:
-            outer = asyncio.ensure_future(worker._run_inflight_verify(item, lease))
+            outer = asyncio.ensure_future(worker.verify_dispatch.run_inflight_verify(item, lease))
             for _ in range(200):
                 await asyncio.sleep(0.01)
                 if started:
@@ -4943,14 +4943,14 @@ class TestOrphanGuardPreservesCancellation:
                 raise
 
         worker, item = self._make_worker_and_item(tmp_path)
-        worker.ORPHAN_REAP_TIMEOUT_SECS = 0.05
+        worker.verify_dispatch.ORPHAN_REAP_TIMEOUT_SECS = 0.05
         lease = self._remote_lease(on_verify=_unkillable)
         started = lease.runner.entered
 
         try:
             with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
                 outer = asyncio.ensure_future(
-                    worker._run_inflight_verify(item, lease)
+                    worker.verify_dispatch.run_inflight_verify(item, lease)
                 )
                 for _ in range(200):
                     await asyncio.sleep(0.01)

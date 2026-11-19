@@ -772,8 +772,8 @@ class TestRunInflightVerifyPassesAutoHealCallback:
         spy = AsyncMock(return_value=None)
 
         async def _run() -> None:
-            with patch('orchestrator.merge_lane.worker.run_post_merge_verify', new=spy):
-                await worker._run_inflight_verify(item, lease)
+            with patch('orchestrator.merge_lane.verify_dispatch.run_post_merge_verify', new=spy):
+                await worker.verify_dispatch.run_inflight_verify(item, lease)
 
         asyncio.run(_run())
 

@@ -51,12 +51,12 @@ from orchestrator.merge_lane import (
     QueuedBranch,
 )
 from orchestrator.merge_lane import ports as lane_ports
+from orchestrator.merge_lane.inflight_verify import resolve_dispatch_time_merge_base
 from orchestrator.merge_lane.ports import escalation_port
 from orchestrator.merge_lane.worker import (
     PRODUCTION_CLOCK,
     PRODUCTION_VERIFIER,
     SpeculativeMergeWorker,
-    resolve_dispatch_time_merge_base,
 )
 from orchestrator.verify import VerifyResult
 

@@ -284,6 +284,10 @@ class FakeVerifier:
             self._entry_bell.clear()
             await self._entry_bell.wait()
 
+    def then(self, *scripts: VerifyScript) -> None:
+        """Queue *scripts* to run next, in order, ahead of the per-task and default scripts."""
+        self._ordered.extend(scripts)
+
     def next_script(self, task_id: str | None) -> VerifyScript:
         """The script the current ``run_scoped`` call for *task_id* follows.
 

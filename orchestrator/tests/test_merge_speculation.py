@@ -99,11 +99,9 @@ from orchestrator.merge_lane.disposition import (
     classify_merge_failure_disposition,
 )
 from orchestrator.merge_lane.landed_outbox import LandedOutbox
+from orchestrator.merge_lane.liveness import _acquire_warm_verify_worktree
 from orchestrator.merge_lane.shadow import _submit_shadow_divergence_escalation  # noqa: F401
-from orchestrator.merge_lane.worker import (
-    MergeRequest,
-    _acquire_warm_verify_worktree,
-)
+from orchestrator.merge_lane.worker import MergeRequest
 from orchestrator.verify import VerifyResult
 from orchestrator.warm_lane_pool import LaneState, WarmLanePool  # noqa: F401
 
@@ -1108,7 +1106,7 @@ class TestSpecLaneAbortReleasesLane:
             # The abort-poll ticks at VERIFY_ABANDON_POLL_SECS (a public class
             # attribute production documents as the tests' knob), so shorten it
             # rather than waiting ten seconds for the next tick.
-            lane.VERIFY_ABANDON_POLL_SECS = 0.01
+            lane.verify_dispatch.VERIFY_ABANDON_POLL_SECS = 0.01
             req_b.result.cancel()
             pool = git_ops.spec_warm_lane_pool
             assert pool is not None
@@ -1142,7 +1140,7 @@ class TestSpecLaneAbortReleasesLane:
         )
 
         async def _halt(lane: MergeLane, req_b: MergeRequest) -> None:
-            lane.VERIFY_ABANDON_POLL_SECS = 0.01
+            lane.verify_dispatch.VERIFY_ABANDON_POLL_SECS = 0.01
             lane.operator_halt('spec-lane abort scenario')
             pool = git_ops.spec_warm_lane_pool
             assert pool is not None

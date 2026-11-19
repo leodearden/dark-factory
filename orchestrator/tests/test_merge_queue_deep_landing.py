@@ -603,7 +603,7 @@ class TestTipPassAdoptionSignal:
 
         releases = _spy_chain_lane_release(monkeypatch)
 
-        res = await worker._run_inflight_verify(item, _local_lease(), chain=chain)
+        res = await worker.verify_dispatch.run_inflight_verify(item, _local_lease(), chain=chain)
         return git_ops, worker, item, chain, res, store, queued, releases
 
     async def test_tip_pass_returns_an_adopting_result(
@@ -721,7 +721,7 @@ class TestTipPassAdoptionSignal:
         chain = placement.chain
         assert chain is not None and len(chain.links) == 2
 
-        await worker._run_inflight_verify(
+        await worker.verify_dispatch.run_inflight_verify(
             item, _local_lease(), chain=chain, dispatch_facts=_placed_facts(placement),
         )
 
@@ -923,7 +923,7 @@ async def _prefix_scene_upto_finalize(
     # genuine `--no-ff` merge of the branch it names.
     adv = _spy_advance_main(git_ops, monkeypatch, hook=advance_hook)
 
-    res = await worker._run_inflight_verify(
+    res = await worker.verify_dispatch.run_inflight_verify(
         item, _local_lease(), chain=chain, dispatch_facts=_placed_facts(placement),
     )
     done: asyncio.Future = asyncio.get_running_loop().create_future()
@@ -1869,7 +1869,7 @@ async def _adopt_and_land(s: dict) -> dict:
     from orchestrator.merge_lane.types import InflightEntry
 
     worker = s['worker']
-    res = await worker._run_inflight_verify(
+    res = await worker.verify_dispatch.run_inflight_verify(
         s['spec_item'], _local_lease(), chain=s['chain'],
     )
     s['verify_result'] = res
@@ -1982,7 +1982,7 @@ class TestHeadCancelOnAdoption:
         monkeypatch.setattr(worker, '_teardown_verify_task', _td)
         monkeypatch.setattr(worker, '_cancel_and_release_tracked', _cr)
 
-        await worker._run_inflight_verify(
+        await worker.verify_dispatch.run_inflight_verify(
             s['spec_item'], _local_lease(), chain=s['chain'],
         )
 
@@ -2010,7 +2010,7 @@ class TestHeadCancelOnAdoption:
             head_task_factory=lambda _go: _head_verify_task(order),
         )
 
-        await s['worker']._run_inflight_verify(
+        await s['worker'].verify_dispatch.run_inflight_verify(
             s['spec_item'], _local_lease(), chain=s['chain'],
         )
 
@@ -2034,7 +2034,7 @@ class TestHeadCancelOnAdoption:
         worker = s['worker']
         assert worker._finalizing_head_entry() is s['head_entry']
 
-        await worker._run_inflight_verify(
+        await worker.verify_dispatch.run_inflight_verify(
             s['spec_item'], _local_lease(), chain=s['chain'],
         )
 
@@ -2370,7 +2370,7 @@ class TestHeadCancelLeavesTheLaneIdle:
         assert git_ops._merge_verify_lease_active() is True
         assert os.getpid() in lane_lock_holder_pids_strict(lock_path)
 
-        await s['worker']._run_inflight_verify(
+        await s['worker'].verify_dispatch.run_inflight_verify(
             s['spec_item'], _local_lease(), chain=s['chain'],
         )
 
@@ -2468,7 +2468,7 @@ async def _adopted_warm_head_scene(
 
     async def _real_head_verify(scene: dict):
         task = asyncio.ensure_future(
-            scene['worker']._run_inflight_verify(
+            scene['worker'].verify_dispatch.run_inflight_verify(
                 scene['head_item'], scene['head_lease'],
                 verify_wt=scene['head_entry'].verify_wt,
             )
@@ -2519,7 +2519,7 @@ async def _adopt_head_only(
     rebased head parks on its gate re-verify.
     """
     worker = s['worker']
-    s['verify_result'] = await worker._run_inflight_verify(
+    s['verify_result'] = await worker.verify_dispatch.run_inflight_verify(
         s['spec_item'], _local_lease(), chain=s['chain'],
     )
     s['head_advanced'] = await asyncio.wait_for(
@@ -3423,7 +3423,7 @@ async def _make_delta_scene(
     # The round recorder, installed ONCE — re-wrapping per round would capture
     # the previous round's recorder as `real` and nest a wrapper deeper each
     # round (γ's note at test_merge_queue_deep_dispatch.py:2398-2401).
-    real_verify = worker._run_inflight_verify
+    real_verify = worker.verify_dispatch.run_inflight_verify
 
     async def _recording(_item, _lease, **kwargs):
         rec = dict(kwargs)
@@ -3431,7 +3431,7 @@ async def _make_delta_scene(
         rec['result'] = await real_verify(_item, _lease, **kwargs)
         return rec['result']
 
-    monkeypatch.setattr(worker, '_run_inflight_verify', _recording)
+    monkeypatch.setattr(worker.verify_dispatch, 'run_inflight_verify', _recording)
     scene.lane_releases = _spy_chain_lane_release(monkeypatch)
 
     real_build = merge_queue.build_chain

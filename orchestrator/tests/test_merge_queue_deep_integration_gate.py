@@ -2015,7 +2015,7 @@ async def _make_gate_scene(
     *remote* / *real_local* select WHERE the verdict is injected — three
     mutually exclusive seams, deepest last:
 
-      * neither — replace ``orchestrator.merge_lane.worker.run_post_merge_verify``
+      * neither — replace ``orchestrator.merge_lane.verify_dispatch.run_post_merge_verify``
         outright (δ's shape).  Cheapest, and the right seam for a row whose
         claim is about LANDING or about queue state.  No ``merge_verify`` event
         is emitted on this path.  NOTE its red is a raw
@@ -2125,7 +2125,7 @@ async def _make_gate_scene(
     # The round recorder, installed ONCE — re-wrapping per round would capture
     # the previous round's recorder as `real` and nest a wrapper deeper each
     # round.
-    real_verify = worker._run_inflight_verify
+    real_verify = worker.verify_dispatch.run_inflight_verify
 
     async def _recording(_item, _lease, **kwargs):
         rec = dict(kwargs)
@@ -2133,7 +2133,7 @@ async def _make_gate_scene(
         rec['result'] = await real_verify(_item, _lease, **kwargs)
         return rec['result']
 
-    monkeypatch.setattr(worker, '_run_inflight_verify', _recording)
+    monkeypatch.setattr(worker.verify_dispatch, 'run_inflight_verify', _recording)
     scene.lane_acquires = _spy_spec_lane_acquire(git_ops, monkeypatch)
     scene.lane_releases = _spy_chain_lane_release(monkeypatch)
     scene.advance_calls = _spy_advance_main(git_ops, monkeypatch, hook=advance_hook)
@@ -2182,7 +2182,7 @@ async def _make_gate_scene(
             return None if passed else _fail_verify_result()
 
         monkeypatch.setattr(
-            'orchestrator.merge_lane.worker.run_post_merge_verify', _oracle,
+            'orchestrator.merge_lane.verify_dispatch.run_post_merge_verify', _oracle,
         )
     return scene
 

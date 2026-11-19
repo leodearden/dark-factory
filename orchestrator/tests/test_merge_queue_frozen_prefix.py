@@ -299,7 +299,7 @@ async def _dispatch(
 
     with (
         mock.patch.object(git_ops, 'get_main_sha', side_effect=get_main_sha),
-        mock.patch.object(worker, '_run_inflight_verify', _noop_verify),
+        mock.patch.object(worker.verify_dispatch, 'run_inflight_verify', _noop_verify),
     ):
         return await worker._dispatch_item(item)
 

@@ -369,7 +369,7 @@ async def _finalize_via_real_worker(
     entry = InflightEntry(
         item=item,
         lease=lease,
-        verify_task=asyncio.ensure_future(worker._run_inflight_verify(item, lease)),
+        verify_task=asyncio.ensure_future(worker.verify_dispatch.run_inflight_verify(item, lease)),
         merge_wt=None,
         was_speculative=False,
     )
@@ -412,7 +412,7 @@ def _assert_evidence_bounded(data: dict) -> None:
 
 class TestFirstAttemptSkewFailureDiagnostic:
     """A first-attempt integration-skew failure — driven through the REAL
-    SpeculativeMergeWorker._run_inflight_verify — must surface disposition
+    VerifyDispatcher.run_inflight_verify — must surface disposition
     and failure_diagnostic on the delivered MergeOutcome verbatim.  This is
     exactly what the escalation server's merge_request response builder
     (server.py ~1169-1170: ``if outcome.failure_diagnostic is not None:
@@ -433,7 +433,7 @@ class TestFirstAttemptSkewFailureDiagnostic:
                 tmp_path, repo, topology, future,
                 merged_branch_tip=topology['branch_tip_sha'],
             )
-            result = await worker._run_inflight_verify(item, lease)
+            result = await worker.verify_dispatch.run_inflight_verify(item, lease)
             return result.outcome
 
         outcome = asyncio.run(_run())
@@ -512,7 +512,7 @@ class TestFirstAttemptSkewL1Escalation:
                 tmp_path, repo, topology, future,
                 merged_branch_tip=topology['branch_tip_sha'],
             )
-            vr = await worker._run_inflight_verify(item, lease)
+            vr = await worker.verify_dispatch.run_inflight_verify(item, lease)
             outcome = vr.outcome
             assert outcome is not None
             assert outcome.disposition == MergeFailureDisposition.INTEGRATION_SKEW
@@ -884,7 +884,7 @@ class TestReviewBounceStaleGreenTradeoff:
                 tmp_path, repo, topology, future,
                 merged_branch_tip=topology['post_bounce_sha'],
             )
-            result = await worker._run_inflight_verify(item, lease)
+            result = await worker.verify_dispatch.run_inflight_verify(item, lease)
             return result.outcome
 
         outcome = asyncio.run(_run())
