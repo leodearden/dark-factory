@@ -50,7 +50,10 @@ def verify_prompt(cluster: dict, *, project_root: str, quality_block: str) -> st
     of that scoping, not as a substitute for it.
 
     Asks for an OBSERVATION, never a diagnosis (codebook lesson
-    guards-assert-unverified-diagnoses)."""
+    guards-assert-unverified-diagnoses).
+
+    The opening sentence is restated, lowercased, as
+    ``reingestion.CENSUS_VERIFIER_PROMPT_OPENER``; tests hold the two in step."""
     return (
         "You are the periodic-census verifier for the dark-factory "
         "agent-confusion codebook (plans/confusion-reduction-prd.md "

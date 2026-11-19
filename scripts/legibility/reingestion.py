@@ -200,8 +200,24 @@ TRICKLE_CODER_PROMPT_OPENER: str = 'you are the trickle coder for the dark-facto
 restated rather than imported for the same layering reason as
 :data:`CODER_JUDGMENT_KEYS`."""
 
+CENSUS_VERIFIER_PROMPT_OPENER: str = (
+    'you are the periodic-census verifier for the dark-factory agent-confusion codebook'
+)
+"""The lowercase opening of scripts/legibility/census_verify.py::verify_prompt,
+restated rather than imported for the same layering reason as
+:data:`TRICKLE_CODER_PROMPT_OPENER`."""
+
+CENSUS_SYNTHESIS_PROMPT_OPENER: str = (
+    'you are the periodic-census synthesis writer for the dark-factory agent-confusion codebook'
+)
+"""The lowercase opening of scripts/legibility/census.py::synthesis_prompt,
+restated rather than imported for the same layering reason as
+:data:`TRICKLE_CODER_PROMPT_OPENER`."""
+
 HARNESS_PROMPT_MARKERS: tuple[str, ...] = (
     TRICKLE_CODER_PROMPT_OPENER,
+    CENSUS_VERIFIER_PROMPT_OPENER,
+    CENSUS_SYNTHESIS_PROMPT_OPENER,
     'your previous run was interrupted by a usage limit',
     'you were interrupted by an orchestrator restart',
     'your previous run was stopped at an orchestrator time limit',
@@ -213,6 +229,10 @@ HARNESS_PROMPT_MARKERS: tuple[str, ...] = (
 """Harness-authored PROSE literals, matched as plain case-insensitive
 substrings (unlike the line-anchored heading markers above): the trickle
 coder's system prompt (scripts/legibility/coder.py:174 ``build_prompt``),
+the periodic-census verifier and synthesis prompts
+(``scripts/legibility/census_verify.py::verify_prompt``,
+``scripts/legibility/census.py::synthesis_prompt``), which embed cluster
+JSON quoting other sessions' signal,
 the harness's three resume prompts --
 ``shared.cli_invoke.CAP_HIT_RESUME_PROMPT`` (cap-hit),
 ``shared.cli_invoke.CRASH_RECOVERY_RESUME_PROMPT`` (orchestrator restart) and
@@ -244,9 +264,11 @@ heading interpolates the task.
 Held in lockstep with the canonical sources by
 ``TestHarnessInjectedTurnFilter.test_resume_prompt_is_excluded_lockstep``
 (the three constants),
-``TestHarnessInjectedTurnFilter.test_steward_continuation_prompt_is_excluded_lockstep``
-and ``test_prior_round_adjudicator_prompt_is_excluded_lockstep`` (prompts
-built by the real builders), all in
+``TestHarnessInjectedTurnFilter.test_steward_continuation_prompt_is_excluded_lockstep``,
+``test_prior_round_adjudicator_prompt_is_excluded_lockstep``,
+``test_census_verifier_prompt_is_excluded_lockstep`` and
+``test_census_synthesis_prompt_is_excluded_lockstep`` (prompts built by the
+real builders), all in
 scripts/tests/test_legibility_reingestion.py, which assert
 ``is_harness_injected_turn(<prompt>) is True`` rather than restating the
 literal -- a harness rewording turns them red instead of silently

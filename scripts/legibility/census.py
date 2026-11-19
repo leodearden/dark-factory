@@ -93,7 +93,10 @@ MAIN checkout even when the census runs from a worktree."""
 def synthesis_prompt(brief: synthesis.Brief, *, quality_block: str) -> str:
     """Prompt for the real Fable synthesize_fn: observations on this run's new
     and re-observed findings (*brief*), as the C6 document ``synthesis.parse``
-    validates, judged against *quality_block* (``code_quality.guidance``)."""
+    validates, judged against *quality_block* (``code_quality.guidance``).
+
+    The opening sentence is restated, lowercased, as
+    ``reingestion.CENSUS_SYNTHESIS_PROMPT_OPENER``; tests hold the two in step."""
     return (
         "You are the periodic-census synthesis writer for the dark-factory "
         "agent-confusion codebook (plans/census-incremental-prd.md C6). You have "
