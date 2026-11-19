@@ -12954,11 +12954,11 @@ class TaskWorkflow:
         from orchestrator.merge_lane import (
             MAIN_HEALTH_RED_REASON_PREFIX,
             POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX,
+            TRANSIENT_INFRA_REASON_PREFIX,
         )
         from orchestrator.merge_lane.worker import (
             DROPPED_PLAN_TARGETS_REASON_PREFIX,
             POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
-            TRANSIENT_INFRA_REASON_PREFIX,
         )
         if result.reason.startswith(DROPPED_PLAN_TARGETS_REASON_PREFIX):
             self._write_merge_failure_review('dropped_plan_targets', result.reason)

@@ -1,0 +1,24 @@
+{
+  "task_id": "5040",
+  "reason": "Move, not growth (PRD plans/merge-lane-quality-prd.md task kappa, post-merge slice): the two patch_targets rises restore what the RED commit's measurement could not see. test_merge_boundary_effective_module_configs.py monkeypatches post_merge_verify.effective_merge_module_configs and test_merge_queue_verify_retry.py patch.objects post_merge_verify.VerifyRunnerPool; at RED that module was not on disk, so the ratchet resolved neither receiver and recorded 1 and 3. Against the commit before RED both are unchanged (2 and 4; total 61 -> 61): the same two patches, retargeted from worker.py onto the module that now looks the names up. worker.py lines 19598 -> 17663, cognitive 1806 -> 1614, prose_lines 10414 -> 9399; post_merge_verify.py 775 lines cognitive 40, verify_failure_outcome.py 713/44, verify_cross_check.py 329/17, every new function <= 9.",
+  "measures": [
+    {
+      "measure": "patch_targets",
+      "key": "orchestrator/tests/test_merge_boundary_effective_module_configs.py",
+      "baseline": 1,
+      "current": 2
+    },
+    {
+      "measure": "patch_targets",
+      "key": "orchestrator/tests/test_merge_queue_verify_retry.py",
+      "baseline": 3,
+      "current": 4
+    },
+    {
+      "measure": "total:patch_targets",
+      "key": "<cluster>",
+      "baseline": 61,
+      "current": 63
+    }
+  ]
+}

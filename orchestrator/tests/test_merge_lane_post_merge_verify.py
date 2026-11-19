@@ -16,6 +16,7 @@ from typing import Any
 
 import pytest
 import pytest_asyncio
+from _git_fixtures import seed_repo
 from _merge_lane_fakes import (
     FakeRemoteRunner,
     FakeVerifier,
@@ -27,7 +28,7 @@ from _merge_lane_fakes import (
 )
 
 from orchestrator.config import GitConfig, OrchestratorConfig
-from orchestrator.git_ops import GitOps, _run
+from orchestrator.git_ops import GitOps
 from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
 from orchestrator.merge_lane.types import MergeOutcome, MergeRequest, QueuedBranch
 from orchestrator.verify import VerifyResult
@@ -38,18 +39,6 @@ from orchestrator.verify_runner import (
 )
 
 TASK_ID = 'pmv-1'
-
-
-async def _seed(repo: Path) -> None:
-    for argv in (
-        ['git', 'init', '-b', 'main'],
-        ['git', 'config', 'user.email', 'test@test.com'],
-        ['git', 'config', 'user.name', 'Test'],
-    ):
-        await _run(argv, cwd=repo)
-    (repo / 'README.md').write_text('# Test\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
 
 
 def _git_config() -> GitConfig:
@@ -81,9 +70,7 @@ class _Scene:
 
 @pytest_asyncio.fixture
 async def scene(tmp_path: Path) -> _Scene:
-    repo = tmp_path / 'repo'
-    repo.mkdir()
-    await _seed(repo)
+    repo = seed_repo(tmp_path / 'repo')
     git_ops = GitOps(_git_config(), repo)
     config = OrchestratorConfig(
         project_root=repo, git=_git_config(), escalate_preexisting_main_break=False,

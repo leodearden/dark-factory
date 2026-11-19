@@ -48,15 +48,8 @@ from shared.mcp_post import open_mcp_client, post_mcp_tool_call
 from orchestrator.branch_stack import UnstackOutcome
 from orchestrator.delivered_checks import gate_mark_done_on_delivered_checks
 from orchestrator.deployed_sha import DeployedSha
-from orchestrator.dry_run_unblock import (
-    investigation_in_flight,
-    investigation_task_name,
-    run_dry_run_unblock,
-)
+from orchestrator.dry_run_unblock import run_dry_run_unblock
 from orchestrator.event_store import EventStore, EventType
-from orchestrator.flake_recorder import (
-    record_merge_flake_suppression,
-)
 from orchestrator.git_ops import (
     PERSISTENT_MERGE_WORKTREE_NAME,
     AdvanceOutcome,
@@ -93,8 +86,6 @@ from orchestrator.merge_lane.dead_base_ledger import (
 )
 from orchestrator.merge_lane.disposition import (
     MergeFailureDisposition,
-    SkewEvidence,
-    classify_merge_failure_disposition,
 )
 from orchestrator.merge_lane.drift import _maybe_run_drift_check
 from orchestrator.merge_lane.gates import (
@@ -113,7 +104,6 @@ from orchestrator.merge_lane.gates import (
     _run_unscoped_typechecks,
 )
 from orchestrator.merge_lane.halt import HaltState
-from orchestrator.merge_lane.history_leg import HistoryLegRunner
 from orchestrator.merge_lane.host_quarantine import HostQuarantine
 from orchestrator.merge_lane.intake import (
     MERGE_LANES,
@@ -147,13 +137,11 @@ from orchestrator.merge_lane.lookahead_hold import LookaheadHold
 from orchestrator.merge_lane.main_health_probe import (
     MAIN_HEALTH_RED_REASON_PREFIX,
     MainHealthProbeHandles,
-    classify_main_health_red,
     file_main_health_escalation,
-    spawn_main_health_probe,
 )
 from orchestrator.merge_lane.member_redrive import MemberRedriveOutcome, MemberRedriver
 from orchestrator.merge_lane.no_progress_abort import NoProgressAbort, emit_no_progress_abort
-from orchestrator.merge_lane.outcome_facts import ConflictEvidence, MergeBlockCategory
+from orchestrator.merge_lane.outcome_facts import ConflictEvidence
 from orchestrator.merge_lane.ports import (
     ClockPort,
     ContainmentPredicate,
@@ -162,6 +150,10 @@ from orchestrator.merge_lane.ports import (
     ProductionVerifier,
     VerifyPort,
     escalation_port,
+)
+from orchestrator.merge_lane.post_merge_verify import (
+    placeholder_local_runner,
+    run_post_merge_verify,
 )
 from orchestrator.merge_lane.rebased_head import (
     is_gate_reanchor,
@@ -179,10 +171,6 @@ from orchestrator.merge_lane.remerge_base import (
 from orchestrator.merge_lane.request_ledger import (
     RequestLedger,
     report_stuck_requests,
-)
-from orchestrator.merge_lane.retry_verify_env import (
-    assemble_retry_verify_env,
-    build_attempt0_payload,
 )
 from orchestrator.merge_lane.reverify_gate_decision import GateClearance, ReverifyDispatch
 from orchestrator.merge_lane.shadow import (
@@ -263,6 +251,11 @@ from orchestrator.merge_lane.verify_cancellation import (
     VerifyDurationWindow,
     merge_verify_cancelled_data,
 )
+from orchestrator.merge_lane.verify_failure_outcome import (
+    DISK_PRESSURE_CAUSE,
+    DryRunInvestigationHandles,
+    transient_infra_reason,
+)
 from orchestrator.merge_pool_facts import with_chain_members
 from orchestrator.merge_verify_facts import (
     BaseRelation,
@@ -275,37 +268,17 @@ from orchestrator.scheduler import StaleEvidenceRejection
 from orchestrator.task_priority import TaskPriorityLookup
 from orchestrator.task_status import WORKFLOW_PRESERVE_STATUSES
 from orchestrator.teardown import complete_despite_cancellation
-from orchestrator.unblock_types import BlockClass
 from orchestrator.verify import (
     VerifyResult,
-    _derive_task_files_from_git,
-    cached_main_baseline_failing_ids,
-    describe_new_failing_ids,
-    diff_new_failures,
-    known_failing_ids_on_main,
-    red_module_prefixes_of,
     run_scoped_verification,
-    seed_main_baseline,
 )
 from orchestrator.verify_cancel import elide_middle
-from orchestrator.verify_categories import (
-    INDETERMINATE_VERDICT_CATEGORIES,
-    INFRA_TRANSIENT_CATEGORIES,
-)
-from orchestrator.verify_classify import reports_disk_full
-from orchestrator.verify_plan import effective_merge_module_configs
 from orchestrator.verify_runner import (
-    UNSCOPED_TYPECHECK_TIMEOUT_CATEGORY,
     HostAllocator,
     HostLease,
     LocalRunner,
     RunnerUnavailable,
     VerifyRunner,
-    VerifyRunnerPool,
-    build_merge_verify_spec,
-    is_flock_contention_failure,
-    is_unscoped_gate_failure,
-    unscoped_gate_failing_subprojects,
 )
 
 if TYPE_CHECKING:
@@ -404,23 +377,6 @@ import-order fragility.  Off by default: zero production overhead beyond a
 single module-bool branch at each call site."""
 
 
-TRANSIENT_INFRA_REASON_PREFIX = 'Transient infrastructure failure'
-"""Cause-neutral prefix of every transient-infra hold's ``MergeOutcome.reason``:
-the pre-verify disk guard, a persistent ENOSPC verify, and a persistent
-``INFRA_TRANSIENT_CATEGORIES`` verify.  Every producer builds its reason with
-``_transient_infra_reason``, which appends the measured cause in parentheses.
-The workflow routes this prefix to
-``_mark_blocked(escalate_to_human=True, category='infra_issue')`` — the
-infra_issue category plus the durable ref lets the escalation-watcher
-auto-resolve if the host has recovered by read-time."""
-
-_DISK_PRESSURE_CAUSE = 'disk pressure'
-
-
-def _transient_infra_reason(cause: str, message: str) -> str:
-    """The ``'<prefix> (<cause>): <message>'`` reason of a transient-infra hold."""
-    return f'{TRANSIENT_INFRA_REASON_PREFIX} ({cause}): {message}'
-
 
 TRAIN_INCOMPLETE_REASON_PREFIX = 'Train merge rejected: not all members are merge-deferred'
 """Prefix of the ``MergeOutcome.reason`` string emitted when a
@@ -467,59 +423,6 @@ that some member tasks still need their status flipped.  Downstream classifiers
 pattern-match this prefix to distinguish a fully-clean landing
 (``reason=None``) from a partial-flip that requires manual / automated
 cleanup."""
-
-
-TRIVIAL_PASS_MAIN_RED_REASON_PREFIX = (
-    'Trivial-pass withheld: config-only merge would advance main over a '
-    'known-red state'
-)
-"""Prefix of the ``MergeOutcome.reason`` string emitted when a config-only
-merge that short-circuited to :func:`verify._trivial_pass` (no ``.py``/``.rs``
-in the diff — ``VerifyResult.trivial is True``) is refused advancement over a
-main tip whose cached failing-id baseline is known-red (task 2823, gate-hole
-#3/3 of the reify 2026-07-19 red-main incident).
-
-A trivial pass ran NO test suite, so it is no evidence the red cleared; letting
-it CAS-advance main would persist the red. The gate keys strictly on
-``verify.trivial`` — a NON-trivial pass (the full merge suite actually ran on
-the merged tree and passed) legitimately heals a red main and is never blocked.
-It is a CACHE-ONLY peek (:func:`verify.known_failing_ids_on_main`) that
-never triggers a probe on the critical path (G4, task 2564) and fails OPEN on a
-cold/unknown baseline, matching the task's "known-red" scope. Paired with
-``MergeFailureDisposition.MAIN_RED``: the break is pre-existing, not this task's
-fault, so the blocked task re-dispatches and passes once main is green again.
-
-Caveat (task 2823 amendment): that self-heal assumes some OTHER, code-touching
-merge greens main first. A config-only change that is *itself* the fix for the
-red main is deliberately NOT trusted here — a trivial pass runs no suite, so it
-can never prove the red cleared, and it will oscillate re-dispatch/block (loud,
-via MAIN_RED) until a non-trivial merge or an operator greens main. The gate
-logs a distinct WITHHELD warning so this edge is recognisable rather than read
-as routine main-red churn."""
-
-
-MAIN_HEALTH_PROBE_PENDING_NOTE = (
-    'provisional: an off-critical-path main-health probe is still checking '
-    'whether this failure pre-exists on bare main (task 2564); if '
-    'confirmed, this task is not at fault and main is being healed '
-    'separately'
-)
-"""Appended, in brackets, to the provisional task-fault
-``MergeOutcome.reason`` that :func:`_run_post_merge_verify` returns in
-DEFERRED mode (``main_health_probe_handles`` is not ``None``) whenever
-:func:`spawn_main_health_probe` reports a probe is actually in flight for
-this failure.
-
-Lets a steward/human reading the surviving reason string distinguish
-"still being classified off-path" from a confirmed task fault — the
-SYNCHRONOUS path (``main_health_probe_handles`` is ``None``) never appends
-this note because :func:`classify_main_health_red` has, by construction,
-already definitively ruled out a pre-existing break by the time the
-task-fault reason is built.  Not appended when the deferred probe itself
-would be skipped (feature disabled / timed-out verify / a
-:data:`PREEXISTING_BREAK_SKIP_CATEGORIES` category) since those cases are
-confirmed task faults in both modes — see
-:func:`spawn_main_health_probe`'s return value."""
 
 
 # ---------------------------------------------------------------------------
@@ -606,21 +509,6 @@ Shared by ``SpeculativeMergeWorker._finalize_inflight`` and
 halt-triggering results ever changes, this one constant updates both."""
 
 
-def _verify_hit_enospc(verify: VerifyResult) -> bool:
-    """True when a failed ``VerifyResult`` bears a disk-full signature.
-
-    Scans the human-readable failure report and each captured output stream
-    (test/lint/type) with ``verify_classify.py::reports_disk_full``.
-    """
-    streams = (
-        verify.failure_report(),
-        verify.test_output,
-        verify.lint_output,
-        verify.type_output,
-    )
-    return reports_disk_full(' '.join(filter(lambda s: isinstance(s, str), streams)))
-
-
 _SPECULATION_RACE_MARKER = 'not something we can merge'
 """LOAD-BEARING exact substring match on git porcelain output.
 
@@ -700,8 +588,8 @@ async def _ensure_verify_disk_space(
             task_id, len(pruned), free / gib,
         )
         return None
-    return _transient_infra_reason(
-        _DISK_PRESSURE_CAUSE,
+    return transient_infra_reason(
+        DISK_PRESSURE_CAUSE,
         f'pre-verify disk guard found only '
         f'{free / gib:.2f} GiB free (threshold {min_free_bytes / gib:.2f} GiB) '
         f'after pruning {len(pruned)} stale merge worktree(s); skipping '
@@ -723,109 +611,6 @@ PRODUCTION_CLOCK: ClockPort = ProductionClock(
 )
 
 
-def _render_skew_surfaces(
-    disposition: MergeFailureDisposition,
-    evidence: SkewEvidence | None,
-) -> tuple[str, dict[str, str] | None]:
-    """Render the I4 reason_suffix + failure_diagnostic surfaces for a
-    merge-skew attribution verdict (task 2383 β, M2 of
-    plans/merge-skew-attribution-prd.md).
-
-    Pure, no I/O.  Only ``INTEGRATION_SKEW`` with non-``None`` *evidence*
-    yields a non-empty ``reason_suffix`` — appended to the task-fault reason
-    so the debugger's dry-run context reads "port landed commit <sha>
-    touching <files> — do not hunt your own diff" — and a
-    ``failure_diagnostic`` ``dict[str, str]`` surfaced verbatim via
-    ``merge_status`` (I4).  Every other ``(disposition, evidence)``
-    combination — ``MAIN_RED`` / ``BRANCH_BUG`` / ``INDETERMINATE``, or
-    ``evidence=None`` — returns ``('', None)``.
-    """
-    if disposition is not MergeFailureDisposition.INTEGRATION_SKEW or evidence is None:
-        return '', None
-    commits = ', '.join(evidence.implicated_commits)
-    files = ', '.join(evidence.overlap_files)
-    tests = ', '.join(evidence.failing_tests)
-    reason_suffix = (
-        f'integration_skew: port landed commit(s) {commits} touching '
-        f'{files} — do not hunt your own diff'
-    )
-    failure_diagnostic = {
-        'disposition': disposition.value,
-        'implicated_commits': commits,
-        'overlap_files': files,
-        'failing_tests': tests,
-    }
-    return reason_suffix, failure_diagnostic
-
-
-async def _classify_disposition_for_outcome(
-    verify: VerifyResult,
-    *,
-    req: MergeRequest,
-    merge_base_sha: str,
-    main_sha: str,
-    event_store: EventStore | None,
-    real_main_head_sha: str | None = None,
-) -> tuple[MergeFailureDisposition, dict[str, str] | None, str, SkewEvidence | None]:
-    """Classify a non-preexisting merge-verify failure and render its I4
-    surfaces (task 2383 β).
-
-    Thin async wrapper: calls ``classify_merge_failure_disposition`` (with
-    ``preexisting=False`` — I1: this is only ever reached on the non-
-    preexisting bucket) and threads the result through
-    ``_render_skew_surfaces``.
-
-    *real_main_head_sha* (task 2869, I6): the CURRENT real published main HEAD,
-    forwarded into the classifier's orphan/ancestor filter so an orphaned
-    speculative *main_sha* train tip never cites its dangling commits. ``None``
-    (default; caller could not resolve real main) skips the filter — today's
-    pre-2869 reference frame (fail-open, additive default).
-
-    Belt-and-suspenders fail-open (I3): any exception — including one raised
-    by the classifier itself, atop its own internal fail-open — is caught
-    here, logged at WARNING, and degrades to ``(INDETERMINATE, None, '', None)``
-    so the caller's outcome is never left half-attached.
-
-    The 4th element (task 3178) is the classifier's GATHERED bundle
-    (``ClassificationResult.observed_evidence``), NOT its adjudicated
-    ``evidence``: it is the one the step-18 ``merge_attempt`` emit needs, because
-    that emit now persists evidence on the ADJUDICATED-INDETERMINATE path too.
-    ``_render_skew_surfaces`` keeps receiving the ADJUDICATED bundle, so only
-    INTEGRATION_SKEW ever renders the "port the landed commit" directive — that
-    contract is untouched.
-    """
-    try:
-        result = await classify_merge_failure_disposition(
-            verify_result=verify,
-            branch=req.branch.bare_id,
-            merge_base_sha=merge_base_sha,
-            main_sha=main_sha,
-            preexisting=False,
-            real_main_head_sha=real_main_head_sha,
-            task_id=req.task_id,
-            repo_root=req.config.project_root,
-            event_store=event_store,
-        )
-        # Read the two evidence slots BY NAME (ClassificationResult): the
-        # ADJUDICATED bundle goes to the renderer (only INTEGRATION_SKEW gets a
-        # directive), the OBSERVED/gathered one out to the caller (task 3178).
-        reason_suffix, failure_diagnostic = _render_skew_surfaces(
-            result.disposition, result.evidence,
-        )
-        return (
-            result.disposition, failure_diagnostic, reason_suffix,
-            result.observed_evidence,
-        )
-    except Exception:
-        logger.warning(
-            'Task %s: _classify_disposition_for_outcome failed; degrading to '
-            'INDETERMINATE (fail-open, I3)',
-            req.task_id,
-            exc_info=True,
-        )
-        return MergeFailureDisposition.INDETERMINATE, None, '', None
-
-
 async def resolve_dispatch_time_merge_base(
     repo_root: Path,
     main_sha: str,
@@ -841,7 +626,7 @@ async def resolve_dispatch_time_merge_base(
     common ancestor via a read-only ``git merge-base`` call.
 
     Returns ``None`` — degrading classification to INDETERMINATE via
-    ``_run_post_merge_verify``'s None-default (I3, fail-open) — when
+    ``run_post_merge_verify``'s None-default (I3, fail-open) — when
     *branch_tip* is unavailable or the git call fails for any reason
     (non-git *repo_root*, unresolvable SHA, subprocess error).
     """
@@ -870,376 +655,6 @@ async def resolve_dispatch_time_merge_base(
         return None
 
 
-# Sentinel task_id prefix for a laptop-side flock-worktree-contention alarm
-# (task 2307 β, PRD plans/laptop-warm-verify-flock-orphan-prd.md §8.2).
-# Mirrors _VERIFY_HOST_UNREACHABLE_SENTINEL_PREFIX's per-host sentinel shape.
-_VERIFY_WORKTREE_CONTENTION_SENTINEL_PREFIX = '__verify_worktree_contention__'
-
-
-def _verify_worktree_contention_sentinel(host: str) -> str:
-    """Return the per-host sentinel task_id for a flock-worktree-contention alarm."""
-    return f'{_VERIFY_WORKTREE_CONTENTION_SENTINEL_PREFIX}{host}'
-
-
-def _alarm_verify_worktree_contention(
-    escalation_queue: Any,
-    *,
-    host: str,
-    holder_pgid: int | None,
-    waiter_pgid: int | None,
-) -> None:
-    """Submit a born-at-L2 escalation for a laptop-side flock-worktree-contention outcome.
-
-    Fired when a remote verify (task 2306 α's ``make_flock_contention_result``)
-    reports that ``.merge_verify.lock`` could not be acquired within the
-    bounded wait — another verify invocation already holds the persistent
-    warm merge-verify worktree.  The laptop CLI holds no escalation client
-    (the escalation MCP server binds 127.0.0.1:8100), so the workstation
-    files this on the laptop's behalf.
-
-    The escalation is:
-
-    * ``level=2`` / ``severity='critical'`` — born-at-L2 (PRD §8.2): routes
-      straight to a human, bypassing the auto-watcher.
-    * ``agent_role='orchestrator-verify-host-monitor'`` — the ``orchestrator-``
-      prefix marks this as a harness sentinel so the escalation server never
-      downgrades the severity (mirrors ``_emit_loop_terminal_escalation``).
-    * ``category='verify_worktree_contention'``
-    * ``task_id=_verify_worktree_contention_sentinel(host)``
-
-    None-safe: returns immediately when *escalation_queue* is None.  Dedup:
-    returns immediately when an open L2 already exists for this host's
-    sentinel task_id.  An orphaned lock-holder (the PRD scenario) persists
-    until manually killed, so without this guard every subsequent distinct
-    merge routed to the host would file another L2 — a burst of duplicate
-    criticals at the human while the orphan lives.  The check goes through
-    ``get_by_task(sentinel, status='pending', level=2)`` rather than
-    ``_alarm_verify_host_unreachable``'s ``has_open_l1``: that helper is
-    hardcoded to ``level=1`` (see ``escalation/queue.py``) and would never
-    match this level=2 escalation.  No event emission — the escalation is
-    the sole user-observable signal (PRD §8.2).
-
-    Args:
-        escalation_queue: Live escalation queue or ``None``.
-        host: Laptop host name that reported the contention.
-        holder_pgid: pgid of the process holding the lock, or ``None`` when
-            the holder's pgid file is absent or corrupt (α's fail-safe).
-        waiter_pgid: pgid of the process that lost the race and reported.
-    """
-    if escalation_queue is None:
-        return
-
-    sentinel = _verify_worktree_contention_sentinel(host)
-
-    # Dedup: don't re-alarm while an open L2 already exists for this host.
-    # has_open_l1 is hardcoded to level=1 (escalation/queue.py), so it would
-    # never match this level=2 escalation; get_by_task is used directly.
-    if escalation_queue.get_by_task(sentinel, status='pending', level=2):
-        return
-
-    # Rendered once and reused below so the detail and suggested_action
-    # fields agree on how a fail-safe None pgid reads to the operator.
-    holder_display = holder_pgid if holder_pgid is not None else '<unknown>'
-    waiter_display = waiter_pgid if waiter_pgid is not None else '<unknown>'
-
-    summary = (
-        f'Flock contention on {host!r}: another verify holds the persistent '
-        f'merge-verify worktree lock'
-    )
-    detail = (
-        f'Host: {host}\n'
-        f'Holder pgid: {holder_display}\n'
-        f'Waiter pgid: {waiter_display}\n'
-        '\n'
-        f'The laptop-side verify on {host!r} could not acquire '
-        '.merge_verify.lock within the bounded wait, so it reported '
-        'contention instead of falling back to an ephemeral worktree. '
-        'The merge is blocked pending investigation.'
-    )
-
-    esc = Escalation(
-        id=escalation_queue.make_id(sentinel),
-        task_id=sentinel,
-        agent_role='orchestrator-verify-host-monitor',
-        severity='critical',
-        level=2,
-        category='verify_worktree_contention',
-        summary=summary,
-        detail=detail,
-        suggested_action=(
-            f'Inspect the holder process (pgid {holder_display}) on {host!r} — '
-            'confirm it is a legitimate in-progress verify and not an orphan. '
-            'Kill an orphaned holder to release .merge_verify.lock, or wait '
-            'for it to finish, then re-submit the blocked merge.'
-        ),
-    )
-    escalation_queue.submit(esc)
-
-
-@dataclasses.dataclass(frozen=True)
-class _DryRunInvestigationHandles:
-    """Opaque bundle of harness-owned handles for the merge-verify dry-run spawn.
-
-    SpeculativeMergeWorker holds none of scheduler/mcp/usage_gate/cost_store
-    itself (the harness owns all of them); this bundles them into one
-    optional, default-``None`` param so ``_run_post_merge_verify`` stays a
-    pure git engine (mirrors the ``train_callback_factory`` opaque-injection
-    pattern — the worker never imports the scheduler).  Only
-    ``SpeculativeMergeWorker._lane_post_merge_verify`` (the in-flight verify
-    and the single-branch gate re-verify) passes a live instance; the
-    solo-reverify and train module-level callers pass nothing,
-    so their spawns automatically no-op.
-
-    ``background_tasks`` is the SAME ``set`` instance the worker stores at
-    ``self._background_tasks`` — a spawned investigation task's strong ref
-    lives exactly as long as the worker, mirroring
-    ``workflow.TaskWorkflow._background_tasks``.
-    """
-
-    scheduler: Any
-    mcp: Any = None
-    usage_gate: Any = None
-    cost_store: Any = None
-    background_tasks: set[asyncio.Task] = dataclasses.field(default_factory=set)
-
-
-def _spawn_merge_verify_dry_run(
-    handles: _DryRunInvestigationHandles | None,
-    req: MergeRequest,
-    reason: str,
-    detail: str,
-    *,
-    event_store: EventStore | None = None,
-    verifier: VerifyPort = PRODUCTION_VERIFIER,
-) -> None:
-    """Fire-and-forget: spawn an autonomous dry-run investigation for a
-    MERGE_VERIFY_RED post-merge-verify block.
-
-    Mirrors ``workflow._spawn_dry_run_unblock``'s fire-and-forget shape
-    (try/except-wrapped ``asyncio.create_task``, strong-ref registration into
-    a ``background_tasks`` set with a discard done-callback) so the
-    merge-verify and agent-block investigation spawns behave identically.
-    ``block_class=BlockClass.MERGE_VERIFY_RED`` is passed explicitly — the
-    generic post-merge reason is deliberately not mapped by
-    ``classify_block_reason`` (see ``unblock_types`` module docstring).
-
-    None-safe: no-ops when *handles* is ``None`` or ``handles.scheduler`` is
-    ``None`` — the solo-reverify and train module-level
-    ``_run_post_merge_verify`` callers pass no handles.  Also no-ops when
-    ``req.config.unblock_auto.enabled`` is falsy, when an investigation for
-    this task is already running anywhere on the event loop (mirrors
-    ``workflow._spawn_dry_run_unblock``'s enablement and in-flight-dedup
-    guards), or when ``req.worktree`` is missing/nonexistent.
-
-    The investigation always reads ``req.worktree`` — the task's OWN retained
-    worktree — rather than the ephemeral merge worktree: by the time this
-    fire-and-forget task actually runs, ``_run_post_merge_verify`` has already
-    handed the merge worktree to ``cleanup_merge_worktree`` (task 2141
-    step-17/18 — the no-op cleanup mock in the test suite hid this).
-    ``req.worktree`` survives while the task stays blocked, and is what
-    ``b3_gate`` re-checks at gate time. (The ephemeral merge worktree is no
-    longer accepted as a parameter here — task 2141 amendment pass, review
-    finding `dead_parameter`.)
-
-    *event_store* is forwarded to ``run_dry_run_unblock`` so the
-    investigation emits the same ``invocation_end``/``'blocked'`` telemetry
-    event the agent-block path emits (observability parity).
-    """
-    if handles is None or handles.scheduler is None:
-        return
-    ua = getattr(req.config, 'unblock_auto', None)
-    if not ua or not ua.enabled:
-        return
-    if investigation_in_flight(req.task_id):
-        logger.debug(
-            'Task %s: merge-verify dry-run investigation already in '
-            'progress, skipping duplicate spawn',
-            req.task_id,
-        )
-        return
-    if req.worktree is None or not req.worktree.exists():
-        logger.debug(
-            'Task %s: skipping merge-verify dry-run — task worktree missing',
-            req.task_id,
-        )
-        return
-    try:
-        task = asyncio.create_task(
-            verifier.dry_run_unblock(
-                task_id=req.task_id,
-                worktree=str(req.worktree),
-                reason=reason,
-                detail=detail,
-                scheduler=handles.scheduler,
-                mcp=handles.mcp,
-                config=req.config,
-                event_store=event_store,
-                usage_gate=handles.usage_gate,
-                cost_store=handles.cost_store,
-                block_class=BlockClass.MERGE_VERIFY_RED,
-            ),
-            name=investigation_task_name(req.task_id),
-        )
-        handles.background_tasks.add(task)
-        task.add_done_callback(handles.background_tasks.discard)
-    except Exception as exc:
-        logger.warning(
-            'Task %s: failed to spawn merge-verify dry-run investigation: %s',
-            req.task_id, exc,
-        )
-
-
-# Dedup sentinel task_id for fix (b)'s per-land cross-check divergence escalation
-# (task 2822) — mirrors verify_runner.py's _DRIFT_SENTINEL / this module's
-# _RESOURCE_AUDIT_SENTINEL.  A single open L1 per episode keeps a run of divergent
-# lands from flooding the queue; the caller-owned quarantine sink does the per-host
-# withholding.
-_CROSS_CHECK_SENTINEL = '__verify_cross_check__'
-
-
-def _merge_boundary_module_configs(
-    config: OrchestratorConfig,
-    module_configs: list[ModuleConfig],
-) -> list[ModuleConfig]:
-    """The effective merge module set for a merge REQUEST — γ's widening, with
-    the zero-module task deliberately left exactly where it already was.
-
-    A thin wrapper over :func:`verify_plan.effective_merge_module_configs`
-    (the ONE implementation of "which modules does a merge-role verify
-    cover?", INV-5) carrying the single policy that belongs to the merge
-    boundary rather than to the breadth knob: an EMPTY passed set is never
-    widened.
-
-    WHY (reviewer amendment, task 3787 γ). A task with no assigned modules —
-    ``WorkflowRunner._resolve_module_configs`` returns ``[]`` whenever
-    ``self.modules`` is empty, i.e. docs-only and root-file tasks — is
-    verified today, even at breadth='full', through the GLOBAL fallback on
-    BOTH legs: ``build_merge_verify_spec`` sources ``global_verify_command``
-    precisely because the projected set is empty (INV-1, task 2883), and
-    ``run_scoped_verification``'s own widening sits INSIDE its ``if
-    module_configs:`` guard, so an empty set falls through to
-    ``_derive_fallback_runs``. Widening ``[]`` to the whole registry here
-    would silently re-point both of those legs at a per-module full-suite
-    fan-out (and ``_run_unscoped_typechecks`` at every registered module) — a
-    materially different, untested gate for the lightest merges, on a live
-    config that sets breadth='full' with 9 modules registered. γ's mandate is
-    to make the suppression gate map node-ids against the set that ACTUALLY
-    RAN; it is not to change what runs.
-
-    So this guard MIRRORS ``run_scoped_verification``'s ``if module_configs:``
-    guard: the boundary widens exactly where that site would have, and is the
-    identity otherwise. Whether breadth='full' OUGHT to cover the whole
-    registry for a zero-module task is a real question — but a pre-existing
-    one, and answering it is not γ's job.
-
-    The shared helper's own contract is deliberately NOT changed: its other
-    caller, ``run_scoped_verification``'s force_workspace branch (verify.py
-    site A), widened an empty passed set before γ and must keep doing so.
-    """
-    if not module_configs:
-        return module_configs
-    return effective_merge_module_configs(config, module_configs)
-
-
-def _placeholder_local_runner(
-    merge_wt: Path, req: MergeRequest, verifier: VerifyPort,
-) -> LocalRunner:
-    """The LocalRunner a local host slot is acquired with.
-
-    Its modules are the merge boundary's (PRD §8.2), through the SAME wrapper
-    as the runner that actually drives the verify, so the two can never
-    disagree about which modules a merge covers.
-    """
-    return LocalRunner(
-        merge_wt,
-        req.config,
-        _merge_boundary_module_configs(req.config, req.module_configs),
-        None,   # task_files — derived inside _run_post_merge_verify
-        run_scoped=verifier.run_scoped,
-        run_unscoped=verifier.run_unscoped_typechecks,
-        task_id=req.task_id,
-    )
-
-
-def _local_merge_verify_runner(
-    merge_wt: Path,
-    req: MergeRequest,
-    effective_module_configs: list[ModuleConfig],
-    task_files_tuple: tuple[str, ...] | None,
-    *,
-    verifier: VerifyPort,
-    event_store: EventStore | None,
-    history_leg_command: str | None,
-) -> VerifyRunner:
-    """The runner a local merge verify dispatches to.
-
-    The full gate's scoped + unscoped bundle, or only the project's declared
-    history leg when *history_leg_command* is set (task 7248).
-    """
-    archive_root = req.config.project_root / 'data' / 'verify-logs'
-    if history_leg_command is not None:
-        return HistoryLegRunner(
-            merge_wt, req.config, history_leg_command,
-            task_id=req.task_id, archive_root=archive_root,
-        )
-    # INV-1 (task 2883): the dispatching store lets run_scoped's merge gate
-    # emit trivial_pass_escalated. The merge-flake gate's side-effects are NOT
-    # threaded here: task ε moved them to the dispatcher
-    # (_run_post_merge_verify), driven off the FlakeSuppression the returned
-    # VerifyResult carries.
-    return LocalRunner(
-        merge_wt, req.config, effective_module_configs, task_files_tuple,
-        run_scoped=verifier.run_scoped,
-        run_unscoped=verifier.run_unscoped_typechecks,
-        task_id=req.task_id,
-        archive_root=archive_root,
-        event_store=event_store,
-    )
-
-
-async def _record_flake_observation(
-    result: VerifyResult,
-    req: MergeRequest,
-    *,
-    merge_sha: str,
-    event_store: EventStore | None,
-    escalation_queue: Any,
-) -> None:
-    """Record whatever flake observation *result* carries (PRD task ε, §5.8).
-
-    Binds this call site's context once — project root, project id, merge SHA,
-    task id and both stores — so the two recording points below cannot drift
-    apart in what they attribute an observation to.
-
-    THE topology rule ε encodes: the DISCRIMINATOR runs where the WORKTREE is
-    (local host or remote runner — only there can the failing tests be re-run);
-    the RECORDER runs HERE, on the dispatcher, because ``_run_post_merge_verify``
-    is the only scope where a local OR remote ``VerifyResult`` sits alongside an
-    ``EventStore``, an escalation queue, ``project_root``, ``merge_sha`` and
-    ``task_id`` at once.
-
-    That co-location is what makes the side-effects — the durable
-    ``flake_occurrence`` row, the ``merge_flake_suppressed`` fact and the INV-4
-    storm-streak bump — unconditional BY CONSTRUCTION rather than dependent on
-    which host happened to run the verify.  Before ε they fired inline inside the
-    producer, so a REMOTE verify landed none of the three: no ledger call existed
-    at all, the remote host has no event store, and its streak counter died with
-    its process.
-
-    Never raises (the recorder owns that guarantee), so a lost measurement can
-    never fail a verify or stall the merge queue.
-    """
-    await record_merge_flake_suppression(
-        result,
-        project_root=req.config.project_root,
-        project_id=req.config.fused_memory.project_id,
-        merge_sha=merge_sha,
-        task_id=req.task_id,
-        event_store=event_store,
-        escalation_queue=escalation_queue,
-    )
-
-
 def _item_commit(item: SpeculativeItem) -> str | None:
     """The merge commit *item* built, or None for a decided item."""
     return item.merge_result.merge_commit if isinstance(item, RealMergeItem) else None
@@ -1249,1356 +664,6 @@ _GATE_HISTORY_LEG_FACTS = MergeVerifyDispatchFacts(
     runner_reason=RunnerReason.LOCAL_ONLY_RULE, base_relation=BaseRelation.MAIN,
 )
 """A gate's history leg verifies the head rebased onto main, on the local-only runner."""
-
-
-async def _run_post_merge_verify(
-    git_ops: GitOps,
-    req: MergeRequest,
-    merge_wt: Path,
-    *,
-    timeouts: dict[str, int],
-    enospc_retries: dict[str, int],
-    max_timeouts: int,
-    max_enospc: int,
-    max_narrowed: int = 1,
-    narrowed_retries: dict[str, int] | None = None,
-    event_store: EventStore | None = None,
-    merge_sha: str = '',
-    on_result: Callable[[VerifyResult], None] | None = None,
-    shadow_baseline_sink: dict[str, str] | None = None,
-    quarantine: Callable[[str], None] | None = None,
-    keep_worktrees: Collection[Path] | None = None,
-    runner: VerifyRunner | None = None,
-    escalation_queue: Any = None,
-    halt_hook: Callable[[str], None] | None = None,
-    dry_run_handles: _DryRunInvestigationHandles | None = None,
-    main_health_probe_handles: MainHealthProbeHandles | None = None,
-    depth: int | None = None,
-    speculative: bool | None = None,
-    chain_items: int = 1,
-    chain_build_ms: int | None = None,
-    merge_base_sha: str | None = None,
-    main_sha: str | None = None,
-    verifier: VerifyPort = PRODUCTION_VERIFIER,
-    history_leg_command: str | None = None,
-    dispatch_facts: MergeVerifyDispatchFacts | None = None,
-) -> MergeOutcome | None:
-    """Run post-merge verification for a single task.
-
-    Returns ``None`` when verification passes; returns a ``MergeOutcome``
-    (and cleans up *merge_wt*) when it fails via a controlled path (disk
-    guard, verify-not-passed).  Does **not** contain a ``try/except`` — any
-    exception from ``run_scoped_verification`` propagates to the caller;
-    ``SpeculativeMergeWorker`` wraps the call in a ``try/except`` that maps a
-    raised verify to a ``'Verification error: ...'`` outcome.
-
-    Args:
-        max_narrowed: Budget for the classified-infra-transient retry loop
-            (task 2835) when this call's failed-only retry was actually
-            NARROWED — i.e. the D2 producer inside that branch built a
-            payload from attempt-0's own result and merged ``retry_env``
-            (see ``narrowed`` below).  Default ``1`` matches the legacy
-            single-retry behaviour, so every existing caller that omits
-            this param is byte-identical.  A non-narrowed retry (flag off,
-            a payload that could not be built or corroborated, or a remote
-            dispatch) always uses ``max_enospc`` instead, regardless of this
-            value.
-        narrowed_retries: Per-task counter dict for the narrowed budget
-            above, mirroring ``enospc_retries`` but DECOUPLED from it (an
-            earlier ENOSPC event never starves a narrowed retry, and vice
-            versa).  ``None`` (default) is normalized to a fresh, throwaway
-            ``{}`` local to this call — existing callers that omit this
-            param keep their legacy behaviour.
-        on_result: Optional callback invoked with the final :class:`~orchestrator.verify.VerifyResult`
-            BEFORE the pass/fail branch — additive, default ``None`` keeps
-            every existing call site byte-identical.  Used by
-            :class:`SpeculativeMergeWorker` to capture warm per-test results
-            for PRD §10 invariant 6(b) shadow compare.
-        shadow_baseline_sink: Optional mutable out-param (PRD
-            verify-retry-failed-only D4, §5.4).  When supplied AND this call
-            actually narrowed the retry (``narrowed`` — the D2 producer merged
-            ``retry_env`` on a tree-OID-corroborated attempt-0 payload), the
-            attempt-0 ``debug_verdicts`` ∪ ``release_verdicts`` map is copied
-            into it.  :class:`SpeculativeMergeWorker` unions this with the
-            PARTIAL narrowed-retry warm output (via
-            :func:`build_warm_shadow_results`) before storing the warm shadow
-            baseline, so the from-scratch full cold shadow compare sees no
-            phantom ``only_cold`` divergence.  Default ``None`` and untouched on
-            every non-narrowed path keep all existing callers byte-identical.
-        keep_worktrees: Additional worktrees to protect during any disk-pressure
-            prune triggered inside this verify run (pre-verify guard and ENOSPC
-            retry).  Default ``None`` keeps the legacy single-keep behaviour
-            (only *merge_wt* is protected).  Pass
-            ``set(worker._owned_merge_worktrees)`` from
-            :class:`SpeculativeMergeWorker` to protect all in-flight + queued
-            speculative worktrees (PRD §5 decision 5).
-
-            **Snapshot timing:** The caller's keep-set is a one-shot snapshot
-            taken at dispatch.  Worktrees registered into the ledger *after*
-            this snapshot is taken are not protected by prunes triggered inside
-            this call — they rely on the heartbeat mtime / grace-period
-            mechanism to avoid premature removal in the residual window between
-            snapshot capture and prune execution.  The gate re-verify passes
-            the live ledger instead (task 6155): dispatch continues while it
-            runs, so each prune reads the ledger as it stands at that moment.
-        escalation_queue: Live escalation queue or ``None`` (default).  Used
-            solely to file a born-at-L2 escalation (task 2307 β) when
-            *verify* is the distinguished flock-worktree-contention outcome
-            (``is_flock_contention_failure``); has no effect on any other
-            failure path.  None-safe — omitting it keeps every existing
-            call site byte-identical.
-        halt_hook: Optional synchronous all-lane merge-queue halt (task 2886
-            fix 3, PRD §3.4 / decision 4).  Invoked with a human-readable
-            reason string the instant a GENUINE concluded cross-check
-            divergence (remote PASS / local trust-anchor FAIL with a
-            non-infra-transient local category) is detected — BEFORE the local
-            FAIL is adopted and the blocked outcome returns — so no FURTHER
-            adoption can occur before a human looks.  A local FAIL with an
-            INFRA-TRANSIENT category is treated as a local hiccup (not a
-            main-red divergence): the land is still withheld + the remote
-            quarantined, but the queue is NOT halted and the escalation is L1
-            blocking rather than born-at-L2 (task 2886 amendment — bound the
-            halt blast radius; DriftDetector Invariant 5).  Only the
-            production ``SpeculativeMergeWorker._lane_post_merge_verify``
-            (the in-flight verify and the single-branch gate re-verify) and
-            ``_leased_train_verify`` call sites pass the worker's
-            ``operator_halt``; every other (module-level or test) caller
-            omits it (default ``None`` → no halt), keeping them
-            byte-identical.  With ``verify_cross_check_remote_green`` on
-            (default True) the cross-check is a BLOCKING pre-land local
-            re-verify, NOT a trailing detector; the halt is synchronous purely
-            so it precedes any further adoption — incident 83336a32 halted +3s
-            too late via the async escalation gate, which trails it.
-        dry_run_handles: Opaque bundle of scheduler/mcp/usage_gate/cost_store
-            (task η, AFK coverage gap).  ``None`` (default) keeps the
-            solo-reverify and train module-level callers byte-identical (no
-            spawn).  Only ``SpeculativeMergeWorker._lane_post_merge_verify``,
-            which serves the in-flight verify and the single-branch gate
-            re-verify, passes a live bundle, at which point a MERGE_VERIFY_RED outcome
-            (generic task-fault or unscoped-typecheck-FAILED) fires a
-            fire-and-forget dry-run investigation via
-            :func:`_spawn_merge_verify_dry_run`.
-        main_health_probe_handles: Opaque bundle carrying the worker's
-            ``background_tasks`` set (task 2564, reify 5067 merge-slot-stall
-            fix).  ``None`` (default) keeps the solo-reverify and train
-            callers, and any other caller, running the main-health probe
-            SYNCHRONOUSLY exactly as before task 2564.  Only
-            ``SpeculativeMergeWorker._lane_post_merge_verify``, which serves
-            the in-flight verify and the single-branch gate re-verify, passes
-            a live bundle, at which point a main-health-eligible failure
-            SKIPS the synchronous ``classify_main_health_red`` probe,
-            returns the provisional task-fault outcome immediately, and
-            spawns the classification as a detached background task via
-            :func:`spawn_main_health_probe` — so the caller's
-            ``verify_task`` (and the merge slot / host lease it holds) is
-            freed within seconds of the verdict instead of blocking on a
-            full local verify build bounded only by the cold timeout.
-        depth: Verify-frontier stack height (task 2340, ε=1890) at dispatch
-            time; threaded straight into ``pool.dispatch`` for the
-            ``merge_verify`` event.  ``None`` (default) keeps every existing
-            caller byte-identical.
-        speculative: Mirrors ``item.speculative``; threaded straight into
-            ``pool.dispatch`` alongside *depth*.  ``None`` (default) keeps
-            every existing caller byte-identical.
-        chain_build_ms: Wall-clock milliseconds the deep chain build that
-            produced this verify's tree cost, or ``None`` when no chain was
-            built (the always-on path).  Forwarded verbatim to
-            ``pool.dispatch`` at all three sites below so an ENOSPC / infra-
-            transient RE-dispatch re-reports the SAME build cost: the build
-            happened once, and attributing it once per emitted event is what
-            lets η1 sum stall time per round rather than per retry.
-        chain_items: Count, in CHAIN-ITEM units, of the items contained in the
-            tree this verify exercises (task 3185, PRD γ) — the dispatching
-            item is chain item #1, and each chained successor actually BUILT
-            adds one.  Deliberately frontier-INDEPENDENT: an ordinary verify
-            that chained nothing is 1 no matter how many other verifies are in
-            flight, which is what makes ``chain_items >= 2`` a sound
-            deep-verify discriminator.  Threaded straight into
-            ``pool.dispatch`` alongside *depth*/*speculative*, at the initial
-            dispatch AND at BOTH retry dispatches — a retry re-verifies the
-            same tree, so dropping back to the default there would understate
-            the chain in exactly the rows the deep-fail-rate reader keys on.
-            Unlike *depth*/*speculative* this defaults to ``1``, not ``None``:
-            a count of items in a verified tree has a smallest TRUTHFUL value
-            of 1, so every existing caller (``reverify_member_solo``,
-            ``_do_train_merge``, ``merge_gates._reverify_rebased_tree``) keeps
-            emitting an honest single-item count with no edit.
-        merge_base_sha: Dispatch-time merge-base SHA (task 2383 β, 2357:
-            caller-supplied, never re-derived here).  Paired with *main_sha*
-            to classify a non-preexisting task-fault failure via
-            :func:`_classify_disposition_for_outcome`, attaching
-            ``disposition``/``failure_diagnostic`` to the returned
-            :class:`MergeOutcome` and appending the rendered reason_suffix.
-            ``None`` (default) skips classification entirely — the train
-            (``_do_train_merge``) and solo (``reverify_member_solo``)
-            callers pass nothing and stay byte-identical (disposition stays
-            ``MergeOutcome``'s ``INDETERMINATE`` default, no
-            ``failure_diagnostic``).
-        main_sha: Dispatch-time main SHA (``item.base_sha``) paired with
-            *merge_base_sha*; see above.  Both must be non-``None`` for
-            classification to run.
-        history_leg_command: The project's declared same-tree history leg
-            (task 7248), passed only by ``gates.py::_reverify_rebased_tree``.
-            When set, the LOCAL pool runs only this command, through
-            ``history_leg.py::HistoryLegRunner``, instead of the full gate;
-            every step around the dispatch is unchanged.  ``None`` (default)
-            runs the full gate.
-        dispatch_facts: The ``runner_reason``/``base_relation`` attempt 0's
-            ``merge_verify`` row carries; every retry reports it as
-            ``retry_held_host`` (``orchestrator/merge_verify_facts.py``).
-    """
-    # Normalize the narrowed-budget counter dict once up front (task 2835):
-    # None (the default for every unmigrated caller) becomes a fresh,
-    # throwaway {} local to this call — mirrors how enospc_retries is always
-    # caller-supplied but keeps this one optional without a mutable default.
-    if narrowed_retries is None:
-        narrowed_retries = {}
-
-    # ── THE merge-request boundary resolution (flake-ledger PRD §8.2, task
-    # 3787 γ) ────────────────────────────────────────────────────────────
-    # The module set a merge-role verify actually COVERS, resolved ONCE here
-    # and threaded into every consumer below.
-    #
-    # ORDERING INVARIANT (INV-5): this binding must precede the spec build and
-    # every LocalRunner construction. Under merge_verify_breadth='full' a
-    # merge verify executes EVERY registered module, so the local runner, the
-    # wire spec (and hence the remote's reconstruction of it in
-    # verify_runner.run_merge_verify_on_worktree) and the merge-flake
-    # suppression gate must all reason against the SAME widened set — by
-    # CONSTRUCTION, from one resolution, rather than by asserting that two
-    # sites independently agree.
-    #
-    # This closes §3.1's task-scoped blindness on BOTH paths.
-    # run_scoped_verification widened the set internally, but rebound a local
-    # that never propagated out — so LocalRunner._module_configs stayed the
-    # TASK's own modules and the suppression gate mapped failing node-ids
-    # against them. A red in a REGISTERED-but-untouched module therefore
-    # mapped to no known subproject and the gate answered "unconfirmable":
-    # inverted exactly where it mattered, since the more clearly unrelated
-    # the failure, the less able it was to say so.
-    #
-    # req.module_configs is NOT mutated — a new local is bound, so the
-    # request object the caller owns is unchanged (and the main-health probe
-    # deliberately keeps using the task-scoped set: that probe is not the
-    # merge gate).
-    #
-    # ZERO-MODULE TASK: an EMPTY req.module_configs is deliberately NOT
-    # widened. That is this boundary's own policy, not the breadth helper's —
-    # _merge_boundary_module_configs' docstring carries the reasoning (both
-    # legs keep today's global-command fallback for a task with no assigned
-    # modules, exactly as before γ).
-    #
-    # ACCEPTED CONSEQUENCE: under breadth='full' this also widens
-    # _run_unscoped_typechecks (LocalRunner's fourth consumer of this set) to
-    # every registered module. That is semantically correct under the knob and
-    # introduces NO new red — but for TWO reasons, not one. γ's amendment pass
-    # re-measured both, because a reviewer read the second path as a new-red
-    # exposure and it is not:
-    #   - SOURCE-BEARING diff: derive_verify_plan takes its merge_full fork,
-    #     and _derive_full_suite_runs already runs each registered module's
-    #     pyright FULL_SUITE.
-    #   - NO-source-file diff (docs/YAML only): derive_verify_plan returns the
-    #     TRIVIAL plan — but run_scoped_verification does NOT return on it at
-    #     the merge gate. role=='merge' AND is_merge_verify (exactly what
-    #     LocalRunner.run_merge_verify passes, and this widened set is
-    #     reachable from nowhere else) hits INV-1, task 2883: the would-be
-    #     trivial pass ESCALATES to the per-subproject fan-out over these same
-    #     module_configs, and each _verify_module -> run_verification(…, mc)
-    #     runs that module's type_check_command. If NO module carries any
-    #     command it fails loud with merge_no_evidence instead, and the
-    #     unscoped gate is never reached at all.
-    # Either way, every module the widened unscoped gate covers has already had
-    # its pyright run on the scoped leg, so that gate can only re-report a red
-    # the merge already has. The real cost is duplication: pyright runs twice
-    # per registered module per merge (concurrently, so wall-clock is the
-    # slowest module rather than the sum) — tracked as task 4490. Splitting the
-    # set inside LocalRunner to dodge it would reintroduce exactly the
-    # two-sites-must-agree drift §8.2 exists to remove.
-    effective_module_configs = _merge_boundary_module_configs(
-        req.config, req.module_configs,
-    )
-
-    # Pre-verify disk guard: if free space is low, prune stale merge
-    # worktrees; if still low, skip the build and escalate as transient
-    # infra rather than entering a doomed multi-minute ENOSPC build.
-    disk = await verifier.ensure_disk_space(
-        git_ops, merge_wt,
-        req.config.merge_verify_min_free_disk_bytes, req.task_id,
-        keep_worktrees=keep_worktrees,
-    )
-    if disk.reason is not None:
-        await git_ops.cleanup_merge_worktree(merge_wt)
-        return MergeOutcome('blocked', reason=disk.reason, verify_skipped=True)
-
-    # Build the spec (carried for forward-compat with γ/δ remote runners;
-    # the LocalRunner does not use it to drive execution).
-    task_files_tuple = tuple(req.task_files) if req.task_files is not None else None
-
-    # Mechanism 5b (dispatching-host scope derivation): when Lever C is on and
-    # task_files was not supplied, derive the scope on the DISPATCHING host
-    # (which has a fresh main) before building the spec.  This ships a faithful
-    # non-None task_files in the spec so the remote's run_scoped_verification
-    # never calls _derive_task_files_from_git against its own possibly-stale main.
-    # Gated on enabled_verify_runners so the local-only path is byte-identical
-    # when Lever C is off (zero behaviour change, trivially revertible).
-    if task_files_tuple is None and req.config.enabled_verify_runners:
-        derived = await _derive_task_files_from_git(merge_wt, req.config)
-        if derived:
-            task_files_tuple = tuple(derived)
-
-    # Projected from the SAME effective set the LocalRunner above receives
-    # (flake-ledger PRD §8.2 / task 3787 γ, INV-5), so the remote's
-    # reconstruction of it — `[_module_config_from_command(vc, spec) for vc in
-    # spec.verify_commands]` in verify_runner.run_merge_verify_on_worktree —
-    # yields the identical module set the local gate uses. Local ≡ remote BY
-    # CONSTRUCTION, from one resolution at the top of this function, rather
-    # than by an assertion that two sites independently agree.
-    #
-    # INV-1 interaction (checked, then re-checked in γ's amendment pass):
-    # build_merge_verify_spec sources `global_verify_command` ONLY when the
-    # projected set is empty. Two directions to keep straight, because they
-    # are NOT symmetric and only the first was reasoned about originally:
-    #   - non-empty -> non-empty. The effective set is never SMALLER than the
-    #     passed set (it is the full registry, or the passed set unchanged),
-    #     so a previously-non-empty spec can never become empty here.
-    #   - EMPTY -> EMPTY, and this is the case a POPULATED registry would
-    #     otherwise flip: widening [] to the whole registry would turn a spec
-    #     of `verify_commands=(), global_verify_command=<live globals>` into
-    #     per-module commands with global_verify_command=None, replacing the
-    #     zero-module task's entire gate as a side effect.
-    #     _merge_boundary_module_configs does not widen an empty passed set, so
-    #     the fallback holds for an empty registry AND for a populated one.
-    #     Pinned by test_merge_boundary_effective_module_configs.py::
-    #     TestMergeBoundaryLeavesTheZeroModuleTaskAlone.
-    spec = build_merge_verify_spec(req.config, effective_module_configs, task_files_tuple)
-
-    # narrowed (task 2835) tracks whether THIS call actually applied a
-    # narrowed retry_env — the ONLY correct gate for the larger max_narrowed
-    # budget below.  req.retry_failed_only alone is NOT enough: a flag-on
-    # retry whose payload could not be built is still a FULL re-verify and
-    # must keep the small legacy max_enospc budget.
-    #
-    # The narrowing itself is applied in the classified-infra-transient retry
-    # branch below, built from THIS call's own attempt-0 VerifyResult (task
-    # 3059).  It deliberately does NOT happen here: attempt-0 has not run yet
-    # at this point, so narrowing here would narrow attempt-0 ITSELF.
-    narrowed = False
-
-    # γ decision 4: additive runner= param selects the verify host.
-    # runner=None (default) → LOCAL-ONLY pool, byte-identical to β for every
-    # legacy caller (_do_merge, reverify_member_solo, _run_cold_shadow_verify —
-    # recovery paths stay on the trust anchor and out of slot accounting).
-    # The single-branch gate's history leg is one of them
-    # (SpeculativeMergeWorker._run_gate_history_leg); its full re-verify is a
-    # dispatch of the rebased head (task 8525).  The train's gate re-verify
-    # runs on its leased host (_leased_train_verify).
-    # runner=<RemoteRunner> → pool=[runner] (no LocalRunner); warm-swap is skipped
-    # (per-host persistent worktree — handled by γ's _run_inflight_verify caller).
-    # The caller-owned `quarantine` callable is the divergence-quarantine sink
-    # for fix (b)'s per-land cross-check below (task 2822): on a remote PASS /
-    # local trust-anchor FAIL split we hand it runner.name, and the lane's
-    # HostQuarantine.quarantine_divergent takes the host out of the shared
-    # HostAllocator's pool.  None is treated as "no quarantine sink" (module-level and
-    # test callers that pass nothing) — the cross-check still fails closed, it
-    # just records no host name.
-    if runner is not None:
-        # Remote path: build a single-runner pool from the injected runner.
-        # Warm-swap runs only for LOCAL leases (caller's responsibility).
-        # archive_root mirrors the local path (910-920) so remote stderr lands
-        # beside local merge-verify logs for side-by-side operator triage
-        # (task 1920, sibling of 1768).
-        pool = VerifyRunnerPool(
-            [runner],
-            event_store=event_store,
-            task_id=req.task_id,
-            archive_root=req.config.project_root / 'data' / 'verify-logs',
-        )
-    else:
-        # Local path: sole production site for human-facing local merge verify.
-        # archive_root mirrors the task-verify convention (workflow.py:4105):
-        # durable logs land under data/verify-logs/<task_id>/ so merge-verify
-        # and task-verify archives are co-located for operator triage.
-        # Cold-shadow (merge_queue.py:9112) and drift (9375/9402) are detective
-        # controls that intentionally leave archive_root=None — they are never
-        # constructed here and are auto-excluded by LocalRunner's default.
-        pool = VerifyRunnerPool(
-            [_local_merge_verify_runner(
-                merge_wt, req, effective_module_configs, task_files_tuple,
-                verifier=verifier, event_store=event_store,
-                history_leg_command=history_leg_command,
-            )],
-            event_store=event_store,
-            task_id=req.task_id,
-        )
-
-    # max_retries=0: post-merge verify hangs are usually deterministic
-    # (e.g. a deadlocked test); retrying just multiplies queue-wide stall.
-    # is_merge_verify=True: merge worktrees are freshly created per
-    # merge (no `.task/` dir and no warm cargo cache), so the cold
-    # timeout applies despite `_is_verify_cold`'s filesystem heuristic
-    # classifying them as warm.  The per-command cold timeout used here
-    # is `merge_verify_cold_command_timeout_secs` (config default 7200 s)
-    # if set, falling back to `verify_cold_command_timeout_secs` then warm.
-    #
-    # Merge-verify lease (task 2315, BUG 1; lock path converged onto the
-    # shared ``<lane_dir>.lock`` in task 2685): record the holder-pgid
-    # lease and hold the SAME ``<lane_dir>.lock`` that reify's
-    # seed-warm-lane.sh / thin-warm-lane.sh / warm-lane-gc.sh and DF's own
-    # ``_seed_warm_lane`` take (see ``GitOps.merge_verify_lease``) — but
-    # ONLY for a LOCAL in-process verify (runner is None) on the persistent
-    # warm lane (``git.persistent_merge_worktree`` on AND
-    # ``GitOps.is_persistent_merge_lane(merge_wt)``). Every other
-    # combination (remote runner, ephemeral worktree, knob off) leaves the
-    # AsyncExitStack empty — no lease recorded, byte-identical to before.
-    # Holding this lease lets :meth:`GitOps.reset_persistent_merge_worktree`
-    # and :meth:`GitOps._run_warm_lane_gc_reclaim` detect the in-flight
-    # verify and avoid clobbering/reclaiming the worktree out from under
-    # it. The residual window between ``reset_persistent_merge_worktree``
-    # returning *merge_wt* (above the caller of this function) and the
-    # lease being acquired here is now closed (task 2685, step-4):
-    # ``reset_persistent_merge_worktree`` itself holds the same
-    # ``<lane_dir>.lock`` across its own tree mutation, so a reify/DF actor
-    # is excluded across both spans, not just this one.
-    async with contextlib.AsyncExitStack() as stack:
-        if (
-            runner is None
-            and req.config.git.persistent_merge_worktree
-            and git_ops.is_persistent_merge_lane(merge_wt)
-        ):
-            await stack.enter_async_context(git_ops.merge_verify_lease())
-
-        # Task ε: attempts whose VERDICT is superseded by a retry below, but whose
-        # OBSERVATION is not.  §5.5 records the observation, not the remedy — and the
-        # compound case is real: `apply_merge_flake_suppression` runs on the SCOPED
-        # leg, so an attempt can suppress a scoped red (a genuine `passes_in_isolation`
-        # observation) and STILL come back failing because the unscoped gate then broke
-        # or the run hit ENOSPC.  That result is retried, `verify` is rebound, and
-        # recording only the settled verdict would silently drop the observation —
-        # exactly the load-correlated shape this PRD exists to measure, and one that
-        # WAS emitted inline (at the moment of observation) before ε moved recording to
-        # the dispatcher.  §8.3's `(test_id, observed_at, call_site)` dedup keeps a
-        # replay idempotent, and each attempt stamps its own `observed_at`, so every
-        # attempt contributes exactly one row per test.
-        superseded_observations: list[VerifyResult] = []
-
-        def _remember_superseded(v: VerifyResult) -> None:
-            """Stash *v* iff it carries an observation, just BEFORE `verify` is rebound."""
-            if getattr(v, 'flake_suppression', None) is not None:
-                superseded_observations.append(v)
-
-        verify = await pool.dispatch(
-            merge_sha, spec, depth=depth, speculative=speculative,
-            chain_items=chain_items, chain_build_ms=chain_build_ms,
-            dispatch_facts=dispatch_facts,
-        )
-        retry_facts = (dispatch_facts or MergeVerifyDispatchFacts()).as_retry()
-
-        # Transient-infra (disk pressure) retry: an ENOSPC failure is
-        # often a self-healing host condition.  Prune stale _merge-*
-        # worktrees (never task worktrees) and retry the verify once in
-        # the same merge_wt before escalating.
-        # ENOSPC always comes from the scoped phase (before the unscoped gate
-        # runs), so the sentinel check is not needed here.
-        if not verify.passed and _verify_hit_enospc(verify):
-            prior_enospc = enospc_retries.get(req.task_id, 0)
-            if prior_enospc < max_enospc:
-                enospc_retries[req.task_id] = prior_enospc + 1
-                enospc_keep = {merge_wt, *(keep_worktrees or ())}
-                pruned = await git_ops.prune_stale_merge_worktrees(keep=enospc_keep)
-                logger.warning(
-                    'Task %s: post-merge verify hit ENOSPC; pruned %d '
-                    'stale merge worktree(s), retrying verify once',
-                    req.task_id, len(pruned),
-                )
-                _remember_superseded(verify)
-                verify = await pool.dispatch(
-                    merge_sha, spec, attempt=1, depth=depth, speculative=speculative,
-                    chain_items=chain_items, chain_build_ms=chain_build_ms,
-                    dispatch_facts=retry_facts,
-                )
-        # Classified infra-transient retry (task ν, verify-scope-inversion-prd.md):
-        # a failing VerifyResult whose category is policy-table infra-transient
-        # (CategoryPolicy.is_infra_transient — semaphore timeout, disk_full-by-
-        # category, pytest INTERNALERROR, env_transient) but was NOT ENOSPC-
-        # string-matched above.  Mirrors the ENOSPC branch's shape and shares its
-        # enospc_retries/max_enospc budget (no new config knob); no worktree
-        # prune since this is not disk-specific.  Note the shared-budget
-        # coupling: if an earlier ENOSPC event already spent this task's
-        # budget, a later classified-infra failure gets ZERO in-place retry
-        # here and falls straight through to the persistent-hold branch below
-        # — still a loud infra_issue hold, never branch-blaming, just with no
-        # retry chance (see test_classified_infra_transient_zero_retry_after_
-        # shared_budget_exhausted in test_merge_queue.py).
-        elif not verify.passed and (verify.category or '') in INFRA_TRANSIENT_CATEGORIES:
-            # Failed-only merge-verify retry PRODUCER (PRD verify-retry-failed-
-            # only D2, re-wired in task 3059).  THIS is the only correct site:
-            # attempt-0 has just run and FAILED, so its own VerifyResult is the
-            # evidence the retry is narrowed against.  The shipped D2 built the
-            # env BEFORE the first dispatch from a sidecar nothing has ever
-            # written — which would have narrowed attempt-0 ITSELF had the file
-            # existed.  The causal chain now reads:
-            #
-            #   attempt-0 result -> build_attempt0_payload (DF-owned: this
-            #   result's per-test verdicts + a `cargo nextest list` planned
-            #   probe, with only the tree-OID pin and the profile list from
-            #   reify's target/reify-verify-attempt.json) -> INV-3 tree-OID
-            #   corroboration (assemble_retry_verify_env) -> narrowed retry.
-            #
-            # Guarded by req.retry_failed_only (D1, task 2833) so the flag-off /
-            # legacy path is byte-identical (D1's strict no-op guarantee).  Every
-            # fail-safe route — unreadable/malformed sidecar, a probe that could
-            # not produce a plan, a probe whose plan does not COVER attempt-0's
-            # observed failures, a rebased or uncorroborated tree, or a subset
-            # that would not materially narrow
-            # (merge_lane/retry_verify_env.py::_materially_narrows) — returns
-            # None and leaves `spec` untouched, so the retry runs FULL via the
-            # existing _reverify_rebased_tree (M4) semantics AND stays on the
-            # legacy budget.  A REMOTE dispatch (runner is not None) skips the
-            # producer altogether, with the same outcome: see
-            # verify_runner.py::MergeVerifySpec.
-            #
-            # `not narrowed` keeps this a once-per-call operation: the loop below
-            # may dispatch several times, but the subset is always attempt-0's.
-            if req.retry_failed_only and not narrowed and runner is None:
-                # spec.verify_env is attempt-0's OWN build environment (the
-                # shared sccache backend et al).  Threading it makes the
-                # `cargo nextest list` probe model the same build the verify
-                # performs — without it a warm lane's probe compiles cold.
-                attempt0 = await build_attempt0_payload(
-                    merge_wt, verify, verify_env=spec.verify_env
-                )
-                if attempt0 is not None:
-                    retry_env = await assemble_retry_verify_env(
-                        git_ops, req, merge_wt, attempt0
-                    )
-                    if retry_env is not None:
-                        spec = dataclasses.replace(
-                            spec, verify_env={**spec.verify_env, **retry_env}
-                        )
-                        narrowed = True
-                        # PRD verify-retry-failed-only D4 (§5.4): copy the
-                        # attempt-0 per-test verdict map into the caller's sink
-                        # so the warm shadow baseline is MERGED (attempt-0 ∪
-                        # partial narrowed-retry output) before storage.  This
-                        # narrowed retry re-runs ONLY the {did-not-pass} subset,
-                        # so its output alone OMITS every attempt-0-passed test →
-                        # a from-scratch full cold shadow compare would flag them
-                        # all only_cold → phantom born-at-L2 divergence.
-                        # Populated ONLY here (narrowed=True) so an
-                        # uncorroborated tree never seeds a stale baseline.
-                        if shadow_baseline_sink is not None:
-                            shadow_baseline_sink.update(
-                                {**attempt0.debug_verdicts, **attempt0.release_verdicts}
-                            )
-
-            # task 2835: a NARROWED (failed-only) retry — the producer directly
-            # above actually merged retry_env — earns its own SEPARATE, larger
-            # budget (max_narrowed/narrowed_retries), decoupled from the legacy
-            # enospc_retries/max_enospc budget so an unrelated prior ENOSPC event
-            # can never starve it.  A non-narrowed retry (flag off, a payload
-            # that could not be built/corroborated, or a remote dispatch) keeps
-            # sharing the legacy budget: at most `max_enospc` full re-verifies,
-            # which matches the pre-2835 single retry only at max_enospc == 1.
-            # reverify_member_solo never sets retry_failed_only, so it always
-            # lands here; its budget is pinned by
-            # orchestrator/tests/test_merge_queue_train_attribution.py::TestReverifyMemberSoloContract::test_persistent_infra_transient_red_earns_one_full_retry
-            retries, budget = (
-                (narrowed_retries, max_narrowed) if narrowed else (enospc_retries, max_enospc)
-            )
-            # The loop condition RE-CHECKS infra-category membership on every
-            # iteration (INV-4 storm-escape): a retry whose fresh category
-            # flips to a deterministic red (e.g. test_failure) exits
-            # immediately regardless of remaining budget, and falls through
-            # to the generic-block path below — never the transient-infra
-            # hold, never another retry.
-            while (
-                not verify.passed
-                and (verify.category or '') in INFRA_TRANSIENT_CATEGORIES
-                and retries.get(req.task_id, 0) < budget
-            ):
-                retries[req.task_id] = retries.get(req.task_id, 0) + 1
-                logger.warning(
-                    'Task %s: post-merge verify classified infra-transient '
-                    '(category=%s); retrying verify (attempt=%d, budget=%d, narrowed=%s)',
-                    req.task_id, verify.category, retries[req.task_id], budget, narrowed,
-                )
-                _remember_superseded(verify)
-                verify = await pool.dispatch(
-                    merge_sha, spec, attempt=retries[req.task_id], depth=depth,
-                    speculative=speculative, chain_items=chain_items,
-                    chain_build_ms=chain_build_ms, dispatch_facts=retry_facts,
-                )
-
-    # Task ε: record EVERY attempt's flake observation, oldest first.
-    #
-    # Placed after BOTH retry loops (ENOSPC and infra-transient) have finished
-    # rebinding `verify`, so the recording order matches the observation order and
-    # a single pass covers both loops.  A superseded attempt's VERDICT is dead, but
-    # its OBSERVATION is not (§5.5 — record the observation, not the remedy): an
-    # attempt whose SCOPED red was suppressed can still come back failing on the
-    # unscoped gate or on ENOSPC and be retried, and that suppression is a real
-    # masked red that the inline pre-ε emit would have reported at the moment it
-    # happened.  `superseded_observations` is empty on every path where no retry
-    # carried an observation, which is the overwhelmingly common case.
-    record_observation = functools.partial(
-        _record_flake_observation, req=req, merge_sha=merge_sha,
-        event_store=event_store, escalation_queue=escalation_queue,
-    )
-    for superseded in superseded_observations:
-        await record_observation(superseded)
-    await record_observation(verify)
-
-    # Invoke the optional result-capture callback (PRD §10 invariant 6(b)):
-    # called with the FINAL VerifyResult (after any ENOSPC retry) so the
-    # warm per-test results are always the last-observed verify for this commit.
-    # Default None keeps existing call sites byte-identical.
-    if on_result is not None:
-        on_result(verify)
-
-    # Fix (b) — per-land cross-check of a remote GREEN (task 2822).  A single
-    # remote host's green must not blindly decide a land: re-verify it with the
-    # LOCAL trust-anchor on the intact merge_wt BEFORE the land.  Scoped to a
-    # REMOTE dispatch (runner is not None) of a REAL-suite green — a trivial
-    # config-only pass ran no suite on either host, so there is nothing to
-    # cross-check and it is left for task 2823's trivial-pass main-red gate on
-    # the pass path below.  Gated by verify_cross_check_remote_green (default
-    # True).  LIVE (task 4579 correction — this was previously "provably
-    # INERT on main today") on any project with an enabled remote runner:
-    # reify's dark-factory-orchestrator.yaml has declared verify_runners
-    # with `laptop` enabled since 2026-06-10, so this branch runs for every
-    # REMOTE-dispatch green.  It executes a FULL LOCAL verify
-    # (LocalRunner(merge_wt, ...) below) inside the SAME awaited verify_task
-    # that _run_inflight_verify polls — precisely why that trigger's
-    # no-progress signal must include the content-mtime arm for REMOTE
-    # leases too (see the union of evidence sources in
-    # _run_inflight_verify's Abort trigger 3).
-    #
-    #   AGREE (local passes too)  → emit verdict_parity_ok, proceed to land.
-    #   DIVERGE (local FAILs)     → fail-CLOSED: quarantine the remote, file a
-    #                               dedup'd blocking verify_cross_check_mismatch
-    #                               escalation, and ADOPT the local FAIL verdict
-    #                               so the `if not verify.passed:` path below
-    #                               withholds the land and cleans up merge_wt.
-    #   local RunnerUnavailable   → fail-SAFE: emit verify_cross_check_inconclusive
-    #                               and TRUST the remote green (never block a land
-    #                               on a local infra hiccup — DriftDetector Invariant 5).
-    #   local INDETERMINATE       → fail-SAFE (task 3173): the local leg returned
-    #                               NORMALLY with passed=False, but EVERY failing leg
-    #                               it reported is verdict-less — today that means
-    #                               each was killed by an external signal
-    #                               (INDETERMINATE_VERDICT_CATEGORIES == {infra_kill};
-    #                               disk_full, semaphore_timeout and env_transient
-    #                               were adjudicated OUT and keep their veto). Emit
-    #                               verify_cross_check_inconclusive and TRUST the
-    #                               remote green — see the invariant on that arm.
-    #                               A MIXED run (one completed failing leg plus one
-    #                               killed leg) takes the DIVERGE arm, even though
-    #                               severity dominance makes its aggregate category
-    #                               'infra_kill'.
-    if (
-        runner is not None
-        and verify.passed
-        and not getattr(verify, 'trivial', False)
-        and req.config.verify_cross_check_remote_green
-    ):
-        cross_check_runner = LocalRunner(
-            merge_wt, req.config, effective_module_configs, task_files_tuple,
-            run_scoped=verifier.run_scoped,
-            run_unscoped=verifier.run_unscoped_typechecks,
-            task_id=req.task_id,
-            archive_root=req.config.project_root / 'data' / 'verify-logs',
-            event_store=event_store,
-        )
-        try:
-            # task 2873: defense-in-depth lane-lock for the REMOTE-path
-            # cross-check's local trust-anchor verify. DF 2685 (local consumer)
-            # and DF 2830 (laptop CLI span) put every OTHER merge-deciding local
-            # verify under merge_verify_lease, but this DF 2822 cross-check ran
-            # its full run_merge_verify OUTSIDE any lease — the runner-is-not-None
-            # guard means the LOCAL-dispatch lease at the top of this function
-            # (which requires runner is None) never fires here. Lock the ACTUAL
-            # merge_wt lane (persistent OR the ephemeral _merge-<hash> speculation
-            # worktree the cross-check verifies in — the incident's case), so a
-            # concurrent reseed/reclaim of THAT lane mutually excludes rather than
-            # clobbering the tree mid-verify (reify 2026-07-20, merge_sha
-            # 83336a32: ENOENT storm → spurious DIVERGE that withheld a good land).
-            # Gated on persistent_merge_worktree (mirrors the local-path gate):
-            # the lane-lock's contenders only exist in the warm-lane regime.
-            # (The contended-lease fail-safe is added in step-6; until then a
-            # MergeVerifyLeaseContended propagates to the requeue handler — a safe
-            # interim, never a clobber.)
-            async with contextlib.AsyncExitStack() as cross_stack:
-                if req.config.git.persistent_merge_worktree:
-                    await cross_stack.enter_async_context(
-                        git_ops.merge_verify_lease(lane_dir=merge_wt)
-                    )
-                local_verify = await cross_check_runner.run_merge_verify(merge_sha, spec)
-            # Task ε: the cross-check ran its OWN merge gate on the local trust
-            # anchor, so it can carry its own observation.  Its LocalRunner had
-            # both stores wired before ε and therefore emitted + bumped inline;
-            # recording it here is what keeps this detective-control path from
-            # regressing.  Inside the `try`, after the await, so a raised verify
-            # (handled below) records nothing — there is no verdict to record.
-            await record_observation(local_verify)
-        except RunnerUnavailable as exc:
-            # Fail-safe: a closed/flaky laptop trust-anchor must never block a
-            # remote green (symmetric with DriftDetector's Invariant 5).
-            if event_store is not None:
-                event_store.emit(
-                    EventType.verify_cross_check_inconclusive,
-                    task_id=req.task_id,
-                    data={
-                        'merge_sha': merge_sha,
-                        'remote_runner': runner.name,
-                        'reason': str(exc),
-                    },
-                )
-            logger.warning(
-                'Task %s: local cross-check trust-anchor unavailable for %s '
-                '(remote=%s) — trusting the remote green (fail-safe): %s',
-                req.task_id, merge_sha, runner.name, exc,
-            )
-        except MergeVerifyLeaseContended as exc:
-            # Fail-safe (task 2873): a contended lane-lock means a reseed/reclaim
-            # is actively mutating merge_wt — running the local verify now would
-            # reproduce the exact ENOENT mid-verify clobber this lease exists to
-            # prevent (reify 2026-07-20, merge_sha 83336a32: the ephemeral
-            # _merge-<hash> worktree was deleted mid-compile). We already hold a
-            # primary verdict (the remote green), so we SKIP the second-opinion
-            # cross-check and TRUST the remote green — mirroring the
-            # RunnerUnavailable fail-safe above and DriftDetector Invariant 5
-            # ("never block a good land on a local infra hiccup"). Do NOT set
-            # local_verify, do NOT quarantine, do NOT file an escalation, do NOT
-            # adopt a FAIL verdict — leaving `verify` = the remote green so the
-            # `if not verify.passed:` path below is skipped and the land proceeds.
-            # Deliberately DIFFERENT from the LOCAL-dispatch-path contention at
-            # the top of this function, which correctly PROPAGATES to the requeue
-            # handler (there is no primary verdict there); this catch keeps
-            # cross-check contention from reaching that handler.
-            if event_store is not None:
-                event_store.emit(
-                    EventType.verify_cross_check_inconclusive,
-                    task_id=req.task_id,
-                    data={
-                        'merge_sha': merge_sha,
-                        'remote_runner': runner.name,
-                        'reason': f'cross-check lane-lock contended: {exc}',
-                    },
-                )
-            logger.warning(
-                'Task %s: cross-check local trust-anchor could not acquire the '
-                'lane lock for %s (remote=%s) — a reseed/reclaim is in flight; '
-                'trusting the remote green (fail-safe, DriftDetector Invariant 5): %s',
-                req.task_id, merge_sha, runner.name, exc,
-            )
-        else:
-            # INVARIANT (task 3173): only a COMPLETED failing verdict on either
-            # host may veto a completed PASS.  A leg that was killed by an
-            # external signal, ran out of disk, or lost a semaphore never
-            # produced a verdict AT ALL — it holds no evidence about the branch,
-            # so discarding an already-built, already-verified merge commit on
-            # its say-so is pure waste.  Measured case: merge_sha b1ac2c7f, a
-            # completed 1097s remote PASS thrown away because the local leg was
-            # SIGKILLed at 0.31s under host load, then surfaced to the human as
-            # "Post-merge verification failed: Failures: lint issues" — a
-            # branch-blaming sentence about a process that emitted zero
-            # diagnostics.
-            #
-            # Same fail-SAFE shape as the two `except` arms above (emit
-            # verify_cross_check_inconclusive, do NOT quarantine, do NOT
-            # escalate, do NOT adopt a verdict — leave `verify` = the remote
-            # green so the `if not verify.passed:` path below is skipped and the
-            # land proceeds).  They are unreachable here only because a killed
-            # leg returns NORMALLY with passed=False instead of raising.
-            #
-            # The registry names only `infra_kill`, and every exclusion is an
-            # adjudicated CategoryPolicy.verdict_indeterminate row rather than
-            # set arithmetic over the infra-transient set:
-            #   - infra_timeout / pytest_internalerror / disk_full fail the
-            #     "the branch could not have CAUSED this" half — an introduced
-            #     deadlock, a conftest that raises only on this host's
-            #     interpreter, and a diff whose build artifacts fill the disk
-            #     are all non-completions a diff can genuinely cause;
-            #   - env_transient / semaphore_timeout fail the "the evidence is
-            #     structural, not text the branch can forge" half — see the
-            #     residuals verify_classify's own docstrings document at
-            #     :498-508 and :438-453.
-            # All of those keep vetoing (fail CLOSED), as does an EMPTY
-            # category.  Note the registry is UNRELATED to
-            # merge_disposition.MergeFailureDisposition.INDETERMINATE, which is
-            # post-failure attribution one layer up.
-            #
-            # GATE ON EVERY FAILING LEG, NOT THE AGGREGATE CATEGORY (task 3173
-            # review).  severity_rank makes `_worst_category` let a rank-1
-            # INFRA_KILL DOMINATE a co-occurring rank-11 TEST_FAILURE — correct
-            # for "how bad was this run" (retry budget, archival, the infra
-            # hold), catastrophic if read as "this run produced no verdict".  A
-            # trust anchor whose test leg COMPLETED and blamed the branch,
-            # alongside an unrelated SIGKILLed lint leg, aggregates to
-            # category='infra_kill'; keying the veto off that single value
-            # would discard the completed, branch-blaming evidence this
-            # cross-check exists to collect (task 2822) and land the remote
-            # PASS.  Only a run in which EVERY failing leg is verdict-less may
-            # decline to veto.  A None list ("not recorded" — an older remote's
-            # wire payload, or any result not produced by run_verification) and
-            # an empty one ("no legs recorded") both fall through to the
-            # `.passed ==` comparison below, i.e. fail CLOSED.
-            local_failing_legs = local_verify.failing_leg_categories or []
-            if not local_verify.passed and local_failing_legs and all(
-                c in INDETERMINATE_VERDICT_CATEGORIES for c in local_failing_legs
-            ):
-                if event_store is not None:
-                    event_store.emit(
-                        EventType.verify_cross_check_inconclusive,
-                        task_id=req.task_id,
-                        data={
-                            'merge_sha': merge_sha,
-                            'remote_runner': runner.name,
-                            'local_category': local_verify.category,
-                            'local_failing_leg_categories': local_failing_legs,
-                            'reason': (
-                                f'local trust-anchor produced no verdict on any '
-                                f'failing leg (legs={local_failing_legs!r}, '
-                                f'category={local_verify.category!r}): '
-                                f'{local_verify.summary}'
-                            ),
-                        },
-                    )
-                logger.warning(
-                    'Task %s: local cross-check trust-anchor produced NO verdict '
-                    'for %s (remote=%s, category=%s, failing_legs=%s) — trusting '
-                    'the remote green (fail-safe, DriftDetector Invariant 5): %s',
-                    req.task_id, merge_sha, runner.name,
-                    local_verify.category, local_failing_legs, local_verify.summary,
-                )
-            elif local_verify.passed == verify.passed:
-                # AGREE — both green.  Emit parity telemetry and proceed to land.
-                if event_store is not None:
-                    event_store.emit(
-                        EventType.verdict_parity_ok,
-                        task_id=req.task_id,
-                        data={
-                            'merge_sha': merge_sha,
-                            'local_runner': cross_check_runner.name,
-                            'remote_runner': runner.name,
-                            'passed': verify.passed,
-                        },
-                    )
-            else:
-                # DIVERGE — remote PASS / local trust-anchor FAIL.  Fail-closed:
-                # quarantine the remote, file a dedup'd escalation, and adopt the
-                # local FAIL verdict so the not-passed path below withholds the
-                # land.
-                #
-                # task 2886 fix 3 (PRD §3.4 / decision 4): a GENUINE concluded
-                # divergence means main is SUSPECTED-RED — a 'human must look now'
-                # condition (INV-5).  For that class HALT the queue via halt_hook
-                # FIRST, synchronously, right here — BEFORE quarantine/escalation
-                # and BEFORE adopting the local FAIL / returning the blocked
-                # outcome — so no FURTHER adoption can occur before a human looks.
-                # The async escalation-queue gate is only checked at the NEXT
-                # merger iteration, so it TRAILS adoption: incident 83336a32
-                # diverged +3s AFTER CAS-advance.  With verify_cross_check_remote_green
-                # on (default True) the cross-check is a BLOCKING pre-land local
-                # re-verify, NOT a trailing detector; the halt is synchronous
-                # purely so it precedes any further adoption.  None-safe: only the
-                # production worker call sites thread operator_halt.
-                #
-                # task 2886 amendment (reviewer robustness — bound the halt blast
-                # radius): only halt the WHOLE fleet when the local FAIL is a
-                # GENUINE test-level divergence.  A local FAIL whose category is
-                # policy-table infra-transient (SEMAPHORE_TIMEOUT, DISK_FULL,
-                # PYTEST_INTERNALERROR/OOM-class, ENV_TRANSIENT) is a LOCAL infra
-                # hiccup, NOT evidence main is red (DriftDetector Invariant 5:
-                # 'never block a good land on a local infra hiccup') — halting
-                # every lane on one flaky local verify would force an operator to
-                # un-halt for a non-divergence.  For that class fall back to the
-                # pre-fix-3 shape: quarantine the remote + withhold THIS land + an
-                # L1 blocking escalation (fail-closed for this land, no fleet halt,
-                # not born-at-L2).  A genuine failure — test_failure, a build/
-                # compile break on the intact merge_wt, or any non-infra /
-                # unclassified category — keeps the fix-3 halt + born-at-L2.
-                local_infra_fail = (
-                    (local_verify.category or '') in INFRA_TRANSIENT_CATEGORIES
-                )
-                if halt_hook is not None and not local_infra_fail:
-                    halt_hook(
-                        f'cross-check divergence for {merge_sha}: remote '
-                        f'{runner.name} PASS / local trust-anchor FAIL — '
-                        f'suspected red main'
-                    )
-                if quarantine is not None:
-                    quarantine(runner.name)
-                if (
-                    escalation_queue is not None
-                    and not escalation_queue.has_open_l1(_CROSS_CHECK_SENTINEL)
-                ):
-                    if local_infra_fail:
-                        # Local infra hiccup, not a genuine divergence: pre-fix-3
-                        # L1 blocking shape — land withheld + remote quarantined,
-                        # but NO fleet halt and NOT born-at-L2.
-                        _xc_severity, _xc_level = 'blocking', 1
-                        _xc_summary = (
-                            f'Cross-check divergence for {merge_sha}: '
-                            f'remote={runner.name!r} PASS / local trust-anchor FAIL '
-                            f'(local category={local_verify.category!r}, '
-                            f'infra-transient) — land withheld, {runner.name!r} '
-                            f'quarantined (queue NOT halted)'
-                        )
-                        _xc_detail = (
-                            f'merge_sha={merge_sha!r} remote_runner={runner.name!r} '
-                            f'reported PASS but the local trust-anchor re-verify '
-                            f'FAILED with an INFRA-TRANSIENT category '
-                            f'(summary={local_verify.summary!r}, '
-                            f'category={local_verify.category!r}).  Treated as a '
-                            f'LOCAL infra hiccup rather than a genuine main-red '
-                            f'divergence (DriftDetector Invariant 5): the land is '
-                            f'withheld and {runner.name!r} is quarantined, but the '
-                            f'merge queue is NOT halted.  If this recurs the remote '
-                            f'host env may be genuinely diverging — investigate '
-                            f'before clearing the quarantine.'
-                        )
-                        _xc_action = (
-                            'Investigate the local infra failure (was it a real '
-                            'divergence or a transient local hiccup?).  Clear the '
-                            "remote quarantine once the host's env is re-proved; no "
-                            'queue un-halt is needed (the queue was not halted).'
-                        )
-                    else:
-                        # Genuine divergence (task 2886 fix 3): born-at-L2 —
-                        # critical severity is in BORN_AT_L2_SEVERITIES so it is
-                        # born at level 2, mirroring the warm/cold shadow alarm;
-                        # the queue has been halted synchronously above.
-                        _xc_severity, _xc_level = 'critical', 2
-                        _xc_summary = (
-                            f'Cross-check divergence for {merge_sha}: '
-                            f'remote={runner.name!r} PASS / local trust-anchor FAIL '
-                            f'— merge queue HALTED, main suspected-red'
-                        )
-                        _xc_detail = (
-                            f'merge_sha={merge_sha!r} remote_runner={runner.name!r} '
-                            f'reported PASS but the local trust-anchor re-verify FAILED '
-                            f'(summary={local_verify.summary!r}, '
-                            f'category={local_verify.category!r}). A remote PASS / local '
-                            f'FAIL split can land unverified code on main; the land is '
-                            f'withheld and {runner.name!r} is quarantined.  The merge '
-                            f'queue has been HALTED synchronously and main is SUSPECTED '
-                            f'RED pending human review — no further land can proceed '
-                            f'until an operator confirms main is green and un-halts the '
-                            f'queue.'
-                        )
-                        _xc_action = (
-                            'Confirm whether main is actually red at this commit; if so, '
-                            'roll it back.  Re-prove the remote host env '
-                            '(run_verdict_parity) and clear its quarantine once parity is '
-                            'restored, then un-halt the merge queue.  Investigate why the '
-                            'remote green disagreed with the local trust-anchor.'
-                        )
-                    escalation_queue.submit(Escalation(
-                        id=escalation_queue.make_id(_CROSS_CHECK_SENTINEL),
-                        task_id=_CROSS_CHECK_SENTINEL,
-                        agent_role='orchestrator-cross-check',
-                        severity=_xc_severity,
-                        level=_xc_level,
-                        category='verify_cross_check_mismatch',
-                        summary=_xc_summary,
-                        detail=_xc_detail,
-                        suggested_action=_xc_action,
-                    ))
-                if event_store is not None:
-                    event_store.emit(
-                        EventType.verify_cross_check_mismatch,
-                        task_id=req.task_id,
-                        data={
-                            'merge_sha': merge_sha,
-                            'remote_runner': runner.name,
-                            'remote_passed': verify.passed,
-                            'local_passed': local_verify.passed,
-                        },
-                    )
-                logger.warning(
-                    'Task %s: cross-check DIVERGENCE for %s — remote %s PASS but '
-                    'local trust-anchor FAIL; withholding the land and quarantining %s',
-                    req.task_id, merge_sha, runner.name, runner.name,
-                )
-                # Adopt the local (failing) verdict so the `if not verify.passed:`
-                # path below withholds the land and cleans up merge_wt.
-                verify = local_verify
-
-    if not verify.passed:
-        await git_ops.cleanup_merge_worktree(merge_wt)
-
-        # Flock-worktree-contention sentinel (task 2307 β): a laptop-side verify
-        # reported that .merge_verify.lock was already held (task 2306 α).  Checked
-        # FIRST — before the unscoped-gate sentinel and the main-health probe — since
-        # contention is not a pre-existing main-HEAD break; probing would be wasteful
-        # and misleading.  Files a born-at-L2 escalation and keeps the merge blocked.
-        if is_flock_contention_failure(verify):
-            payload = verify.contention or {}
-            _alarm_verify_worktree_contention(
-                escalation_queue,
-                host=payload.get('host', '<unknown>'),
-                holder_pgid=payload.get('holder_pgid'),
-                waiter_pgid=payload.get('waiter_pgid'),
-            )
-            return MergeOutcome(
-                'blocked',
-                reason=f'Post-merge verification blocked: {verify.summary} [category: {verify.category}]',
-                failure_category=verify.category,
-            )
-
-        # Unscoped-gate sentinel: check this BEFORE the ENOSPC guard because the
-        # sentinel's type_output field carries type-check output (gate.detail) that
-        # could contain disk-full markers and be misclassified as transient-infra.
-        # Returns blocked directly without running the ENOSPC retry or main-health probe.
-        if is_unscoped_gate_failure(verify):
-            failing = ', '.join(unscoped_gate_failing_subprojects(verify))
-            if verify.category == UNSCOPED_TYPECHECK_TIMEOUT_CATEGORY:
-                reason = (
-                    f'Post-merge verification failed: unscoped type-check timed out '
-                    f'for {failing}.'
-                )
-                new_count = timeouts.get(req.task_id, 0) + 1
-                timeouts[req.task_id] = new_count
-                if new_count >= max_timeouts:
-                    logger.warning(
-                        'Task %s: post-merge unscoped type-check timed out %d times in a '
-                        'row — next submission will be abandoned',
-                        req.task_id, new_count,
-                    )
-            else:
-                reason = (
-                    f'Post-merge verification failed: unscoped type-check failed '
-                    f'for {failing}.'
-                )
-                detail = verify.type_output or ''
-                if detail:
-                    reason = f'{reason}\n\n{detail}'
-            if verify.category != UNSCOPED_TYPECHECK_TIMEOUT_CATEGORY:
-                _spawn_merge_verify_dry_run(
-                    dry_run_handles, req, reason, detail,
-                    event_store=event_store, verifier=verifier,
-                )
-            return MergeOutcome(
-                'blocked', reason=reason, block_category=MergeBlockCategory.POST_MERGE_VERIFY,
-            )
-
-        # Persistent ENOSPC after the prune-and-retry → transient infra.
-        if _verify_hit_enospc(verify):
-            detail = verify.failure_report()
-            reason = _transient_infra_reason(
-                _DISK_PRESSURE_CAUSE,
-                f'post-merge verify '
-                f'still reports no space left on device after pruning '
-                f'stale merge worktrees and retrying. {verify.summary}',
-            )
-            if detail:
-                reason = f'{reason}\n\n{detail}'
-            return MergeOutcome('blocked', reason=reason)
-
-        # Persistent classified infra-transient outcome after the bounded
-        # retry above → transient infra hold (task ν, verify-scope-inversion-
-        # prd.md).  Mirrors the persistent-ENOSPC branch immediately above but
-        # for policy-table infra categories that were not ENOSPC-string-
-        # matched.  Placed before the main-health probe / μ new-ids
-        # attribution / skew disposition / timeout loop-breaker / dry-run
-        # spawn / generic block below so this outcome consumes no merge
-        # verify attempt and routes through the same loud infra_issue L1
-        # consumer (workflow.py:6690) as the ENOSPC branch — no steward, no
-        # branch-blaming.
-        if (verify.category or '') in INFRA_TRANSIENT_CATEGORIES:
-            detail = verify.failure_report()
-            reason = _transient_infra_reason(
-                f'category={verify.category}',
-                f'post-merge verify classified infra-transient '
-                f'and did not clear after retry. {verify.summary}',
-            )
-            if detail:
-                reason = f'{reason}\n\n{detail}'
-            return MergeOutcome('blocked', reason=reason)
-
-        # Main-health probe: classify whether this failure is pre-existing on
-        # bare main HEAD rather than introduced by this merge.  Inserted after
-        # the ENOSPC early-return (ENOSPC is always task-side infra) and before
-        # the generic task-fault build so all 4 merge paths are covered uniformly.
-        # merge_wt is already cleaned up; the probe builds its own _mainprobe-
-        # worktree and always cleans it in a finally block.
-        #
-        # DEFERRED mode (main_health_probe_handles is not None — only
-        # SpeculativeMergeWorker._lane_post_merge_verify, which serves the
-        # in-flight verify and the single-branch gate re-verify):
-        # SKIP the synchronous probe entirely.  It can run for minutes
-        # (bounded only by the cold verify timeout) and would otherwise hold
-        # the caller's verify_task — hence the merge slot / host lease — for
-        # its full duration (task 2564, the reify 5067 stall).  Fall through
-        # to the provisional task-fault outcome below and spawn the
-        # classification as a detached background task; a confirmed
-        # pre-existing break is escalated separately, off the critical path,
-        # by _run_deferred_main_health_probe once it completes.
-        #
-        # SYNCHRONOUS mode (handles is None — solo-reverify, train (its gate
-        # re-verify included), and any other caller that does not pass a
-        # probe-handles bundle):
-        # unchanged behaviour from before this task.
-        if main_health_probe_handles is None:
-            main_health_outcome = await classify_main_health_red(
-                git_ops, req, verify, event_store,
-                escalation_queue=escalation_queue,
-            )
-            if main_health_outcome is not None:
-                return main_health_outcome
-        detail = verify.failure_report()
-        # Task μ (verify-scope-inversion-prd.md): when this failure carries
-        # junit-derived failing_test_ids and main's baseline is cache-warm (a
-        # gate-pass seed or an earlier probe), cite only the NEW failing ids
-        # (branch - baseline) instead of the generic summary (B1). The peek is
-        # COMPLETE for this verify's red modules (the whole tree when its ids
-        # are unattributed) or None, so "not present on main" is never claimed
-        # from a partial baseline; deferred mode reads it before this branch's
-        # own probe has run. CACHE-ONLY: never a probe on the critical path
-        # (G4, task 2564); a cold cache or failing_test_ids=None (OPAQUE/
-        # scoped/degraded) keeps today's wording (B3). The wholly-preexisting
-        # case (new_ids empty) is routed to MAIN_HEALTH_RED by
-        # classify_main_health_red / _run_deferred_main_health_probe; this
-        # enrichment fires only for a non-empty new-ids set, so it never
-        # contradicts that routing.
-        new_ids: frozenset[str] | None = None
-        if verify.failing_test_ids is not None:
-            try:
-                _current_main_sha = await git_ops.get_main_sha()  # type: ignore[union-attr]
-            except Exception:
-                _current_main_sha = ''
-            if _current_main_sha:
-                _cached_baseline = cached_main_baseline_failing_ids(
-                    _current_main_sha, red_module_prefixes=red_module_prefixes_of(verify),
-                )
-                if _cached_baseline is not None:
-                    new_ids = diff_new_failures(verify.failing_test_ids, _cached_baseline)
-        if new_ids:
-            reason = 'Post-merge verification failed: ' + describe_new_failing_ids(
-                new_ids, _current_main_sha,
-            )
-        else:
-            reason = f'Post-merge verification failed: {verify.summary}'
-            # Append the failure category so the timeout-vs-real-failure
-            # distinction is visible in the surviving human-facing signal
-            # without requiring log spelunking.  Append-only (after the
-            # summary, before the detail block) keeps all existing
-            # prefix/substring reason assertions green.
-            if verify.category:
-                reason = f'{reason} [category: {verify.category}]'
-        if detail:
-            reason = f'{reason}\n\n{detail}'
-        # Merge-skew attribution (task 2383 β, M2 of
-        # plans/merge-skew-attribution-prd.md): classify this non-preexisting
-        # (I1: the main-health probe above already returned None) task-fault
-        # failure when the caller supplied dispatch-time base facts.  Absent
-        # base facts (default None — the train and solo-reverify callers pass
-        # nothing) skips classification entirely: disposition stays
-        # MergeOutcome's INDETERMINATE default and failure_diagnostic stays
-        # None, byte-identical to pre-β behaviour (I3).  Runs BEFORE the
-        # dry-run spawn below so the enriched reason (with the 'port landed
-        # commit ... do not hunt your own diff' suffix) flows into the
-        # debugger's dry-run context too.
-        disposition = MergeFailureDisposition.INDETERMINATE
-        failure_diagnostic: dict[str, str] | None = None
-        # Stays None when classification is SKIPPED below (absent base facts) —
-        # the seam the step-18 emit guard keys on (task 3178): nothing was
-        # gathered, so no merge_attempt row is emitted for that INDETERMINATE.
-        skew_evidence: SkewEvidence | None = None
-        if merge_base_sha is not None and main_sha is not None:
-            # Resolve the CURRENT real published main HEAD (task 2869, I6): the
-            # merge-skew classifier filters cited landings to ancestors of real
-            # main, so an ORPHANED speculative-train tip (main_sha=item.base_sha,
-            # frozen at dispatch, that never fast-forwarded onto real main) never
-            # cites its dangling commits as a false INTEGRATION_SKEW (reify
-            # esc-5260-8). main_sha stays frozen = item.base_sha (2357 dispatch
-            # invariant untouched); real_main_head_sha is a distinct, additional
-            # input used only for the ancestor filter. Resolved HERE (post-merge
-            # classification), NOT in _run_inflight_verify where main_sha is
-            # frozen. Fail-safe (loud-over-silent): any get_main_sha error
-            # degrades to None -> the filter is skipped (today's pre-2869
-            # reference frame), WARN-logged, never crashes classification.
-            try:
-                real_main_head_sha: str | None = (await git_ops.get_main_sha()) or None
-            except Exception:
-                real_main_head_sha = None
-                logger.warning(
-                    'Task %s: get_main_sha() failed while resolving real main '
-                    'HEAD for the merge-skew ancestor filter; degrading to None '
-                    '(filter skipped, fail-safe)',
-                    req.task_id,
-                    exc_info=True,
-                )
-            disposition, failure_diagnostic, reason_suffix, skew_evidence = (
-                await _classify_disposition_for_outcome(
-                    verify, req=req, merge_base_sha=merge_base_sha,
-                    main_sha=main_sha, event_store=event_store,
-                    real_main_head_sha=real_main_head_sha,
-                )
-            )
-            if reason_suffix:
-                reason = f'{reason}\n\n{reason_suffix}'
-        # Loop-breaker bookkeeping: bump only when the failure was a
-        # pure timeout.  Real test/lint/type failures already bubble
-        # up to the steward and don't drive the re-queue oscillation
-        # the loop-breaker is designed to catch.
-        if verify.timed_out:
-            new_count = timeouts.get(req.task_id, 0) + 1
-            timeouts[req.task_id] = new_count
-            if new_count >= max_timeouts:
-                logger.warning(
-                    'Task %s: post-merge verify timed out %d times in a '
-                    'row — next submission will be abandoned',
-                    req.task_id, new_count,
-                )
-        if not verify.timed_out:
-            _spawn_merge_verify_dry_run(
-                dry_run_handles, req, reason, detail,
-                event_store=event_store, verifier=verifier,
-            )
-        # DEFERRED mode: spawn the off-critical-path main-health
-        # classification now that the provisional outcome is fully built.
-        # None-safe no-op in SYNCHRONOUS mode (handles is None).
-        #
-        # The return value tells us whether a probe is actually in flight —
-        # as opposed to a cheap guard having already confirmed this really
-        # is a plain task fault in both modes (see
-        # spawn_main_health_probe's docstring).  Task 2564 amendment
-        # (reviewer_comprehensive finding 1): only in the former case do we
-        # annotate the provisional reason as pending reclassification, so a
-        # steward/human reading it can tell "still being classified
-        # off-path" apart from a confirmed fault — without this, a
-        # subsequently-confirmed pre-existing main break would leave this
-        # task's blocked outcome misattributing the break to the task
-        # itself with no signal that a reclassification is in flight.
-        #
-        # HOST-AFFINITY (task 2565): record — but do not steer by — where
-        # the triggering post-merge verify ran.  `runner` is None for a
-        # local lease and a RemoteRunner (is_local=False) for a remote
-        # lease; getattr's True default covers any future runner-like
-        # object that omits is_local.  The probe itself always classifies
-        # locally (it is leaseless and never remote-affine — see
-        # verify_failure_is_preexisting_on_main); this only makes the
-        # placement decision observable in the main_health_red telemetry.
-        origin_is_local = runner is None or getattr(runner, 'is_local', True)
-        probe_pending = spawn_main_health_probe(
-            main_health_probe_handles, git_ops, req, verify,
-            escalation_queue=escalation_queue, event_store=event_store,
-            origin_is_local=origin_is_local,
-        )
-        if probe_pending:
-            reason = f'{reason}\n\n[{MAIN_HEALTH_PROBE_PENDING_NOTE}]'
-        return MergeOutcome(
-            'blocked', reason=reason,
-            failure_category=verify.category,
-            failure_cause_hint=verify.cause_hint,
-            disposition=disposition,
-            failure_diagnostic=failure_diagnostic,
-            skew_evidence=skew_evidence,
-            block_category=MergeBlockCategory.POST_MERGE_VERIFY,
-        )
-
-    # Task 2823 (gate-hole #3/3): a config-only merge (no .py/.rs in the diff)
-    # short-circuits to verify._trivial_pass WITHOUT running any suite, so a
-    # trivial pass is NOT evidence that main is green. Refuse to CAS-advance a
-    # trivial pass over a KNOWN-red main tip (its cached failing-id baseline is
-    # non-empty) — else the red persists (the reify 2026-07-19 incident:
-    # config-only 5247/5249 landed over #5120's red main and re-persisted it).
-    #
-    # CACHE-ONLY peek (known_failing_ids_on_main): never a probe on the
-    # critical path (G4, task 2564). It names every id known red at this SHA
-    # (seed, whole-tree or narrowed module probe); none known fails OPEN,
-    # matching the task's "known-red" scope. Keyed strictly on verify.trivial:
-    # a NON-trivial pass means the full suite ran on the merged tree and
-    # passed, which legitimately heals a red main and must NOT be blocked
-    # (else main-recovery merges would stall). Mirrors the failure-path idiom
-    # above (get_main_sha in a try/except, then a cache-only baseline read).
-    #
-    # getattr default False mirrors the VerifyResult dataclass default
-    # (verify.py: ``trivial: bool = False``): a result object lacking the field
-    # (e.g. a lightweight verify double, or a codec round-trip predating step-2)
-    # is treated as a NON-trivial pass, so the gate stays inert — the fail-open
-    # direction (a non-trivial pass legitimately heals a red main and must never
-    # be blocked). Production always returns a real VerifyResult, so this only
-    # affects stand-ins.
-    if getattr(verify, 'trivial', False):
-        try:
-            _pass_main_sha = await git_ops.get_main_sha()  # type: ignore[union-attr]
-        except Exception:
-            _pass_main_sha = ''
-        _known_red_ids = known_failing_ids_on_main(_pass_main_sha) if _pass_main_sha else frozenset()
-        if _known_red_ids:
-            # Distinct operator signal (task 2823 amendment,
-            # reviewer_comprehensive robustness finding): emit a dedicated
-            # WITHHELD warning — NOT the ordinary main-red-churn line — so the
-            # config-only-fixes-red edge is recognisable in the logs. A trivial
-            # pass runs no suite, so a config-only change that is ITSELF the fix
-            # for the red main can never prove the red cleared and will
-            # oscillate re-dispatch/block here; greening main needs a
-            # code-touching (non-trivial) merge or operator action, not another
-            # config-only re-dispatch.
-            logger.warning(
-                'Task %s: trivial-pass main-red gate WITHHELD a config-only '
-                'merge from advancing main %s over a known-red baseline (%d '
-                'failing test(s): %s). A trivial pass runs no suite, so if this '
-                'config-only change is itself the fix it cannot self-heal by '
-                're-dispatch — main must be greened by a code-touching merge or '
-                'operator action first.',
-                req.task_id, _pass_main_sha, len(_known_red_ids),
-                ', '.join(sorted(_known_red_ids)[:10]),
-            )
-            # Any non-None MergeOutcome return owns merge_wt cleanup (the caller
-            # only reuses merge_wt on a None pass return) — mirrors the
-            # verify-failed path's cleanup contract above.
-            await git_ops.cleanup_merge_worktree(merge_wt)
-            return MergeOutcome(
-                'blocked',
-                reason=(
-                    f'{TRIVIAL_PASS_MAIN_RED_REASON_PREFIX} '
-                    f'(main {_pass_main_sha:.8}, {len(_known_red_ids)} '
-                    f'failing test(s)): '
-                    + ', '.join(sorted(_known_red_ids)[:10])
-                ),
-                disposition=MergeFailureDisposition.MAIN_RED,
-            )
-
-    # Task μ (verify-scope-inversion-prd.md, B2): seed the per-main-SHA
-    # failing-test-id baseline for free on every successful merge+full gate
-    # run. merge_sha is the merged tree the caller will CAS-advance main to
-    # — it IS the next main tip, so seeding it here means the very next
-    # gate's baseline lookup is a cache hit, never a probe. Gated on
-    # verify.failing_test_ids not None (only merge+full breadth collects a
-    # junit report; a 'scoped' pass says nothing about main-at-large) and a
-    # non-empty merge_sha (nothing to key the seed on otherwise).
-    #
-    # Amendment (reviewer_comprehensive finding 1, task 2590): seed the
-    # EMPTY set rather than trusting verify.failing_test_ids verbatim.  We
-    # are on the pass path (verify.passed is True by construction — see the
-    # `if not verify.passed:` branch above, which always returns) so main
-    # has, by definition, no live failures.  The junit parser
-    # (_extract_failing_test_ids_from_junit) records any <testcase> with a
-    # <failure>/<error> child regardless of the run's overall outcome, so a
-    # rerun plugin (e.g. pytest-rerunfailures) that fails-then-passes a
-    # flaky test would otherwise seed that id into the baseline even though
-    # it is NOT actually red on main — silently masking a future genuine
-    # regression of that same test (the baseline-diff would wrongly treat
-    # it as pre-existing). Log loudly if that ever happens so the anomaly
-    # stays visible instead of silently degrading the baseline's soundness.
-    if merge_sha and verify.failing_test_ids is not None:
-        if verify.failing_test_ids:
-            logger.warning(
-                'Task %s: post-merge verify passed but junit reported %d '
-                'failing test id(s) on a pass (%s) — seeding the EMPTY set '
-                'as the baseline for %s instead of trusting the parsed ids '
-                '(likely a rerun-plugin retry-to-pass; a passing verify has '
-                'no live failures by definition)',
-                req.task_id, len(verify.failing_test_ids),
-                ', '.join(sorted(verify.failing_test_ids)), merge_sha,
-            )
-        seed_main_baseline(merge_sha, frozenset(), skipped=verify.skipped_test_ids)
-
-    return None
 
 
 async def _resolve_commit_tree(git_ops: GitOps, commit: str) -> str | None:
@@ -3290,7 +1355,7 @@ async def reverify_member_solo(
 ) -> SoloVerifyResult:
     """Run post-merge verification on a single train member's un-stacked solo branch.
 
-    Wraps :func:`_run_post_merge_verify` (which provides disk-guard, ENOSPC
+    Wraps :func:`run_post_merge_verify` (which provides disk-guard, ENOSPC
     prune-retry, and timeout loop-breaker semantics) but does NOT advance main.
     Fresh per-call ``timeouts`` / ``enospc_retries`` dicts are used so solo
     attempts do not count against the tip's existing timeout budgets.  The
@@ -3300,7 +1365,7 @@ async def reverify_member_solo(
     as a worker merge.
 
     Returns a :class:`SoloVerifyResult`:
-      - ``passed=True``  when ``_run_post_merge_verify`` returns ``None``.
+      - ``passed=True``  when ``run_post_merge_verify`` returns ``None``.
         The solo worktree and branch are **left intact** so that
         ``_attribute_train_failure`` can call ``advance_main`` against the live
         worktree without re-materialising it (keeps verify cost ≤N+1).
@@ -3322,9 +1387,9 @@ async def reverify_member_solo(
         task_files:     Task-scoped files list for scoped verify (may be None).
         module_configs: Module-level configs for multi-module projects.
         event_store:    Optional EventStore for telemetry (may be None).
-        verifier:       Forwarded to :func:`_run_post_merge_verify`; tests
+        verifier:       Forwarded to :func:`run_post_merge_verify`; tests
                         inject a fake through it.
-        escalation_queue: Forwarded to :func:`_run_post_merge_verify`, so a
+        escalation_queue: Forwarded to :func:`run_post_merge_verify`, so a
                         flake the main-health probe suppresses can still file
                         the INV-4 storm escalation.
 
@@ -3342,7 +1407,7 @@ async def reverify_member_solo(
         result=asyncio.get_running_loop().create_future(),
     )
 
-    outcome = await _run_post_merge_verify(
+    outcome = await run_post_merge_verify(
         git_ops, req, solo_wt,
         timeouts={},
         enospc_retries={},
@@ -4849,7 +2914,7 @@ class _TrainVerifyHost:
         only the local slot. No free slot leaves the train unleased on local.
         """
         allocator = worker._ensure_host_allocator(req.config)
-        factory = functools.partial(_placeholder_local_runner, merge_wt, req, worker._verifier)
+        factory = functools.partial(placeholder_local_runner, merge_wt, req, worker._verifier)
         if len(req.member_task_ids) > _TRAIN_REMOTE_VERIFY_MAX_MEMBERS:
             lease = allocator.acquire_local(factory)
         else:
@@ -4913,7 +2978,7 @@ async def _leased_train_verify(
 ) -> AsyncIterator[Callable[..., Awaitable[MergeOutcome | None]]]:
     """Lease a verify host for *req* and yield its verify on that host.
 
-    The yielded callable is ``_run_post_merge_verify`` on the worker's
+    The yielded callable is ``run_post_merge_verify`` on the worker's
     injected VerifyPort. A remote that turns out unreachable is benched and
     the same verify re-runs on local. A verify interrupted mid-run is aborted
     on its host and reaped through the worker's teardown chokepoint before
@@ -4922,7 +2987,7 @@ async def _leased_train_verify(
     exception.
     """
     verify_once = functools.partial(
-        _run_post_merge_verify,
+        run_post_merge_verify,
         timeouts=worker._post_merge_verify_timeouts,
         enospc_retries=worker._post_merge_verify_enospc_retries,
         max_timeouts=worker.MAX_POST_MERGE_VERIFY_TIMEOUTS,
@@ -4930,7 +2995,7 @@ async def _leased_train_verify(
         max_narrowed=worker.MAX_POST_MERGE_VERIFY_NARROWED_RETRIES,
         narrowed_retries=worker._post_merge_verify_narrowed_retries,
         event_store=worker._event_store,
-        quarantine=worker._host_quarantine.quarantine_divergent,
+        quarantine_divergent=worker._host_quarantine.quarantine_divergent,
         halt_hook=worker.operator_halt,
         escalation_queue=worker._escalation_queue,
         verifier=worker._verifier,
@@ -4972,7 +3037,7 @@ async def _do_train_merge(
 
     BEHAVIOUR-ADDING (task 1596): trains now inherit the full shared post-merge
     core already used by single-branch merges — specifically:
-      • disk-guard pre-verify short-circuit (_run_post_merge_verify)
+      • disk-guard pre-verify short-circuit (run_post_merge_verify)
       • verify-timeout loop-breaker (worker._post_merge_verify_timeouts)
       • post-merge content-equivalence gate (_finalize_advanced_merge)
       • unscoped pyright gate (_finalize_advanced_merge)
@@ -5220,7 +3285,7 @@ async def _do_train_merge(
 
     # (e) Workspace-wide post-merge verify via the shared helper, on the
     # worker's injected VerifyPort and a leased host (_leased_train_verify).
-    # _run_post_merge_verify runs the pre-verify disk guard, the scoped
+    # run_post_merge_verify runs the pre-verify disk guard, the scoped
     # verification (with ENOSPC prune-retry), and the timeout loop-breaker
     # bookkeeping.  Returns None when verify passes; returns a MergeOutcome
     # (and cleans up merge_wt) on a controlled failure.
@@ -6581,7 +4646,7 @@ class SpeculativeMergeWorker:
     MAX_CONTENDED_LEASE_DEFER_SECS: float = 14400.0
     # task 3043 amend (reviewer_comprehensive, robustness): upper bound on
     # _run_inflight_verify's orphan-guard reap.  The guard cancels its inner
-    # _run_post_merge_verify task and awaits it in a `finally` on a
+    # run_post_merge_verify task and awaits it in a `finally` on a
     # cancellation-unwind path, and BOTH external cancellers (stop()'s SIGTERM
     # _inflight drain and the head-failure cascade) await the outer task — so
     # an unbounded reap turns a slow inner unwind, against a host that is by
@@ -6786,7 +4851,7 @@ class SpeculativeMergeWorker:
         # merge-verify dry-run investigation spawn.  The worker holds none of
         # these itself in any other capacity — they exist solely to be
         # bundled into self._dry_run_handles below and threaded opaquely into
-        # _run_post_merge_verify by _lane_post_merge_verify
+        # run_post_merge_verify by _lane_post_merge_verify
         # (mirrors the train_callback_factory opaque-injection pattern
         # above: the worker never imports the scheduler).  All four default
         # to None so every existing bare git_ops+queue test constructor stays
@@ -6796,7 +4861,7 @@ class SpeculativeMergeWorker:
         self._usage_gate = usage_gate
         self._cost_store = cost_store
         self._background_tasks: set[asyncio.Task] = set()
-        self._dry_run_handles = _DryRunInvestigationHandles(
+        self._dry_run_handles = DryRunInvestigationHandles(
             scheduler=scheduler, mcp=mcp, usage_gate=usage_gate,
             cost_store=cost_store, background_tasks=self._background_tasks,
         )
@@ -11983,7 +10048,7 @@ class SpeculativeMergeWorker:
                     await _dt
 
         # η: cancel any still-in-flight merge-verify dry-run investigations
-        # (spawned by _spawn_merge_verify_dry_run and tracked in
+        # (spawned by spawn_merge_verify_dry_run and tracked in
         # self._background_tasks) so a detached run_dry_run_unblock — which
         # does git subprocess work and an LLM agent invocation — is not left
         # running after shutdown has been requested (task 2141 amendment
@@ -15022,7 +13087,7 @@ class SpeculativeMergeWorker:
         drain tears it down (shutdown-defensive, so it cannot itself be
         derailed the same way); at the
         three ``_run_inflight_verify`` triggers the escaping error is this
-        coroutine's own cancellation, so the nested ``_run_post_merge_verify``
+        coroutine's own cancellation, so the nested ``run_post_merge_verify``
         future it owns unwinds with the teardown that delivered it.
 
         Task 3204 considered making the reap unconditional HERE and did not,
@@ -15031,7 +13096,7 @@ class SpeculativeMergeWorker:
         that refactor promised to leave alone. **Task 3043 deliberately
         reversed that call — but at the CALLER, not here.** Reify 2026-07-25
         proved the gap was not theoretical: external cancellation left the
-        inner ``_run_post_merge_verify`` running against a down host and its
+        inner ``run_post_merge_verify`` running against a down host and its
         ``RunnerUnavailable`` unretrieved (``Task-350``), stranding the host
         out of the verify pool. The unconditional reap therefore lives in
         :meth:`_run_inflight_verify`'s own ``finally``, which owns that inner
@@ -15213,7 +13278,7 @@ class SpeculativeMergeWorker:
         once it confirms a still-fresh pre-existing break — this is the ONLY
         production path that can reach a main-health-red outcome, since the
         provisional outcome returned to the caller is always task-fault (see
-        :func:`_run_post_merge_verify`'s DEFERRED-mode docstring), so
+        :func:`run_post_merge_verify`'s DEFERRED-mode docstring), so
         ``TaskWorkflow._auto_heal_main_health`` (which keys off
         ``MAIN_HEALTH_RED_REASON_PREFIX``) never fires for it.
 
@@ -15313,12 +13378,12 @@ class SpeculativeMergeWorker:
         self, git_ops: GitOps, req: MergeRequest, merge_wt: Path, **per_call: Any,
     ) -> Coroutine[Any, Any, MergeOutcome | None]:
         """The single place that decides which lane handles a single-branch merge verify inherits."""
-        return _run_post_merge_verify(
+        return run_post_merge_verify(
             git_ops, req, merge_wt,
             max_narrowed=self.MAX_POST_MERGE_VERIFY_NARROWED_RETRIES,
             narrowed_retries=self._post_merge_verify_narrowed_retries,
             event_store=self._event_store,
-            quarantine=self._host_quarantine.quarantine_divergent,
+            quarantine_divergent=self._host_quarantine.quarantine_divergent,
             escalation_queue=self._escalation_queue,
             # task 2886 fix 3 (PRD §3.4 / decision 4): thread the synchronous
             # all-lane halt so a CONCLUDED cross-check divergence stops the
@@ -15379,7 +13444,7 @@ class SpeculativeMergeWorker:
         """Run the verify portion for one in-flight item.
 
         This is the VERIFY HALF of _verify_and_advance (the CAS half is
-        _finalize_inflight).  Warm-swap and _run_post_merge_verify are run
+        _finalize_inflight).  Warm-swap and run_post_merge_verify are run
         here; CAS advance_main and lease release are deferred to _finalize_inflight.
 
         LOCAL lease (lease.is_local=True):
@@ -15394,7 +13459,7 @@ class SpeculativeMergeWorker:
 
         REMOTE lease (lease.is_local=False):
             No warm-swap, no _verify_attempt_count increment.
-            _run_post_merge_verify(runner=lease.runner) dispatches on the
+            run_post_merge_verify(runner=lease.runner) dispatches on the
             injected RemoteRunner.
 
         Returns an InflightVerifyResult; does NOT resolve req.result (that is
@@ -15408,12 +13473,12 @@ class SpeculativeMergeWorker:
 
         depth: Verify-frontier stack height (task 2340, ε=1890), computed
             synchronously by the caller (_dispatch_item) before this task is
-            launched.  Forwarded into _run_post_merge_verify alongside
+            launched.  Forwarded into run_post_merge_verify alongside
             item.speculative.  ``None`` (default) keeps the _verify_and_advance
             shim and any other non-production caller byte-identical.
         probe_base: Variable-depth speculative-probe override (task 2359)
             for the ``main_sha`` dispatch-time fact fed to
-            _run_post_merge_verify's merge-skew classifier -- attributes
+            run_post_merge_verify's merge-skew classifier -- attributes
             this verify to a deeper already-built cumulative tip instead of
             item.base_sha.  Purely a classification/telemetry label: never
             mutates ``item`` itself (so the frozen-prefix base-chain
@@ -15435,7 +13500,7 @@ class SpeculativeMergeWorker:
         chain_items: Count, in CHAIN-ITEM units, of the items contained in
             the tree this verify ACTUALLY EXERCISES (task 3185, PRD γ) — the
             dispatching item is chain item #1 — forwarded into
-            _run_post_merge_verify alongside depth/speculative.
+            run_post_merge_verify alongside depth/speculative.
 
             The caller (_dispatch_item) always passes a flat ``1``: a
             dispatch that builds no chain contributes exactly the one item it
@@ -15554,7 +13619,7 @@ class SpeculativeMergeWorker:
         _is_warm_path = chain.lane_warm if chain is not None else False
         _warm_capture: list[VerifyResult] = []
         # PRD verify-retry-failed-only D4 (§5.4): attempt-0 verdict sink populated
-        # by _run_post_merge_verify ONLY on a corroborated narrowed retry; unioned
+        # by run_post_merge_verify ONLY on a corroborated narrowed retry; unioned
         # into the warm shadow baseline below (build_warm_shadow_results) so a
         # PARTIAL narrowed-retry map never triggers a phantom only_cold divergence.
         _attempt0_shadow: dict[str, str] = {}
@@ -16357,7 +14422,7 @@ class SpeculativeMergeWorker:
             return InflightVerifyResult(outcome=err_outcome, merge_wt=None)
         finally:
             # ── Orphan guard (task 3043, INV-C) ──────────────────────────────
-            # The inner _run_post_merge_verify task must NEVER outlive this
+            # The inner run_post_merge_verify task must NEVER outlive this
             # coroutine, on any exit route.  Reify 2026-07-25 (PID 3360397)
             # logged `Task-350: Task exception was never retrieved` carrying a
             # RunnerUnavailable from a speculative remote verify: the
@@ -17722,7 +15787,7 @@ class SpeculativeMergeWorker:
                 # Reachability, stated honestly (task 3251 amend): today
                 # vr.spec_warm CANNOT be True on this path.  The warm swap runs
                 # under `if lease.is_local` only, and a LOCAL lease dispatches
-                # runner=None, which makes _run_post_merge_verify build a
+                # runner=None, which makes run_post_merge_verify build a
                 # LocalRunner-only VerifyRunnerPool — and every
                 # RunnerUnavailable raise site is inside RemoteRunner, so no
                 # local-lease verify can raise it.
@@ -19137,7 +17202,7 @@ class SpeculativeMergeWorker:
         def _local_factory() -> LocalRunner:
             assert _item_for_factory.merge_wt is not None, \
                 'dispatch path: merge_wt must be non-None for a real item'
-            return _placeholder_local_runner(
+            return placeholder_local_runner(
                 _item_for_factory.merge_wt, _req_for_factory, self._verifier,
             )
 

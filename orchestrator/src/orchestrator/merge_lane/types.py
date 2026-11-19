@@ -997,7 +997,7 @@ class MergeRequest:
     Threaded from ``merge_request(retry_failed_only=...)`` (escalation server)
     onto the ``MergeRequest`` the merge worker dequeues, so it is visible on
     ``req`` inside the worker's post-merge verify retry path
-    (:func:`orchestrator.merge_lane.worker._run_post_merge_verify`).
+    (:func:`orchestrator.merge_lane.post_merge_verify.run_post_merge_verify`).
 
     When set, DF BUILDS THE SUBSET ITSELF (task 3059): on a classified
     infra-transient attempt-0 red it derives the {did-not-pass} set from that
