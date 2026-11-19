@@ -327,7 +327,7 @@ class MergeVerifySpec:
                           home (INV-9), and the file to read before assuming what a
                           key here means.
                           The failed-only retry env from
-                          orchestrator/src/orchestrator/merge_lane/worker.py::_build_retry_verify_env
+                          orchestrator/src/orchestrator/merge_lane/retry_verify_env.py::_build_retry_verify_env
                           has path-valued keys that cannot resolve remotely:
                           its nextest filter files are UNTRACKED files in the
                           dispatching host's merge_wt, which the git-pushed merge

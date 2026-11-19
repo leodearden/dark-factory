@@ -37,6 +37,7 @@ from orchestrator.merge_lane.shadow import (
     _shadow_compare_due,
     _submit_shadow_divergence_escalation,
     diff_per_test_results,
+    parse_per_test_results,
 )
 from orchestrator.merge_lane.worker import (
     PRODUCTION_VERIFIER,
@@ -46,7 +47,6 @@ from orchestrator.merge_lane.worker import (
     SpeculativeMergeWorker,
     _alarm_warm_shadow_unparseable,
     _maybe_schedule_shadow_compare,
-    parse_per_test_results,
 )
 from orchestrator.verify import VerifyResult
 
