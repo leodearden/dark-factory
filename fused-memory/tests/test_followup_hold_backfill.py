@@ -6,16 +6,22 @@ the store, as the stock filed before the hold existed is, and read back through 
 
 from __future__ import annotations
 
+import ast
+import logging
+import pathlib
 from typing import Any
 
 import pytest
+from _ast_guard import calls_named, parse_python_module
 from _submit_stack import Stack
 from _submit_stack import passthrough_main_checkout as passthrough_main_checkout
 from _submit_stack import stack as stack
 from shared.followup_hold_records import FOLLOWUP_HOLD_METADATA_KEY, FOLLOWUP_HOLDER_METADATA_KEY
 
+from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.models.reconciliation import EventType
 from fused_memory.models.scope import resolve_project_id
+from fused_memory.server import main as server_main
 
 _FOLLOWUP = {'source': 'agent-followup', 'spawn_context': 'agent_followup', 'spawned_from': '101'}
 _REVIEW = {'spawn_context': 'review_suggestions'}
@@ -107,3 +113,106 @@ async def test_with_nothing_to_hold_no_holder_is_minted(stack: Stack) -> None:
     assert await stack.events(EventType.followup_hold_backfilled) == [
         {'project_id': resolve_project_id(stack.root), 'count': 0},
     ]
+
+
+def test_the_backfill_is_enabled_by_default() -> None:
+    assert FusedMemoryConfig().followup_hold.backfill_enabled is True
+
+
+def test_the_backfill_can_be_switched_off() -> None:
+    config = FusedMemoryConfig.model_validate({'followup_hold': {'backfill_enabled': False}})
+
+    assert config.followup_hold.backfill_enabled is False
+
+
+class _RecordingBackfiller:
+    def __init__(self, failing: set[str]) -> None:
+        self.seen: list[str] = []
+        self._failing = failing
+
+    async def backfill_followup_holds(self, project_root: str) -> int:
+        self.seen.append(project_root)
+        if project_root in self._failing:
+            raise RuntimeError(f'store unreadable under {project_root}')
+        return 2
+
+
+@pytest.fixture
+def startup_roots(tmp_path: pathlib.Path) -> dict[str, str]:
+    for name in ('first', 'broken', 'last'):
+        (tmp_path / name).mkdir()
+    return {
+        name: str(tmp_path / name) for name in ('first', 'phantom', 'broken', 'last')
+    }
+
+
+@pytest.mark.asyncio
+async def test_startup_backfills_every_real_root_and_isolates_a_failure(
+    startup_roots: dict[str, str], caplog: pytest.LogCaptureFixture,
+) -> None:
+    backfiller = _RecordingBackfiller(failing={startup_roots['broken']})
+    caplog.set_level(logging.WARNING, logger='fused_memory.server.main')
+
+    await server_main._backfill_followup_holds(FusedMemoryConfig(), backfiller, startup_roots.values())
+
+    assert backfiller.seen == [startup_roots['first'], startup_roots['broken'], startup_roots['last']]
+    warned = [record for record in caplog.records if record.levelno == logging.WARNING]
+    failed = [record for record in caplog.records if record.levelno == logging.ERROR]
+    assert any(startup_roots['phantom'] in record.getMessage() for record in warned), warned
+    assert [startup_roots['broken'] in record.getMessage() for record in failed] == [True], failed
+
+
+@pytest.mark.asyncio
+async def test_a_disabled_backfill_touches_no_project(startup_roots: dict[str, str]) -> None:
+    backfiller = _RecordingBackfiller(failing=set())
+    config = FusedMemoryConfig.model_validate({'followup_hold': {'backfill_enabled': False}})
+
+    await server_main._backfill_followup_holds(config, backfiller, startup_roots.values())
+
+    assert backfiller.seen == []
+
+
+def _run_server() -> ast.AsyncFunctionDef:
+    tree = parse_python_module(pathlib.Path(server_main.__file__).resolve())
+    found = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == 'run_server'
+    ]
+    assert len(found) == 1, 'run_server not found in server/main.py'
+    return found[0]
+
+
+def _is_known_projects_values(node: ast.expr) -> bool:
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == 'values'
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == '_known_projects_map'
+    )
+
+
+def test_run_server_awaits_the_backfill_after_the_interceptor_starts_and_before_serving() -> None:
+    run_server = _run_server()
+    backfills = calls_named(run_server, '_backfill_followup_holds')
+    awaited = [
+        node.value for node in ast.walk(run_server)
+        if isinstance(node, ast.Await) and isinstance(node.value, ast.Call)
+        and node.value in backfills
+    ]
+    assert len(backfills) == 1 and awaited == backfills, (
+        'run_server must await _backfill_followup_holds exactly once, never spawn it'
+    )
+    [backfill] = backfills
+    assert any(_is_known_projects_values(argument) for argument in backfill.args), (
+        'the backfill must walk the _known_projects_map snapshot the re-mint sweep walks'
+    )
+    starts = [
+        call for call in calls_named(run_server, 'start')
+        if isinstance(call.func, ast.Attribute)
+        and isinstance(call.func.value, ast.Name) and call.func.value.id == 'task_interceptor'
+    ]
+    servers = calls_named(run_server, 'create_mcp_server')
+    assert len(starts) == 2, 'expected task_interceptor.start() in both reconciliation branches'
+    assert len(servers) == 1
+    assert max(call.lineno for call in starts) < backfill.lineno < servers[0].lineno
