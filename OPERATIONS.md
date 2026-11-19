@@ -4709,10 +4709,12 @@ dates already past the window are abandoned in one WARNING,
 `abandoning <n> never-run date(s) <first>..<last>`.
 The 03:00 scheduled pass after a post-midnight catch-up re-targets the date
 the catch-up already ran. Because the schedule cursor has already reached
-that date, that pass skips sessions the session ledger holds, as a retry
-does, and so re-codes only what the catch-up did not land (task 7025;
-`scripts/legibility/trickle_state.py::schedule_reached`). A manual `--date`
-pass still re-codes everything.
+that date, that pass draws the same sample and codes only the selected
+sessions the session ledger does not hold. So it codes only what the
+catch-up selected and did not land, never a near-duplicate of a session the
+catch-up coded, and it records the night's sample as the catch-up did
+(task 7025; `scripts/legibility/nightly.py::_ledger_skips`). A manual
+`--date` pass still re-codes everything.
 
 **The escalation it files.** `task_id=legibility-trickle-health-<project_id>`
 (deliberately distinct from the nightly's own
