@@ -3707,8 +3707,8 @@ class TestFetchProductionRankingsHoldsALease:
         service is built right after it, both before the `with`.  A
         `bake.load_cleanup_script()` evaluated in the `with` header would sit
         after both and before the `try` — the one window where a raise
-        (`_load_sibling_script` raises `FixtureError` when the spec cannot be
-        built) leaks the directory and skips `close()`.
+        (a sibling whose body raises on first load propagates out of
+        `load_script`) leaks the directory and skips `close()`.
 
         Asserted as "NO resolution happens once a resource exists": the
         `ephemeral_collection_prefix()` call above resolves the reaper either
