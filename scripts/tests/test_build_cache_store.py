@@ -3,17 +3,22 @@
 Both live under scripts/deploy/ (PRD C13 of
 plans/canonical-build-path-shared-cache-prd.md). The pruner is driven as a CLI
 over a fixture store laid out as sccache's remote layout `<k0>/<k1>/<k2>/<key>`,
-with a `systemctl` shim on PATH standing in for the user manager. Tests that
-need a WebDAV server run a private real rclone on loopback; no test touches the
-real user manager, ~/.config, ~/.cache or ports 4226/4227.
+with a `systemctl` shim on PATH standing in for the user manager. The installer
+runs in a scratch HOME against fake_user_systemctl.py, which really launches the
+store unit it wrote, plus `tailscale` and `loginctl` shims. Tests that need a
+WebDAV server run a private real rclone on loopback; no test touches the real
+user manager, ~/.config, ~/.cache or ports 4226/4227.
 """
 from __future__ import annotations
 
 import base64
+import contextlib
 import http.client
 import json
 import os
+import shlex
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -30,9 +35,18 @@ from laptop_battery_guard_fixtures import write_shims
 
 DEPLOY = Path(__file__).resolve().parents[1] / "deploy"
 PRUNER = DEPLOY / "build_cache_store_prune.py"
+INSTALLER = DEPLOY / "install_build_cache_store.sh"
+FAKE_SYSTEMCTL = Path(__file__).resolve().parent / "fake_user_systemctl.py"
 CLI_TIMEOUT = cli_timeout_from_env("BUILD_CACHE_STORE_TEST_TIMEOUT")
 
 STORE_UNIT = "build-cache-store.service"
+PRUNE_SERVICE = "build-cache-store-prune.service"
+PRUNE_TIMER = "build-cache-store-prune.timer"
+STORE_UNITS = (STORE_UNIT, PRUNE_SERVICE, PRUNE_TIMER)
+FAKE_TAILSCALE_ADDR = "127.0.0.2"
+DEFAULT_CAP_BYTES = 300 << 30
+HEX = "0123456789abcdef"
+SYSTEMCTL_MUTATIONS = {"daemon-reload", "enable", "disable", "start", "restart", "stop"}
 DAY = 86400.0
 HOUR = 3600.0
 
@@ -337,3 +351,249 @@ class TestPrune:
             status = http_request("GET", url, auth)[0]
         assert status == 404
         assert proc.poll() is None
+
+
+_TAILSCALE_SHIM = """\
+if [ "${1:-}" = ip ] && [ "${2:-}" = -4 ]; then
+  printf '%s\\n' "${FAKE_TS_ADDR-127.0.0.2}"
+  exit 0
+fi
+exit 1
+"""
+
+_LOGINCTL_SHIM = """\
+printf '%s\\n' "${FAKE_LINGER:-yes}"
+"""
+
+
+class StoreWorld:
+    """A scratch HOME, a fake user manager and a private port for the installer."""
+
+    def __init__(self, tmp_path: Path) -> None:
+        self.home = tmp_path / "home"
+        self.home.mkdir()
+        self.state = tmp_path / "state"
+        self.state.mkdir()
+        self.bin = tmp_path / "bin"
+        write_shims(
+            self.bin,
+            {
+                "tailscale": _TAILSCALE_SHIM,
+                "loginctl": _LOGINCTL_SHIM,
+                "systemctl": f'exec {shlex.quote(sys.executable)} -I {shlex.quote(str(FAKE_SYSTEMCTL))} "$@"\n',
+            },
+        )
+        self.port = free_port()
+        inherited = {k: v for k, v in os.environ.items() if not k.startswith("XDG_")}
+        self.env = {
+            **inherited,
+            "HOME": str(self.home),
+            "PATH": f"{self.bin}{os.pathsep}{os.environ['PATH']}",
+            "FAKE_SYSTEMD_STATE": str(self.state),
+            "BUILD_CACHE_STORE_PORT": str(self.port),
+        }
+        self.store = self.home / ".cache" / "build-cache-store"
+        self.credentials_file = self.home / ".config" / "build-cache-store" / "credentials"
+        self.unit_dir = self.home / ".config" / "systemd" / "user"
+        self.pruner_copy = self.home / ".local" / "lib" / "build-cache-store" / PRUNER.name
+
+    def stub_rclone(self) -> None:
+        """An rclone that preflight can resolve but nothing ever serves from."""
+        write_shims(self.bin, {"rclone": "exit 0\n"})
+
+    def install(self, *args: str, **env: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["bash", str(INSTALLER), *args],
+            env={**self.env, **env},
+            cwd=self.home.parent,
+            capture_output=True,
+            text=True,
+            timeout=2 * CLI_TIMEOUT,
+        )
+
+    def credentials(self) -> dict[str, str]:
+        pairs = (line.partition("=") for line in self.credentials_file.read_text().splitlines())
+        return {name: value for name, sep, value in pairs if sep}
+
+    def auth(self) -> tuple[str, str]:
+        credentials = self.credentials()
+        return credentials["RCLONE_USER"], credentials["RCLONE_PASS"]
+
+    def unit_text(self, unit: str) -> str:
+        return (self.unit_dir / unit).read_text()
+
+    def exec_start(self, unit: str) -> list[str]:
+        lines = [
+            line.removeprefix("ExecStart=")
+            for line in self.unit_text(unit).splitlines()
+            if line.startswith("ExecStart=")
+        ]
+        assert len(lines) == 1, lines
+        return shlex.split(lines[0])
+
+    def systemctl_calls(self) -> list[list[str]]:
+        log = self.state / "systemctl.log"
+        if not log.exists():
+            return []
+        return [json.loads(line) for line in log.read_text().splitlines()]
+
+    def mutations(self) -> list[list[str]]:
+        return [
+            call for call in self.systemctl_calls() if SYSTEMCTL_MUTATIONS & set(call)
+        ]
+
+    def store_pid(self) -> int:
+        return int((self.state / f"{STORE_UNIT}.pid").read_text())
+
+    def is_enabled(self, unit: str) -> bool:
+        return (self.state / f"{unit}.enabled").exists()
+
+    def kill_services(self) -> None:
+        for pid_file in self.state.glob("*.pid"):
+            with contextlib.suppress(ProcessLookupError, ValueError):
+                os.killpg(int(pid_file.read_text()), signal.SIGKILL)
+
+
+@pytest.fixture
+def store_world(tmp_path: Path) -> Iterator[StoreWorld]:
+    world = StoreWorld(tmp_path)
+    try:
+        yield world
+    finally:
+        world.kill_services()
+
+
+@pytest.fixture
+def installed(store_world: StoreWorld) -> StoreWorld:
+    proc = store_world.install()
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    return store_world
+
+
+def leaf_layout() -> set[Path]:
+    return (
+        {Path(a) for a in HEX}
+        | {Path(a, b) for a in HEX for b in HEX}
+        | {Path(a, b, c) for a in HEX for b in HEX for c in HEX}
+    )
+
+
+def addr_values(command: list[str]) -> list[str]:
+    return [command[i + 1] for i, arg in enumerate(command) if arg == "--addr"]
+
+
+@needs_rclone
+class TestStoreInstall:
+    def test_apply_lays_out_store_credentials_and_pruner(self, installed: StoreWorld) -> None:
+        dirs = {path.relative_to(installed.store) for path in installed.store.rglob("*") if path.is_dir()}
+        assert len(dirs) == 16 + 256 + 4096
+        assert dirs == leaf_layout()
+        assert installed.credentials_file.stat().st_mode & 0o777 == 0o600
+        assert set(installed.credentials()) >= {"RCLONE_USER", "RCLONE_PASS"}
+        assert installed.pruner_copy.read_bytes() == PRUNER.read_bytes()
+        assert os.access(installed.pruner_copy, os.X_OK)
+
+    def test_store_round_trips_on_both_addresses(self, installed: StoreWorld) -> None:
+        auth = installed.auth()
+        for address in ("127.0.0.1", FAKE_TAILSCALE_ADDR):
+            url = f"http://{address}:{installed.port}/0/0/0/{os.urandom(8).hex()}"
+            body = os.urandom(2048)
+            assert http_request("PUT", url, auth, body)[0] in (200, 201, 204)
+            assert http_request("GET", url, auth) == (200, body)
+            assert http_request("GET", url)[0] == 401
+
+    def test_store_unit_binds_only_loopback_and_tailscale(self, installed: StoreWorld) -> None:
+        command = installed.exec_start(STORE_UNIT)
+        assert addr_values(command) == [
+            f"127.0.0.1:{installed.port}",
+            f"{FAKE_TAILSCALE_ADDR}:{installed.port}",
+        ]
+        text = installed.unit_text(STORE_UNIT)
+        lines = text.splitlines()
+        assert "Restart=always" in lines
+        assert "Environment=RCLONE_CONFIG=/dev/null" in lines
+        assert installed.auth()[1] not in text
+
+    def test_prune_timer_is_enabled_and_runs_the_installed_pruner(
+        self, installed: StoreWorld
+    ) -> None:
+        assert installed.is_enabled(PRUNE_TIMER)
+        assert installed.is_enabled(STORE_UNIT)
+        assert installed.exec_start(PRUNE_SERVICE) == [
+            "/usr/bin/python3",
+            "-I",
+            str(installed.pruner_copy),
+            str(installed.store),
+            "--cap-bytes",
+            str(DEFAULT_CAP_BYTES),
+            "--rclone-unit",
+            STORE_UNIT,
+        ]
+
+    def test_check_after_apply_passes(self, installed: StoreWorld) -> None:
+        proc = installed.install("--check")
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+
+    def test_reapply_changes_nothing_and_keeps_the_store_running(
+        self, installed: StoreWorld
+    ) -> None:
+        before = {unit: installed.unit_text(unit) for unit in STORE_UNITS}
+        credentials = installed.credentials_file.read_bytes()
+        pid = installed.store_pid()
+        calls_before = len(installed.systemctl_calls())
+
+        proc = installed.install()
+
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert {unit: installed.unit_text(unit) for unit in STORE_UNITS} == before
+        assert installed.credentials_file.read_bytes() == credentials
+        assert installed.store_pid() == pid
+        rerun_calls = installed.systemctl_calls()[calls_before:]
+        assert not [call for call in rerun_calls if "restart" in call]
+
+    def test_check_detects_a_drifted_unit(self, installed: StoreWorld) -> None:
+        with (installed.unit_dir / STORE_UNIT).open("a") as unit:
+            unit.write("# hand edit\n")
+        proc = installed.install("--check")
+        assert proc.returncode == 1
+        assert STORE_UNIT in proc.stderr
+
+
+class TestStoreCheck:
+    def test_check_on_a_fresh_home_fails_and_writes_nothing(
+        self, store_world: StoreWorld
+    ) -> None:
+        store_world.stub_rclone()
+        proc = store_world.install("--check")
+        assert proc.returncode == 1
+        assert str(store_world.credentials_file) in proc.stderr
+        assert str(store_world.store) in proc.stderr
+        assert list(store_world.home.iterdir()) == []
+        assert store_world.mutations() == []
+
+
+class TestStoreRefusals:
+    @pytest.mark.parametrize(
+        ("env", "named"),
+        [
+            ({"FAKE_TS_ADDR": ""}, "tailscale"),
+            ({"FAKE_TS_ADDR": "0.0.0.0"}, "0.0.0.0"),
+            ({"FAKE_LINGER": "no"}, "Linger"),
+        ],
+        ids=["empty-tailscale-address", "wildcard-address", "lingering-off"],
+    )
+    def test_preflight_refuses_and_writes_nothing(
+        self, store_world: StoreWorld, env: dict[str, str], named: str
+    ) -> None:
+        store_world.stub_rclone()
+        proc = store_world.install(**env)
+        assert proc.returncode == 1
+        assert named in proc.stderr
+        assert list(store_world.home.iterdir()) == []
+        assert store_world.mutations() == []
+
+    def test_unexpected_argument_exits_two(self, store_world: StoreWorld) -> None:
+        store_world.stub_rclone()
+        proc = store_world.install("--bogus")
+        assert proc.returncode == 2
+        assert list(store_world.home.iterdir()) == []
