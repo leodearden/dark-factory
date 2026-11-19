@@ -27,6 +27,8 @@ from typing import Literal
 import pytest
 from _verify_config_corpus import DF_CONFIG_PATH, load_config_scalar
 
+from orchestrator.defect_tests_config import DefectTestsConfig, DefectTestsMode
+from orchestrator.verify import _with_defect_plugin_str
 from orchestrator.verify_cmd import ChainSegment, split_and_chain_segments
 
 # Loaded from the COMMITTED config rather than hand-copied a third time.
@@ -48,6 +50,13 @@ _SEGMENT_KEYS = {
     'skip_reason',
     'scope_launch_refused',
 }
+
+
+def _as_the_test_leg_runs_it(command: str) -> str:
+    """*command* as a segment runs it under the default defect mode: with ``-p _df_defect_plugin``."""
+    injected = _with_defect_plugin_str(command)
+    assert injected is not None  # None only for a None input
+    return injected
 
 
 def _fleet_segments() -> list[ChainSegment]:
@@ -815,7 +824,9 @@ class TestRunVerificationSegmentChainedTestWiring:
 
         test_calls = [c for c in calls if 'pytest' in c['cmd']]
         assert len(test_calls) == len(segments)
-        assert [c['cmd'] for c in test_calls] == [s.command for s in segments]
+        assert [c['cmd'] for c in test_calls] == [
+            _as_the_test_leg_runs_it(s.command) for s in segments
+        ]
         assert [c['cwd'] for c in test_calls] == [tmp_path / s.cwd_rel for s in segments]
 
     @pytest.mark.asyncio
@@ -1044,6 +1055,7 @@ class TestSegmentsAreDashNCapped:
         """Blast-radius guard: this repo's live value must stay byte-identical."""
         _result, calls, _runs = await self._run_capped(
             tmp_path, verify_admission_pytest_n='auto',
+            defect_tests=DefectTestsConfig(mode=DefectTestsMode.OFF),
         )
 
         assert self._segment_cmds(calls) == [s.command for s in _fleet_segments()]
@@ -1059,6 +1071,7 @@ class TestSegmentsAreDashNCapped:
         """
         _result, calls, _runs = await self._run_capped(
             tmp_path, verify_admission_enabled=False,
+            defect_tests=DefectTestsConfig(mode=DefectTestsMode.OFF),
         )
 
         assert self._segment_cmds(calls) == [s.command for s in _fleet_segments()]
@@ -1129,8 +1142,9 @@ class TestTheSerialRecoveryRoundTripStaysUncapped:
     def _recovery_chain_segments(worktree) -> list[str]:
         """What the recovery pass's segments must be, derived not hardcoded.
 
-        Computed as ``split_and_chain_segments(_serial_pytest_str(chain, invocation_dir=worktree))`` —
-        the same two transforms production composes — so if `serial_pytest`'s
+        Computed as ``split_and_chain_segments(_serial_pytest_str(chain, invocation_dir=worktree))``,
+        each segment then given the default defect mode's plugin pair by
+        ``_as_the_test_leg_runs_it`` — the transforms production composes — so if `serial_pytest`'s
         emitted form ever changes, this expectation follows it and the test
         keeps asserting "the cap added nothing" rather than freezing one
         rendering of the recovery chain.
@@ -1146,7 +1160,7 @@ class TestTheSerialRecoveryRoundTripStaysUncapped:
         assert serial != _FLEET_TEST_COMMAND, 'the fleet chain must actually serialise'
         segments = split_and_chain_segments(serial)
         assert segments is not None, 'the serialised chain must still be segmentable'
-        return [s.command for s in segments]
+        return [_as_the_test_leg_runs_it(s.command) for s in segments]
 
     @pytest.mark.real_verify_admission
     @pytest.mark.asyncio

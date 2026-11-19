@@ -119,6 +119,7 @@ from orchestrator.verify_cmd import (
     serial_pytest,
     split_and_chain_segments,
     split_chain_tail,
+    with_defect_plugin,
     with_junitxml,
     with_pytest_timeout,
 )
@@ -2597,6 +2598,32 @@ def _with_junitxml_str(cmd: str | None, junit_path: str) -> str | None:
                 'flake confirmation and the per-test timeout floor are unavailable',
                 cmd,
                 junit_path,
+            )
+        return cmd
+    return render(rewritten)
+
+
+def _with_defect_plugin_str(cmd: str | None) -> str | None:
+    """Inject ``-p _df_defect_plugin`` into a structured ``pytest`` command, via VerifyCmd.
+
+    The string-level parse -> ``with_defect_plugin`` -> identity -> render
+    wrapper, shaped like ``_with_junitxml_str``: an untouched command comes
+    back BYTE-identical. A raw-retained pytest chain is the one suppression
+    logged at INFO (plans/defect-tests-prd.md B22), because that leg loses a
+    named capability. An OPAQUE, non-pytest or already-injected command was
+    never going to gain the plugin here, so it is not logged.
+    """
+    if cmd is None:
+        return None
+    parsed = parse_config_command(cmd)
+    rewritten = with_defect_plugin(parsed)
+    if rewritten is parsed:
+        if parsed.tool is ToolKind.PYTEST and parsed.raw is not None:
+            logger.info(
+                'defect plugin injection suppressed: %s is a raw-retained pytest '
+                'command, so no collection map is written for this leg, and its '
+                'defect proof and keep-check record unsupported',
+                cmd,
             )
         return cmd
     return render(rewritten)
@@ -6071,6 +6098,12 @@ class _ClockKw(TypedDict, total=False):
     clock_stop: ClockStopConfig | None
 
 
+class _DefectPluginKw(TypedDict, total=False):
+    """Keyword arguments for the defect-plugin PYTHONPATH merge in ``_run_cmd``."""
+
+    defect_plugin: bool
+
+
 def _match_clock_marker(line: str, cfg: ClockStopConfig) -> str | None:
     """Return 'stop', 'heartbeat', or 'start' if *line*, after stripping leading
     whitespace, STARTS WITH the respective configured marker string; else None.
@@ -7802,6 +7835,10 @@ async def run_verification(
             if segment_chained_test and label is LegSlot.TEST
             else None
         )
+        # ONE local decides both halves of the plugin injection, the `-p` pair
+        # and the PYTHONPATH merge, so they cannot disagree (decision 19).
+        inject_defect_plugin = label is LegSlot.TEST and config.defect_tests.injects_plugin
+        _plugin_kw: _DefectPluginKw = {'defect_plugin': True} if inject_defect_plugin else {}
         # junitxml injection (task μ, verify-scope-inversion-prd.md): only
         # the 'test' leg, only when it runs as one command and the junit plan
         # above gave it a path. _with_junitxml_str keeps the
@@ -7821,6 +7858,11 @@ async def run_verification(
             # granularity the report's ownership actually has.
             _clear_junit_report(junit.leg_path)
             cmd = _with_junitxml_str(cmd, str(junit.leg_path))
+            assert cmd is not None  # None only when the input is None; guarded above
+        # After the junitxml injection and before the `-n` cap and the
+        # governance wrap, for the same opaque-after-governance reason.
+        if inject_defect_plugin and chain_segments is None:
+            cmd = _with_defect_plugin_str(cmd)
             assert cmd is not None  # None only when the input is None; guarded above
         # Admission gate (task 2390 T2): only the pytest ('test') leg is
         # gated by the shared.verify_admission flock semaphore + role nice
@@ -8021,6 +8063,9 @@ async def run_verification(
                         _clear_junit_report(segment_report)
                         reported = _with_junitxml_str(segment_cmd, str(segment_report))
                         assert reported is not None  # None only for a None input
+                    if inject_defect_plugin:
+                        reported = _with_defect_plugin_str(reported)
+                        assert reported is not None  # None only for a None input
                     capped = reported
                     if pytest_n_capped:
                         capped = _with_pytest_numprocesses_str(
@@ -8050,6 +8095,7 @@ async def run_verification(
                         ),
                         **_scope_kw,
                         **_clock_kw,
+                        **_plugin_kw,
                     )
 
                 rc, out, timed_out_flag, segment_dicts = await _run_segmented(
@@ -8079,6 +8125,7 @@ async def run_verification(
                     log_path=_stream_log_path(label, current_attempt),
                     **_scope_kw,
                     **_clock_kw,
+                    **_plugin_kw,
                 )
                 rc, out, timed_out_flag = outcome
                 scope_launch_refused = isinstance(outcome, ScopeLaunchRefused)

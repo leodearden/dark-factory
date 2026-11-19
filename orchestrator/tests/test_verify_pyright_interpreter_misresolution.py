@@ -208,9 +208,10 @@ class TestEnvRecoveryRetryGate:
     "recover" a failure that suite cannot possibly recover.
     """
 
-    # Same rendering as test_verify_env_transient.py's constant of the same
-    # name: render(serial_pytest(parse_config_command('uv run pytest tests/'))).
-    RECOVERED_TEST_COMMAND = 'uv run pytest -p no:xdist -o addopts= tests/'
+    # Same value as test_verify_env_transient.py's constant of the same
+    # name: render(serial_pytest(parse_config_command('uv run pytest tests/'))),
+    # plus the default defect mode's ``-p _df_defect_plugin``.
+    SPAWNED_RECOVERY_COMMAND = 'uv run pytest -p no:xdist -o addopts= -p _df_defect_plugin tests/'
 
     @pytest.mark.asyncio
     async def test_env_transient_from_type_leg_does_not_rerun_a_passing_test_command(
@@ -272,7 +273,7 @@ class TestEnvRecoveryRetryGate:
             f'recovery retry, got {len(pytest_invocations)}: '
             f'{pytest_invocations!r}'
         )
-        assert self.RECOVERED_TEST_COMMAND in pytest_invocations, (
+        assert self.SPAWNED_RECOVERY_COMMAND in pytest_invocations, (
             f'the recovery invocation must carry the serial_pytest markers '
             f'(-p no:xdist, -o addopts=); got {pytest_invocations!r}'
         )
