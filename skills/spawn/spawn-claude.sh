@@ -21,6 +21,8 @@
 #     positional, so the calling forms above are unchanged; unset =
 #     inherit the spawner's default model. For other/extra claude flags use
 #     $CLAUDE_SPAWN_CLAUDE_ARGS (a raw passthrough, applied after --model).
+#   $CLAUDE_SPAWN_CLAUDE_BIN — the executable the tmux and terminal-emulator
+#     lanes run in place of `claude`; see skills/spawn/SKILL.md.
 #
 # Self-exit: $CLAUDE_SPAWN_SELF_EXIT, default per lane; see skills/spawn/SKILL.md.
 # End of work on the t3 lane: $CLAUDE_SPAWN_T3_END; see its entry in skills/spawn/SKILL.md.
@@ -110,6 +112,7 @@ EXIT_LANE_REFUSED=145
 REPO_ROOT="$(cd "$(dirname "$(dirname "$(dirname "${BASH_SOURCE[0]}")")")" && pwd)"
 SESSION_REGISTRY_PY="$REPO_ROOT/orchestrator/src/orchestrator/session_registry.py"
 SPAWN_T3_LANE_PY="$REPO_ROOT/orchestrator/src/orchestrator/spawn_t3_lane.py"
+CLAUDE_EXECUTABLE_PY="$REPO_ROOT/shared/src/shared/claude_executable.py"
 
 if [ $# -eq 4 ] && [ "$4" != "--prompt-file" ]; then
   prompt="$4"
@@ -688,9 +691,27 @@ flags=""
 # CLAUDE_SPAWN_MODEL above; reserve this for other/extra claude flags.
 [ -n "${CLAUDE_SPAWN_CLAUDE_ARGS:-}" ] && flags="$flags $CLAUDE_SPAWN_CLAUDE_ARGS"
 
+# The executable run in place of bare `claude` (CLAUDE_SPAWN_CLAUDE_BIN), by the
+# rule in shared/src/shared/claude_executable.py::claude_executable. Baked into
+# the payload like $flags, so daemon-owned emulators that inherit nothing still
+# run it. An override must exec claude, keeping claude the payload shell's
+# direct child.
+resolve_claude_executable() {
+  claude_executable=""
+  if command -v python3 >/dev/null 2>&1; then
+    claude_executable=$(python3 -I "$CLAUDE_EXECUTABLE_PY" spawn 2>/dev/null) || claude_executable=""
+  fi
+  if [ -z "$claude_executable" ]; then
+    echo "spawn-claude.sh: could not run the claude-executable resolver; launching bare 'claude' and ignoring any CLAUDE_SPAWN_CLAUDE_BIN" >&2
+    claude_executable=claude
+  fi
+}
+resolve_claude_executable
+
 sentinel="$(mktemp -u -t spawn-claude-XXXXXX.done)"
 
 q_cwd=$(printf %q "$cwd")
+q_claude_executable=$(printf %q "$claude_executable")
 q_prompt=$(printf %q "$prompt")
 q_sentinel=$(printf %q "$sentinel")
 q_sentinel_tmp=$(printf %q "$sentinel.tmp")
@@ -775,7 +796,8 @@ q_sentinel_tmp=$(printf %q "$sentinel.tmp")
 #
 # ORDERING IS THE WHOLE CONTRACT, in both directions:
 #   - This invocation's inputs are ALREADY fully consumed by the time $inner
-#     is built -- $flags baked above (CLAUDE_SPAWN_MODEL/CLAUDE_ARGS),
+#     is built -- $flags and the executable baked above
+#     (CLAUDE_SPAWN_MODEL/CLAUDE_ARGS/CLAUDE_BIN),
 #     spawn_mode read near the top, the `python3 ... launching` identity
 #     write (ROLE/PROJECT/TASK_ID/ESCALATION_ID) long since done in its own
 #     subprocess -- so the unset can never disturb them. Deliberate inputs
@@ -841,7 +863,7 @@ payload_pid_publish="{ echo \$\$ > $q_payload_pid_file; } 2>/dev/null; "
 inner="trap 'echo \"\${ec:-\$?}\" > $q_sentinel_tmp; mv -f $q_sentinel_tmp $q_sentinel 2>/dev/null || cat $q_sentinel_tmp > $q_sentinel 2>/dev/null || : > $q_sentinel' EXIT; \
 trap 'exit 129' HUP; \
 trap 'exit 143' TERM; \
-${sanitize_env}${spawn_id_export}${parent_id_export}${result_export}${wm_title_export}${owner_ppid_export}${payload_pid_publish}export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1; cd $q_cwd && claude $flags $q_prompt; ec=\$?; exit \$ec"
+${sanitize_env}${spawn_id_export}${parent_id_export}${result_export}${wm_title_export}${owner_ppid_export}${payload_pid_publish}export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1; cd $q_cwd && $q_claude_executable $flags $q_prompt; ec=\$?; exit \$ec"
 
 # How long to wait for the sentinel to appear after the launcher returns
 # (covers a hair-late write or a very fast emulator).  Tests can shrink this.
