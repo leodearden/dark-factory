@@ -14184,8 +14184,8 @@ class Harness:
             return False
 
         # A live tip that is NOT an ancestor of main: a rebase or manual
-        # landing, or no landing at all (a multi-commit squash reads as none).  The same producer decides,
-        # on the same tip (task 4648).
+        # landing, or no landing at all (a multi-commit squash reads as
+        # none).  The same producer decides, on the same tip (task 4648).
         verdict = await branch_work_landed(
             self.git_ops, task_id, branch,
             branch_tip_sha=branch_tip_sha,
