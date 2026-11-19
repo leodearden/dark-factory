@@ -7,7 +7,7 @@ import os
 import re
 import shutil
 import time as _time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -703,6 +703,43 @@ class TestReconcileOneStrandedLandingRejectEmission:
         cast(AsyncMock, scheduler.set_task_status).assert_awaited_once_with(tid, 'pending')
         [row] = landing_reject_rows(store)
         assert row['data']['delivered_checks_outcome'] == 'disabled'
+
+
+_ArrangeEffectAbsent = Callable[[Harness, str, pytest.MonkeyPatch], None]
+
+
+@pytest.mark.asyncio
+class TestReconcileSweepKeepsTheMergeMarkerPolicy:
+    @pytest.mark.parametrize('arrange', [
+        pytest.param(_on_main_effect_absent, id='on_main'),
+        pytest.param(
+            lambda harness, tid, monkeypatch: _blocked_marker_effect_absent(
+                harness, tid, 'c8' * 20, monkeypatch,
+            ),
+            id='merge_marker',
+        ),
+    ])
+    async def test_the_reject_row_names_the_merge_marker_method(
+        self, harness: Harness, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        arrange: _ArrangeEffectAbsent,
+    ):
+        """Both sub-cases keep ``validate_landing_evidence`` CANDIDATE (task 4648).
+
+        Task 4648 moved the dispatch gate's live-branch arms to
+        ``branch_work_landed``; this sweep deliberately keeps the legacy
+        effect-present policy, so its verdict's method is ``merge_marker``,
+        never ``patch_id``.  The ruling and its reason are recorded in
+        ``docs/prds/landed-not-done-recovery.effect-present-caller-enumeration.md`` §7.
+        """
+        tid = '9030'
+        store = _bind_event_store(harness, tmp_path)
+        arrange(harness, tid, monkeypatch)
+
+        await harness._reconcile_stranded_in_progress()
+
+        [row] = landing_reject_rows(store)
+        assert row['data']['site'] == 'reconcile_sweep'
+        assert row['data']['method'] == 'merge_marker'
 
 
 # ---------------------------------------------------------------------------

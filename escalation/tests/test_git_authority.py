@@ -1380,6 +1380,50 @@ class TestProbeLandingAncestorArmDecidesByBranchWorkLanded:
         assert verdict.merge_sha is None
 
 
+def _merged_landing_then_ref_deleted(root: Path, task_id: str) -> tuple[str, str]:
+    """``task/<task_id>`` merged ``--no-ff`` into main, then its ref deleted.
+
+    Only the ``Merge task/<task_id> into main`` marker is left to find.
+    Returns ``(merge_sha, branch_base_sha)``.
+    """
+    branch = f'task/{task_id}'
+    new_repo(root)
+    base = landing_git(root, 'rev-parse', 'main')
+    landing_git(root, 'checkout', '-b', branch)
+    _write_and_commit(root, f'feat({task_id}): add the module', {'work.py': _lines('feature', 40)})
+    landing_git(root, 'checkout', 'main')
+    landing_git(root, 'merge', '--no-ff', '-m', f'Merge {branch} into main', branch)
+    landing_git(root, 'branch', '-D', branch)
+    return landing_git(root, 'rev-parse', 'main'), base
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures('fresh_landing_tally')
+class TestProbeLandingMarkerArmKeepsTheCandidatePolicy:
+    async def test_a_deleted_ref_marker_is_checked_as_the_candidate(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The marker arm stays on ``validate_landing_evidence`` CANDIDATE (task 4648).
+
+        A deleted ref leaves no live tip for ``branch_work_landed`` to judge,
+        so the marker itself is the candidate the effect-present policy
+        checks, and the producer the live-ref arms use is never asked.  The
+        ruling is recorded in
+        ``docs/prds/landed-not-done-recovery.effect-present-caller-enumeration.md`` §7.
+        """
+        merge_sha, base = _merged_landing_then_ref_deleted(tmp_path / 'repo', '4648')
+        work_landed, validate = _spy_on_landing_producers(monkeypatch)
+
+        verdict = await _probe_repo(tmp_path / 'repo', '4648', metadata={'branch_base_sha': base})
+
+        assert verdict.outcome is GitAuthorityOutcome.found_on_main, verdict
+        assert verdict.arm is GitAuthorityArm.marker
+        validate.assert_awaited_once()
+        assert validate.await_args is not None
+        assert validate.await_args.kwargs['candidate_sha'] == merge_sha
+        work_landed.assert_not_awaited()
+
+
 class TestGitAuthorityVerdict:
     def test_is_frozen(self) -> None:
         verdict = GitAuthorityVerdict(outcome=GitAuthorityOutcome.no_signal)

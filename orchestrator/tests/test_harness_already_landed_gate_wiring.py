@@ -655,6 +655,35 @@ class TestAlreadyLandedDispatchGateMarkerPath:
         assert marker_sha in esc.detail
         assert 'effect_absent' in esc.detail
 
+    async def test_the_marker_arm_keeps_the_merge_marker_policy(
+        self, mock_orch_config, landing_producer: AsyncMock,
+    ) -> None:
+        """The marker arm stays on ``validate_landing_evidence`` CANDIDATE (task 4648).
+
+        A deleted ref leaves no live tip for ``branch_work_landed`` to judge,
+        so the escalated verdict carries ``merge_marker``, not ``patch_id``,
+        and the producer the live-branch arms use is never asked.  The ruling
+        is recorded in
+        ``docs/prds/landed-not-done-recovery.effect-present-caller-enumeration.md`` §7.
+        """
+        h: Any = _wired_marker_harness(
+            mock_orch_config,
+            marker_sha='b' * 40,
+            branch_base_sha='e' * 40,
+            marker_is_ancestor_of_base=False,
+        )
+        h.git_ops.commit_effect_present_in_main = AsyncMock(return_value=False)
+        file_escalation = MagicMock()
+        h._file_unattributed_landing_escalation = file_escalation
+
+        assert await h._already_landed_dispatch_gate('42') is False
+
+        file_escalation.assert_called_once()
+        _task_id, _branch, verdict = file_escalation.call_args.args
+        assert verdict.reason is LandingReason.effect_absent
+        assert verdict.method is LandingMethod.merge_marker
+        landing_producer.assert_not_awaited()
+
     async def test_stale_marker_vetoes_flip(self, mock_orch_config) -> None:
         """A marker that IS an ancestor of branch_base_sha predates this
         incarnation (branch was deleted + re-created under the same task
