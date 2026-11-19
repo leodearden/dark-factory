@@ -433,7 +433,7 @@ class TestDriftCheckFullGateSpecNoDerivation:
             ),
         ):
             await _run_drift_check(
-                git_ops, req, 'commit-sha', None, event_store, set(),
+                git_ops, req, 'commit-sha', None, event_store, set().add,
                 allocator=allocator,
                 verifier=PRODUCTION_VERIFIER,
             )
@@ -625,7 +625,7 @@ class TestDriftCheckEnvDivergenceWiring:
             ),
         ):
             await _run_drift_check(
-                git_ops, req, 'commit-sha', escalation_queue, event_store, set(),
+                git_ops, req, 'commit-sha', escalation_queue, event_store, set().add,
                 allocator=allocator, verifier=PRODUCTION_VERIFIER,
             )
         return event_store, escalation_queue, local_seam, remote_seam
@@ -743,7 +743,7 @@ class TestDriftCheckEnvDivergenceWiring:
         ):
             await _run_drift_check(
                 git_ops, req, 'commit-sha', _RecordingEscalationQueue(),
-                event_store, quarantine_set, allocator=allocator, verifier=PRODUCTION_VERIFIER,
+                event_store, quarantine_set.add, allocator=allocator, verifier=PRODUCTION_VERIFIER,
             )
         from orchestrator.event_store import EventType
         assert quarantine_set == set()
@@ -852,7 +852,7 @@ class TestDriftCheckEnvDivergenceWiring:
         ):
             await _run_drift_check(
                 git_ops, req, 'commit-sha', _RecordingEscalationQueue(), event_store,
-                set(), allocator=allocator, verifier=PRODUCTION_VERIFIER,
+                set().add, allocator=allocator, verifier=PRODUCTION_VERIFIER,
             )
 
         assert local_seam.issued == [], (
@@ -931,7 +931,7 @@ class TestEnvCheckCannotBreakVerdictDriftCheck:
         ):
             await _run_drift_check(
                 git_ops, req, 'commit-sha', _RecordingEscalationQueue(),
-                event_store, set(), allocator=allocator, verifier=PRODUCTION_VERIFIER,
+                event_store, set().add, allocator=allocator, verifier=PRODUCTION_VERIFIER,
             )
 
         assert EventType.verdict_parity_ok in event_store.types(), (
@@ -988,7 +988,7 @@ class TestEnvCheckCannotBreakVerdictDriftCheck:
         ):
             await _run_drift_check(
                 git_ops, req, 'commit-sha', _RecordingEscalationQueue(),
-                _RecordingEventStore(), set(), allocator=allocator, verifier=PRODUCTION_VERIFIER,
+                _RecordingEventStore(), set().add, allocator=allocator, verifier=PRODUCTION_VERIFIER,
             )
 
         env_warnings = [
@@ -1147,7 +1147,7 @@ class TestDriftCheckHoldsLaneLease:
             'orchestrator.merge_lane.worker.run_scoped_verification', _reaping_scoped,
         ):
             await _run_drift_check(
-                drift_git_ops, req, head, None, None, set(), allocator=allocator,
+                drift_git_ops, req, head, None, None, set().add, allocator=allocator,
                 verifier=PRODUCTION_VERIFIER,
             )
 
@@ -1233,7 +1233,7 @@ class _DriftScene:
 
     def run(self, verifier: FakeVerifier, **options: Any) -> Coroutine[Any, Any, None]:
         return _run_drift_check(
-            self.git_ops, self.req, 'drift-sha', None, self.event_store, set(),
+            self.git_ops, self.req, 'drift-sha', None, self.event_store, set().add,
             verifier=verifier, allocator=self.allocator, **options,
         )
 

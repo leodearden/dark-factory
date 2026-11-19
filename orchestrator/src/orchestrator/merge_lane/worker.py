@@ -117,6 +117,7 @@ from orchestrator.merge_lane.gates import (
 )
 from orchestrator.merge_lane.halt import HaltState
 from orchestrator.merge_lane.history_leg import HistoryLegRunner
+from orchestrator.merge_lane.host_quarantine import HostQuarantine
 from orchestrator.merge_lane.intake import (
     MERGE_LANES,
     enqueue_merge_request,
@@ -137,11 +138,6 @@ from orchestrator.merge_lane.liveness import (
     INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS,
     VerifyProgressWatch,
     _acquire_warm_verify_worktree,
-    _alarm_verify_host_skew,
-    _alarm_verify_host_unreachable,
-    _clear_verify_host_skew,
-    _clear_verify_host_skew_of_an_earlier_process,
-    _clear_verify_host_unreachable,
     _safety_valve_due,
     acquire_chain_build_lane,
     alarm_serial_lane_breach,
@@ -207,7 +203,6 @@ from orchestrator.merge_lane.train_selection import select_train_members
 from orchestrator.merge_lane.types import (
     CHAIN_FAULT_REASONS,
     NO_DEEP_PLACEMENT,
-    UNTRACKED_HOST_WIRE,
     CapPermit,
     ChainResult,
     ChainTruncationReason,
@@ -238,7 +233,6 @@ from orchestrator.merge_lane.types import (
     PendingGate,
     QueuedBranch,
     RealMergeItem,
-    RecoveryEvidence,
     RelaneOutcome,
     RemergeBase,
     SoloVerifyResult,
@@ -251,11 +245,9 @@ from orchestrator.merge_lane.types import (
     VerifyInFlight,
     VerifyInFlightKind,
     VerifyWorktreeHandle,
-    _HostUnavailability,
     fell_to_main,
     item_merge_wt,
     lease_activity,
-    quarantine_class,
     remote_dispatch_live,
 )
 from orchestrator.merge_lane.verify_base_detector import (
@@ -277,7 +269,6 @@ from orchestrator.merge_verify_facts import (
     RunnerReason,
     classify_base_relation,
 )
-from orchestrator.remote_gate import GateIdentityPair, RunnerUnavailableKind
 from orchestrator.scheduler import StaleEvidenceRejection
 from orchestrator.task_priority import TaskPriorityLookup
 from orchestrator.task_status import WORKFLOW_PRESERVE_STATUSES
@@ -303,7 +294,6 @@ from orchestrator.verify_categories import (
     PREEXISTING_BREAK_SKIP_CATEGORIES,
 )
 from orchestrator.verify_classify import reports_disk_full
-from orchestrator.verify_hosts import build_remote_runners as _build_remote_runners
 from orchestrator.verify_plan import effective_merge_module_configs
 from orchestrator.verify_runner import (
     UNSCOPED_TYPECHECK_TIMEOUT_CATEGORY,
@@ -1607,7 +1597,7 @@ def _spawn_main_health_probe(
 # Dedup sentinel task_id for fix (b)'s per-land cross-check divergence escalation
 # (task 2822) — mirrors verify_runner.py's _DRIFT_SENTINEL / this module's
 # _RESOURCE_AUDIT_SENTINEL.  A single open L1 per episode keeps a run of divergent
-# lands from flooding the queue; the caller-owned quarantine set does the per-host
+# lands from flooding the queue; the caller-owned quarantine sink does the per-host
 # withholding.
 _CROSS_CHECK_SENTINEL = '__verify_cross_check__'
 
@@ -2513,7 +2503,7 @@ async def _run_post_merge_verify(
     merge_sha: str = '',
     on_result: Callable[[VerifyResult], None] | None = None,
     shadow_baseline_sink: dict[str, str] | None = None,
-    quarantine: set[str] | None = None,
+    quarantine: Callable[[str], None] | None = None,
     keep_worktrees: Collection[Path] | None = None,
     runner: VerifyRunner | None = None,
     escalation_queue: Any = None,
@@ -2841,10 +2831,11 @@ async def _run_post_merge_verify(
     # runs on its leased host (_leased_train_verify).
     # runner=<RemoteRunner> → pool=[runner] (no LocalRunner); warm-swap is skipped
     # (per-host persistent worktree — handled by γ's _run_inflight_verify caller).
-    # The caller-owned `quarantine` set is the divergence-quarantine sink for
-    # fix (b)'s per-land cross-check below (task 2822): on a remote PASS / local
-    # trust-anchor FAIL split we add runner.name to it so the shared HostAllocator
-    # drops the host.  None is treated as "no quarantine sink" (module-level and
+    # The caller-owned `quarantine` callable is the divergence-quarantine sink
+    # for fix (b)'s per-land cross-check below (task 2822): on a remote PASS /
+    # local trust-anchor FAIL split we hand it runner.name, and the lane's
+    # HostQuarantine.quarantine_divergent takes the host out of the shared
+    # HostAllocator's pool.  None is treated as "no quarantine sink" (module-level and
     # test callers that pass nothing) — the cross-check still fails closed, it
     # just records no host name.
     if runner is not None:
@@ -3373,7 +3364,7 @@ async def _run_post_merge_verify(
                         f'suspected red main'
                     )
                 if quarantine is not None:
-                    quarantine.add(runner.name)
+                    quarantine(runner.name)
                 if (
                     escalation_queue is not None
                     and not escalation_queue.has_open_l1(_CROSS_CHECK_SENTINEL)
@@ -4389,11 +4380,6 @@ def _leased_by_host(rows: Iterable[LeaseRow]) -> dict[str, list[str]]:
     return _task_ids_by_host(row for row in rows if row.holds_lease)
 
 
-def _ssh_targets_by_runner(config: OrchestratorConfig) -> Mapping[str, str]:
-    """``{runner name: ssh_host}`` of *config*'s enabled verify runners."""
-    return {r.name: r.ssh_host for r in config.enabled_verify_runners}
-
-
 def _lease_part(row: LeaseRow) -> str:
     """``host=task_id``, annotated ``(activity[,quarantined])`` unless it counts verifying."""
     occupant = f'{row.host}={row.task_id}'
@@ -4481,7 +4467,7 @@ class _TrainMergeHost(Protocol):
     _event_store: EventStore | None
     _verifier: VerifyPort
     _clock: ClockPort
-    _runner_quarantine: set[str]
+    _host_quarantine: HostQuarantine
     _escalation_queue: Any
 
     # ── Per-task counters (mutated by shared helpers) ─────────────────────
@@ -4508,10 +4494,6 @@ class _TrainMergeHost(Protocol):
 
     # ── verify hosts ──────────────────────────────────────────────────────
     def _ensure_host_allocator(self, config: OrchestratorConfig) -> HostAllocator: ...
-    def _quarantine_unreachable_host(
-        self, host: str, reason: str, now: float, *,
-        kind: RunnerUnavailableKind = 'transport', identity: GateIdentityPair | None = None,
-    ) -> None: ...
     def bench_unavailable_runner(self, name: str, exc: RunnerUnavailable) -> None: ...
     async def _cancel_and_release_tracked(self, lease: HostLease | None) -> bool: ...
     async def _teardown_verify_task(
@@ -6184,7 +6166,7 @@ async def _leased_train_verify(
         max_narrowed=worker.MAX_POST_MERGE_VERIFY_NARROWED_RETRIES,
         narrowed_retries=worker._post_merge_verify_narrowed_retries,
         event_store=worker._event_store,
-        quarantine=worker._runner_quarantine,
+        quarantine=worker._host_quarantine.quarantine_divergent,
         halt_hook=worker.operator_halt,
         escalation_queue=worker._escalation_queue,
         verifier=worker._verifier,
@@ -7833,25 +7815,6 @@ class SpeculativeMergeWorker:
     # under both.  Class attribute so tests monkeypatch it small (mirrors
     # MAX_INFLIGHT_DEAD_VERIFY_ABORTS).
     MAX_CONTENDED_LEASE_DEFER_SECS: float = 14400.0
-    # task 3043 amend (reviewer_comprehensive, efficiency): rate limit for the
-    # reprobe sweep's "still unreachable" record.  A host that is permanently
-    # gone — a laptop removed from the fleet, the reify 2026-07-25 shape —
-    # stays in the RU tracker forever while _reprobe_loop sweeps every
-    # verify_host_reprobe_interval_s (120 s), so an unconditional INFO per
-    # sweep is ~720 identical lines/day.  Unbounded repetition of an
-    # UNCHANGING fact is what destroys the greppability the decision logging
-    # exists to buy, so the record is INFO for the first few sweeps of an
-    # episode, INFO again on any CHANGE (a new streak), and thereafter at most
-    # one INFO per period — DEBUG in between, so nothing is ever actually
-    # dropped.  Recovery / park-skip / unresolvable-runner records are
-    # TRANSITIONS (at most one per episode) and are never throttled.
-    # Class attributes so tests can monkeypatch them (mirrors
-    # MAX_INFLIGHT_DEAD_VERIFY_ABORTS).
-    REPROBE_STILL_DOWN_INFO_SWEEPS: int = 3
-    REPROBE_STILL_DOWN_INFO_PERIOD_SECS: float = 1800.0
-    # How often _reprobe_loop launches the remotes' detached gate reapers
-    # (task 6565, design D2: at most hourly per process).
-    GATE_REAP_INTERVAL_SECS: float = 3600.0
     # task 3043 amend (reviewer_comprehensive, robustness): upper bound on
     # _run_inflight_verify's orphan-guard reap.  The guard cancels its inner
     # _run_post_merge_verify task and awaits it in a `finally` on a
@@ -8053,12 +8016,6 @@ class SpeculativeMergeWorker:
         task_priority: TaskPriorityLookup | None = None,
     ):
         self._git_ops = git_ops
-        # Task 6565: handed to every RemoteRunner this worker builds.
-        self._deployed_sha = deployed_sha
-        # Task 6565: every verify runner named in config, enabled or not; at
-        # start (run) the worker resolves the bench L1s a previous process
-        # left open for them.  A host since dropped from config is not covered.
-        self._verify_hosts = tuple(verify_hosts)
         self._queue = queue
         self._event_store = event_store
         # Task η (AFK coverage gap): harness-owned handles for the
@@ -8372,69 +8329,33 @@ class SpeculativeMergeWorker:
         # retired by task ο (RealMergeItem carries no such escape hatch). Never
         # reset so the counter covers the full worker lifetime (cross-submission).
         self._verify_attempt_count: int = 0
-        # Lever C drift detective: land counter and in-memory quarantine set.
-        # _drift_land_count increments on every 'done' land; _runner_quarantine
-        # is the set of remote runner names that have been quarantined by
-        # DriftDetector.check in _run_drift_check.  Both are additive across
-        # submissions; the dedup'd L1 escalation in DriftDetector is the
-        # durable cross-restart protection.  None-safe: initialised here so
-        # bare-worker tests that don't set up remotes stay green.
-        #
-        # RESTART RE-TRUST WINDOW: an injected *runner_quarantine* is owned by
-        # the harness for the PROCESS lifetime (task 6670, PRD
-        # plans/remote-task-leg-verify-prd.md decision 4, §12 Q4), shared by
-        # reference with the task path's HostPool, so it survives an
-        # in-process worker rebuild; the RU tracker below stays this worker's.
-        # It still resets to empty on a process restart: a remote that
-        # diverged (remote PASS / local FAIL) becomes re-eligible then.  The
-        # dedup'd L1 blocking escalation (submitted by DriftDetector before
-        # quarantine) is the cross-restart guard: an open
-        # verify_drift_divergence L1 halts the merge queue across restart via
-        # the normal EscalationQueue gate, so the re-trusted remote's verdict
-        # is never authoritative for real merges until the escalation is
-        # resolved.  Rely on that coupling rather than persisting the set.
+        # Lever C drift detective: land counter.  _drift_land_count increments
+        # on every 'done' land; the remote runners DriftDetector.check
+        # quarantines in _run_drift_check go to HostQuarantine's set below.
+        # Additive across submissions; the dedup'd L1 escalation in
+        # DriftDetector is the durable cross-restart protection.
         self._drift_land_count: int = 0
-        self._runner_quarantine: set[str] = (
-            set() if runner_quarantine is None else runner_quarantine
+        # The lane's remote verify hosts out of the pool (tasks 1795, 3043,
+        # 6565), and the sole lane-side writer of the shared quarantine set
+        # and the per-host RunnerUnavailable tracker.  An injected
+        # *runner_quarantine* is the harness's process-lifetime set (task
+        # 6670).  Its resolvers re-read the live attributes because tests
+        # re-assign them after construction.
+        self._host_quarantine = HostQuarantine(
+            clock=self._clock,
+            allocator=lambda: self._host_allocator,
+            event_store=lambda: self._event_store,
+            escalation_queue=lambda: self._escalation_queue,
+            deployed_sha=deployed_sha,
+            verify_hosts=verify_hosts,
+            quarantine=runner_quarantine,
+            host_holder_reader=host_holder_reader,
+            on_host_readmitted=on_host_readmitted,
         )
-        # Task 6670: the harness's reader of task-path holds per remote host,
-        # shown as task_held_by on the snapshot's host rows, and its hook for
-        # a readmission (readmit_host), so the task pool re-offers the host.
-        self._host_holder_reader = host_holder_reader
-        self._on_host_readmitted = on_host_readmitted
-        # Per-host RunnerUnavailable streak tracker (task 1795).  Keyed by
-        # runner name; entries created on first failure, popped on recovery.
-        # Used by _record_runner_unavailable / _record_runner_recovered to fire
-        # a dedup'd escalation and auto-reprobe on recovery.  None-safe at call
-        # sites: only populated when remote runners are configured.
-        self._runner_unavailable: dict[str, _HostUnavailability] = {}
-        # Thresholds for firing / probing (copies of config knobs set by
-        # _ensure_host_allocator; defaults keep bare-worker tests green).
-        # Override in tests to drive threshold logic synchronously (mirrors
-        # _heartbeat_interval_s precedent).
-        self._unreachable_escalate_after_n: int = 3
-        self._unreachable_escalate_after_secs: float = 600.0
+        # How often _reprobe_loop runs HostQuarantine.sweep (copy of the
+        # config knob set by _ensure_host_allocator; the default keeps
+        # bare-worker tests green).
         self._reprobe_interval_s: float = 120.0
-        # {runner name: configured ssh_host}, the target the unreachability
-        # alarm names (task 5290); set alongside the knobs above.
-        self._runner_ssh_targets: Mapping[str, str] = {}
-        # Rate-limit state for the reprobe sweep's "still unreachable" record
-        # (task 3043 amend).  {host: (last_info_at, last_streak, sweeps_seen)}.
-        # A host that
-        # is permanently gone stays tracked forever and the sweep runs every
-        # _reprobe_interval_s (120 s), so an unconditional INFO per sweep is
-        # ~720 identical lines/day — unbounded repetition of an unchanging fact,
-        # which degrades exactly the greppability the decision logging buys.
-        # Written only by _reprobe_quarantined_hosts; popped in lockstep with
-        # the tracker entry by _record_runner_recovered, so it cannot outlive
-        # the episode it describes.
-        self._reprobe_last_info: dict[str, tuple[float, int, int]] = {}
-        # Skew benches opened per (host, deployed sha) across tracker episodes
-        # (task 6565, design D6).  A readmit pops the tracker entry, so the
-        # count that makes a host's second skew bench sticky lives here.
-        self._skew_benches: dict[tuple[str, str | None], int] = {}
-        # When _reap_idle_gates last launched the remote gate reapers.
-        self._last_gate_reap_at: float | None = None
         # In-flight drift-detective asyncio.Tasks.  asyncio keeps only a WEAK
         # reference to running tasks, so without a strong ref here the drift
         # detective can be GC'd mid-run and a remote-PASS / local-FAIL
@@ -9439,9 +9360,10 @@ class SpeculativeMergeWorker:
         call, once ``project_root`` is available, produces the fully-populated
         cached allocator rather than re-using an empty one.
 
-        The allocator shares ``self._runner_quarantine`` by reference so
-        HostAllocator-driven (RunnerUnavailable) and DriftDetector-driven
-        quarantines share one source of truth.
+        :meth:`HostQuarantine.allocator_over` builds it over the lane's one
+        quarantine set, shared by reference, so HostAllocator-driven
+        (RunnerUnavailable) and DriftDetector-driven quarantines share one
+        source of truth.
 
         The remotes are the constructor's ``remote_runners`` when it was given
         them, and are built from *config* otherwise.
@@ -9451,765 +9373,27 @@ class SpeculativeMergeWorker:
         project_root = getattr(self._git_ops, 'project_root', None)
         if project_root is not None:
             remotes = list(self._remote_runners) if self._remote_runners is not None else (
-                self._remote_runners_from(config, project_root)
+                self._host_quarantine.remote_runners_from(config, project_root)
             )
-            self._host_allocator = HostAllocator(
-                remotes, quarantine=self._runner_quarantine
-            )
-            # Copy config knobs onto worker attrs so operator config drives
-            # production while __init__ defaults keep bare-worker tests green
-            # (mirrors _heartbeat_interval_s precedent).
-            self._unreachable_escalate_after_n = (
-                config.verify_host_unreachable_escalate_after_n
-            )
-            self._unreachable_escalate_after_secs = (
-                config.verify_host_unreachable_escalate_after_secs
-            )
+            self._host_allocator = self._host_quarantine.allocator_over(remotes)
+            # Copy config knobs so operator config drives production while
+            # __init__ defaults keep bare-worker tests green (mirrors
+            # _heartbeat_interval_s precedent).
+            self._host_quarantine.adopt_config(config)
             self._reprobe_interval_s = config.verify_host_reprobe_interval_s
-            self._runner_ssh_targets = _ssh_targets_by_runner(config)
             return self._host_allocator
         # project_root unavailable: return a transient empty-remote allocator
         # without caching so a subsequent call with project_root set builds the
         # fully-populated instance.
-        return HostAllocator([], quarantine=self._runner_quarantine)
-
-    def _remote_runners_from(self, config: OrchestratorConfig, cwd: Path) -> list:
-        """The config's remote runners, gated on this process's deployed sha.
-
-        A config with enabled runners needs that sha: without it there is no
-        gate to dispatch through, and a remote verify must never fall back to
-        a shared remote tree (task 6565, design D2).  ``cli.py::run`` refuses
-        to start in that state, so this raise is the second line.
-
-        Unfiltered by quarantine (task 6670): the allocator reads the shared
-        set at acquire, and a host benched before this build must still get
-        a slot, or its row is an orphan the reprobe cannot re-adopt.
-        """
-        enabled = [r.name for r in config.enabled_verify_runners]
-        if not enabled:
-            return []
-        if self._deployed_sha is None:
-            raise RuntimeError(
-                f'merge worker has enabled verify_runners {enabled} but no deployed '
-                'sha to gate them on (task 6565); start it with Harness(deployed_sha=...)'
-            )
-        return _build_remote_runners(config, cwd, deployed_sha=self._deployed_sha)
-
-    # ── per-host RunnerUnavailable tracker (tasks 1795, 6565) ────────────
-
-    def _record_runner_unavailable(
-        self, host: str, reason: str, now: float, *,
-        kind: RunnerUnavailableKind = 'transport', identity: GateIdentityPair | None = None,
-    ) -> bool:
-        """Record one RunnerUnavailable of *kind* for *host* and return whether to escalate.
-
-        Creates a new ``_HostUnavailability`` entry on the first call, then
-        increments ``streak`` on each subsequent call.  ``first_unavailable_at``
-        is fixed to the first-call timestamp so duration can be computed later.
-
-        A 'skew'-class *kind* (:func:`quarantine_class`) sets the entry's kind,
-        reason and identity, and when it opens a skew bench it counts toward
-        the host's sticky bound (:meth:`_open_skew_bench`).  A 'transport' RU
-        never downgrades a skew entry: it refreshes the reason of a transport
-        entry only.
-
-        Returns whether the caller should alarm: the entry's
-        :meth:`_HostUnavailability.alarm_due` against this worker's streak and
-        time thresholds, the same predicate the reprobe sweep re-asserts
-        (task 5290).  The alarm helpers' ``has_open_l1`` dedup prevents
-        re-submitting.
-        """
-        entry = self._runner_unavailable.setdefault(
-            host, _HostUnavailability(streak=0, first_unavailable_at=now, reason=reason),
-        )
-        entry.streak += 1
-        if quarantine_class(kind) == 'skew':
-            if quarantine_class(entry.kind) == 'ru':
-                self._open_skew_bench(host, entry)
-            entry.kind, entry.reason, entry.identity = kind, reason, identity
-        elif quarantine_class(entry.kind) == 'ru':
-            entry.reason = reason
-        return entry.alarm_due(
-            now,
-            after_n=self._unreachable_escalate_after_n,
-            after_secs=self._unreachable_escalate_after_secs,
-        )
-
-    def _open_skew_bench(self, host: str, entry: _HostUnavailability) -> None:
-        """Count a new skew bench of *host* on this deployed sha; the second is sticky.
-
-        Every bench after the first follows a passing probe (a readmit is what
-        closed the previous one), so the second bench means the cause survives
-        a passing probe: re-admitting again would only spend another verify
-        (design D6).  A failing reprobe opens no bench and so never counts.
-        """
-        key = (host, self._deployed_code_sha())
-        self._skew_benches[key] = self._skew_benches.get(key, 0) + 1
-        entry.sticky = self._skew_benches[key] >= 2
-
-    def _record_runner_recovered(self, host: str) -> None:
-        """Clear the unavailability tracker entry for *host* (idempotent).
-
-        After this call, a subsequent ``_record_runner_unavailable`` starts a
-        fresh episode with ``streak=1`` and a new ``first_unavailable_at``.
-
-        The reprobe sweep's still-unreachable rate-limit state is popped in
-        lockstep (task 3043 amend), so the next downtime episode for this host
-        logs its first sweeps at INFO again instead of inheriting the previous
-        episode's throttle.
-        """
-        self._runner_unavailable.pop(host, None)
-        self._reprobe_last_info.pop(host, None)
-
-    def _local_host_name(self) -> str:
-        """Name of the local (trust-anchor) host, per the allocator when present.
-
-        Reads :attr:`HostAllocator.local_name` (O(1)) rather than scanning
-        ``host_states()`` for the ``is_local`` flag, which materialised one
-        dict per host on every call (task 3043 amend).
-        """
-        if isinstance(self._host_allocator, HostAllocator):
-            return self._host_allocator.local_name
-        return 'local'
-
-    def _quarantine_unreachable_host(
-        self, host: str, reason: str, now: float, *,
-        kind: RunnerUnavailableKind = 'transport', identity: GateIdentityPair | None = None,
-    ) -> None:
-        """Quarantine *host* for a RunnerUnavailable of *kind* AND record it (tasks 3043, 6565).
-
-        The ONE chokepoint every RunnerUnavailable bench goes through, so the
-        design-D6 policy (:func:`quarantine_class`, :func:`escalation_policy`,
-        no downgrade, the sticky bound) is applied in one place; a skew-class
-        bench also emits ``verify_host_skew``.
-
-        INV-A — **a host is never removed from the acquirable pool for an
-        unreachability reason without a ``_runner_unavailable`` entry.**
-        :meth:`_reprobe_quarantined_hosts` can only re-adopt hosts it can see in
-        that tracker, so a quarantine without a record is a permanent strand:
-        the host stops being dispatched to and nothing can ever re-probe it,
-        until an orchestrator restart rebuilds the allocator.
-
-        Recovery from task 1795 was gated on a fragile *conjunction* — a host
-        was re-adoptable only if it was in BOTH the shared quarantine set and
-        the tracker — which three real paths violate: an orphaned verify task
-        whose ``RunnerUnavailable`` escapes after the outer coroutine was
-        cancelled, a ``cancel_and_release`` that leaves the slot PARKED against
-        a down host, and any future quarantine site that forgets to record.
-        Funnelling every RU-class quarantine through this ONE method makes the
-        invariant checkable by reading a single function instead of auditing N
-        call sites for a two-piece state update.
-
-        Order: quarantine first (so ``acquire_remote`` stops handing the host
-        out immediately — ``_runner_quarantine`` is shared BY REFERENCE with the
-        allocator, so this needs no allocator rebuild and no restart), then
-        record, then alarm.  Streak / ``first_unavailable_at`` / reason
-        semantics are DELEGATED to :meth:`_record_runner_unavailable` so they
-        are identical across this path and the existing RUNNER_UNAVAILABLE
-        finalize path, and the L1 alarm keeps the existing
-        ``has_open_l1`` dedup (at most one open alarm per host at a time).
-
-        Local is a no-op *for state*: it is the trust anchor, is never
-        quarantined, and has no remote to probe for recovery.  It is NOT a
-        silent no-op (task 3043 amend): the previous RUNNER_UNAVAILABLE
-        finalize path recorded a local lease unconditionally, so returning
-        without a word here would make "the trust anchor reported itself
-        unavailable" vanish entirely — the silent degradation this repo's
-        loud-over-silent norm and the no-silent-fail-soft design invariant
-        rule out.  A WARNING keeps the event greppable while preserving the
-        never-quarantine-local rule.  None-safe throughout — with no allocator
-        the tracker entry is still written, so recovery remains possible once
-        one exists.
-        """
-        if host == self._local_host_name():
-            logger.warning(
-                'RU-class quarantine requested for the LOCAL trust-anchor host %r '
-                '(reason: %s) — ignoring; local is never quarantined',
-                host, reason,
-            )
-            return
-
-        self._runner_quarantine.add(host)
-
-        _should_escalate = self._record_runner_unavailable(
-            host, reason, now, kind=kind, identity=identity,
-        )
-        entry = self._runner_unavailable[host]
-        if quarantine_class(kind) == 'skew':
-            self._emit_skew_bench(host, entry)
-        if _should_escalate:
-            self._alarm_host(host, entry, now - entry.first_unavailable_at)
+        return self._host_quarantine.allocator_over([])
 
     def bench_unavailable_runner(self, name: str, exc: RunnerUnavailable) -> None:
-        """Bench remote *name* for *exc*, by its kind: the ``on_unavailable`` sink.
-
-        Pools, drift checks and the train fallback hand a RunnerUnavailable
-        here; it goes through :meth:`_quarantine_unreachable_host`.
-        """
-        self._quarantine_unreachable_host(
-            name, str(exc), self._clock.now(), kind=exc.kind, identity=exc.identity,
-        )
-
-    def _deployed_code_sha(self) -> str | None:
-        return self._deployed_sha.sha if self._deployed_sha is not None else None
-
-    def _emit_skew_bench(self, host: str, entry: _HostUnavailability) -> None:
-        if self._event_store is None:
-            return
-        self._event_store.emit(EventType.verify_host_skew, data={
-            'host': host, 'kind': entry.kind, 'reason': entry.reason,
-            'sticky': entry.sticky, 'code_sha': self._deployed_code_sha(),
-            'identity': entry.identity.to_wire() if entry.identity is not None else None,
-        })
-
-    def _alarm_host(self, host: str, entry: _HostUnavailability, duration_s: float) -> None:
-        """File the dedup'd L1 for *host*'s bench, in its quarantine class's category."""
-        if quarantine_class(entry.kind) == 'skew':
-            _alarm_verify_host_skew(
-                self._escalation_queue, host, entry,
-                code_sha=self._deployed_code_sha(), duration_s=duration_s,
-            )
-            return
-        _alarm_verify_host_unreachable(
-            self._escalation_queue,
-            host,
-            entry.reason,
-            streak=entry.streak,
-            duration_s=duration_s,
-            ssh_target=self._runner_ssh_targets.get(host),
-            event_store=self._event_store,
-        )
-
-    def _host_states_block(self, now: float) -> list[dict]:
-        """Per-host slot state + quarantine classification for :meth:`snapshot`.
-
-        One dict per host the allocator manages, in allocator order (local
-        first), then one per **orphan** RU-tracked host (see below), each with
-        a **uniform schema** — every key always present, ``None`` where not
-        applicable::
-
-            {name, is_local, slot_state, quarantined, quarantine_class,
-             unavailable_since, unavailable_secs, streak, reason,
-             kind, sticky, identity, task_held_by}
-
-        *now* is the snapshot's own clock (``time.time()``), passed in so
-        ``unavailable_secs`` is measured against the same instant as every
-        other relative age in the snapshot (``entries[].age_secs``,
-        ``verify_in_progress.age_secs``) rather than against a second,
-        slightly-later read of the wall clock.
-
-        The allocator owns slot state and quarantine membership
-        (:meth:`~orchestrator.verify_runner.HostAllocator.host_states`); the
-        RunnerUnavailable streak tracker is worker-owned, so the RU enrichment
-        is applied here rather than pushed down into the allocator.
-
-        Notes
-        -----
-        - ``quarantine_class`` of a quarantined host is the tracked entry's
-          :func:`quarantine_class` — ``'ru'`` (re-probed by ``ssh true``) or
-          ``'skew'`` (re-probed by ensure-gate, task 6565) — or
-          ``'divergence'`` for an untracked one, held for verdict divergence
-          and cleared only by an operator.  Tracker membership is the same
-          predicate the tracker-driven :meth:`_reprobe_quarantined_hosts`
-          loops on, and :meth:`probe_host` dispatches on the same function, so
-          this snapshot and the reprobe can never disagree.  ``kind``,
-          ``sticky`` and ``identity`` (``GateIdentityPair.to_wire()``) come
-          from the entry too, so a skew bench shows both gate identities.
-        - ``unavailable_since`` / ``unavailable_secs`` / ``streak`` / ``reason``
-          are populated whenever the host is RU-tracked, **independent of
-          quarantine**, so a host accumulating failures below the quarantine
-          threshold is visible too.  ``unavailable_since`` is the absolute
-          epoch (for cross-log correlation); ``unavailable_secs`` is the
-          derived *relative* downtime — ``max(0.0, now - first_unavailable_at)``
-          — which is the operationally interesting form ("how long has this
-          host been down") and matches how every other time-valued field in
-          the snapshot is expressed.  Clamped at 0 so a clock step backwards
-          cannot surface a negative duration.
-        - **Orphan RU entries.** ``_runner_unavailable`` is only pruned on
-          recovery (:meth:`_record_runner_recovered`), while the allocator is
-          built once and cached for the worker's lifetime, so a host that
-          leaves the managed set (renamed/removed remote) can keep a live RU
-          streak that no allocator slot corresponds to.  Those names are
-          appended after the managed hosts with ``slot_state=None``
-          (``None`` = "not allocator-managed", keeping the non-null slot
-          vocabulary exactly :data:`~orchestrator.verify_runner._SLOT_WIRE`)
-          and ``is_local=False``, so an orphaned streak is never invisible —
-          that blind spot is the same class of gap this block exists to close.
-          Quarantine membership for them is read via
-          :meth:`~orchestrator.verify_runner.HostAllocator.is_quarantined`,
-          which answers from the shared-by-reference quarantine set and so
-          works for names the allocator does not manage —
-          :meth:`~orchestrator.verify_runner.HostAllocator.host_states` cannot
-          answer it, since an orphan has no slot to report.  Consequence:
-          ``len(hosts)`` equals ``occupancy.hosts_total`` **plus** the number
-          of orphan entries; with no orphans (the steady state) the two agree.
-        - The ``isinstance`` gate is a TYPE check, not a defensive fail-soft:
-          :meth:`_ensure_host_allocator` always constructs a real
-          :class:`~orchestrator.verify_runner.HostAllocator` and nothing else is
-          ever assigned in production, so the ``[]`` branch is unreachable
-          there.  It exists solely because ``_host_allocator`` carries a
-          ``MagicMock`` double at 79 assignment sites across 15 test files;
-          those doubles answer every attribute, so ``hasattr``/duck-typing
-          would let them crash or inject garbage into this read-only path.
-        - ``task_held_by`` is the harness's task-hold reading for the host
-          (``'task:<id>[,task:<id>]'``), else None.  It is independent of
-          ``slot_state``: a task turn on a remote host takes no merge slot
-          (task 6670, hosts are symmetric).
-        - ``[]`` therefore also means "allocator not built yet (no verify
-          dispatched)".  Deliberately NOT a fabricated ``local`` entry — an
-          absent allocator is a distinct fact from an idle one.
-        """
-        if not isinstance(self._host_allocator, HostAllocator):
-            return []
-        holders = self._host_holder_reader() if self._host_holder_reader is not None else {}
-
-        def _entry(name: str, *, is_local: bool, slot_state: str | None,
-                   quarantined: bool) -> dict:
-            ru = self._runner_unavailable.get(name)
-            return {
-                'name': name,
-                'is_local': is_local,
-                'slot_state': slot_state,
-                'quarantined': quarantined,
-                'quarantine_class': (
-                    (quarantine_class(ru.kind) if ru is not None else 'divergence')
-                    if quarantined else None
-                ),
-                **(ru.to_wire(now) if ru is not None else UNTRACKED_HOST_WIRE),
-                'task_held_by': holders.get(name),
-            }
-
-        out: list[dict] = [
-            _entry(
-                st['name'],
-                is_local=st['is_local'],
-                slot_state=st['slot_state'],
-                quarantined=bool(st['quarantined']),
-            )
-            for st in self._host_allocator.host_states()
-        ]
-        # Orphan RU entries: RU-tracked hosts with no allocator slot. Appended
-        # after the managed hosts so the allocator's own ordering (local first,
-        # then remotes in declaration order) is untouched; sorted for a stable
-        # snapshot across calls.
-        _managed = {h['name'] for h in out}
-        for _orphan in sorted(set(self._runner_unavailable) - _managed):
-            out.append(_entry(
-                _orphan,
-                is_local=False,
-                slot_state=None,
-                quarantined=self._host_allocator.is_quarantined(_orphan),
-            ))
-        return out
-
-    async def _reprobe_quarantined_hosts(self, now: float) -> None:
-        """Probe each RU-**tracked** remote host and re-engage it on recovery.
-
-        Called periodically by :meth:`_reprobe_loop`.  Candidacy is **tracker-
-        driven** (task 3043): the sweep iterates ``self._runner_unavailable``
-        and resolves a runner for each tracked host, rather than iterating the
-        allocator's quarantine set and then requiring a tracker entry.
-
-        Why the inversion.  The old conjunction ("in the quarantine set AND in
-        the tracker") made recovery reachable only when two pieces of state
-        happened to agree, and three real paths violate that agreement, each
-        stranding a host permanently — non-acquirable, yet structurally
-        invisible to this sweep:
-
-        - an orphaned inner verify task whose ``RunnerUnavailable`` escapes
-          after the outer coroutine was cancelled (in neither);
-        - a ``cancel_and_release`` against a down host, which leaves the slot
-          PARKED and non-acquirable *without* adding the host to the quarantine
-          set (in neither, yet out of the pool);
-        - any future quarantine site that forgets to record.
-
-        A single positive condition ("the tracker says this host is
-        unavailable, so probe it") covers **both** the RUNNER_UNAVAILABLE
-        VerifyResult path and those escaping-exception / PARKED-strand paths.
-        The INV-A chokepoint :meth:`_quarantine_unreachable_host` guarantees
-        the tracker entry exists for every RU-class removal from the pool.
-
-        Per host:
-
-        1. Probes via :meth:`probe_host` — ``runner.health()`` for an 'ru'
-           bench, ensure-gate for a 'skew' one; a sticky bench is not probed.
-        2. **On success** (host recovered): if the slot is PARKED and the runner
-           exposes ``probe_clean``, re-admission additionally requires a clean
-           probe — PARK means "the cancel RPC failed, so a stale verify may
-           still be running there", and freeing the slot on mere reachability
-           could double-dispatch onto a host still churning on the previous
-           merge.  A dirty host stays tracked and parked so the NEXT sweep
-           retries it.  A PARKED host whose runner does NOT expose the optional
-           probe is re-admitted on reachability alone but **loudly** (WARNING) —
-           see the inline note: refusing would make it permanently
-           non-acquirable, and the arm is unreachable against a real
-           ``HostAllocator``.  Otherwise the host is **re-admitted** via
-           ``allocator.readmit`` — which un-quarantines *and* un-PARKs; plain
-           ``clear_quarantine`` cannot recover a PARKED slot, since
-           ``acquire_remote`` additionally requires ``_SLOT_FREE`` — then
-           :meth:`readmit_host` resets the tracker and resolves the alarms on
-           the evidence the probe named.
-        3. **On failure** (host still unreachable): re-asserts the alarm while
-           :meth:`_HostUnavailability.alarm_due` holds (dedup'd via
-           ``has_open_l1``), so a resolve issued while the host still fails its
-           probe — on an occupancy read, say — is re-opened on the next sweep:
-           recovery is a measurement (the probe), never a proxy (task 5290).
-           Probing before alarming avoids a spurious open→immediate-resolve L1
-           churn for a host that recovers in the same cycle it would have tripped
-           the time-based threshold.
-
-        **Correctness invariant (Invariant 5)**: hosts quarantined for verdict
-        divergence — by :class:`DriftDetector`'s sampled parity check OR by the
-        land-time per-land cross-check in :func:`_run_post_merge_verify` (task
-        2822 fix b, which adds ``runner.name`` to the same worker-owned
-        ``_runner_quarantine`` set) — are never in ``self._runner_unavailable``,
-        so tracker-driven candidacy excludes them **by construction** rather
-        than by an explicit skip.  Clearing either on mere SSH reachability
-        would bypass the verdict parity gate; both stay quarantined until an
-        operator re-proves the host and clears it explicitly.
-
-        Runner resolution deliberately uses ``getattr`` + a
-        ``quarantined_remote_runners()`` fallback rather than the
-        ``isinstance(_host_allocator, HostAllocator)`` gate used elsewhere in
-        this class: the reprobe suites drive this method through lightweight
-        allocator doubles that are not ``HostAllocator`` instances, and an
-        isinstance gate would make the sweep a silent no-op for them.
-
-        The tracker is iterated as a **snapshot** because the sweep mutates it
-        (``_record_runner_recovered``).  Per-host exceptions are caught so one
-        host's failure cannot abort the sweep for the remaining hosts.
-
-        **Observability.** Every decision emits exactly one single-line record
-        naming the host — recovered, still-unreachable, park-safety skip,
-        unresolvable-runner (WARNING), and the allocator-missing early return
-        while hosts are tracked (WARNING) — so grepping the orchestrator log
-        for a host name answers "did the reprobe loop consider this host, and
-        what did it decide?".  That question was unanswerable during the reify
-        2026-07-25 incident, whose post-mortem had to argue from the *absence*
-        of dispatch attempts.  This complements task 3275's snapshot/heartbeat
-        observability, which reports per-host STATE but not this sweep's
-        decisions.  Deliberately **silent** when the tracker is empty: the
-        healthy steady state runs every ``verify_host_reprobe_interval_s``
-        (120 s) and must not become log noise.
-
-        For the same reason the **still-unreachable** record — the only one
-        that repeats for an unchanging state — is rate-limited to
-        ``REPROBE_STILL_DOWN_INFO_SWEEPS`` INFO lines per episode, plus one on
-        any streak change, plus one per ``REPROBE_STILL_DOWN_INFO_PERIOD_SECS``
-        thereafter; suppressed sweeps drop to DEBUG rather than vanishing (task
-        3043 amend).  Every other record is a TRANSITION, at most one per
-        episode, and is never throttled.
-        """
-        if self._host_allocator is None:
-            # Silent when nothing is tracked (the common "no verify dispatched
-            # yet" case at a 120 s cadence); loud when hosts ARE tracked, since
-            # then this early return is the reason none of them can recover.
-            if self._runner_unavailable:
-                logger.warning(
-                    'reprobe: no host allocator built, but %d host(s) are tracked '
-                    'unavailable (%s) — none can be re-probed or re-admitted this sweep',
-                    len(self._runner_unavailable),
-                    ', '.join(sorted(self._runner_unavailable)),
-                )
-            return
-
-        # Loop-INVARIANT fallback map, hoisted out of the per-host loop and
-        # built AT MOST ONCE per sweep, lazily on the first `remote_runner`
-        # miss (task 3043 amend).  Against a real HostAllocator `remote_runner`
-        # always resolves, so this stays None and costs nothing; only the
-        # legacy-double path pays, and it now pays O(n_quarantined) per sweep
-        # instead of per tracked host.
-        _fallback_runners: dict[str, Any] | None = None
-        _resolve = getattr(self._host_allocator, 'remote_runner', None)
-
-        for name, entry in list(self._runner_unavailable.items()):
-            try:
-                # Resolve a runner for a host that may NOT be in the quarantine
-                # set — the strand shape `quarantined_remote_runners()`
-                # structurally cannot report.  Fallback keeps pre-existing
-                # allocator doubles (which predate `remote_runner`) working.
-                runner = _resolve(name) if _resolve is not None else None
-                if runner is None:
-                    if _fallback_runners is None:
-                        _fallback_runners = dict(
-                            self._host_allocator.quarantined_remote_runners()
-                        )
-                    runner = _fallback_runners.get(name)
-
-                downtime_s = now - entry.first_unavailable_at
-
-                if runner is None:
-                    logger.warning(
-                        'reprobe: host %r is tracked unavailable (down %.0fs) but has '
-                        'no resolvable runner handle — it is stranded out of the verify '
-                        'pool and cannot be re-probed',
-                        name,
-                        downtime_s,
-                    )
-                    continue
-
-                # Probe first so a host that recovers in the same cycle it would
-                # have tripped the time-based threshold goes directly to the
-                # recovery path, avoiding a spurious open→immediate-resolve L1.
-                evidence = await self.probe_host(name, runner)
-                if evidence is not None:
-                    await self._readmit_benched_host(name, runner, now, evidence=evidence)
-                else:
-                    self._note_host_still_out(name, entry, now)
-            except Exception:
-                logger.exception(
-                    'reprobe_quarantined_hosts: unexpected error probing %r; skipping',
-                    name,
-                )
-
-    async def probe_host(self, name: str, runner: Any) -> RecoveryEvidence | None:
-        """The evidence that tracked host *name* has recovered, or None (design D6, task 5290).
-
-        An 'ru' bench answers ``runner.health()`` (``ssh true``), giving
-        ``SSH_HEALTH_PROBE``.  A 'skew' bench answers ``runner.ensure_gate()``
-        — publish, build or reuse the gate, handshake — giving ``ENSURE_GATE``,
-        so a host only comes back once it can run this dispatcher's gate.  A
-        sticky bench is never probed: it waits for an operator clear or a
-        restart.
-        """
-        entry = self._runner_unavailable[name]
-        if entry.sticky:
-            return None
-        if quarantine_class(entry.kind) == 'ru':
-            return await self._ssh_health_evidence(runner)
-        try:
-            await runner.ensure_gate(event_store=self._event_store)
-        except RunnerUnavailable as exc:
-            logger.info('reprobe: ensure-gate for skew-benched host %r failed (%s): %s',
-                        name, exc.kind, exc)
-            return None
-        return RecoveryEvidence.ENSURE_GATE
-
-    @staticmethod
-    async def _ssh_health_evidence(runner: Any) -> RecoveryEvidence | None:
-        return RecoveryEvidence.SSH_HEALTH_PROBE if await runner.health() else None
-
-    async def _readmit_benched_host(
-        self, name: str, runner: Any, now: float, *, evidence: RecoveryEvidence,
-    ) -> bool:
-        """Re-admit *name* on *evidence* unless its PARKED slot is not yet clean.
-
-        PARK means "the cancel RPC failed, so a stale verify may still be
-        running there", so a PARKED slot is freed only on a clean
-        ``probe_clean()``; a dirty host stays tracked and parked for the next
-        sweep.  Returns whether the host was re-admitted.
-        """
-        _is_parked = getattr(self._host_allocator, 'is_parked', None)
-        _was_parked = bool(_is_parked(name)) if _is_parked is not None else False
-        _park_epoch = getattr(self._host_allocator, 'park_epoch', None)
-        _probed_epoch = _park_epoch(name) if _park_epoch is not None else None
-        entry = self._runner_unavailable.get(name)
-        downtime_s = now - entry.first_unavailable_at if entry is not None else 0.0
-        if _was_parked and not await self._parked_slot_is_clean(name, runner, downtime_s):
-            return False
-        if not self.readmit_host(name, now=now, evidence=evidence, expect_epoch=_probed_epoch):
-            return False
-        logger.info(
-            'reprobe: host %r recovered after %.0fs down — re-admitted to '
-            'the verify pool (slot un-PARKed: %s)',
-            name,
-            downtime_s,
-            _was_parked,
-        )
-        return True
-
-    async def _parked_slot_is_clean(self, name: str, runner: Any, downtime_s: float) -> bool:
-        _probe_clean = getattr(runner, 'probe_clean', None)
-        if _probe_clean is None:
-            # FAIL-OPEN, but never SILENTLY (task 3043 amend).  Refusing would
-            # make such a host PERMANENTLY non-acquirable; and against a real
-            # HostAllocator it is unreachable, since cancel_and_release (the
-            # only PARK writer) calls probe_clean() on that very path.
-            logger.warning(
-                'reprobe: host %r is reachable again after %.0fs and its '
-                'slot is PARKED, but its runner (%s) exposes no '
-                'probe_clean() — re-admitting on reachability ALONE; a '
-                'stale verify could still be running there',
-                name,
-                downtime_s,
-                type(runner).__name__,
-            )
-            return True
-        if await _probe_clean():
-            return True
-        logger.info(
-            'reprobe: host %r is reachable again after %.0fs but its '
-            'slot stays PARKED pending a clean probe (a stale verify '
-            'may still be running there); retrying next sweep',
-            name,
-            downtime_s,
-        )
-        return False
-
-    def _note_host_still_out(self, name: str, entry: _HostUnavailability, now: float) -> None:
-        """Log a failed reprobe (rate-limited) and re-assert the alarm while it is due."""
-        downtime_s = now - entry.first_unavailable_at
-        # Rate-limited (task 3043 amend): this is the one record that repeats
-        # forever for a permanently-gone host.  INFO for the first
-        # REPROBE_STILL_DOWN_INFO_SWEEPS sweeps of an episode, INFO on any
-        # CHANGE (a new streak), then at most one INFO per
-        # REPROBE_STILL_DOWN_INFO_PERIOD_SECS.  Suppressed sweeps log at DEBUG.
-        _last_at, _last_streak, _sweeps = self._reprobe_last_info.get(
-            name, (None, None, 0)
-        )
-        _at_info = (
-            _last_at is None
-            or _sweeps < self.REPROBE_STILL_DOWN_INFO_SWEEPS
-            or entry.streak != _last_streak
-            or (now - _last_at) >= self.REPROBE_STILL_DOWN_INFO_PERIOD_SECS
-        )
-        logger.log(
-            logging.INFO if _at_info else logging.DEBUG,
-            'reprobe: host %r still unavailable (%s%s) after %.0fs down '
-            '(streak=%d) — staying out of the verify pool',
-            name,
-            quarantine_class(entry.kind),
-            ', sticky' if entry.sticky else '',
-            downtime_s,
-            entry.streak,
-        )
-        self._reprobe_last_info[name] = (
-            now if _at_info else (_last_at if _last_at is not None else now),
-            entry.streak,
-            _sweeps + 1,
-        )
-        if entry.alarm_due(
-            now,
-            after_n=self._unreachable_escalate_after_n,
-            after_secs=self._unreachable_escalate_after_secs,
-        ):
-            self._alarm_host(name, entry, downtime_s)
-
-    def readmit_host(
-        self, name: str, *, now: float, evidence: RecoveryEvidence,
-        expect_epoch: int | None = None,
-    ) -> bool:
-        """Return remote *name* to the verify pool and close its bench: THE readmit.
-
-        Un-quarantines and un-PARKs it (``allocator.readmit``, refused when the
-        park episode moved past *expect_epoch*), drops its tracker entry, and
-        resolves its pending unreachability and skew alarms on the named
-        *evidence* (task 5290).  The reprobe sweep calls
-        it after a passing :meth:`probe_host`, and keeps the per-(host, sha)
-        skew count that makes the next skew bench sticky;
-        :meth:`clear_host_quarantine` (the operator clear) calls it without a
-        probe and then resets that count, as a restart does.  A readmission
-        then calls the harness's ``on_host_readmitted`` hook, fault-isolated,
-        so the task pool re-offers the host (task 6670).  Returns whether the
-        host was re-admitted.
-        """
-        _readmit = getattr(self._host_allocator, 'readmit', None)
-        if _readmit is None:
-            if self._host_allocator is None:
-                return False
-            self._host_allocator.clear_quarantine(name)
-        elif not _readmit(name, expect_epoch=expect_epoch):
-            return False
-        entry = self._runner_unavailable.get(name)
-        downtime_s = now - entry.first_unavailable_at if entry is not None else 0.0
-        self._record_runner_recovered(name)
-        _clear_verify_host_unreachable(
-            self._escalation_queue, self._event_store, name,
-            downtime_s=downtime_s, evidence=evidence,
-        )
-        _clear_verify_host_skew(
-            self._escalation_queue, self._event_store, name,
-            downtime_s=downtime_s, evidence=evidence,
-        )
-        self._notify_host_readmitted(name)
-        return True
-
-    def _notify_host_readmitted(self, name: str) -> None:
-        """Tell the harness *name* is back; a task-pool fault never undoes the readmission."""
-        if self._on_host_readmitted is None:
-            return
-        try:
-            self._on_host_readmitted(name)
-        except Exception:
-            logger.exception(
-                'on_host_readmitted hook raised for re-admitted verify host %r; '
-                'the merge-lane readmission stands', name,
-            )
+        """Bench remote *name* for *exc*: the ``on_unavailable`` sink pools, drift and trains hold."""
+        self._host_quarantine.bench(name, exc)
 
     async def clear_host_quarantine(self, name: str) -> dict[str, Any]:
-        """The operator clear (escalation tool ``clear_verify_host_quarantine``).
-
-        Re-admits remote *name* whatever benched it — an 'ru' or 'skew' bench,
-        sticky or not, or a verdict-divergence quarantine — without probing
-        its health; a PARKED slot is still freed only once ``probe_clean()``
-        finds no stale verify there.  Like a restart, a clear resets the
-        host's skew count, so its next skew bench is a first one again
-        (design D6: sticky lasts until a restart or an operator clear).
-        Returns ``{host, cleared, quarantine_class, was_sticky}`` plus
-        ``reason`` when nothing was cleared.
-        """
-        entry = self._runner_unavailable.get(name)
-        quarantined = name in self._runner_quarantine
-        result: dict[str, Any] = {
-            'host': name,
-            'cleared': False,
-            'quarantine_class': (
-                quarantine_class(entry.kind) if entry is not None
-                else 'divergence' if quarantined else None
-            ),
-            'was_sticky': bool(entry is not None and entry.sticky),
-        }
-        runner = (
-            self._host_allocator.remote_runner(name)
-            if isinstance(self._host_allocator, HostAllocator) else None
-        )
-        if runner is None:
-            return {**result, 'reason': f'{name!r} is not a remote verify host of this worker'}
-        if entry is None and not quarantined:
-            return {**result, 'reason': f'{name!r} is not benched'}
-        if not await self._readmit_benched_host(
-            name, runner, self._clock.now(), evidence=RecoveryEvidence.OPERATOR_CLEAR,
-        ):
-            return {
-                **result,
-                'reason': 'its slot is PARKED and a stale verify may still be running there',
-            }
-        self._skew_benches.pop((name, self._deployed_code_sha()), None)
-        return {**result, 'cleared': True}
-
-    def _clear_bench_alarms_of_an_earlier_process(self) -> None:
-        """Resolve the skew L1s a previous process left open for this worker's verify hosts.
-
-        A restart clears every bench (design D6), so at start no bench of
-        this process exists yet and any open skew L1 is its predecessor's.
-        Covers the hosts named in config (``verify_hosts``); fault-isolated,
-        since a queue error must never stop the worker starting.
-        """
-        for host in self._verify_hosts:
-            try:
-                _clear_verify_host_skew_of_an_earlier_process(
-                    self._escalation_queue, host, code_sha=self._deployed_code_sha(),
-                )
-            except Exception:
-                logger.exception('could not resolve the earlier skew L1 of host %r', host)
-
-    async def _reap_idle_gates(self, now: float) -> None:
-        """At most hourly, launch the detached gate reaper of each remote in the pool (design D2).
-
-        A benched host (tracked unavailable, or quarantined for any reason,
-        verdict divergence included) is skipped.
-        """
-        if not isinstance(self._host_allocator, HostAllocator):
-            return
-        last = self._last_gate_reap_at
-        if last is not None and now - last < self.GATE_REAP_INTERVAL_SECS:
-            return
-        self._last_gate_reap_at = now
-        for name in self._host_allocator.host_names:
-            runner = self._host_allocator.remote_runner(name)
-            benched = name in self._runner_unavailable or self._host_allocator.is_quarantined(name)
-            if runner is not None and not benched:
-                await runner.reap_idle_gates()
+        """The operator clear (escalation tool ``clear_verify_host_quarantine``): :meth:`HostQuarantine.clear`."""
+        return await self._host_quarantine.clear(name)
 
     # ── owned-worktree liveness ledger ───────────────────────────────────
 
@@ -12455,7 +11639,7 @@ class SpeculativeMergeWorker:
             task_id=entry.item.request.task_id,
             request_id=entry.item.request.request_id,
             activity=activity,
-            host_quarantined=host in self._runner_quarantine,
+            host_quarantined=self._host_quarantine.is_quarantined(host),
         )
 
     def _hosts_total(self) -> int:
@@ -12537,7 +11721,7 @@ class SpeculativeMergeWorker:
             steady state).  This is what makes an under-full `verifying N/M
             hosts` line diagnosable; the five causes and their discriminators:
               - RU-quarantined         : quarantine_class == 'ru' (auto-recovers
-                                         via _reprobe_quarantined_hosts)
+                                         via HostQuarantine.sweep)
               - skew-quarantined       : quarantine_class == 'skew' (re-probed by
                                          ensure-gate unless sticky; identity
                                          carries both gate identities)
@@ -12838,7 +12022,7 @@ class SpeculativeMergeWorker:
             # Backward-compatible (no collision with the existing key set);
             # pure synchronous read via HostAllocator.host_states() — no await,
             # no I/O.  [] when the allocator has not been built yet.
-            'hosts': self._host_states_block(now),
+            'hosts': self._host_quarantine.host_states(now),
             # δ/1889 additive key: per-suffix conflict relation (backward-compatible).
             # Populated by recompute_suffix_conflict_graph() after each drain.
             # Read here synchronously — no await; the expensive async build is
@@ -13062,7 +12246,7 @@ class SpeculativeMergeWorker:
             :attr:`RESOURCE_AUDIT_LOG_COALESCE_CAP_POLLS`.
           * DEBUG on the polls in between — suppressed, never DROPPED, so a
             debug-level operator still sees every poll (mirrors
-            :meth:`_reprobe_quarantined_hosts`'s precedent).
+            :meth:`HostQuarantine.sweep`'s precedent).
           * one INFO ``... audit clear ...`` line on the violating → clean
             transition, so the END of a condition is greppable rather than
             inferred from an absence of lines.
@@ -13163,8 +12347,8 @@ class SpeculativeMergeWorker:
         #   INFO     the clear line, on the violating -> clean transition.
         #
         # The INFO/DEBUG split is one logger.log(level_expr, fmt, ...) call
-        # with a single format string — the idiom _reprobe_quarantined_hosts
-        # (above, task 3043 amend) already uses for the same problem.
+        # with a single format string — the idiom HostQuarantine's reprobe
+        # sweep (task 3043 amend) already uses for the same problem.
         self._resource_audit_log_gate.cap_polls = self.RESOURCE_AUDIT_LOG_COALESCE_CAP_POLLS
         decision = self._resource_audit_log_gate.observe(
             _resource_audit_fingerprint(violations), now,
@@ -13181,7 +12365,7 @@ class SpeculativeMergeWorker:
         else:
             # An unchanged repeat. Due repeats report; the polls between them
             # are NOT dropped, only demoted to DEBUG (mirrors the
-            # _reprobe_last_info precedent above). The violation strings are
+            # HostQuarantine._reprobe_last_info precedent). The violation strings are
             # deliberately omitted so this branch formats nothing eagerly.
             logger.log(
                 logging.INFO if decision.should_log else logging.DEBUG,
@@ -13260,7 +12444,7 @@ class SpeculativeMergeWorker:
         — one of the three 2026-07 incidents where a stuck merge queue was
         diagnosed only by hand-correlating a ``verifying N/M hosts`` line
         against allocator internals.  ``<class>`` is ``ru`` or ``skew``
-        (re-probed by :meth:`_reprobe_quarantined_hosts`) or ``divergence``
+        (re-probed by :meth:`HostQuarantine.sweep`) or ``divergence``
         (operator-cleared only).
 
         The ``depth == 0`` no-op gate above is UNCHANGED: a fully idle pipeline
@@ -13314,7 +12498,7 @@ class SpeculativeMergeWorker:
         _deg = [h for h in snap['hosts'] if h['quarantined']]
         _deg_suffix = ''
         if _deg:
-            # No `or <fallback>` on quarantine_class: _host_states_block sets it
+            # No `or <fallback>` on quarantine_class: HostQuarantine.host_states sets it
             # to exactly 'ru', 'skew' or 'divergence' whenever quarantined is True (and
             # _deg filters on that), so a fallback would be unreachable dead code
             # that quietly papered over an invariant break. If the invariant ever
@@ -13416,37 +12600,13 @@ class SpeculativeMergeWorker:
 
         Runs independently of the merger/verifier loops so it fires even when
         those are idle.  Wakes every ``_reprobe_interval_s`` seconds and runs
-        three steps: the tracker-driven :meth:`_reprobe_quarantined_hosts`
-        first, then :meth:`_reprobe_untracked_parked_slots`, the backstop for
-        PARKED hosts with no tracker entry, then the at-most-hourly
-        :meth:`_reap_idle_gates`.
-
-        Each step is fault-isolated: an unexpected exception is logged and
-        swallowed (same pattern as _heartbeat_loop), so a probe bug can neither
-        crash the worker nor disable the other steps.
+        one :meth:`HostQuarantine.sweep`, which fault-isolates each of its
+        steps, so a probe bug can neither crash the worker nor disable the
+        other steps.
         """
         while self._running:
             await self._clock.sleep(self._reprobe_interval_s)
-            try:
-                await self._reprobe_quarantined_hosts(self._clock.now())
-            except Exception:
-                logger.exception('reprobe_quarantined_hosts: unexpected error in loop')
-            try:
-                await self._reprobe_untracked_parked_slots()
-            except Exception:
-                logger.exception('reprobe_untracked_parked_slots: unexpected error in loop')
-            try:
-                await self._reap_idle_gates(self._clock.now())
-            except Exception:
-                logger.exception('reap_idle_gates: unexpected error in loop')
-
-    async def _reprobe_untracked_parked_slots(self) -> None:
-        """Free PARKED hosts the tracker sweep cannot see; tracked ones stay its job."""
-        if not isinstance(self._host_allocator, HostAllocator):
-            return
-        await self._host_allocator.reprobe_parked_slots(
-            exclude=frozenset(self._runner_unavailable),
-        )
+            await self._host_quarantine.sweep(self._clock.now())
 
     # ── supervisor (task 1857) ───────────────────────────────────────────
 
@@ -13714,7 +12874,7 @@ class SpeculativeMergeWorker:
         self._spawn_loop('merger')
         self._spawn_loop('verifier')
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
-        self._clear_bench_alarms_of_an_earlier_process()
+        self._host_quarantine.clear_bench_alarms_of_an_earlier_process()
         self._reprobe_task = asyncio.create_task(self._reprobe_loop())
         try:
             await self._loops_finished.wait()
@@ -16954,14 +16114,14 @@ class SpeculativeMergeWorker:
         so a stale verify process may still be running there — but it writes
         **only** ``_slots``: the host is NOT added to ``_quarantine``, so
         ``quarantined_remote_runners()`` never yields it and
-        :meth:`_reprobe_quarantined_hosts` has no tracker entry to re-adopt.
+        :meth:`HostQuarantine.sweep` has no tracker entry to re-adopt.
         The host is then silently non-acquirable forever.  That is how the
         laptop went to "verifying 1/2 hosts" with ZERO dispatch attempts for
         3+ h and stayed there until an orchestrator restart rebuilt the
         allocator.
 
         So: detect the PARK and route it through
-        :meth:`_quarantine_unreachable_host`, which upholds INV-A (quarantine
+        :meth:`HostQuarantine.quarantine_unreachable`, which upholds INV-A (quarantine
         implies tracked) and thereby hands recovery to the reprobe sweep.
         ``cancel_and_release``'s own PARK-on-exhaustion semantics are
         deliberately UNTOUCHED — pinned by
@@ -16976,7 +16136,7 @@ class SpeculativeMergeWorker:
         already PARKED, still records the strand and then propagates unchanged.
 
         The PARKED read is gated on ``isinstance(..., HostAllocator)`` — the
-        house pattern task 3275 established at :meth:`_host_states_block`,
+        house pattern task 3275 established at :meth:`HostQuarantine.host_states`,
         because ``_host_allocator`` carries a ``MagicMock`` at ~79 assignment
         sites across 15 test files and a duck-typed ``is_parked`` would let
         every one of those doubles fabricate a quarantine.  Local leases are
@@ -17012,7 +16172,7 @@ class SpeculativeMergeWorker:
                 and self._host_allocator.is_parked(lease.name)
             )
             if _parked:
-                self._quarantine_unreachable_host(
+                self._host_quarantine.quarantine_unreachable(
                     lease.name,
                     f'verify cancel/probe failed against {lease.name!r} — '
                     'host slot PARKED (presumed unreachable)',
@@ -17394,7 +16554,7 @@ class SpeculativeMergeWorker:
             max_narrowed=self.MAX_POST_MERGE_VERIFY_NARROWED_RETRIES,
             narrowed_retries=self._post_merge_verify_narrowed_retries,
             event_store=self._event_store,
-            quarantine=self._runner_quarantine,
+            quarantine=self._host_quarantine.quarantine_divergent,
             escalation_queue=self._escalation_queue,
             # task 2886 fix 3 (PRD §3.4 / decision 4): thread the synchronous
             # all-lane halt so a CONCLUDED cross-check divergence stops the
@@ -18443,7 +17603,7 @@ class SpeculativeMergeWorker:
             # ended CANCELLED while the inner kept pushing to the down host, and
             # when it finally raised there was no VerifyResult, no quarantine
             # and no tracker entry — the host was stranded out of the verify
-            # pool with nothing for _reprobe_quarantined_hosts to re-adopt.
+            # pool with nothing for HostQuarantine.sweep to re-adopt.
             #
             # Provably additive: the three deliberate abort branches already do
             # cancel() + suppress(BaseException): await, so clause 1 is a no-op
@@ -19754,7 +18914,7 @@ class SpeculativeMergeWorker:
                 # open alarm per host per downtime episode regardless of how
                 # many RU events accumulate.
                 #
-                # Routed through the _quarantine_unreachable_host chokepoint
+                # Routed through the HostQuarantine.quarantine_unreachable chokepoint
                 # (task 3043) so this path and the two strand paths (orphaned
                 # verify task, PARKED-slot release) share ONE implementation of
                 # "quarantine implies tracked".  quarantine_and_release above
@@ -19762,7 +18922,7 @@ class SpeculativeMergeWorker:
                 # quarantine set + tracker + alarm, and adding an
                 # already-quarantined name to that set is a no-op.
                 if entry.lease is not None:
-                    self._quarantine_unreachable_host(
+                    self._host_quarantine.quarantine_unreachable(
                         entry.lease.name,
                         vr.reason or '<unknown>',
                         self._clock.now(),

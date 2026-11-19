@@ -2086,7 +2086,7 @@ class TestPerLandCrossCheck:
             merge_sha='mergesha01',
             runner=remote,
             escalation_queue=eq,
-            quarantine=quarantine,
+            quarantine=quarantine.add,
             halt_hook=halt_hook,
             verifier=verifier,
         )
@@ -2154,7 +2154,7 @@ class TestPerLandCrossCheck:
             merge_sha='mergesha07',
             runner=remote,
             escalation_queue=eq,
-            quarantine=quarantine,
+            quarantine=quarantine.add,
             halt_hook=halt_hook,
             verifier=verifier,
         )
@@ -2216,7 +2216,7 @@ class TestPerLandCrossCheck:
             merge_sha='mergesha0h',
             runner=remote,
             escalation_queue=eq,
-            quarantine=quarantine,
+            quarantine=quarantine.add,
             halt_hook=halt_hook,
             verifier=verifier,
         )
@@ -2251,7 +2251,7 @@ class TestPerLandCrossCheck:
             merge_sha='mergesha0n',
             runner=remote,
             escalation_queue=eq,
-            quarantine=quarantine,
+            quarantine=quarantine.add,
             # halt_hook omitted -> None default (byte-identical non-production callers)
             verifier=verifier,
         )
@@ -2285,7 +2285,7 @@ class TestPerLandCrossCheck:
             merge_sha='mergesha02',
             runner=remote,
             escalation_queue=eq,
-            quarantine=quarantine,
+            quarantine=quarantine.add,
             verifier=verifier,
         )
 
@@ -2318,7 +2318,7 @@ class TestPerLandCrossCheck:
             merge_sha='mergesha03',
             runner=remote,
             escalation_queue=eq,
-            quarantine=quarantine,
+            quarantine=quarantine.add,
             verifier=verifier,
         )
 
@@ -2352,7 +2352,7 @@ class TestPerLandCrossCheck:
             merge_sha='mergesha04',
             runner=remote,
             escalation_queue=eq,
-            quarantine=quarantine,
+            quarantine=quarantine.add,
             verifier=verifier,
         )
 
@@ -2388,7 +2388,7 @@ class TestPerLandCrossCheck:
             merge_sha='mergesha05',
             runner=remote,
             escalation_queue=eq,
-            quarantine=quarantine,
+            quarantine=quarantine.add,
             verifier=verifier,
         )
 
@@ -2423,7 +2423,7 @@ class TestPerLandCrossCheck:
             merge_sha='mergesha06',
             runner=None,  # LOCAL dispatch
             escalation_queue=eq,
-            quarantine=quarantine,
+            quarantine=quarantine.add,
             verifier=verifier,
         )
 
@@ -2718,7 +2718,7 @@ class TestIndeterminateLocalLegDoesNotVeto:
             merge_sha=merge_sha,
             runner=remote,
             escalation_queue=eq,
-            quarantine=quarantine,
+            quarantine=quarantine.add,
             verifier=verifier,
         )
         return outcome, git_ops, eq, es, quarantine, verifier
