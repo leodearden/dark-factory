@@ -2420,7 +2420,7 @@ class TestDeepDispatchRoundsIntegration:
     ):
         """``chain_cap=1`` turns chains on; the depth table sizes them.
 
-        Under the shipped table an empty window takes the first row, (0.93, 8),
+        Under the shipped table an empty window takes the first row, (0.992, 12),
         so five buffered requests chain behind the dispatcher: six items.
         """
         from orchestrator.verify_runner import HostLease
@@ -2439,7 +2439,7 @@ class TestDeepDispatchRoundsIntegration:
         assert event['data']['chain_task_ids'] == ['101', *_DEEP_QUEUE]
         reason = event['data']['chain_depth_reason']
         assert (reason['basis'], reason['row'], reason['queue_depth']) == (
-            'no_estimate', [0.93, 8], 6,
+            'no_estimate', [0.992, 12], 6,
         )
 
 
@@ -2455,14 +2455,14 @@ class TestPolicyRow8PassEstimateCrossesATableRow:
     """
 
     async def _seeded_scene(self, tmp_path: Path, monkeypatch, *, chain_cap: int, script):
-        """A scene under the shipped table, its window seeded with 28 passes then
-        2 fails, the head alone in the lane so every round verifies one item."""
+        """A scene under the shipped table, its window seeded with 29 passes then
+        1 fail, the head alone in the lane so every round verifies one item."""
         repo = await _fresh_repo(tmp_path, f'row8-{chain_cap}')
         scene = await _make_deep_scene(
             repo, chain_cap=chain_cap, script=script, monkeypatch=monkeypatch, cohorts=0,
         )
         scene.config.merge_deep.depth_table = list(_SHIPPED_DEPTH_TABLE)
-        _seed_window(scene.worker, tmp_path, [True] * 28 + [False] * 2)
+        _seed_window(scene.worker, tmp_path, [True] * 29 + [False])
         return scene
 
     async def test_a_k1_fail_drops_the_estimate_below_the_first_row(
@@ -2477,10 +2477,10 @@ class TestPolicyRow8PassEstimateCrossesATableRow:
 
         assert scene.depths == [None, None], 'the head is alone: k=1 both rounds'
         first, second = (rec['dispatch_facts'].chain_depth_reason for rec in scene.calls)
-        assert (first.basis, first.row) == (ChainDepthBasis.PASS_ESTIMATE, (0.93, 8))
-        assert first.pass_estimate == pytest.approx(28 / 30)
-        assert second.row == (0.85, 4)
-        assert second.pass_estimate == pytest.approx(27 / 30)
+        assert (first.basis, first.row) == (ChainDepthBasis.PASS_ESTIMATE, (0.959, 6))
+        assert first.pass_estimate == pytest.approx(29 / 30)
+        assert second.row == (0.876, 4)
+        assert second.pass_estimate == pytest.approx(28 / 30)
 
     async def test_the_kill_switch_ignores_the_seeded_window(
         self, tmp_path: Path, monkeypatch,

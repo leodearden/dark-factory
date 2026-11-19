@@ -1436,7 +1436,8 @@ restart, no drained queue.
 **Depth comes from the pass estimate, not a cap.** Cap staging is retired:
 task 3191 (promote the cap to 32) is cancelled, and task 3190 was superseded
 on 2026-11-17. Each round's depth is read off `merge_deep.depth_table`
-(shipped `[[0.93, 8], [0.85, 4], [0.75, 2]]`; below the last row, one item)
+(shipped: one row per depth from 12, at an estimate of 0.992, down to 3, at 0.75; below the
+last row, one item; the rows and their derivation are in `plans/merge-lane-policy-prd.md` D7)
 against the rolling per-item pass estimate over the last 30 tip verdicts of
 the rounds the policy sized, and is never more than the queue holds. The
 window lives in memory and is seeded at worker start from the newest
