@@ -545,7 +545,7 @@ def test_main_session_start_fail_soft_when_probe_read_raises(
     assert len(list(session_records.sessions_dir(root=tmp_path).iterdir())) == 1
 
 
-def test_hand_launched_session_unaffected_by_ownership_probe(tmp_path: Path) -> None:
+def test_hand_launched_session_keeps_one_record_across_hook_events(tmp_path: Path) -> None:
     # A hand-launched session (no CLAUDE_SPAWN_SESSION_ID) keeps the
     # hand-launched keying through every hook event, one record, same slug.
     hook_input = {'session_id': 'sess-hand', 'cwd': '/home/leo/src/dark-factory'}

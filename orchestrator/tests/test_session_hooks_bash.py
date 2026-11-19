@@ -173,9 +173,9 @@ def test_legacy_record_without_owner_pid_adopts_rather_than_splitting_the_owner(
 ) -> None:
     # A record bound before claude_owner_pid existed cannot prove ownership
     # EITHER WAY. Task 4193 L2 ruling item 4-ii: unprovable is not disproved,
-    # so it must take the fail-soft direction this module documents at
-    # _env_slug_ownership ("every failure mode resolves to adopt, never to
-    # fork"). Forking here would split the OWNER's own record on every
+    # so it must take the fail-soft direction
+    # session_hooks.py::_env_slug_ownership documents (an unresolvable probe
+    # adopts, never forks). Forking here would split the OWNER's own record on every
     # routine automatic compaction wherever /proc is unavailable (macOS) --
     # a universal regression, strictly worse than the rare inversion it
     # would prevent. The fork is reserved for a pid that RESOLVES and
