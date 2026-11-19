@@ -73,18 +73,25 @@ def _docs_grant_write_set() -> WriteSet:
     )
 
 
+def _sandbox_applied_events(
+    tmp_path: Path, role: str, backend: str, write_set: WriteSet,
+) -> list[dict]:
+    """The sandbox_applied rows one ``_emit_sandbox_applied`` call stores."""
+    store = EventStore(tmp_path / 'events.db', 'run')
+    wf = _make_bare_workflow(event_store=store)
+    wf._emit_sandbox_applied(role, backend, write_set)
+    return store.fetch_events_by_type(EventType.sandbox_applied)
+
+
 class TestEmitSandboxApplied:
     """_emit_sandbox_applied writes one sandbox_applied event per sandboxed
     invocation on the non-refusing guard path (β2)."""
 
     def test_real_backend_emits_one_row_with_backend_and_digest(self, tmp_path):
-        store = EventStore(tmp_path / 'events.db', 'run')
-        wf = _make_bare_workflow(event_store=store)
         write_set = _make_write_set()
 
-        wf._emit_sandbox_applied('implementer', 'landlock', write_set)
+        events = _sandbox_applied_events(tmp_path, 'implementer', 'landlock', write_set)
 
-        events = store.fetch_events_by_type(EventType.sandbox_applied)
         assert len(events) == 1
         ev = events[0]
         assert ev['data'] == {'backend': 'landlock', 'digest': write_set.digest()}
@@ -96,26 +103,20 @@ class TestEmitSandboxApplied:
         # The explicit backend=none escape hatch is deliberately-unsandboxed but
         # STILL emits sandbox_applied (data.backend lets γ1 distinguish it from
         # real containment) — every sandboxed invocation emits one of the two.
-        store = EventStore(tmp_path / 'events.db', 'run')
-        wf = _make_bare_workflow(event_store=store)
         write_set = _make_write_set()
 
-        wf._emit_sandbox_applied('debugger', 'none', write_set)
+        events = _sandbox_applied_events(tmp_path, 'debugger', 'none', write_set)
 
-        events = store.fetch_events_by_type(EventType.sandbox_applied)
         assert len(events) == 1
         assert events[0]['data']['backend'] == 'none'
         assert events[0]['data']['digest'] == write_set.digest()
         assert events[0]['role'] == 'debugger'
 
     def test_docs_main_grant_adds_its_paths_to_the_payload(self, tmp_path):
-        store = EventStore(tmp_path / 'events.db', 'run')
-        wf = _make_bare_workflow(event_store=store)
         write_set = _docs_grant_write_set()
 
-        wf._emit_sandbox_applied('simple_task', 'landlock', write_set)
+        events = _sandbox_applied_events(tmp_path, 'simple_task', 'landlock', write_set)
 
-        events = store.fetch_events_by_type(EventType.sandbox_applied)
         assert len(events) == 1
         assert events[0]['data'] == {
             'backend': 'landlock',
