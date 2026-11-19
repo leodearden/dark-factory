@@ -32,7 +32,7 @@ const { windowEcho, windowLabel, recentMergesCaption } = window.DF_WINDOW_CHIP;
 const {
   projectInQueue, inQueueOver, inQueueHistory, latencyCaption, depthBucketCaption,
   queuedSince, projectSpeculative, speculativeOver, hitRateText, recentTotal,
-  attemptCount, attemptsOver, attemptsHistory, worstP95Over, projectAttempts, projectDepth,
+  attemptCount, attemptsOver, attemptsHistory, worstP95Over, projectAttempts, projectDepth, totalHint,
 } = window.DF_MERGE_QUEUE;
 const { writeQueue, queueHint, newestHourOps, opsTotals, opsCaption, opsTotalText } = window.DF_MEMORY_READINGS;
 // PerfTab reads the served cards, and why a tile over them is empty — performance_cards.js.
@@ -875,13 +875,15 @@ function MergeTab({ projectFilter }) {
   return (
     <div className="grid cols-12" style={{ gap: 12 }}>
       {(() => {
+        const merges = attemptsOver(DF, projIds);
+        const inQueue = inQueueOver(DF, projIds);
         const speculative = speculativeOver(DF, projIds);
         const worst = worstP95Over(DF, projIds);
         return (
           <div className="col-span-12 grid cols-4">
-            <ST label="Merges (window)" datum={attemptsOver(DF, projIds)}
+            <ST label="Merges (window)" datum={merges} hint={totalHint(merges)}
                 history={attemptsHistory(DF, projIds)} sparkColor={CP.accent} />
-            <ST label="In queue now" datum={inQueueOver(DF, projIds)}
+            <ST label="In queue now" datum={inQueue} hint={totalHint(inQueue)}
                 history={inQueueHistory(DF, projIds).slice(-30)} sparkColor={CP.warn} />
             <ST label="Speculative hit rate"
                 datum={speculative} format={hitRateText}
@@ -889,7 +891,7 @@ function MergeTab({ projectFilter }) {
                 history={[]} sparkColor={CP.ok} />
             <ST label="p95 latency · worst project"
                 datum={worst} format={w => fmtMs(w.p95_ms)}
-                hint={datumView(worst).isHole ? undefined : `${worst.value.timed_projects} projects`}
+                hint={totalHint(worst, datumView(worst).isHole ? undefined : `${worst.value.timed_projects} projects`)}
                 history={[]} sparkColor={CP.warn} />
           </div>
         );
