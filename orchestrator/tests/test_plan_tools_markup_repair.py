@@ -2455,7 +2455,7 @@ class TestReadPlanRepaired:
         assert plan['design_decisions'][0]['rationale'] == _RATIONALE_PROSE
         assert any(f['outcome'] == 'repaired' for f in facts)
         assert 'disk on fire' in caplog.text, 'the write failure must be LOUD'
-        assert plan_markup_repair._MARKUP_WRITE_FAILED_EVENT in caplog.text, (
+        assert plan_markup_repair.MARKUP_WRITE_FAILED_EVENT in caplog.text, (
             'the failure must be a STRUCTURED fact, not just prose'
         )
 
@@ -2519,9 +2519,6 @@ class TestUnresolvableLocatorIsNeverMemoized:
             'an unresolvable locator must be reported every time, not '
             'suppressed on the second call'
         )
-        assert set() == plan_markup_repair._REPORTED_REFUSALS, (
-            'no key that means nothing may ever be recorded'
-        )
         assert len(_fact_payloads(caplog)) == 2, 'both calls must log at WARNING'
         debug_records = [
             r for r in caplog.records
@@ -2557,7 +2554,6 @@ class TestUnresolvableLocatorIsNeverMemoized:
             'a resolvable locator whose field is legitimately absent must '
             'still converge to silence on repeat, unlike a broken locator'
         )
-        assert len(plan_markup_repair._REPORTED_REFUSALS) == 1
 
 
 # ---------------------------------------------------------------------------

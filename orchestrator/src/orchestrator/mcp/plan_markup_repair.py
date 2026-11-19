@@ -42,42 +42,23 @@ class PlanField(NamedTuple):
 
     ``target_keys`` is the strictly smaller subset of those parameters that name
     a PROSE PLAN KEY a recovered value may legally be written to, mapped to the
-    key to write it under. The two vocabularies are NOT the same: the tool's
-    parameter names and the plan document's key names differ. A parameter absent
-    from ``target_keys`` is one of three things, and none of them is a legal
-    recovery target:
+    key to write it under, because a tool's parameter names and the plan
+    document's key names can differ. A parameter absent from ``target_keys`` —
+    one the plan stores under another key, or one holding no prose at all — is
+    never a recovery target. Keying a recovery on the parameter name alone
+    would write a JUNK KEY beside the real, still-corrupt one, or a bare ``str``
+    over a non-prose value: both silent-wrong-value corruption of the plan
+    artifact, the damage class this surface exists to end.
 
-    * an identifier the plan stores under a different key — ``prereq_id`` and
-      ``step_id`` are both written as ``id``;
-    * an enum the plan stores under a different key — ``step_type`` is written
-      as ``type``;
-    * a non-prose value — ``files`` is a list, ``task_id`` an identifier.
+    ``also_written_by`` names the OTHER tools that write this same field, so a
+    fact does not overstate its own precision. The schema owner is the call
+    whose vocabulary ``repair()`` validates against, not necessarily the call
+    that produced the corruption; naming it alone would send whoever triages a
+    fact to the wrong call site.
 
-    Keying a recovery on the parameter name alone would therefore write a JUNK
-    KEY onto the record (``step_type`` beside the real, still-corrupt ``type``)
-    or a bare ``str`` over the ``files`` list. Both are silent-wrong-value
-    corruption of the plan artifact, which is the damage class this surface
-    exists to end.
-
-    ``also_written_by`` names the OTHER tools that write this same field, and
-    exists so the structured fact does not overstate its own precision. The
-    ``tool`` a fact reports is the collection's SCHEMA OWNER — the call whose
-    parameter vocabulary ``repair()`` validates against — which is not always
-    the call that produced the corruption: ``replace_plan_step`` also writes
-    ``steps[].description`` AND ``prerequisites[].description`` (its lookup loop
-    spans both collections), ``update_plan_metadata`` also writes ``analysis``,
-    and ``mark_step_committed`` ALSO writes ``steps[].description`` AND
-    ``prerequisites[].description`` — but differently from the other two: it
-    takes no ``description`` parameter at all. It re-reads the plan and
-    prepends ``TaskArtifacts.mark_step_committed``'s ``[COMMITTED <sha12>]``
-    provenance tag to whatever the field already held. It can therefore never
-    be the tail that INTRODUCES envelope markup into the field — it has no
-    prose argument to leak one from — but it IS a call site a triager may need
-    to account for when a ``[COMMITTED ...]``-prefixed description turns out
-    corrupt, which is why it is listed here despite writing no prose of its
-    own. Naming only the schema owner would send whoever triages a fact to the
-    wrong call site; naming the alternates alongside it keeps the diagnosis
-    honest without pretending the fact can identify the writer it cannot see.
+    plan-tools' rows, and the cases behind each column, are
+    ``orchestrator/src/orchestrator/mcp/plan_tools.py::_REPAIRABLE_PLAN_FIELDS``
+    with its ``*_TARGETS`` maps and ``_DESCRIPTION_ALSO``.
     """
 
     collection: str | None
@@ -170,27 +151,21 @@ def _repair_one_field(
     redeclaration that would displace authored text is declined and reported on
     ``declined_params``.
 
-    A RECOVERY MAY ONLY LAND ON A DECLARED PROSE KEY. The repairable surface
-    distinguishes the TOOL's parameter vocabulary (``schema_params``) from the
-    PLAN's key vocabulary (``target_keys``), and for three parameters they
-    differ: ``prereq_id`` and ``step_id`` are stored as ``id``, ``step_type``
-    as ``type``. Two more name no prose key at all — ``files`` is a list and
-    ``task_id`` an identifier. Writing a recovered prose string into any of
-    them is silent-wrong-value corruption of the plan artifact that the lock
-    charter (``derive_modules`` / ``files_to_modules``) and the merge gate
-    (``plan_files_not_touched``) both consume, which is the exact damage class
-    this surface exists to end — so refusing conservatively there is the point,
-    not a limitation.
+    A RECOVERY MAY ONLY LAND ON A DECLARED PROSE KEY. The record distinguishes
+    the TOOL's parameter vocabulary (``schema_params``) from the PLAN's key
+    vocabulary (``target_keys``), and writing a recovered prose string under a
+    parameter with no prose key is silent-wrong-value corruption of the plan
+    artifact — so refusing conservatively there is the point, not a limitation.
 
     That rule is enforced through the SAME mechanism, not a second one: a
     parameter with no prose target is placed in ``supplied`` UNCONDITIONALLY,
     so ``repair()``'s existing B9 condition refuses any candidate whose tail
     recovers it and the field is left byte-identical. A parameter WITH a prose
     target has its authorship read from the key the plan actually uses
-    (``holder.get('type')``, never the always-absent ``holder.get('step_type')``)
-    — without which the fill-a-hole guard was inert for exactly those params,
-    because the lookup could never see the authored value it was meant to
-    protect.
+    (``holder.get(record.target_keys[name])``, never ``holder.get(name)``,
+    which is always absent where the two vocabularies differ) — without which
+    the fill-a-hole guard would be inert for exactly those parameters, because
+    the lookup could never see the authored value it was meant to protect.
     """
     value = holder.get(record.field)
     if not isinstance(value, str):
@@ -446,7 +421,7 @@ MARKUP_FACT_EVENT = 'plan_markup_repaired'
 #: Stable event name for a repair that could not be PERSISTED. Deliberately
 #: distinct from the fact event: the repair itself succeeded and was served, so
 #: folding the two would make a delivery failure look like a detection outcome.
-_MARKUP_WRITE_FAILED_EVENT = 'plan_markup_write_back_failed'
+MARKUP_WRITE_FAILED_EVENT = 'plan_markup_write_back_failed'
 
 #: Refusals already reported by THIS process, keyed by locator plus a hash of
 #: the refusing value. Process-local, and that is exactly the right scope: the
@@ -470,6 +445,11 @@ _MARKUP_WRITE_FAILED_EVENT = 'plan_markup_write_back_failed'
 #: gets a key built for it, so it is reported on every call instead of being
 #: suppressed under a key that means nothing.
 _REPORTED_REFUSALS: set[tuple[str, str | None, int | None, str, int]] = set()
+
+
+def forget_reported_refusals() -> None:
+    """Empty this process's refusal memo: every refusal reports afresh."""
+    _REPORTED_REFUSALS.clear()
 
 #: Sentinel returned by :func:`_fact_value` when a fact's locators no longer
 #: resolve against the plan (a collection shrank, an index moved). DISTINCT
@@ -616,7 +596,7 @@ def read_plan_repaired(
         # a failed tool call.
         logger.warning(
             json.dumps({
-                'event': _MARKUP_WRITE_FAILED_EVENT,
+                'event': MARKUP_WRITE_FAILED_EVENT,
                 'path': str(plan_path),
                 'error': repr(exc),
                 'served_from_memory': True,

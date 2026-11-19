@@ -227,7 +227,9 @@ _DROP_PLAN_FILE_TARGETS: Mapping[str, str] = MappingProxyType({'reason': 'reason
 #: ``mark_step_committed`` rewrites ``description`` by re-reading and
 #: rewriting the plan, never taking a ``description`` argument at all, so a
 #: signature-based check would have rejected it as an alternate despite it
-#: being a real one.
+#: being a real one. It prepends a ``[COMMITTED <sha12>]`` tag, so it cannot
+#: introduce markup, but a triager of a corrupt tagged description must
+#: still account for it.
 #:
 #: That check is SOUNDNESS only — it cannot catch a writer left OUT of this
 #: mapping. COMPLETENESS is the converse check,

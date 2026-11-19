@@ -144,14 +144,14 @@ QUOTED_DECISION = (
 
 @pytest.fixture(autouse=True)
 def _clear_reported_refusals():
-    """Clear ``_REPORTED_REFUSALS`` around every test in this module.
+    """Forget every reported refusal around each test in this module.
 
     It is PROCESS-global memo state owned by the read-time path, so a refusal
     reported by one test would otherwise be suppressed in the next.
     """
-    plan_markup_repair._REPORTED_REFUSALS.clear()
+    plan_markup_repair.forget_reported_refusals()
     yield
-    plan_markup_repair._REPORTED_REFUSALS.clear()
+    plan_markup_repair.forget_reported_refusals()
 
 
 @pytest.fixture(autouse=True)
