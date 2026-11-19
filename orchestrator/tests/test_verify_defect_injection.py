@@ -4,25 +4,39 @@ Part 1 covers the ``verify_cmd`` mutator and the constants that name where the
 plugin is imported from. Part 2 covers the PYTHONPATH merge in the target
 subprocess env. Every Part 2 test sets or deletes PYTHONPATH itself, because a
 verify run of this suite carries the plugin directory once this lands. Part 3
-covers the sibling collection map in the junit report's lifecycle.
+covers the sibling collection map in the junit report's lifecycle. Part 4 is the
+user-observable signal (B18, B21, B22): a REAL ``run_verification`` driving a
+real pytest over a non-workspace fixture project, after
+test_merge_gate_rerun_end_to_end.py.
 """
 
 from __future__ import annotations
 
+import asyncio
 import gzip
+import json
 import logging
 import os
+import shlex
 import shutil
+import sys
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
+from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT
 
+from orchestrator import verify as verify_module
+from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
+from orchestrator.defect_tests_config import DefectTestsConfig, DefectTestsMode
 from orchestrator.verify import (
+    VerifyResult,
     _archive_junit_report,
     _clear_junit_report,
     _run_cmd,
     _target_subprocess_env,
     collection_map_path,
+    run_verification,
 )
 from orchestrator.verify_cmd import (
     DEFECT_PLUGIN_DIR,
@@ -264,3 +278,130 @@ class TestArchiveJunitReport:
         assert dest is not None and dest.is_file()
         assert not collection_map_path(dest).exists()
         assert any(str(collection_map_path(junit)) in record.getMessage() for record in caplog.records)
+
+
+_FIXTURE_REF = 'human:20261119T000000Z:abcdef12'
+_EXPECTED_FIXTURE_MAP = {
+    'pkg/tests/test_x.py::test_defect': {'defects': [_FIXTURE_REF], 'criterion': None},
+}
+
+
+def _make_fixture_project(root: Path, *, registers_defect_marker: bool = False) -> Path:
+    """A NON-workspace pytest project: no ``shared`` of its own, a strict ini, a marker of its own.
+
+    Without the plugin, its ``defect`` mark is unknown and ``filterwarnings =
+    error`` makes that a collection error, so a run that injects nothing passes
+    only when the project registers the marker itself, as every workspace member does.
+    """
+    root.mkdir(parents=True)
+    own_defect = '    defect(ref): registered by the project\n' if registers_defect_marker else ''
+    (root / 'pytest.ini').write_text(
+        '[pytest]\nmarkers =\n    own: the project\'s own marker\n'
+        f'{own_defect}filterwarnings = error\npythonpath = .\n',
+        encoding='utf-8',
+    )
+    (root / 'testing.py').write_text("ORIGIN = 'project'\n", encoding='utf-8')
+    tests = root / 'pkg' / 'tests'
+    tests.mkdir(parents=True)
+    (tests / 'test_x.py').write_text(
+        'import pytest\n\nimport testing\n\n\n'
+        '@pytest.mark.own\ndef test_own():\n    assert testing.ORIGIN == \'project\'\n\n\n'
+        f'@pytest.mark.defect({_FIXTURE_REF!r})\ndef test_defect():\n    pass\n\n\n'
+        'def test_plain():\n    pass\n',
+        encoding='utf-8',
+    )
+    return root
+
+
+def _make_config(worktree: Path, **overrides) -> OrchestratorConfig:
+    return OrchestratorConfig(
+        project_root=worktree,
+        max_concurrent_tasks=1,
+        git=GitConfig(
+            main_branch='main', branch_prefix='task/', remote='origin', worktree_dir='.worktrees',
+        ),
+        verify_admission_enabled=False,
+        verify_cold_preprovision_command='',
+        verify_env={'PATH': f'{Path(sys.executable).parent}{os.pathsep}{os.environ["PATH"]}'},
+        **overrides,
+    )
+
+
+def _verify(
+    worktree: Path, config: OrchestratorConfig, test_command: str, **kwargs,
+) -> tuple[VerifyResult, list[tuple[str, dict]]]:
+    module = ModuleConfig(
+        prefix='pkg', test_command=test_command, lint_command=None, type_check_command=None,
+    )
+    real_run_cmd = verify_module._run_cmd
+    seen: list[tuple[str, dict]] = []
+
+    async def spy(cmd, *args, **spy_kwargs):
+        seen.append((cmd, spy_kwargs))
+        return await real_run_cmd(cmd, *args, **spy_kwargs)
+
+    with patch.object(verify_module, '_run_cmd', spy):
+        result = asyncio.run(run_verification(worktree, config, module, **kwargs))
+    return result, [(cmd, kw) for cmd, kw in seen if 'pytest' in cmd]
+
+
+def _carries_plugin(cmd: str) -> bool:
+    return _carries_pair(tuple(shlex.split(cmd)), _PLUGIN_PAIR)
+
+
+@pytest.mark.xdist_group('defect_plugin_real_pytest')
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
+class TestVerifyLegInjectionEndToEnd:
+    @pytest.mark.parametrize('test_command', ['pytest', 'pytest -n 2'])
+    def test_shadow_mode_injects_and_the_map_lands_where_verify_looks(
+        self, tmp_path, monkeypatch, test_command,
+    ):
+        monkeypatch.delenv('PYTHONPATH', raising=False)
+        worktree = _make_fixture_project(tmp_path / 'worktree')
+        report = tmp_path / 'out' / 'r.xml'
+        result, legs = _verify(
+            worktree, _make_config(worktree), test_command, junit_report=report,
+        )
+        assert result.passed, result.test_output
+        assert legs and all(_carries_plugin(cmd) for cmd, _ in legs), legs
+        assert all(kw.get('defect_plugin') is True for _, kw in legs)
+        assert json.loads(collection_map_path(report).read_text()) == _EXPECTED_FIXTURE_MAP
+
+    def test_task_cost_archive_carries_the_map(self, tmp_path, monkeypatch):
+        monkeypatch.delenv('PYTHONPATH', raising=False)
+        worktree = _make_fixture_project(tmp_path / 'worktree')
+        (worktree / '.task').mkdir()
+        archive = tmp_path / 'archive'
+        result, _ = _verify(
+            worktree, _make_config(worktree), 'pytest',
+            role='task', attempt_id=1, task_id='t1', archive_root=archive,
+        )
+        assert result.passed, result.test_output
+        archived = list((archive / 't1').glob('attempt-1.pkg.junit-*.xml.gz'))
+        assert len(archived) == 1, list((archive / 't1').iterdir())
+        assert json.loads(collection_map_path(archived[0]).read_text()) == _EXPECTED_FIXTURE_MAP
+
+    def test_mode_off_injects_nothing(self, tmp_path, monkeypatch):
+        monkeypatch.delenv('PYTHONPATH', raising=False)
+        worktree = _make_fixture_project(tmp_path / 'worktree', registers_defect_marker=True)
+        report = tmp_path / 'out' / 'r.xml'
+        config = _make_config(worktree, defect_tests=DefectTestsConfig(mode=DefectTestsMode.OFF))
+        result, legs = _verify(worktree, config, 'pytest', junit_report=report)
+        assert result.passed, result.test_output
+        assert legs and not any(DEFECT_PLUGIN_MODULE in cmd for cmd, _ in legs)
+        assert all('defect_plugin' not in kw for _, kw in legs)
+        assert not collection_map_path(report).exists()
+
+    def test_raw_retained_chain_runs_byte_identical_and_says_so(self, tmp_path, monkeypatch, caplog):
+        monkeypatch.delenv('PYTHONPATH', raising=False)
+        worktree = _make_fixture_project(tmp_path / 'worktree', registers_defect_marker=True)
+        chain = 'pytest pkg/tests/test_x.py && pytest pkg/tests/test_x.py'
+        assert parse_config_command(chain).raw is not None
+        with caplog.at_level(logging.INFO, logger='orchestrator.verify'):
+            result, legs = _verify(worktree, _make_config(worktree), chain)
+        assert result.passed, result.test_output
+        assert [cmd for cmd, _ in legs] == [chain]
+        assert any(
+            chain in record.getMessage() and 'collection map' in record.getMessage()
+            for record in caplog.records
+        ), [record.getMessage() for record in caplog.records]
