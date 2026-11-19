@@ -18,10 +18,10 @@ from orchestrator.agents.docs_scope import (
 
 class TestVocabulary:
     def test_docs_suffixes(self) -> None:
-        assert DOCS_SUFFIXES == frozenset({'.md', '.yaml', '.yml'})
+        assert frozenset({'.md', '.yaml', '.yml'}) == DOCS_SUFFIXES
 
     def test_docs_top_level_dirs(self) -> None:
-        assert DOCS_TOP_LEVEL_DIRS == frozenset({'docs'})
+        assert frozenset({'docs'}) == DOCS_TOP_LEVEL_DIRS
 
 
 class TestIsDocsPath:
