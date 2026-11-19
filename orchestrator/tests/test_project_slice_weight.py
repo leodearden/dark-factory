@@ -12,6 +12,8 @@ import logging
 import pytest
 from _fake_systemctl import fake_systemctl as fake_systemctl
 from _fake_systemctl import recorded_calls
+from shared.cgroup_slice import DAEMON_SUBGROUP
+from shared.psi import resolve_own_cgroup
 
 from orchestrator.project_slice_weight import SliceWeightOutcome, ensure_project_slice_weight
 
@@ -24,6 +26,7 @@ _SERVICE_IN_OTHER_PROJECT_SLICE = (
 _VERIFY_SCOPE_IN_SLICE = (
     f'{_USER_MANAGER}/df.slice/df-my_proj.slice/df-verify-x-0123abcd-0123456789ab.scope'
 )
+_DAEMON_IN_SERVICE_IN_SLICE = f'{_SERVICE_IN_SLICE}/{DAEMON_SUBGROUP}'
 
 
 def _warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
@@ -118,3 +121,74 @@ async def test_missing_systemctl_is_reported_not_raised(tmp_path, monkeypatch):
     outcome = await ensure_project_slice_weight('my-proj', _SERVICE_IN_SLICE)
 
     assert outcome is SliceWeightOutcome.FAILED
+
+
+@pytest.mark.asyncio
+async def test_daemon_subgroup_of_a_service_under_its_slice_gets_the_weight(fake_systemctl):
+    outcome = await ensure_project_slice_weight('my-proj', _DAEMON_IN_SERVICE_IN_SLICE)
+
+    assert outcome is SliceWeightOutcome.APPLIED
+    assert recorded_calls(fake_systemctl) == [
+        ['--user', 'set-property', '--runtime', 'df-my_proj.slice', 'CPUWeight=100'],
+    ]
+
+
+@pytest.mark.parametrize(
+    'own_cgroup_path',
+    [
+        pytest.param(f'{_SERVICE_IN_SLICE}/agent-123', id='sibling-child-of-the-service'),
+        pytest.param(
+            f'{_DAEMON_IN_SERVICE_IN_SLICE}/{DAEMON_SUBGROUP}', id='daemon-nested-too-deep',
+        ),
+        pytest.param(
+            f'{_SERVICE_IN_APP_SLICE}/{DAEMON_SUBGROUP}', id='daemon-of-a-service-in-app-slice',
+        ),
+        pytest.param(
+            f'{_SERVICE_IN_OTHER_PROJECT_SLICE}/{DAEMON_SUBGROUP}',
+            id='daemon-of-a-service-in-another-projects-slice',
+        ),
+        pytest.param(
+            f'{_VERIFY_SCOPE_IN_SLICE}/{DAEMON_SUBGROUP}', id='daemon-under-a-verify-scope',
+        ),
+        pytest.param(
+            f'{_USER_MANAGER}/df.slice/df-my_proj.slice/{DAEMON_SUBGROUP}',
+            id='daemon-directly-under-the-slice',
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_other_children_and_misplaced_daemons_are_flagged_and_left_alone(
+    own_cgroup_path, fake_systemctl, caplog,
+):
+    with caplog.at_level(logging.WARNING):
+        outcome = await ensure_project_slice_weight('my-proj', own_cgroup_path)
+
+    assert outcome is SliceWeightOutcome.UNIT_NOT_IN_SLICE
+    assert recorded_calls(fake_systemctl) == []
+    (warning,) = _warnings(caplog)
+    assert 'df-my_proj.slice' in warning
+    assert own_cgroup_path in warning
+
+
+@pytest.fixture
+def fresh_own_cgroup_cache():
+    resolve_own_cgroup.cache_clear()
+    yield
+    resolve_own_cgroup.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_the_harness_raw_leaf_from_the_daemon_subgroup_gets_the_weight(
+    fake_systemctl, tmp_path, fresh_own_cgroup_cache,
+):
+    """Mirrors orchestrator/src/orchestrator/harness.py::Harness._ensure_project_slice_weight,
+    which hands the weight step the raw leaf, not the slice."""
+    proc_cgroup = tmp_path / 'cgroup'
+    proc_cgroup.write_text(f'0::{_DAEMON_IN_SERVICE_IN_SLICE}\n')
+    raw_leaf = resolve_own_cgroup(
+        None, proc_cgroup_path=proc_cgroup, cgroup_root=tmp_path / 'sys',
+    ).path
+
+    outcome = await ensure_project_slice_weight('my-proj', raw_leaf)
+
+    assert outcome is SliceWeightOutcome.APPLIED
