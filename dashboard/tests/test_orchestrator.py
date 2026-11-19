@@ -800,16 +800,11 @@ class TestDiscoverOrchestratorsIsProcessDiscoveryOnly:
 
 
 class TestReadMaxConcurrentTasks:
-    """Tests for ``read_max_concurrent_tasks`` — the parity alarm's denominator.
+    """Tests for ``read_max_concurrent_tasks`` — the general pool only.
 
-    ``max_concurrent_tasks`` is a top-level key of the orchestrator config and
-    is restart-only (red-tier per CLAUDE.md: absent from ``config.py``'s
-    hot-reload allowlist, and the scheduler semaphore is sized once at
-    startup).  It is still TIME-VARYING across a burndown window, because such
-    a window spans restarts and the cap also differs between projects.  The
-    collector therefore reads it once per snapshot so each historical row is
-    paired with the cap that was in force at THAT instant; comparing a past
-    in-progress census against today's cap would mislabel both directions.
+    These pin the config resolution and slot-count coercion rules that
+    ``read_run_slot_capacity`` (the parity alarm's denominator, tested in
+    ``TestReadRunSlotCapacity``) shares, through the simpler one-key reader.
 
     The contract mirrors this module's ``_read_project_root_from_config``
     sibling: ``yaml.safe_load``, never raise, return ``None`` for anything
@@ -1009,20 +1004,31 @@ class TestReadMaxConcurrentTasks:
             'a config no orchestrator can load must be logged, not silently defaulted'
         )
 
-    def test_restated_default_matches_orchestrator_defaults_yaml(self):
-        """FORMAT COUPLING guard: the restated constant must not drift.
+    @pytest.mark.parametrize(
+        ('key', 'restated_name'),
+        [
+            ('max_concurrent_tasks', '_ORCHESTRATOR_DEFAULT_MAX_CONCURRENT_TASKS'),
+            (
+                'main_health_fix_reserved_slots',
+                '_ORCHESTRATOR_DEFAULT_MAIN_HEALTH_FIX_RESERVED_SLOTS',
+            ),
+        ],
+    )
+    def test_restated_default_matches_orchestrator_defaults_yaml(self, key, restated_name):
+        """FORMAT COUPLING guard: each restated default must not drift.
 
         This module deliberately does not import the ``orchestrator`` package
-        (see its FORMAT COUPLING note), so the default is restated by hand.
+        (see its FORMAT COUPLING note), so the defaults are restated by hand.
         Whenever the orchestrator source IS present next to the dashboard,
-        assert the two agree — a defaults.yaml edit then fails a test instead
+        assert each pair agrees — a defaults.yaml edit then fails a test instead
         of silently mis-sizing every parity denominator.  Skipped when the
         source is not on disk (installed-package / partial-checkout layouts).
         """
         import yaml
 
-        from dashboard.data.orchestrator import _ORCHESTRATOR_DEFAULT_MAX_CONCURRENT_TASKS
+        import dashboard.data.orchestrator as orchestrator_module
 
+        restated = getattr(orchestrator_module, restated_name)
         defaults = (
             Path(__file__).resolve().parents[2]
             / 'orchestrator' / 'src' / 'orchestrator' / 'defaults.yaml'
@@ -1030,13 +1036,12 @@ class TestReadMaxConcurrentTasks:
         if not defaults.is_file():
             pytest.skip(f'orchestrator source not present at {defaults}')
 
-        upstream = (yaml.safe_load(defaults.read_text()) or {}).get('max_concurrent_tasks')
+        upstream = (yaml.safe_load(defaults.read_text()) or {}).get(key)
 
-        assert upstream == _ORCHESTRATOR_DEFAULT_MAX_CONCURRENT_TASKS, (
-            f'{defaults} sets max_concurrent_tasks={upstream!r}, but '
-            f'dashboard.data.orchestrator restates '
-            f'{_ORCHESTRATOR_DEFAULT_MAX_CONCURRENT_TASKS!r} — update the constant '
-            f'(FORMAT COUPLING item 2)'
+        assert upstream == restated, (
+            f'{defaults} sets {key}={upstream!r}, but '
+            f'dashboard.data.orchestrator.{restated_name} restates '
+            f'{restated!r} — update the constant (FORMAT COUPLING item 2)'
         )
 
     # ---- ${VAR:default} expansion ------------------------------------
@@ -1197,3 +1202,156 @@ class TestReadMaxConcurrentTasks:
         # The canonical name is not a readable FILE, so resolution falls through
         # to the legacy spelling rather than exploding on IsADirectoryError.
         assert read_max_concurrent_tasks(tmp_path) == 7
+
+
+class TestReadRunSlotCapacity:
+    """Tests for ``read_run_slot_capacity`` — the parity alarm's denominator.
+
+    The orchestrator runs up to ``max_concurrent_tasks`` general tasks plus
+    ``main_health_fix_reserved_slots`` slots only a main-health fix may take
+    (``docs/main-health-fix-run-slot-reserve.md``). A fix running on the
+    reserve is legitimate, so the alarm must judge live in-progress against
+    the sum. Both keys come from the ONE config file the shared resolution
+    picks, layered over the orchestrator's restated defaults; either key
+    being unusable makes the whole capacity unknown.
+
+    Both keys are restart-only, yet the capacity is TIME-VARYING across a
+    burndown window, which spans restarts; the collector therefore reads it
+    once per snapshot and stores it on the row.
+    """
+
+    LOGGER = 'dashboard.data.orchestrator'
+    CANONICAL = 'dark-factory-orchestrator.yaml'
+
+    @staticmethod
+    def _write(path: Path, text: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+
+    def test_capacity_is_general_slots_plus_reserve(self, tmp_path):
+        from dashboard.data.orchestrator import read_run_slot_capacity
+
+        self._write(
+            tmp_path / self.CANONICAL,
+            'max_concurrent_tasks: 36\nmain_health_fix_reserved_slots: 1\n',
+        )
+
+        assert read_run_slot_capacity(tmp_path) == 37
+
+    def test_omitted_reserve_is_the_orchestrator_default_not_unknown(self, tmp_path):
+        from dashboard.data.orchestrator import (
+            _ORCHESTRATOR_DEFAULT_MAIN_HEALTH_FIX_RESERVED_SLOTS,
+            read_run_slot_capacity,
+        )
+
+        self._write(tmp_path / self.CANONICAL, 'max_concurrent_tasks: 36\n')
+
+        assert read_run_slot_capacity(tmp_path) == (
+            36 + _ORCHESTRATOR_DEFAULT_MAIN_HEALTH_FIX_RESERVED_SLOTS
+        )
+
+    def test_zero_reserve_leaves_exactly_the_general_slots(self, tmp_path):
+        from dashboard.data.orchestrator import read_run_slot_capacity
+
+        self._write(
+            tmp_path / self.CANONICAL,
+            'max_concurrent_tasks: 36\nmain_health_fix_reserved_slots: 0\n',
+        )
+
+        assert read_run_slot_capacity(tmp_path) == 36
+
+    def test_config_carrying_neither_key_sums_both_defaults(self, tmp_path):
+        from dashboard.data.orchestrator import (
+            _ORCHESTRATOR_DEFAULT_MAIN_HEALTH_FIX_RESERVED_SLOTS,
+            _ORCHESTRATOR_DEFAULT_MAX_CONCURRENT_TASKS,
+            read_run_slot_capacity,
+        )
+
+        self._write(tmp_path / self.CANONICAL, 'project_root: /somewhere\n')
+
+        assert read_run_slot_capacity(tmp_path) == (
+            _ORCHESTRATOR_DEFAULT_MAX_CONCURRENT_TASKS
+            + _ORCHESTRATOR_DEFAULT_MAIN_HEALTH_FIX_RESERVED_SLOTS
+        )
+
+    @pytest.mark.parametrize(
+        ('label', 'yaml_value'),
+        [
+            ('non-numeric string', ' lots'),
+            ('float', ' 2.5'),
+            ('bool true', ' true'),
+            ('negative', ' -1'),
+            ('explicit null', ''),
+        ],
+    )
+    def test_unusable_reserve_makes_capacity_unknown_with_warning(
+        self, tmp_path, caplog, label, yaml_value
+    ):
+        """Dropping a malformed reserve would understate capacity and false-alarm."""
+        import logging
+
+        from dashboard.data.orchestrator import read_run_slot_capacity
+
+        self._write(
+            tmp_path / self.CANONICAL,
+            f'max_concurrent_tasks: 36\nmain_health_fix_reserved_slots:{yaml_value}\n',
+        )
+
+        with caplog.at_level(logging.WARNING, logger=self.LOGGER):
+            result = read_run_slot_capacity(tmp_path)
+
+        assert result is None, f'{label} must make the capacity unknown (got {result!r})'
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert any('main_health_fix_reserved_slots' in r.getMessage() for r in warnings), (
+            f'{label} must emit a WARNING naming main_health_fix_reserved_slots'
+        )
+
+    def test_unusable_general_slots_make_capacity_unknown(self, tmp_path):
+        from dashboard.data.orchestrator import read_run_slot_capacity
+
+        self._write(
+            tmp_path / self.CANONICAL,
+            'max_concurrent_tasks: lots\nmain_health_fix_reserved_slots: 1\n',
+        )
+
+        assert read_run_slot_capacity(tmp_path) is None
+
+    def test_env_var_default_in_the_reserve_is_expanded(self, tmp_path, monkeypatch):
+        from dashboard.data.orchestrator import read_run_slot_capacity
+
+        monkeypatch.delenv('DF_TEST_RESERVE', raising=False)
+        self._write(
+            tmp_path / self.CANONICAL,
+            'max_concurrent_tasks: 36\nmain_health_fix_reserved_slots: "${DF_TEST_RESERVE:2}"\n',
+        )
+
+        assert read_run_slot_capacity(tmp_path) == 38
+
+    def test_both_keys_come_from_the_one_authoritative_file(self, tmp_path):
+        """A legacy reserve is never mixed with the canonical general slots."""
+        from dashboard.data.orchestrator import (
+            _ORCHESTRATOR_DEFAULT_MAIN_HEALTH_FIX_RESERVED_SLOTS,
+            read_run_slot_capacity,
+        )
+
+        self._write(tmp_path / self.CANONICAL, 'max_concurrent_tasks: 36\n')
+        self._write(tmp_path / 'orchestrator.yaml', 'main_health_fix_reserved_slots: 5\n')
+
+        assert read_run_slot_capacity(tmp_path) == (
+            36 + _ORCHESTRATOR_DEFAULT_MAIN_HEALTH_FIX_RESERVED_SLOTS
+        )
+
+    def test_legacy_only_config_supplies_both_keys(self, tmp_path):
+        from dashboard.data.orchestrator import read_run_slot_capacity
+
+        self._write(
+            tmp_path / 'orchestrator.yaml',
+            'max_concurrent_tasks: 10\nmain_health_fix_reserved_slots: 2\n',
+        )
+
+        assert read_run_slot_capacity(tmp_path) == 12
+
+    def test_missing_config_is_none(self, tmp_path):
+        from dashboard.data.orchestrator import read_run_slot_capacity
+
+        assert read_run_slot_capacity(tmp_path) is None
