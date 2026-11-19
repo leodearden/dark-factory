@@ -31,10 +31,6 @@ LOADER_FACTORIES = frozenset({'spec_from_file_location', 'spec_from_loader', 'So
 EXEMPT_LOADERS = frozenset(
     {
         # Different policy; migration owned by pending task 7123.
-        # Reuses the cache only when it has a FusedMemoryClient attribute.
-        ('normalize_topic_slugs.py', 'load_mcp_client_module'),
-        # Reuses the cache only when it has a FusedMemoryClient attribute.
-        ('migrate_task_metadata_to_x_namespace.py', '_load_sibling_client'),
         # Raises FixtureError rather than ImportError when there is no spec.
         ('bake_off_storage_shape.py', '_load_sibling_script'),
         # Deliberately execs a fresh copy and never registers it.
