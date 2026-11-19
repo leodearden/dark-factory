@@ -1623,10 +1623,11 @@ predicate cannot be measured
 task 3876). A record measured clean does **not** halt the queue: the journal
 carries a WARNING beginning `Merge halt NOT rehydrated`, and the record is
 stamped `halt_released_at` / `halt_release_note`, so it never re-owns a halt at
-any later restart. A conflict confined to a task worktree therefore never
-re-halts the queue. A released record still needs its human disposition (for
-example, a WIP recovery branch to reapply), but it no longer appears as
-`owner_esc_id` in `get_merge_halt_status`.
+any later restart. A conflict confined to a task worktree does not by itself
+re-halt the queue; such a record re-owns the halt only if `project_root` is
+itself dirty, unmerged or unmeasurable at the restart. A released record still
+needs its human disposition (for example, a WIP recovery branch to reapply),
+but it no longer appears as `owner_esc_id` in `get_merge_halt_status`.
 
 #### `park_lock_contended` — a blocked merge, **not** a halt
 
