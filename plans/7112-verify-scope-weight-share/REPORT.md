@@ -28,8 +28,8 @@ The question has two eras, and neither is used to refute the other:
   own CPU work and something besides the weight. In the same flat layout with the same weights, p50 fell from 81.5
   to 50.8 minutes between the 10-13→11-02 era and 11-16→11-19 [record].
 - **Slice era: refuted for reify's merge scope in the six windows measured.** The merge scope used 0.89–1.00 of its
-  weight-fair share. Its threads waited on a runqueue for at most 0.12 cores' worth, so the scope was limited by its
-  own demand, not by its weight [live]. What did not get its entitlement was the factory as a whole. In the three
+  weight-fair share. Its threads waited on a runqueue for at most 0.12 cores' worth, a figure the scope's own PSI
+  corroborates, so the scope was limited by its own demand, not by its weight [live]. What did not get its entitlement was the factory as a whole. In the three
   windows where both `df.slice` and `app.slice` wanted more than half the host, `df.slice` received 0.51–0.77 of its
   100:100 share [live]. The cause is not established (§3).
 - **After task 9985 (analytic):** if no weights change, moving `orchestrator-reify.service` (daemon and agents, weight
@@ -85,9 +85,13 @@ In it `df.slice` got 8.19 / 10.39 (0.79).
 
 - **The kernel honoured the merge scope's weight, and the entitlement did not bind.** The scope used what it wanted.
   At 07:23Z its 84 processes were sleeping `bash`/`timeout` processes plus three `python3` in uninterruptible I/O
-  wait (state D). The scope's cpu.pressure some avg10 was 5.2 and its io.pressure some avg10 8.0 [live:
-  `census/20261119T072307Z-reify-merge-scope-state.txt`]. A reify merge in this layout gets 2–3% of the host,
-  because that is all it asks for.
+  wait (state D). Its io.pressure some avg10 was 8.0 [live: `census/20261119T072307Z-reify-merge-scope-state.txt`].
+  A reify merge in this layout gets 2–3% of the host, because that is all it asks for.
+- **The scope's own PSI corroborates its small wait.** The census's wait column comes from per-thread schedstat, which
+  misses every process born and gone inside a window (§7). The scope's cpu.pressure counts every task. At 07:23:07Z
+  it read some avg60 10.31 and full avg60 8.56: at least one of its tasks waited for a CPU about 10% of the time,
+  which is at least 0.10 cores of wait. That matches the 0.12 cores the census read for the window ending 07:22:48
+  [live: same file]. PSI was read once, as an exponentially weighted average, not per census window.
 - **How to read used / fair.** When a cgroup wants less than its proportional share, its fair share is its own
   "wanted", so used / fair is just used / (used + wait). Then it measures only how long the cgroup's own threads sat
   on a runqueue, not a broken weight. That is the case for the merge scope in every row: it barely waited. The weight
@@ -189,8 +193,18 @@ inside each project slice when 9985 lands. Otherwise the reinstall roughly halve
 - **"Wanted" is not a lower bound.** It is used plus the summed per-thread runqueue wait of the subtree. For
   CPU-bound work it is a lower bound, because threads shorter than a window are missed. For bursty or mostly sleeping
   threads it is an overestimate: element-desktop showed 1.24 cores of wait against 0.01 used [live]. That inflates the
-  fair shares of desktop and agent siblings. It does not affect the merge-scope verdict, which rests on that scope's
-  own wait being near zero.
+  fair shares of desktop and agent siblings. Schedstat is also blind to every process born and gone inside a window,
+  and a test leg's short-lived `bash` and `timeout` wrappers are such processes. So the merge-scope verdict does not
+  rest on the schedstat wait alone: the scope's cpu.pressure, which counts every task, corroborates it (§3).
+- **Churn at a level.** A child cgroup that starts or ends inside a window is in only one snapshot and is dropped.
+  Its CPU still counts in the parent's hierarchical `usage_usec`, and its wait is missing from the parent's "wanted".
+  Splitting the parent's whole usage among the remaining siblings would inflate their fair shares. Since the
+  amendment after these windows, the census reports that CPU per level as `unattributed` and water-fills only what
+  the present siblings used together. The committed census files predate that column. Recomputed from their printed
+  rows, which overstates it because rows wanting under 0.05 cores are hidden, the unattributed CPU in every window
+  with a merge scope was at most 0.01 cores at `df-reify.slice` and `df.slice`, and at most 0.08 at
+  `user@1000.service`. That moves no fair share in §3 by more than 0.04 cores. In the 07:17:19 handover window,
+  0.92 cores of `df-reify.slice` belonged to the lint and test legs, neither of which was in both snapshots.
 - **Journal join ambiguity.** The test leg's role is read from the merge nice tier in the journal's Started command
   (`shared/src/shared/verify_admission.py::_NICE_TIERS`). Lint legs carry no tier. One is counted as the merge's only
   when a merge test leg starts within 2 s of it ending. Across the 152 merges, 254 lint scopes in merge windows stayed
