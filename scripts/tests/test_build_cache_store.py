@@ -4,7 +4,8 @@ Both live under scripts/deploy/ (PRD C13 of
 plans/canonical-build-path-shared-cache-prd.md). The pruner is driven as a CLI
 over a fixture store laid out as sccache's remote layout `<k0>/<k1>/<k2>/<key>`,
 with a `systemctl` shim on PATH standing in for the user manager. The installer
-runs in a scratch HOME against fake_user_systemctl.py, which really launches the
+runs in a scratch HOME (on tmpfs when one is usable, see tmpfs_scratch_root)
+against fake_user_systemctl.py, which really launches the
 store unit it wrote, plus `tailscale` and `loginctl` shims. Tests that need a
 WebDAV server run a private real rclone on loopback; no test touches the real
 user manager, ~/.config, ~/.cache or ports 4226/4227.
@@ -22,6 +23,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import tomllib
 import urllib.error
@@ -466,13 +468,36 @@ class StoreWorld:
                 os.killpg(int(pid_file.read_text()), signal.SIGKILL)
 
 
+TMPFS = Path("/dev/shm")
+
+
+def tmpfs_scratch_root() -> Path | None:
+    """A fresh directory on a writable, exec-allowed tmpfs, or None.
+
+    An install pre-creates 4,368 store directories. On the loaded workstation's
+    ext4 that one mkdir took 26-36s (measured 2026-11-19, load average ~130),
+    which pushed installs in the full suite past their timeout; tmpfs takes 0.1s.
+    None sends the world back to tmp_path: the landlock agent sandbox, for one,
+    cannot create entries under /dev (task 7711).
+    """
+    try:
+        if os.statvfs(TMPFS).f_flag & (os.ST_NOEXEC | os.ST_RDONLY):
+            return None
+        return Path(tempfile.mkdtemp(prefix="build-cache-store-test-", dir=TMPFS))
+    except OSError:
+        return None
+
+
 @pytest.fixture
 def store_world(tmp_path: Path) -> Iterator[StoreWorld]:
-    world = StoreWorld(tmp_path)
+    tmpfs_root = tmpfs_scratch_root()
+    world = StoreWorld(tmpfs_root or tmp_path)
     try:
         yield world
     finally:
         world.kill_services()
+        if tmpfs_root is not None:
+            shutil.rmtree(tmpfs_root, ignore_errors=True)
 
 
 @pytest.fixture
