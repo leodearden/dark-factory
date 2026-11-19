@@ -3,17 +3,27 @@
 Part 1 covers the ``verify_cmd`` mutator and the constants that name where the
 plugin is imported from. Part 2 covers the PYTHONPATH merge in the target
 subprocess env. Every Part 2 test sets or deletes PYTHONPATH itself, because a
-verify run of this suite carries the plugin directory once this lands.
+verify run of this suite carries the plugin directory once this lands. Part 3
+covers the sibling collection map in the junit report's lifecycle.
 """
 
 from __future__ import annotations
 
+import gzip
+import logging
 import os
+import shutil
 from pathlib import Path
 
 import pytest
 
-from orchestrator.verify import _run_cmd, _target_subprocess_env
+from orchestrator.verify import (
+    _archive_junit_report,
+    _clear_junit_report,
+    _run_cmd,
+    _target_subprocess_env,
+    collection_map_path,
+)
 from orchestrator.verify_cmd import (
     DEFECT_PLUGIN_DIR,
     DEFECT_PLUGIN_MODULE,
@@ -166,3 +176,91 @@ class TestRunCmdForwardsTheFlag:
         rc, output, _ = await _run_cmd('printf %s "$PYTHONPATH"', tmp_path, 60.0)
         assert rc == 0
         assert not output.endswith(_DIR)
+
+
+_MAP_BYTES = b'{"tests/test_x.py::test_d": {"criterion": null, "defects": ["human:20261119T000000Z:abcdef12"]}}'
+
+
+def _live_report(directory: Path, *, with_map: bool) -> Path:
+    junit = directory / 'r.xml'
+    junit.write_text('<testsuites/>', encoding='utf-8')
+    if with_map:
+        collection_map_path(junit).write_bytes(_MAP_BYTES)
+    return junit
+
+
+class TestCollectionMapPath:
+    def test_live_report(self):
+        assert collection_map_path(Path('/w/r.xml')) == Path('/w/r.xml.tests.json')
+
+    def test_archived_report(self):
+        archived = Path('/a/t1/attempt-1.junit-20261119T000000_000000Z.xml.gz')
+        assert collection_map_path(archived) == Path(
+            '/a/t1/attempt-1.junit-20261119T000000_000000Z.xml.gz.tests.json'
+        )
+
+
+class TestClearJunitReport:
+    def test_removes_the_report_and_its_map(self, tmp_path):
+        junit = _live_report(tmp_path, with_map=True)
+        _clear_junit_report(junit)
+        assert not junit.exists()
+        assert not collection_map_path(junit).exists()
+
+    @pytest.mark.parametrize('present', ['report_only', 'map_only', 'neither'])
+    def test_quiet_when_either_is_absent(self, tmp_path, caplog, present):
+        junit = tmp_path / 'r.xml'
+        if present == 'report_only':
+            junit.write_text('<testsuites/>', encoding='utf-8')
+        elif present == 'map_only':
+            collection_map_path(junit).write_bytes(_MAP_BYTES)
+        with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
+            _clear_junit_report(junit)
+        assert not junit.exists()
+        assert not collection_map_path(junit).exists()
+        assert caplog.records == []
+
+
+class TestArchiveJunitReport:
+    def test_archives_the_map_beside_the_archived_report(self, tmp_path):
+        junit = _live_report(tmp_path, with_map=True)
+        dest = _archive_junit_report(junit, tmp_path / 'archive', 't1', 1, module_prefix='pkg')
+        assert dest is not None
+        assert dest.name.startswith('attempt-1.pkg.junit-') and dest.name.endswith('.xml.gz')
+        assert gzip.decompress(dest.read_bytes()) == b'<testsuites/>'
+        assert collection_map_path(dest).read_bytes() == _MAP_BYTES
+
+    def test_no_map_archives_only_the_report(self, tmp_path):
+        junit = _live_report(tmp_path, with_map=False)
+        dest = _archive_junit_report(junit, tmp_path / 'archive', 't1', 1, module_prefix='pkg')
+        assert dest is not None and dest.is_file()
+        assert list((tmp_path / 'archive' / 't1').glob('*.tests.json')) == []
+
+    def test_missing_report_archives_no_stray_map(self, tmp_path):
+        junit = tmp_path / 'r.xml'
+        collection_map_path(junit).write_bytes(_MAP_BYTES)
+        assert _archive_junit_report(junit, tmp_path / 'archive', 't1', 1, module_prefix='pkg') is None
+        archived = tmp_path / 'archive' / 't1'
+        assert not archived.exists() or list(archived.iterdir()) == []
+
+    def test_segment_archive_carries_its_map(self, tmp_path):
+        junit = _live_report(tmp_path, with_map=True)
+        dest = _archive_junit_report(
+            junit, tmp_path / 'archive', 't1', 1, module_prefix='pkg', segment_label='seg0',
+        )
+        assert dest is not None
+        assert dest.name.startswith('attempt-1.pkg.seg0.junit-')
+        assert collection_map_path(dest).read_bytes() == _MAP_BYTES
+
+    def test_map_copy_failure_warns_and_keeps_the_report(self, tmp_path, caplog, monkeypatch):
+        junit = _live_report(tmp_path, with_map=True)
+
+        def _refuse(*_args, **_kwargs):
+            raise PermissionError('denied')
+
+        monkeypatch.setattr(shutil, 'copyfile', _refuse)
+        with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
+            dest = _archive_junit_report(junit, tmp_path / 'archive', 't1', 1, module_prefix='pkg')
+        assert dest is not None and dest.is_file()
+        assert not collection_map_path(dest).exists()
+        assert any(str(collection_map_path(junit)) in record.getMessage() for record in caplog.records)
