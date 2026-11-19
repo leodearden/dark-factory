@@ -860,8 +860,11 @@ dependencies; the edges compose by AND.
 created already held. The holder id is appended to its `dependencies`, and
 its `followup_hold` record is written in the same `add_task`, so the
 scheduler never sees it ready. A `followup_held {task_id, holder_id}` event
-is journaled beside `task_created`. The holder is minted the first time a
-project needs one.
+is journaled beside `task_created`, and the ticket's stored outcome
+(`result_json`) carries `held_by`, the holder's id; `resolve_ticket` does
+not return it. The holder is minted the first time a project needs one, and
+its mint journals a `task_created` event with `source:
+'followup-holder-mint'`, whether a filing or the backfill minted it.
 
 **The backfill.** Each fused-memory start runs the hold over every known
 project before the server serves
@@ -892,11 +895,17 @@ does not block startup or the other projects. The config key
 `deferred_watch` text, and the marker `metadata.followup_holder`
 (`{project_id, minted_at}`). The store's marker is the only record of which
 task is the holder. If a lookup finds two live markers in one project, it
-raises `DuplicateFollowupHolderError` naming both ids and holds nothing. The
-holder is never a curator pool entry or a combine target.
+raises `DuplicateFollowupHolderError` naming both ids. Then every filing in
+that project that the hold rule matches fails and creates no task, and so
+does the project's backfill, until all but one holder is released with
+`release_holder=True`. The holder is never a curator pool entry or a combine
+target.
 
 **Protection.** A `cancelled` or `done` dependency counts as satisfied, so one
 status write on the holder would release the whole held backlog at once.
+A `deferred` holder still holds, but it releases every held follow-up when
+it lands back on `pending`, because promotion (task 8418) fires on that
+landing (decision 14).
 
 - `set_task_status` refuses `done`, `cancelled` and `deferred` on the holder
   unless `release_holder` is the literal `true`. Releasing is a human act.
@@ -910,6 +919,14 @@ holder's `held_count`, the number of active tasks that depend on it, and a
 `protection` field naming the rule that refused. Each refusal journals a
 `followup_holder_protected` event. `release_holder` is ignored on any task
 other than the holder.
+
+Until promotion lands (task 8418), a cancel-release has a side effect. Every
+held follow-up depends on the holder, so targeted reconciliation's
+cancelled-dependency sweep
+(`fused-memory/src/fused_memory/reconciliation/targeted.py::TargetedReconciler._sweep_cancelled_descendants`)
+reads each one as an ambiguous dependent. It files one L1 escalation per
+held follow-up while the project's orchestrator is live, and sets each one
+`blocked` when it is stopped.
 
 **Promotion** removes a held task's holder edge and stamps
 `followup_hold.promoted {by, at, ref}`, where `by` is one of `dependent`,

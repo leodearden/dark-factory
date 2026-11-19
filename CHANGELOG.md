@@ -33,10 +33,16 @@ Promotion, which releases held tasks one at a time, is task 8418. See
   directly or through other stock follow-ups. A second start holds nothing.
 - `set_task_status` gained `release_holder` (strict bool, default `false`).
   `done`, `cancelled` or `deferred` on a holder is refused with
-  `followup_holder_protected` unless it is the literal `true`, because that
-  write releases every held follow-up at once. `update_task` refuses, with the
+  `followup_holder_protected` unless it is the literal `true`, because each of
+  them releases every held follow-up. `update_task` refuses, with the
   same error, a write that strips the holder's `followup_holder` or
-  `deferred_watch` or sets its `trigger_met`.
+  `deferred_watch` or sets its `trigger_met`. Until task 8418 lands, a
+  cancel-release also makes targeted reconciliation file one L1 escalation
+  per held follow-up, or block each one when the orchestrator is stopped.
+- A held filing's stored ticket outcome (`result_json`) carries `held_by`, the
+  holder's id. `resolve_ticket` does not return it.
+- A holder's mint journals `task_created` with `source:
+  'followup-holder-mint'`.
 - Three new event types: `followup_held {task_id, holder_id}` per held filing,
   `followup_hold_backfilled {project_id, count}` once per project per start
   (count possibly 0), and `followup_holder_protected {holder_id,

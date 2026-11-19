@@ -7,6 +7,7 @@ the store, as the stock filed before the hold existed is, and read back through 
 from __future__ import annotations
 
 import ast
+import json
 import logging
 import pathlib
 from collections.abc import Sequence
@@ -27,22 +28,7 @@ from fused_memory.server import main as server_main
 _FOLLOWUP = {'source': 'agent-followup', 'spawn_context': 'agent_followup', 'spawned_from': '101'}
 _REVIEW = {'spawn_context': 'review_suggestions'}
 _EARLIER_HOLD = {'holder': 1, 'held_at': '2026-11-01T00:00:00+00:00'}
-
-
-async def _row(stack: Stack, task_id: str) -> dict[str, Any]:
-    result = await stack.call('get_task', id=task_id)
-    assert 'error' not in result, result
-    return result
-
-
-def _dependencies(row: dict[str, Any]) -> list[str]:
-    return [str(dependency) for dependency in row.get('dependencies') or []]
-
-
-async def _holder_ids(stack: Stack) -> list[str]:
-    found = await stack.call('find_tasks_by_metadata', key=FOLLOWUP_HOLDER_METADATA_KEY)
-    assert 'error' not in found, found
-    return [str(row['task_id']) for row in found['results']]
+_MARKER = {'project_id': 'proj', 'minted_at': '2026-11-08T00:00:00+00:00'}
 
 
 async def _seed_stock(stack: Stack) -> tuple[list[str], list[str]]:
@@ -70,36 +56,38 @@ async def _seed_stock(stack: Stack) -> tuple[list[str], list[str]]:
 @pytest.mark.asyncio
 async def test_the_backfill_holds_every_matching_pending_followup_in_one_event(stack: Stack) -> None:
     matching, untouched = await _seed_stock(stack)
-    prior = {task_id: _dependencies(await _row(stack, task_id)) for task_id in matching}
-    untouched_before = {task_id: await _row(stack, task_id) for task_id in untouched}
+    prior = {task_id: await stack.dependencies(task_id) for task_id in matching}
+    untouched_before = {task_id: await stack.row(task_id) for task_id in untouched}
 
     count = await stack.interceptor.backfill_followup_holds(stack.root, known_roots=[stack.root])
 
     assert count == 3
-    [holder] = await _holder_ids(stack)
+    [holder] = await stack.holder_ids()
     for task_id in matching:
-        row = await _row(stack, task_id)
-        assert _dependencies(row) == [*prior[task_id], holder], task_id
-        assert str(row['metadata'][FOLLOWUP_HOLD_METADATA_KEY]['holder']) == holder
+        assert await stack.dependencies(task_id) == [*prior[task_id], holder], task_id
+        assert str((await stack.metadata(task_id))[FOLLOWUP_HOLD_METADATA_KEY]['holder']) == holder
     for task_id, before in untouched_before.items():
-        assert await _row(stack, task_id) == before, task_id
+        assert await stack.row(task_id) == before, task_id
     assert await stack.events(EventType.followup_hold_backfilled) == [
         {'project_id': resolve_project_id(stack.root), 'count': 3},
     ]
     assert await stack.events(EventType.task_modified) == []
+    assert await stack.events(EventType.task_created) == [
+        {'operation': 'add_task', 'task_id': holder, 'source': 'followup-holder-mint'},
+    ]
 
 
 @pytest.mark.asyncio
 async def test_a_second_backfill_adds_nothing_and_still_reports(stack: Stack) -> None:
     matching, _untouched = await _seed_stock(stack)
     await stack.interceptor.backfill_followup_holds(stack.root, known_roots=[stack.root])
-    held = {task_id: _dependencies(await _row(stack, task_id)) for task_id in matching}
+    held = {task_id: await stack.dependencies(task_id) for task_id in matching}
 
     count = await stack.interceptor.backfill_followup_holds(stack.root, known_roots=[stack.root])
 
     assert count == 0
     for task_id in matching:
-        assert _dependencies(await _row(stack, task_id)) == held[task_id], task_id
+        assert await stack.dependencies(task_id) == held[task_id], task_id
     assert [event['count'] for event in await stack.events(EventType.followup_hold_backfilled)] == [3, 0]
 
 
@@ -110,7 +98,7 @@ async def test_with_nothing_to_hold_no_holder_is_minted(stack: Stack) -> None:
     count = await stack.interceptor.backfill_followup_holds(stack.root, known_roots=[stack.root])
 
     assert count == 0
-    assert await _holder_ids(stack) == []
+    assert await stack.holder_ids() == []
     assert await stack.events(EventType.followup_hold_backfilled) == [
         {'project_id': resolve_project_id(stack.root), 'count': 0},
     ]
@@ -137,18 +125,17 @@ async def test_the_backfill_leaves_unheld_every_followup_an_unheld_task_waits_on
     await stack.backend.add_dependency(a, b, stack.root)
     await _seed_depending(stack, 'Deferred task on X3', x3, status='deferred')
     await _seed_depending(stack, 'Done task on X4', x4, status='done')
-    waited_on_before = {task_id: await _row(stack, task_id) for task_id in (x, x2, x5)}
+    waited_on_before = {task_id: await stack.row(task_id) for task_id in (x, x2, x5)}
 
     count = await stack.interceptor.backfill_followup_holds(stack.root, known_roots=[stack.root])
 
     assert count == 4
-    [holder] = await _holder_ids(stack)
+    [holder] = await stack.holder_ids()
     for task_id in (a, b, x3, x4):
-        row = await _row(stack, task_id)
-        assert holder in _dependencies(row), task_id
-        assert str(row['metadata'][FOLLOWUP_HOLD_METADATA_KEY]['holder']) == holder, task_id
+        assert holder in await stack.dependencies(task_id), task_id
+        assert str((await stack.metadata(task_id))[FOLLOWUP_HOLD_METADATA_KEY]['holder']) == holder, task_id
     for task_id, before in waited_on_before.items():
-        assert await _row(stack, task_id) == before, task_id
+        assert await stack.row(task_id) == before, task_id
     assert [event['count'] for event in await stack.events(EventType.followup_hold_backfilled)] == [4]
 
 
@@ -169,16 +156,66 @@ async def test_a_followup_another_project_waits_on_is_not_held(stack: Stack) -> 
     await _seed_dependent_in(
         stack, other_root, 'Deferred task on Z', f'{this_project}:{z}', status='deferred',
     )
-    x_before = await _row(stack, x)
+    x_before = await stack.row(x)
 
     count = await stack.interceptor.backfill_followup_holds(
         stack.root, known_roots=[stack.root, other_root],
     )
 
     assert count == 1
-    [holder] = await _holder_ids(stack)
-    assert holder in _dependencies(await _row(stack, z))
-    assert await _row(stack, x) == x_before
+    [holder] = await stack.holder_ids()
+    assert holder in await stack.dependencies(z)
+    assert await stack.row(x) == x_before
+
+
+@pytest.mark.asyncio
+async def test_a_followup_already_behind_the_holder_without_a_record_is_left_alone(stack: Stack) -> None:
+    holder = await stack.seed('Follow-up holder (proj)', {FOLLOWUP_HOLDER_METADATA_KEY: _MARKER})
+    edged = await stack.seed('Low follow-up already behind the holder', dict(_FOLLOWUP), priority='low')
+    await stack.backend.add_dependency(edged, holder, stack.root)
+    edged_before = await stack.row(edged)
+
+    count = await stack.interceptor.backfill_followup_holds(stack.root, known_roots=[stack.root])
+
+    assert count == 0
+    assert await stack.row(edged) == edged_before
+    assert await stack.holder_ids() == [holder]
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_known_project_holds_nothing_and_reports_nothing(stack: Stack) -> None:
+    unreadable_root = pathlib.Path(stack.root).parent / 'unreadable'
+    unreadable_root.write_text('a file where a project directory should be')
+    followup = await stack.seed('Low follow-up X', dict(_FOLLOWUP), priority='low')
+    followup_before = await stack.row(followup)
+
+    with pytest.raises(OSError):
+        await stack.interceptor.backfill_followup_holds(
+            stack.root, known_roots=[stack.root, str(unreadable_root)],
+        )
+
+    assert await stack.row(followup) == followup_before
+    assert await stack.holder_ids() == []
+    assert await stack.events(EventType.followup_hold_backfilled) == []
+
+
+@pytest.mark.asyncio
+async def test_an_external_dep_naming_this_project_unnormalised_still_counts_as_a_waiter(stack: Stack) -> None:
+    other_root = str(pathlib.Path(stack.root).parent / 'other')
+    followup = await stack.seed('Low follow-up X', dict(_FOLLOWUP), priority='low')
+    unnormalised = f'{resolve_project_id(stack.root).upper()}:{followup}'
+    await stack.backend.add_task(
+        project_root=other_root, title='Pending task waiting on X',
+        metadata=json.dumps({'external_deps': [unnormalised]}),
+    )
+    followup_before = await stack.row(followup)
+
+    count = await stack.interceptor.backfill_followup_holds(
+        stack.root, known_roots=[stack.root, other_root],
+    )
+
+    assert count == 0
+    assert await stack.row(followup) == followup_before
 
 
 def test_the_backfill_is_enabled_by_default() -> None:

@@ -25,6 +25,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
+from shared.followup_hold_records import FOLLOWUP_HOLDER_METADATA_KEY
 
 from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
 from fused_memory.config.schema import CuratorConfig, FusedMemoryConfig, TaskmasterConfig
@@ -70,10 +71,23 @@ class Stack:
     async def task_count(self) -> int:
         return len((await self.call('get_tasks'))['tasks'])
 
-    async def metadata(self, task_id: str) -> dict[str, Any]:
+    async def row(self, task_id: str) -> dict[str, Any]:
         result = await self.call('get_task', id=task_id)
         assert 'error' not in result, result
-        return result['metadata']
+        return result
+
+    async def metadata(self, task_id: str) -> dict[str, Any]:
+        return (await self.row(task_id))['metadata']
+
+    async def dependencies(self, task_id: str) -> list[str]:
+        """The task's local dependency ids, as strings."""
+        return [str(dependency) for dependency in (await self.row(task_id)).get('dependencies') or []]
+
+    async def holder_ids(self) -> list[str]:
+        """Every task carrying the follow-up holder marker, in any status."""
+        found = await self.call('find_tasks_by_metadata', key=FOLLOWUP_HOLDER_METADATA_KEY)
+        assert 'error' not in found, found
+        return [str(row['task_id']) for row in found['results']]
 
     async def seed(self, title: str, metadata: dict[str, Any], **fields: str) -> str:
         """A row written straight to the store, past every submit-boundary guard.

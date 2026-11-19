@@ -9211,8 +9211,10 @@ def create_mcp_server(
             release_holder: Must be the literal ``true`` for a follow-up holder to go
                 ``done``, ``cancelled`` or ``deferred``; without it that write is refused
                 ``followup_holder_protected`` with the holder's ``held_count``. Releasing the
-                holder releases every held follow-up at once, so it is a human act. Ignored on
-                any other task. See docs/task-authoring.md §3.4.
+                holder releases every held follow-up at once, so it is a human act. Until
+                promotion lands (task 8418), a cancel-release also files one L1 escalation
+                per held follow-up while the orchestrator is live, or blocks each one when
+                it is stopped. Ignored on any other task. See docs/task-authoring.md §3.4.
         """
         agent_id, _ = _resolve_identity(agent_id, None, ctx)
         if err := _reject_if_ticket_id('id', id):

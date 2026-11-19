@@ -42,26 +42,18 @@ async def _file_followup(stack: Stack, title: str, *, priority: str = 'low', **m
     )
 
 
-async def _holder_ids(stack: Stack) -> list[str]:
-    found = await stack.call('find_tasks_by_metadata', key=FOLLOWUP_HOLDER_METADATA_KEY)
-    assert 'error' not in found, found
-    return [str(row['task_id']) for row in found['results']]
-
-
-async def _row(stack: Stack, task_id: str) -> dict[str, Any]:
-    result = await stack.call('get_task', id=task_id)
-    assert 'error' not in result, result
-    return result
-
-
-def _dependencies(row: dict[str, Any]) -> list[str]:
-    return [str(dependency) for dependency in row.get('dependencies') or []]
+async def _minted_holders(stack: Stack) -> list[str]:
+    """The ids of the holders whose mint was journaled, oldest first."""
+    return [
+        event['task_id'] for event in await stack.events(EventType.task_created)
+        if event.get('source') == 'followup-holder-mint'
+    ]
 
 
 async def _assert_unheld(stack: Stack, task_id: str) -> None:
-    row = await _row(stack, task_id)
-    assert _dependencies(row) == [], row
-    assert FOLLOWUP_HOLD_METADATA_KEY not in row['metadata'], row['metadata']
+    assert await stack.dependencies(task_id) == [], task_id
+    metadata = await stack.metadata(task_id)
+    assert FOLLOWUP_HOLD_METADATA_KEY not in metadata, metadata
 
 
 @pytest.mark.asyncio
@@ -70,10 +62,10 @@ async def test_the_first_low_followup_mints_the_holder_and_is_born_held(
 ) -> None:
     held = await _file_followup(stack, 'The retry loop swallows the timeout')
 
-    holders = await _holder_ids(stack)
+    holders = await stack.holder_ids()
     assert len(holders) == 1, holders
     [holder] = holders
-    holder_row = await _row(stack, holder)
+    holder_row = await stack.row(holder)
     holder_metadata = holder_row['metadata']
     assert holder_metadata['task_kind'] == 'deterministic'
     assert holder_metadata['always_escalates'] is True
@@ -83,12 +75,14 @@ async def test_the_first_low_followup_mints_the_holder_and_is_born_held(
     assert not holder_metadata.get('trigger_met')
     assert holder_metadata[FOLLOWUP_HOLDER_METADATA_KEY]['project_id'] == resolve_project_id(stack.root)
     assert holder_row['priority'] == 'low'
-    assert _dependencies(holder_row) == []
+    assert await stack.dependencies(holder) == []
 
-    held_row = await _row(stack, held)
-    assert _dependencies(held_row) == [holder]
-    assert str(held_row['metadata'][FOLLOWUP_HOLD_METADATA_KEY]['holder']) == holder
+    assert await stack.dependencies(held) == [holder]
+    assert str((await stack.metadata(held))[FOLLOWUP_HOLD_METADATA_KEY]['holder']) == holder
     assert await stack.events(EventType.followup_held) == [{'task_id': held, 'holder_id': holder}]
+    assert [event for event in await stack.events(EventType.task_created) if 'source' in event] == [
+        {'operation': 'add_task', 'task_id': holder, 'source': 'followup-holder-mint'},
+    ]
 
 
 @pytest.mark.asyncio
@@ -102,9 +96,10 @@ async def test_later_low_followups_and_review_suggestions_reuse_the_one_holder(
         priority='low', metadata={'spawn_context': 'review_suggestions', 'files': [_FILE]},
     )
 
-    [holder] = await _holder_ids(stack)
+    [holder] = await stack.holder_ids()
     for task_id in (first, second, suggestion):
-        assert _dependencies(await _row(stack, task_id)) == [holder], task_id
+        assert await stack.dependencies(task_id) == [holder], task_id
+    assert await _minted_holders(stack) == [holder]
 
 
 @pytest.mark.asyncio
@@ -121,7 +116,7 @@ async def test_a_medium_a_planned_and_a_cited_followup_are_not_held(
     assert 'error' not in committed, committed
     cited = await _file_followup(stack, 'The tenant leaks into the log', x_finding_key=['fk-1'])
 
-    assert len(await _holder_ids(stack)) == 1
+    assert len(await stack.holder_ids()) == 1
     for task_id in (medium, planned, cited):
         await _assert_unheld(stack, task_id)
 
@@ -132,7 +127,7 @@ async def test_a_medium_followup_mints_no_holder(
 ) -> None:
     medium = await _file_followup(stack, 'The cache key ignores the tenant', priority='medium')
 
-    assert await _holder_ids(stack) == []
+    assert await stack.holder_ids() == []
     await _assert_unheld(stack, medium)
 
 
@@ -144,10 +139,10 @@ async def test_a_cancelled_holder_is_not_live_so_the_next_followup_mints_anew(
 
     held = await _file_followup(stack, 'The retry loop swallows the timeout')
 
-    holders = await _holder_ids(stack)
+    holders = await stack.holder_ids()
     assert released in holders
     [minted] = [holder for holder in holders if holder != released]
-    assert _dependencies(await _row(stack, held)) == [minted]
+    assert await stack.dependencies(held) == [minted]
 
 
 @pytest.mark.asyncio
@@ -165,6 +160,7 @@ async def test_two_live_holders_fail_the_filing_naming_both(
 
     assert resolved.get('status') == 'failed', resolved
     assert first in resolved['reason'] and second in resolved['reason'], resolved
+    assert 'created no task' in resolved['reason'], resolved
     assert await stack.task_count() == count_before
 
 
@@ -177,7 +173,7 @@ async def _arrange_held(stack: Stack) -> tuple[str, list[str]]:
     dropped = await _file_followup(stack, 'The tenant leaks into the log')
     dropped_answer = await stack.call('set_task_status', id=dropped, status='cancelled')
     assert 'error' not in dropped_answer, dropped_answer
-    [holder] = await _holder_ids(stack)
+    [holder] = await stack.holder_ids()
     return holder, held
 
 
@@ -199,7 +195,7 @@ async def test_cancelling_the_holder_is_refused_with_its_held_count(
     answer = await stack.call('set_task_status', id=holder, status='cancelled')
 
     _assert_refused(answer, holder, protection='protected_status', attempted_status='cancelled')
-    assert (await _row(stack, holder))['status'] == 'pending'
+    assert (await stack.row(holder))['status'] == 'pending'
     assert await stack.events(EventType.followup_holder_protected) == [{
         'holder_id': holder, 'attempted_status': 'cancelled', 'protection': 'protected_status',
         'held_count': 2,
@@ -219,7 +215,7 @@ async def test_settling_the_holder_any_other_way_is_refused(
     answer = await stack.call('set_task_status', id=holder, status=status, **extra)
 
     _assert_refused(answer, holder, protection='protected_status', attempted_status=status)
-    assert (await _row(stack, holder))['status'] == 'pending'
+    assert (await stack.row(holder))['status'] == 'pending'
 
 
 @pytest.mark.asyncio
@@ -234,8 +230,8 @@ async def test_a_csv_cancel_refuses_the_holder_and_applies_the_rest(
     by_id = {entry['task_id']: entry['result'] for entry in answer['results']}
     _assert_refused(by_id[holder], holder, protection='protected_status', attempted_status='cancelled')
     assert 'error' not in by_id[other], by_id[other]
-    assert (await _row(stack, holder))['status'] == 'pending'
-    assert (await _row(stack, other))['status'] == 'cancelled'
+    assert (await stack.row(holder))['status'] == 'pending'
+    assert (await stack.row(other))['status'] == 'cancelled'
 
 
 @pytest.mark.asyncio
@@ -247,7 +243,7 @@ async def test_setting_trigger_met_on_the_holder_is_refused(
     answer = await stack.call('update_task', id=holder, metadata={'trigger_met': True})
 
     _assert_refused(answer, holder, protection='trigger_met_set', attempted_status=None)
-    assert 'trigger_met' not in (await _row(stack, holder))['metadata']
+    assert 'trigger_met' not in (await stack.row(holder))['metadata']
 
 
 @pytest.mark.asyncio
@@ -255,7 +251,7 @@ async def test_stripping_the_holder_gate_is_refused(
     stack: Stack, curator_creates: list[PreparedCandidate],
 ) -> None:
     holder, _held = await _arrange_held(stack)
-    stored = (await _row(stack, holder))['metadata']
+    stored = (await stack.row(holder))['metadata']
     unmarked = {key: value for key, value in stored.items() if key != FOLLOWUP_HOLDER_METADATA_KEY}
 
     unwatched = await stack.call('update_task', id=holder, metadata={'deferred_watch': None})
@@ -263,7 +259,7 @@ async def test_stripping_the_holder_gate_is_refused(
 
     _assert_refused(unwatched, holder, protection='deferred_watch_stripped', attempted_status=None)
     _assert_refused(replaced, holder, protection='marker_stripped', attempted_status=None)
-    assert (await _row(stack, holder))['metadata'] == stored
+    assert (await stack.row(holder))['metadata'] == stored
 
 
 @pytest.mark.asyncio
@@ -277,8 +273,8 @@ async def test_updates_that_keep_the_gate_are_allowed(
 
     assert 'error' not in noted, noted
     assert 'error' not in triggered, triggered
-    assert (await _row(stack, holder))['metadata']['x_note'] == 'kept'
-    assert (await _row(stack, held[0]))['metadata']['trigger_met'] is True
+    assert (await stack.row(holder))['metadata']['x_note'] == 'kept'
+    assert (await stack.row(held[0]))['metadata']['trigger_met'] is True
 
 
 @pytest.mark.asyncio
@@ -290,15 +286,15 @@ async def test_an_explicit_release_cancels_the_holder_and_settles_every_held_dep
     answer = await stack.call('set_task_status', id=holder, status='cancelled', release_holder=True)
 
     assert 'error' not in answer, answer
-    assert (await _row(stack, holder))['status'] == 'cancelled'
+    assert (await stack.row(holder))['status'] == 'cancelled'
     for task_id in held:
-        for dependency in _dependencies(await _row(stack, task_id)):
-            assert (await _row(stack, dependency))['status'] in {'done', 'cancelled'}, (task_id, dependency)
+        for dependency in await stack.dependencies(task_id):
+            assert (await stack.row(dependency))['status'] in {'done', 'cancelled'}, (task_id, dependency)
 
     successor = await _file_followup(stack, 'The retry budget is unnamed')
 
-    [minted] = [found for found in await _holder_ids(stack) if found != holder]
-    assert _dependencies(await _row(stack, successor)) == [minted]
+    [minted] = [found for found in await stack.holder_ids() if found != holder]
+    assert await stack.dependencies(successor) == [minted]
 
 
 @pytest.mark.asyncio
@@ -315,4 +311,4 @@ async def test_a_truthy_string_never_releases_the_holder(
         answer = None
 
     assert answer is None or answer.get('error'), answer
-    assert (await _row(stack, holder))['status'] == 'pending'
+    assert (await stack.row(holder))['status'] == 'pending'

@@ -41,11 +41,13 @@ logger = logging.getLogger(__name__)
 __all__ = [
     'HELD_PRIORITIES',
     'HOLDER_GATE_KEYS',
+    'HOLDER_MINT_SOURCE',
     'PROTECTED_STATUSES',
     'BackfillEmit',
     'DuplicateFollowupHolderError',
     'FollowupHolderProtectedError',
     'FollowupHolders',
+    'HolderMinted',
     'HolderProtection',
     'backfill',
     'held_count',
@@ -60,6 +62,7 @@ __all__ = [
 HELD_PRIORITIES: Final = frozenset({'low', 'polish'})
 PROTECTED_STATUSES: Final = frozenset({TaskStatus.DONE, TaskStatus.CANCELLED, TaskStatus.DEFERRED})
 HOLDER_GATE_KEYS: Final = frozenset({FOLLOWUP_HOLDER_METADATA_KEY, 'deferred_watch', 'trigger_met'})
+HOLDER_MINT_SOURCE: Final = 'followup-holder-mint'
 
 _WAITING_STATUSES: Final = frozenset(ACTIVE - {TaskStatus.DEFERRED})
 
@@ -137,13 +140,16 @@ _HOLDER_DESCRIPTION = (
 _HOLDER_DETAILS = (
     'Minted by fused-memory (plans/follow-up-filing-shape-prd.md §4.3). It is a deterministic pure '
     'gate with deferred_watch set, so it never dispatches. set_task_status refuses done, cancelled '
-    'and deferred on it unless release_holder=True is passed, because that releases every held '
-    'follow-up at once. See docs/task-authoring.md §3.4.'
+    'and deferred on it unless release_holder=True is passed, because each of them releases every '
+    'held follow-up. See docs/task-authoring.md §3.4.'
 )
 
 
 class DuplicateFollowupHolderError(TaskmasterError):
-    """More than one live task carries the holder marker: the one-holder invariant is already broken."""
+    """More than one live task carries the holder marker: the one-holder invariant is already broken.
+
+    Every filing the hold rule matches fails while this lasts, and so does the project's backfill.
+    """
 
     def __init__(self, project_id: str, holder_ids: Sequence[int]) -> None:
         self.project_id = project_id
@@ -151,16 +157,25 @@ class DuplicateFollowupHolderError(TaskmasterError):
         named = ', '.join(str(holder_id) for holder_id in self.holder_ids)
         super().__init__(
             TASKMASTER_TOOL_ERROR,
-            f'project {project_id} has more than one live follow-up holder (tasks {named}); '
-            f'nothing was held. Release all but one with release_holder=True.',
+            f'project {project_id} has more than one live follow-up holder (tasks {named}), so this '
+            f'filing failed and created no task. Every low follow-up filed in this project fails '
+            f'the same way until all but one holder is released with release_holder=True.',
         )
 
 
-class FollowupHolders:
-    """Each project's holder id, memoised; the store's marker stays the authority for which task it is."""
+HolderMinted = Callable[[str, int], Awaitable[None]]
 
-    def __init__(self) -> None:
+
+class FollowupHolders:
+    """Each project's holder id, memoised; the store's marker stays the authority for which task it is.
+
+    ``on_minted`` is awaited with the project root and the new holder's id after every mint, still
+    under the caller's write lock, so no holder comes into being unannounced.
+    """
+
+    def __init__(self, *, on_minted: HolderMinted) -> None:
         self._by_root: dict[str, int] = {}
+        self._on_minted = on_minted
 
     async def ensure_holder(self, tm: TaskBackendProtocol, project_root: str) -> int:
         """The project's live holder, minted on first need.
@@ -174,6 +189,7 @@ class FollowupHolders:
         holder_id = await _live_holder(tm, project_root)
         if holder_id is None:
             holder_id = await _mint_holder(tm, project_root)
+            await self._on_minted(project_root, holder_id)
         self._by_root[project_root] = holder_id
         return holder_id
 
@@ -229,9 +245,11 @@ class HolderProtection(StrEnum):
 def protected_status(
     task: Mapping[str, object], status: str, *, release_holder: bool,
 ) -> HolderProtection | None:
-    """Decision 13: a holder leaves ``pending`` for a status a dependent reads as settled only on release.
+    """Decision 13: a holder goes ``done``, ``cancelled`` or ``deferred`` only on release.
 
-    Only a literal ``True`` releases: a whole-backlog release is a human act, never a truthy accident.
+    Done or cancelled settles every held follow-up's holder edge at once; deferred releases them all
+    when the holder lands back on ``pending`` (decision 14). Only a literal ``True`` releases: a
+    whole-backlog release is a human act, never a truthy accident.
     """
     if release_holder is True or status not in PROTECTED_STATUSES or not is_holder(task):
         return None
@@ -262,9 +280,9 @@ def protected_update(
 
 
 _HOLDER_PROTECTED_HINT = (
-    'This task is its project\'s follow-up holder: every held low follow-up depends on it, and a '
-    'done, cancelled or deferred dependency counts as settled, so leaving pending would release '
-    'the whole held backlog at once. That release is a human act: pass release_holder=True to '
+    'This task is its project\'s follow-up holder: every held low follow-up depends on it. Done or '
+    'cancelled releases every held follow-up at once, and deferred releases them all when the '
+    'holder lands back on pending. That release is a human act: pass release_holder=True to '
     'set_task_status. update_task may not strip followup_holder or deferred_watch, nor set '
     'trigger_met. See docs/task-authoring.md §3.4.'
 )
