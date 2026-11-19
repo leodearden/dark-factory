@@ -277,6 +277,20 @@ start it explicitly the first time. Once running:
 
 - Dashboard UI: `http://127.0.0.1:8080` (task/escalation/memory state, polled
   live from fused-memory + each registered orchestrator).
+- `DASHBOARD_SAMPLERS` — an optional `Environment=` line on the dashboard
+  unit, `on` or `off` (case-insensitive, surrounding whitespace ignored).
+  Unset means `on`; any other value fails dashboard startup with a
+  `ValueError` naming the variable. `off` stops the three background samplers
+  (`dashboard/src/dashboard/loops.py::_burndown_loop`, `::_metrics_loop` and
+  `::_quality_loop`), the only writers of the history the charts read
+  (`data/burndown/burndown.db`, `metrics.db`, `quality.db`): every page still
+  serves, but that history stops accruing while the switch is off. Leave it
+  unset in production; the test suite is what runs with it off. The committed
+  unit does not set it, so an installed `Environment=DASHBOARD_SAMPLERS=` line
+  is reported as drift by the unit-parity check (`OPERATIONS.md`
+  §"Dashboard unit-parity check") and a drop-in carrying it as an override.
+  A `scripts/setup-host.sh` re-render drops the line, because the renderer
+  preserves only `DASHBOARD_KNOWN_PROJECT_ROOTS`.
 - `dark-factory-dashboard-watchdog.timer` curls `/healthz` every 30s and
   restarts the dashboard if it wedges.
 - `orchestrator-watchdog.timer` TCP-probes every *enabled* orchestrator's
