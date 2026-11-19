@@ -37,20 +37,13 @@ import pytest
 from nested_pytest_session import run_nested_pytest
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-# APPEND, never insert(0, ...): the repo root must stay LAST on sys.path or the
-# subproject directories (orchestrator/, shared/, ...) resolve as namespace
-# packages shadowing their own src/<pkg>/ — the failure the root conftest.py
-# docstring exists to prevent.
-if str(REPO_ROOT) not in sys.path:
-    sys.path.append(str(REPO_ROOT))
-
-from df_pytest_isolation import (  # noqa: E402
+from df_pytest_isolation import (
     basetemp_rejection_reason,
     git_ceiling_value,
     reject_unsafe_basetemp,
 )
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _CEILING_KEY = 'GIT_CEILING_DIRECTORIES'

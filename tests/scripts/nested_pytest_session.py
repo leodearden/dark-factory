@@ -28,15 +28,7 @@ import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-# APPEND, never insert(0, ...): the repo root must stay LAST on sys.path or the
-# subproject directories (orchestrator/, shared/, ...) resolve as namespace
-# packages shadowing their own src/<pkg>/ — the failure the root conftest.py
-# docstring exists to prevent.
-if str(REPO_ROOT) not in sys.path:
-    sys.path.append(str(REPO_ROOT))
-
-import df_pytest_isolation  # noqa: E402
+import df_pytest_isolation
 
 # Must sit strictly below the run's pytest-timeout per-test axe, so a wedged
 # nested run reports as the calling test's TimeoutExpired, carrying its captured

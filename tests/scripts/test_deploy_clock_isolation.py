@@ -36,20 +36,11 @@ from pathlib import Path
 from types import ModuleType
 
 import pytest
+from nested_pytest_session import arming_conftest, run_nested_pytest
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-# APPEND, never insert(0, ...): the repo root must stay LAST on sys.path or the
-# subproject directories (orchestrator/, shared/, ...) resolve as namespace
-# packages shadowing their own src/<pkg>/ — the failure the root conftest.py
-# docstring exists to prevent.
-if str(REPO_ROOT) not in sys.path:
-    sys.path.append(str(REPO_ROOT))
-
-from nested_pytest_session import arming_conftest, run_nested_pytest  # noqa: E402
-
-import df_pytest_isolation  # noqa: E402
-from df_pytest_isolation import (  # noqa: E402
+import df_pytest_isolation
+from df_pytest_isolation import (
     CLOCK_PROVENANCE_SESSION_KEY,
     CLOCK_PROVENANCE_SOURCE_KEY,
     FLEET_LEASE_RELPATH,
@@ -67,6 +58,7 @@ from df_pytest_isolation import (  # noqa: E402
     run_session_token,
 )
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # NOT `from df_pytest_isolation import _df_deploy_clocks_unwritten`. Importing a
