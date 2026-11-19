@@ -243,6 +243,61 @@ class TestPlanOnlyArchitectIsRouted:
         assert architect_call.kwargs['max_turns'] == 77
         assert _routing_decision_fields(r.stdout)['rule_id'] == 'eval-arch-turns'
 
+    def test_rejected_rule_model_falls_back_and_is_named_on_the_line(
+        self, tmp_path, monkeypatch,
+    ):
+        from orchestrator.config import (
+            ModelsConfig,
+            OrchestratorConfig,
+            RoutingConfig,
+            RoutingRule,
+            RuleMatch,
+            RuleSet,
+        )
+
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            models=ModelsConfig(architect='sonnet'),
+            routing=RoutingConfig(rules=[RoutingRule(
+                id='eval-arch-bad-model',
+                match=RuleMatch(role=['architect']),
+                set=RuleSet(model='not-a-model'),
+            )]),
+        )
+
+        r, invoke_agent, _ = _run_plan_only_cli(
+            tmp_path, monkeypatch, architect=_refusing_architect, config=config,
+        )
+
+        assert r.exit_code == 0, r.output
+        (architect_call,) = invoke_agent.await_args_list
+        assert architect_call.kwargs['model'] == 'sonnet'
+        fields = _routing_decision_fields(r.stdout)
+        assert fields['model'] == 'sonnet'
+        assert fields['source_layer'] == 'config'
+        assert fields['rejected'] == 'policy_rule:model-not-in-allowlist'
+
+    def test_plan_only_architect_runs_on_its_configured_backend(
+        self, tmp_path, monkeypatch,
+    ):
+        from orchestrator.config import BackendsConfig, ModelsConfig, OrchestratorConfig
+
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            backends=BackendsConfig(architect='codex'),
+            models=ModelsConfig(architect='gpt-5-codex'),
+        )
+
+        r, invoke_agent, _ = _run_plan_only_cli(
+            tmp_path, monkeypatch, architect=_refusing_architect, config=config,
+        )
+
+        assert r.exit_code == 0, r.output
+        (architect_call,) = invoke_agent.await_args_list
+        assert (architect_call.kwargs['backend'], architect_call.kwargs['model']) == (
+            'codex', 'gpt-5-codex',
+        )
+
 
 _FRAMED_BASE = 'abc123def'
 _TASK = {'id': '9001', 'title': 'T', 'description': 'D'}

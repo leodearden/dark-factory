@@ -955,8 +955,9 @@ def _run_plan_only(task_path: Path | None, base_config):
     """Generate plans for eval tasks with the architect on its resolved route.
 
     Runs the architect against the pre-task commit for each task, on the
-    route ``resolve_route`` gives role 'architect' under *base_config*, and
-    saves the resulting plan into the task JSON file.
+    route ``resolve_route`` gives role 'architect' under *base_config* and on
+    that config's architect backend, and saves the resulting plan into the
+    task JSON file.
     """
     from orchestrator.evals.runner import load_task
     from orchestrator.evals.snapshots import cleanup_eval_worktree, create_eval_worktree
@@ -1032,7 +1033,7 @@ def _run_plan_only(task_path: Path | None, base_config):
                     allowed_tools=ARCHITECT.allowed_tools or None,
                     disallowed_tools=ARCHITECT.disallowed_tools or None,
                     effort=decision.effort,
-                    backend='claude',
+                    backend=base_config.backends.architect,
                 )
 
                 if not result.success:
