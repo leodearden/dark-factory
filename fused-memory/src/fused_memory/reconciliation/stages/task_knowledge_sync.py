@@ -107,6 +107,7 @@ from fused_memory.reconciliation.task_count_snapshot_cadence import (
 )
 from fused_memory.reconciliation.task_filter import (
     FilteredTaskTree,
+    available_tree,
     detect_task_dump_contamination,
     filter_task_tree,
     format_task_list,
@@ -3957,15 +3958,12 @@ class TaskKnowledgeSync(BaseStage):
             if not mismatches:
                 return
             # Avoid a redundant get_tasks round-trip when the harness has
-            # already injected the full task tree into self.filtered_task_tree.
+            # already injected a FETCHED task tree into self.filtered_task_tree.
             existing_tasks: list[dict] | None = None
-            if self.filtered_task_tree is not None:
+            tree = available_tree(self.filtered_task_tree)
+            if tree is not None:
                 existing_tasks = list(
-                    itertools.chain(
-                        self.filtered_task_tree.active_tasks,
-                        self.filtered_task_tree.done_tasks,
-                        self.filtered_task_tree.cancelled_tasks,
-                    )
+                    itertools.chain(tree.active_tasks, tree.done_tasks, tree.cancelled_tasks)
                 )
             summary = await queue_briefing_refresh_tasks(
                 self.taskmaster,
@@ -4757,7 +4755,7 @@ class IntegrityCheck(BaseStage):
     def record_task_dump_spot_check(self, report: StageReport) -> None:
         """Spot-check the harness-injected filtered_task_tree for contamination signals.
 
-        If self.filtered_task_tree is set, builds a synthetic raw-dump dict from the
+        If self.filtered_task_tree is set and was really fetched, builds a synthetic raw-dump dict from the
         tree's task lists, runs detect_task_dump_contamination against it, and — when
         contamination is detected — records report.stats['task_dump_spot_check'] and
         emits a WARNING for operator triage.
@@ -4766,10 +4764,10 @@ class IntegrityCheck(BaseStage):
         Only records the stat key when contaminated=True (clean cycles leave stats
         untouched, matching the Stage 1 census-inconsistency pattern).
         """
-        if self.filtered_task_tree is None:
+        tree = available_tree(self.filtered_task_tree)
+        if tree is None:
             return
 
-        tree = self.filtered_task_tree
         # Build a synthetic dump from the tree's task lists, stamping self.project_id so
         # the dump mirrors what get_tasks now returns (task-1661 envelope stamp).
         #
