@@ -232,8 +232,9 @@ class TestRecoveredRequestOutcomeHasAnOwner:
         assert worker.is_halt_owner(esc.id)
         scheduler_double.set_task_status.assert_any_await(_TID, 'blocked')
 
+        (harness.git_ops.project_root / 'README.md').write_text('# unparked WIP\n')
         restarted = await _harness_with_real_merge_worker(make, scheduler_double)
-        assert Harness._rehydrate_merge_halt(restarted) == esc.id
+        assert await Harness._rehydrate_merge_halt(restarted) == esc.id
         assert restarted._merge_worker is not None
         assert restarted._merge_worker.is_wip_halted
         assert restarted._merge_worker.is_halt_owner(esc.id)

@@ -379,8 +379,9 @@ class TestHaltCategoriesAreBehaviourallyLoadBearing:
     automatically required to behave like a halt owner.
     """
 
+    @pytest.mark.asyncio
     @pytest.mark.parametrize('category', MERGE_HALT_ESCALATION_CATEGORIES)
-    def test_each_category_restores_the_halt(
+    async def test_each_category_restores_the_halt(
         self, harness: Harness, category: str
     ) -> None:
         """A pending level-1 escalation of each member re-owns the halt."""
@@ -391,7 +392,7 @@ class TestHaltCategoriesAreBehaviourallyLoadBearing:
 
         esc = _make_wip_esc(queue, '4130', category=category)
 
-        result = harness._rehydrate_merge_halt()
+        result = await harness._rehydrate_merge_halt()
 
         assert result == esc.id, (
             f'A preserved level-1 `{category}` L1 did not re-own the merge '
@@ -404,7 +405,8 @@ class TestHaltCategoriesAreBehaviourallyLoadBearing:
         assert worker.is_wip_halted is True
         assert worker.halt_owner_esc_id == esc.id
 
-    def test_a_non_member_category_does_not_restore_the_halt(
+    @pytest.mark.asyncio
+    async def test_a_non_member_category_does_not_restore_the_halt(
         self, harness: Harness
     ) -> None:
         """The negative half: a non-member L1 leaves the queue running.
@@ -428,7 +430,7 @@ class TestHaltCategoriesAreBehaviourallyLoadBearing:
 
         _make_wip_esc(queue, '4130', category=_NON_HALT_CATEGORY)
 
-        result = harness._rehydrate_merge_halt()
+        result = await harness._rehydrate_merge_halt()
 
         assert result is None
         assert worker.is_wip_halted is False, (
