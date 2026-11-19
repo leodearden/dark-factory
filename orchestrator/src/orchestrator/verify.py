@@ -3338,8 +3338,24 @@ class _JunitReportPlan:
         return owned
 
 
+COLLECTION_MAP_SUFFIX = '.tests.json'
+
+
+def collection_map_path(report: Path) -> Path:
+    """The defect-test collection map beside a junit *report*: its full file name plus ``.tests.json``.
+
+    The orchestrator's single home of the map's name, for a live junit
+    (``r.xml.tests.json``) and an archived one
+    (``attempt-1.pkg.junit-<stamp>.xml.gz.tests.json``) alike. The plugin
+    ``shared/src/shared/_pytest_inject/_df_defect_plugin.py`` holds the
+    writer's own copy, because it can import nothing; their agreement is
+    proven end to end in ``orchestrator/tests/test_verify_defect_injection.py``.
+    """
+    return report.with_name(report.name + COLLECTION_MAP_SUFFIX)
+
+
 def _clear_junit_report(junit_path: Path) -> None:
-    """Remove any report left at *junit_path* by an earlier pytest invocation.
+    """Remove any report, and its collection map, left at *junit_path* by an earlier pytest invocation.
 
     Belongs immediately before each test-leg run that injects ``--junitxml``,
     NOT where the path is computed: pytest is invoked 1..N times inside one
@@ -3351,13 +3367,16 @@ def _clear_junit_report(junit_path: Path) -> None:
 
     Siting it at the write also means a leg with no test command clears
     nothing, so a type-only gate cannot delete a report it could never write.
+
+    The sibling collection map goes with it, so a run that writes no map (mode
+    off, or a crash) never leaves a predecessor's map beside a fresh junit, to
+    be archived as this run's.
     """
-    try:
-        junit_path.unlink(missing_ok=True)
-    except OSError as exc:
-        logger.warning(
-            '_clear_junit_report: could not remove %s: %s', junit_path, exc,
-        )
+    for path in (junit_path, collection_map_path(junit_path)):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            logger.warning('_clear_junit_report: could not remove %s: %s', path, exc)
 
 
 def _write_run_log(
@@ -3595,6 +3614,12 @@ def _archive_junit_report(
     *segment_label* names one segment of a segmented task leg (task 5671),
     whose segments each write their own report; omitted, the name is the
     per-leg one.
+
+    The cost and the attributing kinds both archive the report's collection
+    map the same way: copied uncompressed to ``collection_map_path(dest)``, so
+    a reader holding the archived junit's path (client-feed task 6972, the
+    defect-test consumers) derives the map from it. No map, no copy; a failed
+    copy warns and still returns the archived report.
     """
     dest: Path | None = None
     try:
@@ -3618,7 +3643,18 @@ def _archive_junit_report(
             junit_path, dest, exc_info=True,
         )
         return None
+    _archive_collection_map(collection_map_path(junit_path), collection_map_path(dest))
     return dest
+
+
+def _archive_collection_map(live_map: Path, archived_map: Path) -> None:
+    try:
+        if live_map.is_file():
+            shutil.copyfile(live_map, archived_map)
+    except OSError as exc:  # observability may not fail a verify
+        logger.warning(
+            '_archive_junit_report: could not archive %s → %s: %s', live_map, archived_map, exc,
+        )
 
 
 def _write_json_artifact(path: Path, payload: dict, caller: str) -> 'Path | None':
