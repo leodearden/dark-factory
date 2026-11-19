@@ -244,6 +244,7 @@ class _Hosts:
 
     def __init__(self) -> None:
         self.free = 1
+        self.acquire_error: BaseException | None = None
         self.acquired: list[HostLease] = []
         self.released: list[HostLease] = []
 
@@ -251,6 +252,8 @@ class _Hosts:
         return self.free
 
     async def acquire(self, local_factory: Any, *, policy: Any = None) -> HostLease | None:
+        if self.acquire_error is not None:
+            raise self.acquire_error
         if not self.free:
             return None
         lease = _local_lease()
@@ -728,6 +731,27 @@ class TestDispatch:
 
         assert scene.hosts.released == scene.hosts.acquired != []
         assert scene.ports.names()[-1] == 'release_permit'
+
+    async def test_a_launch_raising_after_a_remerge_discards_the_unlaunched_replacement(
+        self, scene: _Scene,
+    ) -> None:
+        dispatcher = scene.dispatcher(FakeVerifier(passes()))
+        item = await scene.merged_item()
+        replacement = dataclasses.replace(await scene.merged_item(), permit=SpecPermit())
+        scene.ports.remerged = replacement
+        scene.hosts.acquire_error = RuntimeError('acquire failed')
+
+        with pytest.raises(RuntimeError, match='acquire failed'):
+            await dispatcher.dispatch(item)
+
+        assert _stale_discards(scene.ports) == ['main_advanced']
+        assert scene.ports.calls[-4:] == [
+            _OUT_OF_REMERGE,
+            ('release_permit',),
+            ('cleanup_owned', replacement.merge_wt),
+            ('record_item_commit_dead', DeadBaseSite.DISPATCH_VOID, True),
+        ]
+        assert scene.hosts.acquired == []
 
 
 _HOMES = {
