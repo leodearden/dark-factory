@@ -11,7 +11,7 @@ import json
 import os
 import subprocess
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -25,7 +25,7 @@ CLI_TIMEOUT = cli_timeout_from_env("CHECK_BUILD_CACHE_IN_SERVICE_TEST_TIMEOUT")
 HOST = "leo-laptop"
 OTHER_HOST = "leo-workstation"
 CANON = "/opt/reify-canon/ws"
-SINCE = datetime(2026, 11, 20, 0, 0, tzinfo=timezone.utc)
+SINCE = datetime(2026, 11, 20, 0, 0, tzinfo=UTC)
 
 
 def at(minutes: int) -> datetime:
