@@ -10,7 +10,10 @@ Every present channel is composed the way production writes it: DF's own
 from __future__ import annotations
 
 import json
+import shutil
+import stat
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -395,6 +398,62 @@ def test_failed_allocation_runs_the_leg_with_no_exception_in_flight(tmp_path: Pa
 
     assert in_flight == (None, None, None)
     assert raised.value.__context__ is None
+
+
+@pytest.fixture
+def shared_temp_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    shared = tmp_path / 'shared'
+    shared.mkdir()
+    monkeypatch.setattr(tempfile, 'tempdir', str(shared))
+    return shared
+
+
+def test_default_allocations_share_one_private_directory_under_the_temp_dir(
+    shared_temp_dir: Path,
+) -> None:
+    with (
+        allocate_verify_event_log(role='task') as a,
+        allocate_verify_event_log(role='merge') as b,
+    ):
+        assert a.path is not None and b.path is not None
+        assert a.path != b.path
+        [entry] = list(shared_temp_dir.iterdir())
+        assert entry.is_dir()
+        assert stat.S_IMODE(entry.stat().st_mode) == 0o700
+        assert a.path.parent == b.path.parent == entry
+        assert a.read().present and b.read().present
+        channel_dir = entry
+
+    assert list(channel_dir.iterdir()) == []
+    assert list(shared_temp_dir.iterdir()) == [channel_dir]
+    with allocate_verify_event_log(role='task') as c:
+        assert c.path is not None
+        assert c.path.parent == channel_dir
+
+
+def test_a_removed_channel_directory_is_recreated_on_the_next_allocation(
+    shared_temp_dir: Path,
+) -> None:
+    with allocate_verify_event_log(role='task') as first:
+        assert first.path is not None
+        first_dir = first.path.parent
+    shutil.rmtree(first_dir)
+
+    with allocate_verify_event_log(role='task') as log:
+        assert log.path is not None
+        assert log.path.parent.is_dir()
+        assert log.path.parent.parent == shared_temp_dir
+        assert log.read().present
+
+
+def test_a_missing_temp_dir_fails_open_to_a_masked_channel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(tempfile, 'tempdir', str(tmp_path / 'missing'))
+
+    with allocate_verify_event_log(role='task') as log:
+        assert log.path is None
+        assert log.export_into({VERIFY_EVENT_LOG_ENV: 'ambient'})[VERIFY_EVENT_LOG_ENV] == ''
 
 
 # classify_failure: C3 rule 4 (present channel decides SEMAPHORE_TIMEOUT) and
