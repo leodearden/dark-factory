@@ -150,13 +150,27 @@ class TestDepthTable:
 
     def test_default_rows_are_typed(self):
         table = MergeDeepConfig().depth_table
-        assert table == [(0.93, 8), (0.85, 4), (0.75, 2)]
         assert all(isinstance(row, DepthRow) for row in table)
-        assert [(row.min_pass_estimate, row.depth) for row in table] == [
-            (0.93, 8),
-            (0.85, 4),
-            (0.75, 2),
-        ]
+        assert [row.depth for row in table] == list(range(12, 2, -1))
+        assert (table[0], table[-1]) == ((0.992, 12), (0.75, 3))
+
+    def test_each_default_row_starts_where_its_depth_gets_cheaper(self):
+        """plans/merge-lane-policy-prd.md D7: a chain of k costs 1/k + (1 - p^k)
+        verifies per item when every member of a red chain verifies alone."""
+        def verifies_per_item(p: float, k: int) -> float:
+            return 1 / k + (1 - p**k)
+
+        *rows, shallowest = MergeDeepConfig().depth_table
+        for threshold, depth in rows:
+            just_below, just_above = threshold - 0.002, threshold + 0.002
+            assert verifies_per_item(just_above, depth) < verifies_per_item(just_above, depth - 1), depth
+            assert verifies_per_item(just_below, depth) > verifies_per_item(just_below, depth - 1), depth
+        assert verifies_per_item(shallowest.min_pass_estimate, shallowest.depth) < 1, (
+            'the shallowest row must still beat verifying each item alone'
+        )
+        assert all(
+            verifies_per_item(p / 100, 3) < verifies_per_item(p / 100, 2) for p in range(50, 100)
+        ), 'depth 2 is never cheaper than depth 3, so it has no row'
 
     def test_project_yaml_table_loads_as_rows(self, tmp_path):
         project_cfg = tmp_path / 'orchestrator.yaml'

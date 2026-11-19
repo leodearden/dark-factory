@@ -1491,14 +1491,19 @@ class MergeDeepConfig(BaseModel):
         ),
     )
     depth_table: list[DepthRow] = Field(
-        default_factory=lambda: [DepthRow(0.93, 8), DepthRow(0.85, 4), DepthRow(0.75, 2)],
+        default_factory=lambda: [
+            DepthRow(0.992, 12), DepthRow(0.990, 11), DepthRow(0.988, 10), DepthRow(0.984, 9),
+            DepthRow(0.979, 8), DepthRow(0.972, 7), DepthRow(0.959, 6), DepthRow(0.934, 5),
+            DepthRow(0.876, 4), DepthRow(0.75, 3),
+        ],
         description=(
             'Chain depth by rolling per-item pass estimate: the first row whose '
             'min_pass_estimate the estimate meets gives the depth, and an '
             'estimate below every row chains nothing (depth 1). Rows are '
             '[min_pass_estimate, depth] pairs, thresholds in [0, 1] and depths '
             '>= 2, both strictly descending. A [0.0, N] row always chains N. '
-            'See plans/merge-lane-policy-prd.md D7.'
+            'The default puts each depth where it starts to cost fewer verifies '
+            'per item than the depth below. See plans/merge-lane-policy-prd.md D7.'
         ),
     )
     chain_build_timeout_secs: float = Field(
