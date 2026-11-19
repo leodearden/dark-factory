@@ -1229,6 +1229,142 @@ class TestProbeLandingPatchIdArm:
         assert default.merge_sha == squash, default
 
 
+def _write_and_commit(root: Path, subject: str, files: dict[str, str]) -> str:
+    for name, body in files.items():
+        (root / name).write_text(body)
+    landing_git(root, 'add', *files)
+    landing_git(root, 'commit', '-m', subject)
+    return landing_git(root, 'rev-parse', 'HEAD')
+
+
+def _lines(stem: str, count: int) -> str:
+    return ''.join(f'{stem} line {n}\n' for n in range(count))
+
+
+def _merged_landing_then_same_path_churn(root: Path, task_id: str) -> tuple[str, str]:
+    """``task/<task_id>`` merged ``--no-ff`` into main, then main rewrites its paths.
+
+    Three later main commits each replace every line the task added, which is
+    the churn a decaying effect-present check reads as "reverted".  Returns
+    ``(merge_sha, branch_base_sha)``.
+    """
+    branch = f'task/{task_id}'
+    new_repo(root)
+    base = landing_git(root, 'rev-parse', 'main')
+    landing_git(root, 'checkout', '-b', branch)
+    _write_and_commit(root, f'feat({task_id}): add the module', {'work.py': _lines('feature', 40)})
+    _write_and_commit(root, f'test({task_id}): cover the module', {'helper.py': _lines('helper', 30)})
+    landing_git(root, 'checkout', 'main')
+    landing_git(root, 'merge', '--no-ff', '-m', f'Merge {branch} into main', branch)
+    merge_sha = landing_git(root, 'rev-parse', 'main')
+    for n in range(3):
+        _write_and_commit(root, f'refactor: churn {n}', {
+            'work.py': _lines(f'churn {n}', 40), 'helper.py': _lines(f'churn {n}', 30),
+        })
+    return merge_sha, base
+
+
+def _spy_on_landing_producers(monkeypatch: pytest.MonkeyPatch) -> tuple[AsyncMock, AsyncMock]:
+    """Delegating spies on the DEFINING module's two landing producers.
+
+    ``git_authority`` imports both per call, so patching
+    ``orchestrator.merge_lane.landing_evidence`` is what its arms resolve.
+    Returns ``(branch_work_landed, validate_landing_evidence)``.
+    """
+    from orchestrator.merge_lane import landing_evidence
+    work_landed = AsyncMock(wraps=landing_evidence.branch_work_landed)
+    validate = AsyncMock(wraps=landing_evidence.validate_landing_evidence)
+    monkeypatch.setattr(landing_evidence, 'branch_work_landed', work_landed)
+    monkeypatch.setattr(landing_evidence, 'validate_landing_evidence', validate)
+    return work_landed, validate
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures('fresh_landing_tally')
+class TestProbeLandingAncestorArmDecidesByBranchWorkLanded:
+    """A live tip that IS an ancestor of main, decided by the non-decaying producer.
+
+    Task 4648 repoints the ancestor arm from ``validate_landing_evidence``'s
+    effect-present DISCOVERY policy to ``branch_work_landed``, the same
+    producer the patch-id arm uses.  Its degeneracy guard and the ``''``
+    citation opt-out still run first.  Which policy each landing-detection
+    site keeps is recorded in
+    ``docs/prds/landed-not-done-recovery.effect-present-caller-enumeration.md`` §7.
+    """
+
+    async def test_a_merged_landing_survives_same_path_churn(self, tmp_path: Path) -> None:
+        merge_sha, base = _merged_landing_then_same_path_churn(tmp_path / 'repo', '4648')
+
+        verdict = await _probe_repo(tmp_path / 'repo', '4648', metadata={'branch_base_sha': base})
+
+        assert verdict.outcome is GitAuthorityOutcome.found_on_main, verdict
+        assert verdict.arm is GitAuthorityArm.ancestor
+        assert verdict.merge_sha == merge_sha
+        assert verdict.merge_sha_fully_guarded is True
+        assert verdict.rescued_by_delivered_checks is False
+
+    async def test_the_ancestor_arm_asks_branch_work_landed_not_the_effect_present_gate(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _merge_sha, base = _merged_landing_then_same_path_churn(tmp_path / 'repo', '4648')
+        metadata = {'branch_base_sha': base}
+        work_landed, validate = _spy_on_landing_producers(monkeypatch)
+
+        await _probe_repo(tmp_path / 'repo', '4648', metadata=metadata)
+
+        work_landed.assert_awaited_once()
+        assert work_landed.await_args is not None
+        assert work_landed.await_args.kwargs['pattern_template'] is None, (
+            "the project's git.commit_citation_pattern, None here, is forwarded as-is"
+        )
+        assert work_landed.await_args.kwargs['metadata'] == metadata
+        validate.assert_not_awaited()
+
+    async def test_the_citation_opt_out_still_answers_at_the_tip_without_the_producer(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _merge_sha, base = _merged_landing_then_same_path_churn(tmp_path / 'repo', '4648')
+        tip = landing_git(tmp_path / 'repo', 'rev-parse', 'task/4648')
+        work_landed, _validate = _spy_on_landing_producers(monkeypatch)
+
+        verdict = await _probe_repo(
+            tmp_path / 'repo', '4648', metadata={'branch_base_sha': base},
+            commit_citation_pattern='',
+        )
+
+        assert verdict.outcome is GitAuthorityOutcome.found_on_main, verdict
+        assert verdict.arm is GitAuthorityArm.ancestor
+        assert verdict.merge_sha == tip
+        assert verdict.citation_gate_skipped is True
+        work_landed.assert_not_awaited()
+
+    async def test_a_degenerate_ancestor_tip_is_no_signal(self, tmp_path: Path) -> None:
+        repo = tmp_path / 'repo'
+        new_repo(repo)
+        base = landing_git(repo, 'rev-parse', 'main')
+        landing_git(repo, 'branch', 'task/4648', base)
+        landing_commit(repo, 'chore: main moves on', 'later.txt')
+
+        verdict = await _probe_repo(repo, '4648', metadata={'branch_base_sha': base})
+
+        assert verdict.outcome is GitAuthorityOutcome.no_signal, verdict
+        assert verdict.merge_sha is None
+
+    async def test_a_raising_producer_degrades_to_probe_failed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _merge_sha, base = _merged_landing_then_same_path_churn(tmp_path / 'repo', '4648')
+        monkeypatch.setattr(
+            'orchestrator.merge_lane.landing_evidence.branch_work_landed',
+            AsyncMock(side_effect=RuntimeError('producer exploded')),
+        )
+
+        verdict = await _probe_repo(tmp_path / 'repo', '4648', metadata={'branch_base_sha': base})
+
+        assert verdict.outcome is GitAuthorityOutcome.probe_failed, verdict
+        assert verdict.merge_sha is None
+
+
 class TestGitAuthorityVerdict:
     def test_is_frozen(self) -> None:
         verdict = GitAuthorityVerdict(outcome=GitAuthorityOutcome.no_signal)
