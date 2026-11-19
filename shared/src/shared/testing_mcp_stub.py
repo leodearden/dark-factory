@@ -14,7 +14,9 @@ the socket.
 
 Real sockets rather than patching a client's modules: the session header, path
 and Accept a client sends are wire facts the server observes in
-:attr:`StubMcpServer.requests`, so no client internals are pinned. Pure stdlib,
+:attr:`StubMcpServer.requests`, and :meth:`StubMcpServer.delivered_arguments`
+names the tool calls that got past the stub's own refusals, so no client
+internals are pinned. Pure stdlib,
 registered in ``shared/tests/test_pure_stdlib_leaves.py``.
 """
 
@@ -116,6 +118,7 @@ class StubMcpServer:
         self._tools = tools
         self._lock = threading.Lock()
         self._requests: list[RecordedRequest] = []
+        self._deliveries: list[tuple[str, Any]] = []
         self._minted: list[str] = []
         self._open: set[str] = set()
         self._httpd: ThreadingHTTPServer | None = None
@@ -159,6 +162,11 @@ class StubMcpServer:
         with self._lock:
             return tuple(self._requests)
 
+    def delivered_arguments(self, tool_name: str) -> tuple[Any, ...]:
+        """*tool_name*'s calls past every transport refusal; the answer may still be a scripted failure."""
+        with self._lock:
+            return tuple(arguments for name, arguments in self._deliveries if name == tool_name)
+
     @property
     def minted_session_ids(self) -> tuple[str, ...]:
         with self._lock:
@@ -191,7 +199,13 @@ class StubMcpServer:
         session_id, refusal = self._session_for(message['method'], request.headers)
         if refusal is not None:
             return refusal
+        if message['method'] == 'tools/call':
+            self._record_delivery(message.get('params', {}))
         return self._answer_message(message, session_id)
+
+    def _record_delivery(self, params: Mapping[str, Any]) -> None:
+        with self._lock:
+            self._deliveries.append((params.get('name', ''), params.get('arguments', {})))
 
     def _refuse_media(self, accept: str) -> _Reply | None:
         has_json, has_sse = _accepted_media(accept)
