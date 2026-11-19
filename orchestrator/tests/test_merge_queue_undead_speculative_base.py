@@ -4,6 +4,8 @@ When the lane gives a built item's request back to the queue, or drops it,
 that item's speculative merge commit will never reach main. A successor
 already built on it must not verify on it: the INV-3 dispatch re-check voids
 the successor's base and re-merges it, and the §5.3 detector stays silent.
+A successor that already verified on it is re-verified without it, never
+adopted on that tree.
 
 Live merger and verifier loops over a real tmp git repo. Head H verifies on
 the remote 'head-host'; S, merged speculatively on H, verifies on 'local';
@@ -18,7 +20,6 @@ import asyncio
 import collections
 import contextlib
 import dataclasses
-import subprocess
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -58,16 +59,24 @@ _POLL_SECS = 0.005
 _AWAITING_DISPATCH = ('awaiting_verify', 'awaiting_host')
 
 Tree = frozenset[str]
+_ON_S_LIVE_COMMIT: Tree = frozenset({'H.txt', 'S.txt', 'T.txt'})
 
 
-def _git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(['git', *args], cwd=repo, capture_output=True, text=True, check=False)
+async def _git(repo: Path, *args: str) -> tuple[int, str]:
+    """``git *args`` in *repo*, off the event loop: its exit code and stdout."""
+    proc = await asyncio.create_subprocess_exec(
+        'git', *args, cwd=repo,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+    )
+    stdout, _ = await proc.communicate()
+    assert proc.returncode is not None
+    return proc.returncode, stdout.decode()
 
 
-def _tree_of(repo: Path, rev: str) -> Tree:
+async def _tree_of(repo: Path, rev: str) -> Tree:
     """The task files (``*.txt``) in *rev*'s tree."""
-    listing = _git(repo, 'ls-tree', '--name-only', rev).stdout.split()
-    return frozenset(name for name in listing if name.endswith('.txt'))
+    _, listing = await _git(repo, 'ls-tree', '--name-only', rev)
+    return frozenset(name for name in listing.split() if name.endswith('.txt'))
 
 
 class _TreeRecordingVerifier(FakeVerifier):
@@ -105,7 +114,7 @@ class _TreeRecordingRemote(FakeRemoteRunner):
         self.trees: list[Tree] = []
 
     async def run_merge_verify(self, merge_sha: str, spec: Any) -> VerifyResult:
-        self.trees.append(_tree_of(self.repo, merge_sha))
+        self.trees.append(await _tree_of(self.repo, merge_sha))
         return await super().run_merge_verify(merge_sha, spec)
 
 
@@ -262,9 +271,9 @@ async def _stage_behind_a_local_verify(
     run.put(*stacked)
     await run.awaiting_dispatch(*stacked)
     s_commit = run.first_merge_base('T')
-    assert 'S.txt' in _tree_of(run.scene.repo, s_commit), 'T was not stacked on S'
-    on_main = _git(run.scene.repo, 'merge-base', '--is-ancestor', s_commit, 'main')
-    assert on_main.returncode == 1, f"S's speculative merge {s_commit} is already on main"
+    assert 'S.txt' in await _tree_of(run.scene.repo, s_commit), 'T was not stacked on S'
+    on_main, _ = await _git(run.scene.repo, 'merge-base', '--is-ancestor', s_commit, 'main')
+    assert on_main == 1, f"S's speculative merge {s_commit} is already on main"
     return s_commit
 
 
@@ -304,7 +313,7 @@ class TestARequeuedPredecessorsCommitIsDead:
             run.release_h.set()
             statuses = {name: await run.outcome_status(name) for name in ('H', 'T', 'S')}
             assert statuses == dict.fromkeys(('H', 'T', 'S'), 'done'), statuses
-            assert _tree_of(scene.repo, 'main') == {'H.txt', 'S.txt', 'T.txt'}
+            assert await _tree_of(scene.repo, 'main') == {'H.txt', 'S.txt', 'T.txt'}
             assert run.divergence_alarms() == []
 
 
@@ -339,7 +348,7 @@ class TestAnAbandonedPredecessorsCommitIsDead:
             run.release_h.set()
             statuses = {name: await run.outcome_status(name) for name in ('H', 'T')}
             assert statuses == dict.fromkeys(('H', 'T'), 'done'), statuses
-            assert _tree_of(scene.repo, 'main') == {'H.txt', 'T.txt'}
+            assert await _tree_of(scene.repo, 'main') == {'H.txt', 'T.txt'}
             assert run.divergence_alarms() == []
 
     async def test_a_successor_of_a_predecessor_cancelled_while_parked_never_verifies_on_its_commit(
@@ -379,5 +388,77 @@ class TestAnAbandonedPredecessorsCommitIsDead:
             release_x.set()
             statuses = {name: await run.outcome_status(name) for name in ('X', 'T')}
             assert statuses == dict.fromkeys(('X', 'T'), 'done'), statuses
-            assert _tree_of(scene.repo, 'main') == {'H.txt', 'X.txt', 'T.txt'}
+            assert await _tree_of(scene.repo, 'main') == {'H.txt', 'X.txt', 'T.txt'}
             assert run.divergence_alarms() == []
+
+
+async def _t_verified_on_s_behind_it(run: _Run) -> None:
+    """H lands and frees 'head-host'; T dispatches there on S's still-live
+    commit while S verifies on local, and its verify passes."""
+    run.release_h.set()
+    assert await run.outcome_status('H') == 'done'
+    await _until(
+        lambda: bool(run.remote_trees_holding('T')) and not run.head_host.live,
+        label="T's verify on head-host passed",
+    )
+    assert run.remote_trees_holding('T') == [_ON_S_LIVE_COMMIT]
+    assert lane_state(run.lane, run.reqs['S'].request_id) == 'verifying', (
+        'precondition: T verified while S still verified'
+    )
+
+
+def _assert_t_reverified_without_s(run: _Run) -> None:
+    """T's only verify on S's work is the one taken on S's live commit."""
+    t_trees = run.local_trees_of('T') + run.remote_trees_holding('T')
+    assert [tree for tree in t_trees if 'S.txt' in tree] == [_ON_S_LIVE_COMMIT], t_trees
+    assert any('S.txt' not in tree for tree in t_trees), t_trees
+
+
+class TestAVerdictTakenOnALivePredecessorIsNotAdoptedOnceItLeaves:
+    """T verified on S's commit while S still verified; S then leaves the lane
+    unlanded, so T's verdict describes a tree that will never be on main.
+    T must be re-verified without S's work, never adopted on that tree."""
+
+    async def test_a_verdict_on_a_predecessor_requeued_after_it_is_not_adopted(
+        self, tmp_path: Path,
+    ) -> None:
+        """S's local verify defers once T's verify has passed on S's commit,
+        so S's request is requeued and merges afresh."""
+        scene = _scene(tmp_path)
+        s_entered, release_s = asyncio.Event(), asyncio.Event()
+        lane_held = raises(MergeVerifyLeaseHeld(scene.repo / '_merge-verify', 4242))
+        s_defers = dataclasses.replace(lane_held, release=release_s, entered=s_entered)
+        async with _running(
+            scene, ('H', 'S', 'T'), local_scripts={'S': [s_defers]}, speculation_depth=2,
+        ) as run:
+            await _stage_behind_a_local_verify(run, 'S', s_entered, ('T',))
+            await _t_verified_on_s_behind_it(run)
+
+            release_s.set()
+            statuses = {name: await run.outcome_status(name) for name in ('T', 'S')}
+            assert statuses == dict.fromkeys(('T', 'S'), 'done'), statuses
+            _assert_t_reverified_without_s(run)
+            assert await _tree_of(scene.repo, 'main') == {'H.txt', 'S.txt', 'T.txt'}
+            assert run.divergence_alarms() == []
+
+    async def test_a_verdict_on_a_predecessor_dropped_after_it_is_not_adopted(
+        self, tmp_path: Path,
+    ) -> None:
+        """S's waiter goes away once T's verify has passed on S's commit, so
+        the lane drops S mid-verify. Adopting T's verdict would land S's work
+        with T."""
+        scene = _scene(tmp_path)
+        s_entered = asyncio.Event()
+        s_holds = hangs_until(asyncio.Event(), entered=s_entered)
+        async with _running(
+            scene, ('H', 'S', 'T'), local_scripts={'S': [s_holds]}, speculation_depth=2,
+        ) as run:
+            await _stage_behind_a_local_verify(run, 'S', s_entered, ('T',))
+            await _t_verified_on_s_behind_it(run)
+
+            run.reqs['S'].result.cancel()
+            assert await run.outcome_status('T') == 'done'
+            _assert_t_reverified_without_s(run)
+            assert await _tree_of(scene.repo, 'main') == {'H.txt', 'T.txt'}
+            assert run.divergence_alarms() == []
+
