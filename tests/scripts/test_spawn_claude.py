@@ -3035,6 +3035,7 @@ def test_spawn_without_claude_bin_override_runs_claude_from_path(
     assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
     assert path_claude_capture.exists(), "bare `claude` on PATH did not run"
     assert not fleet_binary_capture.exists(), "the spawn lane ran the fleet's CLAUDE_BINARY"
+    assert "CLAUDE_SPAWN_CLAUDE_BIN" not in result.stderr.decode(), "a default spawn warned"
 
 
 def test_spawn_claude_bin_override_is_shell_quoted(tmp_path: pathlib.Path) -> None:
@@ -3094,14 +3095,25 @@ def test_spawn_payload_and_written_files_carry_no_credential_value(
     assert leaks == [], f"a credential value was written to disk: {leaks}"
 
 
+@pytest.mark.parametrize(
+    ("resolver_rc", "expected_cause"),
+    [(3, "exited 3"), (0, "exited 0 but printed no executable")],
+    ids=["faulted", "silent"],
+)
 def test_spawn_falls_back_to_claude_when_the_resolver_cannot_run(
-    tmp_path: pathlib.Path,
+    tmp_path: pathlib.Path, resolver_rc: int, expected_cause: str
 ) -> None:
     bin_dir = _make_bin_dir(tmp_path)
     path_claude_capture = tmp_path / "path_claude.bin"
     _write_fake_claude_capturing_argv(bin_dir, path_claude_capture)
     faulting_python = bin_dir / "python3"
-    faulting_python.write_text("#!/usr/bin/env bash\nexit 1\n")
+    faulting_python.write_text(textwrap.dedent(f"""\
+        #!/usr/bin/env bash
+        case "$*" in
+          *claude_executable.py*) echo resolver-stderr-10752 >&2; exit {resolver_rc} ;;
+        esac
+        exit 1
+    """))
     faulting_python.chmod(0o755)
     override = tmp_path / "pool" / "claude-pool"
     override_capture = tmp_path / "override.bin"
@@ -3118,6 +3130,9 @@ def test_spawn_falls_back_to_claude_when_the_resolver_cannot_run(
     assert path_claude_capture.exists(), "bare `claude` must run when the resolver cannot"
     assert not override_capture.exists()
     assert "CLAUDE_SPAWN_CLAUDE_BIN" in stderr, f"no fallback warning on stderr: {stderr}"
+    assert "shared/src/shared/claude_executable.py" in stderr, stderr
+    assert expected_cause in stderr, stderr
+    assert "resolver-stderr-10752" in stderr, "the resolver's own stderr was discarded"
 
 
 def test_t3_lane_launches_with_the_spawn_claude_bin_override_set(t3_lane: _T3Lane) -> None:

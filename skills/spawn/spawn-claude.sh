@@ -697,14 +697,21 @@ flags=""
 # run it. An override must exec claude, keeping claude the payload shell's
 # direct child.
 resolve_claude_executable() {
+  local fallback="launching bare 'claude' and ignoring any CLAUDE_SPAWN_CLAUDE_BIN"
+  local resolver_rc=0
   claude_executable=""
-  if command -v python3 >/dev/null 2>&1; then
-    claude_executable=$(python3 -I "$CLAUDE_EXECUTABLE_PY" spawn 2>/dev/null) || claude_executable=""
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "spawn-claude.sh: python3 is not on PATH, so the claude-executable resolver $CLAUDE_EXECUTABLE_PY cannot run; $fallback" >&2
+  else
+    claude_executable=$(python3 -I "$CLAUDE_EXECUTABLE_PY" spawn) || resolver_rc=$?
+    if [ "$resolver_rc" -ne 0 ]; then
+      echo "spawn-claude.sh: the claude-executable resolver $CLAUDE_EXECUTABLE_PY exited $resolver_rc (its stderr, if any, is above); $fallback" >&2
+      claude_executable=""
+    elif [ -z "$claude_executable" ]; then
+      echo "spawn-claude.sh: the claude-executable resolver $CLAUDE_EXECUTABLE_PY exited 0 but printed no executable; $fallback" >&2
+    fi
   fi
-  if [ -z "$claude_executable" ]; then
-    echo "spawn-claude.sh: could not run the claude-executable resolver; launching bare 'claude' and ignoring any CLAUDE_SPAWN_CLAUDE_BIN" >&2
-    claude_executable=claude
-  fi
+  claude_executable=${claude_executable:-claude}
 }
 resolve_claude_executable
 
