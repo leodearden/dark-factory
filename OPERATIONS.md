@@ -5012,6 +5012,23 @@ run, so ~470 KiB once the retention window is full** — the bound the cap
 buys, worth knowing before reading the per-night figure below, because the
 file is rewritten whole every night rather than appended to in place.
 
+**Reading the `kind` vocabulary drift block.** The JSON's top-level
+`kind_registry_drift` (schema 6) and the markdown's `## Kind vocabulary drift`
+score the live `kind` population against the frozen
+`memory_metadata.KIND_REGISTRY`. `unregistered` lists live values that are not
+in the registry; `absent_from_corpus` lists registry values with no live
+record. A growing unregistered count is the **expected** steady state: PRD §10
+open question 1 was ruled option (b), so `kind` membership only warns (a
+non-str `kind` is still a fatal type defect under `memory_metadata.enforce`).
+Do not top up the registry, regenerate the frozen oracle fixture, or file a
+"registry is stale" task. What is worth a look is a step change in `unregistered_records`
+concentrated on a few values. That means a first-party writer started emitting
+an unregistered kind, as `fused-memory/scripts/cleanup_pin_queue_edges.py` does
+with `pin_queue_edge_cleanup_audit`. The trend is
+`git log -p plans/memory-metadata-census-report.md`. The old
+`memory_metadata.enforce_kind_registry` key is retired: a fused-memory config
+still carrying it loads with a `retired key(s)` WARNING, so delete the line.
+
 **What landing all three nightly costs, stated rather than assumed.** The
 two report artifacts are full rewrites every run (measured: JSON 1.04 MiB /
 markdown 223 KiB raw; 90 KiB / 47 KiB zlib-compressed, which is what git

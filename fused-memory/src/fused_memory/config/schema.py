@@ -662,6 +662,9 @@ class TaskMetadataConfig(BaseModel):
 
 # --- Mem0 metadata write-boundary validation (task 3195, leaf β) ---
 
+_RETIRED_MEMORY_METADATA_KEYS: frozenset[str] = frozenset({'enforce_kind_registry'})
+
+
 class MemoryMetadataConfig(BaseModel):
     """Governs ``MemoryService``'s write-boundary validation of Mem0 ``metadata``.
 
@@ -676,13 +679,17 @@ class MemoryMetadataConfig(BaseModel):
 
     ``extra='forbid'`` so a mistyped leaf fails loud at config load/reload
     rather than silently doing nothing: under ``extra='ignore'`` an operator
-    who typed ``enforce_kind_regsitry`` would get a silently-dropped key and
-    believe enforcement was on.
+    who typed ``enfroce`` would get a silently-dropped key and believe
+    enforcement was on.
+
+    ``enforce_kind_registry`` was retired by task 5266 (PRD §10 OQ1 option
+    (b): ``kind`` membership never rejects); a config still carrying it loads with a
+    ``retired key(s)`` WARNING.
 
     Reload tier: ``reload.py``'s ``RELOADABLE_FIELDS`` is an opt-IN allowlist,
     so every leaf here is restart-required by default and none is listed. That
-    is correct for BOTH pairs, not just the enforce flags — the storm-tuning
-    leaves are read once when ``MemoryService.__init__`` constructs the
+    is correct for the ``enforce`` flag and the storm-tuning leaves alike —
+    the storm-tuning leaves are read once when ``MemoryService.__init__`` constructs the
     ``UnknownKeyStormDetector``, so they are captured by value and a hot
     reload genuinely would not take effect. Allowlisting them would advertise
     a reload that silently does nothing.
@@ -697,21 +704,6 @@ class MemoryMetadataConfig(BaseModel):
             'validation violations emit a memory_metadata.schema_warning log '
             'line and the write proceeds; True rejects the write with '
             'MemoryMetadataValidationError. Not hot-reloadable.'
-        ),
-    )
-    enforce_kind_registry: bool = Field(
-        default=False,
-        description=(
-            'RED-TIER / restart-only: whether an unknown metadata.kind is '
-            'FATAL (rejectable) rather than census-only. Carved out from '
-            "`enforce` and left OFF even after `enforce` flips, because it is "
-            'specifically this check whose safety premise leaf α measured '
-            'FALSE: PRD D3 assumed kind writers are in-repo code + prompts, '
-            'but 242 of the 329 live kind values are singletons, i.e. the '
-            'population is agent-invented free text and open in practice. '
-            'Flipping this on day one would turn every newly invented kind '
-            'into a hard memory-write failure on the live fleet. See PRD §10 '
-            'open question 1. Not hot-reloadable.'
         ),
     )
     unknown_key_storm_threshold: int = Field(
@@ -743,6 +735,11 @@ class MemoryMetadataConfig(BaseModel):
             'the detector.'
         ),
     )
+
+    @model_validator(mode='before')
+    @classmethod
+    def _drop_retired_keys(cls, data: object) -> object:
+        return drop_retired_keys(data, section='memory_metadata', retired=_RETIRED_MEMORY_METADATA_KEYS)
 
 
 # --- Task status transition authority (task 2175, rho1b) ---

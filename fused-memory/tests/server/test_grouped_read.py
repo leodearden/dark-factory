@@ -1346,7 +1346,7 @@ class TestChildRecordSchema:
         """A child is an ordinary entry: parent_id (full UUID) + a child kind."""
         for kind in sorted(CHILD_KINDS):
             meta = {'parent_id': _CANONICAL_ID, 'kind': kind}
-            violations = validate_memory_metadata(meta, enforce_kind_registry=True)
+            violations = validate_memory_metadata(meta)
             fatal = [v for v in violations if v.fatal]
             assert not fatal, (
                 f'A well-formed {kind!r} child record must produce NO fatal '
@@ -1356,7 +1356,7 @@ class TestChildRecordSchema:
     def test_short_hex_parent_id_is_rejected_by_shape_check(self):
         """parent_id must be a canonical full-UUID — the shape check is the schema."""
         meta = {'parent_id': 'deadbeef', 'kind': AMENDMENT_KIND}
-        violations = validate_memory_metadata(meta, enforce_kind_registry=True)
+        violations = validate_memory_metadata(meta)
         codes = {v.code for v in violations if v.fatal}
         assert 'invalid_parent_id_shape' in codes, (
             f'A non-UUID parent_id must be a FATAL shape violation, got {violations!r}'
