@@ -754,8 +754,28 @@ class TestHostConfig:
             ({"REIFY_CANON_POLICY": "fast"}, "RCLONE_USER=u\nRCLONE_PASS=p\n"),
             ({"REIFY_CANON_ENABLED": "yes"}, "RCLONE_USER=u\nRCLONE_PASS=p\n"),
             ({}, "RCLONE_USER=u\n"),
+            ({}, 'RCLONE_USER=u\nRCLONE_PASS=p"q\n'),
+            ({}, "RCLONE_USER=u\nRCLONE_PASS=p\\q\n"),
+            ({}, "RCLONE_USER=u\nRCLONE_PASS=p\tq\n"),
+            ({"BUILD_CACHE_STORE_URL": 'http://h/"x'}, "RCLONE_USER=u\nRCLONE_PASS=p\n"),
+            ({"BUILD_CACHE_STORE_URL": "ftp://h"}, "RCLONE_USER=u\nRCLONE_PASS=p\n"),
+            ({"REIFY_CANON_FALLBACK_DIR": "relative/dir"}, "RCLONE_USER=u\nRCLONE_PASS=p\n"),
+            ({"REIFY_CANON_FALLBACK_CAP": "50 G"}, "RCLONE_USER=u\nRCLONE_PASS=p\n"),
+            ({"REIFY_CANON_POLICY": ""}, "RCLONE_USER=u\nRCLONE_PASS=p\n"),
         ],
-        ids=["unknown-policy", "non-bool-enabled", "no-password"],
+        ids=[
+            "unknown-policy",
+            "non-bool-enabled",
+            "no-password",
+            "quote-in-password",
+            "backslash-in-password",
+            "control-character-in-password",
+            "quote-in-url",
+            "non-http-url",
+            "relative-fallback-dir",
+            "malformed-fallback-cap",
+            "explicitly-empty-policy",
+        ],
     )
     def test_invalid_input_writes_no_file(
         self,
@@ -774,6 +794,98 @@ class TestHostConfig:
         )
         assert proc.returncode == 1
         assert not host_config.exists()
+
+    def test_unset_values_are_kept_from_the_existing_file(
+        self, store_world: StoreWorld, tmp_path: Path
+    ) -> None:
+        credentials = write_credentials(
+            tmp_path / "credentials", "RCLONE_USER=reify-canon\nRCLONE_PASS=feed\n"
+        )
+        host_config = tmp_path / "reify-canon" / "host.toml"
+        common = {
+            "BUILD_CACHE_STORE_CREDENTIALS": str(credentials),
+            "REIFY_CANON_HOST_CONFIG": str(host_config),
+        }
+        first = store_world.install(
+            "--host-config",
+            **common,
+            REIFY_CANON_ENABLED="true",
+            REIFY_CANON_POLICY="mixed",
+            REIFY_CANON_FALLBACK_CAP="20G",
+        )
+        assert first.returncode == 0, first.stdout + first.stderr
+
+        new_url = "http://127.0.0.9:4227"
+        proc = store_world.install("--host-config", **common, BUILD_CACHE_STORE_URL=new_url)
+
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        config = tomllib.loads(host_config.read_text())
+        assert config["enabled"] is True
+        assert config["policy"] == "mixed"
+        assert config["fallback_cap"] == "20G"
+        assert config["store_url"] == new_url
+        assert f"store_url: 'http://127.0.0.1:{store_world.port}' -> '{new_url}'" in proc.stderr
+        assert "policy:" not in proc.stderr
+
+    def test_a_policy_change_is_logged_old_to_new(
+        self, store_world: StoreWorld, tmp_path: Path
+    ) -> None:
+        credentials = write_credentials(
+            tmp_path / "credentials", "RCLONE_USER=reify-canon\nRCLONE_PASS=feed\n"
+        )
+        common = {
+            "BUILD_CACHE_STORE_CREDENTIALS": str(credentials),
+            "REIFY_CANON_HOST_CONFIG": str(tmp_path / "host.toml"),
+        }
+        assert store_world.install("--host-config", **common, REIFY_CANON_POLICY="mixed").returncode == 0
+        write_credentials(credentials, "RCLONE_USER=reify-canon\nRCLONE_PASS=rotated\n")
+
+        proc = store_world.install("--host-config", **common, REIFY_CANON_POLICY="shared")
+
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert "policy: 'mixed' -> 'shared'" in proc.stderr
+        assert "store_password changed" in proc.stderr
+        assert "rotated" not in proc.stdout + proc.stderr
+
+    def test_an_invalid_value_leaves_the_existing_file_untouched(
+        self, store_world: StoreWorld, tmp_path: Path
+    ) -> None:
+        credentials = write_credentials(
+            tmp_path / "credentials", "RCLONE_USER=reify-canon\nRCLONE_PASS=feed\n"
+        )
+        host_config = tmp_path / "host.toml"
+        common = {
+            "BUILD_CACHE_STORE_CREDENTIALS": str(credentials),
+            "REIFY_CANON_HOST_CONFIG": str(host_config),
+        }
+        assert store_world.install("--host-config", **common).returncode == 0
+        before = host_config.read_bytes()
+        proc = store_world.install("--host-config", **common, REIFY_CANON_POLICY="fast")
+        assert proc.returncode == 1
+        assert host_config.read_bytes() == before
+        assert [path.name for path in tmp_path.iterdir() if path.name.startswith(".host")] == []
+
+    def test_check_rejects_a_value_that_write_refuses(
+        self, store_world: StoreWorld, tmp_path: Path
+    ) -> None:
+        host_config = tmp_path / "host.toml"
+        host_config.write_text(
+            "enabled = true\n"
+            'store_url = "http://127.0.0.1:1"\n'
+            'store_user = "u"\n'
+            'store_password = "p\\"q"\n'
+            'fallback_dir = "/tmp/fallback"\n'
+            'fallback_cap = "50G"\n'
+            'policy = "fast"\n'
+        )
+        host_config.chmod(0o600)
+        proc = store_world.install(
+            "--check", "--host-config", REIFY_CANON_HOST_CONFIG=str(host_config)
+        )
+        assert proc.returncode == 1
+        assert "policy 'fast'" in proc.stderr
+        assert "store_password <hidden> holds a quote" in proc.stderr
+        assert 'p"q' not in proc.stderr
 
     @needs_rclone
     def test_check_proves_the_store_takes_this_hosts_credentials(
