@@ -12,8 +12,9 @@ import sys
 from typing import Any
 
 import pytest
+from shared.followup_hold_records import FOLLOWUP_HOLDER_METADATA_KEY
 
-from fused_memory.middleware.followup_hold import FOLLOWUP_HOLDER_METADATA_KEY, is_holder
+from fused_memory.middleware.followup_hold import is_holder
 
 _MARKER = {'project_id': 'dark_factory', 'minted_at': '2026-11-08T00:00:00+00:00'}
 

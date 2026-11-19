@@ -15,10 +15,10 @@ from _submit_stack import curator_creates as curator_creates
 from _submit_stack import passthrough_main_checkout as passthrough_main_checkout
 from _submit_stack import stack as stack
 from shared.declared_scope import DECLARED_SCOPE_METADATA_KEY, DeclaredScope, derive_declared_scope
+from shared.followup_hold_records import FOLLOWUP_HOLDER_METADATA_KEY
 from shared.followup_items import FOLLOWUP_ITEMS_METADATA_KEY, observed_item
 
 from fused_memory.middleware.curator_types import PoolEntry, PreparedCandidate
-from fused_memory.middleware.followup_hold import FOLLOWUP_HOLDER_METADATA_KEY
 
 _FILE = 'src/app/a.py'
 _HOLDER_MARKER = {'project_id': 'p', 'minted_at': '2026-11-08T00:00:00+00:00'}

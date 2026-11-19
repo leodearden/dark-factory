@@ -36,6 +36,12 @@ from pydantic_core import PydanticCustomError
 
 from shared.cancel_dispositions import CancelDispositionEntry
 from shared.declared_scope import DECLARED_SCOPE_METADATA_KEY, DeclaredScope
+from shared.followup_hold_records import (
+    FOLLOWUP_HOLD_METADATA_KEY,
+    FOLLOWUP_HOLDER_METADATA_KEY,
+    FollowupHold,
+    FollowupHolder,
+)
 from shared.pure_gate_provenance import PURE_GATE_FROM_KEY
 from shared.strand_conversion import STRAND_CONVERTED_METADATA_KEY, StrandConverted
 from shared.task_deferral import DeferralRecord
@@ -1210,6 +1216,10 @@ register_metadata_submodel(STRAND_CONVERTED_METADATA_KEY, StrandConverted, cardi
 
 # declared_scope: plans/follow-up-filing-shape-prd.md §4.2.
 register_metadata_submodel(DECLARED_SCOPE_METADATA_KEY, DeclaredScope, cardinality='dict')
+
+# followup_holder, followup_hold: plans/follow-up-filing-shape-prd.md §4.3.
+register_metadata_submodel(FOLLOWUP_HOLDER_METADATA_KEY, FollowupHolder, cardinality='dict')
+register_metadata_submodel(FOLLOWUP_HOLD_METADATA_KEY, FollowupHold, cardinality='dict')
 
 # trigger_chain: plans/completion-driven-triggers-prd.md C2.
 register_metadata_submodel(TRIGGER_CHAIN_KEY, TriggerChain, cardinality='dict')

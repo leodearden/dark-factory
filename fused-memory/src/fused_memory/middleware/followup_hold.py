@@ -7,13 +7,11 @@ imports it, so it must keep importing only the stdlib and lower layers.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Final
 
+from shared.followup_hold_records import FOLLOWUP_HOLDER_METADATA_KEY
 from shared.task_metadata_wire import coerce_task_metadata
 
-__all__ = ['FOLLOWUP_HOLDER_METADATA_KEY', 'is_holder']
-
-FOLLOWUP_HOLDER_METADATA_KEY: Final = 'followup_holder'
+__all__ = ['is_holder']
 
 
 def is_holder(task: Mapping[str, object]) -> bool:
