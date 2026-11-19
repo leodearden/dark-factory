@@ -16,8 +16,7 @@ from hypothesis import settings
 
 # Sibling helpers (`_cockpit_*.py`) import by bare name; enforced by
 # tests/scripts/test_pytest_workspace_collection.py::_SUBPROJECTS_WITH_CONFTEST.
-_TESTS_DIR = Path(__file__).parent
-if str(_TESTS_DIR) not in sys.path:
+if str(_TESTS_DIR := Path(__file__).parent) not in sys.path:
     sys.path.insert(0, str(_TESTS_DIR))
 
 # Suite-wide git isolation (task 3355, incident esc-3072-3).  The verify lane
