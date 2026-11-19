@@ -11,61 +11,14 @@ update an existing plan without recreating it from scratch, and
 go through ``TaskArtifacts`` methods, preserving ``_session_id`` and
 enforcing correct schema.
 
-plan.json is also REPAIRED LAZILY ON READ.  Live plans in the fleet carry
-MCP tool-call envelope markup that leaked into their prose fields when the
-harness mis-closed an argument — a trailing mis-close, or a whole sibling
-parameter absorbed into the value before it.  Every entry point that opens
-an existing plan goes through :func:`_read_plan_repaired`, which repairs
-what it can, writes the result back through ``TaskArtifacts.write_plan_model``,
-and reports every repair and every refusal on the response's
-``markup_repairs`` key.  EVERY plan.json write -- repair write-back and
-tool mutation alike -- goes through that one method, which owns the byte
-format and the atomic/durable guarantee (task 3957): a concurrent reader
-observes either the complete old plan or the complete new one, never a
-partial write.  This module deliberately keeps NO writer of its own; the
-duplicate it used to carry existed only while ``TaskArtifacts`` was
-truncate-then-write.  No fleet quiesce is needed: the next tool call an agent makes fixes
-its own plan.  ``shared.toolcall_markup`` is the SINGLE owner of the
-literal set and of every accept/refuse decision (INV-5) — this module
-enumerates only WHICH plan fields are prose (``_REPAIRABLE_PLAN_FIELDS``),
-never what corruption looks like.
+plan.json is also repaired lazily on read: every entry point that opens an
+existing plan goes through :func:`_read_plan_repaired`, whose mechanism is
+``orchestrator/mcp/plan_markup_repair.py``.  That read-time repair COMPOSES
+with the write-time ``MarkupGuardMiddleware`` ``create_server`` registers;
+the ruling and its two consequences are D8 of
+``plans/toolcall-markup-containment-prd.md``.
 
-TWO MECHANISMS, ONE BOUNDARY EACH (task 4457's ruling — do not collapse them).
-The read-time repair above is NOT the only markup guard on this file:
-``create_server`` also registers
-:class:`shared.mcp_markup_middleware.MarkupGuardMiddleware` under
-``REJECT_WITH_REPAIR``, which guards INBOUND ARGUMENTS at the FastMCP request
-layer, before pydantic validation and before any tool body runs.  The three
-options were enumerated and COMPOSE was chosen:
-
-* SKIP (leave the read-time path as the only mechanism) — rejected.  It cannot
-  reject, cannot see inbound arguments at all, and cannot recover a swallowed
-  REQUIRED parameter; ``_create_plan`` is deliberately unhooked from it and
-  would stay wholly unguarded, on the server that owns 52 of the system's 95
-  unrepairable specimens.
-* SUPERSEDE (register and retire the read-time path) — rejected.  The two have
-  DISJOINT populations: the read-time path's is damage ALREADY LANDED in stored
-  plan.json, which the middleware repairs none of because it only ever sees
-  what an agent is sending NOW.
-* COMPOSE — chosen.  Different layers over different populations: inbound
-  arguments at the request layer, versus stored state at read time inside the
-  tool body.  INV-5 forbids a second ENUMERATION of the envelope literals and
-  there is none — both delegate every accept/refuse decision to
-  ``shared.toolcall_markup``.  D1 forbids per-boundary CALL SITES in place of a
-  blanket middleware, and the read-time path is not a per-boundary call site.
-
-Two consequences of that pairing are load-bearing, and both follow from the
-DECLARED policy rather than from coincidence:
-
-1. Under ``REJECT_WITH_REPAIR`` the middleware NEVER forwards a repaired
-   argument, so no middleware-repaired value can ever reach plan.json — which
-   is why the read-time path can never re-report the same damage as a second
-   fact.
-2. A rejected call short-circuits the tool body, so pre-existing STORED damage
-   is not repaired on that call.  That is a DEFERRAL, not a loss: the next
-   accepted call repairs it.  Do NOT "fix" it by invoking the read-time repair
-   from the middleware — that is exactly how two mechanisms on one boundary
-   become one tangled one.
+Heuristic 14's measurement of this file and its split: task 7082's commit.
 
 Usage (stdio transport, spawned by orchestrator):
     # Direct-interpreter no-uv hot path (production, task 1776):
@@ -470,17 +423,10 @@ def _create_plan(
                 'full analysis via update_plan_metadata(analysis=...).'
             ),
         }
-    # DELIBERATELY NOT hooked to _read_plan_repaired: this overwrites plan.json
-    # wholesale, so there is no existing document to repair on the way in.
-    # Guarding these INBOUND arguments against envelope markup is the write-time
-    # middleware's job, not this read-time surface's — don't "fix" the omission.
-    # That promise is now KEPT: MarkupGuardMiddleware is LIVE on this server
-    # (see create_server), and it refuses a poisoned title or analysis before
-    # this function is ever entered. The instruction above is load-bearing in
-    # the other direction now — hooking this function into _read_plan_repaired
-    # would put the same damage through two mechanisms.
+    # DELIBERATELY NOT hooked to _read_plan_repaired: inbound arguments are the
+    # write-time middleware's (plans/toolcall-markup-containment-prd.md D8).
     #
-    # THE BOOKKEEPING READ BELOW IS NOT A BREACH OF THAT INSTRUCTION. It goes
+    # THE BOOKKEEPING READ BELOW IS NOT A BREACH OF THAT RULE. It goes
     # through a plain `artifacts.read_plan()` for the same reason, and it
     # touches only the guard's own `_markup_rejections` block, the C4
     # descope record (`plan_descope.DESCOPE_PLAN_KEYS`), whose prose already
@@ -1592,109 +1538,20 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
 
     # THE WRITE-TIME BOUNDARY GUARD (task 4457, PRD contract C2). Every INBOUND
     # string argument of every tool on this server is scanned for leaked
-    # tool-call envelope markup before pydantic ever validates it — which is
-    # what lets a repair recover a parameter this server declares as REQUIRED:
-    # the loudest leak shape here is add_design_decision.decision absorbing its
-    # rationale sibling, and no read-time surface can see it at all.
+    # tool-call envelope markup before pydantic validates it. Each wiring
+    # choice below is stated where it is owned:
     #
-    # BOTH ARGUMENTS ARE DECLARED EXPLICITLY (INV-1), never left to a default:
-    #
-    # * The POLICY is PRD section 4 C2's table row for plan-tools. A plan is
-    #   authored once and read for the life of the task, so bouncing the caller
-    #   costs one mechanical retry while forwarding a repair would write a
-    #   guessed-at document that every later reader inherits.
-    # * The empty EXEMPTION SET is an answer, not an omission: no plan-tools
-    #   tool has searching for envelope literals as its job, the way
-    #   fused-memory's scan_memory_content does. An architect legitimately
-    #   QUOTING the literals — planning a task about this very leak — uses the
-    #   deliberate-quoting override instead, which every tool on this server
-    #   DECLARES (task 5283): `accepts_markup_override` appends the `metadata`
-    #   parameter to each registered signature, so the remediation the
-    #   rejection hint gives is part of the advertised contract rather than a
-    #   client that happens to send an undeclared argument. The middleware
-    #   therefore takes `_apply_override`'s FORWARD branch here, and the
-    #   decorator — not the middleware — is what consumes the flag: no tool
-    #   body ever sees it, so it cannot reach plan.json.
-    #
-    # THE ESCALATION SINK IS WIRED, and that is not optional here. Contract C2
-    # is explicit that unrepairable input is refused AND its full raw payload
-    # preserved, and the middleware's refusal hint tells the caller its payload
-    # "is preserved verbatim in the escalation named above". Registering REJECT
-    # with `escalation_sink=None` would ship that promise with nothing behind
-    # it, on the largest unrepairable surface in the system — 52 of the 95
-    # measured specimens are plan-tools' — turning "corrupt but present in
-    # plan.json" into "silently absent".
-    #
-    # Residue is filed under a NON-TASK anchor, never under the leaking task's
-    # own id: the middleware declares it at level 2, and a pending level>=2
-    # record carrying a live task id halts that task. Preserving one payload
-    # must not cost the run that produced it. See
-    # `_MARKUP_RESIDUE_ANCHOR_TASK_ID` for the full reading of the gate.
-    #
-    # `fact_sink` IS WIRED, to a durable journal (task 4744). It was left
-    # unwired here on the premise that "the operator-facing half rides the
-    # storm escalation" and that a second fact channel would have no consumer.
-    # Both halves of that premise were measured false on 2026-08-25.
-    #
-    # The storm escalation carries only count / threshold / window_seconds /
-    # outcome / project — a WINDOW summary — and `project` is structurally None
-    # on this boundary, because `_identity` reads only arguments named agent_id
-    # / project_root / project_id and no plan-tools tool declares any of the
-    # three. So it can say that N calls leaked and never which. Meanwhile the
-    # per-call line that CAN say so reached only this subprocess's stderr:
-    #
-    #     journalctl --user --since 2026-08-22 | grep 'markup guard:'
-    #         ->  0 plan-tools lines
-    #
-    # against 35 real plan-tools rejections in data/orchestrator/
-    # agent-transcripts/ over the same span. A storm record therefore asked a
-    # human to identify the leaking caller from log lines nobody retains, and
-    # anyone following that instruction correctly concluded "no evidence" and
-    # was wrong.
-    #
-    # The fact channel now HAS a consumer — an operator reading
-    # `data/orchestrator/markup-guard/plan-tools.jsonl` — which is exactly the
-    # condition the old comment made the wiring conditional on.
-    #
-    # THE FACT CHANNEL NOW HAS TWO CONSUMERS (task 4597, esc-4528-1), fanned
-    # out by `_markup_fact_sink`. The journal serves an OPERATOR reading a file
-    # under the main checkout; the second stamps a `_markup_rejections` block
-    # onto plan.json itself, which is the artifact every LATER READER opens —
-    # the implementer briefing tells its agent to read `.task/plan.json`
-    # directly, and four architect-facing prompts embed the document verbatim.
-    # Neither of those audiences ever sees the journal, so without the stamp
-    # `design_decisions: []` stayed ambiguous between "the architect never
-    # called" and "the architect called six times and was refused six times".
-    #
-    # THIS NARROWS THE CONTRACT THIS SERVER'S TESTS PIN, deliberately and in
-    # exactly one place:
-    #
-    #     OLD: a refused call leaves plan.json BYTE-identical.
-    #     NEW: a refused call leaves every AUTHORED field of plan.json
-    #          identical. The only difference is the guard's own
-    #          `_markup_rejections` block.
-    #
-    # The narrowing is sound because the byte pin was a PROXY for a property
-    # about VALUES — the one stated four paragraphs above ("forwarding a repair
-    # would write a guessed-at document that every later reader inherits") and
-    # in the middleware header ("no middleware-repaired value can ever reach
-    # plan.json"). That property is preserved intact and is now asserted more
-    # directly than the byte pin ever asserted it: `tool` and `param` come from
-    # the invoked tool's own registration and schema, `outcome` from the
-    # guard's closed vocabulary, `ts` from the clock. NOTHING guessed, repaired
-    # or caller-authored reaches the document. In particular the matched
-    # pattern, the mis-close and the raw payload are all excluded — see
-    # `plan_markup_stamp`'s docstring for the three measured reasons.
-    #
-    # It is EAGER rather than buffered-until-the-next-accepted-write, which
-    # would have left the byte pins untouched. That alternative's one hole is
-    # the worst case: an architect whose LAST plan-tools call is a refusal, and
-    # which then stops, would have its losses silently dropped — and that is
-    # precisely the situation most in need of explanation.
-    #
-    # ONE journal serves the fact sink and the escalation sink's loss records;
-    # why is in the docstring of
-    # orchestrator/src/orchestrator/mcp/markup_sink.py::make_escalation_sink.
+    # * REJECT_WITH_REPAIR, the empty exempt_tools and a real escalation_sink:
+    #   plans/toolcall-markup-containment-prd.md section 4 C2 and section 9 γ2.
+    # * The deliberate-quoting override every tool here declares: PRD D12.
+    # * Residue filed under a non-task anchor: PRD D9.
+    # * The durable fact journal and the measurement that wired it:
+    #   orchestrator/mcp/markup_journal.py's docstring.
+    # * The plan stamp, and the narrowing of "a refusal leaves plan.json
+    #   byte-identical" to "every authored field identical":
+    #   orchestrator/mcp/plan_markup_stamp.py's docstring.
+    # * The one journal both sinks share:
+    #   orchestrator/src/orchestrator/mcp/markup_sink.py::make_escalation_sink.
     journal = _markup_fact_journal(artifacts)
     mcp.add_middleware(
         MarkupGuardMiddleware(

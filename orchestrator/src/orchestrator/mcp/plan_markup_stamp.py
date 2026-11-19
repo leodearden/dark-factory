@@ -22,6 +22,13 @@ to :data:`MARKUP_STAMP_MAX_EVENTS` individual events, and one static ``note``
 naming what the block means — so a reader who has never seen the key does not
 have to infer it.
 
+WRITTEN EAGERLY, at refusal time, rather than buffered until the next accepted
+write, which would have left a refused call's ``plan.json`` byte-identical.
+Buffering's one hole is the worst case: an architect whose LAST plan-tools call
+is a refusal, and which then stops, would have its losses silently dropped —
+the situation most in need of explanation. (The pending buffer below holds only
+refusals that arrive before any plan exists.)
+
 WHAT AN EVENT HOLDS: ``ts``, ``tool``, ``param``, ``outcome``, and nothing
 else. :data:`STAMP_EVENT_KEYS` is the DECLARED allowlist, and
 :func:`build_event` copies FROM it rather than filtering the record — so a fact
@@ -592,9 +599,9 @@ def make_plan_stamp(
              registration and schema, ``outcome`` from the guard's closed
              vocabulary, ``ts`` from the clock.
 
-    What the byte pin was a PROXY for is preserved in full. ``create_server``'s
-    comment justifies the reject policy because "forwarding a repair would
-    write a guessed-at document that every later reader inherits", and the
+    What the byte pin was a PROXY for is preserved in full. This module's
+    docstring justifies the reject policy because "forwarding a repair would
+    write a guessed-at document every later reader inherits", and the
     middleware header says "no middleware-repaired value can ever reach
     plan.json". Both are about VALUES. Nothing guessed, repaired or
     caller-authored reaches the document through here.
