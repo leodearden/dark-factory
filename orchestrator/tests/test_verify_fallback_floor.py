@@ -296,10 +296,10 @@ def _write_files(root: Path, files: list[str]) -> None:
         path.write_text('# placeholder\n')
 
 
-def _passing_run_verification() -> AsyncMock:
-    return AsyncMock(return_value=verify.VerifyResult(
+def _passing_result() -> verify.VerifyResult:
+    return verify.VerifyResult(
         passed=True, test_output='', lint_output='', type_output='', summary='ok',
-    ))
+    )
 
 
 def _executed_configs(spy: AsyncMock) -> list[ModuleConfig]:
@@ -313,21 +313,29 @@ def _plan_pytest_run(plan: dict | None) -> dict:
 
 
 async def _run_fallback(
-    root: Path, test_command: str, files: list[str], role: Literal['merge', 'task'],
-) -> tuple[ModuleConfig, dict]:
+    root: Path,
+    test_command: str,
+    files: list[str],
+    role: Literal['merge', 'task'],
+    *,
+    verdict: verify.VerifyResult | None = None,
+    verify_allow_no_tests_ran: bool = False,
+) -> tuple[ModuleConfig, dict, verify.VerifyResult]:
     config = OrchestratorConfig(
         project_root=root,
         test_command=test_command,
         lint_command='ruff check',
         type_check_command='pyright',
+        verify_allow_no_tests_ran=verify_allow_no_tests_ran,
     )
-    spy = _passing_run_verification()
+    spy = AsyncMock(return_value=verdict if verdict is not None else _passing_result())
     with patch.object(verify, 'run_verification', new=spy):
         result = await verify.run_scoped_verification(
             root, config, [], task_files=files, role=role,
         )
+    spy.assert_awaited_once()
     (executed,) = _executed_configs(spy)
-    return executed, _plan_pytest_run(result.plan)
+    return executed, _plan_pytest_run(result.plan), result
 
 
 @pytest.mark.asyncio
@@ -336,7 +344,7 @@ class TestRunScopedVerificationFallbackFloor:
     async def test_reify_9839_executes_configured_command(self, tmp_path, role):
         _write_files(tmp_path, REIFY_9839_FILES)
 
-        executed, run = await _run_fallback(tmp_path, REIFY_TEST_COMMAND, REIFY_9839_FILES, role)
+        executed, run, _ = await _run_fallback(tmp_path, REIFY_TEST_COMMAND, REIFY_9839_FILES, role)
 
         assert executed.test_command == REIFY_TEST_COMMAND
         assert run['scope_kind'] == 'full_suite'
@@ -348,7 +356,7 @@ class TestRunScopedVerificationFallbackFloor:
     async def test_reify_9761_polyglot_executes_configured_command(self, tmp_path, role):
         _write_files(tmp_path, REIFY_9761_FILES)
 
-        executed, run = await _run_fallback(tmp_path, REIFY_TEST_COMMAND, REIFY_9761_FILES, role)
+        executed, run, _ = await _run_fallback(tmp_path, REIFY_TEST_COMMAND, REIFY_9761_FILES, role)
 
         assert executed.test_command == REIFY_TEST_COMMAND
         assert run['scope_kind'] == 'full_suite'
@@ -359,7 +367,7 @@ class TestRunScopedVerificationFallbackFloor:
         _write_files(tmp_path, ['backend/pyproject.toml', 'backend/app/x.py'])
         test_command = 'cd backend && uv run pytest'
 
-        executed, run = await _run_fallback(tmp_path, test_command, ['backend/app/x.py'], 'task')
+        executed, run, _ = await _run_fallback(tmp_path, test_command, ['backend/app/x.py'], 'task')
 
         assert executed.prefix == 'backend'
         assert executed.test_command == test_command
@@ -377,7 +385,7 @@ class TestRunScopedVerificationFallbackFloor:
             mixed_files, test_command, role, derived_target=False,
         )
 
-        executed, run = await _run_fallback(tmp_path, test_command, mixed_files, role)
+        executed, run, _ = await _run_fallback(tmp_path, test_command, mixed_files, role)
 
         assert executed.prefix == 'backend'
         assert executed.test_command is not None
@@ -392,7 +400,7 @@ class TestRunScopedVerificationFallbackFloor:
     async def test_bare_default_source_only_runs_whole_at_merge_role(self, tmp_path):
         _write_files(tmp_path, ['pkg/helpers.py'])
 
-        executed, run = await _run_fallback(tmp_path, 'pytest', ['pkg/helpers.py'], 'merge')
+        executed, run, _ = await _run_fallback(tmp_path, 'pytest', ['pkg/helpers.py'], 'merge')
 
         assert executed.test_command == 'pytest'
         assert run['scope_kind'] == 'full_suite'
@@ -400,7 +408,7 @@ class TestRunScopedVerificationFallbackFloor:
     async def test_bare_default_source_only_keeps_the_task_role_skip(self, tmp_path):
         _write_files(tmp_path, ['pkg/helpers.py'])
 
-        executed, run = await _run_fallback(tmp_path, 'pytest', ['pkg/helpers.py'], 'task')
+        executed, run, _ = await _run_fallback(tmp_path, 'pytest', ['pkg/helpers.py'], 'task')
 
         assert executed.test_command is None
         assert run['scope_kind'] == 'skipped'
@@ -409,7 +417,7 @@ class TestRunScopedVerificationFallbackFloor:
     async def test_derived_configured_suite_keeps_its_verbatim_reason(self, tmp_path, role):
         _write_files(tmp_path, ['tests/test_widget.py'])
 
-        executed, run = await _run_fallback(
+        executed, run, _ = await _run_fallback(
             tmp_path, REIFY_TEST_COMMAND, ['tests/test_widget.py'], role,
         )
 
@@ -417,3 +425,79 @@ class TestRunScopedVerificationFallbackFloor:
         assert run['reason'] == _unfloored_pytest_run(
             ['tests/test_widget.py'], REIFY_TEST_COMMAND, role,
         ).reason
+
+
+@pytest.mark.asyncio
+class TestNoTestsRanOutcome:
+    async def test_bare_default_source_only_task_role_fails_as_no_tests_ran(self, tmp_path):
+        _write_files(tmp_path, ['pkg/helpers.py'])
+
+        executed, run, result = await _run_fallback(tmp_path, 'pytest', ['pkg/helpers.py'], 'task')
+
+        assert result.passed is False
+        assert result.category == NO_TESTS_RAN_CATEGORY
+        assert result.trivial is False
+        assert result.failing_leg_categories is None
+        assert 'pkg/helpers.py' in result.cause_hint
+        assert executed.test_command is None
+        assert executed.lint_command is not None
+        assert executed.type_check_command is not None
+        assert run['scope_kind'] == 'skipped'
+
+    async def test_bare_default_test_tree_data_module_fails_as_no_tests_ran(self, tmp_path):
+        data_module = 'shared/tests/silent_fallthrough_allowlist.py'
+        _write_files(tmp_path, [data_module])
+
+        executed, _, result = await _run_fallback(tmp_path, 'pytest', [data_module], 'task')
+
+        assert result.category == NO_TESTS_RAN_CATEGORY
+        assert executed.test_command is None
+
+    async def test_a_lint_red_is_reported_as_itself(self, tmp_path):
+        _write_files(tmp_path, ['pkg/helpers.py'])
+        lint_red = verify.VerifyResult(
+            passed=False, test_output='', lint_output='E1 boom', type_output='',
+            summary='lint failed', category='lint_error',
+        )
+
+        _, _, result = await _run_fallback(
+            tmp_path, 'pytest', ['pkg/helpers.py'], 'task', verdict=lint_red,
+        )
+
+        assert result.category == 'lint_error'
+        assert result.passed is False
+
+    async def test_opt_in_lets_the_empty_slot_pass(self, tmp_path):
+        _write_files(tmp_path, ['pkg/helpers.py'])
+
+        _, run, result = await _run_fallback(
+            tmp_path, 'pytest', ['pkg/helpers.py'], 'task', verify_allow_no_tests_ran=True,
+        )
+
+        assert result.passed is True
+        assert result.category != NO_TESTS_RAN_CATEGORY
+        assert run['scope_kind'] == 'skipped'
+
+    @pytest.mark.parametrize('role', ROLES)
+    async def test_empty_test_command_stays_the_explicit_opt_out(self, tmp_path, role):
+        _write_files(tmp_path, ['pkg/helpers.py'])
+
+        _, _, result = await _run_fallback(tmp_path, '', ['pkg/helpers.py'], role)
+
+        assert result.passed is True
+
+    async def test_bare_default_at_merge_role_runs_a_command_and_passes(self, tmp_path):
+        _write_files(tmp_path, ['pkg/helpers.py'])
+
+        executed, _, result = await _run_fallback(tmp_path, 'pytest', ['pkg/helpers.py'], 'merge')
+
+        assert executed.test_command == 'pytest'
+        assert result.passed is True
+
+    @pytest.mark.parametrize('role', ROLES)
+    async def test_configured_suite_floor_runs_a_command_and_passes(self, tmp_path, role):
+        _write_files(tmp_path, REIFY_9839_FILES)
+
+        _, _, result = await _run_fallback(tmp_path, REIFY_TEST_COMMAND, REIFY_9839_FILES, role)
+
+        assert result.passed is True
