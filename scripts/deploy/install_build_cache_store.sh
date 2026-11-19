@@ -12,6 +12,9 @@ set -euo pipefail
 #                                    EnvironmentFile (never in argv or the unit)
 #   build-cache-store-prune.service  the size-cap pruner, copied out of the
 #   build-cache-store-prune.timer    checkout so a branch switch cannot break it
+# With --host-config it instead writes (or with --check checks) THIS host's
+# reify-canon host configuration, C13's host.toml, and installs no store, so
+# the laptop uses it too.
 #
 # ORDER OF OPERATIONS (each step aborts non-zero on any problem)
 #   1. Read-only preflight: rclone on PATH, /usr/bin/python3, lingering on
@@ -26,21 +29,41 @@ set -euo pipefail
 #      the pruner, write each unit only when its text differs, daemon-reload,
 #      enable both, restart the store only when its unit or credentials
 #      changed or it is not running, wait for it to answer, then run step 2.
+#   --host-config: validate every value by enumeration or pattern (none may
+#      hold a quote, backslash or control character, so the TOML needs no
+#      escaping), then write the seven keys 0600 through a temp file and mv.
+#      With --check: the file's mode, its keys, types and values, and that
+#      store_url answers 404 for a missing key with its credentials and 401
+#      without.
 #
 # Usage:
-#   install_build_cache_store.sh [--check]
+#   install_build_cache_store.sh [--check] [--host-config]
 #
 # Env overrides:
 #   BUILD_CACHE_STORE_PORT         listen port (default: 4227)
 #   BUILD_CACHE_STORE_CAP_BYTES    prune cap (default: 300 GiB)
 #   BUILD_CACHE_STORE_DIR          store dir (default: $HOME/.cache/build-cache-store)
-#   BUILD_CACHE_STORE_CREDENTIALS  RCLONE_USER=/RCLONE_PASS= file
+#   BUILD_CACHE_STORE_CREDENTIALS  RCLONE_USER=/RCLONE_PASS= file, read and never sourced
 #                                  (default: $HOME/.config/build-cache-store/credentials)
+# --host-config only:
+#   REIFY_CANON_HOST_CONFIG        the file (default: $HOME/.config/reify-canon/host.toml)
+#   REIFY_CANON_ENABLED            true|false (default: false)
+#   REIFY_CANON_POLICY             shared|mixed|incremental (default: shared)
+#   BUILD_CACHE_STORE_URL          the store as this host reaches it
+#                                  (default: http://127.0.0.1:$BUILD_CACHE_STORE_PORT)
+#   REIFY_CANON_FALLBACK_DIR       (default: $HOME/.cache/reify-canon/sccache-fallback)
+#   REIFY_CANON_FALLBACK_CAP       [0-9]+[KMGT]? (default: 50G)
 
 PORT="${BUILD_CACHE_STORE_PORT:-4227}"
 CAP_BYTES="${BUILD_CACHE_STORE_CAP_BYTES:-$((300 << 30))}"
 STORE_DIR="${BUILD_CACHE_STORE_DIR:-$HOME/.cache/build-cache-store}"
 CREDENTIALS="${BUILD_CACHE_STORE_CREDENTIALS:-$HOME/.config/build-cache-store/credentials}"
+HOST_CONFIG="${REIFY_CANON_HOST_CONFIG:-$HOME/.config/reify-canon/host.toml}"
+CANON_ENABLED="${REIFY_CANON_ENABLED:-false}"
+CANON_POLICY="${REIFY_CANON_POLICY:-shared}"
+STORE_URL="${BUILD_CACHE_STORE_URL:-http://127.0.0.1:$PORT}"
+FALLBACK_DIR="${REIFY_CANON_FALLBACK_DIR:-$HOME/.cache/reify-canon/sccache-fallback}"
+FALLBACK_CAP="${REIFY_CANON_FALLBACK_CAP:-50G}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PRUNER_SRC="$SCRIPT_DIR/build_cache_store_prune.py"
@@ -55,12 +78,14 @@ STORE_USER="reify-canon"
 LEAF_COUNT=4368
 WAIT_SECS=20
 
-usage() { echo "Usage: $(basename "$0") [--check]" >&2; }
+usage() { echo "Usage: $(basename "$0") [--check] [--host-config]" >&2; }
 
 MODE="apply"
+TARGET="store"
 for arg in "$@"; do
     case "$arg" in
         --check) MODE="check" ;;
+        --host-config) TARGET="host_config" ;;
         *)
             echo "ERROR: unexpected argument: $arg" >&2
             usage
@@ -268,6 +293,141 @@ store_check() {
     [ "$CHECK_FAILURES" -eq 0 ]
 }
 
+# ── --host-config ─────────────────────────────────────────────────────────
+host_config_preflight() {
+    [ -x "$HOST_PYTHON" ] || die "$HOST_PYTHON is missing; nothing was changed"
+    command -v curl >/dev/null || die "curl is not on PATH; nothing was changed"
+}
+
+require_toml_safe() {
+    if [[ "$2" == *[\"\\]* || "$2" == *[[:cntrl:]]* ]]; then
+        die "$1 holds a quote, backslash or control character; nothing was changed"
+    fi
+    [ -n "$2" ] || die "$1 is empty; nothing was changed"
+}
+
+write_host_config() {
+    case "$CANON_ENABLED" in
+        true|false) ;;
+        *) die "REIFY_CANON_ENABLED=$CANON_ENABLED is not true or false; nothing was changed" ;;
+    esac
+    case "$CANON_POLICY" in
+        shared|mixed|incremental) ;;
+        *) die "REIFY_CANON_POLICY=$CANON_POLICY is not shared, mixed or incremental; nothing was changed" ;;
+    esac
+    case "$STORE_URL" in
+        http://?*|https://?*) ;;
+        *) die "BUILD_CACHE_STORE_URL=$STORE_URL is not an http(s) URL; nothing was changed" ;;
+    esac
+    case "$FALLBACK_DIR" in
+        /*) ;;
+        *) die "REIFY_CANON_FALLBACK_DIR=$FALLBACK_DIR is not absolute; nothing was changed" ;;
+    esac
+    [[ "$FALLBACK_CAP" =~ ^[0-9]+[KMGT]?$ ]] \
+        || die "REIFY_CANON_FALLBACK_CAP=$FALLBACK_CAP is not a size like 50G; nothing was changed"
+    [ -f "$CREDENTIALS" ] || die "credentials file $CREDENTIALS is missing; nothing was changed"
+    local store_user store_password
+    store_user="$(credential RCLONE_USER)"
+    store_password="$(credential RCLONE_PASS)"
+    require_toml_safe "RCLONE_USER in $CREDENTIALS" "$store_user"
+    require_toml_safe "RCLONE_PASS in $CREDENTIALS" "$store_password"
+    require_toml_safe BUILD_CACHE_STORE_URL "$STORE_URL"
+    require_toml_safe REIFY_CANON_FALLBACK_DIR "$FALLBACK_DIR"
+
+    local dir tmp
+    dir="$(dirname "$HOST_CONFIG")"
+    (umask 077 && mkdir -p "$dir")
+    tmp="$(umask 077 && mktemp "$dir/.host.toml.XXXXXX")"
+    {
+        printf 'enabled = %s\n' "$CANON_ENABLED"
+        printf 'store_url = "%s"\n' "$STORE_URL"
+        printf 'store_user = "%s"\n' "$store_user"
+        printf 'store_password = "%s"\n' "$store_password"
+        printf 'fallback_dir = "%s"\n' "$FALLBACK_DIR"
+        printf 'fallback_cap = "%s"\n' "$FALLBACK_CAP"
+        printf 'policy = "%s"\n' "$CANON_POLICY"
+    } >"$tmp"
+    chmod 600 "$tmp"
+    mv -f "$tmp" "$HOST_CONFIG"
+    log "wrote $HOST_CONFIG: enabled=$CANON_ENABLED policy=$CANON_POLICY store_url=$STORE_URL"
+}
+
+check_host_config() {
+    "$HOST_PYTHON" -I - "$HOST_CONFIG" "$(random_hex 16)" <<'PY'
+import re
+import subprocess
+import sys
+import tomllib
+from pathlib import Path
+
+path, missing_key = Path(sys.argv[1]), sys.argv[2]
+KEYS = {"enabled", "store_url", "store_user", "store_password", "fallback_dir", "fallback_cap", "policy"}
+
+
+def get_status(url, credentials=None):
+    config = "" if credentials is None else f'user = "{credentials}"\n'
+    proc = subprocess.run(
+        ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "5", "-K", "-", url],
+        input=config, capture_output=True, text=True, check=False,
+    )
+    return proc.stdout.strip() or "000"
+
+
+def value_failures(config):
+    if not isinstance(config["enabled"], bool):
+        return [f"{path}: enabled is not a bool"]
+    strings = {key: config[key] for key in KEYS - {"enabled"}}
+    empty = [key for key, value in strings.items() if not isinstance(value, str) or not value]
+    if empty:
+        return [f"{path}: {key} is not a non-empty string" for key in sorted(empty)]
+    failures = []
+    if strings["policy"] not in ("shared", "mixed", "incremental"):
+        failures.append(f"{path}: policy {strings['policy']!r} is not shared, mixed or incremental")
+    if not re.fullmatch(r"https?://.+", strings["store_url"]):
+        failures.append(f"{path}: store_url {strings['store_url']!r} is not an http(s) URL")
+    if not strings["fallback_dir"].startswith("/"):
+        failures.append(f"{path}: fallback_dir {strings['fallback_dir']!r} is not absolute")
+    if not re.fullmatch(r"[0-9]+[KMGT]?", strings["fallback_cap"]):
+        failures.append(f"{path}: fallback_cap {strings['fallback_cap']!r} is not a size like 50G")
+    return failures
+
+
+def store_failures(config):
+    url = config["store_url"].rstrip("/") + "/" + missing_key
+    failures = []
+    anonymous = get_status(url)
+    if anonymous != "401":
+        failures.append(f"an unauthenticated GET of {url} answered {anonymous}, not 401")
+    authenticated = get_status(url, f"{config['store_user']}:{config['store_password']}")
+    if authenticated == "401":
+        failures.append(f"the store at {config['store_url']} rejected the credentials in {path} (401)")
+    elif authenticated != "404":
+        failures.append(f"an authenticated GET of {url} answered {authenticated}, not 404")
+    return failures
+
+
+def check():
+    if not path.is_file():
+        return [f"{path} is missing"]
+    mode = path.stat().st_mode & 0o777
+    failures = [] if mode == 0o600 else [f"{path} has mode {mode:04o}, not 0600"]
+    try:
+        config = tomllib.loads(path.read_text())
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        return [*failures, f"{path} is not valid TOML: {exc}"]
+    if set(config) != KEYS:
+        return [*failures, f"{path} has keys {sorted(config)}, not exactly {sorted(KEYS)}"]
+    invalid = value_failures(config)
+    return [*failures, *(invalid or store_failures(config))]
+
+
+problems = check()
+for problem in problems:
+    print(f"[install_build_cache_store] CHECK FAILED: {problem}", file=sys.stderr)
+sys.exit(1 if problems else 0)
+PY
+}
+
 # ── 3. apply ──────────────────────────────────────────────────────────────
 UNIT_CHANGED="no"
 write_unit() {
@@ -337,6 +497,17 @@ apply() {
     fi
     wait_for_store
 }
+
+if [ "$TARGET" = "host_config" ]; then
+    host_config_preflight
+    if [ "$MODE" = "check" ]; then
+        check_host_config || die "$HOST_CONFIG failed its check"
+        log "check OK: $HOST_CONFIG is valid and the store accepts its credentials"
+        exit 0
+    fi
+    write_host_config
+    exit 0
+fi
 
 preflight
 if [ "$MODE" = "check" ]; then
