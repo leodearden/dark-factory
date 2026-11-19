@@ -26,7 +26,7 @@ from _live_mcp_guard import (
     assert_no_live_attempts,
     install_live_mcp_guard,
 )
-from _tree_scan import TreePass, analyses_requested_by
+from _tree_pass_workers import TreePass, pass_requested_by
 
 # Insert this worktree's src directories at the front of sys.path so that
 # `import orchestrator` and `import shared` load the local (possibly modified)
@@ -315,9 +315,9 @@ def tree_pass(request: pytest.FixtureRequest) -> TreePass:
     carries the whole-tree family mark.  NOT prebuilt at collection time
     (unlike shared/tests/session_prebuild.py): every xdist worker collects
     every item, so a prebuild would make every worker parse.  ``_tree_scan``
-    holds the mechanism.
+    holds the mechanism; ``_tree_pass_workers`` runs it in worker processes.
     """
-    return TreePass.run(analyses_requested_by(request.session.items))
+    return pass_requested_by(request.session.items)
 
 
 @pytest.fixture
