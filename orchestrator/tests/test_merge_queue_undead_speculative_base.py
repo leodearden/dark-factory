@@ -30,6 +30,7 @@ from _merge_lane_fakes import (
     FakeVerifier,
     RecordingEscalations,
     VerifyScript,
+    hangs_until,
     healthy_verify_clock,
     lane_scene_config,
     lane_state,
@@ -197,6 +198,10 @@ class _Run:
     def local_trees_of(self, task_id: str) -> list[Tree]:
         return [tree for task, tree in self.local.trees if task == task_id]
 
+    def remote_trees_holding(self, name: str) -> list[Tree]:
+        """The trees 'head-host' verified that hold task *name*'s file."""
+        return [tree for tree in self.head_host.trees if f'{name}.txt' in tree]
+
     def first_merge_base(self, task_id: str) -> str:
         """The base_sha of *task_id*'s first speculative merge."""
         merges = [
@@ -244,15 +249,19 @@ async def _running(
         yield run
 
 
-async def _stage_t_on_verifying_s(run: _Run, s_entered: asyncio.Event) -> str:
-    """S merged on H and verifying on local, T merged on S and waiting for a
-    host; returns S's original merge commit, read off T's speculative merge."""
-    run.put('S')
+async def _stage_behind_a_local_verify(
+    run: _Run, verifying: str, entered: asyncio.Event, stacked: Sequence[str],
+) -> str:
+    """*verifying* merged on H and held on local, each of *stacked* merged
+    speculatively behind it and waiting for a host, T last and on S; returns
+    S's original merge commit, read off T's speculative merge."""
+    run.put(verifying)
     await wait_responsive(
-        s_entered.wait(), timeout=MERGE_GATE_BARRIER_TIMEOUT, label='S verifying on local',
+        entered.wait(), timeout=MERGE_GATE_BARRIER_TIMEOUT,
+        label=f'{verifying} verifying on local',
     )
-    run.put('T')
-    await run.awaiting_dispatch('T')
+    run.put(*stacked)
+    await run.awaiting_dispatch(*stacked)
     s_commit = run.first_merge_base('T')
     assert 'S.txt' in _tree_of(run.scene.repo, s_commit), 'T was not stacked on S'
     on_main = _git(run.scene.repo, 'merge-base', '--is-ancestor', s_commit, 'main')
@@ -280,7 +289,7 @@ class TestARequeuedPredecessorsCommitIsDead:
         async with _running(
             scene, ('H', 'S', 'T'), local_scripts={'S': [s_defers]}, speculation_depth=2,
         ) as run:
-            s_commit = await _stage_t_on_verifying_s(run, s_entered)
+            s_commit = await _stage_behind_a_local_verify(run, 'S', s_entered, ('T',))
 
             release_s.set()
             await _t_verified(run)
@@ -297,4 +306,79 @@ class TestARequeuedPredecessorsCommitIsDead:
             statuses = {name: await run.outcome_status(name) for name in ('H', 'T', 'S')}
             assert statuses == dict.fromkeys(('H', 'T', 'S'), 'done'), statuses
             assert _tree_of(scene.repo, 'main') == {'H.txt', 'S.txt', 'T.txt'}
+            assert run.divergence_alarms() == []
+
+
+class TestAnAbandonedPredecessorsCommitIsDead:
+    """A build whose request was abandoned left a commit that will never land."""
+
+    async def test_a_successor_of_a_predecessor_cancelled_mid_verify_never_verifies_on_its_commit(
+        self, tmp_path: Path,
+    ) -> None:
+        """S's waiter goes away while S verifies on local, so the lane drops
+        S and the local host frees while H still verifies. T, built on S's
+        commit, must be re-merged before it verifies."""
+        scene = _scene(tmp_path)
+        s_entered = asyncio.Event()
+        s_holds = hangs_until(asyncio.Event(), entered=s_entered)
+        async with _running(
+            scene, ('H', 'S', 'T'), local_scripts={'S': [s_holds]}, speculation_depth=2,
+        ) as run:
+            s_commit = await _stage_behind_a_local_verify(run, 'S', s_entered, ('T',))
+
+            run.reqs['S'].result.cancel()
+            await _t_verified(run)
+            assert all('S.txt' not in tree for tree in run.local_trees_of('T')), (
+                f"T verified on abandoned S's commit: {run.local_trees_of('T')}"
+            )
+            voids = run.dispatch_voids_of('T')
+            assert [(v['dead_link'], v['killer']) for v in voids] == [
+                (s_commit, {'site': 'abandoned', 'task_id': 'S'}),
+            ], voids
+            assert run.divergence_alarms() == []
+
+            run.release_h.set()
+            statuses = {name: await run.outcome_status(name) for name in ('H', 'T')}
+            assert statuses == dict.fromkeys(('H', 'T'), 'done'), statuses
+            assert _tree_of(scene.repo, 'main') == {'H.txt', 'T.txt'}
+            assert run.divergence_alarms() == []
+
+    async def test_a_successor_of_a_predecessor_cancelled_while_parked_never_verifies_on_its_commit(
+        self, tmp_path: Path,
+    ) -> None:
+        """X verifies on local behind H; S, built on X, and T, built on S,
+        wait for a host. S's waiter goes away, then H lands and frees
+        'head-host' while X still verifies. S is abandoned at its dispatch,
+        and T, dispatched on 'head-host', must be re-merged before it
+        verifies."""
+        scene = _scene(tmp_path)
+        x_entered, release_x = asyncio.Event(), asyncio.Event()
+        x_holds = hangs_until(release_x, entered=x_entered)
+        async with _running(
+            scene, ('H', 'X', 'S', 'T'), local_scripts={'X': [x_holds]}, speculation_depth=3,
+        ) as run:
+            s_commit = await _stage_behind_a_local_verify(run, 'X', x_entered, ('S', 'T'))
+
+            run.reqs['S'].result.cancel()
+            run.release_h.set()
+            assert await run.outcome_status('H') == 'done'
+            await _until(
+                lambda: bool(run.remote_trees_holding('T')), label="T's verify on head-host",
+            )
+            assert lane_state(run.lane, run.reqs['X'].request_id) == 'verifying', (
+                'precondition: T dispatched while X still verified'
+            )
+            assert all('S.txt' not in tree for tree in run.remote_trees_holding('T')), (
+                f"T verified on abandoned S's commit: {run.remote_trees_holding('T')}"
+            )
+            voids = run.dispatch_voids_of('T')
+            assert [(v['dead_link'], v['killer']) for v in voids] == [
+                (s_commit, {'site': 'abandoned', 'task_id': 'S'}),
+            ], voids
+            assert run.divergence_alarms() == []
+
+            release_x.set()
+            statuses = {name: await run.outcome_status(name) for name in ('X', 'T')}
+            assert statuses == dict.fromkeys(('X', 'T'), 'done'), statuses
+            assert _tree_of(scene.repo, 'main') == {'H.txt', 'X.txt', 'T.txt'}
             assert run.divergence_alarms() == []
