@@ -115,6 +115,42 @@ async def test_with_nothing_to_hold_no_holder_is_minted(stack: Stack) -> None:
     ]
 
 
+async def _seed_depending(stack: Stack, title: str, depends_on: str, **fields: str) -> str:
+    dependent = await stack.seed(title, {}, **fields)
+    await stack.backend.add_dependency(dependent, depends_on, stack.root)
+    return dependent
+
+
+@pytest.mark.asyncio
+async def test_the_backfill_leaves_unheld_every_followup_an_unheld_task_waits_on(stack: Stack) -> None:
+    def low_followup(title: str) -> dict[str, Any]:
+        return {'title': title, 'metadata': dict(_FOLLOWUP), 'priority': 'low'}
+
+    x, x2, x5, a, b, x3, x4 = [
+        await stack.seed(**low_followup(f'Low follow-up {name}'))
+        for name in ('X', 'X2', 'X5', 'A', 'B', 'X3', 'X4')
+    ]
+    await _seed_depending(stack, 'Pending task waiting on X', x)
+    await stack.backend.add_dependency(x, x2, stack.root)
+    await _seed_depending(stack, 'In-progress task waiting on X5', x5, status='in-progress')
+    await stack.backend.add_dependency(a, b, stack.root)
+    await _seed_depending(stack, 'Deferred task on X3', x3, status='deferred')
+    await _seed_depending(stack, 'Done task on X4', x4, status='done')
+    waited_on_before = {task_id: await _row(stack, task_id) for task_id in (x, x2, x5)}
+
+    count = await stack.interceptor.backfill_followup_holds(stack.root)
+
+    assert count == 4
+    [holder] = await _holder_ids(stack)
+    for task_id in (a, b, x3, x4):
+        row = await _row(stack, task_id)
+        assert holder in _dependencies(row), task_id
+        assert str(row['metadata'][FOLLOWUP_HOLD_METADATA_KEY]['holder']) == holder, task_id
+    for task_id, before in waited_on_before.items():
+        assert await _row(stack, task_id) == before, task_id
+    assert [event['count'] for event in await stack.events(EventType.followup_hold_backfilled)] == [4]
+
+
 def test_the_backfill_is_enabled_by_default() -> None:
     assert FusedMemoryConfig().followup_hold.backfill_enabled is True
 
