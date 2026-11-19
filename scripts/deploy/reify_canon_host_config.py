@@ -43,7 +43,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import _checkout as _checkout
-from shared.safe_io import atomic_write_text
+
+from shared import safe_io
 
 EXIT_OK = 0
 EXIT_FAILED = 1
@@ -161,7 +162,7 @@ def _write_private(path: Path, text: str) -> None:
     """Write *text* to *path* atomically, mode 0600, creating missing directories 0700."""
     os.umask(0o077)
     path.parent.mkdir(parents=True, exist_ok=True)
-    atomic_write_text(path, text, mode=0o600)
+    safe_io.atomic_write_text(path, text, mode=0o600)
 
 
 def _log_transitions(existing: Mapping[str, object], config: Mapping[str, object]) -> None:
