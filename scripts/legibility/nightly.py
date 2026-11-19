@@ -1430,12 +1430,11 @@ def _uncoded(
     cfg: LegibilityConfig, sample: sampling.SampleResult, coded: frozenset[str], target_date: date,
 ) -> list[sampling.ScoredRecord]:
     """*sample*'s selection, in order, without the sessions in *coded*."""
-    if not coded:
-        return list(sample.selected)
     to_code = [record for record in sample.selected if record.session_id not in coded]
     if len(to_code) < len(sample.selected):
         logger.info(
-            'legibility trickle: project=%s date=%s %d of %d selected session(s) already coded',
+            'legibility trickle: project=%s date=%s %d of %d selected session(s) '
+            'already-coded, not re-coded',
             cfg.project_id, target_date.isoformat(),
             len(sample.selected) - len(to_code), len(sample.selected),
         )
@@ -1483,9 +1482,9 @@ def _run_configured_nightly(
     try:
         rendered: dict[tuple, str] = {}
         skips = _ledger_skips(cfg, pass_kind, target_date)
-        sample = _select_stage(
-            cfg, seams.selector, projects_root, target_date, skips.before_sampling,
-            rendered=rendered,
+        sample = seams.selector(
+            cfg, projects_root if projects_root is not None else DEFAULT_PROJECTS_ROOT,
+            target_date, rendered=rendered, skip_sessions=skips.before_sampling,
         )
         _report_sample_outcome(cfg, sample, target_date, raise_alarm=raise_alarm)
         end = _code_and_land(
@@ -1521,23 +1520,6 @@ def _crashed(exc: Exception, raise_alarm: _RaiseAlarm) -> _NightEnd:
     summary = f'legibility trickle run crashed: {type(exc).__name__}: {exc}'
     raise_alarm(AlarmKind.CRASHED, summary, ''.join(traceback.format_exception(exc)))
     return _NightEnd(outcome=trickle_state.RunOutcome.FAILED, reason=summary)
-
-
-def _select_stage(
-    cfg: LegibilityConfig,
-    selector: Selector,
-    projects_root: Path | str | None,
-    target_date: date,
-    skip_sessions: frozenset[str],
-    *,
-    rendered: dict[tuple, str],
-) -> sampling.SampleResult:
-    """The night's sample, drawn without the sessions in *skip_sessions*.
-    *rendered* is the render cache the digest stage reuses."""
-    return selector(
-        cfg, projects_root if projects_root is not None else DEFAULT_PROJECTS_ROOT,
-        target_date, rendered=rendered, skip_sessions=skip_sessions,
-    )
 
 
 def _code_and_land(

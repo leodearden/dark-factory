@@ -32,8 +32,10 @@ from legibility import (
     census_trigger,
     check_trickle_health,
     codebook,
+    detectors,
     digest,
     invariants,
+    inventory,
     layout,
     nightly,
     plan_deviation_census,
@@ -5871,7 +5873,7 @@ class TestScheduledPassOverAReachedDate:
     does not hold."""
 
     def test_a_scheduled_pass_re_targeting_a_reached_date_skips_ledgered_sessions(
-        self, tmp_path,
+        self, tmp_path, caplog,
     ):
         runner = _NightRunner(tmp_path)
         first: list[str] = []
@@ -5879,11 +5881,39 @@ class TestScheduledPassOverAReachedDate:
         assert len(first) == 1
         again: list[str] = []
 
-        results = runner.scheduled_night(13, 'productive', invoke=_counting_invoke(again))
+        with caplog.at_level(logging.INFO, logger='legibility.nightly'):
+            results = runner.scheduled_night(13, 'productive', invoke=_counting_invoke(again))
 
         assert again == []
         assert [result.exit_code for result in results] == [0] * len(results)
         assert runner.recorded()['last_scheduled_target_date'] == '2026-07-13'
+        skipped_lines = [
+            record.getMessage() for record in caplog.records
+            if record.levelno == logging.INFO and 'already-coded' in record.getMessage()
+        ]
+        assert len(skipped_lines) == 1
+        assert ' 1 of 1 selected ' in skipped_lines[0]
+
+    def test_a_re_targeting_pass_codes_the_selected_sessions_the_catch_up_did_not_land(
+        self, tmp_path,
+    ):
+        runner = _NightRunner(tmp_path)
+        _write_transcript(
+            runner.projects_root / _encode_cwd(runner.work_cwd) / 'unlanded-13.jsonl',
+            cwd=runner.work_cwd, timestamp='2026-07-13T11:00:00Z',
+            session_id='unlanded-13',
+            user_text='why does the merge lane keep parking my task',
+        )
+        runner.scheduled_night(13, 'capped')
+        _ledger_census_coding('session-13')
+        prompts: list[str] = []
+
+        runner.scheduled_night(13, 'productive', invoke=_counting_invoke(prompts))
+
+        [prompt] = prompts
+        assert 'unlanded-13' in prompt
+        assert 'session-13' not in prompt
+        assert runner.recorded()['counters']['selected_count'] == 2
 
     def test_a_scheduled_pass_past_the_cursor_still_codes_ledgered_sessions(
         self, tmp_path,
@@ -5966,6 +5996,20 @@ def _sample(*, selected=(), zero_signal_dropped=0, dedupe_collapsed=0,
             zero_signal_dropped + dedupe_collapsed + below_sampling_cut
             + budget_skipped + len(selected)
         ),
+    )
+
+
+def _scored_record(session_id: str) -> nightly.sampling.ScoredRecord:
+    """A minimal signal-bearing record of the 2026-07-13 night, named
+    *session_id*."""
+    return nightly.sampling.ScoredRecord(
+        session=inventory.SessionRecord(
+            path=Path(f'/projects/-work/{session_id}.jsonl'), encoded_dir='-work',
+            cwd='/work', date=date(2026, 7, 13), size_bytes=1000,
+        ),
+        stratum=detectors.AgentClass.INTERACTIVE,
+        counts=nightly.sampling.SignalCounts.of(tool_error=1),
+        session_id=session_id,
     )
 
 
@@ -6100,7 +6144,7 @@ def test_report_sample_outcome_partial_truncation_stays_at_info(tmp_path, caplog
     designed, never an absence."""
     with caplog.at_level('INFO', logger='legibility.nightly'):
         result, posted = _run_sampled_night(
-            tmp_path, _sample(selected=['digest'], budget_skipped=2),
+            tmp_path, _sample(selected=[_scored_record('session-13')], budget_skipped=2),
         )
 
     assert result.alarms == ()
