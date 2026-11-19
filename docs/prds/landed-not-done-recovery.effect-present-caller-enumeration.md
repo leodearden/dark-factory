@@ -275,3 +275,54 @@ tasks 3103 and 3916.
   emitted spelling, no escalation renders `'Unrecognized reason code'` into an
   L1 body. Flipping the emitted value is ε's edit, made together with
   repointing the consumers.
+
+## 7. What ε repointed, and which sites keep the legacy policy (task 4648)
+
+ε re-pointed sites and changed no producer. Measured on task 4648's tree. Each
+verdict's `LandingMethod` says which policy decided it: `patch_id` is the
+non-decaying contract, while `merge_marker` and `citation` (or
+`content_equivalence` when DISCOVERY's citation-miss fallback accepts) are the
+legacy effect-present policy. The divergence below is deliberate, and each row
+is pinned by a test so it cannot drift silently.
+
+| Site (`path::symbol`) | Producer | `LandingMethod` | Ruling and why | Pinning test |
+|---|---|---|---|---|
+| `orchestrator/src/orchestrator/harness.py::Harness._already_landed_dispatch_gate`, ancestry arm (live tip is an ancestor of main) | `branch_work_landed` | `patch_id` | **IN**, repointed. D1 names the dispatch gate. A reject files no escalation; it is recorded as a `landing_evidence_rejected` row. | `orchestrator/tests/test_already_landed_gate_patch_id.py::TestAncestryArmDecidesByPatchId` |
+| the same function, off-main-tip arm (live tip is not an ancestor of main) | `branch_work_landed` | `patch_id` | **IN**, repointed. The `branch_content_in_main` entry condition (§2, site 4) is deleted, so every live non-ancestor tip is now examined. `no_attribution` escalates; every other reject is recorded at `LandingRejectSite.already_landed_gate_off_main_tip`. | `orchestrator/tests/test_already_landed_gate_patch_id.py::TestOffMainTipArmDecidesByPatchId`; the escalation is pinned by `orchestrator/tests/test_harness_already_landed_gate_wiring.py::TestAlreadyLandedDispatchGateContentEquivalence` |
+| the same function, branch-deleted marker arm | `validate_landing_evidence` CANDIDATE | `merge_marker` | **Kept.** A deleted ref leaves no live tip for `branch_work_landed` to judge, and the marker is the only evidence there is. | `orchestrator/tests/test_harness_already_landed_gate_wiring.py::TestAlreadyLandedDispatchGateMarkerPath::test_the_marker_arm_keeps_the_merge_marker_policy` |
+| `escalation/src/escalation/git_authority.py::_ancestor_arm` → `::_branch_work_landed_arm` (Tier-3.5) | `branch_work_landed` | `patch_id` | **IN**, repointed. D1 names Tier-3.5. The degeneracy guard and the `''` citation opt-out still run first. | `escalation/tests/test_git_authority.py::TestProbeLandingAncestorArmDecidesByBranchWorkLanded` |
+| `escalation/src/escalation/git_authority.py::_branch_work_landed_arm` (Tier-3.5, live tip not an ancestor of main) | `branch_work_landed` | `patch_id` | **IN**, already repointed by task 4887. | `escalation/tests/test_git_authority.py::TestProbeLandingPatchIdArm` |
+| `escalation/src/escalation/git_authority.py::_marker_arm` → `::_evidence_verdict` (Tier-3.5) | `validate_landing_evidence` CANDIDATE | `merge_marker` | **Kept**, for the same reason as the gate's marker arm. | `escalation/tests/test_git_authority.py::TestProbeLandingMarkerArmKeepsTheCandidatePolicy` |
+| `orchestrator/src/orchestrator/harness.py::Harness._reconcile_one_stranded` | `validate_landing_evidence` CANDIDATE | `merge_marker` | **OUT** per §4. | `orchestrator/tests/test_reconcile_stranded.py::TestReconcileSweepKeepsTheMergeMarkerPolicy` |
+| Coalesce re-drive, site 8: `orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker._redrive_coalesce_members` → `orchestrator/src/orchestrator/merge_lane/member_redrive.py::MemberRedriver._redrive_on_main` | `validate_landing_evidence` DISCOVERY | `citation` | **OUT** per §4. | `orchestrator/tests/test_merge_lane_member_redrive.py::TestOutcomes::test_the_redrive_keeps_the_citation_policy` |
+| `orchestrator/src/orchestrator/workflow.py::TaskWorkflow._discovered_landing_sha` (task 4704, added after §1 was measured) | `validate_landing_evidence` DISCOVERY | `citation` | **OUT.** It is a workflow recovery guard that decides whether a fallback arm may stamp. It is neither a dispatch-gate site nor a Tier-3.5 site. | Behaviour only: `orchestrator/tests/test_workflow_recovery_landing_evidence.py`. No test pins its method. |
+
+Three other facts changed under this record:
+
+- **Tier-3.5 has moved.** Its arms now live in
+  `escalation/src/escalation/git_authority.py` (task 4887), and
+  `escalation/src/escalation/server.py::merge_status` only renders a
+  `GitAuthorityOutcome`. §4's `merge_status` row predates that extraction.
+  For the live-ref arms it is superseded by the rows above: D1 names
+  Tier-3.5, and esc-4648-3 (ruling A) confirmed the repoint.
+- **`branch_content_in_main` has no landing-detection caller left.** Site 4 is
+  deleted. Two production callers remain:
+  - `orchestrator/src/orchestrator/merge_lane/landing_evidence.py::_content_equivalence_anchor`
+    (task 4862) is DISCOVERY mode's citation-miss fallback. It is part of the
+    legacy policy, so it inherits each DISCOVERY caller's ruling above.
+  - `orchestrator/src/orchestrator/merge_lane/unmeasured_delivery.py::_sibling_own_work`
+    (task 3918) is **OUT**. It is a merge-lane sibling filter, not a
+    landing-detection site.
+- **`validate_landing_evidence` now has five production call expressions, down
+  from seven.** Its public signature is unchanged. The five are the gate's
+  marker arm, the stranded sweep, the coalesce re-drive, the workflow guard and
+  `git_authority.py::_evidence_verdict`. Every one passes `delivered_checks`
+  except the coalesce re-drive, which is task 4497's site. Tasks 5297 and 4500
+  should re-measure against five, not seven.
+
+**Why the repoint is worth its divergence.** Cite §5, not the PRD's
+95.5% / 0.04%. Effect-present's precision is ≈0.06–0.12%, but the
+load-bearing argument is its **monotonic** false-negative mode: it turns a
+transient miss into a permanent loss at a site whose `False` re-dispatches
+landed work. The sites kept on the legacy policy either have no live tip to
+judge (the two marker arms) or sit outside D1's scope limit (§4).
