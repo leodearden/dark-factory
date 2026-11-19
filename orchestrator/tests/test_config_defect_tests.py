@@ -70,7 +70,7 @@ class TestLoad:
 class TestValidation:
     def test_unknown_mode_names_the_three_modes(self):
         with pytest.raises(ValidationError) as excinfo:
-            DefectTestsConfig(mode='sometimes')  # type: ignore[arg-type]
+            DefectTestsConfig.model_validate({'mode': 'sometimes'})
         message = str(excinfo.value)
         for mode in ('off', 'shadow', 'enforce'):
             assert mode in message
