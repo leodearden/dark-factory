@@ -472,7 +472,7 @@ def _force_differential_confirm(monkeypatch: pytest.MonkeyPatch) -> None:
     writes on a confirmation
     (``orchestrator/src/orchestrator/landing_evidence.py::_delivered_checks_differential``)
     and takes ``**kwargs`` because the DISCOVERY arm passes an extra
-    ``anchor_is_branch_tip`` keyword the CANDIDATE arm does not.
+    ``branch_tip`` keyword the CANDIDATE arm does not.
     """
     async def _confirm(
         git_ops: Any, effect_check_sha: str, delivered_checks: Any,

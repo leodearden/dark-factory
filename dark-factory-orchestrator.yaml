@@ -1692,11 +1692,14 @@ git:
     - "dark-factory-orchestrator.yaml"
 
   offline_lane_commands:
+    # `uv run` binds pytest and python to THIS worktree's own venv. A bare
+    # name resolved through the daemon's PATH, i.e. main's .venv, which
+    # imports main's editable source rather than the commit under test.
     - name: qdrant-integration
-      command: "pytest -m integration"
+      command: "uv run pytest -m integration"
       cwd: "fused-memory"
       fix_task_priority: "medium"
-      outage_probe: "python scripts/lane_dependency_probe.py"
+      outage_probe: "uv run python scripts/lane_dependency_probe.py"
     # PRD §11 q4 RE-DECIDED (task 3349, 2026-08-01): the ported warm-lane bash
     # bucket moves OFF the verify hot path and onto this lane — the escape
     # plans/warm-lane-infra-repatriation-prd.md documented for exactly this
@@ -1738,7 +1741,7 @@ git:
     # originals on this suite's green, so a red here must not sit in a
     # low-priority queue.
     - name: warm-lane-bash
-      command: "pytest -m warm_lane_bash"
+      command: "uv run pytest -m warm_lane_bash"
       cwd: "orchestrator"
       fix_task_priority: "high"
 
@@ -1808,7 +1811,7 @@ psi_admission:           # PRD plans/load-throttle-harmonisation-prd.md §6.2 (2
 # Since task 8528 chain_cap is the kill switch only: any positive value turns
 # chains on, and 6 is not a bound. merge_deep.depth_table sets the depth from
 # the rolling per-item pass estimate (plans/merge-lane-policy-prd.md D6/D7); it
-# is left at the code default, [[0.93, 8], [0.85, 4], [0.75, 2]], so no key here.
+# is left at the code default (depth 3 at 0.75 up to depth 12 at 0.992), so no key here.
 # STOP RULE: chain_cap: 0 if gates per landed item exceed 1.0, or on any
 # chain-attributed red main or rebase-conflict cluster. Green tier: reload_config
 # applies a change without a restart. The coalesce test this flip once redded
