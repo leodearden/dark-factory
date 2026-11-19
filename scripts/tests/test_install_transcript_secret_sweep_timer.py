@@ -322,6 +322,7 @@ def test_the_wrapper_forwards_its_arguments(tmp_path):
     completed, recorded = _run_wrapper(tmp_path, '--dry-run', '--host-configs-dir', '/x')
 
     assert completed.returncode == 0, completed.stderr
+    assert recorded is not None, completed.stderr
     assert recorded['argv'] == [
         f'{tmp_path / "repo"}/scripts/transcript_secret_sweep.py', '--dry-run', '--host-configs-dir', '/x',
     ]
