@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import functools
 import json
-import os
 import re
 import shutil
 from collections.abc import Callable, Mapping
@@ -17,9 +16,10 @@ from typing import Any
 
 import pytest
 from shared.cap_markers import REAL_CLI_CAP_HIT_MESSAGES, looks_like_capacity_banner
+from shared.claude_endpoint import ClaudeEndpoint
 from shared.cli_invoke import AgentResult, invoke_with_cap_retry, no_mcp_servers_config
+from shared.cli_proxy import CLIENT_ENV_PATH, proxy_endpoint
 from shared.neutral_cwd import neutral_cli_cwd
-from shared.secret_env import AGENT_CREDENTIAL_VAR
 
 from fused_memory.config.schema import LinkHealConfig
 from fused_memory.maintenance import link_adjudicator
@@ -670,25 +670,22 @@ _LIVE_PAIR = LinkPair(
     parent_text='git stash is unsafe here because the stash stack is shared across all worktrees.',
 )
 
-_CREDENTIALED = {AGENT_CREDENTIAL_VAR: 'test-setup-token'}
+_PROXY = ClaudeEndpoint(base_url='http://127.0.0.1:8317', auth_token='proxy-key')
 
 
-async def _live_edge_verdict(invoke: Invoke, environ: Mapping[str, str]) -> LinkVerdict:
-    """The live pair's verdict; no setup token skips, capacity skips and auth reds.
+async def _live_edge_verdict(invoke: Invoke, proxy: ClaudeEndpoint | None) -> LinkVerdict:
+    """The live pair's verdict, asked through the host's CLI proxy, never an operator's own login.
 
-    The capacity and auth policy is shared/tests/_capacity_skip.py's.
+    No proxy skips before any call. A capacity banner skips and an auth failure stays red, per
+    shared/tests/_capacity_skip.py.
     """
-    token = environ.get(AGENT_CREDENTIAL_VAR)
-    if not token:
-        pytest.skip(
-            f'the live edge needs a Claude setup token in {AGENT_CREDENTIAL_VAR}, '
-            'not the ambient claude.ai login',
-        )
-    credentialed = functools.partial(invoke, oauth_token=token)
+    if proxy is None:
+        pytest.skip(f'the live edge runs through the CLI proxy, and this host has no {CLIENT_ENV_PATH}')
+    proxied = functools.partial(invoke, endpoint=proxy)
     results: list[AgentResult] = []
 
     async def recording(**kwargs: Any) -> AgentResult:
-        result = await credentialed(**kwargs)
+        result = await proxied(**kwargs)
         results.append(result)
         return result
 
@@ -710,13 +707,13 @@ class TestTheLiveEdgeCapacityGuard:
         invoke = FakeInvoke(AgentResult(success=False, output=banner))
 
         with pytest.raises(pytest.skip.Exception, match=re.escape(banner)):
-            await _live_edge_verdict(invoke, _CREDENTIALED)
+            await _live_edge_verdict(invoke, _PROXY)
 
     @pytest.mark.asyncio
     async def test_an_auth_failure_is_not_skipped(self):
         invoke = FakeInvoke(AgentResult(success=False, output='Not logged in · Please run /login'))
 
-        verdict = await _live_edge_verdict(invoke, _CREDENTIALED)
+        verdict = await _live_edge_verdict(invoke, _PROXY)
 
         assert verdict.failed
         assert verdict.failure is AdjudicationFailure.CLI_FAILED
@@ -725,40 +722,30 @@ class TestTheLiveEdgeCapacityGuard:
     async def test_a_successful_reply_is_returned_as_is(self):
         invoke = FakeInvoke(_ok(structured_output=_ONE_SAME_ANSWER))
 
-        verdict = await _live_edge_verdict(invoke, _CREDENTIALED)
+        verdict = await _live_edge_verdict(invoke, _PROXY)
 
         assert not verdict.failed
         assert verdict.verdict is Verdict.SAME
 
 
-class TestTheLiveEdgeCredentialGuard:
+class TestTheLiveEdgeRoute:
     @pytest.mark.asyncio
-    async def test_no_setup_token_skips_before_any_call(self):
+    async def test_no_proxy_skips_before_any_call(self):
         invoke = FakeInvoke(_ok())
 
-        with pytest.raises(pytest.skip.Exception, match=re.escape(AGENT_CREDENTIAL_VAR)):
-            await _live_edge_verdict(invoke, {})
+        with pytest.raises(pytest.skip.Exception, match=re.escape(str(CLIENT_ENV_PATH))):
+            await _live_edge_verdict(invoke, None)
 
         assert invoke.calls == []
 
     @pytest.mark.asyncio
-    async def test_an_empty_setup_token_counts_as_absent(self):
-        invoke = FakeInvoke(_ok())
-
-        with pytest.raises(pytest.skip.Exception, match=re.escape(AGENT_CREDENTIAL_VAR)):
-            await _live_edge_verdict(invoke, {AGENT_CREDENTIAL_VAR: ''})
-
-        assert invoke.calls == []
-
-    @pytest.mark.asyncio
-    async def test_the_setup_token_reaches_the_cli_call(self):
+    async def test_the_proxy_is_the_endpoint_of_every_call(self):
         invoke = FakeInvoke(_ok(structured_output=_ONE_SAME_ANSWER))
 
-        verdict = await _live_edge_verdict(invoke, {AGENT_CREDENTIAL_VAR: 'tok-1'})
+        await _live_edge_verdict(invoke, _PROXY)
 
-        assert not verdict.failed
-        (call,) = invoke.calls
-        assert call['oauth_token'] == 'tok-1'
+        assert [call['endpoint'] for call in invoke.calls] == [_PROXY]
+        assert all('oauth_token' not in call for call in invoke.calls)
 
 
 @pytest.mark.integration
@@ -767,7 +754,7 @@ class TestTheLiveEdge:
     @pytest.mark.asyncio
     @pytest.mark.timeout(600)
     async def test_a_restatement_gets_a_verdict_from_the_real_cli(self):
-        verdict = await _live_edge_verdict(invoke_with_cap_retry, os.environ)
+        verdict = await _live_edge_verdict(invoke_with_cap_retry, proxy_endpoint())
 
         assert not verdict.failed, verdict
         assert isinstance(verdict.verdict, Verdict)
