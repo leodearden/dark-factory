@@ -9,14 +9,15 @@ from pathlib import Path
 
 import pytest
 
+import shared.claude_executable as claude_executable_module
 from shared.claude_executable import (
     DEFAULT_CLAUDE_EXECUTABLE,
     ClaudeLaunchSurface,
     claude_executable,
 )
 
-# The LOCAL tree's module, run by path exactly as skills/spawn/spawn-claude.sh runs it.
-_MODULE_PATH = Path(__file__).resolve().parents[1] / 'src' / 'shared' / 'claude_executable.py'
+# The module under test, run by path exactly as skills/spawn/spawn-claude.sh runs it.
+_MODULE_PATH = Path(claude_executable_module.__file__).resolve()
 
 _OWN_VAR = {
     ClaudeLaunchSurface.FLEET: 'CLAUDE_BINARY',
