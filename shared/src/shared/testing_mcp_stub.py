@@ -10,7 +10,8 @@ in each way a client must not mistake for success (:class:`StubAnswer`), and
 its first *unavailable_tool_calls* requests can be answered 503, as a gateway
 answers while the server behind it restarts. A *tools* handler can answer each
 OK ``tools/call`` by tool name and arguments, so a fake backend is served over
-the socket.
+the socket. :func:`tool_reply_body` is that OK answer's JSON-RPC body, for a
+client-side fault injector whose one good reply cannot come from a socket.
 
 Real sockets rather than patching a client's modules: the session header, path
 and Accept a client sends are wire facts the server observes in
@@ -33,7 +34,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import MappingProxyType, TracebackType
 from typing import Any
 
-__all__ = ['RecordedRequest', 'StubAnswer', 'StubMcpServer', 'ToolHandler']
+__all__ = ['RecordedRequest', 'StubAnswer', 'StubMcpServer', 'ToolHandler', 'tool_reply_body']
 
 _ENDPOINT = '/mcp'
 _INVALID_REQUEST = -32600
@@ -73,8 +74,14 @@ class _Reply:
     session_id: str | None = None
 
 
+def _rpc_body(request_id: Any, *, result: dict | None = None, error: dict | None = None) -> dict:
+    if error is not None:
+        return {'jsonrpc': '2.0', 'id': request_id, 'error': error}
+    return {'jsonrpc': '2.0', 'id': request_id, 'result': result}
+
+
 def _rpc_error(status: int, message: str, code: int = _INVALID_REQUEST) -> _Reply:
-    body = {'jsonrpc': '2.0', 'id': 'server-error', 'error': {'code': code, 'message': message}}
+    body = _rpc_body('server-error', error={'code': code, 'message': message})
     return _Reply(status, json.dumps(body).encode(), 'application/json')
 
 
@@ -88,6 +95,11 @@ def _tool_ok(payload_text: str) -> dict:
 
 def _tool_error(text: str) -> dict:
     return {'content': [{'type': 'text', 'text': text}], 'isError': True}
+
+
+def tool_reply_body(payload: Mapping[str, Any], *, request_id: Any = 1) -> dict:
+    """The JSON-RPC body an MCP server answers an OK ``tools/call`` with when the tool replies *payload*."""
+    return _rpc_body(request_id, result=_tool_ok(json.dumps(dict(payload))))
 
 
 ToolHandler = Callable[[str, Mapping[str, Any]], Mapping[str, Any]]
@@ -322,12 +334,7 @@ class StubMcpServer:
         *,
         error: dict | None = None,
     ) -> _Reply:
-        rpc: dict[str, Any] = {'jsonrpc': '2.0', 'id': message['id']}
-        if error is not None:
-            rpc['error'] = error
-        else:
-            rpc['result'] = result
-        text = json.dumps(rpc)
+        text = json.dumps(_rpc_body(message['id'], result=result, error=error))
         if self._stateful:
             frame = f'event: message\ndata: {text}\n\n'
             return _Reply(200, frame.encode(), 'text/event-stream', session_id=session_id)
