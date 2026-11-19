@@ -36,6 +36,8 @@ class DeadBaseSite(StrEnum):
     CHAIN_RELEASED = 'chain_released'
     #: A built item whose request went back to the queue to merge afresh.
     REQUEUED = 'requeued'
+    #: A built item whose request was abandoned (its waiter gone) before it landed.
+    ABANDONED = 'abandoned'
 
 
 class VoidPoint(StrEnum):

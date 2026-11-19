@@ -9050,8 +9050,10 @@ class SpeculativeMergeWorker:
     async def _drop_from_verify(
         self, item: RealMergeItem, entry_slot: InflightEntrySlot | None,
     ) -> None:
-        """Vacate the entry as DROPPED, then retire *item*'s request_id."""
+        """Vacate the entry as DROPPED, record its commit abandoned, then
+        retire *item*'s request_id."""
         await self._vacate_inflight_entry(entry_slot, InflightStatus.DROPPED)
+        self._record_abandoned_item(item)
         self._retire_item(item.request.request_id)
 
     async def _bench_from_verify(
@@ -10707,7 +10709,8 @@ class SpeculativeMergeWorker:
         (see :meth:`_chain_dead_link`).  Called at every invalidation site
         (head-failure cascade, dispatch chain-invalidation discard, adoption-time
         void, RUNNER_UNAVAILABLE re-merge, rebased landing, requeue of a built
-        item via :meth:`_requeue_built_item`) so a built-awaiting-host
+        item via :meth:`_requeue_built_item`, abandon of one via
+        :meth:`_record_abandoned_item`) so a built-awaiting-host
         straggler that the cascade missed is still caught at its next dispatch.
         *killer* names that site; the ledger keeps a commit's first killer.
         Each commit is then handed to the merger's re-anchor hook,
@@ -20065,7 +20068,7 @@ class SpeculativeMergeWorker:
             # gate re-verify is this verify (task 8525).
             if self._request_abandoned(req):
                 await self._release_or_cleanup(merge_wt, spec_warm=_vr_spec_warm)
-                self._record_unlanded_rebased_head(item)
+                self._record_abandoned_item(item)
                 self._retire_item(req.request_id)
                 return False
 
@@ -20606,6 +20609,17 @@ class SpeculativeMergeWorker:
         if isinstance(item, RealMergeItem) and item.gate_rebase_of is not None:
             self._record_item_commit_dead(item, DeadBaseSite.GATE_UNLANDED)
 
+    def _record_abandoned_item(self, item: SpeculativeItem) -> None:
+        """*item*'s request was abandoned, so the commit it built will never land.
+
+        A rebased head keeps its GATE_UNLANDED killer, since the ledger keeps
+        the first; any other build is recorded ABANDONED.  Either way a
+        successor stacked on it is re-merged at its dispatch (INV-3) and a
+        merger holding it re-anchors (D2).
+        """
+        self._record_unlanded_rebased_head(item)
+        self._record_item_commit_dead(item, DeadBaseSite.ABANDONED)
+
     async def _repark_gate_successors(self, gate: PendingGate) -> list[SpeculativeItem]:
         """Tear down every in-flight successor of a head re-verified as a dispatch.
 
@@ -20866,7 +20880,7 @@ class SpeculativeMergeWorker:
                 with contextlib.suppress(BaseException):
                     await self._cleanup_owned_merge_worktree(_abandon_wt)
             self._remerge_occurred = False  # abandon → reset chain flag
-            self._record_unlanded_rebased_head(item)
+            self._record_abandoned_item(item)
             # MQ-reliability kappa (task 2169): retire at this, the item's
             # own return site (mirrors the REQUEUED_PREDISPATCH branch's
             # own _note_requeue call below) — no Future is ever resolved on
