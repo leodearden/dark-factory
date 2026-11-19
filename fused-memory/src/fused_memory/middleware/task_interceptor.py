@@ -110,10 +110,15 @@ from fused_memory.middleware.done_provenance import (
     validate_done_provenance,
 )
 from fused_memory.middleware.followup_hold import (
+    HOLDER_GATE_KEYS,
     FollowupHolders,
+    HolderProtection,
     hold_at_create,
     hold_scope,
     is_holder,
+    protected_status,
+    protected_update,
+    protection_refusal,
 )
 from fused_memory.middleware.live_task_write_guard import (
     FileFindingFn,
@@ -1391,6 +1396,7 @@ class TaskInterceptor:
         expected_stamped_at: str | None = None,
         restamp_only: bool = False,
         scope: StatusWriteScope = StatusWriteScope.STATUS,
+        release_holder: bool = False,
     ) -> dict:
         """Proxy to Taskmaster, then fire-and-forget targeted reconciliation if triggered.
 
@@ -1423,6 +1429,10 @@ class TaskInterceptor:
         metadata.deferral arguments of the MCP tool; ``scope`` is internal,
         passed only by ``commit_planning``. ``deferral_gate`` decides them:
         its row-independent checks run once here, before the write lock.
+
+        ``release_holder`` lets a follow-up holder leave ``pending`` for a settled status
+        (:func:`fused_memory.middleware.followup_hold.protected_status`); it is ignored on any
+        other task.
         """
         if (hit := await self._idempotency_replay(client_op_id)) is not None:
             return hit
@@ -1478,6 +1488,7 @@ class TaskInterceptor:
                     agent_id=agent_id,
                     pending_since_now=batch_pending_since,
                     deferral_call=deferral_call,
+                    release_holder=release_holder,
                 )
                 results.append({'task_id': tid, 'result': per_result})
             all_ok = all(
@@ -1499,6 +1510,7 @@ class TaskInterceptor:
             heartbeat_at=heartbeat_at,
             agent_id=agent_id,
             deferral_call=deferral_call,
+            release_holder=release_holder,
         )
         await self._idempotency_record(client_op_id, 'set_task_status', result)
         return result
@@ -1535,6 +1547,7 @@ class TaskInterceptor:
         agent_id: str | None = None,
         pending_since_now: str | None = None,
         deferral_call: deferral_gate.DeferralCall,
+        release_holder: bool = False,
     ) -> dict:
         """Single-id status transition with all gates + event emission.
 
@@ -1757,6 +1770,11 @@ class TaskInterceptor:
                     )
                     return repair
                 return {'success': True, 'no_op': True, 'task_id': task_id}
+
+            if (protection := protected_status(before, status, release_holder=release_holder)) is not None:
+                return await self._refuse_holder_write(
+                    tm, project_root, holder_id=task_id, protection=protection, attempted_status=status,
+                )
 
             # 2a-pre. Bulk-reset circuit-breaker (task 918, refined task 1016):
             # observe the attempt before the terminal-exit gate so the guard
@@ -5831,6 +5849,8 @@ class TaskInterceptor:
                 return rejection.to_error_dict()
             if err := await self._declared_scope_refusal(tm, task_id, project_root, kwargs, before):
                 return err
+            if err := await self._holder_update_refusal(tm, task_id, project_root, kwargs, before):
+                return err
 
             async def _do_update_task_write() -> Any:
                 return await self._journal_around(
@@ -5982,6 +6002,50 @@ class TaskInterceptor:
         return DeclaredScopeWriteAuthorityError(
             task_id, violation, stored.get(DECLARED_SCOPE_METADATA_KEY),
         ).to_error_dict()
+
+    async def _holder_update_refusal(
+        self,
+        tm: TaskBackendProtocol,
+        task_id: str,
+        project_root: str,
+        kwargs: Mapping[str, Any],
+        before: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """The refusal for an update that would ungate the follow-up holder.
+
+        Called under the write lock. The stored row is read only when the payload names a gate key
+        or replaces the whole blob; a row read earlier in the call is reused.
+        """
+        raw = kwargs.get('metadata')
+        payload = None if raw is None else coerce_task_metadata(raw)
+        if payload is None:
+            return None
+        replace = kwargs.get('metadata_mode') == 'replace'
+        if not replace and HOLDER_GATE_KEYS.isdisjoint(payload):
+            return None
+        row = before if before is not None else await tm.get_task(task_id, project_root, kwargs.get('tag'))
+        protection = protected_update(row.get('metadata'), payload, replace=replace)
+        if protection is None:
+            return None
+        return await self._refuse_holder_write(
+            tm, project_root, holder_id=task_id, protection=protection, attempted_status=None,
+        )
+
+    async def _refuse_holder_write(
+        self,
+        tm: TaskBackendProtocol,
+        project_root: str,
+        *,
+        holder_id: str,
+        protection: HolderProtection,
+        attempted_status: str | None,
+    ) -> dict[str, Any]:
+        """Journal a refused write on the follow-up holder and return its wire dict."""
+        error = await protection_refusal(tm, project_root, holder_id, protection, attempted_status)
+        await self._journal(self._make_event(
+            EventType.followup_holder_protected, project_root, error.event_payload(),
+        ))
+        return error.to_error_dict()
 
     async def _with_bounded_audit_trail(
         self, result: dict[str, Any], task_id: str, project_root: str, project_id: str,

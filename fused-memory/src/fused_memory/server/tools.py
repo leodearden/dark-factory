@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import aiosqlite
 from mcp.server.fastmcp import Context, FastMCP
+from pydantic import StrictBool
 from shared.async_sqlite_base import CheckpointResult, apply_full_durability_pragmas, connect_daemon
 from shared.defects import DeclareEvent, MalformedDefectRef, OutcomeEvent
 from shared.delivered_check_polarity import (
@@ -9115,6 +9116,7 @@ def create_mcp_server(
         deferral: dict | None = None,
         expected_stamped_at: str | None = None,
         restamp_only: bool = False,
+        release_holder: StrictBool = False,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Update task status. Triggers targeted reconciliation for
@@ -9206,6 +9208,11 @@ def create_mcp_server(
                 and a ``deferral`` required: refused ``deferral_changed`` unless
                 the row is ``deferred`` now with the record named by
                 ``expected_stamped_at`` (omitted = no record).
+            release_holder: Must be the literal ``true`` for a follow-up holder to go
+                ``done``, ``cancelled`` or ``deferred``; without it that write is refused
+                ``followup_holder_protected`` with the holder's ``held_count``. Releasing the
+                holder releases every held follow-up at once, so it is a human act. Ignored on
+                any other task. See docs/task-authoring.md §3.4.
         """
         agent_id, _ = _resolve_identity(agent_id, None, ctx)
         if err := _reject_if_ticket_id('id', id):
@@ -9237,6 +9244,7 @@ def create_mcp_server(
             deferral=deferral,
             expected_stamped_at=expected_stamped_at,
             restamp_only=restamp_only,
+            release_holder=release_holder,
             **claimant_kwargs,
         )
 

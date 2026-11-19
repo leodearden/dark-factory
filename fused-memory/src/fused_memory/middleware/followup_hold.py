@@ -36,20 +36,24 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     'HELD_PRIORITIES',
+    'HOLDER_GATE_KEYS',
     'PROTECTED_STATUSES',
     'DuplicateFollowupHolderError',
     'FollowupHolderProtectedError',
     'FollowupHolders',
     'HolderProtection',
+    'held_count',
     'hold_at_create',
     'hold_scope',
     'is_holder',
     'protected_status',
     'protected_update',
+    'protection_refusal',
 ]
 
 HELD_PRIORITIES: Final = frozenset({'low', 'polish'})
 PROTECTED_STATUSES: Final = frozenset({TaskStatus.DONE, TaskStatus.CANCELLED, TaskStatus.DEFERRED})
+HOLDER_GATE_KEYS: Final = frozenset({FOLLOWUP_HOLDER_METADATA_KEY, 'deferred_watch', 'trigger_met'})
 
 _FOLLOWUP_SOURCE: Final = 'agent-followup'
 _REVIEW_SUGGESTIONS_CONTEXT: Final = 'review_suggestions'
@@ -291,3 +295,29 @@ class FollowupHolderProtectedError(TaskmasterError):
             **self.event_payload(),
             'hint': _HOLDER_PROTECTED_HINT,
         }
+
+
+async def held_count(tm: TaskBackendProtocol, project_root: str, holder_id: int | str) -> int:
+    """How many active tasks depend on the holder: the edge is the authority for held now."""
+    holder = int(holder_id)
+    edges = await tm.get_dependency_edges(project_root)
+    dependents = [str(task_id) for task_id, dependencies in edges.items() if holder in dependencies]
+    if not dependents:
+        return 0
+    statuses = await tm.get_statuses(project_root, ids=dependents)
+    return sum(1 for status in statuses.values() if status in ACTIVE)
+
+
+async def protection_refusal(
+    tm: TaskBackendProtocol,
+    project_root: str,
+    holder_id: str,
+    protection: HolderProtection,
+    attempted_status: str | None,
+) -> FollowupHolderProtectedError:
+    return FollowupHolderProtectedError(
+        holder_id=holder_id,
+        protection=protection,
+        attempted_status=attempted_status,
+        held_count=await held_count(tm, project_root, holder_id),
+    )
