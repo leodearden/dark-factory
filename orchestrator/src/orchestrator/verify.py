@@ -4107,20 +4107,45 @@ def _merge_no_evidence_fail(reason: str) -> 'VerifyResult':
 
 def _no_tests_ran_fail(passed_result: 'VerifyResult', py_files: list[str]) -> 'VerifyResult':
     category = verify_fallback_floor.NO_TESTS_RAN_CATEGORY
-    touched = ', '.join(py_files) or '(none)'
+    declared = ', '.join(py_files) or '(none)'
     return replace(
         passed_result,
         passed=False,
         trivial=False,
         failing_leg_categories=None,
         category=category,
-        summary=f'No tests ran for the touched .py files ({touched}).',
+        summary=f"No tests ran for the task's declared .py files ({declared}).",
         cause_hint=(
-            f'{category}: the fallback verify ran no tests for {touched}. Add or modify '
-            'a test covering the change, configure a non-default test_command, or set '
-            'verify_allow_no_tests_ran: true.'
+            f"{category}: the fallback verify derived no test from the task's declared "
+            f'files ({declared}). Add or modify a test covering the change and declare '
+            "it in the task's files (report_missing_plan_file)."
         ),
     )
+
+
+def _no_tests_ran_verdict(
+    result: 'VerifyResult',
+    executed_fallback: ModuleConfig,
+    config: OrchestratorConfig,
+    files: list[str],
+) -> 'VerifyResult':
+    if not (result.passed and verify_fallback_floor.fallback_ran_no_tests(
+        executed_fallback.test_command, config.test_command,
+    )):
+        return result
+    py_files = [f for f in files if f.endswith('.py')]
+    if config.verify_allow_no_tests_ran:
+        logger.warning(
+            'Fallback verify ran no tests for %s; passing because '
+            'verify_allow_no_tests_ran is set',
+            py_files,
+        )
+        return result
+    logger.warning(
+        'Fallback verify ran no tests for %s; failing as %s',
+        py_files, verify_fallback_floor.NO_TESTS_RAN_CATEGORY,
+    )
+    return _no_tests_ran_fail(result, py_files)
 
 
 async def _verify_pipeline_guard_requires_full_gate(
@@ -10014,23 +10039,7 @@ async def _run_scoped_verification_body(
                     ),
                 )
                 fallback_result.plan = plan_dict
-                if fallback_result.passed and verify_fallback_floor.fallback_ran_no_tests(
-                    fallback.test_command, config.test_command,
-                ):
-                    py_files = [f for f in existing_files if f.endswith('.py')]
-                    if config.verify_allow_no_tests_ran:
-                        logger.warning(
-                            'Fallback verify ran no tests for %s; passing because '
-                            'verify_allow_no_tests_ran is set',
-                            py_files,
-                        )
-                        return fallback_result
-                    logger.warning(
-                        'Fallback verify ran no tests for %s; failing as %s',
-                        py_files, verify_fallback_floor.NO_TESTS_RAN_CATEGORY,
-                    )
-                    fallback_result = _no_tests_ran_fail(fallback_result, py_files)
-                return fallback_result
+                return _no_tests_ran_verdict(fallback_result, fallback, config, existing_files)
 
             # For Rust projects with no module_configs and no Python fallback
             # (Reify's layout), try to scope the global commands.

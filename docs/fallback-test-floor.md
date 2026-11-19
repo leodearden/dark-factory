@@ -71,8 +71,8 @@ claim the floor.
 ## When the fallback still runs no tests
 
 `orchestrator/src/orchestrator/verify_fallback_floor.py::fallback_ran_no_tests`
-is applied in
-`orchestrator/src/orchestrator/verify.py::_run_scoped_verification_body`. A
+is applied by
+`orchestrator/src/orchestrator/verify.py::_no_tests_ran_verdict`. A
 passing fallback verify whose executed test slot is empty, while the project
 configures a `test_command`, fails with category `no_tests_ran`, at either
 role.
@@ -80,6 +80,10 @@ role.
 - Today only arm 6 reaches it. At merge role the floor already fills the slot,
   so the check is the second enforcement point behind it.
 - A lint or type red from the same run is reported as itself.
+- Its `cause_hint` addresses the agent: add or modify a test and declare it in
+  the task's files. The fallback derives test targets from the task's declared
+  files, not from the diff, so an undeclared new test repeats the failure. The
+  operator remedies below are deliberately left out of the hint.
 - `orchestrator/src/orchestrator/verify.py::verify_failure_is_preexisting_on_main`
   never probes a `no_tests_ran` failure: main would reproduce it whenever it
   runs the same fallback over the same files.
