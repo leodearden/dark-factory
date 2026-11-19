@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import dataclasses
 import json
-from typing import cast
 
 import httpx
 import pytest
@@ -278,7 +277,8 @@ class TestToolCallArguments:
             session_id = _open_session(server)
             _post(server, _tool_call("update_task", arguments), session_id=session_id)
             [returned] = server.tool_call_arguments("update_task")
-            cast(dict, returned)["id"] = "edited"
+            assert isinstance(returned, dict)
+            returned["id"] = "edited"
             returned["metadata"]["files"].append("b.py")
             assert server.tool_call_arguments("update_task") == (arguments,)
 

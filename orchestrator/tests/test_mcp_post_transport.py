@@ -131,8 +131,8 @@ async def test_completion_write_sends_the_mcp_accept_header(tmp_path, server):
     await wf._write_completion_to_memory()
 
     assert server.tool_call_arguments('add_memory') != (), (
-        'the POST was refused 406 for a missing/!json Accept header — the write '
-        f'still did not land. arrived at {_arrived_paths(server)!r}'
+        'no add_memory call was answered; a 406 for a missing JSON Accept header '
+        f'is one cause. arrived at {_arrived_paths(server)!r}'
     )
 
 
