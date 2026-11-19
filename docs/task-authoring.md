@@ -781,6 +781,15 @@ consequence it does not spell out: a missing, non-executable, or malformed
 and no escalation. That is a SILENT, indefinite hold on the dependent. Pin the
 script's existence and executability with a test.
 
+A malformed declaration is read the same way everywhere: every reader takes
+`metadata.delivered_checks` through
+`shared/src/shared/declared_checks.py::declared_checks`. An entry that is not a
+mapping, or a value that is neither a list nor empty (a bare dict, a string, a
+number), is never a check and never "nothing declared". The mark-done gate and
+the dependency gate count it as ERRORED, the same silent fail-safe hold as
+above; landing evidence ignores it; the briefing shows it as a malformed entry.
+Repair the record rather than wait it out.
+
 See `plans/write-triage-attach-target-contradiction.md` for the worked example
 (tasks 4762 / 4810 / 3169).
 
