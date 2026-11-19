@@ -45,7 +45,6 @@ fixtures prove it still fires.
 from __future__ import annotations
 
 import ast
-import re
 import textwrap
 from collections.abc import Sequence
 from pathlib import Path
@@ -56,6 +55,7 @@ from loop_blocking_allowlist import (
     ALLOWLIST_KEYS,
     AUDITED_SITES,
     DISPOSITIONS,
+    OWNER_TYPE_BY_DISPOSITION,
 )
 from loop_blocking_scan import (
     BUILTIN_PRIMITIVES,
@@ -66,6 +66,7 @@ from loop_blocking_scan import (
     find_loop_blocking_sites_in_trees,
     site_key,
 )
+from shared.governed_exceptions import TaskRef, TicketRef
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from silent_fallthrough_scan import (
     ParsedFile,
@@ -1400,7 +1401,7 @@ class TestScanHelperStaysInGateScope:
         """
         filed_keys = {
             (relpath, qualname, content_hash)
-            for relpath, qualname, content_hash, disposition, _why in AUDITED_SITES
+            for relpath, qualname, content_hash, disposition, _owner, _why in AUDITED_SITES
             if disposition == 'filed'
         }
 
@@ -1500,6 +1501,18 @@ class TestRatchet:
         assert stale == []
 
 
+def _owner_mismatches(
+    rows: Sequence[tuple[str, str, str, str, TaskRef | TicketRef | None, str]],
+) -> list[str]:
+    """One message per row whose owner is not the type its disposition fixes."""
+    return [
+        f'{relpath}::{qualname}::{content_hash}: disposition {disposition!r} takes a '
+        f'{OWNER_TYPE_BY_DISPOSITION[disposition].__name__} owner, found {owner!r}'
+        for relpath, qualname, content_hash, disposition, owner, _why in rows
+        if not isinstance(owner, OWNER_TYPE_BY_DISPOSITION[disposition])
+    ]
+
+
 class TestAllowlistHygiene:
     """A blessing with no reason is a silent waiver."""
 
@@ -1507,7 +1520,7 @@ class TestAllowlistHygiene:
         assert frozenset({'accepted', 'filed', 'to_file'}) == DISPOSITIONS
 
     def test_every_entry_has_a_known_disposition(self):
-        for relpath, qualname, _hash, disposition, _why in AUDITED_SITES:
+        for relpath, qualname, _hash, disposition, _owner, _why in AUDITED_SITES:
             assert disposition in DISPOSITIONS, (
                 f'{relpath}::{qualname}: unknown disposition {disposition!r}'
             )
@@ -1516,25 +1529,55 @@ class TestAllowlistHygiene:
         """"existing" is not a reason.  An accepted row must say what makes the
         cost acceptable (cached, startup-only, measured cheap); a filed row must
         name its task."""
-        for relpath, qualname, _hash, _disposition, why in AUDITED_SITES:
+        for relpath, qualname, _hash, _disposition, _owner, why in AUDITED_SITES:
             assert why.strip(), f'{relpath}::{qualname} has an empty justification'
             assert len(why.strip()) > 40, (
                 f'{relpath}::{qualname}: justification is too short to be a '
                 f'reason -- {why!r}'
             )
 
-    def test_filed_entries_name_their_task(self):
-        """A ``filed`` row without a task id points nowhere and closes nothing."""
-        for relpath, qualname, _hash, disposition, why in AUDITED_SITES:
-            if disposition != 'filed':
-                continue
-            assert re.search(r'\b\d{3,5}\b', why), (
-                f'{relpath}::{qualname}: disposition "filed" but the '
-                f'justification names no task id -- {why!r}'
+    def test_owner_type_mismatches_are_reported(self):
+        """The owner check can fail: every wrong owner type is named, no right one is."""
+        def _row(disposition, owner):
+            return (
+                'pkg/mod.py',
+                'Cls.handler',
+                'aaaaaaaaaaaa',
+                disposition,
+                owner,
+                'a justification long enough to read as a reason for the row',
             )
 
+        wrong = [
+            _row('filed', TicketRef('tkt_A')),
+            _row('filed', None),
+            _row('to_file', TaskRef(1)),
+            _row('accepted', TaskRef(5270)),
+        ]
+        right = [
+            _row('accepted', None),
+            _row('filed', TaskRef(1)),
+            _row('to_file', TicketRef('tkt_A')),
+        ]
+
+        unreported = [row for row in wrong if len(_owner_mismatches([row])) != 1]
+        assert unreported == [], f'wrong owner types the check let through: {unreported}'
+        assert _owner_mismatches(right) == []
+
+    def test_every_entry_owner_matches_its_disposition(self):
+        """A row's owner is structured data, never a task id fished out of prose."""
+        mismatches = _owner_mismatches(AUDITED_SITES)
+        assert mismatches == [], (
+            'Each row carries the owner its disposition fixes in '
+            'OWNER_TYPE_BY_DISPOSITION: an accepted row carries None and borrows '
+            'the INV-12 default; a filed row carries TaskRef(<task>); a to_file '
+            "row carries TicketRef('tkt_...'). The value must equal the row's "
+            'override in tests/repo_guards/test_repo_guards_governed_lists.py'
+            '::LOOP_BLOCKING_LEDGER.\n  ' + '\n  '.join(mismatches)
+        )
+
     def test_content_hashes_are_well_formed(self):
-        for relpath, qualname, content_hash, _disposition, _why in AUDITED_SITES:
+        for relpath, qualname, content_hash, _disposition, _owner, _why in AUDITED_SITES:
             assert len(content_hash) == 12 and all(
                 ch in '0123456789abcdef' for ch in content_hash
             ), f'{relpath}::{qualname}: malformed content_hash {content_hash!r}'
@@ -1542,7 +1585,7 @@ class TestAllowlistHygiene:
     def test_every_blessed_file_exists(self):
         """A row for a deleted file is a stale record the ratchet cannot catch."""
         missing = sorted({
-            relpath for relpath, _q, _h, _d, _w in AUDITED_SITES
+            relpath for relpath, _q, _h, _d, _o, _w in AUDITED_SITES
             if not (_REPO_ROOT / relpath).is_file()
         })
         assert missing == [], f'blessed rows naming files that do not exist: {missing}'
@@ -1551,7 +1594,7 @@ class TestAllowlistHygiene:
         """``ALLOWLIST_KEYS`` is derived, never hand-maintained alongside the rows."""
         assert [
             (relpath, qualname, content_hash)
-            for relpath, qualname, content_hash, _d, _w in AUDITED_SITES
+            for relpath, qualname, content_hash, _d, _o, _w in AUDITED_SITES
         ] == ALLOWLIST_KEYS
 
 

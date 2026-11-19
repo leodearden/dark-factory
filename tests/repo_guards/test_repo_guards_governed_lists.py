@@ -173,18 +173,37 @@ def test_repeated_sites_keep_distinct_keys() -> None:
     ]
 
 
-def test_loop_blocking_overrides_follow_the_ledger_vocabulary() -> None:
-    assert set(_OWNER_TYPE_BY_LEDGER_DISPOSITION) == loop_blocking_allowlist.DISPOSITIONS, (
-        'loop_blocking_allowlist.DISPOSITIONS changed: decide which INV-12 disposition '
-        'each ledger disposition maps to in _OWNER_TYPE_BY_LEDGER_DISPOSITION.'
-    )
+def test_an_override_must_equal_its_row_owner() -> None:
+    key = 'pkg/mod.py::f::aaaaaaaaaaaa'
+    agreeing = [
+        (TaskRef(5270), Debt(TaskRef(5270))),
+        (TicketRef('tkt_A'), Debt(TicketRef('tkt_A'))),
+        (None, None),
+    ]
+    disagreeing = [
+        (TaskRef(5270), Debt(TaskRef(4484))),
+        (TaskRef(5270), None),
+        (None, Debt(TaskRef(5270))),
+        (TicketRef('tkt_A'), Debt(TaskRef(1))),
+    ]
+    for owner, override in agreeing:
+        assert _loop_blocking_mismatch(key, owner, override) is None, (owner, override)
+    for owner, override in disagreeing:
+        assert _loop_blocking_mismatch(key, owner, override) is not None, (owner, override)
+
+
+def test_loop_blocking_overrides_equal_the_ledger_owners() -> None:
     rows = zip(loop_blocking_allowlist.AUDITED_SITES, LOOP_BLOCKING_LEDGER.keys, strict=True)
-    mismatches = [mismatch for row, key in rows if (mismatch := _loop_blocking_mismatch(row, key))]
+    mismatches = [
+        mismatch
+        for (_relpath, _qualname, _hash, _disposition, owner, _why), key in rows
+        if (mismatch := _loop_blocking_mismatch(key, owner, LOOP_BLOCKING_LEDGER.overrides.get(key)))
+    ]
     assert not mismatches, (
-        'Each loop-blocking override must match its ledger row: none for accepted, '
-        'Debt(TaskRef(<task>)) for filed, Debt(TicketRef(<ticket>)) for to_file, and the '
-        "owner id must appear in the row's justification. Correct the override in this "
-        'module, or the ledger row in loop_blocking_allowlist.py:\n  ' + '\n  '.join(mismatches)
+        "Each owned loop-blocking row's override must equal Debt(<that row's owner>), and "
+        'an owner-less (accepted) row must have no override, because it borrows the '
+        'default. Correct whichever side is wrong: the override in this module, or the '
+        'owner column in loop_blocking_allowlist.py:\n  ' + '\n  '.join(mismatches)
     )
 
 
