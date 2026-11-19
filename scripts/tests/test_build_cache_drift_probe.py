@@ -7,11 +7,14 @@ scratch, and no compiler variable is set. The compilers, rustc, dpkg-query,
 pkg-config and sccache are shims whose answers the tests change one at a
 time. The host trees it digests (the OCCT headers, /opt/reify-deps and the
 slvs header) are small scratch trees named by the probe's REIFY_PROBE_*
-variables, so no run reads the real ones.
+variables, so no run reads the real ones. The scratch reify checkout carries a
+fixture Cargo.lock whose registry crates have sources under the scratch
+$HOME/.cargo/registry/src: two with [package.metadata.system-deps] entries,
+x11-dl with its build.rs probe list, one with neither, and one whose source is
+not on the host.
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import subprocess
 import sys
@@ -34,8 +37,89 @@ REQUIRED_LINES = {
     "cc1plus",
     "as",
     "dpkg.toolchain",
-    "dpkg.dev-packages",
-    "pkg-config.modules",
+    "cargo.registry-sources-missing",
+}
+
+FIXTURE_MODULES = {"glib-2.0", "gobject-2.0", "gtk+-3.0", "gtk-3.0-fallback", "x11", "xscrnsaver", "zlib"}
+
+_REGISTRY = "registry+https://github.com/rust-lang/crates.io-index"
+_CARGO_LOCK = f"""\
+version = 4
+
+[[package]]
+name = "glib-sys"
+version = "0.18.1"
+source = "{_REGISTRY}"
+
+[[package]]
+name = "gtk-sys"
+version = "0.18.2"
+source = "{_REGISTRY}"
+
+[[package]]
+name = "x11-dl"
+version = "2.21.0"
+source = "{_REGISTRY}"
+
+[[package]]
+name = "serde"
+version = "1.0.200"
+source = "{_REGISTRY}"
+
+[[package]]
+name = "winapi"
+version = "0.3.9"
+source = "{_REGISTRY}"
+
+[[package]]
+name = "reify-kernel"
+version = "0.1.0"
+"""
+
+_CRATE_SOURCES = {
+    "glib-sys-0.18.1": {
+        "Cargo.toml": """\
+[package]
+name = "glib-sys"
+version = "0.18.1"
+
+[package.metadata.system-deps.glib_2_0]
+name = "glib-2.0"
+version = "2.56"
+
+[package.metadata.system-deps.gobject_2_0]
+name = "gobject-2.0"
+version = "2.56"
+""",
+    },
+    "gtk-sys-0.18.2": {
+        "Cargo.toml": """\
+[package]
+name = "gtk-sys"
+version = "0.18.2"
+
+[package.metadata.system-deps]
+zlib = "1.2"
+
+[package.metadata.system-deps.gtk]
+name = "gtk+-3.0"
+fallback-names = ["gtk-3.0-fallback"]
+version = "3.22"
+""",
+    },
+    "x11-dl-2.21.0": {
+        "Cargo.toml": '[package]\nname = "x11-dl"\nversion = "2.21.0"\n',
+        "build.rs": """\
+fn main() {
+    let libraries = [
+        // lib           pkgconfig name
+        ("x11", "x11"),
+        ("xscrnsaver", "xscrnsaver"),
+    ];
+}
+""",
+    },
+    "serde-1.0.200": {"Cargo.toml": '[package]\nname = "serde"\nversion = "1.0.200"\n'},
 }
 
 _DPKG_QUERY = """\
@@ -71,6 +155,11 @@ if args == ["--list-all"]:
     for name in modules:
         print(f"{name:<24} {name} - fake module")
     sys.exit(0)
+if len(args) == 2 and args[0] == "--variable=libdir":
+    if args[1] in modules:
+        print(f"/usr/lib/{args[1]}")
+        sys.exit(0)
+    sys.exit(1)
 if args[:1] == ["--modversion"]:
     rc = 0
     for name in args[1:]:
@@ -96,6 +185,12 @@ class ProbeWorld:
         self.home.mkdir()
         self.reify = tmp_path / "reify"
         (self.reify / "crates" / "reify-build-utils").mkdir(parents=True)
+        (self.reify / "Cargo.lock").write_text(_CARGO_LOCK)
+        index = self.home / ".cargo" / "registry" / "src" / "index.crates.io-1949cf8c6b5b557f"
+        for crate, files in _CRATE_SOURCES.items():
+            (index / crate).mkdir(parents=True)
+            for name, text in files.items():
+                (index / crate / name).write_text(text)
         (self.reify / "rust-toolchain.toml").write_text('[toolchain]\nchannel = "1.96.0"\n')
         (self.reify / "crates" / "reify-build-utils" / "native-deps.toml").write_text(
             "[slvs]\n"
@@ -155,7 +250,7 @@ esac
                 {"status": "rc ", "package": "libold-dev", "version": "1.0"},
             ]
         )
-        self.set_modules({"x11": "1.8.7", "zlib": "1.3"})
+        self.set_modules({"x11": "1.8.7", "zlib": "1.3", "glib-2.0": "2.80.0", "unrelated": "9.9"})
         write_python_shim(self.bin, "dpkg-query", self.dpkg_state, _DPKG_QUERY)
         write_python_shim(self.bin, "pkg-config", self.pkg_config_state, _PKG_CONFIG)
 
@@ -249,21 +344,35 @@ class TestDriftProbe:
         world.cc1.write_bytes(b"cc1 v2")
         assert changed_lines(before, world.probe()) == {"cc1"}
 
-    def test_a_dev_package_on_one_host_changes_only_dev_packages(
+    def test_prints_one_pkg_config_line_per_module_the_lock_probes(
+        self, world: ProbeWorld
+    ) -> None:
+        lines = world.probe()
+        derived = {name.removeprefix("pkg-config.") for name in lines if name.startswith("pkg-config.")}
+        assert derived == FIXTURE_MODULES | {"slvs"}
+        assert lines["pkg-config.glib-2.0"] == "2.80.0; libdir=/usr/lib/glib-2.0"
+        assert lines["pkg-config.xscrnsaver"] == "ABSENT"
+        assert lines["cargo.registry-sources-missing"] == "winapi-0.3.9"
+
+    def test_a_module_going_present_changes_only_its_line(self, world: ProbeWorld) -> None:
+        before = world.probe()
+        world.set_modules({**world.modules(), "xscrnsaver": "1.2.3"})
+        after = world.probe()
+        assert changed_lines(before, after) == {"pkg-config.xscrnsaver"}
+        assert after["pkg-config.xscrnsaver"] == "1.2.3; libdir=/usr/lib/xscrnsaver"
+
+    def test_a_module_going_absent_changes_only_its_line(self, world: ProbeWorld) -> None:
+        before = world.probe()
+        world.set_modules({name: v for name, v in world.modules().items() if name != "zlib"})
+        assert changed_lines(before, world.probe()) == {"pkg-config.zlib"}
+
+    def test_an_unprobed_module_or_dev_package_changes_nothing(
         self, world: ProbeWorld
     ) -> None:
         before = world.probe()
+        world.set_modules({**world.modules(), "libfoo": "1.0"})
         world.set_packages(
             [*world.packages(), {"status": "ii ", "package": "libxss-dev", "version": "1:1.2.3-1build3"}]
-        )
-        assert changed_lines(before, world.probe()) == {"dpkg.dev-packages"}
-
-    def test_a_removed_but_configured_dev_package_changes_nothing(
-        self, world: ProbeWorld
-    ) -> None:
-        before = world.probe()
-        world.set_packages(
-            [*world.packages(), {"status": "rc ", "package": "libxss-dev", "version": "1:1.2.3-1build3"}]
         )
         assert changed_lines(before, world.probe()) == set()
 
@@ -290,13 +399,6 @@ class TestDriftProbe:
             world.slvs_header.write_text("/* slvs */\n")
         assert changed_lines(before, world.probe()) == {line}
 
-    def test_a_pkg_config_module_changes_only_the_module_line(
-        self, world: ProbeWorld
-    ) -> None:
-        before = world.probe()
-        world.set_modules({**world.modules(), "xscrnsaver": "1.2.3"})
-        assert changed_lines(before, world.probe()) == {"pkg-config.modules"}
-
     def test_writes_nothing(self, world: ProbeWorld) -> None:
         reify_before = tree_snapshot(world.reify)
         home_before = tree_snapshot(world.home)
@@ -304,27 +406,12 @@ class TestDriftProbe:
         assert tree_snapshot(world.reify) == reify_before
         assert tree_snapshot(world.home) == home_before
 
-    @pytest.mark.parametrize(
-        ("listing", "line", "expected"),
-        [
-            ("dev-packages", "dpkg.dev-packages", ["libc6-dev=2.39-0ubuntu8.6", "libx11-dev=2:1.8.7-1build1"]),
-            ("pkg-config-modules", "pkg-config.modules", ["x11=1.8.7", "zlib=1.3"]),
-        ],
-    )
-    def test_a_listing_is_what_its_line_digests(
-        self, world: ProbeWorld, listing: str, line: str, expected: list[str]
-    ) -> None:
-        proc = world.run(REIFY_PROBE_LIST=listing)
-        assert proc.returncode == 0, proc.stderr
-        assert proc.stdout.splitlines() == expected
-        digest = hashlib.sha256(proc.stdout.encode()).hexdigest()[:16]
-        assert world.probe()[line] == digest
-
-    def test_an_unknown_listing_exits_two(self, world: ProbeWorld) -> None:
-        proc = world.run(str(world.reify), REIFY_PROBE_LIST="everything")
+    def test_a_checkout_without_a_cargo_lock_exits_two(self, world: ProbeWorld) -> None:
+        (world.reify / "Cargo.lock").unlink()
+        proc = world.run(str(world.reify))
         assert proc.returncode == 2
         assert proc.stdout == ""
-        assert "REIFY_PROBE_LIST" in proc.stderr
+        assert "Cargo.lock" in proc.stderr
 
     def test_a_missing_reify_checkout_exits_two(self, world: ProbeWorld, tmp_path: Path) -> None:
         proc = world.run(str(tmp_path / "no-such-reify"))

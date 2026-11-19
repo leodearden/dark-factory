@@ -10,19 +10,27 @@
 #
 # cc1, cc1plus and as are printed although sccache hashes only the compiler
 # driver (PRD decision 20): a host whose driver matches but whose cc1 differs
-# would serve the other host's objects. dpkg.dev-packages and
-# pkg-config.modules catch build-script outcomes such as x11-dl's baked
-# pkg-config result, which a -dev package installed on one host only changes
-# (libxss-dev on the laptop, esc-10782-1).
+# would serve the other host's objects.
+#
+# One pkg-config.<module> line per module that reify's dependencies probe
+# carries its --modversion and libdir, or ABSENT. A build script that bakes a
+# pkg-config answer into generated source (x11-dl's libdir table) makes its
+# crate and every dependent miss on a host that answers differently: gate
+# alpha's cross-host misses were xscrnsaver present on one host only
+# (esc-10782-1). The module list is derived from <checkout>/Cargo.lock each
+# run: every registry crate's [package.metadata.system-deps] entries, read
+# from its source under $CARGO_HOME/registry/src, plus the pkg-config names in
+# x11-dl's build.rs. cargo.registry-sources-missing names any locked registry
+# crate whose source is not on this host, whose modules the list then lacks.
+# Whole-system package or module lists are not compared: hosts legitimately
+# differ in hundreds of unrelated ones.
 #
 # The checkout defaults to $REIFY_ROOT, else $HOME/src/reify; exit 2 if it is
-# not a directory. REIFY_PROBE_DEEP=1 adds the header-closure digest of the
-# two hand-written C++ wrappers (cc -M, preprocess only).
+# not a directory or has no Cargo.lock. REIFY_PROBE_DEEP=1 adds the
+# header-closure digest of the two hand-written C++ wrappers (cc -M,
+# preprocess only).
 #
-# REIFY_PROBE_LIST=dev-packages or =pkg-config-modules prints, instead of the
-# probe, the listing that the dpkg.dev-packages or pkg-config.modules line
-# digests, one name=version per line, so diffing two hosts' listings names
-# the package. It needs no checkout. The host trees digested are
+# The host trees digested are
 # $REIFY_PROBE_OCCT_INCLUDE (default /usr/include/opencascade),
 # $REIFY_PROBE_DEPS_ROOT (default /opt/reify-deps) and
 # $REIFY_PROBE_SLVS_HEADER (default /usr/include/slvs.h).
@@ -34,32 +42,13 @@ SLVS_HEADER="${REIFY_PROBE_SLVS_HEADER:-/usr/include/slvs.h}"
 dig() { sha256sum | cut -c1-16; }
 emit() { printf '%s\t%s\n' "$1" "${2//$'\n'/ }"; }
 filehash() { [ -e "$1" ] && sha256sum "$(readlink -f "$1")" | cut -c1-16 || echo ABSENT; }
-dev_packages() {
-  local status
-  status="$(dpkg-query -W -f '${db:Status-Abbrev} ${Package}=${Version}\n' 2>/dev/null)"
-  printf '%s\n' "$status" | awk '$1 == "ii" && $2 ~ /^[^=]*-dev=/ { print $2 }' | sort
-}
-pkg_config_modules() {
-  local modules
-  modules="$(pkg-config --list-all 2>/dev/null)"
-  printf '%s\n' "$modules" | while read -r m _; do
-    [ -z "$m" ] || printf '%s=%s\n' "$m" "$(pkg-config --modversion "$m" 2>&1)"
-  done | sort
-}
-
-case "${REIFY_PROBE_LIST:-}" in
-  '') ;;
-  dev-packages) dev_packages; exit 0 ;;
-  pkg-config-modules) pkg_config_modules; exit 0 ;;
-  *)
-    echo "build_cache_drift_probe: REIFY_PROBE_LIST=$REIFY_PROBE_LIST is not dev-packages or pkg-config-modules" >&2
-    exit 2
-    ;;
-esac
-
 R="${1:-${REIFY_ROOT:-$HOME/src/reify}}"
 if [ ! -d "$R" ]; then
   echo "build_cache_drift_probe: $R is not a directory (the reify checkout)" >&2
+  exit 2
+fi
+if [ ! -f "$R/Cargo.lock" ]; then
+  echo "build_cache_drift_probe: $R/Cargo.lock is missing (the pkg-config module list is derived from it)" >&2
   exit 2
 fi
 cd "$R" || exit 2   # rust-toolchain.toml pins 1.96.0 only under the repo; elsewhere rustup serves the default toolchain
@@ -82,7 +71,6 @@ emit cc1 "$(filehash "$(cc -print-prog-name=cc1)")"
 emit cc1plus "$(filehash "$(c++ -print-prog-name=cc1plus)")"
 emit as "$(filehash "$(command -v as)")"
 emit dpkg.toolchain "$(dpkg-query -W -f '${Package}=${Version} ' libc6-dev libstdc++-13-dev libgcc-13-dev linux-libc-dev g++-13 gcc-13 cpp-13 binutils 2>&1)"
-emit dpkg.dev-packages "$(dev_packages | dig)"
 
 # ---- headers that reach preprocessed output
 emit dpkg.occt "$(dpkg-query -W -f '${Package}=${Version}\n' 'libocct*' 2>/dev/null | sort | dig)"
@@ -112,7 +100,55 @@ EOF
 )"
 slvs_version="$(pkg-config --modversion slvs 2>&1)"
 emit pkg-config.slvs "${slvs_version%%$'\n'*}; header=$(test -e "$SLVS_HEADER" && echo y || echo n)"
-emit pkg-config.modules "$(pkg_config_modules | dig)"
+python3 -I - "$R/Cargo.lock" "${CARGO_HOME:-$HOME/.cargo}/registry/src" <<'EOF'
+import re, subprocess, sys, tomllib
+from pathlib import Path
+
+lock, registry = Path(sys.argv[1]), Path(sys.argv[2])
+X11_DL_PAIR = re.compile(r'\(\s*"[^"]*"\s*,\s*"([^"]+)"\s*\)')
+
+
+def crate_source(name, version):
+    return next(iter(sorted(registry.glob(f'*/{name}-{version}'))), None)
+
+
+def system_deps(source):
+    manifest = tomllib.loads((source / 'Cargo.toml').read_text())
+    entries = manifest.get('package', {}).get('metadata', {}).get('system-deps', {})
+    for key, spec in entries.items():
+        if isinstance(spec, dict):
+            yield spec.get('name', key)
+            yield from spec.get('fallback-names', [])
+        else:
+            yield key
+
+
+def probed_modules(source, name):
+    yield from system_deps(source)
+    if name == 'x11-dl':
+        yield from X11_DL_PAIR.findall((source / 'build.rs').read_text())
+
+
+def pkg_config(*args):
+    proc = subprocess.run(['pkg-config', *args], capture_output=True, text=True)
+    return proc.stdout.strip() if proc.returncode == 0 else None
+
+
+modules, missing = set(), []
+for package in tomllib.loads(lock.read_text()).get('package', []):
+    if not package.get('source', '').startswith(('registry+', 'sparse+')):
+        continue
+    source = crate_source(package['name'], package['version'])
+    if source is None:
+        missing.append(f"{package['name']}-{package['version']}")
+    else:
+        modules.update(probed_modules(source, package['name']))
+print(f"cargo.registry-sources-missing\t{' '.join(sorted(missing))}")
+for module in sorted(modules):
+    version = pkg_config('--modversion', module)
+    value = 'ABSENT' if version is None else f"{version}; libdir={pkg_config('--variable=libdir', module)}"
+    print(f'pkg-config.{module}\t{value}')
+EOF
 emit tree-sitter.cli "$(command -v tree-sitter >/dev/null && { tree-sitter --version; filehash "$(command -v tree-sitter)"; } | tr '\n' ' ' || echo ABSENT)"
 
 # ---- ambient knobs that must be absent or equal

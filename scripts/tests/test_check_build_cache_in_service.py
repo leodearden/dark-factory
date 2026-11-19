@@ -132,6 +132,17 @@ class TestDegraded:
         assert report["verdict"] == "degraded"
         assert report["latest"]["backend"] == "local_fallback"
 
+    def test_latest_degraded_row_with_null_counters_is_still_degraded(
+        self, tmp_path: Path
+    ) -> None:
+        nulls = json.loads(row(at(10), backend="local_fallback", reason="store_unreachable"))
+        nulls["build_cache"].update(hits=None, misses=None, cpu_secs=None)
+        lines = [*healthy_rows(5), json.dumps(nulls)]
+        code, report, _ = run_check(write_observations(tmp_path, lines))
+        assert code == 1
+        assert report["verdict"] == "degraded"
+        assert report["malformed_lines"] == 0
+
     def test_latest_read_only_server_is_degraded(self, tmp_path: Path) -> None:
         lines = [*healthy_rows(5), row(at(10), reason="read_only_server")]
         code, report, _ = run_check(write_observations(tmp_path, lines))

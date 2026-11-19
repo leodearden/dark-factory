@@ -112,22 +112,28 @@ def parse_time(text: str) -> datetime:
     return parsed.astimezone(UTC)
 
 
+def _counter(value: object) -> float:
+    """A counter as summed; a missing or non-numeric one adds nothing.
+
+    Health and recency never depend on counters (PRD C10), so a row whose
+    counters are absent, for example a real_path run with no sccache server,
+    still decides the verdict.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0
+    return value
+
+
 def _observation_of(build_cache: Mapping[str, object], time: datetime) -> Observation | None:
     mode = build_cache.get("mode")
     backend = build_cache.get("backend")
     policy = build_cache.get("policy")
     reason = build_cache.get("reason")
-    hits = build_cache.get("hits")
-    misses = build_cache.get("misses")
-    cpu_secs = build_cache.get("cpu_secs")
     if not (
         isinstance(mode, str)
         and isinstance(backend, str)
         and isinstance(policy, str)
         and isinstance(reason, str)
-        and isinstance(hits, int)
-        and isinstance(misses, int)
-        and isinstance(cpu_secs, (int, float))
     ):
         return None
     return Observation(
@@ -136,9 +142,9 @@ def _observation_of(build_cache: Mapping[str, object], time: datetime) -> Observ
         backend=backend,
         policy=policy,
         reason=reason,
-        hits=hits,
-        misses=misses,
-        cpu_secs=float(cpu_secs),
+        hits=int(_counter(build_cache.get("hits"))),
+        misses=int(_counter(build_cache.get("misses"))),
+        cpu_secs=float(_counter(build_cache.get("cpu_secs"))),
         health=classify(build_cache),
     )
 

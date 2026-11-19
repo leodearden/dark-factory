@@ -1933,7 +1933,9 @@ unit changed, when the credentials differ from those it was last started with
 (their digest is kept in `~/.local/state/build-cache-store/`), or when it is
 not running, so a re-run that changes nothing never cuts in-flight builds. To rotate the
 password, edit `RCLONE_PASS=` in the credentials file and re-run the
-installer, then re-run `--host-config` on each host. `--check` also reports a
+installer. Re-copy the credentials file to every other host (the `scp` and
+`chmod 600` of the laptop steps below), then re-run `--host-config` and
+`--check --host-config` on each host. `--check` also reports a
 hand-edited unit as drift. Overrides: `BUILD_CACHE_STORE_PORT`,
 `BUILD_CACHE_STORE_CAP_BYTES`, `BUILD_CACHE_STORE_DIR`,
 `BUILD_CACHE_STORE_CREDENTIALS`.
@@ -2000,9 +2002,12 @@ To enable:
    host's own reify orchestrator yaml, never in `verify_env`. Apply with
    `mcp__escalation__reload_config`; the section is hot-reloadable.
 4. Reset the host's task-verify lanes so their build directories are
-   recreated at CANON: `orchestrator verify-lanes reset --config <host yaml>`
-   (task-verify-lanes PRD C10; exit 3 means a busy lane was skipped, so re-run
-   it). Then drop the merge lane's build directory, as in
+   recreated at CANON. `orchestrator verify-lanes reset --config <host yaml>`
+   does this (exit 3 means a busy lane was skipped, so re-run it), but it is
+   delivered by the task-verify-lanes PRD (`plans/task-verify-lanes-prd.md`
+   C10, tasks 10736–10739) and does not exist until those land. Until then,
+   halt the merge queue, wait for in-flight verifies to finish, and remove
+   the lanes' build directories by hand. Then drop the merge lane's build directory, as in
    [Rebuilding the warm base](#rebuilding-the-warm-base).
 5. Once verifies have run, compare the drift probe on both hosts and run the
    in-service check. Only when it exits 0, set `build_canon.expect_canon: true`.
@@ -2108,15 +2113,20 @@ scripts/deploy/build_cache_drift_probe.sh ~/src/reify > /tmp/drift-$(hostname).t
 diff /tmp/drift-<workstation>.tsv /tmp/drift-leo-laptop.tsv
 ```
 
-Zero differences outside `#info` lines are required before gates ι and κ. α
-found libxss-dev installed on the laptop only (esc-10782-1); `dpkg.dev-packages`
-and `pkg-config.modules` show that kind of difference as a digest. To name the
-package, diff the listing behind each line, taken on both hosts:
-
-```bash
-REIFY_PROBE_LIST=dev-packages scripts/deploy/build_cache_drift_probe.sh > /tmp/dev-$(hostname).txt
-REIFY_PROBE_LIST=pkg-config-modules scripts/deploy/build_cache_drift_probe.sh > /tmp/pc-$(hostname).txt
-```
+Zero differences outside `#info` lines are required before gates ι and κ.
+Each pkg-config module that reify's dependencies probe has its own
+`pkg-config.<module>` line, carrying its version and `libdir`, or `ABSENT`, so
+the diff names the module. α's cross-host misses were `xscrnsaver` present on
+the laptop only (libxss-dev, esc-10782-1). The module list is derived from the
+checkout's `Cargo.lock` on every run: each locked registry crate's
+`[package.metadata.system-deps]` entries, read from its source under
+`$CARGO_HOME/registry/src`, plus the pkg-config names in x11-dl's `build.rs`.
+`cargo.registry-sources-missing` names locked registry crates whose source is
+not on that host; the module list then lacks their entries, so a difference on
+that line means running `cargo fetch` in the reify checkout first. Whole-system
+package and module lists are not compared, because the hosts legitimately
+differ in hundreds of unrelated packages. A probe of a checkout with no
+`Cargo.lock` exits 2.
 
 `REIFY_PROBE_DEEP=1` adds the digests of the C++ wrappers' header closures.
 
