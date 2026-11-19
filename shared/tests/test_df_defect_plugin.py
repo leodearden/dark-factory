@@ -237,7 +237,7 @@ def test_runtime_fixture(runtime_error):
 
 
 def test_call_phase_import():
-    from json import definitely_absent_fn  # noqa: F401
+    from json import definitely_absent_fn
 """
 
 
@@ -302,8 +302,8 @@ def outcome_runs(
                 tmp_path_factory.mktemp('project_c'),
                 {
                     'pytest.ini': '[pytest]\n',
-                    'tests/test_new_symbol.py': 'from json import definitely_absent_fn  # noqa: F401\n',
-                    'tests/test_new_module.py': 'import definitely_absent_module_7045  # noqa: F401\n',
+                    'tests/test_new_symbol.py': 'from json import definitely_absent_fn\n',
+                    'tests/test_new_module.py': 'import definitely_absent_module_7045\n',
                     'tests/test_ok.py': 'def test_ok():\n    pass\n',
                 },
             ),
