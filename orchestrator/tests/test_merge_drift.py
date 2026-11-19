@@ -424,7 +424,7 @@ class TestDriftCheckFullGateSpecNoDerivation:
             ),
             # A full-gate drift spec must NOT derive/scope task_files at all.
             patch(
-                'orchestrator.merge_lane.worker._derive_task_files_from_git',
+                'orchestrator.merge_lane.post_merge_verify._derive_task_files_from_git',
                 derive_spy,
             ),
             patch(

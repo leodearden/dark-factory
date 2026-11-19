@@ -8,7 +8,7 @@ are not yet mirrored inside ``spawn_main_health_probe`` for the DEFERRED
 path (added task 2564 step-6). This file pins the RED bar for that gap
 (step-5), plus a regression check that
 ``main_health_probe_handles=None`` (every existing caller) still spawns
-nothing through the full ``_run_post_merge_verify`` chokepoint.
+nothing through the full ``run_post_merge_verify`` chokepoint.
 
 Reuses test_merge_queue_main_health.py's fixtures/config-builders
 (_make_config/_make_git_ops/_make_req, COMPILE_ERROR_RESULT) per that
@@ -54,12 +54,13 @@ from orchestrator.merge_lane.main_health_probe import (
     classify_main_health_red,
     spawn_main_health_probe,
 )
+from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
 from orchestrator.merge_lane.worker import (
+    PRODUCTION_VERIFIER,
     OutcomeKind,
     RealMergeItem,
     SpeculativeMergeWorker,
     _emit_merge_attempt,
-    _run_post_merge_verify,
 )
 from orchestrator.verify import _PROBE_CACHE, VerifyResult
 from orchestrator.verify_runner import HostLease
@@ -237,7 +238,7 @@ class TestSpawnDedup:
 
 
 # ---------------------------------------------------------------------------
-# Task 2565 step-7 (RED): _run_post_merge_verify must derive origin_is_local
+# Task 2565 step-7 (RED): run_post_merge_verify must derive origin_is_local
 # from the `runner` it receives and forward it into spawn_main_health_probe
 # on the DEFERRED path — a REMOTE runner (is_local=False) means
 # origin_is_local=False; runner=None (local) means origin_is_local=True.
@@ -246,7 +247,7 @@ class TestSpawnDedup:
 
 
 class TestRunPostMergeVerifyDerivesOriginIsLocal:
-    """_run_post_merge_verify must derive origin_is_local from `runner` and
+    """run_post_merge_verify must derive origin_is_local from `runner` and
     forward it into spawn_main_health_probe on the DEFERRED path (task 2565)."""
 
     def test_remote_runner_derives_origin_is_local_false(
@@ -271,8 +272,8 @@ class TestRunPostMergeVerifyDerivesOriginIsLocal:
 
         async def _run() -> None:
             handles = MainHealthProbeHandles(background_tasks=set())
-            with patch('orchestrator.merge_lane.worker.spawn_main_health_probe', new=spy):
-                await _run_post_merge_verify(
+            with patch('orchestrator.merge_lane.verify_failure_outcome.spawn_main_health_probe', new=spy):
+                await run_post_merge_verify(
                     git_ops, req, merge_wt,
                     timeouts={},
                     enospc_retries={},
@@ -280,6 +281,7 @@ class TestRunPostMergeVerifyDerivesOriginIsLocal:
                     max_enospc=1,
                     main_health_probe_handles=handles,
                     runner=remote_runner,
+                    verifier=PRODUCTION_VERIFIER,
                 )
 
         asyncio.run(_run())
@@ -303,9 +305,9 @@ class TestRunPostMergeVerifyDerivesOriginIsLocal:
         async def _run() -> None:
             handles = MainHealthProbeHandles(background_tasks=set())
             with patch(
-                'orchestrator.merge_lane.worker.spawn_main_health_probe', new=spy,
+                'orchestrator.merge_lane.verify_failure_outcome.spawn_main_health_probe', new=spy,
             ):
-                await _run_post_merge_verify(
+                await run_post_merge_verify(
                     git_ops, req, merge_wt,
                     timeouts={},
                     enospc_retries={},
@@ -770,16 +772,16 @@ class TestRunInflightVerifyPassesAutoHealCallback:
         spy = AsyncMock(return_value=None)
 
         async def _run() -> None:
-            with patch('orchestrator.merge_lane.worker._run_post_merge_verify', new=spy):
+            with patch('orchestrator.merge_lane.worker.run_post_merge_verify', new=spy):
                 await worker._run_inflight_verify(item, lease)
 
         asyncio.run(_run())
 
-        assert spy.await_args is not None, '_run_post_merge_verify was not called'
+        assert spy.await_args is not None, 'run_post_merge_verify was not called'
         handles = spy.await_args.kwargs.get('main_health_probe_handles')
         assert handles is not None, (
             '_run_inflight_verify must pass a live main_health_probe_handles '
-            'into _run_post_merge_verify'
+            'into run_post_merge_verify'
         )
         assert handles.auto_heal == worker._auto_heal_main_health_deferred, (
             'Expected main_health_probe_handles.auto_heal to be '
@@ -1596,7 +1598,7 @@ class TestTheMuForkFlakeSinkIsWired:
 
         async def _five_red_merges() -> None:
             for _ in range(5):
-                await _run_post_merge_verify(
+                await run_post_merge_verify(
                     _make_git_ops(tmp_path), req, merge_wt,
                     timeouts={}, enospc_retries={}, max_timeouts=3, max_enospc=1,
                     escalation_queue=escalation_queue,

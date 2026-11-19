@@ -40,7 +40,7 @@ NOTE on seams (PRD plans/merge-lane-quality-prd.md task γ)
 ---------------------------------------------------------
 Nothing here reaches into the merge lane.  The verify PORT is injected
 (``FakeVerifier``), which is also what the per-land cross-check's local
-trust anchor runs on -- ``_run_post_merge_verify`` builds its ``LocalRunner``
+trust anchor runs on -- ``run_post_merge_verify`` builds its ``LocalRunner``
 with ``run_scoped=verifier.run_scoped``, so the injected port IS that leg's
 verdict and ``verifier.verified`` is the exact cross-check ran/skipped
 signal.  The host-monitor scenarios drive a RUNNING ``MergeLane`` over a real
@@ -1976,7 +1976,7 @@ class TestUnreachableHostCapstone:
 
 # ===========================================================================
 # Task 2822 fix (b): per-land cross-check of a remote GREEN in
-# _run_post_merge_verify.  A single remote host's green is re-verified by the
+# run_post_merge_verify.  A single remote host's green is re-verified by the
 # LOCAL trust-anchor before the land.  AGREE -> verdict_parity_ok + proceed;
 # DIVERGE (local FAIL) -> fail-closed (adopt the local FAIL verdict so the land
 # is withheld, quarantine the remote, file a dedup'd blocking escalation);
@@ -2002,7 +2002,7 @@ def _xcheck_config(*, project_root: Path, cross_check: bool = True) -> Orchestra
 
 
 def _xcheck_req(config: OrchestratorConfig, *, task_files=('src/foo.py',), worktree=None):
-    """A minimal MergeRequest for _run_post_merge_verify cross-check tests."""
+    """A minimal MergeRequest for run_post_merge_verify cross-check tests."""
     from orchestrator.merge_lane.worker import MergeRequest
 
     loop = asyncio.get_running_loop()
@@ -2041,7 +2041,7 @@ def _xcheck_verifier(*, result=None, raises=None) -> FakeVerifier:
     """The local trust-anchor's verdict, injected as the verify PORT.
 
     The cross-check builds its LocalRunner with
-    ``run_scoped=verifier.run_scoped`` (merge_queue.py::_run_post_merge_verify),
+    ``run_scoped=verifier.run_scoped`` (merge_queue.py::run_post_merge_verify),
     so the injected port IS the local leg: it returns *result*, or raises
     *raises*.  In the REMOTE dispatch path the local-path pool is never built,
     so the ONLY scoped verify is the fix-(b) cross-check trust-anchor — making
@@ -2056,7 +2056,7 @@ def _xcheck_verifier(*, result=None, raises=None) -> FakeVerifier:
 
 @pytest.mark.asyncio
 class TestPerLandCrossCheck:
-    """_run_post_merge_verify cross-checks a remote GREEN against the local
+    """run_post_merge_verify cross-checks a remote GREEN against the local
     trust-anchor before the land (task 2822 fix b).  RED until step-8."""
 
     async def test_diverge_local_fail_withholds_land_quarantines_and_escalates(self, tmp_path):
@@ -2064,7 +2064,7 @@ class TestPerLandCrossCheck:
         halt + BORN-AT-L2 escalation + event (task 2886 fix 3)."""
         from unittest.mock import Mock
 
-        from orchestrator.merge_lane.worker import _run_post_merge_verify
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
 
         config = _xcheck_config(project_root=tmp_path / 'proj', cross_check=True)
         req = _xcheck_req(config, worktree=tmp_path)
@@ -2078,7 +2078,7 @@ class TestPerLandCrossCheck:
         halt_hook = Mock()
 
         verifier = _xcheck_verifier(result=local_fail)
-        outcome = await _run_post_merge_verify(
+        outcome = await run_post_merge_verify(
             git_ops, req, tmp_path,
             timeouts={}, enospc_retries={},
             max_timeouts=2, max_enospc=1,
@@ -2086,7 +2086,7 @@ class TestPerLandCrossCheck:
             merge_sha='mergesha01',
             runner=remote,
             escalation_queue=eq,
-            quarantine=quarantine.add,
+            quarantine_divergent=quarantine.add,
             halt_hook=halt_hook,
             verifier=verifier,
         )
@@ -2130,7 +2130,7 @@ class TestPerLandCrossCheck:
         one flaky local verify cannot block every merge lane fleet-wide)."""
         from unittest.mock import Mock
 
-        from orchestrator.merge_lane.worker import _run_post_merge_verify
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
 
         config = _xcheck_config(project_root=tmp_path / 'proj', cross_check=True)
         req = _xcheck_req(config, worktree=tmp_path)
@@ -2146,7 +2146,7 @@ class TestPerLandCrossCheck:
         halt_hook = Mock()
 
         verifier = _xcheck_verifier(result=local_infra_fail)
-        outcome = await _run_post_merge_verify(
+        outcome = await run_post_merge_verify(
             git_ops, req, tmp_path,
             timeouts={}, enospc_retries={},
             max_timeouts=2, max_enospc=1,
@@ -2154,7 +2154,7 @@ class TestPerLandCrossCheck:
             merge_sha='mergesha07',
             runner=remote,
             escalation_queue=eq,
-            quarantine=quarantine.add,
+            quarantine_divergent=quarantine.add,
             halt_hook=halt_hook,
             verifier=verifier,
         )
@@ -2186,7 +2186,7 @@ class TestPerLandCrossCheck:
         """fix 3 ordering: the synchronous halt MUST precede the escalation submit and the
         blocked return, so no FURTHER adoption can occur before a human looks."""
 
-        from orchestrator.merge_lane.worker import _run_post_merge_verify
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
 
         config = _xcheck_config(project_root=tmp_path / 'proj', cross_check=True)
         req = _xcheck_req(config, worktree=tmp_path)
@@ -2208,7 +2208,7 @@ class TestPerLandCrossCheck:
             order.append('halt')
 
         verifier = _xcheck_verifier(result=_make_result(False))
-        outcome = await _run_post_merge_verify(
+        outcome = await run_post_merge_verify(
             git_ops, req, tmp_path,
             timeouts={}, enospc_retries={},
             max_timeouts=2, max_enospc=1,
@@ -2216,7 +2216,7 @@ class TestPerLandCrossCheck:
             merge_sha='mergesha0h',
             runner=remote,
             escalation_queue=eq,
-            quarantine=quarantine.add,
+            quarantine_divergent=quarantine.add,
             halt_hook=halt_hook,
             verifier=verifier,
         )
@@ -2231,7 +2231,7 @@ class TestPerLandCrossCheck:
         """fix 3 None-safety: non-production callers omit halt_hook (default None) — the
         divergence still withholds the land + files a born-at-L2 escalation, no crash."""
 
-        from orchestrator.merge_lane.worker import _run_post_merge_verify
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
 
         config = _xcheck_config(project_root=tmp_path / 'proj', cross_check=True)
         req = _xcheck_req(config, worktree=tmp_path)
@@ -2243,7 +2243,7 @@ class TestPerLandCrossCheck:
         quarantine: set[str] = set()
 
         verifier = _xcheck_verifier(result=_make_result(False))
-        outcome = await _run_post_merge_verify(
+        outcome = await run_post_merge_verify(
             git_ops, req, tmp_path,
             timeouts={}, enospc_retries={},
             max_timeouts=2, max_enospc=1,
@@ -2251,7 +2251,7 @@ class TestPerLandCrossCheck:
             merge_sha='mergesha0n',
             runner=remote,
             escalation_queue=eq,
-            quarantine=quarantine.add,
+            quarantine_divergent=quarantine.add,
             # halt_hook omitted -> None default (byte-identical non-production callers)
             verifier=verifier,
         )
@@ -2265,7 +2265,7 @@ class TestPerLandCrossCheck:
     async def test_agree_local_pass_proceeds_and_emits_verdict_parity_ok(self, tmp_path):
         """knob ON, remote PASS + local PASS -> proceeds (None) + verdict_parity_ok."""
 
-        from orchestrator.merge_lane.worker import _run_post_merge_verify
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
 
         config = _xcheck_config(project_root=tmp_path / 'proj', cross_check=True)
         req = _xcheck_req(config, worktree=tmp_path)
@@ -2277,7 +2277,7 @@ class TestPerLandCrossCheck:
         quarantine: set[str] = set()
 
         verifier = _xcheck_verifier(result=_make_result(True))
-        outcome = await _run_post_merge_verify(
+        outcome = await run_post_merge_verify(
             git_ops, req, tmp_path,
             timeouts={}, enospc_retries={},
             max_timeouts=2, max_enospc=1,
@@ -2285,7 +2285,7 @@ class TestPerLandCrossCheck:
             merge_sha='mergesha02',
             runner=remote,
             escalation_queue=eq,
-            quarantine=quarantine.add,
+            quarantine_divergent=quarantine.add,
             verifier=verifier,
         )
 
@@ -2298,7 +2298,7 @@ class TestPerLandCrossCheck:
     async def test_knob_off_never_constructs_local_runner_byte_identical(self, tmp_path):
         """knob OFF -> the local cross-check runner is NEVER constructed (byte-identical)."""
 
-        from orchestrator.merge_lane.worker import _run_post_merge_verify
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
 
         config = _xcheck_config(project_root=tmp_path / 'proj', cross_check=False)
         req = _xcheck_req(config, worktree=tmp_path)
@@ -2310,7 +2310,7 @@ class TestPerLandCrossCheck:
         quarantine: set[str] = set()
 
         verifier = _xcheck_verifier(result=_make_result(False))
-        outcome = await _run_post_merge_verify(
+        outcome = await run_post_merge_verify(
             git_ops, req, tmp_path,
             timeouts={}, enospc_retries={},
             max_timeouts=2, max_enospc=1,
@@ -2318,7 +2318,7 @@ class TestPerLandCrossCheck:
             merge_sha='mergesha03',
             runner=remote,
             escalation_queue=eq,
-            quarantine=quarantine.add,
+            quarantine_divergent=quarantine.add,
             verifier=verifier,
         )
 
@@ -2332,7 +2332,7 @@ class TestPerLandCrossCheck:
     async def test_local_runner_unavailable_is_inconclusive_and_trusts_remote(self, tmp_path):
         """knob ON, local cross-check raises RunnerUnavailable -> inconclusive + trust remote green."""
 
-        from orchestrator.merge_lane.worker import _run_post_merge_verify
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
 
         config = _xcheck_config(project_root=tmp_path / 'proj', cross_check=True)
         req = _xcheck_req(config, worktree=tmp_path)
@@ -2344,7 +2344,7 @@ class TestPerLandCrossCheck:
         quarantine: set[str] = set()
 
         verifier = _xcheck_verifier(raises=RunnerUnavailable('laptop closed'))
-        outcome = await _run_post_merge_verify(
+        outcome = await run_post_merge_verify(
             git_ops, req, tmp_path,
             timeouts={}, enospc_retries={},
             max_timeouts=2, max_enospc=1,
@@ -2352,7 +2352,7 @@ class TestPerLandCrossCheck:
             merge_sha='mergesha04',
             runner=remote,
             escalation_queue=eq,
-            quarantine=quarantine.add,
+            quarantine_divergent=quarantine.add,
             verifier=verifier,
         )
 
@@ -2364,7 +2364,7 @@ class TestPerLandCrossCheck:
     async def test_trivial_remote_pass_skips_cross_check(self, tmp_path):
         """knob ON, remote returns a TRIVIAL pass -> cross-check SKIPPED (no suite ran to compare)."""
 
-        from orchestrator.merge_lane.worker import _run_post_merge_verify
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
 
         config = _xcheck_config(project_root=tmp_path / 'proj', cross_check=True)
         req = _xcheck_req(config, worktree=tmp_path)
@@ -2380,7 +2380,7 @@ class TestPerLandCrossCheck:
         quarantine: set[str] = set()
 
         verifier = _xcheck_verifier(result=_make_result(False))
-        outcome = await _run_post_merge_verify(
+        outcome = await run_post_merge_verify(
             git_ops, req, tmp_path,
             timeouts={}, enospc_retries={},
             max_timeouts=2, max_enospc=1,
@@ -2388,7 +2388,7 @@ class TestPerLandCrossCheck:
             merge_sha='mergesha05',
             runner=remote,
             escalation_queue=eq,
-            quarantine=quarantine.add,
+            quarantine_divergent=quarantine.add,
             verifier=verifier,
         )
 
@@ -2402,7 +2402,7 @@ class TestPerLandCrossCheck:
     async def test_local_dispatch_path_skips_cross_check_entirely(self, tmp_path):
         """runner is None (local dispatch): the cross-check branch never runs."""
 
-        from orchestrator.merge_lane.worker import _run_post_merge_verify
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
 
         config = _xcheck_config(project_root=tmp_path / 'proj', cross_check=True)
         req = _xcheck_req(config, worktree=tmp_path)
@@ -2415,7 +2415,7 @@ class TestPerLandCrossCheck:
         # Real local-path pool whose scoped verify is the injected port,
         # returning PASS — no cross-check side effects.
         verifier = _xcheck_verifier(result=_make_result(True))
-        outcome = await _run_post_merge_verify(
+        outcome = await run_post_merge_verify(
             git_ops, req, tmp_path,
             timeouts={}, enospc_retries={},
             max_timeouts=2, max_enospc=1,
@@ -2423,7 +2423,7 @@ class TestPerLandCrossCheck:
             merge_sha='mergesha06',
             runner=None,  # LOCAL dispatch
             escalation_queue=eq,
-            quarantine=quarantine.add,
+            quarantine_divergent=quarantine.add,
             verifier=verifier,
         )
 
@@ -2445,7 +2445,7 @@ class TestPerLandCrossCheck:
 #   (c) a passing remote verify is archived with SCOPE + RESULT + TIMING.
 #   (b) a remote FALSE-GREEN (remote PASS while the LOCAL trust-anchor FAILs)
 #       does NOT land — driven through the real SpeculativeMergeWorker
-#       ._run_inflight_verify -> _run_post_merge_verify caller, proving the
+#       ._run_inflight_verify -> run_post_merge_verify caller, proving the
 #       event_store / escalation_queue / by-reference quarantine set all reach
 #       the cross-check.
 # ===========================================================================
@@ -2670,7 +2670,7 @@ class TestIndeterminateLocalLegDoesNotVeto:
     parent test a second time for zero added coverage.  The claim that the
     task-2822 fail-CLOSED contract still holds alongside the new arm is
     pinned by this class's OWN controls below, which drive the same
-    `_run_post_merge_verify` callee through `_drive`.
+    `run_post_merge_verify` callee through `_drive`.
     """
 
     @staticmethod
@@ -2689,7 +2689,7 @@ class TestIndeterminateLocalLegDoesNotVeto:
         "not recorded" case drivable.
         """
 
-        from orchestrator.merge_lane.worker import _run_post_merge_verify
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
 
         config = _xcheck_config(project_root=tmp_path / 'proj', cross_check=True)
         req = _xcheck_req(config, worktree=tmp_path)
@@ -2710,7 +2710,7 @@ class TestIndeterminateLocalLegDoesNotVeto:
         quarantine: set[str] = set()
 
         verifier = _xcheck_verifier(result=local_fail)
-        outcome = await _run_post_merge_verify(
+        outcome = await run_post_merge_verify(
             git_ops, req, tmp_path,
             timeouts={}, enospc_retries={},
             max_timeouts=2, max_enospc=1,
@@ -2718,7 +2718,7 @@ class TestIndeterminateLocalLegDoesNotVeto:
             merge_sha=merge_sha,
             runner=remote,
             escalation_queue=eq,
-            quarantine=quarantine.add,
+            quarantine_divergent=quarantine.add,
             verifier=verifier,
         )
         return outcome, git_ops, eq, es, quarantine, verifier

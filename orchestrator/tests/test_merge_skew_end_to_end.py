@@ -36,8 +36,8 @@ from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps, MergeResult
 from orchestrator.merge_lane.disposition import MergeFailureDisposition
 from orchestrator.merge_lane.gates import _MAX_EVENT_EVIDENCE_ITEMS
+from orchestrator.merge_lane.verify_failure_outcome import MAIN_HEALTH_PROBE_PENDING_NOTE
 from orchestrator.merge_lane.worker import (
-    MAIN_HEALTH_PROBE_PENDING_NOTE,
     InflightEntry,
     MergeOutcome,
     MergeRequest,
@@ -621,7 +621,7 @@ class TestFirstAttemptSkewMergeAttemptDisposition:
         self, tmp_path: Path,
     ) -> None:
         """merged_branch_tip=None -> base facts absent -> classification is
-        skipped inside _run_post_merge_verify (I3) -> disposition stays the
+        skipped inside run_post_merge_verify (I3) -> disposition stays the
         MergeOutcome default INDETERMINATE -> the guarded step-18 emit must
         NOT fire (byte-identical to pre-β behaviour on this branch).
 
@@ -921,7 +921,7 @@ class TestShippedMainHealthConfiguration:
     patch.  That knob defaults to True in ``config.py``, so without this case
     the module — whose whole stated value is that everything except the scoped
     verify runs against real production code — would never touch the shipped
-    configuration, and the deferred-probe arm of ``_run_post_merge_verify``
+    configuration, and the deferred-probe arm of ``run_post_merge_verify``
     would be unreachable from here.
 
     The probe is made CHEAP, not fake: ``get_main_sha()`` fail-opens to ``''``,

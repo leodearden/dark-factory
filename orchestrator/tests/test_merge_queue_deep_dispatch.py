@@ -1327,7 +1327,7 @@ class TestRunInflightVerifyChainRedirect:
             await asyncio.Event().wait()
 
         monkeypatch.setattr(
-            'orchestrator.merge_lane.worker._run_post_merge_verify', _verify_until_cancelled,
+            'orchestrator.merge_lane.worker.run_post_merge_verify', _verify_until_cancelled,
         )
         in_flight = asyncio.ensure_future(
             worker._run_inflight_verify(members[cancelled_tid], _local_lease()),
@@ -1400,7 +1400,7 @@ class TestRunInflightVerifyChainRedirect:
             await asyncio.sleep(30)
 
         monkeypatch.setattr(
-            'orchestrator.merge_lane.worker._run_post_merge_verify', _slow_verify,
+            'orchestrator.merge_lane.worker.run_post_merge_verify', _slow_verify,
         )
         # The sole waiter gives up: this is what _request_abandoned reads.
         item.request.result.cancel()
@@ -1931,7 +1931,7 @@ async def _make_deep_scene(
     (:func:`_cohort_task_ids`).
 
     *script* is one bool per round (``True`` == the verify passed), or ``None``
-    to install no oracle at all and let the REAL ``_run_post_merge_verify``
+    to install no oracle at all and let the REAL ``run_post_merge_verify``
     run — which is what drives the true ``merge_verify`` emission site.  When
     *allocator* is given it is installed on the worker BEFORE first use, so
     ``_ensure_host_allocator``'s cache check (merge_queue.py:10288) short-
@@ -1994,7 +1994,7 @@ async def _make_deep_scene(
             return None if passed else MergeOutcome('blocked', reason='Verification failed: red')
 
         monkeypatch.setattr(
-            'orchestrator.merge_lane.worker._run_post_merge_verify', _oracle,
+            'orchestrator.merge_lane.worker.run_post_merge_verify', _oracle,
         )
     return scene
 

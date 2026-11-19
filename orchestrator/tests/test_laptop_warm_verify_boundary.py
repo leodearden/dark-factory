@@ -104,10 +104,9 @@ from test_cli import _setup_verify_repo
 import orchestrator.cli as cli_module
 from orchestrator.cli import main
 from orchestrator.config import OrchestratorConfig
-from orchestrator.merge_lane.worker import (
-    _run_post_merge_verify,
-    _verify_worktree_contention_sentinel,
-)
+from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
+from orchestrator.merge_lane.verify_failure_outcome import _verify_worktree_contention_sentinel
+from orchestrator.merge_lane.worker import PRODUCTION_VERIFIER
 from orchestrator.verify_cancel import (
     WatchdogTrigger,
     lane_lock_path,
@@ -968,7 +967,7 @@ def test_normal_warm_path_reuses_fixed_worktree_twice_no_escalation(tmp_path, mo
       failure sentinels like FLOCK_CONTENTION_CATEGORY), contention is None --
       structurally unchanged by the live heartbeat;
     * is_flock_contention_failure(result) is False for both -- the REAL beta
-      discriminant predicate that gates _run_post_merge_verify's escalation
+      discriminant predicate that gates run_post_merge_verify's escalation
       branch (task 2307 beta) never fires on this happy path, so nothing
       downstream would file a born-at-L2 escalation.  (A CLI-only harness
       has no merge_queue in the loop to observe an EscalationQueue directly
@@ -1035,7 +1034,7 @@ def test_normal_warm_path_reuses_fixed_worktree_twice_no_escalation(tmp_path, mo
         )
         assert is_flock_contention_failure(result) is False, (
             f'run {n}: real beta discriminant fired on a happy-path result -- '
-            f'_run_post_merge_verify would wrongly escalate: {result!r}'
+            f'run_post_merge_verify would wrongly escalate: {result!r}'
         )
 
 
@@ -1498,7 +1497,7 @@ def test_starvation_trigger_survives_real_remote_dispatch_and_replayed_worker_wa
 # verify-merge #1 holds .merge_verify.lock mid-build; a real verify-merge #2
 # on the SAME worktree_base reports the FLOCK_CONTENTION_CATEGORY
 # discriminant on stdout WITHOUT ever touching the tree; #2's parsed stdout
-# is then fed through the REAL merge_queue consumer (_run_post_merge_verify +
+# is then fed through the REAL merge_queue consumer (run_post_merge_verify +
 # a real EscalationQueue), asserting a born-at-L2 escalation is filed and the
 # MergeOutcome is 'blocked'.
 # ---------------------------------------------------------------------------
@@ -1528,7 +1527,7 @@ def test_flock_contention_full_two_way_seam_blocks_and_escalates(tmp_path):
     ``acquire_host_verify_worktree`` is ever called on contention).
 
     Consumer side: parses #2's stdout via ``result_from_json`` and feeds it
-    through the REAL ``_run_post_merge_verify`` (a stub runner returning that
+    through the REAL ``run_post_merge_verify`` (a stub runner returning that
     exact parsed result -- the established pattern from
     ``TestRunPostMergeVerifyFlockContention`` in
     ``test_merge_queue_multihost_wiring.py``) with a REAL
@@ -1642,7 +1641,7 @@ def test_flock_contention_full_two_way_seam_blocks_and_escalates(tmp_path):
         kill_holder_tree(holder, timeout=ROW5_HOLDER_TEARDOWN_CEILING_SECS)
 
     # --- Consumer side: feed #2's real discriminant through the real beta
-    # consumer (_run_post_merge_verify) with a real EscalationQueue. ---
+    # consumer (run_post_merge_verify) with a real EscalationQueue. ---
 
     stub_runner = MagicMock()
     stub_runner.is_local = False
@@ -1654,13 +1653,14 @@ def test_flock_contention_full_two_way_seam_blocks_and_escalates(tmp_path):
         config = probe_free_orch_config()
         req = merge_request_for_verify(config, task_files=['src/foo.py'], worktree=tmp_path)
         git_ops = git_ops_mock_for_verify()
-        return await _run_post_merge_verify(
+        return await run_post_merge_verify(
             git_ops, req, tmp_path,
             timeouts={}, enospc_retries={},
             max_timeouts=2, max_enospc=1,
             merge_sha=head_sha,
             runner=stub_runner,
             escalation_queue=eq,
+            verifier=PRODUCTION_VERIFIER,
         )
 
     outcome = asyncio.run(_drive_consumer())

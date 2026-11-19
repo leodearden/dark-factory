@@ -1060,13 +1060,13 @@ class TestDispatchItemProbeWiring:
 @pytest.mark.asyncio
 class TestRunInflightVerifyProbeBaseWiring:
     """_run_inflight_verify's new ``probe_base`` parameter (task 2359
-    step-16) overrides the ``main_sha`` fed to ``_run_post_merge_verify``'s
+    step-16) overrides the ``main_sha`` fed to ``run_post_merge_verify``'s
     merge-skew classification metadata -- WITHOUT touching ``item`` itself
     (item.base_sha, hence the frozen-prefix chain, is never mutated).
 
     Mirrors test_merge_queue_depth_telemetry.py's
     TestRunInflightVerifyDepthWiring exactly (same MagicMock git_ops +
-    HostLease(is_local=False) + patched ``_run_post_merge_verify``
+    HostLease(is_local=False) + patched ``run_post_merge_verify``
     capturing kwargs), scoped to the NEW ``probe_base`` -> ``main_sha``
     channel rather than the already-covered ``depth`` channel.
 
@@ -1103,7 +1103,7 @@ class TestRunInflightVerifyProbeBaseWiring:
         worker = SpeculativeMergeWorker(git_ops=MagicMock(), queue=asyncio.Queue())
 
         with patch(
-            'orchestrator.merge_lane.worker._run_post_merge_verify',
+            'orchestrator.merge_lane.worker.run_post_merge_verify',
             _fake_run_post_merge_verify,
         ):
             await worker._run_inflight_verify(
@@ -1154,7 +1154,7 @@ class TestRunInflightVerifyProbeBaseWiring:
         worker = SpeculativeMergeWorker(git_ops=MagicMock(), queue=asyncio.Queue())
 
         with patch(
-            'orchestrator.merge_lane.worker._run_post_merge_verify',
+            'orchestrator.merge_lane.worker.run_post_merge_verify',
             _fake_run_post_merge_verify,
         ):
             await worker._run_inflight_verify(item, lease, depth=1)

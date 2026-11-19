@@ -64,7 +64,8 @@ from orchestrator.merge_lane.types import (
     RemergeReason,
     SpeculativeItem,
 )
-from orchestrator.merge_lane.worker import MAIN_HEALTH_PROBE_PENDING_NOTE, SpeculativeMergeWorker
+from orchestrator.merge_lane.verify_failure_outcome import MAIN_HEALTH_PROBE_PENDING_NOTE
+from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_runner import RunnerUnavailable
 
@@ -120,7 +121,7 @@ def main_health_probe_spawned(outcome: MergeOutcome) -> bool:
     """Whether a red *outcome* left a detached main-health probe in flight.
 
     Reads ``merge_queue.py::MAIN_HEALTH_PROBE_PENDING_NOTE``, which
-    ``_run_post_merge_verify`` appends to a red outcome's reason whenever
+    ``run_post_merge_verify`` appends to a red outcome's reason whenever
     ``_spawn_main_health_probe`` put a probe in flight -- the only trace the
     probe leaves on the outcome.
 

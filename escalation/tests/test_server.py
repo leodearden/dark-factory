@@ -4255,7 +4255,7 @@ class TestMergeRequestDedup:
         The background worker captures the dequeued MergeRequest so the test
         can assert ``req.retry_failed_only is True`` — i.e. the caller-vouched
         bool reaches the worker's retry path (``req`` is the same object
-        ``_run_post_merge_verify`` reads).
+        ``run_post_merge_verify`` reads).
         """
         import asyncio
 

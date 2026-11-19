@@ -4,7 +4,7 @@ This module covers γ-specific tests that require multi-host verify infrastructu
 Tests are grouped per plan step:
 
   pre-1  SCAFFOLD — shared fixtures/helpers (git repo, gated runner, fake remote)
-  step-1 RED      — _run_post_merge_verify(runner=<fake>) + runner=None byte-identical
+  step-1 RED      — run_post_merge_verify(runner=<fake>) + runner=None byte-identical
   step-3 RED      — _inflight/redispatch-park/_n_failed/_remerge_occurred attrs + InflightEntry
   step-5 RED      — _run_inflight_verify happy paths (LOCAL + REMOTE lease)
   step-7 RED      — _run_inflight_verify abort-poll (abandon + halt)
@@ -72,6 +72,7 @@ from orchestrator.merge_lane.types import QueuedBranch, RemergeBase, RemergeReas
 from orchestrator.merge_lane.verify_cancellation import VerifyCancel, VerifyCancelCause
 from orchestrator.merge_lane.worker import (
     MERGE_WORKER_SHUTDOWN_REASON,
+    PRODUCTION_VERIFIER,
     MergeOutcome,
     MergeRequest,
     SpeculativeItem,
@@ -436,13 +437,13 @@ def _inject_host_allocator(
 
 
 # ---------------------------------------------------------------------------
-# step-1 RED: _run_post_merge_verify(runner=<fake>) wiring
+# step-1 RED: run_post_merge_verify(runner=<fake>) wiring
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 class TestRunPostMergeVerifyRunnerParam:
-    """_run_post_merge_verify(runner=<fake>) dispatches on the injected runner;
+    """run_post_merge_verify(runner=<fake>) dispatches on the injected runner;
     runner=None (default) stays LOCAL-ONLY byte-identical.
 
     RED until step-2 GREEN adds the runner= keyword arg.
@@ -458,19 +459,20 @@ class TestRunPostMergeVerifyRunnerParam:
 
     async def test_remote_runner_dispatched_when_runner_provided(self, tmp_path: Path) -> None:
         """runner=<fake remote> → pool is [runner], fake.run_merge_verify called."""
-        from orchestrator.merge_lane.worker import _run_post_merge_verify
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
 
         fake_remote = _make_fake_remote('laptop')
         config = OrchestratorConfig(git=GitConfig(main_branch='main'))
         req = make_merge_request('t1', 'task/t1', tmp_path, config)
         git_ops = self._make_git_ops_mock()
 
-        outcome = await _run_post_merge_verify(
+        outcome = await run_post_merge_verify(
             git_ops, req, tmp_path,
             timeouts={}, enospc_retries={},
             max_timeouts=2, max_enospc=1,
             merge_sha='abc123',
             runner=fake_remote,  # RED: this param doesn't exist yet
+            verifier=PRODUCTION_VERIFIER,
         )
 
         assert outcome is None  # verify passed
@@ -478,13 +480,13 @@ class TestRunPostMergeVerifyRunnerParam:
 
     async def test_runner_none_uses_local_runner_byte_identical(self, tmp_path: Path) -> None:
         """runner=None (default) → LocalRunner pool, byte-identical to today."""
-        from orchestrator.merge_lane.worker import _run_post_merge_verify
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
 
         config = OrchestratorConfig(git=GitConfig(main_branch='main'))
         req = make_merge_request('t2', 'task/t2', tmp_path, config)
         git_ops = self._make_git_ops_mock()
 
-        outcome = await _run_post_merge_verify(
+        outcome = await run_post_merge_verify(
             git_ops, req, tmp_path,
             timeouts={}, enospc_retries={},
             max_timeouts=2, max_enospc=1,
@@ -498,7 +500,7 @@ class TestRunPostMergeVerifyRunnerParam:
     async def test_merge_verify_event_carries_runner_name_when_remote(self, tmp_path: Path) -> None:
         """merge_verify event runner field == injected runner's name, not 'local'."""
         from orchestrator.event_store import EventStore
-        from orchestrator.merge_lane.worker import _run_post_merge_verify
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
 
         fake_remote = _make_fake_remote('laptop')
         config = OrchestratorConfig(git=GitConfig(main_branch='main'))
@@ -514,13 +516,14 @@ class TestRunPostMergeVerifyRunnerParam:
             def emit(self, event_type, *, task_id=None, phase=None, data=None, **kw):  # type: ignore[override]
                 emitted.append({'event_type': event_type, 'data': data or {}})
 
-        await _run_post_merge_verify(
+        await run_post_merge_verify(
             git_ops, req, tmp_path,
             timeouts={}, enospc_retries={},
             max_timeouts=2, max_enospc=1,
             merge_sha='abc123',
             runner=fake_remote,   # RED: this param doesn't exist yet
             event_store=_FakeEventStore(),
+            verifier=PRODUCTION_VERIFIER,
         )
 
         merge_verify_events = [
@@ -3736,7 +3739,7 @@ class TestRunInflightVerifyRemoteCancelOnAbort:
         gate_entered = asyncio.Event()
 
         # Gated scoped verify, injected through the worker's verifier port, so
-        # the local arm blocks inside _run_post_merge_verify until released.
+        # the local arm blocks inside run_post_merge_verify until released.
         verifier = _GatedVerifier(
             entered={None: gate_entered}, default=hangs_until(gate_release),
         )

@@ -1731,14 +1731,14 @@ class TestSMWShadowStateInit:
 
 
 class TestRunPostMergeVerifyOnResultCallback:
-    """(2) _run_post_merge_verify invokes an optional on_result callback with the VerifyResult."""
+    """(2) run_post_merge_verify invokes an optional on_result callback with the VerifyResult."""
 
     @pytest.mark.asyncio
     async def test_on_result_kwarg_accepted_without_type_error(
         self, tmp_path: Path
     ) -> None:
         """Passing on_result= must not raise TypeError (kwarg must exist)."""
-        from orchestrator.merge_lane.worker import _run_post_merge_verify
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
 
         received: list[VerifyResult] = []
         merge_wt = tmp_path / 'wt'
@@ -1756,11 +1756,11 @@ class TestRunPostMergeVerifyOnResultCallback:
         )
 
         # The verify port is INJECTED, not patched: `verifier=` already exists
-        # on _run_post_merge_verify, and FakeVerifier.ensure_disk_space returns
+        # on run_post_merge_verify, and FakeVerifier.ensure_disk_space returns
         # DiskGuardOutcome(reason=None) — identical to the
         # AsyncMock(return_value=None) this used to patch over
         # _ensure_verify_disk_space.
-        result = await _run_post_merge_verify(
+        result = await run_post_merge_verify(
             MagicMock(), req, merge_wt,
             timeouts={}, enospc_retries={},
             max_timeouts=2, max_enospc=1,
@@ -1772,7 +1772,7 @@ class TestRunPostMergeVerifyOnResultCallback:
         assert len(received) == 1
         assert isinstance(received[0], VerifyResult)
         assert received[0].passed is True
-        # _run_post_merge_verify returns None on PASS
+        # run_post_merge_verify returns None on PASS
         assert result is None
 
 
@@ -1872,7 +1872,7 @@ class TestVerifyAndAdvanceShadowCompareScheduling:
         escalations = _make_escalation_queue()
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         # A passing verify port, INJECTED (model: test_merge_lane_package.py),
-        # replaces the _run_post_merge_verify patch this used to need.
+        # replaces the run_post_merge_verify patch this used to need.
         worker = SpeculativeMergeWorker(
             wcs_git_ops, queue, event_store=None,
             escalation_queue=escalations, verifier=_warm_verifier(),
