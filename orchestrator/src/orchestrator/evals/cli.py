@@ -12,6 +12,7 @@ from shared.project_layout import runs_db, tasks_db
 from orchestrator.cli_config import pass_config
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.main_checkout_defaults import cli_default
+from orchestrator.routing import RoleDefaults, RouteInputs, RoutingDecision, resolve_route
 from orchestrator.shadow_types import ShadowShape
 
 _SHORT_CONFIG_HELP = 'Path to orchestrator config YAML (REQUIRED unless ORCH_CONFIG_PATH is set).'
@@ -936,10 +937,25 @@ def _run_cleanup(base_config):
     asyncio.run(_cleanup())
 
 
-def _run_plan_only(task_path: Path | None, base_config):
-    """Generate plans for eval tasks using the architect (opus-high).
+def _format_routing_decision(role_name: str, decision: RoutingDecision) -> str:
+    """The stdout line naming the route one eval invocation runs on."""
+    line = (
+        f'    routing_decision role={role_name} model={decision.model} '
+        f'effort={decision.effort} budget_usd={decision.budget_usd} '
+        f'max_turns={decision.max_turns} source_layer={decision.source_layer}'
+    )
+    if decision.rule_id is not None:
+        line += f' rule_id={decision.rule_id}'
+    if decision.rejected:
+        line += f' rejected={",".join(decision.rejected)}'
+    return line
 
-    Runs the architect against the pre-task commit for each task,
+
+def _run_plan_only(task_path: Path | None, base_config):
+    """Generate plans for eval tasks with the architect on its resolved route.
+
+    Runs the architect against the pre-task commit for each task, on the
+    route ``resolve_route`` gives role 'architect' under *base_config*, and
     saves the resulting plan into the task JSON file.
     """
     from orchestrator.evals.runner import load_task
@@ -996,17 +1012,26 @@ def _run_plan_only(task_path: Path | None, base_config):
                 )
                 prompt = await briefing.build_architect_prompt(task_def, worktree=worktree)
 
-                # Invoke architect (opus-high, always Claude)
+                decision = resolve_route(RouteInputs(
+                    role_name=ARCHITECT.name, task_id=task_id, task_metadata={},
+                    plan_shape=None, routing_tier=0, dispatch_count=0,
+                    role_defaults=RoleDefaults(
+                        model=ARCHITECT.default_model, effort='high',
+                        budget_usd=ARCHITECT.default_budget,
+                        max_turns=ARCHITECT.default_max_turns,
+                    ),
+                ), base_config)
+                click.echo(_format_routing_decision(ARCHITECT.name, decision))
                 result = await invoke_agent(
                     prompt=prompt,
                     system_prompt=ARCHITECT.system_prompt,
                     cwd=worktree,
-                    model='opus',
-                    max_turns=50,
-                    max_budget_usd=5.0,
+                    model=decision.model,
+                    max_turns=decision.max_turns,
+                    max_budget_usd=decision.budget_usd,
                     allowed_tools=ARCHITECT.allowed_tools or None,
                     disallowed_tools=ARCHITECT.disallowed_tools or None,
-                    effort='high',
+                    effort=decision.effort,
                     backend='claude',
                 )
 
