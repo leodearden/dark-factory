@@ -1615,6 +1615,19 @@ if unsure which one owns it) — `resolve_issue` on it un-halts the whole
 queue. If the log shows the halt cleared but the escalation record still
 shows `pending`, that's a genuine bug, not something to dismiss.
 
+**Across a restart.** A pending halt-owner record survives an orchestrator
+restart, but its halt is re-asserted only while `project_root` still has
+tracked uncommitted WIP or unmerged (`UU`/`AA`/`DD`) entries, or while that
+predicate cannot be measured
+(`orchestrator/src/orchestrator/merge_halt_rehydration.py::rehydrate_merge_halt`,
+task 3876). A record measured clean does **not** halt the queue: the journal
+carries a WARNING beginning `Merge halt NOT rehydrated`, and the record is
+stamped `halt_released_at` / `halt_release_note`, so it never re-owns a halt at
+any later restart. A conflict confined to a task worktree therefore never
+re-halts the queue. A released record still needs its human disposition (for
+example, a WIP recovery branch to reapply), but it no longer appears as
+`owner_esc_id` in `get_merge_halt_status`.
+
 #### `park_lock_contended` — a blocked merge, **not** a halt
 
 Contrast the two categories above, and `stash_failed` (which *does* halt:
