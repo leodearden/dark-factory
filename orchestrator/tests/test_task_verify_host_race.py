@@ -1068,6 +1068,32 @@ class TestAdmissionInactive:
 # ---------------------------------------------------------------------------
 
 
+async def _retry_between_turns(rig: _Rig) -> VerifyResult:
+    """Row 37's second scenario: the test leg's first run times out holding the local turn,
+    an older task takes the turn, and the retry waits behind it while the laptop turn frees."""
+    laptop_holder = rig.hold()
+    await _bounded(laptop_holder.granted.wait())
+    call = rig.start()
+    await _until(lambda: rig.legs.spawned(_TEST), watching=call)
+    older = rig.hold_local(task_id='older', arrival=0.0)
+    await _bounded(older.granted.wait())
+    await _until(lambda: _waiting(rig.local_gate, '7'), watching=call)
+    assert len(rig.legs.pids(_TEST)) == 1
+
+    await laptop_holder.leave()
+    await _until(lambda: _holding(rig.laptop) == _waiters(rig.laptop) == [])
+
+    assert not call.done()
+    await older.leave()
+    result = await _bounded(call)
+    assert result.passed
+    assert len(rig.legs.pids(_TEST)) == 2
+    assert rig.sidecar()['reason'] == 'local_granted_first'
+    assert rig.local.cancels == []
+    assert rig.remotes['laptop'].log == []
+    return result
+
+
 @_REAL
 class TestAGrantedPlanStaysLocal:
     async def test_row37_a_granted_module_keeps_the_plan_local_while_another_queues(
@@ -1105,26 +1131,13 @@ class TestAGrantedPlanStaysLocal:
         self, tmp_path: Path,
     ) -> None:
         rig = _rig(tmp_path, test_leg='times_out_first', module_timeout=1.0)
-        laptop_holder = rig.hold()
-        await _bounded(laptop_holder.granted.wait())
-        call = rig.start()
-        await _until(lambda: rig.legs.spawned(_TEST), watching=call)
-        older = rig.hold_local(task_id='older', arrival=0.0)
-        await _bounded(older.granted.wait())
-        await _until(lambda: _waiting(rig.local_gate, '7'), watching=call)
-        assert len(rig.legs.pids(_TEST)) == 1
+        await _retry_between_turns(rig)
 
-        await laptop_holder.leave()
-        await _until(lambda: _holding(rig.laptop) == _waiters(rig.laptop) == [])
-
-        assert not call.done()
-        await older.leave()
-        result = await _bounded(call)
-        assert result.passed
-        assert len(rig.legs.pids(_TEST)) == 2
-        assert rig.sidecar()['reason'] == 'local_granted_first'
-        assert rig.local.cancels == []
-        assert rig.remotes['laptop'].log == []
+    async def test_row37_a_retry_that_overruns_too_still_settles_locally(self, tmp_path: Path) -> None:
+        rig = _rig(tmp_path, module_timeout=1.0)
+        rig.legs.block(_TEST, _LINT, _TYPE)
+        result = await _retry_between_turns(rig)
+        assert result.timed_out
 
     async def test_row38_a_leg_granted_but_waiting_for_its_flock_keeps_the_plan_local(
         self, tmp_path: Path,
