@@ -15,7 +15,7 @@ from cockpit.panes.spawn_tree import build_spawn_forest, is_outstanding
 
 
 def _make_record(**overrides):
-    """Mirrors test_app.py's/test_session_table.py's _make_record convention."""
+    """Mirrors _cockpit_session_records.py::make_record and test_session_table.py::_make_record."""
     fields: dict = {
         'session_slug': 'unblock-df-2085-4242',
         'status': session_records.Status.RUNNING,
