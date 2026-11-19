@@ -6,6 +6,7 @@ lands, and that failures surface to the caller rather than being contained.
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -18,7 +19,6 @@ from fused_memory.reconciliation.reconciler_escalation import (
     INSTALLED_ESCALATION_QUEUE_FACTORY,
     EscalationQueueFactory,
     file_reconciler_l1,
-    pending_escalations,
     pinning_escalation_ids_by_task,
 )
 
@@ -72,15 +72,6 @@ def test_files_into_the_layout_escalation_queue_when_relocated(
     assert not (tmp_path / escalation_queue_relocation.legacy_relpath).exists()
 
 
-def test_pending_escalations_lists_every_filed_id(tmp_path):
-    root = _root(tmp_path)
-    assert pending_escalations(EscalationQueue, root) == []
-
-    filed_ids = {_file(root, task_id='7'), _file(root, task_id='8')}
-
-    assert {esc.id for esc in pending_escalations(EscalationQueue, root)} == filed_ids
-
-
 def _raise_at_construction(queue_dir: Path) -> EscalationQueue:
     raise OSError('read-only fs')
 
@@ -103,11 +94,6 @@ def test_filing_propagates_a_queue_construction_failure(tmp_path):
 def test_filing_propagates_a_submit_failure(tmp_path):
     with pytest.raises(RuntimeError, match='disk full'):
         _file(_root(tmp_path), factory=_SubmitFailsQueue)
-
-
-def test_pending_escalations_propagates_a_read_failure(tmp_path):
-    with pytest.raises(RuntimeError, match='index unreadable'):
-        pending_escalations(_GetPendingFailsQueue, _root(tmp_path))
 
 
 def _submit(root: ProjectRoot, *, task_id: str, severity: str, level: int) -> str:
@@ -159,6 +145,17 @@ def test_pinning_ids_are_grouped_per_task(tmp_path):
     _submit(root, task_id='8', severity='info', level=1)
 
     assert pinning_escalation_ids_by_task(EscalationQueue, root) == {'7': (blocking_id,)}
+
+
+def test_an_int_typed_task_id_pins_under_its_str_id(tmp_path):
+    root = _root(tmp_path)
+    blocking_id = _submit(root, task_id='7', severity='blocking', level=1)
+    record_path = Path(escalation_queue_dir(root)) / f'{blocking_id}.json'
+    record = json.loads(record_path.read_text())
+    record['task_id'] = 7
+    record_path.write_text(json.dumps(record))
+
+    assert pinning_escalation_ids_by_task(EscalationQueue, root)['7'] == (blocking_id,)
 
 
 def test_pinning_ids_propagate_a_read_failure(tmp_path):

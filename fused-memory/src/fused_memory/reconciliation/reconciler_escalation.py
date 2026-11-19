@@ -1,10 +1,9 @@
 """The reconciler's escalation-queue seam.
 
 Owns the optional ``escalation`` package import and its installed default
-queue factory, filing one reconciler-authored L1, reading the pending queue,
-and deciding which pending records pin a task. Every function here is
-synchronous blocking filesystem I/O that coroutine callers run under
-``asyncio.to_thread`` (INV-8).
+queue factory, filing one reconciler-authored L1, and deciding which pending
+records pin a task. Every function here is synchronous blocking filesystem
+I/O that coroutine callers run under ``asyncio.to_thread`` (INV-8).
 """
 
 from __future__ import annotations
@@ -21,7 +20,6 @@ __all__ = [
     'INSTALLED_ESCALATION_QUEUE_FACTORY',
     'EscalationQueueFactory',
     'file_reconciler_l1',
-    'pending_escalations',
     'pinning_escalation_ids_by_task',
 ]
 
@@ -31,7 +29,7 @@ EscalationQueueFactory = Callable[[Path], 'EscalationQueue']
 # factory is None and every escalation path degrades to its logged no-op or veto.
 try:
     from escalation.models import Escalation  # type: ignore[import-untyped]
-    from escalation.pins import classify_pins
+    from escalation.pins import is_queue_handoff
     from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
     INSTALLED_ESCALATION_QUEUE_FACTORY: EscalationQueueFactory | None = EscalationQueue
 except ImportError:  # pragma: no cover — exercised only in minimal envs
@@ -71,32 +69,21 @@ def file_reconciler_l1(
     ))
 
 
-def pending_escalations(
-    queue_factory: EscalationQueueFactory, project_root: ProjectRoot,
-) -> list[Escalation]:
-    """Every pending escalation in project_root's queue; blocking I/O, raises whatever the queue raised."""
-    return queue_factory(escalation_queue_dir(project_root)).get_pending()
-
-
 def pinning_escalation_ids_by_task(
     queue_factory: EscalationQueueFactory, project_root: ProjectRoot,
 ) -> dict[str, tuple[str, ...]]:
     """Map each task to the ids of its pending escalations that PIN it.
 
-    Blocking I/O; raises whatever the queue raised, like its siblings. Each
-    task's records are classified by ``escalation.pins.classify_pins``, whose
-    chain lives in ``escalation/src/escalation/pins.py`` and is not restated
-    here. Liveness is passed as live with no identity, because the reconciler
-    cannot prove a filer dead, so only an info record, at any level, drops out.
+    Blocking I/O; raises whatever the queue raised, like its sibling. One
+    ``EscalationQueue.get_pending_by_task`` scan serves every task, and a
+    record pins exactly when ``escalation.pins.is_queue_handoff`` says so.
     """
-    records_by_task: dict[str, list[Escalation]] = defaultdict(list)
-    for esc in pending_escalations(queue_factory, project_root):
+    queue = queue_factory(escalation_queue_dir(project_root))
+    pinning_ids: dict[str, list[str]] = defaultdict(list)
+    for raw_task_id, records in queue.get_pending_by_task().items():
         # str(): an int-typed task_id must still match the str dependent id.
-        task_id = str(esc.task_id or '')
-        if task_id:
-            records_by_task[task_id].append(esc)
-    pinning_ids = {
-        task_id: classify_pins(task_id, records, live_claimant=True).queue_handoff
-        for task_id, records in records_by_task.items()
-    }
-    return {task_id: ids for task_id, ids in pinning_ids.items() if ids}
+        task_id = str(raw_task_id or '')
+        ids = [esc.id for esc in records if is_queue_handoff(esc)]
+        if task_id and ids:
+            pinning_ids[task_id].extend(ids)
+    return {task_id: tuple(ids) for task_id, ids in pinning_ids.items()}
