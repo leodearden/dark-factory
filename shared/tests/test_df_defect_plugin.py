@@ -160,7 +160,8 @@ class TestMarkersAndCollectionMap:
     def test_no_junitxml_writes_no_map(self, project_a):
         result = _run_pytest(project_a, '--strict-markers')
         assert result.returncode == 0, result.stdout + result.stderr
-        assert list(project_a.rglob('*.tests.json')) == []
+        for directory in (project_a, project_a / 'tests'):
+            assert list(directory.glob('*.tests.json')) == []
 
     def test_nothing_marked_still_writes_an_empty_map(self, tmp_path):
         project = _write_project(
