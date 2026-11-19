@@ -81,9 +81,9 @@ def test_the_rule_is_shape_only_an_empty_mapping_is_still_a_check() -> None:
 
 
 def test_declared_checks_is_frozen() -> None:
-    declared = _read([_A])
+    mutable: Any = _read([_A])
     with pytest.raises(dataclasses.FrozenInstanceError):
-        setattr(declared, 'checks', ())
+        mutable.checks = ()
 
 
 def test_a_list_of_only_unreadable_entries_is_not_empty() -> None:
