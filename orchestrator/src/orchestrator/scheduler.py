@@ -8277,7 +8277,7 @@ class Scheduler:
 
     def note_workflow_cancelled(self, tid: str) -> None:
         """Stamp *tid* as just-cancelled, opening the reconcile grace window."""
-        self._workflow_cancel_at[tid] = time.monotonic()
+        self._workflow_cancel_at[tid] = self._time_source()
 
     def clear_workflow_cancel(self, tid: str) -> None:
         """Clear *tid*'s cancel stamp, if any (no-op if absent)."""
@@ -8297,7 +8297,7 @@ class Scheduler:
         cancelled_at = self._workflow_cancel_at.get(tid)
         return (
             cancelled_at is not None
-            and time.monotonic() - cancelled_at < self._RECONCILE_CANCEL_GRACE_S
+            and self._time_source() - cancelled_at < self._RECONCILE_CANCEL_GRACE_S
         )
 
     # --- Pre-enqueue MERGE-phase grace accessors (task 2753) ---
@@ -8309,11 +8309,11 @@ class Scheduler:
     def note_merge_phase_entered(self, tid: str) -> None:
         """Stamp *tid* as entering the pre-enqueue MERGE-phase window.
 
-        Re-stamps ``time.monotonic()`` on each call (each REQUEUED retry
-        re-runs a vulnerable pre-merge verify), so the grace tracks the most
-        recent entry.
+        Re-stamps from the scheduler's time source on each call (each
+        REQUEUED retry re-runs a vulnerable pre-merge verify), so the grace
+        tracks the most recent entry.
         """
-        self._merge_phase_at[tid] = time.monotonic()
+        self._merge_phase_at[tid] = self._time_source()
 
     def clear_merge_phase(self, tid: str) -> None:
         """Clear *tid*'s merge-phase stamp, if any (no-op if absent)."""
@@ -8331,7 +8331,7 @@ class Scheduler:
         """
         if grace_secs <= 0:
             return False
-        now = time.monotonic()
+        now = self._time_source()
         return any(
             now - stamp < grace_secs for stamp in self._merge_phase_at.values()
         )
