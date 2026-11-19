@@ -393,9 +393,9 @@ class TestCeilingIsLiveInThisRun:
 
         assert basetemp in entries, (
             f'{_CEILING_KEY} does not contain this run\'s basetemp {basetemp}.\n'
-            'The session ceiling fixture is not loaded for this rootdir. Wire '
-            'the test-root conftest to import _df_git_ceiling_at_basetemp from '
-            'df_pytest_isolation.'
+            'The session ceiling fixture is not armed for this rootdir. Call '
+            'arm_test_root_isolation(config) from the test-root conftest\'s '
+            'pytest_configure.'
         )
 
     def test_the_ambient_ceiling_has_no_duplicate_entries(self) -> None:
@@ -515,12 +515,15 @@ def _file_based_path(node: ast.expr, conftest: Path) -> Path | None:
 
 
 def _repo_root_names(tree: ast.Module, conftest: Path) -> set[str]:
-    """Names bound to a path expression that evaluates to the repo root."""
+    """Names bound, by assignment or walrus, to a path expression that evaluates to the repo root."""
     names: set[str] = set()
     for node in ast.walk(tree):
-        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target = node.targets[0]
+        elif isinstance(node, ast.NamedExpr):
+            target = node.target
+        else:
             continue
-        target = node.targets[0]
         if not isinstance(target, ast.Name):
             continue
         value = _file_based_path(node.value, conftest)
@@ -565,27 +568,30 @@ def _wiring_defects(source: str, conftest: Path) -> list[str]:
         for alias in node.names
     }
     defects.extend(
-        f'does not import {fixture} from df_pytest_isolation (pytest only collects '
-        f'fixtures bound into the conftest namespace, so the import IS the wiring){consequence}'
-        for fixture, consequence in _REQUIRED_ARMED_FIXTURES.items()
-        if fixture not in imported
+        f'does not import {name} from df_pytest_isolation'
+        for name in ('arm_test_root_isolation', 'reject_unsafe_basetemp')
+        if name not in imported
     )
-    if 'reject_unsafe_basetemp' not in imported:
-        defects.append('does not import reject_unsafe_basetemp from df_pytest_isolation')
 
     configures = [
         node for node in tree.body
         if isinstance(node, ast.FunctionDef) and node.name == 'pytest_configure'
     ]
+    called = {
+        inner.func.id
+        for node in configures for inner in ast.walk(node)
+        if isinstance(inner, ast.Call) and isinstance(inner.func, ast.Name)
+    }
     if not configures:
         defects.append('defines no pytest_configure hook')
-    elif not any(
-        isinstance(inner, ast.Call)
-        and isinstance(inner.func, ast.Name)
-        and inner.func.id == 'reject_unsafe_basetemp'
-        for node in configures for inner in ast.walk(node)
-    ):
+    elif 'reject_unsafe_basetemp' not in called:
         defects.append('pytest_configure does not call reject_unsafe_basetemp(config)')
+    if configures and 'arm_test_root_isolation' not in called:
+        defects.append(
+            'pytest_configure does not call arm_test_root_isolation(config) (pytest only '
+            'collects fixtures a plugin or conftest registers, so that call IS the wiring)'
+            + ''.join(_REQUIRED_ARMED_FIXTURES.values())
+        )
 
     root_names = _repo_root_names(tree, conftest)
     if not root_names:
