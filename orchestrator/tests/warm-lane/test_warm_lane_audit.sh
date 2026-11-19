@@ -1997,7 +1997,7 @@ printf '%s\n' 'import json, sys' 'assert json.load(sys.stdin) == {"r": 1}' > "$R
 _r_from_dir() { (cd "$1" && shift && _py_json_check "$@"); }
 
 assert "R0: without isolation the sibling json.py shadows the stdlib json (exit 97; non-vacuity control)" \
-    bash -c 'printf "%s" "{\"r\": 1}" | python3 "$1"; [ "$?" -eq 97 ]' _ "$R_DIR/check.py"
+    bash -c 'printf "%s" "{\"r\": 1}" | env -u PYTHONSAFEPATH python3 "$1"; [ "$?" -eq 97 ]' _ "$R_DIR/check.py"
 assert "R1: a checker script run by _py_json_check imports the stdlib json, not its directory's json.py" \
     _py_json_check '{"r": 1}' "$R_DIR/check.py"
 assert "R2: a -c checker run by _py_json_check from the poisoned cwd imports the stdlib json" \

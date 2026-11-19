@@ -522,14 +522,13 @@ removes the cause, and `SUBPROC_TIMEOUT` is not widened.
 `mktemp -d` holds a `json.py` that writes `poisoned json.py imported` to
 stderr and exits 97, beside a checker that imports json. The stderr line
 names the cause in a failing assert's captured-output dump. **R0** is the non-vacuity control: run
-with bare `python3`, the checker exits 97, so the poison really does shadow
-json. **R1** runs the checker script through the helper, and **R2** runs a
-`-c` checker through it from the poisoned cwd. Both exit 0. The block is
-NON-VACUOUS by construction: with the helper still running bare `python3`,
-the suite reports `Results: 233 passed, 2 failed`, the failures being R1 and
-R2. The floor moved **229 → 232**, re-measured as `Results: 235 passed,
-0 failed` and still deducting L9's 3 root-guarded asserts. The block needs
-only `python3`, which `REQUIRED_HOST_TOOLS` already lists.
+with bare `python3` and `PYTHONSAFEPATH` unset, the checker exits 97, so the
+poison really does shadow json. **R1** runs the checker script through the
+helper, and **R2** runs a `-c` checker through it from the poisoned cwd. Both
+exit 0. The block is NON-VACUOUS by construction: with the helper still
+running bare `python3`, R1 and R2 fail. Its asserts are counted in the floor's
+one home, `test_warm_lane_bash_suite.py::ASSERT_FLOORS`. The block needs only
+`python3`, which `REQUIRED_HOST_TOOLS` already lists.
 
 ### Not a delta — α's provision Deltas 1–2 needed no test-side change
 
