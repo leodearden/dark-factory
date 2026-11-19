@@ -168,7 +168,7 @@ class TestNoTestsRanIsNeverInheritedFromMain:
         )
 
         git_ops = GitOps(config.git, config.project_root)
-        git_ops.get_main_sha = AsyncMock(return_value=MAIN_SHA)  # type: ignore[method-assign]
+        get_main_sha = AsyncMock(return_value=MAIN_SHA)
         git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
         probe = AsyncMock(return_value=failing_result)
 
@@ -176,6 +176,7 @@ class TestNoTestsRanIsNeverInheritedFromMain:
             return (0, '', '')
 
         with (
+            patch.object(git_ops, 'get_main_sha', new=get_main_sha),
             patch.object(verify_module, 'run_scoped_verification', new=probe),
             patch('orchestrator.git_ops._run', side_effect=_fake_run),
         ):
@@ -186,6 +187,7 @@ class TestNoTestsRanIsNeverInheritedFromMain:
             )
 
         assert result == (False, '')
+        get_main_sha.assert_not_awaited()
         probe.assert_not_awaited()
 
 

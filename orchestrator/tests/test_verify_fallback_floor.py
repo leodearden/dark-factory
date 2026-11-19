@@ -7,6 +7,7 @@ tests. Rationale: docs/fallback-test-floor.md.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Literal
 from unittest.mock import AsyncMock, patch
@@ -299,6 +300,7 @@ def _write_files(root: Path, files: list[str]) -> None:
 def _passing_result() -> verify.VerifyResult:
     return verify.VerifyResult(
         passed=True, test_output='', lint_output='', type_output='', summary='ok',
+        failing_leg_categories=[],
     )
 
 
@@ -344,8 +346,11 @@ class TestRunScopedVerificationFallbackFloor:
     async def test_reify_9839_executes_configured_command(self, tmp_path, role):
         _write_files(tmp_path, REIFY_9839_FILES)
 
-        executed, run, _ = await _run_fallback(tmp_path, REIFY_TEST_COMMAND, REIFY_9839_FILES, role)
+        executed, run, result = await _run_fallback(
+            tmp_path, REIFY_TEST_COMMAND, REIFY_9839_FILES, role,
+        )
 
+        assert result.passed is True
         assert executed.test_command == REIFY_TEST_COMMAND
         assert run['scope_kind'] == 'full_suite'
         assert run['module_prefix'] == executed.prefix
@@ -400,18 +405,11 @@ class TestRunScopedVerificationFallbackFloor:
     async def test_bare_default_source_only_runs_whole_at_merge_role(self, tmp_path):
         _write_files(tmp_path, ['pkg/helpers.py'])
 
-        executed, run, _ = await _run_fallback(tmp_path, 'pytest', ['pkg/helpers.py'], 'merge')
+        executed, run, result = await _run_fallback(tmp_path, 'pytest', ['pkg/helpers.py'], 'merge')
 
+        assert result.passed is True
         assert executed.test_command == 'pytest'
         assert run['scope_kind'] == 'full_suite'
-
-    async def test_bare_default_source_only_keeps_the_task_role_skip(self, tmp_path):
-        _write_files(tmp_path, ['pkg/helpers.py'])
-
-        executed, run, _ = await _run_fallback(tmp_path, 'pytest', ['pkg/helpers.py'], 'task')
-
-        assert executed.test_command is None
-        assert run['scope_kind'] == 'skipped'
 
     @pytest.mark.parametrize('role', ROLES)
     async def test_derived_configured_suite_keeps_its_verbatim_reason(self, tmp_path, role):
@@ -439,6 +437,8 @@ class TestNoTestsRanOutcome:
         assert result.trivial is False
         assert result.failing_leg_categories is None
         assert 'pkg/helpers.py' in result.cause_hint
+        assert 'report_missing_plan_file' in result.cause_hint
+        assert 'verify_allow_no_tests_ran' not in result.cause_hint
         assert executed.test_command is None
         assert executed.lint_command is not None
         assert executed.type_check_command is not None
@@ -467,37 +467,28 @@ class TestNoTestsRanOutcome:
         assert result.category == 'lint_error'
         assert result.passed is False
 
-    async def test_opt_in_lets_the_empty_slot_pass(self, tmp_path):
+    async def test_opt_in_lets_the_empty_slot_pass_with_a_warning(self, tmp_path, caplog):
         _write_files(tmp_path, ['pkg/helpers.py'])
 
-        _, run, result = await _run_fallback(
-            tmp_path, 'pytest', ['pkg/helpers.py'], 'task', verify_allow_no_tests_ran=True,
-        )
+        with caplog.at_level(logging.WARNING, logger=verify.__name__):
+            _, run, result = await _run_fallback(
+                tmp_path, 'pytest', ['pkg/helpers.py'], 'task', verify_allow_no_tests_ran=True,
+            )
 
         assert result.passed is True
         assert result.category != NO_TESTS_RAN_CATEGORY
         assert run['scope_kind'] == 'skipped'
+        assert any(
+            record.levelno == logging.WARNING
+            and 'verify_allow_no_tests_ran' in record.getMessage()
+            and 'pkg/helpers.py' in record.getMessage()
+            for record in caplog.records
+        )
 
     @pytest.mark.parametrize('role', ROLES)
     async def test_empty_test_command_stays_the_explicit_opt_out(self, tmp_path, role):
         _write_files(tmp_path, ['pkg/helpers.py'])
 
         _, _, result = await _run_fallback(tmp_path, '', ['pkg/helpers.py'], role)
-
-        assert result.passed is True
-
-    async def test_bare_default_at_merge_role_runs_a_command_and_passes(self, tmp_path):
-        _write_files(tmp_path, ['pkg/helpers.py'])
-
-        executed, _, result = await _run_fallback(tmp_path, 'pytest', ['pkg/helpers.py'], 'merge')
-
-        assert executed.test_command == 'pytest'
-        assert result.passed is True
-
-    @pytest.mark.parametrize('role', ROLES)
-    async def test_configured_suite_floor_runs_a_command_and_passes(self, tmp_path, role):
-        _write_files(tmp_path, REIFY_9839_FILES)
-
-        _, _, result = await _run_fallback(tmp_path, REIFY_TEST_COMMAND, REIFY_9839_FILES, role)
 
         assert result.passed is True
