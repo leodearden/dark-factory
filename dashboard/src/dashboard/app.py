@@ -317,7 +317,8 @@ async def lifespan(app: FastAPI, *, loops: BackgroundLoops = PRODUCTION_LOOPS):
     this lifespan would wire its stores and loops to a config it never built.
     ``app.state`` assignment is retained purely for request handlers (which
     read ``request.app.state.config``) and for the tests that swap it.
-    ``_metrics_loop``'s docstring above states the resulting invariant in full;
+    ``dashboard/src/dashboard/loops.py::_metrics_loop``'s docstring states the
+    resulting invariant in full;
     ``dashboard/tests/test_lifespan_resource_binding.py`` pins it.
 
     **Shutdown also reaps detached cache refreshes**, which are the one thing
@@ -387,7 +388,8 @@ async def lifespan(app: FastAPI, *, loops: BackgroundLoops = PRODUCTION_LOOPS):
     # The reaper reclaims pool connections a cancelled request orphaned, which
     # httpcore itself cannot: dashboard/src/dashboard/http_pool.py states the
     # mechanism. It takes the LOCAL http_client — never app.state.http_client —
-    # for the reason _metrics_loop's docstring gives in full (task 3771).
+    # for the reason dashboard/src/dashboard/loops.py::_metrics_loop's docstring
+    # gives in full (task 3771).
     samplers = (
         (
             asyncio.create_task(loops.burndown(burndown_store, config, http_client)),
