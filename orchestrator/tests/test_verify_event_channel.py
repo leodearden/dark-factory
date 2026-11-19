@@ -14,6 +14,7 @@ import shutil
 import stat
 import sys
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -441,9 +442,38 @@ def test_a_removed_channel_directory_is_recreated_on_the_next_allocation(
 
     with allocate_verify_event_log(role='task') as log:
         assert log.path is not None
-        assert log.path.parent.is_dir()
-        assert log.path.parent.parent == shared_temp_dir
+        assert log.path.parent == first_dir
+        assert stat.S_IMODE(first_dir.stat().st_mode) == 0o700
+        assert list(shared_temp_dir.iterdir()) == [first_dir]
         assert log.read().present
+
+
+def _make_world_writable(channel_dir: Path, tmp_path: Path) -> None:
+    channel_dir.chmod(0o777)
+
+
+def _replace_with_a_symlink_to_a_private_dir(channel_dir: Path, tmp_path: Path) -> None:
+    elsewhere = tmp_path / 'elsewhere'
+    elsewhere.mkdir(mode=0o700)
+    channel_dir.rmdir()
+    channel_dir.symlink_to(elsewhere)
+
+
+@pytest.mark.parametrize(
+    'squat', [_make_world_writable, _replace_with_a_symlink_to_a_private_dir],
+)
+def test_a_channel_directory_not_private_to_this_user_fails_open_without_writing_into_it(
+    shared_temp_dir: Path, tmp_path: Path, squat: Callable[[Path, Path], None],
+) -> None:
+    with allocate_verify_event_log(role='task') as first:
+        assert first.path is not None
+        channel_dir = first.path.parent
+    squat(channel_dir, tmp_path)
+
+    with allocate_verify_event_log(role='task') as log:
+        assert log.path is None
+        assert log.export_into({VERIFY_EVENT_LOG_ENV: 'ambient'})[VERIFY_EVENT_LOG_ENV] == ''
+        assert list(channel_dir.iterdir()) == []
 
 
 def test_a_missing_temp_dir_fails_open_to_a_masked_channel(
