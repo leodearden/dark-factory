@@ -227,7 +227,7 @@ class DryRunInvestigationHandles:
     optional, default-``None`` param so the post-merge verify stays a pure
     git engine (mirrors the ``train_callback_factory`` opaque-injection
     pattern — the worker never imports the scheduler).  Only
-    ``SpeculativeMergeWorker._lane_post_merge_verify`` (the in-flight verify
+    ``VerifyDispatcher.post_merge_verify`` (the in-flight verify
     and the single-branch gate re-verify) passes a live instance; the
     solo-reverify and train module-level callers pass nothing,
     so their spawns automatically no-op.

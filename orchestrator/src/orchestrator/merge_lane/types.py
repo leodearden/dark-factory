@@ -1570,7 +1570,7 @@ class ChainResult:
 
         Off by one from the ``chain_items`` telemetry field on purpose: the
         dispatching item is chain item #1 and is not a link, so γ emits
-        ``1 + depth`` (merge_queue.py, ``_run_inflight_verify``'s chain arm).
+        ``1 + depth`` (merge_queue.py, ``VerifyDispatcher.run_inflight_verify``'s chain arm).
         A 2-link chain is ``depth == 2`` and ``chain_items == 3``.
         """
         return len(self.links)
@@ -1716,7 +1716,7 @@ class ItemLifecycleState(StrEnum):
     Members are ``str`` instances (mirrors :class:`InflightStatus` /
     :class:`OutcomeKind` above). Only THREE members share a wire value with
     an existing live phase string today — ``VERIFYING`` ('verifying', set in
-    ``_run_inflight_verify``), ``GATE_REVERIFY`` ('gate_reverify'), and
+    ``VerifyDispatcher.run_inflight_verify``), ``GATE_REVERIFY`` ('gate_reverify'), and
     ``FINALIZING`` ('finalizing') (the latter two set in
     ``_finalize_inflight``) — so ``==``/``in`` comparisons against THOSE
     THREE raw strings keep working unchanged. The other seven members are
@@ -1763,7 +1763,7 @@ class ItemLifecycleState(StrEnum):
 
 @dataclass
 class VerifyWorktreeHandle:
-    """The worktree ``_run_inflight_verify`` is ACTUALLY verifying in (task 3186).
+    """The worktree ``VerifyDispatcher.run_inflight_verify`` is ACTUALLY verifying in (task 3186).
 
     A one-field mutable box, and the shape is forced by construction order:
     ``_dispatch_item`` creates the verify task BEFORE it builds the
@@ -2024,10 +2024,10 @@ class InflightEntry:
     item           : the SpeculativeItem being verified
     lease          : the HostLease held for this verify (None for passthroughs,
                      and once the verify released it at its verdict)
-    verify_task    : the asyncio.Task wrapping _run_inflight_verify (None for passthroughs)
+    verify_task    : the asyncio.Task wrapping VerifyDispatcher.run_inflight_verify (None for passthroughs)
     merge_wt       : the merge worktree path.  The PRE-verify fact UNTIL δ's
                      adoption publishes the post-verify one onto it (task
-                     3186): ``_run_inflight_verify`` never writes this field,
+                     3186): ``VerifyDispatcher.run_inflight_verify`` never writes this field,
                      so for every non-adopted entry it stays the ephemeral
                      ``_merge-<uuid>`` the item was merged in, and the
                      post-verify path is ``vr.merge_wt``.
@@ -2059,9 +2059,9 @@ class InflightEntry:
                      SpeculativeMergeWorker._land_chain_prefix (task 3186, PRD
                      δ), the in-order CAS walk that lands ``links`` once the
                      tip has passed; a red or errored tip still adopts nothing
-                     (see _run_inflight_verify's chain arm).  NOTE the lane
+                     (see VerifyDispatcher.run_inflight_verify's chain arm).  NOTE the lane
                      referenced here is already RELEASED by the time
-                     _finalize_inflight sees this entry: _run_inflight_verify
+                     _finalize_inflight sees this entry: VerifyDispatcher.run_inflight_verify
                      returns it to the pool in its own ``finally``, so this
                      field is never a release handle.
     chain_adopted  : ``True`` when δ (task 3186) claimed THIS entry for a
@@ -2398,7 +2398,7 @@ UNTRACKED_HOST_WIRE: Mapping[str, None] = MappingProxyType(dict.fromkeys((
 
 @dataclass
 class InflightVerifyResult:
-    """Result returned by SpeculativeMergeWorker._run_inflight_verify.
+    """Result returned by VerifyDispatcher.run_inflight_verify.
 
     Fields
     ------

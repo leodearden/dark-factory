@@ -2170,7 +2170,7 @@ class MergeVerifyLeaseContended(RuntimeError):
       unprotected.  It fires BEFORE any verify is dispatched at all.
 
     Both propagate to the merge worker's requeue seam
-    (``_run_inflight_verify``), which DEFERS the dispatch — re-queued to try
+    (``VerifyDispatcher.run_inflight_verify``), which DEFERS the dispatch — re-queued to try
     again later — instead of resolving a ``MergeOutcome('blocked')``.  That
     placement matters: a blocked resolution here would carry a DETERMINISTIC
     reason string, producing an identical ``merge_outcome_signature`` on every

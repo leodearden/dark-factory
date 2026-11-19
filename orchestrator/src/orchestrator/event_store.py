@@ -255,7 +255,7 @@ class EventType(StrEnum):
     merge_flake_suppressed = 'merge_flake_suppressed'
     # One firing of Abort trigger 3 (no in-flight verify progress for a full
     # budget) in orchestrator/src/orchestrator/merge_lane/worker.py::
-    # SpeculativeMergeWorker._run_inflight_verify, requeue and cap-out alike.
+    # VerifyDispatcher.run_inflight_verify, requeue and cap-out alike.
     # task_id-keyed, phase='merge'; data is defined by
     # orchestrator/src/orchestrator/merge_lane/no_progress_abort.py::
     # NoProgressAbort.event_data.

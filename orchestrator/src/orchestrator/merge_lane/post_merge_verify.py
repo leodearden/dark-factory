@@ -260,7 +260,7 @@ async def run_post_merge_verify(
             lane verify and train verify pass the worker's ``operator_halt``.
         dry_run_handles: Opaque bundle of scheduler/mcp/usage_gate/cost_store
             (task η).  ``None`` (default) makes the dry-run spawn a no-op.
-            Only ``SpeculativeMergeWorker._lane_post_merge_verify`` passes a
+            Only ``VerifyDispatcher.post_merge_verify`` passes a
             live bundle, at which point a MERGE_VERIFY_RED outcome fires a
             fire-and-forget dry-run investigation.
         main_health_probe_handles: Opaque bundle carrying the worker's

@@ -229,7 +229,7 @@ class MainHealthProbeHandles:
     and is drained by the worker's existing shutdown drain
     (``SpeculativeMergeWorker.stop``).
 
-    Only ``SpeculativeMergeWorker._lane_post_merge_verify``, which serves the
+    Only ``VerifyDispatcher.post_merge_verify``, which serves the
     in-flight verify and the single-branch gate re-verify, passes a live
     instance (task 2564 step-16, task 6278).  The solo-reverify and train
     callers — and any bare test caller — pass ``None`` (the default), so

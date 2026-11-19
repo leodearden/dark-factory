@@ -460,7 +460,7 @@ class TestDispatchItemComputesTruthfulChainItems:
                 outcome=None, merge_wt=None, status=InflightStatus.REQUEUED,
             )
 
-        worker.verify_dispatch.run_inflight_verify = _fake_run_inflight_verify
+        vars(worker.verify_dispatch)['run_inflight_verify'] = _fake_run_inflight_verify
         lease = HostLease(name='laptop', runner=_fake_pass_runner(), is_local=False)
         worker._acquire_host_lease_for = AsyncMock(  # type: ignore[method-assign]
             return_value=(lease, None),

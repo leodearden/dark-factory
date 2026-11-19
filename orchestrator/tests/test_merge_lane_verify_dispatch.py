@@ -14,7 +14,7 @@ import asyncio
 import contextlib
 import importlib
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 import pytest_asyncio
@@ -213,7 +213,7 @@ async def scene(tmp_path: Path) -> _Scene:
 
 
 def _local_lease() -> HostLease:
-    return HostLease(name='local', runner=None, is_local=True)  # type: ignore[arg-type]
+    return HostLease(name='local', runner=cast(Any, None), is_local=True)
 
 
 async def _verify(
@@ -254,7 +254,7 @@ class TestRunInflightVerify:
         dispatcher = scene.dispatcher(FakeVerifier(passes()))
         item = await scene.merged_item()
         remote = FakeRemoteRunner('laptop', unreachable=True)
-        lease = HostLease(name='laptop', runner=remote, is_local=False)  # type: ignore[arg-type]
+        lease = HostLease(name='laptop', runner=cast(Any, remote), is_local=False)
 
         result = await _verify(dispatcher, item, lease)
 
@@ -335,7 +335,7 @@ class TestRunInflightVerify:
         dispatcher = scene.dispatcher(FakeVerifier(passes()))
         item = await scene.merged_item()
         remote = _UnwindsUnavailable('laptop', release=release, entered=entered)
-        lease = HostLease(name='laptop', runner=remote, is_local=False)  # type: ignore[arg-type]
+        lease = HostLease(name='laptop', runner=cast(Any, remote), is_local=False)
 
         running = asyncio.ensure_future(dispatcher.run_inflight_verify(item, lease))
         await asyncio.wait_for(entered.wait(), timeout=30.0)

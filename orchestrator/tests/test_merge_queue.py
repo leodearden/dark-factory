@@ -2460,7 +2460,7 @@ class TestSpeculativeMergeWorker:
                 raise RuntimeError('Unexpected verifier error')
             return await original_riv(item, lease, **kwargs)
 
-        worker.verify_dispatch.run_inflight_verify = mock_riv
+        vars(worker.verify_dispatch)['run_inflight_verify'] = mock_riv
 
         req_n = _make_request('vex-n', 'vex-n', wt_n, config)
         req_n1 = _make_request('vex-n1', 'vex-n1', wt_n1, config)
