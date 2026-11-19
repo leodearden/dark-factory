@@ -77,6 +77,17 @@ that coupling is written out in
 ``plans/inv8-caller-side-census-2026-09-03.md`` section 7.  The fix is always a
 deletion, never a re-bless.
 
+EVERY OWNED ROW HAS AN INV-12 OVERRIDE ELSEWHERE.  Each ``filed`` or
+``to_file`` row has a literal override in
+``tests/repo_guards/test_repo_guards_governed_lists.py::LOOP_BLOCKING_LEDGER``,
+keyed ``relpath::qualname::content_hash`` (``#<n>`` on the n-th repeat of an
+identical row) and equal to ``Debt(<owner>)``.  ``accepted`` rows have no
+override: they borrow its default, counted by ``default_covers``.  Re-hashing
+or deleting an owned row means re-keying or deleting its override IN THE SAME
+CHANGE, and adding or deleting an ``accepted`` row means adjusting
+``default_covers``; otherwise collecting ``tests/repo_guards`` fails inside
+``governed_exceptions`` (a ``MalformedDeclaration`` for a stray override key).
+
 MULTISET, not set.  ``reconcile_against_allowlist`` compares with
 ``Counter`` subtraction, so a function with two byte-identical blocking calls
 needs two rows.  This is load-bearing for THIS gate specifically: set
@@ -104,9 +115,9 @@ Regenerating
 ------------
 There is no generation timestamp here, deliberately: re-running the scan and
 diffing this file is then a meaningful reproducibility check rather than a
-guaranteed diff.  To re-derive the rows::
+guaranteed diff.  To re-derive the rows, run from the repo root::
 
-    cd shared && uv run pytest tests/test_loop_blocking_gate.py -q
+    uv run --project shared pytest tests/repo_guards/test_loop_blocking_gate.py -q
 
 A failure names every site whose disposition is missing or stale.
 

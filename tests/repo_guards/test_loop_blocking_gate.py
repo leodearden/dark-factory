@@ -1421,6 +1421,16 @@ class TestScanHelperStaysInGateScope:
         )
 
 
+_INV12_OVERRIDE_POINTER = (
+    'Each filed or to_file row also has a literal INV-12 override in '
+    'tests/repo_guards/test_repo_guards_governed_lists.py::LOOP_BLOCKING_LEDGER, '
+    'keyed relpath::qualname::content_hash and equal to Debt(<owner>): re-key or '
+    'delete it in the same change as its row. An accepted row borrows that '
+    "declaration's default instead, so adding or deleting one means adjusting its "
+    'default_covers.'
+)
+
+
 class TestRatchet:
     """Every live finding is dispositioned, and every disposition is live."""
 
@@ -1439,11 +1449,11 @@ class TestRatchet:
                 'Coroutine call sites reaching a blocking primitive with no '
                 'recorded disposition:\n' + offenders + '\n\n'
                 'Fix it (wrap the call in asyncio.to_thread) OR add\n'
-                '  (relpath, qualname, content_hash, disposition, justification)\n'
+                '  (relpath, qualname, content_hash, disposition, owner, justification)\n'
                 'to loop_blocking_allowlist.AUDITED_SITES **in this same '
                 'change**. A justification of "existing" is a silent waiver and '
-                'defeats the gate -- say what makes the cost acceptable, or name '
-                'the task that will fix it.'
+                'defeats the gate -- say what makes the cost acceptable, or make '
+                'the task that will fix it the owner.\n\n' + _INV12_OVERRIDE_POINTER
             )
 
     def test_no_stale_blessings(self, tree_scan):
@@ -1465,7 +1475,8 @@ class TestRatchet:
             'gate runs this check and a stale row reds verify for every subsequent '
             'task until the row goes. Delete, never re-bless -- a blessing for '
             'a site that no longer exists cannot describe anything. See '
-            'plans/inv8-caller-side-census-2026-09-03.md section 7.'
+            'plans/inv8-caller-side-census-2026-09-03.md section 7.\n\n'
+            + _INV12_OVERRIDE_POINTER
         )
 
     def test_ratchet_is_a_multiset_not_a_set(self):
