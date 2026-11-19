@@ -161,8 +161,30 @@ class VerifyEventLog:
         return channel
 
 
+_CHANNEL_FILE_PREFIX = 'df-verify-events-'
+
+
+def _default_channel_directory() -> Path:
+    return Path(tempfile.gettempdir()) / f'df-verify-channels-{os.getuid()}'
+
+
+def _mkstemp_channel(directory: Path) -> tuple[int, str]:
+    return tempfile.mkstemp(prefix=_CHANNEL_FILE_PREFIX, suffix='.jsonl', dir=directory)
+
+
+def _open_channel_file(directory: Path | None) -> tuple[int, str]:
+    if directory is not None:
+        return _mkstemp_channel(directory)
+    target = _default_channel_directory()
+    try:
+        return _mkstemp_channel(target)
+    except FileNotFoundError:
+        target.mkdir(mode=0o700, exist_ok=True)
+        return _mkstemp_channel(target)
+
+
 def _create_with_header(*, role: str, verify_id: str, directory: Path | None) -> Path:
-    fd, name = tempfile.mkstemp(prefix='df-verify-events-', suffix='.jsonl', dir=directory)
+    fd, name = _open_channel_file(directory)
     try:
         os.write(fd, encode_channel_open(role=role, verify_id=verify_id))
     except OSError:
@@ -186,6 +208,8 @@ def allocate_verify_event_log(
 ) -> Iterator[VerifyEventLog]:
     """A fresh channel file headed by DF's ``channel_open``, removed on exit.
 
+    With no ``directory`` the channel is created in this user's private channel
+    directory under the system temp dir, never in the temp dir itself.
     Allocation failure is logged and yields a log with no path, so the verify runs
     with no channel (C3 rule 2) rather than failing.
     """
