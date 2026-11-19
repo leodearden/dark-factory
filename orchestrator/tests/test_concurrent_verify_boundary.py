@@ -991,7 +991,7 @@ class TestB7SingleHostNewPath:
         )
 
         # Spy on _dispatch_item and _finalize_inflight
-        original_dispatch = worker._dispatch_item
+        original_dispatch = worker.verify_dispatch.dispatch
         original_finalize = worker._finalize_inflight
         # Record the SET of distinct task_ids that flow through each path
         # rather than a raw call count: under event-loop starvation (e.g. a
@@ -1025,7 +1025,7 @@ class TestB7SingleHostNewPath:
             finalized_ids.add(tid)
             return await original_finalize(entry)
 
-        worker._dispatch_item = _spy_dispatch  # type: ignore[method-assign]
+        worker.verify_dispatch.dispatch = _spy_dispatch
         worker._finalize_inflight = _spy_finalize  # type: ignore[method-assign]
 
         # Track peak in-flight via _TrackingDeque

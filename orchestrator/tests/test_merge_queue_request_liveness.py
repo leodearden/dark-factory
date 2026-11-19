@@ -594,7 +594,7 @@ class TestOperatorHaltRequeueNoFalseAlarm:
         )
 
         worker.operator_halt('test: operator halt before dispatch')
-        entry = await worker._dispatch_item(item)
+        entry = await worker.verify_dispatch.dispatch(item)
 
         assert isinstance(entry, InflightEntry) and entry.status == InflightStatus.REQUEUED_PREDISPATCH
         assert not queue.empty(), 'req must be put back on _queue by the halt branch'

@@ -4566,7 +4566,7 @@ class TestSpeculativeMergeWorker:
         # Interpose on the verifier's per-item dispatch: the FIRST time the item is
         # about to be dispatched, advance main out-of-band (disjoint file, clean
         # re-merge) so the dispatch-time staleness check sees base_sha != main.
-        original_dispatch = worker._dispatch_item
+        original_dispatch = worker.verify_dispatch.dispatch
         advanced = {'done': False}
 
         async def dispatch_with_oob_advance(item):  # type: ignore[no-untyped-def]
@@ -4577,7 +4577,7 @@ class TestSpeculativeMergeWorker:
                 await _run(['git', 'commit', '-m', 'oob advance M0->M1'], cwd=git_ops.project_root)
             return await original_dispatch(item)
 
-        worker._dispatch_item = dispatch_with_oob_advance  # type: ignore[method-assign]
+        worker.verify_dispatch.dispatch = dispatch_with_oob_advance
         worker_task = asyncio.create_task(worker.run())
 
         with patch('orchestrator.merge_lane.worker.run_scoped_verification', side_effect=tracking_verify):
@@ -4668,7 +4668,7 @@ class TestSpeculativeMergeWorker:
         worker = SpeculativeMergeWorker(git_ops, queue, event_store=event_store)
 
         # Interpose: advance main out-of-band once, before the first dispatch.
-        original_dispatch = worker._dispatch_item
+        original_dispatch = worker.verify_dispatch.dispatch
         advanced = {'done': False}
 
         async def dispatch_with_oob_advance(item):  # type: ignore[no-untyped-def]
@@ -4679,7 +4679,7 @@ class TestSpeculativeMergeWorker:
                 await _run(['git', 'commit', '-m', 'oob advance M0->M1'], cwd=git_ops.project_root)
             return await original_dispatch(item)
 
-        worker._dispatch_item = dispatch_with_oob_advance  # type: ignore[method-assign]
+        worker.verify_dispatch.dispatch = dispatch_with_oob_advance
         worker_task = asyncio.create_task(worker.run())
 
         with patch('orchestrator.merge_lane.worker.run_scoped_verification', side_effect=tracking_verify):

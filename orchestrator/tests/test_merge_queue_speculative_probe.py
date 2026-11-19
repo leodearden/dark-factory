@@ -1003,7 +1003,7 @@ class TestDispatchItemProbeWiring:
             config=config, merge_wt=tmp_path, merge_commit='c-dispatch',
         )
 
-        entry = await worker._dispatch_item(item)
+        entry = await worker.verify_dispatch.dispatch(item)
 
         assert isinstance(entry, InflightEntry), 'dispatch should succeed with a free local slot'
         assert entry.verify_task is not None
@@ -1044,7 +1044,7 @@ class TestDispatchItemProbeWiring:
             config=config, merge_wt=tmp_path, merge_commit='c-dispatch',
         )
 
-        entry = await worker._dispatch_item(item)
+        entry = await worker.verify_dispatch.dispatch(item)
 
         assert isinstance(entry, InflightEntry), 'dispatch should succeed with a free local slot'
         assert entry.verify_task is not None

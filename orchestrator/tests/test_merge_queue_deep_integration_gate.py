@@ -1581,35 +1581,24 @@ class _GateScene:
         self._round_no += 1
         worker = self.worker
         # ── slot-1 steady state, restored before EVERY dispatch ─────────────
-        # `_n_failed` and `_remerge_occurred` are facts about SLOT 1 and about
-        # the enclosing `_verifier_loop` ITERATION.  This scene models neither:
-        # it drives `_dispatch_item` directly, one slot-2 item per round, with
-        # a structurally empty `_inflight`.
+        # `_n_failed` and the dispatcher's chain invalidation are facts about
+        # SLOT 1 and the enclosing `_verifier_loop` ITERATION.  This scene
+        # models neither: it drives `verify_dispatch.dispatch` directly, one
+        # slot-2 item per round, with a structurally empty `_inflight`.
         #
-        # A REAL slot-2 dispatch never reads either flag.  `_dispatch_item`
-        # gates the whole chain-invalidation / Mechanism-2 re-merge block on
-        # `not _has_inflight_verify`, and a genuine speculative dispatch
-        # happens precisely WHILE the head verify is in flight — so the block
-        # is skipped by construction.  Driving dispatch with an empty
-        # `_inflight` re-opens it, and two artifacts the pipeline itself never
-        # produces then appear:
-        #
-        #   * any round that requeued (i.e. every red tip) leaves
-        #     `_n_failed=True`, so the NEXT round's speculative item is
-        #     re-merged into a NON-speculative one.  Alone in this scene's
-        #     empty frontier it would chain as a head (PRD D5), so round 2 of
-        #     every walk would silently test the head path instead of the
-        #     slot-2 walk.
-        #   * `_remerge_occurred` is self-sustaining once set (it is assigned
-        #     from the same dispatch's own `iteration_did_remerge`), so ONE
-        #     re-merge would disable chaining for the rest of the scene.
-        #
-        # Resetting both restores exactly the state a healthy head slot leaves
-        # behind, which is the premise every row in this file is written
-        # against.  It is a fidelity choice about what this scene models, not a
-        # workaround: nothing in the deep path reads these flags.
+        # A REAL slot-2 dispatch never reads either.  The dispatcher gates its
+        # chain-invalidation / Mechanism-2 re-merge on no verify being in
+        # flight, and a genuine speculative dispatch happens precisely WHILE
+        # the head verify is in flight.  Driving dispatch with an empty
+        # `_inflight` re-opens that gate, so any round that requeued (every
+        # red tip) would leave `_n_failed=True` and the NEXT round's
+        # speculative item would be re-merged into a NON-speculative one,
+        # chaining as a head (PRD D5) instead of walking slot 2.  Chain
+        # invalidation stays clear on its own: only the verifier loop's
+        # head-failure cascade, which this scene never runs, raises it, and
+        # every round's dispatch that does not re-merge clears it.
         worker._n_failed = False
-        worker._remerge_occurred = False
+        assert not worker.verify_dispatch.chain_invalidated()
         n_calls_before = len(self.calls)
         n_built_before = len(self.built)
         n_acquires_before = len(self.lane_acquires)
@@ -1636,7 +1625,7 @@ class _GateScene:
             base_sha=main_before,   # this round really CASes against main
             speculative=True,       # slot 2 — chains whatever the frontier holds (PRD D5)
         )
-        entry = await worker._dispatch_item(item)
+        entry = await worker.verify_dispatch.dispatch(item)
         assert entry is not None, 'dispatch must not decline: a host is free'
         assert entry.verify_task is not None
         await entry.verify_task
@@ -1806,7 +1795,7 @@ class _GateScene:
         head_entry = self.head_entry
         # Slot-1 steady state, for the reason documented at length in `round_`.
         worker._n_failed = False
-        worker._remerge_occurred = False
+        assert not worker.verify_dispatch.chain_invalidated()
         n_calls_before = len(self.calls)
         n_built_before = len(self.built)
         n_acquires_before = len(self.lane_acquires)
@@ -1832,7 +1821,7 @@ class _GateScene:
             base_sha=self.head_mc,  # stacked on the head's merge commit
             speculative=True,       # slot 2 — chains whatever the frontier holds (PRD D5)
         )
-        entry = await worker._dispatch_item(item)
+        entry = await worker.verify_dispatch.dispatch(item)
         assert entry is not None, 'dispatch must not decline: a host is free'
         assert entry.verify_task is not None
         await entry.verify_task

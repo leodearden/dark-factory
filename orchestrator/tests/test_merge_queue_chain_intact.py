@@ -506,7 +506,7 @@ class TestDispatchDeadBaseRecheck:
         )
         assert isinstance(item, RealMergeItem)
 
-        await worker._dispatch_item(item)
+        await worker.verify_dispatch.dispatch(item)
 
         remerge.assert_awaited_once()          # re-merged despite _has_inflight_verify True
         # The live head's commit is the tip the replacement is claimed onto.
@@ -548,7 +548,7 @@ class TestDispatchDeadBaseRecheck:
         )
         assert isinstance(item, RealMergeItem)
 
-        entry = await worker._dispatch_item(item)
+        entry = await worker.verify_dispatch.dispatch(item)
         assert isinstance(entry, InflightEntry) and entry.verify_task is not None
         await entry.verify_task
 
@@ -713,7 +713,7 @@ class TestCascadeStragglerCaughtComposition:
         )
         assert isinstance(straggler, RealMergeItem)
 
-        await worker._dispatch_item(straggler)
+        await worker.verify_dispatch.dispatch(straggler)
 
         # Caught at dispatch: re-merged under a claim, NO verify burned.
         remerge.assert_awaited_once()
@@ -850,7 +850,7 @@ async def _dead_based_straggler(
 
 
 async def _dispatch(worker: SpeculativeMergeWorker, item: RealMergeItem) -> InflightEntry | NoHost:
-    return await worker._dispatch_item(item)
+    return await worker.verify_dispatch.dispatch(item)
 
 
 def _the_row(store: _LateArrivalFakeEventStore, event_type: EventType) -> dict[str, object]:

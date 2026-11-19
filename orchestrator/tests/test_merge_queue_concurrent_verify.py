@@ -540,7 +540,7 @@ class TestRunPostMergeVerifyRunnerParam:
 
 
 class TestInflightStateAttrs:
-    """SpeculativeMergeWorker exposes _inflight/redispatch-park/_n_failed/_remerge_occurred.
+    """SpeculativeMergeWorker exposes _inflight/redispatch-park/_n_failed.
     InflightEntry dataclass is importable from merge_queue.
 
     RED until step-4 GREEN adds the dataclass and initialises the attrs.
@@ -566,11 +566,6 @@ class TestInflightStateAttrs:
         """_n_failed starts False."""
         worker = self._make_worker(git_ops)
         assert worker._n_failed is False
-
-    def test_remerge_occurred_is_false(self, git_ops: GitOps) -> None:
-        """_remerge_occurred starts False."""
-        worker = self._make_worker(git_ops)
-        assert worker._remerge_occurred is False
 
     def test_inflight_entry_importable(self) -> None:
         """InflightEntry is importable from merge_queue."""
@@ -1819,18 +1814,10 @@ class TestSingleHostSerialByteIdentical:
     # ------------------------------------------------------------------
 
     async def test_dispatch_item_method_exists(self, git_ops: GitOps) -> None:
-        """_dispatch_item is a callable on SpeculativeMergeWorker.
-
-        RED: method not yet added (step-16 adds it).
-        GREEN: step-16 adds _dispatch_item.
-        """
+        """The worker's verify dispatcher exposes ``dispatch`` (task 5040)."""
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, q)
-        assert callable(getattr(worker, '_dispatch_item', None)), (
-            '_dispatch_item not found on SpeculativeMergeWorker — '
-            'restructured loop not yet added (step-16). '
-            'RED: None (missing). GREEN: callable after step-16.'
-        )
+        assert callable(getattr(worker.verify_dispatch, 'dispatch', None))
 
     # ------------------------------------------------------------------
     # RED marker 2: _verifier_loop must update self._n_failed on the instance

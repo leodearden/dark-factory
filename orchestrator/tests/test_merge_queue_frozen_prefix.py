@@ -301,7 +301,7 @@ async def _dispatch(
         mock.patch.object(git_ops, 'get_main_sha', side_effect=get_main_sha),
         mock.patch.object(worker.verify_dispatch, 'run_inflight_verify', _noop_verify),
     ):
-        return await worker._dispatch_item(item)
+        return await worker.verify_dispatch.dispatch(item)
 
 
 def _assert_divergence(

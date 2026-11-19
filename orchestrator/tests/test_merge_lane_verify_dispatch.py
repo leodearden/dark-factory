@@ -1,8 +1,8 @@
 """The contract of ``merge_lane/verify_dispatch.py::VerifyDispatcher`` (PRD κ, task 5040).
 
-The dispatcher runs one dispatched item's verify on the lease it holds and
-hands the item back through its ports when the verify ends without a
-verdict. It is built here through its public constructor, over recording
+The dispatcher dispatches one item onto a free verify host, runs its verify
+on the lease it holds, and hands the item back through its ports when the
+verify ends without a verdict. It is built here through its public constructor, over recording
 port doubles, a ``FakeVerifier``, a ``FakeClock`` and a real merge on a real
 repo, and observed only through what it returns and what the ports
 recorded. Every expected value is today's ``SpeculativeMergeWorker``
@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import importlib
 from pathlib import Path
 from typing import Any, cast
@@ -31,7 +32,9 @@ from _merge_lane_fakes import (
 )
 
 from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.event_store import EventType
 from orchestrator.git_ops import GitOps, MergeVerifyLeaseContended
+from orchestrator.merge_lane.dead_base_ledger import DeadBaseSite, VoidPoint
 from orchestrator.merge_lane.dispatch_ports import (
     DispatchCustody,
     DispatchSpeculation,
@@ -43,12 +46,23 @@ from orchestrator.merge_lane.dispatch_ports import (
 from orchestrator.merge_lane.halt import HaltState
 from orchestrator.merge_lane.intake import MERGE_LANES
 from orchestrator.merge_lane.main_health_probe import MainHealthProbeHandles
+from orchestrator.merge_lane.remerge_base import RemergeClaim
 from orchestrator.merge_lane.types import (
+    NO_DEEP_PLACEMENT,
+    CapPermit,
+    DecidedItem,
+    InflightEntry,
     InflightStatus,
     InflightVerifyResult,
+    ItemLifecycleState,
+    MergeOutcome,
     MergeRequest,
+    NoHost,
     QueuedBranch,
     RealMergeItem,
+    RemergeBase,
+    RemergeReason,
+    SpecPermit,
 )
 from orchestrator.merge_lane.verify_dispatch import VerifyDispatcher
 from orchestrator.merge_lane.verify_failure_outcome import DryRunInvestigationHandles
@@ -71,6 +85,13 @@ class _Ports:
         self.calls: list[tuple[Any, ...]] = []
         self.abandoned = False
         self.contended_elapsed = 0.0
+        self.admission_halted = False
+        self.in_verify = False
+        self.previous_failed = False
+        self.dead_link: str | None = None
+        self.main = 'f' * 40
+        self.remerged: Any = None
+        self.placement_error: BaseException | None = None
         self._streak = 0
         self._cap_outs = 0
 
@@ -99,6 +120,23 @@ class _Ports:
         self._cap_outs += 1
         return self._cap_outs
 
+    async def _release_at_verdict(self, verify: Any, slot: Any) -> InflightVerifyResult:
+        return await verify()
+
+    async def _main_sha(self, reader: str) -> str:
+        self.record('main_sha_or_empty', reader)
+        return self.main
+
+    async def _remerge(self, req: MergeRequest, started: float | None, claim: RemergeClaim) -> Any:
+        self.record('remerge', req.task_id)
+        return self.remerged
+
+    async def _deep_chain_placement(self, item: Any, depth: int, is_local: bool) -> Any:
+        self.record('deep_chain_placement', depth)
+        if self.placement_error is not None:
+            raise self.placement_error
+        return NO_DEEP_PLACEMENT
+
     def custody(self) -> DispatchCustody:
         return DispatchCustody(
             request_abandoned=lambda req: self.abandoned,
@@ -111,6 +149,15 @@ class _Ports:
             bench_from_verify=lambda slot, exc: self._async_record('bench_from_verify', str(exc)),
             bench_unavailable_runner=lambda name, exc: self.record('bench_unavailable_runner', name),
             adopt_head_on_tip_authority=lambda item: self._async_record('adopt', item.request.task_id),
+            admission_halted=lambda: self.admission_halted,
+            requeue_request=lambda req: self.record('requeue_request', req.task_id),
+            retire_item=lambda rid: self.record('retire_item', rid),
+            record_unlanded_rebased_head=lambda item: self.record('record_unlanded_rebased_head'),
+            note_transition=lambda rid, before, after, live: self.record(
+                'note_transition', before, after,
+            ),
+            has_inflight_verify=lambda: self.in_verify,
+            release_at_verdict=self._release_at_verdict,
         )
 
     def speculation(self) -> DispatchSpeculation:
@@ -118,6 +165,33 @@ class _Ports:
             mark_next_dispatch_unchained=lambda ids: self.record('unchained', tuple(ids)),
             end_chain_reservation=lambda rid: self.record('end_chain_reservation', rid),
             note_tip_result=lambda reason, depth, out: self.record('note_tip_result', depth),
+            release_cap_permit=lambda permit: self.record('release_cap_permit'),
+            release_permit=lambda permit: self.record('release_permit'),
+            previous_failed=lambda: self.previous_failed,
+            has_dead_bases=lambda: self.dead_link is not None,
+            main_sha_or_empty=self._main_sha,
+            chain_dead_link=lambda item, main: self.dead_link,
+            claim_remerge_base=lambda item, main, permit: RemergeClaim(
+                anchor=RemergeBase(tip=None, reason=RemergeReason.NO_TIP), permit=None,
+            ),
+            emit_dead_base_discard=lambda req, item, dead, point, anchor: self.record(
+                'emit_dead_base_discard', dead, point,
+            ),
+            emit_speculative=lambda event, task_id, **data: self.record(
+                'emit_speculative', event, data['reason'],
+            ),
+            record_item_commit_dead=lambda item, site, notify: self.record(
+                'record_item_commit_dead', site, notify,
+            ),
+            remerge=self._remerge,
+            notify_merger_of_dead=lambda shas: self.record('notify_merger_of_dead'),
+            reanchor_merger_on=lambda dead, replacement: self.record('reanchor_merger_on'),
+            note_main_sha=lambda sha: self.record('note_main_sha'),
+            verify_base_divergence=lambda item, main: None,
+            frontier_base_commits=lambda: (set(), set()),
+            probe_placement=lambda item: None,
+            frontier_depth=lambda: 0,
+            deep_chain_placement=self._deep_chain_placement,
         )
 
     def worktrees(self) -> DispatchWorktrees:
@@ -136,11 +210,34 @@ class _Ports:
         )
 
 
+class _Hosts:
+    """A one-slot host allocator double."""
+
+    def __init__(self) -> None:
+        self.free = 1
+        self.acquired: list[HostLease] = []
+        self.released: list[HostLease] = []
+
+    def free_host_count(self) -> int:
+        return self.free
+
+    async def acquire(self, local_factory: Any, *, policy: Any = None) -> HostLease | None:
+        if not self.free:
+            return None
+        lease = _local_lease()
+        self.acquired.append(lease)
+        return lease
+
+    async def release(self, lease: HostLease) -> None:
+        self.released.append(lease)
+
+
 class _Scene:
     def __init__(self, git_ops: GitOps, config: OrchestratorConfig) -> None:
         self.git_ops = git_ops
         self.config = config
         self.ports = _Ports()
+        self.hosts = _Hosts()
         self.halts: list[str] = []
         self.escalations = RecordingEscalations()
         self.halt = HaltState(MERGE_LANES, on_resume=lambda: None)
@@ -151,6 +248,7 @@ class _Scene:
         ports = self.ports
         dispatcher = VerifyDispatcher(
             git_ops=lambda: self.git_ops,
+            host_allocator=lambda config: cast(Any, self.hosts),
             clock=FakeClock() if clock is None else clock,
             verifier=verifier,
             halt=self.halt,
@@ -175,6 +273,14 @@ class _Scene:
         )
         dispatcher.VERIFY_ABANDON_POLL_SECS = 0.02
         return dispatcher
+
+    def decided_item(self, item: RealMergeItem) -> DecidedItem:
+        return DecidedItem(
+            request=item.request,
+            immediate_outcome=MergeOutcome(status='conflict', reason='decided'),
+            base_sha=item.base_sha,
+            speculative=False,
+        )
 
     async def merged_item(self, task_id: str = 'vd-1') -> RealMergeItem:
         self._n += 1
@@ -387,6 +493,205 @@ class TestPostMergeVerify:
         assert verifier.verified == ['vd-1']
 
 
+async def _launched(entry: InflightEntry | NoHost) -> InflightEntry:
+    assert isinstance(entry, InflightEntry) and entry.verify_task is not None, entry
+    await asyncio.wait_for(entry.verify_task, timeout=30.0)
+    return entry
+
+
+_DEAD_LINK = 'd' * 40
+_INTO_REMERGE = ('note_transition', ItemLifecycleState.DISPATCHING, ItemLifecycleState.MERGING)
+_OUT_OF_REMERGE = ('note_transition', ItemLifecycleState.MERGING, ItemLifecycleState.DISPATCHING)
+
+
+def _stale_discards(ports: _Ports) -> list[str]:
+    return [call[2] for call in ports.calls if call[0] == 'emit_speculative']
+
+
+@pytest.mark.asyncio
+class TestDispatch:
+    async def test_the_cap_permit_is_released_before_any_branching(self, scene: _Scene) -> None:
+        dispatcher = scene.dispatcher(FakeVerifier(passes()))
+        item = dataclasses.replace(await scene.merged_item(), cap_permit=CapPermit())
+        scene.ports.abandoned = True
+
+        entry = await dispatcher.dispatch(item)
+
+        assert scene.ports.names()[0] == 'release_cap_permit'
+        assert isinstance(entry, InflightEntry) and entry.item.cap_permit is None
+
+    async def test_a_predispatch_abandon_cleans_up_and_retires_the_request(self, scene: _Scene) -> None:
+        dispatcher = scene.dispatcher(FakeVerifier(passes()))
+        item = await scene.merged_item()
+        scene.ports.abandoned = True
+
+        entry = await dispatcher.dispatch(item)
+
+        assert isinstance(entry, InflightEntry)
+        assert entry.status == InflightStatus.ABANDONED_PREDISPATCH
+        assert entry.lease is None and entry.verify_task is None
+        assert scene.ports.names() == ['cleanup_owned', 'record_unlanded_rebased_head', 'retire_item']
+        assert scene.hosts.acquired == []
+
+    @pytest.mark.parametrize('halt', ['operator', 'admission'])
+    async def test_a_halt_requeues_a_built_item(self, scene: _Scene, halt: str) -> None:
+        dispatcher = scene.dispatcher(FakeVerifier(passes()))
+        item = await scene.merged_item()
+        if halt == 'operator':
+            scene.halt.operator_halt('test halt')
+        else:
+            scene.ports.admission_halted = True
+
+        entry = await dispatcher.dispatch(item)
+
+        assert isinstance(entry, InflightEntry)
+        assert entry.status == InflightStatus.REQUEUED_PREDISPATCH
+        assert scene.ports.names() == ['cleanup_owned', 'requeue_request']
+        assert not item.request.result.done()
+
+    async def test_a_decided_item_passes_through_a_halt(self, scene: _Scene) -> None:
+        dispatcher = scene.dispatcher(FakeVerifier(passes()))
+        decided = scene.decided_item(await scene.merged_item())
+        scene.halt.operator_halt('test halt')
+
+        entry = await dispatcher.dispatch(decided)
+
+        assert isinstance(entry, InflightEntry)
+        assert entry.passthrough_outcome is decided.immediate_outcome and entry.status is None
+        assert scene.ports.calls == []
+
+    async def test_no_free_host_parks_the_item_before_any_remerge_work(self, scene: _Scene) -> None:
+        dispatcher = scene.dispatcher(FakeVerifier(passes()))
+        item = await scene.merged_item()
+        scene.hosts.free = 0
+        scene.ports.dead_link = _DEAD_LINK
+
+        parked = await dispatcher.dispatch(item)
+
+        assert parked == NoHost(item)
+        assert scene.ports.calls == []
+
+    async def test_a_free_host_launches_the_verify_on_its_lease(self, scene: _Scene) -> None:
+        dispatcher = scene.dispatcher(FakeVerifier(passes()))
+        item = await scene.merged_item()
+        scene.ports.main = item.base_sha
+
+        entry = await _launched(await dispatcher.dispatch(item))
+
+        assert entry.lease is scene.hosts.acquired[0] and entry.item is item
+        assert entry.verify_wt is not None and entry.started_at is not None
+        assert entry.verify_task is not None and entry.verify_task.result().outcome is None
+        assert 'remerge' not in scene.ports.names()
+        assert ('deep_chain_placement', 0) in scene.ports.calls
+
+    async def test_a_dead_base_straggler_is_voided_and_remerged_instead_of_verified(
+        self, scene: _Scene,
+    ) -> None:
+        dispatcher = scene.dispatcher(FakeVerifier(passes()))
+        item = dataclasses.replace(await scene.merged_item(), speculative=True)
+        scene.ports.dead_link = _DEAD_LINK
+        scene.ports.remerged = scene.decided_item(item)
+
+        entry = await dispatcher.dispatch(item)
+
+        assert scene.ports.calls == [
+            ('main_sha_or_empty', 'dispatch chain check'),
+            _INTO_REMERGE,
+            ('cleanup_owned', item.merge_wt),
+            ('emit_dead_base_discard', _DEAD_LINK, VoidPoint.DISPATCH),
+            ('record_item_commit_dead', DeadBaseSite.DISPATCH_VOID, False),
+            ('remerge', 'vd-1'),
+            ('reanchor_merger_on',),
+            _OUT_OF_REMERGE,
+        ]
+        assert isinstance(entry, InflightEntry) and entry.passthrough_outcome is not None
+        assert entry.was_speculative and entry.started_at is not None
+        assert scene.hosts.acquired == []
+
+    @pytest.mark.parametrize(
+        ('speculative', 'previous_failed', 'chain_invalidated', 'reason'),
+        [
+            (True, True, False, 'previous_failed'),
+            (True, True, True, 'previous_failed'),
+            (True, False, True, 'chain_invalidated'),
+            (False, False, False, 'main_advanced'),
+        ],
+    )
+    async def test_a_stale_merge_is_remerged_with_its_reason(
+        self, scene: _Scene, speculative: bool, previous_failed: bool,
+        chain_invalidated: bool, reason: str,
+    ) -> None:
+        dispatcher = scene.dispatcher(FakeVerifier(passes()))
+        item = dataclasses.replace(await scene.merged_item(), speculative=speculative)
+        scene.ports.previous_failed = previous_failed
+        scene.ports.remerged = scene.decided_item(item)
+        if chain_invalidated:
+            dispatcher.note_chain_invalidated()
+
+        entry = await dispatcher.dispatch(item)
+
+        assert _stale_discards(scene.ports) == [reason]
+        assert ('emit_speculative', EventType.speculative_discard, reason) in scene.ports.calls
+        assert ('record_item_commit_dead', DeadBaseSite.STALE_DISCARD, False) in scene.ports.calls
+        assert scene.ports.names().count('note_transition') == 2
+        assert isinstance(entry, InflightEntry) and entry.passthrough_outcome is not None
+
+    async def test_a_speculative_item_off_main_is_not_stale(self, scene: _Scene) -> None:
+        dispatcher = scene.dispatcher(FakeVerifier(passes()))
+        item = dataclasses.replace(await scene.merged_item(), speculative=True)
+
+        await _launched(await dispatcher.dispatch(item))
+
+        assert 'remerge' not in scene.ports.names()
+        assert 'main_sha_or_empty' not in scene.ports.names()
+
+    async def test_no_staleness_remerge_while_a_verify_is_in_flight(self, scene: _Scene) -> None:
+        dispatcher = scene.dispatcher(FakeVerifier(passes()))
+        item = await scene.merged_item()
+        scene.ports.in_verify = True
+        scene.ports.previous_failed = True
+        dispatcher.note_chain_invalidated()
+
+        await _launched(await dispatcher.dispatch(item))
+
+        assert 'remerge' not in scene.ports.names()
+        assert 'main_sha_or_empty' not in scene.ports.names()
+
+    async def test_chain_invalidation_lasts_until_a_dispatch_that_does_not_remerge(
+        self, scene: _Scene,
+    ) -> None:
+        dispatcher = scene.dispatcher(FakeVerifier(passes()))
+        first = dataclasses.replace(await scene.merged_item(), speculative=True)
+        scene.ports.remerged = scene.decided_item(first)
+        dispatcher.note_chain_invalidated()
+
+        await dispatcher.dispatch(first)
+        await dispatcher.dispatch(dataclasses.replace(first))
+        assert _stale_discards(scene.ports) == ['chain_invalidated', 'chain_invalidated']
+
+        assert dispatcher.chain_invalidated()
+
+        await dispatcher.dispatch(scene.decided_item(first))
+        assert not dispatcher.chain_invalidated()
+        await _launched(await dispatcher.dispatch(
+            dataclasses.replace(await scene.merged_item(), speculative=True),
+        ))
+        assert _stale_discards(scene.ports) == ['chain_invalidated', 'chain_invalidated']
+
+    async def test_a_cancel_in_deep_placement_releases_the_lease_and_permit(
+        self, scene: _Scene,
+    ) -> None:
+        dispatcher = scene.dispatcher(FakeVerifier(passes()))
+        item = dataclasses.replace(await scene.merged_item(), permit=SpecPermit())
+        scene.ports.placement_error = asyncio.CancelledError()
+
+        with pytest.raises(asyncio.CancelledError):
+            await dispatcher.dispatch(item)
+
+        assert scene.hosts.released == scene.hosts.acquired != []
+        assert scene.ports.names()[-1] == 'release_permit'
+
+
 _HOMES = {
     'orchestrator.merge_lane.verify_dispatch': ('VerifyDispatcher', 'GATE_HISTORY_LEG_FACTS'),
     'orchestrator.merge_lane.inflight_verify': (
@@ -403,6 +708,7 @@ _GONE_FROM_WORKER_MODULE = (
 )
 _GONE_FROM_WORKER_CLASS = (
     '_run_inflight_verify', '_lane_post_merge_verify', '_run_gate_history_leg',
+    '_dispatch_item', '_launch_verify', '_remerge_at_dispatch', '_discard_unlaunched_replacement',
     'VERIFY_ABANDON_POLL_SECS', 'INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS',
     'INFLIGHT_VERIFY_PROGRESS_PROBE_SECS', 'ORPHAN_REAP_TIMEOUT_SECS',
     'MAX_INFLIGHT_DEAD_VERIFY_ABORTS', 'MAX_CONTENDED_LEASE_DEFER_SECS',

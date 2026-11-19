@@ -477,7 +477,7 @@ class TestDispatchRefreshesLastKnownMainSha:
             return_value=InflightVerifyResult(outcome=None, merge_wt=item.merge_wt)
         )
 
-        entry = await worker._dispatch_item(item)
+        entry = await worker.verify_dispatch.dispatch(item)
 
         assert entry is not None, 'dispatch should succeed with a free local slot'
         assert _cached_main_sha(worker) == new_main
@@ -517,7 +517,7 @@ class TestDispatchRefreshesLastKnownMainSha:
             return_value=InflightVerifyResult(outcome=None, merge_wt=item.merge_wt)
         )
 
-        await worker._dispatch_item(item)
+        await worker.verify_dispatch.dispatch(item)
 
         violations = worker.snapshot()['two_layer_invariants']
         assert violations == [], f'expected a clean snapshot after dispatch, got: {violations!r}'
@@ -551,7 +551,7 @@ class TestDispatchRefreshesLastKnownMainSha:
             return_value=InflightVerifyResult(outcome=None, merge_wt=item.merge_wt)
         )
 
-        entry = await worker._dispatch_item(item)
+        entry = await worker.verify_dispatch.dispatch(item)
 
         assert entry is not None, 'dispatch must still succeed despite the guard error'
         assert _cached_main_sha(worker) == old_main
@@ -671,7 +671,7 @@ class TestAdvisoryContractRegressionPins:
             return_value=InflightVerifyResult(outcome=None, merge_wt=item.merge_wt)
         )
 
-        entry = await worker._dispatch_item(item)
+        entry = await worker.verify_dispatch.dispatch(item)
 
         assert isinstance(entry, InflightEntry), (
             'ADVISORY CONTRACT VIOLATED (task 3206, PRD §5.3): a phantom frozen '
@@ -715,7 +715,7 @@ class TestAdvisoryContractRegressionPins:
         )
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
-            entry = await worker._dispatch_item(item)
+            entry = await worker.verify_dispatch.dispatch(item)
 
         guard_warnings = [
             r for r in caplog.records
@@ -759,7 +759,7 @@ class TestAdvisoryContractRegressionPins:
             return_value=InflightVerifyResult(outcome=None, merge_wt=item.merge_wt)
         )
 
-        entry = await worker._dispatch_item(item)
+        entry = await worker.verify_dispatch.dispatch(item)
 
         assert allocator.acquire.await_count == 1, (
             'fixture precondition: the dispatch must have acquired a lease'
@@ -801,7 +801,7 @@ class TestAdvisoryContractRegressionPins:
         )
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
-            entry = await worker._dispatch_item(item)
+            entry = await worker.verify_dispatch.dispatch(item)
 
         assert entry is not None, 'a healthy dispatch must complete'
         guard_warnings = [
@@ -841,7 +841,7 @@ async def _straggler_dispatch(
     _, built = await _make_merged_item(git_ops, config, 'task/vb-strag', 'vb_s.py', 's=1\n')
     permit = await worker._speculation_ledger.acquire()
     straggler = dataclasses.replace(built, base_sha=_VB_DEAD, speculative=True, permit=permit)
-    entry = await worker._dispatch_item(straggler)
+    entry = await worker.verify_dispatch.dispatch(straggler)
     assert isinstance(entry, InflightEntry)
     tip = tip_item.merge_result.merge_commit
     assert tip is not None

@@ -116,7 +116,7 @@ def _drive_fill(worker: SpeculativeMergeWorker, allocator: HostAllocator) -> _Fi
             result.set_result(MergeOutcome('done'))
         return False
 
-    worker._dispatch_item = _fake_dispatch_item  # type: ignore[method-assign]
+    worker.verify_dispatch.dispatch = _fake_dispatch_item
     worker._finalize_inflight = _fake_finalize_inflight  # type: ignore[method-assign]
     return drive
 

@@ -597,7 +597,7 @@ class TestRequeueToQueuedSites:
         worker._register_item(item, initial=ItemLifecycleState.DISPATCHING)
 
         worker.operator_halt('test: pre-dispatch halt')
-        entry = await worker._dispatch_item(item)
+        entry = await worker.verify_dispatch.dispatch(item)
 
         assert isinstance(entry, InflightEntry) and entry.status == InflightStatus.REQUEUED_PREDISPATCH
         assert not queue.empty(), 'req must be put back on the queue by the halt branch'
@@ -660,7 +660,7 @@ class TestRequeueToQueuedSites:
         )
 
         worker.operator_halt('test: pre-dispatch halt')
-        entry = await worker._dispatch_item(item)
+        entry = await worker.verify_dispatch.dispatch(item)
 
         assert isinstance(entry, InflightEntry) and entry.status == InflightStatus.REQUEUED_PREDISPATCH
         assert worker._lifecycle.current(req.request_id) is None
@@ -868,7 +868,7 @@ class TestOnRequeuedIsAlwaysPairedWithNoteRequeue:
         )
         worker._register_item(item_ph, initial=ItemLifecycleState.DISPATCHING)
         worker.operator_halt('test: pre-dispatch halt')
-        entry_ph = await worker._dispatch_item(item_ph)
+        entry_ph = await worker.verify_dispatch.dispatch(item_ph)
         assert isinstance(entry_ph, InflightEntry)
         assert entry_ph.status == InflightStatus.REQUEUED_PREDISPATCH, f'{entry_ph!r}'
 
@@ -1536,7 +1536,7 @@ class TestVerifierDispatchFillRegistersDispatching:
         worker = make_lane(git_ops, queue)
         req = _make_request('kappa-stale-remerge', 'kappa-stale-remerge', wt, config)
 
-        original_dispatch = worker._dispatch_item
+        original_dispatch = worker.verify_dispatch.dispatch
         advanced = {'done': False}
 
         async def _dispatch_with_oob_advance(item: Any) -> Any:
@@ -1550,7 +1550,7 @@ class TestVerifierDispatchFillRegistersDispatching:
                 )
             return await original_dispatch(item)
 
-        worker._dispatch_item = _dispatch_with_oob_advance  # type: ignore[method-assign]
+        worker.verify_dispatch.dispatch = _dispatch_with_oob_advance
 
         captured: list[Any] = []
         original_remerge = worker._remerge
@@ -2545,7 +2545,7 @@ class TestAbandonPredispatchRetiresRegistry:
         worker._register_item(item, initial=ItemLifecycleState.DISPATCHING)
         req.result.cancel()
 
-        entry = await worker._dispatch_item(item)
+        entry = await worker.verify_dispatch.dispatch(item)
 
         assert isinstance(entry, InflightEntry) and entry.status == InflightStatus.ABANDONED_PREDISPATCH
         assert lane_state(worker, req.request_id) is None, (

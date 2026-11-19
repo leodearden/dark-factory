@@ -812,7 +812,7 @@ class TestDeepChainPlacementBuild:
             _ephemeral_merge_wt(scene.git_ops, 'cancel-dispatch'),
         )
 
-        task = asyncio.ensure_future(scene.worker._dispatch_item(item))
+        task = asyncio.ensure_future(scene.worker.verify_dispatch.dispatch(item))
         await asyncio.wait_for(entered.wait(), timeout=60)
         task.cancel()
         await asyncio.wait([task])
@@ -1881,7 +1881,7 @@ class _DeepScene:
                 speculative=False, base_sha=await _rev_parse(self.repo, 'main'),
             )
         )
-        entry = await self.worker._dispatch_item(item)
+        entry = await self.worker.verify_dispatch.dispatch(item)
         assert entry is not None, 'dispatch must not decline: a host is free'
         assert entry.verify_task is not None
         await entry.verify_task
@@ -2221,7 +2221,7 @@ class TestDeepDispatchRoundsIntegration:
             _ephemeral_merge_wt(scene.git_ops, 'ev-head'), speculative=False,
             base_sha=await _rev_parse(repo, 'main'),
         )
-        entry = await scene.worker._dispatch_item(head_item)
+        entry = await scene.worker.verify_dispatch.dispatch(head_item)
         assert entry is not None and entry.verify_task is not None
         await entry.verify_task
         # A chained head's links go back too, or the speculative rounds find none.
@@ -2327,7 +2327,7 @@ class TestDeepDispatchRoundsIntegration:
             _ephemeral_merge_wt(scene.git_ops, 'can-head'), speculative=False,
             base_sha=await _rev_parse(repo, 'main'),
         )
-        entry = await scene.worker._dispatch_item(head_item)
+        entry = await scene.worker.verify_dispatch.dispatch(head_item)
         assert entry is not None and entry.verify_task is not None
         await entry.verify_task
         await scene.worker._host_allocator.release(entry.lease)

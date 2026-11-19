@@ -423,7 +423,7 @@ class TestDispatchErrorChokepoint:
         async def _raising_dispatch(_item: Any) -> Any:
             raise Exception('boom')
 
-        worker._dispatch_item = _raising_dispatch  # type: ignore[method-assign]
+        worker.verify_dispatch.dispatch = _raising_dispatch
 
         depth0 = worker.snapshot()['speculation']['slot_available']
 
@@ -468,7 +468,7 @@ class TestDispatchErrorChokepoint:
         async def _cancelling_dispatch(_item: Any) -> Any:
             raise asyncio.CancelledError()
 
-        worker._dispatch_item = _cancelling_dispatch  # type: ignore[method-assign]
+        worker.verify_dispatch.dispatch = _cancelling_dispatch
 
         worker._verifier_queue.put_nowait(item)
         worker._verifier_queue.put_nowait(None)
@@ -502,7 +502,7 @@ class TestDispatchErrorChokepoint:
         async def _raising_dispatch(_item: Any) -> Any:
             raise Exception('boom')
 
-        worker._dispatch_item = _raising_dispatch  # type: ignore[method-assign]
+        worker.verify_dispatch.dispatch = _raising_dispatch
 
         # Simulate the waiter detaching before the dispatch error fires.
         assert req.result.cancel()
@@ -593,7 +593,7 @@ class TestPassthroughFinalizeErrorChokepoint:
         async def _raising_finalize(_entry: Any) -> Any:
             raise Exception('boom')
 
-        worker._dispatch_item = _passthrough_dispatch  # type: ignore[method-assign]
+        worker.verify_dispatch.dispatch = _passthrough_dispatch
         worker._finalize_inflight = _raising_finalize  # type: ignore[method-assign]
 
         depth0 = worker.snapshot()['speculation']['slot_available']
@@ -646,7 +646,7 @@ class TestPassthroughFinalizeErrorChokepoint:
         async def _cancelling_finalize(_entry: Any) -> Any:
             raise asyncio.CancelledError()
 
-        worker._dispatch_item = _passthrough_dispatch  # type: ignore[method-assign]
+        worker.verify_dispatch.dispatch = _passthrough_dispatch
         worker._finalize_inflight = _cancelling_finalize  # type: ignore[method-assign]
 
         with pytest.raises(asyncio.CancelledError):
@@ -721,7 +721,7 @@ class TestFinalizeHeadErrorChokepoint:
             worker._speculation_ledger.release(_entry.permit)
             raise Exception('boom')
 
-        worker._dispatch_item = _dispatch_returns_entry  # type: ignore[method-assign]
+        worker.verify_dispatch.dispatch = _dispatch_returns_entry
         worker._finalize_inflight = _raising_finalize  # type: ignore[method-assign]
 
         class _StubAllocator:
@@ -817,7 +817,7 @@ class TestFinalizeHeadErrorChokepoint:
         async def _cancelling_finalize(_entry: Any) -> Any:
             raise asyncio.CancelledError()
 
-        worker._dispatch_item = _dispatch_returns_entry  # type: ignore[method-assign]
+        worker.verify_dispatch.dispatch = _dispatch_returns_entry
         worker._finalize_inflight = _cancelling_finalize  # type: ignore[method-assign]
 
         class _StubAllocator:

@@ -3381,7 +3381,7 @@ class _DeltaScene:
             base_sha=main_before,   # this round really CASes against main
             speculative=True,       # slot 2 — chains whatever the frontier holds (PRD D5)
         )
-        entry = await worker._dispatch_item(item)
+        entry = await worker.verify_dispatch.dispatch(item)
         assert entry is not None, 'dispatch must not decline: a host is free'
         assert entry.verify_task is not None
         await entry.verify_task
