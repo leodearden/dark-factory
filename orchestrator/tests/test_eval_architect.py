@@ -1245,7 +1245,25 @@ class TestArchitectEvalConfigs:
             'architect-sonnet-high',
             'architect-fable-high',
             'architect-fable-max',
+            'architect-fable52-high',
+            'architect-fable52-max',
         }
+
+    @pytest.mark.parametrize(('name', 'effort'), [
+        ('architect-fable52-high', 'high'),
+        ('architect-fable52-max', 'max'),
+    ])
+    def test_architect_fable52_arms_field_shape(self, name, effort):
+        """Task 10488: Fable 5.2 arms are native claude architect candidates."""
+        from orchestrator.evals.configs import get_config_by_name
+
+        cfg = get_config_by_name(name)
+        assert cfg is not None
+        assert cfg.backend == 'claude'
+        assert cfg.model == 'claude-fable-5-2'
+        assert cfg.effort == effort
+        assert cfg.role == 'architect'
+        assert not cfg.env_overrides
 
     def test_architect_fable_max_is_effort_matched_to_opus_incumbent(self):
         """eval-revival ρ: architect-fable-max is the effort-matched fable variant.
