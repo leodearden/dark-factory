@@ -68,11 +68,12 @@ class TestEvalMetricsReplayFrameField:
 _PLAN_ONLY_BASE = 'feedface1234'
 
 
-def _run_plan_only_cli(tmp_path, monkeypatch, *, architect):
+def _run_plan_only_cli(tmp_path, monkeypatch, *, architect, config=None):
     """Run ``orchestrator eval --plan-only`` on one fixture with git, memory and the LLM stubbed.
 
     ``architect`` is the side effect of the stubbed ``invoke_agent``; it may
     write a plan through the real ``TaskArtifacts`` of the worktree it is given.
+    ``config`` is what ``--config`` loads (default: ``project_root=tmp_path``).
     Returns ``(cli_result, invoke_agent_mock, fixture_path)``.
     """
     import json
@@ -85,10 +86,8 @@ def _run_plan_only_cli(tmp_path, monkeypatch, *, architect):
     from orchestrator.cli import main
     from orchestrator.config import OrchestratorConfig
 
-    monkeypatch.setattr(
-        orchestrator.cli_config, 'load_config',
-        lambda _p: OrchestratorConfig(project_root=tmp_path),
-    )
+    loaded = config if config is not None else OrchestratorConfig(project_root=tmp_path)
+    monkeypatch.setattr(orchestrator.cli_config, 'load_config', lambda _p: loaded)
     fixture = tmp_path / 'df_task_9001.json'
     fixture.write_text(json.dumps({
         'id': 'df_task_9001',
@@ -163,6 +162,86 @@ class TestPlanOnlyCliBriefsInReplayFrame:
         written = json.loads(fixture.read_text())
         assert written['plan']['steps']
         assert written['plan_replay_frame'] == REPLAY_FRAME_ID
+
+
+def _refusing_architect(**_kw):
+    from unittest.mock import MagicMock
+
+    return MagicMock(success=False, output='refused')
+
+
+def _routing_decision_fields(stdout: str) -> dict[str, str]:
+    [line] = [line for line in stdout.splitlines() if 'routing_decision' in line]
+    return dict(token.split('=', 1) for token in line.split() if '=' in token)
+
+
+@pytest.mark.usefixtures('code_default_config')
+class TestPlanOnlyArchitectIsRouted:
+    def test_plan_only_architect_route_comes_from_the_config_layer(
+        self, tmp_path, monkeypatch,
+    ):
+        from orchestrator.config import (
+            BudgetsConfig,
+            EffortConfig,
+            ModelsConfig,
+            OrchestratorConfig,
+            TurnsConfig,
+        )
+
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            models=ModelsConfig(architect='sonnet'),
+            budgets=BudgetsConfig(architect=7.5),
+            max_turns=TurnsConfig(architect=33),
+            effort=EffortConfig(architect='medium'),
+        )
+
+        r, invoke_agent, _ = _run_plan_only_cli(
+            tmp_path, monkeypatch, architect=_refusing_architect, config=config,
+        )
+
+        assert r.exit_code == 0, r.output
+        (architect_call,) = invoke_agent.await_args_list
+        assert {
+            key: architect_call.kwargs[key]
+            for key in ('model', 'max_budget_usd', 'max_turns', 'effort', 'backend')
+        } == {
+            'model': 'sonnet', 'max_budget_usd': 7.5, 'max_turns': 33,
+            'effort': 'medium', 'backend': 'claude',
+        }
+        fields = _routing_decision_fields(r.stdout)
+        assert fields['role'] == 'architect'
+        assert fields['model'] == 'sonnet'
+        assert fields['source_layer'] == 'config'
+
+    def test_plan_only_route_honours_a_policy_rule_for_the_architect(
+        self, tmp_path, monkeypatch,
+    ):
+        from orchestrator.config import (
+            OrchestratorConfig,
+            RoutingConfig,
+            RoutingRule,
+            RuleMatch,
+            RuleSet,
+        )
+
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            routing=RoutingConfig(rules=[RoutingRule(
+                id='eval-arch-turns',
+                match=RuleMatch(role=['architect']),
+                set=RuleSet(max_turns=77),
+            )]),
+        )
+
+        r, invoke_agent, _ = _run_plan_only_cli(
+            tmp_path, monkeypatch, architect=_refusing_architect, config=config,
+        )
+
+        assert r.exit_code == 0, r.output
+        (architect_call,) = invoke_agent.await_args_list
+        assert architect_call.kwargs['max_turns'] == 77
+        assert _routing_decision_fields(r.stdout)['rule_id'] == 'eval-arch-turns'
 
 
 _FRAMED_BASE = 'abc123def'
