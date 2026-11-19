@@ -11,25 +11,8 @@ import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-# Suite-wide git isolation (task 3355, incident esc-3072-3).  The verify lane
-# runs `cd dashboard && uv run pytest tests/`, which makes rootdir the
-# SUBPROJECT — the repo-root conftest.py is never loaded, so each test-root
-# conftest wires the defence itself.  APPEND the repo root, never insert(0, ...):
-# at sys.path[0] it would make the subproject directories resolve as namespace
-# packages pointing at the project folder instead of src/<pkg>/, defeating the
-# guard block below.  df_pytest_isolation imports only stdlib and pytest, so it
-# can precede that block.
-if str(REPO_ROOT := Path(__file__).resolve().parents[2]) not in sys.path:
-    sys.path.append(str(REPO_ROOT))
-
-from df_pytest_isolation import (
-    arm_leaked_drain_process_guard,
-    arm_test_root_isolation,
-    reject_unsafe_basetemp,
-)
-
 # ---------------------------------------------------------------------------
-# sys.path guard — MUST stay above every import that can reach dashboard or shared.
+# sys.path guard — MUST stay above all non-stdlib imports.
 #
 # Insert this worktree's src directory at the front of sys.path so that
 # `import dashboard` loads the local (possibly modified) code rather than
@@ -40,8 +23,7 @@ from df_pytest_isolation import (
 # silently resolve against the installed editable package instead of the
 # local worktree src/, causing hard-to-diagnose test failures.
 # ---------------------------------------------------------------------------
-_SRC = Path(__file__).parent.parent / 'src'
-if str(_SRC) not in sys.path:
+if str(_SRC := Path(__file__).parent.parent / 'src') not in sys.path:
     sys.path.insert(0, str(_SRC))
 # Also front-load this worktree's shared/src so `import shared` (e.g. the
 # shared.mcp_idempotency helper the McpSession twin imports, task 2766) loads
@@ -49,18 +31,31 @@ if str(_SRC) not in sys.path:
 # tree — otherwise a brand-new shared submodule that has not yet landed on
 # main is unimportable here, breaking collection of tests that touch it.
 # Mirrors orchestrator/tests/conftest.py's shared/src insertion.
-_SHARED_SRC = Path(__file__).parent.parent.parent / 'shared' / 'src'
-if str(_SHARED_SRC) not in sys.path:
+if str(_SHARED_SRC := Path(__file__).parent.parent.parent / 'shared' / 'src') not in sys.path:
     sys.path.insert(0, str(_SHARED_SRC))
-_TESTS_DIR = Path(__file__).parent
-if str(_TESTS_DIR) not in sys.path:
+if str(_TESTS_DIR := Path(__file__).parent) not in sys.path:
     sys.path.insert(0, str(_TESTS_DIR))
 
-import aiosqlite  # noqa: E402
-import httpx  # noqa: E402
-import pytest  # noqa: E402
-from _dashboard_helpers import RECONCILIATION_SCHEMA, apply_isolated_env  # noqa: E402
-from starlette.testclient import TestClient  # noqa: E402
+# Suite-wide git isolation (task 3355, incident esc-3072-3).  The verify lane
+# runs `cd dashboard && uv run pytest tests/`, which makes rootdir the
+# SUBPROJECT — the repo-root conftest.py is never loaded, so each test-root
+# conftest wires the defence itself.  APPEND the repo root, never insert(0, ...):
+# at sys.path[0] it would make the subproject directories resolve as namespace
+# packages pointing at the project folder instead of src/<pkg>/, defeating the
+# guard block above.
+if str(REPO_ROOT := Path(__file__).resolve().parents[2]) not in sys.path:
+    sys.path.append(str(REPO_ROOT))
+
+import aiosqlite
+import httpx
+import pytest
+from _dashboard_helpers import RECONCILIATION_SCHEMA, apply_isolated_env
+from df_pytest_isolation import (
+    arm_leaked_drain_process_guard,
+    arm_test_root_isolation,
+    reject_unsafe_basetemp,
+)
+from starlette.testclient import TestClient
 
 
 def pytest_configure(config):
