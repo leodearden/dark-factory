@@ -1,9 +1,15 @@
 """The injected pytest plugin ``_df_defect_plugin``, observed through real pytest runs.
 
 Every case runs a fixture project in a subprocess with ``-p _df_defect_plugin``
-and the plugin directory as the ONLY ``PYTHONPATH`` entry, which is how verify
-injects it (plans/defect-tests-prd.md decision 19). Nothing here imports the
-plugin: its contract is the files it writes and the markers it registers.
+and the plugin directory on ``PYTHONPATH``, which is how verify injects it
+(plans/defect-tests-prd.md decision 19). Nothing here imports the plugin: its
+contract is the files it writes and the markers it registers.
+
+Decision 19 also requires the plugin to load in a target that has no ``shared``
+installed. The interpreter running these cases DOES have it, so every run puts a
+``shared`` package that refuses to import AHEAD of the plugin directory.
+``PYTHONPATH`` precedes site-packages and is inherited by xdist workers, so any
+``shared`` import from the plugin, in any process, fails the run.
 """
 
 from __future__ import annotations
@@ -98,9 +104,20 @@ def _write_project(root: Path, files: dict[str, str]) -> Path:
     return root
 
 
+_TARGET_HAS_NO_SHARED = 'targets have no shared (plans/defect-tests-prd.md decision 19)'
+
+
+def _unimportable_shared_beside(project: Path) -> Path:
+    root = project.parent / f'{project.name}-no-shared'
+    package = root / 'shared'
+    package.mkdir(parents=True, exist_ok=True)
+    (package / '__init__.py').write_text(f'raise ImportError({_TARGET_HAS_NO_SHARED!r})\n', encoding='utf-8')
+    return root
+
+
 def _run_pytest(project: Path, *args: str) -> subprocess.CompletedProcess[str]:
     env = {k: v for k, v in os.environ.items() if k not in ('PYTEST_ADDOPTS', 'PYTHONPATH')}
-    env['PYTHONPATH'] = str(_PLUGIN_DIR)
+    env['PYTHONPATH'] = os.pathsep.join([str(_unimportable_shared_beside(project)), str(_PLUGIN_DIR)])
     return subprocess.run(
         [sys.executable, '-m', 'pytest', '-p', '_df_defect_plugin', '-p', 'no:cacheprovider', *args],
         cwd=project,
@@ -184,6 +201,29 @@ class TestPluginDirectory:
     def test_holds_only_the_plugin_module(self):
         entries = {entry.name for entry in _PLUGIN_DIR.iterdir()} - {'__pycache__'}
         assert entries == {'_df_defect_plugin.py'}
+
+
+class TestTargetsWithoutShared:
+    @pytest.mark.parametrize('xdist', [(), ('-n', '2')], ids=['serial', 'xdist'])
+    def test_shared_is_unimportable_in_every_process_the_plugin_runs_in(self, tmp_path, xdist):
+        project = _write_project(
+            tmp_path / 'probe',
+            {
+                'pytest.ini': '[pytest]\n',
+                'tests/test_probe.py': f"""\
+                    import pytest
+
+
+                    @pytest.mark.parametrize('worker', range(4))
+                    def test_shared_refuses(worker):
+                        with pytest.raises(ImportError, match={_TARGET_HAS_NO_SHARED!r}):
+                            import shared
+                    """,
+            },
+        )
+        result = _run_pytest(project, *xdist)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert '4 passed' in result.stdout
 
 
 _PROJECT_B_TESTS = """\
