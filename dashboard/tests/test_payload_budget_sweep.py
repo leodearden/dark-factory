@@ -13,6 +13,10 @@ Four assertions per request:
   reaching the endpoint's data and a real shrink nobody recorded;
 * every declared data-keyed map is present, so a declaration cannot rot.
 
+A request whose route waits a bounded time on its reads is measured once those
+reads have landed, as a polled dashboard serves it
+(``dashboard/tests/_payload_fleet.py::get_landed``).
+
 The fleet is expensive to build, so the module runs in one xdist group.
 """
 
@@ -21,9 +25,11 @@ from __future__ import annotations
 from collections.abc import Iterator
 
 import pytest
-from _payload_fleet import open_fleet_client
+from _payload_fleet import CENSUS, get_landed, open_fleet_client
+from _served_reads import forget_served_reads
 from fastapi.testclient import TestClient
 
+import dashboard.api.prds
 from dashboard.payload_budgets import (
     EndpointBudget,
     field_breakdown,
@@ -49,7 +55,7 @@ def fleet_client() -> Iterator[TestClient]:
 def test_request_is_within_its_budget(
     fleet_client: TestClient, entry: EndpointBudget,
 ) -> None:
-    resp = fleet_client.get(entry.path, params=dict(entry.query))
+    resp = get_landed(fleet_client, entry)
     assert resp.status_code == 200, f'{entry.url_suffix()} answered {resp.status_code}'
 
     measured = len(resp.content)
@@ -76,3 +82,18 @@ def test_request_is_within_its_budget(
             'rotted (a key was renamed or moved); fix data_keyed_maps in '
             'payload_budgets.json.'
         )
+
+
+def test_a_prds_request_whose_activity_reads_miss_their_wait_is_measured_once_they_land(
+    fleet_client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(dashboard.api.prds, 'ACTIVITY_REQUEST_WAIT_SECONDS', 0.0)
+    forget_served_reads()
+    entry = next(entry for entry in _SWEPT if entry.path == '/api/v2/dashboard/prds')
+
+    resp = get_landed(fleet_client, entry)
+
+    assert resp.status_code == 200
+    fresh = {label for label, view in resp.json()['PRD_VIEW'].items() if view['state'] == 'fresh'}
+    assert fresh == {root.label for root in CENSUS.roots if root.holds_tasks}
+    assert not slack_violation(entry.budget_bytes, len(resp.content))
