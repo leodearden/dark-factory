@@ -165,10 +165,10 @@ def wait_for_http(url: str, deadline_secs: float = 15.0) -> None:
 
 
 @pytest.fixture
-def private_rclone(tmp_path: Path) -> Iterator[tuple[subprocess.Popen[bytes], str, tuple[str, str]]]:
-    """A real rclone serving tmp_path/'store' on a private loopback port."""
-    store = tmp_path / "store"
-    store.mkdir(exist_ok=True)
+def private_rclone(
+    world: PrunerWorld, tmp_path: Path
+) -> Iterator[tuple[subprocess.Popen[bytes], str, tuple[str, str]]]:
+    """A real rclone serving the pruner world's store on a private loopback port."""
     port = free_port()
     auth = ("tester", "secret-for-tests")
     env = {
@@ -179,7 +179,7 @@ def private_rclone(tmp_path: Path) -> Iterator[tuple[subprocess.Popen[bytes], st
     }
     with (tmp_path / "rclone.log").open("wb") as log:
         proc = subprocess.Popen(
-            ["rclone", "serve", "webdav", str(store), "--addr", f"127.0.0.1:{port}"],
+            ["rclone", "serve", "webdav", str(world.store), "--addr", f"127.0.0.1:{port}"],
             env=env,
             stdout=log,
             stderr=subprocess.STDOUT,
@@ -318,10 +318,17 @@ class TestPrune:
         assert report["signalled"] == listener.pid
         assert hups.read_text() == "hup\n"
 
-    def test_systemctl_failure_exits_one(self, world: PrunerWorld) -> None:
-        put_object(world.store, "abc-fail", 100, mtime_age=3 * DAY)
-        code, _ = world.prune(cap=0, systemctl_rc=1)
+    def test_systemctl_failure_exits_one_and_removes_nothing(
+        self, world: PrunerWorld
+    ) -> None:
+        path = put_object(world.store, "abc-fail", 100, mtime_age=3 * DAY)
+        code, report = world.prune(cap=0, systemctl_rc=1)
         assert code == 1
+        assert path.exists()
+        assert report["removed"] == 0
+        assert report["remaining_bytes"] == 100
+        assert report["signalled"] is None
+        assert STORE_UNIT in report["error"]
 
     def test_missing_store_root_exits_one(self, world: PrunerWorld, tmp_path: Path) -> None:
         code, _ = world.run(str(tmp_path / "no-such-store"), cap=0)

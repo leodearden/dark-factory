@@ -7,12 +7,13 @@ until the store's total size is at or under --cap-bytes. Files modified less
 than --min-age-secs ago are never removed, because rclone writes a PUT in place
 under its final name; directories are never removed. After any removal the
 store unit's main process gets one SIGHUP so rclone drops its directory cache;
-without it rclone keeps serving a removed object as a truncated 200.
+without it rclone keeps serving a removed object as a truncated 200. That pid
+is resolved before anything is removed, so a failing systemctl removes nothing.
 
 It deletes by default, since a timer runs it; --check is the dry run. One JSON
 line on stdout, logs on stderr. Exit 0 for a completed pass, even one still
 over cap (reported as over_cap); exit 1 when the store root is missing or the
-systemctl call fails.
+systemctl call fails, in which case nothing was removed.
 """
 from __future__ import annotations
 
@@ -122,9 +123,8 @@ def store_main_pid(unit: str) -> int:
         raise SystemctlError(f"systemctl reported no MainPID for {unit}: {proc.stdout!r}") from exc
 
 
-def signal_store(unit: str) -> int | None:
-    """SIGHUP the unit's main process so rclone drops its directory cache; its pid, or None."""
-    pid = store_main_pid(unit)
+def signal_store(unit: str, pid: int) -> int | None:
+    """SIGHUP the unit's main process *pid* so rclone drops its directory cache; the pid, or None."""
     if pid <= 0:
         _log.info("%s %s is not running; nothing to signal", _LOG_PREFIX, unit)
         return None
@@ -167,6 +167,19 @@ def main(argv: list[str] | None = None) -> int:
     now = time.time()
     files = scan(args.store)
     victims = choose_victims(files, args.cap_bytes, now, args.min_age_secs)
+    signalled: int | None = None
+    error: str | None = None
+    if victims and not args.check:
+        try:
+            pid = store_main_pid(args.rclone_unit)
+        except SystemctlError as exc:
+            _log.error("%s %s; nothing was removed", _LOG_PREFIX, exc)
+            error = str(exc)
+            victims = []
+        else:
+            remove(victims)
+            signalled = signal_store(args.rclone_unit, pid)
+
     total_bytes = sum(store_file.size for store_file in files)
     removed_bytes = sum(victim.size for victim in victims)
     remaining_bytes = total_bytes - removed_bytes
@@ -180,18 +193,12 @@ def main(argv: list[str] | None = None) -> int:
         "remaining_bytes": remaining_bytes,
         "skipped_young": sum(1 for f in files if is_young(f, now, args.min_age_secs)),
         "over_cap": remaining_bytes > args.cap_bytes,
-        "signalled": None,
+        "signalled": signalled,
         "check": args.check,
     }
-    exit_code = EXIT_OK
-    if victims and not args.check:
-        remove(victims)
-        try:
-            report["signalled"] = signal_store(args.rclone_unit)
-        except SystemctlError as exc:
-            _log.error("%s %s", _LOG_PREFIX, exc)
-            report["error"] = str(exc)
-            exit_code = EXIT_FAILED
+    if error is not None:
+        report["error"] = error
+    exit_code = EXIT_OK if error is None else EXIT_FAILED
 
     print(json.dumps(report))
     _log.info(
