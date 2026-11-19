@@ -50,6 +50,7 @@ from shared.project_layout import (
     runs_db,
     startup_failures_json,
 )
+from shared.psi import resolve_own_cgroup
 from shared.repo_paths import (
     rejected_dark_factory_root_override,
     resolve_dark_factory_root,
@@ -182,6 +183,7 @@ from orchestrator.pause_policy import (
     policy_for,
 )
 from orchestrator.proc_supervision import EscalationSpec
+from orchestrator.project_slice_weight import ensure_project_slice_weight
 from orchestrator.provenance_conflict import ProvenanceConflictSink
 from orchestrator.quarantine_provenance import QuarantineOutcome
 from orchestrator.recovered_merge_owner import RecoveredMergeOwner
@@ -2709,6 +2711,7 @@ class Harness:
         force_dirty_start: bool = False,
         retag_modules: bool = False,
         until_idle: bool = False,
+        apply_project_slice_weight: bool = False,
     ) -> HarnessReport:
         """Execute the full orchestration pipeline.
 
@@ -2718,6 +2721,9 @@ class Harness:
         If *until_idle* is True, exit when the task queue drains (legacy
         one-shot behavior); otherwise run forever, idling and polling for
         newly-scheduled tasks (the default, for long-lived systemd service use).
+        If *apply_project_slice_weight* is True, startup step 1c1i sets the
+        project slice's CPUWeight; only ``cli.py::run``, the units' ExecStart,
+        passes it (docs/cgroup-slice-topology.md §Slice weight).
         """
         self._until_idle = until_idle
         self.report.started_at = datetime.now(UTC).isoformat()
@@ -2858,6 +2864,12 @@ class Harness:
                 StartupStep('1c0b', self._file_restored_pause_escalation),
                 StartupStep('1c1g', self._run_interactive_worktree_reaper_pass),
                 StartupStep('1c1h', self._run_leftover_verify_scope_reaper_pass),
+                StartupStep(
+                    '1c1i',
+                    functools.partial(
+                        self._ensure_project_slice_weight, apply_project_slice_weight,
+                    ),
+                ),
             )
             task_tree_steps = (
                 StartupStep('2c', self._recover_crashed_tasks),
@@ -9412,6 +9424,15 @@ class Harness:
                 type(exc).__name__,
                 exc,
             )
+
+    async def _ensure_project_slice_weight(self, requested: bool) -> None:
+        """Give this project's slice its CPUWeight, only on the daemon's opt-in;
+        the module never raises for placement and logs its own outcome."""
+        if not requested:
+            return
+        await ensure_project_slice_weight(
+            self.config.fused_memory.project_id, resolve_own_cgroup(None).path,
+        )
 
     async def _block_and_escalate_cross_repo(
         self,

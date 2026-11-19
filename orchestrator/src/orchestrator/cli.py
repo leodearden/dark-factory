@@ -323,6 +323,7 @@ def run(prd: Path | None, config_path: Path | None, dry_run: bool, delay: str | 
             force_dirty_start=force_dirty_start,
             retag_modules=retag_modules,
             until_idle=until_idle,
+            apply_project_slice_weight=True,
         )
 
     try:
