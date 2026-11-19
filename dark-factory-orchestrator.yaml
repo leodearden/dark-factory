@@ -1855,21 +1855,26 @@ fairness:
 # default (off) because enabling is gate 5393's ruling.
 # Why 2: a cell's verify waits on the same admission semaphore as production task
 # verifies. evals/profile.py::EVAL_PROFILE overrides nothing about admission, and
-# build_eval_orch_config derives the cell config by model_copy, so
-# verify_admission_enabled and verify_admission_slots_dir are inherited unchanged; the
-# cell verifies with role='task', and verify_admission_gate.py::gate_for keys the
+# evals/shadow_invocation.py::build_shadow_orch_config wraps
+# evals/runner.py::build_eval_orch_config, which derives the cell config by model_copy;
+# the shadow wrapper changes only sandbox.enabled. So verify_admission_enabled and
+# verify_admission_slots_dir are inherited unchanged; the cell verifies with
+# role='task', and verify_admission_gate.py::gate_for keys the
 # in-process gate by the resolved slots dir. Cells therefore queue on the same
 # AdmissionGate and flock as production (verify_admission_task_slots, above). With remote
 # task legs (6673) moving production's legs to leo-laptop, the workstation semaphore
 # frees more often, so it can absorb more verifies per completed task.
-# FINDING (read from code, 2026-11-19): cell verifies are LOCAL-ONLY.
-# evals/runner.py builds CellProfile(build_eval_orch_config, fixture_task_gate), and the
-# cell's TaskWorkflow gets that as its task_verify. evals/fixture_gate.py::fixture_task_gate
-# calls verify.run_verification(role defaults to 'task') in-process, so no cell ever
-# reaches harness.py's TaskVerifyDispatcher (wired by 6670), whose use is production-only.
-# Each extra cell lands entirely on the workstation slot, which bears on how far to raise
-# this. Do not raise above 2 without remote cell verifies.
-# verify_admission_task_slots is deliberately untouched (its earlier raises were reverted).
+# FINDING (read from code, 2026-11-19): shadow cell verifies are LOCAL-ONLY.
+# evals/shadow_invocation.py::SHADOW_PROFILE gives a shadow cell
+# verify.py::run_scoped_verification (role='task') as its task_verify. That is the
+# in-process local verify. task_verify_dispatch.py::TaskVerifyDispatcher (6670) is
+# constructed only in harness.py, so no cell reaches it and every cell verifies on the
+# workstation. Each extra cell lands entirely on the workstation's task slots, which
+# bears on how far to raise this. Do not raise above 2 without remote cell verifies.
+# No shadow runner is wired in production yet (shadow_eval.py::ShadowCoordinator is never
+# constructed in orchestrator/src), so this value has no runtime effect until one is.
+# verify_admission_task_slots is deliberately untouched by this task (value and history:
+# plans/verify-admission-task-slots-gate.md).
 # Rollback: one reload_config with max_concurrent back at 1 (or delete this block).
 # Green tier; apply with reload_config and read the shadow_eval.max_concurrent disposition.
 shadow_eval:
