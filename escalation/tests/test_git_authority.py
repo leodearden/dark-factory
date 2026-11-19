@@ -1318,6 +1318,23 @@ class TestProbeLandingAncestorArmDecidesByBranchWorkLanded:
         assert verdict.merge_sha_fully_guarded is True
         assert verdict.rescued_by_delivered_checks is False
 
+    async def test_a_reseeded_tip_matched_only_by_a_later_subject_is_unconfirmed(
+        self, tmp_path: Path,
+    ) -> None:
+        """esc-4648-5: a later main commit repeating the tip's subject is not its landing."""
+        repo = tmp_path / 'repo'
+        new_repo(repo)
+        base = landing_git(repo, 'rev-parse', 'main')
+        foreign = landing_commit(repo, 'chore: tidy the census', 'census.md')
+        landing_git(repo, 'branch', 'task/77', foreign)
+        landing_commit(repo, 'chore: tidy the census', 'census-next.md')
+
+        verdict = await _probe_repo(repo, '77', metadata={'branch_base_sha': base})
+
+        assert verdict.outcome is GitAuthorityOutcome.landed_unconfirmed, verdict
+        assert verdict.arm is GitAuthorityArm.ancestor
+        assert verdict.merge_sha is None
+
     async def test_the_ancestor_arm_asks_branch_work_landed_not_the_effect_present_gate(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:

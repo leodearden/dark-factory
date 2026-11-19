@@ -43,6 +43,7 @@ from _landing_git_scenarios import (
     build_merged_landing,
     build_no_op_landing,
     build_rebased_landing,
+    build_reseeded_ancestor_tip,
     build_squashed_landing,
     build_sync_merge_branch,
     build_unlanded_branch,
@@ -205,6 +206,21 @@ class TestAncestryArmDecidesByPatchId:
             'already_landed_gate_ancestry', 'degenerate_branch', 'patch_id',
         )
         gate.queue.submit.assert_not_called()
+
+    async def test_a_reseeded_tip_is_not_stamped_on_a_same_subject_main_commit(
+        self, mock_orch_config: Any, repo: LandingRepo, tmp_path: Path,
+    ) -> None:
+        """esc-4648-5: a subject-only match is not attribution, so nothing is stamped."""
+        sc = build_reseeded_ancestor_tip(repo)
+        gate = WiredGate(mock_orch_config, sc, tmp_path)
+
+        assert await gate.run() is False
+
+        gate.mark.assert_not_awaited()
+        [row] = gate.rejects()
+        assert (row['site'], row['reason'], row['method']) == (
+            'already_landed_gate_ancestry', 'no_attribution', 'patch_id',
+        )
 
     @pytest.mark.parametrize('build', [build_no_op_landing, build_degenerate_branch])
     async def test_every_row_this_arm_writes_names_the_patch_id_policy(

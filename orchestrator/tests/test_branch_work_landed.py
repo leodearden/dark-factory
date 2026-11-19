@@ -38,6 +38,7 @@ from _landing_git_scenarios import (
     build_merged_landing,
     build_no_op_landing,
     build_rebased_landing,
+    build_reseeded_ancestor_tip,
     build_sync_merge_branch,
     build_unlanded_branch,
     numbered_lines,
@@ -1125,6 +1126,29 @@ class TestEmptyContainmentIsRefused:
             branch_tip_sha=sc.branch_tip_sha, metadata=sc.metadata,
         )
         assert verdict.probe['patch_id_containment'] == containment
+
+
+@pytest.mark.asyncio
+class TestReseededAncestorTipIsNotAttributedBySubject:
+    """Attribution anchors only on a citation or the tip's patch-id twin (esc-4648-5).
+
+    On a reseeded ancestor tip containment is vacuous, so attribution is the
+    only guard left; a later main commit that merely repeats the tip's
+    subject carries none of the tip's diff and must not be stamped.
+    """
+
+    async def test_a_later_same_subject_commit_is_not_the_landing(
+        self, git_ops: GitOps, repo: _Repo,
+    ) -> None:
+        sc = build_reseeded_ancestor_tip(repo)
+        verdict = await _landed_under_default_pattern(
+            git_ops, TASK_ID, sc.branch,
+            branch_tip_sha=sc.branch_tip_sha, metadata=sc.metadata,
+        )
+        assert verdict.accepted is False, verdict.probe
+        assert verdict.reason is LandingReason.no_attribution
+        assert verdict.evidence_sha is None
+        assert verdict.probe['evidence_source'] == 'no_equivalent_on_main'
 
 
 @pytest.mark.asyncio

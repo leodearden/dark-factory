@@ -20,8 +20,10 @@ dispatch gate, Tier-3.5) can rebuild exactly the producer's shapes:
 * **B6** degenerate branch — a tip equal to the recorded ``branch_base_sha``
   (:func:`build_degenerate_branch`).
 
-One builder is not a boundary row but a residual the producer accepts: a
-multi-commit branch squash-merged onto main (:func:`build_squashed_landing`).
+Two builders are not boundary rows.  :func:`build_squashed_landing` is a
+residual the producer accepts: a multi-commit branch squash-merged onto main.
+:func:`build_reseeded_ancestor_tip` is a false positive it must refuse: a
+reseeded tip that one later, unrelated main commit matches by subject alone.
 
 Both isolation guards from ``_orch_helpers`` are applied to every repository
 (esc-3072-3): ``assert_isolated_git_repo`` runs BEFORE any subprocess, so a
@@ -349,6 +351,30 @@ def build_squashed_landing(repo: LandingRepo, *, branch: str = BRANCH) -> Scenar
     )
     sc.refresh()
     assert sc.branch_tip_sha == tip
+    return sc
+
+
+def build_reseeded_ancestor_tip(repo: LandingRepo, *, branch: str = BRANCH) -> Scenario:
+    """A branch reseeded onto a FOREIGN main commit, whose subject main later repeats once.
+
+    The tip is an ancestor of main and differs from the recorded
+    ``branch_base_sha``, so the degeneracy guard passes, and the branch owns
+    no commit, so containment is vacuous.  Nothing cites the task and no main
+    commit carries the tip's diff, but exactly one later main commit repeats
+    the tip's subject: a subject-matching attribution tier would stamp that
+    unrelated commit as this task's landing (esc-4648-5).
+    """
+    base = repo.sha('main')
+    foreign = repo.commit('chore: tidy the census', {'census.md': numbered_lines('census', 5)})
+    repo.git('branch', branch, foreign)
+    repo.commit('chore: tidy the census', {'census-next.md': numbered_lines('next', 5)})
+
+    sc = Scenario(
+        repo=repo, branch=branch, branch_base_sha=base, landed_sha=None,
+        metadata={'branch_base_sha': base},
+    )
+    sc.refresh()
+    assert sc.branch_tip_sha == foreign
     return sc
 
 

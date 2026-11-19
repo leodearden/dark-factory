@@ -714,7 +714,10 @@ class TestMergeStatusGitAuthority:
         ``tip != branch_base_sha`` and the branch reads as non-degenerate —
         yet it still carries zero of the task's own work.  Only the
         producer's attribution tier catches this (``no_attribution``), which
-        is why neither guard ships alone.
+        is why neither guard ships alone.  The producer is stubbed here; that
+        its patch-id-only attribution really refuses the shape is pinned in
+        real git by ``test_git_authority.py::TestProbeLandingAncestorArmDecidesByBranchWorkLanded``
+        (esc-4648-5).
         """
         producer = stub_landing_producer(monkeypatch, 'no_attribution')
         server, _ = self._ancestor_arm_server(

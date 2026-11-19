@@ -96,7 +96,7 @@
     "orchestrator/src/orchestrator/merge_lane/intake.py": {"cognitive": 96, "function_local_imports": 0, "lines": 1096, "prose_lines": 476, "reexport_names": 0},
     "orchestrator/src/orchestrator/merge_lane/intake_buffers.py": {"cognitive": 88, "function_local_imports": 0, "lines": 849, "prose_lines": 392, "reexport_names": 0},
     "orchestrator/src/orchestrator/merge_lane/landed_outbox.py": {"cognitive": 13, "function_local_imports": 0, "lines": 230, "prose_lines": 116, "reexport_names": 0},
-    "orchestrator/src/orchestrator/merge_lane/landing_evidence.py": {"cognitive": 173, "function_local_imports": 1, "lines": 3166, "prose_lines": 1670, "reexport_names": 0},
+    "orchestrator/src/orchestrator/merge_lane/landing_evidence.py": {"cognitive": 173, "function_local_imports": 1, "lines": 3169, "prose_lines": 1675, "reexport_names": 0},
     "orchestrator/src/orchestrator/merge_lane/liveness.py": {"cognitive": 67, "function_local_imports": 0, "lines": 1437, "prose_lines": 679, "reexport_names": 0},
     "orchestrator/src/orchestrator/merge_lane/lookahead_hold.py": {"cognitive": 10, "function_local_imports": 0, "lines": 70, "prose_lines": 16, "reexport_names": 0},
     "orchestrator/src/orchestrator/merge_lane/member_redrive.py": {"cognitive": 17, "function_local_imports": 0, "lines": 190, "prose_lines": 28, "reexport_names": 0},

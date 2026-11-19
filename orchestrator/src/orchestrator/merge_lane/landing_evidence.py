@@ -1193,7 +1193,13 @@ async def _resolve_main_reachable_evidence(
        main-reachable by construction; no extra reachability check is needed
        (and none is done, which is what keeps this leg off the decaying
        path-set predicates — see :func:`branch_work_landed`).
-    2. **Patch-id equivalent** — :func:`_patch_id_equivalent_on_main`.
+    2. **Patch-id equivalent** — :func:`_patch_id_equivalent_on_main`, by
+       patch-id ONLY.  ``find_equivalent_commit``'s unique-subject tier is
+       excluded because its hit need not carry *head*'s diff: on a reseeded
+       ancestor tip (containment is vacuous there) one later main commit
+       repeating the tip's subject would otherwise be stamped as this task's
+       landing (esc-4648-5, the narrowing task 4862 applied to the content
+       fallback).
 
     Returns ``None`` when NEITHER tier resolves.  The caller turns that into
     :attr:`LandingReason.no_attribution` rather than accepting: anchoring on
@@ -1220,11 +1226,11 @@ async def _resolve_main_reachable_evidence(
         probe['citation'] = citation
         probe['evidence_source'] = 'citation'
         return citation
-    return await _patch_id_equivalent_on_main(git_ops, head, probe, patch_id_only=False)
+    return await _patch_id_equivalent_on_main(git_ops, head, probe)
 
 
 async def _patch_id_equivalent_on_main(
-    git_ops: GitOps, head: str, probe: dict[str, Any], *, patch_id_only: bool,
+    git_ops: GitOps, head: str, probe: dict[str, Any],
 ) -> str | None:
     """The commit on main whose diff is patch-id equivalent to *head*'s, or None.
 
@@ -1232,12 +1238,11 @@ async def _patch_id_equivalent_on_main(
     ``project_root``, whose HEAD is main.  The map it builds is keyed on
     ``git patch-id --stable``, so the sha it returns is the commit on main
     whose diff is equivalent to *head*'s — the replayed twin a rebase landing
-    produces.  It carries its own refuse-to-guess posture (an ambiguous
-    patch-id, or an ambiguous subject in its tier-2 fallback, yields ``None``
-    rather than an arbitrary pick), which is inherited here deliberately.
-    *patch_id_only* drops that subject tier, whose hit need not carry
-    *head*'s diff: :func:`_content_equivalence_anchor` sets it, and
-    :func:`_resolve_main_reachable_evidence` keeps both tiers.
+    produces.  An ambiguous patch-id yields ``None`` rather than an arbitrary
+    pick, a refuse-to-guess posture inherited here deliberately.  The search
+    is patch-id ONLY: ``find_equivalent_commit``'s subject tier is never
+    used, because its hit need not carry *head*'s diff, and every caller
+    anchors provenance on the answer.
     """
     base = await git_ops.merge_base_with_main(head)
     probe['merge_base'] = base
@@ -1249,7 +1254,7 @@ async def _patch_id_equivalent_on_main(
         return None
 
     equivalent = await git_ops.find_equivalent_commit(
-        git_ops.project_root, base, head, patch_id_only=patch_id_only,
+        git_ops.project_root, base, head, patch_id_only=True,
     )
     probe['evidence_source'] = (
         'patch_id_equivalent' if equivalent else 'no_equivalent_on_main'
@@ -1929,9 +1934,7 @@ async def _content_equivalence_anchor(
         if not await git_ops.branch_content_in_main(branch_tip_sha):
             probe['content_fallback'] = 'not_content_equivalent'
             return None
-        anchor = await _patch_id_equivalent_on_main(
-            git_ops, branch_tip_sha, probe, patch_id_only=True,
-        )
+        anchor = await _patch_id_equivalent_on_main(git_ops, branch_tip_sha, probe)
     except Exception as exc:
         probe['content_fallback'] = 'error'
         probe['content_fallback_error'] = repr(exc)
