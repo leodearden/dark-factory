@@ -290,7 +290,9 @@ start it explicitly the first time. Once running:
   is reported as drift by the unit-parity check (`OPERATIONS.md`
   §"Dashboard unit-parity check") and a drop-in carrying it as an override.
   A `scripts/setup-host.sh` re-render drops the line, because the renderer
-  preserves only `DASHBOARD_KNOWN_PROJECT_ROOTS`.
+  keeps only the dashboard's host-local names
+  (`scripts/systemd_unit_parity.py::ENV_POLICY`), and `DASHBOARD_SAMPLERS` is
+  not one.
 - `dark-factory-dashboard-watchdog.timer` curls `/healthz` every 30s and
   restarts the dashboard if it wedges.
 - `orchestrator-watchdog.timer` TCP-probes every *enabled* orchestrator's
