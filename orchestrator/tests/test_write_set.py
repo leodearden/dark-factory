@@ -385,7 +385,7 @@ class TestGitdirParsingRobustness:
 def _make_write_set(**overrides: Path) -> WriteSet:
     """Construct a WriteSet from dummy Paths (hermetic — digest() depends
     ONLY on writable_paths(), which needs no filesystem)."""
-    fields: dict[str, Path] = dict(
+    base = WriteSet(
         worktree=Path('/wt'),
         task_meta=Path('/base/.task-meta/wt'),
         task_root=Path('/base/.task-meta/task-1'),
@@ -398,8 +398,7 @@ def _make_write_set(**overrides: Path) -> WriteSet:
         tmp=Path('/tmp'),
         dev=Path('/dev'),
     )
-    fields.update(overrides)
-    return WriteSet(**fields)
+    return dataclasses.replace(base, **overrides)
 
 
 class TestWriteSetDigest:

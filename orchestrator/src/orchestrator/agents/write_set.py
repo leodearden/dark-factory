@@ -19,6 +19,10 @@ Contract (PRD Sec Contract) — derived per-invocation from the worktree path:
   8. ``~/.claude/fleet/`` (alpha1 FINAL-WRITABLE-LIST — see
      ``plans/os-sandbox-claude-home-writer-audit.md``)
   9-10. ``/tmp/``, ``/dev/``
+  12-13. conditional: ``<project_root>/.git/`` plus the narrowest grant per
+         declared docs path, present only when
+         ``docs_scope.docs_only_paths(declared_files)`` is non-empty
+         (``plans/os-sandbox-worktree-containment-prd.md`` §Docs-only main grant)
 
 Everything else is read-only. The common dir's ``rr-cache`` is deliberately
 not granted; sandboxed agents run with rerere off instead
@@ -31,10 +35,16 @@ to flag a plan step naming another task's ``.task-meta`` (task 4825).
 from __future__ import annotations
 
 import hashlib
+import logging
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
+from orchestrator.agents.docs_scope import docs_only_paths
 from orchestrator.artifacts import TaskArtifacts
+
+logger = logging.getLogger(__name__)
+
+_UNGRANTABLE_TOP_LEVEL = frozenset({'.git', '.taskmaster', '.worktrees'})
 
 
 @dataclass(frozen=True)
@@ -57,6 +67,16 @@ class WriteSet:
     claude_fleet: Path
     tmp: Path
     dev: Path
+    docs_main_git: Path | None = None
+    docs_main_paths: tuple[Path, ...] = ()
+
+    def __post_init__(self) -> None:
+        if bool(self.docs_main_paths) != (self.docs_main_git is not None):
+            raise ValueError(
+                'WriteSet: docs_main_paths must be non-empty exactly when '
+                f'docs_main_git is set; got docs_main_git={self.docs_main_git!r}, '
+                f'docs_main_paths={self.docs_main_paths!r}'
+            )
 
     def writable_paths(self) -> list[Path]:
         """The single aggregate writable-path list (INV-5) — contract
@@ -74,6 +94,9 @@ class WriteSet:
             self.tmp,
             self.dev,
         ]
+        if self.docs_main_git is not None:
+            paths.append(self.docs_main_git)
+        paths.extend(self.docs_main_paths)
         seen: set[Path] = set()
         deduped: list[Path] = []
         for path in paths:
@@ -147,6 +170,7 @@ def _parse_gitdir(worktree: Path) -> Path:
 
 def compute_write_set(
     worktree: Path, *, task_id: str, task_root: Path | None = None, home: Path | None = None,
+    declared_files: object = None,
 ) -> WriteSet:
     """Derive the full writable-path set for a sandboxed agent invocation
     of task *task_id* rooted at ``worktree``.
@@ -165,12 +189,17 @@ def compute_write_set(
 
     ``home`` defaults to ``Path.home()``; tests should inject a hermetic
     tmp dir.
+
+    ``declared_files`` is the task's declared file scope. When every entry is
+    a docs path, the main checkout's ``.git`` and those paths are granted too
+    (contract rows 12-13); any other value grants nothing extra.
     """
     return _derive_write_set(
         worktree,
         task_root if task_root is not None
         else TaskArtifacts.task_root_for(worktree.parent, task_id),
         home,
+        declared_files,
     )
 
 
@@ -184,11 +213,14 @@ def write_set_of(artifacts: TaskArtifacts, *, home: Path | None = None) -> Write
     return _derive_write_set(artifacts.worktree, artifacts.task_root, home)
 
 
-def _derive_write_set(worktree: Path, task_root: Path, home: Path | None) -> WriteSet:
+def _derive_write_set(
+    worktree: Path, task_root: Path, home: Path | None, declared_files: object = None,
+) -> WriteSet:
     home = home or Path.home()
 
     admindir = _parse_gitdir(worktree)
     main_git = admindir.parent.parent
+    docs_main_git, docs_main_paths = _docs_main_grant(main_git, declared_files)
 
     return WriteSet(
         worktree=worktree.resolve(),
@@ -207,7 +239,60 @@ def _derive_write_set(worktree: Path, task_root: Path, home: Path | None) -> Wri
         claude_fleet=(home / '.claude' / 'fleet').resolve(),
         tmp=Path('/tmp'),
         dev=Path('/dev'),
+        docs_main_git=docs_main_git,
+        docs_main_paths=docs_main_paths,
     )
+
+
+def _docs_main_grant(
+    main_git: Path, declared_files: object,
+) -> tuple[Path | None, tuple[Path, ...]]:
+    docs = docs_only_paths(declared_files)
+    if not docs:
+        return None, ()
+    if main_git.name != '.git' or not main_git.is_dir():
+        logger.warning(
+            'compute_write_set: docs-only declared files %s, but the common git '
+            'dir %s is not a <project_root>/.git; no main-checkout grant',
+            [str(rel) for rel in docs], main_git,
+        )
+        return None, ()
+    paths = _docs_main_grants(main_git.parent.resolve(), docs)
+    return (main_git, paths) if paths else (None, ())
+
+
+def _docs_main_grants(root: Path, docs: tuple[PurePosixPath, ...]) -> tuple[Path, ...]:
+    grants: dict[Path, None] = {}
+    for rel in docs:
+        grant = _docs_grant(root, rel)
+        if grant is not None:
+            grants[grant] = None
+    return tuple(grants)
+
+
+def _docs_grant(root: Path, rel: PurePosixPath) -> Path | None:
+    """The narrowest grant under *root* that lets *rel* be written: the path
+    itself when it exists, else its nearest existing ancestor directory."""
+    target = (root / rel).resolve()
+    grant = target if target.exists() else next(a for a in target.parents if a.exists())
+    reason = _ungrantable_reason(root, grant)
+    if reason is None and not (grant.is_dir() or (grant == target and grant.is_file())):
+        reason = f'{grant} is not a regular file or directory'
+    if reason is not None:
+        logger.warning(
+            'compute_write_set: not granting declared docs path %s: %s', rel, reason,
+        )
+        return None
+    return grant
+
+
+def _ungrantable_reason(root: Path, grant: Path) -> str | None:
+    if grant == root or not grant.is_relative_to(root):
+        return f'it resolves to {grant}, not strictly inside {root}'
+    top = grant.relative_to(root).parts[0]
+    if top in _UNGRANTABLE_TOP_LEVEL:
+        return f'it resolves into {root / top}, which is never granted'
+    return None
 
 
 def ensure_claude_fleet_dir(write_set: WriteSet) -> bool:
@@ -217,9 +302,9 @@ def ensure_claude_fleet_dir(write_set: WriteSet) -> bool:
     ``test_purity_no_makedirs_side_effect``), yet the ``~/.claude/fleet``
     carve-out is load-bearing and must EXIST on disk before the sandbox is
     built: neither backend can grant a nonexistent writable path from INSIDE
-    the sandbox — bwrap ``build_bwrap_command`` binds a writable extra only
-    ``if os.path.isdir(extra)`` (sandbox.py) and landlock ``_add_path`` skips a
-    path that ``not os.path.isdir(path)`` (landlock_exec.py) — and the agent
+    the sandbox — bwrap ``build_bwrap_command`` binds a writable extra only if
+    it is an existing file or dir (sandbox.py), and landlock ``_add_path``
+    skips any other path (landlock_exec.py) — and the agent
     cannot create it itself because the parent ``~/.claude`` is read-only under
     both backends. So the orchestrator must materialize it OUTSIDE the sandbox,
     once, before dispatch (task 2996). This helper is co-located with the
