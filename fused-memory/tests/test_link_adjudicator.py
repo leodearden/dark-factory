@@ -7,7 +7,9 @@ so the two must agree word for word (INV-10).
 
 from __future__ import annotations
 
+import functools
 import json
+import os
 import re
 import shutil
 from collections.abc import Callable, Mapping
@@ -17,6 +19,7 @@ import pytest
 from shared.cap_markers import REAL_CLI_CAP_HIT_MESSAGES, looks_like_capacity_banner
 from shared.cli_invoke import AgentResult, invoke_with_cap_retry, no_mcp_servers_config
 from shared.neutral_cwd import neutral_cli_cwd
+from shared.secret_env import AGENT_CREDENTIAL_VAR
 
 from fused_memory.config.schema import LinkHealConfig
 from fused_memory.maintenance import link_adjudicator
@@ -465,6 +468,9 @@ def _ok(structured_output: Any = None, cost_usd: float = 0.0) -> AgentResult:
     )
 
 
+_ONE_SAME_ANSWER = {'verdicts': [{'id': 'p1', 'verdict': Verdict.SAME.value, 'reason': 'r'}]}
+
+
 @pytest.fixture
 def brief(tmp_path):
     path = tmp_path / 'brief.md'
@@ -585,8 +591,7 @@ class TestPromptVersion:
 class TestConfiguredAdjudicator:
     @pytest.mark.asyncio
     async def test_a_given_brief_names_the_model_and_prompt_every_shard_carries(self, tmp_path):
-        answer = {'verdicts': [{'id': 'p1', 'verdict': Verdict.SAME.value, 'reason': 'r'}]}
-        invoke = FakeInvoke(_ok(structured_output=answer))
+        invoke = FakeInvoke(_ok(structured_output=_ONE_SAME_ANSWER))
         ask = ClaudeShardAsker(
             brief_text=FIXED_BRIEF, brief_path=tmp_path / 'missing.md', invoke=invoke,
         )
@@ -608,8 +613,7 @@ class TestConfiguredAdjudicator:
     async def test_without_a_brief_text_the_brief_is_read_once_at_construction(self, tmp_path):
         brief = tmp_path / 'brief.md'
         brief.write_text(FIXED_BRIEF, encoding='utf-8')
-        answer = {'verdicts': [{'id': 'p1', 'verdict': Verdict.SAME.value, 'reason': 'r'}]}
-        invoke = FakeInvoke(_ok(structured_output=answer))
+        invoke = FakeInvoke(_ok(structured_output=_ONE_SAME_ANSWER))
         config = LinkHealConfig(shard_size=1)
         adjudicate = configured_adjudicator(config, brief_path=brief, invoke=invoke)
         brief.unlink()
@@ -666,13 +670,25 @@ _LIVE_PAIR = LinkPair(
     parent_text='git stash is unsafe here because the stash stack is shared across all worktrees.',
 )
 
+_CREDENTIALED = {AGENT_CREDENTIAL_VAR: 'test-setup-token'}
 
-async def _live_edge_verdict(invoke: Invoke) -> LinkVerdict:
-    """The live pair's verdict; capacity skips and auth reds, per shared/tests/_capacity_skip.py."""
+
+async def _live_edge_verdict(invoke: Invoke, environ: Mapping[str, str]) -> LinkVerdict:
+    """The live pair's verdict; no setup token skips, capacity skips and auth reds.
+
+    The capacity and auth policy is shared/tests/_capacity_skip.py's.
+    """
+    token = environ.get(AGENT_CREDENTIAL_VAR)
+    if not token:
+        pytest.skip(
+            f'the live edge needs a Claude setup token in {AGENT_CREDENTIAL_VAR}, '
+            'not the ambient claude.ai login',
+        )
+    credentialed = functools.partial(invoke, oauth_token=token)
     results: list[AgentResult] = []
 
     async def recording(**kwargs: Any) -> AgentResult:
-        result = await invoke(**kwargs)
+        result = await credentialed(**kwargs)
         results.append(result)
         return result
 
@@ -694,26 +710,55 @@ class TestTheLiveEdgeCapacityGuard:
         invoke = FakeInvoke(AgentResult(success=False, output=banner))
 
         with pytest.raises(pytest.skip.Exception, match=re.escape(banner)):
-            await _live_edge_verdict(invoke)
+            await _live_edge_verdict(invoke, _CREDENTIALED)
 
     @pytest.mark.asyncio
     async def test_an_auth_failure_is_not_skipped(self):
         invoke = FakeInvoke(AgentResult(success=False, output='Not logged in · Please run /login'))
 
-        verdict = await _live_edge_verdict(invoke)
+        verdict = await _live_edge_verdict(invoke, _CREDENTIALED)
 
         assert verdict.failed
         assert verdict.failure is AdjudicationFailure.CLI_FAILED
 
     @pytest.mark.asyncio
     async def test_a_successful_reply_is_returned_as_is(self):
-        answer = {'verdicts': [{'id': 'p1', 'verdict': Verdict.SAME.value, 'reason': 'r'}]}
-        invoke = FakeInvoke(_ok(structured_output=answer))
+        invoke = FakeInvoke(_ok(structured_output=_ONE_SAME_ANSWER))
 
-        verdict = await _live_edge_verdict(invoke)
+        verdict = await _live_edge_verdict(invoke, _CREDENTIALED)
 
         assert not verdict.failed
         assert verdict.verdict is Verdict.SAME
+
+
+class TestTheLiveEdgeCredentialGuard:
+    @pytest.mark.asyncio
+    async def test_no_setup_token_skips_before_any_call(self):
+        invoke = FakeInvoke(_ok())
+
+        with pytest.raises(pytest.skip.Exception, match=re.escape(AGENT_CREDENTIAL_VAR)):
+            await _live_edge_verdict(invoke, {})
+
+        assert invoke.calls == []
+
+    @pytest.mark.asyncio
+    async def test_an_empty_setup_token_counts_as_absent(self):
+        invoke = FakeInvoke(_ok())
+
+        with pytest.raises(pytest.skip.Exception, match=re.escape(AGENT_CREDENTIAL_VAR)):
+            await _live_edge_verdict(invoke, {AGENT_CREDENTIAL_VAR: ''})
+
+        assert invoke.calls == []
+
+    @pytest.mark.asyncio
+    async def test_the_setup_token_reaches_the_cli_call(self):
+        invoke = FakeInvoke(_ok(structured_output=_ONE_SAME_ANSWER))
+
+        verdict = await _live_edge_verdict(invoke, {AGENT_CREDENTIAL_VAR: 'tok-1'})
+
+        assert not verdict.failed
+        (call,) = invoke.calls
+        assert call['oauth_token'] == 'tok-1'
 
 
 @pytest.mark.integration
@@ -722,7 +767,7 @@ class TestTheLiveEdge:
     @pytest.mark.asyncio
     @pytest.mark.timeout(600)
     async def test_a_restatement_gets_a_verdict_from_the_real_cli(self):
-        verdict = await _live_edge_verdict(invoke_with_cap_retry)
+        verdict = await _live_edge_verdict(invoke_with_cap_retry, os.environ)
 
         assert not verdict.failed, verdict
         assert isinstance(verdict.verdict, Verdict)
