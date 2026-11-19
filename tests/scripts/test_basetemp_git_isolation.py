@@ -34,6 +34,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from nested_pytest_session import run_nested_pytest
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -418,9 +419,9 @@ class TestCeilingIsLiveInThisRun:
 # needs it most.  This guard is what makes the coverage uniform and keeps it
 # that way, rather than trusting the next person to remember.
 
-# Every suite-wide fixture a test-root conftest must bind, mapped to the clause
+# Every suite-wide fixture a test-root conftest must arm, mapped to the clause
 # its defect message appends: what goes wrong in a suite that forgets it.
-_REQUIRED_FIXTURE_BINDINGS: dict[str, str] = {
+_REQUIRED_ARMED_FIXTURES: dict[str, str] = {
     '_df_git_ceiling_at_basetemp': (
         ' — without it a cwd=tmp_path git call can walk up into the enclosing '
         'live worktree (esc-3072-3)'
@@ -428,6 +429,10 @@ _REQUIRED_FIXTURE_BINDINGS: dict[str, str] = {
     '_df_deploy_clocks_unwritten': (
         ' — without it this suite can stamp a REAL deploy clock and suppress the '
         'watchdog staleness backstop for 8h (task 3797)'
+    ),
+    '_df_git_env_hermetic': (
+        ' — without it a leaked GIT_DIR/GIT_WORK_TREE redirects every '
+        '`git -C tmp_path` write into the repository it names (incident 2026-08-31)'
     ),
     '_df_claude_binary_unset': (
         ' — without it an ambient CLAUDE_BINARY outranks PATH '
@@ -443,7 +448,7 @@ _REQUIRED_FIXTURE_BINDINGS: dict[str, str] = {
 
 
 def _conftest_sample(
-    bindings: Iterable[str] = tuple(_REQUIRED_FIXTURE_BINDINGS),
+    bindings: Iterable[str] = tuple(_REQUIRED_ARMED_FIXTURES),
     *,
     binding_suffix: str = '',
     bootstrap: str = (
@@ -559,7 +564,7 @@ def _wiring_defects(source: str, conftest: Path) -> list[str]:
     defects.extend(
         f'does not import {fixture} from df_pytest_isolation (pytest only collects '
         f'fixtures bound into the conftest namespace, so the import IS the wiring){consequence}'
-        for fixture, consequence in _REQUIRED_FIXTURE_BINDINGS.items()
+        for fixture, consequence in _REQUIRED_ARMED_FIXTURES.items()
         if fixture not in imported
     )
     if 'reject_unsafe_basetemp' not in imported:
@@ -658,7 +663,7 @@ class TestEveryTestRootConftestIsWired:
 
         assert defects == [], f'{defects}\n{_WIRING_SNIPPET}'
 
-    @pytest.mark.parametrize('missing', sorted(_REQUIRED_FIXTURE_BINDINGS))
+    @pytest.mark.parametrize('missing', sorted(_REQUIRED_ARMED_FIXTURES))
     def test_the_detector_flags_a_conftest_missing_only_one_required_binding(
         self, missing: str,
     ) -> None:
@@ -669,7 +674,7 @@ class TestEveryTestRootConftestIsWired:
         fire alongside another defect and could be deleted without any test
         noticing (task 3797).
         """
-        sample = _conftest_sample(b for b in _REQUIRED_FIXTURE_BINDINGS if b != missing)
+        sample = _conftest_sample(b for b in _REQUIRED_ARMED_FIXTURES if b != missing)
 
         defects = _wiring_defects(sample, REPO_ROOT / 'orchestrator' / 'tests' / 'conftest.py')
 
@@ -704,3 +709,50 @@ class TestEveryTestRootConftestIsWired:
 
         assert REPO_ROOT / 'conftest.py' in conftests
         assert len(conftests) > 1
+
+
+_ARMING_ONLY_CONFTEST = '''\
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from df_pytest_isolation import arm_test_root_isolation
+
+
+def pytest_configure(config):
+    arm_test_root_isolation(config)
+'''
+
+_ARMED_FIXTURES_PROBE = f'''\
+REQUIRED = {sorted(_REQUIRED_ARMED_FIXTURES)!r}
+
+
+def test_every_required_fixture_is_armed(request):
+    missing = [name for name in REQUIRED if name not in request.fixturenames]
+    assert not missing, missing
+
+
+def test_the_fleet_deploy_clock_redirect_is_requestable_by_name(request):
+    assert request.getfixturevalue('_df_fleet_deploy_clock_redirect')
+'''
+
+
+class TestArmTestRootIsolation:
+    """The bundle every test root calls arms the whole required set, independently checked."""
+
+    def test_it_arms_every_required_fixture(self, tmp_path: Path) -> None:
+        """A conftest that only calls arm_test_root_isolation gets every fixture this guard requires.
+
+        The required map above is kept independent of the bundle, so a defence
+        dropped from the bundle fails here instead of silently leaving every
+        test root without it.
+        """
+        result = run_nested_pytest(
+            tmp_path / 'armed',
+            {'conftest.py': _ARMING_ONLY_CONFTEST, 'test_probe.py': _ARMED_FIXTURES_PROBE},
+        )
+
+        output = result.stdout + result.stderr
+        assert result.returncode == 0, output
+        assert '2 passed' in output, output

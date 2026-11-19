@@ -814,14 +814,14 @@ def _nested_run(
 # a gating command is not a test: it says which RUN went red, not which branch.
 #
 # This reduces 4398 to its essentials in a nested pytest session -- two
-# sub-rootdirs, each with a conftest binding the fixture exactly as this repo's
-# three real roots do -- so the branch is pinned by something that names it.
+# sub-rootdirs, each with its own conftest -- so the branch is pinned by
+# something that names it.
 # ---------------------------------------------------------------------------
 
-# The binding IS the wiring, and it goes in a CONFTEST rather than a test
-# module: that is what the real roots do (conftest.py, scripts/tests/conftest.py,
-# orchestrator/tests/conftest.py) and it is what makes two independent instances
-# of one session-scoped fixture exist in a single session.
+# Importing the fixture into each sub-root's conftest gives every root its own
+# instance of one session-scoped fixture in a single session. The real roots no
+# longer do this -- they arm it once per session -- but it is the only wiring
+# that still reaches the adopt branch, so it is kept on purpose.
 _ADOPTION_CONFTEST = """\
 import sys
 from pathlib import Path
@@ -831,6 +831,25 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from df_pytest_isolation import _df_fleet_dir_redirect  # noqa: F401
+"""
+
+# The production wiring (conftest.py, scripts/tests/conftest.py,
+# orchestrator/tests/conftest.py): each root arms the pair from its
+# pytest_configure. Arming also arms the live-fleet heartbeat guard, so the copy
+# is repointed at the nested tree first, keeping the run off the real directory.
+_ARMING_CONFTEST = """\
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import df_pytest_isolation
+
+df_pytest_isolation.LIVE_FLEET_DIR = Path(__file__).resolve().parent.parent / 'fleet'
+
+
+def pytest_configure(config):
+    df_pytest_isolation.arm_fleet_dir_isolation(config)
 """
 
 # Each nested test RECORDS what its own root's instance yielded, so the outer
@@ -864,8 +883,10 @@ def _adoption_test_source(record: str) -> str:
     return _ADOPTION_TEST_TEMPLATE.replace('__RECORD__', repr(record))
 
 
-def _nested_adoption_run(root: Path) -> subprocess.CompletedProcess[str]:
-    """Run one pytest session spanning TWO sub-rootdirs that each bind the fixture.
+def _nested_adoption_run(
+    root: Path, sub_root_conftest: str,
+) -> subprocess.CompletedProcess[str]:
+    """Run one pytest session spanning TWO sub-rootdirs, each wired by *sub_root_conftest*.
 
     The module order on the command line is A, B, A -- the shape task 4398
     actually reported (``pytest scripts/tests/... tests/scripts/...
@@ -878,8 +899,8 @@ def _nested_adoption_run(root: Path) -> subprocess.CompletedProcess[str]:
     return run_nested_pytest(
         root,
         {
-            'root_a/conftest.py': _ADOPTION_CONFTEST,
-            'root_b/conftest.py': _ADOPTION_CONFTEST,
+            'root_a/conftest.py': sub_root_conftest,
+            'root_b/conftest.py': sub_root_conftest,
             'root_a/test_a_first.py': _adoption_test_source('a-first'),
             'root_b/test_b_only.py': _adoption_test_source('b-only'),
             'root_a/test_a_second.py': _adoption_test_source('a-second'),
@@ -894,8 +915,13 @@ def _nested_adoption_run(root: Path) -> subprocess.CompletedProcess[str]:
 class TestTheAdoptBranchHoldsInARealSession:
     """Two roots, one session, one redirect."""
 
+    @pytest.mark.parametrize(
+        'sub_root_conftest',
+        [_ADOPTION_CONFTEST, _ARMING_CONFTEST],
+        ids=['import-binding', 'arming'],
+    )
     def test_both_roots_yield_the_one_redirect_the_env_var_holds(
-        self, tmp_path: Path,
+        self, tmp_path: Path, sub_root_conftest: str,
     ) -> None:
         """The end-to-end proof of ``_df_fleet_dir_redirect``'s adopt branch.
 
@@ -913,11 +939,13 @@ class TestTheAdoptBranchHoldsInARealSession:
         Note the nested session INHERITS this session's ``ORCH_FLEET_DIR``,
         which points into the OUTER basetemp -- so the first instance correctly
         REFUSES it (a previous run's value is never adoptable) and mktemps, and
-        only the second adopts. That is the create path and the adopt path in
-        one run, in the order they occur in production.
+        under import binding only the second adopts: the create path and the
+        adopt path in one run. Under arming, both roots arm the one fixture, so
+        the same assertions pin that the production wiring still yields one
+        redirect.
         """
         root = tmp_path / 'two-roots'
-        result = _nested_adoption_run(root)
+        result = _nested_adoption_run(root, sub_root_conftest)
         combined = result.stdout + result.stderr
 
         assert result.returncode == 0, (
