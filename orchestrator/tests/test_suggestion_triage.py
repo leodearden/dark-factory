@@ -30,7 +30,7 @@ from orchestrator.workflow import StewardInterrupted, WorkflowOutcome
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_workflow(*, escalation_queue=None, escalation_event=None):
+def _make_workflow(*, escalation_queue=None, escalation_event=None, mcp_url='http://localhost:8002'):
     """Build a minimal TaskWorkflow-like object with the methods under test."""
     from orchestrator.workflow import TaskWorkflow
 
@@ -48,7 +48,7 @@ def _make_workflow(*, escalation_queue=None, escalation_event=None):
     scheduler = MagicMock()
 
     mcp = MagicMock()
-    mcp.url = 'http://localhost:8002'
+    mcp.url = mcp_url
 
     briefing = MagicMock()
 
@@ -1573,10 +1573,8 @@ class TestCuratorSubmitTransport:
     @pytest.mark.asyncio
     async def test_submit_task_call_lands_at_the_mcp_path(self):
         """THE regression: the submit_task tools/call must arrive at /mcp."""
-        wf = _make_workflow()
-
         with StubMcpServer(stateful=False, payload={'ticket': 'tkt-1'}) as server:
-            wf.mcp.url = server.url
+            wf = _make_workflow(mcp_url=server.url)
             await self._route(wf, self._suggestions())
 
         arrived = [r.path for r in server.requests]
@@ -1591,14 +1589,13 @@ class TestCuratorSubmitTransport:
     @pytest.mark.asyncio
     async def test_client_is_constructed_with_follow_redirects(self):
         """Task's explicit ask (a), first half."""
-        wf = _make_workflow()
         factory = RecordingClientFactory()
 
         with (
             StubMcpServer(stateful=False, payload={'ticket': 'tkt-1'}) as server,
             patch('httpx.AsyncClient', factory),
         ):
-            wf.mcp.url = server.url
+            wf = _make_workflow(mcp_url=server.url)
             await self._route(wf, self._suggestions())
 
         factory.assert_follows_redirects()
