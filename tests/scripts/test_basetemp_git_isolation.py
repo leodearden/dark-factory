@@ -25,11 +25,11 @@ here is shaped identically to 3182's and the two read as one defence.
 from __future__ import annotations
 
 import ast
+import json
 import os
 import subprocess
 import sys
 import tomllib
-from collections.abc import Iterable
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -448,29 +448,32 @@ _REQUIRED_ARMED_FIXTURES: dict[str, str] = {
 
 
 def _conftest_sample(
-    bindings: Iterable[str] = tuple(_REQUIRED_ARMED_FIXTURES),
     *,
-    binding_suffix: str = '',
     bootstrap: str = (
-        'if str(REPO_ROOT) not in sys.path:\n'
-        '    sys.path.append(str(REPO_ROOT))   # APPEND — never insert(0, ...)\n'
+        'if str(REPO_ROOT := Path(__file__).resolve().parents[2]) not in sys.path:\n'
+        '    sys.path.append(str(REPO_ROOT))  # APPEND — never insert(0, ...)\n'
     ),
-    configure_body: str = '    reject_unsafe_basetemp(config)\n',
+    configure_body: str = (
+        '    reject_unsafe_basetemp(config)\n'
+        '    arm_test_root_isolation(config)\n'
+    ),
 ) -> str:
-    """A test-root conftest binding *bindings*: the printed remediation and the self-tests' input."""
-    imported = ''.join(f'    {name},{binding_suffix}\n' for name in sorted(bindings))
+    """A test-root conftest: the printed remediation and the self-tests' input."""
     return (
         'import sys\n'
         'from pathlib import Path\n'
-        'REPO_ROOT = Path(__file__).resolve().parents[2]\n'
+        '\n'
         f'{bootstrap}'
-        f'from df_pytest_isolation import (\n{imported}    reject_unsafe_basetemp,\n)\n'
+        '\n'
+        'from df_pytest_isolation import arm_test_root_isolation, reject_unsafe_basetemp\n'
+        '\n'
+        '\n'
         'def pytest_configure(config):\n'
         f'{configure_body}'
     )
 
 
-_WIRING_SNIPPET = _conftest_sample(binding_suffix='  # noqa: F401')
+_WIRING_SNIPPET = _conftest_sample()
 
 
 def _test_root_conftests() -> list[Path]:
@@ -663,23 +666,50 @@ class TestEveryTestRootConftestIsWired:
 
         assert defects == [], f'{defects}\n{_WIRING_SNIPPET}'
 
-    @pytest.mark.parametrize('missing', sorted(_REQUIRED_ARMED_FIXTURES))
-    def test_the_detector_flags_a_conftest_missing_only_one_required_binding(
-        self, missing: str,
+    def test_the_wiring_snippet_needs_no_suppression(self, tmp_path: Path) -> None:
+        """Self-test: the printed wiring, copied verbatim, is clean under the repo's ruff rules.
+
+        Task 6966 copied the old printed wiring and then had to add suppressions
+        to get it past lint. ``--ignore-noqa`` means a suppression in the snippet
+        cannot hide a finding either.
+        """
+        conftest = tmp_path / 'conftest.py'
+        conftest.write_text(_WIRING_SNIPPET, encoding='utf-8')
+
+        proc = subprocess.run(
+            [
+                sys.executable, '-m', 'ruff', 'check', '--no-cache', '--ignore-noqa',
+                '--output-format', 'json', '--config', str(REPO_ROOT / 'pyproject.toml'),
+                str(conftest),
+            ],
+            capture_output=True, text=True, cwd=REPO_ROOT,
+        )
+
+        assert proc.returncode in (0, 1), (
+            f'`ruff check` exited {proc.returncode}; a missing ruff or a bad '
+            f'invocation must fail this guard, not skip it. stderr: {proc.stderr.strip()!r}'
+        )
+        findings = [f'{f["code"]}: {f["message"]}' for f in json.loads(proc.stdout)]
+        assert findings == [], f'{findings}\n{_WIRING_SNIPPET}'
+
+    def test_the_detector_flags_a_pytest_configure_that_does_not_arm_the_test_root_isolation(
+        self,
     ) -> None:
-        """Self-test: each required-binding rule is not vacuous on its own.
+        """Self-test: the arm-call rule fires on its own and says what the suite loses.
 
         A conftest correctly wired for everything else must still be flagged
-        for the one binding it lacks — otherwise that rule would only ever
+        when it never arms the bundle — otherwise that rule would only ever
         fire alongside another defect and could be deleted without any test
         noticing (task 3797).
         """
-        sample = _conftest_sample(b for b in _REQUIRED_ARMED_FIXTURES if b != missing)
+        sample = _conftest_sample(configure_body='    reject_unsafe_basetemp(config)\n')
 
         defects = _wiring_defects(sample, REPO_ROOT / 'orchestrator' / 'tests' / 'conftest.py')
 
-        assert len(defects) == 1, f'only the {missing} rule should fire: {defects}'
-        assert missing in defects[0], defects
+        assert len(defects) == 1, f'only the arm rule should fire: {defects}'
+        assert 'arm_test_root_isolation' in defects[0], defects
+        missing = [c for c in _REQUIRED_ARMED_FIXTURES.values() if c not in defects[0]]
+        assert not missing, f'the defect omits consequence clause(s) {missing}: {defects[0]}'
 
     def test_the_detector_flags_an_insert_of_the_repo_root(self) -> None:
         """Self-test: the namespace-package hazard is pinned STRUCTURALLY.
@@ -687,7 +717,9 @@ class TestEveryTestRootConftestIsWired:
         insert(0, ...) is invisible in review and only bites much later, far
         from this change, as confusing import breakage.
         """
-        sample = _conftest_sample(bootstrap='sys.path.insert(0, str(REPO_ROOT))\n')
+        sample = _conftest_sample(
+            bootstrap='sys.path.insert(0, str(REPO_ROOT := Path(__file__).resolve().parents[2]))\n',
+        )
 
         defects = _wiring_defects(sample, REPO_ROOT / 'orchestrator' / 'tests' / 'conftest.py')
 
