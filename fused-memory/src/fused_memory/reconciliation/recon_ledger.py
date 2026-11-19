@@ -126,6 +126,12 @@ MARKER_KINDS = ('stage1_flag_marker', 'stage2_persistence_marker', 'flag_for_sta
 # `from ...mem0_tombstone import RECORD_KIND_MEM0_TOMBSTONE` still resolves.
 RECORD_KIND_MEM0_TOMBSTONE = 'mem0_tombstone'
 
+# The project_id of a row that belongs to no project. It is outside
+# utils/validation.py::validate_project_id's grammar, so no real project can
+# collide with it; every query and gc() filters on project_id, so no project's
+# reads or gc see it.
+SERVICE_SCOPE_PROJECT_ID = '(service)'
+
 # Single-sourced INSERT ... ON CONFLICT used by BOTH upsert() and
 # upsert_many(). Hoisted to module scope so the two write paths cannot drift
 # apart in their conflict semantics — a batched write that resolved conflicts
