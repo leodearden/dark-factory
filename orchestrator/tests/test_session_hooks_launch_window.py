@@ -99,7 +99,7 @@ def test_refresh_path_writes_normally_to_a_bound_launching_record(
     tmp_path: Path,
 ) -> None:
     # The window is LAUNCHING *and unbound*. A LAUNCHING record that already
-    # carries a binding HAS a discriminator, so _env_slug_is_owned has proved
+    # carries a binding HAS a discriminator, so _env_slug_ownership has proved
     # this event belongs to the owner -- withholding there would strand a
     # legitimately-owned record at `launching`.
     slug = 'session-cockpit-3215104'

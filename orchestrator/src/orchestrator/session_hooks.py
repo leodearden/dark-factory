@@ -280,23 +280,6 @@ def _env_slug_ownership(
     return owner_pid == current_pid, True, snapshot
 
 
-def _env_slug_is_owned(
-    slug: str,
-    hook_input: Mapping[str, Any],
-    root: Path | str | None,
-    *,
-    allow_remint: bool = False,
-    probes: EventProbes,
-) -> bool:
-    """Adopt-or-fork half of ``_env_slug_ownership`` -- see its docstring.
-
-    Kept as the narrow, boolean question for callers that only need the
-    identity decision; the binding decision travels separately, through
-    ``_resolve_hook_slug``.
-    """
-    return _env_slug_ownership(slug, hook_input, root, allow_remint=allow_remint, probes=probes)[0]
-
-
 @dataclass(frozen=True)
 class _HookSlugResolution:
     """One hook event's resolved registry identity -- see ``_resolve_hook_slug``.
