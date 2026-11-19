@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 
 import shared
+from shared.defects import SideOutcome
 
 pytestmark = pytest.mark.timeout(300)
 
@@ -183,3 +184,178 @@ class TestPluginDirectory:
     def test_holds_only_the_plugin_module(self):
         entries = {entry.name for entry in _PLUGIN_DIR.iterdir()} - {'__pycache__'}
         assert entries == {'_df_defect_plugin.py'}
+
+
+_PROJECT_B_TESTS = """\
+import json
+
+import pytest
+
+
+@pytest.fixture
+def attribute_error():
+    json.definitely_absent_attr
+
+
+@pytest.fixture
+def nameless_import_error():
+    raise ImportError('cannot import', name='m')
+
+
+@pytest.fixture
+def runtime_error():
+    raise RuntimeError('boom')
+
+
+def test_pass():
+    pass
+
+
+def test_assert():
+    assert False
+
+
+def test_skip():
+    pytest.skip('not here')
+
+
+@pytest.mark.xfail
+def test_xfail():
+    assert False
+
+
+def test_attribute_fixture(attribute_error):
+    pass
+
+
+def test_nameless_import_fixture(nameless_import_error):
+    pass
+
+
+def test_runtime_fixture(runtime_error):
+    pass
+
+
+def test_call_phase_import():
+    from json import definitely_absent_fn  # noqa: F401
+"""
+
+
+def _record(side_outcome, exc_type=None, module=None, symbol=None, owner_type=None):
+    return {
+        'side_outcome': side_outcome,
+        'exc_type': exc_type,
+        'module': module,
+        'symbol': symbol,
+        'owner_type': owner_type,
+    }
+
+
+_EXPECTED_OUTCOMES_B = {
+    'tests/test_b.py::test_pass': _record('passed'),
+    'tests/test_b.py::test_assert': _record('failed', 'builtins.AssertionError'),
+    'tests/test_b.py::test_skip': _record('skipped'),
+    'tests/test_b.py::test_xfail': _record('skipped'),
+    'tests/test_b.py::test_attribute_fixture': _record(
+        'error_attributed',
+        'builtins.AttributeError',
+        module='json',
+        symbol='definitely_absent_attr',
+        owner_type='builtins.module',
+    ),
+    'tests/test_b.py::test_nameless_import_fixture': _record(
+        'error_unattributed', 'builtins.ImportError', module='m'
+    ),
+    'tests/test_b.py::test_runtime_fixture': _record('error_unattributed', 'builtins.RuntimeError'),
+    'tests/test_b.py::test_call_phase_import': _record(
+        'failed', 'builtins.ImportError', module='json', symbol='definitely_absent_fn'
+    ),
+}
+
+_EXPECTED_OUTCOMES_C = {
+    'tests/test_new_symbol.py': _record(
+        'error_attributed', 'builtins.ImportError', module='json', symbol='definitely_absent_fn'
+    ),
+    'tests/test_new_module.py': _record(
+        'error_attributed',
+        'builtins.ModuleNotFoundError',
+        module='definitely_absent_module_7045',
+    ),
+    'tests/test_ok.py::test_ok': _record('passed'),
+}
+
+
+@pytest.fixture(scope='module')
+def outcome_runs(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> dict[tuple[str, str], tuple[subprocess.CompletedProcess[str], Path]]:
+    projects = {
+        'B': (
+            _write_project(
+                tmp_path_factory.mktemp('project_b'),
+                {'pytest.ini': '[pytest]\n', 'tests/test_b.py': _PROJECT_B_TESTS},
+            ),
+            (),
+        ),
+        'C': (
+            _write_project(
+                tmp_path_factory.mktemp('project_c'),
+                {
+                    'pytest.ini': '[pytest]\n',
+                    'tests/test_new_symbol.py': 'from json import definitely_absent_fn  # noqa: F401\n',
+                    'tests/test_new_module.py': 'import definitely_absent_module_7045  # noqa: F401\n',
+                    'tests/test_ok.py': 'def test_ok():\n    pass\n',
+                },
+            ),
+            ('--continue-on-collection-errors',),
+        ),
+    }
+    runs = {}
+    for name, (project, extra) in projects.items():
+        for label, xdist in (('serial', ()), ('xdist', ('-n', '2'))):
+            out = tmp_path_factory.mktemp(f'outcomes_{name}_{label}')
+            result = _run_pytest(project, f'--df-defect-outcomes={out}/o.json', *extra, *xdist)
+            runs[(name, label)] = (result, out / 'o.json')
+    return runs
+
+
+def _read_outcomes(path: Path) -> dict[str, dict]:
+    return json.loads(path.read_text(encoding='utf-8'))
+
+
+class TestOutcomeRecorder:
+    @pytest.mark.parametrize('label', ['serial', 'xdist'])
+    def test_test_phase_outcomes(self, outcome_runs, label):
+        result, path = outcome_runs[('B', label)]
+        assert path.is_file(), result.stdout + result.stderr
+        assert _read_outcomes(path) == _EXPECTED_OUTCOMES_B
+
+    @pytest.mark.parametrize('label', ['serial', 'xdist'])
+    def test_collection_errors_record_the_structural_cause(self, outcome_runs, label):
+        result, path = outcome_runs[('C', label)]
+        assert path.is_file(), result.stdout + result.stderr
+        assert _read_outcomes(path) == _EXPECTED_OUTCOMES_C
+
+    @pytest.mark.parametrize('name', ['B', 'C'])
+    def test_serial_and_xdist_files_agree(self, outcome_runs, name):
+        serial = _read_outcomes(outcome_runs[(name, 'serial')][1])
+        xdist = _read_outcomes(outcome_runs[(name, 'xdist')][1])
+        assert serial == xdist
+
+    def test_no_option_writes_no_outcome_file(self, tmp_path):
+        project = _write_project(
+            tmp_path / 'project',
+            {'pytest.ini': '[pytest]\n', 'tests/test_u.py': 'def test_u():\n    pass\n'},
+        )
+        result = _run_pytest(project, f'--junitxml={tmp_path}/out/r.xml')
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert sorted(p.name for p in (tmp_path / 'out').iterdir()) == ['r.xml', 'r.xml.tests.json']
+
+    def test_records_span_the_side_outcome_vocabulary(self, outcome_runs):
+        recorded = {
+            record['side_outcome']
+            for _, path in outcome_runs.values()
+            for record in _read_outcomes(path).values()
+        }
+        assert recorded <= {outcome.value for outcome in SideOutcome}
+        assert recorded == {outcome.value for outcome in SideOutcome} - {SideOutcome.NOT_COLLECTED.value}
