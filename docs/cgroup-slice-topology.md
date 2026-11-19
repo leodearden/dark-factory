@@ -26,7 +26,8 @@ user@UID.service/
 ├── app.slice/                              desktop apps, interactive terminals
 └── df.slice/
     └── df-<project_id>.slice/
-        ├── orchestrator-<project>.service  the daemon and its ungoverned agents
+        ├── orchestrator-<project>.service/
+        │   └── daemon/                     uv, the daemon and its ungoverned agents
         └── df-verify-<tag>-<uuid>.scope    one per verify leg or segment
 ```
 
@@ -34,7 +35,17 @@ user@UID.service/
   `scripts/orchestrator-<project>.service`.
   `tests/scripts/test_orchestrator_service_files.py::test_project_unit_runs_under_its_project_slice`
   pins each value to the name rule through the unit's `--config` root.
-- Ungoverned agents are children of the daemon. They inherit its service
+- The committed unit also carries `Delegate=memory` and
+  `DelegateSubgroup=daemon`. systemd then starts the unit's whole process tree
+  in `daemon/`, and runs its start and stop hooks in a `.control` child. Only
+  the memory controller is delegated. The cpu controller never is (Leo,
+  2026-11-16, `plans/per-consumer-resource-recording-prd.md` D9), so CPU
+  sharing is unchanged.
+- The three lines appear together or not at all, pinned by
+  `tests/scripts/test_orchestrator_service_files.py::test_unit_carries_slice_and_memory_delegation_together_or_not_at_all`.
+  The subgroup name's code home is
+  `shared/src/shared/cgroup_slice.py::DAEMON_SUBGROUP`.
+- Ungoverned agents are children of the daemon. They inherit its `daemon/`
   cgroup, and nothing places them separately.
 - Verify scopes are placed by `systemd-run --user --scope --slice=<slice>`
   (`orchestrator/src/orchestrator/verify.py::_scope_launch_argv`), alongside
@@ -44,7 +55,8 @@ user@UID.service/
 
 Walk the `0::` path in `/proc/self/cgroup` leaf-upward to the segment EQUAL to
 `project_slice_name(project_id)`. Equivalently, that is the `df-*.slice`
-segment directly under `df.slice`.
+segment directly under `df.slice`. The same walk takes a daemon in its
+`daemon/` leaf up through its service to the slice.
 
 It is NOT the nearest `df-*.slice` ancestor. Every governed sub-slice
 (§Governed sub-slices) also matches `df-*.slice` and sits nearer the leaf, so
@@ -76,12 +88,14 @@ only when both of these hold:
 - (i) `Harness.run` got `apply_project_slice_weight=True`. Only
   `orchestrator/src/orchestrator/cli.py::run`, every unit's ExecStart, passes
   it. This opt-in is what keeps tests off the production slice: agents are
-  children of the daemon and share its service leaf, and so does every pytest
+  children of the daemon and share its leaf cgroup, and so does every pytest
   they run, `Harness.run` tests included.
 - (ii) The daemon's own leaf cgroup is a `.service` directly under its project
-  slice. This is a ROLLOUT check (was the unit reinstalled with `Slice=`?), not
-  an identity check. When it fails, the step logs one WARNING and changes
-  nothing.
+  slice, or that service's `daemon` subgroup (from the first start after the
+  reinstall). This is a ROLLOUT check (was the unit reinstalled with
+  `Slice=`?), not an identity check. Any other child of the service, deeper
+  nesting, or a `daemon` cgroup under anything but such a service fails it.
+  When it fails, the step logs one WARNING and changes nothing.
 
 About the property itself:
 
@@ -114,8 +128,9 @@ slice's weight, so it keeps systemd's default.
 
 The committed units take effect only when an operator reinstalls them with
 `scripts/setup-host.sh` and restarts each orchestrator (dark_factory task
-9985). Verify scopes move as soon as the code lands, because their placement is
-code. Until the reinstall, a project's verify scopes sit under its slice while
+9985). The `Delegate=memory` and `DelegateSubgroup=daemon` lines ride the same
+reinstall as `Slice=`. Verify scopes move as soon as the code lands, because
+their placement is code. Until the reinstall, a project's verify scopes sit under its slice while
 its daemon is still in `app.slice`. In that window step `1c1i` logs its
 WARNING, naming the daemon's actual cgroup, and the unit parity checker
 reports the installed copies as drift.
