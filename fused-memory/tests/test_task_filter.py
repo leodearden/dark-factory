@@ -11,10 +11,12 @@ from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.reconciliation.task_filter import (
     _STATUS_PRIORITY,
+    ACTIVE_TASK_TREE_HEADER,
     MAX_ACTIVE_TASKS_RENDERED,
     MAX_CANCELLED_TASKS_RETAINED,
     MAX_DONE_TASKS_RETAINED,
     FilteredTaskTree,
+    TaskTreeUnavailableReason,
     _render_task_line,
     cross_verify_task_counts,
     detect_census_inconsistency,
@@ -28,6 +30,7 @@ from fused_memory.reconciliation.task_filter import (
     select_done_since_boundary,
     select_visible_active,
     summarize_statuses,
+    tree_unavailable_notice,
 )
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
@@ -1300,6 +1303,71 @@ class TestRenderActiveSection:
             f'({len(candidate_active)} candidate active + {len(tree.cancelled_tasks)} cancelled). '
             f'Each candidate task must be rendered at most once per render_active_section call.'
         )
+
+
+class TestUnavailableTaskTree:
+    """A tree whose fetch failed renders as 'unavailable', never as a project with zero tasks."""
+
+    def test_reasons_are_the_closed_set_of_fetch_failure_branches(self):
+        assert {r.value for r in TaskTreeUnavailableReason} == {
+            'taskmaster_disabled',
+            'empty_project_root',
+            'non_absolute_project_root',
+            'fetch_error',
+        }
+
+    def test_a_fetched_tree_is_not_unavailable(self):
+        assert FilteredTaskTree().unavailable_reason is None
+        fetched_empty = filter_task_tree({'tasks': []})
+        assert fetched_empty.unavailable_reason is None
+        assert tree_unavailable_notice(fetched_empty) is None
+
+    @pytest.mark.parametrize('reason', list(TaskTreeUnavailableReason))
+    def test_an_unavailable_tree_renders_the_notice_instead_of_counts(self, reason):
+        tree = FilteredTaskTree(unavailable_reason=reason)
+        notice = f'Task tree unavailable: {reason.value}'
+
+        visible, active_section = render_active_section(tree)
+        formatted = format_filtered_task_tree(tree)
+
+        assert (visible, active_section) == ([], f'{ACTIVE_TASK_TREE_HEADER}\n{notice}\n')
+        assert formatted == active_section
+        for rendered in (active_section, formatted):
+            assert 'active shown' not in rendered
+            assert 'total' not in rendered
+        assert tree_unavailable_notice(tree) == notice
+        assert render_retained_done_tasks(tree) == notice
+
+    def test_a_fetched_empty_tree_still_renders_zero_counts(self):
+        fetched_empty = filter_task_tree({'tasks': []})
+
+        assert format_filtered_task_tree(fetched_empty) == (
+            '### Active Task Tree\n'
+            '(0 active shown, 0 done, 0 cancelled, 0 other, 0 total, highest task id: 0)\n'
+            'No active tasks.\n'
+            '0 done, 0 cancelled — omitted'
+        )
+        assert render_retained_done_tasks(fetched_empty) == 'No tasks.'
+
+    @pytest.mark.parametrize(
+        'override',
+        [
+            {'total_count': 3},
+            {'done_count': 1},
+            {'max_task_id': 7},
+            {'active_tasks': [{'id': 1, 'status': 'pending'}]},
+        ],
+    )
+    def test_an_unavailable_tree_cannot_carry_tasks_or_counts(self, override):
+        (field_name,) = override
+
+        with pytest.raises(ValueError) as excinfo:
+            FilteredTaskTree(unavailable_reason=TaskTreeUnavailableReason.fetch_error, **override)
+
+        message = str(excinfo.value)
+        assert 'unavailable_reason' in message
+        assert 'fetch_error' in message
+        assert field_name in message
 
 
 class TestFilterTaskTreeDoneAndCancelledLists:
