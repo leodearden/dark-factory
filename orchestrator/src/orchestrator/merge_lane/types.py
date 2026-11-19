@@ -1570,7 +1570,7 @@ class ChainResult:
 
         Off by one from the ``chain_items`` telemetry field on purpose: the
         dispatching item is chain item #1 and is not a link, so γ emits
-        ``1 + depth`` (merge_queue.py, ``VerifyDispatcher.run_inflight_verify``'s chain arm).
+        ``1 + depth`` (merge_lane/inflight_verify.py::InflightVerifyRun._resolve_target's chain arm).
         A 2-link chain is ``depth == 2`` and ``chain_items == 3``.
         """
         return len(self.links)

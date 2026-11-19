@@ -168,6 +168,6 @@ class LaneVerifyContext:
     halt_hook: Callable[[str], None]
     """The synchronous all-lane halt a concluded cross-check divergence fires,
     so the queue stops before any further adoption (task 2886)."""
-    dry_run_handles: DryRunInvestigationHandles
+    dry_run_handles: Callable[[], DryRunInvestigationHandles]
     main_health_probe: Callable[[], MainHealthProbeHandles]
 

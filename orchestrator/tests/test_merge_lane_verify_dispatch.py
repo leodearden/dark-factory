@@ -261,7 +261,9 @@ class _Scene:
                 escalation_queue=lambda: self.escalations,
                 quarantine_divergent=lambda name: ports.record('quarantine_divergent', name),
                 halt_hook=self.halts.append,
-                dry_run_handles=DryRunInvestigationHandles(scheduler=None, background_tasks=background),
+                dry_run_handles=lambda: DryRunInvestigationHandles(
+                    scheduler=None, background_tasks=background,
+                ),
                 main_health_probe=lambda: MainHealthProbeHandles(
                     background_tasks=background, auto_heal=None,
                 ),
@@ -697,7 +699,7 @@ _HOMES = {
     'orchestrator.merge_lane.verify_dispatch': ('VerifyDispatcher', 'GATE_HISTORY_LEG_FACTS'),
     'orchestrator.merge_lane.inflight_verify': (
         'InflightVerifyRun', 'InflightVerifyCall', 'InflightVerifyCounters',
-        'resolve_dispatch_time_merge_base', 'slot_cancel',
+        'resolve_dispatch_time_merge_base',
     ),
     'orchestrator.merge_lane.dispatch_ports': (
         'DispatchCustody', 'DispatchSpeculation', 'DispatchWorktrees', 'LeaseContention',

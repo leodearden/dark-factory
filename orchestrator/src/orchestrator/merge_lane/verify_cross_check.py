@@ -248,21 +248,27 @@ def _escalate_divergence(
     if queue is None or queue.has_open_l1(_CROSS_CHECK_SENTINEL):
         return
     render = _local_hiccup_escalation if local_infra_fail else _genuine_divergence_escalation
-    severity, level, summary, detail, action = render(check.merge_sha, check.remote.name, local_verify)
+    text = render(check.merge_sha, check.remote.name, local_verify)
     queue.submit(Escalation(
         id=queue.make_id(_CROSS_CHECK_SENTINEL),
         task_id=_CROSS_CHECK_SENTINEL,
         agent_role='orchestrator-cross-check',
-        severity=severity,
-        level=level,
+        severity=text.severity,
+        level=text.level,
         category='verify_cross_check_mismatch',
-        summary=summary,
-        detail=detail,
-        suggested_action=action,
+        summary=text.summary,
+        detail=text.detail,
+        suggested_action=text.suggested_action,
     ))
 
 
-_EscalationText = tuple[str, int, str, str, str]
+@dataclasses.dataclass(frozen=True)
+class _EscalationText:
+    severity: str
+    level: int
+    summary: str
+    detail: str
+    suggested_action: str
 
 
 def _local_hiccup_escalation(
@@ -295,7 +301,7 @@ def _local_hiccup_escalation(
         "remote quarantine once the host's env is re-proved; no "
         'queue un-halt is needed (the queue was not halted).'
     )
-    return 'blocking', 1, summary, detail, action
+    return _EscalationText('blocking', 1, summary, detail, action)
 
 
 def _genuine_divergence_escalation(
@@ -326,4 +332,4 @@ def _genuine_divergence_escalation(
         'restored, then un-halt the merge queue.  Investigate why the '
         'remote green disagreed with the local trust-anchor.'
     )
-    return 'critical', 2, summary, detail, action
+    return _EscalationText('critical', 2, summary, detail, action)

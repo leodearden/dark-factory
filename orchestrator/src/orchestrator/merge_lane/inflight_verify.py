@@ -111,7 +111,7 @@ async def resolve_dispatch_time_merge_base(
         return None
 
 
-def slot_cancel(
+def _slot_cancel(
     cause: VerifyCancelCause, entry_slot: InflightEntrySlot | None, lease: HostLease | None,
 ) -> VerifyCancel:
     """The cancel of the verify *entry_slot* wraps, running on *lease*."""
@@ -216,11 +216,19 @@ class _Verdict:
     out: MergeOutcome | None
 
 
-_REQUEUED = InflightStatus.REQUEUED
+@dataclass(frozen=True)
+class _VerifyTarget:
+    """What an in-flight verify verifies and where, as resolved at construction."""
+
+    merge_wt: Path
+    merge_commit: str
+    chain_items: int
+    chain_build_ms: int | None
+    is_warm_path: bool
 
 
 def _requeued() -> InflightVerifyResult:
-    return InflightVerifyResult(outcome=None, merge_wt=None, status=_REQUEUED)
+    return InflightVerifyResult(outcome=None, merge_wt=None, status=InflightStatus.REQUEUED)
 
 
 class InflightVerifyRun:
@@ -235,8 +243,12 @@ class InflightVerifyRun:
         self._chain = call.chain
         self._slot = call.entry_slot
         self._dispatch_facts = with_chain_members(call.dispatch_facts, self._req, call.chain)
-        self._chain_build_ms: int | None = None
-        self._resolve_target()
+        target = self._resolve_target()
+        self._merge_wt: Path = target.merge_wt
+        self._merge_commit: str = target.merge_commit
+        self._chain_items = target.chain_items
+        self._chain_build_ms: int | None = target.chain_build_ms
+        self._is_warm_path = target.is_warm_path
         self._warm_capture: list[VerifyResult] = []
         self._attempt0_shadow: dict[str, str] = {}
         self._spec_warm = False
@@ -246,7 +258,7 @@ class InflightVerifyRun:
         self._chain_item_wt_dropped = False
         self._chain_adopting = False
 
-    def _resolve_target(self) -> None:
+    def _resolve_target(self) -> _VerifyTarget:
         """Choose WHAT is verified and WHERE, once, so no later phase consults
         ``chain`` again. On the chain arm both, and the item count and build
         cost, are read off the ChainResult that actually ran: computed, never
@@ -258,19 +270,23 @@ class InflightVerifyRun:
                 '"Lane ownership") — a None lane here means _deep_chain_placement '
                 'returned an empty result it should have declined'
             )
-            self._merge_wt: Path = chain.lane
-            self._merge_commit: str = chain.tip.strip()
-            self._chain_items = 1 + len(chain.links)
-            self._chain_build_ms = chain.build_ms
-            self._is_warm_path = chain.lane_warm
-            return
+            return _VerifyTarget(
+                merge_wt=chain.lane,
+                merge_commit=chain.tip.strip(),
+                chain_items=1 + len(chain.links),
+                chain_build_ms=chain.build_ms,
+                is_warm_path=chain.lane_warm,
+            )
         assert self._item.merge_wt is not None
         merge_commit = self._item.merge_result.merge_commit
         assert merge_commit is not None
-        self._merge_wt = self._item.merge_wt
-        self._merge_commit = merge_commit.strip()
-        self._chain_items = self._call.chain_items
-        self._is_warm_path = False
+        return _VerifyTarget(
+            merge_wt=self._item.merge_wt,
+            merge_commit=merge_commit.strip(),
+            chain_items=self._call.chain_items,
+            chain_build_ms=None,
+            is_warm_path=False,
+        )
 
     async def run(self) -> InflightVerifyResult:
         try:
@@ -453,7 +469,7 @@ class InflightVerifyRun:
         assert self._verify_task is not None
         await self._lane.custody.teardown_verify_task(
             self._lease, self._verify_task, self._req.task_id,
-            cancel=slot_cancel(cause, self._slot, self._lease),
+            cancel=_slot_cancel(cause, self._slot, self._lease),
         )
         await self._dispose_verify_worktree()
 

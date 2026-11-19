@@ -184,7 +184,7 @@ __all__ = [
 ]
 
 # Sentinel category constants — encode an unscoped-gate failure inside a
-# VerifyResult so _run_post_merge_verify can branch byte-identically.
+# VerifyResult so merge_lane/post_merge_verify.py::run_post_merge_verify can branch byte-identically.
 UNSCOPED_TYPECHECK_FAILED_CATEGORY = 'unscoped_typecheck_failed'
 UNSCOPED_TYPECHECK_TIMEOUT_CATEGORY = 'unscoped_typecheck_timeout'
 

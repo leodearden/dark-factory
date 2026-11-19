@@ -312,7 +312,7 @@ class VerifyDispatcher:
             quarantine_divergent=context.quarantine_divergent,
             escalation_queue=context.escalation_queue(),
             halt_hook=context.halt_hook,
-            dry_run_handles=context.dry_run_handles,
+            dry_run_handles=context.dry_run_handles(),
             main_health_probe_handles=context.main_health_probe(),
             verifier=self._verifier,
             **per_call,

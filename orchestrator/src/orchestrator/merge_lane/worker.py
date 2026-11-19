@@ -6043,9 +6043,9 @@ class SpeculativeMergeWorker:
                 ),
                 event_store=lambda: self._event_store,
                 escalation_queue=lambda: self._escalation_queue,
-                quarantine_divergent=self._host_quarantine.quarantine_divergent,
+                quarantine_divergent=lambda name: self._host_quarantine.quarantine_divergent(name),
                 halt_hook=lambda reason: self.operator_halt(reason),
-                dry_run_handles=self._dry_run_handles,
+                dry_run_handles=lambda: self._dry_run_handles,
                 main_health_probe=lambda: MainHealthProbeHandles(
                     background_tasks=self._background_tasks,
                     auto_heal=self._auto_heal_main_health_deferred,
@@ -6077,7 +6077,7 @@ class SpeculativeMergeWorker:
                 ),
             ),
             speculation=DispatchSpeculation(
-                mark_next_dispatch_unchained=self._next_dispatch_unchained.update,
+                mark_next_dispatch_unchained=lambda ids: self._next_dispatch_unchained.update(ids),
                 end_chain_reservation=lambda rid: self._end_chain_reservation(
                     rid, all_landed=False,
                 ),
