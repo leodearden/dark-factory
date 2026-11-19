@@ -96,7 +96,8 @@ About the property itself:
 - **(a) Two layers of weight.** Task 5205's per-role scope weights (merge 100,
   task 33, background 10) now split ONE project's slice among its verify scopes
   and its daemon. The slice weights set the split between projects.
-  Re-deriving both layers is dark_factory task 9984.
+  Re-deriving both layers is dark_factory task 9984. The measured share of a
+  merge scope under load, per level: `plans/7112-verify-scope-weight-share/REPORT.md`.
 - **(b) Policy: factory work against the desktop.** `df.slice` is a sibling of
   `app.slice` under `user@UID.service`. Under contention, all factory work
   together therefore shares one weight against the desktop and interactive
