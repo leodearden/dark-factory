@@ -8,7 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, ClassVar, Final
@@ -58,6 +58,8 @@ __all__ = [
 HELD_PRIORITIES: Final = frozenset({'low', 'polish'})
 PROTECTED_STATUSES: Final = frozenset({TaskStatus.DONE, TaskStatus.CANCELLED, TaskStatus.DEFERRED})
 HOLDER_GATE_KEYS: Final = frozenset({FOLLOWUP_HOLDER_METADATA_KEY, 'deferred_watch', 'trigger_met'})
+
+_WAITING_STATUSES: Final = frozenset(ACTIVE - {TaskStatus.DEFERRED})
 
 _FOLLOWUP_SOURCE: Final = 'agent-followup'
 _REVIEW_SUGGESTIONS_CONTEXT: Final = 'review_suggestions'
@@ -348,8 +350,10 @@ async def backfill(
 
     Each task's edge and record land in one backend write under the interceptor's write lock, with
     no journal row and no ``task_modified`` event. A task that already carries a ``followup_hold``
-    record was promoted or released and is never re-held. One ``followup_hold_backfilled`` event is
-    emitted per call, its count possibly 0, so a reader can tell the backfill ran.
+    record was promoted or released and is never re-held. A pending follow-up that an active,
+    non-deferred task outside the stock waits on, directly or through other stock tasks, is left
+    unheld, because nothing would promote it. One ``followup_hold_backfilled`` event is emitted per
+    call, its count possibly 0, so a reader can tell the backfill ran.
     """
     async with write_lock:
         held = await _hold_stock(tm, project_root, holders)
@@ -361,12 +365,9 @@ async def backfill(
 
 
 async def _hold_stock(tm: TaskBackendProtocol, project_root: str, holders: FollowupHolders) -> int:
-    pending = await tm.get_tasks(project_root, statuses=[TaskStatus.PENDING], fields=_BACKFILL_FIELDS)
-    stock = [
-        task for task in pending['tasks']
-        if hold_scope(task.get('metadata'), task.get('priority'))
-        and FOLLOWUP_HOLD_METADATA_KEY not in raw_metadata_dict(task.get('metadata'), source=_METADATA_SOURCE)
-    ]
+    candidates = await _unheld_stock(tm, project_root)
+    waited_on = await _waited_on(tm, project_root, frozenset(int(task['id']) for task in candidates))
+    stock = [task for task in candidates if int(task['id']) not in waited_on]
     if not stock:
         return 0
     holder_id = await holders.ensure_holder(tm, project_root)
@@ -383,3 +384,59 @@ async def _hold_stock(tm: TaskBackendProtocol, project_root: str, holders: Follo
         )
         held += 1
     return held
+
+
+async def _unheld_stock(tm: TaskBackendProtocol, project_root: str) -> list[dict[str, Any]]:
+    """The pending tasks the hold rule matches that were never held."""
+    pending = await tm.get_tasks(project_root, statuses=[TaskStatus.PENDING], fields=_BACKFILL_FIELDS)
+    return [
+        task for task in pending['tasks']
+        if hold_scope(task.get('metadata'), task.get('priority'))
+        and FOLLOWUP_HOLD_METADATA_KEY not in raw_metadata_dict(task.get('metadata'), source=_METADATA_SOURCE)
+    ]
+
+
+async def _waited_on(
+    tm: TaskBackendProtocol, project_root: str, candidate_ids: frozenset[int],
+) -> frozenset[int]:
+    """The candidates a task waiting now depends on, directly or through other candidates."""
+    if not candidate_ids:
+        return frozenset()
+    edges = await tm.get_dependency_edges(project_root)
+    seeds = await _cited_by_waiting_dependents(tm, project_root, candidate_ids, edges)
+    return _dependency_closure(seeds, edges, within=candidate_ids)
+
+
+async def _cited_by_waiting_dependents(
+    tm: TaskBackendProtocol,
+    project_root: str,
+    candidate_ids: frozenset[int],
+    edges: Mapping[int, Sequence[int]],
+) -> frozenset[int]:
+    cited_by = {
+        dependent: candidate_ids.intersection(dependencies)
+        for dependent, dependencies in edges.items()
+        if dependent not in candidate_ids and not candidate_ids.isdisjoint(dependencies)
+    }
+    if not cited_by:
+        return frozenset()
+    statuses = await tm.get_statuses(project_root, ids=[str(dependent) for dependent in cited_by])
+    return frozenset(
+        candidate
+        for dependent, cited in cited_by.items() if statuses.get(str(dependent)) in _WAITING_STATUSES
+        for candidate in cited
+    )
+
+
+def _dependency_closure(
+    seeds: Iterable[int], edges: Mapping[int, Sequence[int]], within: frozenset[int],
+) -> frozenset[int]:
+    """The seeds and everything they depend on, directly or transitively, without leaving ``within``."""
+    reached: set[int] = set()
+    frontier = [seed for seed in seeds if seed in within]
+    while frontier:
+        task_id = frontier.pop()
+        if task_id not in reached:
+            reached.add(task_id)
+            frontier.extend(dependency for dependency in edges.get(task_id, ()) if dependency in within)
+    return frozenset(reached)
