@@ -1397,7 +1397,7 @@ class TestVerifierDispatchFillRegistersDispatching:
         """An item already sitting in ``_verifier_queue`` when the loop is
         entered is fetched by DISPATCH-FILL's ``get_nowait()`` branch (the
         FIRST ``VerifyDispatcher.dispatch`` call site). With zero free hosts forced,
-        ``VerifyDispatcher.dispatch`` returns None and the item bounces onto
+        ``VerifyDispatcher.dispatch`` returns ``NoHost`` and the item bounces onto
         the redispatch park — this must transition
         AWAITING_VERIFY -> DISPATCHING -> REDISPATCH_PARKED, not just set
         the legacy ``_dispatching_item`` field.
@@ -3339,7 +3339,7 @@ class TestRunInflightVerifyRequeuesOnlyThroughVacate:
             '        self._requeue_request(item.request)\n'
             '\n'
             'class SpeculativeMergeWorker:\n'
-            '    async def VerifyDispatcher.dispatch(self, item):\n'
+            '    async def _dispatch_deciding(self, item):\n'
             '        self._requeue_request(item.request)\n'
         )
         assert _verify_exit_vacate_bypasses(src) == []

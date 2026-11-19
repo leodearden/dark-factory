@@ -22673,8 +22673,8 @@ class TestSnapshotInflightCollection:
         surfaces in snapshot() as a 'dispatching' entry (task 2435 kappa-b:
         closes the task-2068 census gap).
 
-        DISPATCHING brackets `await self.VerifyDispatcher.dispatch(item)` (mq:9203-9214,
-        9571-9580) — the item is off the redispatch park/_verifier_queue but not yet
+        DISPATCHING brackets each `await self._dispatch_deciding(item)` in
+        `merge_lane/worker.py::SpeculativeMergeWorker._verifier_loop` — the item is off the redispatch park/_verifier_queue but not yet
         appended to _inflight. Historically this window was covered only by
         the census-only `_dispatching_item` field, which snapshot()'s
         'entries' section never read (task 2068 gap). Now that DISPATCHING

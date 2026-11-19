@@ -57,9 +57,9 @@ def _solo_gate(target_task_id: str, gate_release: asyncio.Event) -> FakeVerifier
     """A ``VerifyPort`` that parks *target_task_id*'s solo verify on *gate_release*.
 
     Injected as ``SpeculativeMergeWorker(..., verifier=...)``.  A dispatched
-    single reaches it through the ``LocalRunner(run_scoped=self._verifier
-    .run_scoped, task_id=req.task_id)`` built in
-    ``merge_queue.py::SpeculativeMergeWorker.VerifyDispatcher.dispatch``, and
+    single reaches it through the ``LocalRunner`` a local host slot is acquired
+    with (``orchestrator/src/orchestrator/merge_lane/post_merge_verify.py::placeholder_local_runner``),
+    which binds the injected verifier's ``run_scoped`` and ``task_id=req.task_id``, and
     ``verify_runner.py::LocalRunner.run_merge_verify`` forwards that ``task_id``
     into ``run_scoped``, so the script selects exactly one request rather than
     blocking the first verify positionally.  Every other task verifies green immediately.

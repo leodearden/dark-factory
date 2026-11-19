@@ -2212,7 +2212,7 @@ class TestDeepDispatchRoundsIntegration:
         #
         # base_sha is REAL MAIN, deliberately: a slot-1 item is merged onto
         # main, and a stale base would fire VerifyDispatcher.dispatch's Mechanism-2
-        # staleness re-merge, which sets `_remerge_occurred` and makes every
+        # staleness re-merge, which raises `VerifyDispatcher.chain_invalidated` and makes every
         # LATER speculative round re-merge as `chain_invalidated` — arriving at
         # _deep_chain_placement non-speculative, so no round after this one
         # would chain at all and the whole scene would go quietly vacuous.
