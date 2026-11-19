@@ -23,6 +23,7 @@ import re
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from enum import StrEnum
 from typing import Any
 
 from shared.task_statuses import ACTIVE as ACTIVE_TASK_STATUSES
@@ -887,6 +888,28 @@ def id_key(t: dict) -> int:
 # --------------------------------------------------------------------------- #
 
 
+class TaskTreeUnavailableReason(StrEnum):
+    """Why a reconciliation run could not fetch the task tree."""
+
+    taskmaster_disabled = 'taskmaster_disabled'
+    empty_project_root = 'empty_project_root'
+    non_absolute_project_root = 'non_absolute_project_root'
+    fetch_error = 'fetch_error'
+
+
+_TREE_CONTENT_FIELDS: tuple[str, ...] = (
+    'active_tasks',
+    'done_tasks',
+    'cancelled_tasks',
+    'all_done_tasks',
+    'done_count',
+    'cancelled_count',
+    'other_count',
+    'total_count',
+    'max_task_id',
+)
+
+
 @dataclass
 class FilteredTaskTree:
     """Result of filter_task_tree(): active tasks plus aggregate counts.
@@ -909,6 +932,10 @@ class FilteredTaskTree:
         since-boundary completion-memory audit (``select_done_since_boundary``) so
         that audit's coverage does not silently shrink as done-task throughput
         grows past the 30-cap.  Defaults to [] and is not rendered directly.
+    unavailable_reason: None when the tree was really fetched.  A reason means
+        the fetch failed, so every list and count is unknown rather than zero;
+        such a tree carries no tasks and zero counts (enforced at construction),
+        and every renderer shows ``tree_unavailable_notice`` in its place.
     """
 
     active_tasks: list[dict] = field(default_factory=list)
@@ -925,6 +952,22 @@ class FilteredTaskTree:
     total_count: int = 0
     max_task_id: int = 0
     all_done_tasks: list[dict] = field(default_factory=list)
+    unavailable_reason: TaskTreeUnavailableReason | None = None
+
+    def __post_init__(self) -> None:
+        if self.unavailable_reason is None:
+            return
+        carried = {
+            name: value
+            for name in _TREE_CONTENT_FIELDS
+            if (value := getattr(self, name))
+        }
+        if carried:
+            details = ', '.join(f'{name}={value!r}' for name, value in carried.items())
+            raise ValueError(
+                f'FilteredTaskTree with unavailable_reason={self.unavailable_reason.value} '
+                f'must carry no tasks and zero counts; got {details}'
+            )
 
 
 # --------------------------------------------------------------------------- #
@@ -1527,8 +1570,21 @@ def _retained_window_note(*, status: str, cap_name: str, cap: int, count: int, r
     )
 
 
+def tree_unavailable_notice(tree: FilteredTaskTree) -> str | None:
+    """Return the line that stands in for a failed fetch's contents, or None for a fetched tree."""
+    if tree.unavailable_reason is None:
+        return None
+    return f'Task tree unavailable: {tree.unavailable_reason.value}'
+
+
 def render_retained_done_tasks(tree: FilteredTaskTree) -> str:
-    """Render ``tree.done_tasks``, ending with a window note when MAX_DONE_TASKS_RETAINED left some out."""
+    """Render ``tree.done_tasks``, ending with a window note when MAX_DONE_TASKS_RETAINED left some out.
+
+    An unavailable tree renders as its ``tree_unavailable_notice``.
+    """
+    unavailable = tree_unavailable_notice(tree)
+    if unavailable is not None:
+        return unavailable
     listing = format_task_list(tree.done_tasks)
     note = _retained_window_note(
         status='done',
@@ -1795,6 +1851,9 @@ def render_active_section(
     tree, max_tasks, max_chars).  The returned visible list is byte-identical to
     select_visible_active(tree, max_tasks, max_chars).
 
+    An unavailable tree renders as the header plus its tree_unavailable_notice,
+    with no count line, and an empty visible list.
+
     Args:
         tree: FilteredTaskTree to render.
         max_tasks: Maximum number of active tasks to include.
@@ -1805,6 +1864,10 @@ def render_active_section(
         empty) prefix list of task dicts; assembled_string is the fully rendered
         prompt string suitable for injection into a reconciliation prompt.
     """
+    unavailable = tree_unavailable_notice(tree)
+    if unavailable is not None:
+        return [], f'{ACTIVE_TASK_TREE_HEADER}\n{unavailable}\n'
+
     active_slice = tree.active_tasks[:max_tasks]
     visible, body, header, cancelled_section, summary_line = _select_visible_active_with_body(
         tree, max_tasks, max_chars
@@ -1860,6 +1923,8 @@ def format_filtered_task_tree(
 
     When MAX_CANCELLED_TASKS_RETAINED left cancelled tasks out, the section ends
     with a note naming the window it shows.
+
+    An unavailable tree renders as the header plus its tree_unavailable_notice.
 
     The cancelled section is never truncated by the max_chars clamp — only
     active task lines are trimmed. The cancelled section length is subtracted
