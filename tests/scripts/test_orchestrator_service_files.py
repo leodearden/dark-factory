@@ -54,7 +54,7 @@ import re
 
 import pytest
 from orchestrator_projects import scan_units
-from shared.cgroup_slice import project_slice_name
+from shared.cgroup_slice import DAEMON_SUBGROUP, project_slice_name
 from shared.project_id import project_id_for_root
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
@@ -670,6 +670,105 @@ def test_project_unit_runs_under_its_project_slice(unit_name: str) -> None:
     slices = [line.removeprefix("Slice=") for line in service if line.startswith("Slice=")]
     expected = project_slice_name(project_id_for_root(_PROJECT_UNIT_ROOTS[unit_name]))
     assert slices == [expected]
+
+
+# ---------------------------------------------------------------------------
+# Memory-only delegation, started in the daemon subgroup (task 10460; contract
+# docs/cgroup-slice-topology.md, plans/per-consumer-resource-recording-prd.md
+# D9/D10)
+#
+# A unit under its project slice also delegates the memory controller and
+# starts its process tree in the daemon subgroup; a unit outside any slice
+# carries none of the three. No unit delegates cpu.
+# ---------------------------------------------------------------------------
+
+_DELEGATE_MEMORY = "Delegate=memory"
+_DELEGATE_SUBGROUP = f"DelegateSubgroup={DAEMON_SUBGROUP}"
+_SYSTEMD_BOOLEAN_TRUE = frozenset({"1", "yes", "y", "true", "t", "on"})
+
+
+def _delegates_cpu(value: str) -> bool:
+    """Whether a Delegate= value hands the cpu controller over; boolean true hands over all."""
+    return value.strip().lower() in _SYSTEMD_BOOLEAN_TRUE or "cpu" in value.split()
+
+
+def _cgroup_placement_problems(service_directives: list[str]) -> list[str]:
+    found = {
+        "Slice=": any(d.startswith("Slice=") for d in service_directives),
+        _DELEGATE_MEMORY: _DELEGATE_MEMORY in service_directives,
+        _DELEGATE_SUBGROUP: _DELEGATE_SUBGROUP in service_directives,
+    }
+    problems = []
+    if len(set(found.values())) > 1:
+        present = ", ".join(name for name, is_present in found.items() if is_present)
+        problems.append(
+            f"Slice=, {_DELEGATE_MEMORY} and {_DELEGATE_SUBGROUP} must appear all three "
+            f"or none; present: {present}"
+        )
+    problems.extend(
+        f"{d} delegates the cpu controller, which no orchestrator unit may"
+        for d in service_directives
+        if d.startswith("Delegate=") and _delegates_cpu(d.removeprefix("Delegate="))
+    )
+    return problems
+
+
+_ALL_THREE = ("Slice=df-x.slice", _DELEGATE_MEMORY, _DELEGATE_SUBGROUP)
+
+
+@pytest.mark.parametrize(
+    "service_lines",
+    [pytest.param((), id="none-of-the-three"), pytest.param(_ALL_THREE, id="all-three")],
+)
+def test_cgroup_placement_accepts_all_three_or_none(service_lines: tuple[str, ...]) -> None:
+    service = _directives(parse_sections(_unit_fixture(*service_lines))["Service"])
+    assert _cgroup_placement_problems(service) == []
+
+
+@pytest.mark.parametrize(
+    ("service_lines", "named"),
+    [
+        pytest.param(("Slice=df-x.slice",), "present: Slice=", id="slice-alone"),
+        pytest.param(
+            ("Slice=df-x.slice", _DELEGATE_MEMORY),
+            f"present: Slice=, {_DELEGATE_MEMORY}",
+            id="slice-and-delegation-without-subgroup",
+        ),
+        pytest.param(
+            (_DELEGATE_MEMORY, _DELEGATE_SUBGROUP),
+            f"present: {_DELEGATE_MEMORY}, {_DELEGATE_SUBGROUP}",
+            id="delegation-without-slice",
+        ),
+        pytest.param(
+            ("Slice=df-x.slice", "Delegate=yes", _DELEGATE_SUBGROUP),
+            "Delegate=yes delegates the cpu controller",
+            id="boolean-true-delegates-cpu",
+        ),
+        pytest.param(
+            ("Slice=df-x.slice", "Delegate=memory cpu", _DELEGATE_SUBGROUP),
+            "Delegate=memory cpu delegates the cpu controller",
+            id="controller-list-names-cpu",
+        ),
+    ],
+)
+def test_cgroup_placement_problems_name_what_is_wrong(
+    service_lines: tuple[str, ...], named: str
+) -> None:
+    service = _directives(parse_sections(_unit_fixture(*service_lines))["Service"])
+    problems = _cgroup_placement_problems(service)
+    assert any(named in problem for problem in problems), problems
+
+
+@pytest.mark.parametrize(
+    "unit_path",
+    [*ALL_ORCHESTRATOR_SERVICE_FILES, REPO_ROOT / FACTORY_INIT_REFERENCE],
+    ids=lambda p: p.name,
+)
+def test_unit_carries_slice_and_memory_delegation_together_or_not_at_all(
+    unit_path: pathlib.Path,
+) -> None:
+    service = _directives(parse_sections(_service_unit_text(unit_path))["Service"])
+    assert _cgroup_placement_problems(service) == []
 
 
 # ---------------------------------------------------------------------------
