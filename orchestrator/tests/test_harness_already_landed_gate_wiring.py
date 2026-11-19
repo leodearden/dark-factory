@@ -2832,6 +2832,32 @@ class TestAlreadyLandedGateDeliveredChecksWiring:
         assert spy.await_args is not None
         assert spy.await_args.kwargs.get('delivered_checks') == []
 
+    @pytest.mark.parametrize(
+        ('declaration', 'forwarded'),
+        [
+            pytest.param(['junk', _DC_CHECK], [_DC_CHECK], id='non-dict-entry-dropped'),
+            pytest.param(
+                {'name': 'cap', 'kind': 'grep', 'pattern': 'X', 'expect': 'present'},
+                [],
+                id='bare-dict-value-never-iterated-by-key',
+            ),
+        ],
+    )
+    async def test_only_the_declared_check_descriptors_reach_the_validator(
+        self, mock_orch_config, declaration, forwarded,
+    ) -> None:
+        h, _meta = _arm_harness(
+            mock_orch_config, 'marker', metadata={'delivered_checks': declaration},
+        )
+        spy = AsyncMock(wraps=validate_landing_evidence)
+
+        with patch('orchestrator.harness.validate_landing_evidence', spy), \
+             patch(_GATE_TARGET, AsyncMock(return_value=None)):
+            await h._already_landed_dispatch_gate('42')
+
+        assert spy.await_args is not None
+        assert spy.await_args.kwargs.get('delivered_checks') == forwarded
+
     @pytest.mark.parametrize('arm', _LIVE_TIP_ARMS)
     async def test_a_live_tip_arm_hands_the_recorded_base_to_the_producer(
         self, mock_orch_config, landing_producer: AsyncMock, arm,
