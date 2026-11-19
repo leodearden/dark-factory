@@ -20,6 +20,7 @@ import pytest
 from click.testing import CliRunner
 
 import orchestrator.cli as cli_module
+import orchestrator.cli_config as cli_config
 import orchestrator.evals.runner as runner_module
 from orchestrator.cli import main
 from orchestrator.config import OrchestratorConfig
@@ -108,7 +109,7 @@ def test_eval_ofat_invokes_run_ofat_stage_and_prints_report(
     monkeypatch, base_config, dummy_cfg_file, fixtures_dir,
 ):
     """``eval-ofat`` drives run_ofat_stage over ofat_candidates() and prints C4."""
-    monkeypatch.setattr(cli_module, 'load_config', lambda _: base_config)
+    monkeypatch.setattr(cli_config, 'load_config', lambda _: base_config)
 
     calls: list[tuple] = []
 
@@ -137,7 +138,7 @@ def test_eval_matrix_prints_composite_report_two_config_floor(
     monkeypatch, base_config, dummy_cfg_file, fixtures_dir,
 ):
     """``eval-matrix`` drives the matrix stage; report carries >=2 config rows."""
-    monkeypatch.setattr(cli_module, 'load_config', lambda _: base_config)
+    monkeypatch.setattr(cli_config, 'load_config', lambda _: base_config)
 
     calls: list[tuple] = []
 
@@ -183,7 +184,7 @@ def test_eval_confirm_invokes_run_confirm_stage(
     monkeypatch, base_config, dummy_cfg_file, fixtures_dir,
 ):
     """``eval-confirm`` drives run_confirm_stage for the single winning combo."""
-    monkeypatch.setattr(cli_module, 'load_config', lambda _: base_config)
+    monkeypatch.setattr(cli_config, 'load_config', lambda _: base_config)
 
     cands = configs_module.ofat_candidates()
     arch_name = next(c.name for c in cands if c.role == 'architect')
@@ -221,7 +222,7 @@ def test_eval_confirm_rejects_swapped_arch_impl_flags(
     both-live combo. The driver must reject it, NAME the offending flag, and
     never dispatch the confirmation batch (loud-over-silent).
     """
-    monkeypatch.setattr(cli_module, 'load_config', lambda _: base_config)
+    monkeypatch.setattr(cli_config, 'load_config', lambda _: base_config)
 
     cands = configs_module.ofat_candidates()
     arch_name = next(c.name for c in cands if c.role == 'architect')
@@ -257,7 +258,7 @@ def test_eval_matrix_flag_alias_routes_to_matrix_driver(
     alias must now route to ``run_matrix_stage`` and emit the composite report.
     ``run_eval_matrix`` is neutralized so the pre-impl path never does real work.
     """
-    monkeypatch.setattr(cli_module, 'load_config', lambda _: base_config)
+    monkeypatch.setattr(cli_config, 'load_config', lambda _: base_config)
 
     async def _neutralized_old_path(*args, **kwargs):
         return []
@@ -365,7 +366,7 @@ class TestEmitCompositeReportArchitectSurface:
         self, monkeypatch, base_config, dummy_cfg_file, fixtures_dir,
     ):
         """End-to-end through the `eval-ofat` command, not just the helper."""
-        monkeypatch.setattr(cli_module, 'load_config', lambda _: base_config)
+        monkeypatch.setattr(cli_config, 'load_config', lambda _: base_config)
 
         async def fake_ofat(*args, **kwargs):
             return _arch_ofat_results()

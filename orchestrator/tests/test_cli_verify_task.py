@@ -32,6 +32,7 @@ from test_cli import (
 )
 
 import orchestrator.cli as cli_module
+import orchestrator.cli_config as cli_config
 from orchestrator.cli import main
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps
@@ -75,7 +76,7 @@ class TestCancelVerifyReapsRecordedWorktree:
     def repo_setup(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         repo, head_sha = seed_verify_repo(tmp_path)
         config = OrchestratorConfig(project_root=repo)
-        monkeypatch.setattr(cli_module, 'load_config', lambda _: config)
+        monkeypatch.setattr(cli_config, 'load_config', lambda _: config)
         return repo, head_sha, GitOps(config.git, repo)
 
     def _record_dead_run(self, git_ops: GitOps, request_id: str, worktree: Path) -> Path:
@@ -180,7 +181,7 @@ def _use_host_config(
     config = OrchestratorConfig(project_root=repo, verify_cold_preprovision_command=preprovision)
     if git is not None:
         config = config.model_copy(update={'git': git})
-    monkeypatch.setattr(cli_module, 'load_config', lambda _: config)
+    monkeypatch.setattr(cli_config, 'load_config', lambda _: config)
     return config
 
 
@@ -472,7 +473,7 @@ def test_cancel_verify_kills_a_real_verify_task_and_reaps_its_worktree(
         _wait_for_pgid_file_or_report_crash(pgf, child, timeout=30)
         pgid = int(pgf.read_text().strip())
         wt = _wait_for_recorded_cold_worktree(pgf, child)
-        monkeypatch.setattr(cli_module, 'load_config', lambda _: config)
+        monkeypatch.setattr(cli_config, 'load_config', lambda _: config)
 
         r = _invoke_cancel_verify(tmp_path, 'req-e2e')
 

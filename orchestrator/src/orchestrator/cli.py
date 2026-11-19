@@ -21,7 +21,8 @@ from dotenv import load_dotenv
 from shared.project_layout import runs_db, tasks_db
 from shared.spawn_temp_files import sweep_orphaned_spawn_temp_files
 
-from orchestrator.config import ConfigRequiredError, GitConfig, OrchestratorConfig, load_config
+from orchestrator.cli_config import pass_config
+from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.config_census_ignore import audit_census_ignore_entries
 from orchestrator.main_checkout_defaults import cli_default
 from orchestrator.shadow_types import ShadowShape
@@ -243,11 +244,7 @@ def main(verbose: bool):
 @main.command()
 @click.option('--prd', type=click.Path(exists=True, path_type=Path), default=None,
               help='Path to PRD markdown file (omit to run existing tasks)')
-@click.option('--config', 'config_path', type=click.Path(exists=True, path_type=Path),
-              default=None,
-              help='Path to orchestrator config YAML (REQUIRED unless ORCH_CONFIG_PATH '
-                   'is set). Selects the target project — sets project_root and '
-                   'fused_memory.project_id.')
+@pass_config()
 @click.option('--dry-run', is_flag=True, help='Populate tasks only, do not execute')
 @click.option('--delay', default=None,
               help='Delay before executing tasks (e.g. 4h, 30m, 90s). '
@@ -260,7 +257,7 @@ def main(verbose: bool):
 @click.option('--until-idle', is_flag=True,
               help='Exit when the task queue drains (default: run forever, '
                    'idling for newly-scheduled tasks)')
-def run(prd: Path | None, config_path: Path | None, dry_run: bool, delay: str | None,
+def run(prd: Path | None, config: OrchestratorConfig, dry_run: bool, delay: str | None,
         force_dirty_start: bool, retag_modules: bool, until_idle: bool):
     """Run the orchestrator against a PRD, or execute existing tasks if no PRD given."""
     from orchestrator.deployed_sha import capture_deployed_sha, resolve_code_checkout
@@ -273,11 +270,6 @@ def run(prd: Path | None, config_path: Path | None, dry_run: bool, delay: str | 
     from orchestrator.harness import Harness
 
     delay_secs = _parse_duration(delay) if delay else 0
-    try:
-        config = load_config(config_path)
-    except ConfigRequiredError as e:
-        click.echo(f'Error: {e}', err=True)
-        sys.exit(1)
     if deployed_sha is None and config.enabled_verify_runners:
         click.echo(
             'Error: a remote verify runner is enabled but this process cannot read the '
@@ -365,21 +357,12 @@ def run(prd: Path | None, config_path: Path | None, dry_run: bool, delay: str | 
 
 
 @main.command()
-@click.option('--config', 'config_path', type=click.Path(exists=True, path_type=Path),
-              default=None,
-              help='Path to orchestrator config YAML (REQUIRED unless ORCH_CONFIG_PATH '
-                   'is set). Selects the target project — sets project_root and '
-                   'fused_memory.project_id.')
-def status(config_path: Path | None):
+@pass_config()
+def status(config: OrchestratorConfig):
     """Show current task tree and status."""
     from orchestrator.overrides import OverrideStore
     from orchestrator.scheduler import Scheduler
 
-    try:
-        config = load_config(config_path)
-    except ConfigRequiredError as e:
-        click.echo(f'Error: {e}', err=True)
-        sys.exit(1)
     scheduler = Scheduler(config, override_store=OverrideStore.from_config(config))
 
     async def _show():
@@ -399,12 +382,8 @@ def status(config_path: Path | None):
 
 
 @main.command('flake-ledger')
-@click.option('--config', 'config_path', type=click.Path(exists=True, path_type=Path),
-              default=None,
-              help='Path to orchestrator config YAML (REQUIRED unless ORCH_CONFIG_PATH '
-                   'is set). Selects the target project — sets project_root and '
-                   'fused_memory.project_id.')
-def flake_ledger_cmd(config_path: Path | None):
+@pass_config()
+def flake_ledger_cmd(config: OrchestratorConfig):
     """Print the flake ledger report: open debt, recurrence chains, health counters.
 
     READ ONLY. This command opens no debt, files no task, resolves nothing and
@@ -415,12 +394,6 @@ def flake_ledger_cmd(config_path: Path | None):
     # Named flake_ledger_cmd so the function does not shadow the flake_ledger module.
     from orchestrator.flake_ledger import ledger_db_path
     from orchestrator.flake_report import build_report, corroborate_owners, render_report
-
-    try:
-        config = load_config(config_path)
-    except ConfigRequiredError as e:
-        click.echo(f'Error: {e}', err=True)
-        sys.exit(1)
 
     # Built only when there are owners to read, so an absent ledger never builds one.
     async def read_statuses(ids: list[str]) -> tuple[dict[str, str], Exception | None]:
@@ -441,12 +414,8 @@ def verify_cache_group():
 
 
 @verify_cache_group.command('status')
-@click.option('--config', 'config_path', type=click.Path(exists=True, path_type=Path),
-              default=None,
-              help='Path to orchestrator config YAML (REQUIRED unless ORCH_CONFIG_PATH '
-                   'is set). Selects the target project — sets project_root and '
-                   'fused_memory.project_id.')
-def verify_cache_status_cmd(config_path: Path | None):
+@pass_config()
+def verify_cache_status_cmd(config: OrchestratorConfig):
     """Print each role's cache mode, the registry's greens by tier, and the kill switch.
 
     READ ONLY: it will NOT create a registry for a project that has none.
@@ -461,11 +430,6 @@ def verify_cache_status_cmd(config_path: Path | None):
     )
     from orchestrator.verify_cache.status import render_status
 
-    try:
-        config = load_config(config_path)
-    except ConfigRequiredError as e:
-        click.echo(f'Error: {e}', err=True)
-        sys.exit(1)
     summary: RegistrySummary | RegistryError
     try:
         summary = asyncio.run(Registry(registry_db_path(Path(config.project_root))).summary())
@@ -476,11 +440,7 @@ def verify_cache_status_cmd(config_path: Path | None):
 
 
 @main.command('probe-models')
-@click.option('--config', 'config_path', type=click.Path(exists=True, path_type=Path),
-              default=None,
-              help='Path to orchestrator config YAML (REQUIRED unless ORCH_CONFIG_PATH '
-                   'is set). Selects the target project — sets project_root and '
-                   'fused_memory.project_id.')
+@pass_config()
 @click.option('--models', 'models_csv', default=None,
               help='Comma-separated model list to probe, overriding the default '
                    '(config.routing.allowed_models plus the fable candidate model).')
@@ -495,7 +455,7 @@ def verify_cache_status_cmd(config_path: Path | None):
                    'routing.DEFAULT_PROBE_BUDGET_USD). Must exceed one turn of the '
                    'most expensive probed model — undershooting it reports '
                    'budget_too_low, not unavailability.')
-def probe_models(config_path: Path | None, models_csv: str | None, output_path: Path | None,
+def probe_models(config: OrchestratorConfig, models_csv: str | None, output_path: Path | None,
                  budget_usd: float | None):
     """Probe every configured pool account x candidate model for availability
     and write the rendered status artifact (default config/model-availability.yaml).
@@ -514,12 +474,6 @@ def probe_models(config_path: Path | None, models_csv: str | None, output_path: 
     from datetime import UTC, datetime
 
     from orchestrator import routing
-
-    try:
-        config = load_config(config_path)
-    except ConfigRequiredError as e:
-        click.echo(f'Error: {e}', err=True)
-        sys.exit(1)
 
     models = (
         [m.strip() for m in models_csv.split(',') if m.strip()] or None
@@ -764,7 +718,7 @@ _SpecT = TypeVar('_SpecT')
 
 
 def _run_remote_verify(
-    config_path: Path | None,
+    config: OrchestratorConfig,
     spec_json: str,
     request_id: str | None,
     *,
@@ -776,7 +730,7 @@ def _run_remote_verify(
 ) -> None:
     """The prologue and exit contract every remote verify subcommand shares.
 
-    Loads config, parses ``--spec``, joins its own process group and writes
+    Parses ``--spec``, joins its own process group and writes
     the pgid file (with ``--request-id``), enters *preflight*, starts the
     stdin watchdog, then runs *body*.  Prints one VerifyResult JSON to stdout
     and exits 0 whenever it has one (even ``passed=False``); exits 1 on bad
@@ -786,12 +740,6 @@ def _run_remote_verify(
     """
     from orchestrator.git_ops import GitOps
     from orchestrator.verify_runner import result_to_json
-
-    try:
-        config = load_config(config_path)
-    except ConfigRequiredError as e:
-        click.echo(f'Error: {e}', err=True)
-        sys.exit(1)
 
     try:
         spec = parse_spec(spec_json)
@@ -1079,11 +1027,7 @@ async def _verify_merge_body(
 @main.command('verify-merge')
 @click.option('--sha', required=True, help='Merge commit SHA to verify (must be present in the local repo)')
 @click.option('--spec', 'spec_json', required=True, help='MergeVerifySpec as a JSON string (from RemoteRunner dispatch)')
-@click.option('--config', 'config_path', type=click.Path(exists=True, path_type=Path),
-              default=None,
-              help='Path to orchestrator config YAML (REQUIRED unless ORCH_CONFIG_PATH '
-                   'is set). Selects the target project — sets project_root and '
-                   'fused_memory.project_id.')
+@pass_config()
 @click.option('--request-id', default=None,
               help='Optional request ID for cancellation support (task 1732 α).  '
                    'When provided: joins a new process group via setsid, writes the pgid to '
@@ -1093,7 +1037,7 @@ async def _verify_merge_body(
                    'descendant tree (including start_new_session build escapes).  '
                    'Absent → today\'s exact behavior, back-compat.  '
                    'RemoteRunner wiring is deferred to tasks β/γ.')
-def verify_merge(sha: str, spec_json: str, config_path: Path | None, request_id: str | None):
+def verify_merge(sha: str, spec_json: str, config: OrchestratorConfig, request_id: str | None):
     """Run the merge-verify bundle at a given SHA and emit a VerifyResult JSON to stdout.
 
     Materialises a detached worktree at --sha, runs the same scoped + unscoped
@@ -1130,7 +1074,7 @@ def verify_merge(sha: str, spec_json: str, config_path: Path | None, request_id:
     from orchestrator.verify_runner import spec_from_json
 
     _run_remote_verify(
-        config_path, spec_json, request_id,
+        config, spec_json, request_id,
         parse_spec=spec_from_json,
         body=functools.partial(_verify_merge_body, sha),
         preflight=_merge_lane_gate,
@@ -1162,16 +1106,12 @@ async def _verify_task_body(
 @click.option('--sha', required=True, help='Task tip SHA to verify (must be present in the local repo)')
 @click.option('--spec', 'spec_json', required=True,
               help='TaskVerifySpec as a JSON string (from RemoteRunner.run_task_verify)')
-@click.option('--config', 'config_path', type=click.Path(exists=True, path_type=Path),
-              default=None,
-              help='Path to orchestrator config YAML (REQUIRED unless ORCH_CONFIG_PATH '
-                   'is set). Selects the target project — sets project_root and '
-                   'fused_memory.project_id.')
+@pass_config()
 @click.option('--request-id', default=None,
               help='Optional cancellation key: joins a new process group and records the '
                    'pgid and worktree under <worktree_base>/.merge_verify_pgids/ for '
                    '``orchestrator cancel-verify --request-id X``.')
-def verify_task(sha: str, spec_json: str, config_path: Path | None, request_id: str | None):
+def verify_task(sha: str, spec_json: str, config: OrchestratorConfig, request_id: str | None):
     """Run a task-role verify of --sha on a fresh ephemeral worktree; print one VerifyResult JSON.
 
     Exit 0 on any verdict; exit 1 on a config, spec or infrastructure error, or
@@ -1181,7 +1121,7 @@ def verify_task(sha: str, spec_json: str, config_path: Path | None, request_id: 
     plans/remote-task-leg-verify-prd.md §5.3.
     """
     _run_remote_verify(
-        config_path, spec_json, request_id,
+        config, spec_json, request_id,
         parse_spec=functools.partial(_task_spec_for_sha, sha),
         body=functools.partial(_verify_task_body, sha),
     )
@@ -1246,12 +1186,10 @@ def gate_identity():
 @click.option('--request-id', required=True,
               help='Request ID passed to the verify-merge or verify-task invocation '
                    'to cancel; the worktree that run recorded is reaped too.')
-@click.option('--config', 'config_path', type=click.Path(exists=True, path_type=Path),
-              default=None,
-              help='Path to orchestrator config YAML (REQUIRED unless ORCH_CONFIG_PATH '
-                   'is set). Selects the target project — determines worktree_base for '
-                   'the pgid-file lookup.')
-def cancel_verify(request_id: str, config_path: Path | None):
+@pass_config(help='Path to orchestrator config YAML (REQUIRED unless ORCH_CONFIG_PATH '
+                  'is set). Selects the target project — determines worktree_base for '
+                  'the pgid-file lookup.')
+def cancel_verify(request_id: str, config: OrchestratorConfig):
     """Kill the verify-merge or verify-task tree identified by --request-id and exit 0.
 
     Reads the pgid file at
@@ -1280,12 +1218,6 @@ def cancel_verify(request_id: str, config_path: Path | None):
     laptop via its normal checkout sync.
     """
     from orchestrator.git_ops import GitOps
-
-    try:
-        config = load_config(config_path)
-    except ConfigRequiredError as e:
-        click.echo(f'Error: {e}', err=True)
-        sys.exit(1)
 
     git_ops = GitOps(config.git, config.project_root)
     pgf = pgid_file(git_ops.worktree_base, request_id)
@@ -1351,6 +1283,9 @@ def cancel_verify(request_id: str, config_path: Path | None):
     sys.exit(rc)
 
 
+_SHORT_CONFIG_HELP = 'Path to orchestrator config YAML (REQUIRED unless ORCH_CONFIG_PATH is set).'
+
+
 @main.command('eval')
 @click.option('--task', 'task_path', type=click.Path(exists=True, path_type=Path),
               default=None, help='Path to a single task JSON file')
@@ -1359,11 +1294,7 @@ def cancel_verify(request_id: str, config_path: Path | None):
 @click.option('--matrix', is_flag=True, help='Run full eval matrix (all tasks × all configs)')
 @click.option('--judge', is_flag=True, help='Run Elo-based LLM judge on existing results')
 @click.option('--plan-only', is_flag=True, help='Generate plans for tasks (no execution)')
-@click.option('--config', 'config_path', type=click.Path(exists=True, path_type=Path),
-              default=None,
-              help='Path to orchestrator config YAML (REQUIRED unless ORCH_CONFIG_PATH '
-                   'is set). Selects the target project — sets project_root and '
-                   'fused_memory.project_id.')
+@pass_config()
 @click.option('--max-parallel', type=int, default=None,
               help='Max concurrent eval runs (default: unlimited)')
 @click.option('--trials', type=int, default=1,
@@ -1395,7 +1326,7 @@ def eval_cmd(
     matrix: bool,
     judge: bool,
     plan_only: bool,
-    config_path: Path | None,
+    config: OrchestratorConfig,
     max_parallel: int | None,
     trials: int,
     force: bool,
@@ -1410,12 +1341,6 @@ def eval_cmd(
     combine_runs: tuple[str, ...],
 ):
     """Run multi-provider implementor evaluations."""
-    try:
-        base_config = load_config(config_path)
-    except ConfigRequiredError as e:
-        click.echo(f'Error: {e}', err=True)
-        sys.exit(1)
-
     # Inject ANTHROPIC_BASE_URL into vLLM configs when --vllm-url is set
     if vllm_url:
         from orchestrator.evals.configs import FINAL_RUN_CONFIGS, VLLM_EVAL_CONFIGS
@@ -1424,7 +1349,7 @@ def eval_cmd(
                 cfg.env_overrides['ANTHROPIC_BASE_URL'] = vllm_url
 
     if cleanup:
-        _run_cleanup(base_config)
+        _run_cleanup(config)
         return
 
     if report_only:
@@ -1440,12 +1365,12 @@ def eval_cmd(
         return
 
     if plan_only:
-        _run_plan_only(task_path, base_config)
+        _run_plan_only(task_path, config)
         return
 
     if matrix:
         _run_matrix_cmd(
-            base_config,
+            config,
             max_parallel=max_parallel, trials=trials,
             force=force, timeout=timeout,
         )
@@ -1456,7 +1381,7 @@ def eval_cmd(
         sys.exit(1)
 
     _run_single_eval(
-        task_path, config_name, base_config,
+        task_path, config_name, config,
         force=force, timeout=timeout, worktree_path=worktree_path,
     )
 
@@ -1955,10 +1880,7 @@ def _run_confirm_driver(
 
 
 @main.command('eval-ofat')
-@click.option('--config', 'config_path', type=click.Path(exists=True, path_type=Path),
-              default=None,
-              help='Path to orchestrator config YAML (REQUIRED unless '
-                   'ORCH_CONFIG_PATH is set).')
+@pass_config(help=_SHORT_CONFIG_HELP)
 @click.option('--tasks-dir', type=click.Path(path_type=Path), default=None,
               help='Fixture dir (default: orchestrator/evals/tasks)')
 @click.option('--trials', type=int, default=1,
@@ -1967,7 +1889,7 @@ def _run_confirm_driver(
               help='Max concurrent eval runs (default: unlimited)')
 @click.option('--timeout', type=int, default=None,
               help='Timeout in minutes per eval run (overrides task JSON)')
-def eval_ofat_cmd(config_path, tasks_dir, trials, max_parallel, timeout):
+def eval_ofat_cmd(config, tasks_dir, trials, max_parallel, timeout):
     """OFAT screen (μ): vary ONE role per candidate, pin the rest to incumbents.
 
     Each candidate varies exactly one role — implementer incumbents (Opus AND
@@ -1975,22 +1897,14 @@ def eval_ofat_cmd(config_path, tasks_dir, trials, max_parallel, timeout):
     architect candidates drive ``run_architect_eval`` live with downstream roles
     frozen. Emits the C4 composite report.
     """
-    try:
-        base_config = load_config(config_path)
-    except ConfigRequiredError as e:
-        click.echo(f'Error: {e}', err=True)
-        sys.exit(1)
     _run_ofat_driver(
-        base_config, tasks_dir=tasks_dir,
+        config, tasks_dir=tasks_dir,
         max_parallel=max_parallel, trials=trials, timeout=timeout,
     )
 
 
 @main.command('eval-matrix')
-@click.option('--config', 'config_path', type=click.Path(exists=True, path_type=Path),
-              default=None,
-              help='Path to orchestrator config YAML (REQUIRED unless '
-                   'ORCH_CONFIG_PATH is set).')
+@pass_config(help=_SHORT_CONFIG_HELP)
 @click.option('--tasks-dir', type=click.Path(path_type=Path), default=None,
               help='Fixture dir (default: orchestrator/evals/tasks)')
 @click.option('--trials', type=int, default=1,
@@ -1999,29 +1913,21 @@ def eval_ofat_cmd(config_path, tasks_dir, trials, max_parallel, timeout):
               help='Max concurrent eval runs (default: unlimited)')
 @click.option('--timeout', type=int, default=None,
               help='Timeout in minutes per eval run (overrides task JSON)')
-def eval_matrix_cmd(config_path, tasks_dir, trials, max_parallel, timeout):
+def eval_matrix_cmd(config, tasks_dir, trials, max_parallel, timeout):
     """Matrix stage (μ): both-live architect×implementer cross product.
 
     Runs the FULL architect×implementer cross product over the OFAT survivors,
     INCLUDING same-family diagonals (the plan-style/implementer coupling
     hypothesis, PRD decision 9). Emits the C4 composite report.
     """
-    try:
-        base_config = load_config(config_path)
-    except ConfigRequiredError as e:
-        click.echo(f'Error: {e}', err=True)
-        sys.exit(1)
     _run_matrix_driver(
-        base_config, tasks_dir=tasks_dir,
+        config, tasks_dir=tasks_dir,
         max_parallel=max_parallel, trials=trials, timeout=timeout,
     )
 
 
 @main.command('eval-confirm')
-@click.option('--config', 'config_path', type=click.Path(exists=True, path_type=Path),
-              default=None,
-              help='Path to orchestrator config YAML (REQUIRED unless '
-                   'ORCH_CONFIG_PATH is set).')
+@pass_config(help=_SHORT_CONFIG_HELP)
 @click.option('--arch', required=True,
               help='Winning architect config name (e.g. architect-opus-high)')
 @click.option('--impl', required=True,
@@ -2034,20 +1940,15 @@ def eval_matrix_cmd(config_path, tasks_dir, trials, max_parallel, timeout):
               help='Max concurrent eval runs (default: unlimited)')
 @click.option('--timeout', type=int, default=None,
               help='Timeout in minutes per eval run (overrides task JSON)')
-def eval_confirm_cmd(config_path, arch, impl, tasks_dir, trials, max_parallel, timeout):
+def eval_confirm_cmd(config, arch, impl, tasks_dir, trials, max_parallel, timeout):
     """Confirmation batch (μ): one end-to-end batch of the winning combo.
 
     Runs the single winning (architect, implementer) combo across all fixtures ×
     N trials (default 3 — decision 10's statistics floor, enough repeats for a
     CI95 on the winner). Emits the C4 composite report.
     """
-    try:
-        base_config = load_config(config_path)
-    except ConfigRequiredError as e:
-        click.echo(f'Error: {e}', err=True)
-        sys.exit(1)
     _run_confirm_driver(
-        base_config, arch=arch, impl=impl, tasks_dir=tasks_dir,
+        config, arch=arch, impl=impl, tasks_dir=tasks_dir,
         max_parallel=max_parallel, trials=trials, timeout=timeout,
     )
 
@@ -2058,26 +1959,18 @@ def eval_shadow():
 
 
 @eval_shadow.command('report')
-@click.option('--config', 'config_path', type=click.Path(exists=True, path_type=Path),
-              default=None,
-              help='Path to orchestrator config YAML (REQUIRED unless '
-                   'ORCH_CONFIG_PATH is set).')
+@pass_config(help=_SHORT_CONFIG_HELP)
 @click.option('--shape', type=click.Choice([s.value for s in ShadowShape]),
               default=ShadowShape.IMPLEMENTER.value, show_default=True,
               help='Cell shape to report.')
 @click.option('--candidate', default=None, help='Report only this candidate.')
 @click.option('--json', 'as_json', is_flag=True, help='Emit the report as JSON.')
-def eval_shadow_report_cmd(config_path, shape, candidate, as_json):
+def eval_shadow_report_cmd(config, shape, candidate, as_json):
     """C5 report of one project's shadow cells: one paired line per candidate.
 
     Exits 1 when a settled cell's result is missing, in either form, so a
     short table never reads as a complete measurement.
     """
-    try:
-        config = load_config(config_path)
-    except ConfigRequiredError as e:
-        click.echo(f'Error: {e}', err=True)
-        sys.exit(1)
     from orchestrator.evals.shadow_report import (
         RunsDbMissingError,
         UnsupportedShapeError,

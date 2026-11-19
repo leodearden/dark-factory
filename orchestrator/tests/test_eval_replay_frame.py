@@ -80,13 +80,13 @@ def _run_plan_only_cli(tmp_path, monkeypatch, *, architect):
 
     from click.testing import CliRunner
 
-    import orchestrator.cli
+    import orchestrator.cli_config
     from orchestrator.agents.briefing import BriefingAssembler
     from orchestrator.cli import main
     from orchestrator.config import OrchestratorConfig
 
     monkeypatch.setattr(
-        orchestrator.cli, 'load_config',
+        orchestrator.cli_config, 'load_config',
         lambda _p: OrchestratorConfig(project_root=tmp_path),
     )
     fixture = tmp_path / 'df_task_9001.json'
