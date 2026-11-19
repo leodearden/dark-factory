@@ -5,9 +5,10 @@ curator_types.py imports this module, so it must keep importing only the stdlib 
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, ClassVar, Final
@@ -27,6 +28,7 @@ from fused_memory.backends.task_backend_errors import (
     TaskNotFoundError,
 )
 from fused_memory.middleware.metadata_dict import raw_metadata_dict
+from fused_memory.models.reconciliation import EventType
 from fused_memory.models.scope import resolve_project_id
 
 if TYPE_CHECKING:
@@ -38,10 +40,12 @@ __all__ = [
     'HELD_PRIORITIES',
     'HOLDER_GATE_KEYS',
     'PROTECTED_STATUSES',
+    'BackfillEmit',
     'DuplicateFollowupHolderError',
     'FollowupHolderProtectedError',
     'FollowupHolders',
     'HolderProtection',
+    'backfill',
     'held_count',
     'hold_at_create',
     'hold_scope',
@@ -58,6 +62,12 @@ HOLDER_GATE_KEYS: Final = frozenset({FOLLOWUP_HOLDER_METADATA_KEY, 'deferred_wat
 _FOLLOWUP_SOURCE: Final = 'agent-followup'
 _REVIEW_SUGGESTIONS_CONTEXT: Final = 'review_suggestions'
 _HOLD_EXCLUDING_KEYS: Final = ('execution_class', 'prd_path', 'x_finding_key', 'human_decomposed')
+_HOLD_SCOPE_KEYS: Final = ('source', 'spawn_context', 'task_kind', *_HOLD_EXCLUDING_KEYS)
+_BACKFILL_FIELDS: Final = (
+    'priority',
+    'dependencies',
+    *(f'metadata.{key}' for key in (*_HOLD_SCOPE_KEYS, FOLLOWUP_HOLD_METADATA_KEY)),
+)
 _METADATA_SOURCE: Final = 'followup_hold'
 
 
@@ -321,3 +331,55 @@ async def protection_refusal(
         attempted_status=attempted_status,
         held_count=await held_count(tm, project_root, holder_id),
     )
+
+
+BackfillEmit = Callable[[EventType, Mapping[str, object]], Awaitable[None]]
+
+
+async def backfill(
+    tm: TaskBackendProtocol,
+    project_root: str,
+    *,
+    holders: FollowupHolders,
+    write_lock: asyncio.Lock,
+    emit: BackfillEmit,
+) -> int:
+    """Decision 12: hold every pending task the hold rule matches that was never held, and report once.
+
+    Each task's edge and record land in one backend write under the interceptor's write lock, with
+    no journal row and no ``task_modified`` event. A task that already carries a ``followup_hold``
+    record was promoted or released and is never re-held. One ``followup_hold_backfilled`` event is
+    emitted per call, its count possibly 0, so a reader can tell the backfill ran.
+    """
+    async with write_lock:
+        held = await _hold_stock(tm, project_root, holders)
+    await emit(
+        EventType.followup_hold_backfilled,
+        {'project_id': resolve_project_id(project_root), 'count': held},
+    )
+    return held
+
+
+async def _hold_stock(tm: TaskBackendProtocol, project_root: str, holders: FollowupHolders) -> int:
+    pending = await tm.get_tasks(project_root, statuses=[TaskStatus.PENDING], fields=_BACKFILL_FIELDS)
+    stock = [
+        task for task in pending['tasks']
+        if hold_scope(task.get('metadata'), task.get('priority'))
+        and FOLLOWUP_HOLD_METADATA_KEY not in raw_metadata_dict(task.get('metadata'), source=_METADATA_SOURCE)
+    ]
+    if not stock:
+        return 0
+    holder_id = await holders.ensure_holder(tm, project_root)
+    record = FollowupHold(holder=holder_id, held_at=datetime.now(UTC).isoformat())
+    record_json = json.dumps({FOLLOWUP_HOLD_METADATA_KEY: record.model_dump(mode='json', exclude_none=True)})
+    held = 0
+    for task in stock:
+        dependencies = [str(dependency) for dependency in task.get('dependencies') or []]
+        if str(holder_id) in dependencies:
+            continue
+        await tm.update_task(
+            str(task['id']), project_root,
+            metadata=record_json, metadata_mode='merge', dependencies=[*dependencies, str(holder_id)],
+        )
+        held += 1
+    return held

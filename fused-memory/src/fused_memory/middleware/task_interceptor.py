@@ -113,6 +113,7 @@ from fused_memory.middleware.followup_hold import (
     HOLDER_GATE_KEYS,
     FollowupHolders,
     HolderProtection,
+    backfill,
     hold_at_create,
     hold_scope,
     is_holder,
@@ -2262,6 +2263,20 @@ class TaskInterceptor:
                 project_root=project_root,
                 trigger=MintTrigger.DONE_WRITE,
             )
+
+    async def backfill_followup_holds(self, project_root: str) -> int:
+        """Hold the project's pending follow-up stock behind its holder; see ``followup_hold.backfill``."""
+
+        async def emit(event_type: EventType, payload: Mapping[str, object]) -> None:
+            await self._journal(self._make_event(event_type, project_root, dict(payload)))
+
+        return await backfill(
+            await self._ensure_taskmaster(),
+            project_root,
+            holders=self._followup_holders,
+            write_lock=self._write_lock(resolve_project_id(project_root)),
+            emit=emit,
+        )
 
     async def remint_broken_recurrence_chains(self, project_root: str) -> tuple[MintOutcome, ...]:
         """Mint the missing successor of every chain ``recurrence_mint.broken_chains`` finds."""
