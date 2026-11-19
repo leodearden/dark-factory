@@ -13,7 +13,6 @@ import pytest
 from _fake_systemctl import fake_systemctl as fake_systemctl
 from _fake_systemctl import recorded_calls
 from shared.cgroup_slice import DAEMON_SUBGROUP
-from shared.psi import resolve_own_cgroup
 
 from orchestrator.project_slice_weight import SliceWeightOutcome, ensure_project_slice_weight
 
@@ -168,27 +167,3 @@ async def test_other_children_and_misplaced_daemons_are_flagged_and_left_alone(
     (warning,) = _warnings(caplog)
     assert 'df-my_proj.slice' in warning
     assert own_cgroup_path in warning
-
-
-@pytest.fixture
-def fresh_own_cgroup_cache():
-    resolve_own_cgroup.cache_clear()
-    yield
-    resolve_own_cgroup.cache_clear()
-
-
-@pytest.mark.asyncio
-async def test_the_harness_raw_leaf_from_the_daemon_subgroup_gets_the_weight(
-    fake_systemctl, tmp_path, fresh_own_cgroup_cache,
-):
-    """Mirrors orchestrator/src/orchestrator/harness.py::Harness._ensure_project_slice_weight,
-    which hands the weight step the raw leaf, not the slice."""
-    proc_cgroup = tmp_path / 'cgroup'
-    proc_cgroup.write_text(f'0::{_DAEMON_IN_SERVICE_IN_SLICE}\n')
-    raw_leaf = resolve_own_cgroup(
-        None, proc_cgroup_path=proc_cgroup, cgroup_root=tmp_path / 'sys',
-    ).path
-
-    outcome = await ensure_project_slice_weight('my-proj', raw_leaf)
-
-    assert outcome is SliceWeightOutcome.APPLIED

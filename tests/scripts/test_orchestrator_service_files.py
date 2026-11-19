@@ -548,6 +548,16 @@ def _directives(section_lines: list[str]) -> list[str]:
     ]
 
 
+def _unit_fixture(*service_lines: str) -> str:
+    """A minimal [Service]-shaped unit carrying *service_lines*.
+
+    Shared by the ExecStart parser tests and the cgroup-placement predicate
+    tests below; each asserts only on the lines it passes in.
+    """
+    body = "\n".join(service_lines)
+    return f"[Unit]\nDescription=Fixture\n\n[Service]\nType=simple\n{body}\n"
+
+
 @pytest.mark.parametrize("unit_path", _START_LIMITED_UNITS, ids=lambda p: p.name)
 def test_start_limit_directives_under_unit_section(unit_path: pathlib.Path) -> None:
     """EXPECTED_START_LIMIT must be declared in [Unit], and no StartLimit key in [Service].
@@ -820,12 +830,6 @@ def _exec_start_config_arg(content: str, unit_name: str = "<unit>") -> str | Non
 # _SAMPLE_UNIT): both helpers take a string, so a file would add I/O without
 # adding coverage.
 # ---------------------------------------------------------------------------
-
-
-def _unit_fixture(*service_lines: str) -> str:
-    """A minimal [Service]-shaped unit carrying *service_lines*, for the parsers."""
-    body = "\n".join(service_lines)
-    return f"[Unit]\nDescription=Fixture\n\n[Service]\nType=simple\n{body}\n"
 
 
 @pytest.mark.parametrize(
