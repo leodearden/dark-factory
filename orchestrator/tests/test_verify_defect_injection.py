@@ -25,6 +25,7 @@ from unittest.mock import patch
 
 import pytest
 from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT
+from shared.defect_plugin_location import DEFECT_PLUGIN_DIR
 
 from orchestrator import verify as verify_module
 from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
@@ -39,10 +40,10 @@ from orchestrator.verify import (
     run_verification,
 )
 from orchestrator.verify_cmd import (
-    DEFECT_PLUGIN_DIR,
     DEFECT_PLUGIN_MODULE,
     ToolKind,
     apply_pytest_numprocesses,
+    carries_defect_plugin,
     parse_config_command,
     render,
     serial_pytest,
@@ -113,6 +114,28 @@ class TestWithDefectPlugin:
             cmd = with_defect_plugin(apply_pytest_numprocesses(cmd, '4'))
         assert _carries_pair(cmd.base_flags, _PLUGIN_PAIR)
         assert _carries_pair(cmd.base_flags, ('-n', '4'))
+
+
+class TestCarriesDefectPlugin:
+    @pytest.mark.parametrize('order', ['plugin_only', 'junit_after'])
+    def test_an_injected_command_carries_it_after_a_reparse(self, order):
+        cmd = with_defect_plugin(parse_config_command('pytest tests/'))
+        if order == 'junit_after':
+            cmd = with_junitxml(cmd, '/tmp/r.xml')
+        assert carries_defect_plugin(parse_config_command(render(cmd)))
+
+    def test_an_uninjected_command_does_not(self):
+        assert not carries_defect_plugin(parse_config_command('pytest -p xdist tests/'))
+
+    @pytest.mark.parametrize(
+        'raw',
+        [
+            'pytest -p _df_defect_plugin tests/ && pytest -p _df_defect_plugin other/',
+            'PYTHONPATH=src pytest -p _df_defect_plugin tests/',
+        ],
+    )
+    def test_a_command_the_mutator_cannot_rewrite_never_does(self, raw):
+        assert not carries_defect_plugin(parse_config_command(raw))
 
 
 class TestPluginLocation:
@@ -401,6 +424,7 @@ class TestVerifyLegInjectionEndToEnd:
             result, legs = _verify(worktree, _make_config(worktree), chain)
         assert result.passed, result.test_output
         assert [cmd for cmd, _ in legs] == [chain]
+        assert all('defect_plugin' not in kw for _, kw in legs), legs
         assert any(
             chain in record.getMessage() and 'collection map' in record.getMessage()
             for record in caplog.records

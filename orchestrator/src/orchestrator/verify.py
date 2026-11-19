@@ -43,6 +43,7 @@ if TYPE_CHECKING:
 
 from shared.asyncio_tasks import gather_unwound
 from shared.cgroup_slice import project_slice_name
+from shared.defect_plugin_location import DEFECT_PLUGIN_DIR
 from shared.proc_group import terminate_process_group
 from shared.psi import cpu_some10_or_none, read_psi_sample
 from shared.python_env import without_python_env_selection
@@ -103,7 +104,6 @@ from orchestrator.verify_cmd import (
     _XDIST_N_FLAGS as _XDIST_N_FLAGS,  # re-exported for test_verify_load_stamp.py
 )
 from orchestrator.verify_cmd import (
-    DEFECT_PLUGIN_DIR,
     ChainSegment,
     ToolKind,
     VerifyCmd,
@@ -111,6 +111,7 @@ from orchestrator.verify_cmd import (
     applied_worker_count,
     apply_pytest_numprocesses,
     cargo_scope,
+    carries_defect_plugin,
     govern_cpu,
     parse_config_command,
     render,
@@ -6104,6 +6105,11 @@ class _DefectPluginKw(TypedDict, total=False):
     defect_plugin: bool
 
 
+def _defect_plugin_kw(cmd: str) -> _DefectPluginKw:
+    """Ask ``_run_cmd`` for the PYTHONPATH merge exactly when *cmd* carries ``-p _df_defect_plugin``."""
+    return {'defect_plugin': True} if carries_defect_plugin(parse_config_command(cmd)) else {}
+
+
 def _match_clock_marker(line: str, cfg: ClockStopConfig) -> str | None:
     """Return 'stop', 'heartbeat', or 'start' if *line*, after stripping leading
     whitespace, STARTS WITH the respective configured marker string; else None.
@@ -7835,10 +7841,12 @@ async def run_verification(
             if segment_chained_test and label is LegSlot.TEST
             else None
         )
-        # ONE local decides both halves of the plugin injection, the `-p` pair
-        # and the PYTHONPATH merge, so they cannot disagree (decision 19).
+        # Offers each command of this leg the `-p` pair (decision 19). The
+        # PYTHONPATH merge follows from the command the offer produced
+        # (`_defect_plugin_kw`), so a command the mutator leaves alone
+        # (raw-retained, OPAQUE, not pytest) gets neither half.
         inject_defect_plugin = label is LegSlot.TEST and config.defect_tests.injects_plugin
-        _plugin_kw: _DefectPluginKw = {'defect_plugin': True} if inject_defect_plugin else {}
+        _plugin_kw: _DefectPluginKw = {}
         # junitxml injection (task μ, verify-scope-inversion-prd.md): only
         # the 'test' leg, only when it runs as one command and the junit plan
         # above gave it a path. _with_junitxml_str keeps the
@@ -7864,6 +7872,7 @@ async def run_verification(
         if inject_defect_plugin and chain_segments is None:
             cmd = _with_defect_plugin_str(cmd)
             assert cmd is not None  # None only when the input is None; guarded above
+            _plugin_kw = _defect_plugin_kw(cmd)
         # Admission gate (task 2390 T2): only the pytest ('test') leg is
         # gated by the shared.verify_admission flock semaphore + role nice
         # tier; lint/type ride alongside within the same verify, ungated.
@@ -8063,9 +8072,11 @@ async def run_verification(
                         _clear_junit_report(segment_report)
                         reported = _with_junitxml_str(segment_cmd, str(segment_report))
                         assert reported is not None  # None only for a None input
+                    segment_plugin_kw: _DefectPluginKw = {}
                     if inject_defect_plugin:
                         reported = _with_defect_plugin_str(reported)
                         assert reported is not None  # None only for a None input
+                        segment_plugin_kw = _defect_plugin_kw(reported)
                     capped = reported
                     if pytest_n_capped:
                         capped = _with_pytest_numprocesses_str(
@@ -8095,7 +8106,7 @@ async def run_verification(
                         ),
                         **_scope_kw,
                         **_clock_kw,
-                        **_plugin_kw,
+                        **segment_plugin_kw,
                     )
 
                 rc, out, timed_out_flag, segment_dicts = await _run_segmented(

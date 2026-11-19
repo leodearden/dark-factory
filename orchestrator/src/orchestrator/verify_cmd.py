@@ -46,9 +46,6 @@ import shlex
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
-from pathlib import Path
-
-import shared
 
 
 class ToolKind(StrEnum):
@@ -2248,8 +2245,6 @@ def with_junitxml(cmd: VerifyCmd, junit_path: str) -> VerifyCmd:
 
 #: The injected pytest plugin's module name (plans/defect-tests-prd.md decision 19).
 DEFECT_PLUGIN_MODULE = '_df_defect_plugin'
-#: The directory verify appends to a test leg's PYTHONPATH so ``-p _df_defect_plugin`` imports (decision 19).
-DEFECT_PLUGIN_DIR = Path(shared.__file__).parent / '_pytest_inject'
 
 
 def with_defect_plugin(cmd: VerifyCmd) -> VerifyCmd:
@@ -2264,12 +2259,15 @@ def with_defect_plugin(cmd: VerifyCmd) -> VerifyCmd:
     / KEEP_CHECK_UNSUPPORTED downstream (plans/defect-tests-prd.md B22,
     decision 2).
     """
-    if cmd.tool is not ToolKind.PYTEST or cmd.raw is not None or _carries_defect_plugin(cmd):
+    if cmd.tool is not ToolKind.PYTEST or cmd.raw is not None or carries_defect_plugin(cmd):
         return cmd
     return _append_value_flag(cmd, '-p', DEFECT_PLUGIN_MODULE)
 
 
-def _carries_defect_plugin(cmd: VerifyCmd) -> bool:
+def carries_defect_plugin(cmd: VerifyCmd) -> bool:
+    """True when *cmd* is a structured pytest command whose ``base_flags`` hold ``-p _df_defect_plugin``."""
+    if cmd.tool is not ToolKind.PYTEST or cmd.raw is not None:
+        return False
     flags = cmd.base_flags
     return any(
         flag == '-p' and value == DEFECT_PLUGIN_MODULE

@@ -24,12 +24,10 @@ from pathlib import Path
 
 import pytest
 
-import shared
+from shared.defect_plugin_location import DEFECT_PLUGIN_DIR
 from shared.defects import SideOutcome
 
 pytestmark = pytest.mark.timeout(300)
-
-_PLUGIN_DIR = Path(shared.__file__).parent / '_pytest_inject'
 
 _DEFECT_REF = 'human:20261119T000000Z:abcdef12'
 _SECOND_REF = 'human:20261119T000000Z:12345678'
@@ -118,7 +116,7 @@ def _unimportable_shared_beside(project: Path) -> Path:
 
 def _run_pytest(project: Path, *args: str) -> subprocess.CompletedProcess[str]:
     env = {k: v for k, v in os.environ.items() if k not in ('PYTEST_ADDOPTS', 'PYTHONPATH')}
-    env['PYTHONPATH'] = os.pathsep.join([str(_unimportable_shared_beside(project)), str(_PLUGIN_DIR)])
+    env['PYTHONPATH'] = os.pathsep.join([str(_unimportable_shared_beside(project)), str(DEFECT_PLUGIN_DIR)])
     return subprocess.run(
         [sys.executable, '-m', 'pytest', '-p', '_df_defect_plugin', '-p', 'no:cacheprovider', *args],
         cwd=project,
@@ -200,8 +198,53 @@ class TestMarkersAndCollectionMap:
 
 class TestPluginDirectory:
     def test_holds_only_the_plugin_module(self):
-        entries = {entry.name for entry in _PLUGIN_DIR.iterdir()} - {'__pycache__'}
+        entries = {entry.name for entry in DEFECT_PLUGIN_DIR.iterdir()} - {'__pycache__'}
         assert entries == {'_df_defect_plugin.py'}
+
+
+_CRASHING_TESTS = """\
+import os
+
+
+def test_before():
+    pass
+
+
+def test_crash():
+    os._exit(1)
+
+
+def test_after():
+    pass
+"""
+
+
+class TestACrashedRunRecordsNothing:
+    """A process that dies mid-run leaves no file, so absent keeps meaning "not recorded" under xdist too."""
+
+    def _run_crashing(self, tmp_path: Path, xdist: tuple[str, ...]) -> tuple[subprocess.CompletedProcess[str], Path]:
+        project = _write_project(
+            tmp_path / 'crash', {'pytest.ini': '[pytest]\n', 'tests/test_crash.py': _CRASHING_TESTS},
+        )
+        out = tmp_path / 'out'
+        result = _run_pytest(project, f'--df-defect-outcomes={out}/o.json', f'--junitxml={out}/r.xml', *xdist)
+        assert result.returncode != 0, result.stdout + result.stderr
+        return result, out
+
+    @pytest.mark.parametrize('xdist', [(), ('-n', '2')], ids=['serial', 'xdist'])
+    def test_a_crash_writes_neither_file(self, tmp_path, xdist):
+        result, out = self._run_crashing(tmp_path, xdist)
+        assert not (out / 'o.json').exists(), result.stdout + result.stderr
+        assert not (out / 'r.xml.tests.json').exists(), result.stdout + result.stderr
+
+    def test_an_xdist_crash_removes_a_stale_file(self, tmp_path):
+        out = tmp_path / 'out'
+        out.mkdir()
+        for name in ('o.json', 'r.xml.tests.json'):
+            (out / name).write_text('{"stale": {}}', encoding='utf-8')
+        result, out = self._run_crashing(tmp_path, ('-n', '2'))
+        assert 'crashed' in result.stdout + result.stderr
+        assert sorted(p.name for p in out.iterdir() if p.name.endswith('.json')) == []
 
 
 class TestTargetsWithoutShared:

@@ -4,7 +4,11 @@ It is the only module in a directory with no ``__init__.py``, and it imports the
 standard library and pytest only: verify puts that directory LAST on the
 target's ``PYTHONPATH``, so it is importable in a target that has no ``shared``
 installed and can shadow none of the target's own modules
-(plans/defect-tests-prd.md decision 19).
+(plans/defect-tests-prd.md decision 19). It needs pytest 7.0 or later, the
+first to export the ``pytest.CollectReport`` it checks. Exception attributes
+newer than a target's Python (``AttributeError.name`` and ``.obj`` from 3.10,
+``ImportError.name_from`` from 3.12) are read with ``getattr``, so an older
+target records fewer names rather than failing.
 
 It registers the ``defect(ref)`` and ``criterion(id)`` markers additively, so a
 target running ``--strict-markers`` accepts them and keeps its own.
@@ -58,7 +62,11 @@ carries ``workerinput``). A worker ships its part through
 ``config.workeroutput``; the writer merges every part at
 ``pytest_testnodedown`` and writes once, at its own ``pytest_sessionfinish``,
 atomically (a temporary file in the target directory, then ``os.replace``). A
-write that fails is reported as one line on stderr and never fails the run.
+worker that goes down without shipping its part (it crashed) leaves the file
+incomplete, so the writer then writes nothing and removes a stale file: an
+absent file means "not recorded" under xdist, as it does when a serial run
+crashes. A write that fails is reported as one line on stderr and never fails
+the run.
 
 NODE IDS are pytest's own, relative to the run's rootdir. A consumer that stores
 one qualifies it as ``NodeId(module_root, path, name)``.
@@ -127,17 +135,24 @@ class _HandOff:
         self._config = config
         self._key = _WORKEROUTPUT_PREFIX + name
         self._target = target
+        self._every_worker_shipped = True
         self.payload: dict[str, Any] = {}
 
     @pytest.hookimpl(optionalhook=True)
-    def pytest_testnodedown(self, node: Any, error: object) -> None:
-        self.payload.update(getattr(node, 'workeroutput', {}).get(self._key, {}))
+    def pytest_testnodedown(self, node: object, error: object) -> None:
+        part = getattr(node, 'workeroutput', {}).get(self._key)
+        if error is not None or part is None:
+            self._every_worker_shipped = False
+        else:
+            self.payload.update(part)
 
     def pytest_sessionfinish(self, session: pytest.Session) -> None:
         if _is_xdist_worker(self._config):
             self._config.workeroutput[self._key] = self.payload
-        else:
+        elif self._every_worker_shipped:
             _write_atomically(self._target, self.payload)
+        else:
+            _remove_stale(self._target)
 
 
 class _CollectionMap(_HandOff):
@@ -156,7 +171,12 @@ class _OutcomeRecorder(_HandOff):
         if decided is None or decided['side_outcome'] == 'passed':
             self.payload[item.nodeid] = _phase_record(outcome.get_result(), call)
 
-    def pytest_exception_interact(self, node: Any, call: pytest.CallInfo[Any], report: Any) -> None:
+    def pytest_exception_interact(
+        self,
+        node: pytest.Item | pytest.Collector,
+        call: pytest.CallInfo[Any],
+        report: pytest.CollectReport | pytest.TestReport,
+    ) -> None:
         if isinstance(report, pytest.CollectReport) and call.excinfo is not None:
             self.payload[node.nodeid] = _error_record(call.excinfo.value, failed=False)
 
@@ -190,10 +210,11 @@ def _structural_names(exc: BaseException) -> tuple[str | None, str | None, str |
         return exc.name, None, None
     if isinstance(exc, ImportError):
         return exc.name, getattr(exc, 'name_from', None), None
-    if isinstance(exc, AttributeError) and exc.name is not None:
-        owner = exc.obj
+    symbol = getattr(exc, 'name', None)
+    if isinstance(exc, AttributeError) and symbol is not None:
+        owner = getattr(exc, 'obj', None)
         module = owner.__name__ if isinstance(owner, types.ModuleType) else None
-        return module, exc.name, _qualified(type(owner))
+        return module, symbol, _qualified(type(owner))
     return None, None, None
 
 
@@ -254,3 +275,12 @@ def _write_atomically(target: str, payload: dict[str, Any]) -> None:
             raise
     except OSError as exc:
         sys.stderr.write(f'_df_defect_plugin: could not write {target}: {exc}\n')
+
+
+def _remove_stale(target: str) -> None:
+    try:
+        os.unlink(target)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        sys.stderr.write(f'_df_defect_plugin: could not remove stale {target}: {exc}\n')

@@ -28,8 +28,13 @@ import pytest
 from _verify_config_corpus import DF_CONFIG_PATH, load_config_scalar
 
 from orchestrator.defect_tests_config import DefectTestsConfig, DefectTestsMode
-from orchestrator.verify import _with_defect_plugin_str
-from orchestrator.verify_cmd import ChainSegment, split_and_chain_segments
+from orchestrator.verify_cmd import (
+    ChainSegment,
+    parse_config_command,
+    render,
+    split_and_chain_segments,
+    with_defect_plugin,
+)
 
 # Loaded from the COMMITTED config rather than hand-copied a third time.
 # ``test_verify_config_corpus.TestRootScalarsMatchLiveYaml`` already pins
@@ -54,9 +59,7 @@ _SEGMENT_KEYS = {
 
 def _as_the_test_leg_runs_it(command: str) -> str:
     """*command* as a segment runs it under the default defect mode: with ``-p _df_defect_plugin``."""
-    injected = _with_defect_plugin_str(command)
-    assert injected is not None  # None only for a None input
-    return injected
+    return render(with_defect_plugin(parse_config_command(command)))
 
 
 def _fleet_segments() -> list[ChainSegment]:
@@ -770,7 +773,13 @@ class TestRunVerificationSegmentChainedTestWiring:
         calls: list[dict] = []
 
         async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **_kw):
-            calls.append({'cmd': cmd, 'cwd': cwd, 'timeout': timeout, 'log_path': log_path})
+            calls.append({
+                'cmd': cmd,
+                'cwd': cwd,
+                'timeout': timeout,
+                'log_path': log_path,
+                'defect_plugin': _kw.get('defect_plugin', False),
+            })
             if run_cmd_result is None:
                 return 0, 'ok', False
             return run_cmd_result(cmd)
@@ -828,6 +837,26 @@ class TestRunVerificationSegmentChainedTestWiring:
             _as_the_test_leg_runs_it(s.command) for s in segments
         ]
         assert [c['cwd'] for c in test_calls] == [tmp_path / s.cwd_rel for s in segments]
+
+    @pytest.mark.asyncio
+    async def test_every_segment_but_the_cockpit_subshell_carries_the_plugin_and_its_path(
+        self, tmp_path,
+    ):
+        """Both halves of the injection, per segment: the `-p` pair and the PYTHONPATH merge.
+
+        The presence-guarded cockpit subshell is not structured pytest, so it
+        is left byte-identical and gets no PYTHONPATH merge either.
+        """
+        _result, calls, _runs = await self._run(
+            tmp_path, _FLEET_TEST_COMMAND, segment_chained_test=True,
+        )
+        cockpit = _cockpit_segment().command
+        test_calls = [c for c in calls if 'pytest' in c['cmd']]
+        expected = [s.command != cockpit for s in _fleet_segments()]
+
+        assert [' -p _df_defect_plugin ' in c['cmd'] for c in test_calls] == expected
+        assert [c['defect_plugin'] for c in test_calls] == expected
+        assert cockpit in [c['cmd'] for c in test_calls]
 
     @pytest.mark.asyncio
     async def test_check_run_keeps_the_original_chain_as_cmd_and_carries_segments(self, tmp_path):
