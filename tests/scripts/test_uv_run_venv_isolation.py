@@ -108,6 +108,7 @@ _EXPECTED_UV_RUN_SCRIPTS = frozenset(
         "scripts/check_dashboard_payload_budgets.sh",
         "scripts/check_sandbox_soak.sh",
         "scripts/check_write_triage_flip_preconditions.sh",
+        "scripts/deploy/install_laptop_transcript_secret_sweep.sh",
         "scripts/eval_bootstrap_smoke.sh",
         "scripts/exception-owner-sweep.sh",
         "scripts/fused-memory-duplicate-audit.sh",
