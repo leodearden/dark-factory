@@ -4802,12 +4802,13 @@ class _NightRunner:
             pass_kind=nightly.PassKind.MANUAL, recorder=self.recorder,
         )
 
-    def scheduled_night(self, day, kind, *, retry_recorder=None):
+    def scheduled_night(self, day, kind, *, invoke=None, retry_recorder=None):
         """Run night *day* as main() does for an undated run: through
-        run_scheduled_night, so any retry the backlog owes runs too."""
+        run_scheduled_night, so any retry the backlog owes runs too.
+        *invoke* replaces the kind's coder."""
         self._prepare(day, kind)
         return nightly.run_scheduled_night(
-            **self._pass_kwargs(day, on_night=day, invoke=self._coder(kind)),
+            **self._pass_kwargs(day, on_night=day, invoke=invoke or self._coder(kind)),
             recorder=self.recorder, retry_recorder=retry_recorder,
         )
 
@@ -5386,6 +5387,17 @@ def _counting_invoke(calls: list[str]):
     return _invoke
 
 
+def _ledger_census_coding(session: str) -> None:
+    session_ledger.record_codings(session_ledger.ledger_path('testproj'), [
+        session_ledger.LedgerRow(
+            session=session, instrument_version=1,
+            coded_by=session_ledger.CodedBy.CENSUS, run_ref='census-run',
+            outcome=session_ledger.Outcome.MATCHED,
+            coded_at=datetime(2026, 7, 14, 12, 0, tzinfo=UTC),
+        ),
+    ])
+
+
 def _seed_state(*, day: int, exit_code: int) -> None:
     trickle_state.record_run(
         'testproj',
@@ -5536,14 +5548,7 @@ class TestRetryPass:
 
     def test_a_retry_skips_sessions_the_ledger_already_holds(self, tmp_path):
         runner, _before = _owed_after_storm_then_productive(tmp_path)
-        session_ledger.record_codings(session_ledger.ledger_path('testproj'), [
-            session_ledger.LedgerRow(
-                session='session-13', instrument_version=1,
-                coded_by=session_ledger.CodedBy.CENSUS, run_ref='census-run',
-                outcome=session_ledger.Outcome.MATCHED,
-                coded_at=datetime(2026, 7, 14, 12, 0, tzinfo=UTC),
-            ),
-        ])
+        _ledger_census_coding('session-13')
         retry_prompts: list[str] = []
 
         result = runner.retry(13, on_night=14, invoke=_counting_invoke(retry_prompts))
@@ -5554,7 +5559,7 @@ class TestRetryPass:
 
         scheduled_prompts: list[str] = []
         runner.night(13, 'productive', invoke=_counting_invoke(scheduled_prompts))
-        assert len(scheduled_prompts) == 1, 'a scheduled pass does not skip ledgered sessions'
+        assert len(scheduled_prompts) == 1, 'a manual pass does not skip ledgered sessions'
 
     def test_a_retry_never_refires_the_barren_streak_escalation(self, tmp_path):
         runner = _NightRunner(tmp_path)
@@ -5853,6 +5858,51 @@ class TestNeverRunDates:
             )
 
         assert _testproj_state()['last_scheduled_target_date'] == '2026-07-13'
+
+
+# ---------------------------------------------------------------------------
+# task 7025: a scheduled pass over a date the schedule already reached
+# ---------------------------------------------------------------------------
+
+class TestScheduledPassOverAReachedDate:
+    """The 03:00 pass after a post-midnight catch-up re-targets the date the
+    catch-up already ran, so it skips the sessions the ledger holds."""
+
+    def test_a_scheduled_pass_re_targeting_a_reached_date_skips_ledgered_sessions(
+        self, tmp_path,
+    ):
+        runner = _NightRunner(tmp_path)
+        first: list[str] = []
+        runner.scheduled_night(13, 'productive', invoke=_counting_invoke(first))
+        assert len(first) == 1
+        again: list[str] = []
+
+        results = runner.scheduled_night(13, 'productive', invoke=_counting_invoke(again))
+
+        assert again == []
+        assert [result.exit_code for result in results] == [0] * len(results)
+        assert runner.recorded()['last_scheduled_target_date'] == '2026-07-13'
+
+    def test_a_scheduled_pass_past_the_cursor_still_codes_ledgered_sessions(
+        self, tmp_path,
+    ):
+        runner = _NightRunner(tmp_path)
+        runner.scheduled_night(13, 'productive')
+        _ledger_census_coding('session-14')
+        prompts: list[str] = []
+
+        runner.scheduled_night(14, 'productive', invoke=_counting_invoke(prompts))
+
+        assert len(prompts) == 1
+
+    def test_a_manual_pass_over_a_reached_date_still_re_codes(self, tmp_path):
+        runner = _NightRunner(tmp_path)
+        runner.scheduled_night(13, 'productive')
+        prompts: list[str] = []
+
+        runner.night(13, 'productive', invoke=_counting_invoke(prompts))
+
+        assert len(prompts) == 1
 
 
 # ---------------------------------------------------------------------------
