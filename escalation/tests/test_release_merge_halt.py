@@ -98,9 +98,11 @@ class TestReleaseMergeHalt:
         assert second is not None
         assert second.halt_released_at == first.halt_released_at
         assert second.halt_release_note == 'first'
+        assert second.updated_at == first.updated_at
         reloaded = queue.get(esc.id)
         assert reloaded is not None
         assert reloaded.halt_release_note == 'first'
+        assert reloaded.updated_at == first.updated_at
 
     def test_unknown_id_returns_none(self, tmp_path: Path):
         queue = EscalationQueue(tmp_path / 'esc')
