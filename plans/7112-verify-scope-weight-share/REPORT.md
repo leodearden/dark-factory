@@ -22,8 +22,8 @@ The question has two eras, and neither is used to refute the other:
   `3d0eed5554` first sets `-p CPUWeight`]. #5205 left the merge at 100 and only lowered task and background scopes
   to 33 and 10. So the merge's share against the units, sccache and the desktop did not change [inference].
   The record does not support the second half, that this weight split is what held reify's merge gate back. Over
-  the 147 local merges since 10-28 that could be joined to their merge-role test leg, a merge got 4.0–5.9 cores on
-  average (era p50s). The cores barely respond to host
+  the 144 flat-era local merges since 10-28 that could be joined to their merge-role test leg, a merge got 4.4–5.9
+  cores on average (era p50s). Across all 147 joined merges the cores barely respond to host
   load: about 5.5 below a runqueue ratio of 3, and 4.3–4.8 above it [record]. Latency instead moved with the merge's
   own CPU work and something besides the weight. In the same flat layout with the same weights, p50 fell from 81.5
   to 50.8 minutes between the 10-13→11-02 era and 11-16→11-19 [record].
@@ -165,7 +165,7 @@ or code change is a separate decision, and the bounding rulings are Leo's.
 |---|---|---|---|
 | Raise `df.slice` against `app.slice` | topology contract §Consequences (b) | Lifts the factory's floor against the desktop and, until 9985, against every daemon and agent. Where that split bound (07:20–07:22Z), `df.slice` got 0.51–0.77 of its 100:100 share. | Interactive work is privileged (08-03) |
 | Per-project slice weights | DF task 9984 (values), 9985 (reinstall) | Splits `df.slice` between projects. For reify's merge it is worth only what reify's slice share is worth: 2–3% of the host today, all it asked for | No weights derived from live load |
-| Merge-role sub-slice, or a lower weight on the daemon unit inside each project slice | DF task 9984 | After 9985 it decides whether a merge gets 1.50 or about 3 cores at 07:20Z demand (§2); with the daemon at 33, 3.94 × 100/199 = 1.98 [inference] | Merge verify is never throttled (09-07): this raises the merge and throttles nothing |
+| Merge-role sub-slice, or a lower weight on the daemon unit inside each project slice | DF task 9984 | After 9985 it decides whether a merge gets 1.50 or about 3 cores at 07:20Z demand (§2); with the daemon at 33, water-filling the same 07:20Z claims gives 2.10 [inference] | Merge verify is never throttled (09-07): this raises the merge and throttles nothing |
 | Weights on task verifies, background runs and services (Layout A) | reify task 8827 | 2–5 minutes on a merge verify, by the weights study's model [doc: weights `REPORT.md` §5] | Leo answered 8827 "not now" on 10-13 |
 
 **Recommendation.** 7112 is answered. Reify's merge was not weight-starved live, and in the flat era its cores were
@@ -206,8 +206,9 @@ inside each project slice when 9985 lands. Otherwise the reinstall roughly halve
   this worktree. Frames not yet checkpointed are unseen; they matter only for the last hours.
 - **A second cpu.stat reader.** The census reads `usage_usec` through its own one-line reader. The single parser for
   cgroup files is `shared/src/shared/cgroup_stats.py` (per-consumer-resource-recording PRD D7), and it belongs to
-  leaf 1 (task 10456). Leaf 1 (continuous per-consumer CPU and stall) and leaf 8 (task 10463, CPU per verify role and
-  leg) are the continuous replacement for this hand census.
+  leaf 1 (task 10456). The switch to it is filed as follow-up ticket `tkt_0RX5H1P7BAE70D75KCYHEFNE2W`, after 10456.
+  Leaf 1 (continuous per-consumer CPU and stall) and leaf 8 (task 10463, CPU per verify role and leg) are the
+  continuous replacement for this hand census.
 
 ## 8. How to re-run
 
