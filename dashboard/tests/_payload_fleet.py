@@ -977,40 +977,58 @@ def _unlanded_prd_views(payload: Mapping[str, Any], fleet: FleetCensus) -> dict[
 _UNLANDED_BY_PATH: Mapping[str, Callable[[Mapping[str, Any], FleetCensus], Mapping[str, str]]] = {
     '/api/v2/dashboard/prds': _unlanded_prd_views,
 }
-"""The swept paths whose route waits a bounded time on reads that land for the next poll.
+"""The swept paths whose route waits a bounded time on reads that land for a later poll.
 
 Each maps to what its served payload still lacks, keyed by root; empty once landed.
 """
 
 LANDING_DEADLINE_SECONDS = 120.0
-"""How long :func:`get_landed` polls before failing; well inside pytest's per-test timeout."""
+"""How long :func:`get_landed` polls before failing.
+
+Twice the slowest landing measured: a cold ``/prds`` right after app startup,
+on a host at load ~227-250 over 32 cores, landed in 47-59 s. It stays well
+inside pytest's per-test timeout.
+"""
 
 _LANDING_POLL_SECONDS = 0.05
 
 
-def get_landed(client: TestClient, entry: EndpointBudget, fleet: FleetCensus = CENSUS) -> Response:
+@dataclass(frozen=True)
+class FleetClient:
+    """A client of the real app, paired with the census the app is served from."""
+
+    client: TestClient
+    fleet: FleetCensus
+
+    def get(self, entry: EndpointBudget) -> Response:
+        """*entry*'s request, served once."""
+        return self.client.get(entry.path, params=dict(entry.query))
+
+
+def get_landed(served: FleetClient, entry: EndpointBudget) -> Response:
     """*entry*'s request as a polled dashboard serves it, once every read its route waits on has landed.
 
     A path outside :data:`_UNLANDED_BY_PATH`, or an answer other than 200, is
     returned from the first request. Otherwise the request is repeated until
     nothing is unlanded, and that response is returned. A shielded read lands
-    for the next poll however loaded the host is, so one still unlanded at
-    :data:`LANDING_DEADLINE_SECONDS` never will.
+    eventually, typically by the next poll; under heavy load a cold request
+    can take many polls (see :data:`LANDING_DEADLINE_SECONDS`).
     """
     unlanded_in = _UNLANDED_BY_PATH.get(entry.path)
     deadline = time.monotonic() + LANDING_DEADLINE_SECONDS
     while True:
-        resp = client.get(entry.path, params=dict(entry.query))
+        resp = served.get(entry)
         if unlanded_in is None or resp.status_code != 200:
             return resp
-        unlanded = unlanded_in(resp.json(), fleet)
+        unlanded = unlanded_in(resp.json(), served.fleet)
         if not unlanded:
             return resp
         if time.monotonic() >= deadline:
             raise AssertionError(
-                f'{entry.url_suffix()}\'s waited reads never landed within '
-                f'{LANDING_DEADLINE_SECONDS:.0f}s. That is fixture rot or a read that never '
-                'completes, not host load. Still unlanded:\n'
+                f'{entry.url_suffix()}\'s waited reads did not land within '
+                f'{LANDING_DEADLINE_SECONDS:.0f}s, twice the slowest landing measured on a '
+                'host at load ~250. Suspect fixture rot, or a read that never completes, before '
+                'host load. Still unlanded:\n'
                 + '\n'.join(f'  {label}: {why}' for label, why in sorted(unlanded.items()))
             )
         time.sleep(_LANDING_POLL_SECONDS)
@@ -1024,7 +1042,7 @@ def _clear_caches() -> None:
 
 
 @contextmanager
-def open_fleet_client(fleet: FleetCensus = CENSUS) -> Iterator[TestClient]:
+def open_fleet_client(fleet: FleetCensus = CENSUS) -> Iterator[FleetClient]:
     """The real app, configured over the fleet's roots and answered from the fleet.
 
     The config is installed inside the ``TestClient`` context, as
@@ -1058,7 +1076,7 @@ def open_fleet_client(fleet: FleetCensus = CENSUS) -> Iterator[TestClient]:
             try:
                 with TestClient(app) as client:
                     app.state.config = config
-                    yield client
+                    yield FleetClient(client, fleet)
             finally:
                 _clear_caches()
         assert not substrate.refused(), (
