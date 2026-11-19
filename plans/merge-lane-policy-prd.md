@@ -139,15 +139,21 @@ serial-laptop policy value is NOT added (Leo: straight to K = hosts + 1).
 "not speculative AND another entry is in the verify frontier → None". `_adopt_head_on_tip_authority` tolerates
 the chained item being the head (it currently excludes the tip's own entry and cancels `_inflight[0]`).
 
-**D6. Retry by bisect with a suspect list.** `_chain_halving_state: int | None` becomes a suspect list
-(ordered task ids of the links of the last failed tip). On a tip fail at built depth k: requeue the k links at
-the FRONT in aging-key order, suspects := those links, cancel stacked successors and requeue their items
-behind the links. The next dispatch, while suspects exist, verifies the first ⌈|suspects|/2⌉ suspects as a
-chain; a passing half lands and is removed; a failing half becomes the new suspect set; a lone failing suspect
-is blocked with its findings. Full depth resumes only when no suspects remain. `next_halving_state` is retired.
+**D6. A red chain marks its members, and each verifies alone.** Amended 2026-11-18, Leo's ruling on
+esc-8528-11: the un-chained mark of tasks 10617/10723 owns red-chain isolation; the suspect bisect is retired.
+Evidence: plans/8528-unchained-mark-study-2026-11-18/REPORT.md. On a tip fail the owner and every built link
+are marked (`worker.py::_next_dispatch_unchained`) and the owner is requeued. A marked task is neither a chain
+owner nor a link, so its next verify covers its own tree alone and the verdict is its own: a passer lands and
+the red one is blocked with its findings. The mark is removed only when the task's request is retired (landed,
+blocked or dropped; `worker.py::_retire_item`). Requests that are not marked keep chaining at the depth D7
+gives. A chain verify that raises marks its owner the same way. `_chain_halving_state`, `select_chain_depth`
+and `next_halving_state` are retired. (D6 as first ruled, a suspect list searched by halving, never landed.)
 
 **D7. Depth from a rolling pass-rate estimate, no fixed cap.** p̂ = per-item pass estimate from the last 30
-FRESH tip verdicts (bisect rounds excluded), p̂ = pass_rate^(1/mean k). Depth table: 8 if p̂ ≥ 0.93, 4 if
+tip verdicts of the rounds the policy sized, p̂ = pass_rate^(1/mean k). A round the policy did not size (a
+marked task's verify alone, a dispatch that may not chain, the kill switch) is not counted, by the live fold
+or by the start-up seed. An empty window, including after a seed that failed, has no p̂ and takes the table's
+first row (`chain_depth_reason.basis` `no_estimate`). Depth table: 8 if p̂ ≥ 0.93, 4 if
 ≥ 0.85, 2 if ≥ 0.75, else 1; capped only by queue depth. The table is a config list
 (`merge_deep.depth_table: [[0.93, 8], [0.85, 4], [0.75, 2]]`, green-tier) so the readout (leaf ι) can extend
 it past 8 once the per-item chain wall is measured at depth ≥ 8 (today measured only at k ≤ 2). The first
@@ -156,7 +162,8 @@ on), documented as such; 3191 ("promote chain_cap 6 → 32") is cancelled by dec
 predicate stays (it reads gates per landing and chain-attributed reds, both still meaningful).
 (Superseded 2026-11-17 by Leo's ruling: task 3190 is cancelled. Its figures, and a check on deep-chain verify
 duration against the merge wall, move into ι's readout, task 8532; human gate 7860 now waits on 8532.)
-`chain_depth_reason` on `merge_verify` records p̂, the row chosen, the queue depth and the suspect state.
+`chain_depth_reason` on `merge_verify` records p̂, the row chosen and the queue depth; it is null when the
+policy did not size the round.
 
 **D8. Direct commits meet the merge gate's checks before they land.** `hooks/project-checks` (main-only
 tier) gains two legs: (a) for every staged file, the per-module `lint_command` and `type_check` of the module
@@ -220,7 +227,7 @@ slot_available`; `types.py::InflightEntry.vacated`; `gates.py::_reverify_rebased
 `verify_plan.py::effective_merge_module_configs`; `verify.py::run_main_tip_sweep`; `config.py::MergeDeepConfig`
 (`chain_cap`, `chain_build_timeout_secs`); `hooks/project-checks` (`PYRIGHT_PACKAGES`, the staged-file
 tiers). Novel substrate introduced here, each owned by a leaf: `on_base_invalidated` (β),
-`merge_deep.depth_table` (ζ), the suspect-list state (ζ), the gate-rebased `RealMergeItem` path (γ), the new
+`merge_deep.depth_table` (ζ), the pass-estimate window (ζ), the gate-rebased `RealMergeItem` path (γ), the new
 event fields (α), `scripts/merge_screen.yaml` if absent (η). Nothing assumes κ/λ (D11).
 
 Prerequisite tasks: 7720 (chain links are popped by the look-ahead during a tip verify) before ε/ζ. Tasks 7721
@@ -268,9 +275,11 @@ Successors already in `_inflight` on the dead commit are re-anchored through `ch
 `verified_pending_landing`; landing needs no lease; a gate re-verify or probe calls `HostAllocator.acquire`
 anew. K = `1 + runners + 1`. Invariant: `len(frontier entries with lease) ≤ hosts`, `len(frontier) ≤ K`.
 
-**Depth and suspects:** `ChainPolicyState(suspects: list[task_id], recent: deque[(k, passed)])`;
-`choose_depth(state, queue_len, depth_table) -> (k, reason)`; `on_tip_result(state, links, passed)`.
-Pure; `_chain_halving_state` and `next_halving_state` deleted.
+**Depth:** `ChainPolicyState(recent: tuple[TipVerdict, ...])`;
+`choose_depth(state, queue_depth, depth_table) -> (k, ChainDepthReason)`;
+`on_tip_result(state, depth, passed)`. Pure (`merge_lane/chain_policy.py`); `_chain_halving_state` and
+`next_halving_state` deleted. With an empty `recent`, `choose_depth` returns the table's first row, bounded by
+the queue, with basis `no_estimate`. Red-chain isolation is not policy state: it is the un-chained mark (D6).
 
 **Events (D10):** field names as listed; `merge_verify_cancelled{task_id, elapsed_ms, fraction, cause}`;
 `verdict_voided{..., item_commit, killer}`; `merge_finalized{..., queue_to_land_secs}`. Consumers:
@@ -292,8 +301,8 @@ module and command named. The screen leg runs `scripts/merge_screen.yaml`'s node
 | 4 | permit conservation across a cascade re-anchor | ledger depth K | `speculation_accounting_violations` empty after 100 randomized cascades (property test) |
 | 5 | laptop finishes B while local head A still verifies | K = 3 | laptop lease released at B's verdict; C dispatched to the laptop stacked on B; B lands after A with no gate |
 | 6 | gate re-verify needs a host while both are busy | | A″ waits for a host (no deadlock: it is at the front of redispatch) and takes the first free one |
-| 7 | chain of 4 fails at the tip | suspects empty before | links requeued at the front in aging order; suspects = 4; next dispatch verifies 2; on pass they land and suspects = 2; on the next fail of 1, the lone suspect is blocked with findings |
-| 8 | p̂ crosses a depth-table boundary | 30 fresh verdicts | the next dispatch's `chain_depth_reason` names the new row; `chain_cap: 0` disables chaining regardless of the table |
+| 7 | chain of 4 fails at the tip | no task marked before | all four are marked; each next verifies alone; the passers land and the red one is blocked alone with its findings; afterwards the lane chains again at table depth |
+| 8 | p̂ crosses a depth-table boundary | 30 verdicts in the window | the next dispatch's `chain_depth_reason` names the new row; `chain_cap: 0` disables chaining regardless of the table |
 | 9 | head alone in the frontier, queue ≥ 2 | D5 | the head itself chains (`chain_items > 1` on a non-speculative dispatch) |
 | 10 | staged `scripts/foo.py` with a type error, commit on main | hook installed | commit refused naming `module:scripts:type`; `--no-verify` still lands it |
 | 11 | staged `plans/x.capability-manifest.yaml` naming a script that does not exist | | commit refused by the screen leg naming the manifest test |
@@ -345,9 +354,10 @@ is not used (this is not a quality-instrument remediation).
   is paused can chain a head with the inline build and the warm pool; set reify's `chain_cap: 0` if that
   matters before 7721 and 7824 land.
 
-- **ζ — Suspect-list bisect, depth table, chain_cap as kill switch; cancel 3191** (intermediate;
+- **ζ — Depth table, chain_cap as kill switch, halving state deleted; cancel 3191** (intermediate;
   `worker.py`, `config.py`, yaml comment, docs; ~700 LOC). Unlocks ι. Signal: boundary rows 7, 8;
-  `chain_depth_reason` on live rows. Prereqs: ε.
+  `chain_depth_reason` on live rows. Prereqs: ε. Amended 2026-11-18 with D6: the suspect-list bisect is not
+  part of ζ.
 - **η — Hook parity with the merge gate's module checks, plus the screen leg for tree-read files** (leaf;
   `hooks/project-checks`, `scripts/hook_module_checks.py`, `scripts/merge_screen.yaml` if absent,
   `tests/scripts/test_hook_pyright_packages_drift.py` rewritten; ~400 LOC). Signal: boundary rows 10, 11
@@ -364,8 +374,9 @@ is not used (this is not a quality-instrument remediation).
 - **Closing actions at decompose:** 5056 → done (measurement = the report), 5098 → done (this PRD), 3191 →
   cancelled (D7), 7829 → cancelled (superseded by ι's deploy; 3190 re-pointed to depend on ι instead).
 
-G7 walk (advisory, author mode): `holds-owned-and-bounded` — the suspect list is bounded by the failed tip's
-depth and cleared on resolution; a re-anchored item that never lands is bounded by INV-3 and the existing
+G7 walk (advisory, author mode): `holds-owned-and-bounded` — the un-chained mark is held per task and cleared
+when the task's request is retired (D6), and the pass-estimate window holds at most 30 verdicts; a
+re-anchored item that never lands is bounded by INV-3 and the existing
 no-progress abort. `status-matches-liveness` — releasing the lease at verdict leaves `InflightEntry.status`
 naming "verified, awaiting landing", written by the same choke point. `no-silent-fail-soft` — a re-anchor that
 falls to main records its reason on the item and the event. `contracts-machine-checked` — the depth table is a
@@ -381,8 +392,10 @@ definition for phantom heads (the §5.3 "separate task"); the pre-verify screen'
 
 ## 10. Open questions (tactical)
 
-1. **Where p̂'s 30-verdict window persists across restarts.** Suggested: in-memory, seeded from the last 30
-   `merge_verify` rows at start (the probe's `_recent_verify_outcomes` shape). Decide in ζ.
+1. **Where p̂'s 30-verdict window persists across restarts.** DECIDED in ζ (task 8528): in memory, seeded at
+   worker start from the newest `merge_verify` rows of every run, keeping only the rounds the policy sized
+   (and rows written before the policy existed) and the last attempt per merge commit. See
+   `orchestrator/src/orchestrator/merge_lane/chain_policy.py::seed_from_rows`.
 2. **Whether the gate-rebased item (γ) prefers the head's previous host.** DECIDED in γ (task 8525): no
    head-host preference. The rebased head is dispatched like any item, through `HostAllocator.acquire`
    with the configured `verify_host_policy`. See

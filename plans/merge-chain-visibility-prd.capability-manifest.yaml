@@ -59,11 +59,14 @@ tasks:
           reason: "Rendering states pinned by L3, L4 and the jsdom states; the flag text is interim (γ replaces it), so a text grep would pin a copy γ retires."
   - label: "β"
     task_id: 10759
-    title: "Record merge-chain rounds and culprit searches as events"
+    title: "Record merge-chain rounds and isolations as events"
     note: "Fix at decompose: ChainDepthBasis lives in orchestrator merge_verify_facts.py on 8528's branch and shared never imports orchestrator, so β moves the enum into shared (one home) for merge_chain.py's basis field."
     capabilities:
-      - name: "depth-policy-and-suspects"
-        binding: "producer:task-8528 upstream (ChainDepthBasis, choose_depth, _set_chain_policy, _note_tip_result, _is_code_verdict, chain_policy.py, the reservation context managers)"
+      - name: "depth-policy"
+        binding: "producer:task-8528 upstream (ChainDepthBasis with no_estimate and pass_estimate only, ChainDepthReason, choose_depth, _is_code_verdict, chain_policy.py; suspect search removed by Leo's esc-8528-11 ruling, 2026-11-18)"
+        verdict: PASS
+      - name: "unchained-mark"
+        binding: "`grep:orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker._retire_item` clears the mark set in _run_inflight_verify's red-tip arm (tasks 10617, 10723, done); an isolation is the members one red tip marks"
         verdict: PASS
       - name: "red-tip-and-finally-sites-settled-first"
         binding: "producer:task-10624 upstream; producer:task-10721 upstream (same worker.py sites: red-tip exit, _run_inflight_verify's finally, _deep_chain_placement)"
@@ -102,7 +105,7 @@ tasks:
         verdict: PASS
         delivered_check:
           kind: grep
-          pattern: "^class (ChainRoundStarted|ChainRoundSettled|ChainSearchSettled|ChainRecordRejected)\\b"
+          pattern: "^class (ChainRoundStarted|ChainRoundSettled|ChainIsolationSettled|ChainRecordRejected)\\b"
           paths: ["shared/src/shared/merge_chain.py"]
           expect: present
       - name: "ledger"
@@ -114,7 +117,7 @@ tasks:
           paths: ["orchestrator/src/orchestrator/merge_lane/chain_rounds.py"]
           expect: present
       - name: "chain-event-types"
-        binding: "built here: merge_chain_round_started, merge_chain_round_settled, merge_chain_search_settled, merge_chain_record_rejected in EventType wherever it lives at dispatch"
+        binding: "built here: merge_chain_round_started, merge_chain_round_settled, merge_chain_isolation_settled, merge_chain_record_rejected in EventType wherever it lives at dispatch"
         verdict: PASS
         delivered_check:
           kind: grep
@@ -160,7 +163,7 @@ tasks:
         binding: "producer:task-α upstream (data/merge_chains.py, merge_chains.jsx, shared/tests/fixtures/merge_queue_snapshot_chain.json)"
         verdict: PASS
       - name: "policy-state"
-        binding: "producer:task-8528 upstream (merge_lane/chain_policy.py::ChainPolicyState, depth_table, suspects)"
+        binding: "producer:task-8528 upstream (merge_lane/chain_policy.py::ChainPolicyState, depth_table)"
         verdict: PASS
       - name: "snapshot-and-in-flight-derivation"
         binding: "`grep:orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker.snapshot` `grep:orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker._verifies_in_flight` `grep:orchestrator/src/orchestrator/merge_lane/types.py::VerifyInFlight`"
@@ -206,46 +209,11 @@ tasks:
         delivered_check:
           kind: manual
           reason: "L5 asserts the decided member renders; the retired flag's wording is α's choice, so an absent-grep would pin unknown text."
-  - label: "δ"
-    task_id: 10760
-    title: "Count bisect rounds apart in chain telemetry"
-    capabilities:
-      - name: "shared-telemetry-module-and-card"
-        binding: "producer:task-10621 upstream (summarize_chain_telemetry moved to shared/src/shared/chain_telemetry.py; the Deep chains card)"
-        verdict: PASS
-      - name: "basis-on-merge-verify"
-        binding: "producer:task-8528 upstream (merge_verify.chain_depth_reason.basis; ChainDepthBasis.BISECT == 'bisect')"
-        verdict: PASS
-      - name: "digest-and-throughput-script"
-        binding: "`grep:orchestrator/src/orchestrator/digest.py` `grep:scripts/merge_lane_throughput.py` `grep:scripts/tests/test_chain_telemetry_agreement.py`"
-        verdict: PASS
-      - name: "bisect-split-in-shared-module"
-        binding: "built here: ChainTelemetry gains bisect_rounds and bisect_red"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "bisect_rounds"
-          paths: ["shared/src/shared/chain_telemetry.py"]
-          expect: present
-      - name: "throughput-script-uses-shared-split"
-        binding: "built here: scripts/merge_lane_throughput.py prints the bisect count from the shared function"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "bisect_rounds"
-          paths: ["scripts/merge_lane_throughput.py"]
-          expect: present
-      - name: "agreement-test-covers-bisect"
-        binding: "built here: the agreement test gains a bisect row"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "bisect"
-          paths: ["scripts/tests/test_chain_telemetry_agreement.py"]
-          expect: present
+  # δ (task 10760, "Count bisect rounds apart in chain telemetry") withdrawn 2026-11-18 by Leo's ruling on
+  # esc-8528-11: 8528 has no bisect rounds. Task 10760 cancelled; its three delivered checks retired with it.
   - label: "ε"
     task_id: 10762
-    title: "Show chain rounds and culprit searches in a Chain rounds panel"
+    title: "Show chain rounds and isolations in a Chain rounds panel"
     capabilities:
       - name: "runs-read-model"
         binding: "producer:task-9852 upstream (shared/src/shared/runs_read/merge_lane.py, OUTCOME_FAMILY, OutcomeFamily, contract rows); producer:task-9800 upstream (shared.runs_read RunsQuery, orchestrator/tests/test_runs_read_contract.py)"

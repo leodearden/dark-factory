@@ -80,6 +80,12 @@ from orchestrator.main_health_fix_owner import (
     build_main_fix_task_arguments,
     ensure_main_fix_owner,
 )
+from orchestrator.merge_lane.chain_policy import (
+    ChainPolicyState,
+    choose_depth,
+    on_tip_result,
+    seed_from_rows,
+)
 from orchestrator.merge_lane.chain_reservation import ChainReservations
 from orchestrator.merge_lane.coalesce_unwind import restore_pre_stack_tips
 from orchestrator.merge_lane.dead_base_ledger import (
@@ -200,12 +206,14 @@ from orchestrator.merge_lane.tip_relation import (
 from orchestrator.merge_lane.train_selection import select_train_members
 from orchestrator.merge_lane.types import (
     CHAIN_FAULT_REASONS,
+    NO_DEEP_PLACEMENT,
     UNTRACKED_HOST_WIRE,
     CapPermit,
     ChainResult,
     ChainTruncationReason,
     Decided,
     DecidedItem,
+    DeepPlacement,
     EscalationRecord,
     GroupMergeRequest,
     InflightEntry,
@@ -264,6 +272,7 @@ from orchestrator.merge_lane.verify_cancellation import (
 from orchestrator.merge_pool_facts import with_chain_members
 from orchestrator.merge_verify_facts import (
     BaseRelation,
+    ChainDepthReason,
     MergeVerifyDispatchFacts,
     RunnerReason,
     classify_base_relation,
@@ -357,6 +366,11 @@ When the branch tip advances during verify (tip-advanced pathology), the worker
 auto-chains a gen-(n+1) MergeRequest for the delta.  After this many consecutive
 advances the chain is broken and the request is escalated to humans via a 'blocked'
 outcome using the :data:`POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX`.  Not configurable."""
+
+#: How many of the newest ``merge_verify`` rows seed the deep chain policy's
+#: pass-estimate window at start: room for the retry attempts and unsized rows
+#: orchestrator/src/orchestrator/merge_lane/chain_policy.py::seed_from_rows skips.
+CHAIN_POLICY_SEED_ROWS = 300
 
 _DEAD_BASE_COMMITS_CAP = 256
 """FIFO cap for the INV-3 dead-base ledger (``_dead_base_commits``).
@@ -5106,7 +5120,7 @@ async def build_chain(
     Note the UNIT CONVERSION at that seam: the caller's policy counts ITEMS
     IN THE CHAIN (the dispatching item is #1) while ``cap``/``target_depth``
     here count ADDITIONAL LINKS BEYOND ``head_merge_commit``, so the gate
-    passes ``cap - 1`` / ``d - 1``.
+    passes ``d - 1`` for both.
 
     Building a chain still LANDS nothing here.  A green tip is adopted one
     layer up, by :meth:`SpeculativeMergeWorker._land_chain_prefix` (task 3186,
@@ -5160,9 +5174,12 @@ async def build_chain(
             confirmed to be checked out there before anything is merged;
             otherwise the result is empty with
             ``truncated_reason='lane_base_mismatch'``.
-        cap: Hard ceiling from ``MergeDeepConfig.chain_cap``.  ``0`` is the
-            kill switch.  Keyword-only, so a call site can never transpose it
-            with *target_depth*.
+        cap: Hard ceiling on the links: the depth *d* that
+            :func:`~orchestrator.merge_lane.chain_policy.choose_depth` chose
+            via :meth:`SpeculativeMergeWorker._deep_chain_placement`, minus
+            one.  ``chain_cap`` bounds nothing here; it is only the kill
+            switch, read before this call.  Keyword-only, so a call site can
+            never transpose it with *target_depth*.
         target_depth: How deep this round actually wants to go.
         verify_is_local: Whether the chain tip will be verified on this host,
             from the dispatch's host lease.  It decides which lane the chain is
@@ -7613,21 +7630,14 @@ def select_probe_depth(
 
 # ── deep merge-ahead (PRD γ, task 3185): the SECOND second-slot policy ───────
 #
-# Sibling of select_probe_depth() above: same shape (module-level, pure, knob
-# guard first, `None` == "do nothing this round"), different question.  The
-# probe only RELABELS a dispatch's depth/base attribution; these two decide
-# whether the dispatch is REDIRECTED onto a deep chain tip, and how the
-# halving bisector reacts to the resulting verdict.  Their stateful
-# counterparts are SpeculativeMergeWorker._deep_chain_placement (which owns
-# the live queue length and the git work) and _note_chain_outcome (which owns
-# the live halving state).
-#
-# UNIT — every depth here is a 1-INDEXED COUNT OF ITEMS IN THE CHAIN, where
-# item #1 is the dispatching slot-2 item itself.  So `d == 1` means "a chain
-# consisting of the dispatching item alone", which IS today's adjacent
-# speculative verify.  build_chain()'s own `cap`/`target_depth` are in the
-# different "additional links BEYOND the dispatching item" unit, which is why
-# _deep_chain_placement passes `cap - 1` / `d - 1` (see its docstring).
+# Whether a dispatch may chain at all.  How deep it chains is
+# merge_lane/chain_policy.py; the stateful side is
+# SpeculativeMergeWorker._deep_chain_placement and _note_tip_result.
+
+
+def _is_code_verdict(out: object) -> bool:
+    """Whether a verify's result is a verdict about the code; a low-disk skip is not."""
+    return not (isinstance(out, MergeOutcome) and out.verify_skipped)
 
 
 def may_chain(*, speculative: bool, frontier_depth: int | None) -> bool:
@@ -7637,112 +7647,6 @@ def may_chain(*, speculative: bool, frontier_depth: int | None) -> bool:
     *frontier_depth* of ``None`` is unknown and never licenses a non-speculative chain.
     """
     return speculative or frontier_depth == 0
-
-
-def select_chain_depth(
-    chain_cap: int,
-    queue_len: int,
-    halving_state: int | None,
-) -> int | None:
-    """Decide how deep THIS second-slot dispatch should chain (PRD γ).
-
-    Implements the PRD §Contract dispatch invariant ``target_depth =
-    min(len(queue), cap, halving_state)`` plus its gates.  Returns the
-    1-indexed chain depth to target, or ``None`` meaning **"no chain this
-    round — take today's adjacent-verify path, unchanged"**.
-
-    Order of checks:
-
-      1. ``chain_cap <= 0`` -> ``None`` unconditionally.  This is α's shipped
-         kill switch (``MergeDeepConfig.chain_cap`` defaults to 0), so under
-         stock config every call returns ``None`` regardless of the other
-         arguments.  Note the CALLER
-         (:meth:`SpeculativeMergeWorker._deep_chain_placement`) hoists this
-         same guard a layer up so the O(n) queue scan is skipped too — the
-         kill switch must cost nothing, not merely do nothing.
-      2. ``queue_len < 2`` -> ``None``.  The PRD's ``queue >= 2`` gate: with
-         only the dispatching item available there is nothing to chain ONTO
-         it, so a chain would be a strictly more expensive spelling of the
-         adjacent verify.
-      3. ``target = min(queue_len, chain_cap, halving_state)``, where a
-         ``halving_state`` of ``None`` (the reset sentinel — never failed, or
-         just reset by a pass) drops out of the ``min`` entirely and the
-         result is ``min(queue_len, chain_cap)``.  Storing ``None`` rather
-         than the literal ``min(queue, cap)`` at pass time is deliberate: the
-         target is recomputed at EVERY dispatch, so the sentinel evaluates to
-         a FRESH ``min`` against the queue length as it is now, instead of
-         freezing a length that may be stale by the next round.
-      4. ``target < 2`` -> ``None``: the **d=1 floor**.  A one-item chain is
-         today's adjacent verify, so rather than build one the gate declines,
-         and NO chain code executes at all.  That is what makes the PRD's
-         "the floor is byte-identical to today's adjacent verify" claim true
-         BY CONSTRUCTION rather than by careful mimicry of the ordinary path.
-
-    Pure/synchronous — no I/O, no clock, no RNG, no worker state; callable
-    with no running event loop.
-
-    Args:
-        chain_cap: ``MergeDeepConfig.chain_cap``, read live off the
-            dispatching item's config.  ``0`` is the kill switch.
-        queue_len: 1-indexed count of chainable items INCLUDING the
-            dispatching item (i.e. ``1 + len(chain_snapshot())``).
-        halving_state: The bisector's current state — ``None`` for
-            reset/never-failed, else the depth ceiling
-            :func:`next_halving_state` last produced.
-
-    Returns:
-        The 1-indexed target chain depth (``>= 2``), or ``None`` for
-        "no chain this round".
-
-    See ``plans/deep-merge-ahead-prd.md`` decision 5 and §Contract.
-    """
-    if chain_cap <= 0:
-        return None
-    if queue_len < 2:
-        return None
-    target = min(queue_len, chain_cap)
-    if halving_state is not None:
-        target = min(target, halving_state)
-    if target < 2:
-        return None
-    return target
-
-
-def next_halving_state(passed: bool, dispatched_depth: int) -> int | None:
-    """Fold a deep-tip verdict into the halving bisector (PRD γ, decision 5).
-
-    A deep chain that FAILS says nothing about WHICH item in the chain broke,
-    so the policy bisects: halve the depth ceiling and try again, walking
-    (for example) 6 -> 3 -> 1, at which point :func:`select_chain_depth`'s
-    ``< 2`` floor declines to chain and the pipeline is back on its ordinary
-    one-item-at-a-time path — which does isolate the bad item, via the normal
-    sequential verify.  A chain that PASSES clears the suspicion entirely, so
-    the state resets.
-
-      * ``passed=False`` -> ``max(1, dispatched_depth // 2)``.  The ``max(1,
-        ...)`` floor is load-bearing: without it a fail at depth 1 would
-        produce ``0``, which :func:`select_chain_depth` would then ``min``
-        into every future round and the feature would be permanently, and
-        silently, off.
-      * ``passed=True`` -> ``None``, the reset sentinel (see
-        :func:`select_chain_depth` check 3 for why ``None`` rather than the
-        literal ``min(queue, cap)``).  PRD decision 5 says **any** pass
-        resets, not only a deep tip pass — and that breadth is what lets the
-        walk climb back out at all, since once the floor declines to chain
-        there are no more tip verdicts to reset on.  See
-        :meth:`SpeculativeMergeWorker._note_chain_outcome`'s two call sites.
-
-    *dispatched_depth* must be the depth ACTUALLY BUILT
-    (``1 + len(chain.links)``), never the target that was requested:
-    ``build_chain`` truncates on conflict/train/already-merged, so halving off
-    a 6-target that only built 2 links would punish the round by dropping
-    straight to 3 for a chain that was never 6 deep.
-
-    Pure/synchronous — no I/O, no clock, no worker state.
-    """
-    if passed:
-        return None
-    return max(1, dispatched_depth // 2)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -8817,20 +8721,10 @@ class SpeculativeMergeWorker:
         # speculative items (see _probe_verify_placement); a non-speculative
         # (head trust-anchor) dispatch never consumes a probe round.
         self._probe_round_counter: int = 0
-        # task 3185 (PRD γ, decision 5): the deep merge-ahead HALVING
-        # BISECTOR state -- the live counterpart to the pure
-        # select_chain_depth()/next_halving_state() pair, and the SECOND
-        # piece of second-slot policy state to live in this block. `None` is
-        # the RESET sentinel (never failed, or just cleared by a passing
-        # chain); an int is the depth ceiling a preceding deep-tip FAIL
-        # halved us down to. Mutated in exactly one place,
-        # _note_chain_outcome(); read only via _deep_target_depth().
-        # Deliberately NOT the literal min(queue, cap) frozen at pass time --
-        # see select_chain_depth()'s check 3 for why a sentinel re-evaluated
-        # at dispatch time beats a stale integer. Init-None also means a
-        # restarted worker never inherits phantom suspicion, matching
-        # _recent_verify_outcomes' empty-at-construction rationale above.
-        self._chain_halving_state: int | None = None
+        # The deep policy's pass-estimate window (merge_lane/chain_policy.py).
+        # In memory only: seed_chain_policy() refills it from the event store
+        # at start, and _note_tip_result() appends each sized verdict.
+        self._chain_policy: ChainPolicyState = ChainPolicyState()
 
     # ── MQ-reliability kappa (task 2169): ItemLifecycle chokepoint helpers ──
     # register/transition/retire an item's lifecycle state + the lockstep
@@ -11133,76 +11027,39 @@ class SpeculativeMergeWorker:
         n_failed = sum(1 for passed in self._recent_verify_outcomes if not passed)
         return n_failed / len(self._recent_verify_outcomes)
 
-    # ── deep merge-ahead halving state (PRD γ, task 3185) ────────────────────
+    # ── deep merge-ahead chain policy (task 8528) ────────────────────────────
     #
-    # The stateful counterparts to the module-level select_chain_depth() /
-    # next_halving_state() pair, in the same relationship the two methods
-    # immediately above have to select_probe_depth(): the pure functions hold
-    # the policy, these hold the live state and do nothing else.  Both are
-    # pure/synchronous so they are callable from unit tests with no running
-    # loop and from the dispatch hot path with no await point.
+    # The stateful side of merge_lane/chain_policy.py: these hold the live
+    # ChainPolicyState and do nothing else.
 
-    def _note_chain_outcome(self, passed: bool, depth: int) -> None:
-        """Fold ONE deep-tip verdict into the halving bisector.
+    def _note_tip_result(
+        self,
+        reason: ChainDepthReason | None,
+        built_depth: int,
+        out: MergeOutcome | None,
+    ) -> None:
+        """Fold the verdict of one verify over *built_depth* items into the
+        chain policy, when the deep policy sized the round (*reason*, its
+        dispatch-time decision) and *out* is a verdict about the code."""
+        if reason is None or not _is_code_verdict(out):
+            return
+        self._chain_policy = on_tip_result(self._chain_policy, built_depth, out is None)
 
-        The **single mutation chokepoint** for
-        :attr:`_chain_halving_state`: nothing else in this class assigns to
-        it, so the whole bisector policy is auditable at
-        :func:`next_halving_state` plus this one line.  Same role
-        :meth:`_record_verify_outcome` plays for the probe's rolling window.
-
-        *depth* must be the depth ACTUALLY BUILT (``1 + len(chain.links)``),
-        never the target that was requested — ``build_chain`` truncates, and
-        halving off an unbuilt target would punish a round for depth it never
-        reached.  See :func:`next_halving_state`.
-
-        Deliberately touches NOTHING else.  In particular it does not append
-        to :attr:`_recent_verify_outcomes` and does not advance
-        :attr:`_probe_round_counter`: the deep policy and the speculation
-        probe are independent second-slot policies that happen to share this
-        block, and a deep outcome silently perturbing the probe's cadence or
-        flake-rate suppression would couple them invisibly.
-
-        TWO call sites, both in :meth:`_run_inflight_verify` and both exactly
-        once per dispatch:
-
-          * the CHAIN arm — once per dispatched chain, at the point the tip
-            verdict is known, with the built depth;
-          * the d=1 FLOOR's reset arm — a PASSING slot-2 verify on a round
-            that built no chain, folded at ``depth=1``.  That is truthful
-            rather than a placeholder: at the floor the tree that ran IS a
-            one-item chain.  It is also the ONLY way the walk climbs back out
-            (see that arm's block comment), because a chain outcome alone can
-            only ever push the bisector down.
-
-        Everything else must NOT call this.  In particular a FAILING non-chain
-        round must not: PRD decision 5 scopes the halve to a deep TIP fail,
-        and halving off ordinary red branches would pin the bisector at the
-        floor without a single chain having failed.  A round declined by the
-        kill switch never reaches either site at all.
-
-        Pure/synchronous (no await, no I/O).
-        """
-        self._chain_halving_state = next_halving_state(passed, depth)
-
-    def _deep_target_depth(self, cap: int, queue_len: int) -> int | None:
-        """Return this round's target chain depth, or ``None`` for no chain.
-
-        Composes the live :attr:`_chain_halving_state` with the pure
-        :func:`select_chain_depth` policy and **delegates** rather than
-        re-deriving the ``min(queue_len, cap, halving_state)`` invariant, so
-        the formula is written down in exactly one place.
-
-        *cap* is ``MergeDeepConfig.chain_cap`` read live off the dispatching
-        item's config (never cached at construction); *queue_len* is the
-        1-indexed count INCLUDING the dispatching item, i.e.
-        ``1 + len(chain_snapshot())``.
-
-        Pure/synchronous (no await, no I/O) — the git work lives in
-        :meth:`_deep_chain_placement`, which calls this to decide whether any
-        of it is worth doing.
-        """
-        return select_chain_depth(cap, queue_len, self._chain_halving_state)
+    def seed_chain_policy(self) -> None:
+        """Fill the chain policy's pass-estimate window from the newest
+        ``merge_verify`` rows of every run; a no-op without an event store."""
+        if self._event_store is None:
+            return
+        try:
+            rows = self._event_store.fetch_recent_events_by_type(
+                EventType.merge_verify, limit=CHAIN_POLICY_SEED_ROWS,
+            )
+            self._chain_policy = seed_from_rows(row['data'] for row in rows)
+        except Exception:
+            logger.warning(
+                'merge_queue: seeding the deep chain policy failed; its window '
+                'starts empty', exc_info=True,
+            )
 
     def _available_built_depth(self) -> int:
         """Return the deepest already-built speculative cumulative stack depth.
@@ -11358,7 +11215,7 @@ class SpeculativeMergeWorker:
     async def _deep_chain_placement(
         self, item: RealMergeItem, *, frontier_depth: int | None = None,
         verify_is_local: bool = True,
-    ) -> ChainResult | None:
+    ) -> DeepPlacement:
         """Decide whether THIS dispatch should verify a deep CHAIN tip instead
         of the item's own adjacent merge commit (task 3185, PRD γ; task 8527
         extends it to a head alone in the verify frontier).
@@ -11373,25 +11230,24 @@ class SpeculativeMergeWorker:
         ``chain.lane``, a cumulative tree containing *item* plus every chained
         successor.  That redirect is the capability γ adds.
 
-        Returns ``None`` to mean **"take today's adjacent-verify path,
-        unchanged"** — and on every ``None`` path here that is byte-identical
-        to pre-γ dispatch, not merely equivalent in effect, because no chain
-        code has run.
+        A placement with no chain means **"take today's adjacent-verify path,
+        unchanged"** — byte-identical to pre-γ dispatch, not merely equivalent
+        in effect, because no chain code has run.  Its ``depth_reason`` is
+        ``None`` when a guard declined before the policy was asked.
 
         The guards, in order, and why that order:
 
-          1. not :func:`may_chain` -> ``None``
+          1. not :func:`may_chain` -> no chain, no reason
              (``plans/merge-lane-policy-prd.md`` D5).  A speculative item may
              chain.  A non-speculative item (the head, merged onto REAL main)
              may chain only when no other entry is in the verify frontier:
              anything landing ahead of a main-based item would leave its chain
              stale.  *frontier_depth* is the dispatch-time ``depth``
-             :meth:`_launch_verify` also hands :meth:`_run_inflight_verify`,
-             so this guard and the d=1 floor's reset arm judge one value;
+             :meth:`_launch_verify` also hands :meth:`_run_inflight_verify`;
              ``None`` (a direct caller) never licenses a head.
-          2. ``cap = item.request.config.merge_deep.chain_cap; cap <= 0`` ->
-             ``None``.  α's shipped kill switch, hoisted ABOVE the queue scan
-             for the same reason :meth:`_probe_verify_placement` hoists its
+          2. ``item.request.config.merge_deep.chain_cap <= 0`` -> the same.
+             The kill switch, hoisted ABOVE the queue scan for the
+             same reason :meth:`_probe_verify_placement` hoists its
              ``probe_fraction`` guard: under stock config every speculative
              dispatch takes this branch, so the default path must not pay for
              an O(n) walk whose result the policy would only discard.  The cost
@@ -11400,7 +11256,7 @@ class SpeculativeMergeWorker:
              green-tier ``reload_config`` — which mutates the held
              :class:`~orchestrator.config.MergeDeepConfig` in place — takes
              effect on the very next dispatch, in both directions.
-          2b. ``task_id in self._next_dispatch_unchained`` -> ``None``.  The
+          2b. ``task_id in self._next_dispatch_unchained`` -> the same.  The
              LOOP GUARD (tasks 3185, 10617).  A chain-arm error or a red tip
              was not attributed to this item (the tree was cumulative), so the
              request was DEFERRED rather than blocked — and a defer that
@@ -11411,21 +11267,12 @@ class SpeculativeMergeWorker:
              nothing, and BEFORE the queue scan so a marked task pays no
              O(n) walk either.  The mark lasts until the task's verdict is
              applied (see ``_next_dispatch_unchained`` in ``__init__``).
-          3. ``d = self._deep_target_depth(cap, 1 + len(snapshot))``
-             -> ``None`` -> ``None``.  Delegates the
-             ``min(queue_len, cap, halving_state)`` invariant to
-             :func:`select_chain_depth` rather than re-deriving it, so the
-             formula lives in exactly one place.  ``queue_len`` counts the
-             DISPATCHING item as chain item #1 (hence the ``1 +``), matching
-             the 1-indexed unit both policy functions document.  A ``None``
-             here is either the ``queue >= 2`` gate or the d=1 floor.
-             ``snapshot`` is bound ONCE and reused as ``build_chain``'s
-             argument below: :meth:`chain_snapshot` walks every lane buffer and
-             materialises a fresh list, and paying for that twice on the firing
-             path would contradict the very cost discipline guard 2b's
-             placement above exists to enforce.  Safe because no ``await``
-             intervenes between the bind and the use, so no concurrent dispatch
-             can interleave and make the two reads differ.
+          3. ``(d, reason) = choose_depth(...)``
+             (:mod:`~orchestrator.merge_lane.chain_policy`): the depth table
+             over the rolling pass estimate, bounded by the queue.
+             ``d < 2`` builds nothing.  ``snapshot`` is bound ONCE and reused
+             as ``build_chain``'s argument below; no ``await`` intervenes
+             between the bind and the use.
 
         *verify_is_local* is the dispatch's host-lease locality.  It picks the
         lane the chain is built in (and its tip verified in): a warm ``_spec-``
@@ -11439,42 +11286,45 @@ class SpeculativeMergeWorker:
         RESERVED from the snapshot to the round's end instead (task 7720,
         :mod:`~orchestrator.merge_lane.chain_reservation`), so no other consumer
         takes one. This method touches neither
-        ``_verifier_queue`` nor ``_inflight`` nor the halving state —
-        :meth:`_note_chain_outcome` is the sole writer of the latter, and it is
-        driven by the tip VERDICT, not by a dispatch decision.
+        ``_verifier_queue`` nor ``_inflight`` nor the chain policy, which
+        changes only by a VERDICT (:meth:`_note_tip_result`), not by a dispatch
+        decision.
 
         Returns:
-            A non-empty :class:`ChainResult` that HOLDS its scratch lane (the
-            caller must release it exactly once — see
-            :meth:`_run_inflight_verify`'s chain arm), or ``None``.
+            A :class:`DeepPlacement`.  A non-``None`` ``chain`` HOLDS its
+            scratch lane (the caller must release it exactly once — see
+            :meth:`_run_inflight_verify`'s chain arm).
         """
         if not may_chain(speculative=item.speculative, frontier_depth=frontier_depth):
-            return None
-        cap = item.request.config.merge_deep.chain_cap
-        if cap <= 0:
-            return None
+            return NO_DEEP_PLACEMENT
+        deep = item.request.config.merge_deep
+        if deep.chain_cap <= 0:
+            return NO_DEEP_PLACEMENT
         if item.request.task_id in self._next_dispatch_unchained:
             # Guard 2b: see the docstring. Termination needs no cap: the
             # un-chained re-dispatch verifies the item's OWN tree and, if THAT
             # raises, resolves terminally through the ordinary
             # generic-exception path.
-            return None
-        # ONE snapshot, reused as build_chain's argument below -- see the
-        # docstring's step 3. chain_snapshot() is an O(n) walk over every lane
-        # buffer that materialises a fresh list; calling it twice on the firing
-        # path would contradict guard 2b's own cost-discipline placement. No
-        # await intervenes, so the two uses cannot observe different queues.
+            return NO_DEEP_PLACEMENT
         snapshot = self.chain_snapshot()
-        queue_len = 1 + len(snapshot)
-        d = self._deep_target_depth(cap, queue_len)
-        if d is None:
-            return None
-        # UNIT CONVERSION. Everything above counts ITEMS IN THE CHAIN, with the
-        # dispatching item as #1; build_chain counts ADDITIONAL LINKS BEYOND
-        # the base it is handed, and the base here IS the dispatching item's
-        # merge commit. Hence `cap - 1` / `d - 1`. Both are >= 1 (the policy's
-        # `< 2` floor already declined), so neither can underflow to a
-        # kill-switch-shaped 0.
+        d, reason = choose_depth(self._chain_policy, 1 + len(snapshot), deep.depth_table)
+        if d < 2:
+            return DeepPlacement(chain=None, depth_reason=reason)
+        chain = await self._reserve_and_build_chain(
+            item, snapshot, d, verify_is_local=verify_is_local,
+        )
+        return DeepPlacement(chain=chain, depth_reason=reason)
+
+    async def _reserve_and_build_chain(
+        self, item: RealMergeItem, snapshot: tuple[MergeRequest, ...], d: int,
+        *, verify_is_local: bool,
+    ) -> ChainResult | None:
+        """Build a *d*-item chain from *item* over *snapshot*, its candidates
+        reserved to the round's end; ``None`` when nothing was built."""
+        # UNIT CONVERSION. *d* counts ITEMS IN THE CHAIN, with the dispatching
+        # item as #1; build_chain counts ADDITIONAL LINKS BEYOND the base it is
+        # handed, and the base here IS the dispatching item's merge commit.
+        # Hence `d - 1`, which is >= 1 because the caller builds only at d >= 2.
         #
         # The base is the DISPATCHING ITEM's merge commit, never
         # frozen_prefix_tip(): the chain must be a contiguous continuation of
@@ -11494,7 +11344,7 @@ class SpeculativeMergeWorker:
         self._chain_reservations.reserve_candidates(owner, candidates)
         try:
             result = await self._build_deep_chain(
-                item, snapshot, base, cap=cap, d=d, verify_is_local=verify_is_local,
+                item, snapshot, base, d=d, verify_is_local=verify_is_local,
             )
         except BaseException:
             self._chain_reservations.release(owner.request_id)
@@ -11513,7 +11363,7 @@ class SpeculativeMergeWorker:
 
     async def _build_deep_chain(
         self, item: RealMergeItem, snapshot: tuple[MergeRequest, ...], base: str,
-        *, cap: int, d: int, verify_is_local: bool,
+        *, d: int, verify_is_local: bool,
     ) -> ChainResult | None:
         """Build *item*'s chain over *snapshot* onto *base*, bounded by the build
         deadline; None (the adjacent verify) on overrun, error or zero links.
@@ -11538,7 +11388,7 @@ class SpeculativeMergeWorker:
                     self._git_ops,
                     snapshot,
                     base,
-                    cap=cap - 1,
+                    cap=d - 1,
                     target_depth=d - 1,
                     verify_is_local=verify_is_local,
                 )
@@ -11589,8 +11439,7 @@ class SpeculativeMergeWorker:
             # A zero-link result NEVER holds a lane -- build_chain already
             # released it on that path (merge_types.py "Lane ownership") -- so
             # do NOT release here: that would return a FREE lane to the pool a
-            # second time. Declining also consumes no halving round: nothing
-            # was verified deeply, so there is no verdict to halve or reset on.
+            # second time.
             return None
         # NON-EMPTY: this result HOLDS its lane, and release is now the
         # CALLER's obligation, exactly once, on every exit.
@@ -13861,6 +13710,7 @@ class SpeculativeMergeWorker:
         # Reset supervisor state for this invocation.
         self._live_loops = {'merger', 'verifier'}
         self._loops_finished.clear()
+        self.seed_chain_policy()
         # Spawn merger and verifier via _spawn_loop so the supervisor callbacks
         # are registered from the very first iteration.
         self._spawn_loop('merger')
@@ -18551,8 +18401,8 @@ class SpeculativeMergeWorker:
                 # stays queued and takes its ordinary sequential path, exactly
                 # as on the tip-pass and tip-fail arms.
                 #
-                # NOT `_note_chain_outcome`: an infra error is not a tip
-                # verdict and must not move the halving policy (the exit block
+                # NOT `_note_tip_result`: an infra error is not a tip
+                # verdict and must not move the chain policy (the exit block
                 # below states that contract -- "An EXCEPTION exit never
                 # reaches here at all").
                 #
@@ -18806,18 +18656,14 @@ class SpeculativeMergeWorker:
             # own decision-4 purity comment guards against upstream.  δ's walk
             # preserves that on its own abort path too (see the walk).
             #
-            # The halving state is fed the BUILT depth in chain-item units
-            # (the dispatching item is #1), not the target that was requested,
-            # so a fail halves off what actually ran.  `out is None` is this
-            # method's own vocabulary for a pass; a low-disk `verify_skipped`
-            # therefore counts as not-a-pass, which is the conservative
-            # direction (it walks toward the d=1 floor, never inflating depth).
+            # The pass estimate is fed the BUILT depth in chain-item units
+            # (the dispatching item is #1), not the target that was requested.
             # An EXCEPTION exit never reaches here at all — an infra error is
             # not a tip verdict and must not move the policy.  This feed is
             # SHARED by both arms and stays above the split, so adoption cannot
             # drift it.
             _chain_depth = 1 + len(chain.links)
-            self._note_chain_outcome(out is None, _chain_depth)
+            self._note_tip_result(dispatch_facts.chain_depth_reason, _chain_depth, out)
 
             if _chain_adopting:
                 logger.info(
@@ -18875,45 +18721,10 @@ class SpeculativeMergeWorker:
                 status=InflightStatus.REQUEUED,
             )
 
-        # ══ task 3185 (PRD γ): THE d=1 FLOOR'S RESET ARM ════════════════════
-        #
-        # This is the ONLY way the halving walk ever climbs back out.  At the
-        # floor the gate declines (select_chain_depth's `< 2` check), so no
-        # chain exists and the block above never runs — which means a chain
-        # outcome alone can only ever push the bisector DOWN.  Without this
-        # arm the walk is a one-way ratchet: 6 -> 3 -> 1 -> 1 -> 1 forever, and
-        # two red rounds silently disable deep merge-ahead for the whole life
-        # of the worker process.  That is the same permanently-and-silently-off
-        # failure next_halving_state's `max(1, ...)` floor guards against one
-        # step earlier, and the PRD's boundary row "deep resumes after bad item
-        # blocks" is unreachable without it.
-        #
-        # PASS ONLY, deliberately.  PRD decision 5 scopes the two rules
-        # differently and the asymmetry is load-bearing: the halve is "tip fail
-        # at depth d -> max(1, d//2)" — a fact about a DEEP verify — while the
-        # reset is "ANY pass resets to min(queue, cap)".  Folding a non-chain
-        # FAIL in here would halve off ordinary red branches, which are routine,
-        # and would drag the bisector to the floor and pin it there without a
-        # single deep chain having failed.
-        #
-        # The three guards, in the order they matter:
-        #   * `chain_cap > 0` — α's kill switch.  At the shipped default this
-        #     arm does not merely have no effect, it is not REACHED: cap=0
-        #     dispatch stays byte-identical down to "no method call".
-        #   * `may_chain(...)` — a round that could have chained: slot 2, or a
-        #     head alone in the frontier at its dispatch (PRD D5); a depth of
-        #     None (a non-production caller) never licenses a head.
-        #   * state `is not None` — already reset; nothing to do.
-        # `depth=1` is truthful, not a placeholder: at the floor the tree that
-        # actually ran IS a one-item chain (that is what makes the floor
-        # byte-identical to today's adjacent verify in the first place).
-        if (
-            out is None
-            and may_chain(speculative=item.speculative, frontier_depth=depth)
-            and self._chain_halving_state is not None
-            and req.config.merge_deep.chain_cap > 0
-        ):
-            self._note_chain_outcome(True, 1)
+        # A round the deep policy sized but did not chain verified its item
+        # alone, and its verdict feeds the pass estimate too, pass or fail, or
+        # a policy that chose depth 1 would never see new evidence.
+        self._note_tip_result(dispatch_facts.chain_depth_reason, 1, out)
 
         if out is None:
             logger.info(
@@ -21586,9 +21397,11 @@ class SpeculativeMergeWorker:
             # loop build_chain's own `except BaseException` arm does.  The
             # obligation only begins once `chain` is bound, and from that point
             # to the ensure_future there is still nothing that can raise.
-            chain = await self._deep_chain_placement(
+            deep_placement = await self._deep_chain_placement(
                 item, frontier_depth=depth, verify_is_local=lease.is_local,
             )
+            chain = deep_placement.chain
+            dispatch_facts = dispatch_facts.with_chain_depth_reason(deep_placement.depth_reason)
         except BaseException:
             # See the LEASE/PERMIT LEAK GUARD note above the `try`.  Hand back
             # both resources, then re-raise UNCHANGED -- this arm is a resource

@@ -1,6 +1,7 @@
 # Merge-chain visibility: a live "Verifying now" view, chain rounds recorded by the merge lane, and a "Chain rounds" history panel
 
-**Status:** draft, revision 2 (folds in PRD critic pass 1; table at the end). Authored 2026-11-18 from the ruled
+**Status:** draft, revision 2 (folds in PRD critic pass 1; table at the end), amended 2026-11-18 for Leo's ruling on
+esc-8528-11 (Revision 4, at the end: 8528 drops its suspect search; the un-chained mark isolates a red chain). Authored 2026-11-18 from the ruled
 design note `plans/merge-chain-dashboard-design-2026-11-17/DESIGN.md` (revision 3, untracked) and Leo's rulings of
 2026-11-18. Not yet decomposed.
 **Code anchors** verified against main `8874271539` (2026-11-18; `d74194d263` plus task 10723), and task 8528's
@@ -12,9 +13,13 @@ Words used throughout:
 
 - **Round.** One deep-chain verify: the deep policy chose depth k ≥ 2 for a dispatch, reserved k − 1 waiting
   requests (*links*) behind the dispatching *owner*, built the cumulative *tip* and verified it. Its *members* are
-  the owner and the links. After 8528 a round's basis is fresh (`pass_estimate`, `no_estimate`) or `bisect`.
-- **Search.** After 8528, a red fresh round makes its members *suspects*; the lane verifies halves until none
-  remain. A search ends when the suspect list empties or is replaced.
+  the owner and the links. After 8528 a round's basis is `pass_estimate` or `no_estimate` (8528 has no bisect
+  round: esc-8528-11 ruling).
+- **Isolation.** The set of requests marked by one red round: the red tip marks its owner and every link "verify
+  alone next" (tasks 10617, 10723), and each marked member verifies alone until its request is retired. An
+  isolation opens at the red tip and ends when every marked member has been retired (landed, blocked, dropped).
+  It has no rounds of its own. The live view of it is the per-entry `unchained_mark` (γ). (Replaces *Search*,
+  withdrawn 2026-11-18, esc-8528-11 ruling.)
 - **Hold.** A `ChainReservation` (`merge_lane/chain_reservation.py`). Expiry ends a hold while its round continues.
 
 ## 1. Goal
@@ -24,7 +29,7 @@ An operator on the dashboard's Merge Queue section sees, per project:
 1. **now:** every merge verify in flight, and for a chain its members, host, phase, age, and any member whose
    request is already decided;
 2. **recently:** how each round ended (landed whole, a prefix, nothing, voided, cancelled, aborted) and why, and,
-   after 8528, which suspect a search found red.
+   for a red round, how each member of its isolation left the lane (the blocked one is the culprit).
 
 The merge lane records rounds as a unit (Leo, Q2), so (2) is read from records, not inferred.
 
@@ -33,10 +38,10 @@ The merge lane records rounds as a unit (Leo, Q2), so (2) is read from records, 
 | Mechanism | Consumer |
 |---|---|
 | α's `verifying_now` Datum, projected from the one `get_merge_queue` reply | "Verifying now" (new `static/redux/merge_chains.jsx`, mounted from `tabs.jsx::MergeTab`); "Currently queued"'s "in flight ↑" |
-| β's round, search and rejected-record events | ε's `chain_rounds` read; β's audit script (§10) |
+| β's round, isolation and rejected-record events | ε's `chain_rounds` read; β's audit script (§10) |
 | β's `chain_id` / `origin_chain_id` on `merge_verify`, `chain_id` on `verdict_voided` | 8547's verify list (A-8547) |
 | γ's `restart_drain.verifies_in_flight[]` additions, `entries[].chain`, `entries[].unchained_mark`, `chain_policy` | "Verifying now" (round view), "Currently queued" columns, the project head's controller line |
-| δ's bisect split in `summarize_chain_telemetry`'s module | 10621's Deep chains card, the digest, `scripts/merge_lane_throughput.py` |
+| (δ withdrawn 2026-11-18, esc-8528-11 ruling: no bisect rounds to count apart) | — |
 | ε's `runs_read/merge_lane.py::chain_rounds`, `CHAIN_OUTCOME_FAMILY` | "Chain rounds" panel |
 
 Recent deep verifies with members are 8547's list (A-8547); this PRD adds no second list.
@@ -70,10 +75,11 @@ The dashboard saw none of it: the probe keeps six keys per entry plus `metrics`
 2. A decided link is still reachable: `cancel_request` refuses only finalize-window states and the link being
    landed, so a reserved link can be cancelled mid-verify; `_land_chain_prefix` then stops on it.
 3. `_next_dispatch_unchained` is not on the snapshot.
-4. On 8528's branch a red tip sets suspects (`chain_policy.py::on_tip_result`); a red *fresh* round replaces the
-   suspects wholesale; a lone red bisect verify empties them; `_set_chain_policy` is the one writer;
-   `seed_chain_policy` refills only the pass window, so a restart ends a search. The branch adds two context
-   managers that end a held reservation.
+4. Leo's ruling on esc-8528-11 (2026-11-18): 8528 keeps its depth table and `chain_depth_reason` and removes its
+   suspect search. A red tip marks its owner and every link exactly as on main (`_next_dispatch_unchained`, set in
+   `_run_inflight_verify`'s red-tip arm, cleared only in `_retire_item`); the mark is the one owner of isolation.
+   A restart forgets the marks. `chain_depth_reason.basis` is `no_estimate` or `pass_estimate`. The branch (at
+   `1a28529270`) added two context managers that end a held reservation; re-check after the rework.
 5. 8528's branch edits `test_merge_queue_deep_reservation.py`, which asserts a `chain_reservations[]` row by exact
    dict equality, and rewrites the deep test scenes (`depth_table` replaces `chain_cap` as the depth source).
 6. `_land_rebased_or_park_gate` can finish the owner through `_finalize_landed_by_successor`, which runs no walk.
@@ -82,10 +88,10 @@ The dashboard saw none of it: the probe keeps six keys per entry plus `metrics`
 
 - **α (before 8528), dashboard only.** Project `restart_drain.verifies_in_flight[]` (task 5371) and
   `chain_reservations[]` (task 7720) from the existing reply into one server-side Datum; render "Verifying now".
-- **β (after 8528, 10624, 10721).** A fail-safe `ChainRounds` ledger mints, records and settles rounds and searches;
+- **β (after 8528, 10624, 10721).** A fail-safe `ChainRounds` ledger mints, records and settles rounds and isolations;
   wire records in a new `shared/src/shared/merge_chain.py`; an audit script.
 - **γ (after β).** The snapshot exposes the round view and policy state; the dashboard switches to it.
-- **δ (after 8528, 10621).** Telemetry counts bisect rounds apart. **ε (after θ, 8547, γ).** "Chain rounds".
+- **δ: withdrawn 2026-11-18** (esc-8528-11 ruling; there are no bisect rounds). **ε (after θ, 8547, γ).** "Chain rounds".
 - **Companion corrections** to 8547, 8329, 5245, θ 9852, γ2 9802 and 8532, each order-independent (§11).
 
 ## 5. Resolved design decisions
@@ -99,14 +105,18 @@ The dashboard saw none of it: the probe keeps six keys per entry plus `metrics`
 
 **Round model**
 
-- **D5.** A round is k ≥ 2. 8528's lone-suspect and `awaiting_bisect` verifies are not rounds; the lone-suspect
-  verify's `merge_verify` carries `origin_chain_id`.
+- **D5.** A round is k ≥ 2. A marked member's solo verify is not a round; its `merge_verify` carries
+  `origin_chain_id` (amended 2026-11-18, esc-8528-11 ruling: 8528 has no lone-suspect or `awaiting_bisect` verify).
 - **D6.** The ledger is `merge_lane/chain_rounds.py::ChainRounds` (heuristic 6, one purpose; heuristic 9, deep
-  module). `chain_reservation.py` keeps the hold; the ledger, not `ChainPolicyState`, maps suspects to searches.
-- **D7.** A search's id is the `chain_id` of the red fresh round that opened it; its bisect rounds and lone-suspect
-  verifies carry it as `origin_chain_id`.
+  module). `chain_reservation.py` keeps the hold; the lane keeps the mark (`_next_dispatch_unchained`); the ledger
+  maps marked members to their isolation and records it, and decides nothing.
+- **D7.** An isolation's id is the `chain_id` of the red round that opened it; its members' solo verifies carry it
+  as `origin_chain_id`. Isolations do not supersede each other: two red rounds open two isolations. A member marked
+  again by a later red round (possible only after a restart or a marking race, task 10624 item 1) leaves the earlier
+  isolation as `rechained` and joins the later one (amended 2026-11-18, esc-8528-11 ruling).
 - **D8 (*Departs*).** Settles are keyed by `chain_id`, minted before the build and carried on `ChainResult` and the
-  in-flight entry, never by owner request id (one request can own a fresh then a bisect round). Every exit has a
+  in-flight entry, never by owner request id (one request can own several rounds in turn, e.g. a voided round and
+  then a fresh one). Every exit has a
   named end (§8.1 table). `_end_chain_reservation` takes `chain_id` and an end, and settles as the fallback, so
   callers added later (8528's context managers) are covered; specific sites settle first and the latch keeps the
   first. A fallback settle is recorded as `aborted`/`unattributed`, which the audit counts and the H-rows keep at 0.
@@ -120,11 +130,12 @@ The dashboard saw none of it: the probe keeps six keys per entry plus `metrics`
   `lifetime_deadline_ts` = tip budget + `MAX_CAS_RETRIES` × (1 + `MAX_POST_MERGE_VERIFY_TIMEOUTS` +
   `MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES`) × budget. The lifetime is advisory: a full gate re-verify leaves the round
   (task 8525, `_run_gate_history_leg`), so only a parked history leg keeps one open. Panels claim no liveness.
-- **D12.** β emits `merge_chain_search_settled` per search; ε reads only round and search records, never
+- **D12.** β emits `merge_chain_isolation_settled` per isolation; ε reads only round and isolation records, never
   `merge_verify`. No "back to lane" figure.
-- **D13 (*Departs*).** A red fresh round while a search is open supersedes it: `track_suspects` settles the open
-  search `superseded` (naming the new round) before opening the next. At most one open search.
-- **D14.** `basis` is typed `ChainDepthBasis`; `awaiting_bisect` is rejected at construction.
+- **D13.** Withdrawn 2026-11-18 (esc-8528-11 ruling): there is no suspect list for a red round to replace, so no
+  isolation is superseded. D7 states what happens instead.
+- **D14.** `basis` is typed `ChainDepthBasis`, whose members after the esc-8528-11 ruling are `no_estimate` and
+  `pass_estimate` (`awaiting_bisect` and `bisect` no longer exist).
 - **D15 (*Departs*).** No R2: `merge_verify`'s members are one verify's built set; `started`'s are a round's planned
   set. Two facts, one home each (INV-9). `merge_verify_cancelled` gains no chain fields.
 - **D16 (new, blocker 1).** The ledger is optional observability and fails safe: no `ChainRounds` method raises into
@@ -143,8 +154,9 @@ The dashboard saw none of it: the probe keeps six keys per entry plus `metrics`
   limit (a duplicate live request for the task hides it) is in the title. γ's `decided` replaces it. It does not
   show 6267's case: a resurrected request is live and listed (*Departs* from the note's §9).
 - **D19 (*Departs*).** γ serves the mark as `entries[].unchained_mark`, rendered "marked: verifies alone". The
-  search and depth state go on the controller line ("search ch-… open: only the first suspect chains"; "depth-1
-  row: no chaining"), so no per-entry label claims a dispatch decision the policy makes later.
+  depth state goes on the controller line ("depth-1 row: no chaining"), so no per-entry label claims a dispatch
+  decision the policy makes later. The mark is the lane's own rule, so the per-entry label is the live view of an
+  isolation (amended 2026-11-18, esc-8528-11 ruling: no search state exists).
 - **D20.** The projector is a pure function in `data/merge_chains.py`, called on the one probe reply (one-datum
   PRD, sketch item 1 and decision 11): a server-side Datum with `LIVE_QUEUE_FRESHNESS_BOUND_SECONDS`; a failed
   probe is `unknown` with its reason (no persisted chain history exists). γ2's `project` callable calls it (A-9802).
@@ -164,12 +176,13 @@ The dashboard saw none of it: the probe keeps six keys per entry plus `metrics`
 **History view**
 
 - **D26.** `chain_rounds` is a `RunsQuery` in θ's `runs_read/merge_lane.py`; no raw SQL outside the read model
-  (S22 ω). The only joins are round ↔ settle and round ↔ search, on minted ids. A store with no record of either
+  (S22 ω). The only joins are round ↔ settle and round ↔ isolation, on minted ids. A store with no record of either
   type reads "no chain-round record in this runs.db (β not deployed)", not "no rounds" (INV-13).
 - **D27.** Badges come from `CHAIN_OUTCOME_FAMILY: Mapping[ChainOutcome, OutcomeFamily]` in
   `data/outcome_colors.py`, beside θ's `OUTCOME_FAMILY`, with a totality test.
-- **D28 (*Departs*, critic 6).** δ owns the bisect split; 8532 gets the identical rule as text and no edge, so its
-  7-day clock is not moved. δ's agreement test pins `scripts/merge_lane_throughput.py` to the shared function.
+- **D28.** Withdrawn 2026-11-18 (esc-8528-11 ruling): with no bisect rounds every deep verify after 8528 is a
+  fresh round, so there is no split to own; δ (task 10760) is cancelled and A-8532 is replaced (§11). 8532 keeps no
+  edge on this batch.
 - **D29.** `worker.py` (21,805 lines at `8874271539`) gains calls, not logic: about 25 sites in β, 4 in γ. The
   merge-lane ratchet bounds cognitive complexity per function; β and γ plan an authorised-raise entry under
   `orchestrator/tests/merge_lane_ratchet_raises/` if a function moves.
@@ -180,8 +193,9 @@ The dashboard saw none of it: the probe keeps six keys per entry plus `metrics`
 |---|---|
 | `restart_drain.verifies_in_flight[]` | `worker.py::SpeculativeMergeWorker._verifies_in_flight`, `merge_lane/types.py::VerifyInFlight.to_wire` |
 | `chain_reservations[]`, `entries[].verify_base` | `ChainReservations.snapshot`; `snapshot`'s entry builder (task 5447) |
-| `summarize_chain_telemetry` in shared, the Deep chains card | task 10621 (pending) → δ |
-| `ChainDepthBasis`, `choose_depth`, `_set_chain_policy`, `_note_tip_result`, suspects | 8528 (in progress) → β, γ, δ |
+| `summarize_chain_telemetry` in shared, the Deep chains card | task 10621 (pending); no consumer here since δ was withdrawn |
+| `ChainDepthBasis`, `ChainDepthReason`, `choose_depth` | 8528 (hand carry under the esc-8528-11 ruling) → β, γ |
+| The un-chained mark: set in `_run_inflight_verify`'s red-tip arm, cleared only in `_retire_item` | tasks 10617, 10723 (done); 10624 moves the set ahead of the reservation's release → β, γ |
 | Walk faults through public seams | `orchestrator/tests/_merge_lane_fakes.py::make_lane` takes any `git_ops`; `test_merge_speculation.py::_AdvanceFailingGitOps` overrides `advance_main` |
 | Abort causes | `_run_inflight_verify`'s `VerifyCancelCause.ABANDONED`, `OPERATOR_HALT`, `NO_PROGRESS`; `_tear_down_inflight_entry` (`CASCADE`, `GATE_REANCHOR`) |
 | Event reads for the audit | `event_store.py::EventStore.fetch_events_by_type_all_runs` |
@@ -197,14 +211,14 @@ do not reach 8528. 10723 is done; 8528 is in progress; 10624 and 10721 are pendi
 | Other | Direction | Seam | Owner | Status |
 |---|---|---|---|---|
 | S22 (`plans/review-all-s22-dashboard-readers-and-aggregation-prd.md`) | consumes | `runs_read`, θ's module and `OUTCOME_FAMILY`, γ2's probe helper, ω's guard | S22; ε adds its constructor and row; A-9852, A-9802 (either order) | queued |
-| 8528 | consumes | `ChainDepthBasis`, `choose_depth`, `_set_chain_policy`, `_note_tip_result`, the reservation context managers | 8528; β instruments its merged code | in progress |
+| 8528 | consumes | `ChainDepthBasis`, `ChainDepthReason`, `choose_depth`, any reservation context managers the rework keeps | 8528; β instruments its merged code | hand carry |
 | 10624, 10721 | same sites | red-tip exit, `finally` of `_run_inflight_verify`, `_deep_chain_placement` | those tasks; β waits | pending |
 | 6267 | none here | merge journal | 6267 | pending |
 | 8547 | produces for | `chain_id`, `origin_chain_id`, members on deep rows | 8547 (A-8547) | behind θ |
 | 8329 | shared emit site | `verdict_voided` gains `verify_elapsed_ms` (8329) and `chain_id` (β), additive | each its key | pending |
 | 5245 | same derivation | "what is verifying" from `_verifies_in_flight`; γ owns the `VerifyInFlight` additions | 5245 (A-5245), either order | pending |
 | 10621 | consumes | the shared telemetry module, the card | 10621 | pending |
-| 8532 | same rule | bisect split stated as text | δ owns the code; 8532 the readout (A-8532) | pending |
+| 8532 | none here | none since the esc-8528-11 ruling (δ withdrawn; A-8532 replaced, §11) | 8532 | pending |
 | 9133, 4767 | none | probe, `merge_verify.depth`; nothing here reads them | those tasks | pending |
 | 8932 | future | a hedge may give a round several verifies; panels group by `chain_id` | 8932 | pending |
 | 8359, 10588 | same file | `types.py` split; γ edits `VerifyInFlight` | file locks; second lander rebases | pending |
@@ -230,9 +244,8 @@ ChainRoundSettled(chain_id, outcome: ChainOutcome, built: int | None, truncated_
                   landed: int, stop: ChainStop | None, cancel_cause: str | None,  # a VerifyCancelCause value
                   fault: ChainFault | None, finals: tuple[ChainFinal, ...])
 ChainFinal(request_id: str, final: MemberFinal)
-ChainSearchSettled(origin_chain_id, rounds: tuple[str, ...], solo_verdicts: tuple[SoloVerdict, ...],
-                   ended_by: SearchEnd, superseded_by: str | None, wall_ms: int)
-SoloVerdict(task_id: str, request_id: str, passed: bool)
+ChainIsolationSettled(origin_chain_id, exits: tuple[IsolationExit, ...], ended_by: IsolationEnd, wall_ms: int)
+IsolationExit(task_id: str, request_id: str, exit: MemberExit, solo_verifies: int)  # verifies run alone while marked
 ChainRecordRejected(record_type: str, chain_id: str | None, field: str, value: str, error: str)
 ```
 
@@ -240,34 +253,35 @@ Enums: `ChainOutcome` ∈ `build_declined`, `landed_whole`, `landed_prefix`, `ti
 `voided_at_adoption`, `cancelled`, `aborted`, `shutdown`. `ChainStop` ∈ `link_taken_elsewhere`, `link_abandoned`,
 `cas_not_advanced`, `halt_fault`, `lease_contended`, `link_raised`, `head_landed_by_successor`, `walk_interrupted`.
 `ChainFault` ∈ `verify_raised`, `verify_skipped`, `runner_unavailable`, `verify_lease_contended`, `rebased_at_gate`,
-`gate_red`, `cas_exhausted`, `finalize_raised`, `unattributed`. `MemberFinal` ∈ `landed`, `restored`, `cancelled`, `not_built`. `SearchEnd` ∈
-`suspects_cleared`, `suspects_left_lane`, `chains_switched_off`, `superseded`, `shutdown`.
+`gate_red`, `cas_exhausted`, `finalize_raised`, `unattributed`. `MemberFinal` ∈ `landed`, `restored`, `cancelled`, `not_built`. `IsolationEnd` ∈
+`members_retired`, `shutdown`. `MemberExit` ∈ `landed`, `blocked`, `dropped`, `rechained`.
 
 Events (in `EventType` wherever it lives at dispatch; S22 α moves members verbatim): `merge_chain_round_started`,
-`merge_chain_round_settled`, `merge_chain_search_settled`, `merge_chain_record_rejected`. `merge_verify` gains
+`merge_chain_round_settled`, `merge_chain_isolation_settled`, `merge_chain_record_rejected`. `merge_verify` gains
 `chain_id` and `origin_chain_id` through `merge_verify_facts.py::MergeVerifyDispatchFacts`; `verdict_voided` gains
 `chain_id` and `killer.chain_id` (site `chain_released`).
 
 **Invariants** (checked at construction, raising `ValueError` naming field and value, which the ledger turns into
 a rejected record; checked again by the audit):
-- I1. At most one settle per `chain_id` and one search settle per `origin_chain_id` (the ledger's latch).
-- I2. `members[0] == owner`; distinct request ids; `len(members) >= 2`; `basis != awaiting_bisect`.
+- I1. At most one settle per `chain_id` and one isolation settle per `origin_chain_id` (the ledger's latch).
+- I2. `members[0] == owner`; distinct request ids; `len(members) >= 2`.
 - I3. `built` and `landed` count members including the owner (`built` = `merge_verify.chain_items`).
   `finals` names every planned member once; `landed == count(final == landed)`.
 - I4. `build_declined` ⇒ `built null`, every final `not_built` (the owner verifies alone outside the round).
   `landed_whole` ⇒ `landed == built`. `landed_prefix` ⇒ `1 <= landed < built`, `stop` set. `tip_red`,
   `voided_at_adoption`, `head_not_landed`, `cancelled`, `aborted`, `shutdown` ⇒ `landed 0` (a round whose owner
   advanced never takes these ends).
-  `cancel_cause` iff `cancelled`; `fault` iff `aborted` or `head_not_landed`; `stop` iff `landed_prefix`;
-  `superseded_by` iff `superseded`.
+  `cancel_cause` iff `cancelled`; `fault` iff `aborted` or `head_not_landed`; `stop` iff `landed_prefix`.
+  An isolation's `exits` name each member at most once; `members_retired` ⇒ every built member of the opening round
+  has an exit; `shutdown` ⇒ at least one has none.
 - I5. `from_event_data` on an unknown enum raises `ChainRecordError(field, value)`; ε counts and shows such rows.
 
 **Ledger** `ChainRounds(sink, clock)`, holding `(request_id, task_id)` pairs, never request objects
 (heuristic 5): `mint(...) -> chain_id`; `note_member_landed(chain_id, request_id)`; `settle(chain_id, end) -> bool`;
-`round_of(request_id)`; `origin_of(task_id)`; `track_suspects(suspects, cause, red_round)`;
-`note_solo_verdict(...)`; `settle_open_for_shutdown(finalizing)`. `note_member_landed` is called for the owner in
+`round_of(request_id)`; `origin_of(task_id)`; `open_isolation(red_round)`; `note_solo_verify(task_id, request_id)`;
+`note_member_exit(task_id, request_id, exit)`; `settle_open_for_shutdown(finalizing)`. `note_member_landed` is called for the owner in
 `_advance_candidate`'s advanced arm and for each link the walk lands. **None raises** (D16). Bounds
-(INV-7): open rounds ≤ verifies in flight + builds; one open search.
+(INV-7): open rounds ≤ verifies in flight + builds; open isolations ≤ marked members (each member in at most one).
 
 **End per exit** (β re-derives every row from 8528's merged code; a row it cannot place is a stop for the leaf:
 escalate):
@@ -275,7 +289,7 @@ escalate):
 | Exit | Site | End |
 |---|---|---|
 | Build returns None / raises | `_deep_chain_placement`'s two releases | `build_declined` |
-| Tip red (a code verdict, 8528's `_is_code_verdict`) | `_run_inflight_verify` chain arm, before requeue | `tip_red`; `track_suspects` |
+| Tip red (a code verdict, 8528's `_is_code_verdict`) | `_run_inflight_verify` chain arm, before requeue, beside the mark | `tip_red`; `open_isolation` |
 | Tip verify skipped (low disk) | same arm, `_is_code_verdict` false | `aborted`, `verify_skipped` |
 | Owner abandoned mid-verify | abort trigger 1 | `cancelled`, `abandoned` |
 | Operator halt | abort trigger 2 | `cancelled`, `operator_halt` |
@@ -296,9 +310,11 @@ escalate):
 | Expiry | `_expire_chain_reservations` | none: hold end only |
 | Shutdown | `stop()` | rounds whose owner has not advanced: `shutdown`. A finalizing round is never settled by `stop()` (its walk outlives the 5 s `_shutdown_timeout`); it settles at the walk's end or in `_finalize_inflight`'s `finally`. A process that dies first leaves it unsettled ("orchestrator restarted since") |
 
-Searches: a lone red bisect verify or a passing round empties the suspects → `suspects_cleared`; pruning →
-`suspects_left_lane`; `_end_bisect` → `chains_switched_off`; a red fresh round → `superseded`; `stop()` →
-`shutdown`. `track_suspects` takes the cause from `_set_chain_policy`'s caller.
+Isolations: `open_isolation` is called only beside the red-tip mark; a tip verify that raised marks the owner alone
+and opens none (its round settles `aborted`, `verify_raised`). A marked member that leaves the lane through
+`_retire_item` (landed, blocked, dropped) gets that exit; the last member's exit settles the isolation
+`members_retired`. A member marked again by a later red round exits `rechained` (D7). `stop()` → `shutdown`. The
+exit kind comes from `_retire_item`'s callers; a retirement whose kind cannot be placed is a stop for β.
 
 ### 8.2 Snapshot round view (γ)
 
@@ -307,7 +323,7 @@ Additive keys on `SpeculativeMergeWorker.snapshot()`:
   [{request_id, task_id, decided}], phase: building | verifying, build_deadline_ts, tip, reservation_seconds_left}
   | null`; `host` is the dispatching owner's leased host once held.
 - `entries[]` gain `chain: {chain_id, position} | null` and `unchained_mark: bool`.
-- Top level gains `chain_policy: {enabled, depth_table, pass_estimate, row, suspects, search_id}`.
+- Top level gains `chain_policy: {enabled, depth_table, pass_estimate, row}`.
 - `chain_reservations[]` is unchanged and tests-only (D22).
 
 ### 8.3 Dashboard Datums
@@ -316,7 +332,7 @@ Additive keys on `SpeculativeMergeWorker.snapshot()`:
   kind, host, start, deadline, base main sha or null, chain or null) and any reservation with no matching verify.
   Unknowns: the probe error; "orchestrator predates task 5371" when `restart_drain` is absent.
 - `chain_rounds` (ε): `chain_rounds(since, until, limit=30)` → rounds newest first (started, settled or null,
-  search), the window total, undecodable and rejected counts, and whether any chain record exists.
+  isolation or null), the window total, undecodable and rejected counts, and whether any chain record exists.
 
 Rendering: no state branching in JSX; unknown is "—" with reason; an unsettled round reads "no settle record ·
 ‹elapsed›", "(past tip-verify budget)" after the tip deadline, "past its lifetime" after the lifetime deadline,
@@ -336,8 +352,8 @@ through `from_event_data` (β) and `chain_rounds` (ε). Rows use four members (o
 |---|---|---|
 | H1 | All pass | `landed_whole`, `built 4`, `landed 4`; `merge_verify.chain_id` matches |
 | H2 | First candidate conflicts (zero links) | `build_declined`, every final `not_built` |
-| H3 | Tip red | `tip_red`; a search opens; the next bisect round's `origin_chain_id` is H3's id |
-| H4 | H3, then a lone suspect red | `search_settled` `suspects_cleared` naming it; its `merge_verify.origin_chain_id` set |
+| H3 | Tip red | `tip_red`; an isolation opens over all four members; each next verifies alone, and each solo `merge_verify.origin_chain_id` is H3's id |
+| H4 | H3, then link 2's solo verify red, the other three green | `isolation_settled` `members_retired`; link 2 exits `blocked`, the others `landed`, each `solo_verifies 1` |
 | H5 | `advance_main` not-advanced for link 2 | `landed_prefix`, `landed 2` (owner + link 1), `stop cas_not_advanced`; links 2, 3 `restored` |
 | H6 | Link 2's advance returns a halt result | `stop halt_fault`; the lane halts |
 | H7 | `advance_main` raises `MergeVerifyLeaseContended` for link 2 | `stop lease_contended` |
@@ -348,12 +364,12 @@ through `from_event_data` (β) and `chain_rounds` (ε). Rows use four members (o
 | H12 | Owner's advance fails permanently | `head_not_landed`, `cas_exhausted` |
 | H13 | Cascade | `cancelled`, `cascade` |
 | H14 | Tip verify raises | `aborted`, `verify_raised` |
-| H15 | `stop()` mid-verify, mid-search | `shutdown`; search `shutdown` |
+| H15 | `stop()` mid-verify, mid-isolation | `shutdown`; isolation `shutdown` |
 | H15b | `stop()` during a walk whose links outlast `_shutdown_timeout` | the records match what landed: `landed` counts the owner and every landed link; `landed_whole`, or `landed_prefix` with `walk_interrupted` if the walk is cut off; never `shutdown` |
 | H16 | Owner parks on a declared history leg past the tip budget | no settle until it resolves; audit passes |
 | H17 | Operator halt / no-progress abort / owner abandoned, mid-tip-verify | `cancelled` with each cause |
 | H18 | Landed by successor (`is_ancestor_checked` true) | `landed_prefix`, `landed 1`, `stop head_landed_by_successor` |
-| H19 | Two overlapping fresh rounds, both red | first search `superseded` naming the second; one open search |
+| H19 | Two overlapping rounds, both red | two isolations, disjoint members, each settles on its own; none superseded |
 | H20 | An inconsistent end passed to `ChainRounds.settle` (ledger unit test, and a lane scene); a ledger built on a sink that raises (unit test) | `settle` returns without raising; one `merge_chain_record_rejected` row and a WARNING; in the scene the lane resolves the request with host slot free, speculation permit returned and chain lane back in the pool |
 | H21 | Any of H1–H19 | no `chain_id` settles twice; no `unattributed` fault; the audit script exits 0 |
 | H22 | ε's contract row over H1–H19's store | each round read with outcome, k of n, stop; H4 under H3 |
@@ -370,7 +386,7 @@ through `from_event_data` (β) and `chain_rounds` (ε). Rows use four members (o
 | L4 | α unknowns | probe failure → unknown with error; no `restart_drain` → "predates task 5371" |
 | L5 | γ round view | round id, basis, `building` with deadline, a `decided` member "cancelled, still chained" |
 | L6 | γ queue columns | "round ch-…, 2"; "marked: verifies alone" |
-| L7 | γ controller | on/off, p̂, row, open search; `enabled false` → "chaining off" |
+| L7 | γ controller | on/off, p̂, row; `enabled false` → "chaining off" |
 | L8 | One label unreachable | `/merge-queue` 200; that label unknown, the other fresh |
 
 UI: jsdom through `dom_harness.mjs` with a `wire_fixtures.mjs` entry per state (busy, idle "nothing verifying",
@@ -378,7 +394,8 @@ unknown; ε also "no rounds in this window" and "β not deployed"). No source-te
 
 ## 10. Decomposition plan
 
-Five leaves; same-file pairs carry real edges (overlay). Sizes are expected changed lines.
+Five leaves, four since δ was withdrawn on 2026-11-18; same-file pairs carry real edges (overlay). Sizes are
+expected changed lines.
 
 - **α — Merge tab: "Verifying now" from the live reply** (dashboard).
   Files: new `dashboard/src/dashboard/data/merge_chains.py`; `data/merge_queue.py` (call it from `_probe_live_one`);
@@ -391,7 +408,7 @@ Five leaves; same-file pairs carry real edges (overlay). Sizes are expected chan
   Signal: on df, while a verify runs, "Verifying now" lists it with kind, host or "host —, dispatching", age and
   deadline; a chain owner shows its links in order, "building" until its tip exists; L2–L4, L8 and UI states pass.
   Prerequisites: 10621, 8222 (same files). Size ~700–900.
-- **β — Merge lane records chain rounds and culprit searches** (orchestrator, shared, scripts).
+- **β — Merge lane records chain rounds and isolations** (orchestrator, shared, scripts).
   Files: new `merge_lane/chain_rounds.py`; new `shared/src/shared/merge_chain.py` (records and
   `audit_round_records`); `merge_lane/worker.py` (§8.1 table); `merge_lane/types.py`
   (`ChainResult.chain_id`); `event_store.py` (or `shared/run_events.py`); `merge_verify_facts.py`;
@@ -421,21 +438,15 @@ Five leaves; same-file pairs carry real edges (overlay). Sizes are expected chan
   owner's host, "cancelled, still chained" on a decided member; "Currently queued" shows round and position and
   "marked: verifies alone"; the project head shows the controller line; L1, L5–L8 pass.
   Prerequisites: β, α; 8528. Size ~1,000–1,300.
-- **δ — Chain telemetry counts bisect rounds apart** (shared, orchestrator, scripts, dashboard).
-  Files: the module holding `summarize_chain_telemetry` after 10621; `orchestrator/src/orchestrator/digest.py`;
-  `scripts/merge_lane_throughput.py`; `scripts/tests/test_chain_telemetry_agreement.py`; the Deep chains card's
-  reader in `static/redux/merge_queue.js` and its JSX; tests. Rule: a deep verify (`chain_items >= 2`) is a bisect
-  round when `chain_depth_reason.basis == "bisect"`, otherwise fresh (absent on pre-8528 rows counts fresh); the
-  deep-fail rate is over fresh rounds; card and digest add "bisect rounds: N (M red)".
-  Signal: the digest, the card and `merge_lane_throughput.py` print the bisect count; the agreement test covers a
-  bisect row. Prerequisites: α (same `merge_queue.js`); 8528, 10621. Size ~350–500.
+- **δ — withdrawn 2026-11-18** (esc-8528-11 ruling; task 10760 cancelled). There are no bisect rounds to count
+  apart: every deep verify after 8528 is a fresh round, and 10621's deep-fail rate needs no split.
 - **ε — "Chain rounds" history panel; history-seam integration gate** (shared, orchestrator tests, dashboard).
   Files: `shared/src/shared/runs_read/merge_lane.py` (`chain_rounds`); `orchestrator/tests/test_runs_read_contract.py`
   (row written by a lane scene through a real `EventStore`); `data/merge_chains.py`; `data/redux_api.py`;
   `data/outcome_colors.py`; `static/redux/merge_queue.js`, `merge_chains.jsx`, `index.html`;
-  `dashboard/tests/test_outcome_colors.py`; dashboard tests. Decisions D11–D13, D26, D27.
+  `dashboard/tests/test_outcome_colors.py`; dashboard tests. Decisions D11, D12, D26, D27.
   Signal: on df, "Chain rounds" lists the window's rounds newest first with outcome badge, k of n, wall and stop,
-  searches grouped under their opening round with the red suspect named, "newest N of M", following the WINDOW
+  each red round's isolation under it with every member's exit (the blocked member named), "newest N of M", following the WINDOW
   chip; a pre-β store reads "β not deployed"; H22–H24 and UI states pass.
   Prerequisites: β, γ (same files); θ 9852, 8547. Size ~1,000–1,300.
 
@@ -444,7 +455,7 @@ Five leaves; same-file pairs carry real edges (overlay). Sizes are expected chan
 order (§11). Edges from them onto this batch would put 348 open tasks (mode=ro, 2026-11-18) behind α, β and γ.
 
 ```
-8222 · 10619 → 10620 → 10621 → α → δ ← 8528
+8222 · 10619 → 10620 → 10621 → α
                                  α → γ ← β ← 8528, 10624, 10721
 9852 → 8547 → ε ← γ
 ```
@@ -464,7 +475,7 @@ INV-13: "β not deployed"; the audit refuses an unrecorded window. INV-3, 4, 8, 
 **A-8547** (append to details; no file added: the list already lives in this task's files):
 > AMENDED 2026-11-18 (plans/merge-chain-visibility-prd.md). Show each deep row's members (`chain_task_ids`, head
 > first); rows before 2026-11-15T11:19Z read "members unknown (before 9908)", never an empty list. When present,
-> show `chain_id` and `origin_chain_id` (the PRD's leaf β adds them; a lone bisect verify carries only
+> show `chain_id` and `origin_chain_id` (the PRD's leaf β adds them; a marked member's solo verify carries only
 > `origin_chain_id`) and `verdict_voided.verify_elapsed_ms` (task 8329). This list is the dashboard's one view of
 > recent deep verifies; no other panel lists them.
 
@@ -494,10 +505,12 @@ INV-13: "β not deployed"; the audit refuses an unrecorded window. INV-3, 4, 8, 
 > projections). If it does not, the PRD's leaf α will call it from the `project` callable.
 
 **A-8532** (append; no dependency added):
-> AMENDED 2026-11-18 (plans/merge-chain-visibility-prd.md). Count a deep verify (`chain_items >= 2`) as a
-> culprit-search round when `chain_depth_reason.basis == "bisect"`, otherwise as fresh (rows without the key count
-> fresh); report the deep-fail rate over fresh rounds and bisect rounds separately. The PRD's leaf δ puts the same
-> rule in the shared chain-telemetry module and `scripts/merge_lane_throughput.py`; if δ has landed, use it.
+> AMENDED 2026-11-18 (plans/merge-chain-visibility-prd.md), superseded the same day by Leo's ruling on esc-8528-11:
+> 8528 has no culprit-search (bisect) rounds, so the bisect/fresh split and task 10760 are withdrawn. Every deep
+> verify (`chain_items >= 2`) is an ordinary chain; report one deep-fail rate. After a red chain each member verifies
+> alone (the un-chained mark); report those solo verifies, and how many ended blocked, apart from ordinary singles
+> where the rows let you tell them apart (`merge_verify.origin_chain_id` once task 10759 lands; otherwise say the
+> split is not available).
 
 ## 12. Out of scope
 
@@ -565,3 +578,18 @@ rendering (8932); lane-wide questions routed elsewhere (10620, 8547, 9908).
 | m2 | Accepted: "a stop for the leaf: escalate" |
 | m3 | Accepted: α's fixture captured once from df's real reply (D23) |
 | m4 | Accepted: β names the 180-turn architect-cap tripwire and its split line |
+
+## Revision 4 (Leo's ruling on esc-8528-11, 2026-11-18)
+
+Evidence: `plans/8528-unchained-mark-study-2026-11-18/REPORT.md`. The un-chained mark (tasks 10617, 10723) stays the
+single owner of red-chain culprit isolation; 8528 lands its depth table and `chain_depth_reason` and removes its
+suspect search, so `basis` is `no_estimate` or `pass_estimate` only.
+
+| Changed | How |
+|---|---|
+| *Search* | Replaced by *Isolation* (words list); D7 rewritten; D13 and D28 withdrawn; D5, D6, D12, D14, D19 amended |
+| §8.1 | `ChainSearchSettled`/`SoloVerdict`/`SearchEnd` → `ChainIsolationSettled`/`IsolationExit`/`IsolationEnd`, `MemberExit`; event `merge_chain_isolation_settled`; ledger `open_isolation`, `note_solo_verify`, `note_member_exit` |
+| §8.2 | `chain_policy` loses `suspects` and `search_id` |
+| §9 | H3, H4, H15, H19, L7 rewritten |
+| §10 | β re-scoped (task 10759); δ withdrawn (task 10760 cancelled; γ's edge on it removed); ε reads isolations |
+| §11 | A-8547 wording; A-8532 replaced |

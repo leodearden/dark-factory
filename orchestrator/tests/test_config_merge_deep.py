@@ -29,6 +29,7 @@ from pydantic import ValidationError
 
 from orchestrator.config import (
     RELOADABLE_FIELDS,
+    DepthRow,
     MergeDeepConfig,
     OrchestratorConfig,
     apply_reload,
@@ -39,6 +40,8 @@ from orchestrator.config import (
 from orchestrator.event_store import EventStore
 from orchestrator.harness import Harness
 from orchestrator.run_store import RunStore
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # ---------------------------------------------------------------------------
 # Harness helpers replicated (not imported) from test_harness_config_reload.py:37-71
@@ -111,10 +114,8 @@ class TestChainCapBoundValidation:
 
     @pytest.mark.parametrize('bad_value', [-1, -6, -32])
     def test_negative_cap_rejected(self, bad_value):
-        """A negative cap is meaningless in
-        ``target_depth = min(len(queue), cap, halving_state)`` — it would silently
-        win that min() and disable or underflow the gate, so it must fail loudly
-        at construction (loud over silent degradation).
+        """A negative cap is neither "off" nor "on", so it must fail loudly at
+        construction (loud over silent degradation).
         """
         with pytest.raises(ValidationError):
             MergeDeepConfig(chain_cap=bad_value)
@@ -129,12 +130,113 @@ class TestChainCapBoundValidation:
             OrchestratorConfig(merge_deep={'chain_cap': -1})  # type: ignore[arg-type]
 
     @pytest.mark.parametrize('good_value', [0, 1, 6, 32])
-    def test_whole_staging_ladder_is_representable(self, good_value):
-        """0 = kill switch, 1 = the halving floor (d=1, byte-identical to today's
-        adjacent verify), 6 = the ζ canary depth, 32 = η2's "uncapped in
-        practice". No upper bound is imposed — θ owns the ceiling question.
+    def test_any_non_negative_cap_is_representable(self, good_value):
+        """0 is the kill switch; every positive value simply means "on" (task
+        8528). Depth comes from ``depth_table``, so the cap bounds nothing and
+        no upper bound is imposed.
         """
         assert MergeDeepConfig(chain_cap=good_value).chain_cap == good_value
+
+
+def _from_yaml_rows(rows: object) -> MergeDeepConfig:
+    """Validate *rows* in the shape a project yaml's ``depth_table`` parses to."""
+    return MergeDeepConfig.model_validate({'depth_table': rows})
+
+
+class TestDepthTable:
+    """``depth_table``: the rolling pass-estimate rows that set chain depth
+    (task 8528, plans/merge-lane-policy-prd.md D7).
+    """
+
+    def test_default_rows_are_typed(self):
+        table = MergeDeepConfig().depth_table
+        assert table == [(0.93, 8), (0.85, 4), (0.75, 2)]
+        assert all(isinstance(row, DepthRow) for row in table)
+        assert [(row.min_pass_estimate, row.depth) for row in table] == [
+            (0.93, 8),
+            (0.85, 4),
+            (0.75, 2),
+        ]
+
+    def test_project_yaml_table_loads_as_rows(self, tmp_path):
+        project_cfg = tmp_path / 'orchestrator.yaml'
+        project_cfg.write_text(
+            yaml.dump({'merge_deep': {'chain_cap': 6, 'depth_table': [[0.9, 16], [0.5, 2]]}})
+        )
+        cfg = load_config(project_cfg)
+        assert cfg.merge_deep.depth_table == [DepthRow(0.9, 16), DepthRow(0.5, 2)]
+        assert all(isinstance(row, DepthRow) for row in cfg.merge_deep.depth_table)
+
+    def test_empty_table_rejected(self):
+        with pytest.raises(ValidationError, match='must not be empty'):
+            _from_yaml_rows([])
+
+    @pytest.mark.parametrize('bad_threshold', [-0.1, 1.5])
+    def test_threshold_outside_unit_interval_rejected(self, bad_threshold):
+        with pytest.raises(ValidationError) as excinfo:
+            _from_yaml_rows([[0.95, 8], [bad_threshold, 2]])
+        message = str(excinfo.value)
+        assert '[0, 1]' in message
+        assert repr(DepthRow(bad_threshold, 2)) in message
+
+    @pytest.mark.parametrize('bad_depth', [1, 0, -2])
+    def test_depth_below_two_rejected(self, bad_depth):
+        with pytest.raises(ValidationError) as excinfo:
+            _from_yaml_rows([[0.95, 8], [0.8, bad_depth]])
+        message = str(excinfo.value)
+        assert '>= 2' in message
+        assert repr(DepthRow(0.8, bad_depth)) in message
+
+    @pytest.mark.parametrize(
+        'table', [[[0.8, 8], [0.9, 4]], [[0.9, 8], [0.9, 4]]], ids=['ascending', 'equal']
+    )
+    def test_thresholds_not_strictly_descending_rejected(self, table):
+        with pytest.raises(ValidationError) as excinfo:
+            _from_yaml_rows(table)
+        message = str(excinfo.value)
+        assert 'thresholds' in message and 'strictly descending' in message
+        assert repr(DepthRow(*table[1])) in message
+
+    @pytest.mark.parametrize(
+        'table', [[[0.9, 4], [0.8, 8]], [[0.9, 4], [0.8, 4]]], ids=['ascending', 'equal']
+    )
+    def test_depths_not_strictly_descending_rejected(self, table):
+        with pytest.raises(ValidationError) as excinfo:
+            _from_yaml_rows(table)
+        message = str(excinfo.value)
+        assert 'depths' in message and 'strictly descending' in message
+        assert repr(DepthRow(*table[1])) in message
+
+    @pytest.mark.parametrize('bad_row', [[0.9], [0.9, 8, 1], 0.9, 'eight'])
+    def test_row_that_is_not_a_pair_rejected(self, bad_row):
+        with pytest.raises(ValidationError) as excinfo:
+            _from_yaml_rows([[0.95, 16], bad_row])
+        assert 'depth_table.1' in str(excinfo.value)
+
+    def test_zero_threshold_row_pins_a_fixed_depth(self):
+        assert MergeDeepConfig(depth_table=[DepthRow(0.0, 3)]).depth_table == [(0.0, 3)]
+
+    def test_is_green_tier(self):
+        assert 'merge_deep.depth_table' in RELOADABLE_FIELDS
+
+    @pytest.mark.usefixtures("code_default_config")
+    def test_apply_reload_retunes_the_held_submodel_in_place(self):
+        live = OrchestratorConfig()
+        fresh = OrchestratorConfig(
+            merge_deep=MergeDeepConfig(depth_table=[DepthRow(0.9, 16), DepthRow(0.5, 2)])
+        )
+        submodel = live.merge_deep
+        report = apply_reload(live, fresh)
+        assert report['reloaded'] is True
+        assert 'merge_deep.depth_table' in report['applied']
+        assert 'merge_deep.depth_table' not in report['restart_required']
+        assert live.merge_deep is submodel
+        assert submodel.depth_table == [DepthRow(0.9, 16), DepthRow(0.5, 2)]
+
+    def test_operational_yaml_keeps_the_cap_and_leaves_the_table_at_its_default(self):
+        cfg = load_config(_REPO_ROOT / 'dark-factory-orchestrator.yaml')
+        assert cfg.merge_deep.chain_cap == 6
+        assert cfg.merge_deep.depth_table == MergeDeepConfig().depth_table
 
 
 class TestChainBuildTimeout:
@@ -296,6 +398,13 @@ class TestDefaultsYamlMergeDeepBlock:
             == MergeDeepConfig.model_fields['chain_cap'].default
             == 0
         )
+
+    def test_defaults_yaml_ships_the_field_default_depth_table(self):
+        """Same drift guard for ``depth_table``: the stanza is what applies."""
+        defaults = load_packaged_defaults()
+        field_default = MergeDeepConfig().depth_table
+        assert [tuple(row) for row in defaults['merge_deep']['depth_table']] == field_default
+        assert OrchestratorConfig().merge_deep.depth_table == field_default
 
 
 @pytest.mark.usefixtures("code_default_config")

@@ -1423,46 +1423,50 @@ order. One passing verify can therefore land k items — and it is not a
 statistical bet, because the suite that passed ran on the exact cumulative
 tree being landed.
 
-**The knob.** `merge_deep.chain_cap` bounds how many queued items one chain
-may contain. The shipped default is **`0`**, which is the **kill switch**:
-the gate can never open, so no chain code executes on any dispatch path and
-merging is byte-identical to pre-feature behaviour. Every `merge_deep` leaf
-is green-tier hot-reloadable (see [§6](#6-config-reload-vs-restart)), so
-enabling, retuning and killing the feature are each one `reload_config`
-away — no restart, no drained queue.
+**The knob.** `merge_deep.chain_cap` is the **kill switch** and nothing
+more: `0` is off, and any positive value is on. It no longer bounds how deep
+a chain goes. The stock default is `0`. At `0` the gate can never open, so
+no chain code executes on any dispatch path and merging is byte-identical to
+pre-feature behaviour.
+Every `merge_deep` leaf, `depth_table` included, is green-tier
+hot-reloadable (see [§6](#6-config-reload-vs-restart)), so enabling,
+retuning and killing the feature are each one `reload_config` away — no
+restart, no drained queue.
 
-**Cap staging is a plan, not a live value.** `plans/deep-merge-ahead-prd.md`
-decision 6 stages the cap `6` → `32` (the study-validated depth, then
-"uncapped in practice"), but that rollout is owned by tasks ζ (reify canary
-at 6), η1 (the 7-day predicate) and η2 (promote to 32), and the cap is
-per-project config. The stock default is still `0` everywhere. To learn
-whether chains are live on a unit, read that project's
-`dark-factory-orchestrator.yaml` — do not infer `6` from the PRD.
+**Depth comes from the pass estimate, not a cap.** Cap staging is retired:
+task 3191 (promote the cap to 32) is cancelled, and task 3190 was superseded
+on 2026-11-17. Each round's depth is read off `merge_deep.depth_table`
+(shipped `[[0.93, 8], [0.85, 4], [0.75, 2]]`; below the last row, one item)
+against the rolling per-item pass estimate over the last 30 tip verdicts of
+the rounds the policy sized, and is never more than the queue holds. The
+window lives in memory and is seeded at worker start from the newest
+`merge_verify` rows.
+To learn whether chains are live on a unit, read that project's
+`dark-factory-orchestrator.yaml`.
 
-**Failure policy: halve on fail, reset on pass.** A tip failure says nothing
-about *which* item broke, so the next round targets `max(1, ⌊d/2⌋)` against
-the depth actually built, and consecutive failures log-bisect (6 → 3 → 1)
-toward the bad item. **Any** pass resets the state. Each round recomputes
-`target_depth = min(queue_len, chain_cap, halving_state)` afresh, so a reset
-re-derives the target from the queue as it is *now* rather than replaying a
-stale length. At the `d=1` floor no chain is built at all and the round
-takes today's adjacent verify — the floor is byte-identical **by
-construction**, not by careful mimicry. A failed tip lands nothing *via the
-chain* and mutates the queue not at all: its items stay queued and take
-their normal sequential path. The round is not therefore a zero-landing
-round — the head is never chained, so its own verify proceeds untouched and
-can still land in that same round; the head's verdict is discarded only on a
-tip **pass**, where the tip's tree strictly contains it.
+**Failure policy: each member verifies alone.** A tip failure says nothing
+about *which* item broke, so the failed tip lands nothing, its owner is
+requeued, and the owner and every link are marked. A marked task is neither
+chained nor offered as a link: its next verify covers its own tree alone. A
+passer lands and the bad item is blocked with its findings. The mark lasts
+until the task's request leaves the lane (landed, blocked or dropped), so a
+verify the cascade cancels or voids does not clear it. Requests that are not
+marked keep chaining at the table's depth. A chain verify that RAISES is not
+a verdict: it marks its owner the same way (task 3185). Each `merge_verify`
+row's `chain_depth_reason` records the basis, the estimate, the table row
+and the queue depth; it is null when the policy did not size the round (a
+marked task, a dispatch that may not chain, the kill switch), and such a
+round does not feed the pass estimate.
 
 **What you do with it.** To stop chains on a live unit, set `chain_cap: 0`
 and `reload_config`; that is the whole intervention, and it takes effect on
-the next dispatch round. To judge whether to raise it, read the `--chains`
-report (see
+the next dispatch round. To judge whether to deepen or shallow the table,
+read the `--chains` report (see
 [§"Reading the merge-lane throughput baseline"](#reading-the-merge-lane-throughput-baseline)).
-The authoritative contract — the dispatch and landing invariants,
-truncate-at-conflict semantics, and the stale-CAS abort — is
-`plans/deep-merge-ahead-prd.md`; this section is the operator's summary of
-it, not a second copy.
+The authoritative contracts are `plans/merge-lane-policy-prd.md` D6/D7 for
+depth and the failure policy, and `plans/deep-merge-ahead-prd.md` for the dispatch and
+landing invariants, truncate-at-conflict semantics and the stale-CAS abort;
+this section is the operator's summary of them, not a second copy.
 
 **Deploying a knob flip.** `scripts/merge-deep-set-cap.sh`, like its sibling
 `scripts/merge-pytest-n-ab-switch.sh`, lands its yaml edit through the
@@ -1986,9 +1990,10 @@ takes no arguments: it always re-reads that process's own
   `tests/scripts/test_merge_gate_history_leg.py::test_the_leg_runs_exactly_the_roots_that_own_marked_tests`
   keeps the leg's segments on the packages that own marked tests. Green-tier
   for the same reason as `merge_gate_history_pure`.
-- `merge_deep.chain_cap` (the deep merge-ahead chain cap — see
+- `merge_deep.*`, including `chain_cap` and `depth_table` (deep merge-ahead
+  chains — see
   [§"Deep merge-ahead chains"](#deep-merge-ahead-chains-merge_deepchain_cap);
-  `0` is the shipped default and the feature's kill switch). Green-tier on
+  `chain_cap` is the feature's kill switch, `0` off). Green-tier on
   purpose, for the reason the `config_key_census.*` bullet above and the
   `mem0_update.enabled` bullet below both give: a kill switch you can only
   pull by restarting the unit is not a kill switch. Enable, retune and

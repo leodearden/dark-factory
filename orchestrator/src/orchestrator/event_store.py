@@ -230,6 +230,12 @@ class EventType(StrEnum):
     # verify covers as built, dispatching one first; absent where unknown
     # (trains, shadow and solo-attribution verifies). Built by
     # orchestrator/src/orchestrator/merge_pool_facts.py::with_chain_members.
+    # PLUS chain_depth_reason (task 8528): always present, null when the
+    # dispatch never consulted the deep policy (kill switch, not
+    # chain-eligible, a task marked to verify un-chained, or a non-dispatch
+    # emitter such as shadow, the history leg or a train re-verify);
+    # otherwise the wire shape of
+    # orchestrator/src/orchestrator/merge_verify_facts.py::ChainDepthReason.wire.
     merge_verify = 'merge_verify'
     # The merge lane cancelled a still-running merge verify (task 8523).
     # task_id-keyed, phase='merge'; emitted by
@@ -1317,6 +1323,25 @@ class MergeFinalizedKey(Enum):
 _MERGE_FINALIZED_INDEXES = '\n'.join(key.index_ddl for key in MergeFinalizedKey)
 
 
+
+def _event_row_dict(row: tuple) -> dict:
+    """One ``events`` row selected as the fetch readers select it, ``data`` parsed."""
+    (row_id, timestamp, run_id, task_id, evt_type, phase,
+     role, raw_data, cost_usd, duration_ms) = row
+    return {
+        'id': row_id,
+        'timestamp': timestamp,
+        'run_id': run_id,
+        'task_id': task_id,
+        'event_type': evt_type,
+        'phase': phase,
+        'role': role,
+        'data': json.loads(raw_data) if raw_data else {},
+        'cost_usd': cost_usd,
+        'duration_ms': duration_ms,
+    }
+
+
 class EventStore:
     """Append-only SQLite event store.
 
@@ -1585,6 +1610,31 @@ class EventStore:
             logger.warning('event_store.fetch_events_by_type failed', exc_info=True)
             return []
 
+    def fetch_recent_events_by_type(self, event_type: str | EventType, *, limit: int) -> list[dict]:
+        """Return the newest *limit* events of *event_type* across ALL runs, oldest first.
+
+        Rows are shaped as :meth:`fetch_events_by_type_all_runs` returns them.
+        Errors are logged and return [] (read path is fire-safe).
+        """
+        try:
+            type_str = event_type.value if isinstance(event_type, EventType) else str(event_type)
+            conn = self._connect()
+            try:
+                rows = conn.execute(
+                    'SELECT id, timestamp, run_id, task_id, event_type, phase, role, '
+                    '       data, cost_usd, duration_ms '
+                    'FROM events '
+                    'WHERE event_type = ? '
+                    'ORDER BY id DESC LIMIT ?',
+                    (type_str, limit),
+                ).fetchall()
+            finally:
+                conn.close()
+            return [_event_row_dict(row) for row in reversed(rows)]
+        except Exception:
+            logger.warning('event_store.fetch_recent_events_by_type failed', exc_info=True)
+            return []
+
     def fetch_events_by_type_all_runs(
         self, event_type: str | EventType, *, task_id: str | None = None,
     ) -> list[dict]:
@@ -1621,23 +1671,7 @@ class EventStore:
                 rows = conn.execute(sql, tuple(params)).fetchall()
             finally:
                 conn.close()
-            result = []
-            for row in rows:
-                (row_id, timestamp, run_id, row_task_id, evt_type, phase,
-                 role, raw_data, cost_usd, duration_ms) = row
-                result.append({
-                    'id': row_id,
-                    'timestamp': timestamp,
-                    'run_id': run_id,
-                    'task_id': row_task_id,
-                    'event_type': evt_type,
-                    'phase': phase,
-                    'role': role,
-                    'data': json.loads(raw_data) if raw_data else {},
-                    'cost_usd': cost_usd,
-                    'duration_ms': duration_ms,
-                })
-            return result
+            return [_event_row_dict(row) for row in rows]
         except Exception:
             logger.warning(
                 'event_store.fetch_events_by_type_all_runs failed', exc_info=True
