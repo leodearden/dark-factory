@@ -23,6 +23,7 @@ import socket
 import subprocess
 import sys
 import time
+import tomllib
 import urllib.error
 import urllib.request
 from collections.abc import Iterator
@@ -597,3 +598,137 @@ class TestStoreRefusals:
         proc = store_world.install("--bogus")
         assert proc.returncode == 2
         assert list(store_world.home.iterdir()) == []
+
+
+HOST_CONFIG_KEYS = {
+    "enabled",
+    "store_url",
+    "store_user",
+    "store_password",
+    "fallback_dir",
+    "fallback_cap",
+    "policy",
+}
+
+
+def write_credentials(path: Path, lines: str) -> Path:
+    path.write_text(lines)
+    path.chmod(0o600)
+    return path
+
+
+class TestHostConfig:
+    def test_laptop_writes_only_the_host_config(
+        self, store_world: StoreWorld, tmp_path: Path
+    ) -> None:
+        credentials = write_credentials(
+            tmp_path / "copied-credentials", "RCLONE_USER=reify-canon\nRCLONE_PASS=0123abcd\n"
+        )
+        host_config = tmp_path / "cfg" / "reify-canon" / "host.toml"
+        store_url = f"http://{FAKE_TAILSCALE_ADDR}:{store_world.port}"
+
+        proc = store_world.install(
+            "--host-config",
+            BUILD_CACHE_STORE_CREDENTIALS=str(credentials),
+            REIFY_CANON_HOST_CONFIG=str(host_config),
+            REIFY_CANON_ENABLED="true",
+            REIFY_CANON_POLICY="mixed",
+            BUILD_CACHE_STORE_URL=store_url,
+        )
+
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert host_config.stat().st_mode & 0o777 == 0o600
+        assert host_config.parent.stat().st_mode & 0o777 == 0o700
+        config = tomllib.loads(host_config.read_text())
+        assert set(config) == HOST_CONFIG_KEYS
+        assert config["enabled"] is True
+        assert config["policy"] == "mixed"
+        assert config["store_url"] == store_url
+        assert config["store_user"] == "reify-canon"
+        assert config["store_password"] == "0123abcd"
+        assert config["fallback_dir"].startswith(f"{store_world.home}/")
+        assert config["fallback_cap"] == "50G"
+        assert not store_world.store.exists()
+        assert not store_world.unit_dir.exists()
+        assert store_world.mutations() == []
+
+    def test_defaults_are_disabled_shared_and_loopback(
+        self, store_world: StoreWorld, tmp_path: Path
+    ) -> None:
+        credentials = write_credentials(
+            tmp_path / "credentials", "RCLONE_USER=reify-canon\nRCLONE_PASS=feed\n"
+        )
+        proc = store_world.install(
+            "--host-config", BUILD_CACHE_STORE_CREDENTIALS=str(credentials)
+        )
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        host_config = store_world.home / ".config" / "reify-canon" / "host.toml"
+        config = tomllib.loads(host_config.read_text())
+        assert config["enabled"] is False
+        assert config["policy"] == "shared"
+        assert config["store_url"] == f"http://127.0.0.1:{store_world.port}"
+
+    def test_rerun_is_byte_identical(self, store_world: StoreWorld, tmp_path: Path) -> None:
+        credentials = write_credentials(
+            tmp_path / "credentials", "RCLONE_USER=reify-canon\nRCLONE_PASS=feed\n"
+        )
+        host_config = tmp_path / "reify-canon" / "host.toml"
+        env = {
+            "BUILD_CACHE_STORE_CREDENTIALS": str(credentials),
+            "REIFY_CANON_HOST_CONFIG": str(host_config),
+            "REIFY_CANON_ENABLED": "true",
+        }
+        assert store_world.install("--host-config", **env).returncode == 0
+        first = host_config.read_bytes()
+        assert store_world.install("--host-config", **env).returncode == 0
+        assert host_config.read_bytes() == first
+
+    @pytest.mark.parametrize(
+        ("env", "credential_lines"),
+        [
+            ({"REIFY_CANON_POLICY": "fast"}, "RCLONE_USER=u\nRCLONE_PASS=p\n"),
+            ({"REIFY_CANON_ENABLED": "yes"}, "RCLONE_USER=u\nRCLONE_PASS=p\n"),
+            ({}, "RCLONE_USER=u\n"),
+        ],
+        ids=["unknown-policy", "non-bool-enabled", "no-password"],
+    )
+    def test_invalid_input_writes_no_file(
+        self,
+        store_world: StoreWorld,
+        tmp_path: Path,
+        env: dict[str, str],
+        credential_lines: str,
+    ) -> None:
+        credentials = write_credentials(tmp_path / "credentials", credential_lines)
+        host_config = tmp_path / "reify-canon" / "host.toml"
+        proc = store_world.install(
+            "--host-config",
+            BUILD_CACHE_STORE_CREDENTIALS=str(credentials),
+            REIFY_CANON_HOST_CONFIG=str(host_config),
+            **env,
+        )
+        assert proc.returncode == 1
+        assert not host_config.exists()
+
+    @needs_rclone
+    def test_check_proves_the_store_takes_this_hosts_credentials(
+        self, installed: StoreWorld
+    ) -> None:
+        assert installed.install("--host-config").returncode == 0
+        host_config = installed.home / ".config" / "reify-canon" / "host.toml"
+
+        proc = installed.install("--check", "--host-config")
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+
+        text = host_config.read_text()
+        password = tomllib.loads(text)["store_password"]
+        host_config.write_text(text.replace(password, "wrong-password"))
+        proc = installed.install("--host-config", "--check")
+        assert proc.returncode == 1
+        assert "credentials" in proc.stderr
+
+        host_config.write_text(text)
+        host_config.chmod(0o644)
+        proc = installed.install("--check", "--host-config")
+        assert proc.returncode == 1
+        assert "644" in proc.stderr
