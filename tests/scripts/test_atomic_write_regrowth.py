@@ -440,6 +440,26 @@ _ALLOWED_RENAMERS = {
         'back only because whether the fixture should keep mirroring the shell '
         'idiom is a test-design call for that follow-up and not for a merge '
         'resolution.',
+    # --- task 7045
+    ('shared/src/shared/_pytest_inject/_df_defect_plugin.py', '_write_atomically'):
+        'STDLIB-ONLY INJECTED PLUGIN — the class of fleet_files.atomic_write_text, '
+        'dashboard-watchdog.save_state and render_systemd_unit.main above, so '
+        'that argument is not restated. verify loads this module into TARGET '
+        'projects\' pytest runs via ``-p _df_defect_plugin``, merging only its '
+        'own directory onto PYTHONPATH (orchestrator/src/orchestrator/'
+        'verify_cmd.py::with_defect_plugin, verify.py::_target_subprocess_env). '
+        'Those targets have no ``shared`` install, so the plugin may import '
+        'stdlib and pytest only and ``shared.safe_io.atomic_write_text`` cannot '
+        'resolve there (plans/defect-tests-prd.md decision 19). It writes the '
+        '``<junit>.tests.json`` collection map and the ``--df-defect-outcomes`` '
+        'file from one designated writer via mkstemp + os.replace, so a '
+        'consumer (verify.py::_archive_junit_report, ζ1, client-feed) never '
+        'reads a torn map. No test pins the stdlib-only import set: '
+        'shared/tests/test_df_defect_plugin.py runs the plugin under '
+        'sys.executable, where ``shared`` IS importable. The name is not one '
+        'test_atomic_write_text_helpers_only_delegate inspects, so this entry '
+        'silences no delegate check. A migration candidate only if targets ever '
+        'gain ``shared``. Added by task 7045.',
 }
 
 
