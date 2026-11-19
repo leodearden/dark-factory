@@ -175,7 +175,6 @@ class _Run:
     reqs: dict[str, MergeRequest]
     local: _TreeRecordingVerifier
     head_host: _TreeRecordingRemote
-    h_entered: asyncio.Event
     release_h: asyncio.Event
 
     def put(self, *names: str) -> None:
@@ -240,7 +239,7 @@ async def _running(
         event_store=scene.events, escalation_queue=scene.escalations,
     )
     async with running_lane(lane):
-        run = _Run(scene, lane, queue, reqs, local, head_host, h_entered, release_h)
+        run = _Run(scene, lane, queue, reqs, local, head_host, release_h)
         run.put('H')
         await wait_responsive(
             h_entered.wait(), timeout=MERGE_GATE_BARRIER_TIMEOUT,
