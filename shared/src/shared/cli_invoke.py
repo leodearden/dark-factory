@@ -34,6 +34,7 @@ except ImportError:  # pragma: no cover - exercised only when aiohttp absent
     _VllmBridgeRuntime = None
 
 if TYPE_CHECKING:
+    from shared.account_reserve import WorkClassSource
     from shared.config_dir import TaskConfigDir
     from shared.cost_store import CostStore
     from shared.usage_gate import PoolFrozen, UsageGate
@@ -264,7 +265,9 @@ class AllAccountsCappedException(Exception):
     - ``pool_frozen``: the gate's ``PoolFrozen`` when the deadline was spent
       parked, else ``None``.  It says which accounts were capped and which
       AUTH_FAILED, and the message is built from it, because a pool frozen on
-      rejected credentials is not a cap and will not clear at a reset.
+      rejected credentials is not a cap and will not clear at a reset; nor is
+      a caller refused the allowance reserve (``pool_frozen.reserved_account``
+      set), whose message names the reserve and its release time instead.
     """
 
     def __init__(
@@ -280,10 +283,13 @@ class AllAccountsCappedException(Exception):
         self.label = label
         self.pool_frozen = pool_frozen
         spent = f'after {retries} retries ({elapsed_secs:.1f}s elapsed)'
-        super().__init__(
-            f'{label}: all accounts capped {spent}' if pool_frozen is None
-            else f'{label}: cap-wait deadline spent parked {spent} — {pool_frozen}'
-        )
+        if pool_frozen is None:
+            message = f'{label}: all accounts capped {spent}'
+        elif pool_frozen.reserved_account is not None:
+            message = f'{label}: {pool_frozen} (patience spent waiting {spent})'
+        else:
+            message = f'{label}: cap-wait deadline spent parked {spent} — {pool_frozen}'
+        super().__init__(message)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2354,6 +2360,7 @@ async def invoke_with_cap_retry(
     invoke_fn: Callable[..., Awaitable[AgentResult]] | None = None,
     backend: str = 'claude',
     park_on_frozen_pool: bool = True,
+    work_class: WorkClassSource | None = None,
     **invoke_kwargs,
 ) -> AgentResult:
     """Invoke an agent, retrying on usage-cap hits with account failover.
@@ -2417,6 +2424,15 @@ async def invoke_with_cap_retry(
     to park and lets ``PoolFrozen`` propagate unconverted, for a caller that
     must defer rather than wait and must tell a cap from rejected
     credentials, which will not clear at a reset (task 6042).
+
+    *work_class* is the caller's class for the allowance reserve
+    (plans/allowance-reserve-by-account-prd.md §6.1): a ``WorkClass`` or a
+    function returning one, forwarded to ``usage_gate.invoke_slot`` only when
+    given, so a gate or double that knows nothing of it is called as before.
+    ``None`` is background work, recorded as unclassified. A wait on the
+    reserve happens inside the gate's park, so it counts nothing toward
+    *max_cap_retries*, and a spent park allowance names the reserve and its
+    release time rather than a cap.
 
     Only FAILED results are offered to the cap detector.
     ``UsageGate.detect_cap_hit`` classifies a synthetic ``success=False``
@@ -2711,22 +2727,28 @@ async def invoke_with_cap_retry(
                     None if cap_wait_deadline is None
                     else max(0.0, cap_wait_deadline - time.monotonic())
                 )
+                slot_kwargs = {} if work_class is None else {'work_class': work_class}
                 try:
                     slot = await slot_exit.enter_async_context(
                         usage_gate.invoke_slot(
                             scope=scope,
                             park=park_on_frozen_pool,
                             max_wait_secs=park_allowance,
+                            **slot_kwargs,
                         ),
                     )
                 except PoolFrozen as frozen:
                     if not park_on_frozen_pool:
                         raise
                     elapsed = time.monotonic() - retry_start
+                    why = (
+                        f'patience spent after {elapsed:.1f}s parked: {frozen}'
+                        if frozen.reserved_account is not None
+                        else f'cap-wait sanity bound ({cap_wait_sanity_secs}s) spent parked '
+                        f'after {elapsed:.1f}s: {frozen}'
+                    )
                     raise _cap_patience_spent(
-                        f'cap-wait sanity bound ({cap_wait_sanity_secs}s) spent parked '
-                        f'after {elapsed:.1f}s: {frozen}',
-                        consecutive_cap_hits, elapsed, pool_frozen=frozen,
+                        why, consecutive_cap_hits, elapsed, pool_frozen=frozen,
                     ) from frozen
                 # Consulted inside the acquired slot, after any cooldown or
                 # park, and before attribution and credentials: a declined

@@ -6,6 +6,7 @@ the public names.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from datetime import UTC, datetime, time, timedelta, timezone
@@ -19,15 +20,26 @@ from shared.account_reserve import (
     InvalidReserve,
     ReserveConfig,
     ReserveEvent,
+    ReserveRefusal,
     ReserveState,
+    ReserveWaitEnd,
     ScheduleDrift,
     WeeklyReset,
     WorkClass,
     WorkKind,
     admits,
+    config_event_details,
+    first_choice,
     parse_reserve,
+    refusal,
+    refuses_account,
     resolve_work_class,
     schedule_drift,
+    served_details,
+    wait_end_for_lease,
+    wait_end_without_lease,
+    wait_ended_details,
+    wait_started_details,
 )
 from shared.config_models import UsageCapConfig
 
@@ -479,3 +491,250 @@ class TestAccountsFileLoader:
 
         assert unchanged == first
         assert changed != first
+
+
+GATE_WEDNESDAY = utc(2026, 11, 11, 12)
+GATE_RELEASE_AT = utc(2026, 11, 15, 9)
+GATE_NEXT_RESET = utc(2026, 11, 16, 21)
+GATE_IN_RELEASE = utc(2026, 11, 15, 12)
+
+LOW_TASK = WorkClass(
+    kind=WorkKind.TASK, project_id='dark_factory', tier='low', task_id='7', role='implementer'
+)
+HIGH_TASK = WorkClass(
+    kind=WorkKind.TASK, project_id='dark_factory', tier='high', task_id='8', role='implementer'
+)
+
+
+class TestRefusesAccount:
+    """Seen from Wed 2026-11-11 12:00 UTC the PRD block releases Sun 11-15 09:00, resets Mon 21:00."""
+
+    @pytest.mark.parametrize(
+        'work_class',
+        [pytest.param(LOW_TASK, id='task-low'), pytest.param(BACKGROUND, id='background')],
+    )
+    def test_the_reserve_is_refused_to_an_unadmitted_class_while_protected(
+        self, work_class: WorkClass
+    ) -> None:
+        assert refuses_account(reserve_config(), 'max-h', work_class, GATE_WEDNESDAY) is True
+
+    def test_another_account_is_never_refused(self) -> None:
+        assert refuses_account(reserve_config(), 'max-d', LOW_TASK, GATE_WEDNESDAY) is False
+
+    @pytest.mark.parametrize(
+        'work_class',
+        [pytest.param(HIGH_TASK, id='task-high'), pytest.param(ESSENTIAL, id='essential')],
+    )
+    def test_an_admitted_class_is_not_refused(self, work_class: WorkClass) -> None:
+        assert refuses_account(reserve_config(), 'max-h', work_class, GATE_WEDNESDAY) is False
+
+    def test_nothing_is_refused_in_the_release_window(self) -> None:
+        assert refuses_account(reserve_config(), 'max-h', LOW_TASK, GATE_IN_RELEASE) is False
+
+
+class TestRefusal:
+    def test_with_nothing_open_there_is_no_refusal(self) -> None:
+        assert refusal(reserve_config(), [], LOW_TASK, GATE_WEDNESDAY) is None
+
+    def test_with_another_account_open_there_is_no_refusal(self) -> None:
+        assert refusal(reserve_config(), ['max-d', 'max-h'], LOW_TASK, GATE_WEDNESDAY) is None
+        assert refusal(reserve_config(), ['max-d'], LOW_TASK, GATE_WEDNESDAY) is None
+
+    def test_an_admitted_class_is_not_refused(self) -> None:
+        assert refusal(reserve_config(), ['max-h'], HIGH_TASK, GATE_WEDNESDAY) is None
+
+    def test_the_release_window_refuses_nobody(self) -> None:
+        assert refusal(reserve_config(), ['max-h'], LOW_TASK, GATE_IN_RELEASE) is None
+
+    def test_only_the_reserve_open_and_the_class_refused_is_a_refusal_until_the_release(
+        self,
+    ) -> None:
+        refused = refusal(reserve_config(), ['max-h'], LOW_TASK, GATE_WEDNESDAY)
+
+        assert refused == ReserveRefusal(account='max-h', release_at=GATE_RELEASE_AT)
+
+
+class TestFirstChoice:
+    @pytest.mark.parametrize(
+        ('now', 'expected'),
+        [
+            pytest.param(GATE_WEDNESDAY, None, id='protected'),
+            pytest.param(GATE_RELEASE_AT - timedelta(microseconds=1), None, id='before-release'),
+            pytest.param(GATE_RELEASE_AT, 'max-h', id='at-release'),
+            pytest.param(GATE_IN_RELEASE, 'max-h', id='in-release'),
+            pytest.param(
+                GATE_NEXT_RESET - timedelta(microseconds=1), 'max-h', id='just-before-reset'
+            ),
+            pytest.param(GATE_NEXT_RESET, None, id='at-reset'),
+        ],
+    )
+    def test_the_reserve_comes_first_only_in_the_release_window(
+        self, now: datetime, expected: str | None
+    ) -> None:
+        assert first_choice(reserve_config(), now) == expected
+
+
+class TestWaitEndForLease:
+    def test_a_lease_on_another_account_means_an_account_opened(self) -> None:
+        assert (
+            wait_end_for_lease(reserve_config(), 'max-d', GATE_WEDNESDAY)
+            is ReserveWaitEnd.ACCOUNT_OPENED
+        )
+
+    def test_a_reserve_lease_in_the_release_window_means_released(self) -> None:
+        assert (
+            wait_end_for_lease(reserve_config(), 'max-h', GATE_IN_RELEASE)
+            is ReserveWaitEnd.RELEASED
+        )
+
+    def test_a_reserve_lease_in_the_protected_window_means_admitted(self) -> None:
+        assert (
+            wait_end_for_lease(reserve_config(), 'max-h', GATE_WEDNESDAY)
+            is ReserveWaitEnd.ADMITTED
+        )
+
+
+def test_reserve_wait_end_values() -> None:
+    assert {end.value for end in ReserveWaitEnd} == {
+        'account_opened',
+        'released',
+        'admitted',
+        'reserve_unusable',
+        'deadline',
+        'cancelled',
+    }
+
+
+class TestConfigEventDetails:
+    def test_an_active_reserve_names_its_calendar_and_tiers(self) -> None:
+        details = config_event_details(ActiveReserve(reserve_config()), GATE_WEDNESDAY)
+
+        assert details == {
+            'state': 'active',
+            'reason': None,
+            'account': 'max-h',
+            'next_reset': '2026-11-16T21:00:00+00:00',
+            'release_at': '2026-11-15T09:00:00+00:00',
+            'admit_tiers': {'default': ['critical', 'high']},
+        }
+        assert json.loads(json.dumps(details)) == details
+
+    def test_a_project_list_appears_under_its_project_id(self) -> None:
+        config = reserve_config(admit_tiers={'dark_factory': ['critical', 'high', 'medium']})
+
+        details = config_event_details(ActiveReserve(config), GATE_WEDNESDAY)
+
+        assert details['admit_tiers'] == {
+            'default': ['critical', 'high'],
+            'dark_factory': ['critical', 'high', 'medium'],
+        }
+
+    def test_an_invalid_reserve_gives_its_reason_and_nothing_else(self) -> None:
+        details = config_event_details(InvalidReserve('reserve.colour: extra'), GATE_WEDNESDAY)
+
+        assert details == {
+            'state': 'invalid',
+            'reason': 'reserve.colour: extra',
+            'account': None,
+            'next_reset': None,
+            'release_at': None,
+            'admit_tiers': None,
+        }
+
+
+class TestWaitEndWithoutLease:
+    """A waiting caller selection could not serve: max-h is the reserve, max-d another account."""
+
+    def test_another_account_open_means_an_account_opened(self) -> None:
+        end = wait_end_without_lease(reserve_config(), ['max-d'], [], LOW_TASK, GATE_WEDNESDAY)
+
+        assert end is ReserveWaitEnd.ACCOUNT_OPENED
+
+    @pytest.mark.parametrize(
+        'open_accounts',
+        [pytest.param([], id='nothing-open'), pytest.param(['max-h'], id='reserve-open')],
+    )
+    def test_a_refused_caller_stays_while_the_reserve_is_open_or_probing(
+        self, open_accounts: list[str]
+    ) -> None:
+        end = wait_end_without_lease(reserve_config(), open_accounts, [], LOW_TASK, GATE_WEDNESDAY)
+
+        assert end is None
+
+    def test_the_reserve_failed_means_reserve_unusable(self) -> None:
+        end = wait_end_without_lease(reserve_config(), [], ['max-h'], LOW_TASK, GATE_WEDNESDAY)
+
+        assert end is ReserveWaitEnd.RESERVE_UNUSABLE
+
+    def test_an_open_account_outranks_a_failed_reserve(self) -> None:
+        end = wait_end_without_lease(
+            reserve_config(), ['max-d'], ['max-h'], LOW_TASK, GATE_WEDNESDAY
+        )
+
+        assert end is ReserveWaitEnd.ACCOUNT_OPENED
+
+    def test_a_caller_no_longer_refused_has_been_admitted_or_released(self) -> None:
+        config = reserve_config()
+
+        assert wait_end_without_lease(config, [], [], HIGH_TASK, GATE_WEDNESDAY) is (
+            ReserveWaitEnd.ADMITTED
+        )
+        assert wait_end_without_lease(config, [], [], LOW_TASK, GATE_IN_RELEASE) is (
+            ReserveWaitEnd.RELEASED
+        )
+
+
+LOW_TASK_FIELDS: dict[str, object] = {
+    'kind': 'task',
+    'role': 'implementer',
+    'project_id': 'dark_factory',
+    'tier': 'low',
+    'task_id': '7',
+}
+REFUSED = ReserveRefusal(account='max-h', release_at=GATE_RELEASE_AT)
+
+
+class TestEventDetails:
+    def test_a_wait_start_names_the_class_the_reserve_and_the_release(self) -> None:
+        details = wait_started_details(LOW_TASK, REFUSED, unclassified=False)
+
+        assert details == {
+            **LOW_TASK_FIELDS,
+            'account': 'max-h',
+            'release_at': '2026-11-15T09:00:00+00:00',
+            'unclassified': False,
+        }
+        assert type(details['kind']) is str
+        assert json.loads(json.dumps(details)) == details
+
+    def test_an_unclassified_caller_waits_as_background(self) -> None:
+        details = wait_started_details(resolve_work_class(None), REFUSED, unclassified=True)
+
+        assert {key: details[key] for key in LOW_TASK_FIELDS} == {
+            'kind': 'background',
+            'role': None,
+            'project_id': None,
+            'tier': None,
+            'task_id': None,
+        }
+        assert details['unclassified'] is True
+
+    def test_a_wait_end_adds_the_time_waited_and_the_exit(self) -> None:
+        details = wait_ended_details(
+            LOW_TASK,
+            REFUSED,
+            unclassified=False,
+            waited_secs=12.345,
+            ended_by=ReserveWaitEnd.RELEASED,
+        )
+
+        assert details == {
+            **wait_started_details(LOW_TASK, REFUSED, unclassified=False),
+            'waited_secs': 12.3,
+            'ended_by': 'released',
+        }
+        assert json.loads(json.dumps(details)) == details
+
+    def test_a_served_call_names_the_class_and_its_cost_only(self) -> None:
+        assert served_details(LOW_TASK, cost_usd=1.25) == {**LOW_TASK_FIELDS, 'cost_usd': 1.25}
+        assert served_details(LOW_TASK, cost_usd=None)['cost_usd'] is None
