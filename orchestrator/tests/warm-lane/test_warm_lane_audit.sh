@@ -267,7 +267,7 @@ _strict_max() {
 # Feeds <json> to python3 on stdin; why it is shaped this way:
 # orchestrator/tests/warm-lane/README.md "Delta 11".
 _py_json_check() {
-    printf '%s' "$1" | python3 "${@:2}"
+    printf '%s' "$1" | python3 -I "${@:2}"
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -632,13 +632,13 @@ assert "H2: default format is the table (a lane= row is present)" \
 run_helper --mount "$H_MOUNT" --format json
 assert "H3: exit 0 (json format)" test "$RC" -eq 0
 assert "H4: --format json output parses as JSON (python3 json.load)" \
-    bash -c 'printf "%s" "$1" | python3 -c "import json,sys; json.load(sys.stdin)"' _ "$OUT"
+    _py_json_check "$OUT" -c "import json,sys; json.load(sys.stdin)"
 assert "H5: json output contains a classification key" \
     bash -c 'printf "%s\n" "$1" | grep -q "\"classification\""' _ "$OUT"
 assert "H6: json carries 2 lane objects with the full expected key set" \
-    bash -c 'printf "%s" "$1" | python3 "$2"' _ "$OUT" "$H_PY_KEYS"
+    _py_json_check "$OUT" "$H_PY_KEYS"
 assert "H7: json headroom object has resident=2" \
-    bash -c 'printf "%s" "$1" | python3 "$2"' _ "$OUT" "$H_PY_HEADROOM"
+    _py_json_check "$OUT" "$H_PY_HEADROOM"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Block I — B1 headline boundary (4-lane pool) + A3 exit-0 degradation
@@ -930,7 +930,7 @@ PYEOF
 run_helper --mount "$K_MOUNT" --format json
 assert "K6a: exit 0 (json)" test "$RC" -eq 0
 assert "K6b: json lane objects carry a 'live' key with the same LIVE/IDLE values" \
-    bash -c 'printf "%s" "$1" | python3 "$2"' _ "$OUT" "$K_PY_LIVE"
+    _py_json_check "$OUT" "$K_PY_LIVE"
 
 # Release the live-flock lock.
 kill "$K_LOCK_PID" 2>/dev/null || true
@@ -1108,7 +1108,7 @@ done
 run_helper --mount "$L_MOUNT" --format json
 assert "L8a: exit 0 (json)" test "$RC" -eq 0
 assert "L8b: json lane objects carry the same assigned= values as the table rows" \
-    bash -c 'printf "%s" "$1" | python3 "$2" "${@:3}"' _ "$OUT" "$L_PY_ASSIGNED" "${L_PY_ARGS[@]}"
+    _py_json_check "$OUT" "$L_PY_ASSIGNED" "${L_PY_ARGS[@]}"
 
 # ── L9: a present-but-UNREADABLE record is the third way _lane_record's
 # readability guard can fire, and the only one no other fixture reaches.
@@ -1293,7 +1293,7 @@ PYEOF
 
 ORACLE_MAP="$M_MAP" run_helper --mount "$M_MOUNT" --status-cmd "$ORACLE_STUB_DIR/leak-oracle.sh" --format json
 assert "M7: json lane objects carry a 'pin' key with the same raw values" \
-    bash -c 'printf "%s" "$1" | python3 "$2"' _ "$OUT" "$M_PY_PIN"
+    _py_json_check "$OUT" "$M_PY_PIN"
 
 # A failing oracle must not abort and must not invent a status: a pinned lane
 # whose holder cannot be resolved reports pin=unknown (A3's treatment, applied
@@ -1513,7 +1513,7 @@ ORACLE_MAP="$N_MAP" run_helper --mount "$N_MOUNT" \
     --status-cmd "$ORACLE_STUB_DIR/leak-oracle.sh" --format json
 assert "N6a: exit 0 (json)" test "$RC" -eq 0
 assert "N6b: json headroom carries the same partition + cross-cut fields" \
-    bash -c 'printf "%s" "$1" | python3 "$2" "${@:3}"' _ "$OUT" "$N_PY_HEADROOM" \
+    _py_json_check "$OUT" "$N_PY_HEADROOM" \
     "resident=$n_exp_resident" "live=$n_exp_live" "pinned=$n_exp_pinned" \
     "quarantined=$n_exp_quarantined" "free=$n_exp_free" \
     "assigned=$n_exp_assigned" "state_unknown=$n_exp_state_unknown"
@@ -1660,7 +1660,7 @@ ORACLE_MAP="$O_MAP" run_helper --mount "$O_MOUNT" \
     --status-cmd "$ORACLE_STUB_DIR/leak-oracle.sh" --format json
 assert "O8a: exit 0 (json)" test "$RC" -eq 0
 assert "O8b: json pinned_by_status carries exactly the six buckets, summing to headroom.pinned" \
-    bash -c 'printf "%s" "$1" | python3 "$2" "${@:3}"' _ "$OUT" "$O_PY_PINNED" \
+    _py_json_check "$OUT" "$O_PY_PINNED" \
     "pending=${O_EXPECTED[pending]}" "infra-hold=${O_EXPECTED[infra-hold]}" \
     "blocked=${O_EXPECTED[blocked]}" "terminal=${O_EXPECTED[terminal]}" \
     "other=${O_EXPECTED[other]}" "unknown=${O_EXPECTED[unknown]}"
