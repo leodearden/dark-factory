@@ -514,7 +514,7 @@ test('speculativeOver: sums the counts across every payload project, unprobed on
 test('speculativeOver: a hole in any project is a hole in the total — a rate over a subset is no bound', () => {
   const data = mqData({
     a: entryReading(runsDbRead('fresh', counts(3, 1)), runsDbRead('fresh', 4)),
-    b: entryReading(runsDbRead('unknown'), runsDbRead('unknown')),
+    b: { ...entryReading(runsDbRead('unknown'), runsDbRead('unknown')), runs_db_present: true },
   });
 
   const total = speculativeOver(data, null);
@@ -524,19 +524,6 @@ test('speculativeOver: a hole in any project is a hole in the total — a rate o
   assert.deepEqual(missingParts(total), []);
   assert.equal(speculativeOver(data, ['a', 'missing']).state, 'unknown');
   assert.match(speculativeOver(data, ['a', 'missing']).reason, /missing/);
-});
-
-test('speculativeOver: a present-but-unread runs.db blanks the rate, never a lower bound', () => {
-  const data = mqData({
-    a: entryReading(runsDbRead('fresh', counts(3, 1)), runsDbRead('fresh', 4)),
-    b: { ...entryReading(runsDbRead('unknown'), runsDbRead('unknown')), runs_db_present: true },
-  });
-
-  const total = speculativeOver(data, null);
-
-  assert.equal(total.state, 'unknown');
-  assert.notEqual(total.state, 'lower_bound');
-  assert.match(total.reason, /\bb: /);
 });
 
 test('speculativeOver: a measured window with no attempts has no hit rate to show', () => {

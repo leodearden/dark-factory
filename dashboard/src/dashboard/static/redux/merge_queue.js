@@ -162,7 +162,7 @@ function recentTotal(data, project) {
 function speculativeOver(data, projects) {
   const total = runsDbOver(data, projects, projectSpeculative, sumSpeculativeCounts, combineQueueDatums);
   if (total.state !== 'unknown' && total.value.total === 0) {
-    return unknownQueueDatum(alsoReading('no speculative attempts in this window', total));
+    return unknownQueueDatum(withTotalReason('no speculative attempts in this window', total));
   }
   return total;
 }
@@ -179,7 +179,7 @@ function runsDbOver(data, projects, reader, combine, combineParts) {
 }
 
 // *why*, then *total*'s own reason, so a hole the total read past stays named.
-function alsoReading(why, total) {
+function withTotalReason(why, total) {
   return total.reason ? why + '; ' + total.reason : why;
 }
 
@@ -249,7 +249,7 @@ function attemptsHistory(data, projects) {
 function worstP95Over(data, projects) {
   const worst = runsDbOver(data, projects, projectAttempts, worstTimedP95, lowerBoundQueueDatums);
   if (worst.state !== 'unknown' && worst.value.timed_projects === 0) {
-    return unknownQueueDatum(alsoReading('no timed merges in this window', worst));
+    return unknownQueueDatum(withTotalReason('no timed merges in this window', worst));
   }
   return worst;
 }

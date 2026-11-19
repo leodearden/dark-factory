@@ -426,7 +426,7 @@ function lowerBoundCombinedDatum(partsByLabel, combine, emptyReason) {
   const holes = parts.filter(isHolePart);
   if (holes.length === parts.length) return unknownDatum(labelledReasons(holes));
 
-  const measured = parts.filter(part => !isHolePart(part)).map(([, part]) => part);
+  const measured = parts.filter(labelled => !isHolePart(labelled)).map(([, datum]) => datum);
   const total = measuredTotal(parts, measured, combine, 'lowerBoundCombinedDatum');
   if (holes.length === 0) return total;
   return { ...total, state: 'lower_bound', _missing_parts: holes.map(([label]) => label) };
