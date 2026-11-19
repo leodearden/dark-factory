@@ -32,6 +32,8 @@ from fused_memory.middleware.curator_types import CuratorDecision, PreparedCandi
 from fused_memory.middleware.task_curator import TaskCurator
 from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.middleware.ticket_store import TicketStore
+from fused_memory.models.reconciliation import EventType
+from fused_memory.models.scope import resolve_project_id
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.server.tools import create_mcp_server
 
@@ -49,9 +51,21 @@ class Stack:
     interceptor: TaskInterceptor
     server: Any
     ticket_store: TicketStore
+    event_buffer: EventBuffer
 
     async def call(self, tool: str, **args: Any) -> Any:
         return await self.server._tool_manager.call_tool(tool, {'project_root': self.root, **args})
+
+    async def events(self, event_type: EventType) -> list[dict[str, Any]]:
+        """The payloads of this project's journaled events of *event_type*, oldest first.
+
+        The interceptor's ``_project_root`` envelope key is dropped, so a payload reads as emitted.
+        """
+        journaled = await self.event_buffer.peek_buffered(resolve_project_id(self.root), limit=10_000)
+        return [
+            {key: value for key, value in event.payload.items() if key != '_project_root'}
+            for event in journaled if event.type == event_type
+        ]
 
     async def task_count(self) -> int:
         return len((await self.call('get_tasks'))['tasks'])
@@ -112,7 +126,7 @@ async def stack(tmp_path: Path) -> AsyncIterator[Stack]:
     try:
         yield Stack(
             root=str(tmp_path / 'proj'), backend=backend, interceptor=interceptor, server=server,
-            ticket_store=ticket_store,
+            ticket_store=ticket_store, event_buffer=event_buffer,
         )
     finally:
         await interceptor.close()
