@@ -4543,6 +4543,24 @@ class TestMemoryConsolidatorGateBacklogWiring:
         assert 'stage1_gate_backlog_stalled' not in report.stats
 
     @pytest.mark.asyncio
+    async def test_an_unavailable_tree_claims_no_gate_backlog(self, tmp_path, monkeypatch):
+        """An unknown tree publishes no gate-backlog count, exactly like an unset one."""
+        from escalation.queue import EscalationQueue
+
+        stage = make_consolidator(project_root='/tmp/reify')
+        stage._escalation_queue = EscalationQueue(tmp_path / 'gate_esc')
+        stage.filtered_task_tree = FilteredTaskTree(
+            unavailable_reason=TaskTreeUnavailableReason.fetch_error,
+        )
+
+        report = await self._run(stage, monkeypatch, 'run-gate-unavailable')
+
+        assert 'stage1_gate_backlog_stalled' not in report.stats, (
+            'a zero gate-backlog count over an unknown tree is a false zero claim'
+        )
+        assert 'stage1_gate_backlog_escalated' not in report.stats
+
+    @pytest.mark.asyncio
     async def test_none_queue_noops(self, monkeypatch):
         """(c2) _escalation_queue is None → block no-ops: no raise, no stat."""
         stage = make_consolidator(project_root='/tmp/reify')
