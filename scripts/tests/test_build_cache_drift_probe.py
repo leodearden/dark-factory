@@ -416,6 +416,13 @@ class TestDriftProbe:
         assert tree_snapshot(world.reify) == reify_before
         assert tree_snapshot(world.home) == home_before
 
+    def test_an_unparseable_crate_manifest_fails_the_probe(self, world: ProbeWorld) -> None:
+        crate = world.home / ".cargo" / "registry" / "src" / "index.crates.io-1949cf8c6b5b557f" / "glib-sys-0.18.1"
+        (crate / "Cargo.toml").write_text("[package\n")
+        proc = world.run(str(world.reify))
+        assert proc.returncode == 1
+        assert "deriving the pkg-config module lines" in proc.stderr
+
     def test_a_checkout_without_a_cargo_lock_exits_two(self, world: ProbeWorld) -> None:
         (world.reify / "Cargo.lock").unlink()
         proc = world.run(str(world.reify))

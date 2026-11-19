@@ -104,7 +104,7 @@ EOF
 )"
 slvs_version="$(pkg-config --modversion slvs 2>&1)"
 emit pkg-config.slvs "${slvs_version%%$'\n'*}; header=$(test -e "$SLVS_HEADER" && echo y || echo n)"
-python3 -I - "$R/Cargo.lock" "${CARGO_HOME:-$HOME/.cargo}/registry/src" <<'EOF'
+python3 -I - "$R/Cargo.lock" "${CARGO_HOME:-$HOME/.cargo}/registry/src" <<'EOF' || { echo "build_cache_drift_probe: deriving the pkg-config module lines from $R/Cargo.lock failed (above)" >&2; exit 1; }
 import re, subprocess, sys, tomllib
 from pathlib import Path
 

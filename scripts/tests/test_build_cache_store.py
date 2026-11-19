@@ -616,6 +616,35 @@ class TestStoreInstall:
         assert http_request("GET", url, new_auth) == (200, body)
         assert http_request("GET", url, (old_user, old_password))[0] == 401
 
+    @pytest.mark.parametrize(
+        "credentials",
+        [
+            pytest.param("RCLONE_USER={user}\n", id="password-line-removed"),
+            pytest.param("RCLONE_USER={user}\nRCLONE_PASS=\n", id="password-emptied"),
+            pytest.param("RCLONE_USER={user}\nRCLONE_PASSWORD=typo-0123\n", id="password-misspelt"),
+            pytest.param("RCLONE_USER={user}\nRCLONE_PASS=a b\n", id="password-unsafe-characters"),
+            pytest.param("RCLONE_USER={user}\nRCLONE_PASS=one\nRCLONE_PASS=two\n", id="password-twice"),
+        ],
+    )
+    def test_unusable_credentials_never_restart_the_store(
+        self, installed: StoreWorld, credentials: str
+    ) -> None:
+        user, password = installed.auth()
+        pid = installed.store_pid()
+        installed.credentials_file.write_text(credentials.format(user=user))
+        calls_before = len(installed.systemctl_calls())
+
+        proc = installed.install()
+
+        assert proc.returncode == 1, proc.stdout + proc.stderr
+        assert "nothing was restarted" in proc.stderr
+        assert installed.store_pid() == pid
+        assert not installed.systemctl_calls()[calls_before:]
+        url = f"http://127.0.0.1:{installed.port}/"
+        assert http_request("GET", url, (user, ""))[0] == 401
+        assert http_request("GET", url)[0] == 401
+        assert http_request("GET", url, (user, password))[0] != 401
+
     def test_check_detects_a_drifted_unit(self, installed: StoreWorld) -> None:
         with (installed.unit_dir / STORE_UNIT).open("a") as unit:
             unit.write("# hand edit\n")

@@ -124,18 +124,21 @@ def _counter(value: object) -> float:
     return value
 
 
+def _text(value: object) -> str:
+    return value if isinstance(value, str) else ""
+
+
 def _observation_of(build_cache: Mapping[str, object], time: datetime) -> Observation | None:
-    mode = build_cache.get("mode")
-    backend = build_cache.get("backend")
-    policy = build_cache.get("policy")
-    reason = build_cache.get("reason")
-    if not (
-        isinstance(mode, str)
-        and isinstance(backend, str)
-        and isinstance(policy, str)
-        and isinstance(reason, str)
-    ):
+    """The row's observation, or None when it is malformed.
+
+    A row degraded on backend and reason alone (PRD C10) is never malformed,
+    whatever its other fields hold, so it can always be the latest row.
+    """
+    health = classify(build_cache)
+    labels = [build_cache.get(key) for key in ("mode", "backend", "policy", "reason")]
+    if health is not Health.DEGRADED and not all(isinstance(label, str) for label in labels):
         return None
+    mode, backend, policy, reason = (_text(label) for label in labels)
     return Observation(
         time=time,
         mode=mode,
@@ -145,7 +148,7 @@ def _observation_of(build_cache: Mapping[str, object], time: datetime) -> Observ
         hits=int(_counter(build_cache.get("hits"))),
         misses=int(_counter(build_cache.get("misses"))),
         cpu_secs=float(_counter(build_cache.get("cpu_secs"))),
-        health=classify(build_cache),
+        health=health,
     )
 
 

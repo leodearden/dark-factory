@@ -204,6 +204,27 @@ UNITS=("$STORE_UNIT:render_store_unit" "$PRUNE_UNIT:render_prune_unit" "$PRUNE_T
 
 credential() { sed -n "s/^$1=//p" "$CREDENTIALS"; }
 
+# One reason per line why the credentials file cannot start the store, or
+# nothing. rclone serves without authentication when RCLONE_USER or
+# RCLONE_PASS is unset or empty, so each must appear exactly once with a value
+# of [A-Za-z0-9._-]+, which also reads the same to systemd's EnvironmentFile
+# and to http_status's curl config.
+credential_failures() {
+    if [ ! -f "$CREDENTIALS" ]; then
+        echo "credentials file $CREDENTIALS is missing"
+        return
+    fi
+    local name count
+    for name in RCLONE_USER RCLONE_PASS; do
+        count="$(grep -c "^$name=" "$CREDENTIALS" || true)"
+        if [ "$count" != 1 ]; then
+            echo "$CREDENTIALS has $count $name= lines, not 1"
+        elif ! [[ "$(credential "$name")" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "$CREDENTIALS has a $name= value that is empty or not [A-Za-z0-9._-]+"
+        fi
+    done
+}
+
 # HTTP status of a GET; with a second argument "user:password", sent through
 # curl's stdin config so it stays out of argv. 000 when nothing answered.
 http_status() {
@@ -240,15 +261,14 @@ check_store_dirs() {
 }
 
 check_credentials() {
-    if [ ! -f "$CREDENTIALS" ]; then
-        check_failed "credentials file $CREDENTIALS is missing"
-        return
-    fi
+    local failure
+    while IFS= read -r failure; do
+        [ -z "$failure" ] || check_failed "$failure"
+    done < <(credential_failures)
+    [ -f "$CREDENTIALS" ] || return 0
     local mode
     mode="$(stat -c %a "$CREDENTIALS")"
     [ "$mode" = "600" ] || check_failed "credentials file $CREDENTIALS has mode $mode, not 600"
-    [ -n "$(credential RCLONE_USER)" ] || check_failed "$CREDENTIALS has no RCLONE_USER="
-    [ -n "$(credential RCLONE_PASS)" ] || check_failed "$CREDENTIALS has no RCLONE_PASS="
 }
 
 check_units() {
@@ -356,6 +376,9 @@ apply() {
         log "created credentials $CREDENTIALS"
     fi
     chmod 600 "$CREDENTIALS"
+    local failures
+    failures="$(credential_failures)"
+    [ -z "$failures" ] || die "${failures//$'\n'/; }; nothing was restarted"
     local credentials_digest started_digest=""
     read -r credentials_digest _ < <(sha256sum "$CREDENTIALS")
     if [ -f "$STARTED_CREDENTIALS_DIGEST" ]; then
