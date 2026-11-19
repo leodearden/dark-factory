@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import textwrap
@@ -216,7 +217,7 @@ class TestTargetsWithoutShared:
 
                     @pytest.mark.parametrize('worker', range(4))
                     def test_shared_refuses(worker):
-                        with pytest.raises(ImportError, match={_TARGET_HAS_NO_SHARED!r}):
+                        with pytest.raises(ImportError, match={re.escape(_TARGET_HAS_NO_SHARED)!r}):
                             import shared
                     """,
             },
