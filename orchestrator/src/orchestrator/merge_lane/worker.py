@@ -10781,6 +10781,17 @@ class SpeculativeMergeWorker:
         self._record_item_commit_dead(item, DeadBaseSite.REQUEUED)
         self._requeue_request(item.request)
 
+    def _give_back_built_item(self, item: SpeculativeItem) -> None:
+        """Requeue *item*'s request, or record its build abandoned if that request already resolved.
+
+        Either way the commit it built is recorded dead: no exit of a built
+        item from the lane leaves that commit live.
+        """
+        if item.request.result.done():
+            self._record_abandoned_item(item)
+        else:
+            self._requeue_built_item(item)
+
     def _reanchor_merger_on(self, dead: RealMergeItem, replacement: SpeculativeItem) -> None:
         """Point a merger holding *dead*'s commit at *replacement*'s (D2).
 
@@ -16258,9 +16269,7 @@ class SpeculativeMergeWorker:
                                 and _entry.verify_task.cancelled()
                             ):
                                 self._free_entry_permit(_entry)
-                                _entry_req = _entry.item.request
-                                if not _entry_req.result.done():
-                                    self._requeue_built_item(_entry.item)
+                                self._give_back_built_item(_entry.item)
                                 continue
                             # MQ-reliability kappa follow-up (task 2441): the
                             # registry follows the item through MERGING to
@@ -20604,21 +20613,23 @@ class SpeculativeMergeWorker:
             killer=DeadBaseKiller(DeadBaseSite.GATE_UNLANDED, gate.candidate.item.request.task_id),
         )
 
-    def _record_unlanded_rebased_head(self, item: SpeculativeItem) -> None:
-        """A dispatched rebased head leaves without landing: its commit, the merger's tip (D2), is dead."""
+    @staticmethod
+    def _abandoned_build_site(item: SpeculativeItem) -> DeadBaseSite:
+        """The killer an abandoned build's commit is recorded under: GATE_UNLANDED
+        for a dispatched rebased head, whose commit is the merger's tip (D2),
+        ABANDONED for any other build."""
         if isinstance(item, RealMergeItem) and item.gate_rebase_of is not None:
-            self._record_item_commit_dead(item, DeadBaseSite.GATE_UNLANDED)
+            return DeadBaseSite.GATE_UNLANDED
+        return DeadBaseSite.ABANDONED
 
     def _record_abandoned_item(self, item: SpeculativeItem) -> None:
         """*item*'s request was abandoned, so the commit it built will never land.
 
-        A rebased head keeps its GATE_UNLANDED killer, since the ledger keeps
-        the first; any other build is recorded ABANDONED.  Either way a
+        Recorded dead under :meth:`_abandoned_build_site`'s killer, so a
         successor stacked on it is re-merged at its dispatch (INV-3) and a
         merger holding it re-anchors (D2).
         """
-        self._record_unlanded_rebased_head(item)
-        self._record_item_commit_dead(item, DeadBaseSite.ABANDONED)
+        self._record_item_commit_dead(item, self._abandoned_build_site(item))
 
     async def _repark_gate_successors(self, gate: PendingGate) -> list[SpeculativeItem]:
         """Tear down every in-flight successor of a head re-verified as a dispatch.
