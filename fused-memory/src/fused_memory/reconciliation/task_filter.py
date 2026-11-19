@@ -1209,8 +1209,9 @@ def cross_verify_task_counts(tree: FilteredTaskTree, statuses: dict[str, str] | 
 
     When the status map is empty or None (taskmaster unavailable), returns
     available=False, consistent=True — fail-open: no spurious mismatch warning.
-    When available, compares census total/done against tree.total_count and
-    tree.done_count and flags any discrepancy.
+    An unavailable tree fails open the same way: there is nothing to compare.
+    When both sides are available, compares census total/done against
+    tree.total_count and tree.done_count and flags any discrepancy.
 
     Args:
         tree: FilteredTaskTree from filter_task_tree() (the get_tasks read path).
@@ -1223,7 +1224,11 @@ def cross_verify_task_counts(tree: FilteredTaskTree, statuses: dict[str, str] | 
             total_mismatch (bool): set when available and totals differ.
             done_mismatch (bool): set when available and done counts differ.
             authoritative (dict): census from statuses (when available).
-            tree (dict): {'total': tree.total_count, 'done': tree.done_count}.
+            tree (dict | None): {'total': tree.total_count, 'done': tree.done_count},
+                or None when the tree fetch failed.  Nothing is compared against
+                an unknown tree, so it never yields a mismatch.
+            tree_unavailable_reason (TaskTreeUnavailableReason | None): why the
+                tree fetch failed, or None for a fetched tree.
 
     Note on read-skew: the census and the tree are produced by two independent reads
     (get_tasks then get_statuses) taken a moment apart. A status transition committed
@@ -1235,30 +1240,24 @@ def cross_verify_task_counts(tree: FilteredTaskTree, statuses: dict[str, str] | 
 
     Pure: no I/O, no side effects.
     """
-    _unavailable = {
-        'available': False,
-        'consistent': True,
-        'total_mismatch': False,
-        'done_mismatch': False,
-        'authoritative': None,
-        'tree': {'total': tree.total_count, 'done': tree.done_count},
-    }
-
-    if not statuses:
-        return _unavailable
-
-    census = summarize_statuses(statuses)
-    total_mismatch = census['total'] != tree.total_count
-    done_mismatch = census['done'] != tree.done_count
-    consistent = not total_mismatch and not done_mismatch
+    tree_counts = (
+        None if tree.unavailable_reason is not None
+        else {'total': tree.total_count, 'done': tree.done_count}
+    )
+    census = summarize_statuses(statuses) if statuses else None
+    total_mismatch = done_mismatch = False
+    if census is not None and tree_counts is not None:
+        total_mismatch = census['total'] != tree_counts['total']
+        done_mismatch = census['done'] != tree_counts['done']
 
     return {
-        'available': True,
-        'consistent': consistent,
+        'available': census is not None,
+        'consistent': not total_mismatch and not done_mismatch,
         'total_mismatch': total_mismatch,
         'done_mismatch': done_mismatch,
         'authoritative': census,
-        'tree': {'total': tree.total_count, 'done': tree.done_count},
+        'tree': tree_counts,
+        'tree_unavailable_reason': tree.unavailable_reason,
     }
 
 
