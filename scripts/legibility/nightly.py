@@ -1332,7 +1332,8 @@ def run_nightly(
     the session ledger already holds, never evaluates the census trigger,
     and records through *retry_recorder*. A ``SCHEDULED`` pass whose
     *target_date* the recorded schedule cursor already reached
-    (:func:`trickle_state.schedule_reached`) skips those sessions too.
+    (:func:`trickle_state.schedule_reached`) draws the night's full sample
+    and codes only the selected sessions the ledger does not hold.
 
     The pass ends with one INFO line, :meth:`NightlyResult.journal_line`.
     """
@@ -1399,22 +1400,46 @@ def _ledgered_sessions(cfg: LegibilityConfig) -> frozenset[str]:
     return snapshot.sessions
 
 
-def _skips_ledgered_sessions(
-    cfg: LegibilityConfig, pass_kind: PassKind, target_date: date,
-) -> bool:
-    """A retry, and a scheduled pass over a date the schedule already
-    reached, skip what the session ledger holds."""
+class _LedgerSkips(NamedTuple):
+    """The ledgered sessions a pass leaves out of its sample, or out of what
+    it codes from its selection."""
+
+    before_sampling: frozenset[str] = frozenset()
+    from_selection: frozenset[str] = frozenset()
+
+
+def _ledger_skips(cfg: LegibilityConfig, pass_kind: PassKind, target_date: date) -> _LedgerSkips:
+    """A retry samples without what the ledger holds; a scheduled pass over a
+    date the schedule already reached samples the whole night and codes only
+    the selected sessions the ledger does not hold."""
     match pass_kind:
         case PassKind.RETRY:
-            return True
+            return _LedgerSkips(before_sampling=_ledgered_sessions(cfg))
         case PassKind.SCHEDULED:
-            return trickle_state.schedule_reached(
-                trickle_state.read_prior(cfg.project_id), target_date=target_date,
-            )
+            prior = trickle_state.read_prior(cfg.project_id)
+            if trickle_state.schedule_reached(prior, target_date=target_date):
+                return _LedgerSkips(from_selection=_ledgered_sessions(cfg))
+            return _LedgerSkips()
         case PassKind.MANUAL:
-            return False
+            return _LedgerSkips()
         case _:
             assert_never(pass_kind)
+
+
+def _uncoded(
+    cfg: LegibilityConfig, sample: sampling.SampleResult, coded: frozenset[str], target_date: date,
+) -> list[sampling.ScoredRecord]:
+    """*sample*'s selection, in order, without the sessions in *coded*."""
+    if not coded:
+        return list(sample.selected)
+    to_code = [record for record in sample.selected if record.session_id not in coded]
+    if len(to_code) < len(sample.selected):
+        logger.info(
+            'legibility trickle: project=%s date=%s %d of %d selected session(s) already coded',
+            cfg.project_id, target_date.isoformat(),
+            len(sample.selected) - len(to_code), len(sample.selected),
+        )
+    return to_code
 
 
 def _nothing_sampled() -> sampling.SampleResult:
@@ -1457,12 +1482,15 @@ def _run_configured_nightly(
     sample = _nothing_sampled()
     try:
         rendered: dict[tuple, str] = {}
+        skips = _ledger_skips(cfg, pass_kind, target_date)
         sample = _select_stage(
-            cfg, seams.selector, projects_root, target_date, pass_kind, rendered=rendered,
+            cfg, seams.selector, projects_root, target_date, skips.before_sampling,
+            rendered=rendered,
         )
         _report_sample_outcome(cfg, sample, target_date, raise_alarm=raise_alarm)
         end = _code_and_land(
             cfg, resolved_config_path, seams, sample,
+            _uncoded(cfg, sample, skips.from_selection, target_date),
             rendered=rendered, target_date=target_date, now=now, pass_kind=pass_kind,
             raise_alarm=raise_alarm,
         )
@@ -1500,18 +1528,12 @@ def _select_stage(
     selector: Selector,
     projects_root: Path | str | None,
     target_date: date,
-    pass_kind: PassKind,
+    skip_sessions: frozenset[str],
     *,
     rendered: dict[tuple, str],
 ) -> sampling.SampleResult:
-    """The night's sample, without the sessions the ledger holds when
-    :func:`_skips_ledgered_sessions` says so. *rendered* is the render cache
-    the digest stage reuses."""
-    skip_sessions = (
-        _ledgered_sessions(cfg)
-        if _skips_ledgered_sessions(cfg, pass_kind, target_date)
-        else frozenset()
-    )
+    """The night's sample, drawn without the sessions in *skip_sessions*.
+    *rendered* is the render cache the digest stage reuses."""
     return selector(
         cfg, projects_root if projects_root is not None else DEFAULT_PROJECTS_ROOT,
         target_date, rendered=rendered, skip_sessions=skip_sessions,
@@ -1523,6 +1545,7 @@ def _code_and_land(
     resolved_config_path: Path,
     seams: _NightSeams,
     sample: sampling.SampleResult,
+    to_code: Sequence[sampling.ScoredRecord],
     *,
     rendered: dict[tuple, str],
     target_date: date,
@@ -1532,7 +1555,7 @@ def _code_and_land(
 ) -> _NightEnd:
     """The stages after sampling, in order: digest, code, merge, commit,
     ledger, census. The first stage to end the night returns its end."""
-    digests = _digest_stage(seams.digest_builder, sample, rendered=rendered, raise_alarm=raise_alarm)
+    digests = _digest_stage(seams.digest_builder, to_code, rendered=rendered, raise_alarm=raise_alarm)
     if isinstance(digests, _NightEnd):
         return digests
     cb = _load_codebook(cfg)
@@ -1569,14 +1592,14 @@ def _code_and_land(
 
 def _digest_stage(
     digest_builder: DigestBuilder,
-    sample: sampling.SampleResult,
+    to_code: Sequence[sampling.ScoredRecord],
     *,
     rendered: dict[tuple, str],
     raise_alarm: _RaiseAlarm,
 ) -> list[str] | _NightEnd:
-    """One digest per selected session. A session the builder could not
+    """One digest per session to code. A session the builder could not
     digest fails the night loud (decision 8) before any coding."""
-    digests, extractor_failures = digest_builder(sample.selected, rendered=rendered)
+    digests, extractor_failures = digest_builder(to_code, rendered=rendered)
     if not extractor_failures:
         return digests
     summary = f'legibility trickle extractor crashed on {len(extractor_failures)} session(s)'
