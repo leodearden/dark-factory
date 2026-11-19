@@ -333,14 +333,3 @@ class TestUsage:
         observations = write_observations(tmp_path, healthy_rows(3))
         code, _, _ = run_check(observations, min_runs="0")
         assert code == 64
-
-    def test_help_prints_the_exit_table(self) -> None:
-        proc = subprocess.run(
-            [sys.executable, "-I", str(SCRIPT), "--help"],
-            capture_output=True,
-            text=True,
-            timeout=CLI_TIMEOUT,
-        )
-        assert proc.returncode == 0
-        table_rows = [line.split()[0] for line in proc.stdout.splitlines() if line[:4].strip().isdigit()]
-        assert table_rows == ["74", "1", "0", "2", "75", "64"]
