@@ -1240,10 +1240,8 @@ def cross_verify_task_counts(tree: FilteredTaskTree, statuses: dict[str, str] | 
 
     Pure: no I/O, no side effects.
     """
-    tree_counts = (
-        None if tree.unavailable_reason is not None
-        else {'total': tree.total_count, 'done': tree.done_count}
-    )
+    known = available_tree(tree)
+    tree_counts = None if known is None else {'total': known.total_count, 'done': known.done_count}
     census = summarize_statuses(statuses) if statuses else None
     total_mismatch = done_mismatch = False
     if census is not None and tree_counts is not None:
@@ -1574,6 +1572,13 @@ def tree_unavailable_notice(tree: FilteredTaskTree) -> str | None:
     if tree.unavailable_reason is None:
         return None
     return f'Task tree unavailable: {tree.unavailable_reason.value}'
+
+
+def available_tree(tree: FilteredTaskTree | None) -> FilteredTaskTree | None:
+    """Return *tree* when it was really fetched; None when it is unset or its fetch failed, so a reader treats both as unknown."""
+    if tree is None or tree.unavailable_reason is not None:
+        return None
+    return tree
 
 
 def render_retained_done_tasks(tree: FilteredTaskTree) -> str:
