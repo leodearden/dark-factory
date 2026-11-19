@@ -3417,9 +3417,7 @@ class Scheduler:
             # to serve a verdict computed against the old descriptor.
             declared = declared_checks(dep_task.get('metadata'))
             checks = declared.checks
-            descriptor_digest = _delivered_checks_descriptor_digest(
-                [*declared.checks, *declared.unreadable]
-            )
+            descriptor_digest = _delivered_checks_descriptor_digest(list(checks))
             cache_key = (dep_id, main_sha, descriptor_digest)
             # Prune any stale digest variant(s) left behind by an earlier
             # descriptor for this SAME (dep, sha) (task 2975): bounds cache
@@ -3441,9 +3439,9 @@ class Scheduler:
                 # Only the monotone-safe DELIVERED=True result is ever
                 # cached (see the FAILED branch below) — a cache hit is
                 # therefore always True, served straight from cache with no
-                # checks re-run this sweep. Only a fully readable declaration
-                # is cached, so only one is served: a bare-dict value digests
-                # like the one-element list holding it.
+                # checks re-run this sweep. The digest covers ``checks``
+                # alone, so a declaration with unreadable entries is never
+                # served from it.
                 cached = self._delivered_check_cache[cache_key]
                 projection[dep_id] = cached
                 # A dep resolved definitively (cached True) on a prior sweep
@@ -3455,11 +3453,13 @@ class Scheduler:
 
             results: list[tuple[dict, DeliveredCheckResult]] = []
             over_budget = False
-            # Only the first dep this sweep actually evaluates gets the
+            # Only the first dep this sweep that runs a check gets the
             # forward-progress guarantee; every later dep still respects
-            # the budget exactly as before.
-            guaranteed_dep = first_dep_this_sweep
-            first_dep_this_sweep = False
+            # the budget exactly as before. A wholly unreadable declaration
+            # runs none, so it leaves the guarantee for the next dep.
+            guaranteed_dep = first_dep_this_sweep and bool(checks)
+            if guaranteed_dep:
+                first_dep_this_sweep = False
             for check in checks:
                 if used >= budget and not guaranteed_dep:
                     over_budget = True

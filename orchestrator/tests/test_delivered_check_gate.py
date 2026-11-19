@@ -2624,6 +2624,37 @@ class TestComputeDeliveredCheckCache:
             k[0] == '21' and k[1] == 'sha1' for k in scheduler._delivered_check_cache
         ), 'the deferred dep must not leave ANY digest-variant cache entry'
 
+    # --- (e3) a dep that runs no check leaves the guarantee to the next ----
+
+    @pytest.mark.asyncio
+    async def test_unreadable_only_first_dep_leaves_the_guarantee_to_the_next(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """A wholly unreadable declaration runs no check, so it must not use
+        up the sweep's forward-progress guarantee. Otherwise a later dep with
+        more checks than the budget is deferred on every sweep for as long as
+        the malformed record stays unrepaired."""
+        scheduler.config.delivered_checks.max_checks_per_tick = 1
+        scheduler._resolve_main_sha, _sha_calls = self._fake_sha('sha1')
+        fake_runner, calls = self._fake_runner({
+            'cap-a': DeliveredCheckResult.DELIVERED,
+            'cap-b': DeliveredCheckResult.DELIVERED,
+        })
+        monkeypatch.setattr('orchestrator.scheduler.run_delivered_check', fake_runner)
+        task_a = self._dependent(task_id='10', dep_id='20')
+        dep_a = self._dep(dep_id='20', checks=['garbage'])
+        task_b = self._dependent(task_id='11', dep_id='21')
+        dep_b = self._dep(dep_id='21', checks=self._TWO_CHECKS)
+        status_map = {'20': 'done', '21': 'done'}
+        tasks_by_id = {'20': dep_a, '21': dep_b, '10': task_a, '11': task_b}
+
+        result = await scheduler._compute_delivered_check_cache(
+            [task_a, task_b], status_map, tasks_by_id
+        )
+
+        assert result == {'21': True}
+        assert calls == ['cap-a', 'cap-b']
+
     # --- (f) cache hit: same-sha re-sweep does NOT re-invoke the runner ----
 
     @pytest.mark.asyncio
