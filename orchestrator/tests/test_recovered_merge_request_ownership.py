@@ -12,7 +12,6 @@ module: it reads harness privates, which the merge-lane ratchet
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -25,7 +24,11 @@ from _orch_helpers import (
     wire_live_status_from_get_task,
     wire_scheduler_liveness_mock,
 )
-from _startup_harness import journal_merge_request, merge_lane_harness_factory
+from _startup_harness import (
+    harness_with_real_merge_worker,
+    journal_merge_request,
+    merge_lane_harness_factory,
+)
 from escalation.queue import EscalationQueue
 
 from orchestrator.harness import Harness
@@ -158,17 +161,6 @@ async def _drain(h: Harness) -> None:
     await asyncio.gather(*h._background_tasks)
 
 
-async def _harness_with_real_merge_worker(
-    make: Callable[[], Harness], scheduler: MagicMock,
-) -> Harness:
-    """A Harness over the factory's shared escalation dir, holding a real merge worker."""
-    h = make()
-    await h._start_escalation_server()
-    h.scheduler = scheduler
-    await h._start_merge_worker()
-    return h
-
-
 @pytest.mark.asyncio
 class TestRecoveredRequestOutcomeHasAnOwner:
     async def test_failed_recovered_request_blocks_the_task_with_an_l1(
@@ -190,7 +182,7 @@ class TestRecoveredRequestOutcomeHasAnOwner:
     async def test_landed_recovered_request_drives_the_landed_outbox_done_write(
         self, tmp_path: Path, scheduler_double: MagicMock,
     ) -> None:
-        harness = await _harness_with_real_merge_worker(
+        harness = await harness_with_real_merge_worker(
             merge_lane_harness_factory(tmp_path), scheduler_double,
         )
         assert harness._merge_worker is not None
@@ -213,7 +205,7 @@ class TestRecoveredRequestOutcomeHasAnOwner:
         self, tmp_path: Path, scheduler_double: MagicMock,
     ) -> None:
         make = merge_lane_harness_factory(tmp_path)
-        harness = await _harness_with_real_merge_worker(make, scheduler_double)
+        harness = await harness_with_real_merge_worker(make, scheduler_double)
         worker = harness._merge_worker
         assert worker is not None
         worker.halt_for_wip('park of the main checkout failed')
@@ -233,7 +225,7 @@ class TestRecoveredRequestOutcomeHasAnOwner:
         scheduler_double.set_task_status.assert_any_await(_TID, 'blocked')
 
         (harness.git_ops.project_root / 'README.md').write_text('# unparked WIP\n')
-        restarted = await _harness_with_real_merge_worker(make, scheduler_double)
+        restarted = await harness_with_real_merge_worker(make, scheduler_double)
         assert await Harness._rehydrate_merge_halt(restarted) == esc.id
         assert restarted._merge_worker is not None
         assert restarted._merge_worker.is_wip_halted

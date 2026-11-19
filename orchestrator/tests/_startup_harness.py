@@ -88,6 +88,17 @@ def merge_lane_harness_factory(tmp_path: Path) -> Callable[[], Harness]:
     return make
 
 
+async def harness_with_real_merge_worker(
+    make: Callable[[], Harness], scheduler: MagicMock,
+) -> Harness:
+    """A Harness over the factory's shared escalation dir, holding a real merge worker."""
+    h = make()
+    await h._start_escalation_server()
+    h.scheduler = scheduler
+    await h._start_merge_worker()
+    return h
+
+
 async def journal_merge_request(h: Harness, task_id: str) -> str:
     """Journal a real merge of task *task_id*'s new branch, as the live enqueue does; its id."""
     request = await branch_merge_request(h.git_ops, h.config, task_id, filename=f'{task_id}.txt')
