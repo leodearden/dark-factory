@@ -1443,6 +1443,11 @@ _ARMS = [
     pytest.param('content', id='content-equivalent-arm'),
 ]
 
+#: The arms that validate a merge marker in CANDIDATE mode; every other arm
+#: judges the live branch tip through ``branch_work_landed`` (task 4648).
+_CANDIDATE_ARMS = frozenset({'marker'})
+_LIVE_TIP_ARMS = [arm for arm in _ARMS if arm.values[0] not in _CANDIDATE_ARMS]
+
 _ARM_REASON = {
     'ancestry': 'dispatch-gate-already-on-main',
     'marker': 'dispatch-gate-marker-found',
@@ -2806,6 +2811,22 @@ class TestAlreadyLandedGateDeliveredChecksWiring:
 
         assert spy.await_args is not None
         assert spy.await_args.kwargs.get('delivered_checks') == []
+
+    @pytest.mark.parametrize('arm', _LIVE_TIP_ARMS)
+    async def test_a_live_tip_arm_hands_the_recorded_base_to_the_producer(
+        self, mock_orch_config, landing_producer: AsyncMock, arm,
+    ) -> None:
+        """The producer's recorded-base rung is fed from the task's metadata (task 7836)."""
+        h, _meta = _arm_harness(
+            mock_orch_config, arm,
+            metadata={'branch_base_sha': _BRANCH_BASE_SHA, 'delivered_checks': [_DC_CHECK]},
+        )
+
+        with patch(_GATE_TARGET, AsyncMock(return_value=None)):
+            await _GateProbe(h).decide('42')
+
+        assert landing_producer.await_args is not None
+        assert landing_producer.await_args.kwargs['metadata']['branch_base_sha'] == _BRANCH_BASE_SHA
 
     async def test_a_differential_rescue_stamps_and_discloses_it(
         self, mock_orch_config,

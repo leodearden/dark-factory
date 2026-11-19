@@ -16469,14 +16469,16 @@ class TaskWorkflow:
         reject, or a validation that raises, is logged and answers None, so
         every guard proceeds with its phase rather than stamping.
         """
+        metadata = self.task.get('metadata') or {}
         try:
             verdict = await validate_landing_evidence(
                 self.git_ops, self.task_id,
                 f'{self.config.git.branch_prefix}{self.task_id}',
                 branch_tip_sha=branch_tip_sha,
                 pattern_template=self.git_ops.config.commit_citation_pattern,
-                delivered_checks=_declared_checks(self.task.get('metadata') or {}),
+                delivered_checks=_declared_checks(metadata),
                 checks_enabled=self.config.delivered_checks.enabled,
+                branch_base_sha=metadata.get('branch_base_sha'),
             )
         except Exception:
             logger.warning(

@@ -1053,7 +1053,7 @@ class TestMergeStatusGitAuthority:
     async def test_ancestor_arm_with_declared_checks_makes_no_validator_call(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A task's declared checks travel in the metadata the producer reads."""
+        """Declared checks and the recorded base (task 7836) reach the producer in its metadata."""
         calls = _record_validate_landing_evidence(monkeypatch)
         producer = stub_landing_producer(monkeypatch, 'landed', evidence_sha='c' * 40)
         declared = [{'kind': 'grep', 'pattern': 'def foo', 'expect': 'present'}]
