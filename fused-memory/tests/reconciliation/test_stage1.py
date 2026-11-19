@@ -78,7 +78,7 @@ from fused_memory.reconciliation.stale_status_snapshot_edge_sweep import (
     STATUS_SNAPSHOT_ENUMERATION_COMPLETE_STAT_KEY,
     STATUS_SNAPSHOT_ENUMERATION_INCOMPLETE_KIND_STAT_KEY,
 )
-from fused_memory.reconciliation.task_filter import FilteredTaskTree
+from fused_memory.reconciliation.task_filter import FilteredTaskTree, TaskTreeUnavailableReason
 from fused_memory.services.landed_on_main import LandingVerdict
 from fused_memory.services.live_workflow_detector import WorkflowLiveness
 
@@ -6108,6 +6108,20 @@ class TestMemoryConsolidatorLiveWorkflowCitationGuard:
             'an absent section tells Stage 1 no task is live, so citing one contradicts it'
         )
         assert _annotation_for(report, '5891') is not None
+
+    @pytest.mark.asyncio
+    async def test_an_unavailable_task_tree_leaves_the_guard_inert(self, stage, monkeypatch):
+        _stub_live_workflow_probes(monkeypatch)
+        stage.filtered_task_tree = FilteredTaskTree(
+            unavailable_reason=TaskTreeUnavailableReason.fetch_error,
+        )
+
+        report = await _run_assembling_payload(stage, [_citing_flag(_CITATION_INCIDENT)])
+
+        assert report.stats[_CITATION_STAT] == 0, (
+            'an unknown tree is not evidence that no task is live'
+        )
+        assert _annotation_for(report, '5891') is None
 
     @pytest.mark.asyncio
     async def test_a_run_never_compares_against_a_previous_runs_section(
