@@ -77,11 +77,11 @@ class TestEvalMetricsTerminalKindField:
         scoring as ``'none'``.
         """
         from orchestrator.artifacts import TaskArtifacts
-        from orchestrator.evals.metrics import _DECLINE_READERS, DECLINE_KINDS
+        from orchestrator.evals.metrics import DECLINE_KINDS, DECLINE_READERS
 
-        assert tuple(_DECLINE_READERS) == DECLINE_KINDS
+        assert tuple(DECLINE_READERS) == DECLINE_KINDS
         for kind in DECLINE_KINDS:
-            reader = _DECLINE_READERS[kind]
+            reader = DECLINE_READERS[kind]
             assert callable(getattr(TaskArtifacts, reader, None)), (
                 f'{kind!r} names TaskArtifacts.{reader}, which does not exist'
             )
