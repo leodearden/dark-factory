@@ -136,6 +136,11 @@ def _attr_chain(node: ast.expr) -> tuple[ast.expr, str] | None:
     return node, '.'.join(reversed(parts))
 
 
+#: The name every default assertion's bare construction calls, so a module
+#: that cannot name it holds none.
+CONFIG_CLASS_NAME = OrchestratorConfig.__name__
+
+
 def _is_bare_config_call(node: ast.AST | None) -> bool:
     """True for exactly ``OrchestratorConfig()`` — no args, no keywords.
 
@@ -146,7 +151,7 @@ def _is_bare_config_call(node: ast.AST | None) -> bool:
     return (
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Name)
-        and node.func.id == 'OrchestratorConfig'
+        and node.func.id == CONFIG_CLASS_NAME
         and not node.args
         and not node.keywords
     )
