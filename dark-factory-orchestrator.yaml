@@ -1854,13 +1854,11 @@ fairness:
 # decision 7). Two cells at once. Only max_concurrent is set here: `enabled` stays at its
 # default (off) because enabling is gate 5393's ruling.
 # Why 2: a cell's verify waits on the same admission semaphore as production task
-# verifies. evals/profile.py::EVAL_PROFILE overrides nothing about admission, and
-# evals/shadow_invocation.py::build_shadow_orch_config wraps
-# evals/runner.py::build_eval_orch_config, which derives the cell config by model_copy;
-# the shadow wrapper changes only sandbox.enabled. So verify_admission_enabled and
-# verify_admission_slots_dir are inherited unchanged; the cell verifies with
-# role='task', and verify_admission_gate.py::gate_for keys the
-# in-process gate by the resolved slots dir. Cells therefore queue on the same
+# verifies. A cell's config differs from production only in evals/profile.py::EVAL_PROFILE
+# plus sandbox.enabled, and neither touches admission; the checks that keep it so are
+# orchestrator/tests/test_eval_profile.py::test_apply_eval_profile_parity and
+# orchestrator/tests/test_eval_shadow_invocation.py::test_shadow_diverges_from_the_corpus_eval_profile_only_in_sandbox_enabled.
+# Cells therefore verify with role='task' on the same
 # AdmissionGate and flock as production (verify_admission_task_slots, above). With remote
 # task legs (6673) moving production's legs to leo-laptop, the workstation semaphore
 # frees more often, so it can absorb more verifies per completed task.
