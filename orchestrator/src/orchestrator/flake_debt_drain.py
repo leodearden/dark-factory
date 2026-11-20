@@ -537,6 +537,7 @@ async def _surface_stale_items(
                     esc.id,
                     f'auto-resolved: no flake-debt item has waited over {DUE_ITEM_STALE_MINUTES} minutes',
                     resolved_by=STALE_DUE_ESCALATION_ROLE,
+                    resolution_class='benign',
                 )
             return
         if not pending and summary.unnamed_stale == 0:

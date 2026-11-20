@@ -721,7 +721,10 @@ def _resolve_pending_alarm(escalation_queue: Any, sentinel: str, resolution: str
     """
     pending = escalation_queue.get_by_task(sentinel, status='pending')
     for esc in pending:
-        escalation_queue.resolve(esc.id, resolution, resolved_by='orchestrator-verify-host-monitor')
+        escalation_queue.resolve(
+            esc.id, resolution, resolved_by='orchestrator-verify-host-monitor',
+            resolution_class='benign',
+        )
     return tuple(esc.id for esc in pending)
 
 

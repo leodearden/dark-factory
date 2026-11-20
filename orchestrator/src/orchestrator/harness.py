@@ -8468,6 +8468,7 @@ class Harness:
                     esc.id,
                     'auto-resolved: pool storage is present again',
                     resolved_by=self._POOL_STORAGE_ABSENT_ROLE,
+                    resolution_class='benign',
                 )
                 logger.info(
                     'Pool-storage-absent: auto-resolved escalation %s', esc.id,
@@ -8995,6 +8996,7 @@ class Harness:
                     esc.id,
                     'auto-resolved: warm-lane base is healthy again',
                     resolved_by=self._WARM_BASE_HARD_DOWN_ROLE,
+                    resolution_class='benign',
                 )
                 logger.info(
                     'Warm-base hard-down: auto-resolved escalation %s', esc.id,
@@ -9117,6 +9119,7 @@ class Harness:
                     esc.id,
                     resolution_reason,
                     resolved_by='orchestrator-no-landings-breaker',
+                    resolution_class='benign',
                 )
                 logger.info(
                     'No-landings breaker: auto-resolved INFO escalation %s', esc.id
@@ -9888,6 +9891,7 @@ class Harness:
                 existing_id,
                 resolution=evidence.value,
                 resolved_by='orchestrator-watcher-supervisor',
+                resolution_class='benign',
             )
             logger.info(
                 'Resolved watcher-outage L2 escalation %s (watcher recovered, evidence=%s)',
@@ -9945,6 +9949,7 @@ class Harness:
                         esc.id,
                         'tree now clean at startup',
                         resolved_by='orchestrator-dirty-tree-guard',
+                        resolution_class='benign',
                     )
             return
         logger.warning(
@@ -10013,6 +10018,7 @@ class Harness:
                         esc.id,
                         'config now has no unknown keys at startup',
                         resolved_by='orchestrator-config-key-guard',
+                        resolution_class='benign',
                     )
                 return
 

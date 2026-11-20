@@ -486,6 +486,7 @@ class BacklogPolicy:
                         f'(unhalt_reconciliation / auto-unhalt-after-cooldown).'
                     ),
                     resolved_by='fused-memory-judge-unhalt',
+                    resolution_class='benign',
                 )
                 # resolve() returns None when the id cannot be located (its
                 # `id` key disagrees with the filename, or the `or path.stem`
