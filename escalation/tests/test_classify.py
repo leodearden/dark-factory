@@ -12,6 +12,7 @@ from escalation.authority import COORDINATOR_IDENTITY
 from escalation.classify import (
     DONE_STEP_COMMIT_ORPHAN_CLASS,
     INFO_L0_MECHANICAL_ROLES,
+    RESOLVER_TIERS,
     classify_resolver_tier,
     closed_by_non_sweep_resolver,
     default_resolution_class_for_resolver,
@@ -19,6 +20,7 @@ from escalation.classify import (
     info_l0_mechanical_class,
     is_done_step_commit_orphan,
     is_harness_filed,
+    resolver_tier,
 )
 from escalation.models import HARNESS_SENTINEL_ROLE_PREFIXES, Escalation
 
@@ -123,6 +125,59 @@ class TestClassifyResolverTierUnknownAndOther:
     def test_random_role_is_other_auto(self):
         """resolved_by='random-role' (unrecognised) classifies as 'other-auto'."""
         assert classify_resolver_tier('random-role') == 'other-auto'
+
+
+_HUMAN_SEATS = ('interactive', 'escalation-watcher', COORDINATOR_IDENTITY)
+_NON_HUMAN_RESOLVERS = (
+    'l2-cascade:esc-5-1',
+    'escalation-watcher-auto',
+    'orchestrator-escalation-watcher-auto',
+    'claude-task-2656-steward',
+    'harness-orphan-reaper',
+    'auto-dismissed',
+    'harness-escalation-revalidation-sweep',
+    'orchestrator-starvation-watchdog',
+    None,
+    'random-role',
+)
+
+
+def _closed(resolved_by: str | None, ruled_by_human: bool | None) -> Escalation:
+    esc = _make_escalation(status='resolved', resolution_class='actionable', resolved_by=resolved_by)
+    esc.ruled_by_human = ruled_by_human
+    return esc
+
+
+_RULED_RECORDS = [_closed(r, True) for r in (*_HUMAN_SEATS, 'l2-cascade:esc-5-1')]
+_SEAT_RECORDS = [_closed(r, flag) for r in _HUMAN_SEATS for flag in (None, False)]
+_NON_HUMAN_RECORDS = [_closed(r, None) for r in _NON_HUMAN_RESOLVERS]
+
+
+class TestResolverTier:
+    """resolver_tier(record) reads the human-ruling flag first (plans/instruments-honesty-prd.md decision 10)."""
+
+    @pytest.mark.parametrize('record', _RULED_RECORDS, ids=lambda r: str(r.resolved_by))
+    def test_a_human_ruling_is_human_ruled_whoever_closed_it(self, record: Escalation):
+        assert resolver_tier(record) == 'human-ruled'
+
+    @pytest.mark.parametrize(
+        'record', _SEAT_RECORDS, ids=lambda r: f'{r.resolved_by}-{r.ruled_by_human}'
+    )
+    def test_a_human_seat_close_without_a_ruling_is_attended_seat(self, record: Escalation):
+        assert resolver_tier(record) == 'attended-seat'
+
+    @pytest.mark.parametrize('record', _NON_HUMAN_RECORDS, ids=lambda r: str(r.resolved_by))
+    def test_a_non_human_close_takes_the_resolved_by_tier(self, record: Escalation):
+        assert resolver_tier(record) == classify_resolver_tier(record.resolved_by)
+
+    @pytest.mark.parametrize(
+        'record',
+        [*_RULED_RECORDS, *_SEAT_RECORDS, *_NON_HUMAN_RECORDS],
+        ids=lambda r: f'{r.resolved_by}-{r.ruled_by_human}',
+    )
+    def test_every_tier_is_in_the_record_tier_vocabulary(self, record: Escalation):
+        assert resolver_tier(record) in RESOLVER_TIERS
+        assert 'human' not in RESOLVER_TIERS
 
 
 class TestEffectiveBenign:
