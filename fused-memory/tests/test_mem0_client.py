@@ -4,10 +4,12 @@ import asyncio
 import contextlib
 import logging
 from collections.abc import Iterator
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
+from _fm_helpers import load_script_module
 from _fm_qdrant_live import QDRANT_URL, collection_vector_size, qdrant_skipif
 from _qdrant_responses import missing_collection_404
 from _stub_qdrant_server import StubQdrantServer, stub_qdrant_server
@@ -2124,6 +2126,21 @@ def _asr_clean_collection(_asr_scope, mock_config):
     with contextlib.suppress(Exception):
         client.delete_collection(collection)
     client.close()
+
+
+def test_the_add_system_record_probe_collection_is_one_the_reaper_can_reclaim(
+    _asr_config, _asr_scope,
+):
+    """The probe collection outlives a run by design, so it must be one the reaper deletes."""
+    collection = _asr_scope.mem0_collection_name(_asr_config.mem0.collection_prefix)
+    cleanup = load_script_module(
+        Path(__file__).resolve().parent.parent / 'scripts' / 'cleanup_test_collections.py',
+        mod_name='cleanup_test_collections',
+    )
+
+    assert collection.startswith(cleanup.PREFIX), (
+        f'{collection!r} is not reapable by scripts/cleanup_test_collections.py'
+    )
 
 
 async def _build_asr_backend(mock_config, scope, monkeypatch) -> Mem0Backend:
