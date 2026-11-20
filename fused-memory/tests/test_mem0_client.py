@@ -5,15 +5,14 @@ import contextlib
 import logging
 import uuid
 from collections.abc import Iterator
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
-from _fm_helpers import load_script_module
 from _fm_qdrant_live import (
     EPHEMERAL_COLLECTION_PREFIX,
     QDRANT_URL,
+    assert_reapable,
     collection_vector_size,
     qdrant_skipif,
 )
@@ -2112,16 +2111,16 @@ class TestMem0BackendMetadataReadsOnAbsentCollectionIntegration:
 # This pins the SAME fresh-point-every-call guarantee for the new dedicated,
 # dedup-exempt method.
 #
-# The collection is per xdist worker and reused across runs; it is reaped by
-# scripts/cleanup_test_collections.py, and each run is isolated by its own
-# run_id.
+# One collection is shared by every xdist worker and session and reused across
+# runs; it is reaped by scripts/cleanup_test_collections.py, and each run is
+# isolated by its own run_id.
 
 
 @pytest.fixture
-def _asr_scope(worker_id) -> Scope:
-    """A recon-stage scope isolated per xdist worker for add_system_record tests."""
+def _asr_scope() -> Scope:
+    """The recon-stage scope every add_system_record run shares; runs are isolated by run_id."""
     return Scope(
-        project_id=f'_test_add_system_record_{worker_id}',
+        project_id='_test_add_system_record',
         agent_id='recon-stage-task_knowledge_sync',
     )
 
@@ -2157,15 +2156,7 @@ def test_the_add_system_record_probe_collection_is_one_the_reaper_can_reclaim(
     _asr_config, _asr_scope,
 ):
     """The probe collection outlives a run by design, so it must be one the reaper deletes."""
-    collection = _asr_scope.mem0_collection_name(_asr_config.mem0.collection_prefix)
-    cleanup = load_script_module(
-        Path(__file__).resolve().parent.parent / 'scripts' / 'cleanup_test_collections.py',
-        mod_name='cleanup_test_collections',
-    )
-
-    assert collection.startswith(cleanup.PREFIX), (
-        f'{collection!r} is not reapable by scripts/cleanup_test_collections.py'
-    )
+    assert_reapable(_asr_scope.mem0_collection_name(_asr_config.mem0.collection_prefix))
 
 
 async def _build_asr_backend(mock_config, scope, monkeypatch) -> Mem0Backend:
@@ -2199,9 +2190,9 @@ async def _build_asr_backend(mock_config, scope, monkeypatch) -> Mem0Backend:
 class TestMem0BackendAddSystemRecordIntegration:
     """P4 boundary signal: N identical add_system_record calls -> N distinct points.
 
-    Real Qdrant, a per-worker collection reused across runs (reaped by
-    scripts/cleanup_test_collections.py) with each run isolated by its own
-    run_id, stubbed constant-vector embedder (the worst-case cosine=1.0
+    Real Qdrant, one collection shared by every worker and reused across runs
+    (reaped by scripts/cleanup_test_collections.py) with each run isolated by
+    its own run_id, stubbed constant-vector embedder (the worst-case cosine=1.0
     duplicate signal) — mirrors test_recon_dedup_premise.py's harness for
     backend.add(), applied to the new dedup-exempt backend.add_system_record
     method.

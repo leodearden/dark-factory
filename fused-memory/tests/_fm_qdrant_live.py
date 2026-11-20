@@ -7,6 +7,7 @@ _fm_helpers' module docstring.
 
 import contextlib
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -23,8 +24,13 @@ from _fm_polling import poll_until, poll_until_sync
 
 QDRANT_URL = 'http://localhost:6333'
 
-#: The mem0 collection_prefix whose collections scripts/cleanup_test_collections.py reaps (its PREFIX).
+#: The mem0 collection_prefix whose collections scripts/cleanup_test_collections.py reaps.
+#: Its PREFIX is this value plus Scope.mem0_collection_name's '_' separator, so check names with assert_reapable.
 EPHEMERAL_COLLECTION_PREFIX = '_test_mem0_qdrant_integration'
+
+_COLLECTION_REAPER_SCRIPT = (
+    Path(__file__).resolve().parent.parent / 'scripts' / 'cleanup_test_collections.py'
+)
 
 #: Seconds an abandoned collection meta-op may take to show its effect (task 10599).
 META_OP_SETTLE_TIMEOUT_S = 15.0
@@ -64,6 +70,22 @@ def qdrant_skipif(reason: str = 'Qdrant not reachable'):
     previous local copy.
     """
     return pytest.mark.skipif(not _qdrant_available(), reason=reason)
+
+
+def assert_reapable(collection_name: str) -> None:
+    """Fail unless scripts/cleanup_test_collections.py would delete *collection_name*.
+
+    Loads the reaper under the sys.modules key conftest.py's lease fixture
+    uses. ``_fm_helpers`` is imported lazily, so importing this module never
+    charges its importer for that module's dependencies.
+    """
+    from _fm_helpers import load_script_module
+
+    reaper = load_script_module(_COLLECTION_REAPER_SCRIPT, mod_name='cleanup_test_collections')
+    assert collection_name.startswith(reaper.PREFIXES), (
+        f'{collection_name!r} is not reapable by scripts/cleanup_test_collections.py '
+        f'(PREFIXES={reaper.PREFIXES!r})'
+    )
 
 
 def _run_meta_op(
