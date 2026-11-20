@@ -100,6 +100,15 @@ class AgentRole:
             if tool.startswith('mcp__')
         )
 
+    @property
+    def plan_tools_grants(self) -> frozenset[str]:
+        """The plan-tools tool names this role is granted: its allowed_tools
+        under the plan_tools family prefix, with the prefix stripped."""
+        (prefix,) = _FAMILY_TOOL_PREFIXES['plan_tools']
+        return frozenset(
+            tool.removeprefix(prefix) for tool in self.allowed_tools if tool.startswith(prefix)
+        )
+
     def __post_init__(self) -> None:
         """Import-time capability assertion (W9-η, reify esc-4943-54 class).
 

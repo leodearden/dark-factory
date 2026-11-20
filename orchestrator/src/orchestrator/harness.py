@@ -148,6 +148,7 @@ from orchestrator.lane_record_divergence import (
 from orchestrator.main_tip_sweep_cadence import MainSweepColdControl, SweepSeedMode
 from orchestrator.mcp_lifecycle import McpLifecycle
 from orchestrator.merge_deferred_recovery import AbandonedMemberSweep
+from orchestrator.merge_halt_rehydration import rehydrate_merge_halt
 from orchestrator.merge_lane import enqueue_merge_request
 from orchestrator.merge_lane.landed_outbox import MergeProvenance
 from orchestrator.merge_lane.landing_evidence import (
@@ -13536,7 +13537,7 @@ class Harness:
                 len(strands), exc_info=True,
             )
 
-    def _rehydrate_merge_halt(self) -> str | None:
+    async def _rehydrate_merge_halt(self) -> str | None:
         """Restore merge-halt state from preserved L1 escalations after restart.
 
         On restart, SpeculativeMergeWorker is constructed fresh (un-halted,
@@ -13546,11 +13547,13 @@ class Harness:
         owner.  (stash_failed is the main-checkout-hygiene halt category from
         task 2758: a park of project_root's dirty tracked tree failed.)
 
-        This method scans the settled post-dismissal queue for preserved
-        level-≥1 records of the relevant categories and restores the (halted,
-        owner-registered) state, so the existing _on_escalation_resolved ->
-        unhalt_wip path cleanly releases the halt when the operator resolves
-        the record.
+        This method selects the preserved level-≥1 records of the relevant
+        categories from the settled post-dismissal queue and hands them to
+        ``orchestrator/src/orchestrator/merge_halt_rehydration.py::rehydrate_merge_halt``,
+        which re-tests project_root's hygiene predicate and, when it holds,
+        restores the (halted, owner-registered) state, so the existing
+        _on_escalation_resolved -> unhalt_wip path cleanly releases the halt
+        when the operator resolves the record.
 
         LEVEL PREDICATE IS ``>= 1``, NOT ``== 1`` (task 3537, spec §7.9: "halt
         rehydration matches on category at level >= 1 — promotion must not
@@ -13571,7 +13574,10 @@ class Harness:
         after the next restart, and an operator who deliberately parked (rather
         than resolved) it would face a fleet-wide merge stall clearable only by
         a full resolve or ``force_unhalt_merge_queue``.  One record, one
-        meaning: still open ⇒ still halting.
+        meaning: an open record re-asserts its halt across a restart only while
+        project_root's hygiene predicate measures true or cannot be measured
+        (task 3876); a record measured clean is stamped ``halt_released_at``
+        and never re-owns a halt.
 
         The lower bound stays at 1 deliberately: a level-0 record is
         auto-dismissed at startup by ``dismiss_all_pending``, so honouring one
@@ -13588,28 +13594,12 @@ class Harness:
             if esc.level >= 1
             and esc.category in {'wip_conflict', 'unmerged_state', 'stash_failed'}
         ]
-        if not candidates:
-            return None
-
-        if len(candidates) > 1:
-            logger.warning(
-                '_rehydrate_merge_halt: %d qualifying level-≥1 record(s) '
-                'found; registering only the most recent as halt owner.  The '
-                'merge queue will resume as soon as that owner is resolved — '
-                'even though %d older record(s) remain pending.  Resolve the '
-                'most-recent one last to avoid premature queue resumption.',
-                len(candidates),
-                len(candidates) - 1,
-            )
-        esc = max(candidates, key=lambda e: datetime.fromisoformat(e.timestamp))
-        reason = (
-            f'Rehydrated merge halt from preserved L{esc.level} {esc.id} '
-            f'(category={esc.category}) after restart'
+        return await rehydrate_merge_halt(
+            candidates,
+            probe=self.git_ops,
+            worker=self._merge_worker,
+            records=self._escalation_queue,
         )
-        self._merge_worker.halt_for_wip(reason)
-        self._merge_worker.set_halt_owner(esc.id)
-        logger.warning(reason)
-        return esc.id
 
     async def _recover_pending_merges(self) -> dict:
         """Rehydrate in-flight merge requests from the durable journal (task 1772).

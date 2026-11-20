@@ -2823,6 +2823,7 @@ class TestRemoteCancelClearsTheHolderRendezvous:
         from click.testing import CliRunner
 
         from orchestrator import cli as cli_module
+        from orchestrator import cli_config
         from orchestrator.cli import main
         from orchestrator.config import OrchestratorConfig
         from orchestrator.verify_cancel import cancel_request as real_cancel_request
@@ -2853,7 +2854,7 @@ class TestRemoteCancelClearsTheHolderRendezvous:
 
         monkeypatch.setattr(cli_module, 'cancel_request', _declawed)
         monkeypatch.setattr(
-            cli_module, 'load_config',
+            cli_config, 'load_config',
             lambda _: OrchestratorConfig(project_root=tmp_path),
         )
         mock_git_ops = MagicMock()
@@ -3018,6 +3019,7 @@ class TestRemoteCancelClearsTheHolderRendezvous:
         from click.testing import CliRunner
 
         from orchestrator import cli as cli_module
+        from orchestrator import cli_config
         from orchestrator.cli import main
         from orchestrator.config import OrchestratorConfig
         from orchestrator.verify_cancel import (
@@ -3030,7 +3032,7 @@ class TestRemoteCancelClearsTheHolderRendezvous:
         write_lock_holder_pgid(worktree_base, os.getpgrp())
 
         monkeypatch.setattr(
-            cli_module, 'load_config',
+            cli_config, 'load_config',
             lambda _: OrchestratorConfig(project_root=tmp_path),
         )
         mock_git_ops = MagicMock()

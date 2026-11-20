@@ -323,12 +323,18 @@ VERDICT_TOOLS_MCP_SERVER = 'verdict-tools'
 PER_INVOCATION_MCP_SERVERS = frozenset({PLAN_TOOLS_MCP_SERVER, VERDICT_TOOLS_MCP_SERVER})
 
 
-def _inject_plan_tools_mcp(mcp_config: dict | None, cwd: Path, *, task_root: Path) -> dict:
+def _inject_plan_tools_mcp(
+    mcp_config: dict | None, cwd: Path, role: AgentRole, *, task_root: Path,
+) -> dict:
     """Inject the plan-tools stdio MCP server entry into *mcp_config*.
 
     Creates a minimal ``{'mcpServers': {}}`` skeleton when *mcp_config* is
     ``None``; otherwise preserves all pre-existing server entries and adds
     (or replaces) the ``plan-tools`` key.
+
+    The server exposes only ``role.plan_tools_grants``: dispatches run under
+    ``bypassPermissions``, where ``allowed_tools`` neither hides nor denies a
+    tool, so the grant is enforced by the server registering only these names.
 
     The plan-tools server is launched via the direct-interpreter no-uv hot path
     (task 1776): ``sys.executable -m orchestrator.mcp.plan_tools --worktree <wt>``.
@@ -357,6 +363,7 @@ def _inject_plan_tools_mcp(mcp_config: dict | None, cwd: Path, *, task_root: Pat
     mcp_config.setdefault('mcpServers', {})[PLAN_TOOLS_MCP_SERVER] = plan_tools_mcp_server(
         _ORCH_PROJECT_DIR, cwd, python_executable=sys.executable,
         meta_root=_meta_root_for_worktree(cwd), task_root=task_root,
+        granted_tools=role.plan_tools_grants,
     )
     return mcp_config
 
@@ -441,7 +448,7 @@ def compose_invocation_mcp_config(
     if 'orchestrator' in role.mcp_families and mcp is not None:
         mcp_config = mcp.mcp_config_json(escalation_url=escalation_url)
     if 'plan_tools' in role.mcp_families and cwd:
-        mcp_config = _inject_plan_tools_mcp(mcp_config, cwd, task_root=task_root)
+        mcp_config = _inject_plan_tools_mcp(mcp_config, cwd, role, task_root=task_root)
     if 'verdict_tools' in role.mcp_families and cwd:
         mcp_config = _inject_verdict_tools_mcp(mcp_config, cwd, role, task_root=task_root)
     if strict_mcp_config and not mcp_config:

@@ -66,6 +66,9 @@ Sources of truth, named once: the reason vocabulary is
 The reasons are `probe_failed`, `journaled_not_live`, `prior_run_terminal`, `never_submitted`, `coalesce_train_id` and `landing_unattributable`, one row each below.
 <!-- merge-state-vocab:end -->
 
+<!-- merge-status-switch:begin of=MERGE_REASONS
+     Pinned by escalation/tests/test_merge_status_boundary.py: one row per reason, one bold action each. -->
+
 | `reason` | rides on | meaning | action |
 |---|---|---|---|
 | `probe_failed` | `unknown`; `source` names the failing tier | a probe raised — the answer is not negative | **WAIT**: retry on the normal backoff, under the [wait bound](#wait-bound) |
@@ -75,6 +78,8 @@ The reasons are `probe_failed`, `journaled_not_live`, `prior_run_terminal`, `nev
 | `coalesce_train_id` | `stale_record` | the id names a coalesce train with no outcome row of its own; `last_outcome` is a member's absorption record, never your outcome | **FOLLOW THE MEMBERS**: for your own branch, take merge-queue's [Follow the superseded successor](../merge-queue/SKILL.md#follow-the-superseded-successor) Escape |
 | `landing_unattributable` | any epistemic state but `unknown`, replacing that state's own reason | git shows the branch's work on main but could not confirm attribution or effect | **VERIFY** at once, never resubmit. It is not transient, so it exits every poll loop, including an arm that otherwise treats epistemic answers as its live state. Run [the ladder](deriving-landed-sha.md#the-ladder) in full: a stampable sha is a landing (`done_provenance` kind `found_on_main`, with `commit` and the ladder's `note`); no stampable sha means stop and report |
 | any reason not listed here | — | the vocabulary grew past this table | **FAIL CLOSED**: stop and report `state`, `reason` and `hint` verbatim |
+
+<!-- merge-status-switch:end -->
 
 <a id="wait-bound"></a>
 ## The wait bound

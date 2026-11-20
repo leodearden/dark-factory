@@ -41,7 +41,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
-from _dashboard_helpers import drive_metrics_loop
+from _dashboard_helpers import drive_metrics_loop, enable_samplers
 from fastapi import FastAPI
 from starlette.testclient import TestClient
 
@@ -59,13 +59,16 @@ async def _noop_burndown_loop(*args: object, **kwargs: object) -> None:
     return None
 
 
-def test_nested_lifespans_each_get_their_own_pool_and_client() -> None:
+def test_nested_lifespans_each_get_their_own_pool_and_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A lifespan's metrics loop gets the DbPool/AsyncClient THAT lifespan built.
 
     Nests two ``TestClient(app)`` contexts over the shared global ``app`` — the
     situation the suite creates routinely — and asserts each lifespan's loop was
     handed its own handles, not whatever ``app.state`` points at.
     """
+    enable_samplers(monkeypatch)
     from dashboard.app import app
 
     recorded: list[dict[str, Any]] = []
@@ -174,7 +177,9 @@ async def _noop_metrics_loop(*args: object, **kwargs: object) -> None:
     return None
 
 
-def test_lifespan_binds_burndown_loop_to_the_config_it_built(tmp_path: Path) -> None:
+def test_lifespan_binds_burndown_loop_to_the_config_it_built(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Every startup read binds to the config THIS lifespan built, not a later swap.
 
     ``lifespan`` assigns ``app.state.config`` at the top of startup and then
@@ -212,6 +217,7 @@ def test_lifespan_binds_burndown_loop_to_the_config_it_built(tmp_path: Path) -> 
     a connection-pool bound and touches no path or handle, so a stale read
     there is inert.
     """
+    enable_samplers(monkeypatch)
     from dashboard.app import app
 
     real_build_http_limits = _build_http_limits

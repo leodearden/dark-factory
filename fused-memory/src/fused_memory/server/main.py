@@ -32,6 +32,9 @@ from fused_memory.config.schema import (  # noqa: E402
     DedupOutageDetectorConfig,
     FusedMemoryConfig,
 )
+from fused_memory.embedder.endpoint_probe import (  # noqa: E402  # debt: task 10130
+    EmbedderEndpointProbe,
+)
 from fused_memory.maintenance.rebuild_summaries import (  # noqa: E402  # debt: ticket tkt_0RWT5KQG42DBD4GM4C51E2Y7NT
     RebuildResult,
 )
@@ -595,6 +598,13 @@ async def run_server():
     logger.info(f'  Graphiti: {config.graphiti.provider} ({config.graphiti.falkordb.uri})')
     logger.info(f'  Mem0/Qdrant: {config.mem0.qdrant_url}')
     logger.info(f'  Transport: {config.server.transport}')
+    if config.config_overlay is not None:
+        logger.info(
+            '  Config overlay active: %s (keys: %s)',
+            config.config_overlay.path, ', '.join(config.config_overlay.merged_keys),
+        )
+    embedder_probe = EmbedderEndpointProbe(config.embedder)
+    embedder_probe.start()
     systemd_listeners = take_systemd_listeners()
 
     # Initialize memory service
@@ -1026,6 +1036,7 @@ async def run_server():
         curator_usage_gate=curator_usage_gate,
         known_projects=_known_projects_map,
         topic_cluster_store=topic_cluster_store,
+        embedder_probe=embedder_probe,
     )
 
     # The ToolManager.call_tool wrappers, in the ONE order that works. The

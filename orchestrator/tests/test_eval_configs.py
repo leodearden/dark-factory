@@ -346,8 +346,8 @@ class TestVllmUrlInjection:
             for cfg in EVAL_CONFIGS:
                 captured_state[cfg.name] = dict(cfg.env_overrides)
 
-        monkeypatch.setattr('orchestrator.cli._run_matrix_cmd', stub_run_matrix)
-        monkeypatch.setattr('orchestrator.cli.load_config', lambda *a: object())
+        monkeypatch.setattr('orchestrator.evals.cli._run_matrix_cmd', stub_run_matrix)
+        monkeypatch.setattr('orchestrator.cli_config.load_config', lambda *a: object())
 
         runner = CliRunner()
         result = runner.invoke(main, ['eval', '--matrix', '--vllm-url', self._VLLM_URL])

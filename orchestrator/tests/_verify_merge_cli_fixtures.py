@@ -11,6 +11,7 @@ import pytest
 from click.testing import CliRunner, Result
 
 import orchestrator.cli as cli_module
+import orchestrator.cli_config as cli_config
 from orchestrator.cli import main
 from orchestrator.config import GitConfig, OrchestratorConfig
 
@@ -91,7 +92,7 @@ def _patched_verify_merge(
     fake_config = OrchestratorConfig(
         project_root=tmp_path, git=GitConfig(persistent_merge_worktree=persistent),
     )
-    monkeypatch.setattr(cli_module, 'load_config', lambda _: fake_config)
+    monkeypatch.setattr(cli_config, 'load_config', lambda _: fake_config)
     monkeypatch.setattr(cli_module, 'start_own_process_group', lambda: _VERIFY_MERGE_PGID)
     monkeypatch.setattr(cli_module, 'start_stdin_watchdog', lambda pgid, *a, **kw: MagicMock())
 

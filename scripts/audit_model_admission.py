@@ -1082,30 +1082,45 @@ def _scoped_cap_section(scan: ScopedCapScan, model: str, span: str) -> list[str]
         [(h.created_at, h.account_name, h.reason) for h in scan.scoped_hits],
     )
     out += ['', f'Account-level (unscoped) cap hits in the same period: '
-                f'{scan.unscoped_cap_hit_count}', '',
-            f'Orchestrator startups {span}, from the `runs` table (only an '
-            'orchestrator startup loads a restart-tier leaf):', '']
+                f'{scan.unscoped_cap_hit_count}', '']
+    out += restart_witness_tables(
+        span=span, startups=scan.orchestrator_startups,
+        reloads=scan.restart_required_reloads, restarts=scan.restarts,
+    )
+    return out
+
+
+def restart_witness_tables(
+    *,
+    span: str,
+    startups: Sequence[OrchestratorStartup],
+    reloads: Sequence[RestartRequiredReload],
+    restarts: Sequence[ServiceRestart],
+) -> list[str]:
+    """Both restart witnesses' tables; only a `runs` startup proves a restart-tier leaf loaded."""
+    out = [f'Orchestrator startups {span}, from the `runs` table (only an '
+           'orchestrator startup loads a restart-tier leaf):', '']
     out += markdown_table(
         ['started_at', 'run_id'],
-        [(s.started_at, s.run_id) for s in scan.orchestrator_startups],
+        [(s.started_at, s.run_id) for s in startups],
     )
     out += ['', f'Config reloads {span} that left a leaf restart-required, with the '
                 'first orchestrator startup after each:', '']
     out += markdown_table(
         ['reloaded at', 'restart-required leaves', 'first startup after', 'run_id'],
-        [_reload_row(r) for r in scan.restart_required_reloads],
+        [_reload_row(r) for r in reloads],
     )
     out += ['', f'`service_restart` events {span}:', '']
     out += markdown_table(
         ['timestamp', 'service', 'reason'],
-        [(r.timestamp, r.service, r.reason or '-') for r in scan.restarts],
+        [(r.timestamp, r.service, r.reason or '-') for r in restarts],
     )
     out += ['']
     return out
 
 
 def _reload_row(reload: RestartRequiredReload) -> tuple[str, str, str, str]:
-    """*reload* as one row of section 4's reload table."""
+    """*reload* as one row of the restart-witness reload table."""
     after = reload.first_startup_after
     if after is None:
         return reload.timestamp, ', '.join(reload.leaves), 'none in window', '-'

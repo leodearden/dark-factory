@@ -3125,22 +3125,20 @@ class TestBuildConfigDictEndpointPlumbing:
     AsyncMemory, no _get_instance. Greenfield: nothing tested this dict before.
     """
 
-    # --- default (shipped-config) behaviour: must stay byte-identical ---
-
-    def test_default_omits_embedding_dims_entirely(self, backend):
-        """The load-bearing byte-identical assertion.
-
-        mem0/embeddings/openai.py sets
-        ``_pass_dimensions_to_api = self.config.embedding_dims is not None``.
-        We omit the key today, so ``dimensions`` is NEVER sent on an
-        embeddings request. Emitting the key at all — even as 1536 — would
-        start sending it on every request under the shipped config. Hence the
-        emit-only-when-non-default rule; do not "simplify" it away.
+    @pytest.mark.parametrize('dims', [768, 1024, 1536])
+    def test_no_width_ever_reaches_the_embedder_config(self, mock_config, dims):
+        """mem0/embeddings/openai.py sends ``dimensions`` exactly when
+        ``embedding_dims`` is set, and no client may send it (PRD C3), so the
+        key is absent at every width while the vector store follows the config.
         """
-        config_dict = backend._build_config_dict('some_collection')
+        mock_config.embedder.dimensions = dims
+        config_dict = Mem0Backend(mock_config)._build_config_dict('c')
 
-        assert backend.config.embedder.dimensions == 1536
         assert 'embedding_dims' not in config_dict['embedder']['config']
+        assert (
+            config_dict['vector_store']['config']['embedding_model_dims']
+            == mock_config.embedder.dimensions
+        )
 
     def test_default_emits_incumbent_base_urls(self, backend):
         config_dict = backend._build_config_dict('some_collection')
@@ -3151,18 +3149,20 @@ class TestBuildConfigDictEndpointPlumbing:
             == 'https://api.openai.com/v1'
         )
 
-    def test_default_vector_store_dims_match_mem0s_own_default(self, backend):
-        """Emitting this key is a no-op at the shipped config — mem0's Qdrant
-        default is already 1536 — but it is required for a collection to be
-        CREATED at a non-default dimensionality."""
+    def test_vector_store_dims_follow_the_configured_width(self, backend):
+        """mem0's own Qdrant default is 1536, so this key is what lets a
+        collection be CREATED at any other configured width."""
         from mem0.configs.vector_stores.qdrant import QdrantConfig
 
         config_dict = backend._build_config_dict('some_collection')
 
-        assert config_dict['vector_store']['config']['embedding_model_dims'] == 1536
+        assert (
+            config_dict['vector_store']['config']['embedding_model_dims']
+            == backend.config.embedder.dimensions
+        )
         assert (
             QdrantConfig.model_fields['embedding_model_dims'].default == 1536
-        ), 'mem0 changed its Qdrant dims default — the no-op claim above no longer holds'
+        ), 'mem0 changed its Qdrant dims default — the claim above no longer holds'
 
     def test_preexisting_keys_are_unchanged(self, backend):
         config_dict = backend._build_config_dict('some_collection')
@@ -3181,7 +3181,7 @@ class TestBuildConfigDictEndpointPlumbing:
 
         embedder = config_dict['embedder']['config']
         assert config_dict['embedder']['provider'] == 'openai'
-        assert embedder['model'] == 'text-embedding-3-small'
+        assert embedder['model'] == backend.config.embedder.model
         assert embedder['api_key'] == 'test-key'
 
     # --- local-endpoint behaviour ---
@@ -3200,17 +3200,16 @@ class TestBuildConfigDictEndpointPlumbing:
             == 'http://127.0.0.1:5678/v1'
         )
 
-    def test_non_default_dims_emitted_under_both_key_names(self, mock_config):
-        """BOTH keys are required for a non-1536 arm, and they are NOT the same
-        key: the embedder key controls what dimensionality is requested from
-        the API, the vector-store key controls what Qdrant creates the
-        collection with. Setting only one silently yields a mismatch.
+    def test_a_non_default_width_sets_only_the_vector_store_dims(self, mock_config):
+        """The vector-store key sets the width Qdrant creates the collection
+        at; the embedder gets no width key, so it receives the model's native
+        width and the endpoint never sees ``dimensions``.
         """
         mock_config.embedder.dimensions = 768
         config_dict = Mem0Backend(mock_config)._build_config_dict('c')
 
-        assert config_dict['embedder']['config']['embedding_dims'] == 768
         assert config_dict['vector_store']['config']['embedding_model_dims'] == 768
+        assert 'embedding_dims' not in config_dict['embedder']['config']
 
     def test_anthropic_llm_block_carries_no_openai_base_url(self, mock_config):
         """openai_base_url is an OpenAIConfig-only parameter; passing it to the
@@ -3242,8 +3241,7 @@ class TestBuildConfigDictEndpointPlumbing:
         from mem0.configs.llms.openai import OpenAIConfig
         from mem0.configs.vector_stores.qdrant import QdrantConfig
 
-        # Non-default dims so every optional key is actually emitted.
-        mock_config.embedder.dimensions = 768
+        # Local endpoints, so the endpoint keys carry non-default values.
         mock_config.llm.providers.openai.api_url = 'http://127.0.0.1:1234/v1'
         mock_config.embedder.providers.openai.api_url = 'http://127.0.0.1:5678/v1'
         config_dict = Mem0Backend(mock_config)._build_config_dict('c')

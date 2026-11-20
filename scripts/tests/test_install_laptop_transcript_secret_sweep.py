@@ -37,6 +37,7 @@ PRODUCTION_ROOT = '/home/leo/src/dark-factory'
 UNIT = 'transcript-secret-sweep'
 SWEEP_FILES = (
     'scripts/transcript-secret-sweep.sh',
+    'scripts/lib/resolve_uv.sh',
     'scripts/install-transcript-secret-sweep-timer.sh',
     f'scripts/{UNIT}.service',
     f'scripts/{UNIT}.timer',
@@ -190,6 +191,7 @@ def test_the_sweep_accepts_the_drop_ins_arguments(monkeypatch, tmp_path):
     monkeypatch.setenv('CLAUDE_OAUTH_TOKEN_A', 'sk-ant-oat01-' + 'Dr' * 17 + 'D')
     empty_units = tmp_path / 'units'
     empty_units.mkdir()
+    (tmp_path / 'laptop.yaml').write_text(f'project_root: "{tmp_path / "proj"}"\n')
     drop_in_args = _exec_starts(DROP_IN)[-1].split()[1:]
 
     assert sweep.main([
@@ -228,6 +230,7 @@ def test_the_preflight_imports_the_sweep_exactly_as_the_wrapper_runs_it(world):
     wrapper_env = {
         **{name: value for name, value in os.environ.items() if name != 'TRANSCRIPT_SECRET_SWEEP_CMD'},
         'PATH': f'{world["uv"].parent}{os.pathsep}{os.environ["PATH"]}',
+        'UV_BIN': str(world['uv']),
         'REPO': str(repo),
         'FAKE_STATE': str(world['state']),
     }

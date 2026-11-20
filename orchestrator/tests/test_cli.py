@@ -13,6 +13,7 @@ from _orch_helpers import pydantic_spec
 from click.testing import CliRunner
 
 import orchestrator.cli as cli_module
+import orchestrator.cli_config as cli_config
 from orchestrator.cli import (
     SHUTDOWN_WATCHDOG_TIMEOUT_SECS,
     _force_exit_after_delay,
@@ -528,7 +529,7 @@ def _wire_run_with_fake_harness(monkeypatch, fake_report):
         cli_module, '_force_exit_after_delay', lambda *a, **k: MagicMock()
     )
     fake_config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
-    monkeypatch.setattr(cli_module, 'load_config', lambda _path: fake_config)
+    monkeypatch.setattr(cli_config, 'load_config', lambda _path: fake_config)
 
     fake_harness = MagicMock()
     # AsyncMock so `await harness.run(...)` inside the real _main resolves.
@@ -698,7 +699,7 @@ class TestRunArmsWatchdog:
 
         # Fake config so load_config doesn't need a real file
         fake_config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
-        monkeypatch.setattr(cli_module, 'load_config', lambda _path: fake_config)
+        monkeypatch.setattr(cli_config, 'load_config', lambda _path: fake_config)
 
         # Fake Harness so we don't need a real one
         fake_harness = MagicMock()
@@ -742,7 +743,7 @@ class TestRunArmsWatchdog:
         monkeypatch.setattr(cli_module, '_force_exit_after_delay', fake_force_exit)
 
         fake_config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
-        monkeypatch.setattr(cli_module, 'load_config', lambda _path: fake_config)
+        monkeypatch.setattr(cli_config, 'load_config', lambda _path: fake_config)
 
         fake_harness = MagicMock()
         monkeypatch.setattr('orchestrator.harness.Harness', lambda config, **_: fake_harness)
@@ -786,7 +787,7 @@ class TestRunArmsWatchdog:
         monkeypatch.setattr(cli_module, '_force_exit_after_delay', fake_force_exit)
 
         fake_config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
-        monkeypatch.setattr(cli_module, 'load_config', lambda _path: fake_config)
+        monkeypatch.setattr(cli_config, 'load_config', lambda _path: fake_config)
 
         fake_harness = MagicMock()
         fake_report = MagicMock()
@@ -846,7 +847,7 @@ class TestRunArmsWatchdog:
         monkeypatch.setattr(cli_module.click, 'echo', recording_echo)
 
         fake_config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
-        monkeypatch.setattr(cli_module, 'load_config', lambda _path: fake_config)
+        monkeypatch.setattr(cli_config, 'load_config', lambda _path: fake_config)
 
         fake_harness = MagicMock()
         fake_report = MagicMock()
@@ -901,7 +902,7 @@ class TestRunArmsWatchdog:
         monkeypatch.setattr(cli_module, '_force_exit_after_delay', fake_force_exit)
 
         fake_config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
-        monkeypatch.setattr(cli_module, 'load_config', lambda _path: fake_config)
+        monkeypatch.setattr(cli_config, 'load_config', lambda _path: fake_config)
 
         fake_harness = MagicMock()
         fake_report = MagicMock()
@@ -940,7 +941,7 @@ class TestRunCapturesTheDeployedSha:
         monkeypatch.setattr(cli_module, '_force_exit_after_delay', lambda *a, **k: MagicMock())
         fake_config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
         fake_config.enabled_verify_runners = enabled_runners
-        monkeypatch.setattr(cli_module, 'load_config', lambda _path: fake_config)
+        monkeypatch.setattr(cli_config, 'load_config', lambda _path: fake_config)
         fake_report = MagicMock(blocked=0)
         fake_report.summary.return_value = 'ok'
         received: dict[str, object] = {}

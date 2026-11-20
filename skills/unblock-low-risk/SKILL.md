@@ -219,8 +219,12 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
      <!-- merge-state-vocab:end -->
      This is a **successful submission**, not a failure. `queued` means the entry is
      waiting in the merge queue; `attached` means it was
-     coalesced with an existing in-flight request. Poll `merge_status` until the entry reaches a
-     terminal state:
+     coalesced with an existing in-flight request.
+     <!-- merge-status-route:begin answer=LIVE_STATES,WAIT
+          Pinned by escalation/tests/test_merge_status_boundary.py (rows B1-B8). -->
+     While the `merge_status` answer is a live state or a wait-state reason, **WAIT**: keep
+     polling, up to the deadline below:
+     <!-- merge-status-route:end -->
 
      ```
      deadline = now() + 1200 s          # 20-minute polling ceiling (resume mode: 3 h — see "Resuming a handed-off merge")
@@ -278,7 +282,9 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
    collapses them to `blocked` when observed via polling); `abandoned` is a polled-only state that
    `merge_request` never returns; the epistemic states are poll-only.
 
-   - **`done` (polled state) or `already_merged` (submit-time):** success.
+   <!-- merge-status-route:begin answer=done -->
+   - **`done` (polled state) or `already_merged` (submit-time):** **ACCEPT** — success.
+     <!-- merge-status-route:end -->
      `already_merged` comes in two sub-cases:
      - **Fast-path** (ancestor short-circuit): no `request_id`; `commit` is the ancestor sha —
        use `done_provenance={"kind": "merged", "commit": "<commit>"}`.
@@ -438,12 +444,14 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
        which resume mode then polls), else this run's own, with the re-poll's `state` and
        `reason` in `reason`.
 
+     <!-- merge-status-route:begin answer=prior_run_terminal,never_submitted,coalesce_train_id -->
      Every other answer — `prior_run_terminal` (copy `last_outcome`'s `state`, `run_id`,
      `finished_at` and `reason` into the return value's `reason`), `never_submitted`,
      `coalesce_train_id`, a reason the shared doc does not list, or any other re-poll answer
      (a `done` without `kind: "found_on_main"` included, even one carrying a `merge_sha`: that
      sha is the record's, not a git proof, and the row may be an earlier round's) → `mcp__escalation__merge_cancel(request_id)` then
      **ABORT**. Never resubmit, never direct-merge.
+     <!-- merge-status-route:end -->
 
 ### Resuming a handed-off merge (resume mode)
 

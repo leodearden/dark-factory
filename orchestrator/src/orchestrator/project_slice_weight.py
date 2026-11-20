@@ -1,5 +1,6 @@
 """Give this orchestrator's project slice its CPUWeight at startup, when the
-daemon's unit runs directly under that slice.
+daemon runs in a service directly under that slice, or in that service's daemon
+subgroup.
 
 The placement check establishes the unit's placement, not the caller's identity;
 the caller opts in through ``Harness.run``'s ``apply_project_slice_weight``.
@@ -15,7 +16,7 @@ import logging
 import shutil
 from pathlib import PurePosixPath
 
-from shared.cgroup_slice import project_slice_name
+from shared.cgroup_slice import DAEMON_SUBGROUP, project_slice_name
 
 logger = logging.getLogger(__name__)
 
@@ -34,17 +35,18 @@ async def ensure_project_slice_weight(
     project_id: str, own_cgroup_path: str, *, set_property_timeout_secs: float = 30.0,
 ) -> SliceWeightOutcome:
     """Set ``CPUWeight`` on the project slice when *own_cgroup_path* (the
-    process's raw leaf unified cgroup) is a service directly under it.
+    process's raw leaf unified cgroup) is a service directly under it, or that
+    service's daemon subgroup.
 
     A placement or systemctl failure never raises: every outcome is logged and
     returned. Only an empty *project_id* raises, from the shared name rule."""
     slice_name = project_slice_name(project_id)
-    if not _is_service_directly_under(slice_name, own_cgroup_path):
+    if not _runs_in_a_service_directly_under(slice_name, own_cgroup_path):
         logger.warning(
-            'orchestrator own cgroup %r is not a service unit directly under its '
-            'project slice %s; if it runs as a systemd unit, reinstall the unit so '
-            'Slice= applies (docs/cgroup-slice-topology.md)',
-            own_cgroup_path, slice_name,
+            'orchestrator own cgroup %r is neither a service unit directly under its '
+            'project slice %s nor that service\'s %s/ subgroup; if it runs as a systemd '
+            'unit, reinstall the unit so Slice= applies (docs/cgroup-slice-topology.md)',
+            own_cgroup_path, slice_name, DAEMON_SUBGROUP,
         )
         return SliceWeightOutcome.UNIT_NOT_IN_SLICE
     failure = await _set_slice_cpu_weight(slice_name, set_property_timeout_secs)
@@ -58,9 +60,10 @@ async def ensure_project_slice_weight(
     return SliceWeightOutcome.APPLIED
 
 
-def _is_service_directly_under(slice_name: str, own_cgroup_path: str) -> bool:
-    parts = PurePosixPath(own_cgroup_path).parts
-    return len(parts) >= 2 and parts[-2] == slice_name and parts[-1].endswith('.service')
+def _runs_in_a_service_directly_under(slice_name: str, own_cgroup_path: str) -> bool:
+    own = PurePosixPath(own_cgroup_path)
+    service = own.parent if own.name == DAEMON_SUBGROUP else own
+    return service.name.endswith('.service') and service.parent.name == slice_name
 
 
 async def _set_slice_cpu_weight(slice_name: str, timeout_secs: float) -> str | None:

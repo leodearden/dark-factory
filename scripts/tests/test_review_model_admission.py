@@ -592,6 +592,54 @@ def test_the_review_carries_integrity_ladder_cost_and_leakage_sections(runs_db, 
     assert dict((u.role, u.count) for u in result.containment.by_role)['merger'] == 2
 
 
+SCOPED_CAP_LEAF = 'usage_cap.scoped_cap_models'
+
+
+def _reload(conn, timestamp, *, restart_required):
+    """Seed one `config_reload` carrying only the key the scan reads."""
+    conn.seed_event(timestamp, 'config_reload', data={'restart_required': restart_required})
+
+
+def _seed_restart_witness(runs_db):
+    """Startups either side of the window and in it, and two restart-required reloads.
+
+    The scoped-cap reload is loaded by the one startup inside the window; the
+    later reload has no startup after it, since the one at END is out.
+    """
+    runs_db.seed_run(run_id='run-before-apply', started_at=_at(hours=-15))
+    _reload(runs_db, _at(minutes=17, seconds=35), restart_required={
+        SCOPED_CAP_LEAF: {'old': ['claude-fable-5'], 'new': ['claude-fable-5', FABLE]},
+    })
+    runs_db.seed_run(run_id='run-063e9795fcf6', started_at=_at(hours=2, minutes=56))
+    _reload(runs_db, _at(days=13),
+            restart_required={'max_concurrent_tasks': {'old': 8, 'new': 10}})
+    runs_db.seed_run(run_id='run-at-window-end', started_at=END.isoformat())
+
+
+def test_the_review_carries_the_orchestrator_startups_and_the_reload_to_startup_join(
+    runs_db, scenario
+):
+    _seed_restart_witness(runs_db)
+
+    result = _review(runs_db, scenario)
+
+    startup = audit_model_admission.OrchestratorStartup(
+        started_at=_at(hours=2, minutes=56), run_id='run-063e9795fcf6',
+    )
+    assert result.orchestrator_startups == (startup,)
+    assert result.restart_required_reloads == (
+        audit_model_admission.RestartRequiredReload(
+            timestamp=_at(minutes=17, seconds=35), leaves=(SCOPED_CAP_LEAF,),
+            first_startup_after=startup,
+        ),
+        audit_model_admission.RestartRequiredReload(
+            timestamp=_at(days=13), leaves=('max_concurrent_tasks',),
+            first_startup_after=None,
+        ),
+    )
+    assert [r.service for r in result.restarts] == ['orchestrator']
+
+
 def _cells(line):
     return [cell.strip() for cell in line.strip().strip('|').split('|')]
 
@@ -641,6 +689,37 @@ def test_the_markdown_renders_the_measured_rates_with_their_denominators(runs_db
     assert steward['promoted share'] == '1/2 (50.0%)'
     roles = {row['role']: row for row in _table_rows(markdown) if 'admitted' in row}
     assert roles['implementer']['admitted'] == 'False'
+
+
+def test_section_3_renders_the_startup_witness_beside_the_service_restart_events(
+    runs_db, scenario
+):
+    _seed_restart_witness(runs_db)
+
+    markdown = review_model_admission.render_markdown(_review(runs_db, scenario))
+
+    section = markdown.split('### 3.')[1].split('### 4.')[0].splitlines()
+    startup_at = _at(hours=2, minutes=56)
+    startup_row = f'| {startup_at} | run-063e9795fcf6 |'
+    join_row = (f'| {_at(minutes=17, seconds=35)} | {SCOPED_CAP_LEAF} | {startup_at} '
+                '| run-063e9795fcf6 |')
+    restart_row = f'| {_at(days=1)} | orchestrator | merge landed |'
+    assert startup_row in section
+    assert join_row in section
+    assert f'| {_at(days=13)} | max_concurrent_tasks | none in window | - |' in section
+    assert restart_row in section
+    assert not [line for line in section
+                if 'run-before-apply' in line or 'run-at-window-end' in line]
+    assert 'Service restarts:' not in section
+
+    window = f'[{APPLY.isoformat()}, {END.isoformat()})'
+    captions = [
+        next(i for i, line in enumerate(section) if line.startswith(prefix))
+        for prefix in ('Orchestrator startups ', 'Config reloads ', '`service_restart` events ')
+    ]
+    assert all(f'in {window}' in section[i] for i in captions)
+    rows = [section.index(row) for row in (startup_row, join_row, restart_row)]
+    assert captions[0] < rows[0] < captions[1] < rows[1] < captions[2] < rows[2]
 
 
 def _cli(runs_db_path, escalations, *extra):

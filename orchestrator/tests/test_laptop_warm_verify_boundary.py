@@ -101,7 +101,7 @@ from _verify_merge_cli_fixtures import _setup_verify_repo
 from click.testing import CliRunner
 from escalation.queue import EscalationQueue
 
-import orchestrator.cli as cli_module
+import orchestrator.cli_config as cli_config
 from orchestrator.cli import main
 from orchestrator.config import OrchestratorConfig
 from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
@@ -1091,7 +1091,7 @@ def test_cancel_verify_tree_kills_under_live_watchdog(tmp_path, monkeypatch):
         build = wait_for_pgid_file(build_pgf, proc=child, timeout=row_discovery_ceiling_secs())
         tree = snapshot_pre_kill_tree(leader, build)
 
-        monkeypatch.setattr(cli_module, 'load_config', lambda _path: config_obj)
+        monkeypatch.setattr(cli_config, 'load_config', lambda _path: config_obj)
         result = CliRunner().invoke(main, [
             'cancel-verify', '--request-id', REQUEST_ID, '--config', str(cfg_file),
         ])
