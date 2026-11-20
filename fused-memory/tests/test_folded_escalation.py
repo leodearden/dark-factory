@@ -39,7 +39,11 @@ from shared.project_layout import escalation_queue_dir
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.middleware import _folded_escalation
-from fused_memory.middleware._folded_escalation import file_folded_escalation
+from fused_memory.middleware._folded_escalation import (
+    file_folded_escalation,
+    pending_folded_escalations,
+    resolve_folded_escalations,
+)
 from fused_memory.middleware.curation_deferral import DeferReason
 from fused_memory.middleware.ticket_store import CurationBacklog
 from fused_memory.services.write_journal import JournalGrowthSample, Mem0RetryBacklog
@@ -434,6 +438,128 @@ class TestDedupeFold:
 
         assert _emit(tmp_path, dedupe=True) is not None
         assert len(calls) == 1, 'the default path DOES consult the pending anchor'
+
+
+_OTHER_ANCHOR = 'folded-escalation-test-other'
+_OTHER_ROLE = 'fused-memory/folded-escalation-test-other'
+
+
+def _pending(project_root: str | None, **overrides) -> list:
+    kwargs = {
+        'anchor_task_id': _ANCHOR,
+        'agent_role': _ROLE,
+        'logger': logger,
+        'log_label': 'folded_escalation_test',
+    }
+    kwargs.update(overrides)
+    return pending_folded_escalations(project_root, **kwargs)
+
+
+def _resolve(project_root: str | None, **overrides) -> list:
+    kwargs = {
+        'anchor_task_id': _ANCHOR,
+        'agent_role': _ROLE,
+        'resolution': 'the condition cleared',
+        'logger': logger,
+        'log_label': 'folded_escalation_test',
+    }
+    kwargs.update(overrides)
+    return resolve_folded_escalations(project_root, **kwargs)
+
+
+def _every_record_by_id(tmp_path) -> dict[str, dict]:
+    """Every record on disk, the archive tier a resolve moves it to included."""
+    queue_dir = escalation_queue_dir(tmp_path)
+    return {
+        record['id']: record
+        for record in (json.loads(p.read_text()) for p in queue_dir.rglob('esc-*.json'))
+    }
+
+
+def _file_the_neighbours(tmp_path) -> tuple[str, str, str]:
+    """File ours, one under another anchor, and one under ours by another role."""
+    ours = _emit(tmp_path)
+    other_anchor = _emit(tmp_path, anchor_task_id=_OTHER_ANCHOR)
+    other_role = _emit(tmp_path, agent_role=_OTHER_ROLE, dedupe=False)
+    assert ours is not None and other_anchor is not None and other_role is not None
+    return ours, other_anchor, other_role
+
+
+@_needs_escalation
+class TestReadingAndResolvingUnderAnAnchor:
+    """The read and resolve counterparts of file_folded_escalation (task 10922).
+
+    A filer that self-resolves its alarm when the condition clears, and
+    re-latches onto its own open alarm after a restart, needs the same
+    optional-package guard and queue construction the filer uses.
+    """
+
+    def test_pending_returns_what_this_role_filed_under_this_anchor(self, tmp_path):
+        ours, _, _ = _file_the_neighbours(tmp_path)
+        filed = _every_record_by_id(tmp_path)[ours]
+
+        pending = _pending(str(tmp_path))
+
+        assert [(esc.id, esc.timestamp) for esc in pending] == [(ours, filed['timestamp'])]
+
+    def test_resolve_closes_only_what_pending_returns(self, tmp_path):
+        ours, other_anchor, other_role = _file_the_neighbours(tmp_path)
+
+        resolved = _resolve(str(tmp_path))
+
+        assert resolved == [ours]
+        records = _every_record_by_id(tmp_path)
+        assert records[ours]['status'] == 'resolved'
+        assert records[ours]['resolved_by'] == _ROLE
+        assert records[other_anchor]['status'] == 'pending'
+        assert records[other_role]['status'] == 'pending'
+        assert _pending(str(tmp_path)) == []
+
+    def test_one_failed_resolve_does_not_stop_the_next(self, tmp_path, monkeypatch):
+        first = _emit(tmp_path)
+        second = _emit(tmp_path, dedupe=False)
+        assert first is not None and second is not None
+        class _FirstResolveFails(_folded_escalation.EscalationQueue):
+            def resolve(self, escalation_id, *args, **kwargs):
+                if escalation_id == first:
+                    raise OSError('cannot rewrite the record')
+                return super().resolve(escalation_id, *args, **kwargs)
+
+        monkeypatch.setattr(_folded_escalation, 'EscalationQueue', _FirstResolveFails)
+
+        assert _resolve(str(tmp_path)) == [second]
+        assert _every_record_by_id(tmp_path)[second]['status'] == 'resolved'
+
+    @pytest.mark.parametrize('call', [_pending, _resolve], ids=['pending', 'resolve'])
+    def test_a_none_root_returns_empty_and_writes_nothing(self, tmp_path, call):
+        assert call(None) == []
+        assert not escalation_queue_dir(tmp_path).exists()
+
+    @pytest.mark.parametrize('call', [_pending, _resolve], ids=['pending', 'resolve'])
+    def test_an_invalid_root_returns_empty_and_never_raises(self, tmp_path, call):
+        not_a_directory = tmp_path / 'a-file'
+        not_a_directory.write_text('')
+
+        assert call(str(not_a_directory)) == []
+
+    @pytest.mark.parametrize('call', [_pending, _resolve], ids=['pending', 'resolve'])
+    def test_nothing_pending_returns_empty(self, tmp_path, call):
+        assert call(str(tmp_path)) == []
+
+    @pytest.mark.parametrize('call', [_pending, _resolve], ids=['pending', 'resolve'])
+    def test_without_the_escalation_package_it_warns_on_the_callers_logger(
+        self, tmp_path, monkeypatch, caplog, call,
+    ):
+        """Same lost-alarm level file_folded_escalation uses: a resolve that
+        cannot run leaves a page open, a read that cannot run re-pages."""
+        _emit(tmp_path)
+        monkeypatch.setattr(_folded_escalation, 'HAS_ESCALATION', False)
+
+        with caplog.at_level(logging.DEBUG):
+            assert call(str(tmp_path)) == []
+        assert [r.levelno for r in caplog.records if r.name == logger.name] == [
+            logging.WARNING,
+        ]
 
 
 @_needs_escalation
