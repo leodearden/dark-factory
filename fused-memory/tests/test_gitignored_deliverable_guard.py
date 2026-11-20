@@ -6,6 +6,7 @@ import shutil
 import subprocess
 
 import pytest
+from _census_helpers import census_lines
 from _fm_git_repos import _init_git_repo
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
@@ -185,12 +186,8 @@ class TestGitignoredDeliverableFindingMatrix:
             )
         assert finding is None
         assert probe.calls == []
-        schema_warnings = [
-            r.getMessage() for r in caplog.records
-            if 'task_metadata.schema_warning' in r.getMessage()
-        ]
-        assert len(schema_warnings) == 1
-        assert 'source=gitignored_deliverable_guard' in schema_warnings[0]
+        assert len(census_lines(caplog)) == 1
+        assert len(census_lines(caplog, 'gitignored_deliverable_guard')) == 1
 
     def test_blank_entries_are_not_probed(self):
         probe = _FakeProbe(frozenset({'tasks.db'}))

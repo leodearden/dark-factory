@@ -215,12 +215,12 @@ class DashboardConfig:
     fused_memory_urls: list[str] = field(default_factory=lambda: list(DEFAULT_FUSED_MEMORY_URLS))
     known_project_roots: list[Path] = field(default_factory=list)
     escalation_urls: dict[str, str] = field(default_factory=dict)
-    # Whether lifespan starts the two background samplers
-    # (dashboard/src/dashboard/loops.py::_burndown_loop / ::_metrics_loop), the
-    # only writers of the burndown and metrics history the charts read.
+    # Whether lifespan starts the three background samplers
+    # (dashboard/src/dashboard/loops.py::_burndown_loop / ::_metrics_loop /
+    # ::_quality_loop), the only writers of the history the charts read.
     # Env DASHBOARD_SAMPLERS=on|off, default on. Under off that history stops
-    # accruing while every page still serves; that is how the test suite's
-    # function-scoped clients run (dashboard/tests/conftest.py::samplers_off).
+    # accruing while every page still serves; that is how the whole test suite
+    # runs (dashboard/tests/_dashboard_helpers.py::apply_isolated_env).
     samplers_enabled: bool = True
 
     def __post_init__(self) -> None:

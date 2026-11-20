@@ -1,4 +1,4 @@
-"""pytest configuration for the cockpit suite — git isolation and the Hypothesis settings profile.
+"""pytest configuration for the cockpit suite — tests-dir import path, git isolation and the Hypothesis settings profile.
 
 This subproject has no git-invoking test today.  It is wired anyway: task 3355
 exists to close a defect CLASS, not today's instances, and the anti-drift guard
@@ -13,6 +13,12 @@ import sys
 from pathlib import Path
 
 from hypothesis import settings
+
+# Sibling helpers (`_cockpit_*.py`) import by bare name; enforced by
+# tests/scripts/test_pytest_workspace_collection.py::_SUBPROJECTS_WITH_CONFTEST.
+_TESTS_DIR = Path(__file__).parent
+if str(_TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_TESTS_DIR))
 
 # Suite-wide git isolation (task 3355, incident esc-3072-3).  The verify lane
 # runs `cd cockpit && uv run pytest tests/`, which makes rootdir the SUBPROJECT —

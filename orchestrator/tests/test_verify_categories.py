@@ -576,9 +576,9 @@ class TestCrossModulePreexistingSingleSourced:
 
     def test_merge_queue_preexisting_is_the_derived_object(self):
         from orchestrator import verify_categories
-        from orchestrator.merge_lane import worker as merge_queue
+        from orchestrator.merge_lane import main_health_probe
         assert (
-            merge_queue.PREEXISTING_BREAK_SKIP_CATEGORIES
+            main_health_probe.PREEXISTING_BREAK_SKIP_CATEGORIES
             is verify_categories.PREEXISTING_BREAK_SKIP_CATEGORIES
         )
 

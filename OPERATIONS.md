@@ -499,8 +499,11 @@ window before treating a p90 or a max as complete.
 Each scheduler tick, the dispatch-admission gate reads one load sample. It
 holds new HEAVY agent dispatch while any configured arm is at or over its
 threshold and this orchestrator already has at least `min_inflight_floor`
-tasks in flight. Deterministic tasks are exempt. The floor is per
-orchestrator, so the gate never holds with nothing running. Design:
+tasks in flight. Deterministic tasks and main-health fixes (tasks carrying
+`metadata.main_health_signature`) are exempt, so a `dispatch_deferred` event
+never names a fix (DA-D10 of `docs/prds/dispatch-admission-load-cap.md`).
+The floor is per orchestrator, so the gate never holds with nothing running.
+Design:
 `docs/prds/dispatch-admission-load-cap.md`, amended by
 `plans/load-throttle-harmonisation-prd.md`.
 
@@ -1436,7 +1439,8 @@ restart, no drained queue.
 **Depth comes from the pass estimate, not a cap.** Cap staging is retired:
 task 3191 (promote the cap to 32) is cancelled, and task 3190 was superseded
 on 2026-11-17. Each round's depth is read off `merge_deep.depth_table`
-(shipped `[[0.93, 8], [0.85, 4], [0.75, 2]]`; below the last row, one item)
+(shipped: one row per depth from 12, at an estimate of 0.992, down to 3, at 0.75; below the
+last row, one item; the rows and their derivation are in `plans/merge-lane-policy-prd.md` D7)
 against the rolling per-item pass estimate over the last 30 tip verdicts of
 the rounds the policy sized, and is never more than the queue holds. The
 window lives in memory and is seeded at worker start from the newest
@@ -3970,7 +3974,7 @@ declared registry and its `LoadState`-aware detector).
 |---|---|---|
 | 02:00 | Shared-repo incremental repack + commit-graph (every orchestrator root, one at a time) | `shared-repo-git-maintenance.timer` |
 | 02:15 | link-heal sweep (adjudicate new triage children; records + report; writes gated) | `fused-memory-link-heal.timer` |
-| 02:30 | Transcript secret sweep | `transcript-secret-sweep.timer` |
+| 02:30 | Transcript secret sweep (leo-laptop runs its own copy) | `transcript-secret-sweep.timer` |
 | 03:00 | Legibility trickle coder | `legibility-trickle@.timer` |
 | 03:15 | Scheduled memory evals (produce, judge, file `eval_regression`); runs for hours because of e6, see its section | `fused-memory-memory-eval.timer` |
 | 03:30 | fused-memory flag-marker drain | `fused-memory-flag-marker-sweep.timer` |
@@ -4159,8 +4163,13 @@ check.
 
 ### Transcript secret sweep (02:30)
 
-Agent subprocesses inherit no secret-bearing variable except their own
-`CLAUDE_CODE_OAUTH_TOKEN` (`shared/src/shared/secret_env.py`). Verify and
+Agent subprocesses inherit no secret-bearing variable except the credentials
+their backend names (`shared/src/shared/secret_env.py::agent_subprocess_env`).
+A Claude child keeps only its own `CLAUDE_CODE_OAUTH_TOKEN`. codex, gemini and
+pi keep only their provider keys
+(`orchestrator/src/orchestrator/agents/invoke.py::CODEX_CREDENTIAL_VARS`,
+`GEMINI_CREDENTIAL_VARS`, `PI_CREDENTIAL_VARS`). The `CLAUDE_OAUTH_TOKEN_*`
+pool never reaches any agent child. Verify and
 offline-lane children, a target project's build and test runs, inherit every
 credential except the `CLAUDE_OAUTH_TOKEN_*` account pool
 (`shared/src/shared/secret_env.py::without_account_pool`, task 6828); that
@@ -4180,13 +4189,30 @@ everything already on disk.
   `*.xml.gz`. A `*.xml.gz` is redacted by decompressing it, replacing the
   value and recompressing it, with mode and mtime kept. These logs were added
   after failing pytest env assertions printed live tokens into them (task
-  10144). `~/.claude/projects` is still scanned for transcripts only. The
-  full tree list is `scripts/transcript_secret_sweep.py::swept_trees`.
+  10144). `~/.claude/projects` is still scanned for transcripts only. Last,
+  it scans pytest's per-user base temp (`/tmp/pytest-of-<user>`,
+  `--pytest-tmp-dir`), where env-capturing tests leave raw environment
+  dumps, but only files named like one
+  (`scripts/transcript_secret_sweep.py::PYTEST_ENV_DUMP_SUFFIXES`). Reading
+  every file there is not cheap: the 2026-11-15 run read 821,808 files, and
+  every one of its hits had one of those names. A file or directory pytest
+  prunes mid-walk is passed over, not reported unreadable. An orchestrated
+  project's transcript archive and `~/.claude/projects` are required roots;
+  `data/verify-logs`, `data/orchestrator/offline-lane` and the pytest base
+  temp are optional, because most projects have no offline lane, a project
+  has no verify logs before its first verify, and a host that has not run
+  pytest has no base temp. The full tree list, with each root's required
+  flag, is `scripts/transcript_secret_sweep.py::swept_trees`.
 - **What it matches.** Only the live values the sweep's own environment holds.
   The wrapper sources the repo `.env` for them. It never matches a token-shaped
   pattern. A value is matched in the form the file holds it: JSON-escaped in
-  `*.jsonl` and `*.json`, raw or JSON-escaped in a `*.log`, and entity-escaped
-  in junit text and attribute values. Each hit is replaced in place, by the
+  `*.jsonl` and `*.json`, raw or JSON-escaped in a `*.log`, a `*.bin` or an
+  `env-dump`, and entity-escaped in junit text and attribute values. A value a
+  log cut short is matched too: at least
+  `shared/src/shared/secret_redaction.py::MIN_TRUNCATED_PREFIX_LEN` leading
+  characters of it, followed by `...`, `…` or a closing quote or bracket (in
+  the file's escaped form), are replaced by a placeholder of the same length.
+  Each hit is replaced in place, by the
   2026-10-11 method: a
   `<redacted:VAR>` placeholder padded with `x` to the same length, mode and
   mtime kept, no backup. In XML the placeholder is entity-escaped
@@ -4204,16 +4230,60 @@ everything already on disk.
   It prints one JSON record line to the journal, and never prints a value.
   A `*.xml.gz` that does not decompress is listed under `unreadable` in that
   record line and left as found.
+- **What it files when it cannot cover its roots.** When the sweep cannot run
+  (no secret-bearing values in its environment, e.g. `.env` moved or its
+  variables renamed), cannot find a required root, cannot read an
+  orchestrator unit, or finds no unit naming a project root (a renamed or
+  moved unit), it files one `infra_issue` info escalation (task_id
+  `transcript-secret-sweep-shortfall`) naming each shortfall, and exits 2.
+  The wrapper still exits 0, as every §12 job does, so the escalation is the
+  signal. A failing night re-files: one escalation per night until it is
+  fixed. The archive directory is created when a project archives its first
+  transcript, so a newly onboarded project reports its archive missing until
+  then; that shortfall clears itself. A root a host config names
+  (`--host-configs-dir`, the laptop) has no archive requirement: a verify host
+  archives no agent transcripts, and none of the laptop's four roots had an
+  archive when measured on 2026-11-19. Under `--dry-run` or `--no-escalation`
+  a shortfall is printed and exits 2 but is not filed. The wrapper resolves
+  `uv` via `scripts/lib/resolve_uv.sh`, so a boot catch-up run without the
+  login PATH still finds it.
 - **What it skips.** Files modified in the last 15 minutes, which a live
   session or test run may still be appending to. The next night picks them up.
+- **A dry run.** `--dry-run` rewrites nothing and files nothing. Its record
+  line lists under `matched` every file a real run would redact, with
+  per-variable counts. The wrapper forwards its arguments and sources `.env`,
+  so on the workstation run
+  `/home/leo/src/dark-factory/scripts/transcript-secret-sweep.sh --dry-run`.
+  After a real run, a dry run should list nothing.
 
 Installing it is a post-merge deterministic deploy
 (`scripts/install-transcript-secret-sweep-timer.sh`, which kicks no immediate
 run). For a run now: `systemctl --user start transcript-secret-sweep.service`.
+
 At archive time a refused redaction is counted like any other archival
 failure (`transcript_archive: failed to redact` WARNING), and the transcript is
 held rather than archived with its value. At teardown, its other lines are
 still redacted in place.
+
+**On leo-laptop.** The laptop runs the same timer, service and wrapper from
+its own checkout. They are installed from the workstation by
+`scripts/deploy/install_laptop_transcript_secret_sweep.sh`, a post-merge
+deterministic deploy (run it with `--check` first). The laptop sweep sources
+the laptop's own `.env`, which holds a different slice of the pool, so no
+value crosses the wire. A drop-in (`scripts/transcript-secret-sweep.laptop.conf`)
+adds two flags:
+
+- `--host-configs-dir /home/leo/.config/orchestrator`, because the laptop has
+  no orchestrator units. Its verify configs there name its project roots.
+- `--no-escalation`, because the escalation server binds 127.0.0.1 on the
+  workstation. Laptop findings are therefore in the laptop journal only:
+  `ssh leo-laptop journalctl --user -u transcript-secret-sweep.service`.
+
+It is a user timer, so it fires only while leo's user manager runs. Lingering
+was off on the laptop when measured on 2026-11-16, and `Persistent=true`
+catches up a missed night. A laptop dry run:
+`ssh leo-laptop 'PATH=$HOME/.local/bin:$PATH /home/leo/src/dark-factory/scripts/transcript-secret-sweep.sh --host-configs-dir /home/leo/.config/orchestrator --no-escalation --dry-run'`
+(uv is not on a non-login ssh PATH).
 
 ### Legibility trickle accounts (03:00)
 
@@ -4330,7 +4400,8 @@ exhaustions, each prefixed with the label:
   loud `legibility account pool resolved NO usable accounts` warning naming the
   roster, or with `legibility account pool could not load its roster` when the
   file is unreadable or malformed. The night is still recorded as DEFERRED
-  rather than crashing (task 5635).
+  rather than crashing (task 5635), so after a week of it the trickle health
+  probe's deferred-streak verdict fires.
 - `<label>: no account completed this invocation in one pass over the
   7-account pool and the gate still considers max-c usable — so this is not a
   capacity limit ...`. This is neither weather nor a missing token: every
@@ -4645,6 +4716,29 @@ is how an operator ends up tuning the sampler for a crashed coder:
   at zero the night is simply unfinished and where signal stopped is
   **unknown** (the nightly records its crash sentinel before the digest
   stage, so a `failed` night with nothing selected is ordinary).
+- **owed date past recovery** — the retry backlog holds an owed date that the
+  next night will abandon as older than `RETRY_MAX_AGE_DAYS` (7) days
+  (`scripts/legibility/trickle_state.py::unrecoverable_owed_date`); the verdict
+  names it. Retries run only after a finished pass, one per night, so it takes
+  about a week of passes that did not finish. A pure deferral reaches it on its
+  seventh consecutive night. The check reads the backlog, not a streak count,
+  so one failed night inside the deferral counts the same, as does a finished
+  night whose retry was itself capped, and a manual `nightly.py run --date`
+  pass moves it only through what it does to the backlog. One deferred night
+  is weather; a week has outlasted a
+  weekly cap reset, and each further night that does not finish loses one more
+  date. The verdict reports `consecutive_deferred_runs`,
+  `consecutive_failed_runs` and the last recorded outcome and exit code. Read
+  the DEFERRED reason in `journalctl --user -u legibility-trickle@<project>`
+  (the verdict prints the `--since` window), and for a failed run its error.
+  `no pool accounts resolved` is a config fault that never clears on its own
+  (task 5635), and accounts named with credentials rejected need operator
+  action; see the pool exhaustions under "Legibility trickle accounts
+  (03:00)". Only an all-capped pool is weather, and then there is nothing to
+  do. The abandoned dates' sessions stay minable by the census within
+  `census.ledger_retention_days`. A failed streak takes precedence over this
+  verdict, and this verdict takes precedence over the barren ones; it names no
+  door and reports the carried `consecutive_barren_runs`.
 - **`barren` streak** — the run completed and the sampler's doors dropped
   everything. Compare `budgets.max_daily_digest_bytes` against
   `sampling.top_fraction` / `per_stratum_min`; the verdict names which door
@@ -4661,14 +4755,19 @@ is how an operator ends up tuning the sampler for a crashed coder:
   but the last recorded run was `deferred`: the usage cap deferred its
   coding, so it re-observed neither door. The streak is still unresolved.
   There is no crash to clear and no door to name; the deferral clears at the
-  cap reset, so re-read the probe once a run has completed.
+  cap reset, so re-read the probe once a run has completed. This applies only
+  while no owed date is past recovery; once one is, the owed-date verdict
+  above replaces it.
 - **`missing` / `malformed` / stale** — the recorder itself stopped. The
   nightly is not writing state at all, so neither streak means anything yet.
 - **`quiet`** — a legitimately quiet night. Never alarms, by construction.
 - **`deferred`** — a usage-cap night (`coder.is_cap_deferral`): its digests
   were selected and the cap deferred their coding. No action; it self-clears
-  at the reset. It keeps `last_productive_at` and both streaks unchanged and
-  owes its date a retry (see "Retried nights").
+  at the reset. It keeps `last_productive_at`, the barren streak and the
+  failed streak unchanged, adds one to `consecutive_deferred_runs`, and owes
+  its date a retry (see "Retried nights"). A finished night resets
+  `consecutive_deferred_runs` and a failed one carries it. No verdict reads
+  that count; the OK line reports it.
 - **census fired without advancing** — the census trigger FIREd on at least N
   (default 3) consecutive recorded trickle nights while `last_census_at`
   stayed put, and every such night launches a paid census. A census deferred
@@ -4707,6 +4806,10 @@ mistaken for a gap. When every later night finishes, an outage of up to
 each later night that does not finish costs the oldest owed date. Never-run
 dates already past the window are abandoned in one WARNING,
 `abandoning <n> never-run date(s) <first>..<last>`.
+The progress probe's OK line prints `consecutive_deferred_runs=<n>` and
+`retry_backlog=<n> owed (oldest <date>, window 7 days)` (`retry_backlog=0 owed`
+when nothing is owed), so a growing deferral or backlog is visible before any
+verdict fires.
 
 **The escalation it files.** `task_id=legibility-trickle-health-<project_id>`
 (deliberately distinct from the nightly's own
@@ -4726,7 +4829,9 @@ info escalation, on the first night after deploy, and its detail says why.
 Those silence cases apply to the progress and liveness probes only: a
 census-probe failure **always** posts, because nothing else escalates an
 unadvanced-fire streak. A non-zero exit is the authoritative signal whether or
-not the POST landed.
+not the POST landed. The owed-date-past-recovery verdict posts like any other
+failing progress verdict. When its last night was deferred or failed, that
+night recorded `barren_escalated: false`, so nothing suppresses it.
 
 The nightly escalates when the barren streak reaches its threshold
 (`trickle_state.DEFAULT_MAX_BARREN_RUNS` (3), or

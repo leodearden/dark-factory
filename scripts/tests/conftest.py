@@ -5,13 +5,10 @@ Mirrors the repo root conftest.py sys.path-insertion pattern so that
 scripts/tests/ under importlib import mode.  No package __init__.py is
 needed (importlib mode does not require it).
 
-Also inserts scripts/legibility/ so flat modules nested one level down
-(e.g. `digest.py`, and its PRD-decomposition siblings — the sampler,
-merger, trickle coder, etc. all planned to live under scripts/legibility/)
-resolve via a bare `import digest` the same way top-level scripts/*.py
-modules do. Without this, scripts/ on sys.path alone only makes
-scripts/legibility/ importable as a namespace package (`import legibility`),
-not its contents as bare top-level names.
+scripts/ on sys.path makes scripts/legibility/ importable as the
+`legibility` namespace package, and its modules are imported only as
+`legibility.<mod>`: a bare name would load a second module object for the
+same file (scripts/tests/test_legibility_import_spelling.py).
 
 Also APPENDS scripts/tests/ itself, so non-test helper modules living beside
 the tests (`cli_subprocess_timeout`, `write_triage_attach_fixtures`) resolve
@@ -54,10 +51,6 @@ import pytest
 _SCRIPTS_DIR = Path(__file__).parent.parent  # scripts/tests/../ = scripts/
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
-
-_LEGIBILITY_DIR = _SCRIPTS_DIR / 'legibility'
-if str(_LEGIBILITY_DIR) not in sys.path:
-    sys.path.insert(0, str(_LEGIBILITY_DIR))
 
 # Same insert for scripts/local-model-serving/ (task 3713, LME-alpha).  That
 # directory name is HYPHENATED, so unlike a dotted package name it can never be

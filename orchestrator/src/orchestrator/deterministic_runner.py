@@ -1044,11 +1044,12 @@ class DeterministicRunner:
         #     PYTHONPATH still dies at `shared.async_sqlite_base` ->
         #     `import aiosqlite`, a site-packages-only wheel.  So PYTHONPATH
         #     alone is NOT sufficient.
-        #  2. Workspace src roots — supplied explicitly by the
-        #     `--setenv=PYTHONPATH=` token `RestartPlan`'s detached argv now
-        #     carries (proc_supervision._submit_child_pythonpath).  This is the
-        #     only leg systemd-run can break: it propagates NONE of the caller's
-        #     environment to a transient unit.
+        #  2. Workspace src roots — supplied explicitly by the `PYTHONPATH=`
+        #     assignment prefix RestartPlan's RP-4 wrapper puts on the submit
+        #     command
+        #     (orchestrator/src/orchestrator/proc_supervision.py::_submit_child_shell_command).
+        #     This is the only leg systemd-run can break: it propagates NONE of
+        #     the caller's environment to a transient unit.
         #
         # NOT via "a PYTHONPATH side-channel from the orchestrator service
         # unit", as this comment previously claimed — MEASURED FALSE:

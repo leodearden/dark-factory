@@ -42,7 +42,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
-from _dashboard_helpers import IDLE_BACKGROUND_LOOPS, app_with_loops, drive_metrics_loop
+from _dashboard_helpers import (
+    IDLE_BACKGROUND_LOOPS,
+    app_with_loops,
+    drive_metrics_loop,
+    enable_samplers,
+)
 from fastapi import FastAPI
 from starlette.testclient import TestClient
 
@@ -60,7 +65,7 @@ def test_nested_lifespans_each_get_their_own_pool_and_client(
     situation the suite creates routinely — and asserts each lifespan's loop was
     handed its own handles, not whatever ``app.state`` points at.
     """
-    monkeypatch.setenv('DASHBOARD_SAMPLERS', 'on')
+    enable_samplers(monkeypatch)
     recorded: list[dict[str, Any]] = []
 
     async def _recording_metrics_loop(
@@ -195,7 +200,7 @@ def test_lifespan_binds_burndown_loop_to_the_config_it_built(
     a connection-pool bound and touches no path or handle, so a stale read
     there is inert.
     """
-    monkeypatch.setenv('DASHBOARD_SAMPLERS', 'on')
+    enable_samplers(monkeypatch)
     real_build_http_limits = _build_http_limits
     real_open = _BurndownStore.open
     captured: dict[str, Any] = {}

@@ -287,15 +287,14 @@ class TestLLMConfigClientClass:
         )
 
     @pytest.mark.parametrize('yaml_name', ['config.yaml', 'config-docker.yaml'])
-    def test_shipped_config_yaml_shares_one_openai_api_url_default(
+    def test_shipped_config_yaml_llm_api_url_follows_openai_api_url(
         self, monkeypatch, yaml_name,
     ):
-        """llm and embedder provider blocks must resolve to the SAME api_url.
+        """The llm api_url defaults to OpenAI and follows OPENAI_API_URL.
 
-        Both are ``${OPENAI_API_URL:https://api.openai.com/v1}`` today. Independent
-        LLM/embedder endpoints come from setting the two blocks to different
-        literals — but the shipped DEFAULT must stay shared, so a deployment that
-        sets only OPENAI_API_URL keeps pointing both at one endpoint.
+        The embedder endpoint is deliberately independent of the llm's
+        (plans/local-embedder-cutover-prd.md §6 C3), so its block is only
+        required to exist with a non-empty api_url.
         """
         yaml_path = Path(__file__).resolve().parent.parent / 'config' / yaml_name
         assert yaml_path.is_file(), f'expected {yaml_name} at {yaml_path}'
@@ -306,19 +305,17 @@ class TestLLMConfigClientClass:
         monkeypatch.delenv('OPENAI_API_URL', raising=False)
         cfg = FusedMemoryConfig()
         assert cfg.llm.providers.openai is not None
-        assert cfg.embedder.providers.openai is not None
         assert cfg.llm.providers.openai.api_url == 'https://api.openai.com/v1'
-        assert (
-            cfg.llm.providers.openai.api_url == cfg.embedder.providers.openai.api_url
-        ), f'llm and embedder api_url defaults must stay identical in {yaml_name}'
+        assert cfg.embedder.providers.openai is not None
+        assert isinstance(cfg.embedder.providers.openai.api_url, str)
+        assert cfg.embedder.providers.openai.api_url, (
+            f'embedder.providers.openai.api_url must be non-empty in {yaml_name}'
+        )
 
-        # And when it IS set, both blocks follow it together.
         monkeypatch.setenv('OPENAI_API_URL', 'http://127.0.0.1:1234/v1')
         cfg2 = FusedMemoryConfig()
         assert cfg2.llm.providers.openai is not None
-        assert cfg2.embedder.providers.openai is not None
         assert cfg2.llm.providers.openai.api_url == 'http://127.0.0.1:1234/v1'
-        assert cfg2.embedder.providers.openai.api_url == 'http://127.0.0.1:1234/v1'
 
 
 class TestEmbedderConfigProvider:

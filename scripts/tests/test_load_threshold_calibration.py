@@ -1773,9 +1773,9 @@ def test_int_and_float_spellings_do_not_hide_a_restatement():
 
 
 def test_a_leaf_absent_from_the_defaults_is_reported_unknown_to_the_schema():
-    """Measured: PsiAdmissionConfig has no runqueue_ratio field today (β
-    unlanded). Reported, not flagged and not silently dropped — "this arm is
-    not in the model yet" is a fact the operator needs."""
+    """The defaults here are injected, so the leaves are absent by construction.
+    Reported, not flagged and not silently dropped — "this arm is not in the
+    model" is a fact the operator needs."""
     module = load_script()
 
     result = module.compare_to_code_defaults(

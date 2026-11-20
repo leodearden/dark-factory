@@ -22,6 +22,7 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+from _census_helpers import census_lines
 from shared.task_statuses import ACTIVE, TERMINAL
 
 _DEFAULT_METADATA = object()
@@ -830,13 +831,7 @@ class TestRecurringGateGuardError:
         assert err['existing_gate_task_id'] == '5929'
 
 
-_SCHEMA_WARNING = 'task_metadata.schema_warning'
-_SOURCE = 'source=recurring_gate_guard'
-
-
-def _discard_lines(caplog) -> list[str]:
-    messages = (r.getMessage() for r in caplog.records)
-    return [m for m in messages if _SCHEMA_WARNING in m and _SOURCE in m]
+_SOURCE = 'recurring_gate_guard'
 
 
 class TestUnreadableMetadataIsDiscardedLoudly:
@@ -855,7 +850,7 @@ class TestUnreadableMetadataIsDiscardedLoudly:
             )
         assert result is None
         assert fetch.await_count == 0
-        assert len(_discard_lines(caplog)) == 1
+        assert len(census_lines(caplog, _SOURCE)) == 1
 
     @pytest.mark.parametrize('metadata', ['{not json', ['not', 'a', 'dict'], 42], ids=repr)
     def test_unreadable_stored_row_is_skipped_and_logged_once(self, metadata, caplog):
@@ -863,7 +858,7 @@ class TestUnreadableMetadataIsDiscardedLoudly:
 
         with caplog.at_level(logging.WARNING):
             assert find_open_gate([_row(task_id='5902', metadata=metadata)], '5879') is None
-        assert len(_discard_lines(caplog)) == 1
+        assert len(census_lines(caplog, _SOURCE)) == 1
 
     def test_unreadable_stored_row_is_logged_under_its_own_row_id(self, caplog):
         from fused_memory.middleware.recurring_gate_guard import find_open_gate
@@ -871,7 +866,7 @@ class TestUnreadableMetadataIsDiscardedLoudly:
         corpus = [_row(task_id='5902', metadata='{not json'), _row(task_id='5903', metadata=42)]
         with caplog.at_level(logging.WARNING):
             assert find_open_gate(corpus, '5879') is None
-        lines = _discard_lines(caplog)
+        lines = census_lines(caplog, _SOURCE)
         assert len(lines) == 2
         assert 'source=recurring_gate_guard.find_open_gate[5902] ' in lines[0]
         assert 'source=recurring_gate_guard.find_open_gate[5903] ' in lines[1]
@@ -881,18 +876,18 @@ class TestUnreadableMetadataIsDiscardedLoudly:
 
         with caplog.at_level(logging.WARNING):
             is_gate_submission('{not json')
-        assert not any('find_open_gate' in line for line in _discard_lines(caplog))
+        assert not any('find_open_gate' in line for line in census_lines(caplog, _SOURCE))
 
     def test_extract_gate_subject_logs_one_census_line(self, caplog):
         from fused_memory.middleware.recurring_gate_guard import extract_gate_subject
 
         with caplog.at_level(logging.WARNING):
             assert extract_gate_subject('{not json') is None
-        assert len(_discard_lines(caplog)) == 1
+        assert len(census_lines(caplog, _SOURCE)) == 1
 
     def test_is_gate_submission_logs_one_census_line(self, caplog):
         from fused_memory.middleware.recurring_gate_guard import is_gate_submission
 
         with caplog.at_level(logging.WARNING):
             assert is_gate_submission('{not json') is False
-        assert len(_discard_lines(caplog)) == 1
+        assert len(census_lines(caplog, _SOURCE)) == 1

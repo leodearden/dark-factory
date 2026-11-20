@@ -24,6 +24,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _git_fixtures import seed_repo
+from _seed_script_stubs import seed_default_warm_base
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, OrchestratorConfig
@@ -41,10 +42,7 @@ from orchestrator.warm_lane_pool import LaneState, WarmLanePool, WarmLanePoolShr
 def ig_git_repo(tmp_path: Path) -> Path:
     """Temporary git repo with an initial commit, a warm base and pool-root sentinel."""
     repo = seed_repo(tmp_path / 'repo')
-    default_base = repo / '.worktrees' / '_merge-verify' / 'target'
-    default_base.mkdir(parents=True, exist_ok=True)
-    (default_base / '.keep').write_text('warm base sentinel\n')
-    (repo / '.worktrees' / '.pool-root').touch()
+    seed_default_warm_base(repo)
     return repo
 
 

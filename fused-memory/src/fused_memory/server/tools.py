@@ -55,6 +55,8 @@ from fused_memory.backends.task_projection import (
 )
 from fused_memory.config.reload import apply_reload
 from fused_memory.config.schema import DEFAULT_CONFIG_PATH, FusedMemoryConfig
+from fused_memory.embedder.endpoint_probe import EmbedderEndpointProbe
+from fused_memory.embedder.status import embedder_identity_status
 from fused_memory.mcp_tools.scheduler_state import (
     read_scheduler_events,
     read_scheduler_state,
@@ -622,7 +624,8 @@ Conventions:
   nothing is soft-blocked, the ack carries routed (stored | restated | amended | contested) plus
   canonical_id on an attach, and a restated write becomes a sighting CHILD of the memory it
   restates rather than a standalone entry, so the full text you submitted is kept and the canonical
-  is never edited. There, allow_near_duplicate means force-store (store it standalone, do not
+  is never edited; restated means a near-verbatim repeat that adds nothing, since a write merely
+  about the same thing is judged and filed amended or contested. There, allow_near_duplicate means force-store (store it standalone, do not
   reroute it) rather than bypass-the-reject. Searching first is worth doing either way: it is how
   you find the entry to update instead of restating it.
 - Never write raw MCP envelope markup into a payload. EVERY tool's string parameters are
@@ -1431,6 +1434,7 @@ def create_mcp_server(
     known_projects: dict[str, str] | None = None,
     topic_cluster_store: TopicClusterStore | None = None,
     id_resolver: IdResolver | None = None,
+    embedder_probe: EmbedderEndpointProbe | None = None,
 ) -> FastMCP:
     """Create and configure the FastMCP server with all tools."""
 
@@ -3533,9 +3537,10 @@ def create_mcp_server(
         is ever soft-blocked, and the response carries two extra fields.
 
         * ``routed`` — what triage did with the write, one of ``stored``
-          (a new standalone memory), ``restated`` (it restates an existing
-          memory), ``amended`` (it adds to one) or ``contested`` (it says
-          one is wrong, outdated or different).
+          (a new standalone memory), ``restated`` (it repeats an existing
+          memory near-verbatim, adding nothing), ``amended`` (it adds to
+          one) or ``contested`` (it says one is wrong, outdated or
+          different).
         * ``canonical_id`` — the memory the write was attached to. Present
           ONLY on an attach outcome; absent entirely for ``stored``.
 
@@ -3544,6 +3549,14 @@ def create_mcp_server(
         rediscovery is counted, and the canonical is never edited. Nothing is
         lost and no write is ever blocked — a retrieval or judge failure
         degrades to a plain ``stored``, never to an error.
+
+        ``restated`` is rare. It means your write repeats an existing memory
+        near-verbatim (the rule is ``server/near_verbatim.py``), which is
+        why a sighting's text can be only counted. A write that is merely
+        about the same thing, however similar, is judged and filed
+        ``amended``, its text then digested into the canonical's grouped
+        document, or ``contested``. So a ``restated`` ack really does mean
+        your write added nothing.
 
         A ``contested`` write becomes an AMENDMENT CHILD flagged as contesting
         its parent. Nothing was blocked and nothing was decided: triage
@@ -7804,6 +7817,10 @@ def create_mcp_server(
         recipes probe it (skills/_shared/filing-the-trigger-chain.md §2)
         because it comes from the running process, not from main.
 
+        When the server runs the startup embedder probe, the top-level
+        ``embedder`` block reports the probed endpoint, and ``config_overlay``
+        the active config overlay's provenance.
+
         Args:
             project_id: Get stats for a specific project (optional)
         """
@@ -7879,6 +7896,9 @@ def create_mcp_server(
 
         if isinstance(result, dict) and 'error' not in result:
             result['task_metadata_capabilities'] = sorted(TASK_METADATA_CAPABILITIES)
+
+        if embedder_probe is not None and isinstance(result, dict) and 'error' not in result:
+            result.update(embedder_identity_status(memory_service.config, embedder_probe))
 
         return result
 

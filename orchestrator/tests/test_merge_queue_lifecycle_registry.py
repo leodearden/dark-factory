@@ -36,6 +36,7 @@ from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _git_fixtures import seed_repo
 from _live_merge_worker import REAL_GIT_MERGE_RESULT_TIMEOUT
 from _merge_lane_fakes import (
     FakeClock,
@@ -63,23 +64,10 @@ from orchestrator.merge_lane.types import InflightEntry, MergeOutcome, MergeRequ
 # ---------------------------------------------------------------------------
 
 
-async def _setup_repo(repo: Path) -> None:
-    """Initialise a bare git repository with a single commit on main."""
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    (repo / 'README.md').write_text('# Test\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
-
-
 @pytest.fixture
 def git_repo(tmp_path: Path) -> Path:
     """Create a temporary git repository with an initial commit."""
-    repo = tmp_path / 'repo'
-    repo.mkdir()
-    asyncio.run(_setup_repo(repo))
-    return repo
+    return seed_repo(tmp_path / 'repo')
 
 
 @pytest.fixture
@@ -550,7 +538,7 @@ class TestMergerVerifierHandoffRegistersAwaitingVerify:
 @pytest.mark.asyncio
 class TestRequeueToQueuedSites:
     """The 3 ``_queue.put_nowait(req)`` requeue sites (pre-dispatch
-    operator-halt in ``_dispatch_item``, mid-verify operator-halt in
+    operator-halt in ``VerifyDispatcher.dispatch``, mid-verify operator-halt in
     ``_run_inflight_verify``, and the head-failure cascade's downstream
     self-requeue) must transition a TRACKED item's registry entry back to
     QUEUED, and the SAME request_id must be able to re-arm/re-drain through
@@ -558,7 +546,7 @@ class TestRequeueToQueuedSites:
     duplicate-register ``ValueError`` or a spurious escalation (task 2169
     step-5).
 
-    Targets the pre-dispatch operator-halt branch of ``_dispatch_item``
+    Targets the pre-dispatch operator-halt branch of ``VerifyDispatcher.dispatch``
     directly (bare worker, no real ``worker.run()`` loop) — mirrors
     test_merge_queue_request_liveness.py::TestOperatorHaltRequeueNoFalseAlarm's
     bare-item pattern, which drives the SAME branch on an UNREGISTERED item
@@ -597,7 +585,7 @@ class TestRequeueToQueuedSites:
         worker._register_item(item, initial=ItemLifecycleState.DISPATCHING)
 
         worker.operator_halt('test: pre-dispatch halt')
-        entry = await worker._dispatch_item(item)
+        entry = await worker.verify_dispatch.dispatch(item)
 
         assert isinstance(entry, InflightEntry) and entry.status == InflightStatus.REQUEUED_PREDISPATCH
         assert not queue.empty(), 'req must be put back on the queue by the halt branch'
@@ -660,7 +648,7 @@ class TestRequeueToQueuedSites:
         )
 
         worker.operator_halt('test: pre-dispatch halt')
-        entry = await worker._dispatch_item(item)
+        entry = await worker.verify_dispatch.dispatch(item)
 
         assert isinstance(entry, InflightEntry) and entry.status == InflightStatus.REQUEUED_PREDISPATCH
         assert worker._lifecycle.current(req.request_id) is None
@@ -792,9 +780,9 @@ class TestOnRequeuedIsAlwaysPairedWithNoteRequeue:
             git_ops, queue, verifier=verifier, escalation_queue=fake_eq,
             clock=clock,
         )
-        worker.VERIFY_ABANDON_POLL_SECS = 0.02
-        worker.INFLIGHT_VERIFY_PROGRESS_PROBE_SECS = 0.02
-        worker.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS = 0.2
+        worker.verify_dispatch.VERIFY_ABANDON_POLL_SECS = 0.02
+        worker.verify_dispatch.INFLIGHT_VERIFY_PROGRESS_PROBE_SECS = 0.02
+        worker.verify_dispatch.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS = 0.2
 
         ledger_rids: list[str] = []
         registry_rids: list[str] = []
@@ -824,7 +812,7 @@ class TestOnRequeuedIsAlwaysPairedWithNoteRequeue:
         worker._register_owned_merge_worktree(item_cl.merge_wt)
         worker._register_item(item_cl, initial=ItemLifecycleState.VERIFYING)
         vr_cl = await asyncio.wait_for(
-            worker._run_inflight_verify(item_cl, lease), timeout=15.0,
+            worker.verify_dispatch.run_inflight_verify(item_cl, lease), timeout=15.0,
         )
         assert vr_cl.status == InflightStatus.REQUEUED, f'{vr_cl!r}'
 
@@ -840,9 +828,9 @@ class TestOnRequeuedIsAlwaysPairedWithNoteRequeue:
             'is waiting on something other than the clock it measures its '
             'no-progress budget against'
         )
-        assert set(clock.waits) == {worker.VERIFY_ABANDON_POLL_SECS}, (
+        assert set(clock.waits) == {worker.verify_dispatch.VERIFY_ABANDON_POLL_SECS}, (
             f'every ClockPort.wait_for_any must wait exactly '
-            f'VERIFY_ABANDON_POLL_SECS ({worker.VERIFY_ABANDON_POLL_SECS}s): '
+            f'VERIFY_ABANDON_POLL_SECS ({worker.verify_dispatch.VERIFY_ABANDON_POLL_SECS}s): '
             f'{clock.waits!r}'
         )
 
@@ -853,7 +841,7 @@ class TestOnRequeuedIsAlwaysPairedWithNoteRequeue:
         worker._register_owned_merge_worktree(item_dv.merge_wt)
         worker._register_item(item_dv, initial=ItemLifecycleState.VERIFYING)
         vr_dv = await asyncio.wait_for(
-            worker._run_inflight_verify(item_dv, lease), timeout=15.0,
+            worker.verify_dispatch.run_inflight_verify(item_dv, lease), timeout=15.0,
         )
         assert vr_dv.status == InflightStatus.REQUEUED, f'{vr_dv!r}'
 
@@ -868,7 +856,7 @@ class TestOnRequeuedIsAlwaysPairedWithNoteRequeue:
         )
         worker._register_item(item_ph, initial=ItemLifecycleState.DISPATCHING)
         worker.operator_halt('test: pre-dispatch halt')
-        entry_ph = await worker._dispatch_item(item_ph)
+        entry_ph = await worker.verify_dispatch.dispatch(item_ph)
         assert isinstance(entry_ph, InflightEntry)
         assert entry_ph.status == InflightStatus.REQUEUED_PREDISPATCH, f'{entry_ph!r}'
 
@@ -1255,7 +1243,7 @@ class TestRequeueRequestHelperContract:
 
 # ---------------------------------------------------------------------------
 # step-7 RED / step-8 GREEN: verifier DISPATCH-FILL + blocking-get wiring —
-# AWAITING_VERIFY/REDISPATCH_PARKED -> DISPATCHING at BOTH _dispatch_item call
+# AWAITING_VERIFY/REDISPATCH_PARKED -> DISPATCHING at BOTH VerifyDispatcher.dispatch call
 # sites (DISPATCH-FILL's get_nowait/redispatch-popleft branch and the
 # blocking-get branch), DISPATCHING -> VERIFYING at _inflight_append,
 # DISPATCHING -> REDISPATCH_PARKED on the no-host appendleft (both call
@@ -1268,16 +1256,16 @@ class TestRequeueRequestHelperContract:
 class TestVerifierDispatchFillRegistersDispatching:
     """Every path through the verifier's DISPATCH-FILL / blocking-get dispatch
     call sites must transition the registry into DISPATCHING before calling
-    ``_dispatch_item``, then onward to VERIFYING (real dispatch),
+    ``VerifyDispatcher.dispatch``, then onward to VERIFYING (real dispatch),
     REDISPATCH_PARKED (no host free), or MERGING (dispatch-time staleness
     remerge) — not just the legacy ``_dispatching_item``/``_remerging_item``
     census fields, which cover only a subset of these paths (task 2169
     step-7).
 
     RED until step-8 GREEN wires ``_note_transition`` at both
-    ``_dispatch_item`` call sites in ``_verifier_loop``, at
+    ``VerifyDispatcher.dispatch`` call sites in ``_verifier_loop``, at
     ``_inflight_append``, at the two no-host ``request_redispatch(item, front=True)``
-    sites, and around the dispatch-time remerge inside ``_dispatch_item``.
+    sites, and around the dispatch-time remerge inside ``VerifyDispatcher.dispatch``.
     """
 
     async def test_single_item_progresses_through_dispatching_to_verifying(
@@ -1396,8 +1384,8 @@ class TestVerifierDispatchFillRegistersDispatching:
     ) -> None:
         """An item already sitting in ``_verifier_queue`` when the loop is
         entered is fetched by DISPATCH-FILL's ``get_nowait()`` branch (the
-        FIRST ``_dispatch_item`` call site). With zero free hosts forced,
-        ``_dispatch_item`` returns None and the item bounces onto
+        FIRST ``VerifyDispatcher.dispatch`` call site). With zero free hosts forced,
+        ``VerifyDispatcher.dispatch`` returns ``NoHost`` and the item bounces onto
         the redispatch park — this must transition
         AWAITING_VERIFY -> DISPATCHING -> REDISPATCH_PARKED, not just set
         the legacy ``_dispatching_item`` field.
@@ -1454,7 +1442,7 @@ class TestVerifierDispatchFillRegistersDispatching:
     ) -> None:
         """An item that arrives AFTER the verifier loop is already blocked on
         ``_verifier_queue.get()`` (DISPATCH-FILL found nothing and fell
-        through) is dispatched via the SECOND ``_dispatch_item`` call site.
+        through) is dispatched via the SECOND ``VerifyDispatcher.dispatch`` call site.
         With zero free hosts forced, this must also transition
         AWAITING_VERIFY -> DISPATCHING -> REDISPATCH_PARKED — this call site
         has no legacy ``_dispatching_item`` coverage at all today.
@@ -1521,7 +1509,7 @@ class TestVerifierDispatchFillRegistersDispatching:
         self, git_ops: GitOps, config: OrchestratorConfig,
     ) -> None:
         """The dispatch-time staleness remerge window (Mechanism 2, inside
-        ``_dispatch_item``) must be observed at MERGING, then transition
+        ``VerifyDispatcher.dispatch``) must be observed at MERGING, then transition
         back to DISPATCHING before the (now fresh) item proceeds to a normal
         dispatch — mirrors test_merge_queue.py's
         test_verify_pickup_rebases_when_main_advanced's OOB-advance
@@ -1536,7 +1524,7 @@ class TestVerifierDispatchFillRegistersDispatching:
         worker = make_lane(git_ops, queue)
         req = _make_request('kappa-stale-remerge', 'kappa-stale-remerge', wt, config)
 
-        original_dispatch = worker._dispatch_item
+        original_dispatch = worker.verify_dispatch.dispatch
         advanced = {'done': False}
 
         async def _dispatch_with_oob_advance(item: Any) -> Any:
@@ -1550,7 +1538,7 @@ class TestVerifierDispatchFillRegistersDispatching:
                 )
             return await original_dispatch(item)
 
-        worker._dispatch_item = _dispatch_with_oob_advance  # type: ignore[method-assign]
+        worker.verify_dispatch.dispatch = _dispatch_with_oob_advance
 
         captured: list[Any] = []
         original_remerge = worker._remerge
@@ -2456,7 +2444,7 @@ class TestStopMidFlightRetiresEveryContainer:
 
 # ---------------------------------------------------------------------------
 # step-11 RED / step-12 GREEN (continued): the two abandon/detach-drop sites
-# — the merger's own pre-merge drop-on-detect, and _dispatch_item's own
+# — the merger's own pre-merge drop-on-detect, and VerifyDispatcher.dispatch's own
 # pre-dispatch abandon branch — must retire the registry even though neither
 # ever resolves a Future (the waiter already cancelled it).
 # ---------------------------------------------------------------------------
@@ -2521,7 +2509,7 @@ class TestAbandonPredispatchRetiresRegistry:
     async def test_dispatch_item_predispatch_abandon_retires_registry(
         self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
     ) -> None:
-        """``_dispatch_item``'s own pre-dispatch abandon branch — the waiter
+        """``VerifyDispatcher.dispatch``'s own pre-dispatch abandon branch — the waiter
         cancelled the Future before the item reached a host — is currently
         DISPATCHING and returns an ABANDONED_PREDISPATCH passthrough entry
         with the Future already done (cancelled).
@@ -2545,7 +2533,7 @@ class TestAbandonPredispatchRetiresRegistry:
         worker._register_item(item, initial=ItemLifecycleState.DISPATCHING)
         req.result.cancel()
 
-        entry = await worker._dispatch_item(item)
+        entry = await worker.verify_dispatch.dispatch(item)
 
         assert isinstance(entry, InflightEntry) and entry.status == InflightStatus.ABANDONED_PREDISPATCH
         assert lane_state(worker, req.request_id) is None, (
@@ -2839,7 +2827,7 @@ class TestRegistrySnapshotAgreementAtSamplingPoints:
     cannot see an entry the census invents or one the registry has lost.
 
     The DISPATCHING window was the one former exception: an item mid
-    ``_dispatch_item`` was census-only, deliberately absent from
+    ``VerifyDispatcher.dispatch`` was census-only, deliberately absent from
     ``snapshot()['entries']`` (task 2068). Task 2435 (kappa-b) closed the
     gap, so the DISPATCHING sample below asserts presence exactly like
     every other sampling point here.
@@ -3053,7 +3041,7 @@ class TestMultiItemPipelineToQuiescenceNoLeaks:
 # ends sits at index 0, so the entry R under test is at index >= 1 and cannot
 # reach head-of-line while H verifies. R's verify task is created BEFORE its
 # entry and is handed an InflightEntrySlot that the entry fills, as
-# `_dispatch_item` does.
+# `VerifyDispatcher.dispatch` does.
 # ---------------------------------------------------------------------------
 
 _VACATE_TRIGGERS = ('operator_halt', 'no_progress', 'lane_contended', 'abandon')
@@ -3113,10 +3101,10 @@ async def _verify_exit_scene(
     worker = make_lane(
         git_ops, queue, verifier=verifier, escalation_queue=fake_eq, clock=FakeClock(),
     )
-    worker.VERIFY_ABANDON_POLL_SECS = 0.02
-    worker.INFLIGHT_VERIFY_PROGRESS_PROBE_SECS = 0.02
+    worker.verify_dispatch.VERIFY_ABANDON_POLL_SECS = 0.02
+    worker.verify_dispatch.INFLIGHT_VERIFY_PROGRESS_PROBE_SECS = 0.02
     if trigger == 'no_progress':
-        worker.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS = 0.2
+        worker.verify_dispatch.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS = 0.2
     allocator = MagicMock()
     allocator.cancel_and_release = (
         AsyncMock(return_value=True) if cancel_and_release is None else cancel_and_release
@@ -3143,7 +3131,7 @@ async def _verify_exit_scene(
     lease = HostLease(name='local', runner=local_runner, is_local=True)
     slot = InflightEntrySlot()
     verify_task = asyncio.ensure_future(
-        worker._run_inflight_verify(item, lease, entry_slot=slot),
+        worker.verify_dispatch.run_inflight_verify(item, lease, entry_slot=slot),
     )
     entry = InflightEntry(
         item=item,
@@ -3339,7 +3327,7 @@ class TestRunInflightVerifyRequeuesOnlyThroughVacate:
             '        self._requeue_request(item.request)\n'
             '\n'
             'class SpeculativeMergeWorker:\n'
-            '    async def _dispatch_item(self, item):\n'
+            '    async def _dispatch_deciding(self, item):\n'
             '        self._requeue_request(item.request)\n'
         )
         assert _verify_exit_vacate_bypasses(src) == []
@@ -3347,23 +3335,23 @@ class TestRunInflightVerifyRequeuesOnlyThroughVacate:
     def test_scanner_returns_empty_on_unparseable_source(self) -> None:
         assert _verify_exit_vacate_bypasses('def broken(:\n') == []
 
-    def test_run_inflight_verify_requeues_and_drops_only_through_vacate(self) -> None:
-        import orchestrator.merge_lane.worker as _mq  # module-local import convention
+    def test_the_inflight_verify_requeues_and_drops_only_through_custody(self) -> None:
+        """The in-flight verify moved to merge_lane/inflight_verify.py, where it
+        reaches requests only through the custody port: no bare requeue or
+        retire anywhere in the module, and both vacating wrappers in use."""
+        import orchestrator.merge_lane.inflight_verify as _iv  # module-local import convention
 
-        source = Path(inspect.getfile(_mq)).read_text()
-        offenders = _verify_exit_vacate_bypasses(source)
-        assert offenders == [], (
-            '_run_inflight_verify must give a request back through '
-            '`await self._requeue_from_verify(item)` and drop it through '
-            '`await self._drop_from_verify(item)`, which hand the host lease back '
-            'and mark the InflightEntry first. Bare calls: '
-            f'{offenders!r}'
+        tree = ast.parse(Path(inspect.getfile(_iv)).read_text())
+        bypasses = [
+            ast.unparse(call) for attr in _VERIFY_EXIT_BYPASSES for call in _attr_calls(tree, attr)
+        ]
+        assert bypasses == [], (
+            'the in-flight verify must give a request back through the custody '
+            "port's requeue_from_verify and drop it through drop_from_verify, "
+            f'which vacate the InflightEntry first. Bare calls: {bypasses!r}'
         )
-        routed = _calls_inside_run_inflight_verify(source, '_requeue_from_verify')
-        assert routed, (
-            'no _requeue_from_verify call found inside _run_inflight_verify — '
-            'the scan is mis-wired or the method moved'
-        )
+        assert _attr_calls(tree, 'requeue_from_verify'), 'the scan is mis-wired or the verify moved'
+        assert _attr_calls(tree, 'drop_from_verify'), 'the scan is mis-wired or the verify moved'
 
 
 # The render-once property is pinned through public submission in
