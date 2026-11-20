@@ -48,6 +48,7 @@ from shared.task_metadata import (
 from shared.task_metadata_wire import coerce_task_metadata
 from shared.task_statuses import TERMINAL, TaskStatus
 from shared.task_store_schema import TASK_STORE_DDL
+from shared.task_tags import DEFAULT_TAG
 from shared.task_timestamp import format_task_timestamp
 
 from fused_memory.backends.defect_records import (
@@ -149,8 +150,6 @@ _warned_malformed_task_ids: set[tuple[str, str, int]] = set()
 # key, same growth bound, same "restart re-emits" discipline.
 _warned_machine_authored_task_ids: set[tuple[str, str, int]] = set()
 
-
-DEFAULT_TAG = 'master'
 
 _PROMPT_TITLE_MAX = 200
 

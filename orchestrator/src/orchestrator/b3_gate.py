@@ -27,6 +27,7 @@ from typing import Any
 from shared import safe_io
 from shared.project_layout import escalation_queue_dir, tasks_db
 from shared.safe_io import load_json_or_warn
+from shared.task_tags import DEFAULT_TAG
 from shared.tasks_db_readonly import TaskDbProblem, TaskDbUnreadable, connect_ro
 
 from orchestrator.stop_instruction import detect_stop_instruction
@@ -76,7 +77,6 @@ stay in sync so they cannot silently drift (see
 TestPostMergeRedMainAbort.test_coherence_*).
 """
 
-DEFAULT_TAG = 'master'
 DEFAULT_CAP = 6
 _LAUNCH_RETENTION_DAYS = 30  # prune launches older than this many days (bound state-file growth)
 
