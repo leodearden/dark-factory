@@ -2046,6 +2046,13 @@ class WorktreeConflictError(RuntimeError):
         )
 
 
+class GuardedStep(Enum):
+    """The step a :class:`BranchResetError` refused; its value names it in the message."""
+
+    REBASE = 'requeue/inter-iteration rebase'
+    RESUME_ATTACH = 'resume attach'
+
+
 class BranchResetError(RuntimeError):
     """Raised by :meth:`GitOps.rebase_preserving_task_commits` when a
     requeue/inter-iteration rebase would collapse a task branch to zero
@@ -2080,6 +2087,11 @@ class BranchResetError(RuntimeError):
     ``git reset --hard`` itself actually succeeded — when it did NOT, the
     work is not confirmed safe, and the message says so explicitly instead
     of asserting the pre-rebase HEAD was restored.
+
+    ``step`` names what was refused.  :attr:`GuardedStep.RESUME_ATTACH` is
+    raised by ``GitOps._reuse_warm_lane`` when re-attaching a resumed lane
+    lost commits the branch carried (task 10991); there *pre_rebase_head* is
+    the branch tip on entry and *n_before* its commits over main.
     """
 
     def __init__(
@@ -2089,12 +2101,25 @@ class BranchResetError(RuntimeError):
         pre_rebase_head: str,
         n_before: int,
         restore_ok: bool = True,
+        *,
+        step: GuardedStep = GuardedStep.REBASE,
     ):
         self.worktree = worktree
         self.onto = onto
         self.pre_rebase_head = pre_rebase_head
         self.n_before = n_before
         self.restore_ok = restore_ok
+        self.step = step
+        if step is GuardedStep.RESUME_ATTACH:
+            loss = (
+                f're-attaching the lane on resume dropped commits the branch '
+                f'carried ({n_before} commit(s) over main at {pre_rebase_head})'
+            )
+        else:
+            loss = (
+                f'it would collapse the branch from {n_before} commit(s) over '
+                f'main to 0 (onto={onto})'
+            )
         if restore_ok:
             restore_note = f'restored pre-rebase HEAD {pre_rebase_head}'
         else:
@@ -2104,11 +2129,7 @@ class BranchResetError(RuntimeError):
                 f'work may still be lost from the worktree; recover '
                 f'manually from git reflog before proceeding'
             )
-        super().__init__(
-            f'Refusing requeue/inter-iteration rebase in {worktree}: it '
-            f'would collapse the branch from {n_before} commit(s) over main '
-            f'to 0 (onto={onto}); {restore_note}'
-        )
+        super().__init__(f'Refusing {step.value} in {worktree}: {loss}; {restore_note}')
 
 
 class _ParkedBranchStranded(RuntimeError):
@@ -8575,7 +8596,10 @@ class GitOps:
         :meth:`_reattach_cold_worktree`.  Mirrors :meth:`create_worktree`'s
         cold-requeue reuse block:
         1. Attach the lane onto *full_branch* without moving the branch
-           backward or sideways — :meth:`_attach_lane_to_branch`.
+           backward or sideways — :meth:`_attach_lane_to_branch` — then
+           restore the entry tip and raise :class:`BranchResetError` if the
+           attach lost it (:meth:`_restore_if_attach_dropped_commits`).  The
+           rebase guard in step 3 measures from after the attach.
         2. Commit any uncommitted WIP onto the branch so it is preserved
            across the rebase.
         3. Un-stack, then rebase onto main (best-effort; log failure and
@@ -8606,8 +8630,12 @@ class GitOps:
         #    refs/heads/<full_branch> itself and the un-stack finds the lane
         #    as the worktree holding the branch.  A failed rebind leaves the
         #    lane detached, holding no branch, so step 3 leaves the branch on
-        #    its old base; a refused foreign check-out raises.
+        #    its old base; a refused foreign check-out raises.  The attach is
+        #    guarded here, before the un-stack drops base commits by design;
+        #    the rebase guard in step 3 measures from after it.
+        entry_tip = await branch_tip(_run, lane_dir, full_branch)
         await self._attach_lane_to_branch(lane_dir, full_branch)
+        await self._restore_if_attach_dropped_commits(lane_dir, entry_tip)
 
         # 2. Commit WIP (returns None if nothing to commit — that's fine)
         await self.commit(lane_dir, 'chore: save WIP before requeue rebase')
@@ -8658,6 +8686,34 @@ class GitOps:
             await check_out_branch_over_foreign_head(_run, lane_dir, full_branch)
             return
         await self.rebind_branch_to_head(lane_dir, full_branch)
+
+    async def _restore_if_attach_dropped_commits(
+        self, lane_dir: Path, entry_tip: str | None,
+    ) -> None:
+        """Restore *entry_tip* and raise if the attach left HEAD without it.
+
+        The task-2403 rebase guard measures from its own entry, after the
+        attach, so it cannot see commits the attach itself dropped (reify
+        task/10089, task 10991).  Containment of the branch's entry tip in
+        HEAD spans exactly the attach.  An unreadable answer counts as
+        dropped, failing toward restore as 2403 does for an unmeasurable
+        count.
+        """
+        if entry_tip is None:
+            return
+        _, head, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=lane_dir)
+        if head.strip() and await self.is_ancestor(entry_tip, head.strip()):
+            return
+        rc, count, _ = await _run(
+            ['git', 'rev-list', '--count', f'{self.config.main_branch}..{entry_tip}'],
+            cwd=lane_dir,
+        )
+        n_carried = int(count.strip()) if rc == 0 and count.strip().isdigit() else 0
+        reset_rc, _, _ = await _run(['git', 'reset', '--hard', entry_tip], cwd=lane_dir)
+        raise BranchResetError(
+            lane_dir, None, entry_tip, n_carried,
+            restore_ok=reset_rc == 0, step=GuardedStep.RESUME_ATTACH,
+        )
 
     async def _rebase_requeued_onto_main(
         self, worktree: Path, full_branch: str, *, keep_stack: bool,
@@ -10363,6 +10419,10 @@ class GitOps:
         the suffix_graph frozen-tip rebase) intentionally keep calling the
         unguarded primitive directly — see this task's design decisions for
         why an unconditional guard on the primitive itself would be wrong.
+
+        The resume's own re-attach runs before this guard's baseline, so it
+        is guarded by ``_reuse_warm_lane``'s post-attach containment check
+        (:meth:`_restore_if_attach_dropped_commits`, task 10991), not here.
         """
         baseline_ref = onto if onto is not None else self.config.main_branch
         rc, baseline_out, _ = await _run(

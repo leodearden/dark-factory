@@ -87,7 +87,7 @@
     "complete": true
   },
   "files": {
-    "orchestrator/src/orchestrator/git_ops.py": {"cognitive": 1544, "function_local_imports": 4, "lines": 17050, "prose_lines": 9660, "reexport_names": 1},
+    "orchestrator/src/orchestrator/git_ops.py": {"cognitive": 1551, "function_local_imports": 4, "lines": 17110, "prose_lines": 9684, "reexport_names": 1},
     "orchestrator/src/orchestrator/lane_lifecycle.py": {"cognitive": 58, "function_local_imports": 1, "lines": 868, "prose_lines": 359, "reexport_names": 0},
     "orchestrator/src/orchestrator/merge_lane/__init__.py": {"cognitive": 1, "function_local_imports": 0, "lines": 228, "prose_lines": 22, "reexport_names": 0},
     "orchestrator/src/orchestrator/merge_lane/chain_policy.py": {"cognitive": 24, "function_local_imports": 0, "lines": 125, "prose_lines": 18, "reexport_names": 0},
@@ -143,7 +143,7 @@
     "orchestrator/tests/conftest.py": {"cognitive": 55, "function_local_imports": 8, "lines": 1260, "prose_lines": 737, "reexport_names": 0}
   },
   "functions": {
-    "orchestrator/src/orchestrator/git_ops.py::BranchResetError::__init__": 2,
+    "orchestrator/src/orchestrator/git_ops.py::BranchResetError::__init__": 4,
     "orchestrator/src/orchestrator/git_ops.py::CitationPatternInvalid::__init__": 0,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::__init__": 6,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_abort_lane_acquisition": 20,
@@ -228,6 +228,7 @@
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_resolve_predecessor_tip": 1,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_resolve_warm_lane_script": 3,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_resolve_warm_lane_script_logged": 3,
+    "orchestrator/src/orchestrator/git_ops.py::GitOps::_restore_if_attach_dropped_commits": 5,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_reuse_warm_lane": 3,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_run_no_ff_merge": 1,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_run_warm_lane_audit": 6,
