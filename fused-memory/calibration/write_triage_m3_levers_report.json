@@ -7,10 +7,332 @@
     "d1-stale-detail-check",
     "e1-mark-refused-contests",
     "d1-e1-combined",
+    "a1-e1-combined",
     "b1-sol-medium",
     "b2-sol-high"
   ],
   "arms": {
+    "a1-e1-combined": {
+      "cost": {
+        "calls": 0,
+        "calls_per_write": 0.0,
+        "fail_open": 0,
+        "p50_seconds": null,
+        "p95_seconds": null,
+        "usd": 0.0,
+        "usd_per_1000_judged_writes": null,
+        "usd_per_1000_writes": 0.0,
+        "writes": 673
+      },
+      "outcome_agreement_vs_baseline": {
+        "agree": 551,
+        "n": 591,
+        "rate": 0.9323
+      },
+      "paired_vs_baseline": {
+        "bootstrap": {
+          "resamples": 10000,
+          "seed": 7157
+        },
+        "conflict_set_differs": 0,
+        "false_conflict_change": {
+          "population": 59.47,
+          "sample": 25
+        },
+        "m3_delta": -0.2005,
+        "m3_delta_interval95": [
+          -0.2935,
+          -0.1104
+        ],
+        "transitions": {
+          "amended-sample": {
+            "amended->contested": 8,
+            "stored->contested": 1
+          },
+          "contested-census": {
+            "amended->contested": 13,
+            "stored->contested": 31
+          },
+          "restated-sample": {
+            "amended->contested": 2,
+            "restated->amended": 2,
+            "stored->contested": 8
+          }
+        }
+      },
+      "provenance": {
+        "cases_sha256": "f4bebc74fc86c4d58f704e38b9df91bd7dcf4a332c12a4531af3b313da88567c",
+        "effort": null,
+        "model": null,
+        "prompt_sha256": null,
+        "rows": 673
+      },
+      "score": {
+        "closure": null,
+        "harm": {
+          "delta_interval95": [
+            -0.5022,
+            -0.3115
+          ],
+          "delta_per_write": -0.4091,
+          "n": 671,
+          "per_write": {
+            "status_quo": 0.8256,
+            "triage": 0.4165
+          },
+          "population_delta_interval95": [
+            -0.0624,
+            0.1656
+          ],
+          "population_delta_per_write": 0.0535,
+          "population_per_write": {
+            "status_quo": 0.4559,
+            "triage": 0.5094
+          },
+          "unclear": 2
+        },
+        "m1": {
+          "band_unknown": 4,
+          "hits": 5,
+          "n": 91,
+          "population_interval95": [
+            0.0112,
+            0.1017
+          ],
+          "population_rate": 0.0529,
+          "rate": 0.0549,
+          "unclear": 1,
+          "wilson95": [
+            0.0237,
+            0.1222
+          ]
+        },
+        "m2_amended": {
+          "by_project": {
+            "dark_factory": {
+              "hits": 5,
+              "n": 22
+            },
+            "reify": {
+              "hits": 16,
+              "n": 25
+            },
+            "scoping_intake": {
+              "hits": 0,
+              "n": 1
+            },
+            "solar_challenge": {
+              "hits": 23,
+              "n": 43
+            },
+            "solar_challenge_platform": {
+              "hits": 8,
+              "n": 12
+            }
+          },
+          "hits": 52,
+          "n": 103,
+          "population_interval95": [
+            0.3099,
+            0.5361
+          ],
+          "population_rate": 0.422,
+          "rate": 0.5049,
+          "unclear": 0,
+          "wilson95": [
+            0.4099,
+            0.5995
+          ]
+        },
+        "m2_contested": {
+          "by_project": {
+            "dark_factory": {
+              "hits": 83,
+              "n": 92
+            },
+            "reify": {
+              "hits": 92,
+              "n": 104
+            },
+            "scoping_intake": {
+              "hits": 2,
+              "n": 2
+            },
+            "solar_challenge": {
+              "hits": 75,
+              "n": 102
+            },
+            "solar_challenge_platform": {
+              "hits": 63,
+              "n": 74
+            }
+          },
+          "hits": 315,
+          "n": 374,
+          "population_interval95": [
+            0.7104,
+            0.8747
+          ],
+          "population_rate": 0.7954,
+          "rate": 0.8422,
+          "unclear": 2,
+          "wilson95": [
+            0.8018,
+            0.8757
+          ]
+        },
+        "m3": {
+          "by_ending": {
+            "amended": 12,
+            "contested": 315,
+            "restated": 0,
+            "stored_linked": 12,
+            "stored_unlinked": 32
+          },
+          "hits": 44,
+          "n": 371,
+          "population_interval95": [
+            0.1231,
+            0.3073
+          ],
+          "population_rate": 0.2136,
+          "rate": 0.1186,
+          "unclear": 2,
+          "wilson95": [
+            0.0895,
+            0.1555
+          ]
+        },
+        "m4": {
+          "by_category": {
+            "cross": {
+              "hits": 29,
+              "n": 166,
+              "population_interval95": [
+                0.2402,
+                0.5131
+              ],
+              "population_rate": 0.3784,
+              "rate": 0.1747,
+              "unclear": 1,
+              "wilson95": [
+                0.1245,
+                0.2396
+              ]
+            },
+            "same": {
+              "hits": 59,
+              "n": 316,
+              "population_interval95": [
+                0.2853,
+                0.4805
+              ],
+              "population_rate": 0.3841,
+              "rate": 0.1867,
+              "unclear": 1,
+              "wilson95": [
+                0.1476,
+                0.2333
+              ]
+            },
+            "unknown": {
+              "hits": 0,
+              "n": 0,
+              "population_interval95": null,
+              "population_rate": null,
+              "rate": null,
+              "unclear": 0,
+              "wilson95": null
+            }
+          },
+          "by_route": {
+            "direct": {
+              "hits": 81,
+              "n": 427,
+              "population_interval95": [
+                0.3197,
+                0.4831
+              ],
+              "population_rate": 0.4015,
+              "rate": 0.1897,
+              "unclear": 1,
+              "wilson95": [
+                0.1553,
+                0.2296
+              ]
+            },
+            "unknown": {
+              "hits": 0,
+              "n": 2,
+              "population_interval95": [
+                0.0,
+                0.0
+              ],
+              "population_rate": 0.0,
+              "rate": 0.0,
+              "unclear": 0,
+              "wilson95": [
+                0.0,
+                0.6576
+              ]
+            },
+            "via_sibling": {
+              "hits": 7,
+              "n": 53,
+              "population_interval95": [
+                0.0291,
+                0.1739
+              ],
+              "population_rate": 0.087,
+              "rate": 0.1321,
+              "unclear": 1,
+              "wilson95": [
+                0.0655,
+                0.2484
+              ]
+            }
+          },
+          "hits": 88,
+          "n": 482,
+          "population_interval95": [
+            0.3037,
+            0.46
+          ],
+          "population_rate": 0.3821,
+          "rate": 0.1826,
+          "unclear": 2,
+          "wilson95": [
+            0.1506,
+            0.2195
+          ]
+        },
+        "m5": {
+          "by_action_changing": {
+            "no": 30,
+            "unknown": 25,
+            "yes": 260
+          },
+          "by_scope": {
+            "central": 154,
+            "secondary": 132,
+            "unknown": 29
+          },
+          "hits": 315,
+          "n": 374,
+          "population_interval95": [
+            0.7104,
+            0.8747
+          ],
+          "population_rate": 0.7954,
+          "rate": 0.8422,
+          "unclear": 2,
+          "wilson95": [
+            0.8018,
+            0.8757
+          ]
+        }
+      }
+    },
     "a1-partial-dispute": {
       "cost": {
         "calls": 591,

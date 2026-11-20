@@ -521,6 +521,10 @@ class TestTheTransformArms:
             'transform', 'd1-stale-detail-check', None,
         )
         assert e1.transform is combined.transform is _mod().mark_refused_contest
+        alternative = _arm('a1-e1-combined')
+        assert (alternative.kind, alternative.parent, alternative.transform) == (
+            'transform', 'a1-partial-dispute', _mod().mark_refused_contest,
+        )
         _mod().validate_arms(_mod().ARMS)
 
     @pytest.mark.parametrize(('judge', 'routed', 'marked'), [

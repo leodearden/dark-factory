@@ -354,6 +354,8 @@ ARMS: tuple[Arm, ...] = (
         mark_refused_contest),
     Arm('d1-e1-combined', KIND_TRANSFORM, None, None, None, 'd1-stale-detail-check', SCOPE_ALL,
         'the recommended sequence: d1, then e1 over its verdicts', mark_refused_contest),
+    Arm('a1-e1-combined', KIND_TRANSFORM, None, None, None, 'a1-partial-dispute', SCOPE_ALL,
+        'the low-false-contest alternative: a1, then e1 over its verdicts', mark_refused_contest),
     _shipped_arm('b1-sol-medium', 'medium', 'the shipped prompt at medium reasoning effort'),
     _shipped_arm('b2-sol-high', 'high', 'the shipped prompt at high reasoning effort'),
 )
