@@ -23,6 +23,9 @@ from _fm_polling import poll_until, poll_until_sync
 
 QDRANT_URL = 'http://localhost:6333'
 
+#: The mem0 collection_prefix whose collections scripts/cleanup_test_collections.py reaps (its PREFIX).
+EPHEMERAL_COLLECTION_PREFIX = '_test_mem0_qdrant_integration'
+
 #: Seconds an abandoned collection meta-op may take to show its effect (task 10599).
 META_OP_SETTLE_TIMEOUT_S = 15.0
 
