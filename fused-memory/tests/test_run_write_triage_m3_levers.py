@@ -76,7 +76,8 @@ def _case(
         entry_id=entry, target_id=f'T-{entry}', stratum='amended-sample', project='dark_factory',
         soak_outcome=soak_outcome, soak_band=soak_band, via_sibling=False, cross_category=False,
         parent_edited_after_attach=False, supersedes_target=False, route=cases.Route(route),
-        cos_parent=cos, source_cosine=cos, metadata_recovered=True,
+        near_verbatim=route == 'near_verbatim', cos_parent=cos, source_cosine=cos,
+        metadata_recovered=True,
         child_chars=len(child), parent_chars=len(parent),
     )
     return cases.ReplayCase(features, child, parent)
@@ -147,6 +148,22 @@ def _run(cases: list[Any], arms: list[Any], arms_dir: Path, client: MagicMock, *
 def _rows(arms_dir: Path, arm: str) -> list[dict[str, Any]]:
     path = arms_dir / f'{arm}.jsonl'
     return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+
+class TestParentDigest:
+    def test_covers_what_a_child_reads_and_not_row_order(self) -> None:
+        rows = [_parent_row('E1', 'amended', 'amended'), _parent_row('E2', 'contested', 'stored')]
+        digest = _mod().parent_digest(rows)
+        assert _mod().parent_digest(rows[::-1]) == digest
+        for field, value in (('judge_outcome', 'restated'), ('routed_outcome', 'stored'),
+                             ('candidate_id', 'T-E9'), ('dispute_marked', True)):
+            changed = [{**rows[0], field: value}, rows[1]]
+            assert _mod().parent_digest(changed) != digest, field
+
+    def test_ignores_what_a_child_does_not_read(self) -> None:
+        rows = [_parent_row('E1', 'amended', 'amended')]
+        timed = [{**rows[0], 'seconds': 9.9, 'usd': 1.0}]
+        assert _mod().parent_digest(timed) == _mod().parent_digest(rows)
 
 
 class TestTheArmTable:
@@ -262,6 +279,15 @@ class TestJudgeCase:
         assert (row['calls'], row['usd'], row['judge_outcome']) == (0, 0.0, None)
         assert row['routed_outcome'] == outcome
 
+    def test_a_judged_restatement_is_routed_as_deployed_triage_files_it(self) -> None:
+        client = _client(lambda kwargs: _reply('restates', _target(kwargs)))
+        row = asyncio.run(_judge(_case(), _arm(), client))
+        assert (row['judge_outcome'], row['routed_outcome']) == ('restated', 'amended')
+
+    def test_a_judge_row_names_no_parent(self) -> None:
+        row = asyncio.run(_judge(_case(), _arm(), _client(_amends)))
+        assert (row['parent'], row['parent_sha256']) == (None, None)
+
     def test_the_routed_outcome_applies_the_configs_attach_guard(self) -> None:
         client = _client(_amends)
         row = asyncio.run(_judge(_case(cos=0.59), _arm(), client, config=_config(0.60)))
@@ -366,6 +392,11 @@ class TestSecondPass:
         assert result.complete == ('f3p', 'dispute-test')
         dispute = {row['entry_id']: row for row in _rows(tmp_path, 'dispute-test')}
         assert {entry for entry, row in dispute.items() if row['calls']} == {'E1', 'E2'}
+        assert dispute['E2']['routed_outcome'] == 'amended', 'a refiled restatement is re-asked'
+        assert {row['parent'] for row in dispute.values()} == {'f3p'}
+        assert {row['parent_sha256'] for row in dispute.values()} == {
+            _mod().parent_digest(_rows(tmp_path, 'f3p')),
+        }
         assert dispute['E1']['dispute_marked'] is True
         assert dispute['E2']['dispute_marked'] is False
         assert dispute['E5']['dispute_marked'] is False
@@ -374,6 +405,14 @@ class TestSecondPass:
             assert row['judge_outcome'] == parent[entry]['judge_outcome']
             assert row['routed_outcome'] == parent[entry]['routed_outcome']
         assert dispute['E1']['prompt_sha256'] == _sha('DISPUTE CHECK')
+
+    def test_a_parent_rerun_under_new_verdicts_is_refused(self, tmp_path: Path) -> None:
+        cases = [_case('E1'), _case('E2')]
+        _run(cases, [_arm(), _second_pass_arm()], tmp_path, _client(_amends))
+        (tmp_path / 'f3p.jsonl').unlink()
+        contests = _client(lambda kwargs: _reply('contests', _target(kwargs)))
+        with pytest.raises(ValueError, match='parent_sha256'):
+            _run(cases, [_arm(), _second_pass_arm()], tmp_path, contests)
 
     def test_waits_for_a_complete_parent(self, tmp_path: Path) -> None:
         cases = [_case('E1'), _case('E2')]
@@ -579,17 +618,28 @@ class TestTheTransformArms:
         parent = {row['entry_id']: row for row in _rows(tmp_path, 'f3p')}
         rows = {row['entry_id']: row for row in _rows(tmp_path, 'e1-mark-refused-contests')}
         assert {entry for entry, row in rows.items() if row['dispute_marked']} == {'E1'}
+        digest = _mod().parent_digest(parent.values())
         for entry, row in rows.items():
             assert (row['judge_outcome'], row['routed_outcome']) == (
                 parent[entry]['judge_outcome'], parent[entry]['routed_outcome'],
             )
             assert (row['calls'], row['usd'], row['prompt_sha256']) == (0, 0.0, None)
             assert row['arm'] == 'e1-mark-refused-contests'
+            assert (row['parent'], row['parent_sha256']) == ('f3p', digest)
+        assert set(rows['E1']) == set(parent['E1']), 'a transform row has the judge row schema'
+
+    def test_a_parent_rerun_under_new_verdicts_is_refused(self, tmp_path: Path) -> None:
+        cases = [_case('E1'), _case('E2')]
+        _run(cases, [_arm('f3p'), _arm('e1-mark-refused-contests')], tmp_path, _client(_amends))
+        (tmp_path / 'f3p.jsonl').unlink()
+        contests = _client(lambda kwargs: _reply('contests', _target(kwargs)))
+        with pytest.raises(ValueError, match='parent_sha256'):
+            _run(cases, [_arm('f3p'), _arm('e1-mark-refused-contests')], tmp_path, contests)
 
     def test_keeps_a_mark_its_parent_already_carries(self) -> None:
         row = _parent_row('E1', 'amended', 'amended', dispute_marked=True)
-        assert _mod().transform_row(row, _arm('e1-mark-refused-contests'),
-                                    cases_sha256=_CASES_SHA)['dispute_marked'] is True
+        assert _mod().transform_row(row, _arm('e1-mark-refused-contests'), cases_sha256=_CASES_SHA,
+                                    parent_sha256='d' * 64)['dispute_marked'] is True
 
     def test_waits_for_a_complete_parent(self, tmp_path: Path) -> None:
         result = _run([_case('E1')], [_arm('e1-mark-refused-contests')], tmp_path,

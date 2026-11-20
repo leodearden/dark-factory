@@ -16,8 +16,8 @@ Arms run one after another, because the prompt override is process-global.
 Calls within an arm run concurrently. A transport failure is retried with
 doubling backoff. An unreadable answer, or a failure that outlives the
 retries, gives a fail-open ``stored`` row, as triage would. Re-running
-resumes: rows already written are kept, and rows from another cases file or
-prompt are refused. Once the list-price spend recorded in ``--arms-dir``
+resumes: rows already written are kept, and rows from another cases file,
+prompt or parent-arm verdicts are refused. Once the list-price spend recorded in ``--arms-dir``
 reaches ``--budget-usd``, no further call is dispatched. Calls already in
 flight still land, so the cap can be overshot by up to ``--concurrency``
 calls. The run exits 0 only when every named arm is complete.
@@ -505,13 +505,14 @@ async def _ask(
 
 def _blank_row(
     arm: Arm, *, entry_id: str, target_id: str, route: str, cases_sha256: str,
-    prompt_sha256: str | None,
+    prompt_sha256: str | None, parent_sha256: str | None,
 ) -> dict[str, Any]:
     """Every key an arm row carries, for a write no call has been made on."""
     return {
         'arm': arm.name, 'entry_id': entry_id, 'target_id': target_id, 'route': route,
         'model': arm.model, 'effort': arm.effort,
         'prompt_sha256': prompt_sha256, 'cases_sha256': cases_sha256,
+        'parent': arm.parent, 'parent_sha256': parent_sha256,
         'judge_outcome': None, 'candidate_id': None, 'dispute_marked': None,
         'calls': 0, 'attempts': 0, 'seconds': None, 'input_tokens': None,
         'output_tokens': None, 'reasoning_tokens': None, 'usd': 0.0,
@@ -521,20 +522,33 @@ def _blank_row(
 
 def _base_row(
     case: _cases.ReplayCase, arm: Arm, *, cases_sha256: str, prompt_sha256: str | None,
+    parent_sha256: str | None = None,
 ) -> dict[str, Any]:
     features = case.features
     return _blank_row(
         arm, entry_id=features.entry_id, target_id=features.target_id, route=str(features.route),
-        cases_sha256=cases_sha256, prompt_sha256=prompt_sha256,
+        cases_sha256=cases_sha256, prompt_sha256=prompt_sha256, parent_sha256=parent_sha256,
     )
 
 
+INHERITED_FIELDS = ('judge_outcome', 'candidate_id', 'routed_outcome')
+"""The verdicts a second-pass or transform row copies from its parent's row."""
+
+_PARENT_READ_FIELDS = (*INHERITED_FIELDS, 'dispute_marked')
+
+
 def _inherited(parent_row: Mapping[str, Any]) -> dict[str, Any]:
-    """The verdicts a second-pass or transform row copies from its parent's row."""
-    return {
-        'judge_outcome': parent_row['judge_outcome'], 'candidate_id': parent_row.get('candidate_id'),
-        'routed_outcome': parent_row['routed_outcome'],
-    }
+    return {field: parent_row[field] for field in INHERITED_FIELDS}
+
+
+def parent_digest(rows: Iterable[Mapping[str, Any]]) -> str:
+    """The sha256 of everything a child arm reads from its parent's *rows*.
+
+    A child row records it, so a parent re-run under new verdicts is refused
+    rather than silently kept under rows derived from the old ones.
+    """
+    read = sorted([row['entry_id'], *(row[field] for field in _PARENT_READ_FIELDS)] for row in rows)
+    return hashlib.sha256(json.dumps(read, separators=(',', ':')).encode()).hexdigest()
 
 
 def _call_fields(call: _Call, model: str | None) -> dict[str, Any]:
@@ -571,9 +585,13 @@ def _judged(case: _cases.ReplayCase, arm: Arm) -> bool:
 
 
 def _second_pass_applies(parent_row: Mapping[str, Any]) -> bool:
-    """Is the parent's write an attached amendment or restatement, which a second pass re-asks?"""
-    return parent_row['judge_outcome'] in _SECOND_PASS_SOURCES and (
-        parent_row['routed_outcome'] == parent_row['judge_outcome']
+    """Did the judge find an amendment or restatement that deployed routing attached?
+
+    A judged restatement that is filed amended is still attached, so it is re-asked.
+    """
+    return (
+        parent_row['judge_outcome'] in _SECOND_PASS_SOURCES
+        and parent_row['routed_outcome'] in _SECOND_PASS_SOURCES
     )
 
 
@@ -596,13 +614,14 @@ async def judge_case(
 
 async def second_pass_case(
     case: _cases.ReplayCase, parent_row: Mapping[str, Any], arm: Arm, service: Any, *,
-    cases_sha256: str, prompt_sha256: str,
+    cases_sha256: str, prompt_sha256: str, parent_sha256: str | None,
     sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
 ) -> dict[str, Any]:
     """A second pass over a parent row: is an attached amendment or restatement disputed?"""
-    row = _base_row(case, arm, cases_sha256=cases_sha256, prompt_sha256=prompt_sha256) | (
-        _inherited(parent_row) | {'dispute_marked': False}
-    )
+    row = _base_row(
+        case, arm, cases_sha256=cases_sha256, prompt_sha256=prompt_sha256,
+        parent_sha256=parent_sha256,
+    ) | _inherited(parent_row) | {'dispute_marked': False}
     if not _second_pass_applies(parent_row):
         return row
     call = await _ask(case, service, sleep)
@@ -612,7 +631,7 @@ async def second_pass_case(
 
 
 def transform_row(
-    parent_row: Mapping[str, Any], arm: Arm, *, cases_sha256: str,
+    parent_row: Mapping[str, Any], arm: Arm, *, cases_sha256: str, parent_sha256: str,
 ) -> dict[str, Any]:
     """A transform arm's row: the parent's verdicts, marked by the arm's function, at no cost."""
     if arm.transform is None:
@@ -620,6 +639,7 @@ def transform_row(
     row = _blank_row(
         arm, entry_id=parent_row['entry_id'], target_id=parent_row['target_id'],
         route=parent_row['route'], cases_sha256=cases_sha256, prompt_sha256=None,
+        parent_sha256=parent_sha256,
     )
     return row | _inherited(parent_row) | {
         'dispute_marked': bool(parent_row.get('dispute_marked')) or arm.transform(parent_row),
@@ -668,9 +688,10 @@ class _Spend:
 
 
 def _refuse_foreign(rows: Sequence[Mapping[str, Any]], arm: Arm, *, cases_sha256: str,
-                    prompt_sha256: str | None) -> None:
+                    prompt_sha256: str | None, parent_sha256: str | None) -> None:
     expected = {'cases_sha256': cases_sha256, 'prompt_sha256': prompt_sha256,
-                'model': arm.model, 'effort': arm.effort}
+                'model': arm.model, 'effort': arm.effort, 'parent': arm.parent,
+                'parent_sha256': parent_sha256}
     for row in rows:
         for key, value in expected.items():
             if row.get(key) != value:
@@ -720,9 +741,11 @@ async def _run_arm(
     parents = _complete_parent_rows(cases, arm, arms_dir)
     if parents is None:
         return False
+    parent_sha = parent_digest(parents.values()) if arm.parent is not None else None
     with _wording.judge_system_prompt(arm.prompt or '', label=arm.name) as prompt_sha:
         existing = read_arm_rows(path)
-        _refuse_foreign(existing, arm, cases_sha256=cases_sha256, prompt_sha256=prompt_sha)
+        _refuse_foreign(existing, arm, cases_sha256=cases_sha256, prompt_sha256=prompt_sha,
+                        parent_sha256=parent_sha)
         written = {row['entry_id'] for row in existing}
         todo = [case for case in scope if case.features.entry_id not in written]
         gate = asyncio.Semaphore(concurrency)
@@ -737,7 +760,8 @@ async def _run_arm(
                 else:
                     row = await second_pass_case(
                         case, parents[case.features.entry_id], arm, service,
-                        cases_sha256=cases_sha256, prompt_sha256=prompt_sha, sleep=sleep,
+                        cases_sha256=cases_sha256, prompt_sha256=prompt_sha,
+                        parent_sha256=parent_sha, sleep=sleep,
                     )
                 spend.total += row['usd']
                 with path.open('a') as handle:
@@ -758,11 +782,14 @@ def _run_transform_arm(
     if parents is None:
         return False
     path = arms_dir / f'{arm.name}.jsonl'
+    parent_sha = parent_digest(parents.values())
     existing = read_arm_rows(path)
-    _refuse_foreign(existing, arm, cases_sha256=cases_sha256, prompt_sha256=None)
+    _refuse_foreign(existing, arm, cases_sha256=cases_sha256, prompt_sha256=None,
+                    parent_sha256=parent_sha)
     written = {row['entry_id'] for row in existing}
     rows = [*existing, *(
-        transform_row(parents[case.features.entry_id], arm, cases_sha256=cases_sha256)
+        transform_row(parents[case.features.entry_id], arm, cases_sha256=cases_sha256,
+                      parent_sha256=parent_sha)
         for case in cases if case.features.entry_id not in written
     )]
     _write_sorted(path, rows)

@@ -6,10 +6,12 @@ saw, and the facts deployed routing reads. :func:`build_cases` joins the
 committed soak items to the gitignored texts, cosines and recovered caller
 metadata. Each case's :class:`Route` follows the order of
 ``fused_memory/server/write_triage.py::triage_write``: supersession and the
-caller force-stores come before retrieval, a near-verbatim write is restated
-without a judge call, and everything else is judged. :func:`routed_outcome`
-then applies the attach guard to the outcome, and :func:`item_row` turns it
-into a ``score_write_triage_reader.py`` item row.
+caller force-stores come before retrieval, a restate-band write that is
+near-verbatim to its target is restated without a judge call
+(``write_triage.py::route_band``), and everything else is judged.
+:func:`routed_outcome` then files the verdict as deployed triage does,
+applying the attach guard, and :func:`item_row` turns it into a
+``score_write_triage_reader.py`` item row.
 
 A case's :class:`CaseFeatures` carry no text, so they can be committed. A
 committed arm's outcomes can then be re-scored from git alone.
@@ -44,6 +46,7 @@ from typing import Any
 from fused_memory.server.near_verbatim import is_near_verbatim
 from fused_memory.server.write_triage import (
     ATTACH_OWNED_KEYS,
+    OUTCOME_AMENDED,
     OUTCOME_RESTATED,
     OUTCOME_STORED,
     TRIAGE_OUTCOMES,
@@ -72,6 +75,8 @@ class CaseFeatures:
     ``cos_parent`` and ``source_cosine`` are None when the soak could not
     measure them. ``source_cosine`` is the matched record's cosine: the
     earlier sibling's on a via-sibling attach, the parent's otherwise.
+    ``near_verbatim`` says the write repeats its target near-verbatim
+    (``fused_memory/server/near_verbatim.py::is_near_verbatim``).
     """
 
     entry_id: str
@@ -85,6 +90,7 @@ class CaseFeatures:
     parent_edited_after_attach: bool | None
     supersedes_target: bool
     route: Route
+    near_verbatim: bool
     cos_parent: float | None
     source_cosine: float | None
     metadata_recovered: bool
@@ -177,6 +183,7 @@ def _case(
     metadata: Mapping[str, Any] | None,
 ) -> ReplayCase:
     child, parent = text['child_text'], text['parent_text']
+    near_verbatim = is_near_verbatim(child, parent)
     cos_parent = None if cosine is None else cosine['cos_parent']
     source = cosine['max_cos_earlier_sibling'] if cosine and item['via_sibling'] else cos_parent
     features = CaseFeatures(
@@ -190,7 +197,8 @@ def _case(
         cross_category=item['cross_category'],
         parent_edited_after_attach=item['parent_edited_after_attach'],
         supersedes_target=item['supersedes_target'],
-        route=_route(item['supersedes_target'], metadata, child, parent),
+        route=_route(item['supersedes_target'], metadata, item['band'], near_verbatim),
+        near_verbatim=near_verbatim,
         cos_parent=cos_parent,
         source_cosine=source,
         metadata_recovered=metadata is not None,
@@ -201,7 +209,8 @@ def _case(
 
 
 def _route(
-    supersedes_target: bool, metadata: Mapping[str, Any] | None, child: str, parent: str,
+    supersedes_target: bool, metadata: Mapping[str, Any] | None, soak_band: str | None,
+    near_verbatim: bool,
 ) -> Route:
     if supersedes_target:
         return Route.SUPERSESSION
@@ -212,7 +221,7 @@ def _route(
         or declares_supersession(caller)
     ):
         return Route.FORCE_STORED
-    if is_near_verbatim(child, parent):
+    if soak_band == OUTCOME_RESTATED and near_verbatim:
         return Route.NEAR_VERBATIM
     return Route.JUDGE
 
@@ -220,9 +229,11 @@ def _route(
 def routed_outcome(features: CaseFeatures, verdict_outcome: str | None, guard: AttachGuard) -> str:
     """The outcome deployed triage gives *features* when the judge returns *verdict_outcome*.
 
-    *verdict_outcome* is read only on the judge route. An attach the guard
-    refuses is stored. A case whose cosine the soak could not measure keeps
-    its attach, since no refusal can be shown for it.
+    *verdict_outcome* is read only on the judge route. A judged restatement
+    stands only when the write is near-verbatim to its target; otherwise it
+    is filed amended, as ``write_triage.py::_file_judged_restatement`` files
+    it. An attach the guard refuses is stored. A case whose cosine the soak
+    could not measure keeps its attach, since no refusal can be shown for it.
     """
     if features.route in (Route.SUPERSESSION, Route.FORCE_STORED):
         return OUTCOME_STORED
@@ -233,6 +244,8 @@ def routed_outcome(features: CaseFeatures, verdict_outcome: str | None, guard: A
             f'case {features.entry_id}: verdict outcome {verdict_outcome!r} is not one of'
             f' {sorted(TRIAGE_OUTCOMES)}'
         )
+    elif verdict_outcome == OUTCOME_RESTATED and not features.near_verbatim:
+        outcome = OUTCOME_AMENDED
     else:
         outcome = verdict_outcome
     if outcome == OUTCOME_STORED or not features.cosine_recovered:

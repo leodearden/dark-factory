@@ -93,7 +93,7 @@ def _features(items: list[dict[str, Any]]) -> list[Any]:
             via_sibling=False, cross_category=False, parent_edited_after_attach=False,
             supersedes_target=False,
             route=cases.Route.NEAR_VERBATIM if item['entry_id'] == 'R1' else cases.Route.JUDGE,
-            cos_parent=0.75, source_cosine=0.75, metadata_recovered=True,
+            near_verbatim=item['entry_id'] == 'R1', cos_parent=0.75, source_cosine=0.75, metadata_recovered=True,
             child_chars=10, parent_chars=10,
         )
         for item in items
@@ -108,7 +108,7 @@ def _row(entry: str, outcome: str, *, arm: str = 'f3p', marked: bool | None = No
         'judge_outcome': judged if judged is not None else outcome, 'dispute_marked': marked,
         'calls': 0 if seconds is None else 1, 'seconds': seconds, 'usd': usd,
         'error_type': error, 'prompt_sha256': 'p' * 64, 'model': 'gpt-6.1-sol',
-        'effort': 'low', 'cases_sha256': 'c' * 64,
+        'effort': 'low', 'cases_sha256': 'c' * 64, 'parent': None, 'parent_sha256': None,
     }
 
 
@@ -339,8 +339,81 @@ class TestRender:
         assert report['arms']['f3p']['paired_vs_baseline'] is None
         assert report['arms']['lever-x']['provenance'] == {
             'prompt_sha256': 'p' * 64, 'model': 'gpt-6.1-sol', 'effort': 'low',
-            'cases_sha256': 'c' * 64, 'rows': 6,
+            'cases_sha256': 'c' * 64, 'parent': None, 'parent_sha256': None, 'rows': 6,
         }
+
+
+def _child_rows(parent: list[dict[str, Any]], arm: str, *, calls: int = 0,
+                **marked: bool) -> list[dict[str, Any]]:
+    """A child arm's rows over *parent*'s: its verdicts, its own calls, and any marks."""
+    return [
+        {**row, 'arm': arm, 'parent': parent[0]['arm'], 'parent_sha256': 'd' * 64,
+         'prompt_sha256': None, 'model': None, 'effort': None, 'calls': calls,
+         'seconds': 2.0 if calls else None, 'usd': 0.05 if calls else 0.0,
+         'dispute_marked': marked.get(row['entry_id'], False)}
+        for row in parent
+    ]
+
+
+class TestArmsBuiltOnAParent:
+    def _arm_report(self, name: str, arms: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
+        items, verdicts = _corpus()
+        return _mod().arm_report(
+            name, arms, baseline='f3p', soak_items=items, verdicts=verdicts, strata=_STRATA,
+            features=_features(items),
+        )
+
+    def test_a_transforms_cumulative_cost_is_its_parents(self) -> None:
+        f3p = _soak_rows()
+        arms = {'f3p': f3p, 'mark': _child_rows(f3p, 'mark', A1=True)}
+        report = self._arm_report('mark', arms)
+        assert report['cost']['calls_per_write'] == 0
+        assert report['cost']['usd'] == 0
+        assert report['cumulative_cost'] == _mod().cost(f3p)
+        assert report['paired_vs_baseline']['m3_delta'] < 0
+
+    def test_a_chain_sums_every_ancestors_calls_latency_and_spend(self) -> None:
+        f3p = _soak_rows()
+        second = _child_rows(f3p, 'second', calls=1)
+        arms = {'f3p': f3p, 'second': second, 'mark': _child_rows(second, 'mark')}
+        cumulative = self._arm_report('mark', arms)['cumulative_cost']
+        assert cumulative['calls_per_write'] == 2
+        assert cumulative['usd'] == pytest.approx(6 * (0.01 + 0.05))
+        assert (cumulative['p50_seconds'], cumulative['p95_seconds']) == (3.0, 3.0)
+
+    def test_inherited_verdicts_have_no_agreement_of_their_own(self) -> None:
+        f3p = _soak_rows()
+        arms = {'f3p': f3p, 'mark': _child_rows(f3p, 'mark'), 'lever-x': _soak_rows('lever-x')}
+        assert self._arm_report('mark', arms)['outcome_agreement_vs_baseline'] is None
+        assert self._arm_report('lever-x', arms)['outcome_agreement_vs_baseline']['n'] == 6
+        assert self._arm_report('f3p', arms)['cumulative_cost'] == self._arm_report(
+            'f3p', arms)['cost']
+
+    def test_a_child_whose_verdicts_are_not_its_parents_is_refused(self) -> None:
+        f3p = _soak_rows()
+        stale = _child_rows(_soak_rows(A1='contested'), 'mark')
+        stale = [{**row, 'parent': 'f3p'} for row in stale]
+        with pytest.raises(ValueError, match="'A1'.*'f3p'"):
+            self._arm_report('mark', {'f3p': f3p, 'mark': stale})
+
+    def test_a_child_whose_parent_is_not_scored_is_refused(self) -> None:
+        orphan = _child_rows(_soak_rows('d1'), 'mark')
+        with pytest.raises(ValueError, match="'d1'"):
+            self._arm_report('mark', {'f3p': _soak_rows(), 'mark': orphan})
+
+    def test_the_markdown_costs_a_child_in_full_and_lists_its_own_cost(self) -> None:
+        items, verdicts = _corpus()
+        f3p = _soak_rows()
+        report = _mod().build_report(
+            soak_items=items, verdicts=verdicts, strata=_STRATA, features=_features(items),
+            labels=_labels(), arms={'f3p': f3p, 'mark': _child_rows(f3p, 'mark', A1=True)},
+            baseline='f3p', partial={}, provenance={'shipped_prompt_commit': 'abc'},
+        )
+        markdown = _mod().render_markdown(report)
+        own = markdown.split('## Own cost of the arms built on a parent')[1].split('##')[0]
+        assert [line.split(' | ')[:3] for line in own.splitlines() if line.startswith('| ')][1:] == [
+            ['| mark', 'f3p', '0.0000'],
+        ]
 
 
 def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:

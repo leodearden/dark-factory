@@ -24,7 +24,7 @@ SCRIPTS = Path(__file__).parent.parent / 'scripts'
 CALIBRATION = Path(__file__).parent.parent / 'calibration'
 REPORT = CALIBRATION / 'write_triage_m3_levers_report.json'
 ARMS_DIR = CALIBRATION / 'write_triage_m3_lever_arms'
-ARM_KEYS = ('prompt_sha256', 'model', 'effort', 'cases_sha256')
+ARM_KEYS = ('prompt_sha256', 'model', 'effort', 'cases_sha256', 'parent', 'parent_sha256')
 
 
 @functools.cache
@@ -44,6 +44,13 @@ def _jsonl(path: Path) -> list[dict[str, Any]]:
 
 
 @functools.cache
+def _runner() -> types.ModuleType:
+    return load_script_module(
+        SCRIPTS / 'run_write_triage_m3_levers.py', mod_name='run_write_triage_m3_levers',
+    )
+
+
+@functools.cache
 def _features() -> tuple[Any, ...]:
     cases = load_script_module(
         SCRIPTS / 'write_triage_m3_replay_cases.py', mod_name='write_triage_m3_replay_cases',
@@ -53,6 +60,10 @@ def _features() -> tuple[Any, ...]:
 
 def _arm_rows(name: str) -> list[dict[str, Any]]:
     return _jsonl(ARMS_DIR / f'{name}.jsonl')
+
+
+def _scored_arms() -> dict[str, list[dict[str, Any]]]:
+    return {name: _arm_rows(name) for name in _report()['arm_order']}
 
 
 @functools.cache
@@ -100,10 +111,7 @@ class TestTheCommittedLeverReport:
     def test_each_arm_reproduces(self, name: str) -> None:
         report = _report()
         baseline = report['baseline']
-        rescored = _mod().arm_report(
-            _arm_rows(name), baseline_rows=None if name == baseline else _arm_rows(baseline),
-            **_scoring_inputs(),
-        )
+        rescored = _mod().arm_report(name, _scored_arms(), baseline=baseline, **_scoring_inputs())
         committed = json.loads(json.dumps(report['arms'][name]))
         assert json.loads(json.dumps(rescored, sort_keys=True)) == committed
 
@@ -130,6 +138,29 @@ class TestTheCommittedLeverReport:
                 assert {row[key] for row in rows} == {arm['provenance'][key]}, (name, key)
             assert arm['provenance']['rows'] == len(rows)
             assert {row['arm'] for row in rows} == {name}
+
+    def test_each_arm_built_on_a_parent_carries_its_verdicts_and_digest(self) -> None:
+        report = _report()
+        children = {name: arm['provenance']['parent'] for name, arm in report['arms'].items()
+                    if arm['provenance']['parent'] is not None}
+        assert set(children) == {'c1-dispute-marker', 'e1-mark-refused-contests',
+                                 'd1-e1-combined', 'a1-e1-combined'}
+        for name, parent in children.items():
+            theirs = {row['entry_id']: row for row in _arm_rows(parent)}
+            for row in _arm_rows(name):
+                for field in _runner().INHERITED_FIELDS:
+                    assert row[field] == theirs[row['entry_id']][field], (name, row['entry_id'], field)
+            assert report['arms'][name]['provenance']['parent_sha256'] == (
+                _runner().parent_digest(theirs.values())
+            ), name
+
+    def test_a_judged_restatement_stands_only_near_verbatim(self) -> None:
+        """Deployed triage files any other judged restatement amended (task 7155)."""
+        near_verbatim = {feature.entry_id for feature in _features() if feature.near_verbatim}
+        for path in sorted(ARMS_DIR.glob('*.jsonl')):
+            for row in _jsonl(path):
+                if row['judge_outcome'] == 'restated' and row['entry_id'] not in near_verbatim:
+                    assert row['routed_outcome'] in ('amended', 'stored'), (path.stem, row['entry_id'])
 
     def test_no_arm_is_left_partial(self) -> None:
         """The plan doc reads complete arms only; the partial path is pinned synthetically."""

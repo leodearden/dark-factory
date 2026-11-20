@@ -169,9 +169,20 @@ class TestRoute:
         case = _case(metadata={'supersedes': ['P7']})
         assert case.features.route is _mod().Route.FORCE_STORED
 
-    def test_a_near_verbatim_write_is_restated_without_a_call(self) -> None:
-        case = _case(texts=[_text(child='the CACHE is flushed   daily by the maintenance job .')])
+    def test_a_near_verbatim_restate_band_write_is_restated_without_a_call(self) -> None:
+        case = _case(band='restated',
+                     texts=[_text(child='the CACHE is flushed   daily by the maintenance job .')])
         assert case.features.route is _mod().Route.NEAR_VERBATIM
+        assert case.features.near_verbatim is True
+
+    @pytest.mark.parametrize('band', ['judge', None])
+    def test_a_near_verbatim_write_outside_the_restate_band_is_judged(
+        self, band: str | None,
+    ) -> None:
+        """Deployed ``route_band`` checks near-verbatim only inside the restate band."""
+        case = _case(band=band, texts=[_text(child=_PARENT)])
+        assert case.features.route is _mod().Route.JUDGE
+        assert case.features.near_verbatim is True
 
     def test_everything_else_is_judged(self) -> None:
         assert _case().features.route is _mod().Route.JUDGE
@@ -200,13 +211,25 @@ class TestRoutedOutcome:
         assert _mod().routed_outcome(case.features, None, _GUARD) == 'stored'
 
     def test_a_near_verbatim_route_is_restated(self) -> None:
-        case = _case(texts=[_text(child=_PARENT)])
+        case = _case(band='restated', texts=[_text(child=_PARENT)])
         assert _mod().routed_outcome(case.features, None, _GUARD) == 'restated'
 
-    @pytest.mark.parametrize('verdict', ['restated', 'amended', 'contested', 'stored'])
+    @pytest.mark.parametrize('verdict', ['amended', 'contested', 'stored'])
     def test_a_judged_route_keeps_its_verdict_when_the_guard_passes(self, verdict: str) -> None:
         case = _case(cosine=_cos(0.60))
         assert _mod().routed_outcome(case.features, verdict, _GUARD) == verdict
+
+    def test_a_judged_restatement_is_filed_amended_unless_near_verbatim(self) -> None:
+        """As ``write_triage.py::_file_judged_restatement`` files it (task 7155)."""
+        paraphrase = _case(cosine=_cos(0.60))
+        assert _mod().routed_outcome(paraphrase.features, 'restated', _GUARD) == 'amended'
+        verbatim = _case(cosine=_cos(0.60), texts=[_text(child=_PARENT)])
+        assert verbatim.features.route is _mod().Route.JUDGE
+        assert _mod().routed_outcome(verbatim.features, 'restated', _GUARD) == 'restated'
+
+    def test_a_refiled_restatement_still_passes_the_guard(self) -> None:
+        case = _case(cosine=_cos(0.59))
+        assert _mod().routed_outcome(case.features, 'restated', _GUARD) == 'stored'
 
     def test_the_floor_refuses_an_attach_below_it(self) -> None:
         case = _case(cosine=_cos(0.59))
@@ -284,6 +307,7 @@ class TestFeaturesRow:
     def test_carries_the_route_cosines_recovery_and_text_lengths(self) -> None:
         row = _case(via_sibling=True, cosine=_cos(0.7, 0.9)).features.to_row()
         assert row['route'] == 'judge'
+        assert row['near_verbatim'] is False
         assert (row['cos_parent'], row['source_cosine']) == (0.7, 0.9)
         assert row['metadata_recovered'] is True
         assert row['cosine_recovered'] is True

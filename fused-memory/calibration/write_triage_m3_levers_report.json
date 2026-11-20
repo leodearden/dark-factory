@@ -24,11 +24,18 @@
         "usd_per_1000_writes": 0.0,
         "writes": 673
       },
-      "outcome_agreement_vs_baseline": {
-        "agree": 551,
-        "n": 591,
-        "rate": 0.9323
+      "cumulative_cost": {
+        "calls": 591,
+        "calls_per_write": 0.878158,
+        "fail_open": 0,
+        "p50_seconds": 3.028,
+        "p95_seconds": 5.011,
+        "usd": 1.830812,
+        "usd_per_1000_judged_writes": 3.097821,
+        "usd_per_1000_writes": 2.720374,
+        "writes": 673
       },
+      "outcome_agreement_vs_baseline": null,
       "paired_vs_baseline": {
         "bootstrap": {
           "resamples": 10000,
@@ -55,15 +62,16 @@
           },
           "restated-sample": {
             "amended->contested": 2,
-            "restated->amended": 2,
             "stored->contested": 8
           }
         }
       },
       "provenance": {
-        "cases_sha256": "f4bebc74fc86c4d58f704e38b9df91bd7dcf4a332c12a4531af3b313da88567c",
+        "cases_sha256": "c145d76ffc73d4b4ffcecc43c1895b94ec19cd797528b6305909adef073a621c",
         "effort": null,
         "model": null,
+        "parent": "a1-partial-dispute",
+        "parent_sha256": "496a67c80e83b1ccd049cd509cc2456c0139fa83ce6bcd98e96cf145ea70abd5",
         "prompt_sha256": null,
         "rows": 673
       },
@@ -110,12 +118,12 @@
         "m2_amended": {
           "by_project": {
             "dark_factory": {
-              "hits": 5,
-              "n": 22
+              "hits": 6,
+              "n": 23
             },
             "reify": {
-              "hits": 16,
-              "n": 25
+              "hits": 18,
+              "n": 27
             },
             "scoping_intake": {
               "hits": 0,
@@ -130,18 +138,18 @@
               "n": 12
             }
           },
-          "hits": 52,
-          "n": 103,
+          "hits": 55,
+          "n": 106,
           "population_interval95": [
-            0.3099,
-            0.5361
+            0.3128,
+            0.5383
           ],
-          "population_rate": 0.422,
-          "rate": 0.5049,
+          "population_rate": 0.4246,
+          "rate": 0.5189,
           "unclear": 0,
           "wilson95": [
-            0.4099,
-            0.5995
+            0.4248,
+            0.6117
           ]
         },
         "m2_contested": {
@@ -345,6 +353,17 @@
         "usd_per_1000_writes": 2.720374,
         "writes": 673
       },
+      "cumulative_cost": {
+        "calls": 591,
+        "calls_per_write": 0.878158,
+        "fail_open": 0,
+        "p50_seconds": 3.028,
+        "p95_seconds": 5.011,
+        "usd": 1.830812,
+        "usd_per_1000_judged_writes": 3.097821,
+        "usd_per_1000_writes": 2.720374,
+        "writes": 673
+      },
       "outcome_agreement_vs_baseline": {
         "agree": 551,
         "n": 591,
@@ -374,15 +393,16 @@
             "stored->contested": 4
           },
           "restated-sample": {
-            "amended->contested": 2,
-            "restated->amended": 2
+            "amended->contested": 2
           }
         }
       },
       "provenance": {
-        "cases_sha256": "f4bebc74fc86c4d58f704e38b9df91bd7dcf4a332c12a4531af3b313da88567c",
+        "cases_sha256": "c145d76ffc73d4b4ffcecc43c1895b94ec19cd797528b6305909adef073a621c",
         "effort": "low",
         "model": "gpt-6.1-sol",
+        "parent": null,
+        "parent_sha256": null,
         "prompt_sha256": "ec895da68a9a35542cf6880f3594da1b21dd245c5ed47141ec9735ef5c6c7296",
         "rows": 673
       },
@@ -429,12 +449,12 @@
         "m2_amended": {
           "by_project": {
             "dark_factory": {
-              "hits": 5,
-              "n": 22
+              "hits": 6,
+              "n": 23
             },
             "reify": {
-              "hits": 16,
-              "n": 25
+              "hits": 18,
+              "n": 27
             },
             "scoping_intake": {
               "hits": 0,
@@ -449,18 +469,18 @@
               "n": 12
             }
           },
-          "hits": 52,
-          "n": 103,
+          "hits": 55,
+          "n": 106,
           "population_interval95": [
-            0.3099,
-            0.5361
+            0.3128,
+            0.5383
           ],
-          "population_rate": 0.422,
-          "rate": 0.5049,
+          "population_rate": 0.4246,
+          "rate": 0.5189,
           "unclear": 0,
           "wilson95": [
-            0.4099,
-            0.5995
+            0.4248,
+            0.6117
           ]
         },
         "m2_contested": {
@@ -664,6 +684,17 @@
         "usd_per_1000_writes": 2.684987,
         "writes": 673
       },
+      "cumulative_cost": {
+        "calls": 591,
+        "calls_per_write": 0.878158,
+        "fail_open": 0,
+        "p50_seconds": 3.182,
+        "p95_seconds": 6.104,
+        "usd": 1.806996,
+        "usd_per_1000_judged_writes": 3.057523,
+        "usd_per_1000_writes": 2.684987,
+        "writes": 673
+      },
       "outcome_agreement_vs_baseline": {
         "agree": 564,
         "n": 591,
@@ -696,15 +727,16 @@
             "stored->contested": 1
           },
           "restated-sample": {
-            "contested->amended": 3,
-            "restated->amended": 1
+            "contested->amended": 3
           }
         }
       },
       "provenance": {
-        "cases_sha256": "f4bebc74fc86c4d58f704e38b9df91bd7dcf4a332c12a4531af3b313da88567c",
+        "cases_sha256": "c145d76ffc73d4b4ffcecc43c1895b94ec19cd797528b6305909adef073a621c",
         "effort": "medium",
         "model": "gpt-6.1-sol",
+        "parent": null,
+        "parent_sha256": null,
         "prompt_sha256": "897885879ce30793ba614b837d1ba28f4732ae8ff27dea41eda65bb1d8fbded5",
         "rows": 673
       },
@@ -794,12 +826,12 @@
             "replay-bound-home-no": {
               "by_project": {
                 "dark_factory": {
-                  "hits": 5,
-                  "n": 28
+                  "hits": 6,
+                  "n": 29
                 },
                 "reify": {
-                  "hits": 18,
-                  "n": 30
+                  "hits": 20,
+                  "n": 32
                 },
                 "scoping_intake": {
                   "hits": 0,
@@ -810,33 +842,33 @@
                   "n": 52
                 },
                 "solar_challenge_platform": {
-                  "hits": 7,
-                  "n": 14
+                  "hits": 8,
+                  "n": 15
                 }
               },
-              "hits": 57,
-              "n": 125,
+              "hits": 61,
+              "n": 129,
               "population_interval95": [
-                0.2863,
-                0.4944
+                0.2911,
+                0.4971
               ],
-              "population_rate": 0.3891,
-              "rate": 0.456,
+              "population_rate": 0.3924,
+              "rate": 0.4729,
               "unclear": 0,
               "wilson95": [
-                0.3713,
-                0.5433
+                0.3887,
+                0.5586
               ]
             },
             "replay-bound-home-yes": {
               "by_project": {
                 "dark_factory": {
-                  "hits": 5,
-                  "n": 28
+                  "hits": 6,
+                  "n": 29
                 },
                 "reify": {
-                  "hits": 18,
-                  "n": 30
+                  "hits": 20,
+                  "n": 32
                 },
                 "scoping_intake": {
                   "hits": 0,
@@ -847,28 +879,28 @@
                   "n": 52
                 },
                 "solar_challenge_platform": {
-                  "hits": 7,
-                  "n": 14
+                  "hits": 8,
+                  "n": 15
                 }
               },
-              "hits": 57,
-              "n": 125,
+              "hits": 61,
+              "n": 129,
               "population_interval95": [
-                0.2863,
-                0.4944
+                0.2911,
+                0.4971
               ],
-              "population_rate": 0.3891,
-              "rate": 0.456,
+              "population_rate": 0.3924,
+              "rate": 0.4729,
               "unclear": 0,
               "wilson95": [
-                0.3713,
-                0.5433
+                0.3887,
+                0.5586
               ]
             }
           },
           "population_rate": [
-            0.3891,
-            0.3891
+            0.3924,
+            0.3924
           ]
         },
         "m2_contested": {
@@ -1183,6 +1215,17 @@
         "usd_per_1000_writes": 3.17038,
         "writes": 673
       },
+      "cumulative_cost": {
+        "calls": 591,
+        "calls_per_write": 0.878158,
+        "fail_open": 0,
+        "p50_seconds": 4.083,
+        "p95_seconds": 9.714,
+        "usd": 2.133666,
+        "usd_per_1000_judged_writes": 3.610264,
+        "usd_per_1000_writes": 3.17038,
+        "writes": 673
+      },
       "outcome_agreement_vs_baseline": {
         "agree": 566,
         "n": 591,
@@ -1222,9 +1265,11 @@
         }
       },
       "provenance": {
-        "cases_sha256": "f4bebc74fc86c4d58f704e38b9df91bd7dcf4a332c12a4531af3b313da88567c",
+        "cases_sha256": "c145d76ffc73d4b4ffcecc43c1895b94ec19cd797528b6305909adef073a621c",
         "effort": "high",
         "model": "gpt-6.1-sol",
+        "parent": null,
+        "parent_sha256": null,
         "prompt_sha256": "897885879ce30793ba614b837d1ba28f4732ae8ff27dea41eda65bb1d8fbded5",
         "rows": 673
       },
@@ -1314,81 +1359,81 @@
             "replay-bound-home-no": {
               "by_project": {
                 "dark_factory": {
-                  "hits": 5,
-                  "n": 29
+                  "hits": 6,
+                  "n": 30
                 },
                 "reify": {
-                  "hits": 18,
-                  "n": 32
+                  "hits": 20,
+                  "n": 34
                 },
                 "scoping_intake": {
                   "hits": 0,
                   "n": 1
                 },
                 "solar_challenge": {
-                  "hits": 24,
-                  "n": 50
+                  "hits": 25,
+                  "n": 51
                 },
                 "solar_challenge_platform": {
-                  "hits": 7,
-                  "n": 15
+                  "hits": 8,
+                  "n": 16
                 }
               },
-              "hits": 54,
-              "n": 127,
+              "hits": 59,
+              "n": 132,
               "population_interval95": [
-                0.2822,
-                0.4885
+                0.2876,
+                0.492
               ],
-              "population_rate": 0.3848,
-              "rate": 0.4252,
+              "population_rate": 0.3889,
+              "rate": 0.447,
               "unclear": 0,
               "wilson95": [
-                0.3427,
-                0.5121
+                0.3648,
+                0.5321
               ]
             },
             "replay-bound-home-yes": {
               "by_project": {
                 "dark_factory": {
-                  "hits": 5,
-                  "n": 29
+                  "hits": 6,
+                  "n": 30
                 },
                 "reify": {
-                  "hits": 18,
-                  "n": 32
+                  "hits": 20,
+                  "n": 34
                 },
                 "scoping_intake": {
                   "hits": 0,
                   "n": 1
                 },
                 "solar_challenge": {
-                  "hits": 24,
-                  "n": 50
+                  "hits": 25,
+                  "n": 51
                 },
                 "solar_challenge_platform": {
-                  "hits": 7,
-                  "n": 15
+                  "hits": 8,
+                  "n": 16
                 }
               },
-              "hits": 54,
-              "n": 127,
+              "hits": 59,
+              "n": 132,
               "population_interval95": [
-                0.2822,
-                0.4885
+                0.2876,
+                0.492
               ],
-              "population_rate": 0.3848,
-              "rate": 0.4252,
+              "population_rate": 0.3889,
+              "rate": 0.447,
               "unclear": 0,
               "wilson95": [
-                0.3427,
-                0.5121
+                0.3648,
+                0.5321
               ]
             }
           },
           "population_rate": [
-            0.3848,
-            0.3848
+            0.3889,
+            0.3889
           ]
         },
         "m2_contested": {
@@ -1703,11 +1748,18 @@
         "usd_per_1000_writes": 0.524122,
         "writes": 673
       },
-      "outcome_agreement_vs_baseline": {
-        "agree": 591,
-        "n": 591,
-        "rate": 1.0
+      "cumulative_cost": {
+        "calls": 720,
+        "calls_per_write": 1.069837,
+        "fail_open": 0,
+        "p50_seconds": 3.124,
+        "p95_seconds": 7.751,
+        "usd": 2.06001,
+        "usd_per_1000_judged_writes": 3.485635,
+        "usd_per_1000_writes": 3.060936,
+        "writes": 673
       },
+      "outcome_agreement_vs_baseline": null,
       "paired_vs_baseline": {
         "bootstrap": {
           "resamples": 10000,
@@ -1731,15 +1783,16 @@
             "amended->contested": 16
           },
           "restated-sample": {
-            "amended->contested": 9,
-            "restated->contested": 1
+            "amended->contested": 10
           }
         }
       },
       "provenance": {
-        "cases_sha256": "f4bebc74fc86c4d58f704e38b9df91bd7dcf4a332c12a4531af3b313da88567c",
+        "cases_sha256": "c145d76ffc73d4b4ffcecc43c1895b94ec19cd797528b6305909adef073a621c",
         "effort": "low",
         "model": "gpt-6.1-sol",
+        "parent": "f3p",
+        "parent_sha256": "72e65903c9c295bbc3af357b00af92d84c9f9e481c1d86deee5074cde58e1927",
         "prompt_sha256": "e713c2c63c3e92d8fc0548f2b7e57ee6e77b80d780ba3726df0469b06700a587",
         "rows": 673
       },
@@ -1786,12 +1839,12 @@
         "m2_amended": {
           "by_project": {
             "dark_factory": {
-              "hits": 4,
-              "n": 17
+              "hits": 5,
+              "n": 18
             },
             "reify": {
-              "hits": 16,
-              "n": 23
+              "hits": 18,
+              "n": 25
             },
             "scoping_intake": {
               "hits": 0,
@@ -1802,22 +1855,22 @@
               "n": 32
             },
             "solar_challenge_platform": {
-              "hits": 5,
-              "n": 8
+              "hits": 6,
+              "n": 9
             }
           },
-          "hits": 43,
-          "n": 81,
+          "hits": 47,
+          "n": 85,
           "population_interval95": [
-            0.303,
-            0.5504
+            0.3078,
+            0.5533
           ],
-          "population_rate": 0.4255,
-          "rate": 0.5309,
+          "population_rate": 0.4296,
+          "rate": 0.5529,
           "unclear": 0,
           "wilson95": [
-            0.4233,
-            0.6357
+            0.4472,
+            0.6541
           ]
         },
         "m2_contested": {
@@ -2021,11 +2074,18 @@
         "usd_per_1000_writes": 0.0,
         "writes": 673
       },
-      "outcome_agreement_vs_baseline": {
-        "agree": 514,
-        "n": 591,
-        "rate": 0.8697
+      "cumulative_cost": {
+        "calls": 591,
+        "calls_per_write": 0.878158,
+        "fail_open": 0,
+        "p50_seconds": 3.041,
+        "p95_seconds": 5.167,
+        "usd": 1.948858,
+        "usd_per_1000_judged_writes": 3.29756,
+        "usd_per_1000_writes": 2.895777,
+        "writes": 673
       },
+      "outcome_agreement_vs_baseline": null,
       "paired_vs_baseline": {
         "bootstrap": {
           "resamples": 10000,
@@ -2053,16 +2113,17 @@
           },
           "restated-sample": {
             "amended->contested": 7,
-            "restated->amended": 2,
             "stored->amended": 1,
             "stored->contested": 11
           }
         }
       },
       "provenance": {
-        "cases_sha256": "f4bebc74fc86c4d58f704e38b9df91bd7dcf4a332c12a4531af3b313da88567c",
+        "cases_sha256": "c145d76ffc73d4b4ffcecc43c1895b94ec19cd797528b6305909adef073a621c",
         "effort": null,
         "model": null,
+        "parent": "d1-stale-detail-check",
+        "parent_sha256": "ca0857352968cdfcd080229782b00f40958ca92b8c0041603274008fdc817fc4",
         "prompt_sha256": null,
         "rows": 673
       },
@@ -2109,12 +2170,12 @@
         "m2_amended": {
           "by_project": {
             "dark_factory": {
-              "hits": 4,
-              "n": 17
+              "hits": 5,
+              "n": 18
             },
             "reify": {
-              "hits": 15,
-              "n": 23
+              "hits": 17,
+              "n": 25
             },
             "scoping_intake": {
               "hits": 0,
@@ -2129,18 +2190,18 @@
               "n": 11
             }
           },
-          "hits": 47,
-          "n": 86,
+          "hits": 50,
+          "n": 89,
           "population_interval95": [
-            0.311,
-            0.5598
+            0.3152,
+            0.5622
           ],
-          "population_rate": 0.4359,
-          "rate": 0.5465,
+          "population_rate": 0.4389,
+          "rate": 0.5618,
           "unclear": 0,
           "wilson95": [
-            0.4416,
-            0.6475
+            0.4583,
+            0.6602
           ]
         },
         "m2_contested": {
@@ -2344,6 +2405,17 @@
         "usd_per_1000_writes": 2.895777,
         "writes": 673
       },
+      "cumulative_cost": {
+        "calls": 591,
+        "calls_per_write": 0.878158,
+        "fail_open": 0,
+        "p50_seconds": 3.041,
+        "p95_seconds": 5.167,
+        "usd": 1.948858,
+        "usd_per_1000_judged_writes": 3.29756,
+        "usd_per_1000_writes": 2.895777,
+        "writes": 673
+      },
       "outcome_agreement_vs_baseline": {
         "agree": 514,
         "n": 591,
@@ -2375,16 +2447,17 @@
           },
           "restated-sample": {
             "amended->contested": 7,
-            "restated->amended": 2,
             "stored->amended": 1,
             "stored->contested": 2
           }
         }
       },
       "provenance": {
-        "cases_sha256": "f4bebc74fc86c4d58f704e38b9df91bd7dcf4a332c12a4531af3b313da88567c",
+        "cases_sha256": "c145d76ffc73d4b4ffcecc43c1895b94ec19cd797528b6305909adef073a621c",
         "effort": "low",
         "model": "gpt-6.1-sol",
+        "parent": null,
+        "parent_sha256": null,
         "prompt_sha256": "40189530eecf3d7eb725dcae3005eb217f4d9c0d8d6581981d9d86ab9e2ef202",
         "rows": 673
       },
@@ -2431,12 +2504,12 @@
         "m2_amended": {
           "by_project": {
             "dark_factory": {
-              "hits": 4,
-              "n": 17
+              "hits": 5,
+              "n": 18
             },
             "reify": {
-              "hits": 15,
-              "n": 23
+              "hits": 17,
+              "n": 25
             },
             "scoping_intake": {
               "hits": 0,
@@ -2451,18 +2524,18 @@
               "n": 11
             }
           },
-          "hits": 47,
-          "n": 86,
+          "hits": 50,
+          "n": 89,
           "population_interval95": [
-            0.311,
-            0.5598
+            0.3152,
+            0.5622
           ],
-          "population_rate": 0.4359,
-          "rate": 0.5465,
+          "population_rate": 0.4389,
+          "rate": 0.5618,
           "unclear": 0,
           "wilson95": [
-            0.4416,
-            0.6475
+            0.4583,
+            0.6602
           ]
         },
         "m2_contested": {
@@ -2666,11 +2739,18 @@
         "usd_per_1000_writes": 0.0,
         "writes": 673
       },
-      "outcome_agreement_vs_baseline": {
-        "agree": 591,
-        "n": 591,
-        "rate": 1.0
+      "cumulative_cost": {
+        "calls": 591,
+        "calls_per_write": 0.878158,
+        "fail_open": 0,
+        "p50_seconds": 2.911,
+        "p95_seconds": 4.596,
+        "usd": 1.707276,
+        "usd_per_1000_judged_writes": 2.888792,
+        "usd_per_1000_writes": 2.536814,
+        "writes": 673
       },
+      "outcome_agreement_vs_baseline": null,
       "paired_vs_baseline": {
         "bootstrap": {
           "resamples": 10000,
@@ -2696,9 +2776,11 @@
         }
       },
       "provenance": {
-        "cases_sha256": "f4bebc74fc86c4d58f704e38b9df91bd7dcf4a332c12a4531af3b313da88567c",
+        "cases_sha256": "c145d76ffc73d4b4ffcecc43c1895b94ec19cd797528b6305909adef073a621c",
         "effort": null,
         "model": null,
+        "parent": "f3p",
+        "parent_sha256": "72e65903c9c295bbc3af357b00af92d84c9f9e481c1d86deee5074cde58e1927",
         "prompt_sha256": null,
         "rows": 673
       },
@@ -2788,81 +2870,81 @@
             "replay-bound-home-no": {
               "by_project": {
                 "dark_factory": {
-                  "hits": 5,
-                  "n": 29
+                  "hits": 6,
+                  "n": 30
                 },
                 "reify": {
-                  "hits": 19,
-                  "n": 33
+                  "hits": 21,
+                  "n": 35
                 },
                 "scoping_intake": {
                   "hits": 0,
                   "n": 1
                 },
                 "solar_challenge": {
-                  "hits": 23,
-                  "n": 48
+                  "hits": 24,
+                  "n": 49
                 },
                 "solar_challenge_platform": {
-                  "hits": 7,
-                  "n": 13
+                  "hits": 8,
+                  "n": 14
                 }
               },
-              "hits": 54,
-              "n": 124,
+              "hits": 59,
+              "n": 129,
               "population_interval95": [
-                0.2942,
-                0.505
+                0.2992,
+                0.508
               ],
-              "population_rate": 0.3982,
-              "rate": 0.4355,
+              "population_rate": 0.4022,
+              "rate": 0.4574,
               "unclear": 0,
               "wilson95": [
-                0.3515,
-                0.5234
+                0.3739,
+                0.5433
               ]
             },
             "replay-bound-home-yes": {
               "by_project": {
                 "dark_factory": {
-                  "hits": 5,
-                  "n": 29
+                  "hits": 6,
+                  "n": 30
                 },
                 "reify": {
-                  "hits": 19,
-                  "n": 33
+                  "hits": 21,
+                  "n": 35
                 },
                 "scoping_intake": {
                   "hits": 0,
                   "n": 1
                 },
                 "solar_challenge": {
-                  "hits": 23,
-                  "n": 48
+                  "hits": 24,
+                  "n": 49
                 },
                 "solar_challenge_platform": {
-                  "hits": 7,
-                  "n": 13
+                  "hits": 8,
+                  "n": 14
                 }
               },
-              "hits": 54,
-              "n": 124,
+              "hits": 59,
+              "n": 129,
               "population_interval95": [
-                0.2942,
-                0.505
+                0.2992,
+                0.508
               ],
-              "population_rate": 0.3982,
-              "rate": 0.4355,
+              "population_rate": 0.4022,
+              "rate": 0.4574,
               "unclear": 0,
               "wilson95": [
-                0.3515,
-                0.5234
+                0.3739,
+                0.5433
               ]
             }
           },
           "population_rate": [
-            0.3982,
-            0.3982
+            0.4022,
+            0.4022
           ]
         },
         "m2_contested": {
@@ -3177,12 +3259,25 @@
         "usd_per_1000_writes": 2.536814,
         "writes": 673
       },
+      "cumulative_cost": {
+        "calls": 591,
+        "calls_per_write": 0.878158,
+        "fail_open": 0,
+        "p50_seconds": 2.911,
+        "p95_seconds": 4.596,
+        "usd": 1.707276,
+        "usd_per_1000_judged_writes": 2.888792,
+        "usd_per_1000_writes": 2.536814,
+        "writes": 673
+      },
       "outcome_agreement_vs_baseline": null,
       "paired_vs_baseline": null,
       "provenance": {
-        "cases_sha256": "f4bebc74fc86c4d58f704e38b9df91bd7dcf4a332c12a4531af3b313da88567c",
+        "cases_sha256": "c145d76ffc73d4b4ffcecc43c1895b94ec19cd797528b6305909adef073a621c",
         "effort": "low",
         "model": "gpt-6.1-sol",
+        "parent": null,
+        "parent_sha256": null,
         "prompt_sha256": "897885879ce30793ba614b837d1ba28f4732ae8ff27dea41eda65bb1d8fbded5",
         "rows": 673
       },
@@ -3272,81 +3367,81 @@
             "replay-bound-home-no": {
               "by_project": {
                 "dark_factory": {
-                  "hits": 5,
-                  "n": 29
+                  "hits": 6,
+                  "n": 30
                 },
                 "reify": {
-                  "hits": 19,
-                  "n": 33
+                  "hits": 21,
+                  "n": 35
                 },
                 "scoping_intake": {
                   "hits": 0,
                   "n": 1
                 },
                 "solar_challenge": {
-                  "hits": 23,
-                  "n": 48
+                  "hits": 24,
+                  "n": 49
                 },
                 "solar_challenge_platform": {
-                  "hits": 7,
-                  "n": 13
+                  "hits": 8,
+                  "n": 14
                 }
               },
-              "hits": 54,
-              "n": 124,
+              "hits": 59,
+              "n": 129,
               "population_interval95": [
-                0.2942,
-                0.505
+                0.2992,
+                0.508
               ],
-              "population_rate": 0.3982,
-              "rate": 0.4355,
+              "population_rate": 0.4022,
+              "rate": 0.4574,
               "unclear": 0,
               "wilson95": [
-                0.3515,
-                0.5234
+                0.3739,
+                0.5433
               ]
             },
             "replay-bound-home-yes": {
               "by_project": {
                 "dark_factory": {
-                  "hits": 5,
-                  "n": 29
+                  "hits": 6,
+                  "n": 30
                 },
                 "reify": {
-                  "hits": 19,
-                  "n": 33
+                  "hits": 21,
+                  "n": 35
                 },
                 "scoping_intake": {
                   "hits": 0,
                   "n": 1
                 },
                 "solar_challenge": {
-                  "hits": 23,
-                  "n": 48
+                  "hits": 24,
+                  "n": 49
                 },
                 "solar_challenge_platform": {
-                  "hits": 7,
-                  "n": 13
+                  "hits": 8,
+                  "n": 14
                 }
               },
-              "hits": 54,
-              "n": 124,
+              "hits": 59,
+              "n": 129,
               "population_interval95": [
-                0.2942,
-                0.505
+                0.2992,
+                0.508
               ],
-              "population_rate": 0.3982,
-              "rate": 0.4355,
+              "population_rate": 0.4022,
+              "rate": 0.4574,
               "unclear": 0,
               "wilson95": [
-                0.3515,
-                0.5234
+                0.3739,
+                0.5433
               ]
             }
           },
           "population_rate": [
-            0.3982,
-            0.3982
+            0.4022,
+            0.4022
           ]
         },
         "m2_contested": {
@@ -3661,6 +3756,17 @@
         "usd_per_1000_writes": 2.534125,
         "writes": 673
       },
+      "cumulative_cost": {
+        "calls": 591,
+        "calls_per_write": 0.878158,
+        "fail_open": 0,
+        "p50_seconds": 2.857,
+        "p95_seconds": 4.629,
+        "usd": 1.705466,
+        "usd_per_1000_judged_writes": 2.885729,
+        "usd_per_1000_writes": 2.534125,
+        "writes": 673
+      },
       "outcome_agreement_vs_baseline": {
         "agree": 568,
         "n": 591,
@@ -3694,15 +3800,16 @@
           },
           "restated-sample": {
             "amended->contested": 1,
-            "restated->amended": 1,
             "stored->amended": 1
           }
         }
       },
       "provenance": {
-        "cases_sha256": "f4bebc74fc86c4d58f704e38b9df91bd7dcf4a332c12a4531af3b313da88567c",
+        "cases_sha256": "c145d76ffc73d4b4ffcecc43c1895b94ec19cd797528b6305909adef073a621c",
         "effort": "low",
         "model": "gpt-6.1-sol",
+        "parent": null,
+        "parent_sha256": null,
         "prompt_sha256": "897885879ce30793ba614b837d1ba28f4732ae8ff27dea41eda65bb1d8fbded5",
         "rows": 673
       },
@@ -3749,12 +3856,12 @@
         "m2_amended": {
           "by_project": {
             "dark_factory": {
-              "hits": 5,
-              "n": 27
+              "hits": 6,
+              "n": 28
             },
             "reify": {
-              "hits": 19,
-              "n": 33
+              "hits": 21,
+              "n": 35
             },
             "scoping_intake": {
               "hits": 0,
@@ -3765,22 +3872,22 @@
               "n": 52
             },
             "solar_challenge_platform": {
-              "hits": 7,
-              "n": 13
+              "hits": 8,
+              "n": 14
             }
           },
-          "hits": 55,
-          "n": 126,
+          "hits": 59,
+          "n": 130,
           "population_interval95": [
-            0.2988,
-            0.5089
+            0.3026,
+            0.5116
           ],
-          "population_rate": 0.4034,
-          "rate": 0.4365,
+          "population_rate": 0.4066,
+          "rate": 0.4538,
           "unclear": 0,
           "wilson95": [
-            0.3531,
-            0.5237
+            0.3708,
+            0.5395
           ]
         },
         "m2_contested": {
@@ -4873,9 +4980,11 @@
         "writes": 577
       },
       "provenance": {
-        "cases_sha256": "f4bebc74fc86c4d58f704e38b9df91bd7dcf4a332c12a4531af3b313da88567c",
+        "cases_sha256": "c145d76ffc73d4b4ffcecc43c1895b94ec19cd797528b6305909adef073a621c",
         "effort": "low",
         "model": "gpt-6.1-sol",
+        "parent": null,
+        "parent_sha256": null,
         "prompt_sha256": "312a8c9a7f6ff5fff7d6e8b0af8d327b73e8f860d7025cbac70ceb9b8304cd6a",
         "rows": 577
       }

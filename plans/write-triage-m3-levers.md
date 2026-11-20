@@ -148,8 +148,12 @@ No production module was edited.
 - A supersession is stored with its target marked (F4); 12 cases.
 - Caller-owned attach keys or an orchestrator completion record force-store
   the write; 68 cases, 65 of them completion records.
-- A near-verbatim write is restated without a call; 2 cases.
-- Everything else is judged (591 cases), then passes the attach guard:
+- A restate-band write that is near-verbatim to its target is restated
+  without a call (`write_triage.py::route_band`); 2 cases.
+- Everything else is judged (591 cases). A judged restatement that is not
+  near-verbatim is filed amended, as
+  `write_triage.py::_file_judged_restatement` files it (task 7155); that
+  refiles 3 to 5 writes per arm. The outcome then passes the attach guard:
   `AttachGuard`, min parent cosine 0.60, hoist gap 0.05.
 
 A guard refusal or a force-store on a CONFLICT write ends stored_unlinked,
@@ -228,24 +232,27 @@ Arms, in `run_write_triage_m3_levers.py::ARMS`:
 Figures are population rates from
 `fused-memory/calibration/write_triage_m3_levers_report.json`. "False
 contests" is the population change in false_conflict cells against f3p.
-Calls, latency and USD are the arm's own, at list price ($2 / $10 per Mtok).
-A transform's cost is its parent's, and c1's is f3p's plus its own. M5
+Calls, latency and USD are what running the arm costs, at list price
+($2 / $10 per Mtok): they include the calls of the arm it builds on (the
+report's `cumulative_cost`). So a transform costs what its parent costs, and
+c1 costs f3p's call plus its own second call; the report's `cost` block
+gives each arm's own share. M5
 equals M2-contested-correct in every arm: under this rubric a contest is
 correct exactly when it has CONFLICT. M4 and harm are [low, high] where a
 HOME-tie closure was needed.
 
 | Arm | M3 [95%] | ΔM3 vs f3p [95%] | M1 | M5 | M2 amended correct | False contests | M4 | Harm Δ / write | Calls / write | p50 / p95 s | Fail-open | USD / 1k judged |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
-| f3p | 0.414 [0.310, 0.502] | — | 0.053 | 0.869 | 0.398 | — | 0.429 | 0.117–0.118 | 0.878 | 2.91 / 4.60 | 0 | 2.89 |
-| f3p-repeat | 0.395 [0.293, 0.484] | −0.020 [−0.099, 0.056] | 0.042 | 0.870 | 0.403 | +1.00 | 0.420 | 0.101 | 0.878 | 2.86 / 4.63 | 0 | 2.89 |
-| a1-partial-dispute | 0.281 [0.186, 0.375] | −0.133 [−0.222, −0.047] | 0.053 | 0.802 | 0.422 | +46.22 | 0.388 | 0.063 | 0.878 | 3.03 / 5.01 | 0 | 3.10 |
-| c1-dispute-marker | 0.251 [0.161, 0.341] | −0.164 [−0.255, −0.071] | 0.009 | 0.652 | 0.425 | +161.38 | 0.378 | 0.162 | +0.192 | 3.50 / 6.00 | 0 | 2.73 |
-| d1-stale-detail-check | 0.199 [0.122, 0.284] | −0.215 [−0.315, −0.110] | 0.009 | 0.667 | 0.436 | +161.88 | 0.376 | 0.137 | 0.878 | 3.04 / 5.17 | 0 | 3.30 |
-| e1-mark-refused-contests | 0.373 [0.266, 0.464] | −0.041 [−0.061, −0.024] | 0.053 | 0.857 | 0.398 | +8.25 | 0.424–0.425 | 0.113 | +0 | — | 0 | +0 |
-| **d1-e1-combined** | **0.081 [0.043, 0.136]** | **−0.333 [−0.430, −0.224]** | 0.009 | 0.656 | 0.436 | +205.61 | 0.377 | 0.155 | 0.878 | as d1 | 0 | 3.30 |
-| **a1-e1-combined** | **0.214 [0.123, 0.307]** | **−0.201 [−0.293, −0.110]** | 0.053 | 0.795 | 0.422 | +59.47 | 0.382 | 0.053 | 0.878 | as a1 | 0 | 3.10 |
-| b1-sol-medium | 0.438 [0.336, 0.523] | +0.024 [−0.051, 0.103] | 0.075 | 0.834 | 0.389 | +11.99 | 0.427–0.428 | 0.143–0.144 | 0.878 | 3.18 / 6.10 | 0 | 3.06 |
-| b2-sol-high | 0.439 [0.337, 0.523] | +0.025 [−0.049, 0.105] | 0.064 | 0.833 | 0.385 | +12.24 | 0.438–0.439 | 0.153–0.154 | 0.878 | 4.08 / 9.71 | 0 | 3.61 |
+| f3p | 0.414 [0.310, 0.502] | — | 0.053 | 0.869 | 0.402 | — | 0.429 | 0.117–0.118 | 0.878 | 2.91 / 4.60 | 0 | 2.89 |
+| f3p-repeat | 0.395 [0.293, 0.484] | −0.020 [−0.099, 0.056] | 0.042 | 0.870 | 0.407 | +1.00 | 0.420 | 0.101 | 0.878 | 2.86 / 4.63 | 0 | 2.89 |
+| a1-partial-dispute | 0.281 [0.186, 0.375] | −0.133 [−0.222, −0.047] | 0.053 | 0.802 | 0.425 | +46.22 | 0.388 | 0.063 | 0.878 | 3.03 / 5.01 | 0 | 3.10 |
+| c1-dispute-marker | 0.251 [0.161, 0.341] | −0.164 [−0.255, −0.071] | 0.009 | 0.652 | 0.430 | +161.38 | 0.378 | 0.162 | 1.070 | 3.12 / 7.75 | 0 | 3.49 |
+| d1-stale-detail-check | 0.199 [0.122, 0.284] | −0.215 [−0.315, −0.110] | 0.009 | 0.667 | 0.439 | +161.88 | 0.376 | 0.137 | 0.878 | 3.04 / 5.17 | 0 | 3.30 |
+| e1-mark-refused-contests | 0.373 [0.266, 0.464] | −0.041 [−0.061, −0.024] | 0.053 | 0.857 | 0.402 | +8.25 | 0.424–0.425 | 0.113 | 0.878 | 2.91 / 4.60 | 0 | 2.89 |
+| **d1-e1-combined** | **0.081 [0.043, 0.136]** | **−0.333 [−0.430, −0.224]** | 0.009 | 0.656 | 0.439 | +205.61 | 0.377 | 0.155 | 0.878 | 3.04 / 5.17 | 0 | 3.30 |
+| **a1-e1-combined** | **0.214 [0.123, 0.307]** | **−0.201 [−0.293, −0.110]** | 0.053 | 0.795 | 0.425 | +59.47 | 0.382 | 0.053 | 0.878 | 3.03 / 5.01 | 0 | 3.10 |
+| b1-sol-medium | 0.438 [0.336, 0.523] | +0.024 [−0.051, 0.103] | 0.075 | 0.834 | 0.392 | +11.99 | 0.427–0.428 | 0.143–0.144 | 0.878 | 3.18 / 6.10 | 0 | 3.06 |
+| b2-sol-high | 0.439 [0.337, 0.523] | +0.025 [−0.049, 0.105] | 0.064 | 0.833 | 0.389 | +12.24 | 0.438–0.439 | 0.153–0.154 | 0.878 | 4.08 / 9.71 | 0 | 3.61 |
 
 Reading the table:
 
@@ -270,11 +277,12 @@ Reading the table:
   - e1 fixes 13 census and 7 restated hits, and no amended one.
   - d1-e1 fixes 11 of the 12 amended hits.
   None of these lever arms newly hides a write the baseline showed.
-- **Latency and spend.** Every low-effort arm's p95 is 4.6–5.2 s, under the
-  release condition's 6.1–13.0 s bracket. b2 reaches 9.71 s for no gain.
-  c1's second call adds about 3.5 s at p50 on the 19% of writes it re-asks.
-  e1 adds nothing. A prompt lever costs $2.9–3.3 per 1,000 judged writes,
-  against f3p's $2.89. Latency was measured under replay concurrency 12 on
+- **Latency and spend.** Every single-call low-effort arm's p95 is 4.6–5.2 s,
+  under the release condition's 6.1–13.0 s bracket. b2 reaches 9.71 s for no
+  gain. c1 asks twice in sequence on the 19% of writes it re-asks: its
+  second call alone is 3.50 s at p50, and the pair reaches 7.75 s at p95,
+  inside the bracket. e1 adds nothing to its parent. A prompt lever costs
+  $2.9–3.3 per 1,000 judged writes, and c1 $3.49, against f3p's $2.89. Latency was measured under replay concurrency 12 on
   one-candidate slates. Production's width-5 prompt is longer.
 
 ## 5. Recommended sequence toward 0.10

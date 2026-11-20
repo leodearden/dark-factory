@@ -15,9 +15,9 @@ Two parts:
   soak facts, its rater answers, its replay features and its hand labels.
 - ``report``: each complete arm's metrics, its paired M3 delta against the
   baseline arm, the outcome transitions and false contests the delta costs,
-  and its calls, latency and list-price spend. It also gives the harness
-  checks (the ψ reproduction's agreement with the soak) and the arms left
-  partial.
+  and its calls, latency and list-price spend, both its own and with the
+  calls of the arms it builds on. It also gives the harness checks (the ψ
+  reproduction's agreement with the soak) and the arms left partial.
 
 A substituted outcome can need a HOME answer the raters tied, which today's
 outcome never asked for. The arm is then scored twice, closing each tie
@@ -462,9 +462,14 @@ def _cos_bucket(cosine: float | None) -> str:
     return next(label for edge, label in _COS_EDGES if cosine < edge)
 
 
+_PROVENANCE_KEYS = ('prompt_sha256', 'model', 'effort', 'cases_sha256', 'parent', 'parent_sha256')
+_VERDICT_KEYS = ('judge_outcome', 'routed_outcome')
+"""The verdicts this report reads from an arm row; an arm built on a parent must carry the parent's."""
+
+
 def _arm_provenance(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     provenance: dict[str, Any] = {}
-    for key in ('prompt_sha256', 'model', 'effort', 'cases_sha256'):
+    for key in _PROVENANCE_KEYS:
         values = {row.get(key) for row in rows}
         if len(values) != 1:
             raise ValueError(f'an arm\'s rows carry {len(values)} values of {key}: {sorted(map(str, values))}')
@@ -472,27 +477,79 @@ def _arm_provenance(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     return {**provenance, 'rows': len(rows)}
 
 
+def lineage(name: str, arms: Mapping[str, Sequence[Mapping[str, Any]]]) -> list[str]:
+    """*name*, then each arm it builds on, nearest first.
+
+    Refuses an ancestor missing from *arms*, and a child whose verdicts are
+    not its parent's, row for row.
+    """
+    names = [name]
+    while (parent := _arm_provenance(arms[names[-1]])['parent']) is not None:
+        if parent not in arms or parent in names:
+            raise ValueError(f'arm {names[-1]!r} builds on {parent!r}, which is not a scored ancestor')
+        theirs = {row['entry_id']: row for row in arms[parent]}
+        for row in arms[names[-1]]:
+            parent_row = theirs.get(row['entry_id'], {})
+            if any(row[key] != parent_row.get(key) for key in _VERDICT_KEYS):
+                raise ValueError(
+                    f'arm {names[-1]!r}: row {row["entry_id"]!r} does not carry the verdicts of'
+                    f' its parent {parent!r}'
+                )
+        names.append(parent)
+    return names
+
+
+def _with_ancestors(chain: Iterable[Sequence[Mapping[str, Any]]]) -> list[dict[str, Any]]:
+    """One row per write summing the calls, latency and spend of an arm and every arm it builds on."""
+    by_entry: defaultdict[str, list[Mapping[str, Any]]] = defaultdict(list)
+    for rows in chain:
+        for row in rows:
+            by_entry[row['entry_id']].append(row)
+    combined = []
+    for entry, rows in sorted(by_entry.items()):
+        seconds = [row['seconds'] for row in rows if row['seconds'] is not None]
+        combined.append({
+            'entry_id': entry,
+            'calls': sum(row['calls'] for row in rows),
+            'seconds': round(sum(seconds), 3) if seconds else None,
+            'usd': sum(row['usd'] or 0.0 for row in rows),
+            'error_type': next((row['error_type'] for row in rows if row.get('error_type')), None),
+        })
+    return combined
+
+
 def arm_report(
-    rows: Sequence[Mapping[str, Any]],
+    name: str,
+    arms: Mapping[str, Sequence[Mapping[str, Any]]],
     *,
-    baseline_rows: Sequence[Mapping[str, Any]] | None,
+    baseline: str,
     soak_items: Sequence[Mapping[str, Any]],
     verdicts: Sequence[Mapping[str, Any]],
     strata: Mapping[str, int],
     features: Sequence[_cases.CaseFeatures],
 ) -> dict[str, Any]:
-    """One arm's report entry; *baseline_rows* is None for the baseline arm itself."""
+    """Arm *name*'s report entry, scored against *baseline*; both are keys of *arms*.
+
+    ``cost`` is the arm's own calls; ``cumulative_cost`` adds those of every
+    arm it builds on, so it is what running the arm costs. An arm built on a
+    parent carries the parent's verdicts, so it has no verdict agreement of
+    its own with the baseline.
+    """
+    rows = arms[name]
+    ancestry = lineage(name, arms)
     items = arm_items(soak_items, features, rows)
     paired = agreement = None
-    if baseline_rows is not None:
-        paired = paired_delta(items, arm_items(soak_items, features, baseline_rows), verdicts, strata)
-        agreement = outcome_agreement(rows, baseline_rows)
+    if name != baseline:
+        paired = paired_delta(items, arm_items(soak_items, features, arms[baseline]), verdicts, strata)
+        if len(ancestry) == 1:
+            agreement = outcome_agreement(rows, arms[baseline])
     return {
         'provenance': _arm_provenance(rows),
         'score': score_arm(items, verdicts, strata),
         'paired_vs_baseline': paired,
         'outcome_agreement_vs_baseline': agreement,
         'cost': cost(rows),
+        'cumulative_cost': cost(_with_ancestors(arms[arm] for arm in ancestry)),
     }
 
 
@@ -519,10 +576,10 @@ def build_report(
     baseline_prompt = _arm_provenance(arms[baseline])['prompt_sha256']
     scored = {
         name: arm_report(
-            rows, baseline_rows=None if name == baseline else arms[baseline],
-            soak_items=soak_items, verdicts=verdicts, strata=strata, features=features,
+            name, arms, baseline=baseline, soak_items=soak_items, verdicts=verdicts,
+            strata=strata, features=features,
         )
-        for name, rows in arms.items()
+        for name in arms
     }
     return {
         'rubric': RUBRIC,
@@ -563,7 +620,7 @@ def _rate_of(block: Mapping[str, Any]) -> Any:
 
 
 def _arm_line(name: str, arm: Mapping[str, Any]) -> list[Any]:
-    score, paired, spend = arm['score'], arm['paired_vs_baseline'] or {}, arm['cost']
+    score, paired, spend = arm['score'], arm['paired_vs_baseline'] or {}, arm['cumulative_cost']
     harm = score['harm']
     return [
         name, _rate_of(score['m3']), score['m3']['population_interval95'],
@@ -591,11 +648,24 @@ def render_markdown(report: Mapping[str, Any]) -> str:
         '',
         '## Arms',
         '',
+        'The cost columns include the calls of the arms each arm builds on.',
+        '',
         *_table(
             ['arm', 'M3', 'M3 95%', 'ΔM3 vs base', 'Δ 95%', 'M1', 'M5', 'M2 contested',
              'M2 amended', 'false contests added', 'M4', 'harm Δ', 'calls/write', 'p50 s',
              'p95 s', 'fail-open', 'USD/1k judged'],
             (_arm_line(name, report['arms'][name]) for name in report['arm_order']),
+        ),
+        '',
+        '## Own cost of the arms built on a parent',
+        '',
+        *_table(
+            ['arm', 'parent', 'calls/write', 'p50 s', 'p95 s', 'fail-open', 'USD/1k judged'],
+            ([name, arm['provenance']['parent'], arm['cost']['calls_per_write'],
+              arm['cost']['p50_seconds'], arm['cost']['p95_seconds'], arm['cost']['fail_open'],
+              arm['cost']['usd_per_1000_judged_writes']]
+             for name in report['arm_order']
+             for arm in (report['arms'][name],) if arm['provenance']['parent'] is not None),
         ),
         '',
         '## Harness checks',
