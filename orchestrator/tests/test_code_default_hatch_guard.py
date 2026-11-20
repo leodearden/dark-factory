@@ -1198,6 +1198,10 @@ _ABSENT_CONFIG_PATH_IS_THE_PRECONDITION = frozenset({
      'TestEvalListFixturesCLI.test_needs_no_orchestrator_config'),
     ('test_code_default_hatch_guard.py',
      'TestRequireCodeDefaultConfig.test_fails_when_the_variable_is_unset'),
+    ('test_cli_config.py',
+     'test_missing_config_exits_1_with_the_error_and_never_runs_the_body'),
+    ('test_cli_config.py',
+     'test_every_config_loading_command_fails_the_same_way_without_a_config'),
 })
 
 

@@ -24,6 +24,7 @@ from _verify_merge_cli_fixtures import (
 from click.testing import CliRunner
 
 import orchestrator.cli as cli_module
+import orchestrator.cli_config as cli_config
 from orchestrator.cli import main
 from orchestrator.config import OrchestratorConfig
 
@@ -90,7 +91,7 @@ def test_verify_merge_cli_wrapper_transparency(tmp_path, monkeypatch, test_comma
 
     repo, head_sha = _setup_verify_repo(tmp_path)
     config = OrchestratorConfig(project_root=repo)
-    monkeypatch.setattr(cli_module, 'load_config', lambda _: config)
+    monkeypatch.setattr(cli_config, 'load_config', lambda _: config)
 
     # A dummy config file just to satisfy click.Path(exists=True)
     cfg_file = tmp_path / 'dummy.yaml'
@@ -147,7 +148,7 @@ def test_verify_merge_cleanup(tmp_path, monkeypatch):
 
     repo, head_sha = _setup_verify_repo(tmp_path)
     config = OrchestratorConfig(project_root=repo)
-    monkeypatch.setattr(cli_module, 'load_config', lambda _: config)
+    monkeypatch.setattr(cli_config, 'load_config', lambda _: config)
 
     cfg_file = tmp_path / 'dummy.yaml'
     cfg_file.write_text('')
@@ -206,7 +207,7 @@ def test_verify_merge_clean_error_contract(tmp_path, monkeypatch, bad_case):
 
     repo, head_sha = _setup_verify_repo(tmp_path)
     config = OrchestratorConfig(project_root=repo)
-    monkeypatch.setattr(cli_module, 'load_config', lambda _: config)
+    monkeypatch.setattr(cli_config, 'load_config', lambda _: config)
 
     cfg_file = tmp_path / 'dummy.yaml'
     cfg_file.write_text('')
@@ -809,7 +810,7 @@ def test_cancel_verify_unknown_id_exits_0(tmp_path, monkeypatch):
 
     # Minimal config: project_root -> tmp_path (worktree_base = tmp_path/.worktrees)
     fake_config = OrchestratorConfig(project_root=tmp_path)
-    monkeypatch.setattr(cli_module, 'load_config', lambda _: fake_config)
+    monkeypatch.setattr(cli_config, 'load_config', lambda _: fake_config)
 
     # GitOps mock returning a worktree_base that has no pgid file
     fake_worktree_base = tmp_path / '.worktrees'
@@ -852,7 +853,7 @@ def test_cancel_verify_rc_wiring(tmp_path, monkeypatch):
     monkeypatch.setattr(cli_module, 'cancel_request', fake_cancel_request)
 
     fake_config = OrchestratorConfig(project_root=tmp_path)
-    monkeypatch.setattr(cli_module, 'load_config', lambda _: fake_config)
+    monkeypatch.setattr(cli_config, 'load_config', lambda _: fake_config)
 
     mock_git_ops = MagicMock()
     mock_git_ops.worktree_base = fake_worktree_base
@@ -896,7 +897,7 @@ def test_cancel_verify_real_impl_dead_pgid(tmp_path, monkeypatch):
     write_pgid_file(pgf, NONEXISTENT_PID)
 
     fake_config = OrchestratorConfig(project_root=tmp_path)
-    monkeypatch.setattr(cli_module, 'load_config', lambda _: fake_config)
+    monkeypatch.setattr(cli_config, 'load_config', lambda _: fake_config)
 
     mock_git_ops = MagicMock()
     mock_git_ops.worktree_base = fake_worktree_base
@@ -1017,7 +1018,7 @@ def test_verify_merge_cancel_end_to_end(tmp_path, monkeypatch):
         pgid_val = int(pgf.read_text().strip())
 
         # --- Cancel via CliRunner (in-process, monkeypatched load_config) ---
-        monkeypatch.setattr(cli_module, 'load_config', lambda _: config_obj)
+        monkeypatch.setattr(cli_config, 'load_config', lambda _: config_obj)
         r = CliRunner().invoke(main, [
             'cancel-verify',
             '--request-id', REQUEST_ID,
