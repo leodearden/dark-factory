@@ -354,11 +354,17 @@ class TestEncoderLockstep:
                 assert got == expected_dir, f'{label} drifted from reality: {cwd}'
 
 
-def _write_session(dir_path: Path, session_id: str, cwd: str, timestamp: str = '2026-07-13T10:00:00.000Z'):
+def _write_session(
+    dir_path: Path, session_id: str, cwd: str, timestamp: str = '2026-07-13T10:00:00.000Z',
+    **record_fields: str,
+):
     dir_path.mkdir(parents=True, exist_ok=True)
     session_path = dir_path / f'{session_id}.jsonl'
     lines = [
-        {'type': 'user', 'cwd': cwd, 'timestamp': timestamp, 'message': {'content': 'hello'}},
+        {
+            'type': 'user', 'cwd': cwd, 'timestamp': timestamp, 'message': {'content': 'hello'},
+            **record_fields,
+        },
     ]
     session_path.write_text('\n'.join(json.dumps(line) for line in lines) + '\n')
     return session_path
@@ -991,3 +997,46 @@ class TestArchiveEncPrefilter:
         assert sub_path in opened
         record = next(r for r in records if r.path.name == 'agent-x.jsonl')
         assert record.encoded_dir == self.WT_ENC
+
+
+class TestMainListsArchiveRoots:
+    """The CLI lists archived sessions, recon runs included, with each line's identity."""
+
+    def _main(self, tmp_path: Path, *extra: str) -> int:
+        return mod.main([
+            '--projects-root', str(tmp_path / 'no-projects'),
+            '--cwd-prefix', MAIN_CWD, '--date', '2026-07-13', *extra,
+        ])
+
+    def _archive_recon_session(self, tmp_path: Path) -> Path:
+        archive = tmp_path / 'archive'
+        _write_session(
+            archive / 'recon-58620773' / '-home-leo-src-dark-factory', 'sid-r', MAIN_CWD,
+            sessionId='sid-r',
+        )
+        return archive
+
+    def test_lists_a_recon_session_by_run_id_with_its_identity(self, tmp_path, capsys):
+        archive = self._archive_recon_session(tmp_path)
+        assert self._main(tmp_path, '--agent-transcript-root', str(archive)) == 0
+        lines = capsys.readouterr().out.splitlines()
+        assert len(lines) == 1
+        assert 'recon-58620773' in lines[0]
+        assert lines[0].split('\t')[-2:] == ['sid-r', '']
+
+    def test_without_an_archive_root_the_archive_is_not_listed(self, tmp_path, capsys):
+        self._archive_recon_session(tmp_path)
+        assert self._main(tmp_path) == 0
+        assert capsys.readouterr().out == ''
+
+    def test_a_subagent_line_names_its_parent_last(self, tmp_path, capsys):
+        projects_root = tmp_path / 'projects'
+        _write_session(
+            projects_root / '-home-leo-src-dark-factory' / 'psid' / 'subagents', 'agent-a1',
+            MAIN_CWD, sessionId='psid', agentId='a1',
+        )
+        assert mod.main([
+            '--projects-root', str(projects_root), '--cwd-prefix', MAIN_CWD, '--date', '2026-07-13',
+        ]) == 0
+        (line,) = capsys.readouterr().out.splitlines()
+        assert line.split('\t')[-2:] == ['psid/subagents/agent-a1', 'psid']
