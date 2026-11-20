@@ -102,6 +102,7 @@ from orchestrator.lane_attach import (
     check_out_branch_over_foreign_head,
     describe_head,
     head_relation,
+    restore_branch_tip,
 )
 from orchestrator.lane_branch_holder import (
     BranchCheckedOutElsewhere,
@@ -2090,8 +2091,11 @@ class BranchResetError(RuntimeError):
 
     ``step`` names what was refused.  :attr:`GuardedStep.RESUME_ATTACH` is
     raised by ``GitOps._reuse_warm_lane`` when re-attaching a resumed lane
-    lost commits the branch carried (task 10991); there *pre_rebase_head* is
-    the branch tip on entry and *n_before* its commits over main.
+    lost commits the branch carried (task 10991).  That attach has already
+    run, so the message says it was undone, not refused; *pre_rebase_head* is
+    the branch's entry tip, the commit restored, and *n_before* its commits
+    over main.  Its restore is ``git reset --keep``, and only while the lane
+    is on the branch (``orchestrator/src/orchestrator/lane_attach.py::restore_branch_tip``).
     """
 
     def __init__(
@@ -2111,25 +2115,30 @@ class BranchResetError(RuntimeError):
         self.restore_ok = restore_ok
         self.step = step
         if step is GuardedStep.RESUME_ATTACH:
+            lead = 'Undid' if restore_ok else 'Could not undo'
             loss = (
-                f're-attaching the lane on resume dropped commits the branch '
-                f'carried ({n_before} commit(s) over main at {pre_rebase_head})'
+                f'it dropped commits the branch carried ({n_before} commit(s) '
+                f'over main at its entry tip {pre_rebase_head})'
             )
+            restored = f'the branch to its entry tip {pre_rebase_head}'
+            why_not = "the lane was not on the branch or 'git reset --keep' refused"
         else:
+            lead = 'Refusing'
             loss = (
                 f'it would collapse the branch from {n_before} commit(s) over '
                 f'main to 0 (onto={onto})'
             )
+            restored = f'pre-rebase HEAD {pre_rebase_head}'
+            why_not = "the recovery 'git reset --hard' itself failed"
         if restore_ok:
-            restore_note = f'restored pre-rebase HEAD {pre_rebase_head}'
+            restore_note = f'restored {restored}'
         else:
             restore_note = (
-                f'FAILED TO RESTORE pre-rebase HEAD {pre_rebase_head} — the '
-                f"recovery 'git reset --hard' itself failed, so the task's "
+                f"FAILED TO RESTORE {restored} — {why_not}, so the task's "
                 f'work may still be lost from the worktree; recover '
                 f'manually from git reflog before proceeding'
             )
-        super().__init__(f'Refusing {step.value} in {worktree}: {loss}; {restore_note}')
+        super().__init__(f'{lead} {step.value} in {worktree}: {loss}; {restore_note}')
 
 
 class _ParkedBranchStranded(RuntimeError):
@@ -8647,7 +8656,7 @@ class GitOps:
         #    the rebase guard in step 3 measures from after it.
         entry_tip = await branch_tip(_run, lane_dir, full_branch)
         await self._attach_lane_to_branch(lane_dir, full_branch)
-        await self._restore_if_attach_dropped_commits(lane_dir, entry_tip)
+        await self._restore_if_attach_dropped_commits(lane_dir, full_branch, entry_tip)
 
         # 2. Commit WIP (returns None if nothing to commit — that's fine)
         await self.commit(lane_dir, 'chore: save WIP before requeue rebase')
@@ -8693,14 +8702,16 @@ class GitOps:
         is a foreign commit: the branch is checked out over it unmoved, or
         ``RuntimeError`` is raised when that would discard tracked changes
         (``orchestrator/src/orchestrator/lane_attach.py::check_out_branch_over_foreign_head``).
+        HEAD is classified once, and the rebind acts on that classification.
         """
-        if await head_relation(_run, lane_dir, full_branch) is HeadRelation.FOREIGN:
+        relation = await head_relation(_run, lane_dir, full_branch)
+        if relation is HeadRelation.FOREIGN:
             await check_out_branch_over_foreign_head(_run, lane_dir, full_branch)
             return
-        await self.rebind_branch_to_head(lane_dir, full_branch)
+        await self.rebind_branch_to_head(lane_dir, full_branch, relation=relation)
 
     async def _restore_if_attach_dropped_commits(
-        self, lane_dir: Path, entry_tip: str | None,
+        self, lane_dir: Path, full_branch: str, entry_tip: str | None,
     ) -> None:
         """Restore *entry_tip* and raise if the attach left HEAD without it.
 
@@ -8709,7 +8720,9 @@ class GitOps:
         task/10089, task 10991).  Containment of the branch's entry tip in
         HEAD spans exactly the attach.  An unreadable answer counts as
         dropped, failing toward restore as 2403 does for an unmeasurable
-        count.
+        count.  The WIP commit runs after this, so the restore must keep
+        uncommitted work and move only *full_branch*
+        (``orchestrator/src/orchestrator/lane_attach.py::restore_branch_tip``).
         """
         if entry_tip is None:
             return
@@ -8721,10 +8734,10 @@ class GitOps:
             cwd=lane_dir,
         )
         n_carried = int(count.strip()) if rc == 0 and count.strip().isdigit() else 0
-        reset_rc, _, _ = await _run(['git', 'reset', '--hard', entry_tip], cwd=lane_dir)
+        restored = await restore_branch_tip(_run, lane_dir, full_branch, entry_tip)
         raise BranchResetError(
             lane_dir, None, entry_tip, n_carried,
-            restore_ok=reset_rc == 0, step=GuardedStep.RESUME_ATTACH,
+            restore_ok=restored, step=GuardedStep.RESUME_ATTACH,
         )
 
     async def _rebase_requeued_onto_main(
@@ -8762,7 +8775,9 @@ class GitOps:
             return False
         return await self.rebase_preserving_task_commits(worktree)
 
-    async def rebind_branch_to_head(self, worktree: Path, full_branch: str) -> bool:
+    async def rebind_branch_to_head(
+        self, worktree: Path, full_branch: str, *, relation: HeadRelation | None = None,
+    ) -> bool:
         """Rebind *full_branch* to *worktree*'s HEAD, only forward or in place.
 
         Acts only when HEAD is already on *full_branch*, or detached at its tip
@@ -8772,7 +8787,9 @@ class GitOps:
         which moves the ref to HEAD and attaches the lane, keeping the working
         tree.  Any other HEAD is refused with a WARNING and False, because
         adopting it resets the branch to a commit that is not its own: reify
-        task/10089 lost its work that way (task 10991).
+        task/10089 lost its work that way (task 10991).  *relation* is HEAD's
+        classification when the caller has just made it; it is probed here
+        otherwise.
 
         **Best-effort / never-raise** (task-1923 live-requeue residual fix):
         ``git checkout -B`` bypasses git's linked-worktree single-checkout
@@ -8786,7 +8803,9 @@ class GitOps:
         Returns:
             True when the branch was rebound; False when refused or git failed.
         """
-        if await head_relation(_run, worktree, full_branch) is HeadRelation.FOREIGN:
+        if relation is None:
+            relation = await head_relation(_run, worktree, full_branch)
+        if relation is HeadRelation.FOREIGN:
             logger.warning(
                 'rebind_branch_to_head: refusing to rebind %s (tip %s) to HEAD '
                 '%s of %s: HEAD is neither on the branch nor at or past its tip',

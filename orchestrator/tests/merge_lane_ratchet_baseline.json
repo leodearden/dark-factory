@@ -87,7 +87,7 @@
     "complete": true
   },
   "files": {
-    "orchestrator/src/orchestrator/git_ops.py": {"cognitive": 1551, "function_local_imports": 4, "lines": 17122, "prose_lines": 9694, "reexport_names": 1},
+    "orchestrator/src/orchestrator/git_ops.py": {"cognitive": 1554, "function_local_imports": 4, "lines": 17141, "prose_lines": 9702, "reexport_names": 1},
     "orchestrator/src/orchestrator/lane_lifecycle.py": {"cognitive": 58, "function_local_imports": 1, "lines": 868, "prose_lines": 359, "reexport_names": 0},
     "orchestrator/src/orchestrator/merge_lane/__init__.py": {"cognitive": 1, "function_local_imports": 0, "lines": 228, "prose_lines": 22, "reexport_names": 0},
     "orchestrator/src/orchestrator/merge_lane/chain_policy.py": {"cognitive": 24, "function_local_imports": 0, "lines": 125, "prose_lines": 18, "reexport_names": 0},
@@ -143,7 +143,7 @@
     "orchestrator/tests/conftest.py": {"cognitive": 55, "function_local_imports": 8, "lines": 1260, "prose_lines": 737, "reexport_names": 0}
   },
   "functions": {
-    "orchestrator/src/orchestrator/git_ops.py::BranchResetError::__init__": 4,
+    "orchestrator/src/orchestrator/git_ops.py::BranchResetError::__init__": 6,
     "orchestrator/src/orchestrator/git_ops.py::CitationPatternInvalid::__init__": 0,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::__init__": 6,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_abort_lane_acquisition": 20,
@@ -344,7 +344,7 @@
     "orchestrator/src/orchestrator/git_ops.py::GitOps::reap_merge_verify_survivors": 8,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::rebase_onto_main": 3,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::rebase_preserving_task_commits": 24,
-    "orchestrator/src/orchestrator/git_ops.py::GitOps::rebind_branch_to_head": 2,
+    "orchestrator/src/orchestrator/git_ops.py::GitOps::rebind_branch_to_head": 3,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::reclaim_worktree_build_artifacts": 9,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::recover_red_main": 31,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::refresh_warm_base": 11,

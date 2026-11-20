@@ -149,3 +149,30 @@ async def _keep_tracked_changes(run: GitRunner, worktree: Path) -> Path | None:
         )
         return None
     return kept
+
+
+async def restore_branch_tip(
+    run: GitRunner, worktree: Path, full_branch: str, tip: str,
+) -> bool:
+    """Move *full_branch* back to *tip* in *worktree*, keeping uncommitted work.
+
+    Only while HEAD is attached to *full_branch*: a reset moves whichever
+    branch HEAD names, and no other is this task's to move.  ``reset --keep``
+    refuses, rather than discards, local changes the move would overwrite.
+    Answers whether the branch is back at *tip*; each refusal is logged at
+    WARNING with its reason.
+    """
+    if await head_relation(run, worktree, full_branch) is not HeadRelation.ON_BRANCH:
+        logger.warning(
+            'Not restoring %s to %s in %s: HEAD %s is not on that branch, and a '
+            'reset would move whichever branch it is on.',
+            full_branch, tip, worktree, await describe_head(run, worktree),
+        )
+        return False
+    rc, _, err = await run(['git', 'reset', '--keep', tip], cwd=worktree)
+    if rc != 0:
+        logger.warning(
+            "Could not restore %s to %s in %s: 'git reset --keep' refused: %s",
+            full_branch, tip, worktree, err.strip(),
+        )
+    return rc == 0
