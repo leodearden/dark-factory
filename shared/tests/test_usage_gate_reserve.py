@@ -120,6 +120,23 @@ def stub_probe(gate: UsageGate, answer: Callable[[AccountState], bool]) -> None:
     gate._run_probe = AsyncMock(side_effect=answer)
 
 
+def make_reopening_gate(
+    tmp_path: Path, reopens: str, *, cost_store: CostStore | None = None, **cfg: object
+) -> UsageGate:
+    """On the virtual clock, the resume probe reopens *reopens* alone, one virtual second after
+    it is capped with no reset time, and no host stall can move that."""
+    gate = make_reserve_gate(
+        tmp_path,
+        clock=FakeClock(),
+        cost_store=cost_store,
+        wait_for_reset=True,
+        probe_interval_secs=1,
+        **cfg,
+    )
+    stub_probe(gate, lambda acct: acct.name == reopens)
+    return gate
+
+
 def lease_only(gate: UsageGate, name: str) -> AccountLease:
     lease = gate.try_lease(
         exclude=[other for other in ACCOUNTS if other != name], work_class=ESSENTIAL
@@ -966,16 +983,15 @@ class TestTransitionsWakeTheWait:
         assert await events(store, 'reserve_wait_ended') == []
         await cancel(waiter)
 
+    @virtual_clock_test
     async def test_b14_a_scope_capped_account_opening_sends_the_waiter_to_the_scope_wait(
         self, tmp_path: Path
     ) -> None:
         store = make_mock_cost_store()
-        gate = make_reserve_gate(
-            tmp_path, clock=FakeClock(), cost_store=store, wait_for_reset=True
-        )
+        gate = make_reopening_gate(tmp_path, 'max-d', cost_store=store)
         cap_all_but(gate, 'max-d', RESERVE)
         cap(gate, 'max-d', scope=SCOPE, resets_at=datetime.now(UTC) + timedelta(hours=1))
-        cap(gate, 'max-d', resets_at=soon())
+        cap(gate, 'max-d')
 
         waiter = asyncio.create_task(gate.before_invoke(SCOPE, work_class=LOW))
         await let_run()
