@@ -15,9 +15,9 @@ real Claude Code JSONL schema (observed in
 
 Every helper below returns a plain dict (or writes one) — no behavior, pure
 scaffolding reused by every test class in this file. Import the target
-module as `import digest as mod`, resolved via scripts/tests/conftest.py's
-sys.path insertion (both scripts/ and scripts/legibility/ are on sys.path;
-no package __init__ needed).
+module as `from legibility import digest as mod`, the one spelling every
+legibility module is reached by (scripts/ is on sys.path via
+scripts/tests/conftest.py; no package __init__ needed).
 """
 from __future__ import annotations
 
@@ -26,10 +26,10 @@ import logging
 import re
 from pathlib import Path
 
-import digest as mod
 import pytest
 import yaml
 from legibility import detectors, reingestion
+from legibility import digest as mod
 from legibility import inventory as inventory_mod
 from legibility_carrier_fixtures import (
     CENSUS_MEMORY_CONTEXT_TURN,

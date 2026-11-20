@@ -3,8 +3,8 @@ formatting, and order_queue's queue-build/sort (Fleet Cockpit C5b, PRD §9).
 
 Pure, deterministic unit tests only -- no Textual import, no pilot. The
 DecisionQueue(DataTable) widget itself is covered by test_app.py's pilot
-tests (a later C5b step). Mirrors test_registry_reader.py/test_app.py's
-_make_record convention: a fields dict + .update(overrides).
+tests (a later C5b step). Mirrors test_registry_reader.py::_make_record and
+_cockpit_session_records.py::make_record: a fields dict + .update(overrides).
 """
 
 from __future__ import annotations
@@ -76,7 +76,7 @@ def _make_decision(**overrides):
 
 
 def _make_session(**overrides):
-    """Mirrors test_app.py/test_registry_reader.py's _make_record convention."""
+    """Mirrors _cockpit_session_records.py::make_record and test_registry_reader.py::_make_record."""
     fields: dict = {
         'session_slug': 'unblock-df-2085-4242',
         'status': session_records.Status.RUNNING,

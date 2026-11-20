@@ -136,7 +136,7 @@ _PERMANENT_PRIVATE_SWEEPS = MappingProxyType({
 _OUTSIDE_THE_SHARED_PASS = MappingProxyType({
     'test_merge_lane_ratchet.py': (
         'a complexipy whole-repo measurement through _merge_lane_census, not an '
-        'AST sweep of a tree; task 6986 owns separating it from the family'
+        'AST sweep of a tree; task 9396 owns its family membership'
     ),
 })
 
@@ -153,7 +153,7 @@ OUTSIDE_THE_SHARED_PASS_DECLARATION = governed_exceptions(
     'A whole-tree guard family member that neither sweeps a tree privately nor '
     'consumes the shared tree pass.',
     _OUTSIDE_THE_SHARED_PASS.keys(),
-    default=Debt(TaskRef(6986)),
+    default=Debt(TaskRef(9396)),
     default_covers=1,
 )
 
@@ -167,8 +167,8 @@ OUTSIDE_THE_SHARED_PASS_DECLARATION = governed_exceptions(
 # measured on code since replaced retires with that code.  Corpus:
 # plans/pytest-per-test-timeout-measurement-2026-09-17.md.  That fixture is a
 # whole-repo complexity measurement rather than an AST sweep of this tree, so
-# one member's cost sets the ceiling for the whole family; task 6986 owns
-# separating it.
+# one member's cost sets the ceiling for the whole family; task 9396 owns
+# family membership and ceiling sizing.
 _MEASURED_UNDER_LOAD_WORST_CASE = 148.65
 
 # ABSOLUTE floor in seconds: the measured worst case above times

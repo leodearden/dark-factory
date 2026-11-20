@@ -9,7 +9,7 @@ Mirrors session_table.py's/decision_queue.py's own "pure helpers + widget in
 one module" convention: build_spawn_forest is fast/deterministic to unit
 test directly (no pilot, no event loop) -- only the SpawnTree widget and
 SpawnTreeScreen require a running Textual app, and are covered by
-test_app.py's pilot tests instead.
+test_app_spawn.py's pilot tests instead.
 """
 
 from __future__ import annotations

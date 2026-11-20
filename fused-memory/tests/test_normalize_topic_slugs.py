@@ -22,8 +22,8 @@ import argparse
 import ast
 import contextlib
 import copy
-import dataclasses
 import json
+import subprocess
 import sys
 import types
 from pathlib import Path
@@ -37,8 +37,23 @@ from _store_mutation_preflight_contract import (
     fail_closed_records,
     neutralise_fixture,
 )
+from _topic_slug_migration_doubles import (
+    by_reason,
+    census_client,
+    fail_writes_moving_back_to,
+    gate_task,
+    mcp_client,
+    rec,
+    refuse_writes_to,
+    result_row,
+    task_listing,
+    write_boundary_service,
+)
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
+from fused_memory.maintenance.topic_slug_gates import GateCensus, pair_gate_blocks
+from fused_memory.maintenance.topic_slug_plan import Rename, plan_renames
+from fused_memory.reconciliation.consolidation_gate import GATE_METADATA_KEY
 from fused_memory.utils.store_mutation_preflight import StoreMutationUnavailable
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
@@ -60,444 +75,9 @@ _neutralise = neutralise_fixture(
 )
 
 
-# ---------------------------------------------------------------------------
-# Record fixtures — the shape ``scroll_all_by_metadata`` actually yields
-# ---------------------------------------------------------------------------
-
-def _rec(memory_id: str, topic: object = None, **meta) -> dict:
-    """One scroll-shaped record.
-
-    ``topic=None`` means "no ``topic`` key at all", which is a genuinely
-    different case from ``topic`` present-and-``None`` — the caller spells the
-    latter explicitly via ``metadata``.
-    """
-    metadata: dict = dict(meta)
-    if topic is not None:
-        metadata['topic'] = topic
-    return {'id': memory_id, 'created_at': '2026-01-01T00:00:00Z', 'metadata': metadata}
-
-
-def _by_reason(skips: list[dict], reason: str) -> list[dict]:
-    return [s for s in skips if s.get('reason') == reason]
-
-
 # ===========================================================================
-# plan_renames — the pure planner
+# plan_renames' refusals, as the script grades them
 # ===========================================================================
-
-class TestPlanRenames:
-    """``plan_renames(records, *, project_id) -> (renames, skips)``.
-
-    Pure: it takes plain scroll-shaped dicts and no service, so a wrong answer
-    here can never be masked by a mock.  It decides what the migration WOULD
-    do; nothing in it touches a store.
-    """
-
-    def test_non_conforming_topic_that_folds_yields_one_rename(self):
-        renames, skips = _mod.plan_renames(
-            [_rec('m1', 'mem0_tombstone_coverage')], project_id='dark_factory',
-        )
-        assert skips == []
-        assert len(renames) == 1
-        (rename,) = renames
-        assert rename.project_id == 'dark_factory'
-        assert rename.memory_id == 'm1'
-        assert rename.old_topic == 'mem0_tombstone_coverage'
-        assert rename.new_topic == 'mem0-tombstone-coverage'
-
-    def test_rename_is_frozen(self):
-        """A plan row must not be mutated between planning and writing.
-
-        The whole point of planning the corpus before touching it is that the
-        artifact and the writes agree; a mutable row lets them diverge.
-        """
-        (rename,), _ = _mod.plan_renames(
-            [_rec('m1', 'a_b')], project_id='dark_factory',
-        )
-        with pytest.raises(dataclasses.FrozenInstanceError):
-            rename.new_topic = 'something-else'  # type: ignore[misc]
-
-    def test_conforming_topic_is_neither_a_rename_nor_a_skip(self):
-        """Already-good is not work, and a skip line would MISREPORT it.
-
-        Most of the corpus conforms.  Filing each conforming record as a skip
-        would bury the ~141 records that actually need attention under tens of
-        thousands of lines saying "nothing to do" — and would make the skip
-        buckets, which exist to surface coverage holes, unreadable.
-        """
-        renames, skips = _mod.plan_renames(
-            [_rec('m1', 'already-good'), _rec('m2', 'x1-2y')],
-            project_id='dark_factory',
-        )
-        assert renames == []
-        assert skips == []
-
-    def test_record_without_a_topic_key_is_ignored_entirely(self):
-        """No ``topic`` is retro_stamp_topics' job, not this script's.
-
-        This sweep NORMALIZES the value of a topic that exists; stamping one
-        onto a record that carries none is the bounded sibling's job, and
-        claiming it here would double-report the same corpus gap in two
-        artifacts with two different definitions of it.
-        """
-        renames, skips = _mod.plan_renames(
-            [_rec('m1'), _rec('m2', canonical=True)], project_id='dark_factory',
-        )
-        assert renames == []
-        assert skips == []
-
-    def test_topic_present_but_none_is_ignored_entirely(self):
-        """A null ``topic`` is an absent topic, not a malformed one.
-
-        ``derive_topic_slug(None)`` is ``None``, so without this case a null
-        would land in the ``topic_unfoldable`` bucket and read as a value a
-        human needs to adjudicate — when in fact there is nothing there.
-        """
-        renames, skips = _mod.plan_renames(
-            [{'id': 'm1', 'created_at': None, 'metadata': {'topic': None}}],
-            project_id='dark_factory',
-        )
-        assert renames == []
-        assert skips == []
-
-    def test_unfoldable_topic_is_a_skip_naming_the_raw_value(self):
-        """No honest fold exists — report it, never guess one.
-
-        The skip has to carry the RAW value: an operator resolving this by
-        hand needs to see what is actually on the record, and the whole
-        reason it is here is that the script refused to name a slug for it.
-        """
-        renames, skips = _mod.plan_renames(
-            [_rec('m1', '!!!')], project_id='dark_factory',
-        )
-        assert renames == []
-        entries = _by_reason(skips, 'topic_unfoldable')
-        assert len(entries) == 1
-        entry = entries[0]
-        assert entry['project_id'] == 'dark_factory'
-        assert entry['memory_id'] == 'm1'
-        assert entry['topic'] == '!!!'
-        assert 'new_topic' not in entry, 'a refusal must not carry a guessed slug'
-
-    def test_over_long_topic_is_unfoldable_not_truncated(self):
-        """The cap refuses rather than repairs — pinned at the planner too.
-
-        ``derive_topic_slug`` already returns ``None`` here, but the planner
-        is where that ``None`` becomes an operator-visible line rather than a
-        silently dropped record.
-        """
-        over = 'a' * 101
-        renames, skips = _mod.plan_renames(
-            [_rec('m1', over)], project_id='dark_factory',
-        )
-        assert renames == []
-        assert _by_reason(skips, 'topic_unfoldable')[0]['topic'] == over
-
-    def test_non_str_topic_is_unfoldable(self):
-        """Untrusted values come straight off live records."""
-        renames, skips = _mod.plan_renames(
-            [{'id': 'm1', 'created_at': None, 'metadata': {'topic': 42}}],
-            project_id='dark_factory',
-        )
-        assert renames == []
-        assert _by_reason(skips, 'topic_unfoldable')[0]['topic'] == 42
-
-    def test_an_unfoldable_entry_names_the_value_type(self):
-        """In markdown, ``topic=42`` and ``topic='42'`` differ only by quote marks."""
-        _, skips = _mod.plan_renames(
-            [_rec('m1', '!!!'), _rec('m2', 42), _rec('m3', ['a'])],
-            project_id='dark_factory',
-        )
-        assert [
-            (s['memory_id'], s['topic'], s['topic_type'])
-            for s in _by_reason(skips, 'topic_unfoldable')
-        ] == [('m1', '!!!', 'str'), ('m2', 42, 'int'), ('m3', ['a'], 'list')]
-
-    def test_many_records_sharing_one_legacy_slug_each_get_a_rename(self):
-        """One legacy VALUE can sit on many records; each needs its own write.
-
-        The distinct-value count is what the baseline delta grades (item 4);
-        the per-record count is what the write loop does.  Conflating them is
-        how a migration reports "1 topic normalized" and leaves 7 records
-        behind.
-        """
-        renames, _ = _mod.plan_renames(
-            [_rec(f'm{i}', 'shared_legacy') for i in range(8)],
-            project_id='dark_factory',
-        )
-        assert len(renames) == 8
-        assert {r.new_topic for r in renames} == {'shared-legacy'}
-
-    def test_output_is_sorted_for_a_clean_diff(self):
-        """Sorted by ``(project_id, new_topic, memory_id)``.
-
-        Two dry runs over an unchanged corpus must produce byte-comparable
-        artifacts, and scroll order is not stable.  Without this an operator
-        diffing consecutive rehearsals sees churn that means nothing.
-        """
-        renames, _ = _mod.plan_renames(
-            [
-                _rec('m9', 'zeta_topic'),
-                _rec('m2', 'alpha_topic'),
-                _rec('m1', 'zeta_topic'),
-                _rec('m5', 'alpha_topic'),
-            ],
-            project_id='dark_factory',
-        )
-        assert [(r.new_topic, r.memory_id) for r in renames] == [
-            ('alpha-topic', 'm2'),
-            ('alpha-topic', 'm5'),
-            ('zeta-topic', 'm1'),
-            ('zeta-topic', 'm9'),
-        ]
-
-    def test_skips_are_sorted_too(self):
-        """Same argument as the renames: a rehearsal diff must be readable."""
-        _, skips = _mod.plan_renames(
-            [_rec('m9', '!!!'), _rec('m1', '???')], project_id='dark_factory',
-        )
-        assert [s['memory_id'] for s in _by_reason(skips, 'topic_unfoldable')] == [
-            'm1', 'm9',
-        ]
-
-    def test_record_without_an_id_is_skipped_not_planned(self):
-        """A row with no id cannot be written to; refuse it loudly.
-
-        ``update_memory`` is addressed by memory id.  A record whose id is
-        missing or empty would otherwise reach the write boundary and fail
-        there, one row at a time, inside a report that already claimed it as
-        planned work.
-        """
-        renames, skips = _mod.plan_renames(
-            [{'id': '', 'created_at': None, 'metadata': {'topic': 'a_b'}}],
-            project_id='dark_factory',
-        )
-        assert renames == []
-        assert len(_by_reason(skips, 'record_without_id')) == 1
-
-    def test_empty_input_is_empty_output(self):
-        assert _mod.plan_renames([], project_id='dark_factory') == ([], [])
-
-
-# ===========================================================================
-# Collision classification — the most dangerous case in the migration
-# ===========================================================================
-
-class TestSlugCollision:
-    """A fold that lands on an OCCUPIED slug is refused, never merged.
-
-    Renaming ``foo_bar`` to ``foo-bar`` when records already carry
-    ``foo-bar`` is not a normalization — it MERGES two topic namespaces,
-    changing cluster membership for records this migration never examined.
-
-    Worse, ``topic`` is what SCOPES canonical uniqueness
-    (``memory_service._check_canonical_uniqueness`` probes
-    ``{'topic': T, 'canonical': True}``), so merging two clusters that each
-    hold a canonical manufactures exactly the second canonical that invariant
-    exists to prevent.  Under the shipped ``memory_metadata.enforce = false``
-    the service seam WARN-fails open, so it would land silently — and this
-    script would be the thing that created it.
-
-    Refusing makes the verdict a property of the CORPUS rather than of scroll
-    order.  That is the same posture ``retro_stamp_topics.stamp_one`` takes for
-    ``stray_canonical_on_member``, for the same fail-closed-because-unattended
-    -and-bulk reason.
-    """
-
-    def test_fold_onto_an_occupied_slug_is_refused(self):
-        renames, skips = _mod.plan_renames(
-            [
-                _rec('m1', 'foo_bar'),
-                _rec('m2', 'foo_bar'),
-                _rec('incumbent', 'foo-bar'),
-            ],
-            project_id='dark_factory',
-        )
-        assert renames == [], 'the merge must not be planned'
-        entries = _by_reason(skips, 'slug_collision')
-        assert len(entries) == 1, 'one entry per collision, not one per record'
-        entry = entries[0]
-        assert entry['project_id'] == 'dark_factory'
-        assert entry['old_topic'] == 'foo_bar'
-        assert entry['new_topic'] == 'foo-bar'
-        assert entry['colliding_count'] == 2
-        assert entry['memory_ids'] == ['m1', 'm2']
-
-    def test_the_incumbent_records_are_left_alone(self):
-        """The incumbent already conforms — it is not the migration's business.
-
-        It appears in the skip only as the REASON for the refusal.  Touching
-        it would be the very namespace merge being refused, in the other
-        direction.
-        """
-        renames, _ = _mod.plan_renames(
-            [_rec('m1', 'foo_bar'), _rec('incumbent', 'foo-bar')],
-            project_id='dark_factory',
-        )
-        assert 'incumbent' not in [r.memory_id for r in renames]
-
-    def test_collision_is_scoped_per_project(self):
-        """``foo-bar`` in reify does not block ``foo_bar`` in dark_factory.
-
-        Topics are per-corpus; a cross-project "collision" is two unrelated
-        clusters that happen to share a name, and refusing on it would strand
-        real work for no reason.  ``plan_renames`` sees one project at a time,
-        so this is pinned by construction — the test guards the construction.
-        """
-        renames, skips = _mod.plan_renames(
-            [_rec('m1', 'foo_bar')], project_id='dark_factory',
-        )
-        assert [r.new_topic for r in renames] == ['foo-bar']
-        assert skips == []
-
-    def test_two_legacy_slugs_folding_to_one_target_is_a_collision(self):
-        """``foo_bar`` and ``foo.bar`` both fold to ``foo-bar`` — refuse BOTH.
-
-        Never resolved by scroll order.  Letting the first one through would
-        make the outcome depend on which page the backend returned first, and
-        would leave the second refused for a reason ("occupied") this script
-        itself manufactured a moment earlier.
-        """
-        renames, skips = _mod.plan_renames(
-            [_rec('m1', 'foo_bar'), _rec('m2', 'foo.bar')],
-            project_id='dark_factory',
-        )
-        assert renames == []
-        entries = _by_reason(skips, 'slug_collision')
-        assert len(entries) == 2, 'both source slugs are refused'
-        assert sorted(e['old_topic'] for e in entries) == ['foo.bar', 'foo_bar']
-        assert {e['new_topic'] for e in entries} == {'foo-bar'}
-
-    def test_two_legacy_slugs_refusal_is_order_independent(self):
-        """Reversing the input must not change the verdict for either slug."""
-        forward, _ = _mod.plan_renames(
-            [_rec('m1', 'foo_bar'), _rec('m2', 'foo.bar')],
-            project_id='dark_factory',
-        )
-        reverse, _ = _mod.plan_renames(
-            [_rec('m2', 'foo.bar'), _rec('m1', 'foo_bar')],
-            project_id='dark_factory',
-        )
-        assert forward == reverse == []
-
-    def test_an_unrelated_clean_rename_still_proceeds(self):
-        """A refusal is scoped to its slug, not to the whole run.
-
-        ~141 records need this migration; one unresolvable collision must not
-        strand the rest.
-        """
-        renames, skips = _mod.plan_renames(
-            [
-                _rec('m1', 'foo_bar'),
-                _rec('incumbent', 'foo-bar'),
-                _rec('m3', 'clean_topic'),
-            ],
-            project_id='dark_factory',
-        )
-        assert [(r.memory_id, r.new_topic) for r in renames] == [
-            ('m3', 'clean-topic'),
-        ]
-        assert len(_by_reason(skips, 'slug_collision')) == 1
-
-
-class TestCanonicalCollision:
-    """The severe case: a merge that would manufacture a second canonical.
-
-    Distinct from ``slug_collision`` because the consequence is different in
-    kind.  A plain namespace merge changes cluster membership; a merge across
-    two clusters that EACH hold a ``canonical: true`` record violates the
-    uniqueness invariant ``_check_canonical_uniqueness`` exists to hold — and
-    does so through a seam that warn-fails OPEN under the shipped
-    ``enforce = false``, so nothing downstream would object.
-
-    Reported separately so an operator triaging the artifact can see at a
-    glance which refusals are bookkeeping and which are corruption avoided.
-    """
-
-    def test_two_canonicals_across_the_merge_is_the_severe_outcome(self):
-        renames, skips = _mod.plan_renames(
-            [
-                _rec('legacy-canon', 'foo_bar', canonical=True),
-                _rec('legacy-member', 'foo_bar'),
-                _rec('incumbent-canon', 'foo-bar', canonical=True),
-            ],
-            project_id='dark_factory',
-        )
-        assert renames == []
-        assert _by_reason(skips, 'slug_collision') == [], (
-            'the severe outcome must not ALSO be filed as the mild one'
-        )
-        entries = _by_reason(skips, 'canonical_collision')
-        assert len(entries) == 1
-        entry = entries[0]
-        assert entry['project_id'] == 'dark_factory'
-        assert entry['old_topic'] == 'foo_bar'
-        assert entry['new_topic'] == 'foo-bar'
-        assert entry['old_canonical_ids'] == ['legacy-canon']
-        assert entry['new_canonical_ids'] == ['incumbent-canon']
-
-    def test_only_the_source_side_canonical_is_the_mild_outcome(self):
-        """One canonical across the merge does not violate uniqueness.
-
-        The merged cluster would still hold exactly one, so the refusal is
-        the ordinary namespace-merge one — reported, but not escalated to the
-        severe bucket, which would cry wolf and devalue the real cases.
-        """
-        _, skips = _mod.plan_renames(
-            [
-                _rec('legacy-canon', 'foo_bar', canonical=True),
-                _rec('incumbent', 'foo-bar'),
-            ],
-            project_id='dark_factory',
-        )
-        assert len(_by_reason(skips, 'slug_collision')) == 1
-        assert _by_reason(skips, 'canonical_collision') == []
-
-    def test_only_the_target_side_canonical_is_the_mild_outcome(self):
-        _, skips = _mod.plan_renames(
-            [
-                _rec('legacy', 'foo_bar'),
-                _rec('incumbent-canon', 'foo-bar', canonical=True),
-            ],
-            project_id='dark_factory',
-        )
-        assert len(_by_reason(skips, 'slug_collision')) == 1
-        assert _by_reason(skips, 'canonical_collision') == []
-
-    def test_two_legacy_slugs_each_canonical_is_also_severe(self):
-        """The two-legacy-slugs collision escalates the same way.
-
-        ``foo_bar`` and ``foo.bar`` each holding a canonical would merge into
-        one cluster with two — the same violation, arrived at without any
-        incumbent conforming record involved at all.
-        """
-        _, skips = _mod.plan_renames(
-            [
-                _rec('c1', 'foo_bar', canonical=True),
-                _rec('c2', 'foo.bar', canonical=True),
-            ],
-            project_id='dark_factory',
-        )
-        assert len(_by_reason(skips, 'canonical_collision')) == 2
-        assert _by_reason(skips, 'slug_collision') == []
-
-    def test_canonical_must_be_true_not_merely_truthy(self):
-        """``canonical: 'false'`` is a string and must not read as canonical.
-
-        Metadata comes off a live store and is not schema-enforced here; a
-        truthiness test would turn any stray non-empty value into a phantom
-        canonical and escalate a mild refusal to the severe bucket.
-        """
-        _, skips = _mod.plan_renames(
-            [
-                _rec('legacy', 'foo_bar', canonical='false'),
-                _rec('incumbent', 'foo-bar', canonical='false'),
-            ],
-            project_id='dark_factory',
-        )
-        assert _by_reason(skips, 'canonical_collision') == []
-        assert len(_by_reason(skips, 'slug_collision')) == 1
-
 
 class TestCollisionOutcomesFailTheRun:
     """Both refusals are ERROR outcomes: an unresolved collision exits 1."""
@@ -662,7 +242,7 @@ class TestEnumerateTopicBearing:
         hold the whole ~49.4k-record corpus).
         """
         category = _mod.census_categories()[0]
-        records = [_rec(f'm{i}', 'conforming-topic') for i in range(10_000)]
+        records = [rec(f'm{i}', 'conforming-topic') for i in range(10_000)]
         backend = _backend({category: records})
         result = await _mod.enumerate_topic_bearing(
             _service_with(backend), 'dark_factory', categories=[category],
@@ -674,9 +254,9 @@ class TestEnumerateTopicBearing:
         """``(id, topic, canonical)`` — everything the planner needs, nothing more."""
         category = _mod.census_categories()[0]
         backend = _backend({category: [
-            _rec('m1', 'legacy_topic', canonical=True),
-            _rec('m2', 'conforming-topic'),
-            _rec('m3'),
+            rec('m1', 'legacy_topic', canonical=True),
+            rec('m2', 'conforming-topic'),
+            rec('m3'),
         ]})
         result = await _mod.enumerate_topic_bearing(
             _service_with(backend), 'dark_factory', categories=[category],
@@ -696,12 +276,12 @@ class TestEnumerateTopicBearing:
         """
         category = _mod.census_categories()[0]
         backend = _backend({category: [
-            _rec('i1', 42),
-            _rec('l1', ['a', 'b'], canonical=True),
-            _rec('d1', {'k': 'v'}),
-            _rec('e1', ''),
-            _rec('ok', 'good-topic'),
-            _rec('none'),
+            rec('i1', 42),
+            rec('l1', ['a', 'b'], canonical=True),
+            rec('d1', {'k': 'v'}),
+            rec('e1', ''),
+            rec('ok', 'good-topic'),
+            rec('none'),
         ]})
 
         result = await _mod.enumerate_topic_bearing(
@@ -726,7 +306,7 @@ class TestEnumerateTopicBearing:
         """
         category = _mod.census_categories()[0]
         log: list = []
-        backend = _backend({category: [_rec('m1', 'a_b')]}, call_log=log)
+        backend = _backend({category: [rec('m1', 'a_b')]}, call_log=log)
         await _mod.enumerate_topic_bearing(
             _service_with(backend), 'dark_factory', categories=[category],
         )
@@ -735,7 +315,7 @@ class TestEnumerateTopicBearing:
     @pytest.mark.asyncio
     async def test_a_matching_bracket_is_complete(self):
         category = _mod.census_categories()[0]
-        backend = _backend({category: [_rec('m1', 'a_b')]})
+        backend = _backend({category: [rec('m1', 'a_b')]})
         result = await _mod.enumerate_topic_bearing(
             _service_with(backend), 'dark_factory', categories=[category],
         )
@@ -755,7 +335,7 @@ class TestEnumerateTopicBearing:
         """
         category = _mod.census_categories()[0]
         backend = _backend(
-            {category: [_rec('m1', 'a_b')]}, counts_by_category={category: 5},
+            {category: [rec('m1', 'a_b')]}, counts_by_category={category: 5},
         )
         result = await _mod.enumerate_topic_bearing(
             _service_with(backend), 'dark_factory', categories=[category],
@@ -765,7 +345,7 @@ class TestEnumerateTopicBearing:
         assert cell['scrolled'] == 1
         assert cell['complete'] is False
         assert result['complete'] is False
-        assert len(_by_reason(result['skips'], 'under_enumerated')) == 1
+        assert len(by_reason(result['skips'], 'under_enumerated')) == 1
 
     @pytest.mark.asyncio
     async def test_a_scroll_agreeing_with_the_recount_is_churn_not_truncation(self):
@@ -778,7 +358,7 @@ class TestEnumerateTopicBearing:
         """
         category = _mod.census_categories()[0]
         backend = _backend(
-            {category: [_rec('m1', 'a_b')]},
+            {category: [rec('m1', 'a_b')]},
             counts_by_category={category: 2},
             recounts_by_category={category: 1},
         )
@@ -789,7 +369,7 @@ class TestEnumerateTopicBearing:
         assert (cell['expected'], cell['scrolled'], cell['recount']) == (2, 1, 1)
         assert cell['complete'] is True
         assert result['complete'] is True
-        assert _by_reason(result['skips'], 'under_enumerated') == []
+        assert by_reason(result['skips'], 'under_enumerated') == []
 
     @pytest.mark.asyncio
     async def test_page_budget_exhausted_is_an_explicit_incomplete_outcome(self):
@@ -803,14 +383,14 @@ class TestEnumerateTopicBearing:
         categories = list(_mod.census_categories()[:2])
         first, second = categories
         backend = _backend(
-            {first: [_rec('m1', 'a_b')], second: [_rec('m2', 'c_d')]},
+            {first: [rec('m1', 'a_b')], second: [rec('m2', 'c_d')]},
             scroll_raises={first: _mod.ScrollPageBudgetExhausted('budget')},
         )
         result = await _mod.enumerate_topic_bearing(
             _service_with(backend), 'dark_factory', categories=categories,
         )
         assert result['complete'] is False
-        entries = _by_reason(result['skips'], 'scroll_budget_exhausted')
+        entries = by_reason(result['skips'], 'scroll_budget_exhausted')
         assert len(entries) == 1
         assert entries[0]['category'] == first
         assert entries[0]['project_id'] == 'dark_factory'
@@ -827,7 +407,7 @@ class TestEnumerateTopicBearing:
         categories = list(_mod.census_categories()[:2])
         first, second = categories
         backend = _backend(
-            {first: [_rec('m1', 'a_b')], second: [_rec('m2', 'c_d')]},
+            {first: [rec('m1', 'a_b')], second: [rec('m2', 'c_d')]},
             scroll_raises={first: _mod.ScrollPageBudgetExhausted('budget')},
         )
         result = await _mod.enumerate_topic_bearing(
@@ -877,247 +457,8 @@ class TestCensusCategoriesAreImportedNotRestated:
 
 
 # ===========================================================================
-# rename_one — the single write boundary
+# rename_one's outcomes, as the script grades them
 # ===========================================================================
-
-_UNSET = object()
-
-
-def _service(
-    *,
-    record: object = _UNSET,
-    update_response: object = _UNSET,
-) -> AsyncMock:
-    """A stateless ``MemoryService`` double for the write boundary.
-
-    Children are configured through ``.return_value`` rather than reassigned
-    to fresh ``AsyncMock``s, because a reassigned child stops propagating into
-    the parent's ``mock_calls`` — and the ORDER of the live re-read relative to
-    the write is one of the things this suite has to pin.
-    """
-    service = AsyncMock()
-    service.get_memory_by_id.return_value = (
-        {'id': 'm1', 'metadata': {'topic': 'legacy_topic'}}
-        if record is _UNSET else record
-    )
-    if update_response is _UNSET:
-        service.update_memory.side_effect = lambda **kwargs: {
-            'status': 'updated',
-            'store': 'mem0',
-            'id': kwargs['memory_id'],
-            'content_amended': False,
-            'metadata_patched': True,
-        }
-    else:
-        service.update_memory.return_value = update_response
-    return service
-
-
-def _rename(**overrides) -> object:
-    fields = {
-        'project_id': 'dark_factory',
-        'memory_id': 'm1',
-        'old_topic': 'legacy_topic',
-        'new_topic': 'legacy-topic',
-    }
-    fields.update(overrides)
-    return _mod.Rename(**fields)
-
-
-def _call_names(service: AsyncMock) -> list[str]:
-    return [name for name, _a, _kw in service.mock_calls if name]
-
-
-class TestRenameOne:
-    """``rename_one(memory_service, rename, *, apply)``.
-
-    The only function here that touches a store.  Order is load-bearing and
-    copied from ``retro_stamp_topics.stamp_one``: live re-read, decide, then
-    write.  The re-read is not a formality — the plan's ids come off a scroll
-    that may be minutes old on a corpus orchestrators are writing to, so a
-    record consolidated away since must become a report line rather than a
-    Qdrant ``set_payload`` that acknowledges a write to nothing.
-    """
-
-    @pytest.mark.asyncio
-    async def test_reads_live_before_it_writes(self):
-        service = _service()
-        await _mod.rename_one(service, _rename(), apply=True)
-        assert _call_names(service) == ['get_memory_by_id', 'update_memory']
-
-    @pytest.mark.asyncio
-    async def test_the_write_is_metadata_only_and_carries_only_topic(self):
-        """A migration must not touch content, and must not touch a sibling key.
-
-        ``metadata_mode='merge'`` with a patch containing exactly ``topic``
-        leaves every other metadata key alone.  A wider patch would let a
-        normalization silently clobber ``canonical``, ``supersedes`` or the
-        consolidation bookkeeping on ~141 records at once.
-        """
-        service = _service()
-        await _mod.rename_one(service, _rename(), apply=True)
-        service.update_memory.assert_awaited_once()
-        kwargs = service.update_memory.await_args.kwargs
-        assert kwargs['memory_id'] == 'm1'
-        assert kwargs['project_id'] == 'dark_factory'
-        assert kwargs['metadata_patch'] == {'topic': 'legacy-topic'}
-        assert kwargs['metadata_mode'] == 'merge'
-        assert 'content' not in kwargs
-        assert 'messages' not in kwargs
-
-    @pytest.mark.asyncio
-    async def test_the_write_is_attributed_to_this_sweep(self):
-        """``_source`` / ``reason`` so the amendment-storm alarm can tell.
-
-        A bulk run under the default ``mcp_tool`` source looks exactly like
-        the runaway rewrite that alarm exists to catch.
-        """
-        service = _service()
-        await _mod.rename_one(service, _rename(), apply=True)
-        kwargs = service.update_memory.await_args.kwargs
-        assert kwargs['_source'] == _mod.WRITE_SOURCE == 'normalize_topic_slugs'
-        assert kwargs['reason'] == _mod.WRITE_REASON
-        assert '4878' in _mod.WRITE_REASON
-
-    @pytest.mark.asyncio
-    async def test_no_delete_is_ever_issued(self):
-        """A topic rename is a metadata patch, never a delete-and-recreate.
-
-        Re-creating would mint a new memory id, orphaning every reference to
-        the old one and destroying ``created_at`` — the field consolidation
-        uses to pick a canonical.
-        """
-        service = _service()
-        await _mod.rename_one(service, _rename(), apply=True)
-        service.delete_memory.assert_not_awaited()
-        assert 'delete_memory' not in _call_names(service)
-
-    @pytest.mark.asyncio
-    async def test_a_successful_write_is_renamed(self):
-        service = _service()
-        result = await _mod.rename_one(service, _rename(), apply=True)
-        assert result['outcome'] == 'renamed'
-        assert result['memory_id'] == 'm1'
-        assert result['old_topic'] == 'legacy_topic'
-        assert result['new_topic'] == 'legacy-topic'
-        assert result['response']['status'] == 'updated'
-
-    @pytest.mark.asyncio
-    async def test_dry_run_reads_and_decides_but_never_writes(self):
-        """The rehearsal must exercise the SAME decision path as the apply.
-
-        A dry run that skipped the live re-read would rehearse a different
-        function from the one ``--apply`` runs, and its report would be a
-        prediction rather than a rehearsal.
-        """
-        service = _service()
-        result = await _mod.rename_one(service, _rename(), apply=False)
-        assert result['outcome'] == 'would_rename'
-        service.get_memory_by_id.assert_awaited_once()
-        service.update_memory.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_a_vanished_record_is_memory_not_found(self):
-        """Consolidated away between the scroll and the write.
-
-        Measured precedent: retro_stamp's gate 3036 id ``19705df4`` no longer
-        resolves. Writing to it anyway would be acknowledged by the backend
-        and would appear in the report as a successful rename.
-        """
-        service = _service(record=None)
-        result = await _mod.rename_one(service, _rename(), apply=True)
-        assert result['outcome'] == 'memory_not_found'
-        service.update_memory.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_a_topic_that_moved_since_the_plan_is_refused(self):
-        """Somebody else rewrote it — this plan row is stale, so do not write.
-
-        Applying anyway would overwrite a live value with a fold of a value
-        that no longer exists, which is a data loss the report would score as
-        a success.
-        """
-        service = _service(record={'id': 'm1', 'metadata': {'topic': 'something_else'}})
-        result = await _mod.rename_one(service, _rename(), apply=True)
-        assert result['outcome'] == 'topic_moved_since_plan'
-        assert result['existing_topic'] == 'something_else'
-        service.update_memory.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_already_normalized_costs_zero_writes(self):
-        """A second run plans zero WRITES, not merely zero net effect.
-
-        A no-op ``update_memory`` would still journal a write op, still count
-        toward the amendment-storm alarm, and would inflate the report's
-        renamed count with records that gained nothing.
-        """
-        service = _service(record={'id': 'm1', 'metadata': {'topic': 'legacy-topic'}})
-        result = await _mod.rename_one(service, _rename(), apply=True)
-        assert result['outcome'] == 'already_normalized'
-        service.update_memory.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_an_error_envelope_is_update_failed_not_renamed(self):
-        """``update_memory`` reports some rejections by RETURNING, not raising.
-
-        A caller guarding only against exceptions would score a refused write
-        as a rename — and then the residue probe would find the legacy slug
-        still populated with no explanation in the report.
-        """
-        service = _service(update_response={
-            'error': 'memory not found', 'error_type': 'MemoryNotFound',
-        })
-        result = await _mod.rename_one(service, _rename(), apply=True)
-        assert result['outcome'] == 'update_failed'
-        assert result['error_type'] == 'MemoryNotFound'
-        assert result['error'] == 'memory not found'
-        assert result['response'] == {
-            'error': 'memory not found', 'error_type': 'MemoryNotFound',
-        }
-
-    @pytest.mark.asyncio
-    async def test_a_raising_read_is_one_row_not_an_unwound_sweep(self):
-        """Every await is individually guarded.
-
-        One backend hiccup must cost one report row, not the whole run — the
-        artifact is written after the loop, so an exception escaping here
-        would discard everything the sweep had already learned.
-        """
-        service = _service()
-        service.get_memory_by_id.side_effect = RuntimeError('qdrant timeout')
-        result = await _mod.rename_one(service, _rename(), apply=True)
-        assert result['outcome'] == 'rename_error'
-        assert 'RuntimeError' in result['error']
-        assert 'qdrant timeout' in result['error']
-
-    @pytest.mark.asyncio
-    async def test_a_raising_write_is_one_row_too(self):
-        service = _service()
-        service.update_memory.side_effect = RuntimeError('set_payload failed')
-        result = await _mod.rename_one(service, _rename(), apply=True)
-        assert result['outcome'] == 'rename_error'
-        assert 'set_payload failed' in result['error']
-
-    @pytest.mark.asyncio
-    async def test_the_memory_id_is_never_changed(self):
-        """Whatever the outcome, the row reports the id it was handed.
-
-        The report is how an operator re-addresses a failed row; an id that
-        drifted between the plan and the artifact makes it unusable.
-        """
-        for record in (None, {'id': 'm1', 'metadata': {'topic': 'other_x'}}):
-            result = await _mod.rename_one(
-                _service(record=record), _rename(), apply=True,
-            )
-            assert result['memory_id'] == 'm1'
-
-    @pytest.mark.asyncio
-    async def test_every_outcome_carries_what_it_needs_to_be_actionable(self):
-        """No follow-up query should be needed to act on a report row."""
-        result = await _mod.rename_one(_service(), _rename(), apply=True)
-        for key in ('project_id', 'memory_id', 'old_topic', 'new_topic', 'outcome'):
-            assert key in result
-
 
 class TestRenameOneOutcomesAreGraded:
     """The write-boundary failures fail the run."""
@@ -1141,18 +482,6 @@ class TestRenameOneOutcomesAreGraded:
 # verify_old_slugs_drained — scope item 3, the post-apply verification
 # ===========================================================================
 
-def _result(outcome: str, **overrides) -> dict:
-    row = {
-        'project_id': 'dark_factory',
-        'memory_id': 'm1',
-        'old_topic': 'legacy_topic',
-        'new_topic': 'legacy-topic',
-        'outcome': outcome,
-    }
-    row.update(overrides)
-    return row
-
-
 class TestVerifyOldSlugsDrained:
     """``verify_old_slugs_drained(memory_service, results, skips)``.
 
@@ -1173,11 +502,11 @@ class TestVerifyOldSlugsDrained:
         Asking it eight times would multiply a bulk sweep's read load by its
         own target count for no additional information.
         """
-        service = _service()
+        service = write_boundary_service()
         service.count_memories_by_metadata.return_value = 0
         results = [
-            _result('renamed', memory_id=f'm{i}') for i in range(8)
-        ] + [_result('renamed', memory_id='x1', old_topic='other_slug',
+            result_row('renamed', memory_id=f'm{i}') for i in range(8)
+        ] + [result_row('renamed', memory_id='x1', old_topic='other_slug',
                      new_topic='other-slug')]
         await _mod.verify_old_slugs_drained(service, results, {})
         probed = [
@@ -1195,19 +524,19 @@ class TestVerifyOldSlugsDrained:
         Filing a line per successfully-drained slug would bury the stranded
         ones, which are the only reason this pass exists.
         """
-        service = _service()
+        service = write_boundary_service()
         service.count_memories_by_metadata.return_value = 0
         skips: dict = {}
-        await _mod.verify_old_slugs_drained(service, [_result('renamed')], skips)
+        await _mod.verify_old_slugs_drained(service, [result_row('renamed')], skips)
         assert skips.get('legacy_slug_residue', []) == []
 
     @pytest.mark.asyncio
     async def test_a_stranded_slug_is_reported_with_its_count(self):
         """Corpus-wide means nothing should be left — a remainder is an error."""
-        service = _service()
+        service = write_boundary_service()
         service.count_memories_by_metadata.return_value = 3
         skips: dict = {}
-        await _mod.verify_old_slugs_drained(service, [_result('renamed')], skips)
+        await _mod.verify_old_slugs_drained(service, [result_row('renamed')], skips)
         entries = skips['legacy_slug_residue']
         assert len(entries) == 1
         entry = entries[0]
@@ -1224,10 +553,10 @@ class TestVerifyOldSlugsDrained:
         fix as residue — a false alarm on exactly the run an operator uses to
         decide whether to apply at all.
         """
-        service = _service()
+        service = write_boundary_service()
         service.count_memories_by_metadata.return_value = 8
         skips: dict = {}
-        results = [_result('would_rename', memory_id=f'm{i}') for i in range(8)]
+        results = [result_row('would_rename', memory_id=f'm{i}') for i in range(8)]
         await _mod.verify_old_slugs_drained(service, results, skips)
         assert skips.get('legacy_slug_residue', []) == []
 
@@ -1239,10 +568,10 @@ class TestVerifyOldSlugsDrained:
         record whose topic was refused — and subtracting the rehearsed rows is
         precisely what makes it visible instead of drowned.
         """
-        service = _service()
+        service = write_boundary_service()
         service.count_memories_by_metadata.return_value = 10
         skips: dict = {}
-        results = [_result('would_rename', memory_id=f'm{i}') for i in range(8)]
+        results = [result_row('would_rename', memory_id=f'm{i}') for i in range(8)]
         await _mod.verify_old_slugs_drained(service, results, skips)
         assert skips['legacy_slug_residue'][0]['residue_count'] == 2
 
@@ -1254,10 +583,10 @@ class TestVerifyOldSlugsDrained:
         count smaller than the rehearsal. Reporting -1 residue would be
         nonsense an operator has to decode.
         """
-        service = _service()
+        service = write_boundary_service()
         service.count_memories_by_metadata.return_value = 1
         skips: dict = {}
-        results = [_result('would_rename', memory_id=f'm{i}') for i in range(5)]
+        results = [result_row('would_rename', memory_id=f'm{i}') for i in range(5)]
         await _mod.verify_old_slugs_drained(service, results, skips)
         assert skips.get('legacy_slug_residue', []) == []
 
@@ -1268,11 +597,11 @@ class TestVerifyOldSlugsDrained:
         A row whose write FAILED also still carries it — and that is genuine
         residue, correctly left in.
         """
-        service = _service()
+        service = write_boundary_service()
         service.count_memories_by_metadata.return_value = 1
         skips: dict = {}
         await _mod.verify_old_slugs_drained(
-            service, [_result('update_failed')], skips,
+            service, [result_row('update_failed')], skips,
         )
         assert skips['legacy_slug_residue'][0]['residue_count'] == 1
 
@@ -1283,10 +612,10 @@ class TestVerifyOldSlugsDrained:
         Swallowing the failure would let the report claim a drained corpus on
         the strength of a question that was never answered.
         """
-        service = _service()
+        service = write_boundary_service()
         service.count_memories_by_metadata.side_effect = RuntimeError('qdrant down')
         skips: dict = {}
-        await _mod.verify_old_slugs_drained(service, [_result('renamed')], skips)
+        await _mod.verify_old_slugs_drained(service, [result_row('renamed')], skips)
         entry = skips['legacy_slug_residue'][0]
         assert 'RuntimeError' in entry['error']
         assert 'residue_count' not in entry, 'an unanswered probe has no count'
@@ -1295,23 +624,23 @@ class TestVerifyOldSlugsDrained:
     @pytest.mark.asyncio
     async def test_rows_that_did_not_rename_are_not_probed(self):
         """A refused row never moved a slug, so there is nothing to drain."""
-        service = _service()
+        service = write_boundary_service()
         service.count_memories_by_metadata.return_value = 0
         await _mod.verify_old_slugs_drained(
             service,
-            [_result('memory_not_found'), _result('already_normalized')],
+            [result_row('memory_not_found'), result_row('already_normalized')],
             {},
         )
         service.count_memories_by_metadata.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_probes_are_ordered_for_a_clean_diff(self):
-        service = _service()
+        service = write_boundary_service()
         service.count_memories_by_metadata.return_value = 0
         results = [
-            _result('renamed', project_id='reify', old_topic='z_slug'),
-            _result('renamed', old_topic='b_slug'),
-            _result('renamed', old_topic='a_slug'),
+            result_row('renamed', project_id='reify', old_topic='z_slug'),
+            result_row('renamed', old_topic='b_slug'),
+            result_row('renamed', old_topic='a_slug'),
         ]
         await _mod.verify_old_slugs_drained(service, results, {})
         probed = [
@@ -1329,304 +658,24 @@ class TestVerifyOldSlugsDrained:
 
 
 # ===========================================================================
-# pair_gate_blocks + the gate writer — the two-store lockstep
+# The two-store lockstep's outcomes, as the script grades and renders them
 # ===========================================================================
-#
-# ``metadata.x_recon_consolidation_gate`` is a Tier-C block on TASK metadata,
-# not Mem0 metadata: a genuinely different store, reached through the MCP
-# server rather than through a backend call.  Renaming the memories without
-# moving that block leaves the gate's closure scroll pointed at a slug no
-# record carries any more — the uncloseable-gate trap re-created at a NEW
-# address, which is strictly worse than leaving the snake_case slug alone.
-#
-# So the halves are planned as a pair and refused as a pair.  Every test below
-# exists to pin one edge of that atomicity.
 
-def _gate_task(
-    task_id: str,
-    topic: str,
-    *,
-    project_id: str = 'dark_factory',
-    project_root: str = '/repo',
-    **block_extras,
-) -> dict:
-    """One gate task as the MCP ``get_task`` read hands it over.
+class TestGateAmbiguousReachesTheReport:
+    """A ``gate_ambiguous`` refusal fails the run and names every gate.
 
-    ``block_extras`` seed the SIBLING keys inside the block (``provenance``,
-    ``considered_and_kept``, ...) — the ones the patch must leave untouched.
+    The refusal itself is ``pair_gate_blocks``'s and is pinned in
+    ``test_topic_slug_gates.py``; this pins how the script grades and renders it.
     """
-    block = {'topic': topic}
-    block.update(block_extras)
-    return {
-        'id': task_id,
-        'project_id': project_id,
-        'project_root': project_root,
-        'metadata': {
-            'task_kind': 'deterministic',
-            'always_escalates': True,
-            _mod.GATE_METADATA_KEY: block,
-        },
-    }
-
-
-def _stateful_service(records: dict[str, dict]) -> MagicMock:
-    """A ``MemoryService`` double that REMEMBERS what was written to it.
-
-    The gate lockstep's most important property — that a refused gate patch
-    leaves the memory half at its ORIGINAL value — is a statement about the
-    store's end state, not about a call list.  A stateless double can only
-    show the calls; it cannot show that the corpus came back to where it
-    started, which is the whole claim.
-    """
-    service = MagicMock()
-
-    async def _get(*, project_id, memory_id):
-        record = records.get(memory_id)
-        return None if record is None else {
-            'id': memory_id, 'metadata': dict(record['metadata']),
-        }
-
-    async def _update(*, memory_id, project_id, metadata_patch, **kwargs):
-        record = records.get(memory_id)
-        if record is None:
-            return {'error_type': 'not_found', 'error': memory_id}
-        record['metadata'].update(metadata_patch)
-        return {'status': 'updated', 'id': memory_id, 'metadata_patched': True}
-
-    service.get_memory_by_id = AsyncMock(side_effect=_get)
-    service.update_memory = AsyncMock(side_effect=_update)
-    return service
-
-
-def _store(*topics: tuple[str, str]) -> dict[str, dict]:
-    return {mid: {'metadata': {'topic': topic}} for mid, topic in topics}
-
-
-def _client(*, result: object = None, error: Exception | None = None) -> MagicMock:
-    """A ``FusedMemoryClient`` double.  Injected so no test opens a socket."""
-    client = MagicMock()
-    if error is not None:
-        client.call_tool = AsyncMock(side_effect=error)
-    else:
-        client.call_tool = AsyncMock(
-            return_value=result if result is not None
-            else {'id': '4220', 'updated': True, 'message': 'ok'}
-        )
-    return client
-
-
-class TestPairGateBlocks:
-    """``pair_gate_blocks(renames, gate_tasks) -> (groups, skips)``.
-
-    Pure.  It decides WHICH renames travel with WHICH gate task, before
-    anything is written, so the pairing is reproducible from the plan alone.
-    """
-
-    def test_a_gate_on_a_renamed_slug_is_paired_with_it(self):
-        renames = [_mod.Rename('dark_factory', 'm1', 'mem0_tombstone_coverage',
-                               'mem0-tombstone-coverage')]
-        gates = [_gate_task('4220', 'mem0_tombstone_coverage')]
-
-        groups, skips = _mod.pair_gate_blocks(renames, gates)
-
-        assert len(groups) == 1
-        assert groups[0].old_topic == 'mem0_tombstone_coverage'
-        assert groups[0].new_topic == 'mem0-tombstone-coverage'
-        assert groups[0].gate_task_id == '4220'
-        assert skips == []
-
-    def test_the_patch_moves_the_topic_and_touches_no_sibling_key(self):
-        provenance = {'report_run': 'r1', 'observed_members': ['a'],
-                      'detector': 'd', 'authoritative': False}
-        kept = [{'id': 'x', 'why': 'peer'}]
-        gates = [_gate_task('4220', 'gate_topic', provenance=provenance,
-                            considered_and_kept=kept)]
-        renames = [_mod.Rename('dark_factory', 'm1', 'gate_topic', 'gate-topic')]
-
-        groups, _skips = _mod.pair_gate_blocks(renames, gates)
-
-        assert groups[0].gate_block == {
-            'topic': 'gate-topic',
-            'provenance': provenance,
-            'considered_and_kept': kept,
-        }
-
-    def test_the_patch_does_not_mutate_the_source_task(self):
-        gates = [_gate_task('4220', 'gate_topic', provenance={'a': 1})]
-        renames = [_mod.Rename('dark_factory', 'm1', 'gate_topic', 'gate-topic')]
-
-        _mod.pair_gate_blocks(renames, gates)
-
-        assert gates[0]['metadata'][_mod.GATE_METADATA_KEY]['topic'] == 'gate_topic'
-
-    def test_every_rename_on_the_slug_joins_the_group(self):
-        renames = [
-            _mod.Rename('dark_factory', f'm{i}', 'gate_topic', 'gate-topic')
-            for i in range(4)
-        ]
-        groups, _skips = _mod.pair_gate_blocks(
-            renames, [_gate_task('4220', 'gate_topic')])
-
-        assert len(groups) == 1
-        assert [r.memory_id for r in groups[0].renames] == ['m0', 'm1', 'm2', 'm3']
-
-    def test_a_rename_with_no_gate_still_forms_a_group(self):
-        """Most topics are not gates; those renames must proceed normally."""
-        renames = [_mod.Rename('dark_factory', 'm1', 'plain_topic', 'plain-topic')]
-
-        groups, skips = _mod.pair_gate_blocks(renames, [])
-
-        assert len(groups) == 1
-        assert groups[0].gate_task_id is None
-        assert groups[0].gate_block is None
-        assert skips == []
-
-    def test_a_gate_is_matched_within_its_own_project(self):
-        renames = [_mod.Rename('reify', 'm1', 'gate_topic', 'gate-topic')]
-        gates = [_gate_task('4220', 'gate_topic', project_id='dark_factory')]
-
-        groups, skips = _mod.pair_gate_blocks(renames, gates)
-
-        assert groups[0].gate_task_id is None
-        assert _by_reason(skips, 'orphan_gate_topic')
-
-    def test_a_gate_whose_slug_matches_no_record_is_an_orphan_not_a_silence(self):
-        gates = [_gate_task('4774', 'ghost_topic')]
-
-        groups, skips = _mod.pair_gate_blocks([], gates)
-
-        assert groups == []
-        orphans = _by_reason(skips, 'orphan_gate_topic')
-        assert len(orphans) == 1
-        assert orphans[0]['gate_task_id'] == '4774'
-        assert orphans[0]['gate_topic'] == 'ghost_topic'
-        assert orphans[0]['project_id'] == 'dark_factory'
-
-    def test_a_gate_already_on_a_conforming_slug_is_not_an_orphan(self):
-        """Nothing to migrate is not the same fact as a dangling gate."""
-        groups, skips = _mod.pair_gate_blocks([], [_gate_task('4220', 'good-topic')])
-
-        assert groups == []
-        assert skips == []
-
-    def test_a_gate_task_without_a_block_is_ignored(self):
-        task = {'id': '9', 'project_id': 'dark_factory', 'metadata': {}}
-
-        groups, skips = _mod.pair_gate_blocks([], [task])
-
-        assert (groups, skips) == ([], [])
-
-    def test_groups_are_sorted_for_a_clean_diff(self):
-        renames = [
-            _mod.Rename('reify', 'm9', 'z_topic', 'z-topic'),
-            _mod.Rename('dark_factory', 'm2', 'b_topic', 'b-topic'),
-            _mod.Rename('dark_factory', 'm1', 'a_topic', 'a-topic'),
-        ]
-        groups, _skips = _mod.pair_gate_blocks(renames, [])
-
-        assert [(g.project_id, g.new_topic) for g in groups] == [
-            ('dark_factory', 'a-topic'),
-            ('dark_factory', 'b-topic'),
-            ('reify', 'z-topic'),
-        ]
-
-    def test_the_group_is_frozen(self):
-        groups, _skips = _mod.pair_gate_blocks(
-            [_mod.Rename('dark_factory', 'm1', 'a_topic', 'a-topic')], [])
-        assert dataclasses.is_dataclass(groups[0])
-        with pytest.raises(dataclasses.FrozenInstanceError):
-            groups[0].new_topic = 'other'  # type: ignore[misc]
-
-
-class TestAmbiguousGate:
-    """A legacy slug carrying MORE THAN ONE consolidation gate is refused.
-
-    A ``GateGroup`` moves exactly one gate.  Moving one of several would strand
-    the rest on the vacated slug — the uncloseable-gate trap again — so the
-    slug's renames are withheld and both stores stay on the legacy value, the
-    posture ``slug_collision`` already takes.
-    """
-
-    @staticmethod
-    def _gates_on(slug: str, *task_ids: str) -> list[dict]:
-        return [_gate_task(task_id, slug) for task_id in task_ids]
-
-    def test_a_doubly_gated_slug_forms_no_group_and_is_refused_once(self):
-        renames = [
-            _mod.Rename('dark_factory', 'm2', 'shared_gate', 'shared-gate'),
-            _mod.Rename('dark_factory', 'm1', 'shared_gate', 'shared-gate'),
-        ]
-
-        groups, skips = _mod.pair_gate_blocks(
-            renames, self._gates_on('shared_gate', '7718', '7011'))
-
-        assert groups == []
-        (entry,) = _by_reason(skips, 'gate_ambiguous')
-        assert entry['project_id'] == 'dark_factory'
-        assert entry['old_topic'] == 'shared_gate'
-        assert entry['new_topic'] == 'shared-gate'
-        assert entry['gate_task_ids'] == ['7011', '7718']
-        assert entry['memory_ids'] == ['m1', 'm2']
-
-    def test_neither_gate_is_reported_as_an_orphan(self):
-        """They are matched to live records; "matched to no record" would be false."""
-        _groups, skips = _mod.pair_gate_blocks(
-            [_mod.Rename('dark_factory', 'm1', 'shared_gate', 'shared-gate')],
-            self._gates_on('shared_gate', '7011', '7718'))
-
-        assert _by_reason(skips, 'orphan_gate_topic') == []
-
-    def test_the_refusal_is_per_slug(self):
-        renames = [
-            _mod.Rename('dark_factory', 'm1', 'shared_gate', 'shared-gate'),
-            _mod.Rename('dark_factory', 'm2', 'plain_topic', 'plain-topic'),
-            _mod.Rename('dark_factory', 'm3', 'single_gate', 'single-gate'),
-        ]
-        single = _gate_task('4220', 'single_gate')
-
-        groups, _skips = _mod.pair_gate_blocks(
-            renames, [*self._gates_on('shared_gate', '7011', '7718'), single])
-
-        assert [(g.old_topic, g.gate_task_id) for g in groups] == [
-            ('plain_topic', None),
-            ('single_gate', '4220'),
-        ]
-        unaffected, _ = _mod.pair_gate_blocks(
-            [r for r in renames if r.old_topic != 'shared_gate'], [single])
-        assert groups == unaffected
-
-    def test_the_verdict_does_not_depend_on_gate_order(self):
-        renames = [_mod.Rename('dark_factory', 'm1', 'shared_gate', 'shared-gate')]
-        gates = self._gates_on('shared_gate', '7011', '7718')
-
-        for ordered in (gates, list(reversed(gates))):
-            groups, skips = _mod.pair_gate_blocks(renames, ordered)
-
-            assert groups == []
-            (entry,) = _by_reason(skips, 'gate_ambiguous')
-            assert entry['gate_task_ids'] == ['7011', '7718']
-
-    def test_gates_in_different_projects_are_not_ambiguous(self):
-        """Gates are keyed per project, as the closure scroll that reads them is."""
-        renames = [_mod.Rename('dark_factory', 'm1', 'shared_gate', 'shared-gate')]
-        gates = [
-            _gate_task('4220', 'shared_gate', project_id='dark_factory'),
-            _gate_task('6852', 'shared_gate', project_id='reify'),
-        ]
-
-        groups, skips = _mod.pair_gate_blocks(renames, gates)
-
-        assert [g.gate_task_id for g in groups] == ['4220']
-        assert _by_reason(skips, 'gate_ambiguous') == []
 
     def test_the_markdown_artifact_names_every_gate(self):
-        _groups, skips = _mod.pair_gate_blocks(
-            [_mod.Rename('dark_factory', 'm1', 'shared_gate', 'shared-gate')],
-            self._gates_on('shared_gate', '7011', '7718'))
+        _groups, skips = pair_gate_blocks(
+            [Rename('dark_factory', 'm1', 'shared_gate', 'shared-gate')],
+            [gate_task('7011', 'shared_gate'), gate_task('7718', 'shared_gate')])
 
         rendered = _mod.render_markdown({
             'apply': False,
-            'skips': {'gate_ambiguous': _by_reason(skips, 'gate_ambiguous')},
+            'skips': {'gate_ambiguous': by_reason(skips, 'gate_ambiguous')},
         })
 
         assert '### gate_ambiguous: 1' in rendered
@@ -1636,341 +685,6 @@ class TestAmbiguousGate:
     def test_gate_ambiguous_is_a_pre_seeded_error_bucket(self):
         assert 'gate_ambiguous' in _mod.ERROR_OUTCOMES
         assert 'gate_ambiguous' in _mod.SKIP_BUCKETS
-
-
-def _one_group(renames, gate_tasks=()) -> object:
-    """The single :class:`GateGroup` a writer test drives, unpacked."""
-    groups, _skips = _mod.pair_gate_blocks(renames, list(gate_tasks))
-    assert len(groups) == 1, groups
-    return groups[0]
-
-
-class TestGateLockstepWriter:
-    """``rename_group(memory_service, group, *, apply, client)``.
-
-    The pair is ALL-OR-NOTHING.  Memory renames land first; the gate patch
-    follows only once they ALL succeeded; and if either half fails the group
-    ends at its original state, so no gate is ever left scrolling a slug no
-    record carries.
-    """
-
-    @pytest.mark.asyncio
-    async def test_memory_renames_land_first_then_the_gate_patch(self):
-        records = _store(('m1', 'gate_topic'))
-        service = _stateful_service(records)
-        client = _client()
-        group = _one_group(
-            [_mod.Rename('dark_factory', 'm1', 'gate_topic', 'gate-topic')],
-            [_gate_task('4220', 'gate_topic')])
-
-        outcome = await _mod.rename_group(
-            service, group, apply=True, client=client)
-
-        assert [r['outcome'] for r in outcome.results] == ['renamed']
-        assert records['m1']['metadata']['topic'] == 'gate-topic'
-        assert outcome.gate_row['outcome'] == 'gate_patched'
-        # The write is a NARROW merge of the one block, never a whole-blob
-        # replace: `update_task` refuses any replace carrying `done_provenance`.
-        (tool, payload), _ = client.call_tool.call_args
-        assert tool == 'update_task'
-        assert payload['id'] == '4220'
-        assert payload['metadata_mode'] == 'merge'
-        assert payload['metadata'] == {
-            _mod.GATE_METADATA_KEY: {'topic': 'gate-topic'},
-        }
-
-    @pytest.mark.asyncio
-    async def test_a_dry_run_writes_neither_half(self):
-        records = _store(('m1', 'gate_topic'))
-        service = _stateful_service(records)
-        client = _client()
-        group = _one_group(
-            [_mod.Rename('dark_factory', 'm1', 'gate_topic', 'gate-topic')],
-            [_gate_task('4220', 'gate_topic')])
-
-        outcome = await _mod.rename_group(
-            service, group, apply=False, client=client)
-
-        assert [r['outcome'] for r in outcome.results] == ['would_rename']
-        assert outcome.gate_row['outcome'] == 'would_patch_gate'
-        assert records['m1']['metadata']['topic'] == 'gate_topic'
-        service.update_memory.assert_not_awaited()
-        client.call_tool.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_a_memory_failure_withholds_the_gate_patch(self):
-        """The other direction of the pair: a failed half holds the whole group."""
-        records = _store(('m1', 'gate_topic'))  # m2 is absent -> memory_not_found
-        service = _stateful_service(records)
-        client = _client()
-        group = _one_group(
-            [_mod.Rename('dark_factory', 'm1', 'gate_topic', 'gate-topic'),
-             _mod.Rename('dark_factory', 'm2', 'gate_topic', 'gate-topic')],
-            [_gate_task('4220', 'gate_topic')])
-
-        outcome = await _mod.rename_group(
-            service, group, apply=True, client=client)
-
-        assert {r['outcome'] for r in outcome.results} >= {'memory_not_found'}
-        client.call_tool.assert_not_awaited()
-        assert outcome.gate_row['outcome'] == 'gate_lockstep_failed'
-        assert outcome.gate_row['half'] == 'memory'
-        assert outcome.held_entry is None, 'a held gated pair is reported by its gate row'
-
-    @pytest.mark.asyncio
-    async def test_a_refused_gate_patch_undoes_the_memory_half(self):
-        """The dangerous direction, and the reason the group exists at all.
-
-        ``update_task`` reports some rejections by RETURNING an error envelope
-        inside a successful JSON-RPC frame, so a caller guarding only against
-        exceptions would score a refused gate move as a completed one — and
-        leave the gate scrolling a slug the records no longer carry.
-        """
-        records = _store(('m1', 'gate_topic'), ('m2', 'gate_topic'))
-        service = _stateful_service(records)
-        client = _client(result={'success': False, 'error': 'done_provenance_via_update_task'})
-        group = _one_group(
-            [_mod.Rename('dark_factory', 'm1', 'gate_topic', 'gate-topic'),
-             _mod.Rename('dark_factory', 'm2', 'gate_topic', 'gate-topic')],
-            [_gate_task('4220', 'gate_topic')])
-
-        outcome = await _mod.rename_group(
-            service, group, apply=True, client=client)
-
-        assert outcome.gate_row['outcome'] == 'gate_lockstep_failed'
-        assert outcome.gate_row['half'] == 'gate'
-        assert 'done_provenance_via_update_task' in str(outcome.gate_row['error'])
-        # Net effect: the slug is exactly where it started in BOTH stores.
-        assert records['m1']['metadata']['topic'] == 'gate_topic'
-        assert records['m2']['metadata']['topic'] == 'gate_topic'
-        assert [r['outcome'] for r in outcome.results] == [
-            'gate_lockstep_failed', 'gate_lockstep_failed']
-
-    @pytest.mark.asyncio
-    async def test_a_raising_gate_patch_undoes_the_memory_half_too(self):
-        records = _store(('m1', 'gate_topic'))
-        service = _stateful_service(records)
-        client = _client(error=RuntimeError('mcp down'))
-        group = _one_group(
-            [_mod.Rename('dark_factory', 'm1', 'gate_topic', 'gate-topic')],
-            [_gate_task('4220', 'gate_topic')])
-
-        outcome = await _mod.rename_group(
-            service, group, apply=True, client=client)
-
-        assert outcome.gate_row['outcome'] == 'gate_lockstep_failed'
-        assert 'mcp down' in str(outcome.gate_row['error'])
-        assert records['m1']['metadata']['topic'] == 'gate_topic'
-
-    @pytest.mark.asyncio
-    async def test_a_failed_undo_is_named_on_the_row_not_swallowed(self):
-        records = _store(('m1', 'gate_topic'))
-        service = _stateful_service(records)
-        client = _client(error=RuntimeError('mcp down'))
-        group = _one_group(
-            [_mod.Rename('dark_factory', 'm1', 'gate_topic', 'gate-topic')],
-            [_gate_task('4220', 'gate_topic')])
-
-        calls = {'n': 0}
-        forward = service.update_memory.side_effect
-
-        async def _fail_the_undo(**kwargs):
-            calls['n'] += 1
-            if calls['n'] > 1:
-                raise RuntimeError('undo failed')
-            return await forward(**kwargs)
-
-        service.update_memory = AsyncMock(side_effect=_fail_the_undo)
-
-        outcome = await _mod.rename_group(
-            service, group, apply=True, client=client)
-
-        assert outcome.gate_row['outcome'] == 'gate_lockstep_failed'
-        assert outcome.gate_row['undo_failures']
-        assert 'undo failed' in str(outcome.gate_row['undo_failures'])
-
-    @pytest.mark.asyncio
-    async def test_an_ungated_group_never_reaches_the_client(self):
-        records = _store(('m1', 'plain_topic'))
-        service = _stateful_service(records)
-        client = _client()
-        group = _one_group(
-            [_mod.Rename('dark_factory', 'm1', 'plain_topic', 'plain-topic')])
-
-        outcome = await _mod.rename_group(
-            service, group, apply=True, client=client)
-
-        assert [r['outcome'] for r in outcome.results] == ['renamed']
-        assert (outcome.gate_row, outcome.held_entry) == (None, None)
-        client.call_tool.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_an_ungated_group_runs_without_a_client_at_all(self):
-        """A run that reaches no gate must not require an MCP handshake."""
-        records = _store(('m1', 'plain_topic'))
-        group = _one_group(
-            [_mod.Rename('dark_factory', 'm1', 'plain_topic', 'plain-topic')])
-
-        outcome = await _mod.rename_group(
-            _stateful_service(records), group, apply=True, client=None)
-
-        assert [r['outcome'] for r in outcome.results] == ['renamed']
-        assert outcome.gate_row is None
-
-    @pytest.mark.asyncio
-    async def test_a_gated_group_with_no_client_is_a_lockstep_failure(self):
-        """Unable to move the gate is the same verdict as refused to move it."""
-        records = _store(('m1', 'gate_topic'))
-        service = _stateful_service(records)
-        group = _one_group(
-            [_mod.Rename('dark_factory', 'm1', 'gate_topic', 'gate-topic')],
-            [_gate_task('4220', 'gate_topic')])
-
-        outcome = await _mod.rename_group(
-            service, group, apply=True, client=None)
-
-        assert outcome.gate_row['outcome'] == 'gate_lockstep_failed'
-        assert records['m1']['metadata']['topic'] == 'gate_topic'
-
-    @pytest.mark.asyncio
-    async def test_an_already_normalized_record_is_not_undone(self):
-        """Undo reverses THIS run's writes; it does not rewrite what it found."""
-        records = _store(('m1', 'gate-topic'), ('m2', 'gate_topic'))
-        service = _stateful_service(records)
-        client = _client(error=RuntimeError('mcp down'))
-        group = _one_group(
-            [_mod.Rename('dark_factory', 'm1', 'gate_topic', 'gate-topic'),
-             _mod.Rename('dark_factory', 'm2', 'gate_topic', 'gate-topic')],
-            [_gate_task('4220', 'gate_topic')])
-
-        outcome = await _mod.rename_group(
-            service, group, apply=True, client=client)
-
-        assert outcome.gate_row['outcome'] == 'gate_lockstep_failed'
-        assert records['m1']['metadata']['topic'] == 'gate-topic'
-        assert records['m2']['metadata']['topic'] == 'gate_topic'
-
-
-class TestUngatedGroupRollback:
-    """An ungated slug moves all-or-nothing too.
-
-    A split slug cannot be finished by re-running: the collision guard sees
-    the moved members as incumbents on the new slug.  So when a member is
-    left on the legacy value, the members this run moved are rolled back.
-    """
-
-    @staticmethod
-    def _plain_group() -> object:
-        return _one_group([
-            _mod.Rename('dark_factory', 'm1', 'plain_topic', 'plain-topic'),
-            _mod.Rename('dark_factory', 'm2', 'plain_topic', 'plain-topic'),
-        ])
-
-    @pytest.mark.asyncio
-    async def test_a_refused_member_rolls_the_moved_members_back(self):
-        records = _store(('m1', 'plain_topic'), ('m2', 'plain_topic'))
-        service = _stateful_service(records)
-        _refuse_writes_to(service, 'm2')
-
-        outcome = await _mod.rename_group(
-            service, self._plain_group(), apply=True, client=None)
-
-        assert records['m1']['metadata']['topic'] == 'plain_topic'
-        assert records['m2']['metadata']['topic'] == 'plain_topic'
-        assert [(r['memory_id'], r['outcome'], r.get('undone')) for r in outcome.results] == [
-            ('m1', 'ungated_partial_rename', True),
-            ('m2', 'update_failed', None),
-        ]
-        assert {key: value for key, value in outcome.held_entry.items() if key != 'note'} == {
-            'reason': 'ungated_partial_rename',
-            'project_id': 'dark_factory',
-            'old_topic': 'plain_topic',
-            'new_topic': 'plain-topic',
-            'moved_memory_ids': ['m1'],
-            'failed_memory_ids': ['m2'],
-            'failed_outcomes': ['update_failed'],
-            'on_new_slug_memory_ids': [],
-            'undo_failures': [],
-        }
-
-    @pytest.mark.asyncio
-    async def test_a_failed_rollback_is_named_not_swallowed(self):
-        records = _store(('m1', 'plain_topic'), ('m2', 'plain_topic'))
-        service = _stateful_service(records)
-        _refuse_writes_to(service, 'm2')
-        _fail_writes_moving_back_to(service, 'm1', 'plain_topic')
-
-        outcome = await _mod.rename_group(
-            service, self._plain_group(), apply=True, client=None)
-
-        assert records['m1']['metadata']['topic'] == 'plain-topic'
-        (m1_row,) = [r for r in outcome.results if r['memory_id'] == 'm1']
-        assert m1_row['undone'] is False
-        assert [failure['memory_id'] for failure in outcome.held_entry['undo_failures']] == ['m1']
-        assert 'undo failed' in str(outcome.held_entry['undo_failures'])
-        assert outcome.held_entry['on_new_slug_memory_ids'] == ['m1']
-
-    @pytest.mark.asyncio
-    async def test_a_member_found_on_the_new_slug_is_named_as_still_there(self):
-        """Another writer moved m1 between plan and apply: the hold cannot put it back.
-
-        The undo reverses only this run's writes, so nothing is rolled back and
-        the slug stays split.  The entry says so structurally, rather than
-        leaving an empty ``undo_failures`` to read as "whole again".
-        """
-        records = _store(('m1', 'plain-topic'), ('m2', 'plain_topic'))
-        service = _stateful_service(records)
-        _refuse_writes_to(service, 'm2')
-
-        outcome = await _mod.rename_group(
-            service, self._plain_group(), apply=True, client=None)
-
-        assert records['m1']['metadata']['topic'] == 'plain-topic'
-        assert records['m2']['metadata']['topic'] == 'plain_topic'
-        entry = outcome.held_entry
-        assert (entry['moved_memory_ids'], entry['failed_memory_ids'],
-                entry['on_new_slug_memory_ids'], entry['undo_failures']) == (
-            [], ['m2'], ['m1'], [])
-
-    @pytest.mark.asyncio
-    async def test_a_vanished_straggler_does_not_roll_back_the_rest(self):
-        """A member that is gone splits nothing, so the good write stands."""
-        records = _store(('m1', 'plain_topic'))  # m2 is absent -> memory_not_found
-        service = _stateful_service(records)
-
-        outcome = await _mod.rename_group(
-            service, self._plain_group(), apply=True, client=None)
-
-        assert records['m1']['metadata']['topic'] == 'plain-topic'
-        assert [(r['memory_id'], r['outcome']) for r in outcome.results] == [
-            ('m1', 'renamed'), ('m2', 'memory_not_found'),
-        ]
-        assert outcome.held_entry is None
-
-    @pytest.mark.asyncio
-    async def test_a_dry_run_predicts_the_hold_and_writes_nothing(self):
-        records = _store(('m1', 'plain_topic'), ('m2', 'plain_topic'))
-        service = _stateful_service(records)
-        forward = service.get_memory_by_id.side_effect
-
-        async def _read(**kwargs):
-            if kwargs['memory_id'] == 'm2':
-                raise RuntimeError('read failed')
-            return await forward(**kwargs)
-
-        service.get_memory_by_id = AsyncMock(side_effect=_read)
-
-        outcome = await _mod.rename_group(
-            service, self._plain_group(), apply=False, client=None)
-
-        assert [(r['memory_id'], r['outcome']) for r in outcome.results] == [
-            ('m1', 'would_rename'), ('m2', 'rename_error'),
-        ]
-        entry = outcome.held_entry
-        assert (entry['reason'], entry['moved_memory_ids'], entry['failed_memory_ids']) == (
-            'ungated_partial_rename', ['m1'], ['m2'])
-        assert (entry['on_new_slug_memory_ids'], entry['undo_failures']) == ([], [])
-        service.update_memory.assert_not_awaited()
 
 
 class TestGateLockstepOutcomesAreGraded:
@@ -1988,220 +702,13 @@ class TestGateLockstepOutcomesAreGraded:
         assert 'orphan_gate_topic' not in _mod.ERROR_OUTCOMES
 
 
-def _listing(project_id: str, project_root: str, *tasks: dict) -> dict:
-    """One ``get_tasks`` response in the measured live shape."""
-    return {'tasks': list(tasks), 'project_id': project_id, 'project_root': project_root}
-
-
-def _task_row(task_id: object, metadata: object) -> dict:
-    """One task as ``get_tasks`` lists it, carrying fields the census must drop."""
-    return {'id': task_id, 'title': f'task {task_id}', 'status': 'pending',
-            'dependencies': [], 'metadata': metadata}
-
-
-def _census_client(answers: dict[str, object]) -> MagicMock:
-    """A client whose ``get_tasks`` answers per root: a response, or an exception.
-
-    Answers are deep-copied, as a JSON transport would hand them over, so the
-    census can never alias the double's own state.
-    """
-    async def _call_tool(name, payload):
-        assert name == 'get_tasks', name
-        answer = answers[payload['project_root']]
-        if isinstance(answer, BaseException):
-            raise answer
-        return copy.deepcopy(answer)
-
-    client = MagicMock()
-    client.call_tool = AsyncMock(side_effect=_call_tool)
-    return client
-
-
-_GATE_META = {_mod.GATE_METADATA_KEY: {'topic': 'gate_slug'}}
-
-
-class TestConsolidationGateCensus:
-    """``census_consolidation_gates(client, roots) -> GateCensus``.
-
-    The input the lockstep never had on the live path.  Its contract is to
-    state what it could NOT see: a root that cannot be read becomes a
-    structured failure, never a silent gap that reads as "no gates here".
-    """
-
-    @pytest.mark.asyncio
-    async def test_one_unpaged_get_tasks_per_distinct_root(self):
-        client = _census_client({
-            '/df': _listing('dark_factory', '/df'),
-            '/rf': _listing('reify', '/rf'),
-        })
-
-        await _mod.census_consolidation_gates(client, ['/df', '/rf', '/df'])
-
-        assert client.call_tool.await_args_list == [
-            call('get_tasks', {'project_root': '/df'}),
-            call('get_tasks', {'project_root': '/rf'}),
-        ]
-
-    @pytest.mark.asyncio
-    async def test_only_tasks_carrying_a_gate_block_are_kept(self):
-        client = _census_client({'/df': _listing(
-            'dark_factory', '/df',
-            _task_row(1, _GATE_META),
-            _task_row(2, {'task_kind': 'deterministic'}),
-            _task_row(3, 'not-a-dict'),
-            _task_row(4, {_mod.GATE_METADATA_KEY: 'not-a-dict'}),
-            _task_row(5, None),
-        )})
-
-        census = await _mod.census_consolidation_gates(client, ['/df'])
-
-        assert [t['id'] for t in census.tasks] == ['1']
-
-    @pytest.mark.asyncio
-    async def test_a_kept_task_carries_the_server_stamp_and_nothing_else(self):
-        """``project_id``/``project_root`` come off the RESPONSE, never the caller.
-
-        The server normalizes a worktree root to its main checkout and derives
-        the project id from that — the derivation the closure scroll runs
-        under — so recomputing either here would be a second copy free to
-        diverge.
-        """
-        block = {'topic': 'gate_slug', 'provenance': {'report_run': 'r1'}}
-        client = _census_client({'/main/.worktrees/7': _listing(
-            'dark_factory', '/main',
-            _task_row(4220, {_mod.GATE_METADATA_KEY: block, 'task_kind': 'deterministic'}),
-        )})
-
-        census = await _mod.census_consolidation_gates(client, ['/main/.worktrees/7'])
-
-        assert list(census.tasks) == [{
-            'id': '4220',
-            'project_id': 'dark_factory',
-            'project_root': '/main',
-            'metadata': {_mod.GATE_METADATA_KEY: block},
-        }]
-
-    @pytest.mark.asyncio
-    async def test_tasks_are_sorted_by_project_then_id(self):
-        client = _census_client({
-            '/rf': _listing('reify', '/rf', _task_row(20, _GATE_META), _task_row(10, _GATE_META)),
-            '/df': _listing('dark_factory', '/df', _task_row(30, _GATE_META)),
-        })
-
-        census = await _mod.census_consolidation_gates(client, ['/rf', '/df'])
-
-        assert [(t['project_id'], t['id']) for t in census.tasks] == [
-            ('dark_factory', '30'), ('reify', '10'), ('reify', '20'),
-        ]
-
-    @pytest.mark.asyncio
-    async def test_covered_projects_are_the_projects_that_answered(self):
-        client = _census_client({
-            '/df': _listing('dark_factory', '/df'),
-            '/rf': _listing('reify', '/rf'),
-        })
-
-        census = await _mod.census_consolidation_gates(client, ['/df', '/rf'])
-
-        assert census.covered_projects == {'dark_factory', 'reify'}
-        assert list(census.failures) == []
-
-    @pytest.mark.parametrize('answer', [
-        pytest.param({'error': 'no such project root', 'error_type': 'ValidationError'},
-                     id='error-envelope'),
-        pytest.param({'tasks': {'1': {}}, 'project_id': 'ghost', 'project_root': '/bad'},
-                     id='tasks-not-a-list'),
-        pytest.param({'tasks': [], 'project_root': '/bad'}, id='no-project-id'),
-        pytest.param({'tasks': [], 'project_id': 'ghost'}, id='no-project-root'),
-        pytest.param(RuntimeError('get_tasks failed: timed out'), id='raises'),
-    ])
-    @pytest.mark.asyncio
-    async def test_a_root_that_cannot_be_read_is_a_failure_not_a_gap(self, answer):
-        client = _census_client({
-            '/bad': answer,
-            '/df': _listing('dark_factory', '/df', _task_row(1, _GATE_META)),
-        })
-
-        census = await _mod.census_consolidation_gates(client, ['/bad', '/df'])
-
-        (failure,) = census.failures
-        assert failure['reason'] == 'gate_census_incomplete'
-        assert failure['project_root'] == '/bad'
-        assert failure['error']
-        assert census.covered_projects == {'dark_factory'}
-        assert [t['id'] for t in census.tasks] == ['1']
-
-    @pytest.mark.parametrize('answer, cause', [
-        pytest.param({'error': 'no such project root', 'error_type': 'ValidationError'},
-                     'no such project root', id='error-envelope'),
-        pytest.param(RuntimeError('get_tasks failed: timed out'), 'timed out', id='raises'),
-    ])
-    @pytest.mark.asyncio
-    async def test_the_failure_carries_the_cause_it_was_given(self, answer, cause):
-        census = await _mod.census_consolidation_gates(
-            _census_client({'/bad': answer}), ['/bad'])
-
-        (failure,) = census.failures
-        assert cause in failure['error']
-
-    @pytest.mark.asyncio
-    async def test_one_project_answering_from_two_task_stores_is_ambiguous(self):
-        client = _census_client({
-            '/a': _listing('reify', '/a'),
-            '/b': _listing('reify', '/b'),
-            '/df': _listing('dark_factory', '/df'),
-        })
-
-        census = await _mod.census_consolidation_gates(client, ['/a', '/b', '/df'])
-
-        assert census.covered_projects == {'dark_factory'}
-        (failure,) = census.failures
-        assert failure['reason'] == 'gate_census_incomplete'
-        assert failure['project_id'] == 'reify'
-        assert failure['project_root'] == '/b'
-        assert '/a' in failure['error']
-
-    @pytest.mark.asyncio
-    async def test_two_roots_normalized_to_one_store_are_deduplicated(self):
-        """A worktree path and its main checkout are one task store, read twice."""
-        listing = _listing('dark_factory', '/main', _task_row(1, _GATE_META))
-        client = _census_client({'/main/.worktrees/7': listing, '/main': listing})
-
-        census = await _mod.census_consolidation_gates(
-            client, ['/main/.worktrees/7', '/main'])
-
-        assert list(census.failures) == []
-        assert census.covered_projects == {'dark_factory'}
-        assert [t['id'] for t in census.tasks] == ['1']
-
-    @pytest.mark.asyncio
-    async def test_the_census_records_the_roots_it_attempted(self):
-        client = _census_client({
-            '/df': _listing('dark_factory', '/df'),
-            '/bad': RuntimeError('down'),
-        })
-
-        census = await _mod.census_consolidation_gates(client, ['/df', '/bad', '/df'])
-
-        assert list(census.roots) == ['/df', '/bad']
-
-    def test_the_census_is_a_frozen_value(self):
-        census = _mod.GateCensus(
-            roots=('/df',), tasks=(), covered_projects=frozenset({'dark_factory'}),
-            failures=())
-
-        assert dataclasses.is_dataclass(census)
-        with pytest.raises(dataclasses.FrozenInstanceError):
-            census.tasks = ()  # type: ignore[misc]
-
-
 # ===========================================================================
 # run(), the fail-closed preflight, the artifacts and the CLI
 # ===========================================================================
 
 def _census(*, covered=('dark_factory',), tasks=(), failures=(), roots=('/repo',)) -> object:
     """A ``GateCensus`` built by hand, as ``census_consolidation_gates`` returns one."""
-    return _mod.GateCensus(
+    return GateCensus(
         roots=tuple(roots), tasks=tuple(tasks),
         covered_projects=frozenset(covered), failures=tuple(failures))
 
@@ -2299,7 +806,7 @@ class _FakeCorpus:
 
 def _crec(memory_id: str, topic: object, *,
           category: str = 'procedural_knowledge', **meta) -> dict:
-    """A corpus record: like ``_rec`` but carrying the partition key."""
+    """A corpus record: like ``rec`` but carrying the partition key."""
     metadata: dict = {'category': category}
     metadata.update(meta)
     if topic is not None:
@@ -2310,36 +817,6 @@ def _crec(memory_id: str, topic: object, *,
 def _run_service(records: dict[str, list[dict]] | None = None) -> tuple[MagicMock, _FakeCorpus]:
     corpus = _FakeCorpus(records if records is not None else {})
     return corpus.service(), corpus
-
-
-def _refuse_writes_to(service: MagicMock, *memory_ids: str) -> None:
-    """Make *service* refuse every write to *memory_ids*, forwarding the rest."""
-    forward = service.update_memory.side_effect
-    refused = set(memory_ids)
-
-    async def _update(**kwargs):
-        if kwargs['memory_id'] in refused:
-            return {'error_type': 'write_refused', 'error': 'refused by test'}
-        return await forward(**kwargs)
-
-    service.update_memory = AsyncMock(side_effect=_update)
-
-
-def _fail_writes_moving_back_to(service: MagicMock, memory_id: str, legacy_topic: str) -> None:
-    """Make *service* raise on the write that would put *memory_id* back on *legacy_topic*.
-
-    That write is the rollback of a rename, so this is how a failed undo is
-    staged; every other write is forwarded.
-    """
-    forward = service.update_memory.side_effect
-
-    async def _update(**kwargs):
-        if (kwargs['memory_id'], kwargs['metadata_patch'].get('topic')) == (
-                memory_id, legacy_topic):
-            raise RuntimeError('undo failed')
-        return await forward(**kwargs)
-
-    service.update_memory = AsyncMock(side_effect=_update)
 
 
 class TestRun:
@@ -2574,7 +1051,7 @@ class TestRunRequiresACompleteGateCensus:
         self, caplog, capsys,
     ):
         service, corpus = _run_service({'dark_factory': [_crec('m1', 'legacy_topic')]})
-        client = _client()
+        client = mcp_client()
 
         with (
             caplog.at_level('ERROR', logger='normalize_topic_slugs'),
@@ -2595,7 +1072,7 @@ class TestRunRequiresACompleteGateCensus:
     @pytest.mark.asyncio
     async def test_apply_with_any_census_failure_refuses_the_same_way(self, caplog):
         service, corpus = _run_service({'dark_factory': [_crec('m1', 'legacy_topic')]})
-        client = _client()
+        client = mcp_client()
         census = _census(covered=('dark_factory',), failures=[_census_failure('/rf')])
 
         with (
@@ -2650,8 +1127,8 @@ class TestRunRequiresACompleteGateCensus:
         service, _corpus = _run_service({'dark_factory': [_crec('m1', 'legacy_topic')]})
         census = _census(
             covered=('dark_factory', 'reify'),
-            tasks=[_gate_task('6852', 'legacy_topic', project_id='reify'),
-                   _gate_task('6853', 'ghost_topic', project_id='reify')])
+            tasks=[gate_task('6852', 'legacy_topic', project_id='reify'),
+                   gate_task('6853', 'ghost_topic', project_id='reify')])
 
         report = await run_sweep(service, projects=('dark_factory',), gates=census)
 
@@ -2663,7 +1140,7 @@ class TestRunRequiresACompleteGateCensus:
         """A frozenset through ``default=str`` renders in hash order, not a diffable one."""
         service, _corpus = _run_service({'dark_factory': [], 'reify': []})
         census = _census(roots=('/rf', '/df'), covered=('reify', 'dark_factory'),
-                         tasks=[_gate_task('4220', 'good-topic')])
+                         tasks=[gate_task('4220', 'good-topic')])
 
         report = await run_sweep(service, projects=('dark_factory', 'reify'), gates=census)
 
@@ -2716,27 +1193,27 @@ def _bucket_section(rendered: str, bucket: str) -> str:
 def _real_skip_entry(reason: str) -> dict:
     """One skip entry of *reason*, made by the real pure producer that files it."""
     producers = {
-        'topic_unfoldable': lambda: _mod.plan_renames(
-            [_rec('m1', '!!!')], project_id='dark_factory')[1],
-        'record_without_id': lambda: _mod.plan_renames(
-            [_rec('', 'a_b')], project_id='dark_factory')[1],
-        'slug_collision': lambda: _mod.plan_renames(
-            [_rec('m1', 'dup_topic'), _rec('m2', 'dup-topic')],
+        'topic_unfoldable': lambda: plan_renames(
+            [rec('m1', '!!!')], project_id='dark_factory')[1],
+        'record_without_id': lambda: plan_renames(
+            [rec('', 'a_b')], project_id='dark_factory')[1],
+        'slug_collision': lambda: plan_renames(
+            [rec('m1', 'dup_topic'), rec('m2', 'dup-topic')],
             project_id='dark_factory')[1],
-        'canonical_collision': lambda: _mod.plan_renames(
+        'canonical_collision': lambda: plan_renames(
             [
-                _rec('legacy-canon', 'foo_bar', canonical=True),
-                _rec('legacy-member', 'foo_bar'),
-                _rec('incumbent-canon', 'foo-bar', canonical=True),
+                rec('legacy-canon', 'foo_bar', canonical=True),
+                rec('legacy-member', 'foo_bar'),
+                rec('incumbent-canon', 'foo-bar', canonical=True),
             ],
             project_id='dark_factory')[1],
-        'gate_ambiguous': lambda: _mod.pair_gate_blocks(
-            [_mod.Rename('dark_factory', 'm1', 'shared_gate', 'shared-gate')],
-            [_gate_task('7011', 'shared_gate'), _gate_task('7718', 'shared_gate')])[1],
-        'orphan_gate_topic': lambda: _mod.pair_gate_blocks(
-            [], [_gate_task('4774', 'ghost_topic', project_root='/repo')])[1],
+        'gate_ambiguous': lambda: pair_gate_blocks(
+            [Rename('dark_factory', 'm1', 'shared_gate', 'shared-gate')],
+            [gate_task('7011', 'shared_gate'), gate_task('7718', 'shared_gate')])[1],
+        'orphan_gate_topic': lambda: pair_gate_blocks(
+            [], [gate_task('4774', 'ghost_topic', project_root='/repo')])[1],
     }
-    (entry,) = _by_reason(producers[reason](), reason)
+    (entry,) = by_reason(producers[reason](), reason)
     return entry
 
 
@@ -2749,12 +1226,12 @@ class TestMarkdownHidesNoSkipField:
     """
 
     def test_a_canonical_collision_line_names_both_canonical_id_lists(self):
-        entries = _by_reason(
-            _mod.plan_renames(
+        entries = by_reason(
+            plan_renames(
                 [
-                    _rec('legacy-canon', 'foo_bar', canonical=True),
-                    _rec('legacy-member', 'foo_bar'),
-                    _rec('incumbent-canon', 'foo-bar', canonical=True),
+                    rec('legacy-canon', 'foo_bar', canonical=True),
+                    rec('legacy-member', 'foo_bar'),
+                    rec('incumbent-canon', 'foo-bar', canonical=True),
                 ],
                 project_id='dark_factory',
             )[1],
@@ -2837,7 +1314,7 @@ class TestFailedRowsAreListedInTheirBuckets:
     @pytest.mark.asyncio
     async def test_a_refused_write_is_listed_under_update_failed(self):
         service, _corpus = _run_service({'dark_factory': [_crec('m1', 'legacy_topic')]})
-        _refuse_writes_to(service, 'm1')
+        refuse_writes_to(service, 'm1')
 
         report = await run_sweep(service, projects=('dark_factory',), apply=True)
 
@@ -2856,11 +1333,11 @@ class TestFailedRowsAreListedInTheirBuckets:
         service, _corpus = _run_service({'dark_factory': [
             _crec('df1', 'gate_slug'), _crec('df2', 'gate_slug'),
         ]})
-        _refuse_writes_to(service, 'df2')
+        refuse_writes_to(service, 'df2')
 
         report = await run_sweep(
-            service, projects=('dark_factory',), apply=True, client=_client(),
-            gates=_census(covered=('dark_factory',), tasks=[_gate_task('4220', 'gate_slug')]))
+            service, projects=('dark_factory',), apply=True, client=mcp_client(),
+            gates=_census(covered=('dark_factory',), tasks=[gate_task('4220', 'gate_slug')]))
 
         assert [r['memory_id'] for r in report['skips']['update_failed']] == ['df2']
         lockstep = report['skips']['gate_lockstep_failed']
@@ -2884,69 +1361,6 @@ class TestPartialUngatedGroup:
     whose undo failed, or one another writer had put there — and that slug a
     re-run refuses.
     """
-
-    @staticmethod
-    def _plain_group(gate_tasks=(), *, members: int = 2) -> object:
-        return _one_group([
-            _mod.Rename('dark_factory', f'm{n}', 'plain_topic', 'plain-topic')
-            for n in range(1, members + 1)
-        ], gate_tasks)
-
-    @staticmethod
-    def _plain_results(*outcomes: str) -> list[dict]:
-        return [
-            _result(outcome, memory_id=f'm{n}', old_topic='plain_topic', new_topic='plain-topic')
-            for n, outcome in enumerate(outcomes, start=1)
-        ]
-
-    def test_a_partly_moved_ungated_group_names_both_halves(self):
-        entry = _mod.describe_partial_ungated_group(
-            self._plain_group(), self._plain_results('renamed', 'update_failed'))
-
-        assert {key: value for key, value in entry.items() if key != 'note'} == {
-            'reason': 'ungated_partial_rename',
-            'project_id': 'dark_factory',
-            'old_topic': 'plain_topic',
-            'new_topic': 'plain-topic',
-            'moved_memory_ids': ['m1'],
-            'failed_memory_ids': ['m2'],
-            'failed_outcomes': ['update_failed'],
-        }
-
-    def test_a_rehearsed_rename_counts_as_moved(self):
-        entry = _mod.describe_partial_ungated_group(
-            self._plain_group(), self._plain_results('would_rename', 'rename_error'))
-
-        assert entry['moved_memory_ids'] == ['m1']
-        assert entry['failed_memory_ids'] == ['m2']
-        assert entry['failed_outcomes'] == ['rename_error']
-
-    def test_a_member_found_on_the_new_slug_splits_it_without_having_moved(self):
-        entry = _mod.describe_partial_ungated_group(
-            self._plain_group(), self._plain_results('already_normalized', 'update_failed'))
-
-        assert entry['moved_memory_ids'] == []
-        assert entry['failed_memory_ids'] == ['m2']
-
-    @pytest.mark.parametrize(('gate_tasks', 'outcomes'), [
-        pytest.param([_gate_task('4220', 'plain_topic')], ('renamed', 'update_failed'), id='gated'),
-        pytest.param([], ('renamed', 'already_normalized'), id='all_stood'),
-        pytest.param([], ('update_failed', 'rename_error'), id='none_stood'),
-        pytest.param([], ('renamed', 'memory_not_found'), id='straggler_vanished'),
-        pytest.param([], ('renamed', 'topic_moved_since_plan'), id='straggler_moved_elsewhere'),
-    ])
-    def test_no_entry_unless_an_ungated_slug_is_split(self, gate_tasks, outcomes):
-        assert _mod.describe_partial_ungated_group(
-            self._plain_group(gate_tasks), self._plain_results(*outcomes)) is None
-
-    def test_only_the_members_left_on_the_legacy_value_are_listed_as_failed(self):
-        entry = _mod.describe_partial_ungated_group(
-            self._plain_group(members=3),
-            self._plain_results('renamed', 'update_failed', 'memory_not_found'))
-
-        assert entry['moved_memory_ids'] == ['m1']
-        assert entry['failed_memory_ids'] == ['m2']
-        assert entry['failed_outcomes'] == ['update_failed']
 
     @pytest.mark.asyncio
     async def test_a_straggler_that_moved_elsewhere_is_reported_only_in_its_own_bucket(self):
@@ -2977,7 +1391,7 @@ class TestPartialUngatedGroup:
         service, corpus = _run_service({'dark_factory': [
             _crec('m1', 'legacy_topic'), _crec('m2', 'legacy_topic'),
         ]})
-        _refuse_writes_to(service, 'm2')
+        refuse_writes_to(service, 'm2')
         return service, corpus
 
     @staticmethod
@@ -3023,7 +1437,7 @@ class TestPartialUngatedGroup:
     async def test_a_failed_rollback_leaves_the_split_named_and_a_re_run_refuses_the_straggler(self):
         """The documented residual: a double failure is reported, then finished by hand."""
         service, corpus = self._split_corpus()
-        _fail_writes_moving_back_to(service, 'm1', 'legacy_topic')
+        fail_writes_moving_back_to(service, 'm1', 'legacy_topic')
 
         report = await run_sweep(service, projects=('dark_factory',), apply=True)
 
@@ -3302,6 +1716,41 @@ class TestBaselineDelta:
         assert block['measured_by_project'] == {'dark_factory': 1, 'reify': 2}
 
 
+#: The package modules this suite and its shared doubles may import.  That
+#: none of them reaches a MemoryService is measured below, not declared.
+BACKEND_FREE_MODULES: frozenset[str] = frozenset({
+    'fused_memory.utils.store_mutation_preflight',
+    'fused_memory.maintenance.topic_slug_plan',
+    'fused_memory.maintenance.topic_slug_gates',
+    'fused_memory.maintenance.topic_slug_lockstep',
+    'fused_memory.reconciliation.consolidation_gate',
+})
+
+#: The home of ``MemoryService``.  Every factory and server that builds one
+#: imports it at module scope, so a closure that never loads it cannot build one.
+MEMORY_SERVICE_MODULE = 'fused_memory.services.memory_service'
+
+#: Imports every module named on the command line in this fresh interpreter,
+#: then prints the ``fused_memory`` modules that loaded as its last line.
+_IMPORT_CLOSURE_PROBE = '''
+import importlib, json, sys
+for name in sys.argv[1:]:
+    importlib.import_module(name)
+print(json.dumps(sorted(m for m in sys.modules if m.startswith('fused_memory'))))
+'''
+
+
+def _fused_memory_imports(path: Path) -> set[str]:
+    """Every ``fused_memory`` module *path* names in an import statement."""
+    imported: set[str] = set()
+    for node in ast.walk(ast.parse(path.read_text(encoding='utf-8'))):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            imported.add(node.module or '')
+    return {m for m in imported if m.startswith('fused_memory')}
+
+
 class TestNoLiveCorpusCountIsPinned:
     """The one rule this whole section exists to keep.
 
@@ -3311,32 +1760,40 @@ class TestNoLiveCorpusCountIsPinned:
     hits it to delete the assertion.
     """
 
-    def test_this_suite_never_reaches_a_live_backend(self):
+    @pytest.mark.parametrize('source', [
+        Path(__file__),
+        Path(__file__).parent / '_topic_slug_migration_doubles.py',
+    ], ids=lambda path: path.name)
+    def test_this_suite_imports_only_backend_free_modules(self, source):
         """The structural reason no live count can be pinned here.
 
         Checked over the parsed IMPORT statements rather than by substring,
         so the assertion cannot be satisfied — or defeated — by its own text
         appearing in the file.  This suite loads the script by path and
-        injects doubles; the only thing it imports from the package is the
-        store-mutation guard's own module, for its exception type, and that
-        module reaches no backend (no Qdrant, no network, no MemoryService).
-        So there is no seam through which a live corpus could reach an
-        assertion.
+        injects doubles; it and the doubles it shares import only
+        ``BACKEND_FREE_MODULES`` from the package.
         """
-        tree = ast.parse(Path(__file__).read_text(encoding='utf-8'))
-        imported: set[str] = set()
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                imported.update(alias.name for alias in node.names)
-            elif isinstance(node, ast.ImportFrom):
-                imported.add(node.module or '')
+        assert _fused_memory_imports(source) <= BACKEND_FREE_MODULES
 
-        backend_reaching = [
-            m for m in imported
-            if m.startswith('fused_memory')
-            and m != 'fused_memory.utils.store_mutation_preflight'
-        ]
-        assert not backend_reaching, imported
+    def test_no_allowed_module_reaches_a_memory_service(self):
+        """What makes ``BACKEND_FREE_MODULES`` backend-free, measured.
+
+        Their whole import closure loads in a fresh interpreter, so a module
+        an earlier test already imported cannot hide one, and the closure
+        must never load the home of ``MemoryService``.  A module the closure
+        does load (``backends.mem0_client``, for a constant) is unreachable
+        from a test here without an import the check above refuses.
+        """
+        probe = subprocess.run(
+            [sys.executable, '-c', _IMPORT_CLOSURE_PROBE, *sorted(BACKEND_FREE_MODULES)],
+            cwd=SCRIPT_PATH.parent.parent, capture_output=True, text=True,
+            check=False, timeout=120,
+        )
+        assert probe.returncode == 0, probe.stderr
+        loaded = set(json.loads(probe.stdout.splitlines()[-1]))
+
+        assert loaded >= BACKEND_FREE_MODULES
+        assert MEMORY_SERVICE_MODULE not in loaded
 
 
 # ===========================================================================
@@ -3364,7 +1821,7 @@ def _stateful_gate_client(tasks: list[dict]) -> MagicMock:
             listed = [t for t in tasks if t['project_root'] == root]
             if not listed:
                 return {'error': f'no task store at {root}', 'error_type': 'ValidationError'}
-            return copy.deepcopy(_listing(listed[0]['project_id'], root, *listed))
+            return copy.deepcopy(task_listing(listed[0]['project_id'], root, *listed))
         assert name == 'update_task', name
         task = by_id.get(str(payload['id']))
         if task is None:
@@ -3405,7 +1862,7 @@ def _e2e_corpus() -> tuple[dict[str, list[dict]], list[dict]]:
             _crec('rf3', None),
         ],
     }
-    gates = [_gate_task('4220', 'gate_slug', project_id='dark_factory')]
+    gates = [gate_task('4220', 'gate_slug', project_id='dark_factory')]
     return records, gates
 
 
@@ -3441,7 +1898,7 @@ class TestEndToEnd:
         assert report['skips']['legacy_slug_residue'] == []
         assert corpus.writes == []
         client.call_tool.assert_not_awaited()
-        assert gates[0]['metadata'][_mod.GATE_METADATA_KEY]['topic'] == 'gate_slug'
+        assert gates[0]['metadata'][GATE_METADATA_KEY]['topic'] == 'gate_slug'
 
     @pytest.mark.asyncio
     async def test_an_apply_run_moves_exactly_the_renameable_records(self):
@@ -3481,7 +1938,7 @@ class TestEndToEnd:
             service, projects=('dark_factory', 'reify'), apply=True,
             client=_stateful_gate_client(gates), gates=_e2e_census(gates))
 
-        assert gates[0]['metadata'][_mod.GATE_METADATA_KEY]['topic'] == 'gate-slug'
+        assert gates[0]['metadata'][GATE_METADATA_KEY]['topic'] == 'gate-slug'
         assert [r['outcome'] for r in report['gate_results']] == ['gate_patched']
 
     @pytest.mark.asyncio
@@ -3572,7 +2029,7 @@ class TestEndToEnd:
 def _main_fixture() -> tuple[_FakeCorpus, list[dict], MagicMock]:
     """One gated record, and one client double serving the census and the patch."""
     corpus = _FakeCorpus({'dark_factory': [_crec('df7', 'gate_slug')]})
-    gates = [_gate_task('4220', 'gate_slug', project_id='dark_factory', project_root='/repo')]
+    gates = [gate_task('4220', 'gate_slug', project_id='dark_factory', project_root='/repo')]
     return corpus, gates, _stateful_gate_client(gates)
 
 
@@ -3644,7 +2101,7 @@ class TestMainWiresTheGateLockstep:
 
         report = _written_report(tmp_path)
         assert [row['outcome'] for row in report['gate_results']] == ['gate_patched']
-        assert gates[0]['metadata'][_mod.GATE_METADATA_KEY]['topic'] == 'gate-slug'
+        assert gates[0]['metadata'][GATE_METADATA_KEY]['topic'] == 'gate-slug'
         assert corpus.topic_of('dark_factory', 'df7') == 'gate-slug'
         assert code == 0
 
@@ -3659,7 +2116,7 @@ class TestMainWiresTheGateLockstep:
         assert corpus.scrolls == []
         assert corpus.writes == []
         assert 'update_task' not in _tools_called(client)
-        assert gates[0]['metadata'][_mod.GATE_METADATA_KEY]['topic'] == 'gate_slug'
+        assert gates[0]['metadata'][GATE_METADATA_KEY]['topic'] == 'gate_slug'
         assert not (tmp_path / 'report.json').exists()
         assert not (tmp_path / 'report.md').exists()
 
@@ -3758,24 +2215,6 @@ class TestTopicSelection:
         assert corpus.topic_of('dark_factory', 'm1') == 'dup_topic'
         assert resolve_exit(report) == 1
 
-    def test_an_unselected_value_gets_no_verdict_of_any_kind(self):
-        records = [
-            _rec('m1', '!!!'),
-            _rec('', 'no_id'),
-            _rec('m2', 'dup_topic'), _rec('m3', 'dup-topic'),
-            _rec('m4', 'plain_legacy'),
-        ]
-
-        unnarrowed = _mod.plan_renames(records, project_id='dark_factory')
-        narrowed = _mod.plan_renames(records, project_id='dark_factory',
-                                     topics=frozenset({'other_legacy'}))
-
-        assert sorted(entry['reason'] for entry in unnarrowed[1]) == [
-            'record_without_id', 'slug_collision', 'topic_unfoldable',
-        ]
-        assert [rename.old_topic for rename in unnarrowed[0]] == ['plain_legacy']
-        assert narrowed == ([], [])
-
     @pytest.mark.asyncio
     async def test_only_a_selected_values_id_less_record_is_filed(self):
         """A refusal that is not a collision is narrowed by its legacy value too.
@@ -3830,8 +2269,8 @@ class TestTopicSelection:
     def _gated_legacy_a() -> tuple[MagicMock, _FakeCorpus, object]:
         """``legacy_a`` carries a record and a gate; ``other_slug`` only a gate."""
         service, corpus = _run_service({'dark_factory': [_crec('m1', 'legacy_a')]})
-        census = _census(tasks=[_gate_task('4220', 'legacy_a'),
-                                _gate_task('4221', 'other_slug')])
+        census = _census(tasks=[gate_task('4220', 'legacy_a'),
+                                gate_task('4221', 'other_slug')])
         return service, corpus, census
 
     @pytest.mark.asyncio
@@ -3839,7 +2278,7 @@ class TestTopicSelection:
         service, _corpus, census = self._gated_legacy_a()
 
         report = await run_sweep(service, projects=('dark_factory',), gates=census,
-                                 client=_client(), topics=frozenset({'legacy_a'}))
+                                 client=mcp_client(), topics=frozenset({'legacy_a'}))
 
         assert [(row['gate_task_id'], row['outcome']) for row in report['gate_results']] == [
             ('4220', 'would_patch_gate'),
@@ -3851,7 +2290,7 @@ class TestTopicSelection:
         service, _corpus, census = self._gated_legacy_a()
 
         report = await run_sweep(service, projects=('dark_factory',), gates=census,
-                                 client=_client())
+                                 client=mcp_client())
 
         assert [entry['gate_topic'] for entry in report['skips']['orphan_gate_topic']] == [
             'other_slug',
@@ -3924,7 +2363,7 @@ class TestTopicSelection:
         corpus = _FakeCorpus({'dark_factory': [
             _crec('df1', 'legacy_a'), _crec('df2', 'legacy_b'), _crec('df3', 'legacy_c'),
         ]})
-        client = _census_client({'/repo': _listing('dark_factory', '/repo')})
+        client = census_client({'/repo': task_listing('dark_factory', '/repo')})
         open_memory, open_client, _urls = _openers(corpus, client)
 
         code = _mod.main(

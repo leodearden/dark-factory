@@ -1260,7 +1260,7 @@ async def _run_cold_shadow_verify(
     Creates an ephemeral ``_merge-<uuid>`` worktree at *merge_commit* via
     :meth:`~orchestrator.git_ops.GitOps.create_ephemeral_verify_worktree`,
     runs the full merge verify (build_merge_verify_spec + VerifyRunnerPool
-    dispatch — the same execution path as ``_run_post_merge_verify``), parses
+    dispatch — the same execution path as ``merge_lane/post_merge_verify.py::run_post_merge_verify``), parses
     the per-test results from the output, and removes the throwaway worktree
     in a ``finally`` block.
 

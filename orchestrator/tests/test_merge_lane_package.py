@@ -7,13 +7,17 @@ aliases, so each old name must now fail to import. The ports are
 pinned by driving a real ``MergeLane`` over a real git repository with the
 fakes from ``_merge_lane_fakes`` injected: the injected verifier decides
 whether a branch lands, and the injected clock is the one the worker ages
-its worktrees by. Every observation is a public one -- a ``MergeOutcome``,
-``main``'s tip, a reap report -- never a worker attribute.
+its worktrees by. The production verifier's cold-shadow leg is pinned to
+bind the verifier that owns it, and a lane wired with a fake verifier is
+pinned to run its warm/cold shadow compare's cold leg through that fake.
+Every observation is a public one -- a ``MergeOutcome``, ``main``'s tip, a
+reap report, an emitted event -- never a worker attribute.
 """
 from __future__ import annotations
 
 import ast
 import asyncio
+import dataclasses
 import importlib
 import subprocess
 import sys
@@ -25,6 +29,7 @@ import pytest
 from _merge_lane_fakes import (
     FakeClock,
     FakeVerifier,
+    VerifyScript,
     fails,
     lane_scene_config,
     main_health_probe_spawned,
@@ -33,6 +38,7 @@ from _orch_helpers import make_placeholder_future, wait_responsive
 
 import orchestrator.merge_lane as merge_lane
 from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_lane import (
     DiscardingEscalations,
@@ -41,15 +47,18 @@ from orchestrator.merge_lane import (
     MergeOutcome,
     MergeRequest,
     ProductionEscalations,
+    ProductionVerifier,
     QueuedBranch,
 )
 from orchestrator.merge_lane import ports as lane_ports
+from orchestrator.merge_lane.inflight_verify import resolve_dispatch_time_merge_base
 from orchestrator.merge_lane.ports import escalation_port
 from orchestrator.merge_lane.worker import (
     PRODUCTION_CLOCK,
+    PRODUCTION_VERIFIER,
     SpeculativeMergeWorker,
-    resolve_dispatch_time_merge_base,
 )
+from orchestrator.verify import VerifyResult
 
 # ---------------------------------------------------------------------------
 # The façade
@@ -335,6 +344,117 @@ async def test_the_injected_clock_is_what_the_worker_ages_worktrees_by(
     report = await MergeLane(git_ops, queue, clock=next_week).reap_orphaned_merge_worktrees()
     assert report['reaped'] == [str(stray)]
     assert not stray.exists()
+
+
+# ---------------------------------------------------------------------------
+# The verify port's cold-shadow leg
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class _Call:
+    args: tuple[Any, ...]
+    options: dict[str, Any]
+
+
+class _RecordingStub:
+    """An async collaborator function that keeps every call it receives."""
+
+    def __init__(self) -> None:
+        self.calls: list[_Call] = []
+
+    async def __call__(self, *args: Any, **options: Any) -> dict[str, str]:
+        self.calls.append(_Call(args, options))
+        return {}
+
+
+def _recording_production_verifier() -> tuple[ProductionVerifier, dict[str, _RecordingStub]]:
+    stubs = {field.name: _RecordingStub() for field in dataclasses.fields(ProductionVerifier)}
+    resolvers: dict[str, Any] = {name: (lambda stub=stub: stub) for name, stub in stubs.items()}
+    return ProductionVerifier(**resolvers), stubs
+
+
+@pytest.mark.asyncio
+async def test_the_cold_shadow_port_binds_the_verifier_that_owns_it() -> None:
+    """Two distinct ports, so a binding to one global cannot pass by coincidence."""
+    first, first_stubs = _recording_production_verifier()
+    second, second_stubs = _recording_production_verifier()
+    assert first is not second
+
+    for port, stubs in ((first, first_stubs), (second, second_stubs)):
+        assert await port.cold_shadow('git_ops', 'req', 'abc123', None) == {}
+        (call,) = stubs['cold_shadow_verify'].calls
+        assert call.args == ('git_ops', 'req', 'abc123', None)
+        assert call.options.get('verifier') is port
+        assert call.options.get('verifier') is not PRODUCTION_VERIFIER
+        assert all(not stub.calls for name, stub in stubs.items() if name != 'cold_shadow_verify')
+
+
+class _ParityBellEventStore(EventStore):
+    """A real event store that also rings when a shadow compare confirms parity."""
+
+    def __init__(self, db_path: Path) -> None:
+        super().__init__(db_path, run_id='run-test')
+        self.parity = asyncio.Event()
+
+    def emit(
+        self,
+        event_type: EventType,
+        *,
+        task_id: str | None = None,
+        phase: str | None = None,
+        role: str | None = None,
+        data: dict | None = None,
+        cost_usd: float | None = None,
+        duration_ms: int | None = None,
+    ) -> None:
+        super().emit(
+            event_type, task_id=task_id, phase=phase, role=role, data=data,
+            cost_usd=cost_usd, duration_ms=duration_ms,
+        )
+        if event_type == EventType.verdict_parity_ok:
+            self.parity.set()
+
+
+#: Verify output that parses into a per-test map, so the land is shadowed by
+#: the per-test cold leg, and both legs agree on it.
+_PER_TEST_OUTPUT = '        PASS [   0.1s] crate some::test\n'
+
+
+@pytest.mark.asyncio
+async def test_a_fake_verifier_lane_runs_its_cold_shadow_leg_through_the_fake(
+    git_ops: GitOps, git_config: GitConfig, tmp_path: Path,
+) -> None:
+    shadowed = lane_scene_config(git_ops.project_root, git_config.model_copy(update={
+        'persistent_merge_worktree': True,
+        'warm_verify_shadow_compare': True,
+        'warm_verify_shadow_compare_every_n_merges': 1,
+    }))
+    verifier = FakeVerifier(default=VerifyScript(result=VerifyResult(
+        passed=True, test_output=_PER_TEST_OUTPUT, lint_output='', type_output='',
+        summary='fake verify passed',
+    )))
+    events = _ParityBellEventStore(tmp_path / 'events.db')
+    worktree = await _branch_with_file(git_ops, 'shadowed', 'shadowed.py')
+    queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+    worker = MergeLane(git_ops, queue, event_store=events, verifier=verifier)
+    worker_task = asyncio.create_task(worker.run())
+    try:
+        request = _request('shadowed', worktree, shadowed)
+        await queue.put(request)
+        outcome = await wait_responsive(request.result, label='shadowed merge outcome')
+        assert outcome.status == 'done', outcome
+        await wait_responsive(events.parity.wait(), label='shadow compare parity event')
+    finally:
+        await worker.stop()
+        await worker_task
+
+    (parity,) = events.fetch_events_by_type(EventType.verdict_parity_ok)
+    assert parity['data']['merge_commit'] == outcome.merge_sha
+    warm, cold = verifier.verify_calls
+    assert (warm.task_id, cold.task_id) == ('shadowed', 'shadowed')
+    assert cold.worktree != warm.worktree
+    assert cold.worktree.name.startswith('_merge-')
 
 
 # ---------------------------------------------------------------------------

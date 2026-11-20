@@ -280,7 +280,7 @@ sys.exit(int(os.environ.get("FAKE_SWEEP_RC", "0")))
 '''
 
 
-def _run_wrapper(tmp_path: Path, **env: str) -> tuple[subprocess.CompletedProcess[str], dict]:
+def _run_wrapper(tmp_path: Path, *args: str, **env: str) -> tuple[subprocess.CompletedProcess[str], dict]:
     repo = tmp_path / 'repo'
     repo.mkdir(exist_ok=True)
     (repo / '.env').write_text(f'{_FAKE_POOL_VAR}=fake-wrapper-token-' + 'w' * 30 + '\n')
@@ -295,7 +295,9 @@ def _run_wrapper(tmp_path: Path, **env: str) -> tuple[subprocess.CompletedProces
         'FAKE_SWEEP_RECORD': str(record),
         **env,
     }
-    completed = subprocess.run(['bash', str(WRAPPER)], env=full_env, capture_output=True, text=True, timeout=60)
+    completed = subprocess.run(
+        ['bash', str(WRAPPER), *args], env=full_env, capture_output=True, text=True, timeout=60,
+    )
     return completed, json.loads(record.read_text())
 
 
@@ -304,6 +306,15 @@ def test_the_wrapper_runs_the_sweep_from_its_repo(tmp_path):
 
     assert completed.returncode == 0, completed.stderr
     assert recorded['argv'] == [f'{tmp_path / "repo"}/scripts/transcript_secret_sweep.py']
+
+
+def test_the_wrapper_forwards_its_arguments(tmp_path):
+    completed, recorded = _run_wrapper(tmp_path, '--dry-run', '--host-configs-dir', '/x')
+
+    assert completed.returncode == 0, completed.stderr
+    assert recorded['argv'] == [
+        f'{tmp_path / "repo"}/scripts/transcript_secret_sweep.py', '--dry-run', '--host-configs-dir', '/x',
+    ]
 
 
 def test_the_wrapper_sources_the_repo_env_so_the_sweep_sees_live_values(tmp_path):

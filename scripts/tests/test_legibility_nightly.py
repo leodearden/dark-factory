@@ -32,6 +32,7 @@ from legibility import (
     census_trigger,
     check_trickle_health,
     codebook,
+    coder,
     detectors,
     digest,
     invariants,
@@ -1917,26 +1918,15 @@ class TestRunNightlyRunsOnThePooledSessionRunner:
         assert result.exit_code == 0
         assert len(seen) == 1
 
-    @pytest.mark.parametrize('spelling', ['coder', 'legibility.coder'])
-    def test_the_capped_arm_catches_no_headroom_however_coder_was_imported(
-        self, spelling,
-    ):
-        """scripts/legibility/ is on sys.path as well as scripts/, so census's
-        bare `import coder` and nightly's `from legibility import coder` build
-        two distinct coder module objects. The invocation-boundary exceptions
-        live in session_runner, reached by the package spelling only, so both
-        coders catch the ONE NoHeadroom class the invoker raises. A mismatch
-        would let a capped digest escape run_nightly instead of reaching task
-        4736's exit-0 DEFERRED path.
+    def test_the_capped_arm_catches_the_invokers_no_headroom(self):
+        """The coder's capped arm catches the ONE session_runner.NoHeadroom
+        class the invoker raises. A mismatch would let a capped digest escape
+        run_nightly instead of reaching task 4736's exit-0 DEFERRED path.
         """
-        import importlib
-
-        coder_module = importlib.import_module(spelling)
-
         def capped_invoke(prompt, model):
             raise session_runner.NoHeadroom('no headroom')
 
-        result = coder_module.code_digest(
+        result = coder.code_digest(
             _HAND_DIGEST_FOR_IDENTITY, {'entries': []}, project='dark_factory',
             invoke=capped_invoke, invariant_slugs=(),
         )

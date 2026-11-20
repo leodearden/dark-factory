@@ -382,7 +382,7 @@ def _reconstruct_module_configs(
     * ``module_prefixes == []`` (explicitly persisted empty) -> ``[]``.
       The task genuinely had no assigned modules, so the global-fallback path
       is the correct gate and
-      ``orchestrator.merge_lane.worker::_merge_boundary_module_configs``' deliberate
+      ``orchestrator.merge_lane.post_merge_verify::merge_boundary_module_configs``' deliberate
       no-widen policy is preserved.  Deliberately NOT widened to the registry.
     * ``module_prefixes`` non-empty -> one ``ModuleConfig`` per prefix via
       ``orchestrator.config::OrchestratorConfig.for_module`` (a longest-prefix

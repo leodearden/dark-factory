@@ -372,7 +372,7 @@ Every auto-closed L2 **MUST** be enumerated in the rotation digest — see [Dige
    b. get_pending_escalations(level=2, compact=True) → pending_l2s
    c. already_promoted = ⋃ member_ids over pending_l2s ∪ stranded, where stranded =
       candidates listed only by a resolved/dismissed L2, found by the ARCHIVE-INCLUSIVE
-      cross-check get_task_escalations(task_id=tid, level=2, status=None, compact=True),
+      cross-check get_task_escalations(task_id=tid, level=2, compact=True),
       one call per DISTINCT candidate task_id
    d. work_batch = [e for e in candidate_l1s if e["id"] not in already_promoted]
    e. Close each stranded member (its L2's cascade missed it) — see Draining pending escalations
@@ -412,7 +412,7 @@ On startup and after each watcher fire:
 
 1. Fetch L1 candidates: `mcp__escalation__get_pending_escalations(level=1)` → `candidate_l1s`, in FULL shape
 2. Fetch pending L2s: `mcp__escalation__get_pending_escalations(level=2, compact=True)` → `pending_l2s`
-3. Build the **already-promoted set**: the union of `member_ids` over every pending L2, plus every **stranded** candidate — one listed in the `member_ids` of a resolved or dismissed L2 that the **archive-inclusive cross-check** returns (one `mcp__escalation__get_task_escalations(task_id=tid, level=2, status=None, compact=True)` call per DISTINCT candidate `task_id`), and in no pending L2's
+3. Build the **already-promoted set**: the union of `member_ids` over every pending L2, plus every **stranded** candidate — one listed in the `member_ids` of a resolved or dismissed L2 that the **archive-inclusive cross-check** returns (one `mcp__escalation__get_task_escalations(task_id=tid, level=2, compact=True)` call per DISTINCT candidate `task_id`), and in no pending L2's
 4. Set `work_batch` = L1 candidates whose `id` is **not** in the already-promoted set
 5. Filter `work_batch` again — drop any item whose existing triage stamp is still fresh and covering (`triaged_at` set, < ~6h old, `updated_at` not newer than `triaged_at` — treating `updated_at is None` as "not newer", never comparing `None` directly against a timestamp string — note still plausibly covers the record); see [Triage-ack freshness contract](#triage-ack-freshness-contract) below for the exact skip rule. **Carve-out — never skip a path-guard synthetic-anchor record on triage freshness:** if the item matches the path-guard discriminator (`category == "scope_violation"` AND (`agent_role == "fused-memory/path-guard"` OR id starts with `esc-task-path-guard`)), keep it in `work_batch` **however fresh its `triaged_at` is**. Rationale in the contract below — a stamp cannot end the respawn loop these records cause, so skipping one merely defers the only action that can.
 
@@ -424,11 +424,11 @@ pending_l2s   = mcp__escalation__get_pending_escalations(level=2, compact=True) 
 
 pending_member_ids = {mid for l2 in pending_l2s for mid in l2.get("member_ids", [])}
 
-# ARCHIVE-INCLUSIVE cross-check: status=None scans queue root + archive/<date>/.
+# ARCHIVE-INCLUSIVE cross-check: status is omitted, so the read scans queue root + archive/<date>/.
 # Issue these calls in parallel, in one turn.
 dispositioned_l2_of = {}   # member L1 id -> a resolved/dismissed L2 row that lists it
 for tid in {e["task_id"] for e in candidate_l1s if e.get("task_id")}:
-    for l2 in mcp__escalation__get_task_escalations(task_id=tid, level=2, status=None, compact=True):
+    for l2 in mcp__escalation__get_task_escalations(task_id=tid, level=2, compact=True):
         if l2["status"] != "pending":
             dispositioned_l2_of |= dict.fromkeys(l2.get("member_ids", []), l2)
 
@@ -445,7 +445,8 @@ work_batch = [e for e in candidate_l1s if e["id"] not in already_promoted]
 - **Why the archive read.** `get_pending_escalations` is pending-only BY DESIGN: a resolved or dismissed L2 is archived and invisible to it. Member L1s stay `status == "pending"` at L1 after promotion, and the L2→member resolve cascade is best-effort (a member that fails to resolve is logged and skipped). Without this read, a member a human already dispositioned re-enters `work_batch` and is re-triaged. `get_task_escalations` is the archive-inclusive counterpart.
 - **Call shape.**
   - The lookup is keyed on `task_id` with NO time dimension, so the current tool needs one call per DISTINCT candidate `task_id`; issue them in parallel, in one turn. Each call scans the whole archive; a bulk read that serves the drain from one scan is task 6004. A date-windowed archive scan bounds the wrong axis and is not used.
-  - `level=2` narrows to promotion targets. `status=None` is what makes the read archive-inclusive; `status='pending'` would reproduce the blindness.
+  - `level=2` narrows to promotion targets. `status` is omitted because the tool is archive-inclusive by default (`escalation/src/escalation/server.py::get_task_escalations`); `status='pending'` would reproduce the blindness.
+  - An optional filter you do not want is left out of the call entirely. Never write it as a key with an empty value, such as `"status": ,`: the harness rejects that as unparseable JSON, and the turn is lost.
   - Every L2 read is `compact=True`, so both unions read one key, `member_ids`.
   - The L1 candidate read stays FULL: the compact projection drops `agent_role` and `detail`, which step 5's carve-out and the category handlers read.
   - `get_task_escalation_history` is the wrong tool here: it has no `compact`, and it returns the full `detail` on every row.
@@ -1334,7 +1335,7 @@ Add to digest: `PROMOTED (L2 <id>): risk_identified — <sentinel_task_id> — <
 ```
 
 **Recover and route each `workflow_blocked=False` strand** (Leo's tier-10 grant of 2026-10-22, moved to L1 by §3.12):
-1. Recover the dismissed note: `mcp__escalation__get_task_escalations(task_id=<strand task_id>, status=None)` (archive-inclusive, full rows), and pick the row by id. Not found → routing failure.
+1. Recover the dismissed note: `mcp__escalation__get_task_escalations(task_id=<strand task_id>)` (archive-inclusive by default, full rows), and pick the row by id. Not found → routing failure.
 2. `mcp__fused-memory__get_task(<strand task_id>)`. Owner `status == "pending"` → append the note, opening with its natural key `strand <esc_id>, recovered from stale-L0 sweep <record id>:`. First look for that key in the `details` of the `get_task` result you already hold. Present → an earlier rotation appended it before it was killed: record the note as appended and skip the call. Absent → `mcp__fused-memory__update_task(id=<strand task_id>, details="strand <esc_id>, recovered from stale-L0 sweep <record id>: <summary + detail verbatim>", append=True, project_root=<project_root>)`. Pending only: task text is never re-read after dispatch.
 3. Otherwise (owner dispatched, terminal, or absent, such as a synthetic anchor) → [Convert to tracked work](#convert-to-tracked-work-file-and-resolve) steps 1–2 for that note, with `spawned_from` = the strand task id or `'N/A'` and R4 `escalation_id` = the strand's own esc id. Convert's exclusions still bind: the tier-10 grant decides where a note is routed and lifts neither of them. Without a pending owner, both of these are routing failures:
    - a curator-origin note (`fused-memory/task-curator` / `fused-memory/ticket-janitor`), which is never filed ([Curator-origin records](#curator-origin-records--promote-never-re-file));

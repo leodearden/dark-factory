@@ -299,9 +299,9 @@ async def _dispatch(
 
     with (
         mock.patch.object(git_ops, 'get_main_sha', side_effect=get_main_sha),
-        mock.patch.object(worker, '_run_inflight_verify', _noop_verify),
+        mock.patch.object(worker.verify_dispatch, 'run_inflight_verify', _noop_verify),
     ):
-        return await worker._dispatch_item(item)
+        return await worker.verify_dispatch.dispatch(item)
 
 
 def _assert_divergence(
@@ -1372,15 +1372,15 @@ class TestFinalizingHeadInFrozenPrefix:
         assert worker.frozen_prefix_tip('main0') == 'sha-Hc'
 
 
-# ── Amendment: _dispatch_item guard wiring tests (review suggestion) ──────────
+# ── Amendment: VerifyDispatcher.dispatch guard wiring tests (review suggestion) ──────────
 
 
 @pytest.mark.asyncio
 class TestDispatchItemGuardWiring:
-    """The §5.3 guard in _dispatch_item is fail-open and fires on the real dispatch path.
+    """The §5.3 guard in VerifyDispatcher.dispatch is fail-open and fires on the real dispatch path.
 
     These tests anchor the integration seam: the guard is wired into
-    _dispatch_item (not just directly callable), and a get_main_sha() error
+    VerifyDispatcher.dispatch (not just directly callable), and a get_main_sha() error
     in the guard is swallowed without blocking verify dispatch.
 
     Setup: items use speculative=True so Mechanism 2 does NOT call get_main_sha
@@ -1393,14 +1393,14 @@ class TestDispatchItemGuardWiring:
     ) -> None:
         """get_main_sha() raising in the guard does not block verify dispatch (fail-open).
 
-        The try/except around the guard in _dispatch_item must swallow any
+        The try/except around the guard in VerifyDispatcher.dispatch must swallow any
         Exception so a transient git error never prevents a verify from launching.
-        Confirms the integration wiring: _dispatch_item returns a verifying
+        Confirms the integration wiring: VerifyDispatcher.dispatch returns a verifying
         InflightEntry even when the guard's git call fails.
         """
         worker = _make_worker(git_ops)
 
-        # Build an item that passes all _dispatch_item early-bailout checks:
+        # Build an item that passes all VerifyDispatcher.dispatch early-bailout checks:
         #   - not abandoned (future not cancelled)
         #   - not operator-halted (_operator_halt not set by default)
         #   - no immediate_outcome
@@ -1419,7 +1419,7 @@ class TestDispatchItemGuardWiring:
 
         # Fail-open: dispatch must return a verifying InflightEntry.
         assert isinstance(result, InflightEntry), (
-            f'_dispatch_item returned {result!r}; expected a verifying InflightEntry '
+            f'VerifyDispatcher.dispatch returned {result!r}; expected a verifying InflightEntry '
             'even when get_main_sha() raises inside the §5.3 guard (fail-open)'
         )
         assert result.verify_task is not None, (
@@ -1440,9 +1440,9 @@ class TestDispatchItemGuardWiring:
         git_repo: Path,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """Guard fires a WARNING on the real _dispatch_item path when base_sha ≠ frozen tip.
+        """Guard fires a WARNING on the real VerifyDispatcher.dispatch path when base_sha ≠ frozen tip.
 
-        Proves the guard is wired into _dispatch_item, not just directly callable.
+        Proves the guard is wired into VerifyDispatcher.dispatch, not just directly callable.
         Setup: frozen predecessor with merge_commit='sha-Dc'; dispatch item
         with base_sha='wrong-base' → the wired guard must log a WARNING naming
         the rid, confirming the integration seam is active.
@@ -1477,7 +1477,7 @@ class TestDispatchItemGuardWiring:
         # Guard must have fired at least one WARNING naming the dispatched rid.
         warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
         assert len(warnings) >= 1, (
-            f'expected ≥1 WARNING from the _dispatch_item guard (integration seam), '
+            f'expected ≥1 WARNING from the VerifyDispatcher.dispatch guard (integration seam), '
             f'got {len(warnings)}: {[r.message for r in warnings]}'
         )
         warning_text = ' '.join(r.getMessage() for r in warnings)
@@ -1668,7 +1668,7 @@ class TestRemergeReturnPathParity:
 
     `_remerge` is the SINGLE PRODUCER of recovery items for all five consumer
     paths (`_verifier_loop` head-failure cascade, `_void_and_remerge` INV-3
-    void, `_finalize_inflight` RUNNER_UNAVAILABLE, and `_dispatch_item`'s
+    void, `_finalize_inflight` RUNNER_UNAVAILABLE, and `VerifyDispatcher.dispatch`'s
     dead-base-straggler and Mechanism-2 sites).  Its single exit stamps the
     claim's anchor as `remerge_base` and the claim's permit on whatever
     `_remerge_inner` returned, so the speculative <=> permit invariant

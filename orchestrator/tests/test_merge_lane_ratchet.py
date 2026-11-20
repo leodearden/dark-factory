@@ -1091,7 +1091,7 @@ class TestTestTreeSweep:
                 'orchestrator/tests/test_unrelated.py': (
                     'import json\n\ndef test_y():\n    assert json\n'
                 ),
-                'orchestrator/tests/test_broken.py': 'def (:\n',
+                'orchestrator/tests/test_broken.py': 'from orchestrator.merge_lane import (\n',
             },
         )
 
@@ -1171,6 +1171,131 @@ class TestTestTreeSweep:
                 'private_reads': 0,
             }
         }
+
+    def test_a_file_naming_no_lane_module_is_never_parsed_so_its_syntax_error_is_not_recorded(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The behaviour change of the textual prefilter, stated as a test: a
+        # mid-edit file that cannot be lane-importing no longer marks the
+        # enumeration incomplete. It used to, because every file was parsed.
+        monkeypatch.setattr(lane_cluster, 'TESTS_ROOT', 'orchestrator/tests')
+        root = _committed_tree(
+            tmp_path, {'orchestrator/tests/test_mid_edit.py': 'def (:\n'}
+        )
+        sweep = lane_cluster.sweep_repo(root)
+        assert sweep.unreadable == ()
+        assert sweep.tests == {}
+        assert sweep.test_tree.requested == 1
+
+    def test_an_undecodable_file_is_recorded_whether_or_not_it_names_a_lane_module(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(lane_cluster, 'TESTS_ROOT', 'orchestrator/tests')
+        root = _committed_tree(tmp_path, {'orchestrator/tests/test_ok.py': 'import json\n'})
+        (root / 'orchestrator/tests/test_latin1.py').write_bytes(b'x = "\xff"\n')
+        sweep = lane_cluster.sweep_repo(root)
+        assert sweep.unreadable == ('orchestrator/tests/test_latin1.py',)
+        assert sweep.test_tree.requested == 2
+
+    def test_a_lane_patch_string_without_a_lane_import_is_not_measured(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Patch targets are only ever taken from lane-IMPORTING files
+        # (``test_file_measures_in_tree``), so this file was never in the report;
+        # the prefilter must leave that as it was.
+        monkeypatch.setattr(lane_cluster, 'TESTS_ROOT', 'orchestrator/tests')
+        root = _committed_tree(
+            tmp_path,
+            {
+                'orchestrator/tests/test_patch_only.py': (
+                    'from unittest.mock import patch\n\n'
+                    "def test_p():\n    patch('orchestrator.merge_lane.gates.X')\n"
+                ),
+            },
+        )
+        sweep = lane_cluster.sweep_repo(root)
+        assert sweep.tests == {}
+        assert sweep.unreadable == ()
+
+    def test_a_lane_importing_file_reports_its_string_path_patches(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(lane_cluster, 'TESTS_ROOT', 'orchestrator/tests')
+        root = _committed_tree(
+            tmp_path,
+            {
+                'orchestrator/tests/test_patch_and_import.py': (
+                    'from unittest.mock import patch\n'
+                    'from orchestrator import offline_lane\n\n'
+                    "def test_p():\n    patch('orchestrator.merge_lane.gates.X')\n"
+                ),
+            },
+        )
+        sweep = lane_cluster.sweep_repo(root)
+        assert sweep.tests == {
+            'orchestrator/tests/test_patch_and_import.py': {
+                'patch_targets': ['gates.X'],
+                'private_reads': 0,
+            }
+        }
+
+    @pytest.mark.parametrize(
+        'source',
+        [
+            pytest.param('import orchestrator.git_ops as g\n', id='aliased-plain-import'),
+            pytest.param('from orchestrator import git_ops\n', id='from-package-import-module'),
+            pytest.param('from orchestrator import (\n    json,\n    git_ops,\n)\n', id='parenthesised-list'),
+            pytest.param('from orchestrator.merge_lane import gates\n', id='from-lane-package-import-sub'),
+            pytest.param('from orchestrator.merge_lane.gates import x\n', id='from-lane-submodule'),
+            pytest.param('import orchestrator.merge_lane\n', id='plain-lane-package'),
+            pytest.param('import orchestrator.\\\ngit_ops\n', id='backslash-after-the-dot'),
+            pytest.param('import orchestrator \\\n.git_ops\n', id='backslash-before-the-dot'),
+            pytest.param('from orchestrator.\\\nmerge_lane import x\n', id='backslash-in-from-module'),
+            pytest.param('import orchestrator.ｇit_ops\n', id='full-width-leaf'),
+            pytest.param('from orchestrator import ｇit_ops\n', id='full-width-imported-name'),
+            pytest.param('def f():\n    import orchestrator.recover_main\n', id='function-local'),
+        ],
+    )
+    def test_every_spelling_the_predicate_accepts_survives_the_prefilter(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: str
+    ) -> None:
+        assert lane_cluster.imports_lane_module(source, path='t.py') is True
+        monkeypatch.setattr(lane_cluster, 'TESTS_ROOT', 'orchestrator/tests')
+        root = _committed_tree(tmp_path, {'orchestrator/tests/test_spelling.py': source})
+        assert list(lane_cluster.sweep_repo(root).tests) == [
+            'orchestrator/tests/test_spelling.py'
+        ]
+
+    def test_the_prefilter_follows_lane_package_and_cluster_paths(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(lane_cluster, 'TESTS_ROOT', 'orchestrator/tests')
+        monkeypatch.setattr(lane_cluster, 'LANE_PACKAGE', 'orchestrator.moved_lane')
+        monkeypatch.setattr(
+            lane_cluster, 'CLUSTER_PATHS', ('orchestrator/src/orchestrator/renamed_engine.py',)
+        )
+        root = _committed_tree(
+            tmp_path,
+            {
+                'orchestrator/tests/test_pkg.py': 'from orchestrator import moved_lane\n',
+                'orchestrator/tests/test_mod.py': 'import orchestrator.renamed_engine\n',
+                'orchestrator/tests/test_old.py': 'from orchestrator import git_ops\n',
+            },
+        )
+        assert list(lane_cluster.sweep_repo(root).tests) == [
+            'orchestrator/tests/test_mod.py',
+            'orchestrator/tests/test_pkg.py',
+        ]
+
+    def test_an_import_of_an_unrelated_module_stays_out(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(lane_cluster, 'TESTS_ROOT', 'orchestrator/tests')
+        root = _committed_tree(
+            tmp_path,
+            {'orchestrator/tests/test_other.py': 'import orchestrator.workflow\n'},
+        )
+        assert lane_cluster.sweep_repo(root).tests == {}
 
     def test_an_unreadable_cluster_path_is_not_masked_by_a_clean_sweep(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
