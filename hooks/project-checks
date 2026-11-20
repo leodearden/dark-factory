@@ -241,10 +241,11 @@ fi
 # or a repo-root module other than conftest.py, lists every module's type
 # check, on a host whose merge verifies already load it. Units are reported
 # in listing order. Each unit runs in its own session, so a terminal's Ctrl-C
-# or hangup reaches only this hook. On INT, TERM or HUP the hook TERMs every
-# unit's whole process group, descendants a dying parent orphaned included,
-# and ignores further INT, TERM and HUP while it does. The unit logs go on any
-# exit.
+# or hangup reaches only this hook, and a SIGKILL to the commit's group, which
+# no hook can trap, reaches no unit at all. On INT, TERM or HUP the hook TERMs
+# every unit's whole process group, descendants a dying parent orphaned
+# included, and ignores further INT, TERM and HUP while it does. The unit logs
+# go on any exit.
 GATE_SLOTS=4
 gate_start=$SECONDS
 staged="$(cd "$ROOT" && git -c core.quotepath=false diff --cached --no-renames --name-only --diff-filter=ACMRD)" || {

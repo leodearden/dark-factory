@@ -12,6 +12,7 @@ at most ``GATE_SLOTS`` units at once, and an interrupted commit stops them.
 """
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import os
 import re
@@ -286,6 +287,36 @@ def _eventually(condition: Callable[[], bool], timeout_secs: float) -> bool:
     return True
 
 
+def _start_commit(repo: HookRepo, hook_tmp: Path, out_path: Path) -> subprocess.Popen[bytes]:
+    with out_path.open('w', encoding='utf-8') as out:
+        return subprocess.Popen(
+            ['git', 'commit', '-m', 't'],
+            cwd=repo.root,
+            env={**repo.env, 'TMPDIR': str(hook_tmp)},
+            stdout=out,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+
+
+def _written_pid(pid_file: Path, out_path: Path) -> int:
+    assert _eventually(lambda: pid_file.is_file() and pid_file.read_text().strip() != '', 120), (
+        out_path.read_text(encoding='utf-8')
+    )
+    return int(pid_file.read_text())
+
+
+def _kill_leftovers(commit: subprocess.Popen[bytes], unit_pids: list[int]) -> None:
+    """Each unit runs in its own session, which a SIGKILL to the commit's group never reaches."""
+    if commit.poll() is None:
+        os.killpg(commit.pid, signal.SIGKILL)
+        commit.wait()
+    for pid in unit_pids:
+        if _pid_alive(pid):
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(os.getpgid(pid), signal.SIGKILL)
+
+
 def _hook_pid(git_pid: int) -> int:
     children = Path(f'/proc/{git_pid}/task/{git_pid}/children').read_text(encoding='utf-8').split()
     assert len(children) == 1, children
@@ -331,32 +362,18 @@ def test_an_interrupted_commit_stops_its_units_and_removes_their_logs(
     hook_tmp.mkdir()
     out_path = tmp_path / 'commit.out'
 
-    with out_path.open('w', encoding='utf-8') as out:
-        commit = subprocess.Popen(
-            ['git', 'commit', '-m', 't'],
-            cwd=repo.root,
-            env={**repo.env, 'TMPDIR': str(hook_tmp)},
-            stdout=out,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
-    unit_pid: int | None = None
+    commit = _start_commit(repo, hook_tmp, out_path)
+    unit_pids: list[int] = []
     try:
-        assert _eventually(lambda: pid_file.is_file() and pid_file.read_text().strip() != '', 120), (
-            out_path.read_text(encoding='utf-8')
-        )
-        pid = unit_pid = int(pid_file.read_text())
+        pid = _written_pid(pid_file, out_path)
+        unit_pids.append(pid)
         interrupt(commit.pid)
         commit.wait(timeout=60)
         stopped = _eventually(lambda: not _pid_alive(pid), 30)
         logs_removed = _eventually(lambda: not any(hook_tmp.iterdir()), 30)
     finally:
-        if commit.poll() is None:
-            os.killpg(commit.pid, signal.SIGKILL)
-            commit.wait()
-        if unit_pid is not None and _pid_alive(unit_pid):
-            os.kill(unit_pid, signal.SIGKILL)
+        _kill_leftovers(commit, unit_pids)
 
     assert repo.head() == before
-    assert stopped, f'unit pid {unit_pid} outlived the interrupted commit'
+    assert stopped, f'unit pid {pid} outlived the interrupted commit'
     assert logs_removed, sorted(path.name for path in hook_tmp.iterdir())
