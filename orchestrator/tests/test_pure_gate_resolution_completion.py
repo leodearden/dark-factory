@@ -77,7 +77,7 @@ async def _blocked_gate(h: Harness, task_id: str, **metadata) -> Escalation:
 
 
 async def _resolve(h: Harness, esc_id: str, action: str = 'resume') -> Escalation:
-    esc = _queue(h).resolve(esc_id, 'proceed', resolution_action=action)
+    esc = _queue(h).resolve(esc_id, 'proceed', resolution_action=action, resolution_class='actionable')
     assert esc is not None
     h._on_escalation_resolved(esc)
     await asyncio.gather(*list(h._background_tasks))

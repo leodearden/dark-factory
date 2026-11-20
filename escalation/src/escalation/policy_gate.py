@@ -25,7 +25,7 @@ from escalation.authority import (
     coordinator_denied,
     executor_refusal,
 )
-from escalation.models import Escalation
+from escalation.models import RESOLUTION_CLASS_REQUIRED_CODE, Escalation
 from escalation.policy_state import PolicyStateUnreadable, load_class_states
 from escalation.queue import EscalationQueue
 from escalation.store_identity import QueueKind, StoreIdentity
@@ -66,7 +66,7 @@ def identity_resolve_refusal(
         if resolution_class is None:
             return {
                 'error': 'an executor resolve must state its resolution_class',
-                'code': 'resolution_class_required',
+                'code': RESOLUTION_CLASS_REQUIRED_CODE,
             }
         try:
             state = load_class_states(queue_dir)

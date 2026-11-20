@@ -557,7 +557,7 @@ class TestB4Proceed:
         queue: EscalationQueue = h._escalation_queue  # type: ignore[assignment]
         pending = queue.get_by_task(task_id, status='pending')
         assert pending, 'Pre-condition: must have a pending L2 after first dispatch'
-        queue.resolve(pending[0].id, resolution='proceed')
+        queue.resolve(pending[0].id, resolution='proceed', resolution_class='actionable')
 
         # Re-pend via the production resume path (stamps preserved — NOT cleared)
         await h._action_teardown_and_set_status(task_id, 'pending', 'resume', escalation_id=f'esc-{task_id}-1')
@@ -643,7 +643,7 @@ class TestB5NoGo:
         queue: EscalationQueue = h._escalation_queue  # type: ignore[assignment]
         pending = queue.get_by_task(gate_id, status='pending')
         assert pending, 'Pre-condition: pending L2 must exist after first dispatch'
-        queue.resolve(pending[0].id, resolution='no-go')
+        queue.resolve(pending[0].id, resolution='no-go', resolution_class='actionable')
 
         # Add the new design task N into the store
         n_task = {

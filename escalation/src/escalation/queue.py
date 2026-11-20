@@ -50,6 +50,7 @@ from escalation.declared_pins import normalise_declarers
 from escalation.models import (
     PERSIST_CHECK_ABSENT,
     PERSIST_CHECK_UNREADABLE,
+    RESOLUTION_CLASS_REQUIRED_CODE,
     RESOLUTION_CLASSES,
     STATUS_ACCEPTED_UNPERSISTED,
     Escalation,
@@ -58,6 +59,7 @@ from escalation.models import (
     max_severity,
     note_to_file_class_conflict,
     recut_action_conflict,
+    resolution_class_missing,
 )
 
 logger = logging.getLogger(__name__)
@@ -373,18 +375,38 @@ def blank_resolve_outcome() -> ResolveOutcome:
     }
 
 
+class ResolutionClassRequired(ValueError):
+    """A close of a record whose level requires a resolution_class stated none.
+
+    Raised before anything is written; :attr:`code` is the wire code
+    ``escalation/src/escalation/server.py::resolve_issue`` answers with.
+    """
+
+    def __init__(self, reason: str, *, escalation: Escalation, resolved_by: str | None) -> None:
+        super().__init__(f'{reason} (resolved_by={resolved_by!r})')
+        self.code = RESOLUTION_CLASS_REQUIRED_CODE
+        self.escalation_id = escalation.id
+        self.level = escalation.level
+        self.resolved_by = resolved_by
+
+
 def _stamped_resolution_class(
     escalation: Escalation, resolution_class: str | None, resolved_by: str | None,
 ) -> str | None:
     """The class a terminal write stamps: *resolution_class*, else the resolver default.
 
-    ``ValueError`` with ``models.note_to_file_class_conflict``'s message when
-    *escalation* cannot carry that class.
+    ``ResolutionClassRequired`` when *escalation*'s level requires a class and
+    neither supplies one (``models.resolution_class_missing``); ``ValueError``
+    with ``models.note_to_file_class_conflict``'s message when *escalation*
+    cannot carry that class.
     """
     stamped = (
         resolution_class if resolution_class is not None
         else default_resolution_class_for_resolver(resolved_by)
     )
+    missing = resolution_class_missing(escalation, stamped)
+    if missing is not None:
+        raise ResolutionClassRequired(missing, escalation=escalation, resolved_by=resolved_by)
     conflict = note_to_file_class_conflict(escalation, stamped)
     if conflict is not None:
         raise ValueError(conflict)
@@ -1416,6 +1438,7 @@ class EscalationQueue:
         resolution_action: str | None = None,
         recut: bool = False,
         outcome: ResolveOutcome | None = None,
+        ruled_by_human: bool | None = None,
     ) -> Escalation | None:
         """Update an escalation's status to resolved or dismissed.
 
@@ -1450,7 +1473,16 @@ class EscalationQueue:
         the caller's ``resolved_by`` (see ``escalation.classify.
         default_resolution_class_for_resolver``). A class the record cannot
         carry (``models.note_to_file_class_conflict``) raises ``ValueError``
-        inside the critical section before anything is written.
+        inside the critical section before anything is written. A record whose
+        level requires a class (``models.CLASS_REQUIRED_LEVELS``, level 2) closed
+        with neither an explicit class nor a non-null resolver default raises
+        ``ResolutionClassRequired`` there too, so the refusal writes nothing
+        (INV-1; plans/instruments-honesty-prd.md decision 8).
+
+        ``ruled_by_human`` (plans/instruments-honesty-prd.md decision 9): the
+        caller's assertion that a human ruled on this record, stamped beside
+        ``resolution_class`` on the applied path only and forwarded through the
+        member cascade.
 
         ``outcome`` (task 4495): an optional :class:`ResolveOutcome` dict filled
         in place with what this call DID — whether the resolution was actually
@@ -1585,6 +1617,8 @@ class EscalationQueue:
             if resolution_turns is not None:
                 esc.resolution_turns = resolution_turns
             esc.resolution_class = stamped_class
+            if ruled_by_human is not None:
+                esc.ruled_by_human = ruled_by_human
             if granted_files is not None:
                 esc.granted_files = granted_files
             if resolution_action is not None:
@@ -1626,6 +1660,7 @@ class EscalationQueue:
                         dismiss=dismiss,
                         resolved_by=member_resolved_by,
                         resolution_class=esc.resolution_class,
+                        ruled_by_human=esc.ruled_by_human,
                     )
                 except Exception as e:
                     logger.warning(

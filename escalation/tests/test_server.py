@@ -578,7 +578,7 @@ class TestGetTaskEscalations:
         """
         queue = EscalationQueue(tmp_path / 'esc')
         self._seed(queue, 'esc-42-1', level=2, agent_role='deterministic')
-        queue.resolve('esc-42-1', 'Human reviewed the gate')
+        queue.resolve('esc-42-1', 'Human reviewed the gate', resolution_class='actionable')
         self._seed(queue, 'esc-42-2', level=0, agent_role='implementer')
         return queue
 
@@ -748,7 +748,7 @@ class TestStampTriageTool:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
         esc = self._seed_pending_l2(queue)
-        queue.resolve(esc.id, 'Fixed')
+        queue.resolve(esc.id, 'Fixed', resolution_class='actionable')
 
         result = await _stamp_triage(
             server, escalation_id=esc.id,
@@ -2487,7 +2487,7 @@ class TestPromoteToL2Dedup:
         first = await call_promote(
             server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1']},
         )
-        queue.resolve(first['id'], 'Previous resolution')
+        queue.resolve(first['id'], 'Previous resolution', resolution_class='actionable')
 
         # Second call: same root_cause, but first is resolved → new L2 (status='created')
         second = await call_promote(
@@ -3515,7 +3515,7 @@ class TestPromoteToL2Cascade:
         l2_id = l2_result['id']
 
         # Resolve the L2 via MCP tool
-        resolve_result = await call_resolve_issue(server, escalation_id=l2_id, resolution='Root cause fixed')
+        resolve_result = await call_resolve_issue(server, escalation_id=l2_id, resolution='Root cause fixed', resolution_class='actionable')
 
         assert resolve_result.get('status') == 'resolved', (
             f'Expected L2 resolved, got: {resolve_result}'
@@ -3541,7 +3541,7 @@ class TestPromoteToL2Cascade:
             **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1']},
         )
 
-        await call_resolve_issue(server, escalation_id=l2_result['id'], resolution='Fix confirmed in prod')
+        await call_resolve_issue(server, escalation_id=l2_result['id'], resolution='Fix confirmed in prod', resolution_class='actionable')
 
         m1 = queue.get('esc-l1-1')
         assert m1 is not None
@@ -3562,7 +3562,7 @@ class TestPromoteToL2Cascade:
         )
         l2_id = l2_result['id']
 
-        await call_resolve_issue(server, escalation_id=l2_id, resolution='Fixed')
+        await call_resolve_issue(server, escalation_id=l2_id, resolution='Fixed', resolution_class='actionable')
 
         m1 = queue.get('esc-l1-1')
         assert m1 is not None
@@ -3588,6 +3588,7 @@ class TestPromoteToL2Cascade:
             escalation_id=l2_result['id'],
             resolution='Not actionable',
             action='abandon',
+            resolution_class='actionable',
         )
 
         m1 = queue.get('esc-l1-1')
@@ -8570,6 +8571,7 @@ class TestResolveIssueDeclaredPinGuard:
 
         result = await call_resolve_issue(
             server, escalation_id=l2.id, resolution='bulk close', action='close_only',
+            resolution_class='benign',
         )
 
         assert 'code' not in result, result
@@ -8606,6 +8608,7 @@ class TestResolveIssueDeclaredPinGuard:
 
         result = await call_resolve_issue(
             server, escalation_id=l2.id, resolution='bulk close', action='close_only',
+            resolution_class='benign',
         )
 
         assert 'code' not in result, result
@@ -8642,6 +8645,7 @@ class TestResolveIssueDeclaredPinGuard:
 
         result = await call_resolve_issue(
             server, escalation_id=l2.id, resolution='bulk close', action='close_only',
+            resolution_class='benign',
         )
 
         assert 'code' not in result, result
@@ -8697,6 +8701,7 @@ class TestResolveIssueDeclaredPinGuard:
         result = await call_resolve_issue(
             server, escalation_id=l2.id, resolution='deliberately spending it',
             action='close_only', acknowledge_declared_pins=['esc-3371-2'],
+            resolution_class='benign',
         )
 
         assert 'code' not in result, result

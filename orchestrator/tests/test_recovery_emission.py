@@ -1870,7 +1870,7 @@ class TestPendingHolderCandidates:
         queue = EscalationQueue(tmp_path / 'queue')
         queue.submit(_row('esc-9-2', level=2, members=('esc-1',), task_id='9'))
         queue.submit(_row('esc-9-3', level=2, task_id='9'))
-        queue.resolve('esc-9-3', 'done')
+        queue.resolve('esc-9-3', 'done', resolution_class='actionable')
         return queue
 
     @pytest.mark.parametrize('site', sorted(STREAK_CHARGING_SITES))

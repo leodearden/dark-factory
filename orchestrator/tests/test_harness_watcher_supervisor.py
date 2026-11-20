@@ -3881,7 +3881,7 @@ class TestWatcherHasActionableL1:
             return resolve(self, escalation_id, *args, **kwargs)
 
         with patch.object(EscalationQueue, 'resolve', resolve_missing_the_member):
-            queue.resolve(l2_id, 'human answered the cluster')
+            queue.resolve(l2_id, 'human answered the cluster', resolution_class='actionable')
 
         l2, l1 = queue.get(l2_id), queue.get(l1_id)
         assert l2 is not None and l2.status == 'resolved'

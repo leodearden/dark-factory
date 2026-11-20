@@ -338,6 +338,7 @@ class TestC1HeaderlessFullL2Authority:
 
         result_resume = await _resolve_over_http(
             base_url, escalation_id=esc_resume.id, resolution='fixed', action='resume',
+            resolution_class='actionable',
         )
         assert 'error' not in result_resume, f'Unexpected error: {result_resume}'
         reread_resume = queue.get(esc_resume.id)
@@ -360,6 +361,7 @@ class TestC1HeaderlessFullL2Authority:
 
         result_close = await _resolve_over_http(
             base_url, escalation_id=esc_close.id, resolution='n/a', action='close_only',
+            resolution_class='benign',
         )
         assert 'error' not in result_close, f'Unexpected error: {result_close}'
         reread_close = queue.get(esc_close.id)

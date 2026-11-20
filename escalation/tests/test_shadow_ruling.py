@@ -636,7 +636,7 @@ class _Fixture:
 
     def resolve(self, record: Escalation, *, by: str, dismiss: bool = True) -> Escalation:
         resolved = self.queue.resolve(
-            record.id, 'ruled', dismiss=dismiss, resolved_by=by,
+            record.id, 'ruled', dismiss=dismiss, resolved_by=by, resolution_class='actionable',
         )
         assert resolved is not None
         return resolved
@@ -918,7 +918,9 @@ class TestSelfResolvedBucket:
             record.id, triaged_by=None, triage_note=_stamped_note(_ruling()),
         )
         assert stamped is not None and stamped.triaged_by is None
-        resolved = fixture.queue.resolve(record.id, 'ruled', dismiss=True, resolved_by=None)
+        resolved = fixture.queue.resolve(
+            record.id, 'ruled', dismiss=True, resolved_by=None, resolution_class='actionable',
+        )
         assert resolved is not None and resolved.resolved_by is None
 
         report = fixture.report()

@@ -941,6 +941,23 @@ def recut_action_conflict(resolution_action: str | None, recut: bool) -> str | N
     return f"recut=True applies only to action='restart'; got action={resolution_action!r}"
 
 
+# The wire code of every refusal for a close that states no resolution_class.
+RESOLUTION_CLASS_REQUIRED_CODE: str = 'resolution_class_required'
+# Ladder levels whose close must carry a resolution_class
+# (plans/instruments-honesty-prd.md decision 8).
+CLASS_REQUIRED_LEVELS: frozenset[int] = frozenset({2})
+
+
+def resolution_class_missing(escalation: Escalation, stamped_class: str | None) -> str | None:
+    """Why *escalation* cannot close with *stamped_class*, a missing class, else None."""
+    if stamped_class is not None or escalation.level not in CLASS_REQUIRED_LEVELS:
+        return None
+    return (
+        f'escalation {escalation.id}: a level {escalation.level} close must state its '
+        'resolution_class; the record is unchanged'
+    )
+
+
 def note_to_file_class_conflict(escalation: Escalation, resolution_class: str | None) -> str | None:
     """Why *escalation* cannot carry *resolution_class* under the note-to-file pairing, else None."""
     if escalation.note_to_file == (resolution_class == NOTE_TO_FILE_CLASS):

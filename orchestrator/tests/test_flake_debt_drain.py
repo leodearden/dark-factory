@@ -654,7 +654,7 @@ class TestRegressionFromTheDrain:
 
         (esc,) = queue.regressions()
         assert _item(db, A).last_error == DueFailure.TASK_CLIENT_FAILED.value
-        queue.resolve(esc.id, 'looked at it by hand', resolved_by='interactive')
+        queue.resolve(esc.id, 'looked at it by hand', resolved_by='interactive', resolution_class='actionable')
         client.submit_raises = None
         clock.advance(timedelta(minutes=6))
         await _pass(db, client, clock, queue=queue)

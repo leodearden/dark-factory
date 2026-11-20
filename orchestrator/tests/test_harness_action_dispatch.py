@@ -708,7 +708,7 @@ class TestDispatchTeardownNoKill:
         harness.is_workflow_active = MagicMock(return_value=False)
         queue.set_resolve_callback(harness._on_escalation_resolved)
 
-        queue.resolve(l2.id, 'legacy dismiss', dismiss=True)
+        queue.resolve(l2.id, 'legacy dismiss', dismiss=True, resolution_class='benign')
         await asyncio.gather(*list(harness._background_tasks))
 
         # Legacy L2 dismissed → close_only → no status write
