@@ -18,6 +18,7 @@ from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any, TypeVar
 
+from escalation.models import RESOLUTION_CLASSES
 from orchestrator.decision_registry import UNKNOWN_QUEUE, DecisionState, qualify_decision_id
 from shared.project_id import fold_project_token
 from sitting.inventory import OpenItem, queue_tag
@@ -28,6 +29,9 @@ PREPARED_MARKER = 'x_prepared:'
 AGREED_MARKER = 'x_agreed:'
 X_RULING_KEY = 'x_ruling'
 X_RULING_TEXT_CAP = 600
+SITTING_RULING_CLASS = 'actionable'
+"""The class of a close that carries a human decision on the record, per
+``skills/escalation-watcher-auto/SKILL.md`` "Classify the resolution (``resolution_class``)"."""
 
 RESOLVE_ACTIONS: tuple[str, ...] = ('resume', 'restart', 'park', 'abandon', 'close_only')
 """Mirrors ``escalation/src/escalation/server.py::RESOLVE_ACTIONS``; the test holds the two equal."""
@@ -117,11 +121,18 @@ class AgreedMarker:
 
 def resolve_issue_payload(
     escalation_id: str, resolution: str, action: str, *, resolved_by: str, resolution_turns: int,
+    resolution_class: str, ruled_by_human: bool,
 ) -> ApplyPayload:
     """The call's arguments only; the server may still refuse a legal action
     (``escalation/src/escalation/server.py::resolve_issue`` "Gate precedence")."""
     if action not in RESOLVE_ACTIONS:
         raise ValueError(f'unknown resolve action {action!r}; expected one of {list(RESOLVE_ACTIONS)}')
+    if resolution_class not in RESOLUTION_CLASSES:
+        raise ValueError(
+            f'unknown resolution_class {resolution_class!r}; expected one of {sorted(RESOLUTION_CLASSES)}',
+        )
+    if type(ruled_by_human) is not bool:
+        raise ValueError(f'ruled_by_human must be a bool, got {ruled_by_human!r}')
     _require_positive_int('resolution_turns', resolution_turns)
     return ApplyPayload('resolve_issue', {
         'escalation_id': escalation_id,
@@ -129,6 +140,8 @@ def resolve_issue_payload(
         'action': action,
         'resolved_by': resolved_by,
         'resolution_turns': resolution_turns,
+        'resolution_class': resolution_class,
+        'ruled_by_human': ruled_by_human,
     })
 
 
