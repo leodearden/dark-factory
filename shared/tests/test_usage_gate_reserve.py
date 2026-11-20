@@ -924,20 +924,17 @@ class TestReserveWaitWakes:
 
 
 async def eventually(check: Callable[[], bool], *, polls: int = 300) -> None:
-    """Poll *check* on a real loop for at most *polls* loop turns 10 ms apart.
+    """Poll *check* on the running loop for at most *polls* loop turns 10 ms apart.
 
-    The budget counts loop turns, not wall clock, so a descheduled loop spends none
-    of it; at most a few seconds, far below the 300 s re-poll, so a pass proves a wake.
+    The budget counts loop turns 10 ms apart on the loop's own clock, real or virtual,
+    so a descheduled loop spends none of it; at most a few seconds, far below the 300 s
+    re-poll, so a pass proves a wake.
     """
     for _ in range(polls):
         if check():
             return
         await asyncio.sleep(0.01)
     assert check(), f'not within {polls} polls'
-
-
-def soon() -> datetime:
-    return datetime.now(UTC) + timedelta(seconds=0.1)
 
 
 class TestTransitionsWakeTheWait:
