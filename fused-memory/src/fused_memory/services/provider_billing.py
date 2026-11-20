@@ -117,11 +117,18 @@ def _carries_status(link: BaseException) -> bool:
 
 
 def _exhaustion(source: BillingSource, link: BaseException) -> BillingExhaustion:
+    return exhaustion_of(source, error_type=type(link).__name__, provider_message=str(link))
+
+
+def exhaustion_of(
+    source: BillingSource, *, error_type: str, provider_message: str,
+) -> BillingExhaustion:
+    """Build the exhaustion of *source*, its provider and key scope filled in."""
     facts = _FACTS_BY_SOURCE[source]
     return BillingExhaustion(
         source=source,
         provider=facts.provider,
         key_scope=facts.key_scope,
-        error_type=type(link).__name__,
-        provider_message=str(link)[:_PROVIDER_MESSAGE_CHARS],
+        error_type=error_type,
+        provider_message=provider_message[:_PROVIDER_MESSAGE_CHARS],
     )
