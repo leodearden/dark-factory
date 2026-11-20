@@ -9,7 +9,8 @@ named by ``classify_residual``. The consumer's string form in the store's
 
 A cgroup path is handled as its tuple of segments below the cgroup root; the
 root is ``()``. Verify scopes are recognised only through
-``shared.verify_scope_tag``.
+``shared.verify_scope_tag``. Project slices are recognised only through
+``shared.cgroup_slice``, besides reify's legacy ``reify.slice``.
 
 D3: ``read_tree`` reads the whole tree post-order (children before their
 parent, so hierarchical counter skew is mostly non-negative), and ``account``
@@ -36,6 +37,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import NamedTuple
 
+from shared.cgroup_slice import is_project_slice_name
 from shared.cgroup_stats import (
     CgroupReading,
     PressureResource,
@@ -129,7 +131,6 @@ _FIXED_ANCHORS = frozenset(
 _USER_ANCHOR = re.compile(r'user-\d+\.slice|user@\d+\.service')
 _ORCHESTRATOR_SERVICE = re.compile(r'orchestrator-.+\.service')
 _WATCHDOG = 'orchestrator-watchdog.service'
-_DF_PROJECT_SLICE = re.compile(r'df-.+\.slice')
 _REIFY_SLICE = 'reify.slice'
 _AGENT_CHILD_PREFIX = 'agent-'
 _FACTORY_SERVICES = frozenset(
@@ -161,7 +162,7 @@ def _is_orchestrator_service(name: str) -> bool:
 
 
 def _is_project_slice(name: str) -> bool:
-    return name == _REIFY_SLICE or _DF_PROJECT_SLICE.fullmatch(name) is not None
+    return name == _REIFY_SLICE or is_project_slice_name(name)
 
 
 def _nearest_anchor(segments: Segments) -> str:
@@ -173,10 +174,14 @@ def _first_index(segments: Segments, predicate: Callable[[str], bool]) -> int | 
     return next((i for i, name in enumerate(segments) if predicate(name)), None)
 
 
+def _enclosing_project_slice(segments: Segments) -> str | None:
+    """The one project slice on the path: the outermost, so a governed sub-slice folds into it."""
+    return next((name for name in segments if _is_project_slice(name)), None)
+
+
 def _service_key(segments: Segments, service_index: int) -> str:
     """The project slice the service sits in, else the service unit itself."""
-    enclosing = [name for name in segments[:service_index] if _is_project_slice(name)]
-    return enclosing[-1] if enclosing else segments[service_index]
+    return _enclosing_project_slice(segments[:service_index]) or segments[service_index]
 
 
 def _orchestrator_service(segments: Segments) -> Consumer | None:
@@ -197,8 +202,8 @@ def _verify_scope(segments: Segments) -> Consumer | None:
 
 
 def _project_slice(segments: Segments) -> Consumer | None:
-    index = _first_index(segments, _is_project_slice)
-    return None if index is None else Consumer(Role.PROJECT, segments[index])
+    slice_name = _enclosing_project_slice(segments)
+    return None if slice_name is None else Consumer(Role.PROJECT, slice_name)
 
 
 def _factory_service(segments: Segments) -> Consumer | None:
@@ -267,7 +272,7 @@ def classify_residual(segments: Segments) -> Consumer:
     if _is_orchestrator_service(own):
         return Consumer(Role.AGENTS, _service_key(segments, len(segments) - 1))
     if _is_project_slice(own):
-        return Consumer(Role.PROJECT, own)
+        return Consumer(Role.PROJECT, _enclosing_project_slice(segments))
     named = _first_named(segments, LEAF_RULES[:-1])
     return named if named is not None else Consumer(Role.EXITED, _nearest_anchor(segments))
 
