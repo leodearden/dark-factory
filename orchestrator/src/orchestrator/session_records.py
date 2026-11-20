@@ -452,7 +452,7 @@ class SessionRecord:
         alone cannot tell "the owner re-minted" from "a nested claude
         inherited the env var". The owning process keeps its pid across a
         re-mint; a nested ``claude`` never shares it. See
-        ``session_hooks._env_slug_is_owned``. A non-int, bool, or
+        ``session_hooks.py::_env_slug_ownership``. A non-int, bool, or
         non-positive value in a record body reads back as None instead of
         surviving unchanged (see ``_coerce_owner_pid``).
     claude_owner_identity: the ProcessIdentity of ``claude_owner_pid``,

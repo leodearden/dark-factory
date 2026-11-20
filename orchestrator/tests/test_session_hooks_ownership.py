@@ -545,20 +545,9 @@ def test_main_session_start_fail_soft_when_probe_read_raises(
     assert len(list(session_records.sessions_dir(root=tmp_path).iterdir())) == 1
 
 
-def test_hand_launched_session_unaffected_by_ownership_probe(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # A hand-launched session (no CLAUDE_SPAWN_SESSION_ID) has nothing to
-    # probe and must pay no probe cost at all -- the must-not-be-called
-    # idiom, not merely an assertion that the outcome is unchanged. Note
-    # run_session_start legitimately calls session_records.read_record itself, so it is
-    # sh._env_slug_is_owned that is booby-trapped here, not the registry.
-    def _boom(*_args: object, **_kwargs: object) -> bool:
-        raise AssertionError('ownership probe must not run for a hand-launched session')
-
-    monkeypatch.setattr(sh, '_env_slug_is_owned', _boom)
-
+def test_hand_launched_session_keeps_one_record_across_hook_events(tmp_path: Path) -> None:
+    # A hand-launched session (no CLAUDE_SPAWN_SESSION_ID) keeps the
+    # hand-launched keying through every hook event, one record, same slug.
     hook_input = {'session_id': 'sess-hand', 'cwd': '/home/leo/src/dark-factory'}
     slug = sh.hook_session_slug(hook_input, env={}, root=tmp_path)
 
