@@ -9,6 +9,8 @@ too.  Migrating a module means deleting its entry.
 from __future__ import annotations
 
 import ast
+from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -132,17 +134,41 @@ _NOT_YET_MIGRATED = frozenset({
 })
 
 
-def _git_argvs(func: ast.AST) -> list[list[object]]:
-    """Every ``['git', <verb>, ...]`` list literal under *func*; non-constant elements are None."""
-    argvs: list[list[object]] = []
+_GLOBAL_OPTIONS_WITH_A_VALUE = frozenset({'-C', '-c', '--git-dir', '--work-tree', '--namespace'})
+
+
+def _verb(argv: Sequence[object]) -> str | None:
+    """The git subcommand after git's global options; None when a non-constant element precedes it."""
+    elements = iter(argv[1:])
+    for element in elements:
+        if not isinstance(element, str):
+            return None
+        if element in _GLOBAL_OPTIONS_WITH_A_VALUE:
+            next(elements, None)
+        elif not element.startswith('-'):
+            return element
+    return None
+
+
+@dataclass(frozen=True)
+class _GitArgv:
+    """One ``['git', ...]`` list literal: its subcommand and every element, non-constant ones as None."""
+
+    verb: str
+    argv: tuple[object, ...]
+
+
+def _git_argvs(func: ast.AST) -> list[_GitArgv]:
+    """Every ``['git', ...]`` list literal under *func* whose verb, read after git's global options, is known."""
+    calls: list[_GitArgv] = []
     for node in ast.walk(func):
         if isinstance(node, ast.List):
-            argv: list[object] = [
+            argv = tuple(
                 elt.value if isinstance(elt, ast.Constant) else None for elt in node.elts
-            ]
-            if len(argv) >= 2 and argv[0] == 'git' and isinstance(argv[1], str):
-                argvs.append(argv)
-    return argvs
+            )
+            if argv and argv[0] == 'git' and (verb := _verb(argv)) is not None:
+                calls.append(_GitArgv(verb, argv))
+    return calls
 
 
 def _local_repo_seeders(tree: ast.Module) -> list[str]:
@@ -150,10 +176,10 @@ def _local_repo_seeders(tree: ast.Module) -> list[str]:
     seeders: list[str] = []
     for func in tree.body:
         if isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            argvs = _git_argvs(func)
+            calls = _git_argvs(func)
             if (
-                any(argv[1] == 'init' and '--bare' not in argv for argv in argvs)
-                and any(argv[1] == 'commit' for argv in argvs)
+                any(call.verb == 'init' and '--bare' not in call.argv for call in calls)
+                and any(call.verb == 'commit' for call in calls)
             ):
                 seeders.append(func.name)
     return seeders
