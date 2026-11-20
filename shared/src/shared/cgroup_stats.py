@@ -29,6 +29,7 @@ from typing import TypeVar
 from shared.psi import parse_pressure_totals
 
 __all__ = [
+    'CGROUP_ROOT',
     'CgroupReading',
     'PressureResource',
     'PressureTotals',
@@ -37,6 +38,8 @@ __all__ = [
     'parse_single_value',
     'read_cgroup',
 ]
+
+CGROUP_ROOT = Path('/sys/fs/cgroup')
 
 CPU_STAT = 'cpu.stat'
 MEMORY_STAT = 'memory.stat'

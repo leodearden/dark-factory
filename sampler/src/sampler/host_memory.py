@@ -3,8 +3,8 @@
 PRD ``plans/per-consumer-resource-recording-prd.md`` C1. The kernel's
 background reclaim (``kswapd<N>``) and compaction (``kcompactd<N>``) threads
 are read from ``/proc/<pid>/stat`` through ``shared.proc_group``, and their
-CPU becomes per-kind increments over the interval by the same D3 counter and
-gap rules ``sampler.consumers`` applies to cgroups. Host used memory is
+CPU becomes per-kind increments over the interval by ``sampler.increments``'
+D3 counter and gap rules, which ``sampler.consumers`` applies to cgroups. Host used memory is
 ``MemTotal - MemAvailable`` from ``/proc/meminfo``; host program memory and
 file cache come from the root cgroup's ``memory.stat``.
 
@@ -23,10 +23,10 @@ from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
 
-from shared.cgroup_stats import MEMORY_STAT, parse_keyed_counters
+from shared.cgroup_stats import CGROUP_ROOT, MEMORY_STAT, parse_keyed_counters
 from shared.proc_group import read_cpu_ticks, read_stat_fields
 
-from sampler.consumers import CGROUP_ROOT, counter_increment, is_gap
+from sampler.increments import counter_increment, is_gap
 
 __all__ = [
     'MEMINFO',

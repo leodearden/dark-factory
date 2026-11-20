@@ -15,8 +15,9 @@ root is ``()``. Verify scopes are recognised only through
 D3: ``read_tree`` reads the whole tree post-order (children before their
 parent, so hierarchical counter skew is mostly non-negative), and ``account``
 turns two collections into per-consumer figures. Gauges are summed over
-members and residuals; counters become increments over the interval, kept
-per cgroup by path and inode in a ``TreeState``. A residual subtracts each
+members and residuals; counters become increments over the interval by
+``sampler.increments``' rules, kept per cgroup by path and inode in a
+``TreeState``. A residual subtracts each
 child's ACCOUNTED figure (its own value when validly read, else its children's
 accounted sum), so an unreadable inner cgroup is never double counted;
 residuals are clamped at zero. Stall totals are not hierarchical: only members
@@ -39,6 +40,7 @@ from typing import NamedTuple
 
 from shared.cgroup_slice import is_project_slice_name
 from shared.cgroup_stats import (
+    CGROUP_ROOT,
     CgroupReading,
     PressureResource,
     PressureTotals,
@@ -47,8 +49,9 @@ from shared.cgroup_stats import (
 )
 from shared.verify_scope_tag import parse_verify_scope_unit
 
+from sampler.increments import counter_increment, is_gap
+
 __all__ = [
-    'CGROUP_ROOT',
     'LEAF_RULES',
     'Accounting',
     'CgroupNode',
@@ -63,14 +66,10 @@ __all__ = [
     'account',
     'classify_member',
     'classify_residual',
-    'counter_increment',
     'encode_consumer',
-    'is_gap',
     'parse_consumer',
     'read_tree',
 ]
-
-CGROUP_ROOT = Path('/sys/fs/cgroup')
 
 Segments = tuple[str, ...]
 
@@ -524,11 +523,6 @@ def _increment_values(node: CgroupNode, previous: TreeState) -> _Values:
     return _Values(True, {f: counter_increment(before.get(f), v) for f, v in current.items()})
 
 
-def counter_increment(before: int | None, now: int) -> int:
-    """D3's counter rule: current - previous, or the current value after a reset or when new."""
-    return now if before is None or now < before else now - before
-
-
 def _contributions(
     tree: TreeReading, values: Mapping[Segments, _Values], figures: tuple[Figure, ...]
 ) -> dict[Segments, dict[Figure, int]]:
@@ -607,11 +601,6 @@ def _member_stalls(node: CgroupNode, increments: _Values) -> dict[Figure, int]:
     if node.children or not increments.valid:
         return {}
     return {figure: v for figure, v in increments.own.items() if figure in _STALLS}
-
-
-def is_gap(previous_ts: int | None, now: int, nominal_interval: int) -> bool:
-    """D3's gap: no previous collection, or one more than two intervals old (or ahead)."""
-    return previous_ts is None or not 0 < now - previous_ts <= 2 * nominal_interval
 
 
 def account(

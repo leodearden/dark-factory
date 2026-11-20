@@ -29,7 +29,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, NamedTuple
 
-from shared.cgroup_stats import CgroupReading
+from shared.cgroup_stats import CGROUP_ROOT, CgroupReading
 from shared.psi import (
     RunqueueReading,
     parse_pressure_file,
@@ -40,7 +40,6 @@ from shared.psi import (
 from shared.verify_scope_tag import parse_verify_scope_unit
 
 from sampler.consumers import (
-    CGROUP_ROOT,
     Consumer,
     ConsumerFigures,
     Figure,
