@@ -22,7 +22,7 @@ from orchestrator.verify import VerifyResult
 WHY = 'review checkpoint has no steward'
 
 
-def _submit_reviewer_l0(
+def _submit_reviewer_escalation(
     queue: EscalationQueue,
     task_id: str,
     *,
@@ -78,7 +78,7 @@ class TestReviewerEscalationPromotion:
         review_id = '20260418T120000'
         synthetic = review_escalation_task_id(review_id)
         assert checkpoint.escalation_queue is not None
-        original = _submit_reviewer_l0(checkpoint.escalation_queue, synthetic)
+        original = _submit_reviewer_escalation(checkpoint.escalation_queue, synthetic)
 
         count = checkpoint._promote_reviewer_escalations(review_id)
         assert count == 1
@@ -114,7 +114,7 @@ class TestReviewerEscalationPromotion:
     def test_only_matches_own_review_id(self, checkpoint: ReviewCheckpoint):
         """An escalation from a different review_id is not promoted."""
         assert checkpoint.escalation_queue is not None
-        _submit_reviewer_l0(
+        _submit_reviewer_escalation(
             checkpoint.escalation_queue,
             review_escalation_task_id('20260418T000000'),
         )
@@ -124,7 +124,7 @@ class TestReviewerEscalationPromotion:
         review_id = '20260418T120000'
         synthetic = review_escalation_task_id(review_id)
         assert checkpoint.escalation_queue is not None
-        _submit_reviewer_l0(checkpoint.escalation_queue, synthetic, level=1)
+        _submit_reviewer_escalation(checkpoint.escalation_queue, synthetic, level=1)
         assert checkpoint._promote_reviewer_escalations(review_id) == 0
 
     def test_prompt_names_the_task_id_promotion_keys_on(
@@ -148,7 +148,7 @@ class TestReviewerEscalationPromotion:
         assert f'escalate_info(task_id="{tid}"' in prompt
 
         assert checkpoint.escalation_queue is not None
-        _submit_reviewer_l0(checkpoint.escalation_queue, tid, severity='info')
+        _submit_reviewer_escalation(checkpoint.escalation_queue, tid, severity='info')
         assert checkpoint._promote_reviewer_escalations(review_id) == 1
         l1s = [e for e in checkpoint.escalation_queue.get_pending() if e.level == 1]
         assert [e.task_id for e in l1s] == [tid]
