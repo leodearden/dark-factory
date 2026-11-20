@@ -147,6 +147,7 @@ from fused_memory.services.overreach_shadow import (
     open_overreach_shadow,
     shadow_job_from_write,
 )
+from fused_memory.services.provider_billing import classify_billing_exhaustion
 from fused_memory.services.queued_writes import (
     DecodedReferents,
     QueueCallback,
@@ -1602,30 +1603,17 @@ except Exception:
 def _is_rate_limit_or_quota_error(exc: BaseException) -> bool:
     """Return True if *exc* represents an embedding-provider rate-limit or quota error.
 
-    Matches ANY ``openai.RateLimitError`` — this covers both hard quota
-    exhaustion (``insufficient_quota``, non-retryable) and transient
-    too-many-requests rate limiting (retryable); the two are not
-    distinguished. Also matches duck-typed equivalents — a
-    ``status_code == 429`` attribute (regardless of code/message), or
-    ``'insufficient_quota'`` appearing in the error's ``code`` attribute —
-    so callers (get_entity's degraded fallback) can classify this condition
-    without a hard dependency on the openai SDK's exact exception hierarchy
-    (e.g. if Graphiti wraps/re-raises the error, or a different embedding
-    provider is configured). As a last resort, ``'insufficient_quota'``
-    appearing in the exception's string message also matches, but ONLY when
-    the exception carries neither a ``status_code`` nor a ``code`` attribute
-    — a concrete (even if non-matching, e.g. ``status_code=500``) status or
-    code classification is trusted over the fuzzy message-substring guess,
-    so a wrapped/log-echo error that merely quotes an upstream
-    'insufficient_quota' message inside an otherwise-unrelated, already-
-    classified error does not get swallowed into the degraded fallback
-    (task 2448 review).
+    Matches ANY ``openai.RateLimitError`` and any duck-typed
+    ``status_code == 429``, so a transient too-many-requests rate limit and
+    exhausted credits are deliberately ONE condition here. get_entity's
+    degraded fallback is fine with that because it has no retry loop of its
+    own: on a match it degrades immediately rather than retrying, for either
+    cause. Callers that must tell the two apart ask
+    ``provider_billing.py::classify_billing_exhaustion`` directly.
 
-    Callers that need to tell hard quota exhaustion apart from a
-    retryable transient rate limit must not rely on this predicate alone —
-    it deliberately treats both as one condition. get_entity's degraded
-    fallback is fine with that because it has no retry loop of its own: on
-    a match it degrades immediately rather than retrying, for either cause.
+    The quota half is that classifier's verdict, so the rules for reading
+    ``insufficient_quota`` (through a wrapper's ``__cause__``, structured
+    fields over a message substring, task 2448) have one home.
 
     Never matches a bare BaseException (e.g. ``asyncio.CancelledError``,
     ``KeyboardInterrupt``, ``SystemExit``) — those are structured-concurrency
@@ -1636,15 +1624,9 @@ def _is_rate_limit_or_quota_error(exc: BaseException) -> bool:
         return False
     if _OpenAIRateLimitError is not None and isinstance(exc, _OpenAIRateLimitError):
         return True
-    status_code = getattr(exc, 'status_code', None)
-    if status_code == 429:
+    if getattr(exc, 'status_code', None) == 429:
         return True
-    code = str(getattr(exc, 'code', '') or '')
-    if 'insufficient_quota' in code.lower():
-        return True
-    if status_code is None and not code:
-        return 'insufficient_quota' in str(exc).lower()
-    return False
+    return classify_billing_exhaustion(exc) is not None
 
 
 def _graphiti_degraded_entity_result() -> dict:
@@ -1692,6 +1674,11 @@ def _degrade_or_reraise(exc: Exception, name: str) -> dict:
         exc,
     )
     return _graphiti_degraded_entity_result()
+
+
+def _billing_source_or_none(exc: BaseException | None) -> str | None:
+    exhaustion = classify_billing_exhaustion(exc) if exc is not None else None
+    return exhaustion.source.value if exhaustion is not None else None
 
 
 def _store_failure_diagnostics(
@@ -1754,6 +1741,7 @@ def _store_failure_diagnostics(
 
     Returns:
         dict with keys: store, reason, error_type, error, rate_limit_or_quota,
+        billing_exhausted (the exhausted ``BillingSource`` value, or None),
         query_len, project_id.
     """
     return {
@@ -1762,6 +1750,7 @@ def _store_failure_diagnostics(
         'error_type': type(exc).__name__ if exc is not None else 'TimeoutError',
         'error': (str(exc)[:500] if exc is not None else 'search_timeout'),
         'rate_limit_or_quota': _is_rate_limit_or_quota_error(exc) if exc is not None else False,
+        'billing_exhausted': _billing_source_or_none(exc),
         'query_len': len(query),
         # Intentionally repeated per-entry (not deduped onto SearchResults) so
         # each diagnostic stays self-contained for independent log consumption —
