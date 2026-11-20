@@ -117,3 +117,68 @@ class TestLiveRequeueOntoAForeignHead:
         assert result is WarmLaneUnavailable.FAULT
         assert await scene.tip('task/V') == c1
         assert await scene.tip('task/F') == scene.main
+
+
+async def _git_path(lane: Path, name: str) -> Path:
+    return Path(await _git(lane, 'rev-parse', '--path-format=absolute', '--git-path', name))
+
+
+def _specimens(repo: Path) -> list[Path]:
+    root = repo / '.git' / 'interrupted-operation-specimens'
+    return sorted(root.iterdir()) if root.is_dir() else []
+
+
+@pytest.mark.asyncio
+class TestPriorOccupantInterruptedOperationAtAcquire:
+    """The measured reify _lane-20 chain, replayed end to end.
+
+    task/9844 left a stopped rebase in the lane; task/10089 was handed the lane
+    with rebase-merge/ still on disk, and the next defensive abort reset
+    task/9844 to its orig-head and checked it out.  Every acquire now moves a
+    prior occupant's interrupted operation aside before routing.
+    """
+
+    async def _leave_a_stopped_rebase_of_p(self, scene: _Scene) -> tuple[Path, str]:
+        lane = await acquire_lane(scene.git_ops, 'P', scene.main)
+        await _commit_file(lane, 'p1.txt')
+        rc, _, err = await _run(
+            ['git', 'rebase', '--force-rebase', '-x', 'false', 'main'], cwd=lane,
+        )
+        assert rc != 0, 'fixture expected the rebase to stop'
+        assert (await _git_path(lane, 'rebase-merge')).is_dir(), err
+        return lane, await scene.tip('task/P')
+
+    async def test_a_recycled_lane_arrives_without_the_prior_rebase(
+        self, scene: _Scene,
+    ) -> None:
+        lane, p_tip = await self._leave_a_stopped_rebase_of_p(scene)
+        await scene.git_ops.release_warm_lane(lane, 'P')
+
+        lane = await acquire_lane(scene.git_ops, 'V', scene.main)
+
+        assert not (await _git_path(lane, 'rebase-merge')).exists()
+        assert not (await _git_path(lane, 'rebase-apply')).exists()
+        assert _specimens(scene.repo)
+        assert await scene.tip('task/P') == p_tip
+
+        c1 = await _commit_file(lane, 'c1.txt')
+        assert await scene.git_ops.rebase_onto_main(lane) is True
+        assert await _git(lane, 'rev-parse', '--abbrev-ref', 'HEAD') == 'task/V'
+        result = await scene.git_ops.acquire_warm_lane('V', scene.main)
+        assert isinstance(result, WorktreeInfo), result
+        assert await _git(scene.repo, 'merge-base', '--is-ancestor', c1, 'task/V') == ''
+        assert await scene.tip('task/P') == p_tip
+
+    async def test_a_same_task_handover_arrives_without_the_prior_merge(
+        self, scene: _Scene,
+    ) -> None:
+        lane = await acquire_lane(scene.git_ops, 'S', scene.main)
+        await _commit_file(lane, 's1.txt')
+        merge_head = await _git_path(lane, 'MERGE_HEAD')
+        merge_head.write_text(await _git(lane, 'rev-parse', 'HEAD') + '\n')
+        (await _git_path(lane, 'MERGE_MSG')).write_text('prior occupant merge\n')
+        await scene.git_ops.release_warm_lane(lane, 'S')
+
+        lane = await acquire_lane(scene.git_ops, 'S', scene.main)
+
+        assert not (await _git_path(lane, 'MERGE_HEAD')).exists()
