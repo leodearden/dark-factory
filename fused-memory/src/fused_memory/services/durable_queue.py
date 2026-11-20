@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 import aiosqlite
 from shared.async_sqlite_base import (
@@ -156,6 +156,7 @@ class FailureClass(StrEnum):
     PERMANENT = 'permanent'
     TRANSIENT = 'transient'
     NORMAL = 'normal'
+    PARKED = 'parked'
 
 
 # (value, backend result) -> None. Receives the same value object the executor did.
@@ -212,6 +213,37 @@ class DeadLetterEvent:
 # 'completed' or an intermediate retry. Injected exactly as ``on_terminal`` is.
 DeadLetterHookFn = Callable[[DeadLetterEvent], Coroutine[Any, Any, None]]
 
+@dataclass(frozen=True)
+class ParkedWriteEvent:
+    """One write the ``park_policy`` parked instead of retrying it to death.
+
+    ``attempts`` is the row's count, which parking leaves unchanged.
+    """
+
+    item_id: int
+    group_id: str
+    operation: str
+    attempts: int
+    reason: str
+    exc: BaseException
+
+
+class ParkPolicy(Protocol):
+    """Names the failures that clear only when a human acts, so they PARK.
+
+    A parked row never dead-letters. It is re-probed every
+    ``retry_max_delay_seconds``, and a parked row that completes unparks
+    every other. Both hooks run after the commit and outside the semaphore,
+    and a raising hook is logged and swallowed, as ``on_dead_letter`` is.
+    """
+
+    def park_reason(self, exc: BaseException) -> str | None: ...
+
+    async def on_parked(self, event: ParkedWriteEvent) -> None: ...
+
+    async def on_cleared(self) -> None: ...
+
+
 # Prefix applied to the reported error when an item dead-letters after a
 # backend write for it LANDED, in this attempt or an earlier one — i.e. the
 # registered callback (or the completion commit) is what kept failing, not the
@@ -243,11 +275,13 @@ class DurableWriteQueue:
         transient_error_names: Iterable[str] | None = None,
         on_terminal: TerminalHookFn | None = None,
         on_dead_letter: DeadLetterHookFn | None = None,
+        park_policy: ParkPolicy | None = None,
     ):
         self._data_dir = Path(data_dir)
         self._execute_write = execute_write
         self._on_terminal = on_terminal
         self._on_dead_letter = on_dead_letter
+        self._park_policy = park_policy
         self._workers_per_group = workers_per_group
         self._max_attempts = max_attempts
         self._retry_base_seconds = retry_base_seconds
@@ -447,7 +481,7 @@ class DurableWriteQueue:
             async with self._require_access().write() as db:
                 rows = list(await db.execute_fetchall(
                     "SELECT * FROM write_queue "
-                    "WHERE group_id = ? AND status IN ('pending', 'retry') "
+                    "WHERE group_id = ? AND status IN ('pending', 'retry', 'parked') "
                     "  AND next_retry_at <= ? "
                     "ORDER BY id ASC LIMIT 1",
                     (group_id, now),
@@ -470,9 +504,12 @@ class DurableWriteQueue:
         Both post-commit hooks, by contrast, run AFTER the queue's own commit
         and OUTSIDE the semaphore: ``_notify_terminal`` (the durable write-back
         onto the ``write_ops`` row) and then, for a dead item only,
-        ``_notify_dead_letter`` (the operator alarm).
+        ``_notify_dead_letter`` (the operator alarm). A parked item is not
+        terminal; it reaches ``_notify_parked`` alone, under the same
+        discipline.
         """
         terminal: tuple[str, str | None] | None = None
+        parked: ParkedWriteEvent | None = None
         value: QueuedWrite | None = None
         write_op_id: str | None = None
         # Seeded from the row, since an earlier attempt may already have
@@ -509,8 +546,14 @@ class DurableWriteQueue:
                 await self._mark_completed(item)
                 terminal = ('completed', None)
             except Exception as exc:
-                terminal = await self._handle_failure(item, exc, executed=executed)
+                reason = self._park_reason(exc, executed=executed)
+                if reason is None:
+                    terminal = await self._handle_failure(item, exc, executed=executed)
+                else:
+                    parked = await self._park(item, exc, reason)
 
+        if parked is not None:
+            await self._notify_parked(parked)
         if terminal is not None:
             status, error = terminal
             if status == 'dead' and executed:
@@ -660,6 +703,19 @@ class DurableWriteQueue:
                 item.id, item.operation, item.group_id, exc_info=True,
             )
 
+    async def _notify_parked(self, event: ParkedWriteEvent) -> None:
+        """Report a parked write to the policy, never raising into the worker."""
+        if self._park_policy is None:
+            return
+        try:
+            await self._park_policy.on_parked(event)
+        except Exception:
+            logger.warning(
+                'Item %d (%s, group_id=%s): on_parked hook failed; the item is '
+                'parked but the park was NOT reported',
+                event.item_id, event.operation, event.group_id, exc_info=True,
+            )
+
     async def _mark_completed(self, item: QueueItem) -> None:
         async with self._require_access().write() as db:
             await db.execute(
@@ -687,6 +743,47 @@ class DurableWriteQueue:
         if self._is_transient(exc):
             return (FailureClass.TRANSIENT, self._transient_max_attempts)
         return (FailureClass.NORMAL, item.max_attempts)
+
+    def _park_reason(self, exc: Exception, *, executed: bool) -> str | None:
+        """Why *exc* parks its item, or None to retry or dead-letter it.
+
+        A write that already LANDED never parks: a probe re-runs it, so an
+        unbounded park would duplicate it every period, where the retry path
+        bounds that to ``max_attempts``. An undecodable row never parks either.
+        """
+        if self._park_policy is None or executed or isinstance(exc, QueueDecodeError):
+            return None
+        try:
+            return self._park_policy.park_reason(exc)
+        except Exception:
+            logger.warning('park_policy.park_reason failed; not parking', exc_info=True)
+            return None
+
+    async def _park(self, item: QueueItem, exc: Exception, reason: str) -> ParkedWriteEvent:
+        """Park *item*, attempts unchanged, and re-arm every parked row to one
+        horizon, so the queue probes about once per worker per period rather
+        than once per parked row."""
+        error_msg = f'parked ({reason}): {type(exc).__name__}: {exc}'
+        horizon = time.time() + self._retry_max_delay_seconds
+        async with self._require_access().write() as db:
+            await db.execute(
+                "UPDATE write_queue SET status = 'parked', next_retry_at = ?, error = ? "
+                'WHERE id = ?',
+                (horizon, error_msg, item.id),
+            )
+            await db.execute(
+                "UPDATE write_queue SET next_retry_at = ? WHERE status = 'parked'",
+                (horizon,),
+            )
+        logger.info(
+            'Item %d (%s, group_id=%s) parked, re-probe in %.1fs [%s]: %s',
+            item.id, item.operation, item.group_id, self._retry_max_delay_seconds,
+            FailureClass.PARKED, error_msg,
+        )
+        return ParkedWriteEvent(
+            item_id=item.id, group_id=item.group_id, operation=item.operation,
+            attempts=item.attempts, reason=reason, exc=exc,
+        )
 
     async def _handle_failure(
         self, item: QueueItem, exc: Exception, *, executed: bool
@@ -757,10 +854,10 @@ class DurableWriteQueue:
             logger.info('Recovered %d in-flight items to pending', cursor.rowcount)
 
     async def _start_workers_for_pending_groups(self) -> None:
-        """Start workers for any groups that have pending/retry items."""
+        """Start workers for any groups that have pending/retry/parked items."""
         rows = await self._require_access().read_all(
             "SELECT DISTINCT group_id FROM write_queue "
-            "WHERE status IN ('pending', 'retry')"
+            "WHERE status IN ('pending', 'retry', 'parked')"
         )
         for row in rows:
             group_id = row[0] if isinstance(row, tuple) else row['group_id']
@@ -849,13 +946,13 @@ class DurableWriteQueue:
         if group_id is not None:
             row = await access.read_one(
                 "SELECT MIN(created_at) FROM write_queue "
-                "WHERE status IN ('pending', 'retry') AND group_id = ?",
+                "WHERE status IN ('pending', 'retry', 'parked') AND group_id = ?",
                 (group_id,),
             )
         else:
             row = await access.read_one(
                 "SELECT MIN(created_at) FROM write_queue "
-                "WHERE status IN ('pending', 'retry')"
+                "WHERE status IN ('pending', 'retry', 'parked')"
             )
         if row:
             min_created = row[0] if isinstance(row, tuple) else row[0]
