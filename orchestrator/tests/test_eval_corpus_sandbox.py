@@ -10,7 +10,7 @@ from uuid import uuid4
 import pytest
 
 from orchestrator.agents import sandbox_dispatch
-from orchestrator.config import OrchestratorConfig, SandboxConfig
+from orchestrator.config import OrchestratorConfig, SandboxConfig, project_role_env_overrides
 from orchestrator.evals import runner
 from orchestrator.evals.cell_sandbox import bind_cell_sandbox_backend
 from orchestrator.evals.configs import EvalConfig
@@ -177,3 +177,59 @@ async def test_a_cell_whose_metric_collection_raised_still_records_the_backend(
 
 def test_a_cell_recorded_before_the_field_reads_back_as_none() -> None:
     assert EvalMetrics.from_dict({'composite_score': 0.5}).sandbox_backend is None
+
+
+_REIFY_AGENT_ENV = 'role_env_overrides:\n  implementer:\n    CARGO_HOME: /tmp/eval-probe-cargo-home\n'
+_BASE_AGENT_ENV = {'implementer': {'BASE_ONLY': '1'}}
+
+
+def _project(root: Path, yaml_text: str) -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+    (root / 'dark-factory-orchestrator.yaml').write_text(yaml_text)
+    return root
+
+
+def _base(tmp_path: Path) -> OrchestratorConfig:
+    return OrchestratorConfig(project_root=tmp_path / 'df', role_env_overrides=_BASE_AGENT_ENV)
+
+
+def _corpus_task(project_root: Path) -> dict:
+    return {'id': 'reify_task_12', 'project_root': str(project_root)}
+
+
+def test_a_fixture_from_another_project_takes_that_projects_role_env_overrides(
+    tmp_path: Path,
+) -> None:
+    reify = _project(tmp_path / 'reify', _REIFY_AGENT_ENV)
+
+    result = build_eval_orch_config(_IMPL, _corpus_task(reify), _base(tmp_path))
+
+    assert result.role_env_overrides == {'implementer': {'CARGO_HOME': '/tmp/eval-probe-cargo-home'}}
+
+
+def test_a_fixture_of_the_base_project_keeps_the_bases_role_env_overrides(tmp_path: Path) -> None:
+    base = _base(tmp_path)
+
+    result = build_eval_orch_config(_IMPL, _corpus_task(base.project_root), base)
+
+    assert result.role_env_overrides == _BASE_AGENT_ENV
+
+
+def test_a_fixture_project_with_no_config_gets_the_shipped_default(tmp_path: Path) -> None:
+    bare = tmp_path / 'bare'
+    bare.mkdir()
+
+    result = build_eval_orch_config(_IMPL, _corpus_task(bare), _base(tmp_path))
+
+    assert result.role_env_overrides == {}
+
+
+def test_project_role_env_overrides_reads_another_projects_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reify = _project(tmp_path / 'reify', _REIFY_AGENT_ENV)
+    monkeypatch.setenv('ORCH_CONFIG_PATH', str(tmp_path / 'no-such-config.yaml'))
+
+    assert project_role_env_overrides(reify) == {
+        'implementer': {'CARGO_HOME': '/tmp/eval-probe-cargo-home'},
+    }
