@@ -2,7 +2,8 @@
 """Replay the rated soak corpus through the shipped judge under each M3 lever arm (task 7519).
 
 The only LLM edge of the M3 lever study. Each :class:`Arm` is a judge prompt,
-model and reasoning effort, or a second pass over a parent arm's verdicts.
+model and reasoning effort, a second pass over a parent arm's verdicts, or a
+call-free transform of them.
 Each case goes to the SHIPPED ``write_triage_judge.judge_write`` with a
 one-candidate slate: the parent its raters rated. The arm's prompt is held in
 force by ``write_triage_judge_wording.judge_system_prompt``, and its model
@@ -118,7 +119,11 @@ _NAME = re.compile(r'[a-z0-9][a-z0-9-]*')
 
 @dataclass(frozen=True)
 class Arm:
-    """One replay arm: a judge configuration, or a pass over a parent arm's rows."""
+    """One replay arm: a judge configuration, or a pass over a parent arm's rows.
+
+    A transform arm makes no call: ``transform`` reads each parent row and
+    says whether the write is dispute-marked.
+    """
 
     name: str
     kind: str
@@ -128,6 +133,19 @@ class Arm:
     parent: str | None
     scope: str
     description: str
+    transform: Callable[[Mapping[str, Any]], bool] | None = None
+
+
+def mark_refused_contest(parent_row: Mapping[str, Any]) -> bool:
+    """Lever e1: a write the judge contested but the attach guard stored marks the record it disputes.
+
+    Like F4's supersession mark, the write stays standalone, as the guard
+    wants, and a reader of the disputed record sees the dispute.
+    """
+    return (
+        parent_row['judge_outcome'] == OUTCOME_CONTESTED
+        and parent_row['routed_outcome'] == OUTCOME_STORED
+    )
 
 
 _SHIPPED_PROMPT = _wording.system_prompt(_wording.WORDING_SHIPPED)
@@ -331,6 +349,11 @@ ARMS: tuple[Arm, ...] = (
     Arm('d1-stale-detail-check', KIND_JUDGE, D1_STALE_DETAIL_CHECK_PROMPT, SHIPPED_MODEL, 'low',
         None, SCOPE_ALL,
         "the shipped prompt plus a check of each candidate's time-sensitive details"),
+    Arm('e1-mark-refused-contests', KIND_TRANSFORM, None, None, None, 'f3p', SCOPE_ALL,
+        "f3p's contests the attach guard stored, marking the record each disputes",
+        mark_refused_contest),
+    Arm('d1-e1-combined', KIND_TRANSFORM, None, None, None, 'd1-stale-detail-check', SCOPE_ALL,
+        'the recommended sequence: d1, then e1 over its verdicts', mark_refused_contest),
     _shipped_arm('b1-sol-medium', 'medium', 'the shipped prompt at medium reasoning effort'),
     _shipped_arm('b2-sol-high', 'high', 'the shipped prompt at high reasoning effort'),
 )
@@ -364,6 +387,10 @@ def _arm_problem(arm: Arm, seen: set[str]) -> str | None:
         return f'parent {arm.parent!r} is not an earlier arm'
     if arm.kind != KIND_TRANSFORM and not arm.prompt:
         return 'a judge or second-pass arm needs a prompt'
+    if (arm.kind == KIND_TRANSFORM) != (arm.transform is not None):
+        return 'a transform arm, and only a transform arm, carries a transform function'
+    if arm.kind == KIND_TRANSFORM and (arm.prompt or arm.model or arm.effort):
+        return 'a transform arm makes no call, so it names no prompt, model or effort'
     return None
 
 
@@ -535,6 +562,26 @@ async def second_pass_case(
     }
 
 
+def transform_row(
+    parent_row: Mapping[str, Any], arm: Arm, *, cases_sha256: str,
+) -> dict[str, Any]:
+    """A transform arm's row: the parent's verdicts, marked by the arm's function, at no cost."""
+    if arm.transform is None:
+        raise ValueError(f'arm {arm.name!r} carries no transform')
+    return {
+        'arm': arm.name, 'entry_id': parent_row['entry_id'],
+        'target_id': parent_row.get('target_id'), 'route': parent_row.get('route'),
+        'model': None, 'effort': None, 'prompt_sha256': None, 'cases_sha256': cases_sha256,
+        'judge_outcome': parent_row['judge_outcome'],
+        'candidate_id': parent_row.get('candidate_id'),
+        'routed_outcome': parent_row['routed_outcome'],
+        'dispute_marked': bool(parent_row.get('dispute_marked')) or arm.transform(parent_row),
+        'calls': 0, 'attempts': 0, 'seconds': None, 'input_tokens': None,
+        'output_tokens': None, 'reasoning_tokens': None, 'usd': 0.0,
+        'error_type': None, 'error': None, 'transport_failures': [],
+    }
+
+
 @dataclass(frozen=True)
 class RunResult:
     complete: tuple[str, ...]
@@ -621,8 +668,8 @@ async def _run_arm(
     cases: Sequence[Any], arm: Arm, *, config: Any, arms_dir: Path, spend: _Spend,
     cases_sha256: str, concurrency: int, sleep: Callable[[float], Awaitable[Any]],
 ) -> bool:
-    if arm.kind not in (KIND_JUDGE, KIND_SECOND_PASS):
-        raise ValueError(f'arm {arm.name!r}: kind {arm.kind!r} is not replayed by a judge call')
+    if arm.kind == KIND_TRANSFORM:
+        return _run_transform_arm(cases, arm, arms_dir=arms_dir, cases_sha256=cases_sha256)
     service = arm_service(config, arm)
     if not resolve_judge_enabled(service):
         raise ValueError('write_triage.judge_enabled is false, so no arm can be replayed')
@@ -658,6 +705,24 @@ async def _run_arm(
     rows = read_arm_rows(path)
     if {row['entry_id'] for row in rows} != {case.features.entry_id for case in scope}:
         return False
+    _write_sorted(path, rows)
+    return True
+
+
+def _run_transform_arm(
+    cases: Sequence[Any], arm: Arm, *, arms_dir: Path, cases_sha256: str,
+) -> bool:
+    parents = _complete_parent_rows(cases, arm, arms_dir)
+    if parents is None:
+        return False
+    path = arms_dir / f'{arm.name}.jsonl'
+    existing = read_arm_rows(path)
+    _refuse_foreign(existing, arm, cases_sha256=cases_sha256, prompt_sha256=None)
+    written = {row['entry_id'] for row in existing}
+    rows = [*existing, *(
+        transform_row(parents[case.features.entry_id], arm, cases_sha256=cases_sha256)
+        for case in cases if case.features.entry_id not in written
+    )]
     _write_sorted(path, rows)
     return True
 

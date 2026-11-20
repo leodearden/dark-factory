@@ -506,3 +506,75 @@ class TestCombinationArms:
         rows = {row['entry_id']: row for row in _rows(tmp_path, 'c1-over-a1')}
         assert (rows['E1']['calls'], rows['E1']['dispute_marked']) == (1, True)
         assert (rows['E2']['calls'], rows['E2']['judge_outcome']) == (0, 'contested')
+
+
+def _parent_row(entry: str, judge: str | None, routed: str, **extra: Any) -> dict[str, Any]:
+    return {'entry_id': entry, 'judge_outcome': judge, 'routed_outcome': routed,
+            'dispute_marked': None, **extra}
+
+
+class TestTheTransformArms:
+    def test_the_guard_mark_arms_are_transforms_over_f3p_and_d1(self) -> None:
+        e1, combined = _arm('e1-mark-refused-contests'), _arm('d1-e1-combined')
+        assert (e1.kind, e1.parent, e1.prompt) == ('transform', 'f3p', None)
+        assert (combined.kind, combined.parent, combined.prompt) == (
+            'transform', 'd1-stale-detail-check', None,
+        )
+        assert e1.transform is combined.transform is _mod().mark_refused_contest
+        _mod().validate_arms(_mod().ARMS)
+
+    @pytest.mark.parametrize(('judge', 'routed', 'marked'), [
+        ('contested', 'stored', True),
+        ('contested', 'contested', False),
+        ('amended', 'stored', False),
+        ('amended', 'amended', False),
+        ('stored', 'stored', False),
+        (None, 'stored', False),
+    ])
+    def test_marks_only_a_contest_the_attach_guard_stored(
+        self, judge: str | None, routed: str, marked: bool,
+    ) -> None:
+        assert _mod().mark_refused_contest(_parent_row('E1', judge, routed)) is marked
+
+    def test_a_transform_needs_a_function_and_no_prompt(self) -> None:
+        arm = _mod().Arm('t', 'transform', None, None, None, 'f3p', 'all', 'x')
+        with pytest.raises(ValueError, match="'t'"):
+            _mod().validate_arms([_arm('f3p'), arm])
+        prompted = _mod().Arm('j', 'judge', 'P', 'gpt-6.1-sol', 'low', None, 'all', 'x',
+                              _mod().mark_refused_contest)
+        with pytest.raises(ValueError, match="'j'"):
+            _mod().validate_arms([prompted])
+
+    def test_runs_over_its_parents_rows_without_a_call(self, tmp_path: Path) -> None:
+        def answer(kwargs: dict[str, Any]) -> Any:
+            target = _target(kwargs)
+            return _reply('contests' if target in ('T-E1', 'T-E2') else 'amends', target)
+
+        cases = [_case('E1', cos=0.5), _case('E2'), _case('E3', cos=0.5),
+                 _case('E4', route='force_stored')]
+        client = _client(answer)
+        result = _run(cases, [_arm('f3p')], tmp_path, client, config=_config(0.60))
+        calls_before = client.responses.create.await_count
+        result = _run(cases, [_arm('f3p'), _arm('e1-mark-refused-contests')], tmp_path, client,
+                      config=_config(0.60))
+        assert client.responses.create.await_count == calls_before
+        assert result.complete == ('f3p', 'e1-mark-refused-contests')
+        parent = {row['entry_id']: row for row in _rows(tmp_path, 'f3p')}
+        rows = {row['entry_id']: row for row in _rows(tmp_path, 'e1-mark-refused-contests')}
+        assert {entry for entry, row in rows.items() if row['dispute_marked']} == {'E1'}
+        for entry, row in rows.items():
+            assert (row['judge_outcome'], row['routed_outcome']) == (
+                parent[entry]['judge_outcome'], parent[entry]['routed_outcome'],
+            )
+            assert (row['calls'], row['usd'], row['prompt_sha256']) == (0, 0.0, None)
+            assert row['arm'] == 'e1-mark-refused-contests'
+
+    def test_keeps_a_mark_its_parent_already_carries(self) -> None:
+        row = _parent_row('E1', 'amended', 'amended', dispute_marked=True)
+        assert _mod().transform_row(row, _arm('e1-mark-refused-contests'),
+                                    cases_sha256=_CASES_SHA)['dispute_marked'] is True
+
+    def test_waits_for_a_complete_parent(self, tmp_path: Path) -> None:
+        result = _run([_case('E1')], [_arm('e1-mark-refused-contests')], tmp_path,
+                      _client(_amends))
+        assert result.partial == ('e1-mark-refused-contests',)

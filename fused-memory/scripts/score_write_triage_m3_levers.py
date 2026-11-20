@@ -469,6 +469,30 @@ def _arm_provenance(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     return {**provenance, 'rows': len(rows)}
 
 
+def arm_report(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    baseline_rows: Sequence[Mapping[str, Any]] | None,
+    soak_items: Sequence[Mapping[str, Any]],
+    verdicts: Sequence[Mapping[str, Any]],
+    strata: Mapping[str, int],
+    features: Sequence[Any],
+) -> dict[str, Any]:
+    """One arm's report entry; *baseline_rows* is None for the baseline arm itself."""
+    items = arm_items(soak_items, features, rows)
+    paired = agreement = None
+    if baseline_rows is not None:
+        paired = paired_delta(items, arm_items(soak_items, features, baseline_rows), verdicts, strata)
+        agreement = outcome_agreement(rows, baseline_rows)
+    return {
+        'provenance': _arm_provenance(rows),
+        'score': score_arm(items, verdicts, strata),
+        'paired_vs_baseline': paired,
+        'outcome_agreement_vs_baseline': agreement,
+        'cost': cost(rows),
+    }
+
+
 def build_report(
     *,
     soak_items: Sequence[Mapping[str, Any]],
@@ -482,29 +506,26 @@ def build_report(
     provenance: Mapping[str, Any],
     repro: Mapping[str, Sequence[Mapping[str, Any]]] | None = None,
 ) -> dict[str, Any]:
-    """The whole lever report: classification, every complete arm against the baseline, harness checks."""
+    """The whole lever report: classification, every complete arm against the baseline, harness checks.
+
+    The provenance gains the prompt sha256 the baseline arm ran under, and
+    ``arm_order`` keeps *arms*' order, so the markdown re-renders from the JSON.
+    """
     if baseline not in arms:
         raise ValueError(f'baseline arm {baseline!r} is not among the complete arms {list(arms)}')
-    items_by_arm = {name: arm_items(soak_items, features, rows) for name, rows in arms.items()}
-    base = items_by_arm[baseline]
+    baseline_prompt = _arm_provenance(arms[baseline])['prompt_sha256']
     scored = {
-        name: {
-            'provenance': _arm_provenance(rows),
-            'score': score_arm(items_by_arm[name], verdicts, strata),
-            'paired_vs_baseline': (
-                None if name == baseline else paired_delta(items_by_arm[name], base, verdicts, strata)
-            ),
-            'outcome_agreement_vs_baseline': (
-                None if name == baseline else outcome_agreement(rows, arms[baseline])
-            ),
-            'cost': cost(rows),
-        }
+        name: arm_report(
+            rows, baseline_rows=None if name == baseline else arms[baseline],
+            soak_items=soak_items, verdicts=verdicts, strata=strata, features=features,
+        )
         for name, rows in arms.items()
     }
     return {
         'rubric': RUBRIC,
         'baseline': baseline,
-        'provenance': dict(provenance),
+        'arm_order': list(arms),
+        'provenance': {**provenance, 'shipped_prompt_sha256': baseline_prompt},
         'strata': dict(sorted(strata.items())),
         'soak': score_arm(soak_items, verdicts, strata),
         'classification': classify(soak_items, verdicts, strata, features, labels),
@@ -571,7 +592,7 @@ def render_markdown(report: Mapping[str, Any]) -> str:
             ['arm', 'M3', 'M3 95%', 'ΔM3 vs base', 'Δ 95%', 'M1', 'M5', 'M2 contested',
              'M2 amended', 'false contests added', 'M4', 'harm Δ', 'calls/write', 'p50 s',
              'p95 s', 'fail-open', 'USD/1k judged'],
-            (_arm_line(name, arm) for name, arm in report['arms'].items()),
+            (_arm_line(name, report['arms'][name]) for name in report['arm_order']),
         ),
         '',
         '## Harness checks',
@@ -585,9 +606,10 @@ def render_markdown(report: Mapping[str, Any]) -> str:
         '',
         *_table(
             ['arm', 'verdict agreement with the baseline', 'n'],
-            ([name, arm['outcome_agreement_vs_baseline']['rate'],
-              arm['outcome_agreement_vs_baseline']['n']]
-             for name, arm in report['arms'].items() if arm['outcome_agreement_vs_baseline']),
+            ([name, report['arms'][name]['outcome_agreement_vs_baseline']['rate'],
+              report['arms'][name]['outcome_agreement_vs_baseline']['n']]
+             for name in report['arm_order']
+             if report['arms'][name]['outcome_agreement_vs_baseline']),
         ),
         '',
         '## Arms left partial',
@@ -621,30 +643,61 @@ def _partial_figures(rows: Sequence[Mapping[str, Any]], cases: int) -> dict[str,
 
 
 def _inputs(args: argparse.Namespace) -> dict[str, Any]:
+    return committed_inputs(
+        items=args.items, verdicts=args.verdicts, strata=args.strata, features=args.features,
+        labels=args.labels,
+    )
+
+
+def committed_inputs(
+    *,
+    items: Path = CALIBRATION / 'write_triage_v2_soak_items.jsonl',
+    verdicts: Path = CALIBRATION / 'write_triage_v2_soak_verdicts.jsonl',
+    strata: Path = CALIBRATION / 'write_triage_v2_soak_strata.json',
+    features: Path = CALIBRATION / 'write_triage_m3_replay_cases.jsonl',
+    labels: Path = CALIBRATION / 'write_triage_m3_hidden_conflicts.jsonl',
+) -> dict[str, Any]:
+    """The report's committed inputs, keyed as :func:`build_report` takes them."""
     return {
-        'soak_items': _read_jsonl(args.items),
-        'verdicts': _read_jsonl(args.verdicts),
-        'strata': json.loads(args.strata.read_text()),
-        'features': _cases.read_features(args.features),
-        'labels': _read_jsonl(args.labels),
+        'soak_items': _read_jsonl(items),
+        'verdicts': _read_jsonl(verdicts),
+        'strata': json.loads(strata.read_text()),
+        'features': _cases.read_features(features),
+        'labels': _read_jsonl(labels),
     }
 
 
-def _report(args: argparse.Namespace) -> dict[str, Any]:
-    inputs = _inputs(args)
+def assemble_report(
+    *,
+    arms_dir: Path,
+    arms: Sequence[str],
+    repro_arms: Sequence[str],
+    baseline: str,
+    prompt_commit: str,
+    items: Path = CALIBRATION / 'write_triage_v2_soak_items.jsonl',
+    verdicts: Path = CALIBRATION / 'write_triage_v2_soak_verdicts.jsonl',
+    strata: Path = CALIBRATION / 'write_triage_v2_soak_strata.json',
+    features: Path = CALIBRATION / 'write_triage_m3_replay_cases.jsonl',
+    labels: Path = CALIBRATION / 'write_triage_m3_hidden_conflicts.jsonl',
+) -> dict[str, Any]:
+    """The lever report from files: an arm missing cases is reported as partial, not scored."""
+    inputs = committed_inputs(
+        items=items, verdicts=verdicts, strata=strata, features=features, labels=labels,
+    )
     case_count = len(inputs['features'])
     complete: dict[str, list[dict[str, Any]]] = {}
     partial: dict[str, dict[str, Any]] = {}
-    for name in _names(args.arms):
-        rows = _read_jsonl(args.arms_dir / f'{name}.jsonl') if (args.arms_dir / f'{name}.jsonl').exists() else []
+    for name in arms:
+        path = arms_dir / f'{name}.jsonl'
+        rows = _read_jsonl(path) if path.exists() else []
         if len(rows) == case_count:
             complete[name] = rows
         else:
             partial[name] = _partial_figures(rows, case_count)
-    repro = {name: _read_jsonl(args.arms_dir / f'{name}.jsonl') for name in _names(args.repro_arms)}
+    repro = {name: _read_jsonl(arms_dir / f'{name}.jsonl') for name in repro_arms}
     return build_report(
-        **inputs, arms=complete, baseline=args.baseline, partial=partial,
-        provenance={'shipped_prompt_commit': args.prompt_commit}, repro=repro,
+        **inputs, arms=complete, baseline=baseline, partial=partial,
+        provenance={'shipped_prompt_commit': prompt_commit}, repro=repro,
     )
 
 
@@ -684,9 +737,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps(classify(inputs['soak_items'], inputs['verdicts'], inputs['strata'],
                                   inputs['features'], inputs['labels']), indent=2, sort_keys=True))
         return 0
-    report = _report(args)
-    args.out_json.write_text(json.dumps(report, indent=2, sort_keys=True) + '\n')
-    args.out_md.write_text(render_markdown(report))
+    report = assemble_report(
+        arms_dir=args.arms_dir, arms=_names(args.arms), repro_arms=_names(args.repro_arms),
+        baseline=args.baseline, prompt_commit=args.prompt_commit, items=args.items,
+        verdicts=args.verdicts, strata=args.strata, features=args.features, labels=args.labels,
+    )
+    text = json.dumps(report, indent=2, sort_keys=True) + '\n'
+    args.out_json.write_text(text)
+    args.out_md.write_text(render_markdown(json.loads(text)))
     return 0
 
 

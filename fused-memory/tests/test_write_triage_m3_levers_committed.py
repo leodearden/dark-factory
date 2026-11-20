@@ -56,21 +56,56 @@ def _arm_rows(name: str) -> list[dict[str, Any]]:
 
 
 @functools.cache
-def _rescored() -> dict[str, Any]:
-    report = _report()
-    return _mod().assemble_report(
-        arms_dir=ARMS_DIR,
-        arms=[*report['arm_order'], *report['partial']],
-        repro_arms=list(report['repro']),
-        baseline=report['baseline'],
-        prompt_commit=report['provenance']['shipped_prompt_commit'],
-    )
+def _inputs() -> dict[str, Any]:
+    return _mod().committed_inputs()
 
 
-@pytest.mark.xdist_group('m3-levers-committed')
+def _scoring_inputs() -> dict[str, Any]:
+    return {key: value for key, value in _inputs().items() if key != 'labels'}
+
+
+def _committed_arm_names() -> list[str]:
+    return list(_report()['arm_order'])
+
+
 class TestTheCommittedLeverReport:
-    def test_rescoring_the_committed_inputs_reproduces_the_report(self) -> None:
-        assert json.dumps(_rescored(), indent=2, sort_keys=True) + '\n' == REPORT.read_text()
+    """Re-scoring reproduces the committed report, one arm per test.
+
+    Each arm costs one or two full ``score_reader`` passes, so the arms are
+    split across tests to spread them over workers. Together the tests
+    re-derive every key of the report.
+    """
+
+    def test_the_report_holds_exactly_the_tested_parts(self) -> None:
+        report = _report()
+        assert set(report) == {
+            'rubric', 'baseline', 'arm_order', 'provenance', 'strata', 'soak',
+            'classification', 'arms', 'repro', 'partial',
+        }
+        assert sorted(report['arm_order']) == sorted(report['arms'])
+
+    def test_everything_but_the_arms_reproduces(self) -> None:
+        report = _report()
+        baseline = report['baseline']
+        rescored = _mod().build_report(
+            **_inputs(), arms={baseline: _arm_rows(baseline)}, baseline=baseline,
+            partial=report['partial'],
+            provenance={'shipped_prompt_commit': report['provenance']['shipped_prompt_commit']},
+            repro={name: _arm_rows(name) for name in report['repro']},
+        )
+        for key in set(report) - {'arms', 'arm_order'}:
+            assert rescored[key] == report[key], key
+
+    @pytest.mark.parametrize('name', _committed_arm_names() if REPORT.exists() else ['missing'])
+    def test_each_arm_reproduces(self, name: str) -> None:
+        report = _report()
+        baseline = report['baseline']
+        rescored = _mod().arm_report(
+            _arm_rows(name), baseline_rows=None if name == baseline else _arm_rows(baseline),
+            **_scoring_inputs(),
+        )
+        committed = json.loads(json.dumps(report['arms'][name]))
+        assert json.loads(json.dumps(rescored, sort_keys=True)) == committed
 
     def test_the_markdown_is_the_rendered_report(self) -> None:
         rendered = _mod().render_markdown(_report())

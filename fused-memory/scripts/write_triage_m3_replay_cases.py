@@ -44,7 +44,6 @@ from typing import Any
 from fused_memory.server.near_verbatim import is_near_verbatim
 from fused_memory.server.write_triage import (
     ATTACH_OWNED_KEYS,
-    OUTCOME_JUDGE,
     OUTCOME_RESTATED,
     OUTCOME_STORED,
     TRIAGE_OUTCOMES,
@@ -64,14 +63,6 @@ class Route(enum.StrEnum):
     FORCE_STORED = 'force_stored'
     NEAR_VERBATIM = 'near_verbatim'
     JUDGE = 'judge'
-
-
-_ROUTE_BANDS: Mapping[Route, str] = {
-    Route.SUPERSESSION: OUTCOME_STORED,
-    Route.FORCE_STORED: OUTCOME_STORED,
-    Route.NEAR_VERBATIM: OUTCOME_RESTATED,
-    Route.JUDGE: OUTCOME_JUDGE,
-}
 
 
 @dataclass(frozen=True)
@@ -259,7 +250,8 @@ def item_row(features: CaseFeatures, outcome: str) -> dict[str, Any]:
     """The ``score_write_triage_reader.py`` item row for *features* given *outcome*.
 
     A stored write lists its rated target as the earlier record it might
-    have joined; only a supersession marks it.
+    have joined; only a supersession marks it. ``band`` stays the soak's: it
+    is the write's cosine band, which M1 reads, and routing does not move it.
     """
     stored = outcome == OUTCOME_STORED
     marked = stored and features.route is Route.SUPERSESSION
@@ -270,7 +262,7 @@ def item_row(features: CaseFeatures, outcome: str) -> dict[str, Any]:
         'earlier_ids': [features.target_id] if stored else [],
         'superseded_marks': [features.target_id] if marked else [],
         'supersedes_target': False if stored else features.supersedes_target,
-        'band': _ROUTE_BANDS[features.route],
+        'band': features.soak_band,
         'project': features.project,
         'stratum': features.stratum,
         'via_sibling': features.via_sibling,

@@ -254,17 +254,24 @@ class TestItemRow:
         assert row['supersedes_target'] is False
         _scorer().ReaderItem.from_row(0, row)
 
-    def test_the_row_keeps_the_items_facts_and_names_the_routes_band(self) -> None:
+    def test_the_row_keeps_the_items_facts_and_its_cosine_band(self) -> None:
         judged = _mod().item_row(_case().features, 'amended')
         assert (judged['entry_id'], judged['project'], judged['stratum']) == (
             'E1', 'dark_factory', 'amended-sample',
         )
         assert (judged['via_sibling'], judged['cross_category']) == (False, False)
         assert judged['band'] == 'judge'
-        verbatim = _mod().item_row(_case(texts=[_text(child=_PARENT)]).features, 'restated')
-        assert verbatim['band'] == 'restated'
-        forced = _mod().item_row(_case(metadata={'kind': 'note'}).features, 'stored')
-        assert forced['band'] == 'stored'
+
+    @pytest.mark.parametrize('band', ['restated', 'judge', None])
+    def test_the_band_is_the_writes_cosine_band_whatever_its_route(self, band: str | None) -> None:
+        """M1 reads the band: the writes whose winner cosine was >= t_high, judged or not."""
+        judged = _mod().item_row(_case(band=band).features, 'amended')
+        verbatim = _mod().item_row(_case(band=band, texts=[_text(child=_PARENT)]).features,
+                                   'restated')
+        forced = _mod().item_row(_case(band=band, metadata={'kind': 'note'}).features, 'stored')
+        assert [row['band'] for row in (judged, verbatim, forced)] == [band] * 3
+        for row in (judged, verbatim, forced):
+            _scorer().ReaderItem.from_row(0, row)
 
 
 class TestFeaturesRow:
