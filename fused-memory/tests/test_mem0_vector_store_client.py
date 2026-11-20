@@ -51,7 +51,6 @@ def default_read() -> float:
 
 @pytest.mark.asyncio
 async def test_an_add_slower_than_the_http_client_default_still_lands(config, target, default_read):
-    config.queue.backend_read_timeout_seconds = 1.0
     with stub_qdrant_server(upsert_delay_s={target: default_read + 0.5}) as stub:
         async with backend_against(stub.url, config) as backend:
             result = await backend.add(CONTENT, SCOPE)
@@ -62,7 +61,6 @@ async def test_an_add_slower_than_the_http_client_default_still_lands(config, ta
 
 @pytest.mark.asyncio
 async def test_a_get_slower_than_the_http_client_default_still_answers(config, target, default_read):
-    config.queue.backend_write_timeout_seconds = 1.0
     with stub_qdrant_server(retrieve_delay_s={target: default_read + 0.5}) as stub:
         async with backend_against(stub.url, config) as backend:
             assert await backend.get(MEMORY_ID, SCOPE) is None
