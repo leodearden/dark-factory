@@ -159,7 +159,7 @@ def newest_content_mtime(root: Path) -> float | None:
 
     Pure, heartbeat-immune liveness signal backing the merge-worktree
     no-progress budget in
-    :meth:`orchestrator.merge_lane.worker.SpeculativeMergeWorker._run_inflight_verify`.
+    :meth:`orchestrator.merge_lane.verify_dispatch.VerifyDispatcher.run_inflight_verify`.
     ``root`` itself is never stat'd, and any ``.git`` subtree is pruned from
     the walk entirely — so the #1728 alpha owner-heartbeat
     (``_touch_owned_merge_worktrees``), which calls ``os.utime`` on every
@@ -990,7 +990,7 @@ async def _acquire_warm_verify_worktree(
         deterministic reason string, hence an identical
         ``merge_outcome_signature`` on every attempt, which trips workflow.py's
         ``consecutive_merge_thrash`` ladder into a false-positive human
-        escalation.  ``merge_queue._run_inflight_verify`` implements that
+        escalation.  ``VerifyDispatcher.run_inflight_verify`` implements that
         defer in an ``except`` arm placed BEFORE its generic
         ``except Exception``.  This swap seam is the only place a reader can
         see that this call can raise at all, hence the note here.
@@ -1053,7 +1053,7 @@ async def acquire_chain_build_lane(
     (``warm=False``), mirroring the ordinary remote path, which takes no local
     lane at all (task 7721).
 
-    γ (task 3185) has landed: ``SpeculativeMergeWorker._run_inflight_verify``
+    γ (task 3185) has landed: ``VerifyDispatcher.run_inflight_verify``
     now verifies ``ChainResult.tip`` inside THIS lane rather than acquiring a
     verify worktree of its own, and releases it — once, in its ``finally``,
     on every exit — via :func:`release_chain_build_lane`.  That is why the

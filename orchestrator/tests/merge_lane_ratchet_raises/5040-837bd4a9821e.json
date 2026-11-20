@@ -1,0 +1,12 @@
+{
+  "task_id": "5040",
+  "reason": "Move, not growth: SpeculativeMergeWorker::_dispatch_item (cognitive 37), ::_launch_verify (7), ::_remerge_at_dispatch (2) and ::_discard_unlaunched_replacement (1) move into merge_lane/verify_dispatch.py::VerifyDispatcher.dispatch and its named steps (largest 8). verify_dispatch.py cognitive 0 -> 38 is the moved code; worker.py cognitive 1516 -> 1469 (-47), so the cluster nets -9.",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/verify_dispatch.py",
+      "baseline": 0,
+      "current": 38
+    }
+  ]
+}

@@ -274,7 +274,7 @@ HARNESS NOTES
   * Monkeypatching is INSTANCE-level wherever possible:
     test_merge_queue_reachback_patch_guard.py freezes the
     ``orchestrator.merge_lane.worker.<private>`` reach-back surface.  The sanctioned
-    module-level exceptions are ``build_chain``, ``_run_post_merge_verify``,
+    module-level exceptions are ``build_chain``, ``run_post_merge_verify``,
     ``release_chain_build_lane``.
   * ``fused-memory/scripts/check_bare_magicmock_config.py`` forbids a bare
     ``MagicMock()`` bound to a config-named variable — use ``_make_config(...)``.
@@ -433,7 +433,7 @@ def _timed_out_verify_result():
     instead of the timeout one.
 
     ``category=''`` is load-bearing for the same reason — a category in
-    ``INFRA_TRANSIENT_CATEGORIES`` would make ``_run_post_merge_verify`` RETRY
+    ``INFRA_TRANSIENT_CATEGORIES`` would make ``run_post_merge_verify`` RETRY
     the dispatch rather than conclude, and the leg would be measuring the retry
     loop rather than the timeout path.
     """
@@ -475,8 +475,8 @@ def _verdict_from_tree(bad_file: str):
     ``passed=True`` stub, so this is a documented, public patch point and not a
     ``merge_queue.<private>`` reach-back (which
     test_merge_queue_reachback_patch_guard.py freezes).  Patching HERE rather
-    than replacing ``_run_post_merge_verify`` is what keeps the row honest:
-    the real ``_run_post_merge_verify`` still runs, so a red on the ordinary
+    than replacing ``run_post_merge_verify`` is what keeps the row honest:
+    the real ``run_post_merge_verify`` still runs, so a red on the ordinary
     arm is rendered into a genuine blocked :class:`MergeOutcome` by production
     code, and its ``timeouts``/``enospc_retries`` bookkeeping stays in the
     loop.  A stub in its place would be asserting the test's own arithmetic —
@@ -1503,7 +1503,7 @@ class _GateScene:
 
       * ``n_followers`` is a parameter, so a row states its own queue depth;
       * a REMOTE mode (``remote=True``) that drives the real
-        ``_run_post_merge_verify`` and therefore the real ``merge_verify``
+        ``run_post_merge_verify`` and therefore the real ``merge_verify``
         emission site, for the rows whose claim is about TELEMETRY or about the
         verify BUDGET rather than about landing;
       * per-round FACT RECORDING onto :attr:`rounds`, so a multi-round row
@@ -1511,7 +1511,7 @@ class _GateScene:
         whatever the last round left behind.
 
     Every spy is PASSTHROUGH (``advance_main``, ``release_chain_build_lane``,
-    ``build_chain``, ``_run_post_merge_verify`` in remote mode), so on-disk and
+    ``build_chain``, ``run_post_merge_verify`` in remote mode), so on-disk and
     pool state stay REAL while the call ledgers stay observable.
     """
 
@@ -1581,35 +1581,24 @@ class _GateScene:
         self._round_no += 1
         worker = self.worker
         # ── slot-1 steady state, restored before EVERY dispatch ─────────────
-        # `_n_failed` and `_remerge_occurred` are facts about SLOT 1 and about
-        # the enclosing `_verifier_loop` ITERATION.  This scene models neither:
-        # it drives `_dispatch_item` directly, one slot-2 item per round, with
-        # a structurally empty `_inflight`.
+        # `_n_failed` and the dispatcher's chain invalidation are facts about
+        # SLOT 1 and the enclosing `_verifier_loop` ITERATION.  This scene
+        # models neither: it drives `verify_dispatch.dispatch` directly, one
+        # slot-2 item per round, with a structurally empty `_inflight`.
         #
-        # A REAL slot-2 dispatch never reads either flag.  `_dispatch_item`
-        # gates the whole chain-invalidation / Mechanism-2 re-merge block on
-        # `not _has_inflight_verify`, and a genuine speculative dispatch
-        # happens precisely WHILE the head verify is in flight — so the block
-        # is skipped by construction.  Driving dispatch with an empty
-        # `_inflight` re-opens it, and two artifacts the pipeline itself never
-        # produces then appear:
-        #
-        #   * any round that requeued (i.e. every red tip) leaves
-        #     `_n_failed=True`, so the NEXT round's speculative item is
-        #     re-merged into a NON-speculative one.  Alone in this scene's
-        #     empty frontier it would chain as a head (PRD D5), so round 2 of
-        #     every walk would silently test the head path instead of the
-        #     slot-2 walk.
-        #   * `_remerge_occurred` is self-sustaining once set (it is assigned
-        #     from the same dispatch's own `iteration_did_remerge`), so ONE
-        #     re-merge would disable chaining for the rest of the scene.
-        #
-        # Resetting both restores exactly the state a healthy head slot leaves
-        # behind, which is the premise every row in this file is written
-        # against.  It is a fidelity choice about what this scene models, not a
-        # workaround: nothing in the deep path reads these flags.
+        # A REAL slot-2 dispatch never reads either.  The dispatcher gates its
+        # chain-invalidation / Mechanism-2 re-merge on no verify being in
+        # flight, and a genuine speculative dispatch happens precisely WHILE
+        # the head verify is in flight.  Driving dispatch with an empty
+        # `_inflight` re-opens that gate, so any round that requeued (every
+        # red tip) would leave `_n_failed=True` and the NEXT round's
+        # speculative item would be re-merged into a NON-speculative one,
+        # chaining as a head (PRD D5) instead of walking slot 2.  Chain
+        # invalidation stays clear on its own: only the verifier loop's
+        # head-failure cascade, which this scene never runs, raises it, and
+        # every round's dispatch that does not re-merge clears it.
         worker._n_failed = False
-        worker._remerge_occurred = False
+        assert not worker.verify_dispatch.chain_invalidated()
         n_calls_before = len(self.calls)
         n_built_before = len(self.built)
         n_acquires_before = len(self.lane_acquires)
@@ -1636,7 +1625,7 @@ class _GateScene:
             base_sha=main_before,   # this round really CASes against main
             speculative=True,       # slot 2 — chains whatever the frontier holds (PRD D5)
         )
-        entry = await worker._dispatch_item(item)
+        entry = await worker.verify_dispatch.dispatch(item)
         assert entry is not None, 'dispatch must not decline: a host is free'
         assert entry.verify_task is not None
         await entry.verify_task
@@ -1756,7 +1745,7 @@ class _GateScene:
             ),  # type: ignore[arg-type]
             merge_wt=wt,
             was_speculative=speculative,
-            # Mirrors `_dispatch_item`: the box is built alongside the entry and
+            # Mirrors `VerifyDispatcher.dispatch`: the box is built alongside the entry and
             # seeded with the item's own ephemeral, so a head running the REAL
             # `_run_inflight_verify` has somewhere for a warm swap to publish.
             verify_wt=VerifyWorktreeHandle(merge_wt=wt),
@@ -1806,7 +1795,7 @@ class _GateScene:
         head_entry = self.head_entry
         # Slot-1 steady state, for the reason documented at length in `round_`.
         worker._n_failed = False
-        worker._remerge_occurred = False
+        assert not worker.verify_dispatch.chain_invalidated()
         n_calls_before = len(self.calls)
         n_built_before = len(self.built)
         n_acquires_before = len(self.lane_acquires)
@@ -1832,7 +1821,7 @@ class _GateScene:
             base_sha=self.head_mc,  # stacked on the head's merge commit
             speculative=True,       # slot 2 — chains whatever the frontier holds (PRD D5)
         )
-        entry = await worker._dispatch_item(item)
+        entry = await worker.verify_dispatch.dispatch(item)
         assert entry is not None, 'dispatch must not decline: a host is free'
         assert entry.verify_task is not None
         await entry.verify_task
@@ -1923,7 +1912,7 @@ def _scripted_remote_runner(scene: _GateScene, script, name='gate-runner'):
 
     Used only in ``remote=True`` mode.  The verdict is decided HERE — below
     ``VerifyRunnerPool.dispatch`` — rather than by replacing
-    ``_run_post_merge_verify``, so the whole dispatch/emit/timeout-resolution
+    ``run_post_merge_verify``, so the whole dispatch/emit/timeout-resolution
     path above it genuinely runs and the ``merge_verify`` row is genuinely
     emitted.  A script that runs out returns PASS, matching δ's oracle.
 
@@ -1934,7 +1923,7 @@ def _scripted_remote_runner(scene: _GateScene, script, name='gate-runner'):
       * a :class:`VerifyResult` — returned VERBATIM.  This is the injector for
         a verdict whose SHAPE is the claim rather than its polarity — a
         ``timed_out=True`` result, say — and injecting it here rather than by
-        replacing ``_run_post_merge_verify`` (the ``outcome=`` vocabulary
+        replacing ``run_post_merge_verify`` (the ``outcome=`` vocabulary
         ``_merge_deep_scene.py::_spy_post_merge_verify`` uses) is what leaves the real
         function's ``timeouts``/``enospc_retries`` bookkeeping in the loop.
         A stub in its place would be asserting the test's own arithmetic.
@@ -2015,7 +2004,7 @@ async def _make_gate_scene(
     *remote* / *real_local* select WHERE the verdict is injected — three
     mutually exclusive seams, deepest last:
 
-      * neither — replace ``orchestrator.merge_lane.worker._run_post_merge_verify``
+      * neither — replace ``orchestrator.merge_lane.verify_dispatch.run_post_merge_verify``
         outright (δ's shape).  Cheapest, and the right seam for a row whose
         claim is about LANDING or about queue state.  No ``merge_verify`` event
         is emitted on this path.  NOTE its red is a raw
@@ -2027,11 +2016,11 @@ async def _make_gate_scene(
         ``remote=True``.
       * ``remote=True`` — install a ``_StubRemoteAllocator`` over a REMOTE
         ``HostLease`` whose runner answers the script, and let the real
-        ``_run_post_merge_verify`` run.  The right seam for a row whose claim
+        ``run_post_merge_verify`` run.  The right seam for a row whose claim
         is about TELEMETRY (``chain_items``, ``chain_build_ms``), because that
         is produced strictly below that call.
       * ``real_local=True`` — patch NOTHING on the verify path: a LOCAL lease,
-        the real ``_run_post_merge_verify``, its real ``LocalRunner``, and —
+        the real ``run_post_merge_verify``, its real ``LocalRunner``, and —
         through the INJECTED port (:func:`_scene_verifier`) — the real
         ``run_scoped_verification`` → ``run_verification``.  The ONLY seam that
         reaches ``verify._resolve_verify_timeout``, so the only one a BUDGET
@@ -2046,7 +2035,7 @@ async def _make_gate_scene(
     :func:`_verdict_from_tree`) injected as the port's SCOPED leg, with
     everything above it left real: a LOCAL lease (so the ordinary arm really
     warm-swaps into a ``_spec-`` lane and the verdict sees a real tree), the
-    real ``_run_post_merge_verify``, and therefore the real rendering of a red
+    real ``run_post_merge_verify``, and therefore the real rendering of a red
     into a blocked :class:`MergeOutcome`.  Mutually exclusive with *script* —
     a scene that stated its verdicts BOTH by position and by content would
     have two answers for the same round.  Every call is recorded on
@@ -2071,7 +2060,7 @@ async def _make_gate_scene(
 
     Module-level monkeypatching is confined to (a) the four
     ``orchestrator.merge_lane.worker`` names test_merge_queue_reachback_patch_guard.py
-    sanctions — ``build_chain``, ``_run_post_merge_verify``,
+    sanctions — ``build_chain``, ``run_post_merge_verify``,
     ``release_chain_build_lane`` — and (b)
     ``orchestrator.verify._run_cmd`` (:func:`_capture_verify_timeouts`), a
     public name one layer BELOW the port that no ``VerifyPort`` leg covers.
@@ -2125,7 +2114,7 @@ async def _make_gate_scene(
     # The round recorder, installed ONCE — re-wrapping per round would capture
     # the previous round's recorder as `real` and nest a wrapper deeper each
     # round.
-    real_verify = worker._run_inflight_verify
+    real_verify = worker.verify_dispatch.run_inflight_verify
 
     async def _recording(_item, _lease, **kwargs):
         rec = dict(kwargs)
@@ -2133,7 +2122,7 @@ async def _make_gate_scene(
         rec['result'] = await real_verify(_item, _lease, **kwargs)
         return rec['result']
 
-    monkeypatch.setattr(worker, '_run_inflight_verify', _recording)
+    monkeypatch.setattr(worker.verify_dispatch, 'run_inflight_verify', _recording)
     scene.lane_acquires = _spy_spec_lane_acquire(git_ops, monkeypatch)
     scene.lane_releases = _spy_chain_lane_release(monkeypatch)
     scene.advance_calls = _spy_advance_main(git_ops, monkeypatch, hook=advance_hook)
@@ -2182,7 +2171,7 @@ async def _make_gate_scene(
             return None if passed else _fail_verify_result()
 
         monkeypatch.setattr(
-            'orchestrator.merge_lane.worker._run_post_merge_verify', _oracle,
+            'orchestrator.merge_lane.verify_dispatch.run_post_merge_verify', _oracle,
         )
     return scene
 
@@ -2354,7 +2343,7 @@ class TestRow11TimeoutMargin:
         were ever retuned to 7200.0 the set assertion would stop discriminating
         between the two routes, and the pins fail loudly when that happens.
 
-        This runs the REAL ``_run_post_merge_verify`` → ``LocalRunner`` →
+        This runs the REAL ``run_post_merge_verify`` → ``LocalRunner`` →
         ``run_scoped_verification`` → ``run_verification`` stack, with only the
         subprocess launcher stubbed.  Nothing else reaches the resolver: the
         conftest autouse ``_mock_merge_queue_verification`` short-circuits at
@@ -2557,7 +2546,7 @@ class TestRow11TimeoutMargin:
            no ``merge_finalized`` row at all — the chain's whole prefix stays
            on the queue.
         3. NO blocked ``MergeOutcome`` is rendered for any chained item.  The
-           blocked outcome ``_run_post_merge_verify`` builds internally is
+           blocked outcome ``run_post_merge_verify`` builds internally is
            SWALLOWED into a REQUEUED status by the chain arm, precisely because
            a red tip names no culprit; every request future stays pending.
            This is also what keeps a timeout out of workflow.py's thrash ladder
@@ -2567,7 +2556,7 @@ class TestRow11TimeoutMargin:
            head's re-dispatch verifies alone, unsized by the policy — not a
            fresh full-depth chain (a timeout read as a clean bill of health).
 
-        The verdict is INJECTED below ``_run_post_merge_verify`` so the real
+        The verdict is INJECTED below ``run_post_merge_verify`` so the real
         function does its own ``timeouts``/``enospc`` bookkeeping — a stub in
         its place would be asserting the test's own arithmetic.
         """
@@ -3752,7 +3741,7 @@ class TestRow7KillSwitchByteIdentity:
     ) -> _GateScene:
         """Drive the fixed 3-round mixed sequence over one seeded queue.
 
-        ``remote=True`` so the REAL ``_run_post_merge_verify`` runs and the
+        ``remote=True`` so the REAL ``run_post_merge_verify`` runs and the
         ``merge_verify`` row is genuinely emitted — ``chain_items`` and
         ``chain_build_ms`` are produced strictly below that call, so a scene
         that stubbed it out could not state their absence at all.
@@ -4704,7 +4693,7 @@ class TestRow4ConflictTruncatesSilently:
         with a raw :class:`~orchestrator.verify.VerifyResult`, which the CHAIN
         arm consumes as "not None -> red" without reading a field, but which
         the UN-chained arm dereferences (``out.verify_skipped``) — it expects
-        the :class:`MergeOutcome` the real ``_run_post_merge_verify`` renders.
+        the :class:`MergeOutcome` the real ``run_post_merge_verify`` renders.
         A red on a DECLINED round therefore has to be injected below that
         function, which is exactly what ``remote=True`` does.
         """

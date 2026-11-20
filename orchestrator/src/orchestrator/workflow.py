@@ -12951,12 +12951,14 @@ class TaskWorkflow:
         # case the gate exists for.  Steward mediation (e.g. mutating plan.json
         # to silence the gate) would undermine the safeguard, so skip the L0
         # steward path entirely and submit an L1 immediately.
-        from orchestrator.merge_lane import POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX
+        from orchestrator.merge_lane import (
+            MAIN_HEALTH_RED_REASON_PREFIX,
+            POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX,
+            TRANSIENT_INFRA_REASON_PREFIX,
+        )
         from orchestrator.merge_lane.worker import (
             DROPPED_PLAN_TARGETS_REASON_PREFIX,
-            MAIN_HEALTH_RED_REASON_PREFIX,
             POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
-            TRANSIENT_INFRA_REASON_PREFIX,
         )
         if result.reason.startswith(DROPPED_PLAN_TARGETS_REASON_PREFIX):
             self._write_merge_failure_review('dropped_plan_targets', result.reason)
@@ -16462,19 +16464,23 @@ class TaskWorkflow:
         A fallback arm's has-work heuristic says only that the branch reads as
         merged; main's tip, which those arms used to stamp, is whatever landed
         most recently from ANY task.  This runs ``validate_landing_evidence``
-        in DISCOVERY mode — the shape of the harness dispatch gate's ancestry
-        arm — and returns the task's own attributable, surviving citation.  A
+        in DISCOVERY mode — the legacy citation-plus-effect-present policy,
+        kept here deliberately
+        (``docs/prds/landed-not-done-recovery.effect-present-caller-enumeration.md``
+        §7) — and returns the task's own attributable, surviving citation.  A
         reject, or a validation that raises, is logged and answers None, so
         every guard proceeds with its phase rather than stamping.
         """
+        metadata = self.task.get('metadata') or {}
         try:
             verdict = await validate_landing_evidence(
                 self.git_ops, self.task_id,
                 f'{self.config.git.branch_prefix}{self.task_id}',
                 branch_tip_sha=branch_tip_sha,
                 pattern_template=self.git_ops.config.commit_citation_pattern,
-                delivered_checks=_declared_checks(self.task.get('metadata') or {}),
+                delivered_checks=_declared_checks(metadata),
                 checks_enabled=self.config.delivered_checks.enabled,
+                branch_base_sha=metadata.get('branch_base_sha'),
             )
         except Exception:
             logger.warning(

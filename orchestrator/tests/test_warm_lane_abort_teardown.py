@@ -14,6 +14,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from _seed_script_stubs import seed_default_warm_base
 
 from orchestrator.config import GitConfig
 from orchestrator.git_ops import (
@@ -41,21 +42,11 @@ async def _init_repo(repo: Path) -> None:
 
 @pytest.fixture
 def git_repo(tmp_path: Path) -> Path:
-    """Temporary git repo with an initial commit + a resolvable warm base.
-
-    Task 2061: pre-creates the DEFAULT derived warm-lane base
-    (<repo>/.worktrees/_merge-verify/target, non-empty) so the
-    acquire_warm_lane pre-acquire base-health gate sees WarmBaseHealth.OK.
-    Task 2099: also marks `.worktrees/.pool-root` present so the
-    create-once mount-presence guard does not false-trip.
-    """
+    """Temporary git repo with an initial commit + a resolvable warm base."""
     repo = tmp_path / 'repo'
     repo.mkdir()
     asyncio.run(_init_repo(repo))
-    default_base = repo / '.worktrees' / '_merge-verify' / 'target'
-    default_base.mkdir(parents=True, exist_ok=True)
-    (default_base / '.keep').write_text('warm base sentinel\n')
-    (repo / '.worktrees' / '.pool-root').touch()
+    seed_default_warm_base(repo)
     return repo
 
 

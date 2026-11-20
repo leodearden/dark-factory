@@ -22,9 +22,9 @@ from _orch_helpers import make_placeholder_future, pydantic_spec
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import AdvanceOutcome, MergeResult
 from orchestrator.merge_lane.landed_outbox import LandedOutbox
+from orchestrator.merge_lane.main_health_probe import MAIN_HEALTH_RED_REASON_PREFIX
 from orchestrator.merge_lane.types import QueuedBranch
 from orchestrator.merge_lane.worker import (
-    MAIN_HEALTH_RED_REASON_PREFIX,
     TRAIN_REBASE_CONFLICT_REASON_PREFIX,
     GroupMergeRequest,
     MergeOutcome,
@@ -142,7 +142,7 @@ class TestTrainVerifyFailedReasonTagging:
         )
 
         with patch(
-            'orchestrator.merge_lane.worker._run_post_merge_verify',
+            'orchestrator.merge_lane.worker.run_post_merge_verify',
             new=AsyncMock(return_value=patched_outcome),
         ):
             result = await _do_train_merge(host, req)
@@ -175,7 +175,7 @@ class TestTrainVerifyFailedReasonTagging:
         )
 
         with patch(
-            'orchestrator.merge_lane.worker._run_post_merge_verify',
+            'orchestrator.merge_lane.worker.run_post_merge_verify',
             new=AsyncMock(return_value=mhr_outcome),
         ):
             result = await _do_train_merge(host, req)
@@ -200,7 +200,7 @@ class TestTrainVerifyFailedReasonTagging:
         )
 
         with patch(
-            'orchestrator.merge_lane.worker._run_post_merge_verify',
+            'orchestrator.merge_lane.worker.run_post_merge_verify',
             new=AsyncMock(return_value=transient_outcome),
         ):
             result = await _do_train_merge(host, req)
@@ -219,7 +219,7 @@ class TestTrainVerifyFailedReasonTagging:
         req = _make_group_req()
 
         with patch(
-            'orchestrator.merge_lane.worker._run_post_merge_verify',
+            'orchestrator.merge_lane.worker.run_post_merge_verify',
             new=AsyncMock(side_effect=AssertionError('should not reach verify')),
         ):
             result = await _do_train_merge(host, req)
@@ -237,10 +237,10 @@ class TestTrainVerifyFailedReasonTagging:
 
 @pytest.mark.asyncio
 class TestReverifyMemberSoloContract:
-    """reverify_member_solo wraps _run_post_merge_verify and never calls advance_main."""
+    """reverify_member_solo wraps run_post_merge_verify and never calls advance_main."""
 
     async def test_pass_returns_solo_verify_result_passed(self) -> None:
-        """_run_post_merge_verify → None (pass): SoloVerifyResult.passed=True."""
+        """run_post_merge_verify → None (pass): SoloVerifyResult.passed=True."""
         from orchestrator.merge_lane.worker import SoloVerifyResult, reverify_member_solo
 
         git_ops = _make_git_ops_mock()
@@ -251,7 +251,7 @@ class TestReverifyMemberSoloContract:
         config.git.branch_prefix = 'task/'
 
         with patch(
-            'orchestrator.merge_lane.worker._run_post_merge_verify',
+            'orchestrator.merge_lane.worker.run_post_merge_verify',
             new=AsyncMock(return_value=None),
         ):
             result = await reverify_member_solo(
@@ -275,7 +275,7 @@ class TestReverifyMemberSoloContract:
         git_ops.advance_main.assert_not_called()
 
     async def test_fail_returns_solo_verify_result_failed(self) -> None:
-        """_run_post_merge_verify → blocked MergeOutcome: SoloVerifyResult.passed=False."""
+        """run_post_merge_verify → blocked MergeOutcome: SoloVerifyResult.passed=False."""
         from orchestrator.merge_lane.worker import SoloVerifyResult, reverify_member_solo
 
         git_ops = _make_git_ops_mock()
@@ -292,7 +292,7 @@ class TestReverifyMemberSoloContract:
         )
 
         with patch(
-            'orchestrator.merge_lane.worker._run_post_merge_verify',
+            'orchestrator.merge_lane.worker.run_post_merge_verify',
             new=AsyncMock(return_value=fail_outcome),
         ):
             result = await reverify_member_solo(
@@ -324,7 +324,7 @@ class TestReverifyMemberSoloContract:
         escalation_queue = MagicMock()
         post_merge_verify = AsyncMock(return_value=None)
 
-        with patch('orchestrator.merge_lane.worker._run_post_merge_verify', new=post_merge_verify):
+        with patch('orchestrator.merge_lane.worker.run_post_merge_verify', new=post_merge_verify):
             await reverify_member_solo(
                 git_ops=_make_git_ops_mock(),
                 member_id='b2',
@@ -357,7 +357,7 @@ class TestReverifyMemberSoloContract:
         config.git.branch_prefix = 'task/'
 
         with patch(
-            'orchestrator.merge_lane.worker._run_post_merge_verify',
+            'orchestrator.merge_lane.worker.run_post_merge_verify',
             new=AsyncMock(return_value=None),
         ):
             result = await reverify_member_solo(
@@ -397,7 +397,7 @@ class TestReverifyMemberSoloContract:
         fail_outcome = MergeOutcome('blocked', reason='tests failed', failure_category='x')
 
         with patch(
-            'orchestrator.merge_lane.worker._run_post_merge_verify',
+            'orchestrator.merge_lane.worker.run_post_merge_verify',
             new=AsyncMock(return_value=fail_outcome),
         ):
             result = await reverify_member_solo(
@@ -530,7 +530,7 @@ class TestDoTrainMergeJournalsLandedRow:
 
         with (
             patch(
-                'orchestrator.merge_lane.worker._run_post_merge_verify',
+                'orchestrator.merge_lane.worker.run_post_merge_verify',
                 new=AsyncMock(return_value=None),  # verify passes → advance reached
             ),
             patch(

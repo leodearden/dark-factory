@@ -70,6 +70,9 @@ if str(REPO_ROOT) not in sys.path:
 # `_DEBUG_ASSERTS = os.environ.get(...)` seed picks it up.
 os.environ.setdefault('ORCH_DEBUG_ASSERTS', '1')
 
+# Why: test_suite_loads_no_dotenv.py.
+os.environ['PYTHON_DOTENV_DISABLED'] = '1'
+
 from _git_fixtures import RepoTemplates, session_templates  # noqa: E402
 from _orch_helpers import (  # noqa: E402
     CLAIMANT_TTL_SECS,
