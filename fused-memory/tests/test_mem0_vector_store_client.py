@@ -11,6 +11,7 @@ budget, and the failure named no budget at all.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import re
 from collections.abc import Iterator
 
@@ -24,6 +25,7 @@ from _mem0_stub_backend import (
 )
 from _stub_qdrant_server import POOLING_LOOPBACK_HOST, stub_qdrant_server
 
+from fused_memory.backends import mem0_client
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.models.scope import Scope
 
@@ -140,3 +142,18 @@ async def test_a_first_touch_overrunning_its_write_budget_raises_a_timeout_namin
             stub.release_event.set()
             await poll_until(lambda: not stub.collection_lists_in_flight())
             assert await backend.get(MEMORY_ID, SCOPE) is None
+
+
+@pytest.mark.parametrize(
+    ('read_budget', 'write_budget'),
+    [pytest.param(1.0, 30.0, id='read-narrower'), pytest.param(30.0, 1.0, id='write-narrower')],
+)
+def test_the_vector_store_client_outlasts_whichever_budget_is_wider(
+    config, target, default_read, read_budget, write_budget,
+):
+    config.queue.backend_read_timeout_seconds = read_budget
+    config.queue.backend_write_timeout_seconds = write_budget
+    with stub_qdrant_server(retrieve_delay_s={target: default_read + 0.5}) as stub:
+        config.mem0.qdrant_url = stub.url
+        with contextlib.closing(mem0_client.build_vector_store_client(config)) as client:
+            assert client.retrieve(collection_name=target, ids=[MEMORY_ID]) == []
