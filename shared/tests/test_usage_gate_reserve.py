@@ -120,6 +120,22 @@ def stub_probe(gate: UsageGate, answer: Callable[[AccountState], bool]) -> None:
     gate._run_probe = AsyncMock(side_effect=answer)
 
 
+def make_reopening_gate(
+    tmp_path: Path, reopens: str, *, cost_store: CostStore | None = None
+) -> UsageGate:
+    """On the virtual clock, the resume probe reopens *reopens* alone, one virtual second after
+    it is capped with no reset time, and no host stall can move that."""
+    gate = make_reserve_gate(
+        tmp_path,
+        clock=FakeClock(),
+        cost_store=cost_store,
+        wait_for_reset=True,
+        probe_interval_secs=1,
+    )
+    stub_probe(gate, lambda acct: acct.name == reopens)
+    return gate
+
+
 def lease_only(gate: UsageGate, name: str) -> AccountLease:
     lease = gate.try_lease(
         exclude=[other for other in ACCOUNTS if other != name], work_class=ESSENTIAL
@@ -907,10 +923,11 @@ class TestReserveWaitWakes:
 
 
 async def eventually(check: Callable[[], bool], *, polls: int = 300) -> None:
-    """Poll *check* on a real loop for at most *polls* loop turns 10 ms apart.
+    """Poll *check* on the running loop for at most *polls* loop turns 10 ms apart.
 
-    The budget counts loop turns, not wall clock, so a descheduled loop spends none
-    of it; at most a few seconds, far below the 300 s re-poll, so a pass proves a wake.
+    The budget counts loop turns 10 ms apart on the loop's own clock, real or virtual,
+    so a descheduled loop spends none of it; at most a few seconds, far below the 300 s
+    re-poll, so a pass proves a wake.
     """
     for _ in range(polls):
         if check():
@@ -919,20 +936,15 @@ async def eventually(check: Callable[[], bool], *, polls: int = 300) -> None:
     assert check(), f'not within {polls} polls'
 
 
-def soon() -> datetime:
-    return datetime.now(UTC) + timedelta(seconds=0.1)
-
-
 class TestTransitionsWakeTheWait:
     """PRD §6.3: another account opening, or the reserve failing, wakes a reserve wait."""
 
+    @virtual_clock_test
     async def test_b7_another_account_reopening_serves_the_waiter(self, tmp_path: Path) -> None:
         store = make_mock_cost_store()
-        gate = make_reserve_gate(
-            tmp_path, clock=FakeClock(), cost_store=store, wait_for_reset=True
-        )
+        gate = make_reopening_gate(tmp_path, 'max-d', cost_store=store)
         cap_all_but(gate, 'max-d', RESERVE)
-        cap(gate, 'max-d', resets_at=soon())
+        cap(gate, 'max-d')
 
         waiter = asyncio.create_task(gate.before_invoke(work_class=LOW))
         await let_run()
@@ -966,16 +978,15 @@ class TestTransitionsWakeTheWait:
         assert await events(store, 'reserve_wait_ended') == []
         await cancel(waiter)
 
+    @virtual_clock_test
     async def test_b14_a_scope_capped_account_opening_sends_the_waiter_to_the_scope_wait(
         self, tmp_path: Path
     ) -> None:
         store = make_mock_cost_store()
-        gate = make_reserve_gate(
-            tmp_path, clock=FakeClock(), cost_store=store, wait_for_reset=True
-        )
+        gate = make_reopening_gate(tmp_path, 'max-d', cost_store=store)
         cap_all_but(gate, 'max-d', RESERVE)
         cap(gate, 'max-d', scope=SCOPE, resets_at=datetime.now(UTC) + timedelta(hours=1))
-        cap(gate, 'max-d', resets_at=soon())
+        cap(gate, 'max-d')
 
         waiter = asyncio.create_task(gate.before_invoke(SCOPE, work_class=LOW))
         await let_run()
@@ -1007,14 +1018,14 @@ class TestTransitionsWakeTheWait:
         assert gate.is_paused is True
         await cancel(waiter)
 
+    @virtual_clock_test
     async def test_b10_when_the_reserve_reopens_only_the_admitted_caller_takes_it(
         self, tmp_path: Path
     ) -> None:
         """``is_paused`` is the PRD's public signal that ``_open`` is untouched (TestReserveWait)."""
-        gate = make_reserve_gate(tmp_path, clock=FakeClock(), wait_for_reset=True)
-        stub_probe(gate, lambda acct: acct.name == RESERVE)
+        gate = make_reopening_gate(tmp_path, RESERVE)
         cap_all_but(gate, RESERVE)
-        cap(gate, RESERVE, resets_at=soon())
+        cap(gate, RESERVE)
         paused_reason = gate.paused_reason
         low = asyncio.create_task(gate.before_invoke(work_class=LOW))
         high = asyncio.create_task(gate.before_invoke(work_class=HIGH))
