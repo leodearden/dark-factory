@@ -21,6 +21,7 @@ from pydantic import (
     ConfigDict,
     Field,
     PrivateAttr,
+    TypeAdapter,
     ValidationError,
     field_validator,
     model_validator,
@@ -6768,16 +6769,29 @@ PROJECT_CONFIG_FILENAME = 'dark-factory-orchestrator.yaml'
 """The canonical name of a project's orchestrator config, at its project root."""
 
 
-def project_review_config(project_root: Path) -> ReviewConfig:
-    """The ``review`` block the orchestrator of the project at *project_root* runs with.
+def _project_config_layers(project_root: Path) -> dict[str, Any]:
+    """The YAML layers of the orchestrator config of the project at *project_root*.
 
     Layered the way OrchestratorConfig layers its YAML source (defaults.yaml,
     then the project's own file, then ``${VAR}`` expansion), but without
     setting ``ORCH_CONFIG_PATH``, so one process can read another project's
-    setting. A project with no config file gets the shipped defaults.
+    settings. A project with no config file gets the shipped defaults.
     """
-    layered = YamlSettingsSource(OrchestratorConfig, project_root / PROJECT_CONFIG_FILENAME)()
-    return ReviewConfig.model_validate(layered.get('review') or {})
+    return YamlSettingsSource(OrchestratorConfig, project_root / PROJECT_CONFIG_FILENAME)()
+
+
+def project_review_config(project_root: Path) -> ReviewConfig:
+    """The ``review`` block the orchestrator of the project at *project_root* runs with."""
+    return ReviewConfig.model_validate(_project_config_layers(project_root).get('review') or {})
+
+
+_ROLE_ENV_OVERRIDES = TypeAdapter(dict[str, dict[str, str]])
+
+
+def project_role_env_overrides(project_root: Path) -> dict[str, dict[str, str]]:
+    """The role_env_overrides the orchestrator of the project at *project_root* gives its agents."""
+    layers = _project_config_layers(project_root)
+    return _ROLE_ENV_OVERRIDES.validate_python(layers.get('role_env_overrides') or {})
 
 
 # ---------------------------------------------------------------------------

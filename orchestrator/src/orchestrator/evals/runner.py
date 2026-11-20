@@ -26,6 +26,7 @@ from orchestrator.config import (
     OrchestratorConfig,
     PriceEntry,
     RoutingConfig,
+    project_role_env_overrides,
 )
 from orchestrator.git_ops import GitOps
 from orchestrator.implementer_brief_variant import execute_iteration_cap
@@ -157,6 +158,15 @@ def _admit_claude_role_models(
     return routing.model_copy(update={'allowed_models': admitted})
 
 
+def _fixture_role_env_overrides(
+    base_config: OrchestratorConfig, project_root: Path,
+) -> dict[str, dict[str, str]]:
+    """The agent env of the fixture project's orchestrator; the base's own when it is that project's."""
+    if project_root.resolve() == Path(base_config.project_root).resolve():
+        return base_config.role_env_overrides
+    return project_role_env_overrides(project_root)
+
+
 def build_eval_orch_config(
     config: EvalConfig,
     task: dict,
@@ -223,9 +233,14 @@ def build_eval_orch_config(
     if base_config is None:
         raise ValueError('build_eval_orch_config requires an explicit base_config')
     # Re-rooted BEFORE profiling, so the profile's eval-root leaves resolve
-    # against the fixture's project, the project its worktree is cut from.
+    # against the fixture's project, the project its worktree is cut from. The
+    # re-rooted base also carries that project's agent env: the cache redirects
+    # its production agents run with inside the shared write set.
     project_root = Path(task.get('project_root', str(base_config.project_root)))
-    base = base_config.model_copy(update={'project_root': project_root})
+    base = base_config.model_copy(update={
+        'project_root': project_root,
+        'role_env_overrides': _fixture_role_env_overrides(base_config, project_root),
+    })
 
     # Architect pin: opus/claude/high by default (frozen-plan + plan-only paths),
     # or derived from architect_config for the both-live end-to-end run (μ). When
