@@ -21,7 +21,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from legibility import detectors, inventory, reingestion, sampling
+import yaml
+from legibility import detectors, digest, inventory, reingestion, sampling
 
 MAIN_CWD = '/home/leo/src/dark-factory'
 MAIN_ENC = '-home-leo-src-dark-factory'
@@ -287,3 +288,52 @@ class TestSubagentAgentClassAndFirstTurn:
         assert detectors.is_primary_user_turn(sidechain) is False
         assert detectors.is_primary_user_turn(sidechain, subagent_transcript=True) is True
         assert detectors.is_primary_user_turn(main_chain, subagent_transcript=True) is False
+
+
+def _frontmatter(rendered: str) -> dict[str, Any]:
+    _, block, _ = rendered.split('---\n', 2)
+    return yaml.safe_load(block)
+
+
+class TestSubagentDigest:
+    """A sub-agent's digest names it and its parent, and counts its own turns only."""
+
+    def _tree(self, tmp_path: Path) -> tuple[Path, Path]:
+        return _write_parent_and_subagent(
+            tmp_path / MAIN_ENC,
+            subagent_records=[
+                {
+                    'type': 'assistant',
+                    'message': {'role': 'assistant', 'content': [
+                        {'type': 'text', 'text': 'my mistake, the caller lives in routing.py'},
+                    ]},
+                },
+                _tool_error_record(),
+            ],
+        )
+
+    def test_frontmatter_names_the_subagent_and_its_parent(self, tmp_path):
+        _, subagent = self._tree(tmp_path)
+        front = _frontmatter(digest.build_digest(subagent))
+        assert front['session'] == _subagent_key()
+        assert front['parent_session'] == PARENT_SID
+        assert front['encoded_dir'] == MAIN_ENC
+
+    def test_counts_the_subagents_own_signals(self, tmp_path):
+        _, subagent = self._tree(tmp_path)
+        counts = _frontmatter(digest.build_digest(subagent))['signal_counts']
+        assert counts['tool_error'] == 1
+        assert counts['self_correct'] == 1
+
+    def test_parent_agents_prompt_is_not_a_gold_turn(self, tmp_path):
+        _, subagent = self._tree(tmp_path)
+        rendered = digest.build_digest(subagent)
+        assert _frontmatter(rendered)['n_user_turns'] == 0
+        assert '## User Corrections' not in rendered
+
+    def test_parent_digest_names_no_parent_and_holds_none_of_the_subagents_hits(self, tmp_path):
+        parent, _ = self._tree(tmp_path)
+        front = _frontmatter(digest.build_digest(parent))
+        assert front['session'] == PARENT_SID
+        assert front['parent_session'] == ''
+        assert not any(front['signal_counts'].values())
