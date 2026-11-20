@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -183,7 +184,7 @@ class TestOrphanL0Reaper:
         assert l1.task_id == 'review-abc'
         assert l1.agent_role == 'harness-orphan-reaper'
         assert l1.category == 'design_concern'
-        assert l1.suggested_action == 'manual_intervention'
+        assert l1.suggested_action == original.suggested_action
         assert l1.status == 'pending'
         assert original.summary in l1.summary  # original summary preserved
         # A1: the promoted L1 cites a durable branch ref, not the ephemeral
@@ -1230,6 +1231,82 @@ def _reaper_l1s(queue: EscalationQueue) -> list[Escalation]:
         e for e in (queue.get(p.stem) for p in queue.queue_dir.glob('esc-*.json'))
         if e is not None and e.level == 1 and e.agent_role == 'harness-orphan-reaper'
     ]
+
+
+@pytest.mark.asyncio
+class TestTheReaperPromotesTheWholeFinding:
+    """The reaper's L1 carries the filer's whole finding, behind the reaper's
+    summary wrap and ahead of its durable-branch note."""
+
+    @staticmethod
+    def _submit_whole_finding(harness: Harness) -> Escalation:
+        queue = _bound_queue(harness)
+        esc = Escalation(
+            id=queue.make_id('T7385'),
+            task_id='T7385',
+            agent_role='implementer',
+            severity='blocking',
+            category='design_concern',
+            summary='Plan drift detected',
+            detail='Line one.\nLine two.',
+            suggested_action='investigate',
+            timestamp=_ago(300.0),
+            worktree='/home/leo/src/dark-factory/.worktrees/T7385',
+            level=0,
+            evidence=[{
+                'observation': 'plan names a file the diff never touches',
+                'measured_at': 'HEAD=9856ed15dc',
+                'ref': 'task/T7385',
+            }],
+            options=['A: keep', 'B: revert'],
+            root_cause='r',
+            project_id='dark_factory',
+        )
+        queue.submit(esc)
+        return esc
+
+    async def test_the_l1_carries_the_finding(self, harness: Harness) -> None:
+        l0 = self._submit_whole_finding(harness)
+
+        assert await harness._reap_orphan_l0_escalations() == 1
+
+        (l1,) = _reaper_l1s(_bound_queue(harness))
+        assert re.fullmatch(
+            r'Orphan L0 \(\d+s old, no active workflow\): ' + re.escape(l0.summary),
+            l1.summary,
+        )
+        assert l1.detail.startswith(l0.detail)
+        assert (
+            f'[promoted from {l0.id}: orphan L0 for task_id=T7385 (no active workflow)]'
+            in l1.detail
+        )
+        assert l1.detail.endswith(
+            '\n\n[note] originating worktree may be reaped; branch=task/T7385',
+        )
+        assert (
+            l1.suggested_action, l1.evidence, l1.options, l1.root_cause,
+            l1.project_id, l1.severity, l1.category,
+        ) == (
+            l0.suggested_action, l0.evidence, l0.options, l0.root_cause,
+            l0.project_id, l0.severity, l0.category,
+        )
+        assert l1.worktree is None
+        assert l1.agent_role == 'harness-orphan-reaper'
+        assert l1.filing_claimant_run_id == harness._filing_claimant_run_id
+
+    async def test_the_l0_is_dismissed_naming_the_l1(self, harness: Harness) -> None:
+        l0 = self._submit_whole_finding(harness)
+
+        await harness._reap_orphan_l0_escalations()
+
+        (l1,) = _reaper_l1s(_bound_queue(harness))
+        stored = _bound_queue(harness).get(l0.id)
+        assert stored is not None
+        assert (stored.status, stored.resolved_by) == ('dismissed', 'harness-orphan-reaper')
+        assert stored.resolution is not None
+        assert stored.resolution.startswith('Auto-promoted to level 1')
+        assert l1.id in stored.resolution
+        assert 'no active workflow' in stored.resolution
 
 
 @pytest.mark.asyncio
