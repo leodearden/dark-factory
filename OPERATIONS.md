@@ -499,8 +499,11 @@ window before treating a p90 or a max as complete.
 Each scheduler tick, the dispatch-admission gate reads one load sample. It
 holds new HEAVY agent dispatch while any configured arm is at or over its
 threshold and this orchestrator already has at least `min_inflight_floor`
-tasks in flight. Deterministic tasks are exempt. The floor is per
-orchestrator, so the gate never holds with nothing running. Design:
+tasks in flight. Deterministic tasks and main-health fixes (tasks carrying
+`metadata.main_health_signature`) are exempt, so a `dispatch_deferred` event
+never names a fix (DA-D10 of `docs/prds/dispatch-admission-load-cap.md`).
+The floor is per orchestrator, so the gate never holds with nothing running.
+Design:
 `docs/prds/dispatch-admission-load-cap.md`, amended by
 `plans/load-throttle-harmonisation-prd.md`.
 

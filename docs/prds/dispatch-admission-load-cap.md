@@ -5,6 +5,8 @@
 D1/D3/D10 amend DA-D1 (the CPU arm is the runqueue ratio, `cpu_some_avg10` is off by default,
 and `dispatch_deferred.metric` follows the D10 rank) and DA-D3 (equal floors are set in yaml).
 Read that PRD for the current contract.
+**Amended (2026-11-18, task 10600):** this PRD's DA-D10 (§2) exempts an admitted main-health fix
+from the hold.
 **Slug:** `dispatch-admission-load-cap`.
 **Item:** L3b of reify PRD `docs/prds/run-all-pool-contention-tiering-fix.md` (§9), flagged there
 as **dark-factory-owned, "not built here."**
@@ -58,7 +60,7 @@ PSI reader and config knob exist only to feed this one gate; nothing else reads 
   heavy task in flight** — the cap defers *additional* dispatch, it never wedges the queue.
 - **Deterministic (gate/deploy) tasks are exempt** — they hold no worktree/agent/build and add ~zero
   compile load, so they dispatch regardless of the PSI gate (a deterministic deploy still fires while
-  heavy dispatch is deferred).
+  heavy dispatch is deferred); main-health fixes are exempt for liveness (DA-D10).
 
 ## 1. Premise (G6 — why the cap is needed, with cited evidence)
 
@@ -162,6 +164,36 @@ PSI thresholds, which are **operator-tunable config**, not premises.
   avoids a duplicate parser that would drift and re-derive the kernel-asymmetry bug. **Do not** make
   the orchestrator depend on the `dark-factory-load-sampler` *service* package (wrong direction) — go
   through `shared`.
+- **DA-D10 — Exempt an admitted main-health fix (task 10600).** This exemption is for liveness, not
+  lightness. A task with a non-blank `metadata.main_health_signature`
+  (`orchestrator/src/orchestrator/main_health_fix_owner.py::is_main_health_fix`) is never deferred
+  by a hold, on any tick scope and in both the pinned and the scored loop. Both loops ask one
+  predicate, `orchestrator/src/orchestrator/scheduler.py::Scheduler._exempt_from_psi_hold`, which
+  ORs it with DA-D4's `is_deterministic`.
+  - *Why.* While main is red, the fix is the exit owner of every merge-waiter hold (INV-7
+    `holds-owned-and-bounded`; `docs/main-health-fix-run-slot-reserve.md` §4). Deferring it ties all
+    of those holds to host PSI with no bound, and PSI is host-wide, so sibling orchestrators can keep
+    it saturated. DA-D3's floor guarantees that some task progresses, not that the fix does.
+  - *Why per task, not per scope.* `orchestrator/src/orchestrator/run_slots.py::RunSlots.free_scope`
+    returns ANY while any general slot is free, so the harness runs a `MAIN_HEALTH_FIX` tick only once
+    the general pool is full. Under a hold no new work dispatches, so a partly full pool never fills,
+    and an exemption keyed on the tick scope would leave the fix held for as long as the host stays
+    saturated.
+  - *The bound.* One open fix per signature in production wiring, where the harness passes the merge
+    worker a scheduler and `main_health_fix_owner.py::MainFixTaskFiler` dedupes per signature. With
+    no scheduler, two fallbacks POST the fix without that dedupe:
+    `orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker._spawn_main_health_fix_task`
+    and `orchestrator/src/orchestrator/workflow.py::TaskWorkflow._spawn_main_health_fix_task`. On the
+    reserve, at most `main_health_fix_reserved_slots` beyond
+    `max_concurrent_tasks`. General slots stay capped by `max_concurrent_tasks`. While main is red,
+    the merge-waiters the fix unblocks sit idle in the merge queue rather than compiling.
+  - Lock behaviour keyed on deterministic-kind is a separate axis and is unchanged: a fix takes
+    module locks and may still reserve as a pin head. A pin the hold defers keeps the pin reservation
+    it holds, and with it a head slot under `pin_reservation_max_active`.
+  - *Residual.* That kept reservation is one PSI coupling left. The deferred head cannot dispatch to
+    consume it while the host stays saturated, so a fix whose modules overlap it waits as long as the
+    hold lasts. Without a hold the same wait is bounded: it is the lock-precedence residual in
+    `docs/main-health-fix-run-slot-reserve.md` §6. Follow-up: ticket `tkt_0RX4XDGDEK4X538JGHR7BFWN18`.
 
 ## 3. Pre-conditions / substrate (G3 — all verified in-repo / on-host)
 
@@ -275,7 +307,8 @@ landed; L3b consumes no reify primitive). **No deploy/flip leaf** (DA-D7: enable
   hard-trip; never let an io-only gate mask a memory-pressure host.
 - **Fail-open on unreadable PSI** (DA-D6): degrade to today's dispatch behavior with a loud log; never
   wedge the queue on a metrics-read failure.
-- **Exempt deterministic tasks** (DA-D4): deploy/gate tasks dispatch under load.
+- **Exempt deterministic tasks and main-health fixes** (DA-D4, DA-D10): deploy/gate tasks, and the
+  fix that heals red main, dispatch under load.
 - **Never touch the merge queue** (DA-D8): the gate governs task-lane dispatch only; no halt, no
   delay, no double-governance of merge verifies.
 - **Per-orchestrator floor** (DA-D3): the floor is measured against this orchestrator's own in-flight

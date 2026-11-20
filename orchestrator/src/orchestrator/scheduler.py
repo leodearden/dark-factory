@@ -96,6 +96,7 @@ from orchestrator.lock_table import (
     UncontestedAcquisition,
     one_holder_per_key,
 )
+from orchestrator.main_health_fix_owner import is_main_health_fix
 from orchestrator.mcp_lifecycle import ORCHESTRATOR_MCP_IDENTITY, mcp_call
 from orchestrator.module_charter import derive_modules, sanitize_files_for_persist
 from orchestrator.overrides import OverrideRow, OverrideSource, OverrideStore
@@ -2275,6 +2276,16 @@ class Scheduler:
         if not isinstance(metadata, dict):
             return False
         return metadata.get('task_kind') == 'deterministic'
+
+    @staticmethod
+    def _exempt_from_psi_hold(task: dict) -> bool:
+        """Whether a dispatch-admission hold must still let *task* dispatch.
+
+        A deterministic task is light (DA-D4); a main-health fix is the exit
+        owner of every merge-waiter hold (DA-D10). Both decisions live in
+        docs/prds/dispatch-admission-load-cap.md.
+        """
+        return Scheduler.is_deterministic(task) or is_main_health_fix(task)
 
     async def tasks_by_train(self, train_id: str) -> list[dict]:
         """Return tasks belonging to ``train_id``, sorted ascending by train.order (root→tip).
@@ -6988,6 +6999,9 @@ class Scheduler:
         ``orchestrator/pin_reservation.py``'s module docstring.
         :meth:`_bound_pin_reservations` enforces that bound at phase start
         (so a PSI-held tick still applies it) and after each head reserves.
+        A pin the PSI hold defers keeps the reservation that bound left it,
+        so it still counts as a head: an exempt pin behind it then never
+        reserves only to be displaced in the same tick.
         Every lock-blocked pin also reports ``pin_blocked``
         (:meth:`_note_pin_blocked`).  With ``pin_reservations_enabled`` off, a
         blocked pin neither reserves nor reports, as before task 6040.
@@ -7009,14 +7023,16 @@ class Scheduler:
         self._bound_pin_reservations(ctx, reservable)
         heads = 0
         for pin in queue:
-            if ctx.psi_hold and not self.is_deterministic(pin.task):
+            if ctx.psi_hold and not self._exempt_from_psi_hold(pin.task):
                 # Dispatch-admission gate (task 2328, DA3/DA-D5): a pin
-                # doesn't reduce host load, so a pinned HEAVY candidate is
-                # deferred exactly like a scored one — deterministic pins
-                # remain exempt.  ctx.psi_hold and _note_heavy_deferral are
-                # the SAME once-per-tick decision/helper the scored loop
-                # uses below, so both loops share one hold and one event.
+                # doesn't reduce host load, so a pinned candidate is deferred
+                # exactly like a scored one (see `_exempt_from_psi_hold`).
+                # ctx.psi_hold and _note_heavy_deferral are the SAME
+                # once-per-tick decision/helper the scored loop uses below,
+                # so both loops share one hold and one event.
                 self._note_heavy_deferral(ctx, ctx.psi_hold, pin.task_id)
+                if self.lock_table.reservation_source(pin.task_id) is ReservationSource.PIN:
+                    heads += 1
                 continue
             modules = self._get_modules(pin.task)
             if self.lock_table.try_acquire(pin.task_id, modules):
@@ -7348,11 +7364,10 @@ class Scheduler:
         refused: list[str] = []
         try:
             for _score, task_id, task, pri in scored:
-                if ctx.psi_hold and not self.is_deterministic(task):
-                    # Dispatch-admission gate (DA3): defer this HEAVY candidate —
-                    # deterministic candidates are exempt (DA-D4) and lower-
-                    # ranked exempt/light candidates behind it still get a turn
-                    # (per-candidate `continue`, not a top-level `return None`).
+                if ctx.psi_hold and not self._exempt_from_psi_hold(task):
+                    # Dispatch-admission gate (DA3): a per-candidate `continue`,
+                    # so exempt candidates ranked behind this one (see
+                    # `_exempt_from_psi_hold`) still get a turn.
                     self._note_heavy_deferral(ctx, ctx.psi_hold, task_id)
                     continue
                 modules = self._get_modules(task)
