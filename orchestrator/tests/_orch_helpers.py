@@ -14,10 +14,11 @@ import inspect
 import json
 import logging
 import os
+import sys
 import threading
 import time
 import types
-from collections.abc import Awaitable, Callable, Iterator, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
@@ -27,6 +28,7 @@ import pytest
 from pydantic import BaseModel
 from shared.config_models import AccountConfig, UsageCapConfig
 from shared.psi import PsiSample
+from shared.python_env import without_python_env_selection
 from shared.usage_gate import AccountState, UsageGate
 
 from orchestrator.config import ModuleConfig
@@ -1311,7 +1313,7 @@ async def reap_leaked_claimant_heartbeats() -> int:
     un-retrieved ``TypeError`` from ``asyncio.sleep(<MagicMock>)`` onto the
     shared loop. Either way pytest attributes the fallout to a later, innocent
     test (observed victim: ``TestB7SingleHostNewPath``'s serial-order
-    assertion, which sees a spurious extra ``_dispatch_item`` call).
+    assertion, which sees a spurious extra ``VerifyDispatcher.dispatch`` call).
 
     Like ``reap_leaked_ticket_workers`` (task 2737) — and unlike
     ``MergeWorker.run`` (task 1907) — the loop just blocks on ``asyncio.sleep``
@@ -2108,6 +2110,24 @@ def git_env_with_ceiling(cwd: Path) -> dict[str, str]:
     """
     env = os.environ.copy()
     env['GIT_CEILING_DIRECTORIES'] = str(Path(cwd).resolve().parent)
+    return env
+
+
+def env_resolving_running_interpreter(environ: Mapping[str, str]) -> dict[str, str]:
+    """*environ* with a bare ``python3`` / ``pytest`` bound to THIS test's interpreter.
+
+    A child that names a tool by bare name (a copied hook's ``python3``, a
+    ``LaneCommand``'s ``pytest``) resolves it through PATH. ``uv run`` and the
+    orchestrator daemon both put their venv's ``bin`` on PATH, so the merge gate
+    finds the workspace's interpreter there; ``.venv/bin/python -m pytest`` from a
+    plain shell does not, and the child silently gets the system interpreter,
+    which cannot import ``shared`` and has no ``pytest``. Scrubbed of the caller's
+    own selection first (``shared/src/shared/python_env.py::
+    without_python_env_selection``) so the result does not depend on which venv
+    the launching shell had active.
+    """
+    env = without_python_env_selection(environ)
+    env['PATH'] = os.pathsep.join(filter(None, (str(Path(sys.executable).parent), env.get('PATH'))))
     return env
 
 

@@ -2,9 +2,10 @@
 helpers (Fleet Cockpit C9b, PRD §9).
 
 Pure, deterministic unit tests only -- no Textual import, no pilot. The
-WeightEditorScreen(ModalScreen) widget itself is covered by test_app.py's
-pilot tests instead, mirroring test_decision_queue.py/test_spawn_bar.py's own
-split between fast pure-helper tests here and slower app-level pilot tests.
+WeightEditorScreen(ModalScreen) widget itself is covered by
+test_app_weight_editor.py's pilot tests instead, mirroring
+test_decision_queue.py/test_spawn_bar.py's own split between fast pure-helper
+tests here and slower app-level pilot tests.
 """
 
 from __future__ import annotations
@@ -16,7 +17,7 @@ from orchestrator import session_records
 
 
 def _make_session(**overrides):
-    """Mirrors test_app.py/test_decision_queue.py's _make_record convention."""
+    """Mirrors _cockpit_session_records.py::make_record and test_decision_queue.py::_make_session."""
     fields: dict = {
         'session_slug': 'unblock-df-2085-4242',
         'status': session_records.Status.RUNNING,

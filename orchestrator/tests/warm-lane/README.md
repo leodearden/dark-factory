@@ -1006,7 +1006,7 @@ move independently:
 | | edit point | value |
 |---|---|---|
 | (a) | `orchestrator/pyproject.toml` → `[tool.pytest.ini_options] addopts` | `-m 'not warm_lane_bash'` |
-| (b) | `dark-factory-orchestrator.yaml` → `git.offline_lane_commands` | `name: warm-lane-bash`, `command: "pytest -m warm_lane_bash"`, `cwd: "orchestrator"`, `fix_task_priority: "high"` |
+| (b) | `dark-factory-orchestrator.yaml` → `git.offline_lane_commands` | `name: warm-lane-bash`, `command: "uv run pytest -m warm_lane_bash"`, `cwd: "orchestrator"`, `fix_task_priority: "high"` |
 
 `fix_task_priority` is `high` (the `qdrant-integration` entry alongside it is
 `medium`) because leaf **κ** deletes reify's originals on this suite's green: a

@@ -45,6 +45,7 @@ from shared.cgroup_slice import project_slice_name
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    'ARM_FIELDS',
     'parse_pressure_file',
     'read_pressure',
     'PsiSample',
@@ -321,6 +322,9 @@ Single home (heuristic 11): ``saturated`` reads it order-insensitively
 itself is owned by PRD ``plans/load-throttle-harmonisation-prd.md`` D10.
 """
 
+ARM_FIELDS: frozenset[str] = frozenset(arm.field for arm in _ARMS)
+"""The arm field names of ``_ARMS``: the public, immutable vocabulary projection."""
+
 
 @dataclass(frozen=True)
 class PsiSample:
@@ -370,10 +374,11 @@ class PsiSample:
     def _tripping_arms(self, cfg) -> Iterator[_Arm]:
         """Yield the arms of ``_ARMS`` this sample trips, in D10 rank order."""
         for arm in _ARMS:
-            # Absence means arm off; `saturated` documents why. The rename hazard
-            # is guarded on the config side, where
+            # Absence reads as "arm off" (see `saturated`), so a rename in
+            # orchestrator's PsiAdmissionConfig would silently disable an arm.
+            # `shared` cannot import that model; the parity of its threshold
+            # fields with ARM_FIELDS is pinned on the orchestrator side by
             # orchestrator/tests/test_config_psi_admission_reload.py::TestPsiAdmissionArmVocabulary
-            # pins these arm fields to the config's.
             threshold = getattr(cfg, arm.field, None)
             if threshold is None:
                 continue

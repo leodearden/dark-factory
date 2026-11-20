@@ -4255,7 +4255,7 @@ class TestMergeRequestDedup:
         The background worker captures the dequeued MergeRequest so the test
         can assert ``req.retry_failed_only is True`` — i.e. the caller-vouched
         bool reaches the worker's retry path (``req`` is the same object
-        ``_run_post_merge_verify`` reads).
+        ``run_post_merge_verify`` reads).
         """
         import asyncio
 
@@ -4550,10 +4550,10 @@ class TestMergeRequestWorkflowVerifyEmission:
         resolving to *branch_tip*; yields the event store, then cancels the queued request."""
         from unittest.mock import AsyncMock
 
-        import orchestrator.merge_lane.worker as orchestrator_merge_queue
+        import orchestrator.merge_lane.inflight_verify as inflight_verify
 
         monkeypatch.setattr(
-            orchestrator_merge_queue,
+            inflight_verify,
             'resolve_dispatch_time_merge_base',
             AsyncMock(return_value=self._BASE_SHA),
         )
@@ -4765,14 +4765,14 @@ class TestMergeRequestWorkflowVerifyEmission:
         """
         from unittest.mock import AsyncMock
 
-        import orchestrator.merge_lane.worker as orchestrator_merge_queue
+        import orchestrator.merge_lane.inflight_verify as inflight_verify
 
         tip = 't' * 40
         # Monkeypatched for determinism even though the post-step-4 gate
         # short-circuits before this would ever be called when event_store
         # is None — avoids relying on a real git subprocess pre-step-4.
         monkeypatch.setattr(
-            orchestrator_merge_queue,
+            inflight_verify,
             'resolve_dispatch_time_merge_base',
             AsyncMock(return_value='s' * 40),
         )

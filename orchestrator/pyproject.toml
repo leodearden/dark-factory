@@ -340,7 +340,7 @@ pytest_add_cli_args = ["-n", "0", "-p", "no:cacheprovider"]
 pytest_add_cli_args_test_selection = [
     "tests/test_atomic_train_merge.py",
     "tests/test_block_disposition.py",
-    "tests/test_cli.py",
+    "tests/test_cli_verify_merge.py",
     "tests/test_coalesce_integration_gate.py",
     "tests/test_concurrent_verify_boundary.py",
     "tests/test_config_disjoint_skip_reload.py",

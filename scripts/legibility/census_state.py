@@ -13,13 +13,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
 
-# Import state_docs by the same spelling this module was imported by, so a
-# caller matching on Missing / Malformed / Ok sees the classes this module
-# returns: one source file loaded as two modules has two copies of each.
-if __package__:
-    from . import state_docs
-else:
-    import state_docs
+from legibility import state_docs
 
 
 def _as_census_date(name: str, raw: object) -> date:

@@ -1037,11 +1037,11 @@ _SCRIPTS_PSEUDO_MEMBER = MemberRoots(
     pseudo=True,
     src_root='scripts',
     tests_root='scripts/tests',
-    # scripts/tests/conftest.py puts these on sys.path, mirrored by the root
+    # scripts/tests/conftest.py puts each root on sys.path, mirrored by the root
     # pyproject.toml [tool.pyright].extraPaths. Pinned equal to the first by
     # scripts/tests/test_source_measures_import_roots.py and to the second by
     # tests/scripts/test_source_measures.py::TestExtraImportNames.
-    extra_import_roots=('scripts/legibility', 'scripts/local-model-serving'),
+    extra_import_roots=('scripts/local-model-serving',),
 )
 _TESTS_PSEUDO_MEMBER = MemberRoots(name='tests', pseudo=True, src_root=None, tests_root='tests')
 

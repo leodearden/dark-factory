@@ -3,8 +3,8 @@ result wait, which turns a hang into a confusing ``outcome is None``, and a
 worker stop that a ``wait_responsive`` give-up can skip, which leaks the
 worker into the next test.
 
-Pure: source text in, pytest item ids out (for the teardown scan, a census
-of them). It bills no wall clock. It shares
+Pure: source text or its parsed tree in, pytest item ids out (for the
+teardown scan, a census of them). It bills no wall clock. It shares
 only the item traversal and the ``asyncio.wait_for`` call shape with
 _wait_budget_audit.py, so both scans see the same items.
 
@@ -22,9 +22,11 @@ from typing import NamedTuple
 
 from _wait_budget_audit import (
     collect_test_items,
+    collect_test_items_in,
     is_asyncio_wait_for_call,
     is_responsive_wait_call,
     item_id,
+    parsed_or_none,
 )
 
 
@@ -214,14 +216,23 @@ def _classify_teardown(function: ast.AST) -> _TeardownRoles:
     )
 
 
+_NO_TEARDOWN_SCAN = WorkerTeardownScan(waiting_items=(), stopping_items=(), unguarded_items=())
+
+
 def scan_worker_teardown(source: str) -> WorkerTeardownScan:
-    """The esc-3980-4 teardown census of *source*'s pytest items
-    (see :func:`unguarded_worker_teardown_items` for the rule). Never raises:
+    """:func:`scan_worker_teardown_in` over *source*. Never raises:
     unparseable source yields three empty tuples."""
+    tree = parsed_or_none(source)
+    return _NO_TEARDOWN_SCAN if tree is None else scan_worker_teardown_in(tree)
+
+
+def scan_worker_teardown_in(tree: ast.Module) -> WorkerTeardownScan:
+    """The esc-3980-4 teardown census of *tree*'s pytest items
+    (see :func:`unguarded_worker_teardown_items` for the rule)."""
     waiting: set[str] = set()
     stopping: set[str] = set()
     unguarded: set[str] = set()
-    for owner, function in collect_test_items(source):
+    for owner, function in collect_test_items_in(tree):
         roles = _classify_teardown(function)
         item = item_id(owner, function.name)
         if roles.waits:
