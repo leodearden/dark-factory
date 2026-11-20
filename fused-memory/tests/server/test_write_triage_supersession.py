@@ -38,10 +38,10 @@ OLD = '11111111-2222-3333-4444-555555555555'
 OLD2 = '66666666-7777-4888-9999-aaaaaaaaaaaa'
 NEW_ID = '0f6c2a4e-8b1d-4c3e-9a7f-5d2e1b0c9a8f'
 
-_CONTENT = (
-    'Never run git stash in a dark-factory checkout: refs/stash is a single '
-    'ref in the shared .git dir and is not per-worktree.'
-)
+#: The write: a verbatim repeat of the harness candidate's default text, so a
+#: high-band hit is a restatement that adds nothing, routed `restated` unless
+#: the write declares a supersession.
+_CONTENT = search_candidate().content
 
 #: Patched at the consumer, as in test_add_memory_write_triage_gate.py.
 _JUDGE_PATH = 'fused_memory.server.tools.judge_write'

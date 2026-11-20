@@ -9,17 +9,19 @@ Shared proc_supervision test scaffolding lives in _proc_supervision_doubles.
 
 from __future__ import annotations
 
-import re
 import shlex
-from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
 from _proc_supervision_doubles import (
     FakeRunner,
     detached_rp4_plan,
+    fire_like_systemd_run,
     make_fake_inspector,
+    read_env_probe,
     read_escalations,
+    stub_find_spec,
+    write_env_probe,
 )
 from _proc_supervision_doubles import tmp_queue_dir as tmp_queue_dir
 from escalation.queue import EscalationQueue
@@ -207,13 +209,9 @@ class TestSelfRestartSystemdRunArgv:
             '--collect',
             '--working-directory=/proj',
         )
-        # Index-derived, not a re-hardcoded length: `--setenv=` options (task
-        # 3453) are spliced between --working-directory and /bin/sh, so pin
-        # the COMMAND's shape relative to /bin/sh rather than at fixed offsets.
-        sh_at = argv.index('/bin/sh')
-        assert argv[sh_at + 1] == '-c'
-        assert len(argv) == sh_at + 3, 'the /bin/sh -c payload must be the final token'
-        wrapped = argv[sh_at + 2]
+        assert argv[6:8] == ('/bin/sh', '-c')
+        assert len(argv) == 9, 'the /bin/sh -c payload must be the final token'
+        wrapped = argv[8]
 
         expected_payload = ' '.join(
             shlex.quote(p) for p in ['/proj/scripts/restart-orchestrator.sh', '--foo']
@@ -1241,10 +1239,8 @@ async def _run_rp4_wrapper(
     Returns ``(returncode, combined_output)`` so assertions can quote what the
     child actually printed.
     """
-    import asyncio
+    import dataclasses
     import sys
-
-    from orchestrator.proc_supervision import EscalationSpec, RestartPlan
 
     payload = _write_stub(tmp_path / 'payload.sh', 7)
     monkeypatch.setattr(
@@ -1252,42 +1248,12 @@ async def _run_rp4_wrapper(
     )
 
     runner = FakeRunner(returncode=0)
-    plan = RestartPlan(
-        script=payload,
-        args=['--foo'],
-        cwd=tmp_path,
-        target_unit='orch.service',
-        own_unit='orch.service',
-        on_failure_escalation=EscalationSpec(
-            queue_dir=str(tmp_queue_dir),
-            task_id='task-99',
-            summary='Self-restart fire-time failure',
-        ),
-        verify=None,
-        transient_unit='orch-redeploy-restart-99.service',
-        on_active_secs=10,
+    plan = dataclasses.replace(
+        detached_rp4_plan(tmp_queue_dir, with_spec=True), script=payload, cwd=tmp_path,
     )
     await plan.execute(runner=runner)
-    wrapped = runner.calls[0][0][-1]
 
-    proc = await asyncio.create_subprocess_exec(
-        '/bin/sh', '-c', wrapped,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
-    )
-    out, _ = await proc.communicate()
-    output = out.decode(errors='replace')
-    # `communicate()` has reaped the child, so returncode is always set — but it
-    # is typed `int | None`, so narrow it explicitly.  NOT `proc.returncode or
-    # 0`: that would silently report an unexited child as a clean exit 0, which
-    # is the exact value the success-path caller asserts on.  Same idiom as
-    # shared/tests/test_proc_group.py:524 and the sibling helper in
-    # test_deterministic_runner.py::_run_wrapper_payload.
-    rc = proc.returncode
-    assert rc is not None, (
-        f'communicate() returned but the child has no exit status; output: {output!r}'
-    )
-    return rc, output
+    return await fire_like_systemd_run(runner.calls[0][0])
 
 
 @pytest.mark.asyncio
@@ -1313,7 +1279,9 @@ class TestDetachedWrapperExactnessAndRegistrationFailure:
     by the two BEHAVIOURAL tests below, which execute the real wrapper against
     a stub interpreter and assert on observed exit codes and stderr."""
 
-    async def test_wrapper_payload_is_byte_for_byte(self, tmp_queue_dir: Path) -> None:
+    async def test_wrapper_payload_is_byte_for_byte(
+        self, tmp_queue_dir: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         import sys
 
         from orchestrator.proc_supervision import (
@@ -1321,6 +1289,9 @@ class TestDetachedWrapperExactnessAndRegistrationFailure:
             EscalationSpec,
             RestartPlan,
         )
+
+        monkeypatch.setenv('PYTHONPATH', '/tmp/df-5509-pin')
+        stub_find_spec(monkeypatch, {'escalation', 'shared'})
 
         runner = FakeRunner(returncode=0)
         spec = EscalationSpec(
@@ -1348,7 +1319,7 @@ class TestDetachedWrapperExactnessAndRegistrationFailure:
         quoted_payload = ' '.join(
             shlex.quote(p) for p in ['/proj/scripts/restart-orchestrator.sh', '--foo']
         )
-        quoted_on_failure = ' '.join(
+        quoted_on_failure = 'PYTHONPATH=/tmp/df-5509-pin ' + ' '.join(
             shlex.quote(p) for p in spec.to_submit_argv(sys.executable)
         )
         expected = (
@@ -1517,273 +1488,6 @@ class TestDetachedLeafPlainSpawn:
 
 
 # ---------------------------------------------------------------------------
-# task 3453 step-1: RED — the submit child's PYTHONPATH is EXPLICIT, never
-# inherited.  MEASURED against the live `systemd --user` manager: a caller
-# exporting PYTHONPATH=/tmp/sentinel-df gets a transient unit whose
-# `/bin/sh -c 'echo "[$PYTHONPATH]"'` prints `[]` — systemd-run propagates
-# NONE of the caller's environment.  So whatever the RP-4
-# `python -m escalation submit` child needs on sys.path must ride on the argv
-# itself (`--setenv=PYTHONPATH=...`, which MEASURABLY does reach even the
-# DEFERRED `--on-active` unit at fire time) or it is silently lost.
-# ---------------------------------------------------------------------------
-
-
-def _setenv_pythonpath_tokens(argv) -> list[str]:
-    """Every ``--setenv=PYTHONPATH=`` token on a built systemd-run argv."""
-    return [t for t in argv if isinstance(t, str) and t.startswith('--setenv=PYTHONPATH=')]
-
-
-def _pythonpath_roots(argv) -> list[str]:
-    """The os.pathsep-split roots carried by argv's --setenv=PYTHONPATH token."""
-    import os
-
-    tokens = _setenv_pythonpath_tokens(argv)
-    assert len(tokens) == 1, f'expected exactly one --setenv=PYTHONPATH token, got {tokens!r}'
-    value = tokens[0][len('--setenv=PYTHONPATH='):]
-    return value.split(os.pathsep)
-
-
-@pytest.mark.asyncio
-class TestSubmitChildPythonPathIsExplicit:
-    """The detached RP-4 argv carries an explicit ``--setenv=PYTHONPATH=``
-    naming the import roots the deferred ``python -m escalation submit`` child
-    needs — because systemd-run gives that child an EMPTY PYTHONPATH."""
-
-    async def test_setenv_pythonpath_present_and_carries_resolvable_roots(
-        self, tmp_queue_dir: Path, monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        monkeypatch.delenv('PYTHONPATH', raising=False)
-        runner = FakeRunner(returncode=0)
-        plan = detached_rp4_plan(tmp_queue_dir, with_spec=True)
-
-        await plan.execute(runner=runner)
-
-        argv, _kwargs = runner.calls[0]
-        tokens = _setenv_pythonpath_tokens(argv)
-        assert len(tokens) == 1, (
-            'exactly one --setenv=PYTHONPATH token must be emitted on the '
-            f'detached RP-4 argv, got {tokens!r}'
-        )
-        assert argv.index(tokens[0]) < argv.index('/bin/sh'), (
-            'the --setenv token is a systemd-run option — it must precede the '
-            '/bin/sh command, or systemd-run would pass it to the payload'
-        )
-
-        roots = _pythonpath_roots(argv)
-        assert roots, 'the PYTHONPATH value must not be empty'
-        for root in roots:
-            assert root, f'no empty PYTHONPATH entry may be emitted (got {roots!r})'
-            assert Path(root).is_absolute(), (
-                f'PYTHONPATH root {root!r} must be absolute — the deferred unit '
-                'runs under the systemd user manager, not this process'
-            )
-
-        # Assert against the FILESYSTEM, not a hardcoded repo path, so this
-        # stays worktree-agnostic (and correct under a real wheel install).
-        assert any((Path(r) / 'escalation' / '__init__.py').exists() for r in roots), (
-            f'no PYTHONPATH root resolves the `escalation` package: {roots!r}'
-        )
-        assert any((Path(r) / 'shared' / '__init__.py').exists() for r in roots), (
-            'no PYTHONPATH root resolves the `shared` package — MEASURED, the '
-            'submit child imports it via escalation.queue -> shared.timestamps: '
-            f'{roots!r}'
-        )
-
-    async def test_ambient_pythonpath_is_explicitly_propagated_not_dropped(
-        self, tmp_queue_dir: Path, monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """The crux: systemd-run hands the child an EMPTY PYTHONPATH, so
-        anything this process had must be re-supplied explicitly on the argv
-        or it is silently lost."""
-        sentinel = '/tmp/df-3453-ambient-sentinel'
-        monkeypatch.setenv('PYTHONPATH', sentinel)
-
-        runner = FakeRunner(returncode=0)
-        plan = detached_rp4_plan(tmp_queue_dir, with_spec=True)
-        await plan.execute(runner=runner)
-
-        argv, _kwargs = runner.calls[0]
-        roots = _pythonpath_roots(argv)
-        assert sentinel in roots, (
-            "this process's own PYTHONPATH must be explicitly re-supplied to "
-            f'the deferred child, not dropped: {roots!r}'
-        )
-        assert roots[0] == sentinel, (
-            "the parent's own PYTHONPATH entries must come FIRST so its "
-            f'sys.path precedence is preserved: {roots!r}'
-        )
-
-        # ...and with no ambient PYTHONPATH at all (the MEASURED production
-        # case — the orchestrator unit sets none) the resolved-root floor must
-        # still make the guarantee non-empty.
-        monkeypatch.delenv('PYTHONPATH', raising=False)
-        runner2 = FakeRunner(returncode=0)
-        plan2 = detached_rp4_plan(tmp_queue_dir, with_spec=True)
-        await plan2.execute(runner=runner2)
-
-        argv2, _kwargs2 = runner2.calls[0]
-        roots2 = _pythonpath_roots(argv2)
-        assert roots2, (
-            'with PYTHONPATH unset the resolved import-root floor must still '
-            'be emitted — the guarantee cannot depend on ambient env'
-        )
-        assert sentinel not in roots2, (
-            'the sentinel must not leak into the unset-PYTHONPATH case — the '
-            'value is recomputed per call, never cached'
-        )
-
-    async def test_no_setenv_when_plan_has_no_escalation_spec(
-        self, tmp_queue_dir: Path,
-    ) -> None:
-        """The token exists solely for the RP-4 submit child, so a plan with no
-        EscalationSpec keeps today's byte-identical argv."""
-        from orchestrator.proc_supervision import RestartPlan
-
-        runner = FakeRunner(returncode=0)
-        plan = RestartPlan(
-            script=Path('/proj/scripts/restart-orchestrator.sh'),
-            args=['--foo'],
-            cwd=Path('/proj'),
-            target_unit='orch.service',
-            own_unit='orch.service',
-            on_failure_escalation=None,
-            verify=None,
-            transient_unit='orch-redeploy-restart-99.service',
-            on_active_secs=10,
-        )
-
-        await plan.execute(runner=runner)
-
-        argv, _kwargs = runner.calls[0]
-        assert not [t for t in argv if isinstance(t, str) and t.startswith('--setenv=')], (
-            'no --setenv token may be emitted when there is no submit child to '
-            f'protect: {argv!r}'
-        )
-        expected_payload = ' '.join(
-            shlex.quote(p) for p in ['/proj/scripts/restart-orchestrator.sh', '--foo']
-        )
-        assert argv == (
-            'systemd-run', '--user',
-            '--on-active=10',
-            '--unit=orch-redeploy-restart-99.service',
-            '--collect',
-            '--working-directory=/proj',
-            '/bin/sh', '-c', expected_payload,
-        )
-
-
-# ---------------------------------------------------------------------------
-# task 3453 step-3: RED — an unresolvable import root degrades the escalation
-# guarantee LOUDLY (docs/legibility/design-invariants.md: no-silent-fail-soft)
-# and NEVER blocks the restart itself.
-# ---------------------------------------------------------------------------
-
-
-def _stub_find_spec(monkeypatch: pytest.MonkeyPatch, unresolvable: set[str]) -> None:
-    """Make ``importlib.util.find_spec`` return None for *unresolvable* names.
-
-    Every other name delegates to the real resolver, so this isolates the
-    package under test without disturbing unrelated imports.
-    """
-    import importlib.util
-
-    real = importlib.util.find_spec
-
-    def _fake(name: str, package: str | None = None):
-        if name in unresolvable:
-            return None
-        return real(name, package)
-
-    monkeypatch.setattr(importlib.util, 'find_spec', _fake)
-
-
-@pytest.mark.asyncio
-class TestSubmitChildPythonPathDegradesLoudly:
-    """A package whose import root cannot be resolved must produce a WARNING
-    naming it — never a silently narrowed PYTHONPATH, and never a failed
-    restart. The escalation is a REPORTING mechanism for the restart; degrading
-    the report must not turn a recoverable deploy into a wedged one."""
-
-    async def test_unresolvable_package_warns_and_omits_setenv(
-        self,
-        tmp_queue_dir: Path,
-        monkeypatch: pytest.MonkeyPatch,
-        caplog: pytest.LogCaptureFixture,
-    ) -> None:
-        import logging
-
-        from orchestrator.proc_supervision import (
-            _SUBMIT_CHILD_PACKAGES,
-            RestartDisposition,
-        )
-
-        monkeypatch.delenv('PYTHONPATH', raising=False)
-        _stub_find_spec(monkeypatch, set(_SUBMIT_CHILD_PACKAGES))
-
-        runner = FakeRunner(returncode=0)
-        plan = detached_rp4_plan(tmp_queue_dir, with_spec=True)
-
-        with caplog.at_level(logging.WARNING, logger='orchestrator.proc_supervision'):
-            outcome = await plan.execute(runner=runner)
-
-        argv, _kwargs = runner.calls[0]
-        assert not [t for t in argv if isinstance(t, str) and t.startswith('--setenv=')], (
-            'nothing resolved, so no PYTHONPATH guarantee may be claimed on the argv'
-        )
-
-        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
-        assert any(
-            'escalation' in r.getMessage() and 'PYTHONPATH' in r.getMessage()
-            for r in warnings
-        ), (
-            'an unresolvable submit-child package must be reported by name '
-            f'alongside the PYTHONPATH consequence: {[r.getMessage() for r in warnings]!r}'
-        )
-
-        assert outcome.disposition == RestartDisposition.SCHEDULED, (
-            'a degraded escalation guarantee must NEVER block the restart'
-        )
-
-    async def test_partial_resolution_still_emits_what_resolved(
-        self,
-        tmp_queue_dir: Path,
-        monkeypatch: pytest.MonkeyPatch,
-        caplog: pytest.LogCaptureFixture,
-    ) -> None:
-        """The degrade is per-package and reported — not all-or-nothing."""
-        import logging
-
-        from orchestrator.proc_supervision import RestartDisposition
-
-        monkeypatch.delenv('PYTHONPATH', raising=False)
-        _stub_find_spec(monkeypatch, {'shared'})
-
-        runner = FakeRunner(returncode=0)
-        plan = detached_rp4_plan(tmp_queue_dir, with_spec=True)
-
-        with caplog.at_level(logging.WARNING, logger='orchestrator.proc_supervision'):
-            outcome = await plan.execute(runner=runner)
-
-        argv, _kwargs = runner.calls[0]
-        roots = _pythonpath_roots(argv)
-        assert any((Path(r) / 'escalation' / '__init__.py').exists() for r in roots), (
-            'the root that DID resolve must still be supplied to the child: '
-            f'{roots!r}'
-        )
-        assert not any((Path(r) / 'shared' / '__init__.py').exists() for r in roots), (
-            'the stubbed-unresolvable root must not appear (guards the stub itself)'
-        )
-
-        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
-        assert any('shared' in r.getMessage() for r in warnings), (
-            'the package that failed to resolve must be named in a WARNING: '
-            f'{[r.getMessage() for r in warnings]!r}'
-        )
-
-        assert outcome.disposition == RestartDisposition.SCHEDULED
-
-
-# ---------------------------------------------------------------------------
 # task 3453 step-5: RED — the OTHER leg of the child's importability, the one
 # PYTHONPATH cannot cover.  MEASURED: `python -S -m escalation submit` with
 # only the src roots on PYTHONPATH dies at `shared.async_sqlite_base` ->
@@ -1840,30 +1544,6 @@ class TestSubmitChildInterpreterGuarantee:
 # ---------------------------------------------------------------------------
 
 
-def _write_env_probe(path: Path, *, record_to: Path, exit_code: int) -> Path:
-    """Write an executable stub that records ``[$MODE][$PYTHONPATH]`` (or
-    ``unset``) into *record_to*, ignores argv, and exits *exit_code*."""
-    path.write_text(
-        '#!/bin/sh\n'
-        'printf "[%s][%s]" "${MODE-unset}" "${PYTHONPATH-unset}" > '
-        f'{shlex.quote(str(record_to))}\n'
-        f'exit {exit_code}\n'
-    )
-    path.chmod(0o755)
-    return path
-
-
-_SYSTEMD_EXECSTART_EXPANSION = re.compile(r'\$(?:\$|\{([A-Za-z_][A-Za-z0-9_]*)\})')
-
-
-def _as_systemd_execstart_runs(command: str, unit_env: Mapping[str, str]) -> str:
-    """Model systemd's ``$$`` -> ``$`` and ``${NAME}`` expansion inside an ExecStart argv word."""
-    return _SYSTEMD_EXECSTART_EXPANSION.sub(
-        lambda m: '$' if m.group(0) == '$$' else unit_env.get(m.group(1), ''),
-        command,
-    )
-
-
 @pytest.mark.asyncio
 class TestDetachedPayloadCarriesEnv:
     """Each ``RestartPlan.env`` entry becomes a ``KEY=<quoted value>``
@@ -1884,11 +1564,7 @@ class TestDetachedPayloadCarriesEnv:
         await plan.execute(runner=runner)
 
         argv, _kwargs = runner.calls[0]
-        submit_child_tokens = _setenv_pythonpath_tokens(argv)
-        assert len(submit_child_tokens) == 1, (
-            f'the submit child keeps its own PYTHONPATH token: {argv!r}'
-        )
-        assert [t for t in argv if t.startswith('--setenv=')] == submit_child_tokens, (
+        assert [t for t in argv if t.startswith('--setenv=')] == [], (
             f'the plan env must not become a unit-wide --setenv: {argv!r}'
         )
         wrapped = argv[-1]
@@ -1947,19 +1623,18 @@ class TestDetachedPayloadCarriesEnv:
     async def test_env_reaches_the_payload_but_not_the_submit_child(
         self, tmp_path: Path, tmp_queue_dir: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Executes the REAL wrapper the way the fired unit would: from a bare
-        environment, with a failing payload so the submit child runs too."""
-        import asyncio
+        """Fires the REAL wrapper the way systemd-run would, with a failing
+        payload so the submit child runs too."""
         import dataclasses
         import os
         import sys
 
         payload_saw = tmp_path / 'payload-saw'
         submit_saw = tmp_path / 'submit-saw'
-        payload = _write_env_probe(tmp_path / 'payload.sh', record_to=payload_saw, exit_code=7)
+        payload = write_env_probe(tmp_path / 'payload.sh', record_to=payload_saw, exit_code=7)
         monkeypatch.setattr(
             sys, 'executable',
-            str(_write_env_probe(tmp_path / 'stub-python', record_to=submit_saw, exit_code=0)),
+            str(write_env_probe(tmp_path / 'stub-python', record_to=submit_saw, exit_code=0)),
         )
         plan = dataclasses.replace(
             detached_rp4_plan(tmp_queue_dir, with_spec=True),
@@ -1970,19 +1645,18 @@ class TestDetachedPayloadCarriesEnv:
         runner = FakeRunner(returncode=0)
         await plan.execute(runner=runner)
 
-        proc = await asyncio.create_subprocess_exec(
-            '/bin/sh', '-c',
-            _as_systemd_execstart_runs(runner.calls[0][0][-1], {'HOME': '/home/unit-user'}),
-            env={'PATH': os.environ['PATH']},
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-        )
-        out, _ = await proc.communicate()
+        rc, out = await fire_like_systemd_run(runner.calls[0][0])
 
-        assert proc.returncode == 7, out
-        assert payload_saw.read_text() == '[two $$words ${HOME}][/payload-only]'
-        assert submit_saw.read_text() == '[unset][unset]', (
-            'the plan env must reach the payload alone, never the RP-4 submit child'
+        assert rc == 7, out
+        payload_env = read_env_probe(payload_saw)
+        assert (payload_env.get('MODE'), payload_env.get('PYTHONPATH')) == (
+            'two $$words ${HOME}', '/payload-only',
+        )
+        submit_env = read_env_probe(submit_saw)
+        assert 'MODE' not in submit_env, submit_env
+        assert '/payload-only' not in submit_env.get('PYTHONPATH', '').split(os.pathsep), (
+            'the plan env must reach the payload alone; the RP-4 submit child '
+            f'keeps only its own PYTHONPATH: {submit_env!r}'
         )
 
 

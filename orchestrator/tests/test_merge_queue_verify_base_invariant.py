@@ -444,7 +444,7 @@ def _fake_local_allocator() -> MagicMock:
 
 @pytest.mark.asyncio
 class TestDispatchRefreshesLastKnownMainSha:
-    """The ε=1890 §5.3 dispatch guard in `_dispatch_item` refreshes the cached
+    """The ε=1890 §5.3 dispatch guard in `VerifyDispatcher.dispatch` refreshes the cached
     main SHA from its own already-fetched fresh `get_main_sha()` result
     (task 2357 DEFECT 2), so the main snapshot() feeds two_layer_invariants
     never lags the dispatch's view.
@@ -473,11 +473,11 @@ class TestDispatchRefreshesLastKnownMainSha:
         assert isinstance(item, RealMergeItem)  # narrow union arm for item.merge_wt (pyright)
 
         worker._host_allocator = _fake_local_allocator()
-        worker._run_inflight_verify = AsyncMock(  # type: ignore[method-assign]
+        worker.verify_dispatch.run_inflight_verify = AsyncMock(
             return_value=InflightVerifyResult(outcome=None, merge_wt=item.merge_wt)
         )
 
-        entry = await worker._dispatch_item(item)
+        entry = await worker.verify_dispatch.dispatch(item)
 
         assert entry is not None, 'dispatch should succeed with a free local slot'
         assert _cached_main_sha(worker) == new_main
@@ -513,11 +513,11 @@ class TestDispatchRefreshesLastKnownMainSha:
         )
         assert isinstance(item, RealMergeItem)  # narrow union arm for item.merge_wt (pyright)
         worker._host_allocator = _fake_local_allocator()
-        worker._run_inflight_verify = AsyncMock(  # type: ignore[method-assign]
+        worker.verify_dispatch.run_inflight_verify = AsyncMock(
             return_value=InflightVerifyResult(outcome=None, merge_wt=item.merge_wt)
         )
 
-        await worker._dispatch_item(item)
+        await worker.verify_dispatch.dispatch(item)
 
         violations = worker.snapshot()['two_layer_invariants']
         assert violations == [], f'expected a clean snapshot after dispatch, got: {violations!r}'
@@ -547,11 +547,11 @@ class TestDispatchRefreshesLastKnownMainSha:
         )
         assert isinstance(item, RealMergeItem)  # narrow union arm for item.merge_wt (pyright)
         worker._host_allocator = _fake_local_allocator()
-        worker._run_inflight_verify = AsyncMock(  # type: ignore[method-assign]
+        worker.verify_dispatch.run_inflight_verify = AsyncMock(
             return_value=InflightVerifyResult(outcome=None, merge_wt=item.merge_wt)
         )
 
-        entry = await worker._dispatch_item(item)
+        entry = await worker.verify_dispatch.dispatch(item)
 
         assert entry is not None, 'dispatch must still succeed despite the guard error'
         assert _cached_main_sha(worker) == old_main
@@ -667,11 +667,11 @@ class TestAdvisoryContractRegressionPins:
 
         allocator = _fake_local_allocator()
         worker._host_allocator = allocator
-        worker._run_inflight_verify = AsyncMock(  # type: ignore[method-assign]
+        worker.verify_dispatch.run_inflight_verify = AsyncMock(
             return_value=InflightVerifyResult(outcome=None, merge_wt=item.merge_wt)
         )
 
-        entry = await worker._dispatch_item(item)
+        entry = await worker.verify_dispatch.dispatch(item)
 
         assert isinstance(entry, InflightEntry), (
             'ADVISORY CONTRACT VIOLATED (task 3206, PRD §5.3): a phantom frozen '
@@ -710,12 +710,12 @@ class TestAdvisoryContractRegressionPins:
         )
         assert isinstance(item, RealMergeItem)
         worker._host_allocator = _fake_local_allocator()
-        worker._run_inflight_verify = AsyncMock(  # type: ignore[method-assign]
+        worker.verify_dispatch.run_inflight_verify = AsyncMock(
             return_value=InflightVerifyResult(outcome=None, merge_wt=item.merge_wt)
         )
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
-            entry = await worker._dispatch_item(item)
+            entry = await worker.verify_dispatch.dispatch(item)
 
         guard_warnings = [
             r for r in caplog.records
@@ -735,7 +735,7 @@ class TestAdvisoryContractRegressionPins:
     ) -> None:
         """(c) NO LEASE LEAK — the trap any future enforcement must solve.
 
-        The guard sits AFTER `allocator.acquire()` in `_dispatch_item`, so a
+        The guard sits AFTER `allocator.acquire()` in `VerifyDispatcher.dispatch`, so a
         bare `return None` inserted at the guard would leak the host lease:
         acquired, never released, never attached to a returned entry.  Pin
         both halves — the lease is acquired and NOT released/cancelled, and it
@@ -755,11 +755,11 @@ class TestAdvisoryContractRegressionPins:
         assert isinstance(item, RealMergeItem)
         allocator = _fake_local_allocator()
         worker._host_allocator = allocator
-        worker._run_inflight_verify = AsyncMock(  # type: ignore[method-assign]
+        worker.verify_dispatch.run_inflight_verify = AsyncMock(
             return_value=InflightVerifyResult(outcome=None, merge_wt=item.merge_wt)
         )
 
-        entry = await worker._dispatch_item(item)
+        entry = await worker.verify_dispatch.dispatch(item)
 
         assert allocator.acquire.await_count == 1, (
             'fixture precondition: the dispatch must have acquired a lease'
@@ -796,12 +796,12 @@ class TestAdvisoryContractRegressionPins:
         )
         assert isinstance(item, RealMergeItem)
         worker._host_allocator = _fake_local_allocator()
-        worker._run_inflight_verify = AsyncMock(  # type: ignore[method-assign]
+        worker.verify_dispatch.run_inflight_verify = AsyncMock(
             return_value=InflightVerifyResult(outcome=None, merge_wt=item.merge_wt)
         )
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
-            entry = await worker._dispatch_item(item)
+            entry = await worker.verify_dispatch.dispatch(item)
 
         assert entry is not None, 'a healthy dispatch must complete'
         guard_warnings = [
@@ -829,7 +829,7 @@ async def _straggler_dispatch(
     worker = _make_worker(git_ops)
     worker._host_allocator = _fake_local_allocator()
     monkeypatch.setattr(worker, '_cleanup_owned_merge_worktree', AsyncMock())
-    monkeypatch.setattr(worker, '_run_inflight_verify', AsyncMock(
+    monkeypatch.setattr(worker.verify_dispatch, 'run_inflight_verify', AsyncMock(
         return_value=InflightVerifyResult(outcome=None, merge_wt=Path('/fake/merge-wt')),
     ))
     _, tip_item = await _make_merged_item(git_ops, config, 'task/vb-tip', 'vb_tip.py', 't=1\n')
@@ -841,7 +841,7 @@ async def _straggler_dispatch(
     _, built = await _make_merged_item(git_ops, config, 'task/vb-strag', 'vb_s.py', 's=1\n')
     permit = await worker._speculation_ledger.acquire()
     straggler = dataclasses.replace(built, base_sha=_VB_DEAD, speculative=True, permit=permit)
-    entry = await worker._dispatch_item(straggler)
+    entry = await worker.verify_dispatch.dispatch(straggler)
     assert isinstance(entry, InflightEntry)
     tip = tip_item.merge_result.merge_commit
     assert tip is not None

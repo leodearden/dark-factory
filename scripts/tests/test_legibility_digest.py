@@ -15,9 +15,9 @@ real Claude Code JSONL schema (observed in
 
 Every helper below returns a plain dict (or writes one) — no behavior, pure
 scaffolding reused by every test class in this file. Import the target
-module as `import digest as mod`, resolved via scripts/tests/conftest.py's
-sys.path insertion (both scripts/ and scripts/legibility/ are on sys.path;
-no package __init__ needed).
+module as `from legibility import digest as mod`, the one spelling every
+legibility module is reached by (scripts/ is on sys.path via
+scripts/tests/conftest.py; no package __init__ needed).
 """
 from __future__ import annotations
 
@@ -26,10 +26,10 @@ import logging
 import re
 from pathlib import Path
 
-import digest as mod
 import pytest
 import yaml
 from legibility import detectors, reingestion
+from legibility import digest as mod
 from legibility import inventory as inventory_mod
 from legibility_carrier_fixtures import (
     CENSUS_MEMORY_CONTEXT_TURN,
@@ -40,6 +40,7 @@ from legibility_carrier_fixtures import (
     TASK_NOTIFICATION_TEXT,
     TRICKLE_CODER_PREAMBLE,
     UNKNOWN_PROVENANCE_TEXT,
+    UNMARKED_HEADLESS_SDK_PROMPT_TEXTS,
     WATCHER_ROTATION_PROMPT,
     briefing_text,
     coder_judgment,
@@ -48,6 +49,7 @@ from legibility_carrier_fixtures import (
     pre_5356_replan_prompt,
     prior_round_adjudicator_prompt,
     recon_run_review_text,
+    sdk_prompt,
     steward_continuation_prompt,
     with_origin,
 )
@@ -1072,6 +1074,20 @@ class TestTrickleCoderSessionDigest:
 
         assert yaml.safe_load(frontmatter_yaml)['instrument_version'] >= 7
 
+    def test_frontmatter_instrument_version_is_at_or_past_the_headless_sdk_prompt_generation(
+        self,
+    ):
+        """A version floor only. Generation 8 is the first whose gold section
+        and dialogue carriers exclude headless SDK-delivered prompts. The
+        exclusion itself is pinned by TestHeadlessSdkPromptFilter."""
+        digest = mod.render_digest(
+            [_with_session_meta(_user_text('please fix the bug'))], agent_class='interactive',
+        )
+
+        frontmatter_yaml, _ = _split_frontmatter(digest)
+
+        assert yaml.safe_load(frontmatter_yaml)['instrument_version'] >= 8
+
 
 # ---------------------------------------------------------------------------
 # find_retry_loops — same tool name + canonical (sort_keys) input signature
@@ -2041,17 +2057,6 @@ def _resume_and_context_block_records():
     ]
 
 
-def _sdk_prompt(text):
-    """A prompt delivered over the SDK, shaped like the steward continuation
-    records sighted in reify session 77fb6617: promptSource and turnOrigin
-    'sdk', no 'origin', and the 'isMeta' key ABSENT rather than False."""
-    rec = _user_text(text)
-    rec.pop('isMeta')
-    rec['promptSource'] = 'sdk'
-    rec['turnOrigin'] = 'sdk'
-    return rec
-
-
 _BLOCKED_LITERAL = 'BLOCKED: merge gate refused the branch'
 
 INJECTED_PROSE_PROMPTS = (
@@ -2277,9 +2282,9 @@ class TestHarnessInjectedTurnFilter:
         # The 77fb6617 shape: two continuation prompts around real dialogue.
         continuation = steward_continuation_prompt(tmp_path)
         records = [
-            _sdk_prompt(continuation),
+            sdk_prompt(continuation, entrypoint=None),
             _user_text('please fix the bug'),
-            _sdk_prompt(continuation),
+            sdk_prompt(continuation, entrypoint=None),
         ]
 
         turns = mod.iter_user_turns(records)
@@ -2298,7 +2303,7 @@ class TestHarnessInjectedTurnFilter:
         prompt = steward_continuation_prompt(
             tmp_path, summary='BLOCKED: merge gate refused the branch',
         )
-        records = [_with_session_meta(_sdk_prompt(prompt)) for _ in range(2)]
+        records = [_with_session_meta(sdk_prompt(prompt, entrypoint=None)) for _ in range(2)]
 
         digest = mod.render_digest(records, agent_class='orchestrated-task')
 
@@ -2313,7 +2318,7 @@ class TestHarnessInjectedTurnFilter:
     def test_injected_prose_prompt_is_excluded_from_iter_user_turns(self, prompt):
         # The 16e1a37b / 2880c011 / 4aaf48b0 shape: the injected prompt is
         # the session's first user record.
-        records = [_sdk_prompt(prompt), _user_text('please fix the bug')]
+        records = [sdk_prompt(prompt, entrypoint=None), _user_text('please fix the bug')]
 
         turns = mod.iter_user_turns(records)
 
@@ -2322,7 +2327,7 @@ class TestHarnessInjectedTurnFilter:
     @pytest.mark.parametrize('prompt', INJECTED_PROSE_PROMPTS)
     def test_render_digest_injected_prose_prompt_session_has_no_gold_section(self, prompt):
         digest = mod.render_digest(
-            [_with_session_meta(_sdk_prompt(prompt))], agent_class='orchestrated-task',
+            [_with_session_meta(sdk_prompt(prompt, entrypoint=None))], agent_class='orchestrated-task',
         )
 
         frontmatter_yaml, _ = _split_frontmatter(digest)
@@ -2638,6 +2643,40 @@ class TestNonHumanOriginFilter:
 
         assert mod.iter_user_turns(records) == []
         assert detectors.classify_agent_class(_MAIN_DIR_PATH, records) == 'orchestrated-task'
+
+
+# ---------------------------------------------------------------------------
+# Headless-SDK prompt exclusion (task 6953): a prompt delivered to headless
+# `claude --print` (promptSource 'sdk', entrypoint 'sdk-cli') is excluded by
+# provenance alone, while a human turn typed into an SDK GUI client stays gold.
+# ---------------------------------------------------------------------------
+
+class TestHeadlessSdkPromptFilter:
+    def test_headless_prompts_are_excluded_and_dialogue_keeps_its_index(self):
+        gui_client_turn = sdk_prompt("what's the status of the PR?", entrypoint='sdk-ts')
+        typed_turn = {**_user_text('please fix the bug'), 'promptSource': 'typed', 'entrypoint': 'cli'}
+        records = [sdk_prompt(text) for text in UNMARKED_HEADLESS_SDK_PROMPT_TEXTS.values()]
+        records += [gui_client_turn, typed_turn]
+
+        turns = mod.iter_user_turns(records)
+
+        assert [(t['index'], t['text']) for t in turns] == [
+            (4, "what's the status of the PR?"),
+            (5, 'please fix the bug'),
+        ]
+
+    def test_render_digest_headless_prompt_session_has_no_gold_section(self):
+        records = [
+            _with_session_meta(sdk_prompt(f'{text}\nBLOCKED: merge gate refused the branch'))
+            for text in UNMARKED_HEADLESS_SDK_PROMPT_TEXTS.values()
+        ]
+
+        digest = mod.render_digest(records, agent_class='orchestrated-task')
+
+        meta = yaml.safe_load(_split_frontmatter(digest)[0])
+        assert '## User Corrections' not in digest
+        assert meta['n_user_turns'] == 0
+        assert meta['signal_counts'] == dict.fromkeys(mod.SIGNAL_COUNT_KEYS, 0)
 
 
 # ---------------------------------------------------------------------------

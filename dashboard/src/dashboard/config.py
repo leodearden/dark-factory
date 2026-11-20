@@ -220,8 +220,8 @@ class DashboardConfig:
     # ::_quality_loop), the only writers of the history the charts read.
     # Env DASHBOARD_SAMPLERS=on|off, default on. What off means for an operator:
     # SETUP.md §"7. Dashboard + watchdog units", the DASHBOARD_SAMPLERS entry.
-    # The test suite's function-scoped clients run with it off
-    # (dashboard/tests/conftest.py::samplers_off).
+    # The whole test suite runs with it off
+    # (dashboard/tests/_dashboard_helpers.py::apply_isolated_env).
     samplers_enabled: bool = True
 
     def __post_init__(self) -> None:

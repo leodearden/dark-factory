@@ -20,6 +20,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from _git_fixtures import seed_repo
+from _seed_script_stubs import seed_default_warm_base
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig
@@ -58,10 +59,7 @@ REUSE_ROUTES = (
 def git_repo(tmp_path: Path) -> Path:
     """A repo with an initial commit, a resolvable warm base and `.pool-root`."""
     repo = seed_repo(tmp_path / 'repo')
-    default_base = repo / '.worktrees' / '_merge-verify' / 'target'
-    default_base.mkdir(parents=True, exist_ok=True)
-    (default_base / '.keep').write_text('warm base sentinel\n')
-    (repo / '.worktrees' / '.pool-root').touch()
+    seed_default_warm_base(repo)
     return repo
 
 

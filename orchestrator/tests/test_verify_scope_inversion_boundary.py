@@ -22,7 +22,7 @@ main before this task started:
   ``cached_main_baseline_failing_ids`` / ``diff_new_failures`` (verify.py);
   junit ``failing_test_ids`` on ``VerifyResult``; the merge worker cites
   NEW-only ids vs routing MAIN_HEALTH_RED (merge_queue.py
-  ``_classify_main_health_red`` / ``_run_post_merge_verify``).
+  ``_classify_main_health_red`` / ``run_post_merge_verify``).
 - ν (2591): infra-transient outcomes consume zero attempts at both the
   workflow ``_verify_debugfix_loop`` and merge accounting
   (``INFRA_TRANSIENT_CATEGORIES``, verify_categories.py).
@@ -34,7 +34,7 @@ Row    Name                                        Seam(s) driven
 =====  =========================================  ===============================================
 1      source-only sibling break rejected          producer: ``run_scoped_verification`` (merge+full
                                                      widens to the untouched sibling module); consumer:
-                                                     ``_run_post_merge_verify`` (real merge gate, BLOCKED
+                                                     ``run_post_merge_verify`` (real merge gate, BLOCKED
                                                      citing the sibling's failing id)
 2      task-role signal                            producer+observable: ``run_scoped_verification``
                                                      (role='task' — the floor never widens beyond the
@@ -42,12 +42,12 @@ Row    Name                                        Seam(s) driven
 3      docs-only trivial, both roles                producer+consumer: ``run_scoped_verification`` at
                                                      both role='task'/'merge' (TRIVIAL short-circuit,
                                                      zero commands)
-4      new-vs-preexisting baseline attribution      consumer: ``_run_post_merge_verify`` (mixed
+4      new-vs-preexisting baseline attribution      consumer: ``run_post_merge_verify`` (mixed
                                                      baseline — blocked citing only the NEW id)
-5      wholly pre-existing + cache hit              consumer: ``_run_post_merge_verify`` x2 (MAIN_HEALTH_RED
+5      wholly pre-existing + cache hit              consumer: ``run_post_merge_verify`` x2 (MAIN_HEALTH_RED
                                                      routing, no branch charge, one probe across two merges)
 6      infra non-consumption, both consumers        task-verify: ``TaskWorkflow._verify_debugfix_loop``;
-                                                     merge-verify: ``_run_post_merge_verify`` accounting
+                                                     merge-verify: ``run_post_merge_verify`` accounting
 7      train amortization                           ``MergeLane`` train merge (exactly one broad,
                                                      per-module merge-role verify of the train tip)
 8      rollback path (breadth='scoped')              producer: ``run_scoped_verification`` (byte-identical
@@ -64,7 +64,7 @@ Harness approach — drive REAL seams both ways, fake runners, no ssh (the
 ``orchestrator.verify.run_verification`` (never a real subprocess) and
 inspects the executed ``ModuleConfig``(s) / ``VerifyResult.plan`` /
 ``VerifyResult.summary``. The CONSUMER/merge-gate side drives the REAL
-``_run_post_merge_verify`` chokepoint (merge_queue.py), opting OUT of the
+``run_post_merge_verify`` chokepoint (merge_queue.py), opting OUT of the
 autouse ``_mock_merge_queue_verification`` stub via
 ``@pytest.mark.exercise_merge_verify`` so ``orchestrator.merge_lane.worker.
 run_scoped_verification`` stays bound to the REAL function — which, in turn,
@@ -124,12 +124,10 @@ from orchestrator import verify, verify_plan
 from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_lane import MergeLane
-from orchestrator.merge_lane.worker import (
-    MAIN_HEALTH_RED_REASON_PREFIX,
-    TRANSIENT_INFRA_REASON_PREFIX,
-    MergeOutcome,
-    _run_post_merge_verify,
-)
+from orchestrator.merge_lane.main_health_probe import MAIN_HEALTH_RED_REASON_PREFIX
+from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
+from orchestrator.merge_lane.verify_failure_outcome import TRANSIENT_INFRA_REASON_PREFIX
+from orchestrator.merge_lane.worker import PRODUCTION_VERIFIER, MergeOutcome
 from orchestrator.verify import (
     VerifyResult,
     _mc_attr_for_run_or_none,
@@ -273,7 +271,7 @@ async def _drive_merge_gate(
     timeouts: dict[str, int] | None = None,
     enospc_retries: dict[str, int] | None = None,
 ) -> MergeOutcome | None:
-    """Drive the REAL merge-gate consumer chokepoint, ``_run_post_merge_verify``.
+    """Drive the REAL merge-gate consumer chokepoint, ``run_post_merge_verify``.
 
     Builds a merge+full ``OrchestratorConfig`` (with *module_configs_registry*
     installed as its module registry — mirrors ``_two_module_registry``'s
@@ -290,7 +288,7 @@ async def _drive_merge_gate(
 
     *task_files_content* (``{relative path: file content}``) is written into
     the MERGE worktree (``merge_wt`` — the actual worktree
-    ``_run_post_merge_verify`` scopes against), not the outer *tmp_path*
+    ``run_post_merge_verify`` scopes against), not the outer *tmp_path*
     scratch dir. Omitting this (an empty dict, or a path *task_files* names
     but *task_files_content* doesn't cover) leaves ``merge_wt`` without the
     touched file on disk, which degrades plan derivation to the TRIVIAL
@@ -313,7 +311,7 @@ async def _drive_merge_gate(
     expensive worktree-probe fallback is what the cache actually elides.
 
     *timeouts* / *enospc_retries* let a caller inspect the merge-side
-    attempt-accounting dicts ``_run_post_merge_verify`` mutates in place
+    attempt-accounting dicts ``run_post_merge_verify`` mutates in place
     (the timeout loop-breaker and the shared ENOSPC/classified-infra retry
     budget, respectively) — default ``None`` builds fresh empty dicts
     per-call (byte-identical to every pre-existing call site, which never
@@ -345,10 +343,11 @@ async def _drive_merge_gate(
     req.module_configs = list(touched_module_configs)
 
     with patch.object(verify, 'run_verification', new=run_verification_fake):
-        return await _run_post_merge_verify(
+        return await run_post_merge_verify(
             git_ops, req, merge_wt,
             timeouts=timeouts, enospc_retries=enospc_retries,
             max_timeouts=3, max_enospc=1,
+            verifier=PRODUCTION_VERIFIER,
         )
 
 
@@ -393,7 +392,7 @@ async def _drive_producer(
 # ---------------------------------------------------------------------------
 # Row 1: "the hole, closed" — source-only sibling break rejected at the
 # merge gate. Builds the shared row-1 harness (instrumented fake
-# run_verification + the _run_post_merge_verify consumer driver), reused
+# run_verification + the run_post_merge_verify consumer driver), reused
 # unmodified by rows 4 and 5.
 # ---------------------------------------------------------------------------
 
@@ -520,7 +519,7 @@ class TestRow2TaskRoleSignal:
 # BOTH role='task'/'merge', breadth-independent — zero commands.
 #
 # INV-1 (task 2883) UPDATE: the CONSUMER seam is the *adoptable* merge verdict
-# (``_run_post_merge_verify`` → is_merge_verify=True). INV-1 abolishes the
+# (``run_post_merge_verify`` → is_merge_verify=True). INV-1 abolishes the
 # no-evidence trivial pass there: a docs-only ('no_source_files') diff at the
 # real merge gate no longer trivially passes — it escalates to the project's
 # full gate when a full-gate command exists (see
@@ -545,7 +544,7 @@ class TestRow3DocsOnlyTrivialBothRoles:
     (``run_scoped_verification``, is_merge_verify=False) seam.
 
     INV-1 (task 2883) amends the CONSUMER seam: the adoptable merge verdict
-    (``_run_post_merge_verify`` → is_merge_verify=True) no longer trivially
+    (``run_post_merge_verify`` → is_merge_verify=True) no longer trivially
     passes a no-evidence resolution. A docs-only diff at the real merge gate
     now escalates to the project's full gate (a ``trivial_pass_escalated``
     event with reason='no_source_files', resolution='full_gate') and runs the
@@ -738,7 +737,7 @@ class TestRow5WhollyPreexistingMainHealthRedAndCacheHit:
         shared_git_ops = _make_git_ops(tmp_path)
         probe_spy = AsyncMock(wraps=verify_failure_is_preexisting_on_main)
         with patch(
-            'orchestrator.merge_lane.worker.verify_failure_is_preexisting_on_main',
+            'orchestrator.merge_lane.main_health_probe.verify_failure_is_preexisting_on_main',
             new=probe_spy,
         ):
             outcome1 = await _drive_merge_gate(
@@ -890,7 +889,7 @@ class TestRow6InfraTransientConsumesNoAttemptBothConsumers:
         assert wf._infra_hold_info.get('category') == 'infra_issue'
         assert wf._infra_hold_info.get('escalate_to_human') is True
 
-        # -- MERGE-verify side: drive the REAL merge gate (_run_post_merge_verify)
+        # -- MERGE-verify side: drive the REAL merge gate (run_post_merge_verify)
         # with the SAME persistent infra-transient category. A single touched,
         # unregistered-sibling module keeps the aggregate category exactly
         # ROW6_INFRA_CATEGORY (no widening to muddy the classification).
@@ -938,7 +937,7 @@ class TestRow6InfraTransientConsumesNoAttemptBothConsumers:
 # Row 7: "train amortization" (λ/σ, T1). A 3-member line-stacked Python
 # train lands via exactly ONE broad, per-module merge-role verify of the
 # TIP — the amortization win — driven through the REAL
-# ``MergeLane`` -> ``_do_train_merge`` -> ``_run_post_merge_verify``
+# ``MergeLane`` -> ``_do_train_merge`` -> ``run_post_merge_verify``
 # chokepoint chain. Adapts test_train_integration.py's real-git train harness
 # (``make_stacked_member`` / ``build_group_merge_request`` / ``_SpyEventStore``)
 # driven through ``MergeLane``, to non-cargo Python modules with an

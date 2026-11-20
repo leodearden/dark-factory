@@ -20,6 +20,7 @@ from legibility_carrier_fixtures import (
     briefing_text,
     coder_judgment,
     json_fenced,
+    sdk_prompt,
     text_block,
     tool_result_record,
     tool_use_block,
@@ -304,10 +305,11 @@ class TestNonDialogueCarrierPredicate:
             ),
             (user_record(briefing_text()), briefing_text()),
             (user_record(TRICKLE_CODER_PREAMBLE), TRICKLE_CODER_PREAMBLE),
+            (sdk_prompt(_ORDINARY_DIALOGUE), _ORDINARY_DIALOGUE),
         ],
         ids=[
             'non_human_origin_alone_decides', 'coder_judgment', 'json_fenced_coder_judgment',
-            'briefing', 'trickle_coder_prompt',
+            'briefing', 'trickle_coder_prompt', 'headless_sdk_prompt_alone_decides',
         ],
     )
     def test_a_non_dialogue_carrier_is_rejected(self, record, text):
@@ -319,11 +321,31 @@ class TestNonDialogueCarrierPredicate:
             (with_origin(user_record(_ORDINARY_DIALOGUE), 'human'), _ORDINARY_DIALOGUE),
             (assistant_record(text_block(_PROSE_SELF_CORRECTION)), _PROSE_SELF_CORRECTION),
             (assistant_record(text_block(PROSE_QUOTING_THE_SCHEMA)), PROSE_QUOTING_THE_SCHEMA),
+            (sdk_prompt(_ORDINARY_DIALOGUE, entrypoint='t3-code'), _ORDINARY_DIALOGUE),
         ],
-        ids=['human_origin', 'genuine_self_correction', 'prose_quoting_the_schema_inline'],
+        ids=[
+            'human_origin', 'genuine_self_correction', 'prose_quoting_the_schema_inline',
+            'sdk_gui_client_turn',
+        ],
     )
     def test_this_sessions_own_dialogue_is_kept(self, record, text):
         assert detectors.is_non_dialogue_carrier(record, text) is False
+
+    def test_a_headless_sdk_prompt_counts_no_text_signal_but_its_sessions_tool_results_do(self):
+        text = 'BLOCKED: merge gate refused the branch\n[Request interrupted by user for tool use]'
+        headless = detectors.record_hits(sdk_prompt(text))
+        gui_client = detectors.record_hits(sdk_prompt(text, entrypoint='t3-code'))
+        tool_result = detectors.record_hits({
+            **tool_result_record('tool-1', 'BLOCKED: gate refused\nls: cannot access x: No such file or directory'),
+            'entrypoint': 'sdk-cli',
+        })
+
+        assert headless.count(SignalClass.DF_GUARD) == 0
+        assert headless.count(SignalClass.INTERRUPT) == 0
+        assert gui_client.count(SignalClass.DF_GUARD) == 1
+        assert gui_client.count(SignalClass.INTERRUPT) == 1
+        assert tool_result.count(SignalClass.DF_GUARD) == 1
+        assert tool_result.count(SignalClass.NOT_FOUND) == 1
 
 
 # ---------------------------------------------------------------------------
