@@ -2,6 +2,11 @@
 
 Replaces the in-memory QueueService with crash-safe persistence, retry with
 exponential backoff, dead-lettering, and per-group worker pools.
+
+A failure an injected :class:`ParkPolicy` names (one that clears only when a
+human acts, such as exhausted provider credits) PARKS its write instead of
+dead-lettering it: the row waits at status ``parked`` and is re-probed, and the
+first parked write that lands releases every other.
 """
 
 from __future__ import annotations
@@ -510,6 +515,7 @@ class DurableWriteQueue:
         """
         terminal: tuple[str, str | None] | None = None
         parked: ParkedWriteEvent | None = None
+        unparked: int | None = None
         value: QueuedWrite | None = None
         write_op_id: str | None = None
         # Seeded from the row, since an earlier attempt may already have
@@ -545,6 +551,8 @@ class DurableWriteQueue:
                     await self._callbacks[callback](value, result)
                 await self._mark_completed(item)
                 terminal = ('completed', None)
+                if item.status == 'parked':
+                    unparked = await self._unpark_all(item)
             except Exception as exc:
                 reason = self._park_reason(exc, executed=executed)
                 if reason is None:
@@ -554,6 +562,9 @@ class DurableWriteQueue:
 
         if parked is not None:
             await self._notify_parked(parked)
+        if unparked is not None:
+            await self._start_workers_for_pending_groups()
+            await self._notify_cleared()
         if terminal is not None:
             status, error = terminal
             if status == 'dead' and executed:
@@ -714,6 +725,41 @@ class DurableWriteQueue:
                 'Item %d (%s, group_id=%s): on_parked hook failed; the item is '
                 'parked but the park was NOT reported',
                 event.item_id, event.operation, event.group_id, exc_info=True,
+            )
+
+    async def _unpark_all(self, landed: QueueItem) -> int:
+        """Release every parked row now that a parked write has landed.
+
+        Only a parked write's success proves the parking cause is gone; any
+        other write may never have touched the refusing provider. The rows keep
+        their attempt counts.
+        """
+        async with self._require_access().write() as db:
+            cursor = await db.execute(
+                "UPDATE write_queue SET status = 'pending', next_retry_at = 0 "
+                "WHERE status = 'parked'"
+            )
+        unparked = cursor.rowcount or 0
+        logger.info(
+            'Item %d (%s, group_id=%s) landed after parking; unparked %d other row(s)',
+            landed.id, landed.operation, landed.group_id, unparked,
+        )
+        return unparked
+
+    async def _notify_cleared(self) -> None:
+        """Tell the policy a parked write landed, never raising into the worker.
+
+        Parked rows share one probe horizon, so concurrent probes in several
+        groups can each land: the hook must be idempotent.
+        """
+        if self._park_policy is None:
+            return
+        try:
+            await self._park_policy.on_cleared()
+        except Exception:
+            logger.warning(
+                'on_cleared hook failed; parked rows were released but the '
+                'clearing was NOT reported', exc_info=True,
             )
 
     async def _mark_completed(self, item: QueueItem) -> None:
