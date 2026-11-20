@@ -3,6 +3,11 @@
 
 # Concurrency
 max_concurrent_tasks: 24
+# Run slots beyond max_concurrent_tasks that only a main-health fix may take;
+# rationale in docs/main-health-fix-run-slot-reserve.md. The dashboard restates
+# this value (dashboard/src/dashboard/data/orchestrator.py, FORMAT COUPLING
+# item 2), so change both together.
+main_health_fix_reserved_slots: 1
 max_per_module: 1
 lock_depth: 4
 module_overrides: {}
