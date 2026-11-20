@@ -1245,7 +1245,8 @@ def render_digest(
     *agent_class* is the caller's already-resolved class (typically
     :func:`detectors.classify_agent_class`'s result) -- render_digest never
     classifies on its own. *path*, when given, sources ``encoded_dir``
-    from the transcript file's real parent dir name; otherwise it falls
+    from the encoded dir the transcript file is filed under
+    (:func:`inventory.transcript_encoded_dir`); otherwise it falls
     back to mirror-encoding the derived ``cwd`` (see
     :func:`_derive_encoded_dir`). When the unrestricted render exceeds
     *max_bytes*, :func:`_truncate_sections` trims lowest-signal sections

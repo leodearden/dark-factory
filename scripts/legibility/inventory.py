@@ -13,9 +13,10 @@ dir name — the ``~/.claude/projects`` encoding is lossy (``/``, ``.`` and
 prefix (e.g. ``dark-factory-cockpit``) would otherwise be over-included.
 
 Each encoded dir holds session transcripts ``<sid>.jsonl`` and, per session,
-Claude Code sub-agent transcripts ``<sid>/subagents/agent-<id>.jsonl``; both
-are enumerated, as the archive's recursive walk already does, and each is its
-own session (:class:`TranscriptIdentity`).
+Claude Code sub-agent transcripts ``<sid>/subagents/agent-<id>.jsonl`` and
+``<sid>/subagents/workflows/wf_<id>/agent-<id>.jsonl``; all are enumerated, as
+the archive's recursive walk already does, and each is its own session
+(:class:`TranscriptIdentity`).
 
 Task β of the confusion-reduction PRD (plans/confusion-reduction-prd.md
 §5.2, contract §7.4). Self-contained — does not import task α's
@@ -234,9 +235,13 @@ class TranscriptIdentity:
 
     A session transcript is keyed on its ``sessionId``. A Claude Code
     sub-agent transcript carries its PARENT's ``sessionId`` plus its own
-    ``agentId``, so it is keyed ``<parent sid>/subagents/agent-<agentId>`` —
-    the on-disk layout under the encoded dir — and names the parent in
-    :attr:`parent_session` rather than inside a string a consumer would parse.
+    ``agentId``, so it is keyed ``<parent sid>/subagents/agent-<agentId>`` and
+    names the parent in :attr:`parent_session` rather than inside a string a
+    consumer would parse. That key is an Agent-tool sub-agent's path under the
+    encoded dir; a Workflow-tool sub-agent, filed deeper under
+    ``subagents/workflows/wf_<id>/``, gets the same key shape, because none of
+    its records names the workflow and an ``agentId`` is unique within its
+    session.
     """
 
     session_id: str
@@ -281,12 +286,15 @@ def first_transcript_identity(records: Iterable[Mapping[str, Any]]) -> Transcrip
 def transcript_encoded_dir(path: Path) -> str:
     """The encoded cwd dir a transcript is filed under.
 
-    ``<enc>/<sid>.jsonl`` is filed under its parent dir;
-    ``<enc>/<sid>/subagents/agent-<id>.jsonl`` under the dir two levels
-    higher. The same holds beneath the archive's ``<key>/<enc>/...``.
+    ``<enc>/<sid>.jsonl`` is filed under its parent dir. A sub-agent
+    transcript sits somewhere beneath ``<enc>/<sid>/subagents/`` (directly,
+    or under ``workflows/wf_<id>/``) and is filed under the dir two above its
+    nearest ``subagents`` ancestor. The same holds beneath the archive's
+    ``<key>/<enc>/...``.
     """
-    if path.parent.name == SUBAGENTS_DIR and len(path.parents) > 2:
-        return path.parents[2].name
+    for ancestor in path.parents:
+        if ancestor.name == SUBAGENTS_DIR and len(ancestor.parents) >= 2:
+            return ancestor.parents[1].name
     return path.parent.name
 
 
@@ -355,8 +363,10 @@ def session_cwd(path: Path) -> str | None:
 class SessionRecord:
     """One enumerated session transcript.
 
-    ``encoded_dir`` is the containing directory's basename (a
-    ``~/.claude/projects/<enc>`` entry); ``cwd`` is the REAL decoded cwd
+    ``encoded_dir`` is the ``~/.claude/projects/<enc>`` entry the transcript
+    is filed under, which for a sub-agent transcript is not its containing
+    directory (:func:`transcript_encoded_dir`; an archive transcript's is the
+    ``<enc>`` below its archive key, :func:`_archive_enc`); ``cwd`` is the REAL decoded cwd
     read from the transcript (the value :func:`is_member` was checked
     against), not a re-derivation from ``encoded_dir``. ``identity`` is the
     transcript's :class:`TranscriptIdentity`, ``None`` when no record carries
@@ -369,16 +379,6 @@ class SessionRecord:
     date: date
     size_bytes: int
     identity: TranscriptIdentity | None = None
-
-
-def _first_timestamp_date(path: Path) -> date | None:
-    """Return the UTC date of the first valid ISO-8601 ``timestamp`` line in *path*.
-
-    Returns None when the file is unreadable, has no timestamp line, or
-    every timestamp line is unparseable — callers fall back to file mtime.
-    A thin wrapper over :func:`_read_header`.
-    """
-    return _read_header(path).date
 
 
 def resolve_agent_transcript_roots(
@@ -414,8 +414,8 @@ def _build_session_record(
     the range enumerator (``date_ok = start <= d <= end``) with no duplicated
     walk. Shared by the ``~/.claude/projects`` loop and the archive-roots loop
     in :func:`_enumerate`: the projects path is behaviorally unchanged (guarded
-    by ``TestEnumerateSessions``), while the archive path passes the encoded
-    worktree dir (``session_path.parent.name``) as *encoded_dir*.
+    by ``TestEnumerateSessions``), while the archive path passes the
+    archive transcript's ``<enc>`` (:func:`_archive_enc`) as *encoded_dir*.
     """
     try:
         st = session_path.stat()
@@ -548,11 +548,12 @@ def _archive_enc(session_path: Path, archive_root: Path) -> str | None:
 def _iter_project_transcripts(project_dir: Path) -> Iterator[Path]:
     """Yield a projects-root encoded dir's session transcripts, then its sub-agents'.
 
-    The explicit ``*/subagents/agent-*.jsonl`` glob admits exactly Claude
-    Code's sub-agent layout and never its ``.meta.json`` siblings.
+    The ``*/subagents/**/agent-*.jsonl`` glob admits Claude Code's Agent-tool
+    and Workflow-tool sub-agent layouts and never a ``.meta.json`` sibling or
+    a workflow's ``journal.jsonl``.
     """
     yield from sorted(project_dir.glob('*.jsonl'))
-    yield from sorted(project_dir.glob(f'*/{SUBAGENTS_DIR}/agent-*.jsonl'))
+    yield from sorted(project_dir.glob(f'*/{SUBAGENTS_DIR}/**/agent-*.jsonl'))
 
 
 def _enumerate(

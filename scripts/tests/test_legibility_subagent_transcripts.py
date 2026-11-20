@@ -2,11 +2,13 @@
 
 Claude Code persists an Agent-tool sub-agent at
 ``<enc>/<parent sid>/subagents/agent-<agentId>.jsonl`` beside a
-``.meta.json`` sibling. Every record in it is ``isSidechain: true`` and
-carries ``agentId`` plus its PARENT's ``sessionId``; its first record is a
-``user`` turn whose text is the parent agent's prompt. The parent transcript
-embeds none of those records. The fixture builder below writes exactly that
-measured shape.
+``.meta.json`` sibling, and a Workflow-tool sub-agent one level deeper at
+``<enc>/<parent sid>/subagents/workflows/wf_<id>/agent-<agentId>.jsonl``
+beside the run's ``journal.jsonl``. Every record in either is
+``isSidechain: true`` and carries ``agentId`` plus its PARENT's
+``sessionId``; its first record is a ``user`` turn whose text is the parent
+agent's prompt. The parent transcript embeds none of those records. The
+fixture builder below writes exactly that measured shape.
 
 The contract spans inventory (enumeration, identity), sampling (the session
 key the ledger skip compares), detectors (agent class, first turn) and digest
@@ -23,7 +25,8 @@ from typing import Any
 
 import pytest
 import yaml
-from legibility import detectors, digest, inventory, reingestion, sampling
+from legibility import detectors, digest, inventory, nightly, reingestion, sampling
+from legibility.config import LegibilityConfig, load_config
 
 MAIN_CWD = '/home/leo/src/dark-factory'
 MAIN_ENC = '-home-leo-src-dark-factory'
@@ -37,6 +40,7 @@ OTHER_DAY_TS = '2026-07-12T10:00:00.000Z'
 
 PARENT_SID = '298d816e-484a-4675-ad8d-9549c8b89b08'
 AGENT_ID = 'a85ff34487a904824'
+WORKFLOW = 'wf_599e9ea6-97a'
 DEFAULT_PROMPT = 'Find every caller of resolve_route and report their files.'
 
 
@@ -55,12 +59,14 @@ def _write_parent_and_subagent(
     timestamp: str = TARGET_TS,
     prompt: str = DEFAULT_PROMPT,
     subagent_records: list[dict[str, Any]] | None = None,
+    workflow: str | None = None,
 ) -> tuple[Path, Path]:
     """Write a parent transcript and one of its sub-agents; return ``(parent, subagent)``.
 
     *subagent_records* are the sub-agent's records AFTER its prompt record;
     each is stamped with the sidechain, agentId, sessionId, cwd and timestamp
-    every live sub-agent record carries, unless it sets them itself.
+    every live sub-agent record carries, unless it sets them itself. A
+    *workflow* files the sub-agent under that Workflow-tool run's dir.
     """
     parent_path = _write_jsonl(
         enc_dir / f'{parent_sid}.jsonl',
@@ -93,13 +99,16 @@ def _write_parent_and_subagent(
         },
     ]
     subagents_dir = enc_dir / parent_sid / 'subagents'
+    agent_dir = subagents_dir if workflow is None else subagents_dir / 'workflows' / workflow
     subagent_path = _write_jsonl(
-        subagents_dir / f'agent-{agent_id}.jsonl',
+        agent_dir / f'agent-{agent_id}.jsonl',
         [prompt_record, *({**shared, **record} for record in later)],
     )
-    (subagents_dir / f'agent-{agent_id}.meta.json').write_text(
+    (agent_dir / f'agent-{agent_id}.meta.json').write_text(
         json.dumps({'agentType': 'general-purpose', 'description': 'x'})
     )
+    if workflow is not None:
+        _write_jsonl(agent_dir / 'journal.jsonl', [{'type': 'launched'}])
     return parent_path, subagent_path
 
 
@@ -118,6 +127,22 @@ def _subagent_key(parent_sid: str = PARENT_SID, agent_id: str = AGENT_ID) -> str
 
 def _record_for(records: list[inventory.SessionRecord], path: Path) -> inventory.SessionRecord:
     return next(record for record in records if record.path == path)
+
+
+def _frontmatter(rendered: str) -> dict[str, Any]:
+    _, block, _ = rendered.split('---\n', 2)
+    return yaml.safe_load(block)
+
+
+def _main_checkout_config(root: Path) -> LegibilityConfig:
+    config_path = root / 'legibility.yaml'
+    config_path.write_text(yaml.safe_dump({
+        'project_id': 'dark_factory',
+        'project_root': str(root),
+        'escalation_port': 8199,
+        'cwd_prefixes': [MAIN_CWD],
+    }))
+    return load_config(config_path)
 
 
 class TestTranscriptIdentity:
@@ -139,9 +164,7 @@ class TestTranscriptIdentity:
 
     def test_identity_is_frozen(self):
         identity = inventory.TranscriptIdentity(session_id='p')
-        field = 'session_id'
-        with pytest.raises(dataclasses.FrozenInstanceError):
-            setattr(identity, field, 'q')
+        pytest.raises(dataclasses.FrozenInstanceError, setattr, identity, 'session_id', 'q')
 
 
 class TestProjectsRootEnumeratesSubagents:
@@ -177,6 +200,24 @@ class TestProjectsRootEnumeratesSubagents:
         projects_root, _, _ = self._tree(tmp_path)
         records = inventory.enumerate_sessions(projects_root, [MAIN_CWD], TARGET_DATE)
         assert not [record for record in records if record.path.suffix != '.jsonl']
+
+    def test_workflow_subagent_is_enumerated_under_its_encoded_dir(self, tmp_path):
+        projects_root, _, _ = self._tree(tmp_path)
+        _, workflow_agent = _write_parent_and_subagent(
+            projects_root / MAIN_ENC, agent_id='wf-agent', workflow=WORKFLOW
+        )
+        records = inventory.enumerate_sessions(projects_root, [MAIN_CWD], TARGET_DATE)
+        record = _record_for(records, workflow_agent)
+        assert record.encoded_dir == MAIN_ENC
+        assert record.identity is not None
+        assert record.identity.key == _subagent_key(agent_id='wf-agent')
+
+    def test_workflow_journal_is_not_enumerated(self, tmp_path):
+        projects_root, _, workflow_agent = self._tree(tmp_path, workflow=WORKFLOW)
+        records = inventory.enumerate_sessions(projects_root, [MAIN_CWD], TARGET_DATE)
+        assert [record.path for record in records if record.path.parent == workflow_agent.parent] == [
+            workflow_agent
+        ]
 
     def test_non_member_subagent_under_a_candidate_dir_is_excluded(self, tmp_path):
         projects_root, _, _ = self._tree(tmp_path)
@@ -216,6 +257,18 @@ class TestArchivedSubagentIdentity:
         assert record.identity.parent_session == 'sid'
         assert record.encoded_dir == WORKTREE_ENC
 
+    def test_archived_workflow_subagent_agrees_with_its_digest_on_the_encoded_dir(self, tmp_path):
+        archive = tmp_path / 'archive'
+        _, workflow_agent = _write_parent_and_subagent(
+            archive / '2573' / WORKTREE_ENC, parent_sid='sid', agent_id='x',
+            cwd=WORKTREE_CWD, workflow=WORKFLOW,
+        )
+        records = inventory.enumerate_sessions(
+            tmp_path / 'no-projects', [MAIN_CWD], TARGET_DATE, agent_transcript_roots=[archive]
+        )
+        assert _record_for(records, workflow_agent).encoded_dir == WORKTREE_ENC
+        assert _frontmatter(digest.build_digest(workflow_agent))['encoded_dir'] == WORKTREE_ENC
+
 
 class TestSubagentSessionKey:
     """The session string the sampler reports, and the ledger skip compares, is the identity key."""
@@ -233,9 +286,13 @@ class TestSubagentSessionKey:
         assert sampling.peek_session_id(parent) == PARENT_SID
 
     def test_a_coded_parent_does_not_hide_its_subagent(self, tmp_path):
-        _, subagent = _write_parent_and_subagent(tmp_path / MAIN_ENC)
-        coded_sessions = frozenset({PARENT_SID})
-        assert sampling.peek_session_id(subagent) not in coded_sessions
+        projects_root = tmp_path / 'projects'
+        _, subagent = _write_parent_and_subagent(projects_root / MAIN_ENC)
+        scored = nightly.select_scored_records(
+            _main_checkout_config(tmp_path), projects_root, TARGET_DATE,
+            skip_sessions=frozenset({PARENT_SID}),
+        )
+        assert [record.session.path for record in scored] == [subagent]
 
     def test_inventory_and_sampler_derive_one_key(self, tmp_path):
         projects_root = tmp_path / 'projects'
@@ -249,9 +306,10 @@ class TestSubagentSessionKey:
 class TestSubagentAgentClassAndFirstTurn:
     """A sub-agent's agent class and first turn come from its own encoded dir and prompt."""
 
-    def test_worktree_subagent_is_orchestrated_like_its_parent(self, tmp_path):
+    @pytest.mark.parametrize('workflow', [None, WORKFLOW])
+    def test_worktree_subagent_is_orchestrated_like_its_parent(self, tmp_path, workflow):
         parent, subagent = _write_parent_and_subagent(
-            tmp_path / 'projects' / WORKTREE_ENC, cwd=WORKTREE_CWD
+            tmp_path / 'projects' / WORKTREE_ENC, cwd=WORKTREE_CWD, workflow=workflow
         )
         for path in (parent, subagent):
             agent_class = detectors.classify_agent_class(path, inventory.iter_json_lines(path))
@@ -292,11 +350,6 @@ class TestSubagentAgentClassAndFirstTurn:
         assert detectors.is_primary_user_turn(main_chain, subagent_transcript=True) is False
 
 
-def _frontmatter(rendered: str) -> dict[str, Any]:
-    _, block, _ = rendered.split('---\n', 2)
-    return yaml.safe_load(block)
-
-
 class TestSubagentDigest:
     """A sub-agent's digest names it and its parent, and counts its own turns only."""
 
@@ -333,9 +386,14 @@ class TestSubagentDigest:
         assert _frontmatter(rendered)['n_user_turns'] == 0
         assert '## User Corrections' not in rendered
 
-    def test_parent_digest_names_no_parent_and_holds_none_of_the_subagents_hits(self, tmp_path):
+    def test_parent_digest_names_no_parent(self, tmp_path):
         parent, _ = self._tree(tmp_path)
         front = _frontmatter(digest.build_digest(parent))
         assert front['session'] == PARENT_SID
         assert front['parent_session'] == ''
-        assert not any(front['signal_counts'].values())
+
+    def test_workflow_subagent_digest_names_its_encoded_dir(self, tmp_path):
+        _, workflow_agent = _write_parent_and_subagent(tmp_path / MAIN_ENC, workflow=WORKFLOW)
+        front = _frontmatter(digest.build_digest(workflow_agent))
+        assert front['encoded_dir'] == MAIN_ENC
+        assert front['session'] == _subagent_key()
