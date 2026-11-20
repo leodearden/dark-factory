@@ -77,10 +77,10 @@ import os
 import re
 import signal
 import time
-from collections.abc import Awaitable, Callable, Iterable, Iterator
+from collections.abc import Awaitable, Callable, Iterable, Iterator, Mapping
 from enum import Enum, auto
 from pathlib import Path
-from typing import Any, NamedTuple, NewType, Protocol
+from typing import IO, Any, NamedTuple, NewType, Protocol
 
 from shared.pidfd import P_PIDFD, PIDFD_SIGNAL_PROCESS_GROUP, pidfd_open, pidfd_send_signal
 
@@ -512,19 +512,30 @@ async def terminate_process_group(
 async def spawn_group_leader(
     *cmd: str,
     kill_group: Callable[[asyncio.subprocess.Process], Awaitable[None]],
-    **spawn_kwargs: Any,
+    cwd: str | None = None,
+    env: Mapping[str, str] | None = None,
+    stdin: int | IO[Any] | None = None,
+    stdout: int | None = None,
+    stderr: int | None = None,
 ) -> asyncio.subprocess.Process:
     """Spawn *cmd* as the leader of a new session, so its pgid == ``proc.pid``.
 
-    ``start_new_session`` is forced.  asyncio's own cleanup for a spawn interrupted after the fork SIGKILLs only
-    the direct child, then waits with no bound for every pipe to close, which
-    a surviving group member holds open (tasks 6346, 11044).  So the spawn
+    ``start_new_session`` is forced.  asyncio's own cleanup for a spawn
+    interrupted after the fork SIGKILLs only the direct child, then waits with
+    no bound for every pipe to close, which a surviving group member holds
+    open (tasks 6346, 11044).  So the spawn
     runs shielded: an interrupted spawn is waited out and its Process handed
     to *kill_group* before the original exception propagates.  A spawn
     failure never replaces the interruption.
     """
     spawn = asyncio.ensure_future(asyncio.create_subprocess_exec(
-        *cmd, start_new_session=True, **spawn_kwargs,
+        *cmd,
+        cwd=cwd,
+        env=env,
+        stdin=stdin,
+        stdout=stdout,
+        stderr=stderr,
+        start_new_session=True,
     ))
     try:
         return await asyncio.shield(spawn)

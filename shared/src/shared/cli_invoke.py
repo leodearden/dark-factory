@@ -4239,6 +4239,14 @@ async def _kill_group_on_flat_timeout(
     )
 
 
+_CANCEL_KILL_GRACE_SECS = 5.0
+
+
+async def _terminate_cancelled_group(proc: asyncio.subprocess.Process) -> None:
+    logger.warning(f'Subprocess cancelled — terminating process group for pid {proc.pid}')
+    await terminate_process_group(proc, proc.pid, grace_secs=_CANCEL_KILL_GRACE_SECS)
+
+
 async def run_cli_subprocess(
     cmd: list[str],
     cwd: Path,
@@ -4307,7 +4315,7 @@ async def run_cli_subprocess(
     try:
         proc = await spawn_group_leader(
             *spawn_cmd,
-            kill_group=lambda proc: terminate_process_group(proc, proc.pid, grace_secs=5.0),
+            kill_group=_terminate_cancelled_group,
             cwd=str(cwd),
             env=spawn_env,
             stdin=stdin_file,
@@ -4737,8 +4745,7 @@ async def run_cli_subprocess(
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await comm_task
         if proc.returncode is None:
-            logger.warning(f'Subprocess cancelled — terminating process group for pid {proc.pid}')
-            await terminate_process_group(proc, pgid, grace_secs=5.0)
+            await _terminate_cancelled_group(proc)
         raise
 
     duration_ms = int(time.monotonic() * 1000) - start_ms
