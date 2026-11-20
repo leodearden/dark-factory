@@ -453,10 +453,9 @@ class TestTheCorpusTextGuard:
     ) -> None:
         copied = _sentence_of(_arm(name).prompt, 12)
         cases = [_case('E1'), _case('E2', child=f'An entry. {copied.upper()} More text.')]
-        arms = [_arm('f3p'), _arm(name)] if name.startswith('c1') else [_arm(name)]
         client = _client(_amends)
         with pytest.raises(ValueError, match=name) as refusal:
-            _run(cases, arms, tmp_path, client)
+            _run(cases, [_arm(name)], tmp_path, client)
         assert _shares_a_shingle(copied, str(refusal.value))
         assert client.responses.create.await_count == 0
 

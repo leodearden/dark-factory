@@ -47,6 +47,7 @@ import types
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 import openai
@@ -63,8 +64,12 @@ from fused_memory.server.write_triage import (
     resolve_attach_guard,
 )
 from fused_memory.server.write_triage_judge import (
+    JUDGE_EXEMPLARS,
+    JUDGE_REPLY_SHAPE,
+    JudgeExemplar,
     JudgeOutputError,
     judge_write,
+    render_judge_exemplars,
     resolve_judge_enabled,
 )
 from fused_memory.utils.script_loader import load_script
@@ -132,12 +137,200 @@ def _shipped_arm(name: str, effort: str, description: str) -> Arm:
     return Arm(name, KIND_JUDGE, _SHIPPED_PROMPT, SHIPPED_MODEL, effort, None, SCOPE_ALL, description)
 
 
+# --- lever prompts ----------------------------------------------------------
+#
+# Drafted from the mechanism-level categories of the step-11 classification
+# (calibration/write_triage_m3_hidden_conflicts.jsonl's dispute kinds) and the
+# CONFLICT question of calibration/write_triage_rater_brief_v2.md, never from
+# a case's text; ``refuse_corpus_text`` refuses any prompt that shares an
+# 8-token shingle with one. Every exemplar is synthetic, on the shipped
+# greenhouse candidate. Each prompt keeps the shipped vocabulary and reply
+# shape, so the shipped parser reads its answers.
+
+_GREENHOUSE = JUDGE_EXEMPLARS[0].candidate
+
+_MIXED_DISPUTE = JudgeExemplar(
+    entry=(
+        'Glasshouse setpoints are entered in degrees F, and since the spring firmware '
+        'update the night schedule is set in degrees C.'
+    ),
+    candidate=_GREENHOUSE,
+    verdict='contests',
+)
+"""An entry that adds to the candidate and also says part of it is now different."""
+
+_PASSING_DISPUTE = JudgeExemplar(
+    entry=(
+        'The irrigation timer now opens the valves at 06:00. It takes its readings from '
+        'the greenhouse thermostat, which was recalibrated to Celsius last week.'
+    ),
+    candidate=_GREENHOUSE,
+    verdict='contests',
+)
+"""An entry about something else that shows, in passing, that the candidate is outdated."""
+
+LEVER_EXEMPLARS: Mapping[str, tuple[JudgeExemplar, ...]] = MappingProxyType({
+    'a1-partial-dispute': (*JUDGE_EXEMPLARS, _MIXED_DISPUTE),
+    'c1-dispute-marker': (JUDGE_EXEMPLARS[1], _MIXED_DISPUTE),
+    'd1-stale-detail-check': (*JUDGE_EXEMPLARS, _PASSING_DISPUTE),
+})
+"""Each lever prompt's worked examples, as rendered by ``render_judge_exemplars``."""
+
+A1_PARTIAL_DISPUTE_PROMPT = f"""\
+You classify the RELATIONSHIP between a new memory entry and a small set of \
+existing entries retrieved as its closest matches. You do not decide which \
+entry is correct, and you do not merge, rewrite or rank them.
+
+Answer with exactly one of these four words:
+
+- "distinct" — no candidate makes the same core claim as the new entry. \
+Shared wording alone neither makes a match nor rules one out.
+- "restates" — the new entry asserts what a candidate already asserts and \
+adds nothing a reader of that candidate would need: no new number, condition, \
+cause, fix, caveat or newer state. A paraphrase that adds nothing restates; \
+anything new makes it "amends", or "contests" if it says the candidate is \
+wrong, outdated or different.
+- "amends" — the new entry asserts what a candidate asserts AND adds \
+something the candidate does not have: a detail, a scope, a later \
+observation — and says nothing the candidate states, central or secondary, \
+is wrong, outdated or different.
+- "contests" — the new entry says that something a candidate states is \
+wrong, outdated or different, explicitly or implicitly. That something may \
+be the candidate's central claim or any secondary part of it, such as a \
+status, a count, a measurement or where something lives. An entry that adds \
+to a candidate AND disputes any part of it contests; it does not amend. It \
+does not contest when it merely restates the candidate, or agrees with all \
+of it and only adds. You are DETECTING a contradiction so a human or a \
+downstream gate can adjudicate it; you are NOT deciding which side is true, \
+and nothing you say here deletes or edits anything.
+
+Find the candidate whose core claim the new entry shares (or, for \
+"contests", disputes in any part), answer about THAT candidate, and name it \
+by its id: the verdict is filed against the candidate you name and no other. \
+Answer "distinct", naming none, only when no candidate qualifies.
+
+Worked examples:
+
+{render_judge_exemplars(LEVER_EXEMPLARS['a1-partial-dispute'])}
+
+Reply with a bare JSON object and nothing else:
+
+{JUDGE_REPLY_SHAPE}\
+"""
+"""Lever a1: the shipped prompt with the amends/contests boundary moved.
+
+A dispute of any part of the candidate, central or secondary, contests even
+when the entry also adds. 13 of the 14 amended-stratum M3 hits dispute a
+secondary part of their parent.
+"""
+
+C1_DISPUTE_MARKER_PROMPT = f"""\
+You check one new memory entry against one existing entry, the candidate. An \
+earlier check found that the new entry restates or amends the candidate: it \
+asserts what the candidate asserts, and may add to it. You do not decide \
+which entry is correct, and you do not merge, rewrite or rank them.
+
+Your one question: does any part of the new entry also say that something \
+the candidate states is wrong, outdated or different? That something may be \
+the candidate's central claim or a secondary detail, such as a status, a \
+count, a measurement, where something lives, or a claim that something does \
+not exist. The new entry need not mention the candidate, and it may make the \
+point in passing.
+
+- "contests" — it does: some part of the new entry disputes something the \
+candidate states. You are DETECTING a dispute so a human or a downstream \
+gate can adjudicate it; you are NOT deciding which side is true, and nothing \
+you say here deletes or edits anything.
+- "amends" — it does not: the new entry agrees with everything the \
+candidate states.
+
+The other two words of the vocabulary, "distinct" and "restates", do not \
+answer this question; give one of the two words above. Name the candidate \
+by its id, whichever answer you give.
+
+Worked examples:
+
+{render_judge_exemplars(LEVER_EXEMPLARS['c1-dispute-marker'])}
+
+Reply with a bare JSON object and nothing else:
+
+{JUDGE_REPLY_SHAPE}\
+"""
+"""Lever c1: a second pass over an attached amendment or restatement, asking only about a dispute.
+
+A ``contests`` answer marks the write, and a marked write reads as contested.
+"""
+
+D1_STALE_DETAIL_CHECK_PROMPT = f"""\
+You classify the RELATIONSHIP between a new memory entry and a small set of \
+existing entries retrieved as its closest matches. You do not decide which \
+entry is correct, and you do not merge, rewrite or rank them.
+
+Answer with exactly one of these four words:
+
+- "distinct" — no candidate makes the same core claim as the new entry. \
+Shared wording alone neither makes a match nor rules one out.
+- "restates" — the new entry asserts what a candidate already asserts and \
+adds nothing a reader of that candidate would need: no new number, condition, \
+cause, fix, caveat or newer state. A paraphrase that adds nothing restates; \
+anything new makes it "amends", or "contests" if it says the candidate is \
+wrong, outdated or different.
+- "amends" — the new entry asserts what a candidate asserts AND adds \
+something the candidate does not have: a detail, a scope, a later \
+observation — without saying the candidate is wrong.
+- "contests" — the new entry addresses the same claim or subject as a \
+candidate and says it is wrong, outdated or different, explicitly or \
+implicitly — not when it merely restates it, and not when it agrees and \
+only adds to it. You are DETECTING a contradiction so a human or a \
+downstream gate can adjudicate it; you are NOT deciding which side is true, \
+and nothing you say here deletes or edits anything.
+
+Check the details too. Before you answer anything but "contests", read each \
+detail a candidate states that can go out of date: a status (pending, open, \
+not yet filed, not yet decided), a location (the file, module or function \
+where something lives), a measured figure (a duration, count, size or \
+ratio), an absence or a limit ("there is no X", "only Y"), or a defect \
+stated as current. If the new entry shows that any such detail has changed \
+or reads differently, answer "contests" about that candidate. This holds \
+when the detail is incidental to the candidate, when the new entry gives it \
+only in passing, and when the new entry is mainly about something else; the \
+new entry need not mention the candidate at all.
+
+Find the candidate whose core claim the new entry shares (or, for \
+"contests", contradicts), answer about THAT candidate, and name it by its \
+id: the verdict is filed against the candidate you name and no other. \
+Answer "distinct", naming none, only when no candidate qualifies.
+
+Worked examples:
+
+{render_judge_exemplars(LEVER_EXEMPLARS['d1-stale-detail-check'])}
+
+Reply with a bare JSON object and nothing else:
+
+{JUDGE_REPLY_SHAPE}\
+"""
+"""Lever d1: the shipped prompt plus a check of the candidate's time-sensitive details.
+
+Named from the step-11 classification. 12 of the 14 amended-stratum M3 hits
+dispute such a detail: a status, a location, a measured figure or an
+absence. 10 of them do it in an aside, and 11 sit under a parent whose
+subject is not the entry's.
+"""
+
 ARMS: tuple[Arm, ...] = (
     Arm('psi-repro', KIND_JUDGE, _wording.PSI_JUDGE_SYSTEM_PROMPT, SHIPPED_MODEL, 'low', None,
         SCOPE_SOAK_JUDGE_BAND,
         'the soak-era psi prompt and model; its agreement with the soak outcomes is the harness error'),
     _shipped_arm('f3p', 'low', "the shipped F3' prompt as deployed: the baseline every lever is read against"),
     _shipped_arm('f3p-repeat', 'low', "f3p again: the judge's run-to-run noise floor"),
+    Arm('a1-partial-dispute', KIND_JUDGE, A1_PARTIAL_DISPUTE_PROMPT, SHIPPED_MODEL, 'low', None,
+        SCOPE_ALL, 'the amends/contests boundary moved: a dispute of any part of a candidate contests'),
+    Arm('c1-dispute-marker', KIND_SECOND_PASS, C1_DISPUTE_MARKER_PROMPT, SHIPPED_MODEL, 'low',
+        'f3p', SCOPE_ALL,
+        "a second pass over f3p's attached amendments and restatements; a dispute marks the write"),
+    Arm('d1-stale-detail-check', KIND_JUDGE, D1_STALE_DETAIL_CHECK_PROMPT, SHIPPED_MODEL, 'low',
+        None, SCOPE_ALL,
+        "the shipped prompt plus a check of each candidate's time-sensitive details"),
     _shipped_arm('b1-sol-medium', 'medium', 'the shipped prompt at medium reasoning effort'),
     _shipped_arm('b2-sol-high', 'high', 'the shipped prompt at high reasoning effort'),
 )
@@ -172,6 +365,40 @@ def _arm_problem(arm: Arm, seen: set[str]) -> str | None:
     if arm.kind != KIND_TRANSFORM and not arm.prompt:
         return 'a judge or second-pass arm needs a prompt'
     return None
+
+
+SHINGLE_TOKENS = 8
+"""A prompt may share no run of this many tokens with any case text."""
+
+_TOKEN = re.compile(r'\w+|[^\w\s]')
+
+
+def _shingles(text: str) -> dict[tuple[str, ...], None]:
+    """*text*'s runs of :data:`SHINGLE_TOKENS` lowercased word-or-symbol tokens, in order."""
+    tokens = _TOKEN.findall(text.lower())
+    return dict.fromkeys(
+        tuple(tokens[start:start + SHINGLE_TOKENS])
+        for start in range(len(tokens) - SHINGLE_TOKENS + 1)
+    )
+
+
+def refuse_corpus_text(arms: Iterable[Arm], cases: Iterable[Any]) -> None:
+    """Refuse an arm whose prompt shares a token shingle with any case's write or parent text.
+
+    The same corpus both motivates and scores the lever prompts, so a prompt
+    carrying a case's wording would report a gain that does not generalise.
+    """
+    corpus: set[tuple[str, ...]] = set()
+    for case in cases:
+        corpus.update(_shingles(case.child_text))
+        corpus.update(_shingles(case.parent_text))
+    for arm in arms:
+        shared = [shingle for shingle in _shingles(arm.prompt or '') if shingle in corpus]
+        if shared:
+            raise ValueError(
+                f'arm {arm.name!r}: its prompt shares {len(shared)} {SHINGLE_TOKENS}-token'
+                f' spans with the case texts, first {" ".join(shared[0])!r}'
+            )
 
 
 def arm_service(config: Any, arm: Arm) -> Any:
@@ -376,6 +603,7 @@ async def run_arms(
     sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
 ) -> RunResult:
     """Run each arm in order, resuming from and appending to its arm file."""
+    refuse_corpus_text(arms, cases)
     arms_dir.mkdir(parents=True, exist_ok=True)
     recorded = sum(row.get('usd') or 0.0 for path in sorted(arms_dir.glob('*.jsonl'))
                    for row in read_arm_rows(path))
