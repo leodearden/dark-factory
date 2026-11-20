@@ -116,16 +116,19 @@ by task 4193.
    flipped to `running` by the time a hook runs.
 3. **For a SessionStart re-mint, `claude_owner_pid` equality.** The owning
    pid stamped at bind time must equal the pid of this event's owning claude
-   (see §Session-id re-mints).
+   (see §Session-id re-mints), unless that claude is a shared `claude agents`
+   host, whose pid never proves a re-mint (see §Shared claude agents hosts).
 
 A record reached through a T3 thread pointer has no
 `CLAUDE_SPAWN_OWNER_PPID` to test, so the claude pids decide before binding:
 `EventProbes.owning_claude_pid` against the record's `claude_owner_pid`. An
-absent owner means this is the thread's first claude, which binds; an equal
-pid, or a recorded owner judged dead, binds too; an unresolvable event pid
-adopts without binding; any other pid forks. After binding, discriminator 1
-applies, with the exceptions in §Session-id re-mints. A nested claude in the
-thread has a live owner, its parent claude, so it forks.
+absent owner means this is the thread's first claude, which binds. An equal
+pid binds too, unless that claude is a shared `claude agents` host (see
+§Shared claude agents hosts), and so does a recorded owner judged dead. An
+unresolvable event pid adopts without binding; any other pid forks. After
+binding, discriminator 1 applies, with the exceptions in §Session-id re-mints.
+A nested claude in the thread has a live owner, its parent claude, so it
+forks.
 
 Lineage against `CLAUDE_SPAWN_LAUNCHER_PID` cannot replace any of these. The
 variable is never exported into the spawned session, since `sanitize_env`
@@ -233,8 +236,8 @@ session it runs. A pid shared that way cannot tell one hosted session from
 another (task 6945).
 
 So no `sessions-by-pid` pointer is ever keyed on a host pid. Writers refuse
-one, the resolver ignores one written before this rule, and the pointer sweep
-removes it. A hosted session reaches its record through its session-id
+one, the resolver ignores a legacy host-keyed one still on disk, and the
+pointer sweep removes it. A hosted session reaches its record through its session-id
 pointer or through the hand-launched keying.
 
 Owner-pid equality is never evidence of the same session under a host. A
@@ -402,6 +405,13 @@ against the hook timeout. It is also a correctness property: two decisions
 made from one observation cannot disagree because the tree changed between
 two walks. The memo lives for one event and is never shared across events,
 because the process tree is live state.
+
+Whether the walked claude is a shared `claude agents` host is read through the
+same tree, by its `is_shared_session_host` reader, and memoized with the walk.
+By default that reader is `session_identity.is_shared_session_host`, which
+reads `/proc/<pid>/cmdline` for the walked pid. The store's
+`session_records.is_session_pointer_pid` reads that cmdline again on its own,
+outside the event's memo.
 
 A new record's `launcher_pid` is its liveness signal for the stale-pid
 reaper:
