@@ -4160,8 +4160,13 @@ check.
 
 ### Transcript secret sweep (02:30)
 
-Agent subprocesses inherit no secret-bearing variable except their own
-`CLAUDE_CODE_OAUTH_TOKEN` (`shared/src/shared/secret_env.py`). Verify and
+Agent subprocesses inherit no secret-bearing variable except the credentials
+their backend names (`shared/src/shared/secret_env.py::agent_subprocess_env`).
+A Claude child keeps only its own `CLAUDE_CODE_OAUTH_TOKEN`. codex, gemini and
+pi keep only their provider keys
+(`orchestrator/src/orchestrator/agents/invoke.py::CODEX_CREDENTIAL_VARS`,
+`GEMINI_CREDENTIAL_VARS`, `PI_CREDENTIAL_VARS`). The `CLAUDE_OAUTH_TOKEN_*`
+pool never reaches any agent child. Verify and
 offline-lane children, a target project's build and test runs, inherit every
 credential except the `CLAUDE_OAUTH_TOKEN_*` account pool
 (`shared/src/shared/secret_env.py::without_account_pool`, task 6828); that
@@ -4188,8 +4193,13 @@ everything already on disk.
   (`scripts/transcript_secret_sweep.py::PYTEST_ENV_DUMP_SUFFIXES`). Reading
   every file there is not cheap: the 2026-11-15 run read 821,808 files, and
   every one of its hits had one of those names. A file or directory pytest
-  prunes mid-walk is passed over, not reported unreadable. The full tree list
-  is `scripts/transcript_secret_sweep.py::swept_trees`.
+  prunes mid-walk is passed over, not reported unreadable. An orchestrated
+  project's transcript archive and `~/.claude/projects` are required roots;
+  `data/verify-logs`, `data/orchestrator/offline-lane` and the pytest base
+  temp are optional, because most projects have no offline lane, a project
+  has no verify logs before its first verify, and a host that has not run
+  pytest has no base temp. The full tree list, with each root's required
+  flag, is `scripts/transcript_secret_sweep.py::swept_trees`.
 - **What it matches.** Only the live values the sweep's own environment holds.
   The wrapper sources the repo `.env` for them. It never matches a token-shaped
   pattern. A value is matched in the form the file holds it: JSON-escaped in
@@ -4217,6 +4227,23 @@ everything already on disk.
   It prints one JSON record line to the journal, and never prints a value.
   A `*.xml.gz` that does not decompress is listed under `unreadable` in that
   record line and left as found.
+- **What it files when it cannot cover its roots.** When the sweep cannot run
+  (no secret-bearing values in its environment, e.g. `.env` moved or its
+  variables renamed), cannot find a required root, cannot read an
+  orchestrator unit, or finds no unit naming a project root (a renamed or
+  moved unit), it files one `infra_issue` info escalation (task_id
+  `transcript-secret-sweep-shortfall`) naming each shortfall, and exits 2.
+  The wrapper still exits 0, as every §12 job does, so the escalation is the
+  signal. A failing night re-files: one escalation per night until it is
+  fixed. The archive directory is created when a project archives its first
+  transcript, so a newly onboarded project reports its archive missing until
+  then; that shortfall clears itself. A root a host config names
+  (`--host-configs-dir`, the laptop) has no archive requirement: a verify host
+  archives no agent transcripts, and none of the laptop's four roots had an
+  archive when measured on 2026-11-19. Under `--dry-run` or `--no-escalation`
+  a shortfall is printed and exits 2 but is not filed. The wrapper resolves
+  `uv` via `scripts/lib/resolve_uv.sh`, so a boot catch-up run without the
+  login PATH still finds it.
 - **What it skips.** Files modified in the last 15 minutes, which a live
   session or test run may still be appending to. The next night picks them up.
 - **A dry run.** `--dry-run` rewrites nothing and files nothing. Its record
