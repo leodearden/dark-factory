@@ -875,6 +875,11 @@ class Escalation:
     policy_class: str | None = None
     claimed_at: str | None = None
     claimed_by: str | None = None
+    # The resolver's human-ruling assertion (plans/instruments-honesty-prd.md
+    # decision 9). None = not asserted, which is every legacy record; True = a
+    # human ruled on this record or its sitting docket item. Written only at
+    # the resolve chokepoint. Zero migration via the from_dict filter.
+    ruled_by_human: bool | None = None
     # The merge-halt release marker (task 3876). Sole writer:
     # queue.release_merge_halt. A record carrying halt_released_at never
     # re-owns a merge-queue halt:
