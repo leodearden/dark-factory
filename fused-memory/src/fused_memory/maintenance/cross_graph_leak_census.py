@@ -1,0 +1,347 @@
+"""Count the nodes that leaked across graphs — read-only.
+
+A node whose ``group_id`` property names a graph other than the one it lives in,
+or names no graph, is task 2115's cross-graph leak. Every group-scoped read —
+``task_family_census`` among them — filters on ``group_id`` and so cannot see
+such a node; this module counts them per graph and per label. It is read-only by
+construction: every call it makes is ``GraphHandle.ro_query``. The per-node
+manifest and the remedy are ``fused-memory/scripts/migrate_cross_graph_leak.py``'s
+dry run.
+"""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import logging
+import sys
+from collections.abc import Sequence
+from dataclasses import asdict, dataclass, field
+
+from fused_memory.backends.graph_access import GraphAccess, GraphHandle, OpBoundReader
+from fused_memory.backends.paged_read import (
+    INCOMPLETE_CENSUS_UNAVAILABLE,
+    INCOMPLETE_KINDS,
+    INCOMPLETE_SHORT_READ,
+    census_count,
+)
+from fused_memory.maintenance._utils import ServiceOpen, maintenance_service
+from fused_memory.maintenance.graph_sweep import GraphFailure, read_each_graph, sweep_complete
+
+logger = logging.getLogger(__name__)
+
+LEAK_LABELS: tuple[str, ...] = ('Entity', 'Episodic')
+"""The node labels counted, in report order."""
+
+_LEAKED_MATCH = 'MATCH (n:{label}) WHERE n.group_id IS NULL OR n.group_id <> $graph_key'
+_COUNT_CYPHER = {
+    label: _LEAKED_MATCH.format(label=label) + ' RETURN count(n)' for label in LEAK_LABELS
+}
+_BREAKDOWN_CYPHER = {
+    label: _LEAKED_MATCH.format(label=label) + ' RETURN n.group_id, count(n)'
+    for label in LEAK_LABELS
+}
+
+
+@dataclass(frozen=True)
+class ForeignGroup:
+    """How many leaked nodes of one label carry one ``group_id``; None means none at all."""
+
+    node_group_id: str | None
+    nodes: int
+
+
+@dataclass(frozen=True)
+class LabelLeak:
+    """One label's leaked nodes in one graph, and whether that count is whole.
+
+    ``leaked`` is the proven total from a single-row ``count(n)``, which the
+    server's row cap cannot truncate; None means the store gave no usable
+    count. ``by_group_id`` is a second, grouped read, largest group first.
+    ``incomplete_kind`` is one of ``paged_read.INCOMPLETE_KINDS``, and is None
+    exactly when ``complete``.
+    """
+
+    label: str
+    leaked: int | None
+    by_group_id: tuple[ForeignGroup, ...]
+    complete: bool
+    incomplete_kind: str | None
+
+    def __post_init__(self) -> None:
+        if (self.incomplete_kind is None) != self.complete:
+            raise ValueError(
+                'LabelLeak.incomplete_kind must be None exactly when complete; got '
+                f'complete={self.complete} incomplete_kind={self.incomplete_kind!r} '
+                f'for label {self.label!r}'
+            )
+        if self.incomplete_kind is not None and self.incomplete_kind not in INCOMPLETE_KINDS:
+            raise ValueError(
+                f'LabelLeak.incomplete_kind must be one of {sorted(INCOMPLETE_KINDS)}; got '
+                f'incomplete_kind={self.incomplete_kind!r} complete={self.complete} '
+                f'for label {self.label!r}'
+            )
+
+
+@dataclass(frozen=True)
+class GraphLeaks:
+    """Every label's leak count in the graph named ``graph_key``.
+
+    ``complete`` is derived from ``labels`` at construction — False if any
+    label's count is not whole — and cannot be passed in.
+    """
+
+    graph_key: str
+    labels: tuple[LabelLeak, ...]
+    complete: bool = field(init=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, 'complete', all(leak.complete for leak in self.labels))
+
+
+@dataclass(frozen=True)
+class LabelTotal:
+    """One label's leaked nodes summed over the graphs read, unknown counts adding nothing."""
+
+    label: str
+    leaked: int
+
+
+def _label_totals(graphs: tuple[GraphLeaks, ...]) -> tuple[LabelTotal, ...]:
+    return tuple(
+        LabelTotal(
+            label=label,
+            leaked=sum(
+                leak.leaked or 0
+                for graph in graphs for leak in graph.labels if leak.label == label
+            ),
+        )
+        for label in LEAK_LABELS
+    )
+
+
+@dataclass(frozen=True)
+class LeakSweep:
+    """What a sweep over one or more graphs found.
+
+    ``totals`` and ``complete`` are derived from ``graphs`` and ``failures`` at
+    construction and cannot be passed in, so no sweep can contradict what it
+    summarises. They are fields rather than properties so that ``--json`` emits
+    them (``dataclasses.asdict`` sees fields, not properties).
+
+    ``complete`` is the flag to read before trusting ``totals``. It is
+    ``graph_sweep.sweep_complete``'s answer: False if ANY graph's count was not
+    whole, any graph could not be read at all, or no graph was read.
+    """
+
+    graphs: tuple[GraphLeaks, ...]
+    failures: tuple[GraphFailure, ...]
+    totals: tuple[LabelTotal, ...] = field(init=False)
+    complete: bool = field(init=False)
+    elapsed_ms: float
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, 'totals', _label_totals(self.graphs))
+        object.__setattr__(self, 'complete', sweep_complete(self.graphs, self.failures))
+
+
+def _describe_breakdown(groups: tuple[ForeignGroup, ...]) -> str:
+    return ', '.join(
+        f'{"<none>" if g.node_group_id is None else g.node_group_id}={g.nodes}' for g in groups
+    ) or '(empty breakdown)'
+
+
+def _describe_totals(totals: tuple[LabelTotal, ...]) -> str:
+    return ' '.join(f'{total.label}={total.leaked}' for total in totals)
+
+
+def _incompleteness(leaked: int | None, breakdown_sum: int) -> str | None:
+    """Why a label's read is not whole, or None when it is.
+
+    A breakdown summing ABOVE the proven total is growth between the two reads,
+    not a truncation — the same ``>=`` rule ``paged_ro_query`` applies.
+    """
+    if leaked is None:
+        return INCOMPLETE_CENSUS_UNAVAILABLE
+    if breakdown_sum < leaked:
+        return INCOMPLETE_SHORT_READ
+    return None
+
+
+def _log_label(graph_key: str, leak: LabelLeak) -> None:
+    breakdown = _describe_breakdown(leak.by_group_id)
+    if leak.leaked:
+        logger.warning(
+            'cross-graph leak in graph %r: %d %s node(s) carry another graph\'s group_id '
+            'or none — %s',
+            graph_key, leak.leaked, leak.label, breakdown,
+        )
+    if not leak.complete:
+        logger.error(
+            'COVERAGE SHORTFALL: graph %r %s leak count is incomplete (%s): proven total %s, '
+            'breakdown sums to %d — %s',
+            graph_key, leak.label, leak.incomplete_kind, leak.leaked,
+            sum(g.nodes for g in leak.by_group_id), breakdown,
+        )
+
+
+class CrossGraphLeakCensus:
+    """Counts leaked nodes graph by graph. Never writes.
+
+    Each graph is read through ``graph_access.graph(graph_key)`` with the RAW
+    graph key, never a canonicalized one: the comparison against that key is
+    the whole point, and an alias-named graph would otherwise be compared
+    against a different graph's name.
+    """
+
+    def __init__(self, *, graph_access: GraphAccess):
+        self.graph_access = graph_access
+
+    async def run(self, graph_key: str) -> GraphLeaks:
+        """Count one graph's leaked nodes, one ``LabelLeak`` per entry in ``LEAK_LABELS``."""
+        handle = self.graph_access.graph(graph_key)
+        labels = []
+        for label in LEAK_LABELS:
+            leak = await self._read_label(handle, graph_key, label)
+            _log_label(graph_key, leak)
+            labels.append(leak)
+        return GraphLeaks(graph_key=graph_key, labels=tuple(labels))
+
+    @staticmethod
+    async def _read_label(handle: GraphHandle, graph_key: str, label: str) -> LabelLeak:
+        """The proven total FIRST, then the grouped breakdown checked against it."""
+        params = {'graph_key': graph_key}
+        leaked = await census_count(
+            OpBoundReader(handle, 'cross_graph_leak_count'), _COUNT_CYPHER[label], params,
+        )
+        result = await handle.ro_query(
+            _BREAKDOWN_CYPHER[label], params, op='cross_graph_leak_breakdown',
+        )
+        groups = tuple(sorted(
+            (
+                ForeignGroup(
+                    node_group_id=None if node_group_id is None else str(node_group_id),
+                    nodes=int(nodes),
+                )
+                for node_group_id, nodes in getattr(result, 'result_set', None) or []
+            ),
+            key=lambda g: (-g.nodes, g.node_group_id is None, g.node_group_id or ''),
+        ))
+        kind = _incompleteness(leaked, sum(g.nodes for g in groups))
+        return LabelLeak(
+            label=label,
+            leaked=leaked,
+            by_group_id=groups,
+            complete=kind is None,
+            incomplete_kind=kind,
+        )
+
+    async def sweep(self, graph_keys: Sequence[str]) -> LeakSweep:
+        """Count every graph in *graph_keys*, in order; one unreadable graph costs only itself.
+
+        Returns:
+            A :class:`LeakSweep`. Read its ``complete`` flag before trusting
+            ``totals``.
+        """
+        reads = await read_each_graph(graph_keys, self.run, what='cross-graph leak census')
+        sweep = LeakSweep(
+            graphs=reads.results, failures=reads.failures, elapsed_ms=reads.elapsed_ms,
+        )
+        logger.info(
+            'cross-graph leak census complete: graphs_read=%d graphs_failed=%d %s '
+            'complete=%s elapsed_ms=%.1f',
+            len(sweep.graphs), len(sweep.failures), _describe_totals(sweep.totals),
+            sweep.complete, sweep.elapsed_ms,
+        )
+        return sweep
+
+
+async def run_cross_graph_leak_census(
+    config_path: str | None = None,
+    graph_key: str | None = None,
+) -> LeakSweep:
+    """Open the store for reads only, sweep one graph or every listed graph, close.
+
+    The listing is ``GraphitiBackend.list_graphs``, which keeps its own filter
+    of non-project graphs; supplying *graph_key* skips the listing entirely.
+    """
+    async with maintenance_service(config_path, open_as=ServiceOpen.READS) as (_config, service):
+        keys = [graph_key] if graph_key is not None else await service.graphiti.list_graphs()
+        census = CrossGraphLeakCensus(graph_access=service.graphiti.graph_access)
+        return await census.sweep(keys)
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    """The CLI surface: no flag offers to change the graph, because none may."""
+    parser = argparse.ArgumentParser(
+        description=(
+            "Count nodes whose group_id names another graph, or none — task 2115's "
+            'cross-graph leak — per graph and per label. Read-only: this never changes '
+            'the graph. For the per-node manifest and the remedy, see '
+            'fused-memory/scripts/migrate_cross_graph_leak.py.'
+        ),
+    )
+    parser.add_argument(
+        '--config', default=None,
+        help='Path to the YAML config file (overrides CONFIG_PATH env var).',
+    )
+    parser.add_argument(
+        '--group-id', default=None,
+        help='Read only the graph with this key. Default: every graph in the store.',
+    )
+    parser.add_argument(
+        '--json', action='store_true',
+        help='Emit the full sweep as JSON instead of the summary.',
+    )
+    return parser
+
+
+def _describe_label(leak: LabelLeak) -> str:
+    count = '?' if leak.leaked is None else str(leak.leaked)
+    if leak.complete:
+        return f'{leak.label}={count}'
+    return f'{leak.label}={count} ({leak.incomplete_kind})'
+
+
+def _format_summary(sweep: LeakSweep) -> str:
+    """The summary line, then one line per graph holding a leaked node or an incomplete count."""
+    read = f'{len(sweep.graphs)} graph(s)' if sweep.graphs else '0 graph(s) (no graphs read)'
+    lines = [
+        f'cross-graph leak census: {_describe_totals(sweep.totals)} across {read} '
+        f'complete={sweep.complete} elapsed_ms={sweep.elapsed_ms:.1f}'
+    ]
+    lines.extend(
+        f'  {graph.graph_key}: ' + ' '.join(_describe_label(leak) for leak in graph.labels)
+        for graph in sweep.graphs
+        if not graph.complete or any(leak.leaked for leak in graph.labels)
+    )
+    if sweep.failures:
+        failed = ', '.join(f'{f.group_id} ({f.error})' for f in sweep.failures)
+        lines.append(f'FAILED to read {len(sweep.failures)} graph(s): {failed}')
+    return '\n'.join(lines)
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI entry point: ``python -m fused_memory.maintenance.cross_graph_leak_census``.
+
+    Returns:
+        0 only when every graph was read whole; 1 when any count was incomplete,
+        any graph could not be read, or no graph was read at all. It answers
+        "can I trust these numbers", not "were leaks found".
+    """
+    args = _build_parser().parse_args(argv)
+    logging.basicConfig(level=logging.INFO)
+
+    sweep = asyncio.run(
+        run_cross_graph_leak_census(config_path=args.config, graph_key=args.group_id)
+    )
+
+    if args.json:
+        print(json.dumps(asdict(sweep), indent=2, default=str))
+    else:
+        print(_format_summary(sweep))
+    return 0 if sweep.complete else 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

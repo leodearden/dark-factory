@@ -738,7 +738,7 @@ def _dataclass_double_violation(
 # on trailing path COMPONENTS, so the package directory keeps them distinct.
 _WALL_CLOCK_DEADLINE_DEBT: dict[str, int] = {
     # orchestrator/tests
-    'orchestrator/tests/test_merge_queue_concurrent_verify.py': 65,
+    'orchestrator/tests/test_merge_queue_concurrent_verify.py': 49,
     'orchestrator/tests/test_merge_queue_request_liveness.py': 10,
     'orchestrator/tests/test_offline_lane.py': 10,
     'orchestrator/tests/test_live_merge_worker.py': 6,
@@ -780,7 +780,6 @@ _WALL_CLOCK_DEADLINE_DEBT: dict[str, int] = {
     'orchestrator/tests/test_merge_queue_restart_hook.py': 1,
     'orchestrator/tests/test_offline_lane_records.py': 1,
     'orchestrator/tests/test_remote_gate.py': 1,
-    'orchestrator/tests/test_task_verify_host_race.py': 1,
     'orchestrator/tests/test_verify.py': 1,
     'orchestrator/tests/test_verify_admission_cancel_release.py': 1,
     'orchestrator/tests/test_verify_admission_executor_bypass.py': 1,
@@ -789,7 +788,6 @@ _WALL_CLOCK_DEADLINE_DEBT: dict[str, int] = {
     'orchestrator/tests/test_verify_admission_watch.py': 1,
     'orchestrator/tests/test_verify_hosts.py': 1,
     'orchestrator/tests/test_verify_plan_latch.py': 1,
-    'orchestrator/tests/test_verify_run_cmd_reap.py': 1,
     'orchestrator/tests/test_workflow_halt_owner.py': 1,
     # dashboard/tests
     'dashboard/tests/test_db.py': 26,

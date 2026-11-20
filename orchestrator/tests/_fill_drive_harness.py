@@ -2,7 +2,7 @@
 ``test_merge_queue_dispatch_fill_redispatch.py`` by task 5030 (PRD
 ``plans/merge-lane-quality-prd.md`` task γ7).
 
-It installs fake ``_dispatch_item``/``_finalize_inflight`` methods on a worker
+It installs fake ``VerifyDispatcher.dispatch``/``_finalize_inflight`` methods on a worker
 so a test can start ``_verifier_loop()`` itself and observe the loop's control
 flow with no real git merge or verify underneath. That is exactly the coupling
 γ7 removed from its own tests, which now drive a real lane through its public
@@ -28,6 +28,7 @@ import dataclasses
 from typing import Any
 from unittest.mock import MagicMock
 
+from orchestrator.merge_lane.types import NoHost
 from orchestrator.merge_lane.worker import (
     InflightEntry,
     MergeOutcome,
@@ -40,7 +41,7 @@ from orchestrator.verify_runner import HostAllocator
 class _FillDrive:
     """Recording state installed onto a worker by :func:`_drive_fill`.
 
-    ``dispatched``       : items passed to the stubbed ``_dispatch_item``, in
+    ``dispatched``       : items passed to the stubbed ``VerifyDispatcher.dispatch``, in
                             call order.
     ``first_dispatched``: set inside the stub once the FIRST call's lease is
                             held (i.e. after ``allocator.acquire()`` returns
@@ -62,7 +63,7 @@ class _FillDrive:
 
 
 def _drive_fill(worker: SpeculativeMergeWorker, allocator: HostAllocator) -> _FillDrive:
-    """Install recording ``_dispatch_item``/``_finalize_inflight`` stubs on *worker*.
+    """Install recording ``VerifyDispatcher.dispatch``/``_finalize_inflight`` stubs on *worker*.
 
     Keeps the fill loop's REAL control flow (item acquisition order,
     ``_note_transition``, ``_inflight_append``, the DISPATCH-FILL guard,
@@ -74,11 +75,11 @@ def _drive_fill(worker: SpeculativeMergeWorker, allocator: HostAllocator) -> _Fi
     """
     drive = _FillDrive()
 
-    async def _fake_dispatch_item(item: Any) -> InflightEntry | None:
+    async def _fake_dispatch_item(item: Any) -> InflightEntry | NoHost:
         drive.dispatched.append(item)
         lease = await allocator.acquire(lambda: MagicMock(), policy='prefer_local')
         if lease is None:
-            return None
+            return NoHost(item)
         # Signal only after the lease is confirmed held, not merely
         # requested: a waiter on first_dispatched/second_dispatched must
         # observe free_host_count() already reflecting this dispatch. This
@@ -116,7 +117,7 @@ def _drive_fill(worker: SpeculativeMergeWorker, allocator: HostAllocator) -> _Fi
             result.set_result(MergeOutcome('done'))
         return False
 
-    worker._dispatch_item = _fake_dispatch_item  # type: ignore[method-assign]
+    worker.verify_dispatch.dispatch = _fake_dispatch_item
     worker._finalize_inflight = _fake_finalize_inflight  # type: ignore[method-assign]
     return drive
 

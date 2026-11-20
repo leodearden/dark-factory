@@ -48,6 +48,8 @@ const EXPECTED_FUNCTION_NAMES = [
   'servedDatum',
   'undeliveredDatum',
   'combinedDatum',
+  'lowerBoundCombinedDatum',
+  'missingParts',
 ];
 const EXPECTED_EXPORT_NAMES = [
   ...EXPECTED_FUNCTION_NAMES,
@@ -82,7 +84,7 @@ const { withReceipt, displayedAgeMs } = datum;
 const { datumView, EM_DASH, LOWER_BOUND_PREFIX } = datum;
 const { plainDatum, derivedDatum, PLAIN_DATUM_BOUND_SECONDS } = datum;
 const { servedDatum, undeliveredDatum } = datum;
-const { combinedDatum } = datum;
+const { combinedDatum, lowerBoundCombinedDatum, missingParts } = datum;
 
 // The five-key wire envelope datum.py::Datum.to_wire() emits, verbatim: `as_of`
 // is an ISO-8601 instant normalised to UTC, `reason` is null only when the
@@ -373,8 +375,8 @@ test('displayedAgeMs: an unparseable instant yields null, not NaN', () => {
 // datumView — THE render decision. Every shared component delegates here and
 // holds no arm of its own, which is what makes "one datum, one path" a
 // checkable property rather than a slogan: a tile cannot invent a second rule
-// for holes, prefixes, tooltips or ages without the probe in
-// tests/test_datum_components.py noticing.
+// for holes, prefixes, tooltips or ages without render_app_shell.test.mjs's
+// StatTile/Pip/DatumReading render tests noticing.
 // ---------------------------------------------------------------------------
 
 // A formatter that throws if it is ever called. HBarChart's valueText
@@ -1202,6 +1204,143 @@ test('combinedDatum: a non-Datum part throws a TypeError naming combinedDatum', 
     assert.throws(
       () => combinedDatum([['dark-factory', FRESH_OLDER], ['reify', candidate]], sum, 'unused'),
       err => err instanceof TypeError && err.message.includes('combinedDatum'),
+      `${label} as a part should throw`,
+    );
+  }
+});
+
+// ---------------------------------------------------------------------------
+// lowerBoundCombinedDatum — combinedDatum's sibling for a MONOTONE combine (a
+// sum, a max). A total over the measured parts never exceeds the total over
+// all of them, so when a part is a hole the total is still true as a FLOOR:
+// it is served lower_bound, its reason names every non-fresh part, and the
+// missing labels travel as an annotation missingParts reads.
+// ---------------------------------------------------------------------------
+
+test('lowerBoundCombinedDatum: no parts is a hole carrying the caller\'s reason, and combine is not run', () => {
+  const total = lowerBoundCombinedDatum([], throwingCombine, 'no project in scope');
+
+  assert.equal(isDatum(total), true);
+  assert.equal(total.state, 'unknown');
+  assert.equal(total.reason, 'no project in scope');
+  assert.deepEqual(missingParts(total), []);
+});
+
+test('lowerBoundCombinedDatum: every part a hole is unknown, naming each — no floor of nothing', () => {
+  const total = lowerBoundCombinedDatum(
+    [
+      ['reify', unknownPart('scheduler offline')],
+      ['hive', unknownPart('snapshot failed')],
+    ],
+    throwingCombine,
+    'unused',
+  );
+
+  assert.equal(isDatum(total), true);
+  assert.equal(total.state, 'unknown');
+  assert.equal(total.value, null);
+  assert.equal(total.as_of, null);
+  assert.equal(total.reason, 'reify: scheduler offline; hive: snapshot failed');
+  assert.deepEqual(missingParts(total), []);
+});
+
+test('lowerBoundCombinedDatum: measured parts beside holes are a lower bound naming every non-fresh part', () => {
+  const total = lowerBoundCombinedDatum(
+    [
+      ['reify', FRESH_NEWER],
+      ['hive', unknownPart('snapshot failed')],
+      ['dark-factory', FRESH_OLDER],
+      ['lane', LOWER_BOUND_PART],
+      ['ops', unknownPart('scheduler offline')],
+    ],
+    joinInOrder,
+    'unused',
+  );
+
+  assert.equal(isDatum(total), true);
+  assert.equal(total.state, 'lower_bound');
+  assert.equal(total.value, '4|3|5', 'combine receives the MEASURED values in part order');
+  assert.equal(
+    total.reason,
+    'hive: snapshot failed; lane: window truncated at 500 rows; ops: scheduler offline',
+  );
+  assert.deepEqual(missingParts(total), ['hive', 'ops']);
+  assert.equal(total.as_of, AS_OF, 'a total is only as recent as its oldest measured part');
+  assert.equal(total._served_at, FRESH_OLDER._served_at);
+  assert.equal(total._received_at, FRESH_OLDER._received_at);
+  assert.ok(datumView(total, { now: NOW, format: String }).text.startsWith(LOWER_BOUND_PREFIX));
+
+  missingParts(total).push('mutated');
+  assert.deepEqual(missingParts(total), ['hive', 'ops'], 'missingParts hands out a copy');
+});
+
+test('lowerBoundCombinedDatum: a stale part beside a hole is a lower bound that still badges its age', () => {
+  const total = lowerBoundCombinedDatum(
+    [
+      ['reify', STALE_PART],
+      ['hive', unknownPart('snapshot failed')],
+    ],
+    sum,
+    'unused',
+  );
+
+  assert.equal(total.state, 'lower_bound');
+  const view = datumView(total, { now: NOW, format: String });
+  assert.equal(view.text, `${LOWER_BOUND_PREFIX}7`);
+  assert.equal(view.title, 'reify: ReadTimeout; hive: snapshot failed');
+  assert.equal(view.age, datumView(STALE_PART, { now: NOW, format: String }).age);
+  assert.equal(view.age, '3h');
+});
+
+test('lowerBoundCombinedDatum: with no hole it is exactly combinedDatum', () => {
+  const scopes = [
+    [['reify', FRESH_NEWER], ['dark-factory', FRESH_OLDER]],
+    [['dark-factory', FRESH_NEWER], ['reify', STALE_PART]],
+    [['lane', LOWER_BOUND_PART], ['reify', STALE_PART]],
+  ];
+  for (const parts of scopes) {
+    const total = lowerBoundCombinedDatum(parts, joinInOrder, 'unused');
+    assert.deepEqual(total, combinedDatum(parts, joinInOrder, 'unused'));
+    assert.deepEqual(missingParts(total), []);
+  }
+});
+
+test('missingParts: nothing is missing from a served Datum, a hole or a strict total', () => {
+  assert.deepEqual(missingParts(FRESH_WIRE), []);
+  assert.deepEqual(missingParts(unknownDatum('scheduler offline')), []);
+  assert.deepEqual(missingParts(combinedDatum([['reify', FRESH_NEWER]], sum, 'unused')), []);
+  assert.deepEqual(
+    missingParts(combinedDatum([['reify', FRESH_NEWER], ['hive', unknownPart('gone')]], sum, 'unused')),
+    [],
+  );
+});
+
+test('lowerBoundCombinedDatum: never mutates its inputs, and returns a new object on every call', () => {
+  const parts = [
+    ['reify', FRESH_NEWER],
+    ['hive', unknownPart('snapshot failed')],
+    ['dark-factory', { ...STALE_PART }],
+  ];
+  const before = structuredClone(parts);
+
+  const first = lowerBoundCombinedDatum(parts, sum, 'unused');
+  const second = lowerBoundCombinedDatum(parts, sum, 'unused');
+
+  assert.deepEqual(parts, before, 'lowerBoundCombinedDatum mutated its parts');
+  assert.notEqual(first, second);
+  assert.deepEqual(first, second);
+  for (const [, part] of parts) assert.notEqual(first, part);
+
+  const emptyA = lowerBoundCombinedDatum([], throwingCombine, 'none');
+  const emptyB = lowerBoundCombinedDatum([], throwingCombine, 'none');
+  assert.notEqual(emptyA, emptyB, 'the empty total must not be a shared singleton');
+});
+
+test('lowerBoundCombinedDatum: a non-Datum part throws a TypeError naming lowerBoundCombinedDatum', () => {
+  for (const [label, candidate] of NON_DATUMS) {
+    assert.throws(
+      () => lowerBoundCombinedDatum([['dark-factory', FRESH_OLDER], ['reify', candidate]], sum, 'unused'),
+      err => err instanceof TypeError && err.message.includes('lowerBoundCombinedDatum'),
       `${label} as a part should throw`,
     );
   }

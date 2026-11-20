@@ -7,8 +7,9 @@ from contextlib import aclosing
 from typing import Any, TypeVar
 
 from mem0 import AsyncMemory
+from qdrant_client import QdrantClient
 
-from fused_memory.backends.timeout_budget import await_within
+from fused_memory.backends.timeout_budget import await_within, socket_timeout_outlasting
 from fused_memory.config.env_precedence import warn_if_ambient_base_url_is_overridden
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.models.scope import Scope
@@ -205,12 +206,6 @@ def split_managed_metadata(
     return managed, custom
 
 
-# mem0's own default embedding dimensionality, shared by its Qdrant vector
-# store (mem0/configs/vector_stores/qdrant.py) and its OpenAI embedder
-# (mem0/embeddings/openai.py). Emitting the embedder key at this value would
-# be a behaviour CHANGE, not a no-op — see _build_config_dict.
-_MEM0_DEFAULT_EMBEDDING_DIMS = 1536
-
 # mem0's MemoryConfig.history_db_path value for a private, per-instance SQLite
 # history DB (SQLiteManager's own default).
 _MEM0_IN_MEMORY_HISTORY_DB = ':memory:'
@@ -238,7 +233,15 @@ class Mem0Backend:
     only half a fix, so both halves are enforced in one place: every timed
     call on this class goes through :meth:`_timed_read` / :meth:`_timed_write`
     to ``backends/timeout_budget.py::await_within``, the single home of the
-    message format.
+    message format.  mem0's instance construction (its collection listing and
+    payload-index creates) runs off the event loop under the write budget as
+    ``create_instance``, and the Qdrant client mem0's vector store uses is this
+    backend's own, its socket timeout from ``socket_timeout_outlasting`` over
+    both budgets, so a slow mem0 leg fails on its named budget
+    (tests/test_mem0_vector_store_client.py).  The one exception left: the
+    direct async client's socket timeout is still the read budget, so its
+    calls can still fail unattributed: its writes, and :meth:`list_projects`'
+    untimed listing (gap (2) of task 8196; see :meth:`_ensure_collection`).
 
     This paragraph is the CANONICAL statement of the rule, and a method's own
     ``Raises:`` line adds only the consequence specific to IT — so there is one
@@ -254,6 +257,7 @@ class Mem0Backend:
         self._read_timeout: float = config.queue.backend_read_timeout_seconds
         self._write_timeout: float = config.queue.backend_write_timeout_seconds
         self._async_qdrant_client = None  # Lazy async client for count/list ops
+        self._vector_store_client: QdrantClient | None = None
 
     def _build_config_dict(self, collection_name: str) -> dict[str, Any]:
         """Build a Mem0 config dict from the unified config."""
@@ -265,28 +269,20 @@ class Mem0Backend:
                 'config': {
                     'url': cfg.mem0.qdrant_url,
                     'collection_name': collection_name,
-                    # Note the deliberate asymmetry with the embedder's
-                    # 'embedding_dims' below: DIFFERENT key name, different
-                    # upstream semantics, different emission rule. mem0 would
-                    # CREATE the collection at this width, but never does:
-                    # _ensure_collection has already created it from the same
-                    # cfg.embedder.dimensions, so mem0's create_col always
-                    # finds it present and skips. mem0's own default is 1536
-                    # (mem0/configs/vector_stores/qdrant.py), so emitting it
-                    # unconditionally is a no-op at the shipped config.
+                    # The width the collection is created at. The embedder
+                    # below deliberately gets no width key, so mem0 never
+                    # sends `dimensions` (plans/local-embedder-cutover-prd.md
+                    # §6 C3). mem0 would CREATE the collection at this width,
+                    # but never does: _ensure_collection has already created
+                    # it from the same cfg.embedder.dimensions.
                     #
-                    # OPERATOR HAZARD at a NON-1536 embedder.dimensions on an
-                    # EXISTING deployment: neither key was plumbed before, so
-                    # such a config was inert — mem0 created the collection at
-                    # its own 1536 default and requested 1536-wide vectors.
-                    # Both now follow the config, but an existing collection
-                    # keeps its old width: _ensure_collection's exists-check
-                    # skips it, and so does mem0's QdrantDB.create_col
-                    # ('Collection ... already exists. Skipping creation.'),
-                    # leaving a 1536-wide collection that every N-wide upsert
-                    # then fails against at runtime. Changing
-                    # embedder.dimensions requires recreating and re-embedding
-                    # the Qdrant collection; it is not a live-migratable knob.
+                    # OPERATOR HAZARD on an EXISTING deployment: a collection
+                    # keeps the width it was created at. _ensure_collection's
+                    # exists-check skips it, and so does mem0's
+                    # QdrantDB.create_col, so every upsert at a new width
+                    # fails at runtime. Changing embedder.dimensions requires
+                    # recreating and re-embedding the Qdrant collection; it is
+                    # not a live-migratable knob.
                     'embedding_model_dims': cfg.embedder.dimensions,
                 },
             },
@@ -342,16 +338,6 @@ class Mem0Backend:
                 # the two endpoints stay independent.
                 'openai_base_url': cfg.embedder.providers.openai.api_url,
             }
-            # Emitted ONLY at a non-default dimensionality. This guard is
-            # mandatory, not stylistic: mem0/embeddings/openai.py does
-            #     self._pass_dimensions_to_api = self.config.embedding_dims is not None
-            # so emitting the key at all — even as 1536 — would start sending a
-            # `dimensions` field on EVERY embeddings request under the shipped
-            # config, which is not byte-identical. Do not "simplify" this away.
-            # (Note the key name: the embedder takes `embedding_dims`;
-            # `embedding_model_dims` is the vector store's, set above.)
-            if cfg.embedder.dimensions != _MEM0_DEFAULT_EMBEDDING_DIMS:
-                embedder_config['embedding_dims'] = cfg.embedder.dimensions
             config_dict['embedder'] = {
                 'provider': 'openai',
                 'config': embedder_config,
@@ -385,10 +371,19 @@ class Mem0Backend:
         return await asyncio.shield(creation)
 
     async def _create_instance(self, scope: Scope) -> AsyncMemory:
+        """Build and cache *scope*'s instance; start afresh if :meth:`close` closed its client meanwhile.
+
+        mem0 swallows a failed payload-index create, so an instance built on a
+        client closed mid-build is returned as if whole and would fail every call.
+        """
         collection_name = scope.mem0_collection_name(self.config.mem0.collection_prefix)
         config_dict = self._build_config_dict(collection_name)
         await self._ensure_collection(collection_name)
-        instance = AsyncMemory.from_config(config_dict)
+        client = self._get_vector_store_client()
+        config_dict['vector_store']['config']['client'] = client
+        instance = await self._timed_write(asyncio.to_thread(AsyncMemory.from_config, config_dict), 'create_instance')
+        if client is not self._vector_store_client:
+            return await self._create_instance(scope)
         self._instances[scope.project_id] = instance
         logger.info(f'Mem0 instance created for project {scope.project_id} (collection: {collection_name})')
         return instance
@@ -396,7 +391,7 @@ class Mem0Backend:
     async def _ensure_collection(self, collection_name: str) -> None:
         """Create the collection if absent, under this backend's own budgets (tests/test_mem0_collection_provisioning.py).
 
-        Gap, owned by task 8196: the shared client's socket timeout is
+        Gap, owned by task 8196: the direct async client's socket timeout is
         ``int(read budget)``, so a create slower than that fails as an
         unattributed ``ResponseHandlingException`` before the write budget.
         """
@@ -757,6 +752,15 @@ class Mem0Backend:
             instance.delete(memory_id),
             'delete',
         )
+
+    def _get_vector_store_client(self) -> QdrantClient:
+        """Get or create the sync Qdrant client every mem0 instance's vector store shares."""
+        if self._vector_store_client is None:
+            self._vector_store_client = QdrantClient(
+                url=self.config.mem0.qdrant_url,
+                timeout=socket_timeout_outlasting(self._read_timeout, self._write_timeout),
+            )
+        return self._vector_store_client
 
     async def _get_async_qdrant(self):
         """Get or create a shared async Qdrant client for lightweight ops."""
@@ -1698,14 +1702,13 @@ class Mem0Backend:
         return {str(point.id): float(point.score) for point in response.points}
 
     async def close(self) -> None:
-        """Close all cached AsyncMemory instances and release their connections."""
+        """Drop the cached AsyncMemory instances and close the two Qdrant clients this backend owns."""
         import contextlib
-        for instance in self._instances.values():
-            with contextlib.suppress(Exception):
-                client = getattr(getattr(instance, 'vector_store', None), 'client', None)
-                if client is not None and hasattr(client, 'close'):
-                    await client.close()
         self._instances.clear()
+        if self._vector_store_client is not None:
+            with contextlib.suppress(Exception):
+                self._vector_store_client.close()
+            self._vector_store_client = None
         if self._async_qdrant_client is not None:
             with contextlib.suppress(Exception):
                 await self._async_qdrant_client.close()

@@ -22,6 +22,8 @@ from _orch_helpers import (
     assert_isolated_git_repo,
     git_env_with_ceiling,
 )
+from _seed_script_stubs import seed_default_warm_base
+from _worktree_registrations import lane_admin_dir, registered_worktree_paths
 from shared.git_async import MAX_CONCURRENT_SPAWNS, GitResult
 from shared.merge_subject import format_merge_subject
 
@@ -53,34 +55,12 @@ from orchestrator.lane_branch_holder import BranchCheckedOutElsewhere, BranchHol
 from orchestrator.quarantine_provenance import NOT_RELOCATED
 
 
+# No warm base here: persistent-merge-worktree tests assert ``_merge-verify``
+# is absent until lazily created, so warm-lane tests seed it themselves.
 @pytest.fixture
 def git_repo(tmp_path: Path) -> Path:
     """Create a temporary git repository with an initial commit."""
     return seed_repo(tmp_path / 'repo')
-
-
-def _seed_default_warm_base(repo: Path) -> None:
-    """Pre-create the DEFAULT derived warm-lane base (task 2061).
-
-    <repo>/.worktrees/_merge-verify/target, non-empty — so the
-    acquire_warm_lane pre-acquire base-health gate sees WarmBaseHealth.OK for
-    warm-lane tests using the default (unoverridden) warm_lane_base_target_dir.
-    NOT folded into the shared git_repo fixture: several persistent-merge-
-    worktree tests in this file assert ``_merge-verify`` does NOT exist before
-    it is lazily created, so only warm-lane tests that need a resolvable base
-    call this explicitly.
-
-    Task 2099: also marks ``.pool-root`` present so the NEW mount-presence
-    guard on acquire_warm_lane/acquire_spec_lane's create-once discriminator
-    does not false-trip in these warm-lane tests, which simulate an
-    already-running warm-lane host (a resolvable base presupposes prior pool
-    warmup on an already-mounted host) — an orthogonal concern to whether the
-    base itself is buildable.
-    """
-    default_base = repo / '.worktrees' / '_merge-verify' / 'target'
-    default_base.mkdir(parents=True, exist_ok=True)
-    (default_base / '.keep').write_text('warm base sentinel\n')
-    (repo / '.worktrees' / '.pool-root').touch()
 
 
 async def _inject_uu_state(cwd: Path, path: str, tag: str = '') -> None:
@@ -966,11 +946,7 @@ class TestWorktreeLifecycle:
         assert 'task/orig-task ' not in branches  # exact-match exclusion
 
         # New worktree is registered with git
-        rc, listing, _ = await _run(
-            ['git', 'worktree', 'list', '--porcelain'],
-            cwd=git_ops.project_root,
-        )
-        assert str(new_path.resolve()) in listing
+        assert str(new_path.resolve()) in registered_worktree_paths(git_ops.project_root)
 
     async def test_rename_worktree_unregistered_path_raises(
         self, git_ops: GitOps,
@@ -7395,9 +7371,7 @@ async def _drop_admin_entry(git_ops: GitOps, worktree: Path) -> None:
     rc, admin_dir, err = await _run(['git', 'rev-parse', '--absolute-git-dir'], cwd=worktree)
     assert rc == 0, err
     shutil.rmtree(admin_dir.strip())
-    rc, listing, err = await _run(['git', 'worktree', 'list', '--porcelain'], cwd=git_ops.project_root)
-    assert rc == 0, err
-    assert f'worktree {worktree}' not in listing.splitlines()
+    assert str(worktree.resolve()) not in registered_worktree_paths(git_ops.project_root)
 
 
 async def _branches_matching(git_ops: GitOps, pattern: str) -> str:
@@ -7761,11 +7735,7 @@ class TestOrphanWorktreeHelpers:
         assert outcome.dest is not None
         assert not other.path.exists()
         assert outcome.branch is None
-        rc, listing, err = await _run(
-            ['git', 'worktree', 'list', '--porcelain'], cwd=git_ops.project_root,
-        )
-        assert rc == 0, err
-        assert f'worktree {outcome.dest}' in listing.splitlines()
+        assert str(outcome.dest.resolve()) in registered_worktree_paths(git_ops.project_root)
 
     async def test_quarantine_unregistered_dir_leaves_a_branch_checked_out_elsewhere(
         self, git_ops: GitOps, tmp_path: Path,
@@ -8388,18 +8358,9 @@ class TestPersistentMergeWorktree:
         assert warm_path.exists()
 
         # Path is a registered git worktree
-        rc, out, _ = await _run(
-            ['git', 'worktree', 'list', '--porcelain'],
-            cwd=git_ops.project_root,
-        )
-        assert rc == 0
-        registered_paths = [
-            line[len('worktree '):].strip()
-            for line in out.splitlines()
-            if line.startswith('worktree ')
-        ]
-        assert str(warm_path) in registered_paths, (
-            f'_merge-verify not in registered worktrees: {registered_paths}'
+        registered = registered_worktree_paths(git_ops.project_root)
+        assert str(warm_path.resolve()) in registered, (
+            f'_merge-verify not in registered worktrees: {registered}'
         )
 
         # HEAD of warm worktree == merge_commit
@@ -8570,27 +8531,17 @@ class TestPersistentMergeWorktree:
         # Simulate shape-1: remove the .git/worktrees/<name> admin dir the
         # lane's .git pointer names — registration is gone while the on-disk
         # tree survives, exactly the interrupted-teardown on-disk shape.
-        shutil.rmtree(_lane_admin_dir(merge_wt))
+        shutil.rmtree(lane_admin_dir(merge_wt))
+        registered = registered_worktree_paths(git_ops.project_root)
+        assert str(merge_wt.resolve()) not in registered, (
+            f'shape-1 leak must be unregistered once its admin dir is gone (setup check): {registered}'
+        )
 
         await git_ops.cleanup_merge_worktree(merge_wt)
 
         # The on-disk tree is gone...
         assert not merge_wt.exists(), (
             'shape-1 leak tree must be removed by crash-safe cleanup'
-        )
-        # ...absent from git worktree list...
-        rc, out, _ = await _run(
-            ['git', 'worktree', 'list', '--porcelain'],
-            cwd=git_ops.project_root,
-        )
-        assert rc == 0
-        registered = [
-            line[len('worktree '):].strip()
-            for line in out.splitlines()
-            if line.startswith('worktree ')
-        ]
-        assert str(merge_wt) not in registered, (
-            f'shape-1 leak must be gone from git worktree list: {registered}'
         )
         # ...and NO _merge-* directory OR sibling .lock orphan survives under
         # worktree_base (task 2924's strict no-leak glob).
@@ -8805,18 +8756,9 @@ class TestPersistentOfflineDeepWorktree:
         assert warm_path.exists()
 
         # Path is a registered git worktree
-        rc, out, _ = await _run(
-            ['git', 'worktree', 'list', '--porcelain'],
-            cwd=git_ops.project_root,
-        )
-        assert rc == 0
-        registered_paths = [
-            line[len('worktree '):].strip()
-            for line in out.splitlines()
-            if line.startswith('worktree ')
-        ]
-        assert str(warm_path) in registered_paths, (
-            f'_offline-deep not in registered worktrees: {registered_paths}'
+        registered = registered_worktree_paths(git_ops.project_root)
+        assert str(warm_path.resolve()) in registered, (
+            f'_offline-deep not in registered worktrees: {registered}'
         )
 
         # HEAD of warm worktree == merge_commit
@@ -10671,7 +10613,7 @@ class TestCreateWorktreeWarmLaneRouting:
 
     @pytest.fixture(autouse=True)
     def _warm_base(self, git_repo: Path) -> None:
-        _seed_default_warm_base(git_repo)
+        seed_default_warm_base(git_repo)
 
     async def test_warm_path_returns_lane_not_branch_named_dir(
         self, git_repo: Path,
@@ -10822,7 +10764,7 @@ class TestCleanupWorktreePoolAware:
 
     @pytest.fixture(autouse=True)
     def _warm_base(self, git_repo: Path) -> None:
-        _seed_default_warm_base(git_repo)
+        seed_default_warm_base(git_repo)
 
     async def test_cleanup_lane_not_removed(
         self, git_repo: Path,
@@ -10993,7 +10935,7 @@ class TestCreateWorktreeRequeueAndRecycledId:
 
     @pytest.fixture(autouse=True)
     def _warm_base(self, git_repo: Path) -> None:
-        _seed_default_warm_base(git_repo)
+        seed_default_warm_base(git_repo)
 
     def _warm_config(self) -> GitConfig:
         return GitConfig(
@@ -11615,7 +11557,7 @@ class TestReleaseWarmLaneBranchRetention:
 
     @pytest.fixture(autouse=True)
     def _warm_base(self, git_repo: Path) -> None:
-        _seed_default_warm_base(git_repo)
+        seed_default_warm_base(git_repo)
 
     def _warm_config(self) -> GitConfig:
         return GitConfig(
@@ -11863,7 +11805,7 @@ class TestAcquireWarmLaneCreateOnceLeftoverGuard:
 
     @pytest.fixture(autouse=True)
     def _warm_base(self, git_repo: Path) -> None:
-        _seed_default_warm_base(git_repo)
+        seed_default_warm_base(git_repo)
 
     def _warm_config(self) -> GitConfig:
         return GitConfig(
@@ -12133,7 +12075,7 @@ class TestAcquireWarmLaneResetInPlaceCheckoutGuard:
 
     @pytest.fixture(autouse=True)
     def _warm_base(self, git_repo: Path) -> None:
-        _seed_default_warm_base(git_repo)
+        seed_default_warm_base(git_repo)
 
     def _warm_config(self) -> GitConfig:
         return GitConfig(
@@ -12361,7 +12303,7 @@ class TestRebindBranchToHead:
 
     @pytest.fixture(autouse=True)
     def _warm_base(self, git_repo: Path) -> None:
-        _seed_default_warm_base(git_repo)
+        seed_default_warm_base(git_repo)
 
     def _warm_config(self) -> GitConfig:
         return GitConfig(
@@ -12636,7 +12578,7 @@ class TestAcquireDiskBackstopReuseDetachedRebind:
 
     @pytest.fixture(autouse=True)
     def _warm_base(self, git_repo: Path) -> None:
-        _seed_default_warm_base(git_repo)
+        seed_default_warm_base(git_repo)
 
     def _warm_config(self) -> GitConfig:
         return GitConfig(
@@ -12794,7 +12736,7 @@ class TestReuseWarmLaneBranchAware:
 
     @pytest.fixture(autouse=True)
     def _warm_base(self, git_repo: Path) -> None:
-        _seed_default_warm_base(git_repo)
+        seed_default_warm_base(git_repo)
 
     def _warm_config(self) -> GitConfig:
         return GitConfig(
@@ -12940,7 +12882,7 @@ class TestAcquireWarmLaneReclaimOnExhaustion:
 
     @pytest.fixture(autouse=True)
     def _warm_base(self, git_repo: Path) -> None:
-        _seed_default_warm_base(git_repo)
+        seed_default_warm_base(git_repo)
 
     def _warm_config(self) -> GitConfig:
         return GitConfig(
@@ -13184,15 +13126,6 @@ class TestAcquireWarmLaneReclaimOnExhaustion:
 # ===========================================================================
 
 
-def _lane_admin_dir(lane: Path) -> Path:
-    """Parse the ``.git/worktrees/<name>`` admin dir path out of a lane's
-    ``.git`` pointer file (``gitdir: <repo>/.git/worktrees/<name>``)."""
-    content = (lane / '.git').read_text().strip()
-    prefix = 'gitdir:'
-    assert content.startswith(prefix), f'unexpected worktree .git pointer: {content!r}'
-    return Path(content[len(prefix):].strip())
-
-
 @pytest.mark.asyncio
 class TestAcquireWarmLaneOrphanedReuseGuard:
     """The REUSE path (in-memory map hit -> reused=True) assumes a mapped
@@ -13213,7 +13146,7 @@ class TestAcquireWarmLaneOrphanedReuseGuard:
 
     @pytest.fixture(autouse=True)
     def _warm_base(self, git_repo: Path) -> None:
-        _seed_default_warm_base(git_repo)
+        seed_default_warm_base(git_repo)
 
     def _warm_config(self) -> GitConfig:
         return GitConfig(
@@ -13267,7 +13200,7 @@ class TestAcquireWarmLaneOrphanedReuseGuard:
         # so the next acquire_for('A') returns reused=True.
 
         # Simulate the prune wipe: delete the lane's admin dir.
-        admin_dir = _lane_admin_dir(lane)
+        admin_dir = lane_admin_dir(lane)
         shutil.rmtree(admin_dir)
         assert not await git_ops._is_registered_worktree(lane), (
             'lane must be unregistered after its admin dir is wiped (setup check)'
@@ -13334,7 +13267,7 @@ class TestAcquireWarmLaneOrphanedReuseGuard:
         _, main_head_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
         main_head = main_head_raw.strip()
 
-        admin_dir = _lane_admin_dir(lane)
+        admin_dir = lane_admin_dir(lane)
         shutil.rmtree(admin_dir)
         assert not await git_ops._is_registered_worktree(lane), (
             'lane must be unregistered after its admin dir is wiped (setup check)'
@@ -13433,7 +13366,7 @@ class TestAcquireWarmLaneOrphanedReuseGuard:
 
         # Construct a REPAIRABLE orphan: corrupt the admin dir's gitdir
         # pointer (lane dir + admin dir both survive and stay linkable).
-        admin_dir = _lane_admin_dir(lane)
+        admin_dir = lane_admin_dir(lane)
         (admin_dir / 'gitdir').write_text('/tmp/bogus/.git\n')
         assert not await git_ops._is_registered_worktree(lane), (
             'lane must appear unregistered once its admin dir gitdir '

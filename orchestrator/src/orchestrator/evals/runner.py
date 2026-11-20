@@ -1497,5 +1497,7 @@ class RecordingMemorySink:
 
 
 if __name__ == '__main__':
-    from orchestrator.cli import eval_cmd
+    from orchestrator.cli_config import load_program_dotenv
+    from orchestrator.evals.cli import eval_cmd
+    load_program_dotenv()
     eval_cmd()

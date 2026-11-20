@@ -14,7 +14,7 @@ Widths throughout are CELLS, not characters -- Textual crops a column by
 rich's cell measurement, so a bound counted in characters would let
 double-width text overrun its column (and lose its ellipsis with it).
 
-Consumers import orchestrator.session_registry directly (mirrors
+Consumers import orchestrator.session_records directly (mirrors
 registry_reader.py/session_table.py -- PRD §6 G5: consumers import the
 frozen C1 record shape, never re-derive it).
 """
@@ -26,13 +26,8 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Protocol
 
-from orchestrator.session_registry import (
-    DecisionRecord,
-    DecisionState,
-    Display,
-    SessionRecord,
-    Status,
-)
+from orchestrator.decision_registry import DecisionRecord, DecisionState
+from orchestrator.session_records import Display, SessionRecord, Status
 from rich.cells import cell_len, set_cell_size
 from textual.events import Resize
 from textual.widgets import DataTable

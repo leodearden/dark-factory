@@ -27,6 +27,7 @@ from _fused_memory_tool_surface import (
     registered_fused_memory_tools,
 )
 from _tool_surface_classification import assert_tool_surface_classified
+from reconciliation._preservation_specimen_history import unresolved_passes
 from reconciliation.harness_fixtures import make_harness
 from shared.cli_invoke import AgentResult, AllAccountsCappedException
 from shared.task_claimant import DEFAULT_CLAIMANT_HEARTBEAT_TTL
@@ -68,6 +69,13 @@ from fused_memory.reconciliation.consolidation_auto_executor import (
     auto_consolidation_initial_stats,
 )
 from fused_memory.reconciliation.live_workflow_section import NO_PER_TASK_SIGNAL_TOKEN
+from fused_memory.reconciliation.preservation_specimen_guard import (
+    CANDIDATE_TASK_IDS_STAT,
+    PRESERVATION_SUPPRESSION_STORM_THRESHOLD_PER_CYCLE,
+    UNRESOLVED_CORROBORATION_STREAK_THRESHOLD,
+    UNRESOLVED_CORROBORATION_SUBJECT,
+    UNRESOLVED_TASK_IDS_STAT,
+)
 from fused_memory.reconciliation.prompts import (
     ESCALATION_BOUNDARY_NOTE,
     FLAG_FOR_STAGE2_MARKER_KIND,
@@ -109,6 +117,7 @@ from fused_memory.reconciliation.task_filter import (
     MAX_CANCELLED_TASKS_RETAINED,
     MAX_DONE_TASKS_RETAINED,
     FilteredTaskTree,
+    TaskTreeUnavailableReason,
     filter_task_tree,
     format_task_list,
     id_key,
@@ -2297,13 +2306,15 @@ class TestProjectIdValidation(BaseStageValidationTest):
             # Always present (task 2943): streak accounting runs on every full
             # cycle; 0 here because no standing decision suppressed anything.
             'entity_standing_decision_max_suppression_streak': 0,
-            # Always present (task 4223): the preservation-specimen guard runs
-            # ABOVE the remediation early-return, so all three keys are on EVERY
-            # report. All stay empty here — no flag was emitted, so the guard
-            # short-circuits before any corroboration read.
+            # Always present (tasks 4223, 5464): the preservation-specimen guard
+            # runs ABOVE the remediation early-return, so all five keys are on
+            # EVERY report. All stay empty here — no flag was emitted, so the
+            # guard short-circuits before any corroboration read.
             'preservation_specimen_suppressed': 0,
             'preservation_specimen_unresolved': 0,
             'preservation_specimen_citations': {},
+            'preservation_specimen_candidate_task_ids': [],
+            'preservation_specimen_unresolved_task_ids': [],
             # Always present (task 4874): the live-workflow citation guard runs
             # ABOVE the remediation early-return; 0 with no flag emitted.
             'stage1_live_workflow_citation_contradictions': 0,
@@ -2522,13 +2533,15 @@ class TestProjectIdValidation(BaseStageValidationTest):
             # Always present (task 2943): streak accounting runs on every full
             # cycle; 0 here because no standing decision suppressed anything.
             'entity_standing_decision_max_suppression_streak': 0,
-            # Always present (task 4223): the preservation-specimen guard runs
-            # ABOVE the remediation early-return, so all three keys are on EVERY
-            # report. All stay empty here — no flag was emitted, so the guard
-            # short-circuits before any corroboration read.
+            # Always present (tasks 4223, 5464): the preservation-specimen guard
+            # runs ABOVE the remediation early-return, so all five keys are on
+            # EVERY report. All stay empty here — no flag was emitted, so the
+            # guard short-circuits before any corroboration read.
             'preservation_specimen_suppressed': 0,
             'preservation_specimen_unresolved': 0,
             'preservation_specimen_citations': {},
+            'preservation_specimen_candidate_task_ids': [],
+            'preservation_specimen_unresolved_task_ids': [],
             # Always present (task 4874): the live-workflow citation guard runs
             # ABOVE the remediation early-return; 0 with no flag emitted.
             'stage1_live_workflow_citation_contradictions': 0,
@@ -5628,6 +5641,58 @@ class TestBriefingKnownGapsRefresh:
             )
 
         # Second invocation must not call add_task again
+        mock_deps['taskmaster'].add_task.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_an_unavailable_injected_tree_does_not_suppress_the_dedup_fetch(
+        self, mock_deps, tmp_path, caplog,
+    ):
+        """An unknown injected tree is not 'no pending tasks': the hook fetches its own tree to dedup."""
+        scripts_dir = tmp_path / 'scripts'
+        scripts_dir.mkdir()
+        (scripts_dir / 'refresh_briefing_known_gaps.py').write_text(
+            'import json, sys\n'
+            "print(json.dumps([{'task_id': '1751', 'title': 'Foo', 'subproject': 'bar', 'what': 'gap'}]))\n"
+            'sys.exit(1)\n'
+        )
+        (tmp_path / 'review').mkdir()
+        (tmp_path / 'review' / 'briefing.yaml').write_text('')
+
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.scope = _scope('reify', str(tmp_path))
+        stage.filtered_task_tree = FilteredTaskTree(
+            unavailable_reason=TaskTreeUnavailableReason.fetch_error,
+        )
+        mock_deps['taskmaster'].get_tasks.return_value = {
+            'tasks': [
+                {
+                    'id': '9001',
+                    'status': 'pending',
+                    'title': 'Refresh briefing: remove task 1751 from known_gaps',
+                },
+            ],
+        }
+
+        with (
+            patch.object(stage, 'assemble_payload', new=AsyncMock(return_value='payload')),
+            patch(
+                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                new=AsyncMock(return_value=StageResult(success=True, report={'summary': 'ok'})),
+            ),
+            caplog.at_level(logging.INFO, logger=_TKS_LOGGER),
+        ):
+            await stage.run(
+                events=[],
+                watermark=Watermark(project_id='reify'),
+                prior_reports=[],
+                run_id='test-run-unavailable-tree',
+            )
+
+        queued_records = [
+            r for r in caplog.records
+            if r.name == _TKS_LOGGER and r.getMessage() == 'briefing_refresh_tasks_queued'
+        ]
+        assert [getattr(r, 'skipped_ids', None) for r in queued_records] == [['1751']]
         mock_deps['taskmaster'].add_task.assert_not_called()
 
     @pytest.mark.asyncio
@@ -12779,10 +12844,6 @@ def stage2_guard_mock_deps():
     write_journal_mock.get_ops_by_causation = AsyncMock(return_value=[])
     journal_mock = MagicMock()
     journal_mock.write_journal = write_journal_mock
-    # Task 2744: BaseStage.run now records/clears a per-stage CLI session on the
-    # run row around the stage subprocess; these must be awaitable on the mock.
-    journal_mock.record_run_session = AsyncMock()
-    journal_mock.clear_run_session = AsyncMock()
     return {
         'memory_service': AsyncMock(),
         'taskmaster': AsyncMock(),
@@ -18772,6 +18833,8 @@ class TestMemoryConsolidatorPreservationSpecimenGuard:
 
         assert report.stats['preservation_specimen_suppressed'] == 0
         assert report.stats['preservation_specimen_unresolved'] == 0
+        assert report.stats[CANDIDATE_TASK_IDS_STAT] == []
+        assert report.stats[UNRESOLVED_TASK_IDS_STAT] == []
 
     @pytest.mark.asyncio
     async def test_stats_are_present_and_zero_on_a_quiet_remediation_pass(self, mock_deps):
@@ -18791,6 +18854,8 @@ class TestMemoryConsolidatorPreservationSpecimenGuard:
 
         assert report.stats['preservation_specimen_suppressed'] == 0
         assert report.stats['preservation_specimen_unresolved'] == 0
+        assert report.stats[CANDIDATE_TASK_IDS_STAT] == []
+        assert report.stats[UNRESOLVED_TASK_IDS_STAT] == []
 
     @pytest.mark.asyncio
     async def test_unresolved_corroboration_is_counted_and_keeps_the_flag(self, mock_deps):
@@ -18871,6 +18936,8 @@ class TestMemoryConsolidatorPreservationSpecimenGuard:
         # Pre-inited above the early return, so the key is never conditionally
         # absent — the always-present convention the sibling stats follow.
         assert report.stats['preservation_specimen_citations'] == {}
+        assert report.stats[CANDIDATE_TASK_IDS_STAT] == []
+        assert report.stats[UNRESOLVED_TASK_IDS_STAT] == []
 
     @pytest.mark.asyncio
     async def test_guard_failure_on_a_remediation_pass_is_also_swallowed(self, mock_deps):
@@ -18920,6 +18987,123 @@ class TestMemoryConsolidatorPreservationSpecimenGuard:
         pending = queue.get_by_task('3105', status='pending', level=1)
         assert len(pending) == 1
         assert pending[0].category == 'reconciliation_preservation_specimen_storm'
+
+    # ── Both disclosures on both pass classes (task 5464) ─────────────────────
+
+    @staticmethod
+    def _wire_queue(stage, tmp_path):
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'escalations')
+        stage._escalation_queue = queue
+        return queue
+
+    @staticmethod
+    def _degraded_memory(stage):
+        """Both corroboration channels fail, so task 3105 is left unresolved."""
+        stage.memory.get_memories_by_metadata = AsyncMock(side_effect=TimeoutError('down'))
+        stage.memory.get_entity = AsyncMock(side_effect=RuntimeError('also down'))
+
+    @staticmethod
+    def _pending_unresolved(queue):
+        return queue.get_by_task(UNRESOLVED_CORROBORATION_SUBJECT, status='pending', level=1)
+
+    @pytest.mark.asyncio
+    async def test_storm_escalation_filed_on_a_remediation_pass(self, mock_deps, tmp_path):
+        """The guard runs on remediation passes, so its storm escape must too."""
+        stage = self._make_stage(mock_deps)
+        self._corroborating_memory(stage)
+        queue = self._wire_queue(stage, tmp_path)
+        stage.remediation_findings = [{'description': 'fix me'}]
+
+        n = PRESERVATION_SUPPRESSION_STORM_THRESHOLD_PER_CYCLE + 1
+        storm_flags = [self._stranded_flag(flag_type=f'task_stranded_v{i}') for i in range(n)]
+        base_report = self._make_base_report(storm_flags)
+
+        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)):
+            await stage.run(
+                events=[], watermark=Watermark(project_id='p'), prior_reports=[],
+                run_id='r-5464-storm-remediation',
+            )
+
+        pending = queue.get_by_task('3105', status='pending', level=1)
+        assert len(pending) == 1
+        assert pending[0].category == 'reconciliation_preservation_specimen_storm'
+
+    @pytest.mark.asyncio
+    async def test_unresolved_disclosure_filed_on_a_remediation_pass(self, mock_deps, tmp_path):
+        """Persistent blindness is reported on a remediation pass, from the stage's journal."""
+        stage = self._make_stage(mock_deps)
+        self._degraded_memory(stage)
+        queue = self._wire_queue(stage, tmp_path)
+        stage.remediation_findings = [{'description': 'fix me'}]
+        stage.journal.get_recent_runs = AsyncMock(
+            return_value=unresolved_passes(
+                '3105', project_id='p', count=UNRESOLVED_CORROBORATION_STREAK_THRESHOLD - 1,
+            ),
+        )
+        base_report = self._make_base_report([self._stranded_flag()])
+
+        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)):
+            await stage.run(
+                events=[], watermark=Watermark(project_id='p'), prior_reports=[],
+                run_id='r-5464-unresolved-remediation',
+            )
+
+        assert len(self._pending_unresolved(queue)) == 1
+
+    @pytest.mark.asyncio
+    async def test_single_unresolved_pass_files_nothing(self, mock_deps, tmp_path):
+        """One degraded pass is disclosed in the stats, not as a pending L1."""
+        stage = self._make_stage(mock_deps)
+        self._degraded_memory(stage)
+        queue = self._wire_queue(stage, tmp_path)
+        stage.journal.get_recent_runs = AsyncMock(return_value=[])
+        base_report = self._make_base_report([self._stranded_flag()])
+
+        with self._full_cycle(base_report):
+            report = await stage.run(
+                events=[], watermark=Watermark(project_id='p'), prior_reports=[],
+                run_id='r-5464-single-blip',
+            )
+
+        assert self._pending_unresolved(queue) == []
+        assert report.stats['preservation_specimen_unresolved'] == 1
+
+    @pytest.mark.asyncio
+    async def test_observation_stats_record_the_degraded_pass(self, mock_deps):
+        """What a later pass reads back to measure persistence."""
+        stage = self._make_stage(mock_deps)
+        self._degraded_memory(stage)
+        base_report = self._make_base_report([self._stranded_flag()])
+
+        with self._full_cycle(base_report):
+            report = await stage.run(
+                events=[], watermark=Watermark(project_id='p'), prior_reports=[],
+                run_id='r-5464-observation',
+            )
+
+        assert report.stats[CANDIDATE_TASK_IDS_STAT] == ['3105']
+        assert report.stats[UNRESOLVED_TASK_IDS_STAT] == ['3105']
+
+    @pytest.mark.asyncio
+    async def test_guard_failure_on_a_remediation_pass_files_nothing(self, mock_deps, tmp_path):
+        """No result, no disclosure: the escape is gated on the guard having answered."""
+        stage = self._make_stage(mock_deps)
+        queue = self._wire_queue(stage, tmp_path)
+        stage.remediation_findings = [{'description': 'fix me'}]
+        base_report = self._make_base_report([self._stranded_flag()])
+
+        with (
+            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
+            patch(self._GUARD, new=AsyncMock(side_effect=RuntimeError('guard exploded'))),
+        ):
+            await stage.run(
+                events=[], watermark=Watermark(project_id='p'), prior_reports=[],
+                run_id='r-5464-boom-remediation',
+            )
+
+        assert queue.get_pending() == []
 
 
 class TestTypedAbsenceReachesEveryPrompt:

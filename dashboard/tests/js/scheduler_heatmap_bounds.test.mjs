@@ -179,8 +179,10 @@ function strandedPark(path, contention = 0) {
 function departedHolder(path, contention) {
   return makeModule(path, contention, {
     holder: 'T-gone',
+    holders: ['T-gone'],
     holder_project: 'dark_factory',
     holder_live: false,
+    at_holder_limit: true,
   });
 }
 
@@ -228,8 +230,10 @@ test('a held module keeps its column at contention 1 when its holder has departe
   // column has something to show.
   const held = makeModule('src/g/held.py', 1, {
     holder: 'T-gone',
+    holders: ['T-gone'],
     holder_project: 'dark_factory',
     holder_live: false,
+    at_holder_limit: true,
   });
   const out = boundHeatmapAxes({ rows: [], modules: [...COLUMN_FIXTURE, held] });
 
@@ -262,6 +266,43 @@ test('a held module whose holder is LIVE earns nothing at contention 1 — the o
       holder: 'T-1',
       holder_project: 'dark_factory',
       holder_live: true,
+    })],
+  });
+
+  assert.deepEqual(out.modules, []);
+});
+
+test('a departed holder of a key below its holder limit earns no column and lifts no parked row', () => {
+  // A key taking unlimited holders never fills, so a departed holder blocks
+  // nobody: any waiter can take the key beside it. Only a full key is stuck.
+  const shared = contention => makeModule('src/k/shared.md', contention, {
+    holder: 'T-gone',
+    holders: ['T-gone'],
+    holder_project: 'dark_factory',
+    holder_live: false,
+    at_holder_limit: false,
+  });
+  const out = boundHeatmapAxes({ rows: [], modules: [...COLUMN_FIXTURE, shared(1)] });
+  assert.ok(
+    !out.modules.map(m => m.path).includes('src/k/shared.md'),
+    'a key below its holder limit must not be rescued',
+  );
+
+  const rows = [makeRow('T-1', ['src/a/hot.py']), parkedOn('T-parked', 'src/k/shared.md')];
+  const kept = boundHeatmapAxes({ rows, modules: serverSorted([...COLUMN_FIXTURE, shared(2)]) });
+  assert.deepEqual(kept.rows.map(r => r.task_id), ['T-1', 'T-parked']);
+});
+
+test('a full key with ANY live holder earns nothing at contention 1', () => {
+  // holder_live is any-holder-live: a live co-holder can still release it.
+  const out = boundHeatmapAxes({
+    rows: [],
+    modules: [makeModule('src/i/full.py', 1, {
+      holder: 'T-gone',
+      holders: ['T-1', 'T-gone'],
+      holder_project: 'dark_factory',
+      holder_live: true,
+      at_holder_limit: true,
     })],
   });
 

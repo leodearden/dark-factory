@@ -405,8 +405,12 @@ class TestPlanToolsLaunchDirectInterpreter:
         assert cfg['command'] == '/venv/bin/python'
 
     def test_args_exact_module_invocation_sequence(self, cfg):
-        """args equals ['-m', 'orchestrator.mcp.plan_tools', '--worktree', '/wt'] exactly."""
-        assert cfg['args'] == ['-m', 'orchestrator.mcp.plan_tools', '--worktree', '/wt']
+        """args equals ['-m', 'orchestrator.mcp.plan_tools', '--worktree', '/wt',
+        '--grants-enforced'] exactly: the grant marker always follows the root
+        args (task 7717)."""
+        assert cfg['args'] == [
+            '-m', 'orchestrator.mcp.plan_tools', '--worktree', '/wt', '--grants-enforced',
+        ]
 
     def test_no_uv_tokens_anywhere_in_full_command(self, cfg):
         """None of {'uv', 'run', '--no-sync', '--frozen', '--project'} appear
@@ -688,7 +692,7 @@ class TestStdioLaunchTaskRoot:
         prefix = [] if python_executable else _UV_PREFIX
         assert args == [
             *prefix, '-m', 'orchestrator.mcp.plan_tools',
-            '--worktree', '/wt', '--meta-root', str(_LANE_ROOT),
+            '--worktree', '/wt', '--meta-root', str(_LANE_ROOT), '--grants-enforced',
         ]
 
     def test_verdict_tools_args_without_task_root_are_unchanged(self, python_executable):

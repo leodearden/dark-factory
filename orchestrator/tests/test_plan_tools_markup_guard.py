@@ -73,6 +73,7 @@ from escalation.models import Escalation
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
 from shared.mcp_markup_middleware import (
+    MARKUP_BOUNDARY_STORM_CATEGORY,
     MARKUP_RECURRENCE_ROUTING,
     MarkupGuardMiddleware,
     RepairPolicy,
@@ -80,7 +81,13 @@ from shared.mcp_markup_middleware import (
 from shared.toolcall_markup import ENVELOPE_LITERALS, MARKUP_OVERRIDE_KEY, detect, repair
 
 from orchestrator.artifacts import TaskArtifacts
-from orchestrator.mcp import markup_journal, markup_sink, plan_markup_stamp, plan_tools
+from orchestrator.mcp import (
+    markup_journal,
+    markup_sink,
+    plan_markup_repair,
+    plan_markup_stamp,
+    plan_tools,
+)
 from orchestrator.workflow import _is_gating_escalation
 
 # ---------------------------------------------------------------------------
@@ -137,14 +144,14 @@ QUOTED_DECISION = (
 
 @pytest.fixture(autouse=True)
 def _clear_reported_refusals():
-    """Clear ``_REPORTED_REFUSALS`` around every test in this module.
+    """Forget every reported refusal around each test in this module.
 
     It is PROCESS-global memo state owned by the read-time path, so a refusal
     reported by one test would otherwise be suppressed in the next.
     """
-    plan_tools._REPORTED_REFUSALS.clear()
+    plan_markup_repair.forget_reported_refusals()
     yield
-    plan_tools._REPORTED_REFUSALS.clear()
+    plan_markup_repair.forget_reported_refusals()
 
 
 @pytest.fixture(autouse=True)
@@ -1142,7 +1149,7 @@ class TestUnrepairableResidueIsPreserved:
         ``detect_for(value, param, schema_params)`` triple the scan asks, so
         the three sites agree BY CONSTRUCTION rather than coinciding. Here
         ``repair`` returned ``None``, so there is no ``Repair`` to read one off
-        at all and the guard publishes what ``_first_markup_argument``
+        at all and the guard publishes what ``_markup_arguments``
         actually matched on. Asserting
         the blanket ``detect`` here would name a literal that merely TRAILS
         the leak (PRD 2.2) and would disagree with the fact for the same
@@ -1151,7 +1158,7 @@ class TestUnrepairableResidueIsPreserved:
         The expectation is SPELLED, not computed by calling ``detect_for``
         here. An expectation derived from the predicate under test moves with
         it, so it can only ever catch a disagreement between
-        ``_first_markup_argument`` and ``detect_for`` — never a change to what
+        ``_markup_arguments`` and ``detect_for`` — never a change to what
         ``detect_for`` MEANS. Measured on this corpus specimen: the self-name
         closer sits at offset 459 and the blanket ``detect``'s answer at 471,
         so the widened value is the HEAD of the leak and the blanket one
@@ -1349,7 +1356,7 @@ class TestUnrepairableResidueIsPreserved:
         ``detect_for(value, param, schema_params)`` triple the scan asks, so
         the three sites agree BY CONSTRUCTION rather than coinciding. Here
         ``repair`` returned ``None``, so there is no ``Repair`` to read one off
-        at all and the guard publishes what ``_first_markup_argument``
+        at all and the guard publishes what ``_markup_arguments``
         actually matched on. Asserting
         the blanket ``detect`` here would name a literal that merely TRAILS
         the leak (PRD 2.2) and would disagree with the fact for the same
@@ -1358,7 +1365,7 @@ class TestUnrepairableResidueIsPreserved:
         The expectation is SPELLED, not computed by calling ``detect_for``
         here. An expectation derived from the predicate under test moves with
         it, so it can only ever catch a disagreement between
-        ``_first_markup_argument`` and ``detect_for`` — never a change to what
+        ``_markup_arguments`` and ``detect_for`` — never a change to what
         ``detect_for`` MEANS. Measured on this corpus specimen: the self-name
         closer sits at offset 459 and the blanket ``detect``'s answer at 471,
         so the widened value is the HEAD of the leak and the blanket one
@@ -1466,7 +1473,7 @@ class TestTheStormEscape:
 
         assert len(rig.queue.submitted) == 1
         filed = rig.queue.submitted[0]
-        assert filed.category == plan_tools._MARKUP_STORM_CATEGORY
+        assert filed.category == MARKUP_BOUNDARY_STORM_CATEGORY
         assert filed.task_id == plan_tools._MARKUP_STORM_ANCHOR_TASK_ID, (
             'the burst is a property of the SERVER window, not of one task '
             "payload — pinning the anchor is what makes the dedup lookup stable"
@@ -1547,7 +1554,7 @@ class TestTheStormEscape:
         assert markup_sink._recorded_subject(
             Escalation(
                 id='esc-x', task_id='t', agent_role='r', severity='blocking',
-                category=markup_sink.MARKUP_STORM_CATEGORY,
+                category=MARKUP_BOUNDARY_STORM_CATEGORY,
                 summary='s', detail='some other producer squatted the anchor',
                 worktree='/tmp/wt', level=1,
             )
@@ -1642,7 +1649,7 @@ class TestTheStormEscape:
             await rig.refuse('add_design_decision', {'decision': ABSORBED_RATIONALE})
 
         assert len(rig.queue.submitted) == 1
-        assert rig.queue.submitted[0].category == plan_tools._MARKUP_STORM_CATEGORY
+        assert rig.queue.submitted[0].category == MARKUP_BOUNDARY_STORM_CATEGORY
 
     @pytest.mark.asyncio
     async def test_a_storm_filing_failure_never_changes_the_refusal(
@@ -1844,7 +1851,7 @@ class TestTheStormEscape:
 
         filed = rig.queue.submitted[0]
         assert filed.task_id == plan_tools._MARKUP_STORM_ANCHOR_TASK_ID
-        assert filed.level == plan_tools._MARKUP_STORM_LEVEL
+        assert filed.level == markup_sink.MARKUP_STORM_LEVEL
         assert rig.queue.reads == [
             (plan_tools._MARKUP_STORM_ANCHOR_TASK_ID, 'pending')
         ]
@@ -1875,7 +1882,7 @@ class TestTheStormEscape:
 
         assert len(rig.queue.submitted) == 1
         filed = rig.queue.submitted[0]
-        assert filed.category == plan_tools._MARKUP_STORM_CATEGORY
+        assert filed.category == MARKUP_BOUNDARY_STORM_CATEGORY
         assert filed.summary.startswith(f'[{artifacts.worktree.name}] ')
 
 
@@ -1931,7 +1938,7 @@ class TestWhereTheRecordLands:
         this branch would silently file every record under the CWD.
         """
         monkeypatch.setattr(
-            plan_tools.subprocess, 'run',
+            subprocess, 'run',
             lambda *a, **k: subprocess.CompletedProcess(a, 0, stdout='  \n', stderr=''),
         )
 
@@ -2068,8 +2075,8 @@ class TestAnUnrecognisedRecordKindIsStillFiled:
         assert len(queue.submitted) == 1
         esc = queue.submitted[0]
         assert esc.id == esc_id
-        assert esc.category == plan_tools._ESCALATION_FALLBACK_CATEGORY
-        assert plan_tools._ESCALATION_FALLBACK_SUMMARY in esc.summary
+        assert esc.category == markup_sink.ESCALATION_FALLBACK_CATEGORY
+        assert plan_tools.MARKUP_SINK_SPEC.fallback_summary in esc.summary
         assert UNREPAIRABLE_DECISION in esc.detail, (
             'an unfamiliar record still carries a payload — filing it without '
             'that payload would discard the very thing worth keeping'

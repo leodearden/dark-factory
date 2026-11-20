@@ -1936,14 +1936,14 @@ class TestBuildDeflakeTaskArguments:
         which is exactly what θ's class-2 age backstop would then escalate on."""
         from orchestrator.flake_ledger import (
             RESPONSIBILITY_FIX_ROOT_DEFECT,
-            RESPONSIBILITY_REMOVE_FROM_LEDGER,
+            RESPONSIBILITY_KEEP_NODE_ID_STABLE,
             build_deflake_task_arguments,
         )
 
         description = build_deflake_task_arguments(_debt_row())['description']
 
         assert RESPONSIBILITY_FIX_ROOT_DEFECT in description
-        assert RESPONSIBILITY_REMOVE_FROM_LEDGER in description
+        assert RESPONSIBILITY_KEEP_NODE_ID_STABLE in description
 
     @staticmethod
     def _metadata(row) -> dict:
@@ -1972,7 +1972,7 @@ class TestBuildDeflakeTaskArguments:
             LIVE_DEPENDENCY_ROOT_DEFECT,
             NEVER_WIDEN_A_TIMEOUT,
             RESPONSIBILITY_FIX_ROOT_DEFECT,
-            RESPONSIBILITY_REMOVE_FROM_LEDGER,
+            RESPONSIBILITY_KEEP_NODE_ID_STABLE,
             DebtTrigger,
             build_deflake_task_arguments,
         )
@@ -1995,7 +1995,7 @@ class TestBuildDeflakeTaskArguments:
             *ctx.heads,
             *ctx.pass_ids,
             RESPONSIBILITY_FIX_ROOT_DEFECT,
-            RESPONSIBILITY_REMOVE_FROM_LEDGER,
+            RESPONSIBILITY_KEEP_NODE_ID_STABLE,
             NEVER_WIDEN_A_TIMEOUT,
             LIVE_DEPENDENCY_ROOT_DEFECT,
             LANE_TEST_NOT_ON_MERGE_GATE,

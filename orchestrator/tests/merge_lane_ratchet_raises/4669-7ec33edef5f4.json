@@ -1,0 +1,30 @@
+{
+  "task_id": "4669",
+  "reason": "Net-additive bug fix: rebase_onto_main now reports and records commits a rebase silently drops (rebase_drops.py), and the plan-files gate attributes an untouched plan file to a dropped commit instead of blaming the implementation; the reason assembly moved from workflow.py into gates.py.",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/gates.py",
+      "baseline": 356,
+      "current": 374
+    },
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/test_workflow.py",
+      "baseline": 151,
+      "current": 154
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5051,
+      "current": 5069
+    },
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6422,
+      "current": 6425
+    }
+  ]
+}

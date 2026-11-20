@@ -16,6 +16,7 @@ import tomllib
 from collections.abc import Callable
 from pathlib import Path
 
+import _checkout
 import pytest
 import source_measures
 from git_listing import git
@@ -1066,13 +1067,13 @@ class TestWorkspaceDomain:
         members = {member.name: member for member in source_measures.workspace_domain(root)}
         scripts = {f.path: f for f in members.pop('scripts').files}
         assert {path: f.extra_import_names for path, f in scripts.items()} == {
-            'scripts/legibility/y.py': ('y',),
+            'scripts/legibility/y.py': (),
             'scripts/local-model-serving/lms_z.py': ('lms_z',),
             'scripts/tests/test_x.py': (),
             'scripts/x.py': (),
         }
         assert {path: f.import_names for path, f in scripts.items()} == {
-            'scripts/legibility/y.py': ('legibility.y', 'y'),
+            'scripts/legibility/y.py': ('legibility.y',),
             'scripts/local-model-serving/lms_z.py': ('local-model-serving.lms_z', 'lms_z'),
             'scripts/tests/test_x.py': (),
             'scripts/x.py': ('x',),
@@ -1126,7 +1127,7 @@ class TestWorkspaceDomain:
         package = by_name['orchestrator']['orchestrator/src/orchestrator/__init__.py']
         assert package.import_name == 'orchestrator'
         census = by_name['scripts']['scripts/legibility/census.py']
-        assert census.import_names == ('legibility.census', 'census')
+        assert census.import_names == ('legibility.census',)
         serving = by_name['scripts']['scripts/local-model-serving/lms_ctl.py']
         assert (serving.import_name, serving.extra_import_names) == (
             'local-model-serving.lms_ctl',
@@ -1253,19 +1254,24 @@ class TestUniqueImportPaths:
     def test_each_name_maps_to_the_one_file_it_names(self, tmp_path: Path) -> None:
         domain = source_measures.workspace_domain(_domain_repo(tmp_path / 'repo'))
         paths = source_measures.unique_import_paths(domain, lambda f: f.import_names)
-        assert paths['legibility.y'] == paths['y'] == 'scripts/legibility/y.py'
+        assert paths['legibility.y'] == 'scripts/legibility/y.py'
+        assert 'y' not in paths
+        assert paths['lms_z'] == 'scripts/local-model-serving/lms_z.py'
         assert paths['alpha.sub.deep'] == 'alpha/src/alpha/sub/deep.py'
         assert 'test_x' not in paths
 
     def test_a_name_two_files_share_is_refused_naming_it_and_its_sorted_paths(
         self, tmp_path: Path
     ) -> None:
-        repo = _domain_repo(tmp_path / 'repo', tracked=(*_DOMAIN_TRACKED, 'scripts/y.py'))
+        repo = _domain_repo(tmp_path / 'repo', tracked=(*_DOMAIN_TRACKED, 'scripts/lms_z.py'))
         domain = source_measures.workspace_domain(repo)
         with pytest.raises(source_measures.MetricsError) as refused:
             source_measures.unique_import_paths(domain, lambda f: f.import_names)
-        assert "'y' names ['scripts/legibility/y.py', 'scripts/y.py']" in str(refused.value)
-        assert source_measures.unique_import_paths(domain, _primary_name)['y'] == 'scripts/y.py'
+        assert (
+            "'lms_z' names ['scripts/lms_z.py', 'scripts/local-model-serving/lms_z.py']"
+            in str(refused.value)
+        )
+        assert source_measures.unique_import_paths(domain, _primary_name)['lms_z'] == 'scripts/lms_z.py'
 
 
 def _workspace(*members: str) -> str:
@@ -1301,6 +1307,16 @@ def _stage_conflict(root: Path, relpath: str) -> None:
 #: A tree that is neither layout is refused naming both keys that would make it one.
 _NEITHER_LAYOUT = r'tool\.uv\.workspace.*\[project\]\.name'
 
+#: Workspace-table member lists the checkout reader refuses.
+_READER_REFUSED_MEMBER_LISTS = {
+    'no-members-key': '[tool.uv.workspace]\n',
+    'empty-members': _workspace(),
+    'members-not-a-list': '[tool.uv.workspace]\nmembers = "alpha"\n',
+    'non-string-member': '[tool.uv.workspace]\nmembers = ["alpha", 3]\n',
+    'empty-string-member': _workspace('alpha', ''),
+    'glob-member': _workspace('alpha', 'packages/*'),
+}
+
 
 class TestWorkspaceDomainFailsHard:
     """A domain that cannot be enumerated whole raises, never reads as partial."""
@@ -1321,12 +1337,6 @@ class TestWorkspaceDomainFailsHard:
             ),
             pytest.param('[project]\nname = ""\n', _NEITHER_LAYOUT, id='empty-project-name'),
             pytest.param('[project]\nname = 3\n', _NEITHER_LAYOUT, id='non-string-project-name'),
-            pytest.param(_workspace(), r'tool\.uv\.workspace', id='no-members'),
-            pytest.param(
-                '[tool.uv.workspace]\nmembers = ["alpha", 3]\n',
-                r'tool\.uv\.workspace',
-                id='non-string-member',
-            ),
             pytest.param(
                 _workspace('alpha', 'packages/*'), r"glob.*'packages/\*'", id='glob-member'
             ),
@@ -1351,6 +1361,21 @@ class TestWorkspaceDomainFailsHard:
         root = _domain_repo(tmp_path / 'repo', pyproject=pyproject)
         with pytest.raises(source_measures.MetricsError, match=pattern):
             source_measures.workspace_domain(root)
+
+    @pytest.mark.parametrize(
+        'pyproject',
+        _READER_REFUSED_MEMBER_LISTS.values(),
+        ids=_READER_REFUSED_MEMBER_LISTS.keys(),
+    )
+    def test_a_refused_member_list_carries_the_checkout_readers_reason(
+        self, tmp_path: Path, pyproject: str
+    ) -> None:
+        root = _domain_repo(tmp_path / 'repo', pyproject=pyproject)
+        with pytest.raises(_checkout.CheckoutBindingError) as read:
+            _checkout.workspace_members(root)
+        with pytest.raises(source_measures.MetricsError) as measured:
+            source_measures.workspace_domain(root)
+        assert str(read.value) in str(measured.value)
 
     def test_a_declared_member_with_no_tracked_python_is_refused(
         self, tmp_path: Path
@@ -1631,7 +1656,8 @@ def test_importing_the_layer_loads_no_consumer_and_no_tool() -> None:
     code = (
         'import sys\n'
         'import source_measures\n'
-        "print(sorted({'merge_lane_metrics', 'complexipy', 'radon'} & set(sys.modules)))\n"
+        "consumers = {'merge_lane_metrics', 'merge_lane_cluster', 'merge_lane_ratchet'}\n"
+        "print(sorted((consumers | {'complexipy', 'radon'}) & set(sys.modules)))\n"
     )
     proc = subprocess.run(
         [sys.executable, '-c', code],

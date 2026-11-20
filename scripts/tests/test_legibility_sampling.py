@@ -23,6 +23,8 @@ from legibility.detectors import AgentClass, SignalClass
 from legibility_carrier_fixtures import (
     PROSE_QUOTING_THE_SCHEMA,
     briefing_text,
+    census_synthesis_prompt,
+    census_verifier_prompt,
     coder_judgment,
     json_fenced,
 )
@@ -592,6 +594,12 @@ class TestReingestedContentIsNotScored:
         pytest.param([_assistant_texts(coder_judgment(_LITERAL_LINE))], id='coder_judgment'),
         pytest.param([_assistant_texts(json_fenced(coder_judgment(_LITERAL_LINE)))], id='json_fenced_coder_judgment'),
         pytest.param([_trickle_coder_prompt_turn()], id='trickle_coder_prompt'),
+        pytest.param(
+            [_user_turn(census_verifier_prompt(*_SIGNAL_LITERALS))], id='census_verifier_prompt',
+        ),
+        pytest.param(
+            [_user_turn(census_synthesis_prompt(_LITERAL_LINE))], id='census_synthesis_prompt',
+        ),
         pytest.param([_user_turn(briefing_text(_LITERAL_LINE))], id='briefing'),
         pytest.param(
             [_origin_stamped(_user_turn(_LITERAL_LINE), 'task-notification')],
@@ -698,15 +706,25 @@ class TestSamplerReingestedContentParity:
         assert {name: digested[name] for name in _TEXT_CLASSES} == dict.fromkeys(_TEXT_CLASSES, 0)
 
 
+def _trickle_coder_instrument_prompt() -> str:
+    return coder.build_prompt(digest_text='- (turn 1) ok', codebook_index='', invariant_slugs=())
+
+
 class TestLegibilityInstrumentStratum:
-    def test_an_instrument_session_with_signal_is_sampled_in_its_own_stratum(self, tmp_path):
+    @pytest.mark.parametrize(
+        'build_prompt',
+        [_trickle_coder_instrument_prompt, census_verifier_prompt, census_synthesis_prompt],
+        ids=['trickle_coder', 'census_verifier', 'census_synthesis'],
+    )
+    def test_an_instrument_session_with_signal_is_sampled_in_its_own_stratum(
+        self, tmp_path, build_prompt,
+    ):
         encoded = tmp_path / '-home-leo-src-dark-factory'
         encoded.mkdir()
-        coder_prompt = coder.build_prompt(
-            digest_text='- (turn 1) ok', codebook_index='', invariant_slugs=(),
-        )
         sessions = [
-            _session_on_disk(encoded, 'coder-run', [_user_turn(coder_prompt), _tool_error_record()]),
+            _session_on_disk(
+                encoded, 'instrument-run', [_user_turn(build_prompt()), _tool_error_record()],
+            ),
             _session_on_disk(encoded, 'interactive-run', [_clean_record(0), _not_found_record()]),
         ]
         config = _sampling_config()

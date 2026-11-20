@@ -18,9 +18,21 @@ from fused_memory.services.write_ops_retention import (
     run_periodic_write_ops_prune,
 )
 
-_KIND_TIME_RANGE_SEEK = (
-    'SEARCH write_ops USING INDEX idx_wo_kind_time (kind=? AND created_at>? AND created_at<?)'
+_KIND_TIME_SEEK_AND_WHY = (
+    'SEARCH write_ops USING INDEX idx_wo_kind_time (kind=? AND created_at>? AND created_at<?)',
+    'unless the (kind, created_at) seek is bounded on both sides, a batch re-walks every '
+    'row an earlier batch passed over, which measured 9.4 s cold in one statement on the '
+    'live journal',
 )
+_SEEK_AND_WHY_BY_HORIZON = {
+    'read': (
+        'SEARCH write_ops USING INDEX idx_wo_read_horizon_time (created_at>? AND created_at<?)',
+        'a kind_time seek visits every kept search row in range, which measured 40 s cold '
+        'on the live journal on 2026-11-17',
+    ),
+    'search': _KIND_TIME_SEEK_AND_WHY,
+    'write': _KIND_TIME_SEEK_AND_WHY,
+}
 
 
 @pytest_asyncio.fixture
@@ -40,11 +52,8 @@ async def test_every_prune_batch_seeks_between_its_resume_point_and_cutoff(journ
             ('2026-01-01T00:00:00+00:00', '2026-02-01T00:00:00+00:00', 1),
         ).fetchall()
     details = [row[3] for row in plan]
-    assert _KIND_TIME_RANGE_SEEK in details, (
-        f'the {horizon} batch plans as {details}. Unless the (kind, created_at) '
-        'seek is bounded on both sides, a batch re-walks every row an earlier batch '
-        'passed over, which measured 9.4 s cold in one statement on the live journal.'
-    )
+    expected_seek, why = _SEEK_AND_WHY_BY_HORIZON[horizon]
+    assert expected_seek in details, f'the {horizon} batch plans as {details}: {why}'
     assert not any('TEMP B-TREE' in detail for detail in details), (
         f'the {horizon} batch sorts instead of reading created_at order off the index'
     )
@@ -67,6 +76,35 @@ async def _seed(
 def _surviving_ids(journal: WriteJournal) -> set[str]:
     with contextlib.closing(sqlite3.connect(journal.db_path)) as conn:
         return {row[0] for row in conn.execute('SELECT id FROM write_ops')}
+
+
+def _null_operation(journal: WriteJournal, op_id: str) -> None:
+    with contextlib.closing(sqlite3.connect(journal.db_path)) as conn:
+        conn.execute('UPDATE write_ops SET operation = NULL WHERE id = ?', (op_id,))
+        conn.commit()
+
+
+@pytest.mark.asyncio
+async def test_a_read_with_no_operation_is_pruned_on_the_read_horizon(journal):
+    config = WriteJournalConfig(
+        read_retention_days=10, search_retention_days=1000, write_retention_days=1000
+    )
+    nameless_read = await _seed(
+        journal, operation='get_task', kind='read', success=False, age_days=20
+    )
+    _null_operation(journal, nameless_read)
+    search = await _seed(journal, operation='search', kind='read', age_days=20)
+    nameless_write = await _seed(journal, operation='add_memory', kind='write', age_days=20)
+    _null_operation(journal, nameless_write)
+
+    deleted = await prune_write_ops_pass(journal, config)
+
+    remaining = _surviving_ids(journal)
+    assert deleted == 1 and nameless_read not in remaining, (
+        'a read with a NULL operation matched neither the read nor the search '
+        'horizon, so it was kept forever'
+    )
+    assert {search, nameless_write} <= remaining
 
 
 @pytest.mark.asyncio
@@ -129,8 +167,7 @@ async def test_each_horizon_resumes_where_the_last_pass_drained_it(journal):
     behind = await _seed(journal, operation='get_task', kind='read', success=False, age_days=30)
 
     assert await prune_write_ops_pass(journal, config) == 0, (
-        'the second pass re-walked the range the first one drained; on the live '
-        'journal that range holds every kept search row, 9.4 s cold in one statement'
+        'the second pass re-walked the range the first one drained'
     )
     assert behind in _surviving_ids(journal)
 
@@ -144,24 +181,84 @@ async def test_each_horizon_resumes_where_the_last_pass_drained_it(journal):
         await restarted.close()
 
 
+@pytest.mark.parametrize(
+    ('dropped_index', 'seeded', 'config'),
+    [
+        (
+            write_journal.READ_HORIZON_INDEX,
+            {'operation': 'get_task', 'kind': 'read', 'success': False},
+            WriteJournalConfig(read_retention_days=10),
+        ),
+        (
+            write_journal.KIND_TIME_INDEX,
+            {'operation': 'search', 'kind': 'read'},
+            WriteJournalConfig(read_retention_days=10, search_retention_days=15),
+        ),
+    ],
+)
 @pytest.mark.asyncio
-async def test_a_pass_without_the_kind_time_index_fails_loudly_instead_of_scanning(
-    journal, caplog
+async def test_a_pass_without_its_horizon_index_fails_loudly_instead_of_scanning(
+    journal, caplog, dropped_index, seeded, config
 ):
-    aged = await _seed(journal, operation='get_task', kind='read', success=False, age_days=60)
+    aged = await _seed(journal, age_days=20, **seeded)
     with contextlib.closing(sqlite3.connect(journal.db_path)) as conn:
-        conn.execute('DROP INDEX idx_wo_kind_time')
+        conn.execute(f'DROP INDEX {dropped_index}')
 
     with caplog.at_level(logging.ERROR, logger=write_journal.__name__):
-        deleted = await prune_write_ops_pass(journal, WriteJournalConfig())
+        deleted = await prune_write_ops_pass(journal, config)
 
     assert deleted == 0 and aged in _surviving_ids(journal), (
-        'the prune deleted without idx_wo_kind_time, so it scanned the table'
+        f'the prune deleted without {dropped_index}, so it scanned the table'
     )
     assert any(
-        record.levelno == logging.ERROR and 'idx_wo_kind_time' in record.getMessage()
+        record.levelno == logging.ERROR and dropped_index in record.getMessage()
         for record in caplog.records
     ), 'the missing index must be named at ERROR'
+
+
+@pytest.mark.asyncio
+async def test_a_restart_rebuilds_a_missing_read_horizon_index(journal):
+    aged = await _seed(journal, operation='get_task', kind='read', success=False, age_days=20)
+    await journal.close()
+    with contextlib.closing(sqlite3.connect(journal.db_path)) as conn:
+        conn.execute('DROP INDEX idx_wo_read_horizon_time')
+
+    restarted = WriteJournal(journal.data_dir)
+    await restarted.initialize()
+    try:
+        assert await prune_write_ops_pass(restarted, WriteJournalConfig(read_retention_days=10)) == 1
+        assert aged not in _surviving_ids(restarted)
+    finally:
+        await restarted.close()
+
+
+@pytest.mark.asyncio
+async def test_a_restart_rebuilds_a_read_horizon_index_whose_predicate_is_stale(journal):
+    aged = await _seed(journal, operation='get_task', kind='read', success=False, age_days=20)
+    _null_operation(journal, aged)
+    await journal.close()
+    with contextlib.closing(sqlite3.connect(journal.db_path)) as conn:
+        conn.execute('DROP INDEX idx_wo_read_horizon_time')
+        conn.execute(
+            'CREATE INDEX idx_wo_read_horizon_time ON write_ops(created_at) '
+            "WHERE kind = 'read' AND operation <> 'search'"
+        )
+
+    restarted = WriteJournal(journal.data_dir)
+    await restarted.initialize()
+    try:
+        assert await prune_write_ops_pass(restarted, WriteJournalConfig(read_retention_days=10)) == 1, (
+            'the restart kept an index whose WHERE no longer matches the read '
+            "horizon's, so INDEXED BY had no query solution and every horizon halted"
+        )
+        assert aged not in _surviving_ids(restarted)
+        with contextlib.closing(sqlite3.connect(restarted.db_path)) as conn:
+            (index_sql,) = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE name = 'idx_wo_read_horizon_time'"
+            ).fetchone()
+        assert index_sql == write_journal.READ_HORIZON_INDEX_SQL
+    finally:
+        await restarted.close()
 
 
 @pytest.mark.asyncio

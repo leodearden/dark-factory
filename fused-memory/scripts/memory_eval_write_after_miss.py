@@ -55,6 +55,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -62,7 +63,7 @@ import sqlite3
 import sys
 from bisect import bisect_left
 from collections import Counter, defaultdict
-from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -88,6 +89,7 @@ from shared.memory_eval_metrics import (
 from shared.memory_eval_metrics import render_report as render_series_report
 
 from fused_memory.config.schema import FusedMemoryConfig
+from fused_memory.maintenance._utils import ServiceOpen, maintenance_service
 from fused_memory.models.enums import MEM0_PRIMARY, MemoryCategory
 from fused_memory.models.memory import MemoryResult
 from fused_memory.server.grouped_read import child_parent_id
@@ -96,7 +98,6 @@ from fused_memory.server.near_duplicate_guard import (
     find_near_duplicate_memory,
     resolve_near_dup_threshold,
 )
-from fused_memory.services.memory_service import MemoryService
 from fused_memory.services.read_telemetry import SEARCH_TELEMETRY_SCHEMA_VERSION
 from fused_memory.services.write_journal import WriteJournal
 
@@ -904,32 +905,32 @@ def _default_journal(config: FusedMemoryConfig) -> Path:
     return WriteJournal(data_dir if data_dir.is_absolute() else REPO_ROOT / data_dir).db_path
 
 
-MemoryFactory = Callable[[FusedMemoryConfig], Awaitable[Any]]
+MemoryOpener = Callable[[FusedMemoryConfig], contextlib.AbstractAsyncContextManager[Any]]
 
 
-async def open_memory(
-    config: FusedMemoryConfig,
-    *,
-    service: Callable[[FusedMemoryConfig], Any] = MemoryService,
-) -> Any:
-    """The live service ``main`` uses by default, opened for reads only. The caller closes it.
+@contextlib.asynccontextmanager
+async def open_memory(config: FusedMemoryConfig) -> AsyncIterator[Any]:
+    """The live service ``main`` uses by default, opened for reads only and closed on exit.
 
-    ``initialize_for_reads`` starts no durable write queue and runs no Graphiti
-    startup maintenance. The full ``initialize`` would reset the live server's
+    ``ServiceOpen.READS`` starts no durable write queue and runs no Graphiti
+    startup maintenance. The full opening would reset the live server's
     in-flight queued writes to pending and execute them from this process.
+    Only an error opening the store becomes MemoryStoreUnavailableError; the
+    caller's own errors pass through unchanged.
     """
-    memory = service(config)
-    try:
-        await memory.initialize_for_reads()
-    except (OSError, sqlite3.Error) as exc:
-        await memory.close()
-        raise MemoryStoreUnavailableError(
-            f'the memory store could not be opened ({type(exc).__name__}): {exc}'
-        ) from exc
-    return memory
+    async with contextlib.AsyncExitStack() as stack:
+        try:
+            _, memory = await stack.enter_async_context(
+                maintenance_service(config=config, open_as=ServiceOpen.READS),
+            )
+        except (OSError, sqlite3.Error) as exc:
+            raise MemoryStoreUnavailableError(
+                f'the memory store could not be opened ({type(exc).__name__}): {exc}'
+            ) from exc
+        yield memory
 
 
-async def _run(args: argparse.Namespace, open_memory: MemoryFactory) -> int:
+async def _run(args: argparse.Namespace, open_memory: MemoryOpener) -> int:
     if args.config:
         os.environ['CONFIG_PATH'] = str(args.config)
     stamp = run_stamp()
@@ -940,8 +941,7 @@ async def _run(args: argparse.Namespace, open_memory: MemoryFactory) -> int:
     config = FusedMemoryConfig()
     journal_path = Path(args.journal) if args.journal else _default_journal(config)
     window = read_journal(journal_path, project_id=args.project_id, period=period)
-    memory = await open_memory(config)
-    try:
+    async with open_memory(config) as memory:
         outcome = await produce_write_after_miss(
             window,
             memory,
@@ -951,13 +951,11 @@ async def _run(args: argparse.Namespace, open_memory: MemoryFactory) -> int:
             period=period,
             eval_id=args.eval_id,
         )
-    finally:
-        await memory.close()
     print(outcome.report, end='')
     return 0
 
 
-def main(argv: Sequence[str] | None = None, *, open_memory: MemoryFactory = open_memory) -> int:
+def main(argv: Sequence[str] | None = None, *, open_memory: MemoryOpener = open_memory) -> int:
     """Exit non-zero on an unreadable journal, so the runner files a produce failure."""
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
     args = build_parser().parse_args(argv)

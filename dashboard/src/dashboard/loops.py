@@ -15,8 +15,9 @@ quality.db is outside the retention policy, so its loop never does.
 ``_BurndownStore``, ``_MetricsStore`` and ``_QualityStore`` live here rather
 than in ``app.py`` because they are these loops' writable stores — the loops
 are their only writer, and the migration a store performs on ``open()``
-exists so its loop can run. ``app.py``'s ``lifespan`` constructs all three
-and spawns the loops, importing the six names back.
+exists so its loop can run. ``app.py``'s ``lifespan`` constructs the three
+stores, and ``dashboard/src/dashboard/background_loops.py`` binds the three
+loops into ``PRODUCTION_LOOPS``.
 
 Those names carry a leading underscore from when burndown and metrics
 lived in one file with the app, and the quality pair follows suit; all six

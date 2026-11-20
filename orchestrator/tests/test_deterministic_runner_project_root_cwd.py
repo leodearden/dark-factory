@@ -179,7 +179,7 @@ class TestBeforeDoneRunsUnderConfiguredProjectRoot:
 
         assert outcome == WorkflowOutcome.DONE
         assert marker.read_text().strip() == str(project_root.resolve())
-        assert _done_provenance_kind(scheduler) == 'deterministic-deploy'
+        assert _done_provenance_kind(scheduler) == 'deterministic-deploy-unverified'
 
     async def test_predicate_runs_relative_script_in_project_root(
         self, project_root: Path, elsewhere: Path, marker: Path, queue: EscalationQueue,
@@ -646,4 +646,4 @@ class TestRefusedBeforeDoneIsANamedInfraIssue:
 
         assert outcome == WorkflowOutcome.DONE
         assert marker.read_text().strip() == str(project_root.resolve())
-        assert _done_provenance_kind(scheduler) == 'deterministic-deploy'
+        assert _done_provenance_kind(scheduler) == 'deterministic-deploy-unverified'

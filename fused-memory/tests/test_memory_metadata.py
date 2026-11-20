@@ -13,13 +13,19 @@ from pathlib import Path
 
 import pytest
 from _fm_helpers import load_script_module
+from orchestrator.completion_record import completion_record_metadata
 
 from fused_memory.config.schema import _default_topic_guard_clusters
 from fused_memory.memory_metadata import (
     KIND_REGISTRY,
+    ORCHESTRATOR_COMPLETION_SOURCE,
+    TARGETED_RECONCILIATION_SOURCE,
     TOPIC_SLUG_MAX_LEN,
     TOPIC_SLUG_RE,
     MemoryMetadataValidationError,
+    is_completion_record,
+    is_orchestrator_completion_record,
+    is_reconciliation_completion_echo,
     normalize_supersedes,
 )
 
@@ -42,24 +48,14 @@ from fused_memory.memory_metadata import (
 #: at the frozen projection restores the stated intent — the assertions
 #: below pin the literal against the census it was actually derived from.
 #:
-#: WHAT THIS DELIBERATELY GIVES UP, AND WHERE IT WENT.  The live-artifact
-#: read doubled as a drift tripwire ("census artifact changed — re-derive
-#: the registry").  It fired correctly on 4006's first live run: the live
-#: corpus moved 329 → 385 distinct ``kind`` values (+70 new, −14 gone), so
-#: ``KIND_REGISTRY`` IS materially stale against today's corpus.  That is
-#: not lost — it is handed to leaf β's owner as a reviewed re-derivation
-#: (with the removal policy the −14 need, and the question of whether a
-#: live-artifact drift check should exist at all), filed as ticket
-#: **tkt_0RSH6HFNT4YWRX20663ZGJ9YGZ** carrying the measured deltas and all
-#: three open decisions.  Naming the ticket is the point: without it this
-#: note records a known-stale registry with no traceable owner, and no test
-#: will ever notice further drift now that the tripwire is gone.  (A ticket,
-#: not a task id — the curator files asynchronously, so the resulting task
-#: is found by searching that ticket, not by a number predicted here.)
-#: It is not urgent:
-#: ``memory_metadata.enforce_kind_registry`` ships default **False** and is
-#: deliberately kept off (PRD §10 open question 1 — 242 of 329 measured
-#: values are singletons), so a stale registry rejects no live write.
+#: WHAT THIS GAVE UP, AND WHERE IT WENT.  The live-artifact read doubled as
+#: a drift tripwire, and it fired correctly on 4006's first live run (329 →
+#: 385 distinct ``kind`` values).  The reviewed re-derivation it called for
+#: happened as task 5266, which ruled PRD §10 open question 1 option (b):
+#: this oracle stays frozen as the derivation pin, ``KIND_REGISTRY`` stays
+#: frozen and append-only, and the drift this frozen fixture stopped
+#: surfacing is reported nightly in the census report's
+#: ``kind_registry_drift`` block.
 #: Do NOT regenerate the fixture to make these tests go green; that would
 #: ratify agent-invented free-text kinds into a normative closed registry
 #: without the review PRD D3 requires.
@@ -153,7 +149,7 @@ class TestTopicSlug:
 
         over = 'a' * (TOPIC_SLUG_MAX_LEN + 1)
         assert TOPIC_SLUG_RE.match(over), 'the regex alone must NOT reject it'
-        violations = validate_memory_metadata({'topic': over}, enforce_kind_registry=False)
+        violations = validate_memory_metadata({'topic': over})
         assert {v.code for v in violations} == {'invalid_topic_slug'}
 
     def test_max_len_is_100(self):
@@ -245,8 +241,8 @@ class TestKindRegistry:
     #: cleanup_count_snapshots.py:210); two do not (see the registry's
     #: block 2 comments).  All five are retained regardless:
     #: grandfathering means "what is written", not only "what survives"
-    #: an aging sweep, and excluding them would reject in-repo code the
-    #: moment `enforce_kind_registry` flips.
+    #: an aging sweep, and the registry is append-only (see its comment
+    #: block).
     ZERO_RECORD_IN_REPO_KINDS = frozenset({
         'stage1_flag_marker',
         'project_status_correction',
@@ -265,8 +261,8 @@ class TestKindRegistry:
         assert all(isinstance(value, str) for value in KIND_REGISTRY)
 
     def test_superset_of_every_census_measured_value(self):
-        """Every kind that exists live must be grandfathered — otherwise
-        flipping `enforce_kind_registry` rejects live writers."""
+        """Every kind the derivation census measured stays a member: the
+        registry is append-only, so no measured value is ever removed."""
         measured = set(_census_kind_values())
         missing = measured - KIND_REGISTRY
         assert not missing, f'census-measured kinds absent from the registry: {sorted(missing)}'
@@ -834,16 +830,16 @@ def _by_key(violations, key):
 class TestValidateMemoryMetadata:
     """Pure shape checks (leaf β owns SHAPES ONLY).
 
-    Signature: ``validate_memory_metadata(meta, *, enforce_kind_registry)``
+    Signature: ``validate_memory_metadata(meta)``
     -> ``list[MetadataViolation]``.  It mutates *meta* in place ONLY to
     normalize `supersedes`, mirroring `parse_metadata`'s (value, warnings)
     contract: the caller owns the warn-vs-reject decision.
     """
 
-    def _validate(self, meta, *, enforce_kind_registry=False):
+    def _validate(self, meta):
         from fused_memory.memory_metadata import validate_memory_metadata
 
-        return validate_memory_metadata(meta, enforce_kind_registry=enforce_kind_registry)
+        return validate_memory_metadata(meta)
 
     # -- valid path ------------------------------------------------------
 
@@ -970,12 +966,7 @@ class TestValidateMemoryMetadata:
             'a non-bool canonical is a TYPE defect; canonical_without_topic is '
             'reserved for a genuine `is True`, per §2b\'s isinstance-not-truthiness rule'
         )
-        codes = _codes(
-            self._validate(
-                {'canonical': True, 'kind': 'not_in_registry_xyz'},
-                enforce_kind_registry=True,
-            )
-        )
+        codes = _codes(self._validate({'canonical': True, 'kind': 'not_in_registry_xyz'}))
         assert codes == {'canonical_without_topic', 'unknown_kind'}, (
             'unrelated violations must still be reported alongside, in one pass'
         )
@@ -985,28 +976,13 @@ class TestValidateMemoryMetadata:
     def test_known_kind_accepted(self):
         assert self._validate({'kind': 'cycle_summary'}) == []
 
-    def test_unknown_kind_is_fatal_when_registry_enforced(self):
-        violations = self._validate(
-            {'kind': 'not_in_registry_xyz'}, enforce_kind_registry=True
-        )
-        assert len(violations) == 1
-        assert violations[0].code == 'unknown_kind'
-        assert violations[0].fatal is True
-        assert 'KIND_REGISTRY' in violations[0].message
-
-    def test_unknown_kind_still_censuses_when_registry_not_enforced(self):
-        """Same violation CODE, but non-fatal: it censuses, it does not reject.
-
-        This is the census-refuted-premise carve-out (PRD D3 amendment):
-        242 of 329 live kinds are singletons, so day-one rejection would
-        break the live fleet.
-        """
-        violations = self._validate(
-            {'kind': 'not_in_registry_xyz'}, enforce_kind_registry=False
-        )
+    def test_unknown_kind_censuses_and_is_never_fatal(self):
+        """PRD §10 OQ1 ruled option (b): `kind` membership is a census axis that only warns."""
+        violations = self._validate({'kind': 'not_in_registry_xyz'})
         assert len(violations) == 1
         assert violations[0].code == 'unknown_kind'
         assert violations[0].fatal is False
+        assert 'KIND_REGISTRY' in violations[0].message
 
     def test_non_str_kind(self):
         assert _codes(self._validate({'kind': 42})) == {'invalid_kind_type'}
@@ -1115,7 +1091,7 @@ class TestValidateMemoryMetadata:
             'supersedes': [42],
             'weird_key': 1,
         }
-        violations = self._validate(meta, enforce_kind_registry=True)
+        violations = self._validate(meta)
         assert _codes(violations) == {
             'invalid_topic_slug',
             'invalid_canonical_type',
@@ -1159,20 +1135,20 @@ class TestValidateMemoryMetadata:
         assert all(v.fatal is True for v in violations)
 
     @pytest.mark.parametrize(
-        ('meta', 'kwargs', 'code'),
+        ('meta', 'code'),
         [
-            ({'weird_key': 1}, {}, 'unknown_key'),
-            ({'kind': 'not_in_registry_xyz'}, {}, 'unknown_kind'),
+            ({'weird_key': 1}, 'unknown_key'),
+            ({'kind': 'not_in_registry_xyz'}, 'unknown_kind'),
         ],
     )
-    def test_census_only_violations_are_not_fatal(self, meta, kwargs, code):
-        """The two census axes never reject under the shipped defaults.
+    def test_census_only_violations_are_not_fatal(self, meta, code):
+        """The two census axes never reject.
 
         `unknown_key` is census-only by design (1,627 distinct live keys);
-        `unknown_kind` is non-fatal unless `enforce_kind_registry` is on,
-        because leaf alpha measured D3's closed-registry premise false.
+        `unknown_kind` is census-only unconditionally (PRD §10 OQ1, option
+        (b)), because D3's closed-registry premise was measured false.
         """
-        violations = [v for v in self._validate(meta, **kwargs) if v.code == code]
+        violations = [v for v in self._validate(meta) if v.code == code]
         assert violations, f'expected a {code} violation'
         assert all(v.fatal is False for v in violations)
 
@@ -1283,3 +1259,68 @@ class TestCanonicalRoutingRule:
     # code.  A dedicated test would pin call shape rather than behaviour and
     # add nothing the siblings do not already catch.  The reason it is sync
     # while `_check_canonical_uniqueness` is async is in its docstring.
+
+
+class TestCompletionRecordRegistry:
+    """``is_completion_record`` answers: is this record ABOUT its metadata.task_id?"""
+
+    ORCHESTRATOR_RECORD = completion_record_metadata('4102')
+    LEGACY_ORCHESTRATOR_RECORD = {'task_id': '4102', 'source': ORCHESTRATOR_COMPLETION_SOURCE}
+    RECONCILIATION_ECHO = {
+        'source': TARGETED_RECONCILIATION_SOURCE, 'task_id': '5', 'transition': 'done',
+    }
+
+    @pytest.mark.parametrize(
+        'meta',
+        [ORCHESTRATOR_RECORD, LEGACY_ORCHESTRATOR_RECORD, RECONCILIATION_ECHO],
+        ids=['orchestrator', 'legacy-unkinded-orchestrator', 'reconciliation-echo'],
+    )
+    def test_a_registered_completion_record_counts(self, meta):
+        assert is_completion_record(meta) is True
+
+    @pytest.mark.parametrize(
+        'meta',
+        [
+            {'task_id': '5'},
+            {
+                'source': TARGETED_RECONCILIATION_SOURCE, 'task_id': '5',
+                'verification_verdict': 'confirmed',
+            },
+            {'source': TARGETED_RECONCILIATION_SOURCE, 'task_id': '5', 'transition': 'blocked'},
+            {'kind': 'task_completion', 'task_id': '5'},
+            {},
+        ],
+        ids=[
+            'bare-task-id', 'verification-verdict-note', 'echo-source-not-done',
+            'agent-written-kind-only', 'empty',
+        ],
+    )
+    def test_anything_else_does_not_count(self, meta):
+        assert is_completion_record(meta) is False
+
+    @pytest.mark.parametrize(
+        ('meta', 'expected'),
+        [
+            (ORCHESTRATOR_RECORD, True),
+            (LEGACY_ORCHESTRATOR_RECORD, True),
+            (RECONCILIATION_ECHO, False),
+            ({'task_id': '5'}, False),
+            ({}, False),
+        ],
+        ids=['orchestrator', 'legacy', 'echo', 'bare-task-id', 'empty'],
+    )
+    def test_the_orchestrator_only_predicate_is_unchanged(self, meta, expected):
+        assert is_orchestrator_completion_record(meta) is expected
+
+    @pytest.mark.parametrize(
+        ('meta', 'expected'),
+        [
+            (RECONCILIATION_ECHO, True),
+            ({'source': TARGETED_RECONCILIATION_SOURCE, 'verification_verdict': 'confirmed'}, False),
+            ({'source': 'stage2', 'transition': 'done'}, False),
+            (ORCHESTRATOR_RECORD, False),
+        ],
+        ids=['echo', 'verification-verdict-note', 'other-source-done', 'orchestrator'],
+    )
+    def test_the_echo_predicate_tells_the_echo_from_the_reconcilers_other_notes(self, meta, expected):
+        assert is_reconciliation_completion_echo(meta) is expected

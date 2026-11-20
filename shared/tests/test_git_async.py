@@ -30,6 +30,7 @@ from typing import Any
 from unittest import mock
 
 import pytest
+from _pidfd_kernel import needs_group_pidfd_signals
 from df_pytest_isolation import PIPE_CLOSING_LEAKER_SRC, read_leaked_pid, wait_pid_gone
 
 from shared.git_async import MAX_CONCURRENT_SPAWNS, GitResult, run_git
@@ -509,6 +510,50 @@ async def test_own_timeout_kills_a_backgrounded_grandchild(
 
         assert await asyncio.to_thread(wait_pid_gone, leaked_pid, timeout=run_timeout + 5.0), (
             f'pid {leaked_pid}, a backgrounded grandchild, survived a timed-out run_git'
+        )
+        result = await task
+        assert result.timed_out
+    finally:
+        _abandon(task, leaked_pid)
+
+
+_EXITING_LEADER_SRC = (
+    'sleep 300 &\n'
+    'echo $! > "$LEAK_PIDFILE"\n'
+    'echo $$ > "$LEADER_PIDFILE"\n'
+    'read _\n'
+)
+
+
+@needs_group_pidfd_signals
+async def test_own_timeout_kills_a_helper_left_by_a_leader_that_already_exited(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stdin is piped so the leader, blocked in ``read``, is provably alive when
+    run_git takes its pidfd; it then exits and is reaped, its helper holding the pipes."""
+    script = tmp_path / 'exiting_leader.sh'
+    script.write_text(_EXITING_LEADER_SRC)
+    monkeypatch.setenv('LEAK_PIDFILE', str(tmp_path / 'leaked.pid'))
+    monkeypatch.setenv('LEADER_PIDFILE', str(tmp_path / 'leader.pid'))
+    run_timeout = 3.0
+    task = asyncio.ensure_future(
+        run_git(['sh', str(script)], input_text='go\n', timeout=run_timeout)
+    )
+    leaked_pid = None
+    try:
+        leaked_pid = await asyncio.to_thread(read_leaked_pid, tmp_path / 'leaked.pid')
+        leader_pid = await asyncio.to_thread(read_leaked_pid, tmp_path / 'leader.pid')
+
+        while read_stat_fields(Path('/proc') / str(leader_pid), skip_malformed=True) is not None:
+            await asyncio.sleep(0.05)
+        assert not task.done() and not wait_pid_gone(leaked_pid, timeout=0), (
+            f'leader pid {leader_pid} was reaped only once run_git had timed out and killed '
+            'its group, so the kill reached a live leader and this test would prove nothing'
+        )
+
+        assert await asyncio.to_thread(wait_pid_gone, leaked_pid, timeout=run_timeout + 5.0), (
+            f'pid {leaked_pid}, a helper left holding the pipes by a leader that had already '
+            'exited and been reaped, survived a timed-out run_git'
         )
         result = await task
         assert result.timed_out

@@ -9,7 +9,9 @@ handlers make from it, and :func:`open_fleet_client` points the real app at
 it. Only the seams are faked: the ``mcp_tool_call`` binding in every module
 that imported it, and the ``ps`` scan that discovers running orchestrators.
 Every shaper above them is the production one, so a field added to a row
-shows up here as bytes.
+shows up here as bytes. A request in :data:`_UNLANDED_BY_PATH` is measured as
+a polled dashboard serves it: :func:`get_landed` re-requests it until every
+read its route waits on has landed.
 
 Content is deterministic ASCII filler at the census lengths. Two runs serve
 byte-identical rows; only the instants the app stamps itself vary, and those
@@ -20,12 +22,12 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import time
 from collections import Counter
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
-from functools import partial
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import ModuleType
@@ -62,6 +64,7 @@ from _runs_db_fixture import runs_db_path
 from _served_reads import forget_served_reads
 from _tasks_db_fixture import task_row, write_tasks_db
 from fastapi.testclient import TestClient
+from httpx import Response
 from shared.project_id import normalize_project_id, project_id_for_root
 from shared.quality_series.git_lines import ModuleLines
 from shared.quality_series.landings import GitCrossCheck
@@ -71,13 +74,15 @@ from shared.task_statuses import TERMINAL, TaskStatus
 import dashboard.app
 from dashboard.config import DashboardConfig
 from dashboard.data import task_lookup
-from dashboard.data.escalation_corpus import corpus_queues, reconciliation_queue, serve_corpus
+from dashboard.data.datum import DatumState
+from dashboard.data.escalation_corpus import corpus_queues, reconciliation_queue
 from dashboard.data.memory import mcp_tool_call
 from dashboard.data.orchestrator import find_running_orchestrators
 from dashboard.data.quality_snapshots import BASELINE_HOME, ComputedDiff, DiffState, RootScan
 from dashboard.data.quality_store import QualitySample, write_snapshot_scan
 from dashboard.data.scheduler import _scheduler_cache_clear
 from dashboard.loops import _QualityStore
+from dashboard.payload_budgets import EndpointBudget
 
 
 @dataclass(frozen=True)
@@ -112,6 +117,10 @@ class RootCensus:
     trains: int = 0
     prds: int = 1
 
+    @property
+    def holds_tasks(self) -> bool:
+        return any(self.active.values()) or any(self.terminal.values())
+
 
 @dataclass(frozen=True)
 class QualityShape:
@@ -128,30 +137,36 @@ class FleetCensus:
     """The population the payload budgets were measured against.
 
     PROVENANCE. The budgets in ``payload_budgets.json`` were set on 2026-10-15
-    from live measurements (task 5824, pre-1). The ACTIVE row counts here are
-    that day's: 4,951 rows, pending 4,304, deferred 527, in-progress 88,
-    blocked 30, merge-deferred 2, and 8,278 scheduler modules. The pre-1
-    iteration log did not survive, so the per-root split, the terminal totals
-    and the per-row shapes were re-measured against the live dashboard on
-    2026-10-21 (5,335 active rows):
+    from live measurements (task 5824, pre-1). The active and terminal counts,
+    module pools, dependency densities and merge-cap fill here were re-measured
+    live on 2026-11-15 (task 10139): 7,245 active rows across 12 projects
+    (dark-factory 3,635, reify 2,760) and 10,743 scheduler modules. The fleet
+    titles 11 dependencies in 12, so the densities seed 9,883 dependencies to
+    match live's titled ones (9,043 of 11,623); the rest are id-only
+    references to finished tasks. The per-row shapes were measured against
+    the live dashboard on 2026-10-21 (5,335 active rows):
 
     * titles average 120 characters, ``meta_files`` 5.5 paths of 43;
-    * 1.12 dependencies per row, 92% of them on another active row (titled);
     * 36% of rows name a PRD of 45 characters; 1.1% carry an external dep;
     * 480 held modules, 9 parked tasks, 8 skipped, 17 pinned, 7 recovery
       events in the last hour;
     * the 2026-09-23 per-field accounting put a task description at about
-      2,600 characters (``description`` is not shaped into a task row, but
-      escalation cards embed it).
+      2,600 characters (no budgeted payload ships it: task rows and
+      escalation cards carry no prose).
 
     The sampled and billed histories were measured live on 2026-10-21, and
     the fleet serves each within a few percent of it:
 
     * costs (110,596 bytes at ``window=all``): spend on 189 of the 3,650
       days, 23 (model, role) pairs, 9 accounts, the 200-event cap full;
-    * burndown (989,413 at ``window=90d``): the store reaches back 31 days
-      but holds gap rows, so a root's series averages 1,328 MEASURED rows;
-      the payload scales with that count, not the span;
+    * burndown (950,875 at ``window=90d``, re-measured 2026-11-17 by task
+      6991 once per-project labels became ``label_spans``): 12 projects
+      averaging 1,958 MEASURED rows (1,177 to 2,164) over a union of 2,661
+      labels; the payload scales with that count, not the span. The fleet
+      seeds 2,040 rows per root and serves 952,121. Its union is shorter
+      (2,384 labels), so it needs about 4% more rows per root than live to
+      reach the same bytes. Every third hourly row of the odd roots sits one
+      tick early, so each root's row is about 345 spans (live: 30 to 470);
     * recon (35,216): 50 runs listed, 24 writing agents, 400 buffered events;
     * memory (41,065): 173 memory projects, 18 WAL stores, a day of samples;
     * curator (17,057): no pending tickets, every account capped all day;
@@ -214,71 +229,82 @@ CENSUS = FleetCensus(
         RootCensus(
             'dark-factory',
             {
-                TaskStatus.PENDING: 1465, TaskStatus.DEFERRED: 293, TaskStatus.IN_PROGRESS: 24,
-                TaskStatus.BLOCKED: 6, TaskStatus.MERGE_DEFERRED: 2,
+                TaskStatus.PENDING: 3346, TaskStatus.DEFERRED: 255, TaskStatus.IN_PROGRESS: 24,
+                TaskStatus.BLOCKED: 10,
             },
-            {TaskStatus.DONE: 4929, TaskStatus.CANCELLED: 396},
-            files_per_row=5, modules=2792, deps_per_100_rows=25,
+            {TaskStatus.DONE: 5951, TaskStatus.CANCELLED: 601},
+            files_per_row=5, modules=4704, deps_per_100_rows=63,
             parked=5, skipped=4, pinned=17, recovery_events=1,
             pending_escalations=12, resolved_escalations=1968,
             completed_hours=1555, claimed_terminal=40, merges=600, trains=50, prds=119,
         ),
         RootCensus(
             'reify',
-            {TaskStatus.PENDING: 2095, TaskStatus.DEFERRED: 223, TaskStatus.IN_PROGRESS: 23},
-            {TaskStatus.DONE: 6076, TaskStatus.CANCELLED: 772},
-            files_per_row=5, modules=3775, deps_per_100_rows=131, parked=4, skipped=4,
+            {TaskStatus.PENDING: 2526, TaskStatus.DEFERRED: 218, TaskStatus.IN_PROGRESS: 16},
+            {TaskStatus.DONE: 6445, TaskStatus.CANCELLED: 786},
+            files_per_row=5, modules=4181, deps_per_100_rows=201, parked=4, skipped=4,
             pending_escalations=4, resolved_escalations=8658,
             completed_hours=2123, claimed_terminal=37, merges=600, trains=4, prds=110,
         ),
         RootCensus(
             'solar-challenge-platform',
-            {TaskStatus.PENDING: 499, TaskStatus.IN_PROGRESS: 18, TaskStatus.BLOCKED: 9},
-            {TaskStatus.DONE: 715, TaskStatus.CANCELLED: 94},
-            files_per_row=8, modules=1255, deps_per_100_rows=247,
+            {TaskStatus.PENDING: 563, TaskStatus.BLOCKED: 13},
+            {TaskStatus.DONE: 1242, TaskStatus.CANCELLED: 106},
+            files_per_row=8, modules=1327, deps_per_100_rows=233,
             pending_escalations=31, resolved_escalations=1380,
             completed_hours=529, merges=400, prds=37,
         ),
         RootCensus(
             'solar-challenge',
-            {TaskStatus.PENDING: 200, TaskStatus.IN_PROGRESS: 20, TaskStatus.BLOCKED: 3},
-            {TaskStatus.DONE: 658, TaskStatus.CANCELLED: 133},
-            files_per_row=8, modules=354, deps_per_100_rows=270, recovery_events=6,
+            {TaskStatus.PENDING: 165, TaskStatus.BLOCKED: 2},
+            {TaskStatus.DONE: 1118, TaskStatus.CANCELLED: 146},
+            files_per_row=8, modules=380, deps_per_100_rows=296, recovery_events=6,
             pending_escalations=8, resolved_escalations=633,
             completed_hours=397, merges=400, prds=23,
         ),
         RootCensus(
             'scoping-intake',
-            {TaskStatus.PENDING: 45, TaskStatus.IN_PROGRESS: 3},
-            {TaskStatus.DONE: 50, TaskStatus.CANCELLED: 3},
-            files_per_row=5, modules=88, deps_per_100_rows=181,
+            {TaskStatus.PENDING: 22},
+            {TaskStatus.DONE: 924, TaskStatus.CANCELLED: 15},
+            files_per_row=5, modules=46, deps_per_100_rows=455,
             pending_escalations=0, resolved_escalations=67,
-            completed_hours=32, merges=51, prds=2,
+            completed_hours=32, merges=300, prds=2,
         ),
         RootCensus(
             'know-live',
-            {TaskStatus.DEFERRED: 10, TaskStatus.BLOCKED: 6},
-            {TaskStatus.DONE: 594, TaskStatus.CANCELLED: 2},
-            files_per_row=2, modules=10, deps_per_100_rows=214,
+            {TaskStatus.DEFERRED: 10, TaskStatus.BLOCKED: 1},
+            {TaskStatus.DONE: 599, TaskStatus.CANCELLED: 2},
+            files_per_row=2, modules=14, deps_per_100_rows=273,
             pending_escalations=14, resolved_escalations=13,
             completed_hours=113, merges=300,
         ),
         RootCensus(
-            'pump-web-ui', {TaskStatus.BLOCKED: 5}, {TaskStatus.DONE: 14, TaskStatus.CANCELLED: 1},
-            files_per_row=1, modules=2,
+            'pump-web-ui',
+            {TaskStatus.PENDING: 54, TaskStatus.BLOCKED: 3},
+            {TaskStatus.DONE: 71, TaskStatus.CANCELLED: 2},
+            files_per_row=3, modules=61, deps_per_100_rows=44,
             pending_escalations=11,
-            completed_hours=13, merges=15,
+            completed_hours=13, merges=70,
         ),
         RootCensus(
             'autopilot-video',
-            {TaskStatus.DEFERRED: 1, TaskStatus.BLOCKED: 1},
-            {TaskStatus.DONE: 615, TaskStatus.CANCELLED: 37},
+            {TaskStatus.DEFERRED: 1},
+            {TaskStatus.DONE: 616, TaskStatus.CANCELLED: 37},
             files_per_row=1, modules=2,
             pending_escalations=4, resolved_escalations=7,
             completed_hours=58, merges=250,
         ),
         RootCensus('autotrade', {}, {}, orchestrator_running=False),
         RootCensus('mission-control', {}, {}, orchestrator_running=False),
+        RootCensus(
+            'stream-touch',
+            {TaskStatus.PENDING: 4, TaskStatus.BLOCKED: 3, TaskStatus.DEFERRED: 9},
+            {TaskStatus.DONE: 481, TaskStatus.CANCELLED: 13},
+            files_per_row=2, modules=28, deps_per_100_rows=206,
+            pending_escalations=3, resolved_escalations=247,
+            completed_hours=238, merges=250,
+        ),
+        RootCensus('market-predictor', {}, {TaskStatus.CANCELLED: 1}, orchestrator_running=False),
     ),
     title_len=120,
     description_len=2600,
@@ -316,7 +342,7 @@ CENSUS = FleetCensus(
         account_events=30,
         cap_reason_len=80,
     ),
-    burndown=BurndownShape(samples_per_root=1330, concurrency_cap=24),
+    burndown=BurndownShape(samples_per_root=2040, concurrency_cap=24, misaligned_hour_every=3),
     memory=MemoryShape(
         projects=173, project_id_len=21, graphiti_nodes=132_790, mem0_memories=85_425,
         wal_stores=(
@@ -450,8 +476,9 @@ class _TreeBuilder:
         self, task_id: int, status: TaskStatus, *,
         files: list[str], dependencies: list[int], prd: str | None = None, external: bool = False,
     ) -> dict[str, Any]:
-        # 'notes' stands for every metadata key no row shaper reads; escalation
-        # cards embed the whole metadata, so its size is theirs.
+        # 'notes' stands for every metadata key no row shaper reads. No
+        # budgeted payload ships them, so a shaper that starts shipping whole
+        # metadata grows the sweep by their size.
         metadata: dict[str, Any] = {'files': files, 'notes': self._notes}
         if prd:
             metadata['prd'] = prd
@@ -938,20 +965,74 @@ def _bindings_of(target: object, name: str, known: frozenset[str]) -> list[Modul
     return found
 
 
-def _land_corpus_walk(client: TestClient, config: DashboardConfig) -> None:
-    """Walk the escalation corpus once in the app's own loop, unbounded, as a running dashboard has.
+def _unlanded_prd_views(payload: Mapping[str, Any], fleet: FleetCensus) -> dict[str, str]:
+    """Each root the census populates whose served ``PRD_VIEW`` is not yet fresh, as ``state: reason``."""
+    views = payload['PRD_VIEW']
+    populated = (root.label for root in fleet.roots if root.holds_tasks)
+    return {
+        label: f"{views[label]['state']}: {views[label]['reason']}"
+        for label in populated if views[label]['state'] != DatumState.FRESH
+    }
 
-    ``/prds`` waits
-    ``dashboard/src/dashboard/api/prds.py::REQUEST_READS_WAIT_SECONDS`` on the
-    walk and serves every root UNKNOWN when it misses. The fleet's first walk takes
-    several seconds, so without one landed walk the request's measured size
-    would depend on whether an earlier request had happened to walk it.
+
+_UNLANDED_BY_PATH: Mapping[str, Callable[[Mapping[str, Any], FleetCensus], Mapping[str, str]]] = {
+    '/api/v2/dashboard/prds': _unlanded_prd_views,
+}
+"""The swept paths whose route waits a bounded time on reads that land for a later poll.
+
+Each maps to what its served payload still lacks, keyed by root; empty once landed.
+"""
+
+LANDING_DEADLINE_SECONDS = 120.0
+"""How long :func:`get_landed` polls before failing.
+
+Twice the slowest landing measured: a cold ``/prds`` right after app startup,
+on a host at load ~227-250 over 32 cores, landed in 47-59 s. It stays well
+inside pytest's per-test timeout.
+"""
+
+_LANDING_POLL_SECONDS = 0.05
+
+
+@dataclass(frozen=True)
+class FleetClient:
+    """A client of the real app, paired with the census the app is served from."""
+
+    client: TestClient
+    fleet: FleetCensus
+
+    def get(self, entry: EndpointBudget) -> Response:
+        """*entry*'s request, served once."""
+        return self.client.get(entry.path, params=dict(entry.query))
+
+
+def get_landed(served: FleetClient, entry: EndpointBudget) -> Response:
+    """*entry*'s request as a polled dashboard serves it, once every read its route waits on has landed.
+
+    A path outside :data:`_UNLANDED_BY_PATH`, or an answer other than 200, is
+    returned from the first request. Otherwise the request is repeated until
+    nothing is unlanded, and that response is returned. A shielded read lands
+    eventually, typically by the next poll; under heavy load a cold request
+    can take many polls (see :data:`LANDING_DEADLINE_SECONDS`).
     """
-    assert client.portal is not None, 'the corpus is walked inside a live TestClient'
-    corpus = client.portal.call(partial(
-        serve_corpus, corpus_queues(config), now=datetime.now(UTC), wait_seconds=None,
-    ))
-    assert corpus.value is not None, f'the fleet\'s escalation corpus walk answered no value: {corpus.reason}'
+    unlanded_in = _UNLANDED_BY_PATH.get(entry.path)
+    deadline = time.monotonic() + LANDING_DEADLINE_SECONDS
+    while True:
+        resp = served.get(entry)
+        if unlanded_in is None or resp.status_code != 200:
+            return resp
+        unlanded = unlanded_in(resp.json(), served.fleet)
+        if not unlanded:
+            return resp
+        if time.monotonic() >= deadline:
+            raise AssertionError(
+                f'{entry.url_suffix()}\'s waited reads did not land within '
+                f'{LANDING_DEADLINE_SECONDS:.0f}s, twice the slowest landing measured on a '
+                'host at load ~250. Suspect fixture rot, or a read that never completes, before '
+                'host load. Still unlanded:\n'
+                + '\n'.join(f'  {label}: {why}' for label, why in sorted(unlanded.items()))
+            )
+        time.sleep(_LANDING_POLL_SECONDS)
 
 
 def _clear_caches() -> None:
@@ -962,7 +1043,7 @@ def _clear_caches() -> None:
 
 
 @contextmanager
-def open_fleet_client(fleet: FleetCensus = CENSUS) -> Iterator[TestClient]:
+def open_fleet_client(fleet: FleetCensus = CENSUS) -> Iterator[FleetClient]:
     """The real app, configured over the fleet's roots and answered from the fleet.
 
     The config is installed inside the ``TestClient`` context, as
@@ -996,8 +1077,7 @@ def open_fleet_client(fleet: FleetCensus = CENSUS) -> Iterator[TestClient]:
             try:
                 with TestClient(app) as client:
                     app.state.config = config
-                    _land_corpus_walk(client, config)
-                    yield client
+                    yield FleetClient(client, fleet)
             finally:
                 _clear_caches()
         assert not substrate.refused(), (

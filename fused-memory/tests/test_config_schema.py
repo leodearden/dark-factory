@@ -7,6 +7,7 @@ import re
 import sys
 import unittest.mock
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -34,6 +35,10 @@ from fused_memory.config.schema import (
     TaskMetadataConfig,
     TaskStatusConfig,
     YamlSettingsSource,
+)
+from fused_memory.server.mem0_update_authz import (
+    resolve_mem0_update_allowed_prefixes,
+    resolve_mem0_update_sanctioned_uses,
 )
 from fused_memory.server.near_duplicate_guard import (
     _TOPIC_CLUSTER_DEFAULT_HINT,
@@ -282,15 +287,14 @@ class TestLLMConfigClientClass:
         )
 
     @pytest.mark.parametrize('yaml_name', ['config.yaml', 'config-docker.yaml'])
-    def test_shipped_config_yaml_shares_one_openai_api_url_default(
+    def test_shipped_config_yaml_llm_api_url_follows_openai_api_url(
         self, monkeypatch, yaml_name,
     ):
-        """llm and embedder provider blocks must resolve to the SAME api_url.
+        """The llm api_url defaults to OpenAI and follows OPENAI_API_URL.
 
-        Both are ``${OPENAI_API_URL:https://api.openai.com/v1}`` today. Independent
-        LLM/embedder endpoints come from setting the two blocks to different
-        literals — but the shipped DEFAULT must stay shared, so a deployment that
-        sets only OPENAI_API_URL keeps pointing both at one endpoint.
+        The embedder endpoint is deliberately independent of the llm's
+        (plans/local-embedder-cutover-prd.md §6 C3), so its block is only
+        required to exist with a non-empty api_url.
         """
         yaml_path = Path(__file__).resolve().parent.parent / 'config' / yaml_name
         assert yaml_path.is_file(), f'expected {yaml_name} at {yaml_path}'
@@ -301,19 +305,17 @@ class TestLLMConfigClientClass:
         monkeypatch.delenv('OPENAI_API_URL', raising=False)
         cfg = FusedMemoryConfig()
         assert cfg.llm.providers.openai is not None
-        assert cfg.embedder.providers.openai is not None
         assert cfg.llm.providers.openai.api_url == 'https://api.openai.com/v1'
-        assert (
-            cfg.llm.providers.openai.api_url == cfg.embedder.providers.openai.api_url
-        ), f'llm and embedder api_url defaults must stay identical in {yaml_name}'
+        assert cfg.embedder.providers.openai is not None
+        assert isinstance(cfg.embedder.providers.openai.api_url, str)
+        assert cfg.embedder.providers.openai.api_url, (
+            f'embedder.providers.openai.api_url must be non-empty in {yaml_name}'
+        )
 
-        # And when it IS set, both blocks follow it together.
         monkeypatch.setenv('OPENAI_API_URL', 'http://127.0.0.1:1234/v1')
         cfg2 = FusedMemoryConfig()
         assert cfg2.llm.providers.openai is not None
-        assert cfg2.embedder.providers.openai is not None
         assert cfg2.llm.providers.openai.api_url == 'http://127.0.0.1:1234/v1'
-        assert cfg2.embedder.providers.openai.api_url == 'http://127.0.0.1:1234/v1'
 
 
 class TestEmbedderConfigProvider:
@@ -886,6 +888,18 @@ class TestReconciliationConfigBulkResetGuardFields:
         assert cfg.bulk_reset_guard_write_failure_backoff_seconds == 120.5
 
 
+def _undocumented_prefixes(section: Mem0UpdateConfig) -> list[str]:
+    """Allowlisted prefixes the Mem0UpdateNotAuthorized refusal would render
+    as undocumented, read through the renderer's own resolvers."""
+    svc = SimpleNamespace(config=SimpleNamespace(mem0_update=section))
+    uses = resolve_mem0_update_sanctioned_uses(svc)
+    bar = {
+        *resolve_mem0_update_allowed_prefixes(svc, 'content_amend'),
+        *resolve_mem0_update_allowed_prefixes(svc, 'metadata_patch'),
+    }
+    return sorted(p for p in bar if p not in uses)
+
+
 class TestMem0UpdateConfig:
     """Authorization + storm knobs for the in-place update_memory tool (task 3088).
 
@@ -1014,6 +1028,94 @@ class TestMem0UpdateConfig:
     def test_two_configs_do_not_share_the_submodel(self):
         a, b = FusedMemoryConfig(), FusedMemoryConfig()
         assert a.mem0_update is not b.mem0_update
+
+    # --- agent_prefix_sanctioned_use: the role each allowlisted prefix declares ---
+
+    def test_default_sanctioned_use_documents_every_default_bar_prefix(self):
+        undocumented = _undocumented_prefixes(Mem0UpdateConfig())
+        assert not undocumented, (
+            f'default-allowlisted prefixes with no sanctioned use: {undocumented!r}'
+        )
+
+    def test_default_sanctioned_use_documents_link_heal(self):
+        """config.yaml grants link-heal- on the metadata arm without overriding
+        the map, so its role text has to ship in the schema default."""
+        uses = Mem0UpdateConfig().agent_prefix_sanctioned_use
+        assert isinstance(uses.get('link-heal-'), str)
+        assert uses['link-heal-'].strip()
+
+    def test_sanctioned_use_maps_are_separate_objects(self):
+        a = Mem0UpdateConfig()
+        a.agent_prefix_sanctioned_use['curator-'] = 'MUTATED'
+        a.agent_prefix_sanctioned_use['x-'] = 'ADDED'
+        b = Mem0UpdateConfig()
+        assert b.agent_prefix_sanctioned_use['curator-'] != 'MUTATED'
+        assert 'x-' not in b.agent_prefix_sanctioned_use
+
+    def test_sanctioned_use_override_accepted(self):
+        cfg = Mem0UpdateConfig(
+            agent_prefix_sanctioned_use={'auditor-': 'an audit sitting'},
+        )
+        assert cfg.agent_prefix_sanctioned_use == {'auditor-': 'an audit sitting'}
+
+    @pytest.mark.parametrize('blank', ['', '   '])
+    def test_blank_sanctioned_use_value_rejected_naming_the_prefix(self, blank):
+        with pytest.raises(ValidationError) as exc:
+            Mem0UpdateConfig(
+                agent_prefix_sanctioned_use={
+                    'recon-stage-': 'the reconciliation stages',
+                    'curator-': blank,
+                },
+            )
+        message = str(exc.value)
+        assert 'curator-' in message, message
+        assert 'agent_prefix_sanctioned_use' in message, message
+
+    @pytest.mark.parametrize('blank_key', ['', '  '])
+    def test_blank_sanctioned_use_key_rejected(self, blank_key):
+        with pytest.raises(ValidationError):
+            Mem0UpdateConfig(agent_prefix_sanctioned_use={blank_key: 'x'})
+
+    def test_non_str_sanctioned_use_value_rejected(self):
+        with pytest.raises(ValidationError):
+            Mem0UpdateConfig.model_validate({'agent_prefix_sanctioned_use': {'curator-': 42}})
+
+    def test_every_skill_a_default_sanctioned_use_names_exists(self):
+        """A refusal must never point a caller at a skill that is not there."""
+        repo_root = Path(__file__).resolve().parents[2]
+        uses = Mem0UpdateConfig().agent_prefix_sanctioned_use
+        missing = sorted(
+            (prefix, token)
+            for prefix, use in uses.items()
+            for token in re.findall(r'skills/[a-z0-9-]+', use)
+            if not (repo_root / token / 'SKILL.md').is_file()
+        )
+        assert not missing, f'sanctioned uses naming a missing skill: {missing!r}'
+        assert re.search(r'skills/[a-z0-9-]+', uses['curator-']), (
+            'the curator- entry must name the curation skill it executes, '
+            f'got {uses["curator-"]!r}'
+        )
+
+
+@pytest.mark.parametrize('yaml_name', ['config.yaml', 'config-docker.yaml'])
+class TestShippedConfigDocumentsEveryAllowlistedPrefix:
+    """Documenting a prefix is part of widening either allowlist.
+
+    The shipped configs are where a grant is widened, so each must leave every
+    granted prefix with a sanctioned use the refusal can render.
+    """
+
+    def test_every_allowlisted_prefix_has_a_sanctioned_use(
+        self, monkeypatch, yaml_name,
+    ):
+        yaml_path = Path(__file__).resolve().parent.parent / 'config' / yaml_name
+        assert yaml_path.is_file(), f'expected {yaml_name} at {yaml_path}'
+        monkeypatch.setenv('CONFIG_PATH', str(yaml_path))
+        undocumented = _undocumented_prefixes(FusedMemoryConfig().mem0_update)
+        assert not undocumented, (
+            f'fused-memory/config/{yaml_name} allowlists {undocumented!r} with no '
+            'entry in mem0_update.agent_prefix_sanctioned_use'
+        )
 
 
 class TestEntityMintConfig:
@@ -3918,7 +4020,7 @@ class TestMemoryMetadataConfig:
 
     A direct sibling of ``TaskMetadataConfig``: same top-level placement, same
     warn-by-default posture, same RED-TIER/restart-only wording on the enforce
-    flags. PRD D3 names that precedent explicitly ("census first, tiers later"),
+    flag. PRD D3 names that precedent explicitly ("census first, tiers later"),
     so this section follows it rather than inventing a second shape.
     """
 
@@ -3948,23 +4050,17 @@ class TestMemoryMetadataConfig:
         assert 'memory_metadata' not in ReconciliationConfig.model_fields
 
     def test_defaults_are_warn_mode(self):
-        """Both enforce flags default OFF.
-
-        This is the census-refuted-premise safety default, not timidity: leaf
-        α measured 242 of 329 live `kind` values as singletons, so a day-one
-        strict reject would turn every newly invented kind into a hard
-        memory-write failure on the live fleet.
-        """
+        """The ``enforce`` flag defaults OFF: a fatal shape violation censuses
+        and the write proceeds until the corpus is normalized (PRD §9 ε)."""
         cfg = FusedMemoryConfig().memory_metadata
         assert cfg.enforce is False
-        assert cfg.enforce_kind_registry is False
         assert cfg.unknown_key_storm_threshold == 50
         assert cfg.unknown_key_storm_window_seconds == 300
 
     def test_extra_keys_are_forbidden(self):
         """A mistyped leaf must fail LOUD at config load/reload.
 
-        With ``extra='ignore'`` an operator who typed ``enforce_kind_regsitry``
+        With ``extra='ignore'`` an operator who typed ``enfroce``
         would get a silently-ignored key and believe enforcement was on — the
         no-silent-fail-soft invariant applied to the config surface.
         """
@@ -3991,14 +4087,10 @@ class TestMemoryMetadataConfig:
         # loaded config.yaml actually reaches the model, and a splat makes
         # pyright widen every sibling field's type to the dict's value type,
         # producing a type error per section of FusedMemoryConfig.
-        cfg = FusedMemoryConfig.model_validate(
-            {'memory_metadata': {'enforce': True, 'enforce_kind_registry': True}}
-        )
+        cfg = FusedMemoryConfig.model_validate({'memory_metadata': {'enforce': True}})
         assert cfg.memory_metadata.enforce is True
-        assert cfg.memory_metadata.enforce_kind_registry is True
 
-    @pytest.mark.parametrize('field', ['enforce', 'enforce_kind_registry'])
-    def test_enforce_flags_are_restart_only(self, field):
+    def test_enforce_flag_is_restart_only(self):
         """RED TIER, asserted behaviourally rather than as a doc blurb.
 
         The operator-facing promise is not that some `description=` string
@@ -4028,16 +4120,16 @@ class TestMemoryMetadataConfig:
         #    test_non_allowlisted_leaf_lands_in_restart_required`.
         live = FusedMemoryConfig()
         fresh = FusedMemoryConfig()
-        old = getattr(live.memory_metadata, field)
+        old = live.memory_metadata.enforce
         # `object.__setattr__` is the established idiom in test_config_reload:
         # it bypasses the validation/assignment wrapper so the diff sees a raw
         # differing leaf.
-        object.__setattr__(fresh.memory_metadata, field, not old)
+        object.__setattr__(fresh.memory_metadata, 'enforce', not old)
 
         d = diff_config(live, fresh)
 
-        assert d.restart_required[f'memory_metadata.{field}'] == {'old': old, 'new': not old}
-        assert f'memory_metadata.{field}' not in d.applied_candidates
+        assert d.restart_required['memory_metadata.enforce'] == {'old': old, 'new': not old}
+        assert 'memory_metadata.enforce' not in d.applied_candidates
 
 
 # ── max_backlog_remediation_deferrals (task 3049) ────────────────────

@@ -1860,24 +1860,40 @@ def _append_to_raw_pytest_invocations(raw: str, suffix: str) -> str:
     return ''.join(out)
 
 
-def _is_xdist_option(token: str) -> bool:
-    """True for an xdist option in any spelling.
+def _split_xdist_option(token: str) -> tuple[str, str | None] | None:
+    """The xdist option *token* names and the value attached in it, or ``None``.
 
-    THE one place "is this token an xdist option" is decided, consulted by
-    the structured strip (argv and addopts alike) and the raw refusal screen
-    so they cannot disagree about what they are looking for. Covers the bare
-    form (``-n``/``-d``), the attached long form (``--dist=loadgroup``: one
-    token, and so NOT a ``_PYTEST_VALUE_FLAGS`` member — see that set's
-    comment) and the attached short form (``-nauto``/``-n4``: ``-n`` is
-    xdist's only value-taking short option, and no pytest core short option
-    starts with ``n``). Deciding how WIDE the resulting drop is stays with
-    the caller, because only the separate-token form owns a following token.
+    THE one grammar of an xdist token's spellings, read by the structured
+    strip and the raw refusal screen (through ``_is_xdist_option``) and by the
+    worker-count decoder ``worker_count_values`` that ``verify.py``'s load
+    stamp reads through, so none of them can disagree about what a worker flag
+    looks like. The spellings:
+
+    - the bare form (``-n``/``-d``/``--dist``) -> ``(token, None)``: a value,
+      if the option takes one, is the FOLLOWING token, which the parse has
+      already bound next to it (see ``_PYTEST_VALUE_FLAGS``);
+    - the attached form (``--dist=loadgroup``, ``-n=8``) -> ``(option,
+      value)``, with ``''`` for an empty ``--numprocesses=``;
+    - the concatenated short form (``-n8``/``-nauto``) -> ``('-n', value)``:
+      ``-n`` is xdist's only value-taking short option, and no pytest core
+      short option starts with ``n``.
+
+    Deciding what the token's value MEANS, and how wide a drop is, stays with
+    the caller.
     """
     if token in _XDIST_OPTIONS:
-        return True
+        return token, None
+    head, sep, value = token.partition('=')
+    if sep and head in _XDIST_VALUE_OPTIONS:
+        return head, value
     if token.startswith('-n') and not token.startswith('--'):
-        return True
-    return any(token.startswith(f'{option}=') for option in _XDIST_VALUE_OPTIONS)
+        return '-n', token[2:]
+    return None
+
+
+def _is_xdist_option(token: str) -> bool:
+    """``_split_xdist_option`` as a predicate, for the strip and the raw refusal screen."""
+    return _split_xdist_option(token) is not None
 
 
 def _strip_xdist_options(base_flags: tuple[str, ...]) -> tuple[str, ...]:
@@ -2091,11 +2107,9 @@ def applied_worker_count(tokens: Sequence[str]) -> str | None:
 
 def _attached_worker_count(token: str) -> str:
     """The count a one-token spelling (``-nV``, ``-n=V``, ``--numprocesses=V``) attaches, else ``''``."""
-    head, sep, value = token.partition('=')
-    if sep and head in _XDIST_N_FLAGS:
-        return value
-    if token.startswith('-n') and not token.startswith('--'):
-        return token[2:]
+    match _split_xdist_option(token):
+        case (option, str(value)) if option in _XDIST_N_FLAGS:
+            return value
     return ''
 
 

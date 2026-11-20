@@ -25,6 +25,7 @@ from orchestrator import verify as verify_module
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, WorktreeKind
 from orchestrator.verify import VerifyResult
+from orchestrator.verify_fallback_floor import NO_TESTS_RAN_CATEGORY
 
 # ---------------------------------------------------------------------------
 # Helpers / constants
@@ -145,6 +146,49 @@ class TestVerifyFailureIsPreexistingOnMain:
         assert result == (True, MAIN_SHA), (
             f'Expected (True, {MAIN_SHA!r}) — same signature reproduced on main means inherited; got {result!r}'
         )
+
+
+class TestNoTestsRanIsNeverInheritedFromMain:
+    """A no_tests_ran failure reproduces on main whenever main runs the same fallback
+    over the same files, so a signature match there would halt the queue for a
+    property of the diff's scoping (task 7041)."""
+
+    def test_identical_signature_on_main_is_not_probed(self, tmp_path: Path) -> None:
+        config = _make_config(tmp_path)
+        worktree = tmp_path / 'task-wt'
+        worktree.mkdir()
+        failing_result = VerifyResult(
+            passed=False,
+            test_output='',
+            lint_output='',
+            type_output='',
+            summary='no tests ran',
+            category=NO_TESTS_RAN_CATEGORY,
+            cause_hint='no_tests_ran: pkg/mod.py',
+        )
+
+        git_ops = GitOps(config.git, config.project_root)
+        get_main_sha = AsyncMock(return_value=MAIN_SHA)
+        git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
+        probe = AsyncMock(return_value=failing_result)
+
+        async def _fake_run(cmd, **kwargs):
+            return (0, '', '')
+
+        with (
+            patch.object(git_ops, 'get_main_sha', new=get_main_sha),
+            patch.object(verify_module, 'run_scoped_verification', new=probe),
+            patch('orchestrator.git_ops._run', side_effect=_fake_run),
+        ):
+            result = asyncio.run(
+                verify_module.verify_failure_is_preexisting_on_main(
+                    worktree, config, [], ['pkg/mod.py'], failing_result, git_ops,
+                )
+            )
+
+        assert result == (False, '')
+        get_main_sha.assert_not_awaited()
+        probe.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------

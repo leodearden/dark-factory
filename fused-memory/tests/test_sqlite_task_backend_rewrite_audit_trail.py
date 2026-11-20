@@ -15,6 +15,7 @@ from typing import Any
 
 import pytest
 import pytest_asyncio
+from pydantic import ValidationError
 from shared.toolcall_markup import CANONICAL_OPENER_PREFIX, closer_for
 
 from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
@@ -211,3 +212,30 @@ async def test_caller_supplied_pending_since_is_ignored(seeded):
     await backend.rewrite_audit_trail('1', root, description=None, metadata=forged)
     after = await backend.get_task('1', root)
     assert after['metadata']['pending_since'] == before['metadata']['pending_since']
+
+
+@pytest.mark.asyncio
+async def test_a_rotation_that_retypes_a_strict_field_is_rejected_in_enforce_mode(tmp_path):
+    backend = SqliteTaskBackend(
+        TaskmasterConfig(project_root=str(tmp_path)), task_metadata_enforce=True,
+    )
+    await backend.start()
+    root = str(tmp_path)
+    try:
+        await backend.add_task(
+            project_root=root, title='t',
+            metadata=json.dumps({
+                'files': ['docs/task-authoring.md'],
+                'recurrence': {'key': 'daily', 'interval_secs': 86400},
+            }),
+        )
+        before_row = _stored_row(root)
+        stored = (await backend.get_task('1', root))['metadata']
+        retyped = _rotated_blob(stored, recurrence={'key': 'daily', 'interval_secs': 86400.0})
+
+        with pytest.raises(ValidationError):
+            await backend.rewrite_audit_trail('1', root, description=None, metadata=retyped)
+
+        assert _stored_row(root) == before_row
+    finally:
+        await backend.close()

@@ -9,8 +9,10 @@ from pathlib import Path
 
 import pytest
 import pytest_asyncio
+from pydantic import ValidationError
 
 from fused_memory.models.reconciliation import (
+    JudgeInvocation,
     JudgeVerdict,
     ReconciliationRun,
     RunStatus,
@@ -125,7 +127,9 @@ async def test_fresh_schema_creates_exactly_this_table_set(journal):
     these tables directly, so adding or dropping one must show up here.
     The set cannot show that each table has a live producer (INV-13); whoever
     adds a table owes that check.  recon_ledger shares the file but is
-    created by ReconLedgerStore, not by the journal.
+    created by ReconLedgerStore, not by the journal.  judge_invocations is
+    written by Judge._record_cli_invocation (task 6573); sqlite_sequence is
+    SQLite's own, created by judge_invocations' AUTOINCREMENT.
     """
     db_path = journal.data_dir / 'reconciliation.db'
 
@@ -140,6 +144,8 @@ async def test_fresh_schema_creates_exactly_this_table_set(journal):
         'run_actions',
         'halt_state',
         'judge_pending',
+        'judge_invocations',
+        'sqlite_sequence',
     }
 
 
@@ -251,6 +257,116 @@ async def test_add_verdict_atomically_clears_pending_marker(journal):
     assert run_id in {v.run_id for v in verdicts}
 
 
+_ARMED_CHECK = 'SELECT COUNT(*), MAX(completed_at) FROM judge_invocations'
+_TRIPWIRE_COUNT = 'SELECT COUNT(*) FROM judge_invocations WHERE ended_error_max_turns = 1'
+_TRIPWIRE_FIRST = (
+    'SELECT ji.completed_at, ji.run_id, r.project_id, ji.schema_salvaged, ji.num_turns,'
+    ' ji.rejected_tool_calls FROM judge_invocations ji LEFT JOIN runs r ON r.id = ji.run_id'
+    ' WHERE ji.ended_error_max_turns = 1 ORDER BY ji.completed_at LIMIT 1'
+)
+
+
+def _read_only_rows(db_path: Path, query: str) -> list[tuple]:
+    conn = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True)
+    try:
+        return conn.execute(query).fetchall()
+    finally:
+        conn.close()
+
+
+def _invocation(**overrides) -> JudgeInvocation:
+    fields = {
+        'run_id': 'run-1',
+        'completed_at': datetime.now(UTC),
+        'ended_error_max_turns': False,
+        'schema_salvaged': False,
+        'num_turns': 2,
+        'rejected_tool_calls': 0,
+    }
+    return JudgeInvocation(**(fields | overrides))
+
+
+class TestJudgeInvocations:
+    """The judge_invocations table behind the turn-cap tripwire (task 6573).
+
+    Read back through a read-only sqlite3 connection with the same queries
+    OPERATIONS.md gives the operator, so the recipe is pinned against the
+    real schema.
+    """
+
+    @pytest.mark.asyncio
+    async def test_armed_check_then_round_trip(self, journal):
+        db_path = journal.data_dir / 'reconciliation.db'
+        assert _read_only_rows(db_path, _ARMED_CHECK) == [(0, None)]
+
+        first_at = datetime(2026, 11, 15, 12, 0, tzinfo=UTC)
+        second_at = first_at + timedelta(minutes=5)
+        await journal.record_judge_invocation(_invocation(
+            run_id='run-hit', completed_at=first_at,
+            ended_error_max_turns=True, schema_salvaged=True, num_turns=4, rejected_tool_calls=2,
+        ))
+        await journal.record_judge_invocation(_invocation(
+            run_id='run-ok', completed_at=second_at,
+            ended_error_max_turns=False, num_turns=None, rejected_tool_calls=None,
+        ))
+        await journal.close()
+
+        assert _read_only_rows(
+            db_path,
+            'SELECT run_id, completed_at, ended_error_max_turns, schema_salvaged, num_turns,'
+            ' rejected_tool_calls FROM judge_invocations ORDER BY completed_at',
+        ) == [
+            ('run-hit', first_at.isoformat(), 1, 1, 4, 2),
+            ('run-ok', second_at.isoformat(), 0, 0, None, None),
+        ]
+        assert _read_only_rows(db_path, _ARMED_CHECK) == [(2, second_at.isoformat())]
+        assert _read_only_rows(db_path, _TRIPWIRE_COUNT) == [(1,)]
+        assert _read_only_rows(db_path, _TRIPWIRE_FIRST) == [
+            (first_at.isoformat(), 'run-hit', None, 1, 4, 2),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_initialize_adds_the_table_to_an_existing_db(self, tmp_path):
+        data_dir = tmp_path / 'existing_recon'
+        before = ReconciliationJournal(data_dir)
+        await before.initialize()
+        await before.close()
+        conn = sqlite3.connect(data_dir / 'reconciliation.db')
+        try:
+            conn.execute('DROP TABLE judge_invocations')
+            conn.commit()
+        finally:
+            conn.close()
+
+        after = ReconciliationJournal(data_dir)
+        await after.initialize()
+        try:
+            await after.record_judge_invocation(_invocation())
+        finally:
+            await after.close()
+
+        assert _read_only_rows(data_dir / 'reconciliation.db', _ARMED_CHECK)[0][0] == 1
+
+    @pytest.mark.parametrize('field', ['num_turns', 'rejected_tool_calls'])
+    def test_model_rejects_negative_counts(self, field):
+        with pytest.raises(ValidationError):
+            _invocation(**{field: -1})
+
+    def test_model_rejects_a_zero_turn_count(self):
+        with pytest.raises(ValidationError):
+            _invocation(num_turns=0)
+
+    def test_model_requires_schema_salvaged(self):
+        fields = _invocation().model_dump(exclude={'schema_salvaged'})
+        with pytest.raises(ValidationError):
+            JudgeInvocation.model_validate(fields)
+
+    def test_model_is_frozen(self):
+        invocation = _invocation()
+        with pytest.raises(ValidationError):
+            invocation.num_turns = 5
+
+
 @pytest.mark.asyncio
 async def test_recent_runs(journal):
     for i in range(3):
@@ -327,78 +443,6 @@ async def test_runs_table_has_session_columns(journal):
     assert {'session_id', 'stage_cursor', 'attempt'} <= colnames, (
         f'runs table missing session columns; got {sorted(colnames)!r}'
     )
-
-
-@pytest.mark.asyncio
-async def test_record_run_session_persists_and_increments_attempt(journal):
-    """record_run_session persists (session_id, stage_cursor) and auto-increments
-    attempt; a second call bumps attempt and overwrites the snapshot. Both the
-    get_run and get_running_runs (_row_to_run) read paths carry the fields."""
-    run_id = str(uuid.uuid4())
-    run = ReconciliationRun(
-        id=run_id,
-        project_id='test-project',
-        run_type=RunType.full,
-        trigger_reason='session-capture',
-        started_at=datetime.now(UTC),
-        status=RunStatus.running,
-    )
-    await journal.start_run(run)
-
-    # First stage launch.
-    await journal.record_run_session(
-        run_id, session_id='S1', stage_cursor='memory_consolidator'
-    )
-    loaded = await journal.get_run(run_id)
-    assert loaded is not None
-    assert loaded.session_id == 'S1'
-    assert loaded.stage_cursor == 'memory_consolidator'
-    assert loaded.attempt == 1
-
-    # Same snapshot is visible via the _row_to_run recovery read path.
-    running = {r.id: r for r in await journal.get_running_runs()}
-    assert running[run_id].session_id == 'S1'
-    assert running[run_id].stage_cursor == 'memory_consolidator'
-    assert running[run_id].attempt == 1
-
-    # Second stage launch bumps attempt and overwrites the snapshot.
-    await journal.record_run_session(
-        run_id, session_id='S2', stage_cursor='task_knowledge_sync'
-    )
-    loaded = await journal.get_run(run_id)
-    assert loaded is not None
-    assert loaded.session_id == 'S2'
-    assert loaded.stage_cursor == 'task_knowledge_sync'
-    assert loaded.attempt == 2
-
-
-@pytest.mark.asyncio
-async def test_clear_run_session_nulls_snapshot_but_retains_attempt(journal):
-    """clear_run_session nulls session_id/stage_cursor but leaves attempt intact."""
-    run_id = str(uuid.uuid4())
-    run = ReconciliationRun(
-        id=run_id,
-        project_id='test-project',
-        run_type=RunType.full,
-        trigger_reason='session-capture',
-        started_at=datetime.now(UTC),
-        status=RunStatus.running,
-    )
-    await journal.start_run(run)
-    await journal.record_run_session(
-        run_id, session_id='S1', stage_cursor='memory_consolidator'
-    )
-    await journal.record_run_session(
-        run_id, session_id='S2', stage_cursor='task_knowledge_sync'
-    )
-
-    await journal.clear_run_session(run_id)
-
-    loaded = await journal.get_run(run_id)
-    assert loaded is not None
-    assert loaded.session_id is None
-    assert loaded.stage_cursor is None
-    assert loaded.attempt == 2
 
 
 @pytest.mark.asyncio

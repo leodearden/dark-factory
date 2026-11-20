@@ -20,7 +20,7 @@ from shared.cli_invoke import AgentResult
 
 from orchestrator.agents.review_briefing import ReviewBriefing
 from orchestrator.config import default_price_table
-from orchestrator.evals.measurement import MeasurementStage, Unmeasured, UnmeasuredCause
+from orchestrator.evals.measurement import MeasurementStage, Scored, Unmeasured, UnmeasuredCause
 from orchestrator.evals.reviewer_trial.__main__ import _select_original_corpus, cli
 from orchestrator.evals.reviewer_trial.corpus import (
     CorpusDiff,
@@ -296,27 +296,31 @@ class TestMineDelegates:
             verify_attempts=2, merge_sha=f'sha{task_id}', signal_reason=['outcome:requeued'],
         )
 
-    def test_one_labelled_candidate_is_admitted_and_saved(self, tmp_path: Path) -> None:
+    def test_only_the_labelled_candidate_is_saved_and_each_skip_says_why(self, tmp_path: Path) -> None:
         manifest = CorpusManifest(diffs=[
             CorpusDiff(diff_id='mined_1', language='python', source='mined', diff_text='',
                        description='m1', ground_truth=[], split='test', provenance={'kind': 'mined'}),
         ])
-        labelled, failing = self._candidate('101'), self._candidate('102')
+        labelled, failing, clean = self._candidate('101'), self._candidate('102'), self._candidate('103')
         recovered = [
             RecoveredCandidate(labelled, 'sha101', 'LABELLED_DIFF'),
             RecoveredCandidate(failing, 'sha102', 'FAILING_DIFF'),
+            RecoveredCandidate(clean, 'sha103', 'CLEAN_DIFF'),
         ]
 
         async def propose(diff_text: str, **_kwargs: object):
             if diff_text == 'LABELLED_DIFF':
-                return [_gt('frontier_1')], 0.1
+                return Scored([_gt('frontier_1')], cost_usd=0.1)
+            if diff_text == 'CLEAN_DIFF':
+                return Scored([], cost_usd=0.0)
             raise RuntimeError('frontier call failed')
 
         runs_db = tmp_path / 'runs.db'
         runs_db.touch()
         with (
             patch('orchestrator.evals.reviewer_trial.__main__._load_corpus', return_value=manifest),
-            patch('orchestrator.evals.reviewer_trial.mining.mine_fn_candidates', return_value=[labelled, failing]),
+            patch('orchestrator.evals.reviewer_trial.mining.mine_fn_candidates',
+                  return_value=[labelled, failing, clean]),
             patch('orchestrator.evals.reviewer_trial.mining.mine_escalation_refs', return_value={}),
             patch('orchestrator.evals.reviewer_trial.mining.fetch_task_titles', return_value={}),
             patch('orchestrator.evals.reviewer_trial.mining.recover_candidates', return_value=recovered),
@@ -338,8 +342,11 @@ class TestMineDelegates:
         assert [(e.diff_id, e.frontier_model) for e in saved_log.entries if e.diff_id == 'mined_101'] == [
             ('mined_101', 'opus'),
         ]
-        assert not any(e.diff_id == 'mined_102' for e in saved_log.entries)
-        assert 'Mined 1/2 new diffs' in result.output, result.output
+        assert not any(e.diff_id in ('mined_102', 'mined_103') for e in saved_log.entries)
+        assert 'Mined 1/3 new diffs' in result.output, result.output
+        assert 'mined_102: proposer did not measure (raised' in result.output, result.output
+        assert 'mined_103: no issues proposed' in result.output, result.output
+        assert 'Unmeasured proposals: 1 ' in result.output, result.output
 
 
 class TestRefreshCommand:

@@ -64,7 +64,12 @@ from fused_memory.backends.task_backend_types import (
     TaskFactsRow,
 )
 from fused_memory.config.schema import CuratorConfig
-from fused_memory.middleware import deferral_gate, recon_write_policy, task_text_write_guard
+from fused_memory.middleware import (
+    deferral_gate,
+    gate_stamp_lifecycle,
+    recon_write_policy,
+    task_text_write_guard,
+)
 from fused_memory.middleware.amendment_advisory import (
     TASK_TEXT_FIELDS,
     AmendmentWriter,
@@ -79,6 +84,7 @@ from fused_memory.middleware.curation_deferral import (
     dedupe_skipped_marker,
     pool_defer_reason,
 )
+from fused_memory.middleware.curator_registry import RegistryHealth
 from fused_memory.middleware.curator_types import (
     CandidateTask,
     CuratorDecision,
@@ -2036,7 +2042,12 @@ class TaskInterceptor:
                     _status_write_body(
                         tm, task_id, status, project_root, tag,
                         audit_fields=audit_fields,
-                        clear_keys=deferral_write.clear_keys,
+                        clear_keys=deferral_write.clear_keys
+                        | gate_stamp_lifecycle.terminal_crossing_clear_keys(
+                            old_status=old_status,
+                            new_status=status,
+                            stored_metadata=stored_metadata,
+                        ),
                         claimant_kwargs=claimant_kwargs,
                     ),
                     agent_id=_journal_agent_id,
@@ -2346,13 +2357,14 @@ class TaskInterceptor:
                 )
                 self._background_tasks.add(bg)
                 bg.add_done_callback(lambda t: self._background_tasks.discard(t))
-                # Ask once whether the curator's backend binary resolves at all
-                # (task 4448). Backgrounded for the same reason as the backfill
-                # check: a PATH lookup must not delay task creation. The check
-                # reports and returns a verdict rather than raising — a curator
-                # with a missing binary still degrades to action='create', which
-                # is strictly better than the `except Exception` below turning a
-                # refusal into a silently absent curator.
+                # Ask once whether the curator's backend binary resolves (task
+                # 4448) and whether its guard registries load (task 6622).
+                # Backgrounded for the same reason as the backfill check: a PATH
+                # lookup and registry reads must not delay task creation. The
+                # check reports and returns a verdict rather than raising — a
+                # curator that fails it still fails open, which is strictly
+                # better than the `except Exception` below turning a refusal
+                # into a silently absent curator.
                 check = asyncio.create_task(
                     self._curator.startup_self_check(
                         resolve_project_id(project_root), project_root,
@@ -2366,6 +2378,16 @@ class TaskInterceptor:
             logger.warning('Failed to create TaskCurator', exc_info=True)
             self._curator_construction_error = exception_summary(exc)
             return None
+
+    def curator_registry_health(self) -> tuple[RegistryHealth, ...]:
+        """The curator's guard registry health; ``()`` when no curator exists.
+
+        Never constructs one, so a status read has none of _get_curator's
+        side effects.
+        """
+        if self._curator is None:
+            return ()
+        return self._curator.registry_health()
 
     def _curator_unavailable(self) -> CuratorUnavailable:
         """Why ``_get_curator()`` has no curator to hand out right now.

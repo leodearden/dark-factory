@@ -28,8 +28,14 @@ A ``_``-prefixed, uniquely-named sibling module (like ``_orch_helpers.py``,
 across sibling subprojects under ``sys.modules['conftest']`` — see that file's
 docstring.
 
-Importing this module performs NO disk I/O: the constants are plain literals,
-and ``load_config_scalar`` reads only when a drift test calls it.
+The root fleet chains are COMPOSED from ordered member tuples and literal
+clauses, so a new workspace member is one tuple entry per chain (plus the yaml
+edit the drift gate then demands). Consumers derive counts, positions and
+labels from these parts rather than restating the chain's shape.
+
+Importing this module performs NO disk I/O: the constants are composed from
+in-module literals, and ``load_config_scalar`` reads only when a drift test
+calls it.
 """
 
 from __future__ import annotations
@@ -208,33 +214,58 @@ SCRIPTS_LINT_COMMAND = (
     ' && python3 tests/scripts/raw_envelope_literal_guard.py scripts'
 )
 
-# dark-factory-orchestrator.yaml::lint_command
-ROOT_LINT_COMMAND = (
-    'uv run ruff check shared escalation fused-memory orchestrator dashboard sampler'
-    ' cockpit client-feed conftest.py df_pytest_isolation.py skills'
-    ' && python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests'
-    ' escalation/tests fused-memory/tests orchestrator/tests dashboard/tests'
-    ' sampler/tests cockpit/tests client-feed/tests'
+
+def _cd_fan_out(members: tuple[str, ...], clause: str) -> str:
+    """`cd <first> && <clause> && cd ../<next> && <clause> ...` over *members*, in order."""
+    return ' && '.join(
+        f'cd {"" if i == 0 else "../"}{member} && {clause}' for i, member in enumerate(members)
+    )
+
+
+# Each root chain has its own member tuple because the yaml orders the
+# members differently in each.
+
+# dark-factory-orchestrator.yaml::lint_command — one ruff clause over every
+# member plus the root-level targets, then one checker clause over every
+# member's tests dir.
+FLEET_LINT_MEMBERS = (
+    'shared', 'escalation', 'fused-memory', 'orchestrator', 'dashboard', 'sampler', 'cockpit',
+    'client-feed',
 )
+ROOT_LINT_RUFF_CLAUSE = 'uv run ruff check ' + ' '.join(
+    (*FLEET_LINT_MEMBERS, 'conftest.py', 'df_pytest_isolation.py', 'skills'),
+)
+ROOT_LINT_CHECKER_CLAUSE = 'python3 fused-memory/scripts/check_bare_magicmock_config.py ' + ' '.join(
+    f'{member}/tests' for member in FLEET_LINT_MEMBERS
+)
+ROOT_LINT_COMMAND = f'{ROOT_LINT_RUFF_CLAUSE} && {ROOT_LINT_CHECKER_CLAUSE}'
 
 # dark-factory-orchestrator.yaml::type_check_command
-ROOT_TYPE_CHECK_COMMAND = (
-    'cd fused-memory && npx pyright && cd ../orchestrator && npx pyright'
-    ' && cd ../dashboard && npx pyright && cd ../shared && npx pyright'
-    ' && cd ../escalation && npx pyright && cd ../sampler && npx pyright'
-    ' && cd ../cockpit && npx pyright && cd ../client-feed && npx pyright'
+FLEET_TYPE_CHECK_MEMBERS = (
+    'fused-memory', 'orchestrator', 'dashboard', 'shared', 'escalation', 'sampler', 'cockpit',
+    'client-feed',
 )
+ROOT_TYPE_CHECK_COMMAND = _cd_fan_out(FLEET_TYPE_CHECK_MEMBERS, 'npx pyright')
 
-# dark-factory-orchestrator.yaml::test_command
+# dark-factory-orchestrator.yaml::test_command — one `cd <member> && pytest`
+# pair per member, then `cd ..` and the clauses run at the worktree root.
+FLEET_TEST_MEMBERS = (
+    'shared', 'escalation', 'orchestrator', 'fused-memory', 'dashboard', 'sampler', 'client-feed',
+)
+FLEET_MEMBER_TEST_CLAUSE = 'uv run pytest tests/ --timeout=300'
+FLEET_COCKPIT_TEST_CLAUSE = (
+    '( [ -d cockpit ] || exit 0; cd cockpit && uv run pytest tests/ --timeout=300 )'
+)
+FLEET_SCRIPTS_TEST_CLAUSE = (
+    'uv run --project shared pytest tests/scripts/ scripts/tests/ --timeout=300'
+)
+FLEET_ROOT_TEST_CLAUSES = (
+    FLEET_COCKPIT_TEST_CLAUSE,
+    FLEET_SCRIPTS_TEST_CLAUSE,
+    'uv run --project shared pytest tests/repo_guards/ --timeout=300',
+)
 ROOT_TEST_COMMAND = (
-    'cd shared && uv run pytest tests/ --timeout=300'
-    ' && cd ../escalation && uv run pytest tests/ --timeout=300'
-    ' && cd ../orchestrator && uv run pytest tests/ --timeout=300'
-    ' && cd ../fused-memory && uv run pytest tests/ --timeout=300'
-    ' && cd ../dashboard && uv run pytest tests/ --timeout=300'
-    ' && cd ../sampler && uv run pytest tests/ --timeout=300'
-    ' && cd ../client-feed && uv run pytest tests/ --timeout=300'
-    ' && cd .. && ( [ -d cockpit ] || exit 0; cd cockpit && uv run pytest tests/ --timeout=300 )'
-    ' && uv run --project shared pytest tests/scripts/ scripts/tests/ --timeout=300'
-    ' && uv run --project shared pytest tests/repo_guards/ --timeout=300'
+    _cd_fan_out(FLEET_TEST_MEMBERS, FLEET_MEMBER_TEST_CLAUSE)
+    + ' && cd .. && '
+    + ' && '.join(FLEET_ROOT_TEST_CLAUSES)
 )

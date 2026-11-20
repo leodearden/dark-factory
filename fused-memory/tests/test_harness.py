@@ -7,6 +7,7 @@ import logging
 import sqlite3
 import uuid
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from unittest.mock import DEFAULT, AsyncMock, MagicMock, patch
 
 import httpx
@@ -24,6 +25,7 @@ from reconciliation.harness_fixtures import (
     open_journal,
     stub_stage_runs,
 )
+from reconciliation.legacy_drains import drain_unattributed
 from shared.config_dir import TaskConfigDir
 from shared.project_layout import escalation_queue_dir
 from shared.scheduler_state import SchedulerStateSnapshot
@@ -39,6 +41,7 @@ from fused_memory.models.reconciliation import (
     ReconciliationRun,
     RunStatus,
     RunType,
+    StageId,
     StageReport,
 )
 from fused_memory.models.scope import (
@@ -55,7 +58,14 @@ from fused_memory.reconciliation.cli_stage_runner import (
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.harness import BacklogIterator
 from fused_memory.reconciliation.known_projects_section import render_known_projects_section
+from fused_memory.reconciliation.stages.base import BaseStage
+from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
+from fused_memory.reconciliation.stages.task_knowledge_sync import IntegrityCheck
 from fused_memory.reconciliation.task_count_snapshot_cadence import SNAPSHOT_WRITTEN_STAT_KEY
+from fused_memory.reconciliation.task_filter import (
+    ACTIVE_TASK_TREE_HEADER,
+    TaskTreeUnavailableReason,
+)
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
@@ -98,9 +108,14 @@ async def journal(tmp_path):
         yield j
 
 
+@pytest.fixture
+def event_buffer_db_path(tmp_path) -> Path:
+    return tmp_path / 'harness_eb.db'
+
+
 @pytest_asyncio.fixture
-async def event_buffer(tmp_path):
-    async with open_event_buffer(tmp_path / 'harness_eb.db') as b:
+async def event_buffer(event_buffer_db_path):
+    async with open_event_buffer(event_buffer_db_path) as b:
         yield b
 
 
@@ -137,7 +152,7 @@ async def test_drain_clears_buffer(event_buffer):
     await event_buffer.push(_make_event())
     await event_buffer.push(_make_event())
 
-    events = await event_buffer.drain('test-project')
+    events = await event_buffer.drain('test-project', run_id='R1')
     assert len(events) == 2
 
     # Should be empty now
@@ -6869,6 +6884,7 @@ class TestHarnessFetchFilteredTaskTree:
         assert result.done_count == 2
         assert len(result.done_tasks) == 2  # main's FilteredTaskTree retains done task dicts
         assert result.cancelled_count == 1
+        assert result.unavailable_reason is None
         harness.taskmaster.get_tasks.assert_called_once_with(project_root='/abs/path')  # type: ignore[union-attr,attr-defined]
 
     @pytest.mark.asyncio
@@ -6894,6 +6910,7 @@ class TestHarnessFetchFilteredTaskTree:
         assert isinstance(result, FilteredTaskTree)
         assert result.active_tasks == []
         assert result.total_count == 0
+        assert result.unavailable_reason is TaskTreeUnavailableReason.fetch_error
 
         # Must have logged a warning containing BOTH the project_root and exception message
         assert any(
@@ -6923,6 +6940,7 @@ class TestHarnessFetchFilteredTaskTree:
 
         assert isinstance(result, FilteredTaskTree)
         assert result.active_tasks == []
+        assert result.unavailable_reason is TaskTreeUnavailableReason.taskmaster_disabled
 
     @pytest.mark.asyncio
     async def test_returns_empty_when_empty_project_root(
@@ -6940,6 +6958,7 @@ class TestHarnessFetchFilteredTaskTree:
 
         assert isinstance(result, FilteredTaskTree)
         assert result.active_tasks == []
+        assert result.unavailable_reason is TaskTreeUnavailableReason.empty_project_root
         harness.taskmaster.get_tasks.assert_not_called()  # type: ignore[union-attr,attr-defined]
 
     @pytest.mark.asyncio
@@ -6973,6 +6992,7 @@ class TestHarnessFetchFilteredTaskTree:
         assert isinstance(result, FilteredTaskTree)
         assert result.active_tasks == []
         assert result.total_count == 0
+        assert result.unavailable_reason is TaskTreeUnavailableReason.non_absolute_project_root
 
         # (b) taskmaster.get_tasks must NOT be called (pre-check short-circuit)
         harness.taskmaster.get_tasks.assert_not_called()  # type: ignore[union-attr,attr-defined]
@@ -7474,6 +7494,112 @@ class TestHarnessFetchFilteredTaskTree:
         assert result_b.active_tasks == []
         assert result_b.done_count == 0
         assert result_b.cancelled_count == 0
+
+
+def _empty_stage_report(stage_id: StageId) -> StageReport:
+    now = datetime.now(UTC)
+    return StageReport(stage=stage_id, started_at=now, completed_at=now)
+
+
+async def _stage2_payload_after_full_cycle(
+    journal, event_buffer, memory_service, monkeypatch, taskmaster,
+) -> str:
+    """The real Stage 2 payload that run_full_cycle assembles, with no stage reaching an LLM."""
+    payloads: dict[StageId, str] = {}
+
+    async def canned_run(self, events, watermark, prior_reports, run_id, model=None, **_kw):
+        return _empty_stage_report(self.stage_id)
+
+    async def assemble_then_report(self, events, watermark, prior_reports, run_id, **_kw):
+        payloads[self.stage_id] = await self.assemble_payload(events, watermark, prior_reports)
+        return _empty_stage_report(self.stage_id)
+
+    monkeypatch.setattr(MemoryConsolidator, 'run', canned_run)
+    monkeypatch.setattr(IntegrityCheck, 'run', canned_run)
+    monkeypatch.setattr(BaseStage, 'run', assemble_then_report)
+
+    harness = make_harness(
+        journal=journal,
+        event_buffer=event_buffer,
+        memory_service=memory_service,
+        taskmaster=taskmaster,
+        config=make_harness_config(judge_enabled=False),
+        known_projects={'test-project': '/tmp/test-project'},
+    )
+    await harness.run_full_cycle('test-project', 'test-trigger', events=[_make_event()])
+    return payloads[StageId.task_knowledge_sync]
+
+
+async def _stage2_payload_after_failed_fetch(
+    journal, event_buffer, memory_service, monkeypatch, reason: TaskTreeUnavailableReason,
+) -> str:
+    taskmaster = None
+    if reason is TaskTreeUnavailableReason.fetch_error:
+        taskmaster = AsyncMock()
+        taskmaster.get_tasks.side_effect = RuntimeError('connection refused')
+        taskmaster.get_statuses_fresh.return_value = {}
+    return await _stage2_payload_after_full_cycle(
+        journal, event_buffer, memory_service, monkeypatch, taskmaster,
+    )
+
+
+_PUBLICLY_REACHABLE_FETCH_FAILURES = [
+    TaskTreeUnavailableReason.taskmaster_disabled,
+    TaskTreeUnavailableReason.fetch_error,
+]
+
+
+class TestFailedTreeFetchReachesStagesAsUnavailable:
+    """A failed task-tree fetch reaches Stage 2 as 'unavailable', never as an empty project.
+
+    Only taskmaster_disabled and fetch_error are reachable through run_full_cycle:
+    ProjectScope rejects an empty or relative root before any fetch, so the other two
+    reasons are pinned in TestHarnessFetchFilteredTaskTree.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('reason', _PUBLICLY_REACHABLE_FETCH_FAILURES)
+    async def test_stage2_task_tree_slots_say_unavailable(
+        self, journal, event_buffer, mock_memory_service, monkeypatch, reason,
+    ):
+        payload = await _stage2_payload_after_failed_fetch(
+            journal, event_buffer, mock_memory_service, monkeypatch, reason,
+        )
+
+        notice = f'Task tree unavailable: {reason.value}'
+        assert f'{ACTIVE_TASK_TREE_HEADER}\n{notice}\n' in payload
+        assert '0 active shown' not in payload
+        assert f'### Recently Completed Tasks\n{notice}\n' in payload
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('reason', _PUBLICLY_REACHABLE_FETCH_FAILURES)
+    async def test_stage2_tree_sample_sections_say_unavailable(
+        self, journal, event_buffer, mock_memory_service, monkeypatch, reason,
+    ):
+        payload = await _stage2_payload_after_failed_fetch(
+            journal, event_buffer, mock_memory_service, monkeypatch, reason,
+        )
+
+        notice = f'Task tree unavailable: {reason.value}'
+        assert f'### Proactive Task Sample\n{notice}' in payload
+        assert f'### Done-Task Completion-Memory Audit\n{notice}' in payload
+        assert '### Proactive Task Sample (0 tasks)' not in payload
+        assert '(0 since last cycle)' not in payload
+
+    @pytest.mark.asyncio
+    async def test_a_fetched_empty_project_still_renders_an_empty_sample(
+        self, journal, event_buffer, mock_memory_service, monkeypatch,
+    ):
+        taskmaster = AsyncMock()
+        taskmaster.get_tasks.return_value = {'tasks': []}
+        taskmaster.get_statuses_fresh.return_value = {}
+
+        payload = await _stage2_payload_after_full_cycle(
+            journal, event_buffer, mock_memory_service, monkeypatch, taskmaster,
+        )
+
+        assert '### Proactive Task Sample (0 tasks)' in payload
+        assert 'Task tree unavailable' not in payload
 
 
 # ── Tests for task 455: harness wires filtered_task_tree into stages ──────────
@@ -9819,7 +9945,7 @@ async def test_recover_predecessor_runs_does_not_clobber_a_run_its_own_coroutine
 
 @pytest.mark.asyncio
 async def test_recover_stale_runs_restores_pre_upgrade_unattributed_drained_events(
-    journal, event_buffer, mock_memory_service,
+    journal, event_buffer, event_buffer_db_path, mock_memory_service,
 ):
     """Amendment regression (task 2711 review finding #1): events drained by
     a pre-task-2711 process carry NULL drained_by_run_id, since only current
@@ -9849,12 +9975,12 @@ async def test_recover_stale_runs_restores_pre_upgrade_unattributed_drained_even
         await event_buffer.push(e)
     await event_buffer.drain(project_id, run_id=run_x.id)
 
-    # Pre-task-2711 leftovers: drained with no run_id, simulating the old
-    # code that never stamped drained_by_run_id.
+    # Pre-task-2711 leftovers, seeded as a pre-task-2711 process left them:
+    # drained with no drained_by_run_id stamp.
     legacy_events = [_make_event(project_id), _make_event(project_id)]
     for e in legacy_events:
         await event_buffer.push(e)
-    await event_buffer.drain(project_id)
+    assert drain_unattributed(event_buffer_db_path, project_id) == 2
 
     # Concurrent run Y — still running, owned by the live instance; its
     # (attributed) drained events must survive X's recovery.
@@ -20214,9 +20340,9 @@ async def test_run_full_cycle_attributes_drained_events_to_run_id(
         f'2 events it drained via buffer.drain(); restore_drained(run_id=run_a.id) '
         f'restored {restored_a}'
     )
-    # Drain them back out (no run_id — mirrors an untracked legacy drain) so
-    # the next scenario starts from an empty 'buffered' set.
-    await event_buffer.drain('test-project')
+    # Drain them back out so the next scenario starts from an empty
+    # 'buffered' set.
+    await event_buffer.drain('test-project', run_id='scenario-a-cleanup')
 
     # (b) Iterator-fed path: events pre-drained by the caller must be
     # attributed via buffer.mark_drained_run_id(project_id, event_ids, run_id).
@@ -20226,8 +20352,9 @@ async def test_run_full_cycle_attributes_drained_events_to_run_id(
     pre_drained = [_make_event(), _make_event()]
     for e in pre_drained:
         await event_buffer.push(e)
-    # Pre-drain with no run_id, so only run_full_cycle can attribute them.
-    await event_buffer.drain('test-project')
+    # Pre-drained under another run's id, as BacklogIterator's drain_by_ids
+    # does; run_full_cycle must re-attribute them to its own run.
+    await event_buffer.drain('test-project', run_id='pre-drain-chunk')
 
     run_b = await harness.run_full_cycle(
         'test-project', 'backlog_chunk:1:2', events=pre_drained,
@@ -21139,12 +21266,12 @@ def _orch_finding(**over) -> dict:
 
 
 def _wire_orchestrator_queue(harness, tmp_path, monkeypatch, *, live=True):
-    """Point 'test-project' at *tmp_path* and force the orchestrator-liveness gate."""
+    """Point 'test-project' at *tmp_path* and force the orchestrator-lock gate."""
     import fused_memory.reconciliation.harness as _h
 
     harness._known_projects = dict(harness._known_projects)
     harness._known_projects['test-project'] = str(tmp_path)
-    monkeypatch.setattr(_h, 'is_orchestrator_live_for', lambda _root: live)
+    monkeypatch.setattr(_h, 'is_orchestrator_lock_held', lambda _root: live)
     return escalation_queue_dir(tmp_path)
 
 
@@ -21218,6 +21345,59 @@ def _promote_like_orphan_reaper(queue, esc_id) -> str:
         resolved_by='harness-orphan-reaper',
     )
     return promoted_id
+
+
+def _promote_like_info_l0_router(queue, esc_id) -> str:
+    """Simulate `orchestrator/escalation_router.py::_promote`, the curator-refusal fallback.
+
+    orchestrator is not a fused-memory dependency, so its close is reproduced
+    here: the L0 dismissed by the router with no resolution class, and a NEW L1
+    whose detail is the L0's followed by the router's `[info-l0-router]` block.
+    """
+    from escalation.models import Escalation
+
+    esc = queue.get(esc_id)
+    promoted_id = queue.make_id(esc.task_id)
+    queue.resolve(
+        esc_id,
+        f'Promoted by the info-L0 router (orphan-reaper) to {promoted_id}: ticket_refused',
+        dismiss=True,
+        resolved_by='info-l0-router',
+    )
+    queue.submit(Escalation(
+        id=promoted_id,
+        task_id=esc.task_id,
+        agent_role='harness-info-l0-router',
+        severity=esc.severity,
+        category=esc.category,
+        summary=f'Info note not converted to a task (ticket_refused): {esc.summary}'[:200],
+        detail=(
+            (esc.detail or esc.summary)
+            + '\n\n[info-l0-router] This info note was not converted to a task: '
+            'ticket_refused (curator ticket tkt_1: duplicate).'
+        ),
+        suggested_action='convert_to_task',
+        level=1,
+    ))
+    return promoted_id
+
+
+def _convert_like_info_l0_router(queue, esc_id, converted_task_id='9001') -> None:
+    """Simulate `orchestrator/escalation_router.py::_close_converted`.
+
+    orchestrator is not a fused-memory dependency, so the close it makes once
+    the curator converts an info L0 to a task is reproduced here.
+    """
+    from escalation.disposition import ConvertViaCurator
+
+    queue.resolve(
+        esc_id,
+        'converted — closed by the info-L0 router (orphan-reaper, exit orphan): '
+        f'converted:{converted_task_id}',
+        dismiss=True,
+        resolved_by='info-l0-router',
+        resolution_class=ConvertViaCurator.resolution_class,
+    )
 
 
 def test_file_finding_task_escalation_lands_a_record_on_the_real_task(
@@ -21643,6 +21823,114 @@ def test_resolved_prior_record_does_not_suppress_a_refile(
     assert [e.id for e in EscalationQueue(queue_dir).get_pending()] == [second]
 
 
+def test_router_converted_prior_record_holds_back_the_refile(
+    journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
+):
+    """Dedupe matrix (e): a router conversion is not an adjudication.
+
+    The curator already turned the finding into a task, so refiling it every
+    cycle would only mint one L0 plus one curator ticket per cycle (task 7894).
+    """
+    from escalation.queue import EscalationQueue
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    queue_dir = _wire_orchestrator_queue(harness, tmp_path, monkeypatch)
+
+    first = harness._file_finding_task_escalation('test-project', 'run-1', _orch_finding(), 4)
+    assert first
+    _convert_like_info_l0_router(EscalationQueue(queue_dir), first)
+
+    second = harness._file_finding_task_escalation('test-project', 'run-2', _orch_finding(), 5)
+
+    assert second is None, f'a freshly converted finding must not refile, got {second!r}'
+    assert _routed_records(queue_dir) == []
+    converted = EscalationQueue(queue_dir).get(first)
+    assert converted is not None and converted.refiles_suppressed == 1, (
+        'the held-back refile must leave the INV-4 storm counter on the converted record'
+    )
+
+
+def test_conversion_of_one_finding_does_not_hold_back_a_distinct_one(
+    journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
+):
+    """The conversion hold is keyed on the finding fingerprint, not on the task."""
+    from escalation.queue import EscalationQueue
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    queue_dir = _wire_orchestrator_queue(harness, tmp_path, monkeypatch)
+
+    first = harness._file_finding_task_escalation('test-project', 'run-1', _orch_finding(), 4)
+    assert first
+    _convert_like_info_l0_router(EscalationQueue(queue_dir), first)
+
+    distinct = harness._file_finding_task_escalation(
+        'test-project', 'run-2', _orch_finding_b(), 4,
+    )
+
+    assert distinct and distinct != first, (
+        f'a conversion of another finding must not hold this one back, got {distinct!r}'
+    )
+
+
+def test_conversion_older_than_the_recurrence_window_does_not_hold_back_the_refile(
+    journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
+):
+    """Past the window a persisting finding refiles, and the curator judges it again."""
+    from escalation.queue import EscalationQueue
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    queue_dir = _wire_orchestrator_queue(harness, tmp_path, monkeypatch)
+
+    first = harness._file_finding_task_escalation('test-project', 'run-1', _orch_finding(), 4)
+    assert first
+    _convert_like_info_l0_router(EscalationQueue(queue_dir), first)
+    archived = next(queue_dir.rglob(f'{first}.json'))
+    data = json.loads(archived.read_text())
+    data['resolved_at'] = (datetime.now(UTC) - timedelta(hours=25)).isoformat()
+    archived.write_text(json.dumps(data, indent=2))
+
+    second = harness._file_finding_task_escalation('test-project', 'run-2', _orch_finding(), 5)
+
+    assert second and second != first, (
+        f'a conversion older than the recurrence window must not hold back a refile, '
+        f'got {second!r}'
+    )
+
+
+@pytest.mark.parametrize(
+    'promote',
+    [_promote_like_orphan_reaper, _promote_like_info_l0_router],
+    ids=['orphan-reaper', 'info-l0-router-refusal'],
+)
+def test_promotion_is_not_a_conversion(
+    promote, journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
+):
+    """A promoted and then adjudicated finding refiles: promotion never stamps 'converted'.
+
+    The dismissed L0 carries no 'converted' class, and the promoted L1's
+    suffixed detail carries no readable fingerprint, so neither holds it back.
+    Both promoters a routed L0 can meet are run: the orphan reaper (router
+    off) and the info-L0 router's fallback after a curator refusal (router on,
+    the default).
+    """
+    from escalation.queue import EscalationQueue
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    queue_dir = _wire_orchestrator_queue(harness, tmp_path, monkeypatch)
+    queue = EscalationQueue(queue_dir)
+
+    first = harness._file_finding_task_escalation('test-project', 'run-1', _orch_finding(), 4)
+    assert first
+    promoted = promote(queue, first)
+    queue.resolve(promoted, 'adjudicated by operator')
+
+    after = harness._file_finding_task_escalation('test-project', 'run-2', _orch_finding(), 5)
+
+    assert after and after not in (first, promoted), (
+        f'an adjudicated promotion must let the refile through, got {after!r}'
+    )
+
+
 def test_dead_orchestrator_files_nothing_and_creates_no_queue_directory(
     journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
 ):
@@ -21938,6 +22226,53 @@ async def test_two_persistent_findings_on_one_task_in_one_cycle_yield_two_record
         and e.summary.startswith('Persistently unresolved after remediation')
     }
     assert routed_fps == recon_fps, (routed_fps, recon_fps)
+
+
+@pytest.mark.asyncio
+async def test_converted_routed_record_is_not_refiled_by_the_next_cycle(
+    journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
+):
+    """The task-7894 loop, end to end: no refile once the router has converted.
+
+    After the port-8103 watcher closes the recon-queue twin, `_escalate` is
+    quiet for the recurrence window but the routed filer is called again on
+    every cycle. Without the conversion hold each such cycle files one more
+    routed L0, which the info-L0 router hands to the curator again.
+    """
+    from escalation.queue import EscalationQueue
+
+    from fused_memory.reconciliation.harness import (
+        _INTEGRITY_FINDING_RECURRENCE_THRESHOLD,
+    )
+
+    harness, recon_queue = _make_queued_test_harness(
+        journal, event_buffer, mock_memory_service, tmp_path, subdir='recon-esc',
+    )
+    orch_queue_dir = _wire_orchestrator_queue(harness, tmp_path, monkeypatch)
+    _wire_remediation_tree(harness, ['4458'])
+    finding = _orch_finding()
+
+    await _drive_cycle(
+        harness, journal, event_buffer, finding,
+        n_seed=max(1, _INTEGRITY_FINDING_RECURRENCE_THRESHOLD - 2),
+    )
+
+    routed = _routed_records(orch_queue_dir)
+    twins = [e for e in recon_queue.get_pending() if e.category == 'recon_integrity_issue']
+    assert len(routed) == 1, [e.id for e in routed]
+    assert len(twins) == 1, [e.id for e in twins]
+
+    recon_queue.resolve(
+        twins[0].id, 'closed by the watcher', dismiss=True, resolved_by='escalation-watcher',
+    )
+    _convert_like_info_l0_router(EscalationQueue(orch_queue_dir), routed[0].id)
+
+    await _drive_cycle(harness, journal, event_buffer, finding, n_seed=0)
+
+    assert _routed_records(orch_queue_dir) == [], (
+        'the next cycle refiled a finding the info-L0 router had just converted: '
+        f'{[e.id for e in _routed_records(orch_queue_dir)]}'
+    )
 
 
 # The four tests below are the VOLUME-PARITY guarantee made executable. Each

@@ -230,8 +230,9 @@ subprojects:
     purpose: >
       Internal library providing the Claude CLI invocation wrapper and the multi-account
       usage gate (OAuth failover across Max subscription accounts). Exists so fused-memory
-      and orchestrator share this code without circular dependencies. It is now the SINGLE
-      source of truth: orchestrator/usage_gate.py is a thin re-export shim.
+      and orchestrator share this code without circular dependencies. shared.usage_gate is
+      the SINGLE source of truth and the orchestrator imports it directly (task 6641 deleted
+      the orchestrator/usage_gate.py re-export shim).
 
     key_scenarios:
       - "invoke_claude_agent shells out to Claude CLI and returns structured AgentResult"
@@ -256,8 +257,8 @@ subprojects:
       - decision: "HTTP 429 classifies as cap-hit, not auth_failed"
         why: "cli_invoke's auth predicate is narrowed to {401, 403}; _run_probe also demotes auth_failed→capped on cap prefix as belt-and-braces"
 
-      - decision: "shared.usage_gate is canonical; orchestrator/usage_gate.py is a `from shared.usage_gate import *` shim"
-        why: "The old 'not yet unified' gap is closed — there is one implementation (~1376 lines in shared), no drift risk"
+      - decision: "shared.usage_gate is canonical, with no orchestrator re-export"
+        why: "One implementation and one import spelling. The old `from shared.usage_gate import *` shim reached only what `__all__` listed, so it was a lockstep site; task 6641 removed it"
 
     known_gaps:
       - what: "No cross-process usage gate coordination"
@@ -268,19 +269,22 @@ subprojects:
 
   dashboard:
     purpose: >
-      Read-only monitoring web UI. The user-facing surface is a JSX SPA in
-      static/redux/ (tabs: overview, tasks, curator, scheduler), served by a FastAPI
-      backend that reads directly from the same SQLite databases fused-memory and the
-      sampler write, and proxies a narrow set of MCP calls. Gives a human operator a live
-      view of memory health, write-queue status, reconciliation activity, orchestrator
-      progress, scheduler parks, curator queue/latency, merge-queue/halt state, host load,
-      and historical cost/performance metrics.
+      Operator web UI: a JSX SPA (static/redux/) on a FastAPI backend that gives a
+      human operator a live view of the factory (memory health, write queue,
+      reconciliation, orchestrator progress, scheduler parks, curator, merge queue,
+      escalations, code-quality trends, host load, cost/performance history) plus a
+      small set of operator controls. The backend reads the SQLite databases
+      fused-memory, the orchestrator (data/orchestrator/runs.db) and the sampler
+      write, writes only its own background samplers' history stores
+      (dashboard/src/dashboard/loops.py), and calls fused-memory MCP tools for live
+      reads and for every operator control (see key_decisions).
 
     key_scenarios:
       - "Watching an orchestrator run in real time with per-task progress and details panes"
       - "Inspecting the curator queue — outstanding tickets, latency, cancel button per ticket"
       - "Observing merge-queue state — queued merges, halt status, who/why halted"
-      - "Inspecting scheduler park state — which modules are parked and by whom"
+      - "Inspecting scheduler park state across each module's whole park stack, not only its active top — buried owners, and stranded parks whose owner is no longer live, which the operator can request eviction of"
+      - "Steering dispatch from the scheduler tab — setting or clearing a task's priority override and reordering the pin queue"
       - "Reviewing host load (PSI + verify concurrency/RSS + OCCT queue depth) from the sampler's load-samples.db"
       - "Reviewing costs by account / project / role / run, plus burndown and cap history"
       - "Checking memory subsystem health — Graphiti, Mem0, queue status"
@@ -292,6 +296,7 @@ subprojects:
       - "Graceful degradation when fused-memory or SQLite DBs are unavailable (offline banner, empty state — never synthetic data)"
       - "Tests pass covering routes, data layer, and template/JSX behaviour"
       - "After a backend (Python) change, `systemctl --user restart dark-factory-dashboard.service` is required for the API to pick it up — uvicorn does not auto-reload"
+      - "With fused-memory unreachable, an operator control answers 502 fused_memory_unreachable instead of reporting success; an ambiguous failure answers 502 fused_memory_outcome_unknown and is not retried on another URL"
 
     key_decisions:
       - decision: "JSX SPA ('redux') is the only UI; htmx + Jinja partials were fully removed"
@@ -300,8 +305,11 @@ subprojects:
       - decision: "No synthetic / PRNG / mockup data anywhere in the dashboard"
         why: "Operators distrust dashboards that lie. Empty state is '—' or empty spark; never fake sparklines or hardcoded literals."
 
-      - decision: "Direct SQLite reads for reconciliation/performance/curator/load data"
-        why: "Read-only URI mode (mode=ro) on the same DBs fused-memory and the sampler write; avoids adding API endpoints for monitoring. The load schema (LOAD_SAMPLES_SCHEMA) is a hand-maintained copy of sampler.store._SCHEMA — a manual sync contract, not an import."
+      - decision: "Direct SQLite reads for reconciliation/cost/performance/curator/load data"
+        why: "Read-only URI mode (mode=ro) on the same DBs fused-memory, the orchestrator (runs.db) and the sampler write; avoids adding API endpoints for monitoring. The load-samples schema and metric vocabulary are imported from the sampler, never copied (see sampler key_decisions)."
+
+      - decision: "Every operator control is a POST route that writes through one fused-memory MCP proxy, never a direct write to a store the dashboard does not own"
+        why: "dashboard/src/dashboard/app.py::_mcp_write_proxy is the single proxy behind the curator-cancel and scheduler write routes, so the fused-memory server that owns the state validates and records every change. Failover and no-retry semantics: that function's docstring. The missing retry on an ambiguous failure is deliberate, not a defect."
 
       - decision: "Fan-out across DASHBOARD_FUSED_MEMORY_URLS is failover-only, with first-success-per-root semantics"
         why: "Curator tickets live on a single instance (singleton-lock invariant), so a not_found from URL[0] short-circuits — no need to try other URLs. Avoids double-counting across failover URLs."
@@ -312,10 +320,7 @@ subprojects:
       - decision: "DF_DATA reference-capture loader pattern"
         why: "shell.jsx captures PROJECTS/AGENTS arrays at module load; the loader mutates them in place via STABLE_ARRAY_KEYS so live refresh keeps the references stable for child components"
 
-    known_gaps:
-      - what: "The scheduler view shows only ACTIVE-TOP parks (INV-7); buried/shadowed park owners and orphaned parks are invisible"
-        why: "snapshot_parks() is intentionally top-only, so a preempted-but-shadowed owner or a stranded orphan park does not render. The park-stack-visibility batch (PRD plans/dashboard-park-stack-visibility-prd.md, tasks 1868-1874) adds a full-stack snapshot, stranded/orphan surfacing, and an evict control."
-        tracking: "1868"
+    known_gaps: []
 
     exclude:
       - "static/ — vendored CSS/JS assets (favicon, tailwind, third-party libs)"
@@ -374,39 +379,43 @@ subprojects:
 
   sampler:
     purpose: >
-      Host-load sampler. A timer-fired ONE-SHOT (Type=oneshot, every 5s — NOT a daemon)
-      that collects 9 load metrics — PSI cpu/memory/io avg10 from /proc/pressure, plus
-      occt_queue_depth, verify_concurrency, verify_rss_total_bytes from the process table —
-      and appends them to data/load-samples.db, which the dashboard reads to render live
-      system-health panels. Gives the factory an always-on load signal without a long-lived
-      process that could hang or leak.
+      Host-load sampler: a timer-fired ONE-SHOT (Type=oneshot, every 5s — NOT a daemon)
+      that appends one tick of host load (PSI pressure, run-queue load, the factory's
+      own cgroup pressure per cgroup leaf, verify/OCCT process saturation) to
+      data/load-samples.db, giving the factory an always-on load signal without a
+      long-lived process that could hang or leak. The dashboard reads that file for its
+      live system-health panels, and scripts/load-threshold-calibration.py reads it to
+      recommend the shared.psi admission thresholds.
 
     key_scenarios:
-      - "Every 5s systemd fires the unit; PSI rows + process-level rows are written to data/load-samples.db; the dashboard /api/load endpoint reads them into sparklines"
+      - "Every 5s systemd fires the unit; each admitted collection group's rows land in data/load-samples.db in ONE transaction, so the corpus never holds half a tick; the dashboard /api/load endpoint reads them into sparklines"
       - "occt_queue_depth shows how many cargo-test-occt-gated bash processes are blocked on the OCCT semaphore; verify_concurrency/RSS show verify.sh saturation"
-      - "24-hour rolling window retained (per-tick prune + daily VACUUM) so the DB stays small regardless of uptime"
-      - "Degrade-and-continue: a PSI-collection failure still writes process metrics and vice versa; only a store-construction failure exits non-zero"
+      - "Rows are kept for a bounded retention window and pruned at most once a day, and VACUUM runs only when enough of the file is reclaimable; the window, cadences and reclaim threshold live in sampler/src/sampler/store.py (module docstring 'Retention', LoadSampleStore.cleanup_old, LoadSampleStore.maybe_vacuum). The window is sized for threshold calibration, not just the dashboard sparklines"
+      - "Degrade-and-continue per collection group: a group whose collector fails, or that emits a key its MetricGroup does not admit (logged at ERROR naming the keys), writes nothing that tick while the other groups are still written, and no collection failure exits non-zero. A store failure is not degraded: opening the store (the leaf-column migration included), the tick write, the retention prune and the VACUUM eligibility check all propagate out of sampler/src/sampler/__main__.py::main and exit non-zero; only a failed VACUUM itself is caught and retried (LoadSampleStore.maybe_vacuum)"
 
     what_working_means:
       - "systemctl --user is-active dark-factory-load-sampler.timer returns active"
       - "data/load-samples.db exists at repo root within ~15s of enabling"
-      - "9 distinct metrics appear in the last 30s; journal shows `tick ts=… psi={…} process={…}` lines every 5s with no exception entries"
-      - "The dashboard load panel shows non-null sparklines for all 9 metrics"
+      - "Rows for every group's host-level metrics appear in the last 30s; assert presence, not a count, because the per-tick row count depends on the host's cgroup leaves (sampler/src/sampler/metrics.py::METRIC_GROUPS). The journal shows `tick ts=… psi={…} process={…} load={…}` lines every 5s, with no exception entries and no group rendered `dropped`"
+      - "/api/load returns populated values for every metric it serves (dashboard/src/dashboard/data/load.py::KNOWN_METRICS, a projection of METRIC_GROUPS)"
 
     key_decisions:
       - decision: "Timer-fired oneshot, not a daemon — no in-memory state survives between ticks"
-        why: "Avoids a long-lived process that could hang/leak; trailing-window process metrics are computed by querying the last ~59 DB rows each tick, not from an in-process ring buffer"
+        why: "Avoids a long-lived process that could hang/leak; a windowed metric's trailing window is read back from the DB each tick, per (metric, leaf), rather than kept in an in-process ring buffer (sampler/src/sampler/store.py module docstring, 'Trailing window')"
 
       - decision: "occt_queue_depth uses an FD-9 jobserver heuristic (a gated bash proc whose /proc/<pid>/fd/9 is absent is 'waiting')"
         why: "FD 9 is the jobserver semaphore read-end; this is an implementation-detail heuristic (metrics.py docstring flags it) that may break if the gate script changes FD numbers. Matching is substring on the cmdline, so path-form invocations (…/cargo-test-occt-gated.sh) are counted."
 
-      - decision: "VACUUM opened with isolation_level=None (autocommit), timestamp recorded only after success"
-        why: "Avoids 'cannot VACUUM from within a transaction'; recording the time only on success avoids suppressing retries on transient failure"
+      - decision: "VACUUM runs on its own autocommit connection, only when the reclaimable free-page fraction clears a threshold, and stamps its clock only on success"
+        why: "SQLite refuses VACUUM inside a transaction; a whole-file rewrite pays only after a bulk prune frees pages that steady-state inserts will not reuse; a skip (nothing to reclaim) counts as a successful evaluation, while a failed VACUUM is retried on the next eligible tick. Threshold and cadence: sampler/src/sampler/store.py::LoadSampleStore.maybe_vacuum"
 
-    known_gaps:
-      - what: "The load-samples schema is duplicated between sampler.store._SCHEMA and dashboard's LOAD_SAMPLES_SCHEMA with no automated sync check"
-        why: "A manual contract; a sampler schema change without a matching dashboard update would surface only as a dashboard query failure at read time. Documented in both files, but unenforced."
-        tracking: null
+      - decision: "A cgroup leaf is a column, never part of the metric name"
+        why: "Per-leaf metrics are keyed SampleKey(metric, leaf) and stored in samples.leaf (task 6772). Files written before the column existed are migrated at store construction, additively and feature-detected, in one transaction; that migration's one-time split of legacy `metric:leaf` rows (sampler/src/sampler/store.py::_SPLIT_LEGACY_KEYS_SQL) is the only place ':' is parsed out of a metric name. MetricSpec rejects a name containing ':', and SampleKey.label() is display-only"
+
+      - decision: "The sampler owns the load-samples schema and the metric vocabulary; consumers import them, never copy them"
+        why: "sampler/src/sampler/store.py::SCHEMA and sampler/src/sampler/metrics.py::METRIC_GROUPS (metric names, groups, which metrics are per-leaf, gate arms) are the one home (task 6772). The dashboard declares dark-factory-load-sampler as a workspace dependency and projects METRIC_GROUPS; scripts/load-threshold-calibration.py imports sampler.metrics but never sampler.store, because it runs under /usr/bin/python3 with no venv (that script's module docstring). A reintroduced local copy of the schema or the metric list is a regression"
+
+    known_gaps: []
 
     exclude: []
 

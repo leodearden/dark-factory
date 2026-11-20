@@ -1142,8 +1142,9 @@ class TestA1VerifyRemainsTheGate:
 #
 # Review blocker (robustness / false-DONE at workflow.py:6193): the entry's
 # steps_completed is derived purely from `status == 'done'` and ignores
-# `commit` entirely. α's authoring-time guard `_sha_exists_on_branch`
-# (mcp/plan_tools.py:514) is `git merge-base --is-ancestor <sha> HEAD`, which
+# `commit` entirely. α's authoring-time guard
+# (orchestrator/mcp/branch_probes.py::sha_exists_on_branch) is
+# `git merge-base --is-ancestor <sha> HEAD`, which
 # is satisfied by `base_commit` ITSELF and by every main ancestor below base.
 # An architect can therefore pre-satisfy every step against base-reachable
 # shas on a branch carrying ZERO commits beyond base and still get a
@@ -1237,11 +1238,11 @@ class TestSkippedExecuteEntryRequiresBeyondBaseProvenance:
     ):
         """WHY status alone is insufficient: α's guard is reachability-only.
 
-        If α's ``_sha_exists_on_branch`` is ever tightened to REJECT
+        If α's ``branch_probes.sha_exists_on_branch`` is ever tightened to REJECT
         base-reachable shas, this assertion fails loudly and the writer-side
         filter below can be revisited rather than silently kept forever.
         """
-        from orchestrator.mcp import plan_tools
+        from orchestrator.mcp import branch_probes
 
         await _advance_main(config, 'below_base')
         _rc, below_base_sha, _err = await _run(
@@ -1249,13 +1250,13 @@ class TestSkippedExecuteEntryRequiresBeyondBaseProvenance:
         )
         wt_info = await git_ops.create_worktree(task_assignment.task_id)
 
-        assert plan_tools._sha_exists_on_branch(
+        assert branch_probes.sha_exists_on_branch(
             wt_info.path, wt_info.base_commit,
         ) is True, 'PREMISE: the guard admits base_commit itself'
-        assert plan_tools._sha_exists_on_branch(
+        assert branch_probes.sha_exists_on_branch(
             wt_info.path, below_base_sha,
         ) is True, 'PREMISE: the guard admits arbitrary main ancestors below base'
-        assert plan_tools._sha_exists_on_branch(
+        assert branch_probes.sha_exists_on_branch(
             wt_info.path, _ABSENT_SHA,
         ) is False, 'PREMISE: the guard does reject a non-existent sha'
 

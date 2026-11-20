@@ -92,3 +92,18 @@ test('sketch #7: a project whose newest sample is a gap renders stale, carried i
   assert.deepEqual(parityBannerState(D.BURNDOWN_BY_PROJECT.B, null), { peak: 30, cap: 24, text: ' · 1 snapshot over' });
   assert.equal(parityBannerState(D.BURNDOWN_BY_PROJECT.A, null), null);
 });
+
+test("sketch #7: each project's own label row is rebuilt from its label_spans over the served union", async () => {
+  const client = loadClient();
+  await land(client, burndownPath('30d'), 'burndown_ragged', { win: '30d' });
+  const D = client.window.DF_DATA;
+  const { projectBurndownBlock } = client.window.DF_BURNDOWN_BANDS;
+
+  const b = projectBurndownBlock(D, 'B');
+  assert.deepEqual(b.labels, D.BURNDOWN.labels.slice(0, -1), "B's gap at t2 leaves its row one short of the union");
+  assert.equal(b.labels.length, b.done.length, "B's labels pair with B's own series");
+
+  const a = projectBurndownBlock(D, 'A');
+  assert.deepEqual(a.labels, D.BURNDOWN.labels, 'A measured every union instant');
+  assert.equal(a.labels.length, a.done.length);
+});

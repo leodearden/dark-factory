@@ -184,8 +184,8 @@ def _empty_path_dir(tmp_path):
     return str(path_dir)
 
 
-def test_wrapper_default_prefix_invokes_uv_run_frozen_project(fake_recorder, tmp_path):
-    """Pins the default FLAG_MARKER_SWEEP_CMD prefix -- `uv run --frozen
+def test_wrapper_default_prefix_invokes_uv_run_no_sync_project(fake_recorder, tmp_path):
+    """Pins the default FLAG_MARKER_SWEEP_CMD prefix -- `uv run --no-sync
     --project "$FM" python`, built literally so "$FM" survives verbatim even
     when the repo path contains spaces."""
     uv = fake_recorder("uv", bin_dir=tmp_path / "uv-bin")
@@ -210,7 +210,7 @@ def test_wrapper_default_prefix_invokes_uv_run_frozen_project(fake_recorder, tmp
     calls = uv.calls()
     assert len(calls) == 1, f"calls={calls!r}"
     assert calls[0] == [
-        "run", "--frozen", "--project", str(fake_fm), "python",
+        "run", "--no-sync", "--project", str(fake_fm), "python",
         str(fake_fm / "scripts" / "sweep_orphan_flag_markers.py"),
         "--check", "--project-id", "reify",
     ], f"argv={calls[0]!r}"
@@ -345,7 +345,7 @@ def test_wrapper_resolves_uv_from_home_local_bin_when_path_omits_it(fake_recorde
         f"Expected the $HOME/.local/bin/uv fallback to actually be invoked; "
         f"calls={calls!r} stderr={result.stderr!r}"
     )
-    assert calls[0][:2] == ["run", "--frozen"], f"argv={calls[0]!r}"
+    assert calls[0][:2] == ["run", "--no-sync"], f"argv={calls[0]!r}"
 
 
 def test_wrapper_fails_loud_when_uv_bin_is_set_but_not_executable(fake_recorder, tmp_path):

@@ -546,7 +546,7 @@ test('viewShareText: a measured empty census reads 0%, never NaN%', () => {
 const BURNDOWN_DATA = {
   BURNDOWN: { labels: ['a', 'b', 'c'], in_progress: [1, 2, 3], blocked: [4, 5, 6], pending: [7, 8, 9] },
   BURNDOWN_BY_PROJECT: {
-    'dark-factory': { labels: ['a', 'b'], in_progress: [10, 11], blocked: [12, 13], pending: [14, 15] },
+    'dark-factory': { label_spans: [[0, 2]], in_progress: [10, 11], blocked: [12, 13], pending: [14, 15] },
   },
 };
 

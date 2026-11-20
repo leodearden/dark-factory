@@ -29,8 +29,8 @@ T3 Code v0.1.6 (``~/src/t3code-v0.1.6``):
 
 WHY ``cross_suite_helpers/``.  So the root pyright table can name this helper
 without exposing ``orchestrator/tests``; see the root ``pyproject.toml``
-``extraPaths``. The ``_`` prefix is the convention
-``orchestrator/tests/_mcp_transport_harness.py`` records. No pytest fixtures
+``extraPaths``. The ``_`` prefix is the uniquely-named sibling convention
+``orchestrator/tests/conftest.py`` records. No pytest fixtures
 live here, so no consumer imports one it never names: each test module wraps
 :meth:`FakeT3Server.running` in its own short fixture. A test plays T3's state per call with a :data:`ToolResponder` in
 ``tool_replies``, such as :func:`replies_in_turn`; :data:`HANG_UP` drops one call.

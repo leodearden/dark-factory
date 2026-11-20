@@ -396,8 +396,8 @@ async def apply_retain_arm(
     # boundary in front of it, such as the auto-consolidation executor.
     #
     # The LIVE `memory_service` goes in, positionally. Binding
-    # `memory_service.config` or any leaf of it to a local would make the
-    # five green-tier `mem0_update.*` leaves restart-only in disguise
+    # `memory_service.config` or any leaf of it to a local would make
+    # every green-tier `mem0_update.*` leaf restart-only in disguise
     # (PRD C4).
     decision = resolve_mem0_update_authorization(
         memory_service,

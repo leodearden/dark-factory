@@ -526,10 +526,10 @@ async def test_drain_oldest_chunk_drains_a_folded_row_once(buf):
     await buf.push(_update('A', _at(0)))
     await buf.push(_update('A', _at(1)))
 
-    [chunk] = await buf.drain_oldest_chunk(_PROJECT, limit=10)
+    [chunk] = await buf.drain_oldest_chunk(_PROJECT, limit=10, run_id='r1')
     assert chunk.payload[COALESCED_COUNT_KEY] == 2
     assert await buf.count_buffered(_PROJECT) == 0
-    assert await buf.drain_oldest_chunk(_PROJECT, limit=10) == []
+    assert await buf.drain_oldest_chunk(_PROJECT, limit=10, run_id='r1') == []
 
 
 # ── every pushed event is counted exactly once ─────────────────────────

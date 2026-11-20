@@ -12,7 +12,14 @@ from collections.abc import Callable
 from pathlib import Path
 
 import pytest
-from _git_fixtures import README_SEED, RepoSeed, RepoTemplates, build_repo, seed_repo
+from _git_fixtures import (
+    README_SEED,
+    SEED_REPO_MAX_GIT_SPAWNS,
+    RepoSeed,
+    RepoTemplates,
+    build_repo,
+    seed_repo,
+)
 from _orch_helpers import git_env_with_ceiling
 from _workflow_helpers import _init_git_repo, _init_repo, _init_transcript_repo
 
@@ -298,6 +305,28 @@ def test_a_non_empty_destination_costs_a_full_build(
 
     assert full_build_cost > 1
     assert in_place_cost == full_build_cost
+
+
+def test_seed_repo_max_git_spawns_is_the_costliest_seed_path(
+    templates: RepoTemplates, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    populated = tmp_path / 'populated'
+    populated.mkdir()
+    (populated / 'extra.txt').write_text('already here\n')
+    log = _install_git_spawn_counter(monkeypatch, tmp_path / 'shim')
+
+    costs: dict[str, int] = {}
+    for seed_path, dest in (
+        ('cold copy', tmp_path / 'cold'),
+        ('warm copy', tmp_path / 'warm'),
+        ('in place', populated),
+    ):
+        before = _spawns(log)
+        templates.seed(dest, README_SEED)
+        costs[seed_path] = _spawns(log) - before
+
+    assert max(costs.values()) == SEED_REPO_MAX_GIT_SPAWNS, costs
+    assert costs['cold copy'] == SEED_REPO_MAX_GIT_SPAWNS, costs
 
 
 def test_seed_repo_uses_the_session_templates(tmp_path: Path) -> None:

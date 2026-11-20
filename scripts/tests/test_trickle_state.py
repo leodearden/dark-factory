@@ -35,7 +35,7 @@ import pwd
 import shutil
 import subprocess
 import tempfile
-from collections.abc import MutableMapping
+from collections.abc import Callable, MutableMapping
 from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
@@ -304,6 +304,7 @@ def _state(**overrides) -> TrickleState:
         capped=False,
         consecutive_barren_runs=0,
         consecutive_failed_runs=0,
+        consecutive_deferred_runs=2,
         last_productive_at=_T0,
         last_scheduled_target_date=date(2026, 7, 1),
         census_fired=True,
@@ -377,8 +378,8 @@ class TestTrickleStateCodec:
             'schema_version', 'project_id', 'target_date', 'recorded_at',
             'exit_code', 'outcome', 'applied', 'commit_made',
             'budget_suppressed', 'capped', 'consecutive_barren_runs',
-            'consecutive_failed_runs', 'last_productive_at',
-            'last_scheduled_target_date', 'census_fired',
+            'consecutive_failed_runs', 'consecutive_deferred_runs',
+            'last_productive_at', 'last_scheduled_target_date', 'census_fired',
             'census_fire_streak', 'counters', 'retry_backlog',
             'barren_escalated', 'completion_error_streak',
             'completion_escalated',
@@ -512,6 +513,7 @@ class TestPreGammaDocuments:
         assert state.outcome == RunOutcome.BARREN
         assert state.consecutive_barren_runs == 2
         assert state.consecutive_failed_runs == 0
+        assert state.consecutive_deferred_runs == 0
         assert state.capped is False
         assert dict(state.retry_backlog) == {}
         assert state.last_scheduled_target_date is None
@@ -537,9 +539,9 @@ class TestPreGammaDocuments:
         assert read.value.barren_escalated is recorded
 
     @pytest.mark.parametrize('field', [
-        'consecutive_failed_runs', 'capped', 'retry_backlog',
-        'last_scheduled_target_date', 'census_fired', 'census_fire_streak',
-        'completion_error_streak', 'completion_escalated',
+        'consecutive_failed_runs', 'consecutive_deferred_runs', 'capped',
+        'retry_backlog', 'last_scheduled_target_date', 'census_fired',
+        'census_fire_streak', 'completion_error_streak', 'completion_escalated',
     ])
     def test_each_later_additive_field_may_be_absent_alone(
         self, tmp_path, field
@@ -1125,6 +1127,59 @@ class TestBarrenStreakDue:
         assert trickle_state.barren_streak_due(state, threshold) is due
 
 
+_NIGHT_KINDS: dict[str, Callable[[int], trickle_state.NightRun]] = {
+    'barren': lambda day: _night(day=day, below_sampling_cut=3),
+    'failed': lambda day: _night(day=day, exit_code=1),
+    'deferred': lambda day: _night(day=day, capped=True, selected_count=1),
+    'productive': lambda day: _night(day=day, selected_count=1),
+}
+
+
+def _escalation_due_on(kinds, max_runs) -> list[int]:
+    """The 1-based nights of the *kinds* walk, folded one after another, on
+    which barren_escalation_due is true at *max_runs*."""
+    prior = None
+    due = []
+    for number, kind in enumerate(kinds, start=1):
+        night = trickle_state.fold_night(prior, 'p', _NIGHT_KINDS[kind](number))
+        if trickle_state.barren_escalation_due(night, max_runs):
+            due.append(number)
+        prior = night.state
+    return due
+
+
+class TestBarrenEscalationDue:
+    """The nightly's barren-streak escalation schedule: the threshold, then
+    each later multiple of it in BARREN_ESCALATION_MULTIPLES, then silence
+    until a productive or quiet night resets the streak."""
+
+    def test_a_persistent_streak_reescalates_on_a_doubling_backoff_then_stops(self):
+        assert _escalation_due_on(
+            ['barren'] * 30, trickle_state.DEFAULT_MAX_BARREN_RUNS
+        ) == [3, 6, 12, 24]
+
+    @pytest.mark.parametrize('threshold', [1, 2, 5])
+    def test_the_schedule_is_multiples_of_the_threshold(self, threshold):
+        expected = [
+            threshold * multiple
+            for multiple in trickle_state.BARREN_ESCALATION_MULTIPLES
+            if threshold * multiple <= 30
+        ]
+        assert _escalation_due_on(['barren'] * 30, threshold) == expected
+
+    @pytest.mark.parametrize('kinds, due', [
+        (['barren'] * 5 + ['failed', 'barren'], [3, 7]),
+        (['barren'] * 6 + ['failed', 'barren'], [3, 6]),
+        (['barren'] * 6 + ['deferred', 'barren'], [3, 6]),
+    ], ids=['failed-before-a-point', 'failed-on-a-point', 'deferred-on-a-point'])
+    def test_a_carried_night_neither_fires_nor_shifts_the_schedule(self, kinds, due):
+        assert _escalation_due_on(kinds, trickle_state.DEFAULT_MAX_BARREN_RUNS) == due
+
+    def test_a_reset_rearms_the_schedule_from_its_start(self):
+        kinds = ['barren'] * 6 + ['productive'] + ['barren'] * 3
+        assert _escalation_due_on(kinds, trickle_state.DEFAULT_MAX_BARREN_RUNS) == [3, 6, 10]
+
+
 class TestBarrenRemedy:
     """Each barren door has ONE remedy, spelled once."""
 
@@ -1264,8 +1319,9 @@ class TestRecordRunFailedStreak:
 
 
 class TestRecordRunDeferred:
-    """A night the usage cap deferred observed nothing, so it moves neither
-    streak and owes its date a retry."""
+    """A night the usage cap deferred observed nothing, so it leaves the
+    barren and failed streaks where they were, advances only its own
+    deferred streak, and owes its date a retry."""
 
     @pytest.fixture(autouse=True)
     def _state_root(self, tmp_path, monkeypatch):
@@ -1283,6 +1339,7 @@ class TestRecordRunDeferred:
         assert capped.last_productive_at == prod.last_productive_at
         assert capped.consecutive_barren_runs == 1
         assert capped.consecutive_failed_runs == 0
+        assert capped.consecutive_deferred_runs == 1
         assert capped.census_fired is None
         assert capped.census_fire_streak is not None
         assert capped.census_fire_streak.fires == 2
@@ -1300,6 +1357,154 @@ class TestRecordRunDeferred:
         assert deferred.outcome == RunOutcome.DEFERRED
         assert deferred.consecutive_barren_runs == 2
         assert _record(day=4, budget_skipped=4).consecutive_barren_runs == 3
+
+    def test_consecutive_deferred_nights_count_up(self):
+        assert [
+            _record(day=day, capped=True).consecutive_deferred_runs
+            for day in (1, 2, 3)
+        ] == [1, 2, 3]
+
+    @pytest.mark.parametrize('finisher', [
+        pytest.param(dict(selected_count=2), id='productive'),
+        pytest.param(dict(zero_signal_dropped=3), id='quiet'),
+        pytest.param(dict(budget_skipped=4), id='barren'),
+    ])
+    def test_a_finished_night_resets_the_deferred_streak(self, finisher):
+        _record(day=1, capped=True)
+        _record(day=2, capped=True)
+
+        state = _record(day=3, **finisher)
+        assert state.outcome != RunOutcome.DEFERRED
+        assert state.consecutive_deferred_runs == 0
+
+    def test_a_failed_night_carries_the_deferred_streak(self):
+        """Only a finished pass runs a retry, so a crash neither erases the
+        deferral's progress toward losing owed dates nor adds to it."""
+        _record(day=1, capped=True)
+        _record(day=2, capped=True)
+        assert _record(day=3, exit_code=1).consecutive_deferred_runs == 2
+        assert _record(day=4, capped=True).consecutive_deferred_runs == 3
+
+
+_PASS_KINDS: dict[str, dict[str, Any]] = {
+    'P': dict(exit_code=0, capped=False, commit_made=True),
+    'D': dict(exit_code=0, capped=True, commit_made=False),
+    'F': dict(exit_code=1, capped=False, commit_made=False),
+}
+"""A night's kind as one letter: productive, deferred by the usage cap, or
+failed."""
+
+
+def _scheduled_night(night: int, kind: str) -> trickle_state.NightRun:
+    """The *night*-th scheduled pass in production shape, of *kind* (a key
+    of :data:`_PASS_KINDS`): it covers ``_d(1)`` plus *night* days and is
+    recorded the next day at 03:00."""
+    target = _d(1) + timedelta(days=night)
+    return trickle_state.NightRun(
+        target_date=target,
+        recorded_at=datetime.combine(
+            target + timedelta(days=1), datetime.min.time(), UTC
+        ).replace(hour=3),
+        counters=_counters(selected_count=1),
+        census=None,
+        scheduled=True,
+        **_PASS_KINDS[kind],
+    )
+
+
+class TestUnrecoverableOwedDate:
+    """The owed date the retry backlog can no longer recover: what an
+    unfinished run of nights must cost before the progress probe calls it
+    more than weather."""
+
+    @pytest.fixture(autouse=True)
+    def _state_root(self, tmp_path, monkeypatch):
+        monkeypatch.setenv(trickle_state.STATE_ROOT_ENV, str(tmp_path))
+
+    @pytest.mark.parametrize('short_of_window', [2, 1, 0, -1])
+    def test_the_oldest_owed_date_is_lost_once_the_next_night_is_past_the_window(
+        self, short_of_window
+    ):
+        """The streaks are not read: a finished last night can still leave
+        an owed date the window has passed."""
+        oldest = _T0.date() - timedelta(
+            days=trickle_state.RETRY_MAX_AGE_DAYS - short_of_window
+        )
+        state = _state(
+            retry_backlog={oldest: 1, _T0.date(): 1},
+            consecutive_deferred_runs=0,
+            consecutive_failed_runs=0,
+        )
+
+        lost = trickle_state.unrecoverable_owed_date(state)
+
+        assert lost == (oldest if short_of_window <= 0 else None)
+
+    def test_an_empty_backlog_loses_nothing_whatever_the_deferred_streak(self):
+        state = _state(
+            retry_backlog={},
+            consecutive_deferred_runs=trickle_state.RETRY_MAX_AGE_DAYS + 3,
+        )
+        assert trickle_state.unrecoverable_owed_date(state) is None
+
+    @pytest.mark.parametrize('pattern, loses_first_target', [
+        pytest.param(
+            'D' * (trickle_state.RETRY_MAX_AGE_DAYS - 1), False,
+            id='deferral-one-night-short',
+        ),
+        pytest.param(
+            'D' * trickle_state.RETRY_MAX_AGE_DAYS, True,
+            id='deferral-of-the-window',
+        ),
+        pytest.param(
+            'DDDF' + 'D' * (trickle_state.RETRY_MAX_AGE_DAYS - 4), True,
+            id='crash-inside-the-deferral',
+        ),
+        pytest.param(
+            'D' * (trickle_state.RETRY_MAX_AGE_DAYS - 1) + 'F', True,
+            id='crash-after-the-deferral',
+        ),
+    ])
+    def test_it_names_the_date_the_real_writer_goes_on_to_abandon(
+        self, caplog, pattern, loses_first_target
+    ):
+        """Unfinished nights, then finished ones each running the nightly's
+        retries, through the real writer: the date named after the
+        unfinished nights is exactly the one later abandoned."""
+        lost = [_d(1)] if loses_first_target else []
+        with caplog.at_level('WARNING'):
+            for night, kind in enumerate(pattern):
+                trickle_state.record_run(
+                    'dark_factory', _scheduled_night(night, kind),
+                    barren_escalated=False,
+                )
+            after = trickle_state.read_prior('dark_factory')
+            assert after is not None
+            predicted = trickle_state.unrecoverable_owed_date(after)
+            for night in range(len(pattern), len(pattern) + 12):
+                run = _scheduled_night(night, 'P')
+                state = trickle_state.record_run(
+                    'dark_factory', run, barren_escalated=False
+                )
+                for owed in trickle_state.due_retries(
+                    state, today=run.recorded_at.date()
+                ):
+                    trickle_state.record_retry(
+                        'dark_factory', target_date=owed,
+                        recorded_at=run.recorded_at, exit_code=0, capped=False,
+                        commit_made=True,
+                    )
+
+        assert ([] if predicted is None else [predicted]) == lost
+        assert len(
+            _warnings_naming(caplog, 'trickle retry backlog: abandoning')
+        ) == len(lost)
+        assert all(
+            _warnings_naming(caplog, f'abandoning {owed.isoformat()} ')
+            for owed in lost
+        )
+        final = trickle_state.read_prior('dark_factory')
+        assert final is not None and dict(final.retry_backlog) == {}
 
 
 def _fire(anchor: str | None = '2026-08-02', path=_CENSUS_STATE):

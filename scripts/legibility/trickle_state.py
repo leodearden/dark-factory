@@ -55,13 +55,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import NamedTuple, assert_never
 
-# Import state_docs by the same spelling this module was imported by, so a
-# caller matching on Missing / Malformed / Ok sees the classes this module
-# returns: one source file loaded as two modules has two copies of each.
-if __package__:
-    from . import state_docs
-else:
-    import state_docs
+from legibility import state_docs
 
 logger = logging.getLogger(__name__)
 
@@ -73,10 +67,10 @@ STATE_SCHEMA_VERSION = 1
 OTHER value as malformed rather than guessing at unknown fields.
 
 Fields added after the first writer are ADDITIVE and do not bump it:
-``consecutive_failed_runs``, ``capped``, ``retry_backlog``,
-``last_scheduled_target_date``, ``census_fired``, ``census_fire_streak``,
-``barren_escalated``, ``completion_error_streak`` and
-``completion_escalated``.
+``consecutive_failed_runs``, ``consecutive_deferred_runs``, ``capped``,
+``retry_backlog``, ``last_scheduled_target_date``, ``census_fired``,
+``census_fire_streak``, ``barren_escalated``, ``completion_error_streak``
+and ``completion_escalated``.
 :meth:`TrickleState.from_json` reads an absent one as its default, and an
 absent ``barren_escalated`` as ``None`` (unrecorded). Bumping for such a
 field would make every live state file read malformed on the first
@@ -625,6 +619,7 @@ class TrickleState:
     capped: bool
     consecutive_barren_runs: int
     consecutive_failed_runs: int
+    consecutive_deferred_runs: int
     last_productive_at: datetime | None
     last_scheduled_target_date: date | None
     census_fired: bool | None
@@ -669,6 +664,9 @@ class TrickleState:
             consecutive_failed_runs=defaulted(
                 doc, 'consecutive_failed_runs', state_docs.as_count, 0
             ),
+            consecutive_deferred_runs=defaulted(
+                doc, 'consecutive_deferred_runs', state_docs.as_count, 0
+            ),
             last_productive_at=defaulted(
                 doc, 'last_productive_at', state_docs.as_datetime, None
             ),
@@ -706,6 +704,7 @@ class TrickleState:
             'capped': self.capped,
             'consecutive_barren_runs': self.consecutive_barren_runs,
             'consecutive_failed_runs': self.consecutive_failed_runs,
+            'consecutive_deferred_runs': self.consecutive_deferred_runs,
             'last_productive_at': isoformat_or_none(self.last_productive_at),
             'last_scheduled_target_date': isoformat_or_none(
                 self.last_scheduled_target_date
@@ -747,13 +746,35 @@ def due_retries(state: TrickleState, *, today: date) -> tuple[date, ...]:
 
 
 # ---------------------------------------------------------------------------
+# Recovery policy — the owed date the retry backlog can no longer recover
+# ---------------------------------------------------------------------------
+
+def unrecoverable_owed_date(state: TrickleState) -> date | None:
+    """The oldest date *state* owes that the next night's fold abandons as
+    outside the age window, or ``None`` when every owed date can still be
+    recovered. The bound is :data:`RETRY_MAX_AGE_DAYS`'s; retries run
+    oldest first, so no later date is retried older than this one.
+
+    It reads the backlog, not a streak: deferred and failed nights both
+    leave dates unretried, and a manual pass is not a calendar night. One
+    deferred night is weather (task 4736); the operator reading of a loss
+    is in OPERATIONS.md §"Legibility trickle health probe (04:30)"."""
+    if not state.retry_backlog:
+        return None
+    oldest = min(state.retry_backlog)
+    next_night = state.recorded_at.date() + timedelta(days=1)
+    return None if _within_window(oldest, next_night) else oldest
+
+
+# ---------------------------------------------------------------------------
 # Barren policy — the threshold predicate and each door's remedy
 # ---------------------------------------------------------------------------
 
 def barren_streak_due(state: TrickleState, max_runs: int) -> bool:
     """Whether *state*'s barren streak has reached *max_runs*: the one
-    threshold predicate the nightly's escalation and the progress probe's
-    verdict are both built from."""
+    threshold predicate the progress probe's verdict is built from, and the
+    first point of the nightly's escalation schedule
+    (:func:`barren_escalation_due`)."""
     return state.consecutive_barren_runs >= max_runs
 
 
@@ -858,19 +879,22 @@ def fold_night(
     nothing. ``state.barren_escalated`` is False here; :func:`write_night`
     records the real value.
 
-    ==========  =============  =============  ======================
-    outcome     barren streak  failed streak  last_productive_at
-    ==========  =============  =============  ======================
-    productive  reset          reset          stamped with recorded_at
-    quiet       reset          reset          carried
-    barren      +1             reset          carried
-    failed      carried        +1             carried
-    deferred    carried        carried        carried
-    ==========  =============  =============  ======================
+    ==========  =============  =============  ===============  ========================
+    outcome     barren streak  failed streak  deferred streak  last_productive_at
+    ==========  =============  =============  ===============  ========================
+    productive  reset          reset          reset            stamped with recorded_at
+    quiet       reset          reset          reset            carried
+    barren      +1             reset          reset            carried
+    failed      carried        +1             carried          carried
+    deferred    carried        carried        +1               carried
+    ==========  =============  =============  ===============  ========================
 
     A failed night is evidence about the run, not about signal; a deferred
-    night coded nothing, so it observed neither. Moving a streak on either
-    would let a crash or cap weather erase a real streak or fake one.
+    night coded nothing, so it observed neither. Moving the barren or
+    failed streak on either would let a crash or cap weather erase a real
+    streak or fake one. A deferred night moves only its own streak, which
+    counts the deferred nights since the last finished one: only a
+    finished pass runs a retry, so a failed night carries it.
 
     A census FIRE against the streak's anchor and path increments
     ``census_fire_streak``, any other FIRE restarts it at 1, a NO-FIRE
@@ -886,7 +910,7 @@ def fold_night(
     counts its date in ``retry_backlog`` (:func:`fold_retry_backlog`)."""
     outcome = run.outcome
     today = run.recorded_at.date()
-    barren_streak, failed_streak = _fold_streaks(prior, outcome)
+    streaks = _fold_streaks(prior, outcome)
     completion_streak = _fold_completion_error_streak(
         0 if prior is None else prior.completion_error_streak, run.census
     )
@@ -915,8 +939,9 @@ def fold_night(
         commit_made=run.commit_made,
         budget_suppressed=run.budget_suppressed,
         capped=run.capped,
-        consecutive_barren_runs=barren_streak,
-        consecutive_failed_runs=failed_streak,
+        consecutive_barren_runs=streaks.barren,
+        consecutive_failed_runs=streaks.failed,
+        consecutive_deferred_runs=streaks.deferred,
         last_productive_at=(
             run.recorded_at if outcome == RunOutcome.PRODUCTIVE
             else None if prior is None
@@ -940,22 +965,36 @@ def fold_night(
     return NightFold(prior, run, state, never_run, MappingProxyType(retry.abandoned))
 
 
-def _fold_streaks(
-    prior: TrickleState | None, outcome: RunOutcome
-) -> tuple[int, int]:
-    """``(consecutive_barren_runs, consecutive_failed_runs)`` after a night
-    with *outcome*."""
-    barren = 0 if prior is None else prior.consecutive_barren_runs
-    failed = 0 if prior is None else prior.consecutive_failed_runs
+class Streaks(NamedTuple):
+    """The consecutive barren, failed and deferred runs a night records."""
+
+    barren: int
+    failed: int
+    deferred: int
+
+
+def _fold_streaks(prior: TrickleState | None, outcome: RunOutcome) -> Streaks:
+    """The streaks after a night with *outcome*, per :func:`fold_night`'s
+    table."""
+    carried = (
+        Streaks(0, 0, 0) if prior is None
+        else Streaks(
+            barren=prior.consecutive_barren_runs,
+            failed=prior.consecutive_failed_runs,
+            deferred=prior.consecutive_deferred_runs,
+        )
+    )
     match outcome:
         case RunOutcome.BARREN:
-            return barren + 1, 0
+            return Streaks(barren=carried.barren + 1, failed=0, deferred=0)
         case RunOutcome.FAILED:
-            return barren, failed + 1
+            return carried._replace(failed=carried.failed + 1)
         case RunOutcome.DEFERRED:
-            return barren, failed
+            return carried._replace(deferred=carried.deferred + 1)
+        case RunOutcome.PRODUCTIVE | RunOutcome.QUIET:
+            return Streaks(0, 0, 0)
         case _:
-            return 0, 0
+            assert_never(outcome)
 
 
 def _schedule_cursor(
@@ -981,21 +1020,34 @@ def _schedule_cursor(
 # Escalation re-arm policies — decided on a night's fold, before it is written
 # ---------------------------------------------------------------------------
 
-def barren_streak_reached(night: NightFold, max_runs: int) -> bool:
-    """Whether *night* is the barren night on which its streak first reaches
-    *max_runs*: once per streak, re-armed only when a productive or quiet
-    night resets the streak.
+BARREN_ESCALATION_MULTIPLES: tuple[int, ...] = (1, 2, 4, 8)
+"""The barren streaks, as multiples of the threshold, on which ``nightly.py``
+escalates: 3, 6, 12 and 24 at :data:`DEFAULT_MAX_BARREN_RUNS`.
 
-    Re-firing every night past the threshold would revive task 3270's alarm
-    fatigue; a one-shot latch would leave whoever missed the single
-    escalation in silence, which 3270 rejected as worse. A post that does
-    not land is not retried: ``check_trickle_progress.py`` fails on the same
+A bounded doubling: posting every night would revive task 3270's alarm
+fatigue, and posting once leaves whoever missed that post in silence
+(task 5513). The nightly is silent between these points and after the
+last one. Its only level-triggered follow-up is ``check_trickle_health.py``,
+an opt-in per-project timer: where it is installed it posts on each night
+whose record does not show ``barren_escalated: true``. Where it is not,
+nothing escalates a streak past the last point."""
+
+
+def barren_escalation_due(night: NightFold, max_runs: int) -> bool:
+    """Whether *night* is a barren night whose streak stands on an escalation
+    point: *max_runs* times an entry of :data:`BARREN_ESCALATION_MULTIPLES`.
+    A productive or quiet night resets the streak and so re-arms the
+    schedule from its start.
+
+    Membership alone cannot fire twice in one streak: a barren night always
+    adds exactly 1 to the streak (:func:`_fold_streaks`), and a failed or
+    deferred night carries it without being BARREN. A post that does not
+    land is not retried: ``check_trickle_progress.py`` fails on the same
     streak independently and prints the recorded ``barren_escalated``."""
-    already_due = night.prior is not None and barren_streak_due(night.prior, max_runs)
     return (
         night.state.outcome == RunOutcome.BARREN
-        and barren_streak_due(night.state, max_runs)
-        and not already_due
+        and night.state.consecutive_barren_runs
+        in {max_runs * multiple for multiple in BARREN_ESCALATION_MULTIPLES}
     )
 
 
@@ -1139,7 +1191,8 @@ def record_retry(
 
 
 DEFAULT_MAX_BARREN_RUNS = 3
-"""Consecutive barren runs before ``nightly.py`` escalates and
+"""Consecutive barren runs before ``nightly.py`` first escalates (it
+re-escalates at the multiples in :data:`BARREN_ESCALATION_MULTIPLES`) and
 ``check_trickle_progress.py`` fails.
 
 WHY 3. One barren night can be an ordinary bad day — an unusually large

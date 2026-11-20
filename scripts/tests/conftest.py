@@ -5,13 +5,10 @@ Mirrors the repo root conftest.py sys.path-insertion pattern so that
 scripts/tests/ under importlib import mode.  No package __init__.py is
 needed (importlib mode does not require it).
 
-Also inserts scripts/legibility/ so flat modules nested one level down
-(e.g. `digest.py`, and its PRD-decomposition siblings — the sampler,
-merger, trickle coder, etc. all planned to live under scripts/legibility/)
-resolve via a bare `import digest` the same way top-level scripts/*.py
-modules do. Without this, scripts/ on sys.path alone only makes
-scripts/legibility/ importable as a namespace package (`import legibility`),
-not its contents as bare top-level names.
+scripts/ on sys.path makes scripts/legibility/ importable as the
+`legibility` namespace package, and its modules are imported only as
+`legibility.<mod>`: a bare name would load a second module object for the
+same file (scripts/tests/test_legibility_import_spelling.py).
 
 Also APPENDS scripts/tests/ itself, so non-test helper modules living beside
 the tests (`cli_subprocess_timeout`, `write_triage_attach_fixtures`) resolve
@@ -58,13 +55,26 @@ from pathlib import Path
 
 import pytest
 
+# Suite-wide git isolation (task 3355, incident esc-3072-3).  A run rooted at
+# this directory does not load the repo-root conftest.py, so each test-root
+# conftest wires the defence itself.  APPEND the repo root, never
+# insert(0, ...): at sys.path[0] it would make the subproject directories
+# resolve as namespace packages pointing at the project folder instead of
+# src/<pkg>/, defeating the inserts below.
+if str(REPO_ROOT := Path(__file__).resolve().parents[2]) not in sys.path:
+    sys.path.append(str(REPO_ROOT))
+
+from df_pytest_isolation import (
+    arm_fleet_dir_isolation,
+    arm_leaked_drain_process_guard,
+    arm_test_root_isolation,
+    arm_usage_gate_sweep_confinement,
+    reject_unsafe_basetemp,
+)
+
 _SCRIPTS_DIR = Path(__file__).parent.parent  # scripts/tests/../ = scripts/
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
-
-_LEGIBILITY_DIR = _SCRIPTS_DIR / 'legibility'
-if str(_LEGIBILITY_DIR) not in sys.path:
-    sys.path.insert(0, str(_LEGIBILITY_DIR))
 
 # Same insert for scripts/local-model-serving/ (task 3713, LME-alpha).  That
 # directory name is HYPHENATED, so unlike a dotted package name it can never be
@@ -81,33 +91,14 @@ _THIS_DIR = Path(__file__).resolve().parent
 if str(_THIS_DIR) not in sys.path:
     sys.path.append(str(_THIS_DIR))
 
-# Suite-wide git isolation (task 3355, incident esc-3072-3).  A run rooted at
-# this directory does not load the repo-root conftest.py, so each test-root
-# conftest wires the defence itself.  APPEND the repo root, never
-# insert(0, ...): at sys.path[0] it would make the subproject directories
-# resolve as namespace packages pointing at the project folder instead of
-# src/<pkg>/, defeating the inserts above.
-REPO_ROOT = Path(__file__).resolve().parents[2]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.append(str(REPO_ROOT))
-
-from df_pytest_isolation import (  # noqa: E402
-    _df_claude_binary_unset,  # noqa: F401  — the binding IS the wiring  # debt: task 6997
-    _df_deploy_clocks_unwritten,  # noqa: F401  — the binding IS the wiring
-    _df_fleet_deploy_clock_redirect,  # noqa: F401  — the binding IS the wiring
-    _df_fleet_dir_redirect,  # noqa: F401  — the binding IS the wiring
-    _df_git_ceiling_at_basetemp,  # noqa: F401  — the binding IS the wiring
-    _df_git_env_hermetic,  # noqa: F401  — the binding IS the wiring
-    _df_no_leaked_drain_processes,  # noqa: F401  — the binding IS the wiring
-    _df_no_synthetic_heartbeats_in_live_fleet,  # noqa: F401  — binding IS wiring
-    arm_usage_gate_sweep_confinement,
-    reject_unsafe_basetemp,
-)
 
 
 def pytest_configure(config):
-    """Refuse an unsafe --basetemp (esc-3072-3); arm the UsageGate probe-dir sweep confinement."""
+    """Refuse an unsafe --basetemp (esc-3072-3); arm the suite-wide defences and UsageGate sweep confinement."""
     reject_unsafe_basetemp(config)
+    arm_test_root_isolation(config)
+    arm_fleet_dir_isolation(config)
+    arm_leaked_drain_process_guard(config)
     from shared import usage_gate
 
     arm_usage_gate_sweep_confinement(config, usage_gate)
@@ -115,13 +106,12 @@ def pytest_configure(config):
 
 # The fleet-deploy-clock redirect this directory relied on used to be defined
 # HERE (task 3797). It is now the suite-wide default applied unconditionally by
-# df_pytest_isolation._df_deploy_clocks_unwritten, autoused into every conftest
-# that imports this module — not just this one (task 5299). This directory
-# keeps only the thin `_df_fleet_deploy_clock_redirect` NAME above, imported
-# rather than redefined, so `test_suite_never_stamps_the_repo_fleet_deploy_clock`
-# can still take the resolved path by fixture rather than reading os.environ
-# bare. See df_pytest_isolation.py's module docstring, SECOND DEFENCE, for the
-# full history.
+# df_pytest_isolation._df_deploy_clocks_unwritten in every test root (task
+# 5299). arm_test_root_isolation also arms the thin
+# `_df_fleet_deploy_clock_redirect` view, so
+# `test_suite_never_stamps_the_repo_fleet_deploy_clock` can still take the
+# resolved path by fixture rather than reading os.environ bare. See
+# df_pytest_isolation.py's module docstring, SECOND DEFENCE, for the full history.
 
 
 # ---------------------------------------------------------------------------

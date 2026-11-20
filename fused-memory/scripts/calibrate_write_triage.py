@@ -80,6 +80,8 @@ from typing import Any
 
 import yaml
 
+from fused_memory.config.overlay import WRITE_TRIAGE_BAND_KEYS
+
 logger = logging.getLogger(__name__)
 
 # Labels the curator assigned. `distinct` and `pseudo_contradiction` are the
@@ -779,13 +781,6 @@ def build_report(
 
 _BLOCK_KEY = 'write_triage:'
 
-# The keys this writer DERIVES and is therefore entitled to replace. Everything
-# else found in the block is a hand-set operator knob owned by a human (or by a
-# later leaf), and is preserved verbatim -- see write_triage_config_block.
-_CALIBRATION_OWNED_KEYS = frozenset({
-    't_high', 't_low', 'calibration_report_path', 't_high_by_category',
-})
-
 
 def _interior_comment_run(pending: Sequence[str]) -> list[str]:
     """The leading sub-run of *pending* that belongs to the value ABOVE it.
@@ -823,7 +818,7 @@ def _preserved_block_lines(lines: Sequence[str]) -> tuple[list[str], list[str]]:
     Returns ``(preserved, trailing)``:
 
     * ``preserved`` — every two-space-indented ``key:`` line whose key is not
-      in ``_CALIBRATION_OWNED_KEYS``, together with the run of comment lines
+      in ``WRITE_TRIAGE_BAND_KEYS``, together with the run of comment lines
       immediately above it (its explanatory note) and ALL deeper-indented
       child lines below it (its nested value), interior comments and blank
       separators included -- including a comment that TRAILS the value with
@@ -900,7 +895,7 @@ def _preserved_block_lines(lines: Sequence[str]) -> tuple[list[str], list[str]]:
             continue
         key = stripped.split(':', 1)[0].strip()
         was_keeping = keeping_children
-        keeping_children = key not in _CALIBRATION_OWNED_KEYS
+        keeping_children = key not in WRITE_TRIAGE_BAND_KEYS
         if keeping_children:
             kept.extend(pending)
             kept.append(line)
@@ -1631,7 +1626,7 @@ async def _run(args: Any) -> int:
     import os
 
     from fused_memory.config.schema import FusedMemoryConfig
-    from fused_memory.services.memory_service import MemoryService
+    from fused_memory.maintenance._utils import maintenance_service
 
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
     if args.config:
@@ -1658,9 +1653,7 @@ async def _run(args: Any) -> int:
         if conflict:
             logger.error('ABORT: %s — refusing to calibrate; nothing was written.', conflict)
             return 1
-    memory = MemoryService(config)
-    await memory.initialize()
-    try:
+    async with maintenance_service(config=config) as (_, memory):
         records = load_fixture(args.fixture)
         logger.info('Loaded %d labeled record(s) from %s', len(records), args.fixture)
 
@@ -1749,8 +1742,6 @@ async def _run(args: Any) -> int:
             config_path, ', '.join(sorted(derived_by_category)) or 'none',
         )
         return 0
-    finally:
-        await memory.close()
 
 
 def main() -> int:

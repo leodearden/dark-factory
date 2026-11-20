@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 from escalation.authority import EXECUTOR_IDENTITY, policy_row
 from escalation.models import Escalation
-from orchestrator.session_registry import (
+from orchestrator.decision_registry import (
     AuditOutcome,
     AuditVerdict,
     DecisionRecord,

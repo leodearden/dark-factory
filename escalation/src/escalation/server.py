@@ -6,7 +6,7 @@ import asyncio
 import contextlib
 import json
 import logging
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Collection, Sequence
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -16,6 +16,7 @@ from fastmcp import FastMCP
 from fastmcp.server.dependencies import get_http_headers
 from pydantic import Field, ValidationError
 from shared.branch_names import bare_queued_branch_id, canonical_queued_branch_name
+from shared.escalation_project_scope import escalation_project_for
 from shared.eval_lane import eval_lane_provenance
 
 # Fully qualified rather than `from shared import ...`: the module is
@@ -23,9 +24,11 @@ from shared.eval_lane import eval_lane_provenance
 # not pull fastmcp into every consumer of the base layer.
 from shared.mcp_markup_middleware import (
     FACT_MARKUP_DETECTED,
+    MARKUP_RECURRENCE_ROUTING,
     MARKUP_RESIDUE_ERROR_TYPES,
     MARKUP_STORM_ERROR_TYPE,
     MARKUP_UNRECOVERED_PARAM_ERROR_TYPE,
+    MARKUP_UNRECOVERED_PARAM_OUTCOME_CAVEAT,
     MARKUP_UNREPAIRABLE_ERROR_TYPE,
     MarkupGuardMiddleware,
     RepairPolicy,
@@ -950,8 +953,8 @@ _MARKUP_STORM_ALARM = GuardStormAlarm(
     agent_role=_MARKUP_GUARD_AGENT_ROLE,
     condition='the serialization leak is ACTIVE',
     suggested_action=(
-        'identify the leaking caller from the markup_detected facts and '
-        'report it against plans/toolcall-markup-containment-prd.md'
+        'identify the leaking caller from the markup_detected facts, then '
+        f'{MARKUP_RECURRENCE_ROUTING}'
     ),
 )
 
@@ -1066,8 +1069,9 @@ def _markup_residue_prose(record: dict[str, Any]) -> str:
     produces both.  ``MARKUP_UNREPAIRABLE_ERROR_TYPE`` means the call was
     REFUSED — nothing was written, and the caller was told, so a human may
     reasonably wait for it to resend.  ``MARKUP_UNRECOVERED_PARAM_ERROR_TYPE``
-    means the call was FORWARDED and LANDED without the parameter, and nobody
-    was told: no retry is coming, and the stored record is already wrong.  One
+    means the call was FORWARDED without the parameter, and nobody was told: no
+    retry is coming, and whether the call then succeeded is unknown here
+    (``MARKUP_UNRECOVERED_PARAM_OUTCOME_CAVEAT`` says why).  One
     hardcoded "the call was refused" sentence renders the second kind a record
     that contradicts its own summary three lines above, and the false half is
     the half that changes what an operator does.
@@ -1094,13 +1098,13 @@ def _markup_residue_prose(record: dict[str, Any]) -> str:
         )
     if error_type == MARKUP_UNRECOVERED_PARAM_ERROR_TYPE:
         return (
-            'THE CALL WAS FORWARDED WITHOUT THIS PARAMETER, and it LANDED. The '
-            'value below was recovered from the leak but could not be typed '
-            'against the parameter\'s declared schema, so it was dropped from '
-            'the call rather than passed through untyped. The caller was NOT '
-            'told — nobody is waiting on a retry, and the record that call '
-            'filed is already stored missing this field. The payload below is '
-            'the only surviving copy of it.'
+            'THE CALL WAS FORWARDED WITHOUT THIS PARAMETER. The value below '
+            'was recovered from the leak but could not be typed against the '
+            'parameter\'s declared schema, so it was dropped from the call '
+            'rather than passed through untyped. '
+            f'{MARKUP_UNRECOVERED_PARAM_OUTCOME_CAVEAT} The caller was NOT '
+            'told the value was dropped, so do not wait on a resend of it. The '
+            'payload below is the only surviving copy of it.'
         )
     logger.warning(
         'markup guard: filing an unrecognised residue kind %r — the middleware '
@@ -1302,6 +1306,7 @@ def create_server(
     startup_sweep_now: datetime | None = None,
     store_identity: StoreIdentity | None = None,
     prefix_resolver: PrefixResolver | None = None,
+    per_call_projects: Collection[str] = (),
     mismatch_streak_threshold: int = DEFAULT_MISMATCH_STREAK_THRESHOLD,
 ) -> FastMCP:
     """Create the escalation MCP server with all tools registered.
@@ -1375,10 +1380,18 @@ def create_server(
 
     *prefix_resolver* (default None) — ``shared.uuid_prefix_guard``'s
     ``PrefixResolver`` port.  When given, the uuid-prefix guard is registered
-    after the markup guard, scoped to ``store_identity.project_id``.  A server
-    without a project identity (the reconciliation store) forwards a prefixed
-    call unchanged with ``resolver='no_project'`` and never guesses a project;
-    per-call scoping is task 6910.  When omitted, no prefix guard is registered.
+    after the markup guard, scoped to ``store_identity.project_id``; a server
+    without one is scoped per call through *per_call_projects*.  When omitted,
+    no prefix guard is registered.
+
+    *per_call_projects* (default empty) — the project ids a call on a store
+    without its own project (the reconciliation store) may scope the
+    uuid-prefix guard to, by naming one in its ``X-Escalation-Project``
+    request header (``shared/src/shared/escalation_project_scope.py``).  An
+    absent header, or one naming a project outside this set, leaves the call
+    unscoped (``resolver='no_project'``): a project is never guessed.  Passing
+    it with a project identity raises ValueError.  It scopes only the prefix
+    guard.
 
     *mismatch_streak_threshold* (default 5) — how many refused assertions of
     one ``project_root`` within the streak's window file (or fold) ONE
@@ -1493,8 +1506,8 @@ def create_server(
             '',
             'RAW PAYLOAD, VERBATIM AND ENTIRE — the only surviving copy. '
             'Recover it for the caller if it is still needed, then chase the '
-            'harness serialization leak that produced it '
-            '(plans/toolcall-markup-containment-prd.md).',
+            'harness serialization leak that produced it and '
+            f'{MARKUP_RECURRENCE_ROUTING}.',
             '',
             str(record.get('raw_value') or ''),
         ])
@@ -1540,15 +1553,17 @@ def create_server(
     ))
     # --- Truncated-uuid citations (PRD uuid-prefix-resolution §4-C3) ---
     # After the markup guard, so a parameter it recovers is scanned too (B15).
-    # The project is a registration-time constant: no escalation tool declares
-    # a project_id, and ProjectRootGuard refuses any project_root this store
-    # does not serve. Every tool forwards on ambiguity, because losing an
-    # escalation is worse than the defect.
+    # Every tool forwards on ambiguity, because losing an escalation is worse
+    # than the defect.
+    # Project scope: shared/src/shared/escalation_project_scope.py::escalation_project_for
+    prefix_project_for = escalation_project_for(
+        store_identity.project_id if store_identity is not None else None,
+        per_call_projects,
+    )
     if prefix_resolver is not None:
-        prefix_project = store_identity.project_id if store_identity is not None else None
         mcp.add_middleware(UuidPrefixGuardMiddleware(
             prefix_resolver,
-            lambda _arguments: prefix_project,
+            prefix_project_for,
             exempt_tools=frozenset(),
             forward_on_ambiguity_tools=_ESCALATION_SERVER_TOOL_NAMES,
             escalation_sink=lambda record: file_storm_once(
@@ -2686,7 +2701,10 @@ def create_server(
         NOTE: resolve_issue itself writes no task status — this call changes
         only the escalation record. The orchestrator harness applies the
         ``target_status`` values above. Table B's consumers are listed in the
-        ``escalation/src/escalation/action_effects.py`` module docstring.
+        ``escalation/src/escalation/action_effects.py`` module docstring. A
+        ``resume`` of a held deterministic pure gate is run by the harness
+        inline, which closes it or re-holds it, instead of being re-pended, see
+        ``orchestrator/src/orchestrator/harness.py::Harness._run_held_pure_gate_inline``.
         """
         if terminate is not None:
             return {
@@ -3186,8 +3204,8 @@ def create_server(
         the reconciliation queue are separate stores), so a caller connected to
         one of them learns nothing about records in the other: confirm which
         queue you are talking to before reading any [] as a gap.  Auditing a
-        ``done`` ``task_kind='deterministic'`` gate task that has
-        ``metadata.gate_escalated_at`` set?  Those records live in the
+        ``done`` ``task_kind='deterministic'`` gate task whose
+        ``done_provenance.kind`` is ``'deterministic-gate'``?  Those records live in the
         ORCHESTRATOR queue — call this tool against THAT server before emitting
         any finding, flag, memory or remediation task claiming the escalation
         record was never written.  (Reconciliation stages are denied this tool
@@ -3264,8 +3282,8 @@ def create_server(
         so a caller connected to one of them learns nothing about records in
         the other: confirm which queue you are talking to before treating
         ``count: 0`` as proof that no record was ever filed. Auditing a
-        ``done`` ``task_kind='deterministic'`` gate task that has
-        ``metadata.gate_escalated_at`` set? Those records live in the
+        ``done`` ``task_kind='deterministic'`` gate task whose
+        ``done_provenance.kind`` is ``'deterministic-gate'``? Those records live in the
         ORCHESTRATOR queue — query THAT server before emitting any finding,
         flag, memory or remediation task claiming the escalation record was
         never written. (Reconciliation stages are denied this tool outright
@@ -4159,7 +4177,7 @@ def create_server(
         D1, following the same caller-vouched-bool shape as *verified_green*
         above).  Threaded onto the ``MergeRequest`` the worker dequeues so it
         is visible on ``req`` inside the worker's retry path
-        (``_run_post_merge_verify``).  Default ``False`` is a strict no-op —
+        (``orchestrator/merge_lane/post_merge_verify.py::run_post_merge_verify``).  Default ``False`` is a strict no-op —
         the retry-set primitive that consumes this flag ships separately
         (reify, PRD task D2), so today every value leaves behavior unchanged.
 

@@ -193,21 +193,22 @@ both fakes parse argv and discard the unit token outright: the name never
 reaches the factory, only the real subprocess.  That divergence is deliberate;
 do not "fix" it back into line with the others.
 
-WHICH ROOTDIRS THE DRAIN-SCRIPT DEFENCES ARE WIRED INTO.  Ten conftests
-import from this module; the git ceiling and the deploy-clock guard are in
-all ten.  ``_df_no_leaked_drain_processes`` is armed in nine: bound by
-import in the ROOT conftest (covering ``tests/``) and
-``scripts/tests/conftest.py`` — the two rootdirs that spawn the drain
-script — and armed by :func:`arm_leaked_drain_process_guard` in the seven
-subproject rootdirs (``cockpit``, ``dashboard``, ``escalation``,
-``fused-memory``, ``orchestrator``, ``sampler``, ``shared``), each of which
-runs as its own pytest session and so stamps its own token.  In those nine a
+WHICH ROOTDIRS THE DRAIN-SCRIPT DEFENCES ARE ARMED IN.  Ten conftests
+call :func:`arm_test_root_isolation`, so the git ceiling and the deploy-clock
+guard are in all ten.  :func:`arm_leaked_drain_process_guard` arms
+``_df_no_leaked_drain_processes`` in nine: the ROOT conftest (covering
+``tests/``) and ``scripts/tests/conftest.py`` — the two rootdirs that spawn
+the drain script — and the seven subproject rootdirs (``cockpit``,
+``dashboard``, ``escalation``, ``fused-memory``, ``orchestrator``,
+``sampler``, ``shared``), each of which runs as its own pytest session and so
+stamps its own token.  In those nine a
 green run means the teardown sweep ran; see ``_df_no_leaked_drain_processes``
 for its detection window.  The tenth, ``client-feed``, does not arm this
 guard, so no sweep runs there and a green ``client-feed`` run is unmeasured.
 
 Task 3799's ``_df_fleet_dir_redirect`` / ``_df_no_synthetic_heartbeats_in_live_fleet``
-pair is a SEPARATE defence, bound in three rootdirs: root ``tests/``,
+pair is a SEPARATE defence, armed by :func:`arm_fleet_dir_isolation` in three
+rootdirs: root ``tests/``,
 ``scripts/tests/`` and ``orchestrator/tests/``.  The last is the fleet
 heartbeat's PRODUCER rootdir rather than a drain-script spawner (see the next
 two paragraphs).  The other six subproject rootdirs above carry neither; that
@@ -294,6 +295,16 @@ child: a gate built in a child sweeps whatever tempdir the child inherits, and
 that child's spawner must pass a private ``TMPDIR``, as
 ``orchestrator/tests/test_sighup.py::_exit_after_hup_then_term`` does.
 
+EIGHTH DEFENCE — a mock can never leave a mock-derived directory in the CWD.
+
+``_df_no_mock_derived_stray_dirs`` fails, and cleans up after, any test that
+leaves a tree such as ``AsyncMock/`` or ``MagicMock/`` in the CWD, the shape
+``Path(mock).mkdir()`` produces.  Every test-root conftest arms it through
+:func:`arm_test_root_isolation`, as
+``tests/scripts/test_basetemp_git_isolation.py::_REQUIRED_ARMED_FIXTURES``
+enforces; tasks 3223 and 4592 committed such trees from the orchestrator and
+fused-memory suites.
+
 Import constraint: STDLIB + PYTEST ONLY.  Every subproject conftest imports this
 module, so it must import cleanly inside every member venv — escalation's lacks
 aiosqlite and stubs ``shared`` in ``sys.modules``, so nothing under ``shared/src``
@@ -313,10 +324,12 @@ import enum
 import json
 import math
 import os
+import shutil
 import signal
 import subprocess
 import tempfile
 import time
+import unittest.mock
 import uuid
 import warnings
 from collections.abc import Callable, Iterable, Mapping
@@ -1338,8 +1351,8 @@ def _df_fleet_deploy_clock_redirect(_df_deploy_clocks_unwritten) -> Path:
     """The ``ORCH_FLEET_DEPLOY_CLOCK`` path this session's redirect resolved to.
 
     NOT autouse: the redirect itself is applied unconditionally by
-    :func:`_df_deploy_clocks_unwritten`, which every conftest that imports this
-    module already binds.  This fixture exists only so a test that wants to
+    :func:`_df_deploy_clocks_unwritten`, which :func:`arm_test_root_isolation`
+    arms alongside this fixture in every test root.  This fixture exists only so a test that wants to
     assert ON the redirected path (rather than merely benefit from it) can take
     it BY NAME instead of reading ``os.environ`` bare — deleting the fixture
     then fails collection with a message naming it, instead of quietly passing
@@ -1981,7 +1994,7 @@ def wait_pids_exited(
     means every pid exited.  A zombie counts as exited: reaping a reparented
     orphan is its subreaper's job (``systemd --user`` on this fleet), not the
     code under test's -- the same criterion as
-    ``orchestrator/tests/test_verify_cancel.py::_is_running`` (task 3955).
+    ``shared/src/shared/proc_group.py::pid_running`` (task 3955).
 
     The verdict is always the probe of the returning iteration, so a caller
     descheduled across the deadline never asserts on a stale observation;
@@ -2271,23 +2284,41 @@ def _df_no_leaked_drain_processes():
             pytest.fail(reason, pytrace=False)
 
 
-_LEAKED_DRAIN_GUARD_PLUGIN = 'df-leaked-drain-process-guard'
+def arm_fixtures(config: pytest.Config, *fixtures: Callable[..., object]) -> None:
+    """Register each of *fixtures* for this session, from ``pytest_configure``.
+
+    Idempotent per fixture, because a session that collects several test roots
+    runs each root's ``pytest_configure``. The import of this function is a used
+    call, so a conftest needs no binding of the fixture itself.
+    """
+    for fixture in fixtures:
+        name = getattr(fixture, 'name', None) or fixture.__name__
+        plugin_name = f'df-isolation:{name}'
+        if not config.pluginmanager.has_plugin(plugin_name):
+            config.pluginmanager.register(type(plugin_name, (), {name: fixture}), plugin_name)
 
 
-class _LeakedDrainProcessGuardPlugin:
-    """The plugin :func:`arm_leaked_drain_process_guard` registers: that guard alone."""
+def arm_test_root_isolation(config: pytest.Config) -> None:
+    """Arm the defences every test root carries, from its conftest's ``pytest_configure``."""
+    arm_fixtures(
+        config,
+        _df_git_ceiling_at_basetemp,
+        _df_deploy_clocks_unwritten,
+        _df_fleet_deploy_clock_redirect,
+        _df_git_env_hermetic,
+        _df_claude_binary_unset,
+        _df_no_mock_derived_stray_dirs,
+    )
 
-    _df_no_leaked_drain_processes = _df_no_leaked_drain_processes
+
+def arm_fleet_dir_isolation(config: pytest.Config) -> None:
+    """Arm the fleet-dir redirect and the live-fleet heartbeat guard, from ``pytest_configure``."""
+    arm_fixtures(config, _df_fleet_dir_redirect, _df_no_synthetic_heartbeats_in_live_fleet)
 
 
 def arm_leaked_drain_process_guard(config: pytest.Config) -> None:
-    """Arm :func:`_df_no_leaked_drain_processes` for this session, from ``pytest_configure``.
-
-    Idempotent, because a session that collects several test roots runs each
-    root's ``pytest_configure``.
-    """
-    if not config.pluginmanager.has_plugin(_LEAKED_DRAIN_GUARD_PLUGIN):
-        config.pluginmanager.register(_LeakedDrainProcessGuardPlugin, _LEAKED_DRAIN_GUARD_PLUGIN)
+    """Arm :func:`_df_no_leaked_drain_processes` for this session, from ``pytest_configure``."""
+    arm_fixtures(config, _df_no_leaked_drain_processes)
 
 
 # ---------------------------------------------------------------------------
@@ -2578,7 +2609,7 @@ def fleet_dir_redirect_violation_reason(
     its own wiring and each therefore has its own copy of the test function.
     Two copies of a ~20-line assertion body drift — the first two already had, at
     birth, in the text of the basetemp message.  Each root keeps the one-line
-    test (which is what proves ITS conftest binding is real) and shares the
+    test (which is what proves ITS conftest wiring is real) and shares the
     comparison and the messages, exactly as ``scripts/tests/`` already reuses
     :func:`deploy_clock_snapshot` rather than re-implementing it.
 
@@ -2643,8 +2674,8 @@ def fleet_dir_redirect_target(
     the whole defence.
 
     WHY ADOPTION EXISTS (task 4398): :func:`_df_fleet_dir_redirect` is
-    session-scoped AND autouse, and each test root's conftest binds its own
-    copy. A session collecting two roots runs BOTH instances; without adoption
+    session-scoped AND autouse, and a conftest that binds it by import gets
+    its own copy. A session collecting two such roots runs BOTH instances; without adoption
     each unconditionally ``mktemp``s and overwrites the env var, so the root
     whose fixture ran first yields a path that no longer matches
     ``ORCH_FLEET_DIR`` and its per-root identity assertion fails. One basetemp
@@ -2699,9 +2730,9 @@ def _df_fleet_dir_redirect(tmp_path_factory: pytest.TempPathFactory):
     not "unset" to a ``${VAR:-…}`` default, so leaking one would fall straight
     through to the production path, i.e. be its own bug.
 
-    IDEMPOTENT ACROSS TEST ROOTS (task 4398).  Each root's conftest binds its own
-    copy of this session-scoped fixture, so a session collecting two roots runs
-    both.  When :func:`fleet_dir_redirect_target` says the value already set is
+    IDEMPOTENT ACROSS TEST ROOTS (task 4398).  A conftest that binds this
+    session-scoped fixture by import gets its own copy, so a session collecting
+    two such roots runs both.  When :func:`fleet_dir_redirect_target` says the value already set is
     sound for this run, this instance ADOPTS it and touches neither ``mktemp``
     nor ``os.environ`` — otherwise the second instance to run would overwrite the
     env var out from under the first, leaving the first yielding a path the var
@@ -2714,7 +2745,7 @@ def _df_fleet_dir_redirect(tmp_path_factory: pytest.TempPathFactory):
     :func:`fleet_dir_redirect_violation_reason` would reject.  All three
     properties survive it — hermeticity (the adopted value is inside this run's
     basetemp and is not the live dir), the per-root PROOF (each root's test still
-    takes this fixture BY NAME, so deleting a conftest binding still fails
+    takes this fixture BY NAME, so deleting a conftest's arm call still fails
     collection), and per-call ``env=`` overrides still winning.
 
     WHAT THE RULE CHECKS IS THE PATH, NOT THE FILESYSTEM, so the adopting branch
@@ -2825,7 +2856,8 @@ def leaked_fleet_heartbeat_reason(names: list[str]) -> str | None:
         'seven projects\' '
         'orchestrators use to decide the real fleet\'s drain state.\n'
         'Fix: let df_pytest_isolation._df_fleet_dir_redirect cover the spawner '
-        '(bind it in that rootdir\'s conftest), or set ORCH_FLEET_DIR explicitly '
+        '(arm it from that rootdir\'s conftest with arm_fleet_dir_isolation), or '
+        'set ORCH_FLEET_DIR explicitly '
         'in the call\'s own env=, which is applied after the os.environ copy.\n'
         'DETECT-ONLY: these files have NOT been deleted. Remove them by hand '
         'once you have attributed them — and check the other direction too, '
@@ -3008,3 +3040,109 @@ def _df_claude_binary_unset(monkeypatch: pytest.MonkeyPatch) -> None:
     still set the variable deliberately.
     """
     monkeypatch.delenv(CLAUDE_BINARY_ENV, raising=False)
+
+
+# ---------------------------------------------------------------------------
+# Mock-derived stray directories (task 5145)
+# ---------------------------------------------------------------------------
+
+
+def _public_mock_classes() -> tuple[type, ...]:
+    public = (getattr(unittest.mock, name) for name in unittest.mock.__all__)
+    return tuple(sorted(
+        (c for c in public if isinstance(c, type) and issubclass(c, unittest.mock.NonCallableMock)),
+        key=lambda cls: cls.__name__,
+    ))
+
+
+# Every one's repr, and so str(), is '<ClassName ...>': the FILE shape a mock
+# passed to sqlite3.connect(str(...)) leaves, PathLike or not.
+STDLIB_MOCK_CLASSES = _public_mock_classes()
+
+
+def mock_fspath_root_names(classes: Iterable[type]) -> tuple[str, ...]:
+    """The sorted leading ``os.fspath()`` components of the PathLike mocks in *classes*.
+
+    A class whose instances are not PathLike contributes nothing.  Raises
+    ValueError for a component that is not a plain class name, because the
+    guard rmtree's ``cwd / name`` and a ``..`` or ``/`` would reach past the CWD.
+    """
+    names = set()
+    for cls in classes:
+        try:
+            fspath = os.fspath(cls())
+        except TypeError:
+            continue
+        name = next(iter(Path(fspath).parts), '')
+        if not name.isidentifier():
+            raise ValueError(
+                f'os.fspath({cls.__qualname__}()) is {fspath!r}, whose leading '
+                f'component {name!r} is not a class name; the stray-dir guard '
+                'would rmtree outside the CWD with it.'
+            )
+        names.add(name)
+    return tuple(sorted(names))
+
+
+# Every MagicMixin-based mock's os.fspath() is '<its own class name>/<mock
+# name>/<id>'. DERIVED from the public stdlib classes, so a Python release that
+# adds one is covered with no edit; on 3.13 that is AsyncMock, MagicMock,
+# NonCallableMagicMock and ThreadingMock. AsyncMock is NOT a MagicMock subclass:
+# it shares MagicMixin, which is why a MagicMock-only list missed it.
+MOCK_FSPATH_ROOT_NAMES = mock_fspath_root_names(STDLIB_MOCK_CLASSES)
+
+
+def mock_derived_stray_dirs(cwd: Path) -> list[Path]:
+    """The mock-derived directory trees directly under *cwd*, in name order."""
+    return [cwd / name for name in MOCK_FSPATH_ROOT_NAMES if (cwd / name).is_dir()]
+
+
+def mock_derived_stray_dir_reason(nodeid: str, strays: list[Path]) -> str | None:
+    """The failure message for *strays* left by test *nodeid*, or None when clean."""
+    if not strays:
+        return None
+    left = ', '.join(map(str, strays))
+    classes = ', '.join(MOCK_FSPATH_ROOT_NAMES)
+    return (
+        f'{nodeid} left mock-derived directories: {left}. '
+        f"unittest.mock's {classes} are valid "
+        "os.PathLike[str] whose os.fspath() is repr-derived "
+        "('<ClassName>/<mock name>/<id>'), so passing one where real code calls "
+        'Path(...).mkdir() creates a real tree under the CWD. Give the mock a '
+        'genuine path (e.g. `git_ops.project_root = tmp_path`) instead of letting '
+        'the attribute auto-spec into a child mock. The stray tree has been '
+        'removed so following tests are unaffected.'
+    )
+
+
+@pytest.fixture(autouse=True)
+def _df_no_mock_derived_stray_dirs(request):
+    """EIGHTH DEFENCE — a mock can never leave a mock-derived directory tree in the CWD.
+
+    Production code that coerces a mock with ``Path()`` and creates directories
+    materialises its repr-derived fspath for real; tasks 3223 (``MagicMock/``)
+    and 4592 (``AsyncMock/``) each landed such a tree in a commit.
+
+    FUNCTION scope, like ``_df_git_env_hermetic``.  The CWD and the trees already
+    in it are captured at SETUP: a test that chdir's without restoring cannot
+    hide its tree, and only a tree that APPEARED during the test is blamed and
+    removed.  So a tree left before the session is never pinned on a test (nor
+    seen until removed by hand; ``.gitignore`` contains it).  Every xdist worker
+    shares one CWD, so the named test is the one whose teardown first saw the
+    tree: usually, not always, the leaker.  Removing it keeps one polluter from
+    failing every later test.
+
+    Deliberately NOT matched: the ``<ClassName ...>`` repr FILE shape.
+    ``.gitignore`` contains it everywhere, and in the orchestrator suite
+    ``orchestrator/tests/conftest.py::_no_mock_repr_stray_entries`` fails a
+    test that leaves one.
+    """
+    cwd = Path.cwd()
+    present_at_setup = set(mock_derived_stray_dirs(cwd))
+    yield
+    strays = [d for d in mock_derived_stray_dirs(cwd) if d not in present_at_setup]
+    for stray in strays:
+        shutil.rmtree(stray, ignore_errors=True)
+    reason = mock_derived_stray_dir_reason(request.node.nodeid, strays)
+    if reason is not None:
+        pytest.fail(reason, pytrace=False)

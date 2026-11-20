@@ -2,7 +2,7 @@
 
 Every cockpit symbol is imported inline per test, so this file is
 ImportError-RED until cockpit.backends.base exists (step-2). DisplayTarget
-mirrors orchestrator.session_registry.Display's field shape but is a local,
+mirrors orchestrator.session_records.Display's field shape but is a local,
 concrete dataclass — backends read attributes off a target, never isinstance
 it — so cockpit stays decoupled from orchestrator (mirrors priority.py's
 ScoringItem stand-in for the same reason).

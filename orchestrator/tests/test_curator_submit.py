@@ -1,8 +1,10 @@
 """``submit_task_batch`` over a real httpx client: what each ``submit_task`` became.
 
-Driven through ``patch('httpx.AsyncClient', ...)``, the constructor seam
-``shared.mcp_post.open_mcp_client`` documents, so every reply below crossed a
-real client and the real ``shared.mcp_post.call_mcp_tool`` decode.
+Replies are served by ``StubMcpServer`` over a real socket, so each crossed a
+real client and the real ``shared.mcp_post.call_mcp_tool`` decode. The two
+transport-fault tests inject at the client transport instead: a server cannot
+make a client raise ``ConnectError``, and a socket round-trip does not fit a
+sub-second batch deadline.
 """
 
 from __future__ import annotations
@@ -14,11 +16,7 @@ from unittest.mock import patch
 
 import httpx
 import pytest
-from _mcp_transport_harness import (
-    RecordingClientFactory,
-    RecordingMcpServer,
-    tool_reply_envelope,
-)
+from shared.testing_mcp_stub import StubAnswer, StubMcpServer, tool_reply_body
 
 from orchestrator.curator_submit import (
     SubmitBatchResult,
@@ -47,9 +45,8 @@ def _arguments(title: str) -> dict:
     }
 
 
-async def _submit_to(server: RecordingMcpServer, arguments_list: list[dict]) -> SubmitBatchResult:
-    with patch('httpx.AsyncClient', RecordingClientFactory(server)):
-        return await submit_task_batch(BASE_URL, arguments_list, context=CONTEXT)
+async def _submit_to(server: StubMcpServer, arguments_list: list[dict]) -> SubmitBatchResult:
+    return await submit_task_batch(server.url, arguments_list, context=CONTEXT)
 
 
 def _client_factory(handler: Callable) -> Callable[..., httpx.AsyncClient]:
@@ -69,25 +66,24 @@ def _curator_submit_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
 
 @pytest.mark.asyncio
 async def test_a_ticket_reply_is_a_delivery() -> None:
-    server = RecordingMcpServer(tool_replies={'submit_task': {'ticket': 'tkt_A'}})
     arguments = _arguments('first')
 
-    result = await _submit_to(server, [arguments])
+    with StubMcpServer(stateful=False, payload={'ticket': 'tkt_A'}) as server:
+        result = await _submit_to(server, [arguments])
 
     assert [(o.ticket, o.failure) for o in result.outcomes] == [('tkt_A', None)]
     assert result.all_delivered is True
     assert result.tickets == ('tkt_A',)
     assert result.failures == ()
-    assert [call['params']['arguments'] for call in server.tool_calls('submit_task')] == [
-        arguments,
-    ]
+    assert server.tool_call_arguments('submit_task') == (arguments,)
 
 
 @pytest.mark.asyncio
 async def test_a_tool_refusal_is_a_loud_failure(caplog: pytest.LogCaptureFixture) -> None:
-    server = RecordingMcpServer(tool_replies={'submit_task': REFUSAL})
-
-    with caplog.at_level(logging.WARNING, logger=LOGGER_NAME):
+    with (
+        StubMcpServer(stateful=False, payload=REFUSAL) as server,
+        caplog.at_level(logging.WARNING, logger=LOGGER_NAME),
+    ):
         result = await _submit_to(server, [_arguments('refused one')])
 
     [outcome] = result.outcomes
@@ -103,9 +99,8 @@ async def test_a_tool_refusal_is_a_loud_failure(caplog: pytest.LogCaptureFixture
 @pytest.mark.parametrize('reply', [{'success': True}, {'task_id': '1'}])
 @pytest.mark.asyncio
 async def test_a_reply_without_a_ticket_is_not_a_delivery(reply: dict) -> None:
-    server = RecordingMcpServer(tool_replies={'submit_task': reply})
-
-    result = await _submit_to(server, [_arguments('no ticket')])
+    with StubMcpServer(stateful=False, payload=reply) as server:
+        result = await _submit_to(server, [_arguments('no ticket')])
 
     [outcome] = result.outcomes
     assert outcome.ticket is None
@@ -113,9 +108,13 @@ async def test_a_reply_without_a_ticket_is_not_a_delivery(reply: dict) -> None:
     assert result.all_delivered is False
 
 
+@pytest.mark.parametrize(
+    'answer', [a for a in StubAnswer if a is not StubAnswer.OK], ids=str,
+)
 @pytest.mark.asyncio
-async def test_an_empty_envelope_is_not_a_delivery() -> None:
-    result = await _submit_to(RecordingMcpServer(), [_arguments('empty envelope')])
+async def test_a_scripted_failure_answer_is_not_a_delivery(answer: StubAnswer) -> None:
+    with StubMcpServer(stateful=False, answer=answer) as server:
+        result = await _submit_to(server, [_arguments('scripted failure')])
 
     [outcome] = result.outcomes
     assert outcome.ticket is None
@@ -131,7 +130,7 @@ async def test_a_transport_failure_fails_only_its_own_submission() -> None:
         calls.append(request)
         if len(calls) == 2:
             raise httpx.ConnectError('connection refused', request=request)
-        return httpx.Response(200, json=tool_reply_envelope({'ticket': 'tkt_A'}))
+        return httpx.Response(200, json=tool_reply_body({'ticket': 'tkt_A'}))
 
     with patch('httpx.AsyncClient', _client_factory(handler)):
         result = await submit_task_batch(
@@ -157,7 +156,7 @@ async def test_a_hung_server_fails_every_unanswered_submission_at_the_deadline(
         calls.append(request)
         if len(calls) == 2:
             await never_answered.wait()
-        return httpx.Response(200, json=tool_reply_envelope({'ticket': 'tkt_A'}))
+        return httpx.Response(200, json=tool_reply_body({'ticket': 'tkt_A'}))
 
     titles = ['delivered', 'in flight', 'never sent']
     with (
@@ -184,10 +183,10 @@ async def test_a_hung_server_fails_every_unanswered_submission_at_the_deadline(
 
 @pytest.mark.asyncio
 async def test_outcomes_follow_argument_order_and_carry_each_title() -> None:
-    server = RecordingMcpServer(tool_replies={'submit_task': {'ticket': 'tkt_A'}})
     titles = ['one', 'two', 'three']
 
-    result = await _submit_to(server, [_arguments(title) for title in titles])
+    with StubMcpServer(stateful=False, payload={'ticket': 'tkt_A'}) as server:
+        result = await _submit_to(server, [_arguments(title) for title in titles])
 
     assert [outcome.title for outcome in result.outcomes] == titles
 

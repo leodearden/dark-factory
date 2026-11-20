@@ -1,29 +1,36 @@
 """Shared landing-evidence helper for already-landed re-derivation sites (task 2678).
 
-SEVEN always-on call sites re-derive "has this task's work already landed on
-main?" from live git state before stamping a task ``done`` (re-measured
-2026-08-25 and re-verified 2026-08-29; this list said "five" until task 4647
-recounted it, and the two it omitted were the pair that never had a
-``Harness`` or worker method to be named after).  Each is cited by ENCLOSING
-SYMBOL rather than by line, because a line pin into these two files rots
-within days:
+These always-on call sites re-derive "has this task's work already landed on
+main?" from live git state before stamping a task ``done``.  The list was
+re-measured 2026-08-25, re-verified 2026-08-29 and updated by task 4648, which
+repointed sites 1 and 3 and added site 8.  It said "five" until task
+4647 recounted it: the two it omitted were the pair that never had a
+``Harness`` or worker method to be named after.  Each site is cited by
+ENCLOSING SYMBOL rather than by line, because a line pin into these files
+rots within days:
 
   1. ``orchestrator/src/orchestrator/harness.py::Harness._already_landed_dispatch_gate``'s
-     ancestry path
-  2. the same function's branch-deleted merge-marker path
-  3. the same function's content-equivalence fallback — the third and last of
-     its three ``validate_landing_evidence`` calls, the one gated by
-     ``branch_content_in_main``
+     ancestry arm, which calls :func:`branch_work_landed`
+  2. the same function's branch-deleted merge-marker arm
+  3. the same function's off-main-tip arm, which calls
+     :func:`branch_work_landed`.  It was the content-equivalence fallback
+     gated by ``branch_content_in_main`` until task 4648.
   4. the stranded-in-progress sweep
      (``orchestrator/src/orchestrator/harness.py::Harness._reconcile_one_stranded``)
   5. ``orchestrator/src/orchestrator/merge_lane/member_redrive.py::MemberRedriver.redrive``
      (the parked-member re-drive)
-  6. and 7. the escalation server's
-     ``escalation/src/escalation/server.py::merge_status`` query, both
-     git-authority arms — a read-only report rather than a recovery action,
-     which is why it is easy to miss when counting "sites that stamp a task
-     done", and why it is nonetheless a site: it shows a human the same
-     verdict the other five act on.
+  6. and 7. the escalation server's ``merge_status`` git-authority tier,
+     ``escalation/src/escalation/git_authority.py::_marker_arm`` and
+     ``::_ancestor_arm`` (task 4887).  It is a read-only report rather than a
+     recovery action, which is why it is easy to miss when counting "sites
+     that stamp a task done".  It is nonetheless a site: it shows a human
+     the same verdict the other sites act on.
+  8. ``orchestrator/src/orchestrator/workflow.py::TaskWorkflow._discovered_landing_sha``,
+     the workflow recovery guard (task 4704)
+
+Which policy each site keeps, and why, is recorded in
+``docs/prds/landed-not-done-recovery.effect-present-caller-enumeration.md``
+§7 rather than restated here.
 
 Prior to task 2678 each site inlined its own subset of two primitives landed
 by task 2675 (dep δ): ``git_ops.find_task_citation_commit`` (FIX 2,
@@ -32,7 +39,8 @@ subject-anchored citation discovery) and ``git_ops.commit_effect_present_in_main
 since task 3116 a threshold LINE-SURVIVAL test, not byte-identity) — an
 inline-per-site shape that let two of the five sites (the merge-marker path
 and the coalesce re-drive) ship WITHOUT the effect-present guard at all (the
-task-1175 clobber: a reverted merge still read as a genuine landing) and let
+task-1175 clobber: a merge marker whose branch netted no change still read as
+a genuine landing) and let
 two more lean on a silent ``x or <fallback-sha>`` expression that fabricated
 provenance when discovery came up empty.
 
@@ -108,8 +116,8 @@ citation + effect-present policy) — and they share every observable:
 - :attr:`LandingVerdict.method` as the EXPLICIT mode/policy discriminator —
   the shape the PRD's epsilon bullet mandates in place of two functions a
   consumer must tell apart by which one it happened to call.  It is what lets
-  epsilon distinguish a verdict from the non-decaying patch-id contract from
-  one produced by the effect-present policy it is retiring.
+  a consumer distinguish a verdict from the non-decaying patch-id contract
+  from one produced by the legacy effect-present policy.
 
 ``validate_landing_evidence`` is therefore best read as a MODE over that
 family rather than as a separate helper: its two arms set
@@ -145,18 +153,19 @@ it.
   no-ff merge commit is NOT a no-op — task 2675 made
   ``commit_effect_present_in_main`` merge-aware, so it diffs each of the
   merge commit's non-first parents' content against current main HEAD,
-  correctly catching a reverted no-ff merge (the task-1175 shape). Used by
-  the ancestry path, the content-equivalence fallback, and the coalesce
-  re-drive. A citation miss first tries one upgrade-only fallback
+  correctly catching a reverted no-ff merge, and an empty-net-diff one (the
+  task-1175 shape) through its empty-touched-set fail-safe. Used by
+  the coalesce re-drive and the workflow recovery guard. A citation miss
+  first tries one upgrade-only fallback
   (:func:`_content_equivalence_anchor`, task 4862); it is inert for an
-  ancestor-of-main tip, so only the non-ancestor content-equivalence arm can
+  ancestor-of-main tip, so only a caller holding a non-ancestor tip can
   reach its accept.
 - **CANDIDATE** (``candidate_sha`` given) — attribution was already
   established by the caller (a merge-marker subject match, or a stranded-
   sweep ground-truth report): skip citation discovery and the lineage guard
   entirely, and apply ONLY the FIX 1' effect-present guard to
-  ``candidate_sha``. Used by the merge-marker path and the stranded-
-  in-progress sweep.
+  ``candidate_sha``. Used by the dispatch gate's and Tier-3.5's merge-marker
+  arms and by the stranded-in-progress sweep.
 
 A second shared predicate lives here for the same INV-5 reason (task 3103):
 :func:`branch_is_degenerate` (with its :func:`is_valid_sha_40` helper) answers
@@ -167,10 +176,11 @@ every already-landed re-derivation. Both were previously private to
 and ``merge_request`` fast-path unguarded against a branch parked at an OLD
 main commit: such a branch IS an ancestor of main and is NOT at main's tip,
 so an ancestry-only check answers a confident ``done`` against a commit
-containing none of the task's work. Consumers: ``harness.py`` (×3 sites, via
-the ``Harness._branch_is_degenerate`` delegation), ``escalation/server.py``
-``merge_status`` (both git-authority arms) and ``merge_request``'s
-``already_merged`` fast-path.
+containing none of the task's work. Consumers: ``harness.py`` (×2 sites, via
+the ``Harness._branch_is_degenerate`` delegation),
+``escalation/git_authority.py::_ancestor_arm``, ``merge_request``'s
+``already_merged`` fast-path, and :func:`branch_work_landed` itself, which
+judges degeneracy for every site it decides.
 
 Also shared here (INV-5): :func:`format_unattributed_landing_detail` renders
 a rejected verdict into a human-facing ``(summary, detail)`` pair, and
@@ -203,6 +213,7 @@ from __future__ import annotations
 import collections
 import enum
 import logging
+import re
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeGuard
@@ -211,7 +222,8 @@ from escalation.models import Escalation
 from shared.storm_counter import StormCounter
 
 from orchestrator.config import RecoveryEmissionConfig
-from orchestrator.git_ops import _run
+from orchestrator.git_ops import CitationPatternInvalid, _run, task_citation_pattern
+from orchestrator.merge_lane.git_read import git_read
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -254,6 +266,101 @@ async def _classify_patch_containment(
     return PatchContainment.contained
 
 
+class Containment(enum.StrEnum):
+    """The D10 answer: is every commit a tip carries beyond the target already on it?
+
+    'git could not answer' is UNKNOWN, never NOT_CONTAINED.
+    """
+
+    CONTAINED = 'contained'
+    NOT_CONTAINED = 'not_contained'
+    UNKNOWN = 'unknown'
+
+
+class _AncestryReading(NamedTuple):
+    on_target: bool | None
+    containment: Containment
+
+
+async def _containment_by_ancestry(
+    git_ops: GitOps, tip: str, target: str,
+) -> _AncestryReading:
+    """Empty ``git cherry`` output is containment only when *tip* is ON *target*.
+
+    There git cherry has nothing to list for a genuine landing.  Elsewhere the
+    branch has no non-merge commit beyond *target*, so nothing of its own is
+    proven present.  An unanswerable ancestry probe is a git error.
+    """
+    on_target = await git_ops.is_ancestor_checked(tip, target)
+    if on_target is None:
+        containment = Containment.UNKNOWN
+    elif on_target:
+        containment = Containment.CONTAINED
+    else:
+        containment = Containment.NOT_CONTAINED
+    return _AncestryReading(on_target, containment)
+
+
+_CONTAINMENT_OF_CHERRY: dict[PatchContainment, Containment] = {
+    PatchContainment.contained: Containment.CONTAINED,
+    PatchContainment.not_contained: Containment.NOT_CONTAINED,
+    PatchContainment.unreadable: Containment.UNKNOWN,
+}
+
+
+async def classify_containment(
+    git_ops: GitOps, *, tip: str, target: str,
+) -> Containment:
+    """Whether every commit *tip* has beyond *target* is on *target* by patch id.
+
+    One ``git cherry`` read; its empty answer is settled by ancestry, because
+    a tip whose only commits beyond *target* are merges proves nothing landed.
+    """
+    cherry = await _classify_patch_containment(tip, target, git_ops)
+    if cherry is PatchContainment.vacuous:
+        return (await _containment_by_ancestry(git_ops, tip, target)).containment
+    return _CONTAINMENT_OF_CHERRY[cherry]
+
+
+@dataclass(frozen=True)
+class RangePatchIds:
+    """What a commit range carries, by content.
+
+    ``patch_ids`` holds the ``git patch-id --stable`` ids of the range's
+    non-merge commits, sorted: the canonical form of a multiset, so two values
+    compare with ``==``.
+    """
+
+    patch_ids: tuple[str, ...]
+    has_merge_commit: bool
+
+
+async def range_patch_ids(
+    git_ops: GitOps, *, target: str, tip: str,
+) -> RangePatchIds:
+    """The patch ids of ``target..tip``: one ``git log`` and one ``git patch-id``, whatever its length.
+
+    The range is the set ``target..tip``, the one ``git cherry target tip``
+    reads, and the D6 ``merge-base(target, tip)..tip`` whenever that merge base
+    is unique.  A merge shows no diff, so it contributes no id; the parent list
+    on its ``commit`` line is what flags it.  A git error raises
+    :class:`~orchestrator.merge_lane.git_read.GitReadFailed`.
+    """
+    log = await git_read(git_ops, [
+        'git', 'log', '-p', '--no-color', '--format=commit %H %P', f'{target}..{tip}',
+    ])
+    if not log.strip():
+        return RangePatchIds(patch_ids=(), has_merge_commit=False)
+    has_merge_commit = any(
+        len(line.split()) > 3 for line in log.splitlines() if line.startswith('commit ')
+    )
+    ids = await git_read(git_ops, ['git', 'patch-id', '--stable'], input_text=log)
+    return RangePatchIds(
+        patch_ids=tuple(sorted(line.split()[0] for line in ids.splitlines() if line.strip())),
+        has_merge_commit=has_merge_commit,
+    )
+
+
 async def patch_content_contained(
     head: str,
     upstream: str,
@@ -285,6 +392,8 @@ __all__ = [
     'LANDING_GIT_ERROR_STORM_CATEGORY',
     'LANDING_GIT_ERROR_STORM_SENTINEL',
     'LANDING_TALLY',
+    'Containment',
+    'DifferentialBaseline',
     'DifferentialOutcome',
     'LandingEvidenceVerdict',
     'LandingMethod',
@@ -292,13 +401,16 @@ __all__ = [
     'LandingTally',
     'LandingVerdict',
     'PatchContainment',
+    'RangePatchIds',
     'branch_is_degenerate',
     'branch_work_landed',
+    'classify_containment',
     'file_landing_git_error_storm_escalation',
     'file_unattributed_landing_escalation',
     'format_unattributed_landing_detail',
     'found_on_main_note',
     'is_valid_sha_40',
+    'range_patch_ids',
     'validate_landing_evidence',
     'validate_reported_landing',
 ]
@@ -328,7 +440,13 @@ class LandingReason(enum.StrEnum):
     would be two authorities that must be kept in step forever, and because a
     legacy code reaching a formatter that cannot explain it renders
     ``'Unrecognized reason code: ...'`` into an L1 body a human reads.  Leaf
-    epsilon retires the legacy three when it repoints the consumers.
+    epsilon (task 4648) repointed the sites in its scope to
+    :func:`branch_work_landed`.  Its one producer edit narrowed that
+    producer's evidence tier to patch-id only (esc-4648-5; the reason is
+    :func:`_resolve_main_reachable_evidence`'s docstring) and left
+    :func:`validate_landing_evidence` as it was, so the legacy three now mark
+    exactly the sites that keep the legacy policy
+    (``docs/prds/landed-not-done-recovery.effect-present-caller-enumeration.md`` §7).
     """
 
     #: Accepted — the branch's work is attributably present on main.
@@ -352,10 +470,11 @@ class LandingReason(enum.StrEnum):
     #: being unlanded.  No consumer may collapse it into ``not_landed``.
     git_error = 'git_error'
 
-    #: Legacy (``validate_landing_evidence`` accept).  Epsilon retires it.
+    #: Legacy (``validate_landing_evidence`` accept).
     ok = 'ok'
     #: Legacy (``validate_landing_evidence`` DISCOVERY miss).  The Contract's
-    #: spelling is :attr:`no_attribution`; epsilon flips the emitted value.
+    #: spelling is :attr:`no_attribution`, which :func:`branch_work_landed`
+    #: emits.
     no_citation = 'no_citation'
     #: Legacy (``validate_landing_evidence`` survival reject, FIX 1').
     effect_absent = 'effect_absent'
@@ -370,8 +489,9 @@ class LandingMethod(enum.StrEnum):
     demands in place of two separate functions: it maps one-to-one onto the
     production attribution paths, so any consumer can read which policy
     decided a verdict — in particular whether it came from the NON-DECAYING
-    patch-id contract or from the legacy effect-present policy epsilon is
-    retiring at the landing-detection sites.
+    patch-id contract or from the legacy effect-present policy.  Which
+    landing-detection site carries which method is recorded in
+    ``docs/prds/landed-not-done-recovery.effect-present-caller-enumeration.md`` §7.
     """
 
     #: :func:`branch_work_landed` — ``git cherry`` patch-id equivalence.  The
@@ -411,6 +531,41 @@ class DifferentialOutcome(enum.StrEnum):
     no_signal = 'no_signal'
     #: ``delivered_checks.enabled`` is false, so no check ran.
     disabled = 'disabled'
+
+
+class DifferentialBaseline(enum.StrEnum):
+    """``probe['delivered_checks_baseline']``: which rung named the differential's parent leg.
+
+    See :func:`_differential_parent_ref` for the ladder.
+    """
+
+    #: The branch tip's merge base with main, while the tip is still off main.
+    fork_point = 'fork_point'
+    #: The task's recorded ``branch_base_sha``, a strict ancestor of a tip
+    #: already on main whose every own commit since it cites the task.
+    recorded_branch_base = 'recorded_branch_base'
+    #: ``<sha>^1``: every non-branch-tip anchor, and a branch tip's fallback
+    #: when its fork point is unresolved or no usable record exists.
+    first_parent = 'first_parent'
+    #: No ref stands for "before this branch": a MERGE-COMMIT tip already on
+    #: main with no trusted record.  Its ``^1`` predates only one side of the
+    #: merge, so the differential runs no check and reports no signal.
+    unavailable = 'unavailable'
+
+
+@dataclass(frozen=True)
+class BranchTipAnchor:
+    """A differential anchored on the task's BRANCH TIP, with what shows which commits the branch owns.
+
+    Only :func:`validate_landing_evidence` builds one, when it anchors on the
+    branch tip; every other anchor passes none.  *branch_base_sha* is the
+    task's raw ``metadata.branch_base_sha``, still unvalidated.  See
+    :func:`_differential_parent_ref` for how each field is consulted.
+    """
+
+    task_id: str
+    branch_base_sha: str | None
+    pattern_template: str | None
 
 
 #: Category used for BOTH the storm filing and its ``has_open_l1`` dedup
@@ -748,7 +903,7 @@ class LandingVerdict:
 
         The rescue discriminant for every reader in this package.  A rescued
         accept's ``evidence_sha`` IS on main but its effect is ABSENT at main
-        HEAD — the task-1175 shape FIX 1' guards — so ``accepted``/
+        HEAD — the shape FIX 1' guards — so ``accepted``/
         ``evidence_sha`` alone cannot tell it from a fully-guarded accept (see
         :func:`_delivered_checks_differential`).  Equality, not truthiness:
         ``no_signal`` and ``disabled`` are truthy yet only reach a reject.
@@ -863,47 +1018,178 @@ def _main_ref(git_ops: GitOps) -> str:
     return ref if isinstance(ref, str) and ref else 'main'
 
 
-async def _differential_parent_ref(
-    git_ops: GitOps, effect_check_sha: str, *, anchor_is_branch_tip: bool,
-) -> str:
-    """The ref that stands for "before this landing" in the differential.
-
-    ``<sha>^1`` for a MERGE-COMMIT or citation anchor: the first parent is
-    main-before-the-merge, exactly the pre-merge baseline the three-leg
-    sequence needs.
-
-    NOT ``^1`` for a BRANCH-TIP anchor, which DISCOVERY mode selects whenever
-    the citation is an in-branch work commit.  There ``tip^1`` is the branch's
-    own previous work commit, so the differential would ask "did the branch's
-    LAST commit make this true?" instead of "did this BRANCH make it true?".
-    For any multi-commit branch whose deliverable landed in an earlier commit
-    the parent leg then reads DELIVERED, the sequence fails, and the second
-    accept path silently never fires — for precisely the multi-commit shape
-    most likely to have tripped the survival heuristic in the first place
-    (amendment pass, review finding).  The branch's FORK POINT from main is
-    the honest baseline there.
-
-    Falls back to ``^1`` when the fork point cannot be resolved — a stand-in
-    git_ops without :meth:`~orchestrator.git_ops.GitOps.merge_base_with_main`,
-    a deleted branch, any git failure.  That is the pre-amendment behaviour:
-    a weaker baseline that can only cost an upgrade, never manufacture one.
+async def _usable_branch_base(
+    git_ops: GitOps, recorded: object, head: str,
+) -> str | None:
+    """*recorded* (a task's raw ``metadata.branch_base_sha``) when it can be
+    trusted as a baseline for *head*, else None: it must be a 40-hex sha and
+    an ancestor of *head*, so a malformed, foreign or rebase-stale value falls
+    through to the caller's next rung instead of naming a wrong baseline.
     """
-    parent_ref = f'{effect_check_sha}^1'
-    if not anchor_is_branch_tip:
-        return parent_ref
+    if is_valid_sha_40(recorded) and await git_ops.is_ancestor(recorded, head):
+        return recorded
+    return None
+
+
+async def _fork_point(git_ops: GitOps, sha: str) -> str | None:
+    """*sha*'s merge base with main, or None when it cannot be resolved.
+
+    None covers a stand-in git_ops without
+    :meth:`~orchestrator.git_ops.GitOps.merge_base_with_main`, a deleted
+    branch, and any git failure (logged).
+    """
     resolver = getattr(git_ops, 'merge_base_with_main', None)
     if resolver is None:
-        return parent_ref
+        return None
     try:
-        fork_point = await resolver(effect_check_sha)
+        fork_point = await resolver(sha)
     except Exception:
         logger.warning(
             'fork-point resolution failed for %s — the delivered-checks '
             'differential falls back to its first parent',
-            effect_check_sha, exc_info=True,
+            sha, exc_info=True,
         )
-        return parent_ref
-    return fork_point if isinstance(fork_point, str) and fork_point else parent_ref
+        return None
+    return fork_point if isinstance(fork_point, str) and fork_point else None
+
+
+async def _range_cites_only(
+    git_ops: GitOps, base: str, tip: str, *, task_id: str, pattern_template: str | None,
+) -> bool:
+    """True when ``base..tip`` holds at least one non-merge commit and every
+    non-merge commit's SUBJECT cites *task_id*.
+
+    False for an opted-out (``''``) or invalid citation pattern, and for a
+    stand-in *git_ops* without a git config: ownership cannot be shown.
+    """
+    try:
+        pattern = task_citation_pattern(
+            task_id, pattern_template,
+            branch_prefix=git_ops.config.branch_prefix, main_branch=git_ops.config.main_branch,
+        )
+    except (AttributeError, CitationPatternInvalid):
+        return False
+    if pattern is None:
+        return False
+    out = await git_read(git_ops, [
+        'git', 'log', '--no-merges', '-z', '--format=%s', f'{base}..{tip}',
+    ])
+    subjects = [subject for subject in out.split('\0') if subject.strip()]
+    cites = re.compile(pattern)
+    return bool(subjects) and all(cites.search(subject) for subject in subjects)
+
+
+async def _is_merge_commit(git_ops: GitOps, sha: str) -> bool:
+    out = await git_read(git_ops, ['git', 'log', '-1', '--format=%P', sha])
+    return len(out.split()) > 1
+
+
+async def _differential_parent_ref(
+    git_ops: GitOps, effect_check_sha: str, branch_tip: BranchTipAnchor | None,
+) -> tuple[str | None, DifferentialBaseline]:
+    """The ref that stands for "before this landing" in the differential, and
+    the rung that named it; None when no ref can.
+
+    ``<sha>^1`` for a MERGE-COMMIT or citation anchor (no *branch_tip*): the
+    first parent is main-before-the-merge, exactly the pre-merge baseline the
+    sequence needs.
+
+    A BRANCH-TIP anchor's ``^1`` is the branch's own previous commit, which
+    already carries any capability an earlier branch commit delivered.  Its
+    ladder:
+
+    1. fork point from main unresolved: ``tip^1``, the pre-amendment
+       behaviour, a weaker baseline that can only cost an upgrade, never
+       manufacture one;
+    2. fork point differs from the tip, so the tip is still off main: the
+       fork point;
+    3. fork point IS the tip, so the tip is already on main (task 7836): the
+       recorded ``branch_base_sha``, when :func:`_usable_branch_base` trusts
+       it, it differs from the tip, and every non-merge commit in
+       ``record..tip`` cites the task;
+    4. otherwise ``tip^1`` for a single-parent tip, and no baseline at all
+       for a merge-commit tip.
+
+    The parent leg never names the anchor itself: a parent equal to the
+    citation leg makes FAILED -> DELIVERED -> DELIVERED impossible.  The
+    record is the oldest, most permissive baseline.  The workflow keeps it at
+    the dispatch-time main after an in-place rebase or a merge of main, and
+    then ``record..tip`` carries other tasks' commits, whose capabilities this
+    task must never be credited with: rung 3's citation test is what refuses
+    such a record.  It cannot tell a foreign commit from the factory's own
+    uncited ones (``wip: amendment round N``, ``chore: save WIP before …``),
+    so those refuse the record too, by decision: the landing falls to rung 4,
+    which can cost an upgrade but never manufacture one.  Pinned by
+    ``orchestrator/tests/test_landing_evidence.py::TestDeliveredChecksDifferentialRealGitDiscovery``.
+    """
+    first_parent = (f'{effect_check_sha}^1', DifferentialBaseline.first_parent)
+    if branch_tip is None:
+        return first_parent
+    fork = await _fork_point(git_ops, effect_check_sha)
+    if fork is None:
+        return first_parent
+    if fork != effect_check_sha:
+        return fork, DifferentialBaseline.fork_point
+    recorded = await _usable_branch_base(git_ops, branch_tip.branch_base_sha, effect_check_sha)
+    if (
+        recorded is not None and recorded != effect_check_sha
+        and await _range_cites_only(
+            git_ops, recorded, effect_check_sha,
+            task_id=branch_tip.task_id, pattern_template=branch_tip.pattern_template,
+        )
+    ):
+        return recorded, DifferentialBaseline.recorded_branch_base
+    if await _is_merge_commit(git_ops, effect_check_sha):
+        return None, DifferentialBaseline.unavailable
+    return first_parent
+
+
+async def _differential_leg(
+    git_ops: GitOps, check: dict[str, Any], *, parent_ref: str, citation_ref: str, main_ref: str,
+) -> tuple[dict[str, Any], bool]:
+    """*check*'s three-leg record for ``probe['delivered_checks_legs']``, and
+    whether it was FAILED at the parent and DELIVERED at the citation and main.
+
+    A non-grep check is an explicit no-signal carve-out, run at no ref: a
+    script check execs against the LIVE CHECKOUT, so running it three times
+    would answer identically each time.
+
+    LAZY import (``# noqa: PLC0415``), mirroring
+    :func:`file_unattributed_landing_escalation`'s ``escalation.models``
+    import: this module deliberately imports nothing from ``orchestrator`` at
+    module level (see the module docstring) because
+    ``orchestrator.delivered_checks`` imports ``orchestrator.git_ops``, and a
+    module-level edge here would re-create the harness<->merge_queue cycle
+    this module was extracted to avoid.
+    """
+    from orchestrator.delivered_checks import (
+        DeliveredCheckResult,
+        run_delivered_check,
+    )
+
+    kind = check.get('kind')
+    if kind != 'grep':
+        verdict = 'script_kind_no_signal' if kind == 'script' else 'unsupported_kind_no_signal'
+        return {'name': check.get('name'), 'kind': kind, 'verdict': verdict}, False
+    results = {}
+    for label, ref in (('parent', parent_ref), ('citation', citation_ref), ('main', main_ref)):
+        results[label] = await run_delivered_check(
+            check, project_root=git_ops.project_root, ref=ref,
+        )
+    made_true = (
+        results['parent'] is DeliveredCheckResult.FAILED
+        and results['citation'] is DeliveredCheckResult.DELIVERED
+        and results['main'] is DeliveredCheckResult.DELIVERED
+    )
+    return {
+        'name': check.get('name'),
+        'kind': kind,
+        'expect': check.get('expect'),
+        'parent': results['parent'].value,
+        'citation': results['citation'].value,
+        'main': results['main'].value,
+        'verdict': _DIFFERENTIAL_CONFIRMED if made_true else 'no_signal',
+    }, made_true
 
 
 async def _delivered_checks_differential(
@@ -912,7 +1198,7 @@ async def _delivered_checks_differential(
     delivered_checks: list[dict[str, Any]],
     probe: dict[str, Any],
     *,
-    anchor_is_branch_tip: bool = False,
+    branch_tip: BranchTipAnchor | None = None,
     enabled: bool,
 ) -> bool:
     """The SECOND accept path: did *effect_check_sha* MAKE a declared
@@ -924,8 +1210,11 @@ async def _delivered_checks_differential(
     ground truth: run each ``metadata.delivered_checks`` entry at three refs —
 
         PARENT        the pre-branch baseline: ``<sha>^1`` for a merge-commit
-                      or citation anchor, the branch's FORK POINT for a
-                      branch-tip anchor (see :func:`_differential_parent_ref`)
+                      or citation anchor; for a *branch_tip* anchor, its fork
+                      point while off main, the recorded ``branch_base_sha``
+                      once on main when every own commit since it cites the
+                      task, else ``^1`` or none (see
+                      :func:`_differential_parent_ref`)
         ``<sha>``     the citation itself
         MAIN          current HEAD, named by ``config.main_branch``
 
@@ -968,14 +1257,6 @@ async def _delivered_checks_differential(
     pass, review finding).  Nothing is read off *git_ops*: a real
     ``GitOps.config`` is the ``git`` sub-config, which carries no such field.
 
-    LAZY import (``# noqa: PLC0415``), mirroring
-    :func:`file_unattributed_landing_escalation`'s ``escalation.models``
-    import: this module deliberately imports nothing from ``orchestrator`` at
-    module level (see the module docstring) because
-    ``orchestrator.delivered_checks`` imports ``orchestrator.git_ops``, and a
-    module-level edge here would re-create the harness<->merge_queue cycle
-    this module was extracted to avoid.
-
     Writes ``delivered_checks_legs`` (every check's three-leg outcome) and
     ``delivered_checks_outcome`` (a :class:`DifferentialOutcome`) into
     *probe*, so the escalation can say "capability X was made true by this
@@ -992,59 +1273,23 @@ async def _delivered_checks_differential(
         probe['delivered_checks_outcome'] = DifferentialOutcome.disabled
         return False
 
-    from orchestrator.delivered_checks import (
-        DeliveredCheckResult,
-        run_delivered_check,
-    )
-
     main_ref = _main_ref(git_ops)
     legs: list[dict[str, Any]] = []
     confirmed = False
     try:
-        parent_ref = await _differential_parent_ref(
-            git_ops, effect_check_sha, anchor_is_branch_tip=anchor_is_branch_tip,
+        parent_ref, baseline = await _differential_parent_ref(
+            git_ops, effect_check_sha, branch_tip,
         )
         probe['delivered_checks_parent_ref'] = parent_ref
-        for check in delivered_checks:
-            kind = check.get('kind')
-            if kind != 'grep':
-                # A script check execs against the LIVE CHECKOUT and takes no
-                # ref, so it cannot express a differential at all: running it
-                # three times would answer identically each time.  Recorded as
-                # an explicit carve-out rather than silently dropped.
-                legs.append({
-                    'name': check.get('name'),
-                    'kind': kind,
-                    'verdict': (
-                        'script_kind_no_signal' if kind == 'script'
-                        else 'unsupported_kind_no_signal'
-                    ),
-                })
-                continue
-            results = {}
-            for label, ref in (
-                ('parent', parent_ref),
-                ('citation', effect_check_sha),
-                ('main', main_ref),
-            ):
-                results[label] = await run_delivered_check(
-                    check, project_root=git_ops.project_root, ref=ref,
+        probe['delivered_checks_baseline'] = baseline
+        if parent_ref is not None:
+            for check in delivered_checks:
+                leg, made_true = await _differential_leg(
+                    git_ops, check,
+                    parent_ref=parent_ref, citation_ref=effect_check_sha, main_ref=main_ref,
                 )
-            made_true = (
-                results['parent'] is DeliveredCheckResult.FAILED
-                and results['citation'] is DeliveredCheckResult.DELIVERED
-                and results['main'] is DeliveredCheckResult.DELIVERED
-            )
-            confirmed = confirmed or made_true
-            legs.append({
-                'name': check.get('name'),
-                'kind': kind,
-                'expect': check.get('expect'),
-                'parent': results['parent'].value,
-                'citation': results['citation'].value,
-                'main': results['main'].value,
-                'verdict': _DIFFERENTIAL_CONFIRMED if made_true else 'no_signal',
-            })
+                legs.append(leg)
+                confirmed = confirmed or made_true
     except Exception as exc:
         # Contained but NOT swallowed (structured-facts-at-failure): the whole
         # differential declines rather than upgrading on partial evidence.
@@ -1078,7 +1323,13 @@ async def _resolve_main_reachable_evidence(
        main-reachable by construction; no extra reachability check is needed
        (and none is done, which is what keeps this leg off the decaying
        path-set predicates — see :func:`branch_work_landed`).
-    2. **Patch-id equivalent** — :func:`_patch_id_equivalent_on_main`.
+    2. **Patch-id equivalent** — :func:`_patch_id_equivalent_on_main`, by
+       patch-id ONLY.  ``find_equivalent_commit``'s unique-subject tier is
+       excluded because its hit need not carry *head*'s diff: on a reseeded
+       ancestor tip (containment is vacuous there) one later main commit
+       repeating the tip's subject would otherwise be stamped as this task's
+       landing (esc-4648-5, the narrowing task 4862 applied to the content
+       fallback).
 
     Returns ``None`` when NEITHER tier resolves.  The caller turns that into
     :attr:`LandingReason.no_attribution` rather than accepting: anchoring on
@@ -1105,11 +1356,11 @@ async def _resolve_main_reachable_evidence(
         probe['citation'] = citation
         probe['evidence_source'] = 'citation'
         return citation
-    return await _patch_id_equivalent_on_main(git_ops, head, probe, patch_id_only=False)
+    return await _patch_id_equivalent_on_main(git_ops, head, probe)
 
 
 async def _patch_id_equivalent_on_main(
-    git_ops: GitOps, head: str, probe: dict[str, Any], *, patch_id_only: bool,
+    git_ops: GitOps, head: str, probe: dict[str, Any],
 ) -> str | None:
     """The commit on main whose diff is patch-id equivalent to *head*'s, or None.
 
@@ -1117,12 +1368,11 @@ async def _patch_id_equivalent_on_main(
     ``project_root``, whose HEAD is main.  The map it builds is keyed on
     ``git patch-id --stable``, so the sha it returns is the commit on main
     whose diff is equivalent to *head*'s — the replayed twin a rebase landing
-    produces.  It carries its own refuse-to-guess posture (an ambiguous
-    patch-id, or an ambiguous subject in its tier-2 fallback, yields ``None``
-    rather than an arbitrary pick), which is inherited here deliberately.
-    *patch_id_only* drops that subject tier, whose hit need not carry
-    *head*'s diff: :func:`_content_equivalence_anchor` sets it, and
-    :func:`_resolve_main_reachable_evidence` keeps both tiers.
+    produces.  An ambiguous patch-id yields ``None`` rather than an arbitrary
+    pick, a refuse-to-guess posture inherited here deliberately.  The search
+    is patch-id ONLY: ``find_equivalent_commit``'s subject tier is never
+    used, because its hit need not carry *head*'s diff, and every caller
+    anchors provenance on the answer.
     """
     base = await git_ops.merge_base_with_main(head)
     probe['merge_base'] = base
@@ -1134,7 +1384,7 @@ async def _patch_id_equivalent_on_main(
         return None
 
     equivalent = await git_ops.find_equivalent_commit(
-        git_ops.project_root, base, head, patch_id_only=patch_id_only,
+        git_ops.project_root, base, head, patch_id_only=True,
     )
     probe['evidence_source'] = (
         'patch_id_equivalent' if equivalent else 'no_equivalent_on_main'
@@ -1207,9 +1457,9 @@ async def _no_op_question(
        correct for a COALESCED landing: a merge train brings several tasks in
        at once, so the train merge's own diff is non-empty even when this
        branch contributed nothing to it.  Rungs 2 and 3 would both read that
-       as "not a no-op".  Validated with :func:`is_valid_sha_40` and required
-       to be an ancestor of *head*, so a malformed, foreign or
-       rebase-stale value falls through instead of making ``git diff`` fail.
+       as "not a no-op".  Validated by :func:`_usable_branch_base`, so a
+       malformed, foreign or rebase-stale value falls through instead of
+       making ``git diff`` fail.
     2. **``merge-base(upstream, head)``** — the honest fork point while the
        branch is still OUTSIDE ``upstream``'s history (the unlanded and
        rebase-landing shapes).
@@ -1228,8 +1478,10 @@ async def _no_op_question(
     be caught by attribution instead.  Supplying ``branch_base_sha`` (rung 1)
     removes it, which is why every orchestrator-dispatched caller has one.
     """
-    recorded = (metadata or {}).get('branch_base_sha')
-    if is_valid_sha_40(recorded) and await git_ops.is_ancestor(recorded, head):
+    recorded = await _usable_branch_base(
+        git_ops, (metadata or {}).get('branch_base_sha'), head,
+    )
+    if recorded is not None:
         probe['no_op_baseline'] = 'recorded_branch_base'
         return _NoOpQuestion(recorded, head, False)
 
@@ -1342,7 +1594,9 @@ def _accept_verdict(
     ``reason`` is explicit and not defaulted because the two producers accept
     under DIFFERENT codes — :attr:`LandingReason.landed` for the Contract's
     patch-id producer, the legacy :attr:`LandingReason.ok` for
-    :func:`validate_landing_evidence` until epsilon repoints its consumers.
+    :func:`validate_landing_evidence`, whose callers are exactly the sites
+    that keep the legacy policy
+    (``docs/prds/landed-not-done-recovery.effect-present-caller-enumeration.md`` §7).
     Defaulting it would let a caller silently emit the other one's spelling.
     """
     return _stamped_verdict(
@@ -1402,18 +1656,13 @@ async def _containment_rejection(
 async def _vacuous_containment_rejection(
     git_ops: GitOps, head: str, upstream: str, probe: dict[str, Any],
 ) -> LandingReason | None:
-    """Empty ``git cherry`` output is containment only when *head* is ON *upstream*.
-
-    There git cherry has nothing to list for a genuine landing.  Elsewhere the
-    branch has no non-merge commit beyond *upstream*, so nothing of its own is
-    proven present.
-    """
-    on_upstream = await git_ops.is_ancestor_checked(head, upstream)
-    probe['containment_by_ancestry'] = on_upstream
-    if on_upstream is None:
+    """The vacuous arm of :func:`_containment_rejection`, decided by :func:`_containment_by_ancestry`."""
+    reading = await _containment_by_ancestry(git_ops, head, upstream)
+    probe['containment_by_ancestry'] = reading.on_target
+    if reading.containment is Containment.UNKNOWN:
         probe['git_error_stage'] = 'patch_id_containment'
         return LandingReason.git_error
-    return None if on_upstream else LandingReason.not_landed
+    return None if reading.containment is Containment.CONTAINED else LandingReason.not_landed
 
 
 async def branch_work_landed(
@@ -1817,9 +2066,7 @@ async def _content_equivalence_anchor(
         if not await git_ops.branch_content_in_main(branch_tip_sha):
             probe['content_fallback'] = 'not_content_equivalent'
             return None
-        anchor = await _patch_id_equivalent_on_main(
-            git_ops, branch_tip_sha, probe, patch_id_only=True,
-        )
+        anchor = await _patch_id_equivalent_on_main(git_ops, branch_tip_sha, probe)
     except Exception as exc:
         probe['content_fallback'] = 'error'
         probe['content_fallback_error'] = repr(exc)
@@ -1870,6 +2117,7 @@ async def validate_landing_evidence(
     pattern_template: str | None = None,
     delivered_checks: list[dict[str, Any]] | None = None,
     checks_enabled: bool | None = None,
+    branch_base_sha: str | None = None,
 ) -> LandingVerdict:
     """Validate already-landed evidence for *task_id* on *branch*.
 
@@ -1885,18 +2133,18 @@ async def validate_landing_evidence(
     (task 4647).  ``'ok'`` on accept, ``'no_citation'`` on a DISCOVERY miss and
     ``'effect_absent'`` on a survival reject — now as :class:`LandingReason`
     members, which are genuine ``str`` subclasses, so every incumbent
-    comparison against a plain string holds and none of the seven production
-    call sites needs an edit.
+    comparison against a plain string holds and no production call site
+    needed an edit.
 
-    ``no_attribution`` is the Contract's RENAME of ``no_citation``, and it is
-    REGISTERED in :class:`LandingReason` today while this function keeps
-    emitting the old spelling.  Registration is the load-bearing half: it is
-    what guarantees that when leaf epsilon flips the emitted value, no
-    escalation can render the literal ``'Unrecognized reason code'`` into an
-    L1 body — the vocabulary and its operator-facing prose already cover both
-    spellings.  Flipping the EMITTED value is epsilon's edit, made together
-    with repointing the consumers, and doing it here would break the pins in
-    five test files for no gain.
+    ``no_attribution`` is the Contract's RENAME of ``no_citation``.  Both are
+    REGISTERED in :class:`LandingReason`, so the vocabulary and its
+    operator-facing prose cover both spellings, and no escalation can render
+    the literal ``'Unrecognized reason code'`` into an L1 body.  Leaf epsilon
+    (task 4648) did not flip this function's emitted value.  It repointed
+    the sites in its scope to :func:`branch_work_landed`, which emits the
+    Contract's spellings, so the legacy spellings now mark exactly the sites
+    that keep the legacy policy
+    (``docs/prds/landed-not-done-recovery.effect-present-caller-enumeration.md`` §7).
 
     Args:
         git_ops: A ``GitOps`` instance (or a duck-typed stand-in exposing
@@ -1943,18 +2191,23 @@ async def validate_landing_evidence(
             unwired site's only live effect is the escalation text "this call
             site is unwired"). The call sites are owned by other tasks:
 
-              task 4496  harness.py x4 (three ``_already_landed_dispatch_gate``
-                         arms + ``_reconcile_one_stranded``) — WIRED
-              task 4497  merge_queue.py x1 (the coalesce re-drive)
-              task 4498  escalation/server.py x2 (``merge_status``'s
-                         git-authority arms)
+              task 4496  harness.py x2 (``_already_landed_dispatch_gate``'s
+                         marker arm + ``_reconcile_one_stranded``) — WIRED
+              task 4497  merge_lane/member_redrive.py x1 (the coalesce
+                         re-drive)
+              task 4498  escalation/git_authority.py x1
+                         (``_evidence_verdict``, the marker arm) — WIRED
+              task 4704  workflow.py x1
+                         (``TaskWorkflow._discovered_landing_sha``) — WIRED
               task 4500  CAPSTONE — flips this parameter to REQUIRED and
-                         keyword-only once all seven are wired, so no future
+                         keyword-only once all five are wired, so no future
                          caller can inherit the default silently
 
+            Task 4648 took the count from seven to five by moving the
+            dispatch gate's two live-branch arms to :func:`branch_work_landed`.
             If ``delivered_checks_state == 'unwired'`` is still appearing in
             escalations after 4500 has landed, that is the bug: one of the
-            seven sites regressed to the default.
+            five sites regressed to the default.
         checks_enabled: The project's ``delivered_checks.enabled`` leaf,
             the kill switch's only source (a real ``GitOps.config`` carries no
             ``delivered_checks``). False disarms the second accept path,
@@ -1962,6 +2215,10 @@ async def validate_landing_evidence(
             REQUIRED whenever *delivered_checks* is supplied, ``[]``
             included: omitting it then raises TypeError. The capstone (task
             4500/5297) makes it required together with *delivered_checks*.
+        branch_base_sha: The task's raw ``metadata.branch_base_sha``,
+            validated here and consulted only for a branch-tip anchor
+            already on main, as the differential parent leg (see
+            :func:`_differential_parent_ref`).
 
     Returns:
         A :class:`LandingVerdict`.
@@ -1986,9 +2243,8 @@ async def validate_landing_evidence(
         return _reject_verdict(reason, probe=probe, method=method)
 
     def _accept(evidence_sha: str) -> LandingVerdict:
-        # LEGACY spelling, deliberately.  See this function's docstring: the
-        # Contract's codes are REGISTERED in LandingReason today and epsilon
-        # flips the EMITTED value when it repoints the consumers.
+        # LEGACY spelling, deliberately: it marks a legacy-policy site.  See
+        # this function's docstring.
         return _accept_verdict(
             evidence_sha, reason=LandingReason.ok, probe=probe, method=method,
         )
@@ -2027,8 +2283,8 @@ async def validate_landing_evidence(
     # both is_ancestor directions is still a genuine landing; hard-rejecting
     # it caused a close<->refile ping-pong (the auto-watcher closes the
     # benign L1, the gate re-opens it) that never self-resolved. The FIX 1'
-    # effect-present guard below stays the real gate against a reverted
-    # (task-1175) landing.
+    # effect-present guard below stays the real gate against a reverted or
+    # empty-net-diff (task-1175) landing.
     citation_on_branch = await git_ops.is_ancestor(citation, branch)
 
     # FIX 1' effect-present guard (task 2500/2675): ancestry alone doesn't
@@ -2046,22 +2302,25 @@ async def validate_landing_evidence(
     # authoritative), or in the defensive case a DISCOVERY caller omitted
     # branch_tip_sha despite citation_on_branch.
     effect_check_sha = citation
-    anchor_is_branch_tip = False
+    branch_tip: BranchTipAnchor | None = None
     if citation_on_branch and branch_tip_sha is not None:
         effect_check_sha = branch_tip_sha
-        anchor_is_branch_tip = True
+        branch_tip = BranchTipAnchor(
+            task_id=task_id, branch_base_sha=branch_base_sha,
+            pattern_template=pattern_template,
+        )
     probe['effect_check_sha'] = effect_check_sha
     if not await git_ops.commit_effect_present_in_main(effect_check_sha):
         await _record_effect_divergence(git_ops, effect_check_sha, probe)
         # SECOND ACCEPT PATH — anchored on the sha the survival check actually
         # ran against, so both modes ask the same question.  Inside the reject
         # branch, so it is structurally upgrade-only (task 3116).  The
-        # branch-tip flag travels with it because it decides what "before this
-        # landing" means: a tip's ^1 is the branch's own previous commit, not
-        # a pre-branch baseline (see _differential_parent_ref).
+        # branch-tip anchor travels with it because it decides what "before
+        # this landing" means: a tip's ^1 is the branch's own previous commit,
+        # not a pre-branch baseline (see _differential_parent_ref).
         if delivered_checks and await _delivered_checks_differential(
             git_ops, effect_check_sha, delivered_checks, probe,
-            anchor_is_branch_tip=anchor_is_branch_tip, enabled=enabled,
+            branch_tip=branch_tip, enabled=enabled,
         ):
             return _accept(citation)
         return _reject(LandingReason.effect_absent)
@@ -2587,6 +2846,28 @@ def _render_effect_divergence(
     return block, fragment
 
 
+def _differential_baseline_lines(probe: dict[str, Any]) -> list[str]:
+    """The differential block's parent-leg line, naming the
+    :class:`DifferentialBaseline` rung that chose it; none for a probe that
+    recorded no parent leg.
+
+    An ``unavailable`` baseline gets its own sentence because it ran no
+    check: without one, its block would read like a run whose every check
+    found no signal.
+    """
+    baseline = probe.get('delivered_checks_baseline')
+    if baseline == DifferentialBaseline.unavailable:
+        return [
+            '  no pre-landing baseline (unavailable): the branch tip is a merge '
+            'commit already on main with no trusted branch_base_sha, so no '
+            'check was run'
+        ]
+    parent_ref = probe.get('delivered_checks_parent_ref')
+    if not parent_ref:
+        return []
+    return [f'  pre-landing baseline (the parent leg): {parent_ref} ({baseline})']
+
+
 def _render_delivered_checks_differential(
     verdict: LandingVerdict,
 ) -> str:
@@ -2637,9 +2918,7 @@ def _render_delivered_checks_differential(
             'switch the mark-done delivered-check gate honours).\n\n'
         )
     lines = [f'delivered-checks differential: {outcome}']
-    parent_ref = verdict.probe.get('delivered_checks_parent_ref')
-    if parent_ref:
-        lines.append(f'  pre-landing baseline (the parent leg): {parent_ref}')
+    lines.extend(_differential_baseline_lines(verdict.probe))
     for leg in verdict.probe.get('delivered_checks_legs') or []:
         name = leg.get('name')
         if 'parent' not in leg:
@@ -2676,11 +2955,14 @@ def file_unattributed_landing_escalation(
     near-verbatim copy of this filing boilerplate, differing only in
     ``agent_role``).
 
-    Called by every site that found a positive landing signal (a merge
-    marker, branch content equivalent to main, or an on-main coalesce
-    member) but whose :func:`validate_landing_evidence` verdict came back
-    rejected — an unattributed or effect-absent landing that must not be
-    silently stamped done (the task-1175 clobber this task closes).
+    Called by every site that found a positive landing signal but no
+    attributable one: a merge marker or an on-main coalesce member whose
+    :func:`validate_landing_evidence` verdict came back rejected (an
+    unattributed or effect-absent landing), or the dispatch gate's
+    off-main-tip arm, whose :func:`branch_work_landed` verdict is
+    ``no_attribution`` (the branch's commits are patch-id present on main,
+    but nothing attributes them).  Neither may be silently stamped done (the
+    task-1175 clobber this task closes).
     Escalate-instead-of-stamp is deliberately non-status-blocking: the
     caller leaves the task/member row pending (or flips it to pending) and
     it is re-evaluated next tick. The caller's open-L1 veto stops it re-filing,
@@ -2717,7 +2999,9 @@ def file_unattributed_landing_escalation(
     (CANDIDATE = the candidate sha; DISCOVERY = the discovered citation) and
     stays ``None`` for a ``no_citation`` reject, which returns before the
     citation is ever assigned — so that arm carries no identity by
-    construction.
+    construction.  Neither does :func:`branch_work_landed`'s
+    ``no_attribution``, so after its L1 is resolved the gate's next tick
+    refiles it (follow-up ticket tkt_0RX5SZAFHBEV57JWSVYJR86F95).
 
     **The CITATION is the identity, deliberately NOT the effect-check anchor**
     (task 4499, amendment pass — recorded here so the next reader does not have

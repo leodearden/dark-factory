@@ -158,6 +158,7 @@ async def test_validate_done_provenance_accepts_every_declared_kind(tmp_path):
         },
         'deterministic-deploy': {'kind': 'deterministic-deploy'},
         'deterministic-deploy-scheduled': {'kind': 'deterministic-deploy-scheduled'},
+        'deterministic-deploy-unverified': {'kind': 'deterministic-deploy-unverified'},
         # escalation_id is REQUIRED for this kind (task 5241) — it cites the
         # resolving gate escalation. This table's lockstep assertion is the
         # repo's own guard that it tracks the contract, so it is corrected

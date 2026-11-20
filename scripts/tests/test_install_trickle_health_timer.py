@@ -325,7 +325,7 @@ def _run_script(fake_timer_systemctl, project_id, *, env=None):
     Puts *fake_timer_systemctl* first on PATH, reset on every call, and defaults
     INSTALL_TRICKLE_HEALTH_TIMER_PYTHON=sys.executable so the script's
     `nightly.py resolve-config` delegation runs the REAL resolver directly --
-    no `uv run`/`--frozen` needed in-test. Callers supply XDG_CONFIG_HOME and
+    no `uv run` needed in-test. Callers supply XDG_CONFIG_HOME and
     LEGIBILITY_SEARCH_ROOTS via *env*; any ambient LEGIBILITY_SEARCH_ROOTS is
     popped so a developer's shell cannot make this resolve the real projects.
     """

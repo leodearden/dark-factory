@@ -19,12 +19,15 @@ to test.
 from __future__ import annotations
 
 import os
-import sqlite3
 import subprocess
 import time
 from pathlib import Path
+from types import MappingProxyType
 
+import _checkout as _checkout
 import pytest
+from sampler.metrics import SampleKey, Samples
+from sampler.store import LoadSampleStore
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
@@ -94,20 +97,16 @@ def test_timer_fires_every_five_seconds(unit_values):
 
 # ── the installer ───────────────────────────────────────────────────────────
 
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS samples (
-    ts INTEGER NOT NULL,
-    metric TEXT NOT NULL,
-    value REAL NOT NULL,
-    window_mean REAL,
-    window_max REAL
-);
-CREATE INDEX IF NOT EXISTS idx_samples_metric_ts ON samples (metric, ts);
-"""
+_ONE_HOST_ROW: Samples = MappingProxyType({SampleKey('runqueue_ratio'): 4.06})
 
 
-def _seed_db(root: Path, *, rows: bool = True, ts_offset: int = 60) -> Path:
-    """Build a DB with the real schema where the installed UNIT would write it.
+def _seed_db(
+    root: Path, *, tick: Samples = _ONE_HOST_ROW, ts_offset: int = 60
+) -> Path:
+    """Write a DB where the installed UNIT would write it, with sampler.store's
+    own LoadSampleStore, so the file has the shape the unit writes.
+
+    *tick* is the rows the kick wrote. An empty tick leaves a schema-only file.
 
     *ts_offset* is seconds relative to now. The default is in the FUTURE on
     purpose: the installer records a high-water ts before the kick and then
@@ -117,18 +116,8 @@ def _seed_db(root: Path, *, rows: bool = True, ts_offset: int = 60) -> Path:
     reject -- a leftover from an earlier install.
     """
     db_path = root / 'data' / 'load-samples.db'
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(db_path))
-    try:
-        conn.executescript(_SCHEMA)
-        if rows:
-            conn.execute(
-                'INSERT INTO samples (ts, metric, value) VALUES (?, ?, ?)',
-                (int(time.time()) + ts_offset, 'runqueue_ratio', 4.06),
-            )
-        conn.commit()
-    finally:
-        conn.close()
+    LoadSampleStore(db_path).write_tick(
+        int(time.time()) + ts_offset, unwindowed=tick, windowed={})
     return db_path
 
 
@@ -227,14 +216,32 @@ def test_install_fails_loud_when_the_timer_is_absent_from_list_timers(fake_timer
     assert 'start' not in verbs, f'kicked the service after a failed verify: {verbs}'
 
 
-def test_a_db_with_a_fresh_row_passes_the_row_check(fake_timer_systemctl, tmp_path: Path):
+_LEAF = 'orchestrator-dark-factory.service'
+_HOST_AND_ONE_LEAF: Samples = MappingProxyType({
+    SampleKey('runqueue_ratio'): 4.06,
+    SampleKey('own_read_ok', _LEAF): 1.0,
+    SampleKey('own_cpu_some10', _LEAF): 0.5,
+})
+
+
+@pytest.mark.parametrize(
+    'tick',
+    [_ONE_HOST_ROW, _HOST_AND_ONE_LEAF],
+    ids=['host-only', 'host-and-one-leaf'],
+)
+def test_a_fresh_tick_passes_the_row_check_counting_every_row_it_wrote(
+    fake_timer_systemctl, tmp_path: Path, tick: Samples
+):
+    """A per-leaf row is a real row of the tick, and the report counts it."""
     root = tmp_path / 'root'
-    _seed_db(root)
+    _seed_db(root, tick=tick)
 
     result = _run_script(fake_timer_systemctl, env=_install_env(tmp_path, root))
 
     assert result.returncode == 0, (
         f'stdout={result.stdout!r} stderr={result.stderr!r}')
+    assert f'{len(tick)} sample rows written by the kick' in result.stdout, (
+        result.stdout)
 
 
 def test_an_empty_db_fails_the_row_check_naming_the_path(fake_timer_systemctl, tmp_path: Path):
@@ -244,7 +251,7 @@ def test_an_empty_db_fails_the_row_check_naming_the_path(fake_timer_systemctl, t
     sampler that writes nothing, which is the entire failure this check is for.
     """
     root = tmp_path / 'root'
-    db_path = _seed_db(root, rows=False)
+    db_path = _seed_db(root, tick={})
 
     result = _run_script(fake_timer_systemctl, env=_install_env(tmp_path, root))
 

@@ -126,7 +126,7 @@ async def test_submit_task_on_the_primary_server_receives_json_looking_strings_v
     interceptor = AsyncMock()
     interceptor.submit_task = AsyncMock(return_value={'ticket': 'tkt_x'})
     server = create_mcp_server(AsyncMock(), task_interceptor=interceptor)
-    _install_tool_dispatch_guards(server, known_projects={})
+    _install_tool_dispatch_guards(server, known_projects={}, prefix_resolver=None)
 
     result = await server._tool_manager.call_tool(
         'submit_task',

@@ -37,6 +37,11 @@ from fused_memory.utils.validation import InputValidationError
 #: The group every derived-path test scans in, unless it needs a foreign one.
 GROUP = 'dark_factory'
 
+#: Spelled as escapes, mirroring tests/test_canonical_labels.py: U+212A renders
+#: as an ordinary 'K', so a literal-character fixture would be unreviewable.
+LATIN_SMALL_LETTER_LONG_S = '\u017f'
+KELVIN_SIGN = '\u212a'
+
 
 class TestReferentSourcesVocabulary:
     """``REFERENT_SOURCES`` is the CLOSED vocabulary of resolution sources.
@@ -1077,6 +1082,30 @@ class TestMalformedDeclarationIsRejectedLoudly:
             )
 
     @pytest.mark.parametrize(
+        'lookalike_project_id',
+        ['ta' + LATIN_SMALL_LETTER_LONG_S + 'k', 'tas' + KELVIN_SIGN],
+        ids=['long-s-spelling', 'kelvin-sign-spelling'],
+    )
+    def test_a_unicode_lookalike_of_the_task_vocabulary_is_rejected_loudly(
+        self, lookalike_project_id
+    ):
+        """The declared path never mints a foreign node for a Unicode
+        lookalike of task vocabulary. ``str.lower()`` does not fold the long
+        s, so the vocabulary guard would not recognise the long-s spelling,
+        and only ``validate_project_id``'s ASCII allowlist stops it.
+        ``str.lower()`` does fold the Kelvin sign, so the Kelvin spelling
+        passes the allowlist as ``'task'``, and the vocabulary guard stops
+        it. Pins the loud rejection, not which guard fires, so dropping
+        either guard fails here."""
+        with pytest.raises(InputValidationError):
+            resolve_referents(
+                declared=[{'kind': 'task', 'id': 2500, 'project_id': lookalike_project_id}],
+                metadata={},
+                content='',
+                group_id=GROUP,
+            )
+
+    @pytest.mark.parametrize(
         'declared',
         [
             'task:3127',
@@ -1983,3 +2012,37 @@ class TestKnownProjectIdsNarrowing:
         become the one a caller can pass positionally."""
         with pytest.raises(TypeError):
             resolve_referents(None, {}, 'mirrors reify:132', GROUP, self.REGISTRY)  # type: ignore[misc]
+
+
+class TestDerivedPathReadsTheScanFixes:
+    """The write path derives referents through the fixed scan (task 10082)."""
+
+    REGISTRY = {'dark_factory': '/src/dark-factory', 'reify': '/src/reify'}
+
+    def _derive(self, content, known_project_ids=REGISTRY):
+        return resolve_referents(
+            declared=None,
+            metadata={},
+            content=content,
+            group_id=GROUP,
+            known_project_ids=known_project_ids,
+        )
+
+    def test_a_commit_hash_after_the_task_word_derives_nothing(self):
+        resolution = self._derive('merged 8c7e163fcf for task 8c7e163fcf')
+        assert resolution.source == 'none'
+        assert resolution.referents == ()
+
+    def test_every_number_of_a_plural_list_is_derived(self):
+        resolution = self._derive('tasks 2226 and 2227 both landed')
+        assert resolution.source == 'derived'
+        assert resolution.referents == (Referent(number='2226'), Referent(number='2227'))
+
+    def test_a_registered_project_name_qualifies_a_derived_mention(self):
+        resolution = self._derive('Reify task 3674 was cancelled')
+        assert resolution.source == 'derived'
+        assert resolution.referents == (Referent(project_id='reify', number='3674'),)
+
+    def test_without_a_registry_the_mention_stays_local(self):
+        resolution = self._derive('Reify task 3674 was cancelled', known_project_ids=None)
+        assert resolution.referents == (Referent(number='3674'),)

@@ -36,6 +36,8 @@ from orchestrator.mcp.plan_tools import (
     _create_plan,
     _record_descoped_step,
 )
+from orchestrator.quarantine_provenance import stamp_quarantined_from
+from orchestrator.review_lineage import retire_quarantined_lineages
 from orchestrator.scheduler import BlastRadiusResult, files_to_modules
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 
@@ -1343,3 +1345,177 @@ async def test_remedy_pass_output_takes_the_same_plan_gates_as_the_first_pass(
     assert outcome == WorkflowOutcome.BLOCKED
     assert _no_plan_counter_writes(f) == [1]
     _assert_restored(f, before)
+
+
+# ── task 3663: review rounds retired by a quarantine reach the architect ────
+
+_CARRIED = {
+    'severity': 'suggestion',
+    'location': 'mod_a/file.py:3',
+    'category': 'naming',
+    'description': 'helper name hides its side effect',
+    'suggested_fix': 'rename helper',
+}
+
+_OUT_OF_SCOPE = {
+    'severity': 'suggestion',
+    'location': 'mod_z/elsewhere.py:9',
+    'category': 'design',
+    'description': 'shared helper belongs in mod_z',
+    'suggested_fix': 'move it',
+}
+
+
+def _make_3663(tmp_path: Path) -> _Fixture:
+    """A fixture holding the lock set of the plan's own files, so _CARRIED's location is in scope."""
+    return _make(
+        worktree=tmp_path / 'wt', project_root=tmp_path / 'proj',
+        modules=files_to_modules(['mod_a/file.py'], 2),
+    )
+
+
+def _retire_a_quarantined_lineage(
+    f: _Fixture, *, quarantined_after_confirmation: bool = True, issues: list[dict] | None = None,
+) -> None:
+    """Confirm the plan, then park its reviewed branch after one amendment round, and retire that lineage."""
+    confirmed = datetime.now(UTC) - timedelta(minutes=30)
+    quarantined = confirmed + timedelta(minutes=10 if quarantined_after_confirmation else -10)
+    plan_path = f.artifacts.artifact_path('plan.json')
+    plan = json.loads(plan_path.read_text())
+    plan['_finalized_at'] = confirmed.isoformat()
+    plan_path.write_text(json.dumps(plan))
+    f.artifacts.set_review_counters(amendment_rounds_total=1)
+    archive = f.artifacts.review_archive_dir('amend-1')
+    archive.mkdir(parents=True)
+    issues = [_CARRIED] if issues is None else issues
+    (archive / 'analyst.json').write_text(json.dumps({'verdict': 'ISSUES_FOUND', 'issues': issues}))
+    assert stamp_quarantined_from(f.artifacts, {
+        'branch': 'refs/heads/task/101-20261112T000000Z',
+        'tip_sha': 'c' * 40,
+        'unique_commit_count': 2,
+        'quarantined_at': quarantined.isoformat(),
+        'reason': 'orphan-reaper',
+        'parking': '/q/101-20261112T000000Z',
+        'stored_title': None,
+    })
+    assert retire_quarantined_lineages(f.artifacts)
+
+
+def _carried_by(call) -> list[str]:
+    return [s['description'] for review in call.kwargs.get('retired_reviews', ()) for s in review.suggestions]
+
+
+def _carried(builder: AsyncMock) -> list[str]:
+    return _carried_by(builder.call_args)
+
+
+@pytest.mark.asyncio
+async def test_a_retired_review_round_declines_the_skip_and_reaches_revalidation(tmp_path: Path):
+    f = _make_3663(tmp_path)
+    _retire_a_quarantined_lineage(f)
+
+    with pytest.raises(AssertionError, match='architect must NOT'):
+        await f.wf._plan()
+
+    f.build_revalidation_prompt.assert_awaited_once()
+    assert _carried(f.build_revalidation_prompt) == [_CARRIED['description']]
+
+
+@pytest.mark.asyncio
+async def test_a_retirement_older_than_the_plan_confirmation_still_skips(tmp_path: Path):
+    f = _make_3663(tmp_path)
+    _retire_a_quarantined_lineage(f, quarantined_after_confirmation=False)
+
+    assert await f.wf._plan() == WorkflowOutcome.PLANNED
+    assert f.invoke_called == []
+
+
+@pytest.mark.asyncio
+async def test_a_fresh_plan_carries_the_retired_review_round(tmp_path: Path):
+    f = _make_3663(tmp_path)
+    _retire_a_quarantined_lineage(f)
+    f.artifacts.artifact_path('plan.json').unlink()
+
+    with pytest.raises(AssertionError, match='architect must NOT'):
+        await f.wf._plan()
+
+    f.build_architect_prompt.assert_awaited_once()
+    assert _carried(f.build_architect_prompt) == [_CARRIED['description']]
+
+
+@pytest.mark.asyncio
+async def test_without_a_retirement_the_skip_fires_and_nothing_is_carried(tmp_path: Path):
+    f = _make_3663(tmp_path)
+
+    assert await f.wf._plan() == WorkflowOutcome.PLANNED
+    assert f.invoke_called == []
+
+    f.artifacts.artifact_path('plan.json').unlink()
+    with pytest.raises(AssertionError, match='architect must NOT'):
+        await f.wf._plan()
+    assert _carried(f.build_architect_prompt) == []
+
+
+@pytest.mark.asyncio
+async def test_an_out_of_scope_retired_suggestion_does_not_decline_the_skip(tmp_path: Path):
+    f = _make_3663(tmp_path)
+    _retire_a_quarantined_lineage(f, issues=[_OUT_OF_SCOPE])
+
+    assert await f.wf._plan() == WorkflowOutcome.PLANNED
+    assert f.invoke_called == []
+
+    f.artifacts.artifact_path('plan.json').unlink()
+    with pytest.raises(AssertionError, match='architect must NOT'):
+        await f.wf._plan()
+    assert _carried(f.build_architect_prompt) == []
+
+
+@pytest.mark.asyncio
+async def test_only_in_scope_retired_suggestions_reach_revalidation(tmp_path: Path):
+    f = _make_3663(tmp_path)
+    _retire_a_quarantined_lineage(f, issues=[_CARRIED, _OUT_OF_SCOPE])
+
+    with pytest.raises(AssertionError, match='architect must NOT'):
+        await f.wf._plan()
+
+    f.build_revalidation_prompt.assert_awaited_once()
+    assert _carried(f.build_revalidation_prompt) == [_CARRIED['description']]
+
+
+@pytest.mark.asyncio
+async def test_a_retired_suggestion_left_out_of_scope_is_logged(tmp_path: Path, caplog: pytest.LogCaptureFixture):
+    f = _make_3663(tmp_path)
+    _retire_a_quarantined_lineage(f, issues=[_CARRIED, _OUT_OF_SCOPE])
+
+    with (
+        caplog.at_level('WARNING', logger='orchestrator.workflow'),
+        pytest.raises(AssertionError, match='architect must NOT'),
+    ):
+        await f.wf._plan()
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == 'WARNING']
+    dropped = [message for message in warnings if _OUT_OF_SCOPE['location'] in message]
+    assert dropped
+    assert all('refs/heads/task/101-20261112T000000Z' in message for message in dropped)
+    assert not [message for message in warnings if _CARRIED['location'] in message]
+
+
+@pytest.mark.asyncio
+async def test_the_done_step_integrity_remedy_pass_carries_the_retired_review_round(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    f = _make(
+        worktree=tmp_path / 'wt', project_root=tmp_path / 'proj', git_head=True,
+        changed_files=['mod_a/file.py'], plan_steps=_STEP_1_DONE_STEP_2_PENDING,
+        modules=files_to_modules(['mod_a/file.py'], 2),
+    )
+    _retire_a_quarantined_lineage(f)
+    wipe = [_wipe_to('step-1', 'step-2'), _confirm]
+    _scripted_architect(f, monkeypatch, [wipe, wipe])
+
+    await f.wf._plan()
+
+    first_pass, remedy_pass = f.build_revalidation_prompt.call_args_list
+    assert first_pass.kwargs.get('integrity_refusal') is None
+    assert remedy_pass.kwargs.get('integrity_refusal') is not None
+    assert _carried_by(remedy_pass) == [_CARRIED['description']]

@@ -875,6 +875,13 @@ class Escalation:
     policy_class: str | None = None
     claimed_at: str | None = None
     claimed_by: str | None = None
+    # The merge-halt release marker (task 3876). Sole writer:
+    # queue.release_merge_halt. A record carrying halt_released_at never
+    # re-owns a merge-queue halt:
+    # orchestrator/src/orchestrator/merge_halt_rehydration.py::rehydrate_merge_halt
+    # skips it. Zero migration via the from_dict filter.
+    halt_released_at: str | None = None
+    halt_release_note: str = ''
 
     def to_dict(self) -> dict:
         return asdict(self)

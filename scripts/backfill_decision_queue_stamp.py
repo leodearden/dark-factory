@@ -31,13 +31,13 @@ WHAT IT WRITES
 --------------
 For each OPEN record with a falsy ``escalations_dir`` it stamps either the one
 queue that demonstrably holds its escalation id, or
-``session_registry.UNKNOWN_QUEUE`` ("investigated, could not determine" — the
+``decision_registry.UNKNOWN_QUEUE`` ("investigated, could not determine" — the
 reaper refuses to close those, leaving them as visible cockpit rows for human
 closure). It never rewrites an existing stamp and never touches a non-OPEN
 record: the watchers' stamps are FIRST-HAND evidence from the filer, this
 script's are inference, and inference must not overwrite evidence.
 
-Writes go through ``session_registry.set_decision_escalations_dir`` rather than
+Writes go through ``decision_registry.set_decision_escalations_dir`` rather than
 rewriting decision JSON here, so they are atomic and serialized against the
 live C8 watchers and the cockpit on the same ids via ``decision_id_lock``.
 
@@ -65,13 +65,12 @@ from typing import NoReturn
 # SAME checkout as this script via a __file__-relative path, never a hardcoded
 # absolute. An editable install puts the MAIN checkout's orchestrator/src on
 # sys.path for a bare `python3`, so without this a copy running from a worktree
-# would silently use the main checkout's session_registry (tasks 2881/2882).
+# would silently use the main checkout's decision_registry (tasks 2881/2882).
 # Idempotent — a no-op under pytest, where conftest already inserted scripts/.
-_ORCH_SRC = Path(__file__).resolve().parent.parent / 'orchestrator' / 'src'
-if str(_ORCH_SRC) not in sys.path:
-    sys.path.insert(0, str(_ORCH_SRC))
+if (_ORCH_SRC := str(Path(__file__).resolve().parent.parent / 'orchestrator' / 'src')) not in sys.path:
+    sys.path.insert(0, _ORCH_SRC)
 
-from orchestrator import session_registry as sr  # noqa: E402
+from orchestrator import decision_registry as dr
 
 # The measured provenance discriminator (see resolve_queue_for_decision).
 _WATCHER_SESSION_PREFIX = 'watcher-'
@@ -84,7 +83,7 @@ def queues_holding(escalation_id: str, queues: list[Path]) -> list[Path]:
     order, so the caller can see that an id is ambiguous rather than being
     handed a single silently-chosen answer.
 
-    Uses the SAME two-tier lookup as ``session_registry.read_escalation_status``
+    Uses the SAME two-tier lookup as ``decision_registry.read_escalation_status``
     — the queue-root file ``<queue>/<id>.json`` first (a still-pending
     escalation), then a recursive search under
     ``<queue>/<ESCALATION_ARCHIVE_SUBDIR>/`` (a resolved/dismissed one, moved
@@ -92,7 +91,7 @@ def queues_holding(escalation_id: str, queues: list[Path]) -> list[Path]:
     the reaper's own notion of "this queue contains that id" is load-bearing:
     if the two diverged, this script could stamp a queue the reaper would never
     match against, and the record would be pinned OPEN forever. That is exactly
-    why the archive subdir is read from ``sr.ESCALATION_ARCHIVE_SUBDIR`` rather
+    why the archive subdir is read from ``dr.ESCALATION_ARCHIVE_SUBDIR`` rather
     than re-spelled here — a hand-synced copy of the literal is a divergence
     waiting to happen, and nothing would fail loudly when it did. The archive
     tier also carries most of the value here — legacy records overwhelmingly
@@ -110,7 +109,7 @@ def queues_holding(escalation_id: str, queues: list[Path]) -> list[Path]:
     holders: list[Path] = []
     seen: set[str] = set()
     for queue in queues:
-        canonical = sr.normalize_escalations_dir(queue)
+        canonical = dr.normalize_escalations_dir(queue)
         if canonical in seen:
             continue
         try:
@@ -119,7 +118,7 @@ def queues_holding(escalation_id: str, queues: list[Path]) -> list[Path]:
             if (queue / f'{escalation_id}.json').is_file():
                 found = True
             else:
-                archive = queue / sr.ESCALATION_ARCHIVE_SUBDIR
+                archive = queue / dr.ESCALATION_ARCHIVE_SUBDIR
                 found = any(archive.rglob(f'{escalation_id}.json'))
         except OSError:
             continue
@@ -130,7 +129,7 @@ def queues_holding(escalation_id: str, queues: list[Path]) -> list[Path]:
 
 
 def resolve_queue_for_decision(
-    record: sr.DecisionRecord,
+    record: dr.DecisionRecord,
     *,
     queues: list[Path],
     recon_queue: Path | None,
@@ -183,20 +182,20 @@ def resolve_queue_for_decision(
     # stamp" becomes a checkable invariant instead of an aspiration.
     escalation_id = record.escalation_id
     if not escalation_id:
-        return sr.UNKNOWN_QUEUE, []
+        return dr.UNKNOWN_QUEUE, []
 
     holders = queues_holding(escalation_id, queues)
 
     # Rule 3: the id resolves in no supplied queue -- archive retention pruned
     # it, or the owning project's queue was not passed. Refuse, don't guess.
     if not holders:
-        return sr.UNKNOWN_QUEUE, holders
+        return dr.UNKNOWN_QUEUE, holders
 
     # Rule 2: exactly one holder -> direct evidence, no tiebreak runs. This
     # branch is deliberately ABOVE the heuristics: a measured regularity must
     # never override the id demonstrably being in one specific queue.
     if len(holders) == 1:
-        return sr.normalize_escalations_dir(holders[0]), holders
+        return dr.normalize_escalations_dir(holders[0]), holders
 
     # Ambiguous from here down (2+ queues hold the id). Infer, then CORROBORATE.
     inferred: Path | None = None
@@ -220,12 +219,12 @@ def resolve_queue_for_decision(
         # demonstrably does NOT hold this escalation -- a stamp that looks
         # authoritative while pointing at the wrong queue, which is precisely
         # the false-closure hazard being removed.
-        canonical = sr.normalize_escalations_dir(inferred)
-        if canonical in {sr.normalize_escalations_dir(h) for h in holders}:
+        canonical = dr.normalize_escalations_dir(inferred)
+        if canonical in {dr.normalize_escalations_dir(h) for h in holders}:
             return canonical, holders
 
     # Rule 6: ambiguous and uncorroborated -> UNKNOWN. Human triage, not a coin flip.
-    return sr.UNKNOWN_QUEUE, holders
+    return dr.UNKNOWN_QUEUE, holders
 
 
 # ---------------------------------------------------------------------------
@@ -267,7 +266,7 @@ REASON_AMBIGUOUS = 'ambiguous-uncorroborated'
 
 
 def classify_reason(
-    record: sr.DecisionRecord,
+    record: dr.DecisionRecord,
     resolved: str,
     holders: list[Path],
 ) -> str:
@@ -288,7 +287,7 @@ def classify_reason(
         return REASON_NO_ESCALATION_ID
     if not holders:
         return REASON_NO_HOLDERS
-    if resolved == sr.UNKNOWN_QUEUE:
+    if resolved == dr.UNKNOWN_QUEUE:
         return REASON_AMBIGUOUS
     if len(holders) == 1:
         return REASON_UNIQUE
@@ -460,8 +459,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.verify:
         residue = [
-            d for d in sr.list_decisions(root=root)
-            if d.state == sr.DecisionState.OPEN and not d.escalations_dir
+            d for d in dr.list_decisions(root=root)
+            if d.state == dr.DecisionState.OPEN and not d.escalations_dir
         ]
         for decision in residue:
             print(f'UNSTAMPED {decision.id} project={decision.project} '
@@ -516,8 +515,8 @@ def main(argv: list[str] | None = None) -> int:
     # and an already-stamped record carries first-hand evidence from its filer
     # that this script's inference must not overwrite.
     candidates = [
-        d for d in sr.list_decisions(root=root)
-        if d.state == sr.DecisionState.OPEN and not d.escalations_dir
+        d for d in dr.list_decisions(root=root)
+        if d.state == dr.DecisionState.OPEN and not d.escalations_dir
     ]
     print(f'candidates: {len(candidates)}')
 
@@ -544,7 +543,7 @@ def main(argv: list[str] | None = None) -> int:
             f'holders=[{holder_names}] -> {resolved} ({reason})'
         )
         if args.apply:
-            updated = sr.set_decision_escalations_dir(record.id, resolved, root=root)
+            updated = dr.set_decision_escalations_dir(record.id, resolved, root=root)
             if updated is None:
                 failed += 1
                 print(f'{line} WRITE-FAILED')
