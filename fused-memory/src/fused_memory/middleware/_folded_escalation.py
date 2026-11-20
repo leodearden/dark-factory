@@ -5,7 +5,9 @@ import, the guarded ``EscalationQueue`` construction, the
 ``get_by_task(anchor, status='pending')`` dedupe fold, and the never-raise
 ``Escalation(...)`` + ``queue.submit(...)``.  Each caller keeps its own
 ``_ANCHOR_TASK_ID`` / ``_AGENT_ROLE`` / ``_CATEGORY`` constants and builds its
-own summary and detail.
+own summary and detail.  :func:`pending_folded_escalations` and
+:func:`resolve_folded_escalations` read and close what a caller filed, for an
+alarm that clears itself, under the same guard.
 
 EVERY FILER'S ANCHOR MUST BE UNIQUE.  A filer that dedupes against an anchor
 somebody else keeps open never files again, and that silence is
@@ -53,6 +55,44 @@ def _suffix(context: str) -> str:
     return f' ({context})' if context else ''
 
 
+def _open_queue(
+    project_root: str | None,
+    *,
+    logger: logging.Logger,
+    log_label: str,
+    outcome: str,
+    context: str = '',
+) -> EscalationQueue | None:
+    """Open *project_root*'s queue, or log why not and return None.
+
+    *outcome* completes each no-op line, e.g. ``'nothing escalated'``.
+    """
+    if project_root is None:
+        logger.debug(
+            '%s: no project_root, so there is no project queue; %s%s',
+            log_label, outcome, _suffix(context),
+        )
+        return None
+
+    if not HAS_ESCALATION:
+        logger.warning(
+            '%s: escalation package unavailable; %s%s',
+            log_label, outcome, _suffix(context),
+        )
+        return None
+
+    try:
+        return EscalationQueue(escalation_queue_dir(project_root))
+    except Exception:
+        # Constructing the queue creates its directory; a read-only or missing
+        # project_root must not turn an alarm into a crash on a write path.
+        logger.exception(
+            '%s: could not open the escalation queue at project_root=%r; %s%s',
+            log_label, project_root, outcome, _suffix(context),
+        )
+        return None
+
+
 def file_folded_escalation(
     project_root: str | None,
     *,
@@ -81,7 +121,11 @@ def file_folded_escalation(
             another filer: see the module docstring.
         agent_role: The filer's role string.
         category: The escalation category.
-        severity: ``'blocking'`` or ``'info'``; the caller's choice.
+        severity: ``'blocking'`` or ``'info'``; the caller's choice.  A
+            born-at-L2 severity (``escalation.models.BORN_AT_L2_SEVERITIES``,
+            ``'critical'``/``'urgent'``) pages a human directly, and only an
+            *agent_role* with a ``harness-``/``orchestrator-`` sentinel prefix
+            may file one.
         summary: One-line operator-facing summary.
         detail: The INV-2 structured evidence, already rendered by the caller.
         suggested_action: What a triager should do.
@@ -115,29 +159,11 @@ def file_folded_escalation(
     WARNING for every caller; the rationale lives in
     ``tests/test_folded_escalation.py::TestTheEmittedLevels``.
     """
-    if project_root is None:
-        logger.debug(
-            '%s: no project_root, so there is no project queue to file into; '
-            'nothing escalated%s', log_label, _suffix(context),
-        )
-        return None
-
-    if not HAS_ESCALATION:
-        logger.warning(
-            '%s: escalation package unavailable; nothing will be escalated%s',
-            log_label, _suffix(context),
-        )
-        return None
-
-    try:
-        queue = EscalationQueue(escalation_queue_dir(project_root))
-    except Exception:
-        # Constructing the queue creates its directory; a read-only or missing
-        # project_root must not turn an alarm into a crash on a write path.
-        logger.exception(
-            '%s: could not open the escalation queue at project_root=%r; '
-            'nothing escalated%s', log_label, project_root, _suffix(context),
-        )
+    queue = _open_queue(
+        project_root, logger=logger, log_label=log_label,
+        outcome='nothing escalated', context=context,
+    )
+    if queue is None:
         return None
 
     # While a condition persists every event breaches again, so filing per
@@ -198,3 +224,70 @@ def file_folded_escalation(
 
     logger.warning('%s: queued %s%s', log_label, esc_id, _suffix(context))
     return esc_id
+
+
+def pending_folded_escalations(
+    project_root: str | None,
+    *,
+    anchor_task_id: str,
+    agent_role: str,
+    logger: logging.Logger,
+    log_label: str,
+) -> list[Escalation]:
+    """Return the pending records *agent_role* filed under *anchor_task_id*.
+
+    ``[]`` when there are none or the queue cannot be read; a no-op is logged
+    as :func:`file_folded_escalation` logs it. NEVER raises.
+    """
+    queue = _open_queue(
+        project_root, logger=logger, log_label=log_label, outcome='nothing read',
+    )
+    if queue is None:
+        return []
+    try:
+        return queue.get_by_task(anchor_task_id, status='pending', agent_role=agent_role)
+    except Exception:
+        logger.exception(
+            '%s: failed to read pending records under anchor %r in project_root=%r',
+            log_label, anchor_task_id, project_root,
+        )
+        return []
+
+
+def resolve_folded_escalations(
+    project_root: str | None,
+    *,
+    anchor_task_id: str,
+    agent_role: str,
+    resolution: str,
+    logger: logging.Logger,
+    log_label: str,
+) -> list[str]:
+    """Resolve every record :func:`pending_folded_escalations` would return.
+
+    Resolved as *agent_role*, so the record shows its filer closed it.  A
+    failure on one record is logged and the next is still tried.  Returns the
+    resolved ids. NEVER raises.
+    """
+    pending = pending_folded_escalations(
+        project_root, anchor_task_id=anchor_task_id, agent_role=agent_role,
+        logger=logger, log_label=log_label,
+    )
+    if not pending:
+        return []
+    queue = _open_queue(
+        project_root, logger=logger, log_label=log_label, outcome='nothing resolved',
+    )
+    if queue is None:
+        return []
+    resolved: list[str] = []
+    for esc in pending:
+        try:
+            queue.resolve(esc.id, resolution, resolved_by=agent_role)
+        except Exception:
+            logger.exception('%s: failed to resolve %s', log_label, esc.id)
+            continue
+        resolved.append(esc.id)
+    if resolved:
+        logger.info('%s: resolved %s', log_label, ', '.join(resolved))
+    return resolved

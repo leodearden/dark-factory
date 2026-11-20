@@ -554,6 +554,7 @@ class TestReadingAndResolvingUnderAnAnchor:
         cannot run leaves a page open, a read that cannot run re-pages."""
         _emit(tmp_path)
         monkeypatch.setattr(_folded_escalation, 'HAS_ESCALATION', False)
+        caplog.clear()
 
         with caplog.at_level(logging.DEBUG):
             assert call(str(tmp_path)) == []
