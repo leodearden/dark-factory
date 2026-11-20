@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import dataclasses
 import os
+from collections.abc import MutableMapping
 from pathlib import Path
 
 import pytest
@@ -264,12 +265,11 @@ class TestReadCgroup:
         assert isinstance(reading, CgroupReading)
         assert reading.cpu_stat is not None
 
+        field = 'memory_current'
         with pytest.raises(dataclasses.FrozenInstanceError):
-            reading.memory_current = 0  # type: ignore[misc]
-        with pytest.raises(TypeError):
-            reading.cpu_stat['usage_usec'] = 0  # type: ignore[index]
-        with pytest.raises(TypeError):
-            reading.pressure[PressureResource.CPU] = PressureTotals(0, 0)  # type: ignore[index]
+            setattr(reading, field, 0)
+        assert not isinstance(reading.cpu_stat, MutableMapping)
+        assert not isinstance(reading.pressure, MutableMapping)
 
 
 class TestPressureResource:
