@@ -322,7 +322,7 @@ def _build(args: argparse.Namespace) -> int:
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
+    parser = argparse.ArgumentParser(description=__doc__.split('\n\n')[0] if __doc__ else None)
     commands = parser.add_subparsers(dest='command', required=True)
     build = commands.add_parser('build', help='write the cases (with texts) and their features')
     for flag in ('items', 'texts', 'key', 'hoist', 'adjudications', 'attaches', 'cases-out',

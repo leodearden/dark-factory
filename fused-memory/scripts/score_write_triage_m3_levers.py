@@ -706,7 +706,7 @@ def _names(listed: str) -> list[str]:
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
+    parser = argparse.ArgumentParser(description=__doc__.split('\n\n')[0] if __doc__ else None)
     commands = parser.add_subparsers(dest='command', required=True)
     for name in ('classify', 'report'):
         command = commands.add_parser(name)

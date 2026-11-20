@@ -758,7 +758,7 @@ def _write_sorted(path: Path, rows: Iterable[Mapping[str, Any]]) -> None:
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
+    parser = argparse.ArgumentParser(description=__doc__.split('\n\n')[0] if __doc__ else None)
     commands = parser.add_subparsers(dest='command', required=True)
     run = commands.add_parser('run', help='replay the named arms, resuming any partial one')
     run.add_argument('--cases', type=Path, required=True, help='the scratch cases JSONL (with texts)')

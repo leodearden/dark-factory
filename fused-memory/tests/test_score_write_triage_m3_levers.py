@@ -113,7 +113,7 @@ def _row(entry: str, outcome: str, *, arm: str = 'f3p', marked: bool | None = No
 
 def _soak_rows(arm: str = 'f3p', **overrides: str) -> list[dict[str, Any]]:
     items, _ = _corpus()
-    return [_row(item['entry_id'], overrides.get(item['entry_id'], item['outcome']), arm=arm)
+    return [_row(item['entry_id'], overrides.get(item['entry_id'], str(item['outcome'])), arm=arm)
             for item in items]
 
 
