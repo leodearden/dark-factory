@@ -33,13 +33,14 @@ from escalation.amendments import (
     amendment_room,
 )
 from escalation.classify import default_resolution_class_for_resolver, effective_benign
-from escalation.models import Escalation
+from escalation.models import RESOLUTION_CLASS_REQUIRED_CODE, Escalation
 from escalation.queue import (
     _MAX_LATE_RESOLUTION_CHARS,
     _MAX_LATE_RESOLUTIONS,
     _MAX_ROOT_CAUSE_VARIANTS,
     AmendmentOutcome,
     EscalationQueue,
+    ResolutionClassRequired,
     ResolveOutcome,
     iter_all_escalation_paths,
 )
@@ -9428,3 +9429,132 @@ class TestGetPendingByTask:
             assert [e.id for e in grouped[task_id]] == [
                 e.id for e in queue.get_by_task(task_id, status='pending')
             ] == ['esc-1-1']
+
+
+class TestLevel2ResolutionClassRequired:
+    """A level-2 close must carry a resolution_class (plans/instruments-honesty-prd.md decision 8).
+
+    The refusal raises inside the lock before any write, so the record is
+    unchanged on disk and nothing is archived.
+    """
+
+    def _submit(self, queue: EscalationQueue, esc_id: str, *, level: int, members=()) -> Escalation:
+        esc = _make_escalation(esc_id, task_id=f'task-{esc_id}', level=level)
+        esc.members = list(members)
+        queue.submit(esc)
+        return esc
+
+    def _on_disk(self, queue: EscalationQueue, esc_id: str) -> dict:
+        return json.loads((queue.queue_dir / f'{esc_id}.json').read_text())
+
+    def _archived(self, queue: EscalationQueue) -> list[Path]:
+        return sorted((queue.queue_dir / 'archive').glob('*/*.json'))
+
+    @pytest.mark.parametrize('dismiss', [False, True], ids=['resolve', 'dismiss'])
+    @pytest.mark.parametrize('resolved_by', ['escalation-watcher', 'interactive', None])
+    def test_an_unclassified_level_2_close_is_refused_and_changes_nothing(
+        self, tmp_path: Path, resolved_by: str | None, dismiss: bool,
+    ):
+        queue = EscalationQueue(tmp_path / 'esc')
+        self._submit(queue, 'esc-2-1', level=2)
+        before = self._on_disk(queue, 'esc-2-1')
+        outcome: ResolveOutcome = {
+            'applied': True, 'prior_status': None, 'prior_resolved_by': None,
+            'late_resolution_captured': False, 'resolution_class_corrected': None,
+        }
+
+        with pytest.raises(ResolutionClassRequired) as raised:
+            queue.resolve(
+                'esc-2-1', 'closing it', dismiss=dismiss, resolved_by=resolved_by, outcome=outcome,
+            )
+
+        assert raised.value.code == RESOLUTION_CLASS_REQUIRED_CODE == 'resolution_class_required'
+        message = str(raised.value)
+        assert 'esc-2-1' in message
+        assert 'level 2' in message
+        assert repr(resolved_by) in message
+        assert self._on_disk(queue, 'esc-2-1') == before
+        record = queue.get('esc-2-1')
+        assert record is not None and record.status == 'pending'
+        assert self._archived(queue) == []
+        assert outcome['applied'] is False
+
+    def test_a_reaper_sweep_level_2_close_is_not_refused(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        self._submit(queue, 'esc-2-1', level=2)
+
+        closed = queue.resolve(
+            'esc-2-1', 'swept', dismiss=True, resolved_by='harness-escalation-revalidation-sweep',
+        )
+
+        assert closed is not None and closed.status == 'dismissed'
+        assert closed.resolution_class is not None
+
+    @pytest.mark.parametrize('level', [0, 1])
+    def test_an_unclassified_level_0_or_1_close_still_closes(self, tmp_path: Path, level: int):
+        queue = EscalationQueue(tmp_path / 'esc')
+        self._submit(queue, 'esc-2-1', level=level)
+
+        closed = queue.resolve('esc-2-1', 'done', resolved_by='escalation-watcher')
+
+        assert closed is not None and closed.status == 'resolved'
+        assert closed.resolution_class is None
+
+    def test_a_human_ruling_on_an_l2_is_stamped_on_the_head_and_each_member(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        self._submit(queue, 'esc-2-2', level=1)
+        self._submit(queue, 'esc-2-3', level=1)
+        self._submit(queue, 'esc-2-1', level=2, members=['esc-2-2', 'esc-2-3'])
+
+        queue.resolve(
+            'esc-2-1', 'Leo ruled', resolved_by='escalation-watcher',
+            resolution_class='actionable', ruled_by_human=True,
+        )
+
+        head = queue.get('esc-2-1')
+        assert head is not None
+        assert head.ruled_by_human is True
+        assert head.resolution_class is not None
+        for member_id in ('esc-2-2', 'esc-2-3'):
+            member = queue.get(member_id)
+            assert member is not None
+            assert member.status == 'resolved'
+            assert member.resolved_by == 'l2-cascade:esc-2-1'
+            assert member.resolution_class == head.resolution_class
+            assert member.ruled_by_human is True
+
+    def test_an_omitted_ruling_flag_stays_none_on_the_head_and_members(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        self._submit(queue, 'esc-2-2', level=1)
+        self._submit(queue, 'esc-2-1', level=2, members=['esc-2-2'])
+
+        queue.resolve('esc-2-1', 'closed', resolved_by='escalation-watcher', resolution_class='actionable')
+
+        for esc_id in ('esc-2-1', 'esc-2-2'):
+            record = queue.get(esc_id)
+            assert record is not None
+            assert record.ruled_by_human is None
+
+    def test_an_already_dismissed_level_2_resolved_again_unclassified_does_not_raise(
+        self, tmp_path: Path,
+    ):
+        queue = EscalationQueue(tmp_path / 'esc')
+        self._submit(queue, 'esc-2-1', level=2)
+        queue.resolve('esc-2-1', 'swept', dismiss=True, resolved_by='auto-dismissed')
+
+        again = queue.resolve('esc-2-1', 'a late human close', resolved_by='interactive')
+
+        assert again is not None and again.status == 'dismissed'
+
+    def test_submit_resolved_of_an_unclassified_level_2_is_refused_before_mutation(
+        self, tmp_path: Path,
+    ):
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = _make_escalation('esc-2-1', level=2)
+        before = esc.to_dict()
+
+        with pytest.raises(ResolutionClassRequired):
+            queue.submit_resolved(esc, 'closed at filing', resolved_by='interactive')
+
+        assert esc.to_dict() == before
+        assert queue.get('esc-2-1') is None
