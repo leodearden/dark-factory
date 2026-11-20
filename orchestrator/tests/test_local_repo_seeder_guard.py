@@ -30,11 +30,14 @@ pytestmark = [
 
 _NOT_YET_MIGRATED = frozenset({
     '_merge_deep_scene.py',
+    '_verify_merge_cli_fixtures.py',
     'test_agent_capability_wiring.py',
     'test_architect_all_committed_plan.py',
     'test_atomic_train_merge.py',
     'test_convert_to_blocked.py',
     'test_create_merge_worktree_retry.py',
+    'test_deterministic_provenance_wire_e2e.py',
+    'test_dry_run_unblock.py',
     'test_git_repo_isolation_guard.py',
     'test_harness_infra_resume_truthful.py',
     'test_harness_interactive_reaper.py',
@@ -96,12 +99,17 @@ _NOT_YET_MIGRATED = frozenset({
     'test_rebase_verify_cost.py',
     'test_reconcile_done_step_commits.py',
     'test_remove_merge_worktree_guarded.py',
+    'test_reopen_sticks_e2e.py',
+    'test_roles_ancestry_check.py',
+    'test_roles_staging_command.py',
+    'test_scheduler_park_owner_state.py',
     'test_session_hooks_install.py',
     'test_session_resume_integration_gate.py',
     'test_substrate_gate.py',
     'test_suffix_conflict_tracker.py',
     'test_task_runtime.py',
     'test_train_integration.py',
+    'test_verify_events_units.py',
     'test_verify_phase_rebase.py',
     'test_verify_plan_integration.py',
     'test_verify_scope_inversion_boundary.py',
@@ -204,6 +212,51 @@ def test_the_legacy_seeder_is_flagged() -> None:
     )
 
     assert _local_repo_seeders(tree) == ['_setup_repo']
+
+
+def test_a_seeder_that_commits_through_a_dash_upper_c_path_is_flagged() -> None:
+    tree = ast.parse(
+        'def _init_git_repo(path):\n'
+        '    p = str(path)\n'
+        "    subprocess.run(['git', 'init', '-b', 'main', p])\n"
+        "    subprocess.run(['git', '-C', p, 'commit', '-m', 'initial commit'])\n"
+    )
+
+    assert _local_repo_seeders(tree) == ['_init_git_repo']
+
+
+def test_a_seeder_that_commits_through_dash_c_config_options_is_flagged() -> None:
+    tree = ast.parse(
+        'def _commit_main(root):\n'
+        "    subprocess.run(['git', 'init', '-q', '-b', 'main'], cwd=root)\n"
+        '    subprocess.run(\n'
+        "        ['git', '-c', 'user.name=t', '-c', 'user.email=t@example.com',\n"
+        "         'commit', '-q', '--allow-empty', '-m', 'main'],\n"
+        '        cwd=root,\n'
+        '    )\n'
+    )
+
+    assert _local_repo_seeders(tree) == ['_commit_main']
+
+
+def test_a_seeder_that_commits_through_git_dir_and_work_tree_is_flagged() -> None:
+    tree = ast.parse(
+        'def _seed(repo, git_dir):\n'
+        "    subprocess.run(['git', 'init', str(repo)])\n"
+        "    subprocess.run(['git', '--git-dir', git_dir, '--work-tree=/w', 'commit', '-m', 'x'])\n"
+    )
+
+    assert _local_repo_seeders(tree) == ['_seed']
+
+
+def test_a_global_bare_init_is_not_flagged() -> None:
+    tree = ast.parse(
+        'def _make_origin(origin, p):\n'
+        "    subprocess.run(['git', '--bare', 'init'], cwd=origin)\n"
+        "    subprocess.run(['git', '-C', p, 'commit', '--allow-empty', '-m', 'x'])\n"
+    )
+
+    assert _local_repo_seeders(tree) == []
 
 
 def test_a_bare_origin_helper_is_not_flagged() -> None:
