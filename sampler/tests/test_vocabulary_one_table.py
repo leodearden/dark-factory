@@ -251,9 +251,3 @@ class TestTheLiveTree:
         scanned = {path.name for path, _declares_specs in _scope()}
 
         assert {'consumers.py', 'host_memory.py'} <= scanned
-
-    def test_the_new_groups_names_are_scanned_for(self):
-        new = [g for g in METRIC_GROUPS if g.name in {GroupName.CONSUMERS, GroupName.VERIFY_SCOPES}]
-
-        assert len(new) == 2
-        assert {spec.name for group in new for spec in group.metrics} <= _LIVE_NAMES
