@@ -11,7 +11,7 @@ from datetime import datetime
 from pathlib import Path
 
 import pytest
-from escalation.models import Escalation
+from escalation.models import RESOLUTION_CLASSES, Escalation
 from orchestrator.decision_registry import DecisionRecord, normalize_escalations_dir
 from orchestrator.session_records import SessionRecord, Status
 from shared.project_id import fold_project_token
@@ -313,6 +313,8 @@ class TestRecommendOnly:
         assert resolve['tool'] == 'resolve_issue'
         assert resolve['args']['escalation_id'] == 'esc-400-1'
         assert 'Leo 2026-09-20: esc-400-1 option A' in resolve['args']['resolution']
+        assert resolve['args']['ruled_by_human'] is True
+        assert resolve['args']['resolution_class'] in RESOLUTION_CLASSES
         assert close['tool'] == 'cli:session_registry'
         argv = close['args'][-1]
         assert argv[argv.index('close-decision') + 1:argv.index('close-decision') + 5] == [
