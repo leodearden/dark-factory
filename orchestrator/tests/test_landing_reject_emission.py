@@ -1,8 +1,8 @@
 """Tests for orchestrator.landing_reject_emission (task 4496).
 
-The two ``validate_landing_evidence`` call sites that file no escalation — the
-already-landed gate's ancestry arm and the reconcile sweep's MARK_DONE arm —
-record each reject as a ``landing_evidence_rejected`` runs.db row, gated on a
+The landing-detection call sites that file no escalation — the already-landed
+gate's two live-tip arms and the reconcile sweep's MARK_DONE arm — record each
+reject as a ``landing_evidence_rejected`` runs.db row, gated on a
 new-or-changed signature per (site, task_id).  Exercised through the public
 surface only, against a real EventStore so the payload's JSON-serialisability
 is proven end to end.
@@ -144,6 +144,25 @@ class TestLandingRejectRecorder:
 
         assert len(landing_reject_rows(store)) == 2
 
+    def test_a_moved_branch_tip_writes_a_second_row_with_no_citation_or_effect_sha(
+        self, store: EventStore,
+    ) -> None:
+        """``branch_work_landed`` seeds neither ``citation`` on a reject nor
+        ``effect_check_sha`` at all, so the tip alone must carry the move.
+        """
+        recorder = LandingRejectRecorder()
+        site = LandingRejectSite.already_landed_gate_off_main_tip
+        patch_id_reject = {'citation': None, 'effect_check_sha': None}
+        _observe(recorder, _reject(LandingReason.not_landed, **patch_id_reject), store, site=site)
+
+        assert _observe(
+            recorder,
+            _reject(LandingReason.not_landed, branch_tip_sha='e' * 40, **patch_id_reject),
+            store, site=site,
+        ) is True
+
+        assert len(landing_reject_rows(store)) == 2
+
     def test_another_site_or_task_is_an_independent_key(
         self, store: EventStore,
     ) -> None:
@@ -183,7 +202,7 @@ class TestLandingRejectRecorder:
         recorder.release('42')
 
         assert [_observe(recorder, _reject(), store, site=site) for site in LandingRejectSite] == [
-            True, True,
+            True, True, True,
         ]
         assert _observe(recorder, _reject(), store, task_id='43') is False
 

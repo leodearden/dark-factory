@@ -5,9 +5,9 @@ See plans/confusion-reduction-prd.md §7.3 (coding record contract), §8.1
 (consumer-side boundary test), §8.6 (coder failure storm). Task delta of
 the confusion-reduction PRD decomposition.
 
-Import the target module as `import coder as mod`, resolved via
-scripts/tests/conftest.py's sys.path insertion (both scripts/ and
-scripts/legibility/ are on sys.path; no package __init__ needed) — mirrors
+Import the target module as `from legibility import coder as mod`, the one
+spelling every legibility module is reached by (scripts/ is on sys.path via
+scripts/tests/conftest.py; no package __init__ needed) — mirrors
 test_legibility_digest.py's import style.
 
 No real `claude` is ever reached from this file: every code_digest/code_digests
@@ -25,12 +25,12 @@ import sys
 from enum import StrEnum
 from pathlib import Path
 
-import codebook as codebook_mod
-import coder as mod
-import digest as digest_mod
 import legibility_sighting_fit_fixtures as reify_fit
 import pytest
 from cli_subprocess_timeout import cli_timeout_from_env
+from legibility import codebook as codebook_mod
+from legibility import coder as mod
+from legibility import digest as digest_mod
 from legibility import invariants, session_runner, sighting_fit
 from quality_doc_texts import code_quality, definition_body, heuristic_headlines
 

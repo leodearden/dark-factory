@@ -1,4 +1,6 @@
-"""Pins on the Live-Workflow reading rules as DELIVERED to the recon stage LLMs.
+"""Pins on the Live-Workflow reading rules as DELIVERED to the recon stage LLMs,
+and on every stage prompt's citation of the Active Task Tree header those rules
+are scoped to.
 
 The rules are rendered by the module that owns the section's vocabulary
 (``reconciliation/live_workflow_section.py::render_live_workflow_authority_rules``),
@@ -129,3 +131,11 @@ class TestStageAbsenceRulesAreScopedToTheTree:
             f'`{ACTIVE_TASK_TREE_HEADER}` lists; either one left unqualified lets the '
             "model read 'never probed' as 'not live'"
         )
+
+
+@pytest.mark.parametrize(
+    'prompt', [STAGE1_SYSTEM_PROMPT, STAGE2_SYSTEM_PROMPT], ids=['stage1', 'stage2'],
+)
+class TestPromptNamesTheTreeHeaderThePayloadRenders:
+    def test_names_the_tree_at_no_heading_level_but_the_rendered_one(self, prompt: str) -> None:
+        assert f'## {ACTIVE_TASK_TREE_TITLE}' not in prompt.replace(ACTIVE_TASK_TREE_HEADER, '')

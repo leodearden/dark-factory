@@ -879,9 +879,7 @@ async def _apply_memory_metadata_validation(
     dropped by task GC; it yields the loop, which is the property that
     matters.
     """
-    violations = validate_memory_metadata(
-        meta, enforce_kind_registry=config.enforce_kind_registry
-    )
+    violations = validate_memory_metadata(meta)
 
     # parent_id LIVENESS (leaf δ). Gated on the SHAPE check having passed —
     # `validate_memory_metadata` emits `invalid_parent_id_shape` under the
@@ -985,9 +983,7 @@ async def _apply_memory_metadata_validation(
         before = dict(baseline)
         already = {
             (v.key, v.code)
-            for v in validate_memory_metadata(
-                before, enforce_kind_registry=config.enforce_kind_registry
-            )
+            for v in validate_memory_metadata(before)
         }
         violations = [
             v for v in violations

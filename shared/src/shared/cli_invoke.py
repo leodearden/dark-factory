@@ -19,11 +19,18 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import IO, TYPE_CHECKING, Any, Protocol, TypeGuard, TypeVar
 
+from shared.claude_endpoint import ClaudeEndpoint
 from shared.claude_executable import ClaudeLaunchSurface, claude_executable, override_var
 from shared.cost_store import CapReason
 from shared.proc_group import snapshot_process_group, terminate_process_group
 from shared.process_cost import ProcessCostBasis, derive_process_cost, next_resume_prior
-from shared.secret_env import agent_subprocess_env
+from shared.secret_env import (
+    AGENT_CREDENTIAL_VAR,
+    AGENT_ENDPOINT_VARS,
+    ENDPOINT_BASE_URL_VAR,
+    agent_subprocess_env,
+    is_secret_env_name,
+)
 from shared.spawn_temp_files import MCP_CONFIG_TEMP_NAME, SYSPROMPT_TEMP_NAME
 
 # VllmBridge depends on aiohttp, which is not installed in every consumer
@@ -35,6 +42,7 @@ except ImportError:  # pragma: no cover - exercised only when aiohttp absent
     _VllmBridgeRuntime = None
 
 if TYPE_CHECKING:
+    from shared.account_reserve import WorkClassSource
     from shared.config_dir import TaskConfigDir
     from shared.cost_store import CostStore
     from shared.usage_gate import PoolFrozen, UsageGate
@@ -247,7 +255,9 @@ class AllAccountsCappedException(Exception):
     - ``pool_frozen``: the gate's ``PoolFrozen`` when the deadline was spent
       parked, else ``None``.  It says which accounts were capped and which
       AUTH_FAILED, and the message is built from it, because a pool frozen on
-      rejected credentials is not a cap and will not clear at a reset.
+      rejected credentials is not a cap and will not clear at a reset; nor is
+      a caller refused the allowance reserve (``pool_frozen.reserved_account``
+      set), whose message names the reserve and its release time instead.
     """
 
     def __init__(
@@ -263,10 +273,13 @@ class AllAccountsCappedException(Exception):
         self.label = label
         self.pool_frozen = pool_frozen
         spent = f'after {retries} retries ({elapsed_secs:.1f}s elapsed)'
-        super().__init__(
-            f'{label}: all accounts capped {spent}' if pool_frozen is None
-            else f'{label}: cap-wait deadline spent parked {spent} — {pool_frozen}'
-        )
+        if pool_frozen is None:
+            message = f'{label}: all accounts capped {spent}'
+        elif pool_frozen.reserved_account is not None:
+            message = f'{label}: {pool_frozen} (patience spent waiting {spent})'
+        else:
+            message = f'{label}: cap-wait deadline spent parked {spent} — {pool_frozen}'
+        super().__init__(message)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2337,6 +2350,7 @@ async def invoke_with_cap_retry(
     invoke_fn: Callable[..., Awaitable[AgentResult]] | None = None,
     backend: str = 'claude',
     park_on_frozen_pool: bool = True,
+    work_class: WorkClassSource | None = None,
     **invoke_kwargs,
 ) -> AgentResult:
     """Invoke an agent, retrying on usage-cap hits with account failover.
@@ -2400,6 +2414,15 @@ async def invoke_with_cap_retry(
     to park and lets ``PoolFrozen`` propagate unconverted, for a caller that
     must defer rather than wait and must tell a cap from rejected
     credentials, which will not clear at a reset (task 6042).
+
+    *work_class* is the caller's class for the allowance reserve
+    (plans/allowance-reserve-by-account-prd.md §6.1): a ``WorkClass`` or a
+    function returning one, forwarded to ``usage_gate.invoke_slot`` only when
+    given, so a gate or double that knows nothing of it is called as before.
+    ``None`` is background work, recorded as unclassified. A wait on the
+    reserve happens inside the gate's park, so it counts nothing toward
+    *max_cap_retries*, and a spent park allowance names the reserve and its
+    release time rather than a cap.
 
     Only FAILED results are offered to the cap detector.
     ``UsageGate.detect_cap_hit`` classifies a synthetic ``success=False``
@@ -2694,22 +2717,28 @@ async def invoke_with_cap_retry(
                     None if cap_wait_deadline is None
                     else max(0.0, cap_wait_deadline - time.monotonic())
                 )
+                slot_kwargs = {} if work_class is None else {'work_class': work_class}
                 try:
                     slot = await slot_exit.enter_async_context(
                         usage_gate.invoke_slot(
                             scope=scope,
                             park=park_on_frozen_pool,
                             max_wait_secs=park_allowance,
+                            **slot_kwargs,
                         ),
                     )
                 except PoolFrozen as frozen:
                     if not park_on_frozen_pool:
                         raise
                     elapsed = time.monotonic() - retry_start
+                    why = (
+                        f'patience spent after {elapsed:.1f}s parked: {frozen}'
+                        if frozen.reserved_account is not None
+                        else f'cap-wait sanity bound ({cap_wait_sanity_secs}s) spent parked '
+                        f'after {elapsed:.1f}s: {frozen}'
+                    )
                     raise _cap_patience_spent(
-                        f'cap-wait sanity bound ({cap_wait_sanity_secs}s) spent parked '
-                        f'after {elapsed:.1f}s: {frozen}',
-                        consecutive_cap_hits, elapsed, pool_frozen=frozen,
+                        why, consecutive_cap_hits, elapsed, pool_frozen=frozen,
                     ) from frozen
                 # Consulted inside the acquired slot, after any cooldown or
                 # park, and before attribution and credentials: a declined
@@ -3643,6 +3672,17 @@ def apply_spawn_env(env: dict[str, str], spawn_env: dict[str, str] | None) -> No
     env.pop('CLAUDE_SPAWN_LAUNCHER_PID', None)
 
 
+def _require_endpoint_is_sole_route(oauth_token: str | None, env_overrides: dict[str, str] | None) -> None:
+    """Refuse a second route alongside an explicit endpoint: one child, one endpoint, one credential."""
+    if oauth_token:
+        raise ValueError('an endpoint carries its own credential; oauth_token cannot be combined with it')
+    clashing = sorted(
+        name for name in env_overrides or {} if name in AGENT_ENDPOINT_VARS or is_secret_env_name(name)
+    )
+    if clashing:
+        raise ValueError(f'an endpoint cannot be combined with env_overrides setting {", ".join(clashing)}')
+
+
 async def _invoke_claude(
     prompt: str,
     system_prompt: str,
@@ -3672,6 +3712,7 @@ async def _invoke_claude(
     setting_sources: list[str] | None = None,
     resume_prior_total_cost_usd: float | None = None,
     *,
+    endpoint: ClaudeEndpoint | None = None,
     runner: CliRunner,
 ) -> AgentResult:
     """Invoke Claude Code CLI."""
@@ -3679,6 +3720,8 @@ async def _invoke_claude(
     # files: a blank prompt can never produce a useful run, so failing here
     # leaves nothing to clean up and never spawns a subprocess.
     require_non_blank_prompt(prompt, context='_invoke_claude')
+    if endpoint is not None:
+        _require_endpoint_is_sole_route(oauth_token, env_overrides)
     cmd, temp_files = build_claude_argv(
         model=model,
         max_budget_usd=max_budget_usd,
@@ -3718,7 +3761,10 @@ async def _invoke_claude(
     apply_spawn_env(env, spawn_env)
     # Multi-account failover: inject per-invocation OAuth token
     if oauth_token:
-        env['CLAUDE_CODE_OAUTH_TOKEN'] = oauth_token
+        env[AGENT_CREDENTIAL_VAR] = oauth_token
+    if endpoint is not None:
+        env.pop(AGENT_CREDENTIAL_VAR, None)
+        env.update(endpoint.env())
     # Per-task config dir: credential file + session isolation
     if config_dir:
         env['CLAUDE_CONFIG_DIR'] = str(config_dir)
@@ -3733,16 +3779,16 @@ async def _invoke_claude(
     # any partially-initialised AppRunner resources.
     bridge: VllmBridge | None = None
     try:
-        if env_overrides and env_overrides.get('ANTHROPIC_BASE_URL'):
+        if env_overrides and env_overrides.get(ENDPOINT_BASE_URL_VAR):
             BridgeCls = VllmBridge
             if BridgeCls is None:
                 raise RuntimeError(
                     'ANTHROPIC_BASE_URL is set but aiohttp is not installed; '
                     'install dark-factory-shared with the vllm extras to use VllmBridge.'
                 )
-            bridge = BridgeCls(upstream_url=env_overrides['ANTHROPIC_BASE_URL'])
+            bridge = BridgeCls(upstream_url=env_overrides[ENDPOINT_BASE_URL_VAR])
             await bridge.start()
-            env['ANTHROPIC_BASE_URL'] = bridge.url
+            env[ENDPOINT_BASE_URL_VAR] = bridge.url
 
         # The runner applies the caller-supplied sandbox wrap (e.g. Landlock or
         # bwrap confinement) once, before spawning, after the temp files above
@@ -4794,6 +4840,7 @@ async def invoke_claude_agent(
     setting_sources: list[str] | None = None,
     resume_prior_total_cost_usd: float | None = None,
     *,
+    endpoint: ClaudeEndpoint | None = None,
     runner: CliRunner = run_cli_subprocess,
 ) -> AgentResult:
     """Invoke Claude Code CLI and return structured result.
@@ -4840,7 +4887,15 @@ async def invoke_claude_agent(
     with *resume_session_id* — when both are set, *resume_session_id* wins.
 
     *env_overrides*, when set, are merged into the subprocess environment.
-    Used to point Claude Code at a vLLM endpoint via ``ANTHROPIC_BASE_URL``.
+    Used to point Claude Code at a vLLM endpoint via ``ANTHROPIC_BASE_URL``,
+    which routes the child through a ``VllmBridge``.
+
+    *endpoint*, when set, sends the child straight to that Anthropic-protocol
+    endpoint (e.g. ``shared.cli_proxy.proxy_endpoint``), with no bridge and
+    with the endpoint's client key as its only credential: an inherited
+    ``CLAUDE_CODE_OAUTH_TOKEN`` is dropped.  It cannot be combined with
+    *oauth_token*, nor with endpoint or credential variables in
+    *env_overrides*.
 
     *spawn_env*, when set, carries ``CLAUDE_SPAWN_*`` spawn-identity vars
     (role/project/task/parent) for the SessionStart hook.  Merged into the
@@ -4901,5 +4956,6 @@ async def invoke_claude_agent(
         available_tools=available_tools,
         setting_sources=setting_sources,
         resume_prior_total_cost_usd=resume_prior_total_cost_usd,
+        endpoint=endpoint,
         runner=runner,
     )

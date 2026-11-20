@@ -482,10 +482,10 @@ def _fail_verify_result():
 class _StubRemoteAllocator:
     """Minimal HostAllocator stand-in handing out ONE remote lease at a time.
 
-    REMOTE deliberately: a remote lease makes ``_run_post_merge_verify`` build
+    REMOTE deliberately: a remote lease makes ``run_post_merge_verify`` build
     its pool from the injected runner instead of a real ``LocalRunner``, so
     ``VerifyRunnerPool.dispatch`` — the single ``merge_verify`` emission site —
-    genuinely runs and genuinely emits.  Replacing ``_run_post_merge_verify``
+    genuinely runs and genuinely emits.  Replacing ``run_post_merge_verify``
     wholesale (:func:`_spy_post_merge_verify`) emits no event at all, which
     would make every ``chain_items`` telemetry assertion vacuous.
     """
@@ -534,7 +534,7 @@ class _StubRemoteAllocator:
 
 
 def _spy_post_merge_verify(monkeypatch, outcome=None, *, raises=None) -> list[dict]:
-    """Replace ``_run_post_merge_verify`` with a recorder returning *outcome*.
+    """Replace ``run_post_merge_verify`` with a recorder returning *outcome*.
 
     Returns the recorded call list — each entry carries the positional
     ``merge_wt`` plus every keyword argument the worker passed (``merge_sha``,
@@ -552,7 +552,7 @@ def _spy_post_merge_verify(monkeypatch, outcome=None, *, raises=None) -> list[di
         return outcome
 
     monkeypatch.setattr(
-        'orchestrator.merge_lane.worker._run_post_merge_verify', _recording,
+        'orchestrator.merge_lane.verify_dispatch.run_post_merge_verify', _recording,
     )
     return calls
 
@@ -591,6 +591,9 @@ def _spy_chain_lane_release(monkeypatch) -> list[tuple]:
 
     monkeypatch.setattr(
         'orchestrator.merge_lane.worker.release_chain_build_lane', _recording,
+    )
+    monkeypatch.setattr(
+        'orchestrator.merge_lane.inflight_verify.release_chain_build_lane', _recording,
     )
     return calls
 

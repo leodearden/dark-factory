@@ -11,14 +11,10 @@ import pytest
 from orchestrator.config import StarvationWatchdogConfig
 from orchestrator.pin_reservation import Blocker, BlockerKind
 from orchestrator.starvation_watchdog import (
-    AUTO_PIN_CAP_SENTINEL,
     STARVATION_WATCHDOG_MARKER,
     CandidateFacts,
-    Finding,
-    LockRefusals,
     ParkBlock,
     StarvationGate,
-    cap_escalation,
     classify,
     escalation_text,
 )
@@ -75,27 +71,6 @@ def test_only_park_blocked_does_not_pin() -> None:
     assert {gate for gate in StarvationGate if not gate.pins} == {StarvationGate.PARK_BLOCKED}
 
 
-class TestLockRefusals:
-    def test_counts_scans_per_task(self) -> None:
-        refusals = LockRefusals()
-        refusals.note_scan(['a', 'b'])
-        refusals.note_scan(['a', 'b'])
-        refusals.note_scan(['a'])
-
-        assert refusals.count('a') == 3
-        assert refusals.count('b') == 2
-        assert refusals.count('never') == 0
-        assert refusals.task_ids() == frozenset({'a', 'b'})
-
-    def test_forget_drops_the_count(self) -> None:
-        refusals = LockRefusals()
-        refusals.note_scan(['a', 'b'])
-        refusals.forget('a')
-
-        assert refusals.count('a') == 0
-        assert refusals.task_ids() == frozenset({'b'})
-
-
 class TestEscalationText:
     @pytest.mark.parametrize(('facts', 'gate'), [
         (_facts(age=FLOOR, skips=50), StarvationGate.DUAL),
@@ -130,15 +105,3 @@ class TestEscalationText:
         assert 'escalation/src' in detail
 
 
-def test_cap_escalation_names_every_capped_task() -> None:
-    cohort = [
-        Finding(_facts(task_id='A', age=FLOOR, skips=50), StarvationGate.DUAL, (HOLDER,)),
-        Finding(_facts(task_id='B', age=FLOOR, refusals=50), StarvationGate.LOCK_REFUSED, ()),
-    ]
-
-    l1 = cap_escalation(cohort, CFG)
-
-    assert l1.sentinel == AUTO_PIN_CAP_SENTINEL
-    assert l1.summary.startswith(STARVATION_WATCHDOG_MARKER)
-    for text in ('A', 'B', 'dual', 'lock_refused', HOLDER.module, str(CFG.auto_pin_max_concurrent)):
-        assert text in l1.detail

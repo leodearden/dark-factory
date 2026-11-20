@@ -15,8 +15,8 @@ import json
 import os
 from pathlib import Path
 
-import account_pool as mod
 import pytest
+from legibility import account_pool as mod
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from shared import usage_gate as usage_gate_mod
