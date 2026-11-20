@@ -351,6 +351,15 @@ class TestReapStaleSessionPointers:
     def test_an_absent_pointer_dir_is_an_empty_pass(self, tmp_path: Path) -> None:
         assert session_reaper.reap_stale_session_pointers(root=tmp_path) == []
 
+    @REQUIRES_PROC
+    def test_a_live_shared_hosts_pointer_is_removed(self, tmp_path: Path, shared_host_pid: int) -> None:
+        session_records.write_record(_record(self._SLUG, owner_pid=shared_host_pid), root=tmp_path)
+        pointer = _write_pointer_raw(shared_host_pid, self._SLUG, tmp_path)
+
+        assert session_reaper.reap_stale_session_pointers(root=tmp_path) == [pointer]
+        assert not pointer.exists()
+        assert session_records.record_path_for_slug(self._SLUG, root=tmp_path).is_file()
+
     @pytest.mark.parametrize('variant', list(IdentityVariant))
     def test_a_live_pids_pointer_is_judged_by_its_records_owner_identity(
         self, tmp_path: Path, variant: IdentityVariant
