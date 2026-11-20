@@ -12,6 +12,8 @@ import asyncio
 import json
 
 import pytest
+from legibility import census, census_verify, synthesis
+from orchestrator.agents import code_quality
 from orchestrator.agents.briefing import BriefingAssembler
 from orchestrator.agents.watcher_rearm_outcome_guidance import WATCHER_REARM_OUTCOME_GUIDANCE
 from orchestrator.config import GitConfig, OrchestratorConfig
@@ -406,6 +408,48 @@ def prior_round_adjudicator_prompt(
     return build_resettled_adjudicator_prompt(current, prior)
 
 
+def census_verifier_prompt(*evidence: str) -> str:
+    """The real text ``scripts/legibility/census_verify.py::verify_prompt``
+    sends the periodic-census verifier, built by calling that builder so a
+    rewording of its opening sentence turns the lockstep tests red. *evidence*
+    is the cluster's quoted evidence, lines from OTHER sessions that may carry
+    signal literals or foreign agent-class markers."""
+    return census_verify.verify_prompt(
+        {'title': 'Merge gate refuses rebased branches', 'evidence': list(evidence)},
+        project_root='/home/leo/src/dark-factory',
+        quality_block=code_quality.guidance(),
+    )
+
+
+def census_synthesis_prompt(title: str = 'Merge gate refuses rebased branches') -> str:
+    """The real text ``scripts/legibility/census.py::synthesis_prompt`` sends
+    the periodic-census synthesis writer, built by calling that builder so a
+    rewording of its opening sentence turns the lockstep tests red. *title* is
+    the one new finding's title, free text that may carry signal literals or
+    foreign agent-class markers."""
+    brief = synthesis.Brief(
+        run_id='census-dark_factory-20261003',
+        new=(synthesis.NewFinding(
+            key='fk-0123456789ab',
+            entry_id='entry-cand-20261003-1',
+            title=title,
+            cause=None,
+            area='orchestrator',
+            anchor='orchestrator/x.py::f',
+            tags=('h2',),
+            origin_phase='implement',
+            manifested_phase='verify',
+            sessions=('s-1',),
+            verdict=None,
+        ),),
+        re_observed=(),
+        unkeyed_re_observed=0,
+        invariant_counts=(),
+        counts=(),
+    )
+    return census.synthesis_prompt(brief, quality_block=code_quality.guidance())
+
+
 def pre_5356_replan_prompt(
     issue: str = 'The lease is released before the verify finishes.',
 ) -> str:
@@ -469,8 +513,27 @@ HUMAN_TURNS_NAMING_AN_INJECTED_PROMPT = (
         'why is the autonomous escalation watcher re-arming twice per rotation?',
         id='watcher',
     ),
+    pytest.param(
+        'why does the periodic-census verifier keep hunting for transcripts with find?',
+        id='census_verifier',
+    ),
+    pytest.param(
+        'the census synthesis writer dropped my correction again',
+        id='census_synthesis',
+    ),
+    pytest.param(
+        'why does "You are the periodic-census verifier for the dark-factory '
+        'agent-confusion …" run find over the whole disk?',
+        id='census_verifier_opener_quote',
+    ),
+    pytest.param(
+        'the PRD quotes "You are the periodic-census synthesis writer for the '
+        'dark-factory agent-confusion …" — why does it drop my corrections?',
+        id='census_synthesis_opener_quote',
+    ),
 )
-"""Human turns that name the adjudicator, replan and watcher prompts without
-carrying their opening sentences, so they stay dialogue. Each is a
-``pytest.param`` carrying its own id, ready to parametrize a single ``text``
-argument."""
+"""Human turns that name or quote the harness prose prompts without carrying
+a whole marker, so they stay dialogue. The opener quotes stop one word short
+of their marker, as ``CENSUS_QUOTE_OF_THE_ESCALATION_PAYLOAD`` does, so a
+shortened marker turns them red. Each is a ``pytest.param`` carrying its own
+id, ready to parametrize a single ``text`` argument."""

@@ -24,6 +24,8 @@ from legibility_carrier_fixtures import (
     UNMARKED_HEADLESS_SDK_PROMPTS,
     WATCHER_ROTATION_PROMPT,
     briefing_text,
+    census_synthesis_prompt,
+    census_verifier_prompt,
     coder_judgment,
     json_fenced,
     merger_prompt,
@@ -251,6 +253,14 @@ class TestHarnessInjectedTurnFilter:
         # LOCKSTEP via the REAL builder. Like the steward's, the sighted
         # records carry no origin and no isMeta, so only this text rule sees them.
         assert reingestion.is_harness_injected_turn(prior_round_adjudicator_prompt()) is True
+
+    def test_census_verifier_prompt_is_excluded_lockstep(self):
+        # LOCKSTEP via the REAL builder: the cluster JSON it embeds quotes
+        # other sessions' signal, which must never count as this session's.
+        assert reingestion.is_harness_injected_turn(census_verifier_prompt()) is True
+
+    def test_census_synthesis_prompt_is_excluded_lockstep(self):
+        assert reingestion.is_harness_injected_turn(census_synthesis_prompt()) is True
 
     def test_pre_5356_replan_prompt_is_excluded(self):
         # A RETIRED shape held for the archived corpus, so it is restated, not built.

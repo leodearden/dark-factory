@@ -19,6 +19,8 @@ from pathlib import Path
 from typing import Any
 
 from legibility.reingestion import (
+    CENSUS_SYNTHESIS_PROMPT_OPENER,
+    CENSUS_VERIFIER_PROMPT_OPENER,
     TRICKLE_CODER_PROMPT_OPENER,
     has_non_dialogue_provenance,
     is_reingested_content,
@@ -561,7 +563,11 @@ AGENT_CLASS_MARKERS: tuple[AgentMarker, ...] = (
 
 _MARKER_LITERALS = frozenset(literal for marker in AGENT_CLASS_MARKERS for literal in marker.literals)
 
-INSTRUMENT_PROMPT_OPENERS: tuple[str, ...] = (TRICKLE_CODER_PROMPT_OPENER,)
+INSTRUMENT_PROMPT_OPENERS: tuple[str, ...] = (
+    TRICKLE_CODER_PROMPT_OPENER,
+    CENSUS_VERIFIER_PROMPT_OPENER,
+    CENSUS_SYNTHESIS_PROMPT_OPENER,
+)
 """Lowercase openings of the prompts the legibility pipeline sends its own
 model calls. A session whose first primary user turn opens with one is
 LEGIBILITY_INSTRUMENT; the same text anywhere else is foreign material."""

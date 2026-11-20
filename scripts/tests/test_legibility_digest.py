@@ -43,6 +43,8 @@ from legibility_carrier_fixtures import (
     UNMARKED_HEADLESS_SDK_PROMPT_TEXTS,
     WATCHER_ROTATION_PROMPT,
     briefing_text,
+    census_synthesis_prompt,
+    census_verifier_prompt,
     coder_judgment,
     json_fenced,
     merger_prompt,
@@ -1088,6 +1090,20 @@ class TestTrickleCoderSessionDigest:
 
         assert yaml.safe_load(frontmatter_yaml)['instrument_version'] >= 8
 
+    def test_frontmatter_instrument_version_is_at_or_past_the_census_prompt_generation(self):
+        """A version floor only. Generation 9 is the first whose gold section
+        and dialogue carriers exclude the periodic-census verifier and
+        synthesis prompts. The exclusion itself is pinned by the census params
+        of
+        TestHarnessInjectedTurnFilter.test_render_digest_injected_prose_prompt_session_has_no_gold_section."""
+        digest = mod.render_digest(
+            [_with_session_meta(_user_text('please fix the bug'))], agent_class='interactive',
+        )
+
+        frontmatter_yaml, _ = _split_frontmatter(digest)
+
+        assert yaml.safe_load(frontmatter_yaml)['instrument_version'] >= 9
+
 
 # ---------------------------------------------------------------------------
 # find_retry_loops — same tool name + canonical (sort_keys) input signature
@@ -2066,9 +2082,15 @@ INJECTED_PROSE_PROMPTS = (
     ),
     pytest.param(pre_5356_replan_prompt(_BLOCKED_LITERAL), id='pre_5356_replan'),
     pytest.param(WATCHER_ROTATION_PROMPT, id='watcher_rotation'),
+    pytest.param(
+        census_verifier_prompt(_BLOCKED_LITERAL, 'cat: x: No such file or directory'),
+        id='census_verifier',
+    ),
+    pytest.param(census_synthesis_prompt(_BLOCKED_LITERAL), id='census_synthesis'),
 )
-"""The generation-7 harness prose prompts. Two carry a df_guard literal in
-their review free text, which must not count as this session's signal."""
+"""Harness prose prompts that open a session. All but the watcher rotation
+embed free text quoting signal literals, review text or another session's
+cluster, which must not count as this session's signal."""
 
 
 class TestHarnessInjectedTurnFilter:
