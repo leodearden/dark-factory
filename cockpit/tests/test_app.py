@@ -1841,48 +1841,65 @@ class TestDecisionProjectIsCanonicalAtEveryReadSite:
 
     @pytest.mark.timeout(10)
     async def test_project_stays_canonical_across_the_boost_and_drop_re_reads(self, tmp_path):
+        from textual.widgets.data_table import RowDoesNotExist
+
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
 
-        decision = dr.DecisionRecord(
-            id='dec-1',
-            project='df',
-            text='Which port?',
-            filed_at='2026-07-07T00:00:00+00:00',
-        )
-        assert dr.write_decision(decision, root=tmp_path)
+        # dec-2 is never acted on: a dropped decision leaves the queue, so
+        # after the drop its row is the one left to show what the post-drop
+        # re-read folded.
+        for decision_id, text in (('dec-1', 'Which port?'), ('dec-2', 'Which host?')):
+            decision = dr.DecisionRecord(
+                id=decision_id,
+                project='df',
+                text=text,
+                filed_at='2026-07-07T00:00:00+00:00',
+            )
+            assert dr.write_decision(decision, root=tmp_path)
         # Baseline: the raw spelling is what is actually on disk, so each
         # re-read below really does read 'df' back and really does have to
         # fold it. (These are the legacy rows migrate_decision_project_tokens
         # has not been run over.)
-        assert [d.project for d in dr.list_decisions(root=tmp_path)] == ['df']
+        assert [d.project for d in dr.list_decisions(root=tmp_path)] == ['df', 'df']
 
-        app = CockpitApp(fleet_root=tmp_path, backend=FakeBackend(), poll_interval=0.05)
+        def persisted(decision_id: str) -> dr.DecisionRecord:
+            (record,) = [d for d in dr.list_decisions(root=tmp_path) if d.id == decision_id]
+            return record
+
+        def rendered_project(queue: DecisionQueue, decision_id: str) -> str:
+            return queue.get_row(f'decision:{decision_id}')[2]
+
+        # poll_interval=60: a live poll tick reads through the same folding
+        # reader, so it could repaint the queue between a keypress and its
+        # assertion and hide a re-read that failed to fold.
+        app = CockpitApp(fleet_root=tmp_path, backend=FakeBackend(), poll_interval=60)
         async with app.run_test() as pilot:
             await pilot.pause()
+            queue = app.query_one(DecisionQueue)
 
             # (1) the initial scan (_scan_registry).
-            assert [d.project for d in app._decisions] == ['dark_factory']
+            assert rendered_project(queue, 'dec-1') == 'dark_factory'
 
-            queue = app.query_one(DecisionQueue)
             queue.move_cursor(row=queue.get_row_index('decision:dec-1'))
             await pilot.pause()
 
             # (2) the post-boost re-read (action_boost -> _apply_boost).
             await pilot.press('b')
             await pilot.pause()
-            persisted = dr.list_decisions(root=tmp_path)
-            assert persisted[0].manual_boost != 0  # the write really happened
-            assert persisted[0].project == 'df'  # ...and left the disk raw
-            assert [d.project for d in app._decisions] == ['dark_factory']
+            assert persisted('dec-1').manual_boost != 0  # the write really happened
+            assert persisted('dec-1').project == 'df'  # ...and left the disk raw
+            assert rendered_project(queue, 'dec-1') == 'dark_factory'
 
-            # (3) the post-drop re-read (action_drop).
+            # (3) the post-drop re-read (action_drop); the cursor is still on
+            # dec-1, which the rebuild kept by key.
             await pilot.press('x')
             await pilot.pause()
-            persisted = dr.list_decisions(root=tmp_path)
-            assert persisted[0].state == dr.DecisionState.DROPPED  # the write happened
-            assert persisted[0].project == 'df'  # ...and left the disk raw
-            assert [d.project for d in app._decisions] == ['dark_factory']
+            assert persisted('dec-1').state == dr.DecisionState.DROPPED  # the write happened
+            assert persisted('dec-1').project == 'df'  # ...and left the disk raw
+            with pytest.raises(RowDoesNotExist):
+                queue.get_row('decision:dec-1')
+            assert rendered_project(queue, 'dec-2') == 'dark_factory'
 
 
 class TestInjectedDecisionsReaderIsEveryDecisionRead:
