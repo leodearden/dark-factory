@@ -26,7 +26,6 @@ from orchestrator.config import (
     OrchestratorConfig,
     PriceEntry,
     RoutingConfig,
-    SandboxConfig,
 )
 from orchestrator.git_ops import GitOps
 from orchestrator.implementer_brief_variant import execute_iteration_cap
@@ -302,7 +301,6 @@ def build_eval_orch_config(
         'test_command': task.get('verify_commands', {}).get('test', base.test_command),
         'lint_command': task.get('verify_commands', {}).get('lint', base.lint_command),
         'type_check_command': task.get('verify_commands', {}).get('typecheck', base.type_check_command),
-        'sandbox': SandboxConfig(enabled=False),
         'env_overrides': config.env_overrides,
         'implementer_brief_variant': config.harness_variant,
         'routing': _admit_claude_role_models(profiled.routing, models, backends),
