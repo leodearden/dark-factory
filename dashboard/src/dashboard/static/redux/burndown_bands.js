@@ -39,10 +39,8 @@ const {
 
 // ── The nine stacked bands of the status-mix chart ──
 // One band per census member, keyed and sourced by the member's series key.
-// The in-progress live/stranded split is NOT stacked: it partitions
-// in_progress_rows, the rows' count, which is a different instant from the
-// census members, so stacking it among them would draw a total no census ever
-// produced. It stays on the wire for the parity alarm.
+// The rows' live/stranded split never reaches the client: the server reads it
+// for the parity verdict, which parityBannerState only renders.
 //
 // Stacked bottom-up terminal → backlog → in_flight, members in TaskStatus
 // declaration order inside each view. The three members task 5591 added
