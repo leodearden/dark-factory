@@ -121,12 +121,15 @@ timeout <WAIT_SECS> bash -c 'while git merge-base --is-ancestor task/<TASK_ID> m
 - **Long waits, interactive sessions only** (deep in the queue, or verifying with no `eta_seconds`). Don't spend a turn per minute: run the same loop with a larger bound as ONE `run_in_background` Bash command, its Bash `timeout` at least 60 s above the bound — `skills/escalation-watcher/SKILL.md`'s "Bash-tool timeout contract", which also governs the ceiling. Every wake — the loop exiting, its bound elapsing, or a "was stopped" notification — is the designed re-arm point, not a failure: poll `merge_status` once, and re-arm only while the state is live. Expect to re-arm: reify task/7182's merge took about 2h40m and three watch rounds. A headless or unattended session keeps to the foreground form above — ending the turn there exits the session with the wait still pending.
 - **Monitor** is a per-event stream, not a better tool for this one-outcome wait; the loaded Monitor schema's own description says the same. If you use it anyway: load its schema with `ToolSearch("select:Monitor")` before the first call (it is deferred, and a call with guessed parameters is rejected); take its harness-capped `timeout_ms` limit from that schema, not from memory; and expect to re-arm at every expiry.
 
+<!-- merge-status-route:begin answer=LIVE_STATES
+     Pinned by escalation/tests/test_merge_status_boundary.py (rows B1-B8). -->
 <!-- merge-state-vocab:begin partition=LIVE_STATES
      Mirrors shared/src/shared/merge_state.py::LIVE_STATES. Pinned by
      scripts/tests/test_merge_state_vocabulary_consistency.py — extend the
      enum and this list goes red until it matches. -->
-**Live states** (`queued`, `verifying`, `gate`, `finalizing`) — keep polling.
+**Live states** (`queued`, `verifying`, `gate`, `finalizing`) — **WAIT**: keep polling.
 <!-- merge-state-vocab:end -->
+<!-- merge-status-route:end -->
 
 <!-- merge-state-vocab:begin partition=TERMINAL_STATES
      Mirrors shared/src/shared/merge_state.py::TERMINAL_STATES. Pinned by
@@ -239,11 +242,19 @@ Four rules make this fallback loop terminate correctly. **On the `coalesce-*` ar
 
 **Epistemic answers** — a state that describes the server's records rather than the merge, always carrying a `reason`. Switch on `reason` per [the shared reason switch](../_shared/merge-status-reasons.md#the-switch), including its [request_id re-poll rule](../_shared/merge-status-reasons.md#request-id-polls); never reconstruct the answer from ancestry exit codes. This skill's dispositions:
 
-- **`never_submitted`** on the `request_id`/`task_id` arms, confirmed by a task_id-keyed answer, with `get_merge_queue()` showing no entry for the branch → **resubmit (go back to step 3).** On the `branch` arm it is the live state (above).
-- **`prior_run_terminal`** → report `last_outcome` to the human and stop; resubmitting is their call.
+<!-- merge-status-route:begin answer=never_submitted -->
+- **`never_submitted`** on the `request_id`/`task_id` arms, confirmed by a task_id-keyed answer, with `get_merge_queue()` showing no entry for the branch → **RESUBMIT** (go back to step 3). On the `branch` arm it is the live state (above).
+<!-- merge-status-route:end -->
+<!-- merge-status-route:begin answer=prior_run_terminal -->
+- **`prior_run_terminal`** → **REPORT** `last_outcome` to the human and stop; resubmitting is their call.
+<!-- merge-status-route:end -->
 - **`landing_unattributable`** → verify per the shared switch; a verified sha → step 4's `done`, stamped `found_on_main` with `commit` **and** `note`.
-- **`coalesce_train_id`** → the [Escape](#follow-the-superseded-successor).
-- **Wait-state reasons** → keep polling, under the shared [wait bound](../_shared/merge-status-reasons.md#wait-bound).
+<!-- merge-status-route:begin answer=coalesce_train_id -->
+- **`coalesce_train_id`** → **FOLLOW THE MEMBERS**: the [Escape](#follow-the-superseded-successor).
+<!-- merge-status-route:end -->
+<!-- merge-status-route:begin answer=WAIT -->
+- **Wait-state reasons** → **WAIT**: keep polling, under the shared [wait bound](../_shared/merge-status-reasons.md#wait-bound).
+<!-- merge-status-route:end -->
 
 <a id="canonical-ancestry-check"></a>**The canonical ancestry check — three outcomes, not two.** Every "is it on main?" confirmation in this skill means this check: the unscoped arms' `done` gate, the `already_merged` condition, and the Escape's rules. **Never use the two-way idiom `git merge-base --is-ancestor ... && echo "on main" || echo "not on main"`**: a deleted branch ref exits **128**, which that idiom silently reports as "not on main" — inverting the truth for the normal post-merge state, since the merge lane deletes task branches on cleanup (`_delete_branch_if_on_main`, `orchestrator/src/orchestrator/git_ops.py`), and on the `branch` arm a *foreign* merger's cleanup deletes it out from under you.
 ```bash
@@ -274,7 +285,9 @@ git merge-base --is-ancestor task/<TASK_ID> main; rc=$?; echo "ancestry rc=$rc"
 
 The outcome arrives from either the submit call (terminal at submit time) or the poll loop. Handle each status:
 
-**`done`** — Merge succeeded. Main has been advanced atomically.
+<!-- merge-status-route:begin answer=done -->
+**`done`** — **ACCEPT**: the merge succeeded. Main has been advanced atomically.
+<!-- merge-status-route:end -->
 - Update the task: `set_task_status(id="<TASK_ID>", status="done", project_root="<PROJECT_ROOT>", done_provenance={"kind": "merged", "commit": "<merge-commit-sha>"})`
   - Use `{"kind": "merged", "commit": "<sha>"}` when this branch's merge commit landed on main (the normal case). The server backstops with `git merge-base --is-ancestor <sha> main`.
   - **Where the SHA comes from depends on which call produced the `done`, and not every source is
