@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from legibility import inventory, sampling
+from legibility import detectors, inventory, reingestion, sampling
 
 MAIN_CWD = '/home/leo/src/dark-factory'
 MAIN_ENC = '-home-leo-src-dark-factory'
@@ -99,6 +99,15 @@ def _write_parent_and_subagent(
         json.dumps({'agentType': 'general-purpose', 'description': 'x'})
     )
     return parent_path, subagent_path
+
+
+def _tool_error_record() -> dict[str, Any]:
+    return {
+        'type': 'user',
+        'message': {'role': 'user', 'content': [
+            {'type': 'tool_result', 'tool_use_id': 'toolu_1', 'is_error': True, 'content': 'boom'},
+        ]},
+    }
 
 
 def _subagent_key(parent_sid: str = PARENT_SID, agent_id: str = AGENT_ID) -> str:
@@ -232,3 +241,49 @@ class TestSubagentSessionKey:
         record = _record_for(records, subagent)
         assert record.identity is not None
         assert sampling.score_session(record).session_id == record.identity.key
+
+
+class TestSubagentAgentClassAndFirstTurn:
+    """A sub-agent's agent class and first turn come from its own encoded dir and prompt."""
+
+    def test_worktree_subagent_is_orchestrated_like_its_parent(self, tmp_path):
+        parent, subagent = _write_parent_and_subagent(
+            tmp_path / 'projects' / WORKTREE_ENC, cwd=WORKTREE_CWD
+        )
+        for path in (parent, subagent):
+            agent_class = detectors.classify_agent_class(path, inventory.iter_json_lines(path))
+            assert agent_class is detectors.AgentClass.ORCHESTRATED_TASK, path
+
+    def test_subagent_prompt_is_its_first_turn_for_the_classifier(self, tmp_path):
+        prompt = f'{reingestion.TRICKLE_CODER_PROMPT_OPENER}. Code the digest below.'
+        _, subagent = _write_parent_and_subagent(tmp_path / MAIN_ENC, prompt=prompt)
+        agent_class = detectors.classify_agent_class(subagent, inventory.iter_json_lines(subagent))
+        assert agent_class is detectors.AgentClass.LEGIBILITY_INSTRUMENT
+
+    def test_scan_reports_the_subagent_prompt_as_first_turn(self, tmp_path):
+        _, subagent = _write_parent_and_subagent(tmp_path / MAIN_ENC)
+        assert sampling.scan_transcript(subagent).first_turn_text == DEFAULT_PROMPT
+
+    def test_same_shape_subagents_with_different_prompts_both_survive_dedupe(self, tmp_path):
+        projects_root = tmp_path / 'projects'
+        _, first = _write_parent_and_subagent(
+            projects_root / MAIN_ENC, agent_id='a1',
+            prompt='Find every caller of resolve_route and report their files.',
+            subagent_records=[_tool_error_record()],
+        )
+        _, second = _write_parent_and_subagent(
+            projects_root / MAIN_ENC, agent_id='a2',
+            prompt='Summarise why the merge queue halted overnight.',
+            subagent_records=[_tool_error_record()],
+        )
+        records = inventory.enumerate_sessions(projects_root, [MAIN_CWD], TARGET_DATE)
+        scored = [sampling.score_session(_record_for(records, path)) for path in (first, second)]
+        survivors = sampling.dedupe_shapes(scored)
+        assert {record.path for record in survivors} == {first, second}
+
+    def test_sidechain_is_primary_only_in_a_subagent_transcript(self):
+        sidechain = {'type': 'user', 'isSidechain': True}
+        main_chain = {'type': 'user', 'isSidechain': False}
+        assert detectors.is_primary_user_turn(sidechain) is False
+        assert detectors.is_primary_user_turn(sidechain, subagent_transcript=True) is True
+        assert detectors.is_primary_user_turn(main_chain, subagent_transcript=True) is False
