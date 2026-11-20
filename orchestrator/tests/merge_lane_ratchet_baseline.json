@@ -87,7 +87,7 @@
     "complete": true
   },
   "files": {
-    "orchestrator/src/orchestrator/git_ops.py": {"cognitive": 1542, "function_local_imports": 4, "lines": 17021, "prose_lines": 9652, "reexport_names": 1},
+    "orchestrator/src/orchestrator/git_ops.py": {"cognitive": 1543, "function_local_imports": 4, "lines": 17029, "prose_lines": 9651, "reexport_names": 1},
     "orchestrator/src/orchestrator/lane_lifecycle.py": {"cognitive": 58, "function_local_imports": 1, "lines": 868, "prose_lines": 359, "reexport_names": 0},
     "orchestrator/src/orchestrator/merge_lane/__init__.py": {"cognitive": 1, "function_local_imports": 0, "lines": 228, "prose_lines": 22, "reexport_names": 0},
     "orchestrator/src/orchestrator/merge_lane/chain_policy.py": {"cognitive": 24, "function_local_imports": 0, "lines": 125, "prose_lines": 18, "reexport_names": 0},
@@ -342,7 +342,7 @@
     "orchestrator/src/orchestrator/git_ops.py::GitOps::reap_merge_verify_survivors": 8,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::rebase_onto_main": 3,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::rebase_preserving_task_commits": 24,
-    "orchestrator/src/orchestrator/git_ops.py::GitOps::rebind_branch_to_head": 1,
+    "orchestrator/src/orchestrator/git_ops.py::GitOps::rebind_branch_to_head": 2,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::reclaim_worktree_build_artifacts": 9,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::recover_red_main": 31,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::refresh_warm_base": 11,

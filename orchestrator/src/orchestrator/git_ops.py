@@ -96,6 +96,7 @@ from orchestrator.branch_stack import (
     rebase_own_delta,
 )
 from orchestrator.config import TASK_META_DIRNAME, GitConfig, TranscriptArchiveConfig
+from orchestrator.lane_attach import HeadRelation, branch_tip, describe_head, head_relation
 from orchestrator.lane_branch_holder import (
     BranchCheckedOutElsewhere,
     BranchHolderAction,
@@ -8673,30 +8674,37 @@ class GitOps:
         return await self.rebase_preserving_task_commits(worktree)
 
     async def rebind_branch_to_head(self, worktree: Path, full_branch: str) -> bool:
-        """Rebind *full_branch* to the current HEAD of *worktree* and attach the lane.
+        """Rebind *full_branch* to *worktree*'s HEAD, only forward or in place.
 
-        Runs ``git checkout -B <full_branch>`` (no explicit start point, so the
-        implicit start point is HEAD).  This both:
-        * resets ``refs/heads/<full_branch>`` to the worktree's current HEAD, and
-        * attaches the worktree onto the branch (no longer detached).
-
-        This mirrors the ``checkout -B`` idiom used by :meth:`_reset_warm_lane`
-        (without ``-f``, since _reuse_warm_lane's tree is already
-        committed/clean after :meth:`commit`).
+        Acts only when HEAD is already on *full_branch*, or detached at its tip
+        or a descendant of it, or *full_branch* does not exist yet
+        (``orchestrator/src/orchestrator/lane_attach.py::head_relation``).
+        Then it runs ``git checkout -B <full_branch>`` with no start point,
+        which moves the ref to HEAD and attaches the lane, keeping the working
+        tree.  Any other HEAD is refused with a WARNING and False, because
+        adopting it resets the branch to a commit that is not its own: reify
+        task/10089 lost its work that way (task 10991).
 
         **Best-effort / never-raise** (task-1923 live-requeue residual fix):
         ``git checkout -B`` bypasses git's linked-worktree single-checkout
         guard: if *full_branch* is currently checked out in another live
         worktree, the command still succeeds (rc=0), force-resets the ref to
         the current HEAD, and leaves both worktrees tracking the same branch —
-        a duplicate-dispatch hazard, NOT a safe fail-safe.  This method
-        returns ``False`` only on a genuine non-zero rc (e.g. an invalid
-        branch name); in that case it logs a WARNING and never raises.
+        a duplicate-dispatch hazard, NOT a safe fail-safe.  A non-zero rc
+        (e.g. an invalid branch name) is logged at WARNING and answered False.
         It never converts a reuse into a FAULT.
 
         Returns:
-            True on success (rc=0); False on any non-zero git rc.
+            True when the branch was rebound; False when refused or git failed.
         """
+        if await head_relation(_run, worktree, full_branch) is HeadRelation.FOREIGN:
+            logger.warning(
+                'rebind_branch_to_head: refusing to rebind %s (tip %s) to HEAD '
+                '%s of %s: HEAD is neither on the branch nor at or past its tip',
+                full_branch, await branch_tip(_run, worktree, full_branch),
+                await describe_head(_run, worktree), worktree,
+            )
+            return False
         rc, _, err = await _run(
             ['git', 'checkout', '-B', full_branch],
             cwd=worktree,
