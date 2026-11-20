@@ -19,7 +19,7 @@ from shared.process_identity import ProcessIdentity
 
 from orchestrator import decision_registry as dr
 from orchestrator import session_hooks as sh
-from orchestrator import session_identity, session_records
+from orchestrator import session_identity, session_leases, session_reaper, session_records
 from orchestrator import session_registry as sr
 
 # A pid virtually guaranteed dead on any host (the suite-wide idiom; see
@@ -214,7 +214,7 @@ class TestResolveOwnRecordSlug:
     def test_resolves_the_claude_pid_from_env(self, tmp_path: Path) -> None:
         self._link(tmp_path)
 
-        assert sr.resolve_own_record_slug({'CLAUDE_PID': '1234'}, root=tmp_path) == self._SLUG
+        assert session_leases.resolve_own_record_slug({'CLAUDE_PID': '1234'}, root=tmp_path) == self._SLUG
 
     def test_env_none_reads_os_environ(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -222,7 +222,7 @@ class TestResolveOwnRecordSlug:
         self._link(tmp_path)
         monkeypatch.setenv('CLAUDE_PID', '1234')
 
-        assert sr.resolve_own_record_slug(root=tmp_path) == self._SLUG
+        assert session_leases.resolve_own_record_slug(root=tmp_path) == self._SLUG
 
     @pytest.mark.parametrize(
         'env',
@@ -235,7 +235,7 @@ class TestResolveOwnRecordSlug:
         self._link(tmp_path)
         caplog.set_level(logging.DEBUG)
 
-        assert sr.resolve_own_record_slug(env, root=tmp_path) is None
+        assert session_leases.resolve_own_record_slug(env, root=tmp_path) is None
         assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
 
     def test_a_valid_pid_with_no_pointer_is_none_and_quiet(
@@ -243,7 +243,7 @@ class TestResolveOwnRecordSlug:
     ) -> None:
         caplog.set_level(logging.DEBUG)
 
-        assert sr.resolve_own_record_slug({'CLAUDE_PID': '1234'}, root=tmp_path) is None
+        assert session_leases.resolve_own_record_slug({'CLAUDE_PID': '1234'}, root=tmp_path) is None
         assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
 
     def test_resolve_session_pid_keeps_its_lease_degradation_warning(
@@ -265,7 +265,7 @@ class TestReapStaleSessionPointers:
         session_records.write_record(_record(self._SLUG, owner_pid=os.getpid()), root=tmp_path)
         session_records.write_session_pointer(os.getpid(), self._SLUG, root=tmp_path)
 
-        assert sr.reap_stale_session_pointers(root=tmp_path) == []
+        assert session_reaper.reap_stale_session_pointers(root=tmp_path) == []
         assert session_records.session_pointer_path_for_pid(os.getpid(), root=tmp_path).is_file()
 
     def test_a_dead_pids_pointer_is_removed_even_though_its_record_exists(
@@ -275,14 +275,14 @@ class TestReapStaleSessionPointers:
         session_records.write_session_pointer(_DEAD_PID, self._SLUG, root=tmp_path)
         pointer = session_records.session_pointer_path_for_pid(_DEAD_PID, root=tmp_path)
 
-        assert sr.reap_stale_session_pointers(root=tmp_path) == [pointer]
+        assert session_reaper.reap_stale_session_pointers(root=tmp_path) == [pointer]
         assert not pointer.exists()
 
     def test_a_live_pids_pointer_to_a_reaped_record_is_removed(self, tmp_path: Path) -> None:
         session_records.write_session_pointer(os.getpid(), self._SLUG, root=tmp_path)
         pointer = session_records.session_pointer_path_for_pid(os.getpid(), root=tmp_path)
 
-        assert sr.reap_stale_session_pointers(root=tmp_path) == [pointer]
+        assert session_reaper.reap_stale_session_pointers(root=tmp_path) == [pointer]
         assert not pointer.exists()
 
     @pytest.mark.parametrize('content', ['', '  \n', '../escape', 'a/b', '..'])
@@ -291,7 +291,7 @@ class TestReapStaleSessionPointers:
     ) -> None:
         pointer = _write_pointer_raw(os.getpid(), content, tmp_path)
 
-        assert sr.reap_stale_session_pointers(root=tmp_path) == [pointer]
+        assert session_reaper.reap_stale_session_pointers(root=tmp_path) == [pointer]
         assert not pointer.exists()
 
     @pytest.mark.parametrize('name', ['not-a-pid', '0', '-5', '12.5'])
@@ -303,7 +303,7 @@ class TestReapStaleSessionPointers:
         pointer.parent.mkdir(parents=True)
         pointer.write_text(self._SLUG, encoding='utf-8')
 
-        assert sr.reap_stale_session_pointers(root=tmp_path) == [pointer]
+        assert session_reaper.reap_stale_session_pointers(root=tmp_path) == [pointer]
         assert not pointer.exists()
 
     def test_a_writers_in_flight_temp_file_is_left_alone(self, tmp_path: Path) -> None:
@@ -311,7 +311,7 @@ class TestReapStaleSessionPointers:
         temp.parent.mkdir(parents=True)
         temp.write_text(self._SLUG, encoding='utf-8')
 
-        assert sr.reap_stale_session_pointers(root=tmp_path) == []
+        assert session_reaper.reap_stale_session_pointers(root=tmp_path) == []
         assert temp.is_file()
 
     def test_a_temp_file_abandoned_by_a_killed_writer_is_removed(self, tmp_path: Path) -> None:
@@ -321,11 +321,11 @@ class TestReapStaleSessionPointers:
         a_day_ago = (datetime.now(UTC) - timedelta(days=1)).timestamp()
         os.utime(temp, (a_day_ago, a_day_ago))
 
-        assert sr.reap_stale_session_pointers(root=tmp_path) == [temp]
+        assert session_reaper.reap_stale_session_pointers(root=tmp_path) == [temp]
         assert not temp.exists()
 
     def test_an_absent_pointer_dir_is_an_empty_pass(self, tmp_path: Path) -> None:
-        assert sr.reap_stale_session_pointers(root=tmp_path) == []
+        assert session_reaper.reap_stale_session_pointers(root=tmp_path) == []
 
     @pytest.mark.parametrize('variant', list(IdentityVariant))
     def test_a_live_pids_pointer_is_judged_by_its_records_owner_identity(
@@ -337,7 +337,7 @@ class TestReapStaleSessionPointers:
         pointer = session_records.session_pointer_path_for_pid(os.getpid(), root=tmp_path)
         removed = variant.judged_dead
 
-        assert sr.reap_stale_session_pointers(root=tmp_path) == ([pointer] if removed else [])
+        assert session_reaper.reap_stale_session_pointers(root=tmp_path) == ([pointer] if removed else [])
         assert pointer.exists() is not removed
 
     def test_a_dead_pids_pointer_to_a_record_reclaimed_by_a_live_owner_is_removed(
@@ -348,7 +348,7 @@ class TestReapStaleSessionPointers:
         session_records.write_session_pointer(_DEAD_PID, self._SLUG, root=tmp_path)
         pointer = session_records.session_pointer_path_for_pid(_DEAD_PID, root=tmp_path)
 
-        assert sr.reap_stale_session_pointers(root=tmp_path) == [pointer]
+        assert session_reaper.reap_stale_session_pointers(root=tmp_path) == [pointer]
         assert not pointer.exists()
 
     def test_a_live_pids_pointer_to_a_record_owned_by_another_pid_is_judged_by_its_own_pid(
@@ -359,7 +359,7 @@ class TestReapStaleSessionPointers:
         session_records.write_record(owner, root=tmp_path)
         session_records.write_session_pointer(os.getpid(), self._SLUG, root=tmp_path)
 
-        assert sr.reap_stale_session_pointers(root=tmp_path) == []
+        assert session_reaper.reap_stale_session_pointers(root=tmp_path) == []
         assert session_records.session_pointer_path_for_pid(os.getpid(), root=tmp_path).is_file()
 
     def test_a_corrupt_record_reads_unqualified_so_a_live_pids_pointer_is_kept(
@@ -370,7 +370,7 @@ class TestReapStaleSessionPointers:
         record_path.write_text('{not json', encoding='utf-8')
         session_records.write_session_pointer(os.getpid(), self._SLUG, root=tmp_path)
 
-        assert sr.reap_stale_session_pointers(root=tmp_path) == []
+        assert session_reaper.reap_stale_session_pointers(root=tmp_path) == []
         assert session_records.session_pointer_path_for_pid(os.getpid(), root=tmp_path).is_file()
 
     def test_an_entry_that_cannot_be_removed_is_skipped_and_the_pass_continues(
@@ -383,7 +383,7 @@ class TestReapStaleSessionPointers:
         stale.write_text(self._SLUG, encoding='utf-8')
         caplog.set_level(logging.DEBUG)
 
-        assert sr.reap_stale_session_pointers(root=tmp_path) == [stale]
+        assert session_reaper.reap_stale_session_pointers(root=tmp_path) == [stale]
         assert stuck.is_dir()
         assert not stale.exists()
         assert any(str(_DEAD_PID) in r.getMessage() for r in caplog.records)
@@ -692,8 +692,8 @@ class TestResumedSessionIdKeyedRecordIsRelinked:
 _T0 = datetime(2026, 9, 25, 12, 0, 0, tzinfo=UTC)
 
 
-def _holder(*, pid: int = 0, record_slug: str = '', slug: str = 'watcher-df-1') -> sr.LeaseHolder:
-    return sr.LeaseHolder(
+def _holder(*, pid: int = 0, record_slug: str = '', slug: str = 'watcher-df-1') -> session_leases.LeaseHolder:
+    return session_leases.LeaseHolder(
         session_slug=slug,
         pid=pid or os.getpid(),
         start_ts=_T0.isoformat(),
@@ -705,8 +705,8 @@ class TestLeaseHolderRecordSlug:
     def test_record_slug_round_trips(self) -> None:
         holder = _holder(record_slug='role-proj-uuid')
 
-        assert sr.LeaseHolder.from_dict(holder.to_dict()) == holder
-        assert sr.LeaseHolder.from_json(holder.to_json()) == holder
+        assert session_leases.LeaseHolder.from_dict(holder.to_dict()) == holder
+        assert session_leases.LeaseHolder.from_json(holder.to_json()) == holder
         assert holder.to_dict()['record_slug'] == 'role-proj-uuid'
 
     def test_a_legacy_body_parses_as_unlinked(self) -> None:
@@ -716,23 +716,23 @@ class TestLeaseHolderRecordSlug:
             'start_ts': '2026-08-15T00:00:00+00:00',
         }
 
-        assert sr.LeaseHolder.from_dict(legacy).record_slug == ''
+        assert session_leases.LeaseHolder.from_dict(legacy).record_slug == ''
 
     def test_an_explicit_null_parses_as_unlinked(self) -> None:
         body = {'session_slug': 'watcher-df-1', 'pid': 1, 'start_ts': '', 'record_slug': None}
 
-        assert sr.LeaseHolder.from_dict(body).record_slug == ''
+        assert session_leases.LeaseHolder.from_dict(body).record_slug == ''
 
     def test_the_field_defaults_to_unlinked(self) -> None:
-        holder = sr.LeaseHolder(session_slug='watcher-df-1', pid=1, start_ts='')
+        holder = session_leases.LeaseHolder(session_slug='watcher-df-1', pid=1, start_ts='')
 
         assert holder.record_slug == ''
 
     def test_claim_lease_writes_it_and_a_contender_reads_it_back(self, tmp_path: Path) -> None:
-        sr.claim_lease('watcher-df', holder=_holder(record_slug='role-proj-uuid'), root=tmp_path)
-        body = json.loads(sr.lease_path_for_name('watcher-df', root=tmp_path).read_text())
+        session_leases.claim_lease('watcher-df', holder=_holder(record_slug='role-proj-uuid'), root=tmp_path)
+        body = json.loads(session_leases.lease_path_for_name('watcher-df', root=tmp_path).read_text())
 
-        contended = sr.claim_lease('watcher-df', holder=_holder(slug='watcher-df-2'), root=tmp_path)
+        contended = session_leases.claim_lease('watcher-df', holder=_holder(slug='watcher-df-2'), root=tmp_path)
 
         assert body['record_slug'] == 'role-proj-uuid'
         assert contended.acquired is False
@@ -744,50 +744,50 @@ class TestHolderRecordState:
     _SLUG = 'role-proj-uuid'
 
     def test_no_holder_is_unlinked(self, tmp_path: Path) -> None:
-        assert sr.holder_record_state(None, root=tmp_path) is sr.HolderRecordState.UNLINKED
+        assert session_leases.holder_record_state(None, root=tmp_path) is session_leases.HolderRecordState.UNLINKED
 
     def test_a_holder_without_a_record_slug_is_unlinked(self, tmp_path: Path) -> None:
-        state = sr.holder_record_state(_holder(record_slug=''), root=tmp_path)
+        state = session_leases.holder_record_state(_holder(record_slug=''), root=tmp_path)
 
-        assert state is sr.HolderRecordState.UNLINKED
+        assert state is session_leases.HolderRecordState.UNLINKED
 
     def test_a_record_slug_that_is_not_a_record_key_is_unreadable(self, tmp_path: Path) -> None:
-        state = sr.holder_record_state(_holder(record_slug='../x'), root=tmp_path)
+        state = session_leases.holder_record_state(_holder(record_slug='../x'), root=tmp_path)
 
-        assert state is sr.HolderRecordState.UNREADABLE
+        assert state is session_leases.HolderRecordState.UNREADABLE
 
     def test_a_reaped_record_is_absent(self, tmp_path: Path) -> None:
-        state = sr.holder_record_state(_holder(record_slug=self._SLUG), root=tmp_path)
+        state = session_leases.holder_record_state(_holder(record_slug=self._SLUG), root=tmp_path)
 
-        assert state is sr.HolderRecordState.ABSENT
+        assert state is session_leases.HolderRecordState.ABSENT
 
     @pytest.mark.parametrize('status', sorted(set(session_records.Status) - session_records.TERMINAL_STATUSES))
     def test_a_non_terminal_record_is_active(self, tmp_path: Path, status: session_records.Status) -> None:
         session_records.write_record(_record(self._SLUG, owner_pid=1, status=status), root=tmp_path)
 
-        state = sr.holder_record_state(_holder(record_slug=self._SLUG), root=tmp_path)
+        state = session_leases.holder_record_state(_holder(record_slug=self._SLUG), root=tmp_path)
 
-        assert state is sr.HolderRecordState.ACTIVE
+        assert state is session_leases.HolderRecordState.ACTIVE
 
     @pytest.mark.parametrize('status', sorted(session_records.TERMINAL_STATUSES))
     def test_a_terminal_record_is_exited(self, tmp_path: Path, status: session_records.Status) -> None:
         session_records.write_record(_record(self._SLUG, owner_pid=1, status=status), root=tmp_path)
 
-        state = sr.holder_record_state(_holder(record_slug=self._SLUG), root=tmp_path)
+        state = session_leases.holder_record_state(_holder(record_slug=self._SLUG), root=tmp_path)
 
-        assert state is sr.HolderRecordState.EXITED
+        assert state is session_leases.HolderRecordState.EXITED
 
     def test_a_corrupt_record_is_unreadable(self, tmp_path: Path) -> None:
         path = session_records.record_path_for_slug(self._SLUG, root=tmp_path)
         path.parent.mkdir(parents=True)
         path.write_text('{not json', encoding='utf-8')
 
-        state = sr.holder_record_state(_holder(record_slug=self._SLUG), root=tmp_path)
+        state = session_leases.holder_record_state(_holder(record_slug=self._SLUG), root=tmp_path)
 
-        assert state is sr.HolderRecordState.UNREADABLE
+        assert state is session_leases.HolderRecordState.UNREADABLE
 
     def test_the_printed_values(self) -> None:
-        assert [state.value for state in sr.HolderRecordState] == [
+        assert [state.value for state in session_leases.HolderRecordState] == [
             'unlinked',
             'absent',
             'unreadable',
@@ -799,17 +799,17 @@ class TestHolderRecordState:
 _LEASE = 'watcher-df'
 
 
-def _seed_lease(root: Path, body: str | sr.LeaseHolder, *, age_secs: float = 60.0) -> None:
-    path = sr.lease_path_for_name(_LEASE, root=root)
+def _seed_lease(root: Path, body: str | session_leases.LeaseHolder, *, age_secs: float = 60.0) -> None:
+    path = session_leases.lease_path_for_name(_LEASE, root=root)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(body if isinstance(body, str) else body.to_json(), encoding='utf-8')
     ts = (_T0 - timedelta(seconds=age_secs)).timestamp()
     os.utime(path, (ts, ts))
 
 
-def _contend(root: Path, *, record_slug: str = '') -> sr.LeaseClaim:
+def _contend(root: Path, *, record_slug: str = '') -> session_leases.LeaseClaim:
     contender = _holder(slug='watcher-df-contender', record_slug=record_slug)
-    return sr.claim_lease(_LEASE, holder=contender, root=root, now=_T0)
+    return session_leases.claim_lease(_LEASE, holder=contender, root=root, now=_T0)
 
 
 class TestLeaseClaimHolderRecordState:
@@ -820,15 +820,15 @@ class TestLeaseClaimHolderRecordState:
     ) -> None:
         session_records.write_record(_record(self._SLUG, owner_pid=os.getpid()), root=tmp_path)
 
-        claim = sr.claim_lease(_LEASE, holder=_holder(record_slug=self._SLUG), root=tmp_path)
+        claim = session_leases.claim_lease(_LEASE, holder=_holder(record_slug=self._SLUG), root=tmp_path)
 
         assert claim.acquired is True
-        assert claim.holder_record_state is sr.HolderRecordState.ACTIVE
+        assert claim.holder_record_state is session_leases.HolderRecordState.ACTIVE
 
     def test_an_acquired_unlinked_claim_is_unlinked(self, tmp_path: Path) -> None:
-        claim = sr.claim_lease(_LEASE, holder=_holder(), root=tmp_path)
+        claim = session_leases.claim_lease(_LEASE, holder=_holder(), root=tmp_path)
 
-        assert claim.holder_record_state is sr.HolderRecordState.UNLINKED
+        assert claim.holder_record_state is session_leases.HolderRecordState.UNLINKED
 
     def test_a_contended_claim_reports_the_existing_holders_record(
         self, tmp_path: Path
@@ -841,13 +841,13 @@ class TestLeaseClaimHolderRecordState:
         claim = _contend(tmp_path)
 
         assert claim.acquired is False
-        assert claim.holder_record_state is sr.HolderRecordState.EXITED
+        assert claim.holder_record_state is session_leases.HolderRecordState.EXITED
 
     def test_a_legacy_body_is_unlinked(self, tmp_path: Path) -> None:
         legacy = {'session_slug': 'watcher-df-1', 'pid': os.getpid(), 'start_ts': ''}
         _seed_lease(tmp_path, json.dumps(legacy))
 
-        assert _contend(tmp_path).holder_record_state is sr.HolderRecordState.UNLINKED
+        assert _contend(tmp_path).holder_record_state is session_leases.HolderRecordState.UNLINKED
 
     def test_an_unreadable_body_is_unlinked(self, tmp_path: Path) -> None:
         _seed_lease(tmp_path, '{not json')
@@ -855,14 +855,14 @@ class TestLeaseClaimHolderRecordState:
         claim = _contend(tmp_path)
 
         assert claim.holder is None
-        assert claim.holder_record_state is sr.HolderRecordState.UNLINKED
+        assert claim.holder_record_state is session_leases.HolderRecordState.UNLINKED
 
 
 class TestHolderRecordIsAnAdditiveAxis:
     _SLUG = 'role-proj-uuid'
 
     @staticmethod
-    def _verdict(claim: sr.LeaseClaim) -> tuple[object, ...]:
+    def _verdict(claim: session_leases.LeaseClaim) -> tuple[object, ...]:
         return (claim.decision, claim.acquired, claim.holder_alive, claim.message)
 
     @pytest.mark.parametrize('existing', ['live', 'dead', 'unreadable'])
@@ -892,9 +892,9 @@ class TestHolderRecordIsAnAdditiveAxis:
 
         claim = _contend(tmp_path)
 
-        assert claim.decision is sr.LeaseDecision.STAND_DOWN
+        assert claim.decision is session_leases.LeaseDecision.STAND_DOWN
         assert claim.holder_alive is False
-        assert claim.holder_record_state is sr.HolderRecordState.EXITED
+        assert claim.holder_record_state is session_leases.HolderRecordState.EXITED
 
 
 def _show(capsys: pytest.CaptureFixture[str]) -> list[str]:
@@ -910,24 +910,24 @@ class TestLeaseShowHolderRecord:
         session_records.write_record(_record(self._SLUG, owner_pid=os.getpid()), root=tmp_path)
         _seed_lease(tmp_path, _holder(record_slug=self._SLUG))
 
-        status = sr.lease_status(_LEASE, root=tmp_path, now=_T0)
+        status = session_leases.lease_status(_LEASE, root=tmp_path, now=_T0)
 
         assert status.holder_record_slug == self._SLUG
-        assert status.holder_record_state is sr.HolderRecordState.ACTIVE
+        assert status.holder_record_state is session_leases.HolderRecordState.ACTIVE
 
     def test_an_absent_lease_status_is_unlinked(self, tmp_path: Path) -> None:
-        status = sr.lease_status(_LEASE, root=tmp_path, now=_T0)
+        status = session_leases.lease_status(_LEASE, root=tmp_path, now=_T0)
 
         assert status.holder_record_slug is None
-        assert status.holder_record_state is sr.HolderRecordState.UNLINKED
+        assert status.holder_record_state is session_leases.HolderRecordState.UNLINKED
 
     def test_an_unreadable_lease_status_is_unlinked(self, tmp_path: Path) -> None:
         _seed_lease(tmp_path, '{not json')
 
-        status = sr.lease_status(_LEASE, root=tmp_path, now=_T0)
+        status = session_leases.lease_status(_LEASE, root=tmp_path, now=_T0)
 
         assert status.holder_record_slug is None
-        assert status.holder_record_state is sr.HolderRecordState.UNLINKED
+        assert status.holder_record_state is session_leases.HolderRecordState.UNLINKED
 
     def test_an_absent_lease_still_prints_only_name_and_state(
         self, capsys: pytest.CaptureFixture[str]
@@ -985,8 +985,8 @@ def _link_pid(pid: int, slug: str, root: Path) -> None:
     session_records.write_session_pointer(pid, slug, root=root)
 
 
-def _lease_body(root: Path) -> sr.LeaseHolder:
-    return sr.LeaseHolder.from_json(sr.lease_path_for_name(_LEASE, root=root).read_text())
+def _lease_body(root: Path) -> session_leases.LeaseHolder:
+    return session_leases.LeaseHolder.from_json(session_leases.lease_path_for_name(_LEASE, root=root).read_text())
 
 
 class TestLeaseClaimCliRecordSlug:
@@ -1119,10 +1119,10 @@ class TestALeaseFollowsItsHoldersRecordAcrossARemint:
 
         live = session_records.resolve_session_slug_for_claude_session_id('sid-after', root=tmp_path)
         assert live is not None
-        status = sr.lease_status(_LEASE, root=tmp_path)
+        status = session_leases.lease_status(_LEASE, root=tmp_path)
         assert (status.holder_record_slug, status.holder_record_state) == (
             live,
-            sr.HolderRecordState.ACTIVE,
+            session_leases.HolderRecordState.ACTIVE,
         )
         assert session_records.resolve_session_slug_for_pid(_REMINT_OWNER, root=tmp_path) == live
         record = session_records.read_record(live, root=tmp_path)
@@ -1135,8 +1135,8 @@ def _claim_lines(capsys: pytest.CaptureFixture[str], *extra: str) -> list[str]:
     return capsys.readouterr().out.splitlines()
 
 
-def _seed_fresh_lease(root: Path, holder: sr.LeaseHolder) -> None:
-    path = sr.lease_path_for_name(_LEASE, root=root)
+def _seed_fresh_lease(root: Path, holder: session_leases.LeaseHolder) -> None:
+    path = session_leases.lease_path_for_name(_LEASE, root=root)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(holder.to_json(), encoding='utf-8')
 
@@ -1214,10 +1214,10 @@ class TestLeaseClaimPrintsHolderRecordLast:
         _link_pid(self._PID, self._OWN_SLUG, tmp_path)
         monkeypatch.setenv('CLAUDE_PID', str(self._PID))
 
-        def _boom(*_args: object, **_kwargs: object) -> sr.LeaseClaim:
+        def _boom(*_args: object, **_kwargs: object) -> session_leases.LeaseClaim:
             raise OSError('lease substrate on fire')
 
-        monkeypatch.setattr(sr, 'claim_lease', _boom)
+        monkeypatch.setattr(session_leases, 'claim_lease', _boom)
 
         lines = _claim_lines(capsys)
 

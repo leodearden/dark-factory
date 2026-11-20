@@ -64,7 +64,7 @@ logger = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 1
 
-# 3: session_registry.py::LeaseHolder.record_slug and decision_registry.py::DecisionRecord.record_slug (task 4237).
+# 3: session_leases.py::LeaseHolder.record_slug and decision_registry.py::DecisionRecord.record_slug (task 4237).
 # 4: SessionRecord.self_exit (task 7179).
 # 5: SessionRecord.exit_request and exit_requested_at (task 7193).
 # 6: SessionRecord.claude_launch_session_id (task 6069).
@@ -740,7 +740,7 @@ def resolve_session_slug_for_pid(pid: int, root: Path | str | None = None) -> st
 
     Contract limit: a new process that reuses a dead claude's pid can read
     that session's pointer until its own SessionStart hook overwrites it or
-    ``session_registry.py::reap_stale_session_pointers`` removes it.
+    ``session_reaper.py::reap_stale_session_pointers`` removes it.
     """
     if pid <= 0:
         return None
@@ -830,7 +830,7 @@ T3_THREAD_POINTERS_DIRNAME = 'sessions-by-t3-thread'
 def t3_thread_pointers_dir(root: Path | str | None = None) -> Path:
     """The T3 thread pointer dir, ``<fleet_root>/sessions-by-t3-thread/``; a sibling of ``sessions_dir`` like ``session_pointers_dir``.
 
-    It is the index of live T3-hosted records that ``session_registry.py::mark_t3_sessions_exited`` iterates.
+    It is the index of live T3-hosted records that ``session_reaper.py::mark_t3_sessions_exited`` iterates.
     """
     return fleet_root(root) / T3_THREAD_POINTERS_DIRNAME
 
@@ -858,7 +858,7 @@ def resolve_session_slug_for_t3_thread(
     non-terminal and ``t3_thread_of`` it must be *thread_id*. That is the one
     definition of the index's invariant -- a terminal record has no pointer
     -- which the reap and every terminal write enforce through
-    ``session_registry.py::_is_stale_t3_thread_pointer``. Read-only; never raises.
+    ``session_reaper.py::_is_stale_t3_thread_pointer``. Read-only; never raises.
     """
     if not is_t3_thread_pointer_name(thread_id):
         return None
@@ -898,7 +898,7 @@ def index_t3_record_if_unheld(
     A held pointer is never moved: the T3 lane's bind
     (``orchestrator/src/orchestrator/spawn_t3_lane.py::_bind_to``) is the one
     writer that re-points one. A failed write is logged by the writer, and
-    ``session_registry.py::index_unpointed_t3_records`` retries it.
+    ``session_reaper.py::index_unpointed_t3_records`` retries it.
     """
     thread_id = t3_thread_of(record)
     if (
@@ -964,7 +964,7 @@ def write_record(record: SessionRecord, root: Path | str | None = None) -> None:
     """Atomically write *record* (tmp file in the same dir, then os.replace).
 
     Every successful write bumps record.json's mtime, which
-    session_registry.py::reap_stale_records() reads as this record's heartbeat.
+    session_reaper.py::reap_stale_records() reads as this record's heartbeat.
     """
     path = record_path_for_slug(record.session_slug, root=root)
     atomic_write_text(path, record.to_json())

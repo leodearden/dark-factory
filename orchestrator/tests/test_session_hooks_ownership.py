@@ -21,7 +21,7 @@ from _session_hook_fixtures import (
 from shared.process_identity import ProcessIdentity
 
 from orchestrator import session_hooks as sh
-from orchestrator import session_records
+from orchestrator import session_records, session_windows
 from orchestrator.session_ownership_probes import EventProbes
 
 
@@ -843,28 +843,26 @@ def test_forked_inheritor_records_its_spawner_as_parent(tmp_path: Path) -> None:
     assert session_records.read_record(slug, root=tmp_path).parent_session_id is None
 
 
-def test_forked_inheritor_does_not_claim_the_spawners_window(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_forked_inheritor_does_not_claim_the_spawners_window(tmp_path: Path) -> None:
     # CLAUDE_SPAWN_WM_TITLE marks the SPAWNING session's window: resolving
     # it here would give the forked row the parent's window id, so cockpit
     # focus would raise the parent's terminal and
     # mark_windowless_wm_sessions_exited would treat both rows as one
     # window. The resolver must not even be consulted.
-    def _boom(*_args: object, **_kwargs: object) -> str:
-        raise AssertionError('a forked inheritor must not resolve the spawner window marker')
-
-    monkeypatch.setattr(sh, '_resolve_wm_window_id', _boom)
+    asked: list[str] = []
+    windows = session_windows.WindowProbe(
+        live_window_ids=lambda: None, resolve_by_title=lambda title: asked.append(title)
+    )
 
     slug = 'session-cockpit-3215091'
     write_bound_parent(slug, tmp_path, 3215091)
     hook_input = {'session_id': 'uuid-nested', 'cwd': '/home/leo/src/dark-factory'}
     env = {'CLAUDE_SPAWN_SESSION_ID': slug, 'CLAUDE_SPAWN_WM_TITLE': 'parent-marker'}
 
-    sh.run_session_start(hook_input, env, root=tmp_path)
+    sh.run_session_start(hook_input, env, root=tmp_path, windows=windows)
 
     forked = session_records.read_record(sh.hook_session_slug(hook_input, env, root=tmp_path), root=tmp_path)
+    assert asked == []
     assert forked.display is None
 
 
@@ -990,20 +988,17 @@ def test_adopted_session_retitle_keeps_its_spawn_identity(tmp_path: Path) -> Non
     assert osc == sh.osc_retitle_sequence(session_records.Status.IDLE, 'unblock:df#2085')
 
 
-def test_adopted_session_still_resolves_the_spawn_window_marker(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_adopted_session_still_resolves_the_spawn_window_marker(tmp_path: Path) -> None:
     # The gate is fork-only: the owning session's own SessionStart keeps the
     # task-2510 / Cockpit C10 marker resolution untouched.
-    monkeypatch.setattr(sh, '_resolve_wm_window_id', lambda _marker: '0x1a')
+    windows = session_windows.WindowProbe(live_window_ids=lambda: None, resolve_by_title=lambda _marker: '0x1a')
 
     slug = 'session-cockpit-3215092'
     write_bound_parent(slug, tmp_path, 3215092)
     hook_input = {'session_id': 'uuid-parent', 'cwd': '/home/leo/src/dark-factory'}
     env = {'CLAUDE_SPAWN_SESSION_ID': slug, 'CLAUDE_SPAWN_WM_TITLE': 'parent-marker'}
 
-    sh.run_session_start(hook_input, env, root=tmp_path)
+    sh.run_session_start(hook_input, env, root=tmp_path, windows=windows)
 
     display = session_records.read_record(slug, root=tmp_path).display
     assert display is not None

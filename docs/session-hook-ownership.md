@@ -383,5 +383,10 @@ reaper:
   an hour of heartbeat silence, so a fallback pid cannot reap a record that is
   still being written.
 
+Like the process tree, SessionStart's display resolution reads windows
+through an injected `session_windows.WindowProbe`
+(`run_session_start(..., windows=)`); None reads wmctrl.
+
 Code: `orchestrator/src/orchestrator/session_ownership_probes.py::ProcessTree`,
-`::EventProbes`, `::_owning_claude_pid`.
+`::EventProbes`, `::_owning_claude_pid`,
+`orchestrator/src/orchestrator/session_windows.py::WindowProbe`.
