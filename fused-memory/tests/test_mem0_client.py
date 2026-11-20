@@ -3,18 +3,26 @@
 import asyncio
 import contextlib
 import logging
+import uuid
 from collections.abc import Iterator
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
-from _fm_qdrant_live import QDRANT_URL, collection_vector_size, qdrant_skipif
+from _fm_qdrant_live import (
+    EPHEMERAL_COLLECTION_PREFIX,
+    QDRANT_URL,
+    assert_reapable,
+    collection_vector_size,
+    qdrant_skipif,
+)
 from _qdrant_responses import missing_collection_404
 from _stub_qdrant_server import StubQdrantServer, stub_qdrant_server
 from mem0 import AsyncMemory
 from mem0.configs.base import MemoryConfig
 from qdrant_client import QdrantClient
 from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedResponse
+from qdrant_client.models import FieldCondition, Filter, FilterSelector, MatchValue
 
 from fused_memory.backends.mem0_client import Mem0Backend, is_missing_collection_error
 from fused_memory.config.schema import Mem0BackendConfig
@@ -2102,28 +2110,53 @@ class TestMem0BackendMetadataReadsOnAbsentCollectionIntegration:
 # never dedup-drops), adapted to probe add_system_record instead of add().
 # This pins the SAME fresh-point-every-call guarantee for the new dedicated,
 # dedup-exempt method.
+#
+# One collection is shared by every xdist worker and session and reused across
+# runs; it is reaped by scripts/cleanup_test_collections.py, and each run is
+# isolated by its own run_id.
 
 
 @pytest.fixture
-def _asr_scope(worker_id) -> Scope:
-    """A recon-stage scope isolated per xdist worker for add_system_record tests."""
+def _asr_scope() -> Scope:
+    """The recon-stage scope every add_system_record run shares; runs are isolated by run_id."""
     return Scope(
-        project_id=f'_test_add_system_record_{worker_id}',
+        project_id='_test_add_system_record',
         agent_id='recon-stage-task_knowledge_sync',
     )
 
 
 @pytest.fixture
-def _asr_clean_collection(_asr_scope, mock_config):
-    """Delete the scope's Qdrant collection before AND after the test."""
-    collection = _asr_scope.mem0_collection_name(mock_config.mem0.collection_prefix)
+def _asr_config(mock_config):
+    """``mock_config`` with the collection prefix the reaper sweeps."""
+    config = mock_config.model_copy(deep=True)
+    config.mem0.collection_prefix = EPHEMERAL_COLLECTION_PREFIX
+    return config
+
+
+@pytest.fixture
+def _asr_run_id(_asr_scope, _asr_config):
+    """A run_id unique to this run; teardown deletes only this run's points, never the collection."""
+    run_id = f'task-2222-add-system-record-probe-{uuid.uuid4().hex}'
+    yield run_id
+    collection = _asr_scope.mem0_collection_name(_asr_config.mem0.collection_prefix)
     client = QdrantClient(url=QDRANT_URL, timeout=10)
-    with contextlib.suppress(ResponseHandlingException, UnexpectedResponse):
-        client.delete_collection(collection)
-    yield collection
     with contextlib.suppress(Exception):
-        client.delete_collection(collection)
+        client.delete(
+            collection_name=collection,
+            points_selector=FilterSelector(
+                filter=Filter(
+                    must=[FieldCondition(key='run_id', match=MatchValue(value=run_id))],
+                ),
+            ),
+        )
     client.close()
+
+
+def test_the_add_system_record_probe_collection_is_one_the_reaper_can_reclaim(
+    _asr_config, _asr_scope,
+):
+    """The probe collection outlives a run by design, so it must be one the reaper deletes."""
+    assert_reapable(_asr_scope.mem0_collection_name(_asr_config.mem0.collection_prefix))
 
 
 async def _build_asr_backend(mock_config, scope, monkeypatch) -> Mem0Backend:
@@ -2157,20 +2190,22 @@ async def _build_asr_backend(mock_config, scope, monkeypatch) -> Mem0Backend:
 class TestMem0BackendAddSystemRecordIntegration:
     """P4 boundary signal: N identical add_system_record calls -> N distinct points.
 
-    Real Qdrant, isolated collection, stubbed constant-vector embedder (the
-    worst-case cosine=1.0 duplicate signal) — mirrors
-    test_recon_dedup_premise.py's harness for backend.add(), applied to the
-    new dedup-exempt backend.add_system_record method.
+    Real Qdrant, one collection shared by every worker and reused across runs
+    (reaped by scripts/cleanup_test_collections.py) with each run isolated by
+    its own run_id, stubbed constant-vector embedder (the worst-case cosine=1.0
+    duplicate signal) — mirrors test_recon_dedup_premise.py's harness for
+    backend.add(), applied to the new dedup-exempt backend.add_system_record
+    method.
     """
 
     pytestmark = [qdrant_skipif(), pytest.mark.timeout(60), pytest.mark.integration]
 
     @pytest.mark.asyncio
     async def test_identical_calls_all_land_distinct(
-        self, mock_config, _asr_scope, _asr_clean_collection, monkeypatch,
+        self, _asr_config, _asr_scope, _asr_run_id, monkeypatch,
     ):
-        backend = await _build_asr_backend(mock_config, _asr_scope, monkeypatch)
-        run_id = 'task-2222-add-system-record-probe'
+        backend = await _build_asr_backend(_asr_config, _asr_scope, monkeypatch)
+        run_id = _asr_run_id
         metadata = {'kind': 'cycle_summary', 'run_id': run_id}
         n = 6
         try:
