@@ -226,3 +226,114 @@ class TestWhatDoesNotPark:
             assert execute.await_count == _MAX_ATTEMPTS
         finally:
             await q.close()
+
+
+def _make_due(tmp_path, item_id: int) -> None:
+    """Let *item_id*'s park period elapse, and only its own."""
+    db_path = tmp_path / 'queue' / 'write_queue.db'
+    with contextlib.closing(sqlite3.connect(db_path)) as conn:
+        conn.execute('UPDATE write_queue SET next_retry_at = 0 WHERE id = ?', (item_id,))
+        conn.commit()
+
+
+class _Switchable:
+    """An execute_write that refuses until switched on."""
+
+    def __init__(self) -> None:
+        self.succeeding = False
+
+    async def __call__(self, value: QueuedWrite) -> dict:
+        if not self.succeeding:
+            raise _Exhausted('no credits remaining')
+        return {'episode_uuid': 'ep-1'}
+
+
+async def _park_three(tmp_path, q: DurableWriteQueue) -> tuple[int, int, int]:
+    """Park one row in proj1 to probe first, then one more in each of two groups."""
+    first = await q.enqueue(_write('first', group_id='proj1'))
+    await poll_until(_status_is(tmp_path, first, 'parked'), timeout=10.0)
+    same_group = await q.enqueue(_write('same group', group_id='proj1'))
+    other_group = await q.enqueue(_write('other group', group_id='proj2'))
+    for item_id in (same_group, other_group):
+        await poll_until(_status_is(tmp_path, item_id, 'parked'), timeout=10.0)
+    return first, same_group, other_group
+
+
+class TestUnparking:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('on_cleared_raises', [False, True], ids=['hook-ok', 'hook-raises'])
+    async def test_one_parked_write_landing_drains_every_parked_row(
+        self, tmp_path, on_cleared_raises,
+    ):
+        """The probe that lands proves the cause is gone, so nothing else
+        waits out another period. A long cadence makes the drain observable:
+        only the first row's period is let elapse."""
+        policy = _RecordingParkPolicy(raise_on_cleared=on_cleared_raises)
+        execute = _Switchable()
+        q = _queue(tmp_path, execute, park_policy=policy, retry_max_delay_seconds=30.0)
+        await q.initialize()
+        try:
+            first, same_group, other_group = await _park_three(tmp_path, q)
+
+            execute.succeeding = True
+            _make_due(tmp_path, first)
+
+            for item_id in (first, same_group, other_group):
+                await poll_until(_status_is(tmp_path, item_id, 'completed'), timeout=10.0)
+            assert [_row(tmp_path, i)['attempts'] for i in (same_group, other_group)] == [1, 1]
+            assert policy.cleared == 1
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_a_never_parked_write_landing_clears_nothing(self, tmp_path):
+        policy = _RecordingParkPolicy()
+        q = _queue(tmp_path, AsyncMock(return_value={'episode_uuid': 'ep-1'}), park_policy=policy)
+        await q.initialize()
+        try:
+            item_id = await q.enqueue(_write('healthy'))
+            await poll_until(_status_is(tmp_path, item_id, 'completed'), timeout=10.0)
+
+            assert policy.cleared == 0
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_parked_rows_survive_a_restart_and_drain(self, tmp_path):
+        execute = _Switchable()
+        q = _queue(tmp_path, execute, park_policy=_RecordingParkPolicy())
+        await q.initialize()
+        try:
+            parked = [
+                await q.enqueue(_write('a', group_id='proj1')),
+                await q.enqueue(_write('b', group_id='proj2')),
+            ]
+            for item_id in parked:
+                await poll_until(_status_is(tmp_path, item_id, 'parked'), timeout=10.0)
+        finally:
+            await q.close()
+
+        execute.succeeding = True
+        restarted = _queue(tmp_path, execute, park_policy=_RecordingParkPolicy())
+        await restarted.initialize()
+        try:
+            for item_id in parked:
+                await poll_until(_status_is(tmp_path, item_id, 'completed'), timeout=10.0)
+        finally:
+            await restarted.close()
+
+    @pytest.mark.asyncio
+    async def test_a_dead_letter_from_before_parking_stays_replayable(self, tmp_path):
+        failing = AsyncMock(side_effect=RuntimeError('boom'))
+        q = _queue(tmp_path, failing, park_policy=_RecordingParkPolicy())
+        await q.initialize()
+        try:
+            item_id = await q.enqueue(_write('dies'))
+            await poll_until_dead(q, group_id='proj1', expected_dead=1)
+
+            failing.side_effect = None
+            failing.return_value = {'episode_uuid': 'ep-1'}
+            assert await q.replay_dead() == 1
+            await poll_until(_status_is(tmp_path, item_id, 'completed'), timeout=10.0)
+        finally:
+            await q.close()
