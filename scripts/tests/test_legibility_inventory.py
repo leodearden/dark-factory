@@ -370,6 +370,20 @@ def _write_session(
     return session_path
 
 
+def _install_open_spy(monkeypatch) -> list[Path]:
+    """Wrap+delegate the public transcript reader ``iter_json_lines``,
+    recording every path the enumerator opens with it."""
+    real = mod.iter_json_lines
+    opened: list[Path] = []
+
+    def spy(path):
+        opened.append(path)
+        return real(path)
+
+    monkeypatch.setattr(mod, 'iter_json_lines', spy)
+    return opened
+
+
 class TestIsMember:
     """is_member uses Path.is_relative_to path-component semantics."""
 
@@ -860,10 +874,8 @@ class TestEnumerateSessionsInRange:
         }
 
     def test_single_walk_opens_each_in_range_file_exactly_once(self, tmp_path, monkeypatch):
-        # Three in-range dates across the window. A spy that wraps + delegates
-        # to _read_header (the single gz-decompress/open point)
-        # records each path it is called with: every in-range file must be
-        # passed EXACTLY ONCE — proving the range enumerator is O(total_files),
+        # Three in-range dates across the window. Every in-range file must be
+        # opened EXACTLY ONCE — proving the range enumerator is O(total_files),
         # not O(window_days × files) (the per-date loop would open each file 3×).
         projects_root = tmp_path / 'projects'
         main_dir = projects_root / '-home-leo-src-dark-factory'
@@ -871,14 +883,7 @@ class TestEnumerateSessionsInRange:
         _write_session(main_dir, 'day13', MAIN_CWD, timestamp='2026-07-13T09:00:00.000Z')
         _write_session(main_dir, 'day14', MAIN_CWD, timestamp='2026-07-14T09:00:00.000Z')
 
-        real = mod._read_header
-        opened = []
-
-        def spy(path):
-            opened.append(path)
-            return real(path)
-
-        monkeypatch.setattr(mod, '_read_header', spy)
+        opened = _install_open_spy(monkeypatch)
 
         records = mod.enumerate_sessions_in_range(
             projects_root, [MAIN_CWD], self.START_DATE, self.END_DATE
@@ -909,20 +914,6 @@ class TestArchiveEncPrefilter:
     OTHER_CWD = '/home/leo/src/other-project'
     OTHER_ENC = '-home-leo-src-other-project'
 
-    @staticmethod
-    def _install_open_spy(monkeypatch) -> list[Path]:
-        """Wrap+delegate to _read_header (the single gz-decompress/
-        open point), recording every path it is called with."""
-        real = mod._read_header
-        opened: list[Path] = []
-
-        def spy(path):
-            opened.append(path)
-            return real(path)
-
-        monkeypatch.setattr(mod, '_read_header', spy)
-        return opened
-
     def test_foreign_enc_excluded_and_never_opened(self, tmp_path, monkeypatch):
         # (a) A foreign <enc> (does NOT startswith the encoded MAIN prefix) is
         # excluded AND its path is never passed to the reader — skipped without
@@ -932,7 +923,7 @@ class TestArchiveEncPrefilter:
             archive / '2573' / self.OTHER_ENC, 'foreign', self.OTHER_CWD,
             timestamp='2026-07-13T09:00:00.000Z',
         )
-        opened = self._install_open_spy(monkeypatch)
+        opened = _install_open_spy(monkeypatch)
         records = mod.enumerate_sessions(
             tmp_path / 'no-projects', [MAIN_CWD], self.TARGET_DATE,
             agent_transcript_roots=[archive],
@@ -948,7 +939,7 @@ class TestArchiveEncPrefilter:
             archive / '2573' / self.WT_ENC, 'member', WORKTREE_CWD,
             timestamp='2026-07-13T09:00:00.000Z',
         )
-        opened = self._install_open_spy(monkeypatch)
+        opened = _install_open_spy(monkeypatch)
         records = mod.enumerate_sessions(
             tmp_path / 'no-projects', [MAIN_CWD], self.TARGET_DATE,
             agent_transcript_roots=[archive],
@@ -969,7 +960,7 @@ class TestArchiveEncPrefilter:
             archive / '9999' / cockpit_enc, 'cockpit', COCKPIT_CWD,
             timestamp='2026-07-13T09:00:00.000Z',
         )
-        opened = self._install_open_spy(monkeypatch)
+        opened = _install_open_spy(monkeypatch)
         records = mod.enumerate_sessions(
             tmp_path / 'no-projects', [MAIN_CWD], self.TARGET_DATE,
             agent_transcript_roots=[archive],
@@ -988,7 +979,7 @@ class TestArchiveEncPrefilter:
         sub_path = _write_session(
             sub_dir, 'agent-x', WORKTREE_CWD, timestamp='2026-07-13T09:00:00.000Z',
         )
-        opened = self._install_open_spy(monkeypatch)
+        opened = _install_open_spy(monkeypatch)
         records = mod.enumerate_sessions(
             tmp_path / 'no-projects', [MAIN_CWD], self.TARGET_DATE,
             agent_transcript_roots=[archive],
