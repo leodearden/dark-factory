@@ -2688,7 +2688,7 @@ def test_validate_accepts_a_promoted_candidate_whose_entry_resolves():
     assert mod.validate(_codebook_with_promoted_candidate(promoted_to="entry-a")) == []
 
 
-@pytest.mark.parametrize("filing", ["withheld", "filed"])
+@pytest.mark.parametrize("filing", ["withheld", "owed", "filed"])
 def test_validate_accepts_an_entry_filing_marker_of_the_vocabulary(filing):
     codebook = _minimal_v2()
     codebook["entries"][0]["filing"] = filing
