@@ -371,3 +371,139 @@ class TestSecondPass:
         assert not (tmp_path / 'dispute-test.jsonl').exists() or not _rows(
             tmp_path, 'dispute-test',
         )
+
+
+_LEVERS = ('a1-partial-dispute', 'c1-dispute-marker', 'd1-stale-detail-check')
+_GREENHOUSE = write_triage_judge.JUDGE_EXEMPLARS[0].candidate
+
+
+class TestTheLeverArms:
+    def test_the_lever_arms_and_their_kinds(self) -> None:
+        a1, c1, d1 = map(_arm, _LEVERS)
+        assert (a1.kind, a1.parent, a1.scope) == ('judge', None, 'all')
+        assert (c1.kind, c1.parent, c1.scope) == ('second_pass', 'f3p', 'all')
+        assert (d1.kind, d1.parent, d1.scope) == ('judge', None, 'all')
+        for arm in (a1, c1, d1):
+            assert (arm.model, arm.effort) == ('gpt-6.1-sol', 'low')
+            assert arm.prompt != _SHIPPED
+
+    @pytest.mark.parametrize('name', _LEVERS)
+    def test_each_lever_prompt_keeps_the_shipped_reply_contract(self, name: str) -> None:
+        prompt = _arm(name).prompt
+        for word in write_triage_judge.JUDGE_VERDICTS:
+            assert f'"{word}"' in prompt, word
+        assert write_triage_judge.JUDGE_REPLY_SHAPE in prompt
+        exemplars = _mod().LEVER_EXEMPLARS[name]
+        assert write_triage_judge.render_judge_exemplars(exemplars) in prompt
+        for exemplar in exemplars:
+            assert isinstance(exemplar, write_triage_judge.JudgeExemplar)
+            assert exemplar.verdict in write_triage_judge.JUDGE_VERDICTS
+
+    @pytest.mark.parametrize('name', ['a1-partial-dispute', 'd1-stale-detail-check'])
+    def test_a_first_pass_lever_adds_one_contests_exemplar_on_the_greenhouse_candidate(
+        self, name: str,
+    ) -> None:
+        exemplars = _mod().LEVER_EXEMPLARS[name]
+        shipped = write_triage_judge.JUDGE_EXEMPLARS
+        assert exemplars[:len(shipped)] == shipped
+        (added,) = exemplars[len(shipped):]
+        assert (added.candidate, added.verdict) == (_GREENHOUSE, 'contests')
+        assert added not in shipped
+
+    def test_the_first_pass_levers_add_different_exemplars(self) -> None:
+        a1, d1 = (_mod().LEVER_EXEMPLARS[name][-1] for name in _LEVERS[::2])
+        assert a1.entry != d1.entry
+
+    def test_the_dispute_marker_answers_contests_or_amends(self) -> None:
+        verdicts = {exemplar.verdict for exemplar in _mod().LEVER_EXEMPLARS['c1-dispute-marker']}
+        assert verdicts == {'amends', 'contests'}
+
+    def test_the_shipped_parser_reads_a_lever_answer(self) -> None:
+        client = _client(lambda kwargs: _reply('contests', _target(kwargs)))
+        row = asyncio.run(_judge(_case(), _arm('a1-partial-dispute'), client))
+        assert client.responses.create.call_args.kwargs['instructions'] == (
+            _arm('a1-partial-dispute').prompt
+        )
+        assert (row['judge_outcome'], row['routed_outcome']) == ('contested', 'contested')
+        assert row['prompt_sha256'] == _sha(_arm('a1-partial-dispute').prompt)
+
+
+def _sentence_of(prompt: str, tokens: int) -> str:
+    """The last run of *tokens* word tokens in *prompt*'s instructions, before its examples.
+
+    Joined by spaces, they tokenise back to exactly those tokens.
+    """
+    found = re.findall(r'\w+|[^\w\s]', prompt.split('Worked examples:')[0].lower())
+    for start in range(len(found) - tokens, -1, -1):
+        window = found[start:start + tokens]
+        if all(re.fullmatch(r'\w+', token) for token in window):
+            return ' '.join(window)
+    raise AssertionError(f'no run of {tokens} word tokens')
+
+
+def _shares_a_shingle(span_text: str, message: str) -> bool:
+    words = span_text.lower().split()
+    return any(' '.join(words[i:i + 8]) in message.lower() for i in range(len(words) - 7))
+
+
+class TestTheCorpusTextGuard:
+    @pytest.mark.parametrize('name', _LEVERS)
+    def test_refuses_a_prompt_sharing_an_eight_token_shingle_with_a_case(
+        self, tmp_path: Path, name: str,
+    ) -> None:
+        copied = _sentence_of(_arm(name).prompt, 12)
+        cases = [_case('E1'), _case('E2', child=f'An entry. {copied.upper()} More text.')]
+        arms = [_arm('f3p'), _arm(name)] if name.startswith('c1') else [_arm(name)]
+        client = _client(_amends)
+        with pytest.raises(ValueError, match=name) as refusal:
+            _run(cases, arms, tmp_path, client)
+        assert _shares_a_shingle(copied, str(refusal.value))
+        assert client.responses.create.await_count == 0
+
+    def test_a_parent_text_is_checked_too(self, tmp_path: Path) -> None:
+        copied = _sentence_of(_arm('d1-stale-detail-check').prompt, 9)
+        cases = [_case('E1', parent=copied)]
+        with pytest.raises(ValueError, match='d1-stale-detail-check'):
+            _run(cases, [_arm('d1-stale-detail-check')], tmp_path, _client(_amends))
+
+    def test_a_seven_token_overlap_is_allowed(self, tmp_path: Path) -> None:
+        copied = _sentence_of(_arm('a1-partial-dispute').prompt, 7)
+        cases = [_case('E1', child=f'zzz {copied} qqq')]
+        result = _run(cases, [_arm('a1-partial-dispute')], tmp_path, _client(_amends))
+        assert result.complete == ('a1-partial-dispute',)
+
+    def test_the_shingle_guard_is_public_and_names_the_span(self) -> None:
+        copied = _sentence_of(_arm('a1-partial-dispute').prompt, 8)
+        with pytest.raises(ValueError, match='a1-partial-dispute'):
+            _mod().refuse_corpus_text([_arm('a1-partial-dispute')], [_case(child=copied)])
+        _mod().refuse_corpus_text(list(_mod().ARMS), [_case()])
+
+
+class TestCombinationArms:
+    def _combination(self) -> Any:
+        c1 = _arm('c1-dispute-marker')
+        return _mod().Arm(
+            name='c1-over-a1', kind='second_pass', prompt=c1.prompt, model=c1.model,
+            effort=c1.effort, parent='a1-partial-dispute', scope='all',
+            description='the dispute marker over the boundary lever',
+        )
+
+    def test_a_second_pass_over_a_lever_arm_is_accepted(self) -> None:
+        _mod().validate_arms([*_mod().ARMS, self._combination()])
+
+    def test_it_runs_over_the_lever_arms_rows(self, tmp_path: Path) -> None:
+        marker = _arm('c1-dispute-marker').prompt
+
+        def answer(kwargs: dict[str, Any]) -> Any:
+            target = _target(kwargs)
+            if kwargs['instructions'] == marker:
+                return _reply('contests', target)
+            return _reply('amends' if target == 'T-E1' else 'contests', target)
+
+        cases = [_case('E1'), _case('E2')]
+        result = _run(cases, [_arm('a1-partial-dispute'), self._combination()], tmp_path,
+                      _client(answer))
+        assert result.complete == ('a1-partial-dispute', 'c1-over-a1')
+        rows = {row['entry_id']: row for row in _rows(tmp_path, 'c1-over-a1')}
+        assert (rows['E1']['calls'], rows['E1']['dispute_marked']) == (1, True)
+        assert (rows['E2']['calls'], rows['E2']['judge_outcome']) == (0, 'contested')
