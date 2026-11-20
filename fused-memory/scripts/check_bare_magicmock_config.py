@@ -780,7 +780,6 @@ _WALL_CLOCK_DEADLINE_DEBT: dict[str, int] = {
     'orchestrator/tests/test_merge_queue_restart_hook.py': 1,
     'orchestrator/tests/test_offline_lane_records.py': 1,
     'orchestrator/tests/test_remote_gate.py': 1,
-    'orchestrator/tests/test_task_verify_host_race.py': 1,
     'orchestrator/tests/test_verify.py': 1,
     'orchestrator/tests/test_verify_admission_cancel_release.py': 1,
     'orchestrator/tests/test_verify_admission_executor_bypass.py': 1,

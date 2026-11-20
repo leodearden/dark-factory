@@ -24,13 +24,14 @@ import logging
 import os
 import shlex
 import subprocess
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Collection
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, TypeVar
 
 import pytest
 from _gate_fixtures import gated_remote_runner
+from _poll_responsive import poll_responsive
 from _task_verify_fixtures import VERIFY_MODULE, seed_task_branch_repo
 from shared.verify_admission import acquire_task_slot
 
@@ -65,6 +66,7 @@ _SECOND_MODULE = 'mod2'
 _TEST, _LINT, _TYPE = (f'{kind}-{VERIFY_MODULE}' for kind in ('test', 'lint', 'type'))
 _PROVISION = 'provision'
 _SSH_DOWN = (255, '', 'ssh: connect to host laptop.local port 22: No route to host')
+_STATE_WAIT_SECS = 15.0
 _T = TypeVar('_T')
 
 
@@ -90,9 +92,12 @@ def _alive(pid: int) -> bool:
     return True
 
 
-def _pending_tasks() -> set[asyncio.Task[Any]]:
+def _pending_tasks(*, excluding: Collection[asyncio.Task[Any]] = ()) -> set[asyncio.Task[Any]]:
     current = asyncio.current_task()
-    return {t for t in asyncio.all_tasks() if t is not current and not t.done()}
+    return {
+        t for t in asyncio.all_tasks()
+        if t is not current and t not in excluding and not t.done()
+    }
 
 
 async def _bounded(awaitable: Awaitable[_T], timeout: float = 30.0) -> _T:
@@ -102,14 +107,17 @@ async def _bounded(awaitable: Awaitable[_T], timeout: float = 30.0) -> _T:
 
 async def _until(
     predicate: Callable[[], bool], *, watching: asyncio.Task[Any] | None = None,
-    timeout: float = 15.0,
 ) -> None:
-    async with asyncio.timeout(timeout):
-        while not predicate():
-            if watching is not None and watching.done():
-                watching.result()
-                raise AssertionError('the call finished before reaching the awaited state')
-            await asyncio.sleep(0.01)
+    def reached() -> bool:
+        if predicate():
+            return True
+        if watching is not None and watching.done():
+            watching.result()
+            raise AssertionError('the call finished before reaching the awaited state')
+        return False
+
+    name = getattr(predicate, '__qualname__', repr(predicate))
+    await poll_responsive(reached, timeout=_STATE_WAIT_SECS, label=f'_until({name})')
 
 
 async def _no_sleep(_seconds: float) -> None:
@@ -510,7 +518,9 @@ async def _assert_cancelled_call_unwound(rig: _Rig, before: set[asyncio.Task[Any
     assert rig.local.tasks
     assert all(task is not None and task.done() for task in rig.local.tasks)
     assert rig.local.cancels == [1]
-    await _until(lambda: _pending_tasks() - before == set())
+    test_task = asyncio.current_task()
+    assert test_task is not None
+    await _until(lambda: _pending_tasks(excluding={test_task}) - before == set())
 
 
 def _assert_unwound(rig: _Rig, *, laptop_holders: list[str], local_holders: list[str]) -> None:
