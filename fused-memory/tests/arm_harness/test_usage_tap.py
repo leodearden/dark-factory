@@ -1,12 +1,13 @@
 """The recording reverse proxy between the pinned harness and an arm (arm_harness/usage_tap.py)."""
 
 import http.client
+import io
 import json
 import signal
 import socket
 import threading
 import time
-from contextlib import ExitStack, closing
+from contextlib import ExitStack, closing, redirect_stdout
 from datetime import UTC, datetime, timedelta
 from urllib.parse import urlsplit
 
@@ -253,17 +254,34 @@ def _post_in_background(tap_url: str, statuses: list[int]) -> threading.Thread:
     return client
 
 
+_DRAIN_WAITING = 'usage tap: waiting'
+
+
+class _ReleaseOnceTheDrainWaits(io.StringIO):
+    """Stdout that releases the held upstream once the closing session announces it is draining."""
+
+    def __init__(self, release: threading.Event) -> None:
+        super().__init__()
+        self._release = release
+
+    def write(self, text: str) -> int:
+        written = super().write(text)
+        if _DRAIN_WAITING in self.getvalue():
+            self._release.set()
+        return written
+
+
 def test_closing_a_session_waits_for_a_call_still_in_flight_and_records_it_inside_the_session(
-    tmp_path, capsys
+    tmp_path,
 ):
     log = tmp_path / 'calls.jsonl'
     received, release = threading.Event(), threading.Event()
     statuses: list[int] = []
     with held_upstream(received, release) as upstream:
-        with usage_tap(upstream, log_path=log) as tap_url:
+        stdout = _ReleaseOnceTheDrainWaits(release)
+        with redirect_stdout(stdout), usage_tap(upstream, log_path=log) as tap_url:
             client = _post_in_background(tap_url, statuses)
             assert received.wait(timeout=10)
-            threading.Timer(1.0, release.set).start()
         recorded_at_session_exit = load_call_records(log)
         client.join(timeout=10)
 
@@ -272,8 +290,8 @@ def test_closing_a_session_waits_for_a_call_still_in_flight_and_records_it_insid
     assert record.prompt_tokens == HELD_PROMPT_TOKENS
     assert record.outlived_session is False
     assert statuses == [200]
-    (waiting,) = capsys.readouterr().out.splitlines()
-    assert waiting.startswith('usage tap: waiting')
+    (waiting,) = stdout.getvalue().splitlines()
+    assert waiting.startswith(_DRAIN_WAITING)
     assert '1 in-flight call' in waiting
 
 
