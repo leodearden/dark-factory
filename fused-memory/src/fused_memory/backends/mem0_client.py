@@ -211,9 +211,9 @@ def split_managed_metadata(
 _MEM0_IN_MEMORY_HISTORY_DB = ':memory:'
 
 
-def build_vector_store_client(qdrant_url: str, budget_s: float, *more_s: float) -> QdrantClient:
-    """The sync Qdrant client mem0's vector stores run on, its socket timeout outlasting every budget given."""
-    return QdrantClient(url=qdrant_url, timeout=socket_timeout_outlasting(budget_s, *more_s))
+def build_vector_store_client(qdrant_url: str, *, read_budget_s: float, write_budget_s: float) -> QdrantClient:
+    """The sync Qdrant client mem0's vector stores run on, its socket timeout outlasting both the read and the write budget."""
+    return QdrantClient(url=qdrant_url, timeout=socket_timeout_outlasting(read_budget_s, write_budget_s))
 
 
 class Mem0Backend:
@@ -763,7 +763,9 @@ class Mem0Backend:
         """Get or create the sync Qdrant client every mem0 instance's vector store shares."""
         if self._vector_store_client is None:
             self._vector_store_client = build_vector_store_client(
-                self.config.mem0.qdrant_url, self._read_timeout, self._write_timeout,
+                self.config.mem0.qdrant_url,
+                read_budget_s=self._read_timeout,
+                write_budget_s=self._write_timeout,
             )
         return self._vector_store_client
 
