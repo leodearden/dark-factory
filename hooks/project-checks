@@ -284,10 +284,15 @@ else
             gate_failed=true
         fi
     }
+    gate_interrupted() {
+        trap '' INT TERM HUP
+        gate_stop_units
+        exit "$1"
+    }
     trap 'rm -f "${gate_logs[@]}"' EXIT
-    trap 'trap "" INT TERM HUP; gate_stop_units; exit 130' INT
-    trap 'trap "" INT TERM HUP; gate_stop_units; exit 143' TERM
-    trap 'trap "" INT TERM HUP; gate_stop_units; exit 129' HUP
+    trap 'gate_interrupted 130' INT
+    trap 'gate_interrupted 143' TERM
+    trap 'gate_interrupted 129' HUP
     while IFS=$'\t' read -r unit command; do
         if [ "$((${#gate_pids[@]} - gate_collected))" -ge "$GATE_SLOTS" ]; then
             gate_collect_next
