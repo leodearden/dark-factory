@@ -8729,6 +8729,92 @@ def test_run_census_writes_no_artifact_when_filing_leaves_the_codebook_invalid(t
 
 
 # ---------------------------------------------------------------------------
+# task 7095: a fileable finding whose filing did not land is owed and
+# re-offered. A fresh promotion the dedup store, submit_task or its curator
+# ticket left with no work is marked `filing: owed`, and every later run
+# re-offers it through contract §8 until work is routed.
+# ---------------------------------------------------------------------------
+
+
+def _quiet_run_after(tmp_path, previous, store, **overrides):
+    """The run after *previous*, over its persisted codebook, sighting nothing new."""
+    later = {**_next_run(previous), "task_store": store, **overrides}
+    return _reify_kwargs(tmp_path, later.pop("codebook_dict"), **later)
+
+
+def _answering_submit_fn(ticket):
+    calls = []
+
+    def submit_fn(**kwargs):
+        calls.append(kwargs)
+        return {"ticket": ticket}
+
+    submit_fn.calls = calls
+    return submit_fn
+
+
+def _assert_the_owed_entry_files_once_then_rests(tmp_path, first, **second_overrides):
+    entry_id = _persisted_promoted_entry(first)["id"]
+    second = _quiet_run_after(tmp_path, first, FakeTaskStore(), **second_overrides)
+
+    outcome = _done(census_run.run_census(**second))
+
+    [payload] = second["effects"].submit_fn.calls
+    assert payload["title"] == disposition.task_title(_PROMOTED_TITLE)
+    assert outcome.released_entry_ids == (entry_id,)
+    entry = _persisted_promoted_entry(second)
+    assert entry[codebook.ENTRY_FILING_KEY] == codebook.ENTRY_FILING_FILED
+    [ticket] = outcome.filed_ticket_ids
+    assert ticket in [row["ticket"] for row in entry["filed_tickets"]]
+
+    third = _quiet_run_after(
+        tmp_path, second, FakeTaskStore(),
+        date="2026-07-28", run_id="census-dark_factory-20260728",
+        report_path=tmp_path / "confusion-census-2026-07-28.md",
+    )
+    _done(census_run.run_census(**third))
+    assert third["effects"].submit_fn.calls == []
+
+
+def test_run_census_owes_a_promotion_an_unreachable_store_left_unfiled_and_files_it_next_run(tmp_path):
+    store = task_store.McpTaskStore(url="http://fused-memory.invalid/mcp", post=_unreachable_post("raises"))
+    first = _keyed_kwargs(tmp_path, store)
+
+    census_run.run_census(**first)
+
+    assert first["effects"].submit_fn.calls == []
+    assert _persisted_promoted_entry(first)[codebook.ENTRY_FILING_KEY] == codebook.ENTRY_FILING_OWED
+    _assert_the_owed_entry_files_once_then_rests(tmp_path, first)
+
+
+def test_run_census_owes_a_promotion_whose_submit_failed(tmp_path):
+    first = _keyed_kwargs(tmp_path, FakeTaskStore(), submit_fn=_make_rejecting_submit_fn())
+
+    census_run.run_census(**first)
+
+    assert len(first["effects"].submit_fn.calls) == 1
+    assert _persisted_promoted_entry(first)[codebook.ENTRY_FILING_KEY] == codebook.ENTRY_FILING_OWED
+    _assert_the_owed_entry_files_once_then_rests(tmp_path, first)
+
+
+def test_run_census_owes_a_promotion_whose_ticket_failed(tmp_path):
+    store = FakeTaskStore(resolve_outcomes={
+        "tkt_1": task_store.TicketOutcome(task_store.TicketStatus.FAILED, None, "expired"),
+    })
+    first = _keyed_kwargs(tmp_path, store)
+
+    census_run.run_census(**first)
+
+    entry = _persisted_promoted_entry(first)
+    [row] = entry["filed_tickets"]
+    assert (row["ticket"], row["task_id"], row["resolution"]) == ("tkt_1", None, "failed")
+    assert entry[codebook.ENTRY_FILING_KEY] == codebook.ENTRY_FILING_OWED
+    # Real tickets are unique; a reused tkt_1 would share the failed row's
+    # (ticket, task_id) identity in disposition.with_back_links.
+    _assert_the_owed_entry_files_once_then_rests(tmp_path, first, submit_fn=_answering_submit_fn("tkt_2"))
+
+
+# ---------------------------------------------------------------------------
 # task 6403 step-15: RED — contract §6 (D6): a structural finding is promoted
 # and recorded in the codebook, listed under ## Structural, and NOT filed.
 # ---------------------------------------------------------------------------
@@ -9051,6 +9137,10 @@ def test_run_census_dry_run_with_an_unreachable_store_writes_every_payload(tmp_p
     section = _filed_tasks_text(kwargs)
     assert "_dry-run:" in section
     assert "NOTHING was filed" in section
+    assert all(
+        entry.get(codebook.ENTRY_FILING_KEY) != codebook.ENTRY_FILING_OWED
+        for entry in codebook.load(kwargs["codebook_path"])["entries"]
+    ), "a dry run's payloads file is the hand-filing handle; it owes nothing"
 
 
 # ---------------------------------------------------------------------------
@@ -9737,6 +9827,9 @@ def test_run_census_refiles_again_after_its_superseding_ticket_reached_no_curato
     _override(first, submit_fn=_make_rejecting_submit_fn())
     census_run.run_census(**first)
     assert disposition.FOLLOW_UP not in _persisted_entry_a(first)
+    assert codebook.ENTRY_FILING_KEY not in _persisted_entry_a(first), (
+        "the refiled entry has a task row: L5, not the owed marker, retries it"
+    )
     second = _later_outcome_run(tmp_path, first, "present", FakeTaskStore())
 
     census_run.run_census(**second)
