@@ -240,8 +240,11 @@ fi
 # At most GATE_SLOTS units run at once: a staged shared/ or escalation/ file,
 # or a repo-root module other than conftest.py, lists every module's type
 # check, on a host whose merge verifies already load it. Units are reported
-# in listing order. An interrupt (INT, or TERM sent to this hook alone) stops
-# every running unit's whole process tree; the unit logs go on any exit.
+# in listing order. Each unit runs in its own session, so a terminal Ctrl-C
+# reaches only this hook. An interrupt (INT, or TERM sent to this hook alone)
+# TERMs every unit's whole process group, descendants a dying parent orphaned
+# included, and ignores further INT/TERM while it does. The unit logs go on
+# any exit.
 GATE_SLOTS=4
 gate_start=$SECONDS
 staged="$(cd "$ROOT" && git -c core.quotepath=false diff --cached --no-renames --name-only --diff-filter=ACMRD)" || {
@@ -264,15 +267,10 @@ else
     gate_pids=()
     gate_collected=0
     gate_failed=false
-    gate_process_tree() {
-        local child
-        echo "$1"
-        for child in $(pgrep -P "$1"); do gate_process_tree "$child"; done
-    }
     gate_stop_units() {
-        local job tree=()
-        for job in $(jobs -rp); do tree+=($(gate_process_tree "$job")); done
-        [ "${#tree[@]}" -eq 0 ] || kill -TERM "${tree[@]}" 2>/dev/null
+        local job groups=()
+        for job in $(jobs -p); do groups+=("$job" "-$job"); done
+        [ "${#groups[@]}" -eq 0 ] || kill -TERM -- "${groups[@]}" 2>/dev/null
     }
     gate_collect_next() {
         local i=$gate_collected unit_rc=0
@@ -287,15 +285,15 @@ else
         fi
     }
     trap 'rm -f "${gate_logs[@]}"' EXIT
-    trap 'gate_stop_units; exit 130' INT
-    trap 'gate_stop_units; exit 143' TERM
+    trap 'trap "" INT TERM; gate_stop_units; exit 130' INT
+    trap 'trap "" INT TERM; gate_stop_units; exit 143' TERM
     while IFS=$'\t' read -r unit command; do
         if [ "$((${#gate_pids[@]} - gate_collected))" -ge "$GATE_SLOTS" ]; then
             gate_collect_next
         fi
         log="$(mktemp)"
         echo "  running $unit: $command"
-        (cd "$ROOT" && bash -c "$command") < /dev/null > "$log" 2>&1 &
+        (cd "$ROOT" && exec setsid -w bash -c "$command") < /dev/null > "$log" 2>&1 &
         gate_pids+=("$!")
         gate_units+=("$unit")
         gate_commands+=("$command")
