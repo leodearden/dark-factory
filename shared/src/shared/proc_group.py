@@ -13,10 +13,11 @@ fresh process group).
 
 Usage
 -----
-The pgid MUST be captured by the caller immediately after spawn::
+Spawn through ``spawn_group_leader``, which forces ``start_new_session=True``;
+the pgid MUST be captured by the caller immediately after spawn::
 
-    proc = await asyncio.create_subprocess_exec(
-        *cmd, ..., start_new_session=True,
+    proc = await spawn_group_leader(
+        *cmd, kill_group=lambda proc: terminate_process_group(proc, proc.pid), ...,
     )
     pgid = proc.pid  # start_new_session guarantees pgid == pid at spawn
 
@@ -76,10 +77,10 @@ import os
 import re
 import signal
 import time
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Awaitable, Callable, Iterable, Iterator
 from enum import Enum, auto
 from pathlib import Path
-from typing import NamedTuple, NewType, Protocol
+from typing import Any, NamedTuple, NewType, Protocol
 
 from shared.pidfd import P_PIDFD, PIDFD_SIGNAL_PROCESS_GROUP, pidfd_open, pidfd_send_signal
 
@@ -506,6 +507,48 @@ async def terminate_process_group(
         return
     if await _sigkill_remaining(proc, pgid):
         await _group_terminated_within(proc, pgid, grace_secs)
+
+
+async def spawn_group_leader(
+    *cmd: str,
+    kill_group: Callable[[asyncio.subprocess.Process], Awaitable[None]],
+    **spawn_kwargs: Any,
+) -> asyncio.subprocess.Process:
+    """Spawn *cmd* as the leader of a new session, so its pgid == ``proc.pid``.
+
+    ``start_new_session`` is forced.  asyncio's own cleanup for a spawn interrupted after the fork SIGKILLs only
+    the direct child, then waits with no bound for every pipe to close, which
+    a surviving group member holds open (tasks 6346, 11044).  So the spawn
+    runs shielded: an interrupted spawn is waited out and its Process handed
+    to *kill_group* before the original exception propagates.  A spawn
+    failure never replaces the interruption.
+    """
+    spawn = asyncio.ensure_future(asyncio.create_subprocess_exec(
+        *cmd, start_new_session=True, **spawn_kwargs,
+    ))
+    try:
+        return await asyncio.shield(spawn)
+    except BaseException:
+        proc = await _spawn_outcome(spawn)
+        if proc is not None:
+            await kill_group(proc)
+        raise
+
+
+async def _spawn_outcome(
+    spawn: asyncio.Future[asyncio.subprocess.Process],
+) -> asyncio.subprocess.Process | None:
+    """Wait *spawn* out, absorbing cancellations: its Process, or None if it failed.
+
+    Never raises the spawn's own failure, so it cannot replace the exception
+    that interrupted the caller.
+    """
+    while not spawn.done():
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.wait((spawn,))
+    if spawn.cancelled() or spawn.exception() is not None:
+        return None
+    return spawn.result()
 
 
 class SigkillDispatch(Enum):

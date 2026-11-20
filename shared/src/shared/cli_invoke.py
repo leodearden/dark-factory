@@ -22,7 +22,11 @@ from typing import IO, TYPE_CHECKING, Any, Protocol, TypeGuard, TypeVar
 from shared.claude_endpoint import ClaudeEndpoint
 from shared.claude_executable import ClaudeLaunchSurface, claude_executable, override_var
 from shared.cost_store import CapReason
-from shared.proc_group import snapshot_process_group, terminate_process_group
+from shared.proc_group import (
+    snapshot_process_group,
+    spawn_group_leader,
+    terminate_process_group,
+)
 from shared.process_cost import ProcessCostBasis, derive_process_cost, next_resume_prior
 from shared.secret_env import (
     AGENT_CREDENTIAL_VAR,
@@ -4301,14 +4305,14 @@ async def run_cli_subprocess(
     # stdin_data is None must still yield stdin=None (inherited).
     stdin_file = _materialize_stdin(stdin_data) if stdin_data is not None else None
     try:
-        proc = await asyncio.create_subprocess_exec(
+        proc = await spawn_group_leader(
             *spawn_cmd,
+            kill_group=lambda proc: terminate_process_group(proc, proc.pid, grace_secs=5.0),
             cwd=str(cwd),
             env=spawn_env,
             stdin=stdin_file,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            start_new_session=True,
         )
     finally:
         # Close the parent's handle as soon as the child has its own dup — this
