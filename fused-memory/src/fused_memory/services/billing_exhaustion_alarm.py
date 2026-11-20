@@ -11,6 +11,9 @@ The latch is process-local and flips before the first await, so concurrent
 failures page once. The first successful OpenAI-backed write resolves the
 record, and :meth:`BillingExhaustionAlarm.restore` re-latches onto a record a
 previous process left open, so a restart neither re-pages nor strands it.
+
+:class:`BillingParkPolicy` is the durable queue's side of it: the queue parks
+what the policy names and reports parking and clearing back to the alarm.
 """
 
 from __future__ import annotations
@@ -26,9 +29,11 @@ from fused_memory.middleware._folded_escalation import (
     pending_folded_escalations,
     resolve_folded_escalations,
 )
+from fused_memory.services.durable_queue import ParkedWriteEvent
 from fused_memory.services.provider_billing import (
     BillingExhaustion,
     BillingSource,
+    classify_billing_exhaustion,
     exhaustion_of,
 )
 
@@ -223,3 +228,28 @@ def _detail(latched: BillingAlarmState) -> str:
         'same way. Dead letters filed before parking existed (task 10922) stay '
         'replayable with replay_dead_letters once credits are restored.',
     ])
+
+
+class BillingParkPolicy:
+    """Parks the durable writes a provider refuses for exhausted billing.
+
+    Satisfies ``durable_queue.py::ParkPolicy``; a parked write that lands is
+    the recovery evidence.
+    """
+
+    def __init__(self, alarm: BillingExhaustionAlarm) -> None:
+        self._alarm = alarm
+
+    def park_reason(self, exc: BaseException) -> str | None:
+        exhaustion = classify_billing_exhaustion(exc)
+        if exhaustion is None:
+            return None
+        return f'{exhaustion.provider} {exhaustion.source.value} exhausted (insufficient_quota)'
+
+    async def on_parked(self, event: ParkedWriteEvent) -> None:
+        exhaustion = classify_billing_exhaustion(event.exc)
+        if exhaustion is not None:
+            await self._alarm.record_exhausted(exhaustion, site=f'durable_queue:{event.operation}')
+
+    async def on_cleared(self) -> None:
+        await self._alarm.record_recovered(site='durable_queue')

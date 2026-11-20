@@ -116,6 +116,10 @@ from fused_memory.routing.classifier import WriteClassifier
 from fused_memory.routing.router import ReadRouter
 from fused_memory.services import mem0_retry_backlog_alarm, mem0_write_retry, overreach_guard
 from fused_memory.services.agent_project_storm_counters import AgentProjectStormCounters
+from fused_memory.services.billing_exhaustion_alarm import (
+    BillingExhaustionAlarm,
+    BillingParkPolicy,
+)
 from fused_memory.services.classification_fallback_alarm import (
     ClassificationFallbackAlarm,
     journal_params,
@@ -2170,6 +2174,9 @@ class MemoryService:
         self.classifier = WriteClassifier(config)
         self.router = ReadRouter(config)
         self.durable_queue: DurableWriteQueue | None = None
+        self._billing_alarm = BillingExhaustionAlarm(
+            resolve_project_root=lambda: configured_primary_root(self.config.taskmaster) or None,
+        )
         self._event_buffer: EventBuffer | None = None
         self._write_journal: WriteJournal | None = None
         self.taskmaster: TaskBackendProtocol | None = None
@@ -2446,6 +2453,7 @@ class MemoryService:
         except Exception:
             logger.warning('overreach shadow failed to open; running without it', exc_info=True)
 
+        await self._billing_alarm.restore()
         self.durable_queue = DurableWriteQueue(
             data_dir=qcfg.data_dir,
             execute_write=self._execute_durable_write,
@@ -2459,6 +2467,7 @@ class MemoryService:
             transient_error_names=qcfg.transient_error_names,
             on_terminal=self._record_queue_terminal_outcome,
             on_dead_letter=self._report_queue_dead_letter,
+            park_policy=BillingParkPolicy(self._billing_alarm),
         )
         self.durable_queue.register_callback(
             QueueCallback.DUAL_WRITE_EPISODE, self._dual_write_callback
