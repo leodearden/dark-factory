@@ -33,6 +33,24 @@ import pytest
 if TYPE_CHECKING:
     import socket
 
+# Suite-wide git isolation (task 3355, incident esc-3072-3).  The verify lane
+# runs `cd escalation && uv run pytest tests/`, which makes rootdir the
+# SUBPROJECT — the repo-root conftest.py is never loaded, so each test-root
+# conftest wires the defence itself.  APPEND the repo root, never insert(0, ...):
+# at sys.path[0] it would make the subproject directories resolve as namespace
+# packages pointing at the project folder instead of src/<pkg>/, beating the
+# inserts below.  df_pytest_isolation is stdlib + pytest only, so it imports
+# cleanly ahead of the stubbing block in this venv, which deliberately excludes
+# aiosqlite.
+if str(REPO_ROOT := Path(__file__).resolve().parents[2]) not in sys.path:
+    sys.path.append(str(REPO_ROOT))
+
+from df_pytest_isolation import (
+    arm_leaked_drain_process_guard,
+    arm_test_root_isolation,
+    reject_unsafe_basetemp,
+)
+
 _SRC = Path(__file__).parent.parent / 'src'
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
@@ -49,7 +67,7 @@ if str(_SRC) not in sys.path:
 # (`_SUBPROJECTS_WITH_CONFTEST`), which also fixes the spelling.
 #
 # Note this is `insert(0, ...)`, deliberately unlike the `REPO_ROOT` *append*
-# lower in this file: a tests dir contributes no package-shadowing directories,
+# higher in this file: a tests dir contributes no package-shadowing directories,
 # and `insert(0, ...)` is the spelling the enforcing test requires.
 _TESTS_DIR = Path(__file__).parent
 if str(_TESTS_DIR) not in sys.path:
@@ -131,33 +149,11 @@ if _SHARED_SRC.is_dir() and _ORCH_SRC.is_dir():
 # mode.  `scripts/tests/conftest.py` inserts it because every test in that
 # directory needs those modules; here exactly one does.
 
-# Suite-wide git isolation (task 3355, incident esc-3072-3).  The verify lane
-# runs `cd escalation && uv run pytest tests/`, which makes rootdir the
-# SUBPROJECT — the repo-root conftest.py is never loaded, so each test-root
-# conftest wires the defence itself.  APPEND the repo root, never insert(0, ...):
-# at sys.path[0] it would make the subproject directories resolve as namespace
-# packages pointing at the project folder instead of src/<pkg>/, beating the
-# inserts above.  Placed after the stubbing block to keep that contiguous;
-# df_pytest_isolation is stdlib + pytest only, so it imports cleanly in this
-# venv, which deliberately excludes aiosqlite.
-REPO_ROOT = Path(__file__).resolve().parents[2]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.append(str(REPO_ROOT))
-
-from df_pytest_isolation import (  # noqa: E402
-    _df_claude_binary_unset,  # noqa: F401  — the binding IS the wiring  # debt: task 6997
-    _df_deploy_clocks_unwritten,  # noqa: F401  — the binding IS the wiring
-    _df_git_ceiling_at_basetemp,  # noqa: F401  — the binding IS the wiring
-    _df_git_env_hermetic,  # noqa: F401  — the binding IS the wiring
-    _df_no_mock_derived_stray_dirs,  # noqa: F401  — the binding IS the wiring  # debt: task 6997
-    arm_leaked_drain_process_guard,
-    reject_unsafe_basetemp,
-)
-
 
 def pytest_configure(config):
-    """Refuse a --basetemp aimed inside a live task worktree (esc-3072-3); arm the drain-leak guard."""
+    """Refuse a --basetemp aimed inside a live task worktree (esc-3072-3); arm the suite-wide defences."""
     reject_unsafe_basetemp(config)
+    arm_test_root_isolation(config)
     arm_leaked_drain_process_guard(config)
 
 

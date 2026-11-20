@@ -31,31 +31,21 @@ import dataclasses
 import os
 import signal
 import subprocess
-import sys
 import time
 import warnings
 from collections.abc import Callable, Mapping
 from pathlib import Path
 
 import pytest
-from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
-
-REPO_ROOT = Path(__file__).resolve().parents[2]
-# APPEND, never insert(0, ...): the repo root must stay LAST on sys.path or the
-# subproject directories (orchestrator/, shared/, ...) resolve as namespace
-# packages shadowing their own src/<pkg>/ — the failure the root conftest.py
-# docstring exists to prevent.
-if str(REPO_ROOT) not in sys.path:
-    sys.path.append(str(REPO_ROOT))
-
-from nested_pytest_session import (  # noqa: E402
+from nested_pytest_session import (
     NESTED_SESSION_TIMEOUT_SECS,
-    binding_conftest,
+    arming_conftest,
     run_nested_pytest,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
-import df_pytest_isolation  # noqa: E402
-from df_pytest_isolation import (  # noqa: E402
+import df_pytest_isolation
+from df_pytest_isolation import (
     DRAIN_SCRIPT_CMDLINE_MARKER,
     LEAK_SELF_TERMINATION_CEILING_SECS,
     LEAK_TOKEN_ENV,
@@ -1081,21 +1071,21 @@ class TestGuardIsLiveInThisRun:
         assert marker.autouse is True, 'the guard must be autouse — nothing requests it'
 
     def test_the_guard_fixture_is_registered_in_this_run(self, request) -> None:
-        """The conftest binding is real WIRING, not a dormant definition.
+        """The conftest's arm call is real WIRING, not a dormant definition.
 
-        pytest only collects fixtures bound into a conftest's namespace, which
-        is why df_pytest_isolation's fixtures are imported there under
-        ``# noqa: F401 — the binding IS the wiring``. Deleting that import
-        breaks nothing visible except this assertion.
+        pytest only collects fixtures a plugin or conftest registers, which is
+        why each test-root conftest calls ``arm_leaked_drain_process_guard(config)`` from its
+        ``pytest_configure``. Deleting that call breaks nothing visible except
+        this assertion.
         """
         try:
             request.getfixturevalue(_GUARD_NAME)
         except pytest.FixtureLookupError:
             pytest.fail(
-                f'{_GUARD_NAME} is not registered for this rootdir. Wire the '
-                'test-root conftest to import it from df_pytest_isolation '
-                '(`# noqa: F401 — the binding IS the wiring`); without that, '
-                'this whole suite runs with no leaked-drain-process guard.',
+                f'{_GUARD_NAME} is not registered for this rootdir. Call '
+                'arm_leaked_drain_process_guard(config) from the test-root '
+                'conftest\'s pytest_configure; without that, this whole suite runs '
+                'with no leaked-drain-process guard.',
                 pytrace=False,
             )
 
@@ -1229,7 +1219,7 @@ def _nested_run(
     leaking test spawns.
     """
     return run_nested_pytest(root, {
-        'conftest.py': binding_conftest(_GUARD_NAME),
+        'conftest.py': arming_conftest(_GUARD_NAME),
         _LEAKER_NAME: _NESTED_LEAKER,
         'test_forgetful.py': _nested_test_source(leaks=leaks, entrypoint=entrypoint),
         **(extra_files or {}),

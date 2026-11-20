@@ -19,10 +19,8 @@ from pathlib import Path
 
 import pytest
 from _fm_falkor_live import FALKOR_HOST, FALKOR_PORT, falkor_skipif
-from _fm_helpers import (
-    lease_dir_fixture,  # noqa: F401  # debt: task 6997
-    load_script_module,
-)
+from _fm_helpers import lease_dir_fixture as lease_dir_fixture
+from _fm_helpers import load_script_module
 from _fm_qdrant_live import QDRANT_URL, qdrant_skipif
 from _fm_sockets import has_pending_connection, refused_port, silent_listener
 from shared.lane_probe import OUTAGE_EXIT_STATUS
