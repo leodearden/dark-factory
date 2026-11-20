@@ -377,6 +377,7 @@ def _measured_merge_queue(depth: int) -> dict:
         'active': [],
         'in_queue': Datum(0, _NOW, DatumState.FRESH, None, 30),
         'live_probe_configured': True,
+        'runs_db_present': True,
         'speculative': Datum(
             {'hit_count': 0, 'discard_count': 0, 'total': 0, 'hit_rate': None},
             _NOW, DatumState.FRESH, None, 30,

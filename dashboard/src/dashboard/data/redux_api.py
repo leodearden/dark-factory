@@ -557,9 +557,11 @@ def shape_merge_queue(
     ``recent`` is capped), ``speculative``, ``active`` (the live probe's
     entries), ``in_queue``, ``live_probe_configured`` (false keeps the
     project out of the client's multi-project in-queue totals),
-    ``active_spark``, ``halt``, ``train_events``, ``train_throughput``.
-    ``depth``, ``attempts``, ``in_queue``, ``speculative``, ``recent_total``,
-    ``train_throughput`` and ``live_probe_configured`` are required: the
+    ``runs_db_present`` (false keeps the project out of the client's runs.db
+    totals), ``active_spark``, ``halt``, ``train_events``,
+    ``train_throughput``. ``depth``, ``attempts``, ``in_queue``,
+    ``speculative``, ``recent_total``, ``train_throughput``,
+    ``live_probe_configured`` and ``runs_db_present`` are required: the
     route resolves them for every project.
 
     ``depth``, ``attempts``, ``in_queue``, ``speculative``, ``recent_total``,
@@ -603,6 +605,7 @@ def shape_merge_queue(
             'active': _titled(data.get('active'), f'{label}.active'),
             'in_queue': _served(data.get('in_queue'), f'{label}.in_queue'),
             'live_probe_configured': bool(data['live_probe_configured']),
+            'runs_db_present': bool(data['runs_db_present']),
             'active_spark': {
                 'labels': list(spark.get('labels') or []),
                 'values': list(spark.get('values') or []),
@@ -1064,7 +1067,7 @@ def shape_burndown(
     UNKNOWN.  The aggregate is as of its OLDEST contribution, STALE when any
     project is carried or the newest sample is past the bound, and a
     LOWER_BOUND when a listed project has nothing measured —
-    ``static/redux/datum.js::combinedDatum``'s rules, applied where the
+    ``static/redux/datum.js::lowerBoundCombinedDatum``'s rules, applied where the
     aggregate is built.  A forecast absent for want of 7 days of history is
     UNKNOWN.  Every reason is built from the data alone, so shaping one
     series at two instants past the bound gives one payload.
@@ -1242,7 +1245,7 @@ def _burndown_provenance(
 def _aggregate_provenance(
     as_of: datetime, carried: Mapping[str, str], unmeasured: list[str], age_reason: str | None,
 ) -> _Provenance:
-    """The total's provenance by ``static/redux/datum.js::combinedDatum``'s rules.
+    """The total's provenance by ``static/redux/datum.js::lowerBoundCombinedDatum``'s rules.
 
     As of the oldest contribution; LOWER_BOUND over STALE over FRESH; one
     reason part per carried or unmeasured project, and one for the newest
