@@ -27,6 +27,7 @@ class Transition(enum.StrEnum):
     REOPEN = "reopen"
     WITHHOLD = "withhold"
     FILE = "file"
+    OWE = "owe"
 
 
 @dataclass(frozen=True)
@@ -55,8 +56,14 @@ TABLE: Mapping[Transition, Rule] = MappingProxyType({
     Transition.FILE: Rule(
         "entry",
         codebook.ENTRY_FILING_KEY,
-        frozenset({codebook.ENTRY_FILING_WITHHELD}),
+        frozenset({codebook.ENTRY_FILING_WITHHELD, codebook.ENTRY_FILING_OWED}),
         codebook.ENTRY_FILING_FILED,
+    ),
+    Transition.OWE: Rule(
+        "entry",
+        codebook.ENTRY_FILING_KEY,
+        frozenset({None, codebook.ENTRY_FILING_FILED}),
+        codebook.ENTRY_FILING_OWED,
     ),
 })
 
@@ -140,10 +147,21 @@ def retire_entry(cb: dict, entry_id: str) -> dict:
 
 
 def mark_entry_filed(cb: dict, entry_id: str) -> dict:
-    """A new codebook in which withheld entry *entry_id* is marked filed."""
+    """A new codebook in which withheld or owed entry *entry_id* is marked filed."""
     result = copy.deepcopy(cb)
     entry = codebook.record_by_id(result.get("entries") or [], entry_id, kind="entry")
     transit(entry, Transition.FILE)
+
+    codebook.assert_no_deletion(cb, result)
+    return result
+
+
+def mark_entry_owed(cb: dict, entry_id: str) -> dict:
+    """A new codebook in which entry *entry_id*, whose filing did not land, is
+    marked owed."""
+    result = copy.deepcopy(cb)
+    entry = codebook.record_by_id(result.get("entries") or [], entry_id, kind="entry")
+    transit(entry, Transition.OWE)
 
     codebook.assert_no_deletion(cb, result)
     return result
