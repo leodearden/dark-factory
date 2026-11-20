@@ -75,16 +75,24 @@ def _scoring_inputs() -> dict[str, Any]:
     return {key: value for key, value in _inputs().items() if key != 'labels'}
 
 
-def _committed_arm_names() -> list[str]:
-    return list(_report()['arm_order'])
+def _committed_lever_arm_names() -> list[str]:
+    """Every scored arm but the baseline, which the whole-report test re-scores."""
+    report = _report()
+    return [name for name in report['arm_order'] if name != report['baseline']]
+
+
+def _as_json(value: Any) -> Any:
+    return json.loads(json.dumps(value, sort_keys=True))
 
 
 class TestTheCommittedLeverReport:
     """Re-scoring reproduces the committed report, one arm per test.
 
     Each arm costs one or two full ``score_reader`` passes, so the arms are
-    split across tests to spread them over workers. Together the tests
-    re-derive every key of the report.
+    split across tests to spread them over workers, and none is scored
+    twice: the whole-report test scores the baseline arm along with the soak,
+    and the per-arm test takes every other arm. Together the tests re-derive
+    every key of the report.
     """
 
     def test_the_report_holds_exactly_the_tested_parts(self) -> None:
@@ -95,7 +103,7 @@ class TestTheCommittedLeverReport:
         }
         assert sorted(report['arm_order']) == sorted(report['arms'])
 
-    def test_everything_but_the_arms_reproduces(self) -> None:
+    def test_everything_but_the_lever_arms_reproduces(self) -> None:
         report = _report()
         baseline = report['baseline']
         rescored = _mod().build_report(
@@ -106,14 +114,17 @@ class TestTheCommittedLeverReport:
         )
         for key in set(report) - {'arms', 'arm_order'}:
             assert rescored[key] == report[key], key
+        assert _as_json(rescored['arms'][baseline]) == _as_json(report['arms'][baseline])
 
-    @pytest.mark.parametrize('name', _committed_arm_names() if REPORT.exists() else ['missing'])
-    def test_each_arm_reproduces(self, name: str) -> None:
+    @pytest.mark.parametrize(
+        'name', _committed_lever_arm_names() if REPORT.exists() else ['missing'],
+    )
+    def test_each_lever_arm_reproduces(self, name: str) -> None:
         report = _report()
-        baseline = report['baseline']
-        rescored = _mod().arm_report(name, _scored_arms(), baseline=baseline, **_scoring_inputs())
-        committed = json.loads(json.dumps(report['arms'][name]))
-        assert json.loads(json.dumps(rescored, sort_keys=True)) == committed
+        rescored = _mod().arm_report(
+            name, _scored_arms(), baseline=report['baseline'], **_scoring_inputs(),
+        )
+        assert _as_json(rescored) == _as_json(report['arms'][name])
 
     def test_the_markdown_is_the_rendered_report(self) -> None:
         rendered = _mod().render_markdown(_report())
