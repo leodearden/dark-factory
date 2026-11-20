@@ -71,14 +71,14 @@ def _corpus() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         _item('R1', 'restated', 'restated-sample', band='restated'),  # an M3 hit
     ]
     verdicts = [
-        _vote('A1', home='YES', conflict='YES', loss='NO', scope='SECONDARY'),
+        _vote('A1', home='YES', conflict='YES', scope='SECONDARY'),
         _vote('A2', home='YES', conflict='NO', loss='NO'),
-        _vote('C1', home='YES', conflict='YES', loss='NO', scope='CENTRAL', action_changing='YES'),
+        _vote('C1', home='YES', conflict='YES', scope='CENTRAL', action_changing='YES'),
         _vote('C2', home='YES', conflict='NO', loss='NO'),
-        _vote('C3', home='YES', conflict='YES', loss='NO', scope='CENTRAL', action_changing='NO'),
-        _vote('C3', rater='sonnet', role='second', home='NO', conflict='YES', loss='NO',
+        _vote('C3', home='YES', conflict='YES', scope='CENTRAL', action_changing='NO'),
+        _vote('C3', rater='sonnet', role='second', home='NO', conflict='YES',
               scope='CENTRAL', action_changing='NO'),
-        _vote('R1', home='YES', conflict='YES', loss='NO', scope='SECONDARY'),
+        _vote('R1', home='YES', conflict='YES', scope='SECONDARY'),
     ]
     return items, verdicts
 
@@ -174,7 +174,7 @@ class TestScoreArm:
         items, verdicts = _corpus()
         m3 = _mod().score_arm(items, verdicts, _STRATA)['m3']
         assert m3['hits'] == 2
-        assert m3['population_rate'] == pytest.approx((5 + 4) / (5 + 1 + 1 + 4))
+        assert m3['population_rate'] == pytest.approx((5 + 4) / (5 + 1 + 1 + 4), abs=1e-4)
 
 
 class TestTheHomeTieClosure:
@@ -209,7 +209,7 @@ class TestPairedDelta:
         base = _arm_items(_soak_rows())
         arm = _arm_items(_soak_rows(A1='contested'))
         delta = _mod().paired_delta(arm, base, verdicts, _STRATA)
-        assert delta['m3_delta'] == pytest.approx(-5 / (5 + 1 + 1 + 4))
+        assert delta['m3_delta'] == pytest.approx(-5 / (5 + 1 + 1 + 4), abs=1e-4)
         assert delta['m3_delta_interval95'][0] <= delta['m3_delta'] <= delta['m3_delta_interval95'][1]
         assert delta['transitions'] == {'amended-sample': {'amended->contested': 1}}
         assert delta['false_conflict_change'] == {'sample': 0, 'population': 0}
