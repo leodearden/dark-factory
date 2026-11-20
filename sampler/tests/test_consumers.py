@@ -25,6 +25,8 @@ from sampler.consumers import (
 
 _USER = ('user.slice', 'user-1000.slice', 'user@1000.service')
 _UUID = '5ea08a53433a'
+_GOVERNED = 'df.slice/df-reify.slice/df-reify-governed.slice'
+_GOVERNED_AGENTS = f'{_GOVERNED}/df-reify-governed-agents.slice'
 
 
 def _u(path: str) -> tuple[str, ...]:
@@ -123,6 +125,8 @@ class TestLeafRules:
                 'df.slice/df-dark_factory.slice/orchestrator-dark-factory.service/agent-1',
                 _c(Role.AGENTS, 'df-dark_factory.slice'),
             ),
+            (f'{_GOVERNED}/orchestrator-reify.service/daemon', _c(Role.SERVICE, 'df-reify.slice')),
+            (f'{_GOVERNED}/orchestrator-reify.service/agent-3', _c(Role.AGENTS, 'df-reify.slice')),
         ],
     )
     def test_rule_1_orchestrator_service(self, path, consumer):
@@ -152,6 +156,8 @@ class TestLeafRules:
                 'reify.slice/reify-governed.slice/reify-governed-agents.slice',
                 _c(Role.PROJECT, 'reify.slice'),
             ),
+            (_GOVERNED_AGENTS, _c(Role.PROJECT, 'df-reify.slice')),
+            (f'{_GOVERNED_AGENTS}/x.scope', _c(Role.PROJECT, 'df-reify.slice')),
         ],
     )
     def test_rule_3_project_slice(self, path, consumer):
@@ -231,6 +237,9 @@ class TestResidualRules:
             (_u('df.slice/df-x.slice'), _c(Role.PROJECT, 'df-x.slice')),
             (_u('reify.slice'), _c(Role.PROJECT, 'reify.slice')),
             (_u('reify.slice/reify-governed.slice'), _c(Role.PROJECT, 'reify.slice')),
+            (_u(_GOVERNED), _c(Role.PROJECT, 'df-reify.slice')),
+            (_u(_GOVERNED_AGENTS), _c(Role.PROJECT, 'df-reify.slice')),
+            (_u(f'{_GOVERNED}/orchestrator-reify.service'), _c(Role.AGENTS, 'df-reify.slice')),
             ((), _c(Role.KERNEL)),
             (_u('app.slice/app-t3code.slice'), _c(Role.INTERACTIVE, 't3code')),
             (_u('df.slice'), _c(Role.EXITED, 'user@1000.service')),
@@ -244,6 +253,16 @@ class TestResidualRules:
     )
     def test_residual_order(self, segments, consumer):
         assert classify_residual(segments) == consumer
+
+    def test_a_governed_cgroup_keeps_its_project_key_when_it_gains_a_child(self):
+        path = _u(_GOVERNED_AGENTS)
+        project_depth = path.index('df-reify.slice') + 1
+        prefixes = [path[:depth] for depth in range(project_depth, len(path) + 1)]
+
+        assert len(prefixes) == 3
+        for prefix in prefixes:
+            assert classify_member(prefix) == _c(Role.PROJECT, 'df-reify.slice'), prefix
+            assert classify_residual(prefix) == _c(Role.PROJECT, 'df-reify.slice'), prefix
 
 
 # ---------------------------------------------------------------------------

@@ -15,6 +15,7 @@ from sampler.consumers import (
     Figure,
     TreeState,
     account,
+    encode_consumer,
     parse_consumer,
     read_tree,
 )
@@ -258,6 +259,44 @@ class TestBothVerifyPlacements:
         assert _increment(second, 'verify@proj-1234abcd', Figure.CPU_USEC) == 6 * _S
         assert _figures(second, 'project@df-x.slice').members == 0
         assert _increment(second, 'project@df-x.slice', Figure.CPU_USEC) == 1 * _S
+
+
+class TestGovernedSubSlicesFoldIntoTheProject:
+    _PROJECT = 'df.slice/df-reify.slice'
+    _GOVERNED = f'{_PROJECT}/df-reify-governed.slice'
+    _AGENTS = f'{_GOVERNED}/df-reify-governed-agents.slice'
+
+    @staticmethod
+    def _assert_no_sub_slice_key(accounting: Accounting) -> None:
+        for consumer in accounting.per_consumer:
+            assert 'df-reify-governed' not in encode_consumer(consumer), consumer
+
+    def _set_levels(self, tree: CgroupTree, cpu_seconds: tuple[int, int, int, int]) -> None:
+        df, project, governed, agents = cpu_seconds
+        tree.set('df.slice', memory=1_000, cpu_usec=df * _S)
+        tree.set(self._PROJECT, memory=800, cpu_usec=project * _S)
+        tree.set(self._GOVERNED, memory=600, cpu_usec=governed * _S)
+        tree.set(self._AGENTS, memory=400, cpu_usec=agents * _S)
+
+    def test_every_level_lands_on_the_one_project_key_with_or_without_a_child(self, tree):
+        self._set_levels(tree, (100, 80, 60, 40))
+        first = _first(tree)
+        self._assert_no_sub_slice_key(first)
+        assert _figures(first, 'project@df-reify.slice').gauges[Figure.MEMORY] == 800
+
+        self._set_levels(tree, (110, 88, 66, 44))
+        second = _next(tree, first)
+        self._assert_no_sub_slice_key(second)
+        assert _figures(second, 'project@df-reify.slice').gauges[Figure.MEMORY] == 800
+        assert _increment(second, 'project@df-reify.slice', Figure.CPU_USEC) == 8 * _S
+
+        tree.set(f'{self._AGENTS}/x.scope', memory=100, cpu_usec=2 * _S)
+        self._set_levels(tree, (116, 93, 70, 47))
+        third = _next(tree, second, seconds=2 * _INTERVAL)
+        self._assert_no_sub_slice_key(third)
+        assert _figures(third, 'project@df-reify.slice').gauges[Figure.MEMORY] == 800
+        assert _increment(third, 'project@df-reify.slice', Figure.CPU_USEC) == 5 * _S
+        _no_negative(third)
 
 
 class TestAnUnreadableInnerCgroup:
