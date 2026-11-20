@@ -18,6 +18,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from _fm_helpers import make_insufficient_quota_error
 from shared.project_layout import escalation_queue_dir
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.middleware import _folded_escalation
 from fused_memory.services.billing_exhaustion_alarm import BillingExhaustionAlarm
@@ -26,10 +27,13 @@ from fused_memory.services.provider_billing import (
     classify_billing_exhaustion,
 )
 
-pytestmark = pytest.mark.skipif(
-    not _folded_escalation.HAS_ESCALATION,
-    reason='escalation package unavailable (minimal env)',
-)
+pytestmark = [
+    pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT),
+    pytest.mark.skipif(
+        not _folded_escalation.HAS_ESCALATION,
+        reason='escalation package unavailable (minimal env)',
+    ),
+]
 
 _FIRST_SEEN = datetime(2026, 11, 19, 6, 50, tzinfo=UTC)
 
