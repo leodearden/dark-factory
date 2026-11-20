@@ -300,14 +300,24 @@ def _terminate_the_hook(git_pid: int) -> None:
     os.kill(_hook_pid(git_pid), signal.SIGTERM)
 
 
+def _hang_up(git_pid: int) -> None:
+    os.killpg(git_pid, signal.SIGHUP)
+
+
 @pytest.mark.parametrize(
     ('unit_prelude', 'unit_tail', 'interrupt'),
     [
         ("trap '' INT; ", '; true', _ctrl_c),
         ('', '; true', _terminate_the_hook),
         ("trap '' INT; ", ' & exec sleep 300', _ctrl_c),
+        ('', '; true', _hang_up),
     ],
-    ids=['ctrl-c-with-a-sigint-immune-unit', 'sigterm-to-the-hook-alone', 'ctrl-c-that-kills-the-unit-shell'],
+    ids=[
+        'ctrl-c-with-a-sigint-immune-unit',
+        'sigterm-to-the-hook-alone',
+        'ctrl-c-that-kills-the-unit-shell',
+        'sighup-to-the-commit',
+    ],
 )
 def test_an_interrupted_commit_stops_its_units_and_removes_their_logs(
     tmp_path: Path, unit_prelude: str, unit_tail: str, interrupt: Callable[[int], None],
