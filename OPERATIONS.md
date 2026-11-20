@@ -5992,6 +5992,15 @@ deletes only what it has made durable. The three sites are
 `TaskWorkflow._cleanup_config_dir`, `_recycle_config_dir`, and the
 `GitOps.cleanup_worktree` backstop.
 
+Reconciliation runs are covered too (task 3972):
+`fused-memory/src/fused_memory/reconciliation/cli_stage_runner.py::gc_run_config_dir`
+archives each recon stage transcript to
+`data/orchestrator/agent-transcripts/recon-<run_id>/<enc>/<sid>.jsonl` before it
+removes `data/reconciliation/recon-config/claude-config-<run_id>/`, unless
+`transcript_archive_enabled` is off. To list a day's archived runs, use
+`python scripts/legibility/inventory.py --cwd-prefix <root> --date <d> --agent-transcript-root data/orchestrator/agent-transcripts`;
+each line's path names its `recon-<run_id>`.
+
 The call is **synchronous** on purpose. It used to be
 `await asyncio.to_thread(...)`, which meant a SIGTERM arriving mid-teardown
 cancelled the archive and destroyed the transcript anyway — the failure this

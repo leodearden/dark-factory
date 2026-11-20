@@ -21,6 +21,9 @@ escalation_port: 8102
 # reify adds warm-lane + worktree roots; the inventory pre-filters
 # ~/.claude/projects encoded dir names by these prefixes (57 encodings for
 # dark-factory today: main checkout + .worktrees/.claude-worktrees children).
+# Each encoded dir's <sid>.jsonl and its sub-agents' <sid>/subagents/agent-*.jsonl
+# are enumerated; a sub-agent is its own session, keyed
+# <parent sid>/subagents/agent-<agentId> (scripts/legibility/inventory.py::TranscriptIdentity).
 cwd_prefixes:
   - /home/leo/src/dark-factory
 # Additional archive roots the miner enumerates ALONGSIDE ~/.claude/projects:
