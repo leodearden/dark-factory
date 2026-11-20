@@ -943,13 +943,12 @@ def soon() -> datetime:
 class TestTransitionsWakeTheWait:
     """PRD §6.3: another account opening, or the reserve failing, wakes a reserve wait."""
 
+    @virtual_clock_test
     async def test_b7_another_account_reopening_serves_the_waiter(self, tmp_path: Path) -> None:
         store = make_mock_cost_store()
-        gate = make_reserve_gate(
-            tmp_path, clock=FakeClock(), cost_store=store, wait_for_reset=True
-        )
+        gate = make_reopening_gate(tmp_path, 'max-d', cost_store=store)
         cap_all_but(gate, 'max-d', RESERVE)
-        cap(gate, 'max-d', resets_at=soon())
+        cap(gate, 'max-d')
 
         waiter = asyncio.create_task(gate.before_invoke(work_class=LOW))
         await let_run()
