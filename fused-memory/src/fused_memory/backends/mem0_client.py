@@ -211,14 +211,9 @@ def split_managed_metadata(
 _MEM0_IN_MEMORY_HISTORY_DB = ':memory:'
 
 
-def build_vector_store_client(config: FusedMemoryConfig) -> QdrantClient:
-    """The sync Qdrant client mem0's vector stores run on, its socket timeout outlasting both backend budgets."""
-    return QdrantClient(
-        url=config.mem0.qdrant_url,
-        timeout=socket_timeout_outlasting(
-            config.queue.backend_read_timeout_seconds, config.queue.backend_write_timeout_seconds,
-        ),
-    )
+def build_vector_store_client(qdrant_url: str, budget_s: float, *more_s: float) -> QdrantClient:
+    """The sync Qdrant client mem0's vector stores run on, its socket timeout outlasting every budget given."""
+    return QdrantClient(url=qdrant_url, timeout=socket_timeout_outlasting(budget_s, *more_s))
 
 
 class Mem0Backend:
@@ -246,8 +241,8 @@ class Mem0Backend:
     message format.  mem0's instance construction (its collection listing and
     payload-index creates) runs off the event loop under the write budget as
     ``create_instance``, and the Qdrant client mem0's vector store uses is this
-    backend's own, built by :func:`build_vector_store_client`, which derives its
-    socket timeout from ``socket_timeout_outlasting`` over both budgets, so a
+    backend's own, built by :func:`build_vector_store_client` from the very
+    budgets :meth:`_timed_read` / :meth:`_timed_write` apply, so a
     slow mem0 leg fails on its named budget
     (tests/test_mem0_vector_store_client.py).  The one exception left: the
     direct async client's socket timeout is still the read budget, so its
@@ -767,7 +762,9 @@ class Mem0Backend:
     def _get_vector_store_client(self) -> QdrantClient:
         """Get or create the sync Qdrant client every mem0 instance's vector store shares."""
         if self._vector_store_client is None:
-            self._vector_store_client = build_vector_store_client(self.config)
+            self._vector_store_client = build_vector_store_client(
+                self.config.mem0.qdrant_url, self._read_timeout, self._write_timeout,
+            )
         return self._vector_store_client
 
     async def _get_async_qdrant(self):

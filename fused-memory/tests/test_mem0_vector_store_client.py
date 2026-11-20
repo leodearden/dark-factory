@@ -155,11 +155,9 @@ async def test_a_first_touch_overrunning_its_write_budget_raises_a_timeout_namin
     [pytest.param(1.0, 30.0, id='read-narrower'), pytest.param(30.0, 1.0, id='write-narrower')],
 )
 def test_the_vector_store_client_outlasts_whichever_budget_is_wider(
-    config, target, default_read, read_budget, write_budget,
+    target, default_read, read_budget, write_budget,
 ):
-    config.queue.backend_read_timeout_seconds = read_budget
-    config.queue.backend_write_timeout_seconds = write_budget
     with stub_qdrant_server(retrieve_delay_s={target: default_read + 0.5}) as stub:
-        config.mem0.qdrant_url = stub.url
-        with contextlib.closing(mem0_client.build_vector_store_client(config)) as client:
+        client = mem0_client.build_vector_store_client(stub.url, read_budget, write_budget)
+        with contextlib.closing(client):
             assert client.retrieve(collection_name=target, ids=[MEMORY_ID]) == []
