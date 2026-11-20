@@ -13,7 +13,10 @@ root is ``()``. Verify scopes are recognised only through
 ``shared.cgroup_slice``, besides reify's legacy ``reify.slice``.
 
 D3: ``read_tree`` reads the whole tree post-order (children before their
-parent, so hierarchical counter skew is mostly non-negative), and ``account``
+parent, so hierarchical counter skew is mostly non-negative); a cgroup that
+exits between its listing and its reading is dropped with its subtree, as if
+never listed. ``read_cgroups`` lists the same tree but reads only the cgroups
+its caller selects. ``account``
 turns two collections into per-consumer figures. Gauges are summed over
 members and residuals; counters become increments over the interval by
 ``sampler.increments``' rules, kept per cgroup by path and inode in a
@@ -31,7 +34,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from enum import Enum, StrEnum, auto
 from pathlib import Path
@@ -68,6 +71,7 @@ __all__ = [
     'classify_residual',
     'encode_consumer',
     'parse_consumer',
+    'read_cgroups',
     'read_tree',
 ]
 
@@ -390,6 +394,30 @@ class TreeReading:
 
 
 _LISTING = '.'
+_Listing = list[os.DirEntry[str]]
+
+
+def _list(directory: Path) -> _Listing | Unreadable | None:
+    """The cgroup's entries by name; ``None`` if it exited before it was listed."""
+    try:
+        with os.scandir(directory) as listing:
+            return sorted(listing, key=lambda entry: entry.name)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        return Unreadable(_LISTING, f'{type(exc).__name__}: {exc}')
+
+
+def _subcgroups(entries: _Listing) -> list[os.DirEntry[str]]:
+    return [entry for entry in entries if entry.is_dir(follow_symlinks=False)]
+
+
+def _read_listed(directory: Path, entries: _Listing) -> CgroupReading | Unreadable | None:
+    """The files its listing exposes; ``None`` if the cgroup exited after it was listed."""
+    reading = read_cgroup(directory, present=frozenset(entry.name for entry in entries))
+    if isinstance(reading, Unreadable) and not directory.exists():
+        return None
+    return reading
 
 
 def read_tree(root: str | Path = CGROUP_ROOT) -> TreeReading:
@@ -399,25 +427,57 @@ def read_tree(root: str | Path = CGROUP_ROOT) -> TreeReading:
 
 
 def _read_subtree(directory: Path, segments: Segments, inode: int, nodes: list[CgroupNode]) -> bool:
-    """Append the subtree's nodes post-order; False if the cgroup exited before it was listed."""
-    try:
-        with os.scandir(directory) as listing:
-            entries = sorted(listing, key=lambda entry: entry.name)
-    except FileNotFoundError:
+    """Append the subtree's nodes post-order; False, appending none, if the cgroup exited."""
+    entries = _list(directory)
+    if entries is None:
         return False
-    except OSError as exc:
-        reason = f'{type(exc).__name__}: {exc}'
-        nodes.append(CgroupNode(segments, inode, (), Unreadable(_LISTING, reason)))
+    if isinstance(entries, Unreadable):
+        nodes.append(CgroupNode(segments, inode, (), entries))
         return True
+    start = len(nodes)
     children = tuple(
         entry.name
-        for entry in entries
-        if entry.is_dir(follow_symlinks=False)
-        and _read_subtree(Path(entry.path), (*segments, entry.name), entry.inode(), nodes)
+        for entry in _subcgroups(entries)
+        if _read_subtree(Path(entry.path), (*segments, entry.name), entry.inode(), nodes)
     )
-    present = frozenset(entry.name for entry in entries)
-    nodes.append(CgroupNode(segments, inode, children, read_cgroup(directory, present=present)))
+    reading = _read_listed(directory, entries)
+    if reading is None:
+        del nodes[start:]
+        return False
+    nodes.append(CgroupNode(segments, inode, children, reading))
     return True
+
+
+def read_cgroups(
+    select: Callable[[Segments], bool], root: str | Path = CGROUP_ROOT
+) -> dict[Segments, CgroupReading | Unreadable]:
+    """The cgroups *select* picks, found by listing the tree below *root*.
+
+    Only a picked cgroup's files are read. One that exited before or after it
+    was listed is absent, as from ``read_tree``.
+    """
+    readings: dict[Segments, CgroupReading | Unreadable] = {}
+    for segments, directory, entries in _listings(Path(root), ()):
+        if not select(segments):
+            continue
+        reading = entries if isinstance(entries, Unreadable) else _read_listed(directory, entries)
+        if reading is not None:
+            readings[segments] = reading
+    return readings
+
+
+def _listings(
+    directory: Path, segments: Segments
+) -> Iterator[tuple[Segments, Path, _Listing | Unreadable]]:
+    """Each cgroup at and below *directory*, parents first, with its listing; exited ones skipped."""
+    entries = _list(directory)
+    if entries is None:
+        return
+    yield segments, directory, entries
+    if isinstance(entries, Unreadable):
+        return
+    for entry in _subcgroups(entries):
+        yield from _listings(Path(entry.path), (*segments, entry.name))
 
 
 _STATE_VERSION = 1

@@ -405,6 +405,40 @@ class TestTheVerifyScopeCollector:
         assert all(key.leaf is None for key in collected.samples)
         assert collected.state is None
 
+    def test_only_the_scopes_own_files_are_read(self, world, monkeypatch):
+        from _cgroup_reads import record_reads
+        from _consumer_world import APP_SCOPE, DF_SCOPE
+
+        read = record_reads(monkeypatch)
+
+        world.collect_verify_scopes(_T0, None)
+
+        assert sorted(read) == sorted(world.cgroups.path(s) for s in (APP_SCOPE, DF_SCOPE))
+
+    def test_an_unreadable_scope_is_live_and_its_memory_is_not_written(self, world):
+        from _consumer_world import APP_SCOPE
+
+        world.cgroups.make_unreadable(APP_SCOPE, 'memory.current')
+
+        samples = world.collect_verify_scopes(_T0, None).samples
+
+        assert {key.metric: value for key, value in samples.items()} == {
+            'verify_scopes_live': 2.0,
+        }
+
+    def test_a_scope_that_exits_after_it_was_listed_is_not_live(self, world, monkeypatch):
+        from _cgroup_reads import exit_after_listing
+        from _consumer_world import APP_SCOPE
+
+        exit_after_listing(monkeypatch, world.cgroups.path(APP_SCOPE))
+
+        samples = world.collect_verify_scopes(_T0, None).samples
+
+        assert {key.metric: value for key, value in samples.items()} == {
+            'verify_scopes_live': 1.0,
+            'verify_scope_memory_bytes': 3_000.0,
+        }
+
     def test_with_none_live_it_writes_zero_and_zero(self, world):
         from _consumer_world import APP_SCOPE, DF_SCOPE
 

@@ -46,6 +46,7 @@ from sampler.consumers import (
     TreeState,
     account,
     encode_consumer,
+    read_cgroups,
     read_tree,
 )
 from sampler.host_memory import (
@@ -665,23 +666,25 @@ def collect_consumers(
     )
 
 
+def _is_verify_scope(segments: tuple[str, ...]) -> bool:
+    return bool(segments) and parse_verify_scope_unit(segments[-1]) is not None
+
+
 def collect_verify_scopes(
     _now: int, _previous_state: str | None, *, cgroup_root: Path = _CGROUP_ROOT
 ) -> Collected:
     """The verify-scope group: live ``df-verify-*.scope`` cgroups, in either placement.
 
-    A scope is recognised only by ``shared.verify_scope_tag``. Their memory is
+    A scope is recognised only by ``shared.verify_scope_tag``, from a listing
+    of the tree, and only the scopes' own files are read. Their memory is
     written only when every live scope's could be read, so it is never an
     undercount.
     """
-    scopes = [
-        node for node in read_tree(cgroup_root).nodes
-        if node.segments and parse_verify_scope_unit(node.segments[-1]) is not None
-    ]
+    scopes = read_cgroups(_is_verify_scope, cgroup_root).values()
     memory = [
-        figure for node in scopes
-        if isinstance(node.reading, CgroupReading)
-        and (figure := Figure.MEMORY.source(node.reading)) is not None
+        figure for reading in scopes
+        if isinstance(reading, CgroupReading)
+        and (figure := Figure.MEMORY.source(reading)) is not None
     ]
     samples = {_VERIFY_SCOPES_LIVE.key(): float(len(scopes))}
     if len(memory) == len(scopes):

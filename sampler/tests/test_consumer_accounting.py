@@ -8,6 +8,7 @@ drives ``account`` through two collections, the way the recorder does.
 from __future__ import annotations
 
 import pytest
+from _cgroup_reads import exit_after_listing
 from _cgroup_tree import MEMORY_FILES, CgroupTree
 from shared.cgroup_stats import Unreadable
 
@@ -188,6 +189,27 @@ class TestListedButUnreadableLastTime:
         assert sccache.gauges == {}
         assert sccache.increments == {}
         assert _increment(second, 'exited@app.slice', Figure.CPU_USEC) == 3 * _S
+
+
+class TestACgroupThatExitsAfterItWasListed:
+    _SERVICE = 'app.slice/orchestrator-x.service'
+
+    @pytest.mark.parametrize('exiting', [_SCOPE_S, _SERVICE], ids=['leaf', 'inner'])
+    def test_it_is_dropped_with_its_subtree_as_if_never_listed(self, tree, monkeypatch, exiting):
+        tree.set('app.slice', cpu_usec=20 * _S)
+        tree.set(_SCOPE_S, cpu_usec=5 * _S)
+        tree.set(self._SERVICE, cpu_usec=4 * _S)
+        tree.set(f'{self._SERVICE}/daemon', cpu_usec=4 * _S)
+        first = _first(tree)
+
+        tree.set('app.slice', cpu_usec=30 * _S)
+        exit_after_listing(monkeypatch, tree.path(exiting))
+        second = _next(tree, first)
+
+        gone = tuple(exiting.split('/'))
+        assert [s for s in second.state.listing if s[: len(gone)] == gone] == []
+        assert all(f.readable for f in second.per_consumer.values())
+        assert _increment(second, 'exited@app.slice', Figure.CPU_USEC) == 10 * _S
 
 
 class TestRecorderGap:
