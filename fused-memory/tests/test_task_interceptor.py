@@ -6858,7 +6858,6 @@ async def test_single_call_latency_smoke(
 async def test_set_task_status_does_not_block_during_add_task_curator(
     taskmaster,
     reconciler,
-    event_buffer,
     curator_enabled_config,
     tmp_path,
 ):
@@ -6868,9 +6867,13 @@ async def test_set_task_status_does_not_block_during_add_task_curator(
     Guards the 2026-04-20 split of the single ``_project_lock``, under which a
     long curator LLM call stalled every status write on the same project. The
     curator is gated on an Event, so the ordering is checked, not a duration.
+    The event buffer is in-memory, as on server/main.py's reconciliation-off
+    branch, so no disk commit sits on the status path.
     """
     from fused_memory.middleware.ticket_store import TicketStore
 
+    event_buffer = EventBuffer(db_path=None)
+    await event_buffer.initialize()
     store = TicketStore(tmp_path / 'split_lock_tickets.db')
     await store.initialize()
 
@@ -6903,8 +6906,11 @@ async def test_set_task_status_does_not_block_during_add_task_curator(
             _submit_and_resolve(interceptor, '/project', title='concurrent add'),
         )
         await poll_until(
-            curator_entered.is_set,
+            lambda: curator_entered.is_set() or add.done(),
             message='add_task never reached the curator',
+        )
+        assert not add.done(), (
+            f'add resolved before reaching the curator: {add.result()!r}'
         )
 
         status = asyncio.create_task(
@@ -6918,7 +6924,9 @@ async def test_set_task_status_does_not_block_during_add_task_curator(
             ),
         )
 
-        assert not add.done()
+        assert not add.done(), (
+            f'add resolved while the curator gate was closed: {add.result()!r}'
+        )
         taskmaster.add_task.assert_not_called()
         status_result = status.result()
         assert status_result.get('success') or status_result.get('no_op')
@@ -6941,6 +6949,7 @@ async def test_set_task_status_does_not_block_during_add_task_curator(
                 _wt.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await _wt
+        await event_buffer.close()
 
 
 # ---------------------------------------------------------------------------
