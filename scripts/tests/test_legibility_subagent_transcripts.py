@@ -15,6 +15,7 @@ module's public seam over real tmp-dir trees.
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 from datetime import date as dt_date
 from pathlib import Path
@@ -138,8 +139,9 @@ class TestTranscriptIdentity:
 
     def test_identity_is_frozen(self):
         identity = inventory.TranscriptIdentity(session_id='p')
-        with pytest.raises(AttributeError):
-            identity.session_id = 'q'  # type: ignore[misc]
+        field = 'session_id'
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            setattr(identity, field, 'q')
 
 
 class TestProjectsRootEnumeratesSubagents:
