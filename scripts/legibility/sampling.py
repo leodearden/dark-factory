@@ -43,6 +43,7 @@ from legibility.inventory import (
     enumerate_sessions,
     iter_json_lines,
     resolve_agent_transcript_roots,
+    transcript_identity,
 )
 
 logger = logging.getLogger('legibility.sampling')
@@ -105,9 +106,11 @@ class SignalCounts(Mapping[detectors.SignalClass, int]):
 class TranscriptScan:
     """What one read of a transcript yields: its signal counts, its agent
     class, the text of its first non-sidechain, non-meta user turn ('' when
-    there is none), and the first ``sessionId`` any record carries (the
-    session string the digest frontmatter, and so every coding record and
-    ledger row, carries)."""
+    there is none), and its transcript identity key (the session string the
+    digest frontmatter, and so every coding record and ledger row, carries):
+    the first ``sessionId`` any record carries, plus
+    ``/subagents/agent-<agentId>`` for a sub-agent transcript, whose
+    ``sessionId`` is its parent's."""
 
     counts: SignalCounts
     agent_class: detectors.AgentClass
@@ -116,7 +119,8 @@ class TranscriptScan:
 
 
 def _record_session_id(record: dict[str, Any]) -> str | None:
-    return record.get('sessionId') or None
+    identity = transcript_identity(record)
+    return identity.key if identity is not None else None
 
 
 def peek_session_id(path: Path) -> str | None:
