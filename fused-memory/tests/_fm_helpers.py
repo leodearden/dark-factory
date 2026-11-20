@@ -916,6 +916,50 @@ def _make_rate_limit_error(
     return RateLimitError(message, response=response, body=body)
 
 
+def make_insufficient_quota_error(
+    message: str = (
+        'You have no credits remaining. Please add credits to your account to continue.'
+    ),
+    *,
+    with_code: bool = True,
+) -> RateLimitError:
+    """Build the 2026-11-19 incident's openai.RateLimitError: credits exhausted.
+
+    ``with_code=False`` drops ``code`` and keeps only ``type`` — the shape
+    syslog carried during the incident.
+    """
+    request = httpx.Request('POST', 'https://api.openai.com/v1/embeddings')
+    response = httpx.Response(429, request=request)
+    body: dict[str, Any] = {'message': message, 'type': 'insufficient_quota', 'param': None}
+    if with_code:
+        body['code'] = 'insufficient_quota'
+    return RateLimitError(message, response=response, body=body)
+
+
+def make_transient_rate_limit_error() -> RateLimitError:
+    """Build a real openai.RateLimitError for a transient too-many-requests 429."""
+    message = 'Rate limit reached for requests'
+    request = httpx.Request('POST', 'https://api.openai.com/v1/embeddings')
+    response = httpx.Response(429, request=request)
+    body = {'message': message, 'type': 'requests', 'param': None, 'code': 'rate_limit_exceeded'}
+    return RateLimitError(message, response=response, body=body)
+
+
+def wrap_like_graphiti(inner: BaseException) -> Exception:
+    """Re-raise *inner* the way graphiti_core's OpenAI clients wrap a 429.
+
+    graphiti_core/llm_client/openai_base_client.py does
+    ``raise RateLimitError from e``, so the returned exception carries the
+    structured provider fields only on ``__cause__``.
+    """
+    from graphiti_core.llm_client.errors import RateLimitError as GraphitiRateLimitError
+
+    try:
+        raise GraphitiRateLimitError from inner
+    except GraphitiRateLimitError as wrapped:
+        return wrapped
+
+
 # ---------------------------------------------------------------------------
 # Leaked TaskInterceptor curator-worker reaper (task 2737)
 # ---------------------------------------------------------------------------
