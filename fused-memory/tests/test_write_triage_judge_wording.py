@@ -185,3 +185,66 @@ class TestJudgeWordingOverride:
         assert write_triage_judge.JUDGE_SYSTEM_PROMPT is _mod().system_prompt(
             _mod().WORDING_SHIPPED,
         )
+
+
+class TestJudgeSystemPromptOverride:
+    """An unregistered candidate prompt held in force on the shipped call path (task 7519)."""
+
+    @pytest.mark.asyncio
+    async def test_the_shipped_call_path_sends_the_candidate_then_the_shipped_prompt(
+        self,
+    ) -> None:
+        client = _openai_client()
+        with patch('openai.AsyncOpenAI', return_value=client):
+            with _mod().judge_system_prompt('PROMPT-X', label='lever-x'):
+                await _call_shipped_llm()
+            inside = client.responses.create.call_args.kwargs['instructions']
+            await _call_shipped_llm()
+            after = client.responses.create.call_args.kwargs['instructions']
+
+        assert inside == 'PROMPT-X'
+        assert after == _mod().system_prompt(_mod().WORDING_SHIPPED)
+
+    def test_it_yields_the_candidate_sha(self) -> None:
+        with _mod().judge_system_prompt('PROMPT-X', label='lever-x') as sha:
+            assert sha == _sha('PROMPT-X')
+
+    def test_the_shipped_prompt_is_restored_when_the_body_raises(self) -> None:
+        shipped = _mod().system_prompt(_mod().WORDING_SHIPPED)
+        with pytest.raises(KeyError), _mod().judge_system_prompt('PROMPT-X', label='lever-x'):
+            raise KeyError('boom')
+        assert write_triage_judge.JUDGE_SYSTEM_PROMPT is shipped
+
+    def test_a_candidate_inside_a_wording_is_refused_naming_the_wording(self) -> None:
+        with _mod().judge_wording(_mod().WORDING_PRE_PSI):
+            with (
+                pytest.raises(RuntimeError, match='pre-psi') as excinfo,
+                _mod().judge_system_prompt('PROMPT-X', label='lever-x'),
+            ):
+                pass  # pragma: no cover - the enter refuses
+            assert 'lever-x' in str(excinfo.value)
+            assert write_triage_judge.JUDGE_SYSTEM_PROMPT == _mod().PRE_PSI_JUDGE_SYSTEM_PROMPT
+        assert write_triage_judge.JUDGE_SYSTEM_PROMPT is _mod().system_prompt(
+            _mod().WORDING_SHIPPED,
+        )
+
+    def test_a_wording_inside_a_candidate_is_refused_naming_the_candidate(self) -> None:
+        with _mod().judge_system_prompt('PROMPT-X', label='lever-x'):
+            with (
+                pytest.raises(RuntimeError, match='lever-x') as excinfo,
+                _mod().judge_wording(_mod().WORDING_PRE_PSI),
+            ):
+                pass  # pragma: no cover - the enter refuses
+            assert 'pre-psi' in str(excinfo.value)
+            assert write_triage_judge.JUDGE_SYSTEM_PROMPT == 'PROMPT-X'
+        assert write_triage_judge.JUDGE_SYSTEM_PROMPT is _mod().system_prompt(
+            _mod().WORDING_SHIPPED,
+        )
+
+    def test_an_empty_prompt_is_refused(self) -> None:
+        with pytest.raises(ValueError, match='lever-x'):
+            with _mod().judge_system_prompt('', label='lever-x'):
+                pass  # pragma: no cover - the enter refuses
+        assert write_triage_judge.JUDGE_SYSTEM_PROMPT is _mod().system_prompt(
+            _mod().WORDING_SHIPPED,
+        )
