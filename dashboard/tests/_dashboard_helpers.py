@@ -14,6 +14,7 @@ the same process.
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import os
 import shutil
@@ -31,6 +32,8 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
+from dashboard.app import lifespan
+from dashboard.background_loops import BackgroundLoops
 from dashboard.config import DashboardConfig
 from dashboard.data.db import DbPool
 from dashboard.loops import _metrics_loop, _MetricsStore
@@ -275,7 +278,11 @@ async def drain(*tasks: asyncio.Task[Any]) -> None:
 # ONE definition of "run a real dashboard loop until the caller has seen
 # enough, then cancel it": drive_loop_until for any loop, drive_metrics_loop
 # for _metrics_loop against a recorded collect_metrics_snapshot.  Their
-# contract is pinned by test_metrics_loop_harness.py.
+# contract is pinned by test_metrics_loop_harness.py.  IDLE_BACKGROUND_LOOPS
+# and app_with_loops are the other direction: a whole lifespan, with the loops
+# it starts chosen by the test.  Tests choose a lifespan's background loops
+# through ``lifespan``'s ``loops`` argument, never by patching names on
+# ``dashboard.app``.
 # ---------------------------------------------------------------------------
 
 
@@ -354,6 +361,24 @@ async def drive_metrics_loop(
             timeout=timeout,
         )
     return calls
+
+
+async def _idle_loop(*_args: object, **_kwargs: object) -> None:
+    return None
+
+
+IDLE_BACKGROUND_LOOPS = BackgroundLoops(
+    burndown=_idle_loop, metrics=_idle_loop, quality=_idle_loop, reaper=_idle_loop,
+)
+"""Background loops that return at once, for a lifespan whose loops are not under test.
+
+Derive a variant with ``dataclasses.replace(IDLE_BACKGROUND_LOOPS, metrics=...)``.
+"""
+
+
+def app_with_loops(loops: BackgroundLoops) -> FastAPI:
+    """A fresh app whose every lifespan starts *loops* instead of the production ones."""
+    return FastAPI(lifespan=functools.partial(lifespan, loops=loops))
 
 
 # ---------------------------------------------------------------------------
