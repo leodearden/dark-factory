@@ -1951,7 +1951,10 @@ enter through `resolve-answers`, with `--source docket` or `--source terminal`.
    It exits 3 when a token does not resolve: ask back on each such token and apply nothing for it.
 2. `stamp_triage` with `payloads.append_markers(existing_note, <x_prepared>, <x_agreed>)`, while the
    record is still pending (see "Sitting markers" below; the REPLACES caution applies).
-3. `resolve_issue(..., resolution_turns=<the value resolve-answers printed>)`.
+3. The pre-built `resolve_issue` payload, with `resolution_turns=<the value resolve-answers
+   printed>`. It carries `resolution_class` and `ruled_by_human=True`
+   (`scripts/sitting/payloads.py::resolve_issue_payload`): this is Leo's ruling, and the
+   resolution text cites it. See "Classify and attribute every close" under "Resolving Escalations".
 4. The `update_task` `x_ruling` payload. Say so when it discloses a value it supersedes.
 5. The pre-built `close-decision` payload, quoting the deciding evidence. `close-decision` requires
    `--project` and `--escalations-dir` naming the record you READ, and refuses any other record, so
@@ -2073,7 +2076,9 @@ mcp__escalation__resolve_issue(
   escalation_id="...",
   resolution="Scope expanded to include [<files>]; resuming.",
   action='resume',   # folds the grant, and re-pends unless a live workflow owns the task — see below
-  granted_files=["<project-relative file path>", ...],   # file-level paths, not module names
+  granted_files=["<project-relative file path>"],   # one entry per file; file-level paths, not module names
+  resolution_class="actionable",   # see "Classify and attribute every close" under "Resolving Escalations"
+  ruled_by_human=False,   # True only when the resolution cites Leo's ruling on this record
   resolved_by="escalation-watcher"
 )
 ```
@@ -2108,6 +2113,8 @@ Agent found it depends on work that isn't done yet.
      escalation_id="...",
      resolution="Added dependency on task <dep_id>. Task re-pends; held by dependency gate until dep completes.",
      action='resume',   # flips blocked→pending; dependency gate holds dispatch until dep is done
+     resolution_class="actionable",   # see "Classify and attribute every close" under "Resolving Escalations"
+     ruled_by_human=False,   # True only when the resolution cites Leo's ruling on this record
      resolved_by="escalation-watcher"
    )
    ```
@@ -2667,9 +2674,29 @@ mcp__escalation__resolve_issue(
   escalation_id="esc-XX-N",
   resolution="<text injected into the agent's briefing when it resumes>",
   action='resume',   # default least-destructive intent; see C1 table below
+  resolution_class="actionable",   # see "Classify and attribute every close" just below
+  ruled_by_human=False,   # True only when the resolution cites Leo's ruling on this record
   resolved_by="escalation-watcher"
 )
 ```
+
+### Classify and attribute every close (`resolution_class`, `ruled_by_human`)
+
+- **Every resolve or dismiss of a level-2 record passes `resolution_class`.** Without it the server
+  refuses the call with code `resolution_class_required` and changes nothing
+  (`escalation/src/escalation/queue.py::ResolutionClassRequired`).
+- **The class vocabulary** is `skills/escalation-watcher-auto/SKILL.md` "Classify the resolution
+  (`resolution_class`)" and `escalation/src/escalation/models.py::RESOLUTION_CLASSES`. Pick from
+  there.
+- **`ruled_by_human=True` only when Leo ruled on THIS record, or on its sitting docket item, AND the
+  `resolution` text cites that ruling.** Otherwise pass `False`. A close this attended seat
+  executes on its own judgment is not a ruling: the record reads `attended-seat`, not
+  `human-ruled` (`escalation/src/escalation/classify.py::resolver_tier`), and the shadow-ruling
+  agreement report scores only human-ruled closes. The cascade carries both fields to every member.
+- The server refuses `ruled_by_human=True` from the executor and auto-watcher identities with code
+  `ruled_by_human_forbidden` (`escalation/src/escalation/authority.py::RULED_BY_HUMAN_FORBIDDEN`).
+- `action='park'` takes neither field: the record stays open at L2, unclassified until it is
+  resolved.
 
 ### C1 — `action` semantics (single source of truth)
 
