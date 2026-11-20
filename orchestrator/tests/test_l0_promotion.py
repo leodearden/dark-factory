@@ -50,7 +50,11 @@ def _submit_l0(
 
 
 def _promote(
-    queue: EscalationQueue, l0: Escalation, **caller_choices: str | None,
+    queue: EscalationQueue,
+    l0: Escalation,
+    *,
+    summary_prefix: str = '',
+    worktree: str | None = None,
 ) -> Escalation:
     return promote_l0_to_l1(
         queue, l0,
@@ -59,7 +63,8 @@ def _promote(
         detail_suffix=SUFFIX,
         filing_claimant_run_id='run-x',
         resolved_by='orchestrator-workflow',
-        **caller_choices,
+        summary_prefix=summary_prefix,
+        worktree=worktree,
     )
 
 
