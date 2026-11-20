@@ -121,7 +121,7 @@ def stub_probe(gate: UsageGate, answer: Callable[[AccountState], bool]) -> None:
 
 
 def make_reopening_gate(
-    tmp_path: Path, reopens: str, *, cost_store: CostStore | None = None, **cfg: object
+    tmp_path: Path, reopens: str, *, cost_store: CostStore | None = None
 ) -> UsageGate:
     """On the virtual clock, the resume probe reopens *reopens* alone, one virtual second after
     it is capped with no reset time, and no host stall can move that."""
@@ -131,7 +131,6 @@ def make_reopening_gate(
         cost_store=cost_store,
         wait_for_reset=True,
         probe_interval_secs=1,
-        **cfg,
     )
     stub_probe(gate, lambda acct: acct.name == reopens)
     return gate
