@@ -280,6 +280,18 @@ class TestClassify:
         with pytest.raises(ValueError, match='vibes'):
             self._classify(bad)
 
+    def test_the_dispute_kinds_are_closed_and_each_defined_in_one_sentence(self) -> None:
+        kinds = _mod().DISPUTE_KINDS
+        assert set(kinds) == {'outdated_state', 'status_overtaken', 'newer_measurement',
+                              'contradiction'}
+        for definition in kinds.values():
+            assert definition.endswith('.') and '. ' not in definition
+
+    def test_accepts_every_kind_in_the_vocabulary(self) -> None:
+        for kind in _mod().DISPUTE_KINDS:
+            table = self._classify([{**_labels()[0], 'dispute_kind': kind}, _labels()[1]])
+            assert kind in table['dimensions']['dispute_kind']
+
     def test_counts_and_weighs_the_hits_on_every_dimension(self) -> None:
         table = self._classify(_labels())
         assert (table['hits'], table['population_hits']) == (2, 9.0)

@@ -74,15 +74,28 @@ _BOUND_ANSWERS = (_rubric.Resolved.YES, _rubric.Resolved.NO)
 
 DISPUTE_KINDS: Mapping[str, str] = MappingProxyType({
     'outdated_state': (
-        'The entry reports a later state of the thing the candidate describes, so the'
-        ' candidate is out of date rather than wrong when written.'
+        'The entry reports a later state of the code, configuration or rule the candidate'
+        ' describes, so the candidate is out of date rather than wrong when written.'
+    ),
+    'status_overtaken': (
+        'The entry shows that work the candidate records as pending, open, undecided or not'
+        ' yet done has since been done or decided.'
+    ),
+    'newer_measurement': (
+        'The entry reports a later measurement of a figure the candidate also records (a'
+        ' duration, count or ratio) and the two values differ.'
     ),
     'contradiction': (
         'The entry and the candidate say incompatible things about the same thing at the'
         ' same time.'
     ),
 })
-"""The hand-label vocabulary of what an M3 hit's dispute is; each kind is defined in one sentence."""
+"""The hand-label vocabulary of what an M3 hit's dispute is; each kind is defined in one sentence.
+
+``status_overtaken`` and ``newer_measurement`` are the two kinds of later
+state the soak hits show often enough to need their own name; a hit takes one
+of them before ``outdated_state``.
+"""
 
 LABEL_FLAGS = ('self_declared_correction', 'dispute_in_child_core')
 """Yes/no hand labels: the entry says it corrects or replaces something; the dispute is its main claim."""
