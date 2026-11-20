@@ -6855,47 +6855,41 @@ async def test_single_call_latency_smoke(
 
 
 @pytest.mark.asyncio
-@pytest.mark.xdist_group('task_interceptor_perf_timing')
 async def test_set_task_status_does_not_block_during_add_task_curator(
     taskmaster,
     reconciler,
-    event_buffer,
     curator_enabled_config,
     tmp_path,
 ):
-    """Split-lock regression (2026-04-20): a long-running curator.curate()
-    inside add_task MUST NOT block a concurrent set_task_status on the
-    same project.
+    """A set_task_status issued while add_task's curator holds ``_curator_lock``
+    completes before the curator returns, because it takes only ``_write_lock``.
 
-    Before the split, both ops took the single ``_project_lock``; a 25-35 s
-    curator LLM call under add_task stalled every set_task_status on the
-    same project for the full duration, blowing past the orchestrator's
-    15 s client timeout and logging 50+ empty-str "Failed to set task X
-    status to Y:" errors per run (reify log
-    /tmp/orch-reify-20260420-082733.log). After the split, add_task holds
-    ``_curator_lock`` for the LLM call and only briefly acquires
-    ``_write_lock`` for the tm.add_task write; set_task_status takes just
-    ``_write_lock`` and so completes promptly.
+    Guards the 2026-04-20 split of the single ``_project_lock``, under which a
+    long curator LLM call stalled every status write on the same project. The
+    curator is gated on an Event, so the ordering is checked, not a duration.
+    The event buffer is in-memory, as on server/main.py's reconciliation-off
+    branch, so no disk commit sits on the status path.
     """
     from fused_memory.middleware.ticket_store import TicketStore
 
+    event_buffer = EventBuffer(db_path=None)
+    await event_buffer.initialize()
     store = TicketStore(tmp_path / 'split_lock_tickets.db')
     await store.initialize()
 
-    # Bumped from 2.0s to widen the absolute discrimination gap between the
-    # status_elapsed budget below and CURATOR_LATENCY_S*0.9, giving more
-    # headroom against scheduling jitter under host CPU oversubscription.
-    CURATOR_LATENCY_S = 4.0
+    curator_entered = asyncio.Event()
+    release_curator = asyncio.Event()
 
-    async def slow_curate(candidate, *_args):
-        await asyncio.sleep(CURATOR_LATENCY_S)
+    async def gated_curate(candidate, *_args):
+        curator_entered.set()
+        await release_curator.wait()
         # action='create' so the flow falls through to tm.add_task
         return CuratorDecision(
             action='create',
             justification='ok',
         )
 
-    curator = curator_judging(slow_curate)
+    curator = curator_judging(gated_curate)
     interceptor = TaskInterceptor(
         taskmaster,
         reconciler,
@@ -6905,56 +6899,57 @@ async def test_set_task_status_does_not_block_during_add_task_curator(
         curator=curator,
     )
 
-    start = asyncio.get_event_loop().time()
-
-    async def timed_set_status():
-        # Fire slightly after add_task so add_task is the one holding
-        # _curator_lock first.
-        await asyncio.sleep(0.05)
-        t0 = asyncio.get_event_loop().time()
-        result = await interceptor.set_task_status(
-            '1',
-            'in-progress',
-            '/project',
-        )
-        return result, asyncio.get_event_loop().time() - t0
-
+    add: asyncio.Task | None = None
+    status: asyncio.Task | None = None
     try:
-        add_result, (status_result, status_elapsed) = await asyncio.gather(
+        add = asyncio.create_task(
             _submit_and_resolve(interceptor, '/project', title='concurrent add'),
-            timed_set_status(),
         )
+        await poll_until(
+            lambda: curator_entered.is_set() or add.done(),
+            message='add_task never reached the curator',
+        )
+        assert not add.done(), (
+            f'add resolved before reaching the curator: {add.result()!r}'
+        )
+
+        status = asyncio.create_task(
+            interceptor.set_task_status('1', 'in-progress', '/project'),
+        )
+        await poll_until(
+            status.done,
+            message=(
+                'set_task_status blocked behind add_task curator: it did not '
+                'complete while the curator held _curator_lock'
+            ),
+        )
+
+        assert not add.done(), (
+            f'add resolved while the curator gate was closed: {add.result()!r}'
+        )
+        taskmaster.add_task.assert_not_called()
+        status_result = status.result()
+        assert status_result.get('success') or status_result.get('no_op')
+        taskmaster.set_task_status.assert_called_once()
+
+        release_curator.set()
+        add_result = await add
+        assert add_result.get('id') == '2'  # taskmaster fixture default
+        taskmaster.add_task.assert_called_once()
     finally:
+        release_curator.set()
+        for pending in (add, status):
+            if pending is not None and not pending.done():
+                pending.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await pending
         await store.close()
         for _wt in list(interceptor._worker_tasks.values()):
             if not _wt.done():
                 _wt.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await _wt
-    total_elapsed = asyncio.get_event_loop().time() - start
-
-    # add_task ran the full curator → ~CURATOR_LATENCY_S
-    assert total_elapsed >= CURATOR_LATENCY_S * 0.9, (
-        f'add_task did not wait for curator: total={total_elapsed:.3f}s'
-    )
-    # set_task_status must NOT wait for curator.
-    # Budget rebased as a fraction of CURATOR_LATENCY_S (rather than a bare
-    # absolute like the previous 0.5s) so it still discriminates "status did
-    # NOT wait for curator" (near-instant) from "status blocked behind the
-    # curator" (~CURATOR_LATENCY_S, which would also fail the paired
-    # total_elapsed>=CURATOR_LATENCY_S*0.9 assertion above if it didn't),
-    # while tolerating scheduling jitter under host CPU oversubscription.
-    status_budget = CURATOR_LATENCY_S * 0.4
-    assert status_elapsed < status_budget, (
-        f'set_task_status blocked behind add_task curator: '
-        f'status_elapsed={status_elapsed:.3f}s (budget {status_budget:.3f}s), '
-        f'curator_latency={CURATOR_LATENCY_S}s'
-    )
-    # Both writes landed.
-    assert add_result.get('id') == '2'  # taskmaster fixture default
-    assert status_result.get('success') or status_result.get('no_op')
-    taskmaster.add_task.assert_called_once()
-    taskmaster.set_task_status.assert_called_once()
+        await event_buffer.close()
 
 
 # ---------------------------------------------------------------------------
