@@ -6992,6 +6992,9 @@ class MemoryService:
             write_op_id,
             failure.value,
         )
+        exhaustion = classify_billing_exhaustion(error)
+        if exhaustion is not None:
+            await self._billing_alarm.record_exhausted(exhaustion, site='mem0_write')
         return reason
 
     async def reissue_mem0_intent(self, intent: Mapping[str, Any]) -> Mem0AddOutcome:
@@ -7025,7 +7028,9 @@ class MemoryService:
 
         The one dispatch from method to backend call, shared by the original
         write and its re-issue so the two cannot diverge. The backend_op label
-        is ``add`` for both methods: the mem0 primitive each one calls.
+        is ``add`` for both methods: the mem0 primitive each one calls. A write
+        that lands proves OpenAI credits are back, so it resolves an open
+        billing page.
         """
         match write_method:
             case Mem0WriteMethod.ADD:
@@ -7047,9 +7052,11 @@ class MemoryService:
             payload={'content': content[:200]},
             coro=coro,
         )
-        return read_mem0_add_result(
+        outcome = read_mem0_add_result(
             raw, operation=write_method.value, zero_ids_anomalous=zero_ids_anomalous
         )
+        await self._billing_alarm.record_recovered(site='mem0_write')
+        return outcome
 
     @property
     def mem0_retry_policy(self) -> Mem0RetryPolicy:

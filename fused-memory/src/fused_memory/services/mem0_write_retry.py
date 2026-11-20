@@ -15,6 +15,7 @@ from typing import Any, Protocol
 import openai
 
 from fused_memory.services.mem0_add_outcome import Mem0AddOutcome
+from fused_memory.services.provider_billing import classify_billing_exhaustion
 from fused_memory.services.write_journal import Mem0IntentStatus, WriteJournal
 
 logger = logging.getLogger(__name__)
@@ -25,6 +26,7 @@ OnMem0Landed = Callable[[Mapping[str, Any], Mem0AddOutcome], Awaitable[object]]
 
 
 class TransientProviderFailure(StrEnum):
+    BILLING_EXHAUSTED = 'billing_exhausted'
     RATE_LIMITED = 'rate_limited'
     SERVER_ERROR = 'server_error'
     CONNECTION = 'connection'
@@ -35,15 +37,22 @@ def classify_transient_provider_failure(
 ) -> TransientProviderFailure | None:
     """Name the transient provider failure ``exc`` is, or ``None`` if it is not one.
 
-    Matched by openai SDK type only, never by message text. Re-issuing such a
+    Matched on openai SDK errors only, never by message text. Re-issuing such a
     write cannot duplicate it: ``Mem0Backend.add`` pins ``infer=False``, and
     mem0's ``_add_to_vector_store`` embeds BEFORE ``vector_store.insert``, so an
     openai error proves nothing was persisted.
+
+    An exhausted balance is a 429 too, told apart by its structured code
+    (``provider_billing.py::classify_billing_exhaustion``). It is retried like
+    the rest, since it clears once credits are restored, but named for what it
+    is.
 
     The write-budget ``TimeoutError`` from ``await_within`` is deliberately not
     transient: it wraps the whole add and may fire while the insert is in
     flight. Ambiguous timeouts are task 4872's domain.
     """
+    if isinstance(exc, openai.APIStatusError) and classify_billing_exhaustion(exc) is not None:
+        return TransientProviderFailure.BILLING_EXHAUSTED
     if isinstance(exc, openai.RateLimitError):
         return TransientProviderFailure.RATE_LIMITED
     if isinstance(exc, openai.APIStatusError) and exc.status_code >= 500:
