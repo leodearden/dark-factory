@@ -154,6 +154,11 @@ from orchestrator.main_health_fix_owner import (
     ensure_main_fix_owner,
 )
 from orchestrator.mcp_lifecycle import plan_tools_mcp_server, verdict_tools_mcp_server
+from orchestrator.merge_halt_escalation import (
+    MergeHaltEscalationText,
+    build_merge_halt_escalation_text,
+    submit_halt_owning_escalation,
+)
 from orchestrator.merge_lane.gates import PlanFilesTouchedResult, declaration_coverage
 from orchestrator.merge_lane.landed_outbox import LandedRow, MergeProvenance
 from orchestrator.merge_lane.landing_evidence import (
@@ -227,7 +232,7 @@ from orchestrator.scope_drift import (
     build_scope_drift_report,
     pending_scope_paths,
 )
-from orchestrator.session_registry import build_session_slug
+from orchestrator.session_records import build_session_slug
 from orchestrator.stranded_verified_green import (
     DURABLE_MERGE_FAILURE_STATUSES,
     SUCCESS_TRANSIENT_MERGE_STATUSES,
@@ -318,12 +323,18 @@ VERDICT_TOOLS_MCP_SERVER = 'verdict-tools'
 PER_INVOCATION_MCP_SERVERS = frozenset({PLAN_TOOLS_MCP_SERVER, VERDICT_TOOLS_MCP_SERVER})
 
 
-def _inject_plan_tools_mcp(mcp_config: dict | None, cwd: Path, *, task_root: Path) -> dict:
+def _inject_plan_tools_mcp(
+    mcp_config: dict | None, cwd: Path, role: AgentRole, *, task_root: Path,
+) -> dict:
     """Inject the plan-tools stdio MCP server entry into *mcp_config*.
 
     Creates a minimal ``{'mcpServers': {}}`` skeleton when *mcp_config* is
     ``None``; otherwise preserves all pre-existing server entries and adds
     (or replaces) the ``plan-tools`` key.
+
+    The server exposes only ``role.plan_tools_grants``: dispatches run under
+    ``bypassPermissions``, where ``allowed_tools`` neither hides nor denies a
+    tool, so the grant is enforced by the server registering only these names.
 
     The plan-tools server is launched via the direct-interpreter no-uv hot path
     (task 1776): ``sys.executable -m orchestrator.mcp.plan_tools --worktree <wt>``.
@@ -352,6 +363,7 @@ def _inject_plan_tools_mcp(mcp_config: dict | None, cwd: Path, *, task_root: Pat
     mcp_config.setdefault('mcpServers', {})[PLAN_TOOLS_MCP_SERVER] = plan_tools_mcp_server(
         _ORCH_PROJECT_DIR, cwd, python_executable=sys.executable,
         meta_root=_meta_root_for_worktree(cwd), task_root=task_root,
+        granted_tools=role.plan_tools_grants,
     )
     return mcp_config
 
@@ -436,7 +448,7 @@ def compose_invocation_mcp_config(
     if 'orchestrator' in role.mcp_families and mcp is not None:
         mcp_config = mcp.mcp_config_json(escalation_url=escalation_url)
     if 'plan_tools' in role.mcp_families and cwd:
-        mcp_config = _inject_plan_tools_mcp(mcp_config, cwd, task_root=task_root)
+        mcp_config = _inject_plan_tools_mcp(mcp_config, cwd, role, task_root=task_root)
     if 'verdict_tools' in role.mcp_families and cwd:
         mcp_config = _inject_verdict_tools_mcp(mcp_config, cwd, role, task_root=task_root)
     if strict_mcp_config and not mcp_config:
@@ -12946,12 +12958,14 @@ class TaskWorkflow:
         # case the gate exists for.  Steward mediation (e.g. mutating plan.json
         # to silence the gate) would undermine the safeguard, so skip the L0
         # steward path entirely and submit an L1 immediately.
-        from orchestrator.merge_lane import POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX
+        from orchestrator.merge_lane import (
+            MAIN_HEALTH_RED_REASON_PREFIX,
+            POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX,
+            TRANSIENT_INFRA_REASON_PREFIX,
+        )
         from orchestrator.merge_lane.worker import (
             DROPPED_PLAN_TARGETS_REASON_PREFIX,
-            MAIN_HEALTH_RED_REASON_PREFIX,
             POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
-            TRANSIENT_INFRA_REASON_PREFIX,
         )
         if result.reason.startswith(DROPPED_PLAN_TARGETS_REASON_PREFIX):
             self._write_merge_failure_review('dropped_plan_targets', result.reason)
@@ -13492,71 +13506,12 @@ class TaskWorkflow:
         return None
 
     def _submit_halt_owning_escalation(self, esc: Escalation) -> None:
-        """Submit a halt-owning escalation and register halt ownership.  Non-waiting.
-
-        This is the load-bearing submit → set_halt_owner ordering shared by:
-          - ``_submit_halt_escalation_and_wait`` (single-task path; follows with an await)
-          - ``_escalate_train_halt`` (train path; does not await — tip stays BLOCKED and
-            re-dispatches when the L1 is resolved and the queue is unhalted)
-
-        Order is significant: set_halt_owner MUST follow a successful submit.
-        A registered owner with no pending escalation cannot be resolved by
-        _on_escalation_resolved, so the halt would be permanent.  If submit
-        raises, the exception propagates before set_halt_owner is reached and
-        no orphan halt (OWNER-WITHOUT-ESCALATION) is registered.
-
-        HALT-WITHOUT-OWNER guard (task 1765): when the merger has already engaged
-        a per-lane WIP halt before we get here (``is_wip_halted=True,
-        halt_owner_esc_id=None``), a submit failure leaves the lane halted with no
-        owner registered.  ``_on_escalation_resolved`` has nothing to match, no
-        escalation exists for a human, and the halt silently blocks ALL merges on
-        that lane until ``force_unhalt_merge_queue``.  If submit raises and the
-        halt is ownerless, we release it before re-raising — same rationale as the
-        sibling guards in ``_submit_halt_escalation_and_wait`` (task 1448) and
-        ``_map_advance_failure`` (task 1671).
-
-        Guard condition: ``merge_worker.is_wip_halted and halt_owner_esc_id is None``
-        — ensures we release ONLY genuine ownerless orphans, never a foreign owner's
-        halt.  ``except BaseException`` (not ``Exception``) mirrors the sibling
-        guards and also covers a CancelledError arriving between halt-engage and
-        owner-registration.
-
-        Callers must guard with ``if self.escalation_queue:`` before calling.
-        """
+        """See ``orchestrator/src/orchestrator/merge_halt_escalation.py::submit_halt_owning_escalation``."""
         assert self.escalation_queue is not None, (
             '_submit_halt_owning_escalation requires escalation_queue; '
             'callers must guard with `if self.escalation_queue:`'
         )
-        try:
-            self.escalation_queue.submit(esc)  # propagates on failure; set_halt_owner NOT reached
-        except BaseException:
-            # HALT-WITHOUT-OWNER guard (task 1765): the merger may have already
-            # engaged a per-lane WIP halt before we got here. If submit raises,
-            # set_halt_owner is unreachable, so an engaged-but-ownerless halt would
-            # silently block the whole lane until force_unhalt_merge_queue. Release
-            # the orphan halt before propagating — only when it is genuinely
-            # ownerless (never steal a foreign owner's halt). Mirrors the sibling
-            # guards in _submit_halt_escalation_and_wait and _map_advance_failure.
-            if (
-                self.merge_worker is not None
-                and self.merge_worker.is_wip_halted
-                and self.merge_worker.halt_owner_esc_id is None
-            ):
-                try:
-                    self.merge_worker.unhalt_wip(reason='halt_escalation_submit_failed')
-                except Exception:
-                    # Swallow unhalt_wip failures so the original submit exception
-                    # always propagates to the caller — masking a disk-full or
-                    # serialization error with a secondary unhalt failure would make
-                    # diagnosis much harder.
-                    logger.exception(
-                        'Task %s: unhalt_wip failed during submit-failure cleanup '
-                        '(original submit exception will still propagate)',
-                        self.task_id,
-                    )
-            raise
-        if self.merge_worker is not None:
-            self.merge_worker.set_halt_owner(esc.id)
+        submit_halt_owning_escalation(self.escalation_queue, self.merge_worker, esc)
 
     async def _submit_halt_escalation_and_wait(self, esc: Escalation) -> None:
         """Submit a halt-owning escalation, register ownership, and wait for resolution.
@@ -13608,208 +13563,11 @@ class TaskWorkflow:
         *,
         branch_name: str | None = None,
         train_id: str | None = None,
-    ) -> tuple[str, str, str]:
-        """Build ``(category, summary, detail)`` for a WIP-halt level-1 escalation.
-
-        Shared by both the single-task handlers (``branch_name=...``) and the
-        train consumer ``_escalate_train_halt`` (``train_id=...``), so that
-        human-readable recovery instructions live in one place and cannot drift.
-
-        The task-context label (``'Merge for task X (branch Y)'`` vs
-        ``'Train merge for task X (train Y)'``) and one train-specific
-        split-brain note for ``done_wip_recovery`` are the only per-path
-        variations.
-
-        Parameters
-        ----------
-        status:
-            The ``MergeOutcome.status`` string.  Handled: ``'unmerged_state'``,
-            ``'stash_failed'``, ``'done_wip_recovery'``,
-            ``'wip_recovery_no_advance'``, ``'wip_halted'`` (default branch).
-        result:
-            The ``MergeOutcome`` object (for ``overlap_files``,
-            ``recovery_branch``, ``dirty_files``).
-        branch_name:
-            Single-task context — the local branch being merged.
-            Mutually exclusive with ``train_id``.
-        train_id:
-            Train context — the train identifier string.
-            Mutually exclusive with ``branch_name``.
-
-        Returns
-        -------
-        ``(category, summary, detail)`` :
-            Ready for ``Escalation(category=..., summary=..., detail=...)``.
-        """
-        is_train = train_id is not None
-        task_id = self.task_id
-
-        # Context label used in the detail intro sentence.
-        if is_train:
-            merge_ctx = f'Train merge for task {task_id} (train {train_id!r})'
-        elif branch_name is not None:
-            merge_ctx = f'Merge for task {task_id} (branch {branch_name})'
-        else:
-            merge_ctx = f'Merge for task {task_id}'
-
-        if status == 'unmerged_state':
-            category = 'unmerged_state'
-            if is_train:
-                summary = (
-                    f'Train member {task_id} blocked: '
-                    f'project_root has unresolved (UU/AA/DD) markers'
-                )
-            else:
-                summary = (
-                    'project_root has unresolved (UU/AA/DD) markers — '
-                    'merge queue halted'
-                )
-            detail = (
-                f'{merge_ctx} was blocked because project_root already has unresolved '
-                f'merge conflicts (UU/AA/DD markers) from a prior, unrelated event — '
-                f'the merge queue refuses to stash/advance over a partially resolved tree.\n\n'
-                f'Action required: inspect ``git status`` in project_root, '
-                f'resolve the existing merge state (``git mergetool`` / edit '
-                f'the conflicted files / ``git reset`` to abandon the prior '
-                f'merge), then resolve this escalation to un-halt the merge queue.\n\n'
-                f'Manual intervention required — do NOT let automated tooling '
-                f'resolve this escalation.'
-            )
-
-        elif status == 'done_wip_recovery':
-            category = 'wip_conflict'
-            recovery_branch = result.recovery_branch or '(unknown)'
-            if is_train:
-                summary = (
-                    f'Train member {task_id}: stash pop conflict — '
-                    f'WIP preserved on {recovery_branch}'
-                )
-                wip_clause = (
-                    'uncommitted WIP produced conflicts '
-                    '(split-brain: merge landed, members NOT flipped to done).'
-                )
-                # Task 1599 / Suggestion 4: the merge is already on main.
-                # Instruct the human to flip all members done before resolving
-                # so the re-dispatch does not re-attempt the already-landed merge.
-                post_resolve = (
-                    'Note: the merge commit is already on main.  Before resolving this '
-                    'escalation, ensure all train members are marked done — the train '
-                    're-dispatches on unhalt and re-entering the merge queue with an '
-                    'already-merged tip may produce a confusing split result.\n\n'
-                    'Resolve this escalation to un-halt the merge queue.'
-                )
-            else:
-                summary = f'Stash pop conflict — WIP preserved on {recovery_branch}'
-                wip_clause = 'your uncommitted WIP produced conflicts.'
-                post_resolve = 'Resolve this escalation to un-halt the merge queue.'
-            detail = (
-                f'{merge_ctx} landed on main successfully, but the stash pop of '
-                f'{wip_clause}\n\n'
-                f'Your WIP has been preserved on branch: {recovery_branch}\n\n'
-                f'To recover:\n'
-                f'  git checkout {recovery_branch}\n'
-                f'  # Review and cherry-pick or reapply your changes\n\n'
-                f'{post_resolve}'
-            )
-
-        elif status == 'wip_recovery_no_advance':
-            category = 'wip_conflict'
-            recovery_branch = result.recovery_branch or '(unknown)'
-            if is_train:
-                summary = (
-                    f'Train member {task_id}: stash pop conflict (no advance) — '
-                    f'WIP on {recovery_branch}'
-                )
-                no_advance_intro = (
-                    f'{merge_ctx} did NOT advance main (CAS failure path). '
-                    f'A stash pop conflict occurred, leaving'
-                )
-            else:
-                summary = (
-                    f'Stash pop conflict (merge did not advance) — '
-                    f'WIP on {recovery_branch}'
-                )
-                no_advance_intro = (
-                    f'{merge_ctx} did NOT advance main. '
-                    f'A stash pop conflict occurred after a CAS failure, leaving'
-                )
-            detail = (
-                f'{no_advance_intro} the working tree in an unresolvable state.\n\n'
-                f'Your WIP has been preserved on branch: {recovery_branch}\n\n'
-                f'The merge queue has been halted. To recover:\n'
-                f'  git checkout {recovery_branch}\n'
-                f'  # Review and reapply your changes to a clean branch\n\n'
-                f'Manual intervention required — do NOT let automated tooling '
-                f'resolve this escalation. Resolve this escalation to un-halt '
-                f'the merge queue.'
-            )
-
-        elif status == 'stash_failed':
-            # SHARED main-checkout-hygiene fault (task 2758): advance_main could
-            # not park project_root's dirty tracked WIP before advancing. Unlike
-            # wip_halted (WIP overlapping the merge diff), these files need not
-            # overlap the diff at all — project_root's tree is persistently
-            # dirty, so EVERY task landing fails identically until a human
-            # cleans it. The queue is halted so exactly ONE escalation is filed.
-            category = 'stash_failed'
-            dirty = result.dirty_files or []
-            dirty_head = ', '.join(dirty[:5]) if dirty else '(unknown)'
-            if is_train:
-                summary = (
-                    f'Train member {task_id} blocked: project_root park failed '
-                    f'(dirty tracked tree) — {dirty_head}'
-                )
-            else:
-                summary = (
-                    f'project_root park failed (dirty tracked tree) — '
-                    f'merge queue halted: {dirty_head}'
-                )
-            dirty_block = (
-                '\n'.join(f'  - {f}' for f in dirty) if dirty
-                else '  (dirty tracked file list unavailable)'
-            )
-            detail = (
-                f'{merge_ctx} was blocked because advance_main could not park '
-                f'the uncommitted WIP in project_root before advancing: '
-                f'project_root has dirty TRACKED file(s) that could not be '
-                f'stashed. This is a shared main-checkout infrastructure/hygiene '
-                f'incident — it recurs identically for every task landing until '
-                f'project_root is cleaned, so the merge queue has been halted '
-                f'(one escalation, not one per stalled task).\n\n'
-                f'Dirty tracked file(s):\n'
-                f'{dirty_block}\n\n'
-                f'Action required: inspect ``git status`` in project_root, then '
-                f'commit or clean the persistently-dirty tracked file(s) '
-                f'(``git commit`` / ``git checkout -- <path>`` / ``git stash``), '
-                f'then resolve this escalation to un-halt the merge queue.\n\n'
-                f'Manual intervention required — do NOT let automated tooling '
-                f'resolve this escalation.'
-            )
-
-        else:
-            # wip_halted (and any future halt-inducing status the probe catches)
-            category = 'wip_conflict'
-            overlap = result.overlap_files or []
-            if is_train:
-                summary = (
-                    f'Train member {task_id}: WIP overlaps merge diff: '
-                    + ', '.join(overlap[:5])
-                )
-                subject_ctx = f'train member {task_id} (train {train_id!r})'
-            else:
-                summary = f'WIP overlaps merge diff: {", ".join(overlap[:5])}'
-                branch_str = f' (branch {branch_name})' if branch_name else ''
-                subject_ctx = f'task {task_id}{branch_str}'
-            detail = (
-                f'Merge for {subject_ctx} was blocked because uncommitted '
-                f'work in project_root overlaps the merge diff.\n\n'
-                f'Overlapping files:\n'
-                + '\n'.join(f'  - {f}' for f in overlap)
-                + '\n\nAction required: commit or stash the WIP, then resolve this '
-                'escalation to un-halt the merge queue and retry.'
-            )
-
-        return category, summary, detail
+    ) -> MergeHaltEscalationText:
+        """See ``orchestrator/src/orchestrator/merge_halt_escalation.py::build_merge_halt_escalation_text``."""
+        return build_merge_halt_escalation_text(
+            status, result, task_id=self.task_id, branch_name=branch_name, train_id=train_id,
+        )
 
     def _warn_orphan_halt_no_queue(
         self,
@@ -15816,6 +15574,7 @@ class TaskWorkflow:
             self.event_store.emit(
                 EventType.routing_decision,
                 task_id=self.task_id,
+                phase=self.state.value,
                 role=role.name,
                 data={**decision.model_dump(), 'inputs_digest': digest},
             )
@@ -16712,19 +16471,23 @@ class TaskWorkflow:
         A fallback arm's has-work heuristic says only that the branch reads as
         merged; main's tip, which those arms used to stamp, is whatever landed
         most recently from ANY task.  This runs ``validate_landing_evidence``
-        in DISCOVERY mode — the shape of the harness dispatch gate's ancestry
-        arm — and returns the task's own attributable, surviving citation.  A
+        in DISCOVERY mode — the legacy citation-plus-effect-present policy,
+        kept here deliberately
+        (``docs/prds/landed-not-done-recovery.effect-present-caller-enumeration.md``
+        §7) — and returns the task's own attributable, surviving citation.  A
         reject, or a validation that raises, is logged and answers None, so
         every guard proceeds with its phase rather than stamping.
         """
+        metadata = self.task.get('metadata') or {}
         try:
             verdict = await validate_landing_evidence(
                 self.git_ops, self.task_id,
                 f'{self.config.git.branch_prefix}{self.task_id}',
                 branch_tip_sha=branch_tip_sha,
                 pattern_template=self.git_ops.config.commit_citation_pattern,
-                delivered_checks=_declared_checks(self.task.get('metadata') or {}),
+                delivered_checks=_declared_checks(metadata),
                 checks_enabled=self.config.delivered_checks.enabled,
+                branch_base_sha=metadata.get('branch_base_sha'),
             )
         except Exception:
             logger.warning(

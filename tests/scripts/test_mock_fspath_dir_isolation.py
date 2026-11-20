@@ -154,7 +154,13 @@ class TestMockDerivedStrayDirReason:
 
 
 class TestTheGuardFixtureIsArmed:
-    """Shape pinned structurally; ``tests/scripts`` itself does not bind the guard."""
+    """Shape pinned structurally; ``tests/scripts`` inherits the binding from the repo-root conftest.py."""
+
+    def test_it_is_live_in_this_run(self, request: pytest.FixtureRequest) -> None:
+        assert _GUARD_NAME in request.fixturenames, (
+            f'{_GUARD_NAME} is not active for tests/scripts. Bind it in the '
+            'repo-root conftest.py, which tests/scripts inherits.'
+        )
 
     def test_the_fixture_exists(self) -> None:
         assert hasattr(df_pytest_isolation, _GUARD_NAME), (

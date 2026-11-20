@@ -6,6 +6,9 @@ because both suites' conftests put this ``cross_suite_helpers/`` directory on sy
 
 A label is mentioned when the twin contains it as a token bounded by the label alphabet ``[\\w′-]``, verbatim or, for an
 ASCII Greek name with optional digits (``gamma1``), as its Greek letter in either case.
+
+Labels are this check's intended ceiling: capability names and verdicts are deliberately unpinned, per
+``skills/prd/references/decompose-mode.md`` Step 2.5.
 """
 
 from __future__ import annotations

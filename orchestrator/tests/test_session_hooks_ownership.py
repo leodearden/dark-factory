@@ -21,7 +21,7 @@ from _session_hook_fixtures import (
 from shared.process_identity import ProcessIdentity
 
 from orchestrator import session_hooks as sh
-from orchestrator import session_registry as sr
+from orchestrator import session_records
 from orchestrator.session_ownership_probes import EventProbes
 
 
@@ -49,11 +49,11 @@ def test_run_session_start_binds_claude_session_id_on_first_adoption(
     # spawn-claude.sh exports (CLAUDE_SPAWN_OWNER_PPID): adopting is
     # fail-soft, claiming the record permanently is not (esc-4193-10).
     slug = 'session-cockpit-3215040'
-    result_file = str(sr.record_path_for_slug(slug, root=tmp_path).parent / 'result.md')
-    sr.write_record(
-        sr.SessionRecord(
+    result_file = str(session_records.record_path_for_slug(slug, root=tmp_path).parent / 'result.md')
+    session_records.write_record(
+        session_records.SessionRecord(
             session_slug=slug,
-            status=sr.Status.LAUNCHING,
+            status=session_records.Status.LAUNCHING,
             role='session',
             project='cockpit',
             prompt='/spawn cockpit',
@@ -70,16 +70,16 @@ def test_run_session_start_binds_claude_session_id_on_first_adoption(
 
     sh.run_session_start(hook_input, env, root=tmp_path, process_tree=tree)
 
-    record = sr.read_record(slug, root=tmp_path)
+    record = session_records.read_record(slug, root=tmp_path)
     assert record.claude_session_id == 'uuid-parent'
-    assert record.status == sr.Status.RUNNING
+    assert record.status == session_records.Status.RUNNING
     # The rich launching-vintage fields still survive the binding write.
     assert record.role == 'session'
     assert record.project == 'cockpit'
     assert record.prompt == '/spawn cockpit'
     assert record.launcher_pid == 3215040
     assert record.result_file == result_file
-    dirs = list(sr.sessions_dir(root=tmp_path).iterdir())
+    dirs = list(session_records.sessions_dir(root=tmp_path).iterdir())
     assert len(dirs) == 1
     assert dirs[0].name == slug
 
@@ -96,7 +96,7 @@ def test_run_session_start_binds_claude_session_id_on_hand_launched_record(
     sh.run_session_start(hook_input, env={}, root=tmp_path)
 
     slug = sh.hook_session_slug(hook_input, env={})
-    assert sr.read_record(slug, root=tmp_path).claude_session_id == 'sess-hl'
+    assert session_records.read_record(slug, root=tmp_path).claude_session_id == 'sess-hl'
 
 
 def test_run_session_start_does_not_rebind_existing_claude_session_id(
@@ -105,10 +105,10 @@ def test_run_session_start_does_not_rebind_existing_claude_session_id(
     # Bind-once: a re-fired SessionStart against an already-bound record
     # must not churn the binding.
     slug = 'session-cockpit-3215042'
-    sr.write_record(
-        sr.SessionRecord(
+    session_records.write_record(
+        session_records.SessionRecord(
             session_slug=slug,
-            status=sr.Status.LAUNCHING,
+            status=session_records.Status.LAUNCHING,
             launcher_pid=3215042,
             claude_session_id='uuid-parent',
         ),
@@ -119,7 +119,7 @@ def test_run_session_start_does_not_rebind_existing_claude_session_id(
 
     sh.run_session_start(hook_input, env, root=tmp_path)
 
-    assert sr.read_record(slug, root=tmp_path).claude_session_id == 'uuid-parent'
+    assert session_records.read_record(slug, root=tmp_path).claude_session_id == 'uuid-parent'
 
 
 def test_run_session_start_leaves_claude_session_id_unbound_when_stdin_has_no_session_id(
@@ -129,8 +129,8 @@ def test_run_session_start_leaves_claude_session_id_unbound_when_stdin_has_no_se
     # carries no session_id; that must NEVER be bound as an owner token, or
     # every discriminator-less session would collide on one bogus binding.
     slug = 'session-cockpit-3215043'
-    sr.write_record(
-        sr.SessionRecord(session_slug=slug, status=sr.Status.LAUNCHING, launcher_pid=3215043),
+    session_records.write_record(
+        session_records.SessionRecord(session_slug=slug, status=session_records.Status.LAUNCHING, launcher_pid=3215043),
         root=tmp_path,
     )
     hook_input = {'cwd': '/home/leo/src/dark-factory'}
@@ -138,9 +138,9 @@ def test_run_session_start_leaves_claude_session_id_unbound_when_stdin_has_no_se
 
     sh.run_session_start(hook_input, env, root=tmp_path)
 
-    record = sr.read_record(slug, root=tmp_path)
+    record = session_records.read_record(slug, root=tmp_path)
     assert record.claude_session_id is None
-    assert record.status == sr.Status.RUNNING
+    assert record.status == session_records.Status.RUNNING
 
 
 # ---------------------------------------------------------------------------
@@ -162,8 +162,8 @@ def test_hook_session_slug_adopts_env_slug_when_record_unbound(tmp_path: Path) -
     # A spawn-claude.sh `launching`-vintage (or pre-task-4193) record carries
     # no binding; the first matching hook adopts and binds it.
     slug = 'session-cockpit-3215051'
-    sr.write_record(
-        sr.SessionRecord(session_slug=slug, status=sr.Status.LAUNCHING, launcher_pid=3215051),
+    session_records.write_record(
+        session_records.SessionRecord(session_slug=slug, status=session_records.Status.LAUNCHING, launcher_pid=3215051),
         root=tmp_path,
     )
     hook_input = {'session_id': 'uuid-parent', 'cwd': '/home/leo/src/dark-factory'}
@@ -174,10 +174,10 @@ def test_hook_session_slug_adopts_env_slug_when_record_unbound(tmp_path: Path) -
 
 def test_hook_session_slug_adopts_env_slug_when_binding_matches(tmp_path: Path) -> None:
     slug = 'session-cockpit-3215052'
-    sr.write_record(
-        sr.SessionRecord(
+    session_records.write_record(
+        session_records.SessionRecord(
             session_slug=slug,
-            status=sr.Status.RUNNING,
+            status=session_records.Status.RUNNING,
             launcher_pid=3215052,
             claude_session_id='uuid-parent',
         ),
@@ -195,10 +195,10 @@ def test_hook_session_slug_forks_when_binding_mismatches(tmp_path: Path) -> None
     # the session spawn-claude.sh launched. It must fall through to the
     # unchanged hand-launched keying instead of adopting the parent's slug.
     slug = 'session-cockpit-3215053'
-    sr.write_record(
-        sr.SessionRecord(
+    session_records.write_record(
+        session_records.SessionRecord(
             session_slug=slug,
-            status=sr.Status.RUNNING,
+            status=session_records.Status.RUNNING,
             launcher_pid=3215053,
             claude_session_id='uuid-parent',
         ),
@@ -213,11 +213,11 @@ def test_hook_session_slug_forks_when_binding_mismatches(tmp_path: Path) -> None
     }
 
     forked = sh.hook_session_slug(hook_input, env, root=tmp_path)
-    assert forked == sr.build_session_slug(
+    assert forked == session_records.build_session_slug(
         'unblock',
         'df',
         '2085',
-        'uuid-nested',  # type: ignore[arg-type]
+        'uuid-nested',
     )
     assert forked != slug
 
@@ -230,19 +230,19 @@ def test_run_session_start_nested_inheritor_forks_leaving_parent_untouched(
     # SessionStart must land on its OWN record, leaving the parent's byte-
     # identical.
     slug = 'session-cockpit-3215041'
-    sr.write_record(
-        sr.SessionRecord(
+    session_records.write_record(
+        session_records.SessionRecord(
             session_slug=slug,
-            status=sr.Status.RUNNING,
+            status=session_records.Status.RUNNING,
             title='parent-title-marker',
             launcher_pid=3215041,
             parent_session_id='root-df-1-1',
-            display=sr.Display(kind='wm', wm_title='parent-marker', wm_window_id='0x1a'),
+            display=session_records.Display(kind='wm', wm_title='parent-marker', wm_window_id='0x1a'),
             claude_session_id='uuid-parent',
         ),
         root=tmp_path,
     )
-    snapshot = sr.read_record(slug, root=tmp_path).to_dict()
+    snapshot = session_records.read_record(slug, root=tmp_path).to_dict()
 
     hook_input = {'session_id': 'uuid-nested', 'cwd': '/home/leo/src/dark-factory'}
     # CLAUDE_SPAWN_PARENT_ID/CLAUDE_SPAWN_TITLE/WINDOWID are the concrete
@@ -257,14 +257,14 @@ def test_run_session_start_nested_inheritor_forks_leaving_parent_untouched(
 
     sh.run_session_start(hook_input, env, root=tmp_path)
 
-    assert sr.read_record(slug, root=tmp_path).to_dict() == snapshot
+    assert session_records.read_record(slug, root=tmp_path).to_dict() == snapshot
 
     forked_slug = sh.hook_session_slug(hook_input, env, root=tmp_path)
     assert forked_slug != slug
-    forked = sr.read_record(forked_slug, root=tmp_path)
-    assert forked.status == sr.Status.RUNNING
+    forked = session_records.read_record(forked_slug, root=tmp_path)
+    assert forked.status == session_records.Status.RUNNING
     assert forked.claude_session_id == 'uuid-nested'
-    assert len(list(sr.sessions_dir(root=tmp_path).iterdir())) == 2
+    assert len(list(session_records.sessions_dir(root=tmp_path).iterdir())) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -279,10 +279,10 @@ def test_run_notification_and_stop_keep_writing_to_the_bound_record(
     # capture included -- the ownership probe must not disturb the task-2511
     # convergence it gates.
     slug = 'session-cockpit-3215060'
-    sr.write_record(
-        sr.SessionRecord(
+    session_records.write_record(
+        session_records.SessionRecord(
             session_slug=slug,
-            status=sr.Status.RUNNING,
+            status=session_records.Status.RUNNING,
             launcher_pid=3215060,
             claude_session_id='uuid-parent',
         ),
@@ -296,24 +296,24 @@ def test_run_notification_and_stop_keep_writing_to_the_bound_record(
     env = {'CLAUDE_SPAWN_SESSION_ID': slug}
 
     sh.run_notification(hook_input, env, root=tmp_path)
-    record = sr.read_record(slug, root=tmp_path)
-    assert record.status == sr.Status.AWAITING_INPUT
+    record = session_records.read_record(slug, root=tmp_path)
+    assert record.status == session_records.Status.AWAITING_INPUT
     assert record.question is not None
     assert record.question.text == 'approve rollout?'
 
     sh.run_stop(hook_input, env, root=tmp_path)
-    assert sr.read_record(slug, root=tmp_path).status == sr.Status.IDLE
-    assert len(list(sr.sessions_dir(root=tmp_path).iterdir())) == 1
+    assert session_records.read_record(slug, root=tmp_path).status == session_records.Status.IDLE
+    assert len(list(session_records.sessions_dir(root=tmp_path).iterdir())) == 1
 
 
 def test_run_stop_from_nested_inheritor_does_not_idle_the_parent(tmp_path: Path) -> None:
     # The sharpest statement of the bug: a nested claude finishing its turn
     # must not advertise the spawning session as idle mid-turn.
     slug = 'session-cockpit-3215061'
-    sr.write_record(
-        sr.SessionRecord(
+    session_records.write_record(
+        session_records.SessionRecord(
             session_slug=slug,
-            status=sr.Status.RUNNING,
+            status=session_records.Status.RUNNING,
             launcher_pid=3215061,
             claude_session_id='uuid-parent',
         ),
@@ -324,11 +324,11 @@ def test_run_stop_from_nested_inheritor_does_not_idle_the_parent(tmp_path: Path)
 
     sh.run_stop(hook_input, env, root=tmp_path)
 
-    assert sr.read_record(slug, root=tmp_path).status == sr.Status.RUNNING
+    assert session_records.read_record(slug, root=tmp_path).status == session_records.Status.RUNNING
     forked_slug = sh.hook_session_slug(hook_input, env, root=tmp_path)
     assert forked_slug != slug
-    forked = sr.read_record(forked_slug, root=tmp_path)
-    assert forked.status == sr.Status.IDLE
+    forked = session_records.read_record(forked_slug, root=tmp_path)
+    assert forked.status == session_records.Status.IDLE
     assert forked.claude_session_id == 'uuid-nested'
 
 
@@ -336,10 +336,10 @@ def test_run_notification_from_nested_inheritor_does_not_flip_the_parent(
     tmp_path: Path,
 ) -> None:
     slug = 'session-cockpit-3215062'
-    sr.write_record(
-        sr.SessionRecord(
+    session_records.write_record(
+        session_records.SessionRecord(
             session_slug=slug,
-            status=sr.Status.RUNNING,
+            status=session_records.Status.RUNNING,
             launcher_pid=3215062,
             claude_session_id='uuid-parent',
         ),
@@ -354,11 +354,11 @@ def test_run_notification_from_nested_inheritor_does_not_flip_the_parent(
 
     sh.run_notification(hook_input, env, root=tmp_path)
 
-    parent = sr.read_record(slug, root=tmp_path)
-    assert parent.status == sr.Status.RUNNING
+    parent = session_records.read_record(slug, root=tmp_path)
+    assert parent.status == session_records.Status.RUNNING
     assert parent.question is None
-    forked = sr.read_record(sh.hook_session_slug(hook_input, env, root=tmp_path), root=tmp_path)
-    assert forked.status == sr.Status.AWAITING_INPUT
+    forked = session_records.read_record(sh.hook_session_slug(hook_input, env, root=tmp_path), root=tmp_path)
+    assert forked.status == session_records.Status.AWAITING_INPUT
     assert forked.question is not None
     assert forked.question.text == 'nested asks something'
 
@@ -370,8 +370,8 @@ def test_refresh_path_binds_a_legacy_unbound_record(tmp_path: Path) -> None:
     # SessionStart that may never come again -- so the next nested event is
     # already discriminable.
     slug = 'session-cockpit-3215063'
-    sr.write_record(
-        sr.SessionRecord(session_slug=slug, status=sr.Status.RUNNING, launcher_pid=3215063),
+    session_records.write_record(
+        session_records.SessionRecord(session_slug=slug, status=session_records.Status.RUNNING, launcher_pid=3215063),
         root=tmp_path,
     )
     hook_input = {'session_id': 'uuid-parent', 'cwd': '/home/leo/src/dark-factory'}
@@ -380,10 +380,10 @@ def test_refresh_path_binds_a_legacy_unbound_record(tmp_path: Path) -> None:
 
     sh.run_stop(hook_input, env, root=tmp_path, process_tree=tree)
 
-    record = sr.read_record(slug, root=tmp_path)
-    assert record.status == sr.Status.IDLE
+    record = session_records.read_record(slug, root=tmp_path)
+    assert record.status == session_records.Status.IDLE
     assert record.claude_session_id == 'uuid-parent'
-    assert len(list(sr.sessions_dir(root=tmp_path).iterdir())) == 1
+    assert len(list(session_records.sessions_dir(root=tmp_path).iterdir())) == 1
 
 
 def test_refresh_path_leaves_an_unproven_legacy_record_unbound(tmp_path: Path) -> None:
@@ -394,8 +394,8 @@ def test_refresh_path_leaves_an_unproven_legacy_record_unbound(tmp_path: Path) -
     # collapse), but the record is left OPEN -- a nested `claude -p` must not
     # be able to claim it and exile the owner onto a degraded session-x row.
     slug = 'session-cockpit-3215065'
-    sr.write_record(
-        sr.SessionRecord(session_slug=slug, status=sr.Status.RUNNING, launcher_pid=3215065),
+    session_records.write_record(
+        session_records.SessionRecord(session_slug=slug, status=session_records.Status.RUNNING, launcher_pid=3215065),
         root=tmp_path,
     )
     env = {'CLAUDE_SPAWN_SESSION_ID': slug}
@@ -407,17 +407,17 @@ def test_refresh_path_leaves_an_unproven_legacy_record_unbound(tmp_path: Path) -
         process_tree=claude_process_tree(None),
     )
 
-    record = sr.read_record(slug, root=tmp_path)
+    record = session_records.read_record(slug, root=tmp_path)
     assert record.claude_session_id is None
-    assert len(list(sr.sessions_dir(root=tmp_path).iterdir())) == 1
+    assert len(list(session_records.sessions_dir(root=tmp_path).iterdir())) == 1
 
 
 def test_refresh_path_does_not_rebind_or_write_when_already_bound(tmp_path: Path) -> None:
     slug = 'session-cockpit-3215064'
-    sr.write_record(
-        sr.SessionRecord(
+    session_records.write_record(
+        session_records.SessionRecord(
             session_slug=slug,
-            status=sr.Status.RUNNING,
+            status=session_records.Status.RUNNING,
             launcher_pid=3215064,
             claude_session_id='uuid-parent',
         ),
@@ -428,7 +428,7 @@ def test_refresh_path_does_not_rebind_or_write_when_already_bound(tmp_path: Path
 
     sh.run_stop(hook_input, env, root=tmp_path)
 
-    assert sr.read_record(slug, root=tmp_path).claude_session_id == 'uuid-parent'
+    assert session_records.read_record(slug, root=tmp_path).claude_session_id == 'uuid-parent'
 
 
 # ---------------------------------------------------------------------------
@@ -440,11 +440,11 @@ def test_hook_session_slug_adopts_when_record_is_corrupt(tmp_path: Path) -> None
     # A corrupt body must degrade to the pre-task-4193 behaviour (adopt), not
     # fork a spurious record; the reaper already has its own 'corrupt' rule.
     slug = 'session-cockpit-3215070'
-    record_path = sr.record_path_for_slug(slug, root=tmp_path)
+    record_path = session_records.record_path_for_slug(slug, root=tmp_path)
     record_path.parent.mkdir(parents=True, exist_ok=True)
     record_path.write_text('not-json{{{')
-    with pytest.raises(sr.CorruptSessionRecord):
-        sr.read_record(slug, root=tmp_path)
+    with pytest.raises(session_records.CorruptSessionRecord):
+        session_records.read_record(slug, root=tmp_path)
 
     hook_input = {'session_id': 'uuid-parent', 'cwd': '/home/leo/src/dark-factory'}
     env = {'CLAUDE_SPAWN_SESSION_ID': slug}
@@ -464,7 +464,7 @@ def test_hook_session_slug_adopts_when_read_record_raises(
     def _boom(*_args: object, **_kwargs: object) -> None:
         raise OSError('disk on fire')
 
-    monkeypatch.setattr(sr, 'read_record', _boom)
+    monkeypatch.setattr(session_records, 'read_record', _boom)
 
     with caplog.at_level(logging.WARNING):
         assert sh.hook_session_slug(hook_input, env, root=tmp_path) == slug
@@ -488,22 +488,22 @@ def test_run_stop_fail_soft_when_probe_read_raises(
     hook_input = {'session_id': 'uuid-parent', 'cwd': '/home/leo/src/dark-factory'}
     env = {'CLAUDE_SPAWN_SESSION_ID': slug}
 
-    real_read_record = sr.read_record
+    real_read_record = session_records.read_record
     calls: list[int] = []
 
-    def _boom_once(*args: object, **kwargs: object) -> sr.SessionRecord:
+    def _boom_once(*args: object, **kwargs: object) -> session_records.SessionRecord:
         calls.append(1)
         if len(calls) == 1:
             raise OSError('disk on fire')
         return real_read_record(*args, **kwargs)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(sr, 'read_record', _boom_once)
+    monkeypatch.setattr(session_records, 'read_record', _boom_once)
 
     assert sh.run_stop(hook_input, env, root=tmp_path).startswith('\033]0;')
     # The probe was consulted (and degraded) rather than skipped.
     assert len(calls) >= 1
     # Degrading to adopt means the env slug still owns the write.
-    assert sr.read_record(slug, root=tmp_path).status == sr.Status.IDLE
+    assert session_records.read_record(slug, root=tmp_path).status == session_records.Status.IDLE
 
 
 def test_main_session_start_fail_soft_when_probe_read_raises(
@@ -521,63 +521,52 @@ def test_main_session_start_fail_soft_when_probe_read_raises(
     monkeypatch.setenv('CLAUDE_SPAWN_SESSION_ID', slug)
     stdin_json(monkeypatch, {'session_id': 'uuid-parent', 'cwd': '/home/leo/src/dark-factory'})
 
-    real_read_record = sr.read_record
+    real_read_record = session_records.read_record
     calls: list[int] = []
 
-    def _boom_once(*args: object, **kwargs: object) -> sr.SessionRecord:
+    def _boom_once(*args: object, **kwargs: object) -> session_records.SessionRecord:
         calls.append(1)
         if len(calls) == 1:
             raise OSError('disk on fire')
         return real_read_record(*args, **kwargs)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(sr, 'read_record', _boom_once)
+    monkeypatch.setattr(session_records, 'read_record', _boom_once)
 
     assert sh.main(['session-start']) == 0
 
     # The probe was consulted (and degraded), and adopting the env slug
     # unchecked is exactly the pre-task-4193 behaviour: one record, written.
     assert len(calls) >= 1
-    record = sr.read_record(slug, root=tmp_path)
-    assert record.status == sr.Status.RUNNING
+    record = session_records.read_record(slug, root=tmp_path)
+    assert record.status == session_records.Status.RUNNING
     # ...but a probe that could not answer must not CLAIM the record either:
     # adopting is fail-soft, binding is permanent (esc-4193-10).
     assert record.claude_session_id is None
-    assert len(list(sr.sessions_dir(root=tmp_path).iterdir())) == 1
+    assert len(list(session_records.sessions_dir(root=tmp_path).iterdir())) == 1
 
 
-def test_hand_launched_session_unaffected_by_ownership_probe(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # A hand-launched session (no CLAUDE_SPAWN_SESSION_ID) has nothing to
-    # probe and must pay no probe cost at all -- the must-not-be-called
-    # idiom, not merely an assertion that the outcome is unchanged. Note
-    # run_session_start legitimately calls sr.read_record itself, so it is
-    # sh._env_slug_is_owned that is booby-trapped here, not the registry.
-    def _boom(*_args: object, **_kwargs: object) -> bool:
-        raise AssertionError('ownership probe must not run for a hand-launched session')
-
-    monkeypatch.setattr(sh, '_env_slug_is_owned', _boom)
-
+def test_hand_launched_session_keeps_one_record_across_hook_events(tmp_path: Path) -> None:
+    # A hand-launched session (no CLAUDE_SPAWN_SESSION_ID) keeps the
+    # hand-launched keying through every hook event, one record, same slug.
     hook_input = {'session_id': 'sess-hand', 'cwd': '/home/leo/src/dark-factory'}
     slug = sh.hook_session_slug(hook_input, env={}, root=tmp_path)
 
     sh.run_session_start(hook_input, env={}, root=tmp_path)
-    assert sr.read_record(slug, root=tmp_path).status == sr.Status.RUNNING
+    assert session_records.read_record(slug, root=tmp_path).status == session_records.Status.RUNNING
 
     sh.run_notification(hook_input, env={}, root=tmp_path)
-    assert sr.read_record(slug, root=tmp_path).status == sr.Status.AWAITING_INPUT
+    assert session_records.read_record(slug, root=tmp_path).status == session_records.Status.AWAITING_INPUT
 
     sh.run_stop(hook_input, env={}, root=tmp_path)
-    assert sr.read_record(slug, root=tmp_path).status == sr.Status.IDLE
+    assert session_records.read_record(slug, root=tmp_path).status == session_records.Status.IDLE
 
-    assert slug == sr.build_session_slug(
+    assert slug == session_records.build_session_slug(
         'session',
         'dark-factory',
         None,
-        'sess-hand',  # type: ignore[arg-type]
+        'sess-hand',
     )
-    assert len(list(sr.sessions_dir(root=tmp_path).iterdir())) == 1
+    assert len(list(session_records.sessions_dir(root=tmp_path).iterdir())) == 1
 
 
 def test_hook_session_slug_adopts_when_stdin_has_no_session_id(tmp_path: Path) -> None:
@@ -585,10 +574,10 @@ def test_hook_session_slug_adopts_when_stdin_has_no_session_id(tmp_path: Path) -
     # forking here would key every discriminator-less session on the one
     # 'unknown' literal hook_session_slug falls back to.
     slug = 'session-cockpit-3215074'
-    sr.write_record(
-        sr.SessionRecord(
+    session_records.write_record(
+        session_records.SessionRecord(
             session_slug=slug,
-            status=sr.Status.RUNNING,
+            status=session_records.Status.RUNNING,
             launcher_pid=3215074,
             claude_session_id='uuid-parent',
         ),
@@ -627,7 +616,7 @@ def test_hook_session_slug_treats_a_blank_session_id_as_unknown(tmp_path: Path) 
 
 
 def test_bind_claude_session_id_ignores_a_blank_stdin_session_id() -> None:
-    record = sr.SessionRecord(session_slug='s', status=sr.Status.LAUNCHING)
+    record = session_records.SessionRecord(session_slug='s', status=session_records.Status.LAUNCHING)
     probes = EventProbes({}, claude_process_tree(None))
     assert sh._bind_claude_session_id(record, {'session_id': '   '}, probes=probes) is False
     assert record.claude_session_id is None
@@ -648,10 +637,10 @@ def test_hook_session_slug_adopts_env_slug_when_a_clear_remints_the_session_id(
     # claude_owner_pid must match the pid resolved for this event.
     tree = claude_process_tree(424_242)
     slug = 'session-cockpit-3215080'
-    sr.write_record(
-        sr.SessionRecord(
+    session_records.write_record(
+        session_records.SessionRecord(
             session_slug=slug,
-            status=sr.Status.RUNNING,
+            status=session_records.Status.RUNNING,
             launcher_pid=3215080,
             claude_session_id='uuid-before-clear',
             claude_owner_pid=424_242,
@@ -680,10 +669,10 @@ def test_hook_session_slug_does_not_forgive_a_resume_remint(tmp_path: Path) -> N
     # nested process report 'resume' too, so honouring it here would let any
     # inheritor claim its spawner's record even with the opt-in withheld.
     slug = 'session-cockpit-3215087'
-    sr.write_record(
-        sr.SessionRecord(
+    session_records.write_record(
+        session_records.SessionRecord(
             session_slug=slug,
-            status=sr.Status.RUNNING,
+            status=session_records.Status.RUNNING,
             launcher_pid=3215087,
             claude_session_id='uuid-before',
         ),
@@ -715,10 +704,10 @@ def test_run_session_start_rebinds_on_an_owner_only_source(
     # orchestrator/tests/test_session_hooks_bash.py::test_nested_compact_cannot_invert_ownership.
     tree = claude_process_tree(424_242)
     slug = f'session-cockpit-321508{["clear", "compact"].index(source) + 1}'
-    sr.write_record(
-        sr.SessionRecord(
+    session_records.write_record(
+        session_records.SessionRecord(
             session_slug=slug,
-            status=sr.Status.RUNNING,
+            status=session_records.Status.RUNNING,
             launcher_pid=3215081,
             claude_session_id='uuid-before',
             claude_owner_pid=424_242,
@@ -734,10 +723,10 @@ def test_run_session_start_rebinds_on_an_owner_only_source(
 
     sh.run_session_start(hook_input, env, root=tmp_path, process_tree=tree)
 
-    record = sr.read_record(slug, root=tmp_path)
+    record = session_records.read_record(slug, root=tmp_path)
     assert record.claude_session_id == 'uuid-after'
-    assert record.status == sr.Status.RUNNING
-    assert len(list(sr.sessions_dir(root=tmp_path).iterdir())) == 1
+    assert record.status == session_records.Status.RUNNING
+    assert len(list(session_records.sessions_dir(root=tmp_path).iterdir())) == 1
 
 
 def test_run_session_start_startup_source_with_mismatched_id_still_forks(
@@ -746,10 +735,10 @@ def test_run_session_start_startup_source_with_mismatched_id_still_forks(
     # The other direction: a nested claude is always a fresh process and so
     # always reports source='startup'. It must still fork.
     slug = 'session-cockpit-3215084'
-    sr.write_record(
-        sr.SessionRecord(
+    session_records.write_record(
+        session_records.SessionRecord(
             session_slug=slug,
-            status=sr.Status.RUNNING,
+            status=session_records.Status.RUNNING,
             launcher_pid=3215084,
             claude_session_id='uuid-parent',
         ),
@@ -764,8 +753,8 @@ def test_run_session_start_startup_source_with_mismatched_id_still_forks(
 
     sh.run_session_start(hook_input, env, root=tmp_path)
 
-    assert sr.read_record(slug, root=tmp_path).claude_session_id == 'uuid-parent'
-    assert len(list(sr.sessions_dir(root=tmp_path).iterdir())) == 2
+    assert session_records.read_record(slug, root=tmp_path).claude_session_id == 'uuid-parent'
+    assert len(list(session_records.sessions_dir(root=tmp_path).iterdir())) == 2
 
 
 def test_run_session_start_resume_source_with_mismatched_id_still_forks(
@@ -777,10 +766,10 @@ def test_run_session_start_resume_source_with_mismatched_id_still_forks(
     # _OWNER_ONLY_SESSION_START_SOURCES; a spawned session /resume'd in place
     # simply forks, which is the fail-safe direction.
     slug = 'session-cockpit-3215086'
-    sr.write_record(
-        sr.SessionRecord(
+    session_records.write_record(
+        session_records.SessionRecord(
             session_slug=slug,
-            status=sr.Status.RUNNING,
+            status=session_records.Status.RUNNING,
             launcher_pid=3215086,
             claude_session_id='uuid-parent',
         ),
@@ -795,10 +784,10 @@ def test_run_session_start_resume_source_with_mismatched_id_still_forks(
 
     sh.run_session_start(hook_input, env, root=tmp_path)
 
-    parent = sr.read_record(slug, root=tmp_path)
+    parent = session_records.read_record(slug, root=tmp_path)
     assert parent.claude_session_id == 'uuid-parent'
-    assert parent.status == sr.Status.RUNNING
-    assert len(list(sr.sessions_dir(root=tmp_path).iterdir())) == 2
+    assert parent.status == session_records.Status.RUNNING
+    assert len(list(session_records.sessions_dir(root=tmp_path).iterdir())) == 2
 
 
 def test_refresh_path_ignores_a_forged_owner_only_source(tmp_path: Path) -> None:
@@ -807,10 +796,10 @@ def test_refresh_path_ignores_a_forged_owner_only_source(tmp_path: Path) -> None
     # forged one on a Stop must not be honoured -- otherwise any inheritor
     # gets a one-word bypass of the whole ownership check.
     slug = 'session-cockpit-3215085'
-    sr.write_record(
-        sr.SessionRecord(
+    session_records.write_record(
+        session_records.SessionRecord(
             session_slug=slug,
-            status=sr.Status.RUNNING,
+            status=session_records.Status.RUNNING,
             launcher_pid=3215085,
             claude_session_id='uuid-parent',
         ),
@@ -825,10 +814,10 @@ def test_refresh_path_ignores_a_forged_owner_only_source(tmp_path: Path) -> None
 
     sh.run_stop(hook_input, env, root=tmp_path)
 
-    parent = sr.read_record(slug, root=tmp_path)
+    parent = session_records.read_record(slug, root=tmp_path)
     assert parent.claude_session_id == 'uuid-parent'
-    assert parent.status == sr.Status.RUNNING
-    assert len(list(sr.sessions_dir(root=tmp_path).iterdir())) == 2
+    assert parent.status == session_records.Status.RUNNING
+    assert len(list(session_records.sessions_dir(root=tmp_path).iterdir())) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -848,10 +837,10 @@ def test_forked_inheritor_records_its_spawner_as_parent(tmp_path: Path) -> None:
 
     sh.run_session_start(hook_input, env, root=tmp_path)
 
-    forked = sr.read_record(sh.hook_session_slug(hook_input, env, root=tmp_path), root=tmp_path)
+    forked = session_records.read_record(sh.hook_session_slug(hook_input, env, root=tmp_path), root=tmp_path)
     assert forked.parent_session_id == slug
     # And the spawning session's own record still points where it did.
-    assert sr.read_record(slug, root=tmp_path).parent_session_id is None
+    assert session_records.read_record(slug, root=tmp_path).parent_session_id is None
 
 
 def test_forked_inheritor_does_not_claim_the_spawners_window(
@@ -875,7 +864,7 @@ def test_forked_inheritor_does_not_claim_the_spawners_window(
 
     sh.run_session_start(hook_input, env, root=tmp_path)
 
-    forked = sr.read_record(sh.hook_session_slug(hook_input, env, root=tmp_path), root=tmp_path)
+    forked = session_records.read_record(sh.hook_session_slug(hook_input, env, root=tmp_path), root=tmp_path)
     assert forked.display is None
 
 
@@ -903,7 +892,7 @@ def test_forked_inheritor_does_not_inherit_the_spawners_role_task_or_title(
 
     sh.run_session_start(hook_input, env, root=tmp_path)
 
-    forked = sr.read_record(sh.hook_session_slug(hook_input, env, root=tmp_path), root=tmp_path)
+    forked = session_records.read_record(sh.hook_session_slug(hook_input, env, root=tmp_path), root=tmp_path)
     assert forked.role == 'session'
     # 'dark-factory' is the cwd basename, NOT the inherited 'df': every
     # load-bearing key of _SPAWNER_IDENTITY_ENV_KEYS is set here with a value
@@ -916,7 +905,7 @@ def test_forked_inheritor_does_not_inherit_the_spawners_role_task_or_title(
     assert forked.title == 'session:dark-factory'
     # And the spawning session's own record is untouched -- role/title
     # never carried spawn env in the first place (see write_bound_parent).
-    spawner = sr.read_record(slug, root=tmp_path)
+    spawner = session_records.read_record(slug, root=tmp_path)
     assert spawner.role == ''
     assert spawner.title == ''
 
@@ -924,15 +913,15 @@ def test_forked_inheritor_does_not_inherit_the_spawners_role_task_or_title(
 @pytest.mark.parametrize(
     ('handler', 'status'),
     [
-        (sh.run_stop, sr.Status.IDLE),
-        (sh.run_notification, sr.Status.AWAITING_INPUT),
+        (sh.run_stop, session_records.Status.IDLE),
+        (sh.run_notification, session_records.Status.AWAITING_INPUT),
     ],
     ids=['stop', 'notification'],
 )
 def test_forked_inheritor_retitle_describes_its_own_record(
     tmp_path: Path,
     handler: Callable[..., str],
-    status: sr.Status,
+    status: session_records.Status,
 ) -> None:
     # The escape goes to the hook process's OWN controlling terminal, so it
     # describes the session whose hook fired; a Bash-tool-launched nested
@@ -948,7 +937,7 @@ def test_forked_inheritor_retitle_describes_its_own_record(
     sh.run_session_start(hook_input, env, root=tmp_path)
     osc = handler(hook_input, env, root=tmp_path)
 
-    forked = sr.read_record(sh.hook_session_slug(hook_input, env, root=tmp_path), root=tmp_path)
+    forked = session_records.read_record(sh.hook_session_slug(hook_input, env, root=tmp_path), root=tmp_path)
     assert forked.title == 'session:dark-factory'
     assert osc == sh.osc_retitle_sequence(status, forked.title)
     assert forked.status == status
@@ -972,17 +961,17 @@ def test_forked_inheritor_retitle_falls_back_to_its_own_identity(
 
     osc = sh.run_stop(hook_input, env, root=tmp_path)
 
-    assert osc == sh.osc_retitle_sequence(sr.Status.IDLE, 'session:dark-factory')
+    assert osc == sh.osc_retitle_sequence(session_records.Status.IDLE, 'session:dark-factory')
 
 
 def test_adopted_session_retitle_keeps_its_spawn_identity(tmp_path: Path) -> None:
     # The strip is fork-only: the owning session's blank-titled record still
     # retitles from its own spawn identity.
     slug = 'session-cockpit-3215096'
-    sr.write_record(
-        sr.SessionRecord(
+    session_records.write_record(
+        session_records.SessionRecord(
             session_slug=slug,
-            status=sr.Status.RUNNING,
+            status=session_records.Status.RUNNING,
             launcher_pid=3215096,
             claude_session_id='uuid-owner',
         ),
@@ -998,7 +987,7 @@ def test_adopted_session_retitle_keeps_its_spawn_identity(tmp_path: Path) -> Non
 
     osc = sh.run_stop(hook_input, env, root=tmp_path)
 
-    assert osc == sh.osc_retitle_sequence(sr.Status.IDLE, 'unblock:df#2085')
+    assert osc == sh.osc_retitle_sequence(session_records.Status.IDLE, 'unblock:df#2085')
 
 
 def test_adopted_session_still_resolves_the_spawn_window_marker(
@@ -1016,7 +1005,7 @@ def test_adopted_session_still_resolves_the_spawn_window_marker(
 
     sh.run_session_start(hook_input, env, root=tmp_path)
 
-    display = sr.read_record(slug, root=tmp_path).display
+    display = session_records.read_record(slug, root=tmp_path).display
     assert display is not None
     assert display.wm_title == 'parent-marker'
     assert display.wm_window_id == '0x1a'
@@ -1045,7 +1034,7 @@ def test_forked_inheritor_record_gets_a_pid_that_dies_with_it(tmp_path: Path) ->
     sh.run_session_start(hook_input, env, root=tmp_path, process_tree=tree)
 
     forked_slug = sh.hook_session_slug(hook_input, env, root=tmp_path, process_tree=tree)
-    forked = sr.read_record(forked_slug, root=tmp_path)
+    forked = session_records.read_record(forked_slug, root=tmp_path)
     assert forked.launcher_pid == 424242
 
 
@@ -1059,7 +1048,7 @@ def test_hand_launched_record_keeps_the_durable_session_leader_pid(tmp_path: Pat
     sh.run_session_start(hook_input, env={}, root=tmp_path, process_tree=tree)
 
     slug = sh.hook_session_slug(hook_input, env={}, root=tmp_path, process_tree=tree)
-    assert sr.read_record(slug, root=tmp_path).launcher_pid == 515151
+    assert session_records.read_record(slug, root=tmp_path).launcher_pid == 515151
 
 
 # ---------------------------------------------------------------------------
@@ -1087,7 +1076,7 @@ def test_the_bind_stamps_the_owner_identity_with_the_owner_pid(
         hook_input, env={}, root=tmp_path, process_tree=claude_process_tree(owner_pid)
     )
 
-    record = sr.read_record(slug, root=tmp_path)
+    record = session_records.read_record(slug, root=tmp_path)
     assert record.claude_owner_pid == owner_pid
     assert record.claude_owner_identity == (own_identity() if owner_resolved else None)
 
@@ -1099,7 +1088,7 @@ def test_a_new_record_stamps_the_launcher_identity(tmp_path: Path) -> None:
     sh.run_session_start(hook_input, env={}, root=tmp_path, process_tree=tree)
 
     slug = sh.hook_session_slug(hook_input, env={}, root=tmp_path, process_tree=tree)
-    record = sr.read_record(slug, root=tmp_path)
+    record = session_records.read_record(slug, root=tmp_path)
     assert record.launcher_pid == os.getpid()
     assert record.launcher_identity == own_identity()
 
@@ -1112,10 +1101,10 @@ def _write_owned_by_this_process(tmp_path: Path, recorded: ProcessIdentity) -> s
     slug = sh.hook_session_slug(
         _RECLAIM_EVENT, env={}, root=tmp_path, process_tree=claude_process_tree(None)
     )
-    sr.write_record(
-        sr.SessionRecord(
+    session_records.write_record(
+        session_records.SessionRecord(
             session_slug=slug,
-            status=sr.Status.IDLE,
+            status=session_records.Status.IDLE,
             cwd=_IDENTITY_CWD,
             claude_session_id=_RECLAIM_EVENT['session_id'],
             claude_owner_pid=os.getpid(),
@@ -1135,7 +1124,7 @@ def test_the_reclaim_judges_the_recorded_owner_by_its_identity(
 
     sh.run_stop(_RECLAIM_EVENT, {}, root=tmp_path, process_tree=claude_process_tree(_DEAD_PID))
 
-    record = sr.read_record(slug, root=tmp_path)
+    record = session_records.read_record(slug, root=tmp_path)
     if variant.judged_dead:
         assert record.claude_owner_pid == _DEAD_PID
     else:
@@ -1152,7 +1141,7 @@ def test_an_owner_recorded_with_this_events_pid_is_re_stamped_iff_its_identity_i
 
     sh.run_stop(_RECLAIM_EVENT, {}, root=tmp_path, process_tree=claude_process_tree(os.getpid()))
 
-    record = sr.read_record(slug, root=tmp_path)
+    record = session_records.read_record(slug, root=tmp_path)
     assert record.claude_owner_pid == os.getpid()
     assert record.claude_owner_identity == (own_identity() if variant.judged_dead else recorded)
 
@@ -1175,11 +1164,11 @@ def _t3_spawn_record(
     owner_identity: ProcessIdentity | None = None,
 ) -> str:
     """A running t3 spawn record of ``_THREAD`` (result_file set), indexed by its thread pointer."""
-    record_dir = sr.record_path_for_slug(_T3_SPAWN_SLUG, root=tmp_path).parent
-    sr.write_record(
-        sr.SessionRecord(
+    record_dir = session_records.record_path_for_slug(_T3_SPAWN_SLUG, root=tmp_path).parent
+    session_records.write_record(
+        session_records.SessionRecord(
             session_slug=_T3_SPAWN_SLUG,
-            status=sr.Status.RUNNING,
+            status=session_records.Status.RUNNING,
             title='unblock:df#8124',
             role='unblock',
             project='df',
@@ -1187,8 +1176,8 @@ def _t3_spawn_record(
             cwd=_IDENTITY_CWD,
             launcher_pid=4242,
             result_file=str(record_dir / 'result.md'),
-            display=sr.Display(
-                kind=sr.DisplayKind.T3.value, wm_title='unblock:df#8124', t3_thread_id=_THREAD
+            display=session_records.Display(
+                kind=session_records.DisplayKind.T3.value, wm_title='unblock:df#8124', t3_thread_id=_THREAD
             ),
             claude_session_id=session_id,
             claude_launch_session_id=session_id,
@@ -1197,7 +1186,7 @@ def _t3_spawn_record(
         ),
         root=tmp_path,
     )
-    assert sr.write_t3_thread_pointer(_THREAD, _T3_SPAWN_SLUG, root=tmp_path)
+    assert session_records.write_t3_thread_pointer(_THREAD, _T3_SPAWN_SLUG, root=tmp_path)
     return _T3_SPAWN_SLUG
 
 
@@ -1209,7 +1198,7 @@ def _hand_slug(hook_input: dict[str, str], tmp_path: Path) -> str:
 
 
 def _record_slugs(tmp_path: Path) -> list[str]:
-    return sorted(path.name for path in sr.sessions_dir(tmp_path).iterdir())
+    return sorted(path.name for path in session_records.sessions_dir(tmp_path).iterdir())
 
 
 def test_a_thread_pointer_adopts_and_binds_an_unbound_spawn_record(tmp_path: Path) -> None:
@@ -1220,14 +1209,14 @@ def test_a_thread_pointer_adopts_and_binds_an_unbound_spawn_record(tmp_path: Pat
         hook_input, _T3_ENV, root=tmp_path, process_tree=claude_process_tree(_T3_CLAUDE_PID)
     )
 
-    record = sr.read_record(slug, root=tmp_path)
+    record = session_records.read_record(slug, root=tmp_path)
     assert record.claude_session_id == 'sess-t3'
     assert record.claude_owner_pid == _T3_CLAUDE_PID
-    assert sr.resolve_session_slug_for_claude_session_id('sess-t3', root=tmp_path) == slug
-    assert sr.resolve_session_slug_for_pid(_T3_CLAUDE_PID, root=tmp_path) == slug
+    assert session_records.resolve_session_slug_for_claude_session_id('sess-t3', root=tmp_path) == slug
+    assert session_records.resolve_session_slug_for_pid(_T3_CLAUDE_PID, root=tmp_path) == slug
     assert _record_slugs(tmp_path) == [slug]
     assert record.display is not None
-    assert (record.display.kind, record.display.t3_thread_id) == (sr.DisplayKind.T3, _THREAD)
+    assert (record.display.kind, record.display.t3_thread_id) == (session_records.DisplayKind.T3, _THREAD)
 
 
 @pytest.mark.parametrize(
@@ -1258,11 +1247,11 @@ def test_the_thread_lane_decides_adopt_or_fork_by_the_claude_pids(
         event, _T3_ENV, root=tmp_path, process_tree=claude_process_tree(event_pid)
     )
 
-    record = sr.read_record(slug, root=tmp_path)
+    record = session_records.read_record(slug, root=tmp_path)
     assert record.claude_session_id == bound_after
     assert record.claude_launch_session_id == recorded_session_id
     assert (_record_slugs(tmp_path) == [slug]) is adopted
-    assert sr.resolve_session_slug_for_t3_thread(_THREAD, root=tmp_path) == slug
+    assert session_records.resolve_session_slug_for_t3_thread(_THREAD, root=tmp_path) == slug
 
 
 def test_a_resume_reaching_its_bound_record_by_the_thread_pointer_reclaims_a_dead_owner(
@@ -1280,10 +1269,10 @@ def test_a_resume_reaching_its_bound_record_by_the_thread_pointer_reclaims_a_dea
         nested, _T3_ENV, root=tmp_path, process_tree=claude_process_tree(_T3_CLAUDE_PID)
     )
 
-    record = sr.read_record(slug, root=tmp_path)
+    record = session_records.read_record(slug, root=tmp_path)
     assert (record.claude_session_id, record.claude_owner_pid) == ('sess-owner', os.getpid())
     assert record.claude_owner_identity == own_identity()
-    assert sr.resolve_session_slug_for_claude_session_id('sess-owner', root=tmp_path) == slug
+    assert session_records.resolve_session_slug_for_claude_session_id('sess-owner', root=tmp_path) == slug
     assert _hand_slug(nested, tmp_path) in _record_slugs(tmp_path)
 
 
@@ -1306,10 +1295,10 @@ def test_an_unheld_thread_is_claimed_by_the_hand_launched_record(
     )
 
     slug = _hand_slug(hook_input, tmp_path)
-    record = sr.read_record(slug, root=tmp_path)
-    assert sr.is_t3_record(record)
+    record = session_records.read_record(slug, root=tmp_path)
+    assert session_records.is_t3_record(record)
     assert record.display is not None and record.display.t3_thread_id == thread_id
-    assert sr.resolve_session_slug_for_t3_thread(thread_id, root=tmp_path) == slug
+    assert session_records.resolve_session_slug_for_t3_thread(thread_id, root=tmp_path) == slug
 
 
 def test_a_thread_id_that_cannot_name_a_pointer_is_never_claimed(tmp_path: Path) -> None:
@@ -1322,9 +1311,9 @@ def test_a_thread_id_that_cannot_name_a_pointer_is_never_claimed(tmp_path: Path)
         process_tree=claude_process_tree(_T3_CLAUDE_PID),
     )
 
-    record = sr.read_record(_hand_slug(hook_input, tmp_path), root=tmp_path)
-    assert not sr.is_t3_record(record)
-    assert not sr.t3_thread_pointers_dir(tmp_path).exists()
+    record = session_records.read_record(_hand_slug(hook_input, tmp_path), root=tmp_path)
+    assert not session_records.is_t3_record(record)
+    assert not session_records.t3_thread_pointers_dir(tmp_path).exists()
 
 
 def test_a_nested_claude_in_a_bound_thread_forks_without_claiming_it(tmp_path: Path) -> None:
@@ -1337,12 +1326,12 @@ def test_a_nested_claude_in_a_bound_thread_forks_without_claiming_it(tmp_path: P
         nested, _T3_ENV, root=tmp_path, process_tree=claude_process_tree(_T3_CLAUDE_PID)
     )
 
-    spawn = sr.read_record(slug, root=tmp_path)
+    spawn = session_records.read_record(slug, root=tmp_path)
     assert (spawn.claude_session_id, spawn.claude_owner_pid) == ('sess-owner', os.getpid())
     nested_slug = _hand_slug(nested, tmp_path)
     assert _record_slugs(tmp_path) == sorted([slug, nested_slug])
-    assert not sr.is_t3_record(sr.read_record(nested_slug, root=tmp_path))
-    assert sr.resolve_session_slug_for_t3_thread(_THREAD, root=tmp_path) == slug
+    assert not session_records.is_t3_record(session_records.read_record(nested_slug, root=tmp_path))
+    assert session_records.resolve_session_slug_for_t3_thread(_THREAD, root=tmp_path) == slug
 
 
 def _dead_owner(kind: str) -> tuple[int, ProcessIdentity | None]:
@@ -1368,11 +1357,11 @@ def test_a_fresh_session_start_after_the_owner_died_rebinds_the_thread_record(
         resumed, _T3_ENV, root=tmp_path, process_tree=claude_process_tree(_T3_CLAUDE_PID)
     )
 
-    record = sr.read_record(slug, root=tmp_path)
+    record = session_records.read_record(slug, root=tmp_path)
     assert record.claude_session_id == 'sess-resumed'
     assert record.claude_launch_session_id == 'sess-owner'
     assert record.claude_owner_pid == _T3_CLAUDE_PID
-    assert sr.resolve_session_slug_for_claude_session_id('sess-resumed', root=tmp_path) == slug
+    assert session_records.resolve_session_slug_for_claude_session_id('sess-resumed', root=tmp_path) == slug
     assert _record_slugs(tmp_path) == [slug]
 
 
@@ -1390,11 +1379,11 @@ def test_only_session_start_rebinds_a_thread_record_whose_owner_died(
         resumed, _T3_ENV, root=tmp_path, process_tree=claude_process_tree(_T3_CLAUDE_PID)
     )
 
-    record = sr.read_record(slug, root=tmp_path)
+    record = session_records.read_record(slug, root=tmp_path)
     assert (record.claude_session_id, record.claude_owner_pid) == ('sess-owner', owner_pid)
-    assert record.status == sr.Status.RUNNING
+    assert record.status == session_records.Status.RUNNING
     assert _hand_slug(resumed, tmp_path) in _record_slugs(tmp_path)
-    assert sr.resolve_session_slug_for_t3_thread(_THREAD, root=tmp_path) == slug
+    assert session_records.resolve_session_slug_for_t3_thread(_THREAD, root=tmp_path) == slug
 
 
 @pytest.mark.parametrize('owned', [True, False], ids=['owned-spawn', 'nested-in-a-spawn'])
@@ -1403,8 +1392,8 @@ def test_an_event_keyed_by_a_spawn_session_id_never_touches_the_thread_pointer(
 ) -> None:
     tmux_slug = 'worker-df-8124-77'
     if owned:
-        sr.write_record(
-            sr.SessionRecord(session_slug=tmux_slug, status=sr.Status.LAUNCHING, launcher_pid=77),
+        session_records.write_record(
+            session_records.SessionRecord(session_slug=tmux_slug, status=session_records.Status.LAUNCHING, launcher_pid=77),
             root=tmp_path,
         )
     else:
@@ -1417,9 +1406,9 @@ def test_an_event_keyed_by_a_spawn_session_id_never_touches_the_thread_pointer(
     )
 
     written = tmux_slug if owned else _hand_slug(hook_input, tmp_path)
-    assert sr.read_record(written, root=tmp_path).claude_session_id == 'sess-tmux'
-    assert not sr.is_t3_record(sr.read_record(written, root=tmp_path))
-    assert not sr.t3_thread_pointers_dir(tmp_path).exists()
+    assert session_records.read_record(written, root=tmp_path).claude_session_id == 'sess-tmux'
+    assert not session_records.is_t3_record(session_records.read_record(written, root=tmp_path))
+    assert not session_records.t3_thread_pointers_dir(tmp_path).exists()
 
 
 def test_a_hand_t3_record_regains_its_lost_thread_pointer_on_its_next_event(
@@ -1428,11 +1417,11 @@ def test_a_hand_t3_record_regains_its_lost_thread_pointer_on_its_next_event(
     hook_input = {'session_id': 'sess-hand', 'cwd': _IDENTITY_CWD}
     tree = claude_process_tree(_T3_CLAUDE_PID)
     sh.run_session_start(hook_input, _T3_ENV, root=tmp_path, process_tree=tree)
-    sr.t3_thread_pointer_path(_THREAD, tmp_path).unlink()
+    session_records.t3_thread_pointer_path(_THREAD, tmp_path).unlink()
 
     sh.run_stop(hook_input, _T3_ENV, root=tmp_path, process_tree=tree)
 
-    assert sr.resolve_session_slug_for_t3_thread(_THREAD, root=tmp_path) == _hand_slug(
+    assert session_records.resolve_session_slug_for_t3_thread(_THREAD, root=tmp_path) == _hand_slug(
         hook_input, tmp_path
     )
 
@@ -1447,5 +1436,5 @@ def test_a_hook_event_never_moves_a_thread_pointer_another_live_record_holds(
 
     sh.run_notification(hand_input, _T3_ENV, root=tmp_path, process_tree=tree)
 
-    assert sr.is_t3_record(sr.read_record(_hand_slug(hand_input, tmp_path), root=tmp_path))
-    assert sr.resolve_session_slug_for_t3_thread(_THREAD, root=tmp_path) == spawn_slug
+    assert session_records.is_t3_record(session_records.read_record(_hand_slug(hand_input, tmp_path), root=tmp_path))
+    assert session_records.resolve_session_slug_for_t3_thread(_THREAD, root=tmp_path) == spawn_slug

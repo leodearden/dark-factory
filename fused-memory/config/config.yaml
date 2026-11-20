@@ -42,7 +42,8 @@ llm:
   # OPENAI_API_BASE environment variables that the openai SDK and mem0 would
   # otherwise fall back to. If you route OpenAI traffic through a gateway by
   # exporting OPENAI_BASE_URL, set OPENAI_API_URL (or edit api_url) to the same
-  # value — otherwise traffic goes to whatever is written here. A disagreement
+  # value — otherwise traffic goes to whatever is written here. The routing LLM
+  # inherits it too, unless routing.openai_api_url is set. A disagreement
   # is logged as a warning at client construction.
   providers:
     openai:
@@ -92,6 +93,11 @@ routing:
   confidence_threshold: 0.7
   use_heuristics: true
   llm_fallback: true
+  # The routing LLM's own endpoint and key (add_memory auto-classification and
+  # read routing); null inherits llm.providers.openai.api_url / api_key. See
+  # config/schema.py::RoutingConfig.
+  openai_api_url: null
+  openai_api_key: null
 
 queue:
   semaphore_limit: ${SEMAPHORE_LIMIT:3}
@@ -803,7 +809,7 @@ write_triage:
   # On replay the 0.60 floor removed 28 contested misfiles for 2 correct
   # contests.
   min_parent_cosine: 0.60
-  # hoist_max_cosine_gap: in the judge band, refuse to hoist from the matched
+  # hoist_max_cosine_gap: on a judged write, refuse to hoist from the matched
   # child to its parent when the parent's cosine is more than this below the
   # child's; store standalone. On replay the 0.05 gap removed 32 contested
   # misfiles for 1 correct contest; with F1 (task 6956) contested misfile fell
@@ -812,14 +818,16 @@ write_triage:
   # JUDGE KNOBS (leaf gamma, task 3128) — also hand-set operator knobs, and
   # deliberately ABOVE the calibration fence below so --write-config preserves
   # them. Every judge knob is green-tier hot-reloadable and read live per
-  # middle-band write.
+  # judged write: every write from t_low up except a near-verbatim restatement
+  # (task 7155), so with the judge off the high band stores rather than files
+  # `restated`.
   #
   # judge_enabled: the kill switch for the LLM arm alone. Defaults TRUE,
   # unlike `enabled` above, because the judge is inert while triage is off —
   # and because a judge that had to be switched on SEPARATELY at the 3169 flip
   # is a footgun: the operator would flip `enabled`, get stub behaviour, and
   # read the all-`stored` ack stream as "the corpus is novel". Set false to
-  # stop an in-flight judge incident without disabling the deterministic bands.
+  # stop an in-flight judge incident without disabling the deterministic paths.
   judge_enabled: true
   # judge_provider / judge_model: null INHERITS llm.provider / llm.model, so
   # the judge follows the model this deployment already trusts for add_memory

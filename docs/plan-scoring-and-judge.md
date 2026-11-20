@@ -1722,7 +1722,7 @@ would become the floor for full-workflow cells, and it would fabricate a 100%
 Code: `orchestrator/src/orchestrator/evals/eval_gate.py`
 (`build_eval_usage_gate`, `owned_usage_gate`, `campaign_usage_gate`,
 `GATE_UNSET`, `InjectedGate`). Consumers:
-`runner.py`'s three executors and stage fan-outs, `cli.py::_run_single_eval`
+`runner.py`'s three executors and stage fan-outs, `evals/cli.py::_run_single_eval`
 and `reviewer_trial/__main__.py::campaign`.
 
 **Why an eval invoke is gated at all (eval-revival φ).** Ungated, a capped

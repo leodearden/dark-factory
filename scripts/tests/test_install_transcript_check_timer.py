@@ -163,7 +163,7 @@ def _run_script(tmp_path, project_id, *, env=None):
     Puts a fresh fake `systemctl` on PATH (state reset each call) and
     defaults INSTALL_TRANSCRIPT_CHECK_TIMER_PYTHON=sys.executable so the
     script's `nightly.py resolve-config` delegation runs the REAL resolver
-    directly -- no `uv run`/`--frozen` needed in-test. Callers supply
+    directly -- no `uv run` needed in-test. Callers supply
     XDG_CONFIG_HOME and LEGIBILITY_SEARCH_ROOTS via *env*.
     """
     bin_dir, state_path = _fake_systemctl(tmp_path)

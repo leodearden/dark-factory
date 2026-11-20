@@ -32,6 +32,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _orch_helpers import MOCK_WORKFLOW_PROJECT_ROOT, pydantic_spec
+from _seed_script_stubs import seed_default_warm_base
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, OrchestratorConfig
@@ -397,20 +398,11 @@ class TestRebasePreservingTaskCommitsGuard:
 # ---------------------------------------------------------------------------
 # step-3: the two git_ops requeue reuse sites route THROUGH the guard.
 #
-# Warm-lane helpers copied from test_git_ops.py (`_seed_default_warm_base`
-# at :43, `_add_warm_lane_scripts` at :6636) so this file can drive
+# `_add_warm_lane_scripts` is copied from
+# `test_git_ops.py::_add_warm_lane_scripts` so this file can drive
 # `_reuse_warm_lane` without importing test-internal helpers from another
 # test module.
 # ---------------------------------------------------------------------------
-
-
-def _seed_default_warm_base(repo: Path) -> None:
-    """Pre-create the DEFAULT derived warm-lane base (task 2061) so the
-    acquire_warm_lane pre-acquire base-health gate sees WarmBaseHealth.OK."""
-    default_base = repo / '.worktrees' / '_merge-verify' / 'target'
-    default_base.mkdir(parents=True, exist_ok=True)
-    (default_base / '.keep').write_text('warm base sentinel\n')
-    (repo / '.worktrees' / '.pool-root').touch()
 
 
 async def _add_warm_lane_scripts(repo: Path, port: int = 39411) -> None:
@@ -475,7 +467,7 @@ class TestRequeueReuseSitesRouteThroughGuard:
     ):
         """_reuse_warm_lane (the live-requeue reuse path) that would zero
         the branch must raise BranchResetError and preserve the commit."""
-        _seed_default_warm_base(git_repo)
+        seed_default_warm_base(git_repo)
         await _add_warm_lane_scripts(git_repo)
         _, start_ref_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
         start_ref = start_ref_raw.strip()
@@ -532,7 +524,7 @@ class TestRequeueReuseSitesRouteThroughGuard:
         """
         import json as _json
 
-        _seed_default_warm_base(git_repo)
+        seed_default_warm_base(git_repo)
         await _add_warm_lane_scripts(git_repo)
         _, start_ref_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
         start_ref = start_ref_raw.strip()

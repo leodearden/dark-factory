@@ -324,6 +324,7 @@ def crash_loop_submit_argv(
     return [
         uv_bin,
         "run",
+        "--no-sync",
         "--project",
         os.path.join(repo_dir, "escalation"),
         "escalation",

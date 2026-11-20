@@ -70,6 +70,8 @@ def make_gate_mock(**overrides) -> MagicMock:
     with the sister proxy in ``tests/test_cap_retry.py::_mock_gate``.
     ``__aexit__`` calls ``gate.release_probe_slot(slot.token)`` unless the slot
     was settled, matching the real ``UsageGate.invoke_slot`` behaviour.
+    ``invoke_slot(work_class=...)`` forwards the class into ``before_invoke``
+    only when given, and mirrors it onto ``slot.work_class`` (``None`` otherwise).
     """
     gate = MagicMock(spec=UsageGate)
     gate.account_count = overrides.pop('account_count', 1)
@@ -93,15 +95,18 @@ def make_gate_mock(**overrides) -> MagicMock:
         # report()'s CapHit/NearCap arms (task 4234) and the
         # detect_cap_hit(...) proxy (task 4969).
         _scope = _kw.get('scope')
+        _work_class = _kw.get('work_class')
+        _reserve_kwargs = {} if _work_class is None else {'work_class': _work_class}
 
         async def _aenter_impl(*_args, **_akw):
-            token = await gate.before_invoke(scope=_scope)
+            token = await gate.before_invoke(scope=_scope, **_reserve_kwargs)
             slot = MagicMock(spec=InvokeSlot)
             slot.token = token
             # Mirror InvokeSlot.__init__: None → '' so tests can rely on
             # the same coercion as production code.
             slot.account_name = gate.active_account_name or ''
             slot.scope = _scope
+            slot.work_class = _work_class
             slot._settled = False
 
             def _slot_detect_cap_hit(stderr, output, backend='claude'):

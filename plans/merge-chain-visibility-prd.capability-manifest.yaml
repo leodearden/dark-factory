@@ -1,0 +1,262 @@
+# Machine-readable twin of merge-chain-visibility-prd.capability-manifest.md
+# Pointers resolved against main fd3f84d7ed (2026-11-18); cited by symbol, never by line.
+prd: plans/merge-chain-visibility-prd.md
+schema_version: 1
+signal_leaves: ["γ", "ε"]
+tasks:
+  - label: "α"
+    task_id: 10758
+    title: "Show merge verifies in flight in a Verifying now panel"
+    note: "Interim live panel before 8528; its task-id decided-link flag is retired by γ (PRD D18, D24)."
+    capabilities:
+      - name: "verifies-in-flight-on-the-reply"
+        binding: "`grep:orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker.snapshot` `grep:orchestrator/src/orchestrator/merge_lane/types.py::VerifyInFlight.to_wire` wired: snapshot serves restart_drain.verifies_in_flight from _verifies_in_flight (task 5371, done)"
+        verdict: PASS
+      - name: "chain-reservations-on-the-reply"
+        binding: "`grep:orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker.snapshot` `grep:orchestrator/src/orchestrator/merge_lane/chain_reservation.py::ChainReservations.snapshot` wired: snapshot serves chain_reservations[] (task 7720, done) and entries[].verify_base (task 5447)"
+        verdict: PASS
+      - name: "probe-site-sees-the-raw-reply"
+        binding: "`grep:dashboard/src/dashboard/data/merge_queue.py::_probe_live_one` holds the raw reply before `grep:dashboard/src/dashboard/data/merge_queue.py::_normalize_entry` drops all but six keys"
+        verdict: PASS
+      - name: "live-freshness-bound"
+        binding: "`grep:dashboard/src/dashboard/data/merge_queue.py::LIVE_QUEUE_FRESHNESS_BOUND_SECONDS`"
+        verdict: PASS
+      - name: "jsdom-harness-and-wire-fixtures"
+        binding: "`grep:dashboard/tests/js/dom_harness.mjs` `grep:dashboard/tests/js/wire_fixtures.mjs`"
+        verdict: PASS
+      - name: "merge-tab-mount-point"
+        binding: "`grep:dashboard/src/dashboard/static/redux/tabs.jsx` (MergeTab, a JSX component)"
+        verdict: PASS
+      - name: "projector-module"
+        binding: "built here: dashboard/src/dashboard/data/merge_chains.py, a pure projection serving the verifying_now Datum"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "verifying_now"
+          paths: ["dashboard/src/dashboard/data/merge_chains.py"]
+          expect: present
+      - name: "verifying-now-panel"
+        binding: "built here: dashboard/src/dashboard/static/redux/merge_chains.jsx"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "verifying_now"
+          paths: ["dashboard/src/dashboard/static/redux/merge_chains.jsx"]
+          expect: present
+      - name: "live-wire-fixture"
+        binding: "built here: shared/tests/fixtures/merge_queue_snapshot_chain.json, captured once from df's real get_merge_queue reply (D23)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "verifies_in_flight"
+          paths: ["shared/tests/fixtures/merge_queue_snapshot_chain.json"]
+          expect: present
+      - name: "decided-link-flag-and-unknowns"
+        binding: "built here: the task-id flag (D18) and the two unknown readings (L3, L4)"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "Rendering states pinned by L3, L4 and the jsdom states; the flag text is interim (γ replaces it), so a text grep would pin a copy γ retires."
+  - label: "β"
+    task_id: 10759
+    title: "Record merge-chain rounds and isolations as events"
+    note: "Fix at decompose: ChainDepthBasis lives in orchestrator merge_verify_facts.py on 8528's branch and shared never imports orchestrator, so β moves the enum into shared (one home) for merge_chain.py's basis field."
+    capabilities:
+      - name: "depth-policy"
+        binding: "producer:task-8528 upstream (ChainDepthBasis with no_estimate and pass_estimate only, ChainDepthReason, choose_depth, _is_code_verdict, chain_policy.py; suspect search removed by Leo's esc-8528-11 ruling, 2026-11-18)"
+        verdict: PASS
+      - name: "unchained-mark"
+        binding: "`grep:orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker._retire_item` clears the mark set in _run_inflight_verify's red-tip arm (tasks 10617, 10723, done); an isolation is the members one red tip marks"
+        verdict: PASS
+      - name: "red-tip-and-finally-sites-settled-first"
+        binding: "producer:task-10624 upstream; producer:task-10721 upstream (same worker.py sites: red-tip exit, _run_inflight_verify's finally, _deep_chain_placement)"
+        verdict: PASS
+      - name: "exit-sites"
+        binding: "`grep:orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker._deep_chain_placement` `grep:orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker._run_inflight_verify` `grep:orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker._tear_down_inflight_entry` `grep:orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker._land_chain_prefix` `grep:orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker._void_and_remerge` `grep:orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker._land_rebased_or_park_gate` `grep:orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker._finalize_landed_by_successor` `grep:orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker._finalize_inflight` `grep:orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker._end_chain_reservation` `grep:orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker._expire_chain_reservations` `grep:orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker.stop` `grep:orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker._advance_candidate` `grep:orchestrator/src/orchestrator/merge_lane/worker.py::_HALT_ADVANCE_RESULTS`"
+        verdict: PASS
+      - name: "abort-causes"
+        binding: "`grep:orchestrator/src/orchestrator/merge_lane/verify_cancellation.py::VerifyCancelCause` `grep:orchestrator/src/orchestrator/verify_runner.py::RunnerUnavailable` `grep:orchestrator/src/orchestrator/git_ops.py::MergeVerifyLeaseContended`"
+        verdict: PASS
+      - name: "emit-seams"
+        binding: "`grep:orchestrator/src/orchestrator/merge_verify_facts.py::MergeVerifyDispatchFacts` `grep:orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker._emit_verdict_voided` `grep:orchestrator/src/orchestrator/merge_lane/dead_base_ledger.py::DeadBaseKiller` `grep:orchestrator/src/orchestrator/merge_lane/types.py::ChainResult`"
+        verdict: PASS
+      - name: "event-store-reads-and-emit"
+        binding: "`grep:orchestrator/src/orchestrator/event_store.py::EventStore.fetch_events_by_type_all_runs` `grep:orchestrator/src/orchestrator/event_store.py::EventStore.emit` `grep:orchestrator/src/orchestrator/event_store.py::EventStore.__init__` (emit never raises; the constructor creates a missing store)"
+        verdict: PASS
+      - name: "lifetime-budget-sources"
+        binding: "`grep:orchestrator/src/orchestrator/verify.py::merge_verify_command_budget_secs` `grep:orchestrator/src/orchestrator/config.py::MergeDeepConfig.chain_build_timeout_secs` `grep:orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker.MAX_CAS_RETRIES` `grep:orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker.MAX_POST_MERGE_VERIFY_TIMEOUTS` `grep:orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES`"
+        verdict: PASS
+      - name: "public-fault-seams-for-lane-scenes"
+        binding: "`grep:orchestrator/tests/_merge_lane_fakes.py::make_lane` `grep:orchestrator/tests/test_merge_speculation.py::_AdvanceFailingGitOps`"
+        verdict: PASS
+      - name: "ratchet-raise-home"
+        binding: "`grep:orchestrator/tests/merge_lane_ratchet_raises`"
+        verdict: PASS
+      - name: "chain-depth-basis-in-shared"
+        binding: "built here: ChainDepthBasis moves from orchestrator merge_verify_facts.py (8528) into shared/src/shared/merge_chain.py; merge_verify_facts.py imports it"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^class ChainDepthBasis"
+          paths: ["shared/src/shared/merge_chain.py"]
+          expect: present
+      - name: "round-records"
+        binding: "built here: shared/src/shared/merge_chain.py frozen records with to_event_data/from_event_data"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^class (ChainRoundStarted|ChainRoundSettled|ChainIsolationSettled|ChainRecordRejected)\\b"
+          paths: ["shared/src/shared/merge_chain.py"]
+          expect: present
+      - name: "ledger"
+        binding: "built here: orchestrator/src/orchestrator/merge_lane/chain_rounds.py::ChainRounds"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^class ChainRounds\\b"
+          paths: ["orchestrator/src/orchestrator/merge_lane/chain_rounds.py"]
+          expect: present
+      - name: "chain-event-types"
+        binding: "built here: merge_chain_round_started, merge_chain_round_settled, merge_chain_isolation_settled, merge_chain_record_rejected in EventType wherever it lives at dispatch"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "merge_chain_record_rejected"
+          paths: ["orchestrator/src/orchestrator/event_store.py", "shared/src/shared/run_events.py"]
+          expect: present
+      - name: "merge-verify-carries-chain-ids"
+        binding: "built here: MergeVerifyDispatchFacts gains chain_id and origin_chain_id"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "origin_chain_id"
+          paths: ["orchestrator/src/orchestrator/merge_verify_facts.py"]
+          expect: present
+      - name: "audit-script"
+        binding: "built here: scripts/check_chain_round_records.py"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "runs-db"
+          paths: ["scripts/check_chain_round_records.py"]
+          expect: present
+      - name: "ledger-fails-safe"
+        binding: "built here: no ChainRounds method raises into the lane; a bad record becomes merge_chain_record_rejected (D16, H20)"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "A behavioural property; H20 asserts it through a lane scene and a raising sink."
+      - name: "audit-refuses-vacuous-windows"
+        binding: "built here: the audit refuses a missing path and a window with deep verifies and no round records (H21, H23)"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "Behaviour of the script over fixture stores; H21 and H23 run it."
+  - label: "γ"
+    task_id: 10761
+    title: "Serve the round view in the merge snapshot and render it"
+    capabilities:
+      - name: "ledger-round-lookup"
+        binding: "producer:task-β upstream (ChainRounds.round_of, chain_id on ChainResult)"
+        verdict: PASS
+      - name: "live-panel-and-fixture"
+        binding: "producer:task-α upstream (data/merge_chains.py, merge_chains.jsx, shared/tests/fixtures/merge_queue_snapshot_chain.json)"
+        verdict: PASS
+      - name: "policy-state"
+        binding: "producer:task-8528 upstream (merge_lane/chain_policy.py::ChainPolicyState, depth_table)"
+        verdict: PASS
+      - name: "snapshot-and-in-flight-derivation"
+        binding: "`grep:orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker.snapshot` `grep:orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker._verifies_in_flight` `grep:orchestrator/src/orchestrator/merge_lane/types.py::VerifyInFlight`"
+        verdict: PASS
+      - name: "entry-normalizer-drops-new-keys"
+        binding: "`grep:dashboard/src/dashboard/data/merge_queue.py::_normalize_entry` keeps six keys and no request_id today; γ widens it or carries the keys in the projection"
+        verdict: PASS
+      - name: "unchained-mark-on-the-wire"
+        binding: "built here: entries[].unchained_mark and entries[].chain"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "unchained_mark"
+          paths: ["orchestrator/src/orchestrator/merge_lane/worker.py"]
+          expect: present
+      - name: "controller-line-on-the-wire"
+        binding: "built here: top-level chain_policy from ChainPolicyState.wire"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def wire\\("
+          paths: ["orchestrator/src/orchestrator/merge_lane/chain_policy.py"]
+          expect: present
+      - name: "fixture-regenerator"
+        binding: "built here: orchestrator/tests/test_merge_queue_snapshot_chain_fixture.py"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "merge_queue_snapshot_chain\\.json"
+          paths: ["orchestrator/tests/test_merge_queue_snapshot_chain_fixture.py"]
+          expect: present
+      - name: "dashboard-reads-round-view"
+        binding: "built here: the projection reads unchained_mark and chain_policy"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "unchained_mark"
+          paths: ["dashboard/src/dashboard/data/"]
+          expect: present
+      - name: "task-id-flag-retired"
+        binding: "built here: per-member decided replaces α's task-id flag (D18)"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "L5 asserts the decided member renders; the retired flag's wording is α's choice, so an absent-grep would pin unknown text."
+  # δ (task 10760, "Count bisect rounds apart in chain telemetry") withdrawn 2026-11-18 by Leo's ruling on
+  # esc-8528-11: 8528 has no bisect rounds. Task 10760 cancelled; its three delivered checks retired with it.
+  - label: "ε"
+    task_id: 10762
+    title: "Show chain rounds and isolations in a Chain rounds panel"
+    capabilities:
+      - name: "runs-read-model"
+        binding: "producer:task-9852 upstream (shared/src/shared/runs_read/merge_lane.py, OUTCOME_FAMILY, OutcomeFamily, contract rows); producer:task-9800 upstream (shared.runs_read RunsQuery, orchestrator/tests/test_runs_read_contract.py)"
+        verdict: PASS
+      - name: "round-records-and-events"
+        binding: "producer:task-β upstream (shared/src/shared/merge_chain.py from_event_data, the four event types)"
+        verdict: PASS
+      - name: "live-panel-current-shape"
+        binding: "producer:task-γ upstream (data/merge_chains.py, merge_chains.jsx)"
+        verdict: PASS
+      - name: "recent-deep-verify-list"
+        binding: "producer:task-8547 upstream (the one list of recent deep verifies, A-8547)"
+        verdict: PASS
+      - name: "outcome-colours-module"
+        binding: "`grep:dashboard/src/dashboard/data/outcome_colors.py` `grep:dashboard/tests/test_outcome_colors.py`"
+        verdict: PASS
+      - name: "chain-rounds-query"
+        binding: "built here: chain_rounds, a RunsQuery in runs_read/merge_lane.py"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def chain_rounds\\("
+          paths: ["shared/src/shared/runs_read/merge_lane.py"]
+          expect: present
+      - name: "chain-outcome-family"
+        binding: "built here: CHAIN_OUTCOME_FAMILY beside OUTCOME_FAMILY"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^CHAIN_OUTCOME_FAMILY"
+          paths: ["dashboard/src/dashboard/data/outcome_colors.py"]
+          expect: present
+      - name: "chain-rounds-datum"
+        binding: "built here: the chain_rounds Datum in the /merge-queue payload"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "chain_rounds"
+          paths: ["dashboard/src/dashboard/data/merge_chains.py"]
+          expect: present
+      - name: "pre-beta-store-and-undecodable-rows"
+        binding: "built here: 'β not deployed' reading and undecodable count (H23, H24)"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "Behaviour over fixture stores; H23 and H24 assert it."

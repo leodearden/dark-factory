@@ -74,13 +74,15 @@ from typing import NamedTuple
 
 import _checkout as _checkout
 
-# Tier 1 — the ONE tasks.db and runs.db locators. Tier 3 — the warn-and-continue per-root
+# Tier 1 — the ONE tasks.db and runs.db locators, and the guard that turns an
+# underivable default root into the no-root exit. Tier 3 — the warn-and-continue per-root
 # loop and the shared no-root message. run_audit_cli is deliberately NOT
 # adopted; the exit-ladder block near main() records why.
 # discover_project_roots comes second-hand through the audit's documented
 # re-export, the same route repair_wiped_metadata_files.py takes.
 from _task_db_scan import (
     NO_PROJECT_ROOT_RESOLVED_MESSAGE,
+    discover_or_report_no_default_root,
     runs_db_path,
     sweep_project_roots,
     tasks_db_path,
@@ -1430,7 +1432,7 @@ def main(argv: list[str] | None = None) -> int:
     """Sweep the roots, classify every stamp, and publish the artifact pair."""
     args = _build_parser().parse_args(argv)
 
-    roots = discover_project_roots(args.project_roots)
+    roots = discover_or_report_no_default_root(lambda: discover_project_roots(args.project_roots))
     if not roots:
         print(NO_PROJECT_ROOT_RESOLVED_MESSAGE, file=sys.stderr)
         return EXIT_NO_ROOT

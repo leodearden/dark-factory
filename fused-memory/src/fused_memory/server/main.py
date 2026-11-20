@@ -12,7 +12,7 @@ import socket
 import sys
 import threading
 import time
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
@@ -23,7 +23,6 @@ load_dotenv()
 
 from functools import partial  # noqa: E402
 
-from shared.mcp_markup_middleware import RepairPolicy  # noqa: E402
 from shared.systemd_listeners import take_systemd_listeners  # noqa: E402
 
 from fused_memory.config.checkout_anchor import (  # noqa: E402  # debt: task 10130
@@ -32,6 +31,9 @@ from fused_memory.config.checkout_anchor import (  # noqa: E402  # debt: task 10
 from fused_memory.config.schema import (  # noqa: E402
     DedupOutageDetectorConfig,
     FusedMemoryConfig,
+)
+from fused_memory.embedder.endpoint_probe import (  # noqa: E402  # debt: task 10130
+    EmbedderEndpointProbe,
 )
 from fused_memory.maintenance.rebuild_summaries import (  # noqa: E402  # debt: ticket tkt_0RWT5KQG42DBD4GM4C51E2Y7NT
     RebuildResult,
@@ -42,10 +44,13 @@ from fused_memory.reconciliation.audit_trail_rotation import (  # noqa: E402
 from fused_memory.reconciliation.consolidation_gate import (  # noqa: E402
     closure_exists_probe,
 )
-from fused_memory.server.markup_guard import install_markup_guard  # noqa: E402
+from fused_memory.server.boundary_guards import (  # noqa: E402  # debt: task 10130
+    install_boundary_guards,
+)
 from fused_memory.server.tools import (  # noqa: E402
     _checkpoint_overrides_db_if_exists,
     create_mcp_server,
+    per_use_prefix_resolver,
 )
 from fused_memory.server.wal_status import (  # noqa: E402
     CHECKPOINT_STATUS as _CHECKPOINT_STATUS,
@@ -55,6 +60,7 @@ from fused_memory.services.memory_service import MemoryService  # noqa: E402
 if TYPE_CHECKING:
     from shared.cost_store import CostStore
     from shared.usage_gate import UsageGate
+    from shared.uuid_prefix_guard import PrefixResolver
 
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
     from fused_memory.middleware.task_interceptor import TaskInterceptor
@@ -592,6 +598,13 @@ async def run_server():
     logger.info(f'  Graphiti: {config.graphiti.provider} ({config.graphiti.falkordb.uri})')
     logger.info(f'  Mem0/Qdrant: {config.mem0.qdrant_url}')
     logger.info(f'  Transport: {config.server.transport}')
+    if config.config_overlay is not None:
+        logger.info(
+            '  Config overlay active: %s (keys: %s)',
+            config.config_overlay.path, ', '.join(config.config_overlay.merged_keys),
+        )
+    embedder_probe = EmbedderEndpointProbe(config.embedder)
+    embedder_probe.start()
     systemd_listeners = take_systemd_listeners()
 
     # Initialize memory service
@@ -1023,13 +1036,18 @@ async def run_server():
         curator_usage_gate=curator_usage_gate,
         known_projects=_known_projects_map,
         topic_cluster_store=topic_cluster_store,
+        embedder_probe=embedder_probe,
     )
 
     # The ToolManager.call_tool wrappers, in the ONE order that works. The
     # ordering rationale lives on the helper, and is pinned by
     # tests/test_markup_guard_fused_memory.py::TestInstallationOrder rather
     # than by this comment.
-    _install_tool_dispatch_guards(mcp, known_projects=_known_projects_map)
+    _install_tool_dispatch_guards(
+        mcp,
+        known_projects=_known_projects_map,
+        prefix_resolver=per_use_prefix_resolver(memory_service),
+    )
 
     mcp.settings.host = config.server.host
     mcp.settings.port = config.server.port
@@ -2111,11 +2129,14 @@ def _install_safe_tool_wrapper(mcp: Any) -> None:
 
 
 def _install_tool_dispatch_guards(
-    mcp: Any, *, known_projects: dict[str, str] | None = None
+    mcp: Any,
+    *,
+    known_projects: Mapping[str, str] | None,
+    prefix_resolver: PrefixResolver | None,
 ) -> None:
-    """Install the four ``ToolManager.call_tool`` wrappers, in the ONE order that works.
+    """Install the three ``ToolManager.call_tool`` wrappers, in the ONE order that works.
 
-    Four independent concerns share this chokepoint, and the order they are
+    Three independent concerns share this chokepoint, and the order they are
     installed in is not cosmetic — each call wraps whatever ``call_tool`` it
     finds, so the order decides which one ends up OUTSIDE, and therefore what
     the caller sees when more than one fires:
@@ -2129,16 +2150,12 @@ def _install_tool_dispatch_guards(
        would otherwise poison StreamableHTTPSessionManager's shared task group
        and cascade into uvicorn's main loop. Re-raises CancelledError, which
        asyncio cancellation semantics require.
-    3. :func:`~fused_memory.server.unknown_argument_guard.install_unknown_argument_guard`
-       — refuses a call naming an argument the tool does not declare, which
-       the bundled FastMCP would otherwise drop silently (task 4867).
-    4. :func:`~fused_memory.server.markup_guard.install_markup_guard` — the
-       write-boundary markup guard (task 4458, PRD
-       ``plans/toolcall-markup-containment-prd.md``), OUTERMOST. Rejects a call
-       whose argument absorbed MCP tool-call envelope markup and hands the
-       caller a ``repaired_call`` to resubmit verbatim.
+    3. :func:`~fused_memory.server.boundary_guards.install_boundary_guards` —
+       the boundary chain, OUTERMOST: markup guard, unknown-argument guard and
+       uuid-prefix guard, as one wrapping. That module states the chain's own
+       order and why.
 
-    DO NOT tidy these calls into another order. Both guards REJECT by raising
+    DO NOT tidy these calls into another order. The guards REJECT by raising
     :class:`fastmcp.exceptions.ToolError` — measured as the only shape that
     survives every output schema, since a returned dict is destroyed by the
     output validation of any tool annotated ``-> str``. A guard installed
@@ -2152,31 +2169,19 @@ def _install_tool_dispatch_guards(
     such an exemption would gut the containment ``tests/test_tool_safe_wrapper.py``
     pins. Order is the whole mechanism.
 
-    The unknown-argument guard sits INSIDE the markup guard because the markup
-    remedy, ``metadata={'allow_mcp_markup': True}``, is legal on every tool:
-    on a tool that declares no ``metadata`` the markup guard strips it before
-    forwarding, so the unknown-argument guard must see the post-strip call.
-
     *known_projects* is run_server's ``project_id -> project_root`` registry,
     which the markup guard's storm-escalation sink uses to place a burst in the
-    right queue.
-
-    REJECT_WITH_REPAIR is the PRD's declared tier for fused-memory (section 4,
-    C2), declared HERE at the interception point rather than inferred per tool
-    (INV-1). The recon-report server hosts no write tools and gets no markup
-    guard; it gets the other three through :func:`_install_recon_report_guards`.
+    right queue. *prefix_resolver* resolves a bare uuid prefix for the
+    uuid-prefix guard, which is absent without one. The recon-report server
+    hosts no write tools and gets no boundary chain; it gets the str
+    passthrough, the safe wrapper and the unknown-argument guard through
+    :func:`_install_recon_report_guards`.
     """
     from fused_memory.server.str_argument_passthrough import install_str_argument_passthrough
-    from fused_memory.server.unknown_argument_guard import install_unknown_argument_guard
 
     install_str_argument_passthrough(mcp)
     _install_safe_tool_wrapper(mcp)
-    install_unknown_argument_guard(mcp)
-    install_markup_guard(
-        mcp,
-        policy=RepairPolicy.REJECT_WITH_REPAIR,
-        known_projects=known_projects,
-    )
+    install_boundary_guards(mcp, known_projects=known_projects, prefix_resolver=prefix_resolver)
 
 
 def _install_recon_report_guards(mcp: Any) -> None:

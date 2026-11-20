@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from orchestrator import session_registry as sr
+from orchestrator import session_records
 
 
 def isolate_hook_env(monkeypatch: pytest.MonkeyPatch, fleet_root: Path) -> None:
@@ -56,10 +56,10 @@ def owner_ppid_env(slug: str, ppid: int) -> dict[str, str]:
 
 
 def write_bound_parent(slug: str, root: Path, pid: int) -> None:
-    sr.write_record(
-        sr.SessionRecord(
+    session_records.write_record(
+        session_records.SessionRecord(
             session_slug=slug,
-            status=sr.Status.RUNNING,
+            status=session_records.Status.RUNNING,
             launcher_pid=pid,
             claude_session_id='uuid-parent',
         ),
@@ -74,10 +74,10 @@ def launching_record(
     pid: int = 4193001,
     start_ts: str | None = None,
 ) -> None:
-    sr.write_record(
-        sr.SessionRecord(
+    session_records.write_record(
+        session_records.SessionRecord(
             session_slug=slug,
-            status=sr.Status.LAUNCHING,
+            status=session_records.Status.LAUNCHING,
             launcher_pid=pid,
             role='cockpit',
             start_ts=start_ts if start_ts is not None else datetime.now(UTC).isoformat(),

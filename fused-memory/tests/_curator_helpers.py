@@ -209,22 +209,55 @@ def answer_each_with(
     curator.curate_prepared = AsyncMock(side_effect=curate_prepared)
 
 
+def curator_double() -> MagicMock:
+    """An inert curator double for ``TaskInterceptor(curator=...)``; no verdict is wired.
+
+    Its post-create, re-embed, evict and close calls do nothing. ``close`` is
+    awaitable because ``TaskInterceptor.close()`` awaits it.
+    """
+    curator = MagicMock()
+    curator.note_created = MagicMock()
+    curator.record_task = AsyncMock(return_value=None)
+    curator.reembed_task = AsyncMock(return_value=None)
+    curator.evict_task = AsyncMock(return_value=None)
+    curator.close = AsyncMock(return_value=None)
+    return curator
+
+
+def curator_judging(
+    verdict: Callable[[CandidateTask], Awaitable[CuratorDecision]],
+) -> MagicMock:
+    """A curator double for ``TaskInterceptor(curator=...)`` that judges each candidate with *verdict*.
+
+    Its ``curate`` AsyncMock wraps *verdict* and is the per-candidate verdict,
+    so a test can count the candidates judged.
+    """
+    curator = curator_double()
+    curator.curate = AsyncMock(side_effect=verdict)
+    answer_each_with(curator, curator.curate)
+    return curator
+
+
+def curator_always(decision: CuratorDecision) -> MagicMock:
+    """A :func:`curator_judging` double that answers every candidate with *decision*."""
+    async def always(_candidate: CandidateTask) -> CuratorDecision:
+        return decision
+
+    return curator_judging(always)
+
+
 def curator_returning(*decisions: CuratorDecision) -> MagicMock:
     """A curator double for ``TaskInterceptor(curator=...)``.
 
     Its ``curate_prepared`` hands out *decisions* in order, one per bundle.
     """
-    curator = MagicMock()
+    curator = curator_double()
     answers = iter(decisions)
 
     async def next_decision(_candidate: CandidateTask) -> CuratorDecision:
         return next(answers)
 
     answer_each_with(curator, next_decision)
-    curator.note_created = MagicMock()
-    curator.record_task = AsyncMock()
-    curator.reembed_task = AsyncMock(return_value=None)
-    curator.close = AsyncMock()
     return curator
 
 

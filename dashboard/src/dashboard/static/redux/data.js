@@ -275,7 +275,7 @@ window.DF_DATA = {
   //   bucket_minutes}), attempts: Datum ({outcomes, latency: {p50, p95, p99,
   //   mean_ms, with_duration, without_duration}}), recent, recent_total: Datum,
   //   speculative: Datum, active, in_queue: Datum, live_probe_configured,
-  //   active_spark, halt, train_events:
+  //   runs_db_present, active_spark, halt, train_events:
   //   [{event_type, task_id, run_id, timestamp, data: {train_id,
   //   member_task_ids, ...event-specific keys}}], train_throughput: Datum}};
   //   every recent and active row's title is a Datum. The payload's top-level

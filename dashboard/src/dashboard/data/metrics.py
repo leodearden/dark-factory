@@ -235,6 +235,7 @@ CREATE TABLE IF NOT EXISTS memory_snapshots (
     mem0_memories   INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_mem_snap_pid_ts ON memory_snapshots(project_id, ts);
+CREATE INDEX IF NOT EXISTS idx_mem_snap_ts ON memory_snapshots(ts);
 
 CREATE TABLE IF NOT EXISTS queue_snapshots (
     ts      TEXT PRIMARY KEY,
@@ -822,10 +823,13 @@ async def get_memory_24h_ago(
     but only if it falls within ±2 hours of the target. Projects whose
     only available rows are far from the 24h mark are absent from the
     result so the UI renders ``—`` rather than a misleading zero delta.
+    The read is bounded to that tolerance window, so its cost does not
+    grow with table history.
     """
     if db is None:
         return {}
-    target = (resolve_now(now) - timedelta(hours=24)).isoformat()
+    target = (resolve_now(now) - timedelta(hours=24)).astimezone(UTC)
+    margin = timedelta(seconds=_24H_TOLERANCE_SECONDS + 1)
     try:
         async with db.execute(
             """
@@ -837,9 +841,16 @@ async def get_memory_24h_ago(
                            ORDER BY ABS(strftime('%s', ts) - strftime('%s', ?)) ASC
                        ) AS rn
                 FROM memory_snapshots
+                WHERE ts >= ? AND ts <= ?
             ) WHERE rn = 1 AND d <= ?
             """,
-            (target, target, _24H_TOLERANCE_SECONDS),
+            (
+                target.isoformat(),
+                target.isoformat(),
+                (target - margin).isoformat(),
+                (target + margin).isoformat(),
+                _24H_TOLERANCE_SECONDS,
+            ),
         ) as cur:
             rows = await cur.fetchall()
     except Exception:

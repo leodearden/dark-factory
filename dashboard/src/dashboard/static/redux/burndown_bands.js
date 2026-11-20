@@ -1,8 +1,9 @@
 // burndown_bands.js — the pure render DECISIONS behind the Burndown tab
 // (tabs.jsx BurnTab, aggregate and per-project views alike): the nine bands of
 // the stacked status-mix chart and the legend that explains them, whether the
-// concurrency-parity banner draws, and the reader that stamps the burndown
-// payload's served Datums for the tiles, pips and cells.
+// concurrency-parity banner draws, the reader that stamps the burndown
+// payload's served Datums for the tiles, pips and cells, and the reader that
+// rebuilds a project's own label row from its label_spans.
 //
 // LOAD CONTRACT. It destructures window.DF_DATUM and window.DF_TASK_VOCAB at
 // module scope with no fallback, so index.html loads it after datum.js and
@@ -138,6 +139,42 @@ function burndownDatum(data, block, field) {
   );
 }
 
+// ── A project's burndown block, with its own label row rebuilt ──
+// The wire sends each BURNDOWN_BY_PROJECT block's label row as label_spans:
+// half-open [start, stop) index ranges into BURNDOWN.labels, in the row's own
+// order. This returns a copy of the block carrying that row as `labels`, so
+// every `pb.labels` reader pairs the project's series with its OWN instants.
+// The encoder is dashboard/src/dashboard/data/label_spans.py::label_spans.
+//
+// An absent block is null, as burndownStacks tolerates for the render before
+// the first payload. A present block with missing or malformed spans is a
+// server contract break, and throws rather than drawing a shifted chart.
+function projectBurndownBlock(data, projectId) {
+  const block = (data.BURNDOWN_BY_PROJECT || {})[projectId];
+  if (!block) return null;
+  const union = (data.BURNDOWN || {}).labels || [];
+  const spans = block.label_spans;
+  if (!Array.isArray(spans)) {
+    throw new Error(
+      `burndown project ${projectId} carries no label_spans list ` +
+        `(union has ${union.length} labels)`,
+    );
+  }
+  const labels = spans.flatMap(span => union.slice(...checkedLabelSpan(span, union.length, projectId)));
+  return { ...block, labels };
+}
+
+function checkedLabelSpan(span, unionLength, projectId) {
+  const entry = `burndown project ${projectId} has label_spans entry ${JSON.stringify(span)}`;
+  if (!(Array.isArray(span) && span.length === 2 && span.every(Number.isInteger))) {
+    throw new Error(`${entry} that is not a [start, stop) pair of ints (union has ${unionLength} labels)`);
+  }
+  if (!(0 <= span[0] && span[0] < span[1] && span[1] <= unionLength)) {
+    throw new Error(`${entry} outside 0 <= start < stop <= union length ${unionLength}`);
+  }
+  return span;
+}
+
 // ── How the Forecast tile reads a served forecast value ──
 // One number when the recent and lifetime forecasts agree, a range otherwise.
 function forecastText(forecast) {
@@ -156,6 +193,7 @@ const BURNDOWN_BANDS_API = {
   parityBannerState,
   burndownDatum,
   forecastText,
+  projectBurndownBlock,
   BURNDOWN_ENDPOINT,
 };
 

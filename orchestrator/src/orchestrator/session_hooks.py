@@ -8,8 +8,8 @@ These three hooks fire on *every* Claude Code session, including Leo's
 hand-launched ones — SessionStart is how a hand-launched session first gets
 captured into the session registry.
 
-This module imports ``orchestrator.session_registry`` read-only (PRD §6 G5:
-consumers import the shared record contract, they never re-derive it).
+This module imports the record contract from ``orchestrator.session_records``
+(PRD §6 G5: consumers import the shared record contract, they never re-derive it).
 
 A spawned session's hooks key its record on ``CLAUDE_SPAWN_SESSION_ID``, the
 slug of the record spawn-claude.sh created; a session without one (T3-hosted
@@ -20,7 +20,7 @@ pid, then its ``T3CODE_THREAD_ID`` thread), else on its stdin
 IMPORT CONTRACT. ``skills/spawn/hooks/*.sh`` run this file by absolute path
 from a plain shell with only ``PYTHONPATH=<repo>/orchestrator/src``: no venv,
 no install. ``from orchestrator import ...`` works. ``shared`` leaves are
-reachable only below the ``session_registry`` import, whose bootstrap appends
+reachable only below the ``session_records`` import, whose bootstrap appends
 shared/src; a ``shared`` import above it, or any third-party import, makes
 every hook die quietly. Pinned and mutation-tested
 by the ``session_hooks.py`` row of
@@ -46,13 +46,15 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from orchestrator import session_registry
+from orchestrator import session_records, session_registry
 from orchestrator.session_ownership_probes import EventProbes, ProcessTree
 from orchestrator.session_self_exit import SelfExit
 
-# session_registry's import puts this checkout's shared/src on sys.path for the bare shell.
+# session_records' import puts this checkout's shared/src on sys.path for the bare shell.
 # isort: split
+from shared.proc_liveness import pid_alive
 from shared.process_identity import Liveness
+from shared.project_layout import CheckoutRootError, main_checkout_of
 from shared.session_liveness import capture_for_record, judge
 
 logger = logging.getLogger(__name__)
@@ -180,7 +182,7 @@ class _RecordSnapshot:
     """
 
     slug: str
-    record: session_registry.SessionRecord | None
+    record: session_records.SessionRecord | None
     unreadable: bool = False
 
 
@@ -202,7 +204,7 @@ def _read_record_snapshot(slug: str, root: Path | str | None) -> _RecordSnapshot
     is why the whole body travels rather than a single field.
     """
     try:
-        return _RecordSnapshot(slug, session_registry.read_record(slug, root=root))
+        return _RecordSnapshot(slug, session_records.read_record(slug, root=root))
     except FileNotFoundError:
         return _RecordSnapshot(slug, None)
     except Exception:
@@ -277,23 +279,6 @@ def _env_slug_ownership(
         # Unprovable, not disproved: adopt.
         return True, True, snapshot
     return owner_pid == current_pid, True, snapshot
-
-
-def _env_slug_is_owned(
-    slug: str,
-    hook_input: Mapping[str, Any],
-    root: Path | str | None,
-    *,
-    allow_remint: bool = False,
-    probes: EventProbes,
-) -> bool:
-    """Adopt-or-fork half of ``_env_slug_ownership`` -- see its docstring.
-
-    Kept as the narrow, boolean question for callers that only need the
-    identity decision; the binding decision travels separately, through
-    ``_resolve_hook_slug``.
-    """
-    return _env_slug_ownership(slug, hook_input, root, allow_remint=allow_remint, probes=probes)[0]
 
 
 @dataclass(frozen=True)
@@ -432,7 +417,7 @@ def _pointer_resolution(
     if not session_id:
         return _PointerLookup()
     by_session_id = _adopt_pointer_slug(
-        session_registry.resolve_session_slug_for_claude_session_id(session_id, root=root),
+        session_records.resolve_session_slug_for_claude_session_id(session_id, root=root),
         hook_input,
         root,
         allow_remint=allow_remint,
@@ -443,7 +428,7 @@ def _pointer_resolution(
         return _PointerLookup(by_session_id)
     pid = probes.owning_claude_pid()
     by_pid = None if pid is None else _adopt_pointer_slug(
-        session_registry.resolve_session_slug_for_pid(pid, root=root),
+        session_records.resolve_session_slug_for_pid(pid, root=root),
         hook_input,
         root,
         allow_remint=allow_remint,
@@ -453,10 +438,10 @@ def _pointer_resolution(
     if (
         by_pid is not None
         or t3_thread_id is None
-        or not session_registry.is_t3_thread_pointer_name(t3_thread_id)
+        or not session_records.is_t3_thread_pointer_name(t3_thread_id)
     ):
         return _PointerLookup(by_pid)
-    thread_slug = session_registry.resolve_session_slug_for_t3_thread(t3_thread_id, root=root)
+    thread_slug = session_records.resolve_session_slug_for_t3_thread(t3_thread_id, root=root)
     if thread_slug is None:
         return _PointerLookup(unheld_t3_thread=t3_thread_id)
     return _PointerLookup(
@@ -504,7 +489,7 @@ def _resolve_hook_slug(
     if spawn_session_id is not None:
         # Sanitize BEFORE probing, so an adversarial token can no more escape
         # sessions_dir when read than when written.
-        candidate = session_registry.sanitize_slug(spawn_session_id)
+        candidate = session_records.sanitize_slug(spawn_session_id)
         owned, may_bind, snapshot = _env_slug_ownership(
             candidate,
             hook_input,
@@ -531,13 +516,8 @@ def _resolve_hook_slug(
     # §Forked-inheritor identity.
     identity = resolve_hook_identity(hook_input, env)
     session_id = _hook_session_id(hook_input) or 'unknown'
-    # session_id fills the launcher_pid slot as the uniqueness token; the int
-    # annotation does not bind, since build_session_slug only str()s it.
-    slug = session_registry.build_session_slug(
-        identity.role,
-        identity.project,
-        identity.task_id,
-        session_id,  # type: ignore[arg-type]
+    slug = session_records.build_session_slug(
+        identity.role, identity.project, identity.task_id, session_id
     )
     # This slug embeds session_id itself, so binding it is tautological.
     # No snapshot: any read above was of a DIFFERENT record than this slug.
@@ -566,7 +546,7 @@ def hook_session_slug(
     (blank counts as absent) and owned by this session: it is already
     spawn-claude.sh's record slug, and feeding it back through
     ``build_session_slug`` would prefix it twice. Otherwise, including on a
-    proven mismatch, returns ``session_registry.build_session_slug`` keyed on
+    proven mismatch, returns ``session_records.build_session_slug`` keyed on
     the stdin ``session_id`` (``'unknown'`` when blank), which is the same for
     SessionStart, Notification and Stop. See ``docs/session-hook-ownership.md``
     §Record keying and §Owner or inheritor.
@@ -600,7 +580,7 @@ def _own_identity_env(
 
 
 def _bind_claude_session_id(
-    record: session_registry.SessionRecord,
+    record: session_records.SessionRecord,
     hook_input: Mapping[str, Any],
     *,
     allow_rebind: bool = False,
@@ -637,7 +617,7 @@ def _bind_claude_session_id(
     return True
 
 
-def _stamp_owner(record: session_registry.SessionRecord, pid: int | None) -> None:
+def _stamp_owner(record: session_records.SessionRecord, pid: int | None) -> None:
     """Write *record*'s owner pid and its identity together, so the pair never diverges."""
     record.claude_owner_pid = pid
     record.claude_owner_identity = (
@@ -645,7 +625,7 @@ def _stamp_owner(record: session_registry.SessionRecord, pid: int | None) -> Non
     )
 
 
-def _reclaim_dead_owner_pid(record: session_registry.SessionRecord, probes: EventProbes) -> bool:
+def _reclaim_dead_owner_pid(record: session_records.SessionRecord, probes: EventProbes) -> bool:
     """Re-stamp *record*'s owner with this event's claude pid iff its recorded owner is judged DEAD.
 
     A live recorded owner keeps the record: that is a nested ``claude
@@ -665,18 +645,18 @@ def _reclaim_dead_owner_pid(record: session_registry.SessionRecord, probes: Even
     return True
 
 
-def _recorded_owner_is_dead(record: session_registry.SessionRecord) -> bool:
+def _recorded_owner_is_dead(record: session_records.SessionRecord) -> bool:
     """Whether *record*'s recorded owner claude is judged DEAD; False when it records none."""
     owner = record.claude_owner_pid
     return (
         owner is not None
-        and judge(record.claude_owner_identity, owner, pid_alive=session_registry.pid_alive)
+        and judge(record.claude_owner_identity, owner, pid_alive=pid_alive)
         is Liveness.DEAD
     )
 
 
 def _stamp_session_pointers(
-    record: session_registry.SessionRecord,
+    record: session_records.SessionRecord,
     probes: EventProbes,
     root: Path | str | None,
     *,
@@ -690,46 +670,46 @@ def _stamp_session_pointers(
     pid pointer whenever ``claude_owner_pid`` is this event's owning claude
     pid, and the thread pointer whenever the record is t3 for this event's
     *t3_thread_id* and no other live record holds that thread
-    (``session_registry.index_t3_record_if_unheld``): a hook never moves a
+    (``session_records.index_t3_record_if_unheld``): a hook never moves a
     held thread pointer, only the T3 lane's bind does. The pid and thread
     rules cover every lane (adopt, fork, a withheld launch window, an
     unproven adopt, a blank session_id) without branching on them.
     Fail-soft: the registry writers never raise.
     """
     if newly_bound and record.claude_session_id:
-        session_registry.write_claude_session_pointer(
+        session_records.write_claude_session_pointer(
             record.claude_session_id, record.session_slug, root=root
         )
-    if t3_thread_id is not None and session_registry.t3_thread_of(record) == t3_thread_id:
-        session_registry.index_t3_record_if_unheld(record, record.session_slug, root=root)
+    if t3_thread_id is not None and session_records.t3_thread_of(record) == t3_thread_id:
+        session_records.index_t3_record_if_unheld(record, record.session_slug, root=root)
     pid = probes.owning_claude_pid()
     if pid is None or record.claude_owner_pid != pid:
         return
-    session_registry.write_session_pointer(pid, record.session_slug, root=root)
+    session_records.write_session_pointer(pid, record.session_slug, root=root)
 
 
 # ---------------------------------------------------------------------------
 # Pure OSC-retitle + display-title helpers (PRD §4.6)
 # ---------------------------------------------------------------------------
 
-_GLYPH_BY_STATUS: dict[session_registry.Status, str] = {
-    session_registry.Status.RUNNING: '⚙',
-    session_registry.Status.AWAITING_INPUT: '⏸ AWAITING',
-    session_registry.Status.IDLE: '✅',
+_GLYPH_BY_STATUS: dict[session_records.Status, str] = {
+    session_records.Status.RUNNING: '⚙',
+    session_records.Status.AWAITING_INPUT: '⏸ AWAITING',
+    session_records.Status.IDLE: '✅',
 }
 """PRD §4.6 default glyph prefixes: running=gear, awaiting-input=pause+label,
 idle=check. Statuses this hook trio never emits (LAUNCHING/EXITED/
 FAILED_TO_START) have no entry and fall back to no glyph prefix."""
 
 
-def osc_retitle_sequence(status: session_registry.Status, title: str) -> str:
+def osc_retitle_sequence(status: session_records.Status, title: str) -> str:
     """Build the emulator-agnostic terminal-retitle OSC escape sequence.
 
     Pure string builder -- PRD §4.6: ``\\033]0;<title>\\007``, no konsole
     DBus. *status* selects the glyph prefix (see ``_GLYPH_BY_STATUS``); the
     result is ``'<glyph-prefix> <title>'`` spliced into that OSC template.
     """
-    prefix = _GLYPH_BY_STATUS.get(session_registry.Status(status), '')
+    prefix = _GLYPH_BY_STATUS.get(session_records.Status(status), '')
     label = f'{prefix} {title}' if prefix else title
     return f'\033]0;{label}\007'
 
@@ -737,7 +717,7 @@ def osc_retitle_sequence(status: session_registry.Status, title: str) -> str:
 def hook_display_title(
     identity: session_registry.SpawnIdentity,
     env: Mapping[str, str],
-    record: session_registry.SessionRecord | None = None,
+    record: session_records.SessionRecord | None = None,
 ) -> str:
     """Resolve the display title to retitle a hook's terminal tab with.
 
@@ -896,7 +876,7 @@ def _resolve_display(
     title: str,
     *,
     allow_spawn_marker: bool = True,
-) -> session_registry.Display | None:
+) -> session_records.Display | None:
     """Resolve this session's best-effort focus target from env (Fleet Cockpit C2).
 
     TMUX takes precedence over WINDOWID (hybrid window model, PRD §3 fork 1):
@@ -928,15 +908,15 @@ def _resolve_display(
     genuinely runs in, not by the spawn namespace.
     """
     if env.get('TMUX'):
-        return session_registry.Display(
-            kind=session_registry.DisplayKind.TMUX.value,
+        return session_records.Display(
+            kind=session_records.DisplayKind.TMUX.value,
             tmux_target=env.get('TMUX_PANE') or None,
         )
     if env.get('WINDOWID'):
         # Canonicalize to wmctrl's 0x%08x column form (a real emulator exports
         # $WINDOWID DECIMAL); fall back to the raw value if it won't parse.
-        return session_registry.Display(
-            kind=session_registry.DisplayKind.WM.value,
+        return session_records.Display(
+            kind=session_records.DisplayKind.WM.value,
             wm_title=title,
             wm_window_id=_canonical_window_id(env.get('WINDOWID')) or env.get('WINDOWID'),
         )
@@ -944,8 +924,8 @@ def _resolve_display(
     if marker:
         window_id = _resolve_wm_window_id(marker)
         if window_id is not None:
-            return session_registry.Display(
-                kind=session_registry.DisplayKind.WM.value,
+            return session_records.Display(
+                kind=session_records.DisplayKind.WM.value,
                 wm_title=marker,
                 wm_window_id=window_id,
             )
@@ -958,7 +938,7 @@ def run_session_start(
     root: Path | str | None = None,
     *,
     process_tree: ProcessTree | None = None,
-) -> session_registry.SessionRecord:
+) -> session_records.SessionRecord:
     """SessionStart hook handler: capture or refresh this session's record.
 
     With no record at the slug yet, this is the session's first sight: a rich
@@ -1005,7 +985,7 @@ def run_session_start(
         # Unreadable, not absent: re-read so a corrupt body propagates to
         # main() instead of being overwritten. FileNotFoundError means absent.
         with contextlib.suppress(FileNotFoundError):
-            record = session_registry.read_record(slug, root=root)
+            record = session_records.read_record(slug, root=root)
     if record is None:
         cwd = str(hook_input.get('cwd') or os.getcwd())
         launcher_pid_raw = env.get('CLAUDE_SPAWN_LAUNCHER_PID')
@@ -1017,9 +997,9 @@ def run_session_start(
             launcher_pid = int(launcher_pid_raw)
         else:
             launcher_pid = probes.hand_launched_liveness_pid()
-        record = session_registry.SessionRecord(
+        record = session_records.SessionRecord(
             session_slug=slug,
-            status=session_registry.Status.RUNNING,
+            status=session_records.Status.RUNNING,
             title=hook_display_title(identity, identity_env, record=None),
             role=identity.role,
             project=identity.project,
@@ -1029,10 +1009,10 @@ def run_session_start(
             launcher_pid=launcher_pid,
             launcher_identity=capture_for_record(launcher_pid),
             start_ts=datetime.now(UTC).isoformat(),
-            transcript_path=session_registry.transcript_path_for_cwd(cwd),
+            transcript_path=session_records.transcript_path_for_cwd(cwd),
         )
 
-    record.status = session_registry.Status.RUNNING
+    record.status = session_records.Status.RUNNING
     if forked_from is not None:
         # The rejected env slug IS this nested claude's spawner.
         record.parent_session_id = forked_from
@@ -1043,14 +1023,14 @@ def run_session_start(
     title = record.title or hook_display_title(identity, identity_env, record)
     if resolution.claims_t3_thread is not None:
         # Wins over _resolve_display: TMUX/WINDOWID leak from the T3 server's env.
-        record.display = session_registry.Display(
-            kind=session_registry.DisplayKind.T3.value,
+        record.display = session_records.Display(
+            kind=session_records.DisplayKind.T3.value,
             wm_title=title,
             t3_thread_id=resolution.claims_t3_thread,
         )
     else:
         display = _resolve_display(env, title, allow_spawn_marker=forked_from is None)
-        if display is not None and not session_registry.is_t3_record(record):
+        if display is not None and not session_records.is_t3_record(record):
             record.display = display
     # may_bind, not forked_from, guards the bind: an adopted-but-unproven
     # event refreshes the record without claiming it.
@@ -1061,7 +1041,7 @@ def run_session_start(
         reclaim_dead_owner=resolution.session_id_keyed,
         probes=probes,
     )
-    session_registry.write_record(record, root=root)
+    session_records.write_record(record, root=root)
     _stamp_session_pointers(
         record, probes, root, newly_bound=newly_bound, t3_thread_id=resolution.t3_thread_id
     )
@@ -1073,7 +1053,7 @@ def run_session_start(
 # ---------------------------------------------------------------------------
 
 
-def _extract_question(hook_input: Mapping[str, Any]) -> session_registry.Question | None:
+def _extract_question(hook_input: Mapping[str, Any]) -> session_records.Question | None:
     """Extract a pending Question from a Notification hook's ``message``.
 
     Returns None -- leaving any prior ``record.question`` untouched by the
@@ -1084,7 +1064,7 @@ def _extract_question(hook_input: Mapping[str, Any]) -> session_registry.Questio
     message = hook_input.get('message')
     if not message or not str(message).strip():
         return None
-    return session_registry.Question(text=str(message), asked_at=datetime.now(UTC).isoformat())
+    return session_records.Question(text=str(message), asked_at=datetime.now(UTC).isoformat())
 
 
 _LAUNCH_WINDOW_WITHHOLD_MAX_SECS = 600.0
@@ -1096,7 +1076,7 @@ p90 and maximum, so only a stuck spawn falls through. See
 
 
 def _launch_window_withholding_expired(
-    prior: session_registry.SessionRecord,
+    prior: session_records.SessionRecord,
 ) -> bool:
     """Has *prior* sat in the unbound launch window past the withhold bound?
 
@@ -1117,7 +1097,7 @@ def _launch_window_withholding_expired(
 
 
 def _in_unbound_launch_window(
-    prior: session_registry.SessionRecord | None,
+    prior: session_records.SessionRecord | None,
 ) -> bool:
     """Is *prior* a spawn-created record still LAUNCHING and unbound?
 
@@ -1126,13 +1106,13 @@ def _in_unbound_launch_window(
     window. This answers only the record-shape question; whether to withhold
     is ``_withhold_from_launching``'s decision.
     """
-    if prior is None or prior.status is not session_registry.Status.LAUNCHING:
+    if prior is None or prior.status is not session_records.Status.LAUNCHING:
         return False
     return not (prior.claude_session_id or '').strip()
 
 
 def _withhold_from_launching(
-    prior: session_registry.SessionRecord,
+    prior: session_records.SessionRecord,
     *,
     probes: EventProbes,
 ) -> bool:
@@ -1153,9 +1133,9 @@ def _run_status_refresh_and_retitle(
     hook_input: Mapping[str, Any],
     env: Mapping[str, str],
     root: Path | str | None,
-    status: session_registry.Status,
+    status: session_records.Status,
     *,
-    question: session_registry.Question | None = None,
+    question: session_records.Question | None = None,
     process_tree: ProcessTree | None,
     self_exit: SelfExit | None = None,
 ) -> str:
@@ -1193,7 +1173,7 @@ def _run_status_refresh_and_retitle(
         # block so the withhold is still decided. A corrupt body propagates to
         # main(); FileNotFoundError means absent.
         with contextlib.suppress(FileNotFoundError):
-            prior = session_registry.read_record(slug, root=root)
+            prior = session_records.read_record(slug, root=root)
     # Decided from the same snapshot as the body written; status=None makes
     # the refresh a heartbeat-only bump. `prior is not None` narrows the type.
     in_launch_window = (
@@ -1201,7 +1181,7 @@ def _run_status_refresh_and_retitle(
         and _in_unbound_launch_window(prior)
         and _withhold_from_launching(prior, probes=probes)
     )
-    record = session_registry.apply_refresh(
+    record = session_records.apply_refresh(
         slug, prior, status=None if in_launch_window else status
     )
     # Status, question, binding and the self-exit stamp land in one body. A
@@ -1221,7 +1201,7 @@ def _run_status_refresh_and_retitle(
     if evaluation is not None:
         evaluation.stamp(record)
     # Unconditional: the heartbeat is owed on every event, a withheld one too.
-    session_registry.write_record(record, root=root)
+    session_records.write_record(record, root=root)
     _stamp_session_pointers(
         record, probes, root, newly_bound=newly_bound, t3_thread_id=resolution.t3_thread_id
     )
@@ -1251,7 +1231,7 @@ def run_notification(
         hook_input,
         env,
         root,
-        session_registry.Status.AWAITING_INPUT,
+        session_records.Status.AWAITING_INPUT,
         question=_extract_question(hook_input),
         process_tree=process_tree,
     )
@@ -1278,7 +1258,7 @@ def run_stop(
         hook_input,
         env,
         root,
-        session_registry.Status.IDLE,
+        session_records.Status.IDLE,
         process_tree=process_tree,
         self_exit=SelfExit() if self_exit is None else self_exit,
     )
@@ -1332,40 +1312,18 @@ def merge_hook_settings(settings: Mapping[str, Any], script_dir: str | Path) -> 
 def _hooks_script_dir() -> Path:
     """Absolute path to the in-repo skills/spawn/hooks/ dir.
 
-    Resolves to the PRIMARY checkout's ``skills/spawn/hooks/``, even when
-    this file is itself executing from inside a linked git worktree (e.g.
-    ``.worktrees/<id>/``). Otherwise the ephemeral worktree's path gets
-    baked into the absolute hook commands written into
-    ``~/.claude/settings.json``, and every hook breaks the moment that
-    worktree is reaped.
-
-    Runs ``git -C <this file's dir> rev-parse --path-format=absolute
-    --git-common-dir``: the *common* git dir always points at the primary
-    repo's ``.git``, even from a linked worktree, so its parent is the
-    primary checkout root. Falls back to the previous
-    ``Path(__file__).resolve().parents[3]`` behaviour whenever git is
-    absent, this isn't a git checkout, the command errors, or the resolved
-    directory doesn't actually contain the three hook scripts -- install
-    must stay robust and never raise.
+    Resolves to the PRIMARY checkout's ``skills/spawn/hooks/`` via
+    ``shared.project_layout.main_checkout_of``, even from a linked worktree,
+    so a reaped worktree's path is never baked into the hook commands in
+    ``~/.claude/settings.json``. Falls back to ``Path(__file__).resolve().parents[3]``
+    when no main checkout can be derived or the candidate lacks a hook
+    script: install never raises.
     """
     fallback = Path(__file__).resolve().parents[3] / 'skills' / 'spawn' / 'hooks'
-    file_dir = Path(__file__).resolve().parent
     try:
-        result = subprocess.run(
-            ['git', '-C', str(file_dir), 'rev-parse', '--path-format=absolute', '--git-common-dir'],
-            capture_output=True,
-            text=True,
-            timeout=_HOOK_TIMEOUT_SECS,
-            check=True,
-        )
-    except (OSError, subprocess.SubprocessError):
+        primary_root = main_checkout_of(Path(__file__))
+    except CheckoutRootError:
         return fallback
-
-    git_common_dir = result.stdout.strip()
-    if not git_common_dir:
-        return fallback
-
-    primary_root = Path(git_common_dir).resolve().parent
     candidate = primary_root / 'skills' / 'spawn' / 'hooks'
     if all((candidate / script_name).is_file() for script_name in _HOOK_SCRIPTS.values()):
         return candidate
@@ -1382,7 +1340,7 @@ def _run_install(settings_path: str | Path | None = None) -> None:
     the trio via ``merge_hook_settings``, writes a timestamped ``.bak`` of
     the pre-merge bytes when the file already existed, then atomically
     replaces the settings file (tmp file in the same dir + ``os.replace``,
-    mirroring ``session_registry.write_record``) so a crash mid-write can
+    mirroring ``session_records.write_record``) so a crash mid-write can
     never leave it truncated or corrupt.
     """
     path = Path(settings_path) if settings_path is not None else _DEFAULT_SETTINGS_PATH

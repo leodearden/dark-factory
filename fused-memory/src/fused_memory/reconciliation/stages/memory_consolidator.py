@@ -106,6 +106,7 @@ from fused_memory.reconciliation.summary_pool import (
 )
 from fused_memory.reconciliation.task_filter import (
     FilteredTaskTree,
+    available_tree,
     detect_census_inconsistency,
     format_filtered_task_tree,
 )
@@ -496,9 +497,10 @@ class MemoryConsolidator(BaseStage):
         their ids resolve by construction: they come from a same-cycle Qdrant
         scroll, and the sweep emits no flag unless that scroll returned a row.
         """
-        if self.filtered_task_tree is None:
+        tree = available_tree(self.filtered_task_tree)
+        if tree is None:
             return
-        active_tasks = self.filtered_task_tree.active_tasks
+        active_tasks = tree.active_tasks
         gate_ids = extract_open_gate_task_ids(active_tasks)
         swept = set(gate_ids)
         # Titles for the flag descriptions only; selection stays with extract_open_gate_task_ids.
@@ -636,9 +638,10 @@ class MemoryConsolidator(BaseStage):
         )
 
     def _active_tasks(self) -> list[dict] | None:
-        if self.filtered_task_tree is None:
+        tree = available_tree(self.filtered_task_tree)
+        if tree is None:
             return None
-        return self.filtered_task_tree.active_tasks
+        return tree.active_tasks
 
     def _detect_census_inconsistency(
         self, report: StageReport, events: list[ReconciliationEvent], run_id: str,
@@ -648,7 +651,7 @@ class MemoryConsolidator(BaseStage):
         Skipped when the max is 0 (an empty tree or no parseable id), where every
         id would read as above it: a false-positive flood, not a truncation signal.
         """
-        tree = self.filtered_task_tree
+        tree = available_tree(self.filtered_task_tree)
         if tree is None or tree.max_task_id <= 0:
             return
         event_task_ids = [
@@ -755,9 +758,10 @@ class MemoryConsolidator(BaseStage):
         Stateless: it reads the durable stamp off the active task tree, so it
         needs no Mem0 marker and no LLM finding.
         """
-        if self._escalation_queue is None or self.filtered_task_tree is None:
+        tree = available_tree(self.filtered_task_tree)
+        if self._escalation_queue is None or tree is None:
             return
-        active_tasks = self.filtered_task_tree.active_tasks
+        active_tasks = tree.active_tasks
         now = datetime.now(UTC)
         gate_stalled = extract_stalled_gate_backlog_task_ids(active_tasks, now=now)
         report.stats['stage1_gate_backlog_stalled'] = len(gate_stalled)
@@ -782,7 +786,7 @@ class MemoryConsolidator(BaseStage):
         stats. Absent is honest there, where a False ``enumeration_complete``
         would claim a corpus was observed and found incomplete.
         """
-        terminal_ids = extract_terminal_task_ids(self.filtered_task_tree)
+        terminal_ids = extract_terminal_task_ids(available_tree(self.filtered_task_tree))
         if terminal_ids:
             _publish_sweep_stats(report, _DEGENERATE_SWEEP_STATS, await _await_best_effort(
                 lambda: sweep_degenerate_task_nodes(self.memory, self.project_id, terminal_ids),
@@ -1283,12 +1287,13 @@ Review the above data and perform memory consolidation:
         the payload tight, matching _build_task_tree_section's pattern.  The
         snapshot is retained for :meth:`run`'s citation guard.  A tree with no
         active task yields a real, empty snapshot, because an absent section
-        tells this stage that no task is live; only an unset tree leaves it
-        None, and the guard inert.  Claimant heartbeats are aged at
+        tells this stage that no task is live; only an unset or unavailable
+        tree leaves it None, and the guard inert.  Claimant heartbeats are aged at
         ``filtered_task_tree_fetched_at``, the instant the tree was read, not
         at render time (task 6027).
         """
-        if self.filtered_task_tree is None:
+        tree = available_tree(self.filtered_task_tree)
+        if tree is None:
             return ''
         claims_read_at = resolve_tree_read_instant(
             self.filtered_task_tree_fetched_at,
@@ -1296,7 +1301,7 @@ Review the above data and perform memory consolidation:
             extra={'project_id': self.project_id},
         )
         self._live_workflow_snapshot = await build_live_workflow_snapshot(
-            self.filtered_task_tree.active_tasks,
+            tree.active_tasks,
             self.scope.project_root,
             claims_read_at=claims_read_at,
         )

@@ -667,7 +667,7 @@ def _disposition_table() -> dict[type[BaseException], BlockDisposition]:
         # requeue cap.
         #
         # task 3003: this is no longer a BD-2-completeness-only row. The merge
-        # worker's _run_inflight_verify now genuinely requeues this type (its
+        # worker's VerifyDispatcher.run_inflight_verify now genuinely requeues this type (its
         # defer arm catches (MergeVerifyLeaseContended, MergeVerifyLeaseHeld)),
         # so the values below finally describe what the code does. Until then
         # the type fell to the generic `except Exception` and resolved a
@@ -684,7 +684,7 @@ def _disposition_table() -> dict[type[BaseException], BlockDisposition]:
         # A contended merge-verify lane lock (task 2828) is transient "come back
         # later," identical in shape to MergeVerifyLeaseHeld above: REQUEUE,
         # never escalates, never counts against the requeue cap. Requeued by
-        # the merge worker's _run_inflight_verify (BD-2 forces this explicit
+        # the merge worker's VerifyDispatcher.run_inflight_verify (BD-2 forces this explicit
         # row). Raised by BOTH bounded-wait acquires on the shared
         # <lane_dir>.lock: GitOps.merge_verify_lease (the verify span, 2828)
         # and GitOps.reset_persistent_merge_worktree (the warm-swap reset,

@@ -23,7 +23,7 @@ const { strandBadgeState, agentCellState, locksCellState, schedulerLocksDatum } 
 // The Datum readers. Module scope, no fallback, bound under datum.js's own
 // names — see the CANONICAL note in datum.js's header.
 const { plainDatum, derivedDatum, servedDatum, datumView } = window.DF_DATUM;
-const { burndownStacks, burndownLegend, parityBannerState, burndownDatum, forecastText } = window.DF_BURNDOWN_BANDS;
+const { burndownStacks, burndownLegend, parityBannerState, burndownDatum, forecastText, projectBurndownBlock } = window.DF_BURNDOWN_BANDS;
 const { reconRunCounts, reconSuccessPct, reconStatusTone } = window.DF_RECON_STATUS;
 // Every OrchTab count is a named reading over the served census — task_snapshot.js.
 const { projectCensus, censusOver, projectRows, viewRows, terminalSelectingProjects, createTerminalWindowHooks, censusSegments, censusHistory, terminalOfTotal, CENSUS_VIEWS: TASK_CENSUS_VIEWS, CENSUS_TILES: TASK_CENSUS_TILES } = window.DF_TASK_SNAPSHOT;
@@ -32,7 +32,7 @@ const { windowEcho, windowLabel, recentMergesCaption } = window.DF_WINDOW_CHIP;
 const {
   projectInQueue, inQueueOver, inQueueHistory, latencyCaption, depthBucketCaption,
   queuedSince, projectSpeculative, speculativeOver, hitRateText, recentTotal,
-  attemptCount, attemptsOver, attemptsHistory, worstP95Over, projectAttempts, projectDepth,
+  attemptCount, attemptsOver, attemptsHistory, worstP95Over, projectAttempts, projectDepth, totalHint,
 } = window.DF_MERGE_QUEUE;
 const { writeQueue, queueHint, newestHourOps, opsTotals, opsCaption, opsTotalText } = window.DF_MEMORY_READINGS;
 // PerfTab reads the served cards, and why a tile over them is empty — performance_cards.js.
@@ -875,13 +875,15 @@ function MergeTab({ projectFilter }) {
   return (
     <div className="grid cols-12" style={{ gap: 12 }}>
       {(() => {
+        const merges = attemptsOver(DF, projIds);
+        const inQueue = inQueueOver(DF, projIds);
         const speculative = speculativeOver(DF, projIds);
         const worst = worstP95Over(DF, projIds);
         return (
           <div className="col-span-12 grid cols-4">
-            <ST label="Merges (window)" datum={attemptsOver(DF, projIds)}
+            <ST label="Merges (window)" datum={merges} hint={totalHint(merges)}
                 history={attemptsHistory(DF, projIds)} sparkColor={CP.accent} />
-            <ST label="In queue now" datum={inQueueOver(DF, projIds)}
+            <ST label="In queue now" datum={inQueue} hint={totalHint(inQueue)}
                 history={inQueueHistory(DF, projIds).slice(-30)} sparkColor={CP.warn} />
             <ST label="Speculative hit rate"
                 datum={speculative} format={hitRateText}
@@ -889,7 +891,7 @@ function MergeTab({ projectFilter }) {
                 history={[]} sparkColor={CP.ok} />
             <ST label="p95 latency · worst project"
                 datum={worst} format={w => fmtMs(w.p95_ms)}
-                hint={datumView(worst).isHole ? undefined : `${worst.value.timed_projects} projects`}
+                hint={totalHint(worst, datumView(worst).isHole ? undefined : `${worst.value.timed_projects} projects`)}
                 history={[]} sparkColor={CP.warn} />
           </div>
         );
@@ -1278,7 +1280,7 @@ function BurnTab({ projectFilter, displayWindow }) {
               <thead><tr><th>Project</th><th className="num">Completed</th><th className="num">Running</th><th className="num">Blocked</th><th className="num">Pending</th><th>Trend</th></tr></thead>
               <tbody>
                 {projects.map(p => {
-                  const pb = DF.BURNDOWN_BY_PROJECT[p.id];
+                  const pb = projectBurndownBlock(DF, p.id);
                   if (!pb) return null;
                   const pbLatest = burndownDatum(DF, pb, 'latest');
                   return (
@@ -1299,7 +1301,7 @@ function BurnTab({ projectFilter, displayWindow }) {
       )}
 
       {view === 'per-project' && projects.map(p => {
-        const pb = DF.BURNDOWN_BY_PROJECT[p.id];
+        const pb = projectBurndownBlock(DF, p.id);
         if (!pb) return null;
         const pbLatest = burndownDatum(DF, pb, 'latest');
         const last = i => pb[i][pb[i].length-1];
@@ -1327,9 +1329,10 @@ function BurnTab({ projectFilter, displayWindow }) {
                         <span key={l} style={{ color: 'var(--fg-2)' }}><span style={{ display: 'inline-block', width: 10, height: 10, background: c, marginRight: 5, verticalAlign: 'middle', borderRadius: 2 }}></span>{l}</span>
                       ))}
                     </div>
-                    {/* Bands must be indexed by THIS project's own snapshot row: b.labels is
-                        the sorted union across all projects (redux_api.py shape_burndown), so
-                        pairing it with pb.* both overruns and index-shifts them. */}
+                    {/* Bands must be indexed by THIS project's own snapshot row, which pb.labels
+                        is, restored from its label_spans: b.labels is the sorted union across all
+                        projects (redux_api.py shape_burndown), so pairing it with pb.* both
+                        overruns and index-shifts them. */}
                     <SA labels={pb.labels} stacks={burndownStacks(pb, CP)} height={220} countAxis formatX={window.DF_SHELL.fmtDateTime} />
                   </div>
                 </div>

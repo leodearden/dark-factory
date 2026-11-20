@@ -22,12 +22,11 @@ import pytest
 from _fastmcp_tool_result import tool_result_dict
 from _recon_prompt_write_scope import recon_system_prompts, split_by_write_grant
 from fastmcp.exceptions import ToolError
-from shared.mcp_markup_middleware import RepairPolicy
 from shared.toolcall_markup import CANONICAL_OPENER_PREFIX, closer_for, detect
 
 from fused_memory.config.schema import Mem0UpdateConfig
 from fused_memory.reconciliation import prompts
-from fused_memory.server.markup_guard import install_markup_guard
+from fused_memory.server.boundary_guards import install_boundary_guards
 from fused_memory.server.tools import create_mcp_server
 from fused_memory.utils.toolcall_xml_leak import find_toolcall_xml_leak, has_toolcall_xml_leak
 
@@ -68,10 +67,8 @@ def _guarded_server(tmp_path) -> tuple[Any, AsyncMock]:
         return_value={'status': 'updated', 'store': 'mem0', 'id': _MEMORY_ID}
     )
     server = create_mcp_server(service)
-    install_markup_guard(
-        server,
-        policy=RepairPolicy.REJECT_WITH_REPAIR,
-        known_projects={_PROJECT_ID: str(tmp_path)},
+    install_boundary_guards(
+        server, known_projects={_PROJECT_ID: str(tmp_path)}, prefix_resolver=None
     )
     return server, service
 

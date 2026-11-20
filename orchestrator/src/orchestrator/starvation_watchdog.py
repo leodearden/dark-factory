@@ -1,4 +1,4 @@
-"""The starvation watchdog's predicate, its lock-refusal counter and its filing text.
+"""The starvation watchdog's predicate and its filing text.
 
 The predicate (plans/scheduler-dispatch-scoring-and-lock-layer-prd.md C4, as
 retuned by esc-4851-3): a task is starving only when it has BOTH a durable
@@ -16,20 +16,19 @@ age alone never fires.
   a task parked behind a holder is never routed to a pinning gate.
 
 This module owns the predicate and the text; ``Scheduler`` gathers the facts
-and delivers the consequence (event, pin, escalation).
+(the durable counts live in ``starvation_state.py``) and delivers the
+consequence (event, pin, escalation).
 """
 
 from __future__ import annotations
 
-from collections import Counter
-from collections.abc import Iterable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 
 from orchestrator.config import StarvationWatchdogConfig
 from orchestrator.overrides import OverrideRow, OverrideSource
 from orchestrator.pin_reservation import Blocker
-from orchestrator.sentinel_l1 import SentinelL1
 
 STARVATION_WATCHDOG_ROLE = 'orchestrator-starvation-watchdog'
 # Grep anchor leading every watchdog summary; tests and classifiers key on it.
@@ -128,25 +127,6 @@ def classify(facts: CandidateFacts, cfg: StarvationWatchdogConfig) -> Starvation
     return None
 
 
-class LockRefusals:
-    """Per-task count of scans that refused the task its locks while a lower-ranked task dispatched."""
-
-    def __init__(self) -> None:
-        self._counts: Counter[str] = Counter()
-
-    def note_scan(self, refused: Iterable[str]) -> None:
-        self._counts.update(set(refused))
-
-    def count(self, task_id: str) -> int:
-        return self._counts.get(task_id, 0)
-
-    def forget(self, task_id: str) -> None:
-        self._counts.pop(task_id, None)
-
-    def task_ids(self) -> frozenset[str]:
-        return frozenset(self._counts)
-
-
 def _hours(secs: float) -> str:
     return f'{secs / 3600:.1f}h'
 
@@ -219,33 +199,3 @@ def escalation_text(
             f'{counts}\nBlockers:\n{_blocker_lines(blockers)}'
         )
     return summary[:_SUMMARY_LIMIT], detail
-
-
-def cap_escalation(cohort: Sequence[Finding], cfg: StarvationWatchdogConfig) -> SentinelL1:
-    """One L1 naming every pin-worthy firing the auto-pin cap turned away."""
-    lines = '\n'.join(
-        f'- task {f.facts.task_id}: gate {f.gate.value}, eligible_age_secs='
-        f'{f.facts.eligible_age_secs:.0f}, skip_count={f.facts.skip_count}, '
-        f'lock_refusals={f.facts.lock_refusals}, first blocker '
-        + (f'{f.blockers[0].module} {_first_blocker(f.blockers)}' if f.blockers else 'none recorded')
-        for f in cohort
-    )
-    return SentinelL1(
-        AUTO_PIN_CAP_SENTINEL,
-        category='risk_identified',
-        summary=(
-            f'{STARVATION_WATCHDOG_MARKER}: {len(cohort)} starving task(s) not '
-            f'auto-pinned: the cap of {cfg.auto_pin_max_concurrent} watchdog pins is full'
-        ),
-        detail=(
-            f'The starvation watchdog fired on these tasks, but '
-            f'starvation_watchdog.auto_pin_max_concurrent='
-            f'{cfg.auto_pin_max_concurrent} watchdog-owned pins already exist, so '
-            f'none was pinned and no per-task escalation was filed:\n{lines}\n\n'
-            f'Several tasks starving at once usually share one long lock holder.'
-        ),
-        suggested_action=(
-            'Check the first blockers for a wedged holder; pin by hand any task '
-            'that must go first, or raise auto_pin_max_concurrent.'
-        ),
-    )

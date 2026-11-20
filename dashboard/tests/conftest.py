@@ -59,6 +59,7 @@ from df_pytest_isolation import (  # noqa: E402
     _df_deploy_clocks_unwritten,  # noqa: F401  — the binding IS the wiring
     _df_git_ceiling_at_basetemp,  # noqa: F401  — the binding IS the wiring
     _df_git_env_hermetic,  # noqa: F401  — the binding IS the wiring
+    _df_no_mock_derived_stray_dirs,  # noqa: F401  — the binding IS the wiring  # debt: task 6997
     arm_leaked_drain_process_guard,
     reject_unsafe_basetemp,
 )
@@ -162,17 +163,7 @@ def two_url_config(tmp_path):
 
 
 @pytest.fixture()
-def samplers_off(monkeypatch):
-    """Any app lifespan started later in this test runs without the two background samplers.
-
-    Request it from a test that builds its own ``TestClient(app)`` and asserts
-    on a patched MCP seam (task 5826).
-    """
-    monkeypatch.setenv('DASHBOARD_SAMPLERS', 'off')
-
-
-@pytest.fixture()
-def client(samplers_off):
+def client():
     """Create a TestClient for the dashboard FastAPI app.
 
     Its lifespan is isolated on BOTH axes by the session-scoped
@@ -183,8 +174,9 @@ def client(samplers_off):
     half is not cosmetic: without it every lifespan here makes two real MCP
     round trips, and one slow response wedges ``TestClient.__exit__``.
 
-    The samplers are off, because their discovery ``ps``-scans the real host
-    and their reads land on whatever MCP seam the test patched (task 5826).
+    The samplers are off suite-wide via the session ``_isolated_project_root``
+    (dashboard/tests/_dashboard_helpers.py::apply_isolated_env), because their
+    discovery ``ps``-scans the real host.
     """
     from dashboard.app import app
 
@@ -193,7 +185,7 @@ def client(samplers_off):
 
 
 @pytest.fixture()
-def two_url_client(monkeypatch, samplers_off):
+def two_url_client(monkeypatch):
     """TestClient running the lifespan with a two-URL fused-memory config.
 
     Uses monkeypatch.setenv so DashboardConfig.from_env() inside the lifespan
@@ -204,8 +196,9 @@ def two_url_client(monkeypatch, samplers_off):
     from the session-scoped ``_isolated_project_root`` temp dir, so this
     lifespan does not touch the operator's live checkout either (task 3503).
 
-    The samplers are off, because their discovery ``ps``-scans the real host
-    and their reads land on whatever MCP seam the test patched (task 5826).
+    The samplers are off suite-wide via the session ``_isolated_project_root``
+    (dashboard/tests/_dashboard_helpers.py::apply_isolated_env), because their
+    discovery ``ps``-scans the real host.
     """
     from dashboard.app import app
 

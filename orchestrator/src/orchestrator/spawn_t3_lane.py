@@ -38,7 +38,7 @@ from pathlib import Path
 from typing import Any, TypeGuard
 from urllib.parse import quote
 
-from orchestrator import session_registry, spawn_t3_provider, t3_mcp_client
+from orchestrator import session_records, session_registry, spawn_t3_provider, t3_mcp_client
 from orchestrator.session_ownership_probes import ProcessTree
 
 MESSAGE_CHAR_LIMIT = 120_000
@@ -486,17 +486,17 @@ def _stamp_launched_record(
     """One read-modify-write: the t3 display, status running, and the parent when given; then the thread pointer's reconcile."""
     slug, root = _record_key(record_dir)
     try:
-        record = session_registry.read_record(slug, root=root)
-        record.display = session_registry.Display(
-            kind=session_registry.DisplayKind.T3.value,
+        record = session_records.read_record(slug, root=root)
+        record.display = session_records.Display(
+            kind=session_records.DisplayKind.T3.value,
             wm_title=title,
             t3_thread_id=launched.thread_id,
             t3_environment_id=environment_id,
         )
         if parent is not None:
             record.parent_session_id = parent
-        session_registry.write_record(
-            session_registry.apply_refresh(slug, record, status=session_registry.Status.RUNNING),
+        session_records.write_record(
+            session_records.apply_refresh(slug, record, status=session_records.Status.RUNNING),
             root=root,
         )
         bind_thread_pointer(record_dir, launched.thread_id)
@@ -505,7 +505,7 @@ def _stamp_launched_record(
 
 
 def _usable_parent(parent: str | None) -> str | None:
-    if parent and not session_registry.is_record_key(parent):
+    if parent and not session_records.is_record_key(parent):
         logger.warning(f'ignoring --parent {parent!r}: not a session record key')
         return None
     return parent or None
@@ -605,7 +605,7 @@ def _transcript_dirs(cwd: str) -> list[Path]:
     roots = [Path(os.environ.get('CLAUDE_PROJECTS_DIR') or Path.home() / '.claude' / 'projects')]
     if os.environ.get('CLAUDE_CONFIG_DIR'):
         roots.append(Path(os.environ['CLAUDE_CONFIG_DIR']) / 'projects')
-    encoded = [session_registry.encode_cwd(path) for path in (cwd, os.path.realpath(cwd))]
+    encoded = [session_records.encode_cwd(path) for path in (cwd, os.path.realpath(cwd))]
     return list(dict.fromkeys(root / name for root in roots for name in encoded))
 
 
@@ -652,7 +652,7 @@ def _launch_markers(record_dir: str) -> tuple[str, str]:
     """What only this spawn's own first message says: spawn-claude.sh's result trailer, or the spill pointer."""
     directory = Path(record_dir)
     return (
-        f'write your outcome to: {directory / session_registry.RESULT_FILENAME}',
+        f'write your outcome to: {directory / session_records.RESULT_FILENAME}',
         _spill_pointer(directory / 'prompt.md'),
     )
 
@@ -694,38 +694,38 @@ class Binding:
 _UNBOUND = Binding(None, None, bound=False)
 
 
-def _is_hand_launched(record: session_registry.SessionRecord) -> bool:
+def _is_hand_launched(record: session_records.SessionRecord) -> bool:
     """A spawn's record always has a result file; a hooks-made hand-launched one never does."""
     return record.result_file is None
 
 
-def _read_record_softly(slug: str, root: Path, role: str) -> session_registry.SessionRecord | None:
+def _read_record_softly(slug: str, root: Path, role: str) -> session_records.SessionRecord | None:
     try:
-        return session_registry.read_record(slug, root=root)
-    except (OSError, session_registry.CorruptSessionRecord) as exc:
+        return session_records.read_record(slug, root=root)
+    except (OSError, session_records.CorruptSessionRecord) as exc:
         logger.warning('cannot read %s record %s: %s', role, slug, exc)
         return None
 
 
 def _record_vouching_for(
     session_id: str, spawn_slug: str, root: Path
-) -> session_registry.SessionRecord | None:
+) -> session_records.SessionRecord | None:
     """The other record *session_id*'s pointer is vouched for by, if any."""
-    slug = session_registry.resolve_session_slug_for_claude_session_id(session_id, root=root)
+    slug = session_records.resolve_session_slug_for_claude_session_id(session_id, root=root)
     if slug is None or slug == spawn_slug:
         return None
     return _read_record_softly(slug, root, 'hand-launched')
 
 
-def _fold(hand: session_registry.SessionRecord, root: Path) -> None:
+def _fold(hand: session_records.SessionRecord, root: Path) -> None:
     try:
         session_registry.mark_session_folded(hand.session_slug, root=root)
-    except (OSError, session_registry.CorruptSessionRecord) as exc:
+    except (OSError, session_records.CorruptSessionRecord) as exc:
         logger.warning('cannot fold hand-launched record %s: %s', hand.session_slug, exc)
 
 
 def _bind_to(
-    record_dir: str, session_id: str, hand: session_registry.SessionRecord | None, via: BindingSource
+    record_dir: str, session_id: str, hand: session_records.SessionRecord | None, via: BindingSource
 ) -> Binding:
     """Bind *session_id* to the spawn record, then fold *hand*, the hand-launched record that held it.
 
@@ -748,23 +748,23 @@ def _bind_to(
     owner_identity = hand.claude_owner_identity if hand else None
     hand_slug = hand.session_slug if hand else None
     try:
-        record = session_registry.read_record(slug, root=root)
+        record = session_records.read_record(slug, root=root)
         if record.claude_launch_session_id is None:
             record.claude_launch_session_id = session_id
         record.claude_session_id = session_id
         if owner_pid is not None:
             record.claude_owner_pid = owner_pid
             record.claude_owner_identity = owner_identity
-        session_registry.write_record(record, root=root)
+        session_records.write_record(record, root=root)
     except Exception as exc:
         logger.warning(f'cannot bind session {session_id} to {record_dir}: {exc}')
         return Binding(session_id, hand_slug, bound=False)
-    session_registry.write_claude_session_pointer(session_id, slug, root=root)
+    session_records.write_claude_session_pointer(session_id, slug, root=root)
     if owner_pid is not None:
-        session_registry.write_session_pointer(owner_pid, slug, root=root)
-    thread_id = session_registry.t3_thread_of(record)
+        session_records.write_session_pointer(owner_pid, slug, root=root)
+    thread_id = session_records.t3_thread_of(record)
     if thread_id is not None:
-        session_registry.write_t3_thread_pointer(thread_id, slug, root=root)
+        session_records.write_t3_thread_pointer(thread_id, slug, root=root)
     if hand is not None:
         _fold(hand, root)
     return Binding(session_id, hand_slug, bound=True, via=via)
@@ -786,22 +786,22 @@ def bind_thread_pointer(record_dir: str, thread_id: str) -> Binding:
     written for a t3 spawn record of *thread_id*, bound once a hook bound it.
     """
     slug, root = _record_key(record_dir)
-    holder_slug = session_registry.resolve_session_slug_for_t3_thread(thread_id, root=root)
+    holder_slug = session_records.resolve_session_slug_for_t3_thread(thread_id, root=root)
     if holder_slug is not None and holder_slug != slug:
         holder = _read_record_softly(holder_slug, root, 'thread-pointer holder')
         if holder is None or not holder.claude_session_id:
             return _UNBOUND
         return _bind_to(record_dir, holder.claude_session_id, holder, BindingSource.THREAD_POINTER)
     record = _read_record_softly(slug, root, 'spawn')
-    if record is None or session_registry.t3_thread_of(record) != thread_id:
+    if record is None or session_records.t3_thread_of(record) != thread_id:
         return _UNBOUND
-    session_registry.write_t3_thread_pointer(thread_id, slug, root=root)
+    session_records.write_t3_thread_pointer(thread_id, slug, root=root)
     if not record.claude_session_id:
         return _UNBOUND
     return Binding(record.claude_session_id, None, bound=True, via=BindingSource.THREAD_POINTER)
 
 
-def _needs_binding(record: session_registry.SessionRecord, cwd: str, found: Transcript) -> bool:
+def _needs_binding(record: session_records.SessionRecord, cwd: str, found: Transcript) -> bool:
     """Unbound, or bound to a session whose transcript the newer *found* has replaced.
 
     A bound transcript that does not exist yet (a fresh ``/clear``) is no
@@ -819,7 +819,7 @@ def _needs_binding(record: session_registry.SessionRecord, cwd: str, found: Tran
 def maintain_binding(record_dir: str, cwd: str) -> None:
     """Bind an unbound record, or re-bind one whose transcript a newer one naming it replaced."""
     slug, root = _record_key(record_dir)
-    record = session_registry.read_record(slug, root=root)
+    record = session_records.read_record(slug, root=root)
     since = _parse_instant(record.start_ts)
     found = discover_transcript(cwd, record_dir, since.timestamp() if since else 0.0)
     if found is not None and _needs_binding(record, cwd, found):
@@ -939,10 +939,10 @@ def result_is_final(record_dir: str) -> bool:
     if not record_dir:
         return False
     try:
-        text = (Path(record_dir) / session_registry.RESULT_FILENAME).read_text(encoding='utf-8')
+        text = (Path(record_dir) / session_records.RESULT_FILENAME).read_text(encoding='utf-8')
     except (OSError, ValueError):
         return False
-    return session_registry.parse_result_outcome(text) in session_registry.TERMINAL_RESULT_OUTCOMES
+    return session_records.parse_result_outcome(text) in session_records.TERMINAL_RESULT_OUTCOMES
 
 
 class CallerGone(Exception):
@@ -1080,12 +1080,12 @@ def nearest_claude_ancestor(tree: ProcessTree) -> int | None:
 
 def self_record(tree: ProcessTree) -> str:
     claude_pid = nearest_claude_ancestor(tree)
-    slug = session_registry.resolve_session_slug_for_pid(claude_pid) if claude_pid else None
+    slug = session_records.resolve_session_slug_for_pid(claude_pid) if claude_pid else None
     parent = None
     if slug is not None:
         try:
-            parent = session_registry.read_record(slug).parent_session_id
-        except (OSError, session_registry.CorruptSessionRecord) as exc:
+            parent = session_records.read_record(slug).parent_session_id
+        except (OSError, session_records.CorruptSessionRecord) as exc:
             logger.warning('cannot read own record %s: %s', slug, exc)
     return f'slug={_token(slug)} parent={_token(parent)}'
 

@@ -15,8 +15,10 @@ import pytest
 
 from fused_memory.reconciliation.finding_task_escalation import (
     FINDING_TASK_ESCALATION_CATEGORY,
+    LIVENESS_UNKNOWN_DETAIL_KEY,
     build_finding_task_escalation_kwargs,
     is_routable_task_id,
+    liveness_unknown_detail,
     recent_conversion_suppresses_refile,
     resolve_finding_task_target,
     routed_record_carries_finding,
@@ -413,6 +415,33 @@ class TestBuildFindingTaskEscalationKwargs:
         )
         assert payload['task_id'] == '4458'
         json.loads(payload['detail'])
+
+    def test_detail_lists_its_own_target_when_the_target_liveness_is_unknown(self):
+        detail = json.loads(self._build(target_liveness_unknown=True)['detail'])
+        assert detail[LIVENESS_UNKNOWN_DETAIL_KEY] == ['4458']
+        assert detail['finding_fingerprint'] == 'fp-a'
+        assert detail['run_id'] == 'abcdef0123456789'
+
+    @pytest.mark.parametrize('over', [{}, {'target_liveness_unknown': False}])
+    def test_detail_omits_the_liveness_unknown_key_by_default(self, over):
+        payload = self._build(**over)
+        assert LIVENESS_UNKNOWN_DETAIL_KEY not in json.loads(payload['detail'])
+
+
+class TestLivenessUnknownDetail:
+    """The one shape both the recon-queue and the routed record carry."""
+
+    def test_lists_the_ids_sorted(self):
+        assert liveness_unknown_detail({'902', '777'}) == {
+            LIVENESS_UNKNOWN_DETAIL_KEY: ['777', '902'],
+        }
+
+    def test_no_ids_leaves_the_key_absent_rather_than_empty(self):
+        assert liveness_unknown_detail(frozenset()) == {}
+
+    def test_the_key_spelling_is_a_persisted_contract(self):
+        # Recon-queue records already on disk carry this spelling.
+        assert LIVENESS_UNKNOWN_DETAIL_KEY == 'liveness_unknown_task_ids'
 
 
 _REAPER_DETAIL_SUFFIX = '\n\n[note] originating worktree may be reaped; branch=task/4458'

@@ -80,8 +80,9 @@ _CANDIDATE_ID_RE = re.compile(r"^cand-\d{8}-\d+$")
 
 HEADER = """\
 # Agent-confusion codebook — persistent cause registry for legibility surveys.
-# version 2. MERGER-OWNED FILE: written solely by scripts/legibility/codebook.py
-# (plans/confusion-reduction-prd.md §7.1/§7.3). Append-only, never hand-edited:
+# version 2. MERGER-OWNED FILE: written solely by dark-factory's
+# scripts/legibility/codebook.py (dark-factory's
+# plans/confusion-reduction-prd.md §7.1/§7.3). Append-only, never hand-edited:
 # entries are never deleted (retire via status: retired); sightings/candidates
 # are appended by the deterministic merger's apply_coding_records(). Hand edits
 # will be normalized/overwritten on the next merge.

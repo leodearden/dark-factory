@@ -70,6 +70,9 @@ if str(REPO_ROOT) not in sys.path:
 # `_DEBUG_ASSERTS = os.environ.get(...)` seed picks it up.
 os.environ.setdefault('ORCH_DEBUG_ASSERTS', '1')
 
+# Why: test_suite_loads_no_dotenv.py.
+os.environ['PYTHON_DOTENV_DISABLED'] = '1'
+
 from _git_fixtures import RepoTemplates, session_templates  # noqa: E402
 from _orch_helpers import (  # noqa: E402
     CLAIMANT_TTL_SECS,
@@ -367,7 +370,7 @@ def _isolate_orch_config(monkeypatch, tmp_path):
     env value agrees with the YAML they write.  The opt-in
     ``code_default_config`` fixture runs after this autouse fixture and still
     wins (re-pointing ORCH_CONFIG_PATH at a guaranteed-absent file) for the
-    default-asserting / scoped-behaviour tests.
+    default-asserting tests.
     """
     monkeypatch.setenv("ORCH_CONFIG_PATH", str(REPO_ROOT / "dark-factory-orchestrator.yaml"))
     monkeypatch.setenv("ORCH_PROJECT_ROOT", str(tmp_path))
@@ -391,23 +394,23 @@ def code_default_config(monkeypatch, tmp_path):
     live operational overrides (commit b012af0e0e:
     ``merge_verify_breadth='full'``, ``merge_train_former_enabled=true``,
     ``merge_train_coalesce_enabled=true``) then bleed into any bare
-    ``OrchestratorConfig()``.
+    ``OrchestratorConfig()``.  Since task 7008 the code defaults carry
+    ``merge_verify_breadth='full'`` too, so breadth no longer differs between
+    them.
 
-    Tests that assert the CODE DEFAULTS (``defaults.yaml``:
-    ``merge_verify_breadth='scoped'``, trains OFF) — or that exercise the
-    default *scoped* merge-verify behaviour — must construct the config in
-    isolation from those live overrides.  Pointing ``ORCH_CONFIG_PATH`` at a
-    guaranteed-absent file makes ``YamlSettingsSource.__call__`` skip the
-    layer-2 project file (its ``.exists()`` is False) and load ONLY the
-    package-bundled ``defaults.yaml`` -> pure code defaults.  ``project_root``
-    still resolves to ``tmp_path`` via ``ORCH_PROJECT_ROOT`` (set by the autouse
-    fixture, which runs first), so bare-config tests still never write into the
-    live tree.
+    Tests that assert the CODE DEFAULTS (``defaults.yaml``: trains OFF) must be
+    isolated from those live overrides; scoped-merge tests pin breadth to
+    ``'scoped'`` explicitly rather than rely on this hatch.  Pointing
+    ``ORCH_CONFIG_PATH`` at a guaranteed-absent file makes
+    ``YamlSettingsSource.__call__`` skip the layer-2 project file (its
+    ``.exists()`` is False) and load ONLY the package-bundled ``defaults.yaml``
+    -> pure code defaults.  ``project_root`` still resolves to ``tmp_path`` via
+    ``ORCH_PROJECT_ROOT`` (set by the autouse fixture, which runs first), so
+    bare-config tests still never write into the live tree.
 
     Opt-in via ``@pytest.mark.usefixtures("code_default_config")`` (or a direct
-    request) on exactly the default-asserting / scoped-behaviour tests — NEVER
-    autouse, which would strip config.yaml from the ~10k tests that legitimately
-    rely on it.
+    request) on exactly the default-asserting tests — NEVER autouse, which
+    would strip config.yaml from the ~10k tests that legitimately rely on it.
     """
     monkeypatch.setenv("ORCH_CONFIG_PATH", str(tmp_path / "no-such-config.yaml"))
     monkeypatch.delenv("ORCH_VERIFY_RUNNERS", raising=False)
@@ -1196,6 +1199,8 @@ def mock_orch_config(tmp_path: Path) -> MagicMock:
     # _claimant_heartbeat_loop (workflow.py:2113) under load-exposed
     # teardown ordering, raising TypeError.
     config.claimant_heartbeat_interval_secs = 60.0
+    # Harness.run builds RunSlots from this; a spec'd MagicMock raises TypeError in asyncio.Semaphore.
+    config.main_health_fix_reserved_slots = 1
     # Task 3540: harness._resume_repend_liveness feeds this straight into
     # timedelta(seconds=...); a spec_set MagicMock attribute raises
     # TypeError there. THIS is the single owner of the value for the suite —

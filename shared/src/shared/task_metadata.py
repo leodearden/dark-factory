@@ -361,6 +361,7 @@ _DONE_PROVENANCE_RULES: Mapping[str, _KindRules] = MappingProxyType(
         'deterministic-deploy-scheduled': _KindRules(
             evidence=('unit', 'transient_unit', 'fire_delay_secs'),
         ),
+        'deterministic-deploy-unverified': _KindRules(),
         'deterministic-milestone': _KindRules(),
     }
 )
@@ -424,6 +425,7 @@ class DoneProvenance(BaseModel):
         'found_on_main',
         'deterministic-deploy',
         'deterministic-deploy-scheduled',
+        'deterministic-deploy-unverified',
         'deterministic-gate',
         'deterministic-milestone',
         'operational-verified',
@@ -1608,6 +1610,31 @@ _BLESSED_METADATA_KEYS: frozenset[str] = frozenset(
         # against a live reader — renaming it on one task would fork the
         # vocabulary and be re-added on the next block.
         'last_blocked_at',
+        # Merge-lane machine stamps (task 5281). This is the SINGLE in-repo
+        # copy of their census, a point-in-time snapshot of a growing corpus.
+        # `merge_phase_liveness` (task 2991): written by
+        # orchestrator/src/orchestrator/workflow.py::TaskWorkflow::_stamp_merge_phase_entered
+        # at merge entry and on every retry attempt, cleared by
+        # ::_clear_merge_phase_entered. No in-tree reader since task 3002
+        # (c8d53ef10f) retired harness._has_fresh_merge_phase; task 9614
+        # retires the writer, after which it stays blessed for historical
+        # carriers. Not x_-renamed: the live writer re-adds the bare key on the
+        # next merge entry.
+        # `merge_first_enqueued_at`: no writer since task 2172 (54944f69ff,
+        # 2026-07-07) moved the stamp to RetryLedger.merge_first_enqueued_at.
+        # Its reader is the legacy fast path in
+        # workflow.py::TaskWorkflow::_stamp_first_merge_enqueue, which adopts
+        # a numeric top-level value. Blessed for historical carriers on the
+        # 'modules' precedent: an x_ rename would blind that reader and mean
+        # surgery on 209 done records.
+        # Census 2026-11-15 (dark_factory tasks.db, submodel registrations
+        # imported): merge_first_enqueued_at 209 carriers, all done, all float,
+        # 207 with done_provenance, 0 also carrying the retry_ledger value
+        # (also 209 on 2026-08-31, so frozen); merge_phase_liveness 107
+        # carriers (done 101, pending 4, in-progress 1, cancelled 1), all
+        # {entered_at: str}. Together: 316 unknown_key lines.
+        'merge_first_enqueued_at',
+        'merge_phase_liveness',
         # recurrence (task 4676, PRD docs/prds/recurring-deterministic-tasks.md
         # R-D4), trigger_chain (below) and cancel_dispositions (below) are the
         # blessed keys that are also registered submodels — see the header note

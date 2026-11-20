@@ -27,6 +27,7 @@ from _dashboard_helpers import (
     apply_isolated_env,
     drive_loop_until,
     drive_metrics_loop,
+    enable_samplers,
     live_aiosqlite_worker_threads,
     yielding_noop_sleep,
 )
@@ -486,6 +487,7 @@ async def test_lifespan_shutdown_leaves_no_aiosqlite_worker_threads(
     and the test does not leave the lifespan block until that signal arrives.
     """
     apply_isolated_env(monkeypatch, tmp_path)
+    enable_samplers(monkeypatch)
     config = DashboardConfig.from_env()
     assert config.project_root == tmp_path.resolve(), (
         f'isolation failed: config.project_root={config.project_root} is not '
@@ -575,6 +577,7 @@ def test_metrics_loop_cancelled_mid_connect_reports_no_unhandled_thread_exceptio
     and returns without queueing anything.
     """
     apply_isolated_env(monkeypatch, tmp_path)
+    enable_samplers(monkeypatch)
     config = DashboardConfig.from_env()
     db_paths = _create_metrics_loop_db_files(config)
 

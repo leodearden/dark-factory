@@ -112,6 +112,7 @@ class TestChainMembersOnTheVerifyRow:
 
         assert facts.event_fields() == {
             'runner_reason': 'remote_busy', 'base_relation': None,
+            'chain_depth_reason': None,
             'chain_request_ids': ['mr-a', 'mr-b'], 'chain_task_ids': ['1', '2'],
         }
 

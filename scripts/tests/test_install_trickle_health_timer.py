@@ -495,7 +495,7 @@ def _run_script(tmp_path, project_id, *, env=None):
     Puts a fresh fake `systemctl` on PATH (state reset each call) and defaults
     INSTALL_TRICKLE_HEALTH_TIMER_PYTHON=sys.executable so the script's
     `nightly.py resolve-config` delegation runs the REAL resolver directly --
-    no `uv run`/`--frozen` needed in-test. Callers supply XDG_CONFIG_HOME and
+    no `uv run` needed in-test. Callers supply XDG_CONFIG_HOME and
     LEGIBILITY_SEARCH_ROOTS via *env*; any ambient LEGIBILITY_SEARCH_ROOTS is
     popped so a developer's shell cannot make this resolve the real projects.
     """

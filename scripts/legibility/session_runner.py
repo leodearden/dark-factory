@@ -21,12 +21,10 @@ for an invocation that produced no usable reply, and its subclass
 ``NoHeadroom`` for one that no pool account could take.
 
 THE PACKAGE SPELLING, ``from legibility import session_runner``, is the only
-way consumers reach this module, and that is what makes the exception classes
-unique. scripts/legibility/ sits on sys.path beside scripts/, so census's bare
-``import coder`` and nightly's ``from legibility import coder`` build two coder
-module objects. Defined here rather than in coder, the classes exist once
-however coder itself was imported, so ``coder.code_digest`` catches exactly
-what the invoker raises (task 6042).
+way consumers reach this module, as it is for every sibling, so its exception
+classes exist once and ``coder.code_digest`` catches exactly what the invoker
+raises (task 6042). scripts/tests/test_legibility_import_spelling.py enforces
+the one spelling.
 """
 from __future__ import annotations
 

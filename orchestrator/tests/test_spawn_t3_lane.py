@@ -43,7 +43,7 @@ from _process_identity_variants import own_identity
 from _process_tree_fakes import claude_process_tree
 from shared.process_identity import ProcessIdentity
 
-from orchestrator import session_hooks, t3_mcp_client
+from orchestrator import session_hooks, session_records, t3_mcp_client
 from orchestrator import session_registry as sr
 from orchestrator import spawn_t3_lane as lane
 from orchestrator.session_ownership_probes import ProcessTree
@@ -255,15 +255,15 @@ def run_verb(capsys: pytest.CaptureFixture[str], *argv: str) -> str:
 
 def spawn_record(env: Env, slug: str = 'unblock-df-7489-4242') -> str:
     """A spawn's launching record, with the result file ``_run_launching`` gives every spawn."""
-    record_dir = sr.record_path_for_slug(slug, root=env.fleet).parent
-    sr.write_record(
-        sr.SessionRecord(
+    record_dir = session_records.record_path_for_slug(slug, root=env.fleet).parent
+    session_records.write_record(
+        session_records.SessionRecord(
             session_slug=slug,
-            status=sr.Status.LAUNCHING,
+            status=session_records.Status.LAUNCHING,
             cwd=str(env.project),
             launcher_pid=4242,
             start_ts=datetime.now(UTC).isoformat(),
-            result_file=str(record_dir / sr.RESULT_FILENAME),
+            result_file=str(record_dir / session_records.RESULT_FILENAME),
         ),
         root=env.fleet,
     )
@@ -279,12 +279,12 @@ def stale_t3_record(
 ) -> str:
     """A live, indexed t3 record of ``env.project`` whose thread no listing names."""
     record_dir = spawn_record(env, slug)
-    record = sr.read_record(slug, root=env.fleet)
-    record.display = sr.Display(
+    record = session_records.read_record(slug, root=env.fleet)
+    record.display = session_records.Display(
         kind='t3', t3_thread_id=thread_id, t3_environment_id=environment_id
     )
-    sr.write_record(record, root=env.fleet)
-    sr.write_t3_thread_pointer(thread_id, slug, root=env.fleet)
+    session_records.write_record(record, root=env.fleet)
+    session_records.write_t3_thread_pointer(thread_id, slug, root=env.fleet)
     time.sleep(0.01)
     return record_dir
 
@@ -521,9 +521,9 @@ class TestLaunch:
                 'clientRequestId': ANY,
             }
         ]
-        record = sr.read_record(Path(record_dir).name, root=env.fleet)
-        assert record.status == sr.Status.RUNNING
-        assert record.display == sr.Display(
+        record = session_records.read_record(Path(record_dir).name, root=env.fleet)
+        assert record.status == session_records.Status.RUNNING
+        assert record.display == session_records.Display(
             kind='t3', wm_title='unblock:df#7489 x', t3_thread_id=THREAD_ID,
             t3_environment_id=ENVIRONMENT_ID,
         )
@@ -590,8 +590,8 @@ class TestLaunch:
         line = launch_line(capsys, tmp_path, env.project, *parent_args, record=record_dir)
 
         assert line.startswith('started ')
-        record = sr.read_record(Path(record_dir).name, root=env.fleet)
-        assert (record.parent_session_id, record.status) == (expected, sr.Status.RUNNING)
+        record = session_records.read_record(Path(record_dir).name, root=env.fleet)
+        assert (record.parent_session_id, record.status) == (expected, session_records.Status.RUNNING)
         assert record.display is not None and record.display.t3_thread_id == THREAD_ID
 
     def test_a_model_runs_on_the_projects_live_claude_instance(
@@ -616,7 +616,7 @@ class TestLaunch:
 
         assert line == 'refused reason=provider-disabled instance_id=claudeAgent source=explicit'
         assert t3.tool_calls('t3_thread_launch') == [] and t3.tool_calls('t3_thread_list') == []
-        assert sr.read_record(Path(record_dir).name, root=env.fleet).display is None
+        assert session_records.read_record(Path(record_dir).name, root=env.fleet).display is None
 
     def test_launch_first_sweeps_the_environments_records_whose_thread_is_gone(
         self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -626,8 +626,8 @@ class TestLaunch:
 
         launch_line(capsys, tmp_path, env.project)
 
-        stale = sr.read_record(Path(stale_dir).name, root=env.fleet)
-        assert (stale.status, stale.exit_code) == (sr.Status.EXITED, sr.ORPHAN_EXIT_CODE)
+        stale = session_records.read_record(Path(stale_dir).name, root=env.fleet)
+        assert (stale.status, stale.exit_code) == (session_records.Status.EXITED, sr.ORPHAN_EXIT_CODE)
         assert t3.tool_calls('t3_thread_list') == [{'allProjects': True, 'limit': 100}]
 
     def test_an_unlisted_thread_whose_read_archives_it_is_swept(
@@ -638,8 +638,8 @@ class TestLaunch:
 
         launch_line(capsys, tmp_path, env.project)
 
-        stale = sr.read_record(Path(stale_dir).name, root=env.fleet)
-        assert (stale.status, stale.exit_code) == (sr.Status.EXITED, sr.ORPHAN_EXIT_CODE)
+        stale = session_records.read_record(Path(stale_dir).name, root=env.fleet)
+        assert (stale.status, stale.exit_code) == (session_records.Status.EXITED, sr.ORPHAN_EXIT_CODE)
 
     def test_an_unlisted_thread_that_still_reads_present_is_not_swept(
         self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -650,8 +650,8 @@ class TestLaunch:
 
         launch_line(capsys, tmp_path, env.project)
 
-        assert sr.read_record(Path(stale_dir).name, root=env.fleet).status == sr.Status.LAUNCHING
-        assert sr.resolve_session_slug_for_t3_thread('th-vanished', root=env.fleet) == (
+        assert session_records.read_record(Path(stale_dir).name, root=env.fleet).status == session_records.Status.LAUNCHING
+        assert session_records.resolve_session_slug_for_t3_thread('th-vanished', root=env.fleet) == (
             Path(stale_dir).name
         )
         assert t3.tool_calls('t3_thread_read') == [{'threadId': 'th-vanished', 'limit': 1}]
@@ -664,7 +664,7 @@ class TestLaunch:
 
         launch_line(capsys, tmp_path, env.project)
 
-        assert sr.read_record(Path(stale_dir).name, root=env.fleet).status == sr.Status.LAUNCHING
+        assert session_records.read_record(Path(stale_dir).name, root=env.fleet).status == session_records.Status.LAUNCHING
 
     def test_after_one_unreachable_read_the_sweep_asks_about_no_further_thread(
         self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -677,7 +677,7 @@ class TestLaunch:
 
         assert t3.tool_calls('t3_thread_read') == [{'threadId': 'th-a', 'limit': 1}]
         for record_dir in (first, second):
-            assert sr.read_record(Path(record_dir).name, root=env.fleet).status == sr.Status.LAUNCHING
+            assert session_records.read_record(Path(record_dir).name, root=env.fleet).status == session_records.Status.LAUNCHING
 
     def test_launch_logs_its_sweeps_index_line_at_info(
         self,
@@ -699,8 +699,8 @@ class TestLaunch:
 
         launch_line(capsys, tmp_path, env.project)
 
-        assert sr.read_record(Path(stale_dir).name, root=env.fleet).status == sr.Status.LAUNCHING
-        assert sr.resolve_session_slug_for_t3_thread('th-vanished', root=env.fleet) == (
+        assert session_records.read_record(Path(stale_dir).name, root=env.fleet).status == session_records.Status.LAUNCHING
+        assert session_records.resolve_session_slug_for_t3_thread('th-vanished', root=env.fleet) == (
             Path(stale_dir).name
         )
         assert t3.tool_calls('t3_thread_read') == []
@@ -717,7 +717,7 @@ class TestLaunch:
 
         assert line.startswith('started ')
         assert len(t3.tool_calls('t3_thread_list')) == 2
-        assert sr.read_record(Path(stale_dir).name, root=env.fleet).status == sr.Status.LAUNCHING
+        assert session_records.read_record(Path(stale_dir).name, root=env.fleet).status == session_records.Status.LAUNCHING
 
     def test_a_thread_listing_whose_total_moves_between_pages_sweeps_nothing(
         self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -732,7 +732,7 @@ class TestLaunch:
         line = launch_line(capsys, tmp_path, env.project)
 
         assert line.startswith('started ')
-        assert sr.read_record(Path(record_dir).name, root=env.fleet).status == sr.Status.LAUNCHING
+        assert session_records.read_record(Path(record_dir).name, root=env.fleet).status == session_records.Status.LAUNCHING
 
     def test_a_prompt_over_the_ceiling_is_spilled_into_the_record_dir(
         self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -825,7 +825,7 @@ class TestProjectResolution:
 
         assert line == f'refused reason=project-archived detail={os.path.realpath(paged.archived)}'
         assert t3.tool_calls('t3_thread_launch') == []
-        assert sr.read_record(Path(record_dir).name, root=env.fleet).display is None
+        assert session_records.read_record(Path(record_dir).name, root=env.fleet).display is None
 
     def test_a_cwd_outside_every_project_is_refused(
         self, t3: FakeT3Server, paged: PagedProjects, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -880,8 +880,8 @@ class TestLaunchFailures:
         line = launch_line(capsys, tmp_path, worktree, record=record_dir)
 
         assert line == 'refused reason=cwd-not-project-worktree detail=The%20request%20was%20rejected.'
-        record = sr.read_record(Path(record_dir).name, root=env.fleet)
-        assert (record.display, record.status) == (None, sr.Status.LAUNCHING)
+        record = session_records.read_record(Path(record_dir).name, root=env.fleet)
+        assert (record.display, record.status) == (None, session_records.Status.LAUNCHING)
         assert len(t3.tool_calls('t3_thread_launch')) == 1
 
     def test_an_invalid_root_launch_is_launch_failed_whatever_its_message_says(
@@ -895,7 +895,7 @@ class TestLaunchFailures:
         assert line == (
             'launch-failed detail=invalid_request:%20Path%20%27/x%27%20is%20not%20a%20worktree%20of%20this%20project.'
         )
-        assert sr.read_record(Path(record_dir).name, root=env.fleet).display is None
+        assert session_records.read_record(Path(record_dir).name, root=env.fleet).display is None
 
     def test_another_failure_of_a_worktree_launch_is_launch_failed(
         self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -1009,7 +1009,7 @@ def write_transcript(
     env: Env, session_id: str, first_user_text: str, *, mtime: float | None = None,
     later_text: str = '',
 ) -> Path:
-    directory = env.projects_dir / sr.encode_cwd(str(env.project))
+    directory = env.projects_dir / session_records.encode_cwd(str(env.project))
     directory.mkdir(parents=True, exist_ok=True)
     entries = [
         {'type': 'queue-operation', 'operation': 'enqueue', 'content': later_text},
@@ -1038,10 +1038,10 @@ def hand_record(
 ) -> str:
     """A hand-launched record plus its session-id pointer, as the hooks write them."""
     slug = f'session-proj-{session_id}'
-    sr.write_record(
-        sr.SessionRecord(
+    session_records.write_record(
+        session_records.SessionRecord(
             session_slug=slug,
-            status=sr.Status.RUNNING,
+            status=session_records.Status.RUNNING,
             cwd=str(env.project),
             claude_session_id=session_id,
             claude_owner_pid=owner_pid,
@@ -1049,7 +1049,7 @@ def hand_record(
         ),
         root=env.fleet,
     )
-    sr.write_claude_session_pointer(session_id, slug, root=env.fleet)
+    session_records.write_claude_session_pointer(session_id, slug, root=env.fleet)
     return slug
 
 
@@ -1081,13 +1081,13 @@ class TestAwaitStarted:
 
         assert line == f'started sid={SESSION_ID} hand_slug={hand_slug} bound=yes via=transcript'
         slug = Path(record_dir).name
-        record = sr.read_record(slug, root=env.fleet)
+        record = session_records.read_record(slug, root=env.fleet)
         assert (record.claude_session_id, record.claude_launch_session_id) == (SESSION_ID, SESSION_ID)
         assert record.claude_owner_pid == 424242
-        assert sr.resolve_session_slug_for_claude_session_id(SESSION_ID, root=env.fleet) == slug
-        assert sr.resolve_session_slug_for_pid(424242, root=env.fleet) == slug
-        folded = sr.read_record(hand_slug, root=env.fleet)
-        assert (folded.status, folded.exit_code) == (sr.Status.EXITED, sr.FOLDED_EXIT_CODE)
+        assert session_records.resolve_session_slug_for_claude_session_id(SESSION_ID, root=env.fleet) == slug
+        assert session_records.resolve_session_slug_for_pid(424242, root=env.fleet) == slug
+        folded = session_records.read_record(hand_slug, root=env.fleet)
+        assert (folded.status, folded.exit_code) == (session_records.Status.EXITED, sr.FOLDED_EXIT_CODE)
 
     def test_started_copies_the_hand_launched_owner_identity_with_its_pid(
         self, env: Env, t3: FakeT3Server, capsys: pytest.CaptureFixture[str]
@@ -1100,7 +1100,7 @@ class TestAwaitStarted:
 
         self._await(capsys, env, record_dir, since=time.time() - 60)
 
-        record = sr.read_record(Path(record_dir).name, root=env.fleet)
+        record = session_records.read_record(Path(record_dir).name, root=env.fleet)
         assert record.claude_owner_pid == os.getpid()
         assert record.claude_owner_identity == owner
 
@@ -1114,7 +1114,7 @@ class TestAwaitStarted:
         line = self._await(capsys, env, record_dir)
 
         assert line == f'started sid={SESSION_ID} hand_slug=none bound=yes via=transcript'
-        assert sr.read_record(Path(record_dir).name, root=env.fleet).claude_owner_pid is None
+        assert session_records.read_record(Path(record_dir).name, root=env.fleet).claude_owner_pid is None
 
     def test_a_session_already_pointing_at_the_spawn_record_folds_nothing(
         self, env: Env, t3: FakeT3Server, capsys: pytest.CaptureFixture[str]
@@ -1122,16 +1122,16 @@ class TestAwaitStarted:
         t3.tool_replies['t3_thread_read'] = thread_read(status='running')
         record_dir = spawn_record(env)
         slug = Path(record_dir).name
-        record = sr.read_record(slug, root=env.fleet)
+        record = session_records.read_record(slug, root=env.fleet)
         record.claude_session_id = SESSION_ID
-        sr.write_record(record, root=env.fleet)
-        sr.write_claude_session_pointer(SESSION_ID, slug, root=env.fleet)
+        session_records.write_record(record, root=env.fleet)
+        session_records.write_claude_session_pointer(SESSION_ID, slug, root=env.fleet)
         write_transcript(env, SESSION_ID, trailer(record_dir))
 
         line = self._await(capsys, env, record_dir)
 
         assert line == f'started sid={SESSION_ID} hand_slug=none bound=yes via=transcript'
-        assert sr.read_record(slug, root=env.fleet).status == sr.Status.LAUNCHING
+        assert session_records.read_record(slug, root=env.fleet).status == session_records.Status.LAUNCHING
 
     def test_started_with_no_transcript_naming_the_record_is_unbound(
         self, env: Env, t3: FakeT3Server, capsys: pytest.CaptureFixture[str]
@@ -1146,7 +1146,7 @@ class TestAwaitStarted:
         line = self._await(capsys, env, record_dir, timeout='1', since=time.time() - 60)
 
         assert line == 'started sid=none hand_slug=none bound=no via=none'
-        assert sr.read_record(Path(record_dir).name, root=env.fleet).claude_session_id is None
+        assert session_records.read_record(Path(record_dir).name, root=env.fleet).claude_session_id is None
 
     def test_started_without_a_record_skips_discovery(
         self, env: Env, t3: FakeT3Server, capsys: pytest.CaptureFixture[str]
@@ -1219,7 +1219,7 @@ class TestAwaitStarted:
         t3.tool_replies['t3_thread_read'] = thread_read(status='running')
         record_dir = spawn_record(env)
         slug = Path(record_dir).name
-        sr.update_display(slug, root=env.fleet, kind='t3', t3_thread_id=THREAD_ID)
+        session_records.update_display(slug, root=env.fleet, kind='t3', t3_thread_id=THREAD_ID)
         hand = t3_session_start(env)
 
         line = self._await(capsys, env, record_dir)
@@ -1256,7 +1256,7 @@ class TestAwaitStarted:
 T3_CLAUDE_PID = 424242
 
 
-def t3_session_start(env: Env) -> sr.SessionRecord:
+def t3_session_start(env: Env) -> session_records.SessionRecord:
     """The real SessionStart hook of claude ``T3_CLAUDE_PID`` in thread ``THREAD_ID``, as T3 starts it."""
     return session_hooks.run_session_start(
         {'session_id': SESSION_ID, 'cwd': str(env.project)},
@@ -1266,26 +1266,26 @@ def t3_session_start(env: Env) -> sr.SessionRecord:
     )
 
 
-def assert_folded_into(env: Env, slug: str, hand: sr.SessionRecord) -> None:
+def assert_folded_into(env: Env, slug: str, hand: session_records.SessionRecord) -> None:
     """The spawn record *slug* carries *hand*'s session and owner, every pointer names it, and *hand* is folded."""
-    record = sr.read_record(slug, root=env.fleet)
+    record = session_records.read_record(slug, root=env.fleet)
     assert (record.claude_session_id, record.claude_launch_session_id) == (SESSION_ID, SESSION_ID)
     assert (record.claude_owner_pid, record.claude_owner_identity) == (
         T3_CLAUDE_PID,
         hand.claude_owner_identity,
     )
-    folded = sr.read_record(hand.session_slug, root=env.fleet)
-    assert (folded.status, folded.exit_code) == (sr.Status.EXITED, sr.FOLDED_EXIT_CODE)
-    assert sr.resolve_session_slug_for_t3_thread(THREAD_ID, root=env.fleet) == slug
-    assert sr.resolve_session_slug_for_claude_session_id(SESSION_ID, root=env.fleet) == slug
-    assert sr.resolve_session_slug_for_pid(T3_CLAUDE_PID, root=env.fleet) == slug
+    folded = session_records.read_record(hand.session_slug, root=env.fleet)
+    assert (folded.status, folded.exit_code) == (session_records.Status.EXITED, sr.FOLDED_EXIT_CODE)
+    assert session_records.resolve_session_slug_for_t3_thread(THREAD_ID, root=env.fleet) == slug
+    assert session_records.resolve_session_slug_for_claude_session_id(SESSION_ID, root=env.fleet) == slug
+    assert session_records.resolve_session_slug_for_pid(T3_CLAUDE_PID, root=env.fleet) == slug
 
 
 class TestThreadPointerReconcile:
     def test_launch_folds_a_hand_record_whose_session_start_claimed_the_thread_first(
         self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        hands: list[sr.SessionRecord] = []
+        hands: list[session_records.SessionRecord] = []
 
         def launch_while_the_child_starts(arguments: Mapping[str, Any]) -> ToolSuccess:
             hands.append(t3_session_start(env))
@@ -1297,24 +1297,24 @@ class TestThreadPointerReconcile:
         launch_line(capsys, tmp_path, env.project, record=record_dir)
 
         [hand] = hands
-        assert sr.is_t3_record(hand)
+        assert session_records.is_t3_record(hand)
         assert_folded_into(env, Path(record_dir).name, hand)
 
     def test_a_thread_pointer_another_spawn_holds_is_left_alone(self, env: Env) -> None:
         record_dir = spawn_record(env)
         other_dir = spawn_record(env, 'review-df-7000-777')
-        other = sr.read_record('review-df-7000-777', root=env.fleet)
-        other.display = sr.Display(kind='t3', t3_thread_id=THREAD_ID)
-        other.claude_session_id, other.status = SESSION_ID, sr.Status.RUNNING
-        sr.write_record(other, root=env.fleet)
-        sr.write_t3_thread_pointer(THREAD_ID, 'review-df-7000-777', root=env.fleet)
+        other = session_records.read_record('review-df-7000-777', root=env.fleet)
+        other.display = session_records.Display(kind='t3', t3_thread_id=THREAD_ID)
+        other.claude_session_id, other.status = SESSION_ID, session_records.Status.RUNNING
+        session_records.write_record(other, root=env.fleet)
+        session_records.write_t3_thread_pointer(THREAD_ID, 'review-df-7000-777', root=env.fleet)
 
         binding = lane.bind_thread_pointer(record_dir, THREAD_ID)
 
         assert (binding.bound, binding.via) == (False, lane.BindingSource.NONE)
-        assert sr.read_record(Path(other_dir).name, root=env.fleet).status == sr.Status.RUNNING
-        assert sr.read_record(Path(record_dir).name, root=env.fleet).claude_session_id is None
-        assert sr.resolve_session_slug_for_t3_thread(THREAD_ID, root=env.fleet) == (
+        assert session_records.read_record(Path(other_dir).name, root=env.fleet).status == session_records.Status.RUNNING
+        assert session_records.read_record(Path(record_dir).name, root=env.fleet).claude_session_id is None
+        assert session_records.resolve_session_slug_for_t3_thread(THREAD_ID, root=env.fleet) == (
             'review-df-7000-777'
         )
 
@@ -1329,8 +1329,8 @@ class TestThreadPointerReconcile:
             hand.session_slug,
             lane.BindingSource.TRANSCRIPT,
         )
-        folded = sr.read_record(hand.session_slug, root=env.fleet)
-        assert (folded.status, folded.exit_code) == (sr.Status.EXITED, sr.FOLDED_EXIT_CODE)
+        folded = session_records.read_record(hand.session_slug, root=env.fleet)
+        assert (folded.status, folded.exit_code) == (session_records.Status.EXITED, sr.FOLDED_EXIT_CODE)
 
 
 def test_a_spilled_launch_message_is_discovered(env: Env) -> None:
@@ -1346,18 +1346,18 @@ def test_a_spilled_launch_message_is_discovered(env: Env) -> None:
 def test_a_session_another_spawn_owns_is_neither_bound_nor_folded(env: Env) -> None:
     record_dir = spawn_record(env)
     other_dir = spawn_record(env, 'review-df-7000-777')
-    other = sr.read_record('review-df-7000-777', root=env.fleet)
+    other = session_records.read_record('review-df-7000-777', root=env.fleet)
     other.result_file = f'{other_dir}/result.md'
-    other.claude_session_id, other.status = SESSION_ID, sr.Status.RUNNING
-    sr.write_record(other, root=env.fleet)
-    sr.write_claude_session_pointer(SESSION_ID, 'review-df-7000-777', root=env.fleet)
+    other.claude_session_id, other.status = SESSION_ID, session_records.Status.RUNNING
+    session_records.write_record(other, root=env.fleet)
+    session_records.write_claude_session_pointer(SESSION_ID, 'review-df-7000-777', root=env.fleet)
 
     binding = lane.bind_session(record_dir, lane.Transcript(SESSION_ID, Path('unused'), 0.0))
 
     assert (binding.bound, binding.hand_slug) == (False, None)
-    assert sr.read_record('review-df-7000-777', root=env.fleet).status == sr.Status.RUNNING
-    assert sr.read_record(Path(record_dir).name, root=env.fleet).claude_session_id is None
-    assert sr.resolve_session_slug_for_claude_session_id(SESSION_ID, root=env.fleet) == (
+    assert session_records.read_record('review-df-7000-777', root=env.fleet).status == session_records.Status.RUNNING
+    assert session_records.read_record(Path(record_dir).name, root=env.fleet).claude_session_id is None
+    assert session_records.resolve_session_slug_for_claude_session_id(SESSION_ID, root=env.fleet) == (
         'review-df-7000-777'
     )
 
@@ -1373,7 +1373,7 @@ class TestRebinding:
 
         lane.maintain_binding(record_dir, str(env.project))
 
-        record = sr.read_record(Path(record_dir).name, root=env.fleet)
+        record = session_records.read_record(Path(record_dir).name, root=env.fleet)
         assert (record.claude_session_id, record.claude_owner_pid) == ('handoff-session', 515151)
         assert record.claude_launch_session_id == 'first-session'
 
@@ -1383,25 +1383,25 @@ class TestRebinding:
         now = time.time()
         write_transcript(env, 'launch-session', trailer(record_dir), mtime=now - 600)
         write_transcript(env, 'cleared-session', '/clear', mtime=now)
-        record = sr.read_record(slug, root=env.fleet)
+        record = session_records.read_record(slug, root=env.fleet)
         record.claude_session_id, record.claude_owner_pid = 'cleared-session', 616161
-        sr.write_record(record, root=env.fleet)
+        session_records.write_record(record, root=env.fleet)
 
         lane.maintain_binding(record_dir, str(env.project))
 
-        assert sr.read_record(slug, root=env.fleet).claude_session_id == 'cleared-session'
+        assert session_records.read_record(slug, root=env.fleet).claude_session_id == 'cleared-session'
 
     def test_a_remint_whose_transcript_is_not_written_yet_is_not_undone(self, env: Env) -> None:
         record_dir = spawn_record(env)
         slug = Path(record_dir).name
         write_transcript(env, 'launch-session', trailer(record_dir))
-        record = sr.read_record(slug, root=env.fleet)
+        record = session_records.read_record(slug, root=env.fleet)
         record.claude_session_id = 'cleared-session-unwritten'
-        sr.write_record(record, root=env.fleet)
+        session_records.write_record(record, root=env.fleet)
 
         lane.maintain_binding(record_dir, str(env.project))
 
-        assert sr.read_record(slug, root=env.fleet).claude_session_id == 'cleared-session-unwritten'
+        assert session_records.read_record(slug, root=env.fleet).claude_session_id == 'cleared-session-unwritten'
 
     def test_a_transcript_under_claude_config_dir_is_discovered(
         self, env: Env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1409,7 +1409,7 @@ class TestRebinding:
         config_dir = tmp_path / 'claude-home'
         monkeypatch.setenv('CLAUDE_CONFIG_DIR', str(config_dir))
         record_dir = spawn_record(env)
-        directory = config_dir / 'projects' / sr.encode_cwd(str(env.project))
+        directory = config_dir / 'projects' / session_records.encode_cwd(str(env.project))
         directory.mkdir(parents=True)
         entry = {'type': 'user', 'message': {'role': 'user', 'content': trailer(record_dir)}}
         (directory / f'{SESSION_ID}.jsonl').write_text(json.dumps(entry) + '\n')
@@ -1611,8 +1611,8 @@ class TestWait:
         t3.tool_replies['t3_thread_read'] = thread_read(archived=True, projectId=None)
 
         assert wait_for(env, '', FakeClock()) == 'finished code=0'
-        stale = sr.read_record(Path(stale_dir).name, root=env.fleet)
-        assert (stale.status, stale.exit_code) == (sr.Status.EXITED, sr.ORPHAN_EXIT_CODE)
+        stale = session_records.read_record(Path(stale_dir).name, root=env.fleet)
+        assert (stale.status, stale.exit_code) == (session_records.Status.EXITED, sr.ORPHAN_EXIT_CODE)
         assert t3.tool_calls('t3_thread_list') == [{'allProjects': True, 'limit': 100}]
 
     def test_a_pass_whose_sweep_marks_nothing_logs_its_line_at_debug(
@@ -1635,7 +1635,7 @@ class TestWait:
         t3.tool_replies['t3_thread_read'] = read_per_thread
 
         assert wait_for(env, '', FakeClock()) == 'finished code=0'
-        assert sr.read_record(Path(stale_dir).name, root=env.fleet).status == sr.Status.LAUNCHING
+        assert session_records.read_record(Path(stale_dir).name, root=env.fleet).status == session_records.Status.LAUNCHING
 
     def test_an_incomplete_listing_sweeps_nothing_while_waiting(self, env: Env, t3: FakeT3Server) -> None:
         stale_dir = stale_t3_record(env)
@@ -1647,7 +1647,7 @@ class TestWait:
         }
 
         assert wait_for(env, '', FakeClock()) == 'finished code=0'
-        assert sr.read_record(Path(stale_dir).name, root=env.fleet).status == sr.Status.LAUNCHING
+        assert session_records.read_record(Path(stale_dir).name, root=env.fleet).status == session_records.Status.LAUNCHING
 
     def test_an_unbound_record_is_bound_while_waiting(self, env: Env, t3: FakeT3Server) -> None:
         record_dir = spawn_record(env)
@@ -1656,7 +1656,7 @@ class TestWait:
         t3.tool_replies['t3_thread_read'] = thread_read()
 
         assert wait_for(env, record_dir, FakeClock()) == 'finished code=0'
-        assert sr.read_record(Path(record_dir).name, root=env.fleet).claude_session_id == SESSION_ID
+        assert session_records.read_record(Path(record_dir).name, root=env.fleet).claude_session_id == SESSION_ID
 
     def test_main_reports_a_gone_caller_on_stderr_only(
         self, env: Env, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch,
@@ -1688,14 +1688,14 @@ def _tree(parents: dict[int, int], comms: dict[int, str]) -> ProcessTree:
 
 class TestSelfRecord:
     def test_resolves_the_nearest_claude_ancestors_record_and_its_parent(self, env: Env) -> None:
-        sr.write_record(
-            sr.SessionRecord(
-                session_slug='session-df-abc', status=sr.Status.RUNNING,
+        session_records.write_record(
+            session_records.SessionRecord(
+                session_slug='session-df-abc', status=session_records.Status.RUNNING,
                 claude_owner_pid=100, parent_session_id='watcher-df-9',
             ),
             root=env.fleet,
         )
-        sr.write_session_pointer(100, 'session-df-abc', root=env.fleet)
+        session_records.write_session_pointer(100, 'session-df-abc', root=env.fleet)
         tree = _tree({300: 200, 200: 100, 100: 1}, {300: 'bash', 200: 'bash', 100: 'claude'})
 
         assert lane.self_record(tree) == 'slug=session-df-abc parent=watcher-df-9'
@@ -1706,7 +1706,7 @@ class TestSelfRecord:
         assert lane.self_record(tree) == 'slug=none parent=none'
 
     def test_an_unvouched_pointer_is_none(self, env: Env) -> None:
-        sr.write_session_pointer(100, 'session-df-abc', root=env.fleet)
+        session_records.write_session_pointer(100, 'session-df-abc', root=env.fleet)
         tree = _tree({300: 100}, {300: 'bash', 100: 'claude'})
 
         assert lane.self_record(tree) == 'slug=none parent=none'

@@ -11,12 +11,13 @@ These are cross-store concurrency regressions, not per-store unit tests — each
 needs a SECOND connection to the same file — so they live in one module instead of
 being split across test_journal.py / test_event_buffer.py / test_recon_ledger.py.
 
-The COLLISION arms, a write queued into a read's pinned snapshot, are
-CONSTRUCTED rather than raced.  ``_StatementGate`` parks the store's own read just
-after it pins its snapshot, so each arm is one deterministic run.  Each arm's
-read certifies the pin by not seeing the row the foreign connection committed
-while it was parked, and each positive arm has a legacy control through the same
-helper: the replaced execute + fetchall read, which the same collision kills.
+The COLLISION arms, one per store, each a write queued into a read's pinned
+snapshot, are CONSTRUCTED rather than raced.  ``_StatementGate`` parks the store's
+own read just after it pins its snapshot, so each arm is one deterministic run.
+Each arm's read certifies the pin by not seeing the row the foreign connection
+committed while it was parked, and each positive arm has a legacy control through
+the same helper: the replaced execute + fetchall read, which the same collision
+kills.
 
 MEASURED BASELINES, taken on this task's base commit (2026-09-17), recorded so the
 next reader does not re-derive them:
@@ -32,24 +33,14 @@ it is the CHECKPOINT that raises when another coroutine has a statement in fligh
 the same connection, not the write.  Same defect, same fix; the arms assert neither
 side raises.
 
-TWO GAPS, both deliberate, recorded so a later reader does not mistake either for an
-oversight:
-
-1. There is no ReconLedgerStore COLLISION arm.  One was attempted and measured at
-   0/20 on this base — a multi-hop ``list_suppressions`` read pinned, a foreign
-   commit on the journal's connection, then ``upsert``, at 8,000 rows.  No
-   reproducing shape was found for this store, and an arm that passes on the
-   unfixed code asserts nothing.  The ledger is migrated anyway: it is the third
-   connection to the same file, its checkpoint arm below DOES fail 20/20 today, and
-   its old transaction wrapper carried the same connection-wide rollback.
-
-2. The FAILING-unit half of the connection-wide-rollback regression (one coroutine's
-   failing unit rolls back the CONNECTION, discarding another coroutine's in-flight
-   write, whose own commit then succeeds silently) is pinned at the primitive, in
-   ``shared/tests/test_async_sqlite_base.py``, not here.  It needs a suspension
-   point INSIDE a write unit and no public store method has one; the nearest
-   store-level shape lost 0 of 20 writes when measured.  The CANCELLATION half of
-   the same defect a store method CAN trigger, and is pinned below at the ledger.
+ONE GAP, deliberate, recorded so a later reader does not mistake it for an
+oversight: the FAILING-unit half of the connection-wide-rollback regression (one
+coroutine's failing unit rolls back the CONNECTION, discarding another coroutine's
+in-flight write, whose own commit then succeeds silently) is pinned at the
+primitive, in ``shared/tests/test_async_sqlite_base.py``, not here.  It needs a
+suspension point INSIDE a write unit and no public store method has one; the
+nearest store-level shape lost 0 of 20 writes when measured.  The CANCELLATION half
+of the same defect a store method CAN trigger, and is pinned below at the ledger.
 """
 
 from __future__ import annotations
@@ -72,8 +63,10 @@ from fused_memory.models.reconciliation import (
     EventSource,
     EventType,
     ReconciliationEvent,
+    RunStatus,
 )
 from fused_memory.reconciliation.event_buffer import EventBuffer
+from fused_memory.reconciliation.flag_record_contract import STAGE1_FLAG_SUPPRESSION_KIND
 from fused_memory.reconciliation.journal import ReconciliationJournal
 from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord, ReconLedgerStore
 
@@ -137,14 +130,17 @@ async def test_each_collision_store_runs_its_statements_on_its_injected_connecti
     """
     data_dir = tmp_path / 'recon'
     db_path = str(data_dir / 'reconciliation.db')
-    journal_tap, buffer_tap = _ConnectTap(), _ConnectTap()
+    journal_tap, buffer_tap, ledger_tap = _ConnectTap(), _ConnectTap(), _ConnectTap()
     journal = ReconciliationJournal(data_dir, connect=journal_tap)
     buffer = EventBuffer(db_path=data_dir / 'reconciliation.db', connect=buffer_tap)
+    ledger = ReconLedgerStore(data_dir / 'reconciliation.db', connect=ledger_tap)
     try:
         for name, store, tap, public_read in (
             ('ReconciliationJournal', journal, journal_tap,
              lambda: journal.get_stale_runs(STALE_CUTOFF_SECONDS)),
             ('EventBuffer', buffer, buffer_tap, lambda: buffer.peek_buffered(PROJECT_ID, 10)),
+            ('ReconLedgerStore', ledger, ledger_tap,
+             lambda: ledger.list_suppressions(PROJECT_ID)),
         ):
             await store.initialize()
             traced: list[str] = []
@@ -157,6 +153,7 @@ async def test_each_collision_store_runs_its_statements_on_its_injected_connecti
             )
             assert traced, f"{name}'s read did not run on the connection its connect opened"
     finally:
+        await ledger.close()
         await buffer.close()
         await journal.close()
 
@@ -349,13 +346,8 @@ async def _file_a_late_stale_run(conn: aiosqlite.Connection) -> None:
     await conn.commit()
 
 
-_COLLIDED_SESSION = 'session-collided'
-
-
-async def _record_the_collided_session(journal: ReconciliationJournal) -> None:
-    await journal.record_run_session(
-        'live', session_id=_COLLIDED_SESSION, stage_cursor='stage-collided'
-    )
+async def _complete_the_live_run(journal: ReconciliationJournal) -> None:
+    await journal.complete_run('live', RunStatus.completed.value)
 
 
 def _reaper_cutoff() -> str:
@@ -364,9 +356,9 @@ def _reaper_cutoff() -> str:
 
 async def _assert_the_collided_write_landed(journal: ReconciliationJournal) -> None:
     live = await journal.get_run('live')
-    assert live is not None and live.session_id == _COLLIDED_SESSION, (
-        f"the collided write did not land: run 'live' carries "
-        f'{None if live is None else live.session_id!r}'
+    assert live is not None and live.status == RunStatus.completed, (
+        f"the collided write did not land: run 'live' has status "
+        f'{None if live is None else live.status!r}'
     )
 
 
@@ -380,7 +372,7 @@ async def test_a_write_survives_the_stale_run_reapers_read(
     snapshot pinned, a foreign connection files ``late``, and the write is
     queued into that window.
 
-    ``record_run_session`` is the probe because its unit is a SINGLE ``UPDATE`` with
+    ``complete_run`` is the probe because its unit is a SINGLE ``UPDATE`` with
     no preceding SELECT — a pure write opens no read snapshot of its own, so the
     "expect no error" assertion is structurally sound rather than merely lucky.  A
     SELECT-then-write method would be a flaky probe here (see ``AtomicConnection.
@@ -391,7 +383,7 @@ async def test_a_write_survives_the_stale_run_reapers_read(
     stale, error = await _collide_with_a_pinned_read(
         journal_tap.connection,
         read=lambda: journal.get_stale_runs(STALE_CUTOFF_SECONDS),
-        write=lambda: _record_the_collided_session(journal),
+        write=lambda: _complete_the_live_run(journal),
         foreign_commit=lambda: _file_a_late_stale_run(second_connection),
     )
 
@@ -424,7 +416,7 @@ async def test_a_legacy_multi_hop_reaper_read_kills_the_write(
         read=lambda: _legacy_multi_hop_read(
             journal_tap.connection, _LEGACY_REAPER_SCAN, (_reaper_cutoff(),)
         ),
-        write=lambda: _record_the_collided_session(journal),
+        write=lambda: _complete_the_live_run(journal),
         foreign_commit=lambda: _file_a_late_stale_run(second_connection),
     )
 
@@ -457,7 +449,7 @@ async def test_no_stale_run_means_no_pinned_read_and_no_failures(
         read=lambda: _legacy_multi_hop_read(
             journal_tap.connection, _LEGACY_REAPER_SCAN, (_reaper_cutoff(),)
         ),
-        write=lambda: _record_the_collided_session(journal),
+        write=lambda: _complete_the_live_run(journal),
         foreign_commit=lambda: _file_a_late_stale_run(second_connection),
     )
 
@@ -480,9 +472,7 @@ async def test_checkpoint_and_write_do_not_lock_each_other_out(journal, second_c
     for i in range(CHECKPOINT_ITERATIONS):
         written, checkpointed = await asyncio.wait_for(
             asyncio.gather(
-                journal.record_run_session(
-                    'live', session_id=f'session-{i}', stage_cursor=f'stage-{i}'
-                ),
+                journal.complete_run('live', RunStatus.completed.value),
                 journal.checkpoint(),
                 return_exceptions=True,
             ),
@@ -638,7 +628,7 @@ async def test_a_heartbeat_survives_a_peek_on_the_same_connection(
     a heartbeat that survives but changes nothing fails the arm too.
 
     ``heartbeat`` is the probe because its unit is a SINGLE ``UPDATE`` with no
-    preceding SELECT — the same property that makes ``record_run_session`` the
+    preceding SELECT — the same property that makes ``complete_run`` the
     right probe for the journal arm.  Do not substitute another write method
     without re-checking it.
     """
@@ -727,11 +717,34 @@ async def test_checkpoint_on_an_uninitialized_event_buffer_is_a_non_event():
     assert await EventBuffer().checkpoint() == CheckpointResult.unavailable()
 
 
+@pytest.fixture
+def ledger_tap() -> _ConnectTap:
+    return _ConnectTap()
+
+
 @pytest_asyncio.fixture
-async def ledger(journal):
+async def ledger(journal, ledger_tap):
     """A ReconLedgerStore on the journal's own ``reconciliation.db`` file.
 
     The third of production's three connections to that one file.
+    """
+    store = ReconLedgerStore(journal.data_dir / 'reconciliation.db', connect=ledger_tap)
+    await store.initialize()
+    try:
+        yield store
+    finally:
+        await store.close()
+
+
+@pytest_asyncio.fixture
+async def foreign_ledger(journal):
+    """A second ReconLedgerStore on the same file: the ledger collision arms' foreign writer.
+
+    The pin proof needs a commit from a DIFFERENT connection that lands a row
+    the suppression read would match, and the ledger's own public ``upsert``
+    lands one without copying its schema into this module.  It opens via
+    ``connect_daemon``, so it carries none of ``second_connection``'s shutdown
+    hazard.
     """
     store = ReconLedgerStore(journal.data_dir / 'reconciliation.db')
     await store.initialize()
@@ -741,6 +754,9 @@ async def ledger(journal):
         await store.close()
 
 
+_SEEDED_AT = '2026-09-17T00:00:00+00:00'
+
+
 def _ledger_record(task_id: str) -> ReconLedgerRecord:
     return ReconLedgerRecord(
         project_id=PROJECT_ID,
@@ -748,7 +764,7 @@ def _ledger_record(task_id: str) -> ReconLedgerRecord:
         task_id=task_id,
         payload_json='{}',
         state='open',
-        created_at='2026-09-17T00:00:00+00:00',
+        created_at=_SEEDED_AT,
     )
 
 
@@ -810,6 +826,127 @@ async def test_a_cancelled_write_does_not_discard_a_concurrent_one(ledger):
     )
     assert await ledger.get_by_identity(PROJECT_ID, 'marker', task_id='victim-0') is None, (
         'the cancelled unit left rows behind: its rollback was partial'
+    )
+
+
+_SEEDED_SUPPRESSIONS =('suppressed-0', 'suppressed-1', 'suppressed-2')
+
+_SUPPRESSION_SCAN_PARAMS = (PROJECT_ID, STAGE1_FLAG_SUPPRESSION_KIND, 'active')
+
+# list_by_kind's scan, test-owned: the legacy control runs it in the replaced
+# execute + fetchall shape on the ledger's own connection.
+_LEGACY_SUPPRESSION_SCAN = """SELECT * FROM recon_ledger
+    WHERE project_id = ? AND record_kind = ? AND state = ?
+    ORDER BY created_at, task_id, flag_type, run_id"""
+
+
+def _suppression_record(task_id: str, created_at: str) -> ReconLedgerRecord:
+    return ReconLedgerRecord(
+        project_id=PROJECT_ID,
+        record_kind=STAGE1_FLAG_SUPPRESSION_KIND,
+        task_id=task_id,
+        payload_json='{}',
+        state='active',
+        created_at=created_at,
+    )
+
+
+async def _seed_suppressions(ledger: ReconLedgerStore) -> None:
+    """File ``_SEEDED_SUPPRESSIONS`` as active suppressions, in ONE ``upsert_many``.
+
+    One shared ``created_at``, so ``list_by_kind``'s ``ORDER BY created_at,
+    task_id`` returns them in ``_SEEDED_SUPPRESSIONS`` order.
+    """
+    await ledger.upsert_many(
+        [_suppression_record(task_id, _SEEDED_AT) for task_id in _SEEDED_SUPPRESSIONS]
+    )
+
+
+async def _file_a_late_suppression(foreign_ledger: ReconLedgerStore) -> None:
+    """Commit active suppression ``late``, which the suppression read WOULD match.
+
+    A read pinned before this commit cannot return it, which is how each ledger
+    collision arm certifies that the collision really happened.
+    """
+    await foreign_ledger.upsert(_suppression_record('late', '2026-09-17T00:00:01+00:00'))
+
+
+async def _upsert_the_collided_marker(ledger: ReconLedgerStore) -> None:
+    """The probe write: a marker row, which the suppression read can never match."""
+    await ledger.upsert(_ledger_record('collided'))
+
+
+async def _assert_the_collided_upsert_landed(ledger: ReconLedgerStore) -> None:
+    landed = await ledger.get_by_identity(PROJECT_ID, 'marker', task_id='collided')
+    assert landed is not None, "the collided upsert did not land: marker 'collided' is absent"
+
+
+@pytest.mark.asyncio
+async def test_an_upsert_survives_a_suppression_read_on_the_same_connection(
+    ledger, ledger_tap, foreign_ledger
+):
+    """Arm H: a ledger write must survive a ledger read that is still in flight.
+
+    Constructed, not raced: the production ``list_suppressions`` is parked with
+    its snapshot pinned, a second ReconLedgerStore files suppression ``late``,
+    and the upsert is queued into that window.
+
+    ``upsert`` is the probe because its unit is a SINGLE ``INSERT ... ON
+    CONFLICT`` with no preceding SELECT, so it opens no read snapshot of its
+    own — the property that makes ``record_run_session`` and ``heartbeat`` the
+    journal and buffer probes.  Do not substitute a SELECT-then-write method
+    such as ``mark_addressed`` without re-checking it.
+    """
+    await _seed_suppressions(ledger)
+
+    suppressions, error = await _collide_with_a_pinned_read(
+        ledger_tap.connection,
+        read=lambda: ledger.list_suppressions(PROJECT_ID),
+        write=lambda: _upsert_the_collided_marker(ledger),
+        foreign_commit=lambda: _file_a_late_suppression(foreign_ledger),
+    )
+
+    assert error is None, (
+        f'the upsert died while list_suppressions held a read snapshot on the same '
+        f'connection: {error}'
+    )
+    assert [record.task_id for record in suppressions] == list(_SEEDED_SUPPRESSIONS), (
+        f'the suppression read returned {[record.task_id for record in suppressions]!r}: '
+        "it was not pinned before the foreign commit filed 'late', so this run did not "
+        'collide at all'
+    )
+    await _assert_the_collided_upsert_landed(ledger)
+
+
+@pytest.mark.asyncio
+async def test_a_legacy_multi_hop_suppression_read_kills_the_upsert(
+    ledger, ledger_tap, foreign_ledger
+):
+    """CONTROL: the replaced read shape loses arm H's exact collision.
+
+    Same collision, same production upsert, same foreign commit; only the
+    suppression read's shape is replaced, by an execute + fetchall on the
+    ledger's own connection.  That it kills the upsert is what proves arm H
+    discriminates.
+    """
+    await _seed_suppressions(ledger)
+
+    rows, error = await _collide_with_a_pinned_read(
+        ledger_tap.connection,
+        read=lambda: _legacy_multi_hop_read(
+            ledger_tap.connection, _LEGACY_SUPPRESSION_SCAN, _SUPPRESSION_SCAN_PARAMS
+        ),
+        write=lambda: _upsert_the_collided_marker(ledger),
+        foreign_commit=lambda: _file_a_late_suppression(foreign_ledger),
+    )
+
+    assert error == 'SQLITE_BUSY_SNAPSHOT', (
+        f'the replaced suppression read did not kill the upsert ({error!r}), so this '
+        'collision no longer reproduces the defect arm H guards'
+    )
+    assert [row['task_id'] for row in rows] == list(_SEEDED_SUPPRESSIONS), (
+        f"the parked read saw {[row['task_id'] for row in rows]!r}: it was not pinned "
+        "before the foreign commit filed 'late'"
     )
 
 
