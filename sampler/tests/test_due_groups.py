@@ -199,35 +199,6 @@ class TestReadingRecordsIsOneConnection:
         assert spy.opened == 1
 
 
-class TestIsGroupDue:
-    DUE = 30
-
-    def _attempted_at(self, tmp_path: Path, ts: int):
-        from sampler.store import GroupRecord
-
-        store = _store(tmp_path)
-        store.write_tick(ts, unwindowed={}, windowed={}, records={GROUP: GroupRecord(attempted_at=ts)})
-        return store
-
-    def test_a_group_never_attempted_is_due(self, tmp_path: Path):
-        assert _store(tmp_path).is_group_due(GROUP, 1_000, self.DUE)
-
-    def test_inside_the_interval_it_is_not_due(self, tmp_path: Path):
-        store = self._attempted_at(tmp_path, 1_000)
-
-        assert not store.is_group_due(GROUP, 1_000, self.DUE)
-        assert not store.is_group_due(GROUP, 1_029, self.DUE)
-
-    def test_at_exactly_the_interval_it_is_due(self, tmp_path: Path):
-        assert self._attempted_at(tmp_path, 1_000).is_group_due(GROUP, 1_030, self.DUE)
-
-    def test_a_stamp_in_the_future_is_due(self, tmp_path: Path):
-        assert self._attempted_at(tmp_path, 5_000).is_group_due(GROUP, 1_000, self.DUE)
-
-    def test_another_groups_stamp_does_not_count(self, tmp_path: Path):
-        assert self._attempted_at(tmp_path, 1_000).is_group_due(OTHER, 1_010, self.DUE)
-
-
 # ---------------------------------------------------------------------------
 # Tick: the group contract
 # ---------------------------------------------------------------------------
@@ -238,11 +209,17 @@ INCREMENT = MetricSpec('fixture_counter_increment')
 LEAF_FIGURE = MetricSpec('fixture_leaf_figure', per_leaf=True)
 
 
-def _due_group(collect: Any, *, due_seconds: int | None = DUE, logs_rows: bool = True):
+def _due_group(
+    collect: Any,
+    *,
+    due_seconds: int | None = DUE,
+    logs_rows: bool = True,
+    name: GroupName = GroupName.LOAD,
+):
     from sampler.metrics import MetricGroup
 
     return MetricGroup(
-        GroupName.LOAD,
+        name,
         collect=collect,
         metrics=(INCREMENT, LEAF_FIGURE),
         windowed=False,
@@ -366,6 +343,41 @@ class TestCollectTickHonoursEachGroupsCadence:
         _tick(store, T0, [group])
         assert collect_tick(store, T0 + DUE - 1, [group]) == {group: Skipped.NOT_DUE}
         assert isinstance(collect_tick(store, T0 + DUE, [group])[group], Collected)
+
+    def test_an_attempt_stamped_in_the_future_is_due(self, tmp_path: Path):
+        from sampler.metrics import Collected
+        from sampler.sampler import collect_tick
+
+        group = _due_group(_Recording())
+        store = _store(tmp_path)
+        _tick(store, T0 + 5 * DUE, [group])
+
+        assert isinstance(collect_tick(store, T0, [group])[group], Collected)
+
+    def test_another_groups_attempt_does_not_count(self, tmp_path: Path):
+        from sampler.metrics import Collected
+        from sampler.sampler import collect_tick
+
+        group = _due_group(_Recording())
+        other = _due_group(_Recording(), name=GroupName.PSI)
+        store = _store(tmp_path)
+        _tick(store, T0, [other])
+
+        assert isinstance(collect_tick(store, T0 + 1, [group])[group], Collected)
+
+    def test_every_groups_record_is_read_on_one_connection(self, tmp_path: Path):
+        from sampler.sampler import collect_tick
+
+        spy = Spy()
+        store = _store(tmp_path, spy)
+        groups = [_due_group(_Recording()), _due_group(_Recording(), name=GroupName.PSI)]
+        _tick(store, T0, groups)
+        spy.opened = 0
+
+        collect_tick(store, T0 + 1, groups)
+        collect_tick(store, T0 + DUE, groups)
+
+        assert spy.opened == 2
 
     def test_the_collector_receives_the_state_the_last_written_tick_persisted(self, tmp_path: Path):
         collector = _Recording()

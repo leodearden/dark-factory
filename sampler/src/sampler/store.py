@@ -435,14 +435,6 @@ class LoadSampleStore:
         finally:
             conn.close()
 
-    def is_group_due(self, name: str, now: int, due_seconds: int) -> bool:
-        """True when *name* was never attempted, or its attempt is ``due_seconds`` old.
-
-        The same clock as the retention and VACUUM gates, so an attempt stamped
-        in the future is due too.
-        """
-        return self._is_due(_group_meta_key(name, _GroupField.ATTEMPTED), now, due_seconds)
-
     # ------------------------------------------------------------------
     # Retention
     # ------------------------------------------------------------------

@@ -95,12 +95,12 @@ def collect_tick(
     """
     groups = tuple(groups)
     records = store.read_group_records([group.name for group in groups])
-    return {group: _collect(store, group, records[group.name], now) for group in groups}
+    return {group: _collect(group, records[group.name], now) for group in groups}
 
 
-def _collect(store: LoadSampleStore, group: MetricGroup, record: GroupRecord, now: int) -> Outcome:
-    if group.due_seconds is not None and not store.is_group_due(
-        group.name, now, group.due_seconds
+def _collect(group: MetricGroup, record: GroupRecord, now: int) -> Outcome:
+    if group.due_seconds is not None and not stamp_is_due(
+        record.attempted_at, now, group.due_seconds
     ):
         return Skipped.NOT_DUE
     try:
