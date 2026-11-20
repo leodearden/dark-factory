@@ -105,7 +105,7 @@ class _CountingRecordsScanner:
     mount-call carve-out, because that test simulates an in-flight scan by
     setting the documented main-thread-only _scan_in_flight flag directly
     rather than by actually holding one -- the property under test there is
-    purely _poll_registry's statement ORDER relative to that flag, nothing
+    purely start_poll_tick's statement ORDER relative to that flag, nothing
     about threads. `calls` is what proves the tick really was dropped for
     scanning, so the test cannot silently degrade into exercising the
     ordinary path.
@@ -340,7 +340,7 @@ class TestPollRefresh:
         poll ticks: rebuild-on-change is the behavior under test, and coupling
         it to wall-clock timing (poll_interval vs. a pilot.pause duration) is
         a flake risk under a loaded runner. The timer wiring itself
-        (set_interval actually calling refresh_registry) is covered
+        (set_interval actually calling start_poll_tick) is covered
         separately by TestTimerIntegration below -- the one test in this
         module allowed to depend on real timing.
 
@@ -672,7 +672,7 @@ class TestSelectedSlugRestore:
             table = app.query_one(SessionTable)
 
             async def tick():
-                app._poll_registry()
+                app.start_poll_tick()
                 await pilot.pause()
                 await app.workers.wait_for_complete()
                 await pilot.pause()
@@ -839,13 +839,13 @@ class TestUIConfigWriteDebounce:
         the one that persists the parked cursor -- not one per tick.
 
         Unlike the deterministic variant above, nothing here calls
-        _flush_ui_config by hand: _poll_registry's own flush is what must
+        _flush_ui_config by hand: start_poll_tick's own flush is what must
         fire, so this also pins that the debounce resolves on the real
         timer callback and not only when a test drives it.
         """
 
         async def drive(app, pilot):
-            app._poll_registry()
+            app.start_poll_tick()
             await pilot.pause()
             await app.workers.wait_for_complete()
             await pilot.pause()
@@ -868,7 +868,7 @@ class TestUIConfigWriteDebounce:
         slugs = [record.session_slug for record in running]
 
         # poll_interval=60 keeps on_mount's own set_interval timer from
-        # firing: every tick in this test is an explicit _poll_registry()
+        # firing: every tick in this test is an explicit start_poll_tick()
         # call, which is what makes the write COUNT exact rather than a race
         # against the wall clock.
         app = CockpitApp(fleet_root=tmp_path, poll_interval=60)
@@ -883,10 +883,10 @@ class TestUIConfigWriteDebounce:
                 assert table.highlighted_slug() == slug
             assert recorded == []  # precondition: the burst is still debounced
 
-            # _poll_registry launches the real threaded scan worker, so drain
+            # start_poll_tick launches the real threaded scan worker, so drain
             # it the way test_app_scan_pipeline.py::TestThreadedScanReachesUI and
             # test_app_scan_pipeline.py::TestScanBackpressure do.
-            app._poll_registry()
+            app.start_poll_tick()
             await pilot.pause()
             await app.workers.wait_for_complete()
             await pilot.pause()
@@ -903,7 +903,7 @@ class TestUIConfigWriteDebounce:
             # the persisted one, so a tick over an unchanged selection
             # writes nothing. test_rebuild_bearing_poll_ticks_write_once is
             # the counterpart that keeps the registry CHANGING.
-            app._poll_registry()
+            app.start_poll_tick()
             await pilot.pause()
             await app.workers.wait_for_complete()
             await pilot.pause()
@@ -946,7 +946,7 @@ class TestUIConfigWriteDebounce:
             table = app.query_one(SessionTable)
 
             async def tick():
-                app._poll_registry()
+                app.start_poll_tick()
                 await pilot.pause()
                 await app.workers.wait_for_complete()
                 await pilot.pause()
@@ -998,7 +998,7 @@ class TestUIConfigWriteDebounce:
 
     @pytest.mark.timeout(10)
     async def test_flush_is_not_starved_by_the_scan_backpressure_drop(self, tmp_path, monkeypatch):
-        """Pins that the flush runs BEFORE _poll_registry's
+        """Pins that the flush runs BEFORE start_poll_tick's
         `if self._scan_in_flight: return` drop-tick guard.
 
         In production a full 10k+-session scan (~4.5s, esc-2303-1) routinely
@@ -1029,12 +1029,11 @@ class TestUIConfigWriteDebounce:
             calls_before = scanner.calls
             try:
                 # Stand in for a slow 10k-session scan still running. The
-                # flag is documented main-thread-only, and this file already
-                # drives _poll_registry directly, so setting it beats parking
-                # a real worker thread that a failed assertion could leave
-                # wedged.
+                # flag is documented main-thread-only, so setting it beats
+                # parking a real worker thread that a failed assertion could
+                # leave wedged.
                 app._scan_in_flight = True
-                app._poll_registry()
+                app.start_poll_tick()
                 await pilot.pause()
 
                 # The tick really WAS dropped for scanning -- without this
@@ -1071,7 +1070,7 @@ class TestUIConfigWriteDebounce:
             # never restored anything.
             assert app._selected_slug == restored.session_slug
 
-            app._poll_registry()
+            app.start_poll_tick()
             await pilot.pause()
             await app.workers.wait_for_complete()
             await pilot.pause()
@@ -1109,7 +1108,7 @@ class TestUIConfigWriteDebounce:
             # order_sessions ranks above every RUNNING one.
             assert app._selected_slug == 'debounce-blocked'
 
-            app._poll_registry()
+            app.start_poll_tick()
             await pilot.pause()
             await app.workers.wait_for_complete()
             await pilot.pause()
@@ -1842,48 +1841,65 @@ class TestDecisionProjectIsCanonicalAtEveryReadSite:
 
     @pytest.mark.timeout(10)
     async def test_project_stays_canonical_across_the_boost_and_drop_re_reads(self, tmp_path):
+        from textual.widgets.data_table import RowDoesNotExist
+
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
 
-        decision = dr.DecisionRecord(
-            id='dec-1',
-            project='df',
-            text='Which port?',
-            filed_at='2026-07-07T00:00:00+00:00',
-        )
-        assert dr.write_decision(decision, root=tmp_path)
+        # dec-2 is never acted on: a dropped decision leaves the queue, so
+        # after the drop its row is the one left to show what the post-drop
+        # re-read folded.
+        for decision_id, text in (('dec-1', 'Which port?'), ('dec-2', 'Which host?')):
+            decision = dr.DecisionRecord(
+                id=decision_id,
+                project='df',
+                text=text,
+                filed_at='2026-07-07T00:00:00+00:00',
+            )
+            assert dr.write_decision(decision, root=tmp_path)
         # Baseline: the raw spelling is what is actually on disk, so each
         # re-read below really does read 'df' back and really does have to
         # fold it. (These are the legacy rows migrate_decision_project_tokens
         # has not been run over.)
-        assert [d.project for d in dr.list_decisions(root=tmp_path)] == ['df']
+        assert [d.project for d in dr.list_decisions(root=tmp_path)] == ['df', 'df']
 
-        app = CockpitApp(fleet_root=tmp_path, backend=FakeBackend(), poll_interval=0.05)
+        def persisted(decision_id: str) -> dr.DecisionRecord:
+            (record,) = [d for d in dr.list_decisions(root=tmp_path) if d.id == decision_id]
+            return record
+
+        def rendered_project(queue: DecisionQueue, decision_id: str) -> str:
+            return queue.get_row(f'decision:{decision_id}')[2]
+
+        # poll_interval=60: a live poll tick reads through the same folding
+        # reader, so it could repaint the queue between a keypress and its
+        # assertion and hide a re-read that failed to fold.
+        app = CockpitApp(fleet_root=tmp_path, backend=FakeBackend(), poll_interval=60)
         async with app.run_test() as pilot:
             await pilot.pause()
+            queue = app.query_one(DecisionQueue)
 
             # (1) the initial scan (_scan_registry).
-            assert [d.project for d in app._decisions] == ['dark_factory']
+            assert rendered_project(queue, 'dec-1') == 'dark_factory'
 
-            queue = app.query_one(DecisionQueue)
             queue.move_cursor(row=queue.get_row_index('decision:dec-1'))
             await pilot.pause()
 
             # (2) the post-boost re-read (action_boost -> _apply_boost).
             await pilot.press('b')
             await pilot.pause()
-            persisted = dr.list_decisions(root=tmp_path)
-            assert persisted[0].manual_boost != 0  # the write really happened
-            assert persisted[0].project == 'df'  # ...and left the disk raw
-            assert [d.project for d in app._decisions] == ['dark_factory']
+            assert persisted('dec-1').manual_boost != 0  # the write really happened
+            assert persisted('dec-1').project == 'df'  # ...and left the disk raw
+            assert rendered_project(queue, 'dec-1') == 'dark_factory'
 
-            # (3) the post-drop re-read (action_drop).
+            # (3) the post-drop re-read (action_drop); the cursor is still on
+            # dec-1, which the rebuild kept by key.
             await pilot.press('x')
             await pilot.pause()
-            persisted = dr.list_decisions(root=tmp_path)
-            assert persisted[0].state == dr.DecisionState.DROPPED  # the write happened
-            assert persisted[0].project == 'df'  # ...and left the disk raw
-            assert [d.project for d in app._decisions] == ['dark_factory']
+            assert persisted('dec-1').state == dr.DecisionState.DROPPED  # the write happened
+            assert persisted('dec-1').project == 'df'  # ...and left the disk raw
+            with pytest.raises(RowDoesNotExist):
+                queue.get_row('decision:dec-1')
+            assert rendered_project(queue, 'dec-2') == 'dark_factory'
 
 
 class TestInjectedDecisionsReaderIsEveryDecisionRead:
