@@ -682,7 +682,7 @@ def _decline_kinds():
     """The REAL decline vocabulary, read off the instrument at collection time.
 
     Never a hard-coded list of five strings. ``DECLINE_KINDS`` derives from
-    metrics.py's single ``_DECLINE_READERS`` map precisely so a sixth architect
+    metrics.py's single ``DECLINE_READERS`` map precisely so a sixth architect
     exit cannot be half-added; parametrizing over the tuple extends that
     discipline to the bander, so a new exit that nobody taught ``band_for_cell``
     about fails here instead of silently banding ``no_plan``. Spelled as a
