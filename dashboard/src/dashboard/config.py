@@ -218,9 +218,10 @@ class DashboardConfig:
     # Whether lifespan starts the three background samplers
     # (dashboard/src/dashboard/loops.py::_burndown_loop / ::_metrics_loop /
     # ::_quality_loop), the only writers of the history the charts read.
-    # Env DASHBOARD_SAMPLERS=on|off, default on. Under off that history stops
-    # accruing while every page still serves; that is how the whole test suite
-    # runs (dashboard/tests/_dashboard_helpers.py::apply_isolated_env).
+    # Env DASHBOARD_SAMPLERS=on|off, default on. What off means for an operator:
+    # SETUP.md §"7. Dashboard + watchdog units", the DASHBOARD_SAMPLERS entry.
+    # The whole test suite runs with it off
+    # (dashboard/tests/_dashboard_helpers.py::apply_isolated_env).
     samplers_enabled: bool = True
 
     def __post_init__(self) -> None:
