@@ -43,8 +43,9 @@ through to the hand-launched keying, unless it is a re-mint reached through
 the pid pointer, or a SessionStart in a thread whose recorded owner is dead.
 Every bind, and every dead-owner reclaim (see §Session-id re-mints), writes
 the session-id pointer, and every write of a record whose `claude_owner_pid`
-is the event's claude writes the pid pointer, so spawned, T3-hosted and
-hand-launched records carry the same pointers.
+is the event's claude writes the pid pointer, unless that claude is a shared
+`claude agents` host (see §Shared claude agents hosts), so spawned, T3-hosted
+and hand-launched records carry the same pointers.
 
 The thread pointer is how a T3-hosted session reaches its spawn record, since
 it has no `CLAUDE_SPAWN_*` environment at all. The T3 lane writes the pointer
@@ -149,8 +150,9 @@ when both of these hold:
   enough: it proves the emitter holds a session, not this one. Automatic
   compaction fires `compact` in any long-running nested `claude -p`.
 - The event's owning claude pid equals the `claude_owner_pid` bound on the
-  record. `/clear` and compaction run inside the owning process and keep its
-  pid. A nested claude is a different process.
+  record, and that claude is not a shared `claude agents` host. `/clear` and
+  compaction run inside the owning process and keep its pid. A nested claude
+  is a different process.
 
 When both hold, SessionStart re-binds the record to the new id.
 
@@ -221,6 +223,39 @@ already re-bound the record.
 
 Code: `orchestrator/src/orchestrator/session_hooks.py::_OWNER_ONLY_SESSION_START_SOURCES`,
 `::_is_owner_only_session_start`, `::_env_slug_ownership`.
+
+## Shared claude agents hosts
+
+A `claude agents` process runs the sessions it hosts in-process. Every hosted
+session's owning claude (`EventProbes.owning_claude_pid`) and its
+`$CLAUDE_PID` are therefore the host's pid, and the host outlives each
+session it runs. A pid shared that way cannot tell one hosted session from
+another (task 6945).
+
+So no `sessions-by-pid` pointer is ever keyed on a host pid. Writers refuse
+one, the resolver ignores one written before this rule, and the pointer sweep
+removes it. A hosted session reaches its record through its session-id
+pointer or through the hand-launched keying.
+
+Owner-pid equality is never evidence of the same session under a host. A
+hosted `/clear` or compaction therefore forks onto the hand-launched record of
+its new session id instead of re-binding. That is the safe direction, as for
+a `/resume`d spawned session: re-binding could capture a sibling hosted
+session's record. The cost is that a hosted session splits its record at
+each re-mint.
+
+`claude_owner_pid` still records the host, the process that bound the record.
+Self-exit refuses to signal it (`session_self_exit.py::_owner_refusal`,
+`SHARED_SESSION_HOST`), and a live host owner is never reclaimed.
+
+A hosted record's `launcher_pid` is the host's session leader, as for any
+hand-launched record, so its stale-pid reap waits on that process. A forked
+inheritor's `launcher_pid` is the host itself.
+
+Code: `orchestrator/src/orchestrator/session_identity.py::is_shared_session_host`,
+`orchestrator/src/orchestrator/session_ownership_probes.py::EventProbes.owner_is_shared_host`,
+`orchestrator/src/orchestrator/session_hooks.py::_owner_pid_verdict`,
+`orchestrator/src/orchestrator/session_records.py::is_session_pointer_pid`.
 
 ## Fail-soft direction
 

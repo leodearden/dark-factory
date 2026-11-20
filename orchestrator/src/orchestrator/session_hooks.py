@@ -683,8 +683,10 @@ def _stamp_session_pointers(
     Each pointer asserts exactly what the written record already proves: the
     session-id pointer only when this event changed the binding, the
     pid pointer whenever ``claude_owner_pid`` is this event's owning claude
-    pid, and the thread pointer whenever the record is t3 for this event's
-    *t3_thread_id* and no other live record holds that thread
+    pid and the store accepts that pid as a pointer key
+    (``session_records.is_session_pointer_pid``), and the thread pointer
+    whenever the record is t3 for this event's *t3_thread_id* and no other
+    live record holds that thread
     (``session_records.index_t3_record_if_unheld``): a hook never moves a
     held thread pointer, only the T3 lane's bind does. The pid and thread
     rules cover every lane (adopt, fork, a withheld launch window, an
