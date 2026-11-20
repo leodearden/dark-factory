@@ -32,14 +32,14 @@ pytestmark = [
 
 _NOT_YET_MIGRATED = frozenset({
     '_merge_deep_scene.py',
-    '_verify_merge_cli_fixtures.py',
+    '_verify_merge_cli_fixtures.py',  # debt: task 11025
     'test_agent_capability_wiring.py',
     'test_architect_all_committed_plan.py',
     'test_atomic_train_merge.py',
     'test_convert_to_blocked.py',
     'test_create_merge_worktree_retry.py',
-    'test_deterministic_provenance_wire_e2e.py',
-    'test_dry_run_unblock.py',
+    'test_deterministic_provenance_wire_e2e.py',  # debt: task 11025
+    'test_dry_run_unblock.py',  # debt: task 11026
     'test_git_repo_isolation_guard.py',
     'test_harness_infra_resume_truthful.py',
     'test_harness_interactive_reaper.py',
@@ -101,17 +101,17 @@ _NOT_YET_MIGRATED = frozenset({
     'test_rebase_verify_cost.py',
     'test_reconcile_done_step_commits.py',
     'test_remove_merge_worktree_guarded.py',
-    'test_reopen_sticks_e2e.py',
-    'test_roles_ancestry_check.py',
-    'test_roles_staging_command.py',
-    'test_scheduler_park_owner_state.py',
+    'test_reopen_sticks_e2e.py',  # debt: task 11025
+    'test_roles_ancestry_check.py',  # debt: task 11025
+    'test_roles_staging_command.py',  # debt: task 11026
+    'test_scheduler_park_owner_state.py',  # debt: task 11026
     'test_session_hooks_install.py',
     'test_session_resume_integration_gate.py',
     'test_substrate_gate.py',
     'test_suffix_conflict_tracker.py',
     'test_task_runtime.py',
     'test_train_integration.py',
-    'test_verify_events_units.py',
+    'test_verify_events_units.py',  # debt: task 11025
     'test_verify_phase_rebase.py',
     'test_verify_plan_integration.py',
     'test_verify_scope_inversion_boundary.py',
@@ -138,7 +138,7 @@ _GLOBAL_OPTIONS_WITH_A_VALUE = frozenset({'-C', '-c', '--git-dir', '--work-tree'
 
 
 def _verb(argv: Sequence[object]) -> str | None:
-    """The git subcommand after git's global options; None when a non-constant element precedes it."""
+    """The git subcommand after git's global options; None if there is none or a non-constant element precedes it."""
     elements = iter(argv[1:])
     for element in elements:
         if not isinstance(element, str):
@@ -273,6 +273,30 @@ def test_a_seeder_that_commits_through_git_dir_and_work_tree_is_flagged() -> Non
     )
 
     assert _local_repo_seeders(tree) == ['_seed']
+
+
+@pytest.mark.parametrize('option', ['-C', '-c', '--git-dir', '--work-tree', '--namespace'])
+def test_a_seeder_that_commits_through_any_global_option_with_a_value_is_flagged(
+    option: str,
+) -> None:
+    tree = ast.parse(
+        'def _seed(repo, value):\n'
+        "    subprocess.run(['git', 'init', str(repo)])\n"
+        f"    subprocess.run(['git', {option!r}, value, 'commit', '-m', 'x'])\n"
+    )
+
+    assert _local_repo_seeders(tree) == ['_seed']
+
+
+def test_a_git_literal_with_no_subcommand_is_skipped() -> None:
+    tree = ast.parse(
+        'def _probe(repo):\n'
+        "    subprocess.run(['git', '--version'])\n"
+        "    subprocess.run(['git', 'init', str(repo)])\n"
+        "    subprocess.run(['git', '-C'])\n"
+    )
+
+    assert _local_repo_seeders(tree) == []
 
 
 def test_a_global_bare_init_is_not_flagged() -> None:
