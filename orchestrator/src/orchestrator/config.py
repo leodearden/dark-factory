@@ -1491,14 +1491,19 @@ class MergeDeepConfig(BaseModel):
         ),
     )
     depth_table: list[DepthRow] = Field(
-        default_factory=lambda: [DepthRow(0.93, 8), DepthRow(0.85, 4), DepthRow(0.75, 2)],
+        default_factory=lambda: [
+            DepthRow(0.992, 12), DepthRow(0.990, 11), DepthRow(0.988, 10), DepthRow(0.984, 9),
+            DepthRow(0.979, 8), DepthRow(0.972, 7), DepthRow(0.959, 6), DepthRow(0.934, 5),
+            DepthRow(0.876, 4), DepthRow(0.75, 3),
+        ],
         description=(
             'Chain depth by rolling per-item pass estimate: the first row whose '
             'min_pass_estimate the estimate meets gives the depth, and an '
             'estimate below every row chains nothing (depth 1). Rows are '
             '[min_pass_estimate, depth] pairs, thresholds in [0, 1] and depths '
             '>= 2, both strictly descending. A [0.0, N] row always chains N. '
-            'See plans/merge-lane-policy-prd.md D7.'
+            'The default puts each depth where it starts to cost fewer verifies '
+            'per item than the depth below. See plans/merge-lane-policy-prd.md D7.'
         ),
     )
     chain_build_timeout_secs: float = Field(
@@ -4413,7 +4418,7 @@ class OrchestratorConfig(BaseSettings):
     # local RunnerUnavailable -> fail-safe (trust the remote green, emit
     # verify_cross_check_inconclusive).  Default True is safety-first per the
     # loud-over-silent norm AND provably INERT on main today: reify's
-    # verify_runners is not yet enabled, so _run_post_merge_verify always gets
+    # verify_runners is not yet enabled, so merge_lane/post_merge_verify.py::run_post_merge_verify always gets
     # runner=None (local dispatch path) and the ``runner is not None``
     # cross-check branch never executes — zero behaviour change until Lever C
     # is turned on.  UNLIKE its restart-only merge_verify_workspace /

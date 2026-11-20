@@ -27,7 +27,9 @@ fixed, named cluster where a path it cannot read IS the finding. Concretely:
   ``MetricsError`` naming the tool and the version found;
 * the whole-of-``orchestrator/tests`` sweep keeps the siblings' per-file
   fail-soft polarity, but records every skipped file in
-  ``Enumeration.unreadable`` and marks the enumeration incomplete, and
+  ``Enumeration.unreadable`` and marks the enumeration incomplete (a file
+  that cannot be read, or that names a lane module and cannot be parsed --
+  see ``sweep_repo``), and
   ``scripts/merge_lane_ratchet.py::check_against_baseline`` REFUSES to
   compare an incomplete enumeration.
 
@@ -50,6 +52,7 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import unicodedata
 from collections.abc import Collection
 from pathlib import Path
 
@@ -272,6 +275,34 @@ def _is_in_lane_package(module: str) -> bool:
     return module == LANE_PACKAGE or module.startswith(LANE_PACKAGE + '.')
 
 
+def lane_import_fragments() -> frozenset[str]:
+    """Identifiers of which every lane-importing source names at least one.
+
+    The last component of each cluster module and of ``LANE_PACKAGE``, derived
+    from the same two sources as ``imports_lane_module_in_tree``. A match there
+    is a dotted name that is a cluster module or lies under the package, so one
+    of its components is such a leaf -- written as an identifier, which no line
+    continuation can split (a dotted name's dots can be: ``import
+    orchestrator.\\<newline>git_ops`` parses).
+    """
+    return frozenset(
+        name.rpartition('.')[2] for name in (*lane_module_names(), LANE_PACKAGE)
+    )
+
+
+def may_import_lane_module(source: str, fragments: Collection[str]) -> bool:
+    """False proves *source* imports no lane module, without parsing it.
+
+    True is only "perhaps": comments and strings add matches, and relative
+    imports (which ``imports_lane_module_in_tree`` ignores) are admitted too.
+    The source is read as the parser compares identifiers, under NFKC, so a
+    full-width spelling of a leaf counts (``_tree_scan.ParsedModule.may_name``
+    in ``orchestrator/tests`` is the precedent).
+    """
+    text = source if source.isascii() else unicodedata.normalize('NFKC', source)
+    return any(fragment in text for fragment in fragments)
+
+
 def test_file_measures(
     source: str, *, path: str, patch_modules: Collection[str]
 ) -> dict[str, object] | None:
@@ -403,7 +434,8 @@ def _test_tree_files(root: Path) -> list[str]:
 
 def sweep_repo(root: Path) -> RepoSweep:
     """Take the two test-suite measures in ONE pass over every ``.py`` on disk
-    under ``orchestrator/tests``, reading and parsing each file once.
+    under ``orchestrator/tests``, reading each file once and parsing it once
+    when its text names a lane module (``may_import_lane_module``).
 
     THIS sweep keeps the sibling guards' per-file fail-SOFT polarity -- an
     unrelated mid-edit file must not redden the ratchet, which is the
@@ -413,14 +445,22 @@ def sweep_repo(root: Path) -> RepoSweep:
     ``scripts/merge_lane_ratchet.py::check_against_baseline`` then refuses to
     compare at all. That split is the INV-11 seam between "this cluster file is
     unmeasurable, which IS the finding" and "some unrelated file is mid-edit".
+
+    A file that cannot be read or decoded is recorded whatever it says. A file
+    that names no lane module is never parsed, so a syntax error in one is not
+    recorded: it cannot be lane-importing, and an unparseable file the sweep
+    has no measure for is the unrelated mid-edit file above.
     """
     patch_modules = lane_patch_modules(root)
+    fragments = lane_import_fragments()
     test_tree = _test_tree_files(root)
     tests: dict[str, object] = {}
     unreadable: list[str] = []
     for relpath in test_tree:
         try:
             source = (root / relpath).read_text(encoding='utf-8')
+            if not may_import_lane_module(source, fragments):
+                continue
             measures = test_file_measures(source, path=relpath, patch_modules=patch_modules)
         except (OSError, UnicodeDecodeError, source_measures.MetricsError):
             unreadable.append(relpath)

@@ -2,7 +2,7 @@
 
 On a same-tree rebase a project that declares
 ``OrchestratorConfig.merge_gate_history_test_command`` re-runs only that
-command, through ``worker.py::_run_post_merge_verify``, which builds a
+command, through ``post_merge_verify.py::run_post_merge_verify``, which builds a
 :class:`HistoryLegRunner` in place of the full gate's ``LocalRunner``. So a
 red or unrunnable leg gets every failure path a red re-verify gets; this
 module only runs the command and reports a result that cannot be mistaken for
