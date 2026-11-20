@@ -7088,6 +7088,7 @@ class MemoryService:
             now=now or datetime.now(UTC),
             max_age=timedelta(seconds=self._mem0_retry_policy.backlog_alarm_age_seconds),
             project_roots=self._known_projects,
+            billing=self._billing_alarm.state(),
         )
 
     # ------------------------------------------------------------------

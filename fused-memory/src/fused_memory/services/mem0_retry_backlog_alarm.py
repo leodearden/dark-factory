@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 from typing import Any, Protocol
 
 from fused_memory.middleware._folded_escalation import file_folded_escalation
+from fused_memory.services.billing_exhaustion_alarm import BillingAlarmState
 from fused_memory.services.write_journal import Mem0RetryBacklog, WriteJournal
 
 logger = logging.getLogger(__name__)
@@ -20,6 +21,12 @@ LOG_EVENT = 'mem0_write_retry_backlog'
 _EVIDENCE_QUERY = (
     'SELECT id, project_id, attempts, created_at, next_attempt_at, reason '
     "FROM mem0_intents WHERE status='retrying'"
+)
+_NOTHING_LOST = (
+    'Nothing is lost while they stay retrying, because each '
+    'mem0_intents row holds the full content and metadata and the startup '
+    'prune never touches a retrying row; but they are unsearchable until '
+    'they land.'
 )
 
 
@@ -35,8 +42,13 @@ def emit_mem0_retry_backlog_escalation(
     backlog: Mem0RetryBacklog,
     now: datetime,
     max_age: timedelta,
+    billing: BillingAlarmState | None = None,
 ) -> str | None:
-    """File *backlog* under the alarm's anchor, folding into an open record. Never raises."""
+    """File *backlog* under the alarm's anchor, folding into an open record. Never raises.
+
+    *billing* is the open exhausted-credits episode, if any: the backlog is
+    then named as parked behind it rather than as a transient failure.
+    """
     age_seconds = int(backlog.age(now).total_seconds())
     threshold_seconds = int(max_age.total_seconds())
     detail = '\n'.join((
@@ -47,13 +59,9 @@ def emit_mem0_retry_backlog_escalation(
         f'age_seconds={age_seconds}',
         f'max_attempts={backlog.max_attempts}',
         f'threshold_seconds={threshold_seconds}',
+        *_billing_lines(billing),
         '',
-        "These writes' callers were acked stores_pending_retry=['mem0']: Mem0 "
-        'refused them on a transient provider error and has refused every '
-        're-issue since. Nothing is lost while they stay retrying, because each '
-        'mem0_intents row holds the full content and metadata and the startup '
-        'prune never touches a retrying row; but they are unsearchable until '
-        'they land.',
+        _why_still_retrying(billing),
         '',
         f'Evidence (write_journal.db, read-only): {_EVIDENCE_QUERY}',
         '',
@@ -74,11 +82,7 @@ def emit_mem0_retry_backlog_escalation(
         agent_role=_AGENT_ROLE,
         category=_CATEGORY,
         severity='blocking',
-        summary=(
-            f'{backlog.count} Mem0 write(s) for project_id={backlog.project_id!r} '
-            f'still retrying after {age_seconds}s (threshold {threshold_seconds}s): '
-            'acked as pending retry, unsearchable until they land'
-        ),
+        summary=_summary(backlog, age_seconds, threshold_seconds, billing),
         detail=detail,
         suggested_action=(
             'Check the OpenAI provider Mem0 embeds through (credits, quota, API '
@@ -95,12 +99,61 @@ def emit_mem0_retry_backlog_escalation(
     )
 
 
+def _summary(
+    backlog: Mem0RetryBacklog,
+    age_seconds: int,
+    threshold_seconds: int,
+    billing: BillingAlarmState | None,
+) -> str:
+    writes = f'{backlog.count} Mem0 write(s) for project_id={backlog.project_id!r}'
+    if billing is None:
+        return (
+            f'{writes} still retrying after {age_seconds}s (threshold {threshold_seconds}s): '
+            'acked as pending retry, unsearchable until they land'
+        )
+    return (
+        f'{writes} parked {age_seconds}s behind OpenAI credits exhausted since '
+        f'{billing.first_seen.isoformat()}; see {_billing_page(billing)}; they land '
+        'by themselves once credits are restored'
+    )
+
+
+def _billing_lines(billing: BillingAlarmState | None) -> tuple[str, ...]:
+    if billing is None:
+        return ()
+    return (
+        f'billing_exhausted_since={billing.first_seen.isoformat()}',
+        f'key_scope={billing.exhaustion.key_scope}',
+        f'billing_escalation_id={billing.escalation_id}',
+    )
+
+
+def _why_still_retrying(billing: BillingAlarmState | None) -> str:
+    acked = "These writes' callers were acked stores_pending_retry=['mem0']: "
+    if billing is None:
+        return (
+            f'{acked}Mem0 refused them on a transient provider error and has '
+            f'refused every re-issue since. {_NOTHING_LOST}'
+        )
+    return (
+        f'{acked}the OpenAI credits Mem0 embeds through are exhausted (see '
+        f'{_billing_page(billing)}), and every re-issue since has met the same '
+        f'empty balance. They land by themselves once credits are restored. '
+        f'{_NOTHING_LOST}'
+    )
+
+
+def _billing_page(billing: BillingAlarmState) -> str:
+    return billing.escalation_id or 'the provider_billing_exhausted L2'
+
+
 async def alarm_on_stale_mem0_retries(
     journal: WriteJournal,
     *,
     now: datetime,
     max_age: timedelta,
     project_roots: Mapping[str, str],
+    billing: BillingAlarmState | None = None,
 ) -> list[str]:
     """Escalate each project whose oldest retrying Mem0 write is at least *max_age* old.
 
@@ -117,7 +170,9 @@ async def alarm_on_stale_mem0_retries(
     for backlog in backlogs:
         if backlog.age(now) < max_age:
             continue
-        esc_id = await _escalate(backlog, now=now, max_age=max_age, project_roots=project_roots)
+        esc_id = await _escalate(
+            backlog, now=now, max_age=max_age, project_roots=project_roots, billing=billing,
+        )
         if esc_id is not None:
             filed.append(esc_id)
     return filed
@@ -129,6 +184,7 @@ async def _escalate(
     now: datetime,
     max_age: timedelta,
     project_roots: Mapping[str, str],
+    billing: BillingAlarmState | None,
 ) -> str | None:
     project_root = (
         project_roots.get(backlog.project_id) if backlog.project_id is not None else None
@@ -151,6 +207,7 @@ async def _escalate(
             backlog=backlog,
             now=now,
             max_age=max_age,
+            billing=billing,
         )
     except Exception:
         logger.exception(
