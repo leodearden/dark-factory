@@ -4825,6 +4825,18 @@ mistaken for a gap. When every later night finishes, an outage of up to
 each later night that does not finish costs the oldest owed date. Never-run
 dates already past the window are abandoned in one WARNING,
 `abandoning <n> never-run date(s) <first>..<last>`.
+The 03:00 scheduled pass after a post-midnight catch-up re-targets the date
+the catch-up already ran. Because the schedule cursor has already reached
+that date, that pass draws the night's full sample again and codes only the
+selected sessions the session ledger does not hold, so it never re-codes a
+session the catch-up ledgered (task 7025;
+`scripts/legibility/nightly.py::_ledger_skips`). Its journal says how many
+it left out: `<k> of <n> selected session(s) already-coded, not re-coded`.
+The sample is not guaranteed to be the catch-up's: a session that was still
+running at the catch-up has grown by 03:00, which can change its stratum,
+its dedupe representative or the budget cut, so the pass may code a session
+the catch-up did not select. A manual `--date` pass still re-codes
+everything.
 The progress probe's OK line prints `consecutive_deferred_runs=<n>` and
 `retry_backlog=<n> owed (oldest <date>, window 7 days)` (`retry_backlog=0 owed`
 when nothing is owed), so a growing deferral or backlog is visible before any
