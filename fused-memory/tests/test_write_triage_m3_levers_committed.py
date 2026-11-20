@@ -131,11 +131,9 @@ class TestTheCommittedLeverReport:
             assert arm['provenance']['rows'] == len(rows)
             assert {row['arm'] for row in rows} == {name}
 
-    def test_a_partial_arm_is_reported_with_the_rows_it_has(self) -> None:
-        for name, figures in _report()['partial'].items():
-            path = ARMS_DIR / f'{name}.jsonl'
-            rows = _jsonl(path) if path.exists() else []
-            assert figures['rows'] == len(rows) < figures['cases'], name
+    def test_no_arm_is_left_partial(self) -> None:
+        """The plan doc reads complete arms only; the partial path is pinned synthetically."""
+        assert _report()['partial'] == {}
 
     def test_the_labels_cover_exactly_the_reports_m3_hits(self) -> None:
         report = _report()

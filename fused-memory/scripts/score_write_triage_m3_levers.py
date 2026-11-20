@@ -360,7 +360,9 @@ def _validated_labels(
             quotes[(row['entry_id'], row['target_id'])].extend(str(text) for text in quote.values())
     validated: dict[str, Mapping[str, Any]] = {}
     for index, label in enumerate(labels):
-        problem = _label_problem(label, quotes)
+        problem = _label_problem(label, quotes) or (
+            'an earlier row already labels this entry' if label['entry_id'] in validated else None
+        )
         if problem:
             raise ValueError(f'label row {index} (entry_id {label.get("entry_id")!r}): {problem}')
         validated[label['entry_id']] = label

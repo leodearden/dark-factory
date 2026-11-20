@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import copy
 import functools
+import json
 import types
 from pathlib import Path
 from typing import Any
@@ -275,6 +276,11 @@ class TestClassify:
         with pytest.raises(ValueError, match='A2'):
             self._classify([*_labels(), extra])
 
+    def test_refuses_a_second_label_row_for_one_entry(self) -> None:
+        relabelled = {**_labels()[0], 'dispute_kind': 'contradiction'}
+        with pytest.raises(ValueError, match="'A1'.*already labels"):
+            self._classify([*_labels(), relabelled])
+
     def test_refuses_a_label_outside_the_vocabulary(self) -> None:
         bad = [{**_labels()[0], 'dispute_kind': 'vibes'}, _labels()[1]]
         with pytest.raises(ValueError, match='vibes'):
@@ -335,3 +341,67 @@ class TestRender:
             'prompt_sha256': 'p' * 64, 'model': 'gpt-6.1-sol', 'effort': 'low',
             'cases_sha256': 'c' * 64, 'rows': 6,
         }
+
+
+def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
+    path.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+
+
+class TestAssembleReport:
+    """The report assembled from files, as the ``report`` command writes it."""
+
+    def _inputs(self, root: Path) -> list[str]:
+        items, verdicts = _corpus()
+        paths = {name: root / f'{name}.jsonl' for name in ('items', 'verdicts', 'features', 'labels')}
+        _write_jsonl(paths['items'], items)
+        _write_jsonl(paths['verdicts'], verdicts)
+        _write_jsonl(paths['features'], [feature.to_row() for feature in _features(items)])
+        _write_jsonl(paths['labels'], _labels())
+        strata = root / 'strata.json'
+        strata.write_text(json.dumps(_STRATA))
+        return [*(arg for name, path in paths.items() for arg in (f'--{name}', str(path))),
+                '--strata', str(strata)]
+
+    def _arms_dir(self, root: Path) -> Path:
+        items, _ = _corpus()
+        arms_dir = root / 'arms'
+        arms_dir.mkdir()
+        _write_jsonl(arms_dir / 'f3p.jsonl', _soak_rows())
+        short = [_row(entry, 'amended', arm='lever-y', usd=0.02) for entry in ('A1', 'A2', 'C1')]
+        _write_jsonl(arms_dir / 'lever-y.jsonl', short)
+        repro = [_row(item['entry_id'], 'stored', arm='psi', judged=str(item['outcome']))
+                 for item in items if item['band'] == 'judge']
+        _write_jsonl(arms_dir / 'psi.jsonl', repro)
+        return arms_dir
+
+    def _report(self, tmp_path: Path) -> tuple[dict[str, Any], Path, Path]:
+        out_json, out_md = tmp_path / 'report.json', tmp_path / 'report.md'
+        code = _mod().main([
+            'report', *self._inputs(tmp_path), '--arms-dir', str(self._arms_dir(tmp_path)),
+            '--arms', 'f3p,lever-y,never-run', '--repro-arms', 'psi', '--prompt-commit', 'abc1234',
+            '--out-json', str(out_json), '--out-md', str(out_md),
+        ])
+        assert code == 0
+        return json.loads(out_json.read_text()), out_json, out_md
+
+    def test_writes_the_json_and_its_rendered_markdown(self, tmp_path: Path) -> None:
+        report, _, out_md = self._report(tmp_path)
+        assert out_md.read_text() == _mod().render_markdown(report)
+        assert report['provenance']['shipped_prompt_commit'] == 'abc1234'
+        assert report['arm_order'] == ['f3p']
+
+    def test_an_arm_short_of_cases_is_partial_with_its_projected_spend(
+        self, tmp_path: Path,
+    ) -> None:
+        report, _, _ = self._report(tmp_path)
+        assert report['partial'] == {
+            'lever-y': {'rows': 3, 'cases': 6, 'usd': 0.06, 'projected_usd': 0.12},
+            'never-run': {'rows': 0, 'cases': 6, 'usd': 0.0, 'projected_usd': None},
+        }
+        assert set(report['arms']) == {'f3p'}
+
+    def test_reads_each_repro_arm_against_the_soak(self, tmp_path: Path) -> None:
+        report, _, _ = self._report(tmp_path)
+        agreement = report['repro']['psi']['agreement']
+        assert (agreement['n'], agreement['agree']) == (5, 5)
+        assert report['repro']['psi']['provenance']['rows'] == 5
