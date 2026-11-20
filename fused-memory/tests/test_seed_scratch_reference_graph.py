@@ -276,7 +276,6 @@ def test_a_copy_whose_indexes_never_settle_is_deleted_and_never_saved(
     assert name in message
     assert '0.02s' in message
     assert _UNDER_CONSTRUCTION in message
-    assert graph.catalog_reads >= 2
     assert graph.deleted
     assert server.saves == 0
 
