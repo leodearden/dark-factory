@@ -105,7 +105,7 @@ class _CountingRecordsScanner:
     mount-call carve-out, because that test simulates an in-flight scan by
     setting the documented main-thread-only _scan_in_flight flag directly
     rather than by actually holding one -- the property under test there is
-    purely _poll_registry's statement ORDER relative to that flag, nothing
+    purely start_poll_tick's statement ORDER relative to that flag, nothing
     about threads. `calls` is what proves the tick really was dropped for
     scanning, so the test cannot silently degrade into exercising the
     ordinary path.
@@ -672,7 +672,7 @@ class TestSelectedSlugRestore:
             table = app.query_one(SessionTable)
 
             async def tick():
-                app._poll_registry()
+                app.start_poll_tick()
                 await pilot.pause()
                 await app.workers.wait_for_complete()
                 await pilot.pause()
@@ -839,13 +839,13 @@ class TestUIConfigWriteDebounce:
         the one that persists the parked cursor -- not one per tick.
 
         Unlike the deterministic variant above, nothing here calls
-        _flush_ui_config by hand: _poll_registry's own flush is what must
+        _flush_ui_config by hand: start_poll_tick's own flush is what must
         fire, so this also pins that the debounce resolves on the real
         timer callback and not only when a test drives it.
         """
 
         async def drive(app, pilot):
-            app._poll_registry()
+            app.start_poll_tick()
             await pilot.pause()
             await app.workers.wait_for_complete()
             await pilot.pause()
@@ -868,7 +868,7 @@ class TestUIConfigWriteDebounce:
         slugs = [record.session_slug for record in running]
 
         # poll_interval=60 keeps on_mount's own set_interval timer from
-        # firing: every tick in this test is an explicit _poll_registry()
+        # firing: every tick in this test is an explicit start_poll_tick()
         # call, which is what makes the write COUNT exact rather than a race
         # against the wall clock.
         app = CockpitApp(fleet_root=tmp_path, poll_interval=60)
@@ -883,10 +883,10 @@ class TestUIConfigWriteDebounce:
                 assert table.highlighted_slug() == slug
             assert recorded == []  # precondition: the burst is still debounced
 
-            # _poll_registry launches the real threaded scan worker, so drain
+            # start_poll_tick launches the real threaded scan worker, so drain
             # it the way test_app_scan_pipeline.py::TestThreadedScanReachesUI and
             # test_app_scan_pipeline.py::TestScanBackpressure do.
-            app._poll_registry()
+            app.start_poll_tick()
             await pilot.pause()
             await app.workers.wait_for_complete()
             await pilot.pause()
@@ -903,7 +903,7 @@ class TestUIConfigWriteDebounce:
             # the persisted one, so a tick over an unchanged selection
             # writes nothing. test_rebuild_bearing_poll_ticks_write_once is
             # the counterpart that keeps the registry CHANGING.
-            app._poll_registry()
+            app.start_poll_tick()
             await pilot.pause()
             await app.workers.wait_for_complete()
             await pilot.pause()
@@ -946,7 +946,7 @@ class TestUIConfigWriteDebounce:
             table = app.query_one(SessionTable)
 
             async def tick():
-                app._poll_registry()
+                app.start_poll_tick()
                 await pilot.pause()
                 await app.workers.wait_for_complete()
                 await pilot.pause()
@@ -998,7 +998,7 @@ class TestUIConfigWriteDebounce:
 
     @pytest.mark.timeout(10)
     async def test_flush_is_not_starved_by_the_scan_backpressure_drop(self, tmp_path, monkeypatch):
-        """Pins that the flush runs BEFORE _poll_registry's
+        """Pins that the flush runs BEFORE start_poll_tick's
         `if self._scan_in_flight: return` drop-tick guard.
 
         In production a full 10k+-session scan (~4.5s, esc-2303-1) routinely
@@ -1029,12 +1029,11 @@ class TestUIConfigWriteDebounce:
             calls_before = scanner.calls
             try:
                 # Stand in for a slow 10k-session scan still running. The
-                # flag is documented main-thread-only, and this file already
-                # drives _poll_registry directly, so setting it beats parking
-                # a real worker thread that a failed assertion could leave
-                # wedged.
+                # flag is documented main-thread-only, so setting it beats
+                # parking a real worker thread that a failed assertion could
+                # leave wedged.
                 app._scan_in_flight = True
-                app._poll_registry()
+                app.start_poll_tick()
                 await pilot.pause()
 
                 # The tick really WAS dropped for scanning -- without this
@@ -1071,7 +1070,7 @@ class TestUIConfigWriteDebounce:
             # never restored anything.
             assert app._selected_slug == restored.session_slug
 
-            app._poll_registry()
+            app.start_poll_tick()
             await pilot.pause()
             await app.workers.wait_for_complete()
             await pilot.pause()
@@ -1109,7 +1108,7 @@ class TestUIConfigWriteDebounce:
             # order_sessions ranks above every RUNNING one.
             assert app._selected_slug == 'debounce-blocked'
 
-            app._poll_registry()
+            app.start_poll_tick()
             await pilot.pause()
             await app.workers.wait_for_complete()
             await pilot.pause()

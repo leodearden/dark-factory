@@ -92,7 +92,7 @@ async def _poll_held_after_its_read(
     worker until _apply_scan has run on the loop. The release sits in a finally, so
     a failing assertion inside the block never leaves the worker parked.
     """
-    app._poll_registry()
+    app.start_poll_tick()
     try:
         reached = await asyncio.to_thread(reader.held.wait, reach_timeout_secs)
         assert reached, (
@@ -122,12 +122,12 @@ class TestNonBlockingPoll:
         # A large poll_interval keeps on_mount's own set_interval timer from
         # firing (and launching a second, uncontrolled worker) during this
         # test -- the only scan driven here is the explicit
-        # _poll_registry() call below.
+        # start_poll_tick() call below.
         app = CockpitApp(fleet_root=tmp_path, poll_interval=60, scanner=scanner)
         async with app.run_test() as pilot:
             await pilot.pause()  # on_mount's synchronous scan: call #1, non-blocking
 
-            app._poll_registry()
+            app.start_poll_tick()
             while not scanner.started.is_set():
                 await asyncio.sleep(0.01)
 
@@ -164,7 +164,7 @@ class TestThreadedScanReachesUI:
 
         # A large poll_interval keeps on_mount's own set_interval timer from
         # firing a second, uncontrolled worker mid-test -- the only scan
-        # driven here is the explicit _poll_registry() call below.
+        # driven here is the explicit start_poll_tick() call below.
         app = CockpitApp(fleet_root=tmp_path, poll_interval=60)
         async with app.run_test() as pilot:
             await pilot.pause()
@@ -179,7 +179,7 @@ class TestThreadedScanReachesUI:
             # so the "unchanged" assertion below isn't vacuously true.
             assert any(path.startswith('sessions/') for path in before)
 
-            app._poll_registry()
+            app.start_poll_tick()
             await app.workers.wait_for_complete()
             await pilot.pause()
 
@@ -251,7 +251,7 @@ class TestScanBackpressure:
     """C10 tour F1 / esc-2303-1 follow-through: _scan_in_flight (step-12)
     drops an overlapping poll tick instead of piling up worker threads --
     in production poll_interval (1.5s) is routinely shorter than a full
-    10k+-session scan (~4.5s), so an unguarded _poll_registry would launch
+    10k+-session scan (~4.5s), so an unguarded start_poll_tick would launch
     one thread per tick for the scan's entire duration. It also proves a
     raising scan still clears the flag afterward, so a single bad tick
     never wedges every later poll.
@@ -262,18 +262,18 @@ class TestScanBackpressure:
         scanner = _BlockingCountingScanner()
         # A large poll_interval keeps on_mount's own set_interval timer from
         # firing an uncontrolled worker mid-test -- the only ticks driven
-        # here are the explicit _poll_registry() calls below.
+        # here are the explicit start_poll_tick() calls below.
         app = CockpitApp(fleet_root=tmp_path, poll_interval=60, scanner=scanner)
         async with app.run_test() as pilot:
             await pilot.pause()  # mount's synchronous scan: call #1, non-blocking
 
-            app._poll_registry()
+            app.start_poll_tick()
             while not scanner.started.is_set():
                 await asyncio.sleep(0.01)
             assert scanner.poll_calls == 1
 
             try:
-                app._poll_registry()  # overlapping tick: must be dropped, not queued
+                app.start_poll_tick()  # overlapping tick: must be dropped, not queued
                 await asyncio.sleep(0.1)
                 assert scanner.poll_calls == 1, 'a second scan started while one was in flight'
             finally:
@@ -295,11 +295,11 @@ class TestScanBackpressure:
         async with app.run_test() as pilot:
             await pilot.pause()  # mount's synchronous scan: call #1, succeeds
 
-            app._poll_registry()  # call #2: raises inside the threaded worker
+            app.start_poll_tick()  # call #2: raises inside the threaded worker
             with pytest.raises(WorkerFailed):
                 await app.workers.wait_for_complete()
 
-            app._poll_registry()  # call #3: only runs if the flag was cleared
+            app.start_poll_tick()  # call #3: only runs if the flag was cleared
             await app.workers.wait_for_complete()
             assert scanner.calls == 3
 
@@ -335,7 +335,7 @@ class TestALatePollCannotRegressAFresherScan:
             assert table.row_count == 2, 'the late poll regressed the view'
 
             session_records.write_record(make_record(session_slug='r-3'), root=tmp_path)
-            app._poll_registry()
+            app.start_poll_tick()
             await app.workers.wait_for_complete()
             await pilot.pause()
             assert table.row_count == 3, 'the stale guard froze the view'
