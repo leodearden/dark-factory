@@ -1022,14 +1022,14 @@ class TestTransitionsWakeTheWait:
         assert gate.is_paused is True
         await cancel(waiter)
 
+    @virtual_clock_test
     async def test_b10_when_the_reserve_reopens_only_the_admitted_caller_takes_it(
         self, tmp_path: Path
     ) -> None:
         """``is_paused`` is the PRD's public signal that ``_open`` is untouched (TestReserveWait)."""
-        gate = make_reserve_gate(tmp_path, clock=FakeClock(), wait_for_reset=True)
-        stub_probe(gate, lambda acct: acct.name == RESERVE)
+        gate = make_reopening_gate(tmp_path, RESERVE)
         cap_all_but(gate, RESERVE)
-        cap(gate, RESERVE, resets_at=soon())
+        cap(gate, RESERVE)
         paused_reason = gate.paused_reason
         low = asyncio.create_task(gate.before_invoke(work_class=LOW))
         high = asyncio.create_task(gate.before_invoke(work_class=HIGH))
