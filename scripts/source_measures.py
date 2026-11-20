@@ -353,9 +353,10 @@ _COMPLEXIPY_RANGE_REASON = (
     '(merge_queue.py totals 2031 at 3.0.0, 2092 at 5.0.0, 2133 at 6.x/7.x), so '
     'an unpinned engine would silently rewrite every baseline figure; and 7.x '
     'is ~48x slower on the monolith (247.0s vs 4.75s at 6.2.0, ~330s+ vs 9.52s '
-    'cluster-wide) against the ratchet test\'s 300s timeout, which pytest-'
-    'timeout enforces by os._exit()ing the xdist worker and truncating the '
-    'whole suite. Install the pinned version: `uv sync --all-packages`.'
+    'cluster-wide, before load inflation) against the ratchet test\'s '
+    'WHOLE_TREE_SCAN_TEST_TIMEOUT, which pytest-timeout enforces by '
+    'os._exit()ing the xdist worker and truncating the whole suite. Install '
+    'the pinned version: `uv sync --all-packages`.'
 )
 
 
