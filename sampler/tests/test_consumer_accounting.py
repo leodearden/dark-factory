@@ -226,6 +226,16 @@ class TestRecorderGap:
             assert not figures.readable, consumer
         assert _figures(second, 'shared@sccache.service').gauges[Figure.MEMORY] == 60
 
+    @pytest.mark.parametrize('seconds', [0, -_INTERVAL], ids=['same-ts', 'state-in-the-future'])
+    def test_a_state_not_older_than_now_is_a_gap_with_no_interval(self, tree, seconds):
+        tree.set('app.slice', cpu_usec=20 * _S)
+        first = _first(tree)
+
+        second = _next(tree, first, seconds=seconds)
+
+        assert second.interval_seconds is None
+        assert _figures(second, 'other@app.slice').increments is None
+
     def test_two_intervals_is_not_a_gap(self, tree):
         tree.set('app.slice', cpu_usec=20 * _S)
         first = _first(tree)

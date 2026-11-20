@@ -663,6 +663,13 @@ def _member_stalls(node: CgroupNode, increments: _Values) -> dict[Figure, int]:
     return {figure: v for figure, v in increments.own.items() if figure in _STALLS}
 
 
+def _interval_seconds(previous: TreeState | None, now: int) -> int | None:
+    """Seconds since the previous collection; none without one, or when it is not before *now*."""
+    if previous is None or now <= previous.ts:
+        return None
+    return now - previous.ts
+
+
 def account(
     previous: TreeState | None, current: TreeReading, *, now: int, nominal_interval: int
 ) -> Accounting:
@@ -691,6 +698,6 @@ def account(
         )
     return Accounting(
         per_consumer=MappingProxyType({c: t.figures(gap) for c, t in tallies.items()}),
-        interval_seconds=None if previous is None else now - previous.ts,
+        interval_seconds=_interval_seconds(previous, now),
         state=_state_of(current, now),
     )
