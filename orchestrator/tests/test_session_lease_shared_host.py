@@ -72,7 +72,12 @@ def _warnings(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
 
 
 def _seed_sibling_record(tmp_path: Path, host: int) -> None:
-    """Point the host pid's sessions-by-pid entry at a record the host owns."""
+    """Seed a record the host owns and a host-keyed sessions-by-pid entry naming it.
+
+    That pointer is one written before hosted sessions stopped writing one;
+    ``write_session_pointer`` now refuses a host pid, so the file is written
+    directly.
+    """
     session_records.write_record(
         session_records.SessionRecord(
             session_slug='sibling-hosted-record',
@@ -82,8 +87,10 @@ def _seed_sibling_record(tmp_path: Path, host: int) -> None:
         ),
         root=tmp_path,
     )
-    session_records.write_session_pointer(host, 'sibling-hosted-record', root=tmp_path)
-    assert session_records.resolve_session_slug_for_pid(host, root=tmp_path) == 'sibling-hosted-record'
+    session_records.session_pointers_dir(tmp_path).mkdir(parents=True)
+    session_records.session_pointer_path_for_pid(host, root=tmp_path).write_text(
+        'sibling-hosted-record', encoding='utf-8'
+    )
 
 
 # --- resolution layer --------------------------------------------------------
