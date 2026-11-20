@@ -23,6 +23,7 @@ from _lane_test_helpers import (
 
 from orchestrator.config import GitConfig
 from orchestrator.git_ops import GitOps, WarmLaneUnavailable, WorktreeInfo, _run
+from orchestrator.lane_attach import REFUSED_CHANGES_FILENAME
 
 
 def _warm_git_ops(repo: Path) -> GitOps:
@@ -58,6 +59,11 @@ class _Scene:
 
     async def tip(self, branch: str) -> str:
         return await _git(self.repo, 'rev-parse', f'refs/heads/{branch}')
+
+
+def _specimens(repo: Path) -> list[Path]:
+    root = repo / '.git' / 'interrupted-operation-specimens'
+    return sorted(root.iterdir()) if root.is_dir() else []
 
 
 @pytest_asyncio.fixture
@@ -117,15 +123,27 @@ class TestLiveRequeueOntoAForeignHead:
         assert result is WarmLaneUnavailable.FAULT
         assert await scene.tip('task/V') == c1
         assert await scene.tip('task/F') == scene.main
+        kept = [s / REFUSED_CHANGES_FILENAME for s in _specimens(scene.repo)]
+        assert [k for k in kept if k.is_file()], kept
+        assert '+# edited on a foreign branch' in kept[0].read_text()
+
+    async def test_a_branch_checked_out_in_another_worktree_faults_with_no_ref_moved(
+        self, scene: _Scene, tmp_path: Path,
+    ) -> None:
+        lane, c1 = await self._lane_with_c1_on_v(scene)
+        await _git(lane, 'checkout', 'task/F')
+        await _git(scene.repo, 'worktree', 'add', str(tmp_path / 'second'), 'task/V')
+
+        result = await scene.git_ops.acquire_warm_lane('V', scene.main)
+
+        assert result is WarmLaneUnavailable.FAULT
+        assert await scene.tip('task/V') == c1
+        assert await scene.tip('task/F') == scene.main
+        assert await _git(tmp_path / 'second', 'symbolic-ref', 'HEAD') == 'refs/heads/task/V'
 
 
 async def _git_path(lane: Path, name: str) -> Path:
     return Path(await _git(lane, 'rev-parse', '--path-format=absolute', '--git-path', name))
-
-
-def _specimens(repo: Path) -> list[Path]:
-    root = repo / '.git' / 'interrupted-operation-specimens'
-    return sorted(root.iterdir()) if root.is_dir() else []
 
 
 @pytest.mark.asyncio
@@ -172,13 +190,16 @@ class TestPriorOccupantInterruptedOperationAtAcquire:
     async def test_a_same_task_handover_arrives_without_the_prior_merge(
         self, scene: _Scene,
     ) -> None:
+        """Planted after the release, whose own checkout would clear a merge."""
         lane = await acquire_lane(scene.git_ops, 'S', scene.main)
         await _commit_file(lane, 's1.txt')
+        await scene.git_ops.release_warm_lane(lane, 'S')
         merge_head = await _git_path(lane, 'MERGE_HEAD')
         merge_head.write_text(await _git(lane, 'rev-parse', 'HEAD') + '\n')
         (await _git_path(lane, 'MERGE_MSG')).write_text('prior occupant merge\n')
-        await scene.git_ops.release_warm_lane(lane, 'S')
 
         lane = await acquire_lane(scene.git_ops, 'S', scene.main)
 
         assert not (await _git_path(lane, 'MERGE_HEAD')).exists()
+        kept = [s / 'MERGE_MSG' for s in _specimens(scene.repo)]
+        assert [k.read_text() for k in kept if k.is_file()] == ['prior occupant merge\n']

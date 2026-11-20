@@ -17,10 +17,12 @@ git_ops.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from enum import Enum
 from pathlib import Path
 
+from orchestrator.rebase_recovery import claim_specimen_dir
 from orchestrator.ref_ledger import GitRunner
 
 logger = logging.getLogger(__name__)
@@ -32,6 +34,11 @@ class HeadRelation(Enum):
     ON_BRANCH = 'on_branch'            # attached to the branch itself
     EXTENDS_BRANCH = 'extends_branch'  # detached at its tip or a descendant
     FOREIGN = 'foreign'                # anywhere else, or unknown
+
+
+#: What :func:`check_out_branch_over_foreign_head` keeps of tracked changes it
+#: refuses to discard, inside a claimed specimen directory.
+REFUSED_CHANGES_FILENAME = 'refused-tracked-changes.diff'
 
 
 def _branch_ref(full_branch: str) -> str:
@@ -85,23 +92,30 @@ async def check_out_branch_over_foreign_head(
     ``checkout -f`` is the reset-in-place reattach idiom: it discards the
     tracked state of whatever HEAD the lane was left on.  Tracked changes of
     unknown provenance are not discarded silently, so a tree with any, or one
-    whose status cannot be read, raises instead.  A refused checkout raises
-    too, with git's reason: "already used by worktree" is a duplicate
-    dispatch that must stop the resume.  ``RuntimeError`` is what the lane
-    acquire turns into a FAULT.
+    whose status cannot be read, raises instead.  The changes are first kept
+    as a diff in a specimen (:func:`_keep_tracked_changes`), because the lane
+    the refusal releases is recycled, and a recycle discards them.  A refused
+    checkout raises too, with git's reason: "already used by worktree" is a
+    duplicate dispatch that must stop the resume.  ``RuntimeError`` is what
+    the lane acquire turns into a FAULT.
     """
     head = await describe_head(run, worktree)
     rc, out, _ = await run(
         ['git', 'status', '--porcelain', '--untracked-files=no'], cwd=worktree,
     )
-    if rc != 0 or out.strip():
-        reason = (
-            'its tracked state could not be read' if rc != 0
-            else 'checking the branch out would discard its tracked changes'
-        )
+    if rc != 0:
         raise RuntimeError(
             f'refusing to resume {full_branch} in {worktree}: HEAD {head} is not '
-            f"that branch's tip or a descendant, and {reason}"
+            f"that branch's tip or a descendant, and its tracked state could "
+            f'not be read'
+        )
+    if out.strip():
+        kept = await _keep_tracked_changes(run, worktree)
+        record = f'they are kept in {kept}' if kept else 'they could NOT be recorded'
+        raise RuntimeError(
+            f'refusing to resume {full_branch} in {worktree}: HEAD {head} is not '
+            f"that branch's tip or a descendant, and checking the branch out "
+            f'would discard its tracked changes; {record}'
         )
     rc, _, err = await run(['git', 'checkout', '-f', full_branch], cwd=worktree)
     if rc != 0:
@@ -113,3 +127,25 @@ async def check_out_branch_over_foreign_head(
         'Lane %s was at %s, not on %s; checked the branch out without moving it.',
         worktree, head, full_branch,
     )
+
+
+async def _keep_tracked_changes(run: GitRunner, worktree: Path) -> Path | None:
+    """Write *worktree*'s tracked changes against HEAD into a claimed specimen.
+
+    ``git diff --output`` writes the bytes itself, so a binary or non-UTF-8
+    change is kept exactly.  ``None`` when no specimen could be claimed or the
+    diff failed; both are logged at WARNING.
+    """
+    specimen = await asyncio.to_thread(claim_specimen_dir, worktree)
+    if specimen is None:
+        return None
+    kept = specimen / REFUSED_CHANGES_FILENAME
+    rc, _, err = await run(
+        ['git', 'diff', '--binary', f'--output={kept}', 'HEAD'], cwd=worktree,
+    )
+    if rc != 0:
+        logger.warning(
+            'Could not record the tracked changes in %s: %s', worktree, err.strip(),
+        )
+        return None
+    return kept

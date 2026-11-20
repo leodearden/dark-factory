@@ -2408,6 +2408,18 @@ class TestQuarantineInterruptedOperation:
 
         assert rebase_recovery.quarantine_interrupted_operation(worktree) is None
 
+    @pytest.mark.parametrize(
+        'make_worktree',
+        (vanished_worktree, worktree_is_a_file, git_probe_times_out),
+        ids=lambda f: f.__name__,
+    )
+    def test_no_hostile_state_makes_a_specimen_claim_raise(
+        self, make_worktree, tmp_path: Path, monkeypatch,
+    ) -> None:
+        worktree = make_worktree(tmp_path, monkeypatch)
+
+        assert rebase_recovery.claim_specimen_dir(worktree) is None
+
 
 def _move_branch_to_a_new_commit(repo: Path, branch: str) -> str:
     """Advance *branch* by one commit without touching any worktree."""
@@ -2476,3 +2488,38 @@ class TestRebaseOntoMainNeverAbortsARebaseItDidNotStart:
         assert rebase_recovery.quarantine_stale_rebase(linked) is (
             rebase_recovery.PriorRebase.NONE
         )
+
+    async def test_a_stopped_git_am_under_an_attached_head_is_left_alone(
+        self, tmp_path: Path,
+    ) -> None:
+        """``git am`` keeps rebase-apply/ under an attached HEAD; it is not stale."""
+        repo, linked = _build_clean_linked_worktree(tmp_path)
+        mailbox = tmp_path / 'main-edit.patch'
+        mailbox.write_text(_git_ok(repo, 'format-patch', '-1', '--stdout', 'main'))
+        assert _git(linked, 'am', str(mailbox)).returncode != 0, 'fixture expected am to stop'
+        git_dir = repo / '.git' / 'worktrees' / 'linked'
+        assert (git_dir / 'rebase-apply' / 'applying').exists()
+        feature_before = _git_ok(repo, 'rev-parse', 'refs/heads/feature')
+        ops = _make_git_ops(repo)
+
+        with _guard_spy() as recorded:
+            landed = await ops.rebase_onto_main(linked)
+
+        assert landed is False
+        assert recorded == []
+        assert (git_dir / 'rebase-apply' / 'applying').exists()
+        assert _git_ok(linked, 'symbolic-ref', 'HEAD').strip() == 'refs/heads/feature'
+        assert _git_ok(repo, 'rev-parse', 'refs/heads/feature') == feature_before
+        assert not _operation_specimens_dir(repo).exists()
+
+    async def test_a_stale_rebase_that_cannot_be_moved_is_left_in_place(
+        self, tmp_path: Path,
+    ) -> None:
+        repo, linked, _ = build_linked_mid_rebase_worktree(tmp_path)
+        _git_ok(linked, 'checkout', '-f', '-b', 'victim', 'main')
+        _operation_specimens_dir(repo).write_text('a file where the specimens go\n')
+
+        prior = rebase_recovery.quarantine_stale_rebase(linked)
+
+        assert prior is rebase_recovery.PriorRebase.IN_PROGRESS
+        assert (repo / '.git' / 'worktrees' / 'linked' / 'rebase-merge').is_dir()

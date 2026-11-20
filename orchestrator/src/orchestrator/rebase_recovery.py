@@ -1060,11 +1060,12 @@ async def guarded_abort(
 #: from "there was nothing to abort" -- two states git reports with the same
 #: non-zero exit.  Before a lane is handed on they are what a previous
 #: occupant left behind.
-_IN_PROGRESS_MARKERS = (
-    'rebase-merge', 'rebase-apply', 'MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD',
-)
-
 _REBASE_MARKERS = ('rebase-merge', 'rebase-apply')
+_IN_PROGRESS_MARKERS = (*_REBASE_MARKERS, 'MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD')
+
+#: Written inside ``rebase-apply/`` by ``git am`` alone; the apply rebase
+#: backend writes ``rebasing`` there instead.
+_AM_SESSION_MARKER = 'applying'
 
 #: State git writes BESIDE a marker for the same operation.  Moved with it, so
 #: a specimen is the whole operation and the worktree is left with no half of
@@ -1117,7 +1118,9 @@ class InterruptedOperation:
     when HEAD is detached (or unreadable, which is answered the same way so
     that nothing treats an unknown HEAD as an attached one).
     ``rebase_head_name`` is the branch a rebase was rewriting, read from its
-    own state -- the evidence of whose rebase this is.
+    own state -- the evidence of whose rebase this is.  ``am_session`` is a
+    ``git am`` stopped mid-mailbox: it keeps ``rebase-apply/`` but, unlike a
+    rebase, leaves HEAD attached, so it is never a rebase in progress.
     """
 
     git_dir: Path
@@ -1125,10 +1128,13 @@ class InterruptedOperation:
     entries: tuple[str, ...]
     head_ref: str | None
     rebase_head_name: str | None
+    am_session: bool
 
     @property
     def rebase_in_progress(self) -> bool:
-        return any(entry in _REBASE_MARKERS for entry in self.entries)
+        return not self.am_session and any(
+            entry in _REBASE_MARKERS for entry in self.entries
+        )
 
 
 def _read_stripped(path: Path) -> str | None:
@@ -1178,19 +1184,20 @@ def _interrupted_operation(worktree: Path) -> InterruptedOperation | None:
         entries=markers + _present(git_dir, _OPERATION_COMPANIONS),
         head_ref=_attached_head_ref(git_dir),
         rebase_head_name=_rebase_head_name(git_dir),
+        am_session=os.path.lexists(git_dir / 'rebase-apply' / _AM_SESSION_MARKER),
     )
 
 
-def _claim_specimen_dir(op: InterruptedOperation) -> Path | None:
+def _claim_specimen_dir(git_dir: Path, common_dir: Path) -> Path | None:
     """Exclusively create ``<common>/interrupted-operation-specimens/<wt>-<stamp>``.
 
     ``os.mkdir`` fails with ``FileExistsError`` on a name another run holds,
     so the claim is the guarantee no specimen is ever merged into another's;
     the counter only supplies the next name, as in :func:`quarantine_merge_rr`.
     """
-    root = op.common_dir / _OPERATION_SPECIMENS_DIRNAME
+    root = common_dir / _OPERATION_SPECIMENS_DIRNAME
     stamp = datetime.now(UTC).strftime(_QUARANTINE_STAMP)
-    base = f'{_worktree_token(op.git_dir, op.common_dir)}-{stamp}'
+    base = f'{_worktree_token(git_dir, common_dir)}-{stamp}'
     try:
         root.mkdir(parents=True, exist_ok=True)
         for attempt in range(1, _QUARANTINE_CLAIM_ATTEMPTS + 1):
@@ -1202,16 +1209,30 @@ def _claim_specimen_dir(op: InterruptedOperation) -> Path | None:
             return candidate
     except OSError as exc:
         logger.warning(
-            'Could not claim a specimen directory under %s: %s. The '
-            'interrupted operation in %s is left in place.', root, exc, op.git_dir,
+            'Could not claim a specimen directory under %s for %s: %s.',
+            root, git_dir, exc,
         )
         return None
     logger.warning(
-        'Could not claim a free specimen name under %s after %d attempts. The '
-        'interrupted operation in %s is left in place.',
-        root, _QUARANTINE_CLAIM_ATTEMPTS, op.git_dir,
+        'Could not claim a free specimen name under %s for %s after %d attempts.',
+        root, git_dir, _QUARANTINE_CLAIM_ATTEMPTS,
     )
     return None
+
+
+def claim_specimen_dir(worktree: Path) -> Path | None:
+    """A new, exclusively claimed specimen directory for evidence from *worktree*.
+
+    It sits beside the operations :func:`quarantine_interrupted_operation`
+    moves aside, in the common git dir, so it outlives every recycle of the
+    worktree.  For a caller that refuses to touch state of unknown provenance
+    and must keep a record of it first.  ``None`` when *worktree* cannot be
+    identified or no name could be claimed; never raises.
+    """
+    if not os.path.isdir(worktree):
+        return None
+    dirs = resolve_git_dirs(Path(worktree))
+    return None if dirs is None else _claim_specimen_dir(*dirs)
 
 
 def _move_aside(op: InterruptedOperation) -> Path | None:
@@ -1222,8 +1243,9 @@ def _move_aside(op: InterruptedOperation) -> Path | None:
     is left in the git dir, so a partial move reports failure while keeping
     whatever did move.
     """
-    specimen = _claim_specimen_dir(op)
+    specimen = _claim_specimen_dir(op.git_dir, op.common_dir)
     if specimen is None:
+        logger.warning('The interrupted operation in %s is left in place.', op.git_dir)
         return None
     for entry in op.entries:
         try:
@@ -1278,7 +1300,7 @@ class PriorRebase(Enum):
 
     NONE = 'none'                # nothing there; git itself reports anything odd
     QUARANTINED = 'quarantined'  # a stale rebase was moved aside; proceed
-    IN_PROGRESS = 'in_progress'  # a rebase that may be live; do not touch it
+    IN_PROGRESS = 'in_progress'  # state that may be live, or would not move; leave it
 
 
 def quarantine_stale_rebase(worktree: Path) -> PriorRebase:
@@ -1290,12 +1312,22 @@ def quarantine_stale_rebase(worktree: Path) -> PriorRebase:
     aside changes no ref.  Under a DETACHED HEAD it may be a live or crashed
     rebase of any branch, and nothing here can say whose; the caller must not
     abort it, because an abort resets that rebase's head-name to its
-    orig-head and checks it out (task 10991).
+    orig-head and checks it out (task 10991).  A stopped ``git am`` shares
+    ``rebase-apply/`` but keeps HEAD attached, so an attached HEAD proves
+    nothing about it: it is left in place too.  So is stale state the move
+    could not complete for.
 
     An unresolvable worktree answers ``NONE``: git itself then reports
     whatever is wrong, as it did before this check existed.  Never raises.
     """
     op = _interrupted_operation(Path(worktree))
+    if op is not None and op.am_session:
+        logger.warning(
+            'A git am session is stopped in %s. Not rebasing over it and not '
+            'touching it: it keeps HEAD attached, so nothing says it is stale.',
+            worktree,
+        )
+        return PriorRebase.IN_PROGRESS
     if op is None or not op.rebase_in_progress:
         return PriorRebase.NONE
     if op.head_ref is None:
