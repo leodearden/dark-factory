@@ -142,6 +142,14 @@ MERGE_PATH_CONFIG_READS: Mapping[str, Classified] = MappingProxyType({
     'type_check_command': Classified(
         Fidelity.HOST_DECIDING, _GLOBAL_COMMANDS_FROM_HOST, follow_ups=('agent-followup-5295-global-commands',)
     ),
+    'verify_allow_no_tests_ran': Classified(
+        Fidelity.HOST_DECIDING,
+        'A host whose own config opts in passes a fallback verify whose test slot ran nothing, which '
+        "the dispatcher's default would fail as no_tests_ran. At merge role verify_fallback_floor "
+        'floors every truthy test_command, so the read is reachable only if a future floor arm leaves '
+        'the slot empty. Task 7067 carries the knob on MergeVerifySpec.',
+        follow_ups=('7067',),
+    ),
     # MERGE_NEUTRAL
     'concurrent_verify': Classified(Fidelity.MERGE_NEUTRAL, 'Leg order only: every leg still runs.'),
     'sequential_lint_first': Classified(

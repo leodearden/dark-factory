@@ -1948,6 +1948,11 @@ takes no arguments: it always re-reads that process's own
   homes: `orchestrator/src/orchestrator/config.py::DeterministicConfig` and
   `plans/completion-driven-triggers-prd.md` C1.
 - `verify_env`
+- `verify_allow_no_tests_ran` (default false). It applies when a task's diff
+  matches no module config and the fallback's test slot runs nothing (bare
+  `pytest` default, task role, no test touched): the verify then fails as
+  `no_tests_ran` unless this is true. Green-tier because it is read fresh per
+  verify. Rationale: `docs/fallback-test-floor.md`.
 - `verify_cgroup_cpu_weight_merge` / `_task` / `_background` (the per-role
   cgroup `CPUWeight` a verify scope is spawned with when
   `verify_use_cgroup_scope` is on; read at each scope spawn, so a reload

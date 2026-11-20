@@ -5582,6 +5582,9 @@ class OrchestratorConfig(BaseSettings):
     test_command: str = Field(default='pytest')
     lint_command: str = Field(default='ruff check')
     type_check_command: str = Field(default='pyright')
+    # When a no-module-config fallback verify's test slot runs nothing, True lets it
+    # pass and False fails it as no_tests_ran; see docs/fallback-test-floor.md.
+    verify_allow_no_tests_ran: bool = Field(default=False)
 
     # Fused memory
     fused_memory: FusedMemoryConfig = Field(default_factory=FusedMemoryConfig)
@@ -7021,6 +7024,8 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         # split), so an operator can tune or disable the pre-provision live
         # without a restart.
         'verify_cold_preprovision_command',
+        # Read fresh off the config at each fallback verify; decides one verdict only.
+        'verify_allow_no_tests_ran',
         # Per-land remote-green cross-check gate (task 2822, fix b) — green-tier
         # unlike its restart-only merge_verify_workspace/merge_verify_breadth
         # siblings: it only ever ADDS a second-opinion local verify, so flipping

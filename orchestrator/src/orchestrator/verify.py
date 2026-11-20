@@ -4104,6 +4104,49 @@ def _merge_no_evidence_fail(reason: str) -> 'VerifyResult':
     )
 
 
+def _no_tests_ran_fail(passed_result: 'VerifyResult', py_files: list[str]) -> 'VerifyResult':
+    category = verify_fallback_floor.NO_TESTS_RAN_CATEGORY
+    declared = ', '.join(py_files) or '(none)'
+    return replace(
+        passed_result,
+        passed=False,
+        trivial=False,
+        failing_leg_categories=None,
+        category=category,
+        summary=f"No tests ran for the task's declared .py files ({declared}).",
+        cause_hint=(
+            f"{category}: the fallback verify derived no test from the task's declared "
+            f'files ({declared}). Add or modify a test covering the change and declare '
+            "it in the task's files (report_missing_plan_file)."
+        ),
+    )
+
+
+def _no_tests_ran_verdict(
+    result: 'VerifyResult',
+    executed_fallback: ModuleConfig,
+    config: OrchestratorConfig,
+    files: list[str],
+) -> 'VerifyResult':
+    if not (result.passed and verify_fallback_floor.fallback_ran_no_tests(
+        executed_fallback.test_command, config.test_command,
+    )):
+        return result
+    py_files = [f for f in files if f.endswith('.py')]
+    if config.verify_allow_no_tests_ran:
+        logger.warning(
+            'Fallback verify ran no tests for %s; passing because '
+            'verify_allow_no_tests_ran is set',
+            py_files,
+        )
+        return result
+    logger.warning(
+        'Fallback verify ran no tests for %s; failing as %s',
+        py_files, verify_fallback_floor.NO_TESTS_RAN_CATEGORY,
+    )
+    return _no_tests_ran_fail(result, py_files)
+
+
 async def _verify_pipeline_guard_requires_full_gate(
     worktree: Path,
     changed_files: list[str],
@@ -9995,7 +10038,7 @@ async def _run_scoped_verification_body(
                     ),
                 )
                 fallback_result.plan = plan_dict
-                return fallback_result
+                return _no_tests_ran_verdict(fallback_result, fallback, config, existing_files)
 
             # For Rust projects with no module_configs and no Python fallback
             # (Reify's layout), try to scope the global commands.
@@ -10198,6 +10241,8 @@ async def verify_failure_is_preexisting_on_main(
         ``(False, '')`` (fail-safe) for any of:
           - Main probe passes (break is task-own).
           - Different signature (break is task-own or different inherited break).
+          - A ``no_tests_ran`` failure: a property of the diff's fallback
+            scoping, never of main, so it is never probed (task 7041).
           - ``git_ops.get_main_sha()`` fails or returns empty.
           - ``git worktree add --detach`` fails after retries.
           - Any unexpected exception during probing.
@@ -10265,6 +10310,8 @@ async def verify_failure_is_preexisting_on_main(
             return (hint or '').strip().lower()
 
     try:
+        if failing_result.category == verify_fallback_floor.NO_TESTS_RAN_CATEGORY:
+            return False, ''
         # Resolve the current main SHA.
         try:
             main_sha: str = await git_ops.get_main_sha()  # type: ignore[union-attr]
