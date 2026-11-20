@@ -3,14 +3,13 @@ census run re-offers for filing (task 7095)."""
 from __future__ import annotations
 
 import copy
-from typing import Any
 
 import pytest
 from legibility import census_filing, codebook, disposition, task_store
 
-_OWED: dict[str, Any] = {codebook.ENTRY_FILING_KEY: codebook.ENTRY_FILING_OWED}
-_WITHHELD: dict[str, Any] = {codebook.ENTRY_FILING_KEY: codebook.ENTRY_FILING_WITHHELD}
-_FILED: dict[str, Any] = {codebook.ENTRY_FILING_KEY: codebook.ENTRY_FILING_FILED}
+_OWED = codebook.ENTRY_FILING_OWED
+_WITHHELD = codebook.ENTRY_FILING_WITHHELD
+_FILED = codebook.ENTRY_FILING_FILED
 
 
 def _sighting(session: str) -> dict:
@@ -23,7 +22,8 @@ def _sighting(session: str) -> dict:
     }
 
 
-def _entry(entry_id: str, *, sessions: tuple[str, ...] = ("s-1",), **fields) -> dict:
+def _entry(entry_id: str, *, sessions: tuple[str, ...] = ("s-1",), filing: str | None = None, **fields) -> dict:
+    marker = {codebook.ENTRY_FILING_KEY: filing} if filing else {}
     return {
         "id": entry_id,
         "title": f"Confusion {entry_id}",
@@ -32,6 +32,7 @@ def _entry(entry_id: str, *, sessions: tuple[str, ...] = ("s-1",), **fields) -> 
         "origin_phase": "implement",
         "manifested_phase": "verify",
         "sightings": [_sighting(session) for session in sessions],
+        **marker,
         **fields,
     }
 
@@ -49,7 +50,7 @@ def _fileable_cluster(title: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def test_the_queue_reoffers_an_owed_singleton_unconditionally():
-    cb = _codebook(_entry("entry-owed", **_OWED))
+    cb = _codebook(_entry("entry-owed", filing=_OWED))
 
     [pending] = census_filing.filing_queue([], cb)
 
@@ -64,7 +65,7 @@ def test_the_queue_reoffers_an_owed_singleton_unconditionally():
     [("open", True), ("partially", True), ("fixed", False), ("retired", False), ("accepted", False)],
 )
 def test_the_queue_reoffers_an_owed_entry_only_while_it_is_open_or_partially(status, queued):
-    cb = _codebook(_entry("entry-owed", status=status, **_OWED))
+    cb = _codebook(_entry("entry-owed", status=status, filing=_OWED))
 
     queue = census_filing.filing_queue([], cb)
 
@@ -72,7 +73,7 @@ def test_the_queue_reoffers_an_owed_entry_only_while_it_is_open_or_partially(sta
 
 
 def test_an_owed_entry_a_fileable_cluster_lands_on_is_queued_once_as_that_cluster():
-    cb = _codebook(_entry("entry-owed", **_OWED))
+    cb = _codebook(_entry("entry-owed", filing=_OWED))
     cluster = _fileable_cluster("Confusion entry-owed")
 
     [pending] = census_filing.filing_queue([(cluster, "entry-owed")], cb)
@@ -84,7 +85,7 @@ def test_an_owed_entry_a_fileable_cluster_lands_on_is_queued_once_as_that_cluste
 
 
 def test_a_withheld_entry_a_fileable_cluster_lands_on_carries_its_reoffered_entry_id():
-    cb = _codebook(_entry("entry-withheld", **_WITHHELD))
+    cb = _codebook(_entry("entry-withheld", filing=_WITHHELD))
     cluster = _fileable_cluster("Confusion entry-withheld")
 
     [pending] = census_filing.filing_queue([(cluster, "entry-withheld")], cb)
@@ -94,9 +95,9 @@ def test_a_withheld_entry_a_fileable_cluster_lands_on_carries_its_reoffered_entr
     assert pending.entry_id == "entry-withheld"
 
 
-@pytest.mark.parametrize("marker", [{}, _FILED], ids=["unmarked", "filed"])
-def test_an_unmarked_or_filed_entry_is_not_reoffered(marker):
-    cb = _codebook(_entry("entry-a", sessions=("s-1", "s-2"), **marker))
+@pytest.mark.parametrize("filing", [None, _FILED], ids=["unmarked", "filed"])
+def test_an_unmarked_or_filed_entry_is_not_reoffered(filing):
+    cb = _codebook(_entry("entry-a", sessions=("s-1", "s-2"), filing=filing))
     cluster = _fileable_cluster("Confusion entry-a")
 
     assert census_filing.filing_queue([], cb) == []
@@ -125,9 +126,11 @@ def _row(*, ticket: str | None, task_id: int | None, resolution: str | None, ste
     }
 
 
-def _codebook_of(*, rows: tuple[dict, ...] = (), **marker) -> dict:
-    fields = {"filed_tickets": list(rows)} if rows else {}
-    return _codebook(_entry(_ENTRY_ID, **fields, **marker))
+def _codebook_of(*, rows: tuple[dict, ...] = (), filing: str | None = None) -> dict:
+    entry = _entry(_ENTRY_ID, filing=filing)
+    if rows:
+        entry["filed_tickets"] = list(rows)
+    return _codebook(entry)
 
 
 def _filing(entry_id: str | None = _ENTRY_ID) -> disposition.Filing:
@@ -174,13 +177,13 @@ def test_an_unmarked_entry_whose_decision_routed_nothing_is_owed():
 
 
 def test_a_filed_entry_whose_decision_routed_nothing_is_owed():
-    cb = _codebook_of(**_FILED)
+    cb = _codebook_of(filing=_FILED)
 
     assert _marker_after(_after_filing(_disposal(_unrouted())), cb) == codebook.ENTRY_FILING_OWED
 
 
 def test_a_withheld_entry_whose_decision_routed_nothing_stays_withheld():
-    cb = _codebook_of(**_WITHHELD)
+    cb = _codebook_of(filing=_WITHHELD)
 
     assert _marker_after(_after_filing(_disposal(_unrouted())), cb) == codebook.ENTRY_FILING_WITHHELD
 
