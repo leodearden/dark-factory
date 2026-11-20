@@ -394,8 +394,8 @@ class PsiSample:
         each is read with ``getattr(cfg, field, None)``, so an ABSENT attribute
         and an explicit ``None`` both mean "this arm is off". That keeps a
         v1 cfg (four thresholds, no ``runqueue_ratio`` / ``own_cpu_some_avg10``)
-        working in the live dispatch gate while the config-side v2 lands
-        separately, and it is the same reading the code defaults ask for.
+        working in the live dispatch gate, and it is the same reading the code
+        defaults ask for.
 
         An arm also never trips when its own component read failed. The host
         ``read_ok`` gate stays OUTSIDE the loop, so an unreadable host PSI
