@@ -225,9 +225,12 @@ function OriginPanel({ origin, win, generatedAt, regimeMarkers }) {
 // vertical 6h freshness marker, an open-items list ranked by pending age,
 // and a render-when-present filed→triaged→resolved segment block (2555
 // forward-compat).
-const _RESOLVER_TIERS = ['human', 'cascade', 'auto-watcher', 'steward', 'reaper-sweep', 'unknown', 'other-auto'];
+// Mirrors escalation/src/escalation/classify.py::RESOLVER_TIERS, in its order
+// (dashboard/tests/test_resolver_tier_vocabulary_mirror.py checks it).
+const _RESOLVER_TIERS = ['human-ruled', 'attended-seat', 'cascade', 'auto-watcher', 'steward', 'reaper-sweep', 'unknown', 'other-auto'];
 const _TIER_COLORS = {
-  human: C.PALETTE.ok,
+  'human-ruled': C.PALETTE.ok,
+  'attended-seat': C.PALETTE.fg2,
   cascade: C.PALETTE.accent,
   'auto-watcher': C.PALETTE.info,
   steward: C.PALETTE.accent2,
@@ -237,7 +240,7 @@ const _TIER_COLORS = {
 };
 
 // Any resolver tier the backend emits that isn't in the whitelist above
-// (e.g. a future addition to escalation.classify.classify_resolver_tier, or
+// (e.g. a future addition to escalation.classify.resolver_tier, or
 // a parse anomaly) folds into 'other-auto' rather than being dropped.
 // LifespanPanel's ECDF and WorkflowPanel's 100%-normalized stack both
 // iterate _RESOLVER_TIERS only — an un-folded unknown tier would silently
