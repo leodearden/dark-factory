@@ -64,6 +64,7 @@ PURE_STDLIB_LEAVES = (
     'backends',
     'branch_names',
     'cgroup_slice',
+    'claude_executable',
     'cli_boundary',
     'config_dir',
     'escalation_layout',

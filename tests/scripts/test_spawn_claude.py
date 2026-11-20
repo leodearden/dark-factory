@@ -2831,7 +2831,7 @@ def _fake_claude_argv_capture_line(capture_file: pathlib.Path) -> str:
     the same ``bin_dir/claude`` path, and the second would overwrite the
     first) stay byte-identical in what they record.
     """
-    return f'printf "%s\\0" "$@" > {capture_file!s}\n'
+    return f'printf "%s\\0" "$@" > {shlex.quote(str(capture_file))}\n'
 
 
 def _write_fake_claude_capturing_argv(
@@ -2948,6 +2948,201 @@ def test_spawn_model_env_precedes_raw_claude_args(tmp_path: pathlib.Path) -> Non
     assert argv[model_idxs[0] + 1] == "haiku", f"got: {argv!r}"
     assert argv[model_idxs[1] + 1] == "opus", f"got: {argv!r}"
     assert model_idxs[0] < model_idxs[1], f"got: {argv!r}"
+
+
+# ===========================================================================
+# task-10752: CLAUDE_SPAWN_CLAUDE_BIN -- the executable the tmux and
+# terminal-emulator lanes run in place of bare `claude`
+# ===========================================================================
+# The rule (one override variable per launch surface, empty counts as unset,
+# no surface reads another's) lives in
+# shared/src/shared/claude_executable.py::claude_executable; the script asks it
+# by path. The fleet-wide CLAUDE_BINARY must never reroute a spawned session.
+
+
+def _write_argv_capturing_executable(
+    path: pathlib.Path, capture_file: pathlib.Path
+) -> None:
+    """Write an argv-capturing fake claude at an arbitrary *path*."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "#!/usr/bin/env bash\n"
+        + _fake_claude_argv_capture_line(capture_file)
+        + "exit 0\n"
+    )
+    path.chmod(0o755)
+
+
+def _write_payload_recording_terminal(
+    bin_dir: pathlib.Path, name: str, payload_file: pathlib.Path
+) -> None:
+    """A foreground fake terminal that records the ``$inner`` payload before running it."""
+    p = bin_dir / name
+    p.write_text(textwrap.dedent(f"""\
+        #!/usr/bin/env bash
+        while [[ $# -gt 0 ]]; do
+          if [[ "$1" == "bash" ]]; then
+            printf '%s' "$3" > {shlex.quote(str(payload_file))}
+            exec "$@"
+          fi
+          shift
+        done
+        exit 1
+    """))
+    p.chmod(0o755)
+
+
+@pytest.mark.parametrize("terminal_name", ["gnome-terminal", "konsole"])
+def test_spawn_claude_bin_override_runs_in_place_of_claude(
+    tmp_path: pathlib.Path, terminal_name: str
+) -> None:
+    bin_dir = _make_bin_dir(tmp_path)
+    path_claude_capture = tmp_path / "path_claude.bin"
+    _write_fake_claude_capturing_argv(bin_dir, path_claude_capture)
+    override = tmp_path / "pool" / "claude-pool"
+    override_capture = tmp_path / "override.bin"
+    _write_argv_capturing_executable(override, override_capture)
+    _write_foreground_terminal(bin_dir, terminal_name)
+    env = _base_env(bin_dir, terminal_name)
+    env["CLAUDE_SPAWN_CLAUDE_BIN"] = str(override)
+
+    result = _run_spawn(env, tmp_path)
+
+    assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
+    assert override_capture.exists(), "the CLAUDE_SPAWN_CLAUDE_BIN executable never ran"
+    assert _read_argv(override_capture)[-1].startswith("test prompt")
+    assert not path_claude_capture.exists(), "bare `claude` ran despite the override"
+
+
+@pytest.mark.parametrize("override_value", [None, ""], ids=["unset", "empty"])
+def test_spawn_without_claude_bin_override_runs_claude_from_path(
+    tmp_path: pathlib.Path, override_value: str | None
+) -> None:
+    bin_dir = _make_bin_dir(tmp_path)
+    path_claude_capture = tmp_path / "path_claude.bin"
+    _write_fake_claude_capturing_argv(bin_dir, path_claude_capture)
+    fleet_binary = tmp_path / "fleet-binary" / "claude"
+    fleet_binary_capture = tmp_path / "fleet_binary.bin"
+    _write_argv_capturing_executable(fleet_binary, fleet_binary_capture)
+    _write_foreground_terminal(bin_dir, "xterm")
+    env = _base_env(bin_dir, "xterm")
+    env["CLAUDE_BINARY"] = str(fleet_binary)
+    if override_value is not None:
+        env["CLAUDE_SPAWN_CLAUDE_BIN"] = override_value
+
+    result = _run_spawn(env, tmp_path)
+
+    assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
+    assert path_claude_capture.exists(), "bare `claude` on PATH did not run"
+    assert not fleet_binary_capture.exists(), "the spawn lane ran the fleet's CLAUDE_BINARY"
+    assert "CLAUDE_SPAWN_CLAUDE_BIN" not in result.stderr.decode(), "a default spawn warned"
+
+
+def test_spawn_claude_bin_override_is_shell_quoted(tmp_path: pathlib.Path) -> None:
+    bin_dir = _make_bin_dir(tmp_path)
+    _write_fake_claude(bin_dir, exit_code=0)
+    override = tmp_path / "pool dir $(touch INJECTED) ; it's" / "claude-pool"
+    override_capture = tmp_path / "override.bin"
+    _write_argv_capturing_executable(override, override_capture)
+    _write_foreground_terminal(bin_dir, "xterm")
+    env = _base_env(bin_dir, "xterm")
+    env["CLAUDE_SPAWN_CLAUDE_BIN"] = str(override)
+
+    result = _run_spawn(env, tmp_path)
+
+    assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
+    assert override_capture.exists(), "the metacharacter-laden override never ran"
+    injected = list(tmp_path.rglob("INJECTED"))
+    assert injected == [], f"the override path was evaluated by a shell: {injected}"
+
+
+def test_spawn_payload_and_written_files_carry_no_credential_value(
+    tmp_path: pathlib.Path,
+) -> None:
+    bin_dir = _make_bin_dir(tmp_path)
+    _write_fake_claude(bin_dir, exit_code=0)
+    payload_file = tmp_path / "payload.txt"
+    _write_payload_recording_terminal(bin_dir, "xterm", payload_file)
+    override = tmp_path / "pool" / "claude-pool"
+    override_capture = tmp_path / "override.bin"
+    _write_argv_capturing_executable(override, override_capture)
+    env = _sentinel_test_env(bin_dir, "xterm", tmp_path)
+    env["CLAUDE_SPAWN_CLAUDE_BIN"] = str(override)
+    credentials = {
+        "ANTHROPIC_BASE_URL": "http://sentinel-base-url-10752.invalid",
+        "ANTHROPIC_AUTH_TOKEN": "sentinel-auth-token-10752",
+        "ANTHROPIC_API_KEY": "sentinel-api-key-10752",
+        "CLAUDE_CODE_OAUTH_TOKEN": "sentinel-oauth-token-10752",
+    }
+    env |= credentials
+
+    result = _run_spawn(env, tmp_path)
+
+    assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
+    assert payload_file.exists() and override_capture.exists()
+    written = [payload_file, override_capture] + [
+        p
+        for root in (env["CLAUDE_FLEET_ROOT"], env["TMPDIR"])
+        for p in pathlib.Path(root).rglob("*")
+        if p.is_file() and not p.is_symlink()
+    ]
+    leaks = [
+        (str(path), name)
+        for path in written
+        for name, value in credentials.items()
+        if value.encode() in path.read_bytes()
+    ]
+    assert leaks == [], f"a credential value was written to disk: {leaks}"
+
+
+@pytest.mark.parametrize(
+    ("resolver_rc", "expected_cause"),
+    [(3, "exited 3"), (0, "exited 0 but printed no executable")],
+    ids=["faulted", "silent"],
+)
+def test_spawn_falls_back_to_claude_when_the_resolver_cannot_run(
+    tmp_path: pathlib.Path, resolver_rc: int, expected_cause: str
+) -> None:
+    bin_dir = _make_bin_dir(tmp_path)
+    path_claude_capture = tmp_path / "path_claude.bin"
+    _write_fake_claude_capturing_argv(bin_dir, path_claude_capture)
+    faulting_python = bin_dir / "python3"
+    faulting_python.write_text(textwrap.dedent(f"""\
+        #!/usr/bin/env bash
+        case "$*" in
+          *claude_executable.py*) echo resolver-stderr-10752 >&2; exit {resolver_rc} ;;
+        esac
+        exit 1
+    """))
+    faulting_python.chmod(0o755)
+    override = tmp_path / "pool" / "claude-pool"
+    override_capture = tmp_path / "override.bin"
+    _write_argv_capturing_executable(override, override_capture)
+    _write_foreground_terminal(bin_dir, "xterm")
+    env = _base_env(bin_dir, "xterm")
+    env["CLAUDE_SPAWN_BACKEND"] = "wm"
+    env["CLAUDE_SPAWN_CLAUDE_BIN"] = str(override)
+
+    result = _run_spawn(env, tmp_path)
+
+    stderr = result.stderr.decode()
+    assert result.returncode == 0, f"stderr: {stderr}"
+    assert path_claude_capture.exists(), "bare `claude` must run when the resolver cannot"
+    assert not override_capture.exists()
+    assert "CLAUDE_SPAWN_CLAUDE_BIN" in stderr, f"no fallback warning on stderr: {stderr}"
+    assert "shared/src/shared/claude_executable.py" in stderr, stderr
+    assert expected_cause in stderr, stderr
+    assert "resolver-stderr-10752" in stderr, "the resolver's own stderr was discarded"
+
+
+def test_t3_lane_launches_with_the_spawn_claude_bin_override_set(t3_lane: _T3Lane) -> None:
+    t3_lane.env["CLAUDE_SPAWN_MODE"] = "sibling"
+    t3_lane.env["CLAUDE_SPAWN_CLAUDE_BIN"] = "/nonexistent/claude-pool"
+
+    result = t3_lane.run()
+
+    assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
+    assert len(t3_lane.started_threads()) == 1
 
 
 # ===========================================================================
