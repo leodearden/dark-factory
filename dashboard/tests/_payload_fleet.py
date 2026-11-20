@@ -159,11 +159,11 @@ class FleetCensus:
 
     * costs (110,596 bytes at ``window=all``): spend on 189 of the 3,650
       days, 23 (model, role) pairs, 9 accounts, the 200-event cap full;
-    * burndown (797,344 at ``window=90d`` with the rows' in-progress split
-      stripped, re-measured 2026-11-20 by task 10258): 12 projects, 24,157
-      MEASURED rows over a union of 2,748 labels spanning 61.6 of the 90
+    * burndown (798,490 at ``window=90d`` with the rows' in-progress split
+      stripped, re-measured 2026-11-20 by task 10258): 12 projects, 24,179
+      MEASURED rows over a union of 2,750 labels spanning 61.6 of the 90
       days; the payload scales with the row count, not the span. At about
-      9.5 KB a day it plateaus near 1,068,700 once the window fills, around
+      9.6 KB a day it plateaus near 1,070,650 once the window fills, around
       2026-12-19. The budget must hold that plateau, so the fleet seeds the
       full-window steady state, 2,740 rows per root, not today's partly
       filled window, and serves 1,068,143. Every third hourly row of the odd
