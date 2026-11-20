@@ -2842,7 +2842,7 @@ class WriteTriageConfig(BaseModel):
         ge=0.0,
         le=1.0,
         description=(
-            'Attach-guard HOIST GAP (task 7158): in the judge band only, refuse '
+            'Attach-guard HOIST GAP (task 7158): on judged writes only, refuse '
             'to hoist a write from the matched child to its parent when the '
             "parent's cosine to the write is more than this below the child's; "
             'the write is stored standalone instead, never filed under the '
@@ -2858,7 +2858,7 @@ class WriteTriageConfig(BaseModel):
     # OPERATOR KNOBS like `enabled`/`candidate_k` above, NOT calibrated bands:
     # they ship with real defaults, and None on the inheriting leaves means
     # "follow llm.*", never "uncalibrated". Every judge_* leaf is green-tier
-    # hot-reloadable and read LIVE per middle-band write by
+    # hot-reloadable and read LIVE per judged write by
     # server/write_triage_judge.py's resolvers — nothing is captured at import
     # or construction, which is what makes the registration in
     # config/reload.py real rather than restart-only in disguise.
@@ -2866,10 +2866,13 @@ class WriteTriageConfig(BaseModel):
     judge_enabled: bool = Field(
         default=True,
         description=(
-            "Kill switch for write triage's LLM judge arm — the middle band "
-            'between t_low and t_high. While False that band answers `stored` '
-            'without an LLM call, exactly as leaf beta\'s deliberate stub did, '
-            'and the deterministic bands keep running. Defaults TRUE, unlike '
+            "Kill switch for write triage's LLM judge arm, which judges every "
+            'write from t_low up except a near-verbatim restatement (task 7155). '
+            'While False those writes answer `stored` without an LLM call, '
+            'exactly as leaf beta\'s deliberate stub did, so the high band no '
+            'longer files `restated` without the judge; the near-verbatim '
+            '`restated` path and the below-t_low `stored` band keep running. '
+            'Defaults TRUE, unlike '
             'the `enabled` sibling above, and the asymmetry is deliberate: the '
             'judge is structurally INERT while write_triage.enabled is false '
             '(no triage code executes at all), so it costs nothing on the '
@@ -2878,7 +2881,7 @@ class WriteTriageConfig(BaseModel):
             'get stub behaviour, and read the resulting all-`stored` ack stream '
             'as evidence that the corpus is novel. Its real purpose is stopping '
             'an in-flight JUDGE incident (spend, latency, a bad model) while '
-            'leaving the deterministic bands running, which is a strictly finer '
+            'leaving the deterministic paths running, which is a strictly finer '
             'lever than `enabled` and green-tier for the same reason.'
         ),
     )
