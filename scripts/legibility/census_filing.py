@@ -17,9 +17,11 @@ from legibility import (
     census_report,
     census_verdicts,
     codebook,
+    codebook_lifecycle,
     disposition,
     filing_policy,
     sighting_fit,
+    task_store,
 )
 from legibility import verdict as verdict_mod
 from shared.toolcall_markup import escape_envelope_literals
@@ -285,6 +287,59 @@ def filing_queue(fileable: list[tuple[dict, str | None]], cb: dict) -> list[Pend
         if entry["id"] not in landed:
             queue.append(PendingFiling(entry_cluster(cb, entry), entry["id"], entry["id"]))
     return queue
+
+
+_REOFFER_MARKERS = frozenset({codebook.ENTRY_FILING_WITHHELD, codebook.ENTRY_FILING_OWED})
+
+
+def owed_after_filing(cb: dict, disposal: disposition.Disposal, *, dry_run: bool) -> dict:
+    """*cb* with every entry whose filing this run reached no work marked owed:
+    the entries of decisions that routed nothing, and those of filings the
+    protocol never decided (the dedup store was unreachable), less every entry
+    some routed decision of this run covers. A *dry_run*'s undecided filings
+    are not owed: its payloads file is their one handle
+    (``write_dry_run_payloads``)."""
+    routed = {decision.filing.entry_id for decision in disposal.decisions if decision.routed}
+    stranded = [decision.filing.entry_id for decision in disposal.decisions if not decision.routed]
+    if not dry_run:
+        stranded += [filing.entry_id for filing in disposal.unfiled]
+    return _owe(cb, [entry_id for entry_id in stranded if entry_id not in routed])
+
+
+def owed_after_resolving(cb: dict, resolutions: disposition.Resolutions) -> dict:
+    """*cb* with the entry of every ticket the curator never decided marked
+    owed: one resolved FAILED (expired, server restart). REFUSED and
+    CANCELLED are decisions a re-filing would override, and an undecided
+    ticket never reaches ``Resolutions.resolved``."""
+    return _owe(cb, [
+        resolved.entry_id
+        for resolved in resolutions.resolved
+        if resolved.outcome.status is task_store.TicketStatus.FAILED
+    ])
+
+
+def _owe(cb: dict, entry_ids: Sequence[str | None]) -> dict:
+    """*cb* with each of *entry_ids* marked owed, unless its marker already
+    re-offers it (withheld, owed) or a C1 back-link routes it
+    (``disposition.entry_routed``): that task or pending ticket already
+    carries the finding, and the L5 outcome loop or the ticket pass decides
+    it."""
+    entries = {entry["id"]: entry for entry in cb.get("entries") or []}
+    owed = [
+        entry_id
+        for entry_id in dict.fromkeys(entry_id for entry_id in entry_ids if entry_id is not None)
+        if entries[entry_id].get(codebook.ENTRY_FILING_KEY) not in _REOFFER_MARKERS
+        and not disposition.entry_routed(entries[entry_id])
+    ]
+    for entry_id in owed:
+        cb = codebook_lifecycle.mark_entry_owed(cb, entry_id)
+    if owed:
+        logger.warning(
+            "census: %d codebook entr(ies) whose filing reached no work are marked owed; "
+            "the next census re-offers them: %s",
+            len(owed), owed,
+        )
+    return cb
 
 
 def _carrying(pending: PendingFiling, refiling: disposition.Refiling) -> PendingFiling:
