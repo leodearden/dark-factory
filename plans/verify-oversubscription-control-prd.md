@@ -39,6 +39,7 @@ Grounded in this session's measurements + reify's working system:
 
 **Hard constraints (locked this session):**
 - **C-merge-priority / never-block:** merge-role pytests never acquire the counting semaphore and get the highest verify nice; task can never starve merge (anti-livelock).
+  - *Note 2026-11-20 (Leo's ruling on gate task 10572, `plans/gate-10572-verify-balance-2026-11-19/RULINGS.md`):* this is how the code behaves and it stays, but it is no longer a locked constraint. The 2026-09-07 directive "merge verify is never throttled" was revoked on 2026-11-15. The standing ruling is that merge verifies get no cap and no share while more requests wait than one chain can take, and that capacity moves back toward task verifies if merge verifies start short of requests. The same applies to item 2 of section 1.
 - **C-untimed-acquire:** the slot wait happens **before** the pytest command's timeout clock starts (outside the timed region); it never counts toward `verify_command_timeout_secs` and never triggers a requeue (reify clock-stop equivalent).
 - **C-fail-open:** missing lock dir / acquire error / disabled → run ungated `-n auto` (today's behavior), never block.
 - **C-no-FD-inheritance:** slot FDs are `os.set_inheritable(fd, False)` so no pytest worker / sccache-class descendant pins a slot after exit (reify `9<&-`).
