@@ -51,7 +51,7 @@ from escalation.authority import (
     REVERSIBILITY_WAIVED_ACTIONS,
     REVERSIBLE_POLICY_ACTIONS,
 )
-from escalation.classify import classify_resolver_tier
+from escalation.classify import resolver_tier
 from escalation.models import Escalation
 from escalation.queue import iter_all_escalation_paths, read_escalation_for_scan
 
@@ -424,8 +424,9 @@ class ClassAgreement:
     into either side, so the denominator the adoption threshold is read off is
     one a reader can see, and missing data never reads as disagreement.
 
-    ``non_human_resolver`` counts the in-window stamps whose record was resolved
-    by no human at all — a cascade, a reaper sweep, the steward — so the
+    ``not_human_ruled`` counts the in-window stamps whose record carries no
+    human ruling — an attended-seat close, a cascade, a reaper sweep, the
+    steward (``escalation/src/escalation/classify.py::resolver_tier``) — so the
     proposal was never held against an adjudication. It is PER CLASS because
     ``AgreementReport.resolver_tiers`` says only what took the sample: a reader
     of ``cascade=3`` could not tell which shadowed class paid for it, and a
@@ -438,7 +439,7 @@ class ClassAgreement:
     agreed: int
     diverged: int
     not_comparable: int
-    non_human_resolver: int
+    not_human_ruled: int
 
     @property
     def comparable(self) -> int:
@@ -449,7 +450,7 @@ class ClassAgreement:
     def total(self) -> int:
         """Every in-window record counted for this class, rate-bearing or not."""
         return (
-            self.agreed + self.diverged + self.not_comparable + self.non_human_resolver
+            self.agreed + self.diverged + self.not_comparable + self.not_human_ruled
         )
 
     @property
@@ -489,8 +490,9 @@ class AgreementReport:
     ``resolver_tiers`` is NOT the tier breakdown of every in-window stamp its
     bare name suggests: it is tallied after the gated and self-resolved
     exclusions, so it covers only the subset that reached the resolver check.
-    It is also aggregate — which class a non-human resolution took a sample from
-    is on :attr:`ClassAgreement.non_human_resolver`, which owns that reading.
+    It is also aggregate — which class a record with no human ruling took a
+    sample from is on :attr:`ClassAgreement.not_human_ruled`, which owns that
+    reading.
     """
 
     since: datetime
@@ -578,12 +580,12 @@ def agreement_report(
     ``except OSError`` the no-silent-fail-soft invariant forbids.
 
     THE ORDER OF CHECKS IS PART OF THE CONTRACT: unstamped -> unresolved ->
-    out-of-window -> unreadable -> gated -> self_resolved -> non-human resolver
+    out-of-window -> unreadable -> gated -> self_resolved -> not human-ruled
     -> not_comparable -> agreed/diverged. Everything up to ``not_comparable`` is
     "this record must not contribute to a rate at all"; putting any of them
     later would let an in-window matching close fall through to ``agreed``
-    first. The non-human-resolver step tallies per class as well as per tier;
-    :attr:`ClassAgreement.non_human_resolver` owns why.
+    first. The not-human-ruled step tallies per class as well as per tier;
+    :attr:`ClassAgreement.not_human_ruled` owns why.
 
     TWO OF THOSE POSITIONS FOLLOW FROM THE FIELD SEMANTICS :class:`AgreementReport`
     states, and this docstring does not restate them. Pendingness is decided
@@ -600,7 +602,9 @@ def agreement_report(
     ``escalation-watcher``, so a watcher that stamps a proposal and then closes
     the record itself under that standing rule would otherwise be read back as
     a human agreeing with itself, inflating the very ``design_concern`` class
-    this measurement exists to judge, toward its own adoption threshold.
+    this measurement exists to judge, toward its own adoption threshold. An
+    attended-seat close that asserts no ruling is not a ruling at all, and is
+    counted as not human-ruled before agreement is scored.
 
     The limit of that check, stated honestly: attribution is server-enforced
     only for a header-bearing identity —
@@ -614,7 +618,7 @@ def agreement_report(
     agreed: Counter[str] = Counter()
     diverged: Counter[str] = Counter()
     not_comparable: Counter[str] = Counter()
-    non_human: Counter[str] = Counter()
+    not_human_ruled: Counter[str] = Counter()
     tiers: Counter[str] = Counter()
     gated_stamps = 0
     self_resolved = 0
@@ -653,10 +657,10 @@ def agreement_report(
             self_resolved += 1
             continue
 
-        tier = classify_resolver_tier(record.resolved_by)
+        tier = resolver_tier(record)
         tiers[tier] += 1
-        if tier != 'human':
-            non_human[ruling.ruling_class] += 1
+        if tier != 'human-ruled':
+            not_human_ruled[ruling.ruling_class] += 1
             continue
 
         # COMPARABILITY IS A PROPERTY OF BOTH SIDES, and the observed side can
@@ -677,7 +681,7 @@ def agreement_report(
         else:
             diverged[ruling.ruling_class] += 1
 
-    counted = sorted(set(agreed) | set(diverged) | set(not_comparable) | set(non_human))
+    counted = sorted(set(agreed) | set(diverged) | set(not_comparable) | set(not_human_ruled))
     return AgreementReport(
         since=since,
         until=until,
@@ -687,7 +691,7 @@ def agreement_report(
                 agreed=agreed[slug],
                 diverged=diverged[slug],
                 not_comparable=not_comparable[slug],
-                non_human_resolver=non_human[slug],
+                not_human_ruled=not_human_ruled[slug],
             )
             for slug in counted
         ),
@@ -704,7 +708,7 @@ def agreement_report(
 _DEFAULT_WINDOW = timedelta(days=7)
 
 _ROW = (
-    '{cls:<40} {agreed:>7} {diverged:>9} {not_comparable:>15} {non_human:>10} '
+    '{cls:<40} {agreed:>7} {diverged:>9} {not_comparable:>15} {not_human_ruled:>15} '
     '{comparable:>11} {rate:>8}'
 )
 
@@ -720,7 +724,7 @@ def _as_json(report: AgreementReport) -> str:
                     'agreed': c.agreed,
                     'diverged': c.diverged,
                     'not_comparable': c.not_comparable,
-                    'non_human_resolver': c.non_human_resolver,
+                    'not_human_ruled': c.not_human_ruled,
                     'comparable': c.comparable,
                     'total': c.total,
                     'agreement_rate': c.agreement_rate,
@@ -761,14 +765,14 @@ def _as_table(report: AgreementReport) -> str:
     if report.classes:
         lines.append(_ROW.format(
             cls='class', agreed='agreed', diverged='diverged',
-            not_comparable='not_comp', non_human='non_human',
+            not_comparable='not_comp', not_human_ruled='not_human_ruled',
             comparable='comparable', rate='rate',
         ))
         for c in report.classes:
             rate = 'n/a' if c.agreement_rate is None else f'{c.agreement_rate * 100:.1f}%'
             lines.append(_ROW.format(
                 cls=c.ruling_class, agreed=c.agreed, diverged=c.diverged,
-                not_comparable=c.not_comparable, non_human=c.non_human_resolver,
+                not_comparable=c.not_comparable, not_human_ruled=c.not_human_ruled,
                 comparable=c.comparable, rate=rate,
             ))
     else:
