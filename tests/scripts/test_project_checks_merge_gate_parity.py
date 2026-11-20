@@ -301,15 +301,19 @@ def _terminate_the_hook(git_pid: int) -> None:
 
 
 @pytest.mark.parametrize(
-    ('unit_prelude', 'interrupt'),
-    [("trap '' INT; ", _ctrl_c), ('', _terminate_the_hook)],
-    ids=['ctrl-c-with-a-sigint-immune-unit', 'sigterm-to-the-hook-alone'],
+    ('unit_prelude', 'unit_tail', 'interrupt'),
+    [
+        ("trap '' INT; ", '; true', _ctrl_c),
+        ('', '; true', _terminate_the_hook),
+        ("trap '' INT; ", ' & exec sleep 300', _ctrl_c),
+    ],
+    ids=['ctrl-c-with-a-sigint-immune-unit', 'sigterm-to-the-hook-alone', 'ctrl-c-that-kills-the-unit-shell'],
 )
 def test_an_interrupted_commit_stops_its_units_and_removes_their_logs(
-    tmp_path: Path, unit_prelude: str, interrupt: Callable[[int], None],
+    tmp_path: Path, unit_prelude: str, unit_tail: str, interrupt: Callable[[int], None],
 ) -> None:
     pid_file = tmp_path / 'unit.pid'
-    sleeper = f'sh -c {shlex.quote(f"{unit_prelude}echo $$ > {pid_file}; exec sleep 300")}; true'
+    sleeper = f'sh -c {shlex.quote(f"{unit_prelude}echo $$ > {pid_file}; exec sleep 300")}{unit_tail}'
     repo = make_hook_repo(tmp_path, _type_only_modules(lambda prefix: sleeper if prefix == 'shared' else 'true'))
     before = repo.head()
     repo.stage('shared/src/x.py', 'x = 1\n')
