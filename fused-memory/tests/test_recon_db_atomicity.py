@@ -72,6 +72,7 @@ from fused_memory.models.reconciliation import (
     EventSource,
     EventType,
     ReconciliationEvent,
+    RunStatus,
 )
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.journal import ReconciliationJournal
@@ -349,13 +350,8 @@ async def _file_a_late_stale_run(conn: aiosqlite.Connection) -> None:
     await conn.commit()
 
 
-_COLLIDED_SESSION = 'session-collided'
-
-
-async def _record_the_collided_session(journal: ReconciliationJournal) -> None:
-    await journal.record_run_session(
-        'live', session_id=_COLLIDED_SESSION, stage_cursor='stage-collided'
-    )
+async def _complete_the_live_run(journal: ReconciliationJournal) -> None:
+    await journal.complete_run('live', RunStatus.completed.value)
 
 
 def _reaper_cutoff() -> str:
@@ -364,9 +360,9 @@ def _reaper_cutoff() -> str:
 
 async def _assert_the_collided_write_landed(journal: ReconciliationJournal) -> None:
     live = await journal.get_run('live')
-    assert live is not None and live.session_id == _COLLIDED_SESSION, (
-        f"the collided write did not land: run 'live' carries "
-        f'{None if live is None else live.session_id!r}'
+    assert live is not None and live.status == RunStatus.completed, (
+        f"the collided write did not land: run 'live' has status "
+        f'{None if live is None else live.status!r}'
     )
 
 
@@ -380,7 +376,7 @@ async def test_a_write_survives_the_stale_run_reapers_read(
     snapshot pinned, a foreign connection files ``late``, and the write is
     queued into that window.
 
-    ``record_run_session`` is the probe because its unit is a SINGLE ``UPDATE`` with
+    ``complete_run`` is the probe because its unit is a SINGLE ``UPDATE`` with
     no preceding SELECT — a pure write opens no read snapshot of its own, so the
     "expect no error" assertion is structurally sound rather than merely lucky.  A
     SELECT-then-write method would be a flaky probe here (see ``AtomicConnection.
@@ -391,7 +387,7 @@ async def test_a_write_survives_the_stale_run_reapers_read(
     stale, error = await _collide_with_a_pinned_read(
         journal_tap.connection,
         read=lambda: journal.get_stale_runs(STALE_CUTOFF_SECONDS),
-        write=lambda: _record_the_collided_session(journal),
+        write=lambda: _complete_the_live_run(journal),
         foreign_commit=lambda: _file_a_late_stale_run(second_connection),
     )
 
@@ -424,7 +420,7 @@ async def test_a_legacy_multi_hop_reaper_read_kills_the_write(
         read=lambda: _legacy_multi_hop_read(
             journal_tap.connection, _LEGACY_REAPER_SCAN, (_reaper_cutoff(),)
         ),
-        write=lambda: _record_the_collided_session(journal),
+        write=lambda: _complete_the_live_run(journal),
         foreign_commit=lambda: _file_a_late_stale_run(second_connection),
     )
 
@@ -457,7 +453,7 @@ async def test_no_stale_run_means_no_pinned_read_and_no_failures(
         read=lambda: _legacy_multi_hop_read(
             journal_tap.connection, _LEGACY_REAPER_SCAN, (_reaper_cutoff(),)
         ),
-        write=lambda: _record_the_collided_session(journal),
+        write=lambda: _complete_the_live_run(journal),
         foreign_commit=lambda: _file_a_late_stale_run(second_connection),
     )
 
@@ -480,9 +476,7 @@ async def test_checkpoint_and_write_do_not_lock_each_other_out(journal, second_c
     for i in range(CHECKPOINT_ITERATIONS):
         written, checkpointed = await asyncio.wait_for(
             asyncio.gather(
-                journal.record_run_session(
-                    'live', session_id=f'session-{i}', stage_cursor=f'stage-{i}'
-                ),
+                journal.complete_run('live', RunStatus.completed.value),
                 journal.checkpoint(),
                 return_exceptions=True,
             ),
@@ -638,7 +632,7 @@ async def test_a_heartbeat_survives_a_peek_on_the_same_connection(
     a heartbeat that survives but changes nothing fails the arm too.
 
     ``heartbeat`` is the probe because its unit is a SINGLE ``UPDATE`` with no
-    preceding SELECT — the same property that makes ``record_run_session`` the
+    preceding SELECT — the same property that makes ``complete_run`` the
     right probe for the journal arm.  Do not substitute another write method
     without re-checking it.
     """

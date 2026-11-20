@@ -233,6 +233,23 @@ _PATH_RESOLVE_GUARD_WHY = (
     + _CHEAP_RESOLVE_OWNER_WHY
 )
 
+#: The shared justification of every server/tools.py ``resolve_main_checkout`` row.
+_MAIN_CHECKOUT_COLD_MISS_WHY = (
+    'ROOT CAUSE (one defect): an MCP handler taking a project_root calls '
+    'the nested sync create_mcp_server._normalize_project_root, which '
+    'reaches models/scope.py::resolve_main_checkout -> '
+    'subprocess.run(git). The result is memoised in '
+    '_MAIN_CHECKOUT_CACHE, so this is a COLD-MISS-ONLY fork+exec on the '
+    'loop thread -- exactly the caveat task 3778\'s own census recorded '
+    '("cached but a cold miss runs on the loop thread") and then did '
+    'not act on. One fix closes every row, so no handler is offloaded '
+    'alone. OWNED BY TASK 9822 (S15 α0), which offloads every inline '
+    '_normalize_project_root call with asyncio.to_thread and deletes these '
+    'rows as fixed. Provenance only: task 4484 step-9\'s ticket '
+    'tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ created task 5071, which was '
+    'coalesced into 5270; 5270 handed this cluster to 9822 on 2026-11-14.'
+)
+
 #: Task 6089: run_server canonicalising configured paths before it serves.
 _STARTUP_PATH_RESOLVE_WHY = (
     'ROOT CAUSE (one debt, startup only): run_server canonicalises a '
@@ -789,397 +806,155 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'fused-memory/src/fused_memory/server/tools.py',
         'create_mcp_server.get_tasks',
         '81d0d2709341',
-        'to_file',
-        'ROOT CAUSE (one defect, 22 rows): every MCP handler taking a '
-        'project_root calls the nested sync _normalize_project_root, which '
-        'reaches models/scope.py::resolve_main_checkout -> '
-        'subprocess.run(git). The result is memoised in '
-        '_MAIN_CHECKOUT_CACHE, so this is a COLD-MISS-ONLY fork+exec on the '
-        'loop thread -- exactly the caveat task 3778\'s own census recorded '
-        '("cached but a cold miss runs on the loop thread") and then did '
-        'not act on. 22 rows, one fix: offload or pre-warm '
-        'resolve_main_checkout once. Rows are kept per-site so a 23rd '
-        'handler cannot be added silently under a blessed 22. Follow-up '
-        'filed by task 4484 step-9.'
-        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
+        'filed',
+        _MAIN_CHECKOUT_COLD_MISS_WHY,
     ),
     (
         'fused-memory/src/fused_memory/server/tools.py',
         'create_mcp_server.get_statuses',
         '81d0d2709341',
-        'to_file',
-        'ROOT CAUSE (one defect, 22 rows): every MCP handler taking a '
-        'project_root calls the nested sync _normalize_project_root, which '
-        'reaches models/scope.py::resolve_main_checkout -> '
-        'subprocess.run(git). The result is memoised in '
-        '_MAIN_CHECKOUT_CACHE, so this is a COLD-MISS-ONLY fork+exec on the '
-        'loop thread -- exactly the caveat task 3778\'s own census recorded '
-        '("cached but a cold miss runs on the loop thread") and then did '
-        'not act on. 22 rows, one fix: offload or pre-warm '
-        'resolve_main_checkout once. Rows are kept per-site so a 23rd '
-        'handler cannot be added silently under a blessed 22. Follow-up '
-        'filed by task 4484 step-9.'
-        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
+        'filed',
+        _MAIN_CHECKOUT_COLD_MISS_WHY,
     ),
     (
         'fused-memory/src/fused_memory/server/tools.py',
         'create_mcp_server.get_external_statuses',
         '81d0d2709341',
-        'to_file',
-        'ROOT CAUSE (one defect, 22 rows): every MCP handler taking a '
-        'project_root calls the nested sync _normalize_project_root, which '
-        'reaches models/scope.py::resolve_main_checkout -> '
-        'subprocess.run(git). The result is memoised in '
-        '_MAIN_CHECKOUT_CACHE, so this is a COLD-MISS-ONLY fork+exec on the '
-        'loop thread -- exactly the caveat task 3778\'s own census recorded '
-        '("cached but a cold miss runs on the loop thread") and then did '
-        'not act on. 22 rows, one fix: offload or pre-warm '
-        'resolve_main_checkout once. Rows are kept per-site so a 23rd '
-        'handler cannot be added silently under a blessed 22. Follow-up '
-        'filed by task 4484 step-9.'
-        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
+        'filed',
+        _MAIN_CHECKOUT_COLD_MISS_WHY,
     ),
     (
         'fused-memory/src/fused_memory/server/tools.py',
         'create_mcp_server.get_task',
         '81d0d2709341',
-        'to_file',
-        'ROOT CAUSE (one defect, 22 rows): every MCP handler taking a '
-        'project_root calls the nested sync _normalize_project_root, which '
-        'reaches models/scope.py::resolve_main_checkout -> '
-        'subprocess.run(git). The result is memoised in '
-        '_MAIN_CHECKOUT_CACHE, so this is a COLD-MISS-ONLY fork+exec on the '
-        'loop thread -- exactly the caveat task 3778\'s own census recorded '
-        '("cached but a cold miss runs on the loop thread") and then did '
-        'not act on. 22 rows, one fix: offload or pre-warm '
-        'resolve_main_checkout once. Rows are kept per-site so a 23rd '
-        'handler cannot be added silently under a blessed 22. Follow-up '
-        'filed by task 4484 step-9.'
-        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
+        'filed',
+        _MAIN_CHECKOUT_COLD_MISS_WHY,
     ),
     (
         'fused-memory/src/fused_memory/server/tools.py',
         'create_mcp_server.set_task_status',
         '81d0d2709341',
-        'to_file',
-        'ROOT CAUSE (one defect, 22 rows): every MCP handler taking a '
-        'project_root calls the nested sync _normalize_project_root, which '
-        'reaches models/scope.py::resolve_main_checkout -> '
-        'subprocess.run(git). The result is memoised in '
-        '_MAIN_CHECKOUT_CACHE, so this is a COLD-MISS-ONLY fork+exec on the '
-        'loop thread -- exactly the caveat task 3778\'s own census recorded '
-        '("cached but a cold miss runs on the loop thread") and then did '
-        'not act on. 22 rows, one fix: offload or pre-warm '
-        'resolve_main_checkout once. Rows are kept per-site so a 23rd '
-        'handler cannot be added silently under a blessed 22. Follow-up '
-        'filed by task 4484 step-9.'
-        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
+        'filed',
+        _MAIN_CHECKOUT_COLD_MISS_WHY,
     ),
     (
         'fused-memory/src/fused_memory/server/tools.py',
         'create_mcp_server.set_task_claimant',
         '81d0d2709341',
-        'to_file',
-        'ROOT CAUSE (one defect, 22 rows): every MCP handler taking a '
-        'project_root calls the nested sync _normalize_project_root, which '
-        'reaches models/scope.py::resolve_main_checkout -> '
-        'subprocess.run(git). The result is memoised in '
-        '_MAIN_CHECKOUT_CACHE, so this is a COLD-MISS-ONLY fork+exec on the '
-        'loop thread -- exactly the caveat task 3778\'s own census recorded '
-        '("cached but a cold miss runs on the loop thread") and then did '
-        'not act on. 22 rows, one fix: offload or pre-warm '
-        'resolve_main_checkout once. Rows are kept per-site so a 23rd '
-        'handler cannot be added silently under a blessed 22. Follow-up '
-        'filed by task 4484 step-9.'
-        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
+        'filed',
+        _MAIN_CHECKOUT_COLD_MISS_WHY,
     ),
     (
         'fused-memory/src/fused_memory/server/tools.py',
         'create_mcp_server.submit_task',
         '81d0d2709341',
-        'to_file',
-        'ROOT CAUSE (one defect, 22 rows): every MCP handler taking a '
-        'project_root calls the nested sync _normalize_project_root, which '
-        'reaches models/scope.py::resolve_main_checkout -> '
-        'subprocess.run(git). The result is memoised in '
-        '_MAIN_CHECKOUT_CACHE, so this is a COLD-MISS-ONLY fork+exec on the '
-        'loop thread -- exactly the caveat task 3778\'s own census recorded '
-        '("cached but a cold miss runs on the loop thread") and then did '
-        'not act on. 22 rows, one fix: offload or pre-warm '
-        'resolve_main_checkout once. Rows are kept per-site so a 23rd '
-        'handler cannot be added silently under a blessed 22. Follow-up '
-        'filed by task 4484 step-9.'
-        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
+        'filed',
+        _MAIN_CHECKOUT_COLD_MISS_WHY,
     ),
     (
         'fused-memory/src/fused_memory/server/tools.py',
         'create_mcp_server.resolve_ticket',
         '81d0d2709341',
-        'to_file',
-        'ROOT CAUSE (one defect, 22 rows): every MCP handler taking a '
-        'project_root calls the nested sync _normalize_project_root, which '
-        'reaches models/scope.py::resolve_main_checkout -> '
-        'subprocess.run(git). The result is memoised in '
-        '_MAIN_CHECKOUT_CACHE, so this is a COLD-MISS-ONLY fork+exec on the '
-        'loop thread -- exactly the caveat task 3778\'s own census recorded '
-        '("cached but a cold miss runs on the loop thread") and then did '
-        'not act on. 22 rows, one fix: offload or pre-warm '
-        'resolve_main_checkout once. Rows are kept per-site so a 23rd '
-        'handler cannot be added silently under a blessed 22. Follow-up '
-        'filed by task 4484 step-9.'
-        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
+        'filed',
+        _MAIN_CHECKOUT_COLD_MISS_WHY,
     ),
     (
         'fused-memory/src/fused_memory/server/tools.py',
         'create_mcp_server.list_tickets',
         '81d0d2709341',
-        'to_file',
-        'ROOT CAUSE (one defect, 22 rows): every MCP handler taking a '
-        'project_root calls the nested sync _normalize_project_root, which '
-        'reaches models/scope.py::resolve_main_checkout -> '
-        'subprocess.run(git). The result is memoised in '
-        '_MAIN_CHECKOUT_CACHE, so this is a COLD-MISS-ONLY fork+exec on the '
-        'loop thread -- exactly the caveat task 3778\'s own census recorded '
-        '("cached but a cold miss runs on the loop thread") and then did '
-        'not act on. 22 rows, one fix: offload or pre-warm '
-        'resolve_main_checkout once. Rows are kept per-site so a 23rd '
-        'handler cannot be added silently under a blessed 22. Follow-up '
-        'filed by task 4484 step-9.'
-        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
+        'filed',
+        _MAIN_CHECKOUT_COLD_MISS_WHY,
     ),
     (
         'fused-memory/src/fused_memory/server/tools.py',
         'create_mcp_server.search_tasks',
         '81d0d2709341',
-        'to_file',
-        'ROOT CAUSE (one defect, 22 rows): every MCP handler taking a '
-        'project_root calls the nested sync _normalize_project_root, which '
-        'reaches models/scope.py::resolve_main_checkout -> '
-        'subprocess.run(git). The result is memoised in '
-        '_MAIN_CHECKOUT_CACHE, so this is a COLD-MISS-ONLY fork+exec on the '
-        'loop thread -- exactly the caveat task 3778\'s own census recorded '
-        '("cached but a cold miss runs on the loop thread") and then did '
-        'not act on. 22 rows, one fix: offload or pre-warm '
-        'resolve_main_checkout once. Rows are kept per-site so a 23rd '
-        'handler cannot be added silently under a blessed 22. Follow-up '
-        'filed by task 4484 step-9.'
-        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
+        'filed',
+        _MAIN_CHECKOUT_COLD_MISS_WHY,
     ),
     (
         'fused-memory/src/fused_memory/server/tools.py',
         'create_mcp_server.commit_planning',
         '81d0d2709341',
-        'to_file',
-        'ROOT CAUSE (one defect, 22 rows): every MCP handler taking a '
-        'project_root calls the nested sync _normalize_project_root, which '
-        'reaches models/scope.py::resolve_main_checkout -> '
-        'subprocess.run(git). The result is memoised in '
-        '_MAIN_CHECKOUT_CACHE, so this is a COLD-MISS-ONLY fork+exec on the '
-        'loop thread -- exactly the caveat task 3778\'s own census recorded '
-        '("cached but a cold miss runs on the loop thread") and then did '
-        'not act on. 22 rows, one fix: offload or pre-warm '
-        'resolve_main_checkout once. Rows are kept per-site so a 23rd '
-        'handler cannot be added silently under a blessed 22. Follow-up '
-        'filed by task 4484 step-9.'
-        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
+        'filed',
+        _MAIN_CHECKOUT_COLD_MISS_WHY,
     ),
     (
         'fused-memory/src/fused_memory/server/tools.py',
         'create_mcp_server.update_task',
         '81d0d2709341',
-        'to_file',
-        'ROOT CAUSE (one defect, 22 rows): every MCP handler taking a '
-        'project_root calls the nested sync _normalize_project_root, which '
-        'reaches models/scope.py::resolve_main_checkout -> '
-        'subprocess.run(git). The result is memoised in '
-        '_MAIN_CHECKOUT_CACHE, so this is a COLD-MISS-ONLY fork+exec on the '
-        'loop thread -- exactly the caveat task 3778\'s own census recorded '
-        '("cached but a cold miss runs on the loop thread") and then did '
-        'not act on. 22 rows, one fix: offload or pre-warm '
-        'resolve_main_checkout once. Rows are kept per-site so a 23rd '
-        'handler cannot be added silently under a blessed 22. Follow-up '
-        'filed by task 4484 step-9.'
-        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
+        'filed',
+        _MAIN_CHECKOUT_COLD_MISS_WHY,
     ),
     (
         'fused-memory/src/fused_memory/server/tools.py',
         'create_mcp_server.remove_task',
         '81d0d2709341',
-        'to_file',
-        'ROOT CAUSE (one defect, 22 rows): every MCP handler taking a '
-        'project_root calls the nested sync _normalize_project_root, which '
-        'reaches models/scope.py::resolve_main_checkout -> '
-        'subprocess.run(git). The result is memoised in '
-        '_MAIN_CHECKOUT_CACHE, so this is a COLD-MISS-ONLY fork+exec on the '
-        'loop thread -- exactly the caveat task 3778\'s own census recorded '
-        '("cached but a cold miss runs on the loop thread") and then did '
-        'not act on. 22 rows, one fix: offload or pre-warm '
-        'resolve_main_checkout once. Rows are kept per-site so a 23rd '
-        'handler cannot be added silently under a blessed 22. Follow-up '
-        'filed by task 4484 step-9.'
-        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
+        'filed',
+        _MAIN_CHECKOUT_COLD_MISS_WHY,
     ),
     (
         'fused-memory/src/fused_memory/server/tools.py',
         'create_mcp_server.add_dependency',
         '81d0d2709341',
-        'to_file',
-        'ROOT CAUSE (one defect, 22 rows): every MCP handler taking a '
-        'project_root calls the nested sync _normalize_project_root, which '
-        'reaches models/scope.py::resolve_main_checkout -> '
-        'subprocess.run(git). The result is memoised in '
-        '_MAIN_CHECKOUT_CACHE, so this is a COLD-MISS-ONLY fork+exec on the '
-        'loop thread -- exactly the caveat task 3778\'s own census recorded '
-        '("cached but a cold miss runs on the loop thread") and then did '
-        'not act on. 22 rows, one fix: offload or pre-warm '
-        'resolve_main_checkout once. Rows are kept per-site so a 23rd '
-        'handler cannot be added silently under a blessed 22. Follow-up '
-        'filed by task 4484 step-9.'
-        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
+        'filed',
+        _MAIN_CHECKOUT_COLD_MISS_WHY,
     ),
     (
         'fused-memory/src/fused_memory/server/tools.py',
         'create_mcp_server.remove_dependency',
         '81d0d2709341',
-        'to_file',
-        'ROOT CAUSE (one defect, 22 rows): every MCP handler taking a '
-        'project_root calls the nested sync _normalize_project_root, which '
-        'reaches models/scope.py::resolve_main_checkout -> '
-        'subprocess.run(git). The result is memoised in '
-        '_MAIN_CHECKOUT_CACHE, so this is a COLD-MISS-ONLY fork+exec on the '
-        'loop thread -- exactly the caveat task 3778\'s own census recorded '
-        '("cached but a cold miss runs on the loop thread") and then did '
-        'not act on. 22 rows, one fix: offload or pre-warm '
-        'resolve_main_checkout once. Rows are kept per-site so a 23rd '
-        'handler cannot be added silently under a blessed 22. Follow-up '
-        'filed by task 4484 step-9.'
-        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
+        'filed',
+        _MAIN_CHECKOUT_COLD_MISS_WHY,
     ),
     (
         'fused-memory/src/fused_memory/server/tools.py',
         'create_mcp_server.set_task_priority_override',
         '81d0d2709341',
-        'to_file',
-        'ROOT CAUSE (one defect, 22 rows): every MCP handler taking a '
-        'project_root calls the nested sync _normalize_project_root, which '
-        'reaches models/scope.py::resolve_main_checkout -> '
-        'subprocess.run(git). The result is memoised in '
-        '_MAIN_CHECKOUT_CACHE, so this is a COLD-MISS-ONLY fork+exec on the '
-        'loop thread -- exactly the caveat task 3778\'s own census recorded '
-        '("cached but a cold miss runs on the loop thread") and then did '
-        'not act on. 22 rows, one fix: offload or pre-warm '
-        'resolve_main_checkout once. Rows are kept per-site so a 23rd '
-        'handler cannot be added silently under a blessed 22. Follow-up '
-        'filed by task 4484 step-9.'
-        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
+        'filed',
+        _MAIN_CHECKOUT_COLD_MISS_WHY,
     ),
     (
         'fused-memory/src/fused_memory/server/tools.py',
         'create_mcp_server.clear_task_priority_override',
         '81d0d2709341',
-        'to_file',
-        'ROOT CAUSE (one defect, 22 rows): every MCP handler taking a '
-        'project_root calls the nested sync _normalize_project_root, which '
-        'reaches models/scope.py::resolve_main_checkout -> '
-        'subprocess.run(git). The result is memoised in '
-        '_MAIN_CHECKOUT_CACHE, so this is a COLD-MISS-ONLY fork+exec on the '
-        'loop thread -- exactly the caveat task 3778\'s own census recorded '
-        '("cached but a cold miss runs on the loop thread") and then did '
-        'not act on. 22 rows, one fix: offload or pre-warm '
-        'resolve_main_checkout once. Rows are kept per-site so a 23rd '
-        'handler cannot be added silently under a blessed 22. Follow-up '
-        'filed by task 4484 step-9.'
-        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
+        'filed',
+        _MAIN_CHECKOUT_COLD_MISS_WHY,
     ),
     (
         'fused-memory/src/fused_memory/server/tools.py',
         'create_mcp_server.reorder_pin_queue',
         '81d0d2709341',
-        'to_file',
-        'ROOT CAUSE (one defect, 22 rows): every MCP handler taking a '
-        'project_root calls the nested sync _normalize_project_root, which '
-        'reaches models/scope.py::resolve_main_checkout -> '
-        'subprocess.run(git). The result is memoised in '
-        '_MAIN_CHECKOUT_CACHE, so this is a COLD-MISS-ONLY fork+exec on the '
-        'loop thread -- exactly the caveat task 3778\'s own census recorded '
-        '("cached but a cold miss runs on the loop thread") and then did '
-        'not act on. 22 rows, one fix: offload or pre-warm '
-        'resolve_main_checkout once. Rows are kept per-site so a 23rd '
-        'handler cannot be added silently under a blessed 22. Follow-up '
-        'filed by task 4484 step-9.'
-        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
+        'filed',
+        _MAIN_CHECKOUT_COLD_MISS_WHY,
     ),
     (
         'fused-memory/src/fused_memory/server/tools.py',
         'create_mcp_server.get_pin_queue',
         '81d0d2709341',
-        'to_file',
-        'ROOT CAUSE (one defect, 22 rows): every MCP handler taking a '
-        'project_root calls the nested sync _normalize_project_root, which '
-        'reaches models/scope.py::resolve_main_checkout -> '
-        'subprocess.run(git). The result is memoised in '
-        '_MAIN_CHECKOUT_CACHE, so this is a COLD-MISS-ONLY fork+exec on the '
-        'loop thread -- exactly the caveat task 3778\'s own census recorded '
-        '("cached but a cold miss runs on the loop thread") and then did '
-        'not act on. 22 rows, one fix: offload or pre-warm '
-        'resolve_main_checkout once. Rows are kept per-site so a 23rd '
-        'handler cannot be added silently under a blessed 22. Follow-up '
-        'filed by task 4484 step-9.'
-        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
+        'filed',
+        _MAIN_CHECKOUT_COLD_MISS_WHY,
     ),
     (
         'fused-memory/src/fused_memory/server/tools.py',
         'create_mcp_server.get_scheduler_state',
         '81d0d2709341',
-        'to_file',
-        'ROOT CAUSE (one defect, 22 rows): every MCP handler taking a '
-        'project_root calls the nested sync _normalize_project_root, which '
-        'reaches models/scope.py::resolve_main_checkout -> '
-        'subprocess.run(git). The result is memoised in '
-        '_MAIN_CHECKOUT_CACHE, so this is a COLD-MISS-ONLY fork+exec on the '
-        'loop thread -- exactly the caveat task 3778\'s own census recorded '
-        '("cached but a cold miss runs on the loop thread") and then did '
-        'not act on. 22 rows, one fix: offload or pre-warm '
-        'resolve_main_checkout once. Rows are kept per-site so a 23rd '
-        'handler cannot be added silently under a blessed 22. Follow-up '
-        'filed by task 4484 step-9.'
-        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
+        'filed',
+        _MAIN_CHECKOUT_COLD_MISS_WHY,
     ),
     (
         'fused-memory/src/fused_memory/server/tools.py',
         'create_mcp_server.get_scheduler_events',
         '81d0d2709341',
-        'to_file',
-        'ROOT CAUSE (one defect, 22 rows): every MCP handler taking a '
-        'project_root calls the nested sync _normalize_project_root, which '
-        'reaches models/scope.py::resolve_main_checkout -> '
-        'subprocess.run(git). The result is memoised in '
-        '_MAIN_CHECKOUT_CACHE, so this is a COLD-MISS-ONLY fork+exec on the '
-        'loop thread -- exactly the caveat task 3778\'s own census recorded '
-        '("cached but a cold miss runs on the loop thread") and then did '
-        'not act on. 22 rows, one fix: offload or pre-warm '
-        'resolve_main_checkout once. Rows are kept per-site so a 23rd '
-        'handler cannot be added silently under a blessed 22. Follow-up '
-        'filed by task 4484 step-9.'
-        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
+        'filed',
+        _MAIN_CHECKOUT_COLD_MISS_WHY,
     ),
     (
         'fused-memory/src/fused_memory/server/tools.py',
         'create_mcp_server.request_park_eviction',
         '81d0d2709341',
-        'to_file',
-        'ROOT CAUSE (one defect, 22 rows): every MCP handler taking a '
-        'project_root calls the nested sync _normalize_project_root, which '
-        'reaches models/scope.py::resolve_main_checkout -> '
-        'subprocess.run(git). The result is memoised in '
-        '_MAIN_CHECKOUT_CACHE, so this is a COLD-MISS-ONLY fork+exec on the '
-        'loop thread -- exactly the caveat task 3778\'s own census recorded '
-        '("cached but a cold miss runs on the loop thread") and then did '
-        'not act on. 22 rows, one fix: offload or pre-warm '
-        'resolve_main_checkout once. Rows are kept per-site so a 23rd '
-        'handler cannot be added silently under a blessed 22. Follow-up '
-        'filed by task 4484 step-9.'
-        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
+        'filed',
+        _MAIN_CHECKOUT_COLD_MISS_WHY,
     ),
     (
         'fused-memory/src/fused_memory/server/tools.py',
@@ -1192,14 +967,8 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'fused-memory/src/fused_memory/server/tools.py',
         'create_mcp_server.find_tasks_by_metadata',
         '81d0d2709341',
-        'to_file',
-        'SAME ROOT CAUSE as the server/tools.py::_normalize_project_root '
-        'cluster above, added deliberately as its 23rd handler by task '
-        '6385: the cold-miss-only subprocess.run(git) in '
-        'models/scope.py::resolve_main_checkout, memoised by '
-        '_MAIN_CHECKOUT_CACHE. Offloading it here alone would diverge from '
-        'the 22 siblings that one shared fix closes together.'
-        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
+        'filed',
+        _MAIN_CHECKOUT_COLD_MISS_WHY,
     ),
 ]
 

@@ -12683,19 +12683,18 @@ class TestMemoryMetadataValidationAtSeam:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
-    async def test_kind_registry_carve_out_is_real(self, service, entry_point, caplog):
-        """`enforce=True` + `enforce_kind_registry=False`: unknown kind warns
-        and PROCEEDS, while a bad slug in the same call still raises.
+    async def test_unknown_kind_never_rejects_even_under_enforce(self, service, entry_point, caplog):
+        """With `enforce=True` an unknown kind warns and the write PROCEEDS,
+        while a bad slug under the same flag still raises.
 
-        The carve-out has to be checked in one call, not two: a validator
-        that simply downgraded everything under the kind flag would pass two
-        separate tests while silently disabling the shape checks too.
+        A census-only axis must not silently disable the shape checks: a
+        validator that downgraded every violation alongside `kind` would pass
+        a kind-only test while letting the bad slug through.
         """
         from fused_memory.memory_metadata import MemoryMetadataValidationError
 
         caplog.set_level(logging.WARNING, logger=_MM_CENSUS_LOGGER)
         service.config.memory_metadata.enforce = True
-        service.config.memory_metadata.enforce_kind_registry = False
 
         await _mm_write(service, entry_point, metadata={'kind': 'invented_kind_xyz'})
         _mm_backend_mock(service, entry_point).assert_awaited_once()

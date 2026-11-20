@@ -1219,33 +1219,29 @@ class TestArmMetricStemParity:
     The gate decides on arms; the sampler records metrics; the calibration
     gates (tasks 5219/5220) read one against the other. The metric side is the
     table's projection, sampler.metrics.ARM_METRICS. The arm side is read from
-    the live artifact, shared.psi._ARMS: a private name deliberately, because
-    it IS the saturation truth table and a copy of it here would be the drift
-    this test exists to catch.
+    shared.psi.ARM_FIELDS, the public projection of the saturation truth table.
     """
 
-    @staticmethod
-    def _arm_fields():
-        from shared.psi import _ARMS
-
-        return {arm.field for arm in _ARMS}
-
     def test_every_arm_is_recorded_by_a_table_metric(self):
+        from shared.psi import ARM_FIELDS
+
         from sampler.metrics import ARM_METRICS
 
-        missing = self._arm_fields() - set(ARM_METRICS)
+        missing = ARM_FIELDS - set(ARM_METRICS)
         assert not missing, (
-            f'shared.psi._ARMS has arms no MetricSpec records: {sorted(missing)}. '
+            f'shared.psi.ARM_FIELDS has arms no MetricSpec records: {sorted(missing)}. '
             'Give the recording spec in sampler.metrics.METRIC_GROUPS that arm, or '
             'the gate will hold on a signal the calibration corpus cannot see.'
         )
 
     def test_no_table_arm_is_orphaned(self):
+        from shared.psi import ARM_FIELDS
+
         from sampler.metrics import ARM_METRICS
 
-        orphans = set(ARM_METRICS) - self._arm_fields()
+        orphans = set(ARM_METRICS) - ARM_FIELDS
         assert not orphans, (
-            f'sampler.metrics.METRIC_GROUPS names arms that shared.psi._ARMS does not '
+            f'sampler.metrics.METRIC_GROUPS names arms that shared.psi.ARM_FIELDS does not '
             f'have: {sorted(orphans)}.'
         )
 

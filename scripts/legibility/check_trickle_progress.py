@@ -58,17 +58,15 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-# The deterministic runner EXECs a bound predicate directly
-# (`deterministic_runner._default_run_script` ->
-# `asyncio.create_subprocess_exec(script, *args)`) — no `uv run` wrapper,
-# no project venv, no package context. So `trickle_state` must be
-# importable as a bare top-level module from this file's own directory.
-# DO NOT "clean this up" into a package-relative import: it would break the
-# predicate at DISPATCH time, not at test time.
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+# The deterministic runner (`deterministic_runner._default_run_script` ->
+# `asyncio.create_subprocess_exec(script, *args)`) and check_trickle_health
+# EXEC this file directly: no `uv run` wrapper, no project venv, no package
+# context. So it binds scripts/ itself and reaches its siblings by the one
+# package spelling, `legibility.<mod>`, which a namespace package resolves
+# even under `python3 -I -S`.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import state_docs
-import trickle_state
+from legibility import state_docs, trickle_state
 
 USAGE = (
     'usage: check_trickle_progress.py <project_id> <max_barren_runs> '

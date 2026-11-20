@@ -55,7 +55,7 @@ the one caller least likely to notice.
 PRECEDENT.  This generalises the ``_reprobe_last_info`` /
 ``REPROBE_STILL_DOWN_INFO_SWEEPS`` rate-limiter already in
 ``orchestrator/merge_lane/worker.py`` (see its emitter in
-``SpeculativeMergeWorker._reprobe_quarantined_hosts``),
+``merge_lane/host_quarantine.py::HostQuarantine._reprobe_quarantined_hosts``),
 whose three shape decisions are adopted verbatim: log immediately on any
 CHANGE and throttle only the unchanged repeat; emit suppressed polls at DEBUG
 rather than dropping them, so nothing is ever actually lost; and select the

@@ -29,10 +29,10 @@ from _real_project_slice import RealProjectSlice
 from _real_project_slice import real_project_slice as real_project_slice
 
 from orchestrator.config import FusedMemoryConfig, ModuleConfig, OrchestratorConfig
-from orchestrator.merge_lane.worker import (
+from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
+from orchestrator.merge_lane.verify_failure_outcome import (
     TRANSIENT_INFRA_REASON_PREFIX,
-    _DryRunInvestigationHandles,
-    _run_post_merge_verify,
+    DryRunInvestigationHandles,
 )
 from orchestrator.verify import (
     CheckRun,
@@ -372,11 +372,11 @@ class TestMergeLaneHoldsScopeSpawnFailure:
         verifier = FakeVerifier(default=VerifyScript(result=spawn_failed))
         timeouts: dict[str, int] = {}
 
-        outcome = await _run_post_merge_verify(
+        outcome = await run_post_merge_verify(
             _make_git_ops(), _make_req(tmp_path), MagicMock(),
             timeouts=timeouts, enospc_retries={},
             max_timeouts=2, max_enospc=1,
-            dry_run_handles=_DryRunInvestigationHandles(scheduler=MagicMock()),
+            dry_run_handles=DryRunInvestigationHandles(scheduler=MagicMock()),
             verifier=verifier,
         )
 
@@ -393,7 +393,7 @@ class TestMergeLaneHoldsScopeSpawnFailure:
         spawn_failed = await _scoped_cockpit_merge_verify(worktree)
         verifier = FakeVerifier(sequence=[VerifyScript(result=spawn_failed)])
 
-        outcome = await _run_post_merge_verify(
+        outcome = await run_post_merge_verify(
             _make_git_ops(), _make_req(tmp_path), MagicMock(),
             timeouts={}, enospc_retries={},
             max_timeouts=2, max_enospc=1,

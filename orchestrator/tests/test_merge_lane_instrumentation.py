@@ -248,7 +248,7 @@ async def _halted_mid_verify(
     store = _LateArrivalFakeEventStore()
 
     async with _running_lane(git_ops, verifier=verifier, event_store=store) as (lane, queue):
-        lane.VERIFY_ABANDON_POLL_SECS = 0.02
+        lane.verify_dispatch.VERIFY_ABANDON_POLL_SECS = 0.02
         if warm_up is not None:
             warm = await _submitted(git_ops, config, warm_up)
             await queue.put(warm)

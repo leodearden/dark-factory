@@ -73,55 +73,22 @@ tests.
 
 No sleeps, no network, no skips: if git is unavailable these fail loudly
 rather than silently skipping (the repo's no-silent-fail-soft invariant).
+Every fixture repo carries the esc-3072-3 isolation guards through
+``_ladder_git.py::new_repo``.
 """
 
 from __future__ import annotations
 
 import asyncio
 import re
-import subprocess
 from pathlib import Path
+
+from _ladder_git import commit, git, git_rc, new_repo
 
 from orchestrator.config import GitConfig
 from orchestrator.git_ops import DEFAULT_COMMIT_CITATION_PATTERN, GitOps, render_citation_pattern
 
 TASK_ID = '4924'
-
-# Deterministic identity + no signing, so subjects and shas are stable and
-# the tests never depend on the developer's git config.
-_GIT_ENV_ARGS = [
-    '-c', 'user.name=Test',
-    '-c', 'user.email=test@test.com',
-    '-c', 'commit.gpgsign=false',
-]
-
-
-def _git(root: Path, *args: str) -> str:
-    """Run git in *root* and return stripped stdout (raises on non-zero)."""
-    return subprocess.run(
-        ['git', *_GIT_ENV_ARGS, *args],
-        cwd=root, check=True, capture_output=True, text=True,
-    ).stdout.strip()
-
-
-def _git_rc(root: Path, *args: str) -> int:
-    """Run git in *root* and return only its exit code."""
-    return subprocess.run(
-        ['git', *_GIT_ENV_ARGS, *args], cwd=root, capture_output=True, text=True,
-    ).returncode
-
-
-def _commit(root: Path, subject: str, content: str) -> str:
-    """Write `f.txt`, commit it with *subject*, and return the new sha."""
-    (root / 'f.txt').write_text(content)
-    _git(root, 'add', 'f.txt')
-    _git(root, 'commit', '-m', subject)
-    return _git(root, 'rev-parse', 'HEAD')
-
-
-def _new_repo(root: Path) -> None:
-    root.mkdir()
-    _git(root, 'init', '-b', 'main')
 
 
 def _real_citation_walk(root: Path, tid: str) -> str | None:
@@ -152,7 +119,7 @@ def _citation_walk(root: Path, tid: str) -> str | None:
         DEFAULT_COMMIT_CITATION_PATTERN, tid, branch_prefix='task/', main_branch='main',
     )
     compiled = re.compile(pattern_str)
-    out = _git(
+    out = git(
         root, 'log', 'main', '--extended-regexp',
         f'--grep={pattern_str}', '--format=%H%x1f%s',
     )
@@ -184,21 +151,21 @@ def test_sibling_covered_phantom_branch_fires_the_gate_with_a_workless_tip(
     carries any of its work.
     """
     root = tmp_path / 'repo'
-    _new_repo(root)
+    new_repo(root)
 
     # B: a realistic branch base -- some *other* task's landing on main.
-    base = _commit(root, 'Merge task/4700 into main', 'one\n')
+    base = commit(root, 'Merge task/4700 into main', 'base.txt')
 
     # The task branch is created at B and never advances.
-    _git(root, 'branch', f'task/{TASK_ID}', base)
+    git(root, 'branch', f'task/{TASK_ID}', base)
 
     # S: a sibling's landing commit on main, citing this task via the
     # unanchored `\(#?{tid}\)` alternative.
-    _git(root, 'checkout', 'main')
-    sibling = _commit(root, f'impl(4701): sweep provenance (#{TASK_ID})', 'two\n')
+    git(root, 'checkout', 'main')
+    sibling = commit(root, f'impl(4701): sweep provenance (#{TASK_ID})', 'sibling.txt')
 
     # Step 4: degenerate ancestry passes trivially.
-    assert _git_rc(root, 'merge-base', '--is-ancestor', f'task/{TASK_ID}', 'main') == 0, (
+    assert git_rc(root, 'merge-base', '--is-ancestor', f'task/{TASK_ID}', 'main') == 0, (
         'a branch that never advanced must still pass --is-ancestor against main; '
         'if this stops holding, the rc=0 arm is no longer reachable in this state'
     )
@@ -214,7 +181,7 @@ def test_sibling_covered_phantom_branch_fires_the_gate_with_a_workless_tip(
     )
 
     # Step 3: the group/train-merge probe yields no candidate either.
-    assert _git(
+    assert git(
         root, 'rev-list', '--ancestry-path', '--merges', f'task/{TASK_ID}..main',
     ) == '', 'expected no ancestry-path merge candidate for a branch that never advanced'
 
@@ -233,13 +200,13 @@ def test_sibling_covered_phantom_branch_fires_the_gate_with_a_workless_tip(
     )
 
     # ...and the sha the PRE-FIX ladder would have stamped is worthless.
-    tip = _git(root, 'rev-parse', f'task/{TASK_ID}')
+    tip = git(root, 'rev-parse', f'task/{TASK_ID}')
     assert tip == base, 'the phantom branch tip must be main\'s own old base commit'
     assert tip != sibling, 'the tip and the citing sha must be distinct commits'
     compiled = re.compile(render_citation_pattern(
         DEFAULT_COMMIT_CITATION_PATTERN, TASK_ID, branch_prefix='task/', main_branch='main',
     ))
-    base_subject = _git(root, 'log', '-1', '--format=%s', base)
+    base_subject = git(root, 'log', '-1', '--format=%s', base)
     assert not compiled.search(base_subject), (
         f'the branch tip subject {base_subject!r} must NOT cite task {TASK_ID} -- that is '
         'why stamping the tip earns `misattributed` from '
@@ -260,18 +227,18 @@ def test_genuine_fast_forward_citing_commit_is_on_main_and_may_precede_the_tip(
     `escalation/src/escalation/git_authority.py::found_on_main_response`.
     """
     root = tmp_path / 'repo'
-    _new_repo(root)
+    new_repo(root)
 
-    _commit(root, 'Merge task/4700 into main', 'one\n')
+    commit(root, 'Merge task/4700 into main', 'base.txt')
 
-    _git(root, 'checkout', '-b', f'task/{TASK_ID}')
-    citing = _commit(root, f'impl({TASK_ID}): real work', 'two\n')
-    trailing = _commit(root, 'docs: tweak', 'three\n')
+    git(root, 'checkout', '-b', f'task/{TASK_ID}')
+    citing = commit(root, f'impl({TASK_ID}): real work', 'work.txt')
+    trailing = commit(root, 'docs: tweak', 'docs.md')
 
     # Fast-forward main to the branch tip.
-    _git(root, 'checkout', 'main')
-    _git(root, 'merge', '--ff-only', f'task/{TASK_ID}')
-    assert _git(root, 'rev-parse', 'main') == trailing
+    git(root, 'checkout', 'main')
+    git(root, 'merge', '--ff-only', f'task/{TASK_ID}')
+    assert git(root, 'rev-parse', 'main') == trailing
 
     assert _real_citation_walk(root, TASK_ID) == citing, (
         'GitOps.find_task_citation_commit must select this branch\'s own citing '
@@ -283,7 +250,7 @@ def test_genuine_fast_forward_citing_commit_is_on_main_and_may_precede_the_tip(
         'skills/_shared/deriving-landed-sha.md step 4 needs the same change'
     )
 
-    tip = _git(root, 'rev-parse', f'task/{TASK_ID}')
+    tip = git(root, 'rev-parse', f'task/{TASK_ID}')
     assert tip == trailing
     assert citing != tip, (
         'citing sha and branch tip differ even on an honest fast-forward whenever the '
@@ -291,7 +258,7 @@ def test_genuine_fast_forward_citing_commit_is_on_main_and_may_precede_the_tip(
         'exotic one'
     )
 
-    assert _git_rc(root, 'merge-base', '--is-ancestor', citing, 'main') == 0, (
+    assert git_rc(root, 'merge-base', '--is-ancestor', citing, 'main') == 0, (
         'the citing sha must itself be on main -- it is on main by construction '
         '(`git log main` found it), which is what makes the stamp auditable'
     )

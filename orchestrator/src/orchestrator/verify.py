@@ -1974,8 +1974,7 @@ def seed_main_baseline(
     *ids* is the whole tree's failing set at *main_sha*; ``frozenset()``
     means every module is green there. Called from the PASS path of a
     merge+full gate run (merge_sha IS the merged tree that is about to
-    CAS-advance to become the next main tip — see merge_queue.py's
-    ``_run_post_merge_verify``), so in steady state
+    CAS-advance to become the next main tip — see merge_lane/post_merge_verify.py::run_post_merge_verify), so in steady state
     ``main_baseline_failing_ids`` below is a cache hit for as long as that
     SHA is main's tip and never pays for a probe (B2); and from that
     function's own whole-tree cold-start probe.
