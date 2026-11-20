@@ -573,6 +573,57 @@ class TestRequeueReuseSitesRouteThroughGuard:
             'routed through the production acquire_warm_lane entry'
         )
 
+    async def test_live_requeue_catches_a_rebind_that_drops_commits(
+        self, git_repo: Path, monkeypatch,
+    ):
+        """The resume's own re-attach is guarded, not only its rebase (task 10991).
+
+        reify task/10089 lost c770e00ea8 to the resume's ``checkout -B``,
+        BEFORE any rebase ran, so this guard's rebase baseline read 0 -> 0.
+        The stand-in reproduces that pre-fix rebind: it resets the branch to
+        main and reports success.
+        """
+        seed_default_warm_base(git_repo)
+        await _add_warm_lane_scripts(git_repo)
+        _, start_ref_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        start_ref = start_ref_raw.strip()
+        warm_git_ops = GitOps(
+            GitConfig(
+                main_branch='main',
+                branch_prefix='task/',
+                remote='origin',
+                worktree_dir='.worktrees',
+                push_after_advance=False,
+                warm_lane_pool=True,
+            ),
+            git_repo,
+            warm_lane_pool_size=1,
+        )
+        info = await warm_git_ops.acquire_warm_lane('WD', start_ref)
+        assert isinstance(info, WorktreeInfo), f'Acquire failed: {info!r}'
+        lane = info.path
+        await _commit_unique_work(lane, filename='wd_feature.txt')
+        assert await _commits_over_main(lane) == 1
+        tip = await _head_sha(lane)
+
+        async def _pre_fix_rebind(worktree: Path, full_branch: str) -> bool:
+            await _run(['git', 'checkout', '-B', full_branch, 'main'], cwd=worktree)
+            return True
+
+        monkeypatch.setattr(warm_git_ops, 'rebind_branch_to_head', _pre_fix_rebind)
+
+        with pytest.raises(BranchResetError) as excinfo:
+            await warm_git_ops.acquire_warm_lane('WD', start_ref)
+
+        _, ref_raw, _ = await _run(
+            ['git', 'rev-parse', 'refs/heads/task/WD'], cwd=git_repo,
+        )
+        assert ref_raw.strip() == tip
+        assert await _commits_over_main(lane) == 1
+        message = str(excinfo.value)
+        assert 'attach' in message, message
+        assert 'Refusing requeue/inter-iteration rebase' not in message, message
+
 
 # ---------------------------------------------------------------------------
 # step-5: workflow-level wiring — TaskWorkflow._inter_iteration_rebase must
