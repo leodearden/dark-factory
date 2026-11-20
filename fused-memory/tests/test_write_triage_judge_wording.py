@@ -242,9 +242,11 @@ class TestJudgeSystemPromptOverride:
         )
 
     def test_an_empty_prompt_is_refused(self) -> None:
-        with pytest.raises(ValueError, match='lever-x'):
-            with _mod().judge_system_prompt('', label='lever-x'):
-                pass  # pragma: no cover - the enter refuses
+        with (
+            pytest.raises(ValueError, match='lever-x'),
+            _mod().judge_system_prompt('', label='lever-x'),
+        ):
+            pass  # pragma: no cover - the enter refuses
         assert write_triage_judge.JUDGE_SYSTEM_PROMPT is _mod().system_prompt(
             _mod().WORDING_SHIPPED,
         )
