@@ -105,8 +105,9 @@ class SignalCounts(Mapping[detectors.SignalClass, int]):
 @dataclass(frozen=True)
 class TranscriptScan:
     """What one read of a transcript yields: its signal counts, its agent
-    class, the text of its first non-sidechain, non-meta user turn ('' when
-    there is none), and its transcript identity key (the session string the
+    class, the text of its first user turn on its own chain
+    (:func:`detectors.is_primary_user_turn`; '' when there is none), and its
+    transcript identity key (the session string the
     digest frontmatter, and so every coding record and ledger row, carries):
     the first ``sessionId`` any record carries, plus
     ``/subagents/agent-<agentId>`` for a sub-agent transcript, whose
