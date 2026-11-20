@@ -1333,7 +1333,7 @@ def _after_filing(plan: FilingPlan, disposal: disposition.Disposal) -> tuple[dic
     """The plan's codebook with every re-offered (withheld or owed) entry this
     run routed marked filed, each routed decision's back-link, the run's
     follow-ups, and every entry whose filing reached no work marked owed
-    (``census_filing.owed_after_filing``); and the ids of those released
+    (``census_filing.with_owed_after_filing``); and the ids of those released
     entries."""
     run = plan.run
     released_entry_ids = tuple(dict.fromkeys(
@@ -1356,7 +1356,7 @@ def _after_filing(plan: FilingPlan, disposal: disposition.Disposal) -> tuple[dic
         cb, reverified=plan.reverified, refiled=plan.refiled, decisions=disposal.decisions,
         run_id=run.run_id, as_of_sha=run.as_of_sha,
     )
-    cb = census_filing.owed_after_filing(cb, disposal, dry_run=run.dry_run_payloads_path is not None)
+    cb = census_filing.with_owed_after_filing(cb, disposal, dry_run=run.dry_run_payloads_path is not None)
     return cb, released_entry_ids
 
 
@@ -1526,7 +1526,7 @@ def persist(plan: FilingPlan, effects: CensusEffects) -> Done | Unlanded:
         )
     cb, released_entry_ids = _after_filing(plan, disposal)
     cb, resolutions = disposition.resolve_tickets(cb, store=effects.task_store, run_id=run.run_id)
-    cb = census_filing.owed_after_resolving(cb, resolutions)
+    cb = census_filing.with_owed_after_resolving(cb, resolutions)
     # Synthesis corrections land after filing, so this run's filing pairing
     # and sighting counts read the codebook the run verified.
     cb, synthesis_report = _apply_synthesis_corrections(

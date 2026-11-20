@@ -1,4 +1,6 @@
-"""Which clusters a census run files, and the submit_task payloads it files them with."""
+"""Which clusters a census run files, the submit_task payloads it files them
+with, and which entries a run whose filing did not land leaves owed for the
+next run to re-offer."""
 from __future__ import annotations
 
 import json
@@ -241,12 +243,18 @@ def _owed_reofferable(cb: Mapping[str, Any]) -> list[dict]:
     return _open_entries_marked(cb, codebook.ENTRY_FILING_OWED)
 
 
+def _unlanded(fileable: Sequence[tuple[dict, str | None]], entries: Sequence[dict]) -> list[dict]:
+    """Those of *entries* no *fileable* cluster, given with the id of the
+    entry it landed on, landed on."""
+    landed = {entry_id for _cluster, entry_id in fileable}
+    return [entry for entry in entries if entry["id"] not in landed]
+
+
 def withheld_awaiting_count(fileable: Sequence[tuple[dict, str | None]], cb: Mapping[str, Any]) -> list[dict]:
     """The withheld entries of *cb* still open to filing that no *fileable*
     cluster, given with the id of the entry it landed on, releases: the ones
     only their own sighting count can release."""
-    released = {entry_id for _cluster, entry_id in fileable}
-    return [entry for entry in _withheld_releasable(cb) if entry["id"] not in released]
+    return _unlanded(fileable, _withheld_releasable(cb))
 
 
 def entry_releases(cb: Mapping[str, Any], entry: Mapping[str, Any], sighting_count: int) -> bool:
@@ -273,26 +281,23 @@ def filing_queue(fileable: list[tuple[dict, str | None]], cb: dict) -> list[Pend
     cluster was verified present at as_of_sha this run; a re-offered entry
     rebuilt by ``entry_cluster`` was verified by an earlier run, so it is
     not."""
-    reofferable_ids = {entry["id"] for entry in (*_withheld_releasable(cb), *_owed_reofferable(cb))}
+    withheld = _withheld_releasable(cb)
+    owed = _owed_reofferable(cb)
+    reofferable_ids = {entry["id"] for entry in (*withheld, *owed)}
 
     queue = []
     for cluster, landed_entry_id in fileable:
         reoffered_entry_id = landed_entry_id if landed_entry_id in reofferable_ids else None
         queue.append(PendingFiling(cluster, reoffered_entry_id, landed_entry_id, verified_present=True))
-    for entry in withheld_awaiting_count(fileable, cb):
+    for entry in _unlanded(fileable, withheld):
         if entry_releases(cb, entry, len(sighting_fit.counted_sessions(cb, entry))):
             queue.append(PendingFiling(entry_cluster(cb, entry), entry["id"], entry["id"]))
-    landed = {entry_id for _cluster, entry_id in fileable}
-    for entry in _owed_reofferable(cb):
-        if entry["id"] not in landed:
-            queue.append(PendingFiling(entry_cluster(cb, entry), entry["id"], entry["id"]))
+    for entry in _unlanded(fileable, owed):
+        queue.append(PendingFiling(entry_cluster(cb, entry), entry["id"], entry["id"]))
     return queue
 
 
-_REOFFER_MARKERS = frozenset({codebook.ENTRY_FILING_WITHHELD, codebook.ENTRY_FILING_OWED})
-
-
-def owed_after_filing(cb: dict, disposal: disposition.Disposal, *, dry_run: bool) -> dict:
+def with_owed_after_filing(cb: dict, disposal: disposition.Disposal, *, dry_run: bool) -> dict:
     """*cb* with every entry whose filing this run reached no work marked owed:
     the entries of decisions that routed nothing, and those of filings the
     protocol never decided (the dedup store was unreachable), less every entry
@@ -306,7 +311,7 @@ def owed_after_filing(cb: dict, disposal: disposition.Disposal, *, dry_run: bool
     return _owe(cb, [entry_id for entry_id in stranded if entry_id not in routed])
 
 
-def owed_after_resolving(cb: dict, resolutions: disposition.Resolutions) -> dict:
+def with_owed_after_resolving(cb: dict, resolutions: disposition.Resolutions) -> dict:
     """*cb* with the entry of every ticket the curator never decided marked
     owed: one resolved FAILED (expired, server restart). REFUSED and
     CANCELLED are decisions a re-filing would override, and an undecided
@@ -319,17 +324,16 @@ def owed_after_resolving(cb: dict, resolutions: disposition.Resolutions) -> dict
 
 
 def _owe(cb: dict, entry_ids: Sequence[str | None]) -> dict:
-    """*cb* with each of *entry_ids* marked owed, unless its marker already
-    re-offers it (withheld, owed) or a C1 back-link routes it
-    (``disposition.entry_routed``): that task or pending ticket already
-    carries the finding, and the L5 outcome loop or the ticket pass decides
-    it."""
-    entries = {entry["id"]: entry for entry in cb.get("entries") or []}
+    """*cb* with each of *entry_ids* marked owed, unless ``Transition.OWE`` is
+    illegal from its marker (a withheld or owed marker already re-offers it)
+    or a C1 back-link routes it (``disposition.entry_routed``): that task or
+    pending ticket already carries the finding, and the L5 outcome loop or the
+    ticket pass decides it."""
+    entries = cb.get("entries") or []
     owed = [
         entry_id
         for entry_id in dict.fromkeys(entry_id for entry_id in entry_ids if entry_id is not None)
-        if entries[entry_id].get(codebook.ENTRY_FILING_KEY) not in _REOFFER_MARKERS
-        and not disposition.entry_routed(entries[entry_id])
+        if _owable(codebook.record_by_id(entries, entry_id, kind="entry"))
     ]
     for entry_id in owed:
         cb = codebook_lifecycle.mark_entry_owed(cb, entry_id)
@@ -340,6 +344,13 @@ def _owe(cb: dict, entry_ids: Sequence[str | None]) -> dict:
             len(owed), owed,
         )
     return cb
+
+
+def _owable(entry: Mapping[str, Any]) -> bool:
+    return (
+        codebook_lifecycle.allows(entry, codebook_lifecycle.Transition.OWE)
+        and not disposition.entry_routed(entry)
+    )
 
 
 def _carrying(pending: PendingFiling, refiling: disposition.Refiling) -> PendingFiling:

@@ -72,13 +72,19 @@ class IllegalTransition(ValueError):
     pass
 
 
+def allows(record: Mapping[str, object], transition: Transition) -> bool:
+    """Whether *transition*'s rule lists *record*'s current state as a source."""
+    rule = TABLE[transition]
+    return record.get(rule.field) in rule.sources
+
+
 def transit(record: dict, transition: Transition) -> None:
     """Move *record* along *transition* in place, inside a codebook its caller
     has already copied; raise IllegalTransition, writing nothing, from a state
     the transition's rule does not list."""
     rule = TABLE[transition]
-    current = record.get(rule.field)
-    if current not in rule.sources:
+    if not allows(record, transition):
+        current = record.get(rule.field)
         legal = ", ".join(sorted(repr(source) for source in rule.sources))
         raise IllegalTransition(
             f"{transition}: {rule.kind} {record.get('id')!r} has {rule.field} {current!r}; "

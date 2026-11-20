@@ -66,6 +66,7 @@ def test_every_target_is_of_its_fields_vocabulary():
 def test_a_legal_transition_writes_its_target(transition, state):
     kind, field, _, target = _EXPECTED_TABLE[transition]
     record = _record(kind, field, state)
+    assert codebook_lifecycle.allows(record, transition)
 
     codebook_lifecycle.transit(record, transition)
 
@@ -77,6 +78,7 @@ def test_an_illegal_source_is_refused_naming_everything_a_reader_needs(transitio
     kind, field, sources, _ = _EXPECTED_TABLE[transition]
     record = _record(kind, field, state)
     before = copy.deepcopy(record)
+    assert not codebook_lifecycle.allows(record, transition)
 
     with pytest.raises(codebook_lifecycle.IllegalTransition) as raised:
         codebook_lifecycle.transit(record, transition)
@@ -137,38 +139,29 @@ def _codebook_with_candidate(disposition: str = "pending") -> dict:
     return cb
 
 
-def _codebook_with_withheld_entry() -> dict:
+def _codebook_with_marked_entry(entry_id: str, marker: str) -> dict:
     cb = _minimal_v2_codebook()
     cb["entries"].append(
         {
-            "id": "entry-withheld",
-            "title": "A withheld confusion",
+            "id": entry_id,
+            "title": f"A confusion marked {marker}",
             "severity": "medium",
             "status": "open",
             "origin_phase": "implement",
             "manifested_phase": "verify",
             "sightings": [],
-            codebook.ENTRY_FILING_KEY: codebook.ENTRY_FILING_WITHHELD,
+            codebook.ENTRY_FILING_KEY: marker,
         }
     )
     return cb
+
+
+def _codebook_with_withheld_entry() -> dict:
+    return _codebook_with_marked_entry("entry-withheld", codebook.ENTRY_FILING_WITHHELD)
 
 
 def _codebook_with_owed_entry() -> dict:
-    cb = _minimal_v2_codebook()
-    cb["entries"].append(
-        {
-            "id": "entry-owed",
-            "title": "An owed confusion",
-            "severity": "medium",
-            "status": "open",
-            "origin_phase": "implement",
-            "manifested_phase": "verify",
-            "sightings": [],
-            codebook.ENTRY_FILING_KEY: codebook.ENTRY_FILING_OWED,
-        }
-    )
-    return cb
+    return _codebook_with_marked_entry("entry-owed", codebook.ENTRY_FILING_OWED)
 
 
 _PROMOTION_ENTRY_FIELDS = {

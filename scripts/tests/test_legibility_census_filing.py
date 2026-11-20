@@ -107,7 +107,7 @@ def test_an_unmarked_or_filed_entry_is_not_reoffered(filing):
 
 
 # ---------------------------------------------------------------------------
-# owed_after_filing / owed_after_resolving: the owing rule
+# with_owed_after_filing / with_owed_after_resolving: the owing rule
 # ---------------------------------------------------------------------------
 
 _ENTRY_ID = "entry-a"
@@ -169,7 +169,7 @@ def _marker_after(transform, cb: dict) -> str | None:
 
 
 def _after_filing(disposal: disposition.Disposal, *, dry_run: bool = False):
-    return lambda cb: census_filing.owed_after_filing(cb, disposal, dry_run=dry_run)
+    return lambda cb: census_filing.with_owed_after_filing(cb, disposal, dry_run=dry_run)
 
 
 def test_an_unmarked_entry_whose_decision_routed_nothing_is_owed():
@@ -182,10 +182,11 @@ def test_a_filed_entry_whose_decision_routed_nothing_is_owed():
     assert _marker_after(_after_filing(_disposal(_unrouted())), cb) == codebook.ENTRY_FILING_OWED
 
 
-def test_a_withheld_entry_whose_decision_routed_nothing_stays_withheld():
-    cb = _codebook_of(filing=_WITHHELD)
+@pytest.mark.parametrize("marker", [_WITHHELD, _OWED])
+def test_an_entry_whose_marker_already_reoffers_it_keeps_that_marker(marker):
+    cb = _codebook_of(filing=marker)
 
-    assert _marker_after(_after_filing(_disposal(_unrouted())), cb) == codebook.ENTRY_FILING_WITHHELD
+    assert _marker_after(_after_filing(_disposal(_unrouted())), cb) == marker
 
 
 def test_an_entry_a_back_link_names_a_task_for_is_never_owed():
@@ -218,12 +219,18 @@ def test_a_filing_with_no_entry_is_ignored():
     assert _marker_after(_after_filing(disposal), _codebook_of()) is None
 
 
+def test_a_filing_naming_an_entry_the_codebook_lacks_is_refused_naming_it():
+    with pytest.raises(ValueError, match="no entry 'entry-nope'"):
+        census_filing.with_owed_after_filing(_codebook_of(), _disposal(_unrouted("entry-nope")), dry_run=False)
+
+
 def _after_resolving(resolutions: disposition.Resolutions):
-    return lambda cb: census_filing.owed_after_resolving(cb, resolutions)
+    return lambda cb: census_filing.with_owed_after_resolving(cb, resolutions)
 
 
-def test_an_entry_whose_only_ticket_failed_is_owed():
-    cb = _codebook_of(rows=(_row(ticket="tkt_1", task_id=None, resolution="failed"),))
+@pytest.mark.parametrize("filing", [None, _FILED], ids=["unmarked", "filed"])
+def test_an_entry_whose_only_ticket_failed_is_owed(filing):
+    cb = _codebook_of(rows=(_row(ticket="tkt_1", task_id=None, resolution="failed"),), filing=filing)
     resolutions = _resolutions(task_store.TicketStatus.FAILED, reason="expired")
 
     assert _marker_after(_after_resolving(resolutions), cb) == codebook.ENTRY_FILING_OWED

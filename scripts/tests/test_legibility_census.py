@@ -195,16 +195,16 @@ def _minimal_v2_codebook() -> dict:
 # network call, or model.
 # ---------------------------------------------------------------------------
 
-def _make_fake_submit_fn():
+def _make_fake_submit_fn(*, first=1):
     """Fake curator-path `submit_fn(**kwargs) -> dict` seam. Records every
     call's kwargs in `.calls` and answers in the real curator-path shape
-    (disposition.ticket_id_from_submit_result) with an incrementing ticket
-    id, `{"ticket": "tkt_<n>"}`."""
+    (disposition.ticket_id_from_submit_result) with a ticket id incrementing
+    from *first*, `{"ticket": "tkt_<n>"}`."""
     calls = []
 
     def fake_submit_fn(**kwargs):
         calls.append(kwargs)
-        return {"ticket": f"tkt_{len(calls)}"}
+        return {"ticket": f"tkt_{first + len(calls) - 1}"}
 
     fake_submit_fn.calls = calls
     return fake_submit_fn
@@ -8742,17 +8742,6 @@ def _quiet_run_after(tmp_path, previous, store, **overrides):
     return _reify_kwargs(tmp_path, later.pop("codebook_dict"), **later)
 
 
-def _answering_submit_fn(ticket):
-    calls = []
-
-    def submit_fn(**kwargs):
-        calls.append(kwargs)
-        return {"ticket": ticket}
-
-    submit_fn.calls = calls
-    return submit_fn
-
-
 def _assert_the_owed_entry_files_once_then_rests(tmp_path, first, **second_overrides):
     entry_id = _persisted_promoted_entry(first)["id"]
     second = _quiet_run_after(tmp_path, first, FakeTaskStore(), **second_overrides)
@@ -8811,7 +8800,24 @@ def test_run_census_owes_a_promotion_whose_ticket_failed(tmp_path):
     assert entry[codebook.ENTRY_FILING_KEY] == codebook.ENTRY_FILING_OWED
     # Real tickets are unique; a reused tkt_1 would share the failed row's
     # (ticket, task_id) identity in disposition.with_back_links.
-    _assert_the_owed_entry_files_once_then_rests(tmp_path, first, submit_fn=_answering_submit_fn("tkt_2"))
+    _assert_the_owed_entry_files_once_then_rests(tmp_path, first, submit_fn=_make_fake_submit_fn(first=2))
+
+
+def test_run_census_dry_run_reoffers_an_owed_entry_but_leaves_it_owed(tmp_path, caplog):
+    first = _keyed_kwargs(tmp_path, FakeTaskStore(), submit_fn=_make_rejecting_submit_fn())
+    census_run.run_census(**first)
+    payloads_path = tmp_path / "confusion-census-2026-07-21-payloads.json"
+    second = _quiet_run_after(
+        tmp_path, first, FakeTaskStore(), submit_fn=_poison("submit_fn"), dry_run_payloads_path=payloads_path,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        census_run.run_census(**second)
+
+    [payload] = json.loads(payloads_path.read_text(encoding="utf-8"))
+    assert payload["title"] == disposition.task_title(_PROMOTED_TITLE)
+    assert _persisted_promoted_entry(second)[codebook.ENTRY_FILING_KEY] == codebook.ENTRY_FILING_OWED
+    assert "1 of those payload(s) re-offer withheld or owed codebook entries" in caplog.text
 
 
 # ---------------------------------------------------------------------------
