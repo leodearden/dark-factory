@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from _eval_diff_repo import repo_with_commit
 
+from orchestrator.evals.cell_sandbox import CellSandbox
 from orchestrator.evals.metrics import EvalMetrics, RoleUnderTest
 from orchestrator.evals.runner import collect_metrics
 from orchestrator.implementer_brief_variant import ImplementerBriefVariant
@@ -42,7 +43,7 @@ async def _collect(
     role: RoleUnderTest = RoleUnderTest.IMPLEMENTER,
     replay_frame: str | None = None,
     workflow: MagicMock | None = None,
-    sandbox_backend: str = 'landlock',
+    sandbox_backend: CellSandbox = 'landlock',
 ) -> EvalMetrics:
     verification = VerifyResult(
         passed=True, test_output='', lint_output='', type_output='', summary='',

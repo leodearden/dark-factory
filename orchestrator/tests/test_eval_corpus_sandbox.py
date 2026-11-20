@@ -10,13 +10,18 @@ from uuid import uuid4
 import pytest
 
 from orchestrator.agents import sandbox_dispatch
-from orchestrator.config import OrchestratorConfig, SandboxConfig, project_role_env_overrides
+from orchestrator.config import (
+    PROJECT_CONFIG_FILENAME,
+    OrchestratorConfig,
+    SandboxConfig,
+    project_role_env_overrides,
+)
 from orchestrator.evals import runner
 from orchestrator.evals.cell_sandbox import bind_cell_sandbox_backend
 from orchestrator.evals.configs import EvalConfig
 from orchestrator.evals.live_fixture import build_live_fixture
 from orchestrator.evals.metrics import EvalMetrics
-from orchestrator.evals.results import ResultStore
+from orchestrator.evals.results import EvalResult, ResultStore
 from orchestrator.evals.runner import build_eval_orch_config
 from orchestrator.evals.shadow_invocation import build_shadow_orch_config
 from orchestrator.workflow import WorkflowOutcome
@@ -94,7 +99,15 @@ def test_bind_reports_none_when_the_config_disables_the_sandbox(
     assert bind_cell_sandbox_backend(config) == 'none'
 
 
-def test_bind_reports_none_when_the_configured_backend_is_unavailable(
+def test_bind_reports_none_under_the_none_escape_hatch(tmp_path: Path) -> None:
+    config = OrchestratorConfig(
+        project_root=tmp_path, sandbox=SandboxConfig(enabled=True, backend='none'),
+    )
+
+    assert bind_cell_sandbox_backend(config) == 'none'
+
+
+def test_bind_reports_refused_when_the_configured_backend_is_unavailable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _landlock_available(monkeypatch, False)
@@ -102,7 +115,7 @@ def test_bind_reports_none_when_the_configured_backend_is_unavailable(
         project_root=tmp_path, sandbox=SandboxConfig(enabled=True, backend='landlock'),
     )
 
-    assert bind_cell_sandbox_backend(config) == 'none'
+    assert bind_cell_sandbox_backend(config) == 'refused'
 
 
 def _executor_task(tmp_path: Path) -> dict:
@@ -130,12 +143,21 @@ async def _raising_collect(_wf, _wt, _task, *, role, replay_frame=None, sandbox_
 
 async def _run_landlock_cell(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, collect, store: ResultStore,
-):
-    """One executor cell over a landlock base, in a process whose backend no Harness bound."""
+) -> tuple[EvalResult, list[sandbox_dispatch.Backend]]:
+    """One executor cell over a landlock base, in a process whose backend no Harness bound.
+
+    Returns the cell's result and the process backend each run of its workflow saw.
+    """
     sandbox_dispatch.set_backend('auto')
     _landlock_available(monkeypatch, True)
+    backends_at_run: list[sandbox_dispatch.Backend] = []
+
+    async def run_workflow():
+        backends_at_run.append(sandbox_dispatch.get_backend())
+        return SimpleNamespace(outcome=WorkflowOutcome.DONE)
+
     workflow = MagicMock()
-    workflow.run = AsyncMock(return_value=SimpleNamespace(outcome=WorkflowOutcome.DONE))
+    workflow.run = run_workflow
     monkeypatch.setattr(runner, 'create_eval_worktree', _fake_create_wt)
     monkeypatch.setattr(runner, 'build_workflow', lambda **_kw: workflow)
     monkeypatch.setattr(runner, 'collect_metrics', AsyncMock(side_effect=collect))
@@ -144,9 +166,10 @@ async def _run_landlock_cell(
         project_root=tmp_path, sandbox=SandboxConfig(enabled=True, backend='landlock'),
     )
 
-    return await runner.run_eval(
+    result = await runner.run_eval(
         Path('/fake/task.json'), _IMPL, base, usage_gate=None, store=store,
     )
+    return result, backends_at_run
 
 
 @pytest.mark.asyncio
@@ -155,19 +178,19 @@ async def test_a_workflow_cell_records_the_backend_it_ran_under(
 ) -> None:
     store = ResultStore(tmp_path / 'results')
 
-    result = await _run_landlock_cell(tmp_path, monkeypatch, _fake_collect, store)
+    result, backends_at_run = await _run_landlock_cell(tmp_path, monkeypatch, _fake_collect, store)
 
+    assert backends_at_run == ['landlock']
     assert result.metrics['sandbox_backend'] == 'landlock'
     [persisted] = store.load_all()
     assert EvalMetrics.from_dict(persisted.metrics).sandbox_backend == 'landlock'
-    assert sandbox_dispatch.get_backend() == 'landlock'
 
 
 @pytest.mark.asyncio
 async def test_a_cell_whose_metric_collection_raised_still_records_the_backend(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    result = await _run_landlock_cell(
+    result, _ = await _run_landlock_cell(
         tmp_path, monkeypatch, _raising_collect, ResultStore(tmp_path / 'results'),
     )
 
@@ -185,7 +208,7 @@ _BASE_AGENT_ENV = {'implementer': {'BASE_ONLY': '1'}}
 
 def _project(root: Path, yaml_text: str) -> Path:
     root.mkdir(parents=True, exist_ok=True)
-    (root / 'dark-factory-orchestrator.yaml').write_text(yaml_text)
+    (root / PROJECT_CONFIG_FILENAME).write_text(yaml_text)
     return root
 
 
@@ -205,6 +228,21 @@ def test_a_fixture_from_another_project_takes_that_projects_role_env_overrides(
     result = build_eval_orch_config(_IMPL, _corpus_task(reify), _base(tmp_path))
 
     assert result.role_env_overrides == {'implementer': {'CARGO_HOME': '/tmp/eval-probe-cargo-home'}}
+
+
+def test_a_fixture_project_env_that_would_outrank_the_candidates_env_is_refused(
+    tmp_path: Path,
+) -> None:
+    reify = _project(
+        tmp_path / 'reify',
+        'role_env_overrides:\n  implementer:\n    ANTHROPIC_BASE_URL: http://127.0.0.1:9\n',
+    )
+    candidate = EvalConfig(
+        't', 'claude', 'sonnet', 'high', env_overrides={'ANTHROPIC_BASE_URL': 'http://candidate'},
+    )
+
+    with pytest.raises(ValueError, match="'implementer': \\['ANTHROPIC_BASE_URL'\\]"):
+        build_eval_orch_config(candidate, _corpus_task(reify), _base(tmp_path))
 
 
 def test_a_fixture_of_the_base_project_keeps_the_bases_role_env_overrides(tmp_path: Path) -> None:
@@ -233,3 +271,15 @@ def test_project_role_env_overrides_reads_another_projects_file(
     assert project_role_env_overrides(reify) == {
         'implementer': {'CARGO_HOME': '/tmp/eval-probe-cargo-home'},
     }
+
+
+def test_project_role_env_overrides_warns_on_an_unknown_role(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    project = _project(tmp_path / 'typo', 'role_env_overrides:\n  implementor:\n    A: "1"\n')
+    monkeypatch.setenv('ORCH_CONFIG_PATH', str(tmp_path / 'no-such-config.yaml'))
+
+    with caplog.at_level('WARNING', logger='orchestrator.config'):
+        project_role_env_overrides(project)
+
+    assert "unrecognized role 'implementor'" in caplog.text

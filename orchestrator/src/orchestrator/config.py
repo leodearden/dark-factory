@@ -6785,13 +6785,17 @@ def project_review_config(project_root: Path) -> ReviewConfig:
     return ReviewConfig.model_validate(_project_config_layers(project_root).get('review') or {})
 
 
-_ROLE_ENV_OVERRIDES = TypeAdapter(dict[str, dict[str, str]])
+_ROLE_ENV_OVERRIDES = TypeAdapter(OrchestratorConfig.model_fields['role_env_overrides'].annotation)
 
 
 def project_role_env_overrides(project_root: Path) -> dict[str, dict[str, str]]:
-    """The role_env_overrides the orchestrator of the project at *project_root* gives its agents."""
+    """The role_env_overrides the orchestrator of the project at *project_root* gives its agents.
+
+    Validated as the field validates it: its own annotation, then its unknown-role warning.
+    """
     layers = _project_config_layers(project_root)
-    return _ROLE_ENV_OVERRIDES.validate_python(layers.get('role_env_overrides') or {})
+    shaped = _ROLE_ENV_OVERRIDES.validate_python(layers.get('role_env_overrides') or {})
+    return OrchestratorConfig._warn_unknown_role_env_overrides_keys(shaped)
 
 
 # ---------------------------------------------------------------------------
