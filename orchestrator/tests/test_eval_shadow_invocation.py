@@ -1,9 +1,10 @@
 """The shadow invocation profile a live shadow cell runs under (task 5386).
 
-``build_shadow_orch_config`` is the corpus eval profile plus exactly one
-divergence: sandboxed roles run under the operator's configured sandbox
-backend. Strict MCP and the null memory sentinel are inherited from
-``EVAL_PROFILE``, never re-set.
+``build_shadow_orch_config`` is the corpus eval config plus its two
+refusals: a memory endpoint and a non-shadow fixture id. It has no
+divergence of its own: the sandbox is the base's, inherited through
+``build_eval_orch_config`` as a corpus cell's is (task 9849). Strict MCP and
+the null memory sentinel are inherited from ``EVAL_PROFILE``, never re-set.
 """
 
 from __future__ import annotations
@@ -37,6 +38,7 @@ from orchestrator.fm_retry import FM_NULL_SENTINEL_URL
 from orchestrator.verify import run_scoped_verification
 
 _IMPL = EvalConfig('probe', 'claude', 'sonnet', 'high')
+_SANDBOXED = SandboxConfig(enabled=True, backend='landlock')
 
 
 def _shadow_fixture(project_root: Path) -> dict:
@@ -77,16 +79,14 @@ def test_sandbox_is_enabled_under_the_base_backend(tmp_path: Path) -> None:
 
 
 @pytest.mark.usefixtures('code_default_config')
-def test_shadow_diverges_from_the_corpus_eval_profile_only_in_sandbox_enabled(
-    tmp_path: Path,
-) -> None:
-    base = OrchestratorConfig(project_root=tmp_path)
+def test_shadow_config_equals_the_corpus_config(tmp_path: Path) -> None:
+    base = OrchestratorConfig(project_root=tmp_path, sandbox=_SANDBOXED)
     fixture = _shadow_fixture(tmp_path)
 
     shadow = build_shadow_orch_config(_IMPL, fixture, base)
     corpus = build_eval_orch_config(_IMPL, fixture, base)
 
-    assert _changed_leaf_paths(shadow, corpus) == {'sandbox.enabled'}
+    assert _changed_leaf_paths(shadow, corpus) == set()
 
 
 def test_architect_config_passes_through(tmp_path: Path) -> None:
@@ -214,7 +214,7 @@ async def _build_workflow_kwargs_from(
     monkeypatch.setattr(runner, 'build_workflow', stop_at_build_workflow)
 
     with pytest.raises(_Sentinel):
-        await run(OrchestratorConfig(project_root=tmp_path))
+        await run(OrchestratorConfig(project_root=tmp_path, sandbox=_SANDBOXED))
 
     return captured
 
@@ -236,7 +236,9 @@ async def test_run_eval_under_the_shadow_profile_runs_its_cell_sandboxed_on_the_
 
 
 @pytest.mark.asyncio
-async def test_run_eval_by_default_runs_its_cell_unsandboxed(tmp_path: Path, monkeypatch) -> None:
+async def test_run_eval_by_default_runs_its_cell_under_the_base_sandbox(
+    tmp_path: Path, monkeypatch,
+) -> None:
     config = (await _build_workflow_kwargs_from(
         tmp_path, monkeypatch,
         lambda base: run_eval(
@@ -244,7 +246,7 @@ async def test_run_eval_by_default_runs_its_cell_unsandboxed(tmp_path: Path, mon
         ),
     ))['config']
 
-    assert config.sandbox.enabled is False
+    assert config.sandbox == _SANDBOXED
 
 
 @pytest.mark.asyncio
