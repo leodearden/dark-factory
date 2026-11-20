@@ -49,6 +49,7 @@ from .architect_eval import (
     open_eval_artifacts,
     read_reference_diff,
 )
+from .cell_sandbox import bind_cell_sandbox_backend
 from .configs import (
     EVAL_CONFIGS,
     JUDGE_OFAT_IMPLEMENTER_PIN,
@@ -580,6 +581,7 @@ async def _run_workflow_cell(
     worktree, run_id = await _open_cell_worktree(task, worktree)
     address = CellName(task['id'], label, run_id)
     orch_config = build_orch_config()
+    sandbox_backend = bind_cell_sandbox_backend(orch_config)
     replay_frame = REPLAY_FRAME_ID if replay_framed else None
     async with owned_usage_gate(usage_gate, orch_config, label=cell) as gate:
         workflow = _cell_workflow(
@@ -592,6 +594,7 @@ async def _run_workflow_cell(
         wall_clock_ms = int(time.monotonic() * 1000) - start_ms
         metrics = await _cell_metrics(
             workflow, worktree, task, role=role, replay_frame=replay_frame,
+            sandbox_backend=sandbox_backend,
         )
         result = EvalResult(
             task_id=address.task_id,
@@ -700,15 +703,20 @@ async def _cell_metrics(
     *,
     role: RoleUnderTest,
     replay_frame: str | None,
+    sandbox_backend: str,
 ) -> dict[str, Any]:
     """The cell's metrics; a collection that raised leaves only the stamps the executor knows."""
     try:
         metrics = await collect_metrics(
             workflow, worktree, task, role=role, replay_frame=replay_frame,
+            sandbox_backend=sandbox_backend,
         )
     except Exception as e:
         logger.warning(f'Metric collection failed: {e}')
-        return {'role_under_test': role, 'replay_frame': replay_frame}
+        return {
+            'role_under_test': role, 'replay_frame': replay_frame,
+            'sandbox_backend': sandbox_backend,
+        }
     return metrics.to_dict()
 
 
@@ -719,8 +727,9 @@ async def collect_metrics(
     *,
     role: RoleUnderTest,
     replay_frame: str | None = None,
+    sandbox_backend: str,
 ) -> EvalMetrics:
-    """Collect metrics from a completed workflow run, stamped with *role* and *replay_frame*."""
+    """Collect metrics from a completed workflow run, stamped with *role*, *replay_frame* and *sandbox_backend*."""
     wf_metrics = workflow.metrics
 
     # Plan completion
@@ -798,6 +807,7 @@ async def collect_metrics(
         is_local_model=is_local,
         role_under_test=role,
         replay_frame=replay_frame,
+        sandbox_backend=sandbox_backend,
     )
     # False-green guard — catches the 404-bug signature so the same class of
     # silent failure doesn't need manual quarantine in future runs.

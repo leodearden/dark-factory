@@ -288,6 +288,11 @@ class EvalMetrics:
     # The key is written unconditionally; see docs/eval-replay-frame.md.
     replay_frame: str | None = None
 
+    # The OS sandbox backend this cell's sandboxed agents ran under ('landlock' |
+    # 'bwrap' | 'none'). None means an architect cell, whose agents are all
+    # unsandboxed roles, or a cell recorded before task 9849.
+    sandbox_backend: str | None = None
+
     # Live shadow eval (plans/live-shadow-eval-prd.md C1/C4): the shadow_cells row
     # is the record's home and this is its pointer. None on every non-shadow cell
     # and on every result persisted before these fields existed.
