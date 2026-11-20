@@ -3,13 +3,14 @@ census run re-offers for filing (task 7095)."""
 from __future__ import annotations
 
 import copy
+from typing import Any
 
 import pytest
 from legibility import census_filing, codebook, disposition, task_store
 
-_OWED = {codebook.ENTRY_FILING_KEY: codebook.ENTRY_FILING_OWED}
-_WITHHELD = {codebook.ENTRY_FILING_KEY: codebook.ENTRY_FILING_WITHHELD}
-_FILED = {codebook.ENTRY_FILING_KEY: codebook.ENTRY_FILING_FILED}
+_OWED: dict[str, Any] = {codebook.ENTRY_FILING_KEY: codebook.ENTRY_FILING_OWED}
+_WITHHELD: dict[str, Any] = {codebook.ENTRY_FILING_KEY: codebook.ENTRY_FILING_WITHHELD}
+_FILED: dict[str, Any] = {codebook.ENTRY_FILING_KEY: codebook.ENTRY_FILING_FILED}
 
 
 def _sighting(session: str) -> dict:
