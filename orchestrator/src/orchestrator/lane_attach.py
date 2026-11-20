@@ -17,10 +17,13 @@ git_ops.
 
 from __future__ import annotations
 
+import logging
 from enum import Enum
 from pathlib import Path
 
 from orchestrator.ref_ledger import GitRunner
+
+logger = logging.getLogger(__name__)
 
 
 class HeadRelation(Enum):
@@ -72,3 +75,41 @@ async def head_relation(
         return HeadRelation.EXTENDS_BRANCH
     rc, _, _ = await run(['git', 'merge-base', '--is-ancestor', tip, 'HEAD'], cwd=worktree)
     return HeadRelation.EXTENDS_BRANCH if rc == 0 else HeadRelation.FOREIGN
+
+
+async def check_out_branch_over_foreign_head(
+    run: GitRunner, worktree: Path, full_branch: str,
+) -> None:
+    """Check *full_branch* out in *worktree* over a FOREIGN HEAD, moving no ref.
+
+    ``checkout -f`` is the reset-in-place reattach idiom: it discards the
+    tracked state of whatever HEAD the lane was left on.  Tracked changes of
+    unknown provenance are not discarded silently, so a tree with any, or one
+    whose status cannot be read, raises instead.  A refused checkout raises
+    too, with git's reason: "already used by worktree" is a duplicate
+    dispatch that must stop the resume.  ``RuntimeError`` is what the lane
+    acquire turns into a FAULT.
+    """
+    head = await describe_head(run, worktree)
+    rc, out, _ = await run(
+        ['git', 'status', '--porcelain', '--untracked-files=no'], cwd=worktree,
+    )
+    if rc != 0 or out.strip():
+        reason = (
+            'its tracked state could not be read' if rc != 0
+            else 'checking the branch out would discard its tracked changes'
+        )
+        raise RuntimeError(
+            f'refusing to resume {full_branch} in {worktree}: HEAD {head} is not '
+            f"that branch's tip or a descendant, and {reason}"
+        )
+    rc, _, err = await run(['git', 'checkout', '-f', full_branch], cwd=worktree)
+    if rc != 0:
+        raise RuntimeError(
+            f'could not check {full_branch} out in {worktree} over HEAD {head}: '
+            f'{err.strip()}'
+        )
+    logger.warning(
+        'Lane %s was at %s, not on %s; checked the branch out without moving it.',
+        worktree, head, full_branch,
+    )

@@ -96,7 +96,13 @@ from orchestrator.branch_stack import (
     rebase_own_delta,
 )
 from orchestrator.config import TASK_META_DIRNAME, GitConfig, TranscriptArchiveConfig
-from orchestrator.lane_attach import HeadRelation, branch_tip, describe_head, head_relation
+from orchestrator.lane_attach import (
+    HeadRelation,
+    branch_tip,
+    check_out_branch_over_foreign_head,
+    describe_head,
+    head_relation,
+)
 from orchestrator.lane_branch_holder import (
     BranchCheckedOutElsewhere,
     BranchHolderAction,
@@ -8568,8 +8574,10 @@ class GitOps:
         :meth:`acquire_warm_lane`'s reuse and reattach routes and
         :meth:`_reattach_cold_worktree`.  Mirrors :meth:`create_worktree`'s
         cold-requeue reuse block:
-        1. Commit any uncommitted WIP so it is preserved across the rebase.
-        2. Re-attach the lane onto *full_branch*.
+        1. Attach the lane onto *full_branch* without moving the branch
+           backward or sideways — :meth:`_attach_lane_to_branch`.
+        2. Commit any uncommitted WIP onto the branch so it is preserved
+           across the rebase.
         3. Un-stack, then rebase onto main (best-effort; log failure and
            continue on old base) — :meth:`_rebase_requeued_onto_main`.
         4. Recompute ``base_commit`` as ``merge-base main HEAD``.
@@ -8591,19 +8599,18 @@ class GitOps:
             WorktreeInfo for the reused lane.  Never raises — exceptions
             propagate to the caller's try/except-release wrapper.
         """
-        # 1. Commit WIP (returns None if nothing to commit — that's fine)
-        await self.commit(lane_dir, 'chore: save WIP before requeue rebase')
-
-        # 2. Re-attach the lane, which release_warm_lane may have detached,
-        #    BEFORE the un-stack and the rebase (task-1923 residual), so both
-        #    move refs/heads/<full_branch> itself and the un-stack finds the
-        #    lane as the worktree holding the branch.  On an attached lane
-        #    this is a reset-to-self.  Best-effort: a failed rebind leaves the
+        # 1. Attach the lane, which release_warm_lane may have detached or a
+        #    foreign checkout may have left elsewhere, BEFORE the WIP commit
+        #    (so a foreign branch never receives it, task 10991) and before
+        #    the un-stack and the rebase (task-1923 residual), so both move
+        #    refs/heads/<full_branch> itself and the un-stack finds the lane
+        #    as the worktree holding the branch.  A failed rebind leaves the
         #    lane detached, holding no branch, so step 3 leaves the branch on
-        #    its old base.
-        #    NOTE: checkout -B bypasses git's single-checkout guard; a
-        #    concurrent worktree on full_branch is a duplicate-dispatch hazard.
-        await self.rebind_branch_to_head(lane_dir, full_branch)
+        #    its old base; a refused foreign check-out raises.
+        await self._attach_lane_to_branch(lane_dir, full_branch)
+
+        # 2. Commit WIP (returns None if nothing to commit — that's fine)
+        await self.commit(lane_dir, 'chore: save WIP before requeue rebase')
 
         # 3. Un-stack, then rebase onto main (best-effort; failure leaves the
         #    branch on its old base).  A BranchResetError (task 2403)
@@ -8637,6 +8644,20 @@ class GitOps:
             lane_dir, full_branch, base_commit[:8] if base_commit else '?', port,
         )
         return WorktreeInfo(path=lane_dir, base_commit=base_commit, reify_debug_port=port)
+
+    async def _attach_lane_to_branch(self, lane_dir: Path, full_branch: str) -> None:
+        """Put *lane_dir* on *full_branch* without moving it backward or sideways.
+
+        A HEAD on the branch, or at or past its tip, is rebound in place by
+        :meth:`rebind_branch_to_head`, best-effort as before.  Any other HEAD
+        is a foreign commit: the branch is checked out over it unmoved, or
+        ``RuntimeError`` is raised when that would discard tracked changes
+        (``orchestrator/src/orchestrator/lane_attach.py::check_out_branch_over_foreign_head``).
+        """
+        if await head_relation(_run, lane_dir, full_branch) is HeadRelation.FOREIGN:
+            await check_out_branch_over_foreign_head(_run, lane_dir, full_branch)
+            return
+        await self.rebind_branch_to_head(lane_dir, full_branch)
 
     async def _rebase_requeued_onto_main(
         self, worktree: Path, full_branch: str, *, keep_stack: bool,
