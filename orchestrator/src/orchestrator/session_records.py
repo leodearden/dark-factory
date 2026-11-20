@@ -678,11 +678,13 @@ def session_pointer_path_for_pid(pid: int, root: Path | str | None = None) -> Pa
 
 
 def is_session_pointer_pid(pid: int) -> bool:
-    """True iff *pid* can key a ``sessions-by-pid/`` entry.
+    """True iff *pid* can key a ``sessions-by-pid/`` entry, judged live from ``/proc``.
 
     A shared ``claude agents`` host's pid is every hosted session's owning
     claude, so a pointer keyed on it would name whichever hosted session
-    wrote last. The pid twin of ``is_claude_session_pointer_name``.
+    wrote last. Host-ness is read from ``/proc/<pid>/cmdline`` through
+    ``session_identity.is_shared_session_host`` on every call, so the answer
+    is an observation of the running process, not a property of the pid.
     """
     return pid > 0 and not session_identity.is_shared_session_host(pid)
 
@@ -750,8 +752,7 @@ def resolve_session_slug_for_pid(pid: int, root: Path | str | None = None) -> st
     raises.
 
     A *pid* that cannot key a pointer (``is_session_pointer_pid``) reads as
-    None, so a pointer a shared ``claude agents`` host wrote before hosts
-    stopped writing one is never followed.
+    None, so a legacy host-keyed pointer still on disk is never followed.
 
     Contract limit: a new process that reuses a dead claude's pid can read
     that session's pointer until its own SessionStart hook overwrites it or

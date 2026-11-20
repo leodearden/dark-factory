@@ -15,7 +15,7 @@ from _process_identity_variants import IdentityVariant, own_identity
 from _process_tree_fakes import claude_process_tree
 from _reap_report_wait import await_reap_report
 from _session_hook_fixtures import launching_record, owner_ppid_env
-from _shared_host_fixtures import REQUIRES_PROC, running_shared_host
+from _shared_host_fixtures import REQUIRES_PROC, running_shared_host, write_legacy_host_pointer
 from shared.process_identity import ProcessIdentity
 
 from orchestrator import decision_registry as dr
@@ -215,7 +215,7 @@ class TestResolveSessionSlugForPid:
     @REQUIRES_PROC
     def test_a_shared_host_pid_never_resolves(self, tmp_path: Path, shared_host_pid: int) -> None:
         session_records.write_record(_record(self._SLUG, owner_pid=shared_host_pid), root=tmp_path)
-        _write_pointer_raw(shared_host_pid, self._SLUG, tmp_path)
+        write_legacy_host_pointer(shared_host_pid, self._SLUG, tmp_path)
 
         assert session_records.resolve_session_slug_for_pid(shared_host_pid, root=tmp_path) is None
 
@@ -354,7 +354,7 @@ class TestReapStaleSessionPointers:
     @REQUIRES_PROC
     def test_a_live_shared_hosts_pointer_is_removed(self, tmp_path: Path, shared_host_pid: int) -> None:
         session_records.write_record(_record(self._SLUG, owner_pid=shared_host_pid), root=tmp_path)
-        pointer = _write_pointer_raw(shared_host_pid, self._SLUG, tmp_path)
+        pointer = write_legacy_host_pointer(shared_host_pid, self._SLUG, tmp_path)
 
         assert session_reaper.reap_stale_session_pointers(root=tmp_path) == [pointer]
         assert not pointer.exists()

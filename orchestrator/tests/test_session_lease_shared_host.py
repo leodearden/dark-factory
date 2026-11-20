@@ -16,7 +16,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
-from _shared_host_fixtures import REQUIRES_PROC, running_shared_host
+from _shared_host_fixtures import REQUIRES_PROC, running_shared_host, write_legacy_host_pointer
 
 from orchestrator import session_identity, session_leases, session_records
 from orchestrator import session_registry as sr
@@ -72,12 +72,7 @@ def _warnings(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
 
 
 def _seed_sibling_record(tmp_path: Path, host: int) -> None:
-    """Seed a record the host owns and a host-keyed sessions-by-pid entry naming it.
-
-    That pointer is one written before hosted sessions stopped writing one;
-    ``write_session_pointer`` now refuses a host pid, so the file is written
-    directly.
-    """
+    """Seed a record the host owns and a legacy host-keyed sessions-by-pid entry naming it."""
     session_records.write_record(
         session_records.SessionRecord(
             session_slug='sibling-hosted-record',
@@ -87,10 +82,7 @@ def _seed_sibling_record(tmp_path: Path, host: int) -> None:
         ),
         root=tmp_path,
     )
-    session_records.session_pointers_dir(tmp_path).mkdir(parents=True)
-    session_records.session_pointer_path_for_pid(host, root=tmp_path).write_text(
-        'sibling-hosted-record', encoding='utf-8'
-    )
+    write_legacy_host_pointer(host, 'sibling-hosted-record', tmp_path)
 
 
 # --- resolution layer --------------------------------------------------------
@@ -397,7 +389,10 @@ def test_resolve_own_record_slug_is_none_for_a_shared_host(
     """The host's pointer is last-writer-wins across every hosted session.
 
     So it may name a SIBLING's record, and a DecisionRecord must read unlinked
-    rather than be mis-attributed.
+    rather than be mis-attributed. Two guards give this answer, and this pins
+    the answer rather than either guard: the store never follows a host-keyed
+    pointer (``session_records.is_session_pointer_pid``), and
+    ``SessionIdentity.session_scoped_pid`` is None under a host.
     """
     _seed_sibling_record(tmp_path, shared_host_pid)
     caplog.set_level(logging.DEBUG)

@@ -1,4 +1,4 @@
-"""A real process with the argv of a shared ``claude agents`` session host.
+"""A real process with the argv of a shared ``claude agents`` session host, and its legacy pointer.
 
 ``session_identity.is_shared_session_host`` reads ``/proc/<pid>/cmdline``, so
 tests drive it with a live process whose argv has the host's shape rather
@@ -15,6 +15,8 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
+
+from orchestrator import session_records
 
 REQUIRES_PROC = pytest.mark.skipif(
     not Path('/proc/self/cmdline').exists(), reason='host detection reads /proc'
@@ -50,3 +52,16 @@ def _await_host_argv(pid: int) -> None:
         if time.monotonic() > deadline:
             pytest.fail(f'{cmdline} never showed the `agents` argv')
         time.sleep(0.01)
+
+
+def write_legacy_host_pointer(host: int, slug: str, root: Path) -> Path:
+    """Write a ``sessions-by-pid/<host>`` entry naming *slug*; return its path.
+
+    ``session_records.write_session_pointer`` refuses a host pid, so a
+    host-keyed entry can only be a legacy one already on disk: the file is
+    written directly.
+    """
+    path = session_records.session_pointer_path_for_pid(host, root=root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(slug, encoding='utf-8')
+    return path

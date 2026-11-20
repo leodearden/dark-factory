@@ -357,8 +357,8 @@ def _adopt_t3_thread_slug(
 
     A T3 thread carries no ``CLAUDE_SPAWN_OWNER_PPID``, so the claude pids
     decide (``_owner_pid_verdict``). Unbound: the thread's first claude binds,
-    as does the recorded owner pid or any event once the recorded owner is
-    judged DEAD; an event whose pid is unresolvable adopts without binding.
+    as does a proven owner or any event once the recorded owner is judged
+    DEAD; an event whose pid is unresolvable adopts without binding.
     Bound to this event's session id: adopted as ``session_id_keyed``, so a
     dead owner is reclaimed. Bound to another session id: the owner-only
     re-mint rule of ``_env_slug_ownership``, or, on SessionStart
@@ -370,25 +370,17 @@ def _adopt_t3_thread_slug(
     record = snapshot.record
     if record is None:
         return None
-    owner_pid, current_pid = record.claude_owner_pid, probes.owning_claude_pid()
+    verdict = _owner_pid_verdict(record, probes)
     bound = (record.claude_session_id or '').strip()
     if not bound:
-        if (
-            owner_pid is None
-            or _owner_pid_verdict(record, probes) is True
-            or _recorded_owner_is_dead(record)
-        ):
+        if record.claude_owner_pid is None or verdict is True or _recorded_owner_is_dead(record):
             return _HookSlugResolution(slug, None, True, snapshot)
-        if current_pid is None:
+        if probes.owning_claude_pid() is None:
             return _HookSlugResolution(slug, None, False, snapshot)
         return None
     if bound == _hook_session_id(hook_input):
         return _HookSlugResolution(slug, None, True, snapshot, session_id_keyed=True)
-    if (
-        allow_remint
-        and _is_owner_only_session_start(hook_input)
-        and _owner_pid_verdict(record, probes) is not False
-    ):
+    if allow_remint and _is_owner_only_session_start(hook_input) and verdict is not False:
         return _HookSlugResolution(slug, None, True, snapshot)
     if allow_remint and _recorded_owner_is_dead(record):
         return _HookSlugResolution(slug, None, True, snapshot, may_rebind=True)
