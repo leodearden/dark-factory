@@ -415,8 +415,8 @@ def load_mcp_client_class() -> type:
     would be a second thing to keep in step with the server.
 
     Lazy so the pure planner, the pairing and the CLI parser stay importable
-    with no HTTP dependency, and so the tests — which inject a double — never
-    reach this function at all.
+    with no HTTP dependency, and so the behavioural tests can inject a double
+    in its place.
     """
     return load_mcp_client_module().FusedMemoryClient
 
@@ -427,24 +427,7 @@ def load_mcp_client_module() -> Any:
     Exposed so :func:`open_mcp_client` reads that module's ``DEFAULT_SERVER``
     beside its client class, rather than restating the URL a third time.
     """
-    import importlib.util
-
-    sibling = Path(__file__).parent / 'strip_leaked_control_keys.py'
-    mod_name = 'strip_leaked_control_keys'
-    existing = sys.modules.get(mod_name)
-    if existing is not None and hasattr(existing, 'FusedMemoryClient'):
-        return existing
-    spec = importlib.util.spec_from_file_location(mod_name, sibling)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load the JSON-RPC client from {sibling}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module
-    try:
-        spec.loader.exec_module(module)
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
+    return load_script(Path(__file__).parent / 'strip_leaked_control_keys.py', 'strip_leaked_control_keys')
 
 
 # ---------------------------------------------------------------------------
