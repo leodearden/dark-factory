@@ -122,3 +122,73 @@ def test_a_pointer_written_before_this_change_is_not_followed(
     _session_start(tmp_path, host, 'sess-a2', 'clear')
 
     assert _bound_session_id(slug_b, tmp_path) == 'sess-b'
+
+
+# --- re-mint lanes that never read the pid pointer ----------------------------
+
+
+@pytest.mark.parametrize('source', ['clear', 'compact'])
+def test_a_hosted_remint_does_not_adopt_a_spawn_record_the_host_bound(
+    tmp_path: Path, shared_host_pid: int, source: str
+) -> None:
+    host = shared_host_pid
+    slug = 'session-cockpit-6945001'
+    session_records.write_record(
+        session_records.SessionRecord(
+            session_slug=slug,
+            status=session_records.Status.RUNNING,
+            launcher_pid=6_945_001,
+            claude_session_id='sess-a',
+            claude_launch_session_id='sess-a',
+            claude_owner_pid=host,
+        ),
+        root=tmp_path,
+    )
+
+    sh.run_session_start(
+        _event('sess-b2', source),
+        {'CLAUDE_SPAWN_SESSION_ID': slug},
+        root=tmp_path,
+        process_tree=claude_process_tree(host),
+    )
+
+    assert _bound_session_id(slug, tmp_path) == 'sess-a'
+    forked = _slug_for('sess-b2', tmp_path)
+    assert forked != slug
+    assert session_records.read_record(forked, root=tmp_path).parent_session_id == slug
+
+
+@pytest.mark.parametrize('source', ['clear', 'compact'])
+def test_a_hosted_remint_does_not_adopt_a_t3_record_the_host_bound(
+    tmp_path: Path, shared_host_pid: int, source: str
+) -> None:
+    host = shared_host_pid
+    slug, thread = 'session-t3-6945', 'thread-6945'
+    session_records.write_record(
+        session_records.SessionRecord(
+            session_slug=slug,
+            status=session_records.Status.RUNNING,
+            title='t3 child',
+            cwd=_CWD,
+            launcher_pid=6_945_002,
+            display=session_records.Display(
+                kind=session_records.DisplayKind.T3.value, t3_thread_id=thread
+            ),
+            claude_session_id='sess-a',
+            claude_launch_session_id='sess-a',
+            claude_owner_pid=host,
+        ),
+        root=tmp_path,
+    )
+    session_records.write_t3_thread_pointer(thread, slug, root=tmp_path)
+    session_records.write_claude_session_pointer('sess-a', slug, root=tmp_path)
+
+    sh.run_session_start(
+        _event('sess-b2', source),
+        {'T3CODE_THREAD_ID': thread},
+        root=tmp_path,
+        process_tree=claude_process_tree(host),
+    )
+
+    assert _bound_session_id(slug, tmp_path) == 'sess-a'
+    assert _slug_for('sess-b2', tmp_path) != slug
