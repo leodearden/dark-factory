@@ -82,15 +82,16 @@ class ProcessTree:
     """The process tree one hook event's probes read.
 
     ``ProcessTree()`` reads the live tree: this process's parent and session
-    leader, then ``/proc``. The hook entry points accept one as
-    ``process_tree=``, so a caller names the tree to be judged rather than
-    patching these readers.
+    leader, then ``/proc``, including whether a pid is a shared ``claude
+    agents`` host. The hook entry points accept one as ``process_tree=``, so a
+    caller names the tree to be judged rather than patching these readers.
     """
 
     hook_parent_pid: Callable[[], int] = os.getppid
     parent_pid_of: Callable[[int], int | None] = _parent_pid_of
     comm_of: Callable[[int], str | None] = _process_comm
     session_leader_pid: Callable[[], int] = _session_leader_pid
+    is_shared_session_host: Callable[[int], bool] = session_identity.is_shared_session_host
 
 
 def _owning_claude_pid(tree: ProcessTree) -> int | None:
@@ -143,12 +144,12 @@ class EventProbes:
         """Is this event's ``claude`` a shared ``claude agents`` host? False when its pid is unresolvable.
 
         Every session a host runs in-process shares its pid, so that pid
-        cannot tell one hosted session from another
-        (``session_identity.is_shared_session_host``).
+        cannot tell one hosted session from another. Read through the tree's
+        ``is_shared_session_host``.
         """
         if self._shared_host is _Unresolved.TOKEN:
             pid = self.owning_claude_pid()
-            self._shared_host = pid is not None and session_identity.is_shared_session_host(pid)
+            self._shared_host = pid is not None and self._tree.is_shared_session_host(pid)
         return self._shared_host
 
     def owner_ppid_verdict(self) -> bool | None:
