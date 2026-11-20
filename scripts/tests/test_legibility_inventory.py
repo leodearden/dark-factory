@@ -855,7 +855,7 @@ class TestEnumerateSessionsInRange:
 
     def test_single_walk_opens_each_in_range_file_exactly_once(self, tmp_path, monkeypatch):
         # Three in-range dates across the window. A spy that wraps + delegates
-        # to _session_cwd_and_date (the single gz-decompress/open point)
+        # to _read_header (the single gz-decompress/open point)
         # records each path it is called with: every in-range file must be
         # passed EXACTLY ONCE — proving the range enumerator is O(total_files),
         # not O(window_days × files) (the per-date loop would open each file 3×).
@@ -865,14 +865,14 @@ class TestEnumerateSessionsInRange:
         _write_session(main_dir, 'day13', MAIN_CWD, timestamp='2026-07-13T09:00:00.000Z')
         _write_session(main_dir, 'day14', MAIN_CWD, timestamp='2026-07-14T09:00:00.000Z')
 
-        real = mod._session_cwd_and_date
+        real = mod._read_header
         opened = []
 
         def spy(path):
             opened.append(path)
             return real(path)
 
-        monkeypatch.setattr(mod, '_session_cwd_and_date', spy)
+        monkeypatch.setattr(mod, '_read_header', spy)
 
         records = mod.enumerate_sessions_in_range(
             projects_root, [MAIN_CWD], self.START_DATE, self.END_DATE
@@ -905,16 +905,16 @@ class TestArchiveEncPrefilter:
 
     @staticmethod
     def _install_open_spy(monkeypatch) -> list[Path]:
-        """Wrap+delegate to _session_cwd_and_date (the single gz-decompress/
+        """Wrap+delegate to _read_header (the single gz-decompress/
         open point), recording every path it is called with."""
-        real = mod._session_cwd_and_date
+        real = mod._read_header
         opened: list[Path] = []
 
         def spy(path):
             opened.append(path)
             return real(path)
 
-        monkeypatch.setattr(mod, '_session_cwd_and_date', spy)
+        monkeypatch.setattr(mod, '_read_header', spy)
         return opened
 
     def test_foreign_enc_excluded_and_never_opened(self, tmp_path, monkeypatch):
