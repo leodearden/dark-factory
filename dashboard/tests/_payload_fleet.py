@@ -159,14 +159,16 @@ class FleetCensus:
 
     * costs (110,596 bytes at ``window=all``): spend on 189 of the 3,650
       days, 23 (model, role) pairs, 9 accounts, the 200-event cap full;
-    * burndown (950,875 at ``window=90d``, re-measured 2026-11-17 by task
-      6991 once per-project labels became ``label_spans``): 12 projects
-      averaging 1,958 MEASURED rows (1,177 to 2,164) over a union of 2,661
-      labels; the payload scales with that count, not the span. The fleet
-      seeds 2,040 rows per root and serves 952,121. Its union is shorter
-      (2,384 labels), so it needs about 4% more rows per root than live to
-      reach the same bytes. Every third hourly row of the odd roots sits one
-      tick early, so each root's row is about 345 spans (live: 30 to 470);
+    * burndown (797,344 at ``window=90d`` with the rows' in-progress split
+      stripped, re-measured 2026-11-20 by task 10258): 12 projects, 24,157
+      MEASURED rows over a union of 2,748 labels spanning 61.6 of the 90
+      days; the payload scales with the row count, not the span. At about
+      9.5 KB a day it plateaus near 1,068,700 once the window fills, around
+      2026-12-19. The budget must hold that plateau, so the fleet seeds the
+      full-window steady state, 2,740 rows per root, not today's partly
+      filled window, and serves 1,068,143. Every third hourly row of the odd
+      roots sits one tick early, so each root's row is about 578 spans
+      (live: 43 to 525);
     * recon (35,216): 50 runs listed, 24 writing agents, 400 buffered events;
     * memory (41,065): 173 memory projects, 18 WAL stores, a day of samples;
     * curator (17,057): no pending tickets, every account capped all day;
@@ -342,7 +344,7 @@ CENSUS = FleetCensus(
         account_events=30,
         cap_reason_len=80,
     ),
-    burndown=BurndownShape(samples_per_root=2040, concurrency_cap=24, misaligned_hour_every=3),
+    burndown=BurndownShape(samples_per_root=2740, concurrency_cap=24, misaligned_hour_every=3),
     memory=MemoryShape(
         projects=173, project_id_len=21, graphiti_nodes=132_790, mem0_memories=85_425,
         wal_stores=(
