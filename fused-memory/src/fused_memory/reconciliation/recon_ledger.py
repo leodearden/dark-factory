@@ -55,6 +55,7 @@ from fused_memory.reconciliation.standing_decision_constants import (
     STREAK_PAYLOAD_KEY,
     STREAK_WINDOW_PAYLOAD_KEY,
 )
+from fused_memory.utils.sqlite_connector import Connector
 
 logger = logging.getLogger(__name__)
 
@@ -297,8 +298,13 @@ def _streak_row_from_record(record: ReconLedgerRecord) -> SuppressionStreakRow:
 class ReconLedgerStore:
     """SQLite-backed control-plane ledger for recon markers/suppressions/summaries."""
 
-    def __init__(self, db_path: Path | str) -> None:
+    def __init__(self, db_path: Path | str, *, connect: Connector = connect_daemon) -> None:
+        """*connect* is how ``initialize`` opens the ledger's one connection.
+
+        It is given the database path and defaults to ``connect_daemon``.
+        """
         self._db_path = Path(db_path)
+        self._connect = connect
         self._access: AtomicConnection | None = None
 
     async def initialize(self) -> None:
@@ -329,7 +335,7 @@ class ReconLedgerStore:
         if self._access is not None:
             await self.close()
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
-        conn = await connect_daemon(str(self._db_path))
+        conn = await self._connect(str(self._db_path))
         conn.row_factory = aiosqlite.Row
         await apply_full_durability_pragmas(conn, busy_timeout_ms=5000)
         self._access = AtomicConnection(conn)
