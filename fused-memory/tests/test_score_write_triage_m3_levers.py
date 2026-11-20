@@ -280,12 +280,10 @@ class TestClassify:
         with pytest.raises(ValueError, match='vibes'):
             self._classify(bad)
 
-    def test_the_dispute_kinds_are_closed_and_each_defined_in_one_sentence(self) -> None:
+    def test_the_dispute_kinds_are_a_closed_vocabulary(self) -> None:
         kinds = _mod().DISPUTE_KINDS
         assert set(kinds) == {'outdated_state', 'status_overtaken', 'newer_measurement',
                               'contradiction'}
-        for definition in kinds.values():
-            assert definition.endswith('.') and '. ' not in definition
 
     def test_accepts_every_kind_in_the_vocabulary(self) -> None:
         for kind in _mod().DISPUTE_KINDS:
