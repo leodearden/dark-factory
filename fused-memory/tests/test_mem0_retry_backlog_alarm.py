@@ -10,12 +10,16 @@ from pathlib import Path
 
 import pytest
 import pytest_asyncio
+from _fm_helpers import make_insufficient_quota_error
 from _mem0_intent_fixtures import seed_mem0_intent
 
+from fused_memory.services.billing_exhaustion_alarm import BillingAlarmState
 from fused_memory.services.mem0_retry_backlog_alarm import (
     ANCHOR_TASK_ID,
     alarm_on_stale_mem0_retries,
+    emit_mem0_retry_backlog_escalation,
 )
+from fused_memory.services.provider_billing import classify_billing_exhaustion
 from fused_memory.services.write_journal import (
     Mem0IntentStatus,
     Mem0RetryBacklog,
@@ -155,3 +159,71 @@ class TestTheAlarmNeverMisfilesOrRaises:
         assert filed == []
         assert _escalations(root) == []
         assert any(r.levelno >= logging.ERROR for r in caplog.records)
+
+
+_BILLING_PAGE_ID = 'esc-provider-billing-exhausted-1'
+_CREDITS_GONE_AT = _NOW - timedelta(hours=3)
+
+
+def _billing_state() -> BillingAlarmState:
+    exhaustion = classify_billing_exhaustion(make_insufficient_quota_error())
+    assert exhaustion is not None
+    return BillingAlarmState(
+        exhaustion=exhaustion,
+        first_seen=_CREDITS_GONE_AT,
+        first_site='mem0_write',
+        escalation_id=_BILLING_PAGE_ID,
+    )
+
+
+def _backlog() -> Mem0RetryBacklog:
+    return Mem0RetryBacklog(
+        project_id=_PROJECT,
+        count=3,
+        oldest_created_at=_NOW - timedelta(hours=2),
+        max_attempts=7,
+    )
+
+
+class TestABacklogBehindExhaustedCreditsNamesThem:
+    def test_the_record_points_at_the_billing_page(self, root):
+        billing = _billing_state()
+
+        emit_mem0_retry_backlog_escalation(
+            str(root), backlog=_backlog(), now=_NOW, max_age=_MAX_AGE, billing=billing,
+        )
+
+        (record,) = _escalations(root)
+        assert 'credits exhausted' in record['summary'].lower()
+        assert _BILLING_PAGE_ID in record['summary']
+        assert f'billing_exhausted_since={_CREDITS_GONE_AT.isoformat()}' in record['detail']
+        assert f'key_scope={billing.exhaustion.key_scope}' in record['detail']
+        text = f"{record['summary']} {record['detail']}".lower()
+        assert 'transient provider error' not in text
+
+    @pytest.mark.asyncio
+    async def test_the_periodic_check_threads_the_billing_state_through(self, journal, root):
+        await _seed_retrying(journal, age=timedelta(hours=2))
+
+        await alarm_on_stale_mem0_retries(
+            journal, now=_NOW, max_age=_MAX_AGE, project_roots={_PROJECT: str(root)},
+            billing=_billing_state(),
+        )
+
+        (record,) = _escalations(root)
+        assert 'credits exhausted' in record['summary'].lower()
+        assert _BILLING_PAGE_ID in record['summary']
+
+    def test_without_billing_the_text_is_unchanged(self, root):
+        emit_mem0_retry_backlog_escalation(
+            str(root), backlog=_backlog(), now=_NOW, max_age=_MAX_AGE,
+        )
+
+        (record,) = _escalations(root)
+        assert record['summary'] == (
+            f"3 Mem0 write(s) for project_id='{_PROJECT}' still retrying after 7200s "
+            '(threshold 3600s): acked as pending retry, unsearchable until they land'
+        )
+        assert 'refused them on a transient provider error' in record['detail']
+        assert 'billing_exhausted_since' not in record['detail']
+        assert 'key_scope' not in record['detail']
