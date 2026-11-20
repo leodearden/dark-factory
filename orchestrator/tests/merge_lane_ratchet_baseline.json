@@ -1918,6 +1918,7 @@
     "orchestrator/tests/test_warm_lane_pool_shrink.py": {"patch_targets": [], "private_reads": 5},
     "orchestrator/tests/test_warm_lane_previous_occupant.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_warm_lane_reseed_verify.py": {"patch_targets": [], "private_reads": 8},
+    "orchestrator/tests/test_warm_lane_resume_foreign_head.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_warm_lane_script_resolution.py": {"patch_targets": [], "private_reads": 16},
     "orchestrator/tests/test_warm_lane_seed_scrub.py": {"patch_targets": [], "private_reads": 4},
     "orchestrator/tests/test_warm_lane_soft_floor.py": {"patch_targets": [], "private_reads": 24},
