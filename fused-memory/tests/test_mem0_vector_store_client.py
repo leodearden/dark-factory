@@ -158,6 +158,8 @@ def test_the_vector_store_client_outlasts_whichever_budget_is_wider(
     target, default_read, read_budget, write_budget,
 ):
     with stub_qdrant_server(retrieve_delay_s={target: default_read + 0.5}) as stub:
-        client = mem0_client.build_vector_store_client(stub.url, read_budget, write_budget)
+        client = mem0_client.build_vector_store_client(
+            stub.url, read_budget_s=read_budget, write_budget_s=write_budget,
+        )
         with contextlib.closing(client):
             assert client.retrieve(collection_name=target, ids=[MEMORY_ID]) == []
