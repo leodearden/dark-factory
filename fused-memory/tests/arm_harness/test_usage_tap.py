@@ -38,6 +38,7 @@ REQUEST = {
     'response_format': {'type': 'json_schema', 'json_schema': {'name': 'x', 'schema': {}}},
     'messages': [{'role': 'user', 'content': 'extract the entities'}],
 }
+DRAIN_WAITING = 'usage tap: waiting'
 
 
 def _origin(mock) -> str:
@@ -254,20 +255,17 @@ def _post_in_background(tap_url: str, statuses: list[int]) -> threading.Thread:
     return client
 
 
-_DRAIN_WAITING = 'usage tap: waiting'
+class _DrainNoticeWatcher(io.StringIO):
+    """Stdout that sets ``draining`` once the closing session announces it is draining."""
 
-
-class _ReleaseOnceTheDrainWaits(io.StringIO):
-    """Stdout that releases the held upstream once the closing session announces it is draining."""
-
-    def __init__(self, release: threading.Event) -> None:
+    def __init__(self, draining: threading.Event) -> None:
         super().__init__()
-        self._release = release
+        self._draining = draining
 
     def write(self, text: str) -> int:
         written = super().write(text)
-        if _DRAIN_WAITING in self.getvalue():
-            self._release.set()
+        if DRAIN_WAITING in self.getvalue():
+            self._draining.set()
         return written
 
 
@@ -278,7 +276,7 @@ def test_closing_a_session_waits_for_a_call_still_in_flight_and_records_it_insid
     received, release = threading.Event(), threading.Event()
     statuses: list[int] = []
     with held_upstream(received, release) as upstream:
-        stdout = _ReleaseOnceTheDrainWaits(release)
+        stdout = _DrainNoticeWatcher(draining=release)
         with redirect_stdout(stdout), usage_tap(upstream, log_path=log) as tap_url:
             client = _post_in_background(tap_url, statuses)
             assert received.wait(timeout=10)
@@ -291,7 +289,7 @@ def test_closing_a_session_waits_for_a_call_still_in_flight_and_records_it_insid
     assert record.outlived_session is False
     assert statuses == [200]
     (waiting,) = stdout.getvalue().splitlines()
-    assert waiting.startswith(_DRAIN_WAITING)
+    assert waiting.startswith(DRAIN_WAITING)
     assert '1 in-flight call' in waiting
 
 
@@ -319,7 +317,7 @@ def test_a_call_still_in_flight_when_the_drain_bound_expires_is_marked_as_outliv
     assert record.status == 200
     assert record.prompt_tokens == HELD_PROMPT_TOKENS
     waiting, expired = capsys.readouterr().out.splitlines()
-    assert waiting.startswith('usage tap: waiting')
+    assert waiting.startswith(DRAIN_WAITING)
     assert expired.startswith('usage tap: drain bound')
     assert '1 call(s) still in flight' in expired
 
@@ -332,20 +330,12 @@ def _raise_interrupted(signum, frame) -> None:
     raise _InterruptedWhileDraining
 
 
-def _interrupt_main_thread_once_closed(tap_url: str) -> threading.Thread:
-    """Signal the main thread once the tap refuses connections: it is then draining."""
-    port = urlsplit(tap_url).port
+def _interrupt_main_thread_once_draining(draining: threading.Event) -> threading.Thread:
+    """Signal the main thread once the closing session announces it is draining."""
 
     def interrupt() -> None:
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline:
-            with socket.socket() as probe:
-                probe.settimeout(1)
-                if probe.connect_ex(('127.0.0.1', port)) != 0:
-                    break
-            time.sleep(0.05)
-        time.sleep(0.3)
-        signal.pthread_kill(threading.main_thread().ident or 0, signal.SIGUSR1)
+        if draining.wait(timeout=10):
+            signal.pthread_kill(threading.main_thread().ident or 0, signal.SIGUSR1)
 
     interrupter = threading.Thread(target=interrupt, daemon=True)
     interrupter.start()
@@ -354,17 +344,17 @@ def _interrupt_main_thread_once_closed(tap_url: str) -> threading.Thread:
 
 def test_an_interrupted_drain_still_marks_the_abandoned_call_as_outliving_the_session(tmp_path):
     log = tmp_path / 'calls.jsonl'
-    received, release = threading.Event(), threading.Event()
+    received, release, draining = threading.Event(), threading.Event(), threading.Event()
     statuses: list[int] = []
     previous = signal.signal(signal.SIGUSR1, _raise_interrupted)
     try:
         with held_upstream(received, release) as upstream:
-            with pytest.raises(_InterruptedWhileDraining), usage_tap(
-                upstream, log_path=log
-            ) as tap_url:
+            with pytest.raises(_InterruptedWhileDraining), redirect_stdout(
+                _DrainNoticeWatcher(draining)
+            ), usage_tap(upstream, log_path=log) as tap_url:
                 client = _post_in_background(tap_url, statuses)
                 assert received.wait(timeout=10)
-                interrupter = _interrupt_main_thread_once_closed(tap_url)
+                interrupter = _interrupt_main_thread_once_draining(draining)
             interrupter.join(timeout=10)
             release.set()
             client.join(timeout=10)
