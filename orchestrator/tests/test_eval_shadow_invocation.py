@@ -67,17 +67,6 @@ def test_strict_mcp_and_null_memory_are_inherited_from_the_eval_profile(tmp_path
     assert result.fused_memory.url == FM_NULL_SENTINEL_URL
 
 
-def test_sandbox_is_enabled_under_the_base_backend(tmp_path: Path) -> None:
-    base = OrchestratorConfig(
-        project_root=tmp_path, sandbox=SandboxConfig(enabled=True, backend='landlock'),
-    )
-
-    result = build_shadow_orch_config(_IMPL, _shadow_fixture(tmp_path), base)
-
-    assert result.sandbox.enabled is True
-    assert result.sandbox.backend == 'landlock'
-
-
 @pytest.mark.usefixtures('code_default_config')
 def test_shadow_config_equals_the_corpus_config(tmp_path: Path) -> None:
     base = OrchestratorConfig(project_root=tmp_path, sandbox=_SANDBOXED)
@@ -220,7 +209,7 @@ async def _build_workflow_kwargs_from(
 
 
 @pytest.mark.asyncio
-async def test_run_eval_under_the_shadow_profile_runs_its_cell_sandboxed_on_the_scoped_gate(
+async def test_run_eval_under_the_shadow_profile_gates_its_cell_with_productions_scoped_verify(
     tmp_path: Path, monkeypatch,
 ) -> None:
     kwargs = await _build_workflow_kwargs_from(
@@ -231,7 +220,6 @@ async def test_run_eval_under_the_shadow_profile_runs_its_cell_sandboxed_on_the_
         ),
     )
 
-    assert kwargs['config'].sandbox.enabled is True
     assert kwargs['task_verify'] is run_scoped_verification
 
 
@@ -250,19 +238,9 @@ async def test_run_eval_by_default_runs_its_cell_under_the_base_sandbox(
 
 
 @pytest.mark.asyncio
-async def test_run_shadow_eval_runs_its_cell_sandboxed(tmp_path: Path, monkeypatch) -> None:
-    config = (await _build_workflow_kwargs_from(
-        tmp_path, monkeypatch,
-        lambda base: run_shadow_eval(
-            tmp_path / 'task.json', _IMPL, base, worktree_path=tmp_path, usage_gate=None,
-        ),
-    ))['config']
-
-    assert config.sandbox.enabled is True
-
-
-@pytest.mark.asyncio
-async def test_run_shadow_end_to_end_runs_its_cell_sandboxed(tmp_path: Path, monkeypatch) -> None:
+async def test_run_shadow_end_to_end_runs_its_cell_under_the_architect_config(
+    tmp_path: Path, monkeypatch,
+) -> None:
     architect = EvalConfig('arch', 'claude', 'opus', 'high')
 
     config = (await _build_workflow_kwargs_from(
@@ -272,7 +250,6 @@ async def test_run_shadow_end_to_end_runs_its_cell_sandboxed(tmp_path: Path, mon
         ),
     ))['config']
 
-    assert config.sandbox.enabled is True
     assert config.models.architect == 'opus'
 
 
