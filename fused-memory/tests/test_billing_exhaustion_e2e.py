@@ -4,7 +4,9 @@ On 2026-11-19 an exhausted OpenAI balance dead-lettered 106 writes behind
 alarms that read as a transient rate limit. These tests pin what an operator
 now sees instead: one born-at-L2 page naming the credits, writes PARKED
 rather than dead-lettered, and both clearing by themselves once a write
-lands. A plain 429 keeps today's retry-then-dead-letter path.
+lands. A plain 429 keeps today's retry-then-dead-letter path. Mem0 writes,
+which already retry without limit, page the same way and resolve it when one
+lands.
 """
 
 from __future__ import annotations
@@ -26,6 +28,7 @@ from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from test_e2e_durable_queue import _mock_backends
 
 from fused_memory.middleware import _folded_escalation
+from fused_memory.models.enums import SourceStore
 from fused_memory.models.scope import configured_primary_root
 from fused_memory.services.memory_service import MemoryService
 
@@ -162,6 +165,52 @@ class TestExhaustedCreditsOnTheDurablePath:
             lambda: _records(tmp_path, _DEAD_LETTER) or None, timeout=20.0,
             message='no durable_write_dead_letter record was filed',
         )
+        assert _records(_primary_root(svc), _BILLING) == []
+
+
+async def _add_preference(svc: MemoryService, content: str):
+    return await svc.add_memory(
+        content=content, category='preferences_and_norms', project_id='main',
+    )
+
+
+class TestExhaustedCreditsOnTheMem0Path:
+    @pytest.mark.asyncio
+    async def test_a_deferred_write_pages_once(self, billing_service):
+        svc = billing_service
+        svc.mem0.add = AsyncMock(side_effect=make_insufficient_quota_error())
+
+        first = await _add_preference(svc, 'prefer explicit imports over star imports')
+        second = await _add_preference(svc, 'prefer frozen dataclasses for values')
+
+        assert first.stores_pending_retry == [SourceStore.mem0]
+        assert second.stores_pending_retry == [SourceStore.mem0]
+        [page] = _records(_primary_root(svc), _BILLING)
+        assert page['severity'] == 'critical'
+        assert page['level'] == 2
+        assert page['status'] == 'pending'
+        assert 'credits exhausted' in page['summary'].lower()
+
+    @pytest.mark.asyncio
+    async def test_a_landed_write_resolves_the_page(self, billing_service):
+        svc = billing_service
+        svc.mem0.add = AsyncMock(side_effect=make_insufficient_quota_error())
+        await _add_preference(svc, 'prefer explicit imports over star imports')
+
+        svc.mem0.add = AsyncMock(return_value={'results': [{'id': 'mem0-back'}]})
+        landed = await _add_preference(svc, 'prefer frozen dataclasses for values')
+
+        assert landed.memory_ids == ['mem0-back']
+        assert [r['status'] for r in _records(_primary_root(svc), _BILLING)] == ['resolved']
+
+    @pytest.mark.asyncio
+    async def test_a_transient_429_defers_without_a_billing_page(self, billing_service):
+        svc = billing_service
+        svc.mem0.add = AsyncMock(side_effect=make_transient_rate_limit_error())
+
+        result = await _add_preference(svc, 'prefer explicit imports over star imports')
+
+        assert result.stores_pending_retry == [SourceStore.mem0]
         assert _records(_primary_root(svc), _BILLING) == []
 
 
