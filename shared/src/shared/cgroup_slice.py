@@ -1,4 +1,5 @@
-"""The per-project cgroup slice name rule: one systemd slice level per project id.
+"""The names in the per-project cgroup topology: the slice name rule (one systemd
+slice level per project id) and the daemon's subgroup inside its service.
 
 Contract: docs/cgroup-slice-topology.md.
 """
@@ -7,7 +8,9 @@ from __future__ import annotations
 
 import re
 
-__all__ = ['project_slice_name']
+__all__ = ['DAEMON_SUBGROUP', 'project_slice_name']
+
+DAEMON_SUBGROUP = 'daemon'
 
 _OUTSIDE_SLICE_ALPHABET = re.compile('[^a-z0-9_]')
 

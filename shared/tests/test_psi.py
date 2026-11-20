@@ -722,6 +722,12 @@ CGROUP_NO_SLICE = (
 SLICE_PATH = '/user.slice/user-1000.slice/user@1000.service/df.slice/df-x.slice'
 SCOPE_PATH = f'{SLICE_PATH}/df-verify-x-0123456789ab.scope'
 UNIT_PATH = '/user.slice/user-1000.slice/user@1000.service/app.slice/orchestrator-x.service'
+# plans/per-consumer-resource-recording-prd.md D10 is the home of the daemon-subgroup shape.
+CGROUP_IN_DAEMON_SUBGROUP = (
+    '0::/user.slice/user-1000.slice/user@1000.service/'
+    'df.slice/df-x.slice/orchestrator-x.service/daemon\n'
+)
+DAEMON_PATH = f'{SLICE_PATH}/orchestrator-x.service/daemon'
 
 
 @pytest.fixture(autouse=True)
@@ -782,6 +788,30 @@ class TestResolveOwnCgroup:
 
         assert own.path == UNIT_PATH
         assert own.pressure_path == tmp_path / 'sys' / UNIT_PATH.lstrip('/') / 'cpu.pressure'
+
+    def test_daemon_subgroup_resolves_to_the_project_slice(self, tmp_path):
+        from shared.psi import resolve_own_cgroup
+
+        own = resolve_own_cgroup(
+            'x',
+            proc_cgroup_path=self._cgroup_file(tmp_path, CGROUP_IN_DAEMON_SUBGROUP),
+            cgroup_root=tmp_path / 'sys',
+        )
+
+        assert own.path == SLICE_PATH
+        assert own.pressure_path == tmp_path / 'sys' / SLICE_PATH.lstrip('/') / 'cpu.pressure'
+
+    def test_daemon_subgroup_without_project_id_resolves_to_the_raw_leaf(self, tmp_path):
+        """The raw leaf is what the harness hands the slice weight step."""
+        from shared.psi import resolve_own_cgroup
+
+        own = resolve_own_cgroup(
+            None,
+            proc_cgroup_path=self._cgroup_file(tmp_path, CGROUP_IN_DAEMON_SUBGROUP),
+            cgroup_root=tmp_path / 'sys',
+        )
+
+        assert own.path == DAEMON_PATH
 
     def test_none_project_id_resolves_to_the_leaf(self, tmp_path):
         from shared.psi import resolve_own_cgroup
