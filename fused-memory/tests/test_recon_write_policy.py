@@ -27,6 +27,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 import pytest_asyncio
+from _census_helpers import census_lines
 from _fm_helpers import LoopFreedomProbe, as_async_run_git
 from shared.task_metadata import _BLESSED_METADATA_KEYS, parse_metadata
 
@@ -152,15 +153,6 @@ def _capturing_async_detector(captured: dict, result: bool = False):
         return result
 
     return _spy
-
-
-_SCHEMA_WARNING = 'task_metadata.schema_warning'
-
-
-def _discard_lines(caplog, source: str) -> list[str]:
-    """The census lines that name *source* as the reader that discarded metadata."""
-    messages = (r.getMessage() for r in caplog.records)
-    return [m for m in messages if _SCHEMA_WARNING in m and f'source={source}' in m]
 
 
 # ---------------------------------------------------------------------------
@@ -513,12 +505,12 @@ class TestCheckGate2LiveWorkflow:
         assert verdict.is_rejection is False
 
     @pytest.mark.parametrize(
-        ('task_metadata', 'census_lines'),
+        ('task_metadata', 'expected_census_count'),
         [('not json', 1), (42, 1), ('[]', 1), (['a'], 1), (None, 0), ('', 0)],
         ids=['invalid-json', 'int', 'json-list', 'list', 'none', 'empty-str'],
     )
     async def test_gate_2_logs_unreadable_task_metadata_once_and_absent_never(
-        self, monkeypatch, caplog, task_metadata, census_lines
+        self, monkeypatch, caplog, task_metadata, expected_census_count
     ):
         """Unreadable task_metadata still fails safe toward live, and is
         logged once under source=recon_write_policy.check; absent metadata
@@ -534,7 +526,7 @@ class TestCheckGate2LiveWorkflow:
 
         assert captured['kwargs'].get('task_kind') is None
         assert captured['kwargs'].get('pure_gate') is False
-        assert len(_discard_lines(caplog, 'recon_write_policy.check')) == census_lines
+        assert len(census_lines(caplog, 'recon_write_policy.check')) == expected_census_count
 
 
 # ---------------------------------------------------------------------------
@@ -902,7 +894,7 @@ class TestExtractSnapshotToken:
         with caplog.at_level(logging.WARNING):
             assert recon_write_policy.extract_snapshot_token(metadata) is None
         source = 'recon_write_policy.extract_snapshot_token'
-        assert len(_discard_lines(caplog, source)) == 1
+        assert len(census_lines(caplog, source)) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -1362,7 +1354,7 @@ class TestIsTerminalAnnotationExempt:
                 {'metadata': '{not json'},
             ) is False
         source = 'recon_write_policy.terminal_annotation_merge'
-        assert len(_discard_lines(caplog, source)) == 1
+        assert len(census_lines(caplog, source)) == 1
 
 
 # ---------------------------------------------------------------------------
