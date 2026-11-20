@@ -243,9 +243,9 @@ fi
 # in listing order. Each unit runs in its own session, so a terminal's Ctrl-C
 # or hangup reaches only this hook, and a SIGKILL to the commit's group, which
 # no hook can trap, reaches no unit at all. On INT, TERM or HUP the hook TERMs
-# every unit's whole process group, descendants a dying parent orphaned
-# included, and ignores further INT, TERM and HUP while it does. The unit logs
-# go on any exit.
+# the whole process group of every unit it has not yet collected, orphaned
+# descendants included even once the unit's own shell has exited, and ignores
+# further INT, TERM and HUP while it does. The unit logs go on any exit.
 GATE_SLOTS=4
 gate_start=$SECONDS
 staged="$(cd "$ROOT" && git -c core.quotepath=false diff --cached --no-renames --name-only --diff-filter=ACMRD)" || {
@@ -269,14 +269,15 @@ else
     gate_collected=0
     gate_failed=false
     gate_stop_units() {
-        local job groups=()
-        for job in $(jobs -p); do groups+=("$job" "-$job"); done
-        [ "${#groups[@]}" -eq 0 ] || kill -TERM -- "${groups[@]}" 2>/dev/null
+        local pid live=($(jobs -rp))
+        local -A groups=()
+        for pid in "${live[@]}" "${gate_pids[@]:gate_collected}"; do groups["-$pid"]=1; done
+        [ "${#groups[@]}" -eq 0 ] || kill -TERM -- "${live[@]}" "${!groups[@]}" 2>/dev/null
     }
     gate_collect_next() {
         local i=$gate_collected unit_rc=0
-        gate_collected=$((gate_collected + 1))
         wait "${gate_pids[$i]}" || unit_rc=$?
+        gate_collected=$((gate_collected + 1))
         if [ "$unit_rc" -eq 0 ]; then
             echo "  ok ${gate_units[$i]}"
         else
