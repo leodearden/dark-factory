@@ -38,6 +38,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import dataclasses
+import enum
 import hashlib
 import json
 import os
@@ -86,14 +87,21 @@ else:
     _pairs = load_script(_SCRIPTS / 'score_write_triage_pairs.py', 'score_write_triage_pairs')
     _wording = load_script(_SCRIPTS / 'write_triage_judge_wording.py', 'write_triage_judge_wording')
 
-KIND_JUDGE = 'judge'
-KIND_SECOND_PASS = 'second_pass'
-KIND_TRANSFORM = 'transform'
-ARM_KINDS = (KIND_JUDGE, KIND_SECOND_PASS, KIND_TRANSFORM)
 
-SCOPE_ALL = 'all'
-SCOPE_SOAK_JUDGE_BAND = 'soak-judge-band'
-"""Judge every case the soak's own judge band held, whatever today's route."""
+class ArmKind(enum.StrEnum):
+    """What an arm does with each case."""
+
+    JUDGE = 'judge'
+    SECOND_PASS = 'second_pass'
+    TRANSFORM = 'transform'
+
+
+class ArmScope(enum.StrEnum):
+    """Which cases an arm holds a row for, and which of them it judges."""
+
+    ALL = 'all'
+    SOAK_JUDGE_BAND = 'soak-judge-band'
+    """Judge every case the soak's own judge band held, whatever today's route."""
 
 SHIPPED_MODEL = 'gpt-6.1-sol'
 MAX_ATTEMPTS = 4
@@ -122,18 +130,23 @@ class Arm:
     """One replay arm: a judge configuration, or a pass over a parent arm's rows.
 
     A transform arm makes no call: ``transform`` reads each parent row and
-    says whether the write is dispute-marked.
+    says whether the write is dispute-marked. An unknown kind or scope is
+    refused at construction.
     """
 
     name: str
-    kind: str
+    kind: ArmKind
     prompt: str | None
     model: str | None
     effort: str | None
     parent: str | None
-    scope: str
+    scope: ArmScope
     description: str
     transform: Callable[[Mapping[str, Any]], bool] | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, 'kind', ArmKind(self.kind))
+        object.__setattr__(self, 'scope', ArmScope(self.scope))
 
 
 def mark_refused_contest(parent_row: Mapping[str, Any]) -> bool:
@@ -152,7 +165,8 @@ _SHIPPED_PROMPT = _wording.system_prompt(_wording.WORDING_SHIPPED)
 
 
 def _shipped_arm(name: str, effort: str, description: str) -> Arm:
-    return Arm(name, KIND_JUDGE, _SHIPPED_PROMPT, SHIPPED_MODEL, effort, None, SCOPE_ALL, description)
+    return Arm(name, ArmKind.JUDGE, _SHIPPED_PROMPT, SHIPPED_MODEL, effort, None, ArmScope.ALL,
+               description)
 
 
 # --- lever prompts ----------------------------------------------------------
@@ -336,25 +350,25 @@ subject is not the entry's.
 """
 
 ARMS: tuple[Arm, ...] = (
-    Arm('psi-repro', KIND_JUDGE, _wording.PSI_JUDGE_SYSTEM_PROMPT, SHIPPED_MODEL, 'low', None,
-        SCOPE_SOAK_JUDGE_BAND,
+    Arm('psi-repro', ArmKind.JUDGE, _wording.PSI_JUDGE_SYSTEM_PROMPT, SHIPPED_MODEL, 'low', None,
+        ArmScope.SOAK_JUDGE_BAND,
         'the soak-era psi prompt and model; its agreement with the soak outcomes is the harness error'),
     _shipped_arm('f3p', 'low', "the shipped F3' prompt as deployed: the baseline every lever is read against"),
     _shipped_arm('f3p-repeat', 'low', "f3p again: the judge's run-to-run noise floor"),
-    Arm('a1-partial-dispute', KIND_JUDGE, A1_PARTIAL_DISPUTE_PROMPT, SHIPPED_MODEL, 'low', None,
-        SCOPE_ALL, 'the amends/contests boundary moved: a dispute of any part of a candidate contests'),
-    Arm('c1-dispute-marker', KIND_SECOND_PASS, C1_DISPUTE_MARKER_PROMPT, SHIPPED_MODEL, 'low',
-        'f3p', SCOPE_ALL,
+    Arm('a1-partial-dispute', ArmKind.JUDGE, A1_PARTIAL_DISPUTE_PROMPT, SHIPPED_MODEL, 'low', None,
+        ArmScope.ALL, 'the amends/contests boundary moved: a dispute of any part of a candidate contests'),
+    Arm('c1-dispute-marker', ArmKind.SECOND_PASS, C1_DISPUTE_MARKER_PROMPT, SHIPPED_MODEL, 'low',
+        'f3p', ArmScope.ALL,
         "a second pass over f3p's attached amendments and restatements; a dispute marks the write"),
-    Arm('d1-stale-detail-check', KIND_JUDGE, D1_STALE_DETAIL_CHECK_PROMPT, SHIPPED_MODEL, 'low',
-        None, SCOPE_ALL,
+    Arm('d1-stale-detail-check', ArmKind.JUDGE, D1_STALE_DETAIL_CHECK_PROMPT, SHIPPED_MODEL, 'low',
+        None, ArmScope.ALL,
         "the shipped prompt plus a check of each candidate's time-sensitive details"),
-    Arm('e1-mark-refused-contests', KIND_TRANSFORM, None, None, None, 'f3p', SCOPE_ALL,
+    Arm('e1-mark-refused-contests', ArmKind.TRANSFORM, None, None, None, 'f3p', ArmScope.ALL,
         "f3p's contests the attach guard stored, marking the record each disputes",
         mark_refused_contest),
-    Arm('d1-e1-combined', KIND_TRANSFORM, None, None, None, 'd1-stale-detail-check', SCOPE_ALL,
+    Arm('d1-e1-combined', ArmKind.TRANSFORM, None, None, None, 'd1-stale-detail-check', ArmScope.ALL,
         'the recommended sequence: d1, then e1 over its verdicts', mark_refused_contest),
-    Arm('a1-e1-combined', KIND_TRANSFORM, None, None, None, 'a1-partial-dispute', SCOPE_ALL,
+    Arm('a1-e1-combined', ArmKind.TRANSFORM, None, None, None, 'a1-partial-dispute', ArmScope.ALL,
         'the low-false-contest alternative: a1, then e1 over its verdicts', mark_refused_contest),
     _shipped_arm('b1-sol-medium', 'medium', 'the shipped prompt at medium reasoning effort'),
     _shipped_arm('b2-sol-high', 'high', 'the shipped prompt at high reasoning effort'),
@@ -369,7 +383,7 @@ def arm_named(name: str, arms: Iterable[Arm] = ARMS) -> Arm:
 
 
 def validate_arms(arms: Sequence[Arm]) -> None:
-    """Refuse a malformed arm table: names, kinds, scopes, prompts and parents."""
+    """Refuse a malformed arm table: names, prompts, parents and transforms."""
     seen: set[str] = set()
     for arm in arms:
         problem = _arm_problem(arm, seen)
@@ -381,17 +395,15 @@ def validate_arms(arms: Sequence[Arm]) -> None:
 def _arm_problem(arm: Arm, seen: set[str]) -> str | None:
     if not _NAME.fullmatch(arm.name) or arm.name in seen:
         return 'the name must be unique, lowercase and filename-safe'
-    if arm.kind not in ARM_KINDS or arm.scope not in (SCOPE_ALL, SCOPE_SOAK_JUDGE_BAND):
-        return f'kind {arm.kind!r} or scope {arm.scope!r} is unknown'
-    if (arm.kind == KIND_JUDGE) != (arm.parent is None):
+    if (arm.kind is ArmKind.JUDGE) != (arm.parent is None):
         return 'a judge arm names no parent, and every other kind names one'
     if arm.parent is not None and arm.parent not in seen:
         return f'parent {arm.parent!r} is not an earlier arm'
-    if arm.kind != KIND_TRANSFORM and not arm.prompt:
+    if arm.kind is not ArmKind.TRANSFORM and not arm.prompt:
         return 'a judge or second-pass arm needs a prompt'
-    if (arm.kind == KIND_TRANSFORM) != (arm.transform is not None):
+    if (arm.kind is ArmKind.TRANSFORM) != (arm.transform is not None):
         return 'a transform arm, and only a transform arm, carries a transform function'
-    if arm.kind == KIND_TRANSFORM and (arm.prompt or arm.model or arm.effort):
+    if arm.kind is ArmKind.TRANSFORM and (arm.prompt or arm.model or arm.effort):
         return 'a transform arm makes no call, so it names no prompt, model or effort'
     return None
 
@@ -411,7 +423,7 @@ def _shingles(text: str) -> dict[tuple[str, ...], None]:
     )
 
 
-def refuse_corpus_text(arms: Iterable[Arm], cases: Iterable[Any]) -> None:
+def refuse_corpus_text(arms: Iterable[Arm], cases: Iterable[_cases.ReplayCase]) -> None:
     """Refuse an arm whose prompt shares a token shingle with any case's write or parent text.
 
     The same corpus both motivates and scores the lever prompts, so a prompt
@@ -456,7 +468,7 @@ class _Call:
 
 
 async def _ask(
-    case: Any, service: Any, sleep: Callable[[float], Awaitable[Any]],
+    case: _cases.ReplayCase, service: Any, sleep: Callable[[float], Awaitable[Any]],
 ) -> _Call:
     features = case.features
     score = features.cos_parent if features.cos_parent is not None else _UNMEASURED_STORE_SCORE
@@ -491,16 +503,37 @@ async def _ask(
     raise AssertionError('unreachable: the last attempt always returns')
 
 
-def _base_row(case: Any, arm: Arm, *, cases_sha256: str, prompt_sha256: str | None) -> dict[str, Any]:
-    features = case.features
+def _blank_row(
+    arm: Arm, *, entry_id: str, target_id: str, route: str, cases_sha256: str,
+    prompt_sha256: str | None,
+) -> dict[str, Any]:
+    """Every key an arm row carries, for a write no call has been made on."""
     return {
-        'arm': arm.name, 'entry_id': features.entry_id, 'target_id': features.target_id,
-        'route': str(features.route), 'model': arm.model, 'effort': arm.effort,
+        'arm': arm.name, 'entry_id': entry_id, 'target_id': target_id, 'route': route,
+        'model': arm.model, 'effort': arm.effort,
         'prompt_sha256': prompt_sha256, 'cases_sha256': cases_sha256,
         'judge_outcome': None, 'candidate_id': None, 'dispute_marked': None,
         'calls': 0, 'attempts': 0, 'seconds': None, 'input_tokens': None,
         'output_tokens': None, 'reasoning_tokens': None, 'usd': 0.0,
         'error_type': None, 'error': None, 'transport_failures': [],
+    }
+
+
+def _base_row(
+    case: _cases.ReplayCase, arm: Arm, *, cases_sha256: str, prompt_sha256: str | None,
+) -> dict[str, Any]:
+    features = case.features
+    return _blank_row(
+        arm, entry_id=features.entry_id, target_id=features.target_id, route=str(features.route),
+        cases_sha256=cases_sha256, prompt_sha256=prompt_sha256,
+    )
+
+
+def _inherited(parent_row: Mapping[str, Any]) -> dict[str, Any]:
+    """The verdicts a second-pass or transform row copies from its parent's row."""
+    return {
+        'judge_outcome': parent_row['judge_outcome'], 'candidate_id': parent_row.get('candidate_id'),
+        'routed_outcome': parent_row['routed_outcome'],
     }
 
 
@@ -520,43 +553,57 @@ def _call_fields(call: _Call, model: str | None) -> dict[str, Any]:
     }
 
 
-def _judged(case: Any, arm: Arm) -> bool:
-    if arm.scope == SCOPE_SOAK_JUDGE_BAND:
-        return case.features.soak_band == OUTCOME_JUDGE
-    return case.features.route is _cases.Route.JUDGE
+def _in_scope(case: _cases.ReplayCase, arm: Arm) -> bool:
+    """Does a complete *arm* hold a row for *case*?"""
+    return arm.scope is ArmScope.ALL or case.features.soak_band == OUTCOME_JUDGE
+
+
+def _replayed_features(case: _cases.ReplayCase, arm: Arm) -> _cases.CaseFeatures:
+    """*case*'s features as *arm* routes them: a soak-judge-band arm judges every case it holds."""
+    if arm.scope is ArmScope.SOAK_JUDGE_BAND:
+        return dataclasses.replace(case.features, route=_cases.Route.JUDGE)
+    return case.features
+
+
+def _judged(case: _cases.ReplayCase, arm: Arm) -> bool:
+    """Does a judge *arm* call the judge on *case*, one of the cases it holds a row for?"""
+    return _replayed_features(case, arm).route is _cases.Route.JUDGE
+
+
+def _second_pass_applies(parent_row: Mapping[str, Any]) -> bool:
+    """Is the parent's write an attached amendment or restatement, which a second pass re-asks?"""
+    return parent_row['judge_outcome'] in _SECOND_PASS_SOURCES and (
+        parent_row['routed_outcome'] == parent_row['judge_outcome']
+    )
 
 
 async def judge_case(
-    case: Any, arm: Arm, service: Any, *, cases_sha256: str, prompt_sha256: str,
+    case: _cases.ReplayCase, arm: Arm, service: Any, *, cases_sha256: str, prompt_sha256: str,
     sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
 ) -> dict[str, Any]:
     """One judge-arm row for *case*; the caller holds the arm's prompt in force."""
     row = _base_row(case, arm, cases_sha256=cases_sha256, prompt_sha256=prompt_sha256)
     guard = resolve_attach_guard(service)
-    if not _judged(case, arm):
-        return row | {'routed_outcome': _cases.routed_outcome(case.features, None, guard)}
+    features = _replayed_features(case, arm)
+    if features.route is not _cases.Route.JUDGE:
+        return row | {'routed_outcome': _cases.routed_outcome(features, None, guard)}
     call = await _ask(case, service, sleep)
-    routed = _cases.routed_outcome(
-        dataclasses.replace(case.features, route=_cases.Route.JUDGE), call.outcome, guard,
-    ) if arm.scope == SCOPE_SOAK_JUDGE_BAND else _cases.routed_outcome(case.features, call.outcome, guard)
     return row | _call_fields(call, arm.model) | {
-        'judge_outcome': call.outcome, 'candidate_id': call.candidate_id, 'routed_outcome': routed,
+        'judge_outcome': call.outcome, 'candidate_id': call.candidate_id,
+        'routed_outcome': _cases.routed_outcome(features, call.outcome, guard),
     }
 
 
 async def second_pass_case(
-    case: Any, parent_row: Mapping[str, Any], arm: Arm, service: Any, *, cases_sha256: str,
-    prompt_sha256: str, sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
+    case: _cases.ReplayCase, parent_row: Mapping[str, Any], arm: Arm, service: Any, *,
+    cases_sha256: str, prompt_sha256: str,
+    sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
 ) -> dict[str, Any]:
     """A second pass over a parent row: is an attached amendment or restatement disputed?"""
-    row = _base_row(case, arm, cases_sha256=cases_sha256, prompt_sha256=prompt_sha256) | {
-        'judge_outcome': parent_row['judge_outcome'], 'candidate_id': parent_row['candidate_id'],
-        'routed_outcome': parent_row['routed_outcome'], 'dispute_marked': False,
-    }
-    attached = parent_row['judge_outcome'] in _SECOND_PASS_SOURCES and (
-        parent_row['routed_outcome'] == parent_row['judge_outcome']
+    row = _base_row(case, arm, cases_sha256=cases_sha256, prompt_sha256=prompt_sha256) | (
+        _inherited(parent_row) | {'dispute_marked': False}
     )
-    if not attached:
+    if not _second_pass_applies(parent_row):
         return row
     call = await _ask(case, service, sleep)
     return row | _call_fields(call, arm.model) | {
@@ -570,17 +617,12 @@ def transform_row(
     """A transform arm's row: the parent's verdicts, marked by the arm's function, at no cost."""
     if arm.transform is None:
         raise ValueError(f'arm {arm.name!r} carries no transform')
-    return {
-        'arm': arm.name, 'entry_id': parent_row['entry_id'],
-        'target_id': parent_row.get('target_id'), 'route': parent_row.get('route'),
-        'model': None, 'effort': None, 'prompt_sha256': None, 'cases_sha256': cases_sha256,
-        'judge_outcome': parent_row['judge_outcome'],
-        'candidate_id': parent_row.get('candidate_id'),
-        'routed_outcome': parent_row['routed_outcome'],
+    row = _blank_row(
+        arm, entry_id=parent_row['entry_id'], target_id=parent_row['target_id'],
+        route=parent_row['route'], cases_sha256=cases_sha256, prompt_sha256=None,
+    )
+    return row | _inherited(parent_row) | {
         'dispute_marked': bool(parent_row.get('dispute_marked')) or arm.transform(parent_row),
-        'calls': 0, 'attempts': 0, 'seconds': None, 'input_tokens': None,
-        'output_tokens': None, 'reasoning_tokens': None, 'usd': 0.0,
-        'error_type': None, 'error': None, 'transport_failures': [],
     }
 
 
@@ -610,11 +652,9 @@ def read_arm_rows(path: Path) -> list[dict[str, Any]]:
     return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
 
 
-def arm_scope_cases(cases: Sequence[Any], arm: Arm) -> list[Any]:
+def arm_scope_cases(cases: Sequence[_cases.ReplayCase], arm: Arm) -> list[_cases.ReplayCase]:
     """The cases a complete *arm* holds a row for."""
-    if arm.scope == SCOPE_SOAK_JUDGE_BAND:
-        return [case for case in cases if case.features.soak_band == OUTCOME_JUDGE]
-    return list(cases)
+    return [case for case in cases if _in_scope(case, arm)]
 
 
 class _Spend:
@@ -641,7 +681,7 @@ def _refuse_foreign(rows: Sequence[Mapping[str, Any]], arm: Arm, *, cases_sha256
 
 
 async def run_arms(
-    cases: Sequence[Any],
+    cases: Sequence[_cases.ReplayCase],
     arms: Sequence[Arm],
     *,
     config: Any,
@@ -667,10 +707,10 @@ async def run_arms(
 
 
 async def _run_arm(
-    cases: Sequence[Any], arm: Arm, *, config: Any, arms_dir: Path, spend: _Spend,
+    cases: Sequence[_cases.ReplayCase], arm: Arm, *, config: Any, arms_dir: Path, spend: _Spend,
     cases_sha256: str, concurrency: int, sleep: Callable[[float], Awaitable[Any]],
 ) -> bool:
-    if arm.kind == KIND_TRANSFORM:
+    if arm.kind is ArmKind.TRANSFORM:
         return _run_transform_arm(cases, arm, arms_dir=arms_dir, cases_sha256=cases_sha256)
     service = arm_service(config, arm)
     if not resolve_judge_enabled(service):
@@ -687,11 +727,11 @@ async def _run_arm(
         todo = [case for case in scope if case.features.entry_id not in written]
         gate = asyncio.Semaphore(concurrency)
 
-        async def one(case: Any) -> None:
+        async def one(case: _cases.ReplayCase) -> None:
             async with gate:
                 if spend.exhausted and _needs_call(case, arm, parents):
                     return
-                if arm.kind == KIND_JUDGE:
+                if arm.kind is ArmKind.JUDGE:
                     row = await judge_case(case, arm, service, cases_sha256=cases_sha256,
                                            prompt_sha256=prompt_sha, sleep=sleep)
                 else:
@@ -712,7 +752,7 @@ async def _run_arm(
 
 
 def _run_transform_arm(
-    cases: Sequence[Any], arm: Arm, *, arms_dir: Path, cases_sha256: str,
+    cases: Sequence[_cases.ReplayCase], arm: Arm, *, arms_dir: Path, cases_sha256: str,
 ) -> bool:
     parents = _complete_parent_rows(cases, arm, arms_dir)
     if parents is None:
@@ -729,17 +769,16 @@ def _run_transform_arm(
     return True
 
 
-def _needs_call(case: Any, arm: Arm, parents: Mapping[str, Mapping[str, Any]]) -> bool:
-    if arm.kind == KIND_JUDGE:
+def _needs_call(
+    case: _cases.ReplayCase, arm: Arm, parents: Mapping[str, Mapping[str, Any]],
+) -> bool:
+    if arm.kind is ArmKind.JUDGE:
         return _judged(case, arm)
-    parent = parents[case.features.entry_id]
-    return parent['judge_outcome'] in _SECOND_PASS_SOURCES and (
-        parent['routed_outcome'] == parent['judge_outcome']
-    )
+    return _second_pass_applies(parents[case.features.entry_id])
 
 
 def _complete_parent_rows(
-    cases: Sequence[Any], arm: Arm, arms_dir: Path,
+    cases: Sequence[_cases.ReplayCase], arm: Arm, arms_dir: Path,
 ) -> dict[str, dict[str, Any]] | None:
     """The parent arm's rows by entry id; ``{}`` for a judge arm; None while the parent is partial."""
     if arm.parent is None:

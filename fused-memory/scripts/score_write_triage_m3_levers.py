@@ -39,6 +39,7 @@ The report carries no timestamps, so the same inputs give the same files.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import math
 import sys
@@ -110,7 +111,7 @@ _PLACES = 4
 
 def arm_items(
     soak_items: Sequence[Mapping[str, Any]],
-    features: Sequence[Any],
+    features: Sequence[_cases.CaseFeatures],
     rows: Iterable[Mapping[str, Any]],
 ) -> list[dict[str, Any]]:
     """The scorer item rows an arm's outcomes give; refuse an arm missing any case."""
@@ -141,7 +142,7 @@ def _closures(
         _scorer.item_readings(items, verdicts)
     except _scorer.IncompleteJudgementError as refusal:
         gaps = refusal.gaps
-        if any(gap.binary != _rubric.Binary.HOME or gap.kind != 'tied' for gap in gaps):
+        if any(gap.binary != _rubric.Binary.HOME or gap.kind != _rubric.GapKind.TIED for gap in gaps):
             raise
     else:
         return None
@@ -230,7 +231,7 @@ def _weights(items: Sequence[Mapping[str, Any]], strata: Mapping[str, int]) -> d
 
 def _readings(
     items: Sequence[Mapping[str, Any]], verdicts: Sequence[Mapping[str, Any]],
-) -> dict[str, Any]:
+) -> dict[str, _scorer.ItemReading]:
     """Each item's reading, under the first HOME-tie closure when one is needed.
 
     M3 never reads HOME on a CONFLICT write, so either closure gives the same endings.
@@ -240,15 +241,15 @@ def _readings(
     return {reading.entry_id: reading for reading in _scorer.item_readings(items, rows)}
 
 
-def _is_conflict(reading: Any) -> bool:
+def _is_conflict(reading: _scorer.ItemReading) -> bool:
     return reading.decided is not None and reading.decided.conflict
 
 
-def _is_hidden(reading: Any) -> bool:
+def _is_hidden(reading: _scorer.ItemReading) -> bool:
     return reading.m3_ending in _scorer.HIDDEN_ENDINGS
 
 
-def _false_conflict(reading: Any) -> int:
+def _false_conflict(reading: _scorer.ItemReading) -> int:
     return int(reading.decided is not None and _rubric.Cell.FALSE_CONFLICT in reading.decided.triage_cells)
 
 
@@ -384,7 +385,7 @@ def classify(
     items: Sequence[Mapping[str, Any]],
     verdicts: Sequence[Mapping[str, Any]],
     strata: Mapping[str, int],
-    features: Sequence[Any],
+    features: Sequence[_cases.CaseFeatures],
     labels: Iterable[Mapping[str, Any]],
 ) -> dict[str, Any]:
     """Split the soak's M3 hits by every dimension, in sample and population counts."""
@@ -426,14 +427,14 @@ def classify(
 
 
 def _hit_facts(
-    item: Mapping[str, Any], feature: Any, label: Mapping[str, Any],
-    judgements: Mapping[Any, Any],
+    item: Mapping[str, Any], feature: _cases.CaseFeatures, label: Mapping[str, Any],
+    judgements: Mapping[_rubric.PairKey, _rubric.Judgement],
 ) -> dict[str, str]:
     judgement = judgements.get(
         _rubric.PairKey(item['entry_id'], item['target_id'], _rubric.Basis.CURRENT),
     )
 
-    def answer(binary: Any) -> str:
+    def answer(binary: _rubric.Binary) -> str:
         resolved = None if judgement is None else judgement.answer(binary)
         return 'unknown' if resolved is None else str(resolved).lower()
 
@@ -476,7 +477,7 @@ def arm_report(
     soak_items: Sequence[Mapping[str, Any]],
     verdicts: Sequence[Mapping[str, Any]],
     strata: Mapping[str, int],
-    features: Sequence[Any],
+    features: Sequence[_cases.CaseFeatures],
 ) -> dict[str, Any]:
     """One arm's report entry; *baseline_rows* is None for the baseline arm itself."""
     items = arm_items(soak_items, features, rows)
@@ -498,7 +499,7 @@ def build_report(
     soak_items: Sequence[Mapping[str, Any]],
     verdicts: Sequence[Mapping[str, Any]],
     strata: Mapping[str, int],
-    features: Sequence[Any],
+    features: Sequence[_cases.CaseFeatures],
     labels: Iterable[Mapping[str, Any]],
     arms: Mapping[str, Sequence[Mapping[str, Any]]],
     baseline: str,
@@ -642,28 +643,29 @@ def _partial_figures(rows: Sequence[Mapping[str, Any]], cases: int) -> dict[str,
             'projected_usd': round(usd / len(rows) * cases, 2) if rows else None}
 
 
-def _inputs(args: argparse.Namespace) -> dict[str, Any]:
-    return committed_inputs(
-        items=args.items, verdicts=args.verdicts, strata=args.strata, features=args.features,
-        labels=args.labels,
-    )
+@dataclasses.dataclass(frozen=True)
+class InputPaths:
+    """Where the report's committed inputs are read from; each field is also a CLI flag."""
+
+    items: Path = CALIBRATION / 'write_triage_v2_soak_items.jsonl'
+    verdicts: Path = CALIBRATION / 'write_triage_v2_soak_verdicts.jsonl'
+    strata: Path = CALIBRATION / 'write_triage_v2_soak_strata.json'
+    features: Path = CALIBRATION / 'write_triage_m3_replay_cases.jsonl'
+    labels: Path = CALIBRATION / 'write_triage_m3_hidden_conflicts.jsonl'
 
 
-def committed_inputs(
-    *,
-    items: Path = CALIBRATION / 'write_triage_v2_soak_items.jsonl',
-    verdicts: Path = CALIBRATION / 'write_triage_v2_soak_verdicts.jsonl',
-    strata: Path = CALIBRATION / 'write_triage_v2_soak_strata.json',
-    features: Path = CALIBRATION / 'write_triage_m3_replay_cases.jsonl',
-    labels: Path = CALIBRATION / 'write_triage_m3_hidden_conflicts.jsonl',
-) -> dict[str, Any]:
+COMMITTED = InputPaths()
+"""The committed inputs the report in ``calibration/`` is scored from."""
+
+
+def committed_inputs(paths: InputPaths = COMMITTED) -> dict[str, Any]:
     """The report's committed inputs, keyed as :func:`build_report` takes them."""
     return {
-        'soak_items': _read_jsonl(items),
-        'verdicts': _read_jsonl(verdicts),
-        'strata': json.loads(strata.read_text()),
-        'features': _cases.read_features(features),
-        'labels': _read_jsonl(labels),
+        'soak_items': _read_jsonl(paths.items),
+        'verdicts': _read_jsonl(paths.verdicts),
+        'strata': json.loads(paths.strata.read_text()),
+        'features': _cases.read_features(paths.features),
+        'labels': _read_jsonl(paths.labels),
     }
 
 
@@ -674,16 +676,10 @@ def assemble_report(
     repro_arms: Sequence[str],
     baseline: str,
     prompt_commit: str,
-    items: Path = CALIBRATION / 'write_triage_v2_soak_items.jsonl',
-    verdicts: Path = CALIBRATION / 'write_triage_v2_soak_verdicts.jsonl',
-    strata: Path = CALIBRATION / 'write_triage_v2_soak_strata.json',
-    features: Path = CALIBRATION / 'write_triage_m3_replay_cases.jsonl',
-    labels: Path = CALIBRATION / 'write_triage_m3_hidden_conflicts.jsonl',
+    paths: InputPaths = COMMITTED,
 ) -> dict[str, Any]:
     """The lever report from files: an arm missing cases is reported as partial, not scored."""
-    inputs = committed_inputs(
-        items=items, verdicts=verdicts, strata=strata, features=features, labels=labels,
-    )
+    inputs = committed_inputs(paths)
     case_count = len(inputs['features'])
     complete: dict[str, list[dict[str, Any]]] = {}
     partial: dict[str, dict[str, Any]] = {}
@@ -710,14 +706,8 @@ def _build_parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest='command', required=True)
     for name in ('classify', 'report'):
         command = commands.add_parser(name)
-        command.add_argument('--items', type=Path, default=CALIBRATION / 'write_triage_v2_soak_items.jsonl')
-        command.add_argument('--verdicts', type=Path,
-                             default=CALIBRATION / 'write_triage_v2_soak_verdicts.jsonl')
-        command.add_argument('--strata', type=Path, default=CALIBRATION / 'write_triage_v2_soak_strata.json')
-        command.add_argument('--features', type=Path,
-                             default=CALIBRATION / 'write_triage_m3_replay_cases.jsonl')
-        command.add_argument('--labels', type=Path,
-                             default=CALIBRATION / 'write_triage_m3_hidden_conflicts.jsonl')
+        for field in dataclasses.fields(InputPaths):
+            command.add_argument(f'--{field.name}', type=Path, default=field.default)
     report = commands.choices['report']
     report.add_argument('--arms-dir', type=Path, default=CALIBRATION / 'write_triage_m3_lever_arms')
     report.add_argument('--arms', required=True, help='comma-separated arms to score, in table order')
@@ -730,17 +720,20 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _input_paths(args: argparse.Namespace) -> InputPaths:
+    return InputPaths(**{field.name: getattr(args, field.name) for field in dataclasses.fields(InputPaths)})
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     if args.command == 'classify':
-        inputs = _inputs(args)
+        inputs = committed_inputs(_input_paths(args))
         print(json.dumps(classify(inputs['soak_items'], inputs['verdicts'], inputs['strata'],
                                   inputs['features'], inputs['labels']), indent=2, sort_keys=True))
         return 0
     report = assemble_report(
         arms_dir=args.arms_dir, arms=_names(args.arms), repro_arms=_names(args.repro_arms),
-        baseline=args.baseline, prompt_commit=args.prompt_commit, items=args.items,
-        verdicts=args.verdicts, strata=args.strata, features=args.features, labels=args.labels,
+        baseline=args.baseline, prompt_commit=args.prompt_commit, paths=_input_paths(args),
     )
     text = json.dumps(report, indent=2, sort_keys=True) + '\n'
     args.out_json.write_text(text)

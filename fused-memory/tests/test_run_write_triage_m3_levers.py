@@ -166,6 +166,18 @@ class TestTheArmTable:
             assert arm.scope in {'all', 'soak-judge-band'}
             seen.add(arm.name)
 
+    def test_an_unknown_kind_or_scope_is_refused_at_construction(self) -> None:
+        with pytest.raises(ValueError, match='bogus'):
+            _mod().Arm('x', 'bogus', 'P', 'gpt-6.1-sol', 'low', None, 'all', 'x')
+        with pytest.raises(ValueError, match='everything'):
+            _mod().Arm('x', 'judge', 'P', 'gpt-6.1-sol', 'low', None, 'everything', 'x')
+
+    def test_a_kind_and_scope_given_as_text_are_held_as_their_enums(self) -> None:
+        arm = _mod().Arm('x', 'second_pass', 'P', 'gpt-6.1-sol', 'low', 'f3p', 'soak-judge-band',
+                         'x')
+        assert arm.kind is _mod().ArmKind.SECOND_PASS
+        assert arm.scope is _mod().ArmScope.SOAK_JUDGE_BAND
+
     def test_only_the_shipped_prompt_is_shared(self) -> None:
         prompted = [arm for arm in _mod().ARMS if arm.kind != 'transform']
         assert all(arm.prompt for arm in prompted)
@@ -509,7 +521,8 @@ class TestCombinationArms:
 
 
 def _parent_row(entry: str, judge: str | None, routed: str, **extra: Any) -> dict[str, Any]:
-    return {'entry_id': entry, 'judge_outcome': judge, 'routed_outcome': routed,
+    return {'entry_id': entry, 'target_id': f'T-{entry}', 'route': 'judge',
+            'judge_outcome': judge, 'candidate_id': None, 'routed_outcome': routed,
             'dispute_marked': None, **extra}
 
 
