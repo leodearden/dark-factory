@@ -340,7 +340,7 @@ class TestPollRefresh:
         poll ticks: rebuild-on-change is the behavior under test, and coupling
         it to wall-clock timing (poll_interval vs. a pilot.pause duration) is
         a flake risk under a loaded runner. The timer wiring itself
-        (set_interval actually calling refresh_registry) is covered
+        (set_interval actually calling start_poll_tick) is covered
         separately by TestTimerIntegration below -- the one test in this
         module allowed to depend on real timing.
 

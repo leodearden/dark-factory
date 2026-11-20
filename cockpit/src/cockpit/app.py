@@ -583,16 +583,14 @@ class CockpitApp(App):
         """Run one tick of the background poll: the same call the poll timer makes.
 
         Returns BEFORE the scan lands: the scan runs on a Textual worker
-        thread (_scan_registry_worker), so a caller that needs its result
-        awaits ``app.workers.wait_for_complete()``. A tick that arrives
-        while a scan is still in flight is dropped, but the cockpit-ui.json
-        flush runs even on a dropped tick. refresh_registry, by contrast,
-        scans and applies synchronously on the calling (main) thread, with
-        no flush and no backpressure. Main-thread-only, like the
-        _scan_in_flight flag it checks.
-
-        The scan runs off the UI thread so a slow one (10k+ sessions,
-        ~4.5s) never freezes input (C10 tour F1, esc-2303-1).
+        thread (_scan_registry_worker) so a slow one (10k+ sessions, ~4.5s)
+        never freezes input (C10 tour F1, esc-2303-1), and a caller that
+        needs its result awaits ``app.workers.wait_for_complete()``. A tick
+        that arrives while a scan is still in flight is dropped, but the
+        cockpit-ui.json flush runs even on a dropped tick. refresh_registry,
+        by contrast, scans and applies synchronously on the calling (main)
+        thread, with no flush and no backpressure. Main-thread-only, like
+        the _scan_in_flight flag it checks.
 
         Why the drop: in production poll_interval (1.5s) is routinely
         shorter than a full scan over 10k+ sessions (~4.5s), so an
@@ -608,12 +606,8 @@ class CockpitApp(App):
         and hands it to the worker, so a stale hand-off can be dropped once
         it lands -- see _apply_scan's stale-scan guard (esc-2517-1).
 
-        The flush (see _flush_ui_config) reuses the poll timer rather than
-        adding a second recurring wake-up. It must run BEFORE the
-        _scan_in_flight early return: a 10k+-session scan routinely outlasts
-        the poll interval, so a flush placed after it would be starved for
-        as long as scans keep overlapping -- the busy-fleet case where the
-        operator is most likely to be moving the cursor.
+        A flush (see _flush_ui_config) placed after the _scan_in_flight
+        early return would be starved for as long as scans keep overlapping.
         test_app.py::TestUIConfigWriteDebounce::
         test_flush_is_not_starved_by_the_scan_backpressure_drop pins the
         placement.
