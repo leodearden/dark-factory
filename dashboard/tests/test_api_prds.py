@@ -14,7 +14,7 @@ import logging
 import threading
 import time
 from collections import Counter
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import MappingProxyType
@@ -50,13 +50,6 @@ from dashboard.data.prd_view import Segment
 ROOT = 'dark-factory'
 SLOW = 'slow'
 BROKEN = 'broken'
-
-
-@pytest.fixture(scope='module', autouse=True)
-def _module_samplers_off() -> Iterator[None]:
-    with pytest.MonkeyPatch.context() as patched:
-        patched.setenv('DASHBOARD_SAMPLERS', 'off')
-        yield
 
 
 @pytest.fixture(scope='module')
