@@ -259,9 +259,7 @@ def fast_settle_poll(monkeypatch):
     monkeypatch.setattr(SEED, 'SETTLE_POLL_INTERVAL_S', 0.001)
 
 
-def test_a_copy_whose_indexes_never_settle_is_deleted_and_never_saved(
-    fast_settle_poll, monkeypatch
-):
+def test_a_copy_whose_indexes_never_settle_is_deleted_and_never_saved(monkeypatch):
     monkeypatch.setattr(SEED, 'SETTLE_TIMEOUT_S', 0.02)
     name = _scratch_name()
     graph = _IndexBuildingGraph(
