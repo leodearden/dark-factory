@@ -49,6 +49,7 @@ import sys
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import Enum
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -1266,6 +1267,55 @@ def quarantine_interrupted_operation(worktree: Path) -> Path | None:
             op.head_ref or 'detached',
         )
     return specimen
+
+
+class PriorRebase(Enum):
+    """What a rebase about to start found already in its worktree."""
+
+    NONE = 'none'                # nothing there; git itself reports anything odd
+    QUARANTINED = 'quarantined'  # a stale rebase was moved aside; proceed
+    IN_PROGRESS = 'in_progress'  # a rebase that may be live; do not touch it
+
+
+def quarantine_stale_rebase(worktree: Path) -> PriorRebase:
+    """Classify, and if stale move aside, a rebase *worktree* already carries.
+
+    A rebase (merge or apply backend) detaches HEAD and re-attaches it only on
+    finish, so rebase state under an ATTACHED HEAD means a branch was checked
+    out over an abandoned rebase: it is stale by construction, and moving it
+    aside changes no ref.  Under a DETACHED HEAD it may be a live or crashed
+    rebase of any branch, and nothing here can say whose; the caller must not
+    abort it, because an abort resets that rebase's head-name to its
+    orig-head and checks it out (task 10991).
+
+    An unresolvable worktree answers ``NONE``: git itself then reports
+    whatever is wrong, as it did before this check existed.  Never raises.
+    """
+    op = _interrupted_operation(Path(worktree))
+    if op is None or not op.rebase_in_progress:
+        return PriorRebase.NONE
+    if op.head_ref is None:
+        logger.warning(
+            'A rebase of %s is already in progress in %s under a detached '
+            'HEAD. Not starting another and not aborting it: nothing here can '
+            'attribute it to the branch being rebased now.',
+            op.rebase_head_name, worktree,
+        )
+        return PriorRebase.IN_PROGRESS
+    specimen = _move_aside(op)
+    if specimen is None:
+        logger.warning(
+            'A stale rebase of %s sits under HEAD %s in %s and could not be '
+            'moved aside; refusing to rebase over it.',
+            op.rebase_head_name, op.head_ref, worktree,
+        )
+        return PriorRebase.IN_PROGRESS
+    logger.warning(
+        'Moved a stale rebase of %s aside to %s: HEAD in %s is attached to %s, '
+        'which a running rebase never leaves it. Nothing was aborted.',
+        op.rebase_head_name, specimen, worktree, op.head_ref,
+    )
+    return PriorRebase.QUARANTINED
 
 
 # ---------------------------------------------------------------------------

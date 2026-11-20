@@ -10233,6 +10233,12 @@ class GitOps:
         Returns True on success.  On failure, ATTEMPTS a guarded abort and
         returns False — which does NOT imply a clean worktree: aborts fail.
 
+        It never aborts a rebase it did not start (task 10991).  Rebase state
+        already in *worktree* is classified first by
+        ``orchestrator/src/orchestrator/rebase_recovery.py::quarantine_stale_rebase``:
+        stale state is moved aside and the rebase proceeds, while a rebase
+        that may still be live is refused with False and left untouched.
+
         A commit the rebase drops because the target already carries its
         change is logged and recorded
         (``orchestrator/src/orchestrator/rebase_drops.py::RebaseDropLedger``).
@@ -10241,6 +10247,11 @@ class GitOps:
         outside the lock so multiple tasks can rebase concurrently in
         their own worktrees.
         """
+        prior = await asyncio.to_thread(
+            rebase_recovery.quarantine_stale_rebase, worktree,
+        )
+        if prior is rebase_recovery.PriorRebase.IN_PROGRESS:
+            return False
         target = onto if onto is not None else self.config.main_branch
         rebased = await run_rebase_reporting_drops(_run, worktree, onto=target)
         if not rebased.ok:
