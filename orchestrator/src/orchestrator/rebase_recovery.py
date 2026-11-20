@@ -28,6 +28,12 @@ Each is independently sufficient to make the abort return rc 0.  They are kept
 together because the first stops the failure and the second keeps the
 evidence; deleting either on the theory that the other covers it loses a
 capability the remaining half never had.
+
+A third, separate capability (task 10991): an operation a lane's PREVIOUS
+occupant left half-done is moved aside, never aborted.  Aborting someone
+else's rebase resets their branch to its orig-head and checks it out; moving
+the state into a common-dir specimen changes nothing git tracks and keeps the
+record of whose operation it was.  See :func:`quarantine_interrupted_operation`.
 """
 
 from __future__ import annotations
@@ -369,7 +375,7 @@ def _quarantine_dir(scan: MergeRrScan) -> Path:
     return scan.common_dir / _QUARANTINE_DIRNAME
 
 
-def _worktree_token(scan: MergeRrScan) -> str:
+def _worktree_token(git_dir: Path, common_dir: Path) -> str:
     """Which worktree a specimen came from, for a name that must now say so.
 
     Beside the original, the containing directory identified the worktree.  In
@@ -378,9 +384,8 @@ def _worktree_token(scan: MergeRrScan) -> str:
     git dir is named for the worktree; the main checkout's git dir IS the
     common dir and carries no such name.
     """
-    git_dir = scan.merge_rr_path.parent
     try:
-        if git_dir.resolve() == scan.common_dir.resolve():
+        if git_dir.resolve() == common_dir.resolve():
             return 'main'
     except OSError:
         pass          # unresolvable is not the main checkout; name it as found
@@ -396,7 +401,8 @@ def _free_backup_path(scan: MergeRrScan) -> Path:
     """
     stamp = datetime.now(UTC).strftime(_QUARANTINE_STAMP)
     base = _quarantine_dir(scan) / (
-        f'{scan.merge_rr_path.name}.{_worktree_token(scan)}-{stamp}'
+        f'{scan.merge_rr_path.name}.'
+        f'{_worktree_token(scan.merge_rr_path.parent, scan.common_dir)}-{stamp}'
     )
     if not base.exists():
         return base
@@ -1045,16 +1051,38 @@ async def guarded_abort(
 
 
 # ---------------------------------------------------------------------------
-# CLI
+# Interrupted operations: detected after a failed abort, moved aside at handover
 # ---------------------------------------------------------------------------
 
 #: Files and directories whose PRESENCE means git has an interrupted operation
-#: to undo.  Checked only AFTER a failed abort, where they are what separates
-#: "the abort did not clean up" from "there was nothing to abort" -- two states
-#: git reports with the same non-zero exit.
+#: to undo.  After a failed abort they separate "the abort did not clean up"
+#: from "there was nothing to abort" -- two states git reports with the same
+#: non-zero exit.  Before a lane is handed on they are what a previous
+#: occupant left behind.
 _IN_PROGRESS_MARKERS = (
     'rebase-merge', 'rebase-apply', 'MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD',
 )
+
+_REBASE_MARKERS = ('rebase-merge', 'rebase-apply')
+
+#: State git writes BESIDE a marker for the same operation.  Moved with it, so
+#: a specimen is the whole operation and the worktree is left with no half of
+#: one; never looked for on its own, since none of these means "in progress".
+_OPERATION_COMPANIONS = ('MERGE_MSG', 'MERGE_MODE', 'AUTO_MERGE', 'sequencer')
+
+#: Directory under the COMMON git dir that holds moved-aside operations, for
+#: the same outlives-the-worktree reason :func:`_quarantine_dir` gives.
+_OPERATION_SPECIMENS_DIRNAME = 'interrupted-operation-specimens'
+
+
+def _present(git_dir: Path, names: Iterable[str]) -> tuple[str, ...]:
+    """The subset of *names* present directly under *git_dir*.
+
+    ``os.path.lexists`` answers False on every OSError, so a directory this
+    cannot stat reads as holding nothing rather than raising out of a recovery
+    path.
+    """
+    return tuple(name for name in names if os.path.lexists(git_dir / name))
 
 
 def _operation_still_in_progress(worktree: Path) -> bool:
@@ -1076,8 +1104,173 @@ def _operation_still_in_progress(worktree: Path) -> bool:
     if dirs is None:
         return True
     git_dir, _ = dirs
-    return any((git_dir / marker).exists() for marker in _IN_PROGRESS_MARKERS)
+    return bool(_present(git_dir, _IN_PROGRESS_MARKERS))
 
+
+@dataclass(frozen=True)
+class InterruptedOperation:
+    """An operation git left half-done in one worktree, and whose it was.
+
+    ``entries`` are the names present under ``git_dir``: markers first, then
+    their companions.  ``head_ref`` is the ref HEAD is attached to, or ``None``
+    when HEAD is detached (or unreadable, which is answered the same way so
+    that nothing treats an unknown HEAD as an attached one).
+    ``rebase_head_name`` is the branch a rebase was rewriting, read from its
+    own state -- the evidence of whose rebase this is.
+    """
+
+    git_dir: Path
+    common_dir: Path
+    entries: tuple[str, ...]
+    head_ref: str | None
+    rebase_head_name: str | None
+
+    @property
+    def rebase_in_progress(self) -> bool:
+        return any(entry in _REBASE_MARKERS for entry in self.entries)
+
+
+def _read_stripped(path: Path) -> str | None:
+    try:
+        return path.read_text(errors='surrogateescape').strip()
+    except OSError:
+        return None
+
+
+def _attached_head_ref(git_dir: Path) -> str | None:
+    head = _read_stripped(git_dir / 'HEAD')
+    if head is None or not head.startswith('ref:'):
+        return None
+    return head.removeprefix('ref:').strip()
+
+
+def _rebase_head_name(git_dir: Path) -> str | None:
+    for marker in _REBASE_MARKERS:
+        name = _read_stripped(git_dir / marker / 'head-name')
+        if name:
+            return name
+    return None
+
+
+def _interrupted_operation(worktree: Path) -> InterruptedOperation | None:
+    """What *worktree* has left half-done, or ``None`` for nothing or unknown.
+
+    Unresolvable answers ``None`` here, unlike
+    :func:`_operation_still_in_progress`: every caller of this reader is about
+    to MOVE something, and a worktree that cannot be identified is not one to
+    move anything out of.  One probe, then pure filesystem reads.
+    """
+    dirs = resolve_git_dirs(worktree)
+    if dirs is None:
+        return None
+    git_dir, common_dir = dirs
+    markers = _present(git_dir, _IN_PROGRESS_MARKERS)
+    if not markers:
+        return None
+    return InterruptedOperation(
+        git_dir=git_dir,
+        common_dir=common_dir,
+        entries=markers + _present(git_dir, _OPERATION_COMPANIONS),
+        head_ref=_attached_head_ref(git_dir),
+        rebase_head_name=_rebase_head_name(git_dir),
+    )
+
+
+def _claim_specimen_dir(op: InterruptedOperation) -> Path | None:
+    """Exclusively create ``<common>/interrupted-operation-specimens/<wt>-<stamp>``.
+
+    ``os.mkdir`` fails with ``FileExistsError`` on a name another run holds,
+    so the claim is the guarantee no specimen is ever merged into another's;
+    the counter only supplies the next name, as in :func:`quarantine_merge_rr`.
+    """
+    root = op.common_dir / _OPERATION_SPECIMENS_DIRNAME
+    stamp = datetime.now(UTC).strftime(_QUARANTINE_STAMP)
+    base = f'{_worktree_token(op.git_dir, op.common_dir)}-{stamp}'
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        for attempt in range(1, _QUARANTINE_CLAIM_ATTEMPTS + 1):
+            candidate = root / (base if attempt == 1 else f'{base}-{attempt}')
+            try:
+                os.mkdir(candidate)
+            except FileExistsError:
+                continue      # another run claimed it; take the next name
+            return candidate
+    except OSError as exc:
+        logger.warning(
+            'Could not claim a specimen directory under %s: %s. The '
+            'interrupted operation in %s is left in place.', root, exc, op.git_dir,
+        )
+        return None
+    logger.warning(
+        'Could not claim a free specimen name under %s after %d attempts. The '
+        'interrupted operation in %s is left in place.',
+        root, _QUARANTINE_CLAIM_ATTEMPTS, op.git_dir,
+    )
+    return None
+
+
+def _move_aside(op: InterruptedOperation) -> Path | None:
+    """Rename every entry of *op* into a claimed specimen; the path means MOVED.
+
+    A rename changes no ref, HEAD, index or working tree, which is the whole
+    reason this is not an abort.  The specimen is returned only when no marker
+    is left in the git dir, so a partial move reports failure while keeping
+    whatever did move.
+    """
+    specimen = _claim_specimen_dir(op)
+    if specimen is None:
+        return None
+    for entry in op.entries:
+        try:
+            os.rename(op.git_dir / entry, specimen / entry)
+        except OSError as exc:
+            logger.warning(
+                'Could not move %s aside to %s: %s.',
+                op.git_dir / entry, specimen, exc,
+            )
+    remaining = _present(op.git_dir, _IN_PROGRESS_MARKERS)
+    if remaining:
+        logger.warning(
+            'Interrupted operation in %s is STILL THERE after the move to %s '
+            '(left: %s).', op.git_dir, specimen, ', '.join(remaining),
+        )
+        return None
+    return specimen
+
+
+def quarantine_interrupted_operation(worktree: Path) -> Path | None:
+    """Move whatever git left half-done in *worktree* aside; never abort it.
+
+    A lane handed to a new occupant can still carry the previous one's
+    interrupted rebase or merge: a checkout does not remove ``rebase-merge/``.
+    Aborting it there resets the PREVIOUS occupant's branch to its orig-head
+    and checks that branch out (reify ``_lane-20``, task 10991).  Moving the
+    state into a claimed common-dir specimen instead changes no ref, HEAD,
+    index or tree, and keeps ``head-name`` and ``orig-head`` as the record of
+    whose operation it was.  MERGE_RR is not moved: rerere state stays with
+    :func:`preflight_rebase_recovery`.
+
+    Returns the specimen, or ``None`` when there was nothing to move, the
+    worktree could not be identified, or the move did not complete.  Never
+    raises.
+    """
+    op = _interrupted_operation(Path(worktree))
+    if op is None:
+        return None
+    specimen = _move_aside(op)
+    if specimen is not None:
+        logger.warning(
+            'Moved an interrupted git operation in %s aside to %s without '
+            'aborting it: entries %s; rebase head-name %s; HEAD %s.',
+            worktree, specimen, ', '.join(op.entries), op.rebase_head_name,
+            op.head_ref or 'detached',
+        )
+    return specimen
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
