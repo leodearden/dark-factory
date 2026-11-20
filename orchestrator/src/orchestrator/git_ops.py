@@ -7697,6 +7697,12 @@ class GitOps:
             state.  ``expected_title=None`` (default) disables the guard and
             all existing callers/tests are unaffected.
 
+        **Prior occupant's interrupted operation** (task 10991):
+            Before routing, every acquire moves any rebase, merge, cherry-pick
+            or revert state left in the lane aside into a common-dir specimen
+            (``orchestrator/src/orchestrator/rebase_recovery.py::quarantine_interrupted_operation``),
+            never aborting it.  No ref, HEAD or tree moves, and it never raises.
+
         **Pre-acquire base-health gate** (task 2061, runs FIRST — before the ε
         disk-guard and before :func:`acquire_for`):
             Calls :meth:`_warm_lane_base_resolvable`.  A definite
@@ -8037,6 +8043,12 @@ class GitOps:
                     _orphan_confirmed_unregistered = True
             # else: not reused, already registered, or repair restored the
             # registration in place — proceed (possibly still reused) below.
+
+            # A prior occupant's interrupted rebase/merge rides along with the
+            # lane: a checkout does not remove rebase-merge/, and aborting it
+            # later resets THAT occupant's branch (reify _lane-20, task 10991).
+            # Moved aside on every route, before any of them touches the lane.
+            await asyncio.to_thread(rebase_recovery.quarantine_interrupted_operation, lane)
 
             if reused:
                 # ── Reuse path: live requeue of same task on same lane ────

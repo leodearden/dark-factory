@@ -1159,8 +1159,12 @@ def _interrupted_operation(worktree: Path) -> InterruptedOperation | None:
     Unresolvable answers ``None`` here, unlike
     :func:`_operation_still_in_progress`: every caller of this reader is about
     to MOVE something, and a worktree that cannot be identified is not one to
-    move anything out of.  One probe, then pure filesystem reads.
+    move anything out of.  One probe, then pure filesystem reads.  A path that
+    is not a directory -- a lane not created yet -- is answered without the
+    probe, whose spawn would fail and log as if something were wrong.
     """
+    if not os.path.isdir(worktree):
+        return None
     dirs = resolve_git_dirs(worktree)
     if dirs is None:
         return None
