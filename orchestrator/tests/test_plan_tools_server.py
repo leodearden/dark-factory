@@ -644,7 +644,7 @@ class TestMarkStepDone:
         def _boom(*_a, **_k):  # pragma: no cover - must never run
             raise AssertionError('reachability was probed for an unknown step')
 
-        monkeypatch.setattr(plan_tools, '_sha_branch_reachability', _boom)
+        monkeypatch.setattr(subprocess, 'run', _boom)
 
         result = _mark_step_done(git_artifacts, 'typo-step', 'deadbeef' * 5)
 
@@ -671,7 +671,7 @@ class TestMarkStepDone:
                 raise subprocess.TimeoutExpired(cmd=argv, timeout=10)
             return real_run(argv, **kwargs)
 
-        monkeypatch.setattr(plan_tools.subprocess, 'run', _fake_run)
+        monkeypatch.setattr(subprocess, 'run', _fake_run)
 
         with caplog.at_level(logging.WARNING):
             result = _mark_step_done(git_artifacts, 'step-1', sha)
@@ -724,71 +724,6 @@ class TestMarkStepDone:
         assert plan['design_decisions'][0]['rationale'] == clean
         assert plan['steps'][0]['status'] == 'pending'
         assert not plan['steps'][0].get('commit')
-
-
-class TestShaBranchReachability:
-    """The tri-state probe itself, and the fail-CLOSED boolean built on it."""
-
-    def test_the_two_probes_map_to_the_three_states(self, tmp_path, monkeypatch):
-        """rc-by-rc, with no repo involved — the table the callers rely on."""
-        calls: list[list[str]] = []
-
-        def _fake_run(argv, **_kwargs):
-            calls.append(argv)
-            rc = 0 if 'rev-parse' in argv else _fake_run.merge_base_rc
-            return subprocess.CompletedProcess(argv, rc, '', '')
-
-        monkeypatch.setattr(plan_tools.subprocess, 'run', _fake_run)
-
-        for rc, expected in ((0, 'reachable'), (1, 'unreachable'), (128, 'unreachable')):
-            _fake_run.merge_base_rc = rc
-            assert plan_tools._sha_branch_reachability(tmp_path, 'sha') == expected
-
-        # A repo that does not resolve says nothing about the sha.
-        def _no_repo(argv, **_kwargs):
-            return subprocess.CompletedProcess(argv, 128, '', 'not a git repository')
-
-        monkeypatch.setattr(plan_tools.subprocess, 'run', _no_repo)
-        assert plan_tools._sha_branch_reachability(tmp_path, 'sha') == 'unknown'
-
-    @pytest.mark.parametrize('failing_probe', ['rev-parse', 'merge-base'])
-    @pytest.mark.parametrize(
-        'exc',
-        [subprocess.TimeoutExpired(cmd=['git'], timeout=10), OSError('no git binary')],
-        ids=['timeout', 'oserror'],
-    )
-    def test_either_probe_blowing_up_is_unknown(
-        self, tmp_path, monkeypatch, failing_probe, exc,
-    ):
-        """Both probes, both exception families -> 'unknown', never a verdict.
-
-        Returning 'unreachable' from any of these four cells would turn an
-        infra fault into a rejection of real committed work."""
-        def _fake_run(argv, **_kwargs):
-            if failing_probe in argv:
-                raise exc
-            return subprocess.CompletedProcess(argv, 0, '', '')
-
-        monkeypatch.setattr(plan_tools.subprocess, 'run', _fake_run)
-
-        assert plan_tools._sha_branch_reachability(tmp_path, 'sha') == 'unknown'
-
-    @pytest.mark.parametrize(
-        ('state', 'expected'),
-        [('reachable', True), ('unreachable', False), ('unknown', False)],
-    )
-    def test_sha_exists_on_branch_is_the_fail_closed_projection(
-        self, tmp_path, monkeypatch, state, expected,
-    ):
-        """`_sha_exists_on_branch` == (reachability == 'reachable').
-
-        Pins the collapse of the two duplicated probes into one: the architect
-        guard keeps refusing on BOTH 'unreachable' and 'unknown', which is the
-        behaviour it had when it owned its own subprocess block."""
-        monkeypatch.setattr(
-            plan_tools, '_sha_branch_reachability', lambda *_a, **_k: state,
-        )
-        assert plan_tools._sha_exists_on_branch(tmp_path, 'sha') is expected
 
 
 # ---------------------------------------------------------------------------
@@ -1702,11 +1637,10 @@ class TestArtifactsFromArgsTaskRoot:
         assert not (lane / 'plan.json').exists()
 
     @pytest.mark.asyncio
-    async def test_blocking_dependency_report_stays_in_the_lane_root(self, tmp_path, monkeypatch):
+    async def test_blocking_dependency_report_stays_in_the_lane_root(self, tmp_path):
         task = tmp_path / '.task-meta' / 'task-3155'
         argv, lane = _dual_root_argv(tmp_path, task)
         task.mkdir()
-        monkeypatch.setattr(plan_tools, '_resolve_main_sha', lambda worktree: 'deadbeef')
         server = plan_tools.create_server(_artifacts_from_args(argv))
 
         tool = await server.get_tool('report_blocking_dependency')
@@ -1724,26 +1658,19 @@ class TestArtifactsFromArgsTaskRoot:
 
 @pytest.mark.asyncio
 class TestReportBlockingDependencyToolResolvesRealWorktree:
-    """Pins the ``report_blocking_dependency`` MCP tool's git-resolution
-    target directly, rather than only asserting on the ``TaskArtifacts``
-    object in isolation (``TestArtifactsFromArgs`` above).
+    """The registered ``report_blocking_dependency`` tool resolves ``main``
+    in ``artifacts.worktree``, not in ``artifacts.lane_root.parent``.
 
-    ``TestReportBlockingDependency`` (the ``_report_blocking_dependency``
-    unit tests) call the private helper with an explicit ``main_sha=``,
-    bypassing the tool wrapper's own ``worktree = artifacts.worktree`` /
-    ``_resolve_main_sha(worktree)`` code path entirely — a regression that
-    reverted plan_tools.py:603 back to ``artifacts.lane_root.parent`` would still
-    pass every one of those tests. This test drives the actual registered
-    MCP tool through ``create_server`` with a relocated (sibling)
-    ``meta_root`` and monkeypatches ``_resolve_main_sha`` to capture the
-    path it is invoked with, pinning that path to ``artifacts.worktree``.
+    The ``_report_blocking_dependency`` unit tests pass ``main_sha=``
+    explicitly and so bypass the wrapper's resolution. Here the worktree is a
+    real repo and the relocated ``--meta-root`` sibling is no repository, so
+    a regression to ``lane_root.parent`` records ``''`` and fails.
     """
 
-    async def test_tool_calls_resolve_main_sha_with_worktree_not_root_parent(
-        self, tmp_path, monkeypatch
+    async def test_tool_resolves_main_sha_in_the_worktree_not_root_parent(
+        self, tmp_path
     ):
-        wt = tmp_path / 'wt'
-        wt.mkdir()
+        wt = seed_repo(tmp_path / 'wt')
         mr = tmp_path / 'base' / '.task-meta' / 'wt'
         mr.mkdir(parents=True)
 
@@ -1751,20 +1678,11 @@ class TestReportBlockingDependencyToolResolvesRealWorktree:
             ['--worktree', str(wt), '--meta-root', str(mr)]
         )
         artifacts.init('test-1', 'Test task', 'A test')
-        # Sanity check this fixture actually reproduces the bug scenario:
-        # once root is a relocated sibling, root.parent is the .task-meta
-        # BASE, not the worktree.
         assert artifacts.lane_root.parent != artifacts.worktree
-
-        captured: list[object] = []
-
-        def fake_resolve_main_sha(worktree):
-            captured.append(worktree)
-            return 'deadbeefcafef00d'
-
-        monkeypatch.setattr(
-            plan_tools, '_resolve_main_sha', fake_resolve_main_sha
-        )
+        main_sha = subprocess.run(
+            ['git', 'rev-parse', 'main'],
+            cwd=wt, check=True, capture_output=True, text=True,
+        ).stdout.strip()
 
         server = plan_tools.create_server(artifacts)
         tool = await server.get_tool('report_blocking_dependency')
@@ -1775,11 +1693,9 @@ class TestReportBlockingDependencyToolResolvesRealWorktree:
         )
 
         assert result['status'] == 'ok'
-        assert captured == [artifacts.worktree]
-
         data = artifacts.read_blocking_dependency()
         assert data is not None
-        assert data['main_sha_at_report'] == 'deadbeefcafef00d'
+        assert data['main_sha_at_report'] == main_sha
 
 
 # ---------------------------------------------------------------------------
@@ -1919,10 +1835,11 @@ class TestMainSuppressesBanner:
 # mark_step_committed — pre-satisfy a plan step at AUTHORING time, guarded by a
 # REAL `git cat-file -e <sha>` existence check (task 3030 / PRD Contract A1).
 #
-# Driven against a REAL temp git repo, NOT a monkeypatched _sha_exists_on_branch:
-# a stubbed always-True guard would mask the corroborate-before-acting invariant,
-# so the bogus-sha "plan unchanged" assertion only has teeth when a real repo
-# distinguishes a resolving sha from a non-resolving one.
+# Driven against a REAL temp git repo, NOT a monkeypatched
+# branch_probes.sha_exists_on_branch: a stubbed always-True guard would mask the
+# corroborate-before-acting invariant, so the bogus-sha "plan unchanged"
+# assertion only has teeth when a real repo distinguishes a resolving sha from a
+# non-resolving one.
 # ---------------------------------------------------------------------------
 
 
