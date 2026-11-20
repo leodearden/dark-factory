@@ -377,3 +377,38 @@ def test_an_interrupted_commit_stops_its_units_and_removes_their_logs(
     assert repo.head() == before
     assert stopped, f'unit pid {pid} outlived the interrupted commit'
     assert logs_removed, sorted(path.name for path in hook_tmp.iterdir())
+
+
+def test_an_interrupted_commit_stops_what_an_uncollected_unit_left_when_its_shell_exited(tmp_path: Path) -> None:
+    blocker_pid_file = tmp_path / 'blocker.pid'
+    orphan_pid_file = tmp_path / 'orphan.pid'
+    blocker = f'sh -c {shlex.quote(f"echo $$ > {blocker_pid_file}; exec sleep 300")}'
+    orphan = shlex.quote(
+        f"trap '' INT; while kill -0 \"$1\" 2>/dev/null; do sleep 0.1; done; echo $$ > {orphan_pid_file}; exec sleep 300"
+    )
+    commands = {'escalation': blocker, 'm1': f'sh -c {orphan} unit-shell $$ &', 'shared': 'true'}
+    repo = make_hook_repo(tmp_path, _type_only_modules(commands.__getitem__, 'm1'))
+    before = repo.head()
+    repo.stage('shared/src/x.py', 'x = 1\n')
+    hook_tmp = tmp_path / 'hook_tmp'
+    hook_tmp.mkdir()
+    out_path = tmp_path / 'commit.out'
+
+    commit = _start_commit(repo, hook_tmp, out_path)
+    unit_pids: list[int] = []
+    try:
+        unit_pids.append(_written_pid(blocker_pid_file, out_path))
+        pid = _written_pid(orphan_pid_file, out_path)
+        unit_pids.append(pid)
+        _ctrl_c(commit.pid)
+        commit.wait(timeout=60)
+        stopped = _eventually(lambda: not _pid_alive(pid), 30)
+    finally:
+        _kill_leftovers(commit, unit_pids)
+
+    output = out_path.read_text(encoding='utf-8')
+    assert repo.head() == before
+    assert re.findall(r'^  running (\S+):', output, re.MULTILINE) == [
+        'module:escalation:type', 'module:m1:type', 'module:shared:type',
+    ], 'the orphan must come from a unit launched after the blocker and before the last unit'
+    assert stopped, f'pid {pid}, left running by a unit whose shell had exited, outlived the interrupted commit'
