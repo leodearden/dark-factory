@@ -135,18 +135,30 @@ _UNDER_CONSTRUCTION = '[Indexing] 1/2: UNDER CONSTRUCTION'
 _STATUS_POSITION = [name for _, name in LIVE_HEADER].index('status')
 
 
-class _IndexBuildingGraph(_EmptyGraph):
-    """An empty restored graph whose catalog reports one index, with each read taking the next of *statuses*."""
+async def _outlast(seconds: float) -> None:
+    began = time.monotonic()
+    while time.monotonic() - began < seconds:
+        await asyncio.sleep(seconds)
 
-    def __init__(self, statuses: Iterator[str]) -> None:
+
+class _IndexBuildingGraph(_EmptyGraph):
+    """An empty restored graph whose catalog reports one index, with each read taking the next of *statuses*.
+
+    Its first catalog read can be made to outlast a budget of *first_read_outlasts_s*.
+    """
+
+    def __init__(self, statuses: Iterator[str], *, first_read_outlasts_s: float = 0.0) -> None:
         super().__init__()
         self.statuses = statuses
+        self.first_read_outlasts_s = first_read_outlasts_s
         self.catalog_reads = 0
 
     async def ro_query(self, query: str, *args: object, **kwargs: object) -> SimpleNamespace:
         if query != INDEX_CATALOG_QUERY:
             return await super().ro_query(query, *args, **kwargs)
         self.catalog_reads += 1
+        if self.catalog_reads == 1:
+            await _outlast(self.first_read_outlasts_s)
         [row] = rows_for({('Entity', 'NODE', 'uuid', 'RANGE')})
         row[_STATUS_POSITION] = next(self.statuses)
         return SimpleNamespace(header=LIVE_HEADER, result_set=[row])
@@ -252,7 +264,9 @@ def test_a_copy_whose_indexes_never_settle_is_deleted_and_never_saved(
 ):
     monkeypatch.setattr(SEED, 'SETTLE_TIMEOUT_S', 0.02)
     name = _scratch_name()
-    graph = _IndexBuildingGraph(itertools.repeat(_UNDER_CONSTRUCTION))
+    graph = _IndexBuildingGraph(
+        itertools.repeat(_UNDER_CONSTRUCTION), first_read_outlasts_s=SEED.SETTLE_TIMEOUT_S
+    )
     server = _EmptyScratchServer(graph)
 
     with pytest.raises(IndexCatalogUnsettledError) as raised:
