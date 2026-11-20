@@ -35,6 +35,7 @@ from typing import Any, NamedTuple
 
 import pytest
 from _ast_guard import parse_python_module
+from _fm_helpers import make_insufficient_quota_error
 from shared.project_layout import escalation_queue_dir
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
@@ -46,6 +47,7 @@ from fused_memory.middleware._folded_escalation import (
 )
 from fused_memory.middleware.curation_deferral import DeferReason
 from fused_memory.middleware.ticket_store import CurationBacklog
+from fused_memory.services.provider_billing import classify_billing_exhaustion
 from fused_memory.services.write_journal import JournalGrowthSample, Mem0RetryBacklog
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
@@ -900,6 +902,12 @@ def _curation_backlog(module: Any, project_root: str) -> object:
     return asyncio.run(janitor.tick())
 
 
+def _billing_exhaustion(module: Any, project_root: str) -> object:
+    exhaustion = classify_billing_exhaustion(make_insufficient_quota_error())
+    alarm = module.BillingExhaustionAlarm(resolve_project_root=lambda: project_root)
+    return asyncio.run(alarm.record_exhausted(exhaustion, site='durable_queue:add_episode'))
+
+
 #: THE SINGLE POINT OF TRUTH (heuristic 11) for the escalation level each
 #: migrated filer's record is born at.
 #:
@@ -1010,6 +1018,14 @@ _MIGRATED_FILERS: tuple[_Filer, ...] = (
         'fused_memory.middleware.ticket_janitor',
         _curation_backlog,
         1,
+    ),
+    _Filer(
+        'billing_exhaustion_alarm',
+        'fused_memory.services.billing_exhaustion_alarm',
+        _billing_exhaustion,
+        # Born at L2 on purpose: exhausted credits clear only when a human
+        # pays, so the page skips the watcher, which can do nothing about it.
+        2,
     ),
 )
 
@@ -1210,8 +1226,10 @@ class TestEveryFilerPinsItsLevels:
         }
         assert not_l1 == {
             'markup_tripwire residue': 2, 'completion_claim_gate': 0,
+            'billing_exhaustion_alarm': 2,
         }, (
-            'L1 is the house escalation level; residue (L2) and '
+            'L1 is the house escalation level; residue (L2), '
+            'billing_exhaustion_alarm (L2: only a human can buy credits) and '
             f'completion_claim_gate (L0) are its exceptions. {not_l1!r} says '
             'another filer moved'
         )
@@ -1303,6 +1321,9 @@ def _anchors_read_from_their_own_homes() -> dict[str, str]:
     from fused_memory.server.write_triage import (
         _ANCHOR_TASK_ID as WRITE_TRIAGE_ANCHOR,
     )
+    from fused_memory.services.billing_exhaustion_alarm import (
+        ANCHOR_TASK_ID as BILLING_EXHAUSTION_ANCHOR,
+    )
     from fused_memory.services.classification_fallback_alarm import (
         ANCHOR_TASK_ID as CLASSIFICATION_FALLBACK_ANCHOR,
     )
@@ -1341,6 +1362,7 @@ def _anchors_read_from_their_own_homes() -> dict[str, str]:
         'journal_growth_alarm insert_rate': JOURNAL_RATE_ANCHOR,
         'classification_fallback_alarm': CLASSIFICATION_FALLBACK_ANCHOR,
         'mem0_retry_backlog_alarm': MEM0_RETRY_BACKLOG_ANCHOR,
+        'billing_exhaustion_alarm': BILLING_EXHAUSTION_ANCHOR,
         # -- markup_guard, which CALLS the tripwire's filers with anchors of
         #    its own rather than carrying a copy of the skeleton -------------
         'markup_guard storm': GUARD_STORM_ANCHOR,
@@ -1496,6 +1518,7 @@ class TestNoTwoFilersShareAnAnchor:
             'journal_growth_alarm file_size',
             'journal_growth_alarm insert_rate',
             'classification_fallback_alarm',
+            'billing_exhaustion_alarm',
             'markup_guard storm',
             'markup_guard residue',
             'mem0_update_storm_escalator',
