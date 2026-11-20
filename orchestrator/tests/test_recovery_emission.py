@@ -1155,6 +1155,26 @@ class TestResolveStreakWrappersAndEchoes:
         assert _status(queue, alarm.id) != 'pending'
         assert _status(queue, wrapper.id) != 'pending'
 
+    def test_a_discharged_wrapper_carries_a_resolution_class(self, tmp_path):
+        """A level-2 close must be classified (plans/instruments-honesty-prd.md decision 8)."""
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path)
+        memo: dict[str, int] = {}
+        assert _file_streak(**_streak_kwargs(queue, filed_at=memo)) is True
+        (alarm,) = queue.get_by_task(_streak_sentinel('3535'), status='pending')
+        wrapper = _submit(queue, 'esc-3535-11', task_id='3535', level=2, members=[alarm.id])
+
+        _resolve_streak(
+            escalation_queue=queue, task_id='3535', recovered_streak=5,
+            threshold=3, filed_at=memo,
+        )
+
+        record = queue.get(wrapper.id)
+        assert record is not None
+        assert record.status != 'pending'
+        assert record.resolution_class is not None
+
     def test_a_sentinel_id_wrapper_is_discharged_whatever_its_category(self, tmp_path):
         """(b) The 5542 template shape, under a category the LLM might have chosen."""
         from escalation.queue import EscalationQueue

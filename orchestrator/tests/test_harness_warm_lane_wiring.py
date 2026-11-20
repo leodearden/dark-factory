@@ -2041,6 +2041,20 @@ class TestWarmBaseHardDownFilingDedupResolve:
             f'expected no pending escalations after resolve; got {remaining!r}'
         )
 
+    async def test_resolve_classifies_the_l2_close(self, tmp_path: Path):
+        """A level-2 close must be classified (plans/instruments-honesty-prd.md decision 8)."""
+        harness, queue = _make_warm_base_harness(tmp_path)
+
+        await harness._promote_warm_base_hard_down_l2(summary='l2', detail='d')
+        (l2,) = queue.get_by_task(Harness._WARM_BASE_HARD_DOWN_SENTINEL, status='pending', level=2)
+
+        await harness._resolve_warm_base_hard_down()
+
+        closed = queue.get(l2.id)
+        assert closed is not None
+        assert closed.status != 'pending'
+        assert closed.resolution_class is not None
+
     async def test_resolve_is_idempotent(self, tmp_path: Path):
         harness, queue = _make_warm_base_harness(tmp_path)
 

@@ -2849,6 +2849,7 @@ class TestResolveWatcherOutageL2:
             f'Expected status="resolved"; got {resolved.status!r}'
         )
         assert resolved.resolution == WatcherRecoveryEvidence.HEALTHY_ROTATION
+        assert resolved.resolution_class is not None, 'a level-2 close must be classified'
 
     def test_noop_when_no_open_l2(self, tmp_path: Path) -> None:
         """When no pending L2 with root_cause='watcher_supervisor_down', must be a no-op."""
