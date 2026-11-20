@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 ROOT_ABSENT = ('memory.current', 'memory.swap.current', 'memory.events')
+_UNPARSEABLE = 'garbage\n'
 MEMORY_FILES = (
     'memory.stat',
     'memory.current',
@@ -84,6 +85,7 @@ class CgroupTree:
         self.root = root
         self._counters: dict[str, Counters] = {}
         self._omitted: dict[str, frozenset[str]] = {}
+        self._unreadable: set[tuple[str, str]] = set()
         self.set('', omit=ROOT_ABSENT)
 
     def path(self, rel: str) -> Path:
@@ -106,16 +108,19 @@ class CgroupTree:
         for known in [k for k in self._counters if k == rel or k.startswith(f'{rel}/')]:
             del self._counters[known]
             del self._omitted[known]
+            self._unreadable -= {u for u in self._unreadable if u[0] == known}
 
     def make_unreadable(self, rel: str, file_name: str) -> None:
-        """Replace one listed file with a directory, so opening it fails even as root."""
-        target = self.path(rel) / file_name
-        target.unlink()
-        target.mkdir()
+        """Overwrite one listed file with text no parser accepts, so reading it fails even as root.
+
+        The file stays a file, so the cgroup keeps its place in the tree.
+        """
+        self._unreadable.add((rel, file_name))
+        (self.path(rel) / file_name).write_text(_UNPARSEABLE)
 
     def make_readable(self, rel: str, file_name: str) -> None:
         """Undo ``make_unreadable``; ``set`` never touches an unreadable file."""
-        (self.path(rel) / file_name).rmdir()
+        self._unreadable.discard((rel, file_name))
         self._write(rel, self.path(rel))
 
     def inode(self, rel: str) -> int:
@@ -128,6 +133,7 @@ class CgroupTree:
         replacement = old.with_name(f'{old.name}.recreating')
         replacement.mkdir()
         self._counters[rel] = dataclasses.replace(Counters(), **counters)
+        self._unreadable -= {u for u in self._unreadable if u[0] == rel}
         self._write(rel, replacement)
         shutil.rmtree(old)
         replacement.rename(old)
@@ -139,5 +145,5 @@ class CgroupTree:
                 if target.is_file():
                     target.unlink()
                 continue
-            if not target.is_dir():
+            if (rel, name) not in self._unreadable:
                 target.write_text(text)

@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import pytest
 from _cgroup_tree import MEMORY_FILES, CgroupTree
+from shared.cgroup_stats import Unreadable
 
 from sampler.consumers import (
     Accounting,
+    CgroupNode,
     Figure,
     TreeState,
     account,
@@ -52,6 +54,11 @@ def _increment(accounting: Accounting, name: str, figure: Figure) -> int | None:
     increments = _figures(accounting, name).increments
     assert increments is not None, name
     return increments.get(figure)
+
+
+def _node(tree: CgroupTree, rel: str) -> CgroupNode:
+    segments = tuple(rel.split('/'))
+    return next(node for node in read_tree(tree.root).nodes if node.segments == segments)
 
 
 def _cpu_total(accounting: Accounting) -> int:
@@ -172,6 +179,9 @@ class TestListedButUnreadableLastTime:
         tree.make_unreadable('app.slice/sccache.service', 'memory.current')
         second = _next(tree, first)
 
+        node = _node(tree, 'app.slice/sccache.service')
+        assert node.children == ()
+        assert isinstance(node.reading, Unreadable)
         sccache = _figures(second, 'shared@sccache.service')
         assert not sccache.readable
         assert sccache.members == 1
