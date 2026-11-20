@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from legibility import inventory
+from legibility import inventory, sampling
 
 MAIN_CWD = '/home/leo/src/dark-factory'
 MAIN_ENC = '-home-leo-src-dark-factory'
@@ -203,3 +203,32 @@ class TestArchivedSubagentIdentity:
         assert record.identity is not None
         assert record.identity.parent_session == 'sid'
         assert record.encoded_dir == WORKTREE_ENC
+
+
+class TestSubagentSessionKey:
+    """The session string the sampler reports, and the ledger skip compares, is the identity key."""
+
+    def test_peek_reports_the_subagent_key(self, tmp_path):
+        _, subagent = _write_parent_and_subagent(tmp_path / MAIN_ENC)
+        assert sampling.peek_session_id(subagent) == _subagent_key()
+
+    def test_scan_agrees_with_peek(self, tmp_path):
+        _, subagent = _write_parent_and_subagent(tmp_path / MAIN_ENC)
+        assert sampling.scan_transcript(subagent).session_id == _subagent_key()
+
+    def test_parent_keeps_its_own_session_id(self, tmp_path):
+        parent, _ = _write_parent_and_subagent(tmp_path / MAIN_ENC)
+        assert sampling.peek_session_id(parent) == PARENT_SID
+
+    def test_a_coded_parent_does_not_hide_its_subagent(self, tmp_path):
+        _, subagent = _write_parent_and_subagent(tmp_path / MAIN_ENC)
+        coded_sessions = frozenset({PARENT_SID})
+        assert sampling.peek_session_id(subagent) not in coded_sessions
+
+    def test_inventory_and_sampler_derive_one_key(self, tmp_path):
+        projects_root = tmp_path / 'projects'
+        _, subagent = _write_parent_and_subagent(projects_root / MAIN_ENC)
+        records = inventory.enumerate_sessions(projects_root, [MAIN_CWD], TARGET_DATE)
+        record = _record_for(records, subagent)
+        assert record.identity is not None
+        assert sampling.score_session(record).session_id == record.identity.key
