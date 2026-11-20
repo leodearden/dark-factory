@@ -688,7 +688,11 @@ def main(argv: Sequence[str]) -> int:
 
     A debug/inspection entry point for inventory.py alone — the full
     inventory->score->sample pipeline's CLI acceptance surface is
-    ``sampling.main`` (task 2573 step-18).
+    ``sampling.main`` (task 2573 step-18). Each ``--agent-transcript-root``
+    adds an archive tree to the walk, so an archived run, a reconciliation
+    run's ``recon-<run_id>`` included, is listable. Each line is
+    tab-separated: path, encoded dir, cwd, date, size, then the
+    :class:`TranscriptIdentity` key and parent session ('' when absent).
     """
     parser = argparse.ArgumentParser(
         description="List legibility sessions matching cwd_prefixes for a given UTC date."
@@ -710,6 +714,16 @@ def main(argv: Sequence[str]) -> int:
         default=None,
         help='UTC date to filter sessions to, YYYY-MM-DD (default: yesterday UTC).',
     )
+    parser.add_argument(
+        '--agent-transcript-root',
+        dest='agent_transcript_roots',
+        action='append',
+        default=[],
+        help=(
+            'An archive root walked recursively alongside the projects root, '
+            'e.g. data/orchestrator/agent-transcripts (repeatable).'
+        ),
+    )
     args = parser.parse_args(argv)
 
     target_date = (
@@ -717,11 +731,19 @@ def main(argv: Sequence[str]) -> int:
         if args.date
         else (datetime.now(UTC) - timedelta(days=1)).date()
     )
-    records = enumerate_sessions(args.projects_root, args.cwd_prefixes, target_date)
+    records = enumerate_sessions(
+        args.projects_root,
+        args.cwd_prefixes,
+        target_date,
+        agent_transcript_roots=args.agent_transcript_roots,
+    )
     for record in records:
+        identity = record.identity
+        key = identity.key if identity is not None else ''
+        parent = (identity.parent_session or '') if identity is not None else ''
         print(
             f'{record.path}\t{record.encoded_dir}\t{record.cwd}\t'
-            f'{record.date}\t{record.size_bytes}'
+            f'{record.date}\t{record.size_bytes}\t{key}\t{parent}'
         )
     return 0
 
