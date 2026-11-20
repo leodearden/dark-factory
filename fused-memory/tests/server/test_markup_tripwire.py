@@ -335,9 +335,10 @@ class TestEmitMarkupStormEscalation:
         re-spelling the three words here, so an outcome added there arrives with
         a test rather than with a silently unasserted record. The earlier
         revision pinned two of the three, and the one it left out is the one
-        that matters most at this filer's live call site: ``install_markup_guard``
-        refuses any policy but ``REJECT_WITH_REPAIR``, so ``repaired`` cannot
-        fire here at all while ``unrepairable`` — the burst that LOSES the
+        that matters most at this filer's live call site:
+        ``boundary_guards.py::boundary_guard_chain`` declares
+        ``REJECT_WITH_REPAIR``, so ``repaired`` cannot fire there at all while
+        ``unrepairable`` — the burst that LOSES the
         caller's data — can. 'unrepairable' also carries no 'reject' stem, so
         the stem needle below would not have caught it being mislabelled.
 

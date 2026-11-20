@@ -675,14 +675,17 @@ git:
   # _lane- (warm-lane pool) or _spec- (merge-speculation pool).
   iact_prefix: "_iact-"
 
-# Deep merge-ahead chains (task 3183).  chain_cap is the single gate for the
-# whole feature: the maximum number of queued items one verify may cover as a
-# chain.  0 (shipped default) is the KILL SWITCH — byte-identical to pre-PRD
-# merge behaviour.  Green-tier hot-reloadable, so enable/retune/kill never needs
-# a restart; set it with scripts/merge-deep-set-cap.sh.  Dispatch contract and
-# cap-staging plan: plans/deep-merge-ahead-prd.md.
+# Deep merge-ahead chains (task 3183).  chain_cap is the KILL SWITCH only:
+# 0 (shipped default) is byte-identical to pre-PRD merge behaviour, and any
+# positive value turns chains on without bounding them.  depth_table sets the
+# depth: the first [min_pass_estimate, depth] row the rolling per-item pass
+# estimate meets, else 1 (task 8528).  Green-tier hot-reloadable, so
+# enable/retune/kill never needs a restart; set the switch with
+# scripts/merge-deep-set-cap.sh.  Policy: plans/merge-lane-policy-prd.md D6/D7.
 merge_deep:
   chain_cap: 0
+  depth_table: [[0.992, 12], [0.990, 11], [0.988, 10], [0.984, 9], [0.979, 8],
+                [0.972, 7], [0.959, 6], [0.934, 5], [0.876, 4], [0.75, 3]]
   # Chain-build deadline (s); above reify's measured whole-process build p99 (~1230 s).
   chain_build_timeout_secs: 1800
   # How long a built chain's links stay reserved for its tip verify (s).

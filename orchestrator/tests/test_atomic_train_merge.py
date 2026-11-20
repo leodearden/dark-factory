@@ -34,11 +34,11 @@ from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import AdvanceOutcome, GitOps, TrainMembership, _run
 from orchestrator.merge_lane import MergeLane
 from orchestrator.merge_lane.types import QueuedBranch
+from orchestrator.merge_lane.verify_failure_outcome import TRANSIENT_INFRA_REASON_PREFIX
 from orchestrator.merge_lane.worker import (
     ABANDONED_REASON_PREFIX,
     POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
     TRAIN_REBASE_CONFLICT_REASON_PREFIX,
-    TRANSIENT_INFRA_REASON_PREFIX,
     GroupMergeRequest,
     MergeOutcome,
     MergeRequest,
@@ -2017,7 +2017,7 @@ async def _setup_gate_train(
 class TestGate01TrainDiskGuard:
     """step-01 RED: _do_train_merge has no disk guard; disk pressure is ignored.
 
-    After step-02 (GREEN): _do_train_merge uses _run_post_merge_verify which
+    After step-02 (GREEN): _do_train_merge uses run_post_merge_verify which
     runs the pre-verify disk guard; persistent low disk → blocked/verify_skipped.
     """
 

@@ -271,8 +271,8 @@ class WeightEditorScreen(ModalScreen[None]):
         than on the Input itself -- a new Textual pattern with no existing
         precedent in this codebase. Reviewed and intentionally deferred as
         a UX nicety, not a correctness gap: see
-        test_submit_keeps_prior_value_for_a_rejected_category_edit in
-        test_app.py for the pinned current behavior.
+        test_app_weight_editor.py::TestWeightEditor::test_submit_keeps_prior_value_for_a_rejected_category_edit
+        for the pinned current behavior.
         """
         category_edits: dict[str, str] = {}
         for index, name in enumerate(self._priorities.category_weights):

@@ -76,12 +76,10 @@ from server.write_triage_harness import (
 
 _PROJECT_ID = 'dark_factory'
 
-#: The write under test — a near-verbatim restatement of the default content of
-#: `tests/server/write_triage_harness.py::search_candidate`.
-_CONTENT = (
-    'Never run git stash in a dark-factory checkout: refs/stash is a single '
-    'ref in the shared .git dir and is not per-worktree.'
-)
+#: The write under test — a verbatim repeat of the default content of
+#: `tests/server/write_triage_harness.py::search_candidate`, so a default
+#: candidate at or above t_high is a restatement that adds nothing.
+_CONTENT = search_candidate().content
 #: A caller-supplied parent id, in the full-UUID shape `memory_metadata`
 #: validates `parent_id` against.
 _EXPLICIT_PARENT = '11111111-2222-3333-4444-555555555555'

@@ -1,8 +1,9 @@
 """Tests for scripts/legibility/filing_policy.py — whether and where the
 legibility census files a verified confusion cluster (task 5931).
 
-Imported by bare name (`import filing_policy`), resolved via
-scripts/tests/conftest.py's scripts/legibility/ sys.path insertion.
+Imported as `from legibility import filing_policy`, the one spelling every
+legibility module is reached by (scripts/ is on sys.path via
+scripts/tests/conftest.py).
 
 The regression fixture copies, verbatim and hermetically, the fields of real
 candidates from reify's docs/legibility/confusion-codebook.yaml: four whose
@@ -11,8 +12,8 @@ dark-factory's, and five genuinely reify-actionable (or singleton) ones.
 """
 from __future__ import annotations
 
-import filing_policy
 import pytest
+from legibility import filing_policy
 
 HARNESS_ROOT = "/home/leo/src/dark-factory"
 

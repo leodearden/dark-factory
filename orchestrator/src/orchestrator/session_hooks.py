@@ -36,7 +36,6 @@ import copy
 import json
 import logging
 import os
-import subprocess
 import sys
 import tempfile
 from collections.abc import Mapping
@@ -53,6 +52,7 @@ from orchestrator.session_self_exit import SelfExit
 # isort: split
 from shared.proc_liveness import pid_alive
 from shared.process_identity import Liveness
+from shared.project_layout import CheckoutRootError, main_checkout_of
 from shared.session_liveness import capture_for_record, judge
 
 logger = logging.getLogger(__name__)
@@ -277,23 +277,6 @@ def _env_slug_ownership(
         # Unprovable, not disproved: adopt.
         return True, True, snapshot
     return owner_pid == current_pid, True, snapshot
-
-
-def _env_slug_is_owned(
-    slug: str,
-    hook_input: Mapping[str, Any],
-    root: Path | str | None,
-    *,
-    allow_remint: bool = False,
-    probes: EventProbes,
-) -> bool:
-    """Adopt-or-fork half of ``_env_slug_ownership`` -- see its docstring.
-
-    Kept as the narrow, boolean question for callers that only need the
-    identity decision; the binding decision travels separately, through
-    ``_resolve_hook_slug``.
-    """
-    return _env_slug_ownership(slug, hook_input, root, allow_remint=allow_remint, probes=probes)[0]
 
 
 @dataclass(frozen=True)
@@ -1216,40 +1199,18 @@ def merge_hook_settings(settings: Mapping[str, Any], script_dir: str | Path) -> 
 def _hooks_script_dir() -> Path:
     """Absolute path to the in-repo skills/spawn/hooks/ dir.
 
-    Resolves to the PRIMARY checkout's ``skills/spawn/hooks/``, even when
-    this file is itself executing from inside a linked git worktree (e.g.
-    ``.worktrees/<id>/``). Otherwise the ephemeral worktree's path gets
-    baked into the absolute hook commands written into
-    ``~/.claude/settings.json``, and every hook breaks the moment that
-    worktree is reaped.
-
-    Runs ``git -C <this file's dir> rev-parse --path-format=absolute
-    --git-common-dir``: the *common* git dir always points at the primary
-    repo's ``.git``, even from a linked worktree, so its parent is the
-    primary checkout root. Falls back to the previous
-    ``Path(__file__).resolve().parents[3]`` behaviour whenever git is
-    absent, this isn't a git checkout, the command errors, or the resolved
-    directory doesn't actually contain the three hook scripts -- install
-    must stay robust and never raise.
+    Resolves to the PRIMARY checkout's ``skills/spawn/hooks/`` via
+    ``shared.project_layout.main_checkout_of``, even from a linked worktree,
+    so a reaped worktree's path is never baked into the hook commands in
+    ``~/.claude/settings.json``. Falls back to ``Path(__file__).resolve().parents[3]``
+    when no main checkout can be derived or the candidate lacks a hook
+    script: install never raises.
     """
     fallback = Path(__file__).resolve().parents[3] / 'skills' / 'spawn' / 'hooks'
-    file_dir = Path(__file__).resolve().parent
     try:
-        result = subprocess.run(
-            ['git', '-C', str(file_dir), 'rev-parse', '--path-format=absolute', '--git-common-dir'],
-            capture_output=True,
-            text=True,
-            timeout=_HOOK_TIMEOUT_SECS,
-            check=True,
-        )
-    except (OSError, subprocess.SubprocessError):
+        primary_root = main_checkout_of(Path(__file__))
+    except CheckoutRootError:
         return fallback
-
-    git_common_dir = result.stdout.strip()
-    if not git_common_dir:
-        return fallback
-
-    primary_root = Path(git_common_dir).resolve().parent
     candidate = primary_root / 'skills' / 'spawn' / 'hooks'
     if all((candidate / script_name).is_file() for script_name in _HOOK_SCRIPTS.values()):
         return candidate

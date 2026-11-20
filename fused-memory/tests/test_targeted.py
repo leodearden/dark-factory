@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 import pytest_asyncio
+from _census_helpers import census_lines
 from _flag_for_stage2_pool_fake import LiveFlagPool
 from _fm_helpers import complete_paged_read, make_8df8_scenario, pydantic_spec
 from _git_root_helper import make_git_root
@@ -5615,18 +5616,12 @@ async def test_unblock_dependent_guards(
         mock_taskmaster.set_task_status.assert_not_awaited()
 
 
-_SCHEMA_WARNING = 'task_metadata.schema_warning'
-_VETO_READER_SOURCE = 'source=targeted._unblock_veto_reason'
-
-
-def _veto_reader_discard_lines(caplog) -> list[str]:
-    messages = (r.getMessage() for r in caplog.records)
-    return [m for m in messages if _SCHEMA_WARNING in m and _VETO_READER_SOURCE in m]
+_VETO_READER_SOURCE = 'targeted._unblock_veto_reason'
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    'metadata, expected_type, census_lines',
+    'metadata, expected_type, expected_census_count',
     [
         pytest.param('{not json', 'dependent_unblock_applied', 1, id='unparseable_string'),
         pytest.param(42, 'dependent_unblock_applied', 1, id='non_str_value'),
@@ -5638,7 +5633,7 @@ def _veto_reader_discard_lines(caplog) -> list[str]:
 )
 async def test_unblock_veto_reader_logs_unreadable_dependent_metadata_once(
     wired_reconciler, mock_taskmaster, tmp_path, caplog,
-    metadata, expected_type, census_lines,
+    metadata, expected_type, expected_census_count,
 ):
     """Unreadable dependent metadata still reads as empty, so it raises no
     veto (the ``blocked_unparseable_metadata_treated_as_empty`` pin above),
@@ -5658,7 +5653,7 @@ async def test_unblock_veto_reader_logs_unreadable_dependent_metadata_once(
         )
 
     assert [a['type'] for a in _dep_actions_for(result, '2')] == [expected_type]
-    assert len(_veto_reader_discard_lines(caplog)) == census_lines
+    assert len(census_lines(caplog, _VETO_READER_SOURCE)) == expected_census_count
 
 
 # ── task-4903: durability of the write + per-dependent isolation ───────────

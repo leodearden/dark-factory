@@ -3,7 +3,7 @@ Coding Plan's OpenAI-protocol coding endpoint.
 
 Whoever opens Z.ai eval cells calls ``require_zai_coding_endpoint_for`` ONCE
 per campaign, with the campaign's candidate configs, before the first cell. The
-eval CLI drivers (``orchestrator/cli.py::_require_zai_coding_plan``) are its
+eval CLI drivers (``orchestrator/evals/cli.py::_require_zai_coding_plan``) are its
 callers today; the shadow coordinator (task 5388) is to use the same entry
 point. ``claude_endpoint_candidates()`` and ``get_config_by_name`` deliberately
 never call it: they are offline by-name lookups.

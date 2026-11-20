@@ -348,7 +348,7 @@ failure class this whole task exists to kill.
 | Change | What it does |
 |---|---|
 | `fused_memory/utils/toolcall_xml_leak.py` | The single shared detector. Promoted from `scripts/scan_task_toolcall_leaks.py` (task 2939) and generalized for the Mem0 specimens; its envelope literals are now `shared.toolcall_markup` re-exports (task 3688, §1). |
-| `fused_memory/server/markup_guard.py::install_markup_guard` (task 4458, which replaced task 3141's `markup_tripwire.py` gate, see §1 — NOT this task) | Live rejection at the MCP write boundary, for every tool on the fused-memory server. Listed here only so the picture is complete; see "The boundary rejection" below for why this task ships no guard of its own. |
+| `fused_memory/server/markup_guard.py::build_markup_guard`, installed by `fused_memory/server/boundary_guards.py::install_boundary_guards` (task 4458, which replaced task 3141's `markup_tripwire.py` gate, see §1 — NOT this task) | Live rejection at the MCP write boundary, for every tool on the fused-memory server. Listed here only so the picture is complete; see "The boundary rejection" below for why this task ships no guard of its own. |
 | `fused_memory/backends/task_text_markup_gate.py` (task 4419 — NOT this task) | Storage-layer refusal inside `SqliteTaskBackend.add_task` / `.update_task`, covering the task writers that never cross MCP dispatch. See "The storage-layer refusal" below. |
 | `Mem0Backend.scan_payload_text` → `MemoryService.scan_memory_content` → `scan_memory_content` MCP tool | The missing read capability (§3). |
 | `fused-memory/scripts/sweep_toolcall_xml_leak.py` | The corpus sweep (§5). |
@@ -358,8 +358,10 @@ failure class this whole task exists to kill.
 
 Every tool on the fused-memory server **rejects** a call whose arguments carry
 envelope markup, before anything is persisted. The live guard is
-`fused-memory/src/fused_memory/server/markup_guard.py::install_markup_guard`
-(task 4458). It wraps the server's `call_tool` with
+`fused-memory/src/fused_memory/server/markup_guard.py::build_markup_guard`
+(task 4458), installed by
+`fused-memory/src/fused_memory/server/boundary_guards.py::install_boundary_guards`.
+It wraps the server's `call_tool` with
 `shared/src/shared/mcp_markup_middleware.py::MarkupGuardMiddleware` and answers
 with one of two `error_type` values. `mcp_markup_detected` carries a
 `repaired_call`: the complete argument map with the swallowed parameters

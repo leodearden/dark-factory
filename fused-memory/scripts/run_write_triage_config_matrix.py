@@ -64,7 +64,7 @@ from datetime import datetime
 from itertools import chain
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from shared.cli_boundary import LoudArgumentParser, run_cli
 from shared.safe_io import atomic_write_text
@@ -86,12 +86,12 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 _scorer = load_script(_SCRIPTS / 'score_write_triage_pairs.py', 'score_write_triage_pairs')
 _wording = load_script(_SCRIPTS / 'write_triage_judge_wording.py', 'write_triage_judge_wording')
-_freeze = load_script(
-    _SCRIPTS / 'freeze_write_triage_population.py', 'freeze_write_triage_population',
-)
-_arms = load_script(
-    _SCRIPTS / 'run_write_triage_population_arms.py', 'run_write_triage_population_arms',
-)
+if TYPE_CHECKING:
+    import freeze_write_triage_population as _freeze
+else:
+    _freeze = load_script(
+        _SCRIPTS / 'freeze_write_triage_population.py', 'freeze_write_triage_population',
+    )
 _gate = load_script(
     _REPO_ROOT / 'scripts' / 'check_write_triage_readiness_gate.py',
     'check_write_triage_readiness_gate',
@@ -190,10 +190,10 @@ class Population:
                 f'the population artifact is not shaped as π publishes it: {malformed}'
             ) from None
         slates = block.get('slates')
-        if slates != _arms.Slates.WRITE_TIME:
+        if slates != _freeze.Slates.WRITE_TIME:
             raise MatrixInputError(
                 'μ scores write-time slates (PRD §12 D19); this artifact\'s population.slates'
-                f' is {slates!r}, not {_arms.Slates.WRITE_TIME.value!r}'
+                f' is {slates!r}, not {_freeze.Slates.WRITE_TIME.value!r}'
             )
         absent = [
             key for key in (*_C2_SOURCE_KEYS.values(), 'snapshot_path') if key not in block
@@ -250,7 +250,7 @@ def _read_arm(arm: PiArm, population: Population, data_root: Path) -> list[dict[
     rows = _read_jsonl(path)
     _refuse_foreign_rows(arm, path, rows, 'arm', arm.name)
     _refuse_foreign_rows(arm, path, rows, 'snapshot_sha256', population.block['snapshot_sha256'])
-    _refuse_foreign_rows(arm, path, rows, 'slates', _arms.Slates.WRITE_TIME.value)
+    _refuse_foreign_rows(arm, path, rows, 'slates', _freeze.Slates.WRITE_TIME.value)
     return rows
 
 

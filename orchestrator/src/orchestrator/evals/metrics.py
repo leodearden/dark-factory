@@ -53,7 +53,6 @@ DECLINE_READERS: Mapping[str, str] = MappingProxyType({
     'unactionable': 'read_unactionable_task',
     'ready_to_merge': 'read_ready_to_merge',
 })
-_DECLINE_READERS = DECLINE_READERS
 
 # The five EXPLICIT plan-tools decline exits (plan_tools._report_* →
 # artifacts.TaskArtifacts.write_*), in the fixed order that breaks a

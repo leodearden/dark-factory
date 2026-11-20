@@ -99,11 +99,9 @@ from orchestrator.merge_lane.disposition import (
     classify_merge_failure_disposition,
 )
 from orchestrator.merge_lane.landed_outbox import LandedOutbox
+from orchestrator.merge_lane.liveness import _acquire_warm_verify_worktree
 from orchestrator.merge_lane.shadow import _submit_shadow_divergence_escalation  # noqa: F401
-from orchestrator.merge_lane.worker import (
-    MergeRequest,
-    _acquire_warm_verify_worktree,
-)
+from orchestrator.merge_lane.worker import MergeRequest
 from orchestrator.verify import VerifyResult
 from orchestrator.warm_lane_pool import LaneState, WarmLanePool  # noqa: F401
 
@@ -517,6 +515,44 @@ class TestAcquireSpecLaneFallback:
                 f'acquire_spec_lane raised {type(exc).__name__} on exhaustion: {exc}'
             )
         assert result is not None
+
+    async def test_exhaustion_cold_fallback_is_logged_at_info_naming_the_commit(
+        self, spec_git_repo: Path, caplog: pytest.LogCaptureFixture,
+    ):
+        """A speculative verify that goes cold because the pool is full is visible at INFO."""
+        caplog.set_level(logging.DEBUG, logger='orchestrator.git_ops')
+        await _add_recording_seed_to_repo(spec_git_repo)
+        git_ops = GitOps(
+            _make_spec_git_config(on=True), spec_git_repo,
+            merge_spec_warm_lane_pool_size=1,
+        )
+        _, merge_commit, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=spec_git_repo)
+        merge_commit = merge_commit.strip()
+        await git_ops.acquire_spec_lane(merge_commit)
+        caplog.clear()
+
+        await git_ops.acquire_spec_lane(merge_commit)
+
+        exhausted = [r for r in caplog.records if 'pool exhausted' in r.getMessage()]
+        assert exhausted, 'no record names the pool exhaustion'
+        assert all(r.levelno >= logging.INFO for r in exhausted), (
+            'a cold fallback on an exhausted spec pool must be visible at INFO'
+        )
+        assert any(merge_commit[:8] in r.getMessage() for r in exhausted)
+
+    async def test_knob_off_cold_path_stays_below_info(
+        self, spec_git_repo: Path, caplog: pytest.LogCaptureFixture,
+    ):
+        """No spec pool configured is not a degradation: no INFO line per chain build."""
+        caplog.set_level(logging.DEBUG, logger='orchestrator.git_ops')
+        git_ops = GitOps(_make_spec_git_config(on=False), spec_git_repo)
+        _, merge_commit, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=spec_git_repo)
+
+        await git_ops.acquire_spec_lane(merge_commit.strip())
+
+        absent = [r for r in caplog.records if 'spec pool absent' in r.getMessage()]
+        assert absent
+        assert all(r.levelno < logging.INFO for r in absent)
 
 
 # ===========================================================================
@@ -1070,7 +1106,7 @@ class TestSpecLaneAbortReleasesLane:
             # The abort-poll ticks at VERIFY_ABANDON_POLL_SECS (a public class
             # attribute production documents as the tests' knob), so shorten it
             # rather than waiting ten seconds for the next tick.
-            lane.VERIFY_ABANDON_POLL_SECS = 0.01
+            lane.verify_dispatch.VERIFY_ABANDON_POLL_SECS = 0.01
             req_b.result.cancel()
             pool = git_ops.spec_warm_lane_pool
             assert pool is not None
@@ -1104,7 +1140,7 @@ class TestSpecLaneAbortReleasesLane:
         )
 
         async def _halt(lane: MergeLane, req_b: MergeRequest) -> None:
-            lane.VERIFY_ABANDON_POLL_SECS = 0.01
+            lane.verify_dispatch.VERIFY_ABANDON_POLL_SECS = 0.01
             lane.operator_halt('spec-lane abort scenario')
             pool = git_ops.spec_warm_lane_pool
             assert pool is not None
@@ -1821,7 +1857,7 @@ class TestLateArrivalFailCascade:
     GREEN after step-2: B is a speculative descendant of A; the existing
     cascade in _verifier_loop (7608-7721) finds B in _inflight, cancels its
     verify, re-merges against actual main, re-dispatches through the redispatch park,
-    and emits speculative_discard reason=previous_failed via _dispatch_item.
+    and emits speculative_discard reason=previous_failed via VerifyDispatcher.dispatch.
     """
 
     async def test_predecessor_fail_cascades_to_late_arrival(
@@ -1975,7 +2011,7 @@ class TestLateArrivalFailCascade:
         # ── DONE-WHEN 4(a): speculative_merge event for B (B was dispatched
         #    speculatively against A's commit — only present after step-2).
         #
-        #    NOTE: speculative_discard is emitted in _dispatch_item only when a
+        #    NOTE: speculative_discard is emitted in VerifyDispatcher.dispatch only when a
         #    speculative item is re-dispatched from the redispatch park with _n_failed=True
         #    (single-host path). In the two-host cascade path, the remerged item
         #    has speculative=False (_remerge sets speculative=False), so

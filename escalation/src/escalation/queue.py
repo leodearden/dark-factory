@@ -2360,9 +2360,10 @@ class EscalationQueue:
         "changed since I triaged it" re-assess rule — are, exhaustively:
         ``add_members_to_l2`` (a real member append, severity promotion or
         recorded amendment; guarded, since a true no-op must not bump),
-        ``amend`` (a recorded explicit amendment; guarded the same way) and
+        ``amend`` (a recorded explicit amendment; guarded the same way),
         ``attach_dedupe_child`` (a dedupe fold; unconditional, since every
-        successful call appends a child and increments ``dedupe_count``).
+        successful call appends a child and increments ``dedupe_count``) and
+        ``release_merge_halt`` (a first release stamp; a repeat is a no-op).
 
         Returns the updated ``Escalation``, or ``None`` when *escalation_id*
         is not found in the queue root, fails to parse, or is not pending
@@ -2450,6 +2451,34 @@ class EscalationQueue:
                 'claim_policy_class: %s claimed %s as %s', claimed_by, escalation_id, policy_class,
             )
             return ClaimResult(record=esc, refusal=None)
+
+    def release_merge_halt(self, escalation_id: str, *, note: str) -> Escalation | None:
+        """Record that a pending merge-halt record stopped owning the queue halt (task 3876).
+
+        The sole writer of ``halt_released_at`` / ``halt_release_note``. It bumps
+        ``updated_at``: the record no longer halts the merge queue, a substantive
+        change the watcher's "changed since I triaged it" rule must see.
+
+        It has :meth:`stamp_triage`'s write shape: serialized per id by
+        ``escalation_id_lock``, queue root only, pending only, so a closed
+        record is refused rather than resurrected. Idempotent: a released record
+        is returned unchanged, keeping its first stamp. ``None`` when there is no
+        pending record to release.
+        """
+        with escalation_id_lock(self.queue_dir, escalation_id):
+            esc = self._load_root_pending(escalation_id)
+            if esc is None:
+                return None
+            if esc.halt_released_at is not None:
+                return esc
+
+            now = datetime.now(UTC).isoformat()
+            esc.halt_released_at = now
+            esc.updated_at = now
+            esc.halt_release_note = note
+            self._rewrite(escalation_id, esc)
+            logger.info('release_merge_halt: released the merge halt owned by %s', escalation_id)
+            return esc
 
     def amend(
         self, escalation_id: str, *, root_cause: str = '', summary: str = '',

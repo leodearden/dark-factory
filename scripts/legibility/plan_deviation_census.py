@@ -31,6 +31,9 @@ logger = logging.getLogger('legibility.plan_deviation_census')
 RECENT_WINDOW_DAYS = 7
 
 _PLAN_SECTIONS = ('prerequisites', 'steps')
+# Mirrors orchestrator/src/orchestrator/artifacts.py::Plan's confirmation key;
+# the census tests pin it by reading what the real plan-tools server writes.
+_FINALIZED_AT_KEY = '_finalized_at'
 _NOTED_RESOLUTION_CLASSES = frozenset({NOTE_TO_FILE_CLASS, ObservationConsumed.resolution_class})
 _FALLBACK_AGENT_ROLES = frozenset({'implementer'})
 _NOTE_SCAN_CONTEXT = 'plan_deviation_census.read_archived_notes'
@@ -174,27 +177,39 @@ class CensusRecord:
 
 
 @dataclass(frozen=True)
+class FinalizedPlan:
+    task_id: str
+    finalized_at: datetime
+
+
+@dataclass(frozen=True)
 class CorpusRead:
-    """What one reader returned: its records, how many inputs it parsed, and
-    how many inputs or entries it could not use."""
+    """What one reader returned: its records, the finalized plans it saw, how
+    many inputs it parsed, and how many inputs or entries it could not use."""
 
     records: tuple[CensusRecord, ...]
     opened: int
     skipped: int
+    plans: tuple[FinalizedPlan, ...] = ()
 
 
 _NOTHING = CorpusRead(records=(), opened=0, skipped=0)
 _ONE_SKIPPED = CorpusRead(records=(), opened=0, skipped=1)
+_OPENED_AND_SKIPPED = CorpusRead(records=(), opened=1, skipped=1)
 
 
 def _combine(reads: Iterable[CorpusRead]) -> CorpusRead:
     records: list[CensusRecord] = []
+    plans: list[FinalizedPlan] = []
     opened = skipped = 0
     for read in reads:
         records.extend(read.records)
+        plans.extend(read.plans)
         opened += read.opened
         skipped += read.skipped
-    return CorpusRead(records=tuple(records), opened=opened, skipped=skipped)
+    return CorpusRead(
+        records=tuple(records), opened=opened, skipped=skipped, plans=tuple(plans),
+    )
 
 
 def _is_str_in(value: object, allowed: frozenset[str]) -> bool:
@@ -209,13 +224,32 @@ def _utc_stamp(name: str, raw: object) -> datetime | None:
 
 
 def read_plan_deviations(meta_roots: Sequence[Path], *, horizon: datetime) -> CorpusRead:
-    """Every valid deviation entry in ``<root>/*/plan.json`` under each root.
+    """Every valid deviation entry in ``<root>/*/plan.json`` under each root,
+    and each task's finalized plan.
 
     A plan is rewritten on every write, so one last modified before *horizon*
     cannot hold an in-window entry and is skipped without being opened. The
-    task id is the lane directory's name."""
+    task id is the plan document's own ``task_id``, never its directory's
+    name, and one plan seen under several meta directories (``N/`` and
+    ``task-N/``) counts once: identical records collapse, and a task's
+    finalized plan is its latest ``_finalized_at``."""
     cutoff = horizon.timestamp()
-    return _combine(_read_meta_root(root, cutoff) for root in meta_roots)
+    read = _combine(_read_meta_root(root, cutoff) for root in meta_roots)
+    return CorpusRead(
+        records=tuple(dict.fromkeys(read.records)),
+        opened=read.opened,
+        skipped=read.skipped,
+        plans=_latest_per_task(read.plans),
+    )
+
+
+def _latest_per_task(plans: Iterable[FinalizedPlan]) -> tuple[FinalizedPlan, ...]:
+    latest: dict[str, FinalizedPlan] = {}
+    for plan in plans:
+        kept = latest.get(plan.task_id)
+        if kept is None or plan.finalized_at > kept.finalized_at:
+            latest[plan.task_id] = plan
+    return tuple(latest.values())
 
 
 def _read_meta_root(root: Path, cutoff: float) -> CorpusRead:
@@ -254,11 +288,27 @@ def _read_plan(path: Path, cutoff: float) -> CorpusRead:
         logger.debug('cannot read %s: %s', path, exc)
         return _ONE_SKIPPED
     if not isinstance(doc, dict):
-        return CorpusRead(records=(), opened=1, skipped=1)
-    task_id = path.parent.name
+        return _OPENED_AND_SKIPPED
+    task_id = _document_task_id(doc.get('task_id'))
+    if task_id is None:
+        return _OPENED_AND_SKIPPED
     parsed = [_plan_entry(task_id, entry) for entry in _deviation_entries(doc)]
     records = tuple(record for record in parsed if record is not None)
-    return CorpusRead(records=records, opened=1, skipped=len(parsed) - len(records))
+    finalized_at = _utc_stamp(_FINALIZED_AT_KEY, doc.get(_FINALIZED_AT_KEY))
+    return CorpusRead(
+        records=records,
+        opened=1,
+        skipped=len(parsed) - len(records),
+        plans=() if finalized_at is None else (FinalizedPlan(task_id, finalized_at),),
+    )
+
+
+def _document_task_id(raw: object) -> str | None:
+    if isinstance(raw, str):
+        return raw.strip() or None
+    if isinstance(raw, int) and not isinstance(raw, bool):
+        return str(raw)
+    return None
 
 
 def _deviation_entries(doc: Mapping[str, object]) -> Iterator[object]:
@@ -335,7 +385,8 @@ def _is_counted_note(esc: Escalation) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# evaluate — pure: two windows measured back from now, three triggers
+# evaluate — pure: two windows measured back from now, a rate arm per source
+# and a prose-only arm (records per finalized plan), and a kind pattern
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
@@ -347,12 +398,16 @@ class Verdict:
 
 @dataclass(frozen=True)
 class _Windows:
-    """The records in the recent window ``(now-7d, now]`` and the baseline
-    window ``(now-horizon, now-7d]``."""
+    """The records and the finalized plans in the recent window
+    ``(now-7d, now]`` and the baseline window ``(now-horizon, now-7d]``, and
+    each source's earliest record in ``(now-horizon, now]``."""
 
     now: datetime
     recent: tuple[CensusRecord, ...]
     baseline: tuple[CensusRecord, ...]
+    recent_plans: int
+    baseline_plans: int
+    history_starts: Mapping[RecordSource, datetime | None]
     baseline_days: int
 
     @property
@@ -363,6 +418,39 @@ class _Windows:
     def baseline_mean(self) -> float:
         return len(self.baseline) / self.baseline_days
 
+    def counts(self, predicate: Callable[[CensusRecord], bool]) -> tuple[int, int]:
+        """How many recent and how many baseline records satisfy *predicate*."""
+        return (
+            sum(1 for record in self.recent if predicate(record)),
+            sum(1 for record in self.baseline if predicate(record)),
+        )
+
+    def per_plan(self, recent: int, baseline: int) -> tuple[float | None, float | None]:
+        """*recent* and *baseline* per finalized plan in their windows;
+        ``None`` for a window with no finalized plan."""
+        return (
+            recent / self.recent_plans if self.recent_plans else None,
+            baseline / self.baseline_plans if self.baseline_plans else None,
+        )
+
+    def empty_window(self) -> str | None:
+        if not self.recent_plans:
+            return 'recent'
+        if not self.baseline_plans:
+            return 'baseline'
+        return None
+
+    def history_days(self, source: RecordSource) -> float | None:
+        start = self.history_starts[source]
+        return None if start is None else (self.now - start) / timedelta(days=1)
+
+    def is_warming_up(self, source: RecordSource) -> bool:
+        """Whether *source*'s history is too short for its baseline to mean
+        anything: no in-horizon record, or a first one under the baseline
+        window's length ago."""
+        history = self.history_days(source)
+        return history is None or history < self.baseline_days
+
     def kind_counts(self) -> dict[str, int]:
         counts = Counter(record.kind for record in self.recent)
         return {kind: counts[kind] for kind in sorted(DEVIATION_KINDS)}
@@ -372,27 +460,82 @@ def _as_utc(now: datetime) -> datetime:
     return now.replace(tzinfo=UTC) if now.tzinfo is None else now.astimezone(UTC)
 
 
-def _split(records: Sequence[CensusRecord], *, now: datetime, horizon_days: int) -> _Windows:
+def _split(
+    records: Sequence[CensusRecord],
+    plans: Sequence[FinalizedPlan],
+    *,
+    now: datetime,
+    horizon_days: int,
+) -> _Windows:
     recent_start = now - timedelta(days=RECENT_WINDOW_DAYS)
     horizon = now - timedelta(days=horizon_days)
+    in_horizon = [record for record in records if horizon < record.recorded_at <= now]
     return _Windows(
         now=now,
-        recent=tuple(r for r in records if recent_start < r.recorded_at <= now),
-        baseline=tuple(r for r in records if horizon < r.recorded_at <= recent_start),
+        recent=tuple(record for record in in_horizon if recent_start < record.recorded_at),
+        baseline=tuple(record for record in in_horizon if record.recorded_at <= recent_start),
+        recent_plans=sum(1 for plan in plans if recent_start < plan.finalized_at <= now),
+        baseline_plans=sum(1 for plan in plans if horizon < plan.finalized_at <= recent_start),
+        history_starts={
+            source: min(
+                (record.recorded_at for record in in_horizon if record.source is source),
+                default=None,
+            )
+            for source in RecordSource
+        },
         baseline_days=horizon_days - RECENT_WINDOW_DAYS,
     )
 
 
+@dataclass(frozen=True)
+class _RateArm:
+    """A per-plan rate of the records *predicate* selects, measured against
+    its own baseline; *source*'s warm-up gates it and *floor* is the fewest
+    recent records that may fire it."""
+
+    label: str
+    source: RecordSource
+    predicate: Callable[[CensusRecord], bool]
+    floor: int
+
+
+def _from_source(source: RecordSource) -> Callable[[CensusRecord], bool]:
+    return lambda record: record.source is source
+
+
+def _is_prose_only_plan_step(record: CensusRecord) -> bool:
+    return record.source is RecordSource.PLAN_STEP and record.prose_only
+
+
+def _source_arms(config: PlanDeviationCensus) -> tuple[_RateArm, ...]:
+    return tuple(
+        _RateArm(f'rate-rise[{source.value}]', source, _from_source(source), config.min_records)
+        for source in RecordSource
+    )
+
+
+def _prose_only_arm(config: PlanDeviationCensus) -> _RateArm:
+    return _RateArm(
+        'prose-only', RecordSource.PLAN_STEP, _is_prose_only_plan_step, config.prose_only_min,
+    )
+
+
 def evaluate(
-    records: Sequence[CensusRecord], *, now: datetime, config: PlanDeviationCensus,
+    records: Sequence[CensusRecord],
+    *,
+    plans: Sequence[FinalizedPlan],
+    now: datetime,
+    config: PlanDeviationCensus,
 ) -> Verdict:
-    """Whether the recorded deviations rose in rate or formed a pattern.
-    Records after *now* or at or before the horizon are ignored."""
-    windows = _split(records, now=_as_utc(now), horizon_days=config.horizon_days)
+    """Whether the recorded deviations rose per finalized plan, source by
+    source, or formed a pattern. Records and plans after *now* or at or
+    before the horizon are ignored. A source still warming up, or a window
+    without a finalized plan, fires no rate arm."""
+    windows = _split(records, plans, now=_as_utc(now), horizon_days=config.horizon_days)
     triggers = (
-        _rate_rise(windows, config),
+        *(_rate_arm(windows, arm, config) for arm in _source_arms(config)),
         _kind_pattern(windows, config),
-        _prose_only(windows, config),
+        _rate_arm(windows, _prose_only_arm(config), config),
     )
     return Verdict(
         fire=any(fired for fired, _ in triggers),
@@ -401,37 +544,52 @@ def evaluate(
     )
 
 
-def _rate_rise(windows: _Windows, config: PlanDeviationCensus) -> tuple[bool, str]:
-    count = len(windows.recent)
-    bar = config.rate_rise_factor * windows.baseline_mean
-    fired = windows.recent_mean > bar and count >= config.min_records
+def _rate_arm(windows: _Windows, arm: _RateArm, config: PlanDeviationCensus) -> tuple[bool, str]:
+    recent, baseline = windows.counts(arm.predicate)
+    if windows.is_warming_up(arm.source):
+        return False, f'{arm.label}: {_warming_up_text(windows, arm.source)}'
+    empty = windows.empty_window()
+    if empty is not None:
+        return False, (
+            f'{arm.label}: no finalized plan in the {empty} window '
+            f'({recent} recent, {baseline} baseline record(s))'
+        )
+    recent_rate = recent / windows.recent_plans
+    baseline_rate = baseline / windows.baseline_plans
+    bar = config.rate_rise_factor * baseline_rate
+    fired = recent_rate > bar and recent >= arm.floor
     return fired, (
-        f'rate-rise: {RECENT_WINDOW_DAYS}d mean {windows.recent_mean:.2f}/d vs prior '
-        f'{windows.baseline_days}d mean {windows.baseline_mean:.2f}/d '
-        f'(bar x{float(config.rate_rise_factor)} = {bar:.2f}/d; '
-        f'{RECENT_WINDOW_DAYS}d count {count}, min {config.min_records})'
+        f'{arm.label}: {RECENT_WINDOW_DAYS}d {recent_rate:.3f}/plan '
+        f'({recent} over {windows.recent_plans} plan(s)) vs prior {windows.baseline_days}d '
+        f'{baseline_rate:.3f}/plan ({baseline} over {windows.baseline_plans} plan(s)) '
+        f'(bar x{float(config.rate_rise_factor)} = {bar:.3f}/plan; '
+        f'{RECENT_WINDOW_DAYS}d count {recent}, min {arm.floor})'
     )
+
+
+def _warming_up_text(windows: _Windows, source: RecordSource) -> str:
+    history = windows.history_days(source)
+    if history is None:
+        horizon_days = windows.baseline_days + RECENT_WINDOW_DAYS
+        return f'warming up (no record in the {horizon_days}d horizon)'
+    return f'warming up (history {history:.1f}d < {windows.baseline_days}d)'
 
 
 def _kind_pattern(windows: _Windows, config: PlanDeviationCensus) -> tuple[bool, str]:
     counts = windows.kind_counts()
-    total = len(windows.recent)
-    if not any(counts.values()):
-        return False, f'kind-pattern: no kinded records in {RECENT_WINDOW_DAYS}d ({total} record(s))'
+    kinded = sum(counts.values())
+    if not kinded:
+        return False, (
+            f'kind-pattern: no kinded records in {RECENT_WINDOW_DAYS}d '
+            f'({len(windows.recent)} record(s))'
+        )
     top_kind = min(counts, key=lambda kind: (-counts[kind], kind))
-    share = counts[top_kind] / total
+    share = counts[top_kind] / kinded
     fired = share >= config.pattern_share and counts[top_kind] >= config.min_records
     return fired, (
-        f'kind-pattern: {top_kind} {counts[top_kind]}/{total} = {share:.2f} of '
-        f'{RECENT_WINDOW_DAYS}d records (bar {config.pattern_share}; min {config.min_records})'
-    )
-
-
-def _prose_only(windows: _Windows, config: PlanDeviationCensus) -> tuple[bool, str]:
-    count = sum(record.prose_only for record in windows.recent)
-    return count >= config.prose_only_min, (
-        f'prose-only: {count} prose-only record(s) in {RECENT_WINDOW_DAYS}d '
-        f'(min {config.prose_only_min})'
+        f'kind-pattern: {top_kind} {counts[top_kind]}/{kinded} = {share:.2f} of '
+        f'{RECENT_WINDOW_DAYS}d kinded records (bar {config.pattern_share}; '
+        f'min {config.min_records})'
     )
 
 
@@ -449,19 +607,30 @@ def _evidence(windows: _Windows, config: PlanDeviationCensus) -> tuple[dict, ...
     )
 
 
+def _per_plan_text(rate: float | None) -> str:
+    return 'no finalized plan' if rate is None else f'{rate:.3f}/plan'
+
+
 def _window_evidence(windows: _Windows, config: PlanDeviationCensus) -> tuple[str, str, dict]:
     recent, baseline = len(windows.recent), len(windows.baseline)
+    recent_rate, baseline_rate = windows.per_plan(recent, baseline)
     return 'window', (
-        f'{recent} record(s) in the {RECENT_WINDOW_DAYS} days to {windows.now.isoformat()} '
-        f'(mean {windows.recent_mean:.2f}/d); {baseline} in the prior '
-        f'{windows.baseline_days} days (mean {windows.baseline_mean:.2f}/d)'
+        f'{recent} record(s) over {windows.recent_plans} finalized plan(s) in the '
+        f'{RECENT_WINDOW_DAYS} days to {windows.now.isoformat()} '
+        f'({_per_plan_text(recent_rate)}; mean {windows.recent_mean:.2f}/d); '
+        f'{baseline} over {windows.baseline_plans} in the prior {windows.baseline_days} days '
+        f'({_per_plan_text(baseline_rate)}; mean {windows.baseline_mean:.2f}/d)'
     ), {
         'window_end': windows.now.isoformat(),
         'recent_window_days': RECENT_WINDOW_DAYS,
         'baseline_window_days': windows.baseline_days,
         'recent_count': recent,
+        'recent_plans': windows.recent_plans,
+        'recent_per_plan': recent_rate,
         'recent_mean': windows.recent_mean,
         'baseline_count': baseline,
+        'baseline_plans': windows.baseline_plans,
+        'baseline_per_plan': baseline_rate,
         'baseline_mean': windows.baseline_mean,
         'rate_rise_factor': config.rate_rise_factor,
     }
@@ -469,18 +638,32 @@ def _window_evidence(windows: _Windows, config: PlanDeviationCensus) -> tuple[st
 
 def _kinds_evidence(windows: _Windows) -> tuple[str, str, dict]:
     counts = windows.kind_counts()
+    kinded = sum(counts.values())
     unkinded = sum(record.kind is None for record in windows.recent)
     named = ', '.join(f'{kind} {n}' for kind, n in counts.items() if n) or 'none'
     return 'kinds', (
-        f'recent records by kind: {named}; {unkinded} without a kind'
-    ), {'kind_counts': counts, 'unkinded': unkinded, 'recent_count': len(windows.recent)}
+        f'recent records by kind: {named}; {kinded} with a kind, {unkinded} without'
+    ), {
+        'kind_counts': counts,
+        'kinded_count': kinded,
+        'unkinded': unkinded,
+        'recent_count': len(windows.recent),
+    }
 
 
 def _prose_only_evidence(windows: _Windows) -> tuple[str, str, dict]:
-    count = sum(record.prose_only for record in windows.recent)
+    recent, baseline = windows.counts(_is_prose_only_plan_step)
+    recent_rate, baseline_rate = windows.per_plan(recent, baseline)
     return 'prose_only', (
-        f'{count} recent record(s) were recorded in prose only'
-    ), {'prose_only_count': count}
+        f'{recent} recent record(s) were recorded in prose only '
+        f'({_per_plan_text(recent_rate)}); {baseline} in the baseline '
+        f'({_per_plan_text(baseline_rate)})'
+    ), {
+        'prose_only_count': recent,
+        'baseline_prose_only_count': baseline,
+        'recent_per_plan': recent_rate,
+        'baseline_per_plan': baseline_rate,
+    }
 
 
 def _top_task_ids_evidence(windows: _Windows) -> tuple[str, str, dict]:
@@ -493,11 +676,27 @@ def _top_task_ids_evidence(windows: _Windows) -> tuple[str, str, dict]:
 
 
 def _sources_evidence(windows: _Windows) -> tuple[str, str, dict]:
-    counts = Counter(record.source for record in windows.recent)
-    plan_step, escalation = counts[RecordSource.PLAN_STEP], counts[RecordSource.ESCALATION]
+    per_source = {source.value: _source_fields(windows, source) for source in RecordSource}
+    warming_up = [source.value for source in RecordSource if windows.is_warming_up(source)]
+    named = ', '.join(
+        f'{fields["recent_count"]} {source}' for source, fields in per_source.items()
+    )
     return 'sources', (
-        f'recent records by source: {plan_step} plan-step, {escalation} escalation'
-    ), {RecordSource.PLAN_STEP.value: plan_step, RecordSource.ESCALATION.value: escalation}
+        f'recent records by source: {named}; warming up: {", ".join(warming_up) or "none"}'
+    ), {**per_source, 'warming_up': warming_up}
+
+
+def _source_fields(windows: _Windows, source: RecordSource) -> dict[str, object]:
+    recent, baseline = windows.counts(_from_source(source))
+    recent_rate, baseline_rate = windows.per_plan(recent, baseline)
+    return {
+        'recent_count': recent,
+        'baseline_count': baseline,
+        'recent_per_plan': recent_rate,
+        'baseline_per_plan': baseline_rate,
+        'history_days': windows.history_days(source),
+        'warming_up': windows.is_warming_up(source),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -594,22 +793,43 @@ def _census_line(
         return f'{_LINE_PREFIX}: NO-FIRE -- disabled by plan_deviation_census.enabled', False
     now = _as_utc(now)
     horizon = now - timedelta(days=settings.horizon_days)
-    plans = read_plan_deviations(
+    plan_corpus = read_plan_deviations(
         [Path(cfg.project_root) / root for root in settings.meta_roots], horizon=horizon,
     )
     notes = read_archived_notes(escalation_queue_dir(cfg.project_root), horizon=horizon)
-    verdict = evaluate([*plans.records, *notes.records], now=now, config=settings)
-    summary = (
-        f'{"; ".join(verdict.reasons)}; corpus: {len(plans.records)} plan-step + '
-        f'{len(notes.records)} escalation record(s), {plans.skipped + notes.skipped} skipped'
+    verdict = evaluate(
+        [*plan_corpus.records, *notes.records], plans=plan_corpus.plans, now=now, config=settings,
     )
+    reader_break = _reader_break(plan_corpus)
+    summary = '; '.join((
+        *verdict.reasons,
+        f'corpus: {len(plan_corpus.records)} plan-step + {len(notes.records)} escalation '
+        f'record(s), {len(plan_corpus.plans)} finalized plan(s), '
+        f'{plan_corpus.skipped + notes.skipped} skipped',
+        *(() if reader_break is None else (reader_break,)),
+    ))
     if not verdict.fire:
-        return f'{_LINE_PREFIX}: NO-FIRE -- {summary}', False
+        return f'{_LINE_PREFIX}: NO-FIRE -- {summary}', reader_break is not None
     disposition = _dispose(
         verdict, project_id=cfg.project_id, settings=settings, now=now,
         call_tool=call_tool, state_path=state_path,
     )
-    return f'{_LINE_PREFIX}: FIRE -- {summary}; {disposition.text}', disposition.degraded
+    return (
+        f'{_LINE_PREFIX}: FIRE -- {summary}; {disposition.text}',
+        disposition.degraded or reader_break is not None,
+    )
+
+
+def _reader_break(plan_corpus: CorpusRead) -> str | None:
+    """A deviation is recorded on a finalized plan, so plan-step records with
+    no finalized plan at all mean the plan read broke and every rate arm is
+    blind."""
+    if not plan_corpus.records or plan_corpus.plans:
+        return None
+    return (
+        f'reader break: {len(plan_corpus.records)} plan-step record(s) but no plan with a '
+        f'readable {_FINALIZED_AT_KEY}, so every rate arm is blind'
+    )
 
 
 def _dispose(
@@ -688,8 +908,9 @@ def _filing_arguments(verdict: Verdict, task_id: str) -> dict:
         'summary': 'plan-deviation census FIRE -- ' + '; '.join(verdict.reasons),
         'detail': '\n'.join([*verdict.reasons, f'Design: {_DESIGN_POINTER}.']),
         'suggested_action': (
-            'Read the evidence (window means, per-kind counts, prose-only count, top task '
-            'ids) and decide whether planning doctrine or tooling needs to change.'
+            'Read the evidence (per-plan rates by source, warming-up sources, per-kind '
+            'counts, prose-only rates, top task ids) and decide whether planning doctrine '
+            'or tooling needs to change.'
         ),
         'evidence': list(verdict.evidence),
     }

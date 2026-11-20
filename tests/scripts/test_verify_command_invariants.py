@@ -978,3 +978,94 @@ def test_marked_body_fails_loudly_and_names_the_artifact(doc: str, case: str) ->
     assert "<!-- demo-policy:begin" in message, case
     assert "CONTRIBUTING.md" in message, case
     assert "5769" in message, case
+
+
+# ---------------------------------------------------------------------------
+# marked_bullet_command
+# ---------------------------------------------------------------------------
+
+_BULLET_KWARGS = {
+    "slug": "demo-recipe",
+    "bullet_label": "Demo recipe (v2.0)",
+    "source": "self-test-doc.md",
+    "task": "6883",
+}
+
+_MARKED_BULLET_DOC = """\
+- **Demo recipe (v2.0)**: `python3 decoy.py --outside-the-span`
+
+<!-- demo-recipe:begin the opener cites `pwd` in its own inline code -->
+- **Other recipe**: `ls`
+- **Demo recipe (v2.0)**: `  python3 demo.py --flag  `
+<!-- demo-recipe:end -->
+"""
+
+_MARKER_NAMES_IN_PROSE_DOC = """\
+The span below opens at `demo-recipe:begin` and closes at `demo-recipe:end`.
+
+<!-- demo-recipe:begin -->
+- **Demo recipe (v2.0)**: `python3 demo.py --flag`
+<!-- demo-recipe:end -->
+"""
+
+
+def test_marked_bullet_command_returns_the_labelled_bullets_command_stripped() -> None:
+    """Only the labelled bullet inside the span is read, and its command is stripped.
+
+    The same-label bullet above the span, the other label's bullet and the
+    opener's inline code are all decoys; the label's parens and dot must match
+    literally.
+    """
+    assert (
+        vci.marked_bullet_command(_MARKED_BULLET_DOC, **_BULLET_KWARGS)
+        == "python3 demo.py --flag"
+    )
+
+
+def test_marked_bullet_command_counts_only_comment_markers() -> None:
+    """A prose mention of the bare marker names is not a second marker."""
+    assert (
+        vci.marked_bullet_command(_MARKER_NAMES_IN_PROSE_DOC, **_BULLET_KWARGS)
+        == "python3 demo.py --flag"
+    )
+
+
+@pytest.mark.parametrize(
+    ("doc", "case"),
+    [
+        ("- **Demo recipe (v2.0)**: `python3 demo.py`\n", "no marker at all"),
+        (
+            "<!-- demo-recipe:begin -->\n- **Demo recipe (v2.0)**: `alpha`\n"
+            "<!-- demo-recipe:end -->\n"
+            "<!-- demo-recipe:begin -->\n- **Demo recipe (v2.0)**: `beta`\n"
+            "<!-- demo-recipe:end -->\n",
+            "duplicated span",
+        ),
+        (
+            "<!-- demo-recipe:end -->\n- **Demo recipe (v2.0)**: `alpha`\n"
+            "<!-- demo-recipe:begin -->\n",
+            "inverted markers",
+        ),
+        (
+            "<!-- demo-recipe:begin -->\n- **Other recipe**: `ls`\n"
+            "<!-- demo-recipe:end -->\n",
+            "no bullet under that label",
+        ),
+        (
+            "<!-- demo-recipe:begin -->\n- **Demo recipe (v2.0)**: `   `\n"
+            "<!-- demo-recipe:end -->\n",
+            "blank command",
+        ),
+    ],
+)
+def test_marked_bullet_command_fails_loudly_and_names_the_callers_source(
+    doc: str, case: str
+) -> None:
+    """The single home of the guards' broken-marker cases; the caller's source must reach the message."""
+    with pytest.raises(AssertionError) as excinfo:
+        vci.marked_bullet_command(doc, **_BULLET_KWARGS)
+
+    message = str(excinfo.value)
+    assert "<!-- demo-recipe:begin" in message, case
+    assert "self-test-doc.md" in message, case
+    assert "6883" in message, case

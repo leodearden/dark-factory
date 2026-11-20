@@ -469,7 +469,7 @@ should always use both to fully prevent temporal contamination.
 ### Task-count and task-status values — DO NOT persist as durable edges
 Task-count and task-status values (total, done, blocked, in_progress, highest task id, \
 etc.) are computed at READ time from the live task store and surfaced authoritatively \
-in the `## Active Task Tree` header at the top of every Stage 1 payload. That header \
+in the `{ACTIVE_TASK_TREE_HEADER}` header at the top of every Stage 1 payload. That header \
 is the single source of truth for the current cycle.
 
 **MUST NOT**: write recurring task-count or task-status values as durable \
@@ -480,7 +480,7 @@ future cycles with stale counts. The payload already carries authoritative value
 no durable snapshot edge is needed.
 
 **MUST NOT**: infer or estimate task counts from the rendered active-task lines in \
-the payload. The `## Active Task Tree` header contains the authoritative \
+the payload. The `{ACTIVE_TASK_TREE_HEADER}` header contains the authoritative \
 `highest task id`, `total`, `done`, and `cancelled` values computed over the FULL \
 task list (independent of any render caps). Read those values from the header — do \
 not guess from line counts.
@@ -514,13 +514,13 @@ not re-mint it from a pin-queue observation.
 
 Existing task-count snapshot edges in Graphiti are **stale-by-design**, NOT erroneous. \
 When you encounter an edge whose counts (done/total/highest-id) are slightly below the \
-authoritative `## Active Task Tree` header, this reflects normal task creation or \
+authoritative `{ACTIVE_TASK_TREE_HEADER}` header, this reflects normal task creation or \
 completion that occurred between the edge's write time and the current cycle's read. \
 A small monotonic drift (e.g. the header now shows 635/608 while the edge records \
 634/607) is expected and routine.
 
 **DO NOT** emit an 'off-by-N correction' finding, and **DO NOT** invalidate or rewrite \
-the snapshot edge on account of this drift. The `## Active Task Tree` header is the \
+the snapshot edge on account of this drift. The `{ACTIVE_TASK_TREE_HEADER}` header is the \
 single source of truth for this cycle — snapshot edges are an audit trail, not a live \
 counter. A code-side gate (`filter_stale_count_snapshot_corrections`) drops these \
 false findings after the stage run, but that gate cannot undo an in-run `update_edge` \

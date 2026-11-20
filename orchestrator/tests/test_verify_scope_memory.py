@@ -18,8 +18,12 @@ from typing import Any
 import pytest
 from _fake_systemd_run import assert_scope_carries, recorded_scope_spawns, scope_payload_command
 from _fake_systemd_run import fake_systemd_run as fake_systemd_run
+from _real_project_slice import RealProjectSlice
+from _real_project_slice import real_project_slice as real_project_slice
+from shared.cgroup_slice import project_slice_name
 
 from orchestrator.config import (
+    FusedMemoryConfig,
     ModuleConfig,
     OrchestratorConfig,
     VerifyCgroupMemoryConfig,
@@ -118,10 +122,11 @@ class TestScopeSpawnCarriesMemoryLimits:
         assert result.passed, result.summary
         records = recorded_scope_spawns(fake_systemd_run)
         assert len(records) == 3
+        slice_arg = f'--slice={project_slice_name(config.fused_memory.project_id)}'
         for record in records:
             assert record[:4] == ['--user', '--scope', '--quiet', '--collect'], record
             assert re.fullmatch(r'--unit=df-verify-.+\.scope', record[4]), record
-            assert record[5:8] == ['-p', 'CPUWeight=33', '/bin/bash'], record
+            assert record[5:9] == [slice_arg, '-p', 'CPUWeight=33', '/bin/bash'], record
 
     @pytest.mark.asyncio
     async def test_reloaded_limit_applies_to_next_spawn(
@@ -179,7 +184,9 @@ class TestRealScopeMemoryLimits:
     """
 
     @pytest.mark.asyncio
-    async def test_task_scope_reads_back_configured_limits(self, worktree):
+    async def test_task_scope_reads_back_configured_limits(
+        self, worktree, real_project_slice: RealProjectSlice,
+    ):
         if not _memory_limits_settable():
             pytest.skip('systemd user scopes with memory limits unavailable on this host')
         high, cap, swap = _DISTINCT_LIMITS_GIB
@@ -188,6 +195,7 @@ class TestRealScopeMemoryLimits:
             verify_cgroup_memory=VerifyCgroupMemoryConfig(
                 high_gib=high, max_gib=cap, swap_max_gib=swap,
             ),
+            fused_memory=FusedMemoryConfig(project_id=real_project_slice.project_id),
         )
         module_config = ModuleConfig(
             prefix='pkg',

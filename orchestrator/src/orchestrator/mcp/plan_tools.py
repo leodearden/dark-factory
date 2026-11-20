@@ -2318,9 +2318,35 @@ def _markup_fact_sink(
 # ---------------------------------------------------------------------------
 
 
-def create_server(artifacts: TaskArtifacts) -> FastMCP:
-    """Create the plan-tools MCP server with all tools registered."""
+def create_server(
+    artifacts: TaskArtifacts, granted_tools: frozenset[str] | None = None,
+) -> FastMCP:
+    """Create the plan-tools MCP server.
+
+    *granted_tools* ``None`` registers every tool. Otherwise only the granted
+    names stay registered, so an ungranted tool neither lists nor dispatches;
+    a granted name this server does not register raises ``ValueError``.
+    """
+    mcp, registered = _server_with_every_tool(artifacts)
+    if granted_tools is not None:
+        unknown = sorted(granted_tools - registered)
+        if unknown:
+            raise ValueError(
+                f'plan-tools grant names unregistered tool(s) {unknown}; '
+                f'registered: {sorted(registered)}'
+            )
+        _restrict_to_grant(mcp, registered, granted_tools)
+    return mcp
+
+
+def _server_with_every_tool(artifacts: TaskArtifacts) -> tuple[FastMCP, frozenset[str]]:
     mcp = FastMCP('plan-tools')
+    registered: list[str] = []
+
+    def tool(fn: Callable[_P, _R]) -> Callable[_P, _R]:
+        registered.append(fn.__name__)
+        mcp.tool()(fn)
+        return fn
 
     # THE WRITE-TIME BOUNDARY GUARD (task 4457, PRD contract C2). Every INBOUND
     # string argument of every tool on this server is scanned for leaked
@@ -2438,7 +2464,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
     )
     mcp.add_middleware(MissingArgumentMiddleware())
 
-    @mcp.tool()
+    @tool
     @accepts_markup_override
     def create_plan(
         task_id: str,
@@ -2464,7 +2490,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         """
         return _create_plan(artifacts, task_id, title, analysis, files)
 
-    @mcp.tool()
+    @tool
     @accepts_markup_override
     def add_plan_step(
         step_id: str,
@@ -2486,7 +2512,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         """
         return _add_plan_step(artifacts, step_id, step_type, description)
 
-    @mcp.tool()
+    @tool
     @accepts_markup_override
     def add_prerequisite(
         prereq_id: str,
@@ -2504,7 +2530,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         """
         return _add_prerequisite(artifacts, prereq_id, description)
 
-    @mcp.tool()
+    @tool
     @accepts_markup_override
     def add_design_decision(
         decision: str,
@@ -2518,7 +2544,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         """
         return _add_design_decision(artifacts, decision, rationale)
 
-    @mcp.tool()
+    @tool
     @accepts_markup_override
     def add_reuse_item(
         what: str,
@@ -2534,7 +2560,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         """
         return _add_reuse_item(artifacts, what, where, how)
 
-    @mcp.tool()
+    @tool
     @accepts_markup_override
     def drop_plan_file(
         path: str,
@@ -2567,7 +2593,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         # refactor to a batch/map signature would silently drop the guard.
         return _drop_plan_file(artifacts, path, reason)
 
-    @mcp.tool()
+    @tool
     @accepts_markup_override
     def mark_step_done(
         step_id: str,
@@ -2601,7 +2627,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         """
         return _mark_step_done(artifacts, step_id, commit_sha)
 
-    @mcp.tool()
+    @tool
     @accepts_markup_override
     def record_step_deviation(
         step_id: str,
@@ -2638,7 +2664,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
             prose_only, note,
         )
 
-    @mcp.tool()
+    @tool
     @accepts_markup_override
     def record_descoped_step(
         step_id: str,
@@ -2669,7 +2695,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         # strings get MarkupGuardMiddleware's inbound coverage.
         return _record_descoped_step(artifacts, step_id, commit, disposition, authority, note)
 
-    @mcp.tool()
+    @tool
     @accepts_markup_override
     def mark_step_committed(
         step_id: str,
@@ -2701,7 +2727,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
 
     # --- Revalidation tools ---
 
-    @mcp.tool()
+    @tool
     @accepts_markup_override
     def update_plan_metadata(
         files: list[str] | str | None = None,
@@ -2723,7 +2749,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         """
         return _update_plan_metadata(artifacts, files, analysis)
 
-    @mcp.tool()
+    @tool
     @accepts_markup_override
     def remove_plan_step(
         step_id: str,
@@ -2738,7 +2764,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         """
         return _remove_plan_step(artifacts, step_id)
 
-    @mcp.tool()
+    @tool
     @accepts_markup_override
     def replace_plan_step(
         step_id: str,
@@ -2761,7 +2787,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         """
         return _replace_plan_step(artifacts, step_id, step_type, description)
 
-    @mcp.tool()
+    @tool
     @accepts_markup_override
     def confirm_plan() -> dict[str, Any]:
         """Mark the plan COMPLETE. Call this as your final plan-tools action.
@@ -2781,7 +2807,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         """
         return _confirm_plan(artifacts)
 
-    @mcp.tool()
+    @tool
     @accepts_markup_override
     def report_blocking_dependency(
         depends_on_task_id: str,
@@ -2816,7 +2842,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
             artifacts, depends_on_task_id, reason, main_sha,
         )
 
-    @mcp.tool()
+    @tool
     @accepts_markup_override
     def report_task_already_done(
         commit: str,
@@ -2844,7 +2870,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         """
         return _report_task_already_done(artifacts, commit, evidence)
 
-    @mcp.tool()
+    @tool
     @accepts_markup_override
     def report_ready_to_merge(
         commit: str,
@@ -2888,7 +2914,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         """
         return _report_ready_to_merge(artifacts, commit, evidence)
 
-    @mcp.tool()
+    @tool
     @accepts_markup_override
     def report_unactionable_task(
         reason: str,
@@ -2915,7 +2941,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         """
         return _report_unactionable_task(artifacts, reason, evidence)
 
-    @mcp.tool()
+    @tool
     @accepts_markup_override
     def report_false_premise(
         classification: str,
@@ -2959,7 +2985,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
             artifacts, classification, premise, evidence, proposed_resolution
         )
 
-    @mcp.tool()
+    @tool
     @accepts_markup_override
     def report_missing_plan_file(
         path: str,
@@ -2986,7 +3012,14 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         """
         return _report_missing_plan_file(artifacts, path, reason)
 
-    return mcp
+    return mcp, frozenset(registered)
+
+
+def _restrict_to_grant(
+    mcp: FastMCP, registered: frozenset[str], granted: frozenset[str],
+) -> None:
+    for name in registered - granted:
+        mcp.local_provider.remove_tool(name)
 
 
 # ---------------------------------------------------------------------------
@@ -3003,6 +3036,41 @@ def _artifacts_from_args(argv: list[str] | None = None) -> TaskArtifacts:
     PRD task ε1; the task root, task 3155). Each root must already exist;
     omitting both flags leaves the legacy ``<worktree>/.task`` single root.
     """
+    return _artifacts_from_namespace(_cli_parser().parse_args(argv))
+
+
+def server_from_argv(argv: list[str] | None = None) -> FastMCP:
+    """The server a stdio launch with *argv* serves, over its artifacts.
+
+    A launch carrying ``--grants-enforced`` or any ``--grant`` exposes only
+    the granted tools, so a marked launch with no grant exposes none. A
+    granted name this server does not register is dropped with a WARNING,
+    where ``create_server`` raises. A launch carrying neither keeps every
+    tool and logs a WARNING. Why both cases exist:
+    plans/plan-deviation-recording-prd.md D14.
+    """
+    args = _cli_parser().parse_args(argv)
+    mcp, registered = _server_with_every_tool(_artifacts_from_namespace(args))
+    granted: frozenset[str] = frozenset(args.grant or ())
+    if not (args.grants_enforced or granted):
+        logger.warning(
+            'plan-tools launched without --grants-enforced or any --grant: exposing '
+            'every plan-tools tool, because the launcher predates task 7717. '
+            'Task 10803 removes this path.'
+        )
+        return mcp
+    unknown = sorted(granted - registered)
+    if unknown:
+        logger.warning(
+            'plan-tools launch grants tool(s) %s that this server does not register: '
+            'dropping them, because the launcher predates their rename or removal.',
+            unknown,
+        )
+    _restrict_to_grant(mcp, registered, granted)
+    return mcp
+
+
+def _cli_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description='Plan-tools MCP server (stdio)')
     parser.add_argument(
         '--worktree', type=Path, required=True,
@@ -3023,8 +3091,21 @@ def _artifacts_from_args(argv: list[str] | None = None) -> TaskArtifacts:
             'omitted, every artifact resolves against the lane root.'
         ),
     )
-    args = parser.parse_args(argv)
+    parser.add_argument(
+        '--grant', action='append', metavar='NAME',
+        help='A tool this launch exposes; repeatable.',
+    )
+    parser.add_argument(
+        '--grants-enforced', action='store_true',
+        help=(
+            'Expose only the --grant tools, so none when no grant is given. '
+            'Every launcher from task 7717 on passes it.'
+        ),
+    )
+    return parser
 
+
+def _artifacts_from_namespace(args: argparse.Namespace) -> TaskArtifacts:
     artifacts = TaskArtifacts(
         args.worktree.resolve(),
         args.meta_root.resolve() if args.meta_root is not None else None,
@@ -3038,9 +3119,8 @@ def _artifacts_from_args(argv: list[str] | None = None) -> TaskArtifacts:
 
 
 def main() -> None:
-    """Parse the worktree and artifact roots and run the stdio MCP server."""
-    artifacts = _artifacts_from_args()
-    server = create_server(artifacts)
+    """Parse the worktree, artifact roots and grants and run the stdio MCP server."""
+    server = server_from_argv()
     # show_banner=False suppresses FastMCP's decorative startup banner and its
     # synchronous PyPI update-check (check_for_newer_version -> httpx.get). That
     # check runs on the stdio startup path BEFORE the MCP initialize handshake;

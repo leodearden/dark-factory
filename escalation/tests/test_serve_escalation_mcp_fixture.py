@@ -25,7 +25,6 @@ repo-root multi-package run is not this one. See
 
 from __future__ import annotations
 
-import ast
 import asyncio
 import contextlib
 import errno
@@ -40,6 +39,7 @@ import pytest
 import yaml
 from fastmcp import Client
 from fastmcp.client.transports import StreamableHttpTransport
+from shared.testing_timeout_headroom import UNDER_LOAD_HEADROOM_FACTOR
 from shared.testing_timeout_markers import verify_cli_timeout
 
 # The injected ``escalation_conftest`` is annotated ``Any`` for one reason:
@@ -443,58 +443,28 @@ def test_a_healthy_server_the_client_cannot_reach_names_the_client_error(
 # Corpus: plans/escalation-mcp-readiness-bound-measurement-2026-10-13.md.
 _MEASURED_FIRST_START_WORST_CASE_S = 5.46
 
-# Mirrors orchestrator/tests/_orch_helpers.py::UNDER_LOAD_HEADROOM_FACTOR,
-# which is importable only under orchestrator/tests (CONTRIBUTING.md).
-# test_the_headroom_factor_mirror_matches_its_canonical_home keeps them equal.
-_UNDER_LOAD_HEADROOM_FACTOR = 8
-
 # From __file__, never the cwd: verify runs from escalation/, a repo-root run
 # from the root.
 _REPO_ROOT = Path(__file__).resolve().parents[2]
-_ORCH_HELPERS = _REPO_ROOT / 'orchestrator' / 'tests' / '_orch_helpers.py'
 _ESCALATION_ORCH_YAML = _REPO_ROOT / 'escalation' / 'orchestrator.yaml'
 _FLEET_ORCH_YAML = _REPO_ROOT / 'dark-factory-orchestrator.yaml'
-
-
-def test_the_headroom_factor_mirror_matches_its_canonical_home() -> None:
-    """``_UNDER_LOAD_HEADROOM_FACTOR`` must equal the constant it mirrors.
-
-    Read from source, because that module does not import from here.
-    """
-    canonical = [
-        ast.literal_eval(node.value)
-        for node in ast.parse(_ORCH_HELPERS.read_text(encoding='utf-8')).body
-        if isinstance(node, ast.Assign)
-        and any(
-            isinstance(target, ast.Name) and target.id == 'UNDER_LOAD_HEADROOM_FACTOR'
-            for target in node.targets
-        )
-    ]
-    assert canonical == [_UNDER_LOAD_HEADROOM_FACTOR], (
-        f'_UNDER_LOAD_HEADROOM_FACTOR ({_UNDER_LOAD_HEADROOM_FACTOR}) must mirror '
-        f'the single literal UNDER_LOAD_HEADROOM_FACTOR assignment in '
-        f'{_ORCH_HELPERS}; found {canonical!r}. If the factor was retuned, update '
-        'the mirror. If it moved to a home importable from here (task 6555), '
-        'import it instead and delete the mirror and this test.'
-    )
 
 
 def test_the_readiness_bound_clears_the_measured_first_start_with_headroom(
     escalation_conftest: Any,
 ) -> None:
-    """``_READY_TIMEOUT_S`` must clear 8x the worst first start on record.
+    """``_READY_TIMEOUT_S`` must clear the worst first start on record by the headroom factor.
 
-    8x because the CPU starvation that kills runs sits one load step past
-    where anyone has measured. The anchor is a failure-path figure, and it
-    still bounds the happy path: a successful start does every step the failed
-    one did, then lifespan startup and a handshake.
+    The anchor is a failure-path figure, and it still bounds the happy path: a
+    successful start does every step the failed one did, then lifespan startup
+    and a handshake.
     """
     bound = escalation_conftest._READY_TIMEOUT_S
-    required = _MEASURED_FIRST_START_WORST_CASE_S * _UNDER_LOAD_HEADROOM_FACTOR
+    required = _MEASURED_FIRST_START_WORST_CASE_S * UNDER_LOAD_HEADROOM_FACTOR
     assert bound >= required, (
-        f'_READY_TIMEOUT_S ({bound}s) is below {_UNDER_LOAD_HEADROOM_FACTOR}x '
+        f'_READY_TIMEOUT_S ({bound}s) is below {UNDER_LOAD_HEADROOM_FACTOR}x '
         f'the measured first-start worst case '
-        f'({_MEASURED_FIRST_START_WORST_CASE_S}s x {_UNDER_LOAD_HEADROOM_FACTOR} '
+        f'({_MEASURED_FIRST_START_WORST_CASE_S}s x {UNDER_LOAD_HEADROOM_FACTOR} '
         f'= {required}s). Raise the bound, or re-measure at comparable or higher '
         'load; never lower the anchor. Corpus: '
         'plans/escalation-mcp-readiness-bound-measurement-2026-10-13.md.'

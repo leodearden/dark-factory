@@ -55,6 +55,7 @@ if (
 ) not in sys.path and Path(_CHECKOUT_SHARED_SRC).is_dir():
     sys.path.append(_CHECKOUT_SHARED_SRC)
 
+from shared.project_layout import CheckoutRootError, main_checkout_of
 from shared.session_liveness import capture_for_record
 
 # Siblings are imported relative to orchestrator.session_registry, or else from this
@@ -93,62 +94,25 @@ else:
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Project token from cwd: the enclosing git checkout's main working tree
-# (reads git's on-disk layout, gitrepository-layout(5); never raises)
+# Project token from cwd: shared.project_layout.main_checkout_of; never raises
 # ---------------------------------------------------------------------------
 
 
-def _enclosing_checkout(path: Path) -> Path | None:
-    """The nearest of *path* and its ancestors holding a ``.git`` entry."""
-    for candidate in (path, *path.parents):
-        if os.path.exists(candidate / '.git'):
-            return candidate
-    return None
-
-
-def _read_git_path(pointer_file: Path, prefix: str = '') -> Path | None:
-    """The path a git pointer file (gitfile, ``commondir``) holds on its first line.
-
-    The line must start with *prefix*; a relative path is resolved against
-    the pointer file's directory and lexically normalised. Unreadable,
-    unprefixed or empty -> None.
-    """
+def _project_checkout(cwd: str) -> Path | None:
+    """The main checkout enclosing absolute *cwd*, or the enclosing checkout itself when git's layout names no main one."""
+    if not os.path.isabs(cwd):
+        return None
     try:
-        lines = pointer_file.read_text(encoding='utf-8').splitlines()
-    except (OSError, ValueError):
-        return None
-    if not lines or not lines[0].startswith(prefix):
-        return None
-    raw = lines[0][len(prefix):].strip()
-    if not raw:
-        return None
-    return Path(os.path.normpath(pointer_file.parent / raw))
-
-
-def _main_working_tree(checkout: Path) -> Path:
-    """The main working tree *checkout* belongs to.
-
-    *checkout* itself when its ``.git`` is a directory, or when its gitfile
-    does not lead to a common dir named ``.git`` (submodule, bare-backed
-    worktree, broken gitfile).
-    """
-    dotgit = checkout / '.git'
-    if os.path.isdir(dotgit):
-        return checkout
-    gitdir = _read_git_path(dotgit, prefix='gitdir:')
-    common_dir = _read_git_path(gitdir / 'commondir') if gitdir is not None else None
-    if common_dir is not None and common_dir.name == '.git':
-        return common_dir.parent
-    return checkout
+        return main_checkout_of(cwd)
+    except CheckoutRootError as refused:
+        return refused.checkout
 
 
 def _cwd_project_token(cwd: str) -> str:
     """``parse_spawn_identity``'s default project -- see its step 3."""
-    checkout = _enclosing_checkout(Path(cwd)) if os.path.isabs(cwd) else None
-    if checkout is not None:
-        name = _main_working_tree(checkout).name
-        if name:
-            return name
+    checkout = _project_checkout(cwd)
+    if checkout is not None and checkout.name:
+        return checkout.name
     return os.path.basename(cwd.rstrip('/')) or 'unknown'
 
 
@@ -187,9 +151,11 @@ def parse_spawn_identity(
        The trailing short-slug is always discarded; a project-level title
        (no ``#``) yields ``task_id=None``.
     3. Defaults: ``role='session'``; ``project`` is the basename of the
-       enclosing git checkout's MAIN working tree (a linked worktree resolves
-       through its gitfile's ``gitdir`` and ``commondir`` to the checkout it
-       belongs to), else ``basename(cwd.rstrip('/'))`` or ``'unknown'``. A
+       enclosing git checkout's MAIN working tree, with *cwd* resolved
+       (following symlinks) via ``shared.project_layout.main_checkout_of``.
+       A checkout whose main checkout cannot be derived (bare-backed
+       worktree, submodule, broken gitfile) names itself; with no enclosing
+       checkout it is ``basename(cwd.rstrip('/'))`` or ``'unknown'``. A
        relative *cwd* is not resolved against the process cwd. The token is
        written raw (unfolded); the cockpit folds at its read boundary.
 

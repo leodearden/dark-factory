@@ -8,10 +8,13 @@ in a report's text and attribute values. It is replaced by
 ``<redacted:VAR>`` right-padded with ``x`` to the same byte length, so a file
 keeps its size and line count; in XML the label is entity-escaped
 (``&lt;redacted:VAR&gt;``) and never cut mid-entity, so a report stays
-well-formed and still parses as ``<redacted:VAR>``. A ``Codec`` says how the
-bytes are stored: a gzip file is decompressed, redacted and recompressed, and
-one that does not decompress whole raises ``CorruptCompressedFile`` and is left
-as found. A line whose rewrite would
+well-formed and still parses as ``<redacted:VAR>``. A value a log cut short
+is matched too: at least ``MIN_TRUNCATED_PREFIX_LEN`` leading bytes of a form,
+ending where one of ``TRUNCATION_MARKERS`` (in that markup's escaped forms)
+starts; where hits overlap, the earliest, then the longest, is replaced. A
+``Codec`` says how the bytes are stored: a gzip file is decompressed, redacted
+and recompressed, and one that does not decompress whole raises
+``CorruptCompressedFile`` and is left as found. A line whose rewrite would
 turn it from valid JSON into invalid JSON is left as it was and reported in
 ``FileRedaction.refused``; every other line is still redacted. No message ever
 carries a value.
@@ -37,6 +40,8 @@ from xml.sax.saxutils import escape as xml_escape
 
 __all__ = [
     'MIN_REDACTABLE_LEN',
+    'MIN_TRUNCATED_PREFIX_LEN',
+    'TRUNCATION_MARKERS',
     'Codec',
     'CorruptCompressedFile',
     'FileChangedDuringRedaction',
@@ -48,11 +53,14 @@ __all__ = [
     'RedactionWouldCorruptJson',
     'RefusedLine',
     'file_stamp',
+    'preview_redaction',
     'redact_in_place',
     'redaction_needles',
 ]
 
 MIN_REDACTABLE_LEN = 20
+MIN_TRUNCATED_PREFIX_LEN = 16
+TRUNCATION_MARKERS = ('...', '…', "'", '"', ')', ']', '}', '>')
 
 _DETECT_CHUNK_BYTES = 1 << 20
 
@@ -77,7 +85,18 @@ class Codec(enum.Enum):
 class Needle:
     var: str
     pattern: bytes = field(repr=False)
-    placeholder: bytes
+    markup: Markup
+
+    @property
+    def head(self) -> bytes:
+        return self.pattern[:MIN_TRUNCATED_PREFIX_LEN]
+
+    @property
+    def placeholder(self) -> bytes:
+        return self.placeholder_for(len(self.pattern))
+
+    def placeholder_for(self, length: int) -> bytes:
+        return _MARKUP_RULES[self.markup].placeholder(self.var, length)
 
 
 @dataclass(frozen=True)
@@ -99,6 +118,9 @@ class FileRedaction:
         if self.refused:
             first = self.refused[0]
             raise RedactionWouldCorruptJson(Path(path), first.line_number, first.var)
+
+
+_NO_HITS = FileRedaction(MappingProxyType({}))
 
 
 @dataclass(frozen=True)
@@ -145,7 +167,7 @@ def redaction_needles(
             continue
         for form in rules.forms(value):
             pattern = form.encode()
-            by_pattern.setdefault(pattern, Needle(var, pattern, rules.placeholder(var, len(pattern))))
+            by_pattern.setdefault(pattern, Needle(var, pattern, markup))
     return tuple(sorted(by_pattern.values(), key=lambda needle: -len(needle.pattern)))
 
 
@@ -164,7 +186,7 @@ def redact_in_place(
     original = os.stat(path)
     stamp = unchanged_since or _stamp_of(original)
     if not needles or not _contains_any(path, needles, codec):
-        return FileRedaction(MappingProxyType({}))
+        return _NO_HITS
 
     fd, temp_name = tempfile.mkstemp(prefix=f'.{path.name}.', suffix='.redacting', dir=path.parent)
     os.close(fd)
@@ -174,7 +196,7 @@ def redact_in_place(
             _decoded(path, codec) as reader,
             _encoded(temp, codec, name=path.name, mtime=int(original.st_mtime)) as writer,
         ):
-            result = _copy_lines(reader, writer, needles)
+            result = _copy_lines(reader, writer.write, needles)
         if not result.redacted:
             return result
         os.chmod(temp, stat.S_IMODE(original.st_mode))
@@ -185,6 +207,16 @@ def redact_in_place(
     finally:
         temp.unlink(missing_ok=True)
     return result
+
+
+def preview_redaction(
+    path: StrPath, needles: Sequence[Needle], *, codec: Codec = Codec.PLAIN
+) -> FileRedaction:
+    path = Path(path)
+    if not needles or not _contains_any(path, needles, codec):
+        return _NO_HITS
+    with _decoded(path, codec) as reader:
+        return _copy_lines(reader, lambda _line: None, needles)
 
 
 def _json_escaped_forms(value: str) -> tuple[str, ...]:
@@ -219,12 +251,20 @@ def _xml_placeholder(var: str, length: int) -> bytes:
 class _MarkupRules:
     forms: Callable[[str], tuple[str, ...]]
     placeholder: Callable[[str, int], bytes]
+    markers: tuple[bytes, ...]
+
+
+def _markup_rules(
+    forms: Callable[[str], tuple[str, ...]], placeholder: Callable[[str, int], bytes]
+) -> _MarkupRules:
+    markers = {form.encode() for marker in TRUNCATION_MARKERS for form in (marker, *forms(marker))}
+    return _MarkupRules(forms, placeholder, tuple(sorted(markers)))
 
 
 _MARKUP_RULES: Mapping[Markup, _MarkupRules] = MappingProxyType({
-    Markup.JSON: _MarkupRules(_json_escaped_forms, _text_placeholder),
-    Markup.TEXT: _MarkupRules(_raw_and_json_escaped_forms, _text_placeholder),
-    Markup.XML: _MarkupRules(_xml_escaped_forms, _xml_placeholder),
+    Markup.JSON: _markup_rules(_json_escaped_forms, _text_placeholder),
+    Markup.TEXT: _markup_rules(_raw_and_json_escaped_forms, _text_placeholder),
+    Markup.XML: _markup_rules(_xml_escaped_forms, _xml_placeholder),
 })
 
 
@@ -274,24 +314,25 @@ def _encoded(temp: Path, codec: Codec, *, name: str, mtime: int) -> Iterator[io.
 
 
 def _contains_any(path: Path, needles: Sequence[Needle], codec: Codec) -> bool:
-    overlap = max(len(needle.pattern) for needle in needles) - 1
+    heads = {needle.head for needle in needles}
+    overlap = MIN_TRUNCATED_PREFIX_LEN - 1
     tail = b''
     with _decoded(path, codec) as reader:
         while chunk := reader.read(_DETECT_CHUNK_BYTES):
             window = tail + chunk
-            if any(needle.pattern in window for needle in needles):
+            if any(head in window for head in heads):
                 return True
             tail = window[len(window) - overlap:]
     return False
 
 
 def _copy_lines(
-    reader: io.BufferedIOBase, writer: io.BufferedIOBase, needles: Sequence[Needle]
+    reader: io.BufferedIOBase, write: Callable[[bytes], object], needles: Sequence[Needle]
 ) -> FileRedaction:
     counts: Counter[str] = Counter()
     refused: list[RefusedLine] = []
     for line_number, line in enumerate(reader, start=1):
-        writer.write(_redact_line(line, needles, counts, refused, line_number))
+        write(_redact_line(line, needles, counts, refused, line_number))
     return FileRedaction(MappingProxyType(dict(counts)), tuple(refused))
 
 
@@ -302,13 +343,14 @@ def _redact_line(
     refused: list[RefusedLine],
     line_number: int,
 ) -> bytes:
-    redacted = line
+    pieces: list[bytes] = []
+    copied_up_to = 0
     line_counts: Counter[str] = Counter()
-    for needle in needles:
-        hits = redacted.count(needle.pattern)
-        if hits:
-            line_counts[needle.var] += hits
-            redacted = redacted.replace(needle.pattern, needle.placeholder)
+    for start, end, needle in _resolved_hits(line, needles):
+        pieces += (line[copied_up_to:start], needle.placeholder_for(end - start))
+        copied_up_to = end
+        line_counts[needle.var] += 1
+    redacted = b''.join((*pieces, line[copied_up_to:]))
     if line_counts and _is_json(line) and not _is_json(redacted):
         refused.append(RefusedLine(line_number, next(iter(line_counts))))
         return line
@@ -322,3 +364,38 @@ def _is_json(line: bytes) -> bool:
     except ValueError:
         return False
     return True
+
+
+def _resolved_hits(line: bytes, needles: Sequence[Needle]) -> list[tuple[int, int, Needle]]:
+    candidates = sorted(
+        ((start, end, needle) for needle in needles for start, end in _hits(line, needle)),
+        key=lambda hit: (hit[0], -hit[1]),
+    )
+    kept: list[tuple[int, int, Needle]] = []
+    for hit in candidates:
+        if not kept or hit[0] >= kept[-1][1]:
+            kept.append(hit)
+    return kept
+
+
+def _hits(line: bytes, needle: Needle) -> Iterator[tuple[int, int]]:
+    markers = _MARKUP_RULES[needle.markup].markers
+    start = line.find(needle.head)
+    while start >= 0:
+        length = _hit_length(line, start, needle.pattern, markers)
+        if length:
+            yield start, start + length
+        start = line.find(needle.head, start + max(length, 1))
+
+
+def _hit_length(line: bytes, start: int, pattern: bytes, markers: tuple[bytes, ...]) -> int:
+    if line.startswith(pattern, start):
+        return len(pattern)
+    matched = MIN_TRUNCATED_PREFIX_LEN
+    limit = min(len(pattern), len(line) - start)
+    while matched < limit and line[start + matched] == pattern[matched]:
+        matched += 1
+    for length in range(matched, MIN_TRUNCATED_PREFIX_LEN - 1, -1):
+        if line.startswith(markers, start + length):
+            return length
+    return 0

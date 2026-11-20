@@ -33,6 +33,8 @@ pytestmark = [
 
 _WORKER_CONSTRUCTORS = frozenset({'SpeculativeMergeWorker', 'MergeLane', 'make_lane'})
 
+_CONFIG_CLASS = 'OrchestratorConfig'
+
 _PROBE_FLAG = 'escalate_preexisting_main_break'
 
 
@@ -65,7 +67,7 @@ def _implicit_probe_lines(tree: ast.Module) -> tuple[int, ...]:
     return tuple(sorted(
         node.lineno for node in ast.walk(tree)
         if isinstance(node, ast.Call)
-        and _called_name(node) == 'OrchestratorConfig'
+        and _called_name(node) == _CONFIG_CLASS
         and {'project_root', 'git'} <= {keyword.arg for keyword in node.keywords}
         and _PROBE_FLAG not in {keyword.arg for keyword in node.keywords}
     ))
@@ -73,16 +75,28 @@ def _implicit_probe_lines(tree: ast.Module) -> tuple[int, ...]:
 
 @dataclass(frozen=True)
 class _ModuleFacts:
+    """``worker_imports`` are the module's imports when it constructs a worker, else empty: only a worker module's imports join the scan."""
+
     constructs_a_worker: bool
-    imported_modules: frozenset[str]
+    worker_imports: frozenset[str]
     implicit_probe_lines: tuple[int, ...]
 
 
+_NO_FACTS = _ModuleFacts(constructs_a_worker=False, worker_imports=frozenset(), implicit_probe_lines=())
+
+
 def _module_facts(tree: ast.Module) -> _ModuleFacts:
-    return _ModuleFacts(_constructs_a_worker(tree), _imported_modules(tree), _implicit_probe_lines(tree))
+    constructs_a_worker = _constructs_a_worker(tree)
+    return _ModuleFacts(
+        constructs_a_worker,
+        _imported_modules(tree) if constructs_a_worker else frozenset(),
+        _implicit_probe_lines(tree),
+    )
 
 
 def _parsed_module_facts(module: ParsedModule) -> _ModuleFacts:
+    if not module.may_name(*_WORKER_CONSTRUCTORS, _CONFIG_CLASS):
+        return _NO_FACTS
     return _module_facts(module.tree)
 
 
@@ -93,7 +107,7 @@ def _implicit_probe_scene_configs(modules: dict[str, _ModuleFacts]) -> dict[str,
     modules among *modules* they import.
     """
     worker_modules = {name for name, facts in modules.items() if facts.constructs_a_worker}
-    scanned = worker_modules.union(*(modules[name].imported_modules for name in worker_modules))
+    scanned = worker_modules.union(*(modules[name].worker_imports for name in worker_modules))
     found = {name: list(modules[name].implicit_probe_lines) for name in sorted(scanned & modules.keys())}
     return {name: lines for name, lines in found.items() if lines}
 
@@ -116,6 +130,30 @@ def test_no_worker_module_builds_a_probe_on_scene_config_implicitly(tree_pass: T
         '_merge_lane_fakes.lane_scene_config, or name escalate_preexisting_main_break '
         'explicitly if the scene exercises the main-health probe.'
     )
+
+
+def test_the_extract_reads_names_as_the_parser_normalizes_them(tmp_path: Path) -> None:
+    probe_dir = tmp_path.resolve()
+    sources = {
+        '_scene_helper': (
+            'def scene_config(repo, git):\n'
+            '    return ＯrchestratorConfig(project_root=repo, git=git)\n'
+        ),
+        'test_scene': (
+            'from _scene_helper import scene_config\n'
+            'def scene(git_ops):\n'
+            '    lane = ｍake_lane(git_ops)\n'
+        ),
+    }
+    for stem, source in sources.items():
+        (probe_dir / f'{stem}.py').write_text(source, encoding='utf-8')
+    probe = TreeAnalysis(
+        'lane_scene_probe', files=lambda: [probe_dir / f'{stem}.py' for stem in sources], extract=_parsed_module_facts,
+    )
+
+    facts = TreePass.run([probe]).facts(probe)
+
+    assert _implicit_probe_scene_configs({path.stem: fact for path, fact in facts.items()}) == {'_scene_helper': [2]}
 
 
 def _flagged(**modules: str) -> dict[str, list[int]]:

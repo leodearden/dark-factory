@@ -39,18 +39,45 @@ say the opposite and fails on a legitimate tightening — so it only taxes
 future prompt edits. Every assertion in this file is an existence /
 containment / count / index check against a NAMED CONSTANT: never a
 string literal asserted against the constant's prose, never a regex over
-wording, never a byte-size figure.
+wording, never a byte-size figure. `_role_splice_contract.py` holds the
+mechanical half of each check.
 """
 
 from __future__ import annotations
 
-from _role_splice_contract import assert_opens_own_section
+from _role_splice_contract import (
+    SpliceContract,
+    assert_brace_free,
+    assert_nonempty,
+    assert_opens_own_section,
+)
 
 from orchestrator.agents.harness_guidance import (
     ERROR_REMEDY_HINT_GUIDANCE,
     TOOL_CALL_REJECTION_GUIDANCE,
 )
-from orchestrator.agents.roles import ROLES
+from orchestrator.agents.roles import ROLES, AgentRole
+
+
+def _carries_tool_call_rejection_guidance(role: AgentRole) -> bool:
+    return TOOL_CALL_REJECTION_GUIDANCE in role.system_prompt
+
+
+#: This block travels with this set (see test_carried_by_exactly_the_tool_call_rejection_role_set).
+_TOOL_CALL_REJECTION_CARRIERS = frozenset(
+    name for name, role in ROLES.items() if _carries_tool_call_rejection_guidance(role)
+)
+
+# `roles` is DERIVED from `capability`, so `assert_role_set_matches_capability`
+# would compare the derivation with itself; it is deliberately never called here.
+_CONTRACT = SpliceContract(
+    constant_name='ERROR_REMEDY_HINT_GUIDANCE',
+    constant=ERROR_REMEDY_HINT_GUIDANCE,
+    roles=_TOOL_CALL_REJECTION_CARRIERS,
+    role_set_name='_TOOL_CALL_REJECTION_CARRIERS',
+    capability=_carries_tool_call_rejection_guidance,
+    capability_description='TOOL_CALL_REJECTION_GUIDANCE in its system_prompt',
+)
 
 
 def test_error_remedy_hint_guidance_is_nonempty() -> None:
@@ -64,12 +91,10 @@ def test_error_remedy_hint_guidance_is_nonempty() -> None:
     constant is ever emptied. This one-line assertion is the sole guard
     against the guidance being silently dropped in a prompt refactor.
     """
-    assert ERROR_REMEDY_HINT_GUIDANCE.strip(), (
-        'ERROR_REMEDY_HINT_GUIDANCE is empty. Every containment test added '
-        'for this constant still passes when it is — the empty string is a '
-        'substring of anything — so this assertion is the sole guard '
-        'against the census-4964 guidance being silently dropped in a '
-        'prompt refactor.'
+    assert_nonempty(
+        'ERROR_REMEDY_HINT_GUIDANCE',
+        ERROR_REMEDY_HINT_GUIDANCE,
+        remedy='Restore the census-4964 guidance rather than letting a prompt refactor drop it.',
     )
 
 
@@ -101,13 +126,14 @@ def test_guidance_is_brace_free() -> None:
     nothing and keeps the constant interpolation-safe if a future splice
     site does use an f-string.
     """
-    assert '{' not in ERROR_REMEDY_HINT_GUIDANCE and (
-        '}' not in ERROR_REMEDY_HINT_GUIDANCE
-    ), (
-        'ERROR_REMEDY_HINT_GUIDANCE contains a literal brace. Role prompts '
-        'are deliberately not f-strings, but this constant is held '
-        'brace-free defensively so it stays interpolation-safe if a future '
-        'splice site needs it.'
+    assert_brace_free(
+        'ERROR_REMEDY_HINT_GUIDANCE',
+        ERROR_REMEDY_HINT_GUIDANCE,
+        remedy=(
+            'Role prompts are deliberately not f-strings, but this constant is '
+            'held brace-free defensively so it stays interpolation-safe if a '
+            'future splice site needs it.'
+        ),
     )
 
 
@@ -127,9 +153,6 @@ def test_carried_by_exactly_the_tool_call_rejection_role_set() -> None:
     into `reviewer_comprehensive` here shows up as `extra_new` below,
     without a separate negative test duplicating that coverage.
     """
-    tcrg_carriers = {
-        name for name, role in ROLES.items() if TOOL_CALL_REJECTION_GUIDANCE in role.system_prompt
-    }
     new_carriers = {
         name for name, role in ROLES.items() if ERROR_REMEDY_HINT_GUIDANCE in role.system_prompt
     }
@@ -140,7 +163,7 @@ def test_carried_by_exactly_the_tool_call_rejection_role_set() -> None:
     # equality check below would hold VACUOUSLY (empty == empty) and this
     # test would pass on a total regression. This assertion is the sole
     # guard against that.
-    shared = tcrg_carriers & new_carriers
+    shared = _TOOL_CALL_REJECTION_CARRIERS & new_carriers
     assert shared, (
         'No role carries both TOOL_CALL_REJECTION_GUIDANCE and '
         'ERROR_REMEDY_HINT_GUIDANCE. The equality check below still passes '
@@ -149,8 +172,8 @@ def test_carried_by_exactly_the_tool_call_rejection_role_set() -> None:
         'prompt at once.'
     )
 
-    missing_new = sorted(tcrg_carriers - new_carriers)
-    extra_new = sorted(new_carriers - tcrg_carriers)
+    missing_new = sorted(_TOOL_CALL_REJECTION_CARRIERS - new_carriers)
+    extra_new = sorted(new_carriers - _TOOL_CALL_REJECTION_CARRIERS)
     assert missing_new == [] and extra_new == [], (
         f'ERROR_REMEDY_HINT_GUIDANCE carrier set diverges from '
         f'TOOL_CALL_REJECTION_GUIDANCE: missing_new={missing_new} (carry '
@@ -171,23 +194,20 @@ def test_guidance_appears_exactly_once_per_role() -> None:
     Scoped to catching a stale duplicate splice left beside a new one, NOT
     to enforcing presence — that is
     `test_carried_by_exactly_the_tool_call_rejection_role_set`'s job. A role
-    where the block is entirely absent is skipped here rather than flagged,
-    so a role that has not yet received the splice fails exactly one test
-    for that one root cause instead of two. Mirrors the sibling module's
+    where the block is entirely absent is skipped here rather than flagged.
+    Presence belongs to that test's `missing_new`, and
+    `test_placement_immediately_follows_tool_call_rejection_guidance` also
+    records it as ABSENT, so counting it here would make a third failure for
+    one root cause. Mirrors the sibling module's
     `test_guidance_appears_exactly_once_per_role`.
-    """
-    offenders = {}
-    for name in sorted(ROLES):
-        count = ROLES[name].system_prompt.count(ERROR_REMEDY_HINT_GUIDANCE)
-        if count == 0:
-            continue
-        if count != 1:
-            offenders[name] = count
 
-    assert offenders == {}, (
-        f'Roles carrying more than one copy of ERROR_REMEDY_HINT_GUIDANCE: '
-        f'{offenders}. A stale duplicate splice was probably left beside a '
-        'new one — delete the extra copy.'
+    It iterates `_TOOL_CALL_REJECTION_CARRIERS`; a copy in any other role is
+    reported as `extra_new` by
+    `test_carried_by_exactly_the_tool_call_rejection_role_set`.
+    """
+    _CONTRACT.assert_spliced_exactly_once(
+        absent_ok=True,
+        remedy='Keep exactly one ERROR_REMEDY_HINT_GUIDANCE term per splice chain.',
     )
 
 
@@ -195,14 +215,14 @@ def test_placement_immediately_follows_tool_call_rejection_guidance() -> None:
     """The new block lands immediately after `TOOL_CALL_REJECTION_GUIDANCE`, always.
 
     Iterates `TOOL_CALL_REJECTION_GUIDANCE`'s own carrier set, not the new
-    block's, so a role that gained an out-of-place copy is still checked.
-    Presence is deliberately NOT this test's job: a role that has dropped
-    the splice entirely already fails
+    block's, so a carrier that gained an out-of-place copy is still checked.
+    A carrier where the new block is absent is recorded as an `'ABSENT'`
+    offender rather than skipped, as `SpliceContract.assert_placement`
+    records it for every consumer. Such a role also fails
     `test_carried_by_exactly_the_tool_call_rejection_role_set`'s
-    `missing_new` check (that test's `shared` guard is what keeps such a
-    failure from ever passing vacuously), so it is skipped here rather than
-    re-flagged — the same "one root cause fails one test" discipline
-    `test_guidance_appears_exactly_once_per_role` documents.
+    `missing_new` check. If `TOOL_CALL_REJECTION_GUIDANCE` vanishes from
+    every role, the carrier set is empty and this test passes vacuously;
+    that test's `shared` guard is what catches it.
 
     Why the new block cannot be placed EARLIER: two pre-existing invariants
     constrain the front of every role prompt. For the 7 roles carrying
@@ -218,28 +238,12 @@ def test_placement_immediately_follows_tool_call_rejection_guidance() -> None:
     is the one position that satisfies both, uniformly, with no per-role
     branching.
     """
-    tcrg_carriers = {
-        name for name, role in ROLES.items() if TOOL_CALL_REJECTION_GUIDANCE in role.system_prompt
-    }
-
-    offenders = {}
-    for name in sorted(tcrg_carriers):
-        prompt = ROLES[name].system_prompt
-        idx = prompt.find(ERROR_REMEDY_HINT_GUIDANCE)
-        if idx == -1:
-            # Presence is test_carried_by_exactly_the_tool_call_rejection_role_set's
-            # job (its missing_new check), not this one's — see the
-            # docstring above.
-            continue
-
-        expected = prompt.find(TOOL_CALL_REJECTION_GUIDANCE) + len(TOOL_CALL_REJECTION_GUIDANCE)
-        if idx != expected:
-            offenders[name] = {'offset': idx, 'expected': expected}
-
-    assert offenders == {}, (
-        f'Roles placing ERROR_REMEDY_HINT_GUIDANCE incorrectly: {offenders}. '
-        'It must immediately follow TOOL_CALL_REJECTION_GUIDANCE in every '
-        'role that carries both blocks (a role missing the new block '
-        'entirely is a different, already-covered failure — see '
-        'test_carried_by_exactly_the_tool_call_rejection_role_set).'
+    _CONTRACT.assert_placement(
+        follows=TOOL_CALL_REJECTION_GUIDANCE,
+        follows_name='TOOL_CALL_REJECTION_GUIDANCE',
+        remedy=(
+            'A role reported ABSENT also fails '
+            'test_carried_by_exactly_the_tool_call_rejection_role_set as '
+            'missing_new: restore the splice rather than moving anything.'
+        ),
     )

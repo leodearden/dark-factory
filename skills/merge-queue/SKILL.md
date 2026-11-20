@@ -97,12 +97,12 @@ The call returns with **either** a **terminal** status **or** a **non-terminal**
   ```
   mcp__escalation__merge_status(task_id="<inflight_task_id from submit>")
   ```
-  **Terminal states on this arm are UNCONFIRMED too, for the same reason as the `branch` arm below.** A task-keyed poll is submission-scoped only while the live-snapshot tier is still serving it; once that stops, the event-store tier answers with the newest *current-run* finalize row for that task_id, which can be an earlier round of the reused task_id — task_ids are reused verbatim across resubmissions exactly like branches. (A previous run's row never becomes an outcome state: it answers `stale_record`.) Apply the identical rule: a `done` carrying `kind: "found_on_main"` is already git-authoritative — **accept it directly, do not re-check ancestry**. It is safe because the tier answers `done` only on positive git evidence. On its live-branch and deleted-branch paths the branch advanced past its recorded creation point, *and* a commit on main positively cites the task, *and* that commit's effect is still present at main HEAD (unless the project opts out of citation checking with `git.commit_citation_pattern: ""`, where only the first applies and `merge_sha` is the branch tip; and unless the task declares `metadata.delivered_checks` that a delivered-checks differential confirmed, which waives the effect-present leg alone — `merge_sha` is still a commit on main, but its effect may since have been reverted). On its patch-id path — a live branch that is not an ancestor of main whose every commit is patch-equivalent on main, the worker-rebased landing — `merge_sha` is the citing commit or the branch tip's patch-id twin on main, and is not effect-present-checked, by `docs/prds/landed-not-done-recovery.md` D1. `escalation/src/escalation/git_authority.py::found_on_main_response` is the single statement of the per-path guarantees. A re-check would only repeat a weaker version of what the tier already did. The ancestry re-check applies only to a `done` from the live or event-store tier (no `kind`; any `merge_sha` there is the record's, not a git proof), which you confirm with the [canonical ancestry check](#canonical-ancestry-check) below. Re-check `get_merge_queue()` before acting on a `conflict`/`blocked`/`abandoned`. Because a rejected `done` would otherwise re-serve forever, this arm shares the `branch` arm's 20-minute ceiling and the same stop-and-report exit.
+  **Terminal states on this arm are UNCONFIRMED too, for the same reason as the `branch` arm below.** A task-keyed poll is submission-scoped only while the live-snapshot tier is still serving it; once that stops, the event-store tier answers with the newest *current-run* finalize row for that task_id, which can be an earlier round of the reused task_id — task_ids are reused verbatim across resubmissions exactly like branches. (A previous run's row never becomes an outcome state: it answers `stale_record`.) Apply the identical rule: a `done` carrying `kind: "found_on_main"` is already git-authoritative — **accept it directly, do not re-check ancestry**. It is safe because the tier answers `done` only on positive git evidence. On its two live-branch paths — the tip an ancestor of main, or not an ancestor with every branch commit patch-equivalent on main (the worker-rebased landing) — the branch advanced past its recorded creation point, its own commits are on main by patch-id, and `merge_sha` is the commit on main citing the task or, failing that, the branch tip's patch-id twin there. Neither live path is effect-present-checked, by `docs/prds/landed-not-done-recovery.md` D1, so later edits on main cannot unland it (unless the project opts out of citation checking with `git.commit_citation_pattern: ""`, where an ancestor tip is accepted as-is and `merge_sha` is the branch tip). On its deleted-branch path a merge marker on main positively cites the task *and* that commit's effect is still present at main HEAD (unless the task declares `metadata.delivered_checks` that a delivered-checks differential confirmed, which waives the effect-present leg alone — `merge_sha` is still a commit on main, but its effect may since have been reverted). `escalation/src/escalation/git_authority.py::found_on_main_response` is the single statement of the per-path guarantees. A re-check would only repeat a weaker version of what the tier already did. The ancestry re-check applies only to a `done` from the live or event-store tier (no `kind`; any `merge_sha` there is the record's, not a git proof), which you confirm with the [canonical ancestry check](#canonical-ancestry-check) below. Re-check `get_merge_queue()` before acting on a `conflict`/`blocked`/`abandoned`. Because a rejected `done` would otherwise re-serve forever, this arm shares the `branch` arm's 20-minute ceiling and the same stop-and-report exit.
 - `poll_by == "branch"` (equivalently `pollable == false`) — neither handle is known: a foreign or pre-restart merger owns the worktree, so there's no in-process entry and no waiter. The returned `request_id` was never enqueued — polling it directly answers `no_record` (reason `never_submitted`), which here is expected, NOT a lost record. Poll by branch instead, which benefits from `merge_status`'s git-authority tier (self-resolves a landed merge to `state: "done"` / `kind: "found_on_main"`):
   ```
   mcp__escalation__merge_status(branch="task/<TASK_ID>")
   ```
-  **Terminal states on this arm are UNCONFIRMED.** Once the live tier stops serving it, a branch-keyed poll answers with the newest *current-run* finalize row for that branch (a previous run's row never becomes an outcome state — it answers `stale_record`) — nothing ties that row to *your* submission. Task branches are reused verbatim across resubmissions, so a prior round's `done`/`conflict`/`blocked`/`abandoned` can satisfy the terminal test on the very first tick. **Exception — a `done` carrying `kind: "found_on_main"` is NOT subject to this:** that shape comes from the git-authority tier, a live probe of main reached only because the live and event-store tiers missed, so it structurally cannot be a stale prior-round record — and it cannot be a branch that merely *looks* landed either: the tier answers `done` only on positive git evidence. On its live-branch and deleted-branch paths the branch advanced past its recorded creation point, *and* a commit on main positively cites the task, *and* that commit's effect is still present at main HEAD (unless the project opts out of citation checking with `git.commit_citation_pattern: ""`, where only the first applies and `merge_sha` is the branch tip; and unless the task declares `metadata.delivered_checks` that a delivered-checks differential confirmed, which waives the effect-present leg alone — `merge_sha` is still a commit on main, but its effect may since have been reverted). On its patch-id path (a live branch that is not an ancestor of main, every commit patch-equivalent on main) `merge_sha` is the citing commit or the branch tip's patch-id twin on main, not effect-present-checked by `docs/prds/landed-not-done-recovery.md` D1; `escalation/src/escalation/git_authority.py::found_on_main_response` states each path's guarantee. Accept it directly. For a `done` from the live or event-store tier (no `kind`; any `merge_sha` there is the record's, not a git proof), confirm with the [canonical ancestry check](#canonical-ancestry-check) below — not-landed means stale, so keep polling. On a `conflict`/`blocked`/`abandoned` from this arm, treat it as possibly predating this submission: re-check `get_merge_queue()` and who owns the worktree before resolving or resubmitting.
+  **Terminal states on this arm are UNCONFIRMED.** Once the live tier stops serving it, a branch-keyed poll answers with the newest *current-run* finalize row for that branch (a previous run's row never becomes an outcome state — it answers `stale_record`) — nothing ties that row to *your* submission. Task branches are reused verbatim across resubmissions, so a prior round's `done`/`conflict`/`blocked`/`abandoned` can satisfy the terminal test on the very first tick. **Exception — a `done` carrying `kind: "found_on_main"` is NOT subject to this:** that shape comes from the git-authority tier, a live probe of main reached only because the live and event-store tiers missed, so it structurally cannot be a stale prior-round record — and it cannot be a branch that merely *looks* landed either: the tier answers `done` only on positive git evidence. On its two live-branch paths (the tip an ancestor of main, or not an ancestor with every branch commit patch-equivalent on main) the branch advanced past its recorded creation point, its own commits are on main by patch-id, and `merge_sha` is the commit on main citing the task or, failing that, the branch tip's patch-id twin there, not effect-present-checked by `docs/prds/landed-not-done-recovery.md` D1 (unless the project opts out of citation checking with `git.commit_citation_pattern: ""`, where an ancestor tip is accepted as-is and `merge_sha` is the branch tip). On its deleted-branch path a merge marker on main positively cites the task *and* that commit's effect is still present at main HEAD (unless the task declares `metadata.delivered_checks` that a delivered-checks differential confirmed, which waives the effect-present leg alone — `merge_sha` is still a commit on main, but its effect may since have been reverted). `escalation/src/escalation/git_authority.py::found_on_main_response` states each path's guarantee. Accept it directly. For a `done` from the live or event-store tier (no `kind`; any `merge_sha` there is the record's, not a git proof), confirm with the [canonical ancestry check](#canonical-ancestry-check) below — not-landed means stale, so keep polling. On a `conflict`/`blocked`/`abandoned` from this arm, treat it as possibly predating this submission: re-check `get_merge_queue()` and who owns the worktree before resolving or resubmitting.
 
   Cross-check `get_merge_queue()` for queue-wide context if useful. The server cannot see a foreign merger, so until git proves the landing — by any of the three paths `escalation/src/escalation/git_authority.py::probe_landing` dispatches: ancestry while the ref exists, the merge marker once it is gone, patch-id containment for a worker-rebased landing — this arm answers an epistemic state — typically `no_record` (reason `never_submitted`), or `stale_record` (reason `prior_run_terminal`) when an earlier run left a row for the branch. That is this arm's **live** state, not a first-tick fluke: keep polling. Do NOT read it as a terminal failure or as licence to direct-merge, and do NOT resubmit on it (the resubmit disposition under *Epistemic answers* below is scoped to the other two arms). **One reason exits at once: `landing_unattributable`.** Git has already found the branch's work on main, which is not transient, so stop polling and verify per [its row](../_shared/merge-status-reasons.md#the-switch) now instead of waiting out the ceiling. **Exception to "same for all three arms" below: this arm and the `task_id` arm are bounded by a 20-minute wall-clock ceiling, starting from your first poll on that arm** (not from the original submit) — matching `skills/unblock/SKILL.md`. At expiry, report the last answer to the human; for an epistemic one, give its `state`, `reason` and `last_outcome`. Never resubmit, never fall back to a direct merge.
 
@@ -121,12 +121,15 @@ timeout <WAIT_SECS> bash -c 'while git merge-base --is-ancestor task/<TASK_ID> m
 - **Long waits, interactive sessions only** (deep in the queue, or verifying with no `eta_seconds`). Don't spend a turn per minute: run the same loop with a larger bound as ONE `run_in_background` Bash command, its Bash `timeout` at least 60 s above the bound — `skills/escalation-watcher/SKILL.md`'s "Bash-tool timeout contract", which also governs the ceiling. Every wake — the loop exiting, its bound elapsing, or a "was stopped" notification — is the designed re-arm point, not a failure: poll `merge_status` once, and re-arm only while the state is live. Expect to re-arm: reify task/7182's merge took about 2h40m and three watch rounds. A headless or unattended session keeps to the foreground form above — ending the turn there exits the session with the wait still pending.
 - **Monitor** is a per-event stream, not a better tool for this one-outcome wait; the loaded Monitor schema's own description says the same. If you use it anyway: load its schema with `ToolSearch("select:Monitor")` before the first call (it is deferred, and a call with guessed parameters is rejected); take its harness-capped `timeout_ms` limit from that schema, not from memory; and expect to re-arm at every expiry.
 
+<!-- merge-status-route:begin answer=LIVE_STATES
+     Pinned by escalation/tests/test_merge_status_boundary.py (rows B1-B8). -->
 <!-- merge-state-vocab:begin partition=LIVE_STATES
      Mirrors shared/src/shared/merge_state.py::LIVE_STATES. Pinned by
      scripts/tests/test_merge_state_vocabulary_consistency.py — extend the
      enum and this list goes red until it matches. -->
-**Live states** (`queued`, `verifying`, `gate`, `finalizing`) — keep polling.
+**Live states** (`queued`, `verifying`, `gate`, `finalizing`) — **WAIT**: keep polling.
 <!-- merge-state-vocab:end -->
+<!-- merge-status-route:end -->
 
 <!-- merge-state-vocab:begin partition=TERMINAL_STATES
      Mirrors shared/src/shared/merge_state.py::TERMINAL_STATES. Pinned by
@@ -239,11 +242,19 @@ Four rules make this fallback loop terminate correctly. **On the `coalesce-*` ar
 
 **Epistemic answers** — a state that describes the server's records rather than the merge, always carrying a `reason`. Switch on `reason` per [the shared reason switch](../_shared/merge-status-reasons.md#the-switch), including its [request_id re-poll rule](../_shared/merge-status-reasons.md#request-id-polls); never reconstruct the answer from ancestry exit codes. This skill's dispositions:
 
-- **`never_submitted`** on the `request_id`/`task_id` arms, confirmed by a task_id-keyed answer, with `get_merge_queue()` showing no entry for the branch → **resubmit (go back to step 3).** On the `branch` arm it is the live state (above).
-- **`prior_run_terminal`** → report `last_outcome` to the human and stop; resubmitting is their call.
+<!-- merge-status-route:begin answer=never_submitted -->
+- **`never_submitted`** on the `request_id`/`task_id` arms, confirmed by a task_id-keyed answer, with `get_merge_queue()` showing no entry for the branch → **RESUBMIT** (go back to step 3). On the `branch` arm it is the live state (above).
+<!-- merge-status-route:end -->
+<!-- merge-status-route:begin answer=prior_run_terminal -->
+- **`prior_run_terminal`** → **REPORT** `last_outcome` to the human and stop; resubmitting is their call.
+<!-- merge-status-route:end -->
 - **`landing_unattributable`** → verify per the shared switch; a verified sha → step 4's `done`, stamped `found_on_main` with `commit` **and** `note`.
-- **`coalesce_train_id`** → the [Escape](#follow-the-superseded-successor).
-- **Wait-state reasons** → keep polling, under the shared [wait bound](../_shared/merge-status-reasons.md#wait-bound).
+<!-- merge-status-route:begin answer=coalesce_train_id -->
+- **`coalesce_train_id`** → **FOLLOW THE MEMBERS**: the [Escape](#follow-the-superseded-successor).
+<!-- merge-status-route:end -->
+<!-- merge-status-route:begin answer=WAIT -->
+- **Wait-state reasons** → **WAIT**: keep polling, under the shared [wait bound](../_shared/merge-status-reasons.md#wait-bound).
+<!-- merge-status-route:end -->
 
 <a id="canonical-ancestry-check"></a>**The canonical ancestry check — three outcomes, not two.** Every "is it on main?" confirmation in this skill means this check: the unscoped arms' `done` gate, the `already_merged` condition, and the Escape's rules. **Never use the two-way idiom `git merge-base --is-ancestor ... && echo "on main" || echo "not on main"`**: a deleted branch ref exits **128**, which that idiom silently reports as "not on main" — inverting the truth for the normal post-merge state, since the merge lane deletes task branches on cleanup (`_delete_branch_if_on_main`, `orchestrator/src/orchestrator/git_ops.py`), and on the `branch` arm a *foreign* merger's cleanup deletes it out from under you.
 ```bash
@@ -274,7 +285,9 @@ git merge-base --is-ancestor task/<TASK_ID> main; rc=$?; echo "ancestry rc=$rc"
 
 The outcome arrives from either the submit call (terminal at submit time) or the poll loop. Handle each status:
 
-**`done`** — Merge succeeded. Main has been advanced atomically.
+<!-- merge-status-route:begin answer=done -->
+**`done`** — **ACCEPT**: the merge succeeded. Main has been advanced atomically.
+<!-- merge-status-route:end -->
 - Update the task: `set_task_status(id="<TASK_ID>", status="done", project_root="<PROJECT_ROOT>", done_provenance={"kind": "merged", "commit": "<merge-commit-sha>"})`
   - Use `{"kind": "merged", "commit": "<sha>"}` when this branch's merge commit landed on main (the normal case). The server backstops with `git merge-base --is-ancestor <sha> main`.
   - **Where the SHA comes from depends on which call produced the `done`, and not every source is
@@ -290,27 +303,28 @@ The outcome arrives from either the submit call (terminal at submit time) or the
     when the marker search below is empty and ancestry is rc=1.
 
     - **The git tier's `merge_sha` is always a commit ON main, on all three of the tier's
-      resolution paths** — the citing commit discovered on main on the live-branch path, the merge
-      commit itself on the deleted-branch (`find_merge_marker`) path, and on the patch-id path (a live branch that is
-      not an ancestor of main, every commit patch-equivalent on main) the citing commit or the
-      branch tip's patch-id twin on main. The first two are checked to still be present at main
-      HEAD before being returned; the patch-id path is not, by
+      resolution paths** — on both live-branch paths (the tip an ancestor of main, or a live branch
+      that is not an ancestor of main with every commit patch-equivalent on main) the commit on
+      main citing the task or, failing that, the branch tip's patch-id twin on main, and on the
+      deleted-branch (`find_merge_marker`) path the merge commit itself. Only the deleted-branch
+      path is checked to still be present at main HEAD before being returned; both live-branch
+      paths are checked by patch-id containment instead, by
       `docs/prds/landed-not-done-recovery.md` D1.
       `escalation/src/escalation/git_authority.py::found_on_main_response` states each path's
       guarantee. So it is safe to record exactly as returned. Never substitute the branch tip or a
       `git merge-base` result for it. Two exceptions weaken that guarantee:
 
       - **Citation gate opted out** — on a project that sets `git.commit_citation_pattern: ""` (an
-        explicit per-project opt-out for repos with no citation convention) the live-branch path
-        skips the citation gate and `merge_sha` is the raw branch tip — not a commit on main, and
-        not effect-present-checked, so a reverted landing is indistinguishable from a live one. If
+        explicit per-project opt-out for repos with no citation convention) the ancestor live-branch
+        path skips the landing check and `merge_sha` is the raw branch tip — not a commit on main,
+        and not containment-checked, so a reverted landing is indistinguishable from a live one. If
         you are on such a project, confirm with the marker search below — **including its subject
         check** — before recording it.
-      - **Delivered-checks differential** — if the task declares a non-empty
-        `metadata.delivered_checks` and the differential confirmed the capability, the tier accepts
-        even though the commit's effect is ABSENT at main HEAD. `merge_sha` is still a commit on
-        main, but only the effect-present check was waived — it may name a landing that was later
-        reverted, so confirm the same way before recording it.
+      - **Delivered-checks differential (deleted-branch path only)** — if the task declares a
+        non-empty `metadata.delivered_checks` and the differential confirmed the capability, the
+        tier accepts even though the commit's effect is ABSENT at main HEAD. `merge_sha` is still a
+        commit on main, but only the effect-present check was waived — it may name a landing that
+        was later reverted, so confirm the same way before recording it.
 
     - **So: record a bare git-tier `merge_sha` as** `{"kind": "found_on_main", "commit": "<merge_sha>",
       "note": "<explanation>"}`, not `kind: "merged"` — only re-derive and use the actual merge

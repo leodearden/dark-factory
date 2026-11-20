@@ -11,9 +11,10 @@ All four prerequisite legs are LANDED and BEHAVIOUR-FROZEN for this batch:
   β (3184) — ``build_chain`` (build-on-dispatch): sequential submission-order
       merges in ONE scratch worktree, truncate at the first textual conflict,
       never emit per-item outcomes.  Unit coverage: test_merge_queue_build_chain.py.
-  γ (3185) — deep-tip verify dispatch + the halving state machine
-      (``_deep_chain_placement``, ``select_chain_depth``, ``next_halving_state``,
-      ``chain_items`` telemetry).  Unit coverage: test_merge_queue_deep_dispatch.py.
+  γ (3185) — deep-tip verify dispatch (``_deep_chain_placement``,
+      ``chain_items`` telemetry).  Its halving depth policy was replaced by
+      ζ (8528): ``merge_lane/chain_policy.py``'s depth table.  Unit coverage:
+      test_merge_queue_deep_dispatch.py, test_merge_lane_chain_policy.py.
   δ (3186) — prefix landing on tip pass: the in-order CAS walk, head-verify
       cancellation with a clean lease release, stale-CAS abort, and
       ``landed_via_chain``.  Unit coverage: test_merge_queue_deep_landing.py.
@@ -21,8 +22,8 @@ All four prerequisite legs are LANDED and BEHAVIOUR-FROZEN for this batch:
 WHAT THIS FILE IS
 -----------------
 A TEST-ONLY COMPOSITION gate implementing the PRD's §Boundary-test-sketch
-matrix against BOTH sides of the slice — the WORKER side (dispatch, halving,
-chain build) and the CAS/LEDGER side (in-order advance, permit ledgers, the
+matrix against BOTH sides of the slice — the WORKER side (dispatch, chain
+policy, chain build) and the CAS/LEDGER side (in-order advance, permit ledgers, the
 worktree ledger, request liveness, ItemLifecycle, and workflow.py's merge
 thrash ladder).  "Two-way" is the whole point: several rows are already pinned
 one-way upstream, and the gate's added value is (a) driving the OTHER side of
@@ -34,8 +35,8 @@ THE 11-ROW BOUNDARY MATRIX (verbatim from the PRD's §Boundary-test sketch)
   1.  Tip pass lands full prefix       | 4-item clean chain, tip verify green
       → 4 in-order landings, one verify, ``landed_via_chain=4``, audits green
   2.  Tip fail leaves queue intact     | chain built, tip verify red
-      → zero landings via chain, items still queued, halving state = 2; no
-        member is chained again before it has verified alone
+      → zero landings via chain, items still queued; no member is chained
+        again before it has verified alone
   3.  Red chain isolates bad item      | item 3 of 6 genuinely red
       → one red chain; then each member verifies alone: item 3 blocks, the
         others land; deep resumes after bad item blocks
@@ -86,9 +87,9 @@ asserted after every round).
       |   TestBoundaryRowsComposed |   test_a_failing_tip_lands_nothing_and_
       |                            |   the_item_still_lands_later
    3  | PARTIAL — policy only      | test_merge_queue_deep_dispatch.py
-      |   → ORIGINAL: isolation    |   (the depths [6,3,None,6] walk, driven by
-      |   (step-07/08, class       |   a POSITIONAL pass/fail script)
-      |   TestRow3HalvingIsolates- |
+      |   → ORIGINAL: isolation    |   (test_no_member_of_a_red_chain_is_
+      |   (step-07/08, class       |   chained_again, driven by a POSITIONAL
+      |   TestRow3RedChainIsolates-|   pass/fail script)
       |   TheBadItem)              |
    4  | PARTIAL — truncation at    | test_merge_queue_deep_dispatch.py +
       |   position > 0 only        |   test_merge_queue_deep_landing.py
@@ -273,7 +274,7 @@ HARNESS NOTES
   * Monkeypatching is INSTANCE-level wherever possible:
     test_merge_queue_reachback_patch_guard.py freezes the
     ``orchestrator.merge_lane.worker.<private>`` reach-back surface.  The sanctioned
-    module-level exceptions are ``build_chain``, ``_run_post_merge_verify``,
+    module-level exceptions are ``build_chain``, ``run_post_merge_verify``,
     ``release_chain_build_lane``.
   * ``fused-memory/scripts/check_bare_magicmock_config.py`` forbids a bare
     ``MagicMock()`` bound to a config-named variable — use ``_make_config(...)``.
@@ -340,6 +341,7 @@ from orchestrator.merge_lane.types import (
     VerifyWorktreeHandle,
 )
 from orchestrator.merge_lane.worker import MergeRequest, SpeculativeMergeWorker
+from orchestrator.merge_verify_facts import ChainDepthBasis
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from collections.abc import Sequence
@@ -431,7 +433,7 @@ def _timed_out_verify_result():
     instead of the timeout one.
 
     ``category=''`` is load-bearing for the same reason — a category in
-    ``INFRA_TRANSIENT_CATEGORIES`` would make ``_run_post_merge_verify`` RETRY
+    ``INFRA_TRANSIENT_CATEGORIES`` would make ``run_post_merge_verify`` RETRY
     the dispatch rather than conclude, and the leg would be measuring the retry
     loop rather than the timeout path.
     """
@@ -450,9 +452,9 @@ def _verdict_from_tree(bad_file: str):
     actually handed, green otherwise.  That one property is what turns Row 3
     from a policy replay into an ISOLATION claim: the same physical item is
     red at every depth and in EVERY chain that contains it, and green nowhere,
-    so the bisection's shape is a consequence of the item rather than of the
+    so the walk's shape is a consequence of the item rather than of the
     fixture.  A positional pass/fail script (the ``script=`` vocabulary, and
-    what test_merge_queue_deep_dispatch.py's halving walk uses) cannot make
+    what test_merge_queue_deep_dispatch.py's policy walks use) cannot make
     that claim at all — it is blind to which items were in the tree, and its
     round-3 pass is an INPUT rather than a derived fact.
 
@@ -473,8 +475,8 @@ def _verdict_from_tree(bad_file: str):
     ``passed=True`` stub, so this is a documented, public patch point and not a
     ``merge_queue.<private>`` reach-back (which
     test_merge_queue_reachback_patch_guard.py freezes).  Patching HERE rather
-    than replacing ``_run_post_merge_verify`` is what keeps the row honest:
-    the real ``_run_post_merge_verify`` still runs, so a red on the ordinary
+    than replacing ``run_post_merge_verify`` is what keeps the row honest:
+    the real ``run_post_merge_verify`` still runs, so a red on the ordinary
     arm is rendered into a genuine blocked :class:`MergeOutcome` by production
     code, and its ``timeouts``/``enospc_retries`` bookkeeping stays in the
     loop.  A stub in its place would be asserting the test's own arithmetic —
@@ -1501,7 +1503,7 @@ class _GateScene:
 
       * ``n_followers`` is a parameter, so a row states its own queue depth;
       * a REMOTE mode (``remote=True``) that drives the real
-        ``_run_post_merge_verify`` and therefore the real ``merge_verify``
+        ``run_post_merge_verify`` and therefore the real ``merge_verify``
         emission site, for the rows whose claim is about TELEMETRY or about the
         verify BUDGET rather than about landing;
       * per-round FACT RECORDING onto :attr:`rounds`, so a multi-round row
@@ -1509,7 +1511,7 @@ class _GateScene:
         whatever the last round left behind.
 
     Every spy is PASSTHROUGH (``advance_main``, ``release_chain_build_lane``,
-    ``build_chain``, ``_run_post_merge_verify`` in remote mode), so on-disk and
+    ``build_chain``, ``run_post_merge_verify`` in remote mode), so on-disk and
     pool state stay REAL while the call ledgers stay observable.
     """
 
@@ -1579,35 +1581,24 @@ class _GateScene:
         self._round_no += 1
         worker = self.worker
         # ── slot-1 steady state, restored before EVERY dispatch ─────────────
-        # `_n_failed` and `_remerge_occurred` are facts about SLOT 1 and about
-        # the enclosing `_verifier_loop` ITERATION.  This scene models neither:
-        # it drives `_dispatch_item` directly, one slot-2 item per round, with
-        # a structurally empty `_inflight`.
+        # `_n_failed` and the dispatcher's chain invalidation are facts about
+        # SLOT 1 and the enclosing `_verifier_loop` ITERATION.  This scene
+        # models neither: it drives `verify_dispatch.dispatch` directly, one
+        # slot-2 item per round, with a structurally empty `_inflight`.
         #
-        # A REAL slot-2 dispatch never reads either flag.  `_dispatch_item`
-        # gates the whole chain-invalidation / Mechanism-2 re-merge block on
-        # `not _has_inflight_verify`, and a genuine speculative dispatch
-        # happens precisely WHILE the head verify is in flight — so the block
-        # is skipped by construction.  Driving dispatch with an empty
-        # `_inflight` re-opens it, and two artifacts the pipeline itself never
-        # produces then appear:
-        #
-        #   * any round that requeued (i.e. every red tip) leaves
-        #     `_n_failed=True`, so the NEXT round's speculative item is
-        #     re-merged into a NON-speculative one.  Alone in this scene's
-        #     empty frontier it would chain as a head (PRD D5), so round 2 of
-        #     every bisection would silently test the head path instead of the
-        #     slot-2 walk.
-        #   * `_remerge_occurred` is self-sustaining once set (it is assigned
-        #     from the same dispatch's own `iteration_did_remerge`), so ONE
-        #     re-merge would disable chaining for the rest of the scene.
-        #
-        # Resetting both restores exactly the state a healthy head slot leaves
-        # behind, which is the premise every row in this file is written
-        # against.  It is a fidelity choice about what this scene models, not a
-        # workaround: nothing in the deep path reads these flags.
+        # A REAL slot-2 dispatch never reads either.  The dispatcher gates its
+        # chain-invalidation / Mechanism-2 re-merge on no verify being in
+        # flight, and a genuine speculative dispatch happens precisely WHILE
+        # the head verify is in flight.  Driving dispatch with an empty
+        # `_inflight` re-opens that gate, so any round that requeued (every
+        # red tip) would leave `_n_failed=True` and the NEXT round's
+        # speculative item would be re-merged into a NON-speculative one,
+        # chaining as a head (PRD D5) instead of walking slot 2.  Chain
+        # invalidation stays clear on its own: only the verifier loop's
+        # head-failure cascade, which this scene never runs, raises it, and
+        # every round's dispatch that does not re-merge clears it.
         worker._n_failed = False
-        worker._remerge_occurred = False
+        assert not worker.verify_dispatch.chain_invalidated()
         n_calls_before = len(self.calls)
         n_built_before = len(self.built)
         n_acquires_before = len(self.lane_acquires)
@@ -1634,7 +1625,7 @@ class _GateScene:
             base_sha=main_before,   # this round really CASes against main
             speculative=True,       # slot 2 — chains whatever the frontier holds (PRD D5)
         )
-        entry = await worker._dispatch_item(item)
+        entry = await worker.verify_dispatch.dispatch(item)
         assert entry is not None, 'dispatch must not decline: a host is free'
         assert entry.verify_task is not None
         await entry.verify_task
@@ -1666,7 +1657,6 @@ class _GateScene:
             'main_before': main_before,
             'main_after': await _rev_parse(self.repo, 'main'),
             'head_mc': head_mc,
-            'halving_state': worker._chain_halving_state,
             'outcome': outcome,
             # Per-round SLICES of the cumulative ledgers, so a multi-round row
             # reads what THIS round did rather than the running total.
@@ -1755,7 +1745,7 @@ class _GateScene:
             ),  # type: ignore[arg-type]
             merge_wt=wt,
             was_speculative=speculative,
-            # Mirrors `_dispatch_item`: the box is built alongside the entry and
+            # Mirrors `VerifyDispatcher.dispatch`: the box is built alongside the entry and
             # seeded with the item's own ephemeral, so a head running the REAL
             # `_run_inflight_verify` has somewhere for a warm swap to publish.
             verify_wt=VerifyWorktreeHandle(merge_wt=wt),
@@ -1805,7 +1795,7 @@ class _GateScene:
         head_entry = self.head_entry
         # Slot-1 steady state, for the reason documented at length in `round_`.
         worker._n_failed = False
-        worker._remerge_occurred = False
+        assert not worker.verify_dispatch.chain_invalidated()
         n_calls_before = len(self.calls)
         n_built_before = len(self.built)
         n_acquires_before = len(self.lane_acquires)
@@ -1831,7 +1821,7 @@ class _GateScene:
             base_sha=self.head_mc,  # stacked on the head's merge commit
             speculative=True,       # slot 2 — chains whatever the frontier holds (PRD D5)
         )
-        entry = await worker._dispatch_item(item)
+        entry = await worker.verify_dispatch.dispatch(item)
         assert entry is not None, 'dispatch must not decline: a host is free'
         assert entry.verify_task is not None
         await entry.verify_task
@@ -1872,7 +1862,6 @@ class _GateScene:
             'main_before': main_before,
             'main_after': await _rev_parse(self.repo, 'main'),
             'head_mc': self.head_mc,
-            'halving_state': worker._chain_halving_state,
             'outcome': outcome,
             'built': self.built[n_built_before:],
             'lane_acquires': self.lane_acquires[n_acquires_before:],
@@ -1892,7 +1881,8 @@ class _GateScene:
     # ── the hot-reload seam (step-14): row 10 ───────────────────────────────
 
     def reload_cap(self, chain_cap: int) -> dict:
-        """Flip ``merge_deep.chain_cap`` through the REAL ``config.apply_reload``.
+        """Flip ``merge_deep.chain_cap``, and the one-row depth table
+        ``[(0.0, chain_cap)]`` with it, through the REAL ``config.apply_reload``.
 
         Returns the reload disposition dict verbatim, so the caller asserts on
         ``reloaded`` / ``applied`` / ``restart_required`` rather than on this
@@ -1922,7 +1912,7 @@ def _scripted_remote_runner(scene: _GateScene, script, name='gate-runner'):
 
     Used only in ``remote=True`` mode.  The verdict is decided HERE — below
     ``VerifyRunnerPool.dispatch`` — rather than by replacing
-    ``_run_post_merge_verify``, so the whole dispatch/emit/timeout-resolution
+    ``run_post_merge_verify``, so the whole dispatch/emit/timeout-resolution
     path above it genuinely runs and the ``merge_verify`` row is genuinely
     emitted.  A script that runs out returns PASS, matching δ's oracle.
 
@@ -1933,7 +1923,7 @@ def _scripted_remote_runner(scene: _GateScene, script, name='gate-runner'):
       * a :class:`VerifyResult` — returned VERBATIM.  This is the injector for
         a verdict whose SHAPE is the claim rather than its polarity — a
         ``timed_out=True`` result, say — and injecting it here rather than by
-        replacing ``_run_post_merge_verify`` (the ``outcome=`` vocabulary
+        replacing ``run_post_merge_verify`` (the ``outcome=`` vocabulary
         ``_merge_deep_scene.py::_spy_post_merge_verify`` uses) is what leaves the real
         function's ``timeouts``/``enospc_retries`` bookkeeping in the loop.
         A stub in its place would be asserting the test's own arithmetic.
@@ -2014,7 +2004,7 @@ async def _make_gate_scene(
     *remote* / *real_local* select WHERE the verdict is injected — three
     mutually exclusive seams, deepest last:
 
-      * neither — replace ``orchestrator.merge_lane.worker._run_post_merge_verify``
+      * neither — replace ``orchestrator.merge_lane.verify_dispatch.run_post_merge_verify``
         outright (δ's shape).  Cheapest, and the right seam for a row whose
         claim is about LANDING or about queue state.  No ``merge_verify`` event
         is emitted on this path.  NOTE its red is a raw
@@ -2026,11 +2016,11 @@ async def _make_gate_scene(
         ``remote=True``.
       * ``remote=True`` — install a ``_StubRemoteAllocator`` over a REMOTE
         ``HostLease`` whose runner answers the script, and let the real
-        ``_run_post_merge_verify`` run.  The right seam for a row whose claim
+        ``run_post_merge_verify`` run.  The right seam for a row whose claim
         is about TELEMETRY (``chain_items``, ``chain_build_ms``), because that
         is produced strictly below that call.
       * ``real_local=True`` — patch NOTHING on the verify path: a LOCAL lease,
-        the real ``_run_post_merge_verify``, its real ``LocalRunner``, and —
+        the real ``run_post_merge_verify``, its real ``LocalRunner``, and —
         through the INJECTED port (:func:`_scene_verifier`) — the real
         ``run_scoped_verification`` → ``run_verification``.  The ONLY seam that
         reaches ``verify._resolve_verify_timeout``, so the only one a BUDGET
@@ -2045,7 +2035,7 @@ async def _make_gate_scene(
     :func:`_verdict_from_tree`) injected as the port's SCOPED leg, with
     everything above it left real: a LOCAL lease (so the ordinary arm really
     warm-swaps into a ``_spec-`` lane and the verdict sees a real tree), the
-    real ``_run_post_merge_verify``, and therefore the real rendering of a red
+    real ``run_post_merge_verify``, and therefore the real rendering of a red
     into a blocked :class:`MergeOutcome`.  Mutually exclusive with *script* —
     a scene that stated its verdicts BOTH by position and by content would
     have two answers for the same round.  Every call is recorded on
@@ -2070,7 +2060,7 @@ async def _make_gate_scene(
 
     Module-level monkeypatching is confined to (a) the four
     ``orchestrator.merge_lane.worker`` names test_merge_queue_reachback_patch_guard.py
-    sanctions — ``build_chain``, ``_run_post_merge_verify``,
+    sanctions — ``build_chain``, ``run_post_merge_verify``,
     ``release_chain_build_lane`` — and (b)
     ``orchestrator.verify._run_cmd`` (:func:`_capture_verify_timeouts`), a
     public name one layer BELOW the port that no ``VerifyPort`` leg covers.
@@ -2124,7 +2114,7 @@ async def _make_gate_scene(
     # The round recorder, installed ONCE — re-wrapping per round would capture
     # the previous round's recorder as `real` and nest a wrapper deeper each
     # round.
-    real_verify = worker._run_inflight_verify
+    real_verify = worker.verify_dispatch.run_inflight_verify
 
     async def _recording(_item, _lease, **kwargs):
         rec = dict(kwargs)
@@ -2132,7 +2122,7 @@ async def _make_gate_scene(
         rec['result'] = await real_verify(_item, _lease, **kwargs)
         return rec['result']
 
-    monkeypatch.setattr(worker, '_run_inflight_verify', _recording)
+    monkeypatch.setattr(worker.verify_dispatch, 'run_inflight_verify', _recording)
     scene.lane_acquires = _spy_spec_lane_acquire(git_ops, monkeypatch)
     scene.lane_releases = _spy_chain_lane_release(monkeypatch)
     scene.advance_calls = _spy_advance_main(git_ops, monkeypatch, hook=advance_hook)
@@ -2181,7 +2171,7 @@ async def _make_gate_scene(
             return None if passed else _fail_verify_result()
 
         monkeypatch.setattr(
-            'orchestrator.merge_lane.worker._run_post_merge_verify', _oracle,
+            'orchestrator.merge_lane.verify_dispatch.run_post_merge_verify', _oracle,
         )
     return scene
 
@@ -2192,7 +2182,7 @@ async def _make_gate_scene(
 # Nothing in the tree builds a chain deeper than THREE links: γ's scenes cap at
 # 6 but seed 5 followers, and δ's `_DeltaScene` is hard-wired to 3 links plus a
 # truncator.  The PRD's row 11 is stated at "16-item chain (cap 32)", the
-# observed maximum reify queue depth — so the cap=32 promotion η2 ships is
+# observed maximum reify queue depth — so a chain that deep is
 # ENTIRELY unexercised today.  Before any timeout claim can be made about a
 # depth-16 chain, a scene has to be able to BUILD one.
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2245,9 +2235,9 @@ class TestDeepScaleBuild:
         assert len(scene.built) == 1, (
             f'exactly one build for the round, got {len(scene.built)}'
         )
-        assert scene.built[0]['cap'] == 31, (
-            f'cap must be converted to LINK units (32 - 1), got '
-            f'{scene.built[0]["cap"]!r}'
+        assert scene.built[0]['cap'] == 15, (
+            f'the build is bounded by the chosen depth in LINK units (16 - 1), '
+            f'not by chain_cap; got {scene.built[0]["cap"]!r}'
         )
         assert scene.built[0]['target_depth'] == 15, (
             f'target_depth must be converted to LINK units (16 - 1), got '
@@ -2268,8 +2258,14 @@ class TestDeepScaleBuild:
         )
 
         # ── ONE scratch lane for the whole build (PRD decision #1) ───────────
-        assert chain.lane is not None and chain.lane.name.startswith('_spec-'), (
-            f'the build must claim a pooled _spec- lane, got {chain.lane!r}'
+        # A remote lease's tip never reads a local target/, so the build takes
+        # a plain ephemeral and no pooled _spec- lane (task 7721).
+        assert chain.lane is not None and chain.lane.name.startswith('_merge-'), (
+            f'a remote-lease build must use an ephemeral _merge- lane, got {chain.lane!r}'
+        )
+        assert chain.lane_warm is False
+        assert scene.lane_acquires == [], (
+            f'a remote-lease build claims no _spec- lane; got {scene.lane_acquires!r}'
         )
         assert len(scene.lane_releases) == 1, (
             f'the chain lane is released EXACTLY once per build; got '
@@ -2309,7 +2305,7 @@ class TestDeepScaleBuild:
 #   (c) CLEAN TIMEOUT — when a deep tip verify DOES time out, it degrades
 #       through the EXISTING timeout path and no new one: the loop-breaker
 #       counter advances, nothing lands, no blocked outcome is rendered for
-#       any chained item, and the bisector halves rather than resets.
+#       any chained item, and every chained item is marked to verify alone.
 #
 # NONE of the three may elapse real wall clock.  (a) asserts the BUDGET the
 # code hands down — captured at the ``_run_cmd`` seam, the shape
@@ -2347,7 +2343,7 @@ class TestRow11TimeoutMargin:
         were ever retuned to 7200.0 the set assertion would stop discriminating
         between the two routes, and the pins fail loudly when that happens.
 
-        This runs the REAL ``_run_post_merge_verify`` → ``LocalRunner`` →
+        This runs the REAL ``run_post_merge_verify`` → ``LocalRunner`` →
         ``run_scoped_verification`` → ``run_verification`` stack, with only the
         subprocess launcher stubbed.  Nothing else reaches the resolver: the
         conftest autouse ``_mock_merge_queue_verification`` short-circuits at
@@ -2404,8 +2400,8 @@ class TestRow11TimeoutMargin:
         fall back to the general cold budget) would be invisible to a test that
         only ever measured one depth.
 
-        Same scene, same config, one queued item — ``select_chain_depth``
-        declines at ``queue_len < 2``, so this is the ALWAYS-ON arm.
+        Same scene, same config, one queued item — ``choose_depth`` sizes a
+        one-item queue at depth 1, so this is the ALWAYS-ON arm.
         """
         captured = _capture_verify_timeouts(monkeypatch)
         scene = await _make_gate_scene(
@@ -2550,22 +2546,20 @@ class TestRow11TimeoutMargin:
            no ``merge_finalized`` row at all — the chain's whole prefix stays
            on the queue.
         3. NO blocked ``MergeOutcome`` is rendered for any chained item.  The
-           blocked outcome ``_run_post_merge_verify`` builds internally is
+           blocked outcome ``run_post_merge_verify`` builds internally is
            SWALLOWED into a REQUEUED status by the chain arm, precisely because
            a red tip names no culprit; every request future stays pending.
            This is also what keeps a timeout out of workflow.py's thrash ladder
            (Row 8's claim, which this row must not quietly violate).
-        4. The bisector HALVES rather than resetting: ``next_halving_state``
-           folds a non-pass at the BUILT depth, so a 16-item tree leaves the
-           ceiling at 8 — not ``None`` (which would be a reset, i.e. a timeout
-           being read as a clean bill of health) and not the floor.
+        4. A timeout is a red tip like any other: every item of the BUILT
+           tree is marked, so no link is offered to a chain and the requeued
+           head's re-dispatch verifies alone, unsized by the policy — not a
+           fresh full-depth chain (a timeout read as a clean bill of health).
 
-        The verdict is INJECTED below ``_run_post_merge_verify`` so the real
+        The verdict is INJECTED below ``run_post_merge_verify`` so the real
         function does its own ``timeouts``/``enospc`` bookkeeping — a stub in
         its place would be asserting the test's own arithmetic.
         """
-        from orchestrator.merge_lane.worker import next_halving_state
-
         scene = await _make_gate_scene(
             git_repo, tmp_path, monkeypatch,
             chain_cap=32, n_followers=15, db_name='gate-row11-timeout.db',
@@ -2617,28 +2611,16 @@ class TestRow11TimeoutMargin:
             f'resolved: {sorted(set(scene.reqs) - set(unresolved), key=int)!r}'
         )
 
-        # 4 — the bisector halved off the BUILT depth.
-        #
-        # The LITERAL is the load-bearing form.  Deriving the expectation from
-        # ``next_halving_state`` — the very function whose policy is under test
-        # — proves only that ``_note_chain_outcome`` CALLED it, never that the
-        # ceiling landed on 8: mutating the fail arm to ``dispatched_depth //
-        # 16`` (a 16-item tree collapsing straight to the floor) keeps a
-        # derived-only assertion green.  The derived form is kept BELOW it as a
-        # secondary cross-check that the worker routes through the shipped
-        # policy rather than computing a ceiling of its own.
-        assert worker._chain_halving_state == 8, (
-            f'a timed-out 16-item tip must halve the ceiling to 8 — not '
-            f'None (a reset, i.e. reading a hung verify as a clean bill of '
-            f'health) and not the floor (1, which would decline to chain and '
-            f'silently switch the feature off for the rest of the walk); got '
-            f'{worker._chain_halving_state!r}'
+        # 4 — the BUILT tree's items are marked, and the head verifies alone.
+        assert worker.chain_snapshot() == (), (
+            'no link of the timed-out tip may be offered to a chain before it '
+            'has verified alone'
         )
-        assert worker._chain_halving_state == next_halving_state(False, 16), (
-            f'the ceiling must come from the SHIPPED policy, not from a '
-            f'private computation: next_halving_state(False, 16) = '
-            f'{next_halving_state(False, 16)!r}, worker holds '
-            f'{worker._chain_halving_state!r}'
+        requeued = scene.queue.get_nowait()
+        alone = await scene.round_(tag='timeout16-alone', head_tid='101', req=requeued)
+        assert alone['chain'] is None
+        assert alone['dispatch_facts'].chain_depth_reason is None, (
+            "the policy does not size a marked task's dispatch"
         )
 
 
@@ -2646,12 +2628,11 @@ class TestRow11TimeoutMargin:
 # -- step-07 RED: Row 3 — A RED CHAIN ISOLATES THE BAD ITEM --
 #
 # The row upstream covers only HALFWAY.  test_merge_queue_deep_dispatch.py's
-# ``test_dispatch_depths_follow_the_halving_walk`` drives the depths
-# ``[6, 3, None, 6]`` off a POSITIONAL script (``[False, False, True, True]``):
-# round 1 is red because it is the first element of a list, not because
-# anything in the tree it verified is wrong.  That proves the POLICY — halve
-# on a fail, reset on a pass — and nothing at all about ISOLATION, which is
-# the claim the PRD row actually makes ("item 3 of 6 genuinely red").
+# ``test_no_member_of_a_red_chain_is_chained_again`` drives its rounds off a
+# POSITIONAL script: round 1 is red because it is the first element of a list,
+# not because anything in the tree it verified is wrong.  That proves the
+# reaction to a verdict, and nothing at all about ISOLATION, which is the
+# claim the PRD row actually makes ("item 3 of 6 genuinely red").
 #
 # What a positional script structurally cannot show:
 #
@@ -2666,31 +2647,31 @@ class TestRow11TimeoutMargin:
 # So the verdict here is CONTENT-KEYED: red iff the tree that actually ran
 # contains item 3's file.  Every number below is then a CONSEQUENCE of that
 # one fact plus the shipped policy, and the row's assertions cross-check each
-# dispatched depth against ``select_chain_depth`` evaluated on the live queue
-# and each halving step against ``next_halving_state`` — so a walk that
+# sized round against ``chain_policy.choose_depth`` evaluated on the live queue
+# and on the window ``chain_policy.on_tip_result`` replays — so a walk that
 # happened to produce the right list for the wrong reason still fails.
 #
-# THE MEASURED WALK (8 items, item 3 = task 103 genuinely red, cap=6).  A red
+# THE MEASURED WALK (8 items, item 3 = task 103 genuinely red, cap=6 with the
+# one-row table [(0.0, 6)]).  A red
 # tip sends its owner and every link to an un-chained verify of its own tree
 # before any of them may be chained again (task 10617), and the pipeline
 # re-dispatches the requeued head first:
 #
-#   rnd | head | dispatched | halving after | landed        | why
-#   ----+------+------------+---------------+---------------+------------------
-#    1  | 101  | 6 items    | 3             | —             | chain holds 103
-#    2  | 101  | alone      | None (reset)  | 101           | own tree is clean
-#    3  | 102  | alone      | None          | 102           | own tree is clean
-#    4  | 103  | alone      | None          | — (BLOCKED)   | own tree is red
-#    5  | 104  | alone      | None          | 104           | own tree is clean
-#    6  | 105  | alone      | None          | 105           | own tree is clean
-#    7  | 106  | alone      | None          | 106           | own tree is clean
-#    8  | 107  | 2 items    | None          | 107 + 108     | deep RESUMED
+#   rnd | head | dispatched | sized by the policy | landed        | why
+#   ----+------+------------+---------------------+---------------+------------------
+#    1  | 101  | 6 items    | yes                 | —             | chain holds 103
+#    2  | 101  | alone      | no (marked)         | 101           | own tree is clean
+#    3  | 102  | alone      | no (marked)         | 102           | own tree is clean
+#    4  | 103  | alone      | no (marked)         | — (BLOCKED)   | own tree is red
+#    5  | 104  | alone      | no (marked)         | 104           | own tree is clean
+#    6  | 105  | alone      | no (marked)         | 105           | own tree is clean
+#    7  | 106  | alone      | no (marked)         | 106           | own tree is clean
+#    8  | 107  | 2 items    | yes                 | 107 + 108     | deep RESUMED
 #
 # Two things in that table are worth stating out loud:
 #
-#   (i)  round 2 RESETS the bisector.  A passing slot-2 verify folds
-#        ``next_halving_state(True, 1)`` (``_run_inflight_verify``'s floor
-#        arm) — PRD decision 5's "ANY pass resets".
+#   (i)  rounds 2-7 feed the pass estimate nothing: the policy did not size
+#        them, so round 8 reads a window holding the red chain alone.
 #   (ii) rounds 2-7 are un-chained although the live queue could have fed a
 #        chain: every member of the red chain verifies alone once, and is
 #        offered to no chain as a link until it has, so the culprit is
@@ -2750,17 +2731,17 @@ class TestRow3RedChainIsolatesTheBadItem:
         """Drive the queue to rest, re-dispatching the head until it resolves.
 
         Returns the scene, the per-round 1-indexed queue length observed AT
-        DISPATCH (the input ``select_chain_depth`` was actually evaluated on),
+        DISPATCH (the input ``choose_depth`` was actually evaluated on),
         and the at-rest permit census taken before the first round.
 
         *after_round*, when given, is called with each round's record the
         moment it completes — the only way to sample a state that is true
-        DURING the bisection and no longer true once the queue has drained.
+        DURING the walk and no longer true once the queue has drained.
 
         The schedule is the pipeline's, not the test's convenience: a red tip
         REQUEUES its dispatching head, and the real merger picks that same
         request again on the next pass.  Popping the NEXT item instead would
-        walk a different queue and quietly make the bisection look like it
+        walk a different queue and quietly make the isolation look like it
         terminated when it had merely moved on.
         """
         scene = await _make_gate_scene(
@@ -2817,13 +2798,13 @@ class TestRow3RedChainIsolatesTheBadItem:
           1. DEPTHS.  A member of a red chain that has not yet verified alone
              dispatches un-chained and is offered to no chain as a link; every
              other round's depth is exactly
-             ``select_chain_depth(cap, queue_len_at_dispatch, state_before)``.
+             ``choose_depth(window_before, queue_len_at_dispatch, table)``.
              Cross-checking against the pure policy — rather than against a
              list of literals alone — is what distinguishes the mechanism from
              "the fixture happened to produce these numbers".
-          2. HALVING LADDER.  Every state transition is
-             ``next_halving_state(passed, built_depth)``, with the floor arm's
-             pass-only reset folded at depth 1.
+          2. REASONS.  A marked member's round records no depth reason, and
+             every other round records exactly ``choose_depth``'s, over the
+             window ``on_tip_result`` folds from the sized rounds alone.
           3. THE CLEAN MEMBERS LAND ALONE.  Items 1, 2, 4, 5 and 6 each land on
              their own un-chained round, in order, one main commit each, and
              none carries ``landed_via_chain``.
@@ -2831,8 +2812,13 @@ class TestRow3RedChainIsolatesTheBadItem:
              un-chained verify and blocks through the ordinary path; the two
              items the red chain never held then chain together and land.
         """
+        from orchestrator.merge_lane.chain_policy import (
+            ChainPolicyState,
+            TipVerdict,
+            choose_depth,
+            on_tip_result,
+        )
         from orchestrator.merge_lane.types import InflightStatus
-        from orchestrator.merge_lane.worker import next_halving_state, select_chain_depth
 
         scene, queue_lens, _permits = await self._walk(
             git_repo, tmp_path, monkeypatch, db_name='gate-row3-walk.db',
@@ -2840,7 +2826,7 @@ class TestRow3RedChainIsolatesTheBadItem:
         rounds = scene.rounds
         heads = [r['req'].task_id for r in rounds]
         depths = scene.depths
-        states = [r['halving_state'] for r in rounds]
+        reasons = [r['dispatch_facts'].chain_depth_reason for r in rounds]
 
         assert heads == ['101', '101', '102', '103', '104', '105', '106', '107'], (
             f'the requeued head first, then each member in queue order; got {heads!r}'
@@ -2850,53 +2836,48 @@ class TestRow3RedChainIsolatesTheBadItem:
         assert depths == [6, None, None, None, None, None, None, 2], (
             f'the walk moved: {depths!r}'
         )
-        states_before = [None, *states[:-1]]
+        table = scene.config.merge_deep.depth_table
+        window = ChainPolicyState()
         not_yet_alone: set[str] = set()
-        predicted = []
-        for rec, qlen, state in zip(rounds, queue_lens, states_before, strict=True):
+        predicted, predicted_reasons = [], []
+        for rec, qlen in zip(rounds, queue_lens, strict=True):
             head = rec['req'].task_id
             links = [] if rec['chain'] is None else [tid for tid, _mc in rec['chain'].links]
             assert not_yet_alone.isdisjoint(links), (
                 f'round {rec["round"]} chained {sorted(not_yet_alone & set(links))!r} '
                 f'before they had verified alone'
             )
-            predicted.append(
-                None if head in not_yet_alone
-                else select_chain_depth(_ROW3_CAP, qlen, state)
-            )
+            if head in not_yet_alone:
+                predicted.append(None)
+                predicted_reasons.append(None)
+            else:
+                k, reason = choose_depth(window, qlen, table)
+                predicted.append(None if k < 2 else k)
+                predicted_reasons.append(reason)
+                passed = rec['outcome'] is not None and rec['outcome'].status == 'done'
+                window = on_tip_result(window, 1 + len(links), passed)
             not_yet_alone.discard(head)
             if rec['result'].status is InflightStatus.REQUEUED:
                 not_yet_alone |= {head, *links}
         assert predicted == depths, (
             f'a dispatched depth disagreed with the rule: predicted {predicted!r}, '
-            f'dispatch did {depths!r} (queue_len {queue_lens!r}, state before each '
-            f'round {states_before!r})'
+            f'dispatch did {depths!r} (queue_len {queue_lens!r})'
         )
         assert not_yet_alone == set(), 'every red-chain member verified alone'
 
-        # ── 2. the halving ladder, every step derived from the policy ────────
-        assert states == [3, None, None, None, None, None, None, None], (
-            f'the halving ladder moved: {states!r}'
+        # ── 2. the reasons: only the two chained rounds were sized ───────────
+        assert reasons == predicted_reasons, (
+            f'a recorded depth reason disagreed with the policy: {reasons!r} != '
+            f'{predicted_reasons!r}'
         )
-        for i, (rec, before, after) in enumerate(
-            zip(rounds, states_before, states, strict=True), start=1,
-        ):
-            passed = rec['outcome'] is not None and rec['outcome'].status == 'done'
-            if rec['chain'] is not None:
-                expected = next_halving_state(passed, 1 + len(rec['chain'].links))
-            elif passed and before is not None:
-                # The floor arm's reset, folded at depth 1: an un-chained tree
-                # that ran IS a one-item chain.
-                expected = next_halving_state(True, 1)
-            else:
-                # A red un-chained round folds NOTHING — the arm is pass-only.
-                expected = before
-            assert after == expected, (
-                f'round {i} (head {rec["req"].task_id}, chain '
-                f'{None if rec["chain"] is None else 1 + len(rec["chain"].links)}, '
-                f'passed={passed}) left the bisector at {after!r}; the policy '
-                f'says {expected!r}'
-            )
+        assert [r is not None for r in reasons] == [
+            True, False, False, False, False, False, False, True,
+        ], f'the sized rounds moved: {reasons!r}'
+        assert window.recent == (TipVerdict(6, False), TipVerdict(2, True)), (
+            "no member's solo verdict fed the pass estimate"
+        )
+        assert reasons[-1].basis is ChainDepthBasis.PASS_ESTIMATE
+        assert reasons[-1].pass_estimate == 0.0, 'the red six-item tip alone'
 
         # ── 3. the clean members land alone, unchained ──────────────────────
         alone_landings = [
@@ -3055,7 +3036,7 @@ class TestRow3RedChainIsolatesTheBadItem:
         Without this the whole row could pass for the wrong reason — an oracle
         that is red for a reason unrelated to its ``bad_file`` argument (a
         typo'd path that never matches, inverted, would be red everywhere)
-        produces a plausible-looking bisection too.  Keyed on an absent file
+        produces a plausible-looking walk too.  Keyed on an absent file
         the very first round must chain all six items, pass, and land the whole
         prefix, so the redness in the row above is demonstrably caused by
         item 3's content and by nothing else in the fixture.
@@ -3070,10 +3051,6 @@ class TestRow3RedChainIsolatesTheBadItem:
         assert rec['chain'] is not None and len(rec['chain'].links) == 5, (
             f'six queued items at cap=6 must chain all six; got '
             f'{None if rec["chain"] is None else 1 + len(rec["chain"].links)}'
-        )
-        assert scene.worker._chain_halving_state is None, (
-            f'a green tip resets the bisector; got '
-            f'{scene.worker._chain_halving_state!r}'
         )
         assert sorted(rec['landed'], key=int) == ['101', '102', '103', '104', '105', '106'], (
             f'a green six-item tip lands the whole prefix; got {rec["landed"]!r}'
@@ -3129,12 +3106,12 @@ class TestRow3RedChainIsolatesTheBadItem:
 # ═══════════════════════════════════════════════════════════════════════════
 
 _ROW8_CAP = 8
-"""Chain cap for the row-8 pair.  The walk is 8 -> 4: round 1 targets
-``min(queue_len=11, cap=8)``, and round 2, whose chain may hold none of round
-1's members, targets ``min(1 + 3, 8, next_halving_state(False, 8)=4)``.  Both
-are >= 4, so NEITHER round of the pair is near the ``< 2`` floor where no chain
-code runs at all — a pair that halved into the floor would be asserting silence
-about a round that never chained."""
+"""Chain cap for the row-8 pair, and the depth of its one-row table.  The walk
+is 8 -> 4: round 1 chains eight of the eleven queued items, and round 2, whose
+chain may hold none of round 1's members, chains the head over the three
+followers left.  Both are >= 4, so NEITHER round of the pair is near depth 1,
+where no chain code runs at all — a pair that fell to one item would be
+asserting silence about a round that never chained."""
 
 _ROW8_FOLLOWERS = 10
 """Seven of them are round 1's links; the last three are round 2's."""
@@ -3184,7 +3161,11 @@ class TestRow8DeepFailsNeverFeedTheThrashLadder:
         the depths really were deep, no outcome was rendered, no durable row
         was written, no future resolved, and no request moved in its lane.
         """
-        from orchestrator.merge_lane.worker import next_halving_state, select_chain_depth
+        from orchestrator.merge_lane.chain_policy import (
+            ChainPolicyState,
+            choose_depth,
+            on_tip_result,
+        )
 
         scene = await self._pair(
             git_repo, tmp_path, monkeypatch, db_name='gate-row8-pair.db',
@@ -3197,21 +3178,20 @@ class TestRow8DeepFailsNeverFeedTheThrashLadder:
         assert set(first_links).isdisjoint(second_links), (
             f'round 2 chained a member of round 1\'s red chain: {second_links!r}'
         )
-        expected = [
-            select_chain_depth(_ROW8_CAP, 1 + _ROW8_FOLLOWERS, None),
-            select_chain_depth(
-                _ROW8_CAP, 1 + _ROW8_FOLLOWERS - len(first_links),
-                next_halving_state(False, _ROW8_CAP),
-            ),
-        ]
+        table = scene.config.merge_deep.depth_table
+        first, _ = choose_depth(ChainPolicyState(), 1 + _ROW8_FOLLOWERS, table)
+        second, _ = choose_depth(
+            on_tip_result(ChainPolicyState(), first, False),
+            1 + _ROW8_FOLLOWERS - len(first_links), table,
+        )
+        expected = [first, second]
         assert scene.depths == expected, (
             f'the pair must chain at the policy-selected depths {expected!r}; '
             f'got {scene.depths!r}'
         )
         assert all(d is not None and d >= 4 for d in scene.depths), (
-            f'both rounds must be >= 4 deep — a round that halved into the '
-            f'``< 2`` floor runs no chain code and its silence proves nothing; '
-            f'got {scene.depths!r}'
+            f'both rounds must be >= 4 deep — a round of one item runs no chain '
+            f'code and its silence proves nothing; got {scene.depths!r}'
         )
 
         # 1 — no blocked outcome for ANY item, on either round.
@@ -3514,7 +3494,8 @@ def _gate_round_transcript(scene: _GateScene, idx: int) -> dict:
                               kwarg, which is a literal floor of 1 on every path
                               and would make the field vacuous.
       ``events``            — the DISPATCHING task's ordered event-type stream.
-      ``halving_state``     — ``_chain_halving_state`` after the round.
+      ``chain_depth_reason`` — off the round's ``merge_verify`` row: why the
+                              deep policy chose its depth, or ``None``.
       ``landed_via_chain``  — off the head's ``merge_finalized`` row.
       ``main_moved``        — did main's sha change across the round.
       ``outcome_status``    — the head request's rendered ``MergeOutcome``.
@@ -3544,7 +3525,7 @@ def _gate_round_transcript(scene: _GateScene, idx: int) -> dict:
         'chain_build_ms': None if build_ms is None else '<stamped>',
         'chain_items': verify[0]['chain_items'] if verify else None,
         'events': _events_for_task(scene.db_path, head_tid),
-        'halving_state': rec['halving_state'],
+        'chain_depth_reason': verify[0].get('chain_depth_reason') if verify else None,
         'landed_via_chain': finalized[0].get('landed_via_chain') if finalized else None,
         'main_moved': rec['main_after'] != rec['main_before'],
         'outcome_status': None if outcome is None else outcome.status,
@@ -3575,27 +3556,26 @@ def _gate_sequence_transcript(scene: _GateScene) -> list[dict]:
 #
 # Why a SEQUENCE and not one round.  Every piece of deep state that could leak
 # into the kill-switched path is state that survives ACROSS rounds —
-# ``_chain_halving_state``, the ``_spec-`` lane pool, the speculation permit
-# ledger, ``_n_failed`` / ``_remerge_occurred``.  A one-round comparison cannot
-# see any of it, because a single round has no previous round to inherit from.
-# The three rounds are deliberately MIXED — a pass, a fail, a pass — since the
-# fail is the only round that could arm halving state at all, and the pass
-# after it is the only round that could then observe it.
+# the chain policy's window, the un-chained marks, the ``_spec-`` lane pool, the
+# speculation permit ledger, ``_n_failed`` / ``_remerge_occurred``.  A one-round
+# comparison cannot see any of it, because a single round has no previous round
+# to inherit from.  The three rounds are deliberately MIXED — a pass, a fail, a
+# pass — since the fail is the only round that could mark anyone at all, and
+# the pass after it is the only round that could then observe it.
 #
 # Why a GOLDEN LITERAL and not a second run.  The claim is about ABSENCES, and
 # a literal names each one: chain None, chain_build_ms None, build_chain_calls
-# 0, spec_lane_acquisitions 0, halving_state None, landed_via_chain None,
+# 0, spec_lane_acquisitions 0, chain_depth_reason None, landed_via_chain None,
 # chain_items 1, verified_the_items_own_merge_commit True.  A differential
 # comparison against a re-run would go green for two runs that were identically
 # WRONG.
 #
-# Why ``halving_state: None`` in every round is not an artifact of this worker
-# never having been deep: a fresh — or restarted — worker starts at ``None``
-# (test_merge_queue_deep_dispatch.py::TestChainHalvingWorkerState::
-# test_state_is_none_at_construction), and at cap=0 ``select_chain_depth``
-# returns ``None`` before halving state is read
-# (test_merge_queue_deep_dispatch.py::TestSelectChainDepth::
-# test_cap_zero_is_the_kill_switch_for_every_input).  So no state a previous
+# Why ``chain_depth_reason: None`` in every round is not an artifact of this
+# worker never having been deep: at cap=0 ``_deep_chain_placement`` declines
+# before the policy is asked, whatever its state, and a seeded window is
+# ignored likewise
+# (test_merge_queue_deep_dispatch.py::TestPolicyRow8PassEstimateCrossesATableRow::
+# test_the_kill_switch_ignores_the_seeded_window).  So no state a previous
 # process left behind can move this transcript.
 #
 # Why the POSITIVE CONTROL is mandatory.  A golden of absences passes trivially
@@ -3624,8 +3604,8 @@ which would make "the same sequence" a comparison of a 3-round run against a
 1-round one — a difference proving nothing about the kill switch."""
 
 _ROW7_SCRIPT = [True, False, True]
-"""Pass, FAIL, pass.  The fail is the only round that can arm halving state,
-and the pass after it is the only round that can observe it having leaked."""
+"""Pass, FAIL, pass.  The fail is the only round that can mark anyone, and
+the pass after it is the only round that can observe it having leaked."""
 
 _ROW7_GOLDEN: list[dict] = [
     # ── round 1 — head 101, GREEN.  Lands by the ordinary adjacent path. ──
@@ -3638,7 +3618,7 @@ _ROW7_GOLDEN: list[dict] = [
         'events': [
             'merge_queued', 'merge_verify', 'merge_attempt', 'merge_finalized',
         ],
-        'halving_state': None,           # nothing to bisect
+        'chain_depth_reason': None,      # the policy was never asked
         'landed_via_chain': None,        # landed by advance_main, not by a walk
         'main_moved': True,
         'outcome_status': 'done',
@@ -3663,7 +3643,7 @@ _ROW7_GOLDEN: list[dict] = [
         'chain_build_ms': None,
         'chain_items': 1,
         'events': ['merge_queued', 'merge_verify', 'merge_finalized'],
-        'halving_state': None,           # THE round that would arm it, if deep
+        'chain_depth_reason': None,      # THE round the policy would size, if deep
         'landed_via_chain': None,
         'main_moved': False,
         'outcome_status': 'blocked',     # a named culprit — the ordinary verdict
@@ -3684,7 +3664,7 @@ _ROW7_GOLDEN: list[dict] = [
         'events': [
             'merge_queued', 'merge_verify', 'merge_attempt', 'merge_finalized',
         ],
-        'halving_state': None,           # the red round left NOTHING behind
+        'chain_depth_reason': None,      # the red round left NOTHING behind
         'landed_via_chain': None,
         'main_moved': True,
         'outcome_status': 'done',
@@ -3709,12 +3689,13 @@ _ROW7_DEEP_FIELDS = (
     'chain_build_ms',
     'chain_items',
     'landed_via_chain',
-    'spec_lane_acquisitions',
     'verified_the_items_own_merge_commit',
 )
-"""Every transcript field the deep path can move.  The control asserts ALL of
-them differ at cap=6 — a control that only checked one could pass while the
-other six were silently inert."""
+"""Every transcript field the deep path can move on this remote-lease scene.
+The control asserts ALL of them differ at cap=6 — a control that only checked
+one could pass while the other five were silently inert.
+``spec_lane_acquisitions`` is not among them: a remote lease's chain builds in
+an ephemeral worktree (task 7721), so it stays 0 at cap=6 too."""
 
 
 @pytest.mark.asyncio
@@ -3760,7 +3741,7 @@ class TestRow7KillSwitchByteIdentity:
     ) -> _GateScene:
         """Drive the fixed 3-round mixed sequence over one seeded queue.
 
-        ``remote=True`` so the REAL ``_run_post_merge_verify`` runs and the
+        ``remote=True`` so the REAL ``run_post_merge_verify`` runs and the
         ``merge_verify`` row is genuinely emitted — ``chain_items`` and
         ``chain_build_ms`` are produced strictly below that call, so a scene
         that stubbed it out could not state their absence at all.
@@ -3838,6 +3819,10 @@ class TestRow7KillSwitchByteIdentity:
                 f'round 1 field {field!r} did not move at cap=6: still '
                 f'{transcript[0][field]!r}'
             )
+        assert transcript[0]['spec_lane_acquisitions'] == 0, (
+            'a remote-lease chain builds in an ephemeral and claims no _spec- '
+            f'lane; got {transcript[0]["spec_lane_acquisitions"]!r}'
+        )
         # The red round diverges STRUCTURALLY, not just numerically: the chain
         # arm requeues without naming a culprit, so it renders no outcome and
         # writes no merge_finalized at all.
@@ -3849,10 +3834,11 @@ class TestRow7KillSwitchByteIdentity:
             f'a requeued deep round finalizes nothing; got '
             f'{transcript[1]["events"]!r}'
         )
-        assert transcript[1]['halving_state'] == 1, (
-            f'the red deep round must ARM the bisector (this is exactly what '
-            f'the golden proves cap=0 never does); got '
-            f'{transcript[1]["halving_state"]!r}'
+        reason = transcript[1]['chain_depth_reason']
+        assert reason is not None and reason['basis'] == 'pass_estimate', (
+            f'the policy must have sized the red deep round off the window '
+            f'round 1 fed (this is exactly what the golden proves cap=0 never '
+            f'does); got {reason!r}'
         )
 
 
@@ -3903,7 +3889,7 @@ _COMPOSED_CAP = 4
 Four is the smallest cap that makes all three rows non-degenerate at once: a
 4-item chain has a head plus THREE links, so row 6's abort can land a proper
 prefix (head + 1) and still leave two unlanded links behind, and row 2's
-halving step is ``4 -> 2`` rather than straight to the floor."""
+red tip marks a head and three links."""
 
 _COMPOSED_FOLLOWERS = 5
 """Five followers, so the cap BINDS rather than the queue running out.
@@ -4034,15 +4020,13 @@ class TestBoundaryRowsComposed:
 
         The composition this adds over the upstream owner is everything AFTER
         the red round: each member of the red chain verifies its own tree
-        un-chained and lands on that verdict, the first pass resets the
-        bisector the red round armed, the two items the red chain never held
+        un-chained and lands on that verdict, unsized by the policy, the two
+        items the red chain never held
         then chain together, and the whole scene drains through the two-way
         oracle.  A red tip that quietly consumed a permit, or that left a
         member chainable before it had verified alone, is invisible to a
         one-round scene.
         """
-        from orchestrator.merge_lane.worker import next_halving_state
-
         scene = await _make_gate_scene(
             git_repo, tmp_path, monkeypatch,
             chain_cap=_COMPOSED_CAP, n_followers=_COMPOSED_FOLLOWERS,
@@ -4086,14 +4070,6 @@ class TestBoundaryRowsComposed:
                 f'task {tid} was handed a verdict no verify produced'
             )
 
-        # ── the bisector halved to 2, off the DISPATCHED depth ──────────────
-        assert worker._chain_halving_state == 2, (
-            f'a red 4-item tip must halve the ceiling to 2; got '
-            f'{worker._chain_halving_state!r}'
-        )
-        assert worker._chain_halving_state == next_halving_state(
-            False, _COMPOSED_CAP,
-        ), 'the halving state must be the policy function\'s own answer'
         _assert_midrun_conserved(
             worker, red['main_after'], permits_before, where='after the red round',
         )
@@ -4123,13 +4099,17 @@ class TestBoundaryRowsComposed:
             assert outcome.status == 'done', f'task {tid} must land: {outcome!r}'
             assert outcome.landed_via_chain is None
             assert alone['main_after'] != alone['main_before']
-            assert worker._chain_halving_state is None, (
-                'the first un-chained pass resets the bisector the red round armed'
+            assert alone['dispatch_facts'].chain_depth_reason is None, (
+                "the policy does not size a marked member's round"
             )
 
         resumed = await scene.round_(tag='row2', head_tid=never_chained[0])
         assert resumed['chain'] is not None
         assert [tid for tid, _mc in resumed['chain'].links] == never_chained[1:]
+        reason = resumed['dispatch_facts'].chain_depth_reason
+        assert (reason.basis, reason.pass_estimate) == (ChainDepthBasis.PASS_ESTIMATE, 0.0), (
+            'the window holds the red four-item tip alone'
+        )
         for tid in never_chained:
             assert scene.reqs[tid].result.result().landed_via_chain == 1
 
@@ -4536,9 +4516,8 @@ class TestBoundaryRowsComposed:
 #     links, so `links` is non-empty and the round is deep either way.  A
 #     conflict with the DISPATCHING item truncates at position 0, which is a
 #     different code path in `_deep_chain_placement` — the `if not result.links`
-#     decline, whose two documented obligations (do NOT release the lane a
-#     second time; consume NO halving round) are invisible to a scene that
-#     never reaches it.
+#     decline, whose documented obligation (do NOT release the lane a second
+#     time) is invisible to a scene that never reaches it.
 #   * NO SKIP-AHEAD.  `build_chain` must produce a contiguous PREFIX, so a
 #     conflict at position 0 must NOT be followed by the clean items behind it.
 #     Upstream's fixture has nothing queued past its truncator, so "did it skip
@@ -4588,15 +4567,13 @@ class TestRow4ConflictTruncatesSilently:
         that the chain is short — it is that the two clean items BEHIND the
         conflict were available and were left alone.
 
-        The decline's two documented obligations are pinned alongside it:
-        nothing is released twice (the conservation oracle would see a
-        double-release as a permit or lane violation), and the halving
-        bisector is NOT advanced — a round that verified no chain has no tip
-        verdict to halve on, and halving here would drag the ceiling down for
-        rounds that never failed.
+        The decline's documented obligation is pinned alongside it: nothing
+        is released twice (the conservation oracle would see a double-release
+        as a permit or lane violation).  And the round's ``chain_depth_reason``
+        is still the policy's own: it sized the chain, the build truncated it.
         """
+        from orchestrator.merge_lane.chain_policy import ChainPolicyState, choose_depth
         from orchestrator.merge_lane.types import ItemLifecycleState
-        from orchestrator.merge_lane.worker import select_chain_depth
 
         followers = list(_gate_followers(3))
         scene = await _make_gate_scene(
@@ -4645,18 +4622,20 @@ class TestRow4ConflictTruncatesSilently:
             f'skip ahead" is unfalsifiable; got '
             f'{[r.task_id for r in built["queue_snapshot"]]!r}'
         )
-        assert built['cap'] == _HEAD_CAP - 1, (
-            f'the caller converts ITEMS to LINKS-BEYOND-THE-BASE; got '
-            f'{built["cap"]!r}'
+        target, reason = choose_depth(
+            ChainPolicyState(), 1 + len(followers), scene.config.merge_deep.depth_table,
         )
-        target = select_chain_depth(_HEAD_CAP, 1 + len(followers), None)
-        assert target is not None, (
+        assert target >= 2, (
             'the policy must want a chain here, or the truncation below is '
             'not what declined the round'
         )
-        assert built['target_depth'] == target - 1, (
-            f'the target depth must be the policy function\'s own answer, '
-            f'converted; got {built["target_depth"]!r}'
+        assert rec['dispatch_facts'].chain_depth_reason == reason, (
+            'the declined round still records why the policy sized it'
+        )
+        assert (built['cap'], built['target_depth']) == (target - 1, target - 1), (
+            f'the build is bounded by the policy function\'s own depth, '
+            f'converted from ITEMS to LINKS-BEYOND-THE-BASE; got '
+            f'{(built["cap"], built["target_depth"])!r}'
         )
 
         # ── item 1 lands by the ORDINARY adjacent path ──────────────────────
@@ -4668,13 +4647,6 @@ class TestRow4ConflictTruncatesSilently:
             f'only the dispatching item landed, and NOT via a chain — a stamp '
             f"here would inflate the canary's ratio for a round that verified "
             f'no chain at all; got {_finalized_rows(scene.db_path)!r}'
-        )
-
-        # ── the decline consumed NO halving round ───────────────────────────
-        assert worker._chain_halving_state is None, (
-            f'a declined round has no tip verdict to halve on; halving here '
-            f'would drag the ceiling down for rounds that never failed. Got '
-            f'{worker._chain_halving_state!r}'
         )
 
         # ── every offered item is UNTOUCHED, in its original lane position ──
@@ -4721,7 +4693,7 @@ class TestRow4ConflictTruncatesSilently:
         with a raw :class:`~orchestrator.verify.VerifyResult`, which the CHAIN
         arm consumes as "not None -> red" without reading a field, but which
         the UN-chained arm dereferences (``out.verify_skipped``) — it expects
-        the :class:`MergeOutcome` the real ``_run_post_merge_verify`` renders.
+        the :class:`MergeOutcome` the real ``run_post_merge_verify`` renders.
         A red on a DECLINED round therefore has to be injected below that
         function, which is exactly what ``remote=True`` does.
         """
@@ -4840,15 +4812,14 @@ class TestRow4ConflictTruncatesSilently:
 # every phenomenon the slice can produce:
 #
 #   R1     deep PASS at cap 6         -> six items land through the CAS walk
-#   R2     deep FAIL at 6             -> nothing lands; the bisector halves 6->3
+#   R2     deep FAIL at 6             -> nothing lands; its six items are marked
 #   R3-R8  each member of R2's chain  -> verifies its OWN tree un-chained and
-#          ALONE (task 10617)            lands by the ORDINARY verify; R3's
-#                                        pass RESETS the bisector — the only
-#                                        way the walk ever climbs back out
+#          ALONE (task 10617)            lands by the ORDINARY verify, unsized
+#                                        by the depth policy
 #   R9     stale-CAS ABORT            -> main moves externally mid-walk; the
 #                                        landed prefix stays, the rest requeues
-#   R10    hot-reload 6->32 + CONFLICT -> the very next round chains TWELVE
-#                                        items (twice the old cap, so the
+#   R10    hot-reload of the depth   -> the very next round chains TWELVE
+#          table, 6->32, + CONFLICT      items (twice the old depth, so the
 #                                        reload cannot be a no-op) and
 #                                        truncates on the conflicting tail
 #
@@ -4871,12 +4842,12 @@ class TestRow4ConflictTruncatesSilently:
 # ═══════════════════════════════════════════════════════════════════════════
 
 _CAPSTONE_CAP = 6
-"""The starting cap: deep enough that R1's chain is a real prefix, and an even
-number, so R2's red tip halves it to exactly 3."""
+"""The starting cap, and the depth of its one-row table: deep enough that
+R1's chain is a real prefix."""
 
 _CAPSTONE_RELOADED_CAP = 32
-"""The PRD's stated maximum, and what η2's promotion ships.  R6 must chain
-DEEPER than ``_CAPSTONE_CAP`` for the reload to have been observable at all."""
+"""The depth of the one-row table R10 reloads to.  R10 must chain DEEPER than
+``_CAPSTONE_CAP`` for the reload to have been observable at all."""
 
 _CAPSTONE_FOLLOWERS = 26
 """``102``..``127``: exactly enough to feed ten rounds and leave ONE residue.
@@ -4913,7 +4884,6 @@ class TestDeepGateCapstone:
         self, git_repo: Path, tmp_path: Path, monkeypatch,
     ) -> None:
         """Every round conserves, and the shipped canary matches git's own count."""
-        from orchestrator.merge_lane.worker import next_halving_state
 
         scene = await _make_gate_scene(
             git_repo, tmp_path, monkeypatch,
@@ -4946,16 +4916,13 @@ class TestDeepGateCapstone:
         assert r1['landed'] == ['101', *[t for t, _mc in r1['chain'].links]]
         _conserved(r1)
 
-        # ── R2: a deep FAIL halves 6 -> 3 and lands nothing ─────────────────
+        # ── R2: a deep FAIL lands nothing and marks its six items ───────────
         r2 = await scene.round_(tag='deep-fail', head_tid='107')
         assert r2['chain'] is not None and 1 + len(r2['chain'].links) == _CAPSTONE_CAP
         assert r2['advanced'] is False and r2['advance_calls'] == [], (
             f'a red tip must not reach the CAS walk at all; got '
             f'{r2["advance_calls"]!r}'
         )
-        assert worker._chain_halving_state == next_halving_state(
-            False, _CAPSTONE_CAP,
-        ) == 3
         _conserved(r2)
 
         # ── R3-R8: every member of the red chain verifies ALONE, then lands ──
@@ -4977,9 +4944,8 @@ class TestDeepGateCapstone:
             assert scene.reqs[tid].result.result().landed_via_chain is None, (
                 f'task {tid} landed by the ordinary verify of its own tree'
             )
-            assert worker._chain_halving_state is None, (
-                'ANY pass resets the bisector — this arm is the only way the '
-                'walk climbs back out once a red tip halved it'
+            assert alone['dispatch_facts'].chain_depth_reason is None, (
+                "the policy does not size a marked member's round"
             )
             _conserved(alone)
         assert len(scene.built) == n_builds_before_alone, (
@@ -5005,12 +4971,18 @@ class TestDeepGateCapstone:
         )
         _conserved(r9)
 
-        # ── R10: hot-reload 6 -> 32, then a twelve-item chain that truncates ─
+        # ── R10: hot-reload the table 6 -> 32, then a twelve-item chain that
+        #    truncates ────────────────────────────────────────────────────────
         reload_result = scene.reload_cap(_CAPSTONE_RELOADED_CAP)
         assert reload_result['reloaded'] is True, f'apply_reload refused: {reload_result!r}'
         assert 'merge_deep.chain_cap' in reload_result['applied'], (
             f'chain_cap must be a GREEN-tier leaf; got {reload_result!r}'
         )
+        assert 'merge_deep.depth_table' in reload_result['applied'], (
+            f'the deeper chain below comes from the table, not from the cap, so '
+            f'depth_table must be a GREEN-tier leaf too; got {reload_result!r}'
+        )
+        assert scene.config.merge_deep.depth_table == [(0.0, _CAPSTONE_RELOADED_CAP)]
         assert reload_result['restart_required'] == {}, (
             f'no restart may be required for a green-tier leaf; got '
             f'{reload_result!r}'
@@ -5024,12 +4996,12 @@ class TestDeepGateCapstone:
         assert nxt is scene.reqs['115']
         r10 = await scene.round_(tag='reload+truncate', head_tid='115', req=nxt)
         assert r10['chain'] is not None and 1 + len(r10['chain'].links) == 12, (
-            f'the round AFTER the flip must chain at the NEW cap — twelve '
-            f'items, twice the old ceiling, on the same worker and queue; got '
+            f'the round AFTER the flip must chain under the NEW table — twelve '
+            f'items, twice the old depth, on the same worker and queue; got '
             f'{None if r10["chain"] is None else 1 + len(r10["chain"].links)}'
         )
         assert 1 + len(r10['chain'].links) > _CAPSTONE_CAP, (
-            'a chain no deeper than the old cap would leave the reload unproven'
+            'a chain no deeper than the old table would leave the reload unproven'
         )
         assert scene.built[-1]['result'].truncated_at == '127', (
             f'the conflicting tail must truncate the chain; got '

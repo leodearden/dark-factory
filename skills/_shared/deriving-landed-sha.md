@@ -382,7 +382,7 @@ output most-recent-first and take the first row whose **subject** cites this tas
   carrying none of this task's work, and the server's only backstop
   ([below](#never-from-head)) passes it. This matches
   `escalation/src/escalation/git_authority.py::found_on_main_response`, whose live-branch path returns
-  exactly this citation commit, discovered by `validate_landing_evidence` (task 3103 changed it
+  exactly this citation commit, found by `branch_work_landed`'s citation tier (task 3103 changed it
   from the branch tip for precisely this reason). Do **not** assert "fast-forward" in the note:
   this arm cannot distinguish a genuine fast-forward from a sibling-covered landing — recording
   the tip lets an auditor tell them apart at zero extra commands — and `found_on_main` is honest

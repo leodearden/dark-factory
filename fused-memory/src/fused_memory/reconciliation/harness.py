@@ -2529,11 +2529,12 @@ class ReconciliationHarness:
                 project_id=None,
                 project_root=None,
             ),
-            # This store serves every project, so create_server leaves the guard
-            # unscoped (resolver='no_project') until task 6910 scopes it per call.
             prefix_resolver=lambda project_id, prefix: IdResolver.for_memory_service(
                 self.memory
             ).resolve_prefix(project_id, prefix),
+            # This store serves every project, so each call is scoped by its
+            # stage's X-Escalation-Project header, honoured only for a known project.
+            per_call_projects=frozenset(self._known_projects),
         )
         host = self.config.escalation_host
         port = self.config.escalation_port
