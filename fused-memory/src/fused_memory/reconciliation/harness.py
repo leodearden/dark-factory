@@ -117,6 +117,8 @@ from fused_memory.reconciliation.task_count_snapshot_cadence import (
 )
 from fused_memory.reconciliation.task_filter import (
     FilteredTaskTree,
+    TaskTreeUnavailableReason,
+    available_tree,
     cross_verify_task_counts,
     diff_status_correction,
     filter_task_tree,
@@ -1380,16 +1382,20 @@ class ReconciliationHarness:
     async def _fetch_filtered_task_tree(self, project_root: ProjectRoot) -> FilteredTaskTree:
         """Fetch the task tree once and return a filtered subset of active tasks.
 
-        Degrades gracefully on failure — returns an empty FilteredTaskTree so
-        stages can still do useful memory work without task data. (ref: task 455)
+        Never raises: a failed fetch returns a tree whose unavailable_reason names
+        the failing branch, so stages still do useful memory work and every
+        renderer shows the tree as unavailable rather than as zero tasks.
+        (ref: task 455, task 9487)
 
         Args:
             project_root: Absolute path to the project root for taskmaster.
 
         Returns:
             FilteredTaskTree with active tasks sorted by priority and aggregate
-            counts. Returns empty FilteredTaskTree if taskmaster is unavailable,
-            project_root is empty, non-absolute, or the fetch fails.
+            counts. When taskmaster is unavailable, project_root is empty or
+            non-absolute, or the fetch fails, returns a tree with no tasks whose
+            unavailable_reason is taskmaster_disabled, empty_project_root,
+            non_absolute_project_root or fetch_error respectively.
             Non-absolute paths are rejected before calling taskmaster to avoid
             silent failures from the backend's absolute-path validator.
 
@@ -1408,20 +1414,20 @@ class ReconciliationHarness:
                 'reconciliation.task_tree_taskmaster_disabled',
                 extra={'project_root': project_root},
             )
-            return FilteredTaskTree()
+            return FilteredTaskTree(unavailable_reason=TaskTreeUnavailableReason.taskmaster_disabled)
         if not project_root:
             logger.info(
                 'reconciliation.task_tree_empty_project_root',
                 extra={'project_root_repr': repr(project_root)},
             )
-            return FilteredTaskTree()
+            return FilteredTaskTree(unavailable_reason=TaskTreeUnavailableReason.empty_project_root)
         if not os.path.isabs(project_root):
             logger.warning(
                 '_fetch_filtered_task_tree rejected non-absolute project_root %r'
-                ' — cannot fetch tasks; Stage 2 will see empty tree',
+                ' — cannot fetch tasks; Stage 2 will see the tree as unavailable',
                 project_root,
             )
-            return FilteredTaskTree()
+            return FilteredTaskTree(unavailable_reason=TaskTreeUnavailableReason.non_absolute_project_root)
         try:
             tasks_data = await self.taskmaster.get_tasks(project_root=project_root)
             raw_count = len(tasks_data.get('tasks', []))
@@ -1452,7 +1458,7 @@ class ReconciliationHarness:
             logger.warning(
                 f'_fetch_filtered_task_tree failed for {project_root!r}: {exc}'
             )
-            return FilteredTaskTree()
+            return FilteredTaskTree(unavailable_reason=TaskTreeUnavailableReason.fetch_error)
 
     async def _fetch_task_count_census(self, project_root: ProjectRoot) -> dict[str, str]:
         """Fetch the authoritative {id: status} map from taskmaster.get_statuses_fresh().
@@ -5387,8 +5393,9 @@ class ReconciliationHarness:
             # worktree/branch of their own — routed to DeterministicRunner) do too —
             # which status alone cannot express since 'blocked' is deliberately not in
             # ORCH_LIVE_INELIGIBLE_STATUSES (a normal blocked task may legitimately
-            # auto-unblock mid-pipeline). remediation_tree is always a valid
-            # FilteredTaskTree (degrades to empty on fetch failure), so this is safe.
+            # auto-unblock mid-pipeline). A failed fetch yields a tree carrying an
+            # unavailable_reason and no tasks; available_tree maps it to None, and
+            # the map is then empty.
             #
             # Task 2964 consolidated the former parallel status_by_id/task_kind_by_id
             # scalar maps into this one: the gate now also needs `metadata` (for
@@ -5406,12 +5413,18 @@ class ReconciliationHarness:
             # so status/task_kind/pure_gate/corroborated all degrade to the pre-2031
             # status-blind, fail-safe-toward-live values for that one id, not a new
             # failure mode.
+            fetched_remediation_tree = available_tree(remediation_tree)
+            remediation_tasks: list[dict] = (
+                []
+                if fetched_remediation_tree is None
+                else [
+                    *fetched_remediation_tree.active_tasks,
+                    *fetched_remediation_tree.done_tasks,
+                    *fetched_remediation_tree.cancelled_tasks,
+                ]
+            )
             task_by_id: dict[str, dict] = {}
-            for t in (
-                list(remediation_tree.active_tasks)
-                + list(remediation_tree.done_tasks)
-                + list(remediation_tree.cancelled_tasks)
-            ):
+            for t in remediation_tasks:
                 if not isinstance(t, dict) or t.get('id') is None:
                     continue
                 task_by_id[str(t.get('id'))] = t
@@ -5979,9 +5992,10 @@ class ReconciliationHarness:
                                 #
                                 # `task_by_id and ...` is load-bearing, and is
                                 # the ONE place this gate deliberately fails
-                                # OPEN.  `_fetch_filtered_task_tree` degrades to
-                                # an EMPTY tree whenever taskmaster is disabled
-                                # or the fetch fails, and an empty map is not
+                                # OPEN.  `_fetch_filtered_task_tree` returns a
+                                # tree carrying an unavailable_reason and no
+                                # tasks whenever taskmaster is disabled or the
+                                # fetch fails, so the map is empty, and that is not
                                 # evidence that a task is absent — it is evidence
                                 # that we do not know.  Treating "no tree" as
                                 # "no such task" would silently switch this whole

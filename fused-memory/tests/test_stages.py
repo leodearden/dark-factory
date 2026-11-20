@@ -117,6 +117,7 @@ from fused_memory.reconciliation.task_filter import (
     MAX_CANCELLED_TASKS_RETAINED,
     MAX_DONE_TASKS_RETAINED,
     FilteredTaskTree,
+    TaskTreeUnavailableReason,
     filter_task_tree,
     format_task_list,
     id_key,
@@ -5640,6 +5641,58 @@ class TestBriefingKnownGapsRefresh:
             )
 
         # Second invocation must not call add_task again
+        mock_deps['taskmaster'].add_task.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_an_unavailable_injected_tree_does_not_suppress_the_dedup_fetch(
+        self, mock_deps, tmp_path, caplog,
+    ):
+        """An unknown injected tree is not 'no pending tasks': the hook fetches its own tree to dedup."""
+        scripts_dir = tmp_path / 'scripts'
+        scripts_dir.mkdir()
+        (scripts_dir / 'refresh_briefing_known_gaps.py').write_text(
+            'import json, sys\n'
+            "print(json.dumps([{'task_id': '1751', 'title': 'Foo', 'subproject': 'bar', 'what': 'gap'}]))\n"
+            'sys.exit(1)\n'
+        )
+        (tmp_path / 'review').mkdir()
+        (tmp_path / 'review' / 'briefing.yaml').write_text('')
+
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.scope = _scope('reify', str(tmp_path))
+        stage.filtered_task_tree = FilteredTaskTree(
+            unavailable_reason=TaskTreeUnavailableReason.fetch_error,
+        )
+        mock_deps['taskmaster'].get_tasks.return_value = {
+            'tasks': [
+                {
+                    'id': '9001',
+                    'status': 'pending',
+                    'title': 'Refresh briefing: remove task 1751 from known_gaps',
+                },
+            ],
+        }
+
+        with (
+            patch.object(stage, 'assemble_payload', new=AsyncMock(return_value='payload')),
+            patch(
+                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                new=AsyncMock(return_value=StageResult(success=True, report={'summary': 'ok'})),
+            ),
+            caplog.at_level(logging.INFO, logger=_TKS_LOGGER),
+        ):
+            await stage.run(
+                events=[],
+                watermark=Watermark(project_id='reify'),
+                prior_reports=[],
+                run_id='test-run-unavailable-tree',
+            )
+
+        queued_records = [
+            r for r in caplog.records
+            if r.name == _TKS_LOGGER and r.getMessage() == 'briefing_refresh_tasks_queued'
+        ]
+        assert [getattr(r, 'skipped_ids', None) for r in queued_records] == [['1751']]
         mock_deps['taskmaster'].add_task.assert_not_called()
 
     @pytest.mark.asyncio

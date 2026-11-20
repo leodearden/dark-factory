@@ -25,7 +25,7 @@ from fused_memory.reconciliation.consolidation_auto_executor import (
 )
 from fused_memory.reconciliation.recon_ledger import ReconLedgerStore
 from fused_memory.reconciliation.stages.base import BaseStage
-from fused_memory.reconciliation.task_filter import FilteredTaskTree
+from fused_memory.reconciliation.task_filter import FilteredTaskTree, TaskTreeUnavailableReason
 from reconciliation.consolidator_fixtures import make_consolidator
 
 
@@ -116,6 +116,21 @@ async def test_no_task_tree_fails_closed(stage):
     report = await _run(stage)
 
     assert report.stats['auto_consolidation_skipped_unavailable'] == 'task_tree'
+
+
+@pytest.mark.asyncio
+async def test_an_unavailable_task_tree_fails_closed(stage):
+    stage.memory.config.consolidation_auto.enabled_projects = ['test_project']
+    stage.filtered_task_tree = FilteredTaskTree(
+        unavailable_reason=TaskTreeUnavailableReason.fetch_error,
+    )
+
+    report = await _run(stage)
+
+    assert report.stats['auto_consolidation_skipped_unavailable'] == 'task_tree', (
+        'an unknown tree must not reach the executor as an empty one, or rung 1 '
+        '(already_gated) of consolidation_auto.py::judge_auto_proposal never fires'
+    )
 
 
 @pytest.mark.asyncio
