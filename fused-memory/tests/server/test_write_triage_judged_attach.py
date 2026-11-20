@@ -54,18 +54,20 @@ pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 _T_HIGH = 0.90
 _T_LOW = 0.70
 _BAND_WINNER = 'm1'
+_WRITE = 'the new entry'
 
 
 def _result(
     id_: str,
     cosine: float,
     *,
+    content: str | None = None,
     extra_metadata: dict | None = None,
 ) -> MemoryResult:
     """A post-RRF record: the cosine lives in ``metadata['store_score']``."""
     return MemoryResult(
         id=id_,
-        content=f'content of {id_}',
+        content=content if content is not None else f'content of {id_}',
         category=MemoryCategory.procedural_knowledge,
         source_store=SourceStore.mem0,
         relevance_score=1.0 / (RRF_K + 1),
@@ -74,11 +76,14 @@ def _result(
 
 
 def _middle_band_slate(**m3_metadata) -> list[MemoryResult]:
-    """Four candidates, all inside [t_low, t_high); the band's winner is m1."""
+    """Four candidates, all inside [t_low, t_high); the band's winner is m1.
+
+    m3 repeats the write verbatim, so a judge's `restates` naming it stands.
+    """
     return [
         _result('m1', 0.85),
         _result('m2', 0.83),
-        _result('m3', 0.80, extra_metadata=m3_metadata or None),
+        _result('m3', 0.80, content=_WRITE, extra_metadata=m3_metadata or None),
         _result('m4', 0.78),
     ]
 
@@ -103,7 +108,7 @@ def _judge_answering(answer: object) -> AsyncMock:
 
 async def _triage(results: list[MemoryResult], judge, counter: TriageFailOpenCounter):
     return await triage_write(
-        _svc(results), content='the new entry', project_id='p',
+        _svc(results), content=_WRITE, project_id='p',
         counter=counter, judge=judge,
     )
 
@@ -200,7 +205,7 @@ class TestTheJudgedCandidateIsTheAttachTarget:
     @pytest.mark.asyncio
     async def test_the_deterministic_band_never_asks_the_judge(self) -> None:
         judge = _judge_answering(TriageJudgeVerdict(OUTCOME_AMENDED, 'm3'))
-        slate = [_result('m1', 0.95), *_middle_band_slate()[1:]]
+        slate = [_result('m1', 0.95, content=_WRITE), *_middle_band_slate()[1:]]
 
         decision = await _triage(slate, judge, _counter())
 
@@ -386,7 +391,7 @@ async def _add_memory(
     monkeypatch.setattr(tools, 'TriageFailOpenCounter', lambda: counter)
     with patch('openai.AsyncOpenAI', return_value=_provider_answering(answer)):
         ack = await create_mcp_server(service)._tool_manager.call_tool('add_memory', {
-            'content': 'the new entry',
+            'content': _WRITE,
             'category': 'procedural_knowledge',
             'agent_id': 'claude-interactive',
             'project_id': 'dark_factory',

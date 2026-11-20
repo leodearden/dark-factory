@@ -7,6 +7,7 @@ import logging
 import sqlite3
 import uuid
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from unittest.mock import DEFAULT, AsyncMock, MagicMock, patch
 
 import httpx
@@ -24,6 +25,7 @@ from reconciliation.harness_fixtures import (
     open_journal,
     stub_stage_runs,
 )
+from reconciliation.legacy_drains import drain_unattributed
 from shared.config_dir import TaskConfigDir
 from shared.project_layout import escalation_queue_dir
 from shared.scheduler_state import SchedulerStateSnapshot
@@ -98,9 +100,14 @@ async def journal(tmp_path):
         yield j
 
 
+@pytest.fixture
+def event_buffer_db_path(tmp_path) -> Path:
+    return tmp_path / 'harness_eb.db'
+
+
 @pytest_asyncio.fixture
-async def event_buffer(tmp_path):
-    async with open_event_buffer(tmp_path / 'harness_eb.db') as b:
+async def event_buffer(event_buffer_db_path):
+    async with open_event_buffer(event_buffer_db_path) as b:
         yield b
 
 
@@ -137,7 +144,7 @@ async def test_drain_clears_buffer(event_buffer):
     await event_buffer.push(_make_event())
     await event_buffer.push(_make_event())
 
-    events = await event_buffer.drain('test-project')
+    events = await event_buffer.drain('test-project', run_id='R1')
     assert len(events) == 2
 
     # Should be empty now
@@ -9819,7 +9826,7 @@ async def test_recover_predecessor_runs_does_not_clobber_a_run_its_own_coroutine
 
 @pytest.mark.asyncio
 async def test_recover_stale_runs_restores_pre_upgrade_unattributed_drained_events(
-    journal, event_buffer, mock_memory_service,
+    journal, event_buffer, event_buffer_db_path, mock_memory_service,
 ):
     """Amendment regression (task 2711 review finding #1): events drained by
     a pre-task-2711 process carry NULL drained_by_run_id, since only current
@@ -9849,12 +9856,12 @@ async def test_recover_stale_runs_restores_pre_upgrade_unattributed_drained_even
         await event_buffer.push(e)
     await event_buffer.drain(project_id, run_id=run_x.id)
 
-    # Pre-task-2711 leftovers: drained with no run_id, simulating the old
-    # code that never stamped drained_by_run_id.
+    # Pre-task-2711 leftovers, seeded as a pre-task-2711 process left them:
+    # drained with no drained_by_run_id stamp.
     legacy_events = [_make_event(project_id), _make_event(project_id)]
     for e in legacy_events:
         await event_buffer.push(e)
-    await event_buffer.drain(project_id)
+    assert drain_unattributed(event_buffer_db_path, project_id) == 2
 
     # Concurrent run Y — still running, owned by the live instance; its
     # (attributed) drained events must survive X's recovery.
@@ -20214,9 +20221,9 @@ async def test_run_full_cycle_attributes_drained_events_to_run_id(
         f'2 events it drained via buffer.drain(); restore_drained(run_id=run_a.id) '
         f'restored {restored_a}'
     )
-    # Drain them back out (no run_id — mirrors an untracked legacy drain) so
-    # the next scenario starts from an empty 'buffered' set.
-    await event_buffer.drain('test-project')
+    # Drain them back out so the next scenario starts from an empty
+    # 'buffered' set.
+    await event_buffer.drain('test-project', run_id='scenario-a-cleanup')
 
     # (b) Iterator-fed path: events pre-drained by the caller must be
     # attributed via buffer.mark_drained_run_id(project_id, event_ids, run_id).
@@ -20226,8 +20233,9 @@ async def test_run_full_cycle_attributes_drained_events_to_run_id(
     pre_drained = [_make_event(), _make_event()]
     for e in pre_drained:
         await event_buffer.push(e)
-    # Pre-drain with no run_id, so only run_full_cycle can attribute them.
-    await event_buffer.drain('test-project')
+    # Pre-drained under another run's id, as BacklogIterator's drain_by_ids
+    # does; run_full_cycle must re-attribute them to its own run.
+    await event_buffer.drain('test-project', run_id='pre-drain-chunk')
 
     run_b = await harness.run_full_cycle(
         'test-project', 'backlog_chunk:1:2', events=pre_drained,

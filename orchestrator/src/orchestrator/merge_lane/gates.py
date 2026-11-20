@@ -5,8 +5,9 @@ post-merge-pyright gates, the advance-finalize and advance-failure-mapping
 functions, the ``merge_attempt`` event emitter they share with the worker,
 and their supporting types and reason-prefix constants.
 
-Verify EXECUTION (``_run_post_merge_verify`` and its cluster) stays in the
-worker — this module owns gate POLICY, not verify execution (PRD Open Q1).
+Verify EXECUTION (``merge_lane/post_merge_verify.py::run_post_merge_verify``
+and its cluster) lives outside this module — this module owns gate POLICY,
+not verify execution (PRD Open Q1).
 Where a gate needs a worker function, the worker injects it: the re-verify
 through ``_reverify_rebased_tree``'s *run_post_merge_verify*, the γ2
 auto-chain through :class:`_GenerationChainContext`.  This module never
@@ -3716,10 +3717,10 @@ async def _reverify_rebased_tree(
     rebased_onto:
         The current main SHA the branch was rebased onto.
     timeouts / enospc_retries / max_timeouts / max_enospc:
-        Forwarded verbatim to ``_run_post_merge_verify``.
+        Forwarded verbatim to ``merge_lane/post_merge_verify.py::run_post_merge_verify``.
     keep_worktrees:
         Additional worktrees to protect from disk-guard pruning — forwarded
-        verbatim to ``_run_post_merge_verify``.  Default ``None`` produces
+        verbatim to ``merge_lane/post_merge_verify.py::run_post_merge_verify``.  Default ``None`` produces
         legacy single-keep behaviour (only ``merge_wt`` is protected).
     run_post_merge_verify:
         The worker's verify callable, carrying the worker's handles, its

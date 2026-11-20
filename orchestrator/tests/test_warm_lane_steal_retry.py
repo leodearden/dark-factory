@@ -34,6 +34,7 @@ from pathlib import Path
 
 import pytest
 from _orch_helpers import assert_isolated_git_repo
+from _seed_script_stubs import seed_default_warm_base
 
 from orchestrator.config import GitConfig
 from orchestrator.git_ops import GitOps, SeedLaneLock, WorktreeInfo, _run
@@ -67,19 +68,13 @@ async def _init_repo(repo: Path) -> None:
 
 @pytest.fixture
 def wl_git_repo(tmp_path: Path) -> Path:
-    """A git repo whose default warm-lane base + pool-storage sentinel exist so
-    ``acquire_warm_lane``'s pre-acquire base-health gate sees
-    ``WarmBaseHealth.OK`` and the mount-presence guard does not false-trip
-    (mirrors test_warm_lane_structural_exhaustion.py::wl_git_repo)."""
+    """A git repo with the default warm-lane base and pool-storage sentinel."""
     repo = tmp_path / 'repo'
     repo.mkdir()
     # esc-3072-3 guard lives inside _init_repo, immediately after `git init`
     # (the earliest point the pre-flight is evaluable) — see its docstring.
     asyncio.run(_init_repo(repo))
-    default_base = repo / '.worktrees' / '_merge-verify' / 'target'
-    default_base.mkdir(parents=True, exist_ok=True)
-    (default_base / '.keep').write_text('warm base sentinel\n')
-    (repo / '.worktrees' / '.pool-root').touch()
+    seed_default_warm_base(repo)
     return repo
 
 

@@ -4,7 +4,8 @@ material other than this session's own dialogue?
 Two answers live here. The text half recognises machine content re-ingested
 into a transcript (a prior trickle-coder judgment, or a harness-injected
 prompt, briefing or memory block) by its literal shape; the record half reads
-Claude Code's structured ``origin`` stamp. Both are pure functions over plain
+Claude Code's structured provenance stamps: ``origin``, and ``promptSource``
+with ``entrypoint``. Both are pure functions over plain
 strings and record dicts, and this module imports nothing from the legibility
 pipeline it serves.
 """
@@ -447,3 +448,38 @@ def has_non_human_origin(record: Mapping[str, Any]) -> bool:
         return False
     kind = origin.get('kind')
     return isinstance(kind, str) and kind != HUMAN_ORIGIN_KIND
+
+
+SDK_PROMPT_SOURCE: str = 'sdk'
+"""The Claude Code ``promptSource`` of a prompt delivered over the SDK rather than typed."""
+
+HEADLESS_SDK_ENTRYPOINT: str = 'sdk-cli'
+"""The ``entrypoint`` headless ``claude --print`` stamps unless an inherited
+``CLAUDE_CODE_ENTRYPOINT`` overrides it (residual: task 10794)."""
+
+
+def is_headless_sdk_prompt(record: Mapping[str, Any]) -> bool:
+    """True when *record* is a prompt delivered to headless ``claude --print``:
+    ``promptSource`` is :data:`SDK_PROMPT_SOURCE` AND ``entrypoint`` is
+    :data:`HEADLESS_SDK_ENTRYPOINT`. Any other or absent value answers False
+    and falls through to the text rules.
+
+    promptSource alone is not enough: SDK GUI clients (T3 Code: 'sdk-ts',
+    't3-code') stamp it on human-typed turns. It sits only on prompt records,
+    so the rule never reaches a tool_result carrier. The measurement and the
+    residual: plans/confusion-reduction-prd.md §7.2.2 (generation 8).
+    """
+    return (
+        record.get('promptSource') == SDK_PROMPT_SOURCE
+        and record.get('entrypoint') == HEADLESS_SDK_ENTRYPOINT
+    )
+
+
+def has_non_dialogue_provenance(record: Mapping[str, Any]) -> bool:
+    """True when *record*'s structured provenance alone marks it as material
+    other than this session's own dialogue: the record half of the
+    non-dialogue question, mirroring :func:`is_reingested_content`'s text
+    half. A newly sighted structured provenance stamp is a one-line addition
+    to this union.
+    """
+    return has_non_human_origin(record) or is_headless_sdk_prompt(record)

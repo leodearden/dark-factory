@@ -1067,13 +1067,13 @@ class TestWorkspaceDomain:
         members = {member.name: member for member in source_measures.workspace_domain(root)}
         scripts = {f.path: f for f in members.pop('scripts').files}
         assert {path: f.extra_import_names for path, f in scripts.items()} == {
-            'scripts/legibility/y.py': ('y',),
+            'scripts/legibility/y.py': (),
             'scripts/local-model-serving/lms_z.py': ('lms_z',),
             'scripts/tests/test_x.py': (),
             'scripts/x.py': (),
         }
         assert {path: f.import_names for path, f in scripts.items()} == {
-            'scripts/legibility/y.py': ('legibility.y', 'y'),
+            'scripts/legibility/y.py': ('legibility.y',),
             'scripts/local-model-serving/lms_z.py': ('local-model-serving.lms_z', 'lms_z'),
             'scripts/tests/test_x.py': (),
             'scripts/x.py': ('x',),
@@ -1127,7 +1127,7 @@ class TestWorkspaceDomain:
         package = by_name['orchestrator']['orchestrator/src/orchestrator/__init__.py']
         assert package.import_name == 'orchestrator'
         census = by_name['scripts']['scripts/legibility/census.py']
-        assert census.import_names == ('legibility.census', 'census')
+        assert census.import_names == ('legibility.census',)
         serving = by_name['scripts']['scripts/local-model-serving/lms_ctl.py']
         assert (serving.import_name, serving.extra_import_names) == (
             'local-model-serving.lms_ctl',
@@ -1254,19 +1254,24 @@ class TestUniqueImportPaths:
     def test_each_name_maps_to_the_one_file_it_names(self, tmp_path: Path) -> None:
         domain = source_measures.workspace_domain(_domain_repo(tmp_path / 'repo'))
         paths = source_measures.unique_import_paths(domain, lambda f: f.import_names)
-        assert paths['legibility.y'] == paths['y'] == 'scripts/legibility/y.py'
+        assert paths['legibility.y'] == 'scripts/legibility/y.py'
+        assert 'y' not in paths
+        assert paths['lms_z'] == 'scripts/local-model-serving/lms_z.py'
         assert paths['alpha.sub.deep'] == 'alpha/src/alpha/sub/deep.py'
         assert 'test_x' not in paths
 
     def test_a_name_two_files_share_is_refused_naming_it_and_its_sorted_paths(
         self, tmp_path: Path
     ) -> None:
-        repo = _domain_repo(tmp_path / 'repo', tracked=(*_DOMAIN_TRACKED, 'scripts/y.py'))
+        repo = _domain_repo(tmp_path / 'repo', tracked=(*_DOMAIN_TRACKED, 'scripts/lms_z.py'))
         domain = source_measures.workspace_domain(repo)
         with pytest.raises(source_measures.MetricsError) as refused:
             source_measures.unique_import_paths(domain, lambda f: f.import_names)
-        assert "'y' names ['scripts/legibility/y.py', 'scripts/y.py']" in str(refused.value)
-        assert source_measures.unique_import_paths(domain, _primary_name)['y'] == 'scripts/y.py'
+        assert (
+            "'lms_z' names ['scripts/lms_z.py', 'scripts/local-model-serving/lms_z.py']"
+            in str(refused.value)
+        )
+        assert source_measures.unique_import_paths(domain, _primary_name)['lms_z'] == 'scripts/lms_z.py'
 
 
 def _workspace(*members: str) -> str:

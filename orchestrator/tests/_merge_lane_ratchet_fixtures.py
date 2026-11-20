@@ -1,6 +1,7 @@
 """What the merge-lane ratchet suites share: the instrument, the one seed report,
-the throwaway repo the git-driving suites build history in, and what a gate
-copied into that repo needs beside it.
+the cluster paths and ledger helpers more than one suite asserts on, the
+throwaway repo the git-driving suites build history in, and what a gate copied
+into that repo needs beside it.
 
 The ``scripts/`` modules are imported HERE, once, so no suite carries its own
 ``sys.path`` bootstrap; orchestrator/pyproject.toml's [tool.pyright] extraPaths
@@ -22,7 +23,11 @@ import sys
 from pathlib import Path
 from typing import Self
 
-from _orch_helpers import assert_isolated_git_repo, git_env_with_ceiling
+from _orch_helpers import (
+    assert_isolated_git_repo,
+    env_resolving_running_interpreter,
+    git_env_with_ceiling,
+)
 
 sys.path.insert(0, str(Path(__file__).parents[2] / 'scripts'))
 
@@ -35,10 +40,14 @@ _CHECKOUT = Path(__file__).parents[2]
 
 __all__ = [
     'GATE_IMPORT_CLOSURE',
+    'GIT_OPS_RELPATH',
+    'WORKER_RELPATH',
     'RatchetRepo',
     'a_py_cognitive_raise',
     'blank_file_entry',
+    'corrupt_ledger',
     'lane_cluster',
+    'ledger_files',
     'metrics',
     'ratchet',
     'record',
@@ -60,6 +69,12 @@ GATE_IMPORT_CLOSURE = (
     'scripts/_checkout.py',
     'pyproject.toml',
 )
+
+#: The lane worker, which CLUSTER_PATHS reaches only through its merge_lane/** glob.
+WORKER_RELPATH = 'orchestrator/src/orchestrator/merge_lane/worker.py'
+
+#: The one SIZE_CEILING_EXEMPT path, a literal so a spec can check CLUSTER_PATHS against it.
+GIT_OPS_RELPATH = 'orchestrator/src/orchestrator/git_ops.py'
 
 
 def synthetic_report() -> dict:
@@ -110,6 +125,19 @@ def synthetic_report() -> dict:
     }
 
 
+def ledger_files(ledger: Path) -> dict[str, str]:
+    """Every file in the ledger directory *ledger*, by name -- what a write may not touch."""
+    return {path.name: path.read_text(encoding='utf-8') for path in sorted(ledger.iterdir())}
+
+
+def corrupt_ledger(tmp_path: Path) -> Path:
+    """A ledger directory holding one entry that cannot be read."""
+    ledger = tmp_path / 'raises'
+    ledger.mkdir()
+    (ledger / 'corrupt.json').write_text('{ not json at all', encoding='utf-8')
+    return ledger
+
+
 def blank_file_entry(**overrides: int) -> dict:
     """A cluster-file entry with every measure zero, then *overrides* applied."""
     entry = {
@@ -135,7 +163,8 @@ class RatchetRepo:
         # FIRST, before any subprocess: a rejected root must write nothing.
         assert_isolated_git_repo(root)
         self.root = root
-        self.env = git_env_with_ceiling(root)
+        # The real hooks a case installs run a bare `python3` that must import `shared`.
+        self.env = env_resolving_running_interpreter(git_env_with_ceiling(root))
 
     @staticmethod
     def _init_main(tmp_path: Path) -> Path:

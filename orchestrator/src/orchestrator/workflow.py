@@ -323,12 +323,18 @@ VERDICT_TOOLS_MCP_SERVER = 'verdict-tools'
 PER_INVOCATION_MCP_SERVERS = frozenset({PLAN_TOOLS_MCP_SERVER, VERDICT_TOOLS_MCP_SERVER})
 
 
-def _inject_plan_tools_mcp(mcp_config: dict | None, cwd: Path, *, task_root: Path) -> dict:
+def _inject_plan_tools_mcp(
+    mcp_config: dict | None, cwd: Path, role: AgentRole, *, task_root: Path,
+) -> dict:
     """Inject the plan-tools stdio MCP server entry into *mcp_config*.
 
     Creates a minimal ``{'mcpServers': {}}`` skeleton when *mcp_config* is
     ``None``; otherwise preserves all pre-existing server entries and adds
     (or replaces) the ``plan-tools`` key.
+
+    The server exposes only ``role.plan_tools_grants``: dispatches run under
+    ``bypassPermissions``, where ``allowed_tools`` neither hides nor denies a
+    tool, so the grant is enforced by the server registering only these names.
 
     The plan-tools server is launched via the direct-interpreter no-uv hot path
     (task 1776): ``sys.executable -m orchestrator.mcp.plan_tools --worktree <wt>``.
@@ -357,6 +363,7 @@ def _inject_plan_tools_mcp(mcp_config: dict | None, cwd: Path, *, task_root: Pat
     mcp_config.setdefault('mcpServers', {})[PLAN_TOOLS_MCP_SERVER] = plan_tools_mcp_server(
         _ORCH_PROJECT_DIR, cwd, python_executable=sys.executable,
         meta_root=_meta_root_for_worktree(cwd), task_root=task_root,
+        granted_tools=role.plan_tools_grants,
     )
     return mcp_config
 
@@ -441,7 +448,7 @@ def compose_invocation_mcp_config(
     if 'orchestrator' in role.mcp_families and mcp is not None:
         mcp_config = mcp.mcp_config_json(escalation_url=escalation_url)
     if 'plan_tools' in role.mcp_families and cwd:
-        mcp_config = _inject_plan_tools_mcp(mcp_config, cwd, task_root=task_root)
+        mcp_config = _inject_plan_tools_mcp(mcp_config, cwd, role, task_root=task_root)
     if 'verdict_tools' in role.mcp_families and cwd:
         mcp_config = _inject_verdict_tools_mcp(mcp_config, cwd, role, task_root=task_root)
     if strict_mcp_config and not mcp_config:
@@ -12951,12 +12958,14 @@ class TaskWorkflow:
         # case the gate exists for.  Steward mediation (e.g. mutating plan.json
         # to silence the gate) would undermine the safeguard, so skip the L0
         # steward path entirely and submit an L1 immediately.
-        from orchestrator.merge_lane import POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX
+        from orchestrator.merge_lane import (
+            MAIN_HEALTH_RED_REASON_PREFIX,
+            POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX,
+            TRANSIENT_INFRA_REASON_PREFIX,
+        )
         from orchestrator.merge_lane.worker import (
             DROPPED_PLAN_TARGETS_REASON_PREFIX,
-            MAIN_HEALTH_RED_REASON_PREFIX,
             POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
-            TRANSIENT_INFRA_REASON_PREFIX,
         )
         if result.reason.startswith(DROPPED_PLAN_TARGETS_REASON_PREFIX):
             self._write_merge_failure_review('dropped_plan_targets', result.reason)
@@ -16462,19 +16471,23 @@ class TaskWorkflow:
         A fallback arm's has-work heuristic says only that the branch reads as
         merged; main's tip, which those arms used to stamp, is whatever landed
         most recently from ANY task.  This runs ``validate_landing_evidence``
-        in DISCOVERY mode — the shape of the harness dispatch gate's ancestry
-        arm — and returns the task's own attributable, surviving citation.  A
+        in DISCOVERY mode — the legacy citation-plus-effect-present policy,
+        kept here deliberately
+        (``docs/prds/landed-not-done-recovery.effect-present-caller-enumeration.md``
+        §7) — and returns the task's own attributable, surviving citation.  A
         reject, or a validation that raises, is logged and answers None, so
         every guard proceeds with its phase rather than stamping.
         """
+        metadata = self.task.get('metadata') or {}
         try:
             verdict = await validate_landing_evidence(
                 self.git_ops, self.task_id,
                 f'{self.config.git.branch_prefix}{self.task_id}',
                 branch_tip_sha=branch_tip_sha,
                 pattern_template=self.git_ops.config.commit_citation_pattern,
-                delivered_checks=_declared_checks(self.task.get('metadata') or {}),
+                delivered_checks=_declared_checks(metadata),
                 checks_enabled=self.config.delivered_checks.enabled,
+                branch_base_sha=metadata.get('branch_base_sha'),
             )
         except Exception:
             logger.warning(

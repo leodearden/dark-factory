@@ -1714,6 +1714,53 @@ Block M (tests README Delta 9), and by
 The latter feeds the lib a `rendered_prefix` pair, and a pair rendered for
 another prefix must not cite.
 
+### Delta 20 — `lib_live_refs.sh`: references are translated through mount namespaces
+
+**`lib_live_refs.sh` diverges from reify a third time** (after Deltas 15 and
+18). Added by **task 10784**: C11 and decision 16 of
+`plans/canonical-build-path-shared-cache-prd.md`. A process in another mount
+namespace that sees a lane at a bind-mount point names it by that mount point.
+Its cwd, fd and maps paths then never match the lane's own path, so the two host
+passes read a lane in use as free. That verdict gates `rm -rf <lane>/target`
+and `git worktree remove --force`.
+
+- **A third half, `_live_refs_scan_namespaces`.** One batched `stat` over
+  `/proc/[0-9]*/ns/mnt` finds the pids whose namespace differs from ours. For
+  each such namespace, the first pid with a stat-able `/proc/<pid>/root`
+  stands for it. Its `mountinfo` is filtered to the lines whose maj:min is a
+  candidate's device, so nothing else is stat'ed. Each kept mount point counts
+  as an alias only when `stat` through `/proc/<pid>/root` gives the
+  candidate's device and inode. The namespace's processes' cwd/fd targets (the
+  Delta 15 producer) and maps pathnames are rewritten from an alias back to the
+  candidate. Then they go through the same matcher as the cwd/fd pass, now
+  factored out as `_live_refs_match_candidates`.
+- **Placement.** `live_ref_present` runs the half only after both host halves
+  miss, so a live candidate keeps its short-circuit. `live_referenced_paths`
+  runs all three.
+- **Fails open, like every other unreadable entry.** If our own namespace
+  cannot be identified, the half adds nothing. A namespace none of whose roots
+  can be stat'ed is skipped and never counted as a reference (critique B5): a
+  fail-closed rule would read every browser sandbox as a lane reference.
+- **Footprint.** The half lists no directory but `/proc` and
+  `/proc/<pid>/fd`; it reads `ns/mnt`, `mountinfo`, `maps` and paths under
+  `root` without listing them. All of its awk is POSIX, since the laptop may
+  run mawk.
+- **Not measured on btrfs.** This copy and
+  `shared/src/shared/proc_group.py` keep only the mountinfo lines whose
+  maj:min is the candidate's `st_dev`, and confirm by inode only after that.
+  On btrfs, `stat` may report a per-subvolume anonymous `st_dev` that differs
+  from the maj:min in mountinfo. If it does, no alias survives and the half
+  adds nothing: it fails open, which is how this lib behaved before this delta.
+  The rule was measured only on this host's ext4 (259:6), and the laptop's
+  filesystem is not recorded.
+
+reify's copy gets the same rule from reify-side task δ of that PRD. A re-sync of
+this file must re-apply this hunk along with Deltas 15 and 18.
+
+**Pinned by:** `orchestrator/tests/test_live_refs_lib.py` —
+`TestMountNamespaceTranslation` for the verdicts, `TestScanFootprint` for what
+a negative verdict may list.
+
 ## Sibling-seed defaults, and who resolves them
 
 Two of the relocated scripts default their `--seed-script` to a **sibling**

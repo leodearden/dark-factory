@@ -88,8 +88,8 @@ if str(_ORCH_SRC) not in sys.path:
 if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import codebook as codebook_mod  # noqa: E402
 import yaml  # noqa: E402
+from legibility import codebook as codebook_mod  # noqa: E402  # debt: task 6760
 from legibility import invariants, session_runner  # noqa: E402
 from orchestrator.agents import code_quality  # noqa: E402
 from shared.cap_markers import looks_like_blocking_banner  # noqa: E402

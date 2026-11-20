@@ -153,10 +153,9 @@ and `next_halving_state` are retired. (D6 as first ruled, a suspect list searche
 tip verdicts of the rounds the policy sized, p̂ = pass_rate^(1/mean k). A round the policy did not size (a
 marked task's verify alone, a dispatch that may not chain, the kill switch) is not counted, by the live fold
 or by the start-up seed. An empty window, including after a seed that failed, has no p̂ and takes the table's
-first row (`chain_depth_reason.basis` `no_estimate`). Depth table: 8 if p̂ ≥ 0.93, 4 if
+first row (`chain_depth_reason.basis` `no_estimate`). Depth table, as first ruled: 8 if p̂ ≥ 0.93, 4 if
 ≥ 0.85, 2 if ≥ 0.75, else 1; capped only by queue depth. The table is a config list
-(`merge_deep.depth_table: [[0.93, 8], [0.85, 4], [0.75, 2]]`, green-tier) so the readout (leaf ι) can extend
-it past 8 once the per-item chain wall is measured at depth ≥ 8 (today measured only at k ≤ 2). The first
+(`merge_deep.depth_table`, green-tier) so the readout (leaf ι) can move its rows. The first
 row's depth may exceed `chain_cap`: `chain_cap` becomes the kill switch only (0 = off; any positive value =
 on), documented as such; 3191 ("promote chain_cap 6 → 32") is cancelled by decompose, 3190's canary
 predicate stays (it reads gates per landing and chain-attributed reds, both still meaningful).
@@ -164,6 +163,34 @@ predicate stays (it reads gates per landing and chain-attributed reds, both stil
 duration against the merge wall, move into ι's readout, task 8532; human gate 7860 now waits on 8532.)
 `chain_depth_reason` on `merge_verify` records p̂, the row chosen and the queue depth; it is null when the
 policy did not size the round.
+
+*Amended 2026-11-19, Leo's instruction (task 10920): the table is retuned for the mark.* The first table was
+tuned on the bisect model, which D6 no longer ships. With every member of a red chain verifying alone, a chain
+of k costs one verify, plus k more when it is red: **1/k + (1 − p^k) verifies per item** at per-item pass rate
+p. Each row now sits at the pass rate where its depth starts to cost less than the depth below it:
+
+| p̂ at least | 0.992 | 0.990 | 0.988 | 0.984 | 0.979 | 0.972 | 0.959 | 0.934 | 0.876 | 0.75 | below |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| depth | 12 | 11 | 10 | 9 | 8 | 7 | 6 | 5 | 4 | 3 | 1 |
+
+- Depth 2 has no row: under this cost depth 3 is cheaper than depth 2 at every pass rate.
+- Depth 3 starts at 0.75, above the formula's break-even with no chain (0.693). The formula leaves out
+  results discarded behind a red entry and re-verifies after main moves, and both cost a chain more than
+  a single item.
+- The top row is 12. A 30-verdict window of clean 12-chains bounds the per-item failure rate near 1%, which
+  supports depth 9 to 12 and no more. Rows 7 to 12 also assume a verify takes no longer at that depth; that
+  was measured flat only up to depth 6 (2026-11-18), so the readout (leaf ι, task 8532) checks it.
+- An empty window still takes the first row, which is now depth 12 where it was 8. If the start-up seed
+  fails while the true pass rate is low, the first chain is likely red and its 12 members each verify alone;
+  the estimate then corrects itself. Accepted: the seed normally fills the window.
+- The formula assumes failures are independent. Where they cluster, the estimate falls and the table backs
+  off by itself.
+- On 2026-11-19 the live estimate on dark-factory was 0.89 to 0.90: depth 4 under both tables.
+- Every project with chains on takes this table at its next restart unless its yaml sets its own. reify has
+  `chain_cap: 6` and no table of its own, so it moves too.
+
+`orchestrator/tests/test_config_merge_deep.py` derives the thresholds from the formula, so a row cannot
+drift from it unnoticed.
 
 **D8. Direct commits meet the merge gate's checks before they land.** `hooks/project-checks` (main-only
 tier) gains two legs: (a) for every staged file, the per-module `lint_command` and `type_check` of the module

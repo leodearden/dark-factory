@@ -292,6 +292,109 @@ def test_a_failure_line_never_carries_the_words_of_the_exception() -> None:
     ]
 
 
+PROXY_KEY = 'cpa-' + 'k' * 44
+
+
+class FakeClaudeProxy(BaseHTTPRequestHandler):
+    status: int
+    authorizations: list[str]
+
+    def do_POST(self) -> None:
+        self.rfile.read(int(self.headers.get('Content-Length', '0')))
+        self.authorizations.append(self.headers.get('Authorization', ''))
+        self.send_response(self.status)
+        self.send_header('Content-Type', 'application/json')
+        self.end_headers()
+        self.wfile.write(b'{}')
+
+    def log_message(self, format: str, *args: object) -> None:
+        pass
+
+
+@contextmanager
+def fake_claude_proxy(status: int) -> Iterator[tuple[str, list[str]]]:
+    """A proxy answering every request with *status*; yields its URL and the Authorization headers it saw."""
+    seen: list[str] = []
+    handler = type('Handler', (FakeClaudeProxy,), {'status': status, 'authorizations': seen})
+    server = ThreadingHTTPServer(('127.0.0.1', 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f'http://127.0.0.1:{server.server_address[1]}', seen
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def home_with_proxy_client_file(tmp_path: Path, text: str | None) -> dict[str, str]:
+    """An env whose HOME holds *text* as the proxy client file (none when *text* is None)."""
+    home = tmp_path / 'home'
+    client_file = home / '.config' / 'cliproxyapi' / 'client.env'
+    client_file.parent.mkdir(parents=True)
+    if text is not None:
+        client_file.write_text(text, encoding='utf-8')
+    return {'HOME': str(home)}
+
+
+def proxy_client_file(url: str) -> str:
+    return f'export ANTHROPIC_BASE_URL={url}\nexport ANTHROPIC_AUTH_TOKEN={PROXY_KEY}\n'
+
+
+def test_a_proxy_that_answers_passes_and_was_asked_with_its_client_key(lease_dir: Path, tmp_path: Path) -> None:
+    with fake_claude_proxy(200) as (url, authorizations):
+        env = home_with_proxy_client_file(tmp_path, proxy_client_file(url))
+        result = run_probe('claude-proxy', lease_dir=lease_dir, env=env)
+
+    assert (result.returncode, result.stdout) == (0, ''), result.stderr
+    assert authorizations == [f'Bearer {PROXY_KEY}']
+
+
+def test_an_unreachable_proxy_is_an_outage_naming_the_proxy(lease_dir: Path, tmp_path: Path) -> None:
+    with refused_port() as port:
+        env = home_with_proxy_client_file(tmp_path, proxy_client_file(f'http://127.0.0.1:{port}'))
+        result = run_probe('claude-proxy', lease_dir=lease_dir, env=env)
+
+    assert_names_dependency(result, 'claude-proxy: complete: ConnectError')
+    assert PROXY_KEY not in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize('status', [401, 429, 503])
+def test_a_proxy_that_cannot_serve_is_an_outage(lease_dir: Path, tmp_path: Path, status: int) -> None:
+    with fake_claude_proxy(status) as (url, _):
+        env = home_with_proxy_client_file(tmp_path, proxy_client_file(url))
+        result = run_probe('claude-proxy', lease_dir=lease_dir, env=env)
+
+    assert_names_dependency(result, f'claude-proxy: complete: HTTP {status}')
+    assert PROXY_KEY not in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize('status', [400, 404])
+def test_a_proxy_refusing_the_probes_own_request_is_a_broken_probe(
+    lease_dir: Path, tmp_path: Path, status: int,
+) -> None:
+    with fake_claude_proxy(status) as (url, _):
+        env = home_with_proxy_client_file(tmp_path, proxy_client_file(url))
+        result = run_probe('claude-proxy', lease_dir=lease_dir, env=env)
+
+    assert result.returncode not in (0, OUTAGE_EXIT_STATUS), result.stderr
+    assert result.stdout == ''
+    assert f'HTTP {status}' in result.stderr
+
+
+def test_a_host_without_a_proxy_passes_the_proxy_check(lease_dir: Path, tmp_path: Path) -> None:
+    result = run_probe('claude-proxy', lease_dir=lease_dir, env=home_with_proxy_client_file(tmp_path, None))
+
+    assert (result.returncode, result.stdout) == (0, ''), result.stderr
+
+
+def test_a_proxy_client_file_without_a_key_is_an_outage(lease_dir: Path, tmp_path: Path) -> None:
+    env = home_with_proxy_client_file(tmp_path, 'export ANTHROPIC_BASE_URL=http://127.0.0.1:8317\n')
+    result = run_probe('claude-proxy', lease_dir=lease_dir, env=env)
+
+    assert_names_dependency(result, 'claude-proxy: read client file: ProxyClientFileInvalid')
+
+
 def test_an_unconfigured_dependency_is_named_with_a_fixed_reason() -> None:
     probe = load_script_module(SCRIPT, 'lane_dependency_probe_under_test')
     error = probe.NotConfigured(probe.NotConfiguredReason.NO_PROVIDER_OR_KEY)
