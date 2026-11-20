@@ -141,10 +141,11 @@ _OWNER_ONLY_SESSION_START_SOURCES = frozenset({'clear', 'compact'})
 """SessionStart ``source`` values only a process already holding a session can emit.
 
 ``/clear`` and compaction re-mint ``session_id`` in place. Membership is
-necessary but not sufficient to forgive a re-mint: ``_env_slug_ownership``
-also requires the event's owning claude pid to equal the record's
-``claude_owner_pid``. ``'resume'`` is excluded because a new nested process
-reports it too. See ``docs/session-hook-ownership.md`` §Session-id re-mints.
+necessary but not sufficient to forgive a re-mint: the event's owning claude
+pid must also match the record's ``claude_owner_pid``, as judged by
+``_owner_pid_verdict``, which never forgives under a shared ``claude agents``
+host. ``'resume'`` is excluded because a new nested process reports it too.
+See ``docs/session-hook-ownership.md`` §Session-id re-mints.
 """
 
 
@@ -240,8 +241,8 @@ def _env_slug_ownership(
       need not read again. None only when nothing was read.
 
     Fail-soft: every unresolvable probe adopts, never forks. *allow_remint*
-    (SessionStart only) forgives a mismatch from an owner-only ``source`` when
-    the owning claude pid matches the record's ``claude_owner_pid``. *probes*
+    (SessionStart only) forgives a mismatch from an owner-only ``source``
+    unless ``_owner_pid_verdict`` refutes the owner. *probes*
     is this event's ``EventProbes``. See ``docs/session-hook-ownership.md``
     §Owner or inheritor and §Fail-soft direction.
     """
@@ -271,12 +272,8 @@ def _env_slug_ownership(
         # Forked onto the hand-launched keying, whose slug embeds this very
         # session_id: binding there is tautological, never a capture.
         return False, True, snapshot
-    owner_pid = record.claude_owner_pid
-    current_pid = probes.owning_claude_pid()
-    if owner_pid is None or current_pid is None:
-        # Unprovable, not disproved: adopt.
-        return True, True, snapshot
-    return owner_pid == current_pid, True, snapshot
+    # An unprovable owner (None) is not disproved: adopt.
+    return _owner_pid_verdict(record, probes) is not False, True, snapshot
 
 
 @dataclass(frozen=True)
@@ -359,14 +356,14 @@ def _adopt_t3_thread_slug(
     """Adopt *slug*, the record this event's T3 thread pointer names, unless the event is not its owner.
 
     A T3 thread carries no ``CLAUDE_SPAWN_OWNER_PPID``, so the claude pids
-    decide. Unbound: the thread's first claude binds, as does the recorded
-    owner pid or any event once the recorded owner is judged DEAD; an event
-    whose pid is unresolvable adopts without binding. Bound to this event's
-    session id: adopted as ``session_id_keyed``, so a dead owner is
-    reclaimed. Bound to another
-    session id: the owner-only re-mint rule of ``_env_slug_ownership``, or,
-    on SessionStart (*allow_remint*), a recorded owner judged DEAD re-binds.
-    A nested claude always has a live owner, so it forks. See
+    decide (``_owner_pid_verdict``). Unbound: the thread's first claude binds,
+    as does the recorded owner pid or any event once the recorded owner is
+    judged DEAD; an event whose pid is unresolvable adopts without binding.
+    Bound to this event's session id: adopted as ``session_id_keyed``, so a
+    dead owner is reclaimed. Bound to another session id: the owner-only
+    re-mint rule of ``_env_slug_ownership``, or, on SessionStart
+    (*allow_remint*), a recorded owner judged DEAD re-binds. A nested claude
+    always has a live owner, so it forks. See
     ``docs/session-hook-ownership.md`` §Owner or inheritor.
     """
     snapshot = _read_record_snapshot(slug, root)
@@ -376,7 +373,11 @@ def _adopt_t3_thread_slug(
     owner_pid, current_pid = record.claude_owner_pid, probes.owning_claude_pid()
     bound = (record.claude_session_id or '').strip()
     if not bound:
-        if owner_pid is None or owner_pid == current_pid or _recorded_owner_is_dead(record):
+        if (
+            owner_pid is None
+            or _owner_pid_verdict(record, probes) is True
+            or _recorded_owner_is_dead(record)
+        ):
             return _HookSlugResolution(slug, None, True, snapshot)
         if current_pid is None:
             return _HookSlugResolution(slug, None, False, snapshot)
@@ -386,7 +387,7 @@ def _adopt_t3_thread_slug(
     if (
         allow_remint
         and _is_owner_only_session_start(hook_input)
-        and (owner_pid is None or current_pid is None or owner_pid == current_pid)
+        and _owner_pid_verdict(record, probes) is not False
     ):
         return _HookSlugResolution(slug, None, True, snapshot)
     if allow_remint and _recorded_owner_is_dead(record):
@@ -641,6 +642,22 @@ def _reclaim_dead_owner_pid(record: session_records.SessionRecord, probes: Event
         return False
     _stamp_owner(record, pid)
     return True
+
+
+def _owner_pid_verdict(record: session_records.SessionRecord, probes: EventProbes) -> bool | None:
+    """Does this event's claude pid prove it is *record*'s bound owner process?
+
+    False when ``probes.owner_is_shared_host()``: every session a ``claude
+    agents`` host runs shares its pid. None when ``record.claude_owner_pid``
+    or ``probes.owning_claude_pid()`` is None: unprovable, so callers adopt.
+    Otherwise whether the two pids are equal.
+    """
+    if probes.owner_is_shared_host():
+        return False
+    owner, current = record.claude_owner_pid, probes.owning_claude_pid()
+    if owner is None or current is None:
+        return None
+    return owner == current
 
 
 def _recorded_owner_is_dead(record: session_records.SessionRecord) -> bool:
