@@ -2407,3 +2407,72 @@ class TestQuarantineInterruptedOperation:
         worktree = make_worktree(tmp_path, monkeypatch)
 
         assert rebase_recovery.quarantine_interrupted_operation(worktree) is None
+
+
+def _move_branch_to_a_new_commit(repo: Path, branch: str) -> str:
+    """Advance *branch* by one commit without touching any worktree."""
+    moved = _git_ok(
+        repo, 'commit-tree', f'{branch}^{{tree}}', '-p', branch, '-m', 'moved on',
+    ).strip()
+    _git_ok(repo, 'update-ref', f'refs/heads/{branch}', moved)
+    return moved
+
+
+@pytest.mark.asyncio
+class TestRebaseOntoMainNeverAbortsARebaseItDidNotStart:
+    """An abort resets the rebase's head-name to orig-head and checks it out.
+
+    That is the right undo for a rebase this call started, and the incident's
+    damage for one it did not: on reify's _lane-20, task/10089's resume aborted
+    task/9844's abandoned rebase, which reset task/9844 to its orig-head.
+    """
+
+    async def test_a_stale_rebase_under_an_attached_head_is_moved_aside(
+        self, tmp_path: Path,
+    ) -> None:
+        repo, linked, _ = build_linked_mid_rebase_worktree(tmp_path)
+        moved = _move_branch_to_a_new_commit(repo, 'feature')
+        _git_ok(linked, 'checkout', '-f', '-b', 'victim', 'main')
+        (linked / 'victim.txt').write_text('victim work\n')
+        _git_ok(linked, 'add', 'victim.txt')
+        _git_ok(linked, 'commit', '-qm', 'victim work')
+        ops = _make_git_ops(repo)
+
+        with _guard_spy() as recorded:
+            landed = await ops.rebase_onto_main(linked)
+
+        assert landed is True
+        assert _git_ok(repo, 'rev-parse', 'refs/heads/feature').strip() == moved
+        assert _git_ok(linked, 'symbolic-ref', 'HEAD').strip() == 'refs/heads/victim'
+        assert _git(linked, 'merge-base', '--is-ancestor', 'main', 'victim').returncode == 0
+        rebase_state = Path(
+            _git_ok(linked, 'rev-parse', '--path-format=absolute',
+                    '--git-path', 'rebase-merge').strip(),
+        )
+        assert not rebase_state.exists()
+        assert list(_operation_specimens_dir(repo).iterdir())
+        assert recorded == []
+
+    async def test_a_rebase_still_owning_a_detached_head_is_refused_not_aborted(
+        self, tmp_path: Path,
+    ) -> None:
+        repo, linked, _ = build_linked_mid_rebase_worktree(tmp_path)
+        feature_before = _git_ok(repo, 'rev-parse', 'refs/heads/feature')
+        ops = _make_git_ops(repo)
+
+        with _guard_spy() as recorded:
+            landed = await ops.rebase_onto_main(linked)
+
+        assert landed is False
+        assert recorded == []
+        assert (repo / '.git' / 'worktrees' / 'linked' / 'rebase-merge').is_dir()
+        assert _git_ok(repo, 'rev-parse', 'refs/heads/feature') == feature_before
+
+    async def test_a_clean_worktree_has_no_prior_rebase(
+        self, tmp_path: Path,
+    ) -> None:
+        _, linked = _build_clean_linked_worktree(tmp_path)
+
+        assert rebase_recovery.quarantine_stale_rebase(linked) is (
+            rebase_recovery.PriorRebase.NONE
+        )
