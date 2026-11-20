@@ -16,6 +16,13 @@ from pydantic_settings import (
 from shared.config_models import UsageCapConfig
 
 from fused_memory.config.checkout_anchor import anchor_at_checkout
+from fused_memory.config.overlay import (
+    OVERLAY_ENV_VAR,
+    PROVENANCE_FIELD,
+    ConfigOverlayProvenance,
+    load_overlay,
+    merge_overlay,
+)
 from fused_memory.config.retired_keys import drop_retired_keys
 
 # The ONE topic-slug namespace (task 3198, PRD D4). Imported from the
@@ -102,6 +109,15 @@ class YamlSettingsSource(PydanticBaseSettingsSource):
         return (None, field_name, False)
 
     def __call__(self) -> dict[str, Any]:
+        base = self._load_base()
+        overlay = load_overlay(os.environ, self.settings_cls)
+        if overlay is None:
+            return base
+        merged = merge_overlay(base, self._expand(overlay.data, overlay.provenance.path))
+        merged[PROVENANCE_FIELD] = overlay.provenance.model_dump()
+        return merged
+
+    def _load_base(self) -> dict[str, Any]:
         if not self.config_path.exists():
             return {}
         try:
@@ -109,12 +125,42 @@ class YamlSettingsSource(PydanticBaseSettingsSource):
                 raw_config = yaml.safe_load(f) or {}
         except (yaml.YAMLError, OSError) as e:
             raise RuntimeError(f'Failed to load configuration from {self.config_path}: {e}') from e
+        if isinstance(raw_config, dict) and PROVENANCE_FIELD in raw_config:
+            raise _provenance_forged(str(self.config_path))
+        return self._expand(raw_config, self.config_path)
+
+    def _expand(self, raw_config: Any, source: Path | str) -> Any:
         try:
             return self._expand_env_vars(raw_config)
         except Exception as e:
             raise RuntimeError(
-                f'Failed to expand environment variables in {self.config_path}: {e}'
+                f'Failed to expand environment variables in {source}: {e}'
             ) from e
+
+
+def _provenance_forged(source: str) -> RuntimeError:
+    return RuntimeError(
+        f'{source} sets the reserved key {PROVENANCE_FIELD!r}. Only the loader writes '
+        f'it, from the overlay {OVERLAY_ENV_VAR} names; remove it from {source}.'
+    )
+
+
+class _ProvenanceRefusingSource(PydanticBaseSettingsSource):
+    """``inner``'s values, refused whole if they set the loader-only provenance field."""
+
+    def __init__(self, inner: PydanticBaseSettingsSource, source: str) -> None:
+        super().__init__(inner.settings_cls)
+        self._inner = inner
+        self._source = source
+
+    def get_field_value(self, field: FieldInfo, field_name: str) -> tuple[Any, str, bool]:
+        return self._inner.get_field_value(field, field_name)
+
+    def __call__(self) -> dict[str, Any]:
+        values = self._inner()
+        if PROVENANCE_FIELD in values:
+            raise _provenance_forged(self._source)
+        return values
 
 
 # --- Shared leaf normalisers ---
@@ -3880,6 +3926,14 @@ class FusedMemoryConfig(BaseSettings):
     # Curator's usage-gate pool; independent from ``reconciliation.usage_cap``
     # because each UsageGate instance tracks cap state per-process / per-loop.
     usage_cap: UsageCapConfig | None = Field(default_factory=_default_curator_usage_cap)
+    config_overlay: ConfigOverlayProvenance | None = Field(
+        default=None,
+        description=(
+            'Provenance of the config overlay merged over the base file, or None '
+            'when no overlay is active. Set by the loader only: a config file or '
+            'environment variable setting it is refused. See fused_memory/config/overlay.py.'
+        ),
+    )
 
     @model_validator(mode='after')
     def _validate_socket_timeout_outlasts_backend_budgets(self) -> 'FusedMemoryConfig':
@@ -3917,4 +3971,11 @@ class FusedMemoryConfig(BaseSettings):
     ) -> tuple[PydanticBaseSettingsSource, ...]:
         config_path = Path(os.environ.get('CONFIG_PATH', DEFAULT_CONFIG_PATH))
         yaml_settings = YamlSettingsSource(settings_cls, config_path)
-        return (init_settings, env_settings, yaml_settings, dotenv_settings)
+        return (
+            init_settings,
+            _ProvenanceRefusingSource(
+                env_settings, f'the environment ({PROVENANCE_FIELD.upper()}*)',
+            ),
+            yaml_settings,
+            _ProvenanceRefusingSource(dotenv_settings, 'the dotenv file'),
+        )
