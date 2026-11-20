@@ -10,6 +10,9 @@ contract:
   coarse resolver *tier* (human / cascade / auto-watcher / steward /
   reaper-sweep / unknown / other-auto). Used both for analytics grouping and
   to derive the per-path benign default (see ``default_resolution_class_for_resolver``).
+- ``resolver_tier`` — maps a closed record to its tier in ``RESOLVER_TIERS``,
+  splitting the human tier by the record's ``ruled_by_human`` flag into
+  human-ruled and attended-seat (plans/instruments-honesty-prd.md decision 10).
 - ``effective_benign`` — the stamp-first-with-proxy-fallback predicate that
   turns a resolved/dismissed ``Escalation`` record into a
   ``(class, provenance)`` pair, so aggregators can report the stamped-vs-
@@ -81,6 +84,27 @@ def classify_resolver_tier(resolved_by: str | None) -> str:
     if resolved_by in _REAPER_SWEEP_RESOLVERS:
         return 'reaper-sweep'
     return 'other-auto'
+
+
+# The record-tier vocabulary resolver_tier returns, in display order. The
+# dashboard's frontend tier whitelists mirror this tuple.
+RESOLVER_TIERS: tuple[str, ...] = (
+    'human-ruled', 'attended-seat', 'cascade', 'auto-watcher', 'steward',
+    'reaper-sweep', 'unknown', 'other-auto',
+)
+
+
+def resolver_tier(record: Escalation) -> str:
+    """The resolver tier of *record*: a human ruling first, then the seat that closed it.
+
+    A cascade member that inherited ``ruled_by_human=True`` is human-ruled, not
+    cascade: a ruling on a cluster is a ruling on each member.
+    """
+    if record.ruled_by_human is True:
+        return 'human-ruled'
+    if record.resolved_by in _HUMAN_RESOLVERS:
+        return 'attended-seat'
+    return classify_resolver_tier(record.resolved_by)
 
 
 def effective_benign(record: Escalation) -> tuple[str | None, str]:
