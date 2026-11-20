@@ -312,7 +312,10 @@ log-mode-first behind a soak, and only after the producer fixes land**
    removal) must not run the cancellation cleanup that unhalts today;
    halt rehydration matches on category at level ≥ 1 (promotion must not
    change rehydration identity), and recovery never re-files a sibling
-   halt-category record.
+   halt-category record. Across a restart the halt is re-asserted only
+   while its project_root predicate measures true or cannot be measured; a
+   record measured clean is stamped released and never re-owns a halt
+   (task 3876; see `OPERATIONS.md` §"Merge-halt semantics").
 
 ## 8. Divergence register (code vs this spec, 2026-08-02)
 
