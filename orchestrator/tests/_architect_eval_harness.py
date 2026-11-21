@@ -6,18 +6,50 @@ Also holds the canned task, prompt and agent-result inputs those files feed it.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from _campaign_gate_helpers import NO_INJECTED_GATE
+from shared.cli_invoke import AgentResult
+from shared.config_models import UsageCapConfig
 
+from orchestrator.agents.briefing import BriefingAssembler
+from orchestrator.evals import eval_gate, runner
+from orchestrator.evals.architect_eval import ArchitectEvalDeps
 from orchestrator.evals.judge import PlanQualityVerdict
 from orchestrator.evals.measurement import Scored
+from orchestrator.evals.metrics import DECLINE_READERS
+from orchestrator.evals.replay_frame import build_replay_frame_block
 from orchestrator.evals.results import ResultStore
 
+DEFAULT_JUDGE_PLAN_QUALITY = 0.77
+"""The score the hermetic judge returns when a test supplies no verdict of its own."""
 
-def arch_task() -> dict:
+
+@dataclasses.dataclass(frozen=True)
+class ArchInvokeUsage:
+    """What one architect invoke reports spending, as ``AgentResult`` names it."""
+
+    cost_usd: float
+    duration_ms: int
+    input_tokens: int
+    output_tokens: int
+    cache_read_tokens: int
+    cache_create_tokens: int
+    turns: int
+
+
+DEFAULT_ARCH_INVOKE = ArchInvokeUsage(
+    cost_usd=1.23, duration_ms=4567,
+    input_tokens=12_000, output_tokens=3_000,
+    cache_read_tokens=48_000, cache_create_tokens=6_000, turns=9,
+)
+"""The usage the hermetic architect invoke reports when a test supplies no result of its own."""
+
+
+def _arch_task() -> dict:
     return {
         'id': 'df_task_2605',
         'name': 'implement the widget',
@@ -29,22 +61,20 @@ def arch_task() -> dict:
 
 
 def arch_task_no_reference() -> dict:
-    """``arch_task()`` minus the ``reference`` key.
+    """``_arch_task()`` minus the ``reference`` key.
 
     The shape the three back-filled fixtures had before task 3628 — a
     top-level ``post_task_commit`` with no ``reference`` block — which
     ``run_architect_eval`` reduces to an EMPTY reference diff.
     """
-    task = arch_task()
+    task = _arch_task()
     task.pop('reference', None)
     return task
 
 
 def architect_prompt_sent() -> str:
     """What the hermetic architect receives: the stubbed production briefing plus the replay frame."""
-    from orchestrator.evals.replay_frame import build_replay_frame_block
-
-    return 'ARCH PROMPT' + build_replay_frame_block(arch_task()['pre_task_commit'])
+    return 'ARCH PROMPT' + build_replay_frame_block(_arch_task()['pre_task_commit'])
 
 
 async def run_architect_eval_hermetic(
@@ -187,22 +217,16 @@ async def run_architect_eval_hermetic(
     store, so a cell the real producer wrote can be loaded back from disk;
     ``mocks['save']`` is then that store's bound ``save``.
     """
-    from shared.config_models import UsageCapConfig
-
-    from orchestrator.agents.briefing import BriefingAssembler
-    from orchestrator.evals import eval_gate, runner
-    from orchestrator.evals.architect_eval import ArchitectEvalDeps
-
     if judge_return is None and judge_side_effect is None:
         judge_return = Scored(
-            PlanQualityVerdict(plan_quality=0.77, per_criterion={}, reasoning='good'),
+            PlanQualityVerdict(
+                plan_quality=DEFAULT_JUDGE_PLAN_QUALITY, per_criterion={}, reasoning='good',
+            ),
             cost_usd=0.0,
         )
 
     invoke_return = arch_result if arch_result is not None else MagicMock(
-        success=arch_success, cost_usd=1.23, duration_ms=4567, output='done',
-        input_tokens=12_000, output_tokens=3_000,
-        cache_read_tokens=48_000, cache_create_tokens=6_000, turns=9,
+        success=arch_success, output='done', **dataclasses.asdict(DEFAULT_ARCH_INVOKE),
     )
     mock_invoke = AsyncMock(return_value=invoke_return, side_effect=invoke_side_effect)
 
@@ -214,8 +238,6 @@ async def run_architect_eval_hermetic(
     # mapping is taken from PRODUCTION rather than re-derived as
     # ``f'read_{kind}'``, which is wrong for ``unactionable``
     # (``read_unactionable_task``) and would silently stop pinning that kind.
-    from orchestrator.evals.metrics import DECLINE_READERS
-
     for _reader in DECLINE_READERS.values():
         getattr(artifacts_instance, _reader).return_value = None
     for _kind, _artifact in (declines or {}).items():
@@ -252,7 +274,7 @@ async def run_architect_eval_hermetic(
     # ``timeout_minutes`` rides in on the TASK dict (where it is untyped data)
     # rather than the ``timeout_override: int | None`` parameter, so a test can
     # ask for a sub-minute bound without lying to pyright about that signature.
-    _task_def = arch_task() if task_override is None else task_override
+    _task_def = _arch_task() if task_override is None else task_override
     if task_timeout_minutes is not None:
         _task_def['timeout_minutes'] = task_timeout_minutes
 
@@ -321,20 +343,20 @@ def only_record(metrics: dict) -> dict:
     return records[0]
 
 
-def token_agent_result(input_tokens, output_tokens, *, cost_usd: float = 1.23):
+def token_agent_result(
+    input_tokens, output_tokens, *, cost_usd: float = DEFAULT_ARCH_INVOKE.cost_usd,
+):
     """A REAL ``AgentResult`` carrying explicit token counts.
 
     Real, not a MagicMock, because the ``int | None`` "provider did not report"
     shape is exactly what the token-usage tests pin — a MagicMock cannot express a
     genuine ``None`` on an attribute the runner reads.
     """
-    from shared.cli_invoke import AgentResult
-
     return AgentResult(
         success=True,
         output='done',
         cost_usd=cost_usd,
-        duration_ms=4567,
+        duration_ms=DEFAULT_ARCH_INVOKE.duration_ms,
         turns=3,
         input_tokens=input_tokens,
         output_tokens=output_tokens,

@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _architect_eval_harness import (
+    DEFAULT_JUDGE_PLAN_QUALITY,
     architect_prompt_sent,
     only_record,
     run_architect_eval_hermetic,
@@ -74,7 +75,7 @@ class TestArchitectEvalUsageGate:
         # …and the cell is otherwise untouched: still one architect invoke,
         # still judged, still a non-sentinel score.
         assert mocks['invoke'].call_count == 1
-        assert result.metrics['plan_quality'] == 0.77
+        assert result.metrics['plan_quality'] == DEFAULT_JUDGE_PLAN_QUALITY
         assert result.metrics['cap_tainted'] is False
         assert result.outcome == 'done'
 
@@ -94,7 +95,7 @@ class TestArchitectEvalUsageGate:
         assert not gate_factory.called
         # Byte-equivalent to the pre-φ cell.
         assert mocks['invoke'].call_count == 1
-        assert result.metrics['plan_quality'] == 0.77
+        assert result.metrics['plan_quality'] == DEFAULT_JUDGE_PLAN_QUALITY
         assert result.metrics['cap_tainted'] is False
         assert result.outcome == 'done'
 
@@ -118,7 +119,7 @@ class TestArchitectEvalUsageGate:
 
         # Fully scored cell, not a crash and not an exclusion.
         assert isinstance(result.metrics['plan_quality'], float)
-        assert result.metrics['plan_quality'] == 0.77
+        assert result.metrics['plan_quality'] == DEFAULT_JUDGE_PLAN_QUALITY
         assert result.outcome == 'done'
         assert result.metrics['cap_tainted'] is False
         assert mocks['invoke'].call_count == 1
@@ -204,7 +205,7 @@ class TestArchitectEvalCapFailover:
         assert result.metrics['cap_tainted'] is False
         assert result.metrics['invocation_errors'] is None
         assert result.outcome == 'done'
-        assert result.metrics['plan_quality'] == 0.77
+        assert result.metrics['plan_quality'] == DEFAULT_JUDGE_PLAN_QUALITY
         assert result.metrics['plan_steps'] == 4
 
         # (d) The architect is still invoked with EXACTLY today's kwargs — the
@@ -582,7 +583,7 @@ class TestArchitectEvalZeroAccountGate:
         assert result.outcome == 'done'
         assert result.metrics['cap_tainted'] is False
         assert result.metrics['invocation_errors'] is None
-        assert result.metrics['plan_quality'] == 0.77
+        assert result.metrics['plan_quality'] == DEFAULT_JUDGE_PLAN_QUALITY
 
     async def test_the_empty_gate_is_never_dispatched_through(self):
         """The degrade happens at BUILD time, not by catching the refusal.
@@ -681,7 +682,7 @@ class TestArchitectEvalGateLifecycle:
         )
 
         assert result.outcome == 'done'
-        assert result.metrics['plan_quality'] == 0.77
+        assert result.metrics['plan_quality'] == DEFAULT_JUDGE_PLAN_QUALITY
         assert result.metrics['cap_tainted'] is False
         assert 'shutdown failed' in caplog.text
 
@@ -1033,7 +1034,7 @@ class TestArchitectEvalCapResume:
         assert result.outcome == 'done'
         assert result.metrics['cap_tainted'] is False
         assert result.metrics['invocation_errors'] is None
-        assert result.metrics['plan_quality'] == 0.77
+        assert result.metrics['plan_quality'] == DEFAULT_JUDGE_PLAN_QUALITY
         assert result.metrics['cost_usd'] == pytest.approx(0.9 + 1.23)
 
     async def test_a_sessionless_cap_still_retries_fresh_with_the_real_prompt(self):

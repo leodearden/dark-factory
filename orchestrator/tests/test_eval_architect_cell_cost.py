@@ -10,6 +10,7 @@ import logging
 
 import pytest
 from _architect_eval_harness import (
+    DEFAULT_ARCH_INVOKE,
     PROXY_ENV,
     run_architect_eval_hermetic,
     token_agent_result,
@@ -55,16 +56,16 @@ class TestArchitectCellRecordsJudgeSpend:
         # The RETURNED result...
         assert result.metrics['judge_cost_usd'] == pytest.approx(0.42)
         assert result.metrics['judge_invocations'] == 1
-        # ...the SUBSET invariant: architect spend (1.23, the harness default)
+        # ...the SUBSET invariant: architect spend (the harness default)
         # PLUS the judge spend, never the architect spend alone.
-        assert result.metrics['cost_usd'] == pytest.approx(1.23 + 0.42)
+        assert result.metrics['cost_usd'] == pytest.approx(DEFAULT_ARCH_INVOKE.cost_usd + 0.42)
 
         # ...and what was actually PERSISTED through the store, not just what
         # the function happens to return.
         persisted = mocks['save'].call_args.args[0].metrics
         assert persisted['judge_cost_usd'] == pytest.approx(0.42)
         assert persisted['judge_invocations'] == 1
-        assert persisted['cost_usd'] == pytest.approx(1.23 + 0.42)
+        assert persisted['cost_usd'] == pytest.approx(DEFAULT_ARCH_INVOKE.cost_usd + 0.42)
 
 
 @pytest.mark.asyncio
@@ -139,17 +140,17 @@ class TestArchitectCellStampsTokenUsageAndProxySignal:
         )
 
         persisted = mocks['save'].call_args.args[0].metrics
-        assert persisted['cache_read_tokens'] == 48_000
-        assert persisted['cache_create_tokens'] == 6_000
-        assert persisted['turns_used'] == 9
+        assert persisted['cache_read_tokens'] == DEFAULT_ARCH_INVOKE.cache_read_tokens
+        assert persisted['cache_create_tokens'] == DEFAULT_ARCH_INVOKE.cache_create_tokens
+        assert persisted['turns_used'] == DEFAULT_ARCH_INVOKE.turns
         # output_tokens ÷ that leg's own duration — the identical formula
         # collect_metrics uses, over the same duration workflow_duration_ms
         # carries.
-        assert persisted['workflow_duration_ms'] == 4567
+        assert persisted['workflow_duration_ms'] == DEFAULT_ARCH_INVOKE.duration_ms
         assert persisted['tokens_per_second'] == pytest.approx(
-            round(3_000 / (4567 / 1000), 2),
+            round(DEFAULT_ARCH_INVOKE.output_tokens / (DEFAULT_ARCH_INVOKE.duration_ms / 1000), 2),
         )
-        assert result.metrics['cache_read_tokens'] == 48_000
+        assert result.metrics['cache_read_tokens'] == DEFAULT_ARCH_INVOKE.cache_read_tokens
 
     async def test_zero_duration_cell_reports_zero_tokens_per_second(self):
         """A timed-out cell has no duration to divide by — 0.0, not a
@@ -231,9 +232,9 @@ class TestArchitectCellResolvesCostProvenance:
 
         persisted = mocks['save'].call_args.args[0].metrics
         assert persisted['cost_source'] == 'cli'
-        assert persisted['cost_usd'] == pytest.approx(1.23)
+        assert persisted['cost_usd'] == pytest.approx(DEFAULT_ARCH_INVOKE.cost_usd)
         assert result.metrics['cost_source'] == 'cli'
-        assert result.metrics['cost_usd'] == pytest.approx(1.23)
+        assert result.metrics['cost_usd'] == pytest.approx(DEFAULT_ARCH_INVOKE.cost_usd)
 
     async def test_priced_proxied_candidate_uses_the_price_table(self):
         """A proxied candidate whose model IS listed must be priced from the
@@ -417,7 +418,7 @@ class TestArchitectCellCostSourceIsComposed:
 
         persisted = mocks['save'].call_args.args[0].metrics
         assert persisted['cost_source'] == 'cli'
-        assert persisted['cost_usd'] == pytest.approx(1.23 + 0.42)
+        assert persisted['cost_usd'] == pytest.approx(DEFAULT_ARCH_INVOKE.cost_usd + 0.42)
         assert result.metrics['cost_source'] == 'cli'
 
     async def test_judge_skipped_labels_the_architect_component_alone(self):
@@ -496,5 +497,5 @@ class TestJudgeSkippedBranchesRecordNoJudgeSpend:
         assert result.metrics['judge_cost_usd'] == 0.0
         assert result.metrics['judge_invocations'] == 0
         # No arch_result override here — the harness's default architect
-        # mock reports cost_usd=1.23, and that must be the WHOLE cell cost.
-        assert result.metrics['cost_usd'] == pytest.approx(1.23)
+        # mock reports DEFAULT_ARCH_INVOKE.cost_usd, and that must be the WHOLE cell cost.
+        assert result.metrics['cost_usd'] == pytest.approx(DEFAULT_ARCH_INVOKE.cost_usd)

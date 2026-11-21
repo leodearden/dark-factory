@@ -15,6 +15,8 @@ from pathlib import Path
 
 import pytest
 from _architect_eval_harness import (
+    DEFAULT_ARCH_INVOKE,
+    DEFAULT_JUDGE_PLAN_QUALITY,
     PROXY_ENV,
     arch_task_no_reference,
     architect_prompt_sent,
@@ -191,7 +193,7 @@ class TestRunArchitectEval:
 
         # NON-sentinel plan_quality float + role_under_test stamped.
         assert isinstance(result.metrics['plan_quality'], float)
-        assert result.metrics['plan_quality'] == 0.77
+        assert result.metrics['plan_quality'] == DEFAULT_JUDGE_PLAN_QUALITY
         assert result.metrics['role_under_test'] == 'architect'
         assert result.config_name == 'architect-sonnet-high'
         assert result.task_id == 'df_task_2605'
@@ -252,12 +254,12 @@ class TestRunArchitectEval:
         # Amendment (reviewer test-coverage): a judge that RAISES must not
         # fabricate spend — no invocation credited, no cost, and the cell's
         # cost_usd is the architect's own spend alone (the harness's default
-        # invoke_agent mock reports cost_usd=1.23). A regression that moved
+        # invoke_agent mock reports DEFAULT_ARCH_INVOKE.cost_usd). A regression that moved
         # judge_invocations=1 above the raise, or invented a cost inside the
         # except block, would previously go unnoticed here.
         assert result.metrics['judge_cost_usd'] == 0.0
         assert result.metrics['judge_invocations'] == 0
-        assert result.metrics['cost_usd'] == pytest.approx(1.23)
+        assert result.metrics['cost_usd'] == pytest.approx(DEFAULT_ARCH_INVOKE.cost_usd)
         # ...but the raise must not look identical to a judge that was
         # SKIPPED either: it is recorded so the cell reads "spend unknown",
         # not silently judge-free.
@@ -557,7 +559,7 @@ class TestRunArchitectEval:
         )
         assert result.metrics['invocation_errors'] is None
         assert result.metrics['cap_tainted'] is False
-        assert result.metrics['plan_quality'] == 0.77
+        assert result.metrics['plan_quality'] == DEFAULT_JUDGE_PLAN_QUALITY
 
     async def test_wires_plan_tools_mcp_into_architect_invoke(self):
         # BUG 1: the eval architect must be wired with plan-tools MCP exactly
@@ -757,7 +759,7 @@ class TestSteplessPlanIsNeverJudged:
         persisted = mocks['save'].call_args.args[0].metrics
 
         mocks['judge'].assert_awaited_once()
-        assert persisted['plan_quality'] == 0.77
+        assert persisted['plan_quality'] == DEFAULT_JUDGE_PLAN_QUALITY
         assert persisted['plan_steps'] > 0
         assert persisted['cap_tainted'] is False
 
@@ -831,7 +833,7 @@ class TestJudgedWithoutReference:
         persisted = mocks['save'].call_args.args[0].metrics
 
         assert persisted['judged_without_reference'] is True
-        assert persisted['plan_quality'] == 0.77
+        assert persisted['plan_quality'] == DEFAULT_JUDGE_PLAN_QUALITY
         assert persisted['cap_tainted'] is False
 
     async def test_healthy_cell_carries_the_key_as_false(self):
@@ -1184,8 +1186,8 @@ def _characterized_cfg(**over):
     )
 
 
-# The default hermetic invoke's usage (see run_architect_eval_hermetic) and
-# the all-zero usage of an attempt that never returned.
+# The default hermetic invoke's usage (DEFAULT_ARCH_INVOKE, frozen here as
+# literals) and the all-zero usage of an attempt that never returned.
 _DEFAULT_INVOKE_USAGE = {
     'input_tokens': 12000, 'output_tokens': 3000,
     'cache_read_tokens': 48000, 'cache_create_tokens': 6000,
