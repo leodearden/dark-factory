@@ -46,6 +46,7 @@ from orchestrator.verify import (
     known_failing_ids_on_main,
     seed_main_baseline,
 )
+from orchestrator.verify_cache.replay import CacheAccess
 from orchestrator.verify_categories import INFRA_TRANSIENT_CATEGORIES
 from orchestrator.verify_plan import effective_merge_module_configs
 from orchestrator.verify_runner import (
@@ -434,6 +435,9 @@ class _PostMergeVerify:
         re-dispatches.  Warm-swap runs only for LOCAL leases (the caller's
         job).  Both archive under data/verify-logs/<task_id>/ beside the
         task-verify logs for operator triage (task 1920).
+
+        Only the local pool joins the verify-result cache, through the
+        dispatcher's own registry; the remote arm waits for gamma2 (task 9123).
         """
         if self.runner is not None:
             return VerifyRunnerPool(
@@ -442,13 +446,17 @@ class _PostMergeVerify:
                 task_id=self.task_id,
                 archive_root=self.archive_root,
             )
+        access = CacheAccess.on_dispatcher(self.req.config.project_root)
         return VerifyRunnerPool(
-            [self._local_merge_verify_runner(task_files)],
+            [self._local_merge_verify_runner(task_files, access)],
             event_store=self.event_store,
             task_id=self.task_id,
+            verify_cache_registry=access.registry,
         )
 
-    def _local_merge_verify_runner(self, task_files: tuple[str, ...] | None) -> VerifyRunner:
+    def _local_merge_verify_runner(
+        self, task_files: tuple[str, ...] | None, access: CacheAccess,
+    ) -> VerifyRunner:
         """The full gate's scoped + unscoped bundle, or only the declared history leg (task 7248)."""
         if self.history_leg_command is not None:
             return HistoryLegRunner(
@@ -459,9 +467,13 @@ class _PostMergeVerify:
         # emit trivial_pass_escalated.  The merge-flake gate's side-effects are
         # recorded by this call (task ε), off the FlakeSuppression the returned
         # VerifyResult carries.
-        return self._local_runner(task_files)
+        return self._local_runner(task_files, verify_cache=access)
 
-    def _local_runner(self, task_files: tuple[str, ...] | None) -> LocalRunner:
+    def _local_runner(
+        self, task_files: tuple[str, ...] | None, *, verify_cache: CacheAccess | None = None,
+    ) -> LocalRunner:
+        """The local scoped + unscoped bundle; outside the cache unless given *verify_cache*,
+        so the cross-check's trust anchor always runs."""
         return LocalRunner(
             self.merge_wt, self.req.config, self.effective_module_configs, task_files,
             run_scoped=self.verifier.run_scoped,
@@ -469,6 +481,7 @@ class _PostMergeVerify:
             task_id=self.task_id,
             archive_root=self.archive_root,
             event_store=self.event_store,
+            verify_cache=verify_cache,
         )
 
     def _holds_merge_lane_lease(self) -> bool:

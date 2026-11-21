@@ -42,7 +42,6 @@ this suite and the journal suite cannot disagree about the registry shape.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Collection
 from pathlib import Path
 from typing import Any, Literal
 from unittest.mock import AsyncMock, patch
@@ -68,7 +67,7 @@ from orchestrator.merge_lane.post_merge_verify import (
     run_post_merge_verify,
 )
 from orchestrator.merge_lane.queue_store import MergeQueueStore, reconstruct_merge_request
-from orchestrator.merge_lane.types import DiskGuardOutcome, QueuedBranch
+from orchestrator.merge_lane.types import QueuedBranch
 from orchestrator.merge_lane.worker import MergeOutcome, MergeRequest
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_cache.registry import registry_db_path
@@ -1087,37 +1086,28 @@ class TestRehydratedRequestVerifiesAsWideAsItsOriginal:
 # ---------------------------------------------------------------------------
 
 
-class _CapturingVerifier:
-    """A ``VerifyPort`` whose scoped verify passes and keeps every call's options."""
+class _CapturingVerifier(FakeVerifier):
+    """A ``FakeVerifier`` whose scoped verify passes and also keeps every call's options."""
 
     def __init__(self) -> None:
+        super().__init__(VerifyScript(result=_passing_result()))
         self.scoped_options: list[dict[str, Any]] = []
-
-    async def ensure_disk_space(
-        self, git_ops: Any, merge_wt: Path, min_free_bytes: int, task_id: str,
-        keep_worktrees: Collection[Path] | None = None,
-    ) -> DiskGuardOutcome:
-        return DiskGuardOutcome(reason=None)
 
     async def run_scoped(
         self, worktree: Path, config: Any, module_configs: list[Any], task_files: list[str] | None = None,
         **options: Any,
     ) -> VerifyResult:
         self.scoped_options.append(options)
-        return _passing_result()
-
-    async def run_unscoped_typechecks(
-        self, worktree: Path, config: Any, module_configs: list[Any], **options: Any,
-    ) -> PostMergePyrightResult:
-        return PostMergePyrightResult()
+        return await super().run_scoped(worktree, config, module_configs, task_files, **options)
 
 
 class TestMergeBoundaryJoinsTheVerifyCache:
     @staticmethod
     def _req(tmp_path: Path) -> tuple[MergeRequest, Path]:
-        config = _make_config(tmp_path, merge_verify_breadth='full')
+        config = _make_config(tmp_path, merge_verify_breadth='full').model_copy(
+            update={'verify_cold_preprovision_command': ''},
+        )
         mc_a = _module_config('alpha')
-        config._module_configs = {'alpha': mc_a}
         task_wt = tmp_path / 'task-wt-c1'
         task_wt.mkdir(parents=True, exist_ok=True)
         merge_wt = tmp_path / 'merge-wt-c1'
@@ -1156,11 +1146,7 @@ class TestMergeBoundaryJoinsTheVerifyCache:
         req, merge_wt = self._req(tmp_path)
         verifier = _CapturingVerifier()
 
-        with patch(
-            'orchestrator.merge_lane.history_leg.run_verification',
-            new=AsyncMock(return_value=_passing_result()),
-        ):
-            assert await self._drive(tmp_path, req, merge_wt, verifier, history_leg_command='true') is None
+        assert await self._drive(tmp_path, req, merge_wt, verifier, history_leg_command='true') is None
 
         assert [options for options in verifier.scoped_options if options.get('verify_cache') is not None] == []
 

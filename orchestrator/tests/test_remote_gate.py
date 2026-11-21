@@ -94,7 +94,7 @@ def test_wire_fingerprint_is_pinned_for_todays_wire_classes():
     )
 
 
-def _one_class(name: str, *fields_: tuple[str, object]) -> type:
+def _one_class(name: str, *fields_: tuple[str, object] | tuple[str, object, object]) -> type:
     return dataclasses.make_dataclass(name, list(fields_))
 
 

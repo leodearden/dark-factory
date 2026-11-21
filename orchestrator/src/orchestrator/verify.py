@@ -2725,15 +2725,34 @@ SIGNAL_KILL_SUMMARY_MARKER = 'killed by signal'
 # Same CONSTRAINT ON PRODUCERS as above.  See `_worker_death_leg_note`.
 WORKER_DEATH_SUMMARY_MARKER = 'session aborted after worker death'
 
+# The THIRD (task 5653): a merge verify replayed a recorded green, but the
+# dispatcher could not write that replay's consumption record (I6), so the
+# verdict rests on evidence nothing will ever audit. Same CONSTRAINT ON
+# PRODUCERS as above. See `unconsumed_replay_result`.
+UNCONSUMED_REPLAY_SUMMARY_MARKER = 'replayed verdict without a consumption record'
+
 # Every marker that makes a summary fragment a no-verdict note.
 # `_aggregate_results` carries each such fragment through verbatim, so a new
 # no-verdict note needs only its marker added here.
-_NO_VERDICT_SUMMARY_MARKERS = (SIGNAL_KILL_SUMMARY_MARKER, WORKER_DEATH_SUMMARY_MARKER)
+_NO_VERDICT_SUMMARY_MARKERS = (
+    SIGNAL_KILL_SUMMARY_MARKER, WORKER_DEATH_SUMMARY_MARKER, UNCONSUMED_REPLAY_SUMMARY_MARKER,
+)
 
 
 def is_no_verdict_summary(summary: str) -> bool:
-    """True when *summary* carries a no-verdict note — a signal-killed leg or an xdist-truncated session — so it records no verdict on the code."""
+    """True when *summary* carries a no-verdict note — a signal-killed leg, an xdist-truncated session or an unconsumed replay — so it records no verdict on the code."""
     return any(marker in summary for marker in _NO_VERDICT_SUMMARY_MARKERS)
+
+
+def unconsumed_replay_result(result: 'VerifyResult', reason: str) -> 'VerifyResult':
+    """*result* failed as no verdict: it replayed greens whose consumption could not be recorded (I6)."""
+    return replace(
+        result,
+        passed=False,
+        summary=f'Failures: {UNCONSUMED_REPLAY_SUMMARY_MARKER}: {_without_fragment_separator(reason)}',
+        category='',
+        cause_hint=reason,
+    )
 
 
 def _without_fragment_separator(text: str) -> str:

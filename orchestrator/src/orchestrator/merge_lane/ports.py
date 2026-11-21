@@ -30,6 +30,7 @@ from orchestrator.merge_lane.gates import PostMergePyrightResult
 from orchestrator.merge_lane.types import DiskGuardOutcome, EscalationRecord, MergeRequest
 from orchestrator.unblock_types import BlockClass
 from orchestrator.verify import VerifyResult
+from orchestrator.verify_cache.replay import CacheAccess
 
 _T = TypeVar('_T')
 
@@ -61,6 +62,7 @@ class VerifyPort(Protocol):
         force_workspace: bool = False,
         role: Literal['merge', 'task'] = 'task',
         event_store: EventStore | None = None,
+        verify_cache: CacheAccess | None = None,
     ) -> VerifyResult: ...
 
     async def run_unscoped_typechecks(

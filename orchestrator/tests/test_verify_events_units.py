@@ -189,6 +189,7 @@ class TestUnitVocabulary:
 
         rebuilt = result_from_dict(json.loads(json.dumps(result_to_dict(_result(units=(unit,))))))
 
+        assert rebuilt.units is not None
         assert rebuilt.units == (unit,)
         assert rebuilt.units[0].reason == 'registry unreadable'
 
@@ -199,8 +200,10 @@ class TestUnitVocabulary:
             'outcome': 'ran_green', 'evidence_event_id': None,
         }]
 
-        (unit,) = result_from_dict(wire).units or ()
+        units = result_from_dict(wire).units
 
+        assert units is not None
+        (unit,) = units
         assert unit.reason is None
 
     def test_every_outcome_but_ran_red_is_green(self):
