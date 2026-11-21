@@ -15,7 +15,13 @@ import pytest
 from escalation.queue import EscalationQueue
 
 from fused_memory.config.schema import ReconciliationConfig
-from fused_memory.models.reconciliation import StageId, StageReport, Watermark
+from fused_memory.models.reconciliation import (
+    RunStatus,
+    RunType,
+    StageId,
+    StageReport,
+    Watermark,
+)
 from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
 from fused_memory.reconciliation.cli_stage_runner import StageResult
 from fused_memory.reconciliation.stages.task_knowledge_sync import TaskKnowledgeSync
@@ -25,11 +31,13 @@ SNAPSHOT_KIND = 'task_count_snapshot'
 PROJECT_ID = 'reify'
 STALE_SNAPSHOT_CATEGORY = 'recon_stale_task_count_snapshot'
 PRE_RETIREMENT_MISSED_SNAPSHOT_STATS = {'task_count_snapshot_mem0_written': 0}
+STAT_SET_AFTER_FORMER_SNAPSHOT_SITE = 'recon_markers_gc_swept'
+CYCLES = 3
 
 
 def _memory_service() -> AsyncMock:
     memory_service = AsyncMock()
-    memory_service.count_memories_by_metadata.return_value = 1
+    memory_service.count_memories_by_metadata.return_value = 0
     memory_service.get_memories_by_metadata.return_value = []
     memory_service.delete_memory = AsyncMock(return_value=None)
     memory_service.search.return_value = []
@@ -100,6 +108,7 @@ async def test_stage2_run_for_formerly_snapshotting_project_writes_no_snapshot()
     ]
     snapshot_stats = [key for key in report.stats if SNAPSHOT_KIND in key]
 
+    assert STAT_SET_AFTER_FORMER_SNAPSHOT_SITE in report.stats
     assert snapshot_writes == []
     assert snapshot_reads == []
     assert snapshot_stats == []
@@ -131,9 +140,15 @@ async def test_consecutive_full_cycles_raise_no_stale_snapshot_alarm(tmp_path, m
         known_projects={PROJECT_ID: '/tmp/test-project'},
         escalation_queue=escalation_queue,
     ) as harness:
-        for _ in range(3):
+        for _ in range(CYCLES):
             await harness.run_full_cycle(PROJECT_ID, 'test-trigger')
+        runs = await harness.journal.get_recent_runs(PROJECT_ID, limit=10)
 
+    completed_full_runs = [
+        run for run in runs
+        if run.run_type == RunType.full and run.status == RunStatus.completed
+    ]
+    assert len(completed_full_runs) == CYCLES
     alarm_categories = [
         esc.category for esc in escalation_queue.get_pending()
         if esc.category == STALE_SNAPSHOT_CATEGORY
