@@ -3,8 +3,8 @@
 
 ``holds`` is PRD ``plans/per-consumer-resource-recording-prd.md`` leaf 2: for
 each memory hold in the named projects' runs.db files, which consumers grew and
-which paid in the window before it (scripts/resource_report_holds.py). Leaf 8
-adds ``costs``.
+which paid in the window before it (scripts/resource_report_holds.py, rendered by
+scripts/resource_report_holds_render.py). Leaf 8 adds ``costs``.
 
 Runs under /usr/bin/python3 with no venv: scripts/_checkout.py binds this
 checkout's workspace members. The project roots are named, never defaulted.
@@ -22,6 +22,7 @@ from pathlib import Path
 
 import _checkout as _checkout
 import resource_report_holds as holds
+import resource_report_holds_render as render
 from shared.project_layout import default_project_root
 
 _RELATIVE_SINCE = re.compile(r'(\d+)([smhd])')
@@ -101,9 +102,9 @@ def main(argv: Sequence[str] | None = None, *, now: datetime | None = None) -> i
         print(f'resource_report.py holds: {exc}', file=sys.stderr)
         return 2
     if args.json:
-        print(json.dumps(holds.report_json(report, summary=args.summary), indent=2))
+        print(json.dumps(render.report_json(report, summary=args.summary), indent=2))
     else:
-        print(holds.render_text(report, summary=args.summary))
+        print(render.render_text(report, summary=args.summary))
     return 0
 
 

@@ -1,4 +1,4 @@
-"""The hold analysis: scripts/resource_report_holds.py.
+"""The hold analysis, scripts/resource_report_holds.py, and its rendering, scripts/resource_report_holds_render.py.
 
 PRD ``plans/per-consumer-resource-recording-prd.md`` leaf 2, contract C2 and
 the §7 rows "Hold before go-live" and "Hold mapping, both shapes". Consumers
@@ -16,6 +16,7 @@ from typing import Any
 import _checkout as _checkout
 import pytest
 import resource_report_holds as holds
+import resource_report_holds_render as render
 from resource_report_fixtures import (
     HOLD_SAMPLE,
     memory_hold,
@@ -50,13 +51,13 @@ def ts(seconds: int) -> int:
 
 def hold_block(text: str, moment: datetime, root: Path | None = None) -> str:
     """The rendered block of the hold at *moment*, of *root* when given: the paragraph its heading opens."""
-    heading = f'hold {holds.format_utc(moment)}' + ('' if root is None else f'  {root}  ')
+    heading = f'hold {render.format_utc(moment)}' + ('' if root is None else f'  {root}  ')
     return next(par for par in text.split('\n\n') if par.startswith(heading))
 
 
 def hold_json(report: holds.HoldsReport, moment: datetime) -> Mapping[str, Any]:
-    entries = json.loads(json.dumps(holds.report_json(report)))['holds']
-    return next(entry for entry in entries if entry['at'] == holds.format_utc(moment))
+    entries = json.loads(json.dumps(render.report_json(report)))['holds']
+    return next(entry for entry in entries if entry['at'] == render.format_utc(moment))
 
 
 def reading_at(report: holds.HoldsReport, moment: datetime) -> holds.HoldReading:
@@ -188,7 +189,7 @@ class TestHoldBeforeGoLive:
 
         assert reading.state is holds.HoldState.NOT_LIVE
         assert reading.window is None
-        assert 'recorder not live at this hold' in hold_block(holds.render_text(report), at(-60))
+        assert 'recorder not live at this hold' in hold_block(render.render_text(report), at(-60))
         entry = hold_json(report, at(-60))
         assert entry['state'] == 'recorder_not_live'
         assert 'who_grew' not in entry
@@ -204,7 +205,7 @@ class TestHoldBeforeGoLive:
         )
 
     def test_an_empty_ranking_is_said_and_is_not_recorder_not_live(self, report):
-        block = hold_block(holds.render_text(report), at(300))
+        block = hold_block(render.render_text(report), at(300))
         entry = hold_json(report, at(300))
 
         assert 'who grew: no consumer grew' in block
@@ -224,16 +225,16 @@ class TestHoldBeforeGoLive:
 
     def test_a_hold_past_the_last_collection_has_no_samples(self, report):
         reading = reading_at(report, at(1000))
-        block = hold_block(holds.render_text(report), at(1000))
+        block = hold_block(render.render_text(report), at(1000))
 
         assert reading.state is holds.HoldState.NO_SAMPLES
         assert reading.last_collection == at(600)
-        assert holds.format_utc(at(600)) in block
+        assert render.format_utc(at(600)) in block
         assert 'recorder not live' not in block
         assert hold_json(report, at(1000))['state'] == 'no_samples'
 
     def test_the_heading_names_the_root_the_task_and_the_arm_value(self, root, report):
-        heading = hold_block(holds.render_text(report), at(300)).splitlines()[0]
+        heading = hold_block(render.render_text(report), at(300)).splitlines()[0]
 
         assert str(root) in heading
         assert 'task 5653' in heading
@@ -241,11 +242,11 @@ class TestHoldBeforeGoLive:
 
     def test_the_header_names_the_first_and_last_collection(self, report):
         samples_line = next(
-            line for line in holds.render_text(report).splitlines() if line.startswith('samples db')
+            line for line in render.render_text(report).splitlines() if line.startswith('samples db')
         )
 
-        assert holds.format_utc(at(0)) in samples_line
-        assert holds.format_utc(at(600)) in samples_line
+        assert render.format_utc(at(0)) in samples_line
+        assert render.format_utc(at(600)) in samples_line
 
     def test_the_readings_are_in_hold_order(self, report):
         assert [reading.hold.at for reading in report.readings] == [
@@ -260,7 +261,7 @@ class TestHoldBeforeGoLive:
         )
 
         assert {reading.state for reading in report.readings} == {holds.HoldState.NOT_LIVE}
-        assert 'no consumer collections' in holds.render_text(report)
+        assert 'no consumer collections' in render.render_text(report)
 
 
 class TestTheArmValue:
@@ -315,19 +316,19 @@ class TestSamplerGaps:
 
     def test_a_window_spanning_a_sampler_gap_is_its_own_state_and_not_ranked(self, report):
         reading = reading_at(report, at(1035))
-        block = hold_block(holds.render_text(report), at(1035))
+        block = hold_block(render.render_text(report), at(1035))
         entry = hold_json(report, at(1035))
 
         assert reading.state is holds.HoldState.GAP
         assert reading.window is None
         assert reading.gap == holds.SamplerGap(at(60), at(1000))
         assert 'sampler gap in the window' in block
-        assert holds.format_utc(at(60)) in block
-        assert holds.format_utc(at(1000)) in block
+        assert render.format_utc(at(60)) in block
+        assert render.format_utc(at(1000)) in block
         assert 'incomplete' not in block
         assert entry['state'] == 'sampler_gap'
         assert entry['gap'] == {
-            'before': holds.format_utc(at(60)), 'after': holds.format_utc(at(1000))
+            'before': render.format_utc(at(60)), 'after': render.format_utc(at(1000))
         }
         assert 'who_grew' not in entry
 
@@ -534,7 +535,7 @@ class TestRankings:
         assert entry['incomplete'] == [encode_consumer(self.UNREADABLE)]
 
     def test_the_text_marks_this_project_and_prints_the_aside_lines(self, report, verify):
-        lines = hold_block(holds.render_text(report), at(65)).splitlines()
+        lines = hold_block(render.render_text(report), at(65)).splitlines()
 
         assert any(
             encode_consumer(verify) in line and "[this project's verify]" in line for line in lines
@@ -544,7 +545,7 @@ class TestRankings:
         assert any(encode_consumer(self.UNREADABLE) in line for line in lines)
 
     def test_the_text_shows_bytes_in_binary_units(self, report, verify):
-        block = hold_block(holds.render_text(report), at(65))
+        block = hold_block(render.render_text(report), at(65))
 
         assert '+1.00 GiB' in block
         assert '+10.0 MiB' in block
@@ -580,7 +581,7 @@ class TestAConsumerIncompleteAtTheWindowStart:
     def test_it_stays_ranked_and_its_row_is_marked_incomplete(self, report):
         (reading,) = report.readings
         assert reading.window is not None
-        lines = hold_block(holds.render_text(report), at(65)).splitlines()
+        lines = hold_block(render.render_text(report), at(65)).splitlines()
         first, second = (
             next(line for line in lines if line.strip().startswith(f'{rank}. ')) for rank in (1, 2)
         )
@@ -595,7 +596,7 @@ class TestAConsumerIncompleteAtTheWindowStart:
 
     def test_the_summary_leaves_it_out_and_counts_it_apart(self, report):
         summary = holds.summarise(report)
-        as_json = json.loads(json.dumps(holds.report_json(report, summary=True)))['summary']
+        as_json = json.loads(json.dumps(render.report_json(report, summary=True)))['summary']
 
         assert summary.tops['who_grew'] == {}
         assert summary.incomplete_tops['who_grew'] == {self.SCCACHE: 1}
@@ -692,7 +693,7 @@ class TestHoldMappingBothShapesEndToEnd:
         return holds.read_holds_report(list(roots), store, since=T0, window_seconds=120)
 
     def entry_for(self, report: holds.HoldsReport, root: Path) -> Mapping[str, Any]:
-        entries = holds.report_json(report)['holds']
+        entries = render.report_json(report)['holds']
         return next(entry for entry in entries if entry['project_root'] == str(root))
 
     def test_the_unit_shape_resolves_service_and_verify(self, report, roots):
@@ -735,7 +736,7 @@ class TestHoldMappingBothShapesEndToEnd:
 
         entry = self.entry_for(report, solar)
         project = entry['holding_project']['project']
-        block = hold_block(holds.render_text(report), at(65), solar)
+        block = hold_block(render.render_text(report), at(65), solar)
         slice_lines = [line for line in block.splitlines() if slice_name in line]
 
         assert project['status'] == 'not_mapped'
@@ -793,7 +794,7 @@ class TestReclaimThreads:
 
         kernel = next(
             line.strip()
-            for line in hold_block(holds.render_text(report), at(65)).splitlines()
+            for line in hold_block(render.render_text(report), at(65)).splitlines()
             if line.strip().startswith('kernel:')
         )
 
@@ -808,7 +809,7 @@ class TestReclaimThreads:
         entry = hold_json(report, at(65))
         kernel = next(
             line.strip()
-            for line in hold_block(holds.render_text(report), at(65)).splitlines()
+            for line in hold_block(render.render_text(report), at(65)).splitlines()
             if line.strip().startswith('kernel:')
         )
 
@@ -945,7 +946,7 @@ class TestSummary:
     def test_the_json_summary_encodes_its_consumers(self, report, roots, verify):
         factory, _solar = roots
 
-        summary = json.loads(json.dumps(holds.report_json(report, summary=True)))['summary']
+        summary = json.loads(json.dumps(render.report_json(report, summary=True)))['summary']
 
         assert summary['tops'] == {
             'who_grew': {encode_consumer(verify): 2, encode_consumer(self.T3CODE): 1},
@@ -961,9 +962,9 @@ class TestSummary:
         def summary_sections(text: str) -> list[str]:
             return [par for par in text.split('\n\n') if par.startswith('summary')]
 
-        assert 'summary' not in holds.report_json(report)
-        assert summary_sections(holds.render_text(report)) == []
-        (section,) = summary_sections(holds.render_text(report, summary=True))
+        assert 'summary' not in render.report_json(report)
+        assert summary_sections(render.render_text(report)) == []
+        (section,) = summary_sections(render.render_text(report, summary=True))
         assert encode_consumer(self.T3CODE) in section
         assert 'unattributed' in section
         assert 'reclaim threads' in section
@@ -977,12 +978,12 @@ class TestSummary:
         summary = holds.summarise(report)
         (section,) = [
             par
-            for par in holds.render_text(report, summary=True).split('\n\n')
+            for par in render.render_text(report, summary=True).split('\n\n')
             if par.startswith('summary')
         ]
 
         assert set(summary.aside_shares.values()) == {(None, None)}
         assert summary.reclaim_thread_share is None
-        assert holds.report_json(report, summary=True)['summary']['reclaim_thread_share'] is None
+        assert render.report_json(report, summary=True)['summary']['reclaim_thread_share'] is None
         assert 'n/a' in section
         assert '0.0%' not in section
