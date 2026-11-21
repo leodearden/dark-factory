@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import fcntl
 import os
+import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -448,6 +450,23 @@ def disk_state(mirror: Mirror) -> tuple:
             lock_files(mirror), pgid_records(mirror))
 
 
+TASK_STORE = Path(".taskmaster/tasks/tasks.db")
+
+
+def with_ignored_task_state(mirror: Mirror) -> Path:
+    """Give the stale `123` an ignored `.task/` that the dirty guard cannot see."""
+    exclude = mirror.repo / ".git" / "info" / "exclude"
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    with exclude.open("a") as handle:
+        handle.write(".task/\n")
+    plan = mirror.wt("123") / ".task" / "plan.json"
+    plan.parent.mkdir()
+    plan.write_text("{}")
+    _age(mirror.wt("123"))
+    assert git(mirror.wt("123"), "status", "--porcelain") == ""
+    return plan
+
+
 def test_host_mode_runs_the_same_report_over_ssh(mirror):
     ssh = install_shim(mirror, "fakessh", FAKE_SSH)
     args = ("--repo", str(mirror.repo), *WORKTREE_CLASSES, "--min-age-hours", "24")
@@ -478,3 +497,72 @@ def test_host_mode_relays_ssh_failure(mirror):
 
     assert result.returncode == 255
     assert "fakehost" in result.stderr
+
+
+@pytest.mark.parametrize("apply", [False, True], ids=["report", "apply"])
+@pytest.mark.parametrize("class_args", [
+    [], ["--class", "task-worktree"], ["--class", "merge-worktree"],
+], ids=["default-classes", "task-worktree", "merge-worktree"])
+def test_orchestrator_project_root_refuses_the_worktree_classes(mirror, class_args, apply):
+    store = mirror.repo / TASK_STORE
+    store.parent.mkdir(parents=True)
+    store.touch()
+    plan = with_ignored_task_state(mirror)
+    before = disk_state(mirror)
+
+    result = run(mirror, "--repo", str(mirror.repo), *class_args,
+                 *(["--apply"] if apply else []))
+
+    assert result.returncode == 2, result.stdout
+    assert str(mirror.repo) in result.stderr
+    assert str(store) in result.stderr
+    assert verdict_lines(result.stdout) == []
+    assert disk_state(mirror) == before
+    assert plan.exists()
+    assert systemctl_calls(mirror) == []
+
+
+def test_verify_scope_class_alone_ignores_the_task_store(mirror):
+    store = mirror.repo / TASK_STORE
+    store.parent.mkdir(parents=True)
+    store.touch()
+
+    result = run(mirror, "--repo", str(mirror.repo), *SCOPE_CLASS)
+
+    assert result.returncode == 0, result.stderr
+
+
+GIT_PROGRAM = "git"
+
+
+def store_on_status_git(real_git: str) -> str:
+    """A `git` that creates $STORE_ON_STATUS on its first `status`, then runs the real one."""
+    return (
+        '#!/usr/bin/env bash\n'
+        'for word in "$@"; do\n'
+        '  if [ "$word" = status ]; then\n'
+        '    mkdir -p "$(dirname "$STORE_ON_STATUS")"\n'
+        '    touch "$STORE_ON_STATUS"\n'
+        '    break\n'
+        '  fi\n'
+        'done\n'
+        f'exec {shlex.quote(real_git)} "$@"\n'
+    )
+
+
+def test_task_store_appearing_mid_run_blocks_the_removal(mirror):
+    real_git = shutil.which(GIT_PROGRAM)
+    assert real_git is not None
+    plan = with_ignored_task_state(mirror)
+    install_shim(mirror, GIT_PROGRAM, store_on_status_git(real_git))
+    store = mirror.repo / TASK_STORE
+
+    result = run(mirror, "--repo", str(mirror.repo), "--class", "task-worktree", "--apply",
+                 STORE_ON_STATUS=str(store))
+
+    assert result.returncode == 1, result.stderr
+    assert verdicts(result.stdout)["123"][1:3] == ("failed", "stale")
+    assert mirror.wt("123").is_dir()
+    assert plan.exists()
+    assert str(mirror.wt("123")) in result.stderr
+    assert str(store) in result.stderr
