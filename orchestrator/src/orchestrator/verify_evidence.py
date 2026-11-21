@@ -41,6 +41,12 @@ class UnitOutcome(StrEnum):
     UNAVAILABLE = 'unavailable'
 
 
+#: The outcomes whose unit verdict is green: every red is RAN_RED.
+GREEN_OUTCOMES = frozenset({
+    UnitOutcome.RAN_GREEN, UnitOutcome.CACHE_HIT, UnitOutcome.WOULD_HIT, UnitOutcome.UNAVAILABLE,
+})
+
+
 class VerifySite(StrEnum):
     """Which site emitted a ``workflow_verify`` row, and what each reader makes of it.
 
@@ -78,13 +84,24 @@ def counts_as_branch_verdict(data: Mapping[str, Any]) -> bool:
 
 @dataclass(frozen=True)
 class VerifyUnit:
-    """One verified unit and how its verdict was reached; ``key`` is its cache key, when it has one."""
+    """One verified unit and how its verdict was reached; ``key`` is its cache key, when it has one.
+
+    ran_red is every red. would_hit and unavailable imply the leg ran green.
+    ``evidence_event_id`` is the replayed green (cache_hit), the green a replay
+    would have served (would_hit), or, on ran_red, the green a log-mode replay
+    would have wrongly served.
+    """
 
     unit: str
     tier: UnitTier
     key: str | None
     outcome: UnitOutcome
     evidence_event_id: int | None = None
+    reason: str | None = None
+
+    @property
+    def would_have_leaked(self) -> bool:
+        return self.outcome is UnitOutcome.RAN_RED and self.evidence_event_id is not None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -93,6 +110,7 @@ class VerifyUnit:
             'key': self.key,
             'outcome': str(self.outcome),
             'evidence_event_id': self.evidence_event_id,
+            'reason': self.reason,
         }
 
     @classmethod
