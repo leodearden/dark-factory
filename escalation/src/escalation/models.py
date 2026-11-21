@@ -146,7 +146,7 @@ import json
 import logging
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Literal, TypedDict
+from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict
 
 if TYPE_CHECKING:
     from shared.task_metadata import TriggerChainSkill
@@ -380,6 +380,10 @@ class LateResolution(TypedDict):
     cannot be populated states a fact the entry does not hold; the coarse
     dismiss/resolve intent that `resolve()` genuinely receives is kept instead.
 
+    `ruled_by_human` is the late caller's assertion that a human ruled, kept
+    here because the record's own flag is terminal state and is not moved.
+    Entries captured before the key existed lack it.
+
     Shape mirrors the Amendment / EvidenceEntry / TrainState TypedDicts.
     TypedDict at runtime is a plain dict; existing from_dict / to_dict /
     asdict() paths are unaffected — round-trip fidelity is unchanged.  Stored
@@ -392,6 +396,7 @@ class LateResolution(TypedDict):
     resolved_by: str | None               # the incoming resolver attribution
     dismiss: bool                         # whether the incoming call asked to dismiss
     prior_resolution_class: str | None    # the stamp this capture superseded, or None
+    ruled_by_human: NotRequired[bool | None]  # the incoming human-ruling assertion
 
 
 # The instruction `escalate_blocker` appends to its response, telling the FILER

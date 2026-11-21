@@ -379,15 +379,14 @@ class ResolutionClassRequired(ValueError):
     """A close of a record whose level requires a resolution_class stated none.
 
     Raised before anything is written; :attr:`code` is the wire code
-    ``escalation/src/escalation/server.py::resolve_issue`` answers with.
+    ``escalation/src/escalation/server.py::resolve_issue`` answers with, and the
+    message names the record, its level and the resolver.
     """
 
-    def __init__(self, reason: str, *, escalation: Escalation, resolved_by: str | None) -> None:
+    code = RESOLUTION_CLASS_REQUIRED_CODE
+
+    def __init__(self, reason: str, *, resolved_by: str | None) -> None:
         super().__init__(f'{reason} (resolved_by={resolved_by!r})')
-        self.code = RESOLUTION_CLASS_REQUIRED_CODE
-        self.escalation_id = escalation.id
-        self.level = escalation.level
-        self.resolved_by = resolved_by
 
 
 def _stamped_resolution_class(
@@ -406,7 +405,7 @@ def _stamped_resolution_class(
     )
     missing = resolution_class_missing(escalation, stamped)
     if missing is not None:
-        raise ResolutionClassRequired(missing, escalation=escalation, resolved_by=resolved_by)
+        raise ResolutionClassRequired(missing, resolved_by=resolved_by)
     conflict = note_to_file_class_conflict(escalation, stamped)
     if conflict is not None:
         raise ValueError(conflict)
@@ -472,7 +471,7 @@ def _is_late_resolution_worth_capturing(
 
 def _build_late_resolution(
     *, resolution: str, resolved_by: str | None, dismiss: bool,
-    prior_resolution_class: str | None, timestamp: str,
+    prior_resolution_class: str | None, ruled_by_human: bool | None, timestamp: str,
 ) -> tuple[LateResolution, int]:
     """Build one :class:`~escalation.models.LateResolution`, size-bounded.
 
@@ -502,6 +501,7 @@ def _build_late_resolution(
         'resolved_by': resolved_by,
         'dismiss': dismiss,
         'prior_resolution_class': prior_resolution_class,
+        'ruled_by_human': ruled_by_human,
     }
     return entry, lost
 
@@ -1481,8 +1481,11 @@ class EscalationQueue:
 
         ``ruled_by_human`` (plans/instruments-honesty-prd.md decision 9): the
         caller's assertion that a human ruled on this record, stamped beside
-        ``resolution_class`` on the applied path only and forwarded through the
-        member cascade.
+        ``resolution_class`` on the applied path and forwarded through the
+        member cascade. The already-terminal path never moves the record's
+        flag: a captured late resolution records the assertion on its
+        ``late_resolutions`` entry, and an uncaptured call discards it with
+        its text.
 
         ``outcome`` (task 4495): an optional :class:`ResolveOutcome` dict filled
         in place with what this call DID — whether the resolution was actually
@@ -1598,6 +1601,7 @@ class EscalationQueue:
                         resolved_by=resolved_by,
                         dismiss=dismiss,
                         resolution_class=resolution_class,
+                        ruled_by_human=ruled_by_human,
                     )
                     if captured and outcome is not None:
                         outcome['late_resolution_captured'] = True
@@ -1673,7 +1677,7 @@ class EscalationQueue:
     def _capture_late_resolution(
         self, escalation_id: str, esc: Escalation, *,
         resolution: str, resolved_by: str | None, dismiss: bool,
-        resolution_class: str | None,
+        resolution_class: str | None, ruled_by_human: bool | None,
     ) -> tuple[bool, str | None]:
         """Preserve one late resolution on an already-terminal *esc*.
 
@@ -1731,6 +1735,7 @@ class EscalationQueue:
             # Preserved so the correction destroys nothing and the
             # original derivation stays auditable.
             prior_resolution_class=prior_class if corrected else None,
+            ruled_by_human=ruled_by_human,
             timestamp=datetime.now(UTC).isoformat(),
         )
         prior_list = list(esc.late_resolutions)

@@ -32,7 +32,11 @@ from escalation.amendments import (
     MAX_AMENDMENTS,
     amendment_room,
 )
-from escalation.classify import default_resolution_class_for_resolver, effective_benign
+from escalation.classify import (
+    default_resolution_class_for_resolver,
+    effective_benign,
+    resolver_tier,
+)
 from escalation.models import RESOLUTION_CLASS_REQUIRED_CODE, Escalation
 from escalation.queue import (
     _MAX_LATE_RESOLUTION_CHARS,
@@ -9228,6 +9232,54 @@ class TestLateResolutionCorrectsResolutionClass:
         assert record is not None
         assert len(record.late_resolutions) == 1
         assert record.resolution_class == 'actionable'
+
+
+class TestLateResolutionRecordsTheRulingAssertion:
+    """A late resolve keeps its ruled_by_human assertion on the captured entry.
+
+    Like the rest of the terminal state, the record's own flag is not moved, so
+    the record stays in the sweep's tier.
+    """
+
+    def _swept(self, queue: EscalationQueue, esc_id: str, *, level: int = 1) -> None:
+        queue.submit(_make_escalation(esc_id, task_id='8562', level=level))
+        queue.resolve(esc_id, 'Auto-dismissed: aged out', dismiss=True, resolved_by='auto-dismissed')
+
+    @pytest.mark.parametrize('flag', [True, False, None])
+    def test_a_late_resolve_records_its_ruling_flag_on_the_entry(
+        self, tmp_path: Path, flag: bool | None,
+    ):
+        queue = EscalationQueue(tmp_path / 'queue')
+        self._swept(queue, 'esc-8562-1')
+
+        queue.resolve(
+            'esc-8562-1', 'Leo ruled: a real defect', resolved_by='interactive',
+            ruled_by_human=flag,
+        )
+
+        record = queue.get('esc-8562-1')
+        assert record is not None
+        assert [entry.get('ruled_by_human') for entry in record.late_resolutions] == [flag]
+        assert record.ruled_by_human is None
+        assert resolver_tier(record) == 'reaper-sweep'
+
+    def test_an_l2_ruling_cascading_onto_a_swept_member_is_recorded_on_its_entry(
+        self, tmp_path: Path,
+    ):
+        queue = EscalationQueue(tmp_path / 'queue')
+        self._swept(queue, 'esc-8562-2')
+        l2 = _make_escalation('esc-8562-3', task_id='8562', level=2)
+        l2.members = ['esc-8562-2']
+        queue.submit(l2)
+
+        queue.resolve(
+            'esc-8562-3', 'Leo ruled on the cluster', resolved_by='interactive',
+            resolution_class='actionable', ruled_by_human=True,
+        )
+
+        member = queue.get('esc-8562-2')
+        assert member is not None
+        assert [entry.get('ruled_by_human') for entry in member.late_resolutions] == [True]
 
 
 class TestLateResolutionBounds:
