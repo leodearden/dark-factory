@@ -359,7 +359,7 @@ def _is_committed_report(report_path: str) -> bool:
 
 def guard_committed_report(
     report_path: str, *, dry_run: bool, limit: int | None, slate_mode: str,
-    wording: str = _wording.WORDING_SHIPPED,
+    wording: str = _wording.WORDING_SHIPPED, judge_model: str | None = None,
 ) -> str:
     """Keep a non-measurement run from publishing itself as the measurement.
 
@@ -379,6 +379,8 @@ def guard_committed_report(
       committed one.
     - a non-shipped ``--wording`` measures a prompt production does not
       send, so it is refused outright beside the slate-mode refusal.
+    - a ``--judge-model`` override measures a model other than the
+      configured judge the arbiter measures, so it is refused likewise.
     - ``--limit N`` measures REALLY, just partially. Its numbers are the
       judge's own, and ``provenance.limit`` records the truncation in the
       artifact itself, so an operator (and
@@ -413,6 +415,12 @@ def guard_committed_report(
         raise ValueError(
             f'the committed artifact measures the shipped wording; pass '
             f'--report-path for a {wording} run',
+        )
+
+    if judge_model is not None:
+        raise ValueError(
+            f'the committed artifact measures the configured judge model; pass '
+            f'--report-path for a --judge-model {judge_model} run',
         )
 
     if limit is not None:
@@ -517,7 +525,52 @@ def _retrieved_plan(
     judge_candidate_count: int,
     aliases: Mapping[str, str],
 ) -> _cases.EvalPlan:
-    """Retrieve, band and trim every labelled record exactly as production would.
+    """Retrieve, band, route and trim every labelled record as production would, or replay that.
+
+    ``--slates-in`` replays a :func:`_retrieve_snapshot` an earlier run wrote
+    with ``--slates-out``, so several runs judge one retrieval; its project,
+    band edges and width are the provenance, since they are what the slates
+    were measured at.
+    """
+    retrieval = load_retrieval()
+    labelled = [r for r in records if str(r['label']) != _scoring.LABEL_CANONICAL]
+    if args.slates_in is not None:
+        snapshot = retrieval.SlateSnapshot.load(args.slates_in)
+        _check_snapshot(
+            snapshot, labelled, judge_candidate_count=judge_candidate_count,
+            path=args.slates_in,
+        )
+        logger.info(
+            'Judging %d slate(s) retrieved from project_id=%s, read from %s',
+            len(snapshot.slates), snapshot.project_id, args.slates_in,
+        )
+    else:
+        snapshot = _retrieve_snapshot(
+            args, config, labelled, judge_candidate_count=judge_candidate_count,
+        )
+        if args.slates_out is not None:
+            snapshot.dump(args.slates_out)
+            logger.info('Wrote the retrieved slates to %s', args.slates_out)
+    slates = snapshot.slates
+    return _cases.plan_from_slates(records, slates, provenance={
+        'project_id': snapshot.project_id,
+        't_high': snapshot.t_high,
+        't_low': snapshot.t_low,
+        'candidate_k': snapshot.candidate_k,
+        'canonical_absent': sum(1 for s in slates if not s.canonical_present),
+        'degraded_retrievals': sum(1 for s in slates if s.degraded),
+        'self_retrieved': sum(1 for s in slates if s.self_retrieved),
+    }, aliases=aliases, fixture=fixture)
+
+
+def _retrieve_snapshot(
+    args: Any,
+    config: Any,
+    labelled: Sequence[Mapping[str, Any]],
+    *,
+    judge_candidate_count: int,
+) -> Any:
+    """One production retrieval of *labelled*, banded, routed and trimmed.
 
     The retrieval width and both band edges come from the SAME config the
     shipped ``triage_write`` reads, so a re-calibration moves this eval with it.
@@ -534,7 +587,6 @@ def _retrieved_plan(
     service = types.SimpleNamespace(config=config)
     k = resolve_candidate_k(service)
     t_high, t_low = resolve_bands(service)
-    labelled = [r for r in records if str(r['label']) != _scoring.LABEL_CANONICAL]
     logger.info(
         'Retrieving %d slate(s) from project_id=%s at k=%d, bands t_high=%s '
         't_low=%s', len(labelled), args.project_id, k, t_high, t_low,
@@ -551,15 +603,33 @@ def _retrieved_plan(
         t_high=t_high, t_low=t_low,
         judge_candidate_count=judge_candidate_count,
     )
-    return _cases.plan_from_slates(records, slates, provenance={
-        'project_id': args.project_id,
-        't_high': t_high,
-        't_low': t_low,
-        'candidate_k': k,
-        'canonical_absent': sum(1 for s in slates if not s.canonical_present),
-        'degraded_retrievals': sum(1 for s in slates if s.degraded),
-        'self_retrieved': sum(1 for s in slates if s.self_retrieved),
-    }, aliases=aliases, fixture=fixture)
+    return retrieval.SlateSnapshot(
+        project_id=args.project_id, t_high=t_high, t_low=t_low, candidate_k=k,
+        judge_candidate_count=judge_candidate_count, slates=tuple(slates),
+    )
+
+
+def _check_snapshot(
+    snapshot: Any,
+    labelled: Sequence[Mapping[str, Any]],
+    *,
+    judge_candidate_count: int,
+    path: str,
+) -> None:
+    """Refuse a snapshot that is not a retrieval of this run's population at its width."""
+    expected = [str(record['memory_id']) for record in labelled]
+    measured = [slate.memory_id for slate in snapshot.slates]
+    if measured != expected:
+        raise ValueError(
+            f'{path}: its slates\' memory_ids ({len(measured)}) are not this run\'s '
+            f'{len(expected)} labelled record(s) in order; write the snapshot with '
+            'the same --fixture and --limit',
+        )
+    if snapshot.judge_candidate_count != judge_candidate_count:
+        raise ValueError(
+            f'{path}: judge_candidate_count {snapshot.judge_candidate_count} is not '
+            f"this run's {judge_candidate_count}",
+        )
 
 
 def _run(args: Any) -> int:
@@ -584,13 +654,20 @@ def _run(args: Any) -> int:
     # redirected); rejecting here just means the operator is told now instead
     # of after a corpus-wide run they paid for.
     markdown_sibling(args.report_path)
+    if args.slate_mode != _scoring.SLATE_RETRIEVED:
+        for flag, value in (('--slates-in', args.slates_in), ('--slates-out', args.slates_out)):
+            if value is not None:
+                raise ValueError(
+                    f'{flag} snapshots a retrieval, so it needs --slate-mode '
+                    f'{_scoring.SLATE_RETRIEVED}, not {args.slate_mode}',
+                )
 
     # BEFORE any work, and outside the --limit block: a bare --dry-run also
     # defaults to the committed path, and used to rewrite both committed
     # artifacts with fixed-answer numbers.
     report_path = guard_committed_report(
         args.report_path, dry_run=args.dry_run, limit=args.limit,
-        slate_mode=args.slate_mode, wording=args.wording,
+        slate_mode=args.slate_mode, wording=args.wording, judge_model=args.judge_model,
     )
     aliases = load_canonical_aliases(args.canonical_aliases) if args.canonical_aliases else {}
 
@@ -601,6 +678,8 @@ def _run(args: Any) -> int:
     # `judge_write` applies to it.
     if args.judge_candidate_count is not None:
         config.write_triage.judge_candidate_count = args.judge_candidate_count
+    if args.judge_model is not None:
+        config.write_triage.judge_model = args.judge_model
     field_chars = apply_field_chars(config, args.field_chars)
     service = types.SimpleNamespace(config=config)
     provider = resolve_judge_provider(service)
@@ -730,12 +809,26 @@ def main() -> int:
                              'named, attach target, band, verdict, outcome and '
                              'elision flags (default: no per-case dump)')
     parser.add_argument('--wording', default=_wording.WORDING_SHIPPED,
-                        choices=_wording.WORDINGS,
+                        choices=_wording.SELECTABLE_WORDINGS,
                         help='the judge system prompt the run is made under; '
-                             'pre-psi is the pre-psi wording as an eval-side '
-                             'override. Recorded as '
+                             'pre-psi is the pre-psi wording and psi the '
+                             'prompt shipped from task 6149 until task 7155, '
+                             'each as an eval-side override. Recorded as '
                              'provenance.judge_system_prompt_sha256 '
                              '(default: shipped)')
+    parser.add_argument('--judge-model', dest='judge_model', default=None,
+                        help='override write_triage.judge_model for this run, '
+                             'in memory only — config.yaml is not written. '
+                             'Recorded as provenance.judge_model')
+    snapshots = parser.add_mutually_exclusive_group()
+    snapshots.add_argument('--slates-out', dest='slates_out', default=None,
+                           help='--slate-mode retrieved only: write the retrieved '
+                                'slates to this JSON file, for --slates-in runs '
+                                'to judge the same population')
+    snapshots.add_argument('--slates-in', dest='slates_in', default=None,
+                           help='--slate-mode retrieved only: judge the slates a '
+                                '--slates-out run wrote instead of retrieving; '
+                                'its project, band edges and width are recorded')
     return _run(parser.parse_args())
 
 

@@ -638,6 +638,9 @@ class TestADotMdReportPathIsRejectedAtArgumentTime:
             cases_path=None,
             canonical_aliases=None,
             wording='shipped',
+            judge_model=None,
+            slates_in=None,
+            slates_out=None,
         )
 
     def test_run_refuses_it_before_it_even_reads_the_fixture(
