@@ -153,6 +153,7 @@ async def invoke_agent(
     strict_mcp_config: bool = False,
     resume_prior_total_cost_usd: float | None = None,
     *,
+    setting_sources: list[str] | None = None,
     runner: CliRunner = run_cli_subprocess,
 ) -> AgentResult:
     """Invoke an agent via CLI and return structured result.
@@ -163,6 +164,10 @@ async def invoke_agent(
     the servers in *mcp_config*, ignoring the ambient project ``.mcp.json``
     merge (the recon-watch isolation pattern; task 2796, THREAD 2). The
     codex/gemini/pi backends ignore it — ``--strict-mcp-config`` is claude-only.
+    *setting_sources* (claude backend ONLY) names the settings files the CLI
+    reads; ``[]`` reads none, so no ambient permission allow rule reaches the
+    call. It is forwarded to ``shared.cli_invoke.build_claude_argv``, which
+    validates it; the other backends ignore it.
     *oauth_token*, when set, overrides the Claude CLI's default credentials
     via the ``CLAUDE_CODE_OAUTH_TOKEN`` env var (multi-account failover).
     *resume_session_id*, when set, resumes an existing Claude session.
@@ -209,6 +214,7 @@ async def invoke_agent(
             absolute_cap_secs=absolute_cap_secs,
             strict_mcp_config=strict_mcp_config,
             resume_prior_total_cost_usd=resume_prior_total_cost_usd,
+            setting_sources=setting_sources,
             runner=runner,
         )
     elif backend == 'codex':
@@ -350,14 +356,16 @@ async def _invoke_claude_with_sandbox(
     strict_mcp_config: bool = False,
     resume_prior_total_cost_usd: float | None = None,
     *,
+    setting_sources: list[str] | None = None,
     runner: CliRunner,
 ) -> AgentResult:
     """Invoke Claude Code CLI with optional bwrap sandboxing.
 
     Delegates to shared.cli_invoke for the core invocation; adds
-    orchestrator-specific sandbox wrapping. *strict_mcp_config* threads through
-    to ``build_claude_argv`` (both the sandboxed and non-sandbox sub-paths),
-    emitting ``--strict-mcp-config`` alongside ``--mcp-config`` (task 2796).
+    orchestrator-specific sandbox wrapping. *strict_mcp_config* and
+    *setting_sources* thread through to ``build_claude_argv`` (both the
+    sandboxed and non-sandbox sub-paths), emitting ``--strict-mcp-config``
+    alongside ``--mcp-config`` (task 2796) and ``--setting-sources``.
     """
     # Inject per-session CLI env defaults into every claude agent's subprocess
     # env.  MCP_TIMEOUT: a slow, hung, or incompatible stdio MCP is dropped
@@ -401,6 +409,7 @@ async def _invoke_claude_with_sandbox(
                 resume_session_id=resume_session_id,
                 session_id=session_id,
                 strict_mcp_config=strict_mcp_config,
+                setting_sources=setting_sources,
             )
 
             # User prompt piped via stdin to avoid ARG_MAX
@@ -465,6 +474,7 @@ async def _invoke_claude_with_sandbox(
         absolute_cap_secs=absolute_cap_secs,
         strict_mcp_config=strict_mcp_config,
         resume_prior_total_cost_usd=resume_prior_total_cost_usd,
+        setting_sources=setting_sources,
         runner=runner,
     )
 
