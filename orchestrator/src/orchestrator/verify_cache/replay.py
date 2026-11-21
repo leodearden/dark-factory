@@ -22,7 +22,7 @@ from orchestrator.verify_cache.keys import UnitKey
 from orchestrator.verify_cache.modes import CacheMode, VerifyRole
 from orchestrator.verify_cache.policy import CacheDecision, Decision, LegResult
 from orchestrator.verify_cache.recorder import CacheRecord, LegRun, RecordedUnit
-from orchestrator.verify_cache.registry import Registry, registry_db_path
+from orchestrator.verify_cache.registry import Entry, Registry, registry_db_path
 from orchestrator.verify_evidence import (
     GREEN_OUTCOMES,
     Leg,
@@ -136,11 +136,26 @@ class ReplayPlan:
 
     def replayed_legs(self, prefix: str | None) -> frozenset[Leg]:
         """The legs of module *prefix* that replay a recorded green instead of running."""
-        return frozenset(
-            leg for leg in Leg
-            if (decided := self.modules.get(module_leg_name(prefix, leg))) is not None
-            and decided.decision.decision is Decision.HIT
-        )
+        return frozenset(self._hits(prefix))
+
+    def replayed(self, prefix: str | None) -> tuple[tuple[str, Entry], ...]:
+        """Each unit of module *prefix* that replays a recorded green, with the entry it replays."""
+        return tuple(self._hits(prefix).values())
+
+    @property
+    def tree_replayed(self) -> tuple[tuple[str, Entry], ...]:
+        """The tree unit and the entry it replays, when the whole tree replays."""
+        entry = self.tree.decision.entry
+        return ((keys.TREE_UNIT_ID, entry),) if self.tree_hit and entry is not None else ()
+
+    def _hits(self, prefix: str | None) -> dict[Leg, tuple[str, Entry]]:
+        hits: dict[Leg, tuple[str, Entry]] = {}
+        for leg in Leg:
+            unit_id = module_leg_name(prefix, leg)
+            decided = self.modules.get(unit_id)
+            if decided is not None and decided.decision.decision is Decision.HIT and decided.decision.entry is not None:
+                hits[leg] = (unit_id, decided.decision.entry)
+        return hits
 
     def without_replayed(self, mc: ModuleConfig) -> ModuleConfig | None:
         """*mc* minus its replayed legs; None when nothing is left to run."""

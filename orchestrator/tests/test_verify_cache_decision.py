@@ -396,8 +396,10 @@ async def _task_verify(
     repo: Path, config: OrchestratorConfig, modules: Sequence[ModuleConfig], access: CacheAccess,
     task_files: list[str],
 ) -> VerifyResult:
+    """A task verify as the workflow runs one: its junit cost report is what admits its test leg."""
     return await run_scoped_verification(
         repo, config, list(modules), task_files, role='task', verify_cache=access,
+        attempt_id=1, task_id='5653', archive_root=repo.parent / 'verify-archive',
     )
 
 

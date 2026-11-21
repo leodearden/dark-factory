@@ -166,6 +166,13 @@ MERGE_PATH_CONFIG_READS: Mapping[str, Classified] = MappingProxyType({
         "The host's project_id, read only to name the project slice the cgroup scope runs under "
         '(task 3394): it places the run among the host\'s cgroups and leaves its commands alone.',
     ),
+    'verify_cache': Classified(
+        Fidelity.MERGE_NEUTRAL,
+        "Task 5653: the host's verify-result cache mode. A run joins the cache only through a "
+        'CacheAccess its caller passes, and the remote leg reaches it only as CacheAccess.on_runner(), '
+        'whose missing registry makes every unit UNAVAILABLE, so every leg still runs. The mode also '
+        'stamps the off-wire VerifyResult.cache_record, which never reaches the verdict.',
+    ),
     'verify_admission_background_promote_secs': Classified(Fidelity.MERGE_NEUTRAL, _ADMISSION),
     'verify_admission_enabled': Classified(Fidelity.MERGE_NEUTRAL, _ADMISSION),
     'verify_admission_nice_background': Classified(Fidelity.MERGE_NEUTRAL, _ADMISSION),
