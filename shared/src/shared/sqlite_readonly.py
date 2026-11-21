@@ -17,8 +17,8 @@ def connect_readonly(path: str | Path) -> sqlite3.Connection:
     """Open *path* with ``mode=ro`` and ``PRAGMA temp_store=MEMORY``.
 
     The URI is built from the RESOLVED absolute path, so a relative one cannot
-    be re-resolved against a different cwd by a subprocess or a later chdir —
-    the ``unable to open database file`` shape of the same confusion. It is
+    be re-resolved against a different cwd by a subprocess or a later chdir,
+    which would surface as ``unable to open database file``. It is
     percent-encoded, so a ``#``, ``?`` or ``%`` in the path cannot end the
     path early and drop ``mode=ro``.
     """
