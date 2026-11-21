@@ -11,10 +11,12 @@ from click.testing import CliRunner
 
 from orchestrator.cli import main
 from orchestrator.evals.configs import (
+    ARCHITECT_EVAL_CONFIGS,
     EVAL_CONFIGS,
     VLLM_EVAL_CONFIGS,
     EvalConfig,
     get_config_by_name,
+    ofat_candidates,
 )
 from orchestrator.evals.metrics import RoleUnderTest
 
@@ -395,20 +397,14 @@ class TestVllmUrlInjection:
 
 class TestArchitectEvalConfigs:
     def test_evalconfig_role_defaults_to_implementer(self):
-        from orchestrator.evals.configs import EvalConfig
-
         cfg = EvalConfig('x', 'claude', 'opus', 'high')
         assert cfg.role == 'implementer'
 
     def test_existing_eval_configs_all_resolve_implementer(self):
-        from orchestrator.evals.configs import EVAL_CONFIGS
-
         assert EVAL_CONFIGS  # non-empty
         assert all(c.role == 'implementer' for c in EVAL_CONFIGS)
 
     def test_architect_eval_configs_exist_with_architect_role(self):
-        from orchestrator.evals.configs import ARCHITECT_EVAL_CONFIGS
-
         assert len(ARCHITECT_EVAL_CONFIGS) >= 1
         assert all(c.role == 'architect' for c in ARCHITECT_EVAL_CONFIGS)
         # Candidate names are unique (they key results/lookup).
@@ -416,11 +412,6 @@ class TestArchitectEvalConfigs:
         assert len(names) == len(set(names))
 
     def test_get_config_by_name_resolves_architect_candidate(self):
-        from orchestrator.evals.configs import (
-            ARCHITECT_EVAL_CONFIGS,
-            get_config_by_name,
-        )
-
         name = ARCHITECT_EVAL_CONFIGS[0].name
         cfg = get_config_by_name(name)
         assert cfg is not None
@@ -436,8 +427,6 @@ class TestArchitectEvalConfigs:
         candidate is appended; the new candidate is config-only — it rides
         run_ofat_stage's existing generic role='architect' branch (task 2478).
         """
-        from orchestrator.evals.configs import ARCHITECT_EVAL_CONFIGS, EvalConfig
-
         existing = [
             EvalConfig('architect-opus-high', 'claude', 'opus', 'high', role=RoleUnderTest.ARCHITECT),
             EvalConfig('architect-opus-max', 'claude', 'opus', 'max', role=RoleUnderTest.ARCHITECT),
@@ -473,8 +462,6 @@ class TestArchitectEvalConfigs:
     ])
     def test_architect_fable52_arms_field_shape(self, name, effort):
         """Task 10488: Fable 5.2 arms are native claude architect candidates."""
-        from orchestrator.evals.configs import get_config_by_name
-
         cfg = get_config_by_name(name)
         assert cfg is not None
         assert cfg.backend == 'claude'
@@ -493,8 +480,6 @@ class TestArchitectEvalConfigs:
         so fable-trial-v2 δ's stage-2 screen needs this effort-matched pair to
         isolate the model delta cleanly.
         """
-        from orchestrator.evals.configs import get_config_by_name, ofat_candidates
-
         cfg = get_config_by_name('architect-fable-max')
         assert cfg is not None
         assert cfg.backend == 'claude'

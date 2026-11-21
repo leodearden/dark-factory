@@ -505,7 +505,7 @@ class TestJudgePlanQuality:
     # This is a NARROWING of the task-3410 clamp+warn doctrine, not a
     # reversal: FINITE out-of-range answers (e.g. 1.5) stay orderable and
     # intent-preserving, and keep the clamp+warn path pinned by the sibling
-    # tests directly above (~:930-994).
+    # tests directly above.
 
     @pytest.mark.parametrize('via', ['structured_output', 'json_output'])
     @pytest.mark.parametrize('raw', [
