@@ -123,3 +123,146 @@ class TestSleepMessage:
 
     def test_states_the_hang_simulator_floor(self, message: str):
         assert '60 s' in message
+
+
+def _assert_positions(source: str) -> list[tuple[int, int]]:
+    tree = ast.parse(textwrap.dedent(source))
+    return sorted((node.lineno, node.col_offset) for node in ast.walk(tree) if isinstance(node, ast.Assert))
+
+
+_ELAPSED_FLAGGED = {
+    'direct': """
+        import time
+
+        def test_case():
+            t0 = time.monotonic()
+            assert time.monotonic() - t0 < 0.5
+        """,
+    'elapsed_binding': """
+        import time
+
+        def test_case(start):
+            elapsed = time.monotonic() - start
+            assert elapsed < 2
+        """,
+    'clock_bindings': """
+        import time
+
+        def test_case():
+            start = time.perf_counter()
+            end = time.perf_counter()
+            assert end - start < 1.0
+        """,
+    'rounded_loop_read': """
+        def test_case(loop, t0):
+            took = round(loop.time() - t0, 2)
+            assert took >= 0.1
+        """,
+    'chained': """
+        import time
+
+        def test_case(t0):
+            elapsed = time.monotonic() - t0
+            assert 0.4 < elapsed < 0.6
+        """,
+    'nested_async_scope': """
+        import asyncio
+
+        def test_case():
+            async def scenario(work):
+                t0 = asyncio.get_running_loop().time()
+                await work()
+                elapsed = asyncio.get_running_loop().time() - t0
+                assert elapsed < 1
+        """,
+    'attribute_loop_receiver': """
+        class TestCase:
+            def test_case(self, t0):
+                elapsed = self._loop.time() - t0
+                assert elapsed <= 3
+        """,
+    'nanosecond_read': """
+        import time
+
+        def test_case(t0):
+            assert time.time_ns() - t0 < 5_000_000
+        """,
+}
+
+_ELAPSED_NOT_FLAGGED = {
+    'fake_clock_read': """
+        def test_case(fake_clock, t0):
+            elapsed = fake_clock.monotonic() - t0
+            assert elapsed == 5
+        """,
+    'no_literal': """
+        import time
+
+        def test_case(t0, budget):
+            elapsed = time.monotonic() - t0
+            assert elapsed < budget * 2
+        """,
+    'not_a_numeric_comparison': """
+        import time
+
+        def test_case(t0):
+            elapsed = time.monotonic() - t0
+            assert elapsed is not None
+        """,
+    'bound_in_another_function': """
+        import time
+
+        def helper(t0):
+            elapsed = time.monotonic() - t0
+            return elapsed
+
+        def test_case(elapsed):
+            assert elapsed < 2
+        """,
+    'no_subtraction': """
+        import time
+
+        def test_case():
+            assert time.monotonic() > 0
+        """,
+    'no_clock_binding': """
+        def test_case(x, y):
+            assert x - y < 1
+        """,
+}
+
+
+class TestElapsedAssertLeg:
+    """An assert comparing a REAL elapsed time with a numeric literal, resolved in its own scope."""
+
+    @pytest.mark.parametrize('source', _ELAPSED_FLAGGED.values(), ids=_ELAPSED_FLAGGED.keys())
+    def test_one_violation_at_the_assert(self, source: str):
+        found = _scan(source)
+        assert [(v.lineno, v.col_offset) for v in found] == _assert_positions(source), found
+
+    @pytest.mark.parametrize('source', _ELAPSED_NOT_FLAGGED.values(), ids=_ELAPSED_NOT_FLAGGED.keys())
+    def test_not_a_real_elapsed_time_against_a_literal(self, source: str):
+        assert _scan(source) == []
+
+
+class TestElapsedAssertMessage:
+    @pytest.fixture
+    def message(self) -> str:
+        [violation] = _scan(_ELAPSED_FLAGGED['chained'])
+        return violation.message
+
+    def test_names_the_rule_and_the_comparison_and_no_other_rules_vocabulary(self, message: str):
+        _assert_owns_its_vocabulary(message)
+        assert '0.4 < elapsed < 0.6' in message
+
+    @pytest.mark.parametrize(
+        'needle',
+        [
+            'merge gate',
+            'shared/src/shared/pytest_fake_clock.py::fake_clock',
+            'shared/src/shared/testing_virtual_clock.py::virtual_clock_test',
+            '@pytest.mark.timing(reason=',
+        ],
+    )
+    def test_names_why_and_each_remedy(self, message: str, needle: str):
+        assert needle in message
