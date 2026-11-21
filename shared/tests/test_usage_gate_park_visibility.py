@@ -588,6 +588,61 @@ class TestScopeExhaustedParkIsVisible:
             f'readers to ignore it: {[p for _, p in _park_records(caplog, SCOPE_PARK_EVENT)]!r}'
         )
 
+    async def test_the_scoped_heartbeat_is_throttled_under_fast_repolls(
+        self, caplog, fast_scope_heartbeat, monkeypatch
+    ) -> None:
+        """A scoped park that re-polls fast must not turn the log into a flood.
+
+        NOT a hypothetical: while any account is probe_in_flight the scoped
+        park re-polls every ``_SCOPE_WAIT_REPOLL_CEIL_SECS``, one loop pass per
+        re-poll for as long as the probe is outstanding. Here b stays mid-probe
+        (the legacy setter arms no probe-hold timer) and a is scope-capped, so
+        the park re-polls every 2ms with the fleet open.
+        """
+        interval = fast_scope_heartbeat(0.5)
+        repoll_secs = 0.002
+        monkeypatch.setattr(usage_gate_mod, '_SCOPE_WAIT_REPOLL_CEIL_SECS', repoll_secs)
+        gate = make_gate(['a', 'b'], wait_for_reset=False)
+        async with gate.invoke_slot(scope=SCOPE) as slot:
+            slot.report(CapHit(
+                resets_at=datetime.now(UTC) + timedelta(hours=5), reason='test cap',
+            ))
+        gate._accounts[1].probe_in_flight = True
+        assert not gate.is_paused, (
+            'fixture must leave the fleet open, or this is the all-capped park'
+        )
+
+        # A correct throttle's heartbeat count is bounded by elapsed time, so a
+        # run is evidence only when the re-poll chances exceed the budget below.
+        target_chances = 200
+        started = time.monotonic()
+        async with _interval_ticks(repoll_secs) as ticks:
+            await _park_for(
+                gate,
+                0.0,
+                scope=SCOPE,
+                until=lambda: ticks() >= target_chances,
+                valve_secs=30.0,
+            )
+        duration = time.monotonic() - started
+
+        heartbeats = len(_park_records(caplog, SCOPE_PARK_EVENT))
+        chances = ticks()
+        heartbeat_budget = math.ceil(duration / interval) + 2
+
+        if chances <= heartbeat_budget:
+            pytest.skip(
+                f'only {chances} re-poll chances in {duration:.1f}s, no more than '
+                f'the {heartbeat_budget} heartbeats a {interval}s throttle may emit '
+                'in that time: the host never re-polled faster than the throttle, '
+                'so there was no flood to bound'
+            )
+        assert heartbeats <= heartbeat_budget, (
+            f'{heartbeats} scope_exhausted_park heartbeats across {duration:.2f}s '
+            f'at a {interval}s interval: the log rate must be bounded by the '
+            f'interval, not by how often the park re-polls ({chances} chances)'
+        )
+
 
 class TestAnAbandonedParkIsNotInherited:
     """A park that ends by cancellation must not bequeath its clock.
