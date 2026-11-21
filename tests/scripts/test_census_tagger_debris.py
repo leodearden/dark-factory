@@ -2098,6 +2098,17 @@ def test_the_artifact_cannot_silently_lag_a_schema_bump(artifact):
     assert artifact["schema_version"] == SCHEMA_VERSION
 
 
+def test_the_committed_artifact_carries_the_builders_static_params(artifact):
+    """A params change made without regenerating leaves consumers reading a
+    stale self-description, which is why the schema-bump test exists too."""
+    expected = build_report([])["params"]
+    markdown = _ARTIFACT_MD.read_text(encoding="utf-8")
+
+    for key in sorted(expected.keys() - {"project_roots", "regen_command"}):
+        assert artifact["params"][key] == expected[key], key
+    assert "Consumers: " + ", ".join(expected["consumers"]) + "." in markdown
+
+
 def test_all_six_corpora_are_present_in_both_halves(artifact):
     """(c) A missing project is indistinguishable from a project with nothing
     to report unless the block is present with its counts."""
