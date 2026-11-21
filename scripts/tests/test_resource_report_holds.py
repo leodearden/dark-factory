@@ -18,6 +18,7 @@ import pytest
 import resource_report_holds as holds
 from resource_report_fixtures import memory_hold, project_root, samples_db, write_collection
 from sampler.consumers import Consumer, Figure, Role, encode_consumer
+from sampler.host_memory import ReclaimThreadKind
 from shared.project_layout import runs_db
 from shared.verify_scope_tag import scope_tag_for
 
@@ -500,3 +501,75 @@ class TestHoldMappingBothShapesEndToEnd:
             Consumer(Role.VERIFY, scope_tag_for(factory))
         )
         assert project['verify']['status'] == 'absent'
+
+
+class TestReclaimThreads:
+    """Collections S, S+30 and E; one hold at E+5. Host CPU is every consumer's, aside roles too."""
+
+    @pytest.fixture
+    def root(self, tmp_path: Path, make_runs_db) -> Path:
+        root = project_root(tmp_path, 'dark-factory')
+        make_runs_db([memory_hold(at(65), DF_UNIT)], directory=runs_db(root).parent)
+        return root
+
+    def report(self, tmp_path: Path, root: Path, *, with_reclaim: bool) -> holds.HoldsReport:
+        store = samples_db(tmp_path / 'load-samples.db')
+        for seconds in (0, 30, 60):
+            in_window = seconds > 0
+            reclaim = {
+                ReclaimThreadKind.KSWAPD: 2_000_000 if in_window else 9_999_999,
+                ReclaimThreadKind.KCOMPACTD: 500_000 if in_window else 9_999_999,
+            }
+            write_collection(
+                store,
+                ts(seconds),
+                {
+                    DF_SERVICE: {Figure.ANON: GiB, Figure.CPU_USEC: 6_000_000},
+                    KERNEL: {Figure.ANON: GiB, Figure.CPU_USEC: 4_000_000},
+                },
+                reclaim=reclaim if with_reclaim else None,
+            )
+        return holds.read_holds_report([root], store, since=T0, window_seconds=120)
+
+    def test_the_reclaim_threads_cpu_and_its_share_of_host_cpu(self, tmp_path, root):
+        report = self.report(tmp_path, root, with_reclaim=True)
+        (reading,) = report.readings
+        assert reading.window is not None
+
+        entry = hold_json(report, at(65))
+
+        assert (reading.window.reclaim_threads_cpu_usec, reading.window.host_cpu_usec) == (
+            5_000_000, 20_000_000
+        )
+        assert entry['reclaim_threads_cpu_usec'] == 5_000_000
+        assert entry['host_cpu_usec'] == 20_000_000
+        assert entry['reclaim_threads_share'] == pytest.approx(0.25)
+
+    def test_the_kernel_line_names_the_reclaim_threads_cpu(self, tmp_path, root):
+        report = self.report(tmp_path, root, with_reclaim=True)
+
+        kernel = next(
+            line.strip()
+            for line in hold_block(holds.render_text(report), at(65)).splitlines()
+            if line.strip().startswith('kernel:')
+        )
+
+        assert 'reclaim threads 5.0 s CPU' in kernel
+        assert '25.0% of host CPU' in kernel
+
+    def test_no_reclaim_rows_is_unavailable_never_zero(self, tmp_path, root):
+        report = self.report(tmp_path, root, with_reclaim=False)
+        (reading,) = report.readings
+        assert reading.window is not None
+
+        entry = hold_json(report, at(65))
+        kernel = next(
+            line.strip()
+            for line in hold_block(holds.render_text(report), at(65)).splitlines()
+            if line.strip().startswith('kernel:')
+        )
+
+        assert reading.window.reclaim_threads_cpu_usec is None
+        assert (entry['reclaim_threads_cpu_usec'], entry['reclaim_threads_share']) == (None, None)
+        assert entry['host_cpu_usec'] == 20_000_000
+        assert 'reclaim threads unavailable' in kernel

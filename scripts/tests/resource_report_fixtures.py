@@ -17,7 +17,8 @@ from typing import Any
 
 import _checkout as _checkout
 from sampler.consumers import Consumer, Figure, encode_consumer
-from sampler.metrics import FIGURE_METRICS, MetricSpec
+from sampler.host_memory import ReclaimThreadKind
+from sampler.metrics import FIGURE_METRICS, RECLAIM_METRICS, MetricSpec
 from sampler.store import SCHEMA
 from shared.project_layout import runs_db
 from shared.psi import PsiSample
@@ -83,11 +84,13 @@ def write_collection(
     consumers: Mapping[Consumer, Mapping[Figure, float]],
     *,
     unreadable: Collection[Consumer] = frozenset(),
+    reclaim: Mapping[ReclaimThreadKind, float] | None = None,
 ) -> None:
     """One consumer collection at *ts*; stall figures are given in seconds, as stored.
 
     Every consumer named, in *consumers* or *unreadable*, gets a readability
-    row: 0 when it is in *unreadable*, else 1.
+    row: 0 when it is in *unreadable*, else 1. Each *reclaim* thread kind's CPU
+    increment (µs) is a host-level row.
     """
     rows: list[tuple[int, str, float, str | None]] = []
 
@@ -99,6 +102,8 @@ def write_collection(
     for consumer, figures in consumers.items():
         for figure, value in figures.items():
             add(FIGURE_METRICS[figure].spec, value, encode_consumer(consumer))
+    for kind, usec in (reclaim or {}).items():
+        add(RECLAIM_METRICS[kind], usec, None)
     conn = sqlite3.connect(db)
     try:
         conn.execute('PRAGMA synchronous = OFF')  # a throwaway fixture store needs no fsync
