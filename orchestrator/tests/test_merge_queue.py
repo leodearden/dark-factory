@@ -64,6 +64,7 @@ from orchestrator.merge_lane.gates import (
     DropGuardResult,
     _check_plan_files_touched_in_branch,
     _reverify_rebased_tree,
+    note_queue_verified_main_tip,
 )
 from orchestrator.merge_lane.intake import (
     MERGE_LANES,
@@ -15901,6 +15902,8 @@ class TestReverifyRebasedTree:
         merge_wt cleaned up.
     (d) A green re-verify of a real advance_main rebase seeds main's baseline
         at the rebased sha, and the follow-up advance lands exactly that sha.
+    (e) A trusted disjoint skip clears with no verify and seeds NO baseline
+        at the rebased sha: an unverified tree is never every-module-green.
     """
 
     async def _make_merge_wt(
@@ -15928,6 +15931,13 @@ class TestReverifyRebasedTree:
         rc, _, err = await _run(['git', 'rebase', rebased_onto], cwd=merge_wt)
         assert rc == 0, err
         return merge_wt, req, verified.strip(), rebased_from, rebased_onto
+
+    @staticmethod
+    def _mock_green_verify_with_ids() -> AsyncMock:
+        """A passing verify whose failing_test_ids is a set: a None leaves the baseline unseeded."""
+        return AsyncMock(return_value=fake_verify_result(
+            passed=True, summary='', failing_test_ids=frozenset(),
+        ))
 
     async def _advance_onto_drift(
         self, git_ops: GitOps, config: OrchestratorConfig, branch_name: str,
@@ -16339,10 +16349,7 @@ class TestReverifyRebasedTree:
                 git_ops, config.model_copy(update={'merge_verify_breadth': 'full'}), branch_name,
             )
         )
-        # failing_test_ids must be a set: a None leaves the baseline unseeded.
-        verify_mock = AsyncMock(return_value=fake_verify_result(
-            passed=True, summary='', failing_test_ids=frozenset(),
-        ))
+        verify_mock = self._mock_green_verify_with_ids()
         try:
             with patch('orchestrator.merge_lane.worker.run_scoped_verification', verify_mock):
                 result = await _reverify_rebased_tree(
@@ -16373,6 +16380,46 @@ class TestReverifyRebasedTree:
             assert landed.result == 'advanced', landed
             assert await git_ops.get_main_sha() == rebased_sha, (
                 'the seeded sha must be the one that lands on main'
+            )
+        finally:
+            if merge_wt.exists():
+                await git_ops.cleanup_merge_worktree(merge_wt)
+
+    async def test_disjoint_skip_landing_seeds_no_baseline(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """(e) Real git disjointness over a queue-verified drift clears with no
+        verify, so nothing may record the rebased sha's tree as green.
+        """
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
+
+        scoped = config.model_copy(update={'merge_verify_breadth': 'scoped'})
+        merge_wt, req, verified, rebased_from, rebased_onto, rebased_sha = (
+            await self._advance_onto_drift(git_ops, scoped, 'rvrt-seed-disjoint')
+        )
+        note_queue_verified_main_tip(git_ops.project_root, rebased_onto)
+        verify_mock = self._mock_green_verify_with_ids()
+        try:
+            with patch('orchestrator.merge_lane.worker.run_scoped_verification', verify_mock):
+                result = await _reverify_rebased_tree(
+                    git_ops, req, merge_wt,
+                    verified_merge_sha=verified,
+                    rebased_from=rebased_from,
+                    rebased_onto=rebased_onto,
+                    timeouts={},
+                    enospc_retries={},
+                    max_timeouts=3,
+                    max_enospc=1,
+                    merge_sha=rebased_sha,
+                    run_post_merge_verify=functools.partial(
+                        run_post_merge_verify, verifier=PRODUCTION_VERIFIER,
+                    ),
+                    event_store=None,
+                )
+            assert result == GateClearance.disjoint, result
+            verify_mock.assert_not_called()
+            assert cached_main_baseline_failing_ids(rebased_sha) is None, (
+                'a tree no verify ran on must not be seeded as every-module-green'
             )
         finally:
             if merge_wt.exists():
