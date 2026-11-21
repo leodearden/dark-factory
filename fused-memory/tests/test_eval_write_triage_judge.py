@@ -112,6 +112,16 @@ class TestRunJudgeEval:
         _run(tmp_path)
         assert (tmp_path / 'report.md').exists()
 
+    def test_the_routing_block_is_the_score_of_the_cases_dump(self, tmp_path: Path) -> None:
+        cases_path = tmp_path / 'cases.jsonl'
+        report = _mod().run_judge_eval(
+            plan=_cases_mod().seeded_plan(_corpus(), distractors=2),
+            judge_fn=_fake_judge(), report_path=tmp_path / 'report.json',
+            provenance=dict(_PROVENANCE), cases_path=cases_path,
+        )
+        rows = [json.loads(line) for line in cases_path.read_text().splitlines()]
+        assert report['routing'] == _scoring().score_routing(rows)
+
     # --- the markdown sibling's composition (gate item 4) --------------------
     #
     # `run_judge_eval` writes the JSON and then a markdown sibling. Deriving
