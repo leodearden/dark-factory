@@ -14,13 +14,14 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Iterable, Mapping
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 from orchestrator.merge_verify_facts import ChainMembers, MergeVerifyDispatchFacts
 from orchestrator.task_priority import (
     TaskPriority,
     TaskPriorityLookup,
+    anchor_from_epoch,
     read_task_priority,
     task_age,
 )
@@ -43,7 +44,7 @@ def queued_request_fields(
 ) -> dict[str, object]:
     """The keys ``merge_queued`` adds for *req*: its identity, lane, tiers, pin, and age at *now*."""
     age = task_age(
-        priority, now=now, fallback_anchor=datetime.fromtimestamp(req.first_enqueued_at, UTC),
+        priority, now=now, fallback_anchor=anchor_from_epoch(req.first_enqueued_at),
     )
     return {
         'request_id': req.request_id,

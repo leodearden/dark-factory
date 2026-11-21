@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Protocol
 
 from orchestrator.config import PRIORITY_TIERS
@@ -102,6 +102,15 @@ def task_age(p: TaskPriority, *, now: datetime, fallback_anchor: datetime | None
     except (TypeError, OverflowError):
         secs = 0.0
     return TaskAge(secs, from_anchor=from_anchor)
+
+
+def anchor_from_epoch(epoch: float) -> datetime | None:
+    """The aware UTC instant *epoch* seconds names, or ``None`` when it names none
+    (NaN, an infinity, an out-of-range or millisecond epoch); never raises."""
+    try:
+        return datetime.fromtimestamp(epoch, UTC)
+    except (OverflowError, ValueError, OSError):
+        return None
 
 
 def order_key(
