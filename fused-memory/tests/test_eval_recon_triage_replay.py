@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import functools
 import hashlib
+import json
 import types
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,18 @@ from typing import Any
 import pytest
 from _fm_helpers import load_script_module
 
+from fused_memory.reconciliation.cli_stage_runner import (
+    DISALLOW_MEMORY_WRITES,
+    STAGE1_DISALLOWED,
+)
+from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
+from fused_memory.reconciliation.stage1_payload_format import format_memories
+from fused_memory.server.grouped_read import (
+    AMENDMENT_KIND,
+    CONTESTED_METADATA_KEY,
+    PARENT_ID_KEY,
+    SIGHTING_KIND,
+)
 from fused_memory.server.write_triage import OUTCOME_AMENDED, OUTCOME_CONTESTED, OUTCOME_RESTATED
 
 SCRIPTS = Path(__file__).parent.parent / 'scripts'
@@ -195,3 +208,146 @@ class TestTheDefaultAllocation:
         }
         assert sum(_mod().DEFAULT_ALLOCATION.values()) == 160
         assert _mod().SAMPLE_SEED == 7161
+
+
+# ── the worklist ───────────────────────────────────────────────────────────
+
+
+def _worklist_rows() -> list[dict[str, Any]]:
+    """Two projects' sample rows: 5 in p1 across the outcomes, 3 in p2."""
+    shapes = [
+        ('p1', OUTCOME_CONTESTED), ('p1', OUTCOME_CONTESTED), ('p1', OUTCOME_AMENDED),
+        ('p1', OUTCOME_RESTATED), ('p1', OUTCOME_RESTATED),
+        ('p2', OUTCOME_CONTESTED), ('p2', OUTCOME_AMENDED), ('p2', OUTCOME_RESTATED),
+    ]
+    return [
+        {'entry_id': f'E{index}', 'target_id': f'P{index}', 'outcome': outcome, 'project': project,
+         'stratum': _scoring().sample_stratum(outcome, project), 'headline': True,
+         'live_recon_state': None}
+        for index, (project, outcome) in enumerate(shapes)
+    ]
+
+
+def _texts_root(tmp_path: Path, rows: list[dict[str, Any]]) -> Path:
+    """A RatingScratch-layout texts.json: each pair on the current basis, one also at attach time."""
+    records = [
+        {'basis': 'current', 'child_text': f'child text of {row["entry_id"]}',
+         'entry_id': row['entry_id'], 'parent_text': f'parent text of {row["target_id"]}',
+         'target_id': row['target_id']}
+        for row in rows
+    ]
+    records.append({**records[0], 'basis': 'attach_time', 'child_text': 'the attach-time child'})
+    (tmp_path / 'texts.json').write_text(json.dumps(records))
+    return tmp_path
+
+
+def _texts(tmp_path: Path, rows: list[dict[str, Any]]) -> Any:
+    root = _texts_root(tmp_path, rows)
+    return _mod().load_texts(root, {row['entry_id']: row['project'] for row in rows})
+
+
+class TestTheBatchPlan:
+    def test_each_batch_is_one_project_of_at_most_size_rows(self) -> None:
+        for batch in _mod().plan_batches(_worklist_rows(), size=2, seed=7161):
+            assert {row['project'] for row in batch.rows} == {batch.project}
+            assert 1 <= len(batch.rows) <= 2
+
+    def test_every_row_lands_in_exactly_one_batch(self) -> None:
+        batches = _mod().plan_batches(_worklist_rows(), size=2, seed=7161)
+        placed = [row['entry_id'] for batch in batches for row in batch.rows]
+        assert sorted(placed) == sorted(row['entry_id'] for row in _worklist_rows())
+
+    def test_batch_names_are_deterministic_and_unique(self) -> None:
+        first = _mod().plan_batches(_worklist_rows(), size=2, seed=7161)
+        again = _mod().plan_batches(list(reversed(_worklist_rows())), size=2, seed=7161)
+        assert [batch.name for batch in first] == [batch.name for batch in again]
+        assert first == again
+        assert len({batch.name for batch in first}) == len(first)
+
+    def test_order_within_a_project_follows_the_seed(self) -> None:
+        def order(seed: int) -> list[str]:
+            return [row['entry_id'] for batch in _mod().plan_batches(
+                _worklist_rows(), size=8, seed=seed) for row in batch.rows]
+
+        orders = {tuple(order(seed)) for seed in range(6)}
+        assert len(orders) > 1
+
+
+class TestTheWorklistPayload:
+    def _payload(self, tmp_path: Path) -> tuple[Any, str]:
+        rows = _worklist_rows()
+        batch = next(b for b in _mod().plan_batches(rows, size=8, seed=7161) if b.project == 'p1')
+        payload = _mod().render_worklist_payload(
+            batch, _texts(tmp_path, rows), project_id='p1', project_root='/srv/p1',
+        )
+        return batch, payload
+
+    def test_it_opens_with_the_stage_1_header(self, tmp_path: Path) -> None:
+        _, payload = self._payload(tmp_path)
+        assert payload.splitlines()[:2] == [
+            '## Reconciliation Run — Stage 1: Memory Consolidation', '## Project: p1',
+        ]
+
+    def test_each_child_and_parent_renders_as_stage_1_renders_a_record(self, tmp_path: Path) -> None:
+        batch, payload = self._payload(tmp_path)
+        blocks = payload.split('\n#### ')
+        for row in batch.rows:
+            [block] = [block for block in blocks if block.startswith(f'child {row["entry_id"]}')]
+            contested = row['outcome'] == OUTCOME_CONTESTED
+            metadata: dict[str, Any] = {
+                PARENT_ID_KEY: row['target_id'],
+                'kind': SIGHTING_KIND if row['outcome'] == OUTCOME_RESTATED else AMENDMENT_KIND,
+            }
+            if contested:
+                metadata[CONTESTED_METADATA_KEY] = True
+            child_line, _ = format_memories([{
+                'id': row['entry_id'], 'memory': f'child text of {row["entry_id"]}',
+                'metadata': metadata,
+            }])
+            parent_line, _ = format_memories([{
+                'id': row['target_id'], 'memory': f'parent text of {row["target_id"]}',
+                'metadata': {},
+            }])
+            assert child_line in block.splitlines()
+            assert parent_line in block.splitlines()
+            assert f'triage_outcome={row["outcome"]}' in block
+            assert f'{CONTESTED_METADATA_KEY}={"true" if contested else "false"}' in block
+
+    def test_it_states_the_soak_caveat_and_the_project_root(self, tmp_path: Path) -> None:
+        _, payload = self._payload(tmp_path)
+        assert '2026-10-19' in payload
+        assert 'Use project_root="/srv/p1"' in payload
+
+    def test_it_holds_no_text_from_another_batch(self, tmp_path: Path) -> None:
+        batch, payload = self._payload(tmp_path)
+        mine = {row['entry_id'] for row in batch.rows}
+        for row in _worklist_rows():
+            if row['entry_id'] not in mine:
+                assert f'child text of {row["entry_id"]}' not in payload
+                assert row['entry_id'] not in payload
+
+    def test_it_reads_the_current_basis_only(self, tmp_path: Path) -> None:
+        _, payload = self._payload(tmp_path)
+        assert 'the attach-time child' not in payload
+
+
+class TestTheReplayContract:
+    def test_the_system_prompt_is_stage_1_s_verbatim_plus_the_vocabulary(self) -> None:
+        prompt = _mod().REPLAY_SYSTEM_PROMPT
+        assert prompt.startswith(STAGE1_SYSTEM_PROMPT)
+        addendum = prompt[len(STAGE1_SYSTEM_PROMPT):]
+        for decision in _scoring().Decision:
+            assert decision.value in addendum
+
+    def test_the_deny_list_keeps_every_store_write_out(self) -> None:
+        denied = set(_mod().REPLAY_DISALLOWED)
+        assert denied >= set(STAGE1_DISALLOWED)
+        assert denied >= set(DISALLOW_MEMORY_WRITES)
+        assert 'mcp__fused-memory__propose_consolidation' in denied
+
+    def test_the_output_schema_enumerates_exactly_the_decisions(self) -> None:
+        item = _mod().REPLAY_OUTPUT_SCHEMA['properties']['decisions']['items']
+        assert set(item['properties']['decision']['enum']) == {
+            decision.value for decision in _scoring().Decision
+        }
+        assert set(item['required']) >= {'child_id', 'decision', 'relabel_to', 'reason', 'evidence'}
