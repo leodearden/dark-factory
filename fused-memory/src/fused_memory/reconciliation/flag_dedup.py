@@ -4618,53 +4618,27 @@ async def acknowledge_resolved_flags(
     return total
 
 
-def filter_blocked_snapshot_findings(
+def filter_task_count_snapshot_findings(
     flags: list[dict[str, Any]],
-    project_id: str,
 ) -> list[dict[str, Any]]:
-    """Drop Stage-3 false-positive findings about blocked task-count snapshot edges.
+    """Drop Stage-3 findings that a task-count snapshot is missing or stale.
 
-    For projects in :data:`SNAPSHOT_WRITE_BLOCKED_PROJECTS`, the ABSENCE or
-    staleness of a task-count snapshot temporal_fact edge is the CORRECT state
-    (both write paths are blocked-by-design).  Stage 3 findings asserting the
-    edge is missing or stale are false positives and must be suppressed.
-
-    A flag is DROPPED iff **all three** conditions hold:
-    1. ``project_id`` is in :data:`SNAPSHOT_WRITE_BLOCKED_PROJECTS`.
-    2. ``flag['category']`` is in :data:`_SUPPRESSED_SNAPSHOT_CATEGORIES`
-       (``missing_knowledge`` or ``memory_stale``).
-    3. :func:`_is_task_count_snapshot_finding` returns ``True`` for the flag.
-
-    All other flags pass through unchanged (fail-open).  The blast radius is
-    tight: only registered projects × two categories × matching signature.
-
-    A ``logger.debug`` line is emitted per dropped flag for observability.
-
-    Args:
-        flags: List of flag dicts from Stage 3 ``items_flagged``.
-        project_id: The project being reconciled.
-
-    Returns:
-        Filtered list with false-positive blocked-snapshot findings removed.
+    No project writes a task-count snapshot (task 10081), so such a finding is
+    a false positive everywhere. A flag is dropped iff its ``category`` is in
+    :data:`_SUPPRESSED_SNAPSHOT_CATEGORIES` and
+    :func:`_is_task_count_snapshot_finding` matches it; every other flag passes
+    through, with a ``logger.debug`` line per drop.
     """
-    from fused_memory.reconciliation.policies import is_snapshot_write_blocked
-
-    if not is_snapshot_write_blocked(project_id):
-        # Fail-open: project is not in the blocked set; return all flags unchanged.
-        return list(flags)
-
     kept: list[dict[str, Any]] = []
     for flag in flags:
         category = flag.get('category') or ''
         if category in _SUPPRESSED_SNAPSHOT_CATEGORIES and _is_task_count_snapshot_finding(flag):
             logger.debug(
-                'filter_blocked_snapshot_findings: dropping %s finding for task_id=%s '
-                '(snapshot writes blocked-by-design for project %s)',
+                'filter_task_count_snapshot_findings: dropping %s finding for task_id=%s '
+                '(no project keeps a task-count snapshot)',
                 category,
                 flag.get('task_id'),
-                project_id,
             )
-            # do NOT append — flag is dropped
         else:
             kept.append(flag)
 

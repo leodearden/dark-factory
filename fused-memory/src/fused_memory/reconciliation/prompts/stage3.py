@@ -7,10 +7,7 @@ from fused_memory.reconciliation.dangling_citation import (
 from fused_memory.reconciliation.graphiti_degradation_probe import (
     render_graphiti_degradation_probe_section,
 )
-from fused_memory.reconciliation.policies import (
-    CONTAMINATION_CEILING_RETIRED_PROJECTS,
-    SNAPSHOT_WRITE_BLOCKED_PROJECTS,
-)
+from fused_memory.reconciliation.policies import CONTAMINATION_CEILING_RETIRED_PROJECTS
 from fused_memory.reconciliation.prompts import (
     _STAGE3_PROJECT_ID_GUIDELINE,
     DUPLICATE_FINDING_SALVAGE_GUIDANCE,
@@ -130,37 +127,16 @@ divergence between stores, or knowledge gaps.
 
 {render_graphiti_degradation_probe_section(runs_probes=False)}
 
-## Snapshot Discipline Exception (task-1840)
+## No Task-Count Snapshot Is Kept
 
-For projects whose task-count snapshot write paths are **blocked-by-design** \
-(currently: {', '.join(sorted(SNAPSHOT_WRITE_BLOCKED_PROJECTS))}), the **ABSENCE \
-or staleness** of a task-count snapshot `temporal_fact` edge is the **CORRECT \
-STATE** — do NOT report it as `missing_knowledge` or `memory_stale`.
+Reconciliation writes no task-count snapshot for any project, neither as a Mem0 \
+observation nor as a Graphiti `temporal_facts` edge. Its **absence or staleness** is \
+the **CORRECT STATE** — do NOT report it as `missing_knowledge` or `memory_stale`; \
+**skip the finding entirely**.
 
-Background: two write paths exist for task-count snapshot edges:
-- **Direct path**: `add_memory(category='temporal_facts', ...)` from any \
-  `recon-stage-*` agent is rejected by the project-agnostic \
-  `ReconSnapshotWriteRejected` server guard in `server/tools.py`. This guard \
-  carries no project_id condition, so it unconditionally blocks the direct path \
-  for every registered project.
-- **Graphiti async queue**: best-effort and unreliable. It usually silently \
-  no-ops (`memory_ids=[]`) so no edge lands, but may occasionally land an edge \
-  for some projects. Its success is never guaranteed and must not be relied upon.
-
-Because the only reliable write path (direct) is unconditionally blocked for \
-these projects, the presence of the edge is never guaranteed — its absence or \
-staleness is therefore the expected, structural, non-actionable state, even if \
-an edge is occasionally observed via the unreliable async path. Reporting the \
-absence/staleness as a gap triggers wasteful Stage 2 remediation that will \
-always fail on the direct path (task 1840; run evidence: 43183638, 929b4135, \
-5f2d3c77, 97a11280, ccce9d10).
-
-A code-side gate (`filter_blocked_snapshot_findings` in `flag_dedup.py`) drops \
-these findings after the run as a defense-in-depth backstop — but avoiding them \
-at the source keeps Stage 2 load clean.
-
-If you observe a task-count snapshot edge for any of these projects that appears \
-stale or missing, **skip the finding entirely**.
+A code-side gate (`filter_task_count_snapshot_findings` in `flag_dedup.py`) drops \
+these findings after the run as a backstop — but avoiding them at the source keeps \
+Stage 2 load clean.
 
 ## Contamination-Ceiling Retirement Exception (task 2818/2826)
 

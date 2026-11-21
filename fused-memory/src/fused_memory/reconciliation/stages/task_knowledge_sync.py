@@ -48,9 +48,9 @@ from fused_memory.reconciliation.cross_run_citation_scan import scan_cross_run_c
 from fused_memory.reconciliation.dangling_citation import build_dangling_citation_finding
 from fused_memory.reconciliation.flag_dedup import (
     acknowledge_resolved_flags,
-    filter_blocked_snapshot_findings,
     filter_contamination_ceiling_findings,
     filter_false_phantom_task_creation_flags,
+    filter_task_count_snapshot_findings,
 )
 from fused_memory.reconciliation.flag_identity import (
     compute_flag_signature,
@@ -4052,10 +4052,10 @@ class IntegrityCheck(BaseStage):
         """Execute Stage 3 and post-process with task-dump spot-check.
 
         Calls super().run() first (LLM agent + report extraction), then:
-        1. Applies filter_blocked_snapshot_findings() to suppress false-positive
-           task-count snapshot findings for projects with blocked-by-design write
-           paths (e.g. autopilot_video).  Records
-           report.stats['blocked_snapshot_findings_dropped'] = before - after.
+        1. Applies filter_task_count_snapshot_findings() to drop false-positive
+           findings that a task-count snapshot is missing or stale (no project
+           keeps one).  Records
+           report.stats['task_count_snapshot_findings_dropped'] = before - after.
         2. Applies filter_false_phantom_task_creation_flags() to drop
            phantom-tasks_created findings corroborated by a task that was
            legitimately created in a different known project via cross-project
@@ -4080,19 +4080,17 @@ class IntegrityCheck(BaseStage):
             events, watermark, prior_reports, run_id, model=model,
         )
 
-        # Layer 3 (finding-side) gate for blocked-snapshot false positives.
+        # Layer 3 (finding-side) gate for task-count snapshot false positives.
         # Mirrors the filter_stale_count_snapshot_corrections idiom in
-        # MemoryConsolidator.run() (stages/memory_consolidator.py:115-150).
+        # stages/memory_consolidator.py::MemoryConsolidator.run.
         if report.items_flagged:
             _before = len(report.items_flagged)
-            report.items_flagged = filter_blocked_snapshot_findings(
-                report.items_flagged, project_id=self.project_id
-            )
-            report.stats['blocked_snapshot_findings_dropped'] = (
+            report.items_flagged = filter_task_count_snapshot_findings(report.items_flagged)
+            report.stats['task_count_snapshot_findings_dropped'] = (
                 _before - len(report.items_flagged)
             )
         else:
-            report.stats['blocked_snapshot_findings_dropped'] = 0
+            report.stats['task_count_snapshot_findings_dropped'] = 0
 
         # Layer 3 (finding-side) gate for false phantom-tasks_created findings
         # (task-2525): drop a finding only when a cited task is positively
