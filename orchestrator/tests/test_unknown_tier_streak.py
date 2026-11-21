@@ -7,7 +7,7 @@ import pytest
 from escalation.queue import EscalationQueue
 
 from orchestrator.sentinel_l1 import SentinelL1, file_sentinel_l1, resolve_sentinel_l1
-from orchestrator.task_priority import TaskPriority, TaskPriorityLookup
+from orchestrator.task_priority import TaskPriority
 from orchestrator.unknown_tier_streak import (
     UNKNOWN_TIER_STREAK_LIMIT,
     PriorityGate,
@@ -17,10 +17,6 @@ from orchestrator.unknown_tier_streak import (
 _UNKNOWN = TaskPriority()
 _UNRECOGNISED = TaskPriority(tier='urgent')
 _KNOWN = TaskPriority(tier='high', pinned=False, base_tier='high')
-
-
-def _wired(task_id: str) -> TaskPriority:
-    return _UNKNOWN
 
 
 class _Recorder:
@@ -35,19 +31,26 @@ class _Recorder:
         self.resolved.append(sentinel)
 
     def streak(
-        self, gate: PriorityGate = PriorityGate.MERGE_POOL,
-        lookup: TaskPriorityLookup | None = _wired,
+        self, gate: PriorityGate = PriorityGate.MERGE_POOL, *, lookup_wired: bool = True,
     ) -> UnknownTierStreak:
-        return UnknownTierStreak(gate, lookup, escalate=self.escalate, resolve=self.resolve)
+        return UnknownTierStreak(
+            gate, lookup_wired=lookup_wired, escalate=self.escalate, resolve=self.resolve,
+        )
+
+
+class _RaisingRecorder(_Recorder):
+    def escalate(self, l1: SentinelL1) -> None:
+        super().escalate(l1)
+        raise RuntimeError('escalation queue is down')
+
+    def resolve(self, sentinel: str, resolution: str) -> None:
+        super().resolve(sentinel, resolution)
+        raise RuntimeError('escalation queue is down')
 
 
 def _pick(streak: UnknownTierStreak, priority: TaskPriority, times: int) -> None:
     for _ in range(times):
         streak.note_pick(priority)
-
-
-def _raise(*args: object) -> None:
-    raise RuntimeError('escalation queue is down')
 
 
 def test_nine_unknown_picks_file_nothing() -> None:
@@ -67,8 +70,17 @@ def test_the_tenth_unknown_pick_files_one_infra_l1_for_the_gate() -> None:
     _pick(streak, _UNKNOWN, UNKNOWN_TIER_STREAK_LIMIT)
 
     (l1,) = recorder.filed
-    assert 'merge_pool' in l1.sentinel
+    assert l1.sentinel == '__unknown_tier_merge_pool__'
     assert l1.category == 'infra_issue'
+
+
+def test_a_continuing_streak_files_again_only_at_each_multiple_of_the_limit() -> None:
+    recorder = _Recorder()
+    streak = recorder.streak()
+
+    _pick(streak, _UNKNOWN, 3 * UNKNOWN_TIER_STREAK_LIMIT - 1)
+
+    assert len(recorder.filed) == 2
 
 
 def test_each_gate_files_under_its_own_sentinel() -> None:
@@ -103,9 +115,18 @@ def test_the_first_known_pick_after_a_filing_resolves_it_once() -> None:
     assert recorder.resolved == [l1.sentinel]
 
 
+def test_a_fresh_streak_resolves_what_a_previous_process_may_have_left_open() -> None:
+    recorder = _Recorder()
+    streak = recorder.streak(PriorityGate.VERIFY_ADMISSION)
+
+    _pick(streak, _KNOWN, 2)
+
+    assert recorder.resolved == ['__unknown_tier_verify_admission__']
+
+
 def test_without_a_lookup_nothing_is_ever_filed() -> None:
     recorder = _Recorder()
-    streak = recorder.streak(lookup=None)
+    streak = recorder.streak(lookup_wired=False)
 
     _pick(streak, _UNKNOWN, 5 * UNKNOWN_TIER_STREAK_LIMIT)
 
@@ -113,10 +134,13 @@ def test_without_a_lookup_nothing_is_ever_filed() -> None:
 
 
 def test_a_raising_escalate_or_resolve_does_not_reach_the_pick() -> None:
-    streak = UnknownTierStreak(PriorityGate.MERGE_POOL, _wired, escalate=_raise, resolve=_raise)
+    recorder = _RaisingRecorder()
+    streak = recorder.streak()
 
-    _pick(streak, _UNKNOWN, UNKNOWN_TIER_STREAK_LIMIT + 1)
+    _pick(streak, _UNKNOWN, UNKNOWN_TIER_STREAK_LIMIT)
     streak.note_pick(_KNOWN)
+
+    assert (len(recorder.filed), len(recorder.resolved)) == (1, 1)
 
 
 @pytest.fixture
@@ -132,7 +156,7 @@ def test_a_long_streak_leaves_one_pending_l1(queue: EscalationQueue) -> None:
         file_sentinel_l1(queue, l1)
 
     streak = UnknownTierStreak(
-        PriorityGate.MERGE_POOL, _wired, escalate=escalate,
+        PriorityGate.MERGE_POOL, lookup_wired=True, escalate=escalate,
         resolve=lambda sentinel, resolution: resolve_sentinel_l1(queue, sentinel, resolution),
     )
 

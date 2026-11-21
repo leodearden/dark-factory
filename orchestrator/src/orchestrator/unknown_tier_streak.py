@@ -6,7 +6,7 @@ from collections.abc import Callable
 from enum import StrEnum
 
 from orchestrator.sentinel_l1 import SentinelL1
-from orchestrator.task_priority import TaskPriority, TaskPriorityLookup, gate_rank
+from orchestrator.task_priority import TaskPriority, gate_rank
 
 logger = logging.getLogger(__name__)
 
@@ -21,32 +21,35 @@ class PriorityGate(StrEnum):
 class UnknownTierStreak:
     """Files one L1 from the tenth consecutive unknown-tier pick, and resolves it on the next known one.
 
-    A no-op where no lookup is wired: an unknown tier there is expected, not a broken lookup.
+    While the streak lasts it files again only at each further multiple of the
+    limit, so an L1 resolved mid-streak comes back without an escalation-queue
+    scan on every pick. A no-op unless *lookup_wired*: where no lookup is
+    wired, an unknown tier is expected, not a broken lookup.
     """
 
     def __init__(
         self,
         gate: PriorityGate,
-        lookup: TaskPriorityLookup | None,
         *,
+        lookup_wired: bool,
         escalate: Callable[[SentinelL1], None],
         resolve: Callable[[str, str], None],
     ) -> None:
         self._gate = gate
-        self._wired = lookup is not None
+        self._lookup_wired = lookup_wired
         self._escalate = escalate
         self._resolve = resolve
-        self._sentinel = f'__unknown_tier:{gate}__'
+        self._sentinel = f'__unknown_tier_{gate}__'
         self._count = 0
         # True at start: a previous process may have stopped with its escalation open.
         self._escalation_may_be_open = True
 
     def note_pick(self, priority: TaskPriority) -> None:
-        if not self._wired:
+        if not self._lookup_wired:
             return
         if gate_rank(priority.tier) is None:
             self._count += 1
-            if self._count >= UNKNOWN_TIER_STREAK_LIMIT:
+            if self._count % UNKNOWN_TIER_STREAK_LIMIT == 0:
                 self._file()
             return
         self._count = 0
