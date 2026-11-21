@@ -26,8 +26,6 @@ from escalation.classify import resolver_tier
 from escalation.models import RESOLUTION_CLASS_REQUIRED_CODE, RESOLUTION_CLASSES
 from escalation.queue import EscalationQueue
 
-pytestmark = pytest.mark.asyncio
-
 _SKILL = Path(__file__).resolve().parents[2] / 'skills' / 'escalation-watcher' / 'SKILL.md'
 _CALL_NAME = 'mcp__escalation__resolve_issue'
 _CALL_TOKEN = f'{_CALL_NAME}('
@@ -129,6 +127,7 @@ def test_every_resolve_issue_mention_is_a_parseable_fenced_example():
     )
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize('example', _EXAMPLES, ids=[e.test_id() for e in _EXAMPLES])
 async def test_the_example_closes_a_level_2_record_with_its_provenance(served, example: _Example):
     kwargs = _kwargs(example)
@@ -149,6 +148,7 @@ async def test_the_example_closes_a_level_2_record_with_its_provenance(served, e
     assert resolver_tier(record) in {'human-ruled', 'attended-seat'}
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize('example', _EXAMPLES, ids=[e.test_id() for e in _EXAMPLES])
 async def test_the_example_without_its_class_is_refused(served, example: _Example):
     kwargs = {k: v for k, v in _kwargs(example).items() if k != 'resolution_class'}

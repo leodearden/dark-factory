@@ -3588,7 +3588,7 @@ class TestPromoteToL2Cascade:
             escalation_id=l2_result['id'],
             resolution='Not actionable',
             action='abandon',
-            resolution_class='actionable',
+            resolution_class='benign',
         )
 
         m1 = queue.get('esc-l1-1')
