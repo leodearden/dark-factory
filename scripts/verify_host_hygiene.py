@@ -3,7 +3,8 @@
 
 Classes: `_merge-<8hex>` and task worktrees under each repo's `.worktrees/`,
 and `df-verify-*.scope` user units. Report-only by default. Stdlib only, so
-`--host H` can run this same file on H over ssh. Which mechanism bounds each
+`--host H` can run this same file on H over ssh. The worktree classes refuse
+a repo that holds an orchestrator's task store. Which mechanism bounds each
 class, and what this tool never touches: OPERATIONS.md, "Verify-host disk
 hygiene (leo-laptop, task 7269)".
 """
@@ -29,6 +30,7 @@ from pathlib import Path
 DEFAULT_REPO = Path("/home/leo/src/dark-factory")
 DEFAULT_SSH = "ssh -o BatchMode=yes -o ConnectTimeout=15"
 WORKTREE_BASE_NAME = ".worktrees"
+TASK_STORE_REL_PATH = Path(".taskmaster/tasks/tasks.db")
 PGID_DIR_NAME = ".merge_verify_pgids"
 PGID_WORKTREE_SUFFIX = ".worktree"
 MERGE_WORKTREE_NAME = re.compile(r"_merge-[0-9a-f]{8}")
@@ -117,6 +119,23 @@ def real(path: Path | str) -> Path:
 
 def is_within(path: Path, root: Path) -> bool:
     return path == root or root in path.parents
+
+
+def orchestrator_task_store(repo: Path) -> Path | None:
+    """*repo*'s orchestrator task store when present; an unreadable path counts as present.
+
+    The layout is fixed per project root by fused-memory's sqlite_task_backend.py
+    (dashboard/src/dashboard/project_dbs.py::TASKS_DB_REL_PATH), mirrored here
+    because this file is stdlib-only.
+    """
+    store = repo / TASK_STORE_REL_PATH
+    try:
+        os.lstat(store)
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    except OSError:
+        return store
+    return store
 
 
 # --- facts collected once per run -------------------------------------------
@@ -386,6 +405,9 @@ def report_worktree(candidate: Candidate, facts: RepoFacts, min_age_seconds: flo
 
 def remove_worktree(candidate: Candidate, facts: RepoFacts) -> None:
     """git removes what it tracks (refusing a dirty task worktree); rmtree the rest."""
+    if (store := orchestrator_task_store(facts.repo)) is not None:
+        raise OSError(f"{facts.repo} became an orchestrator's project root ({store} exists); "
+                      f"refusing to remove {candidate.target}")
     path = Path(candidate.target)
     registration = facts.registrations.get(path)
     if registration is None or registration.prunable:
@@ -641,12 +663,20 @@ def run_remote(ns: argparse.Namespace) -> int:
 
 
 def checked_repos(requested: list[Path] | None) -> list[Path] | None:
-    """Each repo's real top level, or None after naming the first that is not one."""
+    """Each repo's real top level, or None after naming the first that is not one.
+
+    An orchestrator's project root is refused too: its worktrees are that orchestrator's.
+    """
     repos = []
     for repo in requested or [DEFAULT_REPO]:
         toplevel = checkout_toplevel(repo)
         if toplevel is None:
             print(f"{PROG}: --repo {repo} is not a git checkout's top level", file=sys.stderr)
+            return None
+        if (store := orchestrator_task_store(toplevel)) is not None:
+            print(f"{PROG}: --repo {repo} is an orchestrator's project root ({store} exists); "
+                  "its worktrees are that orchestrator's to reclaim, so the worktree classes "
+                  "refuse it", file=sys.stderr)
             return None
         repos.append(toplevel)
     return repos
