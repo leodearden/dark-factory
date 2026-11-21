@@ -1650,8 +1650,12 @@ class UsageGate:
         handed back for its next pass, and it dies with ``before_invoke``'s
         frame, so an abandoned park has nothing to bequeath. It logs at most
         once per ``_SCOPE_PARK_LOG_INTERVAL_SECS``, however often the probe
-        re-poll wakes it. It is purely additive: it changes neither what
-        ``before_invoke`` returns nor when it unblocks.
+        re-poll wakes it. That interval is also the longest single wait of this
+        park, as ``_ALL_CAPPED_PARK_LOG_INTERVAL_SECS`` is for the fleet park, so
+        a park hours from its scope reset keeps announcing itself; each wakeup
+        re-runs selection and the sweeps and re-parks, which only ever serves a
+        caller earlier, never later. It is purely additive: it changes neither
+        what ``before_invoke`` returns nor when it unblocks.
         """
         now = time.monotonic()
         clock = clock or _ParkClock(started=now)
@@ -1671,10 +1675,11 @@ class UsageGate:
                 )
             )
             clock = replace(clock, last_logged=now)
-        sleep_for = (
+        sleep_for = min(
+            _SCOPE_PARK_LOG_INTERVAL_SECS,
             max(0.0, (soonest - datetime.now(UTC)).total_seconds())
             if soonest is not None
-            else float(self._config.max_probe_interval_secs)
+            else float(self._config.max_probe_interval_secs),
         )
         if any(a.probe_in_flight for a in self._accounts):
             sleep_for = min(sleep_for, _SCOPE_WAIT_REPOLL_CEIL_SECS)
