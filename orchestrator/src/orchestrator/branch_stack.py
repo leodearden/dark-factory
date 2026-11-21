@@ -29,6 +29,7 @@ its runner, and nothing here imports git_ops or merge_queue.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from dataclasses import dataclass
@@ -37,7 +38,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 from orchestrator.rebase_drops import run_rebase_reporting_drops
-from orchestrator.rebase_recovery import guarded_abort
+from orchestrator.rebase_recovery import guarded_abort, operation_still_in_progress
 from orchestrator.ref_ledger import (
     GitReadError,
     GitRunner,
@@ -363,6 +364,8 @@ class OwnDeltaRebase(NamedTuple):
     ok: bool
     conflicted_paths: tuple[str, ...]
     stderr: str
+    #: The guarded abort failed and left the rebase in progress.
+    abort_failed: bool = False
 
 
 async def rebase_own_delta(
@@ -373,14 +376,21 @@ async def rebase_own_delta(
     A commit the replay drops because *onto* already carries its change is
     logged and recorded (see ``orchestrator/src/orchestrator/rebase_drops.py``).
     On failure the conflicted paths are collected BEFORE the guarded abort,
-    because the abort erases them.
+    because the abort erases them, and ``abort_failed`` says whether the
+    abort left the rebase in progress.
     """
     rebased = await run_rebase_reporting_drops(run, worktree, onto=onto, upstream=cut)
     if rebased.ok:
         return OwnDeltaRebase(ok=True, conflicted_paths=(), stderr='')
     conflicted = await _conflicted_paths(run, worktree)
-    await guarded_abort('rebase', worktree, run)
-    return OwnDeltaRebase(ok=False, conflicted_paths=conflicted, stderr=rebased.stderr)
+    abort_rc, _, _ = await guarded_abort('rebase', worktree, run)
+    abort_failed = abort_rc != 0 and await asyncio.to_thread(
+        operation_still_in_progress, worktree,
+    )
+    return OwnDeltaRebase(
+        ok=False, conflicted_paths=conflicted, stderr=rebased.stderr,
+        abort_failed=abort_failed,
+    )
 
 
 async def _conflicted_paths(run: GitRunner, worktree: Path) -> tuple[str, ...]:
