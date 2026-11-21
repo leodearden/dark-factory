@@ -3125,19 +3125,21 @@ class TestMem0BackendScanPayloadTextIntegration:
 
     @pytest.mark.asyncio
     async def test_matchtext_prefilter_is_a_literal_substring_match(
-        self, mock_config, _spt_scope, _spt_clean_collection, monkeypatch,
+        self, _reapable_config, _spt_scope, _spt_run_id, monkeypatch,
     ):
-        backend = await _build_asr_backend(mock_config, _spt_scope, monkeypatch)
+        backend = await _build_asr_backend(_reapable_config, _spt_scope, monkeypatch)
+        run_id = _spt_run_id
         try:
             await backend.add_system_record(
                 content='The reconciliation stage two judge halts on an empty backlog.',
                 scope=_spt_scope,
-                metadata={'kind': 'scan_payload_text_probe'},
+                metadata={'kind': 'scan_payload_text_probe', 'run_id': run_id},
             )
 
             # Mid-word substring: proves `contains`, not tokenization.
             midword = await backend.scan_payload_text(
-                scope=_spt_scope, needles=['econciliatio'], exhaustive=False
+                scope=_spt_scope, needles=['econciliatio'], exhaustive=False,
+                filters={'run_id': run_id},
             )
             assert midword['scanned'] == 1, (
                 'un-indexed MatchText must substring-match mid-word; a text '
@@ -3146,7 +3148,8 @@ class TestMem0BackendScanPayloadTextIntegration:
 
             # Reversed word order must NOT match a substring engine.
             reversed_order = await backend.scan_payload_text(
-                scope=_spt_scope, needles=['judge reconciliation'], exhaustive=False
+                scope=_spt_scope, needles=['judge reconciliation'], exhaustive=False,
+                filters={'run_id': run_id},
             )
             assert reversed_order['scanned'] == 0, (
                 'reversed word order matched — MatchText is tokenized here, so '
@@ -3156,7 +3159,7 @@ class TestMem0BackendScanPayloadTextIntegration:
             # Sanity: exhaustive mode ignores the prefilter entirely, so it
             # still walks the record regardless of MatchText semantics.
             assert (await backend.scan_payload_text(
-                scope=_spt_scope, exhaustive=True
+                scope=_spt_scope, exhaustive=True, filters={'run_id': run_id},
             ))['scanned'] == 1
         finally:
             await backend.close()
