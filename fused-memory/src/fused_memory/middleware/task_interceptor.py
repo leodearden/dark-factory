@@ -50,6 +50,7 @@ from fused_memory.backends.task_backend_errors import (
     DeclaredScopeWriteAuthorityError,
     DefectRecordsWriteAuthorityError,
     DeferralWriteAuthorityError,
+    DependencyCycle,
     DoneProvenanceWriteAuthorityError,
     DuplicateCandidateKeyError,
     FollowupItemsRefusedError,
@@ -5928,6 +5929,7 @@ class TaskInterceptor:
                 DefectRecordsWriteAuthorityError,
                 DeferralWriteAuthorityError,
                 MetadataNotAnObjectError,
+                DependencyCycle,
             ) as e:
                 # SqliteTaskBackend write-authority floor (task C1): a status
                 # write is always rejected, and so is any add, change or
@@ -6173,7 +6175,8 @@ class TaskInterceptor:
           append-safe merge.  ``'-'`` in the project_id is normalised to ``'_'``.
           The foreign target is not verified at write time (lenient).
         - **Bare integer form**: recorded in the integer ``dependencies`` table,
-          unchanged from the original behavior.
+          unchanged from the original behavior. An edge that would close a cycle
+          comes back as the :class:`DependencyCycle` refusal dict, nothing written.
 
         The interceptor does not inspect or transform ``depends_on``; routing is
         handled entirely by the backend.  The journal and ``task_modified`` event
@@ -6190,20 +6193,23 @@ class TaskInterceptor:
         tm = await self._ensure_taskmaster()
         project_id = resolve_project_id(project_root)
         # WP-E: serialise against concurrent mutations on the same project.
-        async with self._write_lock(project_id):
-            result = dict(
-                await self._journal_around(
-                    'add_dependency',
-                    project_root,
-                    {'task_id': task_id, 'depends_on': depends_on, 'tag': tag},
-                    tm.add_dependency(
-                        task_id,
-                        depends_on,
+        try:
+            async with self._write_lock(project_id):
+                result = dict(
+                    await self._journal_around(
+                        'add_dependency',
                         project_root,
-                        tag,
-                    ),
+                        {'task_id': task_id, 'depends_on': depends_on, 'tag': tag},
+                        tm.add_dependency(
+                            task_id,
+                            depends_on,
+                            project_root,
+                            tag,
+                        ),
+                    )
                 )
-            )
+        except DependencyCycle as e:
+            return e.to_error_dict()
         event = self._make_event(
             EventType.task_modified,
             project_root,
