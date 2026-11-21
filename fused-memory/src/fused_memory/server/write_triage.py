@@ -1574,7 +1574,7 @@ def _storm_summary(count: Any, window_seconds: Any, billing_exhausted: Any) -> s
     if not (isinstance(billing_exhausted, int) and billing_exhausted > 0):
         return summary
     return (
-        f'OpenAI credits exhausted (insufficient_quota) behind {billing_exhausted} '
-        'of these fail-opens; not a transient outage, see the '
-        f'provider_billing_exhausted L2. {summary}'
+        f'Provider credits exhausted behind {billing_exhausted} of these '
+        'fail-opens; not a transient outage, see the provider_billing_exhausted '
+        f'L2 for the provider and key. {summary}'
     )

@@ -52,11 +52,15 @@ _PROVIDER_MESSAGE_CHARS = 300
 
 @dataclass(frozen=True)
 class BillingExhaustion:
-    """A provider refused a call because a paid allowance is used up."""
+    """A provider refused a call because a paid allowance is used up.
+
+    ``code`` is the provider's marker that matched, e.g. ``insufficient_quota``.
+    """
 
     source: BillingSource
     provider: str
     key_scope: str
+    code: str
     error_type: str
     provider_message: str
 
@@ -75,13 +79,19 @@ def classify_billing_exhaustion(exc: BaseException) -> BillingExhaustion | None:
         for marker in markers:
             source = _SOURCE_BY_EXHAUSTION_CODE.get(marker)
             if source is not None:
-                return _exhaustion(source, link)
+                return _exhaustion(source, marker, link)
         return None
     message = str(exc).lower()
     for code, source in _SOURCE_BY_EXHAUSTION_CODE.items():
         if code in message:
-            return _exhaustion(source, exc)
+            return _exhaustion(source, code, exc)
     return None
+
+
+def billing_source_of(exc: BaseException | None) -> str | None:
+    """The ``BillingSource`` value *exc* reports exhausted, or None."""
+    exhaustion = classify_billing_exhaustion(exc) if exc is not None else None
+    return exhaustion.source.value if exhaustion is not None else None
 
 
 def _causal_chain(exc: BaseException) -> Iterator[BaseException]:
@@ -117,12 +127,14 @@ def _carries_status(link: BaseException) -> bool:
     return getattr(link, 'status_code', None) is not None
 
 
-def _exhaustion(source: BillingSource, link: BaseException) -> BillingExhaustion:
-    return exhaustion_of(source, error_type=type(link).__name__, provider_message=str(link))
+def _exhaustion(source: BillingSource, code: str, link: BaseException) -> BillingExhaustion:
+    return exhaustion_of(
+        source, code=code, error_type=type(link).__name__, provider_message=str(link),
+    )
 
 
 def exhaustion_of(
-    source: BillingSource, *, error_type: str, provider_message: str,
+    source: BillingSource, *, code: str, error_type: str, provider_message: str,
 ) -> BillingExhaustion:
     """Build the exhaustion of *source*, its provider and key scope filled in."""
     facts = _FACTS_BY_SOURCE[source]
@@ -130,6 +142,7 @@ def exhaustion_of(
         source=source,
         provider=facts.provider,
         key_scope=facts.key_scope,
+        code=code,
         error_type=error_type,
         provider_message=provider_message[:_PROVIDER_MESSAGE_CHARS],
     )

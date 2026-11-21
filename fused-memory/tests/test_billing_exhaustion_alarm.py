@@ -21,7 +21,10 @@ from shared.project_layout import escalation_queue_dir
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.middleware import _folded_escalation
-from fused_memory.services.billing_exhaustion_alarm import BillingExhaustionAlarm
+from fused_memory.services.billing_exhaustion_alarm import (
+    REPAGE_COOLDOWN,
+    BillingExhaustionAlarm,
+)
 from fused_memory.services.provider_billing import (
     BillingExhaustion,
     classify_billing_exhaustion,
@@ -38,8 +41,8 @@ pytestmark = [
 _FIRST_SEEN = datetime(2026, 11, 19, 6, 50, tzinfo=UTC)
 
 
-def _exhaustion() -> BillingExhaustion:
-    exhaustion = classify_billing_exhaustion(make_insufficient_quota_error())
+def _exhaustion(**error_kwargs) -> BillingExhaustion:
+    exhaustion = classify_billing_exhaustion(make_insufficient_quota_error(**error_kwargs))
     assert exhaustion is not None
     return exhaustion
 
@@ -47,6 +50,19 @@ def _exhaustion() -> BillingExhaustion:
 def _ticking_clock() -> Callable[[], datetime]:
     ticks: Iterator[datetime] = (_FIRST_SEEN + timedelta(minutes=n) for n in range(1000))
     return lambda: next(ticks)
+
+
+class _Clock:
+    """A clock that moves only when the test moves it."""
+
+    def __init__(self) -> None:
+        self.now = _FIRST_SEEN
+
+    def __call__(self) -> datetime:
+        return self.now
+
+    def advance(self, by: timedelta) -> None:
+        self.now += by
 
 
 def _alarm(tmp_path, **kwargs) -> BillingExhaustionAlarm:
@@ -79,9 +95,11 @@ class TestThePage:
         assert 'credits exhausted' in record['summary'].lower()
         assert 'rate limit' not in record['summary'].lower()
         assert 'rate limit' not in record['suggested_action'].lower()
+        assert '(insufficient_quota)' in record['summary']
         detail = record['detail']
         assert 'provider=openai' in detail
         assert 'OPENAI_API_KEY' in detail
+        assert 'code=insufficient_quota' in detail
         assert f'first_seen={_FIRST_SEEN.isoformat()}' in detail
         assert 'first_site=durable_queue:add_episode' in detail
         assert 'parked' in detail.lower()
@@ -106,12 +124,51 @@ class TestThePage:
                 setattr(state, field.name, 'other')
 
 
+    @pytest.mark.asyncio
+    async def test_the_page_names_the_code_the_provider_sent(self, tmp_path):
+        exhaustion = _exhaustion(code='credit_balance_exhausted')
+
+        await _alarm(tmp_path).record_exhausted(exhaustion, site='mem0_write')
+
+        [record] = _records(tmp_path)
+        assert '(credit_balance_exhausted)' in record['summary']
+        assert 'code=credit_balance_exhausted' in record['detail']
+        assert '(insufficient_quota)' not in record['summary']
+
+
+class TestAPageThatCouldNotBeFiled:
+    @pytest.mark.asyncio
+    async def test_the_next_exhaustion_files_it_exactly_once(self, tmp_path):
+        alarm = _alarm(tmp_path)
+        # A file where the queue directory goes, so the queue cannot be opened.
+        blocked = escalation_queue_dir(tmp_path)
+        blocked.parent.mkdir(parents=True, exist_ok=True)
+        blocked.write_text('')
+
+        await alarm.record_exhausted(_exhaustion(), site='durable_queue:add_episode')
+
+        state = alarm.state()
+        assert state is not None
+        assert state.escalation_id is None
+
+        blocked.unlink()
+        await alarm.record_exhausted(_exhaustion(), site='mem0_write')
+        await alarm.record_exhausted(_exhaustion(), site='mem0_write')
+
+        [record] = _records(tmp_path)
+        state = alarm.state()
+        assert state is not None
+        assert state.escalation_id == record['id']
+        assert state.first_site == 'durable_queue:add_episode'
+
+
 class TestRecovery:
     @pytest.mark.asyncio
     async def test_recovery_resolves_the_page_and_a_later_exhaustion_is_a_new_episode(
         self, tmp_path,
     ):
-        alarm = _alarm(tmp_path)
+        clock = _Clock()
+        alarm = _alarm(tmp_path, clock=clock)
         await alarm.record_exhausted(_exhaustion(), site='durable_queue:add_episode')
         [first] = _records(tmp_path)
 
@@ -122,6 +179,7 @@ class TestRecovery:
         assert resolved['status'] == 'resolved'
         assert alarm.state() is None
 
+        clock.advance(REPAGE_COOLDOWN)
         await alarm.record_exhausted(_exhaustion(), site='mem0_write')
         [second] = _pending(tmp_path)
         assert second['id'] != first['id']
@@ -131,6 +189,44 @@ class TestRecovery:
         await _alarm(tmp_path).record_recovered(site='mem0_write')
 
         assert _records(tmp_path) == []
+
+
+class TestTheRepageCooldown:
+    """A balance still settling after a top-up must not page Leo again."""
+
+    @pytest.mark.asyncio
+    async def test_a_recover_exhaust_recover_burst_files_one_page(self, tmp_path):
+        clock = _Clock()
+        alarm = _alarm(tmp_path, clock=clock)
+        await alarm.record_exhausted(_exhaustion(), site='durable_queue:add_episode')
+
+        for _ in range(3):
+            clock.advance(timedelta(minutes=1))
+            await alarm.record_recovered(site='mem0_write')
+            clock.advance(timedelta(minutes=1))
+            await alarm.record_exhausted(_exhaustion(), site='durable_queue:add_episode')
+        await alarm.record_recovered(site='mem0_write')
+
+        assert [r['status'] for r in _records(tmp_path)] == ['resolved']
+
+    @pytest.mark.asyncio
+    async def test_an_exhaustion_that_outlasts_the_cooldown_pages(self, tmp_path):
+        clock = _Clock()
+        alarm = _alarm(tmp_path, clock=clock)
+        await alarm.record_exhausted(_exhaustion(), site='durable_queue:add_episode')
+        await alarm.record_recovered(site='mem0_write')
+        clock.advance(timedelta(minutes=1))
+        await alarm.record_exhausted(_exhaustion(), site='mem0_write')
+        assert _pending(tmp_path) == []
+
+        clock.advance(REPAGE_COOLDOWN)
+        await alarm.record_exhausted(_exhaustion(), site='mem0_write')
+
+        [page] = _pending(tmp_path)
+        state = alarm.state()
+        assert state is not None
+        assert state.escalation_id == page['id']
+        assert state.first_seen == _FIRST_SEEN + timedelta(minutes=1)
 
 
 class TestRestart:

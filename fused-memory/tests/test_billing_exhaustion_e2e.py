@@ -6,12 +6,14 @@ now sees instead: one born-at-L2 page naming the credits, writes PARKED
 rather than dead-lettered, and both clearing by themselves once a write
 lands. A plain 429 keeps today's retry-then-dead-letter path. Mem0 writes,
 which already retry without limit, page the same way and resolve it when one
-lands.
+lands. A restart neither pages again nor strands the page it inherits.
 """
 
 from __future__ import annotations
 
 import json
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -44,23 +46,33 @@ _BILLING = 'provider_billing_exhausted'
 _DEAD_LETTER = 'durable_write_dead_letter'
 
 
-@pytest_asyncio.fixture
-async def billing_service(mock_config, tmp_path):
-    """A MemoryService over a real queue and journal, re-probing parked writes fast."""
+@asynccontextmanager
+async def _running_service(config, tmp_path) -> AsyncIterator[MemoryService]:
+    """A MemoryService over a real queue and journal, re-probing parked writes fast.
+
+    Every entry over one *tmp_path* opens the same queue and journal files, so
+    entering again after an exit is the same server restarted.
+    """
     from fused_memory.services.write_journal import WriteJournal
 
-    mock_config.queue.retry_max_delay_seconds = 0.5
-    svc = mock_memory_backends(MemoryService(mock_config))
+    config.queue.retry_max_delay_seconds = 0.5
+    svc = mock_memory_backends(MemoryService(config))
     await svc.initialize()
     journal = WriteJournal(tmp_path / 'wj_billing')
     await journal.initialize()
     svc.set_write_journal(journal)
     svc.set_known_projects({'main': str(tmp_path)})
+    try:
+        yield svc
+    finally:
+        await svc.close()
+        await journal.close()
 
-    yield svc
 
-    await svc.close()
-    await journal.close()
+@pytest_asyncio.fixture
+async def billing_service(mock_config, tmp_path):
+    async with _running_service(mock_config, tmp_path) as svc:
+        yield svc
 
 
 def _primary_root(svc: MemoryService) -> Path:
@@ -204,6 +216,20 @@ class TestExhaustedCreditsOnTheMem0Path:
         assert [r['status'] for r in _records(_primary_root(svc), _BILLING)] == ['resolved']
 
     @pytest.mark.asyncio
+    async def test_a_write_that_lands_nothing_leaves_the_page_open(self, billing_service):
+        """mem0 can return no ids without calling the embedder, which proves
+        nothing about the credits."""
+        svc = billing_service
+        svc.mem0.add = AsyncMock(side_effect=make_insufficient_quota_error())
+        await _add_preference(svc, 'prefer explicit imports over star imports')
+
+        svc.mem0.add = AsyncMock(return_value={'results': []})
+        empty = await _add_preference(svc, 'prefer frozen dataclasses for values')
+
+        assert empty.memory_ids == []
+        assert [r['status'] for r in _records(_primary_root(svc), _BILLING)] == ['pending']
+
+    @pytest.mark.asyncio
     async def test_a_transient_429_defers_without_a_billing_page(self, billing_service):
         svc = billing_service
         svc.mem0.add = AsyncMock(side_effect=make_transient_rate_limit_error())
@@ -212,6 +238,46 @@ class TestExhaustedCreditsOnTheMem0Path:
 
         assert result.stores_pending_retry == [SourceStore.mem0]
         assert _records(_primary_root(svc), _BILLING) == []
+
+
+class TestARestartMidOutage:
+    @pytest.mark.asyncio
+    async def test_the_first_write_to_land_resolves_the_page_left_open(
+        self, mock_config, tmp_path,
+    ):
+        async with _running_service(mock_config, tmp_path) as before:
+            before.mem0.add = AsyncMock(side_effect=make_insufficient_quota_error())
+            await _add_preference(before, 'prefer explicit imports over star imports')
+
+        async with _running_service(mock_config, tmp_path) as after:
+            await _add_preference(after, 'credits were restored during the restart')
+
+            statuses = [r['status'] for r in _records(_primary_root(after), _BILLING)]
+        assert statuses == ['resolved']
+
+    @pytest.mark.asyncio
+    async def test_a_park_after_the_restart_pages_nothing_new(self, mock_config, tmp_path):
+        async with _running_service(mock_config, tmp_path) as before:
+            before.mem0.add = AsyncMock(side_effect=make_insufficient_quota_error())
+            await _add_preference(before, 'prefer explicit imports over star imports')
+
+        async with _running_service(mock_config, tmp_path) as after:
+            after.graphiti.add_episode = AsyncMock(
+                side_effect=wrap_like_graphiti(make_insufficient_quota_error()),
+            )
+            await _add_episode(after, 'an episode into the outage the restart inherited')
+            await poll_until(
+                lambda: _parked_counts(after), timeout=20.0, message='nothing parked',
+            )
+            root = _primary_root(after)
+            [page] = _records(root, _BILLING)
+            assert page['status'] == 'pending'
+
+            after.graphiti.add_episode = AsyncMock(return_value=None)
+            await poll_until(
+                lambda: [r['status'] for r in _records(root, _BILLING)] == ['resolved'],
+                timeout=20.0, message='the inherited page was not resolved',
+            )
 
 
 async def _parked_counts(svc: MemoryService, *, at_least: int = 1) -> dict | None:

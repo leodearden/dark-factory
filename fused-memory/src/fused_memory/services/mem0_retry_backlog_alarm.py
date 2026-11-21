@@ -112,7 +112,8 @@ def _summary(
             'acked as pending retry, unsearchable until they land'
         )
     return (
-        f'{writes} parked {age_seconds}s behind OpenAI credits exhausted since '
+        f'{writes} parked {age_seconds}s behind {billing.exhaustion.provider} '
+        'credits exhausted since '
         f'{billing.first_seen.isoformat()}; see {_billing_page(billing)}; they land '
         'by themselves once credits are restored'
     )
@@ -136,7 +137,8 @@ def _why_still_retrying(billing: BillingAlarmState | None) -> str:
             f'refused every re-issue since. {_NOTHING_LOST}'
         )
     return (
-        f'{acked}the OpenAI credits Mem0 embeds through are exhausted (see '
+        f'{acked}the {billing.exhaustion.provider} credits Mem0 embeds through '
+        'are exhausted (see '
         f'{_billing_page(billing)}), and every re-issue since has met the same '
         f'empty balance. They land by themselves once credits are restored. '
         f'{_NOTHING_LOST}'
@@ -144,7 +146,7 @@ def _why_still_retrying(billing: BillingAlarmState | None) -> str:
 
 
 def _billing_page(billing: BillingAlarmState) -> str:
-    return billing.escalation_id or 'the provider_billing_exhausted L2'
+    return billing.escalation_id or 'the provider_billing_exhausted L2, not filed yet'
 
 
 async def alarm_on_stale_mem0_retries(

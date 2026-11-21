@@ -137,6 +137,7 @@ from fused_memory.services.mem0_write_retry import (
     Mem0RetryPassSummary,
     Mem0RetryPolicy,
     OnMem0Landed,
+    TransientProviderFailure,
     classify_transient_provider_failure,
     mem0_write_op_landed,
     retry_reason,
@@ -151,7 +152,10 @@ from fused_memory.services.overreach_shadow import (
     open_overreach_shadow,
     shadow_job_from_write,
 )
-from fused_memory.services.provider_billing import classify_billing_exhaustion
+from fused_memory.services.provider_billing import (
+    billing_source_of,
+    classify_billing_exhaustion,
+)
 from fused_memory.services.queued_writes import (
     DecodedReferents,
     QueueCallback,
@@ -1680,11 +1684,6 @@ def _degrade_or_reraise(exc: Exception, name: str) -> dict:
     return _graphiti_degraded_entity_result()
 
 
-def _billing_source_or_none(exc: BaseException | None) -> str | None:
-    exhaustion = classify_billing_exhaustion(exc) if exc is not None else None
-    return exhaustion.source.value if exhaustion is not None else None
-
-
 def _store_failure_diagnostics(
     store: SourceStore,
     exc: BaseException | None,
@@ -1754,7 +1753,7 @@ def _store_failure_diagnostics(
         'error_type': type(exc).__name__ if exc is not None else 'TimeoutError',
         'error': (str(exc)[:500] if exc is not None else 'search_timeout'),
         'rate_limit_or_quota': _is_rate_limit_or_quota_error(exc) if exc is not None else False,
-        'billing_exhausted': _billing_source_or_none(exc),
+        'billing_exhausted': billing_source_of(exc),
         'query_len': len(query),
         # Intentionally repeated per-entry (not deduped onto SearchResults) so
         # each diagnostic stays self-contained for independent log consumption —
@@ -6992,9 +6991,10 @@ class MemoryService:
             write_op_id,
             failure.value,
         )
-        exhaustion = classify_billing_exhaustion(error)
-        if exhaustion is not None:
-            await self._billing_alarm.record_exhausted(exhaustion, site='mem0_write')
+        if failure is TransientProviderFailure.BILLING_EXHAUSTED:
+            exhaustion = classify_billing_exhaustion(error)
+            if exhaustion is not None:
+                await self._billing_alarm.record_exhausted(exhaustion, site='mem0_write')
         return reason
 
     async def reissue_mem0_intent(self, intent: Mapping[str, Any]) -> Mem0AddOutcome:
@@ -7055,7 +7055,8 @@ class MemoryService:
         outcome = read_mem0_add_result(
             raw, operation=write_method.value, zero_ids_anomalous=zero_ids_anomalous
         )
-        await self._billing_alarm.record_recovered(site='mem0_write')
+        if outcome.landed:
+            await self._billing_alarm.record_recovered(site='mem0_write')
         return outcome
 
     @property
