@@ -14,7 +14,10 @@ once, by a unit or by a named residual bucket; a map that does not reconcile
 with the file total is a MetricsError, never a result (INV-11). A partition
 assigns every unit to exactly one cluster; its evaluation reports what the
 split would cost in heuristic-13 terms: refs crossing clusters, cluster
-cycles, and attributes written from more than one cluster.
+cycles, and attributes written from more than one cluster. An acyclic
+partition is also layered into strata, bottom first: a cluster with no
+outgoing cross-cluster edge is stratum 0, any other one above the highest
+stratum it has edges to.
 
 Each residual bucket also carries its line mix: a line in the one prose
 definition is prose, otherwise a whitespace-only line is blank, otherwise it
@@ -421,6 +424,7 @@ class PartitionReport:
     clusters: Mapping[str, ClusterSize]
     edges: Mapping[tuple[str, str], Edge]
     cyclic_groups: tuple[frozenset[str], ...]
+    strata: tuple[frozenset[str], ...]
     shared_writes: Mapping[str, frozenset[str]]
     module_unit_users: Mapping[str, frozenset[str]]
     cluster_of: Mapping[str, str]
@@ -429,10 +433,13 @@ class PartitionReport:
 def evaluate_partition(cmap: ConcernMap, partition: Mapping[str, Sequence[str]]) -> PartitionReport:
     cluster_of = _cluster_of(cmap, partition)
     edges = _edges(cmap.units, cluster_of)
+    successors = _successors(partition, edges)
+    cyclic_groups = _cyclic_groups(successors)
     return PartitionReport(
         clusters=_cluster_sizes(cmap, partition),
         edges=edges,
-        cyclic_groups=_cyclic_groups(partition, edges),
+        cyclic_groups=cyclic_groups,
+        strata=_strata(successors) if not cyclic_groups else (),
         shared_writes=_shared_writes(cmap.units, cluster_of),
         module_unit_users=_module_unit_users(cmap.units, cluster_of),
         cluster_of=MappingProxyType(cluster_of),
@@ -506,12 +513,16 @@ def _edges(units: tuple[Unit, ...], cluster_of: Mapping[str, str]) -> Mapping[tu
     })
 
 
-def _cyclic_groups(
+def _successors(
     clusters: Iterable[str], edges: Mapping[tuple[str, str], Edge]
-) -> tuple[frozenset[str], ...]:
-    successors: dict[str, set[str]] = {cluster: set() for cluster in clusters}
+) -> Mapping[str, frozenset[str]]:
+    found: dict[str, set[str]] = {cluster: set() for cluster in clusters}
     for source, target in edges:
-        successors[source].add(target)
+        found[source].add(target)
+    return MappingProxyType({cluster: frozenset(targets) for cluster, targets in found.items()})
+
+
+def _cyclic_groups(successors: Mapping[str, frozenset[str]]) -> tuple[frozenset[str], ...]:
     reach = {cluster: _reachable(cluster, successors) for cluster in successors}
     components = {
         frozenset({cluster, *(other for other in reach[cluster] if cluster in reach[other])})
@@ -520,7 +531,7 @@ def _cyclic_groups(
     return tuple(sorted((group for group in components if len(group) > 1), key=sorted))
 
 
-def _reachable(start: str, successors: Mapping[str, set[str]]) -> frozenset[str]:
+def _reachable(start: str, successors: Mapping[str, frozenset[str]]) -> frozenset[str]:
     seen: set[str] = set()
     stack = [start]
     while stack:
@@ -528,6 +539,23 @@ def _reachable(start: str, successors: Mapping[str, set[str]]) -> frozenset[str]
         seen |= fresh
         stack.extend(fresh)
     return frozenset(seen)
+
+
+def _strata(successors: Mapping[str, frozenset[str]]) -> tuple[frozenset[str], ...]:
+    depth: dict[str, int] = {}
+    for cluster in sorted(successors):
+        _depth(cluster, successors, depth)
+    return tuple(
+        frozenset(cluster for cluster, found in depth.items() if found == level)
+        for level in range(max(depth.values(), default=-1) + 1)
+    )
+
+
+def _depth(cluster: str, successors: Mapping[str, frozenset[str]], depth: dict[str, int]) -> int:
+    if cluster not in depth:
+        below = [_depth(target, successors, depth) for target in successors[cluster]]
+        depth[cluster] = 1 + max(below) if below else 0
+    return depth[cluster]
 
 
 def _shared_writes(
@@ -584,6 +612,7 @@ def _report_json(report: PartitionReport) -> dict[str, object]:
             for key, edge in report.edges.items()
         },
         'cyclic_groups': [sorted(group) for group in report.cyclic_groups],
+        'strata': [sorted(stratum) for stratum in report.strata],
         'shared_writes': {name: sorted(owners) for name, owners in report.shared_writes.items()},
         'module_unit_users': {
             name: sorted(users) for name, users in report.module_unit_users.items()
@@ -629,9 +658,15 @@ def _bullets(items: Sequence[str]) -> str:
     return '\n'.join(f'- {item}' for item in items) if items else 'none'
 
 
+def _mix(mix: LineMix) -> str:
+    return f'{mix.blank} blank, {mix.prose} prose, {mix.code} code'
+
+
 def _markdown_header(cmap: ConcernMap) -> str:
     in_units = sum(unit.lines for unit in cmap.units)
-    buckets = ', '.join(f'{name} {count}' for name, count in cmap.residual.items())
+    buckets = ', '.join(
+        f'{name} {count} ({_mix(cmap.residual_mix[name])})' for name, count in cmap.residual.items()
+    )
     return (
         f'# Concern map: `{cmap.path}`, class `{cmap.class_name}`\n\n'
         f'{cmap.total_lines} lines: {in_units} in {len(cmap.units)} units, and the '
@@ -655,8 +690,11 @@ def _markdown_units(cmap: ConcernMap, report: PartitionReport | None) -> str:
 
 def _markdown_partition(report: PartitionReport) -> list[str]:
     clusters = _table(
-        ['cluster', 'units', 'lines', 'prose'],
-        ([name, size.units, size.lines, size.prose_lines] for name, size in report.clusters.items()),
+        ['cluster', 'units', 'methods', 'lines', 'prose', 'projected'],
+        (
+            [name, size.units, size.method_units, size.lines, size.prose_lines, size.projected_lines]
+            for name, size in report.clusters.items()
+        ),
     )
     edges = _table(
         ['from', 'to', 'refs', 'sample'],
@@ -670,11 +708,18 @@ def _markdown_partition(report: PartitionReport) -> list[str]:
         '## Clusters\n\n' + clusters,
         '## Cross-cluster edges\n\n' + edges,
         '## Cyclic cluster groups\n\n' + _bullets([_names(group) for group in report.cyclic_groups]),
+        '## Cluster strata (bottom first)\n\n' + _markdown_strata(report),
         '## Shared writes\n\n' + _bullets(
             [f'`{name}`: {_names(owners)}' for name, owners in report.shared_writes.items()]
         ),
         '## Module-unit users\n\n' + users,
     ]
+
+
+def _markdown_strata(report: PartitionReport) -> str:
+    if report.cyclic_groups:
+        return 'none: the partition has cyclic groups'
+    return _bullets([f'{level}: {_names(stratum)}' for level, stratum in enumerate(report.strata)])
 
 
 def _render_markdown(cmap: ConcernMap, report: PartitionReport | None) -> str:
