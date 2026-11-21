@@ -1,11 +1,12 @@
 """Shared scaffolding for the task-4427 campaign-gate pins.
 
-Three test files pin the same contract from different entry points —
+Four test files pin the same contract from different entry points —
 ``test_eval_driver.py`` (the four stage fan-outs and the two cell executors),
-``test_runner_matrix.py`` (``run_eval_matrix``) and ``test_eval_architect.py``
-(``run_architect_eval`` plus the CM itself) — so the probe, the sentinels, the
-assertion bodies and the base-config builder live here rather than being cloned
-into each. They were cloned once already (reviewer: duplication), which is how
+``test_runner_matrix.py`` (``run_eval_matrix``),
+``test_eval_architect_usage_gate.py`` (``run_architect_eval`` plus the CM
+itself) and ``test_eval_cli_dispatch.py`` (``evals.cli._run_single_eval``) — so
+the probe, the sentinels, the assertion bodies and the base-config builder live
+here rather than being cloned into each. They were cloned once already (reviewer: duplication), which is how
 the in-cell teardown guard came to be wrong in two places at once.
 
 Not ``_orch_helpers.py``: this is one task's scaffolding for one contract, and a

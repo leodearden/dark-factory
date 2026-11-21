@@ -1807,7 +1807,7 @@ build, yield and teardown have one implementation. It builds from
 `EVAL_PROFILE` nor the update dict mentioning `usage_cap`. The leaf is
 inherited verbatim and the campaign gate is identical to the one each cell
 would have built. That equivalence is emergent across two files, so
-`test_eval_architect.py::TestCampaignGatePremise` pins it as a tripwire. A
+`test_eval_architect_usage_gate.py::TestCampaignGatePremise` pins it as a tripwire. A
 `None` base config yields `None` without building: there is nothing to build
 from, and every stage function defaults it. A `None` yield, from that or from
 a degraded build, must be threaded to cells as an explicit `usage_gate=None`,
