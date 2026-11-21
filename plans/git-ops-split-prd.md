@@ -223,7 +223,7 @@ extraction leaf does the following:
   ("first, whether the prose is in its right home").
   - The home is a new `docs/git-engine/decisions.md`: one dated entry per rationale, citing its task or
     escalation id, with a one-line pointer left in code. That is one home with pointers (INV-9), and a
-    separate file from `docs/merge-lane/decisions.md`, because the git engine is not the merge lane
+    separate file from the merge lane's planned `docs/merge-lane/decisions.md` (task 5047 creates it), because the git engine is not the merge lane
     (heuristic 6).
   - The `archaeology_blocks` measure is shared with task 5047 (merge-lane ρ). Whichever of 5047 and γ
     lands first defines it in `scripts/merge_lane_metrics.py`, and the second reuses it (heuristic 11).
@@ -494,7 +494,7 @@ module (the overlay's same-file rule): **α → β → γ → δ → ε → ζ �
 - **θ — Sub-split `main_landing`** (D8; priority medium; ~2,000 LOC moved).
   - Modules: new `merge_worktrees.py` and `merging.py` (and `main_park.py` only if the D8 fallback
     measures necessary); `main_landing.py`; callers of the moved methods (S5 ο0's 99-test-file set,
-    re-enumerated); `merge_lane/gates.py`'s merge-worktree factory call; `CLUSTER_PATHS` and the
+    re-enumerated); `orchestrator/src/orchestrator/merge_lane/gates.py`'s merge-worktree factory call; `CLUSTER_PATHS` and the
     baseline; tests.
   - Signal: B14. `main_landing.py` is ≤ 1,500 lines, and `async def merge_to_main(` is absent from it.
   - Prereqs: η, and task 5042.
@@ -561,7 +561,7 @@ module (the overlay's same-file rule): **α → β → γ → δ → ε → ζ �
 - Any behaviour change to worktree creation, lane acquire or release, seeding, landing or queries.
 - S5's own extractions, ports and contracts (C1–C8). They are consumed here, not redone.
 - `advance_main`'s internal structure (task 5042).
-- The merge lane's own over-ceiling files (`merge_lane/worker.py` and others). They are merge-lane-quality's.
+- The merge lane's own over-ceiling files (`orchestrator/src/orchestrator/merge_lane/worker.py` and others). They are merge-lane-quality's.
   D4's rule applies to them, but splitting them is not this batch's work.
 - The reify-side warm-lane shell scripts.
 - Re-anchoring `plans/git-ops-split-prd.concern-map.md`. It is a dated snapshot. α writes a new one.
