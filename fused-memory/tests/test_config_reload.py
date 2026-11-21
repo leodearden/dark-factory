@@ -722,6 +722,7 @@ class TestWriteTriageJudgeLeavesAreGreenTier:
             ('judge_reasoning_effort', 'low'),
             ('judge_field_chars', 1_200),
             ('judge_api_url', 'http://localhost:8080/v1'),
+            ('judge_api_key', 'sk-judge-test'),
         ],
     )
     def test_a_changed_judge_leaf_lands_in_applied_candidates(self, field, new_value):
@@ -749,6 +750,7 @@ class TestWriteTriageJudgeLeavesAreGreenTier:
             ('judge_reasoning_effort', 'resolve_judge_reasoning_effort', 'low'),
             ('judge_field_chars', 'resolve_judge_field_chars', 1_200),
             ('judge_api_url', 'resolve_judge_api_url', 'http://localhost:8080/v1'),
+            ('judge_api_key', 'resolve_judge_api_key', 'sk-judge-test'),
         ],
     )
     def test_an_applied_reload_is_observed_by_the_live_resolver(
