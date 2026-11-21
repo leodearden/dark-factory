@@ -1,6 +1,7 @@
 """scripts/recovery_archive.py: carry the pinned FalkorDB recovery dumps through a host migration (task 7153)."""
 
 import hashlib
+import os
 import shutil
 from pathlib import Path
 
@@ -203,3 +204,101 @@ def test_check_without_a_root_is_a_usage_error():
     with pytest.raises(SystemExit) as raised:
         main(["check"], archives=ARCHIVES)
     assert raised.value.code == 2
+
+
+OLD_MTIME_NS = 1_700_000_000 * 10**9
+
+
+def _source_tree(root: Path) -> tuple[ArchiveDir, ...]:
+    archives = _write_archives(root)
+    for repo_path in (*DUMP_CONTENT, *SIBLING_CONTENT):
+        os.utime(root / repo_path, ns=(OLD_MTIME_NS, OLD_MTIME_NS))
+    for planted in (f"{ARCH_A}/__pycache__/helper.cpython-312.pyc",
+                    "fused-memory/data/falkordb/dump.rdb",
+                    "fused-memory/data/unlisted/x.rdb"):
+        (root / planted).parent.mkdir(parents=True, exist_ok=True)
+        (root / planted).write_bytes(b"not carried")
+    return archives
+
+
+def _snapshot(root: Path) -> dict[Path, tuple[bytes, int]]:
+    return {path: (path.read_bytes(), path.stat().st_mtime_ns)
+            for path in root.rglob("*") if path.is_file()}
+
+
+def _copy(source: Path, dest: Path, archives: tuple[ArchiveDir, ...]) -> int:
+    return main(["copy", str(source), str(dest)], archives=archives)
+
+
+def test_copy_carries_exactly_the_named_archive_dirs_with_their_siblings(tmp_path):
+    src, dst = tmp_path / "src", tmp_path / "dst"
+    archives = _source_tree(src)
+
+    assert _copy(src, dst, archives) == 0
+
+    for repo_path in (*DUMP_CONTENT, *SIBLING_CONTENT):
+        assert (dst / repo_path).read_bytes() == (src / repo_path).read_bytes()
+        assert (dst / repo_path).stat().st_mtime_ns == OLD_MTIME_NS
+    assert not (dst / ARCH_A / "__pycache__").exists()
+    assert not (dst / "fused-memory/data/unlisted").exists()
+    assert not (dst / "fused-memory/data/falkordb").exists()
+
+
+def test_copy_over_an_earlier_copy_succeeds(tmp_path):
+    src, dst = tmp_path / "src", tmp_path / "dst"
+    archives = _source_tree(src)
+
+    assert _copy(src, dst, archives) == 0
+    assert _copy(src, dst, archives) == 0
+
+
+def test_copy_checks_the_destination_and_names_a_corrupt_dump_there(tmp_path, capsys):
+    src, dst = tmp_path / "src", tmp_path / "dst"
+    archives = _source_tree(src)
+    _flip_first_byte(src / ARCH_A / "first.rdb")
+
+    assert _copy(src, dst, archives) == 1
+
+    failed = [line for line in capsys.readouterr().err.splitlines() if "FAILED" in line]
+    assert any(str(dst / ARCH_A / "first.rdb") in line and "sha256" in line for line in failed)
+
+
+def test_copy_names_a_missing_source_archive_and_still_carries_the_others(tmp_path, capsys):
+    src, dst = tmp_path / "src", tmp_path / "dst"
+    archives = _source_tree(src)
+    shutil.rmtree(src / ARCH_B)
+
+    assert _copy(src, dst, archives) == 1
+
+    failed = [line for line in capsys.readouterr().err.splitlines() if "FAILED" in line]
+    assert any(str(src / ARCH_B) in line for line in failed)
+    for repo_path in (*DUMP_CONTENT, *SIBLING_CONTENT):
+        if repo_path.startswith(f"{ARCH_A}/"):
+            assert (dst / repo_path).read_bytes() == (src / repo_path).read_bytes()
+
+
+def test_copy_refuses_a_destination_that_is_the_source(tmp_path, capsys):
+    src = tmp_path / "src"
+    archives = _source_tree(src)
+    same = tmp_path / "src" / ".." / "src"
+    before = _snapshot(tmp_path)
+
+    assert main(["copy", str(src), str(same)], archives=archives) == 1
+
+    failed = [line for line in capsys.readouterr().err.splitlines() if "FAILED" in line]
+    assert any(str(src) in line and str(same) in line for line in failed)
+    assert _snapshot(tmp_path) == before
+
+
+def test_copy_refuses_a_destination_inside_a_source_archive(tmp_path, capsys):
+    src = tmp_path / "src"
+    archives = _source_tree(src)
+    inside = src / ARCH_A / "nested-dest"
+    before = _snapshot(tmp_path)
+
+    assert _copy(src, inside, archives) == 1
+
+    failed = [line for line in capsys.readouterr().err.splitlines() if "FAILED" in line]
+    assert any(str(inside) in line for line in failed)
+    assert not inside.exists()
+    assert _snapshot(tmp_path) == before
