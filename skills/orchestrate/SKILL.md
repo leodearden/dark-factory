@@ -48,11 +48,12 @@ ls "$TARGET_CONFIG"
 ```
 
 As of 2026-09-29 every project under `DASHBOARD_KNOWN_PROJECT_ROOTS` carries that file.
-The legacy spellings (`orchestrator.yaml`, `orchestrator-config.yaml`, `config.yaml`,
-`orchestrator/config.yaml`) are honoured only as a discovery fallback for a not-yet-migrated
-project, never as a choice for a new one — and a stray legacy file can sit BESIDE the canonical
-one (autopilot-video still has a `config.yaml`, pump-web-ui an `orchestrator.yaml`), so never let a
-glob over the legacy names win over the canonical path when both exist.
+Dashboard discovery reads only that name: task 7138 retired the legacy spellings
+(`orchestrator.yaml`, `orchestrator-config.yaml`, `orchestrator/config.yaml`), and a bare
+`config.yaml` was never read, so a project using any other name is invisible to the dashboard
+until renamed. A stray legacy file can still sit BESIDE the canonical one (autopilot-video has a
+`config.yaml`, solar-challenge-platform an `orchestrator.yaml` symlink), so never let a glob over
+the legacy names win over the canonical path when both exist.
 
 Verify the file actually points at the target:
 

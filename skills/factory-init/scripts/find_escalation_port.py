@@ -33,13 +33,13 @@ RESERVED = {
 # Candidate config filenames, in the order projects have historically used
 # them. The canonical name is tried first so a migrated project's real
 # config wins over any legacy symlink/spelling still present alongside it.
-# Kept in sync with dashboard.config's _CANONICAL_CONFIG_NAME +
-# _LEGACY_CONFIG_NAMES (and the legacy-spellings list in CLAUDE.md) — a
-# config spelling recognized by one but not the other is a latent trap
-# (invisible to the port-collision scan, or invisible to dashboard
-# discovery). No bare "config.yaml": it was never one of the three legacy
-# spellings the 7-project migration (commit 97f0bd9f85) actually found in
-# use.
+# Dashboard discovery reads only the canonical name (task 7138 retired the
+# legacy spellings there), but this port survey still scans them: a survey
+# errs toward over-inclusion, so a port named by a stale legacy-only
+# checkout (such checkouts exist on leo-laptop, measured 2026-11-21) is
+# treated as claimed and never handed out. No bare "config.yaml": it was
+# never one of the three legacy spellings the 7-project migration (commit
+# 97f0bd9f85) actually found in use.
 CONFIG_NAMES = (
     "dark-factory-orchestrator.yaml",
     "orchestrator.yaml",

@@ -20,10 +20,10 @@ Every project targeted by Dark Factory — this repo included — must expose
 its top-level orchestrator config at
 `<project_root>/dark-factory-orchestrator.yaml`. That is the canonical,
 required filename: it's what the dashboard's escalation-URL discovery
-(`_discover_escalation_urls`) keys on. Legacy spellings (`orchestrator.yaml`,
-`orchestrator-config.yaml`, `orchestrator/config.yaml`) are honored only as
-a discovery fallback for not-yet-migrated projects, not a supported choice
-for new ones.
+(`_discover_escalation_urls`) keys on. Discovery reads no other name: a
+project still using `orchestrator.yaml`, `orchestrator-config.yaml` or
+`orchestrator/config.yaml` is invisible to the dashboard until renamed (task
+7138 retired those legacy spellings).
 
 This repo uses `ruff check` only; `ruff format` is deliberately NOT adopted
 and most files are not format-clean. Do not file or perform

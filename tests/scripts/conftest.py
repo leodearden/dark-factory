@@ -70,8 +70,8 @@ REPO_ROOT = Path(__file__).parents[2]
 # This worktree's own top-level orchestrator config — the one ``root_config``
 # reads. ``dark-factory-orchestrator.yaml`` is the canonical, REQUIRED filename
 # for a project's top-level config (it is what the dashboard's escalation-URL
-# discovery keys on); the legacy spellings are a discovery fallback for
-# unmigrated projects, not a choice this repo has. Anchored to REPO_ROOT rather
+# discovery keys on); discovery reads no legacy spelling (retired, task 7138),
+# and none is a choice this repo has. Anchored to REPO_ROOT rather
 # than taken from the ambient ORCH_CONFIG_PATH, for the reason the fixture's
 # docstring records at length.
 ROOT_CONFIG_PATH = REPO_ROOT / 'dark-factory-orchestrator.yaml'

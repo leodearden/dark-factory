@@ -27,14 +27,14 @@ Both forms behave identically. When both are set, `--config` wins. If neither is
 | Project | Config file | `project_id` | `project_root` |
 |---------|------------|--------------|----------------|
 | dark-factory | `/home/leo/src/dark-factory/dark-factory-orchestrator.yaml` | `dark_factory` | `/home/leo/src/dark-factory` |
-| reify | `/home/leo/src/reify/orchestrator.yaml` | `reify` | `/home/leo/src/reify` |
-| autopilot-video | `/home/leo/src/autopilot-video/orchestrator-config.yaml` | `autopilot_video` | `/home/leo/src/autopilot-video` |
+| reify | `/home/leo/src/reify/dark-factory-orchestrator.yaml` | `reify` | `/home/leo/src/reify` |
+| autopilot-video | `/home/leo/src/autopilot-video/dark-factory-orchestrator.yaml` | `autopilot_video` | `/home/leo/src/autopilot-video` |
 
-`dark-factory-orchestrator.yaml` (used above by dark-factory) is now the canonical, required top-level config filename for any orchestrator-targeted project — it's the name the dashboard's escalation-URL discovery keys on, and any new project should use it (see "Setting up a new project" below). reify and autopilot-video above still show their historical filenames; that's fine for the orchestrator *binary*, since the `--config` flag (or `ORCH_CONFIG_PATH`) always names the file explicitly — but a non-canonical name is only picked up by dashboard discovery's legacy fallback (which logs a nudge warning) instead of directly.
+`dark-factory-orchestrator.yaml` (used above by all three) is the canonical, required top-level config filename for any orchestrator-targeted project — it's the only name the dashboard's escalation-URL discovery reads, and any new project should use it (see "Setting up a new project" below). The orchestrator *binary* would run from any filename, since the `--config` flag (or `ORCH_CONFIG_PATH`) always names the file explicitly — but a non-canonical name is not picked up by dashboard discovery at all: there is no legacy fallback and no nudge warning (task 7138 retired both).
 
 ## Setting up a new project
 
-1. **Name the config file `dark-factory-orchestrator.yaml`, at the repo root.** This is the canonical, required filename — it's what the dashboard's escalation-URL discovery keys on. The orchestrator binary itself never auto-discovers the file (`--config`/`ORCH_CONFIG_PATH` always name it explicitly), but only the canonical name is picked up by dashboard discovery without a legacy-fallback warning.
+1. **Name the config file `dark-factory-orchestrator.yaml`, at the repo root.** This is the canonical, required filename — it's what the dashboard's escalation-URL discovery keys on. The orchestrator binary itself never auto-discovers the file (`--config`/`ORCH_CONFIG_PATH` always name it explicitly), but dashboard discovery reads only the canonical name: a project under any other name is invisible to the dashboard.
 
 2. **Write the minimum required keys**:
    ```yaml
@@ -72,7 +72,7 @@ Example contents:
 
 ```bash
 # /home/leo/src/reify/.envrc
-export ORCH_CONFIG_PATH="/home/leo/src/reify/orchestrator.yaml"
+export ORCH_CONFIG_PATH="/home/leo/src/reify/dark-factory-orchestrator.yaml"
 ```
 
 To create one for a new project, copy this pattern and adjust the path. Always use the absolute path — direnv runs the file from the directory, but other tools that re-source it may have a different cwd.
@@ -98,7 +98,7 @@ cd /home/leo/src/reify && direnv allow
 cd /home/leo/src/autopilot-video && direnv allow
 ```
 
-After this, `cd /home/leo/src/reify` automatically exports `ORCH_CONFIG_PATH=/home/leo/src/reify/orchestrator.yaml`, and the orchestrator started from any cwd in that shell will target reify without needing `--config`.
+After this, `cd /home/leo/src/reify` automatically exports `ORCH_CONFIG_PATH=/home/leo/src/reify/dark-factory-orchestrator.yaml`, and the orchestrator started from any cwd in that shell will target reify without needing `--config`.
 
 The install is a one-time, sudo action. **Do not install direnv automatically** — confirm with the user first.
 
@@ -110,12 +110,12 @@ Two options:
    ```bash
    cd /home/leo/src/dark-factory
    uv run --project orchestrator orchestrator run \
-       --config /home/leo/src/reify/orchestrator.yaml
+       --config /home/leo/src/reify/dark-factory-orchestrator.yaml
    ```
 
 2. **Set `ORCH_CONFIG_PATH` for the duration of one shell session**:
    ```bash
-   export ORCH_CONFIG_PATH=/home/leo/src/reify/orchestrator.yaml
+   export ORCH_CONFIG_PATH=/home/leo/src/reify/dark-factory-orchestrator.yaml
    # all subsequent orchestrator invocations in this shell target reify
    ```
 
