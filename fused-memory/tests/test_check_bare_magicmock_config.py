@@ -2127,12 +2127,13 @@ def _live_rule_c_debt_entry() -> tuple[str, int]:
     debt = _checker._WALL_CLOCK_DEADLINE_DEBT
     if not debt:
         pytest.fail(
-            'the Rule C debt baseline is empty: every file is migrated. Retire the '
-            'debt machinery in this same change: _WALL_CLOCK_DEADLINE_DEBT, '
-            '_debt_entry, _DebtEntry, _apply_debt_budget, _wall_clock_overrun_msg '
-            'and _wall_clock_slack_msg in check_bare_magicmock_config.py, and the '
-            'tests that call '
-            '_live_rule_c_debt_entry here'
+            'the Rule C debt baseline is empty: every file is migrated. Retire '
+            "Rule C's debt items in this same change: _WALL_CLOCK_DEADLINE_DEBT, "
+            '_WALL_CLOCK_DEADLINE_BUDGETS, _wall_clock_overrun_msg and '
+            '_wall_clock_slack_msg in check_bare_magicmock_config.py, and the '
+            'tests that call _live_rule_c_debt_entry here. The shared DebtEntry, '
+            'DebtBaseline and apply_debt_budget in _lint_cli.py stay: Rule D '
+            'uses them'
         )
     return max(debt.items(), key=lambda item: item[1])
 
@@ -2356,38 +2357,6 @@ class TestWallClockDeadlineDebtBaseline:
             assert citation in overrun.message, (
                 f'the Rule C overrun message must cite {citation!r}; got {overrun.message!r}'
             )
-
-    def test_both_budget_builders_are_required_and_keyword_only(self):
-        """A future Rule D must not be able to inherit another rule's remedy by omission.
-
-        The overrun parameter briefly carried ``= None`` falling back to Rule B's own
-        builder. Both call sites passed it, so the fallback was dead — but a
-        fourth rule calling ``_apply_debt_budget(found, budget)`` would have
-        silently prescribed a mock-double remedy for a wall-clock overrun, with
-        no type error and no failing test. The slack builder (task 6202) carries the
-        same guard. Requiredness is the whole guard, so it is pinned here rather
-        than trusted.
-
-        Every call passes entry None, so no debt entry is ever built here.
-        """
-
-        def _builder(_entry, _found) -> str:
-            return ''
-
-        builders = {'build_overrun_msg': _builder, 'build_slack_msg': _builder}
-        assert (
-            _checker._apply_debt_budget([], None, filename=_NON_DEBT_FILE, **builders) == []
-        ), 'the complete call must succeed, so each TypeError below has one cause'
-        for name in builders:
-            others = {key: value for key, value in builders.items() if key != name}
-            with pytest.raises(TypeError):
-                _checker._apply_debt_budget([], None, filename=_NON_DEBT_FILE, **others)
-            with pytest.raises(TypeError):
-                _checker._apply_debt_budget(
-                    [], None, _builder, filename=_NON_DEBT_FILE, **others
-                )
-        with pytest.raises(TypeError):
-            _checker._apply_debt_budget([], None, _NON_DEBT_FILE, _builder, _builder)
 
 
 class TestWallClockDeadlineDebtSlack:
