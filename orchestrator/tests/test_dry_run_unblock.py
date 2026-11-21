@@ -2759,20 +2759,19 @@ class _TaskDocScheduler:
         return dict(self._task_doc)
 
 
-async def _capture_investigation_call(tmp_path, scheduler, config=None, **overrides) -> dict:
-    """Run one investigation and return the kwargs handed to the agent.
+_LOW_RISK_PROPOSAL = {
+    'proposal_text': 'Rebase on main and rerun verify',
+    'risk_label': 'low',
+    'files_referenced': [],
+}
 
-    *overrides* replace or add ``run_dry_run_unblock`` keyword arguments.
+
+def _investigation_kwargs(tmp_path, scheduler, config=None, **overrides) -> dict:
+    """The ``run_dry_run_unblock`` arguments of one investigation of task 42.
+
+    *overrides* replace or add keyword arguments.
     """
-    from orchestrator.dry_run_unblock import run_dry_run_unblock
-
-    agent_result = _make_agent_result(structured_output={
-        'proposal_text': 'Rebase on main and rerun verify',
-        'risk_label': 'low',
-        'files_referenced': [],
-    })
-    mock_invoke = AsyncMock(return_value=agent_result)
-    investigation = {
+    return {
         'task_id': '42',
         'worktree': str(tmp_path),
         'reason': 'verify exhausted',
@@ -2782,6 +2781,18 @@ async def _capture_investigation_call(tmp_path, scheduler, config=None, **overri
         'config': config if config is not None else _make_config(),
         **overrides,
     }
+
+
+async def _capture_investigation_call(tmp_path, scheduler, config=None, **overrides) -> dict:
+    """Run one investigation and return the kwargs handed to the agent.
+
+    *overrides* replace or add ``run_dry_run_unblock`` keyword arguments.
+    """
+    from orchestrator.dry_run_unblock import run_dry_run_unblock
+
+    agent_result = _make_agent_result(structured_output=dict(_LOW_RISK_PROPOSAL))
+    mock_invoke = AsyncMock(return_value=agent_result)
+    investigation = _investigation_kwargs(tmp_path, scheduler, config, **overrides)
     with patch('orchestrator.dry_run_unblock.invoke_agent', new=mock_invoke):
         await run_dry_run_unblock(**investigation)
     assert mock_invoke.call_args is not None, 'the investigation never reached the agent'
@@ -3248,11 +3259,7 @@ async def _capture_investigation_spawn(tmp_path, config=None) -> tuple[list[str]
                 'total_cost_usd': 0.01,
                 'num_turns': 1,
                 'session_id': 'spawn-capture',
-                'structured_output': {
-                    'proposal_text': 'Rebase on main and rerun verify',
-                    'risk_label': 'low',
-                    'files_referenced': [],
-                },
+                'structured_output': _LOW_RISK_PROPOSAL,
             }),
             stderr='',
             returncode=0,
@@ -3271,13 +3278,7 @@ async def _capture_investigation_spawn(tmp_path, config=None) -> tuple[list[str]
         for name in _PINNED_INVESTIGATION_ENV:
             os.environ.pop(name, None)
         await run_dry_run_unblock(
-            task_id='42',
-            worktree=str(tmp_path),
-            reason='verify exhausted',
-            detail='All 5 attempts timed out',
-            scheduler=_TaskDocScheduler(),
-            mcp=mcp,
-            config=config if config is not None else _make_config(),
+            **_investigation_kwargs(tmp_path, _TaskDocScheduler(), config, mcp=mcp),
         )
     assert len(spawns) == 1, f'expected exactly one CLI spawn; got {len(spawns)}'
     return spawns[0]
@@ -3326,10 +3327,8 @@ class TestInvestigationPermissionEnvelope:
 
     @pytest.mark.asyncio
     async def test_investigation_runs_under_dont_ask_not_bypass(self, tmp_path):
-        kwargs = await _capture_investigation_call(tmp_path, _TaskDocScheduler())
-
-        assert kwargs.get('permission_mode') == 'dontAsk', kwargs.get('permission_mode')
         argv, _ = await _capture_investigation_spawn(tmp_path)
+
         assert argv[argv.index('--permission-mode') + 1] == 'dontAsk', argv
 
     @pytest.mark.asyncio

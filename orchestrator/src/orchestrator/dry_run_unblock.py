@@ -773,7 +773,6 @@ async def run_dry_run_unblock(
                 allowed_tools=_ALLOWED_TOOLS,
                 disallowed_tools=_DISALLOWED_TOOLS,
                 setting_sources=[],
-                # A copy: the claude path layers further defaults onto it.
                 env_overrides=dict(_INVESTIGATION_ENV_OVERRIDES),
                 mcp_config=mcp_config,
                 output_schema=DRY_RUN_PROPOSAL_SCHEMA,
