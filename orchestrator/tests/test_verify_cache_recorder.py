@@ -42,8 +42,7 @@ def _progress(statuses: str, percent: int) -> str:
     return f'{statuses.ljust(_PROGRESS_COLUMN)}[{percent:3d}%]'
 
 
-@pytest.fixture
-def pytest_on_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def put_pytest_on_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A bare ``pytest`` on PATH running this interpreter's pytest: the launcher
     the verify path injects ``--junitxml`` into (``python -m pytest`` gets none)."""
     bin_dir = tmp_path / 'pytest-bin'
@@ -52,6 +51,11 @@ def pytest_on_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     shim.write_text(f'#!/bin/sh\nexec {shlex.quote(sys.executable)} -m pytest "$@"\n')
     shim.chmod(0o755)
     monkeypatch.setenv('PATH', f'{bin_dir}{os.pathsep}{os.environ["PATH"]}')
+
+
+@pytest.fixture
+def pytest_on_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    put_pytest_on_path(tmp_path, monkeypatch)
 
 
 def _leg(leg: Leg = Leg.TEST, *, rc: int = 0) -> LegResult:

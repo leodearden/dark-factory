@@ -10,6 +10,7 @@ from typing import Literal
 import pytest
 from _git_fixtures import RepoSeed, seed_repo
 from _orch_helpers import git_env_with_ceiling
+from test_verify_cache_recorder import put_pytest_on_path
 
 from orchestrator import verify_plan
 from orchestrator.config import (
@@ -18,13 +19,33 @@ from orchestrator.config import (
     OrchestratorConfig,
     VerifyCacheConfig,
 )
-from orchestrator.verify_cache.keys import UnitKey
+from orchestrator.verify import VerifyResult, run_scoped_verification
+from orchestrator.verify_cache.keys import TREE_UNIT_ID, UnitKey
 from orchestrator.verify_cache.modes import CacheMode, VerifyRole
 from orchestrator.verify_cache.policy import Decision
+from orchestrator.verify_cache.recorder import VerifyEvidenceRef, record_greens
 from orchestrator.verify_cache.registry import Entry, Registry
 from orchestrator.verify_cache.replay import CacheAccess, ReplayPlan, plan_replay
-from orchestrator.verify_evidence import Leg, module_leg_name
+from orchestrator.verify_evidence import (
+    Leg,
+    UnitOutcome,
+    VerifyUnit,
+    module_leg_name,
+    module_leg_unit,
+)
 from orchestrator.verify_plan import VerifyPlan
+
+#: Every leg of the fixture appends ``<module>:<leg>`` to the file this names.
+_MARKERS_ENV = 'DF_VERIFY_CACHE_TEST_MARKERS'
+
+
+def _marking_test(prefix: str) -> str:
+    return (
+        f'import os\n\n\ndef test_{prefix}():\n'
+        f"    with open(os.environ['{_MARKERS_ENV}'], 'a') as markers:\n"
+        f"        markers.write('{prefix}:test\\n')\n"
+    )
+
 
 _SEED = RepoSeed(
     files=(
@@ -32,10 +53,10 @@ _SEED = RepoSeed(
         ('pyproject.toml', '[tool.uv.workspace]\nmembers = ["alpha", "beta"]\n'),
         ('alpha/pyproject.toml', '[project]\nname = "alpha"\nversion = "0"\n'),
         ('alpha/src/alpha/__init__.py', 'A = 1\n'),
-        ('alpha/tests/test_alpha.py', 'def test_alpha():\n    pass\n'),
+        ('alpha/tests/test_alpha.py', _marking_test('alpha')),
         ('beta/pyproject.toml', '[project]\nname = "beta"\nversion = "0"\ndependencies = ["alpha>=0"]\n'),
         ('beta/src/beta/__init__.py', 'B = 1\n'),
-        ('beta/tests/test_beta.py', 'def test_beta():\n    pass\n'),
+        ('beta/tests/test_beta.py', _marking_test('beta')),
     ),
     message='verify cache decision fixture',
 )
@@ -75,12 +96,17 @@ def _commit_edit(repo: Path, path: str, text: str) -> None:
 
 
 def _config(
-    repo: Path, modes: VerifyCacheConfig = _ON, *, test_command: str = 'pytest', lint_command: str = 'ruff check',
+    repo: Path,
+    modes: VerifyCacheConfig = _ON,
+    *,
+    test_command: str = 'pytest',
+    lint_command: str = 'ruff check',
+    type_check_command: str = 'pyright',
 ) -> OrchestratorConfig:
     return OrchestratorConfig(
         project_root=repo, merge_verify_workspace=True, merge_verify_breadth='full',
         verify_cold_preprovision_command='', verify_cache=modes,
-        test_command=test_command, lint_command=lint_command,
+        test_command=test_command, lint_command=lint_command, type_check_command=type_check_command,
     )
 
 
@@ -327,3 +353,220 @@ class TestPlanReplay:
 
         assert replay.without_replayed(alpha) is None
         assert replay.without_replayed(beta) == beta
+
+
+# ---------------------------------------------------------------------------
+# The decision at the real fan-out seam: run_scoped_verification's execution funnel.
+
+_TASK_ON_MERGE_OFF = VerifyCacheConfig(task_mode=CacheMode.ON, merge_mode=CacheMode.OFF)
+
+
+@pytest.fixture
+def seam(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, markers: Path) -> None:
+    """Real legs: a bare ``pytest`` whose junit the verify reads, and every leg leaves a marker."""
+    put_pytest_on_path(tmp_path, monkeypatch)
+    monkeypatch.setenv(_MARKERS_ENV, str(markers))
+
+
+def _legs(prefix: str) -> set[str]:
+    return {f'{prefix}:{leg}' for leg in Leg}
+
+
+def _ran_legs(markers: Path) -> set[str]:
+    """The ``<module>:<leg>`` of every leg that executed since *markers* was last cleared."""
+    if not markers.exists():
+        return set()
+    return {line.split()[0] for line in markers.read_text().splitlines() if line.strip()}
+
+
+def _clear(markers: Path) -> None:
+    markers.unlink(missing_ok=True)
+
+
+async def _gate(
+    repo: Path, config: OrchestratorConfig, modules: Sequence[ModuleConfig], access: CacheAccess | None,
+) -> VerifyResult:
+    return await run_scoped_verification(
+        repo, config, list(modules), role='merge', is_merge_verify=True, force_workspace=True,
+        verify_cache=access,
+    )
+
+
+async def _task_verify(
+    repo: Path, config: OrchestratorConfig, modules: Sequence[ModuleConfig], access: CacheAccess,
+    task_files: list[str],
+) -> VerifyResult:
+    return await run_scoped_verification(
+        repo, config, list(modules), task_files, role='task', verify_cache=access,
+    )
+
+
+async def _record_run(registry: Registry, result: VerifyResult, *, event_id: int = 41) -> dict[str, Entry]:
+    assert result.passed, result.summary
+    assert result.cache_record is not None
+    outcome = await record_greens(
+        registry, result.cache_record, flake_suppressed=False,
+        evidence=VerifyEvidenceRef(event_id, 'r', 'sha-first', True),
+    )
+    return {entry.unit_id: entry for entry in outcome.recorded}
+
+
+def _by_unit(result: VerifyResult) -> dict[str, VerifyUnit]:
+    assert result.units is not None
+    return {unit.unit: unit for unit in result.units}
+
+
+def _outcomes(result: VerifyResult, unit_ids: set[str]) -> set[UnitOutcome]:
+    units = _by_unit(result)
+    return {units[unit_id].outcome for unit_id in unit_ids}
+
+
+def _replay_hint(unit_id: str, entry: Entry) -> str:
+    return f'replayed {unit_id} from entry {entry.entry_id} (evidence event {entry.evidence_event_id})'
+
+
+def _tree_key(result: VerifyResult) -> UnitKey:
+    assert result.cache_record is not None and result.cache_record.tree is not None
+    key = result.cache_record.tree.key
+    assert key is not None
+    return key
+
+
+@pytest.mark.usefixtures('seam')
+class TestFanOutSeam:
+    @pytest.mark.asyncio
+    async def test_an_edit_outside_alpha_replays_alpha_and_runs_beta(
+        self, repo, modules, access, registry, markers,
+    ):
+        config = _config(repo)
+        first = await _gate(repo, config, modules, access)
+        recorded = await _record_run(registry, first)
+        assert _units('alpha') <= set(recorded)
+        _commit_edit(repo, 'beta/src/beta/__init__.py', 'B = 2\n')
+        _clear(markers)
+
+        result = await _gate(repo, config, modules, access)
+
+        assert _ran_legs(markers) == _legs('beta')
+        assert result.passed, result.summary
+        assert result.cache_mode is CacheMode.ON
+        assert result.plan == first.plan == _full_suite_plan(modules).to_dict()
+        units = _by_unit(result)
+        for unit_id in _units('alpha'):
+            assert units[unit_id].outcome is UnitOutcome.CACHE_HIT
+            assert units[unit_id].evidence_event_id == 41
+            assert _replay_hint(unit_id, recorded[unit_id]) in result.cause_hint
+        assert _outcomes(result, _units('beta')) == {UnitOutcome.RAN_GREEN}
+
+    @pytest.mark.asyncio
+    async def test_a_wholly_replayed_module_reads_as_a_cache_hit_not_a_run(
+        self, repo, modules, access, registry, markers,
+    ):
+        config = _config(repo)
+        recorded = await _record_run(registry, await _gate(repo, config, modules, access))
+        _commit_edit(repo, 'beta/src/beta/__init__.py', 'B = 2\n')
+        _clear(markers)
+
+        result = await _gate(repo, config, modules[:1], access)
+
+        assert _ran_legs(markers) == set()
+        assert result.passed, result.summary
+        assert result.category == 'cache_hit'
+        assert result.duration_secs == 0.0
+        assert (result.test_output, result.lint_output, result.type_output) == ('', '', '')
+        for unit_id in _units('alpha'):
+            assert _replay_hint(unit_id, recorded[unit_id]) in result.cause_hint
+        assert _outcomes(result, _units('alpha')) == {UnitOutcome.CACHE_HIT}
+
+    @pytest.mark.asyncio
+    async def test_a_recorded_tree_green_runs_no_leg_at_all(self, repo, modules, access, registry, markers):
+        config = _config(repo)
+        first = await _gate(repo, config, modules, access)
+        assert TREE_UNIT_ID in await _record_run(registry, first)
+        tree_entry = await registry.record_green(_tree_key(first), evidence_event_id=99, run_id='r', sha='sha-tree')
+        _clear(markers)
+
+        result = await _gate(repo, config, modules, access)
+
+        assert _ran_legs(markers) == set()
+        assert result.passed, result.summary
+        units = _by_unit(result)
+        assert set(units) == _units('alpha') | _units('beta') | {TREE_UNIT_ID}
+        for unit in units.values():
+            assert unit.outcome is UnitOutcome.CACHE_HIT
+            assert unit.evidence_event_id == tree_entry.evidence_event_id == 99
+
+    @pytest.mark.asyncio
+    async def test_log_mode_runs_every_leg_and_reads_would_hit(self, repo, modules, access, registry, markers):
+        config = _config(repo, _LOG)
+        await _record_run(registry, await _gate(repo, config, modules, access))
+        _clear(markers)
+
+        result = await _gate(repo, config, modules, access)
+
+        assert _ran_legs(markers) == _legs('alpha') | _legs('beta')
+        assert result.passed, result.summary
+        assert result.cache_mode is CacheMode.LOG
+        assert {unit.outcome for unit in _by_unit(result).values()} == {UnitOutcome.WOULD_HIT}
+
+    @pytest.mark.asyncio
+    async def test_outside_the_cache_the_verify_is_as_before(self, repo, modules, tmp_path, markers):
+        result = await _gate(repo, _config(repo, _LOG), modules, None)
+
+        assert _ran_legs(markers) == _legs('alpha') | _legs('beta')
+        assert result.passed, result.summary
+        expected = sorted(
+            (module_leg_unit(prefix, leg, 0) for prefix in ('alpha', 'beta') for leg in Leg),
+            key=lambda unit: unit.unit,
+        )
+        assert sorted(result.units or (), key=lambda unit: unit.unit) == expected
+        assert {unit.reason for unit in expected} == {None}
+        assert result.cache_mode is CacheMode.OFF
+        assert result.plan == _full_suite_plan(modules).to_dict()
+        assert not (tmp_path / 'verify_cache.db').exists()
+
+    @pytest.mark.asyncio
+    async def test_each_role_reads_its_own_mode(self, repo, modules, access, registry, markers):
+        (repo / '.task').mkdir()
+        config = _config(repo, _TASK_ON_MERGE_OFF)
+        task_files = ['alpha/src/alpha/__init__.py', 'beta/src/beta/__init__.py']
+        recorded = await _record_run(registry, await _task_verify(repo, config, modules, access, task_files))
+        alpha_units = {unit_id for unit_id in recorded if unit_id.startswith('module:alpha:')}
+        assert alpha_units
+        _commit_edit(repo, 'beta/src/beta/__init__.py', 'B = 2\n')
+        _clear(markers)
+
+        task = await _task_verify(repo, config, modules, access, task_files)
+
+        assert task.passed, task.summary
+        assert task.cache_mode is CacheMode.ON
+        assert _outcomes(task, alpha_units) == {UnitOutcome.CACHE_HIT}
+        assert not {leg for leg in _ran_legs(markers) if leg.startswith('alpha:')}
+        _clear(markers)
+
+        merge = await _gate(repo, config, modules, access)
+
+        assert merge.passed, merge.summary
+        assert merge.cache_mode is CacheMode.OFF
+        assert _legs('alpha') <= _ran_legs(markers)
+        assert UnitOutcome.CACHE_HIT not in {unit.outcome for unit in _by_unit(merge).values()}
+
+    @pytest.mark.asyncio
+    async def test_a_plan_less_gate_replays_its_recorded_tree_green(self, repo, access, registry, markers):
+        config = _config(
+            repo, test_command='pytest alpha/tests beta/tests -q',
+            lint_command=f'echo global:lint >> {markers}', type_check_command=f'echo global:type >> {markers}',
+        )
+        first = await _gate(repo, config, [], access)
+        assert first.passed, first.summary
+        assert first.plan is None
+        await registry.record_green(_tree_key(first), evidence_event_id=77, run_id='r', sha='sha-first')
+        _clear(markers)
+
+        result = await _gate(repo, config, [], access)
+
+        assert _ran_legs(markers) == set()
+        assert result.passed, result.summary
+        units = _by_unit(result)
+        assert (units[TREE_UNIT_ID].outcome, units[TREE_UNIT_ID].evidence_event_id) == (UnitOutcome.CACHE_HIT, 77)
+        assert {unit.outcome for unit in units.values()} == {UnitOutcome.CACHE_HIT}
