@@ -30,6 +30,7 @@ its runner, and nothing here imports git_ops or merge_queue.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -54,6 +55,47 @@ STACKED_ON_UNLANDED_BASE_REASON_PREFIX = 'Branch is stacked on an unlanded base'
 #: A git read needed to decide the foreign-commit cut failed.
 StackInspectionError = GitReadError
 
+_FULL_SHA = re.compile(r'[0-9a-f]{40}(?:[0-9a-f]{24})?')
+
+
+@dataclass(frozen=True)
+class StackTarget:
+    """Stack a branch on *commit*, a tip of the predecessor branch *branch*."""
+
+    branch: str
+    commit: str
+
+    def __post_init__(self) -> None:
+        if not self.branch:
+            raise ValueError(f'a stack target needs a branch, got {self.branch!r}')
+        if not _FULL_SHA.fullmatch(self.commit):
+            raise ValueError(
+                f'a stack target commit must be a full hex sha, got {self.commit!r}',
+            )
+
+
+class StackRecordState(StrEnum):
+    ABSENT = 'absent'
+    RECORDED = 'recorded'
+    UNREADABLE = 'unreadable'
+
+
+@dataclass(frozen=True)
+class StackBaseRead:
+    """What the ledger says of one branch.  UNREADABLE is a failed read, which
+    is NOT "no record": the branch may be stacked.  ``detail`` says why."""
+
+    state: StackRecordState
+    base: str | None = None
+    detail: str = ''
+
+    def __post_init__(self) -> None:
+        if (self.state is StackRecordState.RECORDED) != (self.base is not None):
+            raise ValueError(f'a {self.state} stack-base read cannot have base {self.base}')
+
+    def names(self, sha: str) -> bool:
+        return self.base == sha
+
 
 @dataclass(frozen=True)
 class StackBaseLedger:
@@ -77,15 +119,41 @@ class StackBaseLedger:
                 base_sha, full_branch, err.strip(),
             )
 
-    async def base_of(self, full_branch: str) -> str | None:
-        rc, out, _ = await self.run(
-            [
-                'git', 'rev-parse', '--verify', '--quiet',
-                f'{self.ref_for(full_branch)}^{{commit}}',
-            ],
+    async def ensure_record(self, full_branch: str, base_sha: str) -> StackBaseRead:
+        """Make *full_branch*'s record name *base_sha*, writing only when it does
+        not already, and return the read-back.  Never raises: the caller asks
+        the answer's ``names(base_sha)``."""
+        if not (await self.read(full_branch)).names(base_sha):
+            await self.record(full_branch, base_sha)
+        return await self.read(full_branch)
+
+    async def read(self, full_branch: str) -> StackBaseRead:
+        ref = self.ref_for(full_branch)
+        rc, out, err = await self.run(
+            ['git', 'for-each-ref', '--format=%(refname) %(objectname) %(objecttype)', ref],
             cwd=self.repo_root,
         )
-        return out.strip() if rc == 0 else None
+        if rc != 0:
+            return StackBaseRead(
+                StackRecordState.UNREADABLE,
+                detail=err.strip() or f'git for-each-ref {ref} exited {rc}',
+            )
+        rows = [line.split(' ') for line in out.splitlines()]
+        exact = [row[1:] for row in rows if row[0] == ref]
+        if not exact:
+            return StackBaseRead(StackRecordState.ABSENT)
+        sha, object_type = exact[0]
+        if object_type != 'commit':
+            return StackBaseRead(
+                StackRecordState.UNREADABLE,
+                detail=f'{ref} names {object_type} {sha}, not a commit',
+            )
+        return StackBaseRead(StackRecordState.RECORDED, sha)
+
+    async def base_of(self, full_branch: str) -> str | None:
+        """The recorded base; None both for no record and for a failed read,
+        which :meth:`read` tells apart."""
+        return (await self.read(full_branch)).base
 
     async def forget(self, full_branch: str) -> None:
         """Drop *full_branch*'s record, if any.  Never raises."""
