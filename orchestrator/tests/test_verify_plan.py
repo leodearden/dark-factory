@@ -67,6 +67,8 @@ from orchestrator.verify_plan import (
     classify_file,
     derive_verify_plan,
     effective_merge_module_configs,
+    executed_module_prefixes,
+    is_trivial_diff,
     reverse_dependent_test_targets,
     scope_prefix_to_keyword,
 )
@@ -124,9 +126,10 @@ DATA_MODULE_DIFF: list[str] = ['shared/tests/silent_fallthrough_allowlist.py']
 # widened for this case).
 STRUCTURAL_DIFF: list[str] = ['orchestrator/src/orchestrator/interfaces.py']
 
-# An all-INERT diff (no .py/.rs at all) for the plan-level flags: every
-# module-path/fallback branch would no-op on this, so derive_verify_plan must
-# short-circuit to a TRIVIAL PlannedRun rather than fabricate a pytest run.
+# A prose-only diff for the plan-level flags: no .py/.rs source and no
+# behavioural artifact (orchestrator/src/orchestrator/verify_artifact_consumers.py::BEHAVIOURAL_ARTIFACTS),
+# so derive_verify_plan must short-circuit to a TRIVIAL PlannedRun rather than
+# fabricate a pytest run.
 _ALL_INERT_DIFF: list[str] = ['docs/README.md', 'scripts/deploy.yaml']
 
 # task λ (2589): a plain SOURCE .py file under a module prefix — not a
@@ -2173,12 +2176,66 @@ class TestDeriveVerifyPlanFallbackPath:
 
 
 # ---------------------------------------------------------------------------
+# Behavioural-artifact fixtures (task 5296)
+# ---------------------------------------------------------------------------
+
+# Shaped like the registered modules that own every behavioural-artifact
+# consumer test in orchestrator/src/orchestrator/verify_artifact_consumers.py.
+_ARTIFACT_ORCH_MC = ModuleConfig(
+    prefix='orchestrator',
+    test_command='uv run --directory orchestrator pytest tests/',
+    lint_command='uv run --directory orchestrator ruff check src/ tests/',
+    type_check_command='uv run --directory orchestrator pyright src/ tests/',
+)
+_ARTIFACT_SCRIPTS_MC = ModuleConfig(
+    prefix='scripts',
+    test_command='uv run --project shared pytest tests/scripts/ scripts/tests/',
+    lint_command='uv run --project shared ruff check scripts/',
+    type_check_command='uv run --project shared pyright scripts/',
+)
+_ARTIFACT_TESTS_SCRIPTS_MC = ModuleConfig(
+    prefix='tests/scripts',
+    test_command='uv run --project shared pytest tests/scripts/',
+    lint_command='uv run --project shared ruff check tests/scripts/',
+    type_check_command='uv run --project shared pyright tests/scripts/',
+)
+_ARTIFACT_MODULES = [_ARTIFACT_ORCH_MC, _ARTIFACT_SCRIPTS_MC, _ARTIFACT_TESTS_SCRIPTS_MC]
+
+_SPAWN_SH = 'skills/spawn/spawn-claude.sh'
+_HOOK_SH = 'skills/spawn/hooks/stop.sh'
+_UNBLOCK_SKILL = 'skills/unblock-auto/SKILL.md'
+_WATCHER_SKILL = 'skills/escalation-watcher-auto/SKILL.md'
+_ROOT_YAML = 'dark-factory-orchestrator.yaml'
+
+_SPAWN_CONSUMERS: dict[str, tuple[str, ...]] = {
+    'orchestrator': (
+        'orchestrator/tests/test_session_hooks.py',
+        'orchestrator/tests/test_session_hooks_bash.py',
+    ),
+    'scripts': ('scripts/tests/test_legibility_inventory.py',),
+    'tests/scripts': ('tests/scripts/test_spawn_claude.py',),
+}
+_SKILL_PROMPT_CONSUMERS = (
+    'orchestrator/tests/test_harness_watcher_supervisor.py',
+    'orchestrator/tests/test_skill_prompt.py',
+)
+
+
+def _is_trivial_plan(plan: VerifyPlan) -> bool:
+    return len(plan.runs) == 1 and plan.runs[0].scope_kind is ScopeKind.TRIVIAL
+
+
+# ---------------------------------------------------------------------------
 # Plan-level flags: needs_pipeline_guard_check / TRIVIAL (step-11: RED)
 # ---------------------------------------------------------------------------
 
 
 class TestPlanFlags:
-    """VerifyPlan's plan-level flags: needs_pipeline_guard_check and TRIVIAL."""
+    """VerifyPlan's plan-level flags: needs_pipeline_guard_check and TRIVIAL.
+
+    The diff here is prose-only: no .py/.rs source and no behavioural artifact.
+    A behavioural-artifact diff is TRIVIAL only at role='merge' (task 5296).
+    """
 
     # -- (a) needs_pipeline_guard_check ---------------------------------------
 
@@ -2213,7 +2270,7 @@ class TestPlanFlags:
         assert plan.runs[0].reason
 
     def test_all_inert_diff_with_module_configs_still_trivial(self):
-        """The TRIVIAL short-circuit applies before ever branching on module_configs."""
+        """A prose-only diff short-circuits before branching on module_configs."""
         mc = ModuleConfig(
             prefix='orchestrator',
             test_command='uv run --directory orchestrator pytest tests/',
@@ -2222,6 +2279,20 @@ class TestPlanFlags:
         plan = derive_verify_plan(_ALL_INERT_DIFF, [mc], None, fake_worktree_reader)
         assert len(plan.runs) == 1
         assert plan.runs[0].scope_kind is ScopeKind.TRIVIAL
+
+    def test_behavioural_artifact_diff_is_not_trivial_at_task_role_when_a_module_owns_its_consumers(self):
+        plan = derive_verify_plan(
+            [_UNBLOCK_SKILL], [_ARTIFACT_ORCH_MC], None, fake_worktree_reader, role='task',
+        )
+        assert not _is_trivial_plan(plan)
+        assert plan.needs_pipeline_guard_check is False
+
+    def test_behavioural_artifact_diff_stays_trivial_at_merge_role(self):
+        plan = derive_verify_plan(
+            [_UNBLOCK_SKILL], [_ARTIFACT_ORCH_MC], None, fake_worktree_reader, role='merge',
+        )
+        assert _is_trivial_plan(plan)
+        assert plan.needs_pipeline_guard_check is True
 
     # -- (c) D1-with-suite pin (module path) --------------------------------------
 
@@ -2242,6 +2313,151 @@ class TestPlanFlags:
         assert run.scope_kind is ScopeKind.FULL_SUITE
         assert mc.test_command is not None
         assert run.cmd == parse_config_command(mc.test_command)
+
+
+class TestDeriveVerifyPlanBehaviouralArtifacts:
+    """Task 5296: at role='task' a touched behavioural artifact runs its consumer tests.
+
+    Prose stays TRIVIAL, and role='merge' is unchanged. Consumer demand is
+    merged into each owning module's single pytest slot, never emitted as a
+    second pytest run.
+    """
+
+    @staticmethod
+    def _plan(
+        files: list[str],
+        modules: list[ModuleConfig] | None = None,
+        role: Literal['merge', 'task'] = 'task',
+        *,
+        reader=fake_worktree_reader,
+        list_pkg_tests=None,
+    ) -> VerifyPlan:
+        return derive_verify_plan(
+            files, _ARTIFACT_MODULES if modules is None else modules, None, reader,
+            role=role, list_pkg_tests=list_pkg_tests,
+        )
+
+    @staticmethod
+    def _assert_consumer_only_module(plan: VerifyPlan, mc: ModuleConfig, artifact: str) -> PlannedRun:
+        for tool_word in ('lint:', 'pyright:'):
+            run = _run_for(plan, mc.prefix, tool_word)
+            assert run is not None, (mc.prefix, tool_word)
+            assert run.scope_kind is ScopeKind.SKIPPED
+            assert run.cmd is None
+        pytest_run = _run_for(plan, mc.prefix, 'pytest:')
+        assert pytest_run is not None, mc.prefix
+        assert artifact in pytest_run.reason
+        return pytest_run
+
+    @pytest.mark.parametrize('artifact', [_SPAWN_SH, _HOOK_SH])
+    def test_spawn_script_runs_each_owning_modules_consumer_tests(self, artifact: str):
+        plan = self._plan([artifact])
+
+        assert not any(run.scope_kind is ScopeKind.TRIVIAL for run in plan.runs)
+        assert executed_module_prefixes(plan) == {'orchestrator', 'scripts', 'tests/scripts'}
+        for mc in _ARTIFACT_MODULES:
+            run = self._assert_consumer_only_module(plan, mc, artifact)
+            targets = _SPAWN_CONSUMERS[mc.prefix]
+            assert run.scope_kind is ScopeKind.FILE_SCOPED
+            assert run.scoped_targets == targets
+            assert mc.test_command is not None
+            assert run.cmd == scope_prefix_to_keyword(mc.test_command, 'pytest', list(targets))
+
+    @pytest.mark.parametrize('artifact', [_UNBLOCK_SKILL, _WATCHER_SKILL])
+    def test_auto_skill_prompt_runs_only_the_orchestrator_prompt_loader_tests(self, artifact: str):
+        plan = self._plan([artifact])
+
+        assert executed_module_prefixes(plan) == {'orchestrator'}
+        run = self._assert_consumer_only_module(plan, _ARTIFACT_ORCH_MC, artifact)
+        assert run.scope_kind is ScopeKind.FILE_SCOPED
+        assert run.scoped_targets == _SKILL_PROMPT_CONSUMERS
+
+    def test_root_yaml_runs_the_tests_scripts_full_suite_only(self):
+        plan = self._plan([_ROOT_YAML])
+
+        assert not any(run.scope_kind is ScopeKind.TRIVIAL for run in plan.runs)
+        assert executed_module_prefixes(plan) == {'tests/scripts'}
+        run = self._assert_consumer_only_module(plan, _ARTIFACT_TESTS_SCRIPTS_MC, _ROOT_YAML)
+        assert run.scope_kind is ScopeKind.FULL_SUITE
+        assert _ARTIFACT_TESTS_SCRIPTS_MC.test_command is not None
+        assert run.cmd == parse_config_command(_ARTIFACT_TESTS_SCRIPTS_MC.test_command)
+        assert run.scoped_targets == ()
+
+    def test_prose_stays_trivial(self):
+        assert _is_trivial_plan(self._plan(['README.md']))
+
+    def test_merge_role_is_unchanged(self):
+        plan = self._plan([_SPAWN_SH], role='merge')
+
+        assert _is_trivial_plan(plan)
+        assert plan.needs_pipeline_guard_check is True
+
+    def test_artifact_whose_consumers_no_passed_module_owns_stays_trivial(self):
+        moda = ModuleConfig(prefix='moda', test_command='uv run --project moda pytest tests/')
+
+        assert _is_trivial_plan(self._plan([_UNBLOCK_SKILL], [moda]))
+
+    def test_consumer_tests_join_the_task_role_floor_selection(self):
+        reader, list_pkg_tests = _guard_family_seams()
+        plan = self._plan(
+            [*SOURCE_ONLY_DIFF, _UNBLOCK_SKILL], reader=reader, list_pkg_tests=list_pkg_tests,
+        )
+
+        run = _run_for(plan, 'orchestrator', 'pytest:')
+        assert run is not None
+        assert run.scope_kind is ScopeKind.FILE_SCOPED
+        assert run.scoped_targets == (*_GUARD_FAMILY, *_SKILL_PROMPT_CONSUMERS)
+        assert run.reason.startswith('pytest: production module touched')
+        assert _UNBLOCK_SKILL in run.reason
+        lint = _run_for(plan, 'orchestrator', 'lint:')
+        assert lint is not None
+        assert lint.scope_kind is ScopeKind.FILE_SCOPED
+        assert lint.scoped_targets == tuple(SOURCE_ONLY_DIFF)
+
+    def test_an_existing_full_suite_absorbs_the_demand(self):
+        plan = self._plan(['orchestrator/tests/conftest.py', _UNBLOCK_SKILL])
+
+        run = _run_for(plan, 'orchestrator', 'pytest:')
+        assert run is not None
+        assert run.scope_kind is ScopeKind.FULL_SUITE
+        assert run.reason.startswith('pytest: conftest touched')
+
+    def test_consumer_tests_all_deselected_widen_to_the_full_suite(self):
+        deselected = 'import pytest\npytestmark = pytest.mark.warm_lane_bash\n\ndef test_x():\n    pass\n'
+        contents = {
+            'orchestrator/pyproject.toml': ORCH_SHAPED_PYPROJECT,
+            **dict.fromkeys(_SKILL_PROMPT_CONSUMERS, deselected),
+        }
+        plan = self._plan([_UNBLOCK_SKILL], reader=contents.get)
+
+        run = _run_for(plan, 'orchestrator', 'pytest:')
+        assert run is not None
+        assert run.scope_kind is ScopeKind.FULL_SUITE
+        assert "'not warm_lane_bash'" in run.reason
+        assert run.scoped_targets == ()
+
+    @pytest.mark.parametrize('role', ['task', 'merge'])
+    @pytest.mark.parametrize(
+        ('files', 'modules'),
+        [
+            pytest.param([_SPAWN_SH], None, id='spawn-sh'),
+            pytest.param([_HOOK_SH], None, id='hook-sh'),
+            pytest.param([_UNBLOCK_SKILL], None, id='unblock-skill'),
+            pytest.param([_WATCHER_SKILL], None, id='watcher-skill'),
+            pytest.param([_ROOT_YAML], None, id='root-yaml'),
+            pytest.param(['README.md'], None, id='prose'),
+            pytest.param(
+                [_UNBLOCK_SKILL], [ModuleConfig(prefix='moda', test_command='pytest tests/')],
+                id='unowned-consumers',
+            ),
+            pytest.param([*SOURCE_ONLY_DIFF, _UNBLOCK_SKILL], None, id='source-plus-skill'),
+            pytest.param(['orchestrator/tests/conftest.py', _UNBLOCK_SKILL], None, id='conftest-plus-skill'),
+        ],
+    )
+    def test_is_trivial_diff_agrees_with_the_plan(self, files, modules, role):
+        mcs = _ARTIFACT_MODULES if modules is None else modules
+
+        assert is_trivial_diff(files, mcs, role) is _is_trivial_plan(self._plan(files, mcs, role=role))
 
 
 # ---------------------------------------------------------------------------
