@@ -3084,6 +3084,10 @@ python3 /home/leo/src/dark-factory/scripts/falkordb_aof_gate.py \
   --compose-file /home/leo/src/dark-factory/fused-memory/docker/docker-compose.yml --check-only
 ```
 
+The recovery dumps under `fused-memory/data/{cgl-eta,cgl-iota,solar-ns-merge}`
+and `data/backups/2026-07-02-ops-purge-prune` are retained under a ruling:
+[docs/falkordb-recovery-dumps.md](docs/falkordb-recovery-dumps.md).
+
 #### Experiments never touch production FalkorDB
 
 Production has segfaulted three times, and two of the crashes were ad-hoc
