@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 from _orch_helpers import pydantic_spec
 
+from orchestrator.agents.review_briefing import ReviewBriefing
 from orchestrator.artifacts import ReviewAggregation, TaskArtifacts
 from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventStore
@@ -73,7 +74,9 @@ def _config(tmp_path: Path, max_review_cycles: int, max_amendment_rounds: int) -
     config.lock_depth = 2
     config.project_root = tmp_path / 'proj'
     config.suppress_resettled_review_suggestions = False
-    # A real model string keeps TaskWorkflow._reviewer_config_fingerprint deterministic.
+    # A real reviewer generation and model string keep
+    # TaskWorkflow._reviewer_config_fingerprint deterministic.
+    config.review.reviewer_briefing = ReviewBriefing.DIFF_ONLY
     config.models = MagicMock()
     config.models.reviewer = 'sonnet'
     return config
