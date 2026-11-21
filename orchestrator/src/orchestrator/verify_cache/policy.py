@@ -53,7 +53,7 @@ class Unavailable:
 async def consult(registry: Registry | None, keys: Sequence[UnitKey]) -> RegistryView | Unavailable:
     """One batched registry read for a verify's *keys*; never raises (I2)."""
     if registry is None:
-        return Unavailable('no registry (e.g. a remote runner)')
+        return Unavailable('no registry on this host (no_registry_on_runner)')
     try:
         return await registry.view(keys)
     except Exception as exc:
