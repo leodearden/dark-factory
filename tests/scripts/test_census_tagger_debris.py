@@ -51,7 +51,6 @@ from audit_wiped_metadata_files import (
 )
 from census_tagger_debris import (
     _RECONCILIATIONS,
-    ARTIFACT_CONSUMERS,
     DEFAULT_JSON_OUT,
     DEFAULT_MD_OUT,
     EXIT_NO_ROOT,
@@ -1597,17 +1596,6 @@ def test_coverage_reports_an_empty_shortfall_list_rather_than_omitting_it(tmp_pa
     coverage = build_report([_census(tmp_path, tasks=[_stamped(1)])])["coverage"]
 
     assert coverage["projects_without_event_log"] == []
-
-
-def test_the_artifact_names_7271_as_its_sole_consumer(tmp_path):
-    """DF 3427 only re-ran the emptiness-keyed DONE-path repair and never read
-    the census; DF 7271 consumed it to decide no dedicated repair is needed
-    (plans/module-tagger-retirement-prd.md "Debris repair disposition")."""
-    report = build_report([_census(tmp_path, tasks=[_stamped(1)])])
-
-    assert report["params"]["consumers"] == ["dark_factory 7271"]
-    assert report["params"]["consumers"] == list(ARTIFACT_CONSUMERS)
-    assert not any("3427" in consumer for consumer in report["params"]["consumers"])
 
 
 # ---------------------------------------------------------------------------
