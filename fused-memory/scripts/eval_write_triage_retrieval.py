@@ -11,16 +11,19 @@ the live corpus.
 
 Nothing here decides what "correct" means, and nothing here calls an LLM. It
 produces :class:`Slate` values; ``eval_write_triage_cases.py::plan_from_slates``
-pairs them with the curator labels, and the eval scores them.
+pairs them with the curator labels, and the eval scores them. A
+:class:`SlateSnapshot` keeps one retrieval on disk so several runs judge it.
 
 Imported by path, the same way the eval script imports the calibrator —
 ``scripts/`` is not an importable package.
 """
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
+from pathlib import Path
 from typing import Any
 
 from fused_memory.models.memory import MemoryResult
@@ -58,6 +61,68 @@ class Slate:
     retrieved_count: int
     degraded: bool
     self_retrieved: bool
+
+
+#: The on-disk shape of a :class:`SlateSnapshot`; a file of any other is refused.
+SLATE_SNAPSHOT_SCHEMA_VERSION = 1
+
+
+def _require_fields(payload: Mapping[str, Any], cls: type, where: str) -> None:
+    missing = [f.name for f in fields(cls) if f.name not in payload]
+    if missing:
+        raise ValueError(f'{where} is missing field(s) {missing}')
+
+
+@dataclass(frozen=True)
+class SlateSnapshot:
+    """A measured retrieval: one retrieval, banded, routed and trimmed, that several judge runs can be judged over.
+
+    The band edges, widths and project are the ones the slates were measured
+    at. Loading rebuilds each :class:`Slate` field by field as it was
+    measured; nothing is re-banded or re-routed.
+    """
+
+    project_id: str
+    t_high: float | None
+    t_low: float | None
+    candidate_k: int
+    judge_candidate_count: int
+    slates: tuple[Slate, ...]
+
+    def dump(self, path: str | Path) -> None:
+        payload = {f.name: getattr(self, f.name) for f in fields(self)}
+        payload['slates'] = [
+            {
+                **{f.name: getattr(slate, f.name) for f in fields(slate)},
+                'candidates': [dict(row) for row in slate.candidates],
+            }
+            for slate in self.slates
+        ]
+        Path(path).write_text(json.dumps(
+            {'schema_version': SLATE_SNAPSHOT_SCHEMA_VERSION, **payload}, indent=2,
+        ) + '\n')
+
+    @classmethod
+    def load(cls, path: str | Path) -> SlateSnapshot:
+        payload = json.loads(Path(path).read_text())
+        version = payload.get('schema_version')
+        if version != SLATE_SNAPSHOT_SCHEMA_VERSION:
+            raise ValueError(
+                f'{path}: schema_version {version!r} is not this module\'s '
+                f'{SLATE_SNAPSHOT_SCHEMA_VERSION}',
+            )
+        _require_fields(payload, cls, str(path))
+        slates = []
+        for index, entry in enumerate(payload['slates']):
+            _require_fields(entry, Slate, f'{path}: slate {index}')
+            slates.append(Slate(**{
+                **{f.name: entry[f.name] for f in fields(Slate)},
+                'candidates': tuple(entry['candidates']),
+            }))
+        return cls(**{
+            **{f.name: payload[f.name] for f in fields(cls)},
+            'slates': tuple(slates),
+        })
 
 
 async def prefetch_retrievals(
