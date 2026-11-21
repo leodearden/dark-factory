@@ -71,6 +71,7 @@ from orchestrator.verify_plan import (
     is_trivial_diff,
     reverse_dependent_test_targets,
     scope_prefix_to_keyword,
+    with_artifact_consumer_modules,
 )
 
 # The real config command strings this suite exercises live in
@@ -2458,6 +2459,77 @@ class TestDeriveVerifyPlanBehaviouralArtifacts:
         mcs = _ARTIFACT_MODULES if modules is None else modules
 
         assert is_trivial_diff(files, mcs, role) is _is_trivial_plan(self._plan(files, mcs, role=role))
+
+
+class TestWithArtifactConsumerModules:
+    """Task 5296: the task module set widened by the registered modules whose
+    tests consume a touched behavioural artifact."""
+
+    _DOCSMOD = ModuleConfig(prefix='docsmod', lint_command='uv run --project docsmod ruff check docs/')
+
+    @classmethod
+    def _config(cls, tmp_path: Path, registry: list[ModuleConfig] | None = None) -> OrchestratorConfig:
+        config = OrchestratorConfig(project_root=tmp_path)
+        modules = [*_ARTIFACT_MODULES, cls._DOCSMOD] if registry is None else registry
+        config._module_configs = {mc.prefix: mc for mc in modules}
+        return config
+
+    def test_a_skill_prompt_adds_the_module_owning_its_consumers(self, tmp_path):
+        config = self._config(tmp_path)
+
+        assert with_artifact_consumer_modules(config, [], [_UNBLOCK_SKILL], 'task') == [_ARTIFACT_ORCH_MC]
+
+    def test_a_spawn_script_adds_every_consumer_module_in_registry_order(self, tmp_path):
+        config = self._config(tmp_path)
+
+        assert with_artifact_consumer_modules(config, [], [_SPAWN_SH], 'task') == _ARTIFACT_MODULES
+
+    def test_the_task_set_leads_and_is_never_duplicated(self, tmp_path):
+        config = self._config(tmp_path)
+        own = dataclasses.replace(_ARTIFACT_ORCH_MC)
+
+        widened = with_artifact_consumer_modules(
+            config, [own], ['orchestrator/src/x.py', _HOOK_SH], 'task',
+        )
+
+        assert widened[0] is own
+        assert widened[1:] == [_ARTIFACT_SCRIPTS_MC, _ARTIFACT_TESTS_SCRIPTS_MC]
+
+    def test_unclaimed_source_keeps_the_empty_set_on_the_fallback(self, tmp_path):
+        config = self._config(tmp_path)
+
+        assert with_artifact_consumer_modules(config, [], ['skills/x.py', _SPAWN_SH], 'task') == []
+
+    def test_merge_role_is_the_identity(self, tmp_path):
+        config = self._config(tmp_path)
+
+        assert with_artifact_consumer_modules(config, [], [_SPAWN_SH], 'merge') == []
+        assert with_artifact_consumer_modules(
+            config, [_ARTIFACT_ORCH_MC], [_SPAWN_SH], 'merge',
+        ) == [_ARTIFACT_ORCH_MC]
+
+    def test_prose_adds_nothing(self, tmp_path):
+        config = self._config(tmp_path)
+
+        assert with_artifact_consumer_modules(config, [], ['README.md'], 'task') == []
+
+    def test_a_module_without_a_test_command_is_never_added(self, tmp_path):
+        no_tests = dataclasses.replace(_ARTIFACT_TESTS_SCRIPTS_MC, test_command=None)
+        config = self._config(tmp_path, [_ARTIFACT_ORCH_MC, no_tests, self._DOCSMOD])
+
+        assert with_artifact_consumer_modules(config, [], [_ROOT_YAML], 'task') == []
+
+    def test_returns_a_new_list_without_mutating_the_argument(self, tmp_path):
+        config = self._config(tmp_path)
+        passed = [_ARTIFACT_ORCH_MC]
+
+        widened = with_artifact_consumer_modules(config, passed, [_SPAWN_SH], 'task')
+
+        assert widened is not passed
+        assert passed == [_ARTIFACT_ORCH_MC]
+        unchanged = with_artifact_consumer_modules(config, passed, ['README.md'], 'task')
+        assert unchanged is not passed
+        assert unchanged == passed
 
 
 # ---------------------------------------------------------------------------
