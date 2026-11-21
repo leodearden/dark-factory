@@ -190,7 +190,7 @@ _REJECT_HINT = (
 #: offer a mechanical retry — there is no repaired call to resend — so it points
 #: at the two things the caller can actually do.
 #:
-#: Spelled ONCE, with the two variants below differing ONLY in the preservation
+#: Spelled ONCE, with the three variants below differing ONLY in the preservation
 #: clause. Composed rather than duplicated for the usual reason (INV-5): a
 #: reworded refusal must not require two edits kept in lock step.
 _UNREPAIRABLE_PREFIX = (

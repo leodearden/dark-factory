@@ -266,7 +266,7 @@ payload. Measured over the guard's deployed life, 2026-08-23..27: residue preser
 `a51dbfd13c`. The cause is that `add_memory` declares `content` before `project_id`, so the leak
 ate the routing key. The capability is actually delivered by
 `fused_memory.server.markup_tripwire::emit_markup_residue_escalation`, reached through
-`fused_memory.server.markup_guard::install_markup_guard`'s residue tiers (queue, then floor, then
+`fused_memory.server.markup_guard::build_markup_guard`'s residue tiers (queue, then floor, then
 log). `fused_memory.server.markup_residue_spool::MarkupResidueSpool` is the floor, and
 `get_status.markup_residue` is the INV-4 loss count. Deferred re-sync tasks **4475** and **4476**
 inherit this correction.
