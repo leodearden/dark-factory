@@ -1607,7 +1607,7 @@ class TestPhaseBackfillTerminalDepRecords:
         tick after tick. Dep ids are chosen so plain alphabetical sort
         ('21' < '29') would pick the WRONG (re-validation) dep first
         without the fix, proving this isn't an accident of sort order."""
-        scheduler.config.delivered_checks.max_checks_per_tick = 1
+        scheduler.config.delivered_checks.max_record_fetches_per_tick = 1
         stale_record = {
             'id': '21',
             'status': 'done',
@@ -1685,7 +1685,7 @@ class TestPhaseBackfillTerminalDepRecords:
         """A deferred held record would fail open, so it outranks a new dep_id
         (which only waits a tick).  '21' < '29' so plain sort would pick the new
         dep first."""
-        scheduler.config.delivered_checks.max_checks_per_tick = 1
+        scheduler.config.delivered_checks.max_record_fetches_per_tick = 1
         scheduler._terminal_dep_record_cache['29'] = self._scheduled_deploy_record(
             '29', 'scheduled'
         )
@@ -1750,7 +1750,7 @@ class TestPhaseBackfillTerminalDepRecords:
     async def test_held_record_deferred_by_the_budget_is_still_served(
         self, scheduler: Scheduler
     ):
-        scheduler.config.delivered_checks.max_checks_per_tick = 1
+        scheduler.config.delivered_checks.max_record_fetches_per_tick = 1
         held_21 = self._scheduled_deploy_record('21', 'scheduled')
         scheduler._terminal_dep_record_cache['20'] = self._scheduled_deploy_record('20', 'scheduled')
         scheduler._terminal_dep_record_cache['21'] = held_21
@@ -1779,7 +1779,7 @@ class TestPhaseBackfillTerminalDepRecords:
         """A deferred dep with no record would fail open; the scheduled-deploy
         arm waits on it instead.  A deferred re-validation keeps its cached,
         known-unheld record, so it is not named."""
-        scheduler.config.delivered_checks.max_checks_per_tick = 1
+        scheduler.config.delivered_checks.max_record_fetches_per_tick = 1
         scheduler._terminal_dep_record_cache['22'] = {
             'id': '22',
             'status': 'done',
@@ -1800,6 +1800,62 @@ class TestPhaseBackfillTerminalDepRecords:
 
         scheduler.get_task.assert_awaited_once_with('20')
         assert ctx.deferred_terminal_deps == frozenset({'21'})
+
+    # --- (n) the record-fetch budget is its own knob -----------------------
+
+    def _two_never_cached_deps_ctx(self) -> tuple[TickContext, dict]:
+        dependents = [
+            self._dependent(task_id='10', dep_id='20'),
+            self._dependent(task_id='11', dep_id='21'),
+        ]
+        ctx = TickContext(
+            tasks=dependents,
+            status_map={'20': 'done', '21': 'done'},
+            tasks_by_id={str(t['id']): t for t in dependents},
+        )
+        records = {
+            dep_id: {'id': dep_id, 'status': 'done', 'metadata': {}}
+            for dep_id in ('20', '21')
+        }
+        return ctx, records
+
+    @pytest.mark.asyncio
+    async def test_check_budget_does_not_throttle_record_fetches(
+        self, scheduler: Scheduler
+    ):
+        scheduler.config.delivered_checks.max_checks_per_tick = 1
+        ctx, records = self._two_never_cached_deps_ctx()
+
+        async def _fake_get_task(task_id):
+            return records[task_id]
+
+        scheduler.get_task = AsyncMock(side_effect=_fake_get_task)
+
+        await scheduler._phase_backfill_terminal_dep_records(ctx)
+
+        assert scheduler.get_task.await_count == 2
+        assert ctx.terminal_dep_records == records
+        assert ctx.deferred_terminal_deps == frozenset()
+
+    @pytest.mark.asyncio
+    async def test_deferral_warning_names_the_record_fetch_budget(
+        self, scheduler: Scheduler, caplog
+    ):
+        scheduler.config.delivered_checks.max_record_fetches_per_tick = 1
+        ctx, records = self._two_never_cached_deps_ctx()
+
+        async def _fake_get_task(task_id):
+            return records[task_id]
+
+        scheduler.get_task = AsyncMock(side_effect=_fake_get_task)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.scheduler'):
+            await scheduler._phase_backfill_terminal_dep_records(ctx)
+
+        assert any(
+            'delivered_checks.max_record_fetches_per_tick' in r.getMessage()
+            for r in caplog.records if r.levelno == logging.WARNING
+        )
 
 
 # ---------------------------------------------------------------------------

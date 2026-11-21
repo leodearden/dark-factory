@@ -216,7 +216,7 @@ class TestDispatchHold:
         dependent = _register_dependent(session, DEPENDENT_ID, dep_id='1000')
         dependent['dependencies'].append({'id': SELF_DEPLOY_ID})
         harness = _build_harness(tmp_path, session, tmp_path / 'escalations')
-        harness.scheduler.config.delivered_checks.max_checks_per_tick = 1
+        harness.scheduler.config.delivered_checks.max_record_fetches_per_tick = 1
 
         assert await _run_tick(harness) is None
         assert await _run_tick(harness) is None
