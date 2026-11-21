@@ -30,6 +30,7 @@ from orchestrator.task_priority import (
     UNKNOWN_PRIORITY,
     TaskAge,
     TaskPriority,
+    anchor_from_epoch,
     gate_rank,
     order_key,
     read_task_priority,
@@ -451,6 +452,19 @@ class TestTaskAge:
         assert task_age(TaskPriority(), now=_NOW, fallback_anchor=fallback) == TaskAge(
             3600.0, from_anchor=False,
         )
+
+
+class TestAnchorFromEpoch:
+
+    def test_a_representable_epoch_is_that_instant_in_utc(self) -> None:
+        anchor = anchor_from_epoch(_NOW.timestamp())
+
+        assert anchor == _NOW
+        assert anchor is not None and anchor.tzinfo is UTC
+
+    @pytest.mark.parametrize('epoch', [float('nan'), float('inf'), float('-inf'), 1.7e12, -1e20])
+    def test_an_epoch_naming_no_instant_is_no_anchor(self, epoch: float) -> None:
+        assert anchor_from_epoch(epoch) is None
 
 
 class TestChainMembersOnTheVerifyRow:

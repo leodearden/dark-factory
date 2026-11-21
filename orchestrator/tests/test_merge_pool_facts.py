@@ -9,6 +9,8 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
 from orchestrator.merge_pool_facts import (
     PICK_RECORD_CAP,
     WAITING_CAP,
@@ -106,6 +108,31 @@ def test_without_an_anchor_the_age_is_from_the_first_enqueue() -> None:
 
 def test_an_anchor_measures_the_age_from_the_anchor() -> None:
     req = _queued_req(waited=timedelta(seconds=5))
+    priority = TaskPriority(tier='low', base_tier='low', age_anchor=_NOW - timedelta(hours=2))
+
+    fields = queued_request_fields(req, priority, now=_NOW)
+
+    assert (fields['age_from'], fields['age_secs']) == ('anchor', 7200.0)
+
+
+@pytest.mark.parametrize('epoch', [float('nan'), float('inf'), 1.7e12])
+def test_an_epoch_naming_no_instant_still_records_the_keys(epoch: float) -> None:
+    req = _queued_req(waited=timedelta(0))
+    req.first_enqueued_at = epoch
+
+    fields = queued_request_fields(req, TaskPriority(tier='low', base_tier='low'), now=_NOW)
+
+    assert {k: fields[k] for k in (
+        'request_id', 'tier', 'base_tier', 'age_from', 'age_secs',
+    )} == {
+        'request_id': 'mr-q', 'tier': 'low', 'base_tier': 'low',
+        'age_from': 'enqueue', 'age_secs': 0.0,
+    }
+
+
+def test_an_anchor_still_measures_when_the_epoch_names_no_instant() -> None:
+    req = _queued_req(waited=timedelta(0))
+    req.first_enqueued_at = float('nan')
     priority = TaskPriority(tier='low', base_tier='low', age_anchor=_NOW - timedelta(hours=2))
 
     fields = queued_request_fields(req, priority, now=_NOW)

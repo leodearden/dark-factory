@@ -235,6 +235,16 @@ class TestSingleRequest:
         assert (row['tier'], row['base_tier'], row['age_from']) == ('pinned', 'low', 'enqueue')
         assert 3600 <= row['age_secs'] < 3660
 
+    async def test_a_millisecond_epoch_still_queues_and_records(self, tmp_path: Path) -> None:
+        scene = _Scene(tmp_path)
+        req = await scene.request('ms')
+        req.merge_first_enqueued_at = time.time() * 1000
+
+        await scene.submit(req, None)
+
+        (row,) = scene.data_of('merge_queued', 'ms')
+        assert (row['age_from'], row['age_secs']) == ('enqueue', 0.0)
+
     async def test_a_request_queued_before_the_first_tick_records_a_pinned_task_as_pinned(
         self, tmp_path: Path,
     ) -> None:
