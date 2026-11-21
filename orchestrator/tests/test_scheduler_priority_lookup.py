@@ -7,7 +7,12 @@ from pathlib import Path
 import pytest
 
 from orchestrator.overrides import OverrideRow, OverrideSource, OverrideStore
-from orchestrator.scheduler_priority_lookup import LookupPins, last_written_tiers, pin_orders
+from orchestrator.scheduler_priority_lookup import (
+    PAUSED_PIN_REFRESH_SECS,
+    LookupPins,
+    last_written_tiers,
+    pin_orders,
+)
 from orchestrator.task_priority import PINNED, TaskPriority
 
 
@@ -16,6 +21,14 @@ def _row(*, pinned: bool, pin_order: int | None = None) -> OverrideRow:
         boost_tier=None, pinned=pinned, pin_order=pin_order, reserve_now=False,
         ttl_until=None, source=OverrideSource.OPERATOR,
     )
+
+
+class _CountingStore(OverrideStore):
+    reads = 0
+
+    def get_overrides(self, project_root: str) -> dict[str, OverrideRow]:
+        self.reads += 1
+        return super().get_overrides(project_root)
 
 
 class _BrokenStore(OverrideStore):
@@ -102,3 +115,18 @@ class TestLookupPins:
 
         assert pins.priority('X', 'low').pinned is None
         assert len(_warnings(caplog)) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_paused_refresh_reads_at_most_once_a_period(self, tmp_path: Path) -> None:
+        now = [0.0]
+        store = _CountingStore(tmp_path / 'overrides.db')
+        pins = LookupPins(store, str(tmp_path), clock=lambda: now[0])
+        store.set_override(str(tmp_path), 'P', pinned=True)
+
+        now[0] = PAUSED_PIN_REFRESH_SECS - 1
+        await pins.refresh_if_due()
+        assert (store.reads, pins.priority('P', 'low').pinned) == (1, False)
+
+        now[0] = PAUSED_PIN_REFRESH_SECS
+        await pins.refresh_if_due()
+        assert (store.reads, pins.priority('P', 'low').pinned) == (2, True)

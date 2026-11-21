@@ -7,9 +7,11 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import threading
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Generic, TypeVar
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -17,8 +19,10 @@ from shared.project_layout import scheduler_state_json
 from shared.scheduler_state import SchedulerStateSnapshot
 
 from orchestrator.config import PRIORITY_TIERS, OrchestratorConfig
+from orchestrator.event_store import EventStore, EventType
 from orchestrator.merge_verify_facts import ChainMembers, MergeVerifyDispatchFacts, RunnerReason
-from orchestrator.overrides import OverrideStore
+from orchestrator.overrides import OverrideRow, OverrideStore
+from orchestrator.pause_policy import PauseClass
 from orchestrator.scheduler import Scheduler
 from orchestrator.task_priority import (
     GATE_RANK,
@@ -53,14 +57,67 @@ def _write_snapshot(path: Path, effective_priorities: dict[str, str]) -> None:
     path.write_text(json.dumps(snapshot.to_json()))
 
 
-def _scheduler(tmp_path: Path, *, with_store: bool) -> tuple[Scheduler, OverrideStore | None]:
+def _scheduler(
+    tmp_path: Path, *, with_store: bool, store_type: type[OverrideStore] = OverrideStore,
+    time_source: Callable[[], float] | None = None, event_store: EventStore | None = None,
+) -> tuple[Scheduler, OverrideStore | None]:
     config = OrchestratorConfig(max_per_module=1, project_root=tmp_path)
-    store = OverrideStore(tmp_path / 'overrides.db') if with_store else None
+    store = store_type(tmp_path / 'overrides.db') if with_store else None
     scheduler = Scheduler(
-        config, override_store=store, state_snapshot_path=tmp_path / 'scheduler_state.json',
+        config, event_store, override_store=store, time_source=time_source,
+        state_snapshot_path=tmp_path / 'scheduler_state.json',
     )
     scheduler.finish_startup()
     return scheduler, store
+
+
+class _ThreadRecordingStore(OverrideStore):
+    def __init__(self, db_path: Path) -> None:
+        super().__init__(db_path)
+        self.read_threads: list[threading.Thread] = []
+
+    def get_overrides(self, project_root: str) -> dict[str, OverrideRow]:
+        self.read_threads.append(threading.current_thread())
+        return super().get_overrides(project_root)
+
+
+class _BreakableStore(OverrideStore):
+    broken = False
+
+    def get_overrides(self, project_root: str) -> dict[str, OverrideRow]:
+        if self.broken:
+            raise OSError('store unreachable')
+        return super().get_overrides(project_root)
+
+
+_S = TypeVar('_S', bound=OverrideStore)
+
+
+class _PausedScene(Generic[_S]):
+    """A scheduler ticked once over task A (tier high), then paused by the operator."""
+
+    def __init__(self, tmp_path: Path, store_type: type[_S]) -> None:
+        self.tmp_path = tmp_path
+        self.now = [1000.0]
+        self.events = EventStore(tmp_path / 'events.db', run_id='run-9933')
+        self.scheduler, store = _scheduler(
+            tmp_path, with_store=True, store_type=store_type,
+            time_source=lambda: self.now[0], event_store=self.events,
+        )
+        assert isinstance(store, store_type)
+        self.store: _S = store
+        self.scheduler.get_tasks = AsyncMock(return_value=[_pending('A', 'high')])
+
+    async def tick_then_pause(self) -> None:
+        await self.scheduler.acquire_next()
+        self.scheduler.pause('test', PauseClass.OPERATOR)
+
+    def pin_a(self) -> None:
+        self.store.set_override(str(self.tmp_path), 'A', pinned=True)
+
+    async def poll_after(self, secs: float) -> None:
+        self.now[0] += secs
+        assert await self.scheduler.acquire_next() is None
 
 
 class TestSchedulerTaskPriority:
@@ -159,6 +216,59 @@ class TestSchedulerTaskPriority:
 
         found = scheduler.task_priority('R')
         assert (found.tier, found.base_tier) == (PINNED, 'low')
+
+    @pytest.mark.asyncio
+    async def test_a_pin_set_while_paused_is_honoured_within_a_minute(self, tmp_path: Path) -> None:
+        scene = _PausedScene(tmp_path, OverrideStore)
+        await scene.tick_then_pause()
+        scene.pin_a()
+
+        await scene.poll_after(0.0)
+        assert scene.scheduler.task_priority('A').tier == 'high'
+
+        await scene.poll_after(60.0)
+        assert scene.scheduler.task_priority('A') == TaskPriority(
+            tier=PINNED, pinned=True, base_tier='high', pin_order=1,
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_paused_reread_leaves_the_ticks_override_snapshot_alone(
+        self, tmp_path: Path,
+    ) -> None:
+        scene = _PausedScene(tmp_path, OverrideStore)
+        await scene.tick_then_pause()
+        scene.pin_a()
+        await scene.poll_after(60.0)
+
+        scene.scheduler.resume()
+        await scene.scheduler.acquire_next()
+
+        pinned = scene.events.fetch_events_by_type(EventType.task_pinned)
+        assert [e['task_id'] for e in pinned] == ['A']
+
+    @pytest.mark.asyncio
+    async def test_the_paused_reread_runs_off_the_event_loop_thread(self, tmp_path: Path) -> None:
+        scene = _PausedScene(tmp_path, _ThreadRecordingStore)
+        await scene.tick_then_pause()
+        scene.store.read_threads.clear()
+
+        await scene.poll_after(60.0)
+
+        assert scene.store.read_threads
+        assert threading.current_thread() not in scene.store.read_threads
+
+    @pytest.mark.asyncio
+    async def test_a_failing_paused_reread_keeps_the_last_pins(self, tmp_path: Path) -> None:
+        scene = _PausedScene(tmp_path, _BreakableStore)
+        scene.pin_a()
+        await scene.tick_then_pause()
+        before = scene.scheduler.task_priority('A')
+        scene.store.broken = True
+
+        await scene.poll_after(60.0)
+
+        assert before.tier == PINNED
+        assert scene.scheduler.task_priority('A') == before
 
 
 class TestReadTaskPriority:
