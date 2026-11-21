@@ -133,12 +133,6 @@ _EMPTY_POOL_FIX_HINT = (
 # constant, not an operator knob.
 _SCOPE_WAIT_REPOLL_CEIL_SECS = 5.0
 
-# How often a caller parked on an exhausted model scope re-announces itself
-# (task 7243): the same interval as the fleet park's
-# `_ALL_CAPPED_PARK_LOG_INTERVAL_SECS`. An internal observability constant,
-# not an operator knob.
-_SCOPE_PARK_LOG_INTERVAL_SECS = 600.0
-
 # How often a FULLY-CAPPED park re-announces itself (task 4945). The park
 # below used to log once at INFO and then block on a bare `_open.wait()`
 # with no further output for as long as the freeze lasted, which made a
@@ -150,6 +144,12 @@ _SCOPE_PARK_LOG_INTERVAL_SECS = 600.0
 # enough not to bury the signal. Deliberately an internal observability
 # constant, not an operator knob.
 _ALL_CAPPED_PARK_LOG_INTERVAL_SECS = 600.0
+
+# How often a caller in the scoped park re-announces itself (task 7243), at
+# the fleet park's interval. It is also the longest single wait of the scoped
+# park; a caller's `max_wait_secs` and `_SCOPE_WAIT_REPOLL_CEIL_SECS` can only
+# shorten it. Deliberately an internal constant, not an operator knob.
+_SCOPE_PARK_LOG_INTERVAL_SECS = _ALL_CAPPED_PARK_LOG_INTERVAL_SECS
 
 # The allowance reserve's wait (plans/allowance-reserve-by-account-prd.md
 # §6.3): a refused caller re-selects at least this often with no account
@@ -1536,7 +1536,7 @@ class UsageGate:
                     park_left = _park_time_left(park_deadline)
                     if park_left is not None and park_left <= 0:
                         raise self._pool_frozen(scope)
-                    scope_park_clock = await self._park_on_exhausted_scope(
+                    scope_park_clock = await self._park_for_scope(
                         scope, evt, park_left, scope_park_clock
                     )
                     continue
@@ -1616,7 +1616,7 @@ class UsageGate:
             release_at=refused.release_at if refused is not None else None,
         )
 
-    async def _park_on_exhausted_scope(
+    async def _park_for_scope(
         self,
         scope: str,
         evt: asyncio.Event,
@@ -1625,8 +1625,9 @@ class UsageGate:
     ) -> _ParkClock:
         """One pass of the scoped no-freeze park (task γ, S3/S6), announced as it waits.
 
-        Reached only while the fleet is OPEN: some account is generally
-        serviceable and only *scope* is exhausted. So it waits on the
+        Reached only while the fleet is OPEN and no account is selectable for
+        *scope*: *scope* is capped on every serviceable account, or the only
+        account that could serve it is mid-probe. So it waits on the
         per-scope waiter *evt*, toward the soonest scope reset or, when none is
         known, ``max_probe_interval_secs``, and never touches ``_open`` or
         ``_paused_reason``: scope exhaustion can neither freeze the fleet (S3)
@@ -1650,12 +1651,16 @@ class UsageGate:
         handed back for its next pass, and it dies with ``before_invoke``'s
         frame, so an abandoned park has nothing to bequeath. It logs at most
         once per ``_SCOPE_PARK_LOG_INTERVAL_SECS``, however often the probe
-        re-poll wakes it. That interval is also the longest single wait of this
-        park, as ``_ALL_CAPPED_PARK_LOG_INTERVAL_SECS`` is for the fleet park, so
-        a park hours from its scope reset keeps announcing itself; each wakeup
-        re-runs selection and the sweeps and re-parks, which only ever serves a
-        caller earlier, never later. It is purely additive: it changes neither
+        re-poll wakes it. The log line is purely additive: it changes neither
         what ``before_invoke`` returns nor when it unblocks.
+
+        THE WAIT CAP. The same interval is also the longest single wait of this
+        park, as ``_ALL_CAPPED_PARK_LOG_INTERVAL_SECS`` is for the fleet park, so
+        a park hours from its scope reset keeps announcing itself. The cap can
+        only make the park unblock earlier, never later: each wakeup re-runs
+        selection and the sweeps, so an account-level reset, which sets no
+        scope waiter, is served within one interval rather than at the scope
+        deadline.
         """
         now = time.monotonic()
         clock = clock or _ParkClock(started=now)
@@ -1666,7 +1671,7 @@ class UsageGate:
         ):
             logger.warning(
                 self._park_heartbeat(
-                    'scope_exhausted_park',
+                    'scoped_park',
                     now - clock.started,
                     scope=scope,
                     soonest_scope_reset_at=(
