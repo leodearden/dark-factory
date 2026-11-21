@@ -136,7 +136,7 @@ All docs changes of a wave — PRDs, manifests, sidecars, the program doc, the s
 
 The contract §11 chain is the program's last act, filed exactly as `skills/_shared/filing-the-trigger-chain.md` §§0–5 says, with `skill = "review-all"` (the bare skill name, per its §0) and this run's `run_id`; nothing about its shape is restated here. What is specific to this skill:
 
-- **Timing.** The gate is filed (§4 interim, or §3 final when the §2 probe in the dark-factory checkout passes) when the first `/prd` stream files; every later `/prd` session adds its own `high`/`critical` tasks as dependencies as it files; `commit_planning` happens only once the program doc's FILED table is complete. `--yes` never runs that `commit_planning`: the human does.
+- **Timing.** The gate is filed (§4 interim, or §3 final when the §2 probe in the dark-factory checkout passes) when the first `/prd` stream files; every later `/prd` session adds its own `high`/`critical` tasks as dependencies as it files; The gate is released per `skills/_shared/filing-the-trigger-chain.md` §3–§4 only once the program doc's FILED table is complete. `--yes` never runs that release: the human does.
 - **Supersede first.** An older open `review-all` chain (§1) is superseded per §5 before this run's gate is filed. When this run was launched from that chain's `review_due` escalation — the normal path once `plans/completion-driven-triggers-prd.md` lands, its id having arrived as `--launched-from` (SKILL.md Phase 0 step 5) — §5 step 2 is where it is resolved, with `ran as <run_id>`.
 - **No tasks filed** (program filed nothing): no chain, and the report's `## Method` `extra` says so (§0).
 
