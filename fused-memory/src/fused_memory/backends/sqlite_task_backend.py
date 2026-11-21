@@ -1749,6 +1749,20 @@ async def _fetch_task_dependencies(read_all: _ReadAll, tag: str, tid: int) -> li
     return [row['depends_on'] for row in rows]
 
 
+async def _refuse_missing_or_self_dependency(
+    conn: aiosqlite.Connection, tag: str, tid: int, deps: Sequence[int], operation: str,
+) -> None:
+    """Refuse a dependency of *tid* on a task absent from *tag*, or on *tid* itself."""
+    for dep in deps:
+        cursor = await conn.execute('SELECT id FROM tasks WHERE tag = ? AND id = ?', (tag, dep))
+        if (await cursor.fetchone()) is None:
+            raise TaskmasterError('TASKMASTER_TOOL_ERROR', f'No tasks found for ID(s): {dep}')
+        if dep == tid:
+            raise TaskmasterError(
+                'TASKMASTER_TOOL_ERROR', f'{operation}: task cannot depend on itself',
+            )
+
+
 async def _refuse_cycle_closing_edges(
     conn: aiosqlite.Connection, tag: str, tid: int, deps: Sequence[int], operation: str,
 ) -> None:
@@ -3375,7 +3389,9 @@ class SqliteTaskBackend:
         #   visible in ``get_task`` and cheap to re-derive, unlike the multi-KB
         #   authored prose the repros destroyed. That is a decision, not an
         #   oversight — widening the guard to a list-valued parameter with
-        #   different merge semantics is a separate call.
+        #   different merge semantics is a separate call. Each new entry must
+        #   exist, must not be the task itself, and must not close a local
+        #   cycle (DependencyCycle, path named; qualified deps are not walked).
         # Validate the metadata_mode VALUE unconditionally — a bad value should
         # always raise immediately, even if no metadata is supplied in this
         # call. But scope the bare-append=False rejection (the task-2180
@@ -3615,8 +3631,13 @@ class SqliteTaskBackend:
                 ) from exc
 
             # Dependencies: replace-mode only. Empty list clears all deps.
+            # Runs after the UPDATE above, the unit's first write, as the
+            # cycle walk requires.
             if dependencies is not None:
                 parsed_deps: list[int] = [_parse_task_id(raw) for raw in dependencies]
+                await _refuse_missing_or_self_dependency(
+                    conn, tag, tid, parsed_deps, 'update_task',
+                )
                 await conn.execute(
                     'DELETE FROM dependencies WHERE tag = ? AND task_id = ?',
                     (tag, tid),
@@ -3627,6 +3648,7 @@ class SqliteTaskBackend:
                         '(tag, task_id, depends_on) VALUES (?, ?, ?)',
                         (tag, tid, dep),
                     )
+                await _refuse_cycle_closing_edges(conn, tag, tid, parsed_deps, 'update_task')
 
             refreshed_cursor = await conn.execute(
                 'SELECT * FROM tasks WHERE tag = ? AND id = ?',
@@ -4021,22 +4043,14 @@ class SqliteTaskBackend:
         dep_tid = _parse_task_id(depends_on)
 
         async with self._write_unit(project_root) as conn:
-            # Verify both endpoints exist before inserting.
-            for tid_check in (tid, dep_tid):
-                cursor = await conn.execute(
-                    'SELECT id FROM tasks WHERE tag = ? AND id = ?',
-                    (tag, tid_check),
-                )
-                if (await cursor.fetchone()) is None:
-                    raise TaskmasterError(
-                        'TASKMASTER_TOOL_ERROR',
-                        f'No tasks found for ID(s): {tid_check}',
-                    )
-            if tid == dep_tid:
-                raise TaskmasterError(
-                    'TASKMASTER_TOOL_ERROR',
-                    'add_dependency: task cannot depend on itself',
-                )
+            cursor = await conn.execute(
+                'SELECT id FROM tasks WHERE tag = ? AND id = ?', (tag, tid),
+            )
+            if (await cursor.fetchone()) is None:
+                raise TaskmasterError('TASKMASTER_TOOL_ERROR', f'No tasks found for ID(s): {tid}')
+            await _refuse_missing_or_self_dependency(
+                conn, tag, tid, (dep_tid,), 'add_dependency',
+            )
             await conn.execute(
                 'INSERT OR IGNORE INTO dependencies '
                 '(tag, task_id, depends_on) VALUES (?, ?, ?)',
