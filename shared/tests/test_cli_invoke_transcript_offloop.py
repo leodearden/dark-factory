@@ -519,8 +519,9 @@ class TestTimeoutPathRereadOffLoop:
 
 
 # ── Normal-exit fixture ─────────────────────────────────────────────────────
-# Two assistant records whose tail is an unreaped background launch.  Borrowed
-# from TestDetectEndedAwaitingBackground::test_single_abandoned_launch_is_true
+# Two assistant records, the second launching a background task, then the
+# result confirming the launch, which nothing reaps.  Borrowed from
+# TestDetectEndedAwaitingBackground::test_single_abandoned_launch_is_true
 # (in test_cli_invoke_background.py) so the expected ended_awaiting_background
 # value is one the detector's own suite already pins, not one invented here.
 #   → transcript_turns == 2 (two type='assistant' records)
@@ -539,10 +540,23 @@ _ABANDONED_LAUNCH_RECORDS = [
             'role': 'assistant',
             'content': [{
                 'type': 'tool_use',
+                'id': 'toolu_1',
                 'name': 'Bash',
                 'input': {'command': './occt-test.sh', 'run_in_background': True},
             }],
         },
+    },
+    {
+        'type': 'user',
+        'message': {
+            'role': 'user',
+            'content': [{
+                'type': 'tool_result',
+                'tool_use_id': 'toolu_1',
+                'content': 'Command running in background with ID: bz89cdzmh.',
+            }],
+        },
+        'toolUseResult': {'stdout': '', 'backgroundTaskId': 'bz89cdzmh'},
     },
 ]
 

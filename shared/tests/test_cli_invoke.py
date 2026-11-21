@@ -5913,8 +5913,8 @@ def _sigkill_proc() -> MagicMock:
 
 
 # Two assistant turns served by a real model, the second of which launches a
-# background Bash command that is never reaped — so ONE transcript yields all
-# three normal-exit signals at once: transcript_turns == 2,
+# background Bash command the CLI confirms and nothing reaps — so ONE transcript
+# yields all three normal-exit signals at once: transcript_turns == 2,
 # ended_awaiting_background is True, model_id == 'claude-opus-5'.
 _MODEL_AND_ABANDONED_LAUNCH_RECORDS = [
     {'type': 'user', 'message': {'role': 'user', 'content': 'go'}},
@@ -5933,10 +5933,23 @@ _MODEL_AND_ABANDONED_LAUNCH_RECORDS = [
             'role': 'assistant',
             'content': [{
                 'type': 'tool_use',
+                'id': 'toolu_1',
                 'name': 'Bash',
                 'input': {'command': './long-build.sh', 'run_in_background': True},
             }],
         },
+    },
+    {
+        'type': 'user',
+        'message': {
+            'role': 'user',
+            'content': [{
+                'type': 'tool_result',
+                'tool_use_id': 'toolu_1',
+                'content': 'Command running in background with ID: bz89cdzmh.',
+            }],
+        },
+        'toolUseResult': {'stdout': '', 'backgroundTaskId': 'bz89cdzmh'},
     },
 ]
 
