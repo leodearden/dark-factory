@@ -35,8 +35,9 @@ either, except the esc-375-2 one, which kept it), with metadata
 `x_readded_from_write_op=<first 8 chars of the write_ops id>` (`esc-375-2` for the escalation
 one) and `x_outage=2026-10-04`. The journal keeps only `content` and `category` in `params`, so
 no re-add carries its writer's metadata. For the 21 completion echoes that means no `task_id`,
-`stage2_suppress` or completion-echo marker (`reconciliation/targeted.py`), so
-`_delete_stale_completion_echoes` will not remove one if its task is reopened. They were kept
+`stage2_suppress` or completion-echo marker, so
+`fused-memory/src/fused_memory/reconciliation/targeted.py::TargetedReconciler._delete_stale_completion_echoes`
+will not remove one if its task is reopened. They were kept
 because each is still true history of a landed task. The esc-375-2 text was re-checked against
 solar-challenge main (`COLOUR_PALETTE`, `_with_alpha`, `_FIGURES`, `monkeypatch.setitem` all
 still present) and no existing memory covers it; task 829's convention refines where the palette
@@ -50,14 +51,14 @@ The 38 full-content `add_system_record` rows are reconciliation cycle summaries 
 cycle summary for run_id: ...") from `recon-stage-task_knowledge_sync` (20) and
 `recon-stage-memory_consolidator` (18). They were first re-queued through `add_memory`. That
 dropped their agent_id and the `kind`, `stage`, `recon_pool` and `run_id` tags that
-`reconciliation/summary_pool.py::enforce_summary_pool_cap` and
+`fused-memory/src/fused_memory/reconciliation/summary_pool.py::enforce_summary_pool_cap` and
 `fused-memory/scripts/prune_recon_cycle_summaries.py` select on, so once landed they would have
 sat outside both bounds for good. Re-issuing them correctly tagged is no better: the pool cap evicts
 oldest-first by `created_at`, and a re-add is stamped today, so seven-week-old summaries would
 push current ones out of the pool. On 2026-11-21 their 38
 `mem0_intents` rows were moved from `retrying` to `failed` with a compare-and-set on
 `status='retrying'` (the same update as
-`services/write_journal.py::WriteJournal.resolve_mem0_intent`), with a reason naming this task. None
+`fused-memory/src/fused_memory/services/write_journal.py::WriteJournal.resolve_mem0_intent`), with a reason naming this task. None
 had landed. `failed` is never retried and ages out with the retention sweep. write_ops id
 prefixes: 1407dcb1 193a1ff2 22c9829c 28693398 2d9a5098 3732eb1b 5f0b75ce 60590a22 618ea8d2
 67b6e4fe 6960fa0c 69cfd802 6bbee068 6f9dbd7d 73a85e82 805ac439 8783f9ba 88558a7d 89686f9c
@@ -67,10 +68,12 @@ cb81f26a d0f3c6af e05a47de ebe8c38f ef9a65e6 f1d5646d f4b16e25 f850c0bf fa2131ed
 Pool-of-one records (8). Seven task-count snapshots ("As of 2026-10-0x: project ... task-count
 snapshot — ...", source `stage2_task_count_snapshot_write`) and one Stage 1 status correction
 (source `stage1_status_correction`) were re-queued with the same loss of tags. The snapshot
-writer, `reconciliation/stages/task_knowledge_sync.py::_write_task_count_snapshot`, tags each
+writer,
+`fused-memory/src/fused_memory/reconciliation/stages/task_knowledge_sync.py::_write_task_count_snapshot`,
+tags each
 one `kind='task_count_snapshot'`, and `_prune_task_count_snapshots` deletes every record of that
 kind before each write, so only the current snapshot per project exists. The status correction
-is written by `reconciliation/harness.py` with `kind='project_status_correction'`, which
+is written by `fused-memory/src/fused_memory/reconciliation/harness.py` with `kind='project_status_correction'`, which
 supersedes the previous one so only one is kept. Untagged, neither mechanism would ever select
 them, and seven-week-old task counts would stay in `observations_and_summaries` for good;
 tagged, the next cycle would delete them. Their 8 intents were withdrawn the same way on
@@ -82,12 +85,15 @@ e20ee7e9 and were never queued); status correction c3da3ac7.
 
 On 2026-11-21 OpenAI credits were exhausted again, so every re-add returned
 `stores_pending_retry=["mem0"]` and sat in `mem0_intents` with status `retrying` (68 rows
-whose metadata carries `x_readded_from_write_op`). The 22 kept re-adds are still `retrying` and
-land when credits return; the 46 withdrawn ones are `failed`. Do not resubmit either. To confirm:
+whose metadata carries `x_outage=2026-10-04` and `x_readded_from_write_op`). The 22 kept re-adds
+are still `retrying` and land when credits return; the 46 withdrawn ones are `failed`. Do not
+resubmit either. To confirm (the `x_outage` filter keeps a later sweep's re-adds, tagged the same
+way, out of these counts):
 
 ```sql
 select status, count(*) from mem0_intents
-where metadata like '%x_readded_from_write_op%' group by 1;
+where json_extract(metadata,'$.x_outage')='2026-10-04'
+  and metadata like '%x_readded_from_write_op%' group by 1;
 ```
 
 Done means `completed` = 22 and `failed` = 46. A `dead` row needs its text re-added by hand from this journal.
