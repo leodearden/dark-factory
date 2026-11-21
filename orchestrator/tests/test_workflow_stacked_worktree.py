@@ -201,7 +201,9 @@ class _PassedTheGate(Exception):
     """The plan-files gate let the branch through to the enqueue."""
 
 
-def _own_work_workflow(scene: _OwnWorkScene, plan_files: list[str]) -> tuple[TaskWorkflow, AsyncMock]:
+def _own_work_workflow(
+    scene: _OwnWorkScene, plan_files: list[str], monkeypatch: pytest.MonkeyPatch,
+) -> tuple[TaskWorkflow, AsyncMock]:
     f = _make(worktree=scene.d_worktree, project_root=scene.git_ops.project_root, task_id='D')
     wf = f.wf
     wf.git_ops = scene.git_ops
@@ -211,9 +213,9 @@ def _own_work_workflow(scene: _OwnWorkScene, plan_files: list[str]) -> tuple[Tas
     wf.merge_queue = MagicMock()
     wf.config.review.briefing_path = 'df-10473-no-such-briefing.yaml'
     mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
-    wf._mark_blocked = mark_blocked  # type: ignore[method-assign]
-    wf._try_narrow_plan = AsyncMock(return_value=False)  # type: ignore[method-assign]
-    scene.git_ops.rebind_branch_to_head = AsyncMock(side_effect=_PassedTheGate)  # type: ignore[method-assign]
+    monkeypatch.setattr(wf, '_mark_blocked', mark_blocked)
+    monkeypatch.setattr(wf, '_try_narrow_plan', AsyncMock(return_value=False))
+    monkeypatch.setattr(scene.git_ops, 'rebind_branch_to_head', AsyncMock(side_effect=_PassedTheGate))
     return wf, mark_blocked
 
 
@@ -221,10 +223,10 @@ def _own_work_workflow(scene: _OwnWorkScene, plan_files: list[str]) -> tuple[Tas
 @pytest.mark.parametrize('landing', list(Landing))
 class TestOwnWorkOnAStackedBranch:
     async def test_a_file_only_the_base_touched_is_reported_not_touched(
-        self, tmp_path: Path, landing: Landing,
+        self, tmp_path: Path, landing: Landing, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         scene = await _own_work_scene(tmp_path / 'repo', landing)
-        wf, mark_blocked = _own_work_workflow(scene, ['d.py', 'p.py'])
+        wf, mark_blocked = _own_work_workflow(scene, ['d.py', 'p.py'], monkeypatch)
 
         await wf._submit_to_merge_queue('D')
 
@@ -234,10 +236,10 @@ class TestOwnWorkOnAStackedBranch:
         assert 'no commit on the branch touched them: p.py.' in reason
 
     async def test_the_own_file_alone_passes_the_gate(
-        self, tmp_path: Path, landing: Landing,
+        self, tmp_path: Path, landing: Landing, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         scene = await _own_work_scene(tmp_path / 'repo', landing)
-        wf, mark_blocked = _own_work_workflow(scene, ['d.py'])
+        wf, mark_blocked = _own_work_workflow(scene, ['d.py'], monkeypatch)
 
         with pytest.raises(_PassedTheGate):
             await wf._submit_to_merge_queue('D')
@@ -245,10 +247,10 @@ class TestOwnWorkOnAStackedBranch:
         mark_blocked.assert_not_awaited()
 
     async def test_the_review_subject_is_the_own_work_alone(
-        self, tmp_path: Path, landing: Landing,
+        self, tmp_path: Path, landing: Landing, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         scene = await _own_work_scene(tmp_path / 'repo', landing)
-        wf, _ = _own_work_workflow(scene, ['d.py'])
+        wf, _ = _own_work_workflow(scene, ['d.py'], monkeypatch)
 
         subject = await wf._context_complete_review_subject()
 
