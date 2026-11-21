@@ -36,6 +36,7 @@ from fused_memory.backends.sqlite_task_backend import (
 )
 from fused_memory.backends.task_backend_errors import (
     AppendUnsupportedFieldError,
+    DependencyCycle,
     DoneProvenanceWriteAuthorityError,
     MetadataNotAnObjectError,
     MetadataTooDeepError,
@@ -2749,6 +2750,67 @@ async def test_add_dependency_self_loop_raises(backend, project_root):
     await backend.add_task(project_root=project_root, title='a')
     with pytest.raises(TaskmasterError):
         await backend.add_dependency('1', '1', project_root=project_root)
+
+
+async def _add_tasks(backend: SqliteTaskBackend, project_root: str, count: int) -> None:
+    for n in range(1, count + 1):
+        await backend.add_task(project_root=project_root, title=f'task {n}')
+
+
+@pytest.mark.asyncio
+async def test_add_dependency_refuses_a_three_cycle_naming_the_path(backend, project_root):
+    await _add_tasks(backend, project_root, 3)
+    await backend.add_dependency('1', '2', project_root=project_root)
+    await backend.add_dependency('2', '3', project_root=project_root)
+
+    with pytest.raises(DependencyCycle) as caught:
+        await backend.add_dependency('3', '1', project_root=project_root)
+
+    assert caught.value.cycle == (3, 1, 2, 3)
+    assert '3 → 1 → 2 → 3' in caught.value.message
+    assert await backend.get_dependency_edges(project_root) == {1: [2], 2: [3]}
+
+
+@pytest.mark.asyncio
+async def test_add_dependency_refuses_a_cycle_through_a_done_task(backend, project_root):
+    await _add_tasks(backend, project_root, 3)
+    await backend.add_dependency('1', '2', project_root=project_root)
+    await backend.add_dependency('2', '3', project_root=project_root)
+    await backend.set_task_status('2', 'done', project_root=project_root)
+
+    with pytest.raises(DependencyCycle) as caught:
+        await backend.add_dependency('3', '1', project_root=project_root)
+
+    assert caught.value.cycle == (3, 1, 2, 3)
+    assert await backend.get_dependency_edges(project_root) == {1: [2], 2: [3]}
+
+
+@pytest.mark.asyncio
+async def test_add_dependency_accepts_a_diamond(backend, project_root):
+    await _add_tasks(backend, project_root, 4)
+    for task, depends_on in (('1', '2'), ('1', '3'), ('2', '4'), ('3', '4')):
+        await backend.add_dependency(task, depends_on, project_root=project_root)
+
+    assert await backend.get_dependency_edges(project_root) == {1: [2, 3], 2: [4], 3: [4]}
+
+
+@pytest.mark.asyncio
+async def test_add_dependency_refuses_a_cycle_closed_from_a_second_backend_instance(
+    backend, project_root, tmp_path,
+):
+    await _add_tasks(backend, project_root, 2)
+    await backend.add_dependency('1', '2', project_root=project_root)
+
+    second = SqliteTaskBackend(TaskmasterConfig(project_root=str(tmp_path)))
+    await second.start()
+    try:
+        with pytest.raises(DependencyCycle) as caught:
+            await second.add_dependency('2', '1', project_root=project_root)
+    finally:
+        await second.close()
+
+    assert caught.value.cycle == (2, 1, 2)
+    assert await backend.get_dependency_edges(project_root) == {1: [2]}
 
 
 # ── add_dependency — qualified (cross-project) happy path ──────────
