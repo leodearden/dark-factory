@@ -417,3 +417,95 @@ class TestLiteralDeadlineMessage:
     def test_names_each_remedy(self, remedy: str):
         [violation] = _scan(_in_async_test('thread.join(timeout=1.0)'))
         assert remedy in violation.message
+
+
+_COVERAGE_PRELUDE = 'import asyncio\nimport time\n\nimport pytest\n\n\n'
+_REASON = "reason='the 5 s stop grace is the behaviour under test'"
+_ALL_KINDS_BODY = (
+    'time.sleep(0.1)\n'
+    'await asyncio.sleep(0.1)\n'
+    'elapsed = time.monotonic() - t0\n'
+    'assert elapsed < 2\n'
+    'await asyncio.wait_for(fut, timeout=5)\n'
+)
+_ALL_KINDS_SITE_COUNT = 4
+_VIRTUAL_LOOP_BODY = _ALL_KINDS_BODY.replace('time.sleep(0.1)\n', '')
+
+
+def _coverage_source(header: str, body: str = _ALL_KINDS_BODY, *, method: bool = False) -> str:
+    """*header* then a test holding *body*: a module function, or a method when *method*."""
+    if method:
+        return _COVERAGE_PRELUDE + header + '    async def test_case(self, t0, fut):\n' + textwrap.indent(body, ' ' * 8)
+    return _COVERAGE_PRELUDE + header + 'async def test_case(t0, fut):\n' + textwrap.indent(body, ' ' * 4)
+
+
+_COVERED = {
+    'marker_on_the_test': _coverage_source(f'@pytest.mark.timing({_REASON})\n'),
+    'marker_on_the_class': _coverage_source(f'@pytest.mark.timing({_REASON})\nclass TestCase:\n', method=True),
+    'marker_on_a_module_helper': _coverage_source(f'@pytest.mark.timing({_REASON})\n').replace(
+        'def test_case', 'def _helper'
+    ),
+    'marker_on_a_fake_class': _coverage_source(
+        f'@pytest.mark.timing({_REASON})\nclass _FakeWorker:\n', method=True
+    ).replace('def test_case', 'def run'),
+    'module_pytestmark': _coverage_source(f'pytestmark = pytest.mark.timing({_REASON})\n\n\n'),
+    'module_pytestmark_list': _coverage_source(
+        f'pytestmark = [pytest.mark.slow, pytest.mark.timing({_REASON})]\n\n\n'
+    ),
+    'virtual_clock_test': _coverage_source(
+        'from shared.testing_virtual_clock import virtual_clock_test\n\n\n@virtual_clock_test\n',
+        _VIRTUAL_LOOP_BODY,
+    ),
+    'virtual_clock_test_attribute': _coverage_source(
+        'from shared import testing_virtual_clock\n\n\n@testing_virtual_clock.virtual_clock_test\n',
+        _VIRTUAL_LOOP_BODY,
+    ),
+}
+
+_NOT_COVERED = {
+    'bare_marker': _coverage_source('@pytest.mark.timing\n'),
+    'no_reason': _coverage_source('@pytest.mark.timing()\n'),
+    'empty_reason': _coverage_source("@pytest.mark.timing(reason='')\n"),
+    'blank_reason': _coverage_source("@pytest.mark.timing(reason='   ')\n"),
+    'non_literal_reason': _coverage_source('@pytest.mark.timing(reason=REASON)\n'),
+    'positional_reason': _coverage_source("@pytest.mark.timing('x')\n"),
+    'marker_on_a_sibling': _coverage_source(
+        f'@pytest.mark.timing({_REASON})\ndef test_sibling():\n    pass\n\n\n'
+    ),
+}
+
+
+class TestCoverage:
+    """Only ``@pytest.mark.timing(reason='<non-blank literal>')`` or a virtual clock excuses a site."""
+
+    def test_the_uncovered_control_carries_one_site_per_statement(self):
+        assert len(_scan(_coverage_source(''))) == _ALL_KINDS_SITE_COUNT
+
+    @pytest.mark.parametrize('source', _COVERED.values(), ids=_COVERED.keys())
+    def test_a_valid_marker_or_a_virtual_clock_covers_every_site(self, source: str):
+        assert _scan(source) == []
+
+    def test_a_class_body_pytestmark_covers_only_that_class(self):
+        covered = _coverage_source(
+            f'class TestCovered:\n    pytestmark = pytest.mark.timing({_REASON})\n\n', method=True
+        )
+        uncovered = _coverage_source('class TestUncovered:\n', method=True)
+        source = covered + '\n\n' + uncovered.removeprefix(_COVERAGE_PRELUDE)
+        uncovered_first_line = source.splitlines().index('class TestUncovered:') + 1
+        found = _scan(source)
+        assert len(found) == _ALL_KINDS_SITE_COUNT, found
+        assert all(v.lineno > uncovered_first_line for v in found), found
+
+    @pytest.mark.parametrize('source', _NOT_COVERED.values(), ids=_NOT_COVERED.keys())
+    def test_an_invalid_or_misplaced_marker_covers_nothing(self, source: str):
+        found = _scan(source)
+        assert len(found) == _ALL_KINDS_SITE_COUNT, found
+        for violation in found:
+            assert 'the marker covers only with a non-empty literal reason=' in violation.message
+
+    def test_a_virtual_clock_does_not_cover_a_real_thread_sleep(self):
+        source = _coverage_source(
+            'from shared.testing_virtual_clock import virtual_clock_test\n\n\n@virtual_clock_test\n'
+        )
+        [violation] = _scan(source)
+        assert 'time.sleep(0.1)' in violation.message
