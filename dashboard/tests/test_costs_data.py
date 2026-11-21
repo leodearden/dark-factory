@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
@@ -2504,6 +2505,27 @@ class TestCuratorLedgerSource:
 
         assert by_role['dark_factory']['task_curator'] == {'opus': pytest.approx(0.02)}
         assert by_role['dark_factory']['implementer'] == {'opus': pytest.approx(2.0)}
+
+    @pytest.mark.asyncio
+    async def test_model_role_rollup_includes_curator_ledger(
+        self, ledger_config, pool, caplog,
+    ):
+        from dashboard.data.model_role import aggregate_model_role_rollup
+        from dashboard.project_dbs import _cost_sources
+
+        await _write_curator_ledger_row(ledger_config.curator_events_db)
+
+        with caplog.at_level(logging.WARNING, logger='dashboard.data.db'):
+            rollup = await aggregate_model_role_rollup(
+                await _cost_sources(ledger_config, pool), days=7, now=_LEDGER_NOW,
+            )
+
+        by_key = {(row['model'], row['role']): row for row in rollup['rows']}
+        assert by_key[('opus', 'task_curator')]['invocation_count'] == 1
+        assert by_key[('opus', 'task_curator')]['total_cost_usd'] == pytest.approx(0.02)
+        assert by_key[('opus', 'implementer')]['invocation_count'] == 1
+        assert by_key[('opus', 'implementer')]['total_cost_usd'] == pytest.approx(2.0)
+        assert 'with_db: query failed' not in caplog.messages
 
     @pytest.mark.asyncio
     async def test_missing_curator_ledger_is_a_strict_no_op(self, ledger_config, pool):

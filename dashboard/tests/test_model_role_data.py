@@ -13,11 +13,13 @@ identical GROUP-BY-(model, role) semantics from the same runs.db shape.
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from datetime import UTC, datetime
 
 import aiosqlite
 import pytest
+from shared.cost_store import CapReason, CostStore
 
 from dashboard.data.model_role import aggregate_model_role_rollup, get_model_role_rollup
 
@@ -514,3 +516,104 @@ class TestWindowFollowsDigestBounds:
         result = await _rollup_of_fresh_db(tmp_path, _seed_saturation_hit_at, timestamp, rollup)
         expected = 0.5 if included else 0.0
         assert result['turn_cap_saturation']['simple_task'] == pytest.approx(expected)
+
+
+# ---------------------------------------------------------------------------
+# The curator's CostStore ledger — invocations + account_events only, no
+# task_results and no events — is one of the ledgers the cost view hands in.
+# ---------------------------------------------------------------------------
+
+_LEDGER_KEY = ('opus', 'task_curator')
+
+_EXPECTED_LEDGER_ROW = {
+    'model': 'opus',
+    'role': 'task_curator',
+    'invocation_count': 2,
+    'done_count': 0,
+    'blocked_count': 0,
+    'done_rate': 0.0,
+    'blocked_rate': 0.0,
+    'capped_count': 1,
+    'cap_hit_rate': 0.5,
+    'total_cost_usd': pytest.approx(0.05),
+    'cost_per_done': None,
+}
+
+
+async def _write_curator_ledger(db_path) -> None:
+    """Two in-window curator invocations (one capped) and one out-of-window,
+    written through the ledger's production writer so the schema is real."""
+    store = CostStore(db_path)
+    await store.open()
+    try:
+        for cost, capped_reason, completed_at in (
+            (0.02, None, '2026-05-10T08:00:00+00:00'),
+            (0.03, CapReason.BUDGET, '2026-05-10T09:00:00+00:00'),
+            (99.0, None, '2026-05-09T00:00:00+00:00'),
+        ):
+            await store.save_invocation(
+                run_id='fused-memory-x',
+                task_id=None,
+                project_id='dark_factory',
+                account_name='a',
+                model='opus',
+                role='task_curator',
+                cost_usd=cost,
+                input_tokens=None,
+                output_tokens=None,
+                cache_read_tokens=None,
+                cache_create_tokens=None,
+                duration_ms=1234,
+                capped=capped_reason is not None,
+                capped_reason=capped_reason,
+                started_at=completed_at,
+                completed_at=completed_at,
+            )
+    finally:
+        await store.close()
+
+
+@pytest.fixture()
+async def curator_ledger_conn(tmp_path):
+    db_path = tmp_path / 'curator_events.db'
+    await _write_curator_ledger(db_path)
+    async with aiosqlite.connect(str(db_path)) as conn:
+        conn.row_factory = aiosqlite.Row
+        yield conn
+
+
+class TestCuratorLedgerShape:
+    """A ledger without task_results/events contributes invocation-only cells:
+    real counts, costs and caps, zero outcomes, and no turn-cap saturation."""
+
+    @pytest.mark.asyncio
+    async def test_invocation_only_ledger_contributes_cells(self, curator_ledger_conn) -> None:
+        result = await get_model_role_rollup(curator_ledger_conn, days=DAYS, now=NOW)
+
+        assert result['rows'] == [_EXPECTED_LEDGER_ROW]
+        assert result['turn_cap_saturation'] == {}
+
+    @pytest.mark.asyncio
+    async def test_invocation_only_ledger_logs_no_query_failure(
+        self, curator_ledger_conn, caplog,
+    ) -> None:
+        with caplog.at_level(logging.WARNING, logger='dashboard.data.db'):
+            await get_model_role_rollup(curator_ledger_conn, days=DAYS, now=NOW)
+
+        assert 'with_db: query failed' not in caplog.messages
+
+    @pytest.mark.asyncio
+    async def test_aggregate_adds_ledger_cells_without_disturbing_runs_db(
+        self, model_role_conn, curator_ledger_conn,
+    ) -> None:
+        runs_only = await aggregate_model_role_rollup([model_role_conn], days=DAYS, now=NOW)
+        with_ledger = await aggregate_model_role_rollup(
+            [model_role_conn, curator_ledger_conn], days=DAYS, now=NOW,
+        )
+
+        runs_by_key = {(row['model'], row['role']): row for row in runs_only['rows']}
+        combined_by_key = {(row['model'], row['role']): row for row in with_ledger['rows']}
+        assert _LEDGER_KEY not in runs_by_key
+        assert combined_by_key.pop(_LEDGER_KEY) == _EXPECTED_LEDGER_ROW
+        assert combined_by_key == runs_by_key
+        assert with_ledger['turn_cap_saturation'] == runs_only['turn_cap_saturation']
