@@ -8011,6 +8011,19 @@ async def test_update_task_dependency_on_a_missing_task_is_refused(backend, proj
 
 
 @pytest.mark.asyncio
+async def test_update_task_writing_back_a_stored_edge_to_a_removed_task_is_accepted(
+    backend, project_root,
+):
+    await _add_tasks(backend, project_root, 3)
+    await backend.add_dependency('1', '3', project_root=project_root)
+    await backend.remove_tasks(['3'], project_root=project_root)
+
+    await backend.update_task('1', project_root=project_root, dependencies=['3', '2'])
+
+    assert (await backend.get_task('1', project_root=project_root))['dependencies'] == [2, 3]
+
+
+@pytest.mark.asyncio
 async def test_update_task_resaving_or_rewiring_an_acyclic_list_is_accepted(
     backend, project_root,
 ):
@@ -8025,19 +8038,19 @@ async def test_update_task_resaving_or_rewiring_an_acyclic_list_is_accepted(
 
 @pytest.mark.asyncio
 async def test_add_task_cannot_close_a_cycle(backend, project_root):
-    await _add_tasks(backend, project_root, 4)
-    await backend.add_dependency('2', '1', project_root=project_root)
-    await backend.add_dependency('3', '2', project_root=project_root)
-    await backend.add_dependency('4', '3', project_root=project_root)
+    await _add_tasks(backend, project_root, 3)
+    await backend.add_dependency('1', '3', project_root=project_root)
     await backend.remove_tasks(['3'], project_root=project_root)
-    assert (await backend.get_dependency_edges(project_root))[4] == [3]
+    assert (await backend.get_dependency_edges(project_root))[1] == [3]
 
     created = await backend.add_task(
-        project_root=project_root, title='new', dependencies='1,2',
+        project_root=project_root, title='new', dependencies='1',
     )
 
-    assert created['id'] == '5'
-    assert (await backend.get_dependency_edges(project_root))[5] == [1, 2]
+    new_id = int(created['id'])
+    edges = await backend.get_dependency_edges(project_root)
+    assert edges[new_id] == [1]
+    assert [task for task, deps in edges.items() if new_id in deps] == []
 
 
 @pytest.mark.asyncio

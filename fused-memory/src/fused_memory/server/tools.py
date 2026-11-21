@@ -10624,9 +10624,9 @@ def create_mcp_server(
                 ``append`` above.
             status: New status (e.g. "pending"/"in-progress"/"done")
             dependencies: Replacement list of dependency task ids (top-level only).
-                Each entry must exist, must not be the task itself, and must
-                not close a local cycle (the same ``DependencyCycle`` refusal
-                as ``add_dependency``).
+                Each entry must exist (one already stored is exempt), must
+                not be the task itself, and must not close a local cycle (the
+                same ``DependencyCycle`` refusal as ``add_dependency``).
             agent_id: Which agent is writing (optional, auto-derived from MCP
                 context). Resolved here for uniform caller-identity attribution
                 across the task write path (task 2175/rho1b); status= writes

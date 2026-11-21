@@ -316,7 +316,9 @@ B over the local table at every status: a `done` or `cancelled` task's
 edges count, so reopening it cannot revive a cycle. A refusal carries
 `error_type` `DependencyCycle` and `cycle` `[A, B, …, A]`, and nothing is
 written: remove one of the named edges rather than retrying the call.
-Self-loops and missing ids are refused on both. The graph is local only:
+Self-loops and missing ids are refused on both; `update_task` exempts a
+missing id already stored for the task, since writing it back adds no
+edge. The graph is local only:
 qualified external deps (§3.2) are not walked. The rule's home is
 `shared/src/shared/dependency_cycle.py`.
 

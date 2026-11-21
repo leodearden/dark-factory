@@ -5931,11 +5931,8 @@ class TaskInterceptor:
                 MetadataNotAnObjectError,
                 DependencyCycle,
             ) as e:
-                # SqliteTaskBackend write-authority floor (task C1): a status
-                # write is always rejected, and so is any add, change or
-                # removal of metadata.done_provenance (under replace, anything
-                # but a verbatim passthrough of the stored value), and a
-                # metadata payload that is not a JSON object, in every mode.
+                # The typed SqliteTaskBackend refusals update_task returns as a
+                # dict; each class documents what it refuses.
                 # _journal_around already logged the failing backend_op row and
                 # re-raised; convert to the canonical rejection dict here so
                 # this surface's long-standing contract — return a dict, never

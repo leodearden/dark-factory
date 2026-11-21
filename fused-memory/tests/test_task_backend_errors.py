@@ -180,7 +180,7 @@ def test_dependency_cycle_is_a_taskmaster_error_naming_the_path():
     err = DependencyCycle('add_dependency', (9301, 9288, 9290, 9301))
 
     assert isinstance(err, TaskmasterError)
-    assert err.code == 'DEPENDENCY_CYCLE'
+    assert err.code == 'TASKMASTER_TOOL_ERROR'
     assert err.cycle == (9301, 9288, 9290, 9301)
     assert err.message == _CYCLE_MESSAGE
 

@@ -416,7 +416,7 @@ class DependencyCycle(TaskmasterError):
         self.cycle = tuple(cycle)
         path = ' → '.join(str(task) for task in self.cycle)
         super().__init__(
-            'DEPENDENCY_CYCLE',
+            TASKMASTER_TOOL_ERROR,
             f'{operation}: {self.cycle[0]} → {self.cycle[1]} would close a cycle {path}; '
             'remove one of those edges first',
         )

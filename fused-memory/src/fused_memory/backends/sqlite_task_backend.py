@@ -1772,6 +1772,8 @@ async def _refuse_cycle_closing_edges(
     first write: that write opens the transaction, so no other connection can
     commit into the walk (shared/src/shared/async_sqlite_base.py::AtomicConnection.write).
     """
+    if not deps:
+        return
     edges = await _fetch_dependencies(conn.execute_fetchall, tag)
     for dep in deps:
         cycle = cycle_closed_by_edge(tid, dep, lambda task: edges.get(task, ()))
@@ -3632,11 +3634,18 @@ class SqliteTaskBackend:
 
             # Dependencies: replace-mode only. Empty list clears all deps.
             # Runs after the UPDATE above, the unit's first write, as the
-            # cycle walk requires.
+            # cycle walk requires. An entry already stored is exempt from the
+            # existence check: remove_tasks leaves rows pointing AT a removed
+            # task, and writing such a list back adds no new edge.
             if dependencies is not None:
                 parsed_deps: list[int] = [_parse_task_id(raw) for raw in dependencies]
+                stored_deps = set(
+                    await _fetch_task_dependencies(conn.execute_fetchall, tag, tid),
+                )
                 await _refuse_missing_or_self_dependency(
-                    conn, tag, tid, parsed_deps, 'update_task',
+                    conn, tag, tid,
+                    [dep for dep in parsed_deps if dep not in stored_deps],
+                    'update_task',
                 )
                 await conn.execute(
                     'DELETE FROM dependencies WHERE tag = ? AND task_id = ?',
