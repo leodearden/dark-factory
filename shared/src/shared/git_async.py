@@ -105,7 +105,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from weakref import WeakKeyDictionary
 
-from shared.proc_group import LeaderPidfd, open_leader_pidfd, sigkill_process_group
+from shared.proc_group import (
+    LeaderPidfd,
+    open_leader_pidfd,
+    sigkill_process_group,
+    spawn_group_leader,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -179,45 +184,20 @@ async def _spawn_session_leader(
     With *pin_c_locale* the child runs in the C locale; without it the child
     inherits ``os.environ`` verbatim.
 
-    asyncio's own cleanup for a spawn interrupted after the fork kills only the
-    direct child, so an interrupted spawn is waited out and its whole group
-    killed before the original exception propagates (task 6346).
+    An interrupted spawn: see ``shared/src/shared/proc_group.py::spawn_group_leader``.
     """
     # Force a stable C locale so child output is always English and amenable
     # to substring matching (see the module docstring — this is load-bearing).
     env = {**os.environ, 'LC_ALL': 'C', 'LANG': 'C'} if pin_c_locale else None
-    spawn = asyncio.ensure_future(asyncio.create_subprocess_exec(
+    return await spawn_group_leader(
         *cmd,
+        kill_group=lambda proc: _kill_and_reap(proc, proc.pid),
         cwd=str(cwd) if cwd is not None else None,
         stdin=asyncio.subprocess.PIPE if pipe_stdin else None,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         env=env,
-        start_new_session=True,
-    ))
-    try:
-        return await asyncio.shield(spawn)
-    except BaseException:
-        proc = await _spawn_outcome(spawn)
-        if proc is not None:
-            await _kill_and_reap(proc, proc.pid)
-        raise
-
-
-async def _spawn_outcome(
-    spawn: asyncio.Future[asyncio.subprocess.Process],
-) -> asyncio.subprocess.Process | None:
-    """Wait *spawn* out, absorbing cancellations: its Process, or None if it failed.
-
-    Never raises the spawn's own failure, so it cannot replace the exception
-    that interrupted the caller.
-    """
-    while not spawn.done():
-        with contextlib.suppress(asyncio.CancelledError):
-            await asyncio.wait((spawn,))
-    if spawn.cancelled() or spawn.exception() is not None:
-        return None
-    return spawn.result()
+    )
 
 
 async def run_git(

@@ -22,7 +22,11 @@ from typing import IO, TYPE_CHECKING, Any, Protocol, TypeGuard, TypeVar
 from shared.claude_endpoint import ClaudeEndpoint
 from shared.claude_executable import ClaudeLaunchSurface, claude_executable, override_var
 from shared.cost_store import CapReason
-from shared.proc_group import snapshot_process_group, terminate_process_group
+from shared.proc_group import (
+    snapshot_process_group,
+    spawn_group_leader,
+    terminate_process_group,
+)
 from shared.process_cost import ProcessCostBasis, derive_process_cost, next_resume_prior
 from shared.secret_env import (
     AGENT_CREDENTIAL_VAR,
@@ -4235,6 +4239,14 @@ async def _kill_group_on_flat_timeout(
     )
 
 
+_CANCEL_KILL_GRACE_SECS = 5.0
+
+
+async def _terminate_cancelled_group(proc: asyncio.subprocess.Process) -> None:
+    logger.warning(f'Subprocess cancelled — terminating process group for pid {proc.pid}')
+    await terminate_process_group(proc, proc.pid, grace_secs=_CANCEL_KILL_GRACE_SECS)
+
+
 async def run_cli_subprocess(
     cmd: list[str],
     cwd: Path,
@@ -4301,14 +4313,14 @@ async def run_cli_subprocess(
     # stdin_data is None must still yield stdin=None (inherited).
     stdin_file = _materialize_stdin(stdin_data) if stdin_data is not None else None
     try:
-        proc = await asyncio.create_subprocess_exec(
+        proc = await spawn_group_leader(
             *spawn_cmd,
+            kill_group=_terminate_cancelled_group,
             cwd=str(cwd),
             env=spawn_env,
             stdin=stdin_file,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            start_new_session=True,
         )
     finally:
         # Close the parent's handle as soon as the child has its own dup — this
@@ -4733,8 +4745,7 @@ async def run_cli_subprocess(
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await comm_task
         if proc.returncode is None:
-            logger.warning(f'Subprocess cancelled — terminating process group for pid {proc.pid}')
-            await terminate_process_group(proc, pgid, grace_secs=5.0)
+            await _terminate_cancelled_group(proc)
         raise
 
     duration_ms = int(time.monotonic() * 1000) - start_ms
