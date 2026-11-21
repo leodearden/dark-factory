@@ -52,6 +52,7 @@ from orchestrator.config_census_ignore import (  # noqa: F401 (re-exported for t
     parse_census_ignore_entries,
 )
 from orchestrator.implementer_brief_variant import ImplementerBriefVariant
+from orchestrator.merge_pool_config import MergePoolConfig
 from orchestrator.routing import DEFAULT_ALLOWED_MODELS, DEFAULT_LADDER
 from orchestrator.shadow_types import ShadowShape
 from orchestrator.verify_admission_gate import AdmissionOrder
@@ -5644,6 +5645,10 @@ class OrchestratorConfig(BaseSettings):
     # defaults.yaml declares the block explicitly so the knob is discoverable.
     merge_deep: MergeDeepConfig = Field(default_factory=MergeDeepConfig)
 
+    # The merge pool's order, promotion period and bounce cap (task 9933,
+    # plans/priority-at-later-gates-prd.md). Nothing reads it yet.
+    merge_pool: MergePoolConfig = Field(default_factory=MergePoolConfig)
+
     # Verify-result cache modes per role (task 5652, plans/verify-result-cache-prd.md).
     # An absent stanza is OFF for both roles.
     verify_cache: VerifyCacheConfig = Field(default_factory=VerifyCacheConfig)
@@ -6871,6 +6876,8 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
     # separate RELOADABLE_FIELDS edit, so chains can be turned on, retuned or
     # killed (chain_cap -> 0) without a restart. See MergeDeepConfig.
     _submodel_leaf_paths('merge_deep', MergeDeepConfig),
+    # The merge pool's knobs (task 9933): every leaf hot, as merge_deep's are.
+    _submodel_leaf_paths('merge_pool', MergePoolConfig),
     # Verify-result cache (task 5652): read per verify decision, so green tier;
     # each role's mode is its own leaf, so a task-only edit applies alone.
     _submodel_leaf_paths('verify_cache', VerifyCacheConfig),
