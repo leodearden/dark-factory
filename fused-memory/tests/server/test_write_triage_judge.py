@@ -96,6 +96,7 @@ from fused_memory.server.write_triage_judge import (
     judge_prompt_elisions,
     judge_write,
     parse_judge_verdict,
+    resolve_judge_api_key,
     resolve_judge_api_url,
     resolve_judge_candidate_count,
     resolve_judge_enabled,
@@ -1423,6 +1424,36 @@ class TestResolveJudgeApiUrl:
         assert resolve_judge_api_url(service) is None
 
 
+class TestResolveJudgeApiKey:
+    """`judge_api_key` — the judge's OWN key, else None meaning INHERIT.
+
+    None hands the choice back to `llm.providers.<provider>.api_key`, and
+    through it to the SDK's environment fallback.
+    """
+
+    def test_a_configured_key_is_used_verbatim(self) -> None:
+        assert resolve_judge_api_key(_svc(judge_api_key='sk-judge')) == 'sk-judge'
+
+    @pytest.mark.parametrize(
+        ('label', 'service'), _MISSING_HOPS,
+        ids=[label for label, _ in _MISSING_HOPS],
+    )
+    def test_a_missing_hop_inherits(self, label: str, service: object) -> None:
+        assert resolve_judge_api_key(service) is None, label
+
+    @pytest.mark.parametrize('value', ['', '   ', None, 0, b'sk-bytes', True, []])
+    def test_a_blank_or_non_string_key_inherits(self, value: object) -> None:
+        """A blank api_key 401s every call instead of falling back to the env."""
+        assert resolve_judge_api_key(_svc(judge_api_key=value)) is None
+
+    def test_the_schema_default_inherits(self) -> None:
+        assert WriteTriageConfig().judge_api_key is None
+
+    @pytest.mark.parametrize('value', ['', '   '])
+    def test_the_schema_stores_a_blank_key_as_inherit(self, value: str) -> None:
+        assert WriteTriageConfig(judge_api_key=value).judge_api_key is None
+
+
 class TestEveryResolverReadsLive:
     """Nothing is captured at import or construction.
 
@@ -1451,10 +1482,11 @@ class TestEveryResolverReadsLive:
                 resolve_judge_api_url, 'judge_api_url',
                 'http://a.example/v1', 'http://b.example/v1',
             ),
+            (resolve_judge_api_key, 'judge_api_key', 'sk-a', 'sk-b'),
         ],
         ids=[
             'enabled', 'provider', 'model', 'timeout', 'candidate_count',
-            'reasoning_effort', 'field_chars', 'api_url',
+            'reasoning_effort', 'field_chars', 'api_url', 'api_key',
         ],
     )
     def test_a_mutation_is_observed_on_the_very_next_call(
