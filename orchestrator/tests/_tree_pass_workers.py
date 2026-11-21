@@ -131,6 +131,7 @@ def serve(request_path: str, reply_path: str) -> None:
     """One worker's whole life: extract the share at *request_path*, write the reply to *reply_path*."""
     request: _WorkerRequest = pickle.loads(Path(request_path).read_bytes())
     sys.path[:] = request.sys_path
+    _require_parent_files(request.parent_imports)
     sys.meta_path.insert(0, _ParentImportFinder(request.parent_imports))
     analyses = _analyses_named(request.paths_by_analysis, request.guard_modules)
     reply = extract_facts({
@@ -164,6 +165,25 @@ def _parent_imports() -> dict[str, _ImportedFrom]:
         and (where := _imported_from(name, module)) is not None
         and os.path.isfile(where.origin)
     }
+
+
+def _require_parent_files(imports: Mapping[str, _ImportedFrom]) -> None:
+    """Fails unless each module in *imports* this process already holds from a file is the parent's file."""
+    diverged = [
+        (name, held.origin, where.origin)
+        for name, where in sorted(imports.items())
+        if (held := _imported_from(name, sys.modules.get(name))) is not None
+        and os.path.realpath(held.origin) != os.path.realpath(where.origin)
+    ]
+    if diverged:
+        raise ImportError(
+            'a tree pass worker must import each module from the file the parent process '
+            'imported it from, but it already holds '
+            + '; '.join(
+                f'{name!r} from {worker_file} (the parent imported {parent_file})'
+                for name, worker_file, parent_file in diverged
+            )
+        )
 
 
 class _ParentImportFinder(importlib.abc.MetaPathFinder):
