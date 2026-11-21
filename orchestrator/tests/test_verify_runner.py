@@ -21,11 +21,23 @@ from _gate_fixtures import (
     gated_remote_runner,
     gated_run,
 )
+from _git_fixtures import seed_repo
 from _orch_helpers import pydantic_spec, wait_responsive
+from test_verify_cache_decision import (
+    _LOG,
+    _MARKERS_ENV,
+    _SEED,
+    _clean_unscoped_gate,
+    _config,
+    _module,
+)
+from test_verify_cache_recorder import put_pytest_on_path
 
 from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
-from orchestrator.verify import VerifyResult
+from orchestrator.verify import VerifyResult, run_scoped_verification
+from orchestrator.verify_cache.registry import registry_db_path
+from orchestrator.verify_evidence import UnitOutcome
 from orchestrator.verify_runner import (
     CANCEL_PROBE_INTERVAL_SECS,
     GIT_PUSH_SSH_CONFIG,
@@ -1306,6 +1318,7 @@ class TestLocalRunnerBundle:
             task_id=None,
             archive_root=None,
             event_store=None,
+            verify_cache=None,
         )
 
 
@@ -3302,6 +3315,34 @@ class TestRunMergeVerifyOnWorktree:
             "type_check_command must survive spec→module_configs reconstruction so the "
             "unscoped typecheck gate is not silently a no-op"
         )
+
+
+class TestRunnerVerifyConsultsNoRegistry:
+    """A runner's verify joins the cache with no registry (task 5653): every unit is
+    UNAVAILABLE naming why, and the runner writes no registry of its own."""
+
+    @pytest.mark.asyncio
+    async def test_every_unit_is_unavailable_and_no_registry_file_appears(self, tmp_path, monkeypatch):
+        from orchestrator.verify_runner import build_merge_verify_spec, run_merge_verify_on_worktree
+
+        put_pytest_on_path(tmp_path, monkeypatch)
+        markers = tmp_path / 'markers.txt'
+        monkeypatch.setenv(_MARKERS_ENV, str(markers))
+        repo = seed_repo(tmp_path / 'repo', _SEED)
+        config = _config(repo, _LOG)
+        modules = [_module('alpha', markers), _module('beta', markers)]
+
+        result = await run_merge_verify_on_worktree(
+            repo, config, build_merge_verify_spec(config, modules, None),
+            run_scoped=run_scoped_verification, run_unscoped=_clean_unscoped_gate,
+        )
+
+        assert result.passed, result.summary
+        assert result.units
+        for unit in result.units:
+            assert unit.outcome is UnitOutcome.UNAVAILABLE, unit
+            assert 'no_registry_on_runner' in (unit.reason or ''), unit
+        assert not registry_db_path(repo).exists()
 
 
 # ---------------------------------------------------------------------------

@@ -42,8 +42,9 @@ this suite and the journal suite cannot disagree about the registry shape.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Collection
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -63,12 +64,16 @@ from orchestrator.event_store import EventType
 from orchestrator.merge_lane.gates import PostMergePyrightResult
 from orchestrator.merge_lane.post_merge_verify import (
     merge_boundary_module_configs,
+    placeholder_local_runner,
     run_post_merge_verify,
 )
 from orchestrator.merge_lane.queue_store import MergeQueueStore, reconstruct_merge_request
-from orchestrator.merge_lane.types import QueuedBranch
+from orchestrator.merge_lane.types import DiskGuardOutcome, QueuedBranch
 from orchestrator.merge_lane.worker import MergeOutcome, MergeRequest
 from orchestrator.verify import VerifyResult
+from orchestrator.verify_cache.registry import registry_db_path
+from orchestrator.verify_cache.replay import CacheAccess
+from orchestrator.verify_runner import build_merge_verify_spec
 
 _MERGE_SHA = 'd' * 40
 
@@ -1075,3 +1080,98 @@ class TestRehydratedRequestVerifiesAsWideAsItsOriginal:
         assert _merge_plan_full_suite_prefixes(
             config, rehydrated.module_configs, self._TASK_FILES,
         ) == ['__fallback__'], 'the zero-module task must still take the global-fallback path'
+
+
+# ---------------------------------------------------------------------------
+# task 5653: the local merge gate joins the verify-result cache, and only it
+# ---------------------------------------------------------------------------
+
+
+class _CapturingVerifier:
+    """A ``VerifyPort`` whose scoped verify passes and keeps every call's options."""
+
+    def __init__(self) -> None:
+        self.scoped_options: list[dict[str, Any]] = []
+
+    async def ensure_disk_space(
+        self, git_ops: Any, merge_wt: Path, min_free_bytes: int, task_id: str,
+        keep_worktrees: Collection[Path] | None = None,
+    ) -> DiskGuardOutcome:
+        return DiskGuardOutcome(reason=None)
+
+    async def run_scoped(
+        self, worktree: Path, config: Any, module_configs: list[Any], task_files: list[str] | None = None,
+        **options: Any,
+    ) -> VerifyResult:
+        self.scoped_options.append(options)
+        return _passing_result()
+
+    async def run_unscoped_typechecks(
+        self, worktree: Path, config: Any, module_configs: list[Any], **options: Any,
+    ) -> PostMergePyrightResult:
+        return PostMergePyrightResult()
+
+
+class TestMergeBoundaryJoinsTheVerifyCache:
+    @staticmethod
+    def _req(tmp_path: Path) -> tuple[MergeRequest, Path]:
+        config = _make_config(tmp_path, merge_verify_breadth='full')
+        mc_a = _module_config('alpha')
+        config._module_configs = {'alpha': mc_a}
+        task_wt = tmp_path / 'task-wt-c1'
+        task_wt.mkdir(parents=True, exist_ok=True)
+        merge_wt = tmp_path / 'merge-wt-c1'
+        merge_wt.mkdir(parents=True, exist_ok=True)
+        req = _make_req('c1', task_wt, config)
+        req.module_configs = [mc_a]
+        return req, merge_wt
+
+    @staticmethod
+    async def _drive(
+        tmp_path: Path, req: MergeRequest, merge_wt: Path, verifier: _CapturingVerifier,
+        *, history_leg_command: str | None = None,
+    ) -> MergeOutcome | None:
+        return await run_post_merge_verify(
+            _make_git_ops(tmp_path), req, merge_wt,
+            timeouts={}, enospc_retries={}, max_timeouts=3, max_enospc=1,
+            merge_sha=_MERGE_SHA, verifier=verifier, history_leg_command=history_leg_command,
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_local_gate_verifies_through_the_dispatchers_registry(self, tmp_path: Path):
+        req, merge_wt = self._req(tmp_path)
+        verifier = _CapturingVerifier()
+
+        assert await self._drive(tmp_path, req, merge_wt, verifier) is None
+
+        (options,) = verifier.scoped_options
+        access = options['verify_cache']
+        assert isinstance(access, CacheAccess)
+        assert access.registry is not None
+        assert (await access.registry.summary()).path == registry_db_path(req.config.project_root)
+        assert access.orchestrator_code is None
+
+    @pytest.mark.asyncio
+    async def test_the_history_leg_stays_outside_the_cache(self, tmp_path: Path):
+        req, merge_wt = self._req(tmp_path)
+        verifier = _CapturingVerifier()
+
+        with patch(
+            'orchestrator.merge_lane.history_leg.run_verification',
+            new=AsyncMock(return_value=_passing_result()),
+        ):
+            assert await self._drive(tmp_path, req, merge_wt, verifier, history_leg_command='true') is None
+
+        assert [options for options in verifier.scoped_options if options.get('verify_cache') is not None] == []
+
+    @pytest.mark.asyncio
+    async def test_the_placeholder_runner_stays_outside_the_cache(self, tmp_path: Path):
+        req, merge_wt = self._req(tmp_path)
+        verifier = _CapturingVerifier()
+        runner = placeholder_local_runner(merge_wt, req, verifier)
+
+        await runner.run_merge_verify(_MERGE_SHA, build_merge_verify_spec(req.config, req.module_configs, None))
+
+        (options,) = verifier.scoped_options
+        assert 'verify_cache' in options
+        assert options['verify_cache'] is None

@@ -5,7 +5,7 @@ from __future__ import annotations
 import subprocess
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Literal
+from typing import Any, ClassVar, Literal
 
 import pytest
 from _git_fixtures import RepoSeed, seed_repo
@@ -19,7 +19,9 @@ from orchestrator.config import (
     OrchestratorConfig,
     VerifyCacheConfig,
 )
-from orchestrator.verify import VerifyResult, run_scoped_verification
+from orchestrator.event_store import EventStore, EventType
+from orchestrator.merge_lane.gates import PostMergePyrightResult
+from orchestrator.verify import VerifyResult, is_no_verdict_summary, run_scoped_verification
 from orchestrator.verify_cache.keys import TREE_UNIT_ID, UnitKey
 from orchestrator.verify_cache.modes import CacheMode, VerifyRole
 from orchestrator.verify_cache.policy import Decision
@@ -34,6 +36,12 @@ from orchestrator.verify_evidence import (
     module_leg_unit,
 )
 from orchestrator.verify_plan import VerifyPlan
+from orchestrator.verify_runner import (
+    LocalRunner,
+    MergeVerifySpec,
+    VerifyRunnerPool,
+    build_merge_verify_spec,
+)
 
 #: Every leg of the fixture appends ``<module>:<leg>`` to the file this names.
 _MARKERS_ENV = 'DF_VERIFY_CACHE_TEST_MARKERS'
@@ -572,3 +580,178 @@ class TestFanOutSeam:
         units = _by_unit(result)
         assert (units[TREE_UNIT_ID].outcome, units[TREE_UNIT_ID].evidence_event_id) == (UnitOutcome.CACHE_HIT, 77)
         assert {unit.outcome for unit in units.values()} == {UnitOutcome.CACHE_HIT}
+
+
+# ---------------------------------------------------------------------------
+# The merge gate as the lane dispatches it: the pool consumes what a verify
+# replayed before the merge_verify row, then records its greens citing that row.
+
+
+async def _clean_unscoped_gate(*_args: Any, **_kwargs: Any) -> PostMergePyrightResult:
+    return PostMergePyrightResult()
+
+
+def _merge_pool(
+    repo: Path,
+    config: OrchestratorConfig,
+    modules: Sequence[ModuleConfig],
+    registry: Registry,
+    store: EventStore,
+    *,
+    run_scoped: Any = run_scoped_verification,
+) -> VerifyRunnerPool:
+    local = LocalRunner(
+        repo, config, list(modules), None,
+        run_scoped=run_scoped, run_unscoped=_clean_unscoped_gate,
+        verify_cache=CacheAccess(registry, _CODE),
+    )
+    return VerifyRunnerPool([local], event_store=store, task_id='5653', verify_cache_registry=registry)
+
+
+def _spec(config: OrchestratorConfig, modules: Sequence[ModuleConfig]) -> MergeVerifySpec:
+    return build_merge_verify_spec(config, list(modules), None)
+
+
+def _head(repo: Path) -> str:
+    return _git(repo, 'rev-parse', 'HEAD')
+
+
+def _row_units(row: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    return {unit['unit']: unit for unit in row['data']['units']}
+
+
+async def _entries_for(registry: Registry, result: VerifyResult) -> dict[str, Entry]:
+    """The live entry of every keyed unit *result* settled, by unit id."""
+    record = result.cache_record
+    assert record is not None
+    settled = (*record.units, *(() if record.tree is None else (record.tree,)))
+    view = await registry.view([unit.key for unit in settled if unit.key is not None])
+    return {entry.unit_id: entry for entry in view.entries.values()}
+
+
+def _garble(db_path: Path) -> None:
+    for sidecar in ('-wal', '-shm'):
+        Path(f'{db_path}{sidecar}').unlink(missing_ok=True)
+    db_path.write_bytes(b'garbage, not sqlite' * 64)
+
+
+class _RemoteDouble:
+    """A non-local runner that returns *result* as a remote verify would."""
+
+    name = 'remote-double'
+    is_local: ClassVar[bool] = False
+
+    def __init__(self, result: VerifyResult) -> None:
+        self._result = result
+
+    async def health(self) -> bool:
+        return True
+
+    async def run_merge_verify(self, merge_sha: str, spec: MergeVerifySpec) -> VerifyResult:
+        return self._result
+
+
+@pytest.fixture
+def store(tmp_path: Path) -> EventStore:
+    return EventStore(tmp_path / 'runs.db', run_id='r')
+
+
+@pytest.mark.usefixtures('seam')
+class TestMergeGateRecordsAndConsumes:
+    @pytest.mark.asyncio
+    async def test_row_1_the_first_gate_records_every_admitted_unit_citing_its_row(
+        self, repo, modules, registry, store,
+    ):
+        config = _config(repo)
+        merge_sha = _head(repo)
+
+        result = await _merge_pool(repo, config, modules, registry, store).dispatch(merge_sha, _spec(config, modules))
+
+        assert result.passed, result.summary
+        (row,) = store.fetch_events_by_type(EventType.merge_verify)
+        units = _row_units(row)
+        assert set(units) == _units('alpha') | _units('beta') | {TREE_UNIT_ID}
+        for unit in units.values():
+            assert unit['outcome'] == 'ran_green'
+            assert unit['key']
+        recorded = await _entries_for(registry, result)
+        assert set(recorded) == set(units)
+        for entry in recorded.values():
+            assert (entry.evidence_event_id, entry.run_id, entry.sha) == (row['id'], 'r', merge_sha)
+
+    @pytest.mark.asyncio
+    async def test_row_2_the_second_gate_replays_alpha_and_consumes_it_before_returning(
+        self, repo, modules, registry, store,
+    ):
+        config = _config(repo)
+        pool = _merge_pool(repo, config, modules, registry, store)
+        first = await pool.dispatch(_head(repo), _spec(config, modules))
+        first_entries = await _entries_for(registry, first)
+        _commit_edit(repo, 'beta/src/beta/__init__.py', 'B = 2\n')
+        merge_sha = _head(repo)
+
+        result = await pool.dispatch(merge_sha, _spec(config, modules))
+        consumed = await registry.consumed_for(merge_sha)
+
+        assert result.passed, result.summary
+        first_row, row = store.fetch_events_by_type(EventType.merge_verify)
+        units = _row_units(row)
+        for unit_id in _units('alpha'):
+            assert units[unit_id]['outcome'] == 'cache_hit'
+            assert units[unit_id]['evidence_event_id'] == first_row['id']
+        assert {entry.unit_id: entry.entry_id for entry in consumed} == {
+            unit_id: first_entries[unit_id].entry_id for unit_id in _units('alpha')
+        }
+
+    @pytest.mark.asyncio
+    async def test_row_9_log_mode_reads_would_hit_and_consumes_nothing(self, repo, modules, registry, store):
+        config = _config(repo, _LOG)
+        pool = _merge_pool(repo, config, modules, registry, store)
+        await pool.dispatch(_head(repo), _spec(config, modules))
+        _commit_edit(repo, 'beta/src/beta/__init__.py', 'B = 2\n')
+        merge_sha = _head(repo)
+
+        result = await pool.dispatch(merge_sha, _spec(config, modules))
+
+        assert result.passed, result.summary
+        units = _row_units(store.fetch_events_by_type(EventType.merge_verify)[-1])
+        assert {units[unit_id]['outcome'] for unit_id in _units('alpha')} == {'would_hit'}
+        assert await registry.consumed_for(merge_sha) == ()
+
+    @pytest.mark.asyncio
+    async def test_a_replay_the_registry_cannot_consume_is_no_verdict(
+        self, repo, modules, registry, store, tmp_path,
+    ):
+        config = _config(repo)
+        await _merge_pool(repo, config, modules, registry, store).dispatch(_head(repo), _spec(config, modules))
+        _commit_edit(repo, 'beta/src/beta/__init__.py', 'B = 2\n')
+
+        async def _decide_then_garble(*args: Any, **kwargs: Any) -> VerifyResult:
+            decided = await run_scoped_verification(*args, **kwargs)
+            _garble(tmp_path / 'verify_cache.db')
+            return decided
+
+        pool = _merge_pool(repo, config, modules, registry, store, run_scoped=_decide_then_garble)
+        result = await pool.dispatch(_head(repo), _spec(config, modules))
+
+        assert _outcomes(result, _units('alpha')) == {UnitOutcome.CACHE_HIT}
+        assert not result.passed
+        assert is_no_verdict_summary(result.summary), result.summary
+        assert store.fetch_events_by_type(EventType.merge_verify)[-1]['data']['passed'] is False
+
+    @pytest.mark.asyncio
+    async def test_a_non_local_runner_records_nothing(self, repo, modules, access, registry, store):
+        config = _config(repo)
+        remote_result = await _gate(repo, config, modules, access)
+        assert remote_result.passed, remote_result.summary
+        assert remote_result.cache_record is not None
+        merge_sha = _head(repo)
+        pool = VerifyRunnerPool(
+            [_RemoteDouble(remote_result)], event_store=store, task_id='5653', verify_cache_registry=registry,
+        )
+
+        result = await pool.dispatch(merge_sha, _spec(config, modules))
+
+        assert result.passed, result.summary
+        assert await _entries_for(registry, result) == {}
+        assert await registry.consumed_for(merge_sha) == ()
