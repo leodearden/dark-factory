@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+import time
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +31,7 @@ from _merge_lane_fakes import (
 from _merge_worker_drive import HEAVY_BARRIER_TEST_TIMEOUT
 from _orch_helpers import wait_responsive
 from _poll_responsive import poll_responsive
+from shared.scheduler_state import SchedulerStateSnapshot
 
 from orchestrator.config import DepthRow, GitConfig, MergeDeepConfig
 from orchestrator.event_store import EventStore
@@ -41,6 +43,8 @@ from orchestrator.merge_lane import (
     QueuedBranch,
     enqueue_merge_request,
 )
+from orchestrator.overrides import OverrideStore
+from orchestrator.scheduler import Scheduler
 from orchestrator.task_priority import TaskPriority, TaskPriorityLookup
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)]
@@ -214,6 +218,43 @@ class TestSingleRequest:
         (row,) = scene.data_of('merge_queued', 'fresh')
         assert row['first_enqueued_at'] == req.enqueued_at
         assert row['head_sha'] is None
+
+    async def test_base_tier_and_age_are_recorded_from_the_first_submission(
+        self, tmp_path: Path,
+    ) -> None:
+        scene = _Scene(tmp_path)
+        req = await scene.request('aged')
+        req.merge_first_enqueued_at = time.time() - 3600
+        priority = _lookup({
+            'aged': TaskPriority(tier='pinned', pinned=True, base_tier='low', pin_order=1),
+        })
+
+        await scene.submit(req, priority)
+
+        (row,) = scene.data_of('merge_queued', 'aged')
+        assert (row['tier'], row['base_tier'], row['age_from']) == ('pinned', 'low', 'enqueue')
+        assert 3600 <= row['age_secs'] < 3660
+
+    async def test_a_request_queued_before_the_first_tick_records_a_pinned_task_as_pinned(
+        self, tmp_path: Path,
+    ) -> None:
+        scene = _Scene(tmp_path)
+        req = await scene.request('early')
+        overrides = OverrideStore(tmp_path / 'overrides.db')
+        overrides.set_override(str(scene.config.project_root), 'early', pinned=True)
+        snapshot_path = tmp_path / 'scheduler_state.json'
+        snapshot = SchedulerStateSnapshot(effective_priorities={'early': 'low'})
+        snapshot_path.write_text(json.dumps(snapshot.to_json()))
+        scheduler = Scheduler(
+            scene.config, override_store=overrides, state_snapshot_path=snapshot_path,
+        )
+
+        await scene.submit(req, scheduler.task_priority)
+
+        (row,) = scene.data_of('merge_queued', 'early')
+        assert (row['tier'], row['pinned'], row['base_tier'], row['age_from']) == (
+            'pinned', True, 'low', 'enqueue',
+        )
 
 
 class TestLookupFailureLeavesTheLaneAlone:
