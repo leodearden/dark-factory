@@ -4809,14 +4809,17 @@ class SpeculativeMergeWorker:
         # consecutive tip-advance equivalence failure; popped on a clean
         # 'done' landing or bound-exceeded escalation.
         self._generation_chain_counts: dict[str, int] = {}
-        # Tasks whose NEXT dispatch verifies un-chained (tasks 3185, 10617): a
-        # chain-arm error marks its owner, a red tip marks its owner and every
-        # link, because neither verdict is attributable to any one member.  A
-        # marked task is neither a chain owner (`_deep_chain_placement` guard
-        # 2b) nor a link (`chain_snapshot`), so its own subset tree gets a
-        # verdict that IS attributable to it.  The mark lasts until a verdict
-        # for the task is applied, which is when its request is retired
-        # (`_retire_item`): a verify the cascade cancels or voids keeps it.
+        # Tasks whose NEXT dispatch verifies un-chained (tasks 3185, 10617,
+        # 10721).  A chain-arm error marks its owner, and a red tip marks its
+        # owner and every link, because neither verdict is attributable to any
+        # one member.  A gate-rebased head marks its own task at dispatch, so
+        # its re-verify covers its own rebased tree alone
+        # (plans/merge-lane-policy-prd.md D3).  A marked task is neither a chain
+        # owner (`_deep_chain_placement` guard 2b) nor a link (`chain_snapshot`),
+        # so its own subset tree gets a verdict that IS attributable to it.  The
+        # mark lasts until a verdict for the task is applied, which is when its
+        # request is retired (`_retire_item`): a verify the cascade cancels or
+        # voids keeps it.
         self._next_dispatch_unchained: set[str] = set()
         # task 2828 amend (reviewer_comprehensive, robustness): per-task
         # consecutive contended-lease requeue counter.  Incremented each time
@@ -7233,17 +7236,16 @@ class SpeculativeMergeWorker:
              green-tier ``reload_config`` — which mutates the held
              :class:`~orchestrator.config.MergeDeepConfig` in place — takes
              effect on the very next dispatch, in both directions.
-          2b. ``task_id in self._next_dispatch_unchained`` -> the same.  The
-             LOOP GUARD (tasks 3185, 10617).  A chain-arm error or a red tip
-             was not attributed to this item (the tree was cumulative), so the
-             request was DEFERRED rather than blocked — and a defer that
-             re-chained into the same tree would ping-pong forever.  Declining
-             sends the re-dispatch down the ordinary path, where it verifies the
-             item's OWN subset tree and gets a verdict that IS attributable to
-             it.  Sits AFTER the kill switch so the stock path still pays
-             nothing, and BEFORE the queue scan so a marked task pays no
-             O(n) walk either.  The mark lasts until the task's verdict is
-             applied (see ``_next_dispatch_unchained`` in ``__init__``).
+          2b. ``task_id in self._next_dispatch_unchained`` -> the same.
+             Declining sends the dispatch down the ordinary path, where it
+             verifies the item's OWN subset tree and gets a verdict that IS
+             attributable to it.  What marks a task, and until when, is
+             ``_next_dispatch_unchained`` in ``__init__``.  It is also the
+             LOOP GUARD (tasks 3185, 10617): an unattributable chain verdict
+             DEFERS its request rather than blocking it, and a defer that
+             re-chained into the same tree would ping-pong forever.  Sits
+             AFTER the kill switch so the stock path still pays nothing, and
+             BEFORE the queue scan so a marked task pays no O(n) walk either.
           3. ``(d, reason) = choose_depth(...)``
              (:mod:`~orchestrator.merge_lane.chain_policy`): the depth table
              over the rolling pass estimate, bounded by the queue.
@@ -15103,6 +15105,8 @@ class SpeculativeMergeWorker:
         redispatch park, with every in-flight successor torn down and parked
         behind it to re-anchor at its own dispatch (plans/merge-lane-policy-prd.md
         D3).  ``_inflight`` is empty on return, so no head-failure cascade runs.
+        The head's task is marked un-chained, so its re-verify covers its own
+        rebased tree alone, a dispatch-time re-merge included (D3).
 
         False when the head did not dispatch: :meth:`_admit_gate_attempt`
         ended the request, or :meth:`_rebased_head_worktree` re-queued it.
@@ -15122,6 +15126,7 @@ class SpeculativeMergeWorker:
             candidate, rebased_sha=gate.rebased_sha, rebased_onto=gate.rebased_onto,
             merge_wt=merge_wt, cap_permit=self._merge_ahead_ledger.try_acquire(),
         )
+        self._next_dispatch_unchained.add(req.task_id)
         self._note_transition(
             req.request_id, ItemLifecycleState.GATE_REVERIFY,
             ItemLifecycleState.REDISPATCH_PARKED, live_obj=head,
