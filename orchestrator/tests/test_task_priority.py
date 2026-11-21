@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import subprocess
+import sys
 import threading
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -312,8 +314,6 @@ class TestReadTaskPriority:
 
     @pytest.mark.parametrize('field, odd_value', [
         ('base_tier', MagicMock()),
-        ('pin_order', True),
-        ('pin_order', '3'),
         ('age_anchor', datetime(2026, 11, 1, 12, 0)),
         ('age_anchor', '2026-11-01T12:00:00+00:00'),
     ])
@@ -326,6 +326,20 @@ class TestReadTaskPriority:
         assert read_task_priority(lambda task_id: answer, '7') == dataclasses.replace(
             well_typed, **{field: None},
         )
+
+    @pytest.mark.parametrize('odd_order', [None, True, '3'])
+    def test_a_pinned_tier_without_a_plain_order_reads_as_order_zero(self, odd_order: Any) -> None:
+        answer = TaskPriority(tier=PINNED, pinned=True, base_tier='low', pin_order=odd_order)
+
+        assert read_task_priority(lambda task_id: answer, '7') == dataclasses.replace(
+            answer, pin_order=0,
+        )
+
+    @pytest.mark.parametrize('tier', ['high', None, MagicMock()])
+    def test_an_order_without_the_pinned_tier_is_dropped(self, tier: Any) -> None:
+        answer = TaskPriority(tier=tier, pinned=False, base_tier='high', pin_order=3)
+
+        assert read_task_priority(lambda task_id: answer, '7').pin_order is None
 
     def test_the_positional_shape_keeps_its_meaning(self) -> None:
         assert TaskPriority('high', False) == TaskPriority(
@@ -350,6 +364,17 @@ def _key(
 
 def _rank(tier: str | None, *, waited: float = 0.0, period: float | None = _PERIOD) -> int:
     return _key(TaskPriority(tier=tier), waited=waited, period=period)[0]
+
+
+def test_task_priority_imports_nothing_from_the_orchestrator() -> None:
+    probe = (
+        'import json, sys, orchestrator.task_priority; '
+        'print(json.dumps(sorted(m for m in sys.modules if m.startswith("orchestrator."))))'
+    )
+
+    ran = subprocess.run([sys.executable, '-c', probe], capture_output=True, text=True, check=True)
+
+    assert json.loads(ran.stdout) == ['orchestrator.task_priority']
 
 
 class TestGateRank:

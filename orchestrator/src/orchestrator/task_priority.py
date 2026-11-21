@@ -5,7 +5,8 @@ consumers that must not import the scheduler — the merge lane today, verify
 admission (task 8261) and the merge-pool pick next — are handed a
 :class:`TaskPriorityLookup` and read it through :func:`read_task_priority`,
 which never raises. :func:`order_key` is the only place a later gate's sort
-key is built.
+key is built. A leaf: it imports nothing from the orchestrator, so the config
+and every gate can import it.
 """
 from __future__ import annotations
 
@@ -14,8 +15,7 @@ import math
 from datetime import UTC, datetime
 from typing import Protocol
 
-from orchestrator.config import PRIORITY_TIERS
-
+PRIORITY_TIERS: tuple[str, ...] = ('critical', 'high', 'medium', 'low', 'polish')
 PINNED = 'pinned'
 GATE_RANK: tuple[str, ...] = (PINNED, *PRIORITY_TIERS)
 _RANK_OF: dict[str, int] = {tier: rank for rank, tier in enumerate(GATE_RANK)}
@@ -27,10 +27,10 @@ _UNKNOWN_TIER_RANK = _RANK_OF['medium']
 class TaskPriority:
     """A task's priority as the later gates see it; ``None`` always means unknown.
 
-    ``tier`` is the effective tier, ``PINNED`` exactly when ``pin_order`` is
-    set, and ``base_tier`` the tier with pins ignored. ``pinned`` says the
-    task's own override row is pinned; ``age_anchor`` is when the task first
-    became eligible.
+    ``tier`` is the effective tier and ``base_tier`` the tier with pins
+    ignored; :func:`read_task_priority` answers ``tier`` ``PINNED`` exactly
+    when ``pin_order`` is set. ``pinned`` says the task's own override row is
+    pinned; ``age_anchor`` is when the task first became eligible.
     """
 
     tier: str | None = None
@@ -54,6 +54,8 @@ def read_task_priority(lookup: TaskPriorityLookup | None, task_id: object) -> Ta
     the single guard that keeps a lookup from raising into its caller: a
     missing lookup, a raising one, or one answering anything but a
     ``TaskPriority`` all read as unknown, and so does a field of the wrong type.
+    A ``PINNED`` tier with no well-typed order reads as order 0, and an order
+    without the ``PINNED`` tier is dropped.
     """
     if lookup is None:
         return UNKNOWN_PRIORITY
@@ -63,13 +65,20 @@ def read_task_priority(lookup: TaskPriorityLookup | None, task_id: object) -> Ta
         return UNKNOWN_PRIORITY
     if not isinstance(found, TaskPriority):
         return UNKNOWN_PRIORITY
+    tier = found.tier if isinstance(found.tier, str) else None
     return TaskPriority(
-        tier=found.tier if isinstance(found.tier, str) else None,
+        tier=tier,
         pinned=found.pinned if isinstance(found.pinned, bool) else None,
         base_tier=found.base_tier if isinstance(found.base_tier, str) else None,
-        pin_order=found.pin_order if _is_plain_int(found.pin_order) else None,
+        pin_order=_pin_order_of(tier, found.pin_order),
         age_anchor=found.age_anchor if _is_aware_datetime(found.age_anchor) else None,
     )
+
+
+def _pin_order_of(tier: str | None, pin_order: int | None) -> int | None:
+    if tier != PINNED:
+        return None
+    return pin_order if _is_plain_int(pin_order) else 0
 
 
 def _is_plain_int(value: object) -> bool:
