@@ -303,6 +303,45 @@ class TestReconciliation:
             'inter_unit_gaps': 8,
         }
 
+    def test_each_residual_bucket_is_mixed_into_blank_prose_and_code(self) -> None:
+        # The preamble is the module docstring and two imports; the class's
+        # non-method lines are its class line, docstring, KIND and 9 blanks.
+        LineMix = concern_map.LineMix
+        assert dict(_measure().residual_mix) == {
+            'module_preamble': LineMix(blank=0, prose=1, code=2),
+            'class_non_method': LineMix(blank=9, prose=1, code=2),
+            'module_other': LineMix(blank=0, prose=0, code=0),
+            'inter_unit_gaps': LineMix(blank=8, prose=0, code=0),
+        }
+
+    def test_each_mix_sums_to_its_bucket(self) -> None:
+        cmap = _measure()
+        for bucket, mix in cmap.residual_mix.items():
+            assert mix.blank + mix.prose + mix.code == cmap.residual[bucket], bucket
+
+    def test_a_mix_that_does_not_sum_to_its_bucket_is_a_named_failure(self) -> None:
+        cmap = _measure()
+        short = {**cmap.residual_mix, 'class_non_method': concern_map.LineMix(9, 1, 1)}
+        with pytest.raises(concern_map.MetricsError) as excinfo:
+            concern_map.ConcernMap(
+                cmap.path, cmap.class_name, cmap.total_lines, cmap.units,
+                cmap.residual, short,
+            )
+        message = str(excinfo.value)
+        assert 'engine.py' in message
+        assert 'class_non_method' in message
+        assert '11' in message
+        assert '12' in message
+
+    def test_a_mix_missing_a_bucket_is_a_named_failure(self) -> None:
+        cmap = _measure()
+        partial = {k: v for k, v in cmap.residual_mix.items() if k != 'module_other'}
+        with pytest.raises(concern_map.MetricsError, match='module_other'):
+            concern_map.ConcernMap(
+                cmap.path, cmap.class_name, cmap.total_lines, cmap.units,
+                cmap.residual, partial,
+            )
+
     def test_a_top_level_statement_binding_no_name_is_module_other(self) -> None:
         source = (
             'import sys\n'
@@ -349,6 +388,7 @@ class TestFailures:
             with pytest.raises(dataclasses.FrozenInstanceError):
                 setattr(cmap, field.name, getattr(cmap, field.name))
         assert not isinstance(cmap.residual, MutableMapping)
+        assert not isinstance(cmap.residual_mix, MutableMapping)
 
 
 # ---------------------------------------------------------------------------
@@ -394,6 +434,44 @@ class TestEvaluatePartition:
         clusters = _report().clusters
         assert (clusters['A'].units, clusters['A'].lines, clusters['A'].prose_lines) == (3, 10, 0)
         assert clusters['C'].prose_lines == 3
+
+    def test_method_units_count_the_class_methods_in_each_cluster(self) -> None:
+        clusters = _report().clusters
+        assert {name: size.method_units for name, size in clusters.items()} == {
+            'A': 3, 'B': 3, 'C': 2,
+        }
+
+    def test_projected_lines_add_the_separators_a_moved_unit_takes_with_it(self) -> None:
+        # Class rate 9 blank separators / 8 methods; module rate 8 gap lines /
+        # 3 module units. A: ceil(3*9/8) = 4; B: ceil(3*9/8 + 8/3) = 7;
+        # C: ceil(2*9/8 + 2*8/3) = 8.
+        clusters = _report().clusters
+        assert {
+            name: size.projected_lines - size.lines for name, size in clusters.items()
+        } == {'A': 4, 'B': 7, 'C': 8}
+
+    def test_a_map_without_methods_has_a_zero_class_rate(self) -> None:
+        source = 'class Engine:\n    pass\n\n\nX = 1\n'
+        cmap = _measure(source)
+        (size,) = concern_map.evaluate_partition(cmap, {'all': ['X']}).clusters.values()
+        assert (size.method_units, size.lines, size.projected_lines) == (0, 1, 3)
+
+    def test_a_map_without_module_units_has_a_zero_module_rate(self) -> None:
+        source = (
+            'import os\n'
+            '\n'
+            '\n'
+            'class Engine:\n'
+            '    def first(self):\n'
+            '        return os.sep\n'
+            '\n'
+            '    def second(self):\n'
+            '        return 2\n'
+        )
+        cmap = _measure(source)
+        partition = {'all': ['Engine.first', 'Engine.second']}
+        (size,) = concern_map.evaluate_partition(cmap, partition).clusters.values()
+        assert (size.method_units, size.lines, size.projected_lines) == (2, 4, 5)
 
     def test_edges_count_cross_cluster_refs_with_a_sample_pair(self) -> None:
         edges = _report().edges
@@ -527,7 +605,9 @@ class TestJsonRendering:
         )
         assert code == 0
         partition = json.loads(out)['partition']
-        assert partition['clusters']['A'] == {'units': 3, 'lines': 10, 'prose_lines': 0}
+        assert partition['clusters']['A'] == {
+            'units': 3, 'method_units': 3, 'lines': 10, 'prose_lines': 0, 'projected_lines': 14,
+        }
         assert partition['edges']['A -> B'] == {
             'count': 1, 'sample': ['Engine.poll', 'Engine.helper_method'],
         }
