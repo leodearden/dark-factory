@@ -161,6 +161,7 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset({
     'write_triage.judge_provider',
     'write_triage.judge_model',
     'write_triage.judge_api_url',
+    'write_triage.judge_api_key',
     'write_triage.judge_timeout_seconds',
     'write_triage.judge_candidate_count',
     'write_triage.judge_reasoning_effort',

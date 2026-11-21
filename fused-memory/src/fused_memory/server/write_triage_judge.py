@@ -46,7 +46,11 @@ import logging
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeGuard, get_args
 
-from fused_memory.config.schema import JudgeReasoningEffort, WriteTriageConfig
+from fused_memory.config.schema import (
+    JudgeReasoningEffort,
+    WriteTriageConfig,
+    blank_means_inherit,
+)
 from fused_memory.routing.json_extract import extract_json
 from fused_memory.server.grouped_read import PARENT_ID_KEY
 
@@ -801,6 +805,18 @@ def resolve_judge_reasoning_effort(memory_service: Any) -> str | None:
     return None
 
 
+def _judge_override(memory_service: Any, attr: str) -> str | None:
+    """A judge-only override leaf, or None meaning INHERIT the provider's value.
+
+    The ``isinstance`` gate stays here because this runs on the write path,
+    where C1 forbids raising, and :func:`blank_means_inherit` takes only str.
+    """
+    value = _judge_attr(memory_service, attr)
+    if isinstance(value, str):
+        return blank_means_inherit(value)
+    return None
+
+
 def resolve_judge_api_url(memory_service: Any) -> str | None:
     """The judge's own endpoint, or None meaning INHERIT the provider's api_url.
 
@@ -809,10 +825,16 @@ def resolve_judge_api_url(memory_service: Any) -> str | None:
     empty ``base_url`` fails every call and reads as a judge outage rather
     than as the cleared leaf it is.
     """
-    value = _judge_attr(memory_service, 'judge_api_url')
-    if isinstance(value, str) and value.strip():
-        return value
-    return None
+    return _judge_override(memory_service, 'judge_api_url')
+
+
+def resolve_judge_api_key(memory_service: Any) -> str | None:
+    """The judge's own API key, or None meaning INHERIT the provider's api_key.
+
+    A blank key is never forwarded: ``AsyncOpenAI(api_key='')`` 401s every
+    call instead of falling back to the environment.
+    """
+    return _judge_override(memory_service, 'judge_api_key')
 
 
 # --- the LLM call ------------------------------------------------------------
