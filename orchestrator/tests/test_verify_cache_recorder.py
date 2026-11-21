@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shlex
@@ -19,10 +20,19 @@ from orchestrator.verify import (
     run_scoped_verification,
     run_verification,
 )
+from orchestrator.verify_cache.keys import UnitKey
 from orchestrator.verify_cache.modes import CacheMode
-from orchestrator.verify_cache.policy import LegResult
-from orchestrator.verify_cache.recorder import CacheRecord, LegRun
-from orchestrator.verify_evidence import Leg
+from orchestrator.verify_cache.policy import CacheDecision, Decision, LegResult
+from orchestrator.verify_cache.recorder import (
+    CacheRecord,
+    LegRun,
+    VerifyEvidenceRef,
+    consume_replayed,
+    record_greens,
+)
+from orchestrator.verify_cache.registry import Entry, Registry
+from orchestrator.verify_cache.replay import ReplayPlan, UnitDecision
+from orchestrator.verify_evidence import Leg, UnitOutcome, UnitTier, VerifyUnit, module_leg_unit
 from orchestrator.verify_runner import result_from_dict, result_to_dict
 
 _PROGRESS_COLUMN = 73
@@ -235,3 +245,322 @@ def _two_module_repo(root: Path) -> Path:
     ):
         subprocess.run(argv, cwd=root, check=True)
     return root
+
+
+# ---------------------------------------------------------------------------
+# Settling a verify's units against its replay plan, and recording its greens.
+
+_MERGE_ON = VerifyCacheConfig(merge_mode=CacheMode.ON)
+_MERGE_LOG = VerifyCacheConfig(merge_mode=CacheMode.LOG)
+
+
+def _key(unit_id: str, *, tier: UnitTier = UnitTier.MODULE, token: str = 'a') -> UnitKey:
+    spec = hashlib.sha256(unit_id.encode()).hexdigest()
+    return UnitKey.of(unit_id, tier, spec, [('spec', spec), ('tree:x', token)])
+
+
+def _decided(decision: Decision, entry: Entry | None = None, *, key: UnitKey | None = None) -> UnitDecision:
+    return UnitDecision(key, CacheDecision(decision, entry, f'{decision} because the test said so'))
+
+
+def _replay(
+    modules: dict[str, UnitDecision], *, tree: UnitDecision | None = None, modes: VerifyCacheConfig = _MERGE_ON,
+) -> ReplayPlan:
+    tree = tree or _decided(Decision.MISS, key=_key('tree', tier=UnitTier.TREE))
+    return ReplayPlan(role='merge', modes=modes, tree=tree, modules=modules)
+
+
+def _ran(unit_id: str, rc: int = 0) -> VerifyUnit:
+    module, leg = unit_id.removeprefix('module:').rsplit(':', 1)
+    return module_leg_unit(module, leg, rc)
+
+
+def _clean(leg: Leg, **overrides: Any) -> LegResult:
+    fields: dict[str, Any] = {
+        'leg': leg, 'rc': 0, 'timed_out': False, 'trivial': False, 'flake_suppressed': False,
+        'junit_tests': 2 if leg is Leg.TEST else None, 'collected': 2 if leg is Leg.TEST else None,
+        'never_cache': False, **overrides,
+    }
+    return LegResult(**fields)
+
+
+@pytest.fixture
+def registry(tmp_path: Path) -> Registry:
+    return Registry(tmp_path / 'verify_cache.db')
+
+
+async def _entry(registry: Registry, key: UnitKey, evidence: int = 7) -> Entry:
+    return await registry.record_green(key, evidence_event_id=evidence, run_id='r0', sha='s0')
+
+
+class TestSettle:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(('decision', 'rc', 'outcome', 'carries_evidence'), [
+        (Decision.WOULD_HIT, 0, UnitOutcome.WOULD_HIT, True),
+        (Decision.WOULD_HIT, 1, UnitOutcome.RAN_RED, True),
+        (Decision.UNAVAILABLE, 0, UnitOutcome.UNAVAILABLE, False),
+        (Decision.UNAVAILABLE, 1, UnitOutcome.RAN_RED, False),
+        (Decision.DISABLED, 0, UnitOutcome.UNAVAILABLE, False),
+        (Decision.DISABLED, 1, UnitOutcome.RAN_RED, False),
+        (Decision.MISS, 0, UnitOutcome.RAN_GREEN, False),
+        (Decision.MISS, 1, UnitOutcome.RAN_RED, False),
+    ])
+    async def test_a_unit_that_ran_settles_by_its_decision_and_its_run(
+        self, registry, decision, rc, outcome, carries_evidence,
+    ):
+        key = _key('module:alpha:test')
+        entry = await _entry(registry, key) if decision is Decision.WOULD_HIT else None
+        replay = _replay({'module:alpha:test': _decided(decision, entry, key=key)})
+        leg = LegRun('module:alpha:test', _clean(Leg.TEST, rc=rc))
+
+        units, record = replay.settle((_ran('module:alpha:test', rc),), (leg,))
+
+        unit = units[0]
+        assert unit.unit == 'module:alpha:test'
+        assert unit.outcome is outcome
+        assert unit.key == key.key
+        assert unit.reason == replay.modules['module:alpha:test'].decision.reason
+        assert unit.evidence_event_id == (entry.evidence_event_id if carries_evidence and entry else None)
+        assert unit.would_have_leaked is (decision is Decision.WOULD_HIT and rc != 0)
+        (recorded,) = record.units
+        assert (recorded.unit, recorded.key, recorded.leg, recorded.entry) == (unit, key, leg.leg, entry)
+
+    @pytest.mark.asyncio
+    async def test_a_hit_that_did_not_run_settles_as_a_cache_hit(self, registry):
+        key = _key('module:alpha:lint')
+        entry = await _entry(registry, key, evidence=41)
+        replay = _replay({'module:alpha:lint': _decided(Decision.HIT, entry, key=key)})
+
+        units, record = replay.settle((), ())
+
+        assert units[0] == VerifyUnit(
+            unit='module:alpha:lint', tier=UnitTier.MODULE, key=key.key, outcome=UnitOutcome.CACHE_HIT,
+            evidence_event_id=41, reason=replay.modules['module:alpha:lint'].decision.reason,
+        )
+        assert record.units[0].entry == entry
+        assert record.units[0].leg is None
+
+    def test_a_unit_outside_the_plan_passes_through_unkeyed(self):
+        replay = _replay({})
+        leg = LegRun('module:gamma:test', _clean(Leg.TEST))
+
+        units, record = replay.settle((_ran('module:gamma:test'),), (leg,))
+
+        assert units[0].outcome is UnitOutcome.RAN_GREEN
+        assert units[0].key is None
+        assert units[0].reason is not None
+        assert units[0].reason.startswith('not keyed: ')
+        assert record.units[0].leg == leg.leg
+
+    def test_the_tree_unit_settles_last_and_records_its_own_key(self):
+        tree_key = _key('tree', tier=UnitTier.TREE)
+        replay = _replay({}, tree=_decided(Decision.MISS, key=tree_key))
+
+        units, record = replay.settle((_ran('module:gamma:test'),), (LegRun('module:gamma:test', _clean(Leg.TEST)),))
+
+        assert units[-1].unit == 'tree'
+        assert units[-1].tier is UnitTier.TREE
+        assert units[-1].outcome is UnitOutcome.RAN_GREEN
+        assert record.tree is not None
+        assert record.tree.key == tree_key
+        assert (record.role, record.modes) == ('merge', _MERGE_ON)
+
+    def test_a_red_unit_makes_the_tree_red(self):
+        replay = _replay({}, tree=_decided(Decision.MISS, key=_key('tree', tier=UnitTier.TREE)))
+
+        units, _record = replay.settle((_ran('module:gamma:test', 1),), ())
+
+        assert units[-1].outcome is UnitOutcome.RAN_RED
+
+
+def _all_admitted() -> tuple[ReplayPlan, tuple[VerifyUnit, ...], tuple[LegRun, ...]]:
+    unit_ids = ('module:alpha:test', 'module:alpha:lint')
+    replay = _replay(
+        {unit_id: _decided(Decision.MISS, key=_key(unit_id)) for unit_id in unit_ids}, modes=_MERGE_LOG,
+    )
+    legs = (LegRun(unit_ids[0], _clean(Leg.TEST)), LegRun(unit_ids[1], _clean(Leg.LINT)))
+    return replay, tuple(_ran(unit_id) for unit_id in unit_ids), legs
+
+
+def _evidence(event_id: int = 11, *, passed: bool = True) -> VerifyEvidenceRef:
+    return VerifyEvidenceRef(event_id=event_id, run_id='r1', sha='merge-sha', passed=passed)
+
+
+async def _recorded(registry: Registry, *keys_: UnitKey) -> dict[str, Entry]:
+    view = await registry.view(keys_)
+    return {unit_id: entry for (unit_id, _key_digest), entry in view.entries.items()}
+
+
+class TestRecordGreens:
+    @pytest.mark.asyncio
+    async def test_only_admitted_units_are_recorded(self, registry):
+        unit_ids = ('module:alpha:test', 'module:alpha:lint', 'module:alpha:type', 'module:beta:test')
+        keys_ = {unit_id: _key(unit_id) for unit_id in unit_ids}
+        replay = _replay({unit_id: _decided(Decision.MISS, key=keys_[unit_id]) for unit_id in unit_ids})
+        legs = (
+            LegRun('module:alpha:test', _clean(Leg.TEST)),
+            LegRun('module:alpha:lint', _clean(Leg.LINT, rc=1)),
+            LegRun('module:alpha:type', _clean(Leg.TYPE, timed_out=True)),
+            LegRun('module:beta:test', _clean(Leg.TEST, collected=3)),
+        )
+        ran = (_ran(unit_ids[0]), _ran(unit_ids[1], 1), _ran(unit_ids[2]), _ran(unit_ids[3]))
+        _units, record = replay.settle(ran, legs)
+
+        outcome = await record_greens(registry, record, flake_suppressed=False, evidence=_evidence())
+
+        recorded = await _recorded(registry, *keys_.values())
+        assert set(recorded) == {'module:alpha:test'}
+        assert recorded['module:alpha:test'].evidence_event_id == 11
+        assert (recorded['module:alpha:test'].run_id, recorded['module:alpha:test'].sha) == ('r1', 'merge-sha')
+        assert outcome.reason
+
+    @pytest.mark.asyncio
+    async def test_a_never_cache_leg_is_not_recorded(self, registry):
+        key = _key('module:alpha:test')
+        replay = _replay({'module:alpha:test': _decided(Decision.MISS, key=key)})
+        legs = (LegRun('module:alpha:test', _clean(Leg.TEST, never_cache=True)),)
+        _units, record = replay.settle((_ran('module:alpha:test'),), legs)
+
+        await record_greens(registry, record, flake_suppressed=False, evidence=_evidence())
+
+        assert await _recorded(registry, key) == {}
+
+    @pytest.mark.asyncio
+    async def test_a_re_record_refreshes_the_one_row(self, registry):
+        replay, ran, legs = _all_admitted()
+        _units, record = replay.settle(ran, legs)
+
+        await record_greens(registry, record, flake_suppressed=False, evidence=_evidence(11))
+        await record_greens(registry, record, flake_suppressed=False, evidence=_evidence(12))
+
+        key = replay.modules['module:alpha:test'].key
+        assert key is not None
+        view = await registry.view([key])
+        assert [entry.evidence_event_id for entry in view.entries.values()] == [12]
+
+    @pytest.mark.asyncio
+    async def test_a_suppressed_flake_records_nothing(self, registry):
+        replay, ran, legs = _all_admitted()
+        _units, record = replay.settle(ran, legs)
+
+        await record_greens(registry, record, flake_suppressed=True, evidence=_evidence())
+
+        assert await _recorded(registry, *_keys_of(replay)) == {}
+
+    @pytest.mark.asyncio
+    async def test_a_replayed_unit_is_not_new_evidence(self, registry):
+        key = _key('module:alpha:lint')
+        entry = await _entry(registry, key, evidence=5)
+        replay = _replay({'module:alpha:lint': _decided(Decision.HIT, entry, key=key)})
+        _units, record = replay.settle((), ())
+
+        await record_greens(registry, record, flake_suppressed=False, evidence=_evidence(99))
+
+        assert (await _recorded(registry, key))['module:alpha:lint'].evidence_event_id == 5
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('passed', [True, False])
+    async def test_the_tree_is_recorded_only_over_a_passing_verdict(self, registry, passed):
+        replay, ran, legs = _all_admitted()
+        _units, record = replay.settle(ran, legs)
+
+        await record_greens(registry, record, flake_suppressed=False, evidence=_evidence(passed=passed))
+
+        assert replay.tree.key is not None
+        recorded = await _recorded(registry, replay.tree.key, *_keys_of(replay))
+        assert set(recorded) == ({'tree'} if passed else set()) | {'module:alpha:test', 'module:alpha:lint'}
+
+    @pytest.mark.asyncio
+    async def test_the_tree_is_not_recorded_beside_a_refused_unit(self, registry):
+        replay, ran, legs = _all_admitted()
+        refused = (legs[0], LegRun(legs[1].unit_id, _clean(Leg.LINT, timed_out=True)))
+        _units, record = replay.settle(ran, refused)
+
+        await record_greens(registry, record, flake_suppressed=False, evidence=_evidence())
+
+        assert replay.tree.key is not None
+        assert 'tree' not in await _recorded(registry, replay.tree.key)
+
+    @pytest.mark.asyncio
+    async def test_no_evidence_records_nothing_and_says_why(self, registry):
+        replay, ran, legs = _all_admitted()
+        _units, record = replay.settle(ran, legs)
+
+        outcome = await record_greens(registry, record, flake_suppressed=False, evidence=None)
+
+        assert outcome.recorded == ()
+        assert 'evidence' in outcome.reason
+        assert await _recorded(registry, *_keys_of(replay)) == {}
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_registry_is_an_outcome_not_an_exception(self, tmp_path):
+        db_path = tmp_path / 'garbage.db'
+        db_path.write_bytes(b'garbage, not sqlite' * 64)
+        replay, ran, legs = _all_admitted()
+        _units, record = replay.settle(ran, legs)
+
+        outcome = await record_greens(Registry(db_path), record, flake_suppressed=False, evidence=_evidence())
+
+        assert outcome.recorded == ()
+        assert str(db_path) in outcome.reason
+
+
+def _keys_of(replay: ReplayPlan) -> list[UnitKey]:
+    return [decided.key for decided in replay.modules.values() if decided.key is not None]
+
+
+class TestConsumeReplayed:
+    @pytest.mark.asyncio
+    async def test_the_live_entries_of_every_hit_are_consumed_for_the_landing(self, registry):
+        keys_ = {unit_id: _key(unit_id) for unit_id in ('module:alpha:test', 'module:alpha:lint')}
+        entries = {unit_id: await _entry(registry, key) for unit_id, key in keys_.items()}
+        replay = _replay({
+            unit_id: _decided(Decision.HIT, entries[unit_id], key=key) for unit_id, key in keys_.items()
+        })
+        _units, record = replay.settle((), ())
+
+        outcome = await consume_replayed(registry, record, landing_sha='land-1')
+
+        assert outcome.backs_every_hit
+        assert set(await registry.consumed_for('land-1')) == set(entries.values())
+
+    @pytest.mark.asyncio
+    async def test_an_evicted_hit_is_unbacked_and_nothing_is_consumed(self, registry):
+        keys_ = {unit_id: _key(unit_id) for unit_id in ('module:alpha:test', 'module:alpha:lint')}
+        entries = {unit_id: await _entry(registry, key) for unit_id, key in keys_.items()}
+        replay = _replay({
+            unit_id: _decided(Decision.HIT, entries[unit_id], key=key) for unit_id, key in keys_.items()
+        })
+        _units, record = replay.settle((), ())
+        await registry.evict_key(keys_['module:alpha:lint'].key, 'test eviction')
+
+        outcome = await consume_replayed(registry, record, landing_sha='land-1')
+
+        assert not outcome.backs_every_hit
+        assert outcome.unbacked == ('module:alpha:lint',)
+        assert await registry.consumed_for('land-1') == ()
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_registry_consumes_nothing(self, registry, tmp_path):
+        key = _key('module:alpha:test')
+        entry = await _entry(registry, key)
+        _units, record = _replay({'module:alpha:test': _decided(Decision.HIT, entry, key=key)}).settle((), ())
+        db_path = tmp_path / 'garbage.db'
+        db_path.write_bytes(b'garbage, not sqlite' * 64)
+
+        outcome = await consume_replayed(Registry(db_path), record, landing_sha='land-1')
+
+        assert not outcome.backs_every_hit
+        assert str(db_path) in outcome.reason
+
+    @pytest.mark.asyncio
+    async def test_a_record_without_a_hit_is_a_no_op(self, tmp_path):
+        replay, ran, legs = _all_admitted()
+        _units, record = replay.settle(ran, legs)
+        db_path = tmp_path / 'untouched.db'
+
+        outcome = await consume_replayed(Registry(db_path), record, landing_sha='land-1')
+
+        assert outcome.backs_every_hit
+        assert outcome.consumed == ()
+        assert not db_path.exists()
