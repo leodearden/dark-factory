@@ -3,7 +3,7 @@
 PRD task epsilon of plans/module-tagger-retirement-prd.md (decision 3). The
 census enumerates every task record carrying ``metadata.files_tagged_at`` — the
 stamp the retired module tagger left behind — across all six project corpora,
-and classifies each on three axes so DF 3113 P4a and DF 3427 can consume a
+and classifies each on three axes so the artifact's consumers can consume a
 machine-readable candidate set instead of a prose claim.
 
 NO TEST HERE ASSERTS A COUNT OR TASK ID DERIVED FROM THE LIVE DATABASES.
@@ -144,7 +144,7 @@ def _lock(timestamp: str, modules: tuple[str, ...], event_id: int = 1) -> ScopeE
 def test_classification_vocabulary_constants_have_exact_string_values():
     """(a) The seven labels are the artifact's public vocabulary.
 
-    DF 3113 P4a and DF 3427 will read these strings out of the committed JSON,
+    The artifact's consumers read these strings out of the committed JSON,
     so a rename is a breaking change to a consumer that cannot see this repo's
     constants. Pinning the literals here makes that breakage a failing test
     rather than a silently-unjoinable artifact.
@@ -290,7 +290,7 @@ def test_absent_evidence_is_explicitly_null_not_a_missing_key():
 # straight from metadata.files, which for a never-reconciled tagger-stamped
 # record IS the guess. A post-stamp lock is therefore an ECHO of the guess, not
 # evidence against it, and v1 was reporting the majority of live victims to
-# DF 3113 P4a / DF 3427 as already repaired.
+# the artifact's consumers as already repaired.
 #
 # Every input below is synthetic. The echo test is depth-INVARIANT by
 # construction: files_to_modules truncates each path to `depth` components, so
@@ -302,7 +302,7 @@ def test_absent_evidence_is_explicitly_null_not_a_missing_key():
 
 
 def test_lock_reconciled_is_a_third_axis_2_value_beside_the_two_v1_labels():
-    """(a) The two v1 labels KEEP their spellings — DF 3113 P4a and DF 3427
+    """(a) The two v1 labels KEEP their spellings — the artifact's consumers
     join on these strings out of the committed JSON, so renaming either would
     break a consumer that cannot see this module's constants. The new class is
     additive."""
@@ -1145,7 +1145,7 @@ def test_census_record_carries_every_field_a_consumer_joins_on(tmp_path):
 
     The merge signature is the audit's own verdict over this task's
     merge_finalized history — a second, independently derived piece of
-    evidence, in the vocabulary DF 3113 P4a and DF 3427 already consume.
+    evidence, in the vocabulary the artifact's consumers already consume.
     """
     root = _make_project(
         tmp_path,
@@ -1207,7 +1207,7 @@ def test_an_unread_event_log_degrades_loudly_not_into_a_clean_project(tmp_path, 
     postdates the stamp" is UNKNOWN, not measured — but every stamped record
     must still be reported, and the coverage block must say the event log was
     unreadable. Reporting the same rows with a silent clean verdict would tell
-    DF 3427 the tagger's guesses were never superseded, which is a claim this
+    a consumer the tagger's guesses were never superseded, which is a claim this
     run did not make. The merge verdict is the audit's EVENT_LOG_UNREAD, never
     NO_MERGE_EVENT, which claims a READ log holds no merge_finalized (INV-13)."""
     root = _make_project(
@@ -1473,7 +1473,7 @@ def test_params_says_how_the_artifact_was_produced(tmp_path):
 
 
 def test_zero_valued_classification_cells_are_present_not_omitted(tmp_path):
-    """(c) A MISSING key must not be readable as a zero. DF 3427 will read the
+    """(c) A MISSING key must not be readable as a zero. A consumer reads the
     live-victim cell straight out of this artifact; if the cell vanished when
     it hit zero, "no victims" and "the schema changed" would look identical."""
     report = build_report([_census(tmp_path, tasks=[_stamped(1, status="pending")])])
