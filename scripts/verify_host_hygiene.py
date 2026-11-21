@@ -10,6 +10,7 @@ hygiene (leo-laptop, task 7269)".
 from __future__ import annotations
 
 import argparse
+import contextlib
 import fcntl
 import math
 import os
@@ -19,7 +20,7 @@ import stat
 import subprocess
 import sys
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -240,6 +241,14 @@ def lane_lock_path(worktree: Path) -> Path:
     return worktree.with_name(worktree.name + ".lock")
 
 
+def try_lock_exclusive(fd: int) -> bool:
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return False
+    return True
+
+
 def lock_is_held(lock: Path) -> bool:
     """Probe an existing lane lock without ever creating one."""
     try:
@@ -249,12 +258,21 @@ def lock_is_held(lock: Path) -> bool:
     except OSError:
         return True
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return not try_lock_exclusive(fd)
+    finally:
+        os.close(fd)
+
+
+@contextlib.contextmanager
+def held_lane_lock(lock: Path) -> Iterator[bool]:
+    """Hold *lock*, created if absent, across the block; False when anyone else holds it."""
+    try:
+        fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o644)
     except OSError:
-        return True
-    else:
-        fcntl.flock(fd, fcntl.LOCK_UN)
-        return False
+        yield False
+        return
+    try:
+        yield try_lock_exclusive(fd)
     finally:
         os.close(fd)
 
@@ -359,6 +377,48 @@ def report_worktree(candidate: Candidate, facts: RepoFacts, min_age_seconds: flo
     return Verdict(candidate, Action.KEEP, reason)
 
 
+def remove_worktree(candidate: Candidate, facts: RepoFacts) -> None:
+    """git removes what it tracks (refusing a dirty task worktree); rmtree the rest."""
+    path = Path(candidate.target)
+    registration = facts.registrations.get(path)
+    if registration is None or registration.prunable:
+        shutil.rmtree(path)
+    elif candidate.kind is Kind.MERGE_WORKTREE:
+        git(facts.repo, "worktree", "remove", "--force", str(path))
+    else:
+        git(facts.repo, "worktree", "remove", str(path))
+    if os.path.lexists(path):
+        raise OSError(f"{path} still exists after removal")
+
+
+def reclaim_worktree(candidate: Candidate, facts: RepoFacts, min_age_seconds: float) -> Verdict:
+    """Acquire-then-remove under the lane lock, the remove_merge_worktree_guarded discipline."""
+    path = Path(candidate.target)
+    lock = lane_lock_path(path)
+    with held_lane_lock(lock) as held:
+        if not held:
+            return Verdict(candidate, Action.KEEP, Reason.LOCK_HELD)
+        reason = classify_worktree(worktree_facts(
+            candidate, facts, lock_held=False, min_age_seconds=min_age_seconds))
+        if reason is not Reason.STALE:
+            return Verdict(candidate, Action.KEEP, reason)
+        size = tree_bytes(path)
+        try:
+            remove_worktree(candidate, facts)
+        except (GitFailed, OSError) as exc:
+            print(f"{PROG}: could not remove {path}: {exc}", file=sys.stderr)
+            return Verdict(candidate, Action.FAILED, reason, size)
+        lock.unlink(missing_ok=True)
+        return Verdict(candidate, Action.RECLAIMED, reason, size)
+
+
+def prune_registry(repo: Path) -> None:
+    try:
+        git(repo, "worktree", "prune")
+    except GitFailed as exc:
+        print(f"{PROG}: {exc}", file=sys.stderr)
+
+
 # --- per-repo pass ----------------------------------------------------------
 
 @dataclass(frozen=True)
@@ -381,16 +441,19 @@ class RepoReport:
 
 
 def repo_pass(repo: Path, kinds: frozenset[Kind], cwds: frozenset[Path],
-              min_age_seconds: float) -> RepoReport:
+              min_age_seconds: float, apply: bool) -> RepoReport:
     free_before = shutil.disk_usage(repo).free
     facts = RepoFacts(repo=repo, registrations=registrations(repo),
                       pgid_records=pgid_records(repo / WORKTREE_BASE_NAME), cwds=cwds)
-    verdicts = tuple(report_worktree(candidate, facts, min_age_seconds)
+    judge = reclaim_worktree if apply else report_worktree
+    verdicts = tuple(judge(candidate, facts, min_age_seconds)
                      for candidate in worktree_candidates(facts.base, kinds))
+    if apply:
+        prune_registry(repo)
     return RepoReport(
         repo=repo, verdicts=verdicts, pgid_total=len(facts.pgid_records),
         pgid_dead=sum(not record.live for record in facts.pgid_records),
-        free_before=free_before, free_after=None)
+        free_before=free_before, free_after=shutil.disk_usage(repo).free if apply else None)
 
 
 def checkout_toplevel(repo: Path) -> Path | None:
@@ -437,7 +500,8 @@ def run_local(ns: argparse.Namespace) -> int:
                 return EXIT_USAGE
             repos.append(toplevel)
     cwds = process_cwds()
-    reports = [repo_pass(repo, kinds, cwds, ns.min_age_hours * 3600) for repo in repos]
+    reports = [repo_pass(repo, kinds, cwds, ns.min_age_hours * 3600, ns.apply)
+               for repo in repos]
     verdicts = [verdict for report in reports for verdict in report.verdicts]
     for verdict in sorted(verdicts, key=lambda v: (v.candidate.kind, v.candidate.target)):
         print(verdict.line())
