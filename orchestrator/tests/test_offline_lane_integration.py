@@ -847,8 +847,9 @@ def test_every_composing_caller_carries_a_timeout_override() -> None:
     ``test_b2_coalesces_burst_of_advances_to_one_rerun`` is the only member:
     it starts `_run_lane(expected_passes=2)` via `asyncio.create_task` and
     then awaits `runner.wait_entered()` — those two bounded waits race the
-    SAME wall clock (max, not sum). The other, b1, drives exactly one
-    `_run_one_lane_pass` call.
+    SAME wall clock (max, not sum). The others, b1 and
+    ``test_a_pass_that_raises_fails_its_drive_with_its_own_exception``, each
+    drive exactly one `_run_one_lane_pass` call.
 
     Correlation between a marker and a SPECIFIC test's value is done via
     `fn.pytestmark` introspection — pytest's own applied-marker list for a
@@ -938,6 +939,7 @@ def test_every_composing_caller_carries_a_timeout_override() -> None:
         f'test.'
     )
     single_pass_exempt = {
+        test_a_pass_that_raises_fails_its_drive_with_its_own_exception,
         test_b1_advance_triggers_from_head_run,
         test_b2_coalesces_burst_of_advances_to_one_rerun,
     }
@@ -1401,6 +1403,27 @@ async def test_out_of_bound_spawn_counts_are_measured_not_asserted(
         f"(and the infra module's mirror, "
         f'test_ib2_infra_run_in_flight_never_gates_merge).'
     )
+
+
+# ---------------------------------------------------------------------------
+# Lane drive harness — a pass that raises fails its drive with its own exception
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_pass_that_raises_fails_its_drive_with_its_own_exception(harness, git_ops, repo, tmp_path):
+    """A pass that raises surfaces at once with its own exception, never as a
+    drive timeout nor as a retry after ``run()``'s fail-open backoff."""
+
+    async def _raising_suite_runner(wt, head, threads):
+        raise RuntimeError('detect seam raised')
+
+    worker = _build_worker(git_ops, tmp_path, suite_runner=_raising_suite_runner)
+    _wire_lane(harness, worker)
+    await _drive_advance(harness, repo)
+
+    with pytest.raises(RuntimeError, match='detect seam raised'):
+        await _run_one_lane_pass(worker)
 
 
 # ---------------------------------------------------------------------------
