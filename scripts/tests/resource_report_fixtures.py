@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import Collection, Mapping
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -38,19 +38,15 @@ _INSERT = (
 )
 
 
+HOLD_SAMPLE = PsiSample(cpu_some10=57.34, mem_some10=9.57, mem_full10=3.7, io_some10=10.25, read_ok=True)
+"""The PSI sample every fixture hold carries, its own cgroup aside."""
+
+
 def memory_hold(
     at: datetime, own_cgroup: str, *, arm: str = 'mem_full_avg10', task_id: str = '5653'
 ) -> dict[str, Any]:
     """A ``dispatch_deferred`` event for ``make_runs_db``, deferred by *arm* at *at*."""
-    sample = PsiSample(
-        cpu_some10=57.34,
-        mem_some10=9.57,
-        mem_full10=3.7,
-        io_some10=10.25,
-        read_ok=True,
-        own_cgroup=own_cgroup,
-        own_read_ok=bool(own_cgroup),
-    )
+    sample = replace(HOLD_SAMPLE, own_cgroup=own_cgroup, own_read_ok=bool(own_cgroup))
     return {
         'timestamp': at.isoformat(),
         'event_type': 'dispatch_deferred',
@@ -85,20 +81,25 @@ def write_collection(
     *,
     unreadable: Collection[Consumer] = frozenset(),
     reclaim: Mapping[ReclaimThreadKind, float] | None = None,
+    after_gap: bool = False,
 ) -> None:
     """One consumer collection at *ts*; stall figures are given in seconds, as stored.
 
     Every consumer named, in *consumers* or *unreadable*, gets a readability
     row: 0 when it is in *unreadable*, else 1. Each *reclaim* thread kind's CPU
-    increment (µs) is a host-level row.
+    increment (µs) is a host-level row. *after_gap* writes the collection as
+    the sampler writes the one after a gap, its first included: every
+    consumer flagged unreadable (D3); give it gauges only.
     """
     rows: list[tuple[int, str, float, str | None]] = []
+    named = {*consumers, *unreadable}
+    flagged = named if after_gap else unreadable
 
     def add(spec: MetricSpec, value: float, leaf: str | None) -> None:
         rows.append((ts, spec.name, float(value), leaf))
 
-    for consumer in {*consumers, *unreadable}:
-        add(READ_OK, 0 if consumer in unreadable else 1, encode_consumer(consumer))
+    for consumer in named:
+        add(READ_OK, 0 if consumer in flagged else 1, encode_consumer(consumer))
     for consumer, figures in consumers.items():
         for figure, value in figures.items():
             add(FIGURE_METRICS[figure].spec, value, encode_consumer(consumer))

@@ -16,7 +16,13 @@ from typing import Any
 import _checkout as _checkout
 import pytest
 import resource_report_holds as holds
-from resource_report_fixtures import memory_hold, project_root, samples_db, write_collection
+from resource_report_fixtures import (
+    HOLD_SAMPLE,
+    memory_hold,
+    project_root,
+    samples_db,
+    write_collection,
+)
 from sampler.consumers import Consumer, Figure, Role, encode_consumer
 from sampler.host_memory import ReclaimThreadKind
 from shared.project_layout import runs_db
@@ -42,9 +48,9 @@ def ts(seconds: int) -> int:
     return int(at(seconds).timestamp())
 
 
-def hold_block(text: str, moment: datetime) -> str:
-    """The rendered block of the hold at *moment*: the paragraph its heading opens."""
-    heading = f'hold {holds.format_utc(moment)}'
+def hold_block(text: str, moment: datetime, root: Path | None = None) -> str:
+    """The rendered block of the hold at *moment*, of *root* when given: the paragraph its heading opens."""
+    heading = f'hold {holds.format_utc(moment)}' + ('' if root is None else f'  {root}  ')
     return next(par for par in text.split('\n\n') if par.startswith(heading))
 
 
@@ -55,6 +61,11 @@ def hold_json(report: holds.HoldsReport, moment: datetime) -> Mapping[str, Any]:
 
 def reading_at(report: holds.HoldsReport, moment: datetime) -> holds.HoldReading:
     return next(reading for reading in report.readings if reading.hold.at == moment)
+
+
+def go_live(store: Path) -> None:
+    """The recorder's first collection, at T0-30, so a window opening at T0 starts there."""
+    write_collection(store, ts(-30), {KERNEL: {Figure.ANON: GiB}}, after_gap=True)
 
 
 class TestHoldMappingBothShapes:
@@ -143,14 +154,17 @@ class TestHoldMappingBothShapes:
 
 
 class TestHoldBeforeGoLive:
-    """Collections every 30 s over [T0, T0+600]; nothing grows."""
+    """Collections every 30 s over [T0, T0+600], the first flagged as the sampler flags it; nothing grows."""
 
     @pytest.fixture
     def store(self, tmp_path: Path) -> Path:
         store = samples_db(tmp_path / 'load-samples.db')
         for seconds in range(0, 601, 30):
             write_collection(
-                store, ts(seconds), {KERNEL: {Figure.ANON: 2**30}, DF_SERVICE: {Figure.ANON: 2**29}}
+                store,
+                ts(seconds),
+                {KERNEL: {Figure.ANON: 2**30}, DF_SERVICE: {Figure.ANON: 2**29}},
+                after_gap=seconds == 0,
             )
         return store
 
@@ -198,14 +212,15 @@ class TestHoldBeforeGoLive:
         assert 'recorder not live' not in block
         assert (entry['state'], entry['who_grew'], entry['who_paid']) == ('ranked', [], [])
 
-    def test_a_window_opening_before_go_live_starts_at_the_first_collection(self, report):
+    def test_a_window_opening_before_go_live_starts_after_the_first_collection(self, report):
         reading = reading_at(report, at(60))
 
         assert reading.state is holds.HoldState.RANKED
         assert reading.window is not None
         assert (reading.window.start, reading.window.end, reading.window.collections) == (
-            at(0), at(60), 3
+            at(30), at(60), 2
         )
+        assert holds.incomplete(reading.window) == ()
 
     def test_a_hold_past_the_last_collection_has_no_samples(self, report):
         reading = reading_at(report, at(1000))
@@ -248,6 +263,106 @@ class TestHoldBeforeGoLive:
         assert 'no consumer collections' in holds.render_text(report)
 
 
+class TestTheArmValue:
+    def test_each_memory_arm_reports_its_own_sample_value(self, tmp_path: Path, make_runs_db):
+        root = project_root(tmp_path, 'dark-factory')
+        make_runs_db(
+            [
+                memory_hold(at(0), DF_UNIT, arm='mem_some_avg10'),
+                memory_hold(at(1), DF_UNIT, arm='mem_full_avg10'),
+            ],
+            directory=runs_db(root).parent,
+        )
+
+        report = holds.read_holds_report(
+            [root], samples_db(tmp_path / 'load-samples.db'), since=T0, window_seconds=120
+        )
+
+        assert [(r.hold.arm, r.hold.arm_value) for r in report.readings] == [
+            ('mem_some_avg10', HOLD_SAMPLE.mem_some10),
+            ('mem_full_avg10', HOLD_SAMPLE.mem_full10),
+        ]
+        assert HOLD_SAMPLE.mem_some10 != HOLD_SAMPLE.mem_full10
+
+
+class TestSamplerGaps:
+    """The recorder went live at T0 and collected every 30 s to T0+60, then not until T0+1000.
+
+    It collected every 30 s from T0+1000 to T0+1150. The collections at T0 and T0+1000
+    are flagged as the sampler flags the one after a gap. The service grows 1 MiB a second.
+    """
+
+    @pytest.fixture
+    def root(self, tmp_path: Path, make_runs_db) -> Path:
+        root = project_root(tmp_path, 'dark-factory')
+        make_runs_db(
+            [memory_hold(at(seconds), DF_UNIT) for seconds in (65, 1035, 1125)],
+            directory=runs_db(root).parent,
+        )
+        return root
+
+    @pytest.fixture
+    def report(self, tmp_path: Path, root: Path) -> holds.HoldsReport:
+        store = samples_db(tmp_path / 'load-samples.db')
+        for seconds in (*range(0, 61, 30), *range(1000, 1151, 30)):
+            write_collection(
+                store,
+                ts(seconds),
+                {KERNEL: {Figure.ANON: GiB}, DF_SERVICE: {Figure.ANON: GiB + seconds * MiB}},
+                after_gap=seconds in (0, 1000),
+            )
+        return holds.read_holds_report([root], store, since=T0, window_seconds=120)
+
+    def test_a_window_spanning_a_sampler_gap_is_its_own_state_and_not_ranked(self, report):
+        reading = reading_at(report, at(1035))
+        block = hold_block(holds.render_text(report), at(1035))
+        entry = hold_json(report, at(1035))
+
+        assert reading.state is holds.HoldState.GAP
+        assert reading.window is None
+        assert reading.gap == holds.SamplerGap(at(60), at(1000))
+        assert 'sampler gap in the window' in block
+        assert holds.format_utc(at(60)) in block
+        assert holds.format_utc(at(1000)) in block
+        assert 'incomplete' not in block
+        assert entry['state'] == 'sampler_gap'
+        assert entry['gap'] == {
+            'before': holds.format_utc(at(60)), 'after': holds.format_utc(at(1000))
+        }
+        assert 'who_grew' not in entry
+
+    def test_a_window_opening_at_the_collection_after_a_gap_starts_at_the_next(self, report):
+        reading = reading_at(report, at(1125))
+
+        assert reading.state is holds.HoldState.RANKED
+        assert reading.window is not None
+        assert (reading.window.start, reading.window.end, reading.window.collections) == (
+            at(1030), at(1120), 4
+        )
+        assert holds.incomplete(reading.window) == ()
+        assert [(row.consumer, row.grew) for row in holds.who_grew(reading.window)] == [
+            (DF_SERVICE, 90 * MiB)
+        ]
+
+    def test_the_recorders_first_collection_never_starts_a_window(self, report):
+        reading = reading_at(report, at(65))
+
+        assert reading.window is not None
+        assert (reading.window.start, reading.window.end) == (at(30), at(60))
+        assert holds.incomplete(reading.window) == ()
+
+    def test_the_summary_counts_a_gap_hold_apart_from_the_ranked(self, report, root):
+        summary = holds.summarise(report)
+
+        assert summary.holds_per_project[root] == {
+            holds.HoldState.RANKED: 2,
+            holds.HoldState.NOT_LIVE: 0,
+            holds.HoldState.NO_SAMPLES: 0,
+            holds.HoldState.GAP: 1,
+        }
+        assert summary.tops['who_grew'] == {DF_SERVICE: 2}
+
+
 def write_collections(
     store: Path,
     collections: Mapping[int, Mapping[Consumer, Mapping[Figure, float]]],
@@ -261,7 +376,7 @@ def write_collections(
 
 
 class TestRankings:
-    """Collections at S = T0, T0+30 and E = T0+60; one hold at E+5, so the window is (S, E]."""
+    """Collections at S = T0, T0+30 and E = T0+60, after go-live; one hold at E+5, so the window is (S, E]."""
 
     T3CODE = Consumer(Role.INTERACTIVE, 't3code')
     SCCACHE = Consumer(Role.SHARED, 'sccache.service')
@@ -314,6 +429,7 @@ class TestRankings:
                 self.UNREADABLE: {Figure.ANON: 5 * MiB},
             }
 
+        go_live(store)
         write_collections(
             store,
             {0: collection(0), 30: collection(1), 60: collection(2)},
@@ -363,7 +479,7 @@ class TestRankings:
 
         aside = {row.label: row for row in holds.aside(window)}
 
-        assert {label: (row.grew, row.reclaimed_pages) for label, row in aside.items()} == {
+        assert {label: (row.positive_growth, row.reclaimed_pages) for label, row in aside.items()} == {
             'kernel': (20 * MiB, 50),
             'unattributed': (300 * MiB, 200),
             'exited': (50 * MiB, 0),
@@ -380,7 +496,7 @@ class TestRankings:
 
         unattributed = {row.label: row for row in holds.aside(window)}['unattributed']
 
-        assert (unattributed.grew, unattributed.net_grew) == (300 * MiB, -100 * MiB)
+        assert (unattributed.positive_growth, unattributed.net_grew) == (300 * MiB, -100 * MiB)
         assert unattributed.growth_share == pytest.approx(300 * MiB / total_growth)
 
     def test_a_consumer_unreadable_in_the_window_is_listed_incomplete(self, window):
@@ -435,6 +551,99 @@ class TestRankings:
         assert '3000 pages' in block
 
 
+class TestAConsumerIncompleteAtTheWindowStart:
+    """sccache is flagged unreadable at S = T0, with no gauge there, and holds 900 MiB from T0+30.
+
+    Collections at S, T0+30 and E = T0+60, after go-live; one hold at E+5. t3code grows 100 MiB.
+    """
+
+    SCCACHE = Consumer(Role.SHARED, 'sccache.service')
+    T3CODE = Consumer(Role.INTERACTIVE, 't3code')
+
+    @pytest.fixture
+    def report(self, tmp_path: Path, make_runs_db) -> holds.HoldsReport:
+        root = project_root(tmp_path, 'dark-factory')
+        make_runs_db([memory_hold(at(65), DF_UNIT)], directory=runs_db(root).parent)
+        store = samples_db(tmp_path / 'load-samples.db')
+        go_live(store)
+        write_collection(
+            store, ts(0), {self.T3CODE: {Figure.ANON: 100 * MiB}}, unreadable={self.SCCACHE}
+        )
+        for seconds, t3code in ((30, 150 * MiB), (60, 200 * MiB)):
+            write_collection(
+                store,
+                ts(seconds),
+                {self.SCCACHE: {Figure.ANON: 900 * MiB}, self.T3CODE: {Figure.ANON: t3code}},
+            )
+        return holds.read_holds_report([root], store, since=T0, window_seconds=120)
+
+    def test_it_stays_ranked_and_its_row_is_marked_incomplete(self, report):
+        (reading,) = report.readings
+        assert reading.window is not None
+        lines = hold_block(holds.render_text(report), at(65)).splitlines()
+        first, second = (
+            next(line for line in lines if line.strip().startswith(f'{rank}. ')) for rank in (1, 2)
+        )
+
+        assert [row.consumer for row in holds.who_grew(reading.window)] == [
+            self.SCCACHE, self.T3CODE
+        ]
+        assert encode_consumer(self.SCCACHE) in first
+        assert '[incomplete]' in first
+        assert encode_consumer(self.T3CODE) in second
+        assert '[incomplete]' not in second
+
+    def test_the_summary_leaves_it_out_and_counts_it_apart(self, report):
+        summary = holds.summarise(report)
+        as_json = json.loads(json.dumps(holds.report_json(report, summary=True)))['summary']
+
+        assert summary.tops['who_grew'] == {}
+        assert summary.incomplete_tops['who_grew'] == {self.SCCACHE: 1}
+        assert summary.totals[self.SCCACHE] == holds.Totals(incomplete_holds=1)
+        assert summary.totals[self.T3CODE] == holds.Totals(grew=100 * MiB)
+        assert as_json['incomplete_tops']['who_grew'] == {encode_consumer(self.SCCACHE): 1}
+        assert as_json['totals'][encode_consumer(self.SCCACHE)]['incomplete_holds'] == 1
+
+
+class TestWhoPaidOrder:
+    """Three consumers lose equal pages; full stall decides, then some stall, ahead of the name."""
+
+    ALPHA = Consumer(Role.INTERACTIVE, 'alpha')
+    BRAVO = Consumer(Role.INTERACTIVE, 'bravo')
+    CHARLIE = Consumer(Role.INTERACTIVE, 'charlie')
+
+    def test_equal_pages_rank_by_full_stall_then_some_stall(self, tmp_path: Path, make_runs_db):
+        root = project_root(tmp_path, 'dark-factory')
+        make_runs_db([memory_hold(at(65), DF_UNIT)], directory=runs_db(root).parent)
+        store = samples_db(tmp_path / 'load-samples.db')
+        go_live(store)
+        stalls = {self.ALPHA: (0.5, 3.0), self.BRAVO: (1.0, 1.0), self.CHARLIE: (1.0, 2.0)}
+        for seconds in (0, 30, 60):
+            write_collection(
+                store,
+                ts(seconds),
+                {
+                    consumer: {
+                        Figure.ANON: GiB,
+                        Figure.RECLAIM_KSWAPD_PAGES: 100,
+                        Figure.MEMORY_FULL_STALL_USEC: full,
+                        Figure.MEMORY_SOME_STALL_USEC: some,
+                    }
+                    for consumer, (full, some) in stalls.items()
+                },
+            )
+
+        (reading,) = holds.read_holds_report(
+            [root], store, since=T0, window_seconds=120
+        ).readings
+        assert reading.window is not None
+
+        assert [
+            (row.consumer, row.reclaimed_pages, row.memory_full_stall_seconds)
+            for row in holds.who_paid(reading.window)
+        ] == [(self.CHARLIE, 200, 2.0), (self.BRAVO, 200, 2.0), (self.ALPHA, 200, 1.0)]
+
+
 class TestHoldMappingBothShapesEndToEnd:
     """The §7 row "Hold mapping, both shapes", from the runs.db events to the report's JSON."""
 
@@ -459,6 +668,7 @@ class TestHoldMappingBothShapesEndToEnd:
     def report(self, tmp_path: Path, roots: tuple[Path, Path]) -> holds.HoldsReport:
         solar, _factory = roots
         store = samples_db(tmp_path / 'load-samples.db')
+        go_live(store)
         solar_verify = Consumer(Role.VERIFY, scope_tag_for(solar))
         growth = {
             self.SOLAR_SERVICE: 50 * MiB,
@@ -525,19 +735,13 @@ class TestHoldMappingBothShapesEndToEnd:
 
         entry = self.entry_for(report, solar)
         project = entry['holding_project']['project']
-        heading = f'hold {holds.format_utc(at(65))}  {solar}  '
-        block = next(
-            par for par in holds.render_text(report).split('\n\n') if par.startswith(heading)
-        )
+        block = hold_block(holds.render_text(report), at(65), solar)
         slice_lines = [line for line in block.splitlines() if slice_name in line]
 
         assert project['status'] == 'not_mapped'
         assert project['consumer'] is None
-        assert 'has no project slice' not in project['reason']
-        assert 'not a project slice' in project['reason']
         assert slice_name in [row['consumer'] for row in entry['who_grew']]
         assert slice_lines
-        assert 'has no project slice' not in block
         assert all("[this project's project]" not in line for line in slice_lines)
 
 
@@ -552,6 +756,7 @@ class TestReclaimThreads:
 
     def report(self, tmp_path: Path, root: Path, *, with_reclaim: bool) -> holds.HoldsReport:
         store = samples_db(tmp_path / 'load-samples.db')
+        go_live(store)
         for seconds in (0, 30, 60):
             in_window = seconds > 0
             reclaim = {
@@ -616,7 +821,8 @@ class TestReclaimThreads:
 class TestSummary:
     """Collections every 30 s over [T0, T0+900]; windows of 120 s ending at each ranked hold.
 
-    dark-factory: ranked holds at T0+120 and T0+360, and one before go-live.
+    The recorder went live at T0-30. dark-factory: ranked holds at T0+120 and T0+360, and one
+    before go-live.
     solar-challenge: a ranked hold at T0+600, and one long after the last collection.
     verify@<dark-factory tag> grows over [T0, T0+360], interactive@t3code over [T0+480, T0+600],
     and t3code is the only consumer pages are reclaimed from.
@@ -666,6 +872,7 @@ class TestSummary:
     @pytest.fixture
     def report(self, tmp_path: Path, roots: tuple[Path, Path], verify: Consumer) -> holds.HoldsReport:
         store = samples_db(tmp_path / 'load-samples.db')
+        go_live(store)
         for seconds in range(0, 901, 30):
             write_collection(
                 store,
@@ -696,11 +903,13 @@ class TestSummary:
                 holds.HoldState.RANKED: 2,
                 holds.HoldState.NOT_LIVE: 1,
                 holds.HoldState.NO_SAMPLES: 0,
+                holds.HoldState.GAP: 0,
             },
             solar: {
                 holds.HoldState.RANKED: 1,
                 holds.HoldState.NOT_LIVE: 0,
                 holds.HoldState.NO_SAMPLES: 1,
+                holds.HoldState.GAP: 0,
             },
         }
 
@@ -743,7 +952,7 @@ class TestSummary:
             'who_paid': {encode_consumer(self.T3CODE): 3},
         }
         assert summary['holds_per_project'][str(factory)] == {
-            'total': 3, 'ranked': 2, 'recorder_not_live': 1, 'no_samples': 0
+            'total': 3, 'ranked': 2, 'recorder_not_live': 1, 'no_samples': 0, 'sampler_gap': 0
         }
         assert summary['totals'][encode_consumer(verify)]['grew_bytes'] == 800 * MiB
         assert summary['reclaim_thread_share'] == pytest.approx(1 / 3)

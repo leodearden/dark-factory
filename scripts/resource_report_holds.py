@@ -16,9 +16,10 @@ import json
 import sqlite3
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 from datetime import UTC, datetime
 from enum import StrEnum
+from itertools import pairwise
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
@@ -33,7 +34,8 @@ from sampler.consumers import (
     encode_consumer,
     parse_consumer,
 )
-from sampler.metrics import FIGURE_METRICS, RECLAIM_METRICS, MetricSpec
+from sampler.increments import is_gap
+from sampler.metrics import FIGURE_METRICS, METRIC_GROUPS, RECLAIM_METRICS, MetricSpec
 from shared.project_layout import runs_db
 from shared.psi import ARM_FIELDS, PsiSample
 from shared.verify_scope_tag import scope_tag_for
@@ -53,6 +55,7 @@ __all__ = [
     'RANKINGS',
     'RootRead',
     'RootStatus',
+    'SamplerGap',
     'SamplesUnavailable',
     'Summary',
     'Totals',
@@ -294,13 +297,35 @@ def _readability(spec: MetricSpec) -> MetricSpec:
 _READ_OK = _readability(FIGURE_METRICS[Figure.ANON].spec)
 """Written for every consumer at every collection, the kernel included: the collection clock."""
 
+
+def _cadence(spec: MetricSpec) -> int:
+    (group,) = (group for group in METRIC_GROUPS if spec in group.metrics)
+    if group.due_seconds is None:
+        raise ImportError(f'{spec.name} is collected every tick: no collection interval')
+    return group.due_seconds
+
+
+_COLLECTION_INTERVAL = _cadence(_READ_OK)
+"""The consumer group's nominal interval, which D3's gap rule (``sampler.increments.is_gap``) reads."""
+
 _SAMPLES_TABLE_SQL = "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'samples'"
 _FIRST_SQL = 'SELECT MIN(ts) FROM samples WHERE metric = ?'
 _LAST_SQL = 'SELECT MAX(ts) FROM samples WHERE metric = ?'
 _LATEST_SQL = 'SELECT MAX(ts) FROM samples WHERE metric = ? AND ts <= ?'
+_PREVIOUS_SQL = 'SELECT MAX(ts) FROM samples WHERE metric = ? AND ts < ?'
+_CLOCK_SQL = 'SELECT DISTINCT ts FROM samples WHERE metric = ? AND ts BETWEEN ? AND ? ORDER BY ts'
 _WINDOW_SQL = 'SELECT ts, metric, leaf, value FROM samples WHERE metric IN ({}) AND ts BETWEEN ? AND ?'
 
 _Row = tuple[int, str, str | None, float]
+
+
+def _require_samples_table(conn: sqlite3.Connection, path: Path) -> None:
+    try:
+        found = conn.execute(_SAMPLES_TABLE_SQL).fetchone() is not None
+    except sqlite3.Error as exc:
+        raise SamplesUnavailable(f'samples store unreadable: {path} ({exc})') from exc
+    if not found:
+        raise SamplesUnavailable(f'samples store has no samples table: {path}')
 
 
 def _open_samples(path: Path) -> sqlite3.Connection:
@@ -308,11 +333,13 @@ def _open_samples(path: Path) -> sqlite3.Connection:
         raise SamplesUnavailable(f'samples store missing: {path}')
     try:
         conn = _read_only(path)
-        if conn.execute(_SAMPLES_TABLE_SQL).fetchone() is None:
-            conn.close()
-            raise SamplesUnavailable(f'samples store has no samples table: {path}')
     except sqlite3.Error as exc:
         raise SamplesUnavailable(f'samples store unreadable: {path} ({exc})') from exc
+    try:
+        _require_samples_table(conn, path)
+    except BaseException:
+        conn.close()
+        raise
     return conn
 
 
@@ -335,6 +362,13 @@ class _Samples:
     def latest_at_or_before(self, moment: float) -> int | None:
         return self._ts(_LATEST_SQL, _READ_OK.name, moment)
 
+    def previous(self, ts: int) -> int | None:
+        return self._ts(_PREVIOUS_SQL, _READ_OK.name, ts)
+
+    def collections(self, start: int, end: int) -> list[int]:
+        """The collections in [start, end], in order."""
+        return [ts for (ts,) in self._conn.execute(_CLOCK_SQL, (_READ_OK.name, start, end))]
+
     def rows(self, specs: Sequence[MetricSpec], start: int, end: int) -> list[_Row]:
         sql = _WINDOW_SQL.format(', '.join('?' * len(specs)))
         return self._conn.execute(sql, (*(spec.name for spec in specs), start, end)).fetchall()
@@ -349,12 +383,17 @@ class HoldState(StrEnum):
     RANKED = 'ranked'
     NOT_LIVE = 'recorder_not_live'
     NO_SAMPLES = 'no_samples'
+    GAP = 'sampler_gap'
 
 
 _STATE_TEXT: Mapping[HoldState, str] = MappingProxyType({
     HoldState.RANKED: 'ranked over the window',
     HoldState.NOT_LIVE: 'recorder not live at this hold',
-    HoldState.NO_SAMPLES: 'no samples: under two consumer collections in the window',
+    HoldState.NO_SAMPLES: (
+        'no samples: under two consumer collections in the window, '
+        'not counting one just after a gap'
+    ),
+    HoldState.GAP: 'sampler gap in the window, so it is not ranked',
 })
 
 
@@ -479,6 +518,14 @@ def _window(samples: _Samples, start: int, end: int) -> Window:
 
 
 @dataclass(frozen=True)
+class SamplerGap:
+    """Two consecutive collections D3 calls a gap: the later one carries no increments."""
+
+    before: datetime
+    after: datetime
+
+
+@dataclass(frozen=True)
 class HoldReading:
     hold: Hold
     mapping: HoldConsumers
@@ -486,26 +533,54 @@ class HoldReading:
     window: Window | None
     last_collection: datetime | None
     """The latest collection at or before the hold."""
+    gap: SamplerGap | None
+    """The sampler gap the window spans, for a GAP reading."""
+
+
+def _is_gap_collection(previous: int | None, ts: int) -> bool:
+    return is_gap(previous, ts, _COLLECTION_INTERVAL)
+
+
+def _spanned_gap(clock: Sequence[int]) -> SamplerGap | None:
+    return next(
+        (
+            SamplerGap(_utc(before), _utc(after))
+            for before, after in pairwise(clock)
+            if _is_gap_collection(before, after)
+        ),
+        None,
+    )
 
 
 def _read_hold(samples: _Samples, hold: Hold, window_seconds: int) -> HoldReading:
     """Read *hold* over the window ending at the latest collection at or before it.
 
-    The window starts at the latest collection at or before ``hold - window``,
+    The window opens at the latest collection at or before ``hold - window``,
     or at the first collection when the recorder went live inside the window.
+    A window spanning a sampler gap is not ranked, since the collection after
+    the gap carries no increments. A window never starts at a collection just
+    after a gap, the recorder's first included: D3 flags every consumer there,
+    so the window starts at the next one.
     """
     mapping = hold_consumers(hold.own_cgroup, hold.project_root)
     moment = hold.at.timestamp()
     end = samples.latest_at_or_before(moment)
     if end is None:
-        return HoldReading(hold, mapping, HoldState.NOT_LIVE, None, None)
+        return HoldReading(hold, mapping, HoldState.NOT_LIVE, None, None, None)
     opens = moment - window_seconds
     start = samples.latest_at_or_before(opens)
     if start is None:
         start = samples.first()
-    if start is None or end < opens or start == end:
-        return HoldReading(hold, mapping, HoldState.NO_SAMPLES, None, _utc(end))
-    return HoldReading(hold, mapping, HoldState.RANKED, _window(samples, start, end), _utc(end))
+    clock = [] if start is None or end < opens else samples.collections(start, end)
+    gap = _spanned_gap(clock)
+    if gap is not None:
+        return HoldReading(hold, mapping, HoldState.GAP, None, _utc(end), gap)
+    if clock and _is_gap_collection(samples.previous(clock[0]), clock[0]):
+        clock = clock[1:]
+    if len(clock) < 2:
+        return HoldReading(hold, mapping, HoldState.NO_SAMPLES, None, _utc(end), None)
+    window = _window(samples, clock[0], end)
+    return HoldReading(hold, mapping, HoldState.RANKED, window, _utc(end), None)
 
 
 # ---------------------------------------------------------------------------
@@ -558,7 +633,7 @@ class Aside:
 
     role: Role
     label: str
-    grew: float
+    positive_growth: float
     """The members' positive growth, on the same basis as ``total_positive_growth``."""
     net_grew: float
     """The members' growth net of any member that shrank."""
@@ -581,13 +656,13 @@ def aside(window: Window) -> tuple[Aside, ...]:
     rows = []
     for role, label in ASIDE_ROLES.items():
         members = [c for c in window.consumers.values() if c.consumer.role is role]
-        grew = sum(max(c.grew, 0.0) for c in members)
+        positive_growth = sum(max(c.grew, 0.0) for c in members)
         net_grew = sum(c.grew for c in members)
         reclaimed = sum(c.reclaimed_pages for c in members)
         rows.append(
             Aside(
-                role, label, grew, net_grew, reclaimed,
-                _share(grew, growth), _share(reclaimed, pages),
+                role, label, positive_growth, net_grew, reclaimed,
+                _share(positive_growth, growth), _share(reclaimed, pages),
             )
         )
     return tuple(rows)
@@ -714,19 +789,24 @@ def read_holds_report(
 
 @dataclass(frozen=True)
 class Totals:
-    """One consumer's figures summed over the ranked holds' windows."""
+    """One consumer's figures summed over the ranked holds' windows it was complete in."""
 
     grew: float = 0.0
     reclaimed_pages: float = 0.0
     memory_some_stall_seconds: float = 0.0
     memory_full_stall_seconds: float = 0.0
+    incomplete_holds: int = 0
+    """The ranked holds left out of the sums, the consumer being incomplete in their windows."""
 
     def plus(self, c: ConsumerWindow) -> Totals:
+        if not c.complete:
+            return replace(self, incomplete_holds=self.incomplete_holds + 1)
         return Totals(
             self.grew + c.grew,
             self.reclaimed_pages + c.reclaimed_pages,
             self.memory_some_stall_seconds + c.memory_some_stall_seconds,
             self.memory_full_stall_seconds + c.memory_full_stall_seconds,
+            self.incomplete_holds,
         )
 
 
@@ -736,7 +816,9 @@ class Summary:
 
     holds_per_project: Mapping[Path, Mapping[HoldState, int]]
     tops: Mapping[str, Mapping[Consumer, int]]
-    """Per ranking in ``RANKINGS``, how many ranked holds each consumer topped."""
+    """Per ranking in ``RANKINGS``, how many ranked holds each consumer topped while complete."""
+    incomplete_tops: Mapping[str, Mapping[Consumer, int]]
+    """Per ranking, the ranked holds whose top consumer was incomplete, by that consumer."""
     totals: Mapping[Consumer, Totals]
     aside_shares: Mapping[str, tuple[float | None, float | None]]
     """Per aside label, its share of the summed positive growth and of the summed pages."""
@@ -757,7 +839,7 @@ def _aside_shares(windows: Sequence[Window]) -> dict[str, tuple[float | None, fl
     pages = sum(total_reclaimed(window) for window in windows)
     return {
         label: (
-            _share(sum(row.grew for row in rows if row.label == label), growth),
+            _share(sum(row.positive_growth for row in rows if row.label == label), growth),
             _share(sum(row.reclaimed_pages for row in rows if row.label == label), pages),
         )
         for label in ASIDE_ROLES.values()
@@ -772,20 +854,32 @@ def _reclaim_thread_share(windows: Sequence[Window]) -> float | None:
     )
 
 
-def summarise(report: HoldsReport) -> Summary:
-    """The C2 summary, built from the readings' windows alone."""
-    windows = [reading.window for reading in report.readings if reading.window is not None]
-    tops = {
-        name: Counter(ranked[0].consumer for window in windows if (ranked := rank(window)))
+def _tops(windows: Sequence[Window], *, complete: bool) -> dict[str, Counter[Consumer]]:
+    return {
+        name: Counter(
+            ranked[0].consumer
+            for window in windows
+            if (ranked := rank(window)) and ranked[0].complete is complete
+        )
         for name, rank in RANKINGS.items()
     }
+
+
+def summarise(report: HoldsReport) -> Summary:
+    """The C2 summary, built from the ranked readings' windows alone.
+
+    A consumer incomplete in a window is left out of that window's tops and
+    totals, and counted apart, so a partial figure never reads as a whole one.
+    """
+    windows = [reading.window for reading in report.readings if reading.window is not None]
     totals: dict[Consumer, Totals] = {}
     for window in windows:
         for c in window.consumers.values():
             totals[c.consumer] = totals.get(c.consumer, Totals()).plus(c)
     return Summary(
         holds_per_project=_holds_per_project(report),
-        tops=tops,
+        tops=_tops(windows, complete=True),
+        incomplete_tops=_tops(windows, complete=False),
         totals=dict(sorted(totals.items(), key=lambda item: (-item[1].grew, item[0]))),
         aside_shares=_aside_shares(windows),
         reclaim_thread_share=_reclaim_thread_share(windows),
@@ -904,11 +998,18 @@ def _reclaim_threads(window: Window) -> str:
 
 def _aside_line(row: Aside, window: Window) -> str:
     line = (
-        f'  {row.label}: grew {_bytes(row.grew)} ({_percent(row.growth_share)} of growth, '
+        f'  {row.label}: grew {_bytes(row.positive_growth)} ({_percent(row.growth_share)} of growth, '
         f'net {_bytes(row.net_grew)}), '
         f'{_pages(row.reclaimed_pages)} reclaimed ({_percent(row.reclaim_share)} of pages)'
     )
     return f'{line}; {_reclaim_threads(window)}' if row.role is Role.KERNEL else line
+
+
+_INCOMPLETE_MARK = '  [incomplete]'
+
+
+def _completeness(c: ConsumerWindow) -> str:
+    return '' if c.complete else _INCOMPLETE_MARK
 
 
 def _ranks(row: ProjectConsumer) -> str:
@@ -926,16 +1027,24 @@ def _project_line(row: ProjectConsumer) -> str:
         return f'    {row.role.value}: {name} absent, no rows in the window'
     return (
         f'    {row.role.value}: {name} grew {_bytes(row.figures.grew)}, '
-        f'{_pages(row.figures.reclaimed_pages)}; {_ranks(row)}'
+        f'{_pages(row.figures.reclaimed_pages)}; {_ranks(row)}{_completeness(row.figures)}'
     )
 
 
-def _window_lines(mapping: HoldConsumers, window: Window) -> list[str]:
-    marks = {
+def _marks(mapping: HoldConsumers, window: Window) -> dict[Consumer, str]:
+    project = {
         consumer: f"  [this project's {role.value}]"
         for role, consumer in mapping.by_role().items()
         if consumer is not None
     }
+    return {
+        consumer: project.get(consumer, '') + _completeness(row)
+        for consumer, row in window.consumers.items()
+    }
+
+
+def _window_lines(mapping: HoldConsumers, window: Window) -> list[str]:
+    marks = _marks(mapping, window)
     unreadable = incomplete(window)
     return [
         f'  window {format_utc(window.start)} to {format_utc(window.end)}, '
@@ -964,25 +1073,31 @@ def _window_lines(mapping: HoldConsumers, window: Window) -> list[str]:
 def _hold_block(reading: HoldReading) -> list[str]:
     if reading.window is not None:
         return [_heading(reading.hold), *_window_lines(reading.mapping, reading.window)]
-    last = reading.last_collection
+    gap, last = reading.gap, reading.last_collection
+    between = (
+        '' if gap is None
+        else f'; no collection between {format_utc(gap.before)} and {format_utc(gap.after)}'
+    )
     after = '' if last is None else f'; the last collection was {format_utc(last)}'
-    return [_heading(reading.hold), f'  {_STATE_TEXT[reading.state]}{after}']
+    return [_heading(reading.hold), f'  {_STATE_TEXT[reading.state]}{between}{after}']
 
 
 def _state_counts(counts: Mapping[HoldState, int]) -> str:
     return ', '.join(f'{state.value} {count}' for state, count in counts.items())
 
 
-def _tops_line(name: str, tops: Mapping[Consumer, int]) -> str:
+def _tops_line(title: str, tops: Mapping[Consumer, int]) -> str:
     topped = ', '.join(f'{encode_consumer(c)} {n}' for c, n in Counter(tops).most_common())
-    return f'  times topping {name}: {topped or "none"}'
+    return f'  {title}: {topped or "none"}'
 
 
 def _totals_line(consumer: Consumer, totals: Totals) -> str:
+    left_out = totals.incomplete_holds
     return (
         f'    {encode_consumer(consumer)}  grew {_bytes(totals.grew)}, '
         f'{_pages(totals.reclaimed_pages)}, stall some {totals.memory_some_stall_seconds:.1f} s, '
         f'full {totals.memory_full_stall_seconds:.1f} s'
+        + (f"; {left_out} hold{'' if left_out == 1 else 's'} left out, incomplete" if left_out else '')
     )
 
 
@@ -996,7 +1111,11 @@ def _summary_lines(report: HoldsReport) -> list[str]:
             f'    {root}: {sum(counts.values())} ({_state_counts(counts)})'
             for root, counts in summary.holds_per_project.items()
         ),
-        *(_tops_line(name, tops) for name, tops in summary.tops.items()),
+        *(_tops_line(f'times topping {name}', tops) for name, tops in summary.tops.items()),
+        *(
+            _tops_line(f'times topping {name} while incomplete, left out above', tops)
+            for name, tops in summary.incomplete_tops.items()
+        ),
         '  totals per consumer over the ranked holds, by growth:',
         *(_totals_line(consumer, totals) for consumer, totals in summary.totals.items()),
         *(
@@ -1059,7 +1178,7 @@ def _figures_json(c: ConsumerWindow) -> dict[str, Any]:
 def _aside_json(row: Aside) -> dict[str, Any]:
     return {
         'label': row.label,
-        'grew_bytes': row.grew,
+        'positive_growth_bytes': row.positive_growth,
         'net_grew_bytes': row.net_grew,
         'reclaimed_pages': row.reclaimed_pages,
         'growth_share': row.growth_share,
@@ -1097,6 +1216,10 @@ def _window_json(mapping: HoldConsumers, window: Window) -> dict[str, Any]:
     }
 
 
+def _gap_json(gap: SamplerGap) -> dict[str, str]:
+    return {'before': format_utc(gap.before), 'after': format_utc(gap.after)}
+
+
 def _reading_json(reading: HoldReading) -> dict[str, Any]:
     hold = reading.hold
     entry: dict[str, Any] = {
@@ -1110,6 +1233,7 @@ def _reading_json(reading: HoldReading) -> dict[str, Any]:
         'mapping': _mapping_json(reading.mapping),
         'state': reading.state.value,
         'last_collection': _time_json(reading.last_collection),
+        'gap': None if reading.gap is None else _gap_json(reading.gap),
         'window': None,
     }
     if reading.window is not None:
@@ -1123,6 +1247,14 @@ def _totals_json(totals: Totals) -> dict[str, Any]:
         'reclaimed_pages': totals.reclaimed_pages,
         'memory_some_stall_seconds': totals.memory_some_stall_seconds,
         'memory_full_stall_seconds': totals.memory_full_stall_seconds,
+        'incomplete_holds': totals.incomplete_holds,
+    }
+
+
+def _tops_json(tops: Mapping[str, Mapping[Consumer, int]]) -> dict[str, dict[str, int]]:
+    return {
+        name: {encode_consumer(c): n for c, n in Counter(counts).most_common()}
+        for name, counts in tops.items()
     }
 
 
@@ -1132,10 +1264,8 @@ def _summary_json(summary: Summary) -> dict[str, Any]:
             str(root): {'total': sum(counts.values()), **{s.value: n for s, n in counts.items()}}
             for root, counts in summary.holds_per_project.items()
         },
-        'tops': {
-            name: {encode_consumer(c): n for c, n in Counter(tops).most_common()}
-            for name, tops in summary.tops.items()
-        },
+        'tops': _tops_json(summary.tops),
+        'incomplete_tops': _tops_json(summary.incomplete_tops),
         'totals': {encode_consumer(c): _totals_json(t) for c, t in summary.totals.items()},
         'aside_shares': {
             label: {'growth_share': growth, 'reclaim_share': pages}
