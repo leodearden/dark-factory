@@ -43,10 +43,11 @@ def _require_no_parent_component(path: PurePosixPath) -> None:
         raise ValueError(f"an archive path must not contain '..', got {str(path)!r}")
 
 
-def _require_outside_live_falkordb_dir(path: PurePosixPath) -> None:
-    if path.parts[: len(LIVE_FALKORDB_DIR.parts)] == LIVE_FALKORDB_DIR.parts:
+def _require_disjoint_from_live_falkordb_dir(path: PurePosixPath) -> None:
+    shared = min(len(path.parts), len(LIVE_FALKORDB_DIR.parts))
+    if path.parts[:shared] == LIVE_FALKORDB_DIR.parts[:shared]:
         raise ValueError(
-            "an archive path must not be at or under the live FalkorDB dir "
+            "an archive path must not be at, under, or above the live FalkorDB dir "
             f"{str(LIVE_FALKORDB_DIR)!r}, got {str(path)!r}"
         )
 
@@ -85,7 +86,7 @@ class ArchiveDir:
         posix_path = PurePosixPath(self.path)
         _require_relative_path(posix_path)
         _require_no_parent_component(posix_path)
-        _require_outside_live_falkordb_dir(posix_path)
+        _require_disjoint_from_live_falkordb_dir(posix_path)
         _require_dumps(self.path, self.dumps)
         _require_unique_dump_names(self.path, self.dumps)
 

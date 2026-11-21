@@ -35,7 +35,8 @@ migration scripts carry them instead:
   sha256, and fails verification if one is missing or altered.
 
 They are never copied into `fused-memory/data/falkordb`: they are archives, not
-a graph to load, and `ArchiveDir` refuses any path at or under that directory.
+a graph to load, and `ArchiveDir` refuses any path at, under, or above that
+directory.
 
 ## Checking them by hand
 
