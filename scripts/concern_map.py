@@ -743,15 +743,16 @@ def _is_partition(content: object) -> TypeGuard[dict[str, list[str]]]:
 
 
 def _load_partition(path: str) -> dict[str, list[str]]:
+    resolved = Path(path).absolute()
     try:
-        content = json.loads(Path(path).read_text(encoding='utf-8'))
+        content = json.loads(resolved.read_text(encoding='utf-8'))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise MetricsError(
-            f'{path}: could not be read as a partition -- {exc.__class__.__name__}: {exc}'
+            f'{resolved}: could not be read as a partition -- {exc.__class__.__name__}: {exc}'
         ) from exc
     if not _is_partition(content):
         raise MetricsError(
-            f'{path}: a partition is a JSON object mapping each cluster name to a '
+            f'{resolved}: a partition is a JSON object mapping each cluster name to a '
             'list of unit names'
         )
     return content
@@ -776,7 +777,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         '--partition',
-        help='A JSON object mapping each cluster name to its unit names; adds its report.',
+        help=(
+            'A JSON object mapping each cluster name to its unit names; adds its report. '
+            'A relative path resolves against the current directory, not --root.'
+        ),
     )
     parser.add_argument('--format', choices=('markdown', 'json'), default='markdown')
     parser.add_argument(

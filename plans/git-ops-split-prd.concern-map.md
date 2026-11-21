@@ -11,13 +11,15 @@ strata added to the rendering, and the `s5-split/main_park` cluster added to the
 ## Reproduction
 
 ```
+cd "$(git rev-parse --show-toplevel)"
 mkdir -p /tmp/git-ops-asof
 git archive c787af9409 orchestrator/src/orchestrator/git_ops.py | tar -x -C /tmp/git-ops-asof
 python3 scripts/concern_map.py orchestrator/src/orchestrator/git_ops.py --class GitOps \
   --root /tmp/git-ops-asof --partition plans/git-ops-split-prd.partition.json --format markdown
 ```
 
-The command prints everything below the rule, byte for byte. `--format json` gives the same
+The source path resolves against `--root`; the script and `--partition` paths resolve against the
+current directory, hence the `cd`. The command prints everything below the rule, byte for byte. `--format json` gives the same
 measurement as data.
 
 ## How the partition was built

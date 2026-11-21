@@ -836,6 +836,26 @@ class TestExitCodes:
         assert code == 2
         assert 'no-such-partition.json' in err
 
+    def test_a_relative_partition_resolves_against_the_current_directory_not_root(
+        self, capsys, engine_root, tmp_path, monkeypatch
+    ) -> None:
+        elsewhere = tmp_path / 'elsewhere'
+        elsewhere.mkdir()
+        (elsewhere / 'mine.json').write_text(json.dumps(PARTITION), encoding='utf-8')
+        monkeypatch.chdir(elsewhere)
+        code, _, _ = _run(capsys, engine_root, '--partition', 'mine.json')
+        assert code == 0
+
+    def test_an_unreadable_relative_partition_names_the_path_it_resolved_to(
+        self, capsys, engine_root, tmp_path, monkeypatch
+    ) -> None:
+        elsewhere = tmp_path / 'elsewhere'
+        elsewhere.mkdir()
+        monkeypatch.chdir(elsewhere)
+        code, _, err = _run(capsys, engine_root, '--partition', 'no-such-partition.json')
+        assert code == 2
+        assert str(elsewhere / 'no-such-partition.json') in err
+
     @pytest.mark.parametrize(
         'content',
         [
