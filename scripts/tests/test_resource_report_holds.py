@@ -21,8 +21,11 @@ from sampler.consumers import Consumer, Figure, Role, encode_consumer
 from sampler.host_memory import ReclaimThreadKind
 from shared.project_layout import runs_db
 from shared.verify_scope_tag import scope_tag_for
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
-APP = '/user.slice/user-1000.slice/user@1000.service/app.slice'
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
+
+APP ='/user.slice/user-1000.slice/user@1000.service/app.slice'
 DF_UNIT = f'{APP}/orchestrator-dark-factory.service'
 T0 = datetime(2026, 11, 21, 18, 0, tzinfo=UTC)
 KERNEL = Consumer(Role.KERNEL)

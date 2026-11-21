@@ -15,8 +15,11 @@ import pytest
 import resource_report
 from resource_report_fixtures import memory_hold, project_root, samples_db
 from shared.project_layout import runs_db
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
-NOW = datetime(2026, 11, 21, 21, 0, tzinfo=UTC)
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
+
+NOW =datetime(2026, 11, 21, 21, 0, tzinfo=UTC)
 DF_UNIT = '/user.slice/user-1000.slice/user@1000.service/app.slice/orchestrator-dark-factory.service'
 
 
