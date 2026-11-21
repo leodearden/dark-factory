@@ -127,10 +127,12 @@ import pathlib
 import re
 import subprocess
 import sys
+import tempfile
 import tomllib
 import types
 
 import pytest
+from host_pytest_temp_root import listing, seed_dead_session_dirs
 from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
 from packaging.version import Version
@@ -235,6 +237,22 @@ def {MAIN_THREAD_TEST}():
 @pytest.mark.parametrize('peer', range(6))
 def test_peer(peer):
     pass
+'''
+
+TEMPROOT_RECORDER_MODULE_NAME = 'test_temproot_recorder.py'
+TEMPROOT_RECORDER_TEST = 'test_records_the_temproot'
+TEMPROOT_RECORD_NAME = 'seen-temproot'
+
+_TEMPROOT_RECORDER_MODULE = f'''\
+import pathlib
+import tempfile
+
+import pytest
+
+
+@pytest.mark.timeout({NON_BLOCKING_TIMEOUT_SECS})
+def {TEMPROOT_RECORDER_TEST}():
+    pathlib.Path(__file__).with_name({TEMPROOT_RECORD_NAME!r}).write_text(tempfile.gettempdir())
 '''
 
 
@@ -488,6 +506,49 @@ def test_a_descendant_still_holding_the_probe_childs_output_does_not_hold_up_the
     assert wait_pid_gone(lingerer, timeout=30), (
         f'the lingering descendant {lingerer} is still running: the probe\'s '
         'process group must not outlive the run.'
+    )
+
+
+@pytest.mark.xdist_group(TIMEOUT_METHOD_PROBE_GROUP)
+def test_a_probe_suite_run_leaves_the_hosts_default_temp_root_untouched(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    host = tmp_path / 'host-temp'
+    seed_dead_session_dirs(host)
+    before = listing(host)
+    # The child's PYTEST_* is scrubbed, so TMPDIR is the only channel to its
+    # temp root. Pin this process's cached tempdir first: run_process_group
+    # opens temp files here, and they must not land in the stand-in.
+    monkeypatch.setattr(tempfile, 'tempdir', tempfile.gettempdir())
+    monkeypatch.setenv('TMPDIR', str(host))
+    suite = _write_probe_suite(tmp_path, SIGNAL_METHOD)
+    (suite.root / TEMPROOT_RECORDER_MODULE_NAME).write_text(
+        _TEMPROOT_RECORDER_MODULE, encoding='utf-8',
+    )
+
+    result = _run_probe_suite(suite, '-k', TEMPROOT_RECORDER_TEST)
+
+    assert result.returncode == pytest.ExitCode.OK, (
+        f'the recorder probe exited {result.returncode}, not '
+        f'{int(pytest.ExitCode.OK)} (OK).\n{_captured(result)}'
+    )
+    seen = pathlib.Path((suite.root / TEMPROOT_RECORD_NAME).read_text(encoding='utf-8'))
+    assert seen.resolve() == host.resolve(), (
+        f'the child ran against temp root {seen}, not the stand-in {host}, so '
+        'the listing check below would pass vacuously.\n'
+        f'{_captured(result)}'
+    )
+    after = listing(host)
+    assert after == before, (
+        "a probe session must not create, lock or clean dirs in the host's "
+        "default pytest temp root: its exit-time sweep of other sessions' dead "
+        'dirs runs outside pytest-timeout and counts against the probe budget.\n'
+        f'before: {before}\nafter:  {after}\n'
+        f'{_captured(result)}'
+    )
+    assert suite.basetemp.is_dir(), (
+        f'the session did not create its private basetemp {suite.basetemp}.\n'
+        f'{_captured(result)}'
     )
 
 
