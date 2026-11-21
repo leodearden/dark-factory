@@ -31,8 +31,8 @@ dark-factory command to execute.
 
 It also certifies CLAUDE.md's ticket-store recipe (task 7438), which hands out
 a host-absolute ``--db`` path to the one shared reconciliation ``tickets.db``;
-the guard swaps that path for a store it builds, so it never reads production
-state.
+the guard checks that path's tail, which rules out the known decoy, then swaps
+it for a store it builds, so it never reads production state.
 
 PLACEMENT IS LOAD-BEARING. ``tests/scripts/`` carries its own module config, so
 this guard runs under FULL_SUITE and merge-role ``merge_verify_breadth: full``.
@@ -83,6 +83,12 @@ _FIXTURE_DDL = "CREATE TABLE tasks (id INTEGER NOT NULL PRIMARY KEY, status TEXT
 _TICKETS_FIXTURE_TABLE = "tickets"
 _TICKETS_FIXTURE_COLUMNS = ("ticket_id", "status")
 _TICKETS_FIXTURE_DDL = "CREATE TABLE tickets (ticket_id TEXT PRIMARY KEY, status TEXT NOT NULL)"
+
+# The live ticket store's path tail: the reconciliation data dir's default in
+# fused-memory/config/config.yaml, plus the file name
+# fused-memory/src/fused_memory/server/main.py::_build_ticket_store gives it.
+# Checked as a tail, never by parsing that config's syntax.
+_LIVE_TICKET_STORE_TAIL = ("data", "reconciliation", "tickets.db")
 
 
 _HAPPY_DOC = """\
@@ -150,12 +156,33 @@ def test_tasks_db_schema_bullet_is_immune_to_inline_code_in_the_begin_comment():
     )
 
 
-def _documented_tool_argv(command, doc_name):
-    """*command* re-pointed at this interpreter and this checkout's copy of the tool.
+def _bare_tool_run_argv(command, *, operand_shape, marker, doc_name, task):
+    """*command* tokenised, after checking it runs the shape tool with *operand_shape* after it.
 
     The SHAPE assertion is load-bearing: a recipe degraded into a raw
     ``sqlite3 ... 'SELECT ...'`` one-liner, or into a python ``-c`` that
     hardcodes a column list, fails here rather than being executed.
+    *operand_shape* only sets how many tokens follow the script and how the
+    failure message describes them; each caller checks its own operands.
+    """
+    argv = shlex.split(command)
+    expected = ", ".join(("python|python3", repr(_TOOL_RELATIVE_PATH), *operand_shape))
+    assert (
+        len(argv) == 2 + len(operand_shape)
+        and argv[0] in _PYTHON_ARGV0
+        and argv[1] == _TOOL_RELATIVE_PATH
+    ), (
+        f"the command inside the {marker!r} marker in {doc_name} is not a bare "
+        f"run of the shape tool (task {task}): {command!r} tokenises to "
+        f"{argv!r}, expected exactly [{expected}]. The convention is that an "
+        f"agent asks the store and reads the answer — a hand-written sqlite "
+        f"query in its place is the confusion this closes."
+    )
+    return argv
+
+
+def _documented_tool_argv(command, doc_name):
+    """*command* re-pointed at this interpreter and this checkout's copy of the tool.
 
     ``sys.executable`` rather than a bare ``python`` off PATH, because
     ``verify._target_subprocess_env`` strips ``VIRTUAL_ENV`` and the venv's bin
@@ -164,17 +191,8 @@ def _documented_tool_argv(command, doc_name):
     cwd set to a temp project root — which is the whole point, since the recipe
     resolves the store from the checkout it is standing in.
     """
-    argv = shlex.split(command)
-    assert len(argv) == 2 and argv[0] in _PYTHON_ARGV0, (
-        f"the command inside the {SHAPE_LOOKUP_MARKER!r} marker in {doc_name} is "
-        f"not a bare run of the shape tool (task 5330): {command!r} tokenises to "
-        f"{argv!r}, expected exactly [python|python3, {_TOOL_RELATIVE_PATH!r}]. "
-        f"The convention is that an agent asks the store and reads the answer — "
-        f"a hand-written sqlite query in its place is the confusion this closes."
-    )
-    assert argv[1] == _TOOL_RELATIVE_PATH, (
-        f"the {SHAPE_LOOKUP_MARKER!r} command in {doc_name} runs {argv[1]!r}, "
-        f"expected {_TOOL_RELATIVE_PATH!r} (task 5330)"
+    argv = _bare_tool_run_argv(
+        command, operand_shape=(), marker=SHAPE_LOOKUP_MARKER, doc_name=doc_name, task="5330"
     )
     return [sys.executable, str(REPO_ROOT / argv[1])]
 
@@ -246,24 +264,21 @@ def _documented_ticket_store_argv(command, doc_name, store):
 
     The documented operand must be ABSOLUTE: the ticket store is one per-host
     file under the fused-memory server's checkout, and a task worktree has no
-    ``data/``, so a relative operand fails from every lane. It is then swapped
-    for *store*, so this guard never reads production state.
+    ``data/``, so a relative operand fails from every lane. It must also end in
+    :data:`_LIVE_TICKET_STORE_TAIL`, which rules out the 0-byte
+    ``fused-memory/data/tickets.db`` decoy. It is then swapped for *store*, so
+    this guard never reads production state.
     """
-    argv = shlex.split(command)
-    expected = f"[python|python3, {_TOOL_RELATIVE_PATH!r}, '--db', <absolute .../tickets.db>]"
-    assert len(argv) == 4 and argv[0] in _PYTHON_ARGV0, (
-        f"the command inside the {TICKETS_LOOKUP_MARKER!r} marker in {doc_name} is "
-        f"not a bare run of the shape tool on the ticket store (task 7438): "
-        f"{command!r} tokenises to {argv!r}, expected exactly {expected}. A "
-        f"hand-written sqlite query in its place is the confusion this closes."
-    )
-    assert argv[1] == _TOOL_RELATIVE_PATH, (
-        f"the {TICKETS_LOOKUP_MARKER!r} command in {doc_name} runs {argv[1]!r}, "
-        f"expected {_TOOL_RELATIVE_PATH!r} (task 7438): {argv!r}"
+    argv = _bare_tool_run_argv(
+        command,
+        operand_shape=("'--db'", f"<absolute .../{'/'.join(_LIVE_TICKET_STORE_TAIL)}>"),
+        marker=TICKETS_LOOKUP_MARKER,
+        doc_name=doc_name,
+        task="7438",
     )
     assert argv[2] == "--db", (
         f"the {TICKETS_LOOKUP_MARKER!r} command in {doc_name} passes {argv[2]!r} "
-        f"where '--db' belongs (task 7438): {argv!r}, expected {expected}"
+        f"where '--db' belongs (task 7438): {argv!r}"
     )
     documented_store = pathlib.PurePosixPath(argv[3])
     assert documented_store.is_absolute(), (
@@ -272,17 +287,20 @@ def _documented_ticket_store_argv(command, doc_name, store):
         f"caller's cwd, and a task worktree has no data/. Name the one shared "
         f"store by its absolute path."
     )
-    assert documented_store.name == "tickets.db", (
+    assert documented_store.parts[-len(_LIVE_TICKET_STORE_TAIL):] == _LIVE_TICKET_STORE_TAIL, (
         f"the {TICKETS_LOOKUP_MARKER!r} command in {doc_name} points --db at "
-        f"{argv[3]!r}, which is not a tickets.db (task 7438): {argv!r}"
+        f"{argv[3]!r}, which does not end in {'/'.join(_LIVE_TICKET_STORE_TAIL)} "
+        f"(task 7438). The live store is in the fused-memory server's "
+        f"reconciliation data dir "
+        f"(fused-memory/src/fused_memory/server/main.py::resolve_data_dir); "
+        f"fused-memory/data/tickets.db is a 0-byte decoy."
     )
     return [sys.executable, str(REPO_ROOT / argv[1]), "--db", str(store)]
 
 
 def _seeded_ticket_store(tmp_path):
-    """A ``tickets.db`` holding :data:`_TICKETS_FIXTURE_DDL`, laid out like the live one."""
-    db_path = tmp_path / "data" / "reconciliation" / "tickets.db"
-    db_path.parent.mkdir(parents=True)
+    """A store holding :data:`_TICKETS_FIXTURE_DDL`; ``--db`` is explicit, so its path is arbitrary."""
+    db_path = tmp_path / "store.db"
     conn = sqlite3.connect(db_path)
     try:
         conn.execute(_TICKETS_FIXTURE_DDL)
@@ -357,10 +375,15 @@ def _recipe_stdout(argv, *, cwd, marker, doc_name, task):
 
 
 def _assert_reports_shape(out, *, marker, store, table, columns, task):
-    """*out* names *table* and every one of *columns* of the store this test built."""
-    assert table in out, (
-        f"the {marker!r} command exited 0 without naming the "
-        f"{table!r} table of the store at {store} (task {task}): {out!r}"
+    """*out* has *table*'s header line and every one of *columns* of the store this test built.
+
+    The header line, not a bare substring: the first line of *out* is the
+    store's path, which can itself contain the table name.
+    """
+    header = f"{table} — "
+    assert any(line.startswith(header) for line in out.splitlines()), (
+        f"the {marker!r} command exited 0 without a {header!r}... header line "
+        f"for the {table!r} table of the store at {store} (task {task}): {out!r}"
     )
     missing = [column for column in columns if column not in out]
     assert not missing, (
