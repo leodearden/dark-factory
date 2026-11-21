@@ -2133,12 +2133,11 @@ def _reapable_config(mock_config):
     return config
 
 
-@pytest.fixture
-def _asr_run_id(_asr_scope, _reapable_config):
-    """A run_id unique to this run; teardown deletes only this run's points, never the collection."""
-    run_id = f'task-2222-add-system-record-probe-{uuid.uuid4().hex}'
-    yield run_id
-    collection = _asr_scope.mem0_collection_name(_reapable_config.mem0.collection_prefix)
+def _delete_run_points(collection: str, run_id: str) -> None:
+    """Best-effort delete of *collection*'s points whose payload run_id is *run_id*.
+
+    The collection itself is never touched.
+    """
     client = QdrantClient(url=QDRANT_URL, timeout=10)
     with contextlib.suppress(Exception):
         client.delete(
@@ -2150,6 +2149,16 @@ def _asr_run_id(_asr_scope, _reapable_config):
             ),
         )
     client.close()
+
+
+@pytest.fixture
+def _asr_run_id(_asr_scope, _reapable_config):
+    """A run_id unique to this run; teardown deletes only this run's points, never the collection."""
+    run_id = f'task-2222-add-system-record-probe-{uuid.uuid4().hex}'
+    yield run_id
+    _delete_run_points(
+        _asr_scope.mem0_collection_name(_reapable_config.mem0.collection_prefix), run_id,
+    )
 
 
 def test_the_add_system_record_probe_collection_is_one_the_reaper_can_reclaim(
@@ -3091,24 +3100,27 @@ class TestMem0BackendScanPayloadTextNamesItsCollection:
 # Correctness does not depend on this test passing: the mandatory Python
 # re-verify keeps the result exact either way, because tokenized matching is
 # strictly MORE permissive for these needles. Only speed would degrade.
+#
+# One collection is shared by every xdist worker and session and reused across
+# runs; it is reaped by scripts/cleanup_test_collections.py, and each run is
+# isolated by its own run_id.
 # ---------------------------------------------------------------------------
 
 
 @pytest.fixture
-def _spt_scope(worker_id) -> Scope:
-    return Scope(project_id=f'_test_scan_payload_text_{worker_id}')
+def _spt_scope() -> Scope:
+    """The scope every scan_payload_text tripwire run shares; runs are isolated by run_id."""
+    return Scope(project_id='_test_scan_payload_text')
 
 
 @pytest.fixture
-def _spt_clean_collection(_spt_scope, mock_config):
-    collection = _spt_scope.mem0_collection_name(mock_config.mem0.collection_prefix)
-    client = QdrantClient(url=QDRANT_URL, timeout=10)
-    with contextlib.suppress(ResponseHandlingException, UnexpectedResponse):
-        client.delete_collection(collection)
-    yield collection
-    with contextlib.suppress(Exception):
-        client.delete_collection(collection)
-    client.close()
+def _spt_run_id(_spt_scope, _reapable_config):
+    """A run_id unique to this run; teardown deletes only this run's points, never the collection."""
+    run_id = f'task-3083-scan-payload-text-probe-{uuid.uuid4().hex}'
+    yield run_id
+    _delete_run_points(
+        _spt_scope.mem0_collection_name(_reapable_config.mem0.collection_prefix), run_id,
+    )
 
 
 def test_the_scan_payload_text_probe_collection_is_one_the_reaper_can_reclaim(
@@ -3119,7 +3131,11 @@ def test_the_scan_payload_text_probe_collection_is_one_the_reaper_can_reclaim(
 
 
 class TestMem0BackendScanPayloadTextIntegration:
-    """Pins the un-indexed MatchText substring semantics against live Qdrant."""
+    """Pins the un-indexed MatchText substring semantics against live Qdrant.
+
+    One reaped collection is shared by every worker and reused across runs;
+    each run's assertions are scoped to its own run_id.
+    """
 
     pytestmark = [qdrant_skipif(), pytest.mark.timeout(60), pytest.mark.integration]
 
