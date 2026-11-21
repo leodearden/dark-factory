@@ -114,7 +114,7 @@ the skill's rendered table (§2). Heuristic 11 SPOT; INV-1 (the contract is a sc
 | action | fields | meaning | validation |
 |---|---|---|---|
 | `keep` | `reason?` | child stands on main / is independent; a cancelled dep counts as satisfied, so it is released | none beyond shape |
-| `repoint` | `onto: list[int]` (non-empty), `reason?` | child needed the parent's DELIVERY; move the edge | each `onto` id exists in the parent's project, is not the parent, not the child, not `cancelled`; no `onto` cycle through the child (backend `add_dependency` has no cycle check — the gate adds one, depth-bounded by `get_dependency_edges()`) |
+| `repoint` | `onto: list[int]` (non-empty), `reason?` | child needed the parent's DELIVERY; move the edge | each `onto` id exists in the parent's project, is not the parent, not the child, not `cancelled`; no `onto` cycle through the child (the store refuses a cycle-closing edge (task 9490); the gate pre-checks the same rule (`shared/src/shared/dependency_cycle.py`) over the literal post-cancel table, cancelled tasks' edges included, so a refusal lands before any write) |
 | `fold` | `into: int`, `reason?` | child's scope is covered by the superseder; the canceller has already transferred uncovered items into `into` | `into` exists, not cancelled, not the child; child has NO live children of its own (§4.7) |
 | `moot` | `reason?` | premise existed only on the parent's branch/plan; nothing replaces it | child has NO live children of its own |
 
