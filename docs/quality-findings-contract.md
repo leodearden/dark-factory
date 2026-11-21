@@ -141,6 +141,8 @@ Two routes, chosen by the finding's class, recorded on the finding:
   deliberation with the human, then a program doc, then `/prd`, which files
   tasks under `planning_mode` and stamps the finding keys (§8) on them.
 
+A live correctness defect (wrong behaviour in landed code today, not a cost of the next change) never waits for deliberation, whatever the class of the finding that exposed it: the instrument records the defect as its own mechanical finding (its anchor, the behaviour, the fix that stops it) and files it by the mechanical route, while any structural finding behind it goes to deliberation carrying the defect's key.
+
 A finding whose proposal is "split this file" or "reduce this number" is
 structural by definition; heuristic 14's measurement protocol in
 `docs/code-quality.md` applies before any split is proposed.
