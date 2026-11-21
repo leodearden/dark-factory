@@ -36,12 +36,80 @@ Usage
   python scripts/eval_write_triage_judge.py --limit 5 --report-path /tmp/smoke.json
 
   # The committed arbiter (plans/write-triage-flip-readiness-prd.md C2'):
-  # production's retrieval, bands and attach targets, every case dumped as it
-  # completes.
+  # production's retrieval, bands, routes and attach targets, every case dumped
+  # as it completes. It is run as the first arm of the 2x2 below, which adds
+  # only --slates-out; its live judge needs the ChatGPT-plan proxy set up there.
   python scripts/eval_write_triage_judge.py --slate-mode retrieved --project-id reify \\
       --canonical-aliases tests/fixtures/write_triage_calibration.canonical_aliases.json \\
       --report-path calibration/write_triage_judge_accuracy_report.json \\
       --cases-path calibration/write_triage_judge_accuracy_report.cases.jsonl
+
+The 2x2 judge arms (task 9045, run by task 11213)
+-------------------------------------------------
+Four arms, the judge prompt {shipped, psi} by the judge model {gpt-6.1-sol,
+the configured one; gpt-6.2-sol}, all judging ONE retrieval, so that
+``compare_write_triage_judge_arms.py`` can separate the prompt effect from the
+model effect. Run every command from the fused-memory package root.
+
+  # 0. The ChatGPT-plan proxy. A live judge is REFUSED unless
+  # write_triage.judge_api_url and write_triage.judge_api_key are both set,
+  # and config.yaml fills them from these two variables (task 9946). Unset,
+  # the run stops before the fixture is loaded, rather than billing
+  # OPENAI_API_KEY.
+  export OPENAI_PLAN_PROXY_URL=...   # the plan proxy's OpenAI-compatible base URL
+  export OPENAI_PLAN_PROXY_KEY=...   # its client key
+
+  # 1. Smoke: one labelled record judged by gpt-6.2-sol, written to /tmp.
+  # A completed report confirms the plan serves the model.
+  python scripts/eval_write_triage_judge.py --limit 1 --judge-model gpt-6.2-sol \\
+      --report-path /tmp/write_triage_judge_smoke.json
+
+  # 2. The arbiter arm, shipped x gpt-6.1-sol: the committed artifact. It
+  # retrieves once and snapshots the slates with --slates-out, outside the
+  # tracked tree, for the other three arms. Keep the snapshot until step 4
+  # has run. --judge-model is refused on this report path, so the model is
+  # the configured one.
+  python scripts/eval_write_triage_judge.py --slate-mode retrieved --project-id reify \\
+      --canonical-aliases tests/fixtures/write_triage_calibration.canonical_aliases.json \\
+      --report-path calibration/write_triage_judge_accuracy_report.json \\
+      --cases-path calibration/write_triage_judge_accuracy_report.cases.jsonl \\
+      --slates-out /tmp/write_triage_judge_arms.slates.json
+
+  # 3. The other three arms, each judging the snapshot with --slates-in.
+  # Each writes calibration/write_triage_judge_arms/<wording>__<model>.json,
+  # its .md render and its .cases.jsonl.
+  python scripts/eval_write_triage_judge.py --slate-mode retrieved \\
+      --slates-in /tmp/write_triage_judge_arms.slates.json \\
+      --canonical-aliases tests/fixtures/write_triage_calibration.canonical_aliases.json \\
+      --wording psi \\
+      --report-path calibration/write_triage_judge_arms/psi__gpt-6.1-sol.json \\
+      --cases-path calibration/write_triage_judge_arms/psi__gpt-6.1-sol.cases.jsonl
+  python scripts/eval_write_triage_judge.py --slate-mode retrieved \\
+      --slates-in /tmp/write_triage_judge_arms.slates.json \\
+      --canonical-aliases tests/fixtures/write_triage_calibration.canonical_aliases.json \\
+      --judge-model gpt-6.2-sol \\
+      --report-path calibration/write_triage_judge_arms/shipped__gpt-6.2-sol.json \\
+      --cases-path calibration/write_triage_judge_arms/shipped__gpt-6.2-sol.cases.jsonl
+  python scripts/eval_write_triage_judge.py --slate-mode retrieved \\
+      --slates-in /tmp/write_triage_judge_arms.slates.json \\
+      --canonical-aliases tests/fixtures/write_triage_calibration.canonical_aliases.json \\
+      --wording psi --judge-model gpt-6.2-sol \\
+      --report-path calibration/write_triage_judge_arms/psi__gpt-6.2-sol.json \\
+      --cases-path calibration/write_triage_judge_arms/psi__gpt-6.2-sol.cases.jsonl
+
+  # 4. The comparison. It refuses arms that did not judge the same
+  # population or that do not fill the grid, and writes comparison.md beside
+  # comparison.json.
+  python scripts/compare_write_triage_judge_arms.py \\
+      --arm calibration/write_triage_judge_accuracy_report.json \\
+      --arm calibration/write_triage_judge_arms/psi__gpt-6.1-sol.json \\
+      --arm calibration/write_triage_judge_arms/shipped__gpt-6.2-sol.json \\
+      --arm calibration/write_triage_judge_arms/psi__gpt-6.2-sol.json \\
+      --out calibration/write_triage_judge_arms/comparison.json
+
+Every arm passes the same ``--canonical-aliases``, and none passes ``--limit``,
+``--field-chars`` or ``--judge-candidate-count``, because the comparison
+refuses arms whose population provenance differs.
 """
 from __future__ import annotations
 
