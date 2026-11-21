@@ -2479,8 +2479,8 @@ class TestHarnessInjectedTurnFilter:
         meta = yaml.safe_load(frontmatter_yaml)
 
         assert '## User Corrections' in digest
-        correction_lines = [line for line in body.splitlines() if line.startswith('- (turn')]
-        assert correction_lines == ['- (turn 3) This is wrong, please redo it.']
+        correction_lines = [line for line in body.splitlines() if line.startswith('- (record')]
+        assert correction_lines == ['- (record 3) This is wrong, please redo it.']
         assert 'previous run was interrupted' not in body
         assert '# Context' not in body
         assert meta['score'] == mod.score_signals(meta['signal_counts'], 1)
@@ -2622,8 +2622,8 @@ class TestNonHumanOriginFilter:
         frontmatter_yaml, body = _split_frontmatter(digest)
         meta = yaml.safe_load(frontmatter_yaml)
 
-        correction_lines = [line for line in body.splitlines() if line.startswith('- (turn')]
-        assert correction_lines == [f'- (turn 1) {_GENUINE_CORRECTION}']
+        correction_lines = [line for line in body.splitlines() if line.startswith('- (record')]
+        assert correction_lines == [f'- (record 1) {_GENUINE_CORRECTION}']
         assert meta['n_user_turns'] == 1
 
     def test_df_guard_and_interrupt_ignore_a_task_notification_carrier(self):
@@ -2895,6 +2895,57 @@ class TestRenderDigest:
         assert meta['size_bytes'] == len(digest.encode('utf-8'))
 
 
+class TestItemRecordLabels:
+    """An item's (record N) is its record position in the transcript, not a user-turn ordinal (task 7439)."""
+
+    def test_not_found_in_a_session_with_no_user_turns_is_labelled_by_record(self):
+        records = [
+            _with_session_meta(_assistant(_tool_use('Read', {'file_path': '/x/missing.md'}, id='tu-r'))),
+            _with_session_meta(_tool_result('tu-r', 'File does not exist.', is_error=True)),
+        ]
+
+        digest = mod.render_digest(records, agent_class='interactive')
+
+        frontmatter_yaml, body = _split_frontmatter(digest)
+        meta = yaml.safe_load(frontmatter_yaml)
+        body_lines = body.splitlines()
+
+        assert meta['n_user_turns'] == 0
+        assert '- (record 1) does not exist' in body_lines
+        error_lines = body_lines[body_lines.index('## Error Neighborhoods') + 1:]
+        assert error_lines[0].startswith('- (record 1) Read(')
+
+    def test_every_indexed_section_labels_items_by_record_position(self):
+        digest = mod.render_digest(_all_signals_records(), agent_class='interactive')
+
+        _, body = _split_frontmatter(digest)
+        body_lines = body.splitlines()
+
+        for expected in (
+            '- (record 0) Please redo this, it is wrong.',
+            '- (record 3) [my mistake] My mistake, let me redo this.',
+            '- (record 9) request interrupted by user',
+            '- (record 8) done_gate_missing_files',
+            '- (record 2) Bash({"command": "false"}) -> [exit 1] Exit code 1',
+            '- (record 7) command not found',
+        ):
+            assert expected in body_lines, expected
+        assert '(turn ' not in digest
+
+    def test_designed_outcome_items_are_labelled_by_record_position(self):
+        digest = mod.render_digest(_designed_outcomes_only_records(), agent_class='interactive')
+
+        _, body = _split_frontmatter(digest)
+        body_lines = body.splitlines()
+        section = body_lines[body_lines.index('## Designed Outcomes') + 1:]
+        section_end = section.index('') if '' in section else len(section)
+        item_lines = [line for line in section[:section_end] if line.startswith('- ')]
+
+        assert len(item_lines) == 3
+        for line, prefix in zip(item_lines, ('- (record 1) ', '- (record 3) ', '- (record 5) ')):
+            assert line.startswith(prefix), line
+
+
 # ---------------------------------------------------------------------------
 # render_digest — 15KB soft-cap priority truncation. Over max_bytes, the
 # LOWEST-priority non-empty section is trimmed/dropped first (ascending
@@ -3028,7 +3079,7 @@ def _oversized_user_correction_records():
 
 class TestPerItemByteCap:
     def test_cap_item_returns_short_line_byte_identical(self):
-        line = '- (turn 0) short line, well under any cap'
+        line = '- (record 0) short line, well under any cap'
 
         capped = mod._cap_item(line, cap=2048)
 
@@ -3036,7 +3087,7 @@ class TestPerItemByteCap:
         assert mod.ITEM_TRUNCATION_MARKER not in capped
 
     def test_cap_item_truncates_oversized_line_with_marker(self):
-        line = '- (turn 0) ' + ('x' * 5000)
+        line = '- (record 0) ' + ('x' * 5000)
         cap = 2048
 
         capped = mod._cap_item(line, cap)
@@ -3058,7 +3109,7 @@ class TestPerItemByteCap:
         # much, so a 20KB pasted turn capped to 2KB looks identical to one
         # capped by 40 bytes. The two numbers must be internally
         # consistent, not decorative.
-        line = '- (turn 0) ' + ('x' * 5000)
+        line = '- (record 0) ' + ('x' * 5000)
         cap = 2048
 
         capped = mod._cap_item(line, cap)
@@ -3081,8 +3132,8 @@ class TestPerItemByteCap:
         # leaves room for -- the cap must hold anyway, for ASCII and
         # multi-byte alike, with no mojibake.
         for line in (
-            '- (turn 0) ' + ('x' * 5000),
-            '- (turn 0) ' + ('é→' * 2000),
+            '- (record 0) ' + ('x' * 5000),
+            '- (record 0) ' + ('é→' * 2000),
         ):
             for cap in (256, 500, 1024, 2048):
                 capped = mod._cap_item(line, cap)
@@ -3103,7 +3154,7 @@ class TestPerItemByteCap:
     def test_cap_item_truncates_multibyte_text_without_mojibake(self):
         # The cap is a BYTE cap -- naive slicing on a multi-byte-character
         # string must not split a codepoint into a replacement character.
-        line = '- (turn 0) ' + ('é→' * 2000)
+        line = '- (record 0) ' + ('é→' * 2000)
         cap = 500
 
         capped = mod._cap_item(line, cap)  # must not raise
@@ -3621,7 +3672,7 @@ class TestEmitConsistencyGuard:
             },
         }
         sections = {key: [] for key in mod.SECTION_PRIORITY}
-        sections['not_found'] = ['- (turn 0) command not found']
+        sections['not_found'] = ['- (record 0) command not found']
 
         mod._warn_if_body_evicted(meta, sections, max_bytes=15360)
 
