@@ -19,7 +19,8 @@ from datetime import UTC, datetime
 
 import aiosqlite
 import pytest
-from shared.cost_store import CapReason, CostStore
+from _curator_ledger import CuratorInvocation, write_curator_invocations
+from shared.cost_store import CapReason
 
 from dashboard.data.model_role import aggregate_model_role_rollup, get_model_role_rollup
 
@@ -540,43 +541,14 @@ _EXPECTED_LEDGER_ROW = {
 }
 
 
-async def _write_curator_ledger(db_path) -> None:
-    """Two in-window curator invocations (one capped) and one out-of-window,
-    written through the ledger's production writer so the schema is real."""
-    store = CostStore(db_path)
-    await store.open()
-    try:
-        for cost, capped_reason, completed_at in (
-            (0.02, None, '2026-05-10T08:00:00+00:00'),
-            (0.03, CapReason.BUDGET, '2026-05-10T09:00:00+00:00'),
-            (99.0, None, '2026-05-09T00:00:00+00:00'),
-        ):
-            await store.save_invocation(
-                run_id='fused-memory-x',
-                task_id=None,
-                project_id='dark_factory',
-                account_name='a',
-                model='opus',
-                role='task_curator',
-                cost_usd=cost,
-                input_tokens=None,
-                output_tokens=None,
-                cache_read_tokens=None,
-                cache_create_tokens=None,
-                duration_ms=1234,
-                capped=capped_reason is not None,
-                capped_reason=capped_reason,
-                started_at=completed_at,
-                completed_at=completed_at,
-            )
-    finally:
-        await store.close()
-
-
 @pytest.fixture()
 async def curator_ledger_conn(tmp_path):
     db_path = tmp_path / 'curator_events.db'
-    await _write_curator_ledger(db_path)
+    await write_curator_invocations(db_path, (
+        CuratorInvocation(0.02, datetime(2026, 5, 10, 8, tzinfo=UTC)),
+        CuratorInvocation(0.03, datetime(2026, 5, 10, 9, tzinfo=UTC), CapReason.BUDGET),
+        CuratorInvocation(99.0, datetime(2026, 5, 9, tzinfo=UTC)),
+    ))
     async with aiosqlite.connect(str(db_path)) as conn:
         conn.row_factory = aiosqlite.Row
         yield conn
@@ -587,20 +559,18 @@ class TestCuratorLedgerShape:
     real counts, costs and caps, zero outcomes, and no turn-cap saturation."""
 
     @pytest.mark.asyncio
-    async def test_invocation_only_ledger_contributes_cells(self, curator_ledger_conn) -> None:
-        result = await get_model_role_rollup(curator_ledger_conn, days=DAYS, now=NOW)
-
-        assert result['rows'] == [_EXPECTED_LEDGER_ROW]
-        assert result['turn_cap_saturation'] == {}
-
-    @pytest.mark.asyncio
-    async def test_invocation_only_ledger_logs_no_query_failure(
+    async def test_invocation_only_ledger_contributes_cells(
         self, curator_ledger_conn, caplog,
     ) -> None:
         with caplog.at_level(logging.WARNING, logger='dashboard.data.db'):
-            await get_model_role_rollup(curator_ledger_conn, days=DAYS, now=NOW)
+            result = await get_model_role_rollup(curator_ledger_conn, days=DAYS, now=NOW)
 
-        assert 'with_db: query failed' not in caplog.messages
+        assert result['rows'] == [_EXPECTED_LEDGER_ROW]
+        assert result['turn_cap_saturation'] == {}
+        assert not [
+            r for r in caplog.records
+            if r.name == 'dashboard.data.db' and r.levelno >= logging.WARNING
+        ]
 
     @pytest.mark.asyncio
     async def test_aggregate_adds_ledger_cells_without_disturbing_runs_db(

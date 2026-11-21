@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 import aiosqlite
 import pytest
+from _curator_ledger import CuratorInvocation, write_curator_invocations
 
 # ---------------------------------------------------------------------------
 # Schema — all four tables that coexist in runs.db
@@ -2410,31 +2411,8 @@ _LEDGER_NOW = datetime(2026, 10, 9, 12, 0, 0, tzinfo=UTC)
 
 
 async def _write_curator_ledger_row(db_path) -> None:
-    """One curator invocation, written through the ledger's own writer."""
-    from shared.cost_store import CostStore
-
-    store = CostStore(db_path)
-    await store.open()
-    try:
-        await store.save_invocation(
-            run_id='fused-memory-x',
-            task_id=None,
-            project_id='dark_factory',
-            account_name='a',
-            model='opus',
-            role='task_curator',
-            cost_usd=0.02,
-            input_tokens=None,
-            output_tokens=None,
-            cache_read_tokens=None,
-            cache_create_tokens=None,
-            duration_ms=1234,
-            capped=False,
-            started_at=(_LEDGER_NOW - timedelta(minutes=1)).isoformat(),
-            completed_at=_LEDGER_NOW.isoformat(),
-        )
-    finally:
-        await store.close()
+    """One $0.02 curator invocation completed at ``_LEDGER_NOW``."""
+    await write_curator_invocations(db_path, [CuratorInvocation(0.02, _LEDGER_NOW)])
 
 
 class TestCuratorLedgerSource:
@@ -2525,7 +2503,10 @@ class TestCuratorLedgerSource:
         assert by_key[('opus', 'task_curator')]['total_cost_usd'] == pytest.approx(0.02)
         assert by_key[('opus', 'implementer')]['invocation_count'] == 1
         assert by_key[('opus', 'implementer')]['total_cost_usd'] == pytest.approx(2.0)
-        assert 'with_db: query failed' not in caplog.messages
+        assert not [
+            r for r in caplog.records
+            if r.name == 'dashboard.data.db' and r.levelno >= logging.WARNING
+        ]
 
     @pytest.mark.asyncio
     async def test_missing_curator_ledger_is_a_strict_no_op(self, ledger_config, pool):
