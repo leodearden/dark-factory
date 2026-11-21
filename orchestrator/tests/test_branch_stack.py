@@ -21,6 +21,7 @@ from pathlib import Path
 
 import pytest
 import pytest_asyncio
+from _git_fault_shim import fail_git
 
 from orchestrator.branch_stack import (
     StackBaseLedger,
@@ -30,6 +31,7 @@ from orchestrator.branch_stack import (
     StackTarget,
     base_owners,
     foreign_commit_cut,
+    rebase_own_delta,
 )
 from orchestrator.config import GitConfig
 from orchestrator.git_ops import GitOps, _run
@@ -453,3 +455,69 @@ class TestBaseOwners:
         await _commit_file(stacked.p_wt, 'p3.txt', 'p3\n')
 
         assert await base_owners(_run, stacked.repo, stacked.p_tip) == ()
+
+
+# ---------------------------------------------------------------------------
+# rebase_own_delta reports whether its abort failed (task 7540, via 10473)
+# ---------------------------------------------------------------------------
+
+#: The argv prefix of guarded_abort's ``rebase --abort`` (RECOVERY_GIT's flags).
+_GUARDED_REBASE_ABORT = '-c rerere.enabled=false rebase --abort'
+
+
+async def _conflicting_own_commit(s: Stacked) -> tuple[Path, str, str]:
+    """task/X from main rewrites base.txt; main then rewrites it differently.
+
+    Returns X's worktree, X's fork point and main's new tip."""
+    x_wt = await _add_branch(s.git_ops, 'X', 'main')
+    fork = await _rev_parse(s.repo, 'main')
+    await _commit_file(x_wt, 'base.txt', 'x\n')
+    onto = await _commit_file(s.repo, 'base.txt', 'main moved\n')
+    return x_wt, fork, onto
+
+
+async def _rebase_merge_dir(wt: Path) -> Path:
+    path = Path((await _git(wt, 'rev-parse', '--git-path', 'rebase-merge')).strip())
+    return path if path.is_absolute() else wt / path
+
+
+@pytest.mark.asyncio
+class TestRebaseOwnDeltaReportsItsAbort:
+    async def test_a_conflict_whose_abort_held_is_not_an_abort_failure(
+        self, stacked: Stacked,
+    ) -> None:
+        x_wt, fork, onto = await _conflicting_own_commit(stacked)
+
+        result = await rebase_own_delta(_run, x_wt, onto=onto, cut=fork)
+
+        assert not result.ok
+        assert result.conflicted_paths == ('base.txt',)
+        assert result.abort_failed is False
+        assert (await _git(x_wt, 'status', '--porcelain')).strip() == ''
+        assert not (await _rebase_merge_dir(x_wt)).exists()
+
+    async def test_a_failed_abort_is_reported(
+        self, stacked: Stacked, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        x_wt, fork, onto = await _conflicting_own_commit(stacked)
+        fail_git(monkeypatch, tmp_path / 'shim' / 'bin', f'{_GUARDED_REBASE_ABORT}*')
+
+        result = await rebase_own_delta(_run, x_wt, onto=onto, cut=fork)
+
+        assert not result.ok
+        assert result.abort_failed is True
+        assert (await _rebase_merge_dir(x_wt)).exists()
+        await _git(x_wt, 'rebase', '--abort')
+
+    async def test_a_rebase_git_refused_to_start_is_not_an_abort_failure(
+        self, stacked: Stacked,
+    ) -> None:
+        x_wt, fork, onto = await _conflicting_own_commit(stacked)
+        (x_wt / 'base.txt').write_text('dirty\n')
+
+        result = await rebase_own_delta(_run, x_wt, onto=onto, cut=fork)
+
+        assert not result.ok
+        assert result.conflicted_paths == ()
+        assert result.abort_failed is False
+        assert (x_wt / 'base.txt').read_text() == 'dirty\n'
