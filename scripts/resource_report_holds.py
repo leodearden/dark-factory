@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections import Counter
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, fields
 from datetime import UTC, datetime
@@ -49,9 +50,12 @@ __all__ = [
     'HoldsReport',
     'ProjectConsumer',
     'ProjectStatus',
+    'RANKINGS',
     'RootRead',
     'RootStatus',
     'SamplesUnavailable',
+    'Summary',
+    'Totals',
     'Window',
     'aside',
     'format_utc',
@@ -64,6 +68,9 @@ __all__ = [
     'read_root',
     'render_text',
     'report_json',
+    'summarise',
+    'total_positive_growth',
+    'total_reclaimed',
     'who_grew',
     'who_paid',
 ]
@@ -579,6 +586,12 @@ def aside(window: Window) -> tuple[Aside, ...]:
     return tuple(rows)
 
 
+RANKINGS: Mapping[str, Callable[[Window], tuple[ConsumerWindow, ...]]] = MappingProxyType(
+    {'who_grew': who_grew, 'who_paid': who_paid}
+)
+"""The two rankings, by the name the report gives each."""
+
+
 def reclaim_threads_share(window: Window) -> float | None:
     """The reclaim threads' share of host CPU; None when either is unavailable or CPU is 0."""
     if window.reclaim_threads_cpu_usec is None:
@@ -685,6 +698,91 @@ def read_holds_report(
 
 
 # ---------------------------------------------------------------------------
+# The summary across holds (C2)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Totals:
+    """One consumer's figures summed over the ranked holds' windows."""
+
+    grew: float = 0.0
+    reclaimed_pages: float = 0.0
+    memory_some_stall_seconds: float = 0.0
+    memory_full_stall_seconds: float = 0.0
+
+    def plus(self, c: ConsumerWindow) -> Totals:
+        return Totals(
+            self.grew + c.grew,
+            self.reclaimed_pages + c.reclaimed_pages,
+            self.memory_some_stall_seconds + c.memory_some_stall_seconds,
+            self.memory_full_stall_seconds + c.memory_full_stall_seconds,
+        )
+
+
+@dataclass(frozen=True)
+class Summary:
+    """Across the report's holds; every share is None where nothing was measured."""
+
+    holds_per_project: Mapping[Path, Mapping[HoldState, int]]
+    tops: Mapping[str, Mapping[Consumer, int]]
+    """Per ranking in ``RANKINGS``, how many ranked holds each consumer topped."""
+    totals: Mapping[Consumer, Totals]
+    aside_shares: Mapping[str, tuple[float | None, float | None]]
+    """Per aside label, its share of the summed positive growth and of the summed pages."""
+    reclaim_thread_share: float | None
+    """Summed reclaim-thread CPU over summed host CPU, where the reclaim figure is available."""
+
+
+def _holds_per_project(report: HoldsReport) -> dict[Path, dict[HoldState, int]]:
+    counts = {read.root: dict.fromkeys(HoldState, 0) for read in report.roots}
+    for reading in report.readings:
+        counts[reading.hold.project_root][reading.state] += 1
+    return counts
+
+
+def _aside_shares(windows: Sequence[Window]) -> dict[str, tuple[float | None, float | None]]:
+    rows = [row for window in windows for row in aside(window)]
+    growth = sum(total_positive_growth(window) for window in windows)
+    pages = sum(total_reclaimed(window) for window in windows)
+    return {
+        label: (
+            _share(sum(row.grew for row in rows if row.label == label), growth),
+            _share(sum(row.reclaimed_pages for row in rows if row.label == label), pages),
+        )
+        for label in ASIDE_ROLES.values()
+    }
+
+
+def _reclaim_thread_share(windows: Sequence[Window]) -> float | None:
+    measured = [w for w in windows if w.reclaim_threads_cpu_usec is not None]
+    return _share(
+        sum(w.reclaim_threads_cpu_usec or 0.0 for w in measured),
+        sum(w.host_cpu_usec for w in measured),
+    )
+
+
+def summarise(report: HoldsReport) -> Summary:
+    """The C2 summary, built from the readings' windows alone."""
+    windows = [reading.window for reading in report.readings if reading.window is not None]
+    tops = {
+        name: Counter(ranked[0].consumer for window in windows if (ranked := rank(window)))
+        for name, rank in RANKINGS.items()
+    }
+    totals: dict[Consumer, Totals] = {}
+    for window in windows:
+        for c in window.consumers.values():
+            totals[c.consumer] = totals.get(c.consumer, Totals()).plus(c)
+    return Summary(
+        holds_per_project=_holds_per_project(report),
+        tops=tops,
+        totals=dict(sorted(totals.items(), key=lambda item: (-item[1].grew, item[0]))),
+        aside_shares=_aside_shares(windows),
+        reclaim_thread_share=_reclaim_thread_share(windows),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Rendering
 # ---------------------------------------------------------------------------
 
@@ -732,6 +830,7 @@ def _heading(hold: Hold) -> str:
 
 _TOP = 5
 _USEC_PER_SECOND = 1_000_000
+_KiB = 2**10
 _MiB = 2**20
 _GiB = 2**30
 
@@ -743,6 +842,8 @@ def _bytes(value: float) -> str:
         return f'{sign}{size / _GiB:.2f} GiB'
     if size >= _MiB:
         return f'{sign}{size / _MiB:.1f} MiB'
+    if size >= _KiB:
+        return f'{sign}{size / _KiB:.0f} KiB'
     return f'{sign}{size:.0f} B'
 
 
@@ -857,8 +958,48 @@ def _hold_block(reading: HoldReading) -> list[str]:
     return [_heading(reading.hold), f'  {_STATE_TEXT[reading.state]}{after}']
 
 
+def _state_counts(counts: Mapping[HoldState, int]) -> str:
+    return ', '.join(f'{state.value} {count}' for state, count in counts.items())
+
+
+def _tops_line(name: str, tops: Mapping[Consumer, int]) -> str:
+    topped = ', '.join(f'{encode_consumer(c)} {n}' for c, n in Counter(tops).most_common())
+    return f'  times topping {name}: {topped or "none"}'
+
+
+def _totals_line(consumer: Consumer, totals: Totals) -> str:
+    return (
+        f'    {encode_consumer(consumer)}  grew {_bytes(totals.grew)}, '
+        f'{_pages(totals.reclaimed_pages)}, stall some {totals.memory_some_stall_seconds:.1f} s, '
+        f'full {totals.memory_full_stall_seconds:.1f} s'
+    )
+
+
+def _summary_lines(report: HoldsReport) -> list[str]:
+    summary = summarise(report)
+    ranked = sum(reading.window is not None for reading in report.readings)
+    return [
+        f'summary across {len(report.readings)} memory holds ({ranked} ranked):',
+        '  holds per project:',
+        *(
+            f'    {root}: {sum(counts.values())} ({_state_counts(counts)})'
+            for root, counts in summary.holds_per_project.items()
+        ),
+        *(_tops_line(name, tops) for name, tops in summary.tops.items()),
+        '  totals per consumer over the ranked holds, by growth:',
+        *(_totals_line(consumer, totals) for consumer, totals in summary.totals.items()),
+        *(
+            f'  {label}: {_percent(growth)} of growth, {_percent(pages)} of pages'
+            for label, (growth, pages) in summary.aside_shares.items()
+        ),
+        f'  reclaim threads: {_percent(summary.reclaim_thread_share)} of host CPU',
+    ]
+
+
 def render_text(report: HoldsReport, *, summary: bool = False) -> str:
     sections = [_header(report), *(_hold_block(reading) for reading in report.readings)]
+    if summary:
+        sections.append(_summary_lines(report))
     return '\n\n'.join('\n'.join(lines) for lines in sections)
 
 
@@ -932,8 +1073,7 @@ def _window_json(mapping: HoldConsumers, window: Window) -> dict[str, Any]:
             'end': format_utc(window.end),
             'collections': window.collections,
         },
-        'who_grew': [_figures_json(c) for c in who_grew(window)],
-        'who_paid': [_figures_json(c) for c in who_paid(window)],
+        **{name: [_figures_json(c) for c in rank(window)] for name, rank in RANKINGS.items()},
         'aside': [_aside_json(row) for row in aside(window)],
         'holding_project': {
             row.role.value: _project_json(row) for row in holding_project(mapping, window)
@@ -965,8 +1105,36 @@ def _reading_json(reading: HoldReading) -> dict[str, Any]:
     return entry
 
 
-def report_json(report: HoldsReport, *, summary: bool = False) -> dict[str, Any]:
+def _totals_json(totals: Totals) -> dict[str, Any]:
     return {
+        'grew_bytes': totals.grew,
+        'reclaimed_pages': totals.reclaimed_pages,
+        'memory_some_stall_seconds': totals.memory_some_stall_seconds,
+        'memory_full_stall_seconds': totals.memory_full_stall_seconds,
+    }
+
+
+def _summary_json(summary: Summary) -> dict[str, Any]:
+    return {
+        'holds_per_project': {
+            str(root): {'total': sum(counts.values()), **{s.value: n for s, n in counts.items()}}
+            for root, counts in summary.holds_per_project.items()
+        },
+        'tops': {
+            name: {encode_consumer(c): n for c, n in Counter(tops).most_common()}
+            for name, tops in summary.tops.items()
+        },
+        'totals': {encode_consumer(c): _totals_json(t) for c, t in summary.totals.items()},
+        'aside_shares': {
+            label: {'growth_share': growth, 'reclaim_share': pages}
+            for label, (growth, pages) in summary.aside_shares.items()
+        },
+        'reclaim_thread_share': summary.reclaim_thread_share,
+    }
+
+
+def report_json(report: HoldsReport, *, summary: bool = False) -> dict[str, Any]:
+    out: dict[str, Any] = {
         'roots': [_root_json(read) for read in report.roots],
         'samples_db': str(report.samples_db),
         'first_collection': _time_json(report.first_collection),
@@ -975,3 +1143,6 @@ def report_json(report: HoldsReport, *, summary: bool = False) -> dict[str, Any]
         'window_seconds': report.window_seconds,
         'holds': [_reading_json(reading) for reading in report.readings],
     }
+    if summary:
+        out['summary'] = _summary_json(summarise(report))
+    return out
