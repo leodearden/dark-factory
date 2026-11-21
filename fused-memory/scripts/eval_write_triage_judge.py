@@ -616,18 +616,8 @@ def _run(args: Any) -> int:
     judge_candidate_count = resolve_judge_candidate_count(service)
     judge_enabled = resolve_judge_enabled(service)
 
-    fixture = load_fixture(args.fixture)
-    logger.info('Loaded %d labeled record(s) from %s', len(fixture), args.fixture)
-    records = fixture if args.limit is None else _limited(fixture, args.limit)
-
-    if args.slate_mode == _scoring.SLATE_RETRIEVED:
-        plan = _retrieved_plan(
-            args, config, records, fixture=fixture,
-            judge_candidate_count=judge_candidate_count, aliases=aliases,
-        )
-    else:
-        plan = _cases.seeded_plan(records, distractors=args.distractors, aliases=aliases)
-
+    # BEFORE the fixture and the plan: a live builder refuses a judge off the
+    # ChatGPT-plan proxy, and that refusal must precede any retrieval.
     if args.dry_run:
         judge_fn = _dry_run_judge_fn()
         provider, model = 'dry-run', f'fixed:{_DRY_RUN_VERDICT}'
@@ -641,6 +631,18 @@ def _run(args: Any) -> int:
             if args.slate_mode == _scoring.SLATE_RETRIEVED
             else _live_judge.build_judge_fn(config)
         )
+
+    fixture = load_fixture(args.fixture)
+    logger.info('Loaded %d labeled record(s) from %s', len(fixture), args.fixture)
+    records = fixture if args.limit is None else _limited(fixture, args.limit)
+
+    if args.slate_mode == _scoring.SLATE_RETRIEVED:
+        plan = _retrieved_plan(
+            args, config, records, fixture=fixture,
+            judge_candidate_count=judge_candidate_count, aliases=aliases,
+        )
+    else:
+        plan = _cases.seeded_plan(records, distractors=args.distractors, aliases=aliases)
 
     with _wording.judge_wording(args.wording) as prompt_sha256:
         report = run_judge_eval(
