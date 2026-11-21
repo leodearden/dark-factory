@@ -14,10 +14,16 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Iterable, Mapping
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from orchestrator.merge_verify_facts import ChainMembers, MergeVerifyDispatchFacts
-from orchestrator.task_priority import TaskPriority, TaskPriorityLookup, read_task_priority
+from orchestrator.task_priority import (
+    TaskPriority,
+    TaskPriorityLookup,
+    read_task_priority,
+    task_age,
+)
 
 if TYPE_CHECKING:
     from orchestrator.merge_lane.types import ChainResult, MergeRequest
@@ -32,15 +38,23 @@ PICK_RECORD_CAP = 16
 """Most pick records held for an emit that never comes (an abandoned pick)."""
 
 
-def queued_request_fields(req: MergeRequest, priority: TaskPriority) -> dict[str, object]:
-    """The keys ``merge_queued`` adds for *req*: its identity, lane, tier, pin and age."""
+def queued_request_fields(
+    req: MergeRequest, priority: TaskPriority, *, now: datetime,
+) -> dict[str, object]:
+    """The keys ``merge_queued`` adds for *req*: its identity, lane, tiers, pin, and age at *now*."""
+    age = task_age(
+        priority, now=now, fallback_anchor=datetime.fromtimestamp(req.first_enqueued_at, UTC),
+    )
     return {
         'request_id': req.request_id,
         'lane': req.lane,
         'tier': priority.tier,
+        'base_tier': priority.base_tier,
         'pinned': priority.pinned,
         'head_sha': req.snapshot_tip,
         'first_enqueued_at': req.first_enqueued_at,
+        'age_secs': round(age.secs, 3),
+        'age_from': 'anchor' if age.from_anchor else 'enqueue',
     }
 
 

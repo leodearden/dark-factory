@@ -13,6 +13,7 @@ import dataclasses
 import logging
 import time
 from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, Protocol
 
@@ -93,7 +94,10 @@ def _emit_merge_queued(
     """
     if event_store is None:
         return
-    data: dict = {'branch': req.branch.bare_id, **queued_request_fields(req, priority)}
+    data: dict = {
+        'branch': req.branch.bare_id,
+        **queued_request_fields(req, priority, now=datetime.now(UTC)),
+    }
     if reason is not None:
         data['reason'] = reason
     if queue_depth is not None:
