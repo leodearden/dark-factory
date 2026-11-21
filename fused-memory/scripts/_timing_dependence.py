@@ -26,6 +26,9 @@ code: one suppression mechanism per rule.  A ``@virtual_clock_test`` span
 covers every kind except a real-thread ``time.sleep``, which is real time even
 on a virtual loop.
 
+Budget: a shrink-only per-file baseline of uncovered violations,
+``_timing_dependence_debt.py::TIMING_DEPENDENCE_DEBT``, applied after coverage.
+
 Hang floor: a literal sleep of ``HANG_SIMULATOR_FLOOR_SECS`` or more, or inf,
 simulates a hang.  A passing test never waits one out, it cancels it, so it
 cannot make a verdict load-sensitive; the census found no literal sleep between
@@ -52,7 +55,8 @@ from typing import NamedTuple
 # Sibling import that survives `python3 -I`: see _lint_cli.py's module docstring.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 try:
-    from _lint_cli import DebtBaseline, Violation
+    from _lint_cli import DebtBaseline, DebtEntry, Violation, apply_debt_budget
+    from _timing_dependence_debt import TIMING_DEPENDENCE_DEBT
 finally:
     del sys.path[0]
 
@@ -65,10 +69,13 @@ finally:
 
 RULE_CODE = 'timing-dependence'
 HANG_SIMULATOR_FLOOR_SECS = 60
+TIMING_DEPENDENCE_BUDGETS = DebtBaseline.from_mapping(TIMING_DEPENDENCE_DEBT)
 
 _FAKE_CLOCK_REF = 'shared/src/shared/pytest_fake_clock.py::fake_clock'
 _VIRTUAL_CLOCK_REF = 'shared/src/shared/testing_virtual_clock.py::virtual_clock_test'
 _OWN_TIME_REF = 'shared/src/shared/testing_own_time.py'
+_DEBT_HOME = 'fused-memory/scripts/_timing_dependence_debt.py'
+_INV12_DECLARATION = 'fused-memory/tests/test_fused_memory_governed_lists.py::TIMING_DEPENDENCE_BASELINE'
 _MARKER_CLAUSE = (
     " Mark the test @pytest.mark.timing(reason='<why>') only when a deadline is the"
     ' behaviour under test; the marker covers only with a non-empty literal reason=.'
@@ -561,11 +568,49 @@ _MESSAGES = {
 }
 
 
+def _overrun_msg(entry: DebtEntry, found: int) -> str:
+    return (
+        f'{RULE_CODE}: this file is on the SHRINK-ONLY timing-dependence debt baseline'
+        f' with a recorded budget of {entry.budget} violation(s), but {found} were'
+        f' found, {found - entry.budget} over budget. The reported sites are the LAST in'
+        ' source order: the anchor is positional, not a claim that they are the new ones.'
+        ' Fix one by waiting on the event or a polled predicate, the fake_clock fixture'
+        f' ({_FAKE_CLOCK_REF}), virtual_clock_test ({_VIRTUAL_CLOCK_REF}) or a bound'
+        f' derived from a named constant; for a real child, {_OWN_TIME_REF}.'
+        + _MARKER_CLAUSE
+        + f' Do NOT raise TIMING_DEPENDENCE_DEBT[{entry.key!r}] in {_DEBT_HOME}.'
+    )
+
+
+def _slack_msg(entry: DebtEntry, found: int) -> str:
+    key = f'TIMING_DEPENDENCE_DEBT[{entry.key!r}]'
+    if found == 0:
+        edit = (
+            f'This file is fully migrated: delete {key} in {_DEBT_HOME}. While other'
+            f' entries remain, the INV-12 declaration {_INV12_DECLARATION} is unaffected.'
+        )
+    else:
+        edit = f'Fix: lower {key} from {entry.budget} to {found} in {_DEBT_HOME}.'
+    return (
+        f'{RULE_CODE}: this file is on the SHRINK-ONLY timing-dependence debt baseline'
+        f' with a recorded budget of {entry.budget} violation(s), but only {found} were'
+        ' found. A budget above the measurement lets that many NEW timing-dependent'
+        f' sites land here silently. {edit}'
+    )
+
+
 def timing_violations(
     facts: Iterable[TimingFact], *, filename: str, budgets: DebtBaseline
 ) -> list[Violation]:
-    """Rule D's violations for one file, from every fact its walk produced."""
-    return [
+    """Rule D's violations for one file, from every fact its walk produced, after its budget."""
+    found = [
         Violation(filename, site.lineno, site.col_offset, _MESSAGES[site.kind](site))
         for site in uncovered_timing_sites(facts)
     ]
+    return apply_debt_budget(
+        found,
+        budgets.entry_for(filename),
+        filename=filename,
+        build_overrun_msg=_overrun_msg,
+        build_slack_msg=_slack_msg,
+    )
