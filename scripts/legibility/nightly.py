@@ -166,27 +166,22 @@ def select_scored_records(
 ) -> list[sampling.ScoredRecord]:
     """Enumerate *target_date*'s sessions for *cfg* and score each one with
     :func:`legibility.sampling.score_session`, the loop ``sampling.main``
-    uses too. A session whose first ``sessionId`` is in *skip_sessions* is
-    dropped before scoring, as ``census_window.SessionBatchSource._select``
-    drops a ledgered one."""
+    uses too. A session in *skip_sessions* is dropped before scoring by
+    :func:`legibility.sampling.drop_coded`, the filter
+    ``census_window.WindowBatchSource`` shares."""
     sessions = inventory.enumerate_sessions(
         projects_root, cfg.cwd_prefixes, target_date,
         agent_transcript_roots=inventory.resolve_agent_transcript_roots(
             cfg.project_root, cfg.agent_transcript_roots
         ),
     )
-    if skip_sessions:
-        uncoded = [
-            session for session in sessions
-            if sampling.peek_session_id(session.path) not in skip_sessions
-        ]
-        if len(uncoded) < len(sessions):
-            logger.info(
-                'legibility trickle: project=%s date=%s skipped %d already-coded session(s)',
-                cfg.project_id, target_date.isoformat(), len(sessions) - len(uncoded),
-            )
-        sessions = uncoded
-    return [sampling.score_session(session) for session in sessions]
+    uncoded = sampling.drop_coded(sessions, skip_sessions)
+    if len(uncoded) < len(sessions):
+        logger.info(
+            'legibility trickle: project=%s date=%s skipped %d already-coded session(s)',
+            cfg.project_id, target_date.isoformat(), len(sessions) - len(uncoded),
+        )
+    return [sampling.score_session(session) for session in uncoded]
 
 
 def select_digest_sessions(
@@ -1388,16 +1383,11 @@ def _load_config_for_project(
 
 
 def _ledgered_sessions(cfg: LegibilityConfig) -> frozenset[str]:
-    """The sessions *cfg*'s session ledger already holds; empty when it is
-    absent or unreadable."""
-    snapshot = session_ledger.read_ledger(session_ledger.ledger_path(cfg.project_id))
-    if snapshot.state is session_ledger.LedgerState.UNREADABLE:
-        logger.warning(
-            'legibility trickle: session ledger unreadable, so no already-coded '
-            'session is skipped this pass: %s',
-            snapshot.error,
-        )
-    return snapshot.sessions
+    """The sessions a pass must not code again, read from (never written to)
+    *cfg*'s session ledger by :func:`session_ledger.already_coded`'s rule."""
+    return session_ledger.already_coded(
+        session_ledger.read_ledger(session_ledger.ledger_path(cfg.project_id)), log=logger,
+    )
 
 
 class _LedgerSkips(NamedTuple):
