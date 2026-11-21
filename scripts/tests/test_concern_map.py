@@ -569,6 +569,18 @@ class TestMarkdownRendering:
         assert '- A, B' in cycles.split('##', 1)[0]
         assert '`_count`: A, B' in out
 
+    @pytest.mark.parametrize('with_partition', [False, True])
+    def test_every_table_row_has_as_many_cells_as_its_header(
+        self, capsys, engine_root, tmp_path, with_partition
+    ) -> None:
+        extra = ['--partition', _partition_file(tmp_path, PARTITION)] if with_partition else []
+        _, out, _ = _run(capsys, engine_root, *extra)
+        tables = [block for block in out.split('\n\n') if block.startswith('|')]
+        assert len(tables) == (4 if with_partition else 1)
+        for table in tables:
+            widths = {line.count('|') for line in table.splitlines()}
+            assert len(widths) == 1, table
+
     def test_an_acyclic_partition_says_none_explicitly(self, capsys, engine_root, tmp_path) -> None:
         acyclic = {'all': [unit.name for unit in _measure().units]}
         _, out, _ = _run(

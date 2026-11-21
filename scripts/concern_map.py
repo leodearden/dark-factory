@@ -15,18 +15,33 @@ with the file total is a MetricsError, never a result (INV-11). A partition
 assigns every unit to exactly one cluster; its evaluation reports what the
 split would cost in heuristic-13 terms: refs crossing clusters, cluster
 cycles, and attributes written from more than one cluster.
+
+Exit codes
+----------
+0  measured -- the map, and the partition report under ``--partition``, is
+   printed to stdout.
+2  instrument failure (``source_measures.MetricsError``, or its subclass
+   ``PartitionError``) -- the source cannot be read or parsed, the class is
+   absent, the map does not reconcile, the partition file is unreadable or
+   not a JSON object of cluster name to unit names, or the partition does not
+   assign every unit exactly once. Never 1: this is a measurement, not a gate,
+   so no measured result is a failure.
 """
 from __future__ import annotations
 
+import argparse
 import ast
 import dataclasses
 import enum
+import json
+import sys
 from collections import Counter
 from collections.abc import Iterable, Iterator, Mapping, Sequence
+from pathlib import Path
 from types import MappingProxyType
 from typing import TypeGuard
 
-import _checkout as _checkout
+import _checkout
 import source_measures
 from source_measures import MetricsError
 
@@ -40,6 +55,7 @@ __all__ = [
     'Unit',
     'UnitKind',
     'evaluate_partition',
+    'main',
     'measure_module',
 ]
 
@@ -357,6 +373,7 @@ class PartitionReport:
     cyclic_groups: tuple[frozenset[str], ...]
     shared_writes: Mapping[str, frozenset[str]]
     module_unit_users: Mapping[str, frozenset[str]]
+    cluster_of: Mapping[str, str]
 
 
 def evaluate_partition(cmap: ConcernMap, partition: Mapping[str, Sequence[str]]) -> PartitionReport:
@@ -368,6 +385,7 @@ def evaluate_partition(cmap: ConcernMap, partition: Mapping[str, Sequence[str]])
         cyclic_groups=_cyclic_groups(partition, edges),
         shared_writes=_shared_writes(cmap.units, cluster_of),
         module_unit_users=_module_unit_users(cmap.units, cluster_of),
+        cluster_of=MappingProxyType(cluster_of),
     )
 
 
@@ -465,3 +483,206 @@ def _module_unit_users(
         for ref in unit.refs & users.keys():
             users[ref].add(cluster_of[unit.name])
     return MappingProxyType({name: frozenset(clusters) for name, clusters in users.items()})
+
+
+# ---------------------------------------------------------------------------
+# Renderings: sorted and deterministic, so a committed one diffs cleanly.
+
+
+def _edge_key(key: tuple[str, str]) -> str:
+    return f'{key[0]} -> {key[1]}'
+
+
+def _unit_json(unit: Unit) -> dict[str, object]:
+    return {
+        'name': unit.name,
+        'kind': unit.kind.value,
+        'lines': unit.lines,
+        'prose_lines': unit.prose_lines,
+        'writes': sorted(unit.writes),
+        'reads': sorted(unit.reads),
+        'refs': sorted(unit.refs),
+    }
+
+
+def _report_json(report: PartitionReport) -> dict[str, object]:
+    return {
+        'clusters': {name: dataclasses.asdict(size) for name, size in report.clusters.items()},
+        'edges': {
+            _edge_key(key): {'count': edge.count, 'sample': list(edge.sample)}
+            for key, edge in report.edges.items()
+        },
+        'cyclic_groups': [sorted(group) for group in report.cyclic_groups],
+        'shared_writes': {name: sorted(owners) for name, owners in report.shared_writes.items()},
+        'module_unit_users': {
+            name: sorted(users) for name, users in report.module_unit_users.items()
+        },
+        'cluster_of': dict(report.cluster_of),
+    }
+
+
+def _render_json(cmap: ConcernMap, report: PartitionReport | None) -> str:
+    rendered: dict[str, object] = {
+        'path': cmap.path,
+        'class_name': cmap.class_name,
+        'total_lines': cmap.total_lines,
+        'residual': dict(cmap.residual),
+        'units': [_unit_json(unit) for unit in cmap.units],
+    }
+    if report is not None:
+        rendered['partition'] = _report_json(report)
+    return json.dumps(rendered, indent=2)
+
+
+def _table(header: Sequence[str], rows: Iterable[Sequence[object]]) -> str:
+    body = [list(row) for row in rows]
+    numeric = [
+        bool(body) and all(isinstance(row[column], int) for row in body)
+        for column in range(len(header))
+    ]
+    separator = ['---:' if right else '---' for right in numeric]
+    return '\n'.join(
+        '| ' + ' | '.join(str(cell) for cell in row) + ' |'
+        for row in (header, separator, *body)
+    )
+
+
+def _names(names: Iterable[str]) -> str:
+    return ', '.join(sorted(names))
+
+
+def _bullets(items: Sequence[str]) -> str:
+    return '\n'.join(f'- {item}' for item in items) if items else 'none'
+
+
+def _markdown_header(cmap: ConcernMap) -> str:
+    in_units = sum(unit.lines for unit in cmap.units)
+    buckets = ', '.join(f'{name} {count}' for name, count in cmap.residual.items())
+    return (
+        f'# Concern map: `{cmap.path}`, class `{cmap.class_name}`\n\n'
+        f'{cmap.total_lines} lines: {in_units} in {len(cmap.units)} units, and the '
+        f'residual buckets {buckets}.'
+    )
+
+
+def _markdown_units(cmap: ConcernMap, report: PartitionReport | None) -> str:
+    cluster_column = [] if report is None else ['cluster']
+    rows = [
+        [
+            unit.name, unit.kind.value, unit.lines, unit.prose_lines,
+            _names(unit.writes), _names(unit.reads), _names(unit.refs),
+            *([] if report is None else [report.cluster_of[unit.name]]),
+        ]
+        for unit in cmap.units
+    ]
+    header = ['unit', 'kind', 'lines', 'prose', 'writes', 'reads', 'refs', *cluster_column]
+    return '## Units\n\n' + _table(header, rows)
+
+
+def _markdown_partition(report: PartitionReport) -> list[str]:
+    clusters = _table(
+        ['cluster', 'units', 'lines', 'prose'],
+        ([name, size.units, size.lines, size.prose_lines] for name, size in report.clusters.items()),
+    )
+    edges = _table(
+        ['from', 'to', 'refs', 'sample'],
+        ([*key, edge.count, ' -> '.join(edge.sample)] for key, edge in report.edges.items()),
+    ) if report.edges else 'none'
+    users = _table(
+        ['module unit', 'clusters'],
+        ([name, _names(found) or 'none'] for name, found in report.module_unit_users.items()),
+    )
+    return [
+        '## Clusters\n\n' + clusters,
+        '## Cross-cluster edges\n\n' + edges,
+        '## Cyclic cluster groups\n\n' + _bullets([_names(group) for group in report.cyclic_groups]),
+        '## Shared writes\n\n' + _bullets(
+            [f'`{name}`: {_names(owners)}' for name, owners in report.shared_writes.items()]
+        ),
+        '## Module-unit users\n\n' + users,
+    ]
+
+
+def _render_markdown(cmap: ConcernMap, report: PartitionReport | None) -> str:
+    sections = [_markdown_header(cmap), _markdown_units(cmap, report)]
+    if report is not None:
+        sections.extend(_markdown_partition(report))
+    return '\n\n'.join(sections)
+
+
+# ---------------------------------------------------------------------------
+# Command line, in the house shape of scripts/merge_lane_metrics.py.
+
+
+def _is_partition(content: object) -> TypeGuard[dict[str, list[str]]]:
+    return isinstance(content, dict) and all(
+        isinstance(cluster, str)
+        and isinstance(members, list)
+        and all(isinstance(member, str) for member in members)
+        for cluster, members in content.items()
+    )
+
+
+def _load_partition(path: str) -> dict[str, list[str]]:
+    try:
+        content = json.loads(Path(path).read_text(encoding='utf-8'))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise MetricsError(
+            f'{path}: could not be read as a partition -- {exc.__class__.__name__}: {exc}'
+        ) from exc
+    if not _is_partition(content):
+        raise MetricsError(
+            f'{path}: a partition is a JSON object mapping each cluster name to a '
+            'list of unit names'
+        )
+    return content
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Measure one module into units (a class's methods and the module's "
+            'top-level bindings), and evaluate a proposed partition of them.'
+        ),
+        epilog=(
+            'Exit codes: 0 measured; 2 instrument failure (an unreadable or '
+            'unparseable source, an absent class, a map that does not reconcile, '
+            'an unreadable or malformed partition file, or a partition that does '
+            'not assign every unit exactly once). Never 1: a measurement is not a gate.'
+        ),
+    )
+    parser.add_argument('path', help='The module to measure, relative to --root.')
+    parser.add_argument(
+        '--class', dest='class_name', required=True, help='The class whose methods are units.'
+    )
+    parser.add_argument(
+        '--partition',
+        help='A JSON object mapping each cluster name to its unit names; adds its report.',
+    )
+    parser.add_argument('--format', choices=('markdown', 'json'), default='markdown')
+    parser.add_argument(
+        '--root', default=str(_checkout.ROOT), help='The checkout root (default: this one).'
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI entry point. See the module docstring for the exit-code contract."""
+    args = _build_parser().parse_args(argv)
+    try:
+        source = source_measures.read_source(Path(args.root), args.path)
+        cmap = measure_module(source, path=args.path, class_name=args.class_name)
+        report = (
+            None if args.partition is None
+            else evaluate_partition(cmap, _load_partition(args.partition))
+        )
+    except MetricsError as exc:
+        print(f'concern_map: {exc}', file=sys.stderr)
+        return 2
+    render = _render_json if args.format == 'json' else _render_markdown
+    print(render(cmap, report))
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
