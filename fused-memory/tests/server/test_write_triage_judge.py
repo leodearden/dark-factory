@@ -1418,11 +1418,6 @@ class TestResolveJudgeApiUrl:
     def test_the_schema_stores_a_blank_url_as_inherit(self, value: str) -> None:
         assert WriteTriageConfig(judge_api_url=value).judge_api_url is None
 
-    def test_the_shipped_config_inherits(self) -> None:
-        """The tracked config.yaml, not just the code default, ships null."""
-        service = types.SimpleNamespace(config=FusedMemoryConfig())
-        assert resolve_judge_api_url(service) is None
-
 
 class TestResolveJudgeApiKey:
     """`judge_api_key` — the judge's OWN key, else None meaning INHERIT.
@@ -1854,6 +1849,50 @@ class TestProviderCredentials:
         )
         assert _provider_credentials(service, 'openai').client_kwargs == {
             'api_key': 'sk-p', 'base_url': 'https://main.example/v1',
+        }
+
+
+_PLAN_PROXY_VARS = ('OPENAI_PLAN_PROXY_URL', 'OPENAI_PLAN_PROXY_KEY')
+
+
+class TestTheShippedJudgeRoute:
+    """The tracked config.yaml routes the judge by the plan-proxy variables.
+
+    Each test sets or deletes both variables itself: server/main.py's
+    import-time load_dotenv() can inject the main checkout's .env into this process.
+    """
+
+    def test_with_the_plan_proxy_variables_set_the_judge_is_routed_to_the_proxy(
+        self, monkeypatch,
+    ) -> None:
+        monkeypatch.setenv('OPENAI_PLAN_PROXY_URL', 'http://127.0.0.1:8317/v1')
+        monkeypatch.setenv('OPENAI_PLAN_PROXY_KEY', 'sk-fm-plan-proxy')
+        monkeypatch.setenv('OPENAI_API_KEY', 'sk-api')
+        service = types.SimpleNamespace(config=FusedMemoryConfig())
+        provider = resolve_judge_provider(service)
+        assert provider == 'openai'
+
+        creds = _provider_credentials(service, provider)
+
+        assert creds.client_kwargs == {
+            'api_key': 'sk-fm-plan-proxy', 'base_url': 'http://127.0.0.1:8317/v1',
+        }
+        assert creds.serves_responses_api is True
+        assert resolve_judge_model(service) == 'gpt-6.1-sol'
+        assert resolve_judge_reasoning_effort(service) == 'low'
+
+    def test_with_the_plan_proxy_variables_unset_the_judge_inherits_the_provider_pair(
+        self, monkeypatch,
+    ) -> None:
+        for name in (*_PLAN_PROXY_VARS, 'OPENAI_API_URL'):
+            monkeypatch.delenv(name, raising=False)
+        monkeypatch.setenv('OPENAI_API_KEY', 'sk-api')
+        service = types.SimpleNamespace(config=FusedMemoryConfig())
+
+        assert resolve_judge_api_url(service) is None
+        assert resolve_judge_api_key(service) is None
+        assert _provider_credentials(service, 'openai').client_kwargs == {
+            'api_key': 'sk-api', 'base_url': 'https://api.openai.com/v1',
         }
 
 
