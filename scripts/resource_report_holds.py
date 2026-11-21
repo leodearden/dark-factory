@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, fields
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -23,30 +23,48 @@ from types import MappingProxyType
 from typing import Any
 
 import _checkout as _checkout
-from sampler.consumers import Consumer, Figure, Role, classify_member, encode_consumer
+from sampler.consumers import (
+    Consumer,
+    Figure,
+    FigureKind,
+    Role,
+    classify_member,
+    encode_consumer,
+    parse_consumer,
+)
 from sampler.metrics import FIGURE_METRICS, MetricSpec
 from shared.project_layout import runs_db
 from shared.psi import ARM_FIELDS, PsiSample
 from shared.verify_scope_tag import scope_tag_for
 
 __all__ = [
+    'ASIDE_ROLES',
     'MEMORY_ARMS',
+    'Aside',
+    'ConsumerWindow',
     'Hold',
     'HoldConsumers',
     'HoldReading',
     'HoldState',
     'HoldsReport',
+    'ProjectConsumer',
+    'ProjectStatus',
     'RootRead',
     'RootStatus',
     'SamplesUnavailable',
     'Window',
+    'aside',
     'format_utc',
     'hold_consumers',
+    'holding_project',
+    'incomplete',
     'parse_utc',
     'read_holds_report',
     'read_root',
     'render_text',
     'report_json',
+    'who_grew',
+    'who_paid',
 ]
 
 
@@ -210,6 +228,14 @@ class HoldConsumers:
     verify: Consumer
     unmapped_reason: str | None
 
+    def by_role(self) -> Mapping[Role, Consumer | None]:
+        return {
+            Role.SERVICE: self.service,
+            Role.AGENTS: self.agents,
+            Role.VERIFY: self.verify,
+            Role.PROJECT: self.project,
+        }
+
 
 _DAEMON_PLACEMENTS = frozenset({Role.SERVICE, Role.PROJECT})
 """What the recorder's own rule makes of a daemon's last segment: its unit, or its project slice."""
@@ -325,12 +351,106 @@ _STATE_TEXT: Mapping[HoldState, str] = MappingProxyType({
 
 
 @dataclass(frozen=True)
+class ConsumerWindow:
+    """One consumer's figures over a window; absent at a collection counts as none (C1)."""
+
+    consumer: Consumer
+    program_growth_bytes: float
+    swap_growth_bytes: float
+    reclaimed_pages: float
+    memory_some_stall_seconds: float
+    memory_full_stall_seconds: float
+    cpu_usec: float
+    complete: bool
+    """False when the consumer was flagged unreadable at any collection of the window."""
+
+    @property
+    def grew(self) -> float:
+        """Program memory plus swap growth: a swap-out moves memory, it does not shrink it."""
+        return self.program_growth_bytes + self.swap_growth_bytes
+
+
+@dataclass(frozen=True)
 class Window:
     """The collections a hold is read over: gauges at start and end, increments in (start, end]."""
 
     start: datetime
     end: datetime
     collections: int
+    consumers: Mapping[Consumer, ConsumerWindow]
+
+
+_RECLAIM_FIGURES = (Figure.RECLAIM_KSWAPD_PAGES, Figure.RECLAIM_DIRECT_PAGES)
+_WINDOW_FIGURES = (
+    Figure.ANON,
+    Figure.SWAP,
+    *_RECLAIM_FIGURES,
+    Figure.MEMORY_SOME_STALL_USEC,
+    Figure.MEMORY_FULL_STALL_USEC,
+    Figure.CPU_USEC,
+)
+_FIGURE_NAMED: Mapping[str, Figure] = MappingProxyType(
+    {FIGURE_METRICS[figure].spec.name: figure for figure in _WINDOW_FIGURES}
+)
+_WINDOW_SPECS = (_READ_OK, *(FIGURE_METRICS[figure].spec for figure in _WINDOW_FIGURES))
+
+
+class _WindowRows:
+    """The window's rows, sorted into gauges at its two ends and increments inside it."""
+
+    def __init__(self, start: int, end: int) -> None:
+        self.start, self.end = start, end
+        self.collections: set[int] = set()
+        self.gauges: dict[tuple[Consumer, Figure, int], float] = {}
+        self.increments: dict[Consumer, dict[Figure, float]] = {}
+        """Every consumer with a row in the window, and its counters summed over (start, end]."""
+        self.unreadable: set[Consumer] = set()
+
+    def add(self, ts: int, metric: str, leaf: str | None, value: float) -> None:
+        if leaf is None:
+            raise ValueError(f'a consumer metric row without a consumer: {metric} at {ts}')
+        consumer = parse_consumer(leaf)
+        increments = self.increments.setdefault(consumer, {})
+        if metric == _READ_OK.name:
+            self.collections.add(ts)
+            if not value:
+                self.unreadable.add(consumer)
+            return
+        figure = _FIGURE_NAMED[metric]
+        if figure.kind is FigureKind.GAUGE:
+            self.gauges[(consumer, figure, ts)] = value
+        elif ts > self.start:
+            increments[figure] = increments.get(figure, 0.0) + value
+
+    def growth(self, consumer: Consumer, figure: Figure) -> float:
+        return self.gauges.get((consumer, figure, self.end), 0.0) - self.gauges.get(
+            (consumer, figure, self.start), 0.0
+        )
+
+    def consumer_window(self, consumer: Consumer) -> ConsumerWindow:
+        increments = self.increments[consumer]
+        return ConsumerWindow(
+            consumer=consumer,
+            program_growth_bytes=self.growth(consumer, Figure.ANON),
+            swap_growth_bytes=self.growth(consumer, Figure.SWAP),
+            reclaimed_pages=sum(increments.get(figure, 0.0) for figure in _RECLAIM_FIGURES),
+            memory_some_stall_seconds=increments.get(Figure.MEMORY_SOME_STALL_USEC, 0.0),
+            memory_full_stall_seconds=increments.get(Figure.MEMORY_FULL_STALL_USEC, 0.0),
+            cpu_usec=increments.get(Figure.CPU_USEC, 0.0),
+            complete=consumer not in self.unreadable,
+        )
+
+
+def _window(samples: _Samples, start: int, end: int) -> Window:
+    rows = _WindowRows(start, end)
+    for row in samples.rows(_WINDOW_SPECS, start, end):
+        rows.add(*row)
+    return Window(
+        start=_utc(start),
+        end=_utc(end),
+        collections=len(rows.collections),
+        consumers=MappingProxyType({c: rows.consumer_window(c) for c in sorted(rows.increments)}),
+    )
 
 
 @dataclass(frozen=True)
@@ -360,10 +480,131 @@ def _read_hold(samples: _Samples, hold: Hold, window_seconds: int) -> HoldReadin
         start = samples.first()
     if start is None or end < opens or start == end:
         return HoldReading(hold, mapping, HoldState.NO_SAMPLES, None, _utc(end))
-    collections = len({row[0] for row in samples.rows((_READ_OK,), start, end)})
-    return HoldReading(
-        hold, mapping, HoldState.RANKED, Window(_utc(start), _utc(end), collections), _utc(end)
+    return HoldReading(hold, mapping, HoldState.RANKED, _window(samples, start, end), _utc(end))
+
+
+# ---------------------------------------------------------------------------
+# The two rankings, and what is reported beside them
+# ---------------------------------------------------------------------------
+
+ASIDE_ROLES: Mapping[Role, str] = MappingProxyType(
+    {Role.KERNEL: 'kernel', Role.OTHER: 'unattributed', Role.EXITED: 'exited'}
+)
+"""The roles reported beside the rankings rather than in them, each with its label."""
+
+
+def _ranked(window: Window) -> list[ConsumerWindow]:
+    return [c for c in window.consumers.values() if c.consumer.role not in ASIDE_ROLES]
+
+
+def who_grew(window: Window) -> tuple[ConsumerWindow, ...]:
+    """The consumers whose program memory plus swap grew, most first."""
+    grown = (c for c in _ranked(window) if c.grew > 0)
+    return tuple(sorted(grown, key=lambda c: (-c.grew, c.consumer)))
+
+
+def who_paid(window: Window) -> tuple[ConsumerWindow, ...]:
+    """The consumers pages were reclaimed from, most first; then their own memory stall."""
+    paid = (
+        c
+        for c in _ranked(window)
+        if c.reclaimed_pages > 0 or c.memory_full_stall_seconds > 0 or c.memory_some_stall_seconds > 0
     )
+    return tuple(
+        sorted(
+            paid,
+            key=lambda c: (
+                -c.reclaimed_pages,
+                -c.memory_full_stall_seconds,
+                -c.memory_some_stall_seconds,
+                c.consumer,
+            ),
+        )
+    )
+
+
+def _share(part: float, whole: float) -> float | None:
+    return None if whole == 0 else part / whole
+
+
+@dataclass(frozen=True)
+class Aside:
+    """One aside role's figures, and its shares of all consumers' positive growth and pages."""
+
+    label: str
+    grew: float
+    reclaimed_pages: float
+    growth_share: float | None
+    reclaim_share: float | None
+
+
+def total_positive_growth(window: Window) -> float:
+    return sum(max(c.grew, 0.0) for c in window.consumers.values())
+
+
+def total_reclaimed(window: Window) -> float:
+    return sum(c.reclaimed_pages for c in window.consumers.values())
+
+
+def aside(window: Window) -> tuple[Aside, ...]:
+    """The kernel, unattributed and exited figures, in ``ASIDE_ROLES`` order."""
+    growth, pages = total_positive_growth(window), total_reclaimed(window)
+    rows = []
+    for role, label in ASIDE_ROLES.items():
+        members = [c for c in window.consumers.values() if c.consumer.role is role]
+        grew = sum(c.grew for c in members)
+        reclaimed = sum(c.reclaimed_pages for c in members)
+        rows.append(Aside(label, grew, reclaimed, _share(grew, growth), _share(reclaimed, pages)))
+    return tuple(rows)
+
+
+def incomplete(window: Window) -> tuple[Consumer, ...]:
+    return tuple(c.consumer for c in window.consumers.values() if not c.complete)
+
+
+class ProjectStatus(StrEnum):
+    PRESENT = 'present'
+    ABSENT = 'absent'
+    NOT_MAPPED = 'not_mapped'
+
+
+@dataclass(frozen=True)
+class ProjectConsumer:
+    """One of the holding project's consumers, as the window saw it; a rank is 1-based."""
+
+    role: Role
+    consumer: Consumer | None
+    status: ProjectStatus
+    reason: str | None
+    figures: ConsumerWindow | None
+    who_grew_rank: int | None
+    who_paid_rank: int | None
+
+
+_NO_PROJECT_SLICE = 'the daemon runs in its own unit, so the project has no project slice'
+
+
+def _rank(consumer: Consumer, ranking: Sequence[ConsumerWindow]) -> int | None:
+    return next((i for i, row in enumerate(ranking, start=1) if row.consumer == consumer), None)
+
+
+def holding_project(mapping: HoldConsumers, window: Window) -> tuple[ProjectConsumer, ...]:
+    """The holding project's service, agents, verify and project consumers over *window*."""
+    grew, paid = who_grew(window), who_paid(window)
+    rows = []
+    for role, consumer in mapping.by_role().items():
+        if consumer is None:
+            reason = mapping.unmapped_reason or _NO_PROJECT_SLICE
+            rows.append(ProjectConsumer(role, None, ProjectStatus.NOT_MAPPED, reason, None, None, None))
+            continue
+        figures = window.consumers.get(consumer)
+        status = ProjectStatus.ABSENT if figures is None else ProjectStatus.PRESENT
+        rows.append(
+            ProjectConsumer(
+                role, consumer, status, None, figures, _rank(consumer, grew), _rank(consumer, paid)
+            )
+        )
+    return tuple(rows)
 
 
 # ---------------------------------------------------------------------------
@@ -461,18 +702,118 @@ def _heading(hold: Hold) -> str:
     return f'hold {format_utc(hold.at)}  {hold.project_root}  task {hold.task_id}  {hold.arm} {value}'
 
 
-def _window_lines(window: Window) -> list[str]:
+_TOP = 5
+_MiB = 2**20
+_GiB = 2**30
+
+
+def _bytes(value: float) -> str:
+    sign = '-' if value < 0 else '+'
+    size = abs(value)
+    if size >= _GiB:
+        return f'{sign}{size / _GiB:.2f} GiB'
+    if size >= _MiB:
+        return f'{sign}{size / _MiB:.1f} MiB'
+    return f'{sign}{size:.0f} B'
+
+
+def _pages(value: float) -> str:
+    return f'{value:.0f} pages'
+
+
+def _percent(share: float | None) -> str:
+    return 'n/a' if share is None else f'{share:.1%}'
+
+
+def _growth(c: ConsumerWindow) -> str:
+    return (
+        f'{_bytes(c.grew)} (program {_bytes(c.program_growth_bytes)}, '
+        f'swap {_bytes(c.swap_growth_bytes)})'
+    )
+
+
+def _paid(c: ConsumerWindow) -> str:
+    return (
+        f'{_pages(c.reclaimed_pages)}, stall some {c.memory_some_stall_seconds:.1f} s, '
+        f'full {c.memory_full_stall_seconds:.1f} s'
+    )
+
+
+def _ranking_lines(
+    title: str,
+    empty: str,
+    ranking: Sequence[ConsumerWindow],
+    figures: Callable[[ConsumerWindow], str],
+    marks: Mapping[Consumer, str],
+) -> list[str]:
+    if not ranking:
+        return [f'  {empty}']
+    return [f'  {title}:'] + [
+        f'    {i}. {encode_consumer(c.consumer)}  {figures(c)}{marks.get(c.consumer, "")}'
+        for i, c in enumerate(ranking[:_TOP], start=1)
+    ]
+
+
+def _aside_line(row: Aside) -> str:
+    return (
+        f'  {row.label}: grew {_bytes(row.grew)} ({_percent(row.growth_share)} of growth), '
+        f'{_pages(row.reclaimed_pages)} reclaimed ({_percent(row.reclaim_share)} of pages)'
+    )
+
+
+def _ranks(row: ProjectConsumer) -> str:
+    def rank(value: int | None) -> str:
+        return 'not ranked' if value is None else str(value)
+
+    return f'who grew: {rank(row.who_grew_rank)}; who paid: {rank(row.who_paid_rank)}'
+
+
+def _project_line(row: ProjectConsumer) -> str:
+    if row.consumer is None:
+        return f'    {row.role.value}: not mapped ({row.reason})'
+    name = encode_consumer(row.consumer)
+    if row.figures is None:
+        return f'    {row.role.value}: {name} absent, no rows in the window'
+    return (
+        f'    {row.role.value}: {name} grew {_bytes(row.figures.grew)}, '
+        f'{_pages(row.figures.reclaimed_pages)}; {_ranks(row)}'
+    )
+
+
+def _window_lines(mapping: HoldConsumers, window: Window) -> list[str]:
+    marks = {
+        consumer: f"  [this project's {role.value}]"
+        for role, consumer in mapping.by_role().items()
+        if consumer is not None
+    }
+    unreadable = incomplete(window)
     return [
         f'  window {format_utc(window.start)} to {format_utc(window.end)}, '
         f'{window.collections} collections',
-        '  who grew: no consumer grew',
-        '  who paid: no consumer paid',
+        *_ranking_lines(
+            'who grew (program + swap)', 'who grew: no consumer grew', who_grew(window), _growth, marks
+        ),
+        *_ranking_lines(
+            'who paid (pages reclaimed, own memory stall)',
+            'who paid: no consumer paid',
+            who_paid(window),
+            _paid,
+            marks,
+        ),
+        *(_aside_line(row) for row in aside(window)),
+        '  this project:',
+        *(_project_line(row) for row in holding_project(mapping, window)),
+        *(
+            [f'  incomplete (unreadable in the window): {", ".join(map(encode_consumer, unreadable))}']
+            if unreadable
+            else []
+        ),
     ]
 
 
 def _hold_block(reading: HoldReading) -> list[str]:
     if reading.window is not None:
-        return [_heading(reading.hold), *_window_lines(reading.window)]
+        return [_heading(reading.hold), *_window_lines(reading.mapping, reading.window)]
     last = reading.last_collection
     after = '' if last is None else f'; the last collection was {format_utc(last)}'
     return [_heading(reading.hold), f'  {_STATE_TEXT[reading.state]}{after}']
@@ -511,15 +852,55 @@ def _mapping_json(mapping: HoldConsumers) -> dict[str, Any]:
     }
 
 
-def _window_json(window: Window) -> dict[str, Any]:
+def _figures_json(c: ConsumerWindow) -> dict[str, Any]:
+    return {
+        'consumer': encode_consumer(c.consumer),
+        'grew_bytes': c.grew,
+        'program_growth_bytes': c.program_growth_bytes,
+        'swap_growth_bytes': c.swap_growth_bytes,
+        'reclaimed_pages': c.reclaimed_pages,
+        'memory_some_stall_seconds': c.memory_some_stall_seconds,
+        'memory_full_stall_seconds': c.memory_full_stall_seconds,
+        'cpu_usec': c.cpu_usec,
+        'complete': c.complete,
+    }
+
+
+def _aside_json(row: Aside) -> dict[str, Any]:
+    return {
+        'label': row.label,
+        'grew_bytes': row.grew,
+        'reclaimed_pages': row.reclaimed_pages,
+        'growth_share': row.growth_share,
+        'reclaim_share': row.reclaim_share,
+    }
+
+
+def _project_json(row: ProjectConsumer) -> dict[str, Any]:
+    return {
+        'consumer': _consumer_json(row.consumer),
+        'status': row.status.value,
+        'reason': row.reason,
+        'figures': None if row.figures is None else _figures_json(row.figures),
+        'who_grew_rank': row.who_grew_rank,
+        'who_paid_rank': row.who_paid_rank,
+    }
+
+
+def _window_json(mapping: HoldConsumers, window: Window) -> dict[str, Any]:
     return {
         'window': {
             'start': format_utc(window.start),
             'end': format_utc(window.end),
             'collections': window.collections,
         },
-        'who_grew': [],
-        'who_paid': [],
+        'who_grew': [_figures_json(c) for c in who_grew(window)],
+        'who_paid': [_figures_json(c) for c in who_paid(window)],
+        'aside': [_aside_json(row) for row in aside(window)],
+        'holding_project': {
+            row.role.value: _project_json(row) for row in holding_project(mapping, window)
+        },
+        'incomplete': [encode_consumer(c) for c in incomplete(window)],
     }
 
 
@@ -539,7 +920,7 @@ def _reading_json(reading: HoldReading) -> dict[str, Any]:
         'window': None,
     }
     if reading.window is not None:
-        entry.update(_window_json(reading.window))
+        entry.update(_window_json(reading.mapping, reading.window))
     return entry
 
 
