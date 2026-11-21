@@ -664,3 +664,161 @@ def _touched_row(r: _Replayed, weights: Mapping[str, float]) -> dict[str, Any]:
         'judge_harm': _write_harm(r.truth.triage_cells, weights),
         'recon_harm': None if repaired is None else _write_harm(repaired.triage_cells, weights),
     }
+
+
+_RATE_KEYS = ('n', 'hits', 'rate', 'wilson95', 'population_rate', 'population_interval95')
+_RATE_HEADER = ('n', 'hits', 'rate', 'Wilson 95%', 'population rate', 'population 95%')
+_HARM_REGIMES = ('judge', 'recon', 'status_quo')
+
+
+def render_markdown(report: Mapping[str, Any]) -> str:
+    """*report* as Markdown tables; the same report always renders to the same text."""
+    sections = [
+        _summary_markdown(report),
+        _headline_markdown(report),
+        _by_outcome_markdown(report),
+        _by_project_markdown(report),
+        _confusion_markdown(report),
+        _harm_markdown(report),
+        _missing_markdown(report),
+        _touched_markdown(report),
+    ]
+    return '\n\n'.join(sections) + '\n'
+
+
+def _shown(value: Any) -> str:
+    if value is None:
+        return '—'
+    if isinstance(value, bool):
+        return 'yes' if value else 'no'
+    return str(value)
+
+
+def _table(header: Sequence[str], rows: Iterable[Sequence[Any]]) -> str:
+    lines = [f'| {" | ".join(header)} |', f'|{"---|" * len(header)}']
+    lines += [f'| {" | ".join(_shown(cell) for cell in row)} |' for row in rows]
+    return '\n'.join(lines)
+
+
+def _listed(counts: Mapping[str, Any]) -> str:
+    return ', '.join(f'{key} {value}' for key, value in counts.items())
+
+
+def _rate_cells(block: Mapping[str, Any]) -> list[Any]:
+    return [block[key] for key in _RATE_KEYS]
+
+
+def _summary_markdown(report: Mapping[str, Any]) -> str:
+    sample = report['sample']
+    return '\n'.join([
+        f'# Recon triage replay scores (rubric {report["rubric"]})',
+        '',
+        f'Headline children: {sample["n_headline"]}; report-only: {sample["n_report_only"]};'
+        f' touched (live recon state known): {sample["n_touched"]}.',
+        f'Sampled per stratum: {_listed(sample["by_stratum"])}.',
+        f'Stratum weights: {_listed(sample["stratum_weights"])}.',
+        f'Bootstrap: {report["bootstrap"]["resamples"]} resamples, seed {report["bootstrap"]["seed"]}.',
+    ])
+
+
+def _headline_markdown(report: Mapping[str, Any]) -> str:
+    rows = [
+        [metric, *_rate_cells(block), block.get('correct_contests_detached')]
+        for metric, block in report['headline'].items()
+    ]
+    return '\n'.join([
+        '## Headline',
+        '',
+        _table(['metric', *_RATE_HEADER, 'correct contests detached'], rows),
+    ])
+
+
+def _by_outcome_markdown(report: Mapping[str, Any]) -> str:
+    rows = [[outcome, *_rate_cells(block)] for outcome, block in report['action_accuracy_by_outcome'].items()]
+    return '\n'.join([
+        '## Action accuracy by outcome',
+        '',
+        _table(['outcome', *_RATE_HEADER], rows),
+    ])
+
+
+def _by_project_markdown(report: Mapping[str, Any]) -> str:
+    rows = [
+        [project, metric, *_rate_cells(block), block.get('correct_contests_detached')]
+        for project, metrics in report['by_project'].items()
+        for metric, block in metrics.items()
+    ]
+    return '\n'.join([
+        '## By project',
+        '',
+        _table(['project', 'metric', *_RATE_HEADER, 'correct contests detached'], rows),
+    ])
+
+
+def _confusion_markdown(report: Mapping[str, Any]) -> str:
+    confusion = report['confusion']
+    columns = sorted({recon for row in confusion.values() for recon in row})
+    rows = [
+        [expected, *(row.get(column, 0) for column in columns)]
+        for expected, row in confusion.items()
+    ]
+    return '\n'.join([
+        '## Confusion (expected repair by recon repair)',
+        '',
+        _table(['expected', *columns], rows),
+    ])
+
+
+def _harm_markdown(report: Mapping[str, Any]) -> str:
+    harm = report['harm']
+    rows: list[list[Any]] = []
+    for scope, block in [('all', harm), *harm['by_project'].items()]:
+        rows.append([
+            scope, 'sample', block['n'], *(block['per_write'][regime] for regime in _HARM_REGIMES),
+            block['delta_per_write'], block['delta_interval95'],
+        ])
+        rows.append([
+            scope, 'population', block['n'],
+            *(block['population_per_write'][regime] for regime in _HARM_REGIMES),
+            block['population_delta_per_write'], block['population_delta_interval95'],
+        ])
+    return '\n'.join([
+        f'## Harm per write (weights: {report["harm_weights_status"]})',
+        '',
+        _table(
+            ['scope', 'figure', 'n priced', 'judge', 'recon', 'status quo', 'recon − judge',
+             'recon − judge 95%'],
+            rows,
+        ),
+        '',
+        f'Weights: {_listed(report["harm_weights"])}.',
+    ])
+
+
+def _missing_markdown(report: Mapping[str, Any]) -> str:
+    missing = report['no_decision']
+    unpriced = report['harm']['unpriced']
+    return '\n'.join([
+        '## Missing and unpriced',
+        '',
+        _table(['kind', 'count', 'children'], [
+            ['no_decision', missing['count'], ', '.join(missing['entry_ids'])],
+            ['unpriced', len(unpriced),
+             ', '.join(f'{row["entry_id"]} ({row["action"]}, {row["derivation"]})' for row in unpriced)],
+        ]),
+    ])
+
+
+def _touched_markdown(report: Mapping[str, Any]) -> str:
+    rows = [
+        [row['entry_id'], row['project'], row['outcome'], row['headline'], row['live_recon_state'],
+         ', '.join(row['truth_cells']) or None, row['expected'], row['recon'], row['correct'],
+         row['judge_harm'], row['recon_harm']]
+        for row in report['touched']
+    ]
+    return '\n'.join([
+        '## Touched children (recon or an agent acted on them live)',
+        '',
+        _table(['entry', 'project', 'outcome', 'headline', 'live recon state', 'truth cells',
+                'expected', 'recon', 'correct', 'judge harm', 'recon harm'], rows),
+    ])
