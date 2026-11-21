@@ -933,8 +933,9 @@ def make_insufficient_quota_error(
 
     ``with_code=False`` drops ``code`` and keeps only ``type`` — the shape
     syslog carried during the incident. ``code='credit_balance_exhausted'``
-    is the shape the live deployment returns (esc-10922-1);
-    ``error_type=None`` drops ``type`` so ``code`` alone carries the signal.
+    is the live deployment's shape: its 429 body carries that code with type
+    ``insufficient_quota``. ``error_type=None`` drops ``type`` so ``code``
+    alone carries the signal.
     """
     request = httpx.Request('POST', 'https://api.openai.com/v1/embeddings')
     response = httpx.Response(429, request=request)
