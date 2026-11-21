@@ -228,9 +228,12 @@ function OriginPanel({ origin, win, generatedAt, regimeMarkers }) {
 // Mirrors escalation/src/escalation/classify.py::RESOLVER_TIERS, in its order
 // (dashboard/tests/test_resolver_tier_vocabulary_mirror.py checks it).
 const _RESOLVER_TIERS = ['human-ruled', 'attended-seat', 'cascade', 'auto-watcher', 'steward', 'reaper-sweep', 'unknown', 'other-auto'];
+// Outside C.PALETTE: no PALETTE hue clears the adjacent-pair CVD and
+// normal-vision checks against both neighbours, human-ruled and cascade.
+const _ATTENDED_SEAT_COLOR = 'oklch(0.62 0.14 60)';
 const _TIER_COLORS = {
   'human-ruled': C.PALETTE.ok,
-  'attended-seat': C.PALETTE.fg2,
+  'attended-seat': _ATTENDED_SEAT_COLOR,
   cascade: C.PALETTE.accent,
   'auto-watcher': C.PALETTE.info,
   steward: C.PALETTE.accent2,
