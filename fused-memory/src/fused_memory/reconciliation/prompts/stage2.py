@@ -224,8 +224,8 @@ belongs elsewhere is fine — follow the Authority Model rules for that.
 - Always review the **Proactive Task Sample** section: check in-progress tasks for completion \
 knowledge that should be captured, blocked tasks for unblock conditions that may now be met, \
 and done tasks for missing knowledge capture. **For each done task in the sample, you MUST \
-call `mcp__fused-memory__count_memories_by_metadata(project_id, \
-{{'task_id': str(task_id), 'stage2_suppress': True}})` as the PRIMARY suppression gate, \
+call `mcp__fused-memory__count_memories_by_metadata(project_id=..., \
+filters={{'task_id': str(task_id), 'stage2_suppress': True}})` as the PRIMARY suppression gate, \
 BEFORE any semantic search or finding** — if `count > 0`, skip that done task entirely \
 (no search, no completion note, no missing_knowledge finding). This gate applies to ALL \
 done tasks in the proactive sample, not just those already flagged by Stage 1.
@@ -235,8 +235,8 @@ reconciliation cycle boundary (via an `updatedAt`-window scan) — it is the AUT
 surface for done-task completion-memory coverage and SUPERSEDES the 5-item **Proactive \
 Task Sample** for that purpose (the sample is a small mixed-status spot-check and \
 systematically under-covers done tasks). For EACH task in the audit section, run the same \
-`stage2_suppress` count-gate FIRST — call `mcp__fused-memory__count_memories_by_metadata(project_id, \
-{{'task_id': str(task_id), 'stage2_suppress': True}})`; if `count > 0`, skip that task \
+`stage2_suppress` count-gate FIRST — call `mcp__fused-memory__count_memories_by_metadata(project_id=..., \
+filters={{'task_id': str(task_id), 'stage2_suppress': True}})`; if `count > 0`, skip that task \
 entirely; otherwise search for related memories and, if completion knowledge is genuinely \
 missing, write a completion note tagged `metadata={{'stage2_suppress': True, 'task_id': \
 str(task_id), 'kind': '{STAGE2_SUPPRESS_GUARD_KIND}'}}` (see the Completion-Note \
@@ -333,8 +333,8 @@ claim about completed work and needs no verification).
 Before writing ANY completion note or "task marked done, no knowledge captured" memory \
 for an already-done task, you MUST first call:
 
-  `mcp__fused-memory__count_memories_by_metadata(project_id, \
-{{'task_id': str(task_id), 'stage2_suppress': True}})`
+  `mcp__fused-memory__count_memories_by_metadata(project_id=..., \
+filters={{'task_id': str(task_id), 'stage2_suppress': True}})`
 
 If this call returns `count > 0`, SKIP the completion-note write entirely — one or more \
 guard memories already exist for this task (carrying `stage2_suppress: True` in their \
