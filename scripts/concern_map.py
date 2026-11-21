@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Measure one module into units, the input to judging a proposed split of it.
+"""Measure one module into units, and evaluate a proposed partition of them.
 
 A unit is a method of the target class, named ``Class.method``, or a top-level
 def, class or assignment of the module, named by what it binds; every binding
@@ -11,14 +11,18 @@ and the units it refs: a receiver attribute naming a method, called or not, or
 a bare name bound to a top-level unit and not shadowed locally, counting
 everything nested inside the unit. Every line of the file is measured exactly
 once, by a unit or by a named residual bucket; a map that does not reconcile
-with the file total is a MetricsError, never a result (INV-11).
+with the file total is a MetricsError, never a result (INV-11). A partition
+assigns every unit to exactly one cluster; its evaluation reports what the
+split would cost in heuristic-13 terms: refs crossing clusters, cluster
+cycles, and attributes written from more than one cluster.
 """
 from __future__ import annotations
 
 import ast
 import dataclasses
 import enum
-from collections.abc import Iterable, Iterator, Mapping
+from collections import Counter
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from types import MappingProxyType
 from typing import TypeGuard
 
@@ -26,7 +30,18 @@ import _checkout as _checkout
 import source_measures
 from source_measures import MetricsError
 
-__all__ = ['ConcernMap', 'MetricsError', 'Unit', 'UnitKind', 'measure_module']
+__all__ = [
+    'ClusterSize',
+    'ConcernMap',
+    'Edge',
+    'MetricsError',
+    'PartitionError',
+    'PartitionReport',
+    'Unit',
+    'UnitKind',
+    'evaluate_partition',
+    'measure_module',
+]
 
 RESIDUAL_BUCKETS: tuple[str, ...] = ('module_preamble', 'class_non_method', 'module_other', 'inter_unit_gaps')
 
@@ -312,3 +327,141 @@ def _reconcile(path: str, total: int, units: tuple[Unit, ...], residual: Mapping
             f'{path}: units and residual buckets measure {measured} lines but the '
             f'file has {total} -- a line was measured twice or never'
         )
+
+
+# ---------------------------------------------------------------------------
+# Partition evaluation: the measurable heuristic-13 symptoms of a proposed split.
+
+
+class PartitionError(MetricsError):
+    """A partition that does not assign every measured unit to exactly one cluster."""
+
+
+@dataclasses.dataclass(frozen=True)
+class ClusterSize:
+    units: int
+    lines: int
+    prose_lines: int
+
+
+@dataclasses.dataclass(frozen=True)
+class Edge:
+    count: int
+    sample: tuple[str, str]
+
+
+@dataclasses.dataclass(frozen=True)
+class PartitionReport:
+    clusters: Mapping[str, ClusterSize]
+    edges: Mapping[tuple[str, str], Edge]
+    cyclic_groups: tuple[frozenset[str], ...]
+    shared_writes: Mapping[str, frozenset[str]]
+    module_unit_users: Mapping[str, frozenset[str]]
+
+
+def evaluate_partition(cmap: ConcernMap, partition: Mapping[str, Sequence[str]]) -> PartitionReport:
+    cluster_of = _cluster_of(cmap, partition)
+    edges = _edges(cmap.units, cluster_of)
+    return PartitionReport(
+        clusters=_cluster_sizes(cmap.units, partition),
+        edges=edges,
+        cyclic_groups=_cyclic_groups(partition, edges),
+        shared_writes=_shared_writes(cmap.units, cluster_of),
+        module_unit_users=_module_unit_users(cmap.units, cluster_of),
+    )
+
+
+def _cluster_of(cmap: ConcernMap, partition: Mapping[str, Sequence[str]]) -> dict[str, str]:
+    measured = {unit.name for unit in cmap.units}
+    listed = Counter(name for members in partition.values() for name in members)
+    problems = [
+        f'{label}: {", ".join(sorted(names))}'
+        for label, names in (
+            ('unassigned', measured - listed.keys()),
+            ('assigned more than once', {name for name, count in listed.items() if count > 1}),
+            ('not a measured unit', listed.keys() - measured),
+        )
+        if names
+    ]
+    if problems:
+        raise PartitionError(
+            f'{cmap.path}: the partition must assign every unit of {cmap.class_name!r} '
+            f'and the module exactly once -- {"; ".join(problems)}'
+        )
+    return {name: cluster for cluster, members in partition.items() for name in members}
+
+
+def _cluster_sizes(
+    units: tuple[Unit, ...], partition: Mapping[str, Sequence[str]]
+) -> Mapping[str, ClusterSize]:
+    by_name = {unit.name: unit for unit in units}
+    return MappingProxyType({
+        cluster: ClusterSize(
+            units=len(members),
+            lines=sum(by_name[name].lines for name in members),
+            prose_lines=sum(by_name[name].prose_lines for name in members),
+        )
+        for cluster, members in partition.items()
+    })
+
+
+def _edges(units: tuple[Unit, ...], cluster_of: Mapping[str, str]) -> Mapping[tuple[str, str], Edge]:
+    pairs: dict[tuple[str, str], list[tuple[str, str]]] = {}
+    for unit in units:
+        source = cluster_of[unit.name]
+        for ref in unit.refs:
+            if cluster_of[ref] != source:
+                pairs.setdefault((source, cluster_of[ref]), []).append((unit.name, ref))
+    return MappingProxyType({
+        key: Edge(count=len(found), sample=min(found)) for key, found in sorted(pairs.items())
+    })
+
+
+def _cyclic_groups(
+    clusters: Iterable[str], edges: Mapping[tuple[str, str], Edge]
+) -> tuple[frozenset[str], ...]:
+    successors: dict[str, set[str]] = {cluster: set() for cluster in clusters}
+    for source, target in edges:
+        successors[source].add(target)
+    reach = {cluster: _reachable(cluster, successors) for cluster in successors}
+    components = {
+        frozenset({cluster, *(other for other in reach[cluster] if cluster in reach[other])})
+        for cluster in successors
+    }
+    return tuple(sorted((group for group in components if len(group) > 1), key=sorted))
+
+
+def _reachable(start: str, successors: Mapping[str, set[str]]) -> frozenset[str]:
+    seen: set[str] = set()
+    stack = [start]
+    while stack:
+        fresh = successors[stack.pop()] - seen
+        seen |= fresh
+        stack.extend(fresh)
+    return frozenset(seen)
+
+
+def _shared_writes(
+    units: tuple[Unit, ...], cluster_of: Mapping[str, str]
+) -> Mapping[str, frozenset[str]]:
+    writers: dict[str, set[str]] = {}
+    for unit in units:
+        for attribute in unit.writes:
+            writers.setdefault(attribute, set()).add(cluster_of[unit.name])
+    return MappingProxyType({
+        attribute: frozenset(clusters)
+        for attribute, clusters in sorted(writers.items())
+        if len(clusters) > 1
+    })
+
+
+def _module_unit_users(
+    units: tuple[Unit, ...], cluster_of: Mapping[str, str]
+) -> Mapping[str, frozenset[str]]:
+    users: dict[str, set[str]] = {
+        unit.name: set() for unit in units if unit.kind is UnitKind.MODULE
+    }
+    for unit in units:
+        for ref in unit.refs & users.keys():
+            users[ref].add(cluster_of[unit.name])
+    return MappingProxyType({name: frozenset(clusters) for name, clusters in users.items()})
