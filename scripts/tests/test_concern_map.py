@@ -414,6 +414,18 @@ THREE_CYCLE = {
     ],
 }
 
+# Acyclic: top -> mid (poll -> helper_method), top -> bottom (poll -> LIMIT
+# and Failure), mid -> bottom (helper -> LIMIT), top -> leaf (wire -> other).
+ACYCLIC_STRATA = {
+    'top': [
+        'Engine.__init__', 'Engine.poll', 'Engine.size', 'Engine.describe',
+        'Engine.bump', 'Engine.wire',
+    ],
+    'mid': ['Engine.helper_method', 'helper'],
+    'bottom': ['LIMIT', 'Failure'],
+    'leaf': ['Engine.other'],
+}
+
 
 def _report(partition=PARTITION) -> concern_map.PartitionReport:
     return concern_map.evaluate_partition(_measure(), partition)
@@ -507,6 +519,21 @@ class TestEvaluatePartition:
         }
         assert _report(acyclic).cyclic_groups == ()
 
+    def test_strata_layer_an_acyclic_partition_bottom_first(self) -> None:
+        # A cluster with no outgoing edge is stratum 0; any other is one above
+        # the highest stratum it has edges to.
+        assert _report(ACYCLIC_STRATA).strata == (
+            frozenset({'bottom', 'leaf'}), frozenset({'mid'}), frozenset({'top'}),
+        )
+
+    @pytest.mark.parametrize(
+        'partition',
+        [pytest.param(PARTITION, id='two-cycle'), pytest.param(THREE_CYCLE, id='three-cycle')],
+    )
+    def test_a_cyclic_partition_has_no_strata(self, partition) -> None:
+        assert _report(partition).cyclic_groups
+        assert _report(partition).strata == ()
+
     def test_an_attribute_written_from_two_clusters_is_a_shared_write(self) -> None:
         assert dict(_report().shared_writes) == {'_count': frozenset({'A', 'B'})}
 
@@ -523,6 +550,9 @@ class TestEvaluatePartition:
             with pytest.raises(dataclasses.FrozenInstanceError):
                 setattr(report, field.name, getattr(report, field.name))
         assert not isinstance(report.clusters, MutableMapping)
+        strata = _report(ACYCLIC_STRATA).strata
+        assert isinstance(strata, tuple)
+        assert all(isinstance(stratum, frozenset) for stratum in strata)
 
 
 class TestPartitionCoverage:
@@ -580,6 +610,12 @@ class TestJsonRendering:
             'pkg/engine.py', 'Engine', 56,
         )
         assert rendered['residual'] == dict(_measure().residual)
+        assert rendered['residual_mix'] == {
+            'module_preamble': {'blank': 0, 'prose': 1, 'code': 2},
+            'class_non_method': {'blank': 9, 'prose': 1, 'code': 2},
+            'module_other': {'blank': 0, 'prose': 0, 'code': 0},
+            'inter_unit_gaps': {'blank': 8, 'prose': 0, 'code': 0},
+        }
         assert 'partition' not in rendered
 
     def test_each_unit_renders_its_measures_with_sorted_lists(self, capsys, engine_root) -> None:
@@ -616,6 +652,27 @@ class TestJsonRendering:
         assert partition['shared_writes'] == {'_count': ['A', 'B']}
         assert partition['module_unit_users']['LIMIT'] == ['A', 'B']
 
+    def test_every_cluster_renders_its_method_units_and_projection(
+        self, capsys, engine_root, tmp_path
+    ) -> None:
+        _, out, _ = _run(
+            capsys, engine_root, '--format', 'json',
+            '--partition', _partition_file(tmp_path, ACYCLIC_STRATA),
+        )
+        partition = json.loads(out)['partition']
+        assert set(partition['clusters']) == set(ACYCLIC_STRATA)
+        for size in partition['clusters'].values():
+            assert {'method_units', 'projected_lines'} <= size.keys()
+
+    def test_strata_render_as_sorted_lists_bottom_first(
+        self, capsys, engine_root, tmp_path
+    ) -> None:
+        _, out, _ = _run(
+            capsys, engine_root, '--format', 'json',
+            '--partition', _partition_file(tmp_path, ACYCLIC_STRATA),
+        )
+        assert json.loads(out)['partition']['strata'] == [['bottom', 'leaf'], ['mid'], ['top']]
+
     def test_the_rendering_is_deterministic(self, capsys, engine_root, tmp_path) -> None:
         partition = _partition_file(tmp_path, PARTITION)
         first = _run(capsys, engine_root, '--format', 'json', '--partition', partition)[1]
@@ -632,6 +689,15 @@ class TestMarkdownRendering:
         assert len(rows) == len(METHOD_NAMES) + 1
         assert '| Engine.poll | method | 4 | 0 |  | _pool | Engine.helper_method, Failure, LIMIT |' in out
 
+    def test_the_header_renders_each_residual_bucket_with_its_mix(
+        self, capsys, engine_root
+    ) -> None:
+        _, out, _ = _run(capsys, engine_root, '--format', 'markdown')
+        header = out.split('## Units', 1)[0]
+        assert 'class_non_method 12 (9 blank, 1 prose, 2 code)' in header
+        assert 'module_preamble 3 (0 blank, 1 prose, 2 code)' in header
+        assert 'inter_unit_gaps 8 (8 blank, 0 prose, 0 code)' in header
+
     def test_markdown_is_the_default_format(self, capsys, engine_root) -> None:
         assert _run(capsys, engine_root)[1] == _run(capsys, engine_root, '--format', 'markdown')[1]
 
@@ -642,8 +708,8 @@ class TestMarkdownRendering:
             capsys, engine_root, '--format', 'markdown',
             '--partition', _partition_file(tmp_path, PARTITION),
         )
-        assert '| cluster | units | lines | prose |' in out
-        assert '| A | 3 | 10 | 0 |' in out
+        assert '| cluster | units | methods | lines | prose | projected |' in out
+        assert '| A | 3 | 3 | 10 | 0 | 14 |' in out
         assert '| from | to | refs | sample |' in out
         assert '| A | B | 1 | Engine.poll -> Engine.helper_method |' in out
         cycles = out.split('## Cyclic cluster groups', 1)[1]
@@ -661,6 +727,25 @@ class TestMarkdownRendering:
         for table in tables:
             widths = {line.count('|') for line in table.splitlines()}
             assert len(widths) == 1, table
+
+    def test_an_acyclic_partition_lists_its_strata_bottom_first(
+        self, capsys, engine_root, tmp_path
+    ) -> None:
+        _, out, _ = _run(
+            capsys, engine_root, '--format', 'markdown',
+            '--partition', _partition_file(tmp_path, ACYCLIC_STRATA),
+        )
+        assert out.index('## Cyclic cluster groups') < out.index('## Cluster strata (bottom first)')
+        strata = out.split('## Cluster strata (bottom first)', 1)[1].split('##', 1)[0]
+        assert strata.strip().splitlines() == ['- 0: bottom, leaf', '- 1: mid', '- 2: top']
+
+    def test_a_cyclic_partition_says_it_has_no_strata(self, capsys, engine_root, tmp_path) -> None:
+        _, out, _ = _run(
+            capsys, engine_root, '--format', 'markdown',
+            '--partition', _partition_file(tmp_path, PARTITION),
+        )
+        strata = out.split('## Cluster strata (bottom first)', 1)[1].split('##', 1)[0]
+        assert strata.strip() == 'none: the partition has cyclic groups'
 
     def test_an_acyclic_partition_says_none_explicitly(self, capsys, engine_root, tmp_path) -> None:
         acyclic = {'all': [unit.name for unit in _measure().units]}
