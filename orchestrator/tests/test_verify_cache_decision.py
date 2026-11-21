@@ -10,7 +10,6 @@ from typing import Literal
 import pytest
 from _git_fixtures import RepoSeed, seed_repo
 from _orch_helpers import git_env_with_ceiling
-from orchestrator.verify_cache.replay import CacheAccess, ReplayPlan, plan_replay
 
 from orchestrator import verify_plan
 from orchestrator.config import (
@@ -23,6 +22,7 @@ from orchestrator.verify_cache.keys import UnitKey
 from orchestrator.verify_cache.modes import CacheMode, VerifyRole
 from orchestrator.verify_cache.policy import Decision
 from orchestrator.verify_cache.registry import Entry, Registry
+from orchestrator.verify_cache.replay import CacheAccess, ReplayPlan, plan_replay
 from orchestrator.verify_evidence import Leg, module_leg_name
 from orchestrator.verify_plan import VerifyPlan
 
