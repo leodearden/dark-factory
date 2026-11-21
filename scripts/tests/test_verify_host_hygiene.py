@@ -21,6 +21,7 @@ import pytest
 from cli_subprocess_timeout import cli_timeout_from_env
 from committed_git_repo import committed_repo
 from git_repo_probe import git
+from verify_host_hygiene import ScopeMember, scope_is_orphaned
 
 SCRIPT = Path(__file__).resolve().parent.parent / "verify_host_hygiene.py"
 CLI_TIMEOUT = cli_timeout_from_env("VERIFY_HOST_HYGIENE_CLI_TIMEOUT")
@@ -31,8 +32,15 @@ WORKTREE_CLASSES = ("--class", "merge-worktree", "--class", "task-worktree")
 FAKE_SYSTEMCTL = (
     '#!/usr/bin/env bash\n'
     'echo "$*" >>"$FAKE_STATE/systemctl.log"\n'
+    'unit="${@: -1}"\n'
     'case "$*" in\n'
     '  *list-units*) [ -f "$FAKE_STATE/units" ] && cat "$FAKE_STATE/units" ;;\n'
+    '  "--user show -p ControlGroup --value "*) cat "$FAKE_STATE/cgroup.$unit" ;;\n'
+    '  "--user is-active "*)\n'
+    '    state=$(cat "$FAKE_STATE/state.$unit" 2>/dev/null || echo inactive)\n'
+    '    echo "$state"; [ "$state" = active ] || exit 3 ;;\n'
+    '  "--user stop "*)\n'
+    '    [ -f "$FAKE_STATE/sticky.$unit" ] || echo inactive >"$FAKE_STATE/state.$unit" ;;\n'
     'esac\n'
     'exit 0\n'
 )
@@ -303,3 +311,106 @@ def test_apply_failure_exits_nonzero_and_reports_failed(mirror, unremovable):
     for name in APPLY_RECLAIMS:
         assert table[name][1:3] == ("reclaimed", "stale"), name
         assert not mirror.wt(name).exists(), name
+
+
+@pytest.mark.parametrize("members", [
+    (),
+    (ScopeMember(pid=100, ppid=1, parent_comm="systemd"),
+     ScopeMember(pid=101, ppid=0, parent_comm=None)),
+    (ScopeMember(pid=100, ppid=50, parent_comm="systemd"),
+     ScopeMember(pid=101, ppid=100, parent_comm="bash")),
+], ids=["empty", "parents-are-pid-0-or-1", "parents-are-systemd-or-members"])
+def test_scope_without_a_live_controller_is_orphaned(members):
+    assert scope_is_orphaned(members)
+
+
+@pytest.mark.parametrize("members", [
+    (ScopeMember(pid=100, ppid=4242, parent_comm="python3"),),
+    (ScopeMember(pid=100, ppid=4242, parent_comm=None),),
+    (ScopeMember(pid=100, ppid=50, parent_comm="systemd"),
+     ScopeMember(pid=101, ppid=4242, parent_comm="python3")),
+], ids=["python-parent", "unreadable-parent", "one-of-two-roots-has-a-controller"])
+def test_scope_with_a_live_or_unknown_controller_is_not_orphaned(members):
+    assert not scope_is_orphaned(members)
+
+
+CONTROLLER = (
+    "import subprocess\n"
+    "child = subprocess.Popen(['sleep', '600'])\n"
+    "print(child.pid, flush=True)\n"
+    "child.wait()\n"
+)
+SCOPE_UNITS = {
+    "df-verify-x-live.scope": "active",
+    "df-verify-x-dead.scope": "active",
+    "df-verify-x-failed.scope": "failed",
+    "df-verify-x-unreadable.scope": "active",
+}
+SCOPE_CLASS = ("--class", "verify-scope")
+
+
+@pytest.fixture
+def scopes(mirror, tmp_path):
+    """Four df-verify units in the fake systemctl, over a fake cgroup tree."""
+    controller = _spawn([sys.executable, "-c", CONTROLLER], cwd=tmp_path,
+                        stdout=subprocess.PIPE, text=True)
+    mirror.children.append(controller)
+    live_pid = int(controller.stdout.readline())
+    reaped = _spawn(["true"], cwd=tmp_path)
+    reaped.wait()
+    procs = {"df-verify-x-live.scope": f"{live_pid}\n",
+             "df-verify-x-dead.scope": f"{reaped.pid}\n"}
+    cgroup_root = tmp_path / "cgroup"
+    listing = []
+    for unit, state in SCOPE_UNITS.items():
+        sub = "running" if state == "active" else state
+        listing.append(f"{unit} loaded {state} {sub} verify scope")
+        cgroup = f"user.slice/app.slice/{unit}"
+        (mirror.state / f"cgroup.{unit}").write_text(f"/{cgroup}\n")
+        (mirror.state / f"state.{unit}").write_text(state)
+        (cgroup_root / cgroup).mkdir(parents=True)
+        if unit in procs:
+            (cgroup_root / cgroup / "cgroup.procs").write_text(procs[unit])
+    (mirror.state / "units").write_text("\n".join(listing) + "\n")
+    return cgroup_root
+
+
+def acting_calls(mirror: Mirror) -> list[str]:
+    verbs = ("--user kill ", "--user stop ", "--user reset-failed ")
+    return [call for call in systemctl_calls(mirror) if call.startswith(verbs)]
+
+
+def test_scope_class_reclaims_only_orphaned_units(mirror, scopes):
+    report = run(mirror, *SCOPE_CLASS, "--cgroup-root", str(scopes))
+
+    assert report.returncode == 0, report.stderr
+    assert {name: action_reason(verdicts(report.stdout), name) for name in SCOPE_UNITS} == {
+        "df-verify-x-live.scope": ("verify-scope", "keep", "controller-alive"),
+        "df-verify-x-dead.scope": ("verify-scope", "reclaim", "orphaned"),
+        "df-verify-x-failed.scope": ("verify-scope", "reclaim", "unit-failed"),
+        "df-verify-x-unreadable.scope": ("verify-scope", "keep", "cgroup-unreadable"),
+    }
+    assert acting_calls(mirror) == []
+
+    applied = run(mirror, *SCOPE_CLASS, "--cgroup-root", str(scopes), "--apply")
+
+    assert applied.returncode == 0, applied.stderr
+    assert sorted(acting_calls(mirror)) == sorted([
+        "--user kill --signal=SIGKILL df-verify-x-dead.scope",
+        "--user stop df-verify-x-dead.scope",
+        "--user reset-failed df-verify-x-failed.scope",
+    ])
+    table = verdicts(applied.stdout)
+    assert table["df-verify-x-dead.scope"][1:3] == ("reclaimed", "orphaned")
+    assert table["df-verify-x-failed.scope"][1:3] == ("reclaimed", "unit-failed")
+    assert table["df-verify-x-live.scope"][1:3] == ("keep", "controller-alive")
+    assert table["df-verify-x-unreadable.scope"][1:3] == ("keep", "cgroup-unreadable")
+
+
+def test_scope_that_survives_the_reap_is_failed(mirror, scopes):
+    (mirror.state / "sticky.df-verify-x-dead.scope").write_text("")
+
+    result = run(mirror, *SCOPE_CLASS, "--cgroup-root", str(scopes), "--apply")
+
+    assert result.returncode == 1
+    assert verdicts(result.stdout)["df-verify-x-dead.scope"][1:3] == ("failed", "orphaned")
