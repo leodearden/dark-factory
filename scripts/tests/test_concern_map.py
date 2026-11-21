@@ -8,7 +8,10 @@ anchor, not a definition.
 from __future__ import annotations
 
 import dataclasses
+import json
+from pathlib import Path
 
+import _checkout
 import concern_map
 import pytest
 import source_measures
@@ -463,3 +466,173 @@ class TestPartitionCoverage:
         twice = {**PARTITION, 'C': [*PARTITION['C'], 'LIMIT']}
         with pytest.raises(concern_map.PartitionError, match='LIMIT'):
             _report(twice)
+
+
+
+# ---------------------------------------------------------------------------
+# The command line: JSON and markdown renderings, and the exit-code contract.
+
+
+@pytest.fixture
+def engine_root(tmp_path: Path) -> Path:
+    (tmp_path / 'pkg').mkdir()
+    (tmp_path / 'pkg' / 'engine.py').write_text(ENGINE_MODULE, encoding='utf-8')
+    return tmp_path
+
+
+def _partition_file(tmp_path: Path, content: object) -> str:
+    target = tmp_path / 'partition.json'
+    target.write_text(json.dumps(content), encoding='utf-8')
+    return str(target)
+
+
+def _run(capsys, root: Path, *extra: str) -> tuple[int, str, str]:
+    code = concern_map.main(['pkg/engine.py', '--class', 'Engine', '--root', str(root), *extra])
+    captured = capsys.readouterr()
+    return code, captured.out, captured.err
+
+
+class TestJsonRendering:
+    def test_the_map_renders_as_a_json_object(self, capsys, engine_root) -> None:
+        code, out, _ = _run(capsys, engine_root, '--format', 'json')
+        assert code == 0
+        rendered = json.loads(out)
+        assert (rendered['path'], rendered['class_name'], rendered['total_lines']) == (
+            'pkg/engine.py', 'Engine', 56,
+        )
+        assert rendered['residual'] == dict(_measure().residual)
+        assert 'partition' not in rendered
+
+    def test_each_unit_renders_its_measures_with_sorted_lists(self, capsys, engine_root) -> None:
+        _, out, _ = _run(capsys, engine_root, '--format', 'json')
+        units = {unit['name']: unit for unit in json.loads(out)['units']}
+        assert [unit['name'] for unit in json.loads(out)['units']][:3] == ['LIMIT', 'helper', 'Failure']
+        assert units['Engine.poll'] == {
+            'name': 'Engine.poll',
+            'kind': 'method',
+            'lines': 4,
+            'prose_lines': 0,
+            'writes': [],
+            'reads': ['_pool'],
+            'refs': ['Engine.helper_method', 'Failure', 'LIMIT'],
+        }
+        assert units['Engine.__init__']['writes'] == ['_count', '_pool']
+        assert units['LIMIT']['kind'] == 'module'
+
+    def test_a_partition_adds_its_report(self, capsys, engine_root, tmp_path) -> None:
+        code, out, _ = _run(
+            capsys, engine_root, '--format', 'json',
+            '--partition', _partition_file(tmp_path, PARTITION),
+        )
+        assert code == 0
+        partition = json.loads(out)['partition']
+        assert partition['clusters']['A'] == {'units': 3, 'lines': 10, 'prose_lines': 0}
+        assert partition['edges']['A -> B'] == {
+            'count': 1, 'sample': ['Engine.poll', 'Engine.helper_method'],
+        }
+        assert set(partition['edges']) == {'A -> B', 'A -> C', 'B -> A', 'B -> C'}
+        assert partition['cyclic_groups'] == [['A', 'B']]
+        assert partition['shared_writes'] == {'_count': ['A', 'B']}
+        assert partition['module_unit_users']['LIMIT'] == ['A', 'B']
+
+    def test_the_rendering_is_deterministic(self, capsys, engine_root, tmp_path) -> None:
+        partition = _partition_file(tmp_path, PARTITION)
+        first = _run(capsys, engine_root, '--format', 'json', '--partition', partition)[1]
+        second = _run(capsys, engine_root, '--format', 'json', '--partition', partition)[1]
+        assert first == second
+
+
+class TestMarkdownRendering:
+    def test_the_unit_table_has_a_row_per_unit(self, capsys, engine_root) -> None:
+        code, out, _ = _run(capsys, engine_root, '--format', 'markdown')
+        assert code == 0
+        assert '| unit | kind | lines | prose | writes | reads | refs |' in out
+        rows = [line for line in out.splitlines() if line.startswith('| Engine.') or line.startswith('| LIMIT')]
+        assert len(rows) == len(METHOD_NAMES) + 1
+        assert '| Engine.poll | method | 4 | 0 |  | _pool | Engine.helper_method, Failure, LIMIT |' in out
+
+    def test_markdown_is_the_default_format(self, capsys, engine_root) -> None:
+        assert _run(capsys, engine_root)[1] == _run(capsys, engine_root, '--format', 'markdown')[1]
+
+    def test_a_partition_adds_cluster_edge_and_cycle_sections(
+        self, capsys, engine_root, tmp_path
+    ) -> None:
+        _, out, _ = _run(
+            capsys, engine_root, '--format', 'markdown',
+            '--partition', _partition_file(tmp_path, PARTITION),
+        )
+        assert '| cluster | units | lines | prose |' in out
+        assert '| A | 3 | 10 | 0 |' in out
+        assert '| from | to | refs | sample |' in out
+        assert '| A | B | 1 | Engine.poll -> Engine.helper_method |' in out
+        cycles = out.split('## Cyclic cluster groups', 1)[1]
+        assert '- A, B' in cycles.split('##', 1)[0]
+        assert '`_count`: A, B' in out
+
+    def test_an_acyclic_partition_says_none_explicitly(self, capsys, engine_root, tmp_path) -> None:
+        acyclic = {'all': [unit.name for unit in _measure().units]}
+        _, out, _ = _run(
+            capsys, engine_root, '--format', 'markdown',
+            '--partition', _partition_file(tmp_path, acyclic),
+        )
+        cycles = out.split('## Cyclic cluster groups', 1)[1].split('##', 1)[0]
+        assert cycles.strip() == 'none'
+
+
+class TestExitCodes:
+    def test_a_missing_class_is_an_instrument_failure(self, capsys, engine_root) -> None:
+        code = concern_map.main(['pkg/engine.py', '--class', 'Missing', '--root', str(engine_root)])
+        err = capsys.readouterr().err
+        assert code == 2
+        assert 'Missing' in err
+
+    def test_a_missing_source_is_an_instrument_failure(self, capsys, engine_root) -> None:
+        code = concern_map.main(['pkg/absent.py', '--class', 'Engine', '--root', str(engine_root)])
+        assert code == 2
+        assert 'pkg/absent.py' in capsys.readouterr().err
+
+    def test_an_unreadable_partition_file_is_an_instrument_failure(
+        self, capsys, engine_root, tmp_path
+    ) -> None:
+        absent = str(tmp_path / 'no-such-partition.json')
+        code, _, err = _run(capsys, engine_root, '--partition', absent)
+        assert code == 2
+        assert 'no-such-partition.json' in err
+
+    @pytest.mark.parametrize(
+        'content',
+        [
+            pytest.param('{not json', id='not-json'),
+            pytest.param('["A"]', id='not-an-object'),
+            pytest.param('{"A": "Engine.poll"}', id='members-not-a-list'),
+            pytest.param('{"A": ["Engine.poll", 3]}', id='member-not-a-string'),
+        ],
+    )
+    def test_a_malformed_partition_file_is_an_instrument_failure(
+        self, capsys, engine_root, tmp_path, content
+    ) -> None:
+        target = tmp_path / 'partition.json'
+        target.write_text(content, encoding='utf-8')
+        code, out, err = _run(capsys, engine_root, '--partition', str(target))
+        assert code == 2
+        assert 'partition.json' in err
+        assert out == ''
+
+    def test_a_partition_error_is_an_instrument_failure(self, capsys, engine_root, tmp_path) -> None:
+        partial = {'A': ['Engine.poll']}
+        code, _, err = _run(capsys, engine_root, '--partition', _partition_file(tmp_path, partial))
+        assert code == 2
+        assert 'Engine.wire' in err
+
+
+class TestTheRealTree:
+    def test_git_ops_measures_with_at_least_one_method_unit(self, capsys) -> None:
+        # ANTI-VACUITY anchor only: independent of git_ops.py's size, which the
+        # git-ops split PRD exists to shrink.
+        code = concern_map.main([
+            'orchestrator/src/orchestrator/git_ops.py', '--class', 'GitOps',
+            '--format', 'json', '--root', str(_checkout.ROOT),
+        ])
+        rendered = json.loads(capsys.readouterr().out)
+        assert code == 0
+        assert any(unit['kind'] == 'method' for unit in rendered['units'])
