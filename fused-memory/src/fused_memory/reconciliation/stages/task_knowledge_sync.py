@@ -51,7 +51,6 @@ from fused_memory.reconciliation.flag_dedup import (
     filter_blocked_snapshot_findings,
     filter_contamination_ceiling_findings,
     filter_false_phantom_task_creation_flags,
-    filter_snapshot_stat_edge_findings,
 )
 from fused_memory.reconciliation.flag_identity import (
     compute_flag_signature,
@@ -971,15 +970,14 @@ ENTITY_STANDING_DECISION_GROWTH_EXPIRED_STAT_KEY = (
 )
 
 # Consecutive-failure streak (in full+completed cycles) at which the growth
-# sweep files a recon escalation (INV-4). Mirrors the task-count-snapshot
-# miss-streak threshold; recomputed from the journal each cycle (no stored
-# counter), so any successful sweep resets it.
+# sweep files a recon escalation (INV-4). Recomputed from the journal each
+# cycle (no stored counter), so any successful sweep resets it.
 GROWTH_SWEEP_FAILURE_STREAK_THRESHOLD: int = 3
 
 # Escalation category for the growth-sweep failure streak (INV-4). Free-form str
 # on ``Escalation.category``; kept distinct from the Stage-1/Stage-2 recon
-# categories (reconciliation_stale_human_operator / reconciliation_stale_flag /
-# recon_stale_task_count_snapshot) so it can be filtered independently.
+# categories (reconciliation_stale_human_operator / reconciliation_stale_flag)
+# so it can be filtered independently.
 ENTITY_STANDING_DECISION_GROWTH_SWEEP_ESCALATION_CATEGORY = (
     'reconciliation_growth_sweep_failure'
 )
@@ -2514,11 +2512,11 @@ async def _sweep_entity_standing_decision_growth(
 
 
 # ── Growth-sweep failure-streak escalation (task 2899 ζ, INV-4) ──────────────
-# Pure helpers mirroring task_count_snapshot_cadence's streak-on-miss shape,
-# INVERTED to streak-on-failure: the counted flag is True=sweep-failed (a
-# Graphiti error left >=1 active row unverified this cycle), not False=miss. The
-# streak is recomputed from journalled prior-run stats each cycle (no persisted
-# counter), so any successful sweep resets it and it survives a restart.
+# Pure helpers for a streak-on-failure rule: the counted flag is
+# True=sweep-failed (a Graphiti error left >=1 active row unverified this
+# cycle). The streak is recomputed from journalled prior-run stats each cycle
+# (no persisted counter), so any successful sweep resets it and it survives a
+# restart.
 
 
 def _extract_growth_sweep_failed(stage_report: object) -> bool | None:
@@ -2601,9 +2599,8 @@ async def _maybe_escalate_growth_sweep_failures(
     """File a level-1 recon escalation on a sustained growth-sweep failure streak.
 
     Mirrors ``stage1_stall_detector.maybe_escalate_stalled_tasks`` (a Stage may
-    file a recon escalation directly via ``self._escalation_queue``) and the
-    harness's ``_maybe_escalate_stale_task_count_snapshot`` journal-recompute:
-    the consecutive-failure streak is recomputed each cycle from
+    file a recon escalation directly via ``self._escalation_queue``). The
+    consecutive-failure streak is recomputed each cycle from
     ``journal.get_recent_runs`` rather than a stored counter, so it resets on any
     successful sweep and survives a restart with no new schema.
 
@@ -2612,7 +2609,7 @@ async def _maybe_escalate_growth_sweep_failures(
       cycle returns ``False`` WITHOUT a journal read (cheap steady state).
     * Prior runs are filtered to full-cycle COMPLETED runs only, EXCLUDING the
       current *run_id* (a remediation/targeted or still-running run neither
-      counts toward nor resets the streak — matching the snapshot cadence).
+      counts toward nor resets the streak).
     * On reaching *threshold*, a single ``Escalation`` (level=1) is filed under
       a STABLE per-project synthetic key ``recon-esd-growth-sweep:<project_id>``
       and deduped via ``escalation_queue.has_open_l1`` so a persistent streak
@@ -3269,8 +3266,8 @@ class TaskKnowledgeSync(BaseStage):
 
         The consecutive-failure streak escalation is evaluated ONLY on a full,
         non-remediation cycle with a wired escalation queue: a remediation/targeted
-        pass must not inflate or reset the streak (mirroring the task-count-snapshot
-        cadence), and an unwired queue has nothing to file to. The filer itself is
+        pass must not inflate or reset the streak, and an unwired queue has
+        nothing to file to. The filer itself is
         journal-recompute + ``has_open_l1``-deduped and never raises.
         """
         result = await _sweep_entity_standing_decision_growth(
@@ -4070,14 +4067,10 @@ class IntegrityCheck(BaseStage):
            missing or stale, for projects whose ceiling is retired-by-design
            (e.g. autopilot_video; task 2818/2826).  Records
            report.stats['contamination_ceiling_findings_dropped'] = before - after.
-        4. Applies filter_snapshot_stat_edge_findings() to drop findings that
-           read a Mem0-only task-count snapshot stat as evidence of a missing
-           Graphiti temporal_facts edge, for every project (task 3487).  Records
-           report.stats['snapshot_stat_edge_findings_dropped'] = before - after.
-        5. Calls scan_cross_run_citations() and appends one finding per
+        4. Calls scan_cross_run_citations() and appends one finding per
            confirmed-absent mem0 citation on a settled run's finding, recording
            the scan's stage3_cross_run_* stats (task 5749).
-        6. Calls record_task_dump_spot_check() to record a non-destructive
+        5. Calls record_task_dump_spot_check() to record a non-destructive
            observability stat when the cached task tree contains contamination
            signals.
 
@@ -4133,15 +4126,6 @@ class IntegrityCheck(BaseStage):
             )
         else:
             report.stats['contamination_ceiling_findings_dropped'] = 0
-
-        # Layer 3 (finding-side) gate for snapshot-stat/missing-edge false
-        # positives (task 3487): project-agnostic, since no project ever
-        # persists a task-count snapshot as a Graphiti edge.
-        _before = len(report.items_flagged)
-        report.items_flagged = filter_snapshot_stat_edge_findings(report.items_flagged)
-        report.stats['snapshot_stat_edge_findings_dropped'] = (
-            _before - len(report.items_flagged)
-        )
 
         scan = await scan_cross_run_citations(
             self.journal, self.memory, project_id=self.project_id

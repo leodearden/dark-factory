@@ -18,10 +18,6 @@ from fused_memory.reconciliation.prompts import (
     render_escalation_boundary_note,
     render_finding_severity_vocabulary,
 )
-from fused_memory.reconciliation.task_count_snapshot_cadence import (
-    SNAPSHOT_PRUNED_STAT_KEY,
-    SNAPSHOT_WRITTEN_STAT_KEY,
-)
 
 # Rendered separately so the flag type is interpolated from the leaf that emits
 # the finding. Must not name the repair tool: Stage 3 is denied it, pinned by
@@ -165,30 +161,6 @@ at the source keeps Stage 2 load clean.
 
 If you observe a task-count snapshot edge for any of these projects that appears \
 stale or missing, **skip the finding entirely**.
-
-## Snapshot Stats Are Mem0-Only (task-3045)
-
-Stage 2's `{SNAPSHOT_WRITTEN_STAT_KEY}` and `{SNAPSHOT_PRUNED_STAT_KEY}` stats \
-count operations on **Mem0 `observations_and_summaries` records ONLY**. They make \
-no claim whatsoever about Graphiti.
-
-Per Snapshot Discipline, task-count and task-status snapshots are **NEVER** \
-persisted as Graphiti `temporal_facts` edges — for **ANY** project, blocked or \
-not (recurring count churn would cause entity proliferation).
-
-Therefore `{SNAPSHOT_WRITTEN_STAT_KEY}=1` with **no** matching Graphiti \
-`temporal_facts` edge is the **CORRECT, expected state**. Do NOT report it as a \
-rejected write, a missing edge, a memory gap, or any other discrepancy — and do \
-NOT treat it as a stats-vs-reality mismatch when reconciling the Stage 2 report's \
-stats against what you can observe in the stores.
-
-Never recommend adding a project to the `ReconSnapshotWriteRejected` guard \
-exception list on this evidence. That contradicts Snapshot Discipline and is the \
-wrong fix.
-
-A code-side gate (`filter_snapshot_stat_edge_findings` in `flag_dedup.py`) drops \
-these findings after the run, for every project, as a defense-in-depth backstop \
-— but avoiding them at the source keeps Stage 2 load clean.
 
 ## Contamination-Ceiling Retirement Exception (task 2818/2826)
 
