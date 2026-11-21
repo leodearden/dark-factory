@@ -48,6 +48,7 @@ from shared.cli_invoke import (
 )
 from shared.config_dir import TaskConfigDir
 from shared.cost_store import CostStore
+from shared.declared_checks import declared_checks
 from shared.mcp_post import open_mcp_client, post_mcp_tool_call
 from shared.prompt_artifact import PromptArtifactStore, default_artifacts_root
 from shared.task_claimant import compose_claimant_run_id
@@ -847,14 +848,6 @@ def _scope_basis(
         'undeclared': list(coverage.undeclared),
         'undelivered': list(coverage.undelivered),
     }
-
-
-def _declared_checks(metadata: Mapping[str, Any]) -> list[dict[str, Any]]:
-    """The task's declared ``metadata.delivered_checks``, mapping entries only."""
-    return [
-        c for c in _declared_entries(metadata, 'delivered_checks')
-        if isinstance(c, dict)
-    ]
 
 
 def _compute_merge_outcome_signature(
@@ -7957,7 +7950,7 @@ class TaskWorkflow:
             self.git_ops, self.task_id, branch,
             reported_sha=commit,
             declared_files=_declared_files(metadata),
-            delivered_checks=_declared_checks(metadata),
+            delivered_checks=list(declared_checks(metadata).checks),
             delivered_checks_enabled=self.config.delivered_checks.enabled,
         )
         if not verdict.accepted or verdict.evidence_sha is None:
@@ -16493,7 +16486,7 @@ class TaskWorkflow:
                 f'{self.config.git.branch_prefix}{self.task_id}',
                 branch_tip_sha=branch_tip_sha,
                 pattern_template=self.git_ops.config.commit_citation_pattern,
-                delivered_checks=_declared_checks(metadata),
+                delivered_checks=list(declared_checks(metadata).checks),
                 checks_enabled=self.config.delivered_checks.enabled,
                 branch_base_sha=metadata.get('branch_base_sha'),
             )

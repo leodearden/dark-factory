@@ -28,7 +28,6 @@ from _merge_lane_fakes import (
     FakeVerifier,
     VerifyScript,
     fails,
-    healthy_verify_clock,
     lane_scene_config,
     make_lane,
     merge_through_lane,
@@ -248,7 +247,7 @@ async def test_the_gate_reverifies_on_the_lanes_verifier(scene: _Scene) -> None:
     store = _RecordingEventStore()
     queue: asyncio.Queue[Any] = asyncio.Queue()
     lane = make_lane(
-        scene.git_ops, queue, verifier=verifier, clock=healthy_verify_clock(), event_store=store,
+        scene.git_ops, queue, verifier=verifier, event_store=store,
     )
 
     outcome = await merge_through_lane(lane, queue, request)
@@ -268,7 +267,7 @@ async def test_a_red_gate_reverify_spawns_a_dry_run_investigation(scene: _Scene)
     queue: asyncio.Queue[Any] = asyncio.Queue()
     lane = make_lane(
         scene.git_ops, queue,
-        verifier=verifier, clock=healthy_verify_clock(), event_store=_RecordingEventStore(),
+        verifier=verifier, event_store=_RecordingEventStore(),
         scheduler=MagicMock(), mcp=MagicMock(),
     )
 
@@ -298,7 +297,7 @@ async def test_a_remote_lease_heads_rebased_commit_is_dispatched_by_the_host_pol
     queue: asyncio.Queue[Any] = asyncio.Queue()
     lane = make_lane(
         remote_scene.git_ops, queue,
-        verifier=verifier, clock=healthy_verify_clock(), event_store=store,
+        verifier=verifier, event_store=store,
         remote_runners=[host],
     )
 
@@ -328,7 +327,7 @@ async def test_a_red_rebased_head_dispatch_blocks_without_a_local_rerun(
     queue: asyncio.Queue[Any] = asyncio.Queue()
     lane = make_lane(
         remote_scene.git_ops, queue,
-        verifier=verifier, clock=healthy_verify_clock(), event_store=store,
+        verifier=verifier, event_store=store,
         remote_runners=[host],
     )
 
@@ -352,7 +351,7 @@ async def test_a_remote_rebased_head_dispatch_keeps_the_local_cross_check(
     queue: asyncio.Queue[Any] = asyncio.Queue()
     lane = make_lane(
         scene.git_ops, queue,
-        verifier=FakeVerifier(), clock=healthy_verify_clock(), event_store=store,
+        verifier=FakeVerifier(), event_store=store,
         remote_runners=[host],
     )
 
@@ -403,7 +402,7 @@ async def test_a_same_tree_history_leg_stays_local_on_a_remote_lease_head(
     queue: asyncio.Queue[Any] = asyncio.Queue()
     lane = make_lane(
         scene.git_ops, queue,
-        verifier=FakeVerifier(), clock=healthy_verify_clock(), event_store=store,
+        verifier=FakeVerifier(), event_store=store,
         remote_runners=[host],
     )
 

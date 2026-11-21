@@ -9,7 +9,7 @@ records each scoped verify as a ``ScopedVerifyCall``;
 ``remote_runners=``; ``FakeClock`` is a
 hand-advanced clock whose ``sleep`` advances it and waits at most
 ``sleep_cap`` of real time, and ``healthy_verify_clock`` one on which an
-in-flight verify keeps writing;
+in-flight verify keeps writing, ``make_lane``'s default clock;
 ``VerifyTasks`` builds a verify-frontier entry's ``verify_task`` in each
 state it can be in (pending, finished, raised, cancelled), and its
 ``verifies`` fixture cancels the pending ones at teardown -- re-export it
@@ -522,9 +522,10 @@ class FakeClock:
     interval per ``wait_cap``, so at the defaults a parked verify's
     no-progress budget runs out in under a second of real time. Load
     only lengthens that, but it is still no load-safe slack: a scene that must not call a verify dead shows the
-    content progress a healthy verify makes -- ``healthy_verify_clock`` --
-    and only a scene exercising the dead-verify abort leaves
-    ``content_mtime`` frozen.
+    content progress a healthy verify makes -- ``healthy_verify_clock``,
+    ``make_lane``'s default -- and a scene exercising the dead-verify abort
+    opts into a frozen ``content_mtime`` by passing ``FakeClock(...)``
+    explicitly.
 
     ``tick`` additionally advances ``mono`` on every ``monotonic()`` read,
     for a lane loop that measures elapsed time off this clock but waits on
@@ -733,7 +734,11 @@ def make_lane(
 
     The verifier and clock default to fresh fakes rather than to the
     production adapters, so a test that forgets to pass one still gets a
-    lane that neither shells out nor waits out a production-sized sleep.
+    lane that never shells out. The clock defaults to
+    ``healthy_verify_clock()``: it waits out no production-sized sleep, and
+    an in-flight verify on it keeps writing, so a slow but healthy verify
+    is never called dead however loaded the host. A scene exercising the
+    dead-verify abort passes a frozen ``FakeClock(...)`` itself.
     *queue* defaults to a fresh ``asyncio.Queue`` on the running loop.
     Anything else ``MergeLane`` accepts passes through in *kwargs*.
     """
@@ -742,7 +747,7 @@ def make_lane(
         asyncio.Queue() if queue is None else queue,
         escalation_queue=escalation_queue,
         verifier=FakeVerifier() if verifier is None else verifier,
-        clock=FakeClock() if clock is None else clock,
+        clock=healthy_verify_clock() if clock is None else clock,
         **kwargs,
     )
 

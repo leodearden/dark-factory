@@ -29,6 +29,7 @@ from typing import (
 from shared import safe_io
 from shared.capability_manifest import CHECK_SUBJECT_FIELD
 from shared.cli_invoke import is_server_error_status
+from shared.declared_checks import declared_checks
 from shared.locking import (
     files_to_modules,
     normalize_lock,
@@ -940,7 +941,7 @@ def _terminal_record_is_immutable(record: dict) -> bool:
     advances after it goes done; both must be re-fetched.
     """
     metadata = record.get('metadata') or {}
-    return not metadata.get('delivered_checks') and not awaits_scheduled_restart(metadata)
+    return declared_checks(metadata).is_empty and not awaits_scheduled_restart(metadata)
 
 
 class McpSessionLike(Protocol):
@@ -3374,8 +3375,7 @@ class Scheduler:
                     # WARNING on every such fetch failure so the bypass is
                     # operator-visible rather than silent.
                     continue
-                checks = (dep_task.get('metadata') or {}).get('delivered_checks')
-                if not checks:
+                if declared_checks(dep_task.get('metadata')).is_empty:
                     continue
                 checked_deps[dep_id] = dep_task
                 deps_by_dependent.setdefault(task_id, set()).add(dep_id)
@@ -3431,8 +3431,9 @@ class Scheduler:
             # DIFFERENT key than the one a prior sweep cached against, so
             # the edit is a cache MISS (re-evaluate) rather than continuing
             # to serve a verdict computed against the old descriptor.
-            checks = (dep_task.get('metadata') or {}).get('delivered_checks') or []
-            descriptor_digest = _delivered_checks_descriptor_digest(checks)
+            declared = declared_checks(dep_task.get('metadata'))
+            checks = declared.checks
+            descriptor_digest = _delivered_checks_descriptor_digest(list(checks))
             cache_key = (dep_id, main_sha, descriptor_digest)
             # Prune any stale digest variant(s) left behind by an earlier
             # descriptor for this SAME (dep, sha) (task 2975): bounds cache
@@ -3450,11 +3451,13 @@ class Scheduler:
             ]
             for stale_key in stale_variant_keys:
                 del self._delivered_check_cache[stale_key]
-            if cache_key in self._delivered_check_cache:
+            if not declared.unreadable and cache_key in self._delivered_check_cache:
                 # Only the monotone-safe DELIVERED=True result is ever
                 # cached (see the FAILED branch below) — a cache hit is
                 # therefore always True, served straight from cache with no
-                # checks re-run this sweep.
+                # checks re-run this sweep. The digest covers ``checks``
+                # alone, so a declaration with unreadable entries is never
+                # served from it.
                 cached = self._delivered_check_cache[cache_key]
                 projection[dep_id] = cached
                 # A dep resolved definitively (cached True) on a prior sweep
@@ -3466,11 +3469,13 @@ class Scheduler:
 
             results: list[tuple[dict, DeliveredCheckResult]] = []
             over_budget = False
-            # Only the first dep this sweep actually evaluates gets the
+            # Only the first dep this sweep that runs a check gets the
             # forward-progress guarantee; every later dep still respects
-            # the budget exactly as before.
-            guaranteed_dep = first_dep_this_sweep
-            first_dep_this_sweep = False
+            # the budget exactly as before. A wholly unreadable declaration
+            # runs none, so it leaves the guarantee for the next dep.
+            guaranteed_dep = first_dep_this_sweep and bool(checks)
+            if guaranteed_dep:
+                first_dep_this_sweep = False
             for check in checks:
                 if used >= budget and not guaranteed_dep:
                     over_budget = True
@@ -3517,7 +3522,9 @@ class Scheduler:
                     dep_id, len(checks), budget,
                 )
 
-            if all(r is DeliveredCheckResult.DELIVERED for _c, r in results):
+            if not declared.unreadable and all(
+                r is DeliveredCheckResult.DELIVERED for _c, r in results
+            ):
                 self._delivered_check_cache[cache_key] = True
                 projection[dep_id] = True
                 self._delivered_check_error_streak.pop(dep_id, None)
@@ -3573,11 +3580,12 @@ class Scheduler:
             )
             error_log(
                 'Delivered-check dep %s: at least one check has ERRORED for '
-                '%d consecutive sweep(s) (checks=%r) — left uncached '
-                '(fail-safe wait; no dispatch-gate event/streak per row 7). '
-                'This may indicate a misconfigured check (bad regex/path, '
-                'or a missing/non-executable script).',
-                dep_id, error_streak, errored_names,
+                '%d consecutive sweep(s) (checks=%r, not check descriptors=%r) '
+                '— left uncached (fail-safe wait; no dispatch-gate event/streak '
+                'per row 7). This may indicate a misconfigured check (bad '
+                'regex/path, or a missing/non-executable script) or a '
+                'malformed metadata.delivered_checks.',
+                dep_id, error_streak, errored_names, declared.unreadable,
             )
 
         # Hold-visibility + grace-streak escalation: per dependent, decided
@@ -3665,7 +3673,7 @@ class Scheduler:
         detail = fail_detail_by_dep.get(dep_id) or {}
         check_name = detail.get('name')
         dep_task = checked_deps.get(dep_id) or {}
-        checks = (dep_task.get('metadata') or {}).get('delivered_checks') or []
+        checks = declared_checks(dep_task.get('metadata')).checks
         check = next((c for c in checks if c.get('name') == check_name), None)
         if check is None:
             check = {'name': check_name, 'kind': detail.get('kind')}
