@@ -22,17 +22,21 @@ from pathlib import Path
 from typing import Any
 
 import _checkout as _checkout
+from sampler.consumers import Consumer, Role, classify_member
 from shared.project_layout import runs_db
 from shared.psi import ARM_FIELDS
+from shared.verify_scope_tag import scope_tag_for
 
 __all__ = [
     'MEMORY_ARMS',
     'Hold',
+    'HoldConsumers',
     'HoldsReport',
     'RootRead',
     'RootStatus',
     'SamplesUnavailable',
     'format_utc',
+    'hold_consumers',
     'parse_utc',
     'read_holds_report',
     'read_root',
@@ -162,6 +166,56 @@ def read_root(root: Path, since: datetime) -> RootRead:
         if hold is not None:
             holds.append(hold)
     return RootRead(root, path, RootStatus.READ, None, tuple(holds), skipped)
+
+
+# ---------------------------------------------------------------------------
+# The holding project's consumers (C2)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class HoldConsumers:
+    """The consumers of the project whose runs.db holds the hold.
+
+    ``unmapped_reason`` says why service, agents and project are all None.
+    """
+
+    service: Consumer | None
+    agents: Consumer | None
+    project: Consumer | None
+    verify: Consumer
+    unmapped_reason: str | None
+
+
+_DAEMON_PLACEMENTS = frozenset({Role.SERVICE, Role.PROJECT})
+"""What the recorder's own rule makes of a daemon's last segment: its unit, or its project slice."""
+
+
+def hold_consumers(own_cgroup: str | None, project_root: Path) -> HoldConsumers:
+    """Map a hold to its project's consumers by its own cgroup's last segment and its root.
+
+    The segment's shape is told by ``sampler.consumers.classify_member``, D2's
+    own rule: a unit keys service and agents, and a project slice keys project
+    too. Verify is keyed by the root's scope tag. Nothing is derived from the
+    project id, so the unit stem, the slug and the id are never assumed alike.
+    """
+    verify = Consumer(Role.VERIFY, scope_tag_for(project_root))
+
+    def unmapped(reason: str) -> HoldConsumers:
+        return HoldConsumers(None, None, None, verify, reason)
+
+    if own_cgroup is None:
+        return unmapped('the hold event carries no own cgroup')
+    segment = next((name for name in reversed(own_cgroup.split('/')) if name), None)
+    if segment is None:
+        return unmapped('own cgroup unresolved')
+    placement = classify_member((segment,))
+    if placement.role not in _DAEMON_PLACEMENTS:
+        return unmapped(f'own cgroup {segment} is neither an orchestrator unit nor a project slice')
+    project = Consumer(Role.PROJECT, segment) if placement.role is Role.PROJECT else None
+    return HoldConsumers(
+        Consumer(Role.SERVICE, segment), Consumer(Role.AGENTS, segment), project, verify, None
+    )
 
 
 # ---------------------------------------------------------------------------
