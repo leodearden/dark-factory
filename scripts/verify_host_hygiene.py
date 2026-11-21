@@ -15,6 +15,7 @@ import fcntl
 import math
 import os
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -26,6 +27,7 @@ from enum import StrEnum
 from pathlib import Path
 
 DEFAULT_REPO = Path("/home/leo/src/dark-factory")
+DEFAULT_SSH = "ssh -o BatchMode=yes -o ConnectTimeout=15"
 WORKTREE_BASE_NAME = ".worktrees"
 PGID_DIR_NAME = ".merge_verify_pgids"
 PGID_WORKTREE_SUFFIX = ".worktree"
@@ -618,6 +620,25 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def forwarded_args(ns: argparse.Namespace) -> list[str]:
+    """Every parsed option except --host, re-serialised for the remote run."""
+    args = [word for repo in ns.repo or [] for word in ("--repo", str(repo))]
+    args += [word for kind in ns.classes or [] for word in ("--class", str(kind))]
+    args += ["--min-age-hours", repr(ns.min_age_hours), "--cgroup-root", str(ns.cgroup_root)]
+    return [*args, "--apply"] if ns.apply else args
+
+
+def run_remote(ns: argparse.Namespace) -> int:
+    """Pipe this file to `python3 -I -` on the host and relay its output and exit code."""
+    ssh = shlex.split(os.environ.get("SSH", DEFAULT_SSH))
+    remote = ["python3", "-I", "-", *forwarded_args(ns)]
+    proc = subprocess.run([*ssh, ns.host, *map(shlex.quote, remote)],
+                          input=Path(__file__).read_bytes())
+    if proc.returncode != 0:
+        print(f"{PROG}: run on {ns.host} exited {proc.returncode}", file=sys.stderr)
+    return proc.returncode
+
+
 def checked_repos(requested: list[Path] | None) -> list[Path] | None:
     """Each repo's real top level, or None after naming the first that is not one."""
     repos = []
@@ -650,7 +671,8 @@ def run_local(ns: argparse.Namespace) -> int:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    return run_local(build_parser().parse_args(argv))
+    ns = build_parser().parse_args(argv)
+    return run_remote(ns) if ns.host else run_local(ns)
 
 
 if __name__ == "__main__":
