@@ -13,6 +13,7 @@ from escalation.classify import (
     DONE_STEP_COMMIT_ORPHAN_CLASS,
     INFO_L0_MECHANICAL_ROLES,
     RESOLVER_TIERS,
+    SeatTier,
     classify_resolver_tier,
     closed_by_non_sweep_resolver,
     default_resolution_class_for_resolver,
@@ -178,6 +179,10 @@ class TestResolverTier:
     def test_every_tier_is_in_the_record_tier_vocabulary(self, record: Escalation):
         assert resolver_tier(record) in RESOLVER_TIERS
         assert 'human' not in RESOLVER_TIERS
+
+    def test_the_record_tier_vocabulary_is_the_human_split_plus_every_other_seat_tier(self):
+        other_seats = [tier.value for tier in SeatTier if tier is not SeatTier.HUMAN]
+        assert ('human-ruled', 'attended-seat', *other_seats) == RESOLVER_TIERS
 
 
 class TestEffectiveBenign:

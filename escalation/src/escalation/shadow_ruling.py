@@ -51,7 +51,7 @@ from escalation.authority import (
     REVERSIBILITY_WAIVED_ACTIONS,
     REVERSIBLE_POLICY_ACTIONS,
 )
-from escalation.classify import resolver_tier
+from escalation.classify import HUMAN_RULED, resolver_tier
 from escalation.models import Escalation
 from escalation.queue import iter_all_escalation_paths, read_escalation_for_scan
 
@@ -659,7 +659,7 @@ def agreement_report(
 
         tier = resolver_tier(record)
         tiers[tier] += 1
-        if tier != 'human-ruled':
+        if tier != HUMAN_RULED:
             not_human_ruled[ruling.ruling_class] += 1
             continue
 
