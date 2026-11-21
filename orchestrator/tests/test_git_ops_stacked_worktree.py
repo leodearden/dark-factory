@@ -6,6 +6,10 @@ stack-base ledger answers the commit.  A declared-train successor is one user
 of the same input: it stacks on its predecessor's tip, records it (task 7660)
 and is still made cold.
 
+On an existing branch, every reuse route (the registered cold worktree, the
+cold re-attach, a warm-pool lane) re-stacks the branch's own delta onto the
+target instead of rebasing it onto main (PRD rows 42, 43 and 47).
+
 Real temp git repositories throughout (``_stacked_repo``); failures are forced
 only through a PATH git shim.
 """
@@ -18,17 +22,28 @@ from pathlib import Path
 import pytest
 import pytest_asyncio
 from _stacked_repo import (
+    D_FILE,
+    RestackScene,
     add_worktree,
+    build_restack_scene,
     commit_files,
     fail_git_calls_starting,
+    git,
     ledger_of,
     make_repo,
     make_warm_repo,
     pool_lane,
+    release_into_lane,
     rev_parse,
 )
 
-from orchestrator.branch_stack import StackBaseRead, StackRecordState, StackTarget
+from orchestrator.branch_stack import (
+    RestackConflict,
+    RestackTrialOutcome,
+    StackBaseRead,
+    StackRecordState,
+    StackTarget,
+)
 from orchestrator.git_ops import GitOps, StackRecordUnconfirmed, _run
 
 _TRAIN_SUCCESSOR = {'id': 'T', 'order': 1, 'members': ['P', 'M']}
@@ -147,3 +162,144 @@ class TestCreateWorktreeStacksOnACommit:
             )
 
         assert not await _branch_exists(cold.root, 'task/D')
+
+
+# ---------------------------------------------------------------------------
+# The re-stack through each reuse route (PRD rows 42, 43 and 47)
+# ---------------------------------------------------------------------------
+
+_UNCOMMITTED = 'd edited, not yet committed\n'
+
+
+async def _is_ancestor(root: Path, ancestor: str, descendant: str) -> bool:
+    rc, _, _ = await _run(['git', 'merge-base', '--is-ancestor', ancestor, descendant], cwd=root)
+    return rc == 0
+
+
+def _new_tip(scene: RestackScene) -> StackTarget:
+    return StackTarget('task/P', scene.p_new)
+
+
+async def _registered(tmp_path: Path, *, conflicting: bool = False) -> RestackScene:
+    scene = await build_restack_scene(await make_repo(tmp_path / 'repo'), conflicting=conflicting)
+    if not conflicting:
+        (scene.d_worktree / D_FILE).write_text(_UNCOMMITTED)
+    return scene
+
+
+async def _removed(tmp_path: Path) -> RestackScene:
+    scene = await build_restack_scene(await make_repo(tmp_path / 'repo'))
+    await git(scene.root, 'worktree', 'remove', '--force', str(scene.d_worktree))
+    return scene
+
+
+async def _in_a_lane(tmp_path: Path, *, conflicting: bool = False) -> RestackScene:
+    scene = await build_restack_scene(
+        await make_warm_repo(tmp_path / 'repo'), conflicting=conflicting,
+    )
+    if not conflicting:
+        (scene.d_worktree / D_FILE).write_text(_UNCOMMITTED)
+    await release_into_lane(scene.git_ops, 'D')
+    return scene
+
+
+async def _assert_restacked_on_the_new_tip(scene: RestackScene, info_base: str) -> None:
+    root = scene.root
+    diff = await git(root, 'diff', '--name-only', scene.p_new, 'task/D')
+    assert set(diff.split()) == {D_FILE}
+    assert await _is_ancestor(root, scene.p_new, 'task/D')
+    assert not await _is_ancestor(root, scene.main_tip, 'task/D')
+    assert not await _is_ancestor(root, scene.p_old, 'task/D')
+    assert await scene.git_ops.stack_base_read('task/D') == StackBaseRead(
+        StackRecordState.RECORDED, scene.p_new,
+    )
+    assert info_base == scene.p_new
+
+
+async def _assert_left_on_the_old_tip(scene: RestackScene, wt: Path) -> None:
+    assert await rev_parse(scene.root, 'task/D') == scene.d_tip
+    assert await ledger_of(scene.git_ops).base_of('task/D') == scene.p_old
+    assert (await git(wt, 'status', '--porcelain')).strip() == ''
+    rebase_dir = Path((await git(wt, 'rev-parse', '--git-path', 'rebase-merge')).strip())
+    assert not (rebase_dir if rebase_dir.is_absolute() else wt / rebase_dir).exists()
+
+
+@pytest.mark.asyncio
+class TestRestackThroughEachReuseRoute:
+    async def test_a_registered_cold_worktree_is_restacked(self, tmp_path: Path) -> None:
+        scene = await _registered(tmp_path)
+
+        info = await scene.git_ops.create_worktree('D', stack_on=_new_tip(scene))
+
+        assert info.path == scene.d_worktree
+        await _assert_restacked_on_the_new_tip(scene, info.base_commit)
+        assert await git(scene.root, 'show', f'task/D:{D_FILE}') == _UNCOMMITTED
+
+    async def test_a_removed_worktree_is_reattached_and_restacked(
+        self, tmp_path: Path,
+    ) -> None:
+        scene = await _removed(tmp_path)
+
+        info = await scene.git_ops.create_worktree('D', stack_on=_new_tip(scene))
+
+        assert info.path == scene.d_worktree
+        await _assert_restacked_on_the_new_tip(scene, info.base_commit)
+
+    async def test_a_warm_lane_is_restacked(self, tmp_path: Path) -> None:
+        scene = await _in_a_lane(tmp_path)
+
+        info = await scene.git_ops.create_worktree('D', stack_on=_new_tip(scene))
+
+        assert info.path == pool_lane(scene.git_ops)
+        await _assert_restacked_on_the_new_tip(scene, info.base_commit)
+        assert await git(scene.root, 'show', f'task/D:{D_FILE}') == _UNCOMMITTED
+
+    async def test_a_conflicting_registered_worktree_raises_and_moves_nothing(
+        self, tmp_path: Path,
+    ) -> None:
+        scene = await _registered(tmp_path, conflicting=True)
+
+        with pytest.raises(RestackConflict):
+            await scene.git_ops.create_worktree('D', stack_on=_new_tip(scene))
+
+        await _assert_left_on_the_old_tip(scene, scene.d_worktree)
+
+    async def test_a_conflicting_warm_lane_raises_and_keeps_the_lane(
+        self, tmp_path: Path,
+    ) -> None:
+        scene = await _in_a_lane(tmp_path, conflicting=True)
+        lane = pool_lane(scene.git_ops)
+
+        with pytest.raises(RestackConflict):
+            await scene.git_ops.create_worktree('D', stack_on=_new_tip(scene))
+
+        await _assert_left_on_the_old_tip(scene, lane)
+        assert (await git(lane, 'symbolic-ref', 'HEAD')).strip() == 'refs/heads/task/D'
+
+
+@pytest.mark.asyncio
+class TestRestackTrialThroughGitOps:
+    async def test_a_clean_scene_is_clean(self, tmp_path: Path) -> None:
+        scene = await build_restack_scene(await make_repo(tmp_path / 'repo'))
+
+        trial = await scene.git_ops.restack_trial('task/D', _new_tip(scene))
+
+        assert trial.outcome is RestackTrialOutcome.CLEAN
+
+    async def test_a_conflicting_scene_conflicts_and_moves_nothing(
+        self, tmp_path: Path,
+    ) -> None:
+        scene = await build_restack_scene(await make_repo(tmp_path / 'repo'), conflicting=True)
+
+        trial = await scene.git_ops.restack_trial('task/D', _new_tip(scene))
+
+        assert trial.outcome is RestackTrialOutcome.CONFLICT
+        await _assert_left_on_the_old_tip(scene, scene.d_worktree)
+
+    async def test_a_branch_with_no_record_is_unknown(self, tmp_path: Path) -> None:
+        scene = await build_restack_scene(await make_repo(tmp_path / 'repo'))
+        await scene.ledger.forget('task/D')
+
+        trial = await scene.git_ops.restack_trial('task/D', _new_tip(scene))
+
+        assert trial.outcome is RestackTrialOutcome.UNKNOWN
