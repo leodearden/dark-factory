@@ -24,20 +24,27 @@ characters is complete; a row at exactly 200 is a digest.
 | Matched | 244 |
 | Full content in journal | 69 (67 distinct texts; two snapshot texts were journaled twice) |
 | Already present in Mem0 (exact and loose-needle check of every `fused_<project>` Qdrant collection, read-only) | 0 |
-| Re-added from journal (`add_memory` rows) | 29 |
-| Not re-added: superseded recon cycle summaries (`add_system_record` rows, withdrawn) | 38 |
+| Re-added from journal: `targeted_recon` completion echoes | 21 (21 texts) |
+| Not re-added: superseded records, withdrawn (see below) | 48 (46 texts: 38 recon cycle summaries, 9 task-count snapshot rows carrying 7 texts, 1 status correction) |
 | Re-added from escalation esc-375-2 (digest-only row of `claude-task-375-implementer`) | 1 |
 | Unrecoverable (digest only, 200-char prefix) | 174 |
 
-The 29 + 1 re-adds were submitted with `add_memory` under their original project and category
-(their originals carried no agent_id either, except the esc-375-2 one, which kept it), with
-metadata `x_readded_from_write_op=<first 8 chars of the write_ops id>` (`esc-375-2` for
-the escalation one) and `x_outage=2026-10-04`. The esc-375-2 text was re-checked against
+The outcome rows sum to 244: 21 + 48 + 1 + 174. The 21 + 1 re-adds were submitted with
+`add_memory` under their original project and category (their originals carried no agent_id
+either, except the esc-375-2 one, which kept it), with metadata
+`x_readded_from_write_op=<first 8 chars of the write_ops id>` (`esc-375-2` for the escalation
+one) and `x_outage=2026-10-04`. The journal keeps only `content` and `category` in `params`, so
+no re-add carries its writer's metadata. For the 21 completion echoes that means no `task_id`,
+`stage2_suppress` or completion-echo marker (`reconciliation/targeted.py`), so
+`_delete_stale_completion_echoes` will not remove one if its task is reopened. They were kept
+because each is still true history of a landed task. The esc-375-2 text was re-checked against
 solar-challenge main (`COLOUR_PALETTE`, `_with_alpha`, `_FIGURES`, `monkeypatch.setitem` all
 still present) and no existing memory covers it; task 829's convention refines where the palette
 is defined but does not replace it.
 
-### The 38 recon cycle summaries were withdrawn
+### 46 superseded records were withdrawn
+
+Recon cycle summaries (38).
 
 The 38 full-content `add_system_record` rows are reconciliation cycle summaries ("Stage ...
 cycle summary for run_id: ...") from `recon-stage-task_knowledge_sync` (20) and
@@ -57,19 +64,39 @@ prefixes: 1407dcb1 193a1ff2 22c9829c 28693398 2d9a5098 3732eb1b 5f0b75ce 60590a2
 8a418287 8cfbcca8 8e939cd9 91edb18c 93854867 99f0f4b8 9dd74b57 b5ebc38e c1de0943 c668bb2b
 cb81f26a d0f3c6af e05a47de ebe8c38f ef9a65e6 f1d5646d f4b16e25 f850c0bf fa2131ed.
 
+Pool-of-one records (8). Seven task-count snapshots ("As of 2026-10-0x: project ... task-count
+snapshot — ...", source `stage2_task_count_snapshot_write`) and one Stage 1 status correction
+(source `stage1_status_correction`) were re-queued with the same loss of tags. The snapshot
+writer, `reconciliation/stages/task_knowledge_sync.py::_write_task_count_snapshot`, tags each
+one `kind='task_count_snapshot'`, and `_prune_task_count_snapshots` deletes every record of that
+kind before each write, so only the current snapshot per project exists. The status correction
+is written by `reconciliation/harness.py` with `kind='project_status_correction'`, which
+supersedes the previous one so only one is kept. Untagged, neither mechanism would ever select
+them, and seven-week-old task counts would stay in `observations_and_summaries` for good;
+tagged, the next cycle would delete them. Their 8 intents were withdrawn the same way on
+2026-11-21. write_ops id prefixes: snapshots 705ffc2d 7c5e073e 45315876 e20ee7e9 38daecba
+f1d0f5ef c39d0d54 (two more snapshot rows, ab5e4002 and 85660029, duplicate 7c5e073e and
+e20ee7e9 and were never queued); status correction c3da3ac7.
+
 ## Caveat: the re-adds are queued, not yet landed
 
 On 2026-11-21 OpenAI credits were exhausted again, so every re-add returned
 `stores_pending_retry=["mem0"]` and sat in `mem0_intents` with status `retrying` (68 rows
-whose metadata carries `x_readded_from_write_op`). The 30 kept re-adds are still `retrying` and
-land when credits return; the 38 withdrawn ones are `failed`. Do not resubmit either. To confirm:
+whose metadata carries `x_readded_from_write_op`). The 22 kept re-adds are still `retrying` and
+land when credits return; the 46 withdrawn ones are `failed`. Do not resubmit either. To confirm:
 
 ```sql
 select status, count(*) from mem0_intents
 where metadata like '%x_readded_from_write_op%' group by 1;
 ```
 
-Done means `completed` = 30 and `failed` = 38. A `dead` row needs its text re-added by hand from this journal.
+Done means `completed` = 22 and `failed` = 46. A `dead` row needs its text re-added by hand from this journal.
+
+`WriteJournal.prune_mem0_intents` deletes `completed` and `failed` rows 30 days after
+`resolved_at` (`mem0_intents_retention_days`). So this query is only valid until 30 days after
+the last re-add lands; the `failed` rows go after about 2026-12-21. After that, confirm landing
+by scrolling each `fused_<project>` Qdrant collection for metadata `x_outage=2026-10-04`
+(22 points expected).
 
 ## Digest-only rows (174 unrecoverable, 1 recovered from esc-375-2), by project, category and agent_id
 
