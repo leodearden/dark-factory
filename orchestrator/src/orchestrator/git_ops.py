@@ -61,7 +61,7 @@ from collections.abc import (
     Mapping,
     Sequence,
 )
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
@@ -87,6 +87,8 @@ from orchestrator.artifacts import TaskArtifacts
 from orchestrator.branch_stack import (
     PreStackTip,
     StackBaseLedger,
+    StackBaseRead,
+    StackTarget,
     TipRestore,
     TipRestoreOutcome,
     UnstackOutcome,
@@ -2139,6 +2141,22 @@ class BranchResetError(RuntimeError):
                 f'manually from git reflog before proceeding'
             )
         super().__init__(f'{lead} {step.value} in {worktree}: {loss}; {restore_note}')
+
+
+class StackRecordUnconfirmed(RuntimeError):
+    """A branch :meth:`GitOps.create_worktree` stacked on a commit is in place,
+    but the stack-base ledger does not answer that commit, so no later reader
+    could tell the branch's own commits from its base's."""
+
+    def __init__(self, full_branch: str, expected_base: str, read_back: StackBaseRead) -> None:
+        self.full_branch = full_branch
+        self.expected_base = expected_base
+        self.read_back = read_back
+        super().__init__(
+            f'{full_branch} is stacked on {expected_base}, but its stack-base record '
+            f'reads back {read_back.state} {read_back.base}'
+            f'{f" ({read_back.detail})" if read_back.detail else ""}'
+        )
 
 
 class _ParkedBranchStranded(RuntimeError):
@@ -4653,6 +4671,21 @@ class GitOps:
             )
         return predecessor_sha, predecessor.branch
 
+    async def _train_stack_target(
+        self, train: TrainMembership, branch_name: str,
+    ) -> StackTarget:
+        sha, predecessor_branch = await self._resolve_predecessor_tip(train, branch_name)
+        return StackTarget(predecessor_branch, sha)
+
+    async def _confirm_stack_base(
+        self, full_branch: str, stack: StackTarget, info: WorktreeInfo,
+    ) -> WorktreeInfo:
+        """*info* with the stacked commit as its base, once the ledger answers it."""
+        read = await self._stack_ledger().ensure_record(full_branch, stack.commit)
+        if not read.names(stack.commit):
+            raise StackRecordUnconfirmed(full_branch, stack.commit, read)
+        return replace(info, base_commit=stack.commit)
+
     async def disable_shared_repo_auto_maintenance(self) -> None:
         """Disable git auto-gc/maintenance on this orchestrator-managed shared repo.
 
@@ -4692,6 +4725,7 @@ class GitOps:
         expected_title: str | None = None,
         train: TrainMembership | None = None,
         recut_ruling: RecutRuling | None = None,
+        stack_on: StackTarget | None = None,
     ) -> WorktreeInfo:
         """Create a git worktree for a task branch, based off main.
 
@@ -4716,7 +4750,21 @@ class GitOps:
         ``recut_ruling`` — a pending re-cut ruling: raise
         :class:`RecutRulingViolation` before any git mutation while a prior
         incarnation of the branch survives.
+
+        ``stack_on`` (``orchestrator/src/orchestrator/branch_stack.py::StackTarget``)
+        — start the branch at that commit of a predecessor's branch instead
+        of main, from the warm pool where there is one.  A train successor
+        is stacked the same way on its predecessor's tip, so the two are
+        exclusive (ValueError).  A stacked branch is returned only once the
+        stack-base ledger answers the commit (else
+        :class:`StackRecordUnconfirmed`), and its ``base_commit`` is that
+        commit.
         """
+        if stack_on is not None and _is_train_successor(train):
+            raise ValueError(
+                f'create_worktree({branch_name!r}): stack_on={stack_on} and a train '
+                f'successor (train_id={train.get("id")!r}) both choose the base',
+            )
         worktree_path = self.worktree_base / branch_name
         worktree_path.parent.mkdir(parents=True, exist_ok=True)
         full_branch = f'{self.config.branch_prefix}{branch_name}'
@@ -4768,12 +4816,15 @@ class GitOps:
         # PRD § 9.4: when a train member has order > 0, branch from the prior
         # member's branch tip so the chain is contiguous.  order=0 (degenerate
         # train) and train=None both fall through to _freshen_main().
+        stack = stack_on
         if _is_train_successor(train):
             # ── Train path: branch from predecessor's tip ─────────────────
-            # PRD § 9.4: resolve the predecessor's branch and use its tip SHA
-            # as start_ref so the new worktree stacks directly on top.
-            # Guard (raise RuntimeError on None) is in _resolve_predecessor_tip.
-            start_ref, _ = await self._resolve_predecessor_tip(train, branch_name)
+            # PRD § 9.4: the new worktree stacks directly on the predecessor's
+            # tip.  Guard (raise RuntimeError on None) is in
+            # _resolve_predecessor_tip.
+            stack = await self._train_stack_target(train, branch_name)
+        if stack is not None:
+            start_ref = stack.commit
         else:
             # ── Freshen main from remote (best-effort) ────────────────────
             # If origin/main has advanced since session start, use the remote-
@@ -4786,20 +4837,20 @@ class GitOps:
 
         # Capture the freshened ref's SHA (used as stable base for diffs)
         rc, base_sha, _ = await _run(
-            ['git', 'rev-parse', start_ref],
+            ['git', 'rev-parse', start_ref] if stack is None
+            else ['git', 'rev-parse', '--verify', f'{start_ref}^{{commit}}'],
             cwd=self.project_root,
         )
         if rc != 0:
-            if _is_train_successor(train):
-                # start_ref was a SHA just verified by resolve_branch_sha; if
-                # rev-parse fails here it indicates git state corruption, not a
-                # missing remote ref.  Falling back to main would silently violate
-                # the train-stacking invariant, so raise instead.
+            if stack is not None:
+                # Falling back to main would silently violate the stacking
+                # invariant (a train's, or a dependent's started early on its
+                # predecessor), so raise instead.
                 raise RuntimeError(
-                    f'create_worktree: rev-parse of confirmed predecessor SHA '
-                    f'{start_ref!r} failed (rc={rc}); this is unexpected — '
-                    f'the SHA was just resolved by resolve_branch_sha and should '
-                    f'be stable'
+                    f'create_worktree: stack commit {start_ref!r} of '
+                    f'{stack.branch!r} does not resolve to a commit (rc={rc}); '
+                    f'{full_branch} is not created on {self.config.main_branch} '
+                    f'instead'
                 )
             logger.warning(
                 'create_worktree: rev-parse %s failed (rc=%d) — falling back to local %s',
@@ -4831,6 +4882,8 @@ class GitOps:
                 branch_name, start_ref, expected_title=expected_title,
             )
             if isinstance(pool_info, WorktreeInfo):
+                if stack is not None:
+                    return await self._confirm_stack_base(full_branch, stack, pool_info)
                 return pool_info
             # β: pool is enabled — no cold-path fall-through.  Route discriminant
             # to the appropriate exception so callers get typed failure signals.
@@ -5229,11 +5282,14 @@ class GitOps:
         post_create_base = mb_out.strip() or base_sha.strip()
         await arm_worktree_hooks(worktree_path)
         port = await self._provision_reify_debug_port(worktree_path)
-        return WorktreeInfo(
+        created = WorktreeInfo(
             path=worktree_path,
             base_commit=post_create_base,
             reify_debug_port=port,
         )
+        if stack is not None:
+            return await self._confirm_stack_base(full_branch, stack, created)
+        return created
 
     async def _reattach_cold_worktree(
         self,
@@ -10773,6 +10829,11 @@ class GitOps:
 
     def _stack_ledger(self) -> StackBaseLedger:
         return StackBaseLedger(self.project_root, _run)
+
+    async def stack_base_read(self, full_branch: str) -> StackBaseRead:
+        """What the stack-base ledger says of *full_branch*: no record, its
+        recorded base, or a failed read, which may hide a record."""
+        return await self._stack_ledger().read(full_branch)
 
     async def forget_stack_bases(self, task_ids: Iterable[str]) -> None:
         """Drop the stack-base records of *task_ids*' branches, e.g. once
