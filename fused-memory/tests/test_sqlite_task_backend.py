@@ -7955,6 +7955,92 @@ async def test_update_task_empty_dependencies_list_is_a_real_write(
 
 
 @pytest.mark.asyncio
+async def test_update_task_dependency_replacement_closing_a_cycle_is_refused(
+    backend, project_root,
+):
+    await _add_tasks(backend, project_root, 3)
+    await backend.add_dependency('2', '1', project_root=project_root)
+    await backend.add_dependency('3', '2', project_root=project_root)
+
+    with pytest.raises(DependencyCycle) as caught:
+        await backend.update_task(
+            '1', project_root=project_root, title='renamed', dependencies=['3'],
+        )
+
+    assert caught.value.cycle == (1, 3, 2, 1)
+    assert caught.value.operation == 'update_task'
+    task = await backend.get_task('1', project_root=project_root)
+    assert (task['title'], task['dependencies']) == ('task 1', [])
+    assert await backend.get_dependency_edges(project_root) == {2: [1], 3: [2]}
+
+
+@pytest.mark.asyncio
+async def test_update_task_refuses_a_cycle_through_a_cancelled_task(backend, project_root):
+    await _add_tasks(backend, project_root, 3)
+    await backend.add_dependency('2', '1', project_root=project_root)
+    await backend.add_dependency('3', '2', project_root=project_root)
+    await backend.set_task_status('2', 'cancelled', project_root=project_root)
+
+    with pytest.raises(DependencyCycle) as caught:
+        await backend.update_task('1', project_root=project_root, dependencies=['3'])
+
+    assert caught.value.cycle == (1, 3, 2, 1)
+    assert await backend.get_dependency_edges(project_root) == {2: [1], 3: [2]}
+
+
+@pytest.mark.asyncio
+async def test_update_task_dependency_self_loop_is_refused(backend, project_root):
+    await _add_tasks(backend, project_root, 1)
+
+    with pytest.raises(TaskmasterError, match='cannot depend on itself'):
+        await backend.update_task('1', project_root=project_root, dependencies=['1'])
+
+    assert await backend.get_dependency_edges(project_root) == {}
+
+
+@pytest.mark.asyncio
+async def test_update_task_dependency_on_a_missing_task_is_refused(backend, project_root):
+    await _add_tasks(backend, project_root, 2)
+    await backend.add_dependency('1', '2', project_root=project_root)
+
+    with pytest.raises(TaskmasterError) as caught:
+        await backend.update_task('1', project_root=project_root, dependencies=['99'])
+
+    assert caught.value.message == 'No tasks found for ID(s): 99'
+    assert (await backend.get_task('1', project_root=project_root))['dependencies'] == [2]
+
+
+@pytest.mark.asyncio
+async def test_update_task_resaving_or_rewiring_an_acyclic_list_is_accepted(
+    backend, project_root,
+):
+    await _add_tasks(backend, project_root, 3)
+    await backend.add_dependency('1', '2', project_root=project_root)
+
+    await backend.update_task('1', project_root=project_root, dependencies=['2'])
+    await backend.update_task('1', project_root=project_root, dependencies=['3'])
+
+    assert (await backend.get_task('1', project_root=project_root))['dependencies'] == [3]
+
+
+@pytest.mark.asyncio
+async def test_add_task_cannot_close_a_cycle(backend, project_root):
+    await _add_tasks(backend, project_root, 4)
+    await backend.add_dependency('2', '1', project_root=project_root)
+    await backend.add_dependency('3', '2', project_root=project_root)
+    await backend.add_dependency('4', '3', project_root=project_root)
+    await backend.remove_tasks(['3'], project_root=project_root)
+    assert (await backend.get_dependency_edges(project_root))[4] == [3]
+
+    created = await backend.add_task(
+        project_root=project_root, title='new', dependencies='1,2',
+    )
+
+    assert created['id'] == '5'
+    assert (await backend.get_dependency_edges(project_root))[5] == [1, 2]
+
+
+@pytest.mark.asyncio
 async def test_update_task_empty_metadata_object_is_a_real_write(
     backend, project_root,
 ):
