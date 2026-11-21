@@ -20,9 +20,17 @@ from orchestrator.config import ModuleConfig, OrchestratorConfig, VerifyCacheCon
 from orchestrator.verify_cache import keys, policy, toolchain, tree_objects
 from orchestrator.verify_cache.keys import UnitKey
 from orchestrator.verify_cache.modes import CacheMode, VerifyRole
-from orchestrator.verify_cache.policy import CacheDecision, Decision
+from orchestrator.verify_cache.policy import CacheDecision, Decision, LegResult
+from orchestrator.verify_cache.recorder import CacheRecord, LegRun, RecordedUnit
 from orchestrator.verify_cache.registry import Registry, registry_db_path
-from orchestrator.verify_evidence import Leg, module_leg_name
+from orchestrator.verify_evidence import (
+    GREEN_OUTCOMES,
+    Leg,
+    UnitOutcome,
+    UnitTier,
+    VerifyUnit,
+    module_leg_name,
+)
 from orchestrator.verify_plan import VerifyPlan
 from orchestrator.verify_spec_shared import canonical_json
 
@@ -143,6 +151,56 @@ class ReplayPlan:
         if not any(getattr(remaining, attr) for attr in _COMMAND_FIELD.values()):
             return None
         return remaining
+
+    def settle(
+        self, ran_units: Sequence[VerifyUnit], legs: Sequence[LegRun],
+    ) -> tuple[tuple[VerifyUnit, ...], CacheRecord]:
+        """The verify's units settled against these decisions, the tree unit last, and what it leaves
+        for recording. A replayed unit did not run, so it is settled from its decision alone."""
+        ran = {unit.unit: unit for unit in ran_units}
+        leg_of = {leg_run.unit_id: leg_run.leg for leg_run in legs}
+        settled = [
+            _settled(unit_id, UnitTier.MODULE, decided, _outcome_of(ran.get(unit_id)), leg_of.get(unit_id))
+            for unit_id, decided in self.modules.items()
+            if unit_id in ran or decided.decision.decision is Decision.HIT
+        ]
+        settled += [
+            RecordedUnit(dataclasses.replace(unit, reason='not keyed: not in the replay plan'), None, leg_of.get(unit_id), None)
+            for unit_id, unit in ran.items() if unit_id not in self.modules
+        ]
+        tree_green = all(recorded.unit.outcome in GREEN_OUTCOMES for recorded in settled)
+        tree_ran = None if self.tree_hit else UnitOutcome.RAN_GREEN if tree_green else UnitOutcome.RAN_RED
+        tree = _settled(keys.TREE_UNIT_ID, UnitTier.TREE, self.tree, tree_ran, None)
+        record = CacheRecord(role=self.role, modes=self.modes, legs=tuple(legs), units=tuple(settled), tree=tree)
+        return (*(r.unit for r in settled), tree.unit), record
+
+
+def _settled(
+    unit_id: str, tier: UnitTier, decided: UnitDecision, ran: UnitOutcome | None, leg: LegResult | None,
+) -> RecordedUnit:
+    outcome, evidence = _settled_outcome(decided.decision, ran)
+    unit = VerifyUnit(
+        unit=unit_id, tier=tier, key=None if decided.key is None else decided.key.key,
+        outcome=outcome, evidence_event_id=evidence, reason=decided.decision.reason,
+    )
+    return RecordedUnit(unit, decided.key, leg, decided.decision.entry)
+
+
+def _settled_outcome(decision: CacheDecision, ran: UnitOutcome | None) -> tuple[UnitOutcome, int | None]:
+    """A unit's outcome from its decision and how it ran (None: it did not run, so it replayed)."""
+    evidence = None if decision.entry is None else decision.entry.evidence_event_id
+    if ran is None:
+        return UnitOutcome.CACHE_HIT, evidence
+    green = ran in GREEN_OUTCOMES
+    if decision.decision is Decision.WOULD_HIT:
+        return (UnitOutcome.WOULD_HIT if green else UnitOutcome.RAN_RED), evidence
+    if decision.decision in (Decision.UNAVAILABLE, Decision.DISABLED):
+        return (UnitOutcome.UNAVAILABLE if green else UnitOutcome.RAN_RED), None
+    return (UnitOutcome.RAN_GREEN if green else UnitOutcome.RAN_RED), None
+
+
+def _outcome_of(unit: VerifyUnit | None) -> UnitOutcome | None:
+    return None if unit is None else unit.outcome
 
 
 async def plan_replay(
