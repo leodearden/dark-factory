@@ -3020,9 +3020,8 @@ class TestCollectTasksWithCountsConcurrency:
             'dashboard.data.active_tasks._acquire_and_shape', _stub,
         )
 
-        active, snapshots = (
-            await collect_tasks_with_counts(client=dummy_client, config=config)
-        )
+        snapshots = await collect_tasks_with_counts(client=dummy_client, config=config)
+        active = _rows_in_root_order(snapshots)
         offline, degraded = _offline(snapshots), _degraded(snapshots)
 
         uids = [row['_task_uid'] for row in active]
@@ -3111,9 +3110,8 @@ class TestCollectTasksWithCountsConcurrency:
         _register_runtime(monkeypatch, {})
         self._tracking_stub(monkeypatch, dwell=0.0, offline_for={'proj-02'})
 
-        active, snapshots = (
-            await collect_tasks_with_counts(client=dummy_client, config=config)
-        )
+        snapshots = await collect_tasks_with_counts(client=dummy_client, config=config)
+        active = _rows_in_root_order(snapshots)
         offline, counts, degraded = (
             _offline(snapshots), _done_counts(snapshots), _degraded(snapshots)
         )
@@ -3149,9 +3147,8 @@ class TestCollectTasksWithCountsConcurrency:
         self._tracking_stub(monkeypatch, dwell=0.0, raise_for={'proj-04'})
 
         with caplog.at_level(logging.WARNING):
-            active, snapshots = (
-                await collect_tasks_with_counts(client=dummy_client, config=config)
-            )
+            snapshots = await collect_tasks_with_counts(client=dummy_client, config=config)
+            active = _rows_in_root_order(snapshots)
         offline, degraded = _offline(snapshots), _degraded(snapshots)
 
         assert offline == ['proj-04'], (

@@ -798,7 +798,7 @@ async def collect_scheduler_state(
     since = effective_now - timedelta(hours=1)
 
     # Fetch active tasks (for lock sets and titles).
-    _, snapshots = await collect_tasks_with_counts(client, config, now=effective_now)
+    snapshots = await collect_tasks_with_counts(client, config, now=effective_now)
     health = {label: classify(snapshot) for label, snapshot in snapshots.items()}
     rows_by_label = {label: snapshot.rows.value or [] for label, snapshot in snapshots.items()}
     offline_projects: list[str] = [
