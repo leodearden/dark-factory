@@ -14,6 +14,7 @@ import contextlib
 import json
 import logging
 import os
+import stat
 import tempfile
 import time
 import uuid
@@ -161,8 +162,44 @@ class VerifyEventLog:
         return channel
 
 
+_CHANNEL_FILE_PREFIX = 'df-verify-events-'
+
+
+def _default_channel_directory() -> Path:
+    return Path(tempfile.gettempdir()) / f'df-verify-channels-{os.getuid()}'
+
+
+def _require_private(directory: Path, found: os.stat_result) -> None:
+    uid = os.getuid()
+    if (
+        not stat.S_ISDIR(found.st_mode)
+        or found.st_uid != uid
+        or stat.S_IMODE(found.st_mode) & 0o077
+    ):
+        raise PermissionError(
+            f'verify event channel directory {directory} is not private to uid {uid}: '
+            f'owner uid {found.st_uid}, mode {stat.filemode(found.st_mode)}'
+        )
+
+
+def _private_channel_directory() -> Path:
+    directory = _default_channel_directory()
+    try:
+        found = directory.lstat()
+    except FileNotFoundError:
+        directory.mkdir(mode=0o700, exist_ok=True)
+        found = directory.lstat()
+    _require_private(directory, found)
+    return directory
+
+
+def _open_channel_file(directory: Path | None) -> tuple[int, str]:
+    target = _private_channel_directory() if directory is None else directory
+    return tempfile.mkstemp(prefix=_CHANNEL_FILE_PREFIX, suffix='.jsonl', dir=target)
+
+
 def _create_with_header(*, role: str, verify_id: str, directory: Path | None) -> Path:
-    fd, name = tempfile.mkstemp(prefix='df-verify-events-', suffix='.jsonl', dir=directory)
+    fd, name = _open_channel_file(directory)
     try:
         os.write(fd, encode_channel_open(role=role, verify_id=verify_id))
     except OSError:
@@ -186,6 +223,9 @@ def allocate_verify_event_log(
 ) -> Iterator[VerifyEventLog]:
     """A fresh channel file headed by DF's ``channel_open``, removed on exit.
 
+    With no ``directory`` the channel is created in this user's private channel
+    directory under the system temp dir, never in the temp dir itself; a directory
+    at that name that is not private to this user fails the allocation.
     Allocation failure is logged and yields a log with no path, so the verify runs
     with no channel (C3 rule 2) rather than failing.
     """
