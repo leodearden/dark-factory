@@ -574,14 +574,16 @@ def test_a_basetemp_smuggled_through_extra_is_refused_before_any_session_starts(
 ) -> None:
     smuggled = tmp_path / 'elsewhere'
     suite = _write_probe_suite(tmp_path, SIGNAL_METHOD)
+    (suite.root / TEMPROOT_RECORDER_MODULE_NAME).write_text(
+        _TEMPROOT_RECORDER_MODULE, encoding='utf-8',
+    )
     smuggle = tuple(arg.format(smuggled) for arg in spelling)
 
     with pytest.raises(ValueError, match='--basetemp') as refused:
-        _run_probe_suite(suite, '-k', MAIN_THREAD_TEST, '-n', '0', *smuggle)
+        _run_probe_suite(suite, '-k', TEMPROOT_RECORDER_TEST, '-n', '0', *smuggle)
 
     assert smuggle[0] in str(refused.value)
-    assert not suite.basetemp.exists(), 'a session started anyway'
-    assert not smuggled.exists(), 'a session started anyway'
+    assert not (suite.root / TEMPROOT_RECORD_NAME).exists(), 'a session started anyway'
 
 
 @pytest.mark.parametrize(
