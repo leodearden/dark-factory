@@ -20,7 +20,9 @@ INV-12 fixtures were added 2026-09-18 with the exceptions-owned-or-ratified
 invariant (task 5599; `plans/inv12-exceptions-owned-or-ratified-prd.md`);
 INV-13 fixtures were added 2026-09-25 with the readers-prove-their-producer
 invariant; INV-14 fixtures were added 2026-10-12 with the
-sampler-vocabulary-one-table invariant (task 6773).
+sampler-vocabulary-one-table invariant (task 6773); INV-15 fixtures were
+added 2026-11-21 with the scheduling-state-survives-restart invariant
+(task 11060; `plans/merge-pool-batches-prd.md` L7).
 
 **Two fixture shapes.** Each invariant below carries exactly two seeded
 violations — both expressions of the SAME underlying violation, so the two
@@ -81,8 +83,9 @@ Acceptance: every fixture flags with the correct slug. The base table
 holds 10 rows (INV-1..5); the 2026-08-02 addendum adds 4 (INV-6..7), the
 2026-08-06 addendum adds 2 (INV-8), the 2026-08-24 addendum adds 2
 (INV-9), the 2026-08-30 addendum adds 2 (INV-10), the INV-11 addendum
-adds 2, the INV-12 addendum adds 2, the INV-13 addendum adds 2, and the
-INV-14 addendum adds 2 — 28 rows cumulative, all `Y`.
+adds 2, the INV-12 addendum adds 2, the INV-13 addendum adds 2, the
+INV-14 addendum adds 2, and the INV-15 addendum adds 2 — 30 rows
+cumulative, all `Y`.
 
 ## INV-1 `contracts-machine-checked`
 
@@ -976,6 +979,51 @@ vocabulary, not a world-fact written into a record or store (not INV-9
 `one-fact-one-home`); the parity test executes the collector rather than
 matching prose (not INV-10 `guards-exercise-behaviour`); and nothing fails
 or falls back (not INV-11 `no-silent-fail-soft`).
+
+### Addendum — INV-15 walk (2026-11-21)
+
+Walked against the as-landed G7 §"Design invariants pass" text and the
+Step 5.5 audit text, both re-read from the working tree at the commit that
+adds INV-15 (task 11060) rather than from the drafting context. Both G7
+paths were walked, as in the 2026-10-12 addendum: the normative path
+(which Reads the doc at run time and auto-extended to INV-15 with no edit)
+and the no-invariants-file fallback path (the trigger-shape list, which
+does NOT auto-extend and gained an INV-15 entry in the same commit). Step
+5.5 is unchanged since the INV-14 walk: it records a `findings` entry
+whose lens is `inv-<n>`.
+
+The same snapshot caveat applies: the Verdict column transcribes phrasing
+as it read on 2026-11-21, not a live pin.
+
+| Fixture ID | Shape | Invariant | Expected slug | Verdict (as-landed text yields) | Match |
+|---|---|---|---|---|---|
+| `INV-15-PRD` | PRD | INV-15 scheduling-state-survives-restart | `scheduling-state-survives-restart` | Normative path: G7's walk of the checkable question ("Does this feature add or touch an attribute, a module-level mutable or a field on an in-memory request that a pick, batch, hold or verify decision reads?", "Which of (a), (b) or (c) is it, and where is that declared?") fires — the row adds `_verify_alone`, which the placement reads to decide what it batches, and declares no restart disposition; its only signal is a lane test that never restarts the lane. Fallback path: the new trigger-shape entry ("in-memory state that a pick, batch, hold or verify decision reads, with no declared restart disposition") fires on the same row → `flag: scheduling-state-survives-restart` | Y |
+| `INV-15-CODE` | CODE | INV-15 scheduling-state-survives-restart | `scheduling-state-survives-restart` | Step 5.5 ("audit the Phase 2 file set against each invariant's checkable question" — Reads the doc generically) applies INV-15's question to `orchestrator/src/orchestrator/merge_lane/solo_marks.py`: `may_batch` reads `_verify_alone` to decide whether a request may be batched, and `SoloMarks` names no store, writes no rows and declares no drop → a `findings` entry with lens `inv-15` (the quality doc names no heuristic for INV-15, so none follows), which the normative heading resolves to `scheduling-state-survives-restart`, `severity="medium"` | Y |
+
+**Addendum result: 2/2 match** (cumulative 30/30). Both fixtures flagged
+on the first walk, so INV-15's checkable question was not reworded and
+there is no reconciliation to record. No wording change to G7's walk
+instruction or to Step 5.5 was needed either. The gate-text edits this
+change did require (G7's trigger-shape entry, the family-inventory row and
+the Calibration pointer) are not rehearsal misses: none of those
+enumerations auto-extends, which is why
+`tests/repo_guards/test_design_invariants_consistency.py` fails the moment a
+heading lands without the first two.
+
+Isolation re-checked while walking. INV-7 `holds-owned-and-bounded` is
+adjacent by construction, since its checkable question already asks
+whether a hold's record survives a restart, and the fixtures are seeded off
+that seam: a marked request is never held, it dispatches alone, so there is
+no hold for INV-7 to own or bound. The set gates batching, not a detector,
+so it is no allow-list entry or inline suppression (not INV-12
+`exceptions-owned-or-ratified`), and nothing reads a store (not INV-13
+`readers-prove-their-producer`). Those three are the distinctions the
+normative doc's INV-15 Family boundary paragraph draws. No other trigger
+shape fires: the mark is the lane's own state, not a snapshot of external
+truth acted on without a re-check (not INV-3 `corroborate-before-acting`);
+the signal test executes the lane rather than matching prose (not INV-10
+`guards-exercise-behaviour`); and nothing fails or falls back (not INV-11
+`no-silent-fail-soft`).
 
 ## Reconciliation — 2026-07-14 base walk
 
