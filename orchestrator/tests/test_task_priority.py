@@ -5,6 +5,8 @@
 """
 from __future__ import annotations
 
+import dataclasses
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -16,6 +18,8 @@ from orchestrator.merge_verify_facts import ChainMembers, MergeVerifyDispatchFac
 from orchestrator.overrides import OverrideStore
 from orchestrator.scheduler import Scheduler
 from orchestrator.task_priority import UNKNOWN_PRIORITY, TaskPriority, read_task_priority
+
+_ANCHOR = datetime(2026, 11, 1, 12, 0, tzinfo=UTC)
 
 
 def _pending(task_id: str, priority: str, *, deps: tuple[str, ...] = ()) -> dict:
@@ -101,6 +105,41 @@ class TestReadTaskPriority:
 
         assert read_task_priority(recording, 42) == TaskPriority(tier='high', pinned=True)
         assert asked == ['42']
+
+    def test_the_new_fields_survive_the_guard(self) -> None:
+        answer = TaskPriority(
+            tier='pinned', base_tier='low', pinned=True, pin_order=3, age_anchor=_ANCHOR,
+        )
+
+        assert read_task_priority(lambda task_id: answer, '7') == answer
+
+    @pytest.mark.parametrize('field, odd_value', [
+        ('base_tier', MagicMock()),
+        ('pin_order', True),
+        ('pin_order', '3'),
+        ('age_anchor', datetime(2026, 11, 1, 12, 0)),
+        ('age_anchor', '2026-11-01T12:00:00+00:00'),
+    ])
+    def test_an_ill_typed_new_field_is_unknown(self, field: str, odd_value: Any) -> None:
+        well_typed = TaskPriority(
+            tier='pinned', base_tier='low', pinned=True, pin_order=3, age_anchor=_ANCHOR,
+        )
+        answer = dataclasses.replace(well_typed, **{field: odd_value})
+
+        assert read_task_priority(lambda task_id: answer, '7') == dataclasses.replace(
+            well_typed, **{field: None},
+        )
+
+    def test_the_positional_shape_keeps_its_meaning(self) -> None:
+        assert TaskPriority('high', False) == TaskPriority(
+            tier='high', pinned=False, base_tier=None, pin_order=None, age_anchor=None,
+        )
+
+    def test_unknown_priority_has_every_field_unknown(self) -> None:
+        assert all(
+            getattr(UNKNOWN_PRIORITY, f.name) is None
+            for f in dataclasses.fields(UNKNOWN_PRIORITY)
+        )
 
 
 class TestChainMembersOnTheVerifyRow:
