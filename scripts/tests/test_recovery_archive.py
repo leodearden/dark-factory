@@ -89,12 +89,21 @@ def test_a_dump_size_must_be_positive(size):
         ("fused-memory/data/../data/cgl-eta", r"\.\."),
         ("fused-memory/data/falkordb", "live FalkorDB"),
         ("fused-memory/data/falkordb/old", "live FalkorDB"),
+        ("fused-memory/data", "live FalkorDB"),
+        ("fused-memory", "live FalkorDB"),
+        (".", "live FalkorDB"),
+        ("", "live FalkorDB"),
     ],
 )
-def test_an_archive_path_is_relative_and_outside_the_live_falkordb_dir(path, invariant):
+def test_an_archive_path_is_relative_and_disjoint_from_the_live_falkordb_dir(path, invariant):
     with pytest.raises(ValueError, match=invariant) as raised:
         ArchiveDir(path=path, dumps=(_dump(),))
     assert path in str(raised.value)
+
+
+def test_the_live_falkordb_refusal_states_the_whole_rule():
+    with pytest.raises(ValueError, match="at, under, or above"):
+        ArchiveDir(path="fused-memory/data", dumps=(_dump(),))
 
 
 @pytest.mark.parametrize("path", ["fused-memory/data/falkordb-old", "fused-memory/data/cgl-eta"])
