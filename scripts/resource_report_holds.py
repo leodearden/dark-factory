@@ -622,7 +622,10 @@ class ProjectConsumer:
     who_paid_rank: int | None
 
 
-_NO_PROJECT_SLICE = 'the daemon runs in its own unit, so the project has no project slice'
+_PROJECT_NOT_KEYED = (
+    "the daemon's own cgroup is its unit, not a project slice, so this report cannot key "
+    "the project's slice (it may still appear in the rankings)"
+)
 
 
 def _rank(consumer: Consumer, ranking: Sequence[ConsumerWindow]) -> int | None:
@@ -635,7 +638,7 @@ def holding_project(mapping: HoldConsumers, window: Window) -> tuple[ProjectCons
     rows = []
     for role, consumer in mapping.by_role().items():
         if consumer is None:
-            reason = mapping.unmapped_reason or _NO_PROJECT_SLICE
+            reason = mapping.unmapped_reason or _PROJECT_NOT_KEYED
             rows.append(ProjectConsumer(role, None, ProjectStatus.NOT_MAPPED, reason, None, None, None))
             continue
         figures = window.consumers.get(consumer)
